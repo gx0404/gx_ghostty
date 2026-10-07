@@ -99,7 +99,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # setup-zig saves an empty cache once .zig-cache exceeds cache-size-limit MiB (default 2048).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          cache-size-limit: 4096
       - name: Install the ABI manifest verifier dependency
         run: |
           sudo apt-get update
@@ -197,7 +200,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # setup-zig saves an empty cache once .zig-cache exceeds cache-size-limit MiB (default 2048).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          cache-size-limit: 4096
       - name: libghostty-vt tests, sharded across processes
         run: |
           python scripts/zig_test.py --suite vt --json "$env:RUNNER_TEMP/gx-zig-test/windows.json"

@@ -147,9 +147,9 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 ## 待首跑确认（PENDING）
 
-以下内容只能在 push 后的 GitHub Actions 上验证，首跑前一律记 PENDING（Actions 已启用；旧布局的 `gx-ci` 首跑已于 2026-10-07 全部通过，用时约 22 min）：
+以下内容只能在 push 后的 GitHub Actions 上验证，首跑前一律记 PENDING（Actions 已启用；旧布局的 `gx-ci` 首跑已于 2026-10-07 全部通过，用时约 22 min；新布局首跑 run 37582059213 同日全部通过，用时约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过）：
 
-- `gx-ci` 新布局的首次运行：`linux-vt`（分片运行 lib-vt 测试，再跑 `test-lib-vt-schema`）、`linux-main`（分片运行 `-Dapp-runtime=none` 的主测试，`ghostty-test` 首次在 Linux 上分进程运行）、改用并行运行器的 `windows`。热缓存要看第二次运行：`linux-main` 设 `cache-size-limit: 4096` 后 Zig 缓存是否保留并命中，`lib-vt-cross` 按 target 分开的 `cache-key` 是否各自命中。
+- `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存是否保留并在下一次运行命中（首跑时 `windows` 的 2.49 GB 超过当时的默认上限、被清空）；`lib-vt-cross` 按 target 分开的 `cache-key` 是否各自命中（首跑时六个目标各存了一份）。
 - `gx-ci` 手动触发的 `gtk-smoke`：`mlugg/setup-zig` 在 `debian:13` 容器内运行、Xvfb 下的软件渲染，以及截图 artifact 的读回。
 - `gx-release` 的第一次只构建运行：libghostty-vt 各目标的实际安装布局（尤其 Windows 的 DLL 位置与 musl 共享库）是否满足 `verify` 的必需文件检查，`distcheck` 在缓存移出检出目录后的行为，`setup-zig` 的 `use-cache` 输入，以及 libghostty-vt 源码包的实际大小（本机只能按工作树估算 `export-ignore` 生效后的体积）。
 - `macos=true` 时 macos-15 上的 Xcode 选择与 `Ghostty.app` 构建。

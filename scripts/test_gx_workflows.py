@@ -38,7 +38,9 @@ ZIG_TEST_COMMANDS = {
 }
 # The only mlugg/setup-zig inputs in gx-ci; no job sets version, so every job installs minimum_zig_version.
 SETUP_ZIG_INPUTS = {
+    "linux-vt": {"cache-size-limit": "4096"},
     "linux-main": {"cache-size-limit": "4096"},
+    "windows": {"cache-size-limit": "4096"},
     "lib-vt-cross": {"cache-key": "${{ matrix.target }}"},
 }
 RELEASE_JOBS = {"prepare", "source", "libvt", "libvt-macos", "linux-gtk", "macos", "verify", "publish"}

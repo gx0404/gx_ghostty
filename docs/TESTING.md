@@ -48,15 +48,15 @@
 
 | 命令 | 规模与结果 | 墙钟 | 改造前 |
 |---|---|---|---|
-| `just test-vt` | 6655 条（vt 3096 + vt_c 3559）：6593 通过、62 跳过、0 失败 | 80.3 s，其中构建 0.6 s | `zig build test-lib-vt` 6–8 min |
+| `just test-vt` | 6655 条（vt 3096 + vt_c 3559）：6593 通过、62 跳过、0 失败 | 80.3 s，其中构建 0.6 s；2026-10-07 收尾时连续三次 84.2、95.8、89.2 s | `zig build test-lib-vt` 6–8 min |
 | `just test-vt --dedupe` | vt_c 里与 vt 同名的用例不再运行 | 约 64 s | — |
 | `just framework-test` | 79 个单元、约 500 个测试（两次实测 494、498 个） | 13.1 s、12.0 s | 串行 `python -m unittest discover` 约 62–87 s（当时 430 个测试） |
-| `just ci-check` | framework-check 约 15 s → fmt-check 约 1 s → test-vt 约 81 s | 约 100 s | — |
+| `just ci-check` | framework-check 约 15 s → fmt-check 约 1 s → test-vt 约 81 s | 约 100 s；收尾时连续三次 95.4、109.7、100.8 s | — |
 
-- **下限**：各用例耗时合计约 1600 s（20 路并行下测得），1600 / 20 ≈ 80 s，所以 80 s 已接近 20 核的下限；最慢的单条用例 `terminal.Terminal.test.Terminal: printSlice differential fuzz vs print` 本机约 45–58 s，核数再多也快不过它。
+- **下限**：各用例耗时合计约 1600 s（20 路并行下测得），1600 / 20 ≈ 80 s，所以 80 s 已接近 20 核的下限；最慢的单条用例 `terminal.Terminal.test.Terminal: printSlice differential fuzz vs print` 本机约 45–58 s，核数再多也快不过它。笔记本 CPU 连续满载后会降频：上表第二次紧接着第一次运行，test-vt 多花了约 10 s；本机同时有其他重负载时，全量可能超过 2 分钟。
 - **`--dedupe`** 是覆盖取舍：vt_c 是同一模块以 `c_abi = true` 编译的测试二进制，同名用例在 C ABI 打开时再跑一遍，另有只在它里面的 `terminal.c.*`；去重后少了 C ABI 打开时的那一遍。默认关闭；用了就在结论里写明。
 - **编译**：改过 Zig 源码后，`ghostty-vt`、`ghostty-vt-c` 两个 Debug 测试二进制都要用 LLVM 重新编译，两次编译并行，各约 2 min、约 6 GB 内存（RSS）。这段时间运行器省不掉：试过 Zig 自托管后端，它在 Windows 上编出的测试二进制无法运行。没改 Zig 源码时，`test-lib-vt-bin` 只做 1 秒内的缓存校验；运行器给测试构建钉 `-Dversion-string=<X.Y.Z>-dev+0000000`，否则版本串随提交哈希变化，每次提交都会让测试二进制整体重编。
-- **CI**：`gx-ci` 的托管 runner 只有 4 个 vCPU，LLVM 编译测试二进制本身就要数分钟，用例也只能分 4 路，CI 达不到本机约 2 分钟的水平。旧布局首次运行墙钟约 22 min（旧 `linux` job 21.5 min、`windows` 19 min）；新布局把 Linux 拆成并行的 `linux-vt` 与 `linux-main` 并改用运行器，实际耗时以用户 push 后的首次运行为准，此前记 PENDING。缓存：`mlugg/setup-zig` 跨运行保存 Zig 缓存目录，目录超过 `cache-size-limit`（默认 2048 MiB）时会被清空。旧 `linux` job 的缓存目录约 2.99 GB，每次都被清空，Linux 从未命中热缓存；新布局给 `linux-main` 设 `cache-size-limit: 4096`（MiB），`lib-vt-cross` 矩阵按 target 各用自己的 `cache-key`，免得六个目标共用一份缓存；`linux-vt`、`linux-main`、`windows` 设 `GX_ZIG_TEST_TIMINGS_DIR=.zig-cache/gx-test-timings`，让运行器的耗时缓存随 Zig 缓存一起保存（否则 CI 每次都没有耗时记录，最慢的用例可能排到最后才开始）。热缓存能否命中要看第二次运行，同样记 PENDING。
+- **CI**：`gx-ci` 的托管 runner 只有 4 个 vCPU，LLVM 编译测试二进制本身就要数分钟，用例也只能分 4 路，CI 达不到本机约 2 分钟的水平。旧布局首次运行墙钟约 22 min（旧 `linux` job 21.5 min、`windows` 19 min）。新布局把 Linux 拆成并行的 `linux-vt` 与 `linux-main` 并改用运行器，2026-10-07 首次运行（run 37582059213，冷缓存、没有耗时记录）墙钟约 14.4 min：`linux-vt` 9.5 min（构建 91 s，6651 条用例 429 s）、`linux-main` 12.8 min（构建 419 s，3909 条用例 330 s）、`windows` 13.9 min（构建 304 s，6655 条用例 323 s），`lib-vt-cross` 各 1.3–2.7 min。缓存：`mlugg/setup-zig` 跨运行保存 Zig 缓存目录，目录超过 `cache-size-limit`（默认 2048 MiB）时会被清空。旧 `linux` job 的缓存目录约 2.99 GB，每次都被清空，Linux 从未命中热缓存；新布局首次运行时 `linux-main` 1.51 GB、`linux-vt` 1.84 GB、`windows` 2.49 GB（超过默认上限、被清空），所以三个测试 job 都设 `cache-size-limit: 4096`（MiB），`lib-vt-cross` 矩阵按 target 各用自己的 `cache-key`，免得六个目标共用一份缓存；这三个 job 还设 `GX_ZIG_TEST_TIMINGS_DIR=.zig-cache/gx-test-timings`，让运行器的耗时缓存随 Zig 缓存一起保存（否则 CI 每次都没有耗时记录，最慢的用例可能排到最后才开始）。热缓存的效果要看之后的运行，记 PENDING。
 
 ## CI 覆盖与本机对应
 
@@ -66,10 +66,10 @@
 |---|---|---|---|
 | `framework` | 每次 | resolver `--check`、version `--check`、`python3 scripts/run_unittests.py`、kb-check、首父链提交标题校验（push 取 `before..after`，`before` 全零时只查 head；PR 取 `base..head`；手动触发只查 head）；不跑 graph-check | `just framework-check`；`just commit-check --range <base>..HEAD` |
 | `zig-fmt` | 每次 | `zig fmt --check .` | `just fmt-check` |
-| `linux-vt` | 每次 | 装 `python3-jsonschema` 后跑 `python3 scripts/zig_test.py --suite vt` 与 `zig build test-lib-vt-schema` | `just test-vt`；ABI 清单的本机前置见下文 |
+| `linux-vt` | 每次 | 装 `python3-jsonschema` 后跑 `python3 scripts/zig_test.py --suite vt` 与 `zig build test-lib-vt-schema`；`setup-zig` 设 `cache-size-limit: 4096` | `just test-vt`；ABI 清单的本机前置见下文 |
 | `linux-main` | 每次，与 `linux-vt` 并行 | `python3 scripts/zig_test.py --suite main -Dapp-runtime=none`；`setup-zig` 设 `cache-size-limit: 4096` | Linux/macOS 开发机上 `just test -Dapp-runtime=none`；Windows 上没有对应（`just test` 退出 2） |
 | `lib-vt-cross` | 每次 | 六个目标各跑一次 `zig build -Demit-lib-vt -Dtarget=<triple>`（默认 Debug）：`x86_64-linux-gnu`、`aarch64-linux-gnu`、`x86_64-linux-musl`、`x86_64-windows-gnu`、`aarch64-macos`、`wasm32-freestanding`；`setup-zig` 的 `cache-key` 按 target 区分 | `just build-vt -Dtarget=<triple>`；`just vt-wasm` 是 ReleaseSmall 变体 |
-| `windows` | 每次 | windows-2025 上关闭 `core.autocrlf` 后检出，跑 `python scripts/zig_test.py --suite vt`、`zig build -Demit-lib-vt`，再构建并运行 `example/c-vt-static` 的 `c_vt_static.exe`；pwsh 中每条原生命令后检查 `$LASTEXITCODE` | `just test-vt`、`just build-vt`、示例构建 |
+| `windows` | 每次 | windows-2025 上关闭 `core.autocrlf` 后检出，跑 `python scripts/zig_test.py --suite vt`、`zig build -Demit-lib-vt`，再构建并运行 `example/c-vt-static` 的 `c_vt_static.exe`；pwsh 中每条原生命令后检查 `$LASTEXITCODE`；`setup-zig` 设 `cache-size-limit: 4096` | `just test-vt`、`just build-vt`、示例构建 |
 | `gtk-smoke` | 仅手动触发且 `gtk_smoke` 为真 | debian:13 容器构建 GTK app，`xvfb-run` 截图，上传证据 artifact（保留 14 天） | 无，本机记 PENDING |
 | `macos` | 仅手动触发且 `macos` 为真 | macos-15 上 `zig build test-lib-vt` | 无，本机记 PENDING |
 
