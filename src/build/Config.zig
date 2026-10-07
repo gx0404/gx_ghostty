@@ -310,7 +310,9 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         };
         if (vsn.tag) |tag| {
             // Tip releases behave just like any other pre-release so we skip.
-            if (!std.mem.eql(u8, tag, "tip")) {
+            // fork(gx): GX-0001 tags without a 'v' prefix (e.g. gx-v0.1.0)
+            // mark fork releases, not Ghostty releases: treat them like tip.
+            if (!std.mem.eql(u8, tag, "tip") and std.mem.startsWith(u8, tag, "v")) {
                 const expected = b.fmt("v{d}.{d}.{d}", .{
                     app_version.major,
                     app_version.minor,
