@@ -1,7 +1,10 @@
 """Lock tests for the fork patch registry in docs/FORK_PATCHES.md.
 
 The registry table is the closed set of ``fork(gx)`` markers in upstream
-source (src/, include/, pkg/, macos/ and build.zig). Run from the repo root:
+source (src/, include/, pkg/, macos/ and build.zig). Pure additions are
+wrapped in ``fork(gx): GX-NNNN begin`` / ``fork(gx): GX-NNNN end`` comment
+lines, so dropping those hunks must give back the merged upstream file.
+Run from the repo root:
 
     python -m unittest scripts.test_fork_patches -v
 """
@@ -24,6 +27,9 @@ STATUSES = ("active", "removed")
 ID_RE = re.compile(r"GX-\d{4}")
 MARKER_RE = re.compile(rb"fork\(gx\)(?::[ \t]*(GX-\d{4})(?![0-9]))?")
 SECTION_RE = re.compile(r"^##[ \t]+(GX-\d{4})(?![0-9])", re.M)
+HUNK_BEGIN_RE = re.compile(r"^[ \t]*// fork\(gx\): (GX-\d{4}) begin(?::.*)?$")
+HUNK_END_RE = re.compile(r"^[ \t]*// fork\(gx\): (GX-\d{4}) end$")
+UPSTREAM_REFS = ("main", "origin/main", "upstream/main")
 
 CONFIG_ZIG = "src/build/Config.zig"
 GX0001_MARKER = "fork(gx): GX-0001"
@@ -37,6 +43,37 @@ UPSTREAM_TIP_GUARD = 'if (!std.mem.eql(u8, tag, "tip")) {'
 UPSTREAM_EXPECTED = 'const expected = b.fmt("v{d}.{d}.{d}", .{'
 UPSTREAM_PANIC = '@panic("tagged releases must be in vX.Y.Z format matching build.zig");'
 UPSTREAM_FALLBACK = ".pre = vsn.branch,"
+
+BUILD_ZIG = "build.zig"
+GX0002 = "GX-0002"
+GX0002_MARKER = f"fork(gx): {GX0002}"
+# (hunk, line prefix it must follow, line prefix it must precede, statements).
+# Statements are compared with squash(), so formatting does not matter.
+GX0002_HUNKS = (
+    ("step declarations",
+     "const test_lib_vt_build_step = b.step(",
+     "const resources = try buildpkg.GhosttyResources.init(", (
+         'const test_bin_step = b.step("test-bin",',
+         'const test_lib_vt_bin_step = b.step("test-lib-vt-bin",',
+         "if (config.emit_lib_vt) test_bin_step.dependOn(&b.addFail(",
+     )),
+    ("libghostty-vt installs",
+     "const mod_vt_c_test = b.addTest(.{",
+     "// Tests (skip when building libghostty-vt)", (
+         "test_lib_vt_bin_step.dependOn(&b.addInstallArtifact(mod_vt_test, .{"
+         ' .dest_dir = .{ .override = .{ .custom = "test/vt" } } }).step);',
+         "test_lib_vt_bin_step.dependOn(&b.addInstallArtifact(mod_vt_c_test, .{"
+         ' .dest_dir = .{ .override = .{ .custom = "test/vt_c" } } }).step);',
+     )),
+    ("ghostty-test install",
+     "const test_exe = b.addTest(.{",
+     "test_valgrind_step.dependOn(&valgrind_run.step);", (
+         "const test_exe_bin_install = b.addInstallArtifact(test_exe, .{"
+         ' .dest_dir = .{ .override = .{ .custom = "test" } } });',
+         "config.addPatchElf(test_exe, &test_exe_bin_install.step);",
+         "test_bin_step.dependOn(&test_exe_bin_install.step);",
+     )),
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +165,90 @@ def find_markers(root: Path, files) -> list[tuple[str, int, str | None]]:
     return found
 
 
+def hunk_problems(rel: str, text: str) -> list[str]:
+    """Report nested, unclosed or stray begin/end hunk delimiters in one file."""
+    problems: list[str] = []
+    open_hunk: tuple[str, int] | None = None
+    for lineno, line in enumerate(text.splitlines(), 1):
+        opened, closed = HUNK_BEGIN_RE.match(line), HUNK_END_RE.match(line)
+        if opened:
+            if open_hunk is not None:
+                problems.append(f"{rel}:{lineno}: {opened.group(1)} begin inside the "
+                                f"{open_hunk[0]} hunk opened on line {open_hunk[1]}")
+            open_hunk = (opened.group(1), lineno)
+        elif closed:
+            if open_hunk is None or open_hunk[0] != closed.group(1):
+                problems.append(f"{rel}:{lineno}: {closed.group(1)} end without a matching begin")
+            else:
+                open_hunk = None
+    if open_hunk is not None:
+        problems.append(f"{rel}:{open_hunk[1]}: {open_hunk[0]} begin is never closed")
+    return problems
+
+
+def marked_hunks(source: str, pid: str) -> tuple[str, list[tuple[int, int]]]:
+    """Strip the begin/end-delimited hunks of patch ``pid`` from ``source``.
+
+    Returns the remaining text (original line endings kept) and the 0-based
+    line indexes of each hunk's begin and end delimiter. Raises ValueError
+    for nested, unclosed or stray delimiters and for a ``pid`` marker that
+    sits outside a hunk.
+    """
+    marker = re.compile(rf"fork\(gx\):[ \t]*{re.escape(pid)}(?![0-9])")
+    kept: list[str] = []
+    hunks: list[tuple[int, int]] = []
+    begin: int | None = None
+    for index, line in enumerate(source.splitlines(keepends=True)):
+        text = line.rstrip("\r\n")
+        opened, closed = HUNK_BEGIN_RE.match(text), HUNK_END_RE.match(text)
+        if opened and opened.group(1) == pid:
+            if begin is not None:
+                raise ValueError(f"line {index + 1}: {pid} begin inside the hunk opened on line {begin + 1}")
+            begin = index
+        elif closed and closed.group(1) == pid:
+            if begin is None:
+                raise ValueError(f"line {index + 1}: {pid} end without a begin")
+            hunks.append((begin, index))
+            begin = None
+        elif begin is None:
+            if marker.search(text):
+                raise ValueError(f"line {index + 1}: {pid} marker outside a begin/end hunk")
+            kept.append(line)
+    if begin is not None:
+        raise ValueError(f"line {begin + 1}: {pid} begin is never closed")
+    return "".join(kept), hunks
+
+
+def squash(code: str) -> str:
+    """Drop comment lines, whitespace and trailing commas so formatting is irrelevant."""
+    body = "".join(line for line in code.splitlines() if not line.lstrip().startswith("//"))
+    return re.sub(r",(?=[)}\]])", "", re.sub(r"\s+", "", body))
+
+
+def merged_upstream_text(root: Path, rel: str) -> tuple[str | None, str]:
+    """Return ``rel`` at the merge base of HEAD and the upstream mirror.
+
+    The text is LF-normalised; on failure the first item is None and the
+    second explains why (used as a skip reason).
+    """
+    for ref in UPSTREAM_REFS:
+        base = subprocess.run(["git", "-C", str(root), "merge-base", "HEAD", ref],
+                              capture_output=True)
+        if base.returncode == 0:
+            break
+    else:
+        return None, "no upstream mirror branch (main) available to compare against"
+    commit = base.stdout.decode("ascii").strip()
+    shown = subprocess.run(["git", "-C", str(root), "show", f"{commit}:{rel}"],
+                           capture_output=True)
+    if shown.returncode != 0:
+        return None, f"{rel} is not readable at merge base {commit}"
+    upstream = shown.stdout.decode("utf-8").replace("\r\n", "\n")
+    if "fork(gx)" in upstream:
+        return None, "merge base already contains fork patches"
+    return upstream, ""
+
+
 def check(root: Path, files: list[str] | None = None) -> list[str]:
     """Return every registry/marker violation; an empty list means clean.
 
@@ -168,6 +289,8 @@ def check(root: Path, files: list[str] | None = None) -> list[str]:
             problems.append(f"{rel}:{lineno}: malformed marker, expected 'fork(gx): GX-NNNN'")
         elif (pid, rel) not in active:
             problems.append(f"{rel}:{lineno}: {pid} is not registered as active for this file in {REGISTRY}")
+    for rel in sorted({rel for rel, _, _ in found}):
+        problems.extend(hunk_problems(rel, (root / rel).read_bytes().decode("utf-8", "replace")))
     return problems
 
 
@@ -206,6 +329,43 @@ def gx0001_problems(source: str) -> list[str]:
     return problems
 
 
+def gx0002_problems(source: str) -> list[str]:
+    """Shape lock for GX-0002 in build.zig: three pure-addition hunks."""
+    try:
+        upstream, hunks = marked_hunks(source, GX0002)
+    except ValueError as err:
+        return [str(err)]
+    problems: list[str] = []
+    if "fork(gx)" in upstream:
+        problems.append("build.zig carries fork(gx) markers outside the GX-0002 hunks")
+    if len(hunks) != len(GX0002_HUNKS):
+        problems.append(f"expected {len(GX0002_HUNKS)} {GX0002} hunks, found {len(hunks)}")
+    lines = source.splitlines()
+    bodies = [squash("\n".join(lines[begin + 1:end])) for begin, end in hunks]
+    outside = squash(upstream)
+
+    def anchor(prefix: str) -> int | None:
+        hits = [i for i, line in enumerate(lines) if line.strip().startswith(prefix)]
+        if len(hits) != 1:
+            problems.append(f"expected exactly one line starting with {prefix!r}, found {len(hits)}")
+            return None
+        return hits[0]
+
+    for name, after, before, statements in GX0002_HUNKS:
+        low, high = anchor(after), anchor(before)
+        for statement in statements:
+            owners = [i for i, body in enumerate(bodies) if squash(statement) in body]
+            if len(owners) != 1 or squash(statement) in outside:
+                problems.append(f"{name}: {statement!r} must appear in exactly one {GX0002} hunk "
+                                f"and nowhere else (found in {len(owners)} hunks)")
+                continue
+            begin, end = hunks[owners[0]]
+            if low is not None and high is not None and not low < begin < end < high:
+                problems.append(f"{name}: the hunk on lines {begin + 1}-{end + 1} must sit "
+                                f"between {after!r} and {before!r}")
+    return problems
+
+
 class RealRepoTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -214,6 +374,9 @@ class RealRepoTests(unittest.TestCase):
 
     def test_registry_lists_gx0001_as_active(self):
         self.assertIn(Patch("GX-0001", CONFIG_ZIG, GX0001_MARKER, "active"), self.patches)
+
+    def test_registry_lists_gx0002_as_active(self):
+        self.assertIn(Patch(GX0002, BUILD_ZIG, GX0002_MARKER, "active"), self.patches)
 
     def test_registry_documents_the_scanned_scope(self):
         rules = self.registry_text.split("## 规则", 1)[1].split("\n## ", 1)[0]
@@ -233,6 +396,10 @@ class RealRepoTests(unittest.TestCase):
     def test_config_zig_keeps_the_gx0001_guard(self):
         source = (ROOT / CONFIG_ZIG).read_text(encoding="utf-8")
         self.assertEqual(gx0001_problems(source), [])
+
+    def test_build_zig_keeps_the_gx0002_hunks(self):
+        source = (ROOT / BUILD_ZIG).read_text(encoding="utf-8")
+        self.assertEqual(gx0002_problems(source), [])
 
 
 class Gx0001ShapeTests(unittest.TestCase):
@@ -256,21 +423,9 @@ class Gx0001ShapeTests(unittest.TestCase):
     def test_patch_is_the_only_change_against_merged_upstream(self):
         if set(re.findall(r"fork\(gx\): (GX-\d{4})", self.source)) != {"GX-0001"}:
             self.skipTest("Config.zig carries other fork patches")
-        for ref in ("main", "origin/main", "upstream/main"):
-            base = subprocess.run(["git", "-C", str(ROOT), "merge-base", "HEAD", ref],
-                                  capture_output=True)
-            if base.returncode == 0:
-                break
-        else:
-            self.skipTest("no upstream mirror branch (main) available to compare against")
-        commit = base.stdout.decode("ascii").strip()
-        shown = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:{CONFIG_ZIG}"],
-                               capture_output=True)
-        if shown.returncode != 0:
-            self.skipTest(f"{CONFIG_ZIG} is not readable at merge base {commit}")
-        upstream = shown.stdout.decode("utf-8").replace("\r\n", "\n")
-        if "fork(gx)" in upstream:
-            self.skipTest("merge base already contains fork patches")
+        upstream, reason = merged_upstream_text(ROOT, CONFIG_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
         self.assertEqual(self.upstream, upstream)
 
     def test_guard_without_tip_check_is_rejected(self):
@@ -287,6 +442,107 @@ class Gx0001ShapeTests(unittest.TestCase):
 
     def test_crlf_source_is_accepted(self):
         self.assertEqual(gx0001_problems(self.source.replace("\n", "\r\n")), [])
+
+
+class Gx0002ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / BUILD_ZIG).read_text(encoding="utf-8")
+        cls.lines = cls.source.splitlines(keepends=True)
+        cls.upstream, cls.hunks = marked_hunks(cls.source, GX0002)
+
+    def without_hunk(self, index: int) -> str:
+        begin, end = self.hunks[index]
+        return "".join(self.lines[:begin] + self.lines[end + 1:])
+
+    def test_stripping_the_hunks_removes_every_marker(self):
+        self.assertEqual(len(self.hunks), len(GX0002_HUNKS))
+        self.assertNotIn("fork(gx)", self.upstream)
+
+    def test_hunks_are_the_only_change_against_merged_upstream(self):
+        if set(re.findall(r"fork\(gx\): (GX-\d{4})", self.source)) != {GX0002}:
+            self.skipTest("build.zig carries other fork patches")
+        upstream, reason = merged_upstream_text(ROOT, BUILD_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        self.assertEqual(self.upstream, upstream)
+
+    def test_stripped_upstream_is_rejected(self):
+        problems = gx0002_problems(self.upstream)
+        self.assertTrue(any("found 0" in problem for problem in problems), problems)
+
+    def test_each_missing_hunk_is_rejected(self):
+        for index, (name, *_) in enumerate(GX0002_HUNKS):
+            with self.subTest(name):
+                problems = gx0002_problems(self.without_hunk(index))
+                self.assertTrue(any(p.startswith(f"{name}:") for p in problems), problems)
+
+    def test_install_directories_are_locked(self):
+        for old, new, name in (('"test/vt_c"', '"test/vt"', "libghostty-vt installs"),
+                               ('.custom = "test" }', '.custom = "bin" }', "ghostty-test install")):
+            with self.subTest(new):
+                problems = gx0002_problems(self.source.replace(old, new, 1))
+                self.assertTrue(any(p.startswith(f"{name}:") for p in problems), problems)
+
+    def test_step_must_depend_on_the_install(self):
+        broken = self.source.replace("test_bin_step.dependOn(&test_exe_bin_install.step);", "", 1)
+        problems = gx0002_problems(broken)
+        self.assertTrue(any(p.startswith("ghostty-test install:") for p in problems), problems)
+
+    def test_hunk_outside_its_block_is_rejected(self):
+        begin, end = self.hunks[1]
+        rest = self.lines[:begin] + self.lines[end + 1:]
+        at = next(i for i, line in enumerate(rest) if line.strip() == "// Zig module tests")
+        moved = "".join(rest[:at] + self.lines[begin:end + 1] + rest[at:])
+        problems = gx0002_problems(moved)
+        self.assertTrue(any("must sit between" in p for p in problems), problems)
+
+    def test_marker_outside_a_hunk_is_rejected(self):
+        problems = gx0002_problems(f"// {GX0002_MARKER} stray note\n" + self.source)
+        self.assertTrue(any("outside a begin/end hunk" in p for p in problems), problems)
+
+    def test_unclosed_hunk_is_rejected(self):
+        _, end = self.hunks[2]
+        problems = gx0002_problems("".join(self.lines[:end] + self.lines[end + 1:]))
+        self.assertTrue(any("never closed" in p for p in problems), problems)
+
+    def test_crlf_source_is_accepted(self):
+        crlf = self.source.replace("\n", "\r\n")
+        self.assertEqual(gx0002_problems(crlf), [])
+        self.assertEqual(marked_hunks(crlf, GX0002)[0].replace("\r\n", "\n"), self.upstream)
+
+
+class HunkTests(unittest.TestCase):
+    TEXT = ("a\n// fork(gx): GX-0002 begin: add b\nb\n// fork(gx): GX-0002 end\nc\n"
+            "// fork(gx): GX-0003 begin\nd\n// fork(gx): GX-0003 end\n")
+
+    def test_strips_only_the_requested_patch(self):
+        stripped, hunks = marked_hunks(self.TEXT, "GX-0002")
+        self.assertEqual(stripped, "a\nc\n// fork(gx): GX-0003 begin\nd\n// fork(gx): GX-0003 end\n")
+        self.assertEqual(hunks, [(1, 3)])
+        self.assertEqual(marked_hunks(self.TEXT, "GX-0003"), ("a\n// fork(gx): GX-0002 begin: add b\n"
+                                                             "b\n// fork(gx): GX-0002 end\nc\n", [(5, 7)]))
+
+    def test_crlf_line_endings_are_kept(self):
+        stripped, hunks = marked_hunks(self.TEXT.replace("\n", "\r\n"), "GX-0002")
+        self.assertEqual(stripped, marked_hunks(self.TEXT, "GX-0002")[0].replace("\n", "\r\n"))
+        self.assertEqual(hunks, [(1, 3)])
+
+    def test_malformed_hunks_are_rejected(self):
+        begin, end = "// fork(gx): GX-0002 begin\n", "// fork(gx): GX-0002 end\n"
+        cases = {
+            "never closed": begin,
+            "without a begin": end,
+            "inside the hunk": begin + begin + end + end,
+            "outside a begin/end hunk": "// fork(gx): GX-0002 one-line note\n",
+        }
+        for expected, text in cases.items():
+            with self.subTest(expected):
+                with self.assertRaisesRegex(ValueError, re.escape(expected)):
+                    marked_hunks(text, "GX-0002")
+
+    def test_squash_ignores_formatting_and_comments(self):
+        self.assertEqual(squash("f(.{\n    // note\n    .a = 1,\n});"), squash("f(.{ .a = 1 });"))
 
 
 REGISTRY_TEMPLATE = """# fork 补丁登记
@@ -389,6 +645,25 @@ class FixtureTests(unittest.TestCase):
         self.write("src/a.zig", "const a = 1;\n// fork(gx): GX-0001\n", newline="\r\n")
         self.assertEqual(check(self.root, ["src/a.zig"]), [])
         self.assertEqual(find_markers(self.root, ["src/a.zig"]), [("src/a.zig", 2, "GX-0001")])
+
+    def test_balanced_hunks_pass(self):
+        self.registry([("GX-0001", "build.zig", "active")])
+        self.write("build.zig", "const a = 1;\n// fork(gx): GX-0001 begin: add b\nconst b = 2;\n"
+                                "// fork(gx): GX-0001 end\n", newline="\r\n")
+        self.assertEqual(check(self.root, ["build.zig"]), [])
+
+    def test_unbalanced_hunks_are_reported(self):
+        self.registry([("GX-0001", "build.zig", "active")])
+        begin, end = "// fork(gx): GX-0001 begin\n", "// fork(gx): GX-0001 end\n"
+        cases = {
+            "build.zig:1: GX-0001 begin is never closed": begin + "const b = 2;\n",
+            "build.zig:2: GX-0001 end without a matching begin": "const b = 2;\n" + end,
+            "build.zig:2: GX-0001 begin inside the GX-0001 hunk opened on line 1": begin + begin + end,
+        }
+        for expected, text in cases.items():
+            with self.subTest(expected):
+                self.write("build.zig", text)
+                self.assertIn(expected, check(self.root, ["build.zig"]))
 
     def test_missing_registry_is_reported(self):
         self.assertEqual(check(self.root, []), [f"{REGISTRY} is missing"])

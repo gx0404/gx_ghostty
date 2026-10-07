@@ -74,6 +74,20 @@ pub fn build(b: *std.Build) !void {
         "test-lib-vt-build",
         "Build libghostty-vt tests without running them (compile check)",
     );
+    // fork(gx): GX-0002 begin: install test binaries without running them,
+    // so scripts/zig_test.py can shard them across processes.
+    const test_bin_step = b.step(
+        "test-bin",
+        "Install the ghostty-test binary to zig-out/test without running it (fork)",
+    );
+    const test_lib_vt_bin_step = b.step(
+        "test-lib-vt-bin",
+        "Install libghostty-vt test binaries to zig-out/test without running them (fork)",
+    );
+    if (config.emit_lib_vt) test_bin_step.dependOn(
+        &b.addFail("ghostty-test is not built with -Demit-lib-vt").step,
+    );
+    // fork(gx): GX-0002 end
     const test_lib_vt_schema_step = b.step(
         "test-lib-vt-schema",
         "Validate the libghostty-vt ABI type manifest",
@@ -373,6 +387,15 @@ pub fn build(b: *std.Build) !void {
         const mod_vt_c_test_run = b.addRunArtifact(mod_vt_c_test);
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
         test_lib_vt_build_step.dependOn(&mod_vt_c_test.step);
+        // fork(gx): GX-0002 begin: both binaries are named "test", so each
+        // module gets its own directory.
+        test_lib_vt_bin_step.dependOn(&b.addInstallArtifact(mod_vt_test, .{
+            .dest_dir = .{ .override = .{ .custom = "test/vt" } },
+        }).step);
+        test_lib_vt_bin_step.dependOn(&b.addInstallArtifact(mod_vt_c_test, .{
+            .dest_dir = .{ .override = .{ .custom = "test/vt_c" } },
+        }).step);
+        // fork(gx): GX-0002 end
     }
 
     // Tests (skip when building libghostty-vt)
@@ -397,6 +420,13 @@ pub fn build(b: *std.Build) !void {
             config.addPatchElf(test_exe, &test_exe_install.step);
             test_step.dependOn(&test_exe_install.step);
         }
+        // fork(gx): GX-0002 begin: same install as above, into zig-out/test.
+        const test_exe_bin_install = b.addInstallArtifact(test_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "test" } },
+        });
+        config.addPatchElf(test_exe, &test_exe_bin_install.step);
+        test_bin_step.dependOn(&test_exe_bin_install.step);
+        // fork(gx): GX-0002 end
         _ = try deps.add(test_exe);
 
         addGhosttyH(b, test_exe.root_module, config.baselineTarget(b.graph.io), .Debug);
