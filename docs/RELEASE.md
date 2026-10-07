@@ -145,12 +145,15 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 `gx-release` 不做签名、不公证、不生成 appcast、不上传 R2，只在 fork 的 GitHub Releases 发布 prerelease。`PACKAGING.md` 里的源码包地址与 minisign 公钥属于上游正式版本，不适用于 fork 资产；fork 资产以 `SHA256SUMS` 与 `manifest.json` 为准。
 
-## 待首跑确认（PENDING）
+## 首跑记录与仍待确认
 
-以下内容只能在 push 后的 GitHub Actions 上验证，首跑前一律记 PENDING（Actions 已启用；旧布局的 `gx-ci` 首跑已于 2026-10-07 全部通过，用时约 22 min；新布局首跑 run 37582059213 同日全部通过，用时约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过）：
+Actions 已启用，以下首跑结果都在 2026-10-07 取得：
 
-- `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存是否保留并在下一次运行命中（首跑时 `windows` 的 2.49 GB 超过当时的默认上限、被清空）；`lib-vt-cross` 按 target 分开的 `cache-key` 是否各自命中（首跑时六个目标各存了一份）。
-- `gx-ci` 手动触发的 `gtk-smoke`：`mlugg/setup-zig` 在 `debian:13` 容器内运行、Xvfb 下的软件渲染，以及截图 artifact 的读回。
-- `gx-release` 的第一次只构建运行：libghostty-vt 各目标的实际安装布局（尤其 Windows 的 DLL 位置与 musl 共享库）是否满足 `verify` 的必需文件检查，`distcheck` 在缓存移出检出目录后的行为，`setup-zig` 的 `use-cache` 输入，以及 libghostty-vt 源码包的实际大小（本机只能按工作树估算 `export-ignore` 生效后的体积）。
-- `macos=true` 时 macos-26 上的 Xcode 选择与 `Ghostty.app` 构建（macos-15 上已确认失败在 `CompileAssetCatalogVariant`，所以换了 runner）。
+- `gx-ci` push：旧布局首跑约 22 min；新布局首跑 run 37582059213 约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过。
+- `gx-ci` 手动触发（run 37587736223，打开 `gtk_smoke` 与 `macos`）全部通过：`gtk-smoke` 在 `debian:13` 容器里构建 ReleaseFast 的 GTK app，在 Xvfb 下用 Mesa 软件渲染（OpenGL 4.5）启动；截图已下载读回，窗口标题栏、标签与菜单按钮、bash 提示符和光标都正常绘制。`macos` job 在 macos-15 上 `zig build test-lib-vt` 通过。
+- `gx-release` 只构建运行（run 37589505152，`publish=false`、`macos=true`）全部通过：`verify` 校验了 12 个发布文件与 `SHA256SUMS`，包括 libghostty-vt 五个目标与 XCFramework、libghostty-vt 源码包、完整源码包、Linux GTK 包、未签名的 macOS app 和 `manifest.json`；libghostty-vt 源码包 4,518,520 字节，低于 5 MiB 上限。之前的 run 37587740223 里 `macos` job 在 macos-15 上失败，见上表 `macos` 行。
+
+仍待确认（PENDING）：
+
+- `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存能否稳定命中。第二次 push 运行时 `linux-main` 的构建从 419 s 降到 207 s，`linux-vt` 没有命中（推测与每次分到的 runner CPU 型号不同有关），`windows` 首跑缓存被清空，第二次仍从冷缓存开始；`lib-vt-cross` 按 target 分开的 `cache-key` 各存了一份，第二次运行各约 1 min。
 - 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。

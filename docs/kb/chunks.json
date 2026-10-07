@@ -2515,13 +2515,6 @@
    "text": "## 发版步骤\n\n1. **定版提交**：把最大版本的 `(TBD)` 改成当天日期，然后依次运行 `just graph`、`just kb`、`just generated-check`。定版的 CHANGELOG、重建后的 `graphify-out/` 与 `docs/kb/chunks.json` 一起提交为 `chore(release): 定版 X.Y.Z`。图谱或 KB 不新鲜时 prepare 会拒绝发版。提交后可在干净检出上运行 `python scripts/gx_release.py prepare`（Linux/macOS 用 `python3`）预演：它跑完四道发版门，并打印将使用的 SHA、tag 与版本串。\n2. **push**：由用户把 `gx_ghostty` push 到 `origin`，等 `gx-ci` 变绿。\n3. **构建验收**：Actions → gx-release → Run workflow。分支选 `gx_ghostty`，`ref` 保持默认 `gx_ghostty`（也可以填完整提交 SHA），`publish` 关闭，`macos` 按需。等价命令：`gh workflow run gx-release.yml --ref gx_ghostty -f ref=gx_ghostty -f publish=false -f macos=false`。跑完后从该运行的 Artifacts 下载 `verified-release` 检查产物（保留 14 天）。\n4. **发布**：同样的输入再运行一次，把 `publish` 打开。这次运行会从头重新构建，发布的是本次运行构建并校验过的产物，不复用第 3 步的 artifact。\n5. **开新版本**：在 `CHANGELOG.md` 顶部加下一个 `## X.Y.Z(TBD)` 标题，运行 `just kb`，把 CHANGELOG 与重建的 `docs/kb/chunks.json` 一起提交（KB 语料包含 CHANGELOG 开头，见「CHANGELOG 规则」）。\n\nagent 可以准备定版提交并在本地验证；push、运行 workflow 与发布由用户决定。不要手工创建 `gx-v*` tag 或 GitHub release，tag 只由 publish job 创建。"
   },
   {
-   "anchor": "版本与发布 > 待首跑确认（PENDING）",
-   "doc": "docs/RELEASE.md",
-   "id": "docs-release-md-版本与发布-待首跑确认-pending",
-   "source_sha256": "580d1659445abaebb4d8d18a0734b102967d29f7cf64cafc0a473176b534824e",
-   "text": "## 待首跑确认（PENDING）\n\n以下内容只能在 push 后的 GitHub Actions 上验证，首跑前一律记 PENDING（Actions 已启用；旧布局的 `gx-ci` 首跑已于 2026-10-07 全部通过，用时约 22 min；新布局首跑 run 37582059213 同日全部通过，用时约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过）：\n\n- `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存是否保留并在下一次运行命中（首跑时 `windows` 的 2.49 GB 超过当时的默认上限、被清空）；`lib-vt-cross` 按 target 分开的 `cache-key` 是否各自命中（首跑时六个目标各存了一份）。\n- `gx-ci` 手动触发的 `gtk-smoke`：`mlugg/setup-zig` 在 `debian:13` 容器内运行、Xvfb 下的软件渲染，以及截图 artifact 的读回。\n- `gx-release` 的第一次只构建运行：libghostty-vt 各目标的实际安装布局（尤其 Windows 的 DLL 位置与 musl 共享库）是否满足 `verify` 的必需文件检查，`distcheck` 在缓存移出检出目录后的行为，`setup-zig` 的 `use-cache` 输入，以及 libghostty-vt 源码包的实际大小（本机只能按工作树估算 `export-ignore` 生效后的体积）。\n- `macos=true` 时 macos-26 上的 Xcode 选择与 `Ghostty.app` 构建（macos-15 上已确认失败在 `CompileAssetCatalogVariant`，所以换了 runner）。\n- 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。"
-  },
-  {
    "anchor": "版本与发布 > 拒绝与回滚",
    "doc": "docs/RELEASE.md",
    "id": "docs-release-md-版本与发布-拒绝与回滚",
@@ -2555,6 +2548,13 @@
    "id": "docs-release-md-版本与发布-首次启用-手动步骤",
    "source_sha256": "1908787aea0da723f0f82b811acbc6df71ca7d61744f5c09282c644f26335296",
    "text": "## 首次启用（手动步骤）\n\n- **启用 Actions**：fork 默认不运行 workflow。在 fork 的 Actions 页面点击 “I understand my workflows, go ahead and enable them”，或在 Settings → Actions → General 允许运行。只读确认：`gh api repos/gx0404/gx_ghostty/actions/permissions`。\n- **默认分支**：`workflow_dispatch` 要求 workflow 文件在默认分支上，fork 的默认分支应为 `gx_ghostty`（本地 `refs/remotes/origin/HEAD` 记录的正是 `origin/gx_ghostty`）。\n- **权限**：仓库默认的 `GITHUB_TOKEN` 权限可以保持只读。`publish` 在 job 内显式申请 `contents: write`，其余 job 都是只读。不需要配置任何 secret。"
+  },
+  {
+   "anchor": "版本与发布 > 首跑记录与仍待确认",
+   "doc": "docs/RELEASE.md",
+   "id": "docs-release-md-版本与发布-首跑记录与仍待确认",
+   "source_sha256": "5d6538cd2920cda264d00c2d9cbceaf519ff0f24a48f2322c3827d0b303939da",
+   "text": "## 首跑记录与仍待确认\n\nActions 已启用，以下首跑结果都在 2026-10-07 取得：\n\n- `gx-ci` push：旧布局首跑约 22 min；新布局首跑 run 37582059213 约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过。\n- `gx-ci` 手动触发（run 37587736223，打开 `gtk_smoke` 与 `macos`）全部通过：`gtk-smoke` 在 `debian:13` 容器里构建 ReleaseFast 的 GTK app，在 Xvfb 下用 Mesa 软件渲染（OpenGL 4.5）启动；截图已下载读回，窗口标题栏、标签与菜单按钮、bash 提示符和光标都正常绘制。`macos` job 在 macos-15 上 `zig build test-lib-vt` 通过。\n- `gx-release` 只构建运行（run 37589505152，`publish=false`、`macos=true`）全部通过：`verify` 校验了 12 个发布文件与 `SHA256SUMS`，包括 libghostty-vt 五个目标与 XCFramework、libghostty-vt 源码包、完整源码包、Linux GTK 包、未签名的 macOS app 和 `manifest.json`；libghostty-vt 源码包 4,518,520 字节，低于 5 MiB 上限。之前的 run 37587740223 里 `macos` job 在 macos-15 上失败，见上表 `macos` 行。\n\n仍待确认（PENDING）：\n\n- `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存能否稳定命中。第二次 push 运行时 `linux-main` 的构建从 419 s 降到 207 s，`linux-vt` 没有命中（推测与每次分到的 runner CPU 型号不同有关），`windows` 首跑缓存被清空，第二次仍从冷缓存开始；`lib-vt-cross` 按 target 分开的 `cache-key` 各存了一份，第二次运行各约 1 min。\n- 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。"
   },
   {
    "anchor": "测试与证据（gx_ghostty）",
