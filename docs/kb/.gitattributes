@@ -1,0 +1,2 @@
+# Generated agent KB (just kb): keep it out of git archive source tarballs and GitHub source zips.
+chunks.json export-ignore

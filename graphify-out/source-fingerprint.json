@@ -1,0 +1,17 @@
+{
+  "artifacts": {
+    "GRAPH_REPORT.md": "a82616bf82a7942d4ca15a777170a494b2e661d174957a2df3d2c837ee821ace",
+    "graph.json": "ecbbbf38ad0780d948758f80bf4d9a71ef5197526346b9827638ab48cf4c48a1"
+  },
+  "index_root": ".",
+  "pipeline": {
+    ".graphifyignore": "ed445fa46ae1aebfd994cd125968205333ff00b101b38e22938e0abb2a9b0540",
+    "scripts/graphify.py": "e6c2f4431b7999aca7b68a9c09e8c42c5f40182fd12fd4cd9a1e8c0c3a293665",
+    "scripts/graphify_fingerprint.py": "174d0d7046af4637101e2066749642162dacb47746836dfcd8d99b38527b2614"
+  },
+  "schema_version": 1,
+  "source": {
+    "file_count": 993,
+    "sha256": "4f02ff6bff43fcbca6891b7b9f46764af6a78af23cb009ab252a65f6051bdeca"
+  }
+}
