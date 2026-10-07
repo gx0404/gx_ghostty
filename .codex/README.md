@@ -13,9 +13,11 @@ Codex 的项目配置面。规则入口是根 `AGENTS.md`（Codex 原生读取�
 
 已知边界：
 
-- 项目层配置只在 Codex 信任本项目后加载；非托管 hook 首次出现或内容变更后要在 `/hooks` 里审阅并信任，未信任前 Codex 会跳过它。
-- `apply_patch` 的 FILE 判定是尽力而为：共享门从补丁头（`*** Add File:`、`*** Update File:`、`*** Delete File:`、`*** Move to:`）提取路径。真实会话里 hook 是否以 `apply_patch` 触发、补丁文本放在哪个键里尚未实测；对不上时生成物的 shell 写入仍由 SHELL 段兜底。
-- 本目录的 `config.toml` 与 `hooks/` 属于安全门配置，Codex 用编辑工具或 shell 改它们一律被拒，由人工修改。
-- 离线已验证 Codex 0.160 接受 `command_windows` 键，`command_windows` 在 Windows PowerShell 5.1 与 PowerShell 7 下的行为也已验证。真实会话中 Codex 是否选用它、用哪个 PowerShell 执行，尚未实测（PENDING，见 `docs/AI_TOOLS.md`）。
+- 项目层配置只在 Codex 信任本项目后加载；非托管 hook 首次出现或内容变更后要由人类在 `/hooks` 里审阅并信任当前 hash，未信任前 Codex 会跳过它。离线脚本失败关闭不保证未加载或未信任的客户端也能拦截；保留现有 sandbox、model 与审批配置，不通过改权限掩盖漏拦。
+- `apply_patch` 的 FILE 判定是尽力而为：共享门从补丁头（`*** Add File:`、`*** Update File:`、`*** Delete File:`、`*** Move to:`）提取路径。真实会话里的 FILE 拦截仍未实测；SHELL 段也只有在 hook 确实加载、受信任且收到匹配调用时才参与判定。
+- 本目录的 `config.toml` 与 `hooks/` 属于安全门配置，策略要求拒绝 Codex 用编辑工具或 shell 改它们；不得把这项策略当成已验证的客户端保障。
+- 2026-10-07，Codex 0.160.0 的 `codex exec --strict-config --ephemeral` 短真实调用 exit 0，根 `AGENTS.md` 自动注入 PASS；项目层实际生效 PENDING。启动头的 `read-only` 是 `exec` 默认值，不能单凭它判断项目配置未加载。
+- 同次真实 shell 探针 FAIL：`gh pr create --help` 进入 gh 后因 gh 配置 `Access denied` 退出 1，`git clean -n -d` 实际执行、exit 0，均没有预期的 hook deny。`git status` 成功与 `codex features list` 的 `hooks=true` 都不证明 hook 参与。[官方文档](https://developers.openai.com/codex/hooks/)说明 `exec_command` 也匹配 `Bash`，当前 matcher 正确；具体漏拦原因 PENDING。
+- 离线已验证 `command_windows` 的解析以及 Windows PowerShell 5.1、PowerShell 7 的脚本行为；真实会话是否选用它、项目与当前 hook hash 的信任流程仍待补验。由人类用 `/debug-config`、`/hooks` 只读核对配置来源和加载状态，再决定是否信任并重跑安全探针；agent 不自动 trust，不读取私有配置或会话，不使用 `config/read` 全层 RPC。完整账本见 `docs/AI_TOOLS.md`。
 
 改 hook 或配置后运行 `python -m unittest scripts.test_ai_tool_hooks`；各客户端的验证状态见 `docs/AI_TOOLS.md`。

@@ -20,6 +20,8 @@
 
 ## 共享安全门（PreToolUse）
 
+以下描述的是策略与适配器在**已加载、受信任且确实收到调用**时的判定，不是所有客户端的无条件保障。离线 fail-closed 不能覆盖未加载或未信任的 hook；真实客户端状态单列在验证账本，Codex 本次 shell 拦截探针为 FAIL。权限基线不因这些离线结果而自动变得安全。
+
 ### 策略
 
 `dangerous_patterns.conf` 每行 `SECTION<TAB>regex<TAB>理由<TAB>deny|ask`：
@@ -85,7 +87,7 @@ git 与 gh 的全局选项用无歧义的 `--?\w[\w-]*` 逐个跳过。旧写法
 
 Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `apply_patch` 的 `tool_input` 里任一字符串值提取补丁头 `*** Add File:`、`*** Update File:`、`*** Delete File:`、`*** Move to:` 之后的路径，再套 FILE 规则；Bash 命令调用 `apply_patch`（例如 heredoc 形式）时同样提取。Write、Edit 写入的正文不解析，文档里的补丁示例不会误拦。
 
-这是尽力而为的覆盖：离线探针已覆盖补丁头的各种写法，但 Codex 真实会话里 hook 收到的 `tool_name` 是否就是 `apply_patch`、补丁文本放在哪个键里，都未实测（PENDING）。对不上时 FILE 规则不生效，生成物仍由 SHELL 段的重定向与写入规则兜底。
+这是尽力而为的覆盖：离线探针已覆盖补丁头的各种写法，但 Codex 真实会话里 hook 收到的 `tool_name` 是否就是 `apply_patch`、补丁文本放在哪个键里，都未实测（PENDING）。对不上时 FILE 规则不生效；SHELL 段也只能在 hook 已加载、受信任且实际收到相应命令时判定，不能视为客户端漏载时的备用保障。
 
 ### 失败关闭与协议
 
@@ -115,7 +117,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
   - 不写 `Write(...)` 路径规则：Claude Code 只按 `Read(...)`/`Edit(...)` 判定文件权限，`Edit` 规则同时覆盖 Write 与 NotebookEdit。
   - reviewer 的 `permissionMode` 会被主会话的 acceptEdits 覆盖，所以只读边界靠工具白名单（Read、Grep、Glob、Bash）与 `disallowedTools`。
 - **Codex**：
-  - `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，是用户授权的基线，与 wezterm、herdr 两个 fork 一致；破坏性操作由安全门兜底。
+  - `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，是用户授权的既有基线，与 wezterm、herdr 两个 fork 一致，本轮不改 sandbox、model 或审批权限。它不自带破坏性操作保障；安全门只有在项目配置已加载、当前 hook hash 已受信任且调用确实经过它时才参与判定，当前真实拦截为 FAIL。
   - `[shell_environment_policy]` 继承全部环境变量，但排除 `*KEY*`、`*SECRET*`、`*TOKEN*`、`*PASSWORD*`。
   - reviewer 用 `config_file` 注册，`sandbox_mode = "read-only"`。
   - 项目层配置只在 Codex 信任本项目后加载；非托管 hook 首次出现或内容变更后，要在 `/hooks` 里审阅并信任，否则会被跳过。
@@ -124,7 +126,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 
 ## Kimi Code
 
-- **规则**：读根 `AGENTS.md`。搭建本框架的 Kimi Code 会话启动时注入了根 `AGENTS.md`（当时只有上游原文），文件落盘变化后会提示重读。
+- **规则**：会话启动时注入根 `AGENTS.md`，文件落盘变化后提示重读。2026-10-07 用 Kimi Code 2.1.1 新会话确认 fork 段也自动注入；在任何工具调用前已复述三条 fork 规则，证据见验证账本。
 - **skills**：按[官方文档](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/skills.html)，项目级扫描 `.kimi-code/skills/` 与 `.agents/skills/`，用户级扫描 `$KIMI_CODE_HOME/skills/` 与 `~/.agents/skills/`。
   - 本仓 `.agents/skills/writing-commit-messages` 是上游 skill，格式为 `<subsystem>: <summary>`。Kimi Code 与 Codex 都会发现它，本会话的项目 skill 列表里就有它；Claude Code 不读取 `.agents/`。
   - 提交信息一律按根 `AGENTS.md`「提交规范」的 `type(scope): 中文描述`，fork 规则优先；该 skill 只用于准备回馈上游的提交。
@@ -164,16 +166,24 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 | 适配器完整性（python3 调用的文件过 `ast.parse`，bash 调用的文件过 `bash -n`） | PASS | PASS | N/A | PASS |
 | 规则提醒 `paths` 的每个 glob 命中 Git 可见文件 | PASS | N/A | N/A | N/A |
 | 本机客户端 | PENDING（未安装 claude） | PASS（`codex --version`：codex-cli 0.160.0） | PASS（`kimi --version`：2.1.1） | PENDING（未安装 zcode） |
-| 严格配置解析（真实启动） | PENDING | PENDING（见下注） | N/A | PENDING |
-| 新会话加载规则入口 | PENDING | PENDING | PENDING（fork 段需新会话确认） | PENDING |
-| 真实会话中 hook 拦截与信任流程 | PENDING | PENDING（含 `apply_patch` 是否触发 hook） | N/A（无项目级 hooks） | PENDING |
+| 严格配置解析（真实启动） | PENDING | PASS（0.160.0，`codex exec --strict-config --ephemeral` 短真实调用 exit 0；不代证项目层实际生效） | N/A | PENDING |
+| 新会话加载规则入口 | PENDING | PASS（0.160.0，根 `AGENTS.md` 自动注入） | PASS（2.1.1，工具调用前已复述 fork 三条规则） | PENDING |
+| 项目层配置实际生效 | PENDING | PENDING（项目层是否受信任并被加载尚未确认） | N/A（无项目配置） | PENDING |
+| 真实会话中 shell hook 拦截 | PENDING | FAIL（两条安全探针均未出现预期 deny，见下文） | N/A（无项目级 hooks） | PENDING |
+| 信任流程与真实 `apply_patch` hook | PENDING | PENDING（未修改信任状态；FILE 探针未完成） | PENDING（新会话信任流程未测） | PENDING |
 | MCP | N/A（本仓无项目级 MCP） | N/A | N/A | N/A |
 
-注：`codex --strict-config --version` 在仓库根输出 `codex-cli 0.160.0`、exit 0，但附加无效的 `-c` 覆盖时同样 exit 0，说明 `--version` 不加载配置，不能代证严格解析；`codex features`、`codex mcp` 不接受 `--strict-config`。真正的严格解析只能在启动会话时验证。
+2026-10-07 的真实客户端补证：
 
-PENDING 的补验方式：在对应客户端里从仓库根开新会话，然后依次确认：
+- **Kimi Code 2.1.1**：用 `kimi --output-format stream-json -p <短只读提示>` 开新会话，在任何工具调用前答出中文提交规范、Zig 必须经 `scripts/zigw.py`、Windows 只有 lib-vt 三条 fork 规则；唯一工具调用为 `git --no-optional-locks status --short --branch`，exit 0，没有通过 Read 临时补读规则。这证明新会话自动注入，不证明信任流程或 hooks。
+- **Codex 0.160.0**：`codex exec --strict-config --ephemeral <短提示>` 的真实调用 exit 0，新会话自动注入根 `AGENTS.md`。启动头显示 `read-only`，但 `exec` 默认即为只读，不能据此判定项目配置未加载；项目层实际生效仍为 PENDING。`codex --strict-config --version` 不加载配置，不能代替本次真实调用。
+- **Codex 拦截失败**：`gh pr create --help` 实际进入 gh，因 gh 配置访问 `Access denied` 退出 1，而不是 hook deny；`git clean -n -d` 实际执行、exit 0。两项预期拒绝断言均为 FAIL；`git status` 成功也不能代证 hook 参与。`codex features list` 显示 `hooks=true`，但功能开关开启不证明项目 hook 已加载或受信任。
+- [Codex 官方 hooks 文档](https://developers.openai.com/codex/hooks/)明确 `exec_command` 也匹配 `Bash`，当前 `^(Bash|apply_patch)$` matcher 无须因此改名。项目受信任与当前 hook hash 被单独信任是前提，漏拦的具体原因仍为 PENDING，不能归因于 matcher、PowerShell 或配置层中的某一项。
+- `command -v claude` 与 `command -v zcode` 均 exit 1，客户端未安装；离线适配器测试不能把它们的真实会话状态改成 PASS。
 
-1. 规则入口：Claude Code 用 `/context` 或 `/memory` 确认 `CLAUDE.md` 与导入的 `AGENTS.md` 已加载；其他客户端直接问它根 `AGENTS.md` 的 fork 段讲了什么。Codex 与 Claude Code 还要先接受项目信任，Codex 在 `/hooks` 里信任 PreToolUse hook。
+补验方式：由人类在对应客户端里从仓库根开新会话，先做只读检查，不由 agent 自动授予信任：
+
+1. 规则入口：Claude Code 用 `/context` 或 `/memory` 确认 `CLAUDE.md` 与导入的 `AGENTS.md` 已加载；其他客户端先复述 fork 规则再调用工具。Codex 用 `/debug-config` 查看项目配置来源与有效值，用 `/hooks` 只读检查 hook 加载状态及当前 hash 的信任状态。是否信任项目或 hook 由人类决定；不读取私有配置、会话文件，也不使用 `config/read` 全层 RPC。
 2. 拦截：让 agent 执行 `gh pr create --help`，应被 deny；这条命令即使漏拦也只会打印帮助。
 3. ask：执行 `git clean -n -d`，Claude Code 与 ZCode 应弹出确认，Codex 应被 deny；`-n` 让它即使漏拦也只是演练。
 4. FILE：Claude Code 与 ZCode 写 `graphify-out/__probe__.txt`，Codex 用 `apply_patch` 新增同一文件，都应被 deny；该目录已被忽略，漏拦也无害。

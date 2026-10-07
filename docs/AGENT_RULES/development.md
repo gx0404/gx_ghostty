@@ -39,7 +39,7 @@
 
 - `.claude/`、`.codex/`、`.zcode/` 只把 `.gitignore` fork 段白名单列出的无凭据配置入库（settings / config、hooks、rules、reviewer、README），会话、认证与本机覆盖留在本机；`.kimi-code/` 整目录忽略；`.agents/` 是上游内容，原样保留且不忽略。
 - 危险模式只改 `dangerous_patterns.conf` 一处，适配器不内嵌副本；工具规则文件、reviewer 定义与 `CLAUDE.md` 只提醒运行 resolver，不复制领域正文。hook 是安全门，不加载规则，也不静默改写源码。
-- 客户端是否生效以 `docs/AI_TOOLS.md` 的验证账本为准：配置能解析不等于会话已加载，未实测的记 PENDING。
+- 客户端状态见 `docs/AI_TOOLS.md`：规则注入、配置加载、拦截与信任分开验收；离线 fail-closed、`hooks=true` 或 `git status` 不能代证拦截。下文「hook 拒绝」以实际加载、受信任并收到调用为前提。人类用 `/debug-config`、`/hooks` 只读检查项目与当前 hook hash；agent 不自动 trust、不读私有配置/会话、不用 `config/read` 全层 RPC，不改 sandbox、model 或审批权限掩盖漏拦。
 - `GX_GATE_WATCHDOG_SECONDS` 只给测试缩短 hook 求值看门狗（`.claude/hooks/pre_tool_use_gate.py::evaluation_deadline` 只认 (0, 10] 秒）；不写进 hook 配置或会话环境，否则 hook 提前超时并按拒绝处理。
 
 ### 脚本约定
@@ -55,7 +55,7 @@
 - `justfile` 在 Windows 经 `cmd.exe` 执行（`set windows-shell`），解释器在 Windows 取 `python`、其余取 `python3`；配方体只写单条命令（Python 脚本调用，`install-hooks` 是 `git config`），串联的门用配方依赖表达，不写 POSIX 守卫或多行 shell。`.githooks/commit-msg` 必须以可执行模式入库（`git add --chmod=+x`），由提交规范测试锁定。默认配方 `just --list`。上游 `Makefile` 不改，也不作 fork 入口。
 - `just framework-check`：rules-check → version-check → framework-test → kb-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
 - `just generated-check`：kb-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑同样两项检查。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
-- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含 Windows 编不出的完整单测），需要钉版 Zig；热缓存约 100 s，改过 Zig 源码另加约 2 min 编译。
+- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含 Windows 编不出的完整单测），需要钉版 Zig；本机热缓存实测约 100 s，改过 Zig 源码另加约 2 min 编译。「所有测试 ≤2 min」尚未完全达成，不得自行排除冷编译或用本机结果代证 CI，详见 `docs/TESTING.md`。
 - `just doctor`：`setup_env.py --check` 只读诊断，标 FOUND / MISSING / OPTIONAL；必需项是 zig、python、git、venv、graphify 与 Windows 上的 MSVC，缺任一项退出 1；hooksPath、Windows 符号链接权限（`symlink`）与 codex / claude / kimi / zcode 等 CLI 只作可选项报告。它只报告并给出修复命令，不隐式安装。配方参数不加引号拼进 cmd 命令行，含 shell 元字符的自由文本改为直接调用脚本。
 
 ### 工具链本地性

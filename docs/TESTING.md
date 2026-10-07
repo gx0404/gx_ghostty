@@ -36,7 +36,7 @@
 
 ## 并行运行器与耗时
 
-目标：热缓存下本机全量测试（Windows 上即 `just ci-check`）不超过 2 分钟；改过 Zig 源码时多出的约 2 分钟编译不在此列，原因见下。命令参数与退出码见 MAKE_COMMANDS.md。
+用户要求所有测试不超过 2 分钟；本机热缓存曾测得 95–110 s，但不保证每轮达标：后续包含 544 个框架测试的 `just ci-check` 实测 133.52 s（框架 12.79 s，test-vt 118.0 s，其中构建 1.5 s），退出 0、6593 条 Zig 用例通过、62 条跳过，性能要求未达成。冷编译、源码变更后的重编译与完整 CI 同样尚未达成要求。不能排除编译耗时或缩小覆盖后宣布目标完成。下列历史热缓存结果只说明其声明条件下的耗时，命令参数与退出码见 MAKE_COMMANDS.md。
 
 **原理**：上游 `zig build test-lib-vt` 与 `zig build test` 让每个测试二进制在一个进程里逐条运行，多核基本闲置。fork 补丁 GX-0002 新增只编译、安装而不运行的步骤 `test-lib-vt-bin` 与 `test-bin`（见 FORK_PATCHES.md），`scripts/zig_test.py` 再按 Zig 测试运行器的 server 协议（`--listen=-`：先 `query_test_metadata` 取用例名，再逐条 `run_test`）把用例分到多个进程。全部用例排成一张任务表，按 `.local/test-timings/<label>.json`（`GX_ZIG_TEST_TIMINGS_DIR` 可换目录）从长到短分给 `--jobs` 个工作线程，每个线程对每个二进制复用一个测试进程；没有记录的用例按 0.1 s 估计，删掉缓存只改变调度顺序，不改变结论。每轮运行后把实测并入缓存；只有本轮由 `--suite` 构建、且 `-D` 与 `--zig-arg` 里都没有 `-Dtest-filter` 的完整二进制，才顺带删去二进制里已不存在的用例，`--no-build`、`--binary` 与带 `-Dtest-filter` 的运行只合并不删。用例崩溃或超时（单条默认 600 s）后，运行器为剩余用例重启进程。超时、崩溃与中断时，运行器在 POSIX 上杀掉测试进程所在的整个进程组，Windows 上在超时与中断时杀掉整个进程树；中断指 Ctrl+C，POSIX 上还包括 SIGTERM、SIGHUP，清理后退出 130（`scripts/run_unittests.py` 对 SIGTERM、SIGHUP 的处理相同）。
 
@@ -56,11 +56,25 @@
 - **下限**：各用例耗时合计约 1600 s（20 路并行下测得），1600 / 20 ≈ 80 s，所以 80 s 已接近 20 核的下限；最慢的单条用例 `terminal.Terminal.test.Terminal: printSlice differential fuzz vs print` 本机约 45–58 s，核数再多也快不过它。笔记本 CPU 连续满载后会降频：上表第二次紧接着第一次运行，test-vt 多花了约 10 s；本机同时有其他重负载时，全量可能超过 2 分钟。
 - **`--dedupe`** 是覆盖取舍：vt_c 是同一模块以 `c_abi = true` 编译的测试二进制，同名用例在 C ABI 打开时再跑一遍，另有只在它里面的 `terminal.c.*`；去重后少了 C ABI 打开时的那一遍。默认关闭；用了就在结论里写明。
 - **编译**：改过 Zig 源码后，`ghostty-vt`、`ghostty-vt-c` 两个 Debug 测试二进制都要用 LLVM 重新编译，两次编译并行，各约 2 min、约 6 GB 内存（RSS）。这段时间运行器省不掉：试过 Zig 自托管后端，它在 Windows 上编出的测试二进制无法运行。没改 Zig 源码时，`test-lib-vt-bin` 只做 1 秒内的缓存校验；运行器给测试构建钉 `-Dversion-string=<X.Y.Z>-dev+0000000`，否则版本串随提交哈希变化，每次提交都会让测试二进制整体重编。
-- **CI**：`gx-ci` 的托管 runner 只有 4 个 vCPU，LLVM 编译测试二进制本身就要数分钟，用例也只能分 4 路，CI 达不到本机约 2 分钟的水平。旧布局首次运行墙钟约 22 min（旧 `linux` job 21.5 min、`windows` 19 min）。新布局把 Linux 拆成并行的 `linux-vt` 与 `linux-main` 并改用运行器，2026-10-07 首次运行（run 37582059213，冷缓存、没有耗时记录）墙钟约 14.4 min：`linux-vt` 9.5 min（构建 91 s，6651 条用例 429 s）、`linux-main` 12.8 min（构建 419 s，3909 条用例 330 s）、`windows` 13.9 min（构建 304 s，6655 条用例 323 s），`lib-vt-cross` 各 1.3–2.7 min。缓存：`mlugg/setup-zig` 跨运行保存 Zig 缓存目录，目录超过 `cache-size-limit`（默认 2048 MiB）时会被清空。旧 `linux` job 的缓存目录约 2.99 GB，每次都被清空，Linux 从未命中热缓存；新布局首次运行时 `linux-main` 1.51 GB、`linux-vt` 1.84 GB、`windows` 2.49 GB（超过默认上限、被清空），所以三个测试 job 都设 `cache-size-limit: 4096`（MiB），`lib-vt-cross` 矩阵按 target 各用自己的 `cache-key`，免得六个目标共用一份缓存；这三个 job 还设 `GX_ZIG_TEST_TIMINGS_DIR=.zig-cache/gx-test-timings`，让运行器的耗时缓存随 Zig 缓存一起保存（否则 CI 每次都没有耗时记录，最慢的用例可能排到最后才开始）。热缓存的效果要看之后的运行，记 PENDING。
+- **CI**：`gx-ci` 的托管 runner 只有 4 个 vCPU，LLVM 编译测试二进制本身就要数分钟，用例也只能分 4 路，已测 CI 未达到 2 分钟。旧布局首次运行墙钟约 22 min（旧 `linux` job 21.5 min、`windows` 19 min）。新布局把 Linux 拆成并行的 `linux-vt` 与 `linux-main` 并改用运行器，2026-10-07 首次运行（run 37582059213，冷缓存、没有耗时记录）墙钟约 14.4 min：`linux-vt` 9.5 min（构建 91 s，6651 条用例 429 s）、`linux-main` 12.8 min（构建 419 s，3909 条用例 330 s）、`windows` 13.9 min（构建 304 s，6655 条用例 323 s），`lib-vt-cross` 各 1.3–2.7 min。
+
+### CI 缓存诊断
+
+`mlugg/setup-zig` 跨运行保存的 Zig 缓存目录超过 `cache-size-limit` 就被清空。旧 `linux` job 约 2.99 GB 超过默认 2048 MiB；三个测试 job 提高到 4096 MiB 后仍有失效：2026-10-07 run 37587736223 的 `linux-vt` 最终为 **5,078,327,232 字节**，超过 4096 MiB 被清空，下一轮恢复的只有 **186 字节**。不能把恢复步骤成功视为有效热缓存命中。
+
+钉版 translate-c 源码已证实 `--zig-lib` 参数的路径直接进入 hash，`setup-zig` 每轮随机解压路径因而会改变输入；CPU 型号切换对此次失效的影响仍是猜测，不写成根因。当前实现与补验边界：
+
+- `linux-vt`、`linux-main`、`windows` 的 setup-zig 均设 `use-tool-cache: true`，以固定工具链路径减少路径变体，并用 `cache-key: stable-toolchain-v1` 隔离旧变体；不删除旧 cache，4096 MiB 上限不变。`lib-vt-cross` 仍按 target 分 key。
+- 三个测试 job 的 `GX_ZIG_TEST_TIMINGS_DIR=.zig-cache/gx-test-timings` 让调度记录随 Zig 缓存保存；只有真正恢复到有效记录，才可按上轮耗时调度。构建增加 `--summary all`（经运行器 `--zig-arg` 透传），从日志区分缓存命中和实际编译。
+- `scripts/ci_cache.py snapshot` 在 restored 与 finished 两阶段按白名单记录 CPU 型号/核数、Zig 可执行文件与库路径、local/global cache 总量及顶层分区大小、timings 条数；不导出完整环境变量或文件内容。报告里的不完整扫描或错误不能当作完整统计。
+- 手动输入 `cache_probe` 默认 false，只有 `workflow_dispatch` 且为 true 时才在同一 runner 重复相同套件的安装构建（main 保留 `-Dapp-runtime=none`），不重复运行用例；普通 push/PR 不增加这次编译。probe JSON 记录命令、耗时与退出码，详细构建 summary 在 job 日志。
+- `gx-zig-test-<job>` 以 `always()` 上传测试 JSON、`cache-restored.json`、`cache-finished.json` 和启用探针时的 `cache-probe.json`，保留 14 天。finished 快照在 setup-zig 的 action post 之前，只反映保存前状态；还要检查 post 日志是否超限清空、下一轮 restored 是否恢复了有效数据。
+
+**PENDING**：上述新实现尚未跑真实 CI。补验需一次手动 `gx-ci`（`cache_probe=true`）读回三个 job 的报告与构建 summary，再对照后续运行的 restored、post 日志和总墙钟；同 runner 复建命中不能代证跨运行命中，也不能预告全 CI 两分钟。不得通过删用例、默认去重或收窄覆盖来满足时间目标。
 
 ## CI 覆盖与本机对应
 
-`gx-ci.yml` 的触发：push 到 `gx_ghostty`、目标为 `gx_ghostty` 的 PR，以及手动 `workflow_dispatch`（可选输入 `gtk_smoke`、`macos`）。全局只有 `contents: read` 权限；同一 PR 的新运行会取消旧运行，push 与手动运行互不取消（每次 push 的提交标题都要校验）。`framework` 与 `zig-fmt` 并行先跑，其余 job 都等它们通过。CI 用 `mlugg/setup-zig` 把 Zig 放到 PATH 上：直接写的 `zig build …` 用它；两个运行器经 `scripts/zigw.py` 调用 Zig，zigw 在没有钉版目录时回退到 PATH 上的同一个 Zig（版本仍须等于 `scripts/setup_zig.py::ZIG_VERSION`）。
+`gx-ci.yml` 的触发：push 到 `gx_ghostty`、目标为 `gx_ghostty` 的 PR，以及手动 `workflow_dispatch`（可选输入 `gtk_smoke`、`macos`、`cache_probe`，均默认 false）。全局只有 `contents: read` 权限；同一 PR 的新运行会取消旧运行，push 与手动运行互不取消（每次 push 的提交标题都要校验）。`framework` 与 `zig-fmt` 并行先跑，其余 job 都等它们通过。CI 用 `mlugg/setup-zig` 把 Zig 放到 PATH 上：直接写的 `zig build …` 用它；两个运行器经 `scripts/zigw.py` 调用 Zig，zigw 在没有钉版目录时回退到 PATH 上的同一个 Zig（版本仍须等于 `scripts/setup_zig.py::ZIG_VERSION`）。
 
 | job | 何时运行 | 内容 | 本机对应 |
 |---|---|---|---|
@@ -73,7 +87,7 @@
 | `gtk-smoke` | 仅手动触发且 `gtk_smoke` 为真 | debian:13 容器构建 GTK app，`xvfb-run` 截图，上传证据 artifact（保留 14 天） | 无，本机记 PENDING |
 | `macos` | 仅手动触发且 `macos` 为真 | macos-15 上 `zig build test-lib-vt` | 无，本机记 PENDING |
 
-`linux-vt`、`linux-main`、`windows` 三个测试 job 给运行器加 `--json "$RUNNER_TEMP/gx-zig-test/<job>.json"`；job 失败时把它上传为 artifact `gx-zig-test-<job>`（保留 14 天），里面有失败用例的全名、stderr 与本轮 seed；job 日志里还有运行器打印的完整复现命令（带着该 job 的 `--suite` 与 `-D`），在能编译该套件的本机上原样执行即可。
+`linux-vt`、`linux-main`、`windows` 三个测试 job 给运行器加 `--json "$RUNNER_TEMP/gx-zig-test/<job>.json"` 与 `--zig-arg=--summary --zig-arg=all`；成功或失败都以 `always()` 上传 artifact `gx-zig-test-<job>`（保留 14 天）。测试 JSON 含失败用例全名、stderr 与本轮 seed，缓存快照及可选复建报告也在同一目录，见「CI 缓存诊断」。job 日志还有运行器打印的完整复现命令（带该 job 的 `--suite` 与 `-D`），在能编译该套件的本机上原样执行即可。
 
 `gx-release.yml` 只能手动触发。它的 prepare 阶段强制 resolver `--check`、version `--check`、kb-check 与 graph-check，图谱或 KB 过期就拒绝发版；构建矩阵与发布步骤见 RELEASE.md。上游 15 个 workflow 原样归档在 `.github/workflows-archive/`，不会被触发，它们多数依赖上游专用的 namespace runner。
 

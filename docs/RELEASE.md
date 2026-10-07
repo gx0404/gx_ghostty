@@ -149,11 +149,11 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 Actions 已启用，以下首跑结果都在 2026-10-07 取得：
 
-- `gx-ci` push：旧布局首跑约 22 min；新布局首跑 run 37582059213 约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过。
+- `gx-ci` push：旧布局首跑约 22 min；新布局首跑 run 37582059213 约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过。文档提交 `8d46309d8` 的 push run 37592253122 也已 success；这些历史结果不覆盖本轮尚未运行的缓存新实现。
 - `gx-ci` 手动触发（run 37587736223，打开 `gtk_smoke` 与 `macos`）全部通过：`gtk-smoke` 在 `debian:13` 容器里构建 ReleaseFast 的 GTK app，在 Xvfb 下用 Mesa 软件渲染（OpenGL 4.5）启动；截图已下载读回，窗口标题栏、标签与菜单按钮、bash 提示符和光标都正常绘制。`macos` job 在 macos-15 上 `zig build test-lib-vt` 通过。
 - `gx-release` 只构建运行（run 37589505152，`publish=false`、`macos=true`）全部通过：`verify` 校验了 12 个发布文件与 `SHA256SUMS`，包括 libghostty-vt 五个目标与 XCFramework、libghostty-vt 源码包、完整源码包、Linux GTK 包、未签名的 macOS app 和 `manifest.json`；libghostty-vt 源码包 4,518,520 字节，低于 5 MiB 上限。之前的 run 37587740223 里 `macos` job 在 macos-15 上失败，见上表 `macos` 行。
 
 仍待确认（PENDING）：
 
-- `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存能否稳定命中。第二次 push 运行时 `linux-main` 的构建从 419 s 降到 207 s，`linux-vt` 没有命中（推测与每次分到的 runner CPU 型号不同有关），`windows` 首跑缓存被清空，第二次仍从冷缓存开始；`lib-vt-cross` 按 target 分开的 `cache-key` 各存了一份，第二次运行各约 1 min。
-- 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。
+- `gx-ci` 的热缓存：2026-10-07 run 37587736223 的 `linux-vt` 缓存达到 5,078,327,232 字节，超过 4096 MiB 后被清空，下一轮恢复的缓存仅 186 字节。钉版 translate-c 源码已证实 `--zig-lib` 路径直接进入 hash，因此 `setup-zig` 的随机解压路径会改变该输入；runner CPU 切换是否造成此次失效仍只是猜测。当前三个测试 job 改用 `use-tool-cache: true` 与 `cache-key: stable-toolchain-v1`，固定工具链路径并隔离旧变体，不删除旧缓存、不提高 4096 MiB 上限；新增缓存快照与可选 `cache_probe` 的补验办法见 [TESTING.md](TESTING.md)「CI 缓存诊断」。新实现尚未在真实 CI 跑过，不能宣称缓存稳定或全 CI 已达两分钟。
+- 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。本轮未公开发布，也不为补验触发发布。

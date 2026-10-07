@@ -31,16 +31,18 @@ CI_TIMEOUTS = {
 }
 # Jobs that run the sharded Zig test runner; each writes its --json report into $RUNNER_TEMP/gx-zig-test/.
 ZIG_TEST_COMMANDS = {
-    "linux-vt": 'python3 scripts/zig_test.py --suite vt --json "$RUNNER_TEMP/gx-zig-test/linux-vt.json"',
-    "linux-main": 'python3 scripts/zig_test.py --suite main -Dapp-runtime=none '
+    "linux-vt": 'python3 scripts/zig_test.py --suite vt --zig-arg=--summary --zig-arg=all '
+                '--json "$RUNNER_TEMP/gx-zig-test/linux-vt.json"',
+    "linux-main": 'python3 scripts/zig_test.py --suite main -Dapp-runtime=none --zig-arg=--summary --zig-arg=all '
                   '--json "$RUNNER_TEMP/gx-zig-test/linux-main.json"',
-    "windows": 'python scripts/zig_test.py --suite vt --json "$env:RUNNER_TEMP/gx-zig-test/windows.json"',
+    "windows": 'python scripts/zig_test.py --suite vt --zig-arg=--summary --zig-arg=all '
+               '--json "$env:RUNNER_TEMP/gx-zig-test/windows.json"',
 }
 # The only mlugg/setup-zig inputs in gx-ci; no job sets version, so every job installs minimum_zig_version.
 SETUP_ZIG_INPUTS = {
-    "linux-vt": {"cache-size-limit": "4096"},
-    "linux-main": {"cache-size-limit": "4096"},
-    "windows": {"cache-size-limit": "4096"},
+    "linux-vt": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
+    "linux-main": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
+    "windows": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
     "lib-vt-cross": {"cache-key": "${{ matrix.target }}"},
 }
 RELEASE_JOBS = {"prepare", "source", "libvt", "libvt-macos", "linux-gtk", "macos", "verify", "publish"}
@@ -311,9 +313,10 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(field(on, "branches", 4), "[gx_ghostty]")
         self.assertEqual(sum(line == "    branches: [gx_ghostty]" for line in on), 2)
         inputs = block(on, on.index("    inputs:"), 4)
-        self.assertEqual([line.strip() for line in inputs if indent_of(line) == 6], ["gtk_smoke:", "macos:"])
-        self.assertEqual(sum(line.strip() == "type: boolean" for line in inputs), 2)
-        self.assertEqual(sum(line.strip() == "default: false" for line in inputs), 2)
+        self.assertEqual([line.strip() for line in inputs if indent_of(line) == 6], ["gtk_smoke:", "macos:", "cache_probe:"])
+        for name in ("gtk_smoke", "macos", "cache_probe"):
+            self.assertEqual(mapping(inputs, name, 6)["type"], "boolean")
+            self.assertEqual(mapping(inputs, name, 6)["default"], "false")
 
     def test_only_pull_requests_cancel_superseded_runs(self):
         # Every push run must finish: its framework job is the only check of that push's before..after subjects,
@@ -394,7 +397,7 @@ class CiWorkflowTests(unittest.TestCase):
     def test_linux_main_runs_the_sharded_core_suite_without_an_app_runtime(self):
         job = CI.job("linux-main")
         self.assertEqual(field(job, "runs-on", 4), "ubuntu-24.04")
-        self.assertEqual(CI.scripts("linux-main"), [ZIG_TEST_COMMANDS["linux-main"]])
+        self.assertIn(ZIG_TEST_COMMANDS["linux-main"], CI.scripts("linux-main"))
         text = CI.job_text("linux-main")
         needles = ("uses: actions/checkout@", "uses: mlugg/setup-zig@", ZIG_TEST_COMMANDS["linux-main"],
                    "uses: actions/upload-artifact@")
@@ -403,9 +406,48 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertNotIn("zig build -Dapp-runtime=none test", CI.text)
 
-    def test_zig_test_jobs_upload_the_json_report_only_on_failure(self):
+    def assert_full_test_step(self, workflow: Workflow, name: str):
+        command = ZIG_TEST_COMMANDS[name]
+        job = workflow.job(name)
+        candidates = [step for step in steps(job) if any(command in script for script in run_scripts(step))]
+        self.assertEqual(len(candidates), 1, f"{name} must have exactly one full test step")
+        step = candidates[0]
+        for key in ("if", "continue-on-error", "env", "working-directory", "shell", "timeout-minutes"):
+            self.assertIsNone(field(step, key, 8), f"{name} full test step must not override {key}")
+        keys = [match[1] for line in step if (match := re.match(r"^        ([\w-]+):", line))]
+        self.assertEqual(keys, ["name", "run"])
+        expected = command + ("\n          " + PWSH_CHECK if name == "windows" else "")
+        self.assertEqual([script.strip() for script in run_scripts(step)], [expected])
+        for key in ("if", "continue-on-error"):
+            self.assertIsNone(field(job, key, 4), f"{name} test job must not override {key}")
+        defaults = block(job, job.index("    defaults:"), 4)
+        self.assertEqual(mapping(defaults, "run", 6), {"shell": "pwsh" if name == "windows" else "bash"})
+
+    def test_full_test_step_mutations_are_rejected(self):
+        overrides = (
+            ["        if: false"],
+            ["        continue-on-error: true"],
+            ["        env:", "          ZIG_GLOBAL_CACHE_DIR: elsewhere"],
+            ["        working-directory: example/c-vt-static"],
+            ["        shell: bash"],
+            ["        timeout-minutes: 1"],
+        )
+        for name, command in ZIG_TEST_COMMANDS.items():
+            line_index = next(index for index, line in enumerate(CI.lines) if command in line)
+            start = max(index for index, line in enumerate(CI.lines[:line_index]) if line.startswith("      - "))
+            for extra in overrides:
+                with self.subTest(job=name, override=extra[0]):
+                    mutated = Workflow.__new__(Workflow)
+                    mutated.path = CI.path
+                    mutated.lines = CI.lines[:start + 1] + extra + CI.lines[start + 1:]
+                    mutated.text = "\n".join(mutated.lines) + "\n"
+                    with self.assertRaises(AssertionError):
+                        self.assert_full_test_step(mutated, name)
+
+    def test_zig_test_jobs_always_upload_test_and_cache_reports(self):
         for name, command in ZIG_TEST_COMMANDS.items():
             with self.subTest(job=name):
+                self.assert_full_test_step(CI, name)
                 job = CI.job(name)
                 self.assertEqual(sum(command in script for script in CI.scripts(name)), 1)
                 self.assertEqual(mapping(job, "env", 4), {
@@ -414,7 +456,7 @@ class CiWorkflowTests(unittest.TestCase):
                 })
                 upload = steps(job)[-1]
                 self.assertTrue((field(upload, "uses", 8) or "").startswith("actions/upload-artifact@"))
-                self.assertEqual(field(upload, "if", 8), "failure()")
+                self.assertEqual(field(upload, "if", 8), "always()")
                 self.assertEqual(mapping(upload, "with", 8), {
                     "name": f"gx-zig-test-{name}",
                     "path": "${{ runner.temp }}/gx-zig-test/",
@@ -424,6 +466,41 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertEqual(sum((field(step, "uses", 8) or "").startswith("actions/upload-artifact@")
                                      for step in steps(job)), 1)
         self.assertEqual(sum("scripts/zig_test.py" in script for script in CI.scripts()), len(ZIG_TEST_COMMANDS))
+
+    def test_cache_diagnostics_wrap_full_tests_and_probe_is_manual_build_only(self):
+        for name, command in ZIG_TEST_COMMANDS.items():
+            with self.subTest(job=name):
+                job_steps = steps(CI.job(name))
+                snapshots = [step for step in job_steps if "scripts/ci_cache.py snapshot" in "\n".join(step)]
+                probes = [step for step in job_steps if "scripts/ci_cache.py probe" in "\n".join(step)]
+                self.assertEqual(len(snapshots), 2)
+                self.assertEqual(len(probes), 1)
+                suite = "main" if name == "linux-main" else "vt"
+                python = "python" if name == "windows" else "python3"
+                temp = "$env:RUNNER_TEMP" if name == "windows" else "$RUNNER_TEMP"
+                for step, phase in zip(snapshots, ("restored", "finished")):
+                    self.assertEqual(field(step, "timeout-minutes", 8), "3")
+                    self.assertEqual(field(step, "if", 8), "always()" if phase == "finished" else None)
+                    expected = (f'{python} scripts/ci_cache.py snapshot --suite {suite} --phase {phase} '
+                                f'--json "{temp}/gx-zig-test/cache-{phase}.json"')
+                    self.assertEqual(run_scripts(step)[0].strip(),
+                                     expected + ("\n          " + PWSH_CHECK if name == "windows" else ""))
+                probe = probes[0]
+                self.assertEqual(field(probe, "if", 8), "github.event_name == 'workflow_dispatch' && inputs.cache_probe")
+                self.assertEqual(field(probe, "timeout-minutes", 8), "16")
+                define = " -Dapp-runtime=none" if suite == "main" else ""
+                expected = (f'{python} scripts/ci_cache.py probe --suite {suite}{define} --timeout 900 '
+                            f'--json "{temp}/gx-zig-test/cache-probe.json"')
+                self.assertEqual(run_scripts(probe)[0].strip(),
+                                 expected + ("\n          " + PWSH_CHECK if name == "windows" else ""))
+                text = CI.job_text(name)
+                order = [text.index(needle) for needle in ("uses: mlugg/setup-zig@", "--phase restored", command,
+                                                         "scripts/ci_cache.py probe", "--phase finished",
+                                                         "uses: actions/upload-artifact@")]
+                self.assertEqual(order, sorted(order))
+                for forbidden in ("--no-build", "--dedupe", "--filter", "-Dtest-filter", "rm -rf", "Remove-Item"):
+                    self.assertNotIn(forbidden, text)
+        self.assertEqual(sum("scripts/ci_cache.py" in script for script in CI.scripts()), 9)
 
     def test_lib_vt_cross_matrix(self):
         job = CI.job("lib-vt-cross")

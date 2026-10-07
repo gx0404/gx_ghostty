@@ -15,6 +15,10 @@ on:
         description: 在 macos-15 上运行 zig build test-lib-vt
         type: boolean
         default: false
+      cache_probe:
+        description: 在同一 runner 复建测试二进制以诊断缓存，不重复执行用例
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -103,17 +107,30 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           cache-size-limit: 4096
+          use-tool-cache: true
+          cache-key: stable-toolchain-v1
+      - name: Cache diagnostics after restore
+        timeout-minutes: 3
+        run: python3 scripts/ci_cache.py snapshot --suite vt --phase restored --json "$RUNNER_TEMP/gx-zig-test/cache-restored.json"
       - name: Install the ABI manifest verifier dependency
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-jsonschema
           python3 -c 'import jsonschema'
       - name: libghostty-vt tests, sharded across processes
-        run: python3 scripts/zig_test.py --suite vt --json "$RUNNER_TEMP/gx-zig-test/linux-vt.json"
+        run: python3 scripts/zig_test.py --suite vt --zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-zig-test/linux-vt.json"
+      - name: Repeat the test binary build without running tests
+        if: github.event_name == 'workflow_dispatch' && inputs.cache_probe
+        timeout-minutes: 16
+        run: python3 scripts/ci_cache.py probe --suite vt --timeout 900 --json "$RUNNER_TEMP/gx-zig-test/cache-probe.json"
       - name: libghostty-vt ABI manifest
         run: zig build test-lib-vt-schema
-      - name: Upload the zig_test report
-        if: failure()
+      - name: Cache diagnostics at job end
+        if: always()
+        timeout-minutes: 3
+        run: python3 scripts/ci_cache.py snapshot --suite vt --phase finished --json "$RUNNER_TEMP/gx-zig-test/cache-finished.json"
+      - name: Upload test and cache reports
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gx-zig-test-linux-vt
@@ -140,10 +157,23 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           cache-size-limit: 4096
+          use-tool-cache: true
+          cache-key: stable-toolchain-v1
+      - name: Cache diagnostics after restore
+        timeout-minutes: 3
+        run: python3 scripts/ci_cache.py snapshot --suite main --phase restored --json "$RUNNER_TEMP/gx-zig-test/cache-restored.json"
       - name: Core tests without an app runtime, sharded across processes
-        run: python3 scripts/zig_test.py --suite main -Dapp-runtime=none --json "$RUNNER_TEMP/gx-zig-test/linux-main.json"
-      - name: Upload the zig_test report
-        if: failure()
+        run: python3 scripts/zig_test.py --suite main -Dapp-runtime=none --zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-zig-test/linux-main.json"
+      - name: Repeat the test binary build without running tests
+        if: github.event_name == 'workflow_dispatch' && inputs.cache_probe
+        timeout-minutes: 16
+        run: python3 scripts/ci_cache.py probe --suite main -Dapp-runtime=none --timeout 900 --json "$RUNNER_TEMP/gx-zig-test/cache-probe.json"
+      - name: Cache diagnostics at job end
+        if: always()
+        timeout-minutes: 3
+        run: python3 scripts/ci_cache.py snapshot --suite main --phase finished --json "$RUNNER_TEMP/gx-zig-test/cache-finished.json"
+      - name: Upload test and cache reports
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gx-zig-test-linux-main
@@ -204,9 +234,22 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           cache-size-limit: 4096
+          use-tool-cache: true
+          cache-key: stable-toolchain-v1
+      - name: Cache diagnostics after restore
+        timeout-minutes: 3
+        run: |
+          python scripts/ci_cache.py snapshot --suite vt --phase restored --json "$env:RUNNER_TEMP/gx-zig-test/cache-restored.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: libghostty-vt tests, sharded across processes
         run: |
-          python scripts/zig_test.py --suite vt --json "$env:RUNNER_TEMP/gx-zig-test/windows.json"
+          python scripts/zig_test.py --suite vt --zig-arg=--summary --zig-arg=all --json "$env:RUNNER_TEMP/gx-zig-test/windows.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Repeat the test binary build without running tests
+        if: github.event_name == 'workflow_dispatch' && inputs.cache_probe
+        timeout-minutes: 16
+        run: |
+          python scripts/ci_cache.py probe --suite vt --timeout 900 --json "$env:RUNNER_TEMP/gx-zig-test/cache-probe.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build libghostty-vt
         run: |
@@ -219,8 +262,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./zig-out/bin/c_vt_static.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Upload the zig_test report
-        if: failure()
+      - name: Cache diagnostics at job end
+        if: always()
+        timeout-minutes: 3
+        run: |
+          python scripts/ci_cache.py snapshot --suite vt --phase finished --json "$env:RUNNER_TEMP/gx-zig-test/cache-finished.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload test and cache reports
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gx-zig-test-windows
