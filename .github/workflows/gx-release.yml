@@ -285,7 +285,8 @@ jobs:
   macos:
     if: inputs.macos
     needs: prepare
-    runs-on: macos-15
+    # Ghostty.icon (Icon Composer) fails to compile on macos-15; upstream builds the app on macOS 26.
+    runs-on: macos-26
     timeout-minutes: 120
     defaults:
       run:

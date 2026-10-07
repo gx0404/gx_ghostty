@@ -595,10 +595,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('(Join-Path $out "$name.zip")', text)
 
     def test_macos_jobs_are_optional(self):
-        for name in ("libvt-macos", "macos"):
+        for name, runner in (("libvt-macos", "macos-15"), ("macos", "macos-26")):
             with self.subTest(job=name):
                 self.assertEqual(field(RELEASE.job(name), "if", 4), "inputs.macos")
-                self.assertEqual(field(RELEASE.job(name), "runs-on", 4), "macos-15")
+                self.assertEqual(field(RELEASE.job(name), "runs-on", 4), runner)
 
     def test_linux_gtk_builds_from_the_dist_tarball_in_debian_13(self):
         job = RELEASE.job("linux-gtk")

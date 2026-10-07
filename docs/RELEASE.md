@@ -53,7 +53,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 | `libvt` | ubuntu-24.04 / windows-2025 | 矩阵构建 libghostty-vt：Linux 三个目标与 wasm32 在 ubuntu 上交叉编译，`x86_64-windows-msvc` 在 windows-2025 上原生构建 |
 | `libvt-macos` | macos-15 | 仅 `macos=true`：构建 libghostty-vt XCFramework |
 | `linux-gtk` | ubuntu-24.04 中的 `debian:13` 容器 | `zig build dist` 产出完整源码包，再从该源码包构建 GTK app 并检查 `+version` |
-| `macos` | macos-15 | 仅 `macos=true`：构建 `Ghostty.app` |
+| `macos` | macos-26 | 仅 `macos=true`：构建 `Ghostty.app`。macos-15（Xcode 26.3）编不过 `images/Ghostty.icon` 的资源目录（2026-10-07 run 37587740223），上游也在 macOS 26 上构建 app |
 | `verify` | ubuntu-24.04 | 收集全部产物，运行 `scripts/gx_release.py verify`，写出 `manifest.json` 与 `SHA256SUMS`；只构建模式也运行 |
 | `publish` | ubuntu-24.04 | 仅 `publish=true`：运行 `scripts/gx_release.py publish`；唯一拥有 `contents: write` 的 job |
 
@@ -152,5 +152,5 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 - `gx-ci` 的热缓存：三个测试 job 设 `cache-size-limit: 4096` 后，Zig 缓存与运行器耗时缓存是否保留并在下一次运行命中（首跑时 `windows` 的 2.49 GB 超过当时的默认上限、被清空）；`lib-vt-cross` 按 target 分开的 `cache-key` 是否各自命中（首跑时六个目标各存了一份）。
 - `gx-ci` 手动触发的 `gtk-smoke`：`mlugg/setup-zig` 在 `debian:13` 容器内运行、Xvfb 下的软件渲染，以及截图 artifact 的读回。
 - `gx-release` 的第一次只构建运行：libghostty-vt 各目标的实际安装布局（尤其 Windows 的 DLL 位置与 musl 共享库）是否满足 `verify` 的必需文件检查，`distcheck` 在缓存移出检出目录后的行为，`setup-zig` 的 `use-cache` 输入，以及 libghostty-vt 源码包的实际大小（本机只能按工作树估算 `export-ignore` 生效后的体积）。
-- `macos=true` 时 macos-15 上的 Xcode 选择与 `Ghostty.app` 构建。
+- `macos=true` 时 macos-26 上的 Xcode 选择与 `Ghostty.app` 构建（macos-15 上已确认失败在 `CompileAssetCatalogVariant`，所以换了 runner）。
 - 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。
