@@ -11,7 +11,8 @@ exit:   0 once a decision is made; 2 (reason on stderr) when the payload is not 
         JSON object, or when the policy cannot be loaded or evaluated for a guarded
         tool (shell, file writes, apply_patch). The hooks are registered for guarded
         tools only, so an unreadable payload fails closed instead of silently allowing.
-        1 (traceback on stderr) when evaluation outlives EVALUATION_DEADLINE_SECONDS;
+        1 (traceback on stderr) when evaluation outlives the watchdog deadline
+        (EVALUATION_DEADLINE_SECONDS; tests may shorten it via GX_GATE_WATCHDOG_SECONDS);
         every registered hook command turns that into a blocking 2.
 """
 
@@ -25,6 +26,7 @@ import posixpath
 import re
 import shlex
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -48,6 +50,9 @@ CODEX_ASK_NOTE = "（Codex 的 PreToolUse 不支持 ask，已按仓库策略直�
 # faulthandler watchdog ends the process first; block_dangerous.sh may try a second
 # interpreter, so two deadlines must still fit inside the client timeout.
 EVALUATION_DEADLINE_SECONDS = 10.0
+# Tests shorten the watchdog with this variable. Only values in (0, EVALUATION_DEADLINE_SECONDS]
+# count, so the environment can never stretch evaluation past the client timeout.
+DEADLINE_ENV = "GX_GATE_WATCHDOG_SECONDS"
 
 _MSYS_DRIVE = re.compile(r"^/(?:cygdrive/)?([A-Za-z])(?=/|$)")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:/")
@@ -289,10 +294,21 @@ def _fail_closed(message: str) -> int:
     return 2
 
 
+def evaluation_deadline(environ: Mapping[str, str] | None = None) -> float:
+    """The watchdog deadline: DEADLINE_ENV when it is a number in (0, default], else the default."""
+    raw = (os.environ if environ is None else environ).get(DEADLINE_ENV, "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return EVALUATION_DEADLINE_SECONDS
+    # NaN fails both comparisons and infinity exceeds the cap, so both keep the default.
+    return value if 0 < value <= EVALUATION_DEADLINE_SECONDS else EVALUATION_DEADLINE_SECONDS
+
+
 def _arm_watchdog() -> bool:
     """Exit with status 1 (and a traceback on stderr) if evaluation outlives the deadline."""
     try:
-        faulthandler.dump_traceback_later(EVALUATION_DEADLINE_SECONDS, exit=True, file=sys.stderr)
+        faulthandler.dump_traceback_later(evaluation_deadline(), exit=True, file=sys.stderr)
     except (AttributeError, OSError, RuntimeError, ValueError):
         return False
     return True

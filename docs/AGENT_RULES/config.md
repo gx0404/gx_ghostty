@@ -75,12 +75,12 @@
 
 ## 验证
 
-- 定向单测（`just test`，Windows 上只是尽力而为；完整的 Linux 覆盖看 `gx-ci` 的 `linux` job）：
-  - 解析与兼容：`just test -Dtest-filter=compatibility`、`just test -Dtest-filter=parseCLI`、`just test -Dtest-filter=LineIterator`。
-  - 条件、主题与克隆：`just test -Dtest-filter=changeConditionalState`、`just test -Dtest-filter=theme`、`just test -Dtest-filter=clone`。
-  - 格式化往返：`just test -Dtest-filter=formatEntry`、`just test -Dtest-filter=formatConfig`。
-  - C 读取：`just test -Dtest-filter=ghostty_config_get`、`just test -Dtest-filter=c_get`。
-- 改 doc comment 或字段集合：`just build -Demit-webdata` 会运行 helpgen 与 webgen，不需要 pandoc；man 与 html 用上游 CI 同款的 `just build -Dapp-runtime=gtk -Demit-docs -Demit-webdata`，只能在装有 pandoc 与 GTK 依赖的 Linux 上运行，本机记 PENDING。
-- 行为冒烟需要可运行的 `ghostty`：Linux 的 GTK 构建产出 `zig-out/bin/ghostty`；macOS 用 app 包里的可执行文件（`macos/Sources/App/main.swift` 经 `ghostty_cli_try_action` 执行动作）；Windows 只产出库，本机记 PENDING。检查 `ghostty +validate-config --config-file=<临时文件>` 在有诊断时退出 1，`ghostty +show-config --default --docs` 列出全部键及其文档。
+- 定向单测（`just test`，只在 Linux/macOS 可跑，Windows 上直接退出 2；完整覆盖看 `gx-ci` 的 `linux-main` job）：
+  - 解析与兼容：`just test --filter compatibility`、`just test --filter parseCLI`、`just test --filter LineIterator`。
+  - 条件、主题与克隆：`just test --filter changeConditionalState`、`just test --filter theme`、`just test --filter clone`。
+  - 格式化往返：`just test --filter formatEntry`、`just test --filter formatConfig`。
+  - C 读取：`just test --filter ghostty_config_get`、`just test --filter c_get`。
+- 改 doc comment 或字段集合：`just build -Demit-webdata` 会运行 helpgen 与 webgen，不需要 pandoc，但 Windows 上它的默认 install 编不过 libghostty-internal 而退出 1（`build-system.md`「平台」），所以只在 Linux/macOS 上跑，本机记 PENDING；man 与 html 用上游 CI 同款的 `just build -Dapp-runtime=gtk -Demit-docs -Demit-webdata`，只能在装有 pandoc 与 GTK 依赖的 Linux 上运行，本机记 PENDING。
+- 行为冒烟需要可运行的 `ghostty`：Linux 的 GTK 构建产出 `zig-out/bin/ghostty`；macOS 用 app 包里的可执行文件（`macos/Sources/App/main.swift` 经 `ghostty_cli_try_action` 执行动作）；Windows 构建不出可执行文件，本机记 PENDING。检查 `ghostty +validate-config --config-file=<临时文件>` 在有诊断时退出 1，`ghostty +show-config --default --docs` 列出全部键及其文档。
 - 改 C 读取面：再跑 `libghostty-embedding.md` 的验证；macOS 侧的构建按 `macos/AGENTS.md`。
 - 收尾：`just fmt-check`；改了 `pub` 签名或文档后跑 `just kb`。

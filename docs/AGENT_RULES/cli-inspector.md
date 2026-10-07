@@ -66,11 +66,11 @@
 
 ## 验证
 
-- 定向单测（`just test`，Windows 上只是尽力而为）：
-  - 动作检测：`just test -Dtest-filter=detect`。
-  - 参数与配置行：`just test -Dtest-filter=parseIntoField`、`just test -Dtest-filter=LineIterator`、`just test -Dtest-filter=splitter`。
-  - `+ssh`：`just test -Dtest-filter=parseDestination`、`just test -Dtest-filter=parseManuallyHook`；分页器：`just test -Dtest-filter=pager`；fish 描述：`just test -Dtest-filter=getDescription`。
-- 动作冒烟需要可运行的 `ghostty`（Linux 的 GTK 构建或 macOS app；Windows 只产出库，本机记 PENDING）：`ghostty +help`、`ghostty +<动作> --help`（核对 help 文本）、`ghostty +version`。
+- 定向单测（`just test`，只在 Linux/macOS 可跑；Windows 上直接退出 2，交 gx-ci `linux-main`）：
+  - 动作检测：`just test --filter detect`。
+  - 参数与配置行：`just test --filter parseIntoField`、`just test --filter LineIterator`、`just test --filter splitter`。
+  - `+ssh`：`just test --filter parseDestination`、`just test --filter parseManuallyHook`；分页器：`just test --filter pager`；fish 描述：`just test --filter getDescription`。
+- 动作冒烟需要可运行的 `ghostty`（Linux 的 GTK 构建或 macOS app；Windows 构建不出可执行文件，本机记 PENDING）：`ghostty +help`、`ghostty +<动作> --help`（核对 help 文本）、`ghostty +version`。
 - 生成器：Linux 上 `just build` 会运行 `ghostty-build-data` 并安装产物，检查 `zig-out/share/` 下对应文件；Windows 默认 `app-runtime=none`，不安装这些资源。
 - inspector 没有单测（见上游指令）：编译与交互验证只能在 Linux GTK（`just build` 后在 Ghostty 里打开 inspector）或 macOS 上进行，本机 Windows 记 PENDING。
 - 收尾：`just fmt-check`；改了 `pub` 签名或文档后跑 `just kb`。

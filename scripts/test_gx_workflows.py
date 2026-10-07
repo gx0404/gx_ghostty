@@ -24,7 +24,23 @@ ARCHIVED = {
     "vouch-manage-by-issue.yml", "vouch-sync-codeowners.yml",
 }
 ALLOWED_ACTIONS = {"actions/checkout", "actions/upload-artifact", "actions/download-artifact", "mlugg/setup-zig"}
-CI_JOBS = {"framework", "zig-fmt", "linux", "lib-vt-cross", "windows", "gtk-smoke", "macos"}
+CI_JOBS = {"framework", "zig-fmt", "linux-vt", "linux-main", "lib-vt-cross", "windows", "gtk-smoke", "macos"}
+CI_TIMEOUTS = {
+    "framework": 20, "zig-fmt": 20, "linux-vt": 45, "linux-main": 60,
+    "lib-vt-cross": 45, "windows": 60, "gtk-smoke": 90, "macos": 60,
+}
+# Jobs that run the sharded Zig test runner; each writes its --json report into $RUNNER_TEMP/gx-zig-test/.
+ZIG_TEST_COMMANDS = {
+    "linux-vt": 'python3 scripts/zig_test.py --suite vt --json "$RUNNER_TEMP/gx-zig-test/linux-vt.json"',
+    "linux-main": 'python3 scripts/zig_test.py --suite main -Dapp-runtime=none '
+                  '--json "$RUNNER_TEMP/gx-zig-test/linux-main.json"',
+    "windows": 'python scripts/zig_test.py --suite vt --json "$env:RUNNER_TEMP/gx-zig-test/windows.json"',
+}
+# The only mlugg/setup-zig inputs in gx-ci; no job sets version, so every job installs minimum_zig_version.
+SETUP_ZIG_INPUTS = {
+    "linux-main": {"cache-size-limit": "4096"},
+    "lib-vt-cross": {"cache-key": "${{ matrix.target }}"},
+}
 RELEASE_JOBS = {"prepare", "source", "libvt", "libvt-macos", "linux-gtk", "macos", "verify", "publish"}
 CROSS_TARGETS = [
     "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl",
@@ -316,15 +332,23 @@ class CiWorkflowTests(unittest.TestCase):
         for name in CI_JOBS - {"framework", "zig-fmt"}:
             with self.subTest(job=name):
                 self.assertEqual(field(CI.job(name), "needs", 4), "[framework, zig-fmt]")
+        for name in ("framework", "zig-fmt"):
+            with self.subTest(job=name):
+                self.assertIsNone(field(CI.job(name), "needs", 4))
+
+    def test_job_timeouts(self):
+        self.assertEqual({name: field(job, "timeout-minutes", 4) for name, job in CI.jobs().items()},
+                         {name: str(minutes) for name, minutes in CI_TIMEOUTS.items()})
 
     def test_framework_job_runs_the_fork_gates_without_graph_check(self):
         text = CI.job_text("framework")
-        for command in ("python3 scripts/resolve_agent_rules.py --check",
-                        "python3 scripts/version.py --check",
-                        "python3 -m unittest discover -s scripts -p 'test_*.py'",
+        for command in ("python3 scripts/resolve_agent_rules.py --check\n",
+                        "python3 scripts/version.py --check\n",
+                        "python3 scripts/run_unittests.py\n",
                         "run: python3 scripts/build_agent_kb.py\n",
                         'python3 scripts/conventional_commits.py --range "$range"'):
             self.assertIn(command, text)
+        self.assertNotIn("unittest discover", CI.text)
         self.assertEqual(field(CI.job("framework"), "runs-on", 4), "ubuntu-24.04")
         self.assertIn("fetch-depth: 0", text)
         self.assertNotIn("--confirm", text)
@@ -350,11 +374,54 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("-1", conventional_commits.range_command(f"{ZERO_SHA}..{'a' * 40}"))
         self.assertIn("--first-parent", conventional_commits.range_command(f"{'b' * 40}..{'a' * 40}"))
 
-    def test_linux_runs_core_and_lib_vt_tests(self):
-        text = CI.job_text("linux")
-        for command in ("zig build -Dapp-runtime=none test", "zig build test-lib-vt\n",
-                        "zig build test-lib-vt-schema", "python3-jsonschema"):
-            self.assertIn(command, text)
+    def test_linux_vt_runs_sharded_lib_vt_tests_then_the_abi_manifest(self):
+        job = CI.job("linux-vt")
+        self.assertEqual(field(job, "runs-on", 4), "ubuntu-24.04")
+        self.assertIn(ZIG_TEST_COMMANDS["linux-vt"], CI.scripts("linux-vt"))
+        self.assertIn("zig build test-lib-vt-schema", CI.scripts("linux-vt"))
+        text = CI.job_text("linux-vt")
+        needles = (
+            "uses: actions/checkout@", "uses: mlugg/setup-zig@",
+            "sudo apt-get install -y --no-install-recommends python3-jsonschema", "python3 -c 'import jsonschema'",
+            ZIG_TEST_COMMANDS["linux-vt"], "zig build test-lib-vt-schema", "uses: actions/upload-artifact@")
+        self.assertEqual({needle: text.count(needle) for needle in needles}, dict.fromkeys(needles, 1))
+        order = [text.index(needle) for needle in needles]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("zig build test-lib-vt\n", text)
+
+    def test_linux_main_runs_the_sharded_core_suite_without_an_app_runtime(self):
+        job = CI.job("linux-main")
+        self.assertEqual(field(job, "runs-on", 4), "ubuntu-24.04")
+        self.assertEqual(CI.scripts("linux-main"), [ZIG_TEST_COMMANDS["linux-main"]])
+        text = CI.job_text("linux-main")
+        needles = ("uses: actions/checkout@", "uses: mlugg/setup-zig@", ZIG_TEST_COMMANDS["linux-main"],
+                   "uses: actions/upload-artifact@")
+        self.assertEqual({needle: text.count(needle) for needle in needles}, dict.fromkeys(needles, 1))
+        order = [text.index(needle) for needle in needles]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("zig build -Dapp-runtime=none test", CI.text)
+
+    def test_zig_test_jobs_upload_the_json_report_only_on_failure(self):
+        for name, command in ZIG_TEST_COMMANDS.items():
+            with self.subTest(job=name):
+                job = CI.job(name)
+                self.assertEqual(sum(command in script for script in CI.scripts(name)), 1)
+                self.assertEqual(mapping(job, "env", 4), {
+                    "PYTHONDONTWRITEBYTECODE": "'1'",
+                    "GX_ZIG_TEST_TIMINGS_DIR": ".zig-cache/gx-test-timings",
+                })
+                upload = steps(job)[-1]
+                self.assertTrue((field(upload, "uses", 8) or "").startswith("actions/upload-artifact@"))
+                self.assertEqual(field(upload, "if", 8), "failure()")
+                self.assertEqual(mapping(upload, "with", 8), {
+                    "name": f"gx-zig-test-{name}",
+                    "path": "${{ runner.temp }}/gx-zig-test/",
+                    "if-no-files-found": "ignore",
+                    "retention-days": "14",
+                })
+                self.assertEqual(sum((field(step, "uses", 8) or "").startswith("actions/upload-artifact@")
+                                     for step in steps(job)), 1)
+        self.assertEqual(sum("scripts/zig_test.py" in script for script in CI.scripts()), len(ZIG_TEST_COMMANDS))
 
     def test_lib_vt_cross_matrix(self):
         job = CI.job("lib-vt-cross")
@@ -368,9 +435,12 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(mapping(job, "defaults", 4), {"run": ""})
         self.assertIn("        shell: pwsh", job)
         text = CI.job_text("windows")
-        for command in ("zig build test-lib-vt", "zig build -Demit-lib-vt",
-                        "working-directory: example/c-vt-static", "./zig-out/bin/c_vt_static.exe"):
-            self.assertIn(command, text)
+        order = [text.index(needle) for needle in (
+            "git config --global core.autocrlf false", "uses: actions/checkout@", "uses: mlugg/setup-zig@",
+            ZIG_TEST_COMMANDS["windows"], "zig build -Demit-lib-vt",
+            "working-directory: example/c-vt-static", "./zig-out/bin/c_vt_static.exe")]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("zig build test-lib-vt", text)
 
     def test_gtk_smoke_is_manual_and_mirrors_the_debian_dockerfile(self):
         job = CI.job("gtk-smoke")
@@ -399,12 +469,16 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(field(job, "runs-on", 4), "macos-15")
         self.assertIn("zig build test-lib-vt", CI.job_text("macos"))
 
-    def test_setup_zig_reads_minimum_zig_version(self):
+    def test_setup_zig_reads_minimum_zig_version_and_tunes_only_the_locked_cache_inputs(self):
+        self.assertLessEqual(set(SETUP_ZIG_INPUTS), CI_JOBS - {"framework"})
         for name, job in CI.jobs().items():
-            for step in steps(job):
-                if (field(step, "uses", 8) or "").startswith("mlugg/setup-zig@"):
-                    with self.subTest(job=name):
-                        self.assertEqual(mapping(step, "with", 8), {})
+            setups = [step for step in steps(job) if (field(step, "uses", 8) or "").startswith("mlugg/setup-zig@")]
+            with self.subTest(job=name):
+                self.assertEqual(len(setups), 0 if name == "framework" else 1)
+                for step in setups:
+                    inputs = SETUP_ZIG_INPUTS.get(name, {})
+                    self.assertEqual(field(step, "with", 8), "" if inputs else None)
+                    self.assertEqual(mapping(step, "with", 8), inputs)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

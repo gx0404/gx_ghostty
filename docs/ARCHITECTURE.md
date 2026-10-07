@@ -4,7 +4,7 @@
 
 ## 1. 定位与产物
 
-fork 自 `ghostty-org/ghostty`：业务代码跟随上游，只叠加 AI 协作框架与构建补丁 GX-0001（第 9 节）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
+fork 自 `ghostty-org/ghostty`：业务代码跟随上游，只叠加 AI 协作框架与两个构建补丁：GX-0001（版本推导，第 9 节）与 GX-0002（只安装测试二进制的构建步骤，第 3 节）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
 
 | 产物 | 说明 | 根文件 / 构建逻辑 |
 |---|---|---|
@@ -17,12 +17,12 @@ fork 自 `ghostty-org/ghostty`：业务代码跟随上游，只叠加 AI 协作�
 |---|---|---|---|
 | Linux、FreeBSD | `gtk` / OpenGL / `fontconfig_freetype` | `bin/ghostty`、`share/` 资源、libghostty-vt | Linux 全量；FreeBSD job 已注释 |
 | macOS | `none`（internal 库用 `embedded`）/ Metal / `coretext` | `GhosttyKit.xcframework`、`Ghostty.app`（`-Demit-macos-app=false` 可跳过）、libghostty-vt | app 与 lib-vt |
-| Windows | `none` / OpenGL / `freetype_windows`；默认 MSVC ABI，i18n 关 | 只有库：`ghostty-vt.dll`、`ghostty-vt-static.lib`、`ghostty-internal.dll`、`ghostty-internal-static.lib` | 只测 lib-vt；完整 test 于 2026-08-28 移除（`380778e3c`） |
+| Windows | `none` / OpenGL / `freetype_windows`；默认 MSVC ABI，i18n 关 | 只有库，而且只有 libghostty-vt：`ghostty-vt.dll`、`ghostty-vt-static.lib`。默认 `install` 还要构建 `ghostty-internal.dll`、`ghostty-internal-static.lib`，它们编译不过（第 3 节末），`zig build` 因此失败，库用 `-Demit-lib-vt` 构建 | 只测 lib-vt；完整 test 于 2026-08-28 移除（`380778e3c`） |
 | iOS、Android | — | 只有 libghostty-vt（全量构建遇 iOS 报 `UnsupportedTarget`） | lib-vt 交叉构建 |
 | wasm32-freestanding | — | 只有 libghostty-vt：`bin/ghostty-vt.wasm` 与静态归档 | wasm、ABI 清单、`test/wasm-alloc.mjs` |
 | 其他 freestanding | — | 只有静态 libghostty-vt 与头文件 | riscv32、thumb |
 
-默认值来自 `src/apprt/runtime.zig::Runtime.default`、`src/renderer/backend.zig::Backend.default`、`src/font/backend.zig::Backend.default` 与 `src/build/Config.zig::init`。本机 Windows 只能验证库，GUI 证据交 `gx-ci`（[TESTING.md](TESTING.md)）。
+默认值来自 `src/apprt/runtime.zig::Runtime.default`、`src/renderer/backend.zig::Backend.default`、`src/font/backend.zig::Backend.default` 与 `src/build/Config.zig::init`。本机 Windows 只能验证 libghostty-vt；非 vt 代码的编译与测试、GUI 证据都交 `gx-ci`（[TESTING.md](TESTING.md)）。
 
 ## 2. 仓库布局
 
@@ -58,9 +58,9 @@ Zig 不允许 `main` 所在文件位于模块根目录的子目录，所以所�
 
 启动：`src/main_ghostty.zig::main` 先 `global.init` 建立进程级状态（分配器、`std.Io`、日志、sentry、locale、资源目录、i18n 等）；有 `+action` 时执行后退出；`app_runtime == .none` 时打印 CLI 用法退出；否则 `App.create` → `apprt.App.init` → `run`。嵌入方依次调 `ghostty_init`、`ghostty_cli_try_action`、`ghostty_app_new`。
 
-`build.zig` 的步骤：默认 `install`；`run`、`run-valgrind`；`test`、`test-valgrind`（完整单测，`-Demit-lib-vt` 时不注册）；`test-lib-vt`、`test-lib-vt-build`；`test-lib-vt-schema`（调 `python3` 校验 ABI 清单）；`update-translations`；`dist`、`distcheck`。默认 `install`：`app_runtime != none` 时装 `ghostty` 与资源；为 `none` 时非 Darwin 装 libghostty-internal 与 `ghostty.h`，macOS 主机出 xcframework 并经 xcodebuild 出 `Ghostty.app`；非 freestanding 目标总会装 libghostty-vt 共享库与静态库（Windows 静态库改名 `ghostty-vt-static.lib`，避开 DLL 导入库）。`-Demit-lib-vt` 是库专用模式，关闭 exe、文档、macOS app 与 internal 库，本仓被当作依赖时默认开启。
+`build.zig` 的步骤：默认 `install`；`run`、`run-valgrind`；`test`、`test-valgrind`（完整单测，`-Demit-lib-vt` 时为空步骤；macOS 上不带 `-Dtest-filter` 的 `test` 还挂上 macOS app 的 `xcodebuild test`）；`test-lib-vt`、`test-lib-vt-build`；`test-lib-vt-schema`（调 `python3` 校验 ABI 清单）；`update-translations`；`dist`、`distcheck`；以及 fork 补丁 GX-0002 新增的 `test-lib-vt-bin`、`test-bin`：只编译并把 `test-lib-vt`、`test` 用的同一批测试二进制装到 `zig-out/test/`（`vt/`、`vt_c/` 与 `ghostty-test`），不运行，由 `scripts/zig_test.py` 按 Zig 测试运行器协议分片到多个进程（`just test-vt`、`just test`；`ghostty-test` 在 Windows 上编译不过）。默认 `install`：`app_runtime != none` 时装 `ghostty` 与资源；为 `none` 时非 Darwin 装 libghostty-internal 与 `ghostty.h`（Windows 上这一步编译不过，见本节末），macOS 主机出 xcframework 并经 xcodebuild 出 `Ghostty.app`；非 freestanding 目标总会装 libghostty-vt 共享库与静态库（Windows 静态库改名 `ghostty-vt-static.lib`，避开 DLL 导入库）。`-Demit-lib-vt` 是库专用模式，关闭 exe、文档、macOS app 与 internal 库，本仓被当作依赖时默认开启。
 
-选项全集在 `src/build/Config.zig::init`，经 `Config.addOptions` 写入 `build_options`、运行期由 `src/build_config.zig` 读取；libghostty-vt 另有 `src/terminal/build_options.zig::Options`（含 `-Dvt-features`）。`src/build/SharedDeps.zig::add` 把 C 依赖与构建期生成模块挂到各编译步骤。
+选项全集在 `src/build/Config.zig::init`，经 `Config.addOptions` 写入 `build_options`、运行期由 `src/build_config.zig` 读取；libghostty-vt 另有 `src/terminal/build_options.zig::Options`（含 `-Dvt-features`）。`src/build/SharedDeps.zig::add` 把 C 依赖与构建期生成模块挂到 libghostty-internal、`ghostty` exe、`ghostty-test` 与 bench 工具的编译步骤（libghostty-vt 只用 `SharedDeps.addSimd`）。其中 translate-c 导入 `posix_c`（`errno.h`、`pwd.h`、`signal.h`、`sys/types.h`、`unistd.h`）不分目标一律添加，MSVC 目标找不到 `pwd.h`，所以这些产物在 Windows 上都编译不过。
 
 ## 4. 核心对象与所有者
 
@@ -174,7 +174,7 @@ Surface（src/Surface.zig）
 
 **产品版本**：`build.zig` 优先读源码包里的 `VERSION`，否则取 `build.zig.zon` 的 `.version`（当前 `1.3.2-dev`），`src/build/Config.zig::init` 只取其中 `X.Y.Z` 再定版：`-Dversion-string` 原样使用；作为依赖构建时为 `X.Y.Z`；否则由 `src/build/GitVersion.zig::detect` 探测——无 git 时为 `X.Y.Z-dev+0000000`，`tip` tag 视为预发布，`v` 前缀 tag 必须恰好是 `vX.Y.Z`（否则 `@panic`），其余为 `X.Y.Z-<分支>+<短 hash>`（分支名的非 `[0-9A-Za-z-]` 字符换成 `-`，本分支得 `1.3.2-gx-ghostty+<hash>`）。带预发布段的版本发布通道为 `tip`（`Config.addOptions`，`+version` 会显示）。libghostty-vt 版本是 `build.zig` 常量 `lib_version`（`0.1.0-dev`），可用 `-Dlib-version-string` 覆盖。
 
-因此源码包没有 `.git` 时退化为 `X.Y.Z-dev+0000000`，解压在别的 Git 工作树之内（如 `distcheck` 解压在 `.zig-cache` 下）时会探测到外层仓库；release 构建一律显式传 `-Dversion-string`。
+因此源码包没有 `.git` 时退化为 `X.Y.Z-dev+0000000`，解压在别的 Git 工作树之内（如 `distcheck` 解压在 `.zig-cache` 下）时会探测到外层仓库；release 构建一律显式传 `-Dversion-string`。测试构建也显式传：`scripts/zig_test.py::pinned_version_string` 给测试步骤固定 `-Dversion-string=X.Y.Z-dev+0000000`（与无 git 时的回退同形），否则版本串随提交哈希变化，每次提交都会让测试二进制整体重编。
 
 **GX-0001**：上游遇到非 `v` 前缀 tag（如 `gx-v0.1.0`）也会 panic，打了 fork tag 的提交不传 `-Dversion-string` 就无法构建。补丁在 `src/build/Config.zig::init` 的 tag 判断处加 `fork(gx): GX-0001` 标记，让这类 tag 与 `tip` 一样跳过发布校验、回退到分支预发布版本；登记与移除条件见 [FORK_PATCHES.md](FORK_PATCHES.md)，由 `scripts/test_fork_patches.py` 锁定。
 
@@ -191,7 +191,7 @@ Surface（src/Surface.zig）
 |---|---|---|
 | fork 独占 | 第 2 节列出的 fork 新增路径 | 不冲突；上游新路径要在 `routes.toml` 登记 |
 | 上游文件 + 追加段 | 根 `AGENTS.md`（`<!-- gx-fork: … -->` 以下）、`.gitignore`、`.prettierignore`（`# --- GX fork：` 段） | 标记以上取上游，标记段原样保留 |
-| 上游文件 + 补丁 | `src/build/Config.zig`（GX-0001） | 按 [FORK_PATCHES.md](FORK_PATCHES.md) 复核 |
+| 上游文件 + 补丁 | `src/build/Config.zig`（GX-0001）、`build.zig`（GX-0002） | 按 [FORK_PATCHES.md](FORK_PATCHES.md) 复核 |
 | 上游文件移位 | 15 个上游 workflow 原样移到 `.github/workflows-archive/` | 上游新增的 workflow 也 `git mv` 进归档，不启用 |
 | 上游独占 | 其余全部，含 `.agents/`、9 份嵌套 `AGENTS.md`、`CODEOWNERS`、lint 配置、`dependabot.yml` | 取上游 |
 

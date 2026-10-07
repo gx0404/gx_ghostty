@@ -43,7 +43,7 @@
 2. ABI / C API：libghostty-vt 函数是否走完四步导出（`src/terminal/c/<module>.zig` → `src/terminal/c/main.zig` → `src/lib_vt.zig` 的 `@export` → `include/ghostty/vt/` 头文件）；新 C 枚举是否以 `_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE` 收尾；已发布的枚举值与结构体字段有没有被重排或改义；sized struct 是否保持 `size` 首字段并配 `GHOSTTY_INIT_SIZED`；是否仍能构建到 `wasm32-freestanding`。改 `include/ghostty.h` 时同时核对 `src/main_c.zig`、`src/apprt/embedded.zig` 与 macOS 调用方。细则见 `libghostty-vt.md`、`libghostty-embedding.md`。
 3. 线程与锁：读写终端状态是否持有 `renderer_state.mutex`（入口 `src/termio/Termio.zig::processOutput`）；不能被饿死的一方是否用 `src/renderer/State.zig::lockDemand` / `unlockDemand`；跨线程是否只经 mailbox 传消息（如 `src/App.zig::drainMailbox`），没有直接改其他线程拥有的状态；OpenGL context 是否只在一个线程上 current；是否引入了 C API 之外的全局状态。细则见 `app-core.md`、`renderer.md`、`termio-pty-os.md`。
 4. 生成物：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`po/*.pot`、`vendor/glad/`、`graphify-out/**`、`docs/kb/chunks.json` 有没有被手改；生成源变了是否已按对应领域文档重建，或说明了为何无影响。
-5. 测试是否真的跑过：每个「已验证」都要对得上命令与结果，层级要匹配（lib-vt 用 `just test-vt`，核心用 `just test -Dtest-filter=<name>`，框架用 `just framework-test`）。Windows 上完整 `just test` 只算尽力而为，GTK、macOS 与 Linux 全量交给 CI 并记 PENDING；跳过、`|| true` 或截断输出造成的「静默绿」至少记「中」。
+5. 测试是否真的跑过：每个「已验证」都要对得上命令与结果，层级要匹配（lib-vt 用 `just test-vt`，核心用 `just test --filter <name>`（Linux/macOS），框架用 `just framework-test`）。`just test` 在 Windows 上直接退出 2，核心全量、GTK 与 macOS 交给 CI 并记 PENDING；跳过、`|| true` 或截断输出造成的「静默绿」至少记「中」。
 6. CHANGELOG：fork 可观察行为变了，却没在最大版本下记 Added / Changed / Fixed，记「中」（规则见 `ci-release.md`）。
 7. fork 补丁：对上游源码（`src/`、`include/`、`pkg/`、`macos/`、`build.zig`）的改动是否带 `fork(gx): GX-NNNN` 标记并在 `docs/FORK_PATCHES.md` 登记；范围外的上游文件除既定追加段与 workflow 归档外是否被改动；能放进新路径的改动有没有被写成上游补丁。
 8. 上游同步影响：有没有无谓地重排、重格式化或改名上游代码；有没有碰归档 workflow、嵌套 AGENTS、`CODEOWNERS`、`VOUCHED.td`。审同步合并时核对：根 AGENTS 标记之前与上游一致、新 workflow 已归档、新嵌套 AGENTS 已登记，以及 `just framework-check`、`just ci-check`、`just generated-check` 的实际结果。
@@ -69,5 +69,5 @@ resolver 在任何方式下都要实跑；其余命令在只读 reviewer 里写�
 
 - 审核开始：`just rules-review <paths>`；改动涉及路由或领域文档时加跑 `just rules-check`。
 - 框架改动：`just framework-check`。
-- 产品改动：`just test-vt -Dtest-filter=<filter>`、`just test -Dtest-filter=<name>`，合并前 `just ci-check`（需要钉版 Zig；缺失时记 PENDING，并提示用户运行 `just setup`）。
+- 产品改动：`just test-vt --filter <filter>`、`just test --filter <name>`，合并前 `just ci-check`（需要钉版 Zig；缺失时记 PENDING，并提示用户运行 `just setup`）。
 - 同步与发版改动：`just generated-check`、`just version-check`、`just commit-check --range <base>..HEAD`。

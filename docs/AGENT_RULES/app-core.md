@@ -12,7 +12,7 @@
 
 - 入口分派：`src/main.zig::entrypoint` 按 `build_config.exe_entrypoint`（`src/build/Config.zig::ExeEntrypoint`：ghostty、helpgen、mdgen_*、webgen_*）选根文件，再转出 `main` 与 `std_options`。
 - `src/main_ghostty.zig::main`：`global.init(.{ .main = … })` → 有 `+action` 就执行并退出 → 否则 `App.create` → `apprt.App.init` → `run`。它的 `std_options`（日志级别、`logFn`）也被 `src/main_c.zig` 复用。
-- `src/apprt.zig::runtime` 编译期选定唯一 apprt：exe 取 `app_runtime`（`none`/`gtk`），lib 取 `embedded`，`wasm_module` 取 `browser`。默认值来自 `src/apprt/runtime.zig::Runtime.default`：Linux/FreeBSD 为 gtk，其余为 none（不产出 exe，改为构建 libghostty-internal）。每个 apprt 必须提供 `App`、`Surface`、`resourcesDir`。
+- `src/apprt.zig::runtime` 编译期选定唯一 apprt：exe 取 `app_runtime`（`none`/`gtk`），lib 取 `embedded`，`wasm_module` 取 `browser`。默认值来自 `src/apprt/runtime.zig::Runtime.default`：Linux/FreeBSD 为 gtk，其余为 none（不产出 exe，默认 install 改为构建 libghostty-internal；Windows 上它编译不过，见「验证」）。每个 apprt 必须提供 `App`、`Surface`、`resourcesDir`。
 - `src/App.zig::App` 拥有：`surfaces`（`*apprt.Surface` 列表）、`mailbox`（`Mailbox.Queue = BlockingQueue(Message, 64)`）、`font_grid_set`（同字体配置的 surface 共享）、`device`（app 级 `renderer.Device`，各 surface 的 renderer 借用）、`config_conditional_state`。`tick` 只做 `drainMailbox`。
 - `src/Surface.zig::Surface` 拥有：`renderer`、`renderer_state`（mutex 堆分配）、`renderer_thread`/`renderer_thr`、`io`（`termio.Termio`）、`io_thread`/`io_thr`、`inspector`、`search`、`config`（`DerivedConfig`）、`keyboard`/`mouse` 状态。`rt_app`/`rt_surface` 指回 apprt 对象，apprt 侧用 `core()` 取回 `*Surface`。
 - 跨线程消息：`src/apprt/surface.zig::Message` 与 `Mailbox`（把消息包成 `App.Message.surface_message` 投到 app 线程）；`src/App.zig::Mailbox.push` 入队后调用 `rt_app.wakeup()`；app 线程经 `App.surfaceMessage` → `Surface.handleMessage` 处理。
@@ -77,9 +77,9 @@
 
 ## 验证
 
-- 定向测试：`just test -Dtest-filter=ghostty.h`（Zig 枚举与 `include/ghostty.h` 对账，含 `apprt.Action.Key`、`ipc.Action.Key`、`ipc.Target.Key`）、`just test -Dtest-filter=Envelope`（崩溃信封）、`just test -Dtest-filter=queueIo`、`just test -Dtest-filter=copyUtf8Z`、`just test -Dtest-filter=keyToMouseShape`。
-- 编译覆盖：Windows 默认 `app_runtime=none`，`just build` 只构建 ghostty-internal（embedded apprt 与 Windows 分支），不覆盖 GTK 与 POSIX 分支；这些由 `gx-ci` 的 `linux` job 负责。Windows 上完整 `just test` 只是尽力而为。
-- 改 apprt 动作、Surface 生命周期或主循环交互：本机没有 GUI，记 PENDING，交 `gx-ci` 手动触发的 `gtk-smoke` 截图与 `macos` job。
+- 定向测试（`just test` 只在 Linux/macOS 可跑）：`just test --filter ghostty.h`（Zig 枚举与 `include/ghostty.h` 对账，含 `apprt.Action.Key`、`ipc.Action.Key`、`ipc.Target.Key`）、`just test --filter Envelope`（崩溃信封）、`just test --filter queueIo`、`just test --filter copyUtf8Z`、`just test --filter keyToMouseShape`。
+- 编译覆盖：本机 Windows 没有本域代码的编译检查。`just build` 要构建的 libghostty-internal 与 `just test` 要构建的 `ghostty-test` 都经 `src/build/SharedDeps.zig::add`，卡在 translate-c 导入 `posix_c` 缺 `pwd.h`（`build-system.md`「平台」）：`just build` 退出 1，`just test` 直接退出 2，本机记 PENDING。POSIX 分支由 `gx-ci` 的 `linux-main` job（`-Dapp-runtime=none` 编译并运行整个 `ghostty-test`，不编 GTK apprt）与 Linux/macOS 开发机覆盖，GTK 在 gx-ci 里只由手动触发的 `gtk-smoke` 构建；只在 Windows 目标上才编译的分支目前没有任何编译检查。
+- 改 apprt 动作、Surface 生命周期或主循环交互：本机没有 GUI，记 PENDING，GTK 交 `gx-ci` 手动触发的 `gtk-smoke` 截图；macOS 侧只能在 Mac 上验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`）。
 - 崩溃链路（Sentry 默认只在 macOS 构建）：用 `crash` 绑定动作人工验证，本机记 PENDING。
 - 改 Zig 后跑 `just fmt-check`。
 

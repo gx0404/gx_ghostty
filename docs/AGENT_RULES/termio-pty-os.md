@@ -47,7 +47,7 @@
 
 ### 平台与库约束
 
-- Windows 没有可运行的 app，这些分支随 ghostty-internal 一起编译。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`getProcessInfo` 在 Windows 上返回 null。
+- Windows 没有可运行的 app；只有 Windows 目标的 libghostty-internal 与 `ghostty-test` 会编译这些分支，而二者目前在 Windows 上都编不过（见「验证」）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`getProcessInfo` 在 Windows 上返回 null。
 - lib-vt 闭包里的 `os` 文件（见「范围」）不得引入 libc、`global.zig`、termio 或 apprt 依赖，必须能编到 `wasm32-freestanding`。
 - `src/os/` 新代码优先显式接收 `io`、`alloc`、`environ_map`（参照 `src/os/xdg.zig`、`src/os/homedir.zig`），不读全局环境。`src/os/locale.zig::ensureLocale` 会改进程环境，只在 `global.init` 里调用，并断言非测试。
 - 读管线常量（`ReadThread.buffer_count`、`buffer_capacity`、`bridge_*`、`gather_budget_ns`）的取值依据（实测数据或延迟预算）写在各自注释里，改动要给出同等证据；`src/benchmark/TerminalStream.zig` 的读缓冲刻意与 `buffer_capacity` 一致，改一处要同步另一处。
@@ -64,11 +64,11 @@
 
 ## 验证
 
-- 定向测试：`just test -Dtest-filter=Command:`（fork/exec、环境变量、工作目录）、`just test -Dtest-filter=execCommand`（各平台 argv）、`just test -Dtest-filter=printf_q`（`string_encoding`）、`just test -Dtest-filter=expand:`（`src/os/path.zig` 的 PATH 查找）。
-- 无名测试（`src/pty.zig` 的 open 与 resize、`src/termio/message.zig` 的尺寸锁）随完整 `just test` 运行。POSIX 行为以 `gx-ci` 的 `linux` job 为准，Windows 本机的完整测试只是尽力而为。
+- 定向测试：`just test --filter Command:`（fork/exec、环境变量、工作目录）、`just test --filter execCommand`（各平台 argv）、`just test --filter printf_q`（`string_encoding`）、`just test --filter expand:`（`src/os/path.zig` 的 PATH 查找）。
+- 无名测试（`src/pty.zig` 的 open 与 resize、`src/termio/message.zig` 的尺寸锁）随完整 `just test` 运行。POSIX 行为以 `gx-ci` 的 `linux-main` job 为准；`ghostty-test` 在 Windows 上无法编译，本机 `just test` 直接退出 2，记 PENDING。
 - 改 lib-vt 闭包里的 `os` 文件：`just test-vt`、`just build-vt`、`just vt-wasm`。
-- Windows 分支（ConPTY、`threadMainWindows`、`Command` 的 Windows 路径）：`just build` 只能证明能编译；运行行为本机无 app 可验，记 PENDING。
-- 改读管线或 StreamHandler 热路径：按 `src/benchmark/AGENTS.md` 的流程对比前后吞吐，用 `just build -Demit-bench -Doptimize=ReleaseFast` 构建 `ghostty-bench`，`+terminal-stream` 近似 IO 线程的解析负载。真实 pty 下的读线程收益本机测不了，记 PENDING。
+- Windows 分支（ConPTY、`threadMainWindows`、`Command` 的 Windows 路径）目前没有任何编译检查：本机 `just build` 在 `src/build/SharedDeps.zig::add` 的 `posix_c` 翻译处就失败（`build-system.md`「平台」）；gx-ci `linux-main` 与 Linux/macOS 开发机按各自目标编译，这些由编译期 `builtin.os.tag` 选中的分支不会被分析。编译与运行行为都记 PENDING。
+- 改读管线或 StreamHandler 热路径：按 `src/benchmark/AGENTS.md` 的流程对比前后吞吐，在 Linux/macOS 上用 `just build -Demit-bench -Doptimize=ReleaseFast` 构建 `ghostty-bench`（Windows 上同样卡在 `posix_c`），`+terminal-stream` 近似 IO 线程的解析负载。真实 pty 下的读线程收益本机测不了，记 PENDING。
 - 改 Zig 后跑 `just fmt-check`。
 
 ## 上游指令

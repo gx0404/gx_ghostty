@@ -44,7 +44,7 @@ jobs:
         run: |
           python3 scripts/resolve_agent_rules.py --check
           python3 scripts/version.py --check
-          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 scripts/run_unittests.py
       - name: Knowledge base is up to date (check mode)
         run: python3 scripts/build_agent_kb.py
       - name: Commit subjects on the first-parent chain
@@ -84,13 +84,17 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check .
 
-  linux:
+  linux-vt:
     needs: [framework, zig-fmt]
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      # Keep zig_test.py scheduling timings inside the directory setup-zig caches.
+      GX_ZIG_TEST_TIMINGS_DIR: .zig-cache/gx-test-timings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,12 +105,48 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-jsonschema
           python3 -c 'import jsonschema'
-      - name: Core tests without an app runtime
-        run: zig build -Dapp-runtime=none test
-      - name: libghostty-vt tests
-        run: zig build test-lib-vt
+      - name: libghostty-vt tests, sharded across processes
+        run: python3 scripts/zig_test.py --suite vt --json "$RUNNER_TEMP/gx-zig-test/linux-vt.json"
       - name: libghostty-vt ABI manifest
         run: zig build test-lib-vt-schema
+      - name: Upload the zig_test report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-zig-test-linux-vt
+          path: ${{ runner.temp }}/gx-zig-test/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  linux-main:
+    needs: [framework, zig-fmt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      # Keep zig_test.py scheduling timings inside the directory setup-zig caches.
+      GX_ZIG_TEST_TIMINGS_DIR: .zig-cache/gx-test-timings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # setup-zig saves an empty cache once .zig-cache exceeds cache-size-limit MiB (default 2048).
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          cache-size-limit: 4096
+      - name: Core tests without an app runtime, sharded across processes
+        run: python3 scripts/zig_test.py --suite main -Dapp-runtime=none --json "$RUNNER_TEMP/gx-zig-test/linux-main.json"
+      - name: Upload the zig_test report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-zig-test-linux-main
+          path: ${{ runner.temp }}/gx-zig-test/
+          if-no-files-found: ignore
+          retention-days: 14
 
   lib-vt-cross:
     needs: [framework, zig-fmt]
@@ -129,7 +169,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # setup-zig keys its cache by job id, which all matrix jobs share.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          cache-key: ${{ matrix.target }}
       - name: Build libghostty-vt
         env:
           GX_TARGET: ${{ matrix.target }}
@@ -142,6 +185,10 @@ jobs:
     defaults:
       run:
         shell: pwsh
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      # Keep zig_test.py scheduling timings inside the directory setup-zig caches.
+      GX_ZIG_TEST_TIMINGS_DIR: .zig-cache/gx-test-timings
     steps:
       - name: Keep repository line endings
         run: |
@@ -151,9 +198,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-      - name: libghostty-vt tests
+      - name: libghostty-vt tests, sharded across processes
         run: |
-          zig build test-lib-vt
+          python scripts/zig_test.py --suite vt --json "$env:RUNNER_TEMP/gx-zig-test/windows.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build libghostty-vt
         run: |
@@ -166,6 +213,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./zig-out/bin/c_vt_static.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the zig_test report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-zig-test-windows
+          path: ${{ runner.temp }}/gx-zig-test/
+          if-no-files-found: ignore
+          retention-days: 14
 
   gtk-smoke:
     if: github.event_name == 'workflow_dispatch' && inputs.gtk_smoke

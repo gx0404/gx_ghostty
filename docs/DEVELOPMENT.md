@@ -9,6 +9,7 @@
 - Git、`just`、Python ≥ 3.10（框架脚本只用标准库；3.10 需已装 `tomli`）。
 - Windows：Visual Studio 2022 Build Tools（MSVC）与 Windows SDK；另需在「设置 → 系统 → 开发者选项」开启开发者模式，允许非管理员创建符号链接，否则 `just test-vt` 中 `src/lib/tinyio` 的符号链接用例会以 `PermissionDenied` 失败。
 - 网络：`just setup` 要下载 Zig 与 graphify；首次 `zig build` 还会拉取 `build.zig.zon` 声明的依赖。
+- 内存：`just test-vt` 并行编译两个 lib-vt 测试二进制时，每个 LLVM 编译进程约占 6 GB。
 
 然后在仓库根依次运行：
 
@@ -22,7 +23,7 @@ just install-hooks  # core.hooksPath=.githooks，启用 commit-msg 提交规范�
 - `just doctor`（`setup_env.py --check`）：不安装，不在仓库里建任何东西（符号链接探测只用系统临时目录并随即删除）。必需项是 zig、python、git、MSVC（仅 Windows）、venv、graphify，任一为 MISSING 就退出 1；hooksPath、Windows 上的符号链接权限（`symlink`，未开开发者模式时为 OPTIONAL）与 codex、claude、kimi、zcode、actionlint、uv 只报 FOUND 或 OPTIONAL。每项都给出修复提示。
 - `just install-hooks`：只改本仓 `.git/config` 的 `core.hooksPath`。不装也能开发，但 `gx-ci` 的 `framework` job 按同一规则校验首父链提交，不合规的提交 push 后一样会红。
 
-装好后用 `just framework-check` 确认框架本身是绿的，再用 `just ci-check` 确认 Zig 链路可用。
+装好后用 `just framework-check` 确认框架本身是绿的，再用 `just ci-check` 确认 Zig 链路可用。首次 `just ci-check` 要拉依赖并编译测试二进制，远比日常慢；之后热缓存下约 100 s，改过 Zig 源码再加约 2 min 编译（见 TESTING.md「并行运行器与耗时」）。
 
 ## 日常闭环（九步）
 
@@ -30,7 +31,7 @@ just install-hooks  # core.hooksPath=.githooks，启用 commit-msg 提交规范�
 
 ### 1. 验收点
 
-动手前写下「做完长什么样」：可观察的行为、要跑的命令、要过的测试，GUI 可见的改动还要写明截图要证明什么。同时判断每个验收点能在哪里证明：Windows 本机只能跑 libghostty-vt 测试和库构建，GTK、macOS 与 Linux 完整测试要靠 `gx-ci`（见 TESTING.md）。给不出可验证验收点的任务，先和人对齐。
+动手前写下「做完长什么样」：可观察的行为、要跑的命令、要过的测试，GUI 可见的改动还要写明截图要证明什么。同时判断每个验收点能在哪里证明：Windows 本机只能跑框架单测、`just fmt-check` 与 libghostty-vt 的测试和构建（`just test` 在 Windows 上退出 2，`just build` 退出 1，见下文「Windows 注意事项」），GTK、macOS、完整单测与非 vt 代码的编译要靠 `gx-ci` 或 Linux/macOS 开发机（见 TESTING.md）。给不出可验证验收点的任务，先和人对齐。
 
 ### 2. 加载规则
 
@@ -54,19 +55,19 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 
 | 改动 | 命令 |
 |---|---|
-| libghostty-vt（根模块 `src/lib_vt.zig`、`src/terminal/c/**`、`include/ghostty/**`） | `just test-vt -Dtest-filter=<名>` |
-| 其他 Zig 核心代码 | `just test -Dtest-filter=<名>`（Windows 上为尽力而为） |
+| libghostty-vt（根模块 `src/lib_vt.zig`、`src/terminal/c/**`、`include/ghostty/**`） | `just test-vt --filter <名>` |
+| 其他 Zig 核心代码 | Linux/macOS 上 `just test --filter <名>`；Windows 上 `just test` 退出 2，记 PENDING 交给 `gx-ci` 的 `linux-main`；改动也编进 libghostty-vt 时（如 `src/terminal/`），本机先跑 `just test-vt` |
 | 任意 `.zig` 文件 | `just fmt-check`，需要改格式时 `just fmt` |
-| 框架脚本、hook、workflow | `python -m unittest scripts.test_<名> -v`（Linux 用 `python3`），再 `just framework-test` |
+| 框架脚本、hook、workflow | `python scripts/run_unittests.py test_<名>`（Linux 用 `python3`；看单个方法用 `python -m unittest scripts.test_<名>.<类>.<方法> -v`），再 `just framework-test` |
 | 路由、领域文档、根 `AGENTS.md` | `just rules-check` |
 
-`-Dtest-filter` 是子串匹配；经 `just` 传的参数里不要带空格，原因与绕过办法见 MAKE_COMMANDS.md「约定」。
+`--filter` 按用例全名做子串匹配，在运行期筛选、不重新编译，可重复给出取并集；一条都没命中时退出 2。`-Dtest-filter` 仍会透传给 zig build，但它在编译期裁剪用例，每换一个值就重编一次测试二进制，定向时优先 `--filter`；它裁掉全部用例时运行器同样退出 2，报错会写明是哪一种。值里含空格时，经 `just` 要写内嵌引号，或改为直接调用脚本，见 MAKE_COMMANDS.md「约定」。
 
 ### 5. 适用集成与 CI
 
 按改动面挑选；不适用的写明原因。
 
-- 本机聚合门：`just ci-check`（framework-check → fmt-check → test-vt），提交前必跑。
+- 本机聚合门：`just ci-check`（framework-check → fmt-check → test-vt），提交前必跑；热缓存约 100 s。Linux/macOS 开发机另跑完整单测 `just test`；它只跑 `ghostty-test`，macOS app 的单测另用 `macos/build.nu --action test`。
 - C API 或头文件：`just build-vt`；示例在各自目录里用钉版 Zig 构建，例如在 `example/c-vt-static` 下执行 `python ../../scripts/zigw.py build`（Linux/macOS 用 `python3`；`just` 的配方总在仓库根执行，进不了示例目录）；ABI 清单用 `just zig build test-lib-vt-schema`，前置见 TESTING.md。
 - wasm：`just vt-wasm`，再用 `node test/wasm-alloc.mjs zig-out/bin/ghostty-vt.wasm` 做分配器冒烟。
 - 其他目标：`just build-vt -Dtarget=<triple>`；源码包：`just dist-vt`。
@@ -74,7 +75,7 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 
 ### 6. 修复复测
 
-失败时先看完整输出，判断是代码问题、环境问题还是前置缺失。修复后用同一条命令复测，必要时再扩大一层。失败输出要保留，不能用后一次成功覆盖前一次失败的记录。缺环境不等于通过：没能运行的检查补齐前置后补跑，否则记 PENDING 并写补验命令；命令已实际运行、因前置缺失而失败的（如未开开发者模式时 `just test-vt` 的 4 处符号链接用例）记 FAIL 并注明原因。
+失败时先看完整输出，判断是代码问题、环境问题还是前置缺失。`just test-vt` / `just test` 失败时，结论行之后会打印一条可直接复制执行的完整复现命令，形如 `python scripts/zig_test.py <本次的 --suite/--binary、-D、--zig-arg、--no-build、非默认的 --timeout> --seed 0x… --filter <引好的用例全名>`，先原样执行它定向重跑；用例名含空格，所以它绕过 just 直接调用脚本，不能把这些参数接在 `just test-vt` 后面。怀疑是分片或执行顺序引起的，再用上游串行路径 `just zig build test-lib-vt` 对照。修复后用同一条命令复测，必要时再扩大一层。失败输出要保留，不能用后一次成功覆盖前一次失败的记录。缺环境不等于通过：没能运行的检查补齐前置后补跑，否则记 PENDING 并写补验命令；命令已实际运行、因前置缺失而失败的（如未开开发者模式时 `just test-vt` 的 4 处符号链接用例）记 FAIL 并注明原因。
 
 ### 7. 生成物与版本
 
@@ -97,7 +98,7 @@ just rules-review <本轮全部路径…>
 
 - 改动清单与各自的真源；
 - 实际跑过的命令及退出码，逐项标 PASS / FAIL / PENDING / N/A（判定见 TESTING.md「证据规则」）；
-- PENDING 项的原因与补验命令，例如「push 后看 `gx-ci` 的 `linux` job」；
+- PENDING 项的原因与补验命令，例如「push 后看 `gx-ci` 的 `linux-main` job」；
 - 建议的提交信息与拆分方式。
 
 只精确暂存本轮相关文件。提交前先提出 commit message 与用户对齐；没有明确要求不 commit、不 push。
@@ -105,10 +106,11 @@ just rules-review <本轮全部路径…>
 ## Windows 注意事项
 
 - **MSVC**：Windows 目标未指定 ABI 时默认用 MSVC ABI（`src/build/Config.zig::init` 的目标解析，避免 MSVC 链接器拒收 GNU ABI 目标文件），所以本机构建需要 MSVC 与 Windows SDK，`just doctor` 会报告二者是否可用。显式 `-Dtarget=x86_64-windows-gnu` 不走这条默认，`gx-ci` 的交叉矩阵里就有这个目标。
-- **没有 app**：`src/apprt/runtime.zig::Runtime.default` 只在 Linux、FreeBSD 上选 `gtk`，其余平台都是 `none`。因此 Windows 上 `just build` 只产出库：libghostty-vt（`ghostty-vt.dll`、`ghostty-vt-static.lib`）和 libghostty-internal（`ghostty-internal.dll`、`ghostty-internal-static.lib`）；i18n 默认关闭。GUI 相关验收在本机记 PENDING：GTK 由 `gx-ci` 的 `gtk-smoke` 截图补证；macOS app 只能由 `gx-release` 构建出未正式签名的包，没有自动化 GUI 冒烟。
-- **主测试是 test-vt**：上游 CI 在 Windows 只跑 `test-lib-vt`、`-Demit-lib-vt` 构建和 C 示例，2026-08-28 起不再在 Windows 跑完整 `zig build test`。本机以 `just test-vt` 为准。`just test` 可以跑，但结果只代表 Windows 本机，失败如实记 FAIL，也不能代替 Linux 完整测试。
+- **没有 app，只能构建 libghostty-vt**：`src/apprt/runtime.zig::Runtime.default` 只在 Linux、FreeBSD 上选 `gtk`，其余平台都是 `none`，所以 Windows 上默认 `install` 要构建 libghostty-vt 与 libghostty-internal（`ghostty-internal.dll`、`ghostty-internal-static.lib`）。后者编译不过：`src/build/SharedDeps.zig::add` 给每个经它装配的产物（libghostty-internal、`ghostty` exe、`ghostty-test`、`-Demit-bench` 的工具）无条件加上 translate-c 导入 `posix_c`（`errno.h`、`pwd.h`、`signal.h`、`sys/types.h`、`unistd.h`），MSVC 目标找不到 `pwd.h`，两条库链都停在 `translate-c posix_c.h`。因此本机 `just build` 退出 1。Windows 上构建库用 `just build-vt`（`zig build -Demit-lib-vt`；libghostty-vt 不经 `SharedDeps.add`），测试用 `just test-vt`，`gx-ci` 的 `windows` job 跑的也是这两项。i18n 默认关闭。GUI 相关验收在本机记 PENDING：GTK 由 `gx-ci` 的 `gtk-smoke` 截图补证；macOS app 只能由 `gx-release` 构建出未正式签名的包，没有自动化 GUI 冒烟。
+- **主测试是 test-vt**：上游 CI 在 Windows 只跑 `test-lib-vt`、`-Demit-lib-vt` 构建和 C 示例，2026-08-28 起不再在 Windows 跑完整 `zig build test`；完整单测 `ghostty-test` 也因同一个 `posix_c` 导入编译不过。所以 `just test` 在 Windows 上不构建，直接以退出码 2 结束并说明原因。本机全量就是 `just ci-check`（框架单测、`just fmt-check`、`just test-vt`）。非 vt 的 Zig 代码在本机没有编译检查：它由 `gx-ci` 的 `linux-main`（`-Dapp-runtime=none` 编译并运行整个 `ghostty-test`）与 Linux/macOS 开发机覆盖，本机记 PENDING；只在 Windows 目标上才编译的非 vt 分支（如 ConPTY）在这两处也不会被分析，目前没有任何编译检查。上游手测程序 `test/windows/test_dll_init.c` 要先构建 `ghostty-internal.dll`，现在无法执行，记 PENDING（受阻）。
+- **编译耗时**：改过 Zig 源码后，`just test-vt` 要用 LLVM 重新编译 `ghostty-vt`、`ghostty-vt-c` 两个 Debug 测试二进制，两次编译并行，约 2 min。这段时间省不掉：Zig 自托管后端在 Windows 上编出的测试二进制无法运行。运行器给测试构建钉住版本串（`X.Y.Z-dev+0000000`），换提交不会让缓存失效；源码没变时构建步骤 1 秒内完成。
 - **python 别名**：`justfile` 在 Windows 上调用 `python`，其他平台调用 `python3`。`%LOCALAPPDATA%\Microsoft\WindowsApps` 下的 `python.exe`、`python3.exe` 是应用执行别名：可能转到 Python 安装管理器（找不到匹配运行时会把 Python 装进当前目录，`.gitignore` 的 fork 段因此忽略 `/Python/`），也可能只是 Microsoft Store 占位程序。`scripts/setup_env.py::find_real_python` 建 venv 时跳过这类别名，`just doctor` 显示实际解析到的解释器；`.githooks/commit-msg` 也只用能实际运行的 `python3` 或 `python`。`zig build test-lib-vt-schema` 由 `build.zig` 直接调用 `python3`，这个名字同样必须能运行。
-- **本机状态都在 `.local/`**：钉版 Zig、Zig 全局缓存（未设置 `ZIG_GLOBAL_CACHE_DIR` 时 `scripts/zigw.py` 指向 `.local/zig-cache/global`）和图谱 venv 都在仓内 `.local/`，由 `.gitignore` 的 fork 段忽略，不写用户全局目录。构建输出与依赖工作副本仍在上游默认的 `zig-out/`、`.zig-cache/`、`zig-pkg/`，已被上游 `.gitignore` 忽略。agent 的文件编辑工具被 hook 禁止写 `.local/`；删除 `.local/` 后要重新 `just setup`，Zig 依赖也会重新下载。
+- **本机状态都在 `.local/`**：钉版 Zig、Zig 全局缓存（未设置 `ZIG_GLOBAL_CACHE_DIR` 时 `scripts/zigw.py` 指向 `.local/zig-cache/global`）、图谱 venv 和两个测试运行器的耗时缓存（`.local/test-timings/`，只影响调度顺序）都在仓内 `.local/`，由 `.gitignore` 的 fork 段忽略，不写用户全局目录。构建输出与依赖工作副本仍在上游默认的 `zig-out/`、`.zig-cache/`、`zig-pkg/`，已被上游 `.gitignore` 忽略。agent 的文件编辑工具被 hook 禁止写 `.local/`；删除 `.local/` 后要重新 `just setup`，Zig 依赖也会重新下载。
 - **换行**：本机 `core.autocrlf=true`。上游 `.gitattributes` 已把 `.zig`、`.md`、`.py`、`.toml`、`.yml` 等固定为 LF，但 `justfile`、`.graphifyignore`、`.conf` 与无扩展名的 hook 不在其中，检出后可能是 CRLF。框架脚本一律用 `splitlines()` 解析，容忍 CRLF；`.githooks/.gitattributes` 把 hook 固定为 LF。提交前跑 `git diff --check`。
 - **shell**：`just` 在 Windows 上用 `cmd.exe` 执行配方（`justfile` 的 `set windows-shell`），所以从 cmd、PowerShell、Git Bash 调用效果相同。配方都是单行 Python 调用，不依赖 POSIX shell。参数是不加引号拼进命令行的：含 `& | < > ^ %` 的自由文本（以及单条提交标题）会被 cmd 解释，这时直接调用脚本，如 `python scripts/conventional_commits.py "<标题>"`、`python scripts/agent_kb.py "<查询>"`。
 
@@ -170,7 +172,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 - **根 `AGENTS.md`**：标记行 `<!-- gx-fork: … -->` 以上整段取上游新版本，标记及以下保留 fork 段。再核对上游新内容有没有让 fork 段里的命令或描述失效，需要时改 fork 段与对应领域文档。合并后超过 16 KiB 时压缩 fork 段，不删改上游原文。
 - **`.gitignore`、`.prettierignore`**：上游行取上游版本；以 `# --- GX fork：` 开头的追加段原样保留在文件末尾。
 - **workflow**：上游修改已归档的 workflow 时，Git 的重命名检测通常会把改动直接落到 `.github/workflows-archive/<name>.yml`，不产生冲突；上游删除已归档的 workflow 时出现 rename/delete 冲突，跟随上游删除归档副本（`git rm`）；上游新增的 workflow 会出现在 `.github/workflows/`，必须原样 `git mv` 进 `.github/workflows-archive/`。最终启用的只能是 `gx-ci.yml` 与 `gx-release.yml`，由 `scripts/test_gx_workflows.py` 锁定。以上 Git 行为已在临时仓库中用 Git 2.56 验证。归档文件有增删时，同步更新 `scripts/test_gx_workflows.py` 的 `ARCHIVED` 清单与 `.github/workflows-archive/README.md` 的用途表；`gx-*.yml` 的每个 action 都复用归档里已钉的 SHA 与版本注释，上游升级钉版后旧 SHA 若不再出现在归档里，同一测试会失败，这时把 `gx-*.yml` 里的 SHA 改成上游的新值。
-- **fork 补丁**：按 `docs/FORK_PATCHES.md` 逐条核对补丁是否仍然需要、是否仍然成立（目前只有 `src/build/Config.zig::init` 的 GX-0001），标记与登记由 `scripts/test_fork_patches.py` 检查。
+- **fork 补丁**：按 `docs/FORK_PATCHES.md` 逐条核对补丁是否仍然需要、是否仍然成立（目前是 `src/build/Config.zig::init` 的 GX-0001 与 `build.zig::build` 的 GX-0002：后者三个纯新增块注册 `test-lib-vt-bin`、`test-bin`，上游改动测试对象时按该节「同步冲突处理」放回），标记与登记由 `scripts/test_fork_patches.py` 检查。
 - **其余上游文件**：取上游版本。不用整文件 ours/theirs 糊过冲突，也不用 squash、cherry-pick 或 rebase 代替合并。
 
 **5. 登记新路径、嵌套 AGENTS 与钉版 Zig**

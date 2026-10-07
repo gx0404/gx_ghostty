@@ -71,6 +71,6 @@
   - 库：`just build -Demit-macos-app=false`，可加 `-Dxcframework-target=native` 提速。
   - App 与单测：`macos/build.nu`，`macos/build.nu --action test`。
   - Swift：在仓库根跑 `swiftlint lint --strict`；fork CI 不跑 swiftlint，没跑过就不得声称通过。
-  - Darwin 专用 Zig：`just test -Dtest-filter=<name>`，例如 `src/os/macos.zig` 的 `cacheDir paths`（在非 Darwin 上不会真正执行）。
+  - Darwin 专用 Zig：`just test --filter <name>`，例如 `src/os/macos.zig` 的 `cacheDir paths`（在非 Darwin 上不会真正执行）。`just test` 只跑 `ghostty-test`，不含上游 `zig build test` 不带 `-Dtest-filter` 时挂上的 `xcodebuild test`，app 单测仍用上一条的 `macos/build.nu --action test`。
   - AppleScript：按 `macos/AGENTS.md` 的 osascript 步骤。
-- **CI**：手动触发 gx-ci 并打开 `macos` 输入，运行 `macos` job。它只证明 macOS 上能构建，不代证签名、公证与交互。`gx-release` 只在输入 `macos=true` 时产出未签名的 app zip。job 定义以 `.github/workflows/gx-ci.yml`、`gx-release.yml` 为准，首跑之前一律 PENDING。
+- **CI**：手动触发 gx-ci 并打开 `macos` 输入，运行 `macos` job。它只跑 `zig build test-lib-vt`：证明 libghostty-vt 在 macOS 上能构建并通过单测，不构建 app，不代证签名、公证与交互。`gx-release` 只在输入 `macos=true` 时产出未签名的 app zip。job 定义以 `.github/workflows/gx-ci.yml`、`gx-release.yml` 为准，首跑之前一律 PENDING。

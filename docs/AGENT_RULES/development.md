@@ -15,6 +15,7 @@
 - 根 `AGENTS.md`：上游原文在前，标记行 `<!-- gx-fork: AI 协作框架（fork 维护段，上游没有；同步时保留）-->` 之后是 fork 段；`CLAUDE.md` 是指回它的薄入口。
 - `.claude/hooks/dangerous_patterns.conf`：危险操作策略唯一真源（`SECTION<TAB>regex<TAB>reason<TAB>deny|ask`），Claude、Codex、ZCode 的 PreToolUse 适配器只读取它；探针 `scripts/test_ai_tool_hooks.py`；接入与逐客户端验证账本 `docs/AI_TOOLS.md`。
 - `justfile` 与命令手册 `docs/MAKE_COMMANDS.md`；Zig 封装 `scripts/zigw.py`，环境 `scripts/setup_zig.py`、`scripts/setup_env.py`。
+- 测试运行器：`scripts/zig_test.py`（`just test-vt`、`just test`，分片运行 GX-0002 步骤装好的测试二进制）与 `scripts/run_unittests.py`（`just framework-test`），锁定测试 `scripts/test_zig_test.py`、`scripts/test_run_unittests.py`；耗时缓存只写 `.local/test-timings/`。
 - 生成物管线：`scripts/graphify.py`、`scripts/graphify_fingerprint.py`、`.graphifyignore`；`scripts/build_agent_kb.py`（默认只检查，`--confirm` 才写入）、`scripts/agent_kb.py`。
 - fork 补丁：`docs/FORK_PATCHES.md` 与 `scripts/test_fork_patches.py`。上游同步与交付闭环的步骤细则：`docs/DEVELOPMENT.md`。
 
@@ -39,6 +40,7 @@
 - `.claude/`、`.codex/`、`.zcode/` 只把 `.gitignore` fork 段白名单列出的无凭据配置入库（settings / config、hooks、rules、reviewer、README），会话、认证与本机覆盖留在本机；`.kimi-code/` 整目录忽略；`.agents/` 是上游内容，原样保留且不忽略。
 - 危险模式只改 `dangerous_patterns.conf` 一处，适配器不内嵌副本；工具规则文件、reviewer 定义与 `CLAUDE.md` 只提醒运行 resolver，不复制领域正文。hook 是安全门，不加载规则，也不静默改写源码。
 - 客户端是否生效以 `docs/AI_TOOLS.md` 的验证账本为准：配置能解析不等于会话已加载，未实测的记 PENDING。
+- `GX_GATE_WATCHDOG_SECONDS` 只给测试缩短 hook 求值看门狗（`.claude/hooks/pre_tool_use_gate.py::evaluation_deadline` 只认 (0, 10] 秒）；不写进 hook 配置或会话环境，否则 hook 提前超时并按拒绝处理。
 
 ### 脚本约定
 
@@ -46,14 +48,14 @@
 - 仓库根取 `Path(__file__).resolve().parents[1]`（显式 `--root` 除外），不依赖当前目录。
 - UTF-8 读写、写出 LF；文本按 `splitlines()` 解析并用 CRLF 样例测试：本机 `core.autocrlf=true`，上游 `.gitattributes` 不覆盖 `.conf`、`.graphifyignore`、`justfile` 与无扩展名钩子（钩子由 `.githooks/.gitattributes` 强制 `eol=lf`）。
 - 同一脚本在 cmd、PowerShell、Git Bash 与 Linux CI 上行为一致；需要真实解释器路径时用 `scripts/setup_env.py::find_real_python`，它跳过 WindowsApps 别名。
-- 违规返回非 0 且原样传递；测试为 `scripts/test_*.py`（unittest、临时目录、不联网、不改真实仓库）。
+- 违规返回非 0 且原样传递；测试为 `scripts/test_*.py`（unittest、临时目录、不联网、不改真实仓库），放在 `scripts/` 顶层。`run_unittests.py` 把每个 TestCase 类放进独立子进程并行跑：类之间不共享可变状态、不依赖执行顺序；拖慢整机进程创建的类设 `RUN_LAST = True`。
 
 ### just 入口与四个门
 
 - `justfile` 在 Windows 经 `cmd.exe` 执行（`set windows-shell`），解释器在 Windows 取 `python`、其余取 `python3`；配方体只写单条命令（Python 脚本调用，`install-hooks` 是 `git config`），串联的门用配方依赖表达，不写 POSIX 守卫或多行 shell。`.githooks/commit-msg` 必须以可执行模式入库（`git add --chmod=+x`），由提交规范测试锁定。默认配方 `just --list`。上游 `Makefile` 不改，也不作 fork 入口。
-- `just framework-check`：rules-check → version-check → framework-test → kb-check；不需要 Zig，几秒级，改规则、脚本、文档后必跑。
+- `just framework-check`：rules-check → version-check → framework-test → kb-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
 - `just generated-check`：kb-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑同样两项检查。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
-- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干，需要钉版 Zig。
+- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含 Windows 编不出的完整单测），需要钉版 Zig；热缓存约 100 s，改过 Zig 源码另加约 2 min 编译。
 - `just doctor`：`setup_env.py --check` 只读诊断，标 FOUND / MISSING / OPTIONAL；必需项是 zig、python、git、venv、graphify 与 Windows 上的 MSVC，缺任一项退出 1；hooksPath、Windows 符号链接权限（`symlink`）与 codex / claude / kimi / zcode 等 CLI 只作可选项报告。它只报告并给出修复命令，不隐式安装。配方参数不加引号拼进 cmd 命令行，含 shell 元字符的自由文本改为直接调用脚本。
 
 ### 工具链本地性
@@ -71,9 +73,10 @@
 
 ### fork 补丁登记
 
-- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、`src/build/Config.zig`（GX-0001）以及归档的 workflow；其余框架内容都在上游没有的新路径。
+- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、`src/build/Config.zig`（GX-0001）、`build.zig`（GX-0002）以及归档的 workflow；其余框架内容都在上游没有的新路径。
 - 改上游源码（`src/`、`include/`、`pkg/`、`macos/` 与 `build.zig`）必须紧邻改动写 `fork(gx): GX-NNNN` 标记注释，并在 `docs/FORK_PATCHES.md` 登记原因与移除条件；`scripts/test_fork_patches.py` 扫描这些路径，锁定标记与登记的闭集。追加段与新路径不是源码补丁，不登记。未登记的标记、无标记的上游语义改动都是缺陷；不为「顺手」重排或重格式化上游文件。
 - GX-0001：`src/build/Config.zig::init` 让 HEAD 上不以 `v` 开头的 tag（如 `gx-v0.1.0`）与 `tip` 一样跳过发布校验，退回分支预发布版本而不 `@panic`；版本契约见 `ci-release.md`。
+- GX-0002：`build.zig::build` 的三个纯新增块注册 `test-lib-vt-bin`、`test-bin`，只编译并安装测试二进制、不运行；安装路径与 `scripts/zig_test.py::SUITES` 一一对应，改一边要同步另一边。
 
 ### 上游同步摘要
 
@@ -102,7 +105,8 @@
 ## 验证
 
 - 改路由、领域文档或根 `AGENTS.md`：`just rules-check`，再 `just framework-check`；查某次改动的必读规则：`just rules <paths>`。
-- 改 `scripts/**`、`.githooks/**`、hook 策略或工具配置：`just framework-test`，再 `just framework-check`。
+- 改 `scripts/**`、`.githooks/**`、hook 策略或工具配置：先 `python scripts/run_unittests.py test_<名>`，再 `just framework-test` 与 `just framework-check`。
+- 改两个测试运行器：除各自单测外再真实跑一次 `just test-vt`（Linux/macOS 加 `just test`）或 `just framework-test`，核对用例总数分别与上游串行路径、`python -m unittest discover -s scripts -p "test_*.py"` 一致。
 - 改 `justfile`、`scripts/zigw.py`、`scripts/setup_*.py`：`just doctor`，有钉版 Zig 时 `just ci-check`。
 - 改 KB 语料：`just kb` 后 `just kb-check`；改被索引源码或图谱管线：`just graph` 后 `just graph-check`。
 - 上游同步完成的标准：`just framework-check`、`just ci-check`、`just generated-check` 全部通过；未运行项记 PENDING 并附补跑命令。

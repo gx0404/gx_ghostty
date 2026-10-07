@@ -12,10 +12,11 @@
 
 | 步骤 | 内容 | 条件 |
 |---|---|---|
-| `install`（默认） | 安装到 `zig-out/` | Windows 只有库：`ghostty-vt` 动态/静态库，非 lib-vt 模式另有 `ghostty-internal` |
+| `install`（默认） | 安装到 `zig-out/` | `app-runtime=none` 且非 lib-vt 模式时还要构建 `ghostty-internal`；它在 Windows 上编译不过，默认 `install` 因此失败（见「平台」）。Windows 只有库可产出：`-Demit-lib-vt` 的 `ghostty-vt` 动态/静态库 |
 | `run` / `run-valgrind` | 运行 app / valgrind 下运行 | `app-runtime` 不为 `none`；macOS 的 `run` 打开原生 app |
-| `test` | 以 `src/main.zig` 为根的 `ghostty-test`（Debug、baseline CPU） | `-Demit-lib-vt` 时为空步骤 |
+| `test` | 以 `src/main.zig` 为根的 `ghostty-test`（Debug、baseline CPU） | `-Demit-lib-vt` 时为空步骤；macOS 上未给 `-Dtest-filter` 时另经 `addTestStepDependencies` 挂上 macOS app 的 `xcodebuild test`（`just test` 不含） |
 | `test-lib-vt` / `test-lib-vt-build` | `ghostty-vt`、`ghostty-vt-c` 两个模块的测试 / 只编译 | 始终定义 |
+| `test-lib-vt-bin` / `test-bin` | fork 补丁 GX-0002：把上面两个测试二进制装到 `zig-out/test/vt/`、`zig-out/test/vt_c/`，把 `ghostty-test` 装到 `zig-out/test/`，不运行（成功不代表测试通过），供 `scripts/zig_test.py` 分片 | 始终定义；`test-bin` 在 `-Demit-lib-vt` 时失败（退出码 1），在 Windows 上与 `test` 一样编译不出 `ghostty-test`（缺 `pwd.h`） |
 | `test-lib-vt-schema` | `python3` 运行 `src/terminal/c/types-schema-verify.py` 校验 ABI 清单 | native freestanding 目标报错 |
 | `test-valgrind` | valgrind 下跑 `ghostty-test` | 需 valgrind（Linux） |
 | `update-translations` | 重写 `po/` 的 pot 与 po | i18n 关闭时报错 |
@@ -64,6 +65,7 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 
 ### 平台
 
+- Windows 原生构建只能产出 libghostty-vt：`src/build/SharedDeps.zig::add` 给每个经它装配的编译步骤（`GhosttyLib`、`GhosttyExe`、`GhosttyBench` 与 `ghostty-test`）无条件加上 translate-c 导入 `posix_c`（`errno.h`、`pwd.h`、`signal.h`、`sys/types.h`、`unistd.h`），MSVC 目标找不到 `pwd.h`。默认 `install`（`app-runtime=none` 时构建 `ghostty-internal.dll` 与 `ghostty-internal-static.lib`）、`test`、`test-bin` 与 `-Demit-bench` 因此都以退出码 1 失败；lib-vt 只经 `SharedDeps.addSimd`，`-Demit-lib-vt` 构建与 `test-lib-vt` 不受影响。非 vt 代码在本机没有编译检查，交 gx-ci `linux-main` 与 Linux/macOS 开发机，本机记 PENDING；只在 Windows 目标上才编译的非 vt 分支目前哪里都不编译。修复属于上游源码改动，而且不止这一处（`docs/FORK_PATCHES.md` 的 GX-0002 节记有跳过 `posix_c` 后的下一个编译错误），动手前先按 GX-NNNN 登记。
 - Windows 原生构建需要人类安装 Visual Studio（Build Tools 即可）的 C++ 工具集与 Windows SDK，`just doctor` 检查前者。`x86_64-windows-msvc` 不能从 Linux 交叉编译（归档的上游 `test.yml` 注释：缺 MSVC 头文件）；显式写 `x86_64-windows-gnu` 不受强制 msvc 影响，可以交叉。
 - `nix/devShell.nix`（经 `flake.nix` 与 `.envrc` 的 `use flake` 加载）是上游 CI 的统一环境，带 zon2nix、valgrind、pandoc、blueprint-compiler 等；gx-ci 与本机都不用 Nix。
 
@@ -74,7 +76,7 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 - 生成物默认只检查；只有有意变更时才用登记表中的生成器重建，并审 diff。
 - `test` 不依赖 `test-lib-vt`（`build.zig::build` 中那条依赖被注释掉），二者是独立的门，互不代证。
 - 产品版本只随上游同步变化：fork 不改 `build.zig.zon` 的 `.version` 与 `nix/package.nix` 等处的硬编码版本；fork 版本只体现在 `CHANGELOG.md` 与发布时的 `-Dversion-string`。
-- `src/build/Config.zig` 上唯一的 fork 改动是带 `fork(gx)` 标记的 GX-0001；再改上游构建文件须按 GX-NNNN 登记（`development.md`），不顺手重排或重格式化。
+- 上游构建文件上的 fork 改动只有两处，都带 `fork(gx)` 标记：`src/build/Config.zig` 的 GX-0001，`build.zig` 的 GX-0002（三个纯新增块）；再改上游构建文件须按 GX-NNNN 登记（`development.md`），不顺手重排或重格式化。
 - fork 内经 just 配方调用钉版 Zig。`CMakeLists.txt` 的 `find_program`、`distcheck` 的内层命令与 CMake 示例都从 PATH 找 `zig`；PATH 上没有 0.16.x 时这些路径记 PENDING。
 
 ## 禁止项
@@ -86,8 +88,9 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 
 ## 验证
 
-- 改构建逻辑或选项：`just zig build --help`、`just build`、`just build-vt`，再 `just test -Dtest-filter=<名>` 与 `just test-vt`，收尾 `just ci-check`。
+- 改构建逻辑或选项：`just zig build --help`、`just build`（Windows 上必然退出 1，见「平台」；本机只能证明 `just build-vt`，完整构建记 PENDING，交 Linux/macOS 开发机）、`just build-vt`，再 `just test --filter <名>`（只在 Linux/macOS 可跑，Windows 上退出 2，记 PENDING 交 `gx-ci` 的 `linux-main`）与 `just test-vt`，收尾 `just ci-check`。
 - 改版本推导：分支 HEAD 上 `just zig build --help` 成功；按 `docs/FORK_PATCHES.md` 中 GX-0001 的「验证」步骤，在 `.local/tmp/` 的临时 clone 里打 `gx-v0.0.0` tag 做正反证（不在真实仓库打 tag）；再跑 `python -m unittest scripts.test_fork_patches`。
+- 改测试安装步骤（GX-0002）：按 `docs/FORK_PATCHES.md` 中 GX-0002 的「验证」步骤确认步骤列表与 `zig-out/test/` 下的产物，再跑 `python -m unittest scripts.test_fork_patches`。
 - 改依赖：在 Nix 主机上 `nix develop -c ./nix/build-support/check-zig-cache.sh` 通过；本机没有 Nix 时记 PENDING 并附该命令。
-- 改 `pkg/<名>`：该包有 `test` 步骤时在 `pkg/<名>/` 下运行 `python ../../scripts/zigw.py build test`（Linux/macOS 用 `python3`），再用 `just build` 或 `just test-vt` 覆盖用到它的产物。
-- 跨平台改动：`just build-vt -Dtarget=<triple>` 交叉编译通过；只影响 Windows MSVC 的改动以本机原生构建或 gx-ci `windows` job 为证据。
+- 改 `pkg/<名>`：该包有 `test` 步骤时在 `pkg/<名>/` 下运行 `python ../../scripts/zigw.py build test`（Linux/macOS 用 `python3`），再用 `just build`（Windows 上不可用）或 `just test-vt` 覆盖用到它的产物；只被非 vt 产物使用的包在 Windows 本机没有编译检查，记 PENDING。
+- 跨平台改动：`just build-vt -Dtarget=<triple>` 交叉编译通过；只影响 Windows MSVC 的 lib-vt 改动以本机 `just build-vt`、`just test-vt` 或 gx-ci `windows` job 为证据，非 vt 部分在 Windows 上编不过（见「平台」），没有可用证据，记 PENDING。

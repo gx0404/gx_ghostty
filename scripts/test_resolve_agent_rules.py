@@ -134,7 +134,19 @@ class TempRepoCase(unittest.TestCase):
     """每个用例一个全新的临时 git 仓库（未提交；--others 让未跟踪文件同样 Git 可见）。
 
     全局与系统 git 配置被隔离，开发机上的 core.excludesFile 不会改变「Git 可见」集合。
+    每个类只在 setUpClass 里 git init 一次，用例复制这份全新的 .git，不再各起一个 git 进程。
     """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve()
+        gitconfig = base / "gitconfig"
+        gitconfig.write_bytes(b"")
+        env = {**CHILD_ENV, "GIT_CONFIG_GLOBAL": str(gitconfig), "GIT_CONFIG_NOSYSTEM": "1"}
+        cls.fresh_git_dir = base / "template" / ".git"
+        subprocess.run(["git", "init", "-q", str(cls.fresh_git_dir.parent)], check=True, env=env, capture_output=True)
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -151,7 +163,7 @@ class TempRepoCase(unittest.TestCase):
         self.root.mkdir()
         for relative, content in FILES.items():
             self.write(relative, content)
-        subprocess.run(["git", "init", "-q", str(self.root)], check=True, env=self.env, capture_output=True)
+        shutil.copytree(self.fresh_git_dir, self.root / ".git")
 
     def write(self, relative: str, content: str | bytes, *, crlf: bool = False) -> None:
         path = self.root.joinpath(*relative.split("/"))

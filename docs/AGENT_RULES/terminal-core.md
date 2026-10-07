@@ -86,12 +86,12 @@ Pin 与代际：
 
 ## 验证
 
-- 首选 `just test-vt -Dtest-filter=<名称>`：跑 `test-lib-vt`，Zig ABI 与 C ABI 两套模块都测；收尾去掉 filter 再跑一次 `just test-vt`。
-- 只在 app 产物中编译的代码不被 `test-vt` 覆盖（`tmux/`、`StringMap.zig`、`search/Thread.zig`、调用 `checkGhosttyHEnum` 的测试），用 `just test -Dtest-filter=<名称>`；Windows 上完整 `just test` 只是尽力而为，以 gx-ci 的 linux job 为准。
+- 首选 `just test-vt --filter <名称>`：分片运行 `test-lib-vt` 的同一对测试二进制，Zig ABI 与 C ABI 两套模块都测；收尾去掉 filter 再跑一次 `just test-vt`。
+- 只在 app 产物中编译的代码不被 `test-vt` 覆盖（`tmux/`、`StringMap.zig`、`search/Thread.zig`、调用 `checkGhosttyHEnum` 的测试），用 `just test --filter <名称>`；`just test` 只在 Linux/macOS 可跑（Windows 上直接退出 2），以 gx-ci 的 `linux-main` job 为准。
 - 触及 freestanding 路径（分配器、页分配、`sys`、`simd` 回退、feature gate）跑 `just vt-wasm`，它是 ReleaseSmall 构建，也能发现误用的 std 调试 IO；改 build options 或 lib 公开面跑 `just build-vt`。改 Zig 跑 `just fmt-check`。
 - 现成的差分守护：`Terminal: printSlice differential fuzz vs print`、`Terminal: graphemeWidth parity`、render 的 `incremental updates match full rebuild`。
-- 快照线格式：`just test-vt -Dtest-filter=snapshot`；Kaitai 交叉校验用上游脚本 `src/terminal/snapshot/verify-kaitai.py`，它要求 nix 开发环境，本机缺失时记 PENDING。
-- 压缩 codec：按 `src/terminal/compress/AGENTS.md` 跑 `lz4 differential`；穷举版先设环境变量 `GHOSTTY_LZ4_SLOW=1`，再运行 `just test -Dtest-filter="lz4 differential"`。
+- 快照线格式：`just test-vt --filter snapshot`；Kaitai 交叉校验用上游脚本 `src/terminal/snapshot/verify-kaitai.py`，它要求 nix 开发环境，本机缺失时记 PENDING。
+- 压缩 codec：按 `src/terminal/compress/AGENTS.md` 跑 `lz4 differential`，这组用例随 libghostty-vt 编译、在 vt 套件里；穷举版先设环境变量 `GHOSTTY_LZ4_SLOW=1`（运行器把环境原样传给测试进程），再运行 `python scripts/zig_test.py --suite vt --filter "lz4 differential"`：过滤串含空格，不经 just（Linux/macOS 用 `python3`），单条超过默认 600 s 时加 `--timeout <秒>`。
 - 改 `src/simd/codepoint_width.*`：按该文件注释临时启用被注释掉的逐码点比对测试。
 
 ## 上游指令

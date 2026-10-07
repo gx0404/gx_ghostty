@@ -53,10 +53,10 @@
 ## 验证
 
 - 路由：`just rules src/renderer/generic.zig` 列出必读集合；改本文档后跑 `just framework-check`。
-- 定向单测（以下都是纯 CPU 用例；`-Dtest-filter` 可重复，按测试名子串匹配，但仍要编出完整测试二进制，Windows 上属尽力而为）：
-  - `just test -Dtest-filter=shader -Dtest-filter=spirv`：glslang/spirv-cross 链路与自定义 uniform 布局。
-  - `just test -Dtest-filter=preedit -Dtest-filter=Contents -Dtest-filter=renderCellMap`：State、cell 缓冲与链接。
-  - `just test -Dtest-filter=kitty`（Kitty 图像）；`just test -Dtest-filter=Health`（对照 `include/ghostty.h`）。
-- 编译与格式：`just build` 在 Windows 只产出 `ghostty-internal` 库，GL/EGL 代码只编译不运行，上游 CI 不在 Windows 构建它，结果尽力而为；改 Zig 跑 `just fmt-check`。
+- 定向单测（以下都是纯 CPU 用例；`--filter` 可重复，在运行期按测试名子串筛选、不重新编译；`just test` 只在 Linux/macOS 可跑，Windows 上直接退出 2）：
+  - `just test --filter shader --filter spirv`：glslang/spirv-cross 链路与自定义 uniform 布局。
+  - `just test --filter preedit --filter Contents --filter renderCellMap`：State、cell 缓冲与链接。
+  - `just test --filter kitty`（Kitty 图像）；`just test --filter Health`（对照 `include/ghostty.h`）。
+- 编译与格式：Windows 上 `just build` 编不过 libghostty-internal（`build-system.md`「平台」），本机没有渲染器的编译检查，Windows 目标的 OpenGL 路径在 gx-ci 里也不被编译，记 PENDING；Linux 侧的编译与单测以 gx-ci `linux-main` 为准。改 Zig 跑 `just fmt-check`。
 - 改 `pkg/wuffs`：`just test-vt` 与 `just build-vt`（wasm32 不含 kitty graphics，`just vt-wasm` 覆盖不到它）；上游 CI 另在 `pkg/wuffs/` 下执行 `zig build test`，gx-ci 未覆盖，需手动补跑。
-- PENDING（本机没有 GPU 呈现路径）：真实 GL 渲染、DMABUF 导入与截图交 gx-ci 手动触发的 `gtk-smoke`（输入 `gtk_smoke`），读回截图后才记 PASS；Metal 与 CVDisplayLink 交 gx-ci 的 `macos`（输入 `macos`）或 macOS 本机；完整单测以 gx-ci `linux` job 的 `zig build -Dapp-runtime=none test` 为准。
+- PENDING（本机没有 GPU 呈现路径）：真实 GL 渲染、DMABUF 导入与截图交 gx-ci 手动触发的 `gtk-smoke`（输入 `gtk_smoke`），读回截图后才记 PASS；Metal 与 CVDisplayLink 只能在 macOS 本机验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，覆盖不到渲染器）；完整单测以 gx-ci `linux-main` job（`zig_test.py --suite main -Dapp-runtime=none`）为准。

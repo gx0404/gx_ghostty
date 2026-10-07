@@ -71,9 +71,9 @@
 
 ## 验证
 
-- 定向测试：`just test -Dtest-filter=parse:` 与 `just test -Dtest-filter=set:`（Binding）、`just test -Dtest-filter=RemapSet`、`just test -Dtest-filter=legacy:`、`just test -Dtest-filter=kitty:`、`just test -Dtest-filter=ctrlseq`、`just test -Dtest-filter=KittySequence`（key_encode）、`just test -Dtest-filter=shouldReport`（mouse_encode）、`just test -Dtest-filter=keyToMouseShape`。
-- 改五个编码文件或其闭包：再跑 `just test-vt -Dtest-filter=<同上>`、`just build-vt` 与 `just vt-wasm`。改 C 可见类型：`just test -Dtest-filter=ghostty.h`，以及 `just zig build test-lib-vt-schema`（脚本需要 Python 的 `jsonschema`，并提示在 `nix develop` 中运行；本机缺依赖时记 PENDING，交 `gx-ci` 的 `linux` job）。
-- `KeymapDarwin` 与 macOS option-as-alt：本机记 PENDING，交 `gx-ci` 手动触发的 `macos` job。GTK 下的实际按键体验同样记 PENDING，交 `gtk-smoke`。
+- 定向测试（`just test` 只在 Linux/macOS 可跑，Windows 上直接退出 2，交 `gx-ci` 的 `linux-main`）：`just test --filter parse:` 与 `just test --filter set:`（Binding）、`just test --filter RemapSet`、`just test --filter legacy:`、`just test --filter kitty:`、`just test --filter ctrlseq`、`just test --filter KittySequence`（key_encode）、`just test --filter shouldReport`（mouse_encode）、`just test --filter keyToMouseShape`。
+- 改五个编码文件或其闭包：再跑 `just test-vt --filter RemapSet --filter legacy: --filter kitty: --filter ctrlseq --filter KittySequence --filter shouldReport`（Binding 的 `parse:`、`set:` 与 `keyToMouseShape` 不在 lib-vt 里；这一组是 Windows 本机能跑的部分）、`just build-vt` 与 `just vt-wasm`。改 C 可见类型：`just test --filter ghostty.h`，以及 `just zig build test-lib-vt-schema`（脚本需要 Python 的 `jsonschema`，并提示在 `nix develop` 中运行；本机缺依赖时记 PENDING，交 `gx-ci` 的 `linux-vt` job）。
+- macOS：`key_encode`、`key_mods` 里的 option-as-alt 用例随 lib-vt，可交 `gx-ci` 手动触发的 `macos` job（它只跑 `zig build test-lib-vt`）；`KeymapDarwin` 只在 `ghostty-test` 里，要在 Mac 上跑 `just test`。本机两者都记 PENDING。GTK 下的实际按键体验同样记 PENDING，交 `gtk-smoke`。
 - 改 Zig 后跑 `just fmt-check`。
 
 ## 上游指令

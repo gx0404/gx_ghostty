@@ -72,7 +72,7 @@
 
 - **本机 Windows**：缺 GTK4、libadwaita、blueprint-compiler 与 gettext，且 Windows 默认 `-Di18n=false`（`update-translations` 直接报错）。GTK 的构建、单测、翻译与 Blueprint 检查一律记 **PENDING**，不记 N/A。本机只跑 `just rules <改动路径>` 与 `just fmt-check`（覆盖 GTK 的 Zig 源码）。
 - **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.16、gettext、pkg-config）：
-  - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk -Dtest-filter=<name>`。
+  - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`。
   - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.16.0）。
   - Blueprint：`nix/build-support/check-blueprints.sh` 后 `git diff --exit-code`（沿用上游 CI）。
   - 看译文：`zig-out/bin/ghostty --language=<locale>`。

@@ -19,8 +19,12 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterator
+from unittest import mock
 
 try:
     import tomllib
@@ -38,6 +42,7 @@ CLAUDE_RULES_DIR = REPO_ROOT / ".claude" / "rules"
 CLAUDE_REVIEWER = REPO_ROOT / ".claude" / "agents" / "code-reviewer.md"
 CODEX_CONFIG = REPO_ROOT / ".codex" / "config.toml"
 ZCODE_CONFIG = REPO_ROOT / ".zcode" / "config.json"
+WATCHDOG_ENV = "GX_GATE_WATCHDOG_SECONDS"
 
 TOPLEVEL = "$(git rev-parse --show-toplevel)"
 # Claude Code exports CLAUDE_PROJECT_DIR to hooks; the git fallback only works inside the checkout.
@@ -457,9 +462,38 @@ def _level(tool: str, tool_input: dict, **kwargs) -> str | None:
     return None if decision is None else decision.level
 
 
+def _probe_env(**overrides: str) -> dict:
+    """os.environ without the gate's watchdog override, then the overrides.
+
+    A value exported in the developer's shell would time out ordinary probes; the tests of the
+    override pass an env that sets it explicitly.
+    """
+    env = dict(os.environ)
+    env.pop(WATCHDOG_ENV, None)
+    env.update(overrides)
+    return env
+
+
 def _run(argv: list[str], payload: dict | bytes, *, cwd: Path = REPO_ROOT, env: dict | None = None):
+    """Run argv with the payload on stdin, in _probe_env() unless env is given."""
     data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    env = _probe_env() if env is None else env
     return subprocess.run(argv, input=data, capture_output=True, cwd=cwd, env=env, timeout=120, check=False)
+
+
+# Process probes (bash, PowerShell, Python) are independent of each other: they run concurrently
+# and their results are asserted afterwards in call order, so every probe still runs for real.
+# The registered-entry chains are the longest batch of the suite and get more workers; the short
+# batches stay small so that several of them at once do not swamp process creation.
+PROBE_WORKERS = 4
+ENTRY_PROBE_WORKERS = 8
+
+
+@contextmanager
+def _started(calls: list[tuple[list[str], dict | bytes, dict]], workers: int = PROBE_WORKERS) -> Iterator[list[Future]]:
+    """Run every (argv, payload, _run keyword arguments) call; the futures keep the call order."""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        yield [pool.submit(_run, argv, payload, **options) for argv, payload, options in calls]
 
 
 def _decision(result: subprocess.CompletedProcess) -> dict | None:
@@ -498,7 +532,7 @@ def find_bash() -> str | None:
 def _bash_env(extra_path: Path | None = None, *, project_dir: str | None = None) -> dict:
     """Environment for running registered hook commands; CLAUDE_PROJECT_DIR only when given."""
     bash = find_bash()
-    env = dict(os.environ)
+    env = _probe_env()
     env.pop("CLAUDE_PROJECT_DIR", None)
     if project_dir is not None:
         env["CLAUDE_PROJECT_DIR"] = project_dir
@@ -855,20 +889,23 @@ class PatchProbeTests(unittest.TestCase):
 class ProtocolTests(unittest.TestCase):
     """Run the gate as a process and check both client protocols byte for byte."""
 
-    def _gate_run(self, protocol: str, tool: str, tool_input: dict):
-        return _run([sys.executable, str(GATE_PATH), "--protocol", protocol], {"tool_name": tool, "tool_input": tool_input})
+    def _gate_call(self, protocol: str, tool: str, tool_input: dict) -> tuple[list[str], dict, dict]:
+        payload = {"tool_name": tool, "tool_input": tool_input}
+        return [sys.executable, str(GATE_PATH), "--protocol", protocol], payload, {}
 
     def test_claude_protocol_reports_deny_and_ask(self) -> None:
-        for command, expected in ((FORCE_PUSH, "deny"), (HARD_RESET, "ask")):
-            with self.subTest(expected=expected):
-                result = self._gate_run("claude", "Bash", {"command": command})
-                self.assertEqual(0, result.returncode, result.stderr)
-                payload = _decision(result)
-                specific = payload["hookSpecificOutput"]
-                self.assertEqual({"hookSpecificOutput"}, set(payload))
-                self.assertEqual("PreToolUse", specific["hookEventName"])
-                self.assertEqual(expected, specific["permissionDecision"])
-                self.assertTrue(specific["permissionDecisionReason"].strip())
+        cases = ((FORCE_PUSH, "deny"), (HARD_RESET, "ask"))
+        with _started([self._gate_call("claude", "Bash", {"command": command}) for command, _ in cases]) as results:
+            for (_, expected), future in zip(cases, results):
+                with self.subTest(expected=expected):
+                    result = future.result()
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    payload = _decision(result)
+                    specific = payload["hookSpecificOutput"]
+                    self.assertEqual({"hookSpecificOutput"}, set(payload))
+                    self.assertEqual("PreToolUse", specific["hookEventName"])
+                    self.assertEqual(expected, specific["permissionDecision"])
+                    self.assertTrue(specific["permissionDecisionReason"].strip())
 
     def test_codex_protocol_never_asks_and_fits_the_codex_schema(self) -> None:
         cases = (
@@ -877,66 +914,104 @@ class ProtocolTests(unittest.TestCase):
             (APPLY_PATCH, {"input": _patch("*** Update File: docs/kb/chunks.json")}),
             (APPLY_PATCH, {"input": _patch("*** Update File: .codex/config.toml")}),
         )
-        for tool, tool_input in cases:
-            with self.subTest(tool=tool, tool_input=tool_input):
-                result = self._gate_run("codex", tool, tool_input)
-                self.assertEqual(0, result.returncode, result.stderr)
-                payload = _decision(result)
-                self.assertLessEqual(set(payload), CODEX_OUTPUT_KEYS)
-                specific = payload["hookSpecificOutput"]
-                self.assertLessEqual(set(specific), CODEX_SPECIFIC_KEYS)
-                self.assertEqual("PreToolUse", specific["hookEventName"])
-                self.assertEqual("deny", specific["permissionDecision"])
-                self.assertTrue(specific["permissionDecisionReason"].strip())
-                self.assertNotIn('"ask"', result.stdout.decode("utf-8"))
-        asked = _decision(self._gate_run("codex", "Bash", {"command": HARD_RESET}))
+        with _started([self._gate_call("codex", tool, tool_input) for tool, tool_input in cases]) as results:
+            for (tool, tool_input), future in zip(cases, results):
+                with self.subTest(tool=tool, tool_input=tool_input):
+                    result = future.result()
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    payload = _decision(result)
+                    self.assertLessEqual(set(payload), CODEX_OUTPUT_KEYS)
+                    specific = payload["hookSpecificOutput"]
+                    self.assertLessEqual(set(specific), CODEX_SPECIFIC_KEYS)
+                    self.assertEqual("PreToolUse", specific["hookEventName"])
+                    self.assertEqual("deny", specific["permissionDecision"])
+                    self.assertTrue(specific["permissionDecisionReason"].strip())
+                    self.assertNotIn('"ask"', result.stdout.decode("utf-8"))
+            # The HARD_RESET case is the ask-level rule; its deny explains why.
+            asked = _decision(results[1].result())
         self.assertIn("不支持 ask", asked["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_allowed_calls_print_nothing(self) -> None:
-        for protocol in ("claude", "codex"):
-            for tool, tool_input in (("Bash", {"command": f"{GIT} status"}), (APPLY_PATCH, {"input": _patch("*** Add File: x.md")})):
+        probes = (("Bash", {"command": f"{GIT} status"}), (APPLY_PATCH, {"input": _patch("*** Add File: x.md")}))
+        cases = [(protocol, tool, tool_input) for protocol in ("claude", "codex") for tool, tool_input in probes]
+        with _started([self._gate_call(*case) for case in cases]) as results:
+            for (protocol, tool, _), future in zip(cases, results):
                 with self.subTest(protocol=protocol, tool=tool):
-                    result = self._gate_run(protocol, tool, tool_input)
+                    result = future.result()
                     self.assertEqual((0, b""), (result.returncode, result.stdout), result.stderr)
 
     def test_unreadable_payload_fails_closed(self) -> None:
         # The hooks are registered for guarded tools only, so a payload that is not a JSON object blocks.
-        for script in (GATE_PATH, CODEX_ADAPTER_PATH):
-            for raw in (b"not json", b"[]", b"null", b'"Bash"', b"", b"\n", "\u00ff".encode("latin-1")):
+        cases = [
+            (script, raw)
+            for script in (GATE_PATH, CODEX_ADAPTER_PATH)
+            for raw in (b"not json", b"[]", b"null", b'"Bash"', b"", b"\n", "\u00ff".encode("latin-1"))
+        ]
+        with _started([([sys.executable, str(script)], raw, {}) for script, raw in cases]) as results:
+            for (script, raw), future in zip(cases, results):
                 with self.subTest(script=script.name, raw=raw):
-                    result = _run([sys.executable, str(script)], raw)
+                    result = future.result()
                     self.assertEqual(2, result.returncode)
                     self.assertEqual(b"", result.stdout)
                     self.assertTrue(result.stderr.strip())
 
     def test_bad_arguments_fail_closed(self) -> None:
-        for script in (GATE_PATH, CODEX_ADAPTER_PATH):
-            with self.subTest(script=script.name):
-                result = _run([sys.executable, str(script), "--no-such-option"], {"tool_name": "Bash"})
-                self.assertEqual(2, result.returncode)
-                self.assertEqual(b"", result.stdout)
+        scripts = (GATE_PATH, CODEX_ADAPTER_PATH)
+        calls = [([sys.executable, str(script), "--no-such-option"], {"tool_name": "Bash"}, {}) for script in scripts]
+        with _started(calls) as results:
+            for script, future in zip(scripts, results):
+                with self.subTest(script=script.name):
+                    result = future.result()
+                    self.assertEqual(2, result.returncode)
+                    self.assertEqual(b"", result.stdout)
 
     def test_slow_evaluation_ends_before_the_client_timeout(self) -> None:
         # A hook timeout allows the call, so the watchdog must end a pathological evaluation
         # first; the registered commands turn its non-zero status into a blocking 2.
         gate = _gate()
         self.assertLessEqual(2 * gate.EVALUATION_DEADLINE_SECONDS + 5, 30, "block_dangerous.sh may try two interpreters")
-        runner = (
-            "import importlib.util, sys\n"
-            "sys.dont_write_bytecode = True\n"
-            "spec = importlib.util.spec_from_file_location('gate', sys.argv[1])\n"
-            "gate = importlib.util.module_from_spec(spec)\n"
-            "spec.loader.exec_module(gate)\n"
-            "gate.EVALUATION_DEADLINE_SECONDS = 0.5\n"
-            "raise SystemExit(gate.main([]))\n"
-        )
         quadratic = "sudo " + " ".join(["Copy-Item"] * 3000)
+        env = dict(os.environ, **{gate.DEADLINE_ENV: "0.5"})
         started = time.monotonic()
-        result = _run([sys.executable, "-c", runner, str(GATE_PATH)], {"tool_name": "Bash", "tool_input": {"command": quadratic}})
+        result = _run([sys.executable, str(GATE_PATH)], {"tool_name": "Bash", "tool_input": {"command": quadratic}}, env=env)
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(1, result.returncode, "faulthandler exits 1; 0 means the probe finished before the deadline")
         self.assertEqual(b"", result.stdout)
         self.assertIn(b"Timeout", result.stderr)
+
+    def test_watchdog_override_can_only_shorten_the_deadline(self) -> None:
+        gate = _gate()
+        self.assertEqual(10.0, gate.EVALUATION_DEADLINE_SECONDS)
+        self.assertEqual(10.0, gate.evaluation_deadline({}))
+        for raw, expected in (("0.5", 0.5), (" 2 ", 2.0), ("1e-3", 0.001), ("10", 10.0)):
+            with self.subTest(raw=raw):
+                self.assertEqual(expected, gate.evaluation_deadline({gate.DEADLINE_ENV: raw}))
+        # Anything else, including values that would outlive the 30 s client timeout, keeps the default.
+        for raw in ("", "soon", "0", "-1", "nan", "inf", "-inf", "10.5", "31", "1e9"):
+            with self.subTest(raw=raw):
+                self.assertEqual(10.0, gate.evaluation_deadline({gate.DEADLINE_ENV: raw}))
+
+    def test_an_exported_override_does_not_reach_ordinary_probes(self) -> None:
+        # The developer's shell may export the override: a child that inherits os.environ verbatim
+        # times out, while the probe environments drop it and the gate answers as usual.
+        self.assertEqual(WATCHDOG_ENV, _gate().DEADLINE_ENV)
+        bash = find_bash()
+        self.assertIsNotNone(bash, "bash (Git Bash on Windows) is required; this test must not be skipped")
+        force = {"tool_name": "Bash", "tool_input": {"command": FORCE_PUSH}}
+        with mock.patch.dict(os.environ, {WATCHDOG_ENV: "0.001"}):
+            calls = [
+                ([sys.executable, str(GATE_PATH)], force, {"env": dict(os.environ)}),
+                ([sys.executable, str(GATE_PATH)], force, {}),
+                ([bash, "-c", CLAUDE_HOOK_COMMAND], force, {"env": _bash_env()}),
+            ]
+            with _started(calls) as results:
+                leaked, direct, entry = (future.result() for future in results)
+        self.assertEqual(1, leaked.returncode, "the exported override must reach a child that inherits os.environ")
+        self.assertIn(b"Timeout", leaked.stderr)
+        for name, result in (("gate", direct), ("registered Claude entry", entry)):
+            with self.subTest(probe=name):
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("deny", _decision(result)["hookSpecificOutput"]["permissionDecision"])
 
 
 class FailClosedTests(unittest.TestCase):
@@ -964,18 +1039,23 @@ class FailClosedTests(unittest.TestCase):
             *((t, {"file_path": "a.txt"}) for t in WRITE_TOOLS),
             (APPLY_PATCH, {"input": _patch("*** Add File: a.txt")}),
         )
+        labels, calls = [], []
         for name, conf in (("malformed", b"SHELL\tonly-three\tcolumns\n"), ("missing", None), ("not utf-8", b"\xff\xfe\x00")):
             root = self._layout(conf)
-            gate = root / ".claude" / "hooks" / GATE_PATH.name
+            gate = [sys.executable, str(root / ".claude" / "hooks" / GATE_PATH.name)]
             for tool, tool_input in guarded:
-                with self.subTest(case=name, tool=tool):
-                    result = _run([sys.executable, str(gate)], {"tool_name": tool, "tool_input": tool_input}, cwd=root)
-                    self.assertEqual(2, result.returncode)
-                    self.assertTrue(result.stderr.strip())
+                labels.append((name, tool, 2))
+                calls.append((gate, {"tool_name": tool, "tool_input": tool_input}, {"cwd": root}))
             for tool in ("Read", ""):
-                with self.subTest(case=name, tool=tool or "<none>"):
-                    result = _run([sys.executable, str(gate)], {"tool_name": tool, "tool_input": {}}, cwd=root)
-                    self.assertEqual(0, result.returncode)
+                labels.append((name, tool or "<none>", 0))
+                calls.append((gate, {"tool_name": tool, "tool_input": {}}, {"cwd": root}))
+        with _started(calls) as results:
+            for (name, tool, code), future in zip(labels, results):
+                with self.subTest(case=name, tool=tool):
+                    result = future.result()
+                    self.assertEqual(code, result.returncode)
+                    if code == 2:
+                        self.assertTrue(result.stderr.strip())
 
     def test_crlf_policy_copy_still_gates(self) -> None:
         text = CONF_PATH.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\n", "\r\n")
@@ -1009,7 +1089,7 @@ class FailClosedTests(unittest.TestCase):
         root = self._layout(CONF_PATH.read_bytes())
         empty_bin = root / "empty-bin"
         empty_bin.mkdir()
-        env = dict(os.environ, PATH=str(empty_bin))
+        env = _probe_env(PATH=str(empty_bin))
         wrapper = root / ".claude" / "hooks" / WRAPPER_PATH.name
         result = _run([bash, str(wrapper)], {"tool_name": "Bash", "tool_input": {"command": f"{GIT} status"}}, cwd=root, env=env)
         self.assertEqual(2, result.returncode, result.stderr)
@@ -1019,12 +1099,14 @@ class FailClosedTests(unittest.TestCase):
     def test_wrapper_propagates_an_unreadable_payload(self) -> None:
         bash = find_bash()
         self.assertIsNotNone(bash, "Git Bash / bash is required to exercise block_dangerous.sh")
-        for raw in (b"not json", b""):
-            with self.subTest(raw=raw):
-                result = _run([bash, str(WRAPPER_PATH)], raw, env=_bash_env())
-                self.assertEqual(2, result.returncode, result.stderr)
-                self.assertEqual(b"", result.stdout)
-                self.assertTrue(result.stderr.strip())
+        raws = (b"not json", b"")
+        with _started([([bash, str(WRAPPER_PATH)], raw, {"env": _bash_env()}) for raw in raws]) as results:
+            for raw, future in zip(raws, results):
+                with self.subTest(raw=raw):
+                    result = future.result()
+                    self.assertEqual(2, result.returncode, result.stderr)
+                    self.assertEqual(b"", result.stdout)
+                    self.assertTrue(result.stderr.strip())
 
     def test_wrapper_falls_back_from_a_broken_python3(self) -> None:
         bash = find_bash()
@@ -1037,7 +1119,7 @@ class FailClosedTests(unittest.TestCase):
             script = fake_bin / name
             script.write_bytes(f"#!/bin/sh\n{body}".encode("utf-8"))
             script.chmod(0o755)
-        env = dict(os.environ, PATH=str(fake_bin), PYTHONDONTWRITEBYTECODE="1")
+        env = _probe_env(PATH=str(fake_bin), PYTHONDONTWRITEBYTECODE="1")
         wrapper = root / ".claude" / "hooks" / WRAPPER_PATH.name
         result = _run([bash, str(wrapper)], {"tool_name": "Bash", "tool_input": {"command": FORCE_PUSH}}, cwd=root, env=env)
         self.assertEqual(0, result.returncode, result.stderr)
@@ -1058,6 +1140,16 @@ class RegisteredEntryTests(unittest.TestCase):
         (APPLY_PATCH, {"input": _patch("*** Update File: " + str(REPO_ROOT / "src" / "terminal" / "Terminal.zig"))},
          {"claude": None, "zcode": None, "codex": None}),
     ]
+    # Every entry answers every probe from the checkout root. A subdirectory session only changes
+    # how an entry locates its script (git rev-parse) and the payload cwd, so there each entry runs
+    # the probe whose answer differs per protocol plus a path that resolves against that cwd.
+    SUBDIR_PROBES = [
+        PROBES[1],
+        ("Write", {"file_path": "../docs/kb/chunks.json"}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+    ]
+    # CLAUDE_PROJECT_DIR only changes how the Claude entry finds its script: one probe per answer
+    # (deny through a FILE rule, ask, allow) shows that each form gates from outside the checkout.
+    PROJECT_DIR_PROBES = [PROBES[3], PROBES[1], PROBES[2]]
     GUARDED_STATUS = {"tool_name": "Bash", "tool_input": {"command": f"{GIT} status"}}
 
     def _bash(self) -> str:
@@ -1090,37 +1182,55 @@ class RegisteredEntryTests(unittest.TestCase):
     def test_registered_commands_gate_as_configured(self) -> None:
         bash = self._bash()
         env = _bash_env()
+        labels, calls = [], []
         for client, command in _registered_commands():
-            for cwd in (REPO_ROOT, REPO_ROOT / "src"):
-                for tool, tool_input, expected in self.PROBES:
-                    with self.subTest(client=client, cwd=cwd.name, tool=tool, expected=expected[client]):
-                        payload = {"tool_name": tool, "tool_input": tool_input, "cwd": str(cwd)}
-                        self._assert_gates(_run([bash, "-c", command], payload, cwd=cwd, env=env), expected[client])
+            for cwd, probes in ((REPO_ROOT, self.PROBES), (REPO_ROOT / "src", self.SUBDIR_PROBES)):
+                for tool, tool_input, expected in probes:
+                    labels.append({"client": client, "cwd": cwd.name, "tool": tool, "expected": expected[client]})
+                    payload = {"tool_name": tool, "tool_input": tool_input, "cwd": str(cwd)}
+                    calls.append(([bash, "-c", command], payload, {"cwd": cwd, "env": env}))
+        with _started(calls, ENTRY_PROBE_WORKERS) as results:
+            for label, future in zip(labels, results):
+                with self.subTest(**label):
+                    self._assert_gates(future.result(), label["expected"])
 
     def test_outside_the_checkout_only_claude_project_dir_keeps_gating(self) -> None:
         bash = self._bash()
         with tempfile.TemporaryDirectory() as tmp:
             outside = Path(tmp).resolve()
             ceiling = {"GIT_CEILING_DIRECTORIES": str(outside.parent)}
+            labels, calls = [], []
             # $(git rev-parse --show-toplevel) is empty outside a checkout: the entry must block, not exit 127.
             for client, command in _registered_commands():
-                with self.subTest(client=client, project_dir=None):
-                    payload = dict(self.GUARDED_STATUS, cwd=str(outside))
-                    self._assert_blocks(_run([bash, "-c", command], payload, cwd=outside, env={**_bash_env(), **ceiling}))
+                labels.append({"client": client, "project_dir": None})
+                payload = dict(self.GUARDED_STATUS, cwd=str(outside))
+                calls.append(([bash, "-c", command], payload, {"cwd": outside, "env": {**_bash_env(), **ceiling}}))
             # Claude Code exports CLAUDE_PROJECT_DIR (a Windows path on Windows), so its entry works from anywhere.
             for project_dir in dict.fromkeys((str(REPO_ROOT), REPO_ROOT.as_posix())):
                 env = {**_bash_env(project_dir=project_dir), **ceiling}
-                for tool, tool_input, expected in self.PROBES:
-                    with self.subTest(project_dir=project_dir, tool=tool, expected=expected["claude"]):
-                        payload = {"tool_name": tool, "tool_input": tool_input, "cwd": str(outside)}
-                        self._assert_gates(_run([bash, "-c", CLAUDE_HOOK_COMMAND], payload, cwd=outside, env=env), expected["claude"])
+                for tool, tool_input, expected in self.PROJECT_DIR_PROBES:
+                    labels.append({"project_dir": project_dir, "tool": tool, "expected": expected["claude"]})
+                    payload = {"tool_name": tool, "tool_input": tool_input, "cwd": str(outside)}
+                    calls.append(([bash, "-c", CLAUDE_HOOK_COMMAND], payload, {"cwd": outside, "env": env}))
+            with _started(calls, ENTRY_PROBE_WORKERS) as results:
+                for label, future in zip(labels, results):
+                    with self.subTest(**label):
+                        if label["project_dir"] is None:
+                            self._assert_blocks(future.result())
+                        else:
+                            self._assert_gates(future.result(), label["expected"])
 
     def test_unreadable_payload_blocks_through_every_entry(self) -> None:
         bash = self._bash()
+        labels, calls = [], []
         for client, command in _registered_commands():
             for raw in (b"not json", b""):
-                with self.subTest(client=client, raw=raw):
-                    self._assert_blocks(_run([bash, "-c", command], raw, env=_bash_env()))
+                labels.append({"client": client, "raw": raw})
+                calls.append(([bash, "-c", command], raw, {"env": _bash_env()}))
+        with _started(calls, ENTRY_PROBE_WORKERS) as results:
+            for label, future in zip(labels, results):
+                with self.subTest(**label):
+                    self._assert_blocks(future.result())
 
     def test_missing_interpreters_block_through_every_entry(self) -> None:
         bash = self._bash()
@@ -1131,9 +1241,12 @@ class RegisteredEntryTests(unittest.TestCase):
             _write_shim(fake_bin, "git", git)
             _write_shim(fake_bin, "bash", bash)
             env = dict(_bash_env(), PATH=str(fake_bin))
-            for client, command in _registered_commands():
-                with self.subTest(client=client):
-                    self._assert_blocks(_run([bash, "-c", command], self.GUARDED_STATUS, env=env))
+            commands = _registered_commands()
+            calls = [([bash, "-c", command], self.GUARDED_STATUS, {"env": env}) for _, command in commands]
+            with _started(calls, ENTRY_PROBE_WORKERS) as results:
+                for (client, _), future in zip(commands, results):
+                    with self.subTest(client=client):
+                        self._assert_blocks(future.result())
 
     def test_large_write_payload_finishes_well_inside_the_hook_timeout(self) -> None:
         bash = self._bash()
@@ -1152,6 +1265,11 @@ class RegisteredEntryTests(unittest.TestCase):
 class WindowsEntryTests(unittest.TestCase):
     """Codex runs command_windows through PowerShell on Windows; run it verbatim the same way."""
 
+    # scripts/run_unittests.py starts this unit after all others: on Windows hosts with on-access
+    # antivirus, a Windows PowerShell 5.1 launch next to the git/bash-heavy units stalls process
+    # creation machine-wide (measured: a parallel run goes from about 12 s to 19 s).
+    RUN_LAST = True
+
     def test_codex_windows_command_gates_under_powershell(self) -> None:
         shells = _powershells()
         if not shells:
@@ -1162,7 +1280,7 @@ class WindowsEntryTests(unittest.TestCase):
         command = codex["hooks"]["PreToolUse"][0]["hooks"][0]["command_windows"]
         force = {"tool_name": "Bash", "tool_input": {"command": FORCE_PUSH}}
         status = {"tool_name": "Bash", "tool_input": {"command": f"{GIT} status"}}
-        base = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        base = _probe_env(PYTHONDONTWRITEBYTECODE="1")
         base.pop("CLAUDE_PROJECT_DIR", None)
         with tempfile.TemporaryDirectory() as tmp:
             outside = Path(tmp).resolve() / "outside"
@@ -1179,10 +1297,16 @@ class WindowsEntryTests(unittest.TestCase):
                 ("cwd outside the checkout", status, outside, dict(base, GIT_CEILING_DIRECTORIES=str(outside.parent)), 2, None),
                 ("python3 missing", status, REPO_ROOT, dict(base, PATH=no_python_path), 2, None),
             ]
+            labels, calls = [], []
             for name, shell in shells:
                 for case, payload, cwd, env, code, expected in cases:
+                    labels.append((name, case, code, expected))
+                    calls.append(([shell, "-NoProfile", "-Command", command], payload, {"cwd": cwd, "env": env}))
+            # RUN_LAST leaves this unit the tail of a parallel run, so all of its probes start together.
+            with _started(calls, len(calls)) as results:
+                for (name, case, code, expected), future in zip(labels, results):
                     with self.subTest(shell=name, case=case):
-                        result = _run([shell, "-NoProfile", "-Command", command], payload, cwd=cwd, env=env)
+                        result = future.result()
                         self.assertEqual(code, result.returncode, result.stderr.decode("utf-8", "replace"))
                         if code == 2:
                             self.assertEqual(b"", result.stdout)

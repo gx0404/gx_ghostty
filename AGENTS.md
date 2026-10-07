@@ -70,7 +70,7 @@ Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领�
 - 上游 `ghostty-org/ghostty`（remote `upstream`），fork `gx0404/gx_ghostty`（remote `origin`）。`main` 只快进镜像上游；`gx_ghostty` 是开发与发布分支。
 - 同步用 merge：`main` 快进到 `upstream/main` 后合入 `gx_ghostty`。永不 force push，永不推送 `upstream`；流程见 `docs/DEVELOPMENT.md`。
 - 上文 Issue and PR Guidelines 照常适用：agent 不创建 issue 或 PR，上游与本 fork 都一样。
-- 改动过的上游文件只有本文件、`.gitignore`、`.prettierignore`（带标记的追加段）、`src/build/Config.zig`（补丁 GX-0001）与归档的 workflow；fork 文件一律用上游没有的新路径。
+- 改动过的上游文件只有本文件、`.gitignore`、`.prettierignore`（带标记的追加段）、`src/build/Config.zig`（补丁 GX-0001）、`build.zig`（补丁 GX-0002）与归档的 workflow；fork 文件一律用上游没有的新路径。
 - 改上游源码必须加 `fork(gx): GX-NNNN` 标记并登记到 `docs/FORK_PATCHES.md`，`scripts/test_fork_patches.py` 锁定闭集。
 - `.github/workflows/` 只启用 `gx-ci.yml` 与 `gx-release.yml`；上游 workflow 原样归档在 `.github/workflows-archive/`，同步带来的新 workflow 也 `git mv` 进去，不得重新启用。
 - 根 `CHANGELOG.md` 只记 fork 的可观察变更（上游没有 CHANGELOG）；产品版本仍以 `build.zig.zon` 为真源。
@@ -79,30 +79,30 @@ Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领�
 ## 项目模型
 
 - Zig 0.16.0（`build.zig.zon` 的 `minimum_zig_version`）。共享核心在 `src/`；产品版本在 `build.zig.zon`，最终版本由 `src/build/Config.zig::init` 推导。
-- 产物：GTK app（Linux/FreeBSD，`src/apprt/gtk`）、macOS Swift app（`macos/`，经 `include/ghostty.h`）、libghostty-vt（`src/lib_vt.zig` 与 `include/ghostty/`，可构建到 wasm32）。Windows 只产出库，没有可运行的 app。
+- 产物：GTK app（Linux/FreeBSD，`src/apprt/gtk`）、macOS Swift app（`macos/`，经 `include/ghostty.h`）、libghostty-vt（`src/lib_vt.zig` 与 `include/ghostty/`，可构建到 wasm32）。Windows 只有库（只能构建 libghostty-vt），没有可运行的 app。
 - 入口：`src/main.zig::entrypoint` 按 `exe_entrypoint` 分派；`src/main_ghostty.zig::main` 先 `global.init` 再 `App.create`；`src/apprt.zig::runtime` 编译期选定 apprt。
 - 数据流：pty → `src/termio/Exec.zig::ReadThread` → `src/termio/Termio.zig::processOutput` → `terminal.Stream` → `Terminal`/`Screen`/`PageList` → `src/renderer/generic.zig::Renderer.updateFrame` → `drawFrame`。每个 surface 有 termio 写线程、pty 读取线程（POSIX 另有 `io-gather`）与渲染线程，搜索时按需另起 search 线程。全貌见 `docs/ARCHITECTURE.md`。
 
 ## 常用命令
 
-zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitignored 的 `.local/`）；上游段的 `zig build …` 改用对应 just 配方，`zig fmt .` 改用 `just fmt` / `just fmt-check`（排除 `.local`、`zig-pkg` 等，后者是拉取的第三方依赖）。
+zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitignored 的 `.local/`）；上游段的 `zig build …` 改用对应 just 配方（测试定向用运行期 `--filter <子串>`，不重编；`-Dtest-filter` 仍可透传，但换值就重编），`zig fmt .` 改用 `just fmt` / `just fmt-check`（排除 `.local`、`zig-pkg` 等，后者是拉取的第三方依赖）。
 
 | 命令 | 用途 |
 |---|---|
 | `just setup` / `just doctor` | 安装钉版 Zig 与 graphify / 只读诊断 |
-| `just build <a>` / `just test <a>` | `zig build` / `zig build test`（定向加 `-Dtest-filter=<name>`） |
-| `just test-vt <a>` / `just build-vt <a>` | `zig build test-lib-vt` / `zig build -Demit-lib-vt` |
+| `just test-vt <a>` / `just test <a>` | lib-vt 单测 / 完整单测，经 `scripts/zig_test.py` 并行分片；`just test` 仅 Linux/macOS |
+| `just build <a>` / `just build-vt <a>` | `zig build` / `zig build -Demit-lib-vt` |
 | `just vt-wasm` / `just dist-vt` | lib-vt wasm32 构建 / lib-vt 源码包 |
 | `just fmt` / `just fmt-check` / `just zig <a>` | 格式化 / 只检查 / 直通钉版 zig |
 | `just rules <p>` / `just rules-review <p>` / `just rules-check` | resolver |
 | `just version` / `just version-check` | fork 版本 / CHANGELOG 标题校验 |
-| `just framework-test` / `just framework-check` / `just ci-check` | 框架 unittest / 框架聚合门 / 再加 fmt-check 与 test-vt |
+| `just framework-test` / `just framework-check` / `just ci-check` | 框架单测（`scripts/run_unittests.py` 并行）/ 框架聚合门 / 再加 fmt-check 与 test-vt（热缓存约 100 s） |
 | `just graph` / `just graph-check` / `just graph-query <q>` | 图谱重建 / 新鲜度 / 查询 |
 | `just kb` / `just kb-check` / `just kb-query <q>` | 知识库构建 / 校验 / 检索 |
 | `just generated-check` | kb-check 与 graph-check（同步后、发版前） |
 | `just install-hooks` / `just commit-check <a>` | 启用 `.githooks` / 校验提交信息 |
 
-Windows 上完整 `just test` 只是尽力而为。Windows 未开开发者模式时，全量 `just test-vt` 固定有 4 处 `src/lib/tinyio` 符号链接用例报 `PermissionDenied`：这是环境前置，不是回归，记 FAIL 并写明原因，不跳过、不改用例（见 `docs/TESTING.md`）。全表与副作用见 `docs/MAKE_COMMANDS.md`。
+Windows 上非 vt 的 Zig 代码编译不过：`src/build/SharedDeps.zig::add` 给 libghostty-internal 与 `ghostty-test` 无条件加 translate-c 导入 `posix_c`（含 `pwd.h`），所以 `just build` 退出 1（库用 `just build-vt`），`just test` 直接退出 2；这部分的编译与完整单测本机记 PENDING，由 `gx-ci` 的 `linux-main` 补证。改过 Zig 源码后，测试二进制要用 LLVM 重编约 2 min，属正常耗时（`docs/TESTING.md`「并行运行器与耗时」）。Windows 未开开发者模式时，全量 `just test-vt` 固定有 4 处 `src/lib/tinyio` 符号链接用例报 `PermissionDenied`：这是环境前置，不是回归，记 FAIL 并写明原因，不跳过、不改用例（见 `docs/TESTING.md`）。全表与副作用见 `docs/MAKE_COMMANDS.md`。
 
 ## 跨域硬边界
 
@@ -156,7 +156,7 @@ fix(build): 非 v 前缀 tag 不再触发版本号 panic
 ## 完成门
 
 1. `just rules-check` 通过；scope 扩大后对完整路径集合重跑 `just rules`。
-2. 按 resolver 列出的领域文档「验证」段跑最小针对性测试：Zig 用 `just test -Dtest-filter=<name>`，libghostty-vt 用 `just test-vt -Dtest-filter=<filter>`，框架脚本用 `python -m unittest scripts.test_<name>`；合并前跑 `just framework-check` 与 `just ci-check`。
+2. 按 resolver 列出的领域文档「验证」段跑最小针对性测试：libghostty-vt 用 `just test-vt --filter <子串>`，其他 Zig 用 `just test --filter <子串>`（Windows 上退出 2，记 PENDING 交 `gx-ci` 的 `linux-main`），框架脚本用 `python scripts/run_unittests.py test_<name>`；合并前跑 `just framework-check` 与 `just ci-check`。
 3. 改 Zig 跑 `just fmt-check`；改 Swift 按 `macos/AGENTS.md` 跑 swiftlint。
 4. 触及生成物必须用对应生成器重建并审 diff，或说明为何无影响；改公开签名或文档后跑 `just kb`，上游同步后跑 `just generated-check`。
 5. GUI 可见变更：本机 Windows 没有 Ghostty GUI，记 PENDING；读回 `gx-ci` 的 `gtk-smoke` 截图后才记 PASS（`testing.md`）。

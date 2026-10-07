@@ -53,11 +53,11 @@
 ## 验证
 
 - 路由：`just rules src/font/SharedGrid.zig`；改本文档后跑 `just framework-check`。
-- 定向单测（本机默认 `freetype_windows`，`src/font/discovery.zig` 里的 fontconfig、CoreText 用例按后端自动 skip；`-Dtest-filter` 可重复；Windows 上编出完整测试二进制属尽力而为，结果如实记 PASS 或 FAIL）：
-  - `just test -Dtest-filter=windows`：含在系统字体目录查找 Arial 的发现用例。
-  - `just test -Dtest-filter=Key -Dtest-filter=getIndex`：grid 键与回退解析。
-  - `just test -Dtest-filter=shape -Dtest-filter=Constraints`：HarfBuzz 整形与 Nerd Font 约束。
-  - `just test -Dtest-filter=sprite -Dtest-filter=glyf`：sprite 与 glyf 金标准比对。
-- 编译与格式：`just build`（Windows 产出 `ghostty-internal`，结果尽力而为）；改 Zig 跑 `just fmt-check`。
+- 定向单测（`src/font/discovery.zig` 的用例按字体后端自动 skip；`--filter` 可重复，运行期筛选；`just test` 只在 Linux/macOS 可跑，`ghostty-test` 在 Windows 上无法编译，所以 `freetype_windows` 的发现用例目前没有可运行的环境，记 PENDING）：
+  - `just test --filter windows`：含在系统字体目录查找 Arial 的发现用例。
+  - `just test --filter Key --filter getIndex`：grid 键与回退解析。
+  - `just test --filter shape --filter Constraints`：HarfBuzz 整形与 Nerd Font 约束。
+  - `just test --filter sprite --filter glyf`：sprite 与 glyf 金标准比对。
+- 编译与格式：Linux/macOS 上 `just build`；Windows 上 `just build` 编不过 libghostty-internal（`build-system.md`「平台」），本机没有字体代码的编译检查，`freetype_windows` 后端在 gx-ci 里也不被编译，记 PENDING；改 Zig 跑 `just fmt-check`。
 - 改 `pkg/freetype`、`pkg/harfbuzz`、`pkg/fontconfig`：各包的 `build.zig` 自带 `test` 步骤，在包目录运行 `zig build test`；gx-ci 未覆盖，需手动补跑并记录结果。
-- PENDING：CoreText 系后端只能在 macOS 验证（上游跑过 `-Drenderer=metal -Dfont-backend=coretext_freetype`，可交 gx-ci 的 `macos` 输入）；`fontconfig_freetype` 由 gx-ci `linux` job 覆盖；字形视觉效果要读回 gx-ci `gtk-smoke` 截图才算通过；`ghostty +list-fonts`、`ghostty +show-face --cp=0x41` 需要可执行文件，只能在 Linux 或 macOS 构建上运行。
+- PENDING：CoreText 系后端只能在 Mac 上用 `just test` 验证（上游跑过 `-Drenderer=metal -Dfont-backend=coretext_freetype`；gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，不含字体）；`fontconfig_freetype` 由 gx-ci `linux-main` job 覆盖；字形视觉效果要读回 gx-ci `gtk-smoke` 截图才算通过；`ghostty +list-fonts`、`ghostty +show-face --cp=0x41` 需要可执行文件，只能在 Linux 或 macOS 构建上运行。

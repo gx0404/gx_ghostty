@@ -144,8 +144,8 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 
 只把实际跑过的检查记为 PASS。离线探针都在 `scripts/test_ai_tool_hooks.py` 里，2026-10-07 在 Windows 11 上实测：
 
-- 从 Git Bash 运行 `python -m unittest scripts.test_ai_tool_hooks`：60 项通过，exit 0。
-- 从 cmd.exe 在最小 Windows PATH 下运行同一命令：此时 `bash` 先解析到 WindowsApps 的 WSL 启动器，测试改从 `git --exec-path` 推导出 Git Bash，60 项同样全部通过，exit 0。
+- 从 Git Bash 运行 `python -m unittest scripts.test_ai_tool_hooks`：62 项通过，exit 0。
+- 从 cmd.exe 在最小 Windows PATH 下运行同一命令：此时 `bash` 先解析到 WindowsApps 的 WSL 启动器，测试改从 `git --exec-path` 推导出 Git Bash，62 项同样全部通过，exit 0。
 - PowerShell 测试在本机用 Windows PowerShell 5.1.26100 与 PowerShell 7.6.6 原样执行注册的 `command_windows`；Windows 上两者都找不到时测试失败而不是跳过，只有非 Windows 主机才跳过。
 - `command_windows` 的键名用 `codex -c … features list`（0.160.0）离线核对：把它设成整数时配置加载报类型错误，未知键不报错；同一 hooks 段放进临时 `CODEX_HOME` 的 `config.toml` 时加载通过。
 
