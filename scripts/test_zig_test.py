@@ -271,6 +271,22 @@ class FakeRunnerTestCase(unittest.TestCase):
                 data = b""
             self.assertEqual(b"", data)
 
+    @contextlib.contextmanager
+    def joins_only_finished_workers(self):
+        """Worker.join 只能在 done 置位之后调用：CPython 3.12 及更早版本里，join(timeout) 被 KeyboardInterrupt
+        打断时会把仍在运行的线程标成已结束（gx-ci 的 ubuntu 3.12 上因此少记了一个 not_run）。"""
+        original = zig_test.Worker.join
+        early: list[str] = []
+
+        def join(worker: zig_test.Worker, timeout: float | None = None) -> None:
+            if not worker.done.is_set():
+                early.append(worker.name)
+            original(worker, timeout)
+
+        with mock.patch.object(zig_test.Worker, "join", join):
+            yield
+        self.assertEqual([], early, "运行器在 worker 结束前调用了 Thread.join")
+
     def assert_no_leaked_threads(self, before: set[threading.Thread]) -> None:
         leaked = [thread.name for thread in threading.enumerate() if thread not in before and thread.name.startswith("zig-test-")]
         self.assertEqual([], leaked, "运行器返回后仍有读管道或工作线程没结束")
@@ -494,7 +510,7 @@ class ProcessTreeTests(FakeRunnerTestCase):
         threading.Thread(target=interrupt_once_running, daemon=True).start()
         before = set(threading.enumerate())
         started = time.monotonic()
-        with mock.patch.object(zig_test, "STDERR_EOF_WAIT", 10.0):
+        with mock.patch.object(zig_test, "STDERR_EOF_WAIT", 10.0), self.joins_only_finished_workers():
             code, report, text = self.run_json("--binary", str(binary), "--jobs", "2")
         elapsed = time.monotonic() - started
         self.assertTrue(fired.is_set(), text)
@@ -503,6 +519,14 @@ class ProcessTreeTests(FakeRunnerTestCase):
         self.assertLess(elapsed, 8, text)
         self.assert_no_leaked_threads(before)
         self.assert_grandchildren_gone(listener, 2)
+
+    def test_workers_are_joined_only_after_they_finish(self) -> None:
+        binary = self.fake("joined", [{"name": f"t{index}", "sleep": 0.05} for index in range(6)])
+        before = set(threading.enumerate())
+        with self.joins_only_finished_workers():
+            code, out, err = self.run_main("--binary", str(binary), "--jobs", "3")
+        self.assertEqual(0, code, out + err)
+        self.assert_no_leaked_threads(before)
 
     def test_normal_shutdown_never_kills(self) -> None:
         first = self.fake("calm_a", [{"name": f"a{index}"} for index in range(4)])

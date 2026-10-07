@@ -900,6 +900,7 @@ class Worker(threading.Thread):
         self.busy = 0.0
         self.tests = 0
         self.idle_at: float | None = None
+        self.done = threading.Event()
         self._processes: dict[str, TestProcess] = {}
 
     def run(self) -> None:
@@ -925,6 +926,7 @@ class Worker(threading.Thread):
             for process in self._processes.values():
                 self.session.release(process)
             self._processes.clear()
+            self.done.set()
 
     def execute(self, task: Task) -> TestResult:
         binary = task.binary
@@ -1106,7 +1108,7 @@ def describe_no_tests(plan: Plan) -> str:
 def load_metadata(session: Session, binaries: Sequence[TestBinary]) -> None:
     errors: dict[str, str] = {}
 
-    def query(binary: TestBinary) -> None:
+    def query(binary: TestBinary, done: threading.Event) -> None:
         process: TestProcess | None = None
         try:
             process = session.spawn(binary)
@@ -1117,13 +1119,18 @@ def load_metadata(session: Session, binaries: Sequence[TestBinary]) -> None:
             errors[binary.label] = str(exc)
             if process is not None:
                 session.release(process)
+        finally:
+            done.set()
 
-    threads = [threading.Thread(target=query, args=(binary,), daemon=True) for binary in binaries]
+    finished = [threading.Event() for _ in binaries]
+    threads = [threading.Thread(target=query, args=(binary, done), daemon=True) for binary, done in zip(binaries, finished)]
     for thread in threads:
         thread.start()
+    for done in finished:
+        while not done.wait(0.2):
+            pass
     for thread in threads:
-        while thread.is_alive():
-            thread.join(0.2)
+        thread.join()
     if errors:
         release_spares(session, binaries)
         raise FatalError("无法读取用例元数据：\n" + "\n".join(f"  {label}: {message}" for label, message in errors.items()))
@@ -1136,6 +1143,9 @@ def release_spares(session: Session, binaries: Sequence[TestBinary]) -> None:
 
 
 def run_workers(session: Session, tasks: list[Task], serial_tasks: list[Task], jobs: int) -> tuple[list[Worker], bool]:
+    """主线程只在 Worker.done 上等待，不用 Thread.join(timeout)：CPython 3.12 及更早版本里，join 被
+    KeyboardInterrupt 打断时 Thread._wait_for_tstate_lock 会释放仍在运行的线程的 tstate 锁并把它标成已结束，
+    之后的 join 立即返回，正在执行的用例就来不及记入结果。"""
     scheduler = Scheduler(tasks, serial_tasks)
     count = max(1, min(jobs, len(tasks) + len(serial_tasks)))
     workers = [Worker(session, scheduler, number, serial=number == 0 and bool(serial_tasks)) for number in range(count)]
@@ -1145,9 +1155,11 @@ def run_workers(session: Session, tasks: list[Task], serial_tasks: list[Task], j
     for worker in workers:
         worker.start()
     try:
-        while any(worker.is_alive() for worker in workers):
-            for worker in workers:
-                worker.join(0.05)
+        while True:
+            pending = [worker for worker in workers if not worker.done.is_set()]
+            if not pending:
+                break
+            pending[0].done.wait(0.05)
             now = time.monotonic()
             if now - last_progress >= PROGRESS_INTERVAL:
                 last_progress = now
@@ -1158,8 +1170,12 @@ def run_workers(session: Session, tasks: list[Task], serial_tasks: list[Task], j
         interrupted = True
         session.stop.set()
         session.kill_all()
+        deadline = time.monotonic() + 10
         for worker in workers:
-            worker.join(10)
+            worker.done.wait(max(0.0, deadline - time.monotonic()))
+    for worker in workers:
+        if worker.done.is_set():
+            worker.join()
     for task in scheduler.drain():
         session.record(TestResult(task.binary.label, task.index, task.name, "not_run", message="interrupted" if interrupted else "not scheduled"))
     return workers, interrupted

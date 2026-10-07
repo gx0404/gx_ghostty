@@ -993,21 +993,26 @@ class ProtocolTests(unittest.TestCase):
 
     def test_an_exported_override_does_not_reach_ordinary_probes(self) -> None:
         # The developer's shell may export the override: a child that inherits os.environ verbatim
-        # times out, while the probe environments drop it and the gate answers as usual.
+        # sees it, while the probe environments drop it and the gate answers as usual. The control
+        # reads the deadline instead of waiting for a 1 ms watchdog, which races interpreter startup
+        # (CPython 3.12 on Windows can crash with an access violation instead of exiting 1).
         self.assertEqual(WATCHDOG_ENV, _gate().DEADLINE_ENV)
         bash = find_bash()
         self.assertIsNotNone(bash, "bash (Git Bash on Windows) is required; this test must not be skipped")
         force = {"tool_name": "Bash", "tool_input": {"command": FORCE_PUSH}}
+        deadline = "import sys; sys.path.insert(0, sys.argv[1]); import pre_tool_use_gate as gate; print(gate.evaluation_deadline())"
         with mock.patch.dict(os.environ, {WATCHDOG_ENV: "0.001"}):
+            leaked = subprocess.run(
+                [sys.executable, "-B", "-c", deadline, str(HOOKS_DIR)],
+                env=dict(os.environ), capture_output=True, text=True, timeout=60, check=False,
+            )
             calls = [
-                ([sys.executable, str(GATE_PATH)], force, {"env": dict(os.environ)}),
                 ([sys.executable, str(GATE_PATH)], force, {}),
                 ([bash, "-c", CLAUDE_HOOK_COMMAND], force, {"env": _bash_env()}),
             ]
             with _started(calls) as results:
-                leaked, direct, entry = (future.result() for future in results)
-        self.assertEqual(1, leaked.returncode, "the exported override must reach a child that inherits os.environ")
-        self.assertIn(b"Timeout", leaked.stderr)
+                direct, entry = (future.result() for future in results)
+        self.assertEqual((0, "0.001"), (leaked.returncode, leaked.stdout.strip()), leaked.stderr)
         for name, result in (("gate", direct), ("registered Claude entry", entry)):
             with self.subTest(probe=name):
                 self.assertEqual(0, result.returncode, result.stderr)
