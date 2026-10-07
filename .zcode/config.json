@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "enabled": true,
+    "timeoutMs": 30000,
+    "events": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "bash \"$(git rev-parse --show-toplevel)/.claude/hooks/block_dangerous.sh\" || exit 2",
+              "timeoutMs": 30000
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

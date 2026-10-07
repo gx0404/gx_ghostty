@@ -1,0 +1,34 @@
+# gx_ghostty 项目级 Codex 配置（团队共享，不含凭据）。
+# 用户级 model / provider / 认证留在 ~/.codex/config.toml，不进项目。
+# 规则入口是根 AGENTS.md（Codex 原生读取）；领域规则由 resolver 按路径解析。
+
+approval_policy = "never"
+# 用户授权的基线，与 wezterm / herdr 两个 fork 一致：不开沙箱、不逐条审批。
+# 破坏性操作由下方 PreToolUse 安全门拦截（策略真源 .claude/hooks/dangerous_patterns.conf）。
+sandbox_mode = "danger-full-access"
+
+[shell_environment_policy]
+inherit = "all"
+exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*"]
+
+[agents.gx_ghostty_reviewer]
+description = "gx_ghostty 只读评审员：经 resolver 加载领域规则审核 diff，按 code-review 四段格式输出。"
+config_file = "agents/gx-ghostty-reviewer.toml"
+
+# hooks 必须写成数组表：事件 [[hooks.PreToolUse]]，命令嵌套在 [[hooks.PreToolUse.hooks]]；
+# 写成单表 [hooks.PreToolUse] 会让 Codex 启动即报 invalid type: map, expected a sequence。
+# timeout 单位是秒（ZCode 才用毫秒 timeoutMs）。Codex 的 PreToolUse 不支持 ask，
+# 适配器把 ask 级规则按 deny 返回。matcher 同时覆盖 apply_patch，FILE 规则按补丁头里的路径判定。
+# Codex 把 exit 2（stderr 写明原因）当作拦截，其他非 0 退出码只记 hook 失败、工具照常执行；
+# 末尾的 || exit 2 让 python3 缺失（127）、判定超时（1）等失败也按拦截处理。
+# Windows 上 Codex 经 PowerShell 执行 command_windows（0.160 也认 commandWindows）：
+# Windows PowerShell 5.1 不认 ||，PowerShell 7 里 || exit 2 不生效，失败都只剩 exit 1，所以改用
+# $?（python3 找不到时 $LASTEXITCODE 不会被设置）与 $LASTEXITCODE 判定，任一失败都 exit 2。
+[[hooks.PreToolUse]]
+matcher = "^(Bash|apply_patch)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py" || exit 2'
+command_windows = 'python3 "$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py"; if (-not $? -or $LASTEXITCODE -ne 0) { exit 2 }'
+timeout = 30

@@ -32,3 +32,28 @@ glad.zip
 vgcore.*
 
 /sprite_face_test*
+
+# --- GX fork：AI 协作开发框架（fork 维护段；上游没有）---
+/.local/
+/Python/
+/graphify-out/*
+!/graphify-out/GRAPH_REPORT.md
+!/graphify-out/source-fingerprint.json
+/.graphify-memory/
+/.claude/*
+!/.claude/settings.json
+!/.claude/hooks/
+!/.claude/rules/
+!/.claude/agents/
+!/.claude/README.md
+/.codex/*
+!/.codex/config.toml
+!/.codex/agents/
+!/.codex/hooks/
+!/.codex/README.md
+/.zcode/*
+!/.zcode/config.json
+!/.zcode/README.md
+/.kimi-code/
+__pycache__/
+*.pyc

@@ -1,0 +1,385 @@
+# gx_ghostty 领域规则路由（schema v3，唯一机器真源）。
+#
+# 语义（resolver：scripts/resolve_agent_rules.py，说明见同目录 README.md）：
+# - [[rules]].paths 是 Git 可见文件的 glob：`*` 不跨 `/`，`**/` 匹配零或多级
+#   目录，`dir/**` 也匹配 `dir` 本身；一个文件命中多个领域时取并集。
+# - [[rules]].tasks 把任务类型（--task）路由到额外必读文档。
+# - root_only：仓库级元文件，没有领域不变量；与领域 paths 不得重叠。
+# - nested_agents：上游自带的嵌套 AGENTS.md 精确登记表；resolver 按 scope 路径的
+#   祖先目录输出，不复制其内容。上游新增或删除嵌套文件时 --check 会失败。
+# - 根 AGENTS.md 每轮常驻加载，resolver 从不输出它。
+#
+# 维护：rules 按 id 排序，paths/tasks/root_only/nested_agents 各自排序；
+# doc 恒为 docs/AGENT_RULES/<id>.md。任何改动后必须让
+# `just rules-check`（python scripts/resolve_agent_rules.py --check）通过。
+
+version = 3
+root_max_bytes = 16384
+
+root_only = [
+  ".gitmodules",
+  ".mailmap",
+  "LICENSE",
+  "README.md",
+]
+
+nested_agents = [
+  "example/AGENTS.md",
+  "macos/AGENTS.md",
+  "src/benchmark/AGENTS.md",
+  "src/inspector/AGENTS.md",
+  "src/terminal/apc/glyph/AGENTS.md",
+  "src/terminal/c/AGENTS.md",
+  "src/terminal/compress/AGENTS.md",
+  "src/terminal/snapshot/AGENTS.md",
+  "test/fuzz-libghostty/AGENTS.md",
+]
+
+[[rules]]
+id = "app-core"
+doc = "docs/AGENT_RULES/app-core.md"
+paths = [
+  "pkg/breakpad/**",
+  "pkg/sentry/**",
+  "src/App.zig",
+  "src/Surface.zig",
+  "src/apprt.zig",
+  "src/apprt/*.zig",
+  "src/crash/**",
+  "src/global.zig",
+  "src/main.zig",
+  "src/main_ghostty.zig",
+  "src/main_wasm.zig",
+  "src/surface_mouse.zig",
+]
+tasks = []
+
+[[rules]]
+id = "apprt-gtk"
+doc = "docs/AGENT_RULES/apprt-gtk.md"
+paths = [
+  ".github/scripts/check-translations.sh",
+  "dist/linux/**",
+  "nix/build-support/check-blueprints.sh",
+  "pkg/gtk4-layer-shell/**",
+  "pkg/libintl/**",
+  "po/**",
+  "src/apprt/gtk.zig",
+  "src/apprt/gtk/**",
+  "src/build/GhosttyI18n.zig",
+  "src/build/gtk.zig",
+  "src/os/cgroup.zig",
+  "src/os/flatpak.zig",
+  "src/os/i18n.zig",
+  "src/os/i18n_locales.zig",
+]
+tasks = []
+
+[[rules]]
+id = "build-system"
+doc = "docs/AGENT_RULES/build-system.md"
+paths = [
+  ".envrc",
+  ".gitattributes",
+  ".gitignore",
+  "CMakeLists.txt",
+  "HACKING.md",
+  "Makefile",
+  "build.zig",
+  "build.zig.zon",
+  "build.zig.zon.json",
+  "build.zig.zon.nix",
+  "build.zig.zon.txt",
+  "default.nix",
+  "flake.lock",
+  "flake.nix",
+  "nix/**",
+  "pkg/**",
+  "shell.nix",
+  "src/build/**",
+  "src/build_config.zig",
+  "src/helpgen.zig",
+  "src/main_build_data.zig",
+  "vendor/**",
+]
+tasks = []
+
+[[rules]]
+id = "ci-release"
+doc = "docs/AGENT_RULES/ci-release.md"
+paths = [
+  ".clang-format",
+  ".editorconfig",
+  ".github/**",
+  ".prettierignore",
+  ".shellcheckrc",
+  ".swiftlint.yml",
+  "CHANGELOG.md",
+  "CODEOWNERS",
+  "CONTRIBUTING.md",
+  "HACKING.md",
+  "docs/RELEASE.md",
+  "scripts/conventional_commits.py",
+  "scripts/gx_release.py",
+  "scripts/test_gx_release.py",
+  "scripts/test_gx_workflows.py",
+  "scripts/version.py",
+  "src/build/docker/debian/**",
+  "typos.toml",
+]
+tasks = ["release", "sync"]
+
+[[rules]]
+id = "cli-inspector"
+doc = "docs/AGENT_RULES/cli-inspector.md"
+paths = [
+  "pkg/dcimgui/**",
+  "src/cli.zig",
+  "src/cli/**",
+  "src/extra/**",
+  "src/inspector/**",
+]
+tasks = []
+
+[[rules]]
+id = "code-review"
+doc = "docs/AGENT_RULES/code-review.md"
+paths = []
+tasks = ["review"]
+
+[[rules]]
+id = "config"
+doc = "docs/AGENT_RULES/config.md"
+paths = [
+  "src/config.zig",
+  "src/config/**",
+  "src/helpgen.zig",
+]
+tasks = []
+
+[[rules]]
+id = "development"
+doc = "docs/AGENT_RULES/development.md"
+paths = [
+  "**/AGENTS.md",
+  ".agents/**",
+  ".claude/**",
+  ".codex/**",
+  ".githooks/**",
+  ".gitignore",
+  ".graphifyignore",
+  ".prettierignore",
+  ".zcode/**",
+  "AGENTS.md",
+  "AI_POLICY.md",
+  "CLAUDE.md",
+  "HACKING.md",
+  "docs/**",
+  "graphify-out/**",
+  "justfile",
+  "scripts/**",
+]
+tasks = ["sync"]
+
+[[rules]]
+id = "font"
+doc = "docs/AGENT_RULES/font.md"
+paths = [
+  "pkg/fontconfig/**",
+  "pkg/freetype/**",
+  "pkg/harfbuzz/**",
+  "src/font/**",
+  "vendor/nerd-fonts/**",
+]
+tasks = []
+
+[[rules]]
+id = "input"
+doc = "docs/AGENT_RULES/input.md"
+paths = [
+  "src/input.zig",
+  "src/input/**",
+  "src/surface_mouse.zig",
+]
+tasks = []
+
+[[rules]]
+id = "libghostty-embedding"
+doc = "docs/AGENT_RULES/libghostty-embedding.md"
+paths = [
+  "include/ghostty.h",
+  "include/module.modulemap",
+  "src/apprt/embedded.zig",
+  "src/benchmark/CApi.zig",
+  "src/build/GhosttyLib.zig",
+  "src/config/CApi.zig",
+  "src/config/c_get.zig",
+  "src/main_c.zig",
+]
+tasks = []
+
+[[rules]]
+id = "libghostty-vt"
+doc = "docs/AGENT_RULES/libghostty-vt.md"
+paths = [
+  ".github/scripts/check-apple-libghostty-vt.nu",
+  "CMakeLists.txt",
+  "Doxyfile",
+  "DoxygenLayout.xml",
+  "dist/cmake/**",
+  "dist/doxygen/**",
+  "example/**",
+  "include/ghostty/**",
+  "nix/libghostty-vt.nix",
+  "nix/test-src/**",
+  "pkg/android-ndk/**",
+  "src/build/GhosttyLibVt.zig",
+  "src/build/docker/lib-c-docs/**",
+  "src/input/config.zig",
+  "src/input/function_keys.zig",
+  "src/input/key.zig",
+  "src/input/key_encode.zig",
+  "src/input/key_mods.zig",
+  "src/input/kitty.zig",
+  "src/input/mouse.zig",
+  "src/input/mouse_encode.zig",
+  "src/input/paste.zig",
+  "src/lib/**",
+  "src/lib_vt.zig",
+  "src/os/mach.zig",
+  "src/os/stderr.zig",
+  "src/os/string_encoding.zig",
+  "src/os/wasm/**",
+  "src/os/windows.zig",
+  "src/renderer/size.zig",
+  "src/terminal/c/**",
+  "test/fuzz-libghostty/*",
+  "test/fuzz-libghostty/src/**",
+  "test/wasm-alloc.mjs",
+]
+tasks = []
+
+[[rules]]
+id = "macos-app"
+doc = "docs/AGENT_RULES/macos-app.md"
+paths = [
+  ".swiftlint.yml",
+  "dist/macos/**",
+  "include/ghostty.h",
+  "include/module.modulemap",
+  "macos/**",
+  "pkg/apple-sdk/**",
+  "pkg/macos/**",
+  "src/apprt/embedded.zig",
+  "src/build/GhosttyXCFramework.zig",
+  "src/build/GhosttyXcodebuild.zig",
+  "src/input/KeymapDarwin.zig",
+  "src/os/cf_release_thread.zig",
+  "src/os/macos.zig",
+]
+tasks = []
+
+[[rules]]
+id = "packaging-dist"
+doc = "docs/AGENT_RULES/packaging-dist.md"
+paths = [
+  "PACKAGING.md",
+  "dist/**",
+  "flatpak/**",
+  "images/**",
+  "nix/package.nix",
+  "snap/**",
+  "src/build/GhosttyDist.zig",
+  "src/build/GhosttyResources.zig",
+]
+tasks = []
+
+[[rules]]
+id = "renderer"
+doc = "docs/AGENT_RULES/renderer.md"
+paths = [
+  "passthrough.glsl",
+  "pkg/glslang/**",
+  "pkg/opengl/**",
+  "pkg/spirv-cross/**",
+  "pkg/wuffs/**",
+  "src/renderer.zig",
+  "src/renderer/**",
+  "vendor/glad/**",
+]
+tasks = []
+
+[[rules]]
+id = "shell-integration"
+doc = "docs/AGENT_RULES/shell-integration.md"
+paths = [
+  "src/extra/bash.zig",
+  "src/extra/fish.zig",
+  "src/extra/zsh.zig",
+  "src/os/shell.zig",
+  "src/shell-integration/**",
+  "src/terminfo/**",
+  "src/termio/shell_integration.zig",
+]
+tasks = []
+
+[[rules]]
+id = "support-libs"
+doc = "docs/AGENT_RULES/support-libs.md"
+paths = [
+  "src/crc32c.zig",
+  "src/datastruct/**",
+  "src/fastmem.zig",
+  "src/fastprint.zig",
+  "src/file_type.zig",
+  "src/lib/**",
+  "src/math.zig",
+  "src/quirks.zig",
+  "src/quirks_memset.zig",
+  "src/stb/**",
+  "src/tripwire.zig",
+]
+tasks = []
+
+[[rules]]
+id = "terminal-core"
+doc = "docs/AGENT_RULES/terminal-core.md"
+paths = [
+  "pkg/highway/**",
+  "pkg/simdutf/**",
+  "src/simd/**",
+  "src/terminal/**",
+  "src/unicode/**",
+]
+tasks = []
+
+[[rules]]
+id = "termio-pty-os"
+doc = "docs/AGENT_RULES/termio-pty-os.md"
+paths = [
+  "src/Command.zig",
+  "src/os/**",
+  "src/pty.c",
+  "src/pty.zig",
+  "src/termio.zig",
+  "src/termio/**",
+]
+tasks = []
+
+[[rules]]
+id = "testing"
+doc = "docs/AGENT_RULES/testing.md"
+paths = [
+  "nix/test-src/**",
+  "nix/tests.nix",
+  "nix/vm/**",
+  "pkg/afl++/**",
+  "src/benchmark/**",
+  "src/build/GhosttyBench.zig",
+  "src/main_bench.zig",
+  "src/main_gen.zig",
+  "src/synthetic/**",
+  "test/**",
+  "valgrind.supp",
+]
+tasks = ["test"]

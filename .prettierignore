@@ -29,3 +29,7 @@ test/fuzz-libghostty/afl-out/
 
 # Swift example build outputs
 example/swift-vt-xcframework/.build/
+
+# --- GX fork：AI 协作开发框架（fork 维护段；上游没有）---
+docs/kb/
+graphify-out/

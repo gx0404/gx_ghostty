@@ -1,0 +1,11 @@
+#!/bin/sh
+# gx_ghostty commit-msg 钩子：提交标题须符合 type(scope): 中文描述。
+# 启用：just install-hooks（git config core.hooksPath .githooks）。
+# git 在工作树根目录运行钩子，$1 是提交信息文件。依次尝试 python3、python。
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c "" </dev/null >/dev/null 2>&1; then
+        exec "$py" scripts/conventional_commits.py --message-file "$1"
+    fi
+done
+echo "commit-msg: 找不到可运行的 python3 或 python，无法校验提交标题" >&2
+exit 1

@@ -1,0 +1,46 @@
+# graphify 扫描排除表：gitignore 语法，扫描根为仓库根，只做代码 AST 抽取（--code-only）。
+# 图谱只收产品源码（src/、pkg/ 绑定、include/、macos/、build.zig），
+# 测试与示例、vendored 第三方代码、生成表、资源、打包与 CI 配置、AI 协作框架自身都排除在外。
+# 本文件是图谱管线输入：改动后 graph-check 会失败，需运行 just graph 重建。
+# graphify 0.9.73 还会无条件剪掉名为 build/、dist/、target/ 等的目录，
+# 所以 src/build/ 与 src/apprt/gtk/build/ 不进图；scripts/graphify_fingerprint.py 同步镜像这一行为。
+
+# 测试、示例与模糊测试语料
+/test/
+/example/
+
+# vendored 第三方代码与上游覆盖文件
+/vendor/
+pkg/*/vendor/
+pkg/*/override/
+src/stb/
+src/shell-integration/bash/bash-preexec.sh
+
+# 生成表、帧数据与二进制资源
+src/font/res/
+src/font/nerd_font_*.zig
+src/font/nerd_font_codepoint_tables.py
+src/build/framegen/
+
+# 翻译、图标、打包与发行配置
+/po/
+/images/
+/dist/
+/flatpak/
+/snap/
+/nix/
+
+# 数据文件不是代码；graphify 会把 .json 当作代码抽取（资源目录、生成的 build.zig.zon.json 等）
+*.json
+
+# CI 与 AI 协作框架：workflow、工具配置、脚本、文档、生成物与本机工具链
+/.github/
+/.agents/
+/.claude/
+/.codex/
+/.zcode/
+/.githooks/
+/docs/
+/scripts/
+/graphify-out/
+/.local/
