@@ -1,0 +1,256 @@
+name: gx-ci
+
+on:
+  push:
+    branches: [gx_ghostty]
+  pull_request:
+    branches: [gx_ghostty]
+  workflow_dispatch:
+    inputs:
+      gtk_smoke:
+        description: 在 debian:13 容器构建 GTK app，用 xvfb-run 截图并上传证据 artifact
+        type: boolean
+        default: false
+      macos:
+        description: 在 macos-15 上运行 zig build test-lib-vt
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Only pull request runs share a group and cancel superseded runs. Push and manual runs get a
+# per-run group: in a shared group a newer run cancels a pending one even without
+# cancel-in-progress, and the cancelled push's commit subjects would never be checked.
+concurrency:
+  group: gx-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  framework:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Rules, CHANGELOG version and framework unit tests
+        run: |
+          python3 scripts/resolve_agent_rules.py --check
+          python3 scripts/version.py --check
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Knowledge base is up to date (check mode)
+        run: python3 scripts/build_agent_kb.py
+      - name: Commit subjects on the first-parent chain
+        env:
+          GX_EVENT: ${{ github.event_name }}
+          GX_BEFORE: ${{ github.event.before }}
+          GX_AFTER: ${{ github.event.after }}
+          GX_BASE: ${{ github.event.pull_request.base.sha }}
+          GX_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          case "$GX_EVENT" in
+            push)
+              # A zero "before" (new branch) makes the script check only the head commit.
+              range="${GX_BEFORE:-$zero}..$GX_AFTER"
+              ;;
+            pull_request)
+              range="$GX_BASE..$GX_HEAD"
+              ;;
+            *)
+              range="$zero..$GITHUB_SHA"
+              ;;
+          esac
+          python3 scripts/conventional_commits.py --range "$range"
+
+  zig-fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: zig fmt --check
+        run: zig fmt --check .
+
+  linux:
+    needs: [framework, zig-fmt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Install the ABI manifest verifier dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-jsonschema
+          python3 -c 'import jsonschema'
+      - name: Core tests without an app runtime
+        run: zig build -Dapp-runtime=none test
+      - name: libghostty-vt tests
+        run: zig build test-lib-vt
+      - name: libghostty-vt ABI manifest
+        run: zig build test-lib-vt-schema
+
+  lib-vt-cross:
+    needs: [framework, zig-fmt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-linux-musl
+          - x86_64-windows-gnu
+          - aarch64-macos
+          - wasm32-freestanding
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Build libghostty-vt
+        env:
+          GX_TARGET: ${{ matrix.target }}
+        run: zig build -Demit-lib-vt "-Dtarget=$GX_TARGET"
+
+  windows:
+    needs: [framework, zig-fmt]
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Keep repository line endings
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: libghostty-vt tests
+        run: |
+          zig build test-lib-vt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build libghostty-vt
+        run: |
+          zig build -Demit-lib-vt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Static linking example
+        working-directory: example/c-vt-static
+        run: |
+          zig build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./zig-out/bin/c_vt_static.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  gtk-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.gtk_smoke
+    needs: [framework, zig-fmt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: debian:13
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build and smoke dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            blueprint-compiler build-essential curl libbz2-dev libonig-dev \
+            libxml2-utils lintian lsb-release pandoc \
+            libadwaita-1-dev libgtk-4-dev libgtk4-layer-shell-dev \
+            git ca-certificates xz-utils gettext \
+            xvfb xauth scrot libgl1-mesa-dri
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trust the workspace for git inside the container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Zig matches build.zig.zon
+        run: |
+          expected="$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)"
+          actual="$(zig version)"
+          echo "zig $actual, build.zig.zon requires $expected"
+          if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+            echo "unexpected Zig version" >&2
+            exit 1
+          fi
+      - name: Build the GTK app
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline
+      - name: ghostty +version
+        run: |
+          mkdir -p "$RUNNER_TEMP/gx-gtk-smoke"
+          ./zig-out/bin/ghostty +version | tee "$RUNNER_TEMP/gx-gtk-smoke/version.txt"
+      - name: Screenshot under Xvfb
+        run: |
+          evidence="$RUNNER_TEMP/gx-gtk-smoke"
+          mkdir -p "$evidence"
+          export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash -euo pipefail -c '
+            evidence="$1"
+            ./zig-out/bin/ghostty --gtk-single-instance=false >"$evidence/ghostty.log" 2>&1 &
+            pid=$!
+            sleep 20
+            state="$(awk "/^State:/ {print \$2}" "/proc/$pid/status" 2>/dev/null || true)"
+            if [ -z "$state" ] || [ "$state" = Z ]; then
+              echo "ghostty exited before the screenshot; see ghostty.log" >&2
+              exit 1
+            fi
+            scrot "$evidence/ghostty-xvfb.png"
+            kill "$pid"
+            wait "$pid" || true
+          ' bash "$evidence"
+          test -s "$evidence/ghostty-xvfb.png"
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-gtk-smoke-evidence
+          path: ${{ runner.temp }}/gx-gtk-smoke/
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos
+    needs: [framework, zig-fmt]
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: libghostty-vt tests
+        run: zig build test-lib-vt

@@ -1,0 +1,409 @@
+name: gx-release
+run-name: "gx-release · ${{ inputs.publish && 'publish' || 'build only' }} · ${{ inputs.ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 构建来源（分支、tag 或提交）；prepare 解析为完整 SHA，后续 job 只用这个 SHA
+        type: string
+        required: true
+        default: gx_ghostty
+      publish:
+        description: 全部校验通过后发布为 prerelease（关闭时只构建与验证，产物从 Artifacts 下载）
+        type: boolean
+        default: false
+      macos:
+        description: 额外构建 macOS 产物（lib-vt XCFramework 与未签名 app）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gx-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'gx0404/gx_ghostty' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.prepare.outputs.sha }}
+      version: ${{ steps.prepare.outputs.version }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      version_string: ${{ steps.prepare.outputs.version_string }}
+      zig: ${{ steps.prepare.outputs.zig }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Resolve source and versions, run the release gates
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GX_PUBLISH: ${{ inputs.publish }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          args=()
+          if [ "$GX_PUBLISH" = true ]; then args+=(--publish); fi
+          python3 scripts/gx_release.py prepare "${args[@]}"
+
+  source:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.prepare.outputs.zig }}
+          use-cache: false
+      - name: zig build distcheck (libghostty-vt source tarball)
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          # Caches outside the checkout: distcheck's inner build runs in the extracted tarball
+          # under the local cache and must not discover this repository's git metadata.
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          rm -rf zig-out/dist
+          zig build distcheck -Demit-lib-vt=true "-Dversion-string=$GX_VERSION_STRING"
+          archive="zig-out/dist/libghostty-vt-$GX_VERSION_STRING.tar.gz"
+          size="$(stat --format=%s "$archive")"
+          max=$((5 * 1024 * 1024))
+          echo "libghostty-vt source tarball: $size bytes (max $max)"
+          if [ "$size" -gt "$max" ]; then
+            echo "the libghostty-vt source tarball exceeds 5 MiB" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/gx-out"
+          cp "$archive" "$RUNNER_TEMP/gx-out/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-source-libghostty-vt
+          path: ${{ runner.temp }}/gx-out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  libvt:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            os: ubuntu-24.04
+            optimize: ReleaseFast
+          - target: aarch64-linux-gnu
+            os: ubuntu-24.04
+            optimize: ReleaseFast
+          - target: x86_64-linux-musl
+            os: ubuntu-24.04
+            optimize: ReleaseFast
+          - target: wasm32-freestanding
+            os: ubuntu-24.04
+            optimize: ReleaseSmall
+          - target: x86_64-windows-msvc
+            os: windows-2025
+            optimize: ReleaseFast
+    steps:
+      - name: Keep repository line endings (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.prepare.outputs.zig }}
+          use-cache: false
+      - name: Build and archive (cross-compiled on Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GX_TARGET: ${{ matrix.target }}
+          GX_OPTIMIZE: ${{ matrix.optimize }}
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          name="libghostty-vt-$GX_VERSION_STRING-$GX_TARGET"
+          stage="$RUNNER_TEMP/gx-libvt"
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          zig build -Demit-lib-vt "-Dtarget=$GX_TARGET" "-Doptimize=$GX_OPTIMIZE" \
+            "-Dversion-string=$GX_VERSION_STRING" --prefix "$stage/$name"
+          mkdir -p "$RUNNER_TEMP/gx-out"
+          tar -C "$stage" -czf "$RUNNER_TEMP/gx-out/$name.tar.gz" "$name"
+      - name: Build and archive (native MSVC on Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GX_TARGET: ${{ matrix.target }}
+          GX_OPTIMIZE: ${{ matrix.optimize }}
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          $name = "libghostty-vt-$env:GX_VERSION_STRING-$env:GX_TARGET"
+          $prefix = Join-Path (Join-Path $env:RUNNER_TEMP 'gx-libvt') $name
+          $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $env:RUNNER_TEMP 'gx-zig-global'
+          $env:ZIG_LOCAL_CACHE_DIR = Join-Path $env:RUNNER_TEMP 'gx-zig-local'
+          zig build -Demit-lib-vt "-Dtarget=$env:GX_TARGET" "-Doptimize=$env:GX_OPTIMIZE" "-Dversion-string=$env:GX_VERSION_STRING" --prefix $prefix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out = Join-Path $env:RUNNER_TEMP 'gx-out'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($prefix, (Join-Path $out "$name.zip"), [System.IO.Compression.CompressionLevel]::Optimal, $true)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-libvt-${{ matrix.target }}
+          path: ${{ runner.temp }}/gx-out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  libvt-macos:
+    if: inputs.macos
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.prepare.outputs.zig }}
+          use-cache: false
+      - name: Build and archive the libghostty-vt XCFramework
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          zig build -Demit-lib-vt -Doptimize=ReleaseFast "-Dversion-string=$GX_VERSION_STRING"
+          test -f zig-out/lib/ghostty-vt.xcframework/Info.plist
+          mkdir -p "$RUNNER_TEMP/gx-out"
+          cd zig-out/lib
+          zip -9 -r --symlinks "$RUNNER_TEMP/gx-out/libghostty-vt-$GX_VERSION_STRING-xcframework.zip" ghostty-vt.xcframework
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-libvt-xcframework
+          path: ${{ runner.temp }}/gx-out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  linux-gtk:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: debian:13
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            blueprint-compiler build-essential curl libbz2-dev libonig-dev \
+            libxml2-utils lintian lsb-release pandoc \
+            libadwaita-1-dev libgtk-4-dev libgtk4-layer-shell-dev \
+            git ca-certificates xz-utils gettext
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Trust the workspace for git inside the container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.prepare.outputs.zig }}
+          use-cache: false
+      - name: zig build dist (full source tarball)
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          rm -rf zig-out/dist
+          zig build dist "-Dversion-string=$GX_VERSION_STRING"
+          mkdir -p "$RUNNER_TEMP/gx-out"
+          cp "zig-out/dist/ghostty-$GX_VERSION_STRING.tar.gz" "$RUNNER_TEMP/gx-out/"
+      - name: Build the GTK app from the source tarball
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          name="ghostty-gx-$GX_VERSION_STRING-x86_64-linux-debian13"
+          src="$RUNNER_TEMP/gx-src"
+          stage="$RUNNER_TEMP/gx-app"
+          mkdir -p "$src" "$stage/$name"
+          tar -xzf "$RUNNER_TEMP/gx-out/ghostty-$GX_VERSION_STRING.tar.gz" -C "$src"
+          cd "$src/ghostty-$GX_VERSION_STRING"
+          test ! -e .git
+          test "$(cat VERSION)" = "$GX_VERSION_STRING"
+          DESTDIR="$stage/$name" zig build --prefix /usr -Doptimize=ReleaseFast -Dcpu=baseline \
+            "-Dversion-string=$GX_VERSION_STRING"
+          "$stage/$name/usr/bin/ghostty" +version | tee "$RUNNER_TEMP/gx-version.txt"
+          grep -Fx "  - version: $GX_VERSION_STRING" "$RUNNER_TEMP/gx-version.txt"
+          tar -C "$stage" -czf "$RUNNER_TEMP/gx-out/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-linux-gtk
+          path: ${{ runner.temp }}/gx-out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  macos:
+    if: inputs.macos
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.prepare.outputs.zig }}
+          use-cache: false
+      - name: Select the newest stable Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode_[0-9]*.app | grep -iv beta | sort -V | tail -n 1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      - name: Build and archive Ghostty.app (ReleaseLocal, ad-hoc signed only)
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          zig build -Doptimize=ReleaseFast "-Dversion-string=$GX_VERSION_STRING"
+          test -x zig-out/Ghostty.app/Contents/MacOS/ghostty
+          mkdir -p "$RUNNER_TEMP/gx-out"
+          cd zig-out
+          zip -9 -r --symlinks "$RUNNER_TEMP/gx-out/ghostty-gx-$GX_VERSION_STRING-universal-macos-unsigned.zip" Ghostty.app
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-macos-app
+          path: ${{ runner.temp }}/gx-out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  verify:
+    needs: [prepare, source, libvt, libvt-macos, linux-gtk, macos]
+    if: >-
+      ${{ !cancelled()
+      && needs.prepare.result == 'success'
+      && needs.source.result == 'success'
+      && needs.libvt.result == 'success'
+      && needs.linux-gtk.result == 'success'
+      && ((inputs.macos && needs.libvt-macos.result == 'success' && needs.macos.result == 'success')
+      || (!inputs.macos && needs.libvt-macos.result == 'skipped' && needs.macos.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gx-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/gx-release
+      - name: Verify assets, write manifest.json and SHA256SUMS (build-only runs too)
+        env:
+          GX_SHA: ${{ needs.prepare.outputs.sha }}
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+          GX_MACOS: ${{ inputs.macos }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          args=()
+          if [ "$GX_MACOS" = true ]; then args+=(--macos); fi
+          python3 scripts/gx_release.py verify --sha "$GX_SHA" --version-string "$GX_VERSION_STRING" \
+            --artifacts "$RUNNER_TEMP/gx-release" "${args[@]}"
+          cd "$RUNNER_TEMP/gx-release"
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-release
+          path: ${{ runner.temp }}/gx-release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    needs: [prepare, verify]
+    if: >-
+      ${{ !cancelled()
+      && inputs.publish
+      && github.repository == 'gx0404/gx_ghostty'
+      && github.event_name == 'workflow_dispatch'
+      && needs.prepare.result == 'success'
+      && needs.verify.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-release
+          path: ${{ runner.temp }}/gx-release
+      - name: Draft, upload, check remote digests, then publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GX_PUBLISH: ${{ inputs.publish }}
+          GX_SHA: ${{ needs.prepare.outputs.sha }}
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+          GX_MACOS: ${{ inputs.macos }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          args=()
+          if [ "$GX_MACOS" = true ]; then args+=(--macos); fi
+          python3 scripts/gx_release.py publish --sha "$GX_SHA" --version-string "$GX_VERSION_STRING" \
+            --artifacts "$RUNNER_TEMP/gx-release" "${args[@]}"
