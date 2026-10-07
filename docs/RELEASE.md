@@ -149,11 +149,13 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 Actions 已启用，以下首跑结果都在 2026-10-07 取得：
 
-- `gx-ci` push：旧布局首跑约 22 min；新布局首跑 run 37582059213 约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过。文档提交 `8d46309d8` 的 push run 37592253122 也已 success；这些历史结果不覆盖本轮尚未运行的缓存新实现。
+- `gx-ci` push：旧布局首跑约 22 min；新布局首跑 run 37582059213 约 14.4 min，`ghostty-test` 在 Linux 上分 4 路运行 3909 条用例全部通过。文档提交 `8d46309d8` 的 push run 37592253122 也已 success；缓存新实现的后续验收另列如下，不由这些历史结果代证。
 - `gx-ci` 手动触发（run 37587736223，打开 `gtk_smoke` 与 `macos`）全部通过：`gtk-smoke` 在 `debian:13` 容器里构建 ReleaseFast 的 GTK app，在 Xvfb 下用 Mesa 软件渲染（OpenGL 4.5）启动；截图已下载读回，窗口标题栏、标签与菜单按钮、bash 提示符和光标都正常绘制。`macos` job 在 macos-15 上 `zig build test-lib-vt` 通过。
 - `gx-release` 只构建运行（run 37589505152，`publish=false`、`macos=true`）全部通过：`verify` 校验了 12 个发布文件与 `SHA256SUMS`，包括 libghostty-vt 五个目标与 XCFramework、libghostty-vt 源码包、完整源码包、Linux GTK 包、未签名的 macOS app 和 `manifest.json`；libghostty-vt 源码包 4,518,520 字节，低于 5 MiB 上限。之前的 run 37587740223 里 `macos` job 在 macos-15 上失败，见上表 `macos` 行。
 
+缓存新实现的真实验收：同一提交 `48b73e018` 的 [push 37601186564](https://github.com/gx0404/gx_ghostty/actions/runs/37601186564) 与 [手动 37603432582](https://github.com/gx0404/gx_ghostty/actions/runs/37603432582)（`cache_probe=true`）均全绿。三个测试 job 的工具链 exe/lib 路径两轮一致，第二轮恢复目录字节数与首轮结束值逐项相等，`stable-toolchain-v1` 缓存和完整 timings 确实恢复，post 均 `keeping intact`、未清空。同 runner probe 全 cached，分别为 0.315、0.416、1.094 s，且没有重复执行用例。固定路径、实际恢复与同机复建记 **PASS**；构建和用例明细见 [TESTING.md](TESTING.md)「两轮真实 CI 验收」。
+
 仍待确认（PENDING）：
 
-- `gx-ci` 的热缓存：2026-10-07 run 37587736223 的 `linux-vt` 缓存达到 5,078,327,232 字节，超过 4096 MiB 后被清空，下一轮恢复的缓存仅 186 字节。钉版 translate-c 源码已证实 `--zig-lib` 路径直接进入 hash，因此 `setup-zig` 的随机解压路径会改变该输入；runner CPU 切换是否造成此次失效仍只是猜测。当前三个测试 job 改用 `use-tool-cache: true` 与 `cache-key: stable-toolchain-v1`，固定工具链路径并隔离旧变体，不删除旧缓存、不提高 4096 MiB 上限；新增缓存快照与可选 `cache_probe` 的补验办法见 [TESTING.md](TESTING.md)「CI 缓存诊断」。新实现尚未在真实 CI 跑过，不能宣称缓存稳定或全 CI 已达两分钟。
+- **跨 runner 完整复用与缓存增长控制**：第二轮首次构建只有 10/45、49/100、10/45 节点 cached，translate-c 与测试编译仍未 cached，`o` 分区继续增长。`linux-vt`、`windows` 的 CPU 从 AMD EPYC 9V74 换成 7763 已由快照确认；`linux-main` 同为 9V74，仍有 miss。源码能解释工具产物差异如何经 `Run.artifact` hash 向下游传播，但初始 native 工具差异原因未定。旧 run 37587736223 的 `linux-vt` 曾达 5,078,327,232 字节、超过 4096 MiB 被清空，下一轮只恢复 186 字节；新实现不删除旧 cache，也未提高上限，未来仍可能超限。本次 PASS 不能写成跨运行全命中或所有缓存问题已解决，更不能代证全 CI 两分钟。
 - 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。本轮未公开发布，也不为补验触发发布。

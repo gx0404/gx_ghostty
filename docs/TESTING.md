@@ -62,7 +62,7 @@
 
 `mlugg/setup-zig` 跨运行保存的 Zig 缓存目录超过 `cache-size-limit` 就被清空。旧 `linux` job 约 2.99 GB 超过默认 2048 MiB；三个测试 job 提高到 4096 MiB 后仍有失效：2026-10-07 run 37587736223 的 `linux-vt` 最终为 **5,078,327,232 字节**，超过 4096 MiB 被清空，下一轮恢复的只有 **186 字节**。不能把恢复步骤成功视为有效热缓存命中。
 
-钉版 translate-c 源码已证实 `--zig-lib` 参数的路径直接进入 hash，`setup-zig` 每轮随机解压路径因而会改变输入；CPU 型号切换对此次失效的影响仍是猜测，不写成根因。当前实现与补验边界：
+钉版 translate-c 源码已证实 `--zig-lib` 参数的路径直接进入 hash，旧 setup-zig 的随机解压路径因而会改变输入。后续两轮已观测到两个 VT job 的 CPU 型号变化，但其与 miss 的因果关系不能一概而论，见下方实测。当前实现与验收边界：
 
 - `linux-vt`、`linux-main`、`windows` 的 setup-zig 均设 `use-tool-cache: true`，以固定工具链路径减少路径变体，并用 `cache-key: stable-toolchain-v1` 隔离旧变体；不删除旧 cache，4096 MiB 上限不变。`lib-vt-cross` 仍按 target 分 key。
 - 三个测试 job 的 `GX_ZIG_TEST_TIMINGS_DIR=.zig-cache/gx-test-timings` 让调度记录随 Zig 缓存保存；只有真正恢复到有效记录，才可按上轮耗时调度。构建增加 `--summary all`（经运行器 `--zig-arg` 透传），从日志区分缓存命中和实际编译。
@@ -70,7 +70,28 @@
 - 手动输入 `cache_probe` 默认 false，只有 `workflow_dispatch` 且为 true 时才在同一 runner 重复相同套件的安装构建（main 保留 `-Dapp-runtime=none`），不重复运行用例；普通 push/PR 不增加这次编译。probe JSON 记录命令、耗时与退出码，详细构建 summary 在 job 日志。
 - `gx-zig-test-<job>` 以 `always()` 上传测试 JSON、`cache-restored.json`、`cache-finished.json` 和启用探针时的 `cache-probe.json`，保留 14 天。finished 快照在 setup-zig 的 action post 之前，只反映保存前状态；还要检查 post 日志是否超限清空、下一轮 restored 是否恢复了有效数据。
 
-**PENDING**：上述新实现尚未跑真实 CI。补验需一次手动 `gx-ci`（`cache_probe=true`）读回三个 job 的报告与构建 summary，再对照后续运行的 restored、post 日志和总墙钟；同 runner 复建命中不能代证跨运行命中，也不能预告全 CI 两分钟。不得通过删用例、默认去重或收窄覆盖来满足时间目标。
+#### 两轮真实 CI 验收
+
+同一提交 `48b73e018` 的首轮 [push 37601186564](https://github.com/gx0404/gx_ghostty/actions/runs/37601186564) 与第二轮 [手动 37603432582](https://github.com/gx0404/gx_ghostty/actions/runs/37603432582)（`cache_probe=true`）均全绿。读回三个测试 job 的 JSON、构建 summary 与 action post 日志后，证据如下；下表秒数仅为构建耗时，不是测试或整个 CI 的墙钟。
+
+| job | 首轮冷构建（s） | 第二轮恢复后首次构建（s） | 第二轮同机 probe（s） | 首次构建 / probe 的 cached 节点 |
+|---|---:|---:|---:|---|
+| `linux-vt` | 101.808 | 120.545 | 0.315 | 10/45 → 45/45 |
+| `linux-main` | 389.189 | 187.431 | 0.416 | 49/100 → 100/100 |
+| `windows` | 341.859 | 398.938 | 1.094 | 10/45 → 45/45 |
+
+| job | 第二轮恢复目录（bytes） | 第二轮结束目录（bytes） | 恢复的 timings 条数 | 第二轮 total / passed / skipped |
+|---|---:|---:|---|---|
+| `linux-vt` | 1,842,888,128 | 3,459,272,197 | vt 3094 + vt_c 3557 | 6651 / 6581 / 70 |
+| `linux-main` | 1,512,204,370 | 2,316,580,596 | main 3909 | 3909 / 3867 / 42 |
+| `windows` | 1,350,354,731 | 2,495,151,382 | vt 3096 + vt_c 3559 | 6655 / 6593 / 62 |
+
+- **PASS：路径固定与真实恢复。** 两轮 Linux 的 exe/lib 均为 `/opt/hostedtoolcache/zig/0.16.0/x64/{zig,lib}`，Windows 均为 `C:\hostedtoolcache\windows\zig\0.16.0\x64\{zig.exe,lib}`，逐项相同。第二轮恢复了首轮的 `stable-toolchain-v1` key，各 job 恢复目录字节数逐项等于首轮结束值，timings 完整带回；两轮 post 均为 `keeping intact`，没有清空。
+- **PASS：同机复建且不重复测试。** probe JSON 的 command 数组与该 job 第一次构建完全一致，只有 `test-lib-vt-bin` / `test-bin` 安装构建步骤；各 job 日志仅一次 `[zig_test] running`，没有 filter 或 dedupe，测试无 failure。probe 的全部构建节点命中，耗时 0.315–1.094 s。
+- **跨 runner 仅部分复用。** 第二轮首次构建仍有 translate-c 与测试编译节点未 cached；缓存 `o` 分区继续增长，不能把恢复成功或同机全 cached 写成跨运行全命中。本次结束大小虽均低于 4096 MiB，未来仍可能超限，不能宣称所有缓存问题已解决。
+- **CPU 事实与根因分开。** `linux-vt`、`windows` 从 AMD EPYC 9V74 换成 7763，`linux-main` 两轮均为 9V74；CPU 变化对前两个 job 已是观测事实，但不足以解释所有 miss。源码支持「编译工具产物不同 → `Run.artifact` hash 改变 → 下游失效」的传播机制；初始 native 工具产物为何不同，尤其 main 同 CPU 时为何 miss，仍未确定。
+
+固定路径、缓存恢复、timings 保留和同机快速复建已验收；跨 runner 完整复用及增长控制仍需后续运行补证。「所有测试 ≤2 min」仍未达成，不能用 probe 秒数替代全量耗时，也不得删用例、默认去重或收窄覆盖。
 
 ## CI 覆盖与本机对应
 
