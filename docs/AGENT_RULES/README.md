@@ -147,7 +147,7 @@ Linux/macOS 直接调用脚本时用 `python3`。其他参数：
 | `cli-inspector` | `src/cli.zig`、`src/cli/`、`src/inspector/`、`src/extra/`、`pkg/dcimgui/` |
 | `code-review` | 无路径；任务 `review` |
 | `config` | `src/config.zig`、`src/config/`、`src/helpgen.zig`，以及 `src/gx/` 的配置分层、`gx-*` 值类型、默认值文件与覆盖文件模块 |
-| `development` | 根与嵌套 `AGENTS.md`、`CLAUDE.md`、`AI_POLICY.md`、`HACKING.md`、`.agents/`、`.claude/`、`.codex/`、`.zcode/`、`.githooks/`、`docs/`、`scripts/`、`graphify-out/`、`justfile`、`.graphifyignore`、`.gitignore`、`.prettierignore`；任务 `sync` |
+| `development` | 根与嵌套 `AGENTS.md`、`CLAUDE.md`、`README.md`（开头的 fork 声明块）、`AI_POLICY.md`、`HACKING.md`、`.agents/`、`.claude/`、`.codex/`、`.zcode/`、`.githooks/`、`docs/`、`scripts/`、`graphify-out/`、`justfile`、`.graphifyignore`、`.gitignore`、`.prettierignore`；任务 `sync` |
 | `font` | `src/font/`（含 DirectWrite 发现 `src/font/directwrite/`）、`pkg/{fontconfig,freetype,harfbuzz}/`、`vendor/nerd-fonts/` |
 | `gx-core` | `src/gx/`（GX 共享核心）、翻译表生成器 `scripts/gx_i18n.py`、`po/zh_CN.po` |
 | `input` | `src/input.zig`、`src/input/`、`src/surface_mouse.zig`、`src/gx/{action,win32_input}.zig` |

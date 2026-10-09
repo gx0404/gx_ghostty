@@ -1,5 +1,7 @@
 # gx_ghostty fork 文档索引
 
+> Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。
+
 `docs/` 整个目录由 GX fork 新增，上游 `ghostty-org/ghostty` 没有这个目录。这里的文档写给在本仓工作的人和 AI agent，不面向 Ghostty 终端用户；用户文档仍由上游在 ghostty.org 维护。每轮必读的启动协议在根 [`AGENTS.md`](../AGENTS.md) 的 fork 段，本页只做导航。
 
 ## fork 文档
@@ -13,7 +15,7 @@
 | [TESTING.md](TESTING.md) | 测试与证据：分层（能证明 / 不能代证）、Windows GUI 验证、并行运行器与耗时、CI 与本机的覆盖差异、Windows 本机与 WSL 的限制、故障注入、PASS / FAIL / PENDING / N/A 规则 |
 | [RELEASE.md](RELEASE.md) | 版本与发布：产品版本与 fork 版本两套体系、`gx-vX.Y.Z` tag 与构建版本串、0.0.1 的发版步骤、`gx-release` 的 job、资产清单与 `manifest.json`、校验、回滚、GX Shell 的跟进、在 fork 上首次启用 Actions |
 | [AI_TOOLS.md](AI_TOOLS.md) | AI 工具面：Claude Code、Codex、ZCode 等客户端的规则加载、共享的 hook 安全门策略，以及逐客户端验证账本 |
-| [FORK_PATCHES.md](FORK_PATCHES.md) | fork 对上游源码的补丁登记（GX-0001～GX-0022，未用的编号不复用）：补丁 ID、文件与标记、原因、行为、同步冲突处理、移除条件、验证与锁定测试 |
+| [FORK_PATCHES.md](FORK_PATCHES.md) | fork 对上游源码的补丁登记（GX-0001～GX-0026，未用的编号不复用）：补丁 ID、文件与标记、原因、行为、同步冲突处理、移除条件、验证与锁定测试 |
 | [AGENT_RULES/README.md](AGENT_RULES/README.md) | 领域规则的加载方式与维护方法；机器真源是 [AGENT_RULES/routes.toml](AGENT_RULES/routes.toml)（路径与任务到领域文档的路由，以及上游嵌套 `AGENTS.md` 的登记） |
 | `kb/chunks.json` | agent 知识库，生成物：`just kb` 生成，`just kb-check` 校验，`just kb-query <词>` 检索；不要手改 |
 

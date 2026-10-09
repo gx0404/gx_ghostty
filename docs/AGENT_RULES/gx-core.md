@@ -16,6 +16,7 @@
 | `config_layers.zig`、`config_types.zig`、`gui_settings.zig`、`theme.zig` | 配置分层、`gx-*` 键的值类型、覆盖文件 `gui-settings.ghostty`、内置主题 |
 | `settings_map.zig` | 与 UI 工具包无关的设置模型：选项、写入的键与值、标签 msgid，`Changes` 一次提交到覆盖文件 |
 | `i18n.zig`、`i18n/` | 界面语言与翻译 |
+| `branding.zig` | 产品名、维护者、链接与非官方分支声明（Ghostty 维护者要求非官方构建写明未获认可）；两个 apprt 的关于对话框与设置的关于页都显示它 |
 | `action.zig`、`profiles.zig` | `gx:` 绑定动作；启动配置探测 |
 | `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 进程快照（Windows 用 Toolhelp32，Linux 读 `/proc`，比较创建时间防 pid 复用）、空闲与 herdr 策略、关闭确认（GX-0012）、herdr 应用模式 |
 | `win32_input.zig`、`conpty.zig`、`osc7.zig`、`path_quote.zig` | Windows 终端支持：KEY_EVENT_RECORD 编码（GX-0006）、随包 ConPTY（GX-0007）、OSC 7 的盘符路径（GX-0008）、拖放与粘贴路径按 shell 引用 |

@@ -1,3 +1,17 @@
+<!-- gx-fork: 非官方分支声明（fork 维护段，上游没有；同步时保留在文件开头，以下是上游原文）-->
+> [!IMPORTANT]
+> **Ghostty GX is an unofficial fork of Ghostty maintained by [gx0404](https://github.com/gx0404). It is not affiliated with or endorsed by the Ghostty project.**
+> It adds a native Windows app and Ghostty GX features on top of Ghostty. Get it from
+> [gx0404/gx_ghostty releases](https://github.com/gx0404/gx_ghostty/releases) and report Ghostty GX problems
+> [here](https://github.com/gx0404/gx_ghostty/issues), not to the Ghostty project. See [CHANGELOG.md](CHANGELOG.md)
+> and [docs/GX_FEATURES.md](docs/GX_FEATURES.md); the rest of this page is the upstream Ghostty README, unchanged.
+>
+> **Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。**
+> 它在 Ghostty 之上增加 Windows 原生应用与 Ghostty GX 功能；请从 [gx0404/gx_ghostty 的 Releases](https://github.com/gx0404/gx_ghostty/releases)
+> 获取，Ghostty GX 的问题请报告到[本仓库](https://github.com/gx0404/gx_ghostty/issues)，不要报告给 Ghostty 项目。
+> 变更见 [CHANGELOG.md](CHANGELOG.md)，功能见 [docs/GX_FEATURES.md](docs/GX_FEATURES.md)；本页其余部分是上游 Ghostty 的 README 原文。
+<!-- /gx-fork -->
+
 <!-- LOGO -->
 <h1>
 <p align="center">

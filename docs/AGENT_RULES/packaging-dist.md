@@ -5,7 +5,7 @@
 - 构建侧：`src/build/GhosttyDist.zig`（`dist`/`distcheck`）、`src/build/GhosttyResources.zig`（安装资源）。
 - 上游打包面：`PACKAGING.md`、`flatpak/**`、`snap/**`、`nix/package.nix`、`images/**`。
 - `dist/**`：`linux/` 桌面集成模板（与 `apprt-gtk.md` 共管）、`macos/` appcast 脚本（与 `macos-app.md` 共管）、`windows/` 顶层编进 exe 的 rc、ico 与 manifest（与 `apprt-win32.md` 共管）、fork 的 `windows/gx/`（Inno Setup 脚本 `ghostty-gx.iss` 与随包许可证）、`cmake/` 与 `doxygen/`（规则见 `libghostty-vt.md`）。
-- fork 打包脚本：`scripts/gx_windows_package.py`（`just package-windows`）、`scripts/gx_package.py`（`just stage`）、`scripts/gx_linux_build.py` 及其测试。
+- fork 打包脚本：`scripts/gx_windows_package.py`（`just package-windows`）、`scripts/gx_package.py`（`just stage`）、`scripts/gx_linux_build.py`、`scripts/gx_icon.py` 及其测试。
 - fork 发布资产的内容与命名；`gx-release` 流程、`$VS` 版本串与 tag 见 `ci-release.md` 与 `docs/RELEASE.md`。
 
 ## 符号真源
@@ -29,7 +29,7 @@
 - Flatpak：`flatpak/com.mitchellh.ghostty.yml`（ReleaseFast）与 `com.mitchellh.ghostty-debug.yml`（Debug）以仓库目录为源，用 `-Dflatpak=true --system $PWD/vendor/p` 构建，依赖源取自生成的 `flatpak/zig-packages.json`；`flatpak/dependencies.yml` 用 sha256 钉住 Zig 0.16.0 官方包。
 - Snap：`snap/snapcraft.yaml` 从 ziglang.org 下载 Zig 0.16.0（不校验摘要），用 `craftctl set version=$(cat VERSION)` 取版本，所以输入必须是源码包；`-Dsnap -Doptimize=ReleaseFast -Dcpu=baseline`，classic confinement，启动器 `snap/local/launcher`。
 - Nix：`nix/package.nix` 以 `build.zig.zon.nix` 为离线依赖，传硬编码的 `-Dversion-string=1.3.2-dev+<rev>-nix` 与 `-Dcpu=baseline`，只声明 Linux 平台。
-- 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程；`dist/windows/ghostty.rc`（引用同目录的 ico 与 PerMonitorV2 manifest）经 `src/build/GhosttyExe.zig::init` 编入 Windows 目标的 `ghostty.exe`。图标：`images/gnome/` 供 Linux 安装、GTK gresource 与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
+- 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程；fork 的 exe 编入 `dist/windows/gx/ghostty-gx.rc`（GX-0026），不用上游 `dist/windows/ghostty.rc` 与其图标，manifest 仍取上游。图标：`images/gnome/` 供 Linux 安装、GTK gresource 与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
 
 ### fork 发布资产（`gx-release`）
 
@@ -50,7 +50,13 @@
 
 - `just package-windows`（`--build`）先把 ReleaseFast 的 win32 app 装进前缀（`-Dtarget=x86_64-windows-gnu`、`-Dversion-string=$VS`），再在 `zig-out/dist/` 产出 `ghostty-gx-$VS-x86_64-windows.zip`（单一顶层目录：`ghostty.exe`、随包 ConPTY 的 `conpty.dll` 与 `OpenConsole.exe`、软件渲染 `mesa/`、`share/`、`fonts/`、`licenses/`、中英文 `README.txt`）与 Inno Setup 7.1 安装包；`--skip-installer` 只出 zip。
 - 第三方输入（ConPTY 1.24.261001001、Mesa llvmpipe、JetBrainsMono Nerd Font 6 款与 Noto Sans CJK 2 款、许可证文本）在模块文档里钉 SHA-256，下载到缓存（默认 `.local/cache/gx-package`，`--offline` 不联网），任一不符即失败。ISCC 依次取 `--iscc`、`$ISCC`、`.local/tools/innosetup/ISCC.exe`（`just setup --innosetup`）与 `PATH`。报告成功前两个产物都按 `expected_assets` 核对。
-- 安装包（`dist/windows/gx/ghostty-gx.iss`）：默认按用户装到 `%LOCALAPPDATA%\Programs\Ghostty GX`，也可为所有用户安装；开始菜单、可选桌面图标、App Paths、可选的资源管理器右键菜单；字体按用户安装，已存在就跳过，卸载时保留；卸载不删用户配置。`just stage windows <新目录>` 用同一棵树生成 GX Shell 的 Windows stage。
+- 安装包（`dist/windows/gx/ghostty-gx.iss`）：欢迎页（`DisableWelcomePage=no`）与「应用和功能」的 `AppComments` 写明非官方分支声明；默认按用户装到 `%LOCALAPPDATA%\Programs\Ghostty GX`，也可为所有用户安装；开始菜单、可选桌面图标、App Paths、可选的资源管理器右键菜单；字体按用户安装，已存在就跳过，卸载时保留；卸载不删用户配置。`just stage windows <新目录>` 用同一棵树生成 GX Shell 的 Windows stage。
+
+### Ghostty GX 图标（`scripts/gx_icon.py`）
+
+- Ghostty 维护者要求非官方构建不用 Ghostty 品牌，Windows 产物因此用 `dist/windows/gx/ghostty-gx.ico`（16～256 像素）：只用标准库的 `python scripts/gx_icon.py` 生成，`--check` 逐像素比对，`--png <目录>` 导出供审阅；改图案改生成器，不手改 ico。
+- 使用者：exe 资源、安装包的 `SetupIconFile`（`scripts/gx_windows_package.py::ICON`）与 Windows stage 的 `build-inputs/ghostty.ico`（GX Shell 安装包图标，stage 契约不变）。
+- Linux 保持上游图标：GTK 窗口图标取应用 ID `com.mitchellh.ghostty`，只换 deb stage 启动器的图标会与窗口不一致，所以 deb stage 仍取 `images/gnome/`。
 
 ### GX Shell 组件 stage（`scripts/gx_package.py`、`scripts/gx_linux_build.py`）
 
@@ -76,7 +82,7 @@
 - 不提交 `zig-out/dist/` 下的 tarball 或任何 dist 预生成资源；不手改 `flatpak/zig-packages.json`。
 - 发布构建不省略 `-Dversion-string`；不手工改资产名，不绕过 `verify` 补传资产。
 - 不改应用 ID、bundle ID、`dist/linux` 模板里的标识或 `images/` 下的图标；不为 fork 重新启用归档的 flatpak、snap 与 release workflow。
-- 不在 fork 资产或文档中引用上游 minisign 公钥声称已签名，不把 fork 资产说成上游官方发布。
+- 不在 fork 资产或文档中引用上游 minisign 公钥声称已签名，不把 fork 资产说成上游官方发布；不用「Ghostty for Windows」「Windows 版 Ghostty」这类暗示 Ghostty 团队出品或认可的说法，写作「基于 Ghostty 的非官方分支 Ghostty GX」。
 - 不为适配 fork 改 `PACKAGING.md`、`flatpak/`、`snap/`、`nix/package.nix` 等上游打包文件；发现过时内容（如 `PACKAGING.md` 的 Zig 版本）写进交付说明，留待上游修正。
 
 ## 验证
@@ -85,6 +91,7 @@
 - 改完整源码包或 GTK 资源：在装好 GTK 构建依赖的 Linux 上跑 `zig build distcheck`（上游形态 `nix develop -c zig build distcheck`）；本机 Windows 记 PENDING，交 `gx-release` 以 `publish=false` 运行的 `linux-gtk` job 验收。
 - 改 `GhosttyResources.zig` 或 `dist/linux/`：Linux 上 `just build` 后检查 `zig-out/share/` 的安装布局；GUI 可见的影响按 `testing.md` 走 `gtk-smoke`。
 - 改资产命名或集合：`just framework-test`（含 `scripts/test_gx_release.py`），再以 `publish=false` 运行 `gx-release` 看 `verify`，未运行前记 PENDING。
+- 改图标：`python scripts/run_unittests.py test_gx_icon`，`--png` 导出读图，再构建并截图任务栏。
 - 改 Windows 打包或 `dist/windows/gx/`：`python scripts/run_unittests.py test_gx_package test_gx_release`，再 `just package-windows`（先 `just setup --innosetup`；首次要下载钉版输入）；解压的 zip 与装到临时目录的安装包各按 `apprt-win32.md` 启动并截图读图。CI 证据是 `gx-release`（`publish=false`）的 `gx-windows-app` artifact。
 - 改 GX Shell stage 或 Ubuntu 配方：`python scripts/run_unittests.py test_gx_package test_gx_linux_build`（Windows 未开开发者模式时 deb stage 用例跳过，在 WSL 克隆里用 `python3` 补跑）；真实验收在全新 `ubuntu:24.04` 容器按模块文档的 deb 命令构建、`verify-stage`，再在另一个全新容器装 `test-deb` 的包并截图读图；CI 证据是 `gx-release`（`publish=false`）的 `evidence-linux-gtk-noble`，读回截图前记 PENDING。
 - 改 `flatpak/`、`snap/`、`nix/package.nix`（仅随上游同步）：Nix 主机上 `nix build .#ghostty-releasefast`（上游 `build-nix` 形态）；Flatpak 与 Snap 需要 Linux 上的 `flatpak-builder` 与 `snapcraft`，本机记 PENDING。

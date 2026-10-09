@@ -687,7 +687,7 @@ class RealRepoRoutesTest(unittest.TestCase):
     def test_schema_sorting_and_root_only(self) -> None:
         self.assertEqual(self.routes.version, 3)
         self.assertEqual(resolver.sort_problems(self.routes), [])
-        self.assertEqual(self.routes.root_only, (".gitmodules", ".mailmap", "LICENSE", "README.md"))
+        self.assertEqual(self.routes.root_only, (".gitmodules", ".mailmap", "LICENSE"))
 
     def test_task_routes(self) -> None:
         by_task = {
@@ -716,12 +716,14 @@ class RealRepoRoutesTest(unittest.TestCase):
             PO_FILE: ["apprt-gtk"],
             SWIFT_FILE: ["macos-app"],
             "src/apprt/embedded.zig": ["app-core", "libghostty-embedding", "macos-app"],
-            "README.md": [],
+            "README.md": ["development"],
+            "LICENSE": [],
         }
         for path, expected in cases.items():
             with self.subTest(path=path):
                 self.assertEqual(matcher.rule_ids(path), expected)
-        self.assertTrue(matcher.in_root_only("README.md"))
+        self.assertTrue(matcher.in_root_only("LICENSE"))
+        self.assertFalse(matcher.in_root_only("README.md"))
 
 
 class RealRepoSmokeTest(unittest.TestCase):

@@ -29,7 +29,7 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
 - 根 `CHANGELOG.md` 只记 fork 的可观察变更：Windows app、GTK 的 GX 层、共享核心与配置、框架、开发流程、构建补丁、发布链。上游 Ghostty 没有 CHANGELOG，这里也不转述上游的产品变更。
 - 版本标题只有 `## X.Y.Z(YYYY-MM-DD)` 与 `## X.Y.Z(TBD)` 两种；二级标题只用于版本，小节用 `### Added` / `### Changed` / `### Fixed`。
 - 数值最大的标题就是当前 fork 版本，与书写顺序无关。它还是 `(TBD)` 时，新条目写在它下面；它已定版时，先加新的 `(TBD)` 标题再写。
-- 发布说明以该版本的 CHANGELOG 段开头（从版本标题的下一行到下一个版本标题之前），后面接生成的「构建与资产」表；所以版本段不能为空，写给使用者看。
+- 发布说明以该版本的 CHANGELOG 段开头（从版本标题的下一行到下一个版本标题之前），后面接生成的「构建与资产」表，结尾是固定的非官方分支声明（`scripts/gx_release.py::DISCLAIMER`，中英文）；所以版本段不能为空，写给使用者看。
 - `just version-check`（`version.py --check`）要求全部标题合法、版本不重复、至少一个；`version.py --release` 另外要求最大版本已带日期。发布模式的 prepare 也做同样的日期检查，并要求版本段非空。
 - `CHANGELOG.md` 的开头 6000 字符（`scripts/build_agent_kb.py::CHANGELOG_HEAD_CHARS`）是知识库语料，版本标题与新条目都落在这一段。所以每次改 CHANGELOG（加条目、定版、开新版本）都要接着运行 `just kb`，把重建的 `docs/kb/chunks.json` 与 CHANGELOG 放进同一个提交，提交前用 `just kb-check` 确认；漏掉时 `gx-ci` 的 `framework` job 在 KB 新鲜度检查上失败，依赖它的 job 全部跳过。
 

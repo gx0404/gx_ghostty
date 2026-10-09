@@ -20,7 +20,6 @@ root_only = [
   ".gitmodules",
   ".mailmap",
   "LICENSE",
-  "README.md",
 ]
 
 nested_agents = [
@@ -192,6 +191,7 @@ paths = [
   "AI_POLICY.md",
   "CLAUDE.md",
   "HACKING.md",
+  "README.md",
   "docs/**",
   "graphify-out/**",
   "justfile",
@@ -319,9 +319,11 @@ paths = [
   "flatpak/**",
   "images/**",
   "nix/package.nix",
+  "scripts/gx_icon.py",
   "scripts/gx_linux_build.py",
   "scripts/gx_package.py",
   "scripts/gx_windows_package.py",
+  "scripts/test_gx_icon.py",
   "scripts/test_gx_linux_build.py",
   "scripts/test_gx_package.py",
   "snap/**",
