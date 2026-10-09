@@ -45,8 +45,8 @@ keybind = alt+7=unbind
 keybind = alt+digit_8=unbind
 keybind = alt+8=unbind
 
-# Ghostty GX actions (gx:<name>, src/gx/action.zig). App runtimes that do
-# not perform them (GTK) pass these keys on to the terminal (performable:).
+# Ghostty GX actions (gx:<name>, src/gx/action.zig). An app runtime that
+# does not perform them passes these keys on to the terminal (performable:).
 keybind = performable:ctrl+shift+m=gx:main_menu
 keybind = performable:ctrl+shift+slash=gx:keybinds
 

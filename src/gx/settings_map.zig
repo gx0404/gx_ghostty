@@ -2,7 +2,9 @@
 //! choices a settings UI offers, the configuration keys and values they
 //! write to `gui-settings.ghostty`, the msgids of their labels, and the
 //! pending changes a UI saves in one go. The GTK settings dialog
-//! (`src/apprt/gtk/gx/settings_dialog.zig`) only renders it.
+//! (`src/apprt/gtk/gx/settings_dialog.zig`) and the Windows settings
+//! overlay (`src/apprt/win32/ui/Settings.zig`) only render it; the Windows
+//! command palette uses its theme list and changes as well.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;

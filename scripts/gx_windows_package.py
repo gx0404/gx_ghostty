@@ -17,13 +17,13 @@ Pinned third-party inputs (DOWNLOADS, PAYLOAD) are fetched once into the cache d
 else $GX_GHOSTTY_PACKAGE_CACHE, else .local/cache/gx-package; --offline never downloads). Every
 download and every extracted file must match its SHA-256, otherwise packaging fails (fail closed):
   - Microsoft.Windows.Console.ConPTY 1.24.261001001 (NuGet, MIT): x64 conpty.dll and OpenConsole.exe,
-    the pair WezTerm GX ships;
+    the pair src/gx/conpty.zig loads from the directory of ghostty.exe;
   - Mesa 26.2.4 llvmpipe from pal1000/mesa-dist-win (release-msvc .7z, extracted with Windows'
     built-in bsdtar, System32\\tar.exe): mesa/opengl32.dll and mesa/libgallium_wgl.dll (static CRT,
     system imports only) plus mesa/dxil.dll for Mesa's D3D12 driver; the app loads
     mesa\\opengl32.dll only as an OpenGL fallback (or with GHOSTTY_GX_OPENGL=software);
-  - fonts byte-identical to WezTerm GX dotfiles/fonts/ and Oh My Zsh GX gx/fonts/JetBrainsMonoNerd/,
-    because GX Shell merges component fonts only when their bytes match: JetBrainsMono Nerd Font
+  - fonts, the ones Oh My Zsh GX also ships (gx/fonts/JetBrainsMonoNerd/) byte-identical to its
+    copies, because GX Shell merges component fonts only when their bytes match: JetBrainsMono Nerd Font
     Regular/Bold/Italic/BoldItalic/SemiBold/SemiBoldItalic from the Nerd Fonts v3.4.0 release asset
     JetBrainsMono.tar.xz, and Noto Sans CJK Regular/Bold .ttc 2.001 from notofonts/noto-cjk tag
     NotoSansV2.001 (the files Ubuntu's fonts-noto-cjk installs as NotoSansCJK-*.ttc);
@@ -692,7 +692,8 @@ def write_zip(tree: Path, top: str, destination: Path) -> Path:
 
 
 def font_name(path: Path) -> str:
-    """Full name (name ID 4) of the first face, preferring US English, as WezTerm GX registers fonts."""
+    """Full name (name ID 4) of the first face, preferring US English: the name Inno Setup's FontInstall
+    registers the font under, as Explorer shows it for the file."""
     data = Path(path).read_bytes()
     try:
         base = struct.unpack_from(">I", data, 12)[0] if data[:4] == b"ttcf" else 0
