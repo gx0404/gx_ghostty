@@ -825,39 +825,47 @@ class CliTests(FakeRunnerTestCase):
         self.assertIn("vt", report["error"])
         self.assertFalse(report["ok"])
 
-    def test_main_suite_is_refused_on_windows_unless_no_build(self) -> None:
-        record = self.fake_zigw(exit_code=1)
-        binary = self.fake("explicit", [{"name": "only"}])
+    def test_main_suite_on_windows_builds_the_win32_runtime_for_windows_gnu(self) -> None:
+        self.assertEqual(("app-runtime=win32", "target=x86_64-windows-gnu"), zig_test.MAIN_SUITE_ON_WINDOWS)
+        record = self.fake_zigw()
+        pinned = "-Dversion-string=1.3.2-dev+0000000"
+        defaults = ["-Dapp-runtime=win32", "-Dtarget=x86_64-windows-gnu"]
 
-        def built_step() -> str:
-            step = json.loads(record.read_text(encoding="utf-8"))[1]
+        def built() -> list[str]:
+            args = json.loads(record.read_text(encoding="utf-8"))
             record.unlink()
-            return step
+            return args
 
+        with self.fake_suite("main", [{"name": "installed"}, {"name": "broken", "status": "fail"}]):
+            with mock.patch.object(zig_test, "host_is_windows", return_value=True):
+                code, report, text = self.run_json("--suite", "main", "--jobs", "1", "--filter", "installed")
+                self.assertEqual(0, code, text)
+                self.assertEqual(["build", "test-bin", pinned, *defaults], built())
+                self.assertEqual([sys.executable, str(self.root / "scripts" / "zigw.py"), "build", "test-bin", pinned, *defaults], report["build"]["command"])
+                code, report, text = self.run_json("--suite", "main", "--jobs", "1", "-Doptimize=ReleaseFast", "--filter", "broken")
+                self.assertEqual(1, code, text)
+                self.assertEqual(["build", "test-bin", pinned, "-Doptimize=ReleaseFast", *defaults], built())
+                argv = split_command(report["reproduce"])
+                self.assertEqual(["--suite", "main", "-Doptimize=ReleaseFast"], argv[4:7], argv)
+                self.assertFalse([arg for arg in argv if arg in defaults], argv)
+                for given, expected in (
+                    (["-Dtarget=x86_64-linux-gnu", "--zig-arg=-Dapp-runtime=none"], ["-Dtarget=x86_64-linux-gnu", "-Dapp-runtime=none"]),
+                    (["-Dapp-runtime=none"], ["-Dapp-runtime=none", "-Dtarget=x86_64-windows-gnu"]),
+                ):
+                    code, out, err = self.run_main("--suite", "main", "--jobs", "1", "--filter", "installed", *given)
+                    self.assertEqual(0, code, out + err)
+                    self.assertEqual(["build", "test-bin", pinned, *expected], built())
+            with mock.patch.object(zig_test, "host_is_windows", return_value=False):
+                code, out, err = self.run_main("--suite", "main", "--jobs", "1", "--filter", "installed")
+            self.assertEqual(0, code, out + err)
+            self.assertEqual(["build", "test-bin", pinned], built())
         with mock.patch.object(zig_test, "host_is_windows", return_value=True):
-            for args in (("--suite", "main"), ("--suite", "main", "--binary", str(binary))):
-                code, report, text = self.run_json(*args)
-                self.assertEqual(2, code, text)
-                self.assertEqual((False, zig_test.MAIN_SUITE_ON_WINDOWS), (report["ok"], report["error"]))
-                for needle in ("ghostty-test", "pwd.h", "linux-main", "just test-vt", "--binary"):
-                    self.assertIn(needle, text)
-            self.assertFalse(record.exists())
-            self.assertEqual([], self.events("start"))
+            self.assertEqual(2, self.run_main("--suite", "vt")[0])
+            self.assertEqual(["build", "test-lib-vt-bin", pinned], built())
             code, _out, err = self.run_main("--suite", "main", "--no-build", "--list")
-            self.assertEqual(2, code, err)
-            self.assertIn("缺少测试二进制（Windows 上无法构建 ghostty-test", err)
-            self.assertNotIn("先去掉 --no-build", err)
-            with self.fake_suite("main", [{"name": "installed"}]):
-                code, out, err = self.run_main("--suite", "main", "--no-build", "--jobs", "1")
-            self.assertEqual(0, code, out + err)
-            code, out, err = self.run_main("--binary", str(binary), "--jobs", "1")
-            self.assertEqual(0, code, out + err)
-            self.assertFalse(record.exists())
-            self.assertEqual((2, "test-lib-vt-bin"), (self.run_main("--suite", "vt")[0], built_step()))
-        with mock.patch.object(zig_test, "host_is_windows", return_value=False):
-            code, _out, err = self.run_main("--suite", "main")
-        self.assertEqual((2, "test-bin"), (code, built_step()), err)
-        self.assertIn("构建失败", err)
+        self.assertEqual(2, code, err)
+        self.assertIn("缺少测试二进制（先去掉 --no-build 构建一次）", err)
+        self.assertFalse(record.exists())
 
     def test_cli_process_exit_codes(self) -> None:
         green = self.fake("cli_green", [{"name": "a"}, {"name": "b", "status": "skip"}])

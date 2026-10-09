@@ -103,8 +103,8 @@ build *a:
     {{python}} scripts/zig_build.py {{a}}
 
 # zig_test.py 先构建 test-bin，再把 ghostty-test 的用例分片到 --jobs N 个进程（默认 CPU 数），-D… 透传 zig build；
-# ghostty-test 不能为 Windows 编译（上游翻译 pwd.h 等 POSIX 头），Windows 上不构建、直接退出 2，主套件以 gx-ci linux-main 为准
-# 完整 Zig 单测（Windows 上退出 2，改用 test-vt；并行分片：运行期 --filter <子串> 定向、不重编译，--jobs N；上游串行路径 just zig build test）
+# Windows 主机上没写 -Dapp-runtime / -Dtarget 时补 -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu（与 just build 同一组合）
+# 完整 Zig 单测（并行分片：运行期 --filter <子串> 定向、不重编译，--jobs N；上游串行路径 just zig build test）
 test *a:
     {{python}} scripts/zig_test.py --suite main {{a}}
 
