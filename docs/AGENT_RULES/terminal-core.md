@@ -58,6 +58,7 @@ Pin 与代际：
 - `Terminal.printSlice` 快路径必须与逐码点 `print` 结果一致；流式打印的宽度与 `graphemeWidth` 一致，宽度决策集中在 `src/unicode/grapheme.zig::graphemeWidthEffect`。
 - 行为对齐主流终端：协议数字用 `src/lib/parse_int.zig::parseInt`（理由见 `support-libs.md`）；kitty 剪贴板以 kitty 参考实现为准（`src/terminal/kitty/clipboard.zig` 文件头）。
 - `src/terminal/osc.zig::Command` 有编译期尺寸断言（64 位目标为 64 字节）；`src/terminal/modes.zig` 的 `entries` 新增 mode 时同步 `include/ghostty/vt/modes.h` 的 `GHOSTTY_MODE_*`。
+- fork 的 `win32_input_mode`（DECSET 9001，补丁 GX-0006）固定是 `entries` 的最后一项：DECRQM、XTSAVE/XTRESTORE 与 RIS 照常处理，DECSTR 不复位它。快照的 `ModePacked` 因此是 44 位，第 43 位是 9001（v1 原本恒为 0 的保留位，不升快照版本，现有金样不变）；上游在末尾新增 mode 时放在 fork 块之前，并同步 `src/terminal/snapshot/terminal.zig` 的位序登记、`snapshot.ksy` 与 `TERMINAL mode bit layout` 单测。
 - 本域已进入 C ABI 的 `lib.Enum` 枚举（如 `Terminal.CompressionMode`、`RenderState.Dirty`、`ScreenSet.Key`）受 `support-libs.md` 的枚举序号规则约束，只能追加，删除留 `null` 空洞。
 
 构建与 freestanding：
@@ -87,9 +88,10 @@ Pin 与代际：
 ## 验证
 
 - 首选 `just test-vt --filter <名称>`：分片运行 `test-lib-vt` 的同一对测试二进制，Zig ABI 与 C ABI 两套模块都测；收尾去掉 filter 再跑一次 `just test-vt`。
-- 只在 app 产物中编译的代码不被 `test-vt` 覆盖（`tmux/`、`StringMap.zig`、`search/Thread.zig`、调用 `checkGhosttyHEnum` 的测试），用 `just test --filter <名称>`；`just test` 只在 Linux/macOS 可跑（Windows 上直接退出 2），以 gx-ci 的 `linux-main` job 为准。
+- 只在 app 产物中编译的代码不被 `test-vt` 覆盖（`tmux/`、`StringMap.zig`、`search/Thread.zig`、调用 `checkGhosttyHEnum` 的测试），用 `just test --filter <名称>`（Windows 与 Linux 都可跑，POSIX 分支以 gx-ci 的 `linux-main` job 为准）。
 - 触及 freestanding 路径（分配器、页分配、`sys`、`simd` 回退、feature gate）跑 `just vt-wasm`，它是 ReleaseSmall 构建，也能发现误用的 std 调试 IO；改 build options 或 lib 公开面跑 `just build-vt`。改 Zig 跑 `just fmt-check`。
 - 现成的差分守护：`Terminal: printSlice differential fuzz vs print`、`Terminal: graphemeWidth parity`、render 的 `incremental updates match full rebuild`。
+- mode 9001：`python scripts/zig_test.py --suite vt --filter 9001 --filter "mode bit layout" --filter DECRQM`（过滤串含空格，不经 just）。
 - 快照线格式：`just test-vt --filter snapshot`；Kaitai 交叉校验用上游脚本 `src/terminal/snapshot/verify-kaitai.py`，它要求 nix 开发环境，本机缺失时记 PENDING。
 - 压缩 codec：按 `src/terminal/compress/AGENTS.md` 跑 `lz4 differential`，这组用例随 libghostty-vt 编译、在 vt 套件里；穷举版先设环境变量 `GHOSTTY_LZ4_SLOW=1`（运行器把环境原样传给测试进程），再运行 `python scripts/zig_test.py --suite vt --filter "lz4 differential"`：过滤串含空格，不经 just（Linux/macOS 用 `python3`），单条超过默认 600 s 时加 `--timeout <秒>`。
 - 改 `src/simd/codepoint_width.*`：按该文件注释临时启用被注释掉的逐码点比对测试。

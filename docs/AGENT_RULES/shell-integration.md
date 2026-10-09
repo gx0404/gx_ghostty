@@ -58,7 +58,7 @@
 
 ## 验证
 
-- 注入与特性（`just test`，只在 Linux/macOS 可跑，Windows 上直接退出 2，以 gx-ci `linux-main` 为准；其中两个 `xdg:` 测试在 Windows 构建里会主动跳过）：`just test --filter bash --filter zsh --filter nushell --filter xdg`、`just test --filter detectShell`、`just test --filter features`。
+- 注入与特性（`just test`，Windows 与 Linux 都可跑，POSIX 行为以 `just wsl test` 或 gx-ci `linux-main` 为准；其中两个 `xdg:` 测试在 Windows 构建里会主动跳过）：`just test --filter bash --filter zsh --filter nushell --filter xdg`、`just test --filter detectShell`、`just test --filter features`。
 - 命令拼接与转义：`just test --filter ShellCommandBuilder`、`just test --filter escape`。
 - terminfo：`just test --filter xtgettcap`（`Source.zig` 的应答表；过滤区分大小写）与 `just test-vt --filter XTGETTCAP`（libghostty-vt 侧的应答）。安装产物只能在 Linux 或 macOS 上检查：`just build -Demit-terminfo -Demit-termcap` 后查看 `zig-out/share/terminfo/`；本机 Windows 记 PENDING。
 - 脚本：仓库内没有脚本单测。`*.sh`、`*.bash` 用 `HACKING.md` 的 ShellCheck 一节给出的上游命令检查（本机未装 shellcheck，未运行就记 PENDING，fork CI 也不跑）；其余 shell 只能在 Linux GTK 构建里实机打开对应 shell，核对 `GHOSTTY_SHELL_FEATURES`、提示跳转与工作目录继承。`ssh-terminfo` 的端到端用例是 `nix/tests.nix` 中的 `ssh-integration-test`，按 `HACKING.md` 的 Nix VM 一节运行，需要 Nix，本机记 PENDING。

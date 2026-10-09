@@ -5,7 +5,8 @@
 - `src/input.zig` 与 `src/input/**`；`src/surface_mouse.zig`（也属 `app-core`）。
 - 五个编码文件 `src/input/key.zig`、`key_encode.zig`、`mouse.zig`、`mouse_encode.zig`、`paste.zig` 同属 `libghostty-vt`：`src/lib_vt.zig::input` 直接导出它们，`src/terminal/c/` 的 `key_event`、`key_encode`、`mouse_event`、`mouse_encode`、`paste`、`types` 包装它们。它们的传递导入 `key_mods.zig`、`config.zig`、`function_keys.zig`、`kitty.zig` 同样随 lib-vt 编译，也登记在 `libghostty-vt` 路由里；闭包里还有 `src/renderer/size.zig`（同样登记，见 `renderer.md`）与 `src/terminal/kitty/key.zig`（归 `terminal-core`）。改上面登记在 `libghostty-vt` 的文件时 resolver 会同时列出 `libghostty-vt.md`，两边规则都要满足；`kitty/key.zig` 只路由到 `terminal-core.md`，它的 lib-vt 约束见该文。
 - `src/input/KeymapDarwin.zig` 同属 `macos-app`。
-- 调用方在 `app-core`：`src/Surface.zig` 的 `keyCallback`、`mouseButtonCallback`、`cursorPosCallback`、`scrollCallback`、`completeClipboardPaste`，以及 `src/App.zig::keyEvent`。平台事件到 `input.KeyEvent` 的翻译在 `src/apprt/gtk/`（`apprt-gtk`）与 `src/apprt/embedded.zig` 加 macOS 宿主（`libghostty-embedding`、`macos-app`）。
+- fork 的两个输入模块（同属 `gx-core`）：`src/gx/action.zig`（`gx:` 绑定动作，补丁 GX-0014）与 `src/gx/win32_input.zig`（win32-input-mode 的 KEY_EVENT_RECORD 编码，补丁 GX-0006，apprt 接入契约写在文件头）。
+- 调用方在 `app-core`：`src/Surface.zig` 的 `keyCallback`、`gxWin32KeyCallback`、`mouseButtonCallback`、`cursorPosCallback`、`scrollCallback`、`completeClipboardPaste`，以及 `src/App.zig::keyEvent`。平台事件到 `input.KeyEvent` 的翻译在 `src/apprt/gtk/`（`apprt-gtk`）、`src/apprt/win32/Surface.zig`（`apprt-win32`）与 `src/apprt/embedded.zig` 加 macOS 宿主（`libghostty-embedding`、`macos-app`）。
 
 ## 符号真源
 
@@ -26,6 +27,7 @@
 - 绑定优先：`maybeHandleBinding` 对 press、repeat、release 都执行。进行中的按键序列只查序列集合；否则从内到外查 key table 栈（上限 `max_active_key_tables` 为 8），最后查根集合。被消费的 press 记下 `bindingHash`，对应的 release 不再编码。
 - `global:`、`all:` 绑定不能用于序列，执行时走 `App.performAllChainedAction` 且总是消费按键；`performable:` 的动作没执行成功时视同不存在。触发关闭类动作后立即返回 `.closed`，此后不再使用 surface 指针。
 - `App.keyEvent` 只查根集合、不支持序列，也不处理 release：global 绑定无论 app 是否聚焦都在这里执行；app 聚焦时，动作全为 app 作用域的绑定也在这里执行；其余返回 false，交给 surface。
+- win32-input-mode（DECSET 9001）：`Surface.encodeKey` 先问 `gx_win32_input.surfaceWriteReq`，只有本次事件带着匹配的 Win32 按键记录（由 `gxWin32KeyCallback` 传入）、子进程未退出、9001 已开且没有 kitty 标志时才以记录替换常规编码；只调 `keyCallback` 的 apprt 行为与上游相同。
 - 编码：`encodeKeyOpts` 在 `renderer_state.mutex` 内用 `Options.fromTerminal` 取终端状态，macOS 再补 `macos_option_as_alt`；先写入 `termio.Message.WriteReq.Small` 大小的数组，放不下才分配，然后经 `Surface.queueIo` 发出。子进程已退出时，任何产生输出的按键都会关闭 surface。
 - 鼠标上报在持锁状态下用 `mouse_encode.Options.fromTerminal` 构造选项，编码结果必须放进 `WriteReq.Small`，溢出时记日志并丢弃。
 - 粘贴：`completeClipboardPaste` 在锁内判断安全性。开启 `clipboard-paste-protection` 时，不安全内容返回 `error.UnsafePaste` 交 apprt 确认；括号模式下含 `\x1b[201~` 一律不安全，否则受 `clipboard-paste-bracketed-safe` 控制。
@@ -39,8 +41,9 @@
   1. 在 `Binding.Action` 加字段，写好 doc comment；
   2. 在 `Action.scope` 归类，并在 `App.performAction` 或 `Surface.performBindingAction` 实现；
   3. 在 `src/input/command.zig::actionCommands` 的穷举里决定是否进命令面板，标题与描述用 `i18n.N_` 标记（翻译同步见 `apprt-gtk.md`）；
-  4. 需要 GUI 配合时新增 `apprt.Action`，按 `app-core.md` 的步骤同步 `include/ghostty.h`，并在 GTK 与 macOS 两端实现；
+  4. 需要 GUI 配合时新增 `apprt.Action`，按 `app-core.md` 的步骤同步 `include/ghostty.h`，并在 GTK、win32 与 macOS 三端实现；
   5. 需要默认键位时改 `Keybinds.init`（`config.md`）。
+- fork 自有的界面操作不加新的 `Binding.Action` 成员，而是加 `gx:` 子动作（`src/gx/action.zig::Action`），由 apprt 的 `gxAction` 执行，不改 C ABI；GX 默认键位写在 `src/gx/defaults.ghostty`（`gx-core.md`）。
 
 ### C 可见类型
 
@@ -71,8 +74,9 @@
 
 ## 验证
 
-- 定向测试（`just test` 只在 Linux/macOS 可跑，Windows 上直接退出 2，交 `gx-ci` 的 `linux-main`）：`just test --filter parse:` 与 `just test --filter set:`（Binding）、`just test --filter RemapSet`、`just test --filter legacy:`、`just test --filter kitty:`、`just test --filter ctrlseq`、`just test --filter KittySequence`（key_encode）、`just test --filter shouldReport`（mouse_encode）、`just test --filter keyToMouseShape`。
-- 改五个编码文件或其闭包：再跑 `just test-vt --filter RemapSet --filter legacy: --filter kitty: --filter ctrlseq --filter KittySequence --filter shouldReport`（Binding 的 `parse:`、`set:` 与 `keyToMouseShape` 不在 lib-vt 里；这一组是 Windows 本机能跑的部分）、`just build-vt` 与 `just vt-wasm`。改 C 可见类型：`just test --filter ghostty.h`，以及 `just zig build test-lib-vt-schema`（脚本需要 Python 的 `jsonschema`，并提示在 `nix develop` 中运行；本机缺依赖时记 PENDING，交 `gx-ci` 的 `linux-vt` job）。
+- 定向测试：`just test --filter parse:` 与 `just test --filter set:`（Binding）、`just test --filter RemapSet`、`just test --filter legacy:`、`just test --filter kitty:`、`just test --filter ctrlseq`、`just test --filter KittySequence`（key_encode）、`just test --filter shouldReport`（mouse_encode）、`just test --filter keyToMouseShape`；fork 模块 `just test --filter gx.win32_input --filter gx.action`。平台相关的按键路径在 Windows 与 Linux（`just wsl test`）各跑一次。
+- 改五个编码文件或其闭包：再跑 `just test-vt --filter RemapSet --filter legacy: --filter kitty: --filter ctrlseq --filter KittySequence --filter shouldReport`（Binding 的 `parse:`、`set:` 与 `keyToMouseShape` 不在 lib-vt 里）、`just build-vt` 与 `just vt-wasm`。
+- 改 win32-input-mode 或 win32 的按键翻译：除单测外按 `apprt-win32.md` 启动 app 实测（PSReadLine 的 Shift+Enter、死键与 AltGr、输入法上屏），日志里有终端开始发送记录的说明行。改 C 可见类型：`just test --filter ghostty.h`，以及 `just zig build test-lib-vt-schema`（脚本需要 Python 的 `jsonschema`，并提示在 `nix develop` 中运行；本机缺依赖时记 PENDING，交 `gx-ci` 的 `linux-vt` job）。
 - macOS：`key_encode`、`key_mods` 里的 option-as-alt 用例随 lib-vt，可交 `gx-ci` 手动触发的 `macos` job（它只跑 `zig build test-lib-vt`）；`KeymapDarwin` 只在 `ghostty-test` 里，要在 Mac 上跑 `just test`。本机两者都记 PENDING。GTK 下的实际按键体验同样记 PENDING，交 `gtk-smoke`。
 - 改 Zig 后跑 `just fmt-check`。
 

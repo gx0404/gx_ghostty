@@ -35,6 +35,10 @@
 - Flatpak：`src/os/flatpak.zig::isFlatpak` 运行期检测 `/.flatpak-info`，`FlatpakHostCommand` 经 `org.freedesktop.Flatpak.Development` 在宿主执行命令；只有 `-Dflatpak` 构建链接 `gio_c`。
 - `dist/linux/*.in` 是 cmake 风格模板（`@NAME@`、`@APPID@`、`@GHOSTTY@`），由 `src/build/GhosttyResources.zig::addLinuxAppResources` 渲染安装 desktop entry、D-Bus service（Flatpak 用 `dbus.service.flatpak.in`）、systemd user service（仅非 Flatpak）与 AppStream metainfo，另装 Dolphin/Nautilus 右键菜单与图标。
 
+### GX 层
+
+- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`window.zig` 与 `menus.zig`（菜单、提示与启动配置下拉随语言重建）、`launch.zig`、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，运行期 libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
+
 ### i18n
 
 - `src/os/i18n.zig`：`init` 由 `src/global.zig` 以资源目录调用，把 gettext domain 绑到资源目录同级的 `locale/`（Windows 直接返回）；`initGlobalDomain` 只给完整拥有应用的 apprt 用；`_` 在 comptime 调用时原样返回 msgid，`N_` 只做标记；`canonicalizeLocale` 依赖 `pkg/libintl` 导出的 `_libintl_locale_name_canonicalize`。
@@ -72,11 +76,11 @@
 
 ## 验证
 
-- **本机 Windows**：缺 GTK4、libadwaita、blueprint-compiler 与 gettext，且 Windows 默认 `-Di18n=false`（`update-translations` 直接报错）。GTK 的构建、单测、翻译与 Blueprint 检查一律记 **PENDING**，不记 N/A。本机只跑 `just rules <改动路径>` 与 `just fmt-check`（覆盖 GTK 的 Zig 源码）。
+- **Windows 主机经 WSL**（`just wsl`，Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 `zh_CN.UTF-8`、`en_US.UTF-8` locale）：`just wsl sync <worktree> --dirty` 同步改动，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑 GTK 单测（GX 层用 `--filter apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图并拷回 Windows，读图后才记 PASS。Windows 本身没有 GTK 与 gettext（默认 `-Di18n=false`），只能跑 `just fmt-check`。
 - **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.16、gettext、pkg-config）：
-  - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`。
+  - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`；Ubuntu 24.04 的打包配方见 `packaging-dist.md`。
   - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.16.0）。
   - Blueprint：`nix/build-support/check-blueprints.sh` 后 `git diff --exit-code`（沿用上游 CI）。
-  - 看译文：`zig-out/bin/ghostty --language=<locale>`。
-- **CI**：gx-ci 的 push/PR 路径只跑 `-Dapp-runtime=none`，不编译 GTK。GTK 改动须手动触发 gx-ci 并打开 `gtk_smoke` 输入，由 `gtk-smoke` job 构建并截图；读过截图前 GUI 可见变更保持 PENDING。job 定义以 `.github/workflows/gx-ci.yml` 为准，各层证明范围见 `docs/TESTING.md`。
-- **发版**：`gx-release` 的 `linux-gtk` job 从 `zig build dist` 源码包构建 GTK tarball（实验性），源码包自带 `ghostty_resources.{c,h}`，不需要 blueprint-compiler；见 `docs/RELEASE.md`。
+  - 看译文：`zig-out/bin/ghostty --language=zh-CN`（或 `en`）。
+- **CI**：gx-ci 的 push/PR 路径只跑 `-Dapp-runtime=none`，不编译 GTK；GTK 改动手动触发 gx-ci 并打开 `gtk_smoke`，`gtk-smoke` job 构建并截图。
+- **发版**：`gx-release` 的 `linux-gtk` 从 `zig build dist` 源码包构建 GTK tarball（实验性，源码包自带 `ghostty_resources.{c,h}`），`linux-gtk-noble` 在 Ubuntu 24.04 验证 GX Shell 的 deb 流程；见 `docs/RELEASE.md`。

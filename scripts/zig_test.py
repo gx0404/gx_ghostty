@@ -9,10 +9,10 @@
 套件（未给 --binary 时默认 --suite vt）：
   vt    python scripts/zigw.py build test-lib-vt-bin -Dversion-string=<V> <-D…> <--zig-arg…>，
         再运行 zig-out/test/vt/ 与 zig-out/test/vt_c/ 下的 test(.exe)
-  main  构建步骤 test-bin，运行 zig-out/test/ghostty-test(.exe)。ghostty-test 不能为 Windows 编译
-        （上游 src/build/SharedDeps.zig 用 translate-c 翻译 pwd.h 等 POSIX 头文件），所以 Windows 上
-        只要没加 --no-build（给了 --binary 也一样）就在构建之前以退出码 2 拒绝；主套件在 Linux/macOS
-        或 gx-ci 的 linux-main 运行
+  main  构建步骤 test-bin，运行 zig-out/test/ghostty-test(.exe)。Windows 主机上另补
+        MAIN_SUITE_ON_WINDOWS（-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu），-D 或 --zig-arg
+        里已写的同名选项以使用者为准：目标未写 ABI 时 src/build/Config.zig 强制 msvc，要装 Visual
+        Studio 与 Windows SDK；GNU ABI 用 Zig 自带的 MinGW 头文件与导入库，与 just build 相同
 <V> 钉为 `<build.zig.zon 的 X.Y.Z>-dev+0000000`（与上游无 git 时的回退版本同形），提交不再
 改变版本串、不再让构建缓存失效；显式 -Dversion-string= 优先。--no-build 跳过构建，直接运行
 已安装的二进制；--binary 可与 --suite 同用（取并集）。构建输出直通终端，构建失败退出 2。
@@ -42,7 +42,7 @@
 孙进程）；Windows 只在进程仍在运行时（超时、中断）用 taskkill /T。正常结束只关闭 stdin，测试进程自行退出。
 
 退出码：0 全部通过（skip 不算失败）；1 存在 fail / leak / log_err / crash / timeout / 未运行的
-用例；2 用法错误（含 Windows 上没加 --no-build 的 --suite main）、构建失败、找不到二进制、元数据
+用例；2 用法错误、构建失败、找不到二进制、元数据
 查询失败或没有可运行的用例（报错写明原因：运行期 --filter 没命中、构建期 -Dtest-filter 裁掉了全部
 用例，或二进制本身没有用例）；130 被 Ctrl+C 中断（POSIX 上 SIGTERM、SIGHUP 同样按中断处理，被忽略的
 信号如 nohup 下的 SIGHUP 除外）。--json PATH 写出机器可读结果（schema 见 build_report）。
@@ -130,12 +130,9 @@ SUITES = {
     "vt": Suite("test-lib-vt-bin", (("vt", "test/vt/test"), ("vt_c", "test/vt_c/test"))),
     "main": Suite("test-bin", (("ghostty-test", "test/ghostty-test"),)),
 }
-MAIN_SUITE_ON_WINDOWS = (
-    "--suite main 不能在 Windows 上构建，未构建即退出：ghostty-test 不能为 Windows 编译（上游 src/build/SharedDeps.zig "
-    "用 translate-c 翻译 pwd.h 等 POSIX 头文件，Windows 上找不到；上游 zig build test 在 Windows 上同样失败）。"
-    "主套件请在 Linux/macOS 上运行（just test），或以 gx-ci 的 linux-main job 为准；Windows 本机用 just test-vt"
-    "（python scripts/zig_test.py --suite vt），只运行 --binary 给出的二进制时去掉 --suite main。"
-)
+# Windows 主机上 --suite main 补的 -D 选项（使用者已写同名选项的项不补）：win32 apprt 与 GNU ABI，
+# 与 just build（scripts/zig_build.py）构建的 Windows 应用同一组合。
+MAIN_SUITE_ON_WINDOWS = ("app-runtime=win32", "target=x86_64-windows-gnu")
 
 
 class FatalError(Exception):
@@ -187,9 +184,23 @@ def build_command(root: Path, suite: str, defines: Sequence[str], zig_args: Sequ
     return command
 
 
+def given_options(defines: Sequence[str], zig_args: Sequence[str]) -> list[str]:
+    """透传给 zig build 的 -D 选项（去掉 -D），含写成 --zig-arg=-D… 的。"""
+    return [*defines, *(arg[2:] for arg in zig_args if arg.startswith("-D"))]
+
+
+def suite_defines(suite: str, defines: Sequence[str], zig_args: Sequence[str]) -> list[str]:
+    """套件构建的 -D 选项：Windows 主机上的 main 套件补上 MAIN_SUITE_ON_WINDOWS 中使用者没写的项。"""
+    result = list(defines)
+    if suite == "main" and host_is_windows():
+        given = {option.partition("=")[0] for option in given_options(defines, zig_args)}
+        result += [define for define in MAIN_SUITE_ON_WINDOWS if define.partition("=")[0] not in given]
+    return result
+
+
 def build_test_filters(defines: Sequence[str], zig_args: Sequence[str]) -> list[str]:
     """透传给 zig build 的 -Dtest-filter 值，含写成 --zig-arg=-Dtest-filter=… 的。"""
-    options = [*defines, *(arg[2:] for arg in zig_args if arg.startswith("-D"))]
+    options = given_options(defines, zig_args)
     return [value for name, _, value in (option.partition("=") for option in options) if name == "test-filter"]
 
 
@@ -1052,20 +1063,17 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def collect_binaries(plan: Plan, args: argparse.Namespace) -> None:
     if not plan.root.is_dir():
         raise FatalError(f"仓库根不是目录：{plan.root}")
-    if plan.suite == "main" and not args.no_build and host_is_windows():
-        raise FatalError(MAIN_SUITE_ON_WINDOWS)
     entries: list[tuple[str, Path, bool]] = []
     if plan.suite is not None:
         if not args.no_build:
-            command = build_command(plan.root, plan.suite, args.defines, args.zig_args)
+            defines = suite_defines(plan.suite, args.defines, args.zig_args)
+            command = build_command(plan.root, plan.suite, defines, args.zig_args)
             plan.build = {"command": command, "seconds": run_build(plan.root, command)}
             plan.build_filters = build_test_filters(args.defines, args.zig_args)
         found, missing = suite_binaries(install_prefix(plan.root, args.zig_args), plan.suite)
         if missing:
             if not args.no_build:
                 hint = f"构建步骤 {SUITES[plan.suite].step} 没有安装它们"
-            elif plan.suite == "main" and host_is_windows():
-                hint = "Windows 上无法构建 ghostty-test，主套件以 gx-ci 的 linux-main 为准"
             else:
                 hint = "先去掉 --no-build 构建一次"
             raise FatalError(f"套件 {plan.suite} 缺少测试二进制（{hint}）：" + "、".join(str(path) for path in missing))

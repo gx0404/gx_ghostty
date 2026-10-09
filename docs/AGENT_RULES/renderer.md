@@ -4,13 +4,14 @@
 
 - `src/renderer.zig`、`src/renderer/**`：渲染线程、通用渲染器、Metal/OpenGL 后端、着色器、Kitty 图像、调试 overlay、DMABUF 帧导出。
 - `pkg/opengl/**`（GL/EGL 绑定）、`pkg/glslang/**` 与 `pkg/spirv-cross/**`（自定义着色器编译链）、`pkg/wuffs/**`（图像解码与像素转换）、`vendor/glad/**`（生成的 loader）、根目录 `passthrough.glsl`。
-- 相邻域：`pkg/**`、`vendor/**` 同归 `build-system.md`；字形与 atlas 见 `font.md`；`RenderState` 见 `terminal-core.md`；GTK 帧消费见 `apprt-gtk.md`。
+- 相邻域：`pkg/**`、`vendor/**` 同归 `build-system.md`；字形与 atlas 见 `font.md`；`RenderState` 见 `terminal-core.md`；GTK 帧消费见 `apprt-gtk.md`；`src/renderer/opengl/wgl.zig` 同属 `apprt-win32`，win32 的呈现钩子与 `frame_event` 见那份文档。
 - `src/renderer/size.zig` 同属 `libghostty-vt`：`src/input/mouse_encode.zig` 与 `src/terminal/c/mouse_encode.zig` 用它的 `Size` 换算鼠标坐标，经 `src/lib_vt.zig::input.MouseEncodeOptions` 进入 lib-vt 公开面。它在仓内只能依赖 `src/terminal/size.zig`（freestanding 约束见 `libghostty-vt.md`），改动后还要跑 `just test-vt` 与 `just vt-wasm`。
 
 ## 符号真源
 
 - 后端（编译期唯一）：`src/renderer.zig::Renderer` 即 `GenericRenderer(GraphicsAPI)`，按 `build_config.renderer` 取 `Metal` 或 `OpenGL`；默认值 `src/renderer/backend.zig::Backend.default`（Darwin 为 `metal`，其余为 `opengl`），`-Drenderer` 在 `src/build/Config.zig` 覆盖。Metal 只支持 macOS/iOS 且要求 embedded apprt（`src/renderer/Metal.zig::init` 内 compileError）。
-- `src/renderer.zig::Device`：app 级设备（`App.device`）；OpenGL 版持有 EGL surfaceless display 与 config，Metal 版持有共享 MTLDevice。
+- `src/renderer.zig::Device`：app 级设备（`App.device`）；OpenGL 版持有 EGL surfaceless display 与 config（Windows 上换成 `src/renderer/opengl/wgl.zig::Device`，见下文），Metal 版持有共享 MTLDevice。
+- Windows（补丁 GX-0004）：没有 EGL，`OpenGL.zig` 的 `Device` 与每个 surface 的 `wgl_context` 来自 `src/renderer/opengl/wgl.zig`；`ExportedFrame` 为 `void`，`present` 把 render target blit 到窗口默认 framebuffer 后 `SwapBuffers`，不导出帧、不推 `.redraw`。实现选择、Mesa 软件回退与 GPU 重置恢复见 `apprt-win32.md`。
 - `src/renderer/generic.zig::Renderer`：层次为 GraphicsAPI → Target → Frame → RenderPass/Step → Pipeline（见其文档注释）。`updateFrame` 做终端快照并 `rebuildCells`；`drawFrame` 同步帧数据、编码各 pass、最后跑自定义后处理链；`frameCompleted` 归还 swap chain 信号量，健康度变化时推 `renderer_health`。
 - 后端实现：`src/renderer/OpenGL.zig` 要求 core profile，最低版本见 `MIN_VERSION_MAJOR`/`MIN_VERSION_MINOR`，离屏渲染后由 `present` 导出 `ExportedFrame`（`dmabuf` 或 `memory`）；`src/renderer/Metal.zig` 以 `IOSurfaceLayer` 输出，`loopEnter` 注册 CALayer display 回调，macOS 用 CVDisplayLink 做 vsync。两者各自声明 `swap_chain_count`（多缓冲帧数）。
 - `src/renderer/Thread.zig`：`Mailbox` 是有界 `BlockingQueue`；async `wakeup`（可合并，drain mailbox 后更新并绘制）、`draw_now`（只绘制）、`stop`；定时器 `render_h`（只服务动画，按 `Renderer.animationWake`）、`cursor_h`（光标闪烁，间隔 `CURSOR_BLINK_INTERVAL`）、`Compression`（空闲后增量压缩 scrollback，只 `tryLock`，从不等锁）。
@@ -23,7 +24,7 @@
 
 ## 不变量
 
-- **OpenGL context 单线程**：每个 surface 一个 EGL context。`OpenGL.init` 在主线程创建后立即释放 current；渲染线程在 `threadEnter` make current 并加载 threadlocal GLAD，`threadExit` 释放后主线程才在 `deinit` 销毁。GL 调用只能出现在渲染线程的 `threadEnter` 与 `threadExit` 之间，主线程没有 GLAD 上下文，调用任何 GL 函数都会崩溃（上游提交 `0fca3d34a` 因此删掉了 GTK imgui widget 的 GL 调用）。`src/Surface.zig::draw`（embedded apprt 的 `ghostty_surface_draw`）要求渲染器容许主线程同步 `drawFrame(true)`，只有 Metal 满足；GTK 不走这条路径，OpenGL 不得接到会调用它的宿主上。
+- **OpenGL context 单线程**：每个 surface 一个 EGL context（Windows 上是 WGL context，主线程的 `OpenGL.init` 只记录窗口 DC，context 在渲染线程的 `threadEnter` 创建）。`OpenGL.init` 在主线程创建后立即释放 current；渲染线程在 `threadEnter` make current 并加载 threadlocal GLAD，`threadExit` 释放后主线程才在 `deinit` 销毁。GL 调用只能出现在渲染线程的 `threadEnter` 与 `threadExit` 之间，主线程没有 GLAD 上下文，调用任何 GL 函数都会崩溃（上游提交 `0fca3d34a` 因此删掉了 GTK imgui widget 的 GL 调用）。`src/Surface.zig::draw`（embedded apprt 的 `ghostty_surface_draw`）要求渲染器容许主线程同步 `drawFrame(true)`，只有 Metal 满足；GTK 不走这条路径，OpenGL 不得接到会调用它的宿主上。
 - **GPU 资源归渲染线程**：`displayRealized`/`displayUnrealized` 在主线程运行，只在 `draw_mutex` 下改标志。swap chain 与 shaders 在 `drawFrame` 惰性重建；`releaseGpuResources` 在渲染线程释放 swap chain（不可见、未 realize、`threadExit` 时），shaders 只在未 realize 时释放；图像只在 `threadExit` 释放，免得遮挡后重传。
 - **锁协议**：
   - `State` 成员（terminal、preedit、mouse、inspector）只在持 `State.mutex` 时读写。渲染快照用 `lockDemand`/`unlockDemand` 成对加解锁；误用 `mutex.unlock` 数据仍安全，但 `yieldToDemand` 一方会空等到超时。
@@ -38,7 +39,7 @@
 - **Health 跨后端共享**：某后端到达不了的状态也保留；增值要同步 `include/ghostty.h`（见 `libghostty-embedding.md`）与 macOS app。
 - **失败可降级**：自定义着色器加载或编译失败只记日志，退化为无后处理。只有 `presentation_health` 为 `healthy` 才尝试导出 DMABUF，失败即退回 CPU 回读；导出纹理必须是非 sRGB 的 RGBA8（Mesa 不能导出 sRGB），blit 时临时关闭 `GL_FRAMEBUFFER_SRGB`。OpenGL 的 `Frame.complete` 忽略 `sync`，帧经 `LatestFrame` 交给 apprt，只留最新一帧。
 - **帧节奏**：常规渲染由 `wakeup` 驱动；`synchronized_output` 下 `updateFrame` 直接返回；不可见时动画全部暂停；动画唤醒间隔下限是 `draw_interval_ms`；`terminal_state` 按帧数定期整体重建以回收内存。
-- **cell 缓冲**：`src/renderer/cell.zig::Contents.fg_rows` 不得用 `appendAssumeCapacity`（组合字符与多字形替换会超出初始容量）；`fg_rows[0]` 专用于光标，保证光标是 GPU 缓冲的首项。
+- **cell 缓冲**：`src/renderer/cell.zig::Contents.fg_rows` 不得用 `appendAssumeCapacity`（组合字符与多字形替换会超出初始容量）；`fg_rows[0]` 专用于光标，保证光标是 GPU 缓冲的首项。`generic.zig` 的 `rebuildRow` 在输入法预编辑区之后追赶字形游标时以 `shaper_cells_unwrapped.len` 为界（补丁 GX-0021，铺满背景色的空格子没有字形）。
 - **wuffs 是共享依赖**：`src/build/GhosttyZig.zig` 在启用 kitty graphics 时把它接进 libghostty-vt（freestanding 目标不启用，见 `src/terminal/build_options.zig::Options.kittyGraphics`），因此不能依赖 libc：非 Windows 目标一律用 `pkg/wuffs/include/` 的极简头文件，未链接 libc 时导出弱符号 `calloc`/`free` 桩。
 - **GLAD 生成物**：GL 部分（`vendor/glad/` 下的 `gl.{h,c}`）由根 `Makefile` 的 `glad` 目标解压 gen.glad.sh 产出的 `glad.zip`（已 gitignore）得到；EGL 部分（`glad_egl.{h,c}` 与随附的 `vendor/glad/include/EGL/eglplatform.h`）出自旧版 glad 生成器，是另行生成后加入的，`Makefile` 不管。两部分的生成器与参数都记在各自头文件注释里。`make glad` 先 `rm -rf vendor/glad`，会连带删掉 EGL 部分，并多写一个未入库的 `vendor/glad/include/glad/glad.h`。
 
@@ -53,10 +54,11 @@
 ## 验证
 
 - 路由：`just rules src/renderer/generic.zig` 列出必读集合；改本文档后跑 `just framework-check`。
-- 定向单测（以下都是纯 CPU 用例；`--filter` 可重复，在运行期按测试名子串筛选、不重新编译；`just test` 只在 Linux/macOS 可跑，Windows 上直接退出 2）：
+- 定向单测（以下都是纯 CPU 用例；`--filter` 可重复，在运行期按测试名子串筛选、不重新编译；Windows 与 Linux 都能跑 `just test`）：
   - `just test --filter shader --filter spirv`：glslang/spirv-cross 链路与自定义 uniform 布局。
   - `just test --filter preedit --filter Contents --filter renderCellMap`：State、cell 缓冲与链接。
   - `just test --filter kitty`（Kitty 图像）；`just test --filter Health`（对照 `include/ghostty.h`）。
-- 编译与格式：Windows 上 `just build` 编不过 libghostty-internal（`build-system.md`「平台」），本机没有渲染器的编译检查，Windows 目标的 OpenGL 路径在 gx-ci 里也不被编译，记 PENDING；Linux 侧的编译与单测以 gx-ci `linux-main` 为准。改 Zig 跑 `just fmt-check`。
+- 编译与格式：Windows 主机上 `just build` 编译 OpenGL 后端的 WGL 路径（gx-ci 的 `windows-app` 同样编译），EGL 路径用 `just wsl build --gtk`，Linux 侧单测以 gx-ci `linux-main` 为准。改 Zig 跑 `just fmt-check`。
+- WGL 呈现：按 `apprt-win32.md` 启动 win32 app，日志有 `loaded OpenGL 4.x vendor=… renderer=… software=…`，缩放、拖动分屏与新建标签后都正常重绘并读图核对；软件路径设 `GHOSTTY_GX_OPENGL=software`（需要 exe 旁的 `mesa\`，如便携包）。
 - 改 `pkg/wuffs`：`just test-vt` 与 `just build-vt`（wasm32 不含 kitty graphics，`just vt-wasm` 覆盖不到它）；上游 CI 另在 `pkg/wuffs/` 下执行 `zig build test`，gx-ci 未覆盖，需手动补跑。
-- PENDING（本机没有 GPU 呈现路径）：真实 GL 渲染、DMABUF 导入与截图交 gx-ci 手动触发的 `gtk-smoke`（输入 `gtk_smoke`），读回截图后才记 PASS；Metal 与 CVDisplayLink 只能在 macOS 本机验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，覆盖不到渲染器）；完整单测以 gx-ci `linux-main` job（`zig_test.py --suite main -Dapp-runtime=none`）为准。
+- PENDING：GTK 的 EGL 渲染与截图用 `just wsl smoke`（Xvfb 加软件 GL）或 gx-ci 手动触发的 `gtk-smoke`，读回截图后才记 PASS；DMABUF 导入要有 GPU 的 Linux 桌面；Metal 与 CVDisplayLink 只能在 macOS 本机验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，覆盖不到渲染器）。
