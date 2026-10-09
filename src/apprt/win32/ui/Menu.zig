@@ -3,12 +3,14 @@
 //! Each `show*` function builds its menu on demand, runs it modally at a
 //! screen position and returns what the user picked (null when the menu
 //! was dismissed); the caller performs the choice. Because menus are
-//! built on every invocation they always use the current UI language.
+//! built on every invocation they always use the current UI language
+//! (labels are English msgids translated with `gx.i18n.tr`).
 //!
 //! The implementation is TrackPopupMenuEx today; a custom popup menu can
 //! replace it behind the same functions.
 const std = @import("std");
 const input = @import("../../../input.zig");
+const i18n = @import("../../../gx/i18n.zig");
 const w32 = @import("../win32.zig");
 const wstr = @import("wstr.zig");
 
@@ -30,15 +32,15 @@ pub fn showSurfaceContextMenu(
 
     var menu = Builder.init() orelse return null;
     defer menu.deinit();
-    menu.item(@intFromEnum(Item.copy), "Copy", has_selection);
-    menu.item(@intFromEnum(Item.paste), "Paste", true);
+    menu.item(@intFromEnum(Item.copy), i18n.tr("Copy"), has_selection);
+    menu.item(@intFromEnum(Item.paste), i18n.tr("Paste"), true);
     menu.separator();
-    menu.item(@intFromEnum(Item.select_all), "Select All", true);
+    menu.item(@intFromEnum(Item.select_all), i18n.tr("Select All"), true);
     menu.separator();
-    menu.item(@intFromEnum(Item.split_right), "Split Right", true);
-    menu.item(@intFromEnum(Item.split_down), "Split Down", true);
+    menu.item(@intFromEnum(Item.split_right), i18n.tr("Split Right"), true);
+    menu.item(@intFromEnum(Item.split_down), i18n.tr("Split Down"), true);
     menu.separator();
-    menu.item(@intFromEnum(Item.reset), "Reset Terminal", true);
+    menu.item(@intFromEnum(Item.reset), i18n.tr("Reset Terminal"), true);
 
     const id = menu.track(owner, screen_pt) orelse return null;
     const item = std.enums.fromInt(Item, id) orelse return null;
@@ -76,12 +78,12 @@ pub fn showTabContextMenu(
     var menu = Builder.init() orelse return null;
     defer menu.deinit();
     if (context.tab) |tab| {
-        menu.item(@intFromEnum(TabCommand.close), "Close Tab", true);
-        menu.item(@intFromEnum(TabCommand.close_others), "Close Other Tabs", context.tab_count > 1);
-        menu.item(@intFromEnum(TabCommand.close_right), "Close Tabs to the Right", tab + 1 < context.tab_count);
+        menu.item(@intFromEnum(TabCommand.close), i18n.tr("Close Tab"), true);
+        menu.item(@intFromEnum(TabCommand.close_others), i18n.tr("Close Other Tabs"), context.tab_count > 1);
+        menu.item(@intFromEnum(TabCommand.close_right), i18n.tr("Close Tabs to the Right"), tab + 1 < context.tab_count);
         menu.separator();
     }
-    menu.item(@intFromEnum(TabCommand.new_tab), "New Tab", true);
+    menu.item(@intFromEnum(TabCommand.new_tab), i18n.tr("New Tab"), true);
 
     const id = menu.track(owner, screen_pt) orelse return null;
     return std.enums.fromInt(TabCommand, id);

@@ -869,6 +869,7 @@ pub extern "user32" fn SendMessageW(
 pub const MB_OKCANCEL: u32 = 0x00000001;
 pub const MB_YESNO: u32 = 0x00000004;
 pub const MB_ICONWARNING: u32 = 0x00000030;
+pub const MB_ICONINFORMATION: u32 = 0x00000040;
 pub const MB_DEFBUTTON2: u32 = 0x00000100;
 pub const IDOK: i32 = 1;
 pub const IDCANCEL: i32 = 2;

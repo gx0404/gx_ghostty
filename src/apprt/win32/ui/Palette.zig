@@ -2,6 +2,8 @@
 //! surface's window with a filter Edit control and a GDI-painted list of
 //! the configured `command-palette-entry` commands (with their keybinding
 //! hints). Picking an entry performs its binding action on the surface.
+//! Entry titles are English msgids shown in the UI language
+//! (`gx.i18n.trRuntime`); the filter matches either form.
 //!
 //! The owning `Surface` embeds this struct as `palette` and calls
 //! `setActive` (from `toggle_command_palette`), `reposition` (on resize),
@@ -15,6 +17,8 @@ const input = @import("../../../input.zig");
 const Surface = @import("../Surface.zig");
 const w32 = @import("../win32.zig");
 const trigger = @import("trigger.zig");
+const i18n = @import("../../../gx/i18n.zig");
+const wstr = @import("wstr.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -207,8 +211,9 @@ fn ensure(self: *Palette) void {
 /// Set the filter's placeholder text via EM_SETCUEBANNER.
 fn setPlaceholder(self: *Palette) void {
     const edit = self.edit orelse return;
-    const placeholder = std.unicode.utf8ToUtf16LeStringLiteral("Type a command...");
-    _ = w32.SendMessageW(edit, 0x1501, 1, @bitCast(@intFromPtr(placeholder))); // EM_SETCUEBANNER
+    var buf: [128]u16 = undefined;
+    const placeholder = wstr.bufZ(&buf, i18n.tr("Execute a command…"));
+    _ = w32.SendMessageW(edit, 0x1501, 1, @bitCast(@intFromPtr(placeholder.ptr))); // EM_SETCUEBANNER
 }
 
 fn createFont(px: f32) ?*anyopaque {
@@ -252,7 +257,10 @@ pub fn reposition(self: *Palette) void {
 fn filter(self: *Palette, text: []const u8) void {
     var count: u16 = 0;
     for (self.entries(), 0..) |entry, i| {
-        if (text.len == 0 or std.ascii.indexOfIgnoreCase(entry.title, text) != null) {
+        if (text.len == 0 or
+            std.ascii.indexOfIgnoreCase(entry.title, text) != null or
+            std.ascii.indexOfIgnoreCase(i18n.trRuntime(entry.title), text) != null)
+        {
             self.filtered[count] = @intCast(i);
             count += 1;
         }
@@ -382,7 +390,7 @@ fn paint(self: *Palette, hwnd: w32.HWND) void {
         const y = list_top + visual_idx * item_height;
         const entry_idx = self.filtered[i];
         if (entry_idx >= all.len) continue;
-        const entry_name = all[entry_idx].title;
+        const entry_name = i18n.trRuntime(all[entry_idx].title);
         const entry_action = all[entry_idx].action;
 
         // Draw selection highlight
@@ -410,14 +418,12 @@ fn paint(self: *Palette, hwnd: w32.HWND) void {
             .right = client_rect.right - kb_area,
             .bottom = y + item_height,
         };
+        // User-configured palette titles are arbitrary length; bufZ
+        // truncates on a codepoint boundary instead of overflowing the
+        // stack buffer.
         var wname_buf: [128]u16 = undefined;
-        // User-configured palette titles are arbitrary length; cap to the
-        // buffer (N UTF-8 bytes ≤ N UTF-16 units) on a codepoint boundary so
-        // a long title truncates instead of overflowing the stack buffer.
-        var name_len = @min(entry_name.len, wname_buf.len);
-        while (name_len > 0 and entry_name[name_len - 1] & 0xC0 == 0x80) name_len -= 1;
-        const wname_len = std.unicode.utf8ToUtf16Le(&wname_buf, entry_name[0..name_len]) catch 0;
-        _ = w32.DrawTextW(hdc, @ptrCast(&wname_buf), @intCast(wname_len), &name_rect, 0);
+        const wname = wstr.bufZ(&wname_buf, entry_name);
+        _ = w32.DrawTextW(hdc, wname.ptr, @intCast(wname.len), &name_rect, 0);
 
         // Draw keybinding hint on the right
         if (s.app.config.keybind.set.getTrigger(entry_action)) |t| {

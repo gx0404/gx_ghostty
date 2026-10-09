@@ -23,6 +23,8 @@ const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
 const d2d = @import("ui/d2d.zig");
+const gx = @import("../../gx/main.zig");
+const i18n = gx.i18n;
 
 const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
@@ -132,6 +134,9 @@ pub fn init(
         break :err def;
     };
     errdefer config.deinit();
+
+    // The UI language follows `language` (zh-CN by default).
+    i18n.setCurrent(i18n.resolve(config.language));
 
     // Create a brush matching the configured background color so that
     // any exposed window area during resize matches the terminal
@@ -1025,8 +1030,8 @@ pub fn performAction(
                 .unhealthy => {
                     self.notif_desktop_surface_id = 0;
                     self.showDesktopNotificationText(
-                        "Renderer Unhealthy",
-                        "The GPU renderer is in an unhealthy state; terminal output may stop updating.",
+                        i18n.tr("Renderer Unhealthy"),
+                        i18n.tr("The GPU renderer is in an unhealthy state; terminal output may stop updating."),
                     );
                 },
             }
@@ -1196,24 +1201,29 @@ pub fn performAction(
                     }
                     if (act.notify) {
                         const title: []const u8 = if (value.exit_code) |code|
-                            (if (code == 0) "Command Succeeded" else "Command Failed")
+                            (if (code == 0) i18n.tr("Command succeeded") else i18n.tr("Command failed"))
                         else
-                            "Command Finished";
-                        var body_buf: [128]u8 = undefined;
-                        const body: []const u8 = if (value.exit_code) |code|
-                            std.fmt.bufPrint(
-                                &body_buf,
-                                "Command took {f} and exited with code {d}.",
-                                .{ value.duration.round(std.time.ns_per_ms), code },
-                            ) catch "Command finished."
-                        else
-                            std.fmt.bufPrint(
-                                &body_buf,
-                                "Command took {f}.",
-                                .{value.duration.round(std.time.ns_per_ms)},
-                            ) catch "Command finished.";
+                            i18n.tr("Command finished");
+                        var duration_buf: [32]u8 = undefined;
+                        const duration = std.fmt.bufPrint(
+                            &duration_buf,
+                            "{f}",
+                            .{value.duration.round(std.time.ns_per_ms)},
+                        ) catch "";
+                        var body_buf: [256]u8 = undefined;
+                        var body: std.Io.Writer = .fixed(&body_buf);
+                        if (value.exit_code) |code| {
+                            i18n.format(&body, i18n.tr("Command took {duration} and exited with code {code}."), .{
+                                .duration = duration,
+                                .code = code,
+                            }) catch {};
+                        } else {
+                            i18n.format(&body, i18n.tr("Command took {duration}."), .{
+                                .duration = duration,
+                            }) catch {};
+                        }
                         self.notif_desktop_surface_id = core_surface.id;
-                        self.showDesktopNotificationText(title, body);
+                        self.showDesktopNotificationText(title, body.buffered());
                     }
                 },
             }
@@ -1386,6 +1396,16 @@ fn updateConfig(self: *App, config: *const Config) void {
     self.config.deinit();
     self.config = new_config;
 
+    // Switch the UI language when `language` changed and rebuild the
+    // translated chrome.
+    const language = i18n.resolve(self.config.language);
+    if (language != i18n.current()) {
+        i18n.setCurrent(language);
+        if (self.ui_factory) |factory| factory.flushFormats();
+        for (self.windows.items) |w| w.onLanguageChanged();
+        if (self.quick_terminal) |qt| qt.window.onLanguageChanged();
+    }
+
     // Recreate the background brush from the new config.
     if (self.bg_brush) |old_brush| {
         _ = w32.DeleteObject(@ptrCast(old_brush));
@@ -1450,12 +1470,11 @@ fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
     defer alloc.free(command_text);
     const command: configpkg.Command = .{ .shell = command_text };
 
-    const title = try std.fmt.allocPrintSentinel(
-        alloc,
-        "Editing configuration file {s}",
-        .{path},
-        0,
-    );
+    const title_text = try i18n.fill(alloc, i18n.tr("Editing configuration file {path}"), .{
+        .path = path,
+    });
+    defer alloc.free(title_text);
+    const title = try alloc.dupeZ(u8, title_text);
     defer alloc.free(title);
 
     const window = try alloc.create(Window);
@@ -1490,12 +1509,12 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
 
     const alloc = self.core_app.alloc;
     const path = Dialogs.saveFilePath(alloc, owner, .{
-        .title = "Export Terminal IO Events",
+        .title = i18n.tr("Export Terminal IO Events"),
         .default_name = "ghostty-terminal-io.txt",
         .default_ext = "txt",
         .filters = &.{
-            .{ .label = "Text files (*.txt)", .pattern = "*.txt" },
-            .{ .label = "All files (*.*)", .pattern = "*.*" },
+            .{ .label = i18n.tr("Text files (*.txt)"), .pattern = "*.txt" },
+            .{ .label = i18n.tr("All files (*.*)"), .pattern = "*.*" },
         },
     }) catch |err| {
         log.warn("unable to choose the terminal IO export path: {}", .{err});

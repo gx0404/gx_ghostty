@@ -7,10 +7,12 @@
 //! pointers that a dispatched message can free (a surface whose child
 //! exits, for example) after the call; re-resolve them instead.
 //!
-//! The implementation is MessageBoxW / GetSaveFileNameW today; a custom
-//! dialog can replace it behind the same functions.
+//! Text is translated with `gx.i18n` at call time. The implementation is
+//! MessageBoxW / GetSaveFileNameW today; a custom dialog can replace it
+//! behind the same functions.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const i18n = @import("../../../gx/i18n.zig");
 const w32 = @import("../win32.zig");
 const wstr = @import("wstr.zig");
 
@@ -33,8 +35,8 @@ const confirm_flags = w32.MB_OKCANCEL | w32.MB_ICONWARNING |
 pub fn confirmCloseSurface(owner: ?w32.HWND) Choice {
     return confirm(
         owner,
-        "A process is still running in this terminal.\nClose anyway?",
-        "Ghostty",
+        i18n.tr("A process is still running in this terminal. Close it anyway?"),
+        i18n.tr("Close Terminal?"),
     );
 }
 
@@ -42,8 +44,8 @@ pub fn confirmCloseSurface(owner: ?w32.HWND) Choice {
 pub fn confirmCloseWindow(owner: ?w32.HWND) Choice {
     return confirm(
         owner,
-        "Processes are still running in this window.\nClose anyway?",
-        "Ghostty",
+        i18n.tr("Processes are still running in this window. Close it anyway?"),
+        i18n.tr("Close Window?"),
     );
 }
 
@@ -51,8 +53,8 @@ pub fn confirmCloseWindow(owner: ?w32.HWND) Choice {
 pub fn confirmQuit(owner: ?w32.HWND) Choice {
     return confirm(
         owner,
-        "Processes are still running.\nQuit anyway?",
-        "Ghostty",
+        i18n.tr("Processes are still running. Quit anyway?"),
+        i18n.tr("Quit Ghostty GX?"),
     );
 }
 
@@ -61,35 +63,54 @@ pub const ClipboardAccess = enum { read, write };
 
 /// A terminal program asks for clipboard access.
 pub fn confirmClipboardAccess(owner: ?w32.HWND, access: ClipboardAccess) Choice {
+    var buf: [512]u8 = undefined;
     return confirm(
         owner,
-        switch (access) {
-            .read => "An application is requesting access to read the clipboard.\n\nAllow this?",
-            .write => "An application is requesting to write to the system clipboard.\n\nAllow this?",
-        },
-        "Ghostty \u{2014} Authorize Clipboard Access",
+        paragraphs(&buf, switch (access) {
+            .read => i18n.tr("A program is trying to read the clipboard."),
+            .write => i18n.tr("A program is trying to write to the clipboard."),
+        }, i18n.tr("Allow this?")),
+        i18n.tr("Authorize Clipboard Access"),
     );
 }
 
 /// The text being pasted can run commands (paste protection).
 pub fn confirmUnsafePaste(owner: ?w32.HWND) Choice {
+    var buf: [512]u8 = undefined;
     return confirm(
         owner,
-        "The text being pasted contains characters that could run " ++
-            "commands unexpectedly (for example, newlines).\n\nPaste anyway?",
-        "Ghostty \u{2014} Potentially Unsafe Paste",
+        paragraphs(
+            &buf,
+            i18n.tr("The text you are pasting contains line breaks and may run commands."),
+            i18n.tr("Paste anyway?"),
+        ),
+        i18n.tr("Warning: Potentially Unsafe Paste"),
     );
 }
 
 /// Tell the user that the shell process exited with a non-zero code.
 pub fn showChildExited(owner: ?w32.HWND, exit_code: u32) void {
-    var buf: [128]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buf,
-        "The shell process exited with code {d}.",
-        .{exit_code},
-    ) catch "The shell process exited unexpectedly.";
-    _ = messageBox(owner, message, "Ghostty", w32.MB_ICONWARNING);
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    i18n.format(&writer, i18n.tr("The shell process exited with code {code}."), .{
+        .code = exit_code,
+    }) catch {};
+    _ = messageBox(owner, writer.buffered(), "Ghostty", w32.MB_ICONWARNING);
+}
+
+/// The About dialog: product name and version.
+pub fn showAbout(owner: ?w32.HWND, version: []const u8) void {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    writer.writeAll(i18n.tr("Ghostty GX")) catch {};
+    writer.writeAll("\n") catch {};
+    i18n.format(&writer, i18n.tr("Version {version}"), .{ .version = version }) catch {};
+    _ = messageBox(owner, writer.buffered(), i18n.tr("About Ghostty GX"), w32.MB_ICONINFORMATION);
+}
+
+/// Two paragraphs separated by a blank line.
+fn paragraphs(buf: []u8, first: []const u8, second: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}\n\n{s}", .{ first, second }) catch first;
 }
 
 /// One file type of a Save As dialog.

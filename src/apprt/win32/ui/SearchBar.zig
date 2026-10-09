@@ -14,6 +14,7 @@ const SearchBar = @This();
 
 const std = @import("std");
 const input = @import("../../../input.zig");
+const i18n = @import("../../../gx/i18n.zig");
 const Surface = @import("../Surface.zig");
 const w32 = @import("../win32.zig");
 
@@ -94,7 +95,12 @@ fn updateCountLabel(self: *SearchBar) void {
         const total = self.total orelse break :blk "";
         if (total == 0) break :blk "0/0";
         if (self.selected) |sel| {
-            break :blk std.fmt.bufPrint(&buf8, "{d}/{d}", .{ sel + 1, total }) catch "";
+            var writer: std.Io.Writer = .fixed(&buf8);
+            i18n.format(&writer, i18n.tr("{current}/{total}"), .{
+                .current = sel + 1,
+                .total = total,
+            }) catch {};
+            break :blk writer.buffered();
         }
         break :blk std.fmt.bufPrint(&buf8, "-/{d}", .{total}) catch "";
     };

@@ -268,6 +268,15 @@ msgstr "此窗口中仍有进程在运行，仍要关闭吗？"
 msgid "Processes are still running. Quit anyway?"
 msgstr "仍有进程在运行，仍要退出吗？"
 
+msgid "Close Terminal?"
+msgstr "关闭终端吗？"
+
+msgid "A process is still running in this terminal. Close it anyway?"
+msgstr "此终端中仍有进程在运行，仍要关闭吗？"
+
+msgid "The shell process exited with code {code}."
+msgstr "Shell 进程已退出，退出码 {code}。"
+
 msgid "{name} is still running."
 msgstr "{name} 仍在运行。"
 
@@ -303,6 +312,9 @@ msgstr "允许"
 msgid "Deny"
 msgstr "拒绝"
 
+msgid "Allow this?"
+msgstr "是否允许？"
+
 msgid "Warning: Potentially Unsafe Paste"
 msgstr "警告：粘贴内容可能不安全"
 
@@ -311,6 +323,9 @@ msgstr "要粘贴的文本包含换行符，可能会执行命令。"
 
 msgid "Paste Anyway"
 msgstr "仍然粘贴"
+
+msgid "Paste anyway?"
+msgstr "仍要粘贴吗？"
 
 msgid "Copied to clipboard"
 msgstr "已复制至剪贴板"
@@ -350,3 +365,41 @@ msgstr "退出码：{code}"
 
 msgid "Command finished in {duration}"
 msgstr "命令已完成，用时 {duration}"
+
+msgid "Command succeeded"
+msgstr "命令执行成功"
+
+msgid "Command took {duration}."
+msgstr "命令用时 {duration}。"
+
+msgid "Command took {duration} and exited with code {code}."
+msgstr "命令用时 {duration}，退出码 {code}。"
+
+msgid "Renderer Unhealthy"
+msgstr "渲染器状态异常"
+
+msgid "The GPU renderer is in an unhealthy state; terminal output may stop updating."
+msgstr "GPU 渲染器状态异常，终端输出可能停止更新。"
+
+#. Windows apprt: terminal context menu, command palette, export and
+#. configuration editor
+msgid "Reset Terminal"
+msgstr "重置终端"
+
+msgid "Close Tabs to the Right"
+msgstr "关闭右侧标签页"
+
+msgid "Execute a command…"
+msgstr "选择要执行的命令…"
+
+msgid "Export Terminal IO Events"
+msgstr "导出终端 IO 事件"
+
+msgid "Text files (*.txt)"
+msgstr "文本文件 (*.txt)"
+
+msgid "All files (*.*)"
+msgstr "所有文件 (*.*)"
+
+msgid "Editing configuration file {path}"
+msgstr "正在编辑配置文件 {path}"
