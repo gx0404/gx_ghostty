@@ -480,6 +480,14 @@ test "the embedded defaults parse cleanly" {
         try testing.expect(entry.value_ptr.leaf.flags.performable);
     }
 
+    // Windows has no selection clipboard: Shift+Insert pastes the clipboard.
+    if (builtin.os.tag == .windows) {
+        const shift_insert = try inputpkg.Binding.Trigger.parse("shift+insert");
+        const entry = cfg.keybind.set.get(shift_insert) orelse return error.TestUnexpectedResult;
+        try testing.expect(entry.value_ptr.* == .leaf);
+        try testing.expect(entry.value_ptr.leaf.action.equal(.paste_from_clipboard));
+    }
+
     // The GX command palette entries follow the upstream ones.
     const upstream_entries = upstream.@"command-palette-entry".value.items;
     const entries = cfg.@"command-palette-entry".value.items;
