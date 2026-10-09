@@ -11,6 +11,10 @@
 
 ## 0.0.2(TBD)
 
+### Fixed
+
+- GTK 应用（GX-0023）：GTK 4.20 以前（如 Ubuntu 24.04 的 GTK 4.14）启动时不再记录 `Theme parser error: style.css:…`。拖动分屏时，目标终端靠近指针的那一半重新显示蓝色高亮；只读提示的文字恢复浅橙色；`window-theme = ghostty` 时 GTK 4.14 不再报 `css parsing failed`，失焦窗口的标题栏略微变暗；GTK 4.16–4.18 上拖放高亮的运行时 CSS 也不再报错。
+
 ## 0.0.1(2026-10-10)
 
 Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应用，两端共用 GX 核心与默认配置，并有 fork 自己的发布链与开发框架。括号里的 GX-NNNN 是 `docs/FORK_PATCHES.md` 登记的上游源码补丁。

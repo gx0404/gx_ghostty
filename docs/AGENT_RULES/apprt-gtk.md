@@ -58,7 +58,7 @@
 - **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。
 - **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 与 `LANGUAGE`（`gx/language.zig::restoreChildEnv`）恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。原始 `LANGUAGE` 由 `gx/language.zig::startup` 在启动阶段记录一次（此后只读的模块级状态，因为它先于 `Application` 对象创建）。启动之后只有界面语言切换会改 `LANGUAGE`（主线程，`setenv` 后 `global.syncEnviron`）。
 - **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。
-- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）。GX 样式与 herdr 应用模式（`src/apprt/gtk/gx/app_mode.zig`）经 fork 补丁 GX-0016 接入 `class/application.zig`、`class/window.zig`；新增 provider 按此排位，GX 逻辑放在 `src/apprt/gtk/gx/`，上游类里只留 begin/end 钩子。
+- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）。GX 样式与 herdr 应用模式（`src/apprt/gtk/gx/app_mode.zig`）经 fork 补丁 GX-0016 接入 `class/application.zig`、`class/window.zig`；新增 provider 按此排位，GX 逻辑放在 `src/apprt/gtk/gx/`，上游类里只留 begin/end 钩子。静态 CSS 与 GX CSS 都须能被 GTK 4.14 解析（GX-0023），4.16 起的写法只进运行期版本门控的 CSS。
 - **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。
 
 ## 禁止项
@@ -76,7 +76,7 @@
 
 ## 验证
 
-- **Windows 主机经 WSL**（`just wsl`，Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 `zh_CN.UTF-8`、`en_US.UTF-8` locale）：`just wsl sync <worktree> --dirty` 同步改动，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑 GTK 单测（GX 层用 `--filter apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图并拷回 Windows，读图后才记 PASS。Windows 本身没有 GTK 与 gettext（默认 `-Di18n=false`），只能跑 `just fmt-check`。
+- **Windows 主机经 WSL**（`just wsl`，Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 `zh_CN.UTF-8`、`en_US.UTF-8` locale）：`just wsl sync <worktree> --dirty` 同步改动，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑 GTK 单测（GX 层用 `--filter apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图并拷回 Windows，读图且日志无 `Theme parser error`、`css parsing failed` 才记 PASS。Windows 本身没有 GTK 与 gettext（默认 `-Di18n=false`），只能跑 `just fmt-check`。
 - **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.16、gettext、pkg-config）：
   - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`；Ubuntu 24.04 的打包配方见 `packaging-dist.md`。
   - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.16.0）。
