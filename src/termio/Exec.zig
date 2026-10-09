@@ -65,6 +65,9 @@ pub fn deinit(self: *Exec) void {
 /// after termio begins because it may put the internal terminal state
 /// into a bad state.
 pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
+    // fork(gx): GX-0022 ConPTY's own screen buffer ignores the OSC 133 fresh-line
+    if (comptime builtin.os.tag == .windows) term.flags.semantic_prompt_fresh_line = false;
+
     // If we have an initial pwd requested by the subprocess, then we
     // set that on the terminal now. This allows rapidly initializing
     // new surfaces to use the proper pwd.
