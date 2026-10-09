@@ -507,6 +507,7 @@ pub fn performAction(
 ) !bool {
     switch (action) {
         .quit => {
+            if (!self.confirmQuit(target)) return true;
             self.quit_requested = true;
             w32.PostQuitMessage(0);
             return true;
@@ -635,9 +636,13 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     // Close the entire window (all tabs), not just one tab.
-                    // Confirm first if any tab still has a running process.
-                    const win = core_surface.rt_surface.parent_window;
-                    if (win.confirmCloseIfNeeded()) win.close();
+                    // The WM_CLOSE handler confirms first if any tab still
+                    // has a running process. Posting it keeps the close
+                    // (and its dialog) out of this core callback, whose
+                    // surface the close frees.
+                    if (core_surface.rt_surface.parent_window.hwnd) |hwnd| {
+                        _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+                    }
                 },
             }
             return true;
@@ -766,10 +771,13 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.closeTabMode(
-                        value,
-                        core_surface.rt_surface,
-                    );
+                    // Ask first when a terminal being closed runs a process;
+                    // the dialog's modal loop can free the surface, so it is
+                    // looked up again afterwards.
+                    const id = core_surface.id;
+                    if (!core_surface.rt_surface.parent_window.confirmCloseTabs(value, core_surface.rt_surface)) return true;
+                    const surface = (self.core_app.findSurfaceByID(id) orelse return true).rt_surface;
+                    surface.parent_window.closeTabMode(value, surface);
                 },
             }
             return true;
@@ -908,8 +916,8 @@ pub fn performAction(
         },
 
         .close_all_windows => {
-            // Close all surfaces by posting WM_CLOSE to each.
-            // The core tracks surfaces; iterate via quit.
+            // Closing every window quits; confirm like quitting does.
+            if (!self.confirmQuit(target)) return true;
             self.quit_requested = true;
             w32.PostQuitMessage(0);
             return true;
@@ -1404,6 +1412,25 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
         .new_tab_profile => |id| self.openProfile(window, id, .tab),
         .new_window_profile => |id| self.openProfile(window, id, .window),
     };
+}
+
+/// Ask before quitting while a terminal runs a process that needs a close
+/// confirmation (`confirm-close-surface`), listing those processes.
+/// Returns whether to quit. The dialog runs a modal loop; nothing here
+/// uses a surface after it.
+fn confirmQuit(self: *App, target: apprt.Target) bool {
+    var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+    defer arena.deinit();
+    var processes: std.ArrayList([]const u8) = .empty;
+    var needs = false;
+    for (self.core_app.surfaces.items) |surface| {
+        if (!surface.core_surface_ready or !surface.core_surface.needsConfirmQuit()) continue;
+        needs = true;
+        surface.appendBusyProcesses(arena.allocator(), &processes);
+    }
+    if (!needs) return true;
+    const owner = if (self.targetWindow(target)) |window| window.hwnd else null;
+    return Dialogs.confirmQuit(owner, processes.items) == .accept;
 }
 
 /// The window an action applies to: the surface's window, or for app
@@ -2036,9 +2063,29 @@ fn surfaceWndProc(
         w32.WM_CLOSE => {
             // Posted by Surface.close() to defer destruction to the
             // message loop. This is the safe place to call closeSplitSurface
-            // (outside of core_surface callbacks).
+            // (outside of core_surface callbacks) — unless a dialog's modal
+            // loop dispatched it, in which case it waits for the dialog.
+            if (Dialogs.deferClose(hwnd)) return 0;
             surface.parent_window.closeSplitSurface(surface);
             return 0;
+        },
+
+        w32.WM_TIMER => {
+            if (surface.handleTimer(wparam)) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
+        Surface.WM_APP_GPU_RESET => {
+            surface.recoverGpuResources();
+            return 0;
+        },
+
+        Surface.WM_GHOSTTY_SIMULATE_GPU_RESET => {
+            // Test-only: the next presented frame acts as if the GPU had
+            // been reset; draw one now.
+            surface.simulate_gpu_reset.store(true, .release);
+            surface.refreshRenderer();
+            return 1;
         },
 
         w32.WM_DESTROY => {

@@ -158,8 +158,10 @@ pub const ISC_SHOWUICOMPOSITIONWINDOW: isize = 0x80000000;
 pub const GCS_COMPSTR: u32 = 0x0008;
 pub const GCS_RESULTSTR: u32 = 0x0800;
 
-// IME composition form styles
+// IME composition and candidate form styles
 pub const CFS_POINT: u32 = 0x0002;
+pub const CFS_CANDIDATEPOS: u32 = 0x0040;
+pub const CFS_EXCLUDE: u32 = 0x0080;
 
 // Virtual key codes
 pub const VK_PROCESSKEY: u16 = 0xE5;
@@ -266,6 +268,7 @@ pub const DEFAULT_CHARSET: u32 = 1;
 
 // Window long pointer indices
 pub const GWLP_USERDATA: i32 = -21;
+pub const GWLP_WNDPROC: i32 = -4;
 
 // HWND_MESSAGE for message-only windows
 pub const HWND_MESSAGE: ?HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -3))));
@@ -348,12 +351,64 @@ pub extern "user32" fn UpdateWindow(
     hWnd: HWND,
 ) callconv(.winapi) i32;
 
+// Modal dialogs: disable the other windows of the thread while a dialog
+// runs its own message loop.
+pub extern "user32" fn EnableWindow(
+    hWnd: HWND,
+    bEnable: i32,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn IsWindowEnabled(
+    hWnd: HWND,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn IsWindow(
+    hWnd: ?HWND,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn IsIconic(
+    hWnd: HWND,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
+
+pub extern "user32" fn SetActiveWindow(
+    hWnd: HWND,
+) callconv(.winapi) ?HWND;
+
+pub extern "user32" fn EnumThreadWindows(
+    dwThreadId: u32,
+    lpfn: *const fn (HWND, isize) callconv(.winapi) i32,
+    lParam: isize,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn GetMessageW(
     lpMsg: *MSG,
     hWnd: ?HWND,
     wMsgFilterMin: u32,
     wMsgFilterMax: u32,
 ) callconv(.winapi) i32;
+
+pub const PM_REMOVE: u32 = 0x0001;
+
+pub extern "user32" fn PeekMessageW(
+    lpMsg: *MSG,
+    hWnd: ?HWND,
+    wMsgFilterMin: u32,
+    wMsgFilterMax: u32,
+    wRemoveMsg: u32,
+) callconv(.winapi) i32;
+
+pub const QS_ALLINPUT: u32 = 0x04FF;
+pub const MWMO_INPUTAVAILABLE: u32 = 0x0004;
+
+pub extern "user32" fn MsgWaitForMultipleObjectsEx(
+    nCount: u32,
+    pHandles: ?[*]const std.os.windows.HANDLE,
+    dwMilliseconds: u32,
+    dwWakeMask: u32,
+    dwFlags: u32,
+) callconv(.winapi) u32;
 
 pub extern "user32" fn TranslateMessage(
     lpMsg: *const MSG,
@@ -535,6 +590,28 @@ pub extern "user32" fn GetWindowRect(
     lpRect: *RECT,
 ) callconv(.winapi) i32;
 
+// Moving several child windows at once (split layout).
+pub const HDWP = *opaque {};
+
+pub extern "user32" fn BeginDeferWindowPos(
+    nNumWindows: i32,
+) callconv(.winapi) ?HDWP;
+
+pub extern "user32" fn DeferWindowPos(
+    hWinPosInfo: HDWP,
+    hWnd: HWND,
+    hWndInsertAfter: ?HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    uFlags: u32,
+) callconv(.winapi) ?HDWP;
+
+pub extern "user32" fn EndDeferWindowPos(
+    hWinPosInfo: HDWP,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn MonitorFromWindow(
     hwnd: HWND,
     dwFlags: u32,
@@ -690,6 +767,13 @@ pub extern "kernel32" fn WaitForSingleObject(
     dwMilliseconds: u32,
 ) callconv(.winapi) u32;
 
+pub extern "kernel32" fn WaitForMultipleObjects(
+    nCount: u32,
+    lpHandles: [*]const HANDLE,
+    bWaitAll: i32,
+    dwMilliseconds: u32,
+) callconv(.winapi) u32;
+
 pub extern "kernel32" fn CloseHandle(
     hObject: HANDLE,
 ) callconv(.winapi) i32;
@@ -747,6 +831,10 @@ pub extern "user32" fn GetClipboardData(
     uFormat: u32,
 ) callconv(.winapi) ?*anyopaque;
 
+pub extern "user32" fn IsClipboardFormatAvailable(
+    format: u32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn SetClipboardData(
     uFormat: u32,
     hMem: *anyopaque,
@@ -798,6 +886,8 @@ pub const WS_CLIPCHILDREN: u32 = 0x02000000;
 pub extern "user32" fn SetFocus(
     hWnd: ?HWND,
 ) callconv(.winapi) ?HWND;
+
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 
 pub extern "user32" fn GetWindowTextW(
     hWnd: HWND,
@@ -1061,6 +1151,18 @@ pub extern "imm32" fn ImmGetCompositionStringW(
 pub extern "imm32" fn ImmSetCompositionWindow(
     hIMC: HIMC,
     lpCompForm: *const COMPOSITIONFORM,
+) callconv(.winapi) i32;
+
+pub const CANDIDATEFORM = extern struct {
+    dwIndex: u32,
+    dwStyle: u32,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
+pub extern "imm32" fn ImmSetCandidateWindow(
+    hIMC: HIMC,
+    lpCandidate: *const CANDIDATEFORM,
 ) callconv(.winapi) i32;
 
 // -----------------------------------------------------------------------
@@ -1397,6 +1499,9 @@ pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const PBT_APMSUSPEND: usize = 0x0004;
 pub const PBT_APMRESUMESUSPEND: usize = 0x0007;
 pub const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+// Display resolution or monitor layout changed (sent to top-level windows).
+pub const WM_DISPLAYCHANGE: u32 = 0x007E;
 
 // -----------------------------------------------------------------------
 // SetWindowCompositionAttribute — accent blur-behind for background-blur.

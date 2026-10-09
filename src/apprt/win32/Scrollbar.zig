@@ -1,6 +1,14 @@
 // Ported from shiweis/ghostty-windows@119b9270c (MIT). Copyright (c) Shiwei Song and Ghostty contributors.
 //! Themed scrollbar for the Win32 apprt: a layered popup owned by the
-//! surface window that follows the system scrollbar mode.
+//! surface window that follows the system scrollbar mode ("Always show
+//! scrollbars" in the accessibility settings).
+//!
+//! Like WezTerm GX, the thumb is a thin rounded bar in the foreground
+//! color: 3 DIPs wide at rest, widening to 8 and brightening while the
+//! pointer is over the scrollbar or it is dragged. In overlay mode (the
+//! default) it floats over the terminal's right edge, fades in when the
+//! terminal scrolls and fades out after a second of inactivity; with
+//! always-visible scrollbars it reserves a column of the grid and stays.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,19 +19,32 @@ const testing = std.testing;
 
 const log = std.log.scoped(.win32_scrollbar);
 
+/// Width of the scrollbar window in DIPs, the hover and click target: the
+/// column an always-visible scrollbar reserves, and the strip an overlay
+/// scrollbar floats over at the right edge.
 const SCROLLBAR_WIDTH_BASE: i32 = 14;
-const SCROLLBAR_WIDTH_OVERLAY_COLLAPSED: i32 = 8;
+const SCROLLBAR_WIDTH_OVERLAY: i32 = 12;
 const THUMB_MIN_HEIGHT_BASE: i32 = 20;
+
+/// Thumb width in DIPs at rest and while hovered or dragged, and its gap
+/// to the right edge.
+const THUMB_WIDTH_REST: f32 = 3;
+const THUMB_WIDTH_ACTIVE: f32 = 8;
+const THUMB_MARGIN: f32 = 2;
 
 const FADE_TIMER_ID: usize = 1;
 const IDLE_TIMER_ID: usize = 2;
 const FADE_INTERVAL_MS: u32 = 16; // ~60Hz
 const FADE_STEP: u8 = 32;
+/// Widening takes four ticks (about 64 ms).
+const GROW_STEP: u8 = 64;
 const IDLE_DELAY_MS: u32 = 1000;
 
-const ALPHA_IDLE: u8 = 80;
-const ALPHA_HOVER: u8 = 140;
-const ALPHA_DRAG: u8 = 200;
+const ALPHA_IDLE: u8 = 90;
+const ALPHA_HOVER: u8 = 160;
+const ALPHA_DRAG: u8 = 220;
+/// The track tint while the pointer is over the scrollbar.
+const ALPHA_TRACK_HOVER: u8 = 20;
 
 /// Computed thumb rectangle within the track.
 pub const ThumbRect = struct { y: i32, h: i32 };
@@ -178,6 +199,9 @@ pub const Scrollbar = struct {
     visibility: Visibility = .hidden,
     /// Fade alpha [0..255]. Multiplied into base_alpha at paint time.
     fade: u8 = 0,
+    /// How far the thumb has widened toward its hover width [0..255],
+    /// animated on the fade timer.
+    grow: u8 = 0,
 
     /// Hover tracking.
     hover: bool = false,
@@ -200,6 +224,7 @@ pub const Scrollbar = struct {
             .surface = surface,
             .owner = owner,
             .hwnd = undefined,
+            .scale = surface.scale,
         };
 
         // WS_EX_LAYERED — DWM-composited above OpenGL.
@@ -308,6 +333,9 @@ pub const Scrollbar = struct {
         var top_right = w32.POINT{ .x = rect.right - width, .y = rect.top };
         _ = w32.ClientToScreen(self.owner, &top_right);
 
+        // Only show it with its surface: the surfaces of background tabs
+        // are hidden and so are their scrollbars.
+        const show: u32 = if (w32.IsWindowVisible_(self.owner) != 0) w32.SWP_SHOWWINDOW else 0;
         _ = w32.SetWindowPos(
             self.hwnd,
             null,
@@ -315,7 +343,7 @@ pub const Scrollbar = struct {
             top_right.y,
             width,
             client_h,
-            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
+            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | show,
         );
 
         self.repaint();
@@ -348,10 +376,7 @@ pub const Scrollbar = struct {
     fn currentWidth(self: *const Scrollbar) i32 {
         return switch (self.mode) {
             .always_visible => self.dpiScaled(SCROLLBAR_WIDTH_BASE),
-            .overlay => if (self.hover or self.dragging)
-                self.dpiScaled(SCROLLBAR_WIDTH_BASE)
-            else
-                self.dpiScaled(SCROLLBAR_WIDTH_OVERLAY_COLLAPSED),
+            .overlay => self.dpiScaled(SCROLLBAR_WIDTH_OVERLAY),
         };
     }
 
@@ -410,41 +435,73 @@ pub const Scrollbar = struct {
 
     fn drawBitmap(self: *Scrollbar, pixels: [*]u32, w: i32, h: i32) void {
         // Premultiplied BGRA. Layout per pixel: 0xAARRGGBB.
-        // Overlay mode: track is fully transparent; only the thumb is painted.
-        // Always-visible mode: track is filled with the opaque background color.
-
-        const track_fill: u32 = switch (self.mode) {
-            .always_visible => packBGRA(self.bg, 255),
-            .overlay => 0,
+        // Overlay mode: the track is tinted while hovered, and otherwise
+        // all but transparent while shown: a layered window lets the mouse
+        // through pixels of alpha 0, and the whole strip, not only the
+        // thin thumb, should catch the hover that widens the thumb.
+        // Always-visible mode: the track is the opaque background color.
+        const track: Rgba = switch (self.mode) {
+            .always_visible => .{ .rgb = self.bg, .a = 255 },
+            .overlay => .{
+                .rgb = self.fg,
+                .a = @max(
+                    effectiveAlpha(lerpU8(0, ALPHA_TRACK_HOVER, self.grow), self.fade),
+                    @as(u8, @intFromBool(self.fade > 0)),
+                ),
+            },
         };
-
-        const total = w * h;
-        var i: i32 = 0;
-        while (i < total) : (i += 1) {
-            pixels[@intCast(i)] = track_fill;
+        const track_px = track.premultiplied();
+        for (pixels[0..@intCast(w * h)]) |*px| px.* = track_px;
+        if (self.mode == .always_visible and self.grow > 0) {
+            const tint: Rgba = .{ .rgb = self.fg, .a = lerpU8(0, ALPHA_TRACK_HOVER, self.grow) };
+            for (pixels[0..@intCast(w * h)]) |*px| px.* = blendOver(tint, 1, px.*);
         }
 
+        // The thumb: a capsule against the right edge, anti-aliased.
         const min_h = self.dpiScaled(THUMB_MIN_HEIGHT_BASE);
         const r = thumbRect(self.state.total, self.state.offset, self.state.len, h, min_h);
+        if (r.h <= 0) return;
+        const thumb: Rgba = .{ .rgb = self.fg, .a = self.thumbAlpha() };
+        if (thumb.a == 0) return;
 
-        const thumb_alpha = self.thumbAlpha();
-        const thumb_color = packBGRA(self.fg, thumb_alpha);
-
+        const grow: f32 = @as(f32, @floatFromInt(self.grow)) / 255.0;
+        const thumb_w = (THUMB_WIDTH_REST + (THUMB_WIDTH_ACTIVE - THUMB_WIDTH_REST) * grow) * self.scale;
+        const right = @as(f32, @floatFromInt(w)) - THUMB_MARGIN * self.scale;
+        const capsule: Capsule = .{
+            .x0 = @max(right - thumb_w, 0),
+            .x1 = right,
+            .y0 = @floatFromInt(r.y),
+            .y1 = @floatFromInt(r.y + r.h),
+        };
+        const x_start: i32 = @max(@as(i32, @intFromFloat(@floor(capsule.x0))), 0);
+        const x_end: i32 = @min(@as(i32, @intFromFloat(@ceil(capsule.x1))), w);
         var y: i32 = r.y;
         while (y < r.y + r.h and y < h) : (y += 1) {
-            var x: i32 = 0;
-            while (x < w) : (x += 1) {
-                pixels[@intCast(y * w + x)] = thumb_color;
+            var x: i32 = x_start;
+            while (x < x_end) : (x += 1) {
+                const coverage = capsule.coverage(@floatFromInt(x), @floatFromInt(y));
+                if (coverage <= 0) continue;
+                const px = &pixels[@intCast(y * w + x)];
+                px.* = blendOver(thumb, coverage, px.*);
             }
         }
     }
 
+    /// The thumb's alpha: brighter while hovered (following the widening)
+    /// and dragged, times the fade in overlay mode.
     fn thumbAlpha(self: *const Scrollbar) u8 {
-        const base = if (self.dragging) ALPHA_DRAG else if (self.hover) ALPHA_HOVER else ALPHA_IDLE;
+        const base = if (self.dragging) ALPHA_DRAG else lerpU8(ALPHA_IDLE, ALPHA_HOVER, self.grow);
         return switch (self.mode) {
             .always_visible => base,
             .overlay => effectiveAlpha(base, self.fade),
         };
+    }
+
+    /// Animate the thumb width toward its hover or rest width.
+    fn animateGrow(self: *Scrollbar) void {
+        const target: u8 = if (self.hover or self.dragging) 255 else 0;
+        if (self.grow == target) return;
+        _ = w32.SetTimer(self.hwnd, FADE_TIMER_ID, FADE_INTERVAL_MS, null);
     }
 
     fn ensureLeaveTracking(self: *Scrollbar) void {
@@ -498,6 +555,7 @@ pub const Scrollbar = struct {
 
         if (!self.hover) {
             self.hover = true;
+            self.animateGrow();
             self.repaint();
         }
     }
@@ -505,6 +563,7 @@ pub const Scrollbar = struct {
     fn onMouseLeave(self: *Scrollbar) void {
         if (self.hover) {
             self.hover = false;
+            self.animateGrow();
             self.repaint();
         }
         if (!self.dragging) self.restartIdleTimer();
@@ -517,6 +576,8 @@ pub const Scrollbar = struct {
             _ = w32.SetCapture(self.hwnd);
             self.drag_anchor = y - r.y;
             self.dragging = true;
+            self.animateGrow();
+            self.repaint();
         } else {
             // Page click.
             const total = self.state.total;
@@ -537,6 +598,7 @@ pub const Scrollbar = struct {
         if (self.dragging) {
             _ = w32.ReleaseCapture();
             self.dragging = false;
+            self.animateGrow();
             self.repaint();
         }
     }
@@ -569,9 +631,10 @@ pub const Scrollbar = struct {
         return true;
     }
 
-    /// Update the DPI scale factor.
+    /// Update the DPI scale factor and resize to it.
     pub fn onDpiChanged(self: *Scrollbar, dpi: u32) void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+        _ = self.repositionAndResize();
     }
 
     fn startFadeIn(self: *Scrollbar) void {
@@ -591,29 +654,33 @@ pub const Scrollbar = struct {
         _ = w32.SetTimer(self.hwnd, IDLE_TIMER_ID, IDLE_DELAY_MS, null);
     }
 
+    /// One step of the fade and widening animations; the timer stops once
+    /// both have settled.
     fn onFadeTick(self: *Scrollbar) void {
+        var animating = false;
         switch (self.visibility) {
             .fading_in => {
                 const new_fade = @min(@as(u16, self.fade) + FADE_STEP, 255);
                 self.fade = @intCast(new_fade);
-                if (self.fade == 255) {
-                    self.visibility = .shown;
-                    _ = w32.KillTimer(self.hwnd, FADE_TIMER_ID);
-                }
-                self.repaint();
+                if (self.fade == 255) self.visibility = .shown else animating = true;
             },
             .fading_out => {
                 const new_fade = if (self.fade > FADE_STEP) self.fade - FADE_STEP else 0;
                 self.fade = new_fade;
                 if (self.fade == 0) {
                     self.visibility = .hidden;
-                    _ = w32.KillTimer(self.hwnd, FADE_TIMER_ID);
                     self.setTransparent();
-                }
-                self.repaint();
+                } else animating = true;
             },
-            else => _ = w32.KillTimer(self.hwnd, FADE_TIMER_ID),
+            .hidden, .shown => {},
         }
+
+        const target: u8 = if (self.hover or self.dragging) 255 else 0;
+        self.grow = stepToward(self.grow, target, GROW_STEP);
+        if (self.grow != target) animating = true;
+
+        if (!animating) _ = w32.KillTimer(self.hwnd, FADE_TIMER_ID);
+        self.repaint();
     }
 
     fn onIdleTick(self: *Scrollbar) void {
@@ -642,6 +709,72 @@ fn packBGRA(c: terminal.color.RGB, a: u8) u32 {
     const g: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(c.g)) * af));
     const b: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(c.b)) * af));
     return (@as(u32, a) << 24) | (r << 16) | (g << 8) | b;
+}
+
+/// A straight-alpha color.
+const Rgba = struct {
+    rgb: terminal.color.RGB,
+    a: u8,
+
+    fn premultiplied(self: Rgba) u32 {
+        return packBGRA(self.rgb, self.a);
+    }
+};
+
+/// `src` drawn with `coverage` (0..1) over the premultiplied pixel `dst`.
+fn blendOver(src: Rgba, coverage: f32, dst: u32) u32 {
+    const a = @as(f32, @floatFromInt(src.a)) / 255.0 * std.math.clamp(coverage, 0, 1);
+    const keep = 1 - a;
+    const channel = struct {
+        fn of(value: u32, shift: u5) f32 {
+            return @floatFromInt((value >> shift) & 0xFF);
+        }
+
+        fn to8(v: f32) u32 {
+            return @intFromFloat(@round(std.math.clamp(v, 0, 255)));
+        }
+    };
+    const out_a = 255 * a + channel.of(dst, 24) * keep;
+    const r = @as(f32, @floatFromInt(src.rgb.r)) * a + channel.of(dst, 16) * keep;
+    const g = @as(f32, @floatFromInt(src.rgb.g)) * a + channel.of(dst, 8) * keep;
+    const b = @as(f32, @floatFromInt(src.rgb.b)) * a + channel.of(dst, 0) * keep;
+    return (channel.to8(out_a) << 24) | (channel.to8(r) << 16) | (channel.to8(g) << 8) | channel.to8(b);
+}
+
+/// A vertical capsule (a rectangle with fully rounded ends) in pixels.
+const Capsule = struct {
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+
+    /// How much of the pixel at (x, y) the capsule covers, 0..1, from the
+    /// distance of the pixel center to the capsule's edge (antialiasing).
+    fn coverage(self: Capsule, x: f32, y: f32) f32 {
+        const radius = (self.x1 - self.x0) / 2;
+        const top = self.y0 + radius;
+        const bottom = @max(self.y1 - radius, top);
+        const px = x + 0.5;
+        const py = y + 0.5;
+        const dx = px - (self.x0 + self.x1) / 2;
+        const dy = py - std.math.clamp(py, top, bottom);
+        const distance = @sqrt(dx * dx + dy * dy) - radius;
+        return std.math.clamp(0.5 - distance, 0, 1);
+    }
+};
+
+/// `a` moved toward `b` by `t`/255.
+fn lerpU8(a: u8, b: u8, t: u8) u8 {
+    const ai: i32 = a;
+    const bi: i32 = b;
+    return @intCast(ai + @divTrunc((bi - ai) * @as(i32, t), 255));
+}
+
+/// `value` moved by at most `step` toward `target`.
+fn stepToward(value: u8, target: u8, step: u8) u8 {
+    if (value < target) return @intCast(@min(@as(u16, value) + step, target));
+    if (value > target) return if (value - target > step) value - step else target;
+    return value;
 }
 
 var class_registered: bool = false;
@@ -836,6 +969,24 @@ test "dragOffset: rounds half to nearest" {
     // mouse_y=191, drag_anchor=0 → 191/380 * 950 = 477.5 → 478 (round-half-to-even rounds .5 up here).
     const off = dragOffset(191, 0, 400, 20, 1000, 50).?;
     try testing.expect(off == 477 or off == 478);
+}
+
+test "lerpU8 and stepToward" {
+    try testing.expectEqual(@as(u8, 90), lerpU8(90, 160, 0));
+    try testing.expectEqual(@as(u8, 160), lerpU8(90, 160, 255));
+    try testing.expectEqual(@as(u8, 20), lerpU8(20, 0, 0));
+    try testing.expectEqual(@as(u8, 64), stepToward(0, 255, 64));
+    try testing.expectEqual(@as(u8, 255), stepToward(240, 255, 64));
+    try testing.expectEqual(@as(u8, 0), stepToward(30, 0, 64));
+}
+
+test "Capsule coverage is full inside and fades at the edge" {
+    const capsule: Capsule = .{ .x0 = 10, .x1 = 16, .y0 = 0, .y1 = 40 };
+    try testing.expectEqual(@as(f32, 1), capsule.coverage(12, 20));
+    try testing.expectEqual(@as(f32, 0), capsule.coverage(20, 20));
+    // The rounded top end leaves its corner pixels uncovered.
+    try testing.expectEqual(@as(f32, 0), capsule.coverage(10, 0));
+    try testing.expect(capsule.coverage(12, 0) > 0);
 }
 
 test "parseMode: non-{0,1} value treated as overlay" {

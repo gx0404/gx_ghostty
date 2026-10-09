@@ -8,7 +8,7 @@
 //! never called.
 //!
 //! `Factory` holds the process-wide D2D/DirectWrite factories, the
-//! resolved UI/icon font families, the CJK font fallback and a text format
+//! resolved UI/icon/monospace font families, the CJK font fallback and a text format
 //! cache; the app owns one (`App.uiFactory`). A `Canvas` belongs to one
 //! render target (an HWND or a GDI DC) and draws in DIPs: 1 unit = 1 pixel
 //! at 96 DPI.
@@ -569,6 +569,10 @@ pub const FontKind = enum {
 
     /// The icon font ("Segoe Fluent Icons", else "Segoe MDL2 Assets").
     icon,
+
+    /// A monospace font for terminal text ("Cascadia Mono", else
+    /// "Consolas"), with the UI font's CJK fallback.
+    mono,
 };
 
 pub const FontWeight = enum(u32) {
@@ -626,6 +630,7 @@ pub const Factory = struct {
     fallback: ?*IDWriteFontFallback = null,
     ui_family: [:0]const u16,
     icon_family: [:0]const u16,
+    mono_family: [:0]const u16,
     formats: std.ArrayList(CachedFormat) = .empty,
 
     const cjk_ranges = [_]UnicodeRange{
@@ -669,12 +674,14 @@ pub const Factory = struct {
             .dwrite = dwrite,
             .ui_family = L("Segoe UI"),
             .icon_family = L("Segoe MDL2 Assets"),
+            .mono_family = L("Consolas"),
         };
 
         if (self.systemFontCollection()) |collection| {
             defer release(collection);
             if (hasFamily(collection, L("Segoe UI Variable Text"))) self.ui_family = L("Segoe UI Variable Text");
             if (hasFamily(collection, L("Segoe Fluent Icons"))) self.icon_family = L("Segoe Fluent Icons");
+            if (hasFamily(collection, L("Cascadia Mono"))) self.mono_family = L("Cascadia Mono");
         }
         self.fallback = self.createFallback();
         return self;
@@ -748,6 +755,7 @@ pub const Factory = struct {
         const family = switch (key.font) {
             .ui => self.ui_family,
             .icon => self.icon_family,
+            .mono => self.mono_family,
         };
         const locale = switch (i18n.current()) {
             .zh_CN => L("zh-CN"),
@@ -767,7 +775,7 @@ pub const Factory = struct {
         ))) return null;
         const f = format orelse return null;
 
-        if (key.font == .ui) {
+        if (key.font != .icon) {
             if (self.fallback) |fallback| {
                 if (queryInterface(f, &IID_IDWriteTextFormat1)) |ptr| {
                     const format1: *IDWriteTextFormat1 = @ptrCast(@alignCast(ptr));
