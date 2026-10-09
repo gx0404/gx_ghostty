@@ -700,3 +700,31 @@ msgstr "复制版本信息"
 
 msgid "Processes are still running in the tabs to be closed. Close them anyway?"
 msgstr "要关闭的标签页中仍有进程在运行，仍要关闭吗？"
+
+#. win32 W2: settings overlay
+msgid "Current default: {name}"
+msgstr "当前默认：{name}"
+
+msgid "Open Configuration Directory"
+msgstr "打开配置目录"
+
+msgid "All window materials are supported on this system (build {build})."
+msgstr "当前系统支持全部窗口材质（Windows 内部版本 {build}）。"
+
+msgid "Dimmed materials are not supported on this system (build {build})."
+msgstr "当前系统不支持灰显的材质（Windows 内部版本 {build}）。"
+
+msgid "Search font families…"
+msgstr "搜索字体…"
+
+msgid "No matching fonts"
+msgstr "没有匹配的字体"
+
+msgid "Switch Section"
+msgstr "切换分类"
+
+msgid "Previewing {name}"
+msgstr "正在预览：{name}"
+
+msgid "Settings saved."
+msgstr "设置已保存。"
