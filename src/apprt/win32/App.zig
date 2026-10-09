@@ -2303,17 +2303,17 @@ fn surfaceWndProc(
             // destructor re-enters our WindowProc via SetFocus, which fires
             // ImeSystemHandler -> oleacc!CreateClient -> COM marshaling that
             // waits for a reply this thread cannot pump (deep WindowProc
-            // stack). Result: SleepConditionVariableSRW forever — the
-            // ghost-hang dumps all bottom out exactly there.
+            // stack). The GUI thread then hangs in SleepConditionVariableSRW
+            // forever.
             //
-            // wezterm avoids this by being single-HWND (no cross-window
-            // focus dance), so AccWraps that exist there are never
-            // destroyed in this re-entrant pattern. Returning 0 here for
-            // OBJID_CLIENT prevents AccWrap creation for our surface
-            // windows, breaking the chain at the source. We don't expose
-            // terminal-cell-level accessibility today anyway, so the only
-            // thing this disables is the generic window-frame proxy that
-            // screen readers would otherwise see.
+            // The hang needs focus to move between HWNDs that each carry an
+            // AccWrap, which never happens in a terminal that draws all of
+            // its panes into one HWND (WezTerm, for example). With one child
+            // HWND per surface, the chain is broken at its source instead:
+            // returning 0 for OBJID_CLIENT keeps oleacc from creating
+            // AccWraps for surface windows. Terminal cells are not exposed
+            // to accessibility tools anyway, so this only drops the generic
+            // window-frame proxy that screen readers would otherwise see.
             if (lparam == w32.OBJID_CLIENT) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
