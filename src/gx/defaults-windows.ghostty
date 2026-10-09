@@ -1,0 +1,3 @@
+# Ghostty GX defaults for Windows, appended to defaults.ghostty.
+
+quit-after-last-window-closed = true

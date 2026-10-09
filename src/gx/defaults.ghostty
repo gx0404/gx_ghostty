@@ -1,0 +1,45 @@
+# Ghostty GX defaults, embedded into the binary (src/gx/config_layers.zig).
+# They sit below the user configuration: config.ghostty (and its config-file
+# includes), gui-settings.ghostty and command-line flags all override them.
+# Keep colors out of this file; they come from the theme.
+
+theme = GX Mocha
+language = zh-CN
+
+# Missing families are skipped with a warning; the embedded font is the
+# final fallback.
+font-family = JetBrainsMono Nerd Font
+font-family = Noto Sans CJK SC
+font-family = Microsoft YaHei UI
+font-size = 12
+
+window-padding-x = 10
+window-padding-y = 8
+window-padding-balance = true
+
+cursor-style = block
+cursor-style-blink = true
+
+right-click-action = context-menu
+confirm-close-surface = true
+gx-herdr-app-mode = true
+
+# Alt+1..Alt+8 stay with the shell (readline digit arguments) instead of
+# switching tabs; both the physical digit keys and the characters are
+# unbound.
+keybind = alt+digit_1=unbind
+keybind = alt+1=unbind
+keybind = alt+digit_2=unbind
+keybind = alt+2=unbind
+keybind = alt+digit_3=unbind
+keybind = alt+3=unbind
+keybind = alt+digit_4=unbind
+keybind = alt+4=unbind
+keybind = alt+digit_5=unbind
+keybind = alt+5=unbind
+keybind = alt+digit_6=unbind
+keybind = alt+6=unbind
+keybind = alt+digit_7=unbind
+keybind = alt+7=unbind
+keybind = alt+digit_8=unbind
+keybind = alt+8=unbind
