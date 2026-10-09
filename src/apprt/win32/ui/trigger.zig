@@ -60,10 +60,14 @@ pub fn formatAction(set: *const Binding.Set, action: Binding.Action, buf: []u8) 
     return null;
 }
 
-/// Whether `format` writes a name for the key of `trigger`.
+/// Whether `format` writes a display name for the key of `trigger`, not
+/// just a tag name (`keyName`) or nothing.
 fn displayable(trigger: Trigger) bool {
-    const caps: Keycaps = .init(trigger);
-    return caps.key_len > 0;
+    return switch (trigger.key) {
+        .unicode => |cp| cp >= 0x20 and cp != 0x7F,
+        .physical => |k| namedKey(k) != null,
+        .catch_all => false,
+    };
 }
 
 fn write(trigger: Trigger, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -128,8 +132,14 @@ fn writeCodepoint(writer: *std.Io.Writer, cp: u21) std.Io.Writer.Error!void {
     try writer.writeAll(buf[0..len]);
 }
 
-/// Map physical key enum to display name.
+/// Map physical key enum to display name: `namedKey`, else the key's tag
+/// name (media and browser keys such as `paste`).
 pub fn keyName(k: input.Key) []const u8 {
+    return namedKey(k) orelse @tagName(k);
+}
+
+/// The display name of physical key `k`, or null when it has none.
+fn namedKey(k: input.Key) ?[]const u8 {
     return switch (k) {
         .key_a => "A",
         .key_b => "B",
@@ -241,7 +251,7 @@ pub fn keyName(k: input.Key) []const u8 {
         .print_screen => "PrtSc",
         .pause => "Pause",
         .context_menu => "Menu",
-        else => @tagName(k),
+        else => null,
     };
 }
 
