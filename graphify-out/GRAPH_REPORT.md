@@ -9,7 +9,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `e7409462`
+- Built from commit: `211b7414`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -3968,12 +3968,12 @@ Nodes (3): DeccolmMode, @"132_cols", @"80_cols"
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Ghostty` connect `Community 16` to `Community 256`, `Community 9`, `Community 14`, `Community 144`, `Community 18`, `Community 19`, `Community 658`, `Community 21`, `Community 149`, `Community 23`, `Community 27`, `Community 31`, `Community 33`, `Community 38`, `Community 167`, `Community 166`, `Community 295`, `Community 298`, `Community 41`, `Community 297`, `Community 296`, `Community 47`, `Community 433`, `Community 437`, `Community 183`, `Community 184`, `Community 313`, `Community 315`, `Community 316`, `Community 65`, `Community 579`, `Community 196`, `Community 197`, `Community 67`, `Community 580`, `Community 200`, `Community 330`, `Community 715`, `Community 464`, `Community 849`, `Community 80`, `Community 215`, `Community 88`, `Community 90`, `Community 102`, `Community 233`, `Community 127`?**
-  _High betweenness centrality (0.081) - this node is a cross-community bridge._
 - **Why does `App` connect `Community 9` to `Community 0`, `Community 166`, `Community 16`, `Community 18`, `Community 115`?**
-  _High betweenness centrality (0.067) - this node is a cross-community bridge._
+  _High betweenness centrality (0.068) - this node is a cross-community bridge._
+- **Why does `Ghostty` connect `Community 16` to `Community 256`, `Community 9`, `Community 14`, `Community 144`, `Community 18`, `Community 19`, `Community 658`, `Community 21`, `Community 149`, `Community 23`, `Community 27`, `Community 31`, `Community 33`, `Community 38`, `Community 167`, `Community 166`, `Community 295`, `Community 298`, `Community 41`, `Community 297`, `Community 296`, `Community 47`, `Community 433`, `Community 437`, `Community 183`, `Community 184`, `Community 313`, `Community 315`, `Community 316`, `Community 65`, `Community 579`, `Community 196`, `Community 197`, `Community 67`, `Community 580`, `Community 200`, `Community 330`, `Community 715`, `Community 464`, `Community 849`, `Community 80`, `Community 215`, `Community 88`, `Community 90`, `Community 102`, `Community 233`, `Community 127`?**
+  _High betweenness centrality (0.066) - this node is a cross-community bridge._
 - **Why does `Foundation` connect `Community 42` to `Community 778`, `Community 16`, `Community 18`, `Community 275`, `Community 662`, `Community 415`, `Community 298`, `Community 46`, `Community 50`, `Community 436`, `Community 53`, `Community 65`, `Community 66`, `Community 199`, `Community 330`, `Community 847`, `Community 464`, `Community 88`, `Community 221`, `Community 353`, `Community 502`, `Community 255`?**
-  _High betweenness centrality (0.058) - this node is a cross-community bridge._
+  _High betweenness centrality (0.065) - this node is a cross-community bridge._
 - **Are the 52 inferred relationships involving `Ghostty` (e.g. with `.userNotificationCenter()` and `.advanceToNextIcon()`) actually correct?**
   _`Ghostty` has 52 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 12 inferred relationships involving `Key` (e.g. with `.canBeUsedAsDictionaryKey()` and `.differentKeysAreNotEqual()`) actually correct?**
