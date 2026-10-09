@@ -12,6 +12,9 @@ const deepEqual = @import("../datastruct/comparison.zig").deepEqual;
 const key = @import("key.zig");
 const key_mods = @import("key_mods.zig");
 const KeyEvent = key.KeyEvent;
+// fork(gx): GX-0014 begin: Ghostty GX binding actions (src/gx/action.zig)
+const gx_action = @import("../gx/action.zig");
+// fork(gx): GX-0014 end
 
 /// The trigger that needs to be performed to execute the action.
 trigger: Trigger,
@@ -989,6 +992,40 @@ pub const Action = union(enum) {
     ///
     crash: CrashThread,
 
+    // fork(gx): GX-0014 begin: Ghostty GX actions performed by the app runtime
+    /// Perform a Ghostty GX action. The value is the action name, followed
+    /// by a colon and an argument for the actions that take one:
+    ///
+    ///   - `settings`
+    ///
+    ///     Open the Ghostty GX settings.
+    ///
+    ///   - `main_menu`
+    ///
+    ///     Open the main menu.
+    ///
+    ///   - `keybinds`
+    ///
+    ///     Show all keyboard shortcuts.
+    ///
+    ///   - `new_tab_profile:<id>`
+    ///
+    ///     Open a new tab with the launch profile `<id>`, for example
+    ///     `pwsh`, `wsl:Ubuntu` or `custom:<name>` for a `gx-launch-profile`
+    ///     entry.
+    ///
+    ///   - `new_window_profile:<id>`
+    ///
+    ///     Open a new window with the launch profile `<id>`.
+    ///
+    /// For example: `keybind = ctrl+shift+m=gx:main_menu`.
+    ///
+    /// GX actions are performed by app runtimes that implement them (the
+    /// Windows app). Elsewhere they are not performed, so a binding with the
+    /// `performable:` prefix passes its key on to the terminal.
+    gx: gx_action.Action,
+    // fork(gx): GX-0014 end
+
     pub const Key = @typeInfo(Action).@"union".tag_type.?;
 
     /// Make this a valid gobject if we're in a GTK environment.
@@ -1438,6 +1475,9 @@ pub const Action = union(enum) {
             .deactivate_all_key_tables,
             .end_key_sequence,
             .crash,
+            // fork(gx): GX-0014 begin: GX actions target the focused surface's window
+            .gx,
+            // fork(gx): GX-0014 end
             => .surface,
 
             // These are less obvious surface actions. They're surface
@@ -1577,6 +1617,9 @@ pub const Action = union(enum) {
                         }
                     }
                 },
+                // fork(gx): GX-0014 begin: unions (the gx action) format themselves
+                .@"union" => try value.format(writer),
+                // fork(gx): GX-0014 end
                 else => @compileError("unhandled type: " ++ @typeName(Value)),
             },
         }
@@ -1618,6 +1661,10 @@ pub const Action = union(enum) {
                 value
             else
                 try value.clone(alloc),
+
+            // fork(gx): GX-0014 begin: unions (the gx action) clone themselves
+            .@"union" => try value.clone(alloc),
+            // fork(gx): GX-0014 end
 
             else => {
                 @compileLog(@TypeOf(value));

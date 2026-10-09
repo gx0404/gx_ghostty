@@ -387,6 +387,34 @@ test "the embedded defaults parse cleanly" {
         const last_tab = try inputpkg.Binding.Trigger.parse("alt+9");
         try testing.expect(cfg.keybind.set.get(last_tab) != null);
     }
+
+    // GX actions get performable bindings on keys upstream leaves free.
+    for ([_]struct { []const u8, inputpkg.Binding.Action }{
+        .{ "ctrl+shift+m", .{ .gx = .main_menu } },
+        .{ "ctrl+shift+slash", .{ .gx = .keybinds } },
+    }) |binding| {
+        const trigger = try inputpkg.Binding.Trigger.parse(binding[0]);
+        try testing.expect(upstream.keybind.set.get(trigger) == null);
+        const entry = cfg.keybind.set.get(trigger) orelse return error.TestUnexpectedResult;
+        try testing.expect(entry.value_ptr.* == .leaf);
+        try testing.expect(entry.value_ptr.leaf.action.equal(binding[1]));
+        try testing.expect(entry.value_ptr.leaf.flags.performable);
+    }
+
+    // The GX command palette entries follow the upstream ones.
+    const upstream_entries = upstream.@"command-palette-entry".value.items;
+    const entries = cfg.@"command-palette-entry".value.items;
+    try testing.expectEqual(upstream_entries.len + 3, entries.len);
+    for (upstream_entries, entries[0..upstream_entries.len]) |expected, actual| {
+        try testing.expect(expected.equal(actual));
+    }
+    const gx_entries = entries[upstream_entries.len..];
+    try testing.expectEqualStrings("Settings", gx_entries[0].title);
+    try testing.expect(gx_entries[0].action.equal(.{ .gx = .settings }));
+    try testing.expectEqualStrings("Keyboard Shortcuts", gx_entries[1].title);
+    try testing.expect(gx_entries[1].action.equal(.{ .gx = .keybinds }));
+    try testing.expectEqualStrings("Main Menu", gx_entries[2].title);
+    try testing.expect(gx_entries[2].action.equal(.{ .gx = .main_menu }));
 }
 
 test "the embedded defaults set no colors" {

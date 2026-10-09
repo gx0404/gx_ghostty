@@ -216,6 +216,9 @@ pub const CommandPalette = extern struct {
             .undo,
             .reset_window_size,
             .toggle_window_float_on_top,
+            // fork(gx): GX-0014 begin: the GTK apprt does not perform GX actions
+            .gx,
+            // fork(gx): GX-0014 end
             => false,
 
             else => true,

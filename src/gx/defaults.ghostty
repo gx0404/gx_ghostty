@@ -44,3 +44,14 @@ keybind = alt+digit_7=unbind
 keybind = alt+7=unbind
 keybind = alt+digit_8=unbind
 keybind = alt+8=unbind
+
+# Ghostty GX actions (gx:<name>, src/gx/action.zig). App runtimes that do
+# not perform them (GTK) pass these keys on to the terminal (performable:).
+keybind = performable:ctrl+shift+m=gx:main_menu
+keybind = performable:ctrl+shift+slash=gx:keybinds
+
+# Appended to the upstream command palette entries. Titles and
+# descriptions are English msgids that the palettes translate.
+command-palette-entry = title:"Settings",description:"Open the Ghostty GX settings.",action:gx:settings
+command-palette-entry = title:"Keyboard Shortcuts",description:"Show all keyboard shortcuts.",action:gx:keybinds
+command-palette-entry = title:"Main Menu",description:"Open the main menu.",action:gx:main_menu

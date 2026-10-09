@@ -507,6 +507,8 @@ pub extern "user32" fn SetCapture(
 
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
 
+pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
+
 pub extern "user32" fn GetWindowLongW(
     hWnd: HWND,
     nIndex: i32,
@@ -867,6 +869,7 @@ pub extern "user32" fn SendMessageW(
 pub const MB_OKCANCEL: u32 = 0x00000001;
 pub const MB_YESNO: u32 = 0x00000004;
 pub const MB_ICONWARNING: u32 = 0x00000030;
+pub const MB_ICONINFORMATION: u32 = 0x00000040;
 pub const MB_DEFBUTTON2: u32 = 0x00000100;
 pub const IDOK: i32 = 1;
 pub const IDCANCEL: i32 = 2;
@@ -1164,6 +1167,7 @@ pub extern "user32" fn TrackMouseEvent(
 pub const MF_STRING: u32 = 0x00000000;
 pub const MF_SEPARATOR: u32 = 0x00000800;
 pub const MF_GRAYED: u32 = 0x00000001;
+pub const MF_POPUP: u32 = 0x00000010;
 
 pub const TPM_LEFTALIGN: u32 = 0x0000;
 pub const TPM_TOPALIGN: u32 = 0x0000;

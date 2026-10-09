@@ -747,6 +747,10 @@ fn actionCommands(action: Action.Key) []const Command {
         .last_tab,
         => comptime &.{},
 
+        // fork(gx): GX-0014 begin: GX entries come from the GX defaults (src/gx/defaults.ghostty)
+        .gx => comptime &.{},
+        // fork(gx): GX-0014 end
+
         // No commands for obvious reasons
         .ignore,
         .unbind,

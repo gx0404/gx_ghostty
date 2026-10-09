@@ -4,6 +4,7 @@
 //! herdr app mode, the colors of the GTK look, plus the Windows terminal
 //! support behind fork patches: win32-input-mode key records, the bundled
 //! ConPTY and OSC 7 working directories.
+pub const action = @import("action.zig");
 pub const app_mode = @import("app_mode.zig");
 pub const config_layers = @import("config_layers.zig");
 pub const config_types = @import("config_types.zig");
@@ -21,6 +22,7 @@ pub const theme = @import("theme.zig");
 pub const win32_input = @import("win32_input.zig");
 
 test {
+    _ = action;
     _ = app_mode;
     _ = config_layers;
     _ = config_types;
