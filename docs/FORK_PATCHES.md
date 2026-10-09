@@ -45,6 +45,12 @@
 | GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
+| GX-0011 | `src/apprt/gtk/App.zig` | `fork(gx): GX-0011` | active |
+| GX-0011 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0011` | active |
+| GX-0011 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0011` | active |
+| GX-0011 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0011` | active |
+| GX-0011 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0011` | active |
+| GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -373,3 +379,60 @@ python3 -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 `scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0010：标记必须存在于 `src/config/Config.zig`，四对 `begin`/`end` 成对且不嵌套。行为由 `src/gx/config_layers.zig` 的单测锁定，其中两条覆盖诊断重放（GX 分层与上游路径各一条）。
+
+## GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查
+
+- 文件：`src/apprt/gtk/class/application.zig`（导入 GX GTK 层并引入其单测的纯新增块；`Application.new` 中按 `language` 改写 `LANG` 的 5 行换成一行 `gx_gtk.language.startup`；`startup` 在 `startupActionMap` 之后注册 GX app action；`propConfig` 开头跟随 `language` 变化）、`src/apprt/gtk/class/window.zig`（导入；`init` 与 `propConfig` 末尾重建菜单与提示；`surfaceMenu` 的参数改为具名，在右键菜单弹出前重建它；`closureTitle` 的兜底标题）、`src/apprt/gtk/class/tab.zig`（标签页兜底标题）、`src/apprt/gtk/class/surface.zig`（`defaultTermioEnv` 给子进程还原 `LANGUAGE`）、`src/apprt/gtk/App.zig`（纯新增 `gxAction`）、`src/apprt/gtk/build/gresource.zig`（登记 `gx/menus` Blueprint）。逻辑都在新路径 `src/apprt/gtk/gx/*.zig` 与 `src/apprt/gtk/ui/1.5/gx/menus.blp`。
+- 标记：`fork(gx): GX-0011`；纯新增（导入、各钩子调用、`gxAction`、Blueprint 登记）都用 begin/end 包住，删掉这些块即得上游原文；改动的上游行（`Application.new` 的 `LANG` 改写、`surfaceMenu` 的参数名、两处兜底标题）上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：6 个文件，`git diff --numstat` 合计 +46/−8（含注释）。
+
+### 原因
+
+- 上游 `Application.new` 把 `language` 原样写进 `LANG`。GX 默认 `language = zh-CN` 不是 locale 名，GTK 初始化时 `setlocale(LC_ALL, "")` 失败，整个进程退回 `C` locale，界面变成英文。
+- glibc 在 `LC_MESSAGES` 为 `C`、`POSIX`、`C.UTF-8` 时忽略 `LANGUAGE`（WSL 默认 `LANG=C.UTF-8`；Ubuntu 24.04 的 glibc 2.39 实测），只设 `LANGUAGE` 不够。
+- 上游的 `language` 不能运行时生效：菜单、按钮提示由模板实例化时的 gettext 定稿；命令面板默认条目在 `Config.default` 时翻译（`src/config/Config.zig::RepeatableCommand.init`），而配置要先加载才知道语言，启动时就会按旧语言翻译。
+- GX 的菜单项（设置、快捷键速查、语言切换）、新建标签页下拉里的启动配置与 `gx:` 绑定动作的 GTK 处理都要挂在上游的应用与窗口类上。
+
+### 行为
+
+- 启动：`gx.i18n.resolve(language)` 决定界面语言（`zh-CN` 或 `en`，未设或不支持时 `zh-CN`；`GHOSTTY_GX_DEFAULTS=0` 也一样）。该语言的 UTF-8 locale（`zh_CN.UTF-8`、`en_US.UTF-8`）已安装时写进 `LANG`（保持上游语义），否则保留原值并告警；`LANGUAGE` 设为 `zh_CN` 或 `en`；先 `gtk_disable_setlocale` 再自行 `setlocale(LC_ALL, "")`，然后把 `LC_MESSAGES` 设为该语言的 locale，不可用时保留已有的非 C locale，或退到另一种受支持语言的 locale；都没有时只有 `gx.i18n` 的字符串跟随语言，日志提示生成 locale。随后 `bind_textdomain_codeset(bundle_id, "UTF-8")`、`gx.i18n.setCurrent`。默认命令面板条目的译文因此改变时（比较前后哈希），当场重新加载一次配置。
+- 运行时：`language` 变化（用户配置加 `reload_config`、`gui-settings.ghostty` 或语言菜单）后，`Application.propConfig` 更新 `LANGUAGE`（`setenv` 加 `global.syncEnviron`，是 GTK apprt 启动后唯一修改进程环境的地方）与 `LC_MESSAGES`，再调一次 `textdomain` 让 gettext 的缓存失效，并切换 `gx.i18n`；命令面板译文变化时在空闲回调里再硬重载一次配置。各窗口的 `propConfig` 随后重建菜单与按钮提示，并弹出 toast「界面语言已切换，重新打开窗口后全部文字才会更新。」：已存在的上游控件与 libadwaita 自带文字只在创建时取译文。之后新开的对话框、命令面板、窗口与标签页的兜底标题（`Ghostty GX`）都用新语言。
+- 菜单：`ui/1.5/gx/menus.blp` 复刻上游 `window.blp` 的 `main_menu`、`split_menu`、`tab_context_menu` 与 `surface.blp` 的 `context_menu_model`，标签是不带 `_()` 的英文 msgid，由 `gx.i18n` 翻译（不进上游 pot）；每次重建都生成新的 `GMenu` 设到按钮、`AdwTabView` 与终端右键菜单上（原地改菜单时 GTK 弹出菜单保留旧子菜单页，报 “duplicate child name in GtkStack”）。窗口只在语言、启动配置或 `app.gx-settings` 是否存在变化时重建。☰ 菜单新增一段：设置…（`app.gx-settings`；该 action 不存在时改为 `app.open-config::os-open`）、键盘快捷键（`app.gx-keybinds`）、语言子菜单（有状态的单选 action `app.gx-language`，把 `language` 写进 `gui-settings.ghostty`，先切换语言再硬重载配置）。
+- 新建标签页下拉：`gx.profiles.detectSystem` 探测到的启动配置加上 `gx-launch-profile`，名称随界面语言；条目激活 `app.new-tab`，参数为 `(0, ["-e", argv…])`（自定义命令行为 `--command=<值>`，均为 `class/Overrides.zig::parse` 的语法），新标签页照常继承工作目录；另有「用启动配置新建窗口」子菜单（`app.new-window-command`）。下拉按钮提示改为「启动配置与分屏」。
+- 快捷键速查：`Adw.Dialog`，按类别列出 `keybind` 根集合的绑定（含前导键序列与链式动作，跳过 `ignore` 与 catch-all），同一动作的多个按键并成一行；标题取命令面板默认条目或 GX 补充标题并经 `gx.i18n` 翻译，副标题是配置语法的动作，按键用 `GtkShortcutLabel`；顶部搜索框按标题、动作、类别与按键过滤。
+- `gx:` 绑定动作：`App.gxAction(target, action)` 按标签名分派 `settings`、`main_menu`、`keybinds`、`new_tab_profile`、`new_window_profile`；`action` 是 `anytype`，`src/gx/action.zig::Action` 合入前后都能编译，未知标签返回 false。`main_menu` 优先从可见的 ☰ 按钮弹出，否则借用活动终端的右键弹出菜单在其右上角显示，关闭后恢复原菜单。
+- 子进程：`Surface.defaultTermioEnv` 在上游恢复 `LANG` 之后把 `LANGUAGE` 恢复为启动时的值（原来没有就删除），终端里的 shell 保持系统语言。
+
+### 上游状态
+
+未回馈上游，只服务 Ghostty GX 的中英界面与菜单。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+- `Application.new` 里 `saved_language` 块被上游改动时，取上游版本，再把按 `language` 写 `LANG` 的部分换回 `gx_gtk.language.startup(alloc, &config)`，它必须在 `adw.init()` 之前、`config` 加载之后执行。
+- 上游改 `window.blp` 或 `surface.blp` 的菜单时，同步改 `ui/1.5/gx/menus.blp`（标签写不带 `_()` 的英文 msgid；`po/zh_CN.po` 没有的新 msgid 加进 `src/gx/i18n/gx.zh_CN.po` 后 `just i18n`）。上游改按钮类型或图标名（`open-menu-symbolic`、`view-grid-symbolic`）时同步 `src/apprt/gtk/gx/window.zig::Header.visit`。
+- `Window.surfaceMenu` 或 `Surface` 的 `menu` 信号被上游改名、改签名时，把 `syncSurfaceMenu` 挪到新的「右键菜单弹出前」位置；`defaultTermioEnv` 的 `LANG` 恢复逻辑变化时，`restoreChildEnv` 仍放在它之后。
+- 其余是单行钩子或纯新增块，按原位置放回即可。
+
+### 移除条件
+
+上游让 `language` 可以运行时切换且接受 `zh-CN` 这类语言标签，并为菜单与新建标签页下拉提供扩展点时，改用上游机制，删除对应钩子与标记，把登记行改为 `removed`。`gxAction` 与 `gx/menus` 的登记只服务 GX 功能，随 GX 菜单一起移除。
+
+### 验证
+
+`ghostty-test` 与 GTK app 在 Windows 上编译不过，以下命令经 WSL（Ubuntu 24.04，`just wsl setup --apt` 已生成 `zh_CN.UTF-8` 与 `en_US.UTF-8`）运行：
+
+```bash
+just wsl sync <worktree> --dirty --clone '~/src/gx_ghostty-GA'
+just wsl build --gtk --clone '~/src/gx_ghostty-GA'
+just wsl test --gtk --filter apprt --clone '~/src/gx_ghostty-GA'
+just wsl smoke --out <目录> --lang zh_CN --xdotool <脚本> --clone '~/src/gx_ghostty-GA'
+python -m unittest scripts.test_fork_patches -v
+```
+
+截图核对：默认配置下（含继承 `LANG=C.UTF-8`）界面与命令面板是中文、终端里 `LANG`/`LANGUAGE` 仍是原值；`--config` 写 `language = en` 时为英文；☰ 菜单有设置…、键盘快捷键与语言子菜单；新建标签页下拉列出启动配置，点击后新标签页运行该程序；语言菜单选 English 或改配置后 `reload_config`，菜单、提示与命令面板变成英文并出现 toast。
+
+### 测试锁定
+
+只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。行为由 `src/apprt/gtk/gx/*.zig` 的单测锁定（`just wsl test --gtk --filter apprt.gtk.gx`）：`LANGUAGE` 与 C locale 判定、子进程 `LANGUAGE` 还原、启动配置参数与查找、速查的分组与标题、`gx:` 动作分派与处理函数的编译。

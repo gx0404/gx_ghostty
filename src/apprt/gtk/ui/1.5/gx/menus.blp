@@ -1,0 +1,335 @@
+// Ghostty GX menus for the window (main menu, new tab dropdown and tab
+// context menu) and the terminal context menu, mirroring the upstream
+// window.blp and surface.blp menus plus the Ghostty GX entries.
+//
+// Labels are plain English msgids: src/apprt/gtk/gx/menus.zig translates
+// them with gx.i18n whenever the UI language changes, so they are not
+// marked for gettext. Sections and submenus with an id are filled in code.
+using Gtk 4.0;
+
+menu main_menu {
+  section {
+    item {
+      label: "Copy";
+      action: "win.copy";
+    }
+
+    item {
+      label: "Paste";
+      action: "win.paste";
+    }
+  }
+
+  section {
+    item {
+      label: "Change Window Title…";
+      action: "win.prompt-window-title";
+    }
+
+    item {
+      label: "New Window";
+      action: "win.new-window";
+    }
+
+    item {
+      label: "Close Window";
+      action: "win.close";
+    }
+  }
+
+  section {
+    item {
+      label: "Change Tab Title…";
+      action: "win.prompt-tab-title";
+    }
+
+    item {
+      label: "New Tab";
+      action: "win.new-tab";
+    }
+
+    item {
+      label: "Close Tab";
+      action: "win.close-tab";
+      target: "this";
+    }
+  }
+
+  section {
+    submenu {
+      label: "Split";
+
+      item {
+        label: "Change Title…";
+        action: "win.prompt-surface-title";
+      }
+
+      item {
+        label: "Split Up";
+        action: "win.split-up";
+      }
+
+      item {
+        label: "Split Down";
+        action: "win.split-down";
+      }
+
+      item {
+        label: "Split Left";
+        action: "win.split-left";
+      }
+
+      item {
+        label: "Split Right";
+        action: "win.split-right";
+      }
+    }
+  }
+
+  section {
+    item {
+      label: "Clear";
+      action: "win.clear";
+    }
+
+    item {
+      label: "Reset";
+      action: "win.reset";
+    }
+  }
+
+  section {
+    item {
+      label: "Command Palette";
+      action: "win.toggle-command-palette";
+    }
+
+    item {
+      label: "Terminal Inspector";
+      action: "win.toggle-inspector";
+    }
+
+    submenu {
+      label: "Config";
+
+      item {
+        label: "Open Configuration in OS Editor";
+        action: "app.open-config";
+        target: "os-open";
+      }
+
+      item {
+        label: "Open Configuration in New Window";
+        action: "app.open-config";
+        target: "new-window";
+      }
+
+      item {
+        label: "Reload Configuration";
+        action: "app.reload-config";
+      }
+    }
+  }
+
+  section {
+    item {
+      label: "Settings…";
+      action: "app.gx-settings";
+    }
+
+    item {
+      label: "Keyboard Shortcuts";
+      action: "app.gx-keybinds";
+    }
+
+    submenu gx_language_menu {
+      label: "Language";
+    }
+  }
+
+  section {
+    item {
+      label: "About Ghostty";
+      action: "win.about";
+    }
+
+    item {
+      label: "Quit";
+      action: "app.quit";
+    }
+  }
+}
+
+menu split_menu {
+  section gx_profiles_menu {
+    label: "New Tab";
+  }
+
+  section {
+    submenu gx_window_profiles_menu {
+      label: "New Window with Profile";
+    }
+  }
+
+  section {
+    item {
+      label: "Split Up";
+      action: "win.split-up";
+    }
+
+    item {
+      label: "Split Down";
+      action: "win.split-down";
+    }
+
+    item {
+      label: "Split Left";
+      action: "win.split-left";
+    }
+
+    item {
+      label: "Split Right";
+      action: "win.split-right";
+    }
+  }
+}
+
+menu tab_context_menu {
+  item {
+    label: "Change Tab Title…";
+    action: "win.prompt-context-tab-title";
+  }
+}
+
+menu context_menu {
+  section {
+    item {
+      label: "Copy";
+      action: "win.copy";
+    }
+
+    item {
+      label: "Paste";
+      action: "win.paste";
+    }
+
+    item {
+      label: "Notify on Next Command Finish";
+      action: "surface.notify-on-next-command-finish";
+    }
+  }
+
+  section {
+    item {
+      label: "Clear";
+      action: "win.clear";
+    }
+
+    item {
+      label: "Reset";
+      action: "win.reset";
+    }
+  }
+
+  section {
+    submenu {
+      label: "Split";
+
+      item {
+        label: "Change Title…";
+        action: "surface.prompt-title";
+      }
+
+      item {
+        label: "Split Up";
+        action: "split-tree.new-split";
+        target: "up";
+      }
+
+      item {
+        label: "Split Down";
+        action: "split-tree.new-split";
+        target: "down";
+      }
+
+      item {
+        label: "Split Left";
+        action: "split-tree.new-split";
+        target: "left";
+      }
+
+      item {
+        label: "Split Right";
+        action: "split-tree.new-split";
+        target: "right";
+      }
+
+      item {
+        label: "Close Split";
+        action: "split-tree.close-split";
+      }
+    }
+
+    submenu {
+      label: "Tab";
+
+      item {
+        label: "Change Tab Title…";
+        action: "tab.prompt-tab-title";
+      }
+
+      item {
+        label: "New Tab";
+        action: "win.new-tab";
+      }
+
+      item {
+        label: "Close Tab";
+        action: "tab.close";
+        target: "this";
+      }
+    }
+
+    submenu {
+      label: "Window";
+
+      item {
+        label: "Change Window Title…";
+        action: "win.prompt-window-title";
+      }
+
+      item {
+        label: "New Window";
+        action: "win.new-window";
+      }
+
+      item {
+        label: "Close Window";
+        action: "win.close";
+      }
+    }
+  }
+
+  section {
+    submenu {
+      label: "Config";
+
+      item {
+        label: "Open Configuration in OS Editor";
+        action: "app.open-config";
+        target: "os-open";
+      }
+
+      item {
+        label: "Open Configuration in New Window";
+        action: "app.open-config";
+        target: "new-window";
+      }
+
+      item {
+        label: "Reload Configuration";
+        action: "app.reload-config";
+      }
+    }
+  }
+}

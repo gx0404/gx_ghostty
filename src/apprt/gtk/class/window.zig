@@ -33,6 +33,9 @@ const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
+// fork(gx): GX-0011 begin: the Ghostty GX layer of the GTK apprt
+const gx_gtk = @import("../gx/main.zig");
+// fork(gx): GX-0011 end
 
 pub const Window = extern struct {
     const Self = @This();
@@ -371,6 +374,9 @@ pub const Window = extern struct {
         // We need to do this so that the title initializes properly,
         // I think because its a dynamic getter.
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+        // fork(gx): GX-0011 begin: Ghostty GX menus, launch profiles and tooltips in the UI language
+        gx_gtk.window.sync(self);
+        // fork(gx): GX-0011 end
     }
 
     /// Setup our action map.
@@ -1194,6 +1200,9 @@ pub const Window = extern struct {
         }
 
         self.syncAppearance();
+        // fork(gx): GX-0011 begin: rebuild the Ghostty GX menus and tooltips (language, launch profiles)
+        gx_gtk.window.sync(self);
+        // fork(gx): GX-0011 end
     }
 
     fn propIsActive(
@@ -1413,7 +1422,8 @@ pub const Window = extern struct {
     ) callconv(.c) ?[*:0]const u8 {
         if (title_override_) |v| return glib.ext.dupeZ(u8, std.mem.span(v));
         if (title_) |v| return glib.ext.dupeZ(u8, std.mem.span(v));
-        return glib.ext.dupeZ(u8, "Ghostty");
+        // fork(gx): GX-0011 the fallback title is the Ghostty GX name in the UI language
+        return glib.ext.dupeZ(u8, gx_gtk.language.fallbackTitle());
     }
 
     fn closureSubtitle(
@@ -1879,10 +1889,14 @@ pub const Window = extern struct {
     }
 
     fn surfaceMenu(
-        _: *Surface,
+        // fork(gx): GX-0011 the surface is needed to rebuild its context menu
+        surface: *Surface,
         self: *Self,
     ) callconv(.c) void {
         self.syncActions();
+        // fork(gx): GX-0011 begin: the context menu follows the UI language
+        gx_gtk.window.syncSurfaceMenu(surface);
+        // fork(gx): GX-0011 end
     }
 
     fn surfacePresentRequest(

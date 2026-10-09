@@ -350,3 +350,94 @@ msgstr "退出码：{code}"
 
 msgid "Command finished in {duration}"
 msgstr "命令已完成，用时 {duration}"
+
+#. GTK: language switching
+msgid "Language changed. Reopen the window to update all labels."
+msgstr "界面语言已切换，重新打开窗口后全部文字才会更新。"
+
+#. GTK: new tab dropdown (launch profiles and splits)
+msgid "Launch Profiles and Splits"
+msgstr "启动配置与分屏"
+
+msgid "New Tab with Profile"
+msgstr "用启动配置新建标签页"
+
+msgid "New Window with Profile"
+msgstr "用启动配置新建窗口"
+
+#. GTK: keyboard shortcuts cheat sheet
+msgid "Search keyboard shortcuts…"
+msgstr "搜索键盘快捷键…"
+
+msgid "Tabs"
+msgstr "标签页"
+
+msgid "Splits"
+msgstr "分屏"
+
+msgid "Windows"
+msgstr "窗口"
+
+msgid "Clipboard and Selection"
+msgstr "剪贴板与选区"
+
+msgid "Scrolling"
+msgstr "滚动"
+
+msgid "Search"
+msgstr "搜索"
+
+msgid "Terminal"
+msgstr "终端"
+
+msgid "Application"
+msgstr "应用"
+
+msgid "Other"
+msgstr "其他"
+
+#. Keybind actions without a command palette entry
+msgid "Previous Tab"
+msgstr "上一个标签页"
+
+msgid "Next Tab"
+msgstr "下一个标签页"
+
+msgid "Last Tab"
+msgstr "最后一个标签页"
+
+msgid "Go to Tab"
+msgstr "切换到标签页"
+
+msgid "Resize Split"
+msgstr "调整分屏大小"
+
+msgid "Adjust Selection"
+msgstr "调整选区"
+
+msgid "Jump to Prompt"
+msgstr "跳转到提示符"
+
+msgid "Scroll Lines"
+msgstr "按行滚动"
+
+msgid "Quick Terminal"
+msgstr "快捷终端"
+
+msgid "Write Screen to File"
+msgstr "将屏幕内容写入文件"
+
+msgid "Write Selection to File"
+msgstr "将选区写入文件"
+
+msgid "Write Scrollback to File"
+msgstr "将回滚内容写入文件"
+
+msgid "Send Text"
+msgstr "发送文本"
+
+msgid "Send Control Sequence"
+msgstr "发送控制序列"
+
+msgid "Send Escape Sequence"
+msgstr "发送转义序列"
