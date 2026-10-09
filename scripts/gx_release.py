@@ -11,9 +11,9 @@ Actions:
       (git ls-remote --tags origin) nor a release for it (gh release view) exists.
       Prints sha/version/tag/version_string/zig and appends them to $GITHUB_OUTPUT.
   verify --sha SHA --artifacts DIR [--macos] [--version-string VS]
-      Check the artifact directory against the exact expected asset set, the archive layouts
-      and the VERSION embedded in the source tarballs, then write manifest.json and SHA256SUMS
-      (or require existing ones to match byte for byte).
+      Check the artifact directory against the exact expected asset set, the archive layouts,
+      the VERSION embedded in the source tarballs and the Windows installer header, then write
+      manifest.json and SHA256SUMS (or require existing ones to match byte for byte).
   publish --sha SHA --artifacts DIR [--macos] [--version-string VS]
       Only inside the manual gx-release workflow of gx0404/gx_ghostty: re-verify, create a
       draft release (not a prerelease) targeting SHA whose notes are the CHANGELOG.md section
@@ -32,6 +32,7 @@ import os
 import posixpath
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -59,6 +60,13 @@ LINUX_LIBVT_TARGETS = ("x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-mu
 WASM_LIBVT_TARGET = "wasm32-freestanding"
 WINDOWS_LIBVT_TARGET = "x86_64-windows-msvc"
 LINUX_APP_TARGET = "x86_64-linux-debian13"
+WINDOWS_APP_TARGET = "x86_64-windows"
+WINDOWS_FONTS = (
+    "JetBrainsMonoNerdFont-Bold.ttf", "JetBrainsMonoNerdFont-BoldItalic.ttf", "JetBrainsMonoNerdFont-Italic.ttf",
+    "JetBrainsMonoNerdFont-Regular.ttf", "JetBrainsMonoNerdFont-SemiBold.ttf",
+    "JetBrainsMonoNerdFont-SemiBoldItalic.ttf", "NotoSansCJK-Bold.ttc", "NotoSansCJK-Regular.ttc",
+)
+INSTALLER_MIN_BYTES = 16 * 1024 * 1024
 GATES = (
     ("rules", ("scripts/resolve_agent_rules.py", "--check")),
     ("version", ("scripts/version.py", "--check")),
@@ -117,6 +125,7 @@ class Asset:
     required_basenames: tuple[str, ...] = ()
     version_file: bool = False
     max_bytes: int | None = None
+    min_bytes: int | None = None
 
 
 def is_hash(value: object, length: int = 64) -> bool:
@@ -419,6 +428,22 @@ def expected_assets(version_string: str, macos: bool = False) -> dict[str, Asset
         f"ghostty-gx-{vs}-{LINUX_APP_TARGET}",
         required=("usr/bin/ghostty",), required_prefixes=("usr/share/ghostty/",),
     ))
+    assets.append(Asset(
+        f"ghostty-gx-{vs}-{WINDOWS_APP_TARGET}.zip", "app", WINDOWS_APP_TARGET,
+        f"ghostty-gx-{vs}-{WINDOWS_APP_TARGET}",
+        required=(
+            "ghostty.exe", "conpty.dll", "OpenConsole.exe",
+            "mesa/opengl32.dll", "mesa/libgallium_wgl.dll", "mesa/dxil.dll",
+            "share/terminfo/ghostty.terminfo", "README.txt",
+            "licenses/Ghostty-MIT.txt", "licenses/THIRD-PARTY.txt",
+            *(f"fonts/{name}" for name in WINDOWS_FONTS),
+        ),
+        required_prefixes=("share/ghostty/",),
+    ))
+    assets.append(Asset(
+        f"ghostty-gx-{vs}-{WINDOWS_APP_TARGET}-setup.exe", "installer", WINDOWS_APP_TARGET, "",
+        min_bytes=INSTALLER_MIN_BYTES,
+    ))
     if macos:
         assets.append(Asset(
             f"libghostty-vt-{vs}-xcframework.zip", "libvt", "xcframework", "ghostty-vt.xcframework",
@@ -501,9 +526,26 @@ def zip_members(path: Path, asset: Asset) -> set[str]:
     return present
 
 
+def check_installer(path: Path, asset: Asset) -> None:
+    size = path.stat().st_size
+    if asset.min_bytes is not None and size < asset.min_bytes:
+        raise ReleaseError(f"{asset.name} is {size} bytes, below the {asset.min_bytes} byte minimum of a complete installer")
+    with path.open("rb") as stream:
+        header = stream.read(64)
+        if len(header) < 64 or header[:2] != b"MZ":
+            raise ReleaseError(f"{asset.name} is not a Windows executable (no MZ header)")
+        stream.seek(struct.unpack_from("<I", header, 60)[0])
+        signature = stream.read(4)
+    if signature != b"PE\0\0":
+        raise ReleaseError(f"{asset.name} has an MZ header but no PE signature")
+
+
 def check_asset(path: Path, asset: Asset, version_string: str) -> None:
     if asset.max_bytes is not None and path.stat().st_size > asset.max_bytes:
         raise ReleaseError(f"{asset.name} is {path.stat().st_size} bytes, above the {asset.max_bytes} byte limit")
+    if asset.kind == "installer":
+        check_installer(path, asset)
+        return
     version: bytes | None = None
     try:
         if asset.name.endswith(".tar.gz"):
@@ -675,6 +717,12 @@ def asset_description(name: str, asset: Asset | None) -> str:
         return f"libghostty-vt 预编译库（`{asset.target}`）"
     if asset.target == LINUX_APP_TARGET:
         return "Ghostty GTK app（实验性，debian:13 构建，解压后运行 `usr/bin/ghostty`）"
+    if asset.kind == "installer":
+        return ("Ghostty GX Windows 安装包（x64；默认按用户安装到 `%LOCALAPPDATA%\\Programs\\Ghostty GX`，"
+                "可改为所有用户；可选桌面图标与资源管理器右键菜单，按用户安装字体，卸载保留用户配置）")
+    if asset.target == WINDOWS_APP_TARGET:
+        return ("Ghostty GX Windows 便携版（x64；解压后运行 `ghostty.exe`，附 ConPTY、Mesa 软件渲染后备、"
+                "字体与许可证，见包内 `README.txt`）")
     return "Ghostty.app（universal，仅 ad-hoc 签名，未公证）"
 
 
@@ -695,8 +743,9 @@ def release_notes(info: ReleaseInfo, sha: str, macos: bool, files: list[Path], c
         "|---|---|",
         *rows,
         "",
-        "全部资产未签名：macOS 包只有 ad-hoc 签名、未经公证，Linux GTK 包是实验性构建。"
-        "下载后用 `sha256sum -c SHA256SUMS` 校验。",
+        "全部资产未签名：Windows 的 exe 与安装包没有 Authenticode 签名（SmartScreen 可能提示），"
+        "macOS 包只有 ad-hoc 签名、未经公证，Linux GTK 包是实验性构建。"
+        "下载后用 `sha256sum -c SHA256SUMS` 校验（Windows 可用 PowerShell 的 `Get-FileHash`）。",
         f"fork 变更见 [CHANGELOG.md](https://github.com/{REPOSITORY}/blob/{info.tag}/CHANGELOG.md)。",
         "",
     ])

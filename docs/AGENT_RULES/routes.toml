@@ -288,6 +288,8 @@ paths = [
   "flatpak/**",
   "images/**",
   "nix/package.nix",
+  "scripts/gx_windows_package.py",
+  "scripts/test_gx_package.py",
   "snap/**",
   "src/build/GhosttyDist.zig",
   "src/build/GhosttyResources.zig",

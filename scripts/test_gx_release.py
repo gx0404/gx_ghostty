@@ -51,7 +51,12 @@ CONTRACT_ASSETS = {
     f"libghostty-vt-{VS}-wasm32-freestanding.tar.gz",
     f"libghostty-vt-{VS}-x86_64-windows-msvc.zip",
     f"ghostty-gx-{VS}-x86_64-linux-debian13.tar.gz",
+    f"ghostty-gx-{VS}-x86_64-windows.zip",
+    f"ghostty-gx-{VS}-x86_64-windows-setup.exe",
 }
+WINDOWS_ZIP = f"ghostty-gx-{VS}-x86_64-windows.zip"
+WINDOWS_SETUP = f"ghostty-gx-{VS}-x86_64-windows-setup.exe"
+TEST_INSTALLER_MIN_BYTES = 4096
 CHANGELOG_BODY = "### Added\n\n- 条目"
 MACOS_ASSETS = {
     f"libghostty-vt-{VS}-xcframework.zip",
@@ -132,12 +137,23 @@ def write_zip(path: Path, root: str, files: dict[str, bytes], *, backslashes: bo
             archive.writestr(separator.join([root, *name.split("/")]), data)
 
 
+def fake_installer(size: int = 2 * TEST_INSTALLER_MIN_BYTES, signature: bytes = b"PE\0\0") -> bytes:
+    data = bytearray(size)
+    data[0:2] = b"MZ"
+    data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    data[0x80:0x84] = signature
+    return bytes(data)
+
+
 def write_artifacts(folder: Path, *, macos: bool = False, version_string: str = VS,
                     skip: tuple[str, ...] = ()) -> dict[str, release.Asset]:
     folder.mkdir(parents=True, exist_ok=True)
     assets = release.expected_assets(version_string, macos)
     for name, asset in assets.items():
         if name in skip:
+            continue
+        if asset.kind == "installer":
+            (folder / name).write_bytes(fake_installer())
             continue
         files, links = asset_members(asset, version_string)
         if name.endswith(".tar.gz"):
@@ -313,6 +329,9 @@ class EnvironmentCase(unittest.TestCase):
         sleep_patch = mock.patch.object(release.time, "sleep")
         sleep_patch.start()
         self.addCleanup(sleep_patch.stop)
+        minimum_patch = mock.patch.object(release, "INSTALLER_MIN_BYTES", TEST_INSTALLER_MIN_BYTES)
+        minimum_patch.start()
+        self.addCleanup(minimum_patch.stop)
 
 
 class ReleaseInfoTests(EnvironmentCase):
@@ -614,6 +633,10 @@ class VerifyTests(EnvironmentCase):
             (f"ghostty-gx-{VS}-x86_64-linux-debian13.tar.gz", "usr/bin/ghostty"),
             (f"ghostty-{VS}.tar.gz", "src/apprt/gtk/ghostty_resources.c"),
             (f"libghostty-vt-{VS}.tar.gz", "CMakeLists.txt"),
+            (WINDOWS_ZIP, "conpty.dll"),
+            (WINDOWS_ZIP, "mesa/libgallium_wgl.dll"),
+            (WINDOWS_ZIP, "fonts/NotoSansCJK-Regular.ttc"),
+            (WINDOWS_ZIP, "README.txt"),
         )
         for name, removed in cases:
             with self.subTest(name=name, removed=removed):
@@ -629,6 +652,34 @@ class VerifyTests(EnvironmentCase):
                 with self.assertRaisesRegex(release.ReleaseError, "lacks"):
                     self.verify()
                 write_artifacts(self.folder)
+
+    def test_windows_app_assets_follow_the_contract(self):
+        assets = release.expected_assets(VS)
+        portable = assets[WINDOWS_ZIP]
+        self.assertEqual((portable.kind, portable.target, portable.root), ("app", "x86_64-windows", WINDOWS_ZIP[:-4]))
+        for required in ("ghostty.exe", "conpty.dll", "OpenConsole.exe", "mesa/opengl32.dll", "mesa/libgallium_wgl.dll",
+                         "share/terminfo/ghostty.terminfo", "README.txt", *(f"fonts/{name}" for name in release.WINDOWS_FONTS)):
+            self.assertIn(required, portable.required)
+        self.assertIn("share/ghostty/", portable.required_prefixes)
+        setup = assets[WINDOWS_SETUP]
+        self.assertEqual((setup.kind, setup.target, setup.min_bytes), ("installer", "x86_64-windows", TEST_INSTALLER_MIN_BYTES))
+        with mock.patch.object(release, "INSTALLER_MIN_BYTES", 16 * 1024 * 1024):
+            self.assertEqual(release.expected_assets(VS)[WINDOWS_SETUP].min_bytes, 16 * 1024 * 1024)
+
+    def test_refuses_installers_without_pe_headers_or_payload(self):
+        path = self.folder / WINDOWS_SETUP
+        cases = (
+            ("text", b"#!/bin/sh\n" + b"x" * (2 * TEST_INSTALLER_MIN_BYTES), "no MZ header"),
+            ("no pe", fake_installer(signature=b"NE\0\0"), "no PE signature"),
+            ("truncated", fake_installer(size=TEST_INSTALLER_MIN_BYTES - 1), "below the 4096 byte minimum"),
+        )
+        for label, data, message in cases:
+            with self.subTest(case=label):
+                path.write_bytes(data)
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    self.verify()
+        path.write_bytes(fake_installer())
+        self.verify()
 
     def test_accepts_windows_zip_with_backslash_separators(self):
         name = f"libghostty-vt-{VS}-x86_64-windows-msvc.zip"
@@ -751,6 +802,8 @@ class PublishTests(EnvironmentCase):
         self.assertIn(SHA, notes)
         self.assertIn(VS, notes)
         self.assertIn("sha256sum -c SHA256SUMS", notes)
+        for name in (WINDOWS_ZIP, WINDOWS_SETUP):
+            self.assertRegex(notes, rf"\| `{name}` \| Ghostty GX Windows ")
         self.assertLess(notes.index(CHANGELOG_BODY), notes.index("| 资产 | 说明 |"))
 
     def test_a_draft_marked_as_prerelease_is_not_published(self):
@@ -876,7 +929,7 @@ class CommandLineTests(EnvironmentCase):
                                      "--version-string", VS)
         self.assertEqual(code, 0)
         self.assertIn(f"PASS: verified {len(CONTRACT_ASSETS) + 2} release files", out)
-        self.assertEqual(len(CONTRACT_ASSETS) + 2, 10)
+        self.assertEqual(len(CONTRACT_ASSETS) + 2, 12)
         code, _, err = self.run_main("verify", "--sha", SHA, "--artifacts", str(folder), "--root", str(self.root),
                                      "--macos")
         self.assertEqual(code, 1)

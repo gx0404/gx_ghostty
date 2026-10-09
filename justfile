@@ -16,9 +16,9 @@ python := if os_family() == "windows" { "python" } else { "python3" }
 default:
     @just --list
 
-# 安装钉版 Zig 0.16.0 与 graphify venv 到 .local/（幂等，已就绪则跳过）
-setup:
-    {{python}} scripts/setup_env.py
+# 安装钉版 Zig 0.16.0 与 graphify venv 到 .local/（幂等，已就绪则跳过）；--innosetup 另装钉版 Inno Setup 7.1.0（仅 Windows）
+setup *a:
+    {{python}} scripts/setup_env.py {{a}}
 
 # 只读环境体检：FOUND / MISSING / OPTIONAL，缺必需项退出 1
 doctor:
@@ -117,6 +117,10 @@ vt-wasm:
 # 打含 libghostty-vt 的源码包：zig build dist -Demit-lib-vt=true
 dist-vt:
     {{python}} scripts/zigw.py build dist -Demit-lib-vt=true
+
+# Windows 便携 zip 与安装包：ReleaseFast 构建 win32 app 到 zig-out，再打包到 zig-out/dist（参数透传，如 --skip-installer）
+package-windows *a:
+    {{python}} scripts/gx_windows_package.py --build {{a}}
 
 # zig fmt 格式化全仓（排除 .local/ 与构建产生的 zig-pkg/、zig-out/、.zig-cache/）
 fmt:
