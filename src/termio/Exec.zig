@@ -1293,6 +1293,15 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        // fork(gx): GX-0012 begin: Windows has no foreground process group; report the child process (the shell)
+        if (comptime builtin.os.tag == .windows and info == .foreground_pid) {
+            const process = self.process orelse return null;
+            return switch (process) {
+                .fork_exec => |cmd| @import("../gx/confirm.zig").windows.processId(cmd.pid orelse return null),
+                .flatpak => null,
+            };
+        }
+        // fork(gx): GX-0012 end
         const pty = &(self.pty orelse return null);
         return pty.getProcessInfo(info);
     }

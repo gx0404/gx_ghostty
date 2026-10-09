@@ -45,6 +45,8 @@
 | GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
+| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |
+| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -373,3 +375,50 @@ python3 -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 `scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0010：标记必须存在于 `src/config/Config.zig`，四对 `begin`/`end` 成对且不嵌套。行为由 `src/gx/config_layers.zig` 的单测锁定，其中两条覆盖诊断重放（GX 分层与上游路径各一条）。
+
+## GX-0012 关闭确认识别空闲进程
+
+- 文件：`src/Surface.zig`，四个纯新增块：`DerivedConfig` 的 `gx_idle_processes` 字段、`DerivedConfig.init` 里对应的赋值、`needsConfirmQuit` 的 `.true` 分支开头、紧随 `needsConfirmQuit` 之后的私有函数 `gxIdleAwayFromPrompt`；`src/termio/Exec.zig`，`Subprocess.getProcessInfo` 开头一个纯新增块。判定逻辑在新路径 `src/gx/confirm.zig`。
+- 标记：`fork(gx): GX-0012`，五块都以 `// fork(gx): GX-0012 begin: <说明>` 开头、`// fork(gx): GX-0012 end` 结尾。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，新增 37 行（含注释），不改、不删上游行。
+
+### 原因
+
+上游 `confirm-close-surface = true` 时，只要光标不在 shell 提示符上就要确认（`Terminal.cursorIsAtPrompt`，靠 OSC 133 shell 集成）。没有 shell 集成的 shell 光标永远「不在提示符」：Windows 的 `cmd.exe` 与 PowerShell、未注入集成的 shell、`shell-integration = none`，关闭每个空闲终端都会弹确认；win32 apprt 的标题栏关闭按钮因此干脆绕开了 `needsConfirmQuit`。Ghostty GX 要求终端里只剩空闲进程（shell、shell 启动器、控制台辅助进程，即 `gx-idle-processes` 或内置列表）时不确认，运行 `vim`、`herdr`、`sleep` 等程序时照常确认。所有 apprt（GTK、win32、macOS 嵌入库）都经上游的 `Surface.needsConfirmQuit` 判断，只能在这里接入；Windows 上 `WindowsPty.getProcessInfo` 一律返回 null，核心拿不到任何 pid，所以还要在 `Exec.Subprocess.getProcessInfo` 补 Windows 分支。
+
+### 行为
+
+- 只改变 `confirm-close-surface = true` 且光标不在提示符时的结论：`gxIdleAwayFromPrompt` 先按上游检查提示符（在提示符上直接交回上游，不列进程），否则把 `Surface.getProcessInfo(.foreground_pid)` 交给 `src/gx/confirm.zig::terminalNeedsConfirm`，列出该进程及其全部子孙进程；全部空闲（`src/gx/policy.zig::isIdle`，`gx-idle-processes` 为空时用内置列表）就不确认，否则仍按上游确认。`always`、`false`、只读模式与子进程已退出的语义不变。
+- 进程来源：Linux 是 pty 的前台进程组组长（`tcgetpgrp`），经 `/proc` 列出；Windows 没有前台进程组，`Subprocess.getProcessInfo(.foreground_pid)` 改为返回子进程（shell）的 pid（`GetProcessId`），经 Toolhelp32 列出。判定看整棵子树，比只看最深的子进程更保守：`gx-zsh.exe → zsh.exe → gitstatusd` 空闲；`pwsh.exe → vim.exe`、`zsh.exe → herdr.exe → zsh.exe`（herdr 里的 shell 不让 herdr 变成空闲）、shell 的后台任务都算忙。
+- 读不到进程（pid 未知、组长已退出、`/proc` 打不开，以及 Linux 与 Windows 以外的系统，如 macOS 嵌入库）时按忙处理，即保持上游结论。
+- 列进程在主线程同步进行，不持有 `renderer_state.mutex`；只在关闭与退出确认时调用，Linux 一次 `/proc` 扫描约数毫秒。
+- Windows 上 `Surface.getProcessInfo(.foreground_pid)` 原本恒为 null，现在返回 shell 的 pid。上游读它的只有 macOS 的 `ghostty_surface_foreground_pid`，Windows 不提供 C API，不受影响；win32 apprt 可直接用这个 pid 做进程判断（如 herdr 应用模式，见 `src/gx/app_mode.zig`）。
+
+### 上游状态
+
+未回馈上游。上游的提示符判断依赖 shell 集成，这个补丁只服务 Ghostty GX 的空闲进程策略；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+五块都是纯新增。上游改动 `needsConfirmQuit`（提示符判断、加锁方式）时，取上游版本，把 GX 块放回 `.true` 分支开头，并让 `gxIdleAwayFromPrompt` 的提示符检查与上游保持一致；`DerivedConfig` 的字段块放在 `key_remaps` 之后，赋值块放在 `.key_remaps = …` 之后、`.arena = arena` 之前。上游改动 `Subprocess.getProcessInfo` 或 `Subprocess.Process` 时，按同一语义放回 Windows 分支（Windows 上 `.foreground_pid` 返回子进程 pid）；上游自己在 Windows 上实现了 `foreground_pid` 时，删掉 `Exec.zig` 的块。
+
+### 移除条件
+
+上游提供等价的「终端只剩空闲进程时不确认」机制，或 Ghostty GX 不再需要该策略时移除：删除五块与标记、`src/gx/confirm.zig`，把两行登记改为 `removed`。只有 `Exec.zig` 的块可以在上游实现 Windows `foreground_pid` 后单独移除。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu   # Windows 分支能编译
+just wsl test --filter gx.confirm                                                # Linux 单测（-Dapp-runtime=none）
+just wsl build --gtk
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprofile --norc`，开两个标签页，空闲标签页 `Ctrl+Shift+W` 直接关闭，运行 `sleep 100` 的标签页弹出关闭确认；Debug 构建日志里有 `gx_confirm` 的判定行。Windows：`cmd.exe`、`pwsh.exe` 空闲时关闭标签页不确认，运行 `vim` 时确认。
+
+### 测试锁定
+
+只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定由 `src/gx/confirm.zig` 的单测锁定，经 GX-0010 的 `test` 块进入 `ghostty-test`。
+

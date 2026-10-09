@@ -349,6 +349,9 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    // fork(gx): GX-0012 begin: processes that count as idle for close confirmation
+    gx_idle_processes: configpkg.Config.RepeatableString,
+    // fork(gx): GX-0012 end
 
     const Link = struct {
         regex: oni.Regex,
@@ -430,6 +433,9 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            // fork(gx): GX-0012 begin: processes that count as idle for close confirmation
+            .gx_idle_processes = try config.@"gx-idle-processes".clone(alloc),
+            // fork(gx): GX-0012 end
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -973,12 +979,34 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
+            // fork(gx): GX-0012 begin: a terminal running only idle processes needs no confirmation
+            if (self.gxIdleAwayFromPrompt()) break :true false;
+            // fork(gx): GX-0012 end
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
     };
 }
+
+// fork(gx): GX-0012 begin: close confirmation from the processes in the terminal (src/gx/confirm.zig)
+/// True if the cursor is not at a shell prompt, where `needsConfirmQuit`
+/// asks, but only idle processes run in the terminal. The prompt is checked
+/// first so that shells with shell integration need no process listing.
+fn gxIdleAwayFromPrompt(self: *Surface) bool {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        if (self.io.terminal.cursorIsAtPrompt()) return false;
+    }
+    return !@import("gx/confirm.zig").terminalNeedsConfirm(
+        self.alloc,
+        global.io(),
+        self.getProcessInfo(.foreground_pid),
+        self.config.gx_idle_processes.list.items,
+    );
+}
+// fork(gx): GX-0012 end
 
 /// Called from the app thread to handle mailbox messages to our specific
 /// surface.
