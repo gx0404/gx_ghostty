@@ -25,14 +25,16 @@ const Dialogs = @import("ui/Dialogs.zig");
 const Keybinds = @import("ui/Keybinds.zig");
 const Settings = @import("ui/Settings.zig");
 const d2d = @import("ui/d2d.zig");
+const trigger = @import("ui/trigger.zig");
+const key_conflicts = @import("shortcut_conflicts.zig");
 const gx = @import("../../gx/main.zig");
 const i18n = gx.i18n;
 
 const input = @import("../../input.zig");
 
-/// A registered global system hotkey: the RegisterHotKey id and the binding
-/// action to perform when WM_HOTKEY delivers that id.
-const GlobalHotkey = struct { id: i32, action: input.Binding.Action };
+/// A registered global system hotkey: the RegisterHotKey id, its chord and
+/// the binding action to perform when WM_HOTKEY delivers that id.
+const GlobalHotkey = struct { id: i32, chord: key_conflicts.Chord, action: input.Binding.Action };
 
 const log = std.log.scoped(.win32);
 
@@ -45,6 +47,10 @@ const WM_APP_QUIT: u32 = w32.WM_APP + 0x62;
 
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
+
+/// Timer ID and delay of the keybinding conflict probe (`probeShortcuts`).
+const SHORTCUT_PROBE_TIMER_ID: usize = 4;
+const shortcut_probe_delay_ms: u32 = 1000;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
@@ -98,6 +104,14 @@ quick_terminal: ?*QuickTerminal = null,
 /// WM_HOTKEY back to the binding action to perform. Generalized from the old
 /// single quick-terminal hotkey to every keybind flagged `global:`.
 global_hotkeys: std.ArrayList(GlobalHotkey) = .empty,
+
+/// The keybinding chords another program or the input method takes, from
+/// the last `probeShortcuts`. The shortcut sheet marks them and menus
+/// leave their hints out.
+shortcut_conflicts: key_conflicts.Conflicts = .{},
+
+/// Whether this session showed the notice about taken default shortcuts.
+shortcut_notice_shown: bool = false,
 
 /// Cached ITaskbarList3 for taskbar-button progress (OSC 9;4), created lazily
 /// on first progress_report. Null until then / if COM creation fails.
@@ -273,6 +287,7 @@ pub fn run(self: *App) !void {
     try window.init(self, .{});
     try self.windows.append(alloc, window);
     _ = try window.addTab();
+    self.scheduleShortcutProbe();
 
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
@@ -433,6 +448,7 @@ pub fn terminate(self: *App) void {
     // Unregister all global hotkeys.
     for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
     self.global_hotkeys.deinit(self.core_app.alloc);
+    self.shortcut_conflicts.deinit(self.core_app.alloc);
 
     // Release the taskbar COM object if we created one.
     if (self.taskbar) |tb| {
@@ -1668,6 +1684,7 @@ fn updateConfig(self: *App, config: *const Config) void {
     for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
     self.global_hotkeys.clearRetainingCapacity();
     self.registerGlobalHotkey();
+    self.scheduleShortcutProbe();
 
     // Update quick terminal config.
     if (self.quick_terminal) |qt| {
@@ -1799,8 +1816,6 @@ fn isEditShortcutVk(vk: u16) bool {
     };
 }
 
-/// Register a system-wide hotkey for toggle_quick_terminal.
-/// Scans keybinds for entries with the `global` flag.
 /// Lazily create (and cache) the shell ITaskbarList3 used for taskbar-button
 /// progress. Returns null if COM or the taskbar object is unavailable.
 fn taskbarList(self: *App) ?*w32.ITaskbarList3 {
@@ -1829,6 +1844,8 @@ fn taskbarList(self: *App) ?*w32.ITaskbarList3 {
     return tb;
 }
 
+/// Register a system-wide hotkey (RegisterHotKey) for every keybind with
+/// the `global` flag.
 fn registerGlobalHotkey(self: *App) void {
     const alloc = self.core_app.alloc;
     var next_id: i32 = 1;
@@ -1841,38 +1858,17 @@ fn registerGlobalHotkey(self: *App) void {
         };
         if (!leaf.flags.global) continue;
 
-        const trigger = entry.key_ptr.*;
-
-        // Convert Ghostty mods to Win32 mods.
-        var mods: u32 = w32.MOD_NOREPEAT;
-        if (trigger.mods.ctrl) mods |= w32.MOD_CONTROL;
-        if (trigger.mods.alt) mods |= w32.MOD_ALT;
-        if (trigger.mods.shift) mods |= w32.MOD_SHIFT;
-        if (trigger.mods.super) mods |= w32.MOD_WIN;
-
-        // Convert Ghostty key to Win32 VK.
-        const vk: ?u32 = switch (trigger.key) {
-            .physical => |phys| keyToVk(phys),
-            .unicode => |cp| blk: {
-                // For ASCII characters, VK code = uppercase char.
-                if (cp >= 'a' and cp <= 'z') break :blk @as(u32, cp - 'a' + 'A');
-                if (cp >= '0' and cp <= '9') break :blk @as(u32, cp);
-                break :blk null;
-            },
-            else => null,
-        };
-
-        const vk_code = vk orelse {
+        const chord = key_conflicts.chordOf(entry.key_ptr.*) orelse {
             log.warn("unsupported key for global hotkey action={s}", .{@tagName(leaf.action)});
             continue;
         };
 
         const id = next_id;
-        if (w32.RegisterHotKey(null, id, mods, vk_code) == 0) {
+        if (w32.RegisterHotKey(null, id, chord.mods | w32.MOD_NOREPEAT, chord.vk) == 0) {
             log.warn("failed to register global hotkey (may be in use) action={s}", .{@tagName(leaf.action)});
             continue;
         }
-        self.global_hotkeys.append(alloc, .{ .id = id, .action = leaf.action }) catch {
+        self.global_hotkeys.append(alloc, .{ .id = id, .chord = chord, .action = leaf.action }) catch {
             _ = w32.UnregisterHotKey(null, id);
             continue;
         };
@@ -1881,75 +1877,74 @@ fn registerGlobalHotkey(self: *App) void {
     }
 }
 
-/// Map a Ghostty physical key to a Win32 virtual key code.
-fn keyToVk(key: @import("../../input/key.zig").Key) ?u32 {
-    return switch (key) {
-        .key_a => 0x41,
-        .key_b => 0x42,
-        .key_c => 0x43,
-        .key_d => 0x44,
-        .key_e => 0x45,
-        .key_f => 0x46,
-        .key_g => 0x47,
-        .key_h => 0x48,
-        .key_i => 0x49,
-        .key_j => 0x4A,
-        .key_k => 0x4B,
-        .key_l => 0x4C,
-        .key_m => 0x4D,
-        .key_n => 0x4E,
-        .key_o => 0x4F,
-        .key_p => 0x50,
-        .key_q => 0x51,
-        .key_r => 0x52,
-        .key_s => 0x53,
-        .key_t => 0x54,
-        .key_u => 0x55,
-        .key_v => 0x56,
-        .key_w => 0x57,
-        .key_x => 0x58,
-        .key_y => 0x59,
-        .key_z => 0x5A,
-        .digit_0 => 0x30,
-        .digit_1 => 0x31,
-        .digit_2 => 0x32,
-        .digit_3 => 0x33,
-        .digit_4 => 0x34,
-        .digit_5 => 0x35,
-        .digit_6 => 0x36,
-        .digit_7 => 0x37,
-        .digit_8 => 0x38,
-        .digit_9 => 0x39,
-        .backquote => w32.VK_OEM_3,
-        .minus => w32.VK_OEM_MINUS,
-        .equal => w32.VK_OEM_PLUS,
-        .bracket_left => w32.VK_OEM_4,
-        .bracket_right => w32.VK_OEM_6,
-        .backslash => w32.VK_OEM_5,
-        .semicolon => w32.VK_OEM_1,
-        .quote => w32.VK_OEM_7,
-        .comma => w32.VK_OEM_COMMA,
-        .period => w32.VK_OEM_PERIOD,
-        .slash => w32.VK_OEM_2,
-        .enter => w32.VK_RETURN,
-        .tab => w32.VK_TAB,
-        .space => w32.VK_SPACE,
-        .backspace => w32.VK_BACK,
-        .escape => w32.VK_ESCAPE,
-        .f1 => w32.VK_F1,
-        .f2 => w32.VK_F2,
-        .f3 => w32.VK_F3,
-        .f4 => w32.VK_F4,
-        .f5 => w32.VK_F5,
-        .f6 => w32.VK_F6,
-        .f7 => w32.VK_F7,
-        .f8 => w32.VK_F8,
-        .f9 => w32.VK_F9,
-        .f10 => w32.VK_F10,
-        .f11 => w32.VK_F11,
-        .f12 => w32.VK_F12,
-        else => null,
+/// Probe the keybindings for chords another program or the input method
+/// takes (`shortcut_conflicts`) a moment from now: after the first window
+/// is up, and once after a burst of configuration reloads.
+fn scheduleShortcutProbe(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    _ = w32.SetTimer(hwnd, SHORTCUT_PROBE_TIMER_ID, shortcut_probe_delay_ms, null);
+}
+
+/// Find the keybinding chords another program registered as a global
+/// hotkey or the input method preserves, log one warning per binding
+/// that uses one, and, once per session, show the notice when default
+/// bindings for copying, pasting, searching or splitting are among them.
+fn probeShortcuts(self: *App) void {
+    const alloc = self.core_app.alloc;
+    const set = &self.config.keybind.set;
+    var own: std.ArrayList(key_conflicts.Chord) = .empty;
+    defer own.deinit(alloc);
+    for (self.global_hotkeys.items) |hk| own.append(alloc, hk.chord) catch return;
+    var chords = key_conflicts.candidates(alloc, set, own.items) catch return;
+    defer chords.deinit(alloc);
+    const found = key_conflicts.probe(alloc, self.msg_hwnd, chords.items) catch |err| {
+        log.warn("cannot probe the keybindings for conflicts err={}", .{err});
+        return;
     };
+    self.shortcut_conflicts.deinit(alloc);
+    self.shortcut_conflicts = found;
+    log.info("probed {} keybinding chords, {} taken by other programs or the input method", .{
+        chords.items.len,
+        found.list.items.len,
+    });
+    key_conflicts.logConflicts(set, &self.shortcut_conflicts);
+    if (!self.shortcut_notice_shown) self.showShortcutNotice();
+}
+
+/// Show the notice about taken default copy, paste, search and split
+/// bindings in the foreground window, when there are any.
+fn showShortcutNotice(self: *App) void {
+    var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var defaults: configpkg.Keybinds = .{};
+    defaults.init(a) catch return;
+    const set = &self.config.keybind.set;
+    const affected = key_conflicts.noticeBindings(a, set, &defaults.set, &self.shortcut_conflicts) catch return;
+    if (affected.items.len == 0) return;
+    const window = self.targetWindow(.app) orelse return;
+
+    var keys_buf: [256]u8 = undefined;
+    var keys: std.Io.Writer = .fixed(&keys_buf);
+    for (affected.items, 0..) |item, i| {
+        var buf: [64]u8 = undefined;
+        if (i > 0) keys.writeAll(", ") catch break;
+        keys.writeAll(trigger.format(item.trigger, &buf)) catch break;
+    }
+    const hints: trigger.Hints = .{ .set = set, .blocked = &self.shortcut_conflicts };
+    var copy_buf: [64]u8 = undefined;
+    var paste_buf: [64]u8 = undefined;
+    var palette_buf: [64]u8 = undefined;
+    var sheet_buf: [64]u8 = undefined;
+    window.shortcut_notice.show(.{
+        .keys = keys.buffered(),
+        .copy = hints.text(.{ .copy_to_clipboard = .mixed }, &copy_buf) orelse "",
+        .paste = hints.text(.paste_from_clipboard, &paste_buf) orelse "",
+        .palette = hints.text(.toggle_command_palette, &palette_buf) orelse "",
+        .sheet = hints.text(.{ .gx = .keybinds }, &sheet_buf) orelse "",
+    });
+    self.shortcut_notice_shown = true;
+    log.info("shortcut conflict notice shown keys={s}", .{keys.buffered()});
 }
 
 // -----------------------------------------------------------------------
@@ -2494,6 +2489,12 @@ fn msgWndProc(
     // Timer ID 3: quick terminal animation tick.
     if (msg == w32.WM_TIMER and wparam == QuickTerminal.ANIM_TIMER_ID) {
         if (app.quick_terminal) |qt| qt.onAnimationTick();
+        return 0;
+    }
+
+    if (msg == w32.WM_TIMER and wparam == SHORTCUT_PROBE_TIMER_ID) {
+        _ = w32.KillTimer(hwnd, SHORTCUT_PROBE_TIMER_ID);
+        app.probeShortcuts();
         return 0;
     }
 

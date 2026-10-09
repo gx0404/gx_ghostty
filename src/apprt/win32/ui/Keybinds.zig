@@ -4,7 +4,9 @@
 //! row per action with its title in the UI language, the action and the
 //! keycaps of every key sequence that runs it (leader sequences as
 //! `A → B`). The search input filters by title (translated or English),
-//! action and keys.
+//! action and keys. A key sequence whose first chord another program or
+//! the input method takes (`App.shortcut_conflicts`) gets a warning
+//! marker, and its row says why Ghostty GX does not receive it.
 //!
 //! Opened by `gx:keybinds` and the main menu's Keyboard Shortcuts item
 //! through `show`. The sheet of a window lives in the command palette of
@@ -17,6 +19,7 @@ const input = @import("../../../input.zig");
 const gx = @import("../../../gx/main.zig");
 const i18n = gx.i18n;
 const Window = @import("../Window.zig");
+const shortcut_conflicts = @import("../shortcut_conflicts.zig");
 const w32 = @import("../win32.zig");
 const Palette = @import("Palette.zig");
 const Popup = @import("Popup.zig");
@@ -53,6 +56,9 @@ const layout = struct {
     const list_pad: f32 = 6;
     const header_height: f32 = 34;
     const row_height: f32 = 34;
+    /// A row with a second line that explains a key conflict.
+    const conflict_row_height: f32 = 54;
+    const marker_size: f32 = 16;
     const row_radius: f32 = 6;
     const sequence_gap: f32 = 12;
     const wheel_step: f32 = 3 * row_height;
@@ -98,7 +104,18 @@ const Entry = struct {
     action_text: []const u8 = "",
     /// The formatted key sequences, for the search.
     keys_text: []const u8 = "",
+    /// Why a key sequence of the entry never reaches Ghostty GX, if one
+    /// does not.
+    conflict: ?shortcut_conflicts.Reason = null,
 };
+
+/// The explanation of a conflict marker.
+fn conflictText(reason: shortcut_conflicts.Reason) [:0]const u8 {
+    return switch (reason) {
+        .hotkey => i18n.tr("Registered as a global hotkey by another program; Ghostty GX does not receive it"),
+        .ime => i18n.tr("Taken by the input method; Ghostty GX does not receive it while the input method is on"),
+    };
+}
 
 const Row = struct {
     kind: union(enum) {
@@ -242,8 +259,15 @@ pub const Sheet = struct {
         }
         const a = self.arena.?.allocator();
         self.entries = .empty;
-        const config = &self.palette().surface().app.config;
-        collect(a, &self.entries, &config.keybind.set, config.@"command-palette-entry".value.items) catch |err| {
+        const app = self.palette().surface().app;
+        const config = &app.config;
+        collect(
+            a,
+            &self.entries,
+            &config.keybind.set,
+            config.@"command-palette-entry".value.items,
+            &app.shortcut_conflicts,
+        ) catch |err| {
             log.warn("cannot list the keyboard shortcuts err={}", .{err});
         };
     }
@@ -276,7 +300,10 @@ pub const Sheet = struct {
             row.y = y;
             row.h = switch (row.kind) {
                 .header => layout.header_height,
-                .entry => layout.row_height,
+                .entry => |index| if (self.entries.items[index].conflict != null)
+                    layout.conflict_row_height
+                else
+                    layout.row_height,
             };
             y += row.h;
         }
@@ -522,18 +549,28 @@ pub const Sheet = struct {
         chips: trigger.ChipColors,
     ) void {
         if (self.hover == row) canvas.fillRoundedRect(rect.inset(0, 1), layout.row_radius, t.hover);
+        const blocked = &self.palette().surface().app.shortcut_conflicts;
 
         // Keycaps, right-aligned; sequences that do not fit are counted.
+        // A sequence that never reaches Ghostty GX has a warning marker.
         const title_w = @min(rect.w * 0.42, 340);
         const min_x = rect.x + 8 + title_w + 8;
         var right = rect.x + rect.w - 8;
         var shown: usize = 0;
         for (entry.sequences.items) |sequence| {
+            const marked = blocked.sequenceReason(sequence) != null;
+            const marker_w: f32 = if (marked) layout.marker_size + 4 else 0;
             const w = trigger.measureSequence(canvas, sequence);
             const x = right - w - (if (shown > 0) layout.sequence_gap else 0);
-            if (x < min_x) break;
-            right = x;
+            if (x - marker_w < min_x) break;
+            right = x - marker_w;
             _ = trigger.drawSequence(canvas, sequence, x, rect.y + rect.h / 2, chips);
+            if (marked) canvas.drawIcon(d2d.icons.warning, .{
+                .x = right,
+                .y = rect.y,
+                .w = layout.marker_size,
+                .h = rect.h,
+            }, layout.marker_size - 2, t.caution);
             shown += 1;
         }
         // Drawn right to left: the first sequence ends up rightmost.
@@ -549,15 +586,27 @@ pub const Sheet = struct {
             right -= w + 4;
         }
 
-        canvas.drawText(entry.title, .{ .x = rect.x + 8, .y = rect.y, .w = title_w, .h = rect.h }, .{
+        // A conflict row explains the marker on a second line.
+        const line_h = if (entry.conflict != null) layout.row_height - 6 else rect.h;
+        canvas.drawText(entry.title, .{ .x = rect.x + 8, .y = rect.y, .w = title_w, .h = line_h }, .{
             .size = style.font_size.body,
             .color = t.text,
         });
         const action_x = rect.x + 8 + title_w + 8;
-        canvas.drawText(entry.action_text, .{ .x = action_x, .y = rect.y, .w = @max(0, right - action_x - 12), .h = rect.h }, .{
+        canvas.drawText(entry.action_text, .{ .x = action_x, .y = rect.y, .w = @max(0, right - action_x - 12), .h = line_h }, .{
             .size = style.font_size.caption,
             .color = t.text_disabled,
         });
+        if (entry.conflict) |reason| {
+            const note: d2d.Rect = .{ .x = rect.x + 8, .y = rect.y + line_h - 4, .w = @max(0, right - rect.x - 20), .h = rect.h - line_h };
+            canvas.drawIcon(d2d.icons.warning, .{ .x = note.x, .y = note.y, .w = layout.marker_size, .h = note.h }, layout.marker_size - 2, t.caution);
+            canvas.drawText(conflictText(reason), .{
+                .x = note.x + layout.marker_size + 4,
+                .y = note.y,
+                .w = @max(0, note.w - layout.marker_size - 4),
+                .h = note.h,
+            }, .{ .size = style.font_size.caption, .color = t.caution });
+        }
     }
 };
 
@@ -575,13 +624,15 @@ fn entryMatches(query: *const fuzzy.Query, entry: Entry) bool {
 /// Collect one entry per action bound in `set` (leader sequences
 /// included; `ignore`, `unbind` and catch-all bindings left out), ordered
 /// by category and then by binding order. `commands` (the configured
-/// palette entries) name actions the built-in tables do not know. All
+/// palette entries) name actions the built-in tables do not know;
+/// `blocked` marks the key sequences that never reach Ghostty GX. All
 /// memory comes from `a`.
 fn collect(
     a: Allocator,
     entries: *std.ArrayList(Entry),
     set: *const input.Binding.Set,
     commands: []const input.Command,
+    blocked: *const shortcut_conflicts.Conflicts,
 ) !void {
     try walk(a, entries, set, &.{});
     std.mem.sort(Entry, entries.items, {}, struct {
@@ -598,6 +649,10 @@ fn collect(
             }
         }.lessThan);
         try describe(a, entry, commands);
+        for (entry.sequences.items) |sequence| {
+            entry.conflict = blocked.sequenceReason(sequence) orelse continue;
+            break;
+        }
     }
 }
 
@@ -847,3 +902,39 @@ const categories: std.StaticStringMap(Category) = .initComptime(.{
     .{ "undo", .terminal },
     .{ "redo", .terminal },
 });
+
+test "collect marks the entries whose keys never reach Ghostty GX" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var set: input.Binding.Set = .{};
+    try set.parseAndPut(a, "ctrl+shift+c=copy_to_clipboard");
+    try set.parseAndPut(a, "ctrl+insert=copy_to_clipboard");
+    try set.parseAndPut(a, "ctrl+shift+o=new_split:right");
+    try set.parseAndPut(a, "ctrl+shift+f>n=start_search");
+    try set.parseAndPut(a, "ctrl+shift+t=new_tab");
+
+    var blocked: shortcut_conflicts.Conflicts = .{};
+    for ([_]struct { []const u8, shortcut_conflicts.Reason }{
+        .{ "ctrl+shift+c", .hotkey },
+        .{ "ctrl+shift+o", .hotkey },
+        .{ "ctrl+shift+f", .ime },
+    }) |taken| {
+        const chord = shortcut_conflicts.chordOf(try Trigger.parse(taken[0])).?;
+        try blocked.list.append(a, .{ .chord = chord, .reason = taken[1] });
+    }
+
+    var entries: std.ArrayList(Entry) = .empty;
+    try collect(a, &entries, &set, &.{}, &blocked);
+    for (entries.items) |entry| {
+        const expected: ?shortcut_conflicts.Reason = switch (entry.actions[0]) {
+            .copy_to_clipboard, .new_split => .hotkey,
+            .start_search => .ime,
+            else => null,
+        };
+        try testing.expectEqual(expected, entry.conflict);
+    }
+    try testing.expectEqual(@as(usize, 4), entries.items.len);
+}

@@ -355,6 +355,12 @@ fn keybindSet(self: *Palette) *const input.Binding.Set {
     return &self.surface().app.config.keybind.set;
 }
 
+/// The shortcuts shown next to the items: none that another program or
+/// the input method takes.
+fn hints(self: *Palette) trigger.Hints {
+    return .{ .set = self.keybindSet(), .blocked = &self.surface().app.shortcut_conflicts };
+}
+
 fn addTabs(self: *Palette, a: Allocator) !void {
     const window = self.surface().parent_window;
     for (0..window.tab_count) |i| {
@@ -370,7 +376,7 @@ fn addTabs(self: *Palette, a: Allocator) !void {
             .title = try i18n.fill(a, i18n.tr("Switch to Tab: {title}"), .{ .title = label }),
             .title_en = try i18n.fill(a, "Switch to Tab: {title}", .{ .title = label }),
             .description = if (i == window.active_tab) i18n.tr("Current Tab") else "",
-            .shortcut = trigger.find(self.keybindSet(), .{ .goto_tab = i + 1 }),
+            .shortcut = self.hints().lookup(.{ .goto_tab = i + 1 }),
             .current = i == window.active_tab,
             .target = .{ .tab = window.tab_active_surface[i] },
         });
@@ -394,7 +400,7 @@ fn addProfiles(self: *Palette, a: Allocator) !void {
             .title_en = try i18n.fill(a, "New Tab: {name}", .{ .name = name_en }),
             .description = try commandText(a, profile.command),
             .key = try std.fmt.allocPrint(a, "gx:new_tab_profile:{s}", .{id}),
-            .shortcut = trigger.find(self.keybindSet(), .{ .gx = .{ .new_tab_profile = id } }),
+            .shortcut = self.hints().lookup(.{ .gx = .{ .new_tab_profile = id } }),
             .target = .{ .profile = id },
         });
     }
@@ -430,7 +436,7 @@ fn addCommands(self: *Palette, a: Allocator) !void {
             else
                 "",
             .key = try std.fmt.allocPrint(a, "{f}", .{action}),
-            .shortcut = trigger.find(self.keybindSet(), action),
+            .shortcut = self.hints().lookup(action),
             .target = .{ .command = action },
         });
     }

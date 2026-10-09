@@ -82,6 +82,12 @@ fn menuHost(app: *App) ?MenuPopup.Host {
     };
 }
 
+/// The shortcut hints of the menus: the configured keybindings without
+/// the keys another program or the input method takes.
+fn hintsOf(app: *App) trigger.Hints {
+    return .{ .set = &app.config.keybind.set, .blocked = &app.shortcut_conflicts };
+}
+
 const SurfaceItem = enum(usize) {
     copy = 1,
     paste,
@@ -116,6 +122,7 @@ pub fn showSurfaceContextMenu(surface: *Surface, screen_pt: w32.POINT) ?input.Bi
     buildSurfaceMenu(
         &menu,
         &app.config,
+        hintsOf(app),
         surface.core_surface.hasSelection(),
         pwd != null,
     ) catch |err| {
@@ -146,51 +153,51 @@ pub fn showSurfaceContextMenu(surface: *Surface, screen_pt: w32.POINT) ?input.Bi
 fn buildSurfaceMenu(
     menu: *MenuPopup.Builder,
     config: *const configpkg.Config,
+    hints: trigger.Hints,
     has_selection: bool,
     has_pwd: bool,
 ) Allocator.Error!void {
-    const set = &config.keybind.set;
     const root = &menu.root;
     var buf: [64]u8 = undefined;
     try menu.add(root, .{
         .id = @intFromEnum(SurfaceItem.copy),
         .label = i18n.tr("Copy"),
         .icon = icons.copy,
-        .shortcut = trigger.formatAction(set, .{ .copy_to_clipboard = .mixed }, &buf),
+        .shortcut = hints.text(.{ .copy_to_clipboard = .mixed }, &buf),
         .enabled = has_selection,
     });
     try menu.add(root, .{
         .id = @intFromEnum(SurfaceItem.paste),
         .label = i18n.tr("Paste"),
         .icon = icons.paste,
-        .shortcut = trigger.formatAction(set, .paste_from_clipboard, &buf),
+        .shortcut = hints.text(.paste_from_clipboard, &buf),
     });
     try menu.add(root, .{
         .id = @intFromEnum(SurfaceItem.select_all),
         .label = i18n.tr("Select All"),
         .icon = icons.select_all,
-        .shortcut = trigger.formatAction(set, .select_all, &buf),
+        .shortcut = hints.text(.select_all, &buf),
     });
     try menu.separator(root);
-    try addSplitMenu(menu, root, set, @intFromEnum(SurfaceItem.split_right));
+    try addSplitMenu(menu, root, hints, @intFromEnum(SurfaceItem.split_right));
     try menu.separator(root);
     try menu.add(root, .{
         .id = @intFromEnum(SurfaceItem.search),
         .label = i18n.tr("Search"),
         .icon = icons.search,
-        .shortcut = trigger.formatAction(set, .start_search, &buf),
+        .shortcut = hints.text(.start_search, &buf),
     });
     try menu.add(root, .{
         .id = @intFromEnum(SurfaceItem.clear_screen),
         .label = i18n.tr("Clear Screen"),
         .icon = icons.clear,
-        .shortcut = trigger.formatAction(set, .clear_screen, &buf),
+        .shortcut = hints.text(.clear_screen, &buf),
     });
     try menu.add(root, .{
         .id = @intFromEnum(SurfaceItem.reset),
         .label = i18n.tr("Reset Terminal"),
         .icon = icons.reset,
-        .shortcut = trigger.formatAction(set, .reset, &buf),
+        .shortcut = hints.text(.reset, &buf),
     });
     try menu.separator(root);
     if (has_pwd) try menu.add(root, .{
@@ -202,17 +209,16 @@ fn buildSurfaceMenu(
         .id = @intFromEnum(SurfaceItem.settings),
         .label = i18n.tr("Settings…"),
         .icon = icons.settings,
-        .shortcut = settingsShortcut(config, &buf),
+        .shortcut = settingsShortcut(config, hints, &buf),
     });
 }
 
 /// The shortcut of the settings: `gx:settings`, else `open_config` while
 /// it opens the settings (`gx-open-config-ui = settings`).
-fn settingsShortcut(config: *const configpkg.Config, buf: []u8) ?[]const u8 {
-    const set = &config.keybind.set;
-    if (trigger.formatAction(set, .{ .gx = .settings }, buf)) |text| return text;
+fn settingsShortcut(config: *const configpkg.Config, hints: trigger.Hints, buf: []u8) ?[]const u8 {
+    if (hints.text(.{ .gx = .settings }, buf)) |text| return text;
     if (config.@"gx-open-config-ui" != .settings) return null;
-    return trigger.formatAction(set, .{ .open_config = .os_open }, buf);
+    return hints.text(.{ .open_config = .os_open }, buf);
 }
 
 /// The terminal's working directory as reported by its shell (OSC 7),
@@ -247,7 +253,7 @@ fn openFolder(alloc: Allocator, owner: w32.HWND, path: []const u8) void {
 fn addSplitMenu(
     menu: *MenuPopup.Builder,
     list: *MenuPopup.List,
-    set: *const input.Binding.Set,
+    hints: trigger.Hints,
     first: usize,
 ) Allocator.Error!void {
     const split = try menu.submenu(list, .{ .label = i18n.tr("Split"), .icon = icons.split });
@@ -265,7 +271,7 @@ fn addSplitMenu(
             .id = first + i,
             .label = label,
             .icon = glyph,
-            .shortcut = trigger.formatAction(set, .{ .new_split = direction }, &buf),
+            .shortcut = hints.text(.{ .new_split = direction }, &buf),
         });
     }
 }
@@ -293,7 +299,7 @@ pub fn showTabContextMenu(window: *Window, screen_pt: w32.POINT, tab: ?usize) ?T
 
     var menu: MenuPopup.Builder = .init(app.core_app.alloc);
     defer menu.deinit();
-    buildTabMenu(&menu, &app.config.keybind.set, tab, window.tab_count) catch |err| {
+    buildTabMenu(&menu, hintsOf(app), tab, window.tab_count) catch |err| {
         log.err("failed to build the tab menu err={}", .{err});
         return null;
     };
@@ -307,7 +313,7 @@ pub fn showTabContextMenu(window: *Window, screen_pt: w32.POINT, tab: ?usize) ?T
 
 fn buildTabMenu(
     menu: *MenuPopup.Builder,
-    set: *const input.Binding.Set,
+    hints: trigger.Hints,
     tab: ?usize,
     tab_count: usize,
 ) Allocator.Error!void {
@@ -318,25 +324,25 @@ fn buildTabMenu(
             .id = @intFromEnum(TabCommand.rename),
             .label = i18n.tr("Rename Tab"),
             .icon = icons.rename,
-            .shortcut = trigger.formatAction(set, .prompt_tab_title, &buf),
+            .shortcut = hints.text(.prompt_tab_title, &buf),
         });
         try menu.separator(root);
         try menu.add(root, .{
             .id = @intFromEnum(TabCommand.close),
             .label = i18n.tr("Close Tab"),
             .icon = icons.close,
-            .shortcut = trigger.formatAction(set, .{ .close_tab = .this }, &buf),
+            .shortcut = hints.text(.{ .close_tab = .this }, &buf),
         });
         try menu.add(root, .{
             .id = @intFromEnum(TabCommand.close_others),
             .label = i18n.tr("Close Other Tabs"),
-            .shortcut = trigger.formatAction(set, .{ .close_tab = .other }, &buf),
+            .shortcut = hints.text(.{ .close_tab = .other }, &buf),
             .enabled = tab_count > 1,
         });
         try menu.add(root, .{
             .id = @intFromEnum(TabCommand.close_right),
             .label = i18n.tr("Close Tabs to the Right"),
-            .shortcut = trigger.formatAction(set, .{ .close_tab = .right }, &buf),
+            .shortcut = hints.text(.{ .close_tab = .right }, &buf),
             .enabled = index + 1 < tab_count,
         });
         try menu.separator(root);
@@ -344,7 +350,7 @@ fn buildTabMenu(
             .id = @intFromEnum(TabCommand.move_to_new_window),
             .label = i18n.tr("Move Tab to New Window"),
             .icon = icons.move_to_window,
-            .shortcut = trigger.formatAction(set, .move_tab_to_new_window, &buf),
+            .shortcut = hints.text(.move_tab_to_new_window, &buf),
             .enabled = tab_count > 1,
         });
         try menu.add(root, .{
@@ -358,7 +364,7 @@ fn buildTabMenu(
         .id = @intFromEnum(TabCommand.new_tab),
         .label = i18n.tr("New Tab"),
         .icon = icons.new_tab,
-        .shortcut = trigger.formatAction(set, .new_tab, &buf),
+        .shortcut = hints.text(.new_tab, &buf),
     });
 }
 
@@ -488,7 +494,7 @@ pub fn showMainMenu(window: *Window, anchor: ?w32.POINT) void {
 }
 
 fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) Allocator.Error!void {
-    const set = &app.config.keybind.set;
+    const hints = hintsOf(app);
     const root = &menu.root;
     var buf: [64]u8 = undefined;
 
@@ -496,36 +502,36 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
         .id = @intFromEnum(MainItem.new_tab),
         .label = i18n.tr("New Tab"),
         .icon = icons.new_tab,
-        .shortcut = trigger.formatAction(set, .new_tab, &buf),
+        .shortcut = hints.text(.new_tab, &buf),
     });
     try menu.add(root, .{
         .id = @intFromEnum(MainItem.new_window),
         .label = i18n.tr("New Window"),
         .icon = icons.new_window,
-        .shortcut = trigger.formatAction(set, .new_window, &buf),
+        .shortcut = hints.text(.new_window, &buf),
     });
     const profile_menu = try menu.submenu(root, .{ .label = i18n.tr("New Tab with Profile"), .icon = icons.profile });
-    try launch.append(menu, profile_menu, set, .tab);
-    try addSplitMenu(menu, root, set, @intFromEnum(MainItem.split_right));
+    try launch.append(menu, profile_menu, hints, .tab);
+    try addSplitMenu(menu, root, hints, @intFromEnum(MainItem.split_right));
     try menu.separator(root);
 
     try menu.add(root, .{
         .id = @intFromEnum(MainItem.command_palette),
         .label = i18n.tr("Command Palette"),
         .icon = icons.command_palette,
-        .shortcut = trigger.formatAction(set, .toggle_command_palette, &buf),
+        .shortcut = hints.text(.toggle_command_palette, &buf),
     });
     try menu.add(root, .{
         .id = @intFromEnum(MainItem.settings),
         .label = i18n.tr("Settings…"),
         .icon = icons.settings,
-        .shortcut = settingsShortcut(&app.config, &buf),
+        .shortcut = settingsShortcut(&app.config, hints, &buf),
     });
     try menu.add(root, .{
         .id = @intFromEnum(MainItem.keybinds),
         .label = i18n.tr("Keyboard Shortcuts"),
         .icon = icons.keyboard,
-        .shortcut = trigger.formatAction(set, .{ .gx = .keybinds }, &buf),
+        .shortcut = hints.text(.{ .gx = .keybinds }, &buf),
     });
     const languages = try menu.submenu(root, .{ .label = i18n.tr("Language"), .icon = icons.language });
     for (std.enums.values(i18n.Language)) |lang| {
@@ -541,7 +547,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
         .id = @intFromEnum(MainItem.reload_config),
         .label = i18n.tr("Reload Configuration"),
         .icon = icons.reload,
-        .shortcut = trigger.formatAction(set, .reload_config, &buf),
+        .shortcut = hints.text(.reload_config, &buf),
     });
     // `open_config` opens the settings with `gx-open-config-ui = settings`.
     try menu.add(root, .{
@@ -551,7 +557,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
         .shortcut = if (app.config.@"gx-open-config-ui" == .settings)
             null
         else
-            trigger.formatAction(set, .{ .open_config = .os_open }, &buf),
+            hints.text(.{ .open_config = .os_open }, &buf),
     });
     try menu.separator(root);
     try menu.add(root, .{
@@ -563,7 +569,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
         .id = @intFromEnum(MainItem.quit),
         .label = i18n.tr("Quit"),
         .icon = icons.quit,
-        .shortcut = trigger.formatAction(set, .quit, &buf),
+        .shortcut = hints.text(.quit, &buf),
     });
 }
 
@@ -617,7 +623,7 @@ pub fn showProfileMenu(window: *Window, anchor: w32.POINT) void {
     defer launch.deinit();
     var menu: MenuPopup.Builder = .init(app.core_app.alloc);
     defer menu.deinit();
-    buildProfileMenu(&menu, &app.config.keybind.set, &launch) catch |err| {
+    buildProfileMenu(&menu, hintsOf(app), &launch) catch |err| {
         log.err("failed to build the profile menu err={}", .{err});
         return;
     };
@@ -636,15 +642,15 @@ pub fn showProfileMenu(window: *Window, anchor: w32.POINT) void {
 
 fn buildProfileMenu(
     menu: *MenuPopup.Builder,
-    set: *const input.Binding.Set,
+    hints: trigger.Hints,
     launch: *ProfileItems,
 ) Allocator.Error!void {
     const root = &menu.root;
     try menu.header(root, i18n.tr("New Tab"));
-    try launch.append(menu, root, set, .tab);
+    try launch.append(menu, root, hints, .tab);
     try menu.separator(root);
     const window_menu = try menu.submenu(root, .{ .label = i18n.tr("New Window with Profile"), .icon = icons.new_window });
-    try launch.append(menu, window_menu, set, .window);
+    try launch.append(menu, window_menu, hints, .window);
     try menu.separator(root);
     try menu.add(root, .{
         .id = default_shell_id,
@@ -698,7 +704,7 @@ const ProfileItems = struct {
         self: *ProfileItems,
         menu: *MenuPopup.Builder,
         list: *MenuPopup.List,
-        set: *const input.Binding.Set,
+        hints: trigger.Hints,
         where: App.ProfileTarget,
     ) Allocator.Error!void {
         if (self.all().len == 0) {
@@ -716,7 +722,7 @@ const ProfileItems = struct {
                 .window => .{ .new_window_profile = profile.id },
             } };
             var buf: [64]u8 = undefined;
-            const shortcut = trigger.formatAction(set, action, &buf);
+            const shortcut = hints.text(action, &buf);
             try menu.add(list, .{
                 .id = first + i,
                 .label = profiles.displayName(alloc, profile) catch profile.name,

@@ -662,3 +662,25 @@ msgstr "设置默认 Shell…"
 
 msgid "Default"
 msgstr "默认"
+
+#. Windows apprt: keyboard shortcuts other programs or the input method take
+msgid "Registered as a global hotkey by another program; Ghostty GX does not receive it"
+msgstr "被其他程序注册为全局快捷键，Ghostty GX 收不到"
+
+msgid "Taken by the input method; Ghostty GX does not receive it while the input method is on"
+msgstr "被输入法占用，输入法开启时 Ghostty GX 收不到"
+
+msgid "Some keyboard shortcuts do not reach Ghostty GX"
+msgstr "部分快捷键被其他程序或输入法占用"
+
+msgid "{keys}: another program or the input method takes these keys first."
+msgstr "{keys}：被其他程序或输入法抢先占用，Ghostty GX 收不到。"
+
+msgid "Copy with {copy} and paste with {paste}, or use the right-click menu or the command palette ({palette})."
+msgstr "可改用 {copy} 复制、{paste} 粘贴，或使用右键菜单与命令面板（{palette}）。"
+
+msgid "Use the right-click menu or the command palette instead."
+msgstr "可改用右键菜单或命令面板。"
+
+msgid "Keyboard Shortcuts ({keys})"
+msgstr "查看快捷键（{keys}）"

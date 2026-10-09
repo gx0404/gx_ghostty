@@ -11,6 +11,14 @@
 
 ## 0.0.2(TBD)
 
+### Added
+
+- Windows 应用检测被占用的快捷键：第一个窗口显示约 1 秒后与每次重载配置后，检查每个带修饰键的绑定是否被其他程序注册为全局快捷键（例如 bilibili 客户端的「老板键」Ctrl+Shift+C），以及是否是当前输入法经 TSF 保留的按键（微软拼音简繁切换的 Ctrl+Shift+F 不是保留键，检测不到）。每个受影响的绑定在日志里记一条警告；快捷键速查表（Ctrl+Shift+/）在这些按键前加警告标记并说明原因；右键菜单、主菜单与命令面板改为提示同一动作的其他可用按键，没有就不提示；默认的复制、粘贴、查找或分屏键受影响时，每次运行在窗口底部提示一次（约 20 秒后消失），列出被占用的键与替代方式（Ctrl+Insert / Shift+Insert、右键菜单、命令面板），并可直接打开速查表。
+
+### Fixed
+
+- Windows 上 Shift+Insert 粘贴剪贴板。Windows 没有选择剪贴板，上游默认的 `shift+insert=paste_from_selection` 按下后什么也不做；GX 的 Windows 默认值改为 `paste_from_clipboard`，与 Ctrl+Insert 复制配对，Ctrl+Shift+C / Ctrl+Shift+V 被其他程序占用时仍可复制粘贴。
+
 ## 0.0.1(2026-10-10)
 
 Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应用，两端共用 GX 核心与默认配置，并有 fork 自己的发布链与开发框架。括号里的 GX-NNNN 是 `docs/FORK_PATCHES.md` 登记的上游源码补丁。

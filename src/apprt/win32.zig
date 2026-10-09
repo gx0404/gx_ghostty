@@ -10,6 +10,8 @@ const internal_os = @import("../os/main.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 test {
+    _ = @import("win32/shortcut_conflicts.zig");
+    _ = @import("win32/ui/Keybinds.zig");
     _ = @import("win32/ui/trigger.zig");
     _ = @import("win32/ui/fuzzy.zig");
     _ = @import("win32/ui/MenuPopup.zig");

@@ -1195,4 +1195,5 @@ pub const icons = struct {
     pub const close: u21 = 0xE8BB;
     pub const more: u21 = 0xE712;
     pub const shield: u21 = 0xEA18;
+    pub const warning: u21 = 0xE7BA;
 };

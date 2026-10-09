@@ -1,10 +1,12 @@
 //! Keybinding triggers for the command palette, menus and the keyboard
 //! shortcut sheet: text ("Ctrl+Shift+T") for menu hints, keycap chips for
 //! the custom-drawn popups (`Keycaps`, `drawSequence`, key sequences shown
-//! as `A → B`), the trigger that runs an action (`find`) and the action a
-//! key press is bound to (`actionForKey`).
+//! as `A → B`), the trigger that runs an action (`find`), the hint that
+//! still works when another program takes a key (`Hints`) and the action
+//! a key press is bound to (`actionForKey`).
 const std = @import("std");
 const input = @import("../../../input.zig");
+const shortcut_conflicts = @import("../shortcut_conflicts.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
 
@@ -42,22 +44,47 @@ pub fn find(set: *const Binding.Set, action: Binding.Action) ?Trigger {
     return null;
 }
 
-/// The formatted trigger of `action` in `set`, or null: the one `find`
-/// returns, or when that key has no display name (such as the `paste` media
-/// key) another binding of the action.
-pub fn formatAction(set: *const Binding.Set, action: Binding.Action, buf: []u8) ?[]const u8 {
-    if (find(set, action)) |trigger| {
-        if (displayable(trigger)) return format(trigger, buf);
+/// The shortcut hints of the menus and the command palette: the triggers
+/// of `set`, leaving out those whose chord never reaches Ghostty GX
+/// (`blocked`, see `shortcut_conflicts`).
+pub const Hints = struct {
+    set: *const Binding.Set,
+    blocked: ?*const shortcut_conflicts.Conflicts = null,
+
+    /// The trigger shown for `action`: the one `find` returns, or when
+    /// that one is blocked another binding of the action. Null when none
+    /// works.
+    pub fn lookup(self: Hints, action: Binding.Action) ?Trigger {
+        return self.pick(action, false);
     }
-    var it = set.bindings.iterator();
-    while (it.next()) |entry| switch (entry.value_ptr.*) {
-        .leaf => |leaf| if (leaf.action.equal(action) and displayable(entry.key_ptr.*)) {
-            return format(entry.key_ptr.*, buf);
-        },
-        .leader, .leaf_chained => {},
-    };
-    return null;
-}
+
+    /// The formatted trigger of `action`, or null: like `lookup`, but
+    /// also skipping keys without a display name (such as the `paste`
+    /// media key).
+    pub fn text(self: Hints, action: Binding.Action, buf: []u8) ?[]const u8 {
+        return format(self.pick(action, true) orelse return null, buf);
+    }
+
+    fn pick(self: Hints, action: Binding.Action, named: bool) ?Trigger {
+        if (find(self.set, action)) |trigger| {
+            if (self.usable(trigger, named)) return trigger;
+        }
+        var it = self.set.bindings.iterator();
+        while (it.next()) |entry| switch (entry.value_ptr.*) {
+            .leaf => |leaf| if (leaf.action.equal(action) and self.usable(entry.key_ptr.*, named)) {
+                return entry.key_ptr.*;
+            },
+            .leader, .leaf_chained => {},
+        };
+        return null;
+    }
+
+    fn usable(self: Hints, trigger: Trigger, named: bool) bool {
+        if (named and !displayable(trigger)) return false;
+        const blocked = self.blocked orelse return true;
+        return blocked.reason(trigger) == null;
+    }
+};
 
 /// Whether `format` writes a display name for the key of `trigger`, not
 /// just a tag name (`keyName`) or nothing.
@@ -416,7 +443,7 @@ test "format modifiers and keys" {
     }, &buf));
 }
 
-test "formatAction skips keys without a display name" {
+test "Hints.text skips keys without a display name" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var set: input.Binding.Set = .{};
@@ -425,9 +452,39 @@ test "formatAction skips keys without a display name" {
     try set.parseAndPut(alloc, "ctrl+shift+v=paste_from_clipboard");
     try set.parseAndPut(alloc, "copy=copy_to_clipboard");
 
+    const hints: Hints = .{ .set = &set };
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("Ctrl+Shift+V", formatAction(&set, .paste_from_clipboard, &buf).?);
-    try testing.expectEqual(@as(?[]const u8, null), formatAction(&set, .{ .copy_to_clipboard = .mixed }, &buf));
+    try testing.expectEqualStrings("Ctrl+Shift+V", hints.text(.paste_from_clipboard, &buf).?);
+    try testing.expectEqual(@as(?[]const u8, null), hints.text(.{ .copy_to_clipboard = .mixed }, &buf));
+}
+
+test "Hints leave out blocked triggers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: input.Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "ctrl+insert=copy_to_clipboard");
+    try set.parseAndPut(alloc, "performable:ctrl+shift+c=copy_to_clipboard");
+    try set.parseAndPut(alloc, "ctrl+shift+o=new_split:right");
+    try set.parseAndPut(alloc, "performable:ctrl+shift+f=start_search");
+
+    var blocked: shortcut_conflicts.Conflicts = .{};
+    defer blocked.deinit(alloc);
+    for ([_][]const u8{ "ctrl+shift+o", "ctrl+shift+f", "ctrl+insert" }) |taken| {
+        const chord = shortcut_conflicts.chordOf(try Trigger.parse(taken)).?;
+        try blocked.list.append(alloc, .{ .chord = chord, .reason = .hotkey });
+    }
+
+    const hints: Hints = .{ .set = &set, .blocked = &blocked };
+    var buf: [64]u8 = undefined;
+    // The reverse mapping's Ctrl+Insert is blocked: the other binding.
+    try testing.expectEqualStrings("Ctrl+Shift+C", hints.text(.{ .copy_to_clipboard = .mixed }, &buf).?);
+    try testing.expectEqual(@as(?[]const u8, null), hints.text(.{ .new_split = .right }, &buf));
+    try testing.expectEqual(@as(?Trigger, null), hints.lookup(.start_search));
+
+    const open: Hints = .{ .set = &set };
+    try testing.expectEqualStrings("Ctrl+Shift+O", open.text(.{ .new_split = .right }, &buf).?);
+    try testing.expect(open.lookup(.start_search) != null);
 }
 
 test "format cuts off at the buffer end" {
