@@ -10,7 +10,7 @@ on:
         required: true
         default: gx_ghostty
       publish:
-        description: 全部校验通过后发布为 prerelease（关闭时只构建与验证，产物从 Artifacts 下载）
+        description: 全部校验通过后发布为正式 Release（关闭时只构建与验证，产物从 Artifacts 下载）
         type: boolean
         default: false
       macos:
@@ -395,7 +395,7 @@ jobs:
         with:
           name: verified-release
           path: ${{ runner.temp }}/gx-release
-      - name: Draft, upload, check remote digests, then publish the prerelease
+      - name: Draft, upload, check remote digests, then publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           GX_PUBLISH: ${{ inputs.publish }}

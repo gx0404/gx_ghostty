@@ -6,8 +6,9 @@ Actions:
       Resolve the clean source commit, the fork version (largest CHANGELOG.md heading), the
       product version (build.zig.zon .version) and the Zig pin, then run the release gates
       (resolver --check, version.py --check, build_agent_kb.py, graphify.py check).
-      --publish additionally requires a dated heading and checks that neither the gx-vX.Y.Z
-      tag (git ls-remote --tags origin) nor a release for it (gh release view) exists.
+      --publish additionally requires a dated heading with a non-empty section body (the
+      release notes start with it) and checks that neither the gx-vX.Y.Z tag
+      (git ls-remote --tags origin) nor a release for it (gh release view) exists.
       Prints sha/version/tag/version_string/zig and appends them to $GITHUB_OUTPUT.
   verify --sha SHA --artifacts DIR [--macos] [--version-string VS]
       Check the artifact directory against the exact expected asset set, the archive layouts
@@ -15,8 +16,9 @@ Actions:
       (or require existing ones to match byte for byte).
   publish --sha SHA --artifacts DIR [--macos] [--version-string VS]
       Only inside the manual gx-release workflow of gx0404/gx_ghostty: re-verify, create a
-      draft prerelease targeting SHA, upload every asset, compare remote sizes and digests,
-      then publish. Never overwrites a release, never reuses or moves a tag.
+      draft release (not a prerelease) targeting SHA whose notes are the CHANGELOG.md section
+      of the version followed by the generated asset table, upload every asset, compare remote
+      sizes and digests, then publish it. Never overwrites a release, never reuses or moves a tag.
 
 Exit codes: 0 success, 1 refused or failed, 2 usage error.
 """
@@ -244,6 +246,29 @@ def release_info(root: Path) -> ReleaseInfo:
     )
 
 
+def changelog_section(root: Path, fork_version: str) -> str:
+    """Body of the `## X.Y.Z(...)` section of fork_version (up to the next version heading), stripped."""
+    try:
+        text = changelog_version.read_changelog(Path(root))
+        headings = sorted(changelog_version.parse_headings(text), key=lambda heading: heading.line)
+    except FileNotFoundError:
+        raise ReleaseError(f"missing CHANGELOG.md in {root}") from None
+    except ValueError as error:
+        raise ReleaseError(f"CHANGELOG.md: {error}") from error
+    lines = text.splitlines()
+    for index, heading in enumerate(headings):
+        if heading.semver != fork_version:
+            continue
+        end = headings[index + 1].line - 1 if index + 1 < len(headings) else len(lines)
+        body = "\n".join(line.rstrip() for line in lines[heading.line:end]).strip("\n")
+        if not body.strip():
+            raise ReleaseError(
+                f"CHANGELOG.md section ## {fork_version} is empty; the release notes start with it"
+            )
+        return body
+    raise ReleaseError(f"CHANGELOG.md has no ## {fork_version} heading")
+
+
 def head_sha(root: Path) -> str:
     sha = git(root, "rev-parse", "HEAD").strip()
     if not is_hash(sha, 40):
@@ -329,6 +354,8 @@ def prepare(root: Path, publish_requested: bool) -> dict[str, str]:
             f"publishing requires a dated heading: CHANGELOG.md still has ## {info.fork_version}(TBD); "
             "set it to the release date, run just graph, just kb and just generated-check, then commit"
         )
+    if publish_requested:
+        changelog_section(root, info.fork_version)
     run_gates(root)
     if publish_requested:
         require_origin(root)
@@ -511,11 +538,10 @@ def write_or_verify(path: Path, content: str) -> None:
 
 def render_manifest(info: ReleaseInfo, sha: str, macos: bool, entries: list[dict]) -> str:
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": REPOSITORY,
         "name": info.title,
         "tag": info.tag,
-        "prerelease": True,
         "fork_version": info.fork_version,
         "product_version": info.product_version,
         "version_string": info.version_string,
@@ -605,7 +631,7 @@ def check_draft(release: object, info: ReleaseInfo, sha: str) -> int:
     release_id = release.get("id")
     if type(release_id) is not int or release_id <= 0:
         raise ReleaseError(f"invalid release id {release_id!r}")
-    expected = {"draft": True, "prerelease": True, "tag_name": info.tag, "name": info.title, "target_commitish": sha}
+    expected = {"draft": True, "prerelease": False, "tag_name": info.tag, "name": info.title, "target_commitish": sha}
     for key, value in expected.items():
         if type(release.get(key)) is not type(value) or release.get(key) != value:
             raise ReleaseError(
@@ -652,12 +678,14 @@ def asset_description(name: str, asset: Asset | None) -> str:
     return "Ghostty.app（universal，仅 ad-hoc 签名，未公证）"
 
 
-def release_notes(info: ReleaseInfo, sha: str, macos: bool, files: list[Path]) -> str:
+def release_notes(info: ReleaseInfo, sha: str, macos: bool, files: list[Path], changelog: str) -> str:
     assets = expected_assets(info.version_string, macos)
     rows = [f"| `{path.name}` | {asset_description(path.name, assets.get(path.name))} |" for path in files]
     return "\n".join([
+        changelog.strip("\n"),
+        "",
         f"<!-- gx-release source={sha} version_string={info.version_string} -->",
-        f"{info.title}（预发布）",
+        "### 构建与资产",
         "",
         f"- 构建版本串：`{info.version_string}`（Ghostty 产品版本 `{info.product_version}` + fork 版本 `{info.fork_version}`）",
         f"- 源码提交：`{sha}`",
@@ -716,6 +744,7 @@ def publish(
     info = release_info(root)
     if info.date is None:
         raise ReleaseError(f"CHANGELOG.md still has ## {info.fork_version}(TBD); refusing to publish")
+    changelog = changelog_section(root, info.fork_version)
     require_origin(root)
     tag = info.tag
     if remote_tag_commit(root, tag) is not None:
@@ -726,8 +755,8 @@ def publish(
         )
     with tempfile.TemporaryDirectory(prefix="gx-release-") as temp:
         notes = Path(temp) / "notes.md"
-        notes.write_bytes(release_notes(info, sha, macos, files).encode("utf-8"))
-        gh(root, "release", "create", tag, "--repo", REPOSITORY, "--draft", "--prerelease",
+        notes.write_bytes(release_notes(info, sha, macos, files, changelog).encode("utf-8"))
+        gh(root, "release", "create", tag, "--repo", REPOSITORY, "--draft",
            "--target", sha, "--title", info.title, "--notes-file", str(notes))
     release_id = check_draft(single_draft(root, tag), info, sha)
     gh(root, "release", "upload", tag, *[str(path) for path in files], "--repo", REPOSITORY)
@@ -737,7 +766,7 @@ def publish(
         raise ReleaseError(f"tag {tag} appeared while uploading; the draft stays unpublished")
     result = gh_json(root, "api", "--method", "PATCH", f"repos/{REPOSITORY}/releases/{release_id}", "-F", "draft=false")
     if (not isinstance(result, dict) or result.get("id") != release_id or result.get("draft") is not False
-            or result.get("prerelease") is not True or result.get("tag_name") != tag):
+            or result.get("prerelease") is not False or result.get("tag_name") != tag):
         raise ReleaseError(f"ambiguous publish response for release {release_id}; inspect it before retrying")
     commit = wait_for_tag(root, tag)
     if commit != sha:
