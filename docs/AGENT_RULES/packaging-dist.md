@@ -44,6 +44,12 @@
 
 资产名、包内必需文件与源码包内的 `VERSION` 由 `scripts/gx_release.py::expected_assets` 定义，`scripts/test_gx_release.py` 锁定。
 
+### GX Shell 组件 stage（`scripts/gx_package.py`、`scripts/gx_linux_build.py`）
+
+- `gx_package.py windows|deb --stage-dir DIR` 生成 schema 3 的 stage，`verify-stage` 复核，`test-deb` 把 deb stage 打成一次性测试包。契约（`stage-manifest.json` 的键与布局、GX Shell 的消费方命令、所需工具与网络）只写在该模块文档里，由 `scripts/test_gx_package.py` 与 `scripts/test_gx_workflows.py` 锁定。`--build` 先构建：windows 为 win32 ReleaseFast（`-Dtarget=x86_64-windows-gnu`），deb 调 `gx_linux_build.py build`。
+- `gx_linux_build.py` 是 Ubuntu 24.04 配方：按清单检查或安装 apt 依赖，要求 patchelf 0.18.0，用钉版 Zig 与 sha256 钉版的 blueprint-compiler 0.16.0，或改从 dist 源码包构建（自带预生成资源）；ReleaseFast、`-fno-sys=gtk4-layer-shell`，`-Dpatch-rpath='$ORIGIN/../lib'` 让随包的 `libgtk4-layer-shell.so` 不靠 `LD_LIBRARY_PATH` 加载，`check-prefix` 在不设它时跑 `+version`。
+- `gx-release` 的 `linux-gtk-noble` 在 `ubuntu:24.04` 容器跑模块文档里的 deb 命令，只上传证据 artifact `evidence-linux-gtk-noble`，不产出发布资产。
+
 ## 不变量
 
 - 源码包是下游打包与 fork 发布共同的输入：要进包的改动必须先提交；预生成资源只由 `dist` 生成，永不提交到 Git。
@@ -54,6 +60,7 @@
 - Linux 集成沿用上游约束：systemd unit 名必须以 `app-` 开头（xdg-desktop-portal 据此识别应用），Nautilus 扩展必须名为 `ghostty.py`，Flatpak 图标不超过 512 像素。
 - fork 资产没有上游 minisign 签名（签名密钥是上游 secrets），完整性靠 `SHA256SUMS`、`manifest.json` 与 GitHub 资产 digest；release 标为 prerelease，不冒充上游正式版。
 - debian13 的 GTK app 包动态链接 Debian 13 的 GTK4 与 libadwaita，只承诺在同代发行版运行。Flatpak、Snap、Nix 渠道由上游维护，fork 不向 Flathub、Snap Store 或 cachix 发布。
+- GX Shell stage 里唯一的符号链接是 `root/usr/bin/ghostty-gx`：前缀 `share/` 内指向自身树的链接（tic 的 `terminfo/g/ghostty`）复制成文件，别的链接一律拒绝；`root/usr/lib/ghostty-gx/lib/` 恰好是二进制实际加载的库，RUNPATH 只能是 `$ORIGIN/../lib`。键集、布局或消费方命令有变就升 schema，并告知 GX Shell 的 release.yml 一起改。
 
 ## 禁止项
 
@@ -69,4 +76,5 @@
 - 改完整源码包或 GTK 资源：在装好 GTK 构建依赖的 Linux 上跑 `zig build distcheck`（上游形态 `nix develop -c zig build distcheck`）；本机 Windows 记 PENDING，交 `gx-release` 以 `publish=false` 运行的 `linux-gtk` job 验收。
 - 改 `GhosttyResources.zig` 或 `dist/linux/`：Linux 上 `just build` 后检查 `zig-out/share/` 的安装布局；GUI 可见的影响按 `testing.md` 走 `gtk-smoke`。
 - 改资产命名或集合：`just framework-test`（含 `scripts/test_gx_release.py`），再以 `publish=false` 运行 `gx-release` 看 `verify`，未运行前记 PENDING。
+- 改 GX Shell stage 或 Ubuntu 配方：`python scripts/run_unittests.py test_gx_package test_gx_linux_build`（Windows 未开开发者模式时 deb stage 用例跳过，在 WSL 克隆里用 `python3` 补跑）；真实验收在全新 `ubuntu:24.04` 容器按模块文档的 deb 命令构建、`verify-stage`，再在另一个全新容器装 `test-deb` 的包并截图读图；CI 证据是 `gx-release`（`publish=false`）的 `evidence-linux-gtk-noble`，读回截图前记 PENDING。
 - 改 `flatpak/`、`snap/`、`nix/package.nix`（仅随上游同步）：Nix 主机上 `nix build .#ghostty-releasefast`（上游 `build-nix` 形态）；Flatpak 与 Snap 需要 Linux 上的 `flatpak-builder` 与 `snapcraft`，本机记 PENDING。

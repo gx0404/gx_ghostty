@@ -53,6 +53,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 | `libvt` | ubuntu-24.04 / windows-2025 | 矩阵构建 libghostty-vt：Linux 三个目标与 wasm32 在 ubuntu 上交叉编译，`x86_64-windows-msvc` 在 windows-2025 上原生构建 |
 | `libvt-macos` | macos-15 | 仅 `macos=true`：构建 libghostty-vt XCFramework |
 | `linux-gtk` | ubuntu-24.04 中的 `debian:13` 容器 | `zig build dist` 产出完整源码包，再从该源码包构建 GTK app 并检查 `+version` |
+| `linux-gtk-noble` | ubuntu-24.04 中的 `ubuntu:24.04` 容器 | 按 GX Shell 的消费方命令从检出构建 GTK app 并生成、校验 deb stage，再装成一次性测试包，检查 `+version` 并截图；只上传证据 artifact `evidence-linux-gtk-noble`，不产出发布资产 |
 | `macos` | macos-26 | 仅 `macos=true`：构建 `Ghostty.app`。macos-15（Xcode 26.3）编不过 `images/Ghostty.icon` 的资源目录（2026-10-07 run 37587740223），上游也在 macOS 26 上构建 app |
 | `verify` | ubuntu-24.04 | 收集全部产物，运行 `scripts/gx_release.py verify`，写出 `manifest.json` 与 `SHA256SUMS`；只构建模式也运行 |
 | `publish` | ubuntu-24.04 | 仅 `publish=true`：运行 `scripts/gx_release.py publish`；唯一拥有 `contents: write` 的 job |
@@ -68,6 +69,8 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 构建 job 的 Zig 由 `mlugg/setup-zig` 按 prepare 输出的版本安装，关闭它的缓存；`ZIG_GLOBAL_CACHE_DIR` 与 `ZIG_LOCAL_CACHE_DIR` 都放在 `$RUNNER_TEMP`。这是为 `distcheck` 准备的：`src/build/GhosttyDist.zig::init` 用 `git archive` 打包 HEAD（只含已提交内容，并写入 `VERSION` 文件），再把包解压到本地缓存目录里，执行 `zig build test-lib-vt -Demit-lib-vt=true` 和一次 CMake 构建。这个内层构建没有 `-Dversion-string`，会对解压目录运行 `git -C`；缓存在检出目录之外时它找不到任何仓库，版本退回 `X.Y.Z-dev+0000000`，与真正拿到源码包的用户一致。若缓存留在检出目录内（Zig 默认的 `.zig-cache`），内层构建会读到外层仓库的分支和 tag。
 
 `linux-gtk` 的依赖取自 `src/build/docker/debian/Dockerfile`，另加 `git`、`ca-certificates`、`xz-utils` 与提供 `msgfmt` 的 `gettext`（i18n 编译 `.po`，见 `src/build/GhosttyI18n.zig::init`）。容器以 root 运行而工作区属于 runner 用户，所以检出后要把工作区加入 `safe.directory`，否则 `git archive` 会拒绝执行。完整源码包内含预生成的 `src/apprt/gtk/ghostty_resources.{c,h}` 与 `src/build/framegen/framedata.compressed`（`src/build/GhosttyDist.zig::Resource`），从源码包构建不再需要 blueprint-compiler。
+
+`linux-gtk-noble` 验证 GX Shell 在 Ubuntu 24.04 上要用的构建链，命令与 `scripts/gx_package.py` 模块文档「Consumer contract」一字不差（`scripts/test_gx_workflows.py` 锁定）：检出前只装 `ca-certificates`、`git`、`python3`，然后 `gx_package.py deb --build --install-deps` 与 `verify-stage`。构建配方是 `scripts/gx_linux_build.py`：apt 依赖按它的清单检查并安装；Ubuntu 24.04 的 blueprint-compiler 只有 0.12，配方下载 sha256 钉版的 0.16.0（GNOME GitLab 的 tag 归档，失败时用 GNOME 的 GitHub 镜像）并用 meson 装进 `.local/tools/`；这个 job 不用 `mlugg/setup-zig`，Zig 由 `scripts/setup_zig.py` 按 sha256 钉版安装，与没有 setup-zig 的消费方一致；Ubuntu 24.04 没有 `libgtk4-layer-shell-dev`，所以用 `-fno-sys=gtk4-layer-shell` 把它编成随包的 `libgtk4-layer-shell.so`，再用 `-Dpatch-rpath='$ORIGIN/../lib'`（patchelf 0.18.0）把可执行文件的 RUNPATH 换成相对路径，不需要 `LD_LIBRARY_PATH`。之后用 `test-deb` 把 stage 打成一次性测试包，在同一容器 `apt-get install` 后检查 `ghostty-gx +version`，并以与 `gtk-smoke` 相同的 Xvfb 参数截图。证据（stage 日志、`stage-manifest.json`、`readelf -d`、测试包信息、`+version`、截图与日志）以 artifact `evidence-linux-gtk-noble` 上传，名字不以 `gx-` 开头，`verify` 不收集它；`verify` 要求这个 job 成功。真正的 deb 由 GX Shell 用 stage 的 `root/` 与 `deb_depends` 构建。
 
 ## 资产
 
@@ -92,7 +95,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 - 两个源码包都由 `git archive` 打包已提交的内容，fork 文件（`scripts/`、`docs/`、工具配置等）也随之进包。体积最大的 fork 文件、知识库产物 `docs/kb/chunks.json` 由 `docs/kb/.gitattributes` 标为 `export-ignore`，不进任何源码包，GitHub 为分支与 tag 自动生成的 Source code（zip / tar.gz）同样不含它；需要 KB 时用 Git 检出（KB 已入库，`just kb` 也能重建）。libghostty-vt 源码包有 5 MiB 上限（`source` job 与 `verify` 都检查），新增大的 fork 文件前先估算它会不会把源码包推过上限，必要时同样用所在 fork 目录的 `.gitattributes` 标 `export-ignore`，不改上游的根 `.gitattributes`。
 - 预编译库构建时用 `--prefix` 安装到 runner 临时目录，`share/pkgconfig/*.pc` 里的 `prefix=` 是这个构建时路径（`src/build/GhosttyLibVt.zig` 用安装前缀生成 `.pc`）；用 pkg-config 前先改成解压位置，或直接用 `include/` 与 `lib/`。
-- GTK app 动态链接系统的 GTK 4、libadwaita 与 gtk4-layer-shell，只在 Debian 13 上构建与检查过。资源目录按 `src/os/resourcesdir.zig::resourcesDir` 查找：从可执行文件所在目录向上找 `share/terminfo`，也可用 `GHOSTTY_RESOURCES_DIR` 指定。
+- GTK app 动态链接系统的 GTK 4、libadwaita 与 gtk4-layer-shell，只在 Debian 13 上构建与检查过；Ubuntu 24.04 不用这个包，而由 GX Shell 从 `linux-gtk-noble` 验证过的 stage 构建自己的 deb。资源目录按 `src/os/resourcesdir.zig::resourcesDir` 查找：从可执行文件所在目录向上找 `share/terminfo`，也可用 `GHOSTTY_RESOURCES_DIR` 指定。
 - macOS 包没有 Developer ID 签名，也没有公证；首次打开会被 Gatekeeper 拦截，需要用户自行放行。
 
 ## 校验
@@ -159,3 +162,4 @@ Actions 已启用，以下首跑结果都在 2026-10-07 取得：
 
 - **跨 runner 完整复用与缓存增长控制**：第二轮首次构建只有 10/45、49/100、10/45 节点 cached，translate-c 与测试编译仍未 cached，`o` 分区继续增长。`linux-vt`、`windows` 的 CPU 从 AMD EPYC 9V74 换成 7763 已由快照确认；`linux-main` 同为 9V74，仍有 miss。源码能解释工具产物差异如何经 `Run.artifact` hash 向下游传播，但初始 native 工具差异原因未定。旧 run 37587736223 的 `linux-vt` 曾达 5,078,327,232 字节、超过 4096 MiB 被清空，下一轮只恢复 186 字节；新实现不删除旧 cache，也未提高上限，未来仍可能超限。本次 PASS 不能写成跨运行全命中或所有缓存问题已解决，更不能代证全 CI 两分钟。
 - 第一次 `publish=true`：GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建。本轮未公开发布，也不为补验触发发布。
+- `linux-gtk-noble` 的首跑：同样的命令已在本机 WSL 的全新 `ubuntu:24.04` podman 容器里跑通（2026-10-09，见 [TESTING.md](TESTING.md)），GitHub runner 上的结果与截图要等用户以 `publish=false` 运行 `gx-release` 后读回 artifact。
