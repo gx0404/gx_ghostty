@@ -8,6 +8,7 @@ pub const i18n = @import("i18n.zig");
 pub const policy = @import("policy.zig");
 pub const proc = @import("proc.zig");
 pub const profiles = @import("profiles.zig");
+pub const settings_map = @import("settings_map.zig");
 pub const theme = @import("theme.zig");
 
 test {
@@ -18,5 +19,6 @@ test {
     _ = policy;
     _ = proc;
     _ = profiles;
+    _ = settings_map;
     _ = theme;
 }

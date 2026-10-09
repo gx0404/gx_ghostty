@@ -116,6 +116,109 @@ msgstr "Ghostty GX"
 msgid "Version {version}"
 msgstr "版本 {version}"
 
+#. Settings dialog (src/gx/settings_map.zig): rows, choices and messages
+msgid "Interface Language"
+msgstr "界面语言"
+
+msgid "Move through the list to preview a theme. Press Enter or Apply to keep it."
+msgstr "在列表中移动即可预览主题，按回车键或点击“应用”保留。"
+
+msgid "No matching themes"
+msgstr "没有匹配的主题"
+
+msgid "Apply"
+msgstr "应用"
+
+msgid "Translucent"
+msgstr "半透明"
+
+msgid "Blur"
+msgstr "毛玻璃"
+
+msgid "Blur needs compositor support."
+msgstr "毛玻璃效果需要窗口合成器支持。"
+
+msgid "Leave empty to use the default font."
+msgstr "留空则使用默认字体。"
+
+msgid "Right-Click Action"
+msgstr "右键操作"
+
+msgid "Show Context Menu"
+msgstr "显示右键菜单"
+
+msgid "Copy or Paste"
+msgstr "复制或粘贴"
+
+msgid "Do Nothing"
+msgstr "无操作"
+
+msgid "If a Process Runs"
+msgstr "有进程运行时"
+
+msgid "Always"
+msgstr "总是"
+
+msgid "Never"
+msgstr "从不"
+
+msgid "System Sound"
+msgstr "系统提示音"
+
+msgid "Audio File"
+msgstr "播放音频文件"
+
+msgid "Request Attention"
+msgstr "请求注意"
+
+msgid "Bell Icon in Title"
+msgstr "标题显示铃铛"
+
+msgid "Border Highlight"
+msgstr "边框提示"
+
+msgid "Used by new tabs and windows."
+msgstr "用于新建的标签页和窗口。"
+
+msgid "System Default"
+msgstr "系统默认"
+
+msgid "Custom: {command}"
+msgstr "自定义：{command}"
+
+msgid "herdr now starts GX Zsh by default."
+msgstr "herdr 已改为默认启动 GX Zsh。"
+
+msgid "herdr uses your own configuration, so its default shell was left unchanged."
+msgstr "herdr 使用你自己的配置，其默认 Shell 保持不变。"
+
+msgid "Could not set the default shell of herdr: {reason}"
+msgstr "无法设置 herdr 的默认 Shell：{reason}"
+
+msgid "herdr exited with code {code} while setting its default shell."
+msgstr "设置默认 Shell 时 herdr 以退出码 {code} 退出。"
+
+msgid "Configuration File"
+msgstr "配置文件"
+
+msgid "Settings File"
+msgstr "设置文件"
+
+msgid "Settings made here are saved to this file and override the configuration file."
+msgstr "此处的设置保存在该文件中，并优先于配置文件。"
+
+msgid "Could not open the configuration file: {reason}"
+msgstr "无法打开配置文件：{reason}"
+
+msgid "Could not save the settings: {reason}"
+msgstr "无法保存设置：{reason}"
+
+msgid "Could not reload the configuration: {reason}"
+msgstr "无法重新加载配置：{reason}"
+
+msgid "Could not preview the theme: {reason}"
+msgstr "无法预览主题：{reason}"
+
 #. Language names are shown in their own language in the language picker
 msgid "Chinese"
 msgstr "中文"
