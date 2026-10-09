@@ -13,6 +13,12 @@
 //! the GL context, so no GL call ever happens on the main thread. Frames
 //! are presented by blitting the render target into the window's default
 //! framebuffer and swapping buffers.
+//!
+//! The context asks to be told about GPU resets (driver timeout recovery,
+//! a driver update) where the driver supports it
+//! (WGL_ARB_create_context_robustness). After a reset `present` replaces
+//! the lost context with a new one and calls the apprt's
+//! `gpuContextReset`, which makes the renderer rebuild its GPU resources.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -33,6 +39,11 @@ const HWND = windows.HWND;
 
 /// A generic GL entry point, as glad expects it from a loader.
 const GlProc = *const fn () callconv(.c) void;
+
+/// glGetGraphicsResetStatus (OpenGL 4.5, GL_ARB_robustness), which the
+/// generated loader does not include.
+const GetGraphicsResetStatusFn = *const fn () callconv(.winapi) u32;
+const GL_NO_ERROR: u32 = 0;
 
 /// The DLL name of the Mesa fallback, relative to the executable.
 const mesa_dll = "mesa\\opengl32.dll";
@@ -136,6 +147,9 @@ pub const Context = struct {
     /// The GL context, alive between `threadEnter` and `threadExit`.
     hglrc: ?HGLRC = null,
 
+    /// glGetGraphicsResetStatus, when the context reports GPU resets.
+    get_reset_status: ?GetGraphicsResetStatusFn = null,
+
     /// Called on the main thread when the renderer is created. Only
     /// records the device context; it makes no GL calls.
     pub fn init(rt_surface: *apprt.Surface) !Context {
@@ -160,9 +174,24 @@ pub const Context = struct {
             WGL_CONTEXT_PROFILE_MASK_ARB,  WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
             0,
         };
-        const hglrc = create(self.hdc, null, &attribs) orelse {
-            log.warn("wglCreateContextAttribsARB failed err={}", .{windows.GetLastError()});
-            return error.WglCreateContextFailed;
+        // Prefer a context that reports GPU resets (it is lost on a reset
+        // instead of failing silently); drivers without
+        // WGL_ARB_create_context_robustness reject the attributes.
+        const robust_attribs = [_]c_int{
+            WGL_CONTEXT_MAJOR_VERSION_ARB,               OpenGL.MIN_VERSION_MAJOR,
+            WGL_CONTEXT_MINOR_VERSION_ARB,               OpenGL.MIN_VERSION_MINOR,
+            WGL_CONTEXT_PROFILE_MASK_ARB,                WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+            WGL_CONTEXT_FLAGS_ARB,                       WGL_CONTEXT_ROBUST_ACCESS_BIT_ARB,
+            WGL_CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB, WGL_LOSE_CONTEXT_ON_RESET_ARB,
+            0,
+        };
+        var robust = true;
+        const hglrc = create(self.hdc, null, &robust_attribs) orelse robust: {
+            robust = false;
+            break :robust create(self.hdc, null, &attribs) orelse {
+                log.warn("wglCreateContextAttribsARB failed err={}", .{windows.GetLastError()});
+                return error.WglCreateContextFailed;
+            };
         };
         errdefer _ = lib.deleteContext(hglrc);
 
@@ -184,6 +213,12 @@ pub const Context = struct {
         self.hglrc = hglrc;
         thread_lib = lib;
         if (lib.swapInterval) |swapInterval| _ = swapInterval(1);
+        self.get_reset_status = if (robust)
+            lib.extension("glGetGraphicsResetStatus", GetGraphicsResetStatusFn) orelse
+                lib.extension("glGetGraphicsResetStatusARB", GetGraphicsResetStatusFn)
+        else
+            null;
+        log.debug("created the OpenGL context reports_resets={}", .{self.get_reset_status != null});
     }
 
     /// Release and destroy the context on the render thread.
@@ -192,7 +227,45 @@ pub const Context = struct {
         _ = lib.makeCurrent(null, null);
         if (self.hglrc) |hglrc| _ = lib.deleteContext(hglrc);
         self.hglrc = null;
+        self.get_reset_status = null;
         thread_lib = null;
+    }
+
+    /// Whether the context was lost to a GPU reset (or the apprt simulates
+    /// one, see `takeSimulatedGpuReset`).
+    fn lost(self: *Context) bool {
+        if (comptime @hasDecl(apprt.Surface, "takeSimulatedGpuReset")) {
+            if (self.surface.takeSimulatedGpuReset()) return true;
+        }
+        const status = (self.get_reset_status orelse return false)();
+        if (status == GL_NO_ERROR) return false;
+        log.warn("the GPU was reset status=0x{x}", .{status});
+        return true;
+    }
+
+    /// Replace a lost context with a new one on the render thread, load
+    /// the GL functions and the state `OpenGL.threadEnter` sets up again,
+    /// and tell the apprt that the renderer's GPU resources are gone with
+    /// the old context (`gpuContextReset`, called with the renderer's draw
+    /// mutex held by this thread).
+    fn recover(self: *Context, device: *const Device) void {
+        log.warn("recreating the lost OpenGL context", .{});
+        self.threadExit(device);
+        gl.glad.unload();
+        self.threadEnter(device) catch |err| {
+            log.err("cannot recreate the OpenGL context err={}", .{err});
+            return;
+        };
+        _ = gl.glad.load(&getProcAddress) catch |err| {
+            log.err("cannot load OpenGL after recreating the context err={}", .{err});
+            return;
+        };
+        gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
+            log.warn("error enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
+        };
+        if (comptime @hasDecl(apprt.Surface, "gpuContextReset")) {
+            self.surface.gpuContextReset();
+        }
     }
 
     /// Log the implementation behind the current context. glad must be
@@ -211,8 +284,15 @@ pub const Context = struct {
     }
 
     /// Copy the rendered target into the window and swap buffers.
-    /// Called on the render thread with the context current.
+    /// Called on the render thread with the context current. After a GPU
+    /// reset nothing is presented: the context is recreated (`recover`)
+    /// and the frame fails with `error.ContextLost`.
     pub fn present(self: *Context, device: *const Device, target: Target) !void {
+        if (self.lost()) {
+            self.recover(device);
+            return error.ContextLost;
+        }
+
         // The target holds sRGB-encoded values; copy them verbatim.
         try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
         defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
@@ -255,6 +335,10 @@ pub const Context = struct {
 
         if (!device.lib.swapBuffers(self.hdc).toBool()) {
             log.warn("SwapBuffers failed err={}", .{windows.GetLastError()});
+            if (self.lost()) {
+                self.recover(device);
+                return error.ContextLost;
+            }
             return error.SwapBuffersFailed;
         }
 
@@ -597,6 +681,10 @@ const WGL_CONTEXT_MAJOR_VERSION_ARB = 0x2091;
 const WGL_CONTEXT_MINOR_VERSION_ARB = 0x2092;
 const WGL_CONTEXT_PROFILE_MASK_ARB = 0x9126;
 const WGL_CONTEXT_CORE_PROFILE_BIT_ARB = 0x00000001;
+const WGL_CONTEXT_FLAGS_ARB = 0x2094;
+const WGL_CONTEXT_ROBUST_ACCESS_BIT_ARB = 0x00000004;
+const WGL_CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB = 0x8256;
+const WGL_LOSE_CONTEXT_ON_RESET_ARB = 0x8252;
 
 extern "kernel32" fn LoadLibraryExW(lpLibFileName: [*:0]const u16, hFile: ?*anyopaque, dwFlags: u32) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn FreeLibrary(hLibModule: HMODULE) callconv(.winapi) BOOL;

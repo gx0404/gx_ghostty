@@ -790,6 +790,8 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
+                    // The confirmation and the close run from the message
+                    // loop (`Window.closeTabMode`).
                     core_surface.rt_surface.parent_window.closeTabMode(
                         value,
                         core_surface.rt_surface,
@@ -2019,11 +2021,21 @@ fn requestQuit(self: *App) void {
 
 /// Quit, after asking when a terminal still runs a program (core
 /// `needsConfirmQuit`, which with the GX idle-process check lets idle
-/// shells pass).
+/// shells pass), listing those processes. The dialog runs a modal loop;
+/// nothing here uses a surface after it.
 fn confirmQuit(self: *App) void {
-    if (self.core_app.needsConfirmQuit()) {
+    var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+    defer arena.deinit();
+    var processes: std.ArrayList([]const u8) = .empty;
+    var needs = false;
+    for (self.core_app.surfaces.items) |surface| {
+        if (!surface.core_surface_ready or !surface.core_surface.needsConfirmQuit()) continue;
+        needs = true;
+        surface.appendBusyProcesses(arena.allocator(), &processes);
+    }
+    if (needs) {
         const owner = if (self.targetWindow(.app)) |window| window.hwnd else null;
-        if (Dialogs.confirmQuit(owner) != .accept) return;
+        if (Dialogs.confirmQuit(owner, processes.items) != .accept) return;
     }
     self.quitNow();
 }
@@ -2167,7 +2179,9 @@ fn surfaceWndProc(
         w32.WM_CLOSE => {
             // Posted by Surface.close() to defer destruction to the
             // message loop. This is the safe place to call closeSplitSurface
-            // (outside of core_surface callbacks).
+            // (outside of core_surface callbacks) — unless a dialog's modal
+            // loop dispatched it, in which case it waits for the dialog.
+            if (Dialogs.deferClose(hwnd)) return 0;
             surface.parent_window.closeSplitSurface(surface);
             return 0;
         },
@@ -2175,6 +2189,24 @@ fn surfaceWndProc(
         Surface.WM_APP_CONFIRM_CLOSE => {
             surface.confirmClose();
             return 0;
+        },
+
+        w32.WM_TIMER => {
+            if (surface.handleTimer(wparam)) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
+        Surface.WM_APP_GPU_RESET => {
+            surface.recoverGpuResources();
+            return 0;
+        },
+
+        Surface.WM_GHOSTTY_SIMULATE_GPU_RESET => {
+            // Test-only: the next presented frame acts as if the GPU had
+            // been reset; draw one now.
+            surface.simulate_gpu_reset.store(true, .release);
+            surface.refreshRenderer();
+            return 1;
         },
 
         w32.WM_DESTROY => {
