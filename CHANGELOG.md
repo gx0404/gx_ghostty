@@ -11,6 +11,10 @@
 
 ## 0.0.2(TBD)
 
+### Added
+
+- Windows 应用检测被占用的快捷键：第一个窗口显示约 1 秒后与每次重载配置后，检查每个带修饰键的绑定是否被其他程序注册为全局快捷键（例如 bilibili 客户端的「老板键」Ctrl+Shift+C），以及是否是当前输入法经 TSF 保留的按键（微软拼音简繁切换的 Ctrl+Shift+F 不是保留键，检测不到）。每个受影响的绑定在日志里记一条警告；快捷键速查表（Ctrl+Shift+/）在这些按键前加警告标记并说明原因；右键菜单、主菜单与命令面板改为提示同一动作的其他可用按键，没有就不提示；默认的复制、粘贴、查找或分屏键受影响时，每次运行在窗口底部提示一次（约 20 秒后消失），列出被占用的键与替代方式（Ctrl+Insert / Shift+Insert、右键菜单、命令面板），并可直接打开速查表。
+
 ### Changed
 
 - Windows 窗口材质透到整个终端区：`gx-window-material = mica|acrylic|tabbed` 不再只透在标题栏，终端背景按 `background-opacity` 透出材质，文字、光标、选区与图片保持不透明，分屏间隙一样透出。没设 `background-opacity` 时材质自带默认值（同 WezTerm GX）：Mica、Tabbed 为 0.3，Acrylic 为 0.75；显式设置（包括 `background-opacity = 1`，只在标题栏透出材质）优先。`solid` 配 `background-opacity` 小于 1 时改为只有终端背景透明、桌面透过来，文字不再随整窗变淡，`background-blur` 照常模糊透出的桌面；`toggle_background_opacity` 改为所有窗口一起在配置的不透明度与不透明之间切换（同 macOS）。需要 Windows 11 22H2（build 22621）及以上与硬件 OpenGL 驱动；更早的系统、Mesa 软件渲染（`GHOSTTY_GX_OPENGL=software`）或像素格式没有 alpha 时保持 0.0.1 的行为，日志记一行原因。`background-opacity` 的配置文档（`+explain-config background-opacity`）写明了 Windows 上的这些行为（GX-0024）。
@@ -18,6 +22,7 @@
 
 ### Fixed
 
+- Windows 上 Shift+Insert 粘贴剪贴板。Windows 没有选择剪贴板，上游默认的 `shift+insert=paste_from_selection` 按下后什么也不做；GX 的 Windows 默认值改为 `paste_from_clipboard`，与 Ctrl+Insert 复制配对，Ctrl+Shift+C / Ctrl+Shift+V 被其他程序占用时仍可复制粘贴。
 - GTK 应用（GX-0023）：GTK 4.20 以前（如 Ubuntu 24.04 的 GTK 4.14）启动时不再记录 `Theme parser error: style.css:…`。拖动分屏时，目标终端靠近指针的那一半重新显示蓝色高亮；只读提示的文字恢复浅橙色；`window-theme = ghostty` 时 GTK 4.14 不再报 `css parsing failed`，失焦窗口的标题栏略微变暗；GTK 4.16–4.18 上拖放高亮的运行时 CSS 也不再报错。
 
 ## 0.0.1(2026-10-10)

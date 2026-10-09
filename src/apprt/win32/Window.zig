@@ -14,6 +14,8 @@
 //!     hit-testing, drag, context menu, inline rename, unread badges.
 //!   - `chrome/Backdrop.zig`: DWM theme, border, material, opacity, blur.
 //!   - `ui/ResizeOverlay.zig` (`resize_overlay`): the size overlay.
+//!   - `ui/ShortcutNotice.zig` (`shortcut_notice`): the notice about
+//!     shortcuts other programs take.
 //!   - `ui/Menu.zig`: the main menu, opened through `queueMainMenu`.
 //!
 //! Closing tabs (`closeTabByIndex`, `closeOtherTabs`, `closeTabsRightOf`,
@@ -69,6 +71,7 @@ const TitleBar = @import("chrome/TitleBar.zig");
 const Dialogs = @import("ui/Dialogs.zig");
 const Menu = @import("ui/Menu.zig");
 const ResizeOverlay = @import("ui/ResizeOverlay.zig");
+const ShortcutNotice = @import("ui/ShortcutNotice.zig");
 const style = @import("ui/style.zig");
 const Settings = @import("ui/Settings.zig");
 
@@ -144,6 +147,9 @@ max_track_h: i32 = 0,
 
 /// Transient "columns × rows" overlay shown while resizing.
 resize_overlay: ResizeOverlay = .{},
+
+/// The notice about default shortcuts other programs take.
+shortcut_notice: ShortcutNotice = .{},
 
 /// Where the main menu queued by `queueMainMenu` opens (null: below the
 /// chrome at the left edge).
@@ -247,6 +253,7 @@ pub fn onLanguageChanged(self: *Window) void {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| entry.view.onLanguageChanged();
     }
+    self.shortcut_notice.reposition();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
@@ -617,6 +624,7 @@ pub fn deinit(self: *Window) void {
     self.tab_bar.deinit();
     self.title_bar.deinit();
     self.resize_overlay.deinit();
+    self.shortcut_notice.deinit();
 
     // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
     if (self.hwnd) |hwnd| {
@@ -1093,6 +1101,7 @@ fn repositionPopups(self: *Window) void {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| entry.view.repositionPopups();
     }
+    self.shortcut_notice.reposition();
 }
 
 pub fn selectTabIndex(self: *Window, idx: usize) void {
@@ -1835,6 +1844,7 @@ fn handleResize(self: *Window) void {
     self.layoutSplits();
     self.invalidateTabBar();
     self.resize_overlay.show();
+    self.shortcut_notice.reposition();
 }
 
 /// Move a tab from one index to another, shifting intermediate tabs.
@@ -1931,6 +1941,7 @@ fn onDestroy(self: *Window) void {
         self.tab_bar.deinit();
         self.title_bar.deinit();
         self.resize_overlay.deinit();
+        self.shortcut_notice.deinit();
         self.hwnd = null;
         // QuickTerminal handles the rest of cleanup (freeing self, quit timer).
         if (app.quick_terminal) |qt| {
@@ -1951,6 +1962,7 @@ fn onDestroy(self: *Window) void {
     self.tab_bar.deinit();
     self.title_bar.deinit();
     self.resize_overlay.deinit();
+    self.shortcut_notice.deinit();
     self.hwnd = null;
 
     // Free the Window allocation.
@@ -2062,6 +2074,7 @@ pub fn windowWndProc(
         },
         w32.WM_TIMER => {
             if (window.resize_overlay.onTimer(wparam)) return 0;
+            if (window.shortcut_notice.onTimer(wparam)) return 0;
             if (window.title_bar.onTimer(wparam)) return 0;
             switch (wparam) {
                 FIRST_FRAME_TIMER_ID => window.checkFirstFrame(),

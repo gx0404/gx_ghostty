@@ -1,3 +1,9 @@
 # Ghostty GX defaults for Windows, appended to defaults.ghostty.
 
 quit-after-last-window-closed = true
+
+# Windows has no selection clipboard (upstream binds Shift+Insert to
+# paste_from_selection), so Shift+Insert pastes the clipboard, the
+# counterpart of Ctrl+Insert copying. Both still work when another
+# program takes Ctrl+Shift+C or Ctrl+Shift+V as a global hotkey.
+keybind = shift+insert=paste_from_clipboard

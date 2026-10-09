@@ -55,6 +55,9 @@ pub const Tokens = struct {
     text_secondary: Color,
     text_disabled: Color,
 
+    /// Warning markers and text (the Fluent caution color).
+    caution: Color,
+
     /// The red of a hovered close button (Windows 11 caption close).
     close_hover: Color = Color.hex(0xc42b1c),
     close_hover_text: Color = Color.hex(0xffffff),
@@ -104,6 +107,7 @@ pub const Tokens = struct {
             .text = fg,
             .text_secondary = mix(fg, bg, 0.35),
             .text_disabled = mix(fg, bg, 0.6),
+            .caution = if (dark) Color.hex(0xfce100) else Color.hex(0x9d5d00),
         };
     }
 };
