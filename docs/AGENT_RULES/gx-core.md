@@ -27,6 +27,7 @@
 - 某层设置 `font-family*` 时替换低层的字体列表而不是追加（`replaced_keys`）。`GHOSTTY_GX_DEFAULTS` 为 `0`、`false`、`off` 或 `no` 时（`enabled`）完全按上游加载。
 - `loadWithOverrides`：设置界面预览用的内存覆盖，排在命令行之上、`-e` 之下；`defaultConfig`：只含 GX 默认值的配置，供界面「恢复默认」；`overlayPath`：覆盖文件放在首选用户配置文件旁（`file_load.preferredDefaultFilePath`，Windows 为 `%XDG_CONFIG_HOME%\ghostty` 或 `%LOCALAPPDATA%\ghostty`，Linux 为 `$XDG_CONFIG_HOME/ghostty` 或 `~/.config/ghostty`）。
 - 默认值：主题 `GX Mocha`、`language = zh-CN`、`JetBrainsMono Nerd Font` 加把 CJK 码段映射到 `Noto Sans CJK SC` 的 `font-codepoint-map`、字号 12、内边距、闪烁块光标、解绑 Alt+1..8、`gx:` 快捷键与三条命令面板条目；Windows 另设 `quit-after-last-window-closed = true`。
+- 默认值里三条命令面板条目的标题与描述是英文 msgid，`gx.zh_CN.po` 必须有它们的译文（单测锁定）。上游 GTK 面板原样显示配置文字，所以 GTK 构建在 `load` 时按各层最终的 `language` 把默认值层这些条目的重放步骤改写成译文（`translatePalette`），主题与条件重放、克隆都保留；win32 面板显示时才翻译，用户自己写的条目不改。
 - `gui_settings.zig::Overlay` 逐行编辑，保留注释、空行、未知键与顺序，`save` 原子替换文件。`theme.zig::install` 在加载前把内置主题写进用户主题目录 `<配置目录>/ghostty/themes`，文件首行是 `theme.marker`；内容变化才替换，没有标记的同名用户文件不动。
 - fork 配置键是 `src/config/Config.zig` 中 GX-0010 块的字段：`gx-launch-profile`（`名称=命令`，可重复）、`gx-herdr-app-mode`（默认 true）、`gx-window-material`（`solid|mica|acrylic|tabbed`，只在 Windows 生效）、`gx-idle-processes`（可重复，空时用 `policy.builtin_idle_processes`）、`gx-open-config-ui`（`settings|editor`，默认 settings）；`language` 只认 `zh-CN` 与 `en`。字段的 doc comment 就是用户文档，写法见 `config.md`。
 

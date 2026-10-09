@@ -720,7 +720,7 @@ Ghostty GX 的 Windows 界面需要能绑定到键位与命令面板的应用操
 
 - 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。
 - `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行全部五个动作；embedded（macOS）与 none 没有实现。
-- 命令面板：win32 与 GTK 都列出 `command-palette-entry` 里的 `gx:` 条目（GX 默认值带「设置」「键盘快捷键」「主菜单」三条），选中后同样经 `performBindingAction` 交给 `gxAction`。GTK 用的是未改动的上游命令面板，按标题或动作（如 `gx:settings`）搜索，标题原样显示：GX 条目的标题是默认值里的英文 msgid，GTK 上不翻译（win32 面板显示时经 `gx.i18n` 翻译）。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
+- 命令面板：win32 与 GTK 都列出 `command-palette-entry` 里的 `gx:` 条目（GX 默认值带「设置」「键盘快捷键」「主菜单」三条），选中后同样经 `performBindingAction` 交给 `gxAction`。GTK 用的是未改动的上游命令面板，按标题或动作（如 `gx:settings`）搜索，原样显示配置里的标题与描述：GX 默认值写的是英文 msgid，GTK 构建在加载配置时（fork 路径 `src/gx/config_layers.zig::translatePalette`，不是源码补丁）把默认值层的这些条目按 `language` 换成译文，切换语言重载配置后随之更新；win32 面板在显示时经 `gx.i18n` 翻译。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
 
 ### 上游状态
 
@@ -741,11 +741,11 @@ python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 python scripts/zigw.py build -Demit-lib-vt
 python -m unittest scripts.test_fork_patches -v
 just test --filter Binding --filter gx.action                 # Windows 本机（win32 apprt）
-just wsl build --gtk --clone '~/src/gx_ghostty-S'
-just wsl test --clone '~/src/gx_ghostty-S' --filter Binding --filter gx.
+just wsl build --gtk
+just wsl test --filter Binding --filter gx.
 ```
 
-单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。GTK 上用 `just wsl smoke --xdotool <脚本>`：Ctrl+Shift+P 打开命令面板，输入 `gx:` 列出三条 GX 条目，回车后打开对应的对话框；读图后才算通过。
+单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像；GTK 上默认条目按 `language` 翻译由 `src/gx/config_layers.zig` 的单测锁定。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。GTK 上用 `just wsl smoke --xdotool <脚本>`：Ctrl+Shift+P 打开命令面板，输入 `gx:` 列出三条 GX 条目（默认 zh-CN 为「设置」「键盘快捷键」「主菜单」与中文描述，`language = en` 时为英文），回车后打开对应的对话框；读图后才算通过。
 
 ### 测试锁定
 

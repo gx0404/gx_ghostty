@@ -201,7 +201,7 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 | `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`，运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
 | `app_mode.zig`、`style.zig`、`style.css` | herdr 应用模式隐藏标签栏、GX 样式的 CSS provider 与 `window-theme` 随配置重设（GX-0016） |
 
-命令面板用上游原样的 `class/command_palette.zig`：它列出 `command-palette-entry` 里的 `gx:` 条目，选中后与绑定一样经 `Surface.performBindingAction`（GX-0014）交给 `App.gxAction`；这些条目的标题是 GX 默认值里的英文 msgid，GTK 上原样显示、不翻译。
+命令面板用上游原样的 `class/command_palette.zig`：它列出 `command-palette-entry` 里的 `gx:` 条目，选中后与绑定一样经 `Surface.performBindingAction`（GX-0014）交给 `App.gxAction`。面板原样显示配置里的标题与描述，GX 默认值写的是英文 msgid，所以 GTK 构建在加载配置时（`src/gx/config_layers.zig::translatePalette`）把默认值层的这些条目按 `language` 换成译文，重载配置即随语言更新；win32 面板则在显示时经 `gx.i18n` 翻译。
 
 GTK 的上游文字仍走 gettext（`_`/`N_`/`C_` 与 `po/`），只有装了对应 UTF-8 locale 才跟随 `language`；GX 自有文字一律用英文 msgid 经 `gx.i18n` 翻译，不进上游 pot。
 
