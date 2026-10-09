@@ -37,7 +37,7 @@
 
 ### GX 层
 
-- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`window.zig` 与 `menus.zig`（菜单、提示与启动配置下拉随语言重建）、`launch.zig`、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，运行期 libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
+- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`：GX 主菜单的「关于 Ghostty GX」，首页写明 gx0404 维护的非官方分支，代替把构建说成 Ghostty 开发者出品的上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单、提示与启动配置下拉随语言重建）、`launch.zig`、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，运行期 libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
 
 ### i18n
 

@@ -13,7 +13,6 @@ pub const Entry = struct {
 };
 
 pub const entries = [_]Entry{
-    .{ .key = "A fast, native terminal emulator based on Ghostty. Ghostty GX is free software under the MIT License.", .msgstr = "基于 Ghostty 的快速原生终端模拟器。Ghostty GX 是采用 MIT 许可证的自由软件。" },
     .{ .key = "A process is still running in this tab. Close it anyway?", .msgstr = "此标签页中仍有进程在运行，仍要关闭吗？" },
     .{ .key = "A process is still running in this terminal. Close it anyway?", .msgstr = "此终端中仍有进程在运行，仍要关闭吗？" },
     .{ .key = "A program in this terminal wants to copy this text to the clipboard:", .msgstr = "此终端中的程序想要将以下文本复制到剪贴板：" },
@@ -199,7 +198,8 @@ pub const entries = [_]Entry{
     .{ .key = "Ghostty", .msgstr = "Ghostty" },
     .{ .key = "Ghostty Developers", .msgstr = "Ghostty 开发团队" },
     .{ .key = "Ghostty GX", .msgstr = "Ghostty GX" },
-    .{ .key = "Ghostty Website", .msgstr = "Ghostty 官网" },
+    .{ .key = "Ghostty GX is an unofficial fork of Ghostty maintained by gx0404. It is not affiliated with or endorsed by the Ghostty project.", .msgstr = "Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。" },
+    .{ .key = "Ghostty GX is free software under the MIT License.", .msgstr = "Ghostty GX 是采用 MIT 许可证的自由软件。" },
     .{ .key = "Ghostty: Terminal Inspector", .msgstr = "Ghostty 终端调试器" },
     .{ .key = "Git Bash", .msgstr = "Git Bash" },
     .{ .key = "Global keybind unavailable", .msgstr = "全局快捷键不可用" },
@@ -422,6 +422,8 @@ pub const entries = [_]Entry{
     .{ .key = "Unable to acquire an OpenGL context for rendering.", .msgstr = "未能获取可用于渲染的 OpenGL 环境。" },
     .{ .key = "Undo", .msgstr = "撤销" },
     .{ .key = "Undo the last action.", .msgstr = "撤销上一个操作。" },
+    .{ .key = "Unofficial fork of Ghostty by gx0404", .msgstr = "gx0404 维护的 Ghostty 非官方分支" },
+    .{ .key = "Upstream Ghostty", .msgstr = "上游 Ghostty" },
     .{ .key = "Use the right-click menu or the command palette instead.", .msgstr = "可改用右键菜单或命令面板。" },
     .{ .key = "Used by new tabs and windows.", .msgstr = "用于新建的标签页和窗口。" },
     .{ .key = "Version {version}", .msgstr = "版本 {version}" },

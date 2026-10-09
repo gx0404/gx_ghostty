@@ -282,7 +282,7 @@ pub const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 pub const IDI_APPLICATION: usize = 32512;
 
 /// Resource ID of the application icon (matches ID_ICON_GHOSTTY in
-/// dist/windows/ghostty.rc).
+/// dist/windows/gx/ghostty-gx.rc).
 pub const IDI_GHOSTTY: usize = 1;
 
 // SetClassLongPtrW indices (used to swap the class-level background

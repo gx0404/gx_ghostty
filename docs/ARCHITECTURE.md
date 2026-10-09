@@ -11,12 +11,12 @@ fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器
 - **GTK 的 GX 层** `src/apprt/gtk/gx/`：运行时切换界面语言、GX 菜单与启动配置、设置对话框、快捷键速查、herdr 应用模式与 GX 样式（第 8 节）。
 - **打包、发布与开发框架**：Windows 便携 zip 与 Inno Setup 安装包、GX Shell 组件 stage、`gx-release` 发布链（第 13 节），以及 `docs/`、`scripts/`、`justfile` 组成的 AI 协作框架。
 
-改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0023，共 41 个上游文件；GX-0013 与 GX-0017～GX-0020 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
+改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026，登记了 43 个上游文件，其中 42 个带着补丁、`src/apprt/gtk/class/command_palette.zig` 已恢复上游原样；GX-0013、GX-0017～GX-0020 与 GX-0025 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
 
 | 产物 | 说明 | 根文件 / 构建逻辑 |
 |---|---|---|
 | `ghostty`（Linux、FreeBSD） | GTK 终端，含 GX 层 | `src/main_ghostty.zig::main`；`src/build/GhosttyExe.zig` |
-| `ghostty.exe`（Windows） | win32 终端，GUI 子系统，经 `dist/windows/ghostty.rc` 嵌入图标与 manifest（per-monitor v2 DPI） | 同上；`src/build/GhosttyExe.zig::init` 的 Windows 分支 |
+| `ghostty.exe`（Windows） | win32 终端，GUI 子系统，经 fork 的 `dist/windows/gx/ghostty-gx.rc`（GX-0026）嵌入 Ghostty GX 图标、版本信息与上游 manifest（per-monitor v2 DPI） | 同上；`src/build/GhosttyExe.zig::init` 的 Windows 分支 |
 | `Ghostty.app` | macOS Swift 应用（上游原样），静态链接 `macos/GhosttyKit.xcframework` | `macos/`；`src/build/GhosttyXCFramework.zig`、`src/build/GhosttyXcodebuild.zig`；日常用 `macos/build.nu` |
 | libghostty-internal | 完整核心的嵌入式 C API `include/ghostty.h`（历史名 libghostty），只服务 macOS app | `src/main_c.zig`；`src/build/GhosttyLib.zig` |
 | libghostty-vt | 可独立嵌入的终端仿真库：C 头 `include/ghostty/`、Zig 模块 `ghostty-vt`/`ghostty-vt-c`、`ghostty-vt.wasm`；API 未稳定但按 ABI 友好设计 | `src/lib_vt.zig`；`src/build/GhosttyZig.zig`、`src/build/GhosttyLibVt.zig` |
@@ -161,7 +161,7 @@ Surface（src/Surface.zig）
 | `ui/MenuPopup.zig`、`ui/Menu.zig` | Windows 11 风格的主题化弹出菜单（子菜单、键盘导航、靠屏幕边缘翻转）；主菜单、启动配置菜单、标签页与终端右键菜单 |
 | `ui/Palette.zig`、`ui/fuzzy.zig`、`ui/trigger.zig`、`ui/Keybinds.zig` | 命令面板（分组、中英文模糊匹配、本次运行内的 frecency、主题预览）；按键显示与反查；快捷键速查表 |
 | `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层：模态、背后变暗，六个分区，改动写入 `gui-settings.ghostty` 后重载 |
-| `ui/Dialogs.zig` | 主题化模态对话框：关闭与退出确认（列出仍在运行的进程）、剪贴板授权与不安全粘贴（带预览）、子进程退出、关于；任务模态，嵌套上限 4 层，对话框期间推迟 `WM_CLOSE`；另存为用系统对话框 |
+| `ui/Dialogs.zig` | 主题化模态对话框：关闭与退出确认（列出仍在运行的进程）、剪贴板授权与不安全粘贴（带预览）、子进程退出、关于（带非官方分支声明）；任务模态，嵌套上限 4 层，对话框期间推迟 `WM_CLOSE`；另存为用系统对话框 |
 | `ui/SearchBar.zig`、`ui/LinkPreview.zig`、`ui/ResizeOverlay.zig`、`ui/wstr.zig` | 查找栏（`当前/总数` 计数）、链接预览气泡、改尺寸时的列×行提示；UTF-8 → UTF-16 |
 
 - 启动：`App.init` 用 `Config.load` 加载配置（GX 分层）、修复资源管理器传来的盘符根目录工作目录、按 `language` 设定界面语言、注册窗口类与消息专用窗口；`App.run` 建第一个窗口与标签后进入消息循环。终端子窗口的按键消息跳过 `TranslateMessage`（由 `handleKeyEvent` 自己调 `ToUnicode`，避免死键状态被改两次），只有 `VK_PROCESSKEY`（交给输入法）与 `VK_PACKET`（`SendInput` 注入的 Unicode）照常翻译。
@@ -177,6 +177,7 @@ Surface（src/Surface.zig）
 | `config_layers.zig`、`config_types.zig`、`defaults.ghostty`、`defaults-windows.ghostty`、`theme.zig`、`themes/` | 配置分层（下文）、`gx-*` 键的值类型、内嵌的 GX 默认值、内置主题 `GX Mocha` |
 | `gui_settings.zig`、`settings_map.zig` | 设置界面的覆盖文件 `gui-settings.ghostty`（逐行编辑、原子替换）；与界面无关的设置模型（选项、写入的键、待保存的改动） |
 | `i18n.zig`、`i18n/gx.zh_CN.po`、`i18n/zh_CN.zig` | 界面语言（`zh-CN`/`en`，进程级，可运行时切换）与 zh-CN 译表；译表由 `just i18n` 从 `po/zh_CN.po` 与 `gx.zh_CN.po` 生成 |
+| `branding.zig` | 两个 apprt 的「关于」用的产品名、维护者、链接与非官方分支声明（msgid） |
 | `profiles.zig` | 启动配置探测（Windows：GX Zsh、herdr、PowerShell 7、Windows PowerShell、命令提示符、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版；Linux：GX Zsh、herdr、登录 shell、zsh、bash、fish）加 `gx-launch-profile`，以及默认启动配置的顺序 |
 | `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 列进程（Linux `/proc`，Windows Toolhelp32）、空闲进程策略、关闭确认（GX-0012）、herdr 应用模式判定 |
 | `action.zig` | `gx:<name>[:<argument>]` 动作的类型、解析与格式化（GX-0014） |
@@ -195,7 +196,7 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 
 | 模块 | 作用 |
 |---|---|
-| `language.zig`、`app.zig` | 启动与运行时应用 `language`：改写 `LANGUAGE` 与 `LC_MESSAGES`、让 gettext 缓存失效、切换 `gx.i18n`，子进程拿回原来的 `LANG`/`LANGUAGE`；app action `app.gx-language`、`app.gx-keybinds`；`performGxAction` 执行五个 `gx:` 动作 |
+| `language.zig`、`app.zig` | 启动与运行时应用 `language`：改写 `LANGUAGE` 与 `LC_MESSAGES`、让 gettext 缓存失效、切换 `gx.i18n`，子进程拿回原来的 `LANG`/`LANGUAGE`；app action `app.gx-language`、`app.gx-keybinds`、`app.gx-about`（`about.zig` 的 Ghostty GX 关于对话框，GX 主菜单用它代替上游 `win.about`）；`performGxAction` 执行五个 `gx:` 动作 |
 | `window.zig`、`menus.zig`、`ui/1.5/gx/menus.blp`、`launch.zig` | 菜单与按钮提示随语言重建（复刻上游菜单并加 GX 分区：设置…、键盘快捷键、语言）；新建标签页下拉的启动配置与「用启动配置新建窗口」 |
 | `shortcuts.zig`、`shortcuts_dialog.zig` | 快捷键速查表（`Adw.Dialog`，可搜索） |
 | `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`，运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
@@ -288,7 +289,8 @@ Windows 包的第三方下载都在 `scripts/gx_windows_package.py::DOWNLOADS`/`
 |---|---|---|
 | fork 独占 | 第 2 节列出的 fork 新增路径 | 不冲突；上游新路径要在 `routes.toml` 登记 |
 | 上游文件 + 追加段 | 根 `AGENTS.md`（`<!-- gx-fork: … -->` 以下）、`.gitignore`、`.prettierignore`（`# --- GX fork：` 段） | 标记以上取上游，标记段原样保留 |
-| 上游文件 + 补丁 | [FORK_PATCHES.md](FORK_PATCHES.md) 登记表里状态为 `active` 的 41 个文件，集中在 `src/Surface.zig`、`src/config/Config.zig`、`src/termio/`、`src/apprt/gtk/class/`、`src/renderer/`、`src/font/` 与 `build.zig`，另有 GTK 的 `src/apprt/gtk/css/style.css` | 按补丁小节的「同步冲突处理」复核，热点见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」 |
+| 上游文件 + 开头声明块 | 根 `README.md`（`<!-- gx-fork: … -->` 到 `<!-- /gx-fork -->`） | 声明块原样保留在开头，其后取上游 |
+| 上游文件 + 补丁 | [FORK_PATCHES.md](FORK_PATCHES.md) 登记表里状态为 `active` 的 42 个文件，集中在 `src/Surface.zig`、`src/config/Config.zig`、`src/termio/`、`src/apprt/gtk/class/`、`src/renderer/`、`src/font/` 与 `build.zig`，另有 GTK 的 `src/apprt/gtk/css/style.css` 与构建的 `src/build/GhosttyExe.zig` | 按补丁小节的「同步冲突处理」复核，热点见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」 |
 | 上游文件移位 | 15 个上游 workflow 原样移到 `.github/workflows-archive/` | 上游新增的 workflow 也 `git mv` 进归档，不启用 |
 | 上游独占 | 其余全部，含 `.agents/`、9 份嵌套 `AGENTS.md`、`CODEOWNERS`、lint 配置、`dependabot.yml` | 取上游 |
 

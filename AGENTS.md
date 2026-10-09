@@ -70,7 +70,7 @@ Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领�
 - 上游 `ghostty-org/ghostty`（remote `upstream`），fork `gx0404/gx_ghostty`（remote `origin`）。`main` 只快进镜像上游；`gx_ghostty` 是开发与发布分支。
 - 同步用 merge：`main` 快进到 `upstream/main` 后合入 `gx_ghostty`。永不 force push，永不推送 `upstream`；流程见 `docs/DEVELOPMENT.md`。
 - 上文 Issue and PR Guidelines 照常适用：agent 不创建 issue 或 PR，上游与本 fork 都一样。
-- 改动过的上游文件以 `docs/FORK_PATCHES.md` 登记表（源码补丁 GX-NNNN）为准，另有本文件、`.gitignore`、`.prettierignore` 的标记追加段与归档的 workflow；fork 代码一律放上游没有的新路径（`src/gx/`、`src/apprt/win32/`、`src/apprt/gtk/gx/`、`src/font/directwrite/` 等），上游文件里只留登记过的钩子。
+- 改动过的上游文件以 `docs/FORK_PATCHES.md` 登记表（源码补丁 GX-NNNN）为准，另有本文件、`.gitignore`、`.prettierignore` 的标记追加段，根 `README.md` 开头的标记声明块与归档的 workflow；fork 代码一律放上游没有的新路径（`src/gx/`、`src/apprt/win32/`、`src/apprt/gtk/gx/`、`src/font/directwrite/` 等），上游文件里只留登记过的钩子。
 - 改上游源码必须加 `fork(gx): GX-NNNN` 标记并登记到 `docs/FORK_PATCHES.md`，`scripts/test_fork_patches.py` 锁定闭集。
 - `.github/workflows/` 只启用 `gx-ci.yml` 与 `gx-release.yml`；上游 workflow 原样归档在 `.github/workflows-archive/`，同步带来的新 workflow 也 `git mv` 进去，不得重新启用。
 - 根 `CHANGELOG.md` 只记 fork 的可观察变更（上游没有 CHANGELOG）；产品版本仍以 `build.zig.zon` 为真源。

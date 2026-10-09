@@ -14,10 +14,14 @@
 ### Added
 
 - Windows 应用检测被占用的快捷键：第一个窗口显示约 1 秒后与每次重载配置后，检查每个带修饰键的绑定是否被其他程序注册为全局快捷键（例如 bilibili 客户端的「老板键」Ctrl+Shift+C），以及是否是当前输入法经 TSF 保留的按键（微软拼音简繁切换的 Ctrl+Shift+F 不是保留键，检测不到）。每个受影响的绑定在日志里记一条警告；快捷键速查表（Ctrl+Shift+/）在这些按键前加警告标记并说明原因；右键菜单、主菜单与命令面板改为提示同一动作的其他可用按键，没有就不提示；默认的复制、粘贴、查找或分屏键受影响时，每次运行在窗口底部提示一次（约 20 秒后消失），列出被占用的键与替代方式（Ctrl+Insert / Shift+Insert、右键菜单、命令面板），并可直接打开速查表。
+- 写明 Ghostty GX 是非官方分支：Windows 的「关于」对话框与设置的「关于」页、Linux GTK 设置对话框的「关于」页、安装包的欢迎页与「应用和功能」里的说明、便携包的 `README.txt`、GitHub 发布说明的结尾与仓库首页 README 的开头，都写明「Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书」（英文界面显示英文）。
+- Linux GTK 主菜单的「关于 Ghostty GX」打开 Ghostty GX 自己的关于对话框：名称、版本、项目主页与问题反馈都指向 gx0404/gx_ghostty，首页写明「gx0404 维护的 Ghostty 非官方分支」，不再显示把本构建说成 Ghostty 开发者出品的上游关于对话框。
 
 ### Changed
 
 - Windows 窗口材质透到整个终端区：`gx-window-material = mica|acrylic|tabbed` 不再只透在标题栏，终端背景按 `background-opacity` 透出材质，文字、光标、选区与图片保持不透明，分屏间隙一样透出。没设 `background-opacity` 时材质自带默认值（同 WezTerm GX）：Mica、Tabbed 为 0.3，Acrylic 为 0.75；显式设置（包括 `background-opacity = 1`，只在标题栏透出材质）优先。`solid` 配 `background-opacity` 小于 1 时改为只有终端背景透明、桌面透过来，文字不再随整窗变淡，`background-blur` 照常模糊透出的桌面；`toggle_background_opacity` 改为所有窗口一起在配置的不透明度与不透明之间切换（同 macOS）。需要 Windows 11 22H2（build 22621）及以上与硬件 OpenGL 驱动；更早的系统、Mesa 软件渲染（`GHOSTTY_GX_OPENGL=software`）或像素格式没有 alpha 时保持 0.0.1 的行为，日志记一行原因。`background-opacity` 的配置文档（`+explain-config background-opacity`）写明了 Windows 上的这些行为（GX-0024）。
+- Ghostty GX 的 Windows 应用与安装包改用自己的图标（GX Mocha 配色的深色圆角方块加蓝色 `>_` 提示符，48 像素起加 `GX` 字样），不再使用 Ghostty 的幽灵图标；标题栏、任务栏、资源管理器、通知区域、安装程序与 GX Shell 的 Windows 安装包都显示它（GX-0026）。`ghostty.exe` 的文件属性显示产品名 Ghostty GX、发行者 gx0404 与非官方分支声明。Linux GTK 应用仍用上游图标。
+- Windows「关于」对话框的第二个链接改为「上游 Ghostty」，指向 ghostty.org。
 - 知识库产物 `docs/kb/chunks.json` 改为 schema 2，体积从约 2.3 MiB 降到约 1.8 MiB（预算仍是 2.5 MiB）：每个文档一行头（路径与逐文档的 `source_sha256`），其后每片一行，diff 按行对应小节；Markdown 正文不变，Zig 结构省略 `pub` 前缀、超长模块文档截断，Zig 与 C 头文件的文档注释只留摘要句。`just kb-query --json` 的 `id` 改为 `path#anchor`；旧格式的产物由 `just kb-check` 报「格式或 schema 变化」，运行 `just kb` 重建即可。
 
 ### Fixed

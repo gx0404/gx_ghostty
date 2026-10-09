@@ -17,8 +17,10 @@ Actions:
   publish --sha SHA --artifacts DIR [--macos] [--version-string VS]
       Only inside the manual gx-release workflow of gx0404/gx_ghostty: re-verify, create a
       draft release (not a prerelease) targeting SHA whose notes are the CHANGELOG.md section
-      of the version followed by the generated asset table, upload every asset, compare remote
-      sizes and digests, then publish it. Never overwrites a release, never reuses or moves a tag.
+      of the version followed by the generated asset table and the fixed footer DISCLAIMER (an
+      unofficial fork, not affiliated with or endorsed by the Ghostty project), upload every
+      asset, compare remote sizes and digests, then publish it. Never overwrites a release,
+      never reuses or moves a tag.
 
 Exit codes: 0 success, 1 refused or failed, 2 usage error.
 """
@@ -55,6 +57,16 @@ WORKFLOW_PATH = ".github/workflows/gx-release.yml"
 TAG_PREFIX = "gx-v"
 MANIFEST = "manifest.json"
 SUMS = "SHA256SUMS"
+# Fixed footer of every release body: the Ghostty maintainers ask unofficial builds to say that
+# they are not affiliated with or endorsed by the Ghostty project.
+DISCLAIMER = (
+    "---",
+    "",
+    "> Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。",
+    ">",
+    "> Ghostty GX is an unofficial fork of Ghostty maintained by gx0404. "
+    "It is not affiliated with or endorsed by the Ghostty project.",
+)
 SOURCE_LIBVT_MAX_BYTES = 5 * 1024 * 1024
 LINUX_LIBVT_TARGETS = ("x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl")
 WASM_LIBVT_TARGET = "wasm32-freestanding"
@@ -716,14 +728,14 @@ def asset_description(name: str, asset: Asset | None) -> str:
     if asset.kind == "libvt":
         return f"libghostty-vt 预编译库（`{asset.target}`）"
     if asset.target == LINUX_APP_TARGET:
-        return "Ghostty GTK app（实验性，debian:13 构建，解压后运行 `usr/bin/ghostty`）"
+        return "Ghostty GX 的 Linux GTK 构建（实验性，debian:13 构建，解压后运行 `usr/bin/ghostty`）"
     if asset.kind == "installer":
         return ("Ghostty GX Windows 安装包（x64；默认按用户安装到 `%LOCALAPPDATA%\\Programs\\Ghostty GX`，"
                 "可改为所有用户；可选桌面图标与资源管理器右键菜单，按同一范围安装随附字体，卸载保留用户配置）")
     if asset.target == WINDOWS_APP_TARGET:
         return ("Ghostty GX Windows 便携版（x64；解压后运行 `ghostty.exe`，附 ConPTY、Mesa 软件渲染后备、"
                 "字体与许可证，见包内 `README.txt`）")
-    return "Ghostty.app（universal，仅 ad-hoc 签名，未公证）"
+    return "由本 fork 源码构建的 macOS app `Ghostty.app`（非官方构建；universal，仅 ad-hoc 签名，未公证）"
 
 
 def release_notes(info: ReleaseInfo, sha: str, macos: bool, files: list[Path], changelog: str) -> str:
@@ -747,6 +759,8 @@ def release_notes(info: ReleaseInfo, sha: str, macos: bool, files: list[Path], c
         "macOS 包只有 ad-hoc 签名、未经公证，Linux GTK 包是实验性构建。"
         "下载后用 `sha256sum -c SHA256SUMS` 校验（Windows 可用 PowerShell 的 `Get-FileHash`）。",
         f"fork 变更见 [CHANGELOG.md](https://github.com/{REPOSITORY}/blob/{info.tag}/CHANGELOG.md)。",
+        "",
+        *DISCLAIMER,
         "",
     ])
 

@@ -805,6 +805,11 @@ class PublishTests(EnvironmentCase):
         for name in (WINDOWS_ZIP, WINDOWS_SETUP):
             self.assertRegex(notes, rf"\| `{name}` \| Ghostty GX Windows ")
         self.assertLess(notes.index(CHANGELOG_BODY), notes.index("| 资产 | 说明 |"))
+        self.assertTrue(notes.endswith("\n".join(release.DISCLAIMER) + "\n"), notes[-400:])
+        self.assertIn("> Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。", notes)
+        self.assertIn("> Ghostty GX is an unofficial fork of Ghostty maintained by gx0404. "
+                      "It is not affiliated with or endorsed by the Ghostty project.", notes)
+        self.assertNotIn("Ghostty GTK app", notes)
 
     def test_a_draft_marked_as_prerelease_is_not_published(self):
         self.runner.prerelease_override = True

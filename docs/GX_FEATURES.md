@@ -1,5 +1,7 @@
 # Ghostty GX 功能清单与 WezTerm GX 对照
 
+> Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。本页的「Ghostty GX」均指这个分支，不指 Ghostty 官方发布。
+
 Ghostty GX 0.0.1 是 GX Shell 新的终端组件，接替 WezTerm GX（GX Shell 0.4.0 起）。本页按功能对照 WezTerm GX 与 Ghostty GX 在 Windows、Linux GTK 上的实现，并列出借鉴自社区项目的做法。代码结构见 [ARCHITECTURE.md](ARCHITECTURE.md)，可观察变更的完整描述见根 `CHANGELOG.md`，验证情况见 [TESTING.md](TESTING.md)。
 
 口径：

@@ -32,6 +32,18 @@ HUNK_BEGIN_RE = re.compile(r"^[ \t]*// fork\(gx\): (GX-\d{4}) begin(?::.*)?$")
 HUNK_END_RE = re.compile(r"^[ \t]*// fork\(gx\): (GX-\d{4}) end$")
 UPSTREAM_REFS = ("main", "origin/main", "upstream/main")
 
+# The marked notice block at the top of the upstream README.md (not a source patch).
+README_NOTICE_BEGIN = "<!-- gx-fork:"
+README_NOTICE_END = "<!-- /gx-fork -->"
+README_NOTICES = (
+    "Ghostty GX is an unofficial fork of Ghostty maintained by [gx0404](https://github.com/gx0404). "
+    "It is not affiliated with or endorsed by the Ghostty project.",
+    "Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。",
+)
+
+GHOSTTY_EXE_ZIG = "src/build/GhosttyExe.zig"
+GX0026_RC = 'b.path("dist/windows/gx/ghostty-gx.rc")'
+
 CONFIG_ZIG = "src/build/Config.zig"
 GX0001_MARKER = "fork(gx): GX-0001"
 GX0001_GUARD_CALL = 'std.mem.startsWith(u8, tag, "v")'
@@ -444,6 +456,22 @@ class RealRepoTests(unittest.TestCase):
 
     def test_markers_registered_and_closed(self):
         self.assertEqual(check(ROOT), [])
+
+    def test_readme_starts_with_the_unofficial_fork_notice(self):
+        lines = (ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+        self.assertTrue(lines[0].startswith(README_NOTICE_BEGIN), lines[0])
+        self.assertEqual(sum(line.startswith(README_NOTICE_BEGIN) for line in lines), 1)
+        self.assertEqual(lines.count(README_NOTICE_END), 1)
+        block = "\n".join(lines[:lines.index(README_NOTICE_END)])
+        for notice in README_NOTICES:
+            self.assertIn(notice, block)
+
+    def test_ghostty_exe_embeds_the_fork_resources(self):
+        lines = (ROOT / GHOSTTY_EXE_ZIG).read_text(encoding="utf-8").splitlines()
+        selected = [i for i, line in enumerate(lines) if GX0026_RC in line]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("fork(gx): GX-0026", lines[selected[0] - 1])
+        self.assertFalse(any('"dist/windows/ghostty.rc"' in line for line in lines))
 
     def test_config_zig_keeps_the_gx0001_guard(self):
         source = (ROOT / CONFIG_ZIG).read_text(encoding="utf-8")

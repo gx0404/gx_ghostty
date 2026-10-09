@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Config = @import("../config/Config.zig");
+const branding = @import("branding.zig");
 const gui_settings = @import("gui_settings.zig");
 const profiles = @import("profiles.zig");
 
@@ -48,6 +49,7 @@ pub const msg = struct {
     pub const herdr_exit = "herdr exited with code {code} while setting its default shell.";
     pub const about = "About";
     pub const app_name = "Ghostty GX";
+    pub const notice = branding.notice;
     pub const version = "Version {version}";
     pub const config_file = "Configuration File";
     pub const settings_file = "Settings File";

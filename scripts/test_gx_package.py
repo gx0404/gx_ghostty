@@ -33,7 +33,7 @@ ROOT = SCRIPTS.parent
 VS = release.release_info(ROOT).version_string
 SHA = "a" * 40
 ROOT_FILES = (
-    "LICENSE", "CHANGELOG.md", "build.zig.zon", "scripts/setup_zig.py", "dist/windows/ghostty.ico",
+    "LICENSE", "CHANGELOG.md", "build.zig.zon", "scripts/setup_zig.py", "dist/windows/gx/ghostty-gx.ico",
     "dist/windows/gx/ghostty-gx.iss", *(item.member for item in pkg.PAYLOAD if item.source == pkg.REPO),
     *(f"images/gnome/{size}.png" for size in stage_mod.ICON_SIZES),
 )
@@ -373,7 +373,9 @@ class PortableTreeTests(Case):
         self.assertTrue(readme.startswith(b"\xef\xbb\xbf"))
         text = readme[3:].decode("utf-8")
         self.assertNotIn("\n", text.replace("\r\n", ""))
-        for needle in (VS, "不是 Ghostty 官方发布", "not an\r\nofficial Ghostty release", pkg.installer_base(VS),
+        for needle in (VS, "Ghostty GX 是 Ghostty 的非官方分支", "与 Ghostty 团队无关，未获其认可或背书",
+                       "Ghostty GX is an unofficial fork of Ghostty maintained by gx0404",
+                       "It is not affiliated with or endorsed by the Ghostty project.", pkg.installer_base(VS),
                        "GHOSTTY_GX_OPENGL=software", "Get-FileHash"):
             self.assertIn(needle, text)
         third_party = (tree / "licenses/THIRD-PARTY.txt").read_text(encoding="utf-8")
@@ -585,6 +587,17 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn("#if VER < EncodeVer(7, 1, 0) || VER >= EncodeVer(8, 0, 0)", self.lines)
         self.assertFalse(self.text.startswith("\ufeff"))
 
+    def test_unofficial_fork_notice(self):
+        notice_en = ("Ghostty GX is an unofficial fork of Ghostty maintained by gx0404. "
+                     "It is not affiliated with or endorsed by the Ghostty project.")
+        notice_zh = "Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。"
+        self.assertEqual(self.setting("AppComments"), notice_en)
+        self.assertEqual(self.setting("DisableWelcomePage"), "no")
+        self.assertIn(f"%n%n{notice_en}%n%n", self.setting("english.WelcomeLabel2"))
+        self.assertIn(f"%n%n{notice_zh}%n%n", self.setting("chinesesimplified.WelcomeLabel2"))
+        self.assertEqual(Path(self.setting("SetupIconFile").strip("{}#")), Path("GxIcon"))
+        self.assertEqual(pkg.ICON, Path("dist/windows/gx/ghostty-gx.ico"))
+
     def test_languages_tasks_files_and_shortcuts(self):
         self.assertIn('Name: "chinesesimplified"; MessagesFile: "compiler:Languages\\ChineseSimplified.isl"', self.lines)
         self.assertIn('Name: "english"; MessagesFile: "compiler:Default.isl"', self.lines)
@@ -629,7 +642,7 @@ class WindowsStageTests(Case):
         self.assertEqual({path.name for path in stage.iterdir()}, {"app", "fonts", "build-inputs", "stage-manifest.json"})
         self.assertEqual(sorted(path.name for path in (stage / "fonts").iterdir()), sorted(release.WINDOWS_FONTS))
         self.assertFalse((stage / "app/fonts").exists())
-        self.assertEqual((stage / "build-inputs/ghostty.ico").read_bytes(), (ROOT / "dist/windows/ghostty.ico").read_bytes())
+        self.assertEqual((stage / "build-inputs/ghostty.ico").read_bytes(), (ROOT / "dist/windows/gx/ghostty-gx.ico").read_bytes())
         info = release.release_info(self.root)
         self.assertEqual({key: manifest[key] for key in ("schema", "platform", "architecture", "source_repository",
                                                            "source_commit", "source_dirty", "package_version",

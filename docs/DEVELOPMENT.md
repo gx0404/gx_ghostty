@@ -230,6 +230,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 
 - **根 `AGENTS.md`**：标记行 `<!-- gx-fork: … -->` 以上整段取上游新版本，标记及以下保留 fork 段。再核对上游新内容有没有让 fork 段里的命令或描述失效，需要时改 fork 段与对应领域文档。合并后超过 16 KiB 时压缩 fork 段，不删改上游原文。
 - **`.gitignore`、`.prettierignore`**：上游行取上游版本；以 `# --- GX fork：` 开头的追加段原样保留在文件末尾。
+- **根 `README.md`**：开头 `<!-- gx-fork: … -->` 到 `<!-- /gx-fork -->` 的非官方分支声明块原样保留，其后整段取上游新版本；`python scripts/run_unittests.py test_fork_patches` 校验声明块仍在首行。
 - **workflow**：上游修改已归档的 workflow 时，Git 的重命名检测通常会把改动直接落到 `.github/workflows-archive/<name>.yml`，不产生冲突；上游删除已归档的 workflow 时出现 rename/delete 冲突，跟随上游删除归档副本（`git rm`）；上游新增的 workflow 会出现在 `.github/workflows/`，必须原样 `git mv` 进 `.github/workflows-archive/`。最终启用的只能是 `gx-ci.yml` 与 `gx-release.yml`，由 `scripts/test_gx_workflows.py` 锁定。以上 Git 行为已在临时仓库中用 Git 2.56 验证。归档文件有增删时，同步更新 `scripts/test_gx_workflows.py` 的 `ARCHIVED` 清单与 `.github/workflows-archive/README.md` 的用途表；`gx-*.yml` 的每个 action 都复用归档里已钉的 SHA 与版本注释，上游升级钉版后旧 SHA 若不再出现在归档里，同一测试会失败，这时把 `gx-*.yml` 里的 SHA 改成上游的新值。
 - **fork 补丁**：按 `docs/FORK_PATCHES.md` 逐条核对补丁是否仍然需要、是否仍然成立，冲突按该补丁小节的「同步冲突处理」放回，标记与登记由 `scripts/test_fork_patches.py` 检查。热点见下表。
 - **其余上游文件**：取上游版本。不用整文件 ours/theirs 糊过冲突，也不用 squash、cherry-pick 或 rebase 代替合并。
@@ -254,6 +255,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 | GX-0021 | `src/renderer/generic.zig` | 预编辑追赶循环的 `< len` 上界；上游自己修好后按移除条件删除 |
 | GX-0022 | `src/terminal/Terminal.zig`、`src/termio/Exec.zig` | `flags.semantic_prompt_fresh_line` 紧跟 `resize_pull_scrollback` 且 `fullReset` 保留它；`semanticPromptFreshLine` 开头的早退；`Exec.initTerminal` 在 Windows 上关闭它与 `resize_pull_scrollback`；上游改 `PageList.resize` 的拉回语义时跑 `scrollback pull` 用例 |
 | GX-0023 | `src/apprt/gtk/css/style.css`、`src/apprt/gtk/class/application.zig` | GTK 4.14 能解析的 CSS：渐变不用过渡提示、`hsl()` 用逗号、`loadRuntimeCss414` 不用 `oklab(from …)`；上游新增的 CSS 跑 `scripts/test_fork_patches.py` 并看 `just wsl smoke` 日志有无 `Theme parser error` |
+| GX-0026 | `src/build/GhosttyExe.zig` | Windows 分支的 `addWin32ResourceFile` 仍指向 `dist/windows/gx/ghostty-gx.rc`；上游改了 `dist/windows/ghostty.rc` 时把同样的变化搬进 fork 的 rc |
 
 合并后，`gx-ci` 的 `windows-app` 只构建 app、不跑单测，`linux-main` 只编译 `-Dapp-runtime=none`、不含 GTK apprt，所以 Windows 上的单测与 GTK apprt 的编译和单测要在本机补齐：Windows 上 `just build` 与 `just test`，WSL 里 `just wsl build --gtk` 与 `just wsl test --gtk`。
 

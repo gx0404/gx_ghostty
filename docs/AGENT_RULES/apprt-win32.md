@@ -3,7 +3,7 @@
 ## 范围
 
 - fork 新路径 `src/apprt/win32.zig` 与 `src/apprt/win32/**`：Windows 目标默认的 apprt（补丁 GX-0003 在 `src/apprt/runtime.zig::Runtime` 加入 `win32` 并设为 Windows 默认值），移植自 MIT 许可的 shiweis/ghostty-windows@119b9270c 后按模块拆分，文件头注明出处。
-- 渲染钩子 `src/renderer/opengl/wgl.zig`（补丁 GX-0004，同属 `renderer`），以及编进 exe 的 `dist/windows/` 顶层资源 `ghostty.rc`、`ghostty.ico`、`ghostty.manifest`（同属 `packaging-dist`）。
+- 渲染钩子 `src/renderer/opengl/wgl.zig`（补丁 GX-0004，同属 `renderer`），以及编进 exe 的资源：fork 的 `dist/windows/gx/ghostty-gx.rc`（GX-0026 让 `src/build/GhosttyExe.zig` 选用它）引用 Ghostty GX 图标 `dist/windows/gx/ghostty-gx.ico` 与上游的 `dist/windows/ghostty.manifest`；上游的 `ghostty.rc`、`ghostty.ico` 不再编进 exe（同属 `packaging-dist`）。
 - 分界：apprt 接口、Surface 生命周期与 `needsConfirmQuit` 见 `app-core.md`；共享核心 `src/gx/**`（UI 语言、配置分层、启动配置、`gx:` 动作、进程判断、win32-input-mode 编码、ConPTY、OSC 7）见 `gx-core.md`；DirectWrite 字体发现见 `font.md`；ConPTY 与 termio 的 Windows 分支见 `termio-pty-os.md`；便携包与安装包见 `packaging-dist.md`。
 
 ## 符号真源
@@ -20,7 +20,7 @@
 | `ui/d2d.zig`、`ui/style.zig`、`ui/Popup.zig` | 手写的 Direct2D/DirectWrite COM 绑定与 `Canvas`（单位 DIP）；由终端配色派生的设计 token；可复用弹层（DWM 圆角、每显示器 DPI、可接输入法的 `TextInput`） |
 | `ui/Palette.zig`、`ui/Keybinds.zig`、`ui/fuzzy.zig`、`ui/trigger.zig` | 命令面板、快捷键速查表（标出冲突按键）、模糊匹配与 frecency、绑定键帽与菜单提示（`Hints` 跳过冲突按键） |
 | `ui/Menu.zig`、`ui/MenuPopup.zig` | 主菜单、启动配置菜单、标签与终端右键菜单；按主题自绘的模态菜单 |
-| `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层（语言、外观、字体、交互、Shell、关于），写 `gui-settings.ghostty` 后重载配置 |
+| `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层（语言、外观、字体、交互、Shell、关于；关于页与关于对话框都显示 `src/gx/branding.zig` 的非官方分支声明），写 `gui-settings.ghostty` 后重载配置 |
 | `ui/Dialogs.zig`、`ui/SearchBar.zig`、`ui/LinkPreview.zig`、`ui/ResizeOverlay.zig`、`ui/ShortcutNotice.zig`、`Scrollbar.zig` | 主题化对话框、查找栏、链接预览、尺寸提示、快捷键冲突提示条、细滚动条 |
 | `QuickTerminal.zig`、`file_log.zig`、`win32.zig`、`ui/wstr.zig` | 快速终端；日志 `%LOCALAPPDATA%\ghostty\logs\ghostty.log`（上一次运行保留为 `.log.1`）；Win32 声明；UTF-8 转 UTF-16 |
 

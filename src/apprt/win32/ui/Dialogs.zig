@@ -27,6 +27,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const i18n = @import("../../../gx/i18n.zig");
+const branding = @import("../../../gx/branding.zig");
 const App = @import("../App.zig");
 const Window = @import("../Window.zig");
 const w32 = @import("../win32.zig");
@@ -171,11 +172,17 @@ pub fn showChildExited(owner: ?w32.HWND, exit_code: u32) void {
     });
 }
 
-/// The About dialog: product name, version and links.
+/// The About dialog: product name, version, the notice that Ghostty GX
+/// is an unofficial fork, and links.
 pub fn showAbout(owner: ?w32.HWND, version: []const u8) void {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     i18n.format(&writer, i18n.tr("Version {version}"), .{ .version = version }) catch {};
+    var detail_buf: [512]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "{s}\n{s}", .{
+        i18n.tr(branding.notice),
+        i18n.tr(branding.license),
+    }) catch i18n.tr(branding.notice);
     var copy_buf: [128]u8 = undefined;
     const copy_text = std.fmt.bufPrint(&copy_buf, "Ghostty GX {s}", .{version}) catch "Ghostty GX";
     _ = run(owner, .{
@@ -183,10 +190,10 @@ pub fn showAbout(owner: ?w32.HWND, version: []const u8) void {
         .title = i18n.tr("Ghostty GX"),
         .icon = .info,
         .body = writer.buffered(),
-        .detail = i18n.tr("A fast, native terminal emulator based on Ghostty. Ghostty GX is free software under the MIT License."),
+        .detail = detail,
         .links = &.{
-            .{ .label = i18n.tr("Project Home"), .url = "https://github.com/gx0404/gx_ghostty" },
-            .{ .label = i18n.tr("Ghostty Website"), .url = "https://ghostty.org" },
+            .{ .label = i18n.tr("Project Home"), .url = branding.home_url },
+            .{ .label = i18n.tr("Upstream Ghostty"), .url = branding.ghostty_url },
         },
         .copy_text = copy_text,
         .buttons = &.{

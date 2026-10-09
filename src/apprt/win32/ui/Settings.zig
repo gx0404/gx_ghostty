@@ -888,6 +888,7 @@ fn buildRows(self: *Settings, buf: *[max_rows]Row) []Row {
                 .title = i18n.tr(msg.app_name),
                 .detail = i18n.fill(scratch, i18n.tr(msg.version), .{ .version = build_config.version_string }) catch "",
             });
+            rows.add(.{ .kind = .note, .detail = i18n.tr(msg.notice) });
             rows.add(.{ .kind = .info, .title = i18n.tr(msg.config_file), .detail = self.config_path });
             rows.add(.{ .kind = .info, .title = i18n.tr(msg.settings_file), .detail = self.overlay_path });
             rows.add(.{ .kind = .note, .detail = i18n.tr(msg.settings_file_hint) });

@@ -13,6 +13,7 @@
 - `docs/AGENT_RULES/routes.toml`：路由唯一机器真源，schema v3（`version = 3`、`root_max_bytes = 16384`、`root_only`、`nested_agents`、`[[rules]]` 每条恰为 `id/doc/paths/tasks`）。人读索引与维护约定在 `docs/AGENT_RULES/README.md`。
 - `scripts/resolve_agent_rules.py`：参数、输出顺序与退出码见 `docs/AGENT_RULES/README.md`；`--check` 单独使用，做全仓守门，违规退出 2。根 `AGENTS.md` 常驻加载，不在输出里。
 - 根 `AGENTS.md`：上游原文在前，标记行 `<!-- gx-fork: AI 协作框架（fork 维护段，上游没有；同步时保留）-->` 之后是 fork 段；`CLAUDE.md` 是指回它的薄入口。
+- 根 `README.md`：开头 `<!-- gx-fork: … -->` 到 `<!-- /gx-fork -->` 是中英文非官方分支声明，其后是上游原文；同步时保留声明块、其余取上游（`scripts/test_fork_patches.py` 锁定）。
 - `.claude/hooks/dangerous_patterns.conf`：危险操作策略唯一真源（`SECTION<TAB>regex<TAB>reason<TAB>deny|ask`），Claude、Codex、ZCode 的 PreToolUse 适配器只读取它；探针 `scripts/test_ai_tool_hooks.py`；接入与逐客户端验证账本 `docs/AI_TOOLS.md`。
 - `justfile` 与命令手册 `docs/MAKE_COMMANDS.md`；Zig 封装 `scripts/zigw.py`，环境 `scripts/setup_zig.py`、`scripts/setup_env.py`。
 - 测试运行器：`scripts/zig_test.py`（`just test-vt`、`just test`，用法见 `testing.md`）与 `scripts/run_unittests.py`（`just framework-test`），锁定测试 `scripts/test_zig_test.py`、`scripts/test_run_unittests.py`；耗时缓存只写 `.local/test-timings/`。
@@ -74,7 +75,7 @@
 
 ### fork 补丁登记
 
-- 改动过的上游文件：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、归档的 workflow，以及 `docs/FORK_PATCHES.md` 登记表列出的源码补丁；以登记表为准，不在别处抄清单。fork 自有代码一律放上游没有的新路径（`src/gx/`、`src/apprt/win32/`、`src/apprt/gtk/gx/`、`src/font/directwrite/` 等）。
+- 改动过的上游文件：`AGENTS.md`（标记后追加）、`README.md`（开头声明块）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、归档的 workflow，以及 `docs/FORK_PATCHES.md` 登记表列出的源码补丁；以登记表为准，不在别处抄清单。fork 自有代码一律放上游没有的新路径（`src/gx/`、`src/apprt/win32/`、`src/apprt/gtk/gx/`、`src/font/directwrite/` 等）。
 - 改上游源码（`src/`、`include/`、`pkg/`、`macos/` 与 `build.zig`）必须紧邻改动写 `fork(gx): GX-NNNN` 标记注释，并在 `docs/FORK_PATCHES.md` 登记原因与移除条件；`scripts/test_fork_patches.py` 扫描这些路径，锁定标记与登记的闭集。追加段与新路径不是源码补丁，不登记。未登记的标记、无标记的上游语义改动都是缺陷；不为「顺手」重排或重格式化上游文件。
 - 与框架相关的两项：GX-0001 让 HEAD 上不以 `v` 开头的 tag（如 `gx-v0.0.1`）不再 `@panic`（版本契约见 `ci-release.md`）；GX-0002 注册只编译、不运行的 `test-lib-vt-bin`、`test-bin`，安装路径与 `scripts/zig_test.py::SUITES` 一一对应，改一边要同步另一边。
 

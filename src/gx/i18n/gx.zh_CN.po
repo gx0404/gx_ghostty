@@ -397,6 +397,10 @@ msgstr "命令执行失败"
 msgid "Language changed. Reopen the window to update all labels."
 msgstr "界面语言已切换，重新打开窗口后全部文字才会更新。"
 
+#. GTK: About dialog, under the application name
+msgid "Unofficial fork of Ghostty by gx0404"
+msgstr "gx0404 维护的 Ghostty 非官方分支"
+
 #. GTK: new tab dropdown (launch profiles and splits)
 msgid "Launch Profiles and Splits"
 msgstr "启动配置与分屏"
@@ -609,15 +613,19 @@ msgstr "……另有 {count} 个"
 msgid "… {count} more lines"
 msgstr "……还有 {count} 行"
 
-#. Windows apprt: About dialog
-msgid "A fast, native terminal emulator based on Ghostty. Ghostty GX is free software under the MIT License."
-msgstr "基于 Ghostty 的快速原生终端模拟器。Ghostty GX 是采用 MIT 许可证的自由软件。"
+#. About dialogs and settings pages of both apprts (src/gx/branding.zig)
+msgid "Ghostty GX is an unofficial fork of Ghostty maintained by gx0404. It is not affiliated with or endorsed by the Ghostty project."
+msgstr "Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。"
 
+msgid "Ghostty GX is free software under the MIT License."
+msgstr "Ghostty GX 是采用 MIT 许可证的自由软件。"
+
+#. Windows apprt: About dialog
 msgid "Project Home"
 msgstr "项目主页"
 
-msgid "Ghostty Website"
-msgstr "Ghostty 官网"
+msgid "Upstream Ghostty"
+msgstr "上游 Ghostty"
 
 msgid "Copy Version"
 msgstr "复制版本信息"
