@@ -27,6 +27,12 @@
 //! (`chrome/Backdrop.zig`). The title bar also owns the chrome tooltip
 //! (`Tooltip`), shared with the tab bar. The owning `Window` embeds this
 //! struct as `title_bar`.
+//!
+//! Sizes, fonts, icons, hit-test rectangles, the canvas DPI and the
+//! tooltip follow the window's content scale (`Window.scale`), like the
+//! terminals. Only what Windows and DWM draw themselves keeps the real DPI
+//! of the window: the resize border (`resizeBandHeight`) and DWM's caption
+//! buttons (`nativeButtonBounds`).
 const TitleBar = @This();
 
 const std = @import("std");
@@ -252,7 +258,9 @@ pub fn nativeButtons(self: *const TitleBar) bool {
     return self.hasCaptionRow() and self.translucent();
 }
 
-/// The DWM caption buttons in client coordinates, if DWM draws them.
+/// The DWM caption buttons in client coordinates, if DWM draws them. DWM
+/// sizes them for the real DPI of the window, so they keep that size when
+/// `Window.scale` differs from it.
 fn nativeButtonBounds(self: *const TitleBar) ?w32.RECT {
     const hwnd = self.windowConst().hwnd orelse return null;
     var bounds: w32.RECT = undefined;
@@ -354,16 +362,27 @@ pub const row_button_height: f32 = 28;
 const menu_button_width: f32 = 36;
 
 /// The top resize band: the invisible resize border the system uses on
-/// the other edges.
+/// the other edges. Windows sizes those borders for the real DPI of the
+/// window, so the band does too.
 fn resizeBandHeight(self: *const TitleBar) i32 {
-    const window_dpi = self.dpi();
+    const window_dpi = self.systemDpi();
     return GetSystemMetricsForDpi(SM_CXPADDEDBORDER, window_dpi) + GetSystemMetricsForDpi(SM_CYSIZEFRAME, window_dpi);
 }
 
-fn dpi(self: *const TitleBar) u32 {
+/// The real DPI of the window (`GetDpiForWindow`), only for what Windows
+/// and DWM draw and hit-test themselves. Everything the title bar draws
+/// follows `Window.scale` (`canvasDpi`), which differs from it under
+/// `Window.WM_GHOSTTY_SIMULATE_DPI`.
+fn systemDpi(self: *const TitleBar) u32 {
     const hwnd = self.windowConst().hwnd orelse return 96;
     const value = w32.GetDpiForWindow(hwnd);
     return if (value == 0) 96 else value;
+}
+
+/// The DPI the chrome row is drawn at: `Window.scale`, the scale its
+/// layout and the terminals use.
+fn canvasDpi(self: *const TitleBar) u32 {
+    return @intFromFloat(@round(self.windowConst().scale * 96.0));
 }
 
 /// What a client point in the chrome row hits.
@@ -731,7 +750,7 @@ pub fn paint(self: *TitleBar, hdc: w32.HDC) void {
     defer _ = w32.SelectObject(mem_dc, old_bmp);
 
     const rect = w32.RECT{ .left = 0, .top = 0, .right = w, .bottom = h };
-    if (!canvas.beginDcAlpha(mem_dc, rect, self.dpi())) return;
+    if (!canvas.beginDcAlpha(mem_dc, rect, self.canvasDpi())) return;
     const tokens = style.Tokens.fromConfig(&win.app.config);
     const see_through = self.translucent();
     canvas.clear(if (see_through) .{ .r = 0, .g = 0, .b = 0, .a = 0 } else tokens.title_bar);
@@ -975,6 +994,7 @@ pub const Tooltip = struct {
         @memcpy(self.text_buf[0..len], value[0..len]);
         self.text_len = len;
 
+        self.popup.setOwnerScale(win.scale);
         const s = self.popup.ownerScale();
         const size = factory.measureText(self.text(), textStyle(tokens), max_width - 2 * pad_x);
         const w = style.px(@min(size.width + 2 * pad_x + 1, max_width), s);

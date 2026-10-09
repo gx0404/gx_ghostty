@@ -10,7 +10,8 @@
 //! with `show(rect)` (screen pixels; size content in DIPs with `scale`),
 //! repaint with `invalidate`, and `destroy` it with the owner. Dismissal
 //! (Escape, click outside, lost activation) hides the popup and reports
-//! the reason through `Callbacks.dismissed`.
+//! the reason through `Callbacks.dismissed`. A popup that belongs to a
+//! window's chrome follows the window's content scale (`setOwnerScale`).
 //!
 //! Text input: with `Options.text_input` the popup keeps a `TextInput`
 //! (`popup.input`) that receives typing, editing keys, clipboard and IME
@@ -117,6 +118,9 @@ options: Options = .{},
 callbacks: ?Callbacks = null,
 visible: bool = false,
 dpi: u32 = 96,
+/// The owner's content scale relative to its window DPI (`setOwnerScale`),
+/// applied on top of `dpi`.
+zoom: f32 = 1,
 tracking_leave: bool = false,
 
 /// The text input (with `Options.text_input`).
@@ -199,16 +203,37 @@ pub fn setBorderColor(self: *Popup, color: d2d.Color) void {
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_BORDER_COLOR, @ptrCast(&ref), @sizeOf(u32));
 }
 
-/// DPI scale (DPI / 96) of the popup.
+/// The scale (DPI / 96) the popup lays out and draws at: its DPI, zoomed
+/// by `setOwnerScale`.
 pub fn scale(self: *const Popup) f32 {
-    return @as(f32, @floatFromInt(self.dpi)) / 96.0;
+    return dpiScale(self.dpi) * self.zoom;
 }
 
-/// DPI scale of the owner window: size a popup with it before it is
-/// shown on the owner's monitor.
+/// Scale of the owner window (its DPI, or the content scale given to
+/// `setOwnerScale`): size a popup with it before it is shown on the
+/// owner's monitor.
 pub fn ownerScale(self: *const Popup) f32 {
     const owner = self.owner orelse return 1.0;
-    return @as(f32, @floatFromInt(dpiOf(owner))) / 96.0;
+    return dpiScale(dpiOf(owner)) * self.zoom;
+}
+
+/// Lay the popup out and draw it at the content scale of its owner
+/// (`Window.scale` for parts of a window's chrome) instead of the owner's
+/// DPI; the two differ after `Window.WM_GHOSTTY_SIMULATE_DPI`. On another
+/// monitor the popup's own DPI still applies on top. `scale` and
+/// `ownerScale` include it.
+pub fn setOwnerScale(self: *Popup, owner_scale: f32) void {
+    const owner = self.owner orelse return;
+    self.zoom = owner_scale / dpiScale(dpiOf(owner));
+}
+
+fn dpiScale(dpi: u32) f32 {
+    return @as(f32, @floatFromInt(dpi)) / 96.0;
+}
+
+/// The DPI the canvas draws at: the popup's DPI with the owner's zoom.
+fn canvasDpi(self: *const Popup) u32 {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(self.dpi)) * self.zoom));
 }
 
 /// The client size in DIPs.
@@ -619,7 +644,7 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     // The canvas keeps its render target between paints: borrow it, don't
     // copy it.
     const canvas = if (self.canvas) |*canvas| canvas else return;
-    if (!canvas.beginHwnd(hwnd, self.dpi)) return;
+    if (!canvas.beginHwnd(hwnd, self.canvasDpi())) return;
     canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
     cb.paint(cb.ctx, self, canvas);
     canvas.end();

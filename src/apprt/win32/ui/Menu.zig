@@ -298,7 +298,10 @@ pub fn showTabContextMenu(window: *Window, screen_pt: w32.POINT, tab: ?usize) ?T
         return null;
     };
 
-    const id = MenuPopup.run(host, owner, &menu.root, .{ .anchor = screen_pt }) orelse return null;
+    const id = MenuPopup.run(host, owner, &menu.root, .{
+        .anchor = screen_pt,
+        .owner_scale = window.scale,
+    }) orelse return null;
     return std.enums.fromInt(TabCommand, id);
 }
 
@@ -452,6 +455,7 @@ pub fn showMainMenu(window: *Window, anchor: ?w32.POINT) void {
     const id = MenuPopup.run(host, hwnd, &menu.root, .{
         .anchor = screen_pt,
         .select_first = anchor == null,
+        .owner_scale = window.scale,
     }) orelse return;
     if (!windowOpen(app, window)) return;
 
@@ -618,7 +622,10 @@ pub fn showProfileMenu(window: *Window, anchor: w32.POINT) void {
         return;
     };
 
-    const id = MenuPopup.run(host, hwnd, &menu.root, .{ .anchor = anchor }) orelse return;
+    const id = MenuPopup.run(host, hwnd, &menu.root, .{
+        .anchor = anchor,
+        .owner_scale = window.scale,
+    }) orelse return;
     if (!windowOpen(app, window)) return;
     if (launch.pick(id)) |pick| {
         _ = app.openProfile(window, pick.id, pick.where);
