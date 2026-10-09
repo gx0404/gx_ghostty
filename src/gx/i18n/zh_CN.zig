@@ -295,7 +295,6 @@ pub const entries = [_]Entry{
     .{ .key = "Previous Match", .msgstr = "上一个匹配项" },
     .{ .key = "Previous Search Result", .msgstr = "上一个匹配项" },
     .{ .key = "Previous Tab", .msgstr = "上一个标签页" },
-    .{ .key = "Processes are still running in the tabs being closed. Close them anyway?", .msgstr = "要关闭的标签页中仍有进程在运行，仍要关闭吗？" },
     .{ .key = "Processes are still running in the tabs to be closed. Close them anyway?", .msgstr = "要关闭的标签页中仍有进程在运行，仍要关闭吗？" },
     .{ .key = "Processes are still running in this window. Close it anyway?", .msgstr = "此窗口中仍有进程在运行，仍要关闭吗？" },
     .{ .key = "Processes are still running. Quit anyway?", .msgstr = "仍有进程在运行，仍要退出吗？" },

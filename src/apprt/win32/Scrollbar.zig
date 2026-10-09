@@ -3,12 +3,13 @@
 //! surface window that follows the system scrollbar mode ("Always show
 //! scrollbars" in the accessibility settings).
 //!
-//! Like WezTerm GX, the thumb is a thin rounded bar in the foreground
-//! color: 3 DIPs wide at rest, widening to 8 and brightening while the
-//! pointer is over the scrollbar or it is dragged. In overlay mode (the
-//! default) it floats over the terminal's right edge, fades in when the
-//! terminal scrolls and fades out after a second of inactivity; with
-//! always-visible scrollbars it reserves a column of the grid and stays.
+//! The thumb is a thin rounded bar in the terminal's foreground color,
+//! drawn translucent so it blends with any theme: 3 DIPs wide at rest,
+//! widening to 8 and brightening while the pointer is over the scrollbar
+//! or it is dragged. In overlay mode (the default) it floats over the
+//! terminal's right edge, fades in when the terminal scrolls and fades out
+//! after a second of inactivity; with always-visible scrollbars it
+//! reserves a column of the grid and stays.
 
 const std = @import("std");
 const builtin = @import("builtin");

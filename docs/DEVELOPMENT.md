@@ -296,7 +296,7 @@ just generated-check
 
 - `type` 是小写英文，取 `feat fix perf docs ci test refactor chore build revert style release` 之一；`scope` 可省略，建议写受影响的面（如 `build`、`win32`、`gtk`、`gx`、`ai`、`github`、`kb`、`sync`）；破坏性变更在冒号前加 `!`。不加 emoji，不加 AI co-author 行。
 - 校验正则是 `^type(\(scope\))?!?: \S`，由 `scripts/conventional_commits.py` 实现：冒号是半角，后面恰好一个空格；scope 里不能有空格或括号；`fixup!`、`squash!`、`amend!` 提交不能进入历史。入口 `just commit-check --message-file <文件>` 或 `just commit-check --range <base>..<head>`；校验单条标题时直接调用 `python scripts/conventional_commits.py "<标题>"`（Linux 用 `python3`），因为标题含空格，经 just 传参会被拆开（见 MAKE_COMMANDS.md「约定」）。
-- 例子：`fix(build): 非 v 前缀 tag 不再触发版本号 panic`、`chore(sync): 合并上游 main（<sha>）`、`release: 定版 0.0.1`。
+- 例子：`fix(build): 非 v 前缀 tag 不再触发版本号 panic`、`chore(sync): 合并上游 main（<sha>）`、`chore(release): 定版 0.0.1`。
 
 **只查首父链**：`--range` 内部用 `git log --first-parent`；`gx-ci` 的 `framework` job 同样只沿首父链校验，push 取 `before..after`（`before` 全零时只查 head），PR 取 `base..head`。上游提交经 `chore(sync)` 合并进来，不在 `gx_ghostty` 的首父链上，不受 fork 规范约束；合并提交本身在首父链上，所以必须带合规信息。
 

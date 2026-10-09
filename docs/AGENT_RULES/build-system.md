@@ -39,7 +39,7 @@
 
 1. 基线是 `build.zig.zon` 的 `.version`；源码包里改用根目录 `VERSION` 文件（`build.zig::build` 读取）。
 2. 给了 `-Dversion-string` 就原样使用（须为合法 SemVer）；作为依赖被构建时只取 `X.Y.Z`。
-3. 否则探测 git：没有 git 或不在仓库内得到 `X.Y.Z-dev+0000000`；HEAD 在以 `v` 开头的 tag 上时，tag 必须等于 `vX.Y.Z`（得到 `X.Y.Z`），否则 `@panic`；`tip` 与 fork 补丁 GX-0001 覆盖的非 `v` 前缀 tag（如 `gx-v0.1.0`）跳过该检查；其余得到 `X.Y.Z-<分支名>+<短 hash>`，分支名中 `[0-9A-Za-z-]` 以外的字符换成 `-`，本分支即 `1.3.2-gx-ghostty+<hash>`。
+3. 否则探测 git：没有 git 或不在仓库内得到 `X.Y.Z-dev+0000000`；HEAD 在以 `v` 开头的 tag 上时，tag 必须等于 `vX.Y.Z`（得到 `X.Y.Z`），否则 `@panic`；`tip` 与 fork 补丁 GX-0001 覆盖的非 `v` 前缀 tag（如 `gx-v0.0.1`）跳过该检查；其余得到 `X.Y.Z-<分支名>+<短 hash>`，分支名中 `[0-9A-Za-z-]` 以外的字符换成 `-`，本分支即 `1.3.2-gx-ghostty+<hash>`。
 4. `Config.addOptions` 把预发布段非空的版本标为 `tip` 渠道，否则 `stable`；`+version` 打印 `src/build_config.zig::version_string` 与 `release_channel`。
 5. libghostty-vt 版本是常量 `build.zig::lib_version`，只能用 `-Dlib-version-string` 覆盖；该选项的帮助文本称会用 git，实现并不探测。
 

@@ -35,7 +35,7 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
 
 ## 发版步骤（以 0.0.1 为例）
 
-1. **定版提交**：把 `CHANGELOG.md` 的 `## 0.0.1(TBD)` 改成发布当天的日期，如 `## 0.0.1(2026-10-10)`；然后依次运行 `just graph`、`just kb`、`just generated-check`。定版的 CHANGELOG、重建后的 `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` 与 `docs/kb/chunks.json` 一起提交为 `release: 定版 0.0.1`。图谱或 KB 不新鲜时 prepare 会拒绝发版。提交后可在干净检出上运行 `python scripts/gx_release.py prepare`（Linux/macOS 用 `python3`）预演：它跑完四道发版门，并打印将使用的 SHA、tag 与版本串。
+1. **定版提交**：把 `CHANGELOG.md` 的 `## 0.0.1(TBD)` 改成发布当天的日期，如 `## 0.0.1(2026-10-10)`；然后依次运行 `just graph`、`just kb`、`just generated-check`。定版的 CHANGELOG、重建后的 `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` 与 `docs/kb/chunks.json` 一起提交为 `chore(release): 定版 0.0.1`。图谱或 KB 不新鲜时 prepare 会拒绝发版。提交后可在干净检出上运行 `python scripts/gx_release.py prepare`（Linux/macOS 用 `python3`）预演：它跑完四道发版门，并打印将使用的 SHA、tag 与版本串。
 2. **push**：由用户执行 `git push origin gx_ghostty`。
 3. **CI 变绿**：等这次 push 触发的 `gx-ci` 全部通过（`framework`、`zig-fmt`、`linux-vt`、`linux-main`、`lib-vt-cross`、`windows`、`windows-app`）。
 4. **发布**：由用户运行

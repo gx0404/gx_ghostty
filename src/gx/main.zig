@@ -1,10 +1,23 @@
-//! Ghostty GX core modules shared by the win32 and GTK apprts: UI language
-//! and translations, the settings overlay, configuration layering, launch
-//! profiles, process inspection and process policies, close confirmation,
-//! herdr app mode, shell quoting of dropped file paths, the colors of the
-//! GTK look, plus the Windows terminal
-//! support behind fork patches: win32-input-mode key records, the bundled
-//! ConPTY and OSC 7 working directories.
+//! Ghostty GX core shared by the win32 and GTK apprts. None of these
+//! modules depends on a UI toolkit or an apprt.
+//!
+//! - Configuration: layering of the GX defaults, the user configuration,
+//!   `gui-settings.ghostty` and the command line (`config_layers`); value
+//!   types of the `gx-*` keys (`config_types`); line-preserving edits of
+//!   `gui-settings.ghostty`, the file the settings UIs write
+//!   (`gui_settings`); the settings model that the GTK settings dialog
+//!   and the Windows settings overlay render (`settings_map`); the
+//!   built-in GX Mocha theme (`theme`).
+//! - UI language and translations (`i18n`).
+//! - `gx:` binding actions (`action`) and launch profiles (`profiles`).
+//! - Processes: inspection (`proc`), the idle and herdr policies
+//!   (`policy`), close confirmation (`confirm`) and herdr app mode
+//!   (`app_mode`).
+//! - The colors of the GTK look, as CSS (`gtk_css`).
+//! - Windows terminal support: win32-input-mode key records
+//!   (`win32_input`), the bundled ConPTY (`conpty`), OSC 7 working
+//!   directories (`osc7`) and shell quoting of dropped or pasted file
+//!   paths (`path_quote`).
 pub const action = @import("action.zig");
 pub const app_mode = @import("app_mode.zig");
 pub const config_layers = @import("config_layers.zig");

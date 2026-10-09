@@ -98,7 +98,7 @@ fork 的发布 tag 是 `gx-vX.Y.Z`（见 `docs/RELEASE.md`）。未传 `-Dversio
 | 无，或 `tip` | 分支预发布版本 `X.Y.Z-<branch>+<hash>` | 不变 |
 | `vX.Y.Z`，且与产品版本一致 | 正式版本 `X.Y.Z` | 不变 |
 | 其他以 `v` 开头的 tag | panic | 不变，仍然 panic |
-| 不以 `v` 开头的 tag，如 `gx-v0.1.0` | panic | 分支预发布版本 `X.Y.Z-<branch>+<hash>` |
+| 不以 `v` 开头的 tag，如 `gx-v0.0.1` | panic | 分支预发布版本 `X.Y.Z-<branch>+<hash>` |
 
 - 传了 `-Dversion-string` 时直接使用它；作为依赖构建时跳过 git 推导。这两条路径都不受补丁影响，`gx-release` 的构建本来就显式传 `-Dversion-string=<X.Y.Z>-gx.<fork 版本>`。
 - `<branch>` 来自 `git rev-parse --abbrev-ref HEAD`，其中不属于 `[0-9A-Za-z-]` 的字符替换为 `-`：在 `gx_ghostty` 分支上是 `gx-ghostty`，分离 HEAD（例如 CI 检出 tag）时是 `HEAD`。
@@ -622,7 +622,7 @@ Windows 本机的第一条用 `just test --filter gx. --filter config --filter c
 - 菜单：`ui/1.5/gx/menus.blp` 复刻上游 `window.blp` 的 `main_menu`、`split_menu`、`tab_context_menu` 与 `surface.blp` 的 `context_menu_model`，标签是不带 `_()` 的英文 msgid，由 `gx.i18n` 翻译（不进上游 pot）；每次重建都生成新的 `GMenu` 设到按钮、`AdwTabView` 与终端右键菜单上（原地改菜单时 GTK 弹出菜单保留旧子菜单页，报 “duplicate child name in GtkStack”）。窗口只在语言、启动配置或 `app.gx-settings` 是否存在变化时重建。☰ 菜单新增一段：设置…（`app.gx-settings`；该 action 不存在时改为 `app.open-config::os-open`）、键盘快捷键（`app.gx-keybinds`）、语言子菜单（有状态的单选 action `app.gx-language`，把 `language` 写进 `gui-settings.ghostty`，先切换语言再硬重载配置）。
 - 新建标签页下拉：`gx.profiles.detectSystem` 探测到的启动配置加上 `gx-launch-profile`，名称随界面语言；条目激活 `app.new-tab`，参数为 `(0, ["-e", argv…])`（自定义命令行为 `--command=<值>`，均为 `class/Overrides.zig::parse` 的语法），新标签页照常继承工作目录；另有「用启动配置新建窗口」子菜单（`app.new-window-command`）。下拉按钮提示改为「启动配置与分屏」。
 - 快捷键速查：`Adw.Dialog`，按类别列出 `keybind` 根集合的绑定（含前导键序列与链式动作，跳过 `ignore` 与 catch-all），同一动作的多个按键并成一行；标题取命令面板默认条目或 GX 补充标题并经 `gx.i18n` 翻译，副标题是配置语法的动作，按键用 `GtkShortcutLabel`；顶部搜索框按标题、动作、类别与按键过滤。
-- `gx:` 绑定动作：`App.gxAction(target, action)` 按标签名分派 `settings`、`main_menu`、`keybinds`、`new_tab_profile`、`new_window_profile`；`action` 是 `anytype`，`src/gx/action.zig::Action` 合入前后都能编译，未知标签返回 false。`main_menu` 优先从可见的 ☰ 按钮弹出，否则借用活动终端的右键弹出菜单在其右上角显示，关闭后恢复原菜单。
+- `gx:` 绑定动作：`App.gxAction(target, action)` 按标签名分派 `settings`、`main_menu`、`keybinds`、`new_tab_profile`、`new_window_profile`；`action` 是 `anytype`，`src/apprt/gtk/gx/app.zig::request` 只按标签名映射，不依赖 `src/gx/action.zig::Action` 的具体定义，未知标签返回 false。`main_menu` 优先从可见的 ☰ 按钮弹出，否则借用活动终端的右键弹出菜单在其右上角显示，关闭后恢复原菜单。
 - 子进程：`Surface.defaultTermioEnv` 在上游恢复 `LANG` 之后把 `LANGUAGE` 恢复为启动时的值（原来没有就删除），终端里的 shell 保持系统语言。
 
 ### 上游状态
@@ -645,10 +645,10 @@ Windows 本机的第一条用 `just test --filter gx. --filter config --filter c
 GTK app 与 GTK apprt 的单测只能在装有 GTK 的 Linux 上构建，以下命令经 WSL（Ubuntu 24.04，`just wsl setup --apt` 已生成 `zh_CN.UTF-8` 与 `en_US.UTF-8`）运行：
 
 ```bash
-just wsl sync <worktree> --dirty --clone '~/src/gx_ghostty-GA'
-just wsl build --gtk --clone '~/src/gx_ghostty-GA'
-just wsl test --gtk --filter apprt --clone '~/src/gx_ghostty-GA'
-just wsl smoke --out <目录> --lang zh_CN --xdotool <脚本> --clone '~/src/gx_ghostty-GA'
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl test --gtk --filter apprt
+just wsl smoke --out <目录> --lang zh_CN --xdotool <脚本>
 python -m unittest scripts.test_fork_patches -v
 ```
 

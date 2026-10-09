@@ -559,6 +559,8 @@ msgstr "发送控制序列"
 
 msgid "Send Escape Sequence"
 msgstr "发送转义序列"
+
+#. Windows apprt: command finished and renderer health notifications
 msgid "Command succeeded"
 msgstr "命令执行成功"
 
@@ -660,14 +662,14 @@ msgstr "输入关键字搜索 {count} 个主题…"
 msgid "Navigation"
 msgstr "导航"
 
-#. win32 W5b
+#. Windows apprt: confirmation before closing several tabs
 msgid "Close Tabs?"
 msgstr "关闭这些标签页吗？"
 
-msgid "Processes are still running in the tabs being closed. Close them anyway?"
+msgid "Processes are still running in the tabs to be closed. Close them anyway?"
 msgstr "要关闭的标签页中仍有进程在运行，仍要关闭吗？"
 
-#. win32 W7: dialogs and the find bar
+#. Windows apprt: dialog bodies, running process lists and text previews
 msgid "A program in this terminal wants to read the clipboard. It would receive this text:"
 msgstr "此终端中的程序想要读取剪贴板，它将收到以下文本："
 
@@ -686,6 +688,7 @@ msgstr "……另有 {count} 个"
 msgid "… {count} more lines"
 msgstr "……还有 {count} 行"
 
+#. Windows apprt: About dialog
 msgid "A fast, native terminal emulator based on Ghostty. Ghostty GX is free software under the MIT License."
 msgstr "基于 Ghostty 的快速原生终端模拟器。Ghostty GX 是采用 MIT 许可证的自由软件。"
 
@@ -698,10 +701,7 @@ msgstr "Ghostty 官网"
 msgid "Copy Version"
 msgstr "复制版本信息"
 
-msgid "Processes are still running in the tabs to be closed. Close them anyway?"
-msgstr "要关闭的标签页中仍有进程在运行，仍要关闭吗？"
-
-#. win32 W2: settings overlay
+#. Windows apprt: settings overlay
 msgid "Current default: {name}"
 msgstr "当前默认：{name}"
 
@@ -729,7 +729,7 @@ msgstr "正在预览：{name}"
 msgid "Settings saved."
 msgstr "设置已保存。"
 
-#. win32 W4
+#. Windows apprt: tab and terminal context menus, launch profile menu
 msgid "Duplicate Tab"
 msgstr "复制标签页"
 
