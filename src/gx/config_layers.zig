@@ -343,7 +343,7 @@ test "the embedded defaults parse cleanly" {
     try testing.expectEqualStrings("GX Mocha", cfg.theme.?.light);
     try testing.expectEqualStrings("GX Mocha", cfg.theme.?.dark);
     try testing.expectEqualStrings("zh-CN", cfg.language.?);
-    try expectFamilies(&.{ "JetBrainsMono Nerd Font", "Noto Sans CJK SC", "Microsoft YaHei UI" }, cfg.@"font-family");
+    try expectFamilies(&.{"JetBrainsMono Nerd Font"}, cfg.@"font-family");
     try testing.expectEqual(@as(f32, 12), cfg.@"font-size");
     try testing.expectEqual(@as(u32, 10), cfg.@"window-padding-x".top_left);
     try testing.expectEqual(@as(u32, 10), cfg.@"window-padding-x".bottom_right);

@@ -6,11 +6,12 @@
 theme = GX Mocha
 language = zh-CN
 
-# Missing families are skipped with a warning; the embedded font is the
-# final fallback.
+# The first family that exists sets the cell metrics, so only monospace
+# families belong here; a missing family falls through to the embedded
+# JetBrains Mono. CJK text is routed through font-codepoint-map instead, and
+# falls back to system font discovery when that family is not installed.
 font-family = JetBrainsMono Nerd Font
-font-family = Noto Sans CJK SC
-font-family = Microsoft YaHei UI
+font-codepoint-map = U+2E80-U+2FDF,U+3000-U+303F,U+3040-U+30FF,U+3100-U+312F,U+3190-U+31FF,U+3400-U+4DBF,U+4E00-U+9FFF,U+F900-U+FAFF,U+FE30-U+FE4F,U+FF00-U+FFEF=Noto Sans CJK SC
 font-size = 12
 
 window-padding-x = 10
