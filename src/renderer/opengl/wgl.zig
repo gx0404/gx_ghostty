@@ -12,7 +12,10 @@
 //! `Device.setPixelFormat`; the render thread creates, uses and destroys
 //! the GL context, so no GL call ever happens on the main thread. Frames
 //! are presented by blitting the render target into the window's default
-//! framebuffer and swapping buffers.
+//! framebuffer and swapping buffers. The window pixel format has an alpha
+//! channel when the driver offers one, so the frames keep the renderer's
+//! premultiplied alpha; `Device.alphaFrames` tells the apprt whether it
+//! can let the desktop compositor blend them with what is behind.
 //!
 //! The context asks to be told about GPU resets (driver timeout recovery,
 //! a driver update) where the driver supports it
@@ -93,6 +96,19 @@ pub const Device = struct {
         self.* = undefined;
     }
 
+    /// Whether the frames presented to windows of this device carry an
+    /// alpha channel that the desktop compositor can blend with what is
+    /// behind the window (the renderer writes premultiplied alpha), or
+    /// why not. Only the system driver qualifies: the Mesa fallback keeps
+    /// windows opaque.
+    pub fn alphaFrames(self: *const Device) AlphaFrames {
+        if (self.lib.software) return .software;
+        if (!self.lib.alpha) return .no_alpha_channel;
+        return .supported;
+    }
+
+    pub const AlphaFrames = enum { supported, software, no_alpha_channel };
+
     /// Set an OpenGL pixel format on the device context of a newly
     /// created window. A window's pixel format can only be set once, so
     /// the apprt must call this exactly once per window, before any
@@ -101,31 +117,8 @@ pub const Device = struct {
         const hdc: HDC = @ptrCast(hdc_);
         const lib = &self.lib;
 
-        var format: c_int = 0;
-        if (lib.choosePixelFormatArb) |choose| {
-            // Prefer an sRGB-capable format, then accept any RGBA8 one.
-            for ([_]c_int{ 1, 0 }) |srgb| {
-                const attribs = [_]c_int{
-                    WGL_DRAW_TO_WINDOW_ARB,           1,
-                    WGL_SUPPORT_OPENGL_ARB,           1,
-                    WGL_DOUBLE_BUFFER_ARB,            1,
-                    WGL_PIXEL_TYPE_ARB,               WGL_TYPE_RGBA_ARB,
-                    WGL_RED_BITS_ARB,                 8,
-                    WGL_GREEN_BITS_ARB,               8,
-                    WGL_BLUE_BITS_ARB,                8,
-                    WGL_ALPHA_BITS_ARB,               8,
-                    WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB, srgb,
-                    0,
-                };
-                var count: u32 = 0;
-                if (choose(hdc, &attribs, null, 1, @ptrCast(&format), &count).toBool() and
-                    count > 0 and format > 0) break;
-                format = 0;
-            }
-        }
-
         var pfd = basePixelFormat();
-        if (format == 0) format = lib.choosePixelFormat(hdc, &pfd);
+        const format = choosePixelFormat(lib, hdc, &pfd);
         if (format == 0) return error.NoPixelFormat;
 
         _ = lib.describePixelFormat(hdc, format, @sizeOf(PIXELFORMATDESCRIPTOR), &pfd);
@@ -135,6 +128,33 @@ pub const Device = struct {
         }
     }
 };
+
+/// The pixel format for a window: through WGL_ARB_pixel_format an
+/// sRGB-capable RGBA8 format, then any RGBA8 one; otherwise the format
+/// ChoosePixelFormat picks for `pfd`. Zero when there is none.
+fn choosePixelFormat(lib: *const Lib, hdc: HDC, pfd: *const PIXELFORMATDESCRIPTOR) c_int {
+    if (lib.choosePixelFormatArb) |choose| {
+        for ([_]c_int{ 1, 0 }) |srgb| {
+            const attribs = [_]c_int{
+                WGL_DRAW_TO_WINDOW_ARB,           1,
+                WGL_SUPPORT_OPENGL_ARB,           1,
+                WGL_DOUBLE_BUFFER_ARB,            1,
+                WGL_PIXEL_TYPE_ARB,               WGL_TYPE_RGBA_ARB,
+                WGL_RED_BITS_ARB,                 8,
+                WGL_GREEN_BITS_ARB,               8,
+                WGL_BLUE_BITS_ARB,                8,
+                WGL_ALPHA_BITS_ARB,               8,
+                WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB, srgb,
+                0,
+            };
+            var format: c_int = 0;
+            var count: u32 = 0;
+            if (choose(hdc, &attribs, null, 1, @ptrCast(&format), &count).toBool() and
+                count > 0 and format > 0) return format;
+        }
+    }
+    return lib.choosePixelFormat(hdc, pfd);
+}
 
 /// Per-surface WGL state.
 pub const Context = struct {
@@ -368,6 +388,8 @@ pub fn getProcAddress(name: [*:0]const u8) callconv(.c) ?GlProc {
 const Lib = struct {
     module: HMODULE,
     software: bool,
+    /// Whether the pixel format windows get has an alpha channel.
+    alpha: bool = false,
 
     createContext: *const fn (HDC) callconv(.winapi) ?HGLRC,
     deleteContext: *const fn (HGLRC) callconv(.winapi) BOOL,
@@ -487,6 +509,13 @@ fn probe(kind: Lib.Kind) !Lib {
     lib.createContextAttribs = lib.extension("wglCreateContextAttribsARB", Lib.CreateContextAttribsFn);
     lib.choosePixelFormatArb = lib.extension("wglChoosePixelFormatARB", Lib.ChoosePixelFormatArbFn);
     lib.swapInterval = lib.extension("wglSwapIntervalEXT", Lib.SwapIntervalFn);
+    lib.alpha = alpha: {
+        var window_pfd = basePixelFormat();
+        const window_format = choosePixelFormat(&lib, hdc, &window_pfd);
+        if (window_format == 0) break :alpha false;
+        if (lib.describePixelFormat(hdc, window_format, @sizeOf(PIXELFORMATDESCRIPTOR), &window_pfd) == 0) break :alpha false;
+        break :alpha window_pfd.cAlphaBits >= 8;
+    };
     const create = lib.createContextAttribs orelse return error.WglCreateContextUnsupported;
 
     const attribs = [_]c_int{

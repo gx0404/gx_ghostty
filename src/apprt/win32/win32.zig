@@ -1206,6 +1206,23 @@ pub extern "dwmapi" fn DwmSetWindowAttribute(
     cbAttribute: u32,
 ) callconv(.winapi) i32;
 
+pub const DWM_BB_ENABLE: u32 = 0x1;
+pub const DWM_BB_BLURREGION: u32 = 0x2;
+
+pub const DWM_BLURBEHIND = extern struct {
+    dwFlags: u32,
+    fEnable: i32,
+    hRgnBlur: ?*anyopaque = null,
+    fTransitionOnMaximized: i32 = 0,
+};
+
+pub extern "dwmapi" fn DwmEnableBlurBehindWindow(
+    hWnd: HWND,
+    pBlurBehind: *const DWM_BLURBEHIND,
+) callconv(.winapi) i32;
+
+pub extern "gdi32" fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) callconv(.winapi) ?*anyopaque;
+
 // -----------------------------------------------------------------------
 // GDI double-buffered painting API
 // -----------------------------------------------------------------------

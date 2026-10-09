@@ -55,6 +55,7 @@ const Window = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const configpkg = @import("../../config.zig");
 const global = @import("../../global.zig");
 const gx = @import("../../gx/main.zig");
 
@@ -226,7 +227,7 @@ pub const InitOptions = struct {
 pub fn onConfigChange(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     const config = &self.app.config;
-    Backdrop.onConfigChange(hwnd, config);
+    Backdrop.onConfigChange(hwnd, config, self.app.alpha_frames);
     if (!self.is_quick_terminal) {
         const decoration = TitleBar.Decoration.fromConfig(config.@"window-decoration");
         if (decoration != self.title_bar.decoration) self.title_bar.applyDecoration(config);
@@ -301,7 +302,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // Store the Window pointer in GWLP_USERDATA for the WndProc.
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    Backdrop.apply(hwnd, &app.config, .{ .force_opaque = options.force_opaque });
+    Backdrop.apply(hwnd, &app.config, .{ .force_opaque = options.force_opaque, .alpha_frames = app.alpha_frames });
 
     // Query DPI scale (the window was created on its monitor already).
     const dpi = w32.GetDpiForWindow(hwnd);
@@ -1144,12 +1145,14 @@ pub fn layoutSplits(self: *Window) void {
     panes.awaitResizeFrames();
     if (tree.zoomed != null) return;
 
-    // Paint divider lines directly using GetDC (not BeginPaint, which
-    // clips to the invalid region and misses the content area gaps).
+    // Repaint the gaps and the divider lines directly using GetDC (not
+    // BeginPaint, which clips to the invalid region and misses the content
+    // area gaps), so no line of a previous layout or background of a
+    // previous opacity stays behind.
     if (self.hwnd) |hwnd| {
         const hdc = w32.GetDC(hwnd);
         if (hdc) |dc| {
-            self.paintDividers(dc);
+            self.eraseSurfaceArea(dc);
             _ = w32.ReleaseDC(hwnd, dc);
         }
     }
@@ -1252,13 +1255,23 @@ const PaneLayout = struct {
 };
 
 /// Paint the part of the client area below the chrome that no pane covers
-/// with the terminal background, then the split dividers.
+/// with the terminal background, then the split dividers. When DWM
+/// composes the window per pixel the background gets the terminals'
+/// `background-opacity`, so the material shows through the gaps alike.
 fn eraseSurfaceArea(self: *Window, hdc: w32.HDC) void {
-    const brush = self.app.bg_brush orelse return;
     const rect = self.surfaceRect();
-    _ = w32.FillRect(hdc, &rect, brush);
+    const config = &self.app.config;
+    if (Backdrop.perPixel(config, self.app.alpha_frames)) {
+        Backdrop.fillBackground(hdc, rect, config);
+    } else {
+        const brush = self.app.bg_brush orelse return;
+        _ = w32.FillRect(hdc, &rect, brush);
+    }
     self.paintDividers(hdc);
 }
+
+/// Color of the split dividers.
+const divider_color: configpkg.Config.Color = .{ .r = 0x80, .g = 0x80, .b = 0x80 };
 
 /// Paint divider lines between split panes in the active tab.
 fn paintDividers(self: *Window, hdc: w32.HDC) void {
@@ -1270,6 +1283,27 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     self.paintDividerNode(hdc, tree, .root, rect);
 }
 
+/// Draw one divider line of `width` pixels from (x0, y0) to (x1, y1), a
+/// vertical or horizontal line, opaque even when DWM composes the window
+/// per pixel (where a GDI pen would leave it transparent).
+fn drawDivider(self: *Window, hdc: w32.HDC, x0: i32, y0: i32, x1: i32, y1: i32, width: i32) void {
+    if (Backdrop.perPixel(&self.app.config, self.app.alpha_frames)) {
+        const offset = @divTrunc(width, 2);
+        const line: w32.RECT = if (x0 == x1)
+            .{ .left = x0 - offset, .top = y0, .right = x0 - offset + width, .bottom = y1 }
+        else
+            .{ .left = x0, .top = y0 - offset, .right = x1, .bottom = y0 - offset + width };
+        Backdrop.fillOpaque(hdc, line, divider_color);
+        return;
+    }
+    const pen = w32.CreatePen(0, width, w32.RGB(divider_color.r, divider_color.g, divider_color.b)) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const old_pen = w32.SelectObject(hdc, pen);
+    defer _ = w32.SelectObject(hdc, old_pen);
+    _ = w32.MoveToEx(hdc, x0, y0, null);
+    _ = w32.LineTo(hdc, x1, y1);
+}
+
 fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
@@ -1278,16 +1312,10 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
             const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
             const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
 
-            const pen = w32.CreatePen(0, line_w, 0x00808080) orelse return;
-            defer _ = w32.DeleteObject(pen);
-            const old_pen = w32.SelectObject(hdc, pen);
-            defer _ = w32.SelectObject(hdc, old_pen);
-
             if (s.layout == .horizontal) {
                 const total_w = rect.right - rect.left;
                 const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                _ = w32.MoveToEx(hdc, split_x, rect.top, null);
-                _ = w32.LineTo(hdc, split_x, rect.bottom);
+                self.drawDivider(hdc, split_x, rect.top, split_x, rect.bottom, line_w);
                 const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
                 const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
                 self.paintDividerNode(hdc, tree, s.left, left_rect);
@@ -1295,8 +1323,7 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
             } else {
                 const total_h = rect.bottom - rect.top;
                 const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                _ = w32.MoveToEx(hdc, rect.left, split_y, null);
-                _ = w32.LineTo(hdc, rect.right, split_y);
+                self.drawDivider(hdc, rect.left, split_y, rect.right, split_y, line_w);
                 const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
                 self.paintDividerNode(hdc, tree, s.left, top_rect);

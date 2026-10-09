@@ -18,6 +18,12 @@
 //! replace the list from lower layers instead of extending it, the same
 //! way command-line font families replace configured ones upstream.
 //!
+//! A window material (`gx-window-material`) that shows behind the
+//! terminals comes with a `background-opacity` in the defaults layer
+//! (`materialOpacity`) unless a layer sets `background-opacity`; only the
+//! app runtime knows whether the material can show there and says so with
+//! `setMaterialOpacity` before loading.
+//!
 //! The command palette entries of the defaults have `gx:` actions and
 //! English msgids as titles and descriptions. The win32 palette translates
 //! entries when it shows them; the GTK palette shows them as configured,
@@ -40,11 +46,67 @@ const themepkg = @import("../config/theme.zig");
 const cli = @import("../cli.zig");
 const global = @import("../global.zig");
 const inputpkg = @import("../input.zig");
+const config_types = @import("config_types.zig");
 const gui_settings = @import("gui_settings.zig");
 const i18n = @import("i18n.zig");
 const gx_theme = @import("theme.zig");
 
 const log = std.log.scoped(.gx_config);
+
+/// Whether a window material shows behind the terminals
+/// (`setMaterialOpacity`).
+var material_opacity: std.atomic.Value(bool) = .init(false);
+
+/// Tells loading whether a window material (`gx-window-material`) shows
+/// behind the terminals, which the Windows version and the OpenGL driver
+/// decide: then the defaults give the material a `background-opacity`
+/// (`materialOpacity`). The win32 app runtime sets it once before it loads
+/// the configuration; it is off everywhere else.
+pub fn setMaterialOpacity(shows: bool) void {
+    material_opacity.store(shows, .monotonic);
+}
+
+/// The `background-opacity` argument the defaults add for a window
+/// material that shows behind the terminals when no layer sets
+/// `background-opacity`, as in WezTerm GX: the opaque, wallpaper-tinted
+/// Mica and Mica Alt (`tabbed`) at 0.3, the see-through Acrylic at 0.75.
+pub fn materialOpacity(material: config_types.WindowMaterial) ?[:0]const u8 {
+    return switch (material) {
+        .solid => null,
+        .mica, .tabbed => "--background-opacity=0.3",
+        .acrylic => "--background-opacity=0.75",
+    };
+}
+
+/// Applies `arg` (`--key=value`) to a loaded configuration above every
+/// layer and below `-e`, and finalizes it again. The argument is recorded
+/// like any other input, so theme and conditional reloads keep it.
+pub fn applyArg(config: *Config, alloc_gpa: Allocator, arg: [:0]const u8) !void {
+    const steps = config._replay_steps.items;
+    const command_start = for (steps, 0..) |step, i| {
+        if (step == .@"-e") break i;
+    } else steps.len;
+
+    // The conditional steps are the theme's, which finalizing loads
+    // again; replaying the matching ones would record them unconditional.
+    var scratch: ArenaAllocator = .init(alloc_gpa);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var ordered: std.ArrayList(Step) = .empty;
+    for (steps[0..command_start]) |step| {
+        if (step != .conditional_arg) try ordered.append(arena, step);
+    }
+    try ordered.append(arena, .{ .arg = arg });
+    try ordered.appendSlice(arena, steps[command_start..]);
+
+    var result = try config.cloneEmpty(alloc_gpa);
+    errdefer result.deinit();
+    try result.gxReplay(alloc_gpa, ordered.items);
+    result.@"_xdg-terminal-exec" = config.@"_xdg-terminal-exec";
+    try result.finalize();
+    config.deinit();
+    config.* = result;
+}
 
 /// The Ghostty GX defaults for this platform, in configuration file
 /// syntax.
@@ -150,6 +212,10 @@ const SystemSources = struct {
         return comptime build_config.app_runtime == .gtk;
     }
 
+    fn materialOpacity(_: SystemSources) bool {
+        return material_opacity.load(.monotonic);
+    }
+
     fn installTheme(_: SystemSources, alloc: Allocator) void {
         var arena: ArenaAllocator = .init(alloc);
         defer arena.deinit();
@@ -225,6 +291,9 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
     if (sources.translatesPalette()) {
         try translatePalette(arena, ordered.items[0..defaults_end], configuredLanguage(ordered.items));
     }
+    if (sources.materialOpacity()) {
+        if (materialOpacityStep(ordered.items)) |step| try ordered.insert(arena, defaults_end, step);
+    }
 
     var result = try live.cloneEmpty(alloc_gpa);
     errdefer result.deinit();
@@ -288,6 +357,29 @@ fn replacedKey(arg: []const u8) ?usize {
     return null;
 }
 
+/// The defaults' `background-opacity` step for the window material that
+/// layered `steps` configure (`materialOpacity`), or null without a
+/// material or when a layer sets `background-opacity` itself.
+fn materialOpacityStep(steps: []const Step) ?Step {
+    const material_prefix = "--gx-window-material=";
+    var material: config_types.WindowMaterial = .solid;
+    for (steps) |step| switch (step) {
+        .arg => |arg| {
+            if (std.mem.startsWith(u8, arg, "--background-opacity=")) return null;
+            if (std.mem.startsWith(u8, arg, material_prefix)) {
+                const value = arg[material_prefix.len..];
+                material = if (value.len == 0)
+                    .solid
+                else
+                    std.meta.stringToEnum(config_types.WindowMaterial, value) orelse material;
+            }
+        },
+        .@"-e" => break,
+        else => {},
+    };
+    return .{ .arg = materialOpacity(material) orelse return null };
+}
+
 /// The UI language that layered `steps` configure: the last `language`
 /// value before `-e`, resolved like the app runtimes resolve it.
 fn configuredLanguage(steps: []const Step) i18n.Language {
@@ -342,8 +434,8 @@ fn translatePaletteEntry(arena: Allocator, arg: []const u8, lang: i18n.Language)
 
 /// Layer sources for tests: explicit defaults text, at most one user file
 /// (absolute path), command-line arguments, an overlay file, overrides,
-/// and whether the palette entries of the defaults are translated (as on
-/// GTK).
+/// whether the palette entries of the defaults are translated (as on
+/// GTK) and whether a window material shows behind the terminals.
 const TestSources = struct {
     defaults_text: []const u8,
     user_path: ?[]const u8 = null,
@@ -351,6 +443,7 @@ const TestSources = struct {
     overlay_path: ?[]const u8 = null,
     overrides: []const [:0]const u8 = &.{},
     translate_palette: bool = false,
+    material_opacity: bool = false,
 
     fn defaultsText(self: TestSources) []const u8 {
         return self.defaults_text;
@@ -358,6 +451,10 @@ const TestSources = struct {
 
     fn translatesPalette(self: TestSources) bool {
         return self.translate_palette;
+    }
+
+    fn materialOpacity(self: TestSources) bool {
+        return self.material_opacity;
     }
 
     fn loadUserFiles(self: TestSources, cfg: *Config, alloc: Allocator) !void {
@@ -1069,4 +1166,87 @@ test "overlayPath is next to the preferred configuration file" {
     defer testing.allocator.free(config_path);
     try testing.expectEqualStrings(gui_settings.file_name, std.fs.path.basename(path));
     try testing.expectEqualStrings(std.fs.path.dirname(config_path).?, std.fs.path.dirname(path).?);
+}
+
+test "a window material that shows behind the terminals gets a default background opacity" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const light = try dir.write(arena, "light", "background = #eeeeee\n");
+    const dark = try dir.write(arena, "dark", "background = #111111\n");
+    const defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\n", .{ light, dark });
+    const mica = try dir.write(arena, "mica.ghostty", "gx-window-material = mica\n");
+    const acrylic = try dir.write(arena, "acrylic.ghostty", "gx-window-material = acrylic\n");
+    const own = try dir.write(arena, "own.ghostty", "background-opacity = 0.9\ngx-window-material = tabbed\n");
+    const opaque_overlay = try dir.write(arena, "opaque.ghostty", "background-opacity = 1\n");
+
+    const cases = [_]struct { TestSources, f64 }{
+        .{ .{ .defaults_text = defaults_text, .user_path = mica, .material_opacity = true }, 0.3 },
+        .{ .{ .defaults_text = defaults_text, .user_path = acrylic, .material_opacity = true }, 0.75 },
+        .{ .{ .defaults_text = defaults_text, .args = &.{"--gx-window-material=tabbed"}, .material_opacity = true }, 0.3 },
+        // A layer that sets the opacity wins, whatever its rank.
+        .{ .{ .defaults_text = defaults_text, .user_path = own, .material_opacity = true }, 0.9 },
+        .{ .{ .defaults_text = defaults_text, .user_path = mica, .overlay_path = opaque_overlay, .material_opacity = true }, 1 },
+        // No material, a material reset, or a material the app runtime
+        // cannot show behind the terminals.
+        .{ .{ .defaults_text = defaults_text, .material_opacity = true }, 1 },
+        .{ .{ .defaults_text = defaults_text, .user_path = mica, .args = &.{"--gx-window-material="}, .material_opacity = true }, 1 },
+        .{ .{ .defaults_text = defaults_text, .user_path = mica }, 1 },
+    };
+    for (cases) |case| {
+        var cfg = try loadWith(testing.allocator, case[0]);
+        defer cfg.deinit();
+        try expectNoDiagnostics(&cfg);
+        try testing.expectEqual(case[1], cfg.@"background-opacity");
+    }
+
+    // The default is configuration input: conditional reloads keep it.
+    var cfg = try loadWith(testing.allocator, TestSources{ .defaults_text = defaults_text, .user_path = mica, .material_opacity = true });
+    defer cfg.deinit();
+    var dark_cfg = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark_cfg.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, dark_cfg.background);
+    try testing.expectEqual(@as(f64, 0.3), dark_cfg.@"background-opacity");
+}
+
+test "applyArg ranks above every layer and keeps the -e command" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const light = try dir.write(arena, "light", "background = #eeeeee\nbackground-opacity = 0.5\n");
+    const dark = try dir.write(arena, "dark", "background = #111111\n");
+    const user = try dir.write(arena, "config.ghostty", "background-opacity = 0.8\n");
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\n", .{ light, dark }),
+        .user_path = user,
+        .args = &.{ "--font-size=15", "-e", "htop" },
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(f64, 0.8), cfg.@"background-opacity");
+
+    try applyArg(&cfg, testing.allocator, "--background-opacity=1");
+    try expectNoDiagnostics(&cfg);
+    try testing.expectEqual(@as(f64, 1), cfg.@"background-opacity");
+    try testing.expectEqual(@as(f32, 15), cfg.@"font-size");
+    try testing.expectEqual(Config.Color{ .r = 0xee, .g = 0xee, .b = 0xee }, cfg.background);
+    const command = cfg.@"initial-command".?.direct;
+    try testing.expectEqual(@as(usize, 1), command.len);
+    try testing.expectEqualStrings("htop", command[0]);
+
+    var dark_cfg = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark_cfg.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, dark_cfg.background);
+    try testing.expectEqual(@as(f64, 1), dark_cfg.@"background-opacity");
+    try testing.expectEqual(@as(usize, 1), dark_cfg.@"initial-command".?.direct.len);
+
+    try applyArg(&cfg, testing.allocator, "--background-opacity=0.8");
+    try testing.expectEqual(@as(f64, 0.8), cfg.@"background-opacity");
 }

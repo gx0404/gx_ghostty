@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0023）之后的号。在册的 18 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016 与 GX-0021～GX-0023，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0024）之后的号。在册的 19 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016 与 GX-0021～GX-0024，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -78,6 +78,7 @@
 | GX-0022 | `src/termio/Exec.zig` | `fork(gx): GX-0022` | active |
 | GX-0023 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0023` | active |
 | GX-0023 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0023` | active |
+| GX-0024 | `src/config/Config.zig` | `fork(gx): GX-0024` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -557,7 +558,7 @@ python -m unittest scripts.test_fork_patches -v
 - 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（5 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
 - 标记：`fork(gx): GX-0010`；四个纯新增块以 `// fork(gx): GX-0010 begin: <说明>` 开头、`// fork(gx): GX-0010 end` 结尾，`language` 注释上方是单行标记。
 - 状态：active，未回馈上游。
-- 改动量：改写 `language` 的 18 行文档注释为 25 行；新增约 105 行（键与文档约 80 行、钩子、包装与诊断重放约 25 行），不改、不删其他上游行。
+- 改动量：改写 `language` 的 18 行文档注释为 25 行；新增约 115 行（键与文档约 90 行、钩子、包装与诊断重放约 25 行），不改、不删其他上游行。
 
 ### 原因
 
@@ -1004,3 +1005,43 @@ just wsl smoke --out <目录> --name ghostty-theme --config <写有 window-theme
 ### 测试锁定
 
 登记表与闭集检查之外，`scripts/test_fork_patches.py::gtk414_css_problems` 锁定 `style.css` 去掉注释后没有 GTK 4.14 解析不了的写法：渐变的过渡提示、空格分隔的 `rgb()`/`hsl()`，以及 `color-mix()`、`oklab()` 等新的颜色函数与 `var()`；夹具用例覆盖上游原来的写法、本补丁的写法与注释里的旧写法。`application.zig` 里的运行时 CSS 不在锁定范围内，由 GTK 冒烟验证。
+
+## GX-0024 background-opacity 文档写明 Windows 上的按像素透明
+
+- 文件：`src/config/Config.zig`，`background-opacity` 字段文档注释末尾追加一段，说明 Windows 上的行为。
+- 标记：`fork(gx): GX-0024`，追加段上方一行单行标记（夹在文档注释的两段之间，helpgen 只取 `///` 行）。
+- 状态：active，不回馈上游。
+- 改动量：1 个文件，新增 1 行空文档行、1 行标记与 6 行文档注释，不改上游原有行。
+
+### 原因
+
+`background-opacity` 的文档注释就是用户文档（`+show-config --docs`、`+explain-config`、生成的配置文档）。Windows 应用在 Windows 11 22H2 及以上、使用硬件 OpenGL 驱动时，让 DWM 按像素合成窗口（`src/apprt/win32/chrome/Backdrop.zig`），只有终端背景半透明，文字、光标、选区与图片保持不透明，窗口材质（`gx-window-material`）或桌面从背景透出；软件渲染与更早的系统仍整窗半透明。窗口材质还会给它一个默认值。这些都是 fork 的 Windows 行为，上游文档只写了 macOS，用户读不到，所以在字段文档里补一段；实现全在 fork 路径，不改上游代码。
+
+### 行为
+
+只多出一段文档；配置解析、默认值与渲染器都不变。
+
+### 上游状态
+
+不回馈：描述的是 fork 的 Windows 应用。
+
+### 同步冲突处理
+
+上游改写 `background-opacity` 的文档时取上游版本，再把标记行与追加段放回注释末尾（`@"background-opacity"` 字段之前）；上游删除或改名该字段时，按新字段名迁移这段说明。
+
+### 移除条件
+
+Windows 应用不再支持按像素透明，或这段说明改由 fork 自有的文档承载时，删除追加段与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>
+python -m unittest scripts.test_fork_patches -v
+```
+
+`<prefix>\bin\ghostty.exe +explain-config background-opacity | Out-String`（PowerShell）输出末尾有 Windows 一段。
+
+### 测试锁定
+
+只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。

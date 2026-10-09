@@ -1016,6 +1016,14 @@ palette: Palette = .{},
 /// widgets to show through which isn't generally desirable.
 ///
 /// On macOS, changing this configuration requires restarting Ghostty completely.
+///
+// fork(gx): GX-0024 background-opacity doc describes the Windows behavior
+/// On Windows 11 22H2 (build 22621) and later with a hardware OpenGL
+/// driver, only the terminal background is translucent: text, the cursor,
+/// selections and images stay opaque, and the window material
+/// (`gx-window-material`, which also gives this a default) or the desktop
+/// shows through. Otherwise on Windows, a value below 1 makes the whole
+/// window translucent, text included.
 @"background-opacity": f64 = 1.0,
 
 /// Applies background opacity to cells with an explicit background color
@@ -4058,8 +4066,17 @@ term: []const u8 = "xterm-ghostty",
 ///   * `tabbed` - The Mica Alt material that Windows uses for tabbed
 ///     windows, with a stronger wallpaper tint than `mica`.
 ///
-/// Materials other than `solid` need Windows 11; older versions of
-/// Windows use `solid`.
+/// The material shows behind the whole window: the terminal background is
+/// drawn with `background-opacity`, while text, the cursor, selections and
+/// images stay opaque. Unless `background-opacity` is set, a material
+/// sets it to `0.3` (`mica`, `tabbed`) or `0.75` (`acrylic`); set
+/// `background-opacity = 1` to keep the terminals opaque and show the
+/// material behind the title bar only.
+///
+/// Materials other than `solid` need Windows 11 22H2 (build 22621) or
+/// later; older versions of Windows use `solid`. With the software
+/// renderer (Mesa) the material shows behind the title bar only and gets
+/// no default `background-opacity`.
 ///
 /// The default is `solid`.
 ///
