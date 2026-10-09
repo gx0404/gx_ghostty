@@ -282,6 +282,80 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+  linux-gtk-noble:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ubuntu:24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install Git before the checkout so that it is a clone
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Trust the workspace for git inside the container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build and stage the GX Shell deb component (the documented consumer commands)
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
+          export GX_GHOSTTY_PACKAGE_CACHE="$RUNNER_TEMP/gx-package-cache"
+          evidence="$RUNNER_TEMP/gx-noble-evidence"
+          mkdir -p "$evidence"
+          python3 scripts/gx_package.py deb --build --install-deps --stage-dir "$RUNNER_TEMP/ghostty-gx-stage" --version-string "$GX_VERSION_STRING" 2>&1 | tee "$evidence/stage.log"
+          python3 scripts/gx_package.py verify-stage "$RUNNER_TEMP/ghostty-gx-stage" | tee "$evidence/verify-stage.log"
+          cp "$RUNNER_TEMP/ghostty-gx-stage/stage-manifest.json" "$evidence/"
+          readelf -d "$RUNNER_TEMP/ghostty-gx-stage/root/usr/lib/ghostty-gx/bin/ghostty" | tee "$evidence/readelf-dynamic.txt"
+      - name: Install the stage as a throwaway package, check +version and take an Xvfb screenshot
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          evidence="$RUNNER_TEMP/gx-noble-evidence"
+          package="$RUNNER_TEMP/ghostty-gx-stage-test.deb"
+          python3 scripts/gx_package.py test-deb "$RUNNER_TEMP/ghostty-gx-stage" --output "$package"
+          dpkg-deb --info "$package" | tee "$evidence/test-deb-info.txt"
+          apt-get install -y --no-install-recommends "$package" xvfb xauth scrot libgl1-mesa-dri fonts-dejavu-core
+          cd "$RUNNER_TEMP"
+          ghostty-gx +version | tee "$evidence/version.txt"
+          grep -Fx "  - version: $GX_VERSION_STRING" "$evidence/version.txt"
+          export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash -euo pipefail -c '
+            evidence="$1"
+            ghostty-gx --gtk-single-instance=false >"$evidence/ghostty.log" 2>&1 &
+            pid=$!
+            sleep 20
+            state="$(awk "/^State:/ {print \$2}" "/proc/$pid/status" 2>/dev/null || true)"
+            if [ -z "$state" ] || [ "$state" = Z ]; then
+              echo "ghostty-gx exited before the screenshot; see ghostty.log" >&2
+              exit 1
+            fi
+            scrot "$evidence/ghostty-gx-noble-xvfb.png"
+            kill "$pid"
+            wait "$pid" || true
+          ' bash "$evidence"
+          test -s "$evidence/ghostty-gx-noble-xvfb.png"
+      - name: Upload the Ubuntu 24.04 evidence (not a release asset)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence-linux-gtk-noble
+          path: ${{ runner.temp }}/gx-noble-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
   windows-app:
     needs: prepare
     runs-on: windows-2025
@@ -383,13 +457,14 @@ jobs:
           retention-days: 14
 
   verify:
-    needs: [prepare, source, libvt, libvt-macos, linux-gtk, windows-app, macos]
+    needs: [prepare, source, libvt, libvt-macos, linux-gtk, linux-gtk-noble, windows-app, macos]
     if: >-
       ${{ !cancelled()
       && needs.prepare.result == 'success'
       && needs.source.result == 'success'
       && needs.libvt.result == 'success'
       && needs.linux-gtk.result == 'success'
+      && needs.linux-gtk-noble.result == 'success'
       && needs.windows-app.result == 'success'
       && ((inputs.macos && needs.libvt-macos.result == 'success' && needs.macos.result == 'success')
       || (!inputs.macos && needs.libvt-macos.result == 'skipped' && needs.macos.result == 'skipped')) }}
