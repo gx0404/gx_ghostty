@@ -25,6 +25,11 @@
 |---|---|---|---|
 | GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |
 | GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |
+| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |
+| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |
+| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
+| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
+| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -156,3 +161,54 @@ python -m unittest scripts.test_fork_patches -v
 
 - 纯新增：删掉三个 GX-0002 块后，`build.zig` 与 `HEAD` 和 `main` 的 merge-base 上的上游版本（LF 归一化）完全相同；没有 `main` 时跳过。
 - 形状（`GX0002_HUNKS`）：恰好三个块；`test-bin`、`test-lib-vt-bin` 两个步骤，`mod_vt_test` → `test/vt`、`mod_vt_c_test` → `test/vt_c`、`test_exe` → `test` 三个安装目录，步骤对安装的依赖、`addPatchElf` 与 `-Demit-lib-vt` 时的 `addFail`，都各自只出现在一个块里；三个块分别位于 `test_lib_vt_build_step` 声明之后、`mod_vt_c_test` 之后、`test_exe` 之后，且都在各自的上游区块之内。
+
+## GX-0005 Windows 下的 termio 与核心修正
+
+- 文件：`src/termio/Options.zig`、`src/termio/Termio.zig`、`src/termio/stream_handler.zig`（`renderer_wakeup` 改为指针）、`src/Surface.zig`（传入渲染线程自己的 `wakeup`；`resolvePathForOpening` 跳过 URL）、`src/termio/Exec.zig`（读线程的退出条件、退出管道的 Win32 句柄、Windows 的 `TERM`、shell 值的 Windows 命令行切分，及一条对应测试）。
+- 标记：`fork(gx): GX-0005`；纯新增块用 begin/end，改动的单行上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：5 个文件，`git diff --numstat` 合计 +120/−17（含注释与一条测试）。
+
+### 原因
+
+win32 apprt 第一次让这些 Windows 分支真正运行，暴露出上游从未被执行过的问题：
+
+- libxev 的 IOCP `Async` 把等待者记录在结构体内部；`Surface.init` 把渲染线程的 `wakeup` 按值复制给 termio，副本永远没有等待者，`notify` 只置位、唤不醒渲染线程，终端输出不重绘。
+- `Exec` 的读线程遇到 `ReadFile` 的其他错误（子进程退出后 ConPTY 关闭管道）与 `PeekNamedPipe` 失败时执行 `unreachable`；退出管道是 `CreatePipe` 得到的 Win32 句柄，却用 CRT 的 `write`/`close` 操作，UCRT 对无效描述符会触发参数校验并终止进程。
+- 找到资源目录时 `TERM` 设为 `xterm-ghostty` 并把 `TERMINFO` 指向 Windows 路径，Windows 上的程序（MSYS2/Git Bash 的 ncurses、各类原生 TUI）没有这个 terminfo 条目。
+- 带参数的 shell 值按空白切分，`"C:\Program Files\…\bash.exe" -l` 这类带引号的路径无法使用。
+- `resolvePathForOpening` 把 `https://…` 之类的 URL 交给 `std.fs.path.resolve`，Windows 上会命中断言。
+
+### 行为
+
+- `termio.Options`、`Termio`、`StreamHandler` 持有 `*xev.Async`，指向 `Surface.renderer_thread.wakeup`；所有平台语义不变。
+- Windows 读线程在 `BROKEN_PIPE`、`HANDLE_EOF`、`PIPE_NOT_CONNECTED` 与零字节读时记 info 后退出，其他读错误与退出管道检查失败记 error 后退出，不再崩溃；子进程退出由 libxev 的进程监视（IOCP job object）照常上报。退出管道在 Windows 上用 `WriteFile`/`CloseHandle`。
+- Windows 上 `TERM=xterm-256color`、`COLORTERM=truecolor`，不设 `TERMINFO`；`TERM_PROGRAM`、`TERM_PROGRAM_VERSION` 等不变。用户仍可用 `env` 配置覆盖。
+- Windows 上带参数的 shell 值按 C 运行时的命令行规则（`std.process.Args.Iterator.Windows`）切分，支持双引号；不带空白的值与 direct 形式不变。
+- 含 `://` 的字符串不再作为相对路径解析。
+
+### 上游状态
+
+未回馈上游。这些分支只在 Windows apprt 存在时才会运行；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+先取上游版本，再按上述语义放回各处；上游若改用别的唤醒机制、重写读线程或 shell 切分，以上游实现为准并确认 Windows 上同样成立（GUI 冒烟：输出能刷新、`exit` 后窗口关闭、带引号的 `command` 能启动）。
+
+### 移除条件
+
+上游修正同一批问题（按指针传递唤醒句柄、读线程正常退出、Windows 句柄的退出管道、Windows 的 `TERM` 与命令行切分、URL 不按路径解析）后逐项移除，删除改动与标记并把对应登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+python scripts/zigw.py build -Dtarget=x86_64-linux-gnu -Dapp-runtime=none
+python -m unittest scripts.test_fork_patches -v
+```
+
+运行 `zig-out/bin/ghostty.exe`：输入命令后输出立即刷新；在 cmd 里 `exit` 后日志有 `child process exited` 与 `read thread got quit signal`，窗口关闭且没有崩溃；`ghostty.exe --command="\"C:\Program Files\PowerShell\7\pwsh.exe\" -NoLogo"` 能启动。`execCommand windows:` 用例随 `ghostty-test` 在 Windows 目标上运行。
+
+### 测试锁定
+
+只有登记表与闭集检查；`src/termio/Exec.zig` 新增 `execCommand windows: quoted path with spaces stays one argument` 用例。

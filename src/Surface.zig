@@ -687,7 +687,8 @@ pub fn init(
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
+            // fork(gx): GX-0005 the renderer thread's own Async, see termio.Options
+            .renderer_wakeup = &self.renderer_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
@@ -2159,6 +2160,9 @@ fn resolvePathForOpening(
     self: *Surface,
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
+    // fork(gx): GX-0005 begin: URLs are not paths; Windows path resolution asserts on them
+    if (std.mem.indexOf(u8, path, "://") != null) return null;
+    // fork(gx): GX-0005 end
     if (!std.fs.path.isAbsolute(path)) {
         const terminal_pwd = self.io.terminal.getPwd() orelse {
             return null;

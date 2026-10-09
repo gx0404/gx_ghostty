@@ -123,8 +123,9 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    // fork(gx): GX-0005 the pipe holds Win32 handles on Windows
+    errdefer closePipe(pipe[0]);
+    errdefer closePipe(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -203,7 +204,8 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+    // fork(gx): GX-0005 the pipe holds Win32 handles on Windows
+    switch (writeQuitPipe(exec.read_thread_pipe)) {
         .SUCCESS => {},
 
         // EPIPE means that our read thread is closed already, which is
@@ -547,7 +549,8 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        // fork(gx): GX-0005 the pipe holds Win32 handles on Windows
+        closePipe(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -564,6 +567,39 @@ pub const ThreadData = struct {
         self.termios_timer.deinit();
     }
 };
+
+// fork(gx): GX-0005 begin: the read thread quit pipe holds Win32 handles on Windows
+fn closePipe(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = windows.exp.kernel32.CloseHandle(fd);
+    } else {
+        _ = posix.system.close(fd);
+    }
+}
+
+/// Write the quit byte. Windows reports its own errors and returns success.
+fn writeQuitPipe(fd: posix.fd_t) posix.E {
+    if (comptime builtin.os.tag != .windows) return posix.errno(posix.system.write(fd, "x", 1));
+
+    var written: windows.DWORD = 0;
+    if (WriteFile(fd, "x", 1, &written, null) == windows.FALSE) {
+        switch (windows.GetLastError()) {
+            // The read thread already exited and closed its end.
+            .BROKEN_PIPE, .NO_DATA => {},
+            else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
+        }
+    }
+    return .SUCCESS;
+}
+
+extern "kernel32" fn WriteFile(
+    hFile: windows.HANDLE,
+    lpBuffer: [*]const u8,
+    nNumberOfBytesToWrite: windows.DWORD,
+    lpNumberOfBytesWritten: ?*windows.DWORD,
+    lpOverlapped: ?*windows.OVERLAPPED,
+) callconv(.winapi) windows.BOOL;
+// fork(gx): GX-0005 end
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
@@ -640,7 +676,8 @@ const Subprocess = struct {
         //
         // For now, we just look up a bundled dir but in the future we should
         // also load the terminfo database and look for it.
-        if (cfg.resources_dir) |base| {
+        // fork(gx): GX-0005 Windows programs have no terminfo database for xterm-ghostty
+        if (if (builtin.os.tag == .windows) null else cfg.resources_dir) |base| {
             try env.put("TERM", cfg.term);
             try env.put("COLORTERM", "truecolor");
 
@@ -1772,7 +1809,8 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        // fork(gx): GX-0005 the pipe holds Win32 handles on Windows
+        defer closePipe(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1791,12 +1829,27 @@ pub const ReadThread = struct {
                         // Check for a quit signal
                         .OPERATION_ABORTED => break,
 
+                        // fork(gx): GX-0005 begin: the pty closed; exit detection is separate
+                        .BROKEN_PIPE, .HANDLE_EOF, .PIPE_NOT_CONNECTED => {
+                            log.info("io reader exiting", .{});
+                            return;
+                        },
+                        // fork(gx): GX-0005 end
+
                         else => {
                             log.err("io reader error err={}", .{err});
-                            unreachable;
+                            // fork(gx): GX-0005 end the reader instead of crashing the app
+                            return;
                         },
                     }
                 }
+
+                // fork(gx): GX-0005 begin: a zero-byte read means the pty closed
+                if (n == 0) {
+                    log.info("io reader exiting", .{});
+                    return;
+                }
+                // fork(gx): GX-0005 end
 
                 @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
 
@@ -1810,7 +1863,8 @@ pub const ReadThread = struct {
             if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
                 const err = windows.GetLastError();
                 log.err("quit pipe reader error err={}", .{err});
-                unreachable;
+                // fork(gx): GX-0005 end the reader instead of crashing the app
+                return;
             }
 
             if (quit_bytes > 0) {
@@ -1978,10 +2032,10 @@ fn execCommand(
                 // (extra process in the tree, per-process cmd AutoRun
                 // state not reaching the user's actual shell).
                 //
-                // Values with arguments are split on whitespace. This
-                // does not honor Windows CLI quoting rules; users who
-                // need quoted arguments should use the direct command
-                // form, which takes an argv array as-is.
+                // fork(gx): GX-0005 values with arguments are split with the
+                // Windows command-line rules, so paths with spaces can be
+                // double-quoted; the direct command form takes an argv
+                // array as-is.
                 //
                 // Note we don't free any of the memory below since it is
                 // allocated in the arena.
@@ -1998,7 +2052,8 @@ fn execCommand(
                         try alloc.dupe(u8, v);
                     try args.append(alloc, try alloc.dupeZ(u8, argv0));
                 } else {
-                    var it = std.mem.tokenizeAny(u8, v, " \t");
+                    // fork(gx): GX-0005 Windows quoting rules instead of whitespace
+                    var it = try windowsArgIterator(alloc, v);
                     while (it.next()) |tok| {
                         try args.append(alloc, try alloc.dupeZ(u8, tok));
                     }
@@ -2020,6 +2075,20 @@ fn execCommand(
         },
     };
 }
+
+// fork(gx): GX-0005 begin: split a shell value like the C runtime splits a command line
+fn windowsArgIterator(
+    alloc: Allocator,
+    value: []const u8,
+) (Allocator.Error || error{SystemError})!std.process.Args.Iterator.Windows {
+    const trimmed = std.mem.trimStart(u8, value, " \t");
+    const value_w = std.unicode.wtf8ToWtf16LeAlloc(alloc, trimmed) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidWtf8 => return error.SystemError,
+    };
+    return try .init(alloc, value_w);
+}
+// fork(gx): GX-0005 end
 
 /// Append a value to an environment variable such as PATH.
 /// The returned value is always allocated so it must be freed.
@@ -2281,6 +2350,33 @@ test "execCommand windows: shell with args is split on whitespace" {
     try testing.expectEqualStrings("wsl", result[0]);
     try testing.expectEqualStrings("~", result[1]);
 }
+
+// fork(gx): GX-0005 begin: Windows quoting rules for shell values
+test "execCommand windows: quoted path with spaces stays one argument" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(
+        alloc,
+        .{ .shell = "\"C:\\Program Files\\Git\\bin\\bash.exe\" -l -c \"echo a b\"" },
+        struct {
+            fn get(_: Allocator) !PasswdEntry {
+                return .{};
+            }
+        },
+    );
+
+    try testing.expectEqual(4, result.len);
+    try testing.expectEqualStrings("C:\\Program Files\\Git\\bin\\bash.exe", result[0]);
+    try testing.expectEqualStrings("-l", result[1]);
+    try testing.expectEqualStrings("-c", result[2]);
+    try testing.expectEqualStrings("echo a b", result[3]);
+}
+// fork(gx): GX-0005 end
 
 test "execCommand windows: direct command is passed through unchanged" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;

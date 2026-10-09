@@ -32,7 +32,8 @@ renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
 /// a repaint should happen.
-renderer_wakeup: xev.Async,
+// fork(gx): GX-0005 by pointer: libxev's IOCP Async keeps its waiter inline, so a copy never wakes
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for renderer messages.
 renderer_mailbox: *renderer.Thread.Mailbox,

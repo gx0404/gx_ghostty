@@ -39,7 +39,8 @@ pub const StreamHandler = struct {
 
     /// A handle to wake up the renderer. This hints to the renderer that
     /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    // fork(gx): GX-0005 by pointer: libxev's IOCP Async keeps its waiter inline, so a copy never wakes
+    renderer_wakeup: *xev.Async,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
