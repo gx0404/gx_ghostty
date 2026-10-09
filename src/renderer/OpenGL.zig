@@ -2,6 +2,10 @@
 pub const OpenGL = @This();
 
 const std = @import("std");
+// fork(gx): GX-0004 begin: WGL on Windows
+const builtin = @import("builtin");
+const wgl = @import("opengl/wgl.zig");
+// fork(gx): GX-0004 end
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
 const egl = gl.egl;
@@ -12,7 +16,8 @@ const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 const Dmabuf = @import("Dmabuf.zig");
-pub const Device = @import("opengl/Device.zig");
+// fork(gx): GX-0004 Windows has no EGL; its device loads WGL instead
+pub const Device = if (builtin.os.tag == .windows) wgl.Device else @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -47,13 +52,27 @@ blending: configpkg.Config.AlphaBlending,
 /// The shared render device.
 device: *const Device,
 
-egl_context: *gl.egl.Context,
+// fork(gx): GX-0004 Windows uses `wgl_context` instead
+egl_context: if (builtin.os.tag == .windows) void else *gl.egl.Context,
+
+// fork(gx): GX-0004 begin: per-surface WGL state on Windows
+wgl_context: if (builtin.os.tag == .windows) wgl.Context else void = undefined,
+// fork(gx): GX-0004 end
 
 pub fn init(
     alloc: Allocator,
     device: *const Device,
     opts: rendererpkg.Options,
 ) !OpenGL {
+    // fork(gx): GX-0004 begin: the WGL context is created on the render thread
+    if (comptime builtin.os.tag == .windows) return .{
+        .alloc = alloc,
+        .blending = opts.config.blending,
+        .device = device,
+        .egl_context = {},
+        .wgl_context = try .init(opts.rt_surface),
+    };
+    // fork(gx): GX-0004 end
     const display = device.display;
 
     // Bind to OpenGL API explicitly before we create the context,
@@ -90,6 +109,13 @@ pub fn init(
 }
 
 pub fn deinit(self: *OpenGL) void {
+    // fork(gx): GX-0004 begin: the WGL context is gone with the render thread
+    if (comptime builtin.os.tag == .windows) {
+        self.wgl_context.deinit();
+        self.* = undefined;
+        return;
+    }
+    // fork(gx): GX-0004 end
     self.device.display.releaseCurrent();
     self.egl_context.destroy(self.device.display) catch {};
     self.* = undefined;
@@ -200,6 +226,15 @@ fn prepareContext(getProcAddress: anytype) !void {
 /// function pointers so all subsequent GL work on this thread is valid.
 pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
+    // fork(gx): GX-0004 begin: create and bind the WGL context on Windows
+    if (comptime builtin.os.tag == .windows) {
+        try self.wgl_context.threadEnter(self.device);
+        errdefer self.wgl_context.threadExit(self.device);
+        try prepareContext(&wgl.getProcAddress);
+        self.wgl_context.logImplementation(self.device);
+        return;
+    }
+    // fork(gx): GX-0004 end
     try self.device.display.makeCurrent(null, null, self.egl_context);
     // Load our function pointers for this thread's threadlocal.
     try prepareContext(&gl.egl.getProcAddress);
@@ -209,6 +244,13 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
 /// thread; unbinds the context from this thread so it can be destroyed on
 /// the main thread.
 pub fn threadExit(self: *OpenGL) void {
+    // fork(gx): GX-0004 begin: destroy the WGL context on Windows
+    if (comptime builtin.os.tag == .windows) {
+        self.wgl_context.threadExit(self.device);
+        gl.glad.unload();
+        return;
+    }
+    // fork(gx): GX-0004 end
     self.device.display.releaseCurrent();
     gl.glad.unload();
 }
@@ -279,6 +321,9 @@ pub fn present(
     target: Target,
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
+    // fork(gx): GX-0004 begin: Windows presents straight to the window
+    if (comptime builtin.os.tag == .windows) return self.wgl_context.present(self.device, target);
+    // fork(gx): GX-0004 end
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
     if (presentation_health == .healthy) {
@@ -298,7 +343,8 @@ pub fn present(
 }
 
 /// A finished frame exported for presentation by the apprt.
-pub const ExportedFrame = union(enum) {
+// fork(gx): GX-0004 Windows presents in place and exports nothing
+pub const ExportedFrame = if (builtin.os.tag == .windows) void else union(enum) {
     dmabuf: Dmabuf,
     memory: Memory,
 

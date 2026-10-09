@@ -82,7 +82,8 @@ pub fn complete(self: *const Self, sync: bool) void {
         self.renderer.pushFrame(frame);
 
         // Notify the surface that it should redraw
-        _ = self.renderer.surface_mailbox.push(.redraw, .{ .forever = {} });
+        // fork(gx): GX-0004 Windows presents in place, there is nothing to redraw
+        if (comptime OpenGL.ExportedFrame != void) _ = self.renderer.surface_mailbox.push(.redraw, .{ .forever = {} });
     }
 
     // Report the health to the renderer.

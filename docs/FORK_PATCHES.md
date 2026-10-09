@@ -25,6 +25,8 @@
 |---|---|---|---|
 | GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |
 | GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |
+| GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |
+| GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |
 | GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
@@ -161,6 +163,51 @@ python -m unittest scripts.test_fork_patches -v
 
 - 纯新增：删掉三个 GX-0002 块后，`build.zig` 与 `HEAD` 和 `main` 的 merge-base 上的上游版本（LF 归一化）完全相同；没有 `main` 时跳过。
 - 形状（`GX0002_HUNKS`）：恰好三个块；`test-bin`、`test-lib-vt-bin` 两个步骤，`mod_vt_test` → `test/vt`、`mod_vt_c_test` → `test/vt_c`、`test_exe` → `test` 三个安装目录，步骤对安装的依赖、`addPatchElf` 与 `-Demit-lib-vt` 时的 `addFail`，都各自只出现在一个块里；三个块分别位于 `test_lib_vt_build_step` 声明之后、`mod_vt_c_test` 之后、`test_exe` 之后，且都在各自的上游区块之内。
+
+## GX-0004 OpenGL 渲染器在 Windows 上用 WGL
+
+- 文件：`src/renderer/OpenGL.zig`（导入、`Device` 与 `egl_context` 两处类型、新增 `wgl_context` 字段，`init`、`deinit`、`threadEnter`、`threadExit`、`present` 开头各一个 Windows 分支，`ExportedFrame` 在 Windows 上为 `void`）、`src/renderer/opengl/Frame.zig`（`ExportedFrame` 为 `void` 时不再推送 `.redraw`）。WGL 实现在新路径 `src/renderer/opengl/wgl.zig`。
+- 标记：`fork(gx): GX-0004`；纯新增块用 begin/end，三处改动的单行上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，`git diff --numstat` 合计 +51/−4（含注释）。
+
+### 原因
+
+上游的 OpenGL 后端只走 EGL：`opengl/Device.zig` 打开 surfaceless EGL display，每个 surface 的 EGL context 在主线程创建、在渲染线程 make current，帧离屏渲染后导出为 DMABUF 或 CPU 像素交给 GTK 合成，再推 `.redraw` 让 apprt 重绘。Windows 没有 EGL（构建也不编译 `glad_egl.c`），win32 apprt 把帧直接呈现到子窗口，需要 WGL。
+
+### 行为
+
+- Windows 上 `OpenGL.Device` 即 `wgl.Device`：进程启动时用一个隐藏的探测窗口载入 `wglCreateContextAttribsARB`、`wglChoosePixelFormatARB`、`wglSwapIntervalEXT`，并确认能建 OpenGL 4.3 core context；系统驱动不满足时改用 exe 同目录 `mesa\opengl32.dll`（Mesa llvmpipe），环境变量 `GHOSTTY_GX_OPENGL=software` 直接用 Mesa。两者都不可用时弹出说明对话框，`App` 初始化以 `DeviceFailed` 失败。
+- apprt 为每个子窗口（`CS_OWNDC`）调用一次 `Device.setPixelFormat`，优先选 sRGB-capable 的双缓冲 RGBA8 格式。
+- `OpenGL.init`（主线程）只记录 surface 的 HDC，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、设 swap interval 1，并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
+- `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer（尺寸不一致时按左上角对齐，其余区域清为透明黑），再 `SwapBuffers`；没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
+- 非 Windows 目标的行为与产物不变。
+
+### 上游状态
+
+未回馈上游。上游 OpenGL 后端没有 WGL 路径。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+先取上游版本，再把各 Windows 分支放回对应函数开头（`init`、`deinit`、`threadEnter`、`threadExit`、`present`），恢复 `Device`、`egl_context`、`ExportedFrame` 三处类型选择与 `wgl_context` 字段、`Frame.complete` 里 `.redraw` 的守卫。上游改动这些函数的签名、`Device` 接口（`init`/`deinit`）或帧呈现协议时，同步调整 `src/renderer/opengl/wgl.zig`。
+
+### 移除条件
+
+上游提供 Windows 上可用的 OpenGL 呈现路径（WGL 或其他），且 win32 apprt 改用它之后移除；移除时删除改动、标记与 `wgl.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+python scripts/zigw.py build -Dtarget=x86_64-linux-gnu -Dapp-runtime=none
+python -m unittest scripts.test_fork_patches -v
+```
+
+运行 `zig-out/bin/ghostty.exe`：日志有 `loaded OpenGL 4.x vendor=… renderer=… software=false`，窗口正常渲染、缩放后重绘，Ctrl+Shift+T 新建的标签页同样渲染。把 Mesa 的 `opengl32.dll` 与 `libgallium_wgl.dll` 放进 `zig-out/bin/mesa/` 并以 `GHOSTTY_GX_OPENGL=software` 启动，日志应为 `software=true`、renderer 为 llvmpipe。GTK 的 EGL 路径需在 Linux 上验证。
+
+### 测试锁定
+
+只有登记表与闭集检查；`wgl.zig` 带一个版本串解析的单元测试。
 
 ## GX-0005 Windows 下的 termio 与核心修正
 
