@@ -1,8 +1,10 @@
 // Ported from shiweis/ghostty-windows@119b9270c (MIT). Copyright (c) Shiwei Song and Ghostty contributors.
 //! Win32 application runtime. Manages the Win32 window classes, the
 //! message loop, the window list and performs the apprt actions the core
-//! sends (`performAction`), delegating window chrome to `Window` and
-//! surface popups, menus and dialogs to `Surface` and the `ui/` modules.
+//! sends (`performAction`) and the Ghostty GX binding actions (`gxAction`:
+//! settings, main menu, keyboard shortcuts, launch profiles), delegating
+//! window chrome to `Window` and surface popups, menus and dialogs to
+//! `Surface` and the `ui/` modules.
 const App = @This();
 
 const std = @import("std");
@@ -22,6 +24,8 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
+const Keybinds = @import("ui/Keybinds.zig");
+const Settings = @import("ui/Settings.zig");
 const d2d = @import("ui/d2d.zig");
 const gx = @import("../../gx/main.zig");
 const i18n = gx.i18n;
@@ -640,19 +644,11 @@ pub fn performAction(
         },
 
         .open_config => {
-            const config_path = configpkg.edit.openPath(
-                self.core_app.alloc,
-            ) catch |err| {
-                log.err("failed to get config path: {}", .{err});
-                return false;
-            };
-            defer self.core_app.alloc.free(config_path);
-
-            return switch (value) {
-                .os_open => self.openConfigWithOs(config_path),
-                .new_window => (try self.openConfigInNewWindow(config_path)) or
-                    self.openConfigWithOs(config_path),
-            };
+            // `gx-open-config-ui` picks the settings UI or the file.
+            if (self.config.@"gx-open-config-ui" == .settings) {
+                if (self.targetWindow(target)) |window| return Settings.show(window);
+            }
+            return try self.openConfigFile(value);
         },
 
         .scrollbar => {
@@ -1384,6 +1380,153 @@ pub fn performAction(
 
         // All 66 apprt actions are now handled above.
     }
+}
+
+/// Perform a Ghostty GX binding action (`gx:<name>` in `keybind` and
+/// `command-palette-entry`). The core surface calls this for the `gx`
+/// binding action (fork patch GX-0014). Returns whether the action was
+/// performed.
+pub fn gxAction(self: *App, target: apprt.Target, action: gx.action.Action) !bool {
+    const window = self.targetWindow(target) orelse {
+        log.info("no window for GX action action=gx:{f}", .{action});
+        return false;
+    };
+    return self.performGx(window, action);
+}
+
+/// Perform a GX action for `window`. Menus and buttons call this directly.
+/// The main menu opens after the current message has been handled.
+pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
+    return switch (action) {
+        .settings => Settings.show(window),
+        .main_menu => window.queueMainMenu(null),
+        .keybinds => Keybinds.show(window),
+        .new_tab_profile => |id| self.openProfile(window, id, .tab),
+        .new_window_profile => |id| self.openProfile(window, id, .window),
+    };
+}
+
+/// The window an action applies to: the surface's window, or for app
+/// targets the foreground window, else the most recently opened one.
+fn targetWindow(self: *App, target: apprt.Target) ?*Window {
+    switch (target) {
+        .surface => |core_surface| return core_surface.rt_surface.parent_window,
+        .app => {
+            const foreground = w32.GetForegroundWindow();
+            for (self.windows.items) |window| {
+                if (window.hwnd != null and window.hwnd == foreground) return window;
+            }
+            if (self.windows.items.len == 0) return null;
+            return self.windows.items[self.windows.items.len - 1];
+        },
+    }
+}
+
+/// Create and track a top-level window without tabs. It is shown with its
+/// first tab (`Window.addTab*`).
+pub fn newWindow(self: *App, options: Window.InitOptions) !*Window {
+    const alloc = self.core_app.alloc;
+    const window = try alloc.create(Window);
+    errdefer alloc.destroy(window);
+    try window.init(self, options);
+    errdefer window.deinit();
+    try self.windows.append(alloc, window);
+    return window;
+}
+
+/// The launch profiles: the shells detected on this system followed by the
+/// `gx-launch-profile` entries. The caller owns the list (`deinit`).
+pub fn launchProfiles(self: *App) !gx.profiles.List {
+    const alloc = self.core_app.alloc;
+    const map = &self.config.@"gx-launch-profile".map;
+    const custom = try alloc.alloc(gx.profiles.Custom, map.count());
+    defer alloc.free(custom);
+    for (map.keys(), map.values(), custom) |name, command, *entry| {
+        entry.* = .{ .name = name, .command = command };
+    }
+
+    var env = try global.environMap();
+    defer env.deinit();
+    return try gx.profiles.detectSystem(alloc, global.io(), &env, custom);
+}
+
+pub const ProfileTarget = enum { tab, window };
+
+/// Open the launch profile `id` (`gx.profiles.Profile.id`, e.g. `pwsh` or
+/// `wsl:Ubuntu`; a bare `gx-launch-profile` name also finds `custom:<name>`)
+/// in a new tab of `window` or in a new window. Returns false, after
+/// logging why, when there is no such profile or the terminal could not
+/// be created.
+pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTarget) bool {
+    var list = self.launchProfiles() catch |err| {
+        log.err("launch profile detection failed err={}", .{err});
+        return false;
+    };
+    defer list.deinit();
+    const profile = findProfile(&list, id) orelse {
+        log.warn("no launch profile with id={s}", .{id});
+        return false;
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+    defer arena.deinit();
+    const command: configpkg.Command = switch (profile.command) {
+        .argv => |argv| .{ .direct = argv },
+        .command_line => |line| parsed: {
+            var parsed: configpkg.Command = undefined;
+            parsed.parseCLI(arena.allocator(), line) catch |err| {
+                log.warn("invalid launch profile command id={s} err={}", .{ profile.id, err });
+                return false;
+            };
+            break :parsed parsed;
+        },
+    };
+
+    const destination = switch (where) {
+        .tab => window,
+        .window => self.newWindow(.{}) catch |err| {
+            log.err("failed to create a window for launch profile id={s} err={}", .{ profile.id, err });
+            return false;
+        },
+    };
+    _ = destination.addTabWithOptions(.{
+        .context = switch (where) {
+            .tab => .tab,
+            .window => .window,
+        },
+        .command = &command,
+    }) catch |err| {
+        log.err("failed to open launch profile id={s} err={}", .{ profile.id, err });
+        if (where == .window) destination.close();
+        return false;
+    };
+    return true;
+}
+
+fn findProfile(list: *const gx.profiles.List, id: []const u8) ?*const gx.profiles.Profile {
+    if (list.find(id)) |profile| return profile;
+    var buf: [256]u8 = undefined;
+    const custom_id = std.fmt.bufPrint(&buf, "custom:{s}", .{id}) catch return null;
+    return list.find(custom_id);
+}
+
+/// Open the configuration file: `.os_open` with the Windows file
+/// association; `.new_window` in a new window running $VISUAL or $EDITOR,
+/// else with the file association.
+pub fn openConfigFile(self: *App, mode: apprt.action.OpenConfig) !bool {
+    const config_path = configpkg.edit.openPath(
+        self.core_app.alloc,
+    ) catch |err| {
+        log.err("failed to get config path: {}", .{err});
+        return false;
+    };
+    defer self.core_app.alloc.free(config_path);
+
+    return switch (mode) {
+        .os_open => self.openConfigWithOs(config_path),
+        .new_window => (try self.openConfigInNewWindow(config_path)) or
+            self.openConfigWithOs(config_path),
+    };
 }
 
 /// Replace the app config after a reload and refresh the app-wide GUI

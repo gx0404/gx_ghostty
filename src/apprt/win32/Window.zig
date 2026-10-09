@@ -12,6 +12,7 @@
 //!     drag, context menu and inline rename.
 //!   - `chrome/Backdrop.zig`: DWM theme, opacity and blur.
 //!   - `ui/ResizeOverlay.zig` (`resize_overlay`): the size overlay.
+//!   - `ui/Menu.zig`: the main menu, opened through `queueMainMenu`.
 //!
 //! Language changes reach the window through `onLanguageChanged`.
 const Window = @This();
@@ -97,6 +98,13 @@ max_track_h: i32 = 0,
 
 /// Transient "columns × rows" overlay shown while resizing.
 resize_overlay: ResizeOverlay = .{},
+
+/// Where the main menu queued by `queueMainMenu` opens (null: below the
+/// chrome at the left edge).
+main_menu_anchor: ?w32.POINT = null,
+
+/// Posted by `queueMainMenu`; opens the main menu.
+const WM_APP_MAIN_MENU: u32 = w32.WM_APP + 20;
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -372,6 +380,17 @@ pub fn performBindingAction(self: *Window, action: @import("../../input.zig").Bi
             log.err("binding action failed action={t} err={}", .{ action, err });
         };
     }
+}
+
+/// Open the main menu (`Menu.showMainMenu`) once the current message has
+/// been handled, at `anchor` in screen coordinates or below the chrome.
+/// The menu runs a modal loop, which must not run inside a core callback
+/// such as a key binding. Returns false if the request could not be queued.
+pub fn queueMainMenu(self: *Window, anchor: ?w32.POINT) bool {
+    const hwnd = self.hwnd orelse return false;
+    if (self.closing) return false;
+    self.main_menu_anchor = anchor;
+    return w32.PostMessageW(hwnd, WM_APP_MAIN_MENU, 0, 0) != 0;
 }
 
 /// Find the tab index containing a given surface.
@@ -1392,6 +1411,11 @@ pub fn windowWndProc(
         w32.WM_TIMER => {
             if (window.resize_overlay.onTimer(wparam)) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
+        WM_APP_MAIN_MENU => {
+            if (!window.closing) Menu.showMainMenu(window, window.main_menu_anchor);
+            return 0;
         },
 
         w32.WM_CTLCOLORSTATIC => {

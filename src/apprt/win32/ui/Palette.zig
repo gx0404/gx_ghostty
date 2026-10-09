@@ -426,7 +426,7 @@ fn paint(self: *Palette, hwnd: w32.HWND) void {
         _ = w32.DrawTextW(hdc, wname.ptr, @intCast(wname.len), &name_rect, 0);
 
         // Draw keybinding hint on the right
-        if (s.app.config.keybind.set.getTrigger(entry_action)) |t| {
+        if (trigger.find(&s.app.config.keybind.set, entry_action)) |t| {
             _ = w32.SetTextColor(hdc, w32.RGB(140, 140, 140));
             var kb_buf: [64]u8 = undefined;
             const kb = trigger.format(t, &kb_buf);

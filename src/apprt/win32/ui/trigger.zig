@@ -11,6 +11,26 @@ pub fn format(trigger: input.Binding.Trigger, buf: []u8) []const u8 {
     return writer.buffered();
 }
 
+/// A trigger that performs `action` in `set`: the set's reverse mapping,
+/// else the first `performable:` binding of the action (the reverse
+/// mapping leaves those out). Sequences and chains are not searched.
+pub fn find(set: *const input.Binding.Set, action: input.Binding.Action) ?input.Binding.Trigger {
+    if (set.getTrigger(action)) |t| return t;
+    var it = set.bindings.iterator();
+    while (it.next()) |entry| switch (entry.value_ptr.*) {
+        .leaf => |leaf| if (leaf.action.equal(action)) return entry.key_ptr.*,
+        .leader, .leaf_chained => {},
+    };
+    return null;
+}
+
+/// The formatted trigger of `action` in `set` (see `find`), or null.
+pub fn formatAction(set: *const input.Binding.Set, action: input.Binding.Action, buf: []u8) ?[]const u8 {
+    const trigger = find(set, action) orelse return null;
+    const text = format(trigger, buf);
+    return if (text.len == 0) null else text;
+}
+
 fn write(trigger: input.Binding.Trigger, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     if (trigger.mods.super) try writer.writeAll("Win+");
     if (trigger.mods.ctrl) try writer.writeAll("Ctrl+");

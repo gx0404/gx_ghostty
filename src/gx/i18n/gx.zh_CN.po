@@ -403,3 +403,22 @@ msgstr "所有文件 (*.*)"
 
 msgid "Editing configuration file {path}"
 msgstr "正在编辑配置文件 {path}"
+
+#. Windows apprt: main menu and the GX command palette entries
+msgid "Main Menu"
+msgstr "主菜单"
+
+msgid "New Tab with Profile"
+msgstr "用配置新建标签页"
+
+msgid "No Launch Profiles"
+msgstr "没有启动配置"
+
+msgid "Open the Ghostty GX settings."
+msgstr "打开 Ghostty GX 设置。"
+
+msgid "Show all keyboard shortcuts."
+msgstr "显示全部键盘快捷键。"
+
+msgid "Open the main menu."
+msgstr "打开主菜单。"

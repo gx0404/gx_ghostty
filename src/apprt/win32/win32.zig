@@ -1167,6 +1167,7 @@ pub extern "user32" fn TrackMouseEvent(
 pub const MF_STRING: u32 = 0x00000000;
 pub const MF_SEPARATOR: u32 = 0x00000800;
 pub const MF_GRAYED: u32 = 0x00000001;
+pub const MF_POPUP: u32 = 0x00000010;
 
 pub const TPM_LEFTALIGN: u32 = 0x0000;
 pub const TPM_TOPALIGN: u32 = 0x0000;
