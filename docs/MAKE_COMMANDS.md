@@ -75,6 +75,28 @@
 - `--no-build` 跑的是 `zig-out/test/` 里上次安装的二进制；用过 `-Dtest-filter` 之后，那里可能只剩裁剪后的用例，裁空时报「测试二进制本身没有用例」。这类运行只把实测并入耗时缓存，不删记录（见 TESTING.md「并行运行器与耗时」）。
 - 上游串行路径原样保留，用于与运行器的结论对照：`just zig build test-lib-vt`（每个二进制在单个进程里逐条运行，本机全量 6–8 min）与 `just zig build test`（Linux/macOS；macOS 上不带 `-Dtest-filter` 时还多跑 app 的 `xcodebuild test`）；`-Dtest-filter` 在这两条路径上同样可用。
 
+### WSL（Windows 主机上的 Linux 构建、测试与截图）
+
+| 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
+|---|---|---|---|---|
+| `just wsl <子命令> <参数…>` | `scripts/gx_wsl.py`：经 `wsl.exe -d <发行版> -e bash -c <脚本> gx-wsl <参数…>` 在 WSL 克隆（默认 `Ubuntu-24.04` 的 `~/src/gx_ghostty`）里执行，补上 Windows 本机编不出的 GTK app 与 `just test` 主套件。全局参数放在子命令前后都可以：`--distro`、`--clone`（Linux 路径；Git Bash 会改写以 `/` 开头的参数，写成 `'~/src/x'`）、`--dry-run`（只打印 wsl.exe 命令行与脚本） | Windows 与 WSL2；发行版里装好 apt 依赖（`setup --apt` 可补装）；首次 `setup` 要联网 | 只写 WSL 内：克隆、克隆内的 `.local/`（钉版 Zig、Zig 缓存）与 `zig-pkg/`、`~/.local/opt/blueprint-compiler-0.16.0` 与 `~/.local/bin/blueprint-compiler`；`smoke` 另写 `--out` 给的 Windows 目录 | 透传 WSL 内命令的退出码；用法错误、找不到 wsl.exe、缺克隆或缺构建产物、wsl.exe 自身失败为 2；`sync` 拒绝改动克隆为 3 |
+
+| 子命令 | 作用 |
+|---|---|
+| `setup [--check] [--apt]` | 幂等：克隆不存在时从本仓 `git clone`；克隆内 `python3 scripts/setup_zig.py --install`；下载钉版 blueprint-compiler 0.16.0（GNOME GitLab 的 `v0.16.0` tag 归档，按 sha256 校验），用 meson 装到 `~/.local/opt/blueprint-compiler-0.16.0` 并写 `~/.local/bin/blueprint-compiler` shim（不覆盖别人写的同名文件）；最后预取 Zig 包。`--check` 只读报告；`--apt` 先以 root 安装缺失的 apt 包与 locale，只装缺的、不升级已装的 |
+| `sync [<ref> \| <worktree 目录>] [--dirty]` | 把本仓的一个提交取进克隆并 detached 检出：目录参数按 worktree 处理（取其 HEAD），其余按本仓 ref 解析，省略时取脚本所在的 worktree。`--dirty` 用临时 index 把该 worktree 的未提交与未跟踪（未被忽略）文件快照成一个提交对象再同步，不动它的 index、ref 与文件，快照对象留在对象库里直到 gc。克隆有本地改动、或检出会孤立克隆里的本地提交时拒绝；同步结果记在克隆的 `refs/gx-wsl/synced` |
+| `build [--gtk] <zig build 参数…>` | 克隆内 `python3 scripts/zigw.py build …`；`--gtk` 追加 `-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell`：Ubuntu 24.04 没有 gtk4-layer-shell 开发包，改由 `pkg/gtk4-layer-shell` 构建动态库并装到 `zig-out/lib/` |
+| `test [--suite main\|vt] [--gtk] [--filter <子串>]… <zig_test 参数…>` | 克隆内 `python3 scripts/zig_test.py`；`main`（默认）与 gx-ci `linux-main` 一样加 `-Dapp-runtime=none`，`--gtk` 改为 GTK 运行时 |
+| `smoke --out <Windows 目录> [--lang zh_CN\|en] [--xdotool <文件>] [--config <文件>] [--wait <秒>] [--name <前缀>] [-- <ghostty 参数…>]` | 与 gx-ci `gtk-smoke` 相同的 `xvfb-run`（`1280x800x24`）、`GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1` 与 `--gtk-single-instance=false`，等 `--wait` 秒（默认 20）后 scrot 截图；给了 xdotool 脚本就执行它（`$1` 是 Ghostty 的 PID）再截一张。`<前缀>.png`、`<前缀>-after.png`、`<前缀>.log`、`<前缀>-version.txt`、`<前缀>-meta.txt` 复制到 `--out`，前缀默认 `ghostty-xvfb[-<lang>]`；Ghostty 提前退出或截图为空时退出 1 |
+| `run [--lang zh_CN\|en] [--config <文件>] [--x11] [-- <ghostty 参数…>]` | 在 WSLg 桌面后台启动 `zig-out/bin/ghostty`（默认 Wayland，`--x11` 走 XWayland），打印 PID 与停止命令；每次的私有配置与日志在 `~/.cache/gx-wsl/run/<时间>-<pid>/`，只保留最近 10 次 |
+| `shell` | 打印进入克隆、手工构建与运行的命令 |
+
+- 网络：WSL 里 Zig 自带的 HTTP 客户端经 HTTP 代理访问 HTTPS 会失败（`HttpConnectionClosing`：CONNECT 隧道建好后没有做 TLS），所以 `setup`、`build`、`test` 先按 `build.zig.zon.json` 与各级 `build.zig.zon`（忽略 `//` 注释）用 curl 下载缺失的包，再在克隆里 `zig fetch <文件>` 登记，打印出的包 hash 必须等于声明值；`git+https` 依赖改取 GitHub / Codeberg 上该提交的归档，同样由 hash 保证内容一致。
+- 运行期库：Zig 写进 `ghostty` 的 RUNPATH 是相对路径 `.zig-cache/o/<hash>`，只有在克隆根目录下运行才找得到 `libgtk4-layer-shell.so`，所以 `smoke`、`run` 设 `LD_LIBRARY_PATH=<克隆>/zig-out/lib`。另一条路是 `src/build/Config.zig` 的 `-Dpatch-rpath='$ORIGIN/../lib'`（PATH 上要有 `patchelf`）：实测得到 RUNPATH `$ORIGIN/../lib`，任意目录都能运行；但它就地改写 Zig 缓存里的产物，gx_wsl 不默认使用。
+- 配置隔离：`smoke`、`run` 给 Ghostty 一个私有的 `XDG_CONFIG_HOME`，其中 `ghostty/config.ghostty` 是 `--config` 文件（CRLF 转为 LF）或空文件，并用 `env = XDG_CONFIG_HOME=…` 把原值交还给终端里的 shell；不读写 WSL 用户自己的 Ghostty 配置，也不在 `~/.config/ghostty` 生成模板。
+- WSL 内的环境：去掉 PATH 中的 `/mnt/*` 项、把 `~/.local/bin` 放在最前，并 unset `ZIG` 与 `GX_GHOSTTY_ZIG`，一律使用克隆内的钉版 Zig。
+- 一个克隆同一时间只给一个任务用；其他任务用 `--clone '~/src/gx_ghostty-<id>'`（或 `GX_WSL_CLONE`）各自建克隆，`setup` 会负责克隆。
+
 ## 环境变量
 
 | 变量 | 读取方 | 作用 |
@@ -88,6 +110,8 @@
 | `GX_GHOSTTY_GRAPHIFY_CLI` | `scripts/graphify.py` | 指定 graphify CLI；未设置时先用 `.local/tools/venv` 的 `python -m graphify`（不直接执行 venv 里生成的 `graphify.exe`：Windows 智能应用控制会以 WinError 4551 拦截这个未签名启动器），再找 PATH 里的 `graphify` |
 | `GX_GHOSTTY_GRAPHIFY_ALLOW_ANY_VERSION` | `scripts/graphify.py` | 设为 `1` 时放行非钉版 graphify，只用于升级钉版前在临时副本里比对图谱 |
 | `GHOSTTY_GX_DEFAULTS` | `src/gx/config_layers.zig::enabled`（`Config.load`） | 设为 `0`、`false`、`off` 或 `no` 时，ghostty 像上游一样加载配置：没有 Ghostty GX 默认值、不读 `gui-settings.ghostty`、按上游顺序；用于对照上游行为与测试 |
+| `GX_WSL_DISTRO` | `scripts/gx_wsl.py` | `just wsl` 的默认 WSL 发行版（缺省 `Ubuntu-24.04`），`--distro` 优先 |
+| `GX_WSL_CLONE` | `scripts/gx_wsl.py` | `just wsl` 的默认克隆路径，必须是 Linux 路径（缺省 `~/src/gx_ghostty`），`--clone` 优先 |
 | `GX_GATE_WATCHDOG_SECONDS` | `.claude/hooks/pre_tool_use_gate.py::evaluation_deadline` | 只供测试：缩短 hook 求值看门狗（默认 `EVALUATION_DEADLINE_SECONDS`，10 秒），只认 (0, 10] 内的数，其余值一律按默认处理，所以只能缩短、不能延长。日常会话不要设置：它只会让 hook 更早超时，从而拒绝本可放行的调用 |
 
 ## 上游 Makefile 目标（原样保留）
@@ -106,4 +130,5 @@
 - `justfile` 在 Windows 上调用 `python`。如果它解析到 `WindowsApps` 下不可用的别名，所有配方（包括 `just doctor`）都会失败；用 `where python` 与 `python --version` 确认解析结果，必要时调整 PATH 让真实解释器排在前面。
 - 构建需要 MSVC 与 Windows SDK，由人类安装；`just doctor` 用 vswhere 查找带 C++ 工具组件的 Visual Studio，只报告不安装。
 - `just test` 在 Windows 上直接以退出码 2 结束（`ghostty-test` 编译不过，见上表），`just build` 以退出码 1 结束（libghostty-internal 编译不过，库用 `just build-vt`）；`just test-vt` 是本机主测试，本机能跑的全量是 `just ci-check`（framework-check、fmt-check、test-vt）。完整单测与非 vt 代码的编译交给 `gx-ci` 的 `linux-main`，本机记 PENDING。GUI 相关命令在 Windows 上没有对应物。
+- 装了 WSL2 时，`just wsl test`、`just wsl build --gtk` 与 `just wsl smoke --out <目录>` 在 WSL 克隆里补跑完整单测、GTK 构建与 Xvfb 截图（见上文「WSL」）；这是本机 Linux 证据，与 `gx-ci` 的 job 互不代证。
 - 判断成败只看退出码，不把命令接到 `| tail`、`| head`；各 shell 的写法见 TESTING.md「证据规则」。

@@ -6,7 +6,7 @@
 
 | 层 | 命令 | 前置 | 能证明 | 不能代证 |
 |---|---|---|---|---|
-| 框架单测 | `just framework-test`（`scripts/run_unittests.py` 并行）；只跑一部分用 `python scripts/run_unittests.py <PATTERN…>` | Python ≥ 3.10 | resolver、hook 允许与拒绝探针、版本、提交规范、zigw 与 setup、两个测试运行器、发布脚本、workflow 形状与启用集合、KB 检索回归、图谱指纹、fork 补丁标记等框架契约 | 任何 Zig 产品行为；AI 客户端的新会话是否真的加载了配置（见 AI_TOOLS.md 验证账本） |
+| 框架单测 | `just framework-test`（`scripts/run_unittests.py` 并行）；只跑一部分用 `python scripts/run_unittests.py <PATTERN…>` | Python ≥ 3.10 | resolver、hook 允许与拒绝探针、版本、提交规范、zigw 与 setup、两个测试运行器、WSL 入口的命令与脚本构造、发布脚本、workflow 形状与启用集合、KB 检索回归、图谱指纹、fork 补丁标记等框架契约 | 任何 Zig 产品行为；AI 客户端的新会话是否真的加载了配置（见 AI_TOOLS.md 验证账本） |
 | 规则闭集 | `just rules-check` | Python、Git | 每个 Git 可见文件都有路由、pattern 无零命中、与 `root_only` 不重叠；嵌套 `AGENTS.md` 与登记一致；领域文档闭集与体积；根 `AGENTS.md` ≤16 KiB 且含 fork 标记 | 规则内容是否与源码一致，这要靠复审 |
 | 版本格式 | `just version-check` | Python | `CHANGELOG.md` 标题都合法、至少有一个，可以取出最大 SemVer | 能否发版：`gx-release` 以 `publish=true` 运行时，prepare 另要求最大版本已带日期 |
 | KB 新鲜度 | `just kb-check` | Python | `docs/kb/chunks.json` 与当前语料一致 | 文档内容是否正确 |
@@ -21,6 +21,7 @@
 | wasm | `just vt-wasm`，再 `node test/wasm-alloc.mjs zig-out/bin/ghostty-vt.wasm` | Zig；冒烟需要 Node | wasm32-freestanding 的 ReleaseSmall 构建；导出的分配接口可用 | 浏览器集成与性能 |
 | 源码包 | `just dist-vt`；完整校验 `just zig build distcheck -Demit-lib-vt=true` | Zig、Git；distcheck 的内层命令另需 PATH 上的 `zig`（0.16.x）、`tar` 与 `cmake` | dist：用 `git archive` 打包 HEAD 生成源码 tarball；distcheck：解包后 `test-lib-vt` 通过，且 CMake 能从 tarball 构建 | 工作树里未提交的改动（不进 tarball）；二进制发布包 |
 | GTK 冒烟 | 手动触发 `gx-ci`，打开 `gtk_smoke` 输入 | fork 已启用 Actions，提交已 push | debian:13 容器里 GTK app 能以 ReleaseFast 构建，`ghostty +version` 能运行，在 Xvfb（1280x800，X11 后端、软件渲染）下启动 20 秒后仍在运行并完成截图；artifact `gx-gtk-smoke-evidence` 必须下载并实际读图 | 渲染内容是否正确（以读图结论为准）、Wayland、IME、真实桌面交互与其他发行版 |
+| WSL 本机 Linux | `just wsl test`（主套件，`-Dapp-runtime=none`）、`just wsl test --suite vt`、`just wsl build --gtk` 后 `just wsl smoke --out <目录>`（见 MAKE_COMMANDS.md「WSL」） | Windows 与 WSL2 Ubuntu 24.04，`just wsl setup` 装好钉版 Zig、blueprint-compiler 0.16.0 与 Zig 包 | 该 Ubuntu 24.04（GTK 4.14.5、libadwaita 1.5.0）上完整单测与 lib-vt 单测通过；GTK app 能构建，以与 `gtk-smoke` 相同的 Xvfb 参数启动并截图，`--lang` 切换界面语言，xdotool 脚本可以驱动键盘输入；截图须实际读图 | gx-ci 的 debian:13 容器与 ReleaseFast 构建、真实 Wayland 桌面与 IME；WSLg 交互（本机 WSLg 窗口内容截取不到，只能确认窗口出现） |
 | macOS lib-vt | 手动触发 `gx-ci`，打开 `macos` 输入 | 同上 | macos-15 上 `zig build test-lib-vt` 通过 | macOS app 构建（Xcode）、签名、公证与 app 交互 |
 | macOS app 构建 | 手动运行 `gx-release`，打开 `macos` 输入（`publish=false` 只构建不发布） | 同上 | macos-26 上 `zig build -Doptimize=ReleaseFast` 产出只做 ad-hoc 签名的 `Ghostty.app`，以 artifact 形式保留 | GUI 行为、正式签名与公证；没有自动化的 macOS GUI 冒烟 |
 | valgrind | `just zig build test-valgrind`、`just zig build run-valgrind` | Linux 与 valgrind，手动执行 | 单测或运行期没有 valgrind 能发现的内存错误（已知误报由 `valgrind.supp` 抑制） | 其他平台 |
@@ -117,6 +118,7 @@
 ## Windows 本机限制
 
 - 没有 GUI：GTK 与 macOS 相关验收在本机记 PENDING，不记 N/A，因为能力存在、只是本机缺环境。GTK 的补验是手动触发 `gx-ci` 的 `gtk-smoke` 并读回截图；macOS 只能用 `gx-ci` 的 `macos`（lib-vt 测试）或 `gx-release` 的 macOS 构建补证构建层面，GUI 行为仍是 PENDING。
+- WSL：装有 WSL2 时，`just wsl` 在 WSL 克隆里补跑完整单测、GTK 构建与 Xvfb 截图（分层表「WSL 本机 Linux」）。2026-10-09 在 32 逻辑核的 WSL Ubuntu 24.04 上实测：`just wsl setup` 从零（克隆、钉版 Zig、blueprint-compiler、39 个 Zig 包）85 s，已就绪时约 1 s；GTK Debug 冷构建 69 s；主套件 3939 条（3897 通过、42 跳过）冷编译时墙钟 267 s（构建 225 s），热缓存 43 s；`just wsl test --gtk` 带上 GTK apprt 共 3971 条（3929 通过、42 跳过），冷编译时墙钟 306 s（构建 231 s）；lib-vt 6712 条（6642 通过、70 跳过）热缓存 84 s；`smoke` 约 25 s（含默认 20 s 等待）。WSL 结果是本机 Linux 证据，不代证 `gx-ci` 的 `linux-main` 与 `gtk-smoke`，GUI 可见变更的 PASS 判据不变。
 - 非 vt 的 Zig 代码不能在 Windows 上编译：`src/build/SharedDeps.zig::add` 给每个经它装配的产物（libghostty-internal、`ghostty` exe、`ghostty-test`、`-Demit-bench` 的工具）无条件加上 translate-c 导入 `posix_c`（`errno.h`、`pwd.h`、`signal.h`、`sys/types.h`、`unistd.h`），MSVC 目标找不到 `pwd.h`。libghostty-vt 不经这条路径，不受影响。后果：
   - `just build`（含 `-Demit-bench` 等变体）退出 1：默认 `install` 要构建的 `ghostty-internal.dll` 与 `ghostty-internal-static.lib` 都停在 `translate-c posix_c.h`。Windows 上的库构建用 `just build-vt`。
   - `just test` 只要没加 `--no-build`，就在构建前以退出码 2 结束并说明原因（`scripts/zig_test.py::MAIN_SUITE_ON_WINDOWS`）。上游 `zig build test` 同样失败，上游 2026-08-28 起也不在 Windows 跑它（提交 `380778e3c` 移除了 `test-windows` job）。

@@ -137,3 +137,9 @@ fmt-check:
 # 直通钉版 zig（例：just zig version）
 zig *a:
     {{python}} scripts/zigw.py {{a}}
+
+# gx_wsl.py 从 Windows 经 wsl.exe 驱动 WSL 里的克隆（默认 Ubuntu-24.04 的 ~/src/gx_ghostty），只在 Windows 主机上可用；
+# 子命令 setup / sync / build / test / smoke / run / shell，参数与退出码见 docs/MAKE_COMMANDS.md「WSL」
+# WSL 里的 Linux GTK 构建、完整单测与 Xvfb 截图（例：just wsl build --gtk；just wsl smoke --out <Windows 目录>）
+wsl *a:
+    {{python}} scripts/gx_wsl.py {{a}}
