@@ -998,7 +998,8 @@ pub const Action = union(enum) {
             .{ .name = "GhosttyBindingAction" },
         ),
 
-        .none => void,
+        // fork(gx): GX-0003 the win32 apprt has no GObject types
+        .none, .win32 => void,
     };
 
     pub const CrashThread = enum {

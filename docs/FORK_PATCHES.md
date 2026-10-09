@@ -25,6 +25,18 @@
 |---|---|---|---|
 | GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |
 | GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |
+| GX-0003 | `src/apprt.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/apprt/action.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/apprt/runtime.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/apprt/structs.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/apprt/surface.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/build/SharedDeps.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/config/Config.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/datastruct/split_tree.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/font/face.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/input/Binding.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/main_ghostty.zig` | `fork(gx): GX-0003` | active |
+| GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |
 | GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |
 | GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |
 | GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |
@@ -163,6 +175,57 @@ python -m unittest scripts.test_fork_patches -v
 
 - 纯新增：删掉三个 GX-0002 块后，`build.zig` 与 `HEAD` 和 `main` 的 merge-base 上的上游版本（LF 归一化）完全相同；没有 `main` 时跳过。
 - 形状（`GX0002_HUNKS`）：恰好三个块；`test-bin`、`test-lib-vt-bin` 两个步骤，`mod_vt_test` → `test/vt`、`mod_vt_c_test` → `test/vt_c`、`test_exe` → `test` 三个安装目录，步骤对安装的依赖、`addPatchElf` 与 `-Demit-lib-vt` 时的 `addFail`，都各自只出现在一个块里；三个块分别位于 `test_lib_vt_build_step` 声明之后、`mod_vt_c_test` 之后、`test_exe` 之后，且都在各自的上游区块之内。
+
+## GX-0003 Windows 原生应用（win32 apprt）的构建与接线
+
+- 文件：`src/apprt/runtime.zig`（`Runtime` 新增 `win32`，Windows 目标默认取它）、`src/apprt.zig`（导入并选中 `apprt/win32.zig`）、`src/build/SharedDeps.zig`（Windows 目标不再 translate-c `posix_c`；`.win32` 分支链接 Win32 系统库）、`src/main_ghostty.zig`（`logFn` 末尾把日志另写到文件）、`src/config/Config.zig`（`finalize` 的 apprt 分支、两处 GObject 分支、`quit-after-last-window-closed` 的 Windows 默认值），以及按 `app_runtime` 穷举的 GObject 分支：`src/apprt/action.zig`、`src/apprt/structs.zig`（两处）、`src/apprt/surface.zig`、`src/datastruct/split_tree.zig`、`src/font/face.zig`、`src/input/Binding.zig`、`src/terminal/mouse.zig`。
+- 标记：`fork(gx): GX-0003`。纯新增块用 begin/end 包住（`runtime.zig` 两块、`apprt.zig` 两块、`SharedDeps.zig` 的链接块、`main_ghostty.zig` 的日志块）；改动的单行（各处 `.none => void` 改为 `.none, .win32 => void`、`posix_c` 守卫、`quit-after-last-window-closed` 默认值）上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：12 个文件，`git diff --numstat` 合计 +60/−15（含注释）。
+
+### 原因
+
+本 fork 要在 Windows 上产出可运行的原生应用。apprt 本体是新路径 `src/apprt/win32.zig` 与 `src/apprt/win32/**`（移植自 MIT 许可的 shiweis/ghostty-windows@119b9270c，各文件头注明出处），不是源码补丁；但上游代码在三处把 apprt 集合写死，必须改上游文件才能接入：
+
+- `src/apprt/runtime.zig::Runtime` 是 apprt 的闭集，`src/apprt.zig::runtime` 按它编译期选实现；多个类型的 `getGObjectType` 与 `Config.finalize` 对 `app_runtime` 穷举，新增成员不补分支就编译失败。
+- `src/build/SharedDeps.zig::add` 对所有目标 translate-c `posix_c`（含 `pwd.h`），Windows 目标找不到该头文件，任何非 vt 产物都编不过；win32 apprt 还要链接 user32、gdi32 等系统库。
+- GUI 子系统的 exe 没有控制台，`logFn` 写 stderr 的日志全部丢失；`quit-after-last-window-closed` 上游只在 Linux 默认开启，Windows 上关掉最后一个窗口后进程会无窗口地留在后台。
+
+### 行为
+
+- Windows 目标未给 `-Dapp-runtime` 时默认 `win32`，`zig build -Dtarget=x86_64-windows-gnu` 产出 `zig-out/bin/ghostty.exe`。Linux/FreeBSD 仍默认 `gtk`，其余目标仍默认 `none`。
+- Windows 目标不再导入 `posix_c` 模块；与上游 PR #14608 的同一行守卫一致。非 Windows 目标不变。
+- `.win32` 且目标是 Windows 时链接 opengl32、gdi32、user32、dwmapi、imm32、shell32、ole32、uxtheme、comctl32、comdlg32、advapi32。
+- win32 构建里每条日志额外追加到 `%LOCALAPPDATA%\ghostty\logs\ghostty.log`（实现在 `src/apprt/win32/file_log.zig`，每次运行的首条日志时创建，上一次的日志改名为 `ghostty.log.1`）；Debug 构建写全部级别，其余构建与 stderr 一样不写 debug。其他 apprt 不受影响。
+- `quit-after-last-window-closed` 在 Windows 上默认 `true`，与 Linux 一致；文档注释同步写明。其他平台默认值不变。
+- 所有 GObject 分支在 win32 下与 `none` 一样取 `void`，`Config.finalize` 不加 win32 专属默认值。
+
+### 上游状态
+
+未回馈上游。上游没有 Windows apprt；`posix_c` 守卫与上游 PR #14608（未合入本次同步的上游 main）逐字相同，PR 合入后该行在同步时会以上游版本为准。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+先取上游版本，再按原语义放回：`Runtime` 的 `win32` 成员与 Windows 默认值；`apprt.zig` 的导入与 `.win32 => win32` 分支；各 `getGObjectType` 与 `Config.finalize` 的 `.none, .win32` 分支（上游新增按 `app_runtime` 穷举的 switch 时，同样补 `.win32`，编译 win32 目标会指出遗漏处）；`SharedDeps.add` 的 `.win32` 链接块；`logFn` 末尾的文件日志块；`quit-after-last-window-closed` 的默认值与文档注释。上游合入 PR #14608 后，`posix_c` 那一行若与本补丁相同，删除该处标记即可。
+
+### 移除条件
+
+上游提供原生 Windows apprt（或接受本 apprt）且其构建默认值、链接库、日志去向满足本 fork 时整体移除；`posix_c` 一处在上游合入相同守卫后单独移除。移除时删除改动与标记，把对应登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu   # 产出 zig-out/bin/ghostty.exe
+python scripts/zigw.py build -Dtarget=x86_64-linux-gnu -Dapp-runtime=none       # Linux 核心交叉编译不回归
+python scripts/zigw.py build -Demit-lib-vt                                     # libghostty-vt 不回归
+python -m unittest scripts.test_fork_patches -v
+```
+
+运行 `zig-out/bin/ghostty.exe`，窗口出现后检查 `%LOCALAPPDATA%\ghostty\logs\ghostty.log` 有 `runtime=.win32` 与 `loaded OpenGL` 行；关闭最后一个窗口后进程退出。GTK 构建需在装有 GTK 的 Linux 上验证。
+
+### 测试锁定
+
+只有登记表与闭集检查（见 GX-0001 的「测试锁定」）；没有形状断言。`src/termio/Exec.zig` 等 win32 运行时行为由 GX-0005 与 GUI 冒烟验证。
 
 ## GX-0004 OpenGL 渲染器在 Windows 上用 WGL
 

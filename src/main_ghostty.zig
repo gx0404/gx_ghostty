@@ -165,6 +165,14 @@ fn logFn(
         nosuspend stderr.file_writer.interface.print(level_txt ++ prefix ++ format ++ "\n", args) catch break :stderr;
         nosuspend stderr.file_writer.interface.flush() catch break :stderr;
     }
+
+    // fork(gx): GX-0003 begin: the win32 GUI app has no console, so also log to a file
+    if (comptime build_config.app_runtime == .win32 and
+        (builtin.mode == .Debug or level != .debug))
+    {
+        apprt.win32.file_log.write(level, scope, format, args);
+    }
+    // fork(gx): GX-0003 end
 }
 
 /// Returns the macOS unified logging logger for the given scope. The

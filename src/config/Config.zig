@@ -2628,13 +2628,14 @@ keybind: Keybinds = .{},
 /// Whether or not to quit after the last surface is closed.
 ///
 /// This defaults to `false` on macOS since that is standard behavior for
-/// a macOS application. On Linux, this defaults to `true` since that is
-/// generally expected behavior.
+/// a macOS application. On Linux and Windows, this defaults to `true` since
+/// that is generally expected behavior.
 ///
 /// On Linux, if this is `true`, Ghostty can delay quitting fully until a
 /// configurable amount of time has passed after the last window is closed.
 /// See the documentation of `quit-after-last-window-closed-delay`.
-@"quit-after-last-window-closed": bool = builtin.os.tag == .linux,
+// fork(gx): GX-0003 Windows apps also quit with their last window
+@"quit-after-last-window-closed": bool = builtin.os.tag == .linux or builtin.os.tag == .windows,
 
 /// Controls how long Ghostty will stay running after the last open surface has
 /// been closed. This only has an effect if `quit-after-last-window-closed` is
@@ -4886,7 +4887,8 @@ pub fn finalize(self: *Config) !void {
 
     // Apprt-specific defaults
     switch (build_config.app_runtime) {
-        .none => {},
+        // fork(gx): GX-0003 the win32 apprt has no runtime-specific defaults
+        .none, .win32 => {},
         .gtk => {
             switch (self.@"gtk-single-instance") {
                 .true, .false => {},
@@ -9348,7 +9350,8 @@ pub const GtkTitlebarStyle = enum(c_int) {
             .{ .name = "GhosttyGtkTitlebarStyle" },
         ),
 
-        .none => void,
+        // fork(gx): GX-0003 the win32 apprt has no GObject types
+        .none, .win32 => void,
     };
 };
 
@@ -10070,7 +10073,8 @@ pub const WindowDecoration = enum(c_int) {
             .{ .name = "GhosttyConfigWindowDecoration" },
         ),
 
-        .none => void,
+        // fork(gx): GX-0003 the win32 apprt has no GObject types
+        .none, .win32 => void,
     };
 
     pub fn parseCLI(input_: ?[]const u8) !WindowDecoration {

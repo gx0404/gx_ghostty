@@ -64,7 +64,8 @@ pub const DesiredSize = struct {
             .{ .name = "GhosttyFontDesiredSize" },
         ),
 
-        .none => void,
+        // fork(gx): GX-0003 the win32 apprt has no GObject types
+        .none, .win32 => void,
     };
 };
 

@@ -736,7 +736,8 @@ pub const InitialSize = extern struct {
             .{ .name = "GhosttyApprtInitialSize" },
         ),
 
-        .none => void,
+        // fork(gx): GX-0003 the win32 apprt has no GObject types
+        .none, .win32 => void,
     };
 };
 

@@ -16,6 +16,9 @@ pub const action = @import("apprt/action.zig");
 pub const ipc = @import("apprt/ipc.zig");
 pub const gtk = @import("apprt/gtk.zig");
 pub const none = @import("apprt/none.zig");
+// fork(gx): GX-0003 begin: native Windows application runtime
+pub const win32 = @import("apprt/win32.zig");
+// fork(gx): GX-0003 end
 pub const browser = @import("apprt/browser.zig");
 pub const embedded = @import("apprt/embedded.zig");
 pub const surface = @import("apprt/surface.zig");
@@ -44,6 +47,9 @@ pub const runtime = switch (build_config.artifact) {
     .exe => switch (build_config.app_runtime) {
         .none => none,
         .gtk => gtk,
+        // fork(gx): GX-0003 begin: native Windows application runtime
+        .win32 => win32,
+        // fork(gx): GX-0003 end
     },
     .lib => embedded,
     .wasm_module => browser,
