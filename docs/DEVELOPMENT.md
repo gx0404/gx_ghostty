@@ -250,7 +250,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 | GX-0012 | `src/Surface.zig`、`src/termio/Exec.zig` | `needsConfirmQuit` 的 `.true` 分支、`Subprocess.getProcessInfo` 的 Windows 分支 |
 | GX-0014 | `src/input/Binding.zig`、`src/input/command.zig`、`src/Surface.zig` | `Binding.Action` 新增穷举 switch 时补 `.gx`；`src/apprt/gtk/class/command_palette.zig` 的过滤块已移除（登记为 `removed`），该文件取上游 |
 | GX-0021 | `src/renderer/generic.zig` | 预编辑追赶循环的 `< len` 上界；上游自己修好后按移除条件删除 |
-| GX-0022 | `src/terminal/Terminal.zig`、`src/termio/Exec.zig` | `flags.semantic_prompt_fresh_line` 紧跟 `resize_pull_scrollback` 且 `fullReset` 保留它；`semanticPromptFreshLine` 开头的早退；`Exec.initTerminal` 在 Windows 上关闭它 |
+| GX-0022 | `src/terminal/Terminal.zig`、`src/termio/Exec.zig` | `flags.semantic_prompt_fresh_line` 紧跟 `resize_pull_scrollback` 且 `fullReset` 保留它；`semanticPromptFreshLine` 开头的早退；`Exec.initTerminal` 在 Windows 上关闭它与 `resize_pull_scrollback`；上游改 `PageList.resize` 的拉回语义时跑 `scrollback pull` 用例 |
 
 合并后，`gx-ci` 的 `windows-app` 只构建 app、不跑单测，`linux-main` 只编译 `-Dapp-runtime=none`、不含 GTK apprt，所以 Windows 上的单测与 GTK apprt 的编译和单测要在本机补齐：Windows 上 `just build` 与 `just test`，WSL 里 `just wsl build --gtk` 与 `just wsl test --gtk`。
 

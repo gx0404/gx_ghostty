@@ -59,7 +59,7 @@ Pin 与代际：
 - 行为对齐主流终端：协议数字用 `src/lib/parse_int.zig::parseInt`（理由见 `support-libs.md`）；kitty 剪贴板以 kitty 参考实现为准（`src/terminal/kitty/clipboard.zig` 文件头）。
 - `src/terminal/osc.zig::Command` 有编译期尺寸断言（64 位目标为 64 字节）；`src/terminal/modes.zig` 的 `entries` 新增 mode 时同步 `include/ghostty/vt/modes.h` 的 `GHOSTTY_MODE_*`。
 - fork 的 `win32_input_mode`（DECSET 9001，补丁 GX-0006）固定是 `entries` 的最后一项：DECRQM、XTSAVE/XTRESTORE 与 RIS 照常处理，DECSTR 不复位它。快照的 `ModePacked` 因此是 44 位，第 43 位是 9001（v1 原本恒为 0 的保留位，不升快照版本，现有金样不变）；上游在末尾新增 mode 时放在 fork 块之前，并同步 `src/terminal/snapshot/terminal.zig` 的位序登记、`snapshot.ksy` 与 `TERMINAL mode bit layout` 单测。
-- `Terminal.flags` 里随 pty 而定的配置（上游的 `resize_pull_scrollback`、fork 的 `semantic_prompt_fresh_line`，补丁 GX-0022）在 `fullReset` 后保留；后者为 false 时 OSC 133 A、N、L 不移动光标，由 termio 在 Windows 上设置。
+- `Terminal.flags` 里随 pty 而定的配置（上游的 `resize_pull_scrollback`、fork 的 `semantic_prompt_fresh_line`，补丁 GX-0022）在 `fullReset` 后保留；前者为 false 时缩放不把回滚区的行拉回活动区，后者为 false 时 OSC 133 A、N、L 不移动光标。termio 在 Windows 上把两者都设为 false，与 ConPTY 的屏幕缓冲同步。
 - 本域已进入 C ABI 的 `lib.Enum` 枚举（如 `Terminal.CompressionMode`、`RenderState.Dirty`、`ScreenSet.Key`）受 `support-libs.md` 的枚举序号规则约束，只能追加，删除留 `null` 空洞。
 
 构建与 freestanding：
