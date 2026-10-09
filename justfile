@@ -49,11 +49,11 @@ version-check:
 framework-test:
     {{python}} scripts/run_unittests.py
 
-# 框架门：rules-check、version-check、framework-test、kb-check（改公开签名或文档后先 just kb）
-framework-check: rules-check version-check framework-test kb-check
+# 框架门：rules-check、version-check、framework-test、kb-check、i18n-check（改公开签名或文档后先 just kb）
+framework-check: rules-check version-check framework-test kb-check i18n-check
 
-# 生成物新鲜度门：kb-check、graph-check（上游同步后与发版前）
-generated-check: kb-check graph-check
+# 生成物新鲜度门：kb-check、i18n-check、graph-check（上游同步后与发版前）
+generated-check: kb-check i18n-check graph-check
 
 # 本地 CI 门：framework-check、fmt-check、test-vt
 ci-check: framework-check fmt-check test-vt
@@ -81,6 +81,14 @@ kb-check:
 # 检索知识库（查询含 & | < > ^ % 等字符时直接调用 scripts/agent_kb.py，见文件头）
 kb-query *q:
     {{python}} scripts/agent_kb.py {{q}}
+
+# 重新生成 GX 界面 zh-CN 翻译表 src/gx/i18n/zh_CN.zig（源：po/zh_CN.po 与 src/gx/i18n/gx.zh_CN.po）
+i18n:
+    {{python}} scripts/gx_i18n.py
+
+# 只读校验 GX 翻译表与两份 .po 一致
+i18n-check:
+    {{python}} scripts/gx_i18n.py --check
 
 # 启用仓库内 git 钩子（commit-msg 校验提交标题）
 install-hooks:

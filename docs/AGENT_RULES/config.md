@@ -17,7 +17,7 @@
 
 ### 加载链
 
-- `Config.load` = `default` → `loadDefaultFiles` → `loadCliArgs` → `loadRecursiveFiles` → `finalize`。
+- `Config.load` = `default` → `loadDefaultFiles` → `loadCliArgs` → `loadRecursiveFiles` → `finalize`。fork 补丁 GX-0010 让它默认转交 `src/gx/config_layers.zig::load`：按同样顺序读文件后，把重放步骤排成「GX 默认值 < 用户文件与全部 include < `gui-settings.ghostty` < 命令行 < `-e`」并经 `Config.gxReplay` 重建；`GHOSTTY_GX_DEFAULTS=0` 回到上游路径。`src/gx/**` 是 fork 的共享核心，单测经 GX-0010 的 `test` 块进入 `ghostty-test`。
 - `loadDefaultFiles`：XDG 下先读旧名 `ghostty/config`，再读 `ghostty/config.ghostty`，两者都在就都加载；macOS 另读 Application Support（路径函数在 `src/config/file_load.zig`）。一个也没有时按 `config-template` 写出模板。
 - `loadCliArgs`：Linux/FreeBSD 识别以 `xdg-terminal-exec` 身份启动；CLI 上的 `font-family*` 覆盖而非追加；`--config-default-files=false` 时借 replay 丢掉默认文件的内容。`Path`/`RepeatablePath` 的相对路径，来自 CLI 时按当前目录展开，来自文件时按该文件所在目录展开。
 - `loadRecursiveFiles`：按出现顺序加载 `config-file`，`?` 前缀表示可选，同一路径再次出现记 cycle 诊断；`-e` 及其后的参数始终留在 replay 末尾。

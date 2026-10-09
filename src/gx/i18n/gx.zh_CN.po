@@ -1,0 +1,352 @@
+# Ghostty GX user interface translations (zh_CN).
+#
+# Entries here override po/zh_CN.po in the generated table
+# src/gx/i18n/zh_CN.zig. Regenerate after every change with
+# `python scripts/gx_i18n.py`; `python scripts/gx_i18n.py --check` fails
+# when the table is stale. Placeholders such as {name} must appear in
+# msgstr exactly as in msgid. Strings already translated upstream are
+# repeated here (with the upstream wording) so the Ghostty GX UIs keep
+# working when upstream edits or drops them.
+msgid ""
+msgstr ""
+"Project-Id-Version: ghostty-gx\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#. Settings: window title and sections
+msgid "Settings"
+msgstr "设置"
+
+msgid "Language"
+msgstr "语言"
+
+msgid "Appearance"
+msgstr "外观"
+
+msgid "Font"
+msgstr "字体"
+
+msgid "Interaction"
+msgstr "交互"
+
+msgid "Shell"
+msgstr "Shell"
+
+msgid "About"
+msgstr "关于"
+
+#. Settings: appearance
+msgid "Theme"
+msgstr "主题"
+
+msgid "Search themes…"
+msgstr "搜索主题…"
+
+msgid "Window Material"
+msgstr "窗口材质"
+
+msgid "Solid"
+msgstr "纯色"
+
+msgid "Mica"
+msgstr "云母"
+
+msgid "Acrylic"
+msgstr "亚克力"
+
+#. Windows 11 "Mica Alt" backdrop (DWMSBT_TABBEDWINDOW)
+msgid "Tabbed"
+msgstr "云母 Alt"
+
+msgid "Window material requires Windows 11."
+msgstr "窗口材质需要 Windows 11。"
+
+msgid "Show Scrollbar"
+msgstr "显示滚动条"
+
+msgid "Scrollbar"
+msgstr "滚动条"
+
+#. Settings: font
+msgid "Font Family"
+msgstr "字体族"
+
+msgid "Font Size"
+msgstr "字号"
+
+#. Settings: interaction
+msgid "Right-Click Menu"
+msgstr "右键菜单"
+
+msgid "Bell"
+msgstr "响铃"
+
+msgid "Close Confirmation"
+msgstr "关闭确认"
+
+msgid "Confirm Before Closing"
+msgstr "关闭前确认"
+
+msgid "herdr App Mode"
+msgstr "herdr 应用模式"
+
+msgid "Show herdr like a standalone app when it is the only tab"
+msgstr "仅有一个标签页且运行 herdr 时，像独立应用一样显示"
+
+#. Settings: shell
+msgid "Default Shell"
+msgstr "默认 Shell"
+
+msgid "Open Configuration File"
+msgstr "打开配置文件"
+
+msgid "Reset to Default"
+msgstr "恢复默认"
+
+msgid "Changes are saved automatically."
+msgstr "更改会自动保存。"
+
+#. Settings: about
+msgid "Ghostty GX"
+msgstr "Ghostty GX"
+
+msgid "Version {version}"
+msgstr "版本 {version}"
+
+#. Language names are shown in their own language in the language picker
+msgid "Chinese"
+msgstr "中文"
+
+msgid "English"
+msgstr "English"
+
+#. Menus
+msgid "New Tab"
+msgstr "新建标签页"
+
+msgid "New Window"
+msgstr "新建窗口"
+
+msgid "Split Right"
+msgstr "向右分屏"
+
+msgid "Split Down"
+msgstr "向下分屏"
+
+msgid "Split Left"
+msgstr "向左分屏"
+
+msgid "Split Up"
+msgstr "向上分屏"
+
+msgid "Close Tab"
+msgstr "关闭标签页"
+
+msgid "Close Other Tabs"
+msgstr "关闭其他标签页"
+
+msgid "Rename Tab"
+msgstr "重命名标签页"
+
+msgid "Rename Tab…"
+msgstr "重命名标签页…"
+
+msgid "Settings…"
+msgstr "设置…"
+
+msgid "Keyboard Shortcuts"
+msgstr "键盘快捷键"
+
+msgid "Command Palette"
+msgstr "命令面板"
+
+msgid "Reload Configuration"
+msgstr "重新加载配置"
+
+msgid "About Ghostty GX"
+msgstr "关于 Ghostty GX"
+
+msgid "Quit"
+msgstr "退出"
+
+msgid "Copy"
+msgstr "复制"
+
+msgid "Paste"
+msgstr "粘贴"
+
+msgid "Select All"
+msgstr "全选"
+
+msgid "Clear Screen"
+msgstr "清除屏幕"
+
+msgid "Toggle Fullscreen"
+msgstr "切换全屏"
+
+#. Title bar and tab bar tooltips
+msgid "New tab"
+msgstr "新建标签页"
+
+msgid "Close tab"
+msgstr "关闭标签页"
+
+msgid "Main menu"
+msgstr "主菜单"
+
+msgid "Minimize"
+msgstr "最小化"
+
+msgid "Maximize"
+msgstr "最大化"
+
+msgid "Restore"
+msgstr "还原"
+
+msgid "Close"
+msgstr "关闭"
+
+#. Launch profiles
+msgid "GX Zsh"
+msgstr "GX Zsh"
+
+msgid "herdr"
+msgstr "herdr"
+
+msgid "PowerShell 7"
+msgstr "PowerShell 7"
+
+msgid "Windows PowerShell"
+msgstr "Windows PowerShell"
+
+msgid "Command Prompt"
+msgstr "命令提示符"
+
+msgid "Git Bash"
+msgstr "Git Bash"
+
+msgid "MSYS2 UCRT64"
+msgstr "MSYS2 UCRT64"
+
+msgid "Nushell"
+msgstr "Nushell"
+
+msgid "WSL: {name}"
+msgstr "WSL: {name}"
+
+msgid "Login Shell"
+msgstr "登录 Shell"
+
+msgid "Zsh"
+msgstr "Zsh"
+
+msgid "Bash"
+msgstr "Bash"
+
+msgid "Fish"
+msgstr "Fish"
+
+#. Confirmation dialogs
+msgid "Close Tab?"
+msgstr "关闭标签页吗？"
+
+msgid "Close Window?"
+msgstr "关闭窗口吗？"
+
+msgid "Quit Ghostty GX?"
+msgstr "退出 Ghostty GX 吗？"
+
+msgid "A process is still running in this tab. Close it anyway?"
+msgstr "此标签页中仍有进程在运行，仍要关闭吗？"
+
+msgid "Processes are still running in this window. Close it anyway?"
+msgstr "此窗口中仍有进程在运行，仍要关闭吗？"
+
+msgid "Processes are still running. Quit anyway?"
+msgstr "仍有进程在运行，仍要退出吗？"
+
+msgid "{name} is still running."
+msgstr "{name} 仍在运行。"
+
+msgid "Don't ask again"
+msgstr "不再询问"
+
+msgid "Yes"
+msgstr "是"
+
+msgid "No"
+msgstr "否"
+
+msgid "Cancel"
+msgstr "取消"
+
+#. Windows dialogs use 确定 for OK; upstream GTK strings use 确认
+msgid "OK"
+msgstr "确定"
+
+#. Clipboard confirmations
+msgid "Authorize Clipboard Access"
+msgstr "剪贴板访问授权"
+
+msgid "A program is trying to read the clipboard."
+msgstr "某个程序正在尝试读取剪贴板。"
+
+msgid "A program is trying to write to the clipboard."
+msgstr "某个程序正在尝试写入剪贴板。"
+
+msgid "Allow"
+msgstr "允许"
+
+msgid "Deny"
+msgstr "拒绝"
+
+msgid "Warning: Potentially Unsafe Paste"
+msgstr "警告：粘贴内容可能不安全"
+
+msgid "The text you are pasting contains line breaks and may run commands."
+msgstr "要粘贴的文本包含换行符，可能会执行命令。"
+
+msgid "Paste Anyway"
+msgstr "仍然粘贴"
+
+msgid "Copied to clipboard"
+msgstr "已复制至剪贴板"
+
+#. Search bar
+msgid "Find…"
+msgstr "查找…"
+
+msgid "No results"
+msgstr "无结果"
+
+#. Search match position, e.g. 3/10
+msgid "{current}/{total}"
+msgstr "{current}/{total}"
+
+msgid "Previous Match"
+msgstr "上一个匹配项"
+
+msgid "Next Match"
+msgstr "下一个匹配项"
+
+msgid "Match case"
+msgstr "区分大小写"
+
+msgid "Close search"
+msgstr "关闭搜索"
+
+#. Notifications
+msgid "Command finished"
+msgstr "命令已完成"
+
+msgid "Command failed"
+msgstr "命令执行失败"
+
+msgid "Exit code: {code}"
+msgstr "退出码：{code}"
+
+msgid "Command finished in {duration}"
+msgstr "命令已完成，用时 {duration}"

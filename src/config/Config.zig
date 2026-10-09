@@ -106,23 +106,31 @@ pub const compatibility = std.StaticStringMap(
     .{ "copy-on-select", compatCopyOnSelect },
 });
 
-/// Set Ghostty's graphical user interface language to a language other than the
-/// system default language. For example:
+// fork(gx): GX-0010 language doc describes the Ghostty GX values and runtime switching
+/// The language of Ghostty GX's graphical user interface: menus, dialogs,
+/// the settings window and other GUI text. Valid values:
 ///
-///     language = de
+///   * `zh-CN` - Simplified Chinese. `zh`, `zh_CN` and `zh-Hans` are
+///     accepted as well, in any letter case.
+///   * `en` - English, also written as `en-US`, `en_GB` and so on.
 ///
-/// will force the strings in Ghostty's graphical user interface to be in German
-/// rather than the system default.
+/// For example:
+///
+///     language = en
+///
+/// The default is `zh-CN` (set by the Ghostty GX defaults). Unsupported
+/// values also use `zh-CN`.
 ///
 /// This will not affect the language used by programs run _within_ Ghostty.
 /// Those will continue to use the default system language. There are also many
 /// non-GUI elements in Ghostty that are not translated - this setting will have
 /// no effect on those.
 ///
-/// Warning: This setting cannot be reloaded at runtime. To change the language
-/// you must fully restart Ghostty.
+/// On Windows and GTK the language can be switched at runtime, from the
+/// settings window or by changing this value and reloading the
+/// configuration; no restart is needed.
 ///
-/// GTK only.
+/// Windows and GTK only.
 /// Available since 1.3.0.
 language: ?[:0]const u8 = null,
 
@@ -4009,6 +4017,84 @@ term: []const u8 = "xterm-ghostty",
 /// This only works on macOS since only macOS has an auto-update feature.
 @"auto-update-channel": ?build_config.ReleaseChannel = null,
 
+// fork(gx): GX-0010 begin: Ghostty GX configuration keys
+/// A launch profile for the Ghostty GX new tab menu, written as
+/// `name=command`. Repeat this to add more profiles; they are listed after
+/// the shells Ghostty GX detects, in the order they are defined. For
+/// example:
+///
+///     gx-launch-profile = Python=python -i
+///     gx-launch-profile = Logs=direct:tail -f /var/log/syslog
+///
+/// The command uses the same syntax as `command`, including the `direct:`
+/// and `shell:` prefixes. Defining a name again replaces its command, a
+/// name with an empty command (`Python=`) removes that profile, and an
+/// empty value removes all profiles defined before it.
+///
+/// Detected shells are GX Zsh, herdr, PowerShell 7, Windows PowerShell,
+/// Command Prompt, Git Bash, MSYS2 UCRT64, Nushell and one profile per WSL
+/// distribution on Windows, and GX Zsh, herdr, the login shell (`$SHELL`),
+/// zsh, bash and fish on Linux.
+///
+/// Available since Ghostty GX 0.0.1.
+@"gx-launch-profile": RepeatableStringMap = .{},
+
+/// Whether a window whose only tab runs herdr switches to herdr app mode,
+/// presenting herdr like a standalone application instead of a shell tab.
+/// The window leaves herdr app mode when it gets a second tab or herdr
+/// exits.
+///
+/// The default is `true`.
+///
+/// Available since Ghostty GX 0.0.1.
+@"gx-herdr-app-mode": bool = true,
+
+/// The backdrop material of Ghostty GX windows. Valid values:
+///
+///   * `solid` - An opaque background in the background color.
+///   * `mica` - The Windows 11 Mica material, tinted by the desktop
+///     wallpaper.
+///   * `acrylic` - The translucent, blurred Acrylic material.
+///   * `tabbed` - The Mica Alt material that Windows uses for tabbed
+///     windows, with a stronger wallpaper tint than `mica`.
+///
+/// Materials other than `solid` need Windows 11; older versions of
+/// Windows use `solid`.
+///
+/// The default is `solid`.
+///
+/// Windows only.
+/// Available since Ghostty GX 0.0.1.
+@"gx-window-material": gx_config_types.WindowMaterial = .solid,
+
+/// Process names that do not count as running programs when Ghostty GX
+/// checks the processes in a terminal to decide whether closing it needs
+/// confirmation (see `confirm-close-surface`). Repeat this to list more
+/// names. Matching ignores letter case and a trailing `.exe`, and a
+/// trailing `*` matches any rest of the name, as in `gitstatusd*`.
+///
+/// If no names are set, a built-in list of shells and console helpers is
+/// used: `cmd.exe`, `pwsh.exe`, `powershell.exe`, `zsh`, `bash`, `sh`,
+/// `fish`, `nu`, `gx-zsh`, `wsl.exe`, `wslhost.exe`, `conhost.exe`,
+/// `OpenConsole.exe`, `gitstatusd*` and `env.exe`. Setting any name
+/// replaces the whole built-in list, and an empty value restores it.
+///
+/// Available since Ghostty GX 0.0.1.
+@"gx-idle-processes": RepeatableString = .{},
+
+/// What opening the configuration (for example from the main menu or the
+/// `open_config` keybind action) shows. Valid values:
+///
+///   * `settings` - The Ghostty GX settings window.
+///   * `editor` - The configuration file in a text editor, like upstream
+///     Ghostty.
+///
+/// The default is `settings`.
+///
+/// Available since Ghostty GX 0.0.1.
+@"gx-open-config-ui": gx_config_types.OpenConfigUi = .settings,
+// fork(gx): GX-0010 end
+
 /// This is set by the CLI parser for deinit.
 _arena: ?ArenaAllocator = null,
 
@@ -4037,6 +4123,23 @@ pub fn deinit(self: *Config) void {
     self.* = undefined;
 }
 
+// fork(gx): GX-0010 begin: Ghostty GX configuration layering (src/gx/config_layers.zig)
+const gx_config_layers = @import("../gx/config_layers.zig");
+const gx_config_types = @import("../gx/config_types.zig");
+
+/// Parses recorded configuration steps (`_replay_steps`) into this
+/// configuration, as theme loading does. Ghostty GX uses it to rebuild a
+/// configuration in its layer order.
+pub fn gxReplay(self: *Config, alloc_gpa: Allocator, steps: []const Replay.Step) !void {
+    var it = Replay.iterator(steps, self);
+    try self.loadIter(alloc_gpa, &it);
+}
+
+test {
+    _ = @import("../gx/main.zig");
+}
+// fork(gx): GX-0010 end
+
 /// Load the configuration according to the default rules:
 ///
 ///   1. Defaults
@@ -4046,6 +4149,9 @@ pub fn deinit(self: *Config) void {
 ///   5. Recursively defined configuration files
 ///
 pub fn load(alloc_gpa: Allocator) !Config {
+    // fork(gx): GX-0010 begin: load with the Ghostty GX layers unless GHOSTTY_GX_DEFAULTS=0
+    if (gx_config_layers.enabled(alloc_gpa)) return try gx_config_layers.load(alloc_gpa);
+    // fork(gx): GX-0010 end
     var result = try default(alloc_gpa);
     errdefer result.deinit();
 
@@ -5470,6 +5576,11 @@ const Replay = struct {
                             log.warn("error appending diagnostic err={}", .{err});
                             break :diag;
                         };
+                        // fork(gx): GX-0010 begin: record the diagnostic again so later replays keep reporting it
+                        self.config._replay_steps.append(arena_alloc, .{ .diagnostic = cloned }) catch |err| {
+                            log.warn("error recording diagnostic err={}", .{err});
+                        };
+                        // fork(gx): GX-0010 end
                     },
 
                     .conditional_arg => |v| conditional: {

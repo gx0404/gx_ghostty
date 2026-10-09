@@ -154,6 +154,7 @@ doc = "docs/AGENT_RULES/config.md"
 paths = [
   "src/config.zig",
   "src/config/**",
+  "src/gx/**",
   "src/helpgen.zig",
 ]
 tasks = []
