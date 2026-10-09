@@ -11,7 +11,7 @@ fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器
 - **GTK 的 GX 层** `src/apprt/gtk/gx/`：运行时切换界面语言、GX 菜单与启动配置、设置对话框、快捷键速查、herdr 应用模式与 GX 样式（第 8 节）。
 - **打包、发布与开发框架**：Windows 便携 zip 与 Inno Setup 安装包、GX Shell 组件 stage、`gx-release` 发布链（第 13 节），以及 `docs/`、`scripts/`、`justfile` 组成的 AI 协作框架。
 
-改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021，共 39 个上游文件；GX-0013 与 GX-0017～GX-0020 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
+改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021、GX-0022，共 40 个上游文件；GX-0013 与 GX-0017～GX-0020 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
 
 | 产物 | 说明 | 根文件 / 构建逻辑 |
 |---|---|---|

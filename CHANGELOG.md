@@ -62,4 +62,5 @@ Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应�
 - 配置诊断（GX-0010）：设置了 `theme` 时，明暗切换与 `ghostty +validate-config` 再次重放配置不再丢掉 `config-file` 打不开、循环引用等诊断，`+validate-config` 不再漏报缺失的 include；`GHOSTTY_GX_DEFAULTS=0` 时同样生效。
 - Windows 字体发现改用 DirectWrite（GX-0009）：粗体、斜体、粗斜体使用字体族里真实的字面（此前粗体常显示为常规体）；`微软雅黑` 等本地化族名、注册表登记在其他目录的字体与 `AddFontResourceEx` 加载的字体都能找到；按码位回退改用系统字体回退并按区域设置选字（`中` 在 zh-CN 下用 Microsoft YaHei UI），首个 CJK 字符不再逐个打开字体文件；`ghostty +list-fonts` 列出各字面的样式名。
 - 输入法预编辑（GX-0021，各平台共用的渲染器）：在 herdr 这类铺满背景色的 TUI 里开始组字时，渲染线程不再因字形游标越界而崩溃。
+- Windows 上的语义提示符（GX-0022）：shell 在提示符前发 OSC 133（如 GX Zsh 的 powerlevel10k）时，使用系统自带 ConPTY（开发构建、`GHOSTTY_GX_CONPTY=system` 或随包 ConPTY 不可用时）不再每执行一条命令就把上一条折叠后的命令行滚出屏幕、在顶部留下空行；Windows 上 OSC 133 不再做 fresh-line，与 ConPTY 和 Windows Terminal 一致。
 - Windows 上的上游 termio 缺陷（GX-0005）：终端输出能及时重绘，子进程退出时进程不再崩溃，带引号且含空格的 `command` 路径可以启动，`https://…` 这类链接不再被当作路径解析而触发断言。
