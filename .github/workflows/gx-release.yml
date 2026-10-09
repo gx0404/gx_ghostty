@@ -327,7 +327,7 @@ jobs:
           package="$RUNNER_TEMP/ghostty-gx-stage-test.deb"
           python3 scripts/gx_package.py test-deb "$RUNNER_TEMP/ghostty-gx-stage" --output "$package"
           dpkg-deb --info "$package" | tee "$evidence/test-deb-info.txt"
-          apt-get install -y --no-install-recommends "$package" xvfb xauth scrot libgl1-mesa-dri fonts-dejavu-core
+          apt-get install -y --no-install-recommends "$package" xvfb xauth scrot libgl1-mesa-dri fonts-dejavu-core librsvg2-common
           cd "$RUNNER_TEMP"
           ghostty-gx +version | tee "$evidence/version.txt"
           grep -Fx "  - version: $GX_VERSION_STRING" "$evidence/version.txt"

@@ -55,7 +55,8 @@ RELEASE_JOBS = {
 }
 ASSET_JOBS = {"source", "libvt", "libvt-macos", "linux-gtk", "windows-app", "macos"}
 NOBLE_BOOTSTRAP = {"ca-certificates", "git", "python3"}
-NOBLE_SMOKE = {"xvfb", "xauth", "scrot", "libgl1-mesa-dri", "fonts-dejavu-core"}
+# librsvg2-common is only a Recommends of libgtk-4-1; without it the SVG header bar icons draw as image-missing.
+NOBLE_SMOKE = {"xvfb", "xauth", "scrot", "libgl1-mesa-dri", "fonts-dejavu-core", "librsvg2-common"}
 WIN32_BUILD = "zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu"
 CROSS_TARGETS = [
     "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl",
