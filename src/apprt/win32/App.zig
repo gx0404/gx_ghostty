@@ -298,6 +298,9 @@ pub fn run(self: *App) !void {
             if (self.routeEditKey(&msg)) continue :loop;
         }
 
+        // Alt+Space opens the window menu (see Window.handleSystemMenuKey).
+        if (Window.handleSystemMenuKey(self, &msg)) continue :loop;
+
         // Skip TranslateMessage for keyboard events on terminal surface
         // windows: handleKeyEvent calls ToUnicode directly, and
         // TranslateMessage's internal ToUnicodeEx mutates the same
@@ -569,6 +572,8 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
+                    // Badge the tab when it is in the background.
+                    core_surface.rt_surface.parent_window.onBell(core_surface.rt_surface);
                     if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
                         if (w32.GetForegroundWindow() != win_hwnd) {
                             var fwi: w32.FLASHWINFO = .{
@@ -833,28 +838,9 @@ pub fn performAction(
         .initial_size => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Convert client size to window size (accounts for
-                        // title bar, borders, scrollbar).
-                        var rect = w32.RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = @intCast(value.width),
-                            .bottom = @intCast(value.height),
-                        };
-                        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
-                        _ = w32.SetWindowPos(
-                            h,
-                            null,
-                            0,
-                            0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
-                            w32.SWP_NOZORDER | w32.SWP_NOMOVE,
-                        );
-                    }
-                },
+                // The window adds its frame and chrome to the terminal size.
+                .surface => |core_surface| core_surface.rt_surface.parent_window
+                    .setInitialSize(value.width, value.height),
             }
             return true;
         },
@@ -942,27 +928,8 @@ pub fn performAction(
         .reset_window_size => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Reset to default 800x600
-                        var rect = w32.RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = 800,
-                            .bottom = 600,
-                        };
-                        _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
-                        _ = w32.SetWindowPos(
-                            h,
-                            null,
-                            0,
-                            0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
-                            w32.SWP_NOZORDER | w32.SWP_NOMOVE,
-                        );
-                    }
-                },
+                // Back to the window-width/-height size, or the default.
+                .surface => |core_surface| core_surface.rt_surface.parent_window.resetWindowSize(),
             }
             return true;
         },

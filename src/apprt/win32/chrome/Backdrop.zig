@@ -1,18 +1,57 @@
 //! DWM chrome theming and window backdrop of a top-level terminal window:
-//! the dark/light title bar and caption color (`window-theme`,
-//! `background`), the dark theme of common controls, translucency
-//! (`background-opacity` through `WS_EX_LAYERED`) and the accent blur
-//! behind translucent windows (`background-blur`).
+//! the dark/light frame (`window-theme`, `background`), the border color,
+//! the dark theme of common controls, the system backdrop material
+//! (`gx-window-material`), translucency (`background-opacity` through
+//! `WS_EX_LAYERED`) and the accent blur behind translucent windows
+//! (`background-blur`).
+//!
+//! Materials: `mica`, `acrylic` and `tabbed` set `DWMWA_SYSTEMBACKDROP_TYPE`
+//! (Windows 11 22H2, build 22621, and later; older systems fall back to
+//! `solid` and log it). DWM only shows a backdrop through client pixels
+//! whose alpha is below one inside the frame extended into the client
+//! area, so `extendFrame` extends the frame over the title bar row, which
+//! `TitleBar` draws with per-pixel alpha (transparent strip and inactive
+//! tabs, opaque active tab). DWM then draws its own caption buttons in that
+//! row, so the title bar uses them instead of its custom-drawn ones
+//! (`TitleBar.nativeButtons`).
+//!
+//! The material shows in the chrome only. The terminals are WGL child
+//! windows and DWM composes their pixels opaque even inside an extended
+//! frame (with the whole client area extended and `background-opacity =
+//! 0.3`, the terminal still covered the backdrop on Windows 11 build
+//! 26300), so the terminal area keeps its solid background.
+//! `background-opacity` below one makes the whole window, chrome included,
+//! uniformly translucent with `WS_EX_LAYERED`; DWM keeps drawing the
+//! material under it. `background-blur` (the accent blur behind a
+//! translucent window) only applies to the solid material.
 //!
 //! Stateless: everything lives on the HWND. `Window` calls `apply` once
-//! after creating its HWND and `onConfigChange` after every app-level
-//! configuration change; `App` uses `toggleOpacity` for
-//! `toggle_background_opacity`. The window material (`gx-window-material`:
-//! Mica, acrylic, tabbed) belongs here as well.
+//! after creating its HWND, `onConfigChange` after every app-level
+//! configuration change and `extendFrame` whenever the height of its chrome
+//! changes; `App` uses `toggleOpacity` for `toggle_background_opacity`.
 const std = @import("std");
 const configpkg = @import("../../../config.zig");
 const Config = configpkg.Config;
+const gx_config = @import("../../../gx/config_types.zig");
 const w32 = @import("../win32.zig");
+const style = @import("../ui/style.zig");
+
+const log = std.log.scoped(.win32_backdrop);
+
+pub const Material = gx_config.WindowMaterial;
+
+/// First Windows build with `DWMWA_SYSTEMBACKDROP_TYPE` (Windows 11 22H2).
+pub const material_min_build: u32 = 22621;
+
+const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+/// `DWMWA_BORDER_COLOR` value that removes the border (Windows 11).
+const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
+
+/// DWM_SYSTEMBACKDROP_TYPE values.
+const DWMSBT_NONE: u32 = 1;
+const DWMSBT_MAINWINDOW: u32 = 2;
+const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+const DWMSBT_TABBEDWINDOW: u32 = 4;
 
 pub const ApplyOptions = struct {
     /// Start fully opaque regardless of `background-opacity` (a new window
@@ -22,7 +61,9 @@ pub const ApplyOptions = struct {
 
 /// Apply the complete chrome state of a freshly created window.
 pub fn apply(hwnd: w32.HWND, config: *const Config, options: ApplyOptions) void {
-    applyChromeTheme(hwnd, config.@"window-theme", config.background);
+    applyTheme(hwnd, config);
+    applyBorderColor(hwnd, config);
+    applyMaterial(hwnd, config);
 
     // Apply dark theme to common controls (scrollbar, etc.).
     _ = w32.SetWindowTheme(
@@ -37,15 +78,94 @@ pub fn apply(hwnd: w32.HWND, config: *const Config, options: ApplyOptions) void 
     if (config.@"background-opacity" < 1.0 and !options.force_opaque) {
         setLayeredOpacity(hwnd, config.@"background-opacity");
     }
-    if (config.@"background-blur".enabled()) {
-        applyBackgroundBlur(hwnd, true);
-    }
+    if (blurEnabled(config)) applyBackgroundBlur(hwnd, true);
 }
 
-/// Follow a live configuration reload (background color in particular).
+/// Follow a live configuration reload: theme, border, material and blur.
 pub fn onConfigChange(hwnd: w32.HWND, config: *const Config) void {
-    applyChromeTheme(hwnd, config.@"window-theme", config.background);
-    applyBackgroundBlur(hwnd, config.@"background-blur".enabled());
+    applyTheme(hwnd, config);
+    applyBorderColor(hwnd, config);
+    applyMaterial(hwnd, config);
+    applyBackgroundBlur(hwnd, blurEnabled(config));
+}
+
+/// The accent blur only applies to the solid material: the system
+/// backdrops are blurred (or tinted) already and would fight with it.
+fn blurEnabled(config: *const Config) bool {
+    return config.@"background-blur".enabled() and material(config) == .solid;
+}
+
+/// The material the window actually uses: `gx-window-material`, or
+/// `solid` when the system has no backdrop support.
+pub fn material(config: *const Config) Material {
+    const wanted = config.@"gx-window-material";
+    if (wanted == .solid or !supportsMaterials()) return .solid;
+    return wanted;
+}
+
+/// Whether the title bar row is drawn transparent over a backdrop.
+pub fn chromeIsTranslucent(config: *const Config) bool {
+    return material(config) != .solid;
+}
+
+/// Whether DWM supports system backdrop materials on this system.
+pub fn supportsMaterials() bool {
+    return windowsBuild() >= material_min_build;
+}
+
+/// The Windows build number (RtlGetVersion, which unlike GetVersionEx is
+/// not subject to manifest-based version lies). Zero when unknown.
+pub fn windowsBuild() u32 {
+    var info: std.os.windows.RTL_OSVERSIONINFOW = undefined;
+    info.dwOSVersionInfoSize = @sizeOf(std.os.windows.RTL_OSVERSIONINFOW);
+    if (std.os.windows.ntdll.RtlGetVersion(&info) != .SUCCESS) return 0;
+    return info.dwBuildNumber;
+}
+
+fn applyMaterial(hwnd: w32.HWND, config: *const Config) void {
+    // Without system backdrop support the attribute does not exist; there
+    // is nothing to reset either.
+    if (!supportsMaterials()) {
+        const wanted = config.@"gx-window-material";
+        if (wanted != .solid) log.info(
+            "gx-window-material={t} needs Windows 11 22H2 (build {d}) or later; this is build {d}, using solid",
+            .{ wanted, material_min_build, windowsBuild() },
+        );
+        return;
+    }
+    const value: u32 = switch (material(config)) {
+        .solid => DWMSBT_NONE,
+        .mica => DWMSBT_MAINWINDOW,
+        .acrylic => DWMSBT_TRANSIENTWINDOW,
+        .tabbed => DWMSBT_TABBEDWINDOW,
+    };
+    const hr = w32.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, @ptrCast(&value), @sizeOf(u32));
+    if (hr < 0) log.warn("DWMWA_SYSTEMBACKDROP_TYPE={d} failed hr=0x{x}", .{ value, @as(u32, @bitCast(hr)) });
+}
+
+/// Extend the DWM frame over the top `chrome_height` pixels of the client
+/// area when the material shows through the chrome, and retract it
+/// otherwise. Call it whenever the chrome height or the material changes.
+pub fn extendFrame(hwnd: w32.HWND, config: *const Config, chrome_height: i32) void {
+    const top: i32 = if (chromeIsTranslucent(config)) @max(chrome_height, 0) else 0;
+    const margins: w32.MARGINS = .{ .left = 0, .right = 0, .top = top, .bottom = 0 };
+    _ = w32.DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
+
+/// The 1px Windows 11 window border follows the theme: a hairline between
+/// the background and the foreground, like the chrome separators.
+fn applyBorderColor(hwnd: w32.HWND, config: *const Config) void {
+    const tokens = style.Tokens.fromConfig(config);
+    const ref: u32 = tokens.window_border.colorRef();
+    _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_BORDER_COLOR, @ptrCast(&ref), @sizeOf(u32));
+}
+
+/// Remove the Windows 11 border (borderless windows) or restore the theme
+/// border.
+pub fn setBorderVisible(hwnd: w32.HWND, config: *const Config, visible: bool) void {
+    if (visible) return applyBorderColor(hwnd, config);
+    const none: u32 = DWMWA_COLOR_NONE;
+    _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_BORDER_COLOR, @ptrCast(&none), @sizeOf(u32));
 }
 
 /// Whether the window is currently translucent (`WS_EX_LAYERED`).
@@ -118,15 +238,24 @@ pub fn isDark(theme: Config.WindowTheme, bg: Config.Color) bool {
     };
 }
 
-/// Apply the DWM dark/light title bar, honoring `window-theme` (see
-/// `isDark`). The caption is tinted to the terminal background only for
+/// The DWM theme of the window (see `applyChromeTheme`). A material fills
+/// the caption itself, so the caption is never tinted then.
+fn applyTheme(hwnd: w32.HWND, config: *const Config) void {
+    applyChromeTheme(hwnd, config.@"window-theme", config.background, material(config) == .solid);
+}
+
+/// Apply the DWM dark/light frame, honoring `window-theme` (see `isDark`):
+/// it picks the dark or light variant of the shadow, the border and the
+/// system backdrop, and of the system caption of native title bars. With
+/// `tint` that caption is tinted to the terminal background, but only for
 /// the luminance-derived themes; for the explicit dark/light/system themes
-/// the caption is reset to the system default so the standard themed title
-/// bar (and legible glyphs) is drawn.
+/// it is reset to the system default so the standard themed title bar (and
+/// legible glyphs) is drawn.
 pub fn applyChromeTheme(
     hwnd: w32.HWND,
     theme: Config.WindowTheme,
     bg: Config.Color,
+    tint: bool,
 ) void {
     const dark_mode: u32 = if (isDark(theme, bg)) 1 else 0;
     _ = w32.DwmSetWindowAttribute(
@@ -136,7 +265,7 @@ pub fn applyChromeTheme(
         @sizeOf(u32),
     );
 
-    const tint_caption = switch (theme) {
+    const tint_caption = tint and switch (theme) {
         .auto, .ghostty => true,
         else => false,
     };
