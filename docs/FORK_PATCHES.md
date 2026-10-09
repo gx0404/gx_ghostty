@@ -51,6 +51,8 @@
 | GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |
 | GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |
 | GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |
+| GX-0008 | `src/os/hostname.zig` | `fork(gx): GX-0008` | active |
+| GX-0008 | `src/termio/stream_handler.zig` | `fork(gx): GX-0008` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
 <!-- fork-patches:end -->
 
@@ -426,6 +428,51 @@ python -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 只有登记表与闭集检查；`src/gx/conpty.zig` 的单测锁定 `GHOSTTY_GX_CONPTY` 的解析、同目录路径拼接与 flags 取值。
+
+## GX-0008 Windows 上解析 OSC 7 工作目录
+
+- 文件：`src/termio/stream_handler.zig`（导入；`reportPwd` 去掉 Windows 的提前返回，缺主机名按空主机名处理，解码后的路径经 `gx_osc7.nativePath`）、`src/os/hostname.zig`（`isLocal` 接受空主机名；Windows 上不区分大小写并接受 DNS 主机名；两条单测）。路径转换在新路径 `src/gx/osc7.zig`。
+- 标记：`fork(gx): GX-0008`；纯新增块用 begin/end 包住，改动的上游行上一行写单行标记，删去的 Windows 提前返回处留一行单行标记。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，`git diff --numstat` 合计 +58/−10（含注释与单测）。
+
+### 原因
+
+`StreamHandler.reportPwd` 在 Windows 上直接返回（日志 `reportPwd unimplemented on windows`），终端从不记录 shell 报告的工作目录，新标签页、分屏与窗口只能继承启动目录。Windows shell 报告的形式也与 POSIX 不同：GX Zsh 发 `file://localhost/C:/…`（百分号编码；本机已安装的旧版发 `file:///cygdrive/c/…`），herdr 发 `file://<大写的 COMPUTERNAME>/C:/…`，MSYS2 系的 shell 可能发 `/c/…`；而 `hostname.isLocal` 区分大小写，并拒绝空主机名（`file:///C:/…`）。
+
+### 行为
+
+- 所有平台：`file:///path`（以及没有 authority 的 `file:/path`）的空主机名视为本机，`isLocal("")` 返回 true；`localhost` 与其他平台上的主机名比较不变。
+- Windows：主机名与 `GetComputerNameA`（NetBIOS 名）或 `GetComputerNameExA(ComputerNameDnsHostname)`（DNS 主机名，MSYS2 `hostname` 打印的那个）不区分大小写地比较。
+- Windows：URI 路径照常百分号解码（`kitty-shell-cwd://` 照常不解码），再由 `src/gx/osc7.zig::windowsPath` 转成本机路径：`/C:/Users/x`、`/c/Users/x` 与 Cygwin 的 `/cygdrive/c/Users/x` 都变成 `C:\Users\x`，`/C:`、`/c`、`/cygdrive/c` 变成 `C:\`；盘符转大写，`/` 与 `\` 都算分隔符，重复与末尾的分隔符去掉。相对路径、UNC 与设备路径（`//server/share`、`//?/…`）、POSIX 路径（`/home/me`、`/mnt/c/…`）、盘符相对路径（`/C:x`）以及含控制字符或 `<>:"|?*` 的路径记 warning 后忽略，pwd 不变。
+- 之后与其他平台相同：`Terminal.setPwd`、`pwd_change` 消息、没有标题时以路径为标题。新表面的继承不需要 apprt 改动：`apprt.surface.newConfig` 取 `App.focusedSurface()` 的 `Surface.pwd`，按 `window-/tab-/split-inherit-working-directory`（默认都开）写进 `working-directory`；`termio.Exec` 能访问该目录时把它作为 `CreateProcessW` 的当前目录并设 `PWD`，不能访问时记 warning 后用默认目录。win32 apprt 新建标签页、分屏与窗口时已用对应的 `context` 调 `newConfig`，并在获得焦点时调 `focusCallback(true)`，所以 OSC 7 报告之后新建的表面直接从该目录启动。
+- libghostty-vt 的 `stream_terminal.Handler.reportPwd` 原样保存 URL、由嵌入方解码，不受影响。
+
+### 上游状态
+
+未回馈上游。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游实现 Windows 上的 OSC 7 时以上游为准，确认 `localhost`、空主机名、大写主机名与 `/C:/…`、`/c/…` 的行为后删除对应改动。上游改写 `reportPwd` 的解析步骤时保持：主机检查之后、`setPwd` 之前把解码后的路径交给 `gx_osc7.nativePath`。
+
+### 移除条件
+
+上游在 Windows 上把 OSC 7 路径转成本机路径，且 `isLocal` 接受空主机名并在 Windows 上不区分大小写之后移除：删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build test-bin -Dtarget=x86_64-windows-gnu -Dapp-runtime=none
+python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --filter gx.osc7 --filter os.hostname
+python -m unittest scripts.test_fork_patches -v
+```
+
+Linux 上用 `python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx.osc7 --filter os.hostname`。GUI：在 pwsh 中运行 ``Write-Host -NoNewline "`e]7;file://localhost/C:/Windows`a"`` 后按 Ctrl+Shift+T，新标签页从 `C:\Windows` 启动；GX Zsh 与 herdr 的报告同样生效。
+
+### 测试锁定
+
+登记表与闭集检查之外：`src/gx/osc7.zig` 的单测锁定路径转换与拒绝规则，并在 Windows 上把 GX Zsh、herdr、MSYS、kitty 形式的 URL 走一遍与 `reportPwd` 相同的解析、主机检查与转换；`src/os/hostname.zig` 新增空主机名与 Windows 大小写两条单测（`src/os/main.zig` 不引用该文件的单测，由 `src/gx/osc7.zig` 引入）。
 
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 

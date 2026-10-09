@@ -13,6 +13,9 @@ const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const terminfo = @import("../terminfo/main.zig");
 const posix = std.posix;
+// fork(gx): GX-0008 begin: OSC 7 working directories on Windows
+const gx_osc7 = @import("../gx/osc7.zig");
+// fork(gx): GX-0008 end
 
 const log = std.log.scoped(.io_handler);
 
@@ -1518,10 +1521,7 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
-            return;
-        }
+        // fork(gx): GX-0008 Windows no longer returns here; its path is converted below
 
         // Attempt to parse this file-style URI using options appropriate
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
@@ -1543,10 +1543,8 @@ pub const StreamHandler = struct {
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         const host = uri.getHost(&host_buffer) catch |err| switch (err) {
-            error.UriMissingHost => {
-                log.warn("OSC 7 uri must contain a hostname: {}", .{err});
-                return;
-            },
+            // fork(gx): GX-0008 file:///path has an empty host, which isLocal accepts
+            error.UriMissingHost => std.Io.net.HostName{ .bytes = "" },
         };
 
         // OSC 7 is a little sketchy because anyone can send any value from
@@ -1570,7 +1568,9 @@ pub const StreamHandler = struct {
         var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
         var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
         defer arena_alloc.deinit();
-        const path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+        // fork(gx): GX-0008 Windows stores a native path (C:\...), see src/gx/osc7.zig
+        const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+        const path = try gx_osc7.nativePath(arena_alloc.allocator(), raw_path) orelse return;
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
