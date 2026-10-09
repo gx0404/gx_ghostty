@@ -44,6 +44,9 @@
 | GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
+| GX-0009 | `src/font/DeferredFace.zig` | `fork(gx): GX-0009` | active |
+| GX-0009 | `src/font/backend.zig` | `fork(gx): GX-0009` | active |
+| GX-0009 | `src/font/discovery.zig` | `fork(gx): GX-0009` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
 | GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |
 | GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |
@@ -327,6 +330,60 @@ python -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 只有登记表与闭集检查；`src/termio/Exec.zig` 新增 `execCommand windows: quoted path with spaces stays one argument` 用例。
+
+## GX-0009 Windows 字体发现改用 DirectWrite
+
+- 文件：`src/font/discovery.zig`（`Discover` 在 `freetype_windows` 下取 `DirectWrite`；纯新增块导出 `DirectWrite` 并把 `src/font/directwrite/match.zig` 的单测接进测试树）、`src/font/DeferredFace.zig`（`familyName`、`name` 的 `freetype_windows` 分支改用 FreeType 解码的族名与样式名）、`src/font/backend.zig`（`freetype_windows` 的文档注释与 `Backend.default` 的注释）。实现在新路径 `src/font/directwrite/`：`com.zig`（DirectWrite COM 与所需 GDI、kernel32 函数的绑定）、`discovery.zig`（发现逻辑）、`match.zig`（与平台无关的样式匹配，带单测）；移植自 MIT 许可的 shiweis/ghostty-windows@119b9270c，文件头注明出处。
+- 标记：`fork(gx): GX-0009`。`discovery.zig` 的纯新增块用 begin/end 包住，其余改动的上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：3 个文件，`git diff --numstat` 合计 +21/−9（含注释）。
+
+### 原因
+
+上游 `freetype_windows` 后端的发现是 `src/font/discovery.zig::Windows`：每次 `discover` 都遍历 `%SYSTEMROOT%\Fonts` 与 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`，用 FreeType 打开文件比较族名。
+
+- `matches` 不看粗体、斜体：同一族里按文件名排序第一个命中的文件被用作所有样式。实测 `font-family = "Cascadia Code"` 的四种样式都是可变字体的默认实例（粗体显示为常规），`JetBrainsMono NF` 四种样式都是 `-Bold.ttf`（整屏粗体）；因为每种样式都「找到了」，`completeStyles` 也不会合成，只有常规体的字体（如 Lucida Console）没有粗斜体。
+- 族名只比 FreeType 的英文族名与 SFNT 第一条族名记录，`微软雅黑`、`宋体` 这样的本地化族名找不到。
+- 只看两个目录：注册表里登记在其他路径的字体（GX Shell 的 `{app}\fonts\*.ttf`、WPS 的 `C:\ProgramData\Kingsoft\...`）、应用包随附的字体（如 Windows Terminal 包里的 `CascadiaCodeItalic.ttf`）、`AddFontResourceEx` 加载的字体都看不到。
+- 按码位回退时逐个打开文件直到找到含该码位的字体，按字母序取第一个（`中` 取到 DengXian），找不到的码位要打开全部文件；缺失的族名在启动时每种样式各扫描一遍全部文件。
+
+### 行为
+
+- 族名查找：先用 DirectWrite 系统字体集合 `FindFamilyName`（匹配所有语言的族名；集合包含系统与每用户字体目录、注册表 HKLM/HKCU `Fonts` 中任意路径的字体、应用包字体）；找不到时用 GDI `EnumFontFamiliesExW` 按 GDI 族名查找（覆盖 `AddFontResourceEx` 加载的字体与 `Segoe UI Semibold` 这类 GDI 旧族名），经 `IDWriteGdiInterop::CreateFontFaceFromHdc` 取得字体文件。空族名、非法 WTF-8 视为找不到。
+- 样式匹配（`src/font/directwrite/match.zig::select`）：跳过 DirectWrite 模拟出的粗体、斜体变体；只保留宽度最接近 normal 的字面；按 CSS Fonts 4 的顺序比较宽度、倾斜、字重。粗体请求只接受至少 semibold 且比该族常规字面更重的字面，斜体请求只接受 italic 或 oblique 字面；没有真实字面时返回空，由 `Collection.completeStyles` 按 `font-synthetic-style` 合成。`font-style*` 指定样式名时按各语言的字面名精确或包含匹配，忽略粗斜体。
+- 可变字体：DirectWrite 把每个命名实例列为同一文件的字面，发现按 `IDWriteFontFace5` 报告的轴值找到坐标相同的 FreeType 命名实例，把实例号编进 `DeferredFace.Windows.face_index` 的高 16 位，`load` 时 FreeType 直接打开该实例；用户的 `font-variation*` 照常叠加。
+- 按码位回退：先用系统字体回退 `IDWriteFontFallback::MapCharacters`（按用户区域设置选字，`中` 在 zh-CN 下得到 Microsoft YaHei UI）；该字体被调用方拒绝（例如表现形式不符）或系统回退无结果时，再检查每个族的第一个字面，取覆盖该码位的族的常规字面。`font-codepoint-map` 照常先按族名查找，族不存在时记 warning 后走同一回退。
+- `+list-fonts`：不带 `--family` 时列出集合中全部真实字面（同一字体装在多处只列一次）及只有 GDI 知道的字体；`DeferredFace.name` 在本后端返回 FreeType 解码的「族名 样式名」（如 `Cascadia Code Bold`），`familyName` 返回 FreeType 族名，不再输出上游 `Face.name` 原样返回的 UTF-16BE 字节。GUI 子系统的 exe 只在标准输出被重定向或接管道时可见输出（cmd 的 `>`、`|` 与直接运行、Git Bash 均可；PowerShell 需 `| Out-String`，赋值给变量或 `>` 会遇到 `PIPE_CLOSING`，与本补丁无关）。
+- 字体文件仍由 FreeType 打开：路径含 ANSI 代码页以外的字符时改用 8.3 短路径（FreeType 在 Windows 上用 `CreateFileA`）；不是本地文件的字体（内存、远程字体）跳过。FreeType 栅格化、HarfBuzz shaping 不变。
+- DirectWrite 初始化失败时记 warning，回退到原目录扫描 `discovery.Windows`。非 Windows 后端的行为与产物不变。
+
+### 上游状态
+
+未回馈上游。上游 `freetype_windows` 由 Yasuhiro Matsumoto 的 PR 加入（提交 `61fce4d0a`），注释里提到将来可用 DirectWrite 替换。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+先取上游版本，再放回：`Discover` 的 `.freetype_windows => DirectWrite` 一行与其标记、导出 `DirectWrite` 并引用 `match.zig` 单测的 begin/end 块（放在 `pub const Windows` 之前）、`DeferredFace` 两处 `freetype_windows` 分支、`backend.zig` 的两处注释。上游若改动 `DeferredFace.Windows` 的字段、`Descriptor`、`Discover` 的接口（`init`、`deinit`、`discover`、`discoverFallback`、迭代器的 `next`/`deinit`）或 `discovery.Windows` 的接口，同步调整 `src/font/directwrite/discovery.zig`。上游若自己改用 DirectWrite 发现，按「移除条件」处理。
+
+### 移除条件
+
+上游的 Windows 字体发现满足本补丁的行为（真实粗斜体、本地化族名、注册表与 GDI 字体、系统字体回退）时移除：删除三处改动、标记与 `src/font/directwrite/`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+python scripts/zigw.py test src/font/directwrite/match.zig   # 样式匹配单测，任何平台
+python scripts/zigw.py test src/font/directwrite/com.zig     # Windows：COM 绑定的集合查找与系统回退
+python -m unittest scripts.test_fork_patches -v
+```
+
+用临时 `LOCALAPPDATA` 运行 `zig-out/bin/ghostty.exe --font-family="Cascadia Code"`，在 pwsh 里输出 SGR 1/3 文本（测试进程不要继承 `NO_COLOR`，否则 pwsh 去掉转义序列），粗体、斜体、粗斜体应分别是真实字面，日志有 `font bold: Cascadia Code Bold` 等行；`--font-family=微软雅黑` 应找到 Microsoft YaHei 并合成斜体；`ghostty.exe +list-fonts --family="Cascadia Code" --bold > out.txt` 应列出 Bold、SemiBold。Linux 上 `match.zig` 的单测随 `ghostty-test` 运行，`just wsl test --filter directwrite`。
+
+### 测试锁定
+
+登记表与闭集检查锁定标记；`src/font/directwrite/match.zig` 的单测锁定字重、宽度、倾斜排序，粗斜体真实字面的判定，样式名匹配与命名实例选择，经 `discovery.zig` 的测试块进入所有平台的 `ghostty-test`；`com.zig` 的两条用例只在 Windows 运行；`directwrite/discovery.zig` 的两条端到端用例（Arial 四种样式、按码位回退）需要能编译 `ghostty-test` 的 Windows 环境。
+
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 
 - 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（5 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。

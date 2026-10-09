@@ -42,3 +42,4 @@
 ### Fixed
 
 - 设置了 `theme` 时，配置再次重放（明暗切换、`ghostty +validate-config` 在加载后再次 finalize）不再丢掉 `config-file` 打不开、循环引用等诊断，`+validate-config` 因此不会漏报缺失的 include（fork 补丁 GX-0010）。
+- Windows 字体发现改用 DirectWrite（fork 补丁 GX-0009）：粗体、斜体、粗斜体使用字体族里真实的字面（此前同一族按文件名第一个命中的文件用于所有样式，粗体常显示为常规体，没有真实字面时也不合成）；`微软雅黑` 等本地化族名、注册表登记在其他目录的字体、应用包随附的字体与 `AddFontResourceEx` 加载的字体都能找到；按码位回退改用系统字体回退并按用户区域设置选字（`中` 在 zh-CN 下用 Microsoft YaHei UI），首个 CJK 字符不再逐个打开字体文件；`ghostty +list-fonts` 列出各字面的样式名。字体仍由 FreeType 栅格化、HarfBuzz 整形。

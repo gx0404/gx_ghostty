@@ -8,8 +8,8 @@
 
 ## 符号真源
 
-- 后端（编译期唯一）：`src/font/backend.zig::Backend`。`Backend.default`：wasm32 为 `web_canvas`；Windows 为 `freetype_windows`（FreeType 栅格化、HarfBuzz shaping、自带字体目录扫描）；Darwin 为 `coretext`；其余为 `fontconfig_freetype`。`-Dfont-backend` 在 `src/build/Config.zig` 覆盖；`hasFreetype`/`hasCoretext`/`hasFontconfig`/`hasHarfbuzz` 决定 `src/build/SharedDeps.zig::add` 链接哪些库（FreeType 总会链接，Dear ImGui 也用它）。
-- 按后端分派：`src/font/face.zig::Face`、`src/font/library.zig::Library`、`src/font/shape.zig::Shaper`、`src/font/discovery.zig::Discover`（`freetype` 与 `web_canvas` 无发现，`freetype_windows` 用 `Windows`，`fontconfig_freetype` 用 `Fontconfig`，CoreText 系用 `CoreText`）。wasm 目标下 `src/font/main.zig::options` 强制 `web_canvas`。
+- 后端（编译期唯一）：`src/font/backend.zig::Backend`。`Backend.default`：wasm32 为 `web_canvas`；Windows 为 `freetype_windows`（FreeType 栅格化、HarfBuzz shaping、DirectWrite 发现）；Darwin 为 `coretext`；其余为 `fontconfig_freetype`。`-Dfont-backend` 在 `src/build/Config.zig` 覆盖；`hasFreetype`/`hasCoretext`/`hasFontconfig`/`hasHarfbuzz` 决定 `src/build/SharedDeps.zig::add` 链接哪些库（FreeType 总会链接，Dear ImGui 也用它）。
+- 按后端分派：`src/font/face.zig::Face`、`src/font/library.zig::Library`、`src/font/shape.zig::Shaper`、`src/font/discovery.zig::Discover`（`freetype` 与 `web_canvas` 无发现，`freetype_windows` 用 fork 补丁 GX-0009 的 `DirectWrite`（`src/font/directwrite/`），`fontconfig_freetype` 用 `Fontconfig`，CoreText 系用 `CoreText`）。wasm 目标下 `src/font/main.zig::options` 强制 `web_canvas`。
 - 共享链：
   - `src/font/SharedGridSet.zig`：由 `App.font_grid_set` 持有；`Key` 由 `DerivedConfig`（字体相关配置）加字号与 DPI 构成，`ref`/`deref` 做引用计数。
   - `src/font/SharedGrid.zig`：codepoint→font index 与字形渲染两级缓存、灰度与彩色两张 `Atlas`、`metrics`、读写锁 `lock`。
@@ -34,7 +34,7 @@
 - **回退与发现**：发现实例在 `SharedGridSet` 生命周期内只初始化一次（fontconfig 不能重复 init）。`CodepointResolver.getIndex` 不报错、尽力返回，改算法要同步 doc comment；sprite 码位总由 sprite face 提供；emoji 一律按 cover 加居中约束渲染（`SharedGrid.renderGlyph`）。
 - **shaper 契约**：四种 shaper 提供同一组方法（`init`、`deinit`、`runIterator`、`shape`、`endFrame`）。`shape` 返回的 cells 归 shaper 所有，只到下一次 shape 前有效；渲染器每次 `updateFrame` 结束都调 `endFrame`，CoreText 借此释放帧内积压的对象。
 - **Atlas**：写满时 `grow` 成两倍再重试；每次写入递增 `modified`，渲染器据此决定是否重传纹理；同一 atlas 内格式统一（灰度 1 字节，彩色 BGRA）。
-- **Windows 发现**：`src/font/discovery.zig::Windows` 每次 `discover` 都遍历 `%SYSTEMROOT%\Fonts` 与 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`，没有索引，按 FreeType family 名或 SFNT name 表匹配；按 codepoint 回退要逐个打开候选字体，开销大。它读 `global.environ()`，依赖全局状态已初始化。
+- **Windows 发现**（GX-0009，细节见 `docs/FORK_PATCHES.md`）：`src/font/directwrite/discovery.zig::DirectWrite` 只负责找到字体文件与 face index，结果仍是 `DeferredFace.Windows`，由 FreeType 打开；可变字体的命名实例编进 `face_index` 高 16 位。族名先查 DirectWrite 系统集合（各语言族名、注册表任意路径、应用包字体），再查 GDI（`AddFontResourceEx` 字体与 GDI 旧族名）。样式选择在纯函数 `src/font/directwrite/match.zig::select`：跳过 DirectWrite 模拟的字面，粗斜体请求没有真实字面就返回空，让 `completeStyles` 合成。按码位回退先 `MapCharacters`，再逐族查第一个字面。COM 对象只读、可跨线程（渲染线程会调 `discoverFallback`），发现结构里不放可变状态。DirectWrite 初始化失败才回退上游目录扫描 `discovery.Windows`，后者读 `global.environ()`。
 - **生成物**：
   - `src/font/nerd_font_tables.zig` 与 `src/font/nerd_font_codepoint_tables.py` 只经 `src/font/nerd_font_codegen.py` 重建：Python 版本与 fontTools 依赖见脚本 docstring，第一个参数是 SymbolsNerdFont（非 Mono）字体路径。脚本以当前目录相对路径读写 `nerd_font_codepoint_tables.py`，缓存缺失或版本不符时把源符号字体联网下载到当前目录的 `nerd_font_symbol_fonts/`，所以要在 `src/font/` 下运行。
   - `vendor/nerd-fonts/font-patcher.py` 是上游原样拷贝（README 记录取自的 commit），更新时同步 README 并重新生成表。
@@ -53,11 +53,12 @@
 ## 验证
 
 - 路由：`just rules src/font/SharedGrid.zig`；改本文档后跑 `just framework-check`。
-- 定向单测（`src/font/discovery.zig` 的用例按字体后端自动 skip；`--filter` 可重复，运行期筛选；`just test` 只在 Linux/macOS 可跑，`ghostty-test` 在 Windows 上无法编译，所以 `freetype_windows` 的发现用例目前没有可运行的环境，记 PENDING）：
-  - `just test --filter windows`：含在系统字体目录查找 Arial 的发现用例。
+- 定向单测（`src/font/discovery.zig` 的用例按字体后端自动 skip；`--filter` 可重复，运行期筛选；`just test` 只在 Linux/macOS 可跑）：
+  - `just test --filter directwrite`：`match.zig` 的样式匹配纯函数单测，所有平台都跑。
+  - Windows：`python scripts/zigw.py test src/font/directwrite/match.zig` 与 `.../com.zig`（COM 绑定）可独立运行；`freetype_windows` 的端到端发现用例随 `python scripts/zigw.py build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter=directwrite` 运行（`-Dtest-filter=windows` 含上游目录扫描查找 Arial 的用例）。
   - `just test --filter Key --filter getIndex`：grid 键与回退解析。
   - `just test --filter shape --filter Constraints`：HarfBuzz 整形与 Nerd Font 约束。
   - `just test --filter sprite --filter glyf`：sprite 与 glyf 金标准比对。
-- 编译与格式：Linux/macOS 上 `just build`；Windows 上 `just build` 编不过 libghostty-internal（`build-system.md`「平台」），本机没有字体代码的编译检查，`freetype_windows` 后端在 gx-ci 里也不被编译，记 PENDING；改 Zig 跑 `just fmt-check`。
+- 编译与格式：Linux/macOS 上 `just build`；Windows 上 `python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu` 编译 `freetype_windows` 后端与 win32 app（gx-ci 不编译它，本机补证）；改 Zig 跑 `just fmt-check`。
 - 改 `pkg/freetype`、`pkg/harfbuzz`、`pkg/fontconfig`：各包的 `build.zig` 自带 `test` 步骤，在包目录运行 `zig build test`；gx-ci 未覆盖，需手动补跑并记录结果。
-- PENDING：CoreText 系后端只能在 Mac 上用 `just test` 验证（上游跑过 `-Drenderer=metal -Dfont-backend=coretext_freetype`；gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，不含字体）；`fontconfig_freetype` 由 gx-ci `linux-main` job 覆盖；字形视觉效果要读回 gx-ci `gtk-smoke` 截图才算通过；`ghostty +list-fonts`、`ghostty +show-face --cp=0x41` 需要可执行文件，只能在 Linux 或 macOS 构建上运行。
+- PENDING：CoreText 系后端只能在 Mac 上用 `just test` 验证（上游跑过 `-Drenderer=metal -Dfont-backend=coretext_freetype`；gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，不含字体）；`fontconfig_freetype` 由 gx-ci `linux-main` job 覆盖；字形视觉效果要读回 gx-ci `gtk-smoke` 截图才算通过；`ghostty +list-fonts`、`ghostty +show-face --cp=0x41` 需要可执行文件：Linux/macOS 构建，或 Windows 的 win32 构建（GUI 子系统，输出须重定向或接管道才可见，PowerShell 用 `| Out-String`）。Windows GUI 冒烟的测试进程不要继承 `NO_COLOR`，否则 pwsh 去掉 SGR 序列，粗斜体看起来全是常规体。

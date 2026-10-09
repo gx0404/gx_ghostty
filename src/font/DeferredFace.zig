@@ -144,7 +144,8 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
 
-        .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
+        // fork(gx): GX-0009 FreeType's decoded names; Face.name may return raw UTF-16
+        .freetype_windows => if (self.win) |w| return try font.discovery.DirectWrite.familyName(&w.peek, buf),
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.family, 0)).string,
@@ -174,7 +175,8 @@ pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
 
-        .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
+        // fork(gx): GX-0009 family and style name, such as "Cascadia Code Bold"
+        .freetype_windows => if (self.win) |w| return try font.discovery.DirectWrite.fullName(&w.peek, buf),
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.fullname, 0)).string,
