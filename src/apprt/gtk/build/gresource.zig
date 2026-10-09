@@ -51,6 +51,9 @@ pub const blueprints: []const Blueprint = &.{
     .{ .major = 1, .minor = 5, .name = "title-dialog" },
     .{ .major = 1, .minor = 5, .name = "window" },
     .{ .major = 1, .minor = 5, .name = "command-palette" },
+    // fork(gx): GX-0015 begin: Ghostty GX settings dialog
+    .{ .major = 1, .minor = 5, .name = "gx-settings-dialog" },
+    // fork(gx): GX-0015 end
 };
 
 /// CSS files in css_path
