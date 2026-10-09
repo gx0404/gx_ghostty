@@ -43,6 +43,9 @@ const log = std.log.scoped(.win32);
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
+/// Posted to the message-only window by `requestQuit`.
+const WM_APP_QUIT: u32 = w32.WM_APP + 0x62;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -115,6 +118,14 @@ com_initialized: bool = false,
 /// created on first use by `uiFactory`.
 ui_factory: ?*d2d.Factory = null,
 
+/// The command of new terminals while `command` is not configured (see
+/// `updateDefaultCommand`). Null when `command` is configured or no shell
+/// was found; the configured command (upstream: `cmd.exe`) applies then.
+default_command: ?configpkg.Command = null,
+
+/// Owns `default_command`.
+default_command_arena: std.heap.ArenaAllocator,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -138,6 +149,7 @@ pub fn init(
         break :err def;
     };
     errdefer config.deinit();
+    repairWorkingDirectory(&config);
 
     // The UI language follows `language` (zh-CN by default).
     i18n.setCurrent(i18n.resolve(config.language));
@@ -153,7 +165,10 @@ pub fn init(
         .config = config,
         .hinstance = hinstance,
         .bg_brush = bg_brush,
+        .default_command_arena = .init(alloc),
     };
+    errdefer self.default_command_arena.deinit();
+    self.updateDefaultCommand();
 
     // Register the window container class (GDI painting, no CS_OWNDC).
     // CS_DBLCLKS is required to receive WM_LBUTTONDBLCLK for divider equalize.
@@ -314,6 +329,11 @@ pub fn run(self: *App) !void {
                 // dead. This does not disturb the ToUnicode dead-key state:
                 // handleKeyEvent never calls ToUnicode for VK_PROCESSKEY.
                 if (msg.wParam == w32.VK_PROCESSKEY) break :blk false;
+                // Characters injected with SendInput KEYEVENTF_UNICODE arrive
+                // as VK_PACKET, which only TranslateMessage turns into the
+                // WM_CHAR that carries them; it does not consult the
+                // keyboard layout, so the dead-key state is untouched.
+                if (msg.wParam == w32.VK_PACKET) break :blk false;
                 const h = msg.hwnd orelse break :blk false;
                 const atom: u16 = @truncate(w32.GetClassLongW(h, w32.GCW_ATOM));
                 break :blk atom != 0 and atom == self.terminal_class_atom;
@@ -467,6 +487,7 @@ pub fn terminate(self: *App) void {
         self.class_atom = 0;
     }
 
+    self.default_command_arena.deinit();
     self.config.deinit();
 }
 
@@ -507,8 +528,7 @@ pub fn performAction(
 ) !bool {
     switch (action) {
         .quit => {
-            self.quit_requested = true;
-            w32.PostQuitMessage(0);
+            self.requestQuit();
             return true;
         },
 
@@ -561,12 +581,14 @@ pub fn performAction(
         },
 
         .ring_bell => {
-            // Audio bell.
-            _ = w32.MessageBeep(0xFFFFFFFF);
-            // Visual bell: flash the taskbar button if the window owning
-            // this surface isn't currently the foreground window. Without
-            // this, BEL on a backgrounded terminal is invisible.
-            switch (target) {
+            const features = self.config.@"bell-features";
+            // `system`: the Windows default beep sound.
+            if (features.system) _ = w32.MessageBeep(0xFFFFFFFF);
+            // `attention`: flash the taskbar button until the window comes
+            // to the foreground, if the window owning this surface isn't
+            // the foreground window. Without this, BEL on a backgrounded
+            // terminal is invisible.
+            if (features.attention) switch (target) {
                 .app => {},
                 .surface => |core_surface| {
                     if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
@@ -582,7 +604,7 @@ pub fn performAction(
                         }
                     }
                 },
-            }
+            };
             return true;
         },
 
@@ -633,12 +655,9 @@ pub fn performAction(
         .close_window => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    // Close the entire window (all tabs), not just one tab.
-                    // Confirm first if any tab still has a running process.
-                    const win = core_surface.rt_surface.parent_window;
-                    if (win.confirmCloseIfNeeded()) win.close();
-                },
+                // Close the entire window (all tabs), not just one tab,
+                // after asking if a tab still runs a program (WM_CLOSE).
+                .surface => |core_surface| core_surface.rt_surface.parent_window.requestClose(),
             }
             return true;
         },
@@ -908,10 +927,8 @@ pub fn performAction(
         },
 
         .close_all_windows => {
-            // Close all surfaces by posting WM_CLOSE to each.
-            // The core tracks surfaces; iterate via quit.
-            self.quit_requested = true;
-            w32.PostQuitMessage(0);
+            // Closing every window quits; ask like quit does.
+            self.requestQuit();
             return true;
         },
 
@@ -1253,8 +1270,9 @@ pub fn performAction(
                 .surface => |core_surface| {
                     const win = core_surface.rt_surface.parent_window;
                     if (win.hwnd) |hwnd| {
-                        // ShowWindow(SW_RESTORE) brings back from minimize.
-                        _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+                        // SW_RESTORE brings the window back from minimized;
+                        // it would also un-maximize, so only when minimized.
+                        if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
                         _ = w32.SetForegroundWindow(hwnd);
                         // Make sure the tab containing this surface is active.
                         if (win.findTabIndex(core_surface.rt_surface)) |idx| {
@@ -1510,6 +1528,115 @@ fn findProfile(list: *const gx.profiles.List, id: []const u8) ?*const gx.profile
     return list.find(custom_id);
 }
 
+/// Pick the command of new terminals (first window, tabs, splits and
+/// windows) for when `command` is not configured on the command line, in
+/// a configuration file or by the settings: the default launch profile,
+/// i.e. GX Zsh, then PowerShell 7, Windows PowerShell and Command Prompt
+/// (`gx.profiles.defaultProfile`). `-e` still runs its command in the
+/// first terminal, and launch profiles pass their own command.
+fn updateDefaultCommand(self: *App) void {
+    self.default_command = null;
+    _ = self.default_command_arena.reset(.free_all);
+    if (commandConfigured(self.config._replay_steps.items)) return;
+
+    var list = self.launchProfiles() catch |err| {
+        log.warn("cannot detect the default shell err={}", .{err});
+        return;
+    };
+    defer list.deinit();
+    const profile = gx.profiles.defaultProfile(list.profiles, .native) orelse {
+        log.info("no default shell detected, new terminals run the command default", .{});
+        return;
+    };
+
+    const alloc = self.default_command_arena.allocator();
+    self.default_command = switch (profile.command) {
+        .argv => |argv| (configpkg.Command{ .direct = argv }).clone(alloc),
+        .command_line => |line| parsed: {
+            var parsed: configpkg.Command = undefined;
+            parsed.parseCLI(alloc, line) catch |err| {
+                log.warn("invalid default shell command id={s} err={}", .{ profile.id, err });
+                return;
+            };
+            break :parsed parsed;
+        },
+    } catch |err| {
+        log.warn("cannot keep the default shell command err={}", .{err});
+        return;
+    };
+    log.info("default shell profile={s}", .{profile.id});
+}
+
+/// Whether the recorded configuration inputs `steps`
+/// (`Config._replay_steps`) set `command`: the last `--command=` value
+/// before `-e` (whose arguments are the initial command) is not empty.
+/// The loaded value cannot tell, because `Config.finalize` falls back to
+/// `cmd.exe` on Windows.
+fn commandConfigured(steps: anytype) bool {
+    const prefix = "--command=";
+    var configured = false;
+    for (steps) |step| {
+        const arg: []const u8 = switch (step) {
+            .@"-e" => break,
+            .arg => |arg| arg,
+            .conditional_arg => |conditional| conditional.arg,
+            else => continue,
+        };
+        if (std.mem.startsWith(u8, arg, prefix)) {
+            configured = std.mem.trim(u8, arg[prefix.len..], " ").len > 0;
+        }
+    }
+    return configured;
+}
+
+/// Repair a `working-directory` path that lost its trailing backslash to
+/// the Windows command-line quoting rules (`restoreTrailingBackslash`):
+/// Explorer's "open here" passes `--working-directory="%V"`, which is
+/// `"C:\"` for a drive root. A path that still has characters Windows
+/// paths cannot contain is dropped (terminals then start in the directory
+/// Ghostty GX was started in): the file APIs treat such names as a
+/// programming error and terminate the process.
+fn repairWorkingDirectory(config: *Config) void {
+    var path = switch (config.@"working-directory" orelse return) {
+        .path => |path| path,
+        .home, .inherit => return,
+    };
+    if (restoreTrailingBackslash(config.arenaAlloc(), path) catch null) |repaired| {
+        log.info("repaired working-directory from={s} to={s}", .{ path, repaired });
+        config.@"working-directory" = .{ .path = repaired };
+        path = repaired;
+    }
+    if (!validWindowsPath(path)) {
+        log.warn("working-directory is not a valid Windows path, ignoring it path={s}", .{path});
+        config.@"working-directory" = .inherit;
+    }
+}
+
+/// Whether `path` has none of the characters that Windows file names
+/// cannot contain (`"<>|*` and control characters). `?` and `:` are left
+/// to the file APIs: they appear in `\\?\` and drive prefixes.
+fn validWindowsPath(path: []const u8) bool {
+    for (path) |c| switch (c) {
+        0...0x1F, '"', '<', '>', '|', '*' => return false,
+        else => {},
+    };
+    return true;
+}
+
+/// In a Windows command line `\"` is an escaped quote, so the argument
+/// `"C:\"` reaches the program as `C:"`. Windows paths cannot contain a
+/// double quote, so trailing quotes stand for the swallowed backslash.
+/// Returns the path with them replaced by one backslash, or null if the
+/// path does not end in a quote.
+fn restoreTrailingBackslash(alloc: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "\"");
+    if (trimmed.len == path.len or trimmed.len == 0) return null;
+    if (std.mem.endsWith(u8, trimmed, "\\") or std.mem.endsWith(u8, trimmed, "/")) {
+        return try alloc.dupe(u8, trimmed);
+    }
+    return try std.mem.concat(alloc, u8, &.{ trimmed, "\\" });
+}
+
 /// Open the configuration file: `.os_open` with the Windows file
 /// association; `.new_window` in a new window running $VISUAL or $EDITOR,
 /// else with the file association.
@@ -1538,6 +1665,8 @@ fn updateConfig(self: *App, config: *const Config) void {
     };
     self.config.deinit();
     self.config = new_config;
+    repairWorkingDirectory(&self.config);
+    self.updateDefaultCommand();
 
     // Switch the UI language when `language` changed and rebuild the
     // translated chrome.
@@ -1861,6 +1990,8 @@ const WM_APP_TRAY: u32 = w32.WM_APP + 3;
 const NOTIF_DESKTOP_UID: u32 = 1;
 const NOTIF_DESKTOP_TIMER_ID: usize = 2;
 
+extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) i32;
+
 /// Start the quit timer. Called when the last surface closes.
 pub fn startQuitTimer(self: *App) void {
     // Cancel any existing timer first.
@@ -1907,6 +2038,32 @@ pub fn stopQuitTimer(self: *App) void {
             self.quit_timer_state = .off;
         },
     }
+}
+
+/// Quit on behalf of the user (the `quit` and `close_all_windows`
+/// actions). The core asks from its tick, so the confirmation runs from
+/// the message loop (`WM_APP_QUIT`, `confirmQuit`).
+fn requestQuit(self: *App) void {
+    if (self.msg_hwnd) |hwnd| {
+        if (w32.PostMessageW(hwnd, WM_APP_QUIT, 0, 0) != 0) return;
+    }
+    self.quitNow();
+}
+
+/// Quit, after asking when a terminal still runs a program (core
+/// `needsConfirmQuit`, which with the GX idle-process check lets idle
+/// shells pass).
+fn confirmQuit(self: *App) void {
+    if (self.core_app.needsConfirmQuit()) {
+        const owner = if (self.targetWindow(.app)) |window| window.hwnd else null;
+        if (Dialogs.confirmQuit(owner) != .accept) return;
+    }
+    self.quitNow();
+}
+
+fn quitNow(self: *App) void {
+    self.quit_requested = true;
+    w32.PostQuitMessage(0);
 }
 
 /// Show a Windows balloon notification via Shell_NotifyIconW.
@@ -1959,9 +2116,16 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     @memcpy(nid.szTip[0..tip.len], tip);
     nid.szTip[tip.len] = 0;
 
-    // Add the icon, show notification, then remove the icon.
-    _ = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid);
-    _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
+    // Add the icon with the balloon, then remove the icon. While the icon
+    // of an earlier notification still exists adding fails and modifying
+    // it shows the new balloon; doing both would show it twice.
+    const shown = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0 or
+        w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid) != 0;
+    if (shown) {
+        log.info("desktop notification shown surface_id={x}", .{self.notif_desktop_surface_id});
+    } else {
+        log.warn("desktop notification could not be shown", .{});
+    }
 
     // Schedule icon removal via a timer.
     _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
@@ -2038,6 +2202,11 @@ fn surfaceWndProc(
             // message loop. This is the safe place to call closeSplitSurface
             // (outside of core_surface callbacks).
             surface.parent_window.closeSplitSurface(surface);
+            return 0;
+        },
+
+        Surface.WM_APP_CONFIRM_CLOSE => {
+            surface.confirmClose();
             return 0;
         },
 
@@ -2281,11 +2450,17 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == WM_APP_QUIT) {
+        app.confirmQuit();
+        return 0;
+    }
+
     if (msg == WM_APP_TRAY) {
         // wparam = uID, lparam = NIN_* event. We only act on
         // NIN_BALLOONUSERCLICK on the desktop notification.
         const event: u32 = @intCast(lparam & 0xFFFF);
         if (wparam == NOTIF_DESKTOP_UID and event == w32.NIN_BALLOONUSERCLICK) {
+            log.info("desktop notification clicked surface_id={x}", .{app.notif_desktop_surface_id});
             // Focus the surface that produced the notification (click-to-
             // focus, matching macOS/GTK).
             if (app.notif_desktop_surface_id != 0) {
@@ -2335,4 +2510,66 @@ fn msgWndProc(
 test "export terminal IO requires a surface target" {
     var app: App = undefined;
     try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
+}
+
+test "commandConfigured reads the recorded configuration inputs" {
+    const testing = std.testing;
+    const cli = @import("../../cli.zig");
+
+    var config: Config = try .default(testing.allocator);
+    defer config.deinit();
+    try testing.expect(!commandConfigured(config._replay_steps.items));
+
+    const Load = struct {
+        fn lines(cfg: *Config, text: []const u8) !void {
+            var reader: std.Io.Reader = .fixed(text);
+            var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+            try cfg.loadIter(testing.allocator, &iter);
+        }
+    };
+    try Load.lines(&config, "font-size = 13\n");
+    try testing.expect(!commandConfigured(config._replay_steps.items));
+    try Load.lines(&config, "command = pwsh -NoLogo\n");
+    try testing.expect(commandConfigured(config._replay_steps.items));
+    // An empty value resets `command` to its default.
+    try Load.lines(&config, "command =\n");
+    try testing.expect(!commandConfigured(config._replay_steps.items));
+    try Load.lines(&config, "command = direct:cmd.exe\n");
+    try testing.expect(commandConfigured(config._replay_steps.items));
+
+    // The arguments after `-e` are the initial command, not configuration.
+    const Step = std.meta.Elem(@TypeOf(config._replay_steps.items));
+    try testing.expect(!commandConfigured(&[_]Step{ .@"-e", .{ .arg = "--command=pwsh" } }));
+    try testing.expect(commandConfigured(&[_]Step{ .{ .arg = "--command=pwsh" }, .@"-e", .{ .arg = "--command=" } }));
+}
+
+test "restoreTrailingBackslash repairs quoted drive roots" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `--working-directory="C:\"` arrives as `C:"`.
+    try testing.expectEqualStrings("C:\\", (try restoreTrailingBackslash(alloc, "C:\"")).?);
+    try testing.expectEqualStrings("D:\\My Files\\", (try restoreTrailingBackslash(alloc, "D:\\My Files\"")).?);
+    try testing.expectEqualStrings("\\\\server\\share\\", (try restoreTrailingBackslash(alloc, "\\\\server\\share\"")).?);
+    try testing.expectEqualStrings("C:\\", (try restoreTrailingBackslash(alloc, "C:\\\"\"")).?);
+
+    try testing.expectEqual(null, try restoreTrailingBackslash(alloc, "C:\\"));
+    try testing.expectEqual(null, try restoreTrailingBackslash(alloc, "C:\\Users\\me"));
+    try testing.expectEqual(null, try restoreTrailingBackslash(alloc, "\""));
+    try testing.expectEqual(null, try restoreTrailingBackslash(alloc, ""));
+}
+
+test "validWindowsPath rejects characters file names cannot contain" {
+    const testing = std.testing;
+    try testing.expect(validWindowsPath("C:\\"));
+    try testing.expect(validWindowsPath("D:\\My Files\\项目"));
+    try testing.expect(validWindowsPath("\\\\?\\C:\\Users\\me"));
+    try testing.expect(validWindowsPath("~/projects"));
+    try testing.expect(!validWindowsPath("C:\""));
+    try testing.expect(!validWindowsPath("C:\\a\"b"));
+    try testing.expect(!validWindowsPath("C:\\a|b"));
+    try testing.expect(!validWindowsPath("C:\\*"));
+    try testing.expect(!validWindowsPath("C:\\a\nb"));
 }

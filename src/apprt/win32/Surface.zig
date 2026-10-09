@@ -19,6 +19,7 @@ const terminal = @import("../../terminal/main.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 const global = @import("../../global.zig");
+const gx_win32_input = @import("../../gx/win32_input.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
@@ -91,6 +92,18 @@ ime_composing: bool = false,
 /// PostMessage) is then suppressed to avoid double input. Reset to false
 /// when WM_CHAR arrives (whether suppressed or processed).
 key_event_produced_text: bool = false,
+
+/// ToUnicode output of the latest key message, the text of its
+/// win32-input-mode record (`gx_win32_input.KeyMessage.text`).
+key_utf16: [4]u16 = undefined,
+
+/// Scan codes of keys whose press went to the IME (VK_PROCESSKEY), so
+/// handleKeyEvent does not report their release as a key of its own.
+ime_keys: std.StaticBitSet(256) = .initEmpty(),
+
+/// Whether the log already noted that this terminal sends win32-input-mode
+/// records (`noteWin32InputMode`).
+win32_input_logged: bool = false,
 
 /// Whether the user is actively dragging a window border/titlebar.
 /// During live resize, handleResize blocks until the renderer draws
@@ -288,6 +301,9 @@ pub fn initWithOptions(
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
         config.@"shell-integration" = .detect;
+    } else if (app.default_command) |command| {
+        // `command` is not configured: the default launch profile.
+        config.command = try command.clone(config.arenaAlloc());
     }
     if (options.title) |title| {
         config.title = try config.arenaAlloc().dupeZ(u8, title);
@@ -446,24 +462,35 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     };
 }
 
+/// Posted by `close` when the terminal to close still runs a program;
+/// surfaceWndProc hands it to `confirmClose`.
+pub const WM_APP_CONFIRM_CLOSE: u32 = w32.WM_APP + 0x60;
+
+/// Close this terminal. `process_active` is the core's
+/// `needsConfirmQuit`: with the GX idle-process check, true only while a
+/// program other than an idle shell runs, so then the user is asked
+/// first. The core calls this from its callbacks (a `close_surface`
+/// binding, the child exiting), where the surface must stay alive, so
+/// both the question and the close run from the message loop: WM_CLOSE
+/// reaches `Window.closeSplitSurface` through surfaceWndProc.
 pub fn close(self: *Surface, process_active: bool) void {
     log.debug("Surface.close called process_active={}", .{process_active});
-    // If a shell command is still running, prompt the user before
-    // closing. Without this, Ctrl+Shift+W silently kills the running
-    // process — macOS shows the same kind of dialog for parity. We
-    // only prompt for programmatic close paths; the X-button path
-    // bypasses needsConfirmQuit entirely (cmd.exe lacks OSC 133 so
-    // the core would return process_active=true unconditionally).
-    if (process_active) {
-        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd) != .accept) return;
-    }
-    // Defer destruction to the message loop via PostMessage.
-    // This avoids calling surface.deinit() from inside core_surface
-    // callbacks (during tick), which causes reentrancy and crashes.
-    // The WM_CLOSE handler in surfaceWndProc will call closeTab.
     if (self.hwnd) |hwnd| {
-        _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+        _ = w32.PostMessageW(hwnd, if (process_active) WM_APP_CONFIRM_CLOSE else w32.WM_CLOSE, 0, 0);
     }
+}
+
+/// Handle `WM_APP_CONFIRM_CLOSE`: ask whether to close this terminal while
+/// it still runs a program, then close it. The dialog's modal loop keeps
+/// dispatching messages and can close the terminal meanwhile.
+pub fn confirmClose(self: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.core_surface_ready and self.core_surface.needsConfirmQuit()) {
+        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd) != .accept) return;
+        const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+        if (userdata == 0 or @as(usize, @bitCast(userdata)) != @intFromPtr(self)) return;
+    }
+    self.parent_window.closeSplitSurface(self);
 }
 
 pub fn supportsClipboard(
@@ -940,14 +967,30 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
 }
 
 /// Handle WM_KEYDOWN / WM_SYSKEYDOWN / WM_KEYUP / WM_SYSKEYUP.
+///
+/// Every message also reaches the core as a `gx_win32_input.KeyMessage`
+/// (`gxWin32KeyCallback`), so while the terminal has win32-input-mode on
+/// (ConPTY requests it) the key goes to the pty as a KEY_EVENT_RECORD:
+/// presses, repeats and releases, modifier keys included. See
+/// src/gx/win32_input.zig for the contract.
 pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
     if (!self.core_surface_ready) return;
     const vk: u16 = @intCast(wparam & 0xFFFF);
+    // Bits 16-23 of lparam. Bit 24 is the extended-key flag, not part of
+    // the scancode; including it broke ToUnicode for AltGr layouts
+    // (German, Polish) and arrow/numpad keys.
+    const scancode: u8 = @truncate(@as(usize, @bitCast(lparam)) >> 16);
 
     // When the IME is active, physical key presses arrive as VK_PROCESSKEY.
     // The IME will produce the composed text via WM_IME_COMPOSITION — skip
-    // the key event so we don't feed garbage to the terminal.
-    if (vk == w32.VK_PROCESSKEY) return;
+    // the key event so we don't feed garbage to the terminal. The release
+    // of such a key can still arrive with its real virtual-key code;
+    // remember the key so that release is not reported on its own.
+    if (vk == w32.VK_PROCESSKEY) {
+        self.ime_keys.setValue(scancode, action == .press);
+        return;
+    }
+    if (action == .press) self.ime_keys.unset(scancode);
 
     // VK_PACKET is sent by SendInput with KEYEVENTF_UNICODE (used by
     // accessibility tools, on-screen keyboards, and Unicode injection).
@@ -987,29 +1030,41 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     // ToUnicode produces text below.
     self.key_event_produced_text = false;
 
-    if ((actual_action == .press or actual_action == .repeat) and !isModifierVk(vk)) {
-        // App.run skips TranslateMessage for surface keyboard messages, so
-        // this ToUnicode call owns the per-queue dead-key state. result>0
-        // means composed text (including composition with a previously
-        // pending dead key); result<0 means VK is itself a dead key and
-        // ToUnicode just stored it for the next call.
-        var keyboard_state: [256]u8 = undefined;
-        if (w32.GetKeyboardState(&keyboard_state) != 0) {
-            // Mask to 8 bits — bit 24 of lparam is the extended-key flag,
-            // not part of the scancode. Including it broke ToUnicode for
-            // AltGr layouts (German, Polish) and arrow/numpad keys.
-            const scancode: u32 = @intCast((lparam >> 16) & 0xFF);
-            var utf16_buf: [4]u16 = undefined;
+    // The modifier and lock state for this message, read for every key
+    // (modifiers and releases included) as the console host would.
+    var keyboard_state: [256]u8 = undefined;
+    const have_keyboard_state = w32.GetKeyboardState(&keyboard_state) != 0;
+    if (!have_keyboard_state) @memset(&keyboard_state, 0);
+    var message: gx_win32_input.KeyMessage = .{
+        .vk = vk,
+        .lparam = lparam,
+        .down = action == .press,
+        .state = .fromKeyboardState(&keyboard_state),
+    };
+
+    if (have_keyboard_state and !isModifierVk(vk)) {
+        // ToUnicode's raw UTF-16 output, control characters included, is
+        // the record's character. The buffer lives in the surface so the
+        // message never points into a finished call.
+        const utf16_buf = &self.key_utf16;
+        if (actual_action == .press or actual_action == .repeat) {
+            // App.run skips TranslateMessage for surface keyboard messages,
+            // so this ToUnicode call owns the per-queue dead-key state.
+            // result>0 means composed text (including composition with a
+            // previously pending dead key); result<0 means VK is itself a
+            // dead key and ToUnicode just stored it for the next call.
             const result = w32.ToUnicode(
                 @intCast(vk),
                 scancode,
                 &keyboard_state,
-                &utf16_buf,
+                utf16_buf,
                 utf16_buf.len,
                 0,
             );
+            if (result < 0) message.dead = true;
             if (result > 0) {
                 const utf16_slice = utf16_buf[0..@intCast(result)];
+                message.text = utf16_slice;
                 // Skip Ctrl-induced control chars (0x01-0x1A): the core
                 // handles modifier combos via key + mods, and emitting
                 // the control char here would double-encode.
@@ -1038,6 +1093,20 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
                     }
                 }
             }
+        } else {
+            // A release record carries the key's character too. Translate
+            // without changing the keyboard state, so a pending dead key
+            // survives for the next press.
+            const result = w32.ToUnicode(
+                @intCast(vk),
+                scancode,
+                &keyboard_state,
+                utf16_buf,
+                utf16_buf.len,
+                tounicode_keep_state,
+            );
+            if (result < 0) message.dead = true;
+            if (result > 0) message.text = utf16_buf[0..@intCast(result)];
         }
     }
 
@@ -1050,9 +1119,40 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
         .unshifted_codepoint = unshifted_codepoint,
     };
 
-    _ = self.core_surface.keyCallback(event) catch |err| {
+    // The press of this key went to the IME, so its release is not
+    // reported on its own either.
+    if (action == .release and self.ime_keys.isSet(scancode)) {
+        self.ime_keys.unset(scancode);
+        _ = self.core_surface.keyCallback(event) catch |err| {
+            log.err("key callback error: {}", .{err});
+        };
+        return;
+    }
+
+    const effect = self.core_surface.gxWin32KeyCallback(event, message) catch |err| {
         log.err("key callback error: {}", .{err});
+        return;
     };
+    if (effect != .closed) self.noteWin32InputMode();
+}
+
+/// ToUnicode wFlags bit 2: translate without changing the keyboard state
+/// (Windows 10 version 1607 and later).
+const tounicode_keep_state: u32 = 0x4;
+
+/// Log once per terminal when its key input starts going out as
+/// win32-input-mode records, i.e. ConPTY (or a program) turned the mode on.
+fn noteWin32InputMode(self: *Surface) void {
+    if (self.win32_input_logged) return;
+    const core_surface = &self.core_surface;
+    const active = active: {
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        break :active gx_win32_input.active(&core_surface.io.terminal);
+    };
+    if (!active) return;
+    self.win32_input_logged = true;
+    log.info("win32-input-mode (9001) active: keys go to the pty as KEY_EVENT_RECORDs", .{});
 }
 
 /// Handle WM_CHAR — character input after translation.
@@ -1094,15 +1194,16 @@ pub fn handleCharEvent(self: *Surface, wparam: usize) void {
 
     // Send through keyCallback with .unidentified key — this is the
     // standard path for IME/text input (same as GTK's imCommit).
-    // keyCallback will encode the utf8 text and write it to the PTY.
-    _ = self.core_surface.keyCallback(.{
+    // keyCallback will encode the utf8 text and write it to the PTY, as
+    // VK = 0 records while win32-input-mode is on.
+    _ = self.core_surface.gxWin32KeyCallback(.{
         .action = .press,
         .key = .unidentified,
         .mods = .{},
         .consumed_mods = .{},
         .composing = false,
         .utf8 = utf8_buf[0..len],
-    }) catch |err| {
+    }, null) catch |err| {
         log.err("text input callback error: {}", .{err});
     };
 }
@@ -1232,8 +1333,9 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
     }) orelse return;
     defer alloc.free(text);
 
-    // Send through keyCallback as text so it goes through the same
-    // path as IME/clipboard input (PTY-bound, encoding-correct).
+    // Send through keyCallback as text (PTY-bound, encoding-correct).
+    // Like a paste, and as in Windows Terminal, the paths stay raw text
+    // even while win32-input-mode is on, so this is not gxWin32KeyCallback.
     _ = self.core_surface.keyCallback(.{
         .action = .press,
         .key = .unidentified,
@@ -1465,15 +1567,16 @@ fn sendImeText(self: *Surface, utf16: []const u16) void {
     if (len == 0) return;
 
     // Send through keyCallback with .unidentified key — this is the
-    // standard path for IME/text input (same as GTK's imCommit).
-    _ = self.core_surface.keyCallback(.{
+    // standard path for IME/text input (same as GTK's imCommit); VK = 0
+    // records while win32-input-mode is on.
+    _ = self.core_surface.gxWin32KeyCallback(.{
         .action = .press,
         .key = .unidentified,
         .mods = .{},
         .consumed_mods = .{},
         .composing = false,
         .utf8 = utf8_buf[0..len],
-    }) catch |err| {
+    }, null) catch |err| {
         log.err("IME text callback error: {}", .{err});
     };
 }

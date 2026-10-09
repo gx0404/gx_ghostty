@@ -659,3 +659,9 @@ msgstr "输入关键字搜索 {count} 个主题…"
 
 msgid "Navigation"
 msgstr "导航"
+#. win32 W5b
+msgid "Close Tabs?"
+msgstr "关闭这些标签页吗？"
+
+msgid "Processes are still running in the tabs being closed. Close them anyway?"
+msgstr "要关闭的标签页中仍有进程在运行，仍要关闭吗？"

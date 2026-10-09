@@ -73,6 +73,7 @@
 | GX-0015 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0015` | active |
 | GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |
 | GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |
+| GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -838,3 +839,43 @@ GTK 冒烟（Xvfb，`just wsl smoke`）：开 2–3 个标签页与一个分屏�
 ### 测试锁定
 
 只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定与配色由 `src/gx/app_mode.zig`、`src/gx/gtk_css.zig` 的单测锁定；GTK 胶水代码（`src/apprt/gtk/gx/`）没有单测，靠 GTK 构建与冒烟截图验证。
+
+## GX-0021 输入法预编辑后的字形游标不越界
+
+- 文件：`src/renderer/generic.zig`，`rebuildRow` 中预编辑区之后追赶字形游标的 `while` 条件加上 `shaper_cells_i < shaper_cells_unwrapped.len`。
+- 标记：`fork(gx): GX-0021`，改动行上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，改 1 行、加 1 行标记注释。
+
+### 原因
+
+`rebuildRow` 跳过输入法预编辑（preedit）覆盖的格子后，要把字形游标 `shaper_cells_i` 追到当前格子：先找到覆盖该格的 shaping run，再把游标推进到第一个 x 不小于当前格的字形。run 的 `cells` 按格子计数，而 shaping 只为有内容的格子产生字形，带背景色的空格子也在 run 里却没有字形；当前格之后不再有字形时，上游这个循环没有下界检查，读到 `shaper_cells_unwrapped[len]`，Debug 构建 panic（`index out of bounds`），渲染线程崩溃带走整个进程。Windows 上 GX 默认中文界面，系统输入法常为微软拼音，在 herdr 这类整屏铺背景色的 TUI 里只要按下一个字母开始拼音组字就会触发；上游 main（2026-10-08 的 b115e4567）同样如此。
+
+### 行为
+
+游标追到 run 的字形末尾即停；随后本行的主循环本来就会在游标到达末尾时取下一个 run（`shaper_cells_i >= shaper_cells.?.len`），空格子没有字形可画，结果与上游在不越界时完全相同。其余渲染路径不变。
+
+### 上游状态
+
+未回馈上游。这是上游的通用缺陷，适合回馈；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游改写预编辑追赶逻辑时，取上游版本，确认推进 `shaper_cells_i` 的循环仍有 `< len` 的边界；上游已自带边界时按「移除条件」处理。
+
+### 移除条件
+
+上游修复该越界（循环带上界或改写追赶逻辑）后，删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GUI：微软拼音中文模式下，在 Ghostty GX 里运行 herdr，在窗格中按字母开始组字（预编辑内联显示），不再崩溃；上屏后文字到达窗格。
+
+### 测试锁定
+
+只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。
