@@ -1,6 +1,8 @@
 // Ported from shiweis/ghostty-windows@119b9270c (MIT). Copyright (c) Shiwei Song and Ghostty contributors.
-//! Win32 application runtime. Manages the Win32 window class, message loop,
-//! and surface (window) lifecycle.
+//! Win32 application runtime. Manages the Win32 window classes, the
+//! message loop, the window list and performs the apprt actions the core
+//! sends (`performAction`), delegating window chrome to `Window` and
+//! surface popups, menus and dialogs to `Surface` and the `ui/` modules.
 const App = @This();
 
 const std = @import("std");
@@ -18,6 +20,8 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
+const Backdrop = @import("chrome/Backdrop.zig");
+const Dialogs = @import("ui/Dialogs.zig");
 
 const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
@@ -277,78 +281,7 @@ pub fn run(self: *App) !void {
         // Intercept keystrokes destined for popup edit controls so
         // Enter/Escape/Arrow keys can be handled by our code.
         if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null) {
-            const vk: u16 = @intCast(msg.wParam & 0xFFFF);
-
-            // Check if this edit is a tab rename edit
-            if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
-                for (self.windows.items) |win| {
-                    if (win.rename_edit != null and win.rename_edit.? == msg.hwnd) {
-                        if (vk == w32.VK_RETURN) {
-                            win.finishTabRename();
-                        } else {
-                            win.cancelTabRename();
-                        }
-                        continue :loop;
-                    }
-                }
-            }
-
-            // Find the parent surface of this edit control
-            const parent = w32.GetParent(msg.hwnd.?);
-            if (parent) |p| {
-                const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
-                if (userdata != 0) {
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
-                    if (surface.search_active and surface.search_edit == msg.hwnd) {
-                        if (surface.handleSearchKey(vk)) continue;
-                    }
-                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                        if (surface.handlePaletteKey(vk)) continue;
-                    }
-                }
-            }
-
-            // Bubble global keybindings from popup edit controls (tab
-            // rename, command palette, search) up to the surface so that
-            // e.g. `Ctrl+Shift+P` while renaming actually toggles the
-            // palette instead of being eaten by the Edit. Excludes
-            // Ctrl-only A/C/V/X/Y/Z so standard text-edit shortcuts keep
-            // working inside the popup.
-            const ctrl_held = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
-            const shift_held = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
-            const route_key = ctrl_held and (shift_held or !isEditShortcutVk(vk));
-            if (route_key) {
-                const target_surface: ?*Surface = blk: {
-                    // Tab rename edit lives on the Window, not a surface.
-                    // Commit (not cancel) — matches standard Win32 inline
-                    // rename convention (Explorer, Edge): any action that
-                    // takes focus away saves the typed title.
-                    for (self.windows.items) |win| {
-                        if (win.rename_edit != null and win.rename_edit.? == msg.hwnd) {
-                            win.finishTabRename();
-                            break :blk win.getActiveSurface();
-                        }
-                    }
-                    // Palette/search edits are children of a surface HWND.
-                    const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
-                    const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
-                    if (ud == 0) break :blk null;
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
-                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                        surface.setCommandPaletteActive(false);
-                        break :blk surface;
-                    }
-                    if (surface.search_active and surface.search_edit == msg.hwnd) {
-                        surface.setSearchActive(false, &[_:0]u8{});
-                        break :blk surface;
-                    }
-                    break :blk null;
-                };
-                if (target_surface) |s| {
-                    s.handleKeyEvent(msg.wParam, msg.lParam, .press);
-                    continue :loop;
-                }
-            }
+            if (self.routeEditKey(&msg)) continue :loop;
         }
 
         // Skip TranslateMessage for keyboard events on terminal surface
@@ -376,6 +309,88 @@ pub fn run(self: *App) !void {
         if (!skip_translate) _ = w32.TranslateMessage(&msg);
         _ = w32.DispatchMessageW(&msg);
     }
+}
+
+/// The chrome or popup element that owns a focused Edit control.
+const EditOwner = union(enum) {
+    rename: *Window,
+    palette: *Surface,
+    search: *Surface,
+};
+
+/// Find which tab rename, palette or search Edit control `hwnd` is.
+fn findEditOwner(self: *App, hwnd: w32.HWND) ?EditOwner {
+    for (self.windows.items) |win| {
+        if (findEditOwnerIn(win, hwnd)) |owner| return owner;
+    }
+    if (self.quick_terminal) |qt| return findEditOwnerIn(qt.window, hwnd);
+    return null;
+}
+
+fn findEditOwnerIn(win: *Window, hwnd: w32.HWND) ?EditOwner {
+    if (win.tab_bar.isRenameEdit(hwnd)) return .{ .rename = win };
+    for (0..win.tab_count) |i| {
+        var it = win.tab_trees[i].iterator();
+        while (it.next()) |entry| {
+            const surface = entry.view;
+            if (surface.palette.active and surface.palette.ownsEdit(hwnd)) return .{ .palette = surface };
+            if (surface.search_bar.active and surface.search_bar.ownsEdit(hwnd)) return .{ .search = surface };
+        }
+    }
+    return null;
+}
+
+/// Handle a WM_KEYDOWN for one of the chrome/popup Edit controls before
+/// it is translated: Enter/Escape/arrows drive the rename, palette and
+/// search popups, and Ctrl/Ctrl+Shift keybindings bubble up to the
+/// surface. Returns true when the message was consumed.
+fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
+    const hwnd = msg.hwnd orelse return false;
+    const owner = self.findEditOwner(hwnd) orelse return false;
+    const vk: u16 = @intCast(msg.wParam & 0xFFFF);
+
+    switch (owner) {
+        .rename => |win| if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
+            if (vk == w32.VK_RETURN) {
+                win.tab_bar.finishRename();
+            } else {
+                win.tab_bar.cancelRename();
+            }
+            return true;
+        },
+        .search => |surface| if (surface.search_bar.handleKey(vk)) return true,
+        .palette => |surface| if (surface.palette.handleKey(vk)) return true,
+    }
+
+    // Bubble global keybindings from popup edit controls (tab rename,
+    // command palette, search) up to the surface so that e.g.
+    // `Ctrl+Shift+P` while renaming actually toggles the palette instead
+    // of being eaten by the Edit. Excludes Ctrl-only A/C/V/X/Y/Z so
+    // standard text-edit shortcuts keep working inside the popup.
+    const ctrl_held = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+    const shift_held = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+    if (!(ctrl_held and (shift_held or !isEditShortcutVk(vk)))) return false;
+
+    const target: ?*Surface = switch (owner) {
+        // Commit (not cancel) — matches standard Win32 inline rename
+        // convention (Explorer, Edge): any action that takes focus away
+        // saves the typed title.
+        .rename => |win| target: {
+            win.tab_bar.finishRename();
+            break :target win.getActiveSurface();
+        },
+        .palette => |surface| target: {
+            surface.palette.setActive(false);
+            break :target surface;
+        },
+        .search => |surface| target: {
+            surface.search_bar.setActive(false, &[_:0]u8{});
+            break :target surface;
+        },
+    };
+    const surface = target orelse return false;
+    surface.handleKeyEvent(msg.wParam, msg.lParam, .press);
+    return true;
 }
 
 pub fn terminate(self: *App) void {
@@ -476,8 +491,7 @@ pub fn performAction(
                 .surface => |cs| blk: {
                     if (self.config.@"background-opacity" >= 1.0) break :blk false;
                     const h = cs.rt_surface.parent_window.hwnd orelse break :blk false;
-                    const ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
-                    break :blk (ex & w32.WS_EX_LAYERED) == 0;
+                    break :blk !Backdrop.isTranslucent(h);
                 },
             };
 
@@ -670,7 +684,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.setSearchActive(true, value.needle);
+                    core_surface.rt_surface.search_bar.setActive(true, value.needle);
                 },
             }
             return true;
@@ -680,7 +694,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.setSearchActive(false, "");
+                    core_surface.rt_surface.search_bar.setActive(false, "");
                 },
             }
             return true;
@@ -690,7 +704,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.setSearchTotal(value.total);
+                    core_surface.rt_surface.search_bar.setTotal(value.total);
                 },
             }
             return true;
@@ -700,7 +714,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.setSearchSelected(value.selected);
+                    core_surface.rt_surface.search_bar.setSelected(value.selected);
                 },
             }
             return true;
@@ -849,33 +863,10 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const exit_code = value.exit_code;
-                    if (exit_code != 0) {
-                        // Show a message box including the actual exit code.
-                        const hwnd_val = core_surface.rt_surface.parent_window.hwnd;
-                        var utf8_buf: [128]u8 = undefined;
-                        const msg_utf8 = std.fmt.bufPrint(
-                            &utf8_buf,
-                            "The shell process exited with code {d}.",
-                            .{exit_code},
-                        ) catch "The shell process exited unexpectedly.";
-
-                        var utf16_buf: [256]u16 = undefined;
-                        const utf16_len = std.unicode.utf8ToUtf16Le(&utf16_buf, msg_utf8) catch {
-                            _ = w32.MessageBoxW(
-                                hwnd_val,
-                                std.unicode.utf8ToUtf16LeStringLiteral("The shell process exited unexpectedly."),
-                                std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-                                w32.MB_ICONWARNING,
-                            );
-                            return true;
-                        };
-                        utf16_buf[utf16_len] = 0;
-                        _ = w32.MessageBoxW(
-                            hwnd_val,
-                            @ptrCast(&utf16_buf),
-                            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-                            w32.MB_ICONWARNING,
+                    if (value.exit_code != 0) {
+                        Dialogs.showChildExited(
+                            core_surface.rt_surface.parent_window.hwnd,
+                            value.exit_code,
                         );
                     }
                 },
@@ -906,26 +897,7 @@ pub fn performAction(
                 .app => {},
                 .surface => |core_surface| {
                     if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        const current_ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
-                        if (current_ex & w32.WS_EX_LAYERED != 0) {
-                            // Remove layered style (restore full opacity).
-                            // Clearing WS_EX_LAYERED is not repainted
-                            // automatically — without an explicit redraw the
-                            // window stays translucent until the next
-                            // repaint (e.g. a later focus change).
-                            _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex & ~w32.WS_EX_LAYERED);
-                            _ = w32.RedrawWindow(
-                                h,
-                                null,
-                                null,
-                                w32.RDW_ERASE | w32.RDW_INVALIDATE | w32.RDW_FRAME | w32.RDW_ALLCHILDREN,
-                            );
-                        } else {
-                            // Apply opacity from config
-                            _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex | w32.WS_EX_LAYERED);
-                            const alpha: u8 = @intFromFloat(@round(self.config.@"background-opacity" * 255.0));
-                            _ = w32.SetLayeredWindowAttributes(h, 0, alpha, w32.LWA_ALPHA);
-                        }
+                        Backdrop.toggleOpacity(h, self.config.@"background-opacity");
                     }
                 },
             }
@@ -1334,8 +1306,8 @@ pub fn performAction(
                 .surface => |core_surface| blk: {
                     const window = core_surface.rt_surface.parent_window;
                     switch (value) {
-                        .surface, .tab => window.startTabRename(window.active_tab),
-                        .window => window.startWindowRename(),
+                        .surface, .tab => window.tab_bar.startRename(window.active_tab),
+                        .window => window.tab_bar.startWindowRename(),
                     }
                     break :blk true;
                 },
@@ -1349,8 +1321,8 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const active = core_surface.rt_surface.palette_active;
-                    core_surface.rt_surface.setCommandPaletteActive(!active);
+                    const palette = &core_surface.rt_surface.palette;
+                    palette.setActive(!palette.active);
                 },
             }
             return true;
@@ -1494,37 +1466,21 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
         .surface => |core_surface| core_surface.rt_surface.parent_window.hwnd,
     };
 
-    var file_buf: [32768]u16 = std.mem.zeroes([32768]u16);
-    const default_name = std.unicode.utf8ToUtf16LeStringLiteral("ghostty-terminal-io.txt");
-    @memcpy(file_buf[0..default_name.len], default_name);
-
-    // The common-dialog filter is a sequence of NUL-terminated label/pattern
-    // pairs followed by an additional NUL.
-    const filter = std.unicode.utf8ToUtf16LeStringLiteral(
-        "Text files (*.txt)\x00*.txt\x00All files (*.*)\x00*.*\x00",
-    );
-    var dialog: w32.OPENFILENAMEW = std.mem.zeroes(w32.OPENFILENAMEW);
-    dialog.lStructSize = @sizeOf(w32.OPENFILENAMEW);
-    dialog.hwndOwner = owner;
-    dialog.lpstrFilter = filter;
-    dialog.nFilterIndex = 1;
-    dialog.lpstrFile = &file_buf;
-    dialog.nMaxFile = file_buf.len;
-    dialog.lpstrTitle = std.unicode.utf8ToUtf16LeStringLiteral("Export Terminal IO Events");
-    dialog.lpstrDefExt = std.unicode.utf8ToUtf16LeStringLiteral("txt");
-    dialog.Flags = w32.OFN_EXPLORER |
-        w32.OFN_NOCHANGEDIR |
-        w32.OFN_PATHMUSTEXIST |
-        w32.OFN_OVERWRITEPROMPT;
-
-    // Cancellation is a handled action, just with no file written.
-    if (w32.GetSaveFileNameW(&dialog) == 0) return true;
-
-    const path_len = std.mem.indexOfScalar(u16, &file_buf, 0) orelse file_buf.len;
     const alloc = self.core_app.alloc;
-    const path = std.unicode.utf16LeToUtf8Alloc(alloc, file_buf[0..path_len]) catch |err| {
-        log.warn("unable to decode terminal IO export path: {}", .{err});
+    const path = Dialogs.saveFilePath(alloc, owner, .{
+        .title = "Export Terminal IO Events",
+        .default_name = "ghostty-terminal-io.txt",
+        .default_ext = "txt",
+        .filters = &.{
+            .{ .label = "Text files (*.txt)", .pattern = "*.txt" },
+            .{ .label = "All files (*.*)", .pattern = "*.*" },
+        },
+    }) catch |err| {
+        log.warn("unable to choose the terminal IO export path: {}", .{err});
         return false;
+    } orelse {
+        // Cancellation is a handled action, just with no file written.
+        return true;
     };
     defer alloc.free(path);
 
@@ -1848,11 +1804,8 @@ fn surfaceWndProc(
     else
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
-    // Guard: verify this is a surface window or one of its popups.
-    const is_surface_window = surface.hwnd != null and surface.hwnd.? == hwnd;
-    const is_search_popup = surface.search_hwnd != null and surface.search_hwnd.? == hwnd;
-    const is_palette_popup = surface.palette_hwnd != null and surface.palette_hwnd.? == hwnd;
-    if (!is_surface_window and !is_search_popup and !is_palette_popup)
+    // Guard: verify this is the surface window itself.
+    if (surface.hwnd == null or surface.hwnd.? != hwnd)
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
@@ -1929,10 +1882,6 @@ fn surfaceWndProc(
         },
 
         w32.WM_PAINT => {
-            if (is_palette_popup) {
-                surface.paintPalette(hwnd);
-                return 0;
-            }
             // Validate the paint region to stop Windows from
             // sending more WM_PAINT messages, then wake the
             // renderer thread to redraw.
@@ -2039,20 +1988,6 @@ fn surfaceWndProc(
         },
 
         w32.WM_LBUTTONDOWN => {
-            if (is_palette_popup) {
-                const y: i32 = @intCast(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
-                const sc = surface.scale;
-                const list_top: i32 = @intFromFloat(@round(Surface.PALETTE_LIST_TOP * sc));
-                const item_height: i32 = @intFromFloat(@round(Surface.PALETTE_ITEM_HEIGHT * sc));
-                if (y >= list_top) {
-                    const clicked = @divTrunc(y - list_top, item_height);
-                    if (clicked >= 0 and clicked < surface.palette_count) {
-                        surface.palette_selected = @intCast(clicked);
-                        surface.executePaletteSelection();
-                    }
-                }
-                return 0;
-            }
             // Take keyboard focus on click. WS_CHILD windows don't
             // auto-focus the way top-level windows do, so without this
             // an active sibling popup edit (tab rename, search, palette)
@@ -2125,74 +2060,6 @@ fn surfaceWndProc(
             const hit_test: u16 = @intCast(lparam & 0xFFFF);
             if (hit_test == w32.HTCLIENT and surface.handleSetCursor()) {
                 return 1; // TRUE = we set the cursor
-            }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
-        w32.WM_COMMAND => {
-            const notification: u16 = @intCast((wparam >> 16) & 0xFFFF);
-            const control_id: u16 = @intCast(wparam & 0xFFFF);
-            if (control_id == Surface.SEARCH_EDIT_ID and notification == w32.EN_CHANGE) {
-                surface.handleSearchChange();
-                return 0;
-            }
-            if (control_id == Surface.PALETTE_EDIT_ID and notification == w32.EN_CHANGE) {
-                surface.handlePaletteChange();
-                return 0;
-            }
-            // Auto-dismiss popups when the Edit loses focus (click outside,
-            // Alt+Tab away). Matches standard popup UX (VS Code palette,
-            // macOS Spotlight). The dismiss helpers clear *_active first,
-            // so any re-entrant EN_KILLFOCUS during ShowWindow(SW_HIDE) /
-            // SetFocus falls through these guards as a no-op.
-            if (notification == w32.EN_KILLFOCUS) {
-                if (control_id == Surface.PALETTE_EDIT_ID and surface.palette_active) {
-                    surface.setCommandPaletteActive(false);
-                    return 0;
-                }
-                if (control_id == Surface.SEARCH_EDIT_ID and surface.search_active) {
-                    surface.setSearchActive(false, &[_:0]u8{});
-                    return 0;
-                }
-            }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
-        w32.WM_CTLCOLOREDIT => {
-            // Dark mode colors for search/palette edit controls
-            const hdc_edit: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_edit, w32.RGB(220, 220, 220));
-            _ = w32.SetBkColor(hdc_edit, if (is_palette_popup) w32.RGB(30, 30, 30) else w32.RGB(45, 45, 45));
-            if (is_palette_popup) {
-                if (surface.palette_brush) |brush| {
-                    return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
-                }
-            }
-            if (surface.app.bg_brush) |brush| {
-                return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
-            }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
-        w32.WM_CTLCOLORSTATIC => {
-            // Dark mode colors for the search match-count label.
-            const hdc_static: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_static, w32.RGB(160, 160, 160));
-            _ = w32.SetBkColor(hdc_static, w32.RGB(45, 45, 45));
-            if (surface.app.bg_brush) |brush| {
-                return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
-            }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
-        w32.WM_ACTIVATE => {
-            // Dismiss command palette when it loses focus
-            if (is_palette_popup) {
-                const activate = @as(u16, @intCast(wparam & 0xFFFF));
-                if (activate == 0) { // WA_INACTIVE
-                    surface.setCommandPaletteActive(false);
-                }
-                return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
