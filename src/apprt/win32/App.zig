@@ -82,6 +82,15 @@ windows: std.ArrayList(*Window) = .empty,
 /// matching the terminal background so the flash is invisible.
 bg_brush: ?w32.HBRUSH = null,
 
+/// Whether DWM can compose the terminals' frames with their alpha, so
+/// the window material and `background-opacity` show per pixel
+/// (`Backdrop.alphaFramesSupported`, decided once at startup).
+alpha_frames: bool = false,
+
+/// The `background-opacity` that `toggle_background_opacity` restores
+/// while it holds the terminals opaque (per-pixel translucency only).
+opaque_restore: ?f64 = null,
+
 /// Quit timer state, mirroring GTK's three-state approach:
 /// - off: no quit pending
 /// - active: timer is running (waiting for delay to expire)
@@ -133,6 +142,11 @@ pub fn init(
     const hinstance = w32.GetModuleHandleW(null) orelse
         return error.Win32Error;
 
+    // The Ghostty GX defaults give a window material a background opacity
+    // only where the material can show behind the terminals.
+    const alpha_frames = Backdrop.alphaFramesSupported(&core_app.device);
+    gx.config_layers.setMaterialOpacity(alpha_frames);
+
     // Load the configuration for this application.
     const alloc = core_app.alloc;
     var config = Config.load(alloc) catch |err| err: {
@@ -162,6 +176,7 @@ pub fn init(
         .config = config,
         .hinstance = hinstance,
         .bg_brush = bg_brush,
+        .alpha_frames = alpha_frames,
         .default_command_arena = .init(alloc),
     };
     errdefer self.default_command_arena.deinit();
@@ -540,6 +555,8 @@ pub fn performAction(
             const force_opaque: bool = switch (target) {
                 .app => false,
                 .surface => |cs| blk: {
+                    // Per-pixel translucency toggles the configuration.
+                    if (self.alpha_frames) break :blk false;
                     if (self.config.@"background-opacity" >= 1.0) break :blk false;
                     const h = cs.rt_surface.parent_window.hwnd orelse break :blk false;
                     break :blk !Backdrop.isTranslucent(h);
@@ -879,6 +896,7 @@ pub fn performAction(
                     return true;
                 };
                 defer new_config.deinit();
+                if (self.opaque_restore != null) self.holdOpaque(&new_config);
                 self.core_app.updateConfig(self, &new_config) catch |err| {
                     log.err("config update error: {}", .{err});
                 };
@@ -921,7 +939,9 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
+                    if (self.alpha_frames) {
+                        self.toggleBackgroundOpaque();
+                    } else if (core_surface.rt_surface.parent_window.hwnd) |h| {
                         Backdrop.toggleOpacity(h, self.config.@"background-opacity");
                     }
                 },
@@ -1675,6 +1695,45 @@ fn updateConfig(self: *App, config: *const Config) void {
     }
 }
 
+/// `toggle_background_opacity` with per-pixel translucency: every window
+/// switches between the configured `background-opacity` and an opaque
+/// background, as on macOS. The renderers draw the opacity, so the switch
+/// is a configuration input the core hands to every surface (and that
+/// theme and conditional reloads replay).
+fn toggleBackgroundOpaque(self: *App) void {
+    const restore = self.opaque_restore;
+    if (restore == null and self.config.@"background-opacity" >= 1.0) return;
+    var config = self.config.clone(self.core_app.alloc) catch |err| {
+        log.err("error toggling the background opacity err={}", .{err});
+        return;
+    };
+    defer config.deinit();
+    if (restore) |opacity| {
+        self.opaque_restore = null;
+        self.setBackgroundOpacity(&config, opacity);
+    } else {
+        self.holdOpaque(&config);
+    }
+    self.core_app.updateConfig(self, &config) catch |err| {
+        log.err("config update error: {}", .{err});
+    };
+}
+
+/// Make `config` opaque while `toggle_background_opacity` holds the
+/// terminals opaque, remembering its opacity for the next toggle.
+fn holdOpaque(self: *App, config: *Config) void {
+    self.opaque_restore = config.@"background-opacity";
+    self.setBackgroundOpacity(config, 1.0);
+}
+
+fn setBackgroundOpacity(self: *App, config: *Config, opacity: f64) void {
+    var buf: [64]u8 = undefined;
+    const arg = std.fmt.bufPrintZ(&buf, "--background-opacity={d}", .{opacity}) catch return;
+    gx.config_layers.applyArg(config, self.core_app.alloc, arg) catch |err| {
+        log.err("error setting the background opacity err={}", .{err});
+    };
+}
+
 /// Open the configuration with the Windows file association.
 fn openConfigWithOs(self: *App, path: [:0]const u8) bool {
     const alloc = self.core_app.alloc;
@@ -2225,13 +2284,18 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Fill with the configured background color to prevent
-            // a visible flash during resize. The OpenGL renderer will
-            // overwrite the entire client area on the next frame.
-            if (surface.app.bg_brush) |brush| {
-                const hdc_erase: w32.HDC = @ptrFromInt(wparam);
-                var rect: w32.RECT = undefined;
-                if (w32.GetClientRect(hwnd, &rect) != 0) {
+            // Fill with the configured background color (at the
+            // background opacity when DWM composes the window per pixel)
+            // to prevent a visible flash during resize. The OpenGL
+            // renderer will overwrite the entire client area on the next
+            // frame.
+            const hdc_erase: w32.HDC = @ptrFromInt(wparam);
+            var rect: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &rect) != 0) {
+                const config = &surface.app.config;
+                if (Backdrop.perPixel(config, surface.app.alpha_frames)) {
+                    Backdrop.fillBackground(hdc_erase, rect, config);
+                } else if (surface.app.bg_brush) |brush| {
                     _ = w32.FillRect(hdc_erase, &rect, brush);
                 }
             }

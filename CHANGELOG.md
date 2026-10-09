@@ -11,6 +11,10 @@
 
 ## 0.0.2(TBD)
 
+### Changed
+
+- Windows 窗口材质透到整个终端区：`gx-window-material = mica|acrylic|tabbed` 不再只透在标题栏，终端背景按 `background-opacity` 透出材质，文字、光标、选区与图片保持不透明，分屏间隙一样透出。没设 `background-opacity` 时材质自带默认值（同 WezTerm GX）：Mica、Tabbed 为 0.3，Acrylic 为 0.75；显式设置（包括 `background-opacity = 1`，只在标题栏透出材质）优先。`solid` 配 `background-opacity` 小于 1 时改为只有终端背景透明、桌面透过来，文字不再随整窗变淡，`background-blur` 照常模糊透出的桌面；`toggle_background_opacity` 改为所有窗口一起在配置的不透明度与不透明之间切换（同 macOS）。需要 Windows 11 22H2（build 22621）及以上与硬件 OpenGL 驱动；更早的系统、Mesa 软件渲染（`GHOSTTY_GX_OPENGL=software`）或像素格式没有 alpha 时保持 0.0.1 的行为，日志记一行原因。
+
 ## 0.0.1(2026-10-10)
 
 Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应用，两端共用 GX 核心与默认配置，并有 fork 自己的发布链与开发框架。括号里的 GX-NNNN 是 `docs/FORK_PATCHES.md` 登记的上游源码补丁。

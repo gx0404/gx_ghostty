@@ -15,7 +15,7 @@
 | `App.zig` | 注册窗口类 `GhosttyWindow`、`GhosttyTerminal`（`CS_OWNDC`）与消息专用窗口 `GhosttyMsg`；消息循环 `run`、`wakeup`、`performAction`、`gxAction`；默认 shell（`updateDefaultCommand`）、全局热键、托盘通知、任务栏进度、退出计时 |
 | `Window.zig` | 顶层窗口：标签模型（每个标签一棵 split tree）、分屏布局、DPI、窗口位置（首窗约为显示器工作区的 80%）、首帧前 cloak、herdr 应用模式（`updateAppMode`）、关闭标签与窗口 |
 | `Surface.zig` | 每个终端一个子 HWND：按键、IME、鼠标、拖放、剪贴板、标题与光标；持有 `palette`、`search_bar`、`link_preview`、`scrollbar` 与 `frame_event` |
-| `chrome/TitleBar.zig`、`chrome/TabBar.zig`、`chrome/Backdrop.zig` | 集成标题栏（`WM_NCCALCSIZE`、`WM_NCHITTEST`、Snap Layouts、系统菜单）；Direct2D 标签栏；DWM 主题与窗口材质（`gx-window-material`） |
+| `chrome/TitleBar.zig`、`chrome/TabBar.zig`、`chrome/Backdrop.zig` | 集成标题栏（`WM_NCCALCSIZE`、`WM_NCHITTEST`、Snap Layouts、系统菜单）；Direct2D 标签栏；DWM 主题、窗口材质（`gx-window-material`）与按像素透明（`background-opacity`） |
 | `ui/d2d.zig`、`ui/style.zig`、`ui/Popup.zig` | 手写的 Direct2D/DirectWrite COM 绑定与 `Canvas`（单位 DIP）；由终端配色派生的设计 token；可复用弹层（DWM 圆角、每显示器 DPI、可接输入法的 `TextInput`） |
 | `ui/Palette.zig`、`ui/Keybinds.zig`、`ui/fuzzy.zig`、`ui/trigger.zig` | 命令面板、快捷键速查表、模糊匹配与 frecency、绑定键帽 |
 | `ui/Menu.zig`、`ui/MenuPopup.zig` | 主菜单、启动配置菜单、标签与终端右键菜单；按主题自绘的模态菜单 |
@@ -57,6 +57,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 - 模态循环：菜单、对话框、`MessageBoxW` 与另存为对话框都会继续派发消息，任何对象都可能在其间被释放。返回后重新解析 Window 与 Surface，不沿用调用前的裸指针；对话框打开期间窗口推迟自己的 `WM_CLOSE`，最外层对话框返回后再投递。窗口与终端销毁时清零 `GWLP_USERDATA`，窗口过程据此丢弃迟到的消息。
 - 菜单只从窗口消息里打开：绑定动作经 `Window.queueMainMenu` 投递 `WM_APP_MAIN_MENU`，同一时刻只开一个菜单。
 - Direct2D 可能不可用（`App.uiFactory` 返回 null）：自绘 UI 要有退路，对话框退回 `MessageBoxW`。
+- 按像素合成：`Backdrop.perPixel` 为真的顶层窗口开了 DWM blur-behind（空区域），DWM 按客户区像素的 alpha 合成，GDI 画出的像素 alpha 为 0、等于全透明。在顶层窗口与终端子窗口上作画一律经预乘 32bpp DIB（`Backdrop.fillBackground`、`fillOpaque`，标题栏的 Direct2D DIB），不直接用 `FillRect` 或画笔；能否按像素合成在启动时由 `Backdrop.alphaFramesSupported` 定一次（`App.alpha_frames`）。
 - 新增自定义消息或计时器先查上表，同一 HWND 不重号，`WM_TIMER` 分派保持完整，并把新 ID 写进上表。
 - 配置：`App.config` 只在 GUI 线程的 `config_change` 中替换；设计 token 绘制时由当前配置派生（`ui/style.zig`），不跨线程缓存 `*const Config`。
 
