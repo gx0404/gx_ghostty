@@ -507,6 +507,8 @@ pub extern "user32" fn SetCapture(
 
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
 
+pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
+
 pub extern "user32" fn GetWindowLongW(
     hWnd: HWND,
     nIndex: i32,

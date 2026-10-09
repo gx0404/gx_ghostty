@@ -22,6 +22,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
+const d2d = @import("ui/d2d.zig");
 
 const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
@@ -103,6 +104,10 @@ taskbar: ?*w32.ITaskbarList3 = null,
 notif_desktop_surface_id: u64 = 0,
 /// Whether CoInitializeEx has been called on the main thread.
 com_initialized: bool = false,
+
+/// Direct2D/DirectWrite state of the custom-drawn UI (popups, chrome),
+/// created on first use by `uiFactory`.
+ui_factory: ?*d2d.Factory = null,
 
 pub fn init(
     self: *App,
@@ -434,6 +439,12 @@ pub fn terminate(self: *App) void {
         self.bg_brush = null;
     }
 
+    // After the windows: their popups draw with the factory.
+    if (self.ui_factory) |factory| {
+        factory.destroy();
+        self.ui_factory = null;
+    }
+
     if (self.msg_class_atom != 0) {
         _ = w32.UnregisterClassW(MSG_CLASS_NAME, self.hinstance);
         self.msg_class_atom = 0;
@@ -448,6 +459,17 @@ pub fn terminate(self: *App) void {
     }
 
     self.config.deinit();
+}
+
+/// The Direct2D/DirectWrite factory of the custom-drawn UI, created on
+/// first use. Null when Direct2D is unavailable.
+pub fn uiFactory(self: *App) ?*d2d.Factory {
+    if (self.ui_factory) |factory| return factory;
+    self.ui_factory = d2d.Factory.create(self.core_app.alloc) catch |err| {
+        log.warn("Direct2D UI unavailable err={}", .{err});
+        return null;
+    };
+    return self.ui_factory;
 }
 
 /// Wake up the message loop from any thread by posting a message
