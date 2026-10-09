@@ -1,5 +1,5 @@
 {
- "chunk_count": 1414,
+ "chunk_count": 1415,
  "chunks": [
   {
    "anchor": "Agent Development Guide",
@@ -3539,9 +3539,16 @@
   {
    "anchor": "gx_ghostty fork 文档索引 > fork 文档",
    "doc": "docs/README.md",
-   "id": "docs-readme-md-gx-ghostty-fork-文档索引-fork-文档",
-   "source_sha256": "1651518e0b46342201eb81075d5ae1f2243d51fdbcc0afe065a70a0dfb0ad13e",
-   "text": "## fork 文档\n\n| 文档 | 用途 |\n|---|---|\n| [ARCHITECTURE.md](ARCHITECTURE.md) | 代码架构：产物与平台矩阵、仓库布局、入口、核心对象与状态所有者、线程与数据流、跨语言契约、关键不变量、生成物、版本推导、上游同步面 |\n| [DEVELOPMENT.md](DEVELOPMENT.md) | 开发流程：首次准备、九步日常闭环、Windows 注意事项、分支模型、上游同步、提交规范、生成物重建时机 |\n| [MAKE_COMMANDS.md](MAKE_COMMANDS.md) | 命令手册：每个 `just` 配方的作用、前置、副作用与退出码，环境变量，上游 `Makefile` 目标 |\n| [TESTING.md](TESTING.md) | 测试与证据：分层（能证明 / 不能代证）、CI 与本机的覆盖差异、Windows 限制、故障注入、PASS / FAIL / PENDING / N/A 规则 |\n| [RELEASE.md](RELEASE.md) | 版本与发布：产品版本与 fork 版本两套体系、`gx-vX.Y.Z` tag 与构建版本串、定版步骤、`gx-release` 的 job 与资产校验、回滚、在 fork 上首次启用 Actions |\n| [AI_TOOLS.md](AI_TOOLS.md) | AI 工具面：Claude Code、Codex、ZCode 等客户端的规则加载、共享的 hook 安全门策略，以及逐客户端验证账本 |\n| [FORK_PATCHES.md](FORK_PATCHES.md) | fork 对上游源码的补丁登记：补丁 ID、位置、原因、锁定测试与移除条件 |\n| [AGENT_RULES/README.md](AGENT_RULES/README.md) | 领域规则的加载方式与维护方法；机器真源是 [AGENT_RULES/routes.toml](AGENT_RULES/routes.toml)（路径与任务到领域文档的路由，以及上游嵌套 `AGENTS.md` 的登记） |\n| `kb/chunks.json` | agent 知识库，生成物：`just kb` 生成，`just kb-check` 校验，`just kb-query <词>` 检索；不要手改 |\n\n代码图谱产物在仓库根的 `graphify-out/`：只入库 `GRAPH_REPORT.md` 与 `source-fingerprint.json`，约 20 MB 的 `graph.json` 由 `just graph` 在本机重建、不入库。两类生成物的输入与重建时机见 DEVELOPMENT.md「生成物重建时机」。"
+   "id": "docs-readme-md-gx-ghostty-fork-文档索引-fork-文档-part1",
+   "source_sha256": "d83917a02f838993622d470ffee276b2ddb81ed2c7b913a7dbde01932ad4a402",
+   "text": "## fork 文档\n\n| 文档 | 用途 |\n|---|---|\n| [GX_FEATURES.md](GX_FEATURES.md) | 产品功能清单：WezTerm GX 与 Ghostty GX（Windows、Linux GTK、macOS）逐项对照，借鉴的社区做法，没有实现的功能 |\n| [ARCHITECTURE.md](ARCHITECTURE.md) | 代码架构：产物与平台矩阵、仓库布局、入口、核心对象与状态所有者、线程与数据流（含 WGL 与 EGL/DMABUF 两条呈现路径）、win32 apprt 的模块与自绘界面、GX 共享核心与配置分层、GTK 的 GX 层、跨语言契约、关键不变量、生成物、版本推导、打包与发布产物、上游同步面 |\n| [DEVELOPMENT.md](DEVELOPMENT.md) | 开发流程：首次准备、九步日常闭环、Windows 开发（构建运行、隔离配置、日志、随包 ConPTY 与 Mesa、打包）、WSL 上的 Linux GTK、分支模型、上游同步与补丁热点、提交规范、生成物重建时机 |\n| [MAKE_COMMANDS.md](MAKE_COMMANDS.md) | 命令手册：每个 `just` 配方的作用、前置、副作用与退出码（含 `just package-windows`、`just stage`、`just wsl`），环境变量，上游 `Makefile` 目标 |\n| [TESTING.md](TESTING.md) | 测试与证据：分层（能证明 / 不能代证）、Windows GUI 验证、并行运行器与耗时、CI 与本机的覆盖差异、Windows 本机与 WSL 的限制、故障注入、PASS / FAIL / PENDING / N/A 规则 |\n| [RELEASE.md](RELEASE.md) | 版本与发布：产品版本与 fork 版本两套体系、`gx-vX.Y.Z` tag 与构建版本串、0.0.1 的发版步骤、`gx-release` 的 job、资产清单与 `manifest.json`、校验、回滚、GX Shell 的跟进、在 fork 上首次启用 Actions |\n| [AI_TOOLS.md](AI_TOOLS.md) | AI 工具面：Claude Code、Codex、ZCode 等客户端的规则加载、共享的 hook 安全门策略，以及逐客户端验证账本 |\n| [FORK_PATCHES.md](FORK_PATCHES.md) | fork 对上游源码的补丁登记（GX-0001～GX-0021，未用的编号不复用）：补丁 ID、文件与标记、原因、行为、同步冲突处理、移除条件、验证与锁定测试 |\n| [AGENT_RULES/README.md](AGENT_RULES/README.md) | 领域规则的加载方式与维护方法；机器真源是 [AGENT_RULES/routes.toml](AGENT_RULES/routes.toml)（路径与任务到领域文档的路由，以及上游嵌套 `AGENTS.md` 的登记） |\n| `kb/chunks.json` | agent 知识库，生成物：`just kb` 生成，`just kb-check` 校验，`just kb-query <词>` 检索；不要手改 |"
+  },
+  {
+   "anchor": "gx_ghostty fork 文档索引 > fork 文档",
+   "doc": "docs/README.md",
+   "id": "docs-readme-md-gx-ghostty-fork-文档索引-fork-文档-part2",
+   "source_sha256": "d83917a02f838993622d470ffee276b2ddb81ed2c7b913a7dbde01932ad4a402",
+   "text": "代码图谱产物在仓库根的 `graphify-out/`：只入库 `GRAPH_REPORT.md` 与 `source-fingerprint.json`，约 20 MB 的 `graph.json` 由 `just graph` 在本机重建、不入库。两类生成物的输入与重建时机见 DEVELOPMENT.md「生成物重建时机」。"
   },
   {
    "anchor": "gx_ghostty fork 文档索引 > 上游文档（权威来源，fork 不修改）",
@@ -3554,8 +3561,8 @@
    "anchor": "gx_ghostty fork 文档索引 > 从哪里开始",
    "doc": "docs/README.md",
    "id": "docs-readme-md-gx-ghostty-fork-文档索引-从哪里开始",
-   "source_sha256": "3f7a773f24d7364ee59e982c12137030661a956589729575f329ae9b67563037",
-   "text": "## 从哪里开始\n\n- 第一次进入本仓：按 DEVELOPMENT.md「首次准备」依次运行 `just setup`、`just doctor`、`just install-hooks`。\n- agent 每轮任务：读根 `AGENTS.md`，再 `just rules <本轮路径…>` 加载领域规则与适用的上游嵌套 `AGENTS.md`，然后按 DEVELOPMENT.md 的九步闭环交付。\n- 找命令用 `just --list` 或 MAKE_COMMANDS.md；判断某项验证属于哪一层、本机能否证明，看 TESTING.md。"
+   "source_sha256": "f807b15398836b38d2d9950b18af67a0c2eb2dc53de904cd7f1ea52b89bf816e",
+   "text": "## 从哪里开始\n\n- 第一次进入本仓：先读 GX_FEATURES.md 了解 Ghostty GX 做了什么，再按 DEVELOPMENT.md「首次准备」依次运行 `just setup`、`just doctor`、`just install-hooks`。\n- agent 每轮任务：读根 `AGENTS.md`，再 `just rules <本轮路径…>` 加载领域规则与适用的上游嵌套 `AGENTS.md`，然后按 DEVELOPMENT.md 的九步闭环交付。\n- 找命令用 `just --list` 或 MAKE_COMMANDS.md；判断某项验证属于哪一层、本机能否证明，看 TESTING.md。"
   },
   {
    "anchor": "gx_ghostty fork 文档索引 > 约定",
