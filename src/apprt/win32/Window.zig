@@ -31,6 +31,7 @@ const TitleBar = @import("chrome/TitleBar.zig");
 const Dialogs = @import("ui/Dialogs.zig");
 const Menu = @import("ui/Menu.zig");
 const ResizeOverlay = @import("ui/ResizeOverlay.zig");
+const Settings = @import("ui/Settings.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -317,6 +318,8 @@ pub fn resizeForSurface(
 
 /// Deinitialize the Window: close all tabs, delete fonts, destroy HWND.
 pub fn deinit(self: *Window) void {
+    Settings.onWindowDestroyed(self);
+
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
 
@@ -1322,6 +1325,7 @@ fn cleanupAllSurfaces(self: *Window) void {
 /// Surfaces are already cleaned up by close() before DestroyWindow.
 fn onDestroy(self: *Window) void {
     const app = self.app;
+    Settings.onWindowDestroyed(self);
 
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
     if (self.is_quick_terminal) {

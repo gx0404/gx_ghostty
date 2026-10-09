@@ -612,3 +612,31 @@ msgstr "显示全部键盘快捷键。"
 
 msgid "Open the main menu."
 msgstr "打开主菜单。"
+
+#. win32 W2: settings overlay
+msgid "Current default: {name}"
+msgstr "当前默认：{name}"
+
+msgid "Open Configuration Directory"
+msgstr "打开配置目录"
+
+msgid "All window materials are supported on this system (build {build})."
+msgstr "当前系统支持全部窗口材质（Windows 内部版本 {build}）。"
+
+msgid "Dimmed materials are not supported on this system (build {build})."
+msgstr "当前系统不支持灰显的材质（Windows 内部版本 {build}）。"
+
+msgid "Search font families…"
+msgstr "搜索字体…"
+
+msgid "No matching fonts"
+msgstr "没有匹配的字体"
+
+msgid "Switch Section"
+msgstr "切换分类"
+
+msgid "Previewing {name}"
+msgstr "正在预览：{name}"
+
+msgid "Settings saved."
+msgstr "设置已保存。"
