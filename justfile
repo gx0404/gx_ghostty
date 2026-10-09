@@ -90,9 +90,9 @@ install-hooks:
 commit-check *a:
     {{python}} scripts/conventional_commits.py {{a}}
 
-# zig build（参数原样透传）
+# zig build（参数原样透传）；Windows 上未给 -Dtarget 时补 -Dtarget=x86_64-windows-gnu，构建 win32 应用
 build *a:
-    {{python}} scripts/zigw.py build {{a}}
+    {{python}} scripts/zig_build.py {{a}}
 
 # zig_test.py 先构建 test-bin，再把 ghostty-test 的用例分片到 --jobs N 个进程（默认 CPU 数），-D… 透传 zig build；
 # ghostty-test 不能为 Windows 编译（上游翻译 pwd.h 等 POSIX 头），Windows 上不构建、直接退出 2，主套件以 gx-ci linux-main 为准
