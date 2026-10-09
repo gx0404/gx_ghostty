@@ -46,7 +46,7 @@ Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应�
 
 **开发框架与工具**
 
-- AI 协作框架：根 `AGENTS.md` 的 fork 段、`docs/AGENT_RULES/` 的 20 份领域规则与 `just rules`；Claude Code、Codex、ZCode 的 PreToolUse hook 共用一份危险操作策略，真实接入状态见 `docs/AI_TOOLS.md`。
+- AI 协作框架：根 `AGENTS.md` 的 fork 段、`docs/AGENT_RULES/` 的 22 份领域规则与 `just rules`；Claude Code、Codex、ZCode 的 PreToolUse hook 共用一份危险操作策略，真实接入状态见 `docs/AI_TOOLS.md`。
 - `just` 命令入口（Windows 与 Linux/macOS 用法相同）：`just setup` 把钉版 Zig 0.16.0 与 graphify 装进仓库内的 `.local/`（`--innosetup` 另装 Inno Setup 7.1），不做系统级安装；并行测试运行器 `scripts/zig_test.py`（`just test-vt`、`just test`，运行期 `--filter` 不重新编译，失败时打印复现命令）与 `scripts/run_unittests.py`（`just framework-test`），测试二进制由 `test-lib-vt-bin`、`test-bin` 步骤构建（GX-0002）；另有代码图谱与知识库（`just graph*`、`just kb*`）、GX 翻译表（`just i18n`）、WSL 入口 `just wsl` 与提交规范 `type(scope): 中文描述`。
 
 ### Changed
