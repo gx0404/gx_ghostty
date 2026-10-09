@@ -30,7 +30,7 @@
 | NixOS VM | 按 `HACKING.md` 运行 `nix run .#checks.<system>.<test-name>.driver`，全部用 `nix flake check` | Nix，手动执行 | `nix/tests.nix` 定义的 GUI 与集成场景 | 非 NixOS 环境 |
 | 上游 lint | 按 `HACKING.md`「Linting」一节运行 prettier、alejandra、shellcheck、swiftlint | 对应工具，本机均未安装 | 文档、Nix、shell、Swift 符合上游 lint 规则 | fork CI 不跑这些检查；没实际跑过就不能声称通过 |
 
-聚合入口：`just framework-check` = rules-check → version-check → framework-test → kb-check，不需要 Zig，本机约 15 s；`just ci-check` = framework-check → fmt-check → test-vt，提交前必跑，热缓存约 100 s，改过 Zig 源码另加约 2 min 编译（见下节）；`just generated-check` = kb-check → graph-check，上游同步后与发版前必跑。valgrind、fuzz、esctest、benchmark、NixOS VM 与上游 lint 是上游的手动流程，fork 不提供专门的 just 配方，也不进 CI。
+聚合入口：`just framework-check` = rules-check → version-check → framework-test → kb-check → i18n-check，不需要 Zig，本机约 15 s；`just ci-check` = framework-check → fmt-check → test-vt，提交前必跑，热缓存约 100 s，改过 Zig 源码另加约 2 min 编译（见下节）；`just generated-check` = kb-check → i18n-check → graph-check，上游同步后与发版前必跑。valgrind、fuzz、esctest、benchmark、NixOS VM 与上游 lint 是上游的手动流程，fork 不提供专门的 just 配方，也不进 CI。
 
 示例、`test/fuzz-libghostty` 与 `test/esctest` 是各带 `build.zig` 的子工程，`just` 配方总在仓库根执行、进不了这些目录；表中子工程里的 `zig build …` 都在该目录用钉版 Zig 运行，即 `python ../../scripts/zigw.py build …`（Linux/macOS 用 `python3`）。
 

@@ -70,7 +70,7 @@ Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领�
 - 上游 `ghostty-org/ghostty`（remote `upstream`），fork `gx0404/gx_ghostty`（remote `origin`）。`main` 只快进镜像上游；`gx_ghostty` 是开发与发布分支。
 - 同步用 merge：`main` 快进到 `upstream/main` 后合入 `gx_ghostty`。永不 force push，永不推送 `upstream`；流程见 `docs/DEVELOPMENT.md`。
 - 上文 Issue and PR Guidelines 照常适用：agent 不创建 issue 或 PR，上游与本 fork 都一样。
-- 改动过的上游文件只有本文件、`.gitignore`、`.prettierignore`（带标记的追加段）、`src/build/Config.zig`（补丁 GX-0001）、`build.zig`（补丁 GX-0002）与归档的 workflow；fork 文件一律用上游没有的新路径。
+- 改动过的上游文件只有本文件、`.gitignore`、`.prettierignore`（带标记的追加段）、`src/build/Config.zig`（补丁 GX-0001）、`build.zig`（补丁 GX-0002）、`src/config/Config.zig`（补丁 GX-0010）与归档的 workflow；fork 文件一律用上游没有的新路径（GX 共享核心在 `src/gx/`）。
 - 改上游源码必须加 `fork(gx): GX-NNNN` 标记并登记到 `docs/FORK_PATCHES.md`，`scripts/test_fork_patches.py` 锁定闭集。
 - `.github/workflows/` 只启用 `gx-ci.yml` 与 `gx-release.yml`；上游 workflow 原样归档在 `.github/workflows-archive/`，同步带来的新 workflow 也 `git mv` 进去，不得重新启用。
 - 根 `CHANGELOG.md` 只记 fork 的可观察变更（上游没有 CHANGELOG）；产品版本仍以 `build.zig.zon` 为真源。
@@ -99,7 +99,8 @@ zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitigno
 | `just framework-test` / `just framework-check` / `just ci-check` | 框架单测（`scripts/run_unittests.py` 并行）/ 框架聚合门 / 再加 fmt-check 与 test-vt（热缓存约 100 s） |
 | `just graph` / `just graph-check` / `just graph-query <q>` | 图谱重建 / 新鲜度 / 查询 |
 | `just kb` / `just kb-check` / `just kb-query <q>` | 知识库构建 / 校验 / 检索 |
-| `just generated-check` | kb-check 与 graph-check（同步后、发版前） |
+| `just i18n` / `just i18n-check` | 由 `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` 重建 / 校验 GX 翻译表 |
+| `just generated-check` | kb-check、i18n-check 与 graph-check（同步后、发版前） |
 | `just install-hooks` / `just commit-check <a>` | 启用 `.githooks` / 校验提交信息 |
 
 Windows 上非 vt 的 Zig 代码编译不过：`src/build/SharedDeps.zig::add` 给 libghostty-internal 与 `ghostty-test` 无条件加 translate-c 导入 `posix_c`（含 `pwd.h`），所以 `just build` 退出 1（库用 `just build-vt`），`just test` 直接退出 2；这部分的编译与完整单测本机记 PENDING，由 `gx-ci` 的 `linux-main` 补证。改过 Zig 源码后，测试二进制要用 LLVM 重编约 2 min，属正常耗时（`docs/TESTING.md`「并行运行器与耗时」）。Windows 未开开发者模式时，全量 `just test-vt` 固定有 4 处 `src/lib/tinyio` 符号链接用例报 `PermissionDenied`：这是环境前置，不是回归，记 FAIL 并写明原因，不跳过、不改用例（见 `docs/TESTING.md`）。全表与副作用见 `docs/MAKE_COMMANDS.md`。
@@ -115,7 +116,7 @@ Windows 上非 vt 的 Zig 代码编译不过：`src/build/SharedDeps.zig::add` �
 - **嵌入边界**：`include/ghostty.h` 是只供 macOS app 的 libghostty-internal，外部嵌入方用 libghostty-vt；Swift 只经 `ghostty.h`/`module.modulemap` 访问核心（`libghostty-embedding.md`、`macos-app.md`）。
 - **配置即文档**：`src/config/Config.zig` 字段的 doc comment 生成用户文档，用 Pandoc Markdown 写（`config.md`）。
 - **i18n**：GTK 可见字符串用 `_`/`N_`/`C_` 标记，pot 经 `update-translations` 步骤同步；macOS 未本地化（`apprt-gtk.md`）。
-- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
+- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json`、`src/gx/i18n/zh_CN.zig` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
 - **工具链本地性**：Zig 与 graphify 只经 `just setup` 装进 `.local/`，禁止 winget/choco/scoop/msiexec 等系统级安装（`development.md`）。
 
 ## 提交规范

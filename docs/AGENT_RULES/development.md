@@ -53,8 +53,8 @@
 ### just 入口与四个门
 
 - `justfile` 在 Windows 经 `cmd.exe` 执行（`set windows-shell`），解释器在 Windows 取 `python`、其余取 `python3`；配方体只写单条命令（Python 脚本调用，`install-hooks` 是 `git config`），串联的门用配方依赖表达，不写 POSIX 守卫或多行 shell。`.githooks/commit-msg` 必须以可执行模式入库（`git add --chmod=+x`），由提交规范测试锁定。默认配方 `just --list`。上游 `Makefile` 不改，也不作 fork 入口。
-- `just framework-check`：rules-check → version-check → framework-test → kb-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
-- `just generated-check`：kb-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑同样两项检查。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
+- `just framework-check`：rules-check → version-check → framework-test → kb-check → i18n-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
+- `just generated-check`：kb-check → i18n-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑 kb、graph 两项。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
 - `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含 Windows 编不出的完整单测），需要钉版 Zig；本机热缓存实测约 100 s，改过 Zig 源码另加约 2 min 编译。「所有测试 ≤2 min」尚未完全达成，不得自行排除冷编译或用本机结果代证 CI，详见 `docs/TESTING.md`。
 - `just doctor`：`setup_env.py --check` 只读诊断，标 FOUND / MISSING / OPTIONAL；必需项是 zig、python、git、venv、graphify 与 Windows 上的 MSVC，缺任一项退出 1；hooksPath、Windows 符号链接权限（`symlink`）与 codex / claude / kimi / zcode 等 CLI 只作可选项报告。它只报告并给出修复命令，不隐式安装。配方参数不加引号拼进 cmd 命令行，含 shell 元字符的自由文本改为直接调用脚本。
 
@@ -73,7 +73,7 @@
 
 ### fork 补丁登记
 
-- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、`src/build/Config.zig`（GX-0001）、`build.zig`（GX-0002）以及归档的 workflow；其余框架内容都在上游没有的新路径。
+- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、`src/build/Config.zig`（GX-0001）、`build.zig`（GX-0002）、`src/config/Config.zig`（GX-0010）以及归档的 workflow；其余框架内容都在上游没有的新路径。
 - 改上游源码（`src/`、`include/`、`pkg/`、`macos/` 与 `build.zig`）必须紧邻改动写 `fork(gx): GX-NNNN` 标记注释，并在 `docs/FORK_PATCHES.md` 登记原因与移除条件；`scripts/test_fork_patches.py` 扫描这些路径，锁定标记与登记的闭集。追加段与新路径不是源码补丁，不登记。未登记的标记、无标记的上游语义改动都是缺陷；不为「顺手」重排或重格式化上游文件。
 - GX-0001：`src/build/Config.zig::init` 让 HEAD 上不以 `v` 开头的 tag（如 `gx-v0.1.0`）与 `tip` 一样跳过发布校验，退回分支预发布版本而不 `@panic`；版本契约见 `ci-release.md`。
 - GX-0002：`build.zig::build` 的三个纯新增块注册 `test-lib-vt-bin`、`test-bin`，只编译并安装测试二进制、不运行；安装路径与 `scripts/zig_test.py::SUITES` 一一对应，改一边要同步另一边。

@@ -35,7 +35,7 @@
 | `just version` | `version.py`：打印 fork 版本，即 `CHANGELOG.md` 中数值最大的 SemVer | Python | stdout 一行 `X.Y.Z` | 0；标题非法或读不到 CHANGELOG 时 1 |
 | `just version-check` | `version.py --check`：所有二级标题都是合法版本标题、版本不重复、至少一个 | Python | 只读 | 0 / 1 |
 | `just framework-test` | `run_unittests.py`：并行运行 `scripts/test_*.py` 全部框架单测。每个 `TestCase` 类是一个单元、各起一个 `python -m unittest` 子进程（定义了 `load_tests` 的模块整体算一个单元）；并发默认取逻辑核数与 8 的较小值，按耗时缓存从慢到快调度，类属性 `RUN_LAST = True` 的单元最后启动。配方不接参数；只跑一部分或改并发时直接调用 `python scripts/run_unittests.py [-j N] [--list] [--timeout 秒] [PATTERN…]`，PATTERN 取 `test_x`、`scripts/test_x.py`、`test_x.Class` 或通配符，单元时限默认 600 s；单个测试方法用 `python -m unittest scripts.test_x.Class.test_y` | Python | 测试只用临时目录，不改仓库；写耗时缓存 `.local/test-timings/unittest.json`；本机约 500 个测试、约 13 s | 0 全部通过（跳过不算失败）；1 有失败、错误、崩溃或超时；2 用法或发现错误（模块导入失败、PATTERN 未命中）；130 被中断：Ctrl+C，POSIX 上 SIGTERM、SIGHUP 也按 Ctrl+C 处理，清理子进程后退出 |
-| `just framework-check` | 聚合门：rules-check → version-check → framework-test → kb-check，不需要 Zig | Python、Git、已生成的 KB | 只读；本机约 15 s | 首个失败子项的退出码 |
+| `just framework-check` | 聚合门：rules-check → version-check → framework-test → kb-check → i18n-check，不需要 Zig | Python、Git、已生成的 KB | 只读；本机约 15 s | 首个失败子项的退出码 |
 | `just ci-check` | 聚合门：framework-check → fmt-check → test-vt，本机复现 CI 主干（不含完整单测 `just test`） | 以上，加钉版 Zig；Windows 需 MSVC | 构建缓存、`zig-out/` 与 `.local/test-timings/`；热缓存约 100 s，改过 Zig 源码另加约 2 min 编译（见 TESTING.md「并行运行器与耗时」） | 首个失败子项的退出码 |
 | `just commit-check <参数…>` | `conventional_commits.py`：校验提交标题，用 `--message-file <文件>` 或 `--range <A>..<B>`（`git log --first-parent`；A 为全零 SHA 时只查 B）；`fixup!`、`squash!`、`amend!` 提交一律不合规。脚本也接受直接给出的标题，但标题必含空格，经 just 传入会被拆成几段而误报，`>`、`&` 等字符还会被配方 shell 解释（见「约定」），单条标题改用 `python scripts/conventional_commits.py "<标题>"` | Python；`--range` 需要 Git 历史 | 只读；不合规时列出标题与原因 | 0 全部合规；1 有违规；2 用法错误或读不到输入 |
 
@@ -49,7 +49,9 @@
 | `just graph` | `graphify.py rebuild`：全量重建代码图谱，随后写入并校验指纹 | `just setup` 装好的 graphifyy 0.9.73；耗时数分钟 | 写 `graphify-out/`：入库的 `GRAPH_REPORT.md`、`source-fingerprint.json`，以及本机的 `graph.json` | 0；graphify 缺失、版本不符或抽取失败时非 0 |
 | `just graph-check` | `graphify.py check`：校验源码、管线与入库产物的指纹 | Python、Git；不需要 graphify 与 `graph.json` | 只读；`graph.json` 缺失时只提示 | 0 新鲜；过期或缺产物 2 |
 | `just graph-query <问题…>` | `graphify.py query`：在本机图谱上查询，多个词合并为一句；路径与解释查询没有配方，直接用 `python scripts/graphify.py path …` 或 `python scripts/graphify.py explain …` | 本机已有 `graph.json`（先 `just graph`） | stdout | 透传 graphify；缺 `graph.json` 时 1 |
-| `just generated-check` | 聚合门：kb-check → graph-check | 同上两项 | 只读 | 首个失败子项的退出码 |
+| `just i18n` | `gx_i18n.py`：由上游 `po/zh_CN.po` 与 fork 的 `src/gx/i18n/gx.zh_CN.po`（同一 msgid 以 fork 为准）重新生成 GX 界面的 zh-CN 翻译表；跳过 fuzzy、废弃与空译文，带 msgctxt 的条目以 `<msgctxt>\x04<msgid>` 为键，fork 条目的 `{name}` 占位符必须与原文一致 | Python | 写 `src/gx/i18n/zh_CN.zig`（按键的 UTF-8 字节序排序、LF、无时间戳，入库，审 diff）；内容不变时不写 | 0；源文件缺失、语法错误、键重复或占位符不一致 2 |
+| `just i18n-check` | `gx_i18n.py --check`：内存重新生成后与已提交的翻译表比较（CRLF 检出视同 LF） | Python | 只读 | 0 新鲜；缺失或过期 1；源文件问题 2 |
+| `just generated-check` | 聚合门：kb-check → i18n-check → graph-check | 同上三项 | 只读 | 首个失败子项的退出码 |
 
 ### 产品构建与测试
 
@@ -85,6 +87,7 @@
 | `ZIG_GLOBAL_CACHE_DIR` | Zig；`scripts/zigw.py` | Zig 全局缓存目录。未设置或为空时 `zigw.py` 设为 `.local/zig-cache/global`；显式设置的值原样保留 |
 | `GX_GHOSTTY_GRAPHIFY_CLI` | `scripts/graphify.py` | 指定 graphify CLI；未设置时先用 `.local/tools/venv` 的 `python -m graphify`（不直接执行 venv 里生成的 `graphify.exe`：Windows 智能应用控制会以 WinError 4551 拦截这个未签名启动器），再找 PATH 里的 `graphify` |
 | `GX_GHOSTTY_GRAPHIFY_ALLOW_ANY_VERSION` | `scripts/graphify.py` | 设为 `1` 时放行非钉版 graphify，只用于升级钉版前在临时副本里比对图谱 |
+| `GHOSTTY_GX_DEFAULTS` | `src/gx/config_layers.zig::enabled`（`Config.load`） | 设为 `0`、`false`、`off` 或 `no` 时，ghostty 像上游一样加载配置：没有 Ghostty GX 默认值、不读 `gui-settings.ghostty`、按上游顺序；用于对照上游行为与测试 |
 | `GX_GATE_WATCHDOG_SECONDS` | `.claude/hooks/pre_tool_use_gate.py::evaluation_deadline` | 只供测试：缩短 hook 求值看门狗（默认 `EVALUATION_DEADLINE_SECONDS`，10 秒），只认 (0, 10] 内的数，其余值一律按默认处理，所以只能缩短、不能延长。日常会话不要设置：它只会让 hook 更早超时，从而拒绝本可放行的调用 |
 
 ## 上游 Makefile 目标（原样保留）
