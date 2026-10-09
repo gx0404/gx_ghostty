@@ -53,12 +53,13 @@
 ## 验证
 
 - 路由：`just rules src/font/SharedGrid.zig`；改本文档后跑 `just framework-check`。
-- 定向单测（`src/font/discovery.zig` 的用例按字体后端自动 skip；`--filter` 可重复，运行期筛选；`just test` 只在 Linux/macOS 可跑）：
-  - `just test --filter directwrite`：`match.zig` 的样式匹配纯函数单测，所有平台都跑。
-  - Windows：`python scripts/zigw.py test src/font/directwrite/match.zig` 与 `.../com.zig`（COM 绑定）可独立运行；`freetype_windows` 的端到端发现用例随 `python scripts/zigw.py build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter=directwrite` 运行（`-Dtest-filter=windows` 含上游目录扫描查找 Arial 的用例）。
+- 定向单测（`src/font/discovery.zig` 的用例按字体后端自动 skip；`--filter` 可重复，运行期筛选）：
+  - `just test --filter directwrite`：`match.zig` 的样式匹配纯函数单测在所有平台都跑；Windows 上另含 `com.zig` 的 COM 绑定用例与 `directwrite/discovery.zig` 的端到端发现用例（Arial 四种样式、按码位回退）。
   - `just test --filter Key --filter getIndex`：grid 键与回退解析。
   - `just test --filter shape --filter Constraints`：HarfBuzz 整形与 Nerd Font 约束。
   - `just test --filter sprite --filter glyf`：sprite 与 glyf 金标准比对。
-- 编译与格式：Linux/macOS 上 `just build`；Windows 上 `python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu` 编译 `freetype_windows` 后端与 win32 app（gx-ci 不编译它，本机补证）；改 Zig 跑 `just fmt-check`。
+  - `fontconfig_freetype` 的用例只在 Linux 构建里：`just wsl test --filter font`，CI 证据是 `linux-main`。
+- 编译与格式：`just build`（Windows 主机上编译 `freetype_windows` 后端与 win32 app，gx-ci 的 `windows-app` 也编译它），Linux 用 `just wsl build`；改 Zig 跑 `just fmt-check`。
 - 改 `pkg/freetype`、`pkg/harfbuzz`、`pkg/fontconfig`：各包的 `build.zig` 自带 `test` 步骤，在包目录运行 `zig build test`；gx-ci 未覆盖，需手动补跑并记录结果。
-- PENDING：CoreText 系后端只能在 Mac 上用 `just test` 验证（上游跑过 `-Drenderer=metal -Dfont-backend=coretext_freetype`；gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，不含字体）；`fontconfig_freetype` 由 gx-ci `linux-main` job 覆盖；字形视觉效果要读回 gx-ci `gtk-smoke` 截图才算通过；`ghostty +list-fonts`、`ghostty +show-face --cp=0x41` 需要可执行文件：Linux/macOS 构建，或 Windows 的 win32 构建（GUI 子系统，输出须重定向或接管道才可见，PowerShell 用 `| Out-String`）。Windows GUI 冒烟的测试进程不要继承 `NO_COLOR`，否则 pwsh 去掉 SGR 序列，粗斜体看起来全是常规体。
+- 字形视觉效果要读过截图才算通过：Windows 按 `apprt-win32.md` 隔离启动截图（测试进程不继承 `NO_COLOR`，否则 pwsh 去掉 SGR，粗斜体都像常规体），GTK 用 `just wsl smoke` 或 `gtk-smoke`。`ghostty +list-fonts`、`ghostty +show-face --cp=0x41` 在 Windows 上要重定向或接管道才看得到输出（PowerShell 用 `| Out-String`）。
+- PENDING：CoreText 系后端只能在 Mac 上用 `just test` 验证（上游跑过 `-Drenderer=metal -Dfont-backend=coretext_freetype`；gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`，不含字体）。

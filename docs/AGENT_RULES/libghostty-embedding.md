@@ -12,7 +12,7 @@
 
 ## 符号真源
 
-- 构建分派：`build.zig::build` 在 `app_runtime == .none` 且未设 `-Demit-lib-vt` 时调用 `GhosttyLib.initShared`/`initStatic`；非 Darwin 目标安装 `include/ghostty.h` 与 `ghostty-internal.{dll,so}`、`ghostty-internal-static.lib`/`ghostty-internal.a`（Windows 上这两条链目前编译不过，见「不变量」的 Windows 条），Darwin 改由 XCFramework 打包。`src/apprt/runtime.zig::Runtime.default` 让 Windows、macOS 默认 `none`，Linux、FreeBSD 默认 `gtk`。
+- 构建分派：`build.zig::build` 在 `app_runtime == .none` 且未设 `-Demit-lib-vt` 时调用 `GhosttyLib.initShared`/`initStatic`；非 Darwin 目标安装 `include/ghostty.h` 与 `ghostty-internal.{dll,so}`、`ghostty-internal-static.lib`/`ghostty-internal.a`（Windows 上这两条链目前链接失败，见「不变量」的 Windows 条），Darwin 改由 XCFramework 打包。`src/apprt/runtime.zig::Runtime.default` 让 macOS 默认 `none`，Linux、FreeBSD 默认 `gtk`，Windows 默认 `win32`（补丁 GX-0003）。
 - apprt 选择：`src/build_config.zig::Artifact.detect` 把 `Lib` 输出判为 `.lib`，`src/apprt.zig::runtime` 随之取 `embedded`。
 - 导出收集：`src/main_c.zig` 第二个 `comptime` 块引用 `config.CApi`、`apprt.runtime.CAPI`、`src/benchmark/main.zig::CApi` 与 `src/quirks_memset.zig`；不在这条引用链上的 `export fn` 不会进库。
 - 运行时选项：`src/apprt/embedded.zig::App.Options`（即 `ghostty_runtime_config_s`，含 wakeup、action、剪贴板、close_surface 回调）、`Surface.Options`（即 `ghostty_surface_config_s`）、`PlatformTag`（0 保留为无效，macOS=1，iOS=2）。
@@ -32,7 +32,7 @@
 - 生命周期：宿主先调用 `ghostty_init` 初始化 `src/global.zig` 的全局状态（config、app、benchmark 各 API 都经 `global.alloc()` 分配），再按 config → app → surface 创建；`wakeup` 回调触发后调用 `ghostty_app_tick`。库分配的 `ghostty_string_s` 用 `ghostty_string_free` 释放，`ghostty_text_s` 用 `ghostty_surface_free_text`。
 - 平台：surface 只能建在 Darwin 视图上（其他目标的 `Platform.MacOS`、`Platform.IOS` 为 `void`，`Platform.init` 返回 `UnsupportedPlatform`）；完整构建已不支持 iOS 目标，iOS 标签只为 ABI 保留。
 - 头文件隔离：`src/build/GhosttyXCFramework.zig` 只拷贝 `ghostty.h` 与 `module.modulemap`，避免 vt 头触发 umbrella 告警；`ghostty.h` 不包含 `include/ghostty/vt/` 的任何头，`src/input/key.zig::Key` 等共享枚举同时决定两套头文件的取值。
-- Windows：默认 `app-runtime=none`，构建图因此注册 `ghostty-internal.dll` 与 `ghostty-internal-static.lib`，但两条链目前都编译不过：`GhosttyLib.initShared`/`initStatic` 经 `src/build/SharedDeps.zig::add` 无条件加入 translate-c 导入 `posix_c`，MSVC 目标找不到其中的 `pwd.h`（`build-system.md`「平台」）。构建脚本里的 Windows 处理仍在：`GhosttyLib.initShared` 在 MSVC ABI 下链接 `libvcruntime`、`libucrt` 并探测 Windows SDK 的 ucrt 目录，`src/main_c.zig::DllMain` 手工初始化静态 CRT（Zig 未处理 MSVC DLL 的 CRT 启动，属临时绕过）。C API 本身在 Windows 上也尚不受支持：`global.init` 的 `.c` 分支返回 `error.UnsupportedOSForCApi`，`ghostty_init` 因此失败，只有不依赖全局状态的函数（如 `ghostty_info`）可用。
+- Windows：只有显式 `-Dapp-runtime=none` 才注册 `ghostty-internal.dll` 与 `ghostty-internal-static.lib`。补丁 GX-0003 去掉 `posix_c` 后，windows-gnu 构建仍在链接时缺 `gladLoadGLContext`、`gladLoaderUnloadGLContext`（glad 的 `gl.c` 只编进非 lib 产物，2026-10 本机实测；`build-system.md`「平台」），MSVC 组合未验证。构建脚本里的 Windows 处理仍在：`GhosttyLib.initShared` 在 MSVC ABI 下链接 `libvcruntime`、`libucrt` 并探测 Windows SDK 的 ucrt 目录，`src/main_c.zig::DllMain` 手工初始化静态 CRT（Zig 未处理 MSVC DLL 的 CRT 启动，属临时绕过）。C API 本身在 Windows 上也尚不受支持：`global.init` 的 `.c` 分支返回 `error.UnsupportedOSForCApi`，`ghostty_init` 因此失败，只有不依赖全局状态的函数（如 `ghostty_info`）可用。
 - 版本：`ghostty_info` 与 `ghostty-internal` 的 pkg-config 用 app 版本，与 lib-vt 的 `lib_version` 无关。`ghostty_benchmark_cli` 目前总是导出（源码注释说将来可能按构建选项门控）。
 
 ## 禁止项
@@ -41,13 +41,13 @@
 - 不单改头文件或单改 Zig；不在枚举、action 列表或 extern struct 中间插入、重排或改值。
 - 不改 `include/module.modulemap` 的模块名 `GhosttyKit`，不把 vt 头加进它，也不让 `ghostty.h` 与 vt 头互相包含。
 - 不在 `main_c.zig` 引用链之外放 `export fn`，不另起导出收集方式。
-- 不声称在 Windows 上构建或验证过 `ghostty-internal.dll`（目前编译不过），也不把它当可运行的终端交付；为在 Windows 编出它或启用 C API 而改上游源码，必须先按 `docs/FORK_PATCHES.md` 登记 `fork(gx)` 补丁。
+- 不声称在 Windows 上构建或验证过 `ghostty-internal.dll`（目前链接失败），也不把它当可运行的终端交付（Windows 的终端是 win32 app）；为在 Windows 编出它或启用 C API 而改上游源码，必须先按 `docs/FORK_PATCHES.md` 登记 `fork(gx)` 补丁。
 
 ## 验证
 
 - 枚举同步：`just test --filter ghostty.h`，跑全部 `test "ghostty.h …"`（需要 translate-c 能解析头文件）；CI 上由 gx-ci `linux-main` job（`-Dapp-runtime=none` 的完整主测试）覆盖。
 - 配置读取与字符串所有权：`just test --filter ghostty_config_get`、`just test --filter c_get`、`just test --filter ghostty_string_s`。
-- Windows 本机：没有本域的编译检查。`just build` 构建 `ghostty-internal.dll`、`ghostty-internal-static.lib` 时停在 `translate-c posix_c.h`（`'pwd.h' not found`），以退出码 1 结束；`ghostty-test` 同样编不过，`just test` 直接退出 2。主测试交 gx-ci `linux-main`，本机记 PENDING；DLL 装载回归 `test/windows/test_dll_init.c`（步骤见 `test/windows/README.md`）要先有 DLL，目前无法执行，记 PENDING 并注明受阻。
+- Windows 本机：`just build -Dapp-runtime=none` 在链接 `ghostty-internal.dll` 时失败（见上），本域只有 `just test` 里的对账用例（如 `just test --filter ghostty.h`）能在本机跑；DLL 装载回归 `test/windows/test_dll_init.c`（步骤见 `test/windows/README.md`）要先有 DLL，目前无法执行，记 PENDING 并注明受阻。
 - Linux：`just build -Dapp-runtime=none` 产出 `ghostty-internal.so`（与上游 `build-linux-libghostty` job 同款）。
 - macOS：XCFramework 与 app 只能在 Mac 上按 `macos/AGENTS.md` 用 `macos/build.nu` 构建，本机 Windows 记 PENDING。gx-ci 手动触发的 `macos` job 只跑 `test-lib-vt`，覆盖不到 `ghostty.h`；端到端构建 app 的只有 `gx-release` 的可选 `macos` job（见 `ci-release.md`）。
 - 改 Zig 源码一律跑 `just fmt-check`；改 Swift 按 `macos/AGENTS.md` 跑 swiftlint。

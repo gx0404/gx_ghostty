@@ -92,7 +92,7 @@ ABI 工具：
 ## 验证
 
 - `src/lib/**`：`just test-vt --filter <名称>`（libghostty-vt 的测试根引用 `src/lib/main.zig`）。涉及 `checkGhosttyHEnum`、`compat/` 或 app 侧用法时，再跑 `just test --filter <名称>`。
-- `src/datastruct/**`、`src/tripwire.zig`、`src/quirks_memset.zig`：`just test --filter <名称>`（由 `src/main_ghostty.zig` 与 `src/main.zig` 的 test 块引用）；被 `PageList` 等终端代码使用的部分再跑 `just test-vt`。`just test` 在 Windows 上直接退出 2（`ghostty-test` 无法在 Windows 编译），以 gx-ci 的 `linux-main` job 为准。
+- `src/datastruct/**`、`src/tripwire.zig`、`src/quirks_memset.zig`：`just test --filter <名称>`（由 `src/main_ghostty.zig` 与 `src/main.zig` 的 test 块引用）；被 `PageList` 等终端代码使用的部分再跑 `just test-vt`。Windows 上的 `just test` 只编译 Windows 分支，POSIX 分支以 `just wsl test` 或 gx-ci 的 `linux-main` job 为准。
 - 定向运行要核对运行器计数表里实际运行的用例数（零命中时运行器退出 2，不论是 `--filter` 没命中还是 `-Dtest-filter` 裁空；走上游 `zig build` 的 `-Dtest-filter` 时零命中照样退出 0）：`src/crc32c.zig`、`src/fastprint.zig` 等叶子模块没有被任何测试根显式 `_ = @import`，自测试是否被收集以实际输出为准，可先用 `just test-vt --list --filter <名称>` 只列不跑。`crc32c` 另用 `just test-vt --filter snapshot` 覆盖快照路径。
 - 改 `TinyIo`、分配器或 `WasmPagePool`：再跑 `just vt-wasm` 与 `just build-vt`。本机是 Windows，`just test-vt` 跑 `src/lib/tinyio/test.zig` 的共享测试时走的是 windows 分支；posix 分支以 gx-ci 为准。
 - 改 Zig 跑 `just fmt-check`；改 `src/quirks_memset.zig`、`src/fastmem.zig` 这类性能件，按 `src/benchmark/AGENTS.md` 的流程做基准对比。

@@ -3,7 +3,7 @@
 ## 范围
 
 - 核心对象：`src/App.zig`、`src/Surface.zig`、`src/surface_mouse.zig`（后者也属 `input`）。
-- apprt 接口层：`src/apprt.zig` 与 `src/apprt/*.zig` 中的 `action`、`surface`、`ipc`、`structs`、`runtime`、`none`、`browser`。同一 glob 还命中 `src/apprt/gtk.zig`（另属 `apprt-gtk`）与 `src/apprt/embedded.zig`（另属 `libghostty-embedding`、`macos-app`），它们的实现规则以那几份文档为准。
+- apprt 接口层：`src/apprt.zig` 与 `src/apprt/*.zig` 中的 `action`、`surface`、`ipc`、`structs`、`runtime`、`none`、`browser`。同一 glob 还命中 `src/apprt/gtk.zig`（另属 `apprt-gtk`）、`src/apprt/win32.zig`（另属 `apprt-win32`）与 `src/apprt/embedded.zig`（另属 `libghostty-embedding`、`macos-app`），它们的实现规则以那几份文档为准。
 - 入口与进程状态：`src/main.zig`、`src/main_ghostty.zig`、`src/main_wasm.zig`、`src/global.zig`；libghostty C API 入口 `src/main_c.zig` 归 `libghostty-embedding`。
 - 崩溃上报：`src/crash/**`、`pkg/sentry/**`、`pkg/breakpad/**`（两个 `pkg/` 同属 `build-system`）。
 - 本文给出线程模型总览；termio 的线程与锁细节见 `termio-pty-os.md`，渲染线程与 `renderer/State.zig` 见 `renderer.md`。
@@ -12,7 +12,7 @@
 
 - 入口分派：`src/main.zig::entrypoint` 按 `build_config.exe_entrypoint`（`src/build/Config.zig::ExeEntrypoint`：ghostty、helpgen、mdgen_*、webgen_*）选根文件，再转出 `main` 与 `std_options`。
 - `src/main_ghostty.zig::main`：`global.init(.{ .main = … })` → 有 `+action` 就执行并退出 → 否则 `App.create` → `apprt.App.init` → `run`。它的 `std_options`（日志级别、`logFn`）也被 `src/main_c.zig` 复用。
-- `src/apprt.zig::runtime` 编译期选定唯一 apprt：exe 取 `app_runtime`（`none`/`gtk`），lib 取 `embedded`，`wasm_module` 取 `browser`。默认值来自 `src/apprt/runtime.zig::Runtime.default`：Linux/FreeBSD 为 gtk，其余为 none（不产出 exe，默认 install 改为构建 libghostty-internal；Windows 上它编译不过，见「验证」）。每个 apprt 必须提供 `App`、`Surface`、`resourcesDir`。
+- `src/apprt.zig::runtime` 编译期选定唯一 apprt：exe 取 `app_runtime`（`none`/`gtk`/`win32`，`win32` 由补丁 GX-0003 加入），lib 取 `embedded`，`wasm_module` 取 `browser`。默认值来自 `src/apprt/runtime.zig::Runtime.default`：Linux/FreeBSD 为 gtk，Windows 为 win32，其余为 none（不产出 exe，默认 install 改为构建 libghostty-internal）。每个 apprt 必须提供 `App`、`Surface`、`resourcesDir`；GX 绑定动作另由可选的 `App.gxAction` 处理（`gx-core.md`）。
 - `src/App.zig::App` 拥有：`surfaces`（`*apprt.Surface` 列表）、`mailbox`（`Mailbox.Queue = BlockingQueue(Message, 64)`）、`font_grid_set`（同字体配置的 surface 共享）、`device`（app 级 `renderer.Device`，各 surface 的 renderer 借用）、`config_conditional_state`。`tick` 只做 `drainMailbox`。
 - `src/Surface.zig::Surface` 拥有：`renderer`、`renderer_state`（mutex 堆分配）、`renderer_thread`/`renderer_thr`、`io`（`termio.Termio`）、`io_thread`/`io_thr`、`inspector`、`search`、`config`（`DerivedConfig`）、`keyboard`/`mouse` 状态。`rt_app`/`rt_surface` 指回 apprt 对象，apprt 侧用 `core()` 取回 `*Surface`。
 - 跨线程消息：`src/apprt/surface.zig::Message` 与 `Mailbox`（把消息包成 `App.Message.surface_message` 投到 app 线程）；`src/App.zig::Mailbox.push` 入队后调用 `rt_app.wakeup()`；app 线程经 `App.surfaceMessage` → `Surface.handleMessage` 处理。
@@ -24,7 +24,7 @@
 
 ### 线程模型
 
-- 主线程跑 apprt 事件循环：GTK 的 `Application` 主循环调用 `App.tick`，macOS 宿主经 C API `ghostty_app_tick`。apprt 回调、`Surface.handleMessage`、`App.updateConfig`、`Surface.init` 都只在主线程执行（后两者的注释明确要求）。
+- 主线程跑 apprt 事件循环：GTK 的 `Application` 主循环与 win32 的消息循环（收到 `App.wakeup` 投递的消息后）调用 `App.tick`，macOS 宿主经 C API `ghostty_app_tick`。apprt 回调、`Surface.handleMessage`、`App.updateConfig`、`Surface.init` 都只在主线程执行（后两者的注释明确要求）。
 - 每个 surface 的线程：`renderer`（`src/renderer/Thread.zig::threadMain`）、`io` 写线程（`src/termio/Thread.zig::threadMain`）、pty 读线程 `io-reader`，POSIX 上再加采集线程 `io-gather`；执行 `search` 绑定动作时按需创建 `search` 线程（`terminal.search.Thread`，与 surface 共用 `renderer_state.mutex`）。
 - 进程级线程：`App.create` 分离启动字体发现与渲染设备的 `warmup`（后端提供时）；开启 Sentry 时有 `sentry-init`；macOS CoreText shaper 自带 CF 释放线程（`font` 域）。
 - 非主线程不直接调用 App/Surface 方法，一律投递消息。消息必须自带内存：内联定长数据、`MessageData` 的 small/stable/alloc 变体，或 arena 持有的指针（如 `apprt.ClipboardRequest.KittyRead`），由接收方释放。
@@ -46,7 +46,7 @@
 
 - 新增 apprt 动作遵循 `src/apprt/action.zig::Action` 开头的「A GUIDE TO ADDING NEW ACTIONS」：`Key` 只在末尾追加（顺序直接映射 libghostty C 枚举），union 加值，非 void 值必须是 extern 或提供 `C` 与 `cval`，并同步 `include/ghostty.h`。`Action.CValue` 的大小由 comptime 断言锁在 24 字节；`src/apprt/ipc.zig::Action` 适用同一套规则（其 `CValue` 也有尺寸断言）。
 - 动作对 apprt 是可选的，`performAction` 返回是否已处理；必需能力直接定义在 runtime 结构上，缺失就编译失败。
-- `src/apprt/structs.zig` 里注明要同步 `ghostty.h` 的类型（`Clipboard`、`ClipboardReadResult` 等），以及按 `app_runtime` 穷举 `gtk`/`none` 的 `getGObjectType`，要一起维护；新增 `apprt.Runtime` 成员会波及所有这类 switch。
+- `src/apprt/structs.zig` 里注明要同步 `ghostty.h` 的类型（`Clipboard`、`ClipboardReadResult` 等），以及按 `app_runtime` 穷举的 `getGObjectType`（`none` 与 `win32` 同取 `void`），要一起维护；新增 `apprt.Runtime` 成员会波及所有这类 switch，GX-0003 的登记列出了全部位置。
 
 ### 全局状态
 
@@ -78,9 +78,9 @@
 
 ## 验证
 
-- 定向测试（`just test` 只在 Linux/macOS 可跑）：`just test --filter ghostty.h`（Zig 枚举与 `include/ghostty.h` 对账，含 `apprt.Action.Key`、`ipc.Action.Key`、`ipc.Target.Key`）、`just test --filter Envelope`（崩溃信封）、`just test --filter queueIo`、`just test --filter copyUtf8Z`、`just test --filter keyToMouseShape`。
-- 编译覆盖：本机 Windows 没有本域代码的编译检查。`just build` 要构建的 libghostty-internal 与 `just test` 要构建的 `ghostty-test` 都经 `src/build/SharedDeps.zig::add`，卡在 translate-c 导入 `posix_c` 缺 `pwd.h`（`build-system.md`「平台」）：`just build` 退出 1，`just test` 直接退出 2，本机记 PENDING。POSIX 分支由 `gx-ci` 的 `linux-main` job（`-Dapp-runtime=none` 编译并运行整个 `ghostty-test`，不编 GTK apprt）与 Linux/macOS 开发机覆盖，GTK 在 gx-ci 里只由手动触发的 `gtk-smoke` 构建；只在 Windows 目标上才编译的分支目前没有任何编译检查。
-- 改 apprt 动作、Surface 生命周期或主循环交互：本机没有 GUI，记 PENDING，GTK 交 `gx-ci` 手动触发的 `gtk-smoke` 截图；macOS 侧只能在 Mac 上验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`）。
+- 定向测试：`just test --filter ghostty.h`（Zig 枚举与 `include/ghostty.h` 对账，含 `apprt.Action.Key`、`ipc.Action.Key`、`ipc.Target.Key`）、`just test --filter Envelope`（崩溃信封）、`just test --filter queueIo`、`just test --filter copyUtf8Z`、`just test --filter keyToMouseShape`。Windows 上 `just test` 编译 win32 运行时的 `ghostty-test`（`testing.md`），POSIX 分支用 `just wsl test --filter <名>` 或 gx-ci 的 `linux-main`（`-Dapp-runtime=none`）。
+- 编译覆盖：Windows 本机 `just build` 与 `just test` 覆盖 Windows 分支与 win32 apprt；POSIX 分支由 `linux-main` 与 WSL 覆盖，GTK 由 `just wsl build --gtk` 与手动触发的 `gtk-smoke` 构建；Darwin 分支只在 Mac 上编译。Windows 的 `-Dapp-runtime=none`（libghostty-internal）目前链接失败（`build-system.md`「平台」）。
+- 改 apprt 动作、Surface 生命周期或主循环交互：两个 apprt 都要有 GUI 证据，win32 按 `apprt-win32.md` 在本机截图，GTK 用 `just wsl smoke` 或 `gtk-smoke` 截图（`apprt-gtk.md`）；macOS 侧只能在 Mac 上验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`），记 PENDING。
 - 崩溃链路（Sentry 默认只在 macOS 构建）：用 `crash` 绑定动作人工验证，本机记 PENDING。
 - 改 Zig 后跑 `just fmt-check`。
 

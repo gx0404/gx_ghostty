@@ -4,6 +4,7 @@
 
 - termio：`src/termio.zig` 与 `src/termio/**`（`Termio`、`Thread`、`Exec`、`backend`、`mailbox`、`message`、`stream_handler`、`Options`）。`src/termio/shell_integration.zig` 同属 `shell-integration`，注入细节以那份文档为准。
 - 子进程与 pty：`src/Command.zig`、`src/pty.zig`、`src/pty.c`（Linux、FreeBSD、macOS 的 openpty 等 C 头，经 translate-c 以 `pty-c` 模块引入，见 `src/build/SharedDeps.zig`）。
+- fork 的 Windows 支持 `src/gx/conpty.zig`（随包 ConPTY，补丁 GX-0007）与 `src/gx/osc7.zig`（OSC 7 路径，补丁 GX-0008），模块约定同属 `gx-core.md`。
 - OS 辅助 `src/os/**`。以下文件另属其他域，改动时两边规则都要满足：`cgroup.zig`、`flatpak.zig`、`i18n.zig`、`i18n_locales.zig` 属 `apprt-gtk`；`macos.zig`、`cf_release_thread.zig` 属 `macos-app`；`shell.zig` 属 `shell-integration`；`wasm/**`、`mach.zig`、`stderr.zig`、`string_encoding.zig`、`windows.zig` 属 `libghostty-vt`。
 - 这几个 lib-vt 文件经以下引用进入 libghostty-vt 的导入闭包，因此同时受 `libghostty-vt.md` 的 freestanding 约束：`stderr.zig`（被 `src/lib_vt.zig`、`src/terminal/c/sys.zig` 引用）、`windows.zig`（被 `src/terminal/page.zig`、`src/terminal/mem.zig`、`src/lib/tinyio/` 引用）、`mach.zig`（被 `src/terminal/PageList.zig` 引用）、`string_encoding.zig`（被 OSC 133 解析器 `src/terminal/osc/parsers/semantic_prompt.zig` 引用）。
 
@@ -41,13 +42,15 @@
 - `Command.start` 在 fork 之前用 arena 完成全部分配（源码注释：fork 与 exec 之间 malloc 属未定义行为）。子进程里只做 fd 重定向、`chdir`（失败忽略、不记日志，因为 stderr 已指向 pty）、恢复 rlimit、pre-exec 回调与 `execve`。pre-exec 回调（如 GTK 的 `src/apprt/gtk/pre_exec.zig::preExec`）同样不做堆分配，返回非 null 时子进程以该值退出。exec 失败时向 stderr 说明原因并返回 `error.ExecFailedInChild`，`Exec.threadEnter` 收到后直接 `std.process.exit(1)`，绝不回到父进程逻辑。
 - POSIX pty：master 设 `FD_CLOEXEC` 并打开 `IUTF8`；子进程 `childPreExec` 复位信号、`setsid`、`TIOCSCTTY`，然后关闭 master 与 slave；父进程启动成功后关闭 slave。进程级忽略 `SIGPIPE`（`src/global.zig::GlobalState`）。
 - 停止子进程：`killPid` 对进程组循环发 `SIGHUP`，直到 `waitpid(WNOHANG)` 回收（Darwin 的 `EPERM` 忽略）；Flatpak 经 `FlatpakHostCommand` 走 D-Bus。`threadExit` 先停子进程，再写退出管道（Windows 另调 `CancelIoEx`），最后 join 读线程。
-- 子进程环境由 `Exec.Subprocess.init` 组装：`GHOSTTY_RESOURCES_DIR`；`TERM` 与 `COLORTERM=truecolor`（找到资源目录时 `TERM` 取配置的 `term` 并设 `TERMINFO`，否则 `TERM=xterm-256color`）；`GHOSTTY_BIN_DIR` 并把它追加到 `PATH`；`TERM_PROGRAM`、`TERM_PROGRAM_VERSION`；删除 `VTE_VERSION`；shell 集成与 `GHOSTTY_SHELL_FEATURES`；最后叠加用户 `env`，有 cwd 时设 `PWD`。`GHOSTTY_SURFACE_ID` 的注入与 `GHOSTTY_LOG` 的移除在 `Surface.init`。这些都是对 shell 与外部程序的契约。
-- argv 由 `execCommand` 生成：macOS 一律经 `/usr/bin/login -flp <user>`（自查 `.hushlogin` 决定是否加 `-q`），shell 形式的命令再包一层 `bash --noprofile --norc -c "exec -l …"`；其他 POSIX 把 shell 形式包进 `/bin/sh -c`（Flatpak 内加 `-l`）；Windows 直接执行 shell 值，裸 `cmd.exe` 解析为 `%COMSPEC%`，带参数时按空白切分，不遵循 Windows 引号规则。direct 形式的 argv 原样传递。
+- 子进程环境由 `Exec.Subprocess.init` 组装：`GHOSTTY_RESOURCES_DIR`；`TERM` 与 `COLORTERM=truecolor`（找到资源目录时 `TERM` 取配置的 `term` 并设 `TERMINFO`，否则 `TERM=xterm-256color`；Windows 上恒为 `xterm-256color`、不设 `TERMINFO`，补丁 GX-0005）；`GHOSTTY_BIN_DIR` 并把它追加到 `PATH`；`TERM_PROGRAM`、`TERM_PROGRAM_VERSION`；删除 `VTE_VERSION`；shell 集成与 `GHOSTTY_SHELL_FEATURES`；最后叠加用户 `env`，有 cwd 时设 `PWD`。`GHOSTTY_SURFACE_ID` 的注入与 `GHOSTTY_LOG` 的移除在 `Surface.init`。这些都是对 shell 与外部程序的契约。
+- argv 由 `execCommand` 生成：macOS 一律经 `/usr/bin/login -flp <user>`（自查 `.hushlogin` 决定是否加 `-q`），shell 形式的命令再包一层 `bash --noprofile --norc -c "exec -l …"`；其他 POSIX 把 shell 形式包进 `/bin/sh -c`（Flatpak 内加 `-l`）；Windows 直接执行 shell 值，裸 `cmd.exe` 解析为 `%COMSPEC%`，带参数时按 C 运行库的命令行规则切分（支持双引号，GX-0005）。direct 形式的 argv 原样传递。
 - termios 轮询（200ms，用来识别密码输入）只在 POSIX 运行，Windows 上一旦启动就 `@panic`；失焦时停止。
 
 ### 平台与库约束
 
-- Windows 没有可运行的 app；只有 Windows 目标的 libghostty-internal 与 `ghostty-test` 会编译这些分支，而二者目前在 Windows 上都编不过（见「验证」）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`WindowsPty.getProcessInfo` 返回 null，fork 补丁 GX-0012 让 `Exec.Subprocess.getProcessInfo(.foreground_pid)` 在 Windows 上改报子进程（shell）的 pid，供关闭确认与 herdr 应用模式列进程（`src/gx/confirm.zig`、`src/gx/app_mode.zig`）。
+- Windows 分支由 win32 app 实际运行（`apprt-win32.md`）。渲染唤醒句柄按指针传递（`termio.Options.renderer_wakeup` 是 `*xev.Async`，GX-0005）：libxev 的 IOCP `Async` 把等待者存在结构体里，复制出的副本唤不醒渲染线程。读线程遇到管道断开、EOF 或零字节读即正常退出，退出管道用 `WriteFile`/`CloseHandle` 操作 Win32 句柄（GX-0005）。
+- ConPTY：`WindowsPty.open` 经 `src/gx/conpty.zig::Instance.create` 优先载入 exe 旁成对的 `conpty.dll` 与 `OpenConsole.exe`（flags 0x6），缺任一或失败时退回 kernel32；`GHOSTTY_GX_CONPTY=system` 强制系统 ConPTY；缩放与关闭必须用创建它的同一实现（GX-0007）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）。
+- `WindowsPty.getProcessInfo` 返回 null；GX-0012 让 `Exec.Subprocess.getProcessInfo(.foreground_pid)` 在 Windows 上改报子进程（shell）的 pid，供关闭确认与 herdr 应用模式列进程（`src/gx/confirm.zig`、`src/gx/app_mode.zig`）。OSC 7 在 Windows 上经 `src/gx/osc7.zig::nativePath` 转成盘符路径后存为 pwd，新标签与分屏据此继承工作目录（GX-0008）。
 - lib-vt 闭包里的 `os` 文件（见「范围」）不得引入 libc、`global.zig`、termio 或 apprt 依赖，必须能编到 `wasm32-freestanding`。
 - `src/os/` 新代码优先显式接收 `io`、`alloc`、`environ_map`（参照 `src/os/xdg.zig`、`src/os/homedir.zig`），不读全局环境。`src/os/locale.zig::ensureLocale` 会改进程环境，只在 `global.init` 里调用，并断言非测试。
 - 读管线常量（`ReadThread.buffer_count`、`buffer_capacity`、`bridge_*`、`gather_budget_ns`）的取值依据（实测数据或延迟预算）写在各自注释里，改动要给出同等证据；`src/benchmark/TerminalStream.zig` 的读缓冲刻意与 `buffer_capacity` 一致，改一处要同步另一处。
@@ -65,10 +68,10 @@
 ## 验证
 
 - 定向测试：`just test --filter Command:`（fork/exec、环境变量、工作目录）、`just test --filter execCommand`（各平台 argv）、`just test --filter printf_q`（`string_encoding`）、`just test --filter expand:`（`src/os/path.zig` 的 PATH 查找）。
-- 无名测试（`src/pty.zig` 的 open 与 resize、`src/termio/message.zig` 的尺寸锁）随完整 `just test` 运行。POSIX 行为以 `gx-ci` 的 `linux-main` job 为准；`ghostty-test` 在 Windows 上无法编译，本机 `just test` 直接退出 2，记 PENDING。
+- 无名测试（`src/pty.zig` 的 open 与 resize、`src/termio/message.zig` 的尺寸锁）随完整 `just test` 运行；Windows 上 `pty.test` 经同一入口走系统 ConPTY。
+- 平台分支各自验证：Windows 分支（ConPTY、`threadMainWindows`、`Command` 的 Windows 路径、`execCommand windows:` 用例）用本机 `just build` 与 `just test --filter execCommand --filter pty.test --filter gx.conpty --filter gx.osc7`；POSIX 分支用 `just wsl test --filter <名>` 或 gx-ci 的 `linux-main`。运行行为（输出刷新、`exit` 后关窗、ConPTY 日志行）按 `apprt-win32.md` 启动 app 检查。
 - 改 lib-vt 闭包里的 `os` 文件：`just test-vt`、`just build-vt`、`just vt-wasm`。
-- Windows 分支（ConPTY、`threadMainWindows`、`Command` 的 Windows 路径）目前没有任何编译检查：本机 `just build` 在 `src/build/SharedDeps.zig::add` 的 `posix_c` 翻译处就失败（`build-system.md`「平台」）；gx-ci `linux-main` 与 Linux/macOS 开发机按各自目标编译，这些由编译期 `builtin.os.tag` 选中的分支不会被分析。编译与运行行为都记 PENDING。
-- 改读管线或 StreamHandler 热路径：按 `src/benchmark/AGENTS.md` 的流程对比前后吞吐，在 Linux/macOS 上用 `just build -Demit-bench -Doptimize=ReleaseFast` 构建 `ghostty-bench`（Windows 上同样卡在 `posix_c`），`+terminal-stream` 近似 IO 线程的解析负载。真实 pty 下的读线程收益本机测不了，记 PENDING。
+- 改读管线或 StreamHandler 热路径：按 `src/benchmark/AGENTS.md` 的流程对比前后吞吐，用 `just build -Demit-bench -Doptimize=ReleaseFast` 构建 `ghostty-bench`，`+terminal-stream` 近似 IO 线程的解析负载；真实 pty 下的读线程收益没有基准覆盖，记 PENDING。
 - 改 Zig 后跑 `just fmt-check`。
 
 ## 上游指令

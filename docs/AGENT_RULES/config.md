@@ -4,6 +4,7 @@
 
 - 门面 `src/config.zig`（re-export 字段类型、`ConditionalState`、`FileFormatter`、`CApi`）与 `src/config/**`：`Config.zig` 承载全部配置键，其余模块负责键枚举、条件、主题、路径、命令、格式化，另有首启模板 `config-template` 与主题测试夹具 `testdata/`；`ErrorList.zig` 当前无人引用。
 - C 与 wasm 读取面 `CApi.zig`、`c_get.zig`、`Wasm.zig`；把 doc comment 变成 `help_strings` 模块的 `src/helpgen.zig`。
+- fork 的配置层（同属 `gx-core`）：`src/gx/config_layers.zig`、`src/gx/config_types.zig`、`src/gx/gui_settings.zig` 与默认值文件 `src/gx/defaults.ghostty`、`src/gx/defaults-windows.ghostty`。层序、默认值与覆盖文件的规则在 `gx-core.md`，本文只写它们与上游加载链的接口。
 - 并集分工：`CApi.zig`、`c_get.zig` 的 ABI 规则见 `libghostty-embedding.md`；参数语法实现 `src/cli/args.zig` 与 `+show-config`、`+validate-config`、`+explain-config` 见 `cli-inspector.md`；`help_strings` 的构建接线（`src/build/` 下的 `HelpStrings.zig`、`GhosttyDocs.zig`、`GhosttyWebdata.zig`、`mdgen/`、`webgen/`）归 `build-system.md`，这里只写它们对 doc comment 的要求；各 `DerivedConfig` 的消费端见 `app-core.md`、`renderer.md`、`font.md`、`termio-pty-os.md`。
 
 ## 符号真源
@@ -71,16 +72,17 @@
 - 不在渲染线程或 termio 线程读取 `Config`；不为了让某个键可重载而跨线程缓存 `*const Config`。
 - 不绕过 `DiagnosticList.append` 直接改 `_diagnostics.list`。
 - 不手改 helpgen、mdgen、webgen 的产物（它们只存在于 `.zig-cache/` 与安装目录）；文档问题回到 doc comment 修正。
-- `src/config/**` 与 `src/helpgen.zig` 是上游源码：fork 内的改动（包括新增配置键）必须带 `fork(gx)` 标记并登记 GX 补丁（流程见 `development.md`），否则不改。
+- `src/config/**` 与 `src/helpgen.zig` 是上游源码：fork 内的改动必须带 `fork(gx)` 标记并登记 GX 补丁（流程见 `development.md`），否则不改。fork 的新配置键一律叫 `gx-*`，加在 GX-0010 的字段块里（留在字段区末尾），值类型放 `src/gx/config_types.zig`。
 
 ## 验证
 
-- 定向单测（`just test`，只在 Linux/macOS 可跑，Windows 上直接退出 2；完整覆盖看 `gx-ci` 的 `linux-main` job）：
+- 定向单测（`just test`，Windows 与 Linux 都可跑；完整覆盖看 `gx-ci` 的 `linux-main` job）：
   - 解析与兼容：`just test --filter compatibility`、`just test --filter parseCLI`、`just test --filter LineIterator`。
   - 条件、主题与克隆：`just test --filter changeConditionalState`、`just test --filter theme`、`just test --filter clone`。
   - 格式化往返：`just test --filter formatEntry`、`just test --filter formatConfig`。
   - C 读取：`just test --filter ghostty_config_get`、`just test --filter c_get`。
-- 改 doc comment 或字段集合：`just build -Demit-webdata` 会运行 helpgen 与 webgen，不需要 pandoc，但 Windows 上它的默认 install 编不过 libghostty-internal 而退出 1（`build-system.md`「平台」），所以只在 Linux/macOS 上跑，本机记 PENDING；man 与 html 用上游 CI 同款的 `just build -Dapp-runtime=gtk -Demit-docs -Demit-webdata`，只能在装有 pandoc 与 GTK 依赖的 Linux 上运行，本机记 PENDING。
-- 行为冒烟需要可运行的 `ghostty`：Linux 的 GTK 构建产出 `zig-out/bin/ghostty`；macOS 用 app 包里的可执行文件（`macos/Sources/App/main.swift` 经 `ghostty_cli_try_action` 执行动作）；Windows 构建不出可执行文件，本机记 PENDING。检查 `ghostty +validate-config --config-file=<临时文件>` 在有诊断时退出 1，`ghostty +show-config --default --docs` 列出全部键及其文档。
+  - GX 分层与设置模型：`just test --filter gx.config_layers --filter gx.settings_map`（上游单测不经过 GX 分层）。
+- 改 doc comment 或字段集合：`just build -Demit-webdata` 运行 helpgen 与 webgen，产出 `share/ghostty/webdata/config.mdx` 等，不需要 pandoc（Windows 主机上连同 win32 app 一起构建，2026-10 本机实测通过）；man 与 html 用上游 CI 同款的 `just build -Dapp-runtime=gtk -Demit-docs -Demit-webdata`，只能在装有 pandoc 与 GTK 依赖的 Linux 上运行，否则记 PENDING。
+- 行为冒烟需要可运行的 `ghostty`：Windows 用 `just build` 产出的 `zig-out/bin/ghostty.exe`（GUI 子系统，输出要重定向或接管道）；Linux 的 GTK 构建产出 `zig-out/bin/ghostty`（`just wsl build --gtk`）；macOS 用 app 包里的可执行文件（`macos/Sources/App/main.swift` 经 `ghostty_cli_try_action` 执行动作）。检查 `ghostty +validate-config --config-file=<临时文件>` 在有诊断时退出 1，`ghostty +show-config --default --docs` 列出全部键及其文档；对照上游行为时设 `GHOSTTY_GX_DEFAULTS=0`。
 - 改 C 读取面：再跑 `libghostty-embedding.md` 的验证；macOS 侧的构建按 `macos/AGENTS.md`。
 - 收尾：`just fmt-check`；改了 `pub` 签名或文档后跑 `just kb`。

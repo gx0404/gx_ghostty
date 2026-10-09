@@ -50,7 +50,7 @@
 - **构建顺序**：改了 `macos/` 之外的代码，要先重建底层库再构建 app（命令见 `macos/AGENTS.md`）。xcframework 与 `zig-out/share` 必须出自同一次 Zig 构建，否则打进 app 的资源与库不一致。
 - **共享标识**：`src/build_config.zig::bundle_id` 的注释要求它与 App 的 bundle id 一致，它还决定 `appSupportDir`/`cacheDir` 的路径与 gettext domain，fork 不改名。部署目标的两处（Xcode 与 `osVersionMin`）要同步调整。
 - **本地化现状**：Swift 源码里没有 `NSLocalizedString`，也不调 `ghostty_translate`；`po/README_CONTRIBUTORS.md` 声明 macOS 尚未实现本地化。Xcode 工程虽然打包了 `zig-out/share/locale`，核心也刻意不给 embedded 运行时翻译：`src/config/Config.zig::RepeatableCommand.init` 只在 `app_runtime == .gtk` 时翻译默认命令面板条目，以免未本地化的 UI 里出现本地化的命令面板。i18n 规则见 `apprt-gtk.md`。
-- **fork 的更新渠道**：fork 发布的版本串带预发布段（如 `1.3.2-gx.0.1.0`），`src/build/Config.zig::addOptions` 因此把 `release_channel` 设为 `tip`。fork 构建的 app 若检查更新，查询的是上游 tip appcast，校验用的也是上游公钥。
+- **fork 的更新渠道**：fork 发布的版本串带预发布段（如 `1.3.2-gx.0.0.1`），`src/build/Config.zig::addOptions` 因此把 `release_channel` 设为 `tip`。fork 构建的 app 若检查更新，查询的是上游 tip appcast，校验用的也是上游公钥。
 
 ## 禁止项
 

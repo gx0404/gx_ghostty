@@ -28,6 +28,7 @@
 - 头文件手写，没有测试逐项比对 Zig（`checkGhosttyHEnum` 只查 `ghostty.h`），清单则由 Zig 生成；改枚举值或结构布局要人工对照头文件。
 - 函数用 `callconv(lib.calling_conv)` 返回 `Result`；分配器参数可传 NULL（原生 freestanding 上默认分配器恒失败，嵌入方须自带）；构造失败时 out 句柄置 NULL。库分配的内存用 `ghostty_free` 配同一分配器释放，Windows 上不能用 C `free()`。
 - `src/input/key.zig::Key`、`Action` 与 `src/input/mouse.zig::Button` 同时决定 vt 的 `GhosttyKey`、`GhosttyKeyAction`、`GhosttyMouseButton` 与 `ghostty.h` 的同类枚举，改它们就是同时改两套 ABI。
+- fork 补丁 GX-0006 在 `include/ghostty/vt/modes.h` 加了 `GHOSTTY_MODE_WIN32_INPUT`（DECSET 9001）：C API 能查询与设置这个模式，但 libghostty-vt 只记录它，不提供 Win32 按键编码（编码器在只属于 app 的 `src/gx/win32_input.zig`）。模式表的排位规则见 `terminal-core.md`。
 
 ### 导出链
 
@@ -75,7 +76,7 @@
 - feature 组合：`just zig build test-lib-vt-build "-Dvt-features=-all,+render-state"` 只编译；覆盖导出块再跑 `just build-vt "-Dvt-features=-all,+render-state" -Dtarget=wasm32-freestanding`。
 - ABI 清单：`just zig build test-lib-vt-schema`，需要 `python3` 与 `jsonschema`（wasm 另需 `wasmtime`，上游由 `nix develop` 提供）；本机缺依赖时如实记 FAIL 或 PENDING，CI 由 `gx-ci.yml` 的 `linux-vt` job 运行。
 - 源码包：`just dist-vt`；完整校验 `just zig build distcheck -Demit-lib-vt=true`，其内层构建按 PATH 查找 zig 与 cmake（见 `packaging-dist.md`）。
-- 改与 app 共用的 `src/input/` 编码文件时再加 `just test --filter <name>`（只在 Linux/macOS 可跑；Windows 上直接退出 2，交 gx-ci `linux-main`）。
+- 改与 app 共用的 `src/input/` 编码文件时再加 `just test --filter <name>`（Windows 与 Linux 都可跑，POSIX 分支以 gx-ci `linux-main` 为准）。
 - 改示例：在 `example/<dir>` 内运行 `python ../../scripts/zigw.py build`（用钉版 Zig 执行上游的 `zig build`；Linux/macOS 用 `python3`）；改头文件注释或示例标记：仓库根运行 `doxygen`（本机未装记 PENDING）；改 Zig 源码一律 `just fmt-check`。
 
 ## 上游指令
