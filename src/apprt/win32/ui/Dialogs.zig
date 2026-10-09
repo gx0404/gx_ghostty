@@ -1,6 +1,6 @@
-//! Modal dialogs of the win32 apprt: confirmations (closing a terminal or
-//! window with running processes, quitting, clipboard access, unsafe
-//! paste), notices (child exited) and the native Save As dialog.
+//! Modal dialogs of the win32 apprt: confirmations (closing a terminal,
+//! tabs or a window with running processes, quitting, clipboard access,
+//! unsafe paste), notices (child exited) and the native Save As dialog.
 //!
 //! Every function blocks in a modal loop and returns the user's choice.
 //! The modal loop keeps dispatching messages, so callers must not use
@@ -37,6 +37,25 @@ pub fn confirmCloseSurface(owner: ?w32.HWND) Choice {
         owner,
         i18n.tr("A process is still running in this terminal. Close it anyway?"),
         i18n.tr("Close Terminal?"),
+    );
+}
+
+/// Closing a tab (all of its splits) whose process is still running.
+pub fn confirmCloseTab(owner: ?w32.HWND) Choice {
+    return confirm(
+        owner,
+        i18n.tr("A process is still running in this tab. Close it anyway?"),
+        i18n.tr("Close Tab?"),
+    );
+}
+
+/// Closing several tabs (other tabs, tabs to the right) while a process in
+/// one of them is running.
+pub fn confirmCloseTabs(owner: ?w32.HWND) Choice {
+    return confirm(
+        owner,
+        i18n.tr("Processes are still running in the tabs being closed. Close them anyway?"),
+        i18n.tr("Close Tabs?"),
     );
 }
 

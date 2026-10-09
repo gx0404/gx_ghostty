@@ -14,12 +14,19 @@
 //!   - `ui/ResizeOverlay.zig` (`resize_overlay`): the size overlay.
 //!   - `ui/Menu.zig`: the main menu, opened through `queueMainMenu`.
 //!
+//! Closing tabs (`closeTabByIndex`, `closeOtherTabs`, `closeTabsRightOf`,
+//! the `close_tab` action) and the window (WM_CLOSE) asks first only when
+//! a terminal runs a program (core `needsConfirmQuit`). herdr app mode
+//! (`updateAppMode`) hides the tab bar while the only tab runs herdr.
+//!
 //! Language changes reach the window through `onLanguageChanged`.
 const Window = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const global = @import("../../global.zig");
+const gx = @import("../../gx/main.zig");
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
@@ -107,8 +114,25 @@ main_menu_anchor: ?w32.POINT = null,
 /// `setTabBarSuppressed`).
 tab_bar_suppressed: bool = false,
 
+/// Whether the window is in herdr app mode (see `updateAppMode`).
+app_mode: bool = false,
+
+/// Whether the herdr app mode timer (`app_mode_timer_id`) runs.
+app_mode_timer: bool = false,
+
 /// Posted by `queueMainMenu`; opens the main menu.
 const WM_APP_MAIN_MENU: u32 = w32.WM_APP + 20;
+
+/// Posted by `closeTabMode`: wparam is the `apprt.action.CloseTabMode`,
+/// lparam the core id of the surface whose tab it refers to.
+const WM_APP_CLOSE_TAB: u32 = w32.WM_APP + 0x61;
+
+/// The timer that re-checks herdr app mode while the window has one tab.
+const app_mode_timer_id: usize = 0x4844; // 'HD'
+const app_mode_interval_ms: u32 = 1500;
+
+/// The most terminals of a tab whose processes the app mode check reads.
+const app_mode_max_terminals = 32;
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -122,6 +146,7 @@ pub const InitOptions = struct {
 /// reloads (background color in particular).
 pub fn onConfigChange(self: *Window) void {
     if (self.hwnd) |hwnd| Backdrop.onConfigChange(hwnd, &self.app.config);
+    self.updateAppMode();
 }
 
 /// The UI language changed: rebuild menus and repaint the chrome and the
@@ -489,6 +514,7 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
         self.selectTabIndex(pos);
     }
     self.updateTabBarVisibility();
+    self.updateAppMode();
     return surface;
 }
 
@@ -497,11 +523,105 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
 pub fn closeTab(self: *Window, surface: *Surface) void {
     log.debug("closeTab called for surface={x} tab_count={}", .{ @intFromPtr(surface), self.tab_count });
     const idx = self.findTabIndex(surface) orelse return;
-    self.closeTabByIndex(idx);
+    self.removeTab(idx);
 }
 
-/// Close the tab at `idx`, deinitializing its split tree.
+/// Close the tab at `idx` on behalf of the user (tab bar, menus, the
+/// `close_tab` action): asks first when one of its terminals runs a
+/// program (core `needsConfirmQuit`).
 pub fn closeTabByIndex(self: *Window, idx: usize) void {
+    self.closeTabs(.{ .one = idx });
+}
+
+/// Close every tab except the one at `keep`, asking first like
+/// `closeTabByIndex`.
+pub fn closeOtherTabs(self: *Window, keep: usize) void {
+    self.closeTabs(.{ .all_but = keep });
+}
+
+/// Close every tab after the one at `idx`, asking first like
+/// `closeTabByIndex`.
+pub fn closeTabsRightOf(self: *Window, idx: usize) void {
+    self.closeTabs(.{ .right_of = idx });
+}
+
+/// Tabs to close together (`closeTabs`).
+const TabSelection = union(enum) {
+    one: usize,
+    all_but: usize,
+    right_of: usize,
+
+    fn contains(self: TabSelection, idx: usize) bool {
+        return switch (self) {
+            .one => |i| idx == i,
+            .all_but => |i| idx != i,
+            .right_of => |i| idx > i,
+        };
+    }
+};
+
+/// Close the `selection` tabs, after one confirmation when a terminal in
+/// any of them runs a program. The dialog's modal loop keeps dispatching
+/// messages, which can close tabs or this whole window, so the tabs are
+/// found again by a terminal's core id afterwards.
+fn closeTabs(self: *Window, selection: TabSelection) void {
+    const hwnd = self.hwnd orelse return;
+    var ids: [MAX_TABS]u64 = undefined;
+    var count: usize = 0;
+    var needs_confirm = false;
+    for (0..self.tab_count) |i| {
+        if (!selection.contains(i)) continue;
+        ids[count] = self.tab_active_surface[i].core_surface.id;
+        count += 1;
+        if (!needs_confirm) needs_confirm = self.tabNeedsConfirm(i);
+    }
+    if (count == 0) return;
+
+    if (needs_confirm) {
+        const choice = if (count == 1)
+            Dialogs.confirmCloseTab(hwnd)
+        else
+            Dialogs.confirmCloseTabs(hwnd);
+        if (choice != .accept or !isAlive(hwnd, self)) return;
+    }
+
+    for (ids[0..count]) |id| {
+        if (self.findTabBySurfaceId(id)) |idx| self.removeTab(idx);
+    }
+}
+
+/// Whether closing the tab at `idx` needs confirmation: one of its
+/// terminals runs a program (core `needsConfirmQuit`, which with the GX
+/// idle-process check lets idle shells close without asking).
+fn tabNeedsConfirm(self: *Window, idx: usize) bool {
+    var it = self.tab_trees[idx].iterator();
+    while (it.next()) |entry| {
+        const surface = entry.view;
+        if (surface.core_surface_ready and surface.core_surface.needsConfirmQuit()) return true;
+    }
+    return false;
+}
+
+/// The index of the tab with the terminal whose core surface id is `id`.
+fn findTabBySurfaceId(self: *Window, id: u64) ?usize {
+    for (0..self.tab_count) |i| {
+        var it = self.tab_trees[i].iterator();
+        while (it.next()) |entry| {
+            if (entry.view.core_surface_initialized and entry.view.core_surface.id == id) return i;
+        }
+    }
+    return null;
+}
+
+/// Whether `hwnd` is still the live window of `window`, e.g. after a modal
+/// dialog. `window` is not dereferenced: it may have been freed.
+fn isAlive(hwnd: w32.HWND, window: *const Window) bool {
+    const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    return userdata != 0 and @as(usize, @bitCast(userdata)) == @intFromPtr(window);
+}
+
+/// Remove the tab at `idx` without asking, deinitializing its split tree.
+fn removeTab(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
     // Cancel any in-progress rename (the edit control may belong to this tab).
     self.tab_bar.cancelRename();
@@ -517,6 +637,7 @@ pub fn closeTabByIndex(self: *Window, idx: usize) void {
     self.tab_count -= 1;
     if (self.tab_count == 0) {
         self.closing = true;
+        self.setAppModeTimer(false);
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
@@ -527,36 +648,35 @@ pub fn closeTabByIndex(self: *Window, idx: usize) void {
     }
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
+    // The tab bar stays visible with `window-show-tab-bar = always`, so
+    // nothing else repaints it without the removed tab.
+    self.invalidateTabBar();
+    self.updateAppMode();
 }
 
-/// Close tabs based on mode: this (current), other (all but current), right (all after current).
+/// The `close_tab` action: close the tab of `surface` (`this`, all of its
+/// splits), the other tabs or the tabs to its right. The core performs it
+/// inside a key binding, so the confirmation and the close run from the
+/// message loop (`WM_APP_CLOSE_TAB`).
 pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    if (!surface.core_surface_initialized) return;
+    _ = w32.PostMessageW(
+        hwnd,
+        WM_APP_CLOSE_TAB,
+        @intCast(@intFromEnum(mode)),
+        @bitCast(surface.core_surface.id),
+    );
+}
+
+/// Handle `WM_APP_CLOSE_TAB` (see `closeTabMode`).
+fn onCloseTabRequest(self: *Window, wparam: usize, lparam: isize) void {
+    const mode = std.enums.fromInt(apprt.action.CloseTabMode, wparam) orelse return;
+    const idx = self.findTabBySurfaceId(@bitCast(lparam)) orelse return;
     switch (mode) {
-        .this => self.closeSplitSurface(surface),
-        .other => self.closeOtherTabs(self.findTabIndex(surface) orelse return),
-        .right => self.closeTabsRightOf(self.findTabIndex(surface) orelse return),
-    }
-}
-
-/// Close every tab except the one at `keep`.
-pub fn closeOtherTabs(self: *Window, keep: usize) void {
-    var current = keep;
-    var i: usize = self.tab_count;
-    while (i > 0) {
-        i -= 1;
-        if (i != current) {
-            self.closeTabByIndex(i);
-            if (i < current) current -= 1;
-        }
-    }
-}
-
-/// Close every tab after the one at `idx`.
-pub fn closeTabsRightOf(self: *Window, idx: usize) void {
-    var i: usize = self.tab_count;
-    while (i > idx + 1) {
-        i -= 1;
-        self.closeTabByIndex(i);
+        .this => self.closeTabByIndex(idx),
+        .other => self.closeOtherTabs(idx),
+        .right => self.closeTabsRightOf(idx),
     }
 }
 
@@ -610,9 +730,10 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         self.tab_active_surface[tab] = ns;
         self.layoutSplits();
         if (ns.hwnd) |h| _ = w32.SetFocus(h);
+        self.updateAppMode();
     } else {
         log.debug("closeSplitSurface: no next surface, closing tab", .{});
-        self.closeTabByIndex(tab);
+        self.removeTab(tab);
     }
 }
 
@@ -890,6 +1011,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
 
     self.layoutSplits();
     if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
+    self.updateAppMode();
 }
 
 /// Navigate to a split in the given direction.
@@ -1107,6 +1229,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
     self.invalidateTabBar();
+    self.updateAppMode();
 
     destination.updateTabBarVisibility();
     destination.updateWindowTitle();
@@ -1114,6 +1237,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     _ = w32.UpdateWindow(destination_hwnd);
     destination.layoutSplits();
     if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
+    destination.updateAppMode();
 
     tracked = false;
     return true;
@@ -1170,6 +1294,51 @@ pub fn setTabBarSuppressed(self: *Window, suppressed: bool) void {
     if (self.tab_bar_suppressed == suppressed) return;
     self.tab_bar_suppressed = suppressed;
     self.updateTabBarVisibility();
+}
+
+/// herdr app mode (`gx-herdr-app-mode`, see src/gx/app_mode.zig): while
+/// the only tab of the window runs herdr in one of its terminals, the tab
+/// bar is hidden so the window presents herdr like an application of its
+/// own. Checked when tabs or splits change and, while the window has a
+/// single tab, on a timer (`app_mode_interval_ms`); a second tab or herdr
+/// exiting restores the tab bar.
+pub fn updateAppMode(self: *Window) void {
+    const enabled = self.app.config.@"gx-herdr-app-mode" and !self.is_quick_terminal;
+    const watch = enabled and !self.closing and self.tab_count == 1;
+    self.setAppModeTimer(watch);
+
+    var answers: [app_mode_max_terminals]?bool = undefined;
+    var count: usize = 0;
+    if (watch) {
+        var it = self.tab_trees[0].iterator();
+        while (it.next()) |entry| {
+            if (count == answers.len) break;
+            const surface = entry.view;
+            answers[count] = if (surface.core_surface_ready) gx.app_mode.terminalRunsHerdr(
+                self.app.core_app.alloc,
+                global.io(),
+                surface.core_surface.getProcessInfo(.foreground_pid),
+                true,
+            ) else null;
+            count += 1;
+        }
+    }
+
+    const app_mode = gx.app_mode.decide(enabled, self.tab_count, answers[0..count], self.app_mode);
+    if (app_mode != self.app_mode) log.info("herdr app mode {s}", .{if (app_mode) "on" else "off"});
+    self.app_mode = app_mode;
+    self.setTabBarSuppressed(app_mode);
+}
+
+fn setAppModeTimer(self: *Window, run: bool) void {
+    if (self.app_mode_timer == run) return;
+    const hwnd = self.hwnd orelse return;
+    if (run) {
+        if (w32.SetTimer(hwnd, app_mode_timer_id, app_mode_interval_ms, null) == 0) return;
+    } else {
+        _ = w32.KillTimer(hwnd, app_mode_timer_id);
+    }
+    self.app_mode_timer = run;
 }
 
 /// Invalidate the tab bar region so it gets repainted.
@@ -1263,31 +1432,34 @@ pub fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.invalidateTabBar();
 }
 
-/// Return true if it is safe to close this whole window. If any tab still
-/// has a running process, show a single aggregate confirmation dialog
-/// (mirroring macOS/GTK, which confirm once per window) and return whether
-/// the user approved. Whole-window close paths (title-bar X, Alt+F4,
-/// close_window) previously skipped this check entirely; the per-surface
-/// close path (Ctrl+Shift+W) still confirms separately in Surface.close.
-/// When the last tab has already been closed (tab_count == 0) there is
-/// nothing to confirm, so this returns true silently.
+/// Return true if it is safe to close this whole window. If a terminal in
+/// any tab runs a program (core `needsConfirmQuit`, which lets idle shells
+/// pass), show a single aggregate confirmation dialog (mirroring
+/// macOS/GTK, which confirm once per window) and return whether the user
+/// approved. Every whole-window close (caption close button, Alt+F4,
+/// `close_window`) arrives as WM_CLOSE and asks here. When the last tab
+/// has already been closed (tab_count == 0) there is nothing to confirm,
+/// so this returns true silently. Returns false when the window was
+/// destroyed while the dialog was open; `self` is invalid then.
 pub fn confirmCloseIfNeeded(self: *Window) bool {
+    const hwnd = self.hwnd orelse return true;
     var needs = false;
-    outer: for (0..self.tab_count) |i| {
-        var it = self.tab_trees[i].iterator();
-        while (it.next()) |entry| {
-            const surface = entry.view;
-            if (surface.core_surface_ready and
-                surface.core_surface.needsConfirmQuit())
-            {
-                needs = true;
-                break :outer;
-            }
+    for (0..self.tab_count) |i| {
+        if (self.tabNeedsConfirm(i)) {
+            needs = true;
+            break;
         }
     }
     if (!needs) return true;
 
-    return Dialogs.confirmCloseWindow(self.hwnd) == .accept;
+    return Dialogs.confirmCloseWindow(hwnd) == .accept and isAlive(hwnd, self);
+}
+
+/// Close this window from a core action (`close_window`): through
+/// WM_CLOSE, so the confirmation and the close run from the message loop
+/// rather than inside the key binding that asked for it.
+pub fn requestClose(self: *Window) void {
+    if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
 }
 
 /// Handle WM_CLOSE: clean up all tabs, then destroy the window.
@@ -1422,11 +1594,20 @@ pub fn windowWndProc(
         },
         w32.WM_TIMER => {
             if (window.resize_overlay.onTimer(wparam)) return 0;
+            if (wparam == app_mode_timer_id) {
+                window.updateAppMode();
+                return 0;
+            }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
         WM_APP_MAIN_MENU => {
             if (!window.closing) Menu.showMainMenu(window, window.main_menu_anchor);
+            return 0;
+        },
+
+        WM_APP_CLOSE_TAB => {
+            if (!window.closing) window.onCloseTabRequest(wparam, lparam);
             return 0;
         },
 

@@ -43,6 +43,9 @@ const log = std.log.scoped(.win32);
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
+/// Posted to the message-only window by `requestQuit`.
+const WM_APP_QUIT: u32 = w32.WM_APP + 0x62;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -525,8 +528,7 @@ pub fn performAction(
 ) !bool {
     switch (action) {
         .quit => {
-            self.quit_requested = true;
-            w32.PostQuitMessage(0);
+            self.requestQuit();
             return true;
         },
 
@@ -651,12 +653,9 @@ pub fn performAction(
         .close_window => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    // Close the entire window (all tabs), not just one tab.
-                    // Confirm first if any tab still has a running process.
-                    const win = core_surface.rt_surface.parent_window;
-                    if (win.confirmCloseIfNeeded()) win.close();
-                },
+                // Close the entire window (all tabs), not just one tab,
+                // after asking if a tab still runs a program (WM_CLOSE).
+                .surface => |core_surface| core_surface.rt_surface.parent_window.requestClose(),
             }
             return true;
         },
@@ -926,10 +925,8 @@ pub fn performAction(
         },
 
         .close_all_windows => {
-            // Close all surfaces by posting WM_CLOSE to each.
-            // The core tracks surfaces; iterate via quit.
-            self.quit_requested = true;
-            w32.PostQuitMessage(0);
+            // Closing every window quits; ask like quit does.
+            self.requestQuit();
             return true;
         },
 
@@ -2038,6 +2035,32 @@ pub fn stopQuitTimer(self: *App) void {
     }
 }
 
+/// Quit on behalf of the user (the `quit` and `close_all_windows`
+/// actions). The core asks from its tick, so the confirmation runs from
+/// the message loop (`WM_APP_QUIT`, `confirmQuit`).
+fn requestQuit(self: *App) void {
+    if (self.msg_hwnd) |hwnd| {
+        if (w32.PostMessageW(hwnd, WM_APP_QUIT, 0, 0) != 0) return;
+    }
+    self.quitNow();
+}
+
+/// Quit, after asking when a terminal still runs a program (core
+/// `needsConfirmQuit`, which with the GX idle-process check lets idle
+/// shells pass).
+fn confirmQuit(self: *App) void {
+    if (self.core_app.needsConfirmQuit()) {
+        const owner = if (self.targetWindow(.app)) |window| window.hwnd else null;
+        if (Dialogs.confirmQuit(owner) != .accept) return;
+    }
+    self.quitNow();
+}
+
+fn quitNow(self: *App) void {
+    self.quit_requested = true;
+    w32.PostQuitMessage(0);
+}
+
 /// Show a Windows balloon notification via Shell_NotifyIconW.
 /// Creates a temporary tray icon, shows the balloon, then removes
 /// the icon after a short delay.
@@ -2167,6 +2190,11 @@ fn surfaceWndProc(
             // message loop. This is the safe place to call closeSplitSurface
             // (outside of core_surface callbacks).
             surface.parent_window.closeSplitSurface(surface);
+            return 0;
+        },
+
+        Surface.WM_APP_CONFIRM_CLOSE => {
+            surface.confirmClose();
             return 0;
         },
 
@@ -2407,6 +2435,11 @@ fn msgWndProc(
 
     if (msg == WM_APP_WAKEUP) {
         app.tick();
+        return 0;
+    }
+
+    if (msg == WM_APP_QUIT) {
+        app.confirmQuit();
         return 0;
     }
 

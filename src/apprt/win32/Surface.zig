@@ -462,24 +462,35 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     };
 }
 
+/// Posted by `close` when the terminal to close still runs a program;
+/// surfaceWndProc hands it to `confirmClose`.
+pub const WM_APP_CONFIRM_CLOSE: u32 = w32.WM_APP + 0x60;
+
+/// Close this terminal. `process_active` is the core's
+/// `needsConfirmQuit`: with the GX idle-process check, true only while a
+/// program other than an idle shell runs, so then the user is asked
+/// first. The core calls this from its callbacks (a `close_surface`
+/// binding, the child exiting), where the surface must stay alive, so
+/// both the question and the close run from the message loop: WM_CLOSE
+/// reaches `Window.closeSplitSurface` through surfaceWndProc.
 pub fn close(self: *Surface, process_active: bool) void {
     log.debug("Surface.close called process_active={}", .{process_active});
-    // If a shell command is still running, prompt the user before
-    // closing. Without this, Ctrl+Shift+W silently kills the running
-    // process — macOS shows the same kind of dialog for parity. We
-    // only prompt for programmatic close paths; the X-button path
-    // bypasses needsConfirmQuit entirely (cmd.exe lacks OSC 133 so
-    // the core would return process_active=true unconditionally).
-    if (process_active) {
-        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd) != .accept) return;
-    }
-    // Defer destruction to the message loop via PostMessage.
-    // This avoids calling surface.deinit() from inside core_surface
-    // callbacks (during tick), which causes reentrancy and crashes.
-    // The WM_CLOSE handler in surfaceWndProc will call closeTab.
     if (self.hwnd) |hwnd| {
-        _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+        _ = w32.PostMessageW(hwnd, if (process_active) WM_APP_CONFIRM_CLOSE else w32.WM_CLOSE, 0, 0);
     }
+}
+
+/// Handle `WM_APP_CONFIRM_CLOSE`: ask whether to close this terminal while
+/// it still runs a program, then close it. The dialog's modal loop keeps
+/// dispatching messages and can close the terminal meanwhile.
+pub fn confirmClose(self: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.core_surface_ready and self.core_surface.needsConfirmQuit()) {
+        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd) != .accept) return;
+        const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+        if (userdata == 0 or @as(usize, @bitCast(userdata)) != @intFromPtr(self)) return;
+    }
+    self.parent_window.closeSplitSurface(self);
 }
 
 pub fn supportsClipboard(
