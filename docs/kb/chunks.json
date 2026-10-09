@@ -1,5 +1,5 @@
 {
- "chunk_count": 1304,
+ "chunk_count": 1323,
  "chunks": [
   {
    "anchor": "Agent Development Guide",
@@ -313,8 +313,8 @@
    "anchor": "app-core：App、Surface、apprt 接口与进程入口 > 不变量 > 全局状态",
    "doc": "docs/AGENT_RULES/app-core.md",
    "id": "docs-agent-rules-app-core-md-app-core-app-surface-apprt-接口与进程入口-不变量-全局状态",
-   "source_sha256": "8c81e5f188e23462aef13971785d90b83100059c320f4de8bdbf9b54897e2013",
-   "text": "### 全局状态\n\n- `src/main_ghostty.zig::main` 的注释说明：全局状态存在是因为 C API 需要访问它，其他 Zig 代码都不应访问。它只由 exe 的 `main`（`.main`）、工具二进制（`.tool`，跳过 app CLI 动作检测）或 libghostty 的 `ghostty_init`（`.c`，Windows 返回 `error.UnsupportedOSForCApi`）初始化。\n- `src/global.zig` 在 `terminal_options.artifact == .lib` 时 `@compileError`，libghostty-vt 可达代码只要 import 它就编译失败。\n- 现状：Zig 0.16 迁移后很多模块经 `global.io()`、`global.alloc()` 取 I/O 与分配器。测试构建中 `io`、`alloc`、`environ`、`environMap` 回退到 `std.testing` 的对应物，`args`、`resourcesDir`、`rlimits` 返回空值；`tmpDirPath`、`logging`、`action` 没有测试回退，`syncEnviron` 断言非测试。上游正把依赖改成显式传参，例如 `src/crash/sentry.zig::init` 接收 `environ_map`，`src/os/xdg.zig` 接收 `io`、`alloc`、`environ_map`。\n- 进程环境只在启动阶段修改：`global.init`（`ensureLocale` 之后 `syncEnviron`）与 GTK `Application` 初始化（设 `LANG`、`GDK_DEBUG`、`GDK_DISABLE` 后同样 `global.syncEnviron`）。`syncEnviron` 没有并发控制，启动之后改用 `std.process.Environ.Map`。`GHOSTTY_LOG` 控制日志去向；`Surface.init` 启动子进程前移除它，并注入 `GHOSTTY_SURFACE_ID`。"
+   "source_sha256": "6606f654a2c0ee2106ce03375e666b40cb1763f79518ca38d5a88d4cd9ea4d0b",
+   "text": "### 全局状态\n\n- `src/main_ghostty.zig::main` 的注释说明：全局状态存在是因为 C API 需要访问它，其他 Zig 代码都不应访问。它只由 exe 的 `main`（`.main`）、工具二进制（`.tool`，跳过 app CLI 动作检测）或 libghostty 的 `ghostty_init`（`.c`，Windows 返回 `error.UnsupportedOSForCApi`）初始化。\n- `src/global.zig` 在 `terminal_options.artifact == .lib` 时 `@compileError`，libghostty-vt 可达代码只要 import 它就编译失败。\n- 现状：Zig 0.16 迁移后很多模块经 `global.io()`、`global.alloc()` 取 I/O 与分配器。测试构建中 `io`、`alloc`、`environ`、`environMap` 回退到 `std.testing` 的对应物，`args`、`resourcesDir`、`rlimits` 返回空值；`tmpDirPath`、`logging`、`action` 没有测试回退，`syncEnviron` 断言非测试。上游正把依赖改成显式传参，例如 `src/crash/sentry.zig::init` 接收 `environ_map`，`src/os/xdg.zig` 接收 `io`、`alloc`、`environ_map`。\n- 进程环境只在启动阶段修改：`global.init`（`ensureLocale` 之后 `syncEnviron`）与 GTK `Application` 初始化（设 `LANG`、`LANGUAGE`、`GDK_DEBUG`、`GDK_DISABLE` 后同样 `global.syncEnviron`）。`syncEnviron` 没有并发控制，启动之后改用 `std.process.Environ.Map`。唯一的例外是 GX 界面语言的运行时切换（补丁 GX-0011）：gettext 每次查词都读 `LANGUAGE`，所以它在主线程 `setenv` 后 `syncEnviron`。`GHOSTTY_LOG` 控制日志去向；`Surface.init` 启动子进程前移除它，并注入 `GHOSTTY_SURFACE_ID`。"
   },
   {
    "anchor": "app-core：App、Surface、apprt 接口与进程入口 > 不变量 > 崩溃上报",
@@ -341,8 +341,8 @@
    "anchor": "app-core：App、Surface、apprt 接口与进程入口 > 禁止项",
    "doc": "docs/AGENT_RULES/app-core.md",
    "id": "docs-agent-rules-app-core-md-app-core-app-surface-apprt-接口与进程入口-禁止项",
-   "source_sha256": "82beeb029b36fb28ed9dea3a3a176dcb1c308e5d5816695967f2b7aab77d50d2",
-   "text": "## 禁止项\n\n- 不在非主线程调用 App/Surface 的公共方法；跨线程只发自带内存的消息。\n- 不绕过 `Surface.queueIo` 直接调用 `io.queueMessage`，否则只读模式失效。\n- 不在 `apprt.Action.Key`、`ipc.Action` 中间插入或重排成员；不改 C 可见类型而不同步 `include/ghostty.h`。\n- 不新增全局可变状态；libghostty-vt 可达代码不 import `src/global.zig`；不在启动阶段之外修改进程环境（`setenv`、`syncEnviron`）。\n- 不让崩溃上报默认上传数据；不假设 Windows 上有 Sentry。\n- 不先释放再 join；不跨 tick 保存未经 `hasSurface` 校验的 surface 指针。"
+   "source_sha256": "051d56560a8f169b7df397e48f70b54eacf64575e4648feab5acc3637dd362c8",
+   "text": "## 禁止项\n\n- 不在非主线程调用 App/Surface 的公共方法；跨线程只发自带内存的消息。\n- 不绕过 `Surface.queueIo` 直接调用 `io.queueMessage`，否则只读模式失效。\n- 不在 `apprt.Action.Key`、`ipc.Action` 中间插入或重排成员；不改 C 可见类型而不同步 `include/ghostty.h`。\n- 不新增全局可变状态；libghostty-vt 可达代码不 import `src/global.zig`；除上文 GX 界面语言切换外，不在启动阶段之外修改进程环境（`setenv`、`syncEnviron`）。\n- 不让崩溃上报默认上传数据；不假设 Windows 上有 Sentry。\n- 不先释放再 join；不跨 tick 保存未经 `hasSurface` 校验的 surface 指针。"
   },
   {
    "anchor": "app-core：App、Surface、apprt 接口与进程入口 > 符号真源",
@@ -383,15 +383,22 @@
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 不变量",
    "doc": "docs/AGENT_RULES/apprt-gtk.md",
    "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-不变量-part1",
-   "source_sha256": "c24057b4899eebad44385e82319cfba5319077858abd61d38932ff94ac566fbb",
+   "source_sha256": "f40698bd999fe5c8cf558b7c9b42a7743e8c4c65c5ab7fc5c393cd83d354fa20",
    "text": "## 不变量\n\n- **主线程**：GTK、GLib、libadwaita 对象只在 `Application.run` 所在的主线程上操作，私有状态 `running` 只由主循环写。termio、渲染线程不调 GTK，只向核心 mailbox 投递；`src/App.zig` 投递后调 `rt_app.wakeup()`，主循环在下一次 `core_app.tick` 处理。\n- **渲染交接**：`class/render_surface.zig::RenderSurface` 在主线程的 `snapshot` 里用 `renderer.takeFrame()` 取渲染线程导出的最新帧建 `GdkTexture`；渲染初始化在渲染线程完成后才创建 core surface。帧优先以 DMABUF 导出，导入失败时调 `reportPresentationHealth(.unhealthy)`，渲染器改发 CPU 内存帧。终端 surface 不用 `GtkGLArea`（只有 inspector 的 `class/imgui_widget.zig` 在用）。\n- **GObject 生命周期**：使用模板的类在 `dispose` 里先 `gtk.Widget.disposeTemplate` 再链式调父类；属性访问器持有的私有字符串、boxed、对象在 `finalize` 释放（访问器只在 set 时替换旧值）；`WeakRef` 在宿主 `dispose` 中 `deinit`，`WeakRef.get` 返回的强引用用完要 `unref`；模板回调返回 `c_int` 而不是 Zig `bool`（`bindTemplateCallback` 编译期拒绝 `bool`）。\n- **Blueprint 登记**：每个 `.blp` 都登记在 `gresource.blueprints`，未登记的既不进 gresource 也不被 xgettext 扫描。构建要求 libadwaita 头文件不低于登记表最高版本，新增更高版本目录会抬高整个 GTK 构建的下限；多版本变体（如 `clipboard-confirmation-dialog`、`debug-warning`）在 `Class.init` 用 comptime 版本门挑选。\n- **可翻译字符串**：Zig 里立即翻译用 `i18n._(\"…\")`，先存 msgid、展示时再翻译用 `i18n.N_(\"…\")`；带上下文的 `C_(\"ctx\", \"…\")` 只能写在 `.blp`（`src/os/i18n.zig` 没有 `C_`）。只有 `createUpdateStep` 列出的输入会被抽取，在其外新增可翻译字面量时必须把文件加进该步骤。命令面板条目在 `src/input/command.zig` 用 `i18n.N_` 标记，由 `src/config/Config.zig::RepeatableCommand.init` 只在 `app_runtime == .gtk` 时翻译。"
   },
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 不变量",
    "doc": "docs/AGENT_RULES/apprt-gtk.md",
    "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-不变量-part2",
-   "source_sha256": "c24057b4899eebad44385e82319cfba5319077858abd61d38932ff94ac566fbb",
-   "text": "- **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。\n- **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。\n- **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。\n- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）。GX 样式与 herdr 应用模式（`src/apprt/gtk/gx/app_mode.zig`）经 fork 补丁 GX-0016 接入 `class/application.zig`、`class/window.zig`；新增 provider 按此排位，GX 逻辑放在 `src/apprt/gtk/gx/`，上游类里只留 begin/end 钩子。\n- **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。"
+   "source_sha256": "f40698bd999fe5c8cf558b7c9b42a7743e8c4c65c5ab7fc5c393cd83d354fa20",
+   "text": "- **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。\n- **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 与 `LANGUAGE`（`gx/language.zig::restoreChildEnv`）恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。原始 `LANGUAGE` 由 `gx/language.zig::startup` 在启动阶段记录一次（此后只读的模块级状态，因为它先于 `Application` 对象创建）。启动之后只有界面语言切换会改 `LANGUAGE`（主线程，`setenv` 后 `global.syncEnviron`）。\n- **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。\n- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）。GX 样式与 herdr 应用模式（`src/apprt/gtk/gx/app_mode.zig`）经 fork 补丁 GX-0016 接入 `class/application.zig`、`class/window.zig`；新增 provider 按此排位，GX 逻辑放在 `src/apprt/gtk/gx/`，上游类里只留 begin/end 钩子。"
+  },
+  {
+   "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 不变量",
+   "doc": "docs/AGENT_RULES/apprt-gtk.md",
+   "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-不变量-part3",
+   "source_sha256": "f40698bd999fe5c8cf558b7c9b42a7743e8c4c65c5ab7fc5c393cd83d354fa20",
+   "text": "- **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。"
   },
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 禁止项",
@@ -417,16 +424,23 @@
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 符号真源 > i18n",
    "doc": "docs/AGENT_RULES/apprt-gtk.md",
-   "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-符号真源-i18n",
-   "source_sha256": "f68d20a71dad80fc0928107d188c49328ef3bbbdb4bea152db4ad1878902bb15",
-   "text": "### i18n\n\n- `src/os/i18n.zig`：`init` 由 `src/global.zig` 以资源目录调用，把 gettext domain 绑到资源目录同级的 `locale/`（Windows 直接返回）；`initGlobalDomain` 只给完整拥有应用的 apprt 用；`_` 在 comptime 调用时原样返回 msgid，`N_` 只做标记；`canonicalizeLocale` 依赖 `pkg/libintl` 导出的 `_libintl_locale_name_canonicalize`。\n- `src/os/i18n_locales.zig::locales`：受支持的 locale 列表，顺序有语义（只知语言码时取第一个匹配）；单独成文件是为减少构建程序的传递依赖。\n- `src/build/GhosttyI18n.zig`：`init` 对每个 locale 跑 `msgfmt`，装到 `share/locale/<locale>/LC_MESSAGES/com.mitchellh.ghostty.mo`。`createUpdateStep` 用 `xgettext --language=C --keyword=_ --keyword=N_ --keyword=C_:1c,2` 扫描已登记的 `.blp`、`src/apprt/gtk` 下全部 `.zig`（排序后）与 `src/input/command.zig`，再以 Python 模式扫 `dist/linux/ghostty_nautilus.py`，合并写回 `po/com.mitchellh.ghostty.pot`，并对每个 locale `msgmerge --no-fuzzy-matching`。`build.zig` 把它挂在 `update-translations` 步骤，i18n 关闭时该步骤报错。\n- `-Di18n` 默认（`src/build/Config.zig::init`）：macOS/iOS 开；Linux/FreeBSD 只在 glibc 开；其余关。musl 要开需 gettext-tiny 一类 stub（`po/README_CONTRIBUTORS.md`），`src/os/i18n.zig` 手写 gettext extern 声明也是因为 musl 未必有 `libintl.h`。`language` 配置项只对 GTK 生效，且不能运行时重载。\n- `pkg/libintl` 用 GNU gettext 源码构建静态 libintl，只在 Darwin 目标由 `src/build/SharedDeps.zig` 链接；它的 `config.h` 在 macOS 上手工生成，升级 gettext 时要复核末尾手工补的 `xlocale.h` include。"
+   "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-符号真源-i18n-part1",
+   "source_sha256": "55c0d0a45f22ddaeec43b20ee4059e5fa1450f77071a1e5e27c892c5232ad595",
+   "text": "### i18n\n\n- `src/os/i18n.zig`：`init` 由 `src/global.zig` 以资源目录调用，把 gettext domain 绑到资源目录同级的 `locale/`（Windows 直接返回）；`initGlobalDomain` 只给完整拥有应用的 apprt 用；`_` 在 comptime 调用时原样返回 msgid，`N_` 只做标记；`canonicalizeLocale` 依赖 `pkg/libintl` 导出的 `_libintl_locale_name_canonicalize`。\n- `src/os/i18n_locales.zig::locales`：受支持的 locale 列表，顺序有语义（只知语言码时取第一个匹配）；单独成文件是为减少构建程序的传递依赖。\n- `src/build/GhosttyI18n.zig`：`init` 对每个 locale 跑 `msgfmt`，装到 `share/locale/<locale>/LC_MESSAGES/com.mitchellh.ghostty.mo`。`createUpdateStep` 用 `xgettext --language=C --keyword=_ --keyword=N_ --keyword=C_:1c,2` 扫描已登记的 `.blp`、`src/apprt/gtk` 下全部 `.zig`（排序后）与 `src/input/command.zig`，再以 Python 模式扫 `dist/linux/ghostty_nautilus.py`，合并写回 `po/com.mitchellh.ghostty.pot`，并对每个 locale `msgmerge --no-fuzzy-matching`。`build.zig` 把它挂在 `update-translations` 步骤，i18n 关闭时该步骤报错。\n- `-Di18n` 默认（`src/build/Config.zig::init`）：macOS/iOS 开；Linux/FreeBSD 只在 glibc 开；其余关。musl 要开需 gettext-tiny 一类 stub（`po/README_CONTRIBUTORS.md`），`src/os/i18n.zig` 手写 gettext extern 声明也是因为 musl 未必有 `libintl.h`。"
+  },
+  {
+   "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 符号真源 > i18n",
+   "doc": "docs/AGENT_RULES/apprt-gtk.md",
+   "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-符号真源-i18n-part2",
+   "source_sha256": "55c0d0a45f22ddaeec43b20ee4059e5fa1450f77071a1e5e27c892c5232ad595",
+   "text": "- 界面语言（GX-0011，`src/apprt/gtk/gx/`）：`language` 经 `gx.i18n.resolve` 取 `zh-CN` 或 `en`；启动时 locale 已安装才写 `LANG`，`LANGUAGE` 选 gettext 目录，禁用 GTK 自己的 `setlocale` 后把 `LC_MESSAGES` 设为真实 UTF-8 locale（glibc 在 `C`/`C.UTF-8` 下忽略 `LANGUAGE`）。运行时 `language` 变化由 `Application.propConfig` 切换 `LANGUAGE`、`LC_MESSAGES`、`textdomain` 与 `gx.i18n`，命令面板译文变了就再硬重载一次配置；菜单来自 `ui/1.5/gx/menus.blp`（不带 `_()` 的英文 msgid，由 `gx.i18n` 翻译），窗口在 `propConfig` 时整套替换。fork 自有字符串一律走 `gx.i18n.tr`/`trRuntime` 与 `src/gx/i18n/gx.zh_CN.po`，不用 `_`/`N_`/`C_`，以免流入上游 pot。\n- `pkg/libintl` 用 GNU gettext 源码构建静态 libintl，只在 Darwin 目标由 `src/build/SharedDeps.zig` 链接；它的 `config.h` 在 macOS 上手工生成，升级 gettext 时要复核末尾手工补的 `xlocale.h` include。"
   },
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 符号真源 > 入口与主循环",
    "doc": "docs/AGENT_RULES/apprt-gtk.md",
    "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-符号真源-入口与主循环",
-   "source_sha256": "78d3df507450a750bd7617e84bf2a68e00ad91f6f2a4f95df8fdaf537c2b8115",
-   "text": "### 入口与主循环\n\n- `src/apprt/gtk.zig` 导出 apprt 必需的 `App`、`Surface`、`resourcesDir`（即 `src/apprt/gtk/flatpak.zig::resourcesDir`），另导出 `class`、`WeakRef`、`pre_exec`、`post_fork`。`App.zig::App` 是外壳，工作委托给 `class/application.zig::Application`（GObject 名 `GhosttyApplication`，父类 `adw.Application`）；`Surface.zig` 同样转发给 `class/surface.zig::Surface`。\n- `Application.new` 的顺序：加载配置（失败用默认配置并记诊断）→ 按 `language` 配置改写 `LANG` 并保存原值 → `i18n.initGlobalDomain` → `setGtkEnv` → `adw.init` → 选 app id（合法的 `class` 配置优先，否则 `build/info.zig::application_id`）→ `winproto.App.init`（失败退回 `none`）。\n- `Application.run` 取代 `gio.Application.run`：注册、按 `initial-window` 决定是否 activate、非主实例直接返回、`systemd.notify.ready()`，然后循环执行 `glib.MainContext.iteration` 与 `core_app.tick`。`Application.wakeup` 只调 `glib.MainContext.wakeup(null)`。"
+   "source_sha256": "31f44860fcbd8b5510eded058747a04940bdd46ac38b3b4d2d44301b364578e7",
+   "text": "### 入口与主循环\n\n- `src/apprt/gtk.zig` 导出 apprt 必需的 `App`、`Surface`、`resourcesDir`（即 `src/apprt/gtk/flatpak.zig::resourcesDir`），另导出 `class`、`WeakRef`、`pre_exec`、`post_fork`。`App.zig::App` 是外壳，工作委托给 `class/application.zig::Application`（GObject 名 `GhosttyApplication`，父类 `adw.Application`）；`Surface.zig` 同样转发给 `class/surface.zig::Surface`。\n- `Application.new` 的顺序：加载配置（失败用默认配置并记诊断）→ 保存原 `LANG`，`gx/language.zig::startup` 按 `language` 设定界面语言（补丁 GX-0011，见下文 i18n）→ `i18n.initGlobalDomain` → `setGtkEnv` → `adw.init` → 选 app id（合法的 `class` 配置优先，否则 `build/info.zig::application_id`）→ `winproto.App.init`（失败退回 `none`）。\n- `Application.run` 取代 `gio.Application.run`：注册、按 `initial-window` 决定是否 activate、非主实例直接返回、`systemd.notify.ready()`，然后循环执行 `glib.MainContext.iteration` 与 `core_app.tick`。`Application.wakeup` 只调 `glib.MainContext.wakeup(null)`。"
   },
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 符号真源 > 窗口系统与系统集成",
@@ -2809,6 +2823,69 @@
    "text": "### 验证\n\n`ghostty-test` 在 Windows 上编译不过，以下命令在 Linux（或 WSL）运行：\n\n```bash\npython3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx. --filter config --filter cli.\npython3 scripts/zigw.py build -Dapp-runtime=none -Demit-webdata\npython3 -m unittest scripts.test_fork_patches -v\n```\n\n- 第一条覆盖 `src/gx/**` 全部单测（层序、主题覆盖、明暗切换、`-e`、`config-default-files=false`、诊断保留、默认值内容）与上游配置、CLI 单测。\n- 第二条运行 helpgen 与 webgen，确认新键的文档注释能生成配置文档。"
   },
   {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查",
+   "source_sha256": "bd293fb73b5d3fa222f25b76139f6d8e035867b401ac0c98b673b8f0c720a8aa",
+   "text": "## GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查\n\n- 文件：`src/apprt/gtk/class/application.zig`（导入 GX GTK 层并引入其单测的纯新增块；`Application.new` 中按 `language` 改写 `LANG` 的 5 行换成一行 `gx_gtk.language.startup`；`startup` 在 `startupActionMap` 之后注册 GX app action；`propConfig` 开头跟随 `language` 变化）、`src/apprt/gtk/class/window.zig`（导入；`init` 与 `propConfig` 末尾重建菜单与提示；`surfaceMenu` 的参数改为具名，在右键菜单弹出前重建它；`closureTitle` 的兜底标题）、`src/apprt/gtk/class/tab.zig`（标签页兜底标题）、`src/apprt/gtk/class/surface.zig`（`defaultTermioEnv` 给子进程还原 `LANGUAGE`）、`src/apprt/gtk/App.zig`（纯新增 `gxAction`）、`src/apprt/gtk/build/gresource.zig`（登记 `gx/menus` Blueprint）。逻辑都在新路径 `src/apprt/gtk/gx/*.zig` 与 `src/apprt/gtk/ui/1.5/gx/menus.blp`。\n- 标记：`fork(gx): GX-0011`；纯新增（导入、各钩子调用、`gxAction`、Blueprint 登记）都用 begin/end 包住，删掉这些块即得上游原文；改动的上游行（`Application.new` 的 `LANG` 改写、`surfaceMenu` 的参数名、两处兜底标题）上一行写单行标记。\n- 状态：active，未回馈上游。\n- 改动量：6 个文件，`git diff --numstat` 合计 +46/−8（含注释）。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 上游状态",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-上游状态",
+   "source_sha256": "60f159086ea50bf5eda8269f6a20420771574370638b9d76d79c62ea2d73feb2",
+   "text": "### 上游状态\n\n未回馈上游，只服务 Ghostty GX 的中英界面与菜单。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 原因",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-原因",
+   "source_sha256": "210edb32d080deb1814b786ce2d49dfe83dea9d5b2ad81c051dadf4186084f6c",
+   "text": "### 原因\n\n- 上游 `Application.new` 把 `language` 原样写进 `LANG`。GX 默认 `language = zh-CN` 不是 locale 名，GTK 初始化时 `setlocale(LC_ALL, \"\")` 失败，整个进程退回 `C` locale，界面变成英文。\n- glibc 在 `LC_MESSAGES` 为 `C`、`POSIX`、`C.UTF-8` 时忽略 `LANGUAGE`（WSL 默认 `LANG=C.UTF-8`；Ubuntu 24.04 的 glibc 2.39 实测），只设 `LANGUAGE` 不够。\n- 上游的 `language` 不能运行时生效：菜单、按钮提示由模板实例化时的 gettext 定稿；命令面板默认条目在 `Config.default` 时翻译（`src/config/Config.zig::RepeatableCommand.init`），而配置要先加载才知道语言，启动时就会按旧语言翻译。\n- GX 的菜单项（设置、快捷键速查、语言切换）、新建标签页下拉里的启动配置与 `gx:` 绑定动作的 GTK 处理都要挂在上游的应用与窗口类上。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 同步冲突处理",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-同步冲突处理",
+   "source_sha256": "ce0c9b5e0d05691dfc4535e03ed861d7491835bafcfbb1257ee14dcac4481429",
+   "text": "### 同步冲突处理\n\n- `Application.new` 里 `saved_language` 块被上游改动时，取上游版本，再把按 `language` 写 `LANG` 的部分换回 `gx_gtk.language.startup(alloc, &config)`，它必须在 `adw.init()` 之前、`config` 加载之后执行。\n- 上游改 `window.blp` 或 `surface.blp` 的菜单时，同步改 `ui/1.5/gx/menus.blp`（标签写不带 `_()` 的英文 msgid；`po/zh_CN.po` 没有的新 msgid 加进 `src/gx/i18n/gx.zh_CN.po` 后 `just i18n`）。上游改按钮类型或图标名（`open-menu-symbolic`、`view-grid-symbolic`）时同步 `src/apprt/gtk/gx/window.zig::Header.visit`。\n- `Window.surfaceMenu` 或 `Surface` 的 `menu` 信号被上游改名、改签名时，把 `syncSurfaceMenu` 挪到新的「右键菜单弹出前」位置；`defaultTermioEnv` 的 `LANG` 恢复逻辑变化时，`restoreChildEnv` 仍放在它之后。\n- 其余是单行钩子或纯新增块，按原位置放回即可。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 测试锁定",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-测试锁定",
+   "source_sha256": "f0ee1bf46c203462e72c305c9e63f1cde2fe15dc95a770d389ad406e7c96da1c",
+   "text": "### 测试锁定\n\n只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。行为由 `src/apprt/gtk/gx/*.zig` 的单测锁定（`just wsl test --gtk --filter apprt.gtk.gx`）：`LANGUAGE` 与 C locale 判定、子进程 `LANGUAGE` 还原、启动配置参数与查找、速查的分组与标题、`gx:` 动作分派与处理函数的编译。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 移除条件",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-移除条件",
+   "source_sha256": "f2425badbfd1cb165817fc37bfb96b137dd4e6971b3c2c4b2368a56f264392f3",
+   "text": "### 移除条件\n\n上游让 `language` 可以运行时切换且接受 `zh-CN` 这类语言标签，并为菜单与新建标签页下拉提供扩展点时，改用上游机制，删除对应钩子与标记，把登记行改为 `removed`。`gxAction` 与 `gx/menus` 的登记只服务 GX 功能，随 GX 菜单一起移除。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 行为",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-行为-part1",
+   "source_sha256": "0538bc23a21d9f54772a5fd6af2190ea1f40ff933e29b1bf0524b5a9c163308e",
+   "text": "### 行为\n\n- 启动：`gx.i18n.resolve(language)` 决定界面语言（`zh-CN` 或 `en`，未设或不支持时 `zh-CN`；`GHOSTTY_GX_DEFAULTS=0` 也一样）。该语言的 UTF-8 locale（`zh_CN.UTF-8`、`en_US.UTF-8`）已安装时写进 `LANG`（保持上游语义），否则保留原值并告警；`LANGUAGE` 设为 `zh_CN` 或 `en`；先 `gtk_disable_setlocale` 再自行 `setlocale(LC_ALL, \"\")`，然后把 `LC_MESSAGES` 设为该语言的 locale，不可用时保留已有的非 C locale，或退到另一种受支持语言的 locale；都没有时只有 `gx.i18n` 的字符串跟随语言，日志提示生成 locale。随后 `bind_textdomain_codeset(bundle_id, \"UTF-8\")`、`gx.i18n.setCurrent`。默认命令面板条目的译文因此改变时（比较前后哈希），当场重新加载一次配置。\n- 运行时：`language` 变化（用户配置加 `reload_config`、`gui-settings.ghostty` 或语言菜单）后，`Application.propConfig` 更新 `LANGUAGE`（`setenv` 加 `global.syncEnviron`，是 GTK apprt 启动后唯一修改进程环境的地方）与 `LC_MESSAGES`，再调一次 `textdomain` 让 gettext 的缓存失效，并切换 `gx.i18n`；命令面板译文变化时在空闲回调里再硬重载一次配置。各窗口的 `propConfig` 随后重建菜单与按钮提示，并弹出 toast「界面语言已切换，重新打开窗口后全部文字才会更新。」：已存在的上游控件与 libadwaita 自带文字只在创建时取译文。之后新开的对话框、命令面板、窗口与标签页的兜底标题（`Ghostty GX`）都用新语言。\n- 菜单：`ui/1.5/gx/menus.blp` 复刻上游 `window.blp` 的 `main_menu`、`split_menu`、`tab_context_menu` 与 `surface.blp` 的 `context_menu_model`，标签是不带 `_()` 的英文 msgid，由 `gx.i18n` 翻译（不进上游 pot）；每次重建都生成新的 `GMenu` 设到按钮、`AdwTabView` 与终端右键菜单上（原地改菜单时 GTK 弹出菜单保留旧子菜单页，报 “duplicate child name in GtkStack”）。窗口只在语言、启动配置或 `app.gx-settings` 是否存在变化时重建。☰ 菜单新增一段：设置…（`app.gx-settings`；该 action 不存在时改为 `app.open-config::os-open`）、键盘快捷键（`app.gx-keybinds`）、语言子菜单（有状态的单选 action `app.gx-language`，把 `language` 写进 `gui-settings.ghostty`，先切换语言再硬重载配置）。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 行为",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-行为-part2",
+   "source_sha256": "0538bc23a21d9f54772a5fd6af2190ea1f40ff933e29b1bf0524b5a9c163308e",
+   "text": "- 新建标签页下拉：`gx.profiles.detectSystem` 探测到的启动配置加上 `gx-launch-profile`，名称随界面语言；条目激活 `app.new-tab`，参数为 `(0, [\"-e\", argv…])`（自定义命令行为 `--command=<值>`，均为 `class/Overrides.zig::parse` 的语法），新标签页照常继承工作目录；另有「用启动配置新建窗口」子菜单（`app.new-window-command`）。下拉按钮提示改为「启动配置与分屏」。\n- 快捷键速查：`Adw.Dialog`，按类别列出 `keybind` 根集合的绑定（含前导键序列与链式动作，跳过 `ignore` 与 catch-all），同一动作的多个按键并成一行；标题取命令面板默认条目或 GX 补充标题并经 `gx.i18n` 翻译，副标题是配置语法的动作，按键用 `GtkShortcutLabel`；顶部搜索框按标题、动作、类别与按键过滤。\n- `gx:` 绑定动作：`App.gxAction(target, action)` 按标签名分派 `settings`、`main_menu`、`keybinds`、`new_tab_profile`、`new_window_profile`；`action` 是 `anytype`，`src/gx/action.zig::Action` 合入前后都能编译，未知标签返回 false。`main_menu` 优先从可见的 ☰ 按钮弹出，否则借用活动终端的右键弹出菜单在其右上角显示，关闭后恢复原菜单。\n- 子进程：`Surface.defaultTermioEnv` 在上游恢复 `LANG` 之后把 `LANGUAGE` 恢复为启动时的值（原来没有就删除），终端里的 shell 保持系统语言。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查 > 验证",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0011-gtk-界面语言运行时切换-gx-菜单-启动配置与快捷键速查-验证",
+   "source_sha256": "c400d5f3d36e3e8ea8dee7e9d41cf9e4a3c4852c99998d8e6a7461d80cf71b93",
+   "text": "### 验证\n\n`ghostty-test` 与 GTK app 在 Windows 上编译不过，以下命令经 WSL（Ubuntu 24.04，`just wsl setup --apt` 已生成 `zh_CN.UTF-8` 与 `en_US.UTF-8`）运行：\n\n```bash\njust wsl sync <worktree> --dirty --clone '~/src/gx_ghostty-GA'\njust wsl build --gtk --clone '~/src/gx_ghostty-GA'\njust wsl test --gtk --filter apprt --clone '~/src/gx_ghostty-GA'\njust wsl smoke --out <目录> --lang zh_CN --xdotool <脚本> --clone '~/src/gx_ghostty-GA'\npython -m unittest scripts.test_fork_patches -v\n```\n\n截图核对：默认配置下（含继承 `LANG=C.UTF-8`）界面与命令面板是中文、终端里 `LANG`/`LANGUAGE` 仍是原值；`--config` 写 `language = en` 时为英文；☰ 菜单有设置…、键盘快捷键与语言子菜单；新建标签页下拉列出启动配置，点击后新标签页运行该程序；语言菜单选 English 或改配置后 `reload_config`，菜单、提示与命令面板变成英文并出现 toast。"
+  },
+  {
    "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程",
@@ -2931,22 +3008,22 @@
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part1",
-   "source_sha256": "d9ba1c3a2040a855ebced2b15b96525851155f50044d5d6bb546815e4f349a41",
+   "source_sha256": "77c62c2ef82fdd1ca9b8c465339ab0d4e79fcc98ab711a41d14270db3d265fdf",
    "text": "## 登记表\n\n格式约定（`scripts/test_fork_patches.py` 按此解析）：\n\n- 表格位于 `fork-patches:begin` 与 `fork-patches:end` 两行注释之间，表头固定为 `ID | 文件 | 标记 | 状态`。\n- `ID` 形如 `GX-0001`；`文件` 是仓库相对的 POSIX 路径；`标记` 必须等于 `fork(gx): <ID>`；`文件` 与 `标记` 写在反引号里。\n- `状态` 取 `active`（标记必须存在于该文件）或 `removed`（标记必须已从该文件消失）。\n- 同一个 (ID, 文件) 只登记一行；每个 ID 在下文都有以 `## <ID>` 开头的小节。\n\n<!-- fork-patches:begin -->\n| ID | 文件 | 标记 | 状态 |\n|---|---|---|---|\n| GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |\n| GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |\n| GX-0003 | `src/apprt.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/action.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/runtime.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/structs.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/surface.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/build/SharedDeps.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/config/Config.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/datastruct/split_tree.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/font/face.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/input/Binding.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/main_ghostty.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |\n| GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |\n| GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part2",
-   "source_sha256": "d9ba1c3a2040a855ebced2b15b96525851155f50044d5d6bb546815e4f349a41",
-   "text": "| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |\n| GX-0006 | `include/ghostty/vt/modes.h` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/Surface.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/modes.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |\n| GX-0008 | `src/os/hostname.zig` | `fork(gx): GX-0008` | active |\n| GX-0008 | `src/termio/stream_handler.zig` | `fork(gx): GX-0008` | active |\n| GX-0009 | `src/font/DeferredFace.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/backend.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/discovery.zig` | `fork(gx): GX-0009` | active |\n| GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |"
+   "source_sha256": "77c62c2ef82fdd1ca9b8c465339ab0d4e79fcc98ab711a41d14270db3d265fdf",
+   "text": "| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |\n| GX-0006 | `include/ghostty/vt/modes.h` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/Surface.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/modes.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |\n| GX-0008 | `src/os/hostname.zig` | `fork(gx): GX-0008` | active |\n| GX-0008 | `src/termio/stream_handler.zig` | `fork(gx): GX-0008` | active |\n| GX-0009 | `src/font/DeferredFace.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/backend.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/discovery.zig` | `fork(gx): GX-0009` | active |\n| GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |\n| GX-0011 | `src/apprt/gtk/App.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0011` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part3",
-   "source_sha256": "d9ba1c3a2040a855ebced2b15b96525851155f50044d5d6bb546815e4f349a41",
-   "text": "| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
+   "source_sha256": "77c62c2ef82fdd1ca9b8c465339ab0d4e79fcc98ab711a41d14270db3d265fdf",
+   "text": "| GX-0011 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |\n| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
   },
   {
    "anchor": "fork 补丁登记 > 规则",
@@ -4177,8 +4254,8 @@
    "anchor": "structure",
    "doc": "src/apprt/gtk/App.zig",
    "id": "src-apprt-gtk-app-zig-structure",
-   "source_sha256": "597d05b86ead9e1a787a651b11fc9498dbd7a7ea7b8a3e7370e45ac85f18ac1b",
-   "text": "pub const application_id = @import(\"build/info.zig\").application_id — GTK application ID\npub const object_path = @import(\"build/info.zig\").object_path — GTK object path\npub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void\npub fn run(self: *App) !void\npub fn terminate(self: *App) void\npub fn wakeup(self: *App) void — Called by CoreApp to wake up the event loop.\npub fn performAction(self: *App, target: apprt.Target, comptime action: apprt.Action.Key, value: apprt.Action.Value(action)) !bool\npub fn performIpc(alloc: Allocator, target: apprt.ipc.Target, comptime action: apprt.ipc.Action.Key, value: apprt.ipc.Action.Value(action)) !bool — Send the given IPC to a running Ghostty. Returns `true` if the action was able to be performed, `false` otherwise. Note that this is a static function. Since this is called from a CLI app (or\npub fn redrawInspector(_: *App, surface: *Surface) void — Redraw the inspector for the given surface."
+   "source_sha256": "4d9914f0f826e9224314b5227c1201f2e1514da5375c9e27fbb842e3e99d3294",
+   "text": "pub const application_id = @import(\"build/info.zig\").application_id — GTK application ID\npub const object_path = @import(\"build/info.zig\").object_path — GTK object path\npub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void\npub fn run(self: *App) !void\npub fn terminate(self: *App) void\npub fn wakeup(self: *App) void — Called by CoreApp to wake up the event loop.\npub fn performAction(self: *App, target: apprt.Target, comptime action: apprt.Action.Key, value: apprt.Action.Value(action)) !bool\npub fn gxAction(self: *App, target: apprt.Target, action: anytype) !bool — Perform a Ghostty GX binding action (`gx.action.Action`). Returns whether it was handled.\npub fn performIpc(alloc: Allocator, target: apprt.ipc.Target, comptime action: apprt.ipc.Action.Key, value: apprt.ipc.Action.Value(action)) !bool — Send the given IPC to a running Ghostty. Returns `true` if the action was able to be performed, `false` otherwise. Note that this is a static function. Since this is called from a CLI app (or\npub fn redrawInspector(_: *App, surface: *Surface) void — Redraw the inspector for the given surface."
   },
   {
    "anchor": "structure",
@@ -4462,10 +4539,66 @@
   },
   {
    "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/app.zig",
+   "id": "src-apprt-gtk-gx-app-zig-structure",
+   "source_sha256": "4470d214775721f177824b02355c5d06aa9e86ae20e308cc42fa1d4c1f999c1f",
+   "text": "//! Ghostty GX additions to `class/application.zig::Application`: the\n//! `app.gx-language` and `app.gx-keybinds` actions, following `language`\n//! changes at runtime, and the GTK side of the Ghostty GX binding actions\n//! (`gx:<name>[:<arg>]`, dispatched by the core through `App.gxAction`).\npub fn startup(app: *Application) void — Registers the Ghostty GX app actions: `app.gx-language` (stateful, the `language` configuration value, written to `gui-settings.ghostty`) and `app.gx-keybinds` (the keyboard shortcuts cheat sheet). Called from\npub fn configChanged(app: *Application) void — Follows the `language` of the application configuration. Called from `Application.propConfig`, which runs before the windows see the new configuration and rebuild their menus.\npub fn performGxAction(app: *Application, target: apprt.Target, action: anytype) bool — Handles a Ghostty GX binding action for `target`. `action` is a `gx.action.Action`; see `request`. Returns false when the action is not handled.\npub const Request = union(enum)\npub fn request(action: anytype) Request — Maps a `gx.action.Action` to a request by tag name, so this compiles with any tagged union (`settings`, `main_menu`, `keybinds`, and the profile actions with a profile id or name); other tags are unknown."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/language.zig",
+   "id": "src-apprt-gtk-gx-language-zig-structure",
+   "source_sha256": "99c624f9d6e97bef9ebee797b2ae231cc9478e99f130db82d538a16f67664d29",
+   "text": "//! The Ghostty GX UI language on the GTK apprt: applies the `language`\n//! configuration to gettext (the upstream GTK strings) and to `gx.i18n`\n//! (the Ghostty GX strings), at startup and when it changes at runtime.\n//!\n//! The language picks the gettext catalogs through `LANGUAGE`. glibc\n//! ignores `LANGUAGE` while the messages locale is `C`, `POSIX` or\n//! `C.UTF-8` (the WSL default), so the messages locale is switched to the\n//! UTF-8 locale of the language when it is installed, else kept if it is\n//! already a real locale, else set to the locale of another supported\n//! language. Without any such locale only the `gx.i18n` strings follow the\n//! language. Child processes get the original `LANG` and `LANGUAGE` back\n//! (see `restoreChildEnv`).\npub fn startup(alloc: Allocator, config: *configpkg.Config) void — Applies the configured language before GTK is initialized. This replaces upstream's `LANG = language`, which breaks with GX values such as `zh-CN` that are not locale names: `LANG` becomes the UTF-8 locale\npub fn switchTo(lang: Language) bool — Switches the running app to `lang`: `LANGUAGE`, the messages locale, the gettext caches and `gx.i18n`. Widgets that already exist keep their text. Returns true if the default command palette entries translate\npub fn restoreChildEnv(env: *std.process.Environ.Map) Allocator.Error!void — Gives a child process environment the `LANGUAGE` value Ghostty was started with (upstream restores `LANG` the same way).\npub fn fallbackTitle() [:0]const u8 — The window and tab title used before the terminal sets one.\npub fn gettextLanguages(lang: Language) [:0]const u8 — The `LANGUAGE` list for `lang`. English has no catalog, so gettext returns the msgids.\npub fn isCLocale(name: []const u8) bool — Whether gettext ignores `LANGUAGE` under the locale `name`."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/launch.zig",
+   "id": "src-apprt-gtk-gx-launch-zig-structure",
+   "source_sha256": "3de37c448f10483a2999d7cb79b66250077b13f8e3623d1cf1d1dbede577c941",
+   "text": "//! Launch profiles (`gx.profiles`) for the GTK apprt: the profiles of the\n//! running system plus `gx-launch-profile`, with display names in the\n//! current UI language and the arguments that start them through the\n//! `app.new-tab` and `app.new-window-command` actions.\npub const Item = struct\npub const List = struct — Launch profiles. All memory is owned by `arena`.\n  pub fn deinit(self: *List) void\n  pub fn find(self: *const List, query: []const u8) ?*const Item — The profile whose id or name is `query`; names match ignoring ASCII case.\npub fn detect(alloc: Allocator, config: *const configpkg.Config) Allocator.Error!List — Detects the profiles of the running system and appends the `gx-launch-profile` entries of `config`. Detection only probes a few paths, so it runs whenever a menu is rebuilt.\npub fn args(alloc: Allocator, command: gx.profiles.Command) Allocator.Error![]const [:0]const u8 — The `Overrides.parse` arguments that start `command`. Detected shells run through `-e`, which takes the following arguments verbatim (paths may contain spaces); custom profiles are command lines in the syntax"
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/main.zig",
+   "id": "src-apprt-gtk-gx-main-zig-structure",
+   "source_sha256": "bac760b30f548972eb53b9004cc579b6ff5602e2637c61d45ca73f142598d466",
+   "text": "//! The Ghostty GX layer of the GTK apprt (fork patch GX-0011), on top of\n//! the shared core in `src/gx`: the UI language at startup and at runtime,\n//! the GX menus with launch profiles, the keyboard shortcuts cheat sheet\n//! and the handler of the `gx:` binding actions. Upstream GTK files only\n//! call into these modules from small marked hooks.\npub const app = @import(\"app.zig\")\npub const language = @import(\"language.zig\")\npub const launch = @import(\"launch.zig\")\npub const menus = @import(\"menus.zig\")\npub const shortcuts = @import(\"shortcuts.zig\")\npub const shortcuts_dialog = @import(\"shortcuts_dialog.zig\")\npub const window = @import(\"window.zig\")"
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/menus.zig",
+   "id": "src-apprt-gtk-gx-menus-zig-structure",
+   "source_sha256": "0bc19ce8f17f057b5947e90123166be6ed9b235e9429c52205518cc5bfdf488d",
+   "text": "//! Ghostty GX menus for the GTK apprt. `ui/1.5/gx/menus.blp` mirrors the\n//! upstream window and terminal menus and adds the Ghostty GX entries. Its\n//! labels are English msgids that are translated here with `gx.i18n`, so\n//! the menus of open windows can be rebuilt whenever the UI language\n//! changes. Callers set the new menus on their buttons and popovers rather\n//! than editing the menus in place: GTK popover menus keep the pages of\n//! removed submenus and then refuse new pages with the same label.\npub const Id = enum — The menus defined in `gx/menus.blp`.\npub const Options = struct\n  pub fn signature(self: Options) u64 — A hash of everything the menus are built from, including the UI language, to skip rebuilding menus that would not change.\npub const Source = struct — The menus of `gx/menus.blp` with the dynamic sections filled in.\n  pub fn init(options: Options) Source\n  pub fn deinit(self: *Source) void\n  pub fn translated(self: *const Source, comptime id: Id) *gio.Menu — A new menu with the items of menu `id` translated into the current UI language. Empty sections and submenus are dropped. The caller owns the returned reference.\npub fn isCurrent(model: *gio.MenuModel) bool — Whether `model` is a menu built by `Source.translated` in the current UI language."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/shortcuts_dialog.zig",
+   "id": "src-apprt-gtk-gx-shortcuts-dialog-zig-structure",
+   "source_sha256": "b6055985b9703aa82ddc8e1e2f4dcaa9d80304340614c46950444d5033c542a4",
+   "text": "//! The Ghostty GX keyboard shortcuts cheat sheet: an `Adw.Dialog` that\n//! lists the keybindings of the configuration by category (see\n//! `shortcuts.zig`) with a search field. Built in code, in the current UI\n//! language, each time it is opened.\npub fn present(alloc: Allocator, config: *const configpkg.Config, parent: *gtk.Widget) void — Shows the cheat sheet for the keybindings of `config` over `parent`."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/shortcuts.zig",
+   "id": "src-apprt-gtk-gx-shortcuts-zig-structure",
+   "source_sha256": "d727c26c45f2dd240f11f908ac4b15ad1313b64aacaa4f402693dd32788846d9",
+   "text": "//! The model of the Ghostty GX keyboard shortcuts cheat sheet: the\n//! keybindings of a configuration grouped by category, one row per action\n//! with every key sequence that runs it. Titles are English msgids for\n//! `gx.i18n`; the dialog in `shortcuts_dialog.zig` translates them.\npub const Category = enum\n  pub fn title(self: Category) [:0]const u8 — The msgid of the category title.\npub const Row = struct\npub fn collect(arena: Allocator, set: *const Binding.Set) Allocator.Error![]Row — The rows for the bindings of `set`, ordered by category and then by the first binding of each action. `ignore` bindings and catch-all keys are left out. The rows borrow actions from `set` and allocate in\npub fn category(action: Binding.Action) Category — The category of an action, by its tag name so that actions added later fall into `other` instead of breaking the build.\npub fn title(action: Binding.Action, formatted: []const u8) ?[:0]const u8 — The msgid of the title of an action: the title of its default command palette entry, else of the only palette entry with the same action name, else a Ghostty GX title. Null when there is none; callers then"
+  },
+  {
+   "anchor": "structure",
    "doc": "src/apprt/gtk/gx/style.zig",
    "id": "src-apprt-gtk-gx-style-zig-structure",
    "source_sha256": "265aa02a4d15df4f6f3ae7db64721deea421b61011bab5a2abdf1875862a2b21",
    "text": "//! The Ghostty GX look of the GTK app (fork patch GX-0016): the static\n//! rules in `style.css` plus colors derived from the terminal theme\n//! (`src/gx/gtk_css.zig`), in a CSS provider of its own. `Style.apply` runs\n//! from `Application.propConfig` on startup and on every configuration\n//! change; it also applies `window-theme` to the style manager (from an\n//! idle callback), which upstream does only once in\n//! `Application.startupStyleManager`.\npub const priority — Above libadwaita and Ghostty's `style.css` (`APPLICATION`), below Ghostty's runtime CSS (`APPLICATION + 3`) and `gtk-custom-css` (`USER`).\npub const static_css — The static rules, independent of the configuration.\npub const Style = struct — The Ghostty GX stylesheet and color scheme of the application.\n  pub fn apply(self: *Style, config: *const CoreConfig) void — Loads the stylesheet for `config`, adding the provider to the default display the first time, and applies `window-theme`.\n  pub fn deinit(self: *Style) void — Removes the provider from the display and drops a pending scheme.\npub fn colorScheme(config: *const CoreConfig) adw.ColorScheme — The style manager color scheme for `window-theme`, as `Application.startupStyleManager` computes it.\npub fn writeCss(writer: *std.Io.Writer, config: *const CoreConfig) std.Io.Writer.Error!void — Writes the whole stylesheet for `config`: the static rules, then the colors when the window follows the terminal colors."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/window.zig",
+   "id": "src-apprt-gtk-gx-window-zig-structure",
+   "source_sha256": "7dc9ec5b74d32ee652bdf22957ea42ba09f0a76dc03f149a4fdb79c8bba66da9",
+   "text": "//! Ghostty GX additions to `class/window.zig::Window`: menus and header\n//! bar tooltips in the current UI language (rebuilt when it changes, with a\n//! toast because some libadwaita labels only change in new windows), launch\n//! profiles in the new tab dropdown, the terminal context menu, and opening\n//! the main menu for the `gx:main_menu` action.\npub fn sync(window: *Window) void — Brings the menus and tooltips of `window` up to date with the UI language, the launch profiles and the configuration. Called when the window is created and whenever its configuration changes.\npub fn syncSurfaceMenu(surface: *Surface) void — Rebuilds the context menu of `surface` if the UI language changed since it was built. Called right before the menu opens.\npub fn popupMainMenu(window: *Window) bool — Opens the main menu of `window`: from its header bar or tab bar button when one is shown, else from the active terminal. Returns false if there is neither."
   },
   {
    "anchor": "structure",

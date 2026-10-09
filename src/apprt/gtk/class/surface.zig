@@ -1611,6 +1611,9 @@ pub const Surface = extern struct {
         } else {
             _ = env.orderedRemove("LANG");
         }
+        // fork(gx): GX-0011 begin: child processes keep the LANGUAGE Ghostty was started with
+        try @import("../gx/main.zig").language.restoreChildEnv(&env);
+        // fork(gx): GX-0011 end
 
         // Don't leak these GTK environment variables to child processes.
         _ = env.orderedRemove("GDK_DEBUG");

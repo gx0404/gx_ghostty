@@ -66,6 +66,14 @@ pub fn performAction(
 ) !bool {
     return try self.app.performAction(target, action, value);
 }
+// fork(gx): GX-0011 begin: Ghostty GX binding actions (`gx:`), called by the core
+
+/// Perform a Ghostty GX binding action (`gx.action.Action`). Returns
+/// whether it was handled.
+pub fn gxAction(self: *App, target: apprt.Target, action: anytype) !bool {
+    return @import("gx/main.zig").app.performGxAction(self.app, target, action);
+}
+// fork(gx): GX-0011 end
 
 /// Send the given IPC to a running Ghostty. Returns `true` if the action was
 /// able to be performed, `false` otherwise.

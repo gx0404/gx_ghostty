@@ -52,6 +52,12 @@ const gx_style = @import("../gx/style.zig");
 // fork(gx): GX-0016 end
 
 const log = std.log.scoped(.gtk_ghostty_application);
+// fork(gx): GX-0011 begin: the Ghostty GX layer of the GTK apprt
+const gx_gtk = @import("../gx/main.zig");
+test {
+    _ = gx_gtk;
+}
+// fork(gx): GX-0011 end
 
 extern "c" fn setenv(name: ?[*]const u8, value: ?[*]const u8, overwrite: c_int) c_int;
 
@@ -302,11 +308,8 @@ pub const Application = extern struct {
                 const lang = global.environ().getPosix("LANG") orelse break :old_language null;
                 break :old_language alloc.dupeSentinel(u8, @ptrCast(lang), 0) catch null;
             };
-            if (config.language) |language| {
-                // Override LANG if we need to (sync global environs if so)
-                _ = setenv("LANG", @ptrCast(language), 1);
-                global.syncEnviron();
-            }
+            // fork(gx): GX-0011 resolve `language` through Ghostty GX (valid locale, LANGUAGE, messages locale)
+            gx_gtk.language.startup(alloc, &config);
             break :saved_language old_language;
         };
 
@@ -1313,6 +1316,9 @@ pub const Application = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
+        // fork(gx): GX-0011 begin: follow `language` changes before the windows rebuild their menus
+        gx_gtk.app.configChanged(self);
+        // fork(gx): GX-0011 end
         // Sync our accelerators for menu items.
         self.syncActionAccelerators();
 
@@ -1407,6 +1413,9 @@ pub const Application = extern struct {
 
         // Setup our action map
         self.startupActionMap();
+        // fork(gx): GX-0011 begin: Ghostty GX app actions (language picker, keyboard shortcuts)
+        gx_gtk.app.startup(self);
+        // fork(gx): GX-0011 end
 
         // Setup our global shortcuts
         self.startupGlobalShortcuts();
