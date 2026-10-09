@@ -54,7 +54,7 @@
 
 可以记 PASS 的证据：在真实桌面会话里截下、已经读过、能看出预期状态的截图，加上对应的日志行。不能记 PASS 的：只确认进程在运行或窗口存在；截图全黑、全白或截到了别的窗口；截了但没读；只读日志没看界面。
 
-已知的坑：微软拼音把 Ctrl+Shift+F 当作简繁切换吞掉，自动化测试查找栏前先切到英文键盘布局，或从命令面板打开查找；GUI 子系统的 exe 没有控制台（见下文「Windows 本机」）；复现 CI 的软件渲染设 `GHOSTTY_GX_OPENGL=software`，并把 Mesa 的 DLL 放进 exe 旁的 `mesa\`。
+已知的坑：微软拼音把 Ctrl+Shift+F 当作简繁切换吞掉，自动化测试查找栏前先切到英文键盘布局，或从命令面板打开查找；GUI 子系统的 exe 没有控制台（见下文「Windows 本机限制」）；复现 CI 的软件渲染设 `GHOSTTY_GX_OPENGL=software`，并把 Mesa 的 DLL 放进 exe 旁的 `mesa\`。
 
 难在本机复现的路径有测试钩子：向顶层窗口 `SendMessage` `src/apprt/win32/Window.zig::WM_GHOSTTY_SIMULATE_DPI`（`wParam` 为 DPI）走一遍 `WM_DPICHANGED` 的处理，向终端子窗口发 `src/apprt/win32/Surface.zig::WM_GHOSTTY_SIMULATE_GPU_RESET` 让渲染器把下一帧当作 GPU 重置处理。钩子只证明这两条代码路径，不代证真实的多显示器与驱动重置。软件渲染路径用 `GHOSTTY_GX_OPENGL=software` 加 exe 旁的 `mesa\` 验证（`gx-ci` 的 `win_smoke` 也是这样做的）。
 
@@ -149,7 +149,7 @@ GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来
 
 差异要点：图谱新鲜度只在发版与同步时检查，push CI 不查；Linux 完整单测（`linux-main`）、GTK 与 macOS 的 CI 证据要等用户 push 或手动触发后才有，此前一律 PENDING；Windows 的单测只在本机跑，CI 只构建 Windows app。2026-10-09 时 `origin/gx_ghostty` 仍停在 `0ac89c301`（2026-10-07），之后加入的 `windows-app`、`win_smoke`、`linux-gtk-noble` 与 gx-release 的 `windows-app` 都还没在 GitHub 上跑过。
 
-## Windows 本机
+## Windows 本机限制
 
 能跑：框架单测、`just fmt-check`、`just test-vt` 与 `just build-vt`（MSVC）、`just build` 与 `just test`（GNU ABI，win32 apprt）、Windows GUI 验证、`just package-windows`，以及经 `just wsl` 的 Linux 构建、单测与 Xvfb 截图。限制与已知的环境性失败：
 
