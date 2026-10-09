@@ -581,12 +581,14 @@ pub fn performAction(
         },
 
         .ring_bell => {
-            // Audio bell.
-            _ = w32.MessageBeep(0xFFFFFFFF);
-            // Visual bell: flash the taskbar button if the window owning
-            // this surface isn't currently the foreground window. Without
-            // this, BEL on a backgrounded terminal is invisible.
-            switch (target) {
+            const features = self.config.@"bell-features";
+            // `system`: the Windows default beep sound.
+            if (features.system) _ = w32.MessageBeep(0xFFFFFFFF);
+            // `attention`: flash the taskbar button until the window comes
+            // to the foreground, if the window owning this surface isn't
+            // the foreground window. Without this, BEL on a backgrounded
+            // terminal is invisible.
+            if (features.attention) switch (target) {
                 .app => {},
                 .surface => |core_surface| {
                     if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
@@ -602,7 +604,7 @@ pub fn performAction(
                         }
                     }
                 },
-            }
+            };
             return true;
         },
 
@@ -1268,8 +1270,9 @@ pub fn performAction(
                 .surface => |core_surface| {
                     const win = core_surface.rt_surface.parent_window;
                     if (win.hwnd) |hwnd| {
-                        // ShowWindow(SW_RESTORE) brings back from minimize.
-                        _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+                        // SW_RESTORE brings the window back from minimized;
+                        // it would also un-maximize, so only when minimized.
+                        if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
                         _ = w32.SetForegroundWindow(hwnd);
                         // Make sure the tab containing this surface is active.
                         if (win.findTabIndex(core_surface.rt_surface)) |idx| {
@@ -1987,6 +1990,8 @@ const WM_APP_TRAY: u32 = w32.WM_APP + 3;
 const NOTIF_DESKTOP_UID: u32 = 1;
 const NOTIF_DESKTOP_TIMER_ID: usize = 2;
 
+extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) i32;
+
 /// Start the quit timer. Called when the last surface closes.
 pub fn startQuitTimer(self: *App) void {
     // Cancel any existing timer first.
@@ -2111,9 +2116,16 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     @memcpy(nid.szTip[0..tip.len], tip);
     nid.szTip[tip.len] = 0;
 
-    // Add the icon, show notification, then remove the icon.
-    _ = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid);
-    _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
+    // Add the icon with the balloon, then remove the icon. While the icon
+    // of an earlier notification still exists adding fails and modifying
+    // it shows the new balloon; doing both would show it twice.
+    const shown = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0 or
+        w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid) != 0;
+    if (shown) {
+        log.info("desktop notification shown surface_id={x}", .{self.notif_desktop_surface_id});
+    } else {
+        log.warn("desktop notification could not be shown", .{});
+    }
 
     // Schedule icon removal via a timer.
     _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
@@ -2448,6 +2460,7 @@ fn msgWndProc(
         // NIN_BALLOONUSERCLICK on the desktop notification.
         const event: u32 = @intCast(lparam & 0xFFFF);
         if (wparam == NOTIF_DESKTOP_UID and event == w32.NIN_BALLOONUSERCLICK) {
+            log.info("desktop notification clicked surface_id={x}", .{app.notif_desktop_surface_id});
             // Focus the surface that produced the notification (click-to-
             // focus, matching macOS/GTK).
             if (app.notif_desktop_surface_id != 0) {
