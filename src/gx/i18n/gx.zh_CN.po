@@ -612,3 +612,50 @@ msgstr "显示全部键盘快捷键。"
 
 msgid "Open the main menu."
 msgstr "打开主菜单。"
+
+#. win32 W3: command palette entries and groups, keyboard shortcut sheet
+msgid "Type a command…"
+msgstr "输入命令…"
+
+msgid "Recently Used"
+msgstr "最近使用"
+
+msgid "Launch Profiles"
+msgstr "启动配置"
+
+msgid "Commands"
+msgstr "命令"
+
+msgid "Themes"
+msgstr "主题"
+
+msgid "Switch to Tab: {title}"
+msgstr "切换到标签: {title}"
+
+msgid "Current Tab"
+msgstr "当前标签页"
+
+msgid "New Tab: {name}"
+msgstr "新建标签页: {name}"
+
+msgid "Settings: {section}"
+msgstr "设置: {section}"
+
+#. {language} is the native name of the other language: English or 中文
+msgid "Switch Language to {language}"
+msgstr "切换界面语言为 {language}"
+
+msgid "Current language: {language}"
+msgstr "当前语言：{language}"
+
+msgid "Theme: {name}"
+msgstr "主题: {name}"
+
+msgid "Current Theme"
+msgstr "当前主题"
+
+msgid "Type to search {count} themes…"
+msgstr "输入关键字搜索 {count} 个主题…"
+
+msgid "Navigation"
+msgstr "导航"
