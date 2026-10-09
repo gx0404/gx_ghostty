@@ -11,6 +11,10 @@
 
 ## 0.0.2(TBD)
 
+### Changed
+
+- 知识库产物 `docs/kb/chunks.json` 改为 schema 2，体积从约 2.3 MiB 降到约 1.8 MiB（预算仍是 2.5 MiB）：每个文档一行头（路径与逐文档的 `source_sha256`），其后每片一行，diff 按行对应小节；Markdown 正文不变，Zig 结构省略 `pub` 前缀、超长模块文档截断，Zig 与 C 头文件的文档注释只留摘要句。`just kb-query --json` 的 `id` 改为 `path#anchor`；旧格式的产物由 `just kb-check` 报「格式或 schema 变化」，运行 `just kb` 重建即可。
+
 ## 0.0.1(2026-10-10)
 
 Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应用，两端共用 GX 核心与默认配置，并有 fork 自己的发布链与开发框架。括号里的 GX-NNNN 是 `docs/FORK_PATCHES.md` 登记的上游源码补丁。

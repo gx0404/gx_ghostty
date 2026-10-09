@@ -69,7 +69,7 @@
 ### 生成物默认只检查
 
 - 入库的图谱产物只有 `graphify-out/GRAPH_REPORT.md` 与 `source-fingerprint.json`；`graph.json` 本机重建并被忽略，缺它 graph-check 照常运行。KB 产物是 `docs/kb/chunks.json`。编辑工具写这些路径会被 hook 拒绝，只能经 `just graph` / `just kb` 生成；有意重建后审 diff，检查失败时不得手改产物或放宽排除表来「变绿」。`GRAPH_REPORT.md` 里「Run `graphify update .`」的提示不适用：`scripts/graphify.py` 拒绝 `update`，重建一律 `just graph`。
-- KB 触发：语料变化，即各级 AGENTS 与根目录说明文档（含 `CHANGELOG.md`）、`docs/` 与 `docs/AGENT_RULES/` 的 Markdown、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含 `///`）、`include/ghostty/**/*.h` 的声明；清单以 `scripts/build_agent_kb.py` 为准，函数体改动不会让 KB 过期。kb-check 在 framework-check 里，过期即失败，修法是 `just kb`。
+- KB 触发：语料变化，即各级 AGENTS 与根目录说明文档（含 `CHANGELOG.md`）、`docs/` 与 `docs/AGENT_RULES/` 的 Markdown、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含 `///`）、`include/ghostty/**/*.h` 的声明；清单、格式与裁剪规则以 `scripts/build_agent_kb.py` 为准，函数体改动不会让 KB 过期。kb-check 在 framework-check 里，过期即失败，修法是 `just kb`。体积预算 2.5 MiB 不放宽（`scripts/test_agent_kb.py::SIZE_BUDGET_BYTES`）。
 - 图谱触发：未被 `.graphifyignore` 排除的被索引源文件增删改（扩展名见 `scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS`），或管线输入 `scripts/graphify_fingerprint.py::PIPELINE_INPUTS`（两个图谱脚本与 `.graphifyignore`）变化。日常可不立即重建；发版前与同步后 `just graph`，再 `just generated-check`。已知盲区：graphify 跳过名为 `build` 的目录（`src/build/**` 不在图里），拿不到 `include/` 头文件的符号，这两处直接读源码或用 `just kb-query`。graphify 一律经 venv 的 `python -m graphify` 运行，不直接执行 `graphify.exe`（Windows 智能应用控制会拦截）。
 
 ### fork 补丁登记

@@ -94,7 +94,7 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 
 ### 7. 生成物与版本
 
-- KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。
+- KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。产物是 schema 2 的紧凑 JSON：首行文件头，每个文档一行 `[path, source_sha256, [`（逐文档的来源哈希），其后每片一行 `[anchor, text]`，所以 diff 里变化的行就是变化的小节；chunk id 不入库，`kb-query --json` 的 `id` 由 `path#anchor` 推导。Markdown 正文原样收录；代码层为控制体积做了裁剪：Zig 结构省略 `pub` 前缀，模块文档丢掉分隔线与字形表、超过 3000 字符截断，`///` 与头文件注释只留首句及 120 字符内的后续整句。体积预算 2.5 MiB 由 `scripts/test_agent_kb.py` 锁定，逼近时收紧代码层裁剪、用 `just kb-query` 对照代表查询的前后结果，不放宽预算，也不删 Markdown 语料。
 - GX 译表：改了两份 `.po` 就 `just i18n`，`src/gx/i18n/zh_CN.zig` 随改动提交。
 - 图谱：日常不强制重建；发版前和上游同步后必须 `just graph`，再跑 `just generated-check`。
 - 版本：CHANGELOG 标题格式用 `just version-check` 校验；CHANGELOG 前 6000 字符也是 KB 语料，改完同样要 `just kb`。产品版本仍以 `build.zig.zon` 为真源，不做同步。

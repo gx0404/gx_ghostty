@@ -3,11 +3,14 @@
 
 用法：python scripts/agent_kb.py <查询词...> [--top 8] [--json] [--kb PATH]
 
+读取 schema 2 产物（scripts/build_agent_kb.py 写出）：docs 的每项是 [path, source_sha256,
+[[anchor, text], ...]]，展开成片后按 path#anchor 推导 chunk id（同一文档内重复的锚点
+依次加 ~2、~3）。
 分词：拉丁词 [a-z0-9_./:-]{2,}（小写；`path::symbol`、`snake_case` 这类复合词另拆出各段）
 加 CJK 二元组（单字词保留单字）。索引覆盖正文、标题路径（权重 2）与文档路径；
 查询按 GLOSSARY 做中英术语互扩（扩展词权重 0.5），让英文标识符也能命中中文领域文档。
 同一文档最多返回 2 片，结果覆盖更多来源。每条命中带 doc 与 anchor，便于回源阅读。
-没有命中时输出“(无命中)”，退出码仍为 0；知识库缺失或损坏退出 2。
+没有命中时输出“(无命中)”，退出码仍为 0；知识库缺失、损坏或 schema 不符退出 2。
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KB = REPO_ROOT / "docs" / "kb" / "chunks.json"
+SCHEMA_VERSION = 2
 K1 = 1.2
 B = 0.75
 ANCHOR_WEIGHT = 2
@@ -149,12 +153,11 @@ class KBIndex:
                 if tf:
                     score += weight * self.idf[term] * tf * (K1 + 1) / (tf + norm)
             if score > 0:
-                chunk = self.chunks[index]
-                scored.append((-score, str(chunk.get("doc", "")), str(chunk.get("id", "")), index))
+                scored.append((-score, str(self.chunks[index].get("doc", "")), index))
         scored.sort()
         results: list[dict] = []
         per_doc_count: Counter = Counter()
-        for negative, doc, _id, index in scored:
+        for negative, doc, index in scored:
             if per_doc > 0 and per_doc_count[doc] >= per_doc:
                 continue
             per_doc_count[doc] += 1
@@ -177,6 +180,30 @@ class KBLoadError(RuntimeError):
     pass
 
 
+def expand_docs(docs: list) -> list[dict]:
+    """把 schema 2 的 [path, source_sha256, [[anchor, text], ...]] 展开成片；格式不符抛 ValueError。"""
+    chunks: list[dict] = []
+    for entry in docs:
+        if not (
+            isinstance(entry, list)
+            and len(entry) == 3
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], str)
+            and isinstance(entry[2], list)
+        ):
+            raise ValueError("docs 的每项应为 [path, source_sha256, chunks]")
+        path, _digest, parts = entry
+        seen: Counter = Counter()
+        for part in parts:
+            if not (isinstance(part, list) and len(part) == 2 and all(isinstance(value, str) for value in part)):
+                raise ValueError(f"{path} 的片应为 [anchor, text]")
+            anchor, text = part
+            seen[anchor] += 1
+            chunk_id = f"{path}#{anchor}" + (f"~{seen[anchor]}" if seen[anchor] > 1 else "")
+            chunks.append({"id": chunk_id, "doc": path, "anchor": anchor, "text": text})
+    return chunks
+
+
 def load_chunks(path: Path) -> list[dict]:
     if not path.is_file():
         raise KBLoadError(f"缺少知识库 {path}；运行 just kb 生成")
@@ -184,10 +211,16 @@ def load_chunks(path: Path) -> list[dict]:
         payload = json.loads(path.read_bytes().decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise KBLoadError(f"知识库不可读：{path}：{exc}；运行 just kb 重建") from exc
-    chunks = payload.get("chunks") if isinstance(payload, dict) else None
-    if not isinstance(chunks, list):
-        raise KBLoadError(f"知识库格式错误（缺少 chunks 列表）：{path}；运行 just kb 重建")
-    return [chunk for chunk in chunks if isinstance(chunk, dict)]
+    version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if version != SCHEMA_VERSION:
+        raise KBLoadError(f"知识库 schema {version!r} 不受支持（需要 {SCHEMA_VERSION}）：{path}；运行 just kb 重建")
+    docs = payload.get("docs")
+    if not isinstance(docs, list):
+        raise KBLoadError(f"知识库格式错误（缺少 docs 列表）：{path}；运行 just kb 重建")
+    try:
+        return expand_docs(docs)
+    except ValueError as exc:
+        raise KBLoadError(f"知识库格式错误（{exc}）：{path}；运行 just kb 重建") from exc
 
 
 def load_index(path: Path = DEFAULT_KB) -> KBIndex:
