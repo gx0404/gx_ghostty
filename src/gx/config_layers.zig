@@ -18,6 +18,14 @@
 //! replace the list from lower layers instead of extending it, the same
 //! way command-line font families replace configured ones upstream.
 //!
+//! The command palette entries of the defaults have `gx:` actions and
+//! English msgids as titles and descriptions. The win32 palette translates
+//! entries when it shows them; the GTK palette shows them as configured,
+//! so on GTK loading translates them into the configured `language`
+//! (`translatePalette`). The translated entries are recorded as the
+//! defaults' configuration input, so theme and conditional replays keep
+//! them, and loading again after `language` changes translates them anew.
+//!
 //! Setting the environment variable `GHOSTTY_GX_DEFAULTS=0` (or `false`,
 //! `off`, `no`) loads the configuration exactly like upstream Ghostty: no
 //! defaults, no overlay, upstream order.
@@ -25,12 +33,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const build_config = @import("../build_config.zig");
 const Config = @import("../config/Config.zig");
 const file_load = @import("../config/file_load.zig");
 const themepkg = @import("../config/theme.zig");
 const cli = @import("../cli.zig");
 const global = @import("../global.zig");
+const inputpkg = @import("../input.zig");
 const gui_settings = @import("gui_settings.zig");
+const i18n = @import("i18n.zig");
 const gx_theme = @import("theme.zig");
 
 const log = std.log.scoped(.gx_config);
@@ -133,6 +144,12 @@ const SystemSources = struct {
         };
     }
 
+    /// Whether loading translates the palette entries of the defaults:
+    /// only the GTK command palette shows entry texts as configured.
+    fn translatesPalette(_: SystemSources) bool {
+        return comptime build_config.app_runtime == .gtk;
+    }
+
     fn installTheme(_: SystemSources, alloc: Allocator) void {
         var arena: ArenaAllocator = .init(alloc);
         defer arena.deinit();
@@ -195,6 +212,7 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
 
     var ordered: std.ArrayList(Step) = .empty;
     try appendLayer(arena, &ordered, try defaultSteps(arena, sources.defaultsText()));
+    const defaults_end = ordered.items.len;
     var user: std.ArrayList(Step) = .empty;
     if (default_files) try user.appendSlice(arena, steps[0..cli_start]);
     try user.appendSlice(arena, steps[command_start..includes_end]);
@@ -203,6 +221,10 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
     try appendLayer(arena, &ordered, steps[cli_begin..command_start]);
     try appendLayer(arena, &ordered, try argSteps(arena, sources.overrides));
     try ordered.appendSlice(arena, steps[includes_end .. includes_end + command_len]);
+
+    if (sources.translatesPalette()) {
+        try translatePalette(arena, ordered.items[0..defaults_end], configuredLanguage(ordered.items));
+    }
 
     var result = try live.cloneEmpty(alloc_gpa);
     errdefer result.deinit();
@@ -266,18 +288,76 @@ fn replacedKey(arg: []const u8) ?usize {
     return null;
 }
 
+/// The UI language that layered `steps` configure: the last `language`
+/// value before `-e`, resolved like the app runtimes resolve it.
+fn configuredLanguage(steps: []const Step) i18n.Language {
+    const prefix = "--language=";
+    var value: ?[]const u8 = null;
+    for (steps) |step| switch (step) {
+        .arg => |arg| if (std.mem.startsWith(u8, arg, prefix)) {
+            value = if (arg.len > prefix.len) arg[prefix.len..] else null;
+        },
+        .@"-e" => break,
+        else => {},
+    };
+    return i18n.resolve(value);
+}
+
+/// Translates the `command-palette-entry` steps of the defaults layer into
+/// `lang` (see `translatePaletteEntry`). The steps stay configuration
+/// input, so every later replay of them keeps the translation.
+fn translatePalette(arena: Allocator, defaults_layer: []Step, lang: i18n.Language) Allocator.Error!void {
+    for (defaults_layer) |*step| switch (step.*) {
+        .arg => |arg| if (try translatePaletteEntry(arena, arg, lang)) |translated| {
+            step.* = .{ .arg = translated };
+        },
+        else => {},
+    };
+}
+
+/// `arg` with its title and description replaced by their `lang`
+/// translations, if `arg` is a `command-palette-entry` with a `gx:` action
+/// and `lang` translates at least one of its texts; null otherwise. The
+/// result uses the syntax `+show-config` writes.
+fn translatePaletteEntry(arena: Allocator, arg: []const u8, lang: i18n.Language) Allocator.Error!?[:0]const u8 {
+    const prefix = "--command-palette-entry=";
+    if (!std.mem.startsWith(u8, arg, prefix)) return null;
+    const command = cli.args.parseAutoStruct(inputpkg.Command, arena, arg[prefix.len..], null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (command.action != .gx) return null;
+    const title = i18n.lookup(lang, command.title);
+    const description = i18n.lookup(lang, command.description);
+    if (title == null and description == null) return null;
+
+    const action = try std.fmt.allocPrint(arena, "{f}", .{command.action});
+    return try std.fmt.allocPrintSentinel(arena, "{s}title:\"{f}\",description:\"{f}\",action:\"{f}\"", .{
+        prefix,
+        std.zig.fmtString(title orelse command.title),
+        std.zig.fmtString(description orelse command.description),
+        std.zig.fmtString(action),
+    }, 0);
+}
+
 /// Layer sources for tests: explicit defaults text, at most one user file
-/// (absolute path), command-line arguments, an overlay file and
-/// overrides.
+/// (absolute path), command-line arguments, an overlay file, overrides,
+/// and whether the palette entries of the defaults are translated (as on
+/// GTK).
 const TestSources = struct {
     defaults_text: []const u8,
     user_path: ?[]const u8 = null,
     args: []const []const u8 = &.{},
     overlay_path: ?[]const u8 = null,
     overrides: []const [:0]const u8 = &.{},
+    translate_palette: bool = false,
 
     fn defaultsText(self: TestSources) []const u8 {
         return self.defaults_text;
+    }
+
+    fn translatesPalette(self: TestSources) bool {
+        return self.translate_palette;
     }
 
     fn loadUserFiles(self: TestSources, cfg: *Config, alloc: Allocator) !void {
@@ -352,7 +432,6 @@ fn expectNoDiagnostics(cfg: *const Config) !void {
 
 test "the embedded defaults parse cleanly" {
     const testing = std.testing;
-    const inputpkg = @import("../input.zig");
 
     var upstream = try Config.default(testing.allocator);
     defer upstream.deinit();
@@ -800,6 +879,180 @@ test "upstream loading also keeps config-file errors across theme reloads" {
     try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
     try cfg.finalize();
     try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
+}
+
+/// The `language` and `command-palette-entry` lines of the embedded
+/// defaults.
+fn paletteDefaults(arena: Allocator) Allocator.Error![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, defaults, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "language") and
+            !std.mem.startsWith(u8, line, "command-palette-entry")) continue;
+        try result.appendSlice(arena, line);
+        try result.append(arena, '\n');
+    }
+    return result.items;
+}
+
+/// The titles and descriptions of the palette entries of the embedded
+/// defaults, translated into `lang` where the table has a translation.
+fn defaultPaletteTexts(arena: Allocator, lang: i18n.Language) ![]const [2][]const u8 {
+    const prefix = "--command-palette-entry=";
+    var result: std.ArrayList([2][]const u8) = .empty;
+    for (try defaultSteps(arena, defaults)) |step| {
+        if (!std.mem.startsWith(u8, step.arg, prefix)) continue;
+        const command = try cli.args.parseAutoStruct(inputpkg.Command, arena, step.arg[prefix.len..], null);
+        try result.append(arena, .{
+            i18n.lookup(lang, command.title) orelse command.title,
+            i18n.lookup(lang, command.description) orelse command.description,
+        });
+    }
+    return result.items;
+}
+
+/// Checks the titles and descriptions of the `gx:` command palette
+/// entries of `cfg`, in order, and that the C mirror matches every entry.
+fn expectGxEntries(cfg: *const Config, expected: []const [2][]const u8) !void {
+    const testing = std.testing;
+    const entries = cfg.@"command-palette-entry";
+    try testing.expectEqual(entries.value.items.len, entries.value_c.items.len);
+    var count: usize = 0;
+    for (entries.value.items, entries.value_c.items) |command, c| {
+        try testing.expectEqualStrings(command.title, std.mem.span(c.title));
+        try testing.expectEqualStrings(command.description, std.mem.span(c.description));
+        if (command.action != .gx) continue;
+        try testing.expect(count < expected.len);
+        try testing.expectEqualStrings(expected[count][0], command.title);
+        try testing.expectEqualStrings(expected[count][1], command.description);
+        count += 1;
+    }
+    try testing.expectEqual(expected.len, count);
+}
+
+test "the GX palette entries of the defaults have zh-CN translations" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const english = try defaultPaletteTexts(arena, .en);
+    const chinese = try defaultPaletteTexts(arena, .zh_CN);
+    try testing.expectEqual(@as(usize, 3), english.len);
+    for (english, chinese) |en, zh| {
+        for (en, zh) |en_text, zh_text| {
+            if (std.mem.eql(u8, en_text, zh_text)) {
+                std.debug.print("missing zh-CN translation for {s}\n", .{en_text});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    try testing.expectEqualStrings("设置", chinese[0][0]);
+}
+
+test "translatePaletteEntry translates the texts of gx: entries" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const prefix = "--command-palette-entry=";
+
+    var list: Config.RepeatableCommand = .{};
+    const settings = prefix ++ "title:\"Settings\",description:\"Open the Ghostty GX settings.\",action:gx:settings";
+    try list.parseCLI(arena, (try translatePaletteEntry(arena, settings, .zh_CN)).?[prefix.len..]);
+    // Without a description, and with an argument that has colons.
+    const profile = prefix ++ "title:\"Main Menu\",action:gx:new_tab_profile:wsl:Ubuntu";
+    try list.parseCLI(arena, (try translatePaletteEntry(arena, profile, .zh_CN)).?[prefix.len..]);
+
+    try testing.expectEqualStrings("设置", list.value.items[0].title);
+    try testing.expectEqualStrings(i18n.lookup(.zh_CN, "Open the Ghostty GX settings.").?, list.value.items[0].description);
+    try testing.expect(list.value.items[0].action.equal(.{ .gx = .settings }));
+    try testing.expectEqualStrings(i18n.lookup(.zh_CN, "Main Menu").?, list.value.items[1].title);
+    try testing.expectEqualStrings("", list.value.items[1].description);
+    try testing.expect(list.value.items[1].action.equal(.{ .gx = .{ .new_tab_profile = "wsl:Ubuntu" } }));
+
+    for ([_][]const u8{
+        prefix ++ "title:\"New Tab\",action:new_tab",
+        prefix ++ "title:\"My Settings\",description:\"Mine\",action:gx:settings",
+        prefix ++ "title:\"Settings\"",
+        "--font-size=12",
+    }) |arg| {
+        try testing.expectEqual(@as(?[:0]const u8, null), try translatePaletteEntry(arena, arg, .zh_CN));
+    }
+    try testing.expectEqual(@as(?[:0]const u8, null), try translatePaletteEntry(arena, settings, .en));
+}
+
+test "loading on GTK translates the GX palette entries into the configured language" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const english = try defaultPaletteTexts(arena, .en);
+    const chinese = try defaultPaletteTexts(arena, .zh_CN);
+    const defaults_text = try paletteDefaults(arena);
+    const user_en = try dir.write(arena, "config.ghostty", "language = en\n");
+    const overlay_zh = try dir.write(arena, gui_settings.file_name, "language = zh-CN\n");
+
+    const cases = [_]struct { TestSources, []const [2][]const u8 }{
+        .{ .{ .defaults_text = defaults_text, .translate_palette = true }, chinese },
+        .{ .{ .defaults_text = defaults_text, .translate_palette = true, .user_path = user_en }, english },
+        .{ .{ .defaults_text = defaults_text, .translate_palette = true, .user_path = user_en, .overlay_path = overlay_zh }, chinese },
+        .{ .{ .defaults_text = defaults_text, .translate_palette = true, .overlay_path = overlay_zh, .args = &.{"--language=en"} }, english },
+        .{ .{ .defaults_text = defaults_text, .translate_palette = true, .args = &.{ "--language=en", "-e", "--language=zh-CN" } }, english },
+        // Other app runtimes translate entries when they show them.
+        .{ .{ .defaults_text = defaults_text }, english },
+    };
+    for (cases) |case| {
+        var cfg = try loadWith(testing.allocator, case[0]);
+        defer cfg.deinit();
+        try expectNoDiagnostics(&cfg);
+        try expectGxEntries(&cfg, case[1]);
+    }
+
+    // Entries the user writes are shown as written.
+    const user_entry = try dir.write(arena, "entry.ghostty", "command-palette-entry = title:\"Settings\",action:gx:settings\n");
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = defaults_text,
+        .user_path = user_entry,
+        .translate_palette = true,
+    });
+    defer cfg.deinit();
+    const expected = try std.mem.concat(arena, [2][]const u8, &.{ chinese, &.{.{ "Settings", "" }} });
+    try expectGxEntries(&cfg, expected);
+}
+
+test "translated GX palette entries survive conditional reloads and clones" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const chinese = try defaultPaletteTexts(arena, .zh_CN);
+    const light = try dir.write(arena, "light", "background = #eeeeee\n");
+    const dark = try dir.write(arena, "dark", "background = #111111\n");
+    const defaults_text = try std.fmt.allocPrint(
+        arena,
+        "theme = light:{s},dark:{s}\n{s}",
+        .{ light, dark, try paletteDefaults(arena) },
+    );
+
+    var cfg = try loadWith(testing.allocator, TestSources{ .defaults_text = defaults_text, .translate_palette = true });
+    defer cfg.deinit();
+    try expectGxEntries(&cfg, chinese);
+
+    var dark_cfg = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark_cfg.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, dark_cfg.background);
+    try expectGxEntries(&dark_cfg, chinese);
+
+    var cloned = try dark_cfg.clone(testing.allocator);
+    defer cloned.deinit();
+    try expectGxEntries(&cloned, chinese);
 }
 
 test "GHOSTTY_GX_DEFAULTS values that turn the layering off" {

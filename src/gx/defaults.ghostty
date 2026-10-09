@@ -51,7 +51,9 @@ keybind = performable:ctrl+shift+m=gx:main_menu
 keybind = performable:ctrl+shift+slash=gx:keybinds
 
 # Appended to the upstream command palette entries. Titles and
-# descriptions are English msgids that the palettes translate.
+# descriptions are English msgids with translations in i18n/gx.zh_CN.po:
+# the Windows palette translates them when it shows them, and on GTK
+# loading translates them into `language` (config_layers.zig).
 command-palette-entry = title:"Settings",description:"Open the Ghostty GX settings.",action:gx:settings
 command-palette-entry = title:"Keyboard Shortcuts",description:"Show all keyboard shortcuts.",action:gx:keybinds
 command-palette-entry = title:"Main Menu",description:"Open the main menu.",action:gx:main_menu
