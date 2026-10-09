@@ -47,7 +47,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 - 按键：`App.run` 对 `GhosttyTerminal` 的按键消息跳过 `TranslateMessage`（`Surface.handleKeyEvent` 自己调 `ToUnicode`，两者共用死键状态），但 `VK_PROCESSKEY`（交给输入法）与 `VK_PACKET`（SendInput 的 Unicode 注入）必须经过它。按键、`WM_CHAR` 与输入法上屏文字都经核心 `Surface.gxWin32KeyCallback` 进入（补丁 GX-0006，接入契约在 `src/gx/win32_input.zig` 文件头）；终端开着 DECSET 9001 时按 KEY_EVENT_RECORD 发出。粘贴与拖放不走记录，拖放的路径按 shell 引用（`gx.path_quote`）。
 - 弹层编辑框：`App.routeEditKey` 先把 Enter、Esc 与方向键交给标签改名、命令面板与查找栏；Ctrl 与 Ctrl+Shift 组合键冒泡给终端绑定，只有 Ctrl+A/C/V/X/Y/Z 留给编辑框。Alt+Space 由 `Window.handleSystemMenuKey` 打开窗口菜单。
 - IME：组字串作为 preedit 交给核心内联显示，候选窗由 `Surface.positionImeWindow` 按 DPI 放到光标处；终端失焦时取消组字。
-- DPI：manifest 声明 PerMonitorV2。只有顶层窗口收到 `WM_DPICHANGED`，`Window.handleDpiChange` 重排 chrome 并调用每个 Surface 的 `handleDpiChange`；弹层本身是顶层窗口，自己处理。
+- DPI：manifest 声明 PerMonitorV2。只有顶层窗口收到 `WM_DPICHANGED`，`Window.handleDpiChange` 重排 chrome 并调用每个 Surface 的 `handleDpiChange`；弹层本身是顶层窗口，自己处理。chrome（标题栏、标签栏、它们的提示、尺寸提示与从标题栏打开的菜单）的尺寸、字体、命中区、Direct2D 画布 DPI 以及新建终端的初始缩放一律取 `Window.scale`（弹层经 `Popup.setOwnerScale`），只有 Windows 与 DWM 自己画的部分（顶部缩放带、材质下 DWM 的标题按钮）取 `GetDpiForWindow`；`WM_GHOSTTY_SIMULATE_DPI` 只改 `Window.scale`，混用两者在模拟时就会错位。
 - 界面文字：一律写英文 msgid，经 `gx.i18n.tr`（编译期 msgid）或 `trRuntime` 在使用时翻译；菜单与对话框每次显示时重建，语言切换经各模块的 `onLanguageChanged` 下发。规则与生成器见 `gx-core.md`。
 
 ## 不变量

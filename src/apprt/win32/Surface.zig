@@ -53,7 +53,7 @@ hdc: ?w32.HDC = null,
 width: u32 = 800,
 height: u32 = 600,
 
-/// DPI scale factor (DPI / 96.0).
+/// Content scale (DPI / 96.0): the parent window's `Window.scale`.
 scale: f32 = 1.0,
 
 /// The parent App.
@@ -426,14 +426,10 @@ fn deinitGui(self: *Surface) void {
     log.debug("surface deinit: complete", .{});
 }
 
-/// Update the DPI scale factor from the window's DPI.
+/// Start at the content scale of the parent window (`Window.scale`), like
+/// its chrome and the other terminals; `handleDpiChange` follows it later.
 fn updateDpiScale(self: *Surface) void {
-    if (self.hwnd) |hwnd| {
-        const dpi = w32.GetDpiForWindow(hwnd);
-        if (dpi != 0) {
-            self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
-        }
-    }
+    self.scale = self.parent_window.scale;
 }
 
 /// Update the cached client area size.

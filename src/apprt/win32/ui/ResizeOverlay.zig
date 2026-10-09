@@ -112,6 +112,7 @@ pub fn show(self: *ResizeOverlay) void {
 
     // Size to the text; position within the surface area of the client
     // per resize-overlay-position.
+    self.popup.setOwnerScale(win.scale);
     const scale = self.popup.ownerScale();
     const text_w = factory.measureText(text, textStyle(t), 1000).width;
     const ow = style.px(text_w + 2 * pad_x, scale);

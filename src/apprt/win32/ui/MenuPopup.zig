@@ -8,9 +8,10 @@
 //!
 //! Build the items with a `Builder` and `run` them. `run` opens the menu
 //! at an anchor point, flipped and clamped to stay within the work area of
-//! the anchor's monitor and sized for the owner's DPI, and blocks in a
-//! modal message loop until an action is picked (its `Item.id` is
-//! returned) or the menu is dismissed (null). A new popup stays cloaked
+//! the anchor's monitor and sized for the owner's DPI (or the content
+//! scale in `Options.owner_scale`), and blocks in a modal message loop
+//! until an action is picked (its `Item.id` is returned) or the menu is
+//! dismissed (null). A new popup stays cloaked
 //! until it has been painted twice: DWM may drop the first frame of a
 //! window presented right after it is shown.
 //!
@@ -141,6 +142,9 @@ pub const Options = struct {
     anchor: w32.POINT,
     /// Highlight the first item, for menus opened from the keyboard.
     select_first: bool = false,
+    /// The owner's content scale (`Window.scale` for the menus of a
+    /// window's chrome), when the menu follows it (`Popup.setOwnerScale`).
+    owner_scale: ?f32 = null,
 };
 
 /// Dismiss the open menu, if any; its `run` returns null.
@@ -169,6 +173,7 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
         .owner = owner,
         .alloc = arena.allocator(),
         .anchor = options.anchor,
+        .owner_scale = options.owner_scale,
         .foreground = w32.GetForegroundWindow(),
         .start_pt = cursor,
         .last_pt = cursor,
@@ -610,6 +615,7 @@ const State = struct {
     owner: w32.HWND,
     alloc: Allocator,
     anchor: w32.POINT,
+    owner_scale: ?f32,
     levels: [max_depth]Level = undefined,
     depth: usize = 0,
     result: Result = .open,
@@ -662,6 +668,7 @@ const State = struct {
         };
         self.depth += 1;
 
+        if (self.owner_scale) |owner_scale| level.popup.setOwnerScale(owner_scale);
         level.scale = level.popup.ownerScale();
         level.layout();
         if (select_first) level.hot = level.step(null, .next);

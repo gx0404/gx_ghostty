@@ -40,8 +40,10 @@
 //! rect Windows suggests and lays the panes out again. The popups are
 //! top-level windows themselves: they get their own WM_DPICHANGED when
 //! they land on another monitor (`ui/Popup.zig`), and size themselves
-//! with their owner's DPI when shown. `WM_GHOSTTY_SIMULATE_DPI` runs the
-//! same path without a monitor of another DPI.
+//! with their owner's DPI when shown; those of the chrome (the title bar
+//! tooltip, the resize overlay, the menus opened from the title bar)
+//! follow `scale` instead (`Popup.setOwnerScale`). `WM_GHOSTTY_SIMULATE_DPI`
+//! runs the same path without a monitor of another DPI.
 //!
 //! Rendering stays live in the modal move/size loop: the surfaces render
 //! on their own threads, and a live resize waits once per layout for the
@@ -90,7 +92,9 @@ tab_active_surface: [MAX_TABS]*Surface = undefined,
 /// Index of the currently active (visible) tab.
 active_tab: usize = 0,
 
-/// DPI scale factor (DPI / 96.0).
+/// Content scale (DPI / 96.0) of the chrome and the terminals, from the
+/// last WM_DPICHANGED (or `WM_GHOSTTY_SIMULATE_DPI`). Lay out and draw
+/// with it, not with `GetDpiForWindow`.
 scale: f32 = 1.0,
 
 /// UTF-16 title buffers for each tab (for painting the tab bar).
