@@ -207,7 +207,9 @@
 //! bit 40  report_visibility
 //! bit 41  in_band_size_reports
 //! bit 42  kitty_paste_events
-//! bits 43-63  reserved, zero
+// fork(gx): GX-0006 bit 43 was reserved and zero in upstream v1; see docs/FORK_PATCHES.md
+//! bit 43  win32_input_mode
+//! bits 44-63  reserved, zero
 //! ```
 //!
 //! This is the packed field order of native `ModePacked`. Its layout is
@@ -471,7 +473,8 @@ pub const Header = struct {
         try writer.writeByte(@intCast(@intFromEnum(self.mouse_shape)));
         try writer.writeByte(@intFromBool(self.password_input));
 
-        // Runtime, saved, and reset mode sets. ModePacked occupies 43 bits;
+        // fork(gx): GX-0006 win32_input_mode grew ModePacked from 43 to 44 bits
+        // Runtime, saved, and reset mode sets. ModePacked occupies 44 bits;
         // its eight-byte wire slots zero-extend the native packed value.
         const mode_values = [_]terminal_modes.ModePacked{
             self.current_modes,
@@ -1209,8 +1212,9 @@ const test_header_fixture = test_fixture.parse(
 );
 
 test "TERMINAL mode bit layout" {
+    // fork(gx): GX-0006 the registry is 44 bits wide (u43 became u44 below)
     try std.testing.expectEqual(
-        @as(usize, 43),
+        @as(usize, 44),
         @bitSizeOf(terminal_modes.ModePacked),
     );
 
@@ -1219,8 +1223,8 @@ test "TERMINAL mode bit layout" {
     );
     first.disable_keyboard = true;
     try std.testing.expectEqual(
-        @as(u43, 1) << 0,
-        @as(u43, @bitCast(first)),
+        @as(u44, 1) << 0,
+        @as(u44, @bitCast(first)),
     );
 
     var visibility: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1228,8 +1232,8 @@ test "TERMINAL mode bit layout" {
     );
     visibility.report_visibility = true;
     try std.testing.expectEqual(
-        @as(u43, 1) << 40,
-        @as(u43, @bitCast(visibility)),
+        @as(u44, 1) << 40,
+        @as(u44, @bitCast(visibility)),
     );
 
     var size_reports: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1237,8 +1241,8 @@ test "TERMINAL mode bit layout" {
     );
     size_reports.in_band_size_reports = true;
     try std.testing.expectEqual(
-        @as(u43, 1) << 41,
-        @as(u43, @bitCast(size_reports)),
+        @as(u44, 1) << 41,
+        @as(u44, @bitCast(size_reports)),
     );
 
     var last: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1246,9 +1250,20 @@ test "TERMINAL mode bit layout" {
     );
     last.kitty_paste_events = true;
     try std.testing.expectEqual(
-        @as(u43, 1) << 42,
-        @as(u43, @bitCast(last)),
+        @as(u44, 1) << 42,
+        @as(u44, @bitCast(last)),
     );
+
+    // fork(gx): GX-0006 begin: win32_input_mode takes the first reserved bit
+    var win32_input: terminal_modes.ModePacked = std.mem.zeroes(
+        terminal_modes.ModePacked,
+    );
+    win32_input.win32_input_mode = true;
+    try std.testing.expectEqual(
+        @as(u44, 1) << 43,
+        @as(u44, @bitCast(win32_input)),
+    );
+    // fork(gx): GX-0006 end
 }
 
 test "TERMINAL header golden encoding and decoding" {

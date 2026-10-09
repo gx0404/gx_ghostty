@@ -395,6 +395,10 @@ const entries: []const ModeEntry = &.{
         // Kitty clipboard read that a paste event grants.
         .disabled = build_options.artifact != .lib and builtin.os.tag != .macos,
     },
+    // fork(gx): GX-0006 begin: win32-input-mode, keys as Win32 KEY_EVENT_RECORDs
+    // ConPTY requests it; see src/gx/win32_input.zig.
+    .{ .name = "win32_input_mode", .value = 9001 },
+    // fork(gx): GX-0006 end
 };
 
 test {
@@ -551,6 +555,24 @@ test "getReport large unknown modes" {
         try testing.expectEqualDeep(tag, report.tag);
     }
 }
+
+// fork(gx): GX-0006 begin: win32-input-mode tests
+test "win32-input-mode is DEC private mode 9001" {
+    try testing.expectEqual(Mode.win32_input_mode, modeFromInt(9001, false).?);
+    try testing.expect(modeFromInt(9001, true) == null);
+    try testing.expect(defaultConfigurable(.win32_input_mode));
+
+    var state: ModeState = .{};
+    try testing.expect(!state.get(.win32_input_mode));
+    try testing.expectEqual(Report.State.reset, state.getReport(.{ .value = 9001 }).state);
+    state.set(.win32_input_mode, true);
+    try testing.expectEqual(Report.State.set, state.getReport(.{ .value = 9001 }).state);
+    try testing.expectEqual(Report.State.not_recognized, state.getReport(.{ .value = 9001, .ansi = true }).state);
+
+    state.reset();
+    try testing.expect(!state.get(.win32_input_mode));
+}
+// fork(gx): GX-0006 end
 
 test "Report.encode maximum size" {
     var buf: [Report.max_size]u8 = undefined;

@@ -44,6 +44,12 @@
 | GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
+| GX-0006 | `include/ghostty/vt/modes.h` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/Surface.zig` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/modes.zig` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
 <!-- fork-patches:end -->
 
@@ -323,6 +329,57 @@ python -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 只有登记表与闭集检查；`src/termio/Exec.zig` 新增 `execCommand windows: quoted path with spaces stays one argument` 用例。
+
+## GX-0006 win32-input-mode（DECSET 9001）
+
+- 文件：`src/terminal/modes.zig`（`entries` 末尾追加 `win32_input_mode`，值 9001，另加一条单测）、`include/ghostty/vt/modes.h`（`GHOSTTY_MODE_WIN32_INPUT`）、`src/terminal/snapshot/terminal.zig`（模式位登记表与编码注释改为 44 位，`TERMINAL mode bit layout` 单测改为 44 位并检查第 43 位）、`src/terminal/snapshot/snapshot.ksy`（`mode_set` 的说明、`valid.max` 与新实例）、`src/terminal/stream_terminal.zig`（一条经解析流的 DECSET/DECRQM 单测）、`src/Surface.zig`（导入、`gx_win32_key` 字段、`gxWin32KeyCallback` 入口、`encodeKey` 开头的分流）。编码器、记录构造与 apprt 接入契约在新路径 `src/gx/win32_input.zig`。
+- 标记：`fork(gx): GX-0006`；纯新增块用 begin/end 包住，改动的上游行（快照的登记表、编码注释与单测位宽，ksy 的说明与上限）上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：6 个文件，`git diff --numstat` 合计 +136/−13（含注释与单测）。
+
+### 原因
+
+ConPTY 启动时向宿主终端发送 `CSI ? 9001 h`（Windows Terminal 定义的 win32-input-mode），关闭时发送 `CSI ? 9001 l`（microsoft/terminal `src/host/VtIo.cpp`）。终端支持该模式时，每次按下与抬起（修饰键也算）都以完整的 KEY_EVENT_RECORD 交给 ConPTY，控制台程序（PSReadLine、herdr 等）才能区分 Shift+Enter、Ctrl+Space、Ctrl+Break、单独的修饰键与按键抬起；否则 ConPTY 只能从 VT 序列反推，信息有损。上游 Ghostty 不认识 9001：日志记 `unimplemented mode: 9001`，DECRQM 报告未识别。模式表 `entries` 是 `Mode`、`ModePacked`、DECRQM 与 XTSAVE 的唯一来源，只能改上游文件；快照把 `ModePacked` 的位序当作线格式登记表，必须同步；按键编码的入口在 `Surface.encodeKey`。
+
+### 行为
+
+- `CSI ? 9001 h/l` 设置与清除 `win32_input_mode`，DECRQM（`CSI ? 9001 $ p`）报告 1 或 2，XTSAVE/XTRESTORE 与 RIS 与其他模式相同；DECSTR 不改它（Ghostty 的 DECSTR 只复位固定的几个模式）。C API 用 `GHOSTTY_MODE_WIN32_INPUT` 查询与设置；libghostty-vt 只记录模式，不提供 Win32 按键编码。
+- 快照：`ModePacked` 由 43 位变为 44 位（仍是 8 字节），新模式占第 43 位，即上游 v1 里恒为 0、解码时被忽略的保留位。第 0–42 位不变，所以上游写的快照在 fork 里解码后该位为 0，上游解码器读 fork 的快照时丢弃该位，现有金样全部不变。上游注释要求新增模式时升快照版本，fork 不升：解码器只认单一版本，升版要为全部 v1 金样另建新版本并在每次同步时冲突，而上面两个方向本来就兼容；快照格式 v1 也明确不承诺稳定，应用本身不持久化快照。
+- 编码（`src/gx/win32_input.zig`）：每条记录写成 `CSI Vk;Sc;Uc;Kd;Cs;Rc _`，六个参数总是写全（与 Windows Terminal `TerminalInput::_makeWin32Output` 相同，herdr 的 `parse_win32_input_mode_key_record` 也要求六个）。Uc 是一个 UTF-16 码元，按键产生多个码元时每个码元一条记录；死键 Uc=0；Cs 是 dwControlKeyState 的低 16 位，ENHANCED_KEY 取自 lParam 第 24 位；Sc 取 lParam 第 16–23 位；Rc 取 lParam 低 16 位（0 按 1）。没有按键的文字（WM_CHAR、输入法结果）每个码元一对 VK=0、Sc=0 的按下与抬起记录。kitty 键盘协议标志非 0 时让位给 kitty 编码，与 Windows Terminal 相同（ConPTY 从不关闭 9001）。
+- 分流：`Surface.gxWin32KeyCallback(event, message)` 把本次事件的 Win32 消息记进 `gx_win32_key`，再调用原 `keyCallback`；`encodeKey` 开头的 `gx_win32_input.surfaceWriteReq` 只在「事件与记录匹配、子进程未退出、9001 已开且没有 kitty 标志」时用记录替换常规编码，否则照常编码。apprt 只调用 `keyCallback` 时（目前的 win32 apprt 与 GTK）行为与上游完全相同，所以接入之前打字不受影响。绑定、按键序列、KAM、只读模式、滚动到底与清除选区都沿用 `keyCallback`；绑定执行期间产生的其他按键事件（例如失焦时补发的抬起）与记录不匹配，走常规编码；关闭表面的绑定返回 `.closed` 后不再触碰表面。
+- win32 apprt 的接入（`src/apprt/win32/**` 由其他任务改动，本补丁只提供接口，契约写在 `src/gx/win32_input.zig` 文件头）：`handleKeyEvent` 对每条 WM_KEYDOWN/WM_SYSKEYDOWN/WM_KEYUP/WM_SYSKEYUP（VK_PROCESSKEY、VK_PACKET 仍提前返回）读取 `GetKeyboardState`，构造 `KeyMessage{ .vk = wParam, .lparam, .down, .state = .fromKeyboardState(&keyboard_state), .text, .dead }`，其中 `text` 是 ToUnicode 的原始 UTF-16 输出（含 Ctrl+C 的 0x03 这类控制字符；抬起时用 wFlags 0x4 不消耗死键状态再译一次，或留空），ToUnicode 返回负数时 `dead = true`，然后改调 `core_surface.gxWin32KeyCallback(event, message)`；`handleCharEvent`（WM_CHAR）与 `sendImeText`（输入法结果）改调 `gxWin32KeyCallback(event, null)`；粘贴与拖放文件保持原样发原始文本（与 Windows Terminal 相同）。记录经常规的 `Surface.queueIo` 写入 pty，apprt 不直接写 pty。
+
+### 上游状态
+
+未回馈上游。上游没有 Windows 运行时，也不识别 win32-input-mode。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+- `entries` 里的 fork 块保持在最后：上游在末尾新增模式时，把上游条目放在 fork 块之前，`win32_input_mode` 顺延一位，并同步快照登记表注释、编码注释、ksy 的说明、实例除数与 `valid.max`、`TERMINAL mode bit layout` 单测的位宽与位号（fork 快照里该位随之移动，v1 不承诺兼容）。上游若升了快照版本，按新版本重新检查保留位与金样。
+- 上游自己支持 9001 时，删掉 fork 的条目、宏与快照改动，`src/gx/win32_input.zig::active` 改用上游的模式名。
+- `Surface.keyCallback`、`encodeKey` 被上游重构时，保持两点：编码前先问 `gx_win32_input.surfaceWriteReq`；`gxWin32KeyCallback` 包住 `keyCallback`，返回 `.closed` 后不碰表面。
+
+### 移除条件
+
+上游实现 win32-input-mode（识别 9001 并在按键编码中输出 KEY_EVENT_RECORD）之后移除：删除各处改动与标记，把登记行改为 `removed`，win32 apprt 改用上游接口。
+
+### 验证
+
+```bash
+python scripts/zig_test.py --suite vt --filter 9001 --filter "mode bit layout" --filter modes --filter DECRQM --filter "TERMINAL header"
+python scripts/zigw.py build test-bin -Dtarget=x86_64-windows-gnu -Dapp-runtime=none
+python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --filter gx.win32_input
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+python -m unittest scripts.test_fork_patches -v
+```
+
+- 第一条在 `ghostty-vt`、`ghostty-vt-c` 两个模块里运行模式、DECRQM 与快照单测；全量 `just test-vt` 同样覆盖。Linux 上主套件用 `python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx.win32_input`。
+- 运行 `ghostty.exe` 并启动任意 shell：日志不再出现 `unimplemented mode: 9001`。按键改走记录要等 win32 apprt 接入后在 GUI 里验证（PSReadLine 的 Shift+Enter、GX Zsh 的 herdr 探针）。
+
+### 测试锁定
+
+登记表与闭集检查之外，`src/terminal/modes.zig` 与 `src/terminal/stream_terminal.zig` 各一条单测锁定 9001 的识别、DECRQM 与复位，`TERMINAL mode bit layout` 锁定位序；`src/gx/win32_input.zig` 的单测锁定编码（Ctrl+C 向量 `ESC[67;46;3;1;8;1_ESC[67;46;3;0;8;1_`、规范里的 Shift+A 与 Ctrl+F1、AltGr、ENHANCED_KEY、重复计数、死键、代理对、VK=0 文字）与分流条件。
+
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 
 - 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（5 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
