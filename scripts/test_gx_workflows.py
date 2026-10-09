@@ -49,8 +49,14 @@ SETUP_ZIG_INPUTS = {
     "windows-app": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
     "lib-vt-cross": {"cache-key": "${{ matrix.target }}"},
 }
-RELEASE_JOBS = {"prepare", "source", "libvt", "libvt-macos", "linux-gtk", "windows-app", "macos", "verify", "publish"}
+RELEASE_JOBS = {
+    "prepare", "source", "libvt", "libvt-macos", "linux-gtk", "linux-gtk-noble", "windows-app", "macos", "verify",
+    "publish",
+}
 ASSET_JOBS = {"source", "libvt", "libvt-macos", "linux-gtk", "windows-app", "macos"}
+NOBLE_BOOTSTRAP = {"ca-certificates", "git", "python3"}
+# librsvg2-common is only a Recommends of libgtk-4-1; without it the SVG header bar icons draw as image-missing.
+NOBLE_SMOKE = {"xvfb", "xauth", "scrot", "libgl1-mesa-dri", "fonts-dejavu-core", "librsvg2-common"}
 WIN32_BUILD = "zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu"
 CROSS_TARGETS = [
     "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl",
@@ -746,6 +752,43 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertIn('name="ghostty-gx-$GX_VERSION_STRING-x86_64-linux-debian13"', text)
 
+    def test_linux_gtk_noble_runs_the_documented_deb_contract_in_ubuntu_24_04(self):
+        import gx_package
+
+        job = RELEASE.job("linux-gtk-noble")
+        self.assertEqual(mapping(job, "container", 4), {"image": "ubuntu:24.04"})
+        self.assertEqual(field(job, "runs-on", 4), "ubuntu-24.04")
+        self.assertEqual(field(job, "needs", 4), "prepare")
+        self.assertIsNone(field(job, "if", 4))
+        self.assertEqual(apt_packages(RELEASE.scripts("linux-gtk-noble")[0]), NOBLE_BOOTSTRAP)
+        documented = [line.strip() for line in gx_package.__doc__.splitlines()
+                      if line.strip().startswith("python3 scripts/gx_package.py") and "RUNNER_TEMP" in line
+                      and "--source-tarball" not in line]
+        self.assertEqual(len(documented), 2)
+        commands = [line.replace('"$VS"', '"$GX_VERSION_STRING"') for line in documented]
+        self.assertIn("--build --install-deps", commands[0])
+        text = RELEASE.job_text("linux-gtk-noble")
+        order = [text.index(needle) for needle in (
+            "apt-get install", "uses: actions/checkout@", 'safe.directory "$GITHUB_WORKSPACE"',
+            'export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/', 'export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/',
+            commands[0], commands[1], 'python3 scripts/gx_package.py test-deb "$RUNNER_TEMP/ghostty-gx-stage"',
+            'apt-get install -y --no-install-recommends "$package"', "ghostty-gx +version",
+            'grep -Fx "  - version: $GX_VERSION_STRING"', "xvfb-run", "ghostty-gx --gtk-single-instance=false",
+            'scrot "$evidence/ghostty-gx-noble-xvfb.png"', "uses: actions/upload-artifact@")]
+        self.assertEqual(order, sorted(order))
+        install = next(line for line in text.splitlines() if '"$package"' in line and "apt-get install" in line)
+        self.assertLessEqual(NOBLE_SMOKE, set(install.split()))
+        self.assertNotIn("mlugg/setup-zig", text)
+        self.assertNotIn("zig build", text)
+        upload = steps(job)[-1]
+        self.assertEqual(field(upload, "if", 8), "always()")
+        self.assertEqual(mapping(upload, "with", 8), {
+            "name": "evidence-linux-gtk-noble",
+            "path": "${{ runner.temp }}/gx-noble-evidence/",
+            "if-no-files-found": "warn",
+            "retention-days": "14",
+        })
+
     def test_windows_app_builds_packages_and_uploads_exactly_two_assets(self):
         import setup_env
 
@@ -820,8 +863,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("inputs.publish", verify_if)
         self.assertIn("!cancelled()", verify_if)
         self.assertIn("needs.linux-gtk.result == 'success'", verify_if)
+        self.assertIn("needs.linux-gtk-noble.result == 'success'", verify_if)
         self.assertIn("needs.windows-app.result == 'success'", verify_if)
-        self.assertIn("windows-app", field(RELEASE.job("verify"), "needs", 4))
+        verify_needs = field(RELEASE.job("verify"), "needs", 4)
+        self.assertEqual({name.strip() for name in verify_needs.strip("[]").split(",")}, RELEASE_JOBS - {"verify", "publish"})
         verify = RELEASE.job_text("verify")
         self.assertIn('python3 scripts/gx_release.py verify --sha "$GX_SHA" --version-string "$GX_VERSION_STRING"', verify)
         self.assertIn("sha256sum -c SHA256SUMS", verify)

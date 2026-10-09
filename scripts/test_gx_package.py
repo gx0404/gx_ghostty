@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import struct
 import subprocess
@@ -22,9 +23,11 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import gx_linux_build as linux  # noqa: E402
 import gx_package as stage_mod  # noqa: E402
 import gx_release as release  # noqa: E402
 import gx_windows_package as pkg  # noqa: E402
+from test_gx_linux_build import LAYER_SHELL, make_elf  # noqa: E402
 
 ROOT = SCRIPTS.parent
 VS = release.release_info(ROOT).version_string
@@ -124,13 +127,22 @@ def windows_prefix(base: Path, *, imports: tuple[str, ...] = ("KERNEL32.dll", "h
     return prefix
 
 
+def linux_binary(runpath: str | None = linux.ORIGIN_RUNPATH) -> bytes:
+    return make_elf((LAYER_SHELL, "libgtk-4.so.1", "libc.so.6"), runpath=runpath)
+
+
 def deb_prefix(base: Path) -> Path:
+    """A DESTDIR shaped like gx_linux_build's prefix: bundled libgtk4-layer-shell.so, tic's terminfo symlink."""
     destdir = base / "destdir"
     usr = destdir / "usr"
-    write(usr / "bin/ghostty", fake_elf())
+    write(usr / "bin/ghostty", linux_binary())
     write(usr / "bin/ghostty-extra", b"#!/bin/sh\n")
+    write(usr / "lib" / LAYER_SHELL, make_elf(("libgtk-4.so.1", "libc.so.6"), soname=LAYER_SHELL))
+    write(usr / "lib/libghostty-vt.so.0.1.0", make_elf(("libc.so.6",), soname="libghostty-vt.so.0"))
     write(usr / "share/ghostty/themes/Builtin Dark", b"background = #000000\n")
-    write(usr / "share/terminfo/g/ghostty", b"compiled terminfo")
+    write(usr / "share/terminfo/x/xterm-ghostty", b"compiled terminfo")
+    (usr / "share/terminfo/g").mkdir()
+    os.symlink("../x/xterm-ghostty", usr / "share/terminfo/g/ghostty")
     write(usr / "share/locale/zh_CN/LC_MESSAGES/com.mitchellh.ghostty.mo", b"mo")
     write(usr / "share/applications/com.mitchellh.ghostty.desktop", b"[Desktop Entry]\n")
     write(usr / "share/dbus-1/services/com.mitchellh.ghostty.service", b"[D-BUS Service]\n")
@@ -720,32 +732,199 @@ class VerifyStageTests(Case):
         self.assertIn("PASS stage", out.getvalue())
         self.assertIn("must not exist", err.getvalue())
         for argv in ([], ["windows"], ["windows", "--stage-dir", "x", "--deb-depends", "libc6"], ["mac", "--stage-dir", "x"],
-                     ["verify-stage"]):
+                     ["verify-stage"], ["test-deb", str(self.stage)]):
             with self.subTest(argv=argv), mock.patch("sys.stderr", io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     stage_mod.main(argv)
                 self.assertEqual(raised.exception.code, 2)
 
+    def test_test_package_needs_a_deb_stage(self):
+        with self.assertRaisesRegex(pkg.PackageError, "is a windows stage, not a deb stage"):
+            stage_mod.test_deb(self.stage, self.base / "test.deb")
+        self.assertFalse((self.base / "test.deb").exists())
+
+
+class ShareAndShlibdepsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+
+    def test_share_files_are_listed_in_order(self):
+        write(self.base / "share/ghostty/themes/B", b"b")
+        write(self.base / "share/ghostty/themes/A", b"a")
+        write(self.base / "share/terminfo/x/xterm-ghostty", b"ti")
+        self.assertEqual([relative for relative, _ in stage_mod.share_files(self.base / "share")],
+                         ["ghostty/themes/A", "ghostty/themes/B", "terminfo/x/xterm-ghostty"])
+        with self.assertRaisesRegex(pkg.PackageError, "share/ is missing"):
+            stage_mod.share_files(self.base / "absent")
+
+    def test_shlibdeps_runs_in_a_package_tree(self):
+        binary = write(self.base / "stage/root/usr/lib/ghostty-gx/bin/ghostty", linux_binary())
+        write(self.base / "stage/root/usr/lib/ghostty-gx/lib" / LAYER_SHELL, make_elf(soname=LAYER_SHELL))
+        calls = []
+
+        def runner(command, **kwargs):
+            work = Path(kwargs["cwd"])
+            tree = work / "package" / "usr/lib/ghostty-gx"
+            calls.append((command, (work / "debian" / "control").read_text(encoding="utf-8"),
+                          (work / "package" / "DEBIAN").is_dir(), (tree / "bin/ghostty").read_bytes(),
+                          sorted(path.name for path in (tree / "lib").iterdir())))
+            return subprocess.CompletedProcess(command, 0, "shlibs:Depends=libc6 (>= 2.39), libgtk-4-1\n", "")
+
+        with mock.patch.object(stage_mod.shutil, "which", return_value="/usr/bin/dpkg-shlibdeps"):
+            self.assertEqual(stage_mod.shlibdeps(binary, runner), "libc6 (>= 2.39), libgtk-4-1")
+            command, control, debian, copied, libraries = calls[0]
+            self.assertEqual(command, ["/usr/bin/dpkg-shlibdeps", "-O", "-epackage/usr/lib/ghostty-gx/bin/ghostty",
+                                       f"-epackage/usr/lib/ghostty-gx/lib/{LAYER_SHELL}"])
+            self.assertIn("Package: ghostty-gx", control)
+            self.assertEqual((debian, copied, libraries), (True, linux_binary(), [LAYER_SHELL]))
+            missing = "dpkg-shlibdeps: warning: cannot find library libfoo.so needed by package/x\n"
+            for result, message in (((0, "", missing), "cannot resolve every needed library"),
+                                    ((2, "", "boom"), "failed \\(exit 2\\): boom"),
+                                    ((0, "shlibs:Depends=\n", ""), "reported no shlibs:Depends")):
+                with self.subTest(message=message), self.assertRaisesRegex(pkg.PackageError, message):
+                    stage_mod.shlibdeps(binary, lambda command, **kwargs: subprocess.CompletedProcess(command, *result))
+        with mock.patch.object(stage_mod.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(pkg.PackageError, "dpkg-dev"):
+                stage_mod.shlibdeps(binary)
+
+
+class BuildCommandTests(unittest.TestCase):
+    """--build and the documented consumer commands, with the build and the stage replaced by fakes."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        self.builds: list = []
+        self.stages: list = []
+        for stream in ("stdout", "stderr"):
+            patcher = mock.patch(f"sys.{stream}", new_callable=io.StringIO)
+            setattr(self, stream, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def fake_build(self, platform, prefix, version_string, **kwargs):
+        prefix = Path(prefix)
+        self.assertTrue(prefix.is_dir() and not any(prefix.iterdir()))
+        self.builds.append((platform, prefix, version_string, kwargs))
+
+    @staticmethod
+    def manifest(platform: str, version_string: str) -> dict:
+        return {"platform": platform, "product_version": version_string, "source_commit": SHA,
+                "source_dirty": False, "files": []}
+
+    def fake_stage(self, platform, stage, prefix, version_string, **kwargs):
+        self.stages.append((platform, stage, prefix, version_string, kwargs))
+        return self.manifest(platform, version_string)
+
+    def main(self, argv: list[str], build=None) -> int:
+        with mock.patch.object(stage_mod, "build_prefix", side_effect=build or self.fake_build), \
+                mock.patch.object(stage_mod, "build_stage", side_effect=self.fake_stage), \
+                mock.patch.object(stage_mod, "verify_stage", return_value=self.manifest("deb", VS)):
+            return stage_mod.main(argv)
+
+    def test_build_uses_a_temporary_prefix_next_to_the_stage(self):
+        stage = self.base / "out" / "ghostty-gx-stage"
+        self.assertEqual(self.main(["deb", "--build", "--install-deps", "--stage-dir", str(stage),
+                                    "--version-string", VS, "--cache-dir", str(self.base / "cache"), "--offline"]), 0)
+        platform, prefix, version_string, kwargs = self.builds[0]
+        self.assertEqual((platform, version_string), ("deb", VS))
+        self.assertEqual(prefix.parent, stage.parent)
+        self.assertTrue(prefix.name.startswith(".ghostty-gx-stage.prefix-"))
+        self.assertEqual(kwargs, {"source_tarball": None, "install_deps": True, "cache": self.base / "cache",
+                                  "offline": True})
+        self.assertEqual(self.stages[-1][1:4], (stage.absolute(), prefix.resolve(), VS))
+        self.assertEqual(list(stage.parent.iterdir()), [])
+        self.assertIn("STAGED", self.stdout.getvalue())
+
+    def test_an_explicit_prefix_is_kept_and_a_failed_build_stops(self):
+        prefix = self.base / "prefix"
+        self.assertEqual(self.main(["windows", "--build", "--prefix", str(prefix), "--stage-dir",
+                                    str(self.base / "stage")], build=lambda *args, **kwargs: prefix.mkdir()), 0)
+        self.assertTrue(prefix.is_dir())
+        self.assertEqual(self.stages[-1][2], prefix.resolve())
+        stages = len(self.stages)
+        failing = mock.Mock(side_effect=pkg.PackageError("zig build failed with exit code 1"))
+        self.assertEqual(self.main(["deb", "--build", "--stage-dir", str(self.base / "stage-2")], build=failing), 1)
+        self.assertEqual(len(self.stages), stages)
+        self.assertEqual(sorted(path.name for path in self.base.iterdir()), ["prefix"])
+        self.assertIn("ERROR: zig build failed", self.stderr.getvalue())
+
+    def test_refusals_come_before_building(self):
+        taken = write(self.base / "taken" / "file", b"x").parent
+        self.assertEqual(self.main(["deb", "--build", "--stage-dir", str(taken)]), 1)
+        self.assertEqual(self.main(["deb", "--build", "--stage-dir", str(self.base / "new"),
+                                    "--version-string", "9.9.9-gx.9.9.9"]), 1)
+        self.assertEqual(self.builds, [])
+        for argv in (["windows", "--build", "--install-deps", "--stage-dir", "x"],
+                     ["deb", "--source-tarball", "t.tar.gz", "--stage-dir", "x"],
+                     ["windows", "--build", "--source-tarball", "t.tar.gz", "--stage-dir", "x"]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as raised:
+                self.main(argv)
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_build_prefix_dispatches_per_platform(self):
+        with mock.patch.object(stage_mod.linux, "build") as build:
+            stage_mod.build_prefix("deb", self.base / "p", VS, source_tarball=Path("t.tar.gz"), install_deps=True,
+                                   cache=Path("c"), offline=True, runner=subprocess.run)
+        build.assert_called_once_with(self.base / "p", VS, root=ROOT, source_tarball=Path("t.tar.gz"),
+                                      install_deps=True, cache=Path("c"), offline=True, runner=subprocess.run)
+        calls = []
+        with mock.patch.object(stage_mod.linux, "ensure_zig", side_effect=lambda root, runner: calls.append("zig")), \
+                mock.patch.object(stage_mod.windows, "run_build",
+                                  side_effect=lambda prefix, vs, root, runner: calls.append((prefix, vs, root))):
+            stage_mod.build_prefix("windows", self.base / "w", VS)
+        self.assertEqual(calls, ["zig", ((self.base / "w").absolute(), VS, ROOT)])
+        write(self.base / "full" / "x", b"x")
+        with self.assertRaisesRegex(pkg.PackageError, "must not exist or be an empty directory"):
+            stage_mod.build_prefix("windows", self.base / "full", VS)
+
+    def test_documented_consumer_commands_run(self):
+        commands = [line.strip() for line in stage_mod.__doc__.splitlines()
+                    if line.strip().startswith("python") and "RUNNER_TEMP" in line]
+        self.assertEqual(len(commands), 5)
+        runner_temp = (self.base / "runner").as_posix()
+        for command in commands:
+            text = (command.replace("$env:RUNNER_TEMP", runner_temp).replace("$RUNNER_TEMP", runner_temp)
+                    .replace("$env:VS", VS).replace("$VS", VS).replace("\\", "/"))
+            argv = shlex.split(text)
+            with self.subTest(command=command):
+                self.assertIn(argv[0], ("python", "python3"))
+                self.assertEqual(argv[1], "scripts/gx_package.py")
+                self.assertEqual(self.main(argv[2:]), 0)
+        platforms = [(platform, kwargs["install_deps"], kwargs["source_tarball"])
+                     for platform, _, _, kwargs in self.builds]
+        self.assertEqual(platforms, [("windows", False, None), ("deb", True, None),
+                                     ("deb", True, Path(f"ghostty-{VS}.tar.gz"))])
+
 
 @unittest.skipUnless(symlinks_supported(), "deb stages need symlinks (Developer Mode on Windows)")
 class DebStageTests(Case):
-    def build(self, stage: Path | None = None, **kwargs) -> tuple[Path, dict]:
+    def build(self, stage: Path | None = None, prefix: Path | None = None, **kwargs) -> tuple[Path, dict]:
         stage = stage or self.base / "deb-stage"
         options = {"root": make_root(self.base / "themed", themes={"GX Mocha": b"palette\r\n"}), "cache": self.cache,
                    "source_info": lambda root: (SHA, False), **self.common()}
         options.update(kwargs)
         if "deb_depends" not in options and "depends" not in options:
             options["depends"] = lambda binary: "libc6 (>= 2.39), libgtk-4-1 (>= 4.14.0)"
-        manifest = stage_mod.build_stage("deb", stage, deb_prefix(self.base), **options)
+        manifest = stage_mod.build_stage("deb", stage, prefix or deb_prefix(self.base), **options)
         return stage, manifest
 
     def test_layout_manifest_and_desktop_integration(self):
         stage, manifest = self.build()
         self.assertEqual({path.name for path in stage.iterdir()}, {"root", "fonts", "stage-manifest.json"})
         lib = stage / "root/usr/lib/ghostty-gx"
-        self.assertEqual((lib / "bin/ghostty").read_bytes(), fake_elf())
+        self.assertEqual((lib / "bin/ghostty").read_bytes(), linux_binary())
         self.assertFalse((lib / "bin/ghostty-extra").exists())
-        self.assertTrue((lib / "share/terminfo/g/ghostty").is_file())
+        self.assertEqual(sorted(path.name for path in (lib / "lib").iterdir()), [LAYER_SHELL])
+        terminfo = lib / "share/terminfo/g/ghostty"
+        self.assertFalse(terminfo.is_symlink())
+        self.assertEqual(terminfo.read_bytes(), (lib / "share/terminfo/x/xterm-ghostty").read_bytes())
+        output = self.stdout.getvalue()
+        for line in ("copied share/terminfo/g/ghostty as a file (symlink to ../x/xterm-ghostty)",
+                     "skipped bin/ghostty-extra", "skipped lib/libghostty-vt.so.0.1.0"):
+            self.assertIn(line, output)
         self.assertTrue((lib / "share/locale/zh_CN/LC_MESSAGES/com.mitchellh.ghostty.mo").is_file())
         self.assertEqual((lib / "share/ghostty/themes/GX Mocha").read_bytes(), b"palette\n")
         for skipped in stage_mod.SKIPPED_SHARE:
@@ -767,7 +946,7 @@ class DebStageTests(Case):
                        " Permission is hereby granted, free of charge"):
             self.assertIn(needle, copyright_text)
         self.assertEqual(manifest["deb_depends"], "libc6 (>= 2.39), libgtk-4-1 (>= 4.14.0)")
-        self.assertEqual(manifest["binaries"], {"ghostty": sha(fake_elf())})
+        self.assertEqual(manifest["binaries"], {"ghostty": sha(linux_binary())})
         self.assertIn({"path": "root/usr/bin/ghostty-gx", "symlink": "../lib/ghostty-gx/bin/ghostty"}, manifest["files"])
         self.assertEqual(stage_mod.verify_stage(stage)["platform"], "deb")
         os.unlink(link)
@@ -775,32 +954,83 @@ class DebStageTests(Case):
         with self.assertRaisesRegex(pkg.PackageError, "unexpected stage symlink"):
             stage_mod.verify_stage(stage)
 
+    def test_verify_checks_the_bundled_libraries(self):
+        stage, _ = self.build()
+        manifest_path = stage / "stage-manifest.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        libraries = "root/usr/lib/ghostty-gx/lib/"
+
+        def restage(change) -> None:
+            change()
+            manifest = dict(original, files=stage_mod.inventory(stage, "deb"))
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        restage(lambda: write(stage / libraries / "libunused.so", make_elf(soname="libunused.so")))
+        with self.assertRaisesRegex(pkg.PackageError, "must hold exactly the libraries ghostty loads"):
+            stage_mod.verify_stage(stage)
+        restage(lambda: [(stage / libraries / name).unlink() for name in ("libunused.so", LAYER_SHELL)])
+        with self.assertRaisesRegex(pkg.PackageError, "does not bundle it"):
+            stage_mod.verify_stage(stage)
+
     def test_depends_override_and_prefix_checks(self):
         _, manifest = self.build(deb_depends="libc6, libadwaita-1-0")
         self.assertEqual(manifest["deb_depends"], "libc6, libadwaita-1-0")
         destdir = deb_prefix(self.base / "broken")
-        (destdir / "usr/share/terminfo/g/ghostty").unlink()
+        shutil.rmtree(destdir / "usr/share/terminfo")
         with self.assertRaisesRegex(pkg.PackageError, "compiled terminfo"):
             stage_mod.build_stage("deb", self.base / "other", destdir, root=self.root, cache=self.cache,
                                   source_info=lambda root: (SHA, False), deb_depends="libc6", **self.common())
         write(destdir / "usr/bin/ghostty", fake_elf(machine=0xB7))
         with self.assertRaisesRegex(pkg.PackageError, "not x86-64"):
-            stage_mod.check_elf(destdir / "usr/bin/ghostty", VS)
+            linux.check_binary(destdir / "usr/bin/ghostty", VS)
 
-    def test_shlibdeps_output_is_parsed(self):
-        calls = []
+    def test_unsafe_prefixes_are_refused(self):
+        cases = (
+            ("zig cache runpath", lambda usr: write(usr / "bin/ghostty",
+                                                    linux_binary(runpath="/src/.zig-cache/o/0123:$ORIGIN/../lib")),
+             "RUNPATH entries"),
+            ("unbundled library", lambda usr: (usr / "lib" / LAYER_SHELL).unlink(), "does not bundle it"),
+            ("link out of share", lambda usr: os.symlink("../../bin/ghostty", usr / "share/ghostty/escape"),
+             "outside share/"),
+            ("dangling link", lambda usr: os.symlink("missing", usr / "share/ghostty/dangling"), "not a file"),
+            ("linked directory", lambda usr: os.symlink("../locale", usr / "share/ghostty/linked"),
+             "symlink or reparse point"),
+        )
+        for index, (label, mutate, message) in enumerate(cases):
+            with self.subTest(case=label):
+                destdir = deb_prefix(self.base / f"case-{index}")
+                mutate(destdir / "usr")
+                with self.assertRaisesRegex(pkg.PackageError, message):
+                    self.build(self.base / f"stage-{index}", prefix=destdir, deb_depends="libc6")
+                self.assertFalse((self.base / f"stage-{index}").exists())
+
+    def test_test_package_from_the_stage(self):
+        stage, manifest = self.build()
+        seen = {}
 
         def runner(command, **kwargs):
-            calls.append((command, Path(kwargs["cwd"], "debian", "control").read_text(encoding="utf-8")))
-            return subprocess.CompletedProcess(command, 0, "shlibs:Depends=libc6 (>= 2.39), libgtk-4-1\n", "")
+            tree = Path(command[-2])
+            seen["control"] = (tree / "DEBIAN" / "control").read_text(encoding="utf-8")
+            seen["link"] = os.readlink(tree / "usr/bin/ghostty-gx")
+            seen["modes"] = {oct((tree / path).stat().st_mode & 0o777)
+                             for path in ("usr", "usr/lib/ghostty-gx/bin", "DEBIAN")}
+            write(Path(command[-1]), b"!<arch>\n")
+            return subprocess.CompletedProcess(command, 0)
 
-        with mock.patch.object(stage_mod.shutil, "which", return_value="/usr/bin/dpkg-shlibdeps"):
-            self.assertEqual(stage_mod.shlibdeps(Path("/x/ghostty"), runner), "libc6 (>= 2.39), libgtk-4-1")
-        self.assertEqual(calls[0][0], ["/usr/bin/dpkg-shlibdeps", "-O", f"-e{Path('/x/ghostty')}"])
-        self.assertIn("Package: ghostty-gx", calls[0][1])
-        with mock.patch.object(stage_mod.shutil, "which", return_value=None):
-            with self.assertRaisesRegex(pkg.PackageError, "dpkg-dev"):
-                stage_mod.shlibdeps(Path("/x/ghostty"))
+        output = self.base / "out" / "test.deb"
+        with mock.patch.object(stage_mod.shutil, "which", return_value="/usr/bin/dpkg-deb"):
+            self.assertEqual(stage_mod.test_deb(stage, output, runner), output)
+            with self.assertRaisesRegex(pkg.PackageError, "must not exist yet"):
+                stage_mod.test_deb(stage, output, runner)
+        control = seen["control"].splitlines()
+        for line in ("Package: ghostty-gx-stage-test", f"Version: {VS.replace('-', '~')}", "Architecture: amd64",
+                     f"Depends: {manifest['deb_depends']}", f" gx0404/gx_ghostty {SHA}. GX Shell ships the real package."):
+            self.assertIn(line, control)
+        self.assertEqual(seen["link"], "../lib/ghostty-gx/bin/ghostty")
+        self.assertEqual(seen["modes"], {"0o755"})
+        with mock.patch.object(stage_mod.shutil, "which", return_value=None), \
+                self.assertRaisesRegex(pkg.PackageError, "dpkg-deb is not installed"):
+            stage_mod.test_deb(stage, self.base / "other.deb", runner)
 
 
 if __name__ == "__main__":
