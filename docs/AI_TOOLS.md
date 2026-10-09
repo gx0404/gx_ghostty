@@ -101,7 +101,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 - `block_dangerous.sh` 依次尝试 `python3`、`python`；第一个解释器无法运行时（例如 Windows 应用商店的 `python3` 占位程序）回退到下一个，两者都不可用时 exit 2。Codex 适配器加载不到共享门或共享门运行出错时同样 exit 2。
 - 判定看门狗：客户端在 hook 超时（30 秒）后放行工具，而病态命令能让正则引擎在不释放 GIL 的情况下长时间运行。共享门用 `faulthandler` 的 C 级看门狗限时 10 秒（`pre_tool_use_gate.py::EVALUATION_DEADLINE_SECONDS`），超时以 exit 1 结束并把调用栈写到 stderr；注册命令把它转成 exit 2。`block_dangerous.sh` 最多试两个解释器，两次限时加启动仍在 30 秒内。
 - Claude Code 与 ZCode 收到 `hookSpecificOutput.permissionDecision`，取值 deny 或 ask。
-- Codex 收到同一结构，但从不出现 ask：Codex 0.160 把 ask 当作 hook 失败并继续执行工具，所以 ask 级规则按 deny 返回，理由里注明。Codex 的输出键集合按其可执行文件内嵌的 PreToolUse 输出 schema（两级都是 `additionalProperties: false`）锁进测试。wezterm 参考实现里扁平的 `{"permissionDecision", "reason"}` 不在该 schema 内，属于无效输出；按 Codex 文档，hook 只会被记为失败，工具照常执行。本仓没有照搬。
+- Codex 收到同一结构，但从不出现 ask：Codex 0.160 把 ask 当作 hook 失败并继续执行工具，所以 ask 级规则按 deny 返回，理由里注明。Codex 的输出键集合按其可执行文件内嵌的 PreToolUse 输出 schema（两级都是 `additionalProperties: false`）锁进测试。扁平的 `{"permissionDecision", "reason"}` 不在该 schema 内，属于无效输出；按 Codex 文档，hook 只会被记为失败，工具照常执行，所以本仓不用这种写法。
 
 ### 修改流程
 
@@ -117,7 +117,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
   - 不写 `Write(...)` 路径规则：Claude Code 只按 `Read(...)`/`Edit(...)` 判定文件权限，`Edit` 规则同时覆盖 Write 与 NotebookEdit。
   - reviewer 的 `permissionMode` 会被主会话的 acceptEdits 覆盖，所以只读边界靠工具白名单（Read、Grep、Glob、Bash）与 `disallowedTools`。
 - **Codex**：
-  - `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，是用户授权的既有基线，与 wezterm、herdr 两个 fork 一致，本轮不改 sandbox、model 或审批权限。它不自带破坏性操作保障；安全门只有在项目配置已加载、当前 hook hash 已受信任且调用确实经过它时才参与判定，当前真实拦截为 FAIL。
+  - `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，是用户授权的既有基线，本仓不改 sandbox、model 或审批权限。它不自带破坏性操作保障；安全门只有在项目配置已加载、当前 hook hash 已受信任且调用确实经过它时才参与判定，当前真实拦截为 FAIL。
   - `[shell_environment_policy]` 继承全部环境变量，但排除 `*KEY*`、`*SECRET*`、`*TOKEN*`、`*PASSWORD*`。
   - reviewer 用 `config_file` 注册，`sandbox_mode = "read-only"`。
   - 项目层配置只在 Codex 信任本项目后加载；非托管 hook 首次出现或内容变更后，要在 `/hooks` 里审阅并信任，否则会被跳过。
@@ -175,7 +175,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 
 2026-10-07 的真实客户端补证：
 
-- **Kimi Code 2.1.1**：用 `kimi --output-format stream-json -p <短只读提示>` 开新会话，在任何工具调用前答出中文提交规范、Zig 必须经 `scripts/zigw.py`、Windows 只有 lib-vt 三条 fork 规则；唯一工具调用为 `git --no-optional-locks status --short --branch`，exit 0，没有通过 Read 临时补读规则。这证明新会话自动注入，不证明信任流程或 hooks。
+- **Kimi Code 2.1.1**：用 `kimi --output-format stream-json -p <短只读提示>` 开新会话，在任何工具调用前答出中文提交规范、Zig 必须经 `scripts/zigw.py`、Windows 只有 lib-vt 三条 fork 规则（第三条是当时 fork 段的说法，现已过时：Windows 已有 win32 app）；唯一工具调用为 `git --no-optional-locks status --short --branch`，exit 0，没有通过 Read 临时补读规则。这证明新会话自动注入，不证明信任流程或 hooks。
 - **Codex 0.160.0**：`codex exec --strict-config --ephemeral <短提示>` 的真实调用 exit 0，新会话自动注入根 `AGENTS.md`。启动头显示 `read-only`，但 `exec` 默认即为只读，不能据此判定项目配置未加载；项目层实际生效仍为 PENDING。`codex --strict-config --version` 不加载配置，不能代替本次真实调用。
 - **Codex 拦截失败**：`gh pr create --help` 实际进入 gh，因 gh 配置访问 `Access denied` 退出 1，而不是 hook deny；`git clean -n -d` 实际执行、exit 0。两项预期拒绝断言均为 FAIL；`git status` 成功也不能代证 hook 参与。`codex features list` 显示 `hooks=true`，但功能开关开启不证明项目 hook 已加载或受信任。
 - [Codex 官方 hooks 文档](https://developers.openai.com/codex/hooks/)明确 `exec_command` 也匹配 `Bash`，当前 `^(Bash|apply_patch)$` matcher 无须因此改名。项目受信任与当前 hook hash 被单独信任是前提，漏拦的具体原因仍为 PENDING，不能归因于 matcher、PowerShell 或配置层中的某一项。
