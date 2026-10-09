@@ -155,6 +155,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 - **启用 Actions**：fork 默认不运行 workflow。在 fork 的 Actions 页面点击 “I understand my workflows, go ahead and enable them”，或在 Settings → Actions → General 允许运行。只读确认：`gh api repos/gx0404/gx_ghostty/actions/permissions`。
 - **默认分支**：`workflow_dispatch` 要求 workflow 文件在默认分支上，fork 的默认分支应为 `gx_ghostty`（本地 `refs/remotes/origin/HEAD` 记录的正是 `origin/gx_ghostty`）。
+- **禁用镜像分支上的上游 workflow**：`main` 原样镜像上游，推送它会触发上游带 `push` 触发器的 workflow，在 fork 上只会一直排队或跳过。`Test` 与 `Nix` 已于 2026-10-10 用 `gh workflow disable` 禁用，做法见 [DEVELOPMENT.md](DEVELOPMENT.md) 的同步步骤 2。
 - **权限**：仓库默认的 `GITHUB_TOKEN` 权限可以保持只读。`publish` 在 job 内显式申请 `contents: write`，其余 job 都是只读。不需要配置任何 secret。
 
 ## workflow 归档与上游同步

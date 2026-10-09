@@ -207,6 +207,8 @@ git merge --ff-only upstream/main
 
 不能快进说明 `main` 上出现了非上游提交，先查清原因；不能用 `reset --hard` 或 force push 解决。
 
+`main` 上是上游原样的 `.github/workflows/`，推送 `main` 会在 fork 上触发其中带 `push` 触发器的 workflow；它们依赖上游的 runner 与密钥，在 fork 上只会一直排队或跳过。上游的 `Test` 与 `Nix` 已在 fork 上禁用（`gh workflow disable Test --repo gx0404/gx_ghostty`，`Nix` 同理；`gh workflow list --all` 查看状态）。推送 `main` 后若出现新的上游 workflow 运行，取消它并同样禁用。
+
 **3. 合入 `gx_ghostty`**
 
 ```sh
