@@ -276,7 +276,7 @@ class DependencyTests(unittest.TestCase):
         with mock.patch.object(linux.os, "geteuid", return_value=0, create=True):
             update, install = linux.apt_install_commands(["git", "meson"])
         self.assertEqual(update, ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600",
-                                  "update"])
+                                  "-o", "Acquire::Retries=5", "update"])
         self.assertEqual(install[-5:], ["install", "-y", "--no-install-recommends", "git", "meson"])
         with mock.patch.object(linux.os, "geteuid", return_value=1000, create=True), \
                 mock.patch.object(linux.shutil, "which", return_value="/usr/bin/sudo"):
@@ -307,7 +307,7 @@ class DependencyTests(unittest.TestCase):
                 linux.ensure_deps("tarball", runner=runner)
             linux.ensure_deps("tarball", install=True, runner=runner)
         apt = [command for command in commands if "apt-get" in command]
-        self.assertEqual([command[command.index("apt-get") + 3] for command in apt], ["update", "install"])
+        self.assertEqual([command[command.index("apt-get") + 5] for command in apt], ["update", "install"])
         self.assertNotIn("git", apt[1])
         self.assertIn("apt packages for a tarball build: ok", stdout.getvalue())
         self.assertNotIn("note:", stdout.getvalue())

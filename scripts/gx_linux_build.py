@@ -370,12 +370,9 @@ def apt_install_commands(packages: Iterable[str]) -> list[list[str]]:
         if sudo is None:
             raise PackageError("installing apt packages needs root: run as root or install sudo")
         prefix = [sudo]
-    environment = [*prefix, "env", "DEBIAN_FRONTEND=noninteractive"]
-    return [
-        [*environment, "apt-get", "-o", "DPkg::Lock::Timeout=600", "update"],
-        [*environment, "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "--no-install-recommends",
-         *packages],
-    ]
+    apt = [*prefix, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "-o",
+           "Acquire::Retries=5"]
+    return [[*apt, "update"], [*apt, "install", "-y", "--no-install-recommends", *packages]]
 
 
 def run(command: list[str], runner: Runner = subprocess.run, **kwargs) -> None:
