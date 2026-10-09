@@ -110,11 +110,12 @@ pub fn height(self: *const TabBar) i32 {
     return @intFromFloat(@round(32.0 * self.windowConst().scale));
 }
 
-/// Recompute visibility from `window-show-tab-bar` and the tab count.
-/// Returns true when it changed, so the window must lay itself out again.
+/// Recompute visibility from `window-show-tab-bar`, the tab count and
+/// `Window.tab_bar_suppressed`. Returns true when it changed, so the window
+/// must lay itself out again.
 pub fn updateVisibility(self: *TabBar) bool {
     const win = self.window();
-    const should_show = if (win.is_quick_terminal) false else switch (win.app.config.@"window-show-tab-bar") {
+    const should_show = if (win.is_quick_terminal or win.tab_bar_suppressed) false else switch (win.app.config.@"window-show-tab-bar") {
         .always => true,
         .auto => win.tab_count > 1,
         .never => false,
@@ -567,13 +568,21 @@ pub fn onMouseLeave(self: *TabBar) void {
     }
 }
 
-/// Handle a right-button release in the tab bar: show the tab context menu
-/// for the clicked tab (or only "New Tab" over the empty area).
+/// Handle a right-button release in the tab bar: the launch profile menu
+/// over the "+" button, else the tab context menu for the clicked tab (or
+/// only "New Tab" over the empty area).
 pub fn onRightButtonUp(self: *TabBar, x: i16, y: i16) void {
     if (!self.visible) return;
     if (y >= self.height()) return;
     const win = self.window();
     const hwnd = win.hwnd orelse return;
+
+    if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
+        var anchor = w32.POINT{ .x = self.new_tab_rect.left, .y = self.height() };
+        _ = w32.ClientToScreen(hwnd, &anchor);
+        Menu.showProfileMenu(win, anchor);
+        return;
+    }
 
     const clicked_tab = self.tabAt(x);
 

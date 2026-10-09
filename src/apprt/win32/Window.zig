@@ -103,6 +103,10 @@ resize_overlay: ResizeOverlay = .{},
 /// chrome at the left edge).
 main_menu_anchor: ?w32.POINT = null,
 
+/// Hides the tab bar regardless of `window-show-tab-bar` (see
+/// `setTabBarSuppressed`).
+tab_bar_suppressed: bool = false,
+
 /// Posted by `queueMainMenu`; opens the main menu.
 const WM_APP_MAIN_MENU: u32 = w32.WM_APP + 20;
 
@@ -1158,6 +1162,14 @@ pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) 
 /// Update tab bar visibility based on config and tab count.
 fn updateTabBarVisibility(self: *Window) void {
     if (self.tab_bar.updateVisibility()) self.handleResize();
+}
+
+/// Hide the tab bar regardless of `window-show-tab-bar`, or stop hiding
+/// it; for example while herdr runs as the only tab (`gx-herdr-app-mode`).
+pub fn setTabBarSuppressed(self: *Window, suppressed: bool) void {
+    if (self.tab_bar_suppressed == suppressed) return;
+    self.tab_bar_suppressed = suppressed;
+    self.updateTabBarVisibility();
 }
 
 /// Invalidate the tab bar region so it gets repainted.

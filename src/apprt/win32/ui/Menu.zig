@@ -3,9 +3,9 @@
 //! Each `show*` function builds its menu on demand and runs it modally at
 //! a screen position. The context menus return what the user picked (null
 //! when the menu was dismissed) and the caller performs the choice; the
-//! main menu performs its items itself. Because menus are built on every
-//! invocation they always use the current UI language (labels are English
-//! msgids translated with `gx.i18n.tr`).
+//! main and launch profile menus perform the picked item themselves.
+//! Because menus are built on every invocation they always use the current
+//! UI language (labels are English msgids translated with `gx.i18n.tr`).
 //!
 //! The implementation is TrackPopupMenuEx today; a custom popup menu can
 //! replace it behind the same functions.
@@ -15,6 +15,7 @@ const input = @import("../../../input.zig");
 const i18n = @import("../../../gx/i18n.zig");
 const profiles = @import("../../../gx/profiles.zig");
 const w32 = @import("../win32.zig");
+const App = @import("../App.zig");
 const Window = @import("../Window.zig");
 const Dialogs = @import("Dialogs.zig");
 const trigger = @import("trigger.zig");
@@ -109,14 +110,8 @@ pub fn showMainMenu(window: *Window, anchor: ?w32.POINT) void {
     const app = window.app;
     const set = &app.config.keybind.set;
 
-    var arena: std.heap.ArenaAllocator = .init(app.core_app.alloc);
-    defer arena.deinit();
-    var launch: ?profiles.List = app.launchProfiles() catch |err| null: {
-        log.warn("launch profile detection failed err={}", .{err});
-        break :null null;
-    };
-    defer if (launch) |*list| list.deinit();
-    const profile_list: []const profiles.Profile = if (launch) |list| list.profiles else &.{};
+    var launch: ProfileItems = .init(app);
+    defer launch.deinit();
 
     var menu = Builder.init() orelse return;
     defer menu.deinit();
@@ -126,11 +121,7 @@ pub fn showMainMenu(window: *Window, anchor: ?w32.POINT) void {
     menu.itemHint(@intFromEnum(MainItem.new_window), i18n.tr("New Window"), trigger.formatAction(set, .new_window, &hint_buf));
     if (Builder.init()) |submenu_| {
         var submenu = submenu_;
-        if (profile_list.len == 0) submenu.item(0, i18n.tr("No Launch Profiles"), false);
-        for (profile_list, 0..) |profile, i| {
-            const name = profiles.displayName(arena.allocator(), profile) catch profile.name;
-            submenu.item(main_menu_profile_first + i, name, true);
-        }
+        launch.append(&submenu);
         menu.submenu(submenu, i18n.tr("New Tab with Profile"));
     }
     menu.separator();
@@ -156,8 +147,8 @@ pub fn showMainMenu(window: *Window, anchor: ?w32.POINT) void {
     };
     const id = menu.track(hwnd, screen_pt) orelse return;
 
-    if (id >= main_menu_profile_first and id - main_menu_profile_first < profile_list.len) {
-        _ = app.openProfile(window, profile_list[id - main_menu_profile_first].id, .tab);
+    if (launch.profileId(id)) |profile_id| {
+        _ = app.openProfile(window, profile_id, .tab);
         return;
     }
     switch (std.enums.fromInt(MainItem, id) orelse return) {
@@ -188,8 +179,64 @@ const MainItem = enum(usize) {
     quit,
 };
 
-/// Command id of the first launch profile in the main menu.
-const main_menu_profile_first: usize = 0x1000;
+/// The launch profile menu of the new-tab button: one item per launch
+/// profile; the picked profile opens in a new tab of `window`. Opens at
+/// `anchor` (screen coordinates). Same calling rules as `showMainMenu`.
+pub fn showProfileMenu(window: *Window, anchor: w32.POINT) void {
+    const hwnd = window.hwnd orelse return;
+    var launch: ProfileItems = .init(window.app);
+    defer launch.deinit();
+
+    var menu = Builder.init() orelse return;
+    defer menu.deinit();
+    launch.append(&menu);
+
+    const id = menu.track(hwnd, anchor) orelse return;
+    if (launch.profileId(id)) |profile_id| _ = window.app.openProfile(window, profile_id, .tab);
+}
+
+/// The launch profiles (`App.launchProfiles`) as menu items with command
+/// ids from `first_id` on.
+const ProfileItems = struct {
+    const first_id: usize = 0x1000;
+
+    arena: std.heap.ArenaAllocator,
+    list: ?profiles.List,
+
+    fn init(app: *App) ProfileItems {
+        return .{
+            .arena = .init(app.core_app.alloc),
+            .list = app.launchProfiles() catch |err| null: {
+                log.warn("launch profile detection failed err={}", .{err});
+                break :null null;
+            },
+        };
+    }
+
+    fn deinit(self: *ProfileItems) void {
+        if (self.list) |*list| list.deinit();
+        self.arena.deinit();
+    }
+
+    fn all(self: *const ProfileItems) []const profiles.Profile {
+        return if (self.list) |list| list.profiles else &.{};
+    }
+
+    /// Append one item per profile, or a disabled placeholder if none.
+    fn append(self: *ProfileItems, menu: *Builder) void {
+        if (self.all().len == 0) menu.item(0, i18n.tr("No Launch Profiles"), false);
+        for (self.all(), 0..) |profile, i| {
+            const name = profiles.displayName(self.arena.allocator(), profile) catch profile.name;
+            menu.item(first_id + i, name, true);
+        }
+    }
+
+    /// The profile id behind menu command `id`, if it is a profile item.
+    fn profileId(self: *const ProfileItems, id: usize) ?[]const u8 {
+        if (id < first_id or id - first_id >= self.all().len) return null;
+        return self.all()[id - first_id].id;
+    }
+};
 
 /// Hook for a language change. Menus are built on demand, so there is
 /// nothing cached to rebuild.
