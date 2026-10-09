@@ -13,7 +13,7 @@ Usage
 Consumer contract (GX Shell release.yml)
   Check out gx0404/gx_ghostty at the release commit (actions/checkout with persist-credentials: false;
   depth 1 is enough) and run the commands from its root. VS is <build.zig.zon X.Y.Z>-gx.<fork X.Y.Z> of
-  that commit, 1.3.2-gx.0.1.0 for gx-v0.1.0 (gx-release's prepare job prints it as version_string);
+  that commit, 1.3.2-gx.0.0.1 for gx-v0.0.1 (gx-release's prepare job prints it as version_string);
   without --version-string that VS is used, any other value is refused before building.
   windows-2025 runner, shell pwsh, every command followed by `if ($LASTEXITCODE -ne 0) { exit
   $LASTEXITCODE }`; `git config --global core.autocrlf false` before the checkout keeps the shipped shell
@@ -86,8 +86,8 @@ Windows layout (top level exactly app/, fonts/, build-inputs/ and the manifest)
                         ghostty.exe, conpty.dll, OpenConsole.exe, mesa/, share/ (with
                         share/terminfo/ghostty.terminfo and fork themes), licenses/ (Ghostty-MIT.txt,
                         THIRD-PARTY.txt and the ConPTY, Mesa, LLVM and font license texts), README.txt
-  fonts/                the 8 pinned fonts of gx_release.WINDOWS_FONTS, byte-identical to WezTerm GX
-                        dotfiles/fonts/ (GX Shell merges component fonts only when the bytes match)
+  fonts/                the 8 pinned fonts of gx_release.WINDOWS_FONTS; GX Shell merges component fonts
+                        only when the bytes match, so the four Oh My Zsh GX also ships are identical
   build-inputs/ghostty.ico   dist/windows/ghostty.ico
 Deb layout (top level exactly root/, fonts/ and the manifest)
   root/usr/lib/ghostty-gx/   bin/ghostty and share/ from the prefix (relocatable: the app finds

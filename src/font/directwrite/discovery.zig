@@ -9,10 +9,10 @@
 //! named by a GDI family name such as "Segoe UI Semibold", are looked up
 //! through GDI.
 //!
-//! DirectWrite only finds the font: its file and face index are loaded by
-//! FreeType as before (`DeferredFace.Windows`), so rasterization and
-//! shaping do not change. Without DirectWrite, discovery falls back to the
-//! font directory scanner `discovery.Windows`.
+//! DirectWrite only finds the font: FreeType loads its file and face index
+//! (`DeferredFace.Windows`) and rasterizes it, and HarfBuzz shapes the
+//! text, exactly as with the font directory scanner `discovery.Windows`,
+//! which discovery falls back to without DirectWrite.
 //!
 //! Based on the DirectWrite discovery of shiweis/ghostty-windows
 //! `src/font/discovery.zig` (MIT, commit 119b9270c).

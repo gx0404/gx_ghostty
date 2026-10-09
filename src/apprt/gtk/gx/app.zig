@@ -162,7 +162,7 @@ fn reload(data: ?*anyopaque) callconv(.c) c_int {
 }
 
 /// Opens the Ghostty GX settings (`app.gx-settings`), or the configuration
-/// file while that action does not exist.
+/// file if the application has no such action.
 fn openSettings(app: *Application) bool {
     const group = app.as(gio.ActionGroup);
     if (group.hasAction("gx-settings") != 0 and group.getActionParameterType("gx-settings") == null) {

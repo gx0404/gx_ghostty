@@ -719,7 +719,7 @@ def asset_description(name: str, asset: Asset | None) -> str:
         return "Ghostty GTK app（实验性，debian:13 构建，解压后运行 `usr/bin/ghostty`）"
     if asset.kind == "installer":
         return ("Ghostty GX Windows 安装包（x64；默认按用户安装到 `%LOCALAPPDATA%\\Programs\\Ghostty GX`，"
-                "可改为所有用户；可选桌面图标与资源管理器右键菜单，按用户安装字体，卸载保留用户配置）")
+                "可改为所有用户；可选桌面图标与资源管理器右键菜单，按同一范围安装随附字体，卸载保留用户配置）")
     if asset.target == WINDOWS_APP_TARGET:
         return ("Ghostty GX Windows 便携版（x64；解压后运行 `ghostty.exe`，附 ConPTY、Mesa 软件渲染后备、"
                 "字体与许可证，见包内 `README.txt`）")

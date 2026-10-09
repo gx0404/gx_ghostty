@@ -3,7 +3,8 @@
 ;   GxVersion         version string VS (<build.zig.zon X.Y.Z>-gx.<fork X.Y.Z>)
 ;   GxNumericVersion  X.Y.Z.0 of the Ghostty product version, for the version resource
 ;   GxApp             portable directory without fonts\, installed into {app}
-;   GxFonts           generated [Files] entries that install the bundled fonts per user
+;   GxFonts           generated [Files] entries that install the bundled fonts into {autofonts}
+;                     (the user's fonts, or all users' fonts in an all-users installation)
 ;   GxIcon, GxOutput, GxFilename
 ; Uninstalling removes only what this installer wrote: the user's Ghostty configuration is kept,
 ; and fonts stay installed (uninsneveruninstall) because other GX programs share them.

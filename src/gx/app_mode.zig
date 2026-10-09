@@ -1,9 +1,10 @@
 //! herdr app mode for Ghostty GX: while the only tab of a window runs
 //! herdr, the window presents herdr like a standalone application (the
-//! GTK apprt hides the tab bar; see `gx-herdr-app-mode`). The apprts ask
-//! `terminalRunsHerdr` about every terminal of a window's only tab,
-//! passing what `Surface.getProcessInfo(.foreground_pid)` reports, and
-//! combine the answers with `decide`.
+//! GTK and win32 apprts hide the tabs and keep the window controls; see
+//! `gx-herdr-app-mode`). The apprts ask `terminalRunsHerdr` about every
+//! terminal of a window's only tab, passing what
+//! `Surface.getProcessInfo(.foreground_pid)` reports, and combine the
+//! answers with `decide`.
 //!
 //! On Linux that pid is the foreground process group leader of the pty,
 //! so herdr counts while it runs in the foreground: herdr itself, or a
