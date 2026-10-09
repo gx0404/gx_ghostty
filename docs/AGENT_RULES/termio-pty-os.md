@@ -47,7 +47,7 @@
 
 ### 平台与库约束
 
-- Windows 没有可运行的 app；只有 Windows 目标的 libghostty-internal 与 `ghostty-test` 会编译这些分支，而二者目前在 Windows 上都编不过（见「验证」）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`getProcessInfo` 在 Windows 上返回 null。
+- Windows 没有可运行的 app；只有 Windows 目标的 libghostty-internal 与 `ghostty-test` 会编译这些分支，而二者目前在 Windows 上都编不过（见「验证」）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`WindowsPty.getProcessInfo` 返回 null，fork 补丁 GX-0012 让 `Exec.Subprocess.getProcessInfo(.foreground_pid)` 在 Windows 上改报子进程（shell）的 pid，供关闭确认与 herdr 应用模式列进程（`src/gx/confirm.zig`、`src/gx/app_mode.zig`）。
 - lib-vt 闭包里的 `os` 文件（见「范围」）不得引入 libc、`global.zig`、termio 或 apprt 依赖，必须能编到 `wasm32-freestanding`。
 - `src/os/` 新代码优先显式接收 `io`、`alloc`、`environ_map`（参照 `src/os/xdg.zig`、`src/os/homedir.zig`），不读全局环境。`src/os/locale.zig::ensureLocale` 会改进程环境，只在 `global.init` 里调用，并断言非测试。
 - 读管线常量（`ReadThread.buffer_count`、`buffer_capacity`、`bridge_*`、`gather_budget_ns`）的取值依据（实测数据或延迟预算）写在各自注释里，改动要给出同等证据；`src/benchmark/TerminalStream.zig` 的读缓冲刻意与 `buffer_capacity` 一致，改一处要同步另一处。

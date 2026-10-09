@@ -38,6 +38,7 @@
 - app 线程处理 surface 消息前用 `hasSurface` 确认目标仍在；`deleteSurface` 主动清空 `focused_surface`，因为分配器会复用地址，单靠 `hasSurface` 会误判（源码注释记录过这个缺陷）。`focusedSurface` 只在主线程、`tick` 之前有效。
 - `DerivedConfig` 把所需配置复制进自己的 arena，surface 不持有 `Config` 指针。`Surface.updateConfig` 重新派生，向 renderer 发 `renderer.Message.initChangeConfig` 的结果、向 termio 发堆上的 `Termio.DerivedConfig`，并结束按键序列、停用全部 key table（它们持有旧配置里的指针）。`apprt.surface.Message.change_config` 的指针收到后即失效，必须当场派生。
 - 写往 pty 的数据统一经 `Surface.queueIo`：只读模式（`readonly`）在这里丢弃并释放 `write_*` 消息。
+- 关闭确认统一经 `Surface.needsConfirmQuit`（各 apprt 都调用它）：只读模式恒确认、子进程已退出不确认，其余按 `confirm-close-surface`。fork 补丁 GX-0012 在 `true` 且光标不在提示符时，经 `src/gx/confirm.zig` 列出终端里的进程（Linux 为前台进程组组长及其子孙，Windows 为 shell 及其子孙），全部空闲就不确认；列进程在主线程进行，不持有 `renderer_state.mutex`。
 - `activateInspector`/`deactivateInspector` 在 `renderer_state.mutex` 下挂上或摘下 `renderer_state.inspector`，再通知 renderer 与 termio；inspector 包本身见 `cli-inspector.md`。
 - `App.drainMailbox` 收到 `.quit` 立刻执行并返回，剩余消息留到下一次 tick。
 
