@@ -281,7 +281,7 @@ class PinTests(unittest.TestCase):
         self.assertEqual(asset.root, pkg.top_name(VS))
         self.assertIn(pkg.installer_base(VS) + ".exe", release.expected_assets(VS))
 
-    def test_fonts_are_the_wezterm_gx_snapshot(self):
+    def test_font_payload_is_exactly_the_pinned_font_files(self):
         expected = {
             "JetBrainsMonoNerdFont-Bold.ttf": "e82e27a7f37c9a0a13cc4e417503a149c6a0280586930772d2ebed803159c864",
             "JetBrainsMonoNerdFont-BoldItalic.ttf": "961222be7bce59f310b41a3e158368d5ea22a47a0ac31defd57caac9b9e82cb0",
@@ -550,7 +550,7 @@ class BinaryFormatTests(unittest.TestCase):
             self.assertTrue(pkg.contains(path, b"needle"))
             self.assertFalse(pkg.contains(path, b"missing"))
 
-    def test_font_names_follow_wezterm_gx(self):
+    def test_font_full_name_and_copyright_come_from_the_name_table(self):
         with tempfile.TemporaryDirectory() as temp:
             ttf = write(Path(temp) / "a.ttf", sfnt("JetBrainsMono NF Regular"))
             ttc = write(Path(temp) / "b.ttc", sfnt("Noto Sans CJK JP", ttc=True))
