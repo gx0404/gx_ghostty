@@ -762,7 +762,10 @@ fn run(self: *Palette, index: usize) void {
                 log.err("palette action failed action={t} err={}", .{ action, err });
             };
         },
-        .tab => |tab| if (window.findTabIndex(tab)) |i| window.selectTabIndex(i),
+        .tab => |tab| if (window.findTabIndex(tab)) |i| {
+            window.selectTabIndex(i);
+            window.invalidateTabBar();
+        },
         .profile => |id| _ = app.openProfile(window, id, .tab),
         .settings => _ = Settings.show(window),
         .language => |language| saveSetting(window, "language", language.configValue()),
