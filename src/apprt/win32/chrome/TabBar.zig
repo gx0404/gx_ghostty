@@ -590,20 +590,8 @@ pub fn onRightButtonUp(self: *TabBar, x: i16, y: i16) void {
     var pt = w32.POINT{ .x = @intCast(x), .y = @intCast(y) };
     _ = w32.ClientToScreen(hwnd, &pt);
 
-    const command = Menu.showTabContextMenu(hwnd, pt, .{
-        .tab = clicked_tab,
-        .tab_count = win.tab_count,
-    }) orelse return;
-    switch (command) {
-        .close => if (clicked_tab) |tab| win.closeTabByIndex(tab),
-        .close_others => if (clicked_tab) |tab| win.closeOtherTabs(tab),
-        .close_right => if (clicked_tab) |tab| win.closeTabsRightOf(tab),
-        .new_tab => {
-            _ = win.addTab() catch |err| {
-                log.err("failed to create new tab: {}", .{err});
-            };
-        },
-    }
+    const command = Menu.showTabContextMenu(win, pt, clicked_tab) orelse return;
+    Menu.performTabCommand(win, clicked_tab, command);
 }
 
 /// Whether `hwnd` is the inline rename edit control.
