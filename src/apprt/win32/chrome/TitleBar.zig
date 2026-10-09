@@ -404,6 +404,16 @@ pub fn handleMessage(
 ) ?isize {
     const hwnd = self.window().hwnd orelse return null;
 
+    // Track activation before DWM gets the message: the glyphs dim while
+    // the window is inactive.
+    if (msg == WM_NCACTIVATE) {
+        const active = wparam != 0;
+        if (active != self.active) {
+            self.active = active;
+            self.invalidate();
+        }
+    }
+
     // DWM hit-tests, hovers and presses its own caption buttons.
     const native = self.nativeButtons();
     if (native) {
@@ -414,14 +424,7 @@ pub fn handleMessage(
     switch (msg) {
         WM_NCCALCSIZE => return self.onNcCalcSize(hwnd, wparam, lparam),
         WM_NCHITTEST => return self.onNcHitTest(hwnd, lparam),
-        WM_NCACTIVATE => {
-            const active = wparam != 0;
-            if (active != self.active) {
-                self.active = active;
-                self.invalidate();
-            }
-            return null;
-        },
+        WM_NCACTIVATE => return null,
         else => {},
     }
 
