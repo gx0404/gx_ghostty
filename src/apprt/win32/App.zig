@@ -314,6 +314,11 @@ pub fn run(self: *App) !void {
                 // dead. This does not disturb the ToUnicode dead-key state:
                 // handleKeyEvent never calls ToUnicode for VK_PROCESSKEY.
                 if (msg.wParam == w32.VK_PROCESSKEY) break :blk false;
+                // Characters injected with SendInput KEYEVENTF_UNICODE arrive
+                // as VK_PACKET, which only TranslateMessage turns into the
+                // WM_CHAR that carries them; it does not consult the
+                // keyboard layout, so the dead-key state is untouched.
+                if (msg.wParam == w32.VK_PACKET) break :blk false;
                 const h = msg.hwnd orelse break :blk false;
                 const atom: u16 = @truncate(w32.GetClassLongW(h, w32.GCW_ATOM));
                 break :blk atom != 0 and atom == self.terminal_class_atom;
