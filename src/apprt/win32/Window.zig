@@ -625,12 +625,6 @@ pub fn deinit(self: *Window) void {
     }
 }
 
-/// Returns the height in pixels of the chrome row while it shows tabs,
-/// else 0.
-pub fn tabBarHeight(self: *const Window) i32 {
-    return if (self.tab_bar.visible) self.title_bar.height() else 0;
-}
-
 /// Height of the chrome above the terminals: the single chrome row (the
 /// integrated title bar with the tabs, or a plain tab row).
 pub fn chromeHeight(self: *const Window) i32 {

@@ -22,7 +22,6 @@ const configpkg = @import("../../config.zig");
 const input = @import("../../input.zig");
 const terminal = @import("../../terminal/main.zig");
 const CoreSurface = @import("../../Surface.zig");
-const internal_os = @import("../../os/main.zig");
 const global = @import("../../global.zig");
 const gx_win32_input = @import("../../gx/win32_input.zig");
 const gx_confirm = @import("../../gx/confirm.zig");

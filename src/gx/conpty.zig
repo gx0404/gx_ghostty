@@ -26,7 +26,6 @@
 //! the cursor at the origin, so there is nothing to inherit, and an
 //! unanswered request blocks older hosts' input indefinitely.
 const std = @import("std");
-const builtin = @import("builtin");
 const windows = @import("../os/main.zig").windows;
 
 const log = std.log.scoped(.gx_conpty);
