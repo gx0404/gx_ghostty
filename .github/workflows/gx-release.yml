@@ -10,7 +10,7 @@ on:
         required: true
         default: gx_ghostty
       publish:
-        description: 全部校验通过后发布为 prerelease（关闭时只构建与验证，产物从 Artifacts 下载）
+        description: 全部校验通过后发布为正式 Release（关闭时只构建与验证，产物从 Artifacts 下载）
         type: boolean
         default: false
       macos:
@@ -282,6 +282,64 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+  windows-app:
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Keep repository line endings
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.prepare.outputs.zig }}
+          use-cache: false
+      - name: Install checksum-pinned Inno Setup (current user, portable)
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+          $destination = Join-Path $env:RUNNER_TEMP 'gx-inno'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $installer
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f') { throw 'Inno Setup checksum mismatch' }
+          $installed = Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', '/PORTABLE=1', "/DIR=`"$destination`"" -Wait -PassThru
+          if ($installed.ExitCode -ne 0) { throw "Inno Setup failed: $($installed.ExitCode)" }
+          if (-not (Test-Path -LiteralPath (Join-Path $destination 'ISCC.exe'))) { throw 'ISCC.exe is missing after the Inno Setup install' }
+          "ISCC=$(Join-Path $destination 'ISCC.exe')" >> $env:GITHUB_ENV
+      - name: Build the win32 app (ReleaseFast)
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+        run: |
+          $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $env:RUNNER_TEMP 'gx-zig-global'
+          $env:ZIG_LOCAL_CACHE_DIR = Join-Path $env:RUNNER_TEMP 'gx-zig-local'
+          $prefix = Join-Path $env:RUNNER_TEMP 'gx-prefix'
+          zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast "-Dversion-string=$env:GX_VERSION_STRING" --prefix $prefix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package the portable zip and the installer
+        env:
+          GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'gx-out'
+          python scripts/gx_windows_package.py --prefix (Join-Path $env:RUNNER_TEMP 'gx-prefix') --version-string $env:GX_VERSION_STRING --output-dir $out --cache-dir (Join-Path $env:RUNNER_TEMP 'gx-package-cache') --iscc $env:ISCC
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $assets = @(Get-ChildItem -LiteralPath $out -File | ForEach-Object Name | Sort-Object)
+          $expected = @("ghostty-gx-$env:GX_VERSION_STRING-x86_64-windows-setup.exe", "ghostty-gx-$env:GX_VERSION_STRING-x86_64-windows.zip")
+          if (Compare-Object $assets $expected) { throw "unexpected files in gx-out: $($assets -join ', ')" }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-windows-app
+          path: ${{ runner.temp }}/gx-out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   macos:
     if: inputs.macos
     needs: prepare
@@ -325,13 +383,14 @@ jobs:
           retention-days: 14
 
   verify:
-    needs: [prepare, source, libvt, libvt-macos, linux-gtk, macos]
+    needs: [prepare, source, libvt, libvt-macos, linux-gtk, windows-app, macos]
     if: >-
       ${{ !cancelled()
       && needs.prepare.result == 'success'
       && needs.source.result == 'success'
       && needs.libvt.result == 'success'
       && needs.linux-gtk.result == 'success'
+      && needs.windows-app.result == 'success'
       && ((inputs.macos && needs.libvt-macos.result == 'success' && needs.macos.result == 'success')
       || (!inputs.macos && needs.libvt-macos.result == 'skipped' && needs.macos.result == 'skipped')) }}
     runs-on: ubuntu-24.04
@@ -395,7 +454,7 @@ jobs:
         with:
           name: verified-release
           path: ${{ runner.temp }}/gx-release
-      - name: Draft, upload, check remote digests, then publish the prerelease
+      - name: Draft, upload, check remote digests, then publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           GX_PUBLISH: ${{ inputs.publish }}

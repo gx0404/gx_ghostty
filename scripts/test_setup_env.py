@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import io
 import json
 import os
@@ -75,11 +76,15 @@ class CheckModeTests(unittest.TestCase):
             for name in ("zig", "python", "git", "venv", "hooksPath", *setup_env.OPTIONAL_CLIS):
                 self.assertIn(name, result.stdout)
             symlink_rows = [line for line in result.stdout.splitlines() if re.match(r"^\S+\s+symlink\s", line)]
+            innosetup_rows = [line for line in result.stdout.splitlines() if re.match(r"^\S+\s+innosetup\s", line)]
             if os.name == "nt":
                 self.assertEqual(1, len(symlink_rows), result.stdout)
                 self.assertRegex(symlink_rows[0], r"^(FOUND|OPTIONAL)\s")
+                self.assertEqual(1, len(innosetup_rows), result.stdout)
+                self.assertRegex(innosetup_rows[0], r"^OPTIONAL\s.*just setup --innosetup")
             else:
                 self.assertEqual([], symlink_rows)
+                self.assertEqual([], innosetup_rows)
             self.assertEqual([], list(root.iterdir()), "--check 不得在仓库里建任何东西")
             self.assertFalse(zig_home.exists(), "--check 不得创建 Zig 安装根")
 
@@ -270,12 +275,134 @@ class SymlinkTests(unittest.TestCase):
             "check_optional_clis": lambda: [Item("uv", "OPTIONAL", "", False)],
         }
         hint = Item("symlink", "OPTIONAL", setup_env.SYMLINK_PRIVILEGE_HINT, False)
-        with mock.patch.multiple(setup_env, check_symlink=lambda: hint, **stubs):
+        inno = Item("innosetup", "OPTIONAL", "未安装", False)
+        with mock.patch.multiple(setup_env, check_symlink=lambda: hint, check_innosetup=lambda root: inno, **stubs):
             items = setup_env.collect(ROOT, {})
-        self.assertEqual(["zig", "python", "git", "hooksPath", "symlink", "uv"], [item.name for item in items])
+        self.assertEqual(["zig", "python", "git", "hooksPath", "symlink", "innosetup", "uv"], [item.name for item in items])
         self.assertEqual(0, setup_env.exit_code(items))
-        with mock.patch.multiple(setup_env, check_symlink=lambda: None, **stubs):
-            self.assertNotIn("symlink", [item.name for item in setup_env.collect(ROOT, {})])
+        with mock.patch.multiple(setup_env, check_symlink=lambda: None, check_innosetup=lambda root: None, **stubs):
+            names = [item.name for item in setup_env.collect(ROOT, {})]
+        self.assertNotIn("symlink", names)
+        self.assertNotIn("innosetup", names)
+
+
+class InnoSetupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def install_files(self, marker: str | None = None) -> None:
+        iscc = setup_env.iscc_path(self.root)
+        iscc.parent.mkdir(parents=True, exist_ok=True)
+        iscc.write_bytes(b"MZ")
+        setup_env.innosetup_marker(self.root).write_text(
+            marker or f"{setup_env.INNOSETUP_VERSION} {setup_env.INNOSETUP_SHA256}\n", encoding="utf-8")
+
+    def test_pin_is_the_gx_shell_release_pin(self) -> None:
+        self.assertEqual("7.1.0", setup_env.INNOSETUP_VERSION)
+        self.assertEqual(
+            "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe", setup_env.INNOSETUP_URL
+        )
+        self.assertEqual("0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f", setup_env.INNOSETUP_SHA256)
+        self.assertEqual(self.root / ".local" / "tools" / "innosetup" / "ISCC.exe", setup_env.iscc_path(self.root))
+
+    def test_doctor_row(self) -> None:
+        self.assertIsNone(setup_env.check_innosetup(self.root, is_windows=False))
+        missing = setup_env.check_innosetup(self.root, is_windows=True)
+        self.assertEqual(("OPTIONAL", False), (missing.status, missing.required))
+        self.assertIn(setup_env.INNOSETUP_HINT, missing.detail)
+        self.install_files(marker="6.4.0 deadbeef\n")
+        stale = setup_env.check_innosetup(self.root, is_windows=True)
+        self.assertEqual("OPTIONAL", stale.status)
+        self.assertIn("删除该目录", stale.detail)
+        self.install_files()
+        found = setup_env.check_innosetup(self.root, is_windows=True)
+        self.assertEqual(("FOUND", False), (found.status, found.required))
+        self.assertIn("7.1.0", found.detail)
+        self.assertEqual(0, setup_env.exit_code([missing, stale, found]))
+
+    def test_installs_portably_for_the_current_user(self) -> None:
+        downloads: list[tuple[str, Path, str]] = []
+
+        def download(url: str, destination: Path, sha256: str) -> None:
+            downloads.append((url, destination, sha256))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"installer")
+
+        def runner(command, **kwargs):
+            target = Path(next(arg for arg in command if arg.startswith("/DIR="))[5:])
+            (target / "ISCC.exe").parent.mkdir(parents=True, exist_ok=True)
+            (target / "ISCC.exe").write_bytes(b"MZ")
+            return subprocess.CompletedProcess(command, 0)
+
+        calls = []
+        with redirect_stdout(io.StringIO()):
+            setup_env.ensure_innosetup(
+                self.root, runner=lambda command, **kwargs: calls.append(command) or runner(command), download=download, is_windows=True
+            )
+        self.assertEqual([(setup_env.INNOSETUP_URL, self.root / ".local/cache/innosetup/innosetup-7.1.0-x64.exe", setup_env.INNOSETUP_SHA256)], downloads)
+        command = calls[0]
+        for flag in ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/PORTABLE=1", f"/DIR={setup_env.innosetup_dir(self.root)}"):
+            self.assertIn(flag, command)
+        self.assertTrue(setup_env.innosetup_ready(self.root))
+        with redirect_stdout(io.StringIO()) as out:
+            setup_env.ensure_innosetup(self.root, runner=runner, download=download, is_windows=True)
+        self.assertIn("跳过", out.getvalue())
+        self.assertEqual(1, len(downloads))
+
+    def test_install_failures(self) -> None:
+        def download(url: str, destination: Path, sha256: str) -> None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"installer")
+
+        with self.assertRaisesRegex(setup_env.SetupEnvError, "非 Windows"):
+            setup_env.ensure_innosetup(self.root, download=download, is_windows=False)
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(setup_env.SetupEnvError, "退出码 5"):
+                setup_env.ensure_innosetup(
+                    self.root, runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 5), download=download, is_windows=True
+                )
+            with self.assertRaisesRegex(setup_env.SetupEnvError, "ISCC.exe"):
+                setup_env.ensure_innosetup(
+                    self.root, runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0), download=download, is_windows=True
+                )
+        setup_env.innosetup_dir(self.root).mkdir(parents=True)
+        with self.assertRaisesRegex(setup_env.SetupEnvError, "删除该目录"):
+            setup_env.ensure_innosetup(self.root, download=download, is_windows=True)
+
+    def test_download_is_verified_and_discarded_on_mismatch(self) -> None:
+        payload = b"inno setup installer"
+        digest = hashlib.sha256(payload).hexdigest()
+        destination = self.root / "cache" / "installer.exe"
+        opened = []
+
+        def urlopen(request, timeout=None):
+            opened.append(request.full_url)
+            return io.BytesIO(payload)
+
+        with self.assertRaisesRegex(setup_env.SetupEnvError, "sha256 不符"):
+            setup_env.download_verified("https://example.invalid/x.exe", destination, "0" * 64, urlopen=urlopen)
+        self.assertEqual([], list(destination.parent.iterdir()))
+        setup_env.download_verified("https://example.invalid/x.exe", destination, digest, urlopen=urlopen)
+        self.assertEqual(payload, destination.read_bytes())
+        setup_env.download_verified("https://example.invalid/x.exe", destination, digest, urlopen=urlopen)
+        self.assertEqual(2, len(opened))
+
+    def test_setup_flag_and_check_conflict(self) -> None:
+        with mock.patch.object(setup_env, "ensure_zig"), mock.patch.object(setup_env, "ensure_venv"), mock.patch.object(
+            setup_env, "ensure_innosetup", side_effect=setup_env.SetupEnvError("下载失败")
+        ) as ensure, redirect_stdout(io.StringIO()) as out, mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(1, setup_env.setup(self.root, {}, innosetup=True))
+            self.assertEqual(0, setup_env.setup(self.root, {}))
+        ensure.assert_called_once_with(self.root)
+        self.assertIn("3/3", out.getvalue())
+        self.assertIn("innosetup", err.getvalue())
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as raised:
+            setup_env.main(["--check", "--innosetup"])
+        self.assertEqual(2, raised.exception.code)
 
 
 class VenvTests(unittest.TestCase):

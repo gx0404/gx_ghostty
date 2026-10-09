@@ -51,7 +51,13 @@ CONTRACT_ASSETS = {
     f"libghostty-vt-{VS}-wasm32-freestanding.tar.gz",
     f"libghostty-vt-{VS}-x86_64-windows-msvc.zip",
     f"ghostty-gx-{VS}-x86_64-linux-debian13.tar.gz",
+    f"ghostty-gx-{VS}-x86_64-windows.zip",
+    f"ghostty-gx-{VS}-x86_64-windows-setup.exe",
 }
+WINDOWS_ZIP = f"ghostty-gx-{VS}-x86_64-windows.zip"
+WINDOWS_SETUP = f"ghostty-gx-{VS}-x86_64-windows-setup.exe"
+TEST_INSTALLER_MIN_BYTES = 4096
+CHANGELOG_BODY = "### Added\n\n- 条目"
 MACOS_ASSETS = {
     f"libghostty-vt-{VS}-xcframework.zip",
     f"ghostty-gx-{VS}-universal-macos-unsigned.zip",
@@ -131,12 +137,23 @@ def write_zip(path: Path, root: str, files: dict[str, bytes], *, backslashes: bo
             archive.writestr(separator.join([root, *name.split("/")]), data)
 
 
+def fake_installer(size: int = 2 * TEST_INSTALLER_MIN_BYTES, signature: bytes = b"PE\0\0") -> bytes:
+    data = bytearray(size)
+    data[0:2] = b"MZ"
+    data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    data[0x80:0x84] = signature
+    return bytes(data)
+
+
 def write_artifacts(folder: Path, *, macos: bool = False, version_string: str = VS,
                     skip: tuple[str, ...] = ()) -> dict[str, release.Asset]:
     folder.mkdir(parents=True, exist_ok=True)
     assets = release.expected_assets(version_string, macos)
     for name, asset in assets.items():
         if name in skip:
+            continue
+        if asset.kind == "installer":
+            (folder / name).write_bytes(fake_installer())
             continue
         files, links = asset_members(asset, version_string)
         if name.endswith(".tar.gz"):
@@ -169,6 +186,7 @@ class FakeRunner:
         self.tag_during_upload: str | None = None
         self.tag_on_publish: str | None = None
         self.target_override: str | None = None
+        self.prerelease_override: bool | None = None
         self.notes: str | None = None
         self.stale_listings = 0
         self.stale_assets = 0
@@ -233,7 +251,8 @@ class FakeRunner:
             self.notes = Path(values["--notes-file"]).read_text(encoding="utf-8")
             record = {
                 "id": 42 + len(self.releases), "tag_name": rest[2], "name": values["--title"],
-                "draft": "--draft" in flags, "prerelease": "--prerelease" in flags,
+                "draft": "--draft" in flags,
+                "prerelease": "--prerelease" in flags if self.prerelease_override is None else self.prerelease_override,
                 "target_commitish": self.target_override or values["--target"], "body": self.notes,
             }
             self.releases.append(record)
@@ -310,6 +329,9 @@ class EnvironmentCase(unittest.TestCase):
         sleep_patch = mock.patch.object(release.time, "sleep")
         sleep_patch.start()
         self.addCleanup(sleep_patch.stop)
+        minimum_patch = mock.patch.object(release, "INSTALLER_MIN_BYTES", TEST_INSTALLER_MIN_BYTES)
+        minimum_patch.start()
+        self.addCleanup(minimum_patch.stop)
 
 
 class ReleaseInfoTests(EnvironmentCase):
@@ -369,6 +391,26 @@ class ReleaseInfoTests(EnvironmentCase):
         with self.assertRaisesRegex(release.ReleaseError, "CHANGELOG.md"):
             release.release_info(self.root)
 
+    def test_changelog_section_is_the_body_under_the_version_heading(self):
+        self.assertEqual(release.changelog_section(self.root, FORK), CHANGELOG_BODY)
+        self.assertEqual(release.changelog_section(self.root, "0.0.9"), "- 旧条目")
+        crlf = write_root(self.base / "crlf", newline="\r\n")
+        self.assertEqual(release.changelog_section(crlf, FORK), CHANGELOG_BODY)
+        text = "\n".join([
+            "# Changelog", "", "## 0.2.0(2026-10-09)", "", "### Fixed", "", "```text", "## not a heading", "```",
+            "", "- 修复  ", "", "## 0.1.0(2026-10-01)", "", "- 旧", "",
+        ])
+        (self.root / "CHANGELOG.md").write_text(text, encoding="utf-8")
+        self.assertEqual(release.changelog_section(self.root, "0.2.0"),
+                         "### Fixed\n\n```text\n## not a heading\n```\n\n- 修复")
+        self.assertEqual(release.changelog_section(self.root, "0.1.0"), "- 旧")
+        with self.assertRaisesRegex(release.ReleaseError, "no ## 0.3.0 heading"):
+            release.changelog_section(self.root, "0.3.0")
+        (self.root / "CHANGELOG.md").write_text("# Changelog\n\n## 0.2.0(TBD)\n\n\n## 0.1.0(2026-10-01)\n\n- 旧\n",
+                                                encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "section ## 0.2.0 is empty"):
+            release.changelog_section(self.root, "0.2.0")
+
 
 class PrepareTests(EnvironmentCase):
     def setUp(self) -> None:
@@ -420,6 +462,17 @@ class PrepareTests(EnvironmentCase):
         with self.assertRaisesRegex(release.ReleaseError, r"dated heading.*0\.1\.0\(TBD\)"):
             release.prepare(root, True)
         self.assertEqual(self.gate_scripts(), [])
+
+    def test_publish_requires_release_notes_but_build_only_does_not(self):
+        root = write_root(self.base / "empty")
+        changelog = root / "CHANGELOG.md"
+        changelog.write_text(changelog.read_text(encoding="utf-8").replace("### Added\n\n- 条目\n", ""),
+                             encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "is empty"):
+            release.prepare(root, True)
+        self.assertEqual(self.gate_scripts(), [])
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(release.prepare(root, False)["version"], FORK)
 
     def test_publish_checks_tag_and_release_absence(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO):
@@ -489,12 +542,12 @@ class VerifyTests(EnvironmentCase):
         manifest_bytes = (self.folder / release.MANIFEST).read_bytes()
         self.assertNotIn(b"\r", manifest_bytes)
         manifest = json.loads(manifest_bytes)
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["repository"], "gx0404/gx_ghostty")
         self.assertEqual((manifest["tag"], manifest["name"], manifest["version_string"]), (TAG, TITLE, VS))
         self.assertEqual((manifest["fork_version"], manifest["product_version"]), (FORK, "1.3.2"))
         self.assertEqual(manifest["source_commit"], SHA)
-        self.assertIs(manifest["prerelease"], True)
+        self.assertNotIn("prerelease", manifest)
         self.assertIs(manifest["macos"], False)
         self.assertEqual([entry["name"] for entry in manifest["assets"]], sorted(CONTRACT_ASSETS))
         for entry in manifest["assets"]:
@@ -580,6 +633,10 @@ class VerifyTests(EnvironmentCase):
             (f"ghostty-gx-{VS}-x86_64-linux-debian13.tar.gz", "usr/bin/ghostty"),
             (f"ghostty-{VS}.tar.gz", "src/apprt/gtk/ghostty_resources.c"),
             (f"libghostty-vt-{VS}.tar.gz", "CMakeLists.txt"),
+            (WINDOWS_ZIP, "conpty.dll"),
+            (WINDOWS_ZIP, "mesa/libgallium_wgl.dll"),
+            (WINDOWS_ZIP, "fonts/NotoSansCJK-Regular.ttc"),
+            (WINDOWS_ZIP, "README.txt"),
         )
         for name, removed in cases:
             with self.subTest(name=name, removed=removed):
@@ -595,6 +652,34 @@ class VerifyTests(EnvironmentCase):
                 with self.assertRaisesRegex(release.ReleaseError, "lacks"):
                     self.verify()
                 write_artifacts(self.folder)
+
+    def test_windows_app_assets_follow_the_contract(self):
+        assets = release.expected_assets(VS)
+        portable = assets[WINDOWS_ZIP]
+        self.assertEqual((portable.kind, portable.target, portable.root), ("app", "x86_64-windows", WINDOWS_ZIP[:-4]))
+        for required in ("ghostty.exe", "conpty.dll", "OpenConsole.exe", "mesa/opengl32.dll", "mesa/libgallium_wgl.dll",
+                         "share/terminfo/ghostty.terminfo", "README.txt", *(f"fonts/{name}" for name in release.WINDOWS_FONTS)):
+            self.assertIn(required, portable.required)
+        self.assertIn("share/ghostty/", portable.required_prefixes)
+        setup = assets[WINDOWS_SETUP]
+        self.assertEqual((setup.kind, setup.target, setup.min_bytes), ("installer", "x86_64-windows", TEST_INSTALLER_MIN_BYTES))
+        with mock.patch.object(release, "INSTALLER_MIN_BYTES", 16 * 1024 * 1024):
+            self.assertEqual(release.expected_assets(VS)[WINDOWS_SETUP].min_bytes, 16 * 1024 * 1024)
+
+    def test_refuses_installers_without_pe_headers_or_payload(self):
+        path = self.folder / WINDOWS_SETUP
+        cases = (
+            ("text", b"#!/bin/sh\n" + b"x" * (2 * TEST_INSTALLER_MIN_BYTES), "no MZ header"),
+            ("no pe", fake_installer(signature=b"NE\0\0"), "no PE signature"),
+            ("truncated", fake_installer(size=TEST_INSTALLER_MIN_BYTES - 1), "below the 4096 byte minimum"),
+        )
+        for label, data, message in cases:
+            with self.subTest(case=label):
+                path.write_bytes(data)
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    self.verify()
+        path.write_bytes(fake_installer())
+        self.verify()
 
     def test_accepts_windows_zip_with_backslash_separators(self):
         name = f"libghostty-vt-{VS}-x86_64-windows-msvc.zip"
@@ -693,26 +778,39 @@ class PublishTests(EnvironmentCase):
     def uploaded(self) -> set[str]:
         return {asset["name"] for assets in self.runner.assets.values() for asset in assets}
 
-    def test_drafts_uploads_checks_digests_then_publishes_a_prerelease(self):
+    def test_drafts_uploads_checks_digests_then_publishes_a_formal_release(self):
         url = self.publish()
         self.assertEqual(url, f"https://github.com/gx0404/gx_ghostty/releases/tag/{TAG}")
         self.assertEqual(self.runner.mutations(), ["release create", "release upload", "api PATCH"])
         create = next(call for call in self.runner.commands("gh") if call[1:3] == ["release", "create"])
         self.assertEqual(create[3], TAG)
-        for flag in ("--draft", "--prerelease"):
-            self.assertIn(flag, create)
+        self.assertIn("--draft", create)
+        self.assertNotIn("--prerelease", create)
         self.assertEqual(create[create.index("--target") + 1], SHA)
         self.assertEqual(create[create.index("--title") + 1], TITLE)
         self.assertEqual(create[create.index("--repo") + 1], "gx0404/gx_ghostty")
         self.assertEqual(self.uploaded(), CONTRACT_ASSETS | {release.MANIFEST, release.SUMS})
         record = self.runner.releases[0]
         self.assertIs(record["draft"], False)
-        self.assertIs(record["prerelease"], True)
+        self.assertIs(record["prerelease"], False)
         self.assertEqual(self.runner.tag_commit, SHA)
         self.assertFalse(any("--clobber" in call for call in self.runner.calls))
-        self.assertIn(SHA, self.runner.notes)
-        self.assertIn(VS, self.runner.notes)
-        self.assertIn("sha256sum -c SHA256SUMS", self.runner.notes)
+        notes = self.runner.notes
+        self.assertTrue(notes.startswith(CHANGELOG_BODY + "\n\n<!-- gx-release source="), notes[:200])
+        self.assertNotIn("旧条目", notes)
+        self.assertNotIn("预发布", notes)
+        self.assertIn(SHA, notes)
+        self.assertIn(VS, notes)
+        self.assertIn("sha256sum -c SHA256SUMS", notes)
+        for name in (WINDOWS_ZIP, WINDOWS_SETUP):
+            self.assertRegex(notes, rf"\| `{name}` \| Ghostty GX Windows ")
+        self.assertLess(notes.index(CHANGELOG_BODY), notes.index("| 资产 | 说明 |"))
+
+    def test_a_draft_marked_as_prerelease_is_not_published(self):
+        self.runner.prerelease_override = True
+        with self.assertRaisesRegex(release.ReleaseError, "prerelease=True"):
+            self.publish()
+        self.assertEqual(self.runner.mutations(), ["release create"])
 
     def test_guard_rejects_runs_outside_the_manual_fork_workflow(self):
         variants = [
@@ -830,7 +928,8 @@ class CommandLineTests(EnvironmentCase):
         code, out, _ = self.run_main("verify", "--sha", SHA, "--artifacts", str(folder), "--root", str(self.root),
                                      "--version-string", VS)
         self.assertEqual(code, 0)
-        self.assertIn("PASS: verified 10 release files", out)
+        self.assertIn(f"PASS: verified {len(CONTRACT_ASSETS) + 2} release files", out)
+        self.assertEqual(len(CONTRACT_ASSETS) + 2, 12)
         code, _, err = self.run_main("verify", "--sha", SHA, "--artifacts", str(folder), "--root", str(self.root),
                                      "--macos")
         self.assertEqual(code, 1)

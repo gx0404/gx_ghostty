@@ -7,9 +7,13 @@
   2. 框架 venv → .local/tools/venv/，内装 graphifyy==0.9.73：有 uv 时用
      `uv venv --python <真实解释器> <venv>` + `uv pip install --python <venv python>`，
      否则 `python -m venv` + pip；已就绪则跳过。
+--innosetup（just setup --innosetup，仅 Windows）另外安装钉版 Inno Setup 7.1.0：安装包按 sha256 校验
+  （不符即删除并失败）后缓存在 .local/cache/innosetup/，以 /CURRENTUSER /PORTABLE=1 静默装进
+  .local/tools/innosetup/（不写注册表、不建卸载项与快捷方式），供 just package-windows 生成安装包。
 --check（just doctor）只读：不安装、不在仓库里建任何东西，输出 FOUND / MISSING / OPTIONAL 表；
   必需项（zig、python、git、venv、graphify，Windows 另加 MSVC）缺失时退出 1。
-  Windows 上另在系统临时目录（仓库外，用后即删）试建一次符号链接，报告可选项 symlink。
+  Windows 上另在系统临时目录（仓库外，用后即删）试建一次符号链接，报告可选项 symlink，
+  并报告可选项 innosetup（钉版 Inno Setup 是否已装进 .local/tools/innosetup/）。
 --force 覆盖重装损坏的钉版 Zig。
 
 WindowsApps 下的 python / python3 是 Python 安装管理器的别名，找不到匹配运行时会把
@@ -20,6 +24,7 @@ MSVC 与 git 属系统级工具，本脚本只检测不安装。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -28,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, NamedTuple, Sequence
 
@@ -47,6 +53,11 @@ VSWHERE_RELATIVE = Path("Microsoft Visual Studio") / "Installer" / "vswhere.exe"
 OPTIONAL_CLIS = ("codex", "claude", "kimi", "zcode", "actionlint", "uv")
 ERROR_PRIVILEGE_NOT_HELD = 1314
 SYMLINK_PRIVILEGE_HINT = "未开启开发者模式：just test-vt 的 tinyio 符号链接用例会以 PermissionDenied 失败"
+INNOSETUP_VERSION = "7.1.0"
+INNOSETUP_URL = "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe"
+INNOSETUP_SHA256 = "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f"
+INNOSETUP_MARKER = ".gx-innosetup"
+INNOSETUP_HINT = "just setup --innosetup"
 FOUND = "FOUND"
 MISSING = "MISSING"
 OPTIONAL = "OPTIONAL"
@@ -97,6 +108,31 @@ def venv_executable(venv: Path, name: str) -> Path:
     if os.name == "nt":
         return Path(venv) / "Scripts" / f"{name}.exe"
     return Path(venv) / "bin" / name
+
+
+def innosetup_dir(root: Path) -> Path:
+    return Path(root) / ".local" / "tools" / "innosetup"
+
+
+def iscc_path(root: Path) -> Path:
+    """钉版 Inno Setup 的命令行编译器；scripts/gx_windows_package.py 默认从这里取 ISCC。"""
+    return innosetup_dir(root) / "ISCC.exe"
+
+
+def innosetup_marker(root: Path) -> Path:
+    return innosetup_dir(root) / INNOSETUP_MARKER
+
+
+def innosetup_ready(root: Path) -> bool:
+    """ISCC.exe 存在，且标记文件记录的正是钉版的版本与安装包 sha256。"""
+    marker = innosetup_marker(root)
+    if not iscc_path(root).is_file() or not marker.is_file():
+        return False
+    try:
+        recorded = marker.read_text(encoding="utf-8").split()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return recorded == [INNOSETUP_VERSION, INNOSETUP_SHA256]
 
 
 def is_windows_apps_alias(path: str | os.PathLike[str]) -> bool:
@@ -333,6 +369,20 @@ def check_symlink(is_windows: bool | None = None, symlink: Callable[[str, str], 
     return Item("symlink", FOUND, "可创建符号链接", False)
 
 
+def check_innosetup(root: Path, is_windows: bool | None = None) -> Item | None:
+    """仅 Windows：钉版 Inno Setup 是否已装进 .local/tools/innosetup/；只作可选项。"""
+    if not (os.name == "nt" if is_windows is None else is_windows):
+        return None
+    if innosetup_ready(root):
+        return Item("innosetup", FOUND, f"Inno Setup {INNOSETUP_VERSION}（钉版）{iscc_path(root)}", False)
+    target = innosetup_dir(root)
+    if target.exists():
+        detail = f"{target} 不是完整的钉版 Inno Setup {INNOSETUP_VERSION}；删除该目录后运行 {INNOSETUP_HINT}"
+    else:
+        detail = f"未安装（可选：just package-windows 生成安装包需要；{INNOSETUP_HINT}）"
+    return Item("innosetup", OPTIONAL, detail, False)
+
+
 def check_optional_clis(which: Which = shutil.which) -> list[Item]:
     items = []
     for name in OPTIONAL_CLIS:
@@ -351,6 +401,9 @@ def collect(root: Path, env: Mapping[str, str]) -> list[Item]:
     symlink = check_symlink()
     if symlink is not None:
         items.append(symlink)
+    innosetup = check_innosetup(root)
+    if innosetup is not None:
+        items.append(innosetup)
     items.extend(check_optional_clis())
     return items
 
@@ -460,18 +513,101 @@ def ensure_venv(
     print(f"[setup-env] 框架 venv 就绪：{venv}（{GRAPHIFY_REQUIREMENT}）")
 
 
-def setup(root: Path, env: Mapping[str, str], force: bool = False) -> int:
+def file_sha256(path: Path) -> str:
+    checksum = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def download_verified(url: str, destination: Path, sha256: str, urlopen: Callable[..., object] = urllib.request.urlopen) -> None:
+    """下载到 destination 并校验 sha256；已有且匹配则跳过，不匹配的下载删除后失败（fail closed）。"""
+    destination = Path(destination)
+    if destination.is_file() and file_sha256(destination) == sha256:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".part")
+    request = urllib.request.Request(url, headers={"User-Agent": "gx_ghostty-setup-env"})
+    try:
+        with urlopen(request, timeout=120) as response, partial.open("wb") as stream:
+            shutil.copyfileobj(response, stream, 1 << 20)
+    except (OSError, ValueError) as exc:
+        partial.unlink(missing_ok=True)
+        raise SetupEnvError(f"下载失败 {url}：{exc}") from exc
+    actual = file_sha256(partial)
+    if actual != sha256:
+        partial.unlink(missing_ok=True)
+        raise SetupEnvError(f"sha256 不符，已删除下载：{url} 得到 {actual}，钉版为 {sha256}")
+    os.replace(partial, destination)
+
+
+def innosetup_command(installer: Path, target: Path, log: Path) -> list[str]:
+    """Inno Setup 自身安装包的静默参数：当前用户、便携模式（不写注册表、不建卸载项与快捷方式）。"""
+    return [
+        str(installer),
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-",
+        "/CURRENTUSER",
+        "/PORTABLE=1",
+        f"/DIR={target}",
+        f"/LOG={log}",
+    ]
+
+
+def ensure_innosetup(
+    root: Path,
+    *,
+    runner: Runner = subprocess.run,
+    download: Callable[[str, Path, str], None] = download_verified,
+    is_windows: bool | None = None,
+) -> None:
+    if not (os.name == "nt" if is_windows is None else is_windows):
+        raise SetupEnvError("Inno Setup 只用于 Windows 安装包，非 Windows 主机不安装")
+    target = innosetup_dir(root)
+    if innosetup_ready(root):
+        print(f"[setup-env] Inno Setup {INNOSETUP_VERSION} 已就绪，跳过：{iscc_path(root)}")
+        return
+    if target.exists():
+        raise SetupEnvError(f"{target} 已存在但不是完整的钉版 Inno Setup {INNOSETUP_VERSION}；删除该目录后重试")
+    cache = Path(root) / ".local" / "cache" / "innosetup"
+    installer = cache / f"innosetup-{INNOSETUP_VERSION}-x64.exe"
+    download(INNOSETUP_URL, installer, INNOSETUP_SHA256)
+    command = innosetup_command(installer, target, cache / "install.log")
+    print("[setup-env] $ " + subprocess.list2cmdline(command), flush=True)
+    try:
+        result = runner(command, check=False, timeout=900)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupEnvError(f"无法运行 Inno Setup 安装包：{exc}") from exc
+    if result.returncode != 0:
+        raise SetupEnvError(f"Inno Setup 安装包退出码 {result.returncode}；日志：{cache / 'install.log'}")
+    if not iscc_path(root).is_file():
+        raise SetupEnvError(f"安装后没有找到 {iscc_path(root)}；日志：{cache / 'install.log'}")
+    innosetup_marker(root).write_text(f"{INNOSETUP_VERSION} {INNOSETUP_SHA256}\n", encoding="utf-8", newline="\n")
+    print(f"[setup-env] Inno Setup {INNOSETUP_VERSION} 就绪：{iscc_path(root)}")
+
+
+def setup(root: Path, env: Mapping[str, str], force: bool = False, innosetup: bool = False) -> int:
     failures: list[tuple[str, str]] = []
-    print(f"[setup-env] 1/2 钉版 Zig {setup_zig.ZIG_VERSION}", flush=True)
+    total = 3 if innosetup else 2
+    print(f"[setup-env] 1/{total} 钉版 Zig {setup_zig.ZIG_VERSION}", flush=True)
     try:
         ensure_zig(env, root, force)
     except SetupEnvError as exc:
         failures.append(("zig", str(exc)))
-    print(f"[setup-env] 2/2 框架 venv（{GRAPHIFY_REQUIREMENT}）", flush=True)
+    print(f"[setup-env] 2/{total} 框架 venv（{GRAPHIFY_REQUIREMENT}）", flush=True)
     try:
         ensure_venv(root)
     except SetupEnvError as exc:
         failures.append(("venv", str(exc)))
+    if innosetup:
+        print(f"[setup-env] 3/{total} 钉版 Inno Setup {INNOSETUP_VERSION}（.local/tools/innosetup，便携模式）", flush=True)
+        try:
+            ensure_innosetup(root)
+        except SetupEnvError as exc:
+            failures.append(("innosetup", str(exc)))
     if failures:
         for name, message in failures:
             print(f"[setup-env] 失败 {name}：{message}", file=sys.stderr)
@@ -490,12 +626,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="只读体检（just doctor），不安装任何东西")
     mode.add_argument("--force", action="store_true", help="覆盖重装损坏的钉版 Zig")
+    parser.add_argument(
+        "--innosetup",
+        action="store_true",
+        help=f"另外安装钉版 Inno Setup {INNOSETUP_VERSION} 到 .local/tools/innosetup（仅 Windows，生成安装包用）",
+    )
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="仓库根目录（默认取脚本所在仓库）")
     args = parser.parse_args(argv)
+    if args.check and args.innosetup:
+        parser.error("--innosetup 只用于安装，不能与 --check 同用")
     root = Path(args.root).resolve()
     if args.check:
         return doctor(root, os.environ)
-    return setup(root, os.environ, force=args.force)
+    return setup(root, os.environ, force=args.force, innosetup=args.innosetup)
 
 
 if __name__ == "__main__":

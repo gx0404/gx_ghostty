@@ -24,11 +24,14 @@ ARCHIVED = {
     "vouch-manage-by-issue.yml", "vouch-sync-codeowners.yml",
 }
 ALLOWED_ACTIONS = {"actions/checkout", "actions/upload-artifact", "actions/download-artifact", "mlugg/setup-zig"}
-CI_JOBS = {"framework", "zig-fmt", "linux-vt", "linux-main", "lib-vt-cross", "windows", "gtk-smoke", "macos"}
+CI_JOBS = {
+    "framework", "zig-fmt", "linux-vt", "linux-main", "lib-vt-cross", "windows", "windows-app", "gtk-smoke", "macos",
+}
 CI_TIMEOUTS = {
     "framework": 20, "zig-fmt": 20, "linux-vt": 45, "linux-main": 60,
-    "lib-vt-cross": 45, "windows": 60, "gtk-smoke": 90, "macos": 60,
+    "lib-vt-cross": 45, "windows": 60, "windows-app": 75, "gtk-smoke": 90, "macos": 60,
 }
+CI_INPUTS = ["gtk_smoke", "macos", "cache_probe", "win_smoke"]
 # Jobs that run the sharded Zig test runner; each writes its --json report into $RUNNER_TEMP/gx-zig-test/.
 ZIG_TEST_COMMANDS = {
     "linux-vt": 'python3 scripts/zig_test.py --suite vt --zig-arg=--summary --zig-arg=all '
@@ -43,9 +46,12 @@ SETUP_ZIG_INPUTS = {
     "linux-vt": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
     "linux-main": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
     "windows": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
+    "windows-app": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
     "lib-vt-cross": {"cache-key": "${{ matrix.target }}"},
 }
-RELEASE_JOBS = {"prepare", "source", "libvt", "libvt-macos", "linux-gtk", "macos", "verify", "publish"}
+RELEASE_JOBS = {"prepare", "source", "libvt", "libvt-macos", "linux-gtk", "windows-app", "macos", "verify", "publish"}
+ASSET_JOBS = {"source", "libvt", "libvt-macos", "linux-gtk", "windows-app", "macos"}
+WIN32_BUILD = "zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu"
 CROSS_TARGETS = [
     "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl",
     "x86_64-windows-gnu", "aarch64-macos", "wasm32-freestanding",
@@ -60,7 +66,7 @@ LIBVT_MATRIX = {
 SMOKE_TOOLS = {"git", "ca-certificates", "xz-utils", "gettext", "xvfb", "xauth", "scrot"}
 RELEASE_TOOLS = {"git", "ca-certificates", "xz-utils", "gettext"}
 PWSH_CHECK = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
-NATIVE_RE = re.compile(r"^(?:&\s*)?(?:git|zig|python3?|gh|\.[/\\])")
+NATIVE_RE = re.compile(r"^(?:&\s*\S|git|zig|python3?|gh|\.[/\\])")
 USES_RE = re.compile(r"^\s*(?:- )?uses:\s*(?P<ref>\S+)(?P<comment>.*)$")
 RUN_RE = re.compile(r"^(?P<indent>\s*)(?P<dash>- )?run:\s*(?P<value>.*)$")
 PIN_RE = re.compile(r"^(?P<action>[\w.-]+/[\w.-]+(?:/[\w./-]+)?)@(?P<sha>[0-9a-f]{40})$")
@@ -281,11 +287,11 @@ class SharedShapeTests(unittest.TestCase):
                     self.assertLessEqual(int(timeout), 120)
 
     def test_pwsh_native_commands_check_the_exit_code(self):
-        scripts = CI.scripts("windows") + [
+        scripts = CI.scripts("windows") + CI.scripts("windows-app") + RELEASE.scripts("windows-app") + [
             script for step in steps(RELEASE.job("libvt")) if field(step, "shell", 8) == "pwsh"
             for script in run_scripts(step)
         ]
-        self.assertGreaterEqual(len(scripts), 5)
+        self.assertGreaterEqual(len(scripts), 12)
         checked = 0
         for script in scripts:
             lines = [line.strip() for line in script.splitlines() if line.strip()]
@@ -295,7 +301,7 @@ class SharedShapeTests(unittest.TestCase):
                         self.assertLess(index + 1, len(lines))
                         self.assertEqual(lines[index + 1], PWSH_CHECK)
                         checked += 1
-        self.assertGreaterEqual(checked, 7)
+        self.assertGreaterEqual(checked, 13)
 
     def test_zig_pin_matches_build_zig_zon(self):
         import setup_zig
@@ -313,8 +319,8 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(field(on, "branches", 4), "[gx_ghostty]")
         self.assertEqual(sum(line == "    branches: [gx_ghostty]" for line in on), 2)
         inputs = block(on, on.index("    inputs:"), 4)
-        self.assertEqual([line.strip() for line in inputs if indent_of(line) == 6], ["gtk_smoke:", "macos:", "cache_probe:"])
-        for name in ("gtk_smoke", "macos", "cache_probe"):
+        self.assertEqual([line.strip() for line in inputs if indent_of(line) == 6], [f"{name}:" for name in CI_INPUTS])
+        for name in CI_INPUTS:
             self.assertEqual(mapping(inputs, name, 6)["type"], "boolean")
             self.assertEqual(mapping(inputs, name, 6)["default"], "false")
 
@@ -521,6 +527,54 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertNotIn("zig build test-lib-vt", text)
 
+    def test_windows_app_builds_the_win32_runtime_and_smokes_on_demand(self):
+        import gx_windows_package
+
+        job = CI.job("windows-app")
+        self.assertEqual(field(job, "runs-on", 4), "windows-2025")
+        self.assertIsNone(field(job, "if", 4))
+        self.assertEqual(mapping(block(job, job.index("    defaults:"), 4), "run", 6), {"shell": "pwsh"})
+        text = CI.job_text("windows-app")
+        order = [text.index(needle) for needle in (
+            "git config --global core.autocrlf false", "uses: actions/checkout@", "uses: mlugg/setup-zig@",
+            WIN32_BUILD + "\n", "Invoke-WebRequest", "-RedirectStandardError", "CopyFromScreen",
+            "'loaded OpenGL 4.'", "uses: actions/upload-artifact@")]
+        self.assertEqual(order, sorted(order))
+        job_steps = steps(job)
+        smoke = next(step for step in job_steps if "CopyFromScreen" in "\n".join(step))
+        manual = "github.event_name == 'workflow_dispatch' && inputs.win_smoke"
+        self.assertEqual(field(smoke, "if", 8), manual)
+        self.assertEqual(field(smoke, "timeout-minutes", 8), "15")
+        upload = job_steps[-1]
+        self.assertEqual(field(upload, "if", 8), f"always() && {manual}")
+        self.assertEqual(mapping(upload, "with", 8)["name"], "evidence-windows-smoke")
+        self.assertEqual(mapping(upload, "with", 8)["path"], "${{ runner.temp }}/gx-windows-smoke/")
+        build = next(step for step in job_steps if WIN32_BUILD in "\n".join(step))
+        self.assertIsNone(field(build, "if", 8))
+        script = run_scripts(smoke)[0]
+        mesa = next(item for item in gx_windows_package.DOWNLOADS if item.name == gx_windows_package.MESA)
+        self.assertIn(f"Invoke-WebRequest '{mesa.url}' -OutFile $archive", script)
+        self.assertIn(f"-ne '{mesa.sha256}'", script)
+        for item in gx_windows_package.PAYLOAD:
+            if item.target in ("mesa/opengl32.dll", "mesa/libgallium_wgl.dll"):
+                self.assertIn(f"'{item.target.split('/')[1]}' = '{item.sha256}'", script)
+                self.assertIn(item.member, script)
+        for needle in ('& "$env:SystemRoot\\System32\\tar.exe" -xf $archive', "Join-Path (Resolve-Path 'zig-out/bin') 'mesa'",
+                       "$env:GALLIUM_DRIVER = 'llvmpipe'", "$env:GHOSTTY_GX_OPENGL = 'software'",
+                       "Join-Path $env:LOCALAPPDATA 'ghostty\\logs\\ghostty.log'", "System.Drawing", "Stop-Process"):
+            self.assertIn(needle, script)
+
+    def test_only_release_assets_use_the_gx_artifact_prefix_that_verify_downloads(self):
+        for name, job in RELEASE.jobs().items():
+            for step in steps(job):
+                if (field(step, "uses", 8) or "").startswith("actions/upload-artifact@"):
+                    artifact = mapping(step, "with", 8)["name"]
+                    with self.subTest(job=name, artifact=artifact):
+                        self.assertEqual(artifact.startswith("gx-"), name in ASSET_JOBS)
+        uploads = [mapping(step, "with", 8)["name"] for step in steps(CI.job("windows-app"))
+                   if (field(step, "uses", 8) or "").startswith("actions/upload-artifact@")]
+        self.assertEqual(uploads, ["evidence-windows-smoke"])
+
     def test_gtk_smoke_is_manual_and_mirrors_the_debian_dockerfile(self):
         job = CI.job("gtk-smoke")
         self.assertEqual(field(job, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.gtk_smoke")
@@ -692,8 +746,36 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertIn('name="ghostty-gx-$GX_VERSION_STRING-x86_64-linux-debian13"', text)
 
+    def test_windows_app_builds_packages_and_uploads_exactly_two_assets(self):
+        import setup_env
+
+        job = RELEASE.job("windows-app")
+        self.assertEqual(field(job, "runs-on", 4), "windows-2025")
+        self.assertEqual(field(job, "needs", 4), "prepare")
+        self.assertIsNone(field(job, "if", 4))
+        self.assertEqual(mapping(block(job, job.index("    defaults:"), 4), "run", 6), {"shell": "pwsh"})
+        text = RELEASE.job_text("windows-app")
+        order = [text.index(needle) for needle in (
+            "git config --global core.autocrlf false", "uses: actions/checkout@", "uses: mlugg/setup-zig@",
+            f"Invoke-WebRequest '{setup_env.INNOSETUP_URL}' -OutFile $installer",
+            WIN32_BUILD + ' -Doptimize=ReleaseFast "-Dversion-string=$env:GX_VERSION_STRING" --prefix $prefix',
+            "python scripts/gx_windows_package.py --prefix (Join-Path $env:RUNNER_TEMP 'gx-prefix') "
+            "--version-string $env:GX_VERSION_STRING --output-dir $out",
+            "Compare-Object $assets $expected", "uses: actions/upload-artifact@")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn(f"-ne '{setup_env.INNOSETUP_SHA256}'", text)
+        for flag in ("'/VERYSILENT'", "'/SUPPRESSMSGBOXES'", "'/NORESTART'", "'/CURRENTUSER'", "'/PORTABLE=1'"):
+            self.assertIn(flag, text)
+        self.assertIn("--iscc $env:ISCC", text)
+        self.assertIn('"ghostty-gx-$env:GX_VERSION_STRING-x86_64-windows-setup.exe", '
+                      '"ghostty-gx-$env:GX_VERSION_STRING-x86_64-windows.zip"', text)
+        upload = steps(job)[-1]
+        self.assertEqual(mapping(upload, "with", 8)["name"], "gx-windows-app")
+        self.assertEqual(mapping(upload, "with", 8)["path"], "${{ runner.temp }}/gx-out/*")
+
     def test_workflow_produces_exactly_the_assets_verify_expects(self):
         import gx_release
+        import gx_windows_package
 
         produced = set()
         texts = {name: RELEASE.job_text(name) for name in RELEASE_JOBS}
@@ -705,6 +787,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             produced.add("ghostty-$VS.tar.gz")
         if '"$RUNNER_TEMP/gx-out/$name.tar.gz"' in texts["linux-gtk"]:
             produced.add("ghostty-gx-$VS-x86_64-linux-debian13.tar.gz")
+        if "python scripts/gx_windows_package.py" in texts["windows-app"] and "--skip-installer" not in texts["windows-app"]:
+            produced.add(gx_windows_package.zip_name("$VS"))
+            produced.add(gx_windows_package.installer_base("$VS") + ".exe")
         for job, name in (("libvt-macos", "libghostty-vt-$GX_VERSION_STRING-xcframework.zip"),
                           ("macos", "ghostty-gx-$GX_VERSION_STRING-universal-macos-unsigned.zip")):
             if name in texts[job]:
@@ -717,7 +802,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             for step in steps(job):
                 if (field(step, "uses", 8) or "").startswith("actions/upload-artifact@"):
                     uploads[name] = mapping(step, "with", 8)
-        for name in ("source", "libvt", "libvt-macos", "linux-gtk", "macos"):
+        for name in sorted(ASSET_JOBS):
             with self.subTest(job=name):
                 self.assertTrue(uploads[name]["name"].startswith("gx-"))
                 self.assertEqual(uploads[name]["if-no-files-found"], "error")
@@ -735,6 +820,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("inputs.publish", verify_if)
         self.assertIn("!cancelled()", verify_if)
         self.assertIn("needs.linux-gtk.result == 'success'", verify_if)
+        self.assertIn("needs.windows-app.result == 'success'", verify_if)
+        self.assertIn("windows-app", field(RELEASE.job("verify"), "needs", 4))
         verify = RELEASE.job_text("verify")
         self.assertIn('python3 scripts/gx_release.py verify --sha "$GX_SHA" --version-string "$GX_VERSION_STRING"', verify)
         self.assertIn("sha256sum -c SHA256SUMS", verify)
