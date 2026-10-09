@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0021）之后的号。在册的 16 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016 与 GX-0021，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -167,7 +167,7 @@ GX-0002 新增两个只编译并安装、不运行的步骤，把测试二进制
 - `test-bin` 与 `-Demit-test-exe` 一样对 `ghostty-test` 调 `config.addPatchElf`（只在 `-Dpatch-interp`、`-Dpatch-rpath` 时生效）。
 - `-Demit-lib-vt` 时上游不构建 `ghostty-test`，`test` 是空步骤；`test-bin` 则依赖一个 `b.addFail` 步骤，以退出码 1 失败并提示 `ghostty-test is not built with -Demit-lib-vt`，免得调用方误用 `zig-out/test/` 里的旧二进制。这里不用上游惯用的 `Step.addError`：Zig 0.16 中它只打印消息、退出码仍为 0（上游 `update-translations` 在 i18n 关闭时就是这样）。
 - 上游已有步骤（`test`、`test-lib-vt`、`test-lib-vt-build`、默认 `install` 等）的行为与产物不变，`zig build` 不会安装这些测试二进制。
-- Windows 原生（MSVC）编译不出 `ghostty-test`：`src/build/SharedDeps.zig::add` 对所有目标 translate-c `posix_c`（含 `pwd.h`，Zig 自带的 mingw 头文件也没有它），上游 `test` 在 Windows 同样失败于 `'pwd.h' not found`；临时跳过 `posix_c` 后，编译又停在 `src/renderer/Dmabuf.zig` 用 `-1` 初始化 `std.posix.fd_t`（Windows 上是句柄指针）。`test-bin` 只在能编译 `ghostty-test` 的平台（Linux、macOS）有产物。
+- Windows：上游 `src/build/SharedDeps.zig::add` 对所有目标 translate-c `posix_c`（含 `pwd.h`，Zig 自带的 mingw 头文件也没有它），上游 `test` 在 Windows 上失败于 `'pwd.h' not found`。GX-0003 让 Windows 目标跳过这个导入之后，`test-bin` 能为 `x86_64-windows-gnu` 编译出 `zig-out/test/ghostty-test.exe`：2026-10-09 本机以 `-Dapp-runtime=win32` 编译并运行了全部 4133 条用例（结果见 `docs/TESTING.md`），GX-0006～GX-0008 的验证命令用的是 `-Dapp-runtime=none`。未写 ABI 的 Windows 目标（强制 MSVC）能否编译未验证。
 
 调用方约定：先运行 `python scripts/zigw.py build test-lib-vt-bin` 或 `test-bin`（其余 `-D` 选项原样透传，退出码非 0 即失败），再从上表路径取二进制。它们是标准 Zig 测试运行器，只接受 `--listen=-`、`--seed=<n>` 与 `--cache-dir=<dir>`（仅 fuzz 构建需要），其他参数直接 panic：不带参数时串行运行全部用例；带 `--listen=-` 时走 `std.zig.Server` 协议，`query_test_metadata` 返回用例名，`run_test` 按序号运行单条用例。`zig build` 自己运行它们时传的是 `--cache-dir=<.zig-cache> --seed=0x<每次随机> --listen=-`。
 
@@ -211,7 +211,7 @@ python -m unittest scripts.test_fork_patches -v
 - 文件：`src/apprt/runtime.zig`（`Runtime` 新增 `win32`，Windows 目标默认取它）、`src/apprt.zig`（导入并选中 `apprt/win32.zig`）、`src/build/SharedDeps.zig`（Windows 目标不再 translate-c `posix_c`；`.win32` 分支链接 Win32 系统库）、`src/main_ghostty.zig`（`logFn` 末尾把日志另写到文件）、`src/config/Config.zig`（`finalize` 的 apprt 分支、两处 GObject 分支、`quit-after-last-window-closed` 的 Windows 默认值），以及按 `app_runtime` 穷举的 GObject 分支：`src/apprt/action.zig`、`src/apprt/structs.zig`（两处）、`src/apprt/surface.zig`、`src/datastruct/split_tree.zig`、`src/font/face.zig`、`src/input/Binding.zig`、`src/terminal/mouse.zig`。
 - 标记：`fork(gx): GX-0003`。纯新增块用 begin/end 包住（`runtime.zig` 两块、`apprt.zig` 两块、`SharedDeps.zig` 的链接块、`main_ghostty.zig` 的日志块）；改动的单行（各处 `.none => void` 改为 `.none, .win32 => void`、`posix_c` 守卫、`quit-after-last-window-closed` 默认值）上一行写单行标记。
 - 状态：active，未回馈上游。
-- 改动量：12 个文件，`git diff --numstat` 合计 +60/−15（含注释）。
+- 改动量：12 个文件，`git diff --numstat` 合计 +61/−15（含注释）。
 
 ### 原因
 
@@ -225,7 +225,7 @@ python -m unittest scripts.test_fork_patches -v
 
 - Windows 目标未给 `-Dapp-runtime` 时默认 `win32`，`zig build -Dtarget=x86_64-windows-gnu` 产出 `zig-out/bin/ghostty.exe`（`just build` 在 Windows 主机上自动补这个目标，见 `scripts/zig_build.py`）。Linux/FreeBSD 仍默认 `gtk`，其余目标仍默认 `none`。
 - Windows 目标不再导入 `posix_c` 模块；与上游 PR #14608 的同一行守卫一致。非 Windows 目标不变。
-- `.win32` 且目标是 Windows 时链接 opengl32、gdi32、user32、dwmapi、imm32、shell32、ole32、uxtheme、comctl32、comdlg32、advapi32。
+- `.win32` 且目标是 Windows 时链接 opengl32、gdi32、user32、dwmapi、imm32、shell32、ole32、uxtheme、comctl32、comdlg32、advapi32，以及自绘界面（`src/apprt/win32/ui/d2d.zig` 的 Direct2D/DirectWrite 绑定）用的 d2d1、dwrite。
 - win32 构建里每条日志额外追加到 `%LOCALAPPDATA%\ghostty\logs\ghostty.log`（实现在 `src/apprt/win32/file_log.zig`，每次运行的首条日志时创建，上一次的日志改名为 `ghostty.log.1`）；Debug 构建写全部级别，其余构建与 stderr 一样不写 debug。其他 apprt 不受影响。
 - `quit-after-last-window-closed` 在 Windows 上默认 `true`，与 Linux 一致；文档注释同步写明。其他平台默认值不变。
 - 所有 GObject 分支在 win32 下与 `none` 一样取 `void`，`Config.finalize` 不加 win32 专属默认值。
@@ -274,6 +274,7 @@ python -m unittest scripts.test_fork_patches -v
 - apprt 为每个子窗口（`CS_OWNDC`）调用一次 `Device.setPixelFormat`，优先选 sRGB-capable 的双缓冲 RGBA8 格式。
 - `OpenGL.init`（主线程）只记录 surface 的 HDC，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、设 swap interval 1，并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
 - `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer（尺寸不一致时按左上角对齐，其余区域清为透明黑），再 `SwapBuffers`；没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
+- 交换成功后调用 apprt 的 `signalFrameDrawn`（win32 apprt 在拖动改尺寸时最多等 16 ms 新帧）。驱动支持 `WGL_ARB_create_context_robustness` 时上下文按「重置即丢失」创建；GPU 重置（驱动超时恢复、驱动更新）后 `wgl.Context.present` 换上新上下文、调 apprt 的 `gpuContextReset` 让渲染器重建 GPU 资源，本帧以 `error.ContextLost` 放弃。这些都在新路径 `wgl.zig` 与 win32 apprt 里，补丁行不变。
 - 非 Windows 目标的行为与产物不变。
 
 ### 上游状态
@@ -369,8 +370,8 @@ ConPTY 启动时向宿主终端发送 `CSI ? 9001 h`（Windows Terminal 定义�
 - `CSI ? 9001 h/l` 设置与清除 `win32_input_mode`，DECRQM（`CSI ? 9001 $ p`）报告 1 或 2，XTSAVE/XTRESTORE 与 RIS 与其他模式相同；DECSTR 不改它（Ghostty 的 DECSTR 只复位固定的几个模式）。C API 用 `GHOSTTY_MODE_WIN32_INPUT` 查询与设置；libghostty-vt 只记录模式，不提供 Win32 按键编码。
 - 快照：`ModePacked` 由 43 位变为 44 位（仍是 8 字节），新模式占第 43 位，即上游 v1 里恒为 0、解码时被忽略的保留位。第 0–42 位不变，所以上游写的快照在 fork 里解码后该位为 0，上游解码器读 fork 的快照时丢弃该位，现有金样全部不变。上游注释要求新增模式时升快照版本，fork 不升：解码器只认单一版本，升版要为全部 v1 金样另建新版本并在每次同步时冲突，而上面两个方向本来就兼容；快照格式 v1 也明确不承诺稳定，应用本身不持久化快照。
 - 编码（`src/gx/win32_input.zig`）：每条记录写成 `CSI Vk;Sc;Uc;Kd;Cs;Rc _`，六个参数总是写全（与 Windows Terminal `TerminalInput::_makeWin32Output` 相同，herdr 的 `parse_win32_input_mode_key_record` 也要求六个）。Uc 是一个 UTF-16 码元，按键产生多个码元时每个码元一条记录；死键 Uc=0；Cs 是 dwControlKeyState 的低 16 位，ENHANCED_KEY 取自 lParam 第 24 位；Sc 取 lParam 第 16–23 位；Rc 取 lParam 低 16 位（0 按 1）。没有按键的文字（WM_CHAR、输入法结果）每个码元一对 VK=0、Sc=0 的按下与抬起记录。kitty 键盘协议标志非 0 时让位给 kitty 编码，与 Windows Terminal 相同（ConPTY 从不关闭 9001）。
-- 分流：`Surface.gxWin32KeyCallback(event, message)` 把本次事件的 Win32 消息记进 `gx_win32_key`，再调用原 `keyCallback`；`encodeKey` 开头的 `gx_win32_input.surfaceWriteReq` 只在「事件与记录匹配、子进程未退出、9001 已开且没有 kitty 标志」时用记录替换常规编码，否则照常编码。apprt 只调用 `keyCallback` 时（目前的 win32 apprt 与 GTK）行为与上游完全相同，所以接入之前打字不受影响。绑定、按键序列、KAM、只读模式、滚动到底与清除选区都沿用 `keyCallback`；绑定执行期间产生的其他按键事件（例如失焦时补发的抬起）与记录不匹配，走常规编码；关闭表面的绑定返回 `.closed` 后不再触碰表面。
-- win32 apprt 的接入（`src/apprt/win32/**` 由其他任务改动，本补丁只提供接口，契约写在 `src/gx/win32_input.zig` 文件头）：`handleKeyEvent` 对每条 WM_KEYDOWN/WM_SYSKEYDOWN/WM_KEYUP/WM_SYSKEYUP（VK_PROCESSKEY、VK_PACKET 仍提前返回）读取 `GetKeyboardState`，构造 `KeyMessage{ .vk = wParam, .lparam, .down, .state = .fromKeyboardState(&keyboard_state), .text, .dead }`，其中 `text` 是 ToUnicode 的原始 UTF-16 输出（含 Ctrl+C 的 0x03 这类控制字符；抬起时用 wFlags 0x4 不消耗死键状态再译一次，或留空），ToUnicode 返回负数时 `dead = true`，然后改调 `core_surface.gxWin32KeyCallback(event, message)`；`handleCharEvent`（WM_CHAR）与 `sendImeText`（输入法结果）改调 `gxWin32KeyCallback(event, null)`；粘贴与拖放文件保持原样发原始文本（与 Windows Terminal 相同）。记录经常规的 `Surface.queueIo` 写入 pty，apprt 不直接写 pty。
+- 分流：`Surface.gxWin32KeyCallback(event, message)` 把本次事件的 Win32 消息记进 `gx_win32_key`，再调用原 `keyCallback`；`encodeKey` 开头的 `gx_win32_input.surfaceWriteReq` 只在「事件与记录匹配、子进程未退出、9001 已开且没有 kitty 标志」时用记录替换常规编码，否则照常编码。apprt 只调用 `keyCallback` 时（GTK、macOS 的 embedded apprt）行为与上游完全相同。绑定、按键序列、KAM、只读模式、滚动到底与清除选区都沿用 `keyCallback`；绑定执行期间产生的其他按键事件（例如失焦时补发的抬起）与记录不匹配，走常规编码；关闭表面的绑定返回 `.closed` 后不再触碰表面。
+- win32 apprt 已按下述契约接入（新路径 `src/apprt/win32/Surface.zig` 的 `handleKeyEvent`、`handleCharEvent`、`sendImeText`；契约写在 `src/gx/win32_input.zig` 文件头）：`handleKeyEvent` 对每条 WM_KEYDOWN/WM_SYSKEYDOWN/WM_KEYUP/WM_SYSKEYUP（VK_PROCESSKEY、VK_PACKET 仍提前返回）读取 `GetKeyboardState`，构造 `KeyMessage{ .vk = wParam, .lparam, .down, .state = .fromKeyboardState(&keyboard_state), .text, .dead }`，其中 `text` 是 ToUnicode 的原始 UTF-16 输出（含 Ctrl+C 的 0x03 这类控制字符；抬起时用 wFlags 0x4 不消耗死键状态再译一次，或留空），ToUnicode 返回负数时 `dead = true`，然后改调 `core_surface.gxWin32KeyCallback(event, message)`；`handleCharEvent`（WM_CHAR）与 `sendImeText`（输入法结果）改调 `gxWin32KeyCallback(event, null)`；粘贴与拖放文件保持原样发原始文本（与 Windows Terminal 相同）。记录经常规的 `Surface.queueIo` 写入 pty，apprt 不直接写 pty。
 
 ### 上游状态
 
@@ -397,7 +398,7 @@ python -m unittest scripts.test_fork_patches -v
 ```
 
 - 第一条在 `ghostty-vt`、`ghostty-vt-c` 两个模块里运行模式、DECRQM 与快照单测；全量 `just test-vt` 同样覆盖。Linux 上主套件用 `python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx.win32_input`。
-- 运行 `ghostty.exe` 并启动任意 shell：日志不再出现 `unimplemented mode: 9001`。按键改走记录要等 win32 apprt 接入后在 GUI 里验证（PSReadLine 的 Shift+Enter、GX Zsh 的 herdr 探针）。
+- 运行 `ghostty.exe` 并启动任意 shell：日志不再出现 `unimplemented mode: 9001`。按键改走记录要在 GUI 里验证（PSReadLine 的 Shift+Enter、GX Zsh 的 herdr 探针）；Windows 本机也可用 `just test --filter gx.win32_input` 跑编码单测。
 
 ### 测试锁定
 
@@ -420,7 +421,7 @@ Windows 自带的 ConPTY（kernel32 `CreatePseudoConsole` 加 System32 的 conho
 - flags：随包 ConPTY 用 `PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE`（0x6）。1.22 起的 conpty.dll 总是这样工作并忽略这两位（其 `src/winconpty/winconpty.cpp` 只解析 INHERIT_CURSOR 与 GLYPH_WIDTH 的 0x18 两组），所以对 1.24 无害，只对更老的 conpty.dll 生效；系统 ConPTY 保持上游的 0。`PSEUDOCONSOLE_INHERIT_CURSOR`（0x1）不开：宿主会在启动时发 `CSI 6 n` 并等终端回答光标位置。实测临时加上 0x1 时 OpenConsole 以 `--inheritcursor` 启动，Ghostty 正确回答，启动耗时与输入都正常；但每个表面启动时屏幕为空、光标在原点，没有可继承的位置，旧宿主得不到回答时还会无限期阻塞输入，Windows Terminal 默认也不开。
 - 每个伪控制台记住创建它的实现（`WindowsPty.gx_conpty`），缩放与关闭都走同一实现，关闭后释放这次 `LoadLibraryExW` 的引用。`HPCON` 照常交给 `src/Command.zig` 的 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`（conpty.dll 的伪控制台结构与 kernelbase 相同，Windows Terminal 也这样用）。
 - 每次创建记一条 info 日志：`ConPTY: bundled <路径> flags=0x6`，或 `ConPTY: system (kernel32) flags=0x0, <原因>`（例如 `conpty.dll is not next to the executable`、`GHOSTTY_GX_CONPTY=system`）；随包实现失败时另记 warning。
-- 文件布局：`conpty.dll` 与 `OpenConsole.exe` 成对来自同一个包版本，与 `ghostty.exe` 平铺在同一目录（x64 取包内 `runtimes/win-x64/native/conpty.dll` 与 `build/native/runtimes/x64/OpenConsole.exe`）。本补丁不改构建与打包，放置文件由发布流程负责。
+- 文件布局：`conpty.dll` 与 `OpenConsole.exe` 成对来自同一个包版本，与 `ghostty.exe` 平铺在同一目录（x64 取包内 `runtimes/win-x64/native/conpty.dll` 与 `build/native/runtimes/x64/OpenConsole.exe`）。本补丁不改构建：`just build` 不放这两个文件，开发构建因此走系统 ConPTY；便携包与安装包由 `scripts/gx_windows_package.py` 按 `PAYLOAD` 里钉死的 sha256 放进去。
 
 ### 上游状态
 
@@ -443,7 +444,7 @@ python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --f
 python -m unittest scripts.test_fork_patches -v
 ```
 
-把 NuGet 包 1.24.261001001 的 x64 `conpty.dll` 与 `OpenConsole.exe`（sha256 见 wezterm 资产 README）复制到 `<prefix>\bin\` 后运行 `ghostty.exe`：日志为 `ConPTY: bundled …\conpty.dll flags=0x6`，shell 的父进程是 `OpenConsole.exe`；删掉 `OpenConsole.exe` 或设 `GHOSTTY_GX_CONPTY=system` 后为 `ConPTY: system (kernel32) …`。上游的 `pty.test_0`（open 与 resize）在 Windows 测试二进制里经同一入口走系统 ConPTY。
+把 NuGet 包 1.24.261001001 的 x64 `conpty.dll` 与 `OpenConsole.exe`（sha256 钉在 `scripts/gx_windows_package.py::PAYLOAD`；最省事的来源是 `just package-windows` 产出的便携 zip）复制到 `<prefix>\bin\` 后运行 `ghostty.exe`：日志为 `ConPTY: bundled …\conpty.dll flags=0x6`，shell 的父进程是 `OpenConsole.exe`；删掉 `OpenConsole.exe` 或设 `GHOSTTY_GX_CONPTY=system` 后为 `ConPTY: system (kernel32) …`。上游的 `pty.test_0`（open 与 resize）在 Windows 测试二进制里经同一入口走系统 ConPTY。
 
 ### 测试锁定
 
@@ -545,7 +546,7 @@ python -m unittest scripts.test_fork_patches -v
 
 ### 测试锁定
 
-登记表与闭集检查锁定标记；`src/font/directwrite/match.zig` 的单测锁定字重、宽度、倾斜排序，粗斜体真实字面的判定，样式名匹配与命名实例选择，经 `discovery.zig` 的测试块进入所有平台的 `ghostty-test`；`com.zig` 的两条用例只在 Windows 运行；`directwrite/discovery.zig` 的两条端到端用例（Arial 四种样式、按码位回退）需要能编译 `ghostty-test` 的 Windows 环境。
+登记表与闭集检查锁定标记；`src/font/directwrite/match.zig` 的单测锁定字重、宽度、倾斜排序，粗斜体真实字面的判定，样式名匹配与命名实例选择，经 `discovery.zig` 的测试块进入所有平台的 `ghostty-test`；`com.zig` 的两条用例只在 Windows 运行；`directwrite/discovery.zig` 的两条端到端用例（Arial 四种样式、按码位回退）随 Windows 上的 `ghostty-test` 运行（`just test --filter directwrite`）。
 
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 
@@ -583,13 +584,15 @@ Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/
 
 ### 验证
 
-`ghostty-test` 在 Windows 上编译不过，以下命令在 Linux（或 WSL）运行：
+Linux（或 WSL 克隆）上：
 
 ```bash
 python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx. --filter config --filter cli.
 python3 scripts/zigw.py build -Dapp-runtime=none -Demit-webdata
 python3 -m unittest scripts.test_fork_patches -v
 ```
+
+Windows 本机的第一条用 `just test --filter gx. --filter config --filter cli.`（运行器在 Windows 上按 win32 apprt、`x86_64-windows-gnu` 构建）。
 
 - 第一条覆盖 `src/gx/**` 全部单测（层序、主题覆盖、明暗切换、`-e`、`config-default-files=false`、诊断保留、默认值内容）与上游配置、CLI 单测。
 - 第二条运行 helpgen 与 webgen，确认新键的文档注释能生成配置文档。
@@ -639,7 +642,7 @@ python3 -m unittest scripts.test_fork_patches -v
 
 ### 验证
 
-`ghostty-test` 与 GTK app 在 Windows 上编译不过，以下命令经 WSL（Ubuntu 24.04，`just wsl setup --apt` 已生成 `zh_CN.UTF-8` 与 `en_US.UTF-8`）运行：
+GTK app 与 GTK apprt 的单测只能在装有 GTK 的 Linux 上构建，以下命令经 WSL（Ubuntu 24.04，`just wsl setup --apt` 已生成 `zh_CN.UTF-8` 与 `en_US.UTF-8`）运行：
 
 ```bash
 just wsl sync <worktree> --dirty --clone '~/src/gx_ghostty-GA'
@@ -690,6 +693,7 @@ python -m unittest scripts.test_fork_patches -v
 
 ```bash
 python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu   # Windows 分支能编译
+just test --filter gx.confirm                                                    # Windows 本机单测（win32 apprt）
 just wsl test --filter gx.confirm                                                # Linux 单测（-Dapp-runtime=none）
 just wsl build --gtk
 python -m unittest scripts.test_fork_patches -v
@@ -715,8 +719,8 @@ Ghostty GX 的 Windows 界面需要能绑定到键位与命令面板的应用操
 ### 行为
 
 - 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。
-- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。目前只有 win32 apprt 实现 `gxAction`；GTK、embedded（macOS）与 none 没有实现。
-- GTK 命令面板不列出 `gx` 条目。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
+- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行全部五个动作；embedded（macOS）与 none 没有实现。
+- GTK 命令面板仍由本补丁的过滤块排除 `gx` 条目（GTK 实现 `gxAction` 之后，这个块已满足下文的单独移除条件，但尚未删除）。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
 
 ### 上游状态
 
@@ -736,6 +740,7 @@ Ghostty GX 不再需要绑定到键位或命令面板的 GX 操作（或上游�
 python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 python scripts/zigw.py build -Demit-lib-vt
 python -m unittest scripts.test_fork_patches -v
+just test --filter Binding --filter gx.action                 # Windows 本机（win32 apprt）
 just wsl build --gtk --clone '~/src/gx_ghostty-S'
 just wsl test --clone '~/src/gx_ghostty-S' --filter Binding --filter gx.
 ```
