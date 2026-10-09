@@ -1,7 +1,6 @@
 //! Drawing helpers of the settings overlay: cards, switches, radio
 //! buttons, chips, buttons, key caps and theme swatches in the Fluent look
 //! of `ui/style.zig`. Everything is in DIPs on a `d2d.Canvas`.
-const std = @import("std");
 const d2d = @import("../d2d.zig");
 const style = @import("../style.zig");
 const swatch = @import("swatch.zig");

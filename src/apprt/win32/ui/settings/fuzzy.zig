@@ -119,8 +119,8 @@ pub fn isBlank(pattern: []const u8) bool {
     return std.mem.trim(u8, pattern, " \t").len == 0;
 }
 
-/// Decodes up to `buf.len` codepoints of `text`, folding ASCII letters to
-/// lower case when `fold_case` and skipping spaces when `skip_space`.
+/// Decodes up to `buf.len` codepoints of `text`, skipping spaces and
+/// folding ASCII letters to lower case when `skip_space` (a pattern).
 /// Invalid UTF-8 decodes to U+FFFD.
 fn decode(text: []const u8, buf: []u21, skip_space: bool) []u21 {
     var len: usize = 0;

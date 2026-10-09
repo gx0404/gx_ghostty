@@ -34,7 +34,7 @@
 - 耗时不能越过证据范围：用户「所有测试 ≤2 min」的要求尚未达成，不得擅自排除冷编译，也不用本机结果代证 CI；4 vCPU runner 的实测耗时、缓存超限被清空与跨 runner 复用等未解问题记在 `docs/TESTING.md`。
 - 测试 job 与 `windows-app` 用 `use-tool-cache: true` 固定工具链路径，以 `cache-key: stable-toolchain-v1` 隔离旧变体，不删除旧 cache，`cache-size-limit: 4096` 不变；`lib-vt-cross` 按 target 分 key。测试构建传 `--summary all`，`scripts/ci_cache.py` 只按白名单报告 CPU、Zig 路径、缓存分区大小和 timings 条数；手动输入 `cache_probe` 为真时才在同一 runner 重复安装构建、不重跑用例，快照随 `gx-zig-test-<job>` 上传。不得删 job、ABI 校验、默认加 `--dedupe` 或缩小 filter 来换取提速。
 - GUI 复测：win32 的 GUI 可见变更在本机按 `apprt-win32.md` 截图；GTK 用 `just wsl smoke`，或手动触发 `gtk-smoke`（debian:13 容器构建、`xvfb-run` 截图、证据作为 artifact 上传）。读回截图后才记 PASS。
-- `gx-release` 只能 `workflow_dispatch`（`ref` 默认 `gx_ghostty`，`publish`、`macos` 默认 false），带仓库守卫 `github.repository == 'gx0404/gx_ghostty'`；同一仓库的运行串行排队、不互相取消。prepare 把 `ref` 解析成完整 SHA，后续 job 只构建这个 SHA。
+- `gx-release` 只能 `workflow_dispatch`（`ref` 默认 `gx_ghostty`，`publish`、`macos` 默认 false），带仓库守卫 `github.repository == 'gx0404/gx_ghostty'`；同一仓库的运行串行排队、不互相取消。`ref` 接受分支、tag 或完整的 40 位提交 SHA（`actions/checkout` 取不到缩写 SHA）；prepare 把它解析成完整 SHA，后续 job 只构建这个 SHA。
 
 ### 版本与 tag
 

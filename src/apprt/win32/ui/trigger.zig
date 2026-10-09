@@ -5,7 +5,6 @@
 //! key press is bound to (`actionForKey`).
 const std = @import("std");
 const input = @import("../../../input.zig");
-const w32 = @import("../win32.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
 
@@ -357,16 +356,6 @@ pub fn drawSequence(
 const MAPVK_VK_TO_CHAR: u32 = 2;
 const MAPVK_VK_TO_VSC_EX: u32 = 4;
 extern "user32" fn MapVirtualKeyW(code: u32, map_type: u32) callconv(.winapi) u32;
-
-/// The modifiers held right now.
-pub fn currentMods() input.Mods {
-    return .{
-        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
-        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
-        .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
-        .super = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
-    };
-}
 
 /// The action a single-key binding of `set` performs for the virtual key
 /// `vk` with `mods`, matched like the core matches key events: by the

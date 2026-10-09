@@ -67,9 +67,6 @@ msgstr "窗口材质需要 Windows 11。"
 msgid "Show Scrollbar"
 msgstr "显示滚动条"
 
-msgid "Scrollbar"
-msgstr "滚动条"
-
 #. Settings: font
 msgid "Font Family"
 msgstr "字体族"
@@ -86,15 +83,6 @@ msgstr "响铃"
 
 msgid "Close Confirmation"
 msgstr "关闭确认"
-
-msgid "Confirm Before Closing"
-msgstr "关闭前确认"
-
-msgid "herdr App Mode"
-msgstr "herdr 应用模式"
-
-msgid "Show herdr like a standalone app when it is the only tab"
-msgstr "仅有一个标签页且运行 herdr 时，像独立应用一样显示"
 
 #. Settings: shell
 msgid "Default Shell"
@@ -219,13 +207,6 @@ msgstr "无法重新加载配置：{reason}"
 msgid "Could not preview the theme: {reason}"
 msgstr "无法预览主题：{reason}"
 
-#. Language names are shown in their own language in the language picker
-msgid "Chinese"
-msgstr "中文"
-
-msgid "English"
-msgstr "English"
-
 #. Menus
 msgid "New Tab"
 msgstr "新建标签页"
@@ -253,9 +234,6 @@ msgstr "关闭其他标签页"
 
 msgid "Rename Tab"
 msgstr "重命名标签页"
-
-msgid "Rename Tab…"
-msgstr "重命名标签页…"
 
 msgid "Settings…"
 msgstr "设置…"
@@ -299,15 +277,6 @@ msgstr "关闭标签页"
 
 msgid "Main menu"
 msgstr "主菜单"
-
-msgid "Minimize"
-msgstr "最小化"
-
-msgid "Maximize"
-msgstr "最大化"
-
-msgid "Restore"
-msgstr "还原"
 
 msgid "Close"
 msgstr "关闭"
@@ -380,18 +349,6 @@ msgstr "此终端中仍有进程在运行，仍要关闭吗？"
 msgid "The shell process exited with code {code}."
 msgstr "Shell 进程已退出，退出码 {code}。"
 
-msgid "{name} is still running."
-msgstr "{name} 仍在运行。"
-
-msgid "Don't ask again"
-msgstr "不再询问"
-
-msgid "Yes"
-msgstr "是"
-
-msgid "No"
-msgstr "否"
-
 msgid "Cancel"
 msgstr "取消"
 
@@ -403,32 +360,17 @@ msgstr "确定"
 msgid "Authorize Clipboard Access"
 msgstr "剪贴板访问授权"
 
-msgid "A program is trying to read the clipboard."
-msgstr "某个程序正在尝试读取剪贴板。"
-
-msgid "A program is trying to write to the clipboard."
-msgstr "某个程序正在尝试写入剪贴板。"
-
 msgid "Allow"
 msgstr "允许"
 
 msgid "Deny"
 msgstr "拒绝"
 
-msgid "Allow this?"
-msgstr "是否允许？"
-
 msgid "Warning: Potentially Unsafe Paste"
 msgstr "警告：粘贴内容可能不安全"
 
-msgid "The text you are pasting contains line breaks and may run commands."
-msgstr "要粘贴的文本包含换行符，可能会执行命令。"
-
 msgid "Paste Anyway"
 msgstr "仍然粘贴"
-
-msgid "Paste anyway?"
-msgstr "仍要粘贴吗？"
 
 msgid "Copied to clipboard"
 msgstr "已复制至剪贴板"
@@ -444,30 +386,12 @@ msgstr "无结果"
 msgid "{current}/{total}"
 msgstr "{current}/{total}"
 
-msgid "Previous Match"
-msgstr "上一个匹配项"
-
-msgid "Next Match"
-msgstr "下一个匹配项"
-
-msgid "Match case"
-msgstr "区分大小写"
-
-msgid "Close search"
-msgstr "关闭搜索"
-
 #. Notifications
 msgid "Command finished"
 msgstr "命令已完成"
 
 msgid "Command failed"
 msgstr "命令执行失败"
-
-msgid "Exit code: {code}"
-msgstr "退出码：{code}"
-
-msgid "Command finished in {duration}"
-msgstr "命令已完成，用时 {duration}"
 
 #. GTK: language switching
 msgid "Language changed. Reopen the window to update all labels."
@@ -583,9 +507,6 @@ msgstr "重置终端"
 
 msgid "Close Tabs to the Right"
 msgstr "关闭右侧标签页"
-
-msgid "Execute a command…"
-msgstr "选择要执行的命令…"
 
 msgid "Export Terminal IO Events"
 msgstr "导出终端 IO 事件"

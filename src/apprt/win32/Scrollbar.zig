@@ -12,7 +12,6 @@
 //! reserves a column of the grid and stays.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const w32 = @import("win32.zig");
 const terminal = @import("../../terminal/main.zig");
 const Surface = @import("Surface.zig");

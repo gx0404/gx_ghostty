@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 构建来源（分支、tag 或提交）；prepare 解析为完整 SHA，后续 job 只用这个 SHA
+        description: 构建来源（分支、tag 或完整的 40 位提交 SHA；actions/checkout 取不到缩写 SHA）；prepare 解析为完整 SHA，后续 job 只用这个 SHA
         type: string
         required: true
         default: gx_ghostty

@@ -73,10 +73,6 @@ rename_font: ?*anyopaque = null,
 rename_tab: usize = 0,
 rename_window: bool = false,
 
-/// GDI UI font (Segoe UI) at the window DPI, shared with the resize
-/// overlay.
-font: ?*anyopaque = null,
-
 /// Whether WM_MOUSELEAVE tracking is active for the tab bar.
 tracking_mouse: bool = false,
 
@@ -143,37 +139,10 @@ fn windowConst(self: *const TabBar) *const Window {
 
 /// Release the GDI objects of the tab bar.
 pub fn deinit(self: *TabBar) void {
-    if (self.font) |font| {
-        _ = w32.DeleteObject(font);
-        self.font = null;
-    }
     if (self.rename_font) |font| {
         _ = w32.DeleteObject(font);
         self.rename_font = null;
     }
-}
-
-/// (Re)create the GDI UI font (Segoe UI, 12px at 96 DPI, scaled). Called
-/// at window creation and whenever the DPI changes.
-pub fn createFont(self: *TabBar) void {
-    if (self.font) |font| _ = w32.DeleteObject(font);
-    const font_height: i32 = -@as(i32, @intFromFloat(16.0 * self.window().scale));
-    self.font = w32.CreateFontW(
-        font_height, // cHeight (negative = character height)
-        0, // cWidth
-        0, // cEscapement
-        0, // cOrientation
-        w32.FW_NORMAL, // cWeight
-        0, // bItalic
-        0, // bUnderline
-        0, // bStrikeOut
-        w32.DEFAULT_CHARSET, // iCharSet
-        0, // iOutPrecision
-        0, // iClipPrecision
-        0, // iQuality
-        0, // iPitchAndFamily
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
 }
 
 /// Recompute whether the tabs are shown from `window-show-tab-bar`, the

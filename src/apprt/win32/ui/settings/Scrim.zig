@@ -74,12 +74,6 @@ pub fn destroy(self: *Scrim) void {
     self.* = .{};
 }
 
-/// Change the darkness (0-255).
-pub fn setAlpha(self: *Scrim, alpha: u8) void {
-    const hwnd = self.hwnd orelse return;
-    _ = w32.SetLayeredWindowAttributes(hwnd, 0, alpha, w32.LWA_ALPHA);
-}
-
 /// Cover `rect` (screen pixels) and show without taking activation.
 pub fn show(self: *Scrim, rect: w32.RECT) void {
     const hwnd = self.hwnd orelse return;

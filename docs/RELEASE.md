@@ -44,7 +44,7 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
    gh workflow run gx-release.yml -f ref=gx_ghostty -f publish=true
    ```
 
-   或在 Actions → gx-release → Run workflow 里选同样的输入；要附 macOS 产物时加 `-f macos=true`。workflow 文件取默认分支 `gx_ghostty` 上的版本，`ref` 在 prepare 里解析成完整 SHA，后续 job 只构建这个 SHA。这次运行从头构建全部资产，`verify` 通过后 `publish` 才发布；任何 job 失败都不会发布。agent 不运行这条命令（见下文）。
+   或在 Actions → gx-release → Run workflow 里选同样的输入；要附 macOS 产物时加 `-f macos=true`。workflow 文件取默认分支 `gx_ghostty` 上的版本，`ref` 在 prepare 里解析成完整 SHA，后续 job 只构建这个 SHA。`ref` 可以是分支、tag 或提交；提交必须写完整的 40 位 SHA，`actions/checkout` 取不到缩写 SHA（如 `ref=4f4e0e128`），prepare 会在检出这一步失败。这次运行从头构建全部资产，`verify` 通过后 `publish` 才发布；任何 job 失败都不会发布。agent 不运行这条命令（见下文）。
 
    可选的预检：`windows-app` 与 `linux-gtk-noble` 还没在 GitHub 上跑过，第一次发版前可以先用 `-f publish=false` 跑一次只构建验收，从该运行的 Artifacts 下载 `verified-release`（保留 14 天）与 `evidence-linux-gtk-noble` 检查；发布那次仍会重新构建，不复用这次的产物。
 5. **核对资产**：发布完成后只读地检查——
@@ -59,7 +59,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 ## gx-release 的 job
 
-所有 job 都只在 `gx0404/gx_ghostty` 上通过 `workflow_dispatch` 运行；同一时间只跑一个发版（`concurrency: gx-release`，不取消进行中的运行）。输入（`ref` 默认 `gx_ghostty`，`publish`、`macos` 默认 false）只经 `env:` 传给脚本，`run:` 里不内插 `${{ }}`。
+所有 job 都只在 `gx0404/gx_ghostty` 上通过 `workflow_dispatch` 运行；同一时间只跑一个发版（`concurrency: gx-release`，不取消进行中的运行）。输入（`ref` 默认 `gx_ghostty`，指定提交时写完整的 40 位 SHA；`publish`、`macos` 默认 false）只经 `env:` 传给脚本，`run:` 里不内插 `${{ }}`。
 
 | job | runner | 做什么 |
 |---|---|---|

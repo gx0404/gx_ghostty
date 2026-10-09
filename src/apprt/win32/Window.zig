@@ -309,7 +309,6 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
-    self.tab_bar.createFont();
     if (!options.is_quick_terminal) {
         // WM_NCCALCSIZE reaches the title bar from now on.
         self.title_bar.applyDecoration(&app.config);
@@ -519,7 +518,6 @@ pub fn onFrameChanged(self: *Window) void {
 fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     if (dpi == 0) return;
     self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
-    self.tab_bar.createFont();
     self.title_bar.onDpiChanged();
 
     for (0..self.tab_count) |i| {
@@ -625,12 +623,6 @@ pub fn deinit(self: *Window) void {
         _ = w32.DestroyWindow(hwnd);
         self.hwnd = null;
     }
-}
-
-/// Returns the height in pixels of the chrome row while it shows tabs,
-/// else 0.
-pub fn tabBarHeight(self: *const Window) i32 {
-    return if (self.tab_bar.visible) self.title_bar.height() else 0;
 }
 
 /// Height of the chrome above the terminals: the single chrome row (the

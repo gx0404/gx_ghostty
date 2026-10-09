@@ -13,8 +13,6 @@ const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
-const CoreSurface = @import("../../Surface.zig");
-const internal_os = @import("../../os/main.zig");
 const global = @import("../../global.zig");
 
 const QuickTerminal = @import("QuickTerminal.zig");
@@ -30,7 +28,6 @@ const d2d = @import("ui/d2d.zig");
 const gx = @import("../../gx/main.zig");
 const i18n = gx.i18n;
 
-const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
 
 /// A registered global system hotkey: the RegisterHotKey id and the binding
