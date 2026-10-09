@@ -697,7 +697,8 @@ pub fn add(
                 for ([_][]const u8{
                     "opengl32", "gdi32",    "user32",   "dwmapi",
                     "imm32",    "shell32",  "ole32",    "uxtheme",
-                    "comctl32", "comdlg32", "advapi32",
+                    "comctl32", "comdlg32", "advapi32", "d2d1",
+                    "dwrite",
                 }) |name| step.root_module.linkSystemLibrary(name, .{});
             },
             // fork(gx): GX-0003 end

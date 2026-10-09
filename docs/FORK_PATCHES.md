@@ -182,7 +182,7 @@ python -m unittest scripts.test_fork_patches -v
 - 文件：`src/apprt/runtime.zig`（`Runtime` 新增 `win32`，Windows 目标默认取它）、`src/apprt.zig`（导入并选中 `apprt/win32.zig`）、`src/build/SharedDeps.zig`（Windows 目标不再 translate-c `posix_c`；`.win32` 分支链接 Win32 系统库）、`src/main_ghostty.zig`（`logFn` 末尾把日志另写到文件）、`src/config/Config.zig`（`finalize` 的 apprt 分支、两处 GObject 分支、`quit-after-last-window-closed` 的 Windows 默认值），以及按 `app_runtime` 穷举的 GObject 分支：`src/apprt/action.zig`、`src/apprt/structs.zig`（两处）、`src/apprt/surface.zig`、`src/datastruct/split_tree.zig`、`src/font/face.zig`、`src/input/Binding.zig`、`src/terminal/mouse.zig`。
 - 标记：`fork(gx): GX-0003`。纯新增块用 begin/end 包住（`runtime.zig` 两块、`apprt.zig` 两块、`SharedDeps.zig` 的链接块、`main_ghostty.zig` 的日志块）；改动的单行（各处 `.none => void` 改为 `.none, .win32 => void`、`posix_c` 守卫、`quit-after-last-window-closed` 默认值）上一行写单行标记。
 - 状态：active，未回馈上游。
-- 改动量：12 个文件，`git diff --numstat` 合计 +60/−15（含注释）。
+- 改动量：12 个文件，`git diff --numstat` 合计 +61/−15（含注释）。
 
 ### 原因
 
@@ -196,7 +196,7 @@ python -m unittest scripts.test_fork_patches -v
 
 - Windows 目标未给 `-Dapp-runtime` 时默认 `win32`，`zig build -Dtarget=x86_64-windows-gnu` 产出 `zig-out/bin/ghostty.exe`（`just build` 在 Windows 主机上自动补这个目标，见 `scripts/zig_build.py`）。Linux/FreeBSD 仍默认 `gtk`，其余目标仍默认 `none`。
 - Windows 目标不再导入 `posix_c` 模块；与上游 PR #14608 的同一行守卫一致。非 Windows 目标不变。
-- `.win32` 且目标是 Windows 时链接 opengl32、gdi32、user32、dwmapi、imm32、shell32、ole32、uxtheme、comctl32、comdlg32、advapi32。
+- `.win32` 且目标是 Windows 时链接 opengl32、gdi32、user32、dwmapi、imm32、shell32、ole32、uxtheme、comctl32、comdlg32、advapi32，以及自绘界面（`src/apprt/win32/ui/d2d.zig` 的 Direct2D/DirectWrite 绑定）用的 d2d1、dwrite。
 - win32 构建里每条日志额外追加到 `%LOCALAPPDATA%\ghostty\logs\ghostty.log`（实现在 `src/apprt/win32/file_log.zig`，每次运行的首条日志时创建，上一次的日志改名为 `ghostty.log.1`）；Debug 构建写全部级别，其余构建与 stderr 一样不写 debug。其他 apprt 不受影响。
 - `quit-after-last-window-closed` 在 Windows 上默认 `true`，与 Linux 一致；文档注释同步写明。其他平台默认值不变。
 - 所有 GObject 分支在 win32 下与 `none` 一样取 `void`，`Config.finalize` 不加 win32 专属默认值。
