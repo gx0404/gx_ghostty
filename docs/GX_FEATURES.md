@@ -19,7 +19,7 @@ Ghostty GX 0.0.1 是 GX Shell 新的终端组件，接替 WezTerm GX（GX Shell 
 | 壁纸 | 有：壁纸浮层（列出、预览、添加、删除）与 16 张内置壁纸 | 未移植。上游的 `background-image`（与 `-opacity`、`-position`、`-fit`、`-repeat`）可以设背景图，Windows 上没有专门验证过 | 未移植；同样可用上游的 `background-image` | 上游的 `background-image` | GX Shell 0.4.0 随 WezTerm GX 移除了壁纸 |
 | 标签栏外观 | 有：fancy 圆角标签栏、集成标题栏按钮、关闭按钮悬停 `#c42b1c`、未读计数、☰ 按钮 | 有：标签并入标题栏，Direct2D 绘制：8 DIP 圆角、活动标签与终端背景相连、`程序 ~ 标题`、未读圆点、管理员盾牌与 WSL 图标；拖动排序、双击改名、中键关闭；自绘最小化、最大化、关闭（悬停 `#c42b1c`），贴靠布局与窗口菜单；新窗口约占显示器工作区 80%，首帧前不显示 | 有（GX-0016）：libadwaita 标签栏加 GX 样式：8 px 圆角、取自主题的标题栏与标签配色、1 px 分屏线、细滚动条 | 上游原样 | — |
 | 主菜单 | 有：☰ 主菜单（命令面板、快捷键、设置、重载配置、隐藏窗口、退出），`ShowMainMenu` | 有：☰ 主菜单是按主题自绘的弹出菜单：新建标签页与窗口、启动配置子菜单、分屏、命令面板、设置、键盘快捷键、语言、重新加载配置、打开配置文件、关于、退出；`gx:main_menu`（默认 Ctrl+Shift+M） | 有（GX-0011）：上游 ☰ 菜单加 GX 分区（设置…、键盘快捷键、语言）；`gx:main_menu` 从 ☰ 按钮弹出 | 上游菜单栏 | Windows 的标签页右键与终端右键菜单也是同一套自绘菜单 |
-| 命令面板 | 有：汉化的命令面板，中文模糊搜索，frecency 排序，鼠标悬停与点击 | 有：Direct2D 弹层，分组列出最近使用、标签页、启动配置、命令、设置、主题；同时匹配译文与英文原文；本次运行内的 frecency；选中主题即预览；键盘与鼠标 | 上游 GTK 命令面板，条目随界面语言翻译；`gx:` 条目被过滤，不出现在面板里（GX-0014） | 上游 | Windows 的使用记录只保存在进程内，重启后清空 |
+| 命令面板 | 有：汉化的命令面板，中文模糊搜索，frecency 排序，鼠标悬停与点击 | 有：Direct2D 弹层，分组列出最近使用、标签页、启动配置、命令、设置、主题；同时匹配译文与英文原文；本次运行内的 frecency；选中主题即预览；键盘与鼠标 | 上游 GTK 命令面板，上游条目随界面语言翻译；GX 默认值的三条 `gx:` 条目也列出，可按标题或 `gx:` 动作搜索、回车执行（GX-0014），但标题不翻译，显示英文 Settings、Keyboard Shortcuts、Main Menu | 上游 | Windows 的使用记录只保存在进程内，重启后清空 |
 | 快捷键速查表 | 有：快捷键速查浮层 | 有：`gx:keybinds`（默认 Ctrl+Shift+/）：按类别列出全部绑定，前导键序列显示为 `A → B`，可按标题、动作与按键搜索 | 有（GX-0011）：`Adw.Dialog`，按类别分组，可搜索 | 无 | — |
 | 启动配置与默认 Shell | 有：探测 PowerShell 7、Windows PowerShell 5.1、cmd、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版与 GX Zsh；设置的 Shell 分区写默认 Shell；回退顺序 GX Zsh、PowerShell 7、PowerShell 5.1 | 有：`src/gx/profiles.zig` 探测 GX Zsh、herdr、PowerShell 7、Windows PowerShell、命令提示符、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版，加 `gx-launch-profile`；「+」旁的「▾」与右键「+」列出，另有 `gx:new_tab_profile`、`gx:new_window_profile`；未配置 `command` 时默认 GX Zsh，依次退到 PowerShell 7、Windows PowerShell、命令提示符；设置的 Shell 分区写 `command` | 有：新建标签页下拉列出 GX Zsh、herdr、登录 Shell、zsh、bash、fish 与 `gx-launch-profile`，另有「用启动配置新建窗口」；默认仍是上游的登录 shell，设置的 Shell 分区可写 `command` | 上游 | 两边选 GX Zsh 时都在后台运行 `herdr --gx-set-default-shell`，退出码 3 表示用户自管 herdr 配置，只提示 |
 | herdr 应用模式 | 有（配置脚本 `events/status.lua`）：唯一标签运行 herdr 时隐藏标签栏 | 有：`gx-herdr-app-mode`（默认开）：窗口唯一的标签页运行 herdr 时隐藏标签，保留标题栏与按钮；每 1.5 s 及标签页、分屏变化时重新判断 | 有（GX-0016）：隐藏标签栏；`gtk-titlebar-style = tabs` 时改为显示标题栏，窗口仍可拖动与关闭 | 无 | — |
@@ -50,5 +50,5 @@ Ghostty GX 0.0.1 是 GX Shell 新的终端组件，接替 WezTerm GX（GX Shell 
 
 - WezTerm GX 的壁纸浮层与内置壁纸、剪贴板图片粘贴、CLI 帮助汉化，以及配置脚本里的插件与键位集合，Ghostty GX 都没有移植；GX Shell 0.4.0 不迁移 WezTerm 的配置。
 - 会话恢复（窗口、标签与工作目录在重启后恢复）两边都没有。
-- Linux GTK 上：默认 shell 仍是登录 shell（不默认进 GX Zsh），命令面板不显示 `gx:` 条目，没有系统窗口材质。
+- Linux GTK 上：默认 shell 仍是登录 shell（不默认进 GX Zsh），命令面板里 `gx:` 条目的标题不随界面语言翻译（显示英文），没有系统窗口材质。
 - macOS app 没有任何 GX 界面与配置分层。
