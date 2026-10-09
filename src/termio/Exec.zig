@@ -65,9 +65,12 @@ pub fn deinit(self: *Exec) void {
 /// after termio begins because it may put the internal terminal state
 /// into a bad state.
 pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
-    // fork(gx): GX-0022 ConPTY's own screen buffer ignores the OSC 133 fresh-line
-    if (comptime builtin.os.tag == .windows) term.flags.semantic_prompt_fresh_line = false;
-
+    // fork(gx): GX-0022 begin: stay in sync with ConPTY's own screen buffer
+    if (comptime builtin.os.tag == .windows) {
+        term.flags.resize_pull_scrollback = false;
+        term.flags.semantic_prompt_fresh_line = false;
+    }
+    // fork(gx): GX-0022 end
     // If we have an initial pwd requested by the subprocess, then we
     // set that on the terminal now. This allows rapidly initializing
     // new surfaces to use the proper pwd.
@@ -2411,3 +2414,30 @@ test "execCommand windows: direct command is passed through unchanged" {
     try testing.expectEqualStrings("C:\\tools\\foo.exe", result[0]);
     try testing.expectEqualStrings("arg with spaces", result[1]);
 }
+
+// fork(gx): GX-0022 begin: Windows terminals stay in sync with ConPTY's screen buffer
+test "initTerminal: ConPTY screen buffer sync on Windows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var term = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer term.deinit(alloc);
+
+    var exec: Exec = .{ .subprocess = .{
+        .arena = .init(alloc),
+        .cwd = null,
+        .env = null,
+        .args = &.{},
+        .grid_size = .{},
+        .screen_size = .{ .width = 0, .height = 0 },
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    } };
+    defer exec.subprocess.arena.deinit();
+    exec.initTerminal(&term);
+
+    const conpty = builtin.os.tag == .windows;
+    try testing.expectEqual(!conpty, term.flags.resize_pull_scrollback);
+    try testing.expectEqual(!conpty, term.flags.semantic_prompt_fresh_line);
+}
+// fork(gx): GX-0022 end

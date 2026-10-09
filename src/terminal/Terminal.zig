@@ -16351,6 +16351,50 @@ test "Terminal: resize without scrollback pull" {
     }
 }
 
+// fork(gx): GX-0022 begin: resize without scrollback pull, as Windows ConPTY needs
+test "Terminal: resize without scrollback pull stays in sync with ConPTY" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+
+    // The bundled ConPTY sends nothing on resize and later echoes the
+    // input at the prompt with an absolute cursor position.
+    {
+        var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+        t.flags.resize_pull_scrollback = false;
+        var s = t.vtStream();
+        defer s.deinit();
+
+        s.nextSlice("1\r\n2\r\n3\r\n4\r\n>");
+        try t.resize(alloc, .{ .cols = 10, .rows = 5 });
+        s.nextSlice("\x1b[3;2Hls\r\nout\r\n>");
+
+        const str = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(str);
+        try testing.expectEqualStrings("1\n2\n3\n4\n>ls\nout\n>", str);
+    }
+
+    // The inbox ConPTY repaints its whole buffer right after a resize.
+    {
+        var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+        t.flags.resize_pull_scrollback = false;
+        var s = t.vtStream();
+        defer s.deinit();
+
+        s.nextSlice("1\r\n2\r\n3\r\n4\r\n>");
+        try t.resize(alloc, .{ .cols = 10, .rows = 5 });
+        s.nextSlice("\x1b[H3\x1b[K\r\n4\x1b[K\r\n>\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[3;2H");
+
+        const str = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(str);
+        try testing.expectEqualStrings("1\n2\n3\n4\n>", str);
+        try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.x);
+        try testing.expectEqual(@as(size.CellCountInt, 2), t.screens.active.cursor.y);
+    }
+}
+// fork(gx): GX-0022 end
+
 // https://github.com/mitchellh/ghostty/issues/1343
 test "Terminal: resize with wraparound off" {
     const alloc = testing.allocator;
