@@ -1,7 +1,8 @@
 //! Ghostty GX additions to `class/application.zig::Application`: the
-//! `app.gx-language` and `app.gx-keybinds` actions, following `language`
-//! changes at runtime, and the GTK side of the Ghostty GX binding actions
-//! (`gx:<name>[:<arg>]`, dispatched by the core through `App.gxAction`).
+//! `app.gx-language`, `app.gx-keybinds` and `app.gx-about` actions,
+//! following `language` changes at runtime, and the GTK side of the
+//! Ghostty GX binding actions (`gx:<name>[:<arg>]`, dispatched by the core
+//! through `App.gxAction`).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gio = @import("gio");
@@ -15,6 +16,7 @@ const gx = @import("../../../gx/main.zig");
 const ext = @import("../ext.zig");
 const Application = @import("../class/application.zig").Application;
 const Window = @import("../class/window.zig").Window;
+const about = @import("about.zig");
 const language = @import("language.zig");
 const launch = @import("launch.zig");
 const shortcuts_dialog = @import("shortcuts_dialog.zig");
@@ -27,8 +29,9 @@ const log = std.log.scoped(.gtk_gx_app);
 const reload_key = "gx-language-reload";
 
 /// Registers the Ghostty GX app actions: `app.gx-language` (stateful, the
-/// `language` configuration value, written to `gui-settings.ghostty`) and
-/// `app.gx-keybinds` (the keyboard shortcuts cheat sheet). Called from
+/// `language` configuration value, written to `gui-settings.ghostty`),
+/// `app.gx-keybinds` (the keyboard shortcuts cheat sheet) and
+/// `app.gx-about` (the Ghostty GX About dialog). Called from
 /// `Application.startup`.
 pub fn startup(app: *Application) void {
     const s_variant_type = glib.ext.VariantType.newFor([:0]const u8);
@@ -42,6 +45,7 @@ pub fn startup(app: *Application) void {
             glib.Variant.newString(gx.i18n.current().configValue()),
         ),
         .init("gx-keybinds", actionKeybinds, null),
+        .init("gx-about", actionAbout, null),
     };
     ext.actions.add(Application, app, &actions);
 }
@@ -125,6 +129,15 @@ fn actionKeybinds(
 ) callconv(.c) void {
     const window = activeWindow(app) orelse return;
     _ = showShortcuts(app, window);
+}
+
+fn actionAbout(
+    _: *gio.SimpleAction,
+    _: ?*glib.Variant,
+    app: *Application,
+) callconv(.c) void {
+    const window = activeWindow(app) orelse return;
+    about.present(window);
 }
 
 fn saveLanguage(alloc: Allocator, lang: gx.i18n.Language) !void {

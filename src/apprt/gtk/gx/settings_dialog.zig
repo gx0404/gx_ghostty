@@ -103,6 +103,7 @@ pub const GxSettingsDialog = extern struct {
         shell_group: *adw.PreferencesGroup,
         shell_row: *adw.ComboRow,
         about_page: *adw.PreferencesPage,
+        about_group: *adw.PreferencesGroup,
         version_row: *adw.ActionRow,
         config_path_row: *adw.ActionRow,
         open_config_button: *gtk.Button,
@@ -462,6 +463,7 @@ pub const GxSettingsDialog = extern struct {
         const st = &priv.state;
         const arena = st.arena.allocator();
         priv.about_page.setTitle(self.tr(msg.about));
+        priv.about_group.setDescription(self.tr(msg.notice));
 
         priv.version_row.as(adw.PreferencesRow).setTitle(self.tr(msg.app_name));
         if (self.fill(arena, msg.version, .{ .version = build_config.version_string })) |version| {
@@ -1138,6 +1140,7 @@ pub const GxSettingsDialog = extern struct {
             class.bindTemplateChildPrivate("shell_group", .{});
             class.bindTemplateChildPrivate("shell_row", .{});
             class.bindTemplateChildPrivate("about_page", .{});
+            class.bindTemplateChildPrivate("about_group", .{});
             class.bindTemplateChildPrivate("version_row", .{});
             class.bindTemplateChildPrivate("config_path_row", .{});
             class.bindTemplateChildPrivate("open_config_button", .{});

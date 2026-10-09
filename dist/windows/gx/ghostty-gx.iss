@@ -42,14 +42,16 @@ AppPublisher=gx0404
 AppPublisherURL=https://github.com/gx0404/gx_ghostty
 AppSupportURL=https://github.com/gx0404/gx_ghostty/issues
 AppUpdatesURL=https://github.com/gx0404/gx_ghostty/releases
+AppComments=Ghostty GX is an unofficial fork of Ghostty maintained by gx0404. It is not affiliated with or endorsed by the Ghostty project.
 VersionInfoVersion={#GxNumericVersion}
 VersionInfoProductVersion={#GxNumericVersion}
 VersionInfoTextVersion={#GxVersion}
 VersionInfoProductTextVersion={#GxVersion}
 VersionInfoProductName=Ghostty GX
-VersionInfoDescription=Ghostty GX Setup
+VersionInfoDescription=Ghostty GX Setup (unofficial fork of Ghostty)
 VersionInfoCompany=gx0404
 DefaultDirName={autopf}\Ghostty GX
+DisableWelcomePage=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -71,6 +73,10 @@ RestartApplications=no
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+chinesesimplified.WelcomeLabel2=现在将安装 [name/ver] 到您的电脑中。%n%nGhostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。%n%n推荐您在继续安装前关闭所有其它应用程序。
+english.WelcomeLabel2=This will install [name/ver] on your computer.%n%nGhostty GX is an unofficial fork of Ghostty maintained by gx0404. It is not affiliated with or endorsed by the Ghostty project.%n%nIt is recommended that you close all other applications before continuing.
 
 [CustomMessages]
 chinesesimplified.IntegrationGroup=系统集成：

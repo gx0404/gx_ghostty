@@ -11,6 +11,16 @@
 
 ## 0.0.2(TBD)
 
+### Added
+
+- 写明 Ghostty GX 是非官方分支：Windows 的「关于」对话框与设置的「关于」页、Linux GTK 设置对话框的「关于」页、安装包的欢迎页与「应用和功能」里的说明、便携包的 `README.txt`、GitHub 发布说明的结尾与仓库首页 README 的开头，都写明「Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书」（英文界面显示英文）。
+- Linux GTK 主菜单的「关于 Ghostty GX」打开 Ghostty GX 自己的关于对话框：名称、版本、项目主页与问题反馈都指向 gx0404/gx_ghostty，首页写明「gx0404 维护的 Ghostty 非官方分支」，不再显示把本构建说成 Ghostty 开发者出品的上游关于对话框。
+
+### Changed
+
+- Ghostty GX 的 Windows 应用与安装包改用自己的图标（GX Mocha 配色的深色圆角方块加蓝色 `>_` 提示符，48 像素起加 `GX` 字样），不再使用 Ghostty 的幽灵图标；标题栏、任务栏、资源管理器、通知区域、安装程序与 GX Shell 的 Windows 安装包都显示它（GX-0026）。`ghostty.exe` 的文件属性显示产品名 Ghostty GX、发行者 gx0404 与非官方分支声明。Linux GTK 应用仍用上游图标。
+- Windows「关于」对话框的第二个链接改为「上游 Ghostty」，指向 ghostty.org。
+
 ## 0.0.1(2026-10-10)
 
 Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应用，两端共用 GX 核心与默认配置，并有 fork 自己的发布链与开发框架。括号里的 GX-NNNN 是 `docs/FORK_PATCHES.md` 登记的上游源码补丁。

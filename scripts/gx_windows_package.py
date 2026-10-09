@@ -80,7 +80,7 @@ ROOT = SCRIPTS.parent
 PRODUCT = "ghostty-gx"
 TARGET = gx_release.WINDOWS_APP_TARGET
 ISS = Path("dist/windows/gx/ghostty-gx.iss")
-ICON = Path("dist/windows/ghostty.ico")
+ICON = Path("dist/windows/gx/ghostty-gx.ico")
 THEMES = Path("src/gx/themes")
 SKIPPED_SHARE = ("pkgconfig",)
 CACHE_ENV = "GX_GHOSTTY_PACKAGE_CACHE"
@@ -593,7 +593,8 @@ def readme(version_string: str) -> str:
     setup = installer_base(version_string) + ".exe"
     text = f"""Ghostty GX {version_string}（Windows x64）
 
-Ghostty GX 是 gx0404 维护的 Ghostty 分支（https://github.com/gx0404/gx_ghostty），不是 Ghostty 官方发布。
+Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护（https://github.com/gx0404/gx_ghostty），
+与 Ghostty 团队无关，未获其认可或背书。
 
 使用
 - 运行 ghostty.exe 启动终端。便携版整个目录可以放在任何位置，不写注册表。
@@ -610,8 +611,8 @@ Ghostty GX 是 gx0404 维护的 Ghostty 分支（https://github.com/gx0404/gx_gh
 
 Ghostty GX {version_string} (Windows x64)
 
-Ghostty GX is the Ghostty fork maintained by gx0404 (https://github.com/gx0404/gx_ghostty); it is not an
-official Ghostty release.
+Ghostty GX is an unofficial fork of Ghostty maintained by gx0404 (https://github.com/gx0404/gx_ghostty).
+It is not affiliated with or endorsed by the Ghostty project.
 
 Usage
 - Run ghostty.exe. The portable directory can live anywhere and writes nothing to the registry.

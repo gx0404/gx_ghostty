@@ -88,7 +88,7 @@ Windows layout (top level exactly app/, fonts/, build-inputs/ and the manifest)
                         THIRD-PARTY.txt and the ConPTY, Mesa, LLVM and font license texts), README.txt
   fonts/                the 8 pinned fonts of gx_release.WINDOWS_FONTS; GX Shell merges component fonts
                         only when the bytes match, so the four Oh My Zsh GX also ships are identical
-  build-inputs/ghostty.ico   dist/windows/ghostty.ico
+  build-inputs/ghostty.ico   dist/windows/gx/ghostty-gx.ico (the Ghostty GX icon, see scripts/gx_icon.py)
 Deb layout (top level exactly root/, fonts/ and the manifest)
   root/usr/lib/ghostty-gx/   bin/ghostty and share/ from the prefix (relocatable: the app finds
                              share/ghostty, share/terminfo and share/locale relative to its real path),

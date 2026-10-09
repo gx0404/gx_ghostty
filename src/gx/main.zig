@@ -8,7 +8,8 @@
 //!   (`gui_settings`); the settings model that the GTK settings dialog
 //!   and the Windows settings overlay render (`settings_map`); the
 //!   built-in GX Mocha theme (`theme`).
-//! - UI language and translations (`i18n`).
+//! - UI language and translations (`i18n`); the name, links and
+//!   non-affiliation notice of the About surfaces (`branding`).
 //! - `gx:` binding actions (`action`) and launch profiles (`profiles`).
 //! - Processes: inspection (`proc`), the idle and herdr policies
 //!   (`policy`), close confirmation (`confirm`) and herdr app mode
@@ -20,6 +21,7 @@
 //!   paths (`path_quote`).
 pub const action = @import("action.zig");
 pub const app_mode = @import("app_mode.zig");
+pub const branding = @import("branding.zig");
 pub const config_layers = @import("config_layers.zig");
 pub const config_types = @import("config_types.zig");
 pub const confirm = @import("confirm.zig");
@@ -39,6 +41,7 @@ pub const win32_input = @import("win32_input.zig");
 test {
     _ = action;
     _ = app_mode;
+    _ = branding;
     _ = config_layers;
     _ = config_types;
     _ = confirm;
