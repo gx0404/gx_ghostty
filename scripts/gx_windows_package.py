@@ -39,9 +39,10 @@ Outputs
                                           licenses/ (with Ghostty-MIT.txt and THIRD-PARTY.txt) and a
                                           Chinese/English README.txt
   ghostty-gx-VS-x86_64-windows-setup.exe  Inno Setup 7.1 installer built from dist/windows/gx/ghostty-gx.iss:
-                                          the same tree without fonts/ goes to {app}, the fonts are
-                                          installed per user (skipped when already present, never
-                                          uninstalled); --skip-installer omits it
+                                          the same tree without fonts/ goes to {app}, the fonts to
+                                          {autofonts}, i.e. for the user or, in an all-users
+                                          installation, for all users (skipped when already present,
+                                          never uninstalled); --skip-installer omits it
 Both outputs are checked against scripts/gx_release.py::expected_assets before success is reported.
 ISCC comes from --iscc, $ISCC, .local/tools/innosetup/ISCC.exe (just setup --innosetup) or PATH.
 scripts/gx_package.py builds the GX Shell Windows stage from the same tree (build_tree).
@@ -597,7 +598,7 @@ Ghostty GX 是 gx0404 维护的 Ghostty 分支（https://github.com/gx0404/gx_gh
 使用
 - 运行 ghostty.exe 启动终端。便携版整个目录可以放在任何位置，不写注册表。
 - fonts\\：JetBrainsMono Nerd Font 与 Noto Sans CJK。便携版不安装字体，需要时双击字体文件安装；
-  安装包 {setup} 会把它们按用户安装（已有同名字体时跳过）。
+  安装包 {setup} 会一并安装它们，范围与程序相同：当前用户或所有用户（已有同名字体时跳过）。
 - conpty.dll、OpenConsole.exe：微软 Microsoft.Windows.Console.ConPTY 1.24.261001001，提供比系统自带
   更新的 ConPTY。
 - mesa\\：Mesa llvmpipe 软件渲染，只在系统驱动建不出 OpenGL 4.3 上下文时作为后备加载；
@@ -615,8 +616,8 @@ official Ghostty release.
 Usage
 - Run ghostty.exe. The portable directory can live anywhere and writes nothing to the registry.
 - fonts\\: JetBrainsMono Nerd Font and Noto Sans CJK. The portable build does not install fonts;
-  double-click a font file to install it. The installer {setup} installs them per user
-  (skipping fonts that already exist).
+  double-click a font file to install it. The installer {setup} installs them like the program,
+  for the current user or for all users (skipping fonts that already exist).
 - conpty.dll, OpenConsole.exe: Microsoft.Windows.Console.ConPTY 1.24.261001001, a newer ConPTY than
   the one built into Windows.
 - mesa\\: Mesa llvmpipe software rendering, loaded only as a fallback when the system driver cannot
