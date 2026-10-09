@@ -1,5 +1,5 @@
 {
- "chunk_count": 1237,
+ "chunk_count": 1258,
  "chunks": [
   {
    "anchor": "Agent Development Guide",
@@ -26,8 +26,8 @@
    "anchor": "Agent Development Guide > fork 治理",
    "doc": "AGENTS.md",
    "id": "agents-md-agent-development-guide-fork-治理",
-   "source_sha256": "3c934f61ccbb880ea4bd72f2a984f0445bd992e979ee4afd7230ec9d15693af6",
-   "text": "## fork 治理\n\n- 上游 `ghostty-org/ghostty`（remote `upstream`），fork `gx0404/gx_ghostty`（remote `origin`）。`main` 只快进镜像上游；`gx_ghostty` 是开发与发布分支。\n- 同步用 merge：`main` 快进到 `upstream/main` 后合入 `gx_ghostty`。永不 force push，永不推送 `upstream`；流程见 `docs/DEVELOPMENT.md`。\n- 上文 Issue and PR Guidelines 照常适用：agent 不创建 issue 或 PR，上游与本 fork 都一样。\n- 改动过的上游文件只有本文件、`.gitignore`、`.prettierignore`（带标记的追加段）、`src/build/Config.zig`（补丁 GX-0001）、`build.zig`（补丁 GX-0002）、`src/config/Config.zig`（补丁 GX-0010）与归档的 workflow；fork 文件一律用上游没有的新路径（GX 共享核心在 `src/gx/`）。\n- 改上游源码必须加 `fork(gx): GX-NNNN` 标记并登记到 `docs/FORK_PATCHES.md`，`scripts/test_fork_patches.py` 锁定闭集。\n- `.github/workflows/` 只启用 `gx-ci.yml` 与 `gx-release.yml`；上游 workflow 原样归档在 `.github/workflows-archive/`，同步带来的新 workflow 也 `git mv` 进去，不得重新启用。\n- 根 `CHANGELOG.md` 只记 fork 的可观察变更（上游没有 CHANGELOG）；产品版本仍以 `build.zig.zon` 为真源。\n- 发布只经 `gx-release`（手动触发，tag `gx-vX.Y.Z`），不手工创建 release 或 tag；见 `docs/RELEASE.md`。"
+   "source_sha256": "b541b19023b7f6c844f69b24f7a7e033d0254f0bf179bec70be391929d88403b",
+   "text": "## fork 治理\n\n- 上游 `ghostty-org/ghostty`（remote `upstream`），fork `gx0404/gx_ghostty`（remote `origin`）。`main` 只快进镜像上游；`gx_ghostty` 是开发与发布分支。\n- 同步用 merge：`main` 快进到 `upstream/main` 后合入 `gx_ghostty`。永不 force push，永不推送 `upstream`；流程见 `docs/DEVELOPMENT.md`。\n- 上文 Issue and PR Guidelines 照常适用：agent 不创建 issue 或 PR，上游与本 fork 都一样。\n- 改动过的上游文件只有本文件、`.gitignore`、`.prettierignore`（带标记的追加段）、归档的 workflow，以及 `docs/FORK_PATCHES.md` 登记表列出的源码补丁（GX-NNNN）；fork 文件一律用上游没有的新路径（GX 共享核心在 `src/gx/`，GTK 的 GX 代码在 `src/apprt/gtk/gx/`）。\n- 改上游源码必须加 `fork(gx): GX-NNNN` 标记并登记到 `docs/FORK_PATCHES.md`，`scripts/test_fork_patches.py` 锁定闭集。\n- `.github/workflows/` 只启用 `gx-ci.yml` 与 `gx-release.yml`；上游 workflow 原样归档在 `.github/workflows-archive/`，同步带来的新 workflow 也 `git mv` 进去，不得重新启用。\n- 根 `CHANGELOG.md` 只记 fork 的可观察变更（上游没有 CHANGELOG）；产品版本仍以 `build.zig.zon` 为真源。\n- 发布只经 `gx-release`（手动触发，tag `gx-vX.Y.Z`），不手工创建 release 或 tag；见 `docs/RELEASE.md`。"
   },
   {
    "anchor": "Agent Development Guide > Issue and PR Guidelines",
@@ -138,36 +138,36 @@
    "anchor": "recent",
    "doc": "CHANGELOG.md",
    "id": "changelog-md-recent-part1",
-   "source_sha256": "6024ac933ffb3fe02e457fd4b7a851e0c366a625f4da5c4cd96f2afe5f6dd5da",
+   "source_sha256": "b82eabe13bbae6df9ddbef7f5bb63f3cbb60dae14e8aa0e2e0bf7528ba7a43b0",
    "text": "# Changelog（gx0404/gx_ghostty fork）\n\n本文件只记录 fork 层面的可观察变更：AI 协作框架、开发流程、构建补丁与发布链。上游 Ghostty 不维护 CHANGELOG；Ghostty 产品版本以 `build.zig.zon` 的 `.version` 为真源，本文件不复述上游产品变更，也不与产品版本同步。\n\n版本规则：\n\n- fork 版本取本文件 `## X.Y.Z(YYYY-MM-DD|TBD)` 标题中数值最大的 SemVer；`just version` 查询，`just version-check` 校验标题格式。\n- 未发布的版本写 `(TBD)`，发版时改为发布当天的日期。发布 tag 为 `gx-vX.Y.Z`，构建版本串为 `<build.zig.zon 的 X.Y.Z>-gx.<X.Y.Z>`，流程见 `docs/RELEASE.md`。\n- 每个版本按 `### Added` / `### Changed` / `### Fixed` 分节（没有条目的节省略），只写使用者能观察到的效果。\n- 本文件开头 6000 字符是知识库语料：每次修改后运行 `just kb`，把 `docs/kb/chunks.json` 与本文件放进同一个提交，否则 `gx-ci` 的 `framework` job 失败。\n\n## 0.1.0(TBD)\n\n### Added\n\n- AI 协作框架：根 `AGENTS.md` 在上游原文之后追加 fork 协作协议，`CLAUDE.md` 是薄入口；20 份领域规则放在 `docs/AGENT_RULES/`。`just rules <paths>` 按路径列出必读的领域文档和适用的上游嵌套 `AGENTS.md`，`just rules-check` 守住路由闭集、根文件体积与嵌套 `AGENTS.md` 登记。Claude Code、Codex、ZCode 的 PreToolUse hook 共用同一份危险操作策略（Codex 拦 Bash 与 `apply_patch`，后者按补丁头里的路径尽力判定；hook 命令失败或输入异常时按拒绝处理；失败关闭仅适用于已加载、受信任且确实被调用的 hook；2026-10-07 Codex 0.160.0 与 Kimi 2.1.1 新会话根规则自动注入通过，但 Codex 两条真实 shell 拦截探针失败，项目配置生效与信任流程待证；Claude/ZCode 未安装，真实接入仍待验，见 `docs/AI_TOOLS.md`）。"
   },
   {
    "anchor": "recent",
    "doc": "CHANGELOG.md",
    "id": "changelog-md-recent-part2",
-   "source_sha256": "6024ac933ffb3fe02e457fd4b7a851e0c366a625f4da5c4cd96f2afe5f6dd5da",
+   "source_sha256": "b82eabe13bbae6df9ddbef7f5bb63f3cbb60dae14e8aa0e2e0bf7528ba7a43b0",
    "text": "- just 命令入口：根 `justfile` 覆盖环境安装与诊断（`just setup`、`just doctor`）、构建与测试（`just build`、`just test`、`just test-vt`、`just build-vt`、`just vt-wasm`、`just dist-vt`）、格式化（`just fmt`、`just fmt-check`）和框架门（`just framework-check`、`just ci-check`）。配方都是单条命令，Windows（cmd、PowerShell、Git Bash）与 Linux/macOS 用法相同；参数不加引号地交给配方 shell，含空格或 `&`、`>` 等 shell 元字符的文本改为直接调用脚本（见 `docs/MAKE_COMMANDS.md`）。Windows 上 `just build` 以退出码 1 结束：默认 install 要构建的 libghostty-internal 编译不过（`src/build/SharedDeps.zig` 对所有目标翻译含 `pwd.h` 的 POSIX 头），库用 `just build-vt`。上游 `Makefile` 不变。\n- 工具链本地性：`just setup` 把钉版 Zig 0.16.0（sha256 校验）和 graphify 装进仓库内 gitignored 的 `.local/`，zig 全局缓存默认也放在 `.local/`；不做任何系统级安装。`just doctor` 只读报告必需与可选前置，Windows 上包括 MSVC，以及能否创建符号链接（未开启开发者模式时 `just test-vt` 的 tinyio 符号链接用例会失败，只作可选项提示）。\n- 代码图谱与知识库：`just graph` / `just graph-check` / `just graph-query` 重建、校验和查询 graphify 图谱（只入库 `GRAPH_REPORT.md` 与源码指纹，`graph.json` 在本机重建）；`just kb` / `just kb-check` / `just kb-query` 构建、校验和检索 `docs/kb/chunks.json`；该文件标为 `export-ignore`，不进 `git archive` 打出的源码包与 GitHub 自动生成的源码压缩包，为 libghostty-vt 源码包的 5 MiB 上限留出余量。\n- CI：`gx-ci` 在 push 与 PR 到 `gx_ghostty` 时运行框架检查（规则路由、CHANGELOG 版本标题、框架单测、知识库新鲜度、首父链提交标题）与 `zig fmt` 检查；两者通过后，Linux 上跑无 app runtime 的核心测试、libghostty-vt 测试与 ABI 清单校验，为 6 个目标（含 `wasm32-freestanding`）构建 libghostty-vt，Windows（windows-2025）上跑 libghostty-vt 测试、构建 libghostty-vt，并构建、运行 `example/c-vt-static` 静态链接示例。GTK 截图冒烟与 macOS 上的 libghostty-vt 测试需手动触发。同一 PR 的新运行会取消旧运行；push 与手动触发的运行互不取消，每次 push 的提交标题都会被检查。"
   },
   {
    "anchor": "recent",
    "doc": "CHANGELOG.md",
    "id": "changelog-md-recent-part3",
-   "source_sha256": "6024ac933ffb3fe02e457fd4b7a851e0c366a625f4da5c4cd96f2afe5f6dd5da",
+   "source_sha256": "b82eabe13bbae6df9ddbef7f5bb63f3cbb60dae14e8aa0e2e0bf7528ba7a43b0",
    "text": "- 发布：`gx-release` 只能手动触发，默认只构建并校验，产物从该次运行的 Artifacts 下载：libghostty-vt 各平台预编译库、libghostty-vt 源码包、完整源码包和实验性的 Linux GTK 包，附 `SHA256SUMS` 与 `manifest.json`；macOS 产物（libghostty-vt XCFramework 与未签名 app）需另开 `macos` 输入。只有 `publish=true` 时才以 `gx-vX.Y.Z` tag 发布为 prerelease。\n- 提交规范：提交信息使用 `type(scope): 中文描述`；`just install-hooks` 启用本地 commit-msg 校验，`gx-ci` 校验首父链上的提交。\n- 并行 Zig 测试运行器 `scripts/zig_test.py`：按 Zig 0.16 测试运行器协议（`--listen=-`）向测试二进制查询用例清单，把用例分片到 `--jobs` 个工作进程（默认等于逻辑核数），按 `.local/test-timings/` 记录的上次耗时从长到短调度。`--filter <子串>` 在运行时按用例全名过滤，不重新编译；`--seed` 固定随机种子；有用例失败时打印一条可直接复制执行的复现命令（`python scripts/zig_test.py`，带本次的 `--suite`/`--binary`、`-D`、`--zig-arg`、`--no-build` 与非默认的 `--timeout`，加 `--seed` 与引好的 `--filter <用例全名>`；用例名含空格，所以不经 just）；`--json <文件>` 写出机器可读结果；`--list` 只列出用例。判定与 `zig build` 相同：失败、内存泄漏、error 日志、崩溃、超时都算未通过。用例超时、崩溃或运行被中断时，POSIX 上杀掉测试进程所在的整个进程组，Windows 上在超时与中断时杀掉整个进程树。同一位置同时有无后缀与 `.exe` 的测试二进制时，非 Windows 主机取无后缀的，Windows 取 `.exe`。退出码：0 全部通过（跳过不算失败），1 有用例未通过，2 用法错误、构建失败或没有可运行的用例（报错区分运行期 `--filter` 没命中与构建期 `-Dtest-filter` 裁掉了全部用例），130 被中断（Ctrl+C；POSIX 上 SIGTERM、SIGHUP 也按 Ctrl+C 处理，清理后退出）。\n- 构建步骤 `test-lib-vt-bin` 与 `test-bin`（fork 补丁 GX-0002，修改 `build.zig`，见 `docs/FORK_PATCHES.md`）：只编译测试二进制并装到 `zig-out/test/`（lib-vt 的两个在 `vt/`、`vt_c/`，完整单测 `ghostty-test` 在该目录下），不运行用例；`test-bin` 遇 `-Demit-lib-vt` 以退出码 1 失败。上游已有步骤的行为与产物不变。"
   },
   {
    "anchor": "recent",
    "doc": "CHANGELOG.md",
    "id": "changelog-md-recent-part4",
-   "source_sha256": "6024ac933ffb3fe02e457fd4b7a851e0c366a625f4da5c4cd96f2afe5f6dd5da",
+   "source_sha256": "b82eabe13bbae6df9ddbef7f5bb63f3cbb60dae14e8aa0e2e0bf7528ba7a43b0",
    "text": "- Ghostty GX 共享核心 `src/gx/`（fork 补丁 GX-0010 修改 `src/config/Config.zig`，见 `docs/FORK_PATCHES.md`）：配置按「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< 设置界面的 `gui-settings.ghostty` < 命令行」分层加载。GX 默认值为主题 `GX Mocha`（加载时写入用户主题目录）、界面语言 `zh-CN`、字体链 JetBrainsMono Nerd Font → Noto Sans CJK SC → Microsoft YaHei UI（缺失的字体跳过并告警）、12 号字、内边距 10/8 并居中、闪烁块光标、右键菜单与关闭确认，Alt+1..Alt+8 留给 shell，Windows 上关闭最后一个窗口即退出；用户的 `theme` 与显式颜色照常覆盖，环境变量 `GHOSTTY_GX_DEFAULTS=0` 恢复上游加载方式。新增配置键 `gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`；`language` 只认 `zh-CN` 与 `en`，默认 `zh-CN`。界面翻译表 `src/gx/i18n/zh_CN.zig` 由 `just i18n` 从 `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` 生成，`just i18n-check` 校验并已加入 `framework-check` 与 `generated-check`。翻译、启动配置探测、进程检查与设置覆盖文件的读写模块已就绪，但 Windows 与 GTK 界面尚未接入。\n- 并行框架单测运行器 `scripts/run_unittests.py`：每个 `TestCase` 类在独立子进程里运行，默认并发取逻辑核数与 8 的较小值，按 `.local/test-timings/unittest.json` 从慢到快调度，类属性 `RUN_LAST = True` 的类最后启动。可按模块（`test_x`）、单元（`test_x.Class`）或通配符选择；退出码 0 通过，1 有失败、错误或超时，2 用法或发现错误（含选择条件没有命中），130 被中断（Ctrl+C；POSIX 上 SIGTERM、SIGHUP 也按 Ctrl+C 处理，清理子进程后退出）。"
   },
   {
    "anchor": "recent",
    "doc": "CHANGELOG.md",
    "id": "changelog-md-recent-part5",
-   "source_sha256": "6024ac933ffb3fe02e457fd4b7a851e0c366a625f4da5c4cd96f2afe5f6dd5da",
-   "text": "- WSL 入口 `just wsl`（`scripts/gx_wsl.py`）：在 Windows 上经 `wsl.exe` 驱动 WSL 里的克隆（默认 `Ubuntu-24.04` 的 `~/src/gx_ghostty`），补上本机编不出的部分。`setup` 幂等地克隆本仓、安装钉版 Zig、sha256 钉版的 blueprint-compiler 0.16.0（`~/.local/opt` 加 `~/.local/bin` shim）并预取 Zig 包（WSL 经 HTTP 代理联网时 Zig 自身取不到 HTTPS 包，改用 curl 下载后 `zig fetch` 校验 hash）；`sync` 把本仓的 ref 或某个 worktree（`--dirty` 连未提交改动）detached 检出到克隆，克隆有本地改动时拒绝；`build --gtk` 用 `-fno-sys=gtk4-layer-shell` 构建 GTK app；`test` 跑完整单测（默认同 gx-ci `linux-main` 加 `-Dapp-runtime=none`）或 lib-vt 单测；`smoke` 按 gx-ci `gtk-smoke` 的参数在 Xvfb 下截图，可切换 `--lang zh_CN|en`、执行 xdotool 脚本、换用配置文件，并把截图与日志复制回 Windows 目录；`run` 在 WSLg 桌面启动 app，`shell` 打印手工进入的方法。\n\n### Changed\n\n- 上游的 15 个 GitHub Actions workflow 原样归档到 `.github/workflows-archive/`，在本 fork 上不再运行；启用的只有 `gx-ci.yml` 与 `gx-release.yml`。"
+   "source_sha256": "b82eabe13bbae6df9ddbef7f5bb63f3cbb60dae14e8aa0e2e0bf7528ba7a43b0",
+   "text": "- WSL 入口 `just wsl`（`scripts/gx_wsl.py`）：在 Windows 上经 `wsl.exe` 驱动 WSL 里的克隆（默认 `Ubuntu-24.04` 的 `~/src/gx_ghostty`），补上本机编不出的部分。`setup` 幂等地克隆本仓、安装钉版 Zig、sha256 钉版的 blueprint-compiler 0.16.0（`~/.local/opt` 加 `~/.local/bin` shim）并预取 Zig 包（WSL 经 HTTP 代理联网时 Zig 自身取不到 HTTPS 包，改用 curl 下载后 `zig fetch` 校验 hash）；`sync` 把本仓的 ref 或某个 worktree（`--dirty` 连未提交改动）detached 检出到克隆，克隆有本地改动时拒绝；`build --gtk` 用 `-fno-sys=gtk4-layer-shell` 构建 GTK app；`test` 跑完整单测（默认同 gx-ci `linux-main` 加 `-Dapp-runtime=none`）或 lib-vt 单测；`smoke` 按 gx-ci `gtk-smoke` 的参数在 Xvfb 下截图，可切换 `--lang zh_CN|en`、执行 xdotool 脚本、换用配置文件，并把截图与日志复制回 Windows 目录；`run` 在 WSLg 桌面启动 app，`shell` 打印手工进入的方法。"
   },
   {
    "anchor": "Claude Code 薄适配",
@@ -327,8 +327,8 @@
    "anchor": "app-core：App、Surface、apprt 接口与进程入口 > 不变量 > 生命周期与所有权",
    "doc": "docs/AGENT_RULES/app-core.md",
    "id": "docs-agent-rules-app-core-md-app-core-app-surface-apprt-接口与进程入口-不变量-生命周期与所有权",
-   "source_sha256": "43281026912bcc08c8566d48fd799cdaa639c1fd429c8a1b5968b3effb8ee273",
-   "text": "### 生命周期与所有权\n\n- `Surface.init` 需要稳定指针（回调会保存它）。顺序：应用条件配置并派生 `DerivedConfig` → 从 `App.font_grid_set` 引用字体网格 → `Renderer.init`（借 `App.device`）→ 渲染线程状态与 `termio.Thread` → `termio.Exec`、SPSC mailbox、`Termio.init` → 启动 renderer 与 io 线程。`App.first` 决定是否使用 `initial-command`。\n- `Surface.deinit` 先停 search 线程，再依次通知并 join 渲染线程与 io 线程，之后才释放共享状态（renderer、termio、inspector、键盘队列、`font_grid_set.deref`、mutex、`DerivedConfig`）。新增跨线程状态同样「先 join 后释放」。\n- `App.deinit` 先销毁全部 surface，断言 `font_grid_set.count() == 0`，最后 `device.deinit()`。\n- app 线程处理 surface 消息前用 `hasSurface` 确认目标仍在；`deleteSurface` 主动清空 `focused_surface`，因为分配器会复用地址，单靠 `hasSurface` 会误判（源码注释记录过这个缺陷）。`focusedSurface` 只在主线程、`tick` 之前有效。\n- `DerivedConfig` 把所需配置复制进自己的 arena，surface 不持有 `Config` 指针。`Surface.updateConfig` 重新派生，向 renderer 发 `renderer.Message.initChangeConfig` 的结果、向 termio 发堆上的 `Termio.DerivedConfig`，并结束按键序列、停用全部 key table（它们持有旧配置里的指针）。`apprt.surface.Message.change_config` 的指针收到后即失效，必须当场派生。\n- 写往 pty 的数据统一经 `Surface.queueIo`：只读模式（`readonly`）在这里丢弃并释放 `write_*` 消息。\n- `activateInspector`/`deactivateInspector` 在 `renderer_state.mutex` 下挂上或摘下 `renderer_state.inspector`，再通知 renderer 与 termio；inspector 包本身见 `cli-inspector.md`。\n- `App.drainMailbox` 收到 `.quit` 立刻执行并返回，剩余消息留到下一次 tick。"
+   "source_sha256": "1ae0f9f31397c00de48440c18266463da03e9ed663e515b723a6ca437fad2fb7",
+   "text": "### 生命周期与所有权\n\n- `Surface.init` 需要稳定指针（回调会保存它）。顺序：应用条件配置并派生 `DerivedConfig` → 从 `App.font_grid_set` 引用字体网格 → `Renderer.init`（借 `App.device`）→ 渲染线程状态与 `termio.Thread` → `termio.Exec`、SPSC mailbox、`Termio.init` → 启动 renderer 与 io 线程。`App.first` 决定是否使用 `initial-command`。\n- `Surface.deinit` 先停 search 线程，再依次通知并 join 渲染线程与 io 线程，之后才释放共享状态（renderer、termio、inspector、键盘队列、`font_grid_set.deref`、mutex、`DerivedConfig`）。新增跨线程状态同样「先 join 后释放」。\n- `App.deinit` 先销毁全部 surface，断言 `font_grid_set.count() == 0`，最后 `device.deinit()`。\n- app 线程处理 surface 消息前用 `hasSurface` 确认目标仍在；`deleteSurface` 主动清空 `focused_surface`，因为分配器会复用地址，单靠 `hasSurface` 会误判（源码注释记录过这个缺陷）。`focusedSurface` 只在主线程、`tick` 之前有效。\n- `DerivedConfig` 把所需配置复制进自己的 arena，surface 不持有 `Config` 指针。`Surface.updateConfig` 重新派生，向 renderer 发 `renderer.Message.initChangeConfig` 的结果、向 termio 发堆上的 `Termio.DerivedConfig`，并结束按键序列、停用全部 key table（它们持有旧配置里的指针）。`apprt.surface.Message.change_config` 的指针收到后即失效，必须当场派生。\n- 写往 pty 的数据统一经 `Surface.queueIo`：只读模式（`readonly`）在这里丢弃并释放 `write_*` 消息。\n- 关闭确认统一经 `Surface.needsConfirmQuit`（各 apprt 都调用它）：只读模式恒确认、子进程已退出不确认，其余按 `confirm-close-surface`。fork 补丁 GX-0012 在 `true` 且光标不在提示符时，经 `src/gx/confirm.zig` 列出终端里的进程（Linux 为前台进程组组长及其子孙，Windows 为 shell 及其子孙），全部空闲就不确认；列进程在主线程进行，不持有 `renderer_state.mutex`。\n- `activateInspector`/`deactivateInspector` 在 `renderer_state.mutex` 下挂上或摘下 `renderer_state.inspector`，再通知 renderer 与 termio；inspector 包本身见 `cli-inspector.md`。\n- `App.drainMailbox` 收到 `.quit` 立刻执行并返回，剩余消息留到下一次 tick。"
   },
   {
    "anchor": "app-core：App、Surface、apprt 接口与进程入口 > 不变量 > 线程模型",
@@ -383,15 +383,15 @@
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 不变量",
    "doc": "docs/AGENT_RULES/apprt-gtk.md",
    "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-不变量-part1",
-   "source_sha256": "57bc139c7829dc2a9da9d98d71cc588433c8020a12d24af342b82733d002ec68",
+   "source_sha256": "c24057b4899eebad44385e82319cfba5319077858abd61d38932ff94ac566fbb",
    "text": "## 不变量\n\n- **主线程**：GTK、GLib、libadwaita 对象只在 `Application.run` 所在的主线程上操作，私有状态 `running` 只由主循环写。termio、渲染线程不调 GTK，只向核心 mailbox 投递；`src/App.zig` 投递后调 `rt_app.wakeup()`，主循环在下一次 `core_app.tick` 处理。\n- **渲染交接**：`class/render_surface.zig::RenderSurface` 在主线程的 `snapshot` 里用 `renderer.takeFrame()` 取渲染线程导出的最新帧建 `GdkTexture`；渲染初始化在渲染线程完成后才创建 core surface。帧优先以 DMABUF 导出，导入失败时调 `reportPresentationHealth(.unhealthy)`，渲染器改发 CPU 内存帧。终端 surface 不用 `GtkGLArea`（只有 inspector 的 `class/imgui_widget.zig` 在用）。\n- **GObject 生命周期**：使用模板的类在 `dispose` 里先 `gtk.Widget.disposeTemplate` 再链式调父类；属性访问器持有的私有字符串、boxed、对象在 `finalize` 释放（访问器只在 set 时替换旧值）；`WeakRef` 在宿主 `dispose` 中 `deinit`，`WeakRef.get` 返回的强引用用完要 `unref`；模板回调返回 `c_int` 而不是 Zig `bool`（`bindTemplateCallback` 编译期拒绝 `bool`）。\n- **Blueprint 登记**：每个 `.blp` 都登记在 `gresource.blueprints`，未登记的既不进 gresource 也不被 xgettext 扫描。构建要求 libadwaita 头文件不低于登记表最高版本，新增更高版本目录会抬高整个 GTK 构建的下限；多版本变体（如 `clipboard-confirmation-dialog`、`debug-warning`）在 `Class.init` 用 comptime 版本门挑选。\n- **可翻译字符串**：Zig 里立即翻译用 `i18n._(\"…\")`，先存 msgid、展示时再翻译用 `i18n.N_(\"…\")`；带上下文的 `C_(\"ctx\", \"…\")` 只能写在 `.blp`（`src/os/i18n.zig` 没有 `C_`）。只有 `createUpdateStep` 列出的输入会被抽取，在其外新增可翻译字面量时必须把文件加进该步骤。命令面板条目在 `src/input/command.zig` 用 `i18n.N_` 标记，由 `src/config/Config.zig::RepeatableCommand.init` 只在 `app_runtime == .gtk` 时翻译。"
   },
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 不变量",
    "doc": "docs/AGENT_RULES/apprt-gtk.md",
    "id": "docs-agent-rules-apprt-gtk-md-apprt-gtk-gtk-应用运行时-i18n-与-linux-桌面集成-不变量-part2",
-   "source_sha256": "57bc139c7829dc2a9da9d98d71cc588433c8020a12d24af342b82733d002ec68",
-   "text": "- **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。\n- **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。\n- **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。\n- **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。"
+   "source_sha256": "c24057b4899eebad44385e82319cfba5319077858abd61d38932ff94ac566fbb",
+   "text": "- **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。\n- **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。\n- **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。\n- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）。GX 样式与 herdr 应用模式（`src/apprt/gtk/gx/app_mode.zig`）经 fork 补丁 GX-0016 接入 `class/application.zig`、`class/window.zig`；新增 provider 按此排位，GX 逻辑放在 `src/apprt/gtk/gx/`，上游类里只留 begin/end 钩子。\n- **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。"
   },
   {
    "anchor": "apprt-gtk：GTK 应用运行时、i18n 与 Linux 桌面集成 > 禁止项",
@@ -824,8 +824,8 @@
    "anchor": "development：AI 协作框架自身 > 不变量 > fork 补丁登记",
    "doc": "docs/AGENT_RULES/development.md",
    "id": "docs-agent-rules-development-md-development-ai-协作框架自身-不变量-fork-补丁登记",
-   "source_sha256": "c134cdf98e694a48bdcd779691ee60577c72ee0218339ed907a9087c09cf560d",
-   "text": "### fork 补丁登记\n\n- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、`src/build/Config.zig`（GX-0001）、`build.zig`（GX-0002）、`src/config/Config.zig`（GX-0010）以及归档的 workflow；其余框架内容都在上游没有的新路径。\n- 改上游源码（`src/`、`include/`、`pkg/`、`macos/` 与 `build.zig`）必须紧邻改动写 `fork(gx): GX-NNNN` 标记注释，并在 `docs/FORK_PATCHES.md` 登记原因与移除条件；`scripts/test_fork_patches.py` 扫描这些路径，锁定标记与登记的闭集。追加段与新路径不是源码补丁，不登记。未登记的标记、无标记的上游语义改动都是缺陷；不为「顺手」重排或重格式化上游文件。\n- GX-0001：`src/build/Config.zig::init` 让 HEAD 上不以 `v` 开头的 tag（如 `gx-v0.1.0`）与 `tip` 一样跳过发布校验，退回分支预发布版本而不 `@panic`；版本契约见 `ci-release.md`。\n- GX-0002：`build.zig::build` 的三个纯新增块注册 `test-lib-vt-bin`、`test-bin`，只编译并安装测试二进制、不运行；安装路径与 `scripts/zig_test.py::SUITES` 一一对应，改一边要同步另一边。"
+   "source_sha256": "09106d2cb7a7d2fb6e1c651646c7f6708c5486e4a9411741fac6a18512834363",
+   "text": "### fork 补丁登记\n\n- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、归档的 workflow，以及 `docs/FORK_PATCHES.md` 登记表列出的源码补丁（GX-NNNN）；其余框架内容都在上游没有的新路径。\n- 改上游源码（`src/`、`include/`、`pkg/`、`macos/` 与 `build.zig`）必须紧邻改动写 `fork(gx): GX-NNNN` 标记注释，并在 `docs/FORK_PATCHES.md` 登记原因与移除条件；`scripts/test_fork_patches.py` 扫描这些路径，锁定标记与登记的闭集。追加段与新路径不是源码补丁，不登记。未登记的标记、无标记的上游语义改动都是缺陷；不为「顺手」重排或重格式化上游文件。\n- GX-0001：`src/build/Config.zig::init` 让 HEAD 上不以 `v` 开头的 tag（如 `gx-v0.1.0`）与 `tip` 一样跳过发布校验，退回分支预发布版本而不 `@panic`；版本契约见 `ci-release.md`。\n- GX-0002：`build.zig::build` 的三个纯新增块注册 `test-lib-vt-bin`、`test-bin`，只编译并安装测试二进制、不运行；安装路径与 `scripts/zig_test.py::SUITES` 一一对应，改一边要同步另一边。"
   },
   {
    "anchor": "development：AI 协作框架自身 > 不变量 > just 入口与四个门",
@@ -1650,8 +1650,8 @@
    "anchor": "termio-pty-os：终端 IO、子进程、pty 与 OS 辅助 > 不变量 > 平台与库约束",
    "doc": "docs/AGENT_RULES/termio-pty-os.md",
    "id": "docs-agent-rules-termio-pty-os-md-termio-pty-os-终端-io-子进程-pty-与-os-辅助-不变量-平台与库约束",
-   "source_sha256": "125444faba03cb18b3db819456687ea8bfcefb45acbb750d33e217cf057658b2",
-   "text": "### 平台与库约束\n\n- Windows 没有可运行的 app；只有 Windows 目标的 libghostty-internal 与 `ghostty-test` 会编译这些分支，而二者目前在 Windows 上都编不过（见「验证」）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`getProcessInfo` 在 Windows 上返回 null。\n- lib-vt 闭包里的 `os` 文件（见「范围」）不得引入 libc、`global.zig`、termio 或 apprt 依赖，必须能编到 `wasm32-freestanding`。\n- `src/os/` 新代码优先显式接收 `io`、`alloc`、`environ_map`（参照 `src/os/xdg.zig`、`src/os/homedir.zig`），不读全局环境。`src/os/locale.zig::ensureLocale` 会改进程环境，只在 `global.init` 里调用，并断言非测试。\n- 读管线常量（`ReadThread.buffer_count`、`buffer_capacity`、`bridge_*`、`gather_budget_ns`）的取值依据（实测数据或延迟预算）写在各自注释里，改动要给出同等证据；`src/benchmark/TerminalStream.zig` 的读缓冲刻意与 `buffer_capacity` 一致，改一处要同步另一处。"
+   "source_sha256": "daefa7037311d26021d18de0d4ef9b1d8c73b99c851f08adc6396f8b9bbea9b3",
+   "text": "### 平台与库约束\n\n- Windows 没有可运行的 app；只有 Windows 目标的 libghostty-internal 与 `ghostty-test` 会编译这些分支，而二者目前在 Windows 上都编不过（见「验证」）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）；`WindowsPty.getProcessInfo` 返回 null，fork 补丁 GX-0012 让 `Exec.Subprocess.getProcessInfo(.foreground_pid)` 在 Windows 上改报子进程（shell）的 pid，供关闭确认与 herdr 应用模式列进程（`src/gx/confirm.zig`、`src/gx/app_mode.zig`）。\n- lib-vt 闭包里的 `os` 文件（见「范围」）不得引入 libc、`global.zig`、termio 或 apprt 依赖，必须能编到 `wasm32-freestanding`。\n- `src/os/` 新代码优先显式接收 `io`、`alloc`、`environ_map`（参照 `src/os/xdg.zig`、`src/os/homedir.zig`），不读全局环境。`src/os/locale.zig::ensureLocale` 会改进程环境，只在 `global.init` 里调用，并断言非测试。\n- 读管线常量（`ReadThread.buffer_count`、`buffer_capacity`、`bridge_*`、`gather_budget_ns`）的取值依据（实测数据或延迟预算）写在各自注释里，改动要给出同等证据；`src/benchmark/TerminalStream.zig` 的读缓冲刻意与 `buffer_capacity` 一致，改一处要同步另一处。"
   },
   {
    "anchor": "termio-pty-os：终端 IO、子进程、pty 与 OS 辅助 > 不变量 > 数据流与锁",
@@ -2557,18 +2557,130 @@
    "text": "### 验证\n\n`ghostty-test` 在 Windows 上编译不过，以下命令在 Linux（或 WSL）运行：\n\n```bash\npython3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx. --filter config --filter cli.\npython3 scripts/zigw.py build -Dapp-runtime=none -Demit-webdata\npython3 -m unittest scripts.test_fork_patches -v\n```\n\n- 第一条覆盖 `src/gx/**` 全部单测（层序、主题覆盖、明暗切换、`-e`、`config-default-files=false`、诊断保留、默认值内容）与上游配置、CLI 单测。\n- 第二条运行 helpgen 与 webgen，确认新键的文档注释能生成配置文档。"
   },
   {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程",
+   "source_sha256": "95649610dd21d1642a17020abcd6602146cf1b8088d9ef9818cb50e3ebf3a8a1",
+   "text": "## GX-0012 关闭确认识别空闲进程\n\n- 文件：`src/Surface.zig`，四个纯新增块：`DerivedConfig` 的 `gx_idle_processes` 字段、`DerivedConfig.init` 里对应的赋值、`needsConfirmQuit` 的 `.true` 分支开头、紧随 `needsConfirmQuit` 之后的私有函数 `gxIdleAwayFromPrompt`；`src/termio/Exec.zig`，`Subprocess.getProcessInfo` 开头一个纯新增块。判定逻辑在新路径 `src/gx/confirm.zig`。\n- 标记：`fork(gx): GX-0012`，五块都以 `// fork(gx): GX-0012 begin: <说明>` 开头、`// fork(gx): GX-0012 end` 结尾。\n- 状态：active，未回馈上游。\n- 改动量：2 个文件，新增 37 行（含注释），不改、不删上游行。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 上游状态",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-上游状态",
+   "source_sha256": "8292003113d472ddc31f90e43b17872fb9c9a0a4a6e7b51af7e092e4085ba964",
+   "text": "### 上游状态\n\n未回馈上游。上游的提示符判断依赖 shell 集成，这个补丁只服务 Ghostty GX 的空闲进程策略；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 原因",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-原因",
+   "source_sha256": "20c77ee2c4900bb9b77f2d666e4a245e4faf68e8faf96195b9c575c2224bf36c",
+   "text": "### 原因\n\n上游 `confirm-close-surface = true` 时，只要光标不在 shell 提示符上就要确认（`Terminal.cursorIsAtPrompt`，靠 OSC 133 shell 集成）。没有 shell 集成的 shell 光标永远「不在提示符」：Windows 的 `cmd.exe` 与 PowerShell、未注入集成的 shell、`shell-integration = none`，关闭每个空闲终端都会弹确认；win32 apprt 的标题栏关闭按钮因此干脆绕开了 `needsConfirmQuit`。Ghostty GX 要求终端里只剩空闲进程（shell、shell 启动器、控制台辅助进程，即 `gx-idle-processes` 或内置列表）时不确认，运行 `vim`、`herdr`、`sleep` 等程序时照常确认。所有 apprt（GTK、win32、macOS 嵌入库）都经上游的 `Surface.needsConfirmQuit` 判断，只能在这里接入；Windows 上 `WindowsPty.getProcessInfo` 一律返回 null，核心拿不到任何 pid，所以还要在 `Exec.Subprocess.getProcessInfo` 补 Windows 分支。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 同步冲突处理",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-同步冲突处理",
+   "source_sha256": "b654324c688e7401de2af3977b8ffb6c8d72fd9ff29ffbf8e52ebb72f6ab7636",
+   "text": "### 同步冲突处理\n\n五块都是纯新增。上游改动 `needsConfirmQuit`（提示符判断、加锁方式）时，取上游版本，把 GX 块放回 `.true` 分支开头，并让 `gxIdleAwayFromPrompt` 的提示符检查与上游保持一致；`DerivedConfig` 的字段块放在 `key_remaps` 之后，赋值块放在 `.key_remaps = …` 之后、`.arena = arena` 之前。上游改动 `Subprocess.getProcessInfo` 或 `Subprocess.Process` 时，按同一语义放回 Windows 分支（Windows 上 `.foreground_pid` 返回子进程 pid）；上游自己在 Windows 上实现了 `foreground_pid` 时，删掉 `Exec.zig` 的块。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 测试锁定",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-测试锁定",
+   "source_sha256": "e0de739ba966ea2962dea8e6d4a7e122d498bf07f747d169fd6ec2750b7888fd",
+   "text": "### 测试锁定\n\n只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定由 `src/gx/confirm.zig` 的单测锁定，经 GX-0010 的 `test` 块进入 `ghostty-test`。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 移除条件",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-移除条件",
+   "source_sha256": "a1ca92725a726e5a75918a88ef0f60814433d50d328dc10eed30142b7ae7d752",
+   "text": "### 移除条件\n\n上游提供等价的「终端只剩空闲进程时不确认」机制，或 Ghostty GX 不再需要该策略时移除：删除五块与标记、`src/gx/confirm.zig`，把两行登记改为 `removed`。只有 `Exec.zig` 的块可以在上游实现 Windows `foreground_pid` 后单独移除。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 行为",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-行为",
+   "source_sha256": "243aadfa48e81d0ce9f2f4efd5e0cb4b78064d6c88a96d5486a9c25852d0950f",
+   "text": "### 行为\n\n- 只改变 `confirm-close-surface = true` 且光标不在提示符时的结论：`gxIdleAwayFromPrompt` 先按上游检查提示符（在提示符上直接交回上游，不列进程），否则把 `Surface.getProcessInfo(.foreground_pid)` 交给 `src/gx/confirm.zig::terminalNeedsConfirm`，列出该进程及其全部子孙进程；全部空闲（`src/gx/policy.zig::isIdle`，`gx-idle-processes` 为空时用内置列表）就不确认，否则仍按上游确认。`always`、`false`、只读模式与子进程已退出的语义不变。\n- 进程来源：Linux 是 pty 的前台进程组组长（`tcgetpgrp`），经 `/proc` 列出；Windows 没有前台进程组，`Subprocess.getProcessInfo(.foreground_pid)` 改为返回子进程（shell）的 pid（`GetProcessId`），经 Toolhelp32 列出。判定看整棵子树，比只看最深的子进程更保守：`gx-zsh.exe → zsh.exe → gitstatusd` 空闲；`pwsh.exe → vim.exe`、`zsh.exe → herdr.exe → zsh.exe`（herdr 里的 shell 不让 herdr 变成空闲）、shell 的后台任务都算忙。\n- 读不到进程（pid 未知、组长已退出、`/proc` 打不开，以及 Linux 与 Windows 以外的系统，如 macOS 嵌入库）时按忙处理，即保持上游结论。\n- 列进程在主线程同步进行，不持有 `renderer_state.mutex`；只在关闭与退出确认时调用，Linux 一次 `/proc` 扫描约数毫秒。\n- Windows 上 `Surface.getProcessInfo(.foreground_pid)` 原本恒为 null，现在返回 shell 的 pid。上游读它的只有 macOS 的 `ghostty_surface_foreground_pid`，Windows 不提供 C API，不受影响；win32 apprt 可直接用这个 pid 做进程判断（如 herdr 应用模式，见 `src/gx/app_mode.zig`）。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0012 关闭确认识别空闲进程 > 验证",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0012-关闭确认识别空闲进程-验证",
+   "source_sha256": "ab3533009b11d08eb400f8fbf56f254df948a1712ed4b500141dae221aeda6d0",
+   "text": "### 验证\n\n```bash\npython scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu   # Windows 分支能编译\njust wsl test --filter gx.confirm                                                # Linux 单测（-Dapp-runtime=none）\njust wsl build --gtk\npython -m unittest scripts.test_fork_patches -v\n```\n\nGTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprofile --norc`，开两个标签页，空闲标签页 `Ctrl+Shift+W` 直接关闭，运行 `sleep 100` 的标签页弹出关闭确认；Debug 构建日志里有 `gx_confirm` 的判定行。Windows：`cmd.exe`、`pwsh.exe` 空闲时关闭标签页不确认，运行 `vim` 时确认。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载",
+   "source_sha256": "1434e6e4bb0f55fafabe80b4fa0184c13e51eee57116fea679a5596357735070",
+   "text": "## GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载\n\n- 文件：`src/apprt/gtk/class/window.zig`，十个纯新增块：导入、`Private.gx_app_mode`、公开访问器 `gxAppMode`、`getTabsVisible` 与 `getHeaderbarVisible` 的判断、`connectSurfaceHandlers` 里的标题信号、`tabViewSelectedPage`、`tabViewNPages`、`tabSplitTreeChanged` 的重新判断、`dispose` 里停掉定时器；`src/apprt/gtk/class/application.zig`，四个纯新增块：导入、`Private.gx_style`、`deinit` 移除样式、`propConfig` 应用样式与 `window-theme`。逻辑在新路径 `src/apprt/gtk/gx/app_mode.zig`、`src/apprt/gtk/gx/style.zig`、`src/apprt/gtk/gx/style.css`，与平台无关的部分在共享核心 `src/gx/app_mode.zig`、`src/gx/gtk_css.zig`。\n- 标记：`fork(gx): GX-0016`，十四块都以 `// fork(gx): GX-0016 begin: <说明>` 开头、`// fork(gx): GX-0016 end` 结尾。\n- 状态：active，未回馈上游。\n- 改动量：2 个文件，新增 49 行（含注释），不改、不删上游行。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 上游状态",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-上游状态",
+   "source_sha256": "267156bf2d2edc1e292e184d4560499e091859edb7e2044b350d8c9168cb5843",
+   "text": "### 上游状态\n\n未回馈上游。herdr 应用模式与 GX 外观只服务 Ghostty GX；`window-theme` 运行时重载是上游可接受的改进，如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 原因",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-原因",
+   "source_sha256": "ac995bb52fa4ee18cf4fcd67da7eaf133ddc4a7a26f3ee3ae8e0e80dcfb52e58",
+   "text": "### 原因\n\n- herdr 应用模式（`gx-herdr-app-mode`）：窗口唯一的标签页运行 herdr 时，窗口应像独立的 herdr 应用一样呈现。标签栏是否显示由上游 `Window.getTabsVisible` 决定，判断入口、重新判断的时机（标签页增减与切换、分屏变化、终端标题变化）与窗口释放都在上游的 `window.zig` 里。\n- GX 外观：圆角标签、跟随终端主题的标签与标题栏配色、1 px 分屏线、更细的滚动条、平直的标题栏。上游的运行时 CSS 只覆盖少数配置项，`gtk-custom-css` 属于用户；GX 需要自己的 CSS provider，并在每次配置变化时重新生成颜色，加载入口 `Application.propConfig` 与清理入口 `Application.deinit` 都是上游函数。\n- `window-theme`：上游只在 `Application.startupStyleManager` 设置一次 libadwaita 的配色方案，运行时改 `window-theme` 或主题背景要重启才生效；GX 的设置界面会在运行时改配置。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 同步冲突处理",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-同步冲突处理",
+   "source_sha256": "a1292deffc2a5f511b36269ea951fc2bfe9ab22211d5927bf2cd0f450b292a0d",
+   "text": "### 同步冲突处理\n\n十四块都是纯新增，只依赖这些上游接口：`Window.getTabsVisible`、`getHeaderbarVisible`、`connectSurfaceHandlers`（与 `disconnectSurfaceHandlers` 按 `data = self` 断开全部信号）、`tabViewSelectedPage`、`tabViewNPages`、`tabSplitTreeChanged`、`dispose`、`getTabView`、`getConfig`，以及 `Application.propConfig`、`deinit`、`startupStyleManager` 的配色规则。上游重组这些函数时，把对应块放回同一语义的位置；`startupStyleManager` 的配色规则变化时同步 `src/apprt/gtk/gx/style.zig::colorScheme`。上游改动标签栏、工具栏或分屏的 CSS 节点（`tabbar tab`、`toolbarview > .top-bar`、`.split paned > separator`）时，核对 `style.css` 与 `src/gx/gtk_css.zig` 的选择器。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 测试锁定",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-测试锁定",
+   "source_sha256": "739a59d490bcab8c50b1c54c8550b481aab586a6e9ed72b109d11c17638cbe9b",
+   "text": "### 测试锁定\n\n只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定与配色由 `src/gx/app_mode.zig`、`src/gx/gtk_css.zig` 的单测锁定；GTK 胶水代码（`src/apprt/gtk/gx/`）没有单测，靠 GTK 构建与冒烟截图验证。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 移除条件",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-移除条件",
+   "source_sha256": "ec62b38cf660cd50eb297e2b539e2d89d3c83cbd6117710622253538c14c9187",
+   "text": "### 移除条件\n\nGhostty GX 不再需要 GTK 的 herdr 应用模式与 GX 外观时移除：删除全部块与标记、`src/apprt/gtk/gx/`、`src/gx/gtk_css.zig`（`src/gx/app_mode.zig` 仍供 win32 使用时保留），把两行登记改为 `removed`。上游实现运行时重设 `window-theme` 后，删除 `Style.apply` 里的配色方案调用。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 行为",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-行为",
+   "source_sha256": "469d50ca8e254d8a7d617543334733c701fda3ee0f142b7e140aaa0f0ded75bf",
+   "text": "### 行为\n\n- herdr 应用模式：`gx-herdr-app-mode = true`、窗口恰好一个标签页，且该标签页某个终端运行 herdr 时进入。判断由 `src/gx/app_mode.zig` 完成：Linux 取 `Surface.getProcessInfo(.foreground_pid)`（pty 前台进程组组长），名字是 herdr 即命中，是 shell 等内置空闲进程即未命中（herdr 至多是后台或已停止的任务），其他程序（如包装脚本）再经 `/proc` 查它下面有没有 herdr。进入后 `getTabsVisible` 返回 false，即使 `window-show-tab-bar = always` 也隐藏标签栏；退出 herdr、新开第二个标签页或关掉 `gx-herdr-app-mode` 后恢复。\n- `gtk-titlebar-style = tabs` 时窗口控制按钮、新建标签与主菜单都在标签栏里，隐藏它会让窗口无法拖动和关闭，所以应用模式下 `getHeaderbarVisible` 改为显示标题栏（启用 CSD 时）顶替标签栏；`native` 风格只隐藏标签栏。最大化且 `gtk-titlebar-hide-when-maximized` 时两者都隐藏，与上游一致。\n- 重新判断的时机：标签页数量与选中页变化、标签页分屏变化、任一终端标题变化（只读前台进程名，不扫描 `/proc`），以及窗口恰好一个标签页时每 1.5 s 一次的定时器（可扫描）。定时器在其他标签页数量时停止，`dispose` 时移除；状态变化时通知 `tabs-visible` 与 `headerbar-visible`。\n- GX 样式：独立的 CSS provider，优先级 `GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2`，高于 libadwaita 与 Ghostty 的 `style.css`，低于 Ghostty 的运行时 CSS（`+3`）与 `gtk-custom-css`（`USER`），两者仍能覆盖它。静态规则（`style.css`）：标签 8 px 圆角；默认的 `raised` 工具栏风格去掉标题栏与标签栏下方的阴影（`raised-border` 保留边线）；分屏线 1 px；滚动条变细，只作位置指示时更细。`window-theme = auto` 或 `ghostty` 时再追加由终端主题生成的颜色（`src/gx/gtk_css.zig`）：标题栏与标签栏取 `window-titlebar-background`/`-foreground`（缺省为终端背景与前景），标签悬停、按下与选中色由二者混合，选中标签描一圈 palette 4 的半透明边，分屏线取背景与前景的 15% 混合（用户设了 `split-divider-color` 时由运行时 CSS 覆盖）；`system`、`light`、`dark` 不改颜色。每次配置变化重新生成。\n- `window-theme`：每次配置变化（含启动时的首次）按 `startupStyleManager` 的同一规则重设 libadwaita 配色方案，运行时修改即时生效。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载 > 验证",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0016-gtk-herdr-应用模式-gx-样式与-window-theme-随配置重载-验证",
+   "source_sha256": "922389c4cc43280ab64c2e31d7e13bf7e135b87b8d40da20c221610b93b8fbe5",
+   "text": "### 验证\n\n```bash\njust wsl build --gtk\njust wsl test --filter gx.app_mode --filter gx.gtk_css    # 共享核心单测（-Dapp-runtime=none）\npython -m unittest scripts.test_fork_patches -v\n```\n\nGTK 冒烟（Xvfb，`just wsl smoke`）：开 2–3 个标签页与一个分屏，看圆角标签、标签配色、1 px 分屏线；`window-show-tab-bar = always` 时在唯一的标签页运行 `cp /bin/sleep /tmp/herdr && /tmp/herdr 60`，标签栏在 1.5 s 内隐藏，herdr 退出或新开标签页后恢复；`gtk-titlebar-style = tabs` 时应用模式显示标题栏。"
+  },
+  {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part1",
-   "source_sha256": "a80579385f69c4825e347dd8237fb04266703f2cf2e259659aad33c37de303c3",
+   "source_sha256": "b3d0ebba68a728b7e41b8bf9c6bcc96784bdbc6da65b3b13dc9e0f6c7d72e4db",
    "text": "## 登记表\n\n格式约定（`scripts/test_fork_patches.py` 按此解析）：\n\n- 表格位于 `fork-patches:begin` 与 `fork-patches:end` 两行注释之间，表头固定为 `ID | 文件 | 标记 | 状态`。\n- `ID` 形如 `GX-0001`；`文件` 是仓库相对的 POSIX 路径；`标记` 必须等于 `fork(gx): <ID>`；`文件` 与 `标记` 写在反引号里。\n- `状态` 取 `active`（标记必须存在于该文件）或 `removed`（标记必须已从该文件消失）。\n- 同一个 (ID, 文件) 只登记一行；每个 ID 在下文都有以 `## <ID>` 开头的小节。\n\n<!-- fork-patches:begin -->\n| ID | 文件 | 标记 | 状态 |\n|---|---|---|---|\n| GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |\n| GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |\n| GX-0003 | `src/apprt.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/action.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/runtime.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/structs.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/surface.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/build/SharedDeps.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/config/Config.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/datastruct/split_tree.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/font/face.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/input/Binding.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/main_ghostty.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |\n| GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |\n| GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part2",
-   "source_sha256": "a80579385f69c4825e347dd8237fb04266703f2cf2e259659aad33c37de303c3",
-   "text": "| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |\n| GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
+   "source_sha256": "b3d0ebba68a728b7e41b8bf9c6bcc96784bdbc6da65b3b13dc9e0f6c7d72e4db",
+   "text": "| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |\n| GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |\n| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
   },
   {
    "anchor": "fork 补丁登记 > 规则",
@@ -4023,8 +4135,8 @@
    "anchor": "structure",
    "doc": "src/apprt/gtk/class/window.zig",
    "id": "src-apprt-gtk-class-window-zig-structure",
-   "source_sha256": "9498a6562380224f3fe99e7097a7dc17e78ce3b19ae5bf4643bd479ab68fb0d0",
-   "text": "pub const Window = extern struct\n  pub const Parent = adw.ApplicationWindow\n  pub const getGObjectType\n  pub const properties = struct\n    pub const @\"active-surface\" = struct — The active surface is the focus that should be receiving all surface-targeted actions. This is usually the focused surface, but may also not be focused if the user has selected a non-surface\n      pub const name\n    pub const config = struct\n      pub const name\n    pub const debug = struct\n      pub const name\n        pub fn getter(_: *Self) bool\n    pub const @\"titlebar-style\" = struct\n      pub const name\n    pub const @\"headerbar-visible\" = struct\n      pub const name\n    pub const @\"quick-terminal\" = struct\n      pub const name\n    pub const @\"tabs-autohide\" = struct\n      pub const name\n    pub const @\"tabs-wide\" = struct\n      pub const name\n    pub const @\"tabs-visible\" = struct\n      pub const name\n    pub const @\"toolbar-style\" = struct\n      pub const name\n    pub const @\"title-override\" = struct\n      pub const name\n    pub var offset: c_int\n  pub fn new(app: *Application, overrides: struct { title: ?[:0]const u8 = null, pub const none: @This() = .{}; }) *Self\n    pub const none: @This()\n  pub fn winproto(self: *Self) *winprotopkg.Window — Winproto backend for this window.\n  pub fn newTab(self: *Self, parent_: ?*CoreSurface, overrides: Overrides) void — Create a new tab with the given parent. The tab will be inserted at the position dictated by the `window-new-tab-position` config. The new tab will be selected.\n  pub fn newTabForWindow(self: *Self, parent_: ?*CoreSurface, overrides: Overrides) void\n  pub const SelectTab = union(enum)\n  pub fn selectTab(self: *Self, n: SelectTab) bool — Select the tab as requested. Returns true if the tab selection changed.\n  pub fn moveTab(self: *Self, surface: *Surface, amount: isize) bool — Move the tab containing the given surface by the given amount. Returns if this affected any tab positioning.\n  pub fn moveTabToNewWindow(self: *Self, surface: *Surface) bool\n  pub fn toggleTabOverview(self: *Self) void\n  pub fn toggleVisibility(self: *Self) void — Toggle the visible property.\n  pub fn isQuickTerminal(self: *Self) bool — Whether this terminal is a quick terminal or not.\n  pub fn getActiveSurface(self: *Self) ?*Surface — Get the currently active surface. See the \"active-surface\" property. This does not ref the value.\n  pub fn getConfig(self: *Self) ?*Config — Returns the configuration for this window. The reference count is not increased.\n  pub fn getTabView(self: *Self) *adw.TabView — Get the tab view for this window.\n  pub fn getWindowDecoration(self: *Self) configpkg.WindowDecoration — Get the current window decoration value for this window.\n  pub fn resizeSurface(self: *Self, surface: *Surface, size: apprt.action.ResizeWindow) bool — Resize the window so that the given surface is the given size, as requested by the running program. See `apprt.action.ResizeWindow`. This is only done if the surface is the only terminal in the window\n  pub fn toggleWindowDecorations(self: *Self) void — Toggle the window decorations for this window.\n  pub fn setTitleOverride(self: *Self, title: ?[]const u8) void\n  pub fn promptWindowTitle(self: *Self) void\n  pub const as = C.as\n  pub const ref = C.ref\n  pub const unref = C.unref\n  pub const Class = extern struct\n    pub const Instance = Self\n    pub const as = C.Class.as\n    pub const bindTemplateChildPrivate = C.Class.bindTemplateChildPrivate\n    pub const bindTemplateCallback = C.Class.bindTemplateCallback"
+   "source_sha256": "60e94a1ffaae7396e2310262e6232334255ed0b58a820a8174614deb717bca74",
+   "text": "pub const Window = extern struct\n  pub const Parent = adw.ApplicationWindow\n  pub const getGObjectType\n  pub const properties = struct\n    pub const @\"active-surface\" = struct — The active surface is the focus that should be receiving all surface-targeted actions. This is usually the focused surface, but may also not be focused if the user has selected a non-surface\n      pub const name\n    pub const config = struct\n      pub const name\n    pub const debug = struct\n      pub const name\n        pub fn getter(_: *Self) bool\n    pub const @\"titlebar-style\" = struct\n      pub const name\n    pub const @\"headerbar-visible\" = struct\n      pub const name\n    pub const @\"quick-terminal\" = struct\n      pub const name\n    pub const @\"tabs-autohide\" = struct\n      pub const name\n    pub const @\"tabs-wide\" = struct\n      pub const name\n    pub const @\"tabs-visible\" = struct\n      pub const name\n    pub const @\"toolbar-style\" = struct\n      pub const name\n    pub const @\"title-override\" = struct\n      pub const name\n    pub var offset: c_int\n  pub fn new(app: *Application, overrides: struct { title: ?[:0]const u8 = null, pub const none: @This() = .{}; }) *Self\n    pub const none: @This()\n  pub fn winproto(self: *Self) *winprotopkg.Window — Winproto backend for this window.\n  pub fn newTab(self: *Self, parent_: ?*CoreSurface, overrides: Overrides) void — Create a new tab with the given parent. The tab will be inserted at the position dictated by the `window-new-tab-position` config. The new tab will be selected.\n  pub fn newTabForWindow(self: *Self, parent_: ?*CoreSurface, overrides: Overrides) void\n  pub const SelectTab = union(enum)\n  pub fn selectTab(self: *Self, n: SelectTab) bool — Select the tab as requested. Returns true if the tab selection changed.\n  pub fn moveTab(self: *Self, surface: *Surface, amount: isize) bool — Move the tab containing the given surface by the given amount. Returns if this affected any tab positioning.\n  pub fn moveTabToNewWindow(self: *Self, surface: *Surface) bool\n  pub fn toggleTabOverview(self: *Self) void\n  pub fn toggleVisibility(self: *Self) void — Toggle the visible property.\n  pub fn isQuickTerminal(self: *Self) bool — Whether this terminal is a quick terminal or not.\n  pub fn getActiveSurface(self: *Self) ?*Surface — Get the currently active surface. See the \"active-surface\" property. This does not ref the value.\n  pub fn getConfig(self: *Self) ?*Config — Returns the configuration for this window. The reference count is not increased.\n  pub fn getTabView(self: *Self) *adw.TabView — Get the tab view for this window.\n  pub fn gxAppMode(self: *Self) *gx_app_mode.AppMode\n  pub fn getWindowDecoration(self: *Self) configpkg.WindowDecoration — Get the current window decoration value for this window.\n  pub fn resizeSurface(self: *Self, surface: *Surface, size: apprt.action.ResizeWindow) bool — Resize the window so that the given surface is the given size, as requested by the running program. See `apprt.action.ResizeWindow`. This is only done if the surface is the only terminal in the window\n  pub fn toggleWindowDecorations(self: *Self) void — Toggle the window decorations for this window.\n  pub fn setTitleOverride(self: *Self, title: ?[]const u8) void\n  pub fn promptWindowTitle(self: *Self) void\n  pub const as = C.as\n  pub const ref = C.ref\n  pub const unref = C.unref\n  pub const Class = extern struct\n    pub const Instance = Self\n    pub const as = C.Class.as\n    pub const bindTemplateChildPrivate = C.Class.bindTemplateChildPrivate\n    pub const bindTemplateCallback = C.Class.bindTemplateCallback"
   },
   {
    "anchor": "structure",
@@ -4074,6 +4186,20 @@
    "id": "src-apprt-gtk-gtk-version-zig-structure",
    "source_sha256": "4a67525d95b08950ca964d976c00480e8d564eec59489a88e9db2b469ef98b5e",
    "text": "pub const comptime_version: std.SemanticVersion\npub fn getRuntimeVersion() std.SemanticVersion\npub fn logVersion() void\npub inline fn atLeast(comptime major: u16, comptime minor: u16, comptime micro: u16) bool — Verifies that the GTK version is at least the given version. This can be run in both a comptime and runtime context. If it is run in a comptime context, it will only check the version in the headers. If it is\npub inline fn runtimeAtLeast(comptime major: u16, comptime minor: u16, comptime micro: u16) bool — Verifies that the GTK version at runtime is at least the given version. This function should be used in cases where the only the runtime behavior is affected by the version check. For checks which would affect code\npub inline fn runtimeUntil(comptime major: u16, comptime minor: u16, comptime micro: u16) bool"
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/app_mode.zig",
+   "id": "src-apprt-gtk-gx-app-mode-zig-structure",
+   "source_sha256": "460e6abfea6173036668dfe28b2fda73eb6848b9389a1303800c0284d06ba82f",
+   "text": "//! herdr app mode for GTK windows (fork patch GX-0016). While the only tab\n//! of a window runs herdr (see `src/gx/app_mode.zig`) and\n//! `gx-herdr-app-mode` is on, `Window.getTabsVisible` hides the tab bar,\n//! so herdr looks like a standalone application. With\n//! `gtk-titlebar-style = tabs` the tab bar also holds the window controls,\n//! the new tab button and the main menu, so `Window.getHeaderbarVisible`\n//! shows the header bar in its place and the window stays usable.\n//!\n//! A window re-evaluates when its number of pages, its selected page or\n//! the splits of a tab change, when a terminal title changes (shells and\n//! herdr set titles as programs start and exit), and every `interval_ms`\n//! while it has exactly one tab. A title change only reads the name of the\n//! foreground process; the other events may also list the processes below\n//! it when that name is not conclusive.\npub const interval_ms — How often a window with exactly one tab re-evaluates herdr app mode.\npub const AppMode = struct — The herdr app mode state of a window, kept in its private data.\n  pub fn update(self: *AppMode, window: *Window, scan: bool) void — Re-evaluates herdr app mode, then starts or stops the timer. `scan` allows listing processes (see `gx_app_mode.terminalRunsHerdr`).\n  pub fn deinit(self: *AppMode) void — Stops the timer for good. Call it when the window is disposed, before its children are.\npub fn connectSurface(window: *Window, surface: *Surface) void — Re-evaluates herdr app mode when the title of `surface` changes. `Window.connectSurfaceHandlers` calls this for every surface; the handler is disconnected with the window's other surface handlers."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/apprt/gtk/gx/style.zig",
+   "id": "src-apprt-gtk-gx-style-zig-structure",
+   "source_sha256": "44e006c02b3e1f745b786f9fbdb3504f850ebfcd9cf752fb26d439b0421d8fd6",
+   "text": "//! The Ghostty GX look of the GTK app (fork patch GX-0016): the static\n//! rules in `style.css` plus colors derived from the terminal theme\n//! (`src/gx/gtk_css.zig`), in a CSS provider of its own. `Style.apply` runs\n//! from `Application.propConfig` on startup and on every configuration\n//! change; it also applies `window-theme` to the style manager, which\n//! upstream does only once in `Application.startupStyleManager`.\npub const priority — Above libadwaita and Ghostty's `style.css` (`APPLICATION`), below Ghostty's runtime CSS (`APPLICATION + 3`) and `gtk-custom-css` (`USER`).\npub const static_css — The static rules, independent of the configuration.\npub const Style = struct — The Ghostty GX stylesheet of the application.\n  pub fn apply(self: *Style, app: *adw.Application, config: *const CoreConfig) void — Applies `window-theme` and loads the stylesheet for `config`, adding the provider to the default display the first time.\n  pub fn deinit(self: *Style) void — Removes the provider from the display.\npub fn colorScheme(config: *const CoreConfig) adw.ColorScheme — The style manager color scheme for `window-theme`, as `Application.startupStyleManager` computes it.\npub fn writeCss(writer: *std.Io.Writer, config: *const CoreConfig) std.Io.Writer.Error!void — Writes the whole stylesheet for `config`: the static rules, then the colors when the window follows the terminal colors."
   },
   {
    "anchor": "structure",
@@ -5722,6 +5848,13 @@
   },
   {
    "anchor": "structure",
+   "doc": "src/gx/app_mode.zig",
+   "id": "src-gx-app-mode-zig-structure",
+   "source_sha256": "7825bd95697e38a797ff6996d726b456c6f22f411aa32826a75d7c2b50a1a2cc",
+   "text": "//! herdr app mode for Ghostty GX: while the only tab of a window runs\n//! herdr, the window presents herdr like a standalone application (the\n//! GTK apprt hides the tab bar; see `gx-herdr-app-mode`). The apprts ask\n//! `terminalRunsHerdr` about every terminal of a window's only tab,\n//! passing what `Surface.getProcessInfo(.foreground_pid)` reports, and\n//! combine the answers with `decide`.\n//!\n//! On Linux that pid is the foreground process group leader of the pty,\n//! so herdr counts while it runs in the foreground: herdr itself, or a\n//! program such as a wrapper script that runs herdr below it. A shell in\n//! the foreground means herdr is not running there (at most as a stopped\n//! or background job) and needs no process scan, which keeps the periodic\n//! check of an idle window down to reading one `comm` file. On Windows the\n//! pid is the terminal's child process (normally the shell), so herdr\n//! anywhere below it counts and every check lists the processes.\npub const Foreground = enum — What the name of a terminal's foreground process says about herdr.\npub fn classify(name: []const u8) Foreground — Classifies the name of a terminal's foreground process.\npub fn decide(enabled: bool, tab_count: usize, answers: []const ?bool, current: bool) bool — Whether a window is in herdr app mode, given `enabled` (`gx-herdr-app-mode`), its number of tabs and the `terminalRunsHerdr` answers for the terminals of its tab. Any terminal running herdr turns\npub fn terminalRunsHerdr(alloc: Allocator, io: std.Io, root: ?u64, scan: bool) ?bool — Whether the terminal whose `Surface.getProcessInfo(.foreground_pid)` is `root` runs herdr (see the module documentation). With `scan` false, answers that need a list of processes (Linux: the foreground process\npub fn procRunsHerdr(alloc: Allocator, io: std.Io, proc_dir: std.Io.Dir, root: proc.Pid, scan: bool) Allocator.Error!?bool — `terminalRunsHerdr` for Linux, reading a procfs layout from `proc_dir` (normally `/proc`)."
+  },
+  {
+   "anchor": "structure",
    "doc": "src/gx/config_layers.zig",
    "id": "src-gx-config-layers-zig-structure",
    "source_sha256": "a7d02692781082f480e9c1c322508a509be5be2ea0dd91f4e48d528ca8a192ab",
@@ -5733,6 +5866,20 @@
    "id": "src-gx-config-types-zig-structure",
    "source_sha256": "dbf99023c815e4eac5e48380ee21df16f5928974993f7fa9963ed67dce048715",
    "text": "//! Value types of the Ghostty GX configuration keys (`gx-*` in\n//! `src/config/Config.zig`).\npub const WindowMaterial = enum — Valid values for `gx-window-material`.\npub const OpenConfigUi = enum — Valid values for `gx-open-config-ui`."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/gx/confirm.zig",
+   "id": "src-gx-confirm-zig-structure",
+   "source_sha256": "5810260f25923e7963c3173adc1c699094429872f47db77102c70296656b5e83",
+   "text": "//! Close confirmation for Ghostty GX. With `confirm-close-surface = true`,\n//! upstream Ghostty asks before closing a terminal whose cursor is not at a\n//! shell prompt, which is every terminal whose shell lacks shell\n//! integration (for example `cmd.exe` and PowerShell on Windows). Ghostty\n//! GX also skips the question when every process running in the terminal\n//! is idle: a shell, a shell launcher or a console helper (see\n//! `policy.isIdle` and `gx-idle-processes`).\n//!\n//! `src/Surface.zig::needsConfirmQuit` (fork patch GX-0012) passes the pid\n//! that `Surface.getProcessInfo(.foreground_pid)` reports: the foreground\n//! process group leader of the pty on POSIX, and the terminal's child\n//! process (normally the shell) on Windows, which has no foreground\n//! process groups. `terminalNeedsConfirm` checks that process and all of\n//! its descendants, so `gx-zsh.exe` running `zsh.exe` is idle, while a\n//! shell running `vim`, `herdr`, a script or a background job is busy.\npub fn needsConfirm(names: []const []const u8, idle_list: []const [:0]const u8) bool — Returns true if closing a terminal running the processes `names` needs confirmation: false only when every process is idle according to `idle_list` (the `gx-idle-processes` values; empty selects the built-in\npub fn terminalNeedsConfirm(alloc: Allocator, io: std.Io, root: ?u64, idle_list: []const [:0]const u8) bool — `needsConfirm` for the processes of a terminal: `root` (see the module documentation) and all of its descendants. Returns true when `root` is null or the processes cannot be read, including on systems other than\npub const windows — Windows helpers for the termio backend, which only knows the child process by its handle.\n  pub fn processId(handle: win.HANDLE) ?u64 — The process id of the process `handle`, or null if it is unknown."
+  },
+  {
+   "anchor": "structure",
+   "doc": "src/gx/gtk_css.zig",
+   "id": "src-gx-gtk-css-zig-structure",
+   "source_sha256": "dd6d718091970e236dd897525d9845bf98ed90942af082716591604f1660bcb5",
+   "text": "//! The colors of the Ghostty GX look for the GTK app, as CSS derived from\n//! the terminal theme: the header bar and tab bar take the titlebar colors\n//! (the terminal background and foreground unless `window-titlebar-*` is\n//! set), tabs get hover and selected shades mixed from them, the selected\n//! tab an outline in the theme's blue (palette color 4), and split\n//! dividers a line between the terminal background and foreground.\n//! `src/apprt/gtk/gx/style.zig` appends the output of `write` to the\n//! static rules in `src/apprt/gtk/gx/style.css`. It is plain text\n//! generation without GTK so the core test suite covers it.\npub const Rgb = struct\n  pub fn format(self: Rgb, writer: *std.Io.Writer) std.Io.Writer.Error!void\npub const Rgba = struct — An `Rgb` with an opacity, formatted as CSS `rgba()`.\n  pub fn format(self: Rgba, writer: *std.Io.Writer) std.Io.Writer.Error!void\npub const Colors = struct\npub fn fromConfig(config: *const Config) ?Colors — The colors of the GX look for `config`, or null unless the window follows the terminal colors (`window-theme = auto` or `ghostty`); with `system`, `light` and `dark` the header bar keeps the libadwaita colors.\npub fn mix(a: Rgb, b: Rgb, t: f32) Rgb — `a` moved towards `b` by `t` (0 is `a`, 1 is `b`), per channel and rounded to the nearest value.\npub fn write(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void — Writes the color rules for `colors`."
   },
   {
    "anchor": "structure",
@@ -5759,8 +5906,8 @@
    "anchor": "structure",
    "doc": "src/gx/main.zig",
    "id": "src-gx-main-zig-structure",
-   "source_sha256": "12def1177f9c4f0923ed28c0d82bbf629eb184c9e77ef37435077d33120fe94c",
-   "text": "//! Ghostty GX core modules shared by the win32 and GTK apprts: UI language\n//! and translations, the settings overlay, configuration layering, launch\n//! profiles, process inspection and process policies.\npub const config_layers = @import(\"config_layers.zig\")\npub const config_types = @import(\"config_types.zig\")\npub const gui_settings = @import(\"gui_settings.zig\")\npub const i18n = @import(\"i18n.zig\")\npub const policy = @import(\"policy.zig\")\npub const proc = @import(\"proc.zig\")\npub const profiles = @import(\"profiles.zig\")\npub const theme = @import(\"theme.zig\")"
+   "source_sha256": "351dc0817f916de367e4d874cdc1de7975c91b4388a0e6c54b427ec865d61c46",
+   "text": "//! Ghostty GX core modules shared by the win32 and GTK apprts: UI language\n//! and translations, the settings overlay, configuration layering, launch\n//! profiles, process inspection and process policies, close confirmation,\n//! herdr app mode and the colors of the GTK look.\npub const app_mode = @import(\"app_mode.zig\")\npub const config_layers = @import(\"config_layers.zig\")\npub const config_types = @import(\"config_types.zig\")\npub const confirm = @import(\"confirm.zig\")\npub const gtk_css = @import(\"gtk_css.zig\")\npub const gui_settings = @import(\"gui_settings.zig\")\npub const i18n = @import(\"i18n.zig\")\npub const policy = @import(\"policy.zig\")\npub const proc = @import(\"proc.zig\")\npub const profiles = @import(\"profiles.zig\")\npub const theme = @import(\"theme.zig\")"
   },
   {
    "anchor": "structure",

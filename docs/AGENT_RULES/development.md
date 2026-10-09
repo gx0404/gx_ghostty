@@ -73,7 +73,7 @@
 
 ### fork 补丁登记
 
-- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、`src/build/Config.zig`（GX-0001）、`build.zig`（GX-0002）、`src/config/Config.zig`（GX-0010）以及归档的 workflow；其余框架内容都在上游没有的新路径。
+- 改动过的上游文件只有：`AGENTS.md`（标记后追加）、`.gitignore` 与 `.prettierignore`（末尾带标记的追加段）、归档的 workflow，以及 `docs/FORK_PATCHES.md` 登记表列出的源码补丁（GX-NNNN）；其余框架内容都在上游没有的新路径。
 - 改上游源码（`src/`、`include/`、`pkg/`、`macos/` 与 `build.zig`）必须紧邻改动写 `fork(gx): GX-NNNN` 标记注释，并在 `docs/FORK_PATCHES.md` 登记原因与移除条件；`scripts/test_fork_patches.py` 扫描这些路径，锁定标记与登记的闭集。追加段与新路径不是源码补丁，不登记。未登记的标记、无标记的上游语义改动都是缺陷；不为「顺手」重排或重格式化上游文件。
 - GX-0001：`src/build/Config.zig::init` 让 HEAD 上不以 `v` 开头的 tag（如 `gx-v0.1.0`）与 `tip` 一样跳过发布校验，退回分支预发布版本而不 `@panic`；版本契约见 `ci-release.md`。
 - GX-0002：`build.zig::build` 的三个纯新增块注册 `test-lib-vt-bin`、`test-bin`，只编译并安装测试二进制、不运行；安装路径与 `scripts/zig_test.py::SUITES` 一一对应，改一边要同步另一边。

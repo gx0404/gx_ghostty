@@ -53,6 +53,7 @@
 - **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。
 - **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。
 - **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。
+- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）。GX 样式与 herdr 应用模式（`src/apprt/gtk/gx/app_mode.zig`）经 fork 补丁 GX-0016 接入 `class/application.zig`、`class/window.zig`；新增 provider 按此排位，GX 逻辑放在 `src/apprt/gtk/gx/`，上游类里只留 begin/end 钩子。
 - **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。
 
 ## 禁止项
