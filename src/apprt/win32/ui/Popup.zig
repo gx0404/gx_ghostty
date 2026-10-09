@@ -132,6 +132,7 @@ const WM_NCHITTEST: u32 = 0x0084;
 const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_RBUTTONDBLCLK: u32 = 0x0206;
 const WM_IME_CHAR: u32 = 0x0286;
+const SW_PARENTOPENING: isize = 3;
 
 /// Create the (hidden) popup window owned by `owner`.
 pub fn create(
@@ -249,9 +250,12 @@ pub fn setBounds(self: *Popup, rect: w32.RECT) void {
 
 /// Hide without reporting a dismissal.
 pub fn hide(self: *Popup) void {
-    if (!self.visible) return;
+    const was_visible = self.visible;
     self.visible = false;
     const hwnd = self.hwnd orelse return;
+    // The window can be visible behind a stale flag (shown by something
+    // else than `show`), so check it too.
+    if (!was_visible and w32.IsWindowVisible_(hwnd) == 0) return;
     if (self.options.capture_mouse and w32.GetCapture() == hwnd) _ = w32.ReleaseCapture();
     _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
 }
@@ -612,7 +616,9 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     _ = w32.BeginPaint(hwnd, &ps);
     defer _ = w32.EndPaint(hwnd, &ps);
     const cb = self.callbacks orelse return;
-    const canvas = &(self.canvas orelse return);
+    // The canvas keeps its render target between paints: borrow it, don't
+    // copy it.
+    const canvas = if (self.canvas) |*canvas| canvas else return;
     if (!canvas.beginHwnd(hwnd, self.dpi)) return;
     canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
     cb.paint(cb.ctx, self, canvas);
@@ -693,6 +699,13 @@ fn wndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_ERASEBKGND => return 1,
+        w32.WM_SHOWWINDOW => {
+            // Restoring the owner shows the popups that minimizing it hid,
+            // including one hidden in the meantime (a find bar whose
+            // search ended): keep that one hidden.
+            if (wparam != 0 and lparam == SW_PARENTOPENING and !self.visible) return 0;
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_PAINT => {
             self.paint(hwnd);
             return 0;

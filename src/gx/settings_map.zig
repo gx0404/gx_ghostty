@@ -384,6 +384,86 @@ fn appendWindowsQuoted(alloc: Allocator, out: *std.ArrayList(u8), arg: []const u
     try out.append(alloc, '"');
 }
 
+/// The launch profile that the `command` configuration starts, as an index
+/// into `list`: the profile whose `profileCommand` is `command` (what the
+/// settings UI writes), else the first profile that runs the same program
+/// without arguments (`cmd.exe` is `C:\Windows\system32\cmd.exe`). Without
+/// a `command`, the platform's default profile. Allocates temporary text
+/// with `alloc` (an arena).
+pub fn commandProfile(
+    alloc: Allocator,
+    list: []const profiles.Profile,
+    command: ?Config.Command,
+    platform: profiles.Platform,
+) Allocator.Error!?usize {
+    const configured = command orelse {
+        const fallback = profiles.defaultProfile(list, platform) orelse return null;
+        for (list, 0..) |*profile, i| {
+            if (profile == fallback) return i;
+        }
+        return null;
+    };
+
+    const text = try commandText(alloc, configured);
+    for (list, 0..) |profile, i| {
+        if (std.mem.eql(u8, try profileCommand(alloc, profile, platform), text)) return i;
+    }
+
+    const program = programName(configured, platform);
+    if (program.len == 0) return null;
+    for (list, 0..) |profile, i| switch (profile.command) {
+        .argv => |argv| if (argv.len == 1 and samePath(programName(.{ .direct = argv }, platform), program, platform)) return i,
+        .command_line => {},
+    };
+    return null;
+}
+
+/// `command` in configuration syntax, the way `profileCommand` writes it.
+fn commandText(alloc: Allocator, command: Config.Command) Allocator.Error![]const u8 {
+    switch (command) {
+        .shell => |line| return line,
+        .direct => |args| {
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(alloc, "direct:");
+            for (args, 0..) |arg, i| {
+                if (i > 0) try out.append(alloc, ' ');
+                try out.appendSlice(alloc, arg);
+            }
+            return out.items;
+        },
+    }
+}
+
+/// The file name of the program `command` runs (on Windows without
+/// `.exe`).
+fn programName(command: Config.Command, platform: profiles.Platform) []const u8 {
+    const program = switch (command) {
+        .direct => |args| if (args.len > 0) args[0] else "",
+        .shell => |line| first: {
+            const trimmed = std.mem.trimStart(u8, line, " \t");
+            if (trimmed.len > 0 and (trimmed[0] == '"' or trimmed[0] == '\'')) {
+                const end = std.mem.indexOfScalarPos(u8, trimmed, 1, trimmed[0]) orelse trimmed.len;
+                break :first trimmed[1..end];
+            }
+            break :first trimmed[0 .. std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len];
+        },
+    };
+    return switch (platform) {
+        .linux => std.fs.path.basenamePosix(program),
+        .windows => windows: {
+            const name = std.fs.path.basenameWindows(program);
+            break :windows if (std.ascii.endsWithIgnoreCase(name, ".exe")) name[0 .. name.len - ".exe".len] else name;
+        },
+    };
+}
+
+fn samePath(a: []const u8, b: []const u8, platform: profiles.Platform) bool {
+    return switch (platform) {
+        .linux => std.mem.eql(u8, a, b),
+        .windows => std.ascii.eqlIgnoreCase(a, b),
+    };
+}
+
 /// Settings changed in a settings UI and not saved yet, in the order they
 /// were first changed. A UI collects changes for a moment and then
 /// `commit`s them, so rapid edits write the overlay file once.
@@ -712,6 +792,46 @@ test "profileCommand direct commands parse back to the arguments" {
     const parsed = cfg.command.?.direct;
     try testing.expectEqual(argv.len, parsed.len);
     for (argv, parsed) |e, a| try testing.expectEqualStrings(e, a);
+}
+
+test "commandProfile finds the profile a command starts" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const windows = [_]profiles.Profile{
+        .{ .id = "gx-zsh", .name = "GX Zsh", .command = .{ .argv = &.{"C:\\GX\\bin\\gx-zsh.exe"} }, .kind = .gx_zsh },
+        .{ .id = "pwsh", .name = "PowerShell 7", .command = .{ .argv = &.{"C:\\Program Files\\PowerShell\\7\\pwsh.exe"} }, .kind = .pwsh },
+        .{ .id = "cmd", .name = "Command Prompt", .command = .{ .argv = &.{"C:\\Windows\\system32\\cmd.exe"} }, .kind = .cmd },
+        .{ .id = "git-bash", .name = "Git Bash", .command = .{ .argv = &.{ "C:\\Git\\bin\\bash.exe", "-i", "-l" } }, .kind = .git_bash },
+        .{ .id = "custom:Py", .name = "Py", .command = .{ .command_line = "python -i" }, .kind = .custom },
+    };
+    const cases = [_]struct { ?Config.Command, ?usize }{
+        // What the settings UI writes.
+        .{ .{ .direct = &.{"C:\\GX\\bin\\gx-zsh.exe"} }, 0 },
+        .{ .{ .shell = "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\"" }, 1 },
+        .{ .{ .direct = &.{ "C:\\Git\\bin\\bash.exe", "-i", "-l" } }, 3 },
+        .{ .{ .shell = "python -i" }, 4 },
+        // The same program spelled differently.
+        .{ .{ .shell = "cmd.exe" }, 2 },
+        .{ .{ .shell = "PWSH -NoLogo" }, 1 },
+        .{ .{ .shell = "bash" }, null },
+        .{ .{ .shell = "nvim" }, null },
+        // Without a command, the default profile.
+        .{ null, 0 },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(case[1], try commandProfile(alloc, &windows, case[0], .windows));
+    }
+
+    const linux = [_]profiles.Profile{
+        .{ .id = "login-shell", .name = "Login Shell", .command = .{ .argv = &.{"/bin/bash"} }, .kind = .login_shell },
+        .{ .id = "zsh", .name = "Zsh", .command = .{ .argv = &.{"/usr/bin/zsh"} }, .kind = .zsh },
+    };
+    try testing.expectEqual(@as(?usize, 0), try commandProfile(alloc, &linux, .{ .shell = "/bin/bash" }, .linux));
+    try testing.expectEqual(@as(?usize, 1), try commandProfile(alloc, &linux, .{ .direct = &.{"/usr/bin/zsh"} }, .linux));
+    try testing.expectEqual(@as(?usize, null), try commandProfile(alloc, &linux, .{ .shell = "ZSH" }, .linux));
+    try testing.expectEqual(@as(?usize, 0), try commandProfile(alloc, &linux, null, .linux));
 }
 
 test "Changes keep the first position and the last value" {

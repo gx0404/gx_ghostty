@@ -8,6 +8,11 @@
 //! (`palette`), `ui/SearchBar.zig` (`search_bar`), `ui/LinkPreview.zig`
 //! (`link_preview`), the context menu in `ui/Menu.zig` and the
 //! confirmations in `ui/Dialogs.zig`.
+//!
+//! Clipboard access that another application blocks is retried from
+//! timers; dropped and pasted files are quoted for the shell running in
+//! the terminal (`gx.path_quote`). The renderer thread reports frames
+//! (`signalFrameDrawn`) and GPU resets (`gpuContextReset`) back here.
 const Surface = @This();
 
 const std = @import("std");
@@ -20,6 +25,9 @@ const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 const global = @import("../../global.zig");
 const gx_win32_input = @import("../../gx/win32_input.zig");
+const gx_confirm = @import("../../gx/confirm.zig");
+const gx_proc = @import("../../gx/proc.zig");
+const path_quote = @import("../../gx/path_quote.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
@@ -116,6 +124,14 @@ in_live_resize: bool = false,
 /// live resize to synchronize rendering with the DWM compositor.
 frame_event: ?w32.HANDLE = null,
 
+/// Set by `handleResize` during a live resize after it asked the renderer
+/// for a frame at the new size, until something waited for that frame.
+resize_frame_pending: bool = false,
+
+/// Set by WM_GHOSTTY_SIMULATE_GPU_RESET, taken by the renderer thread
+/// (`takeSimulatedGpuReset`).
+simulate_gpu_reset: std.atomic.Value(bool) = .init(false),
+
 /// Themed scrollbar (custom layered-popup overlay).
 /// Created lazily after the surface HWND exists.
 scrollbar: ?*Scrollbar = null,
@@ -147,6 +163,16 @@ last_reported_visible: ?bool = null,
 
 /// Command palette popup (see ui/Palette.zig).
 palette: Palette = .{},
+
+/// Clipboard accesses waiting for another application to close the
+/// clipboard (see `retryClipboardRead` and `writeClipboard`).
+pending_clipboard_read: ?PendingClipboardRead = null,
+pending_clipboard_write: ?PendingClipboardWrite = null,
+
+/// The command this terminal was started with instead of the configured
+/// one (`InitOptions.command`, e.g. a launch profile), so that its tab can
+/// be duplicated (see ui/Menu.zig).
+launch_command: ?configpkg.Command = null,
 
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
@@ -301,10 +327,15 @@ pub fn initWithOptions(
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
         config.@"shell-integration" = .detect;
+        self.launch_command = try command.clone(alloc);
     } else if (app.default_command) |command| {
         // `command` is not configured: the default launch profile.
         config.command = try command.clone(config.arenaAlloc());
     }
+    errdefer if (self.launch_command) |*command| {
+        command.deinit(alloc);
+        self.launch_command = null;
+    };
     if (options.title) |title| {
         config.title = try config.arenaAlloc().dupeZ(u8, title);
     }
@@ -344,6 +375,11 @@ pub fn deinit(self: *Surface) void {
     }
     log.debug("surface deinit: frame_event closed", .{});
 
+    if (self.launch_command) |*command| {
+        command.deinit(self.app.core_app.alloc);
+        self.launch_command = null;
+    }
+
     if (self.hdc) |hdc| {
         if (self.hwnd) |hwnd| {
             log.debug("surface deinit: ReleaseDC", .{});
@@ -359,6 +395,16 @@ pub fn deinit(self: *Surface) void {
 /// Destroy resources only the GUI thread touches: the scrollbar, popup
 /// windows, GDI objects, and the GWLP_USERDATA back-pointer.
 fn deinitGui(self: *Surface) void {
+    // Drop clipboard accesses still waiting for the clipboard.
+    if (self.hwnd) |hwnd| {
+        _ = w32.KillTimer(hwnd, CLIPBOARD_READ_TIMER);
+        _ = w32.KillTimer(hwnd, CLIPBOARD_WRITE_TIMER);
+    }
+    if (self.pending_clipboard_read) |pending| destroyClipboardRequest(pending.state);
+    self.pending_clipboard_read = null;
+    if (self.pending_clipboard_write) |pending| _ = w32.GlobalFree(pending.data);
+    self.pending_clipboard_write = null;
+
     // Destroy the themed scrollbar before the surface HWND is gone.
     if (self.scrollbar) |sb| {
         sb.destroy();
@@ -447,8 +493,10 @@ pub fn getTitle(self: *const Surface) ?[:0]const u8 {
 /// then drop.
 pub fn setVisible(self: *Surface, visible: bool) void {
     // Hide the hovered-URL bubble when this surface is occluded so a stale
-    // preview doesn't float over the newly-active tab.
+    // preview doesn't float over the newly-active tab, and the find bar
+    // with the surface (it stays open and comes back with it).
     if (!visible) self.link_preview.hide();
+    self.search_bar.setOwnerVisible(visible);
     if (!self.core_surface_ready) return;
     if (self.last_reported_visible == visible) return;
     self.last_reported_visible = visible;
@@ -481,16 +529,35 @@ pub fn close(self: *Surface, process_active: bool) void {
 }
 
 /// Handle `WM_APP_CONFIRM_CLOSE`: ask whether to close this terminal while
-/// it still runs a program, then close it. The dialog's modal loop keeps
-/// dispatching messages and can close the terminal meanwhile.
+/// it still runs a program, listing those processes, then close it. The
+/// dialog's modal loop keeps dispatching messages and can close the
+/// terminal meanwhile.
 pub fn confirmClose(self: *Surface) void {
     const hwnd = self.hwnd orelse return;
     if (self.core_surface_ready and self.core_surface.needsConfirmQuit()) {
-        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd) != .accept) return;
+        var arena: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
+        defer arena.deinit();
+        var processes: std.ArrayList([]const u8) = .empty;
+        self.appendBusyProcesses(arena.allocator(), &processes);
+        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd, processes.items) != .accept) return;
         const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
         if (userdata == 0 or @as(usize, @bitCast(userdata)) != @intFromPtr(self)) return;
     }
     self.parent_window.closeSplitSurface(self);
+}
+
+/// Append the processes of this terminal that make closing it need a
+/// confirmation (see `gx.confirm.appendBusyProcesses`), copied with
+/// `arena`, to `out`. Appends nothing when they are unknown.
+pub fn appendBusyProcesses(self: *Surface, arena: Allocator, out: *std.ArrayList([]const u8)) void {
+    if (!self.core_surface_ready) return;
+    gx_confirm.appendBusyProcesses(
+        arena,
+        global.io(),
+        self.core_surface.getProcessInfo(.foreground_pid),
+        self.core_surface.config.gx_idle_processes.list.items,
+        out,
+    ) catch |err| log.warn("cannot list the busy processes err={}", .{err});
 }
 
 pub fn supportsClipboard(
@@ -554,20 +621,44 @@ pub fn clipboardRequest(
         );
     }
 
+    return self.readClipboard(state) catch |err| switch (err) {
+        // Another application holds the clipboard open: try again shortly.
+        error.ClipboardBusy => if (self.retryClipboardRead(state)) .started else busy: {
+            log.warn("OpenClipboard failed", .{});
+            break :busy .unavailable;
+        },
+        else => |e| return e,
+    };
+}
+
+/// Timer ids on the surface window.
+const CLIPBOARD_READ_TIMER: usize = 0x4352; // 'CR'
+const CLIPBOARD_WRITE_TIMER: usize = 0x4357; // 'CW'
+
+/// Opening a clipboard that another application holds open (clipboard
+/// managers, remote desktop) is retried this many times from a timer,
+/// after 10, 20, 40, ... ms (about 0.6 s in total), so a busy clipboard
+/// never blocks the GUI thread.
+const clipboard_retries = 6;
+
+fn clipboardRetryDelay(attempt: u8) u32 {
+    return @as(u32, 10) << @intCast(@min(attempt, 10));
+}
+
+/// Read the clipboard for `state` and complete the request. Fails with
+/// `error.ClipboardBusy`, before touching the request, when the clipboard
+/// cannot be opened.
+fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.ClipboardReadResult {
     // Paste events request a target listing without reading clipboard data.
     // Win32 exposes files and Unicode text as a text/plain representation.
     if (state == .list) {
-        if (w32.OpenClipboard(self.hwnd) == 0) {
-            log.warn("OpenClipboard failed", .{});
-            return .unavailable;
-        }
-        defer _ = w32.CloseClipboard();
-
-        if (w32.GetClipboardData(w32.CF_HDROP) == null and
-            w32.GetClipboardData(w32.CF_UNICODETEXT) == null)
-        {
-            return .unavailable;
-        }
+        const has_text = has_text: {
+            if (w32.OpenClipboard(self.hwnd) == 0) return error.ClipboardBusy;
+            defer _ = w32.CloseClipboard();
+            break :has_text w32.GetClipboardData(w32.CF_HDROP) != null or
+                w32.GetClipboardData(w32.CF_UNICODETEXT) != null;
+        };
+        if (!has_text) return .unavailable;
 
         return self.completeClipboardRequestWithConfirmation(
             state,
@@ -577,16 +668,19 @@ pub fn clipboardRequest(
     }
 
     const alloc = self.app.core_app.alloc;
+    // Pasted files are quoted for the shell running in the terminal, which
+    // is looked up before the clipboard is opened.
+    const quoting: path_quote.Style = if (w32.IsClipboardFormatAvailable(w32.CF_HDROP) != 0)
+        self.pathQuoting()
+    else
+        .windows;
 
     // Read the clipboard into an owned UTF-8 string in a tight scope so the
     // system clipboard is CLOSED before any modal confirmation dialog — the
     // dialog can be up for an unbounded time and would otherwise block every
     // other process's clipboard access.
     const utf8z: [:0]const u8 = blk: {
-        if (w32.OpenClipboard(self.hwnd) == 0) {
-            log.warn("OpenClipboard failed", .{});
-            return .unavailable;
-        }
+        if (w32.OpenClipboard(self.hwnd) == 0) return error.ClipboardBusy;
         defer _ = w32.CloseClipboard();
 
         // Files copied in Explorer land on the clipboard as CF_HDROP with no
@@ -605,7 +699,7 @@ pub fn clipboardRequest(
             // pointer: clipboard data is moveable, so the handle and the
             // locked address are different values. And never DragFinish it;
             // the clipboard owns this handle, not us.
-            const paths = (try hdropPathsToUtf8(alloc, @ptrCast(hdrop_handle))) orelse
+            const paths = (try hdropPathsToUtf8(alloc, @ptrCast(hdrop_handle), quoting)) orelse
                 break :hdrop;
             defer alloc.free(paths);
             break :blk try alloc.dupeZ(u8, paths);
@@ -642,6 +736,78 @@ pub fn clipboardRequest(
     );
 }
 
+/// A clipboard read waiting for another application to release the
+/// clipboard (see `retryClipboardRead`).
+const PendingClipboardRead = struct {
+    state: apprt.ClipboardRequest,
+    attempt: u8,
+};
+
+/// A clipboard write waiting likewise: a CF_UNICODETEXT HGLOBAL that the
+/// surface owns until it is handed to the clipboard.
+const PendingClipboardWrite = struct {
+    data: *anyopaque,
+    attempt: u8,
+};
+
+/// Start retrying a clipboard read from a timer. Returns false when the
+/// read cannot wait, because another one already does.
+fn retryClipboardRead(self: *Surface, state: apprt.ClipboardRequest) bool {
+    if (self.pending_clipboard_read != null) return false;
+    const hwnd = self.hwnd orelse return false;
+    if (w32.SetTimer(hwnd, CLIPBOARD_READ_TIMER, clipboardRetryDelay(0), null) == 0) return false;
+    self.pending_clipboard_read = .{ .state = state, .attempt = 0 };
+    return true;
+}
+
+fn onClipboardReadTimer(self: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    _ = w32.KillTimer(hwnd, CLIPBOARD_READ_TIMER);
+    const pending = self.pending_clipboard_read orelse return;
+    self.pending_clipboard_read = null;
+    if (!self.core_surface_ready) {
+        destroyClipboardRequest(pending.state);
+        return;
+    }
+
+    // The core already treats the request as started, so a read that does
+    // not complete it denies it.
+    const result = self.readClipboard(pending.state) catch |err| {
+        if (err == error.ClipboardBusy and pending.attempt + 1 < clipboard_retries) {
+            const attempt = pending.attempt + 1;
+            if (w32.SetTimer(hwnd, CLIPBOARD_READ_TIMER, clipboardRetryDelay(attempt), null) != 0) {
+                self.pending_clipboard_read = .{ .state = pending.state, .attempt = attempt };
+                return;
+            }
+        }
+        log.warn("clipboard read failed err={}", .{err});
+        self.core_surface.denyClipboardRequest(pending.state);
+        return;
+    };
+    if (result != .started) self.core_surface.denyClipboardRequest(pending.state);
+}
+
+/// Release what a clipboard request owns when it can no longer be
+/// completed (its surface is going away).
+fn destroyClipboardRequest(state: apprt.ClipboardRequest) void {
+    switch (state) {
+        .kitty_read => |kitty| kitty.destroy(),
+        .kitty_write => |kitty| kitty.destroy(),
+        else => {},
+    }
+}
+
+/// Handle WM_TIMER for the surface's own timers; returns false for others.
+pub fn handleTimer(self: *Surface, id: usize) bool {
+    switch (id) {
+        CLIPBOARD_READ_TIMER => self.onClipboardReadTimer(),
+        CLIPBOARD_WRITE_TIMER => self.onClipboardWriteTimer(),
+        GPU_RESET_TIMER => self.onGpuResetTimer(),
+        else => return false,
+    }
+    return true;
+}
+
 /// Complete a structured clipboard request and run the native authorization
 /// prompt when the core requires it. The modal dialog can destroy the surface,
 /// so all post-dialog access re-resolves the core surface by id.
@@ -666,11 +832,17 @@ fn completeClipboardRequestWithConfirmation(
         // `self` may be freed while the modal dialog pumps messages, so
         // re-resolve the surface by id before re-completing.
         const owner = self.parent_window.hwnd;
+        // The dialogs show the text being pasted, read or written; a Kitty
+        // write carries its text in the request.
+        const text = switch (state) {
+            .kitty_write => |kitty| clipboardText(kitty.contents),
+            else => clipboardText(contents),
+        };
         const choice: Dialogs.Choice = switch (err) {
-            error.UnsafePaste => Dialogs.confirmUnsafePaste(owner),
+            error.UnsafePaste => Dialogs.confirmUnsafePaste(owner, text),
             error.UnauthorizedPaste => switch (state) {
-                .kitty_write, .osc_52_write => Dialogs.confirmClipboardAccess(owner, .write),
-                else => Dialogs.confirmClipboardAccess(owner, .read),
+                .kitty_write, .osc_52_write => Dialogs.confirmClipboardAccess(owner, .write, text),
+                else => Dialogs.confirmClipboardAccess(owner, .read, text),
             },
             else => {
                 log.err("completeClipboardRequest error: {}", .{err});
@@ -705,6 +877,20 @@ fn completeClipboardRequestWithConfirmation(
     return .started;
 }
 
+/// The first text representation of clipboard contents (core or apprt
+/// content structs), if any.
+fn findClipboardText(contents: anytype) ?[]const u8 {
+    for (contents) |content| {
+        if (terminal.clipboard.isTextMime(content.mime)) return content.data;
+    }
+    return null;
+}
+
+/// `findClipboardText`, or "" when there is no text.
+fn clipboardText(contents: anytype) []const u8 {
+    return findClipboardText(contents) orelse "";
+}
+
 pub fn setClipboard(
     self: *Surface,
     clipboard_type: apprt.Clipboard,
@@ -714,70 +900,89 @@ pub fn setClipboard(
     // Only the standard clipboard is supported on Win32.
     if (clipboard_type != .standard) return;
 
-    // The confirm dialog below pumps messages and can free `self` (child
-    // exit → surface close). Capture the App (stable for the process) and
-    // avoid dereferencing `self` after the prompt.
-    const app = self.app;
+    // Without a text representation there is nothing to write.
+    const text = findClipboardText(contents) orelse return;
 
     // When the core requests confirmation (e.g. an OSC 52 clipboard write
     // with clipboard-write = ask), prompt before writing. Previously the
     // flag was discarded, so remote apps could write the clipboard silently.
+    // The dialog pumps messages and can free `self` (child exit → surface
+    // close), so the surface is re-resolved by id afterwards.
+    var surface = self;
     if (confirm) {
-        if (Dialogs.confirmClipboardAccess(self.parent_window.hwnd, .write) != .accept) return;
+        const app = self.app;
+        const id = self.core_surface.id;
+        if (Dialogs.confirmClipboardAccess(self.parent_window.hwnd, .write, text) != .accept) return;
+        const cs = app.core_app.findSurfaceByID(id) orelse return;
+        surface = cs.rt_surface;
     }
 
-    // Find the text/plain content.
-    const text = blk: {
-        for (contents) |c| {
-            if (std.mem.eql(u8, c.mime, "text/plain")) break :blk c.data;
-        }
-        // No text/plain content; nothing to write.
-        return;
-    };
+    const data = (try unicodeTextGlobal(surface.app.core_app.alloc, text)) orelse return;
+    surface.writeClipboard(data, 0);
+}
 
-    const alloc = app.core_app.alloc;
-
-    // Convert UTF-8 to UTF-16LE.  Add 1 for the null terminator.
+/// `text` as a moveable CF_UNICODETEXT memory block (UTF-16LE, NUL
+/// terminated), or null when it could not be allocated.
+fn unicodeTextGlobal(alloc: Allocator, text: []const u8) !?*anyopaque {
     const utf16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
     defer alloc.free(utf16);
 
-    // Size in bytes including the null terminator (u16 → 2 bytes each).
-    const byte_size = (utf16.len + 1) * @sizeOf(u16);
-
-    // Allocate a moveable global memory block.
-    const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, byte_size) orelse {
+    const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, (utf16.len + 1) * @sizeOf(u16)) orelse {
         log.warn("GlobalAlloc failed for clipboard write", .{});
-        return;
+        return null;
     };
-
     const dst_bytes = w32.GlobalLock(hglobal) orelse {
         log.warn("GlobalLock failed for clipboard write", .{});
         _ = w32.GlobalFree(hglobal);
-        return;
+        return null;
     };
-
-    // Copy the UTF-16LE data (including null terminator) into the block.
     const dst16: [*]u16 = @ptrCast(@alignCast(dst_bytes));
     @memcpy(dst16[0..utf16.len], utf16);
-    dst16[utf16.len] = 0; // null terminator
-
+    dst16[utf16.len] = 0;
     _ = w32.GlobalUnlock(hglobal);
+    return hglobal;
+}
 
-    // null owner: the write is not tied to the (possibly freed) surface hwnd.
+/// Put `data` (from `unicodeTextGlobal`, owned by this call) on the
+/// clipboard. While another application holds the clipboard open the
+/// write is retried from a timer; a newer write replaces a waiting one.
+fn writeClipboard(self: *Surface, data: *anyopaque, attempt: u8) void {
+    if (self.pending_clipboard_write) |pending| {
+        if (pending.data != data) _ = w32.GlobalFree(pending.data);
+        self.pending_clipboard_write = null;
+        if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, CLIPBOARD_WRITE_TIMER);
+    }
+
+    // null owner: the write is not tied to the surface hwnd.
     if (w32.OpenClipboard(null) == 0) {
+        if (attempt + 1 < clipboard_retries) {
+            if (self.hwnd) |hwnd| {
+                if (w32.SetTimer(hwnd, CLIPBOARD_WRITE_TIMER, clipboardRetryDelay(attempt), null) != 0) {
+                    self.pending_clipboard_write = .{ .data = data, .attempt = attempt };
+                    return;
+                }
+            }
+        }
         log.warn("OpenClipboard failed for clipboard write", .{});
-        _ = w32.GlobalFree(hglobal);
+        _ = w32.GlobalFree(data);
         return;
     }
     defer _ = w32.CloseClipboard();
 
     _ = w32.EmptyClipboard();
 
-    // SetClipboardData takes ownership of hglobal on success.
-    if (w32.SetClipboardData(w32.CF_UNICODETEXT, hglobal) == null) {
+    // SetClipboardData takes ownership of the data on success.
+    if (w32.SetClipboardData(w32.CF_UNICODETEXT, data) == null) {
         log.warn("SetClipboardData failed", .{});
-        _ = w32.GlobalFree(hglobal);
+        _ = w32.GlobalFree(data);
     }
+}
+
+fn onClipboardWriteTimer(self: *Surface) void {
+    if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, CLIPBOARD_WRITE_TIMER);
+    const pending = self.pending_clipboard_write orelse return;
+    self.pending_clipboard_write = null;
+    self.writeClipboard(pending.data, pending.attempt + 1);
 }
 
 pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
@@ -845,6 +1050,13 @@ pub fn handleSetCursor(self: *Surface) bool {
 /// mouse_over_link action.
 pub fn setMouseOverLink(self: *Surface, url: []const u8) void {
     self.link_preview.show(url);
+}
+
+/// The window moved: keep the screen-positioned popups on the surface.
+pub fn repositionPopups(self: *Surface) void {
+    if (self.scrollbar) |sb| _ = sb.repositionAndResize();
+    self.search_bar.reposition();
+    self.link_preview.hide();
 }
 
 /// The UI language changed: refresh the translated text of the popups.
@@ -917,6 +1129,7 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
         log.err("sizeCallback error: {}", .{err});
         return;
     };
+    if (self.ime_composing) self.positionImeWindow();
 
     // During live resize (user dragging the border), block until the
     // renderer has presented one frame at the new size. This prevents
@@ -932,16 +1145,26 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
         // Wake the renderer to redraw at the new size.
         self.core_surface.renderer_thread.wakeup.notify() catch {};
 
-        if (self.frame_event) |event| {
-            // Wait for the renderer to present. Use a short timeout
-            // so we never stall the UI if the renderer is slow.
-            _ = w32.WaitForSingleObject(event, 16);
-        }
+        // When the window lays out its panes it waits for all of them at
+        // once afterwards (`Window.layoutSplits`), so split panes render
+        // in parallel.
+        self.resize_frame_pending = true;
+        if (!self.parent_window.laying_out) self.awaitResizeFrame();
     } else {
         // Outside live resize (programmatic resize, initial layout),
         // just wake the renderer asynchronously.
         self.core_surface.renderer_thread.wakeup.notify() catch {};
     }
+}
+
+/// How long a live resize waits for the renderer to present a frame at
+/// the new size. Short, so a slow renderer never stalls the UI.
+pub const resize_frame_timeout_ms: u32 = 16;
+
+/// Wait for the frame `handleResize` asked for during a live resize.
+fn awaitResizeFrame(self: *Surface) void {
+    self.resize_frame_pending = false;
+    if (self.frame_event) |event| _ = w32.WaitForSingleObject(event, resize_frame_timeout_ms);
 }
 
 /// Called by the parent Window when it moved to a monitor with another
@@ -961,9 +1184,13 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
     // tiny/huge after dragging the window between monitors.
     self.search_bar.onDpiChanged();
     self.palette.onDpiChanged();
+    self.link_preview.hide();
 
     // Notify the scrollbar of the new DPI.
-    if (self.scrollbar) |sb| sb.onDpiChanged(@intFromFloat(self.scale * 96.0));
+    if (self.scrollbar) |sb| sb.onDpiChanged(dpi);
+
+    // The IME windows follow the cursor, which moved in pixels.
+    self.positionImeWindow();
 }
 
 /// Handle WM_KEYDOWN / WM_SYSKEYDOWN / WM_KEYUP / WM_SYSKEYUP.
@@ -1280,7 +1507,7 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
         _ = w32.ReleaseCapture();
     }
 
-    // TrackPopupMenuEx's modal loop takes capture and swallows the physical
+    // The menu's modal loop takes capture and swallows the physical
     // WM_RBUTTONUP, so the core would never see the right-button release and
     // would leave click_state[right] stuck at .press (corrupting later mouse
     // motion). Synthesize the release now.
@@ -1294,11 +1521,8 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     };
     _ = w32.ClientToScreen(hwnd, &pt);
 
-    const binding = Menu.showSurfaceContextMenu(
-        hwnd,
-        pt,
-        self.core_surface.hasSelection(),
-    ) orelse return;
+    // Null also when this terminal closed while the menu was open.
+    const binding = Menu.showSurfaceContextMenu(self, pt) orelse return;
     _ = self.core_surface.performBindingAction(binding) catch |err| {
         log.err("context menu action failed err={}", .{err});
     };
@@ -1319,15 +1543,15 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
 }
 
 /// Handle WM_DROPFILES — a file (or files) was dropped onto this
-/// surface. Convert each path to UTF-8, quote if it contains
-/// whitespace, and paste into the terminal at the cursor.
+/// surface. Convert each path to UTF-8, quote it for the shell running in
+/// the terminal, and type the paths at the cursor.
 pub fn handleDropFiles(self: *Surface, wparam: usize) void {
     if (!self.core_surface_ready) return;
     const hdrop: w32.HDROP = @ptrFromInt(wparam);
     defer w32.DragFinish(hdrop);
 
     const alloc = self.app.core_app.alloc;
-    const text = (hdropPathsToUtf8(alloc, hdrop) catch |err| {
+    const text = (hdropPathsToUtf8(alloc, hdrop, self.pathQuoting()) catch |err| {
         log.err("drop-files path conversion: {}", .{err});
         return;
     }) orelse return;
@@ -1349,8 +1573,24 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
     };
 }
 
+/// How dropped and pasted file paths are quoted: for the innermost shell
+/// running in the terminal (`gx.path_quote.styleFor`), in double quotes
+/// when it is unknown.
+fn pathQuoting(self: *Surface) path_quote.Style {
+    if (!self.core_surface_ready) return .windows;
+    const root = self.core_surface.getProcessInfo(.foreground_pid) orelse return .windows;
+    const pid = std.math.cast(gx_proc.Pid, root) orelse return .windows;
+    var arena: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
+    defer arena.deinit();
+    var snapshot = gx_proc.snapshot(arena.allocator(), global.io(), pid) catch return .windows;
+    defer snapshot.deinit();
+    const names = snapshot.tree.names(arena.allocator(), pid) catch return .windows;
+    return path_quote.styleFor(names);
+}
+
 /// Convert the path list in an HDROP into one shell-ready UTF-8 string:
-/// each path double-quoted, joined with single spaces.
+/// each path quoted in `quoting` (`gx.path_quote`), joined with single
+/// spaces.
 ///
 /// Used by both WM_DROPFILES and CF_HDROP clipboard pastes. The caller owns
 /// the returned slice; this function never releases the HDROP. A
@@ -1359,7 +1599,7 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
 /// or unlocked — the clipboard owns it, and DragQueryFileW takes and drops
 /// its own lock internally, so the caller neither locks nor unlocks it.
 /// Returns null when there is nothing usable.
-fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP) Allocator.Error!?[]u8 {
+fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP, quoting: path_quote.Style) Allocator.Error!?[]u8 {
     // Number of files (passing 0xFFFFFFFF as iFile).
     const count = w32.DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
     if (count == 0) return null;
@@ -1383,33 +1623,28 @@ fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP) Allocator.Error!?[]u8 {
         const utf8_len = std.unicode.utf16LeToUtf8(utf8_buf, u16_buf[0..got]) catch continue;
         const path = utf8_buf[0..utf8_len];
 
-        // A double quote can't occur in a path created through the Win32
-        // API, but volumes written by WSL, Samba/NFS, or via \\?\ paths can
-        // carry one. It would close the wrapper below and let the rest of
-        // the name — and the quoting of every path after it — be read as
-        // shell syntax, so refuse to emit such a path at all. Logged
-        // without the name: it can also hold control characters.
-        if (std.mem.indexOfScalar(u8, path, '"') != null) {
-            log.warn("refusing to paste a path containing a double quote", .{});
-            continue;
-        }
-
         // Quote unconditionally, not just for whitespace. Windows filenames
-        // may legally contain & | ( ) ; ^ < > and glob characters, and
-        // wrapping neutralizes those in cmd.exe, PowerShell and POSIX
-        // shells alike. Residual, and not fixable without knowing which
-        // shell is on the other end: $(...) and backticks still expand
-        // inside double quotes under bash/zsh/PowerShell, as does %VAR%
-        // under cmd.exe. The core unsafe-paste check does not cover these
-        // (input/paste.zig isSafe only looks for \n and \x1b[201~), but
-        // pasting never submits a line on its own.
+        // may legally contain & | ( ) ; ^ < > and glob characters; the
+        // quoting matches the shell, so $ and backticks stay literal in
+        // PowerShell and POSIX shells (single quotes). Residual: %VAR%
+        // still expands inside cmd.exe's double quotes. The core
+        // unsafe-paste check does not cover these (input/paste.zig isSafe
+        // only looks for \n and \x1b[201~), but typing paths never submits
+        // a line on its own.
         //
         // Separate from whatever we already appended rather than keying off
         // `i`, so a skipped entry can't leave a leading or doubled space.
+        const mark = buf.items.len;
         if (buf.items.len > 0) try buf.append(alloc, ' ');
-        try buf.append(alloc, '"');
-        try buf.appendSlice(alloc, path);
-        try buf.append(alloc, '"');
+        if (!try path_quote.appendQuoted(alloc, &buf, path, quoting)) {
+            // A path the quoting cannot contain (a double quote for cmd.exe,
+            // control characters), possible on volumes written by WSL,
+            // Samba/NFS or via \\?\ paths: it would let the rest of the
+            // name be read as shell syntax, so it is not emitted at all.
+            // Logged without the name, which can hold control characters.
+            buf.shrinkRetainingCapacity(mark);
+            log.warn("refusing to paste a path the shell cannot quote", .{});
+        }
     }
 
     if (buf.items.len == 0) {
@@ -1554,6 +1789,10 @@ fn updateImePreedit(self: *Surface) void {
     self.core_surface.preeditCallback(if (len8 == 0) null else buf8[0..len8]) catch |err| {
         log.warn("preeditCallback failed err={}", .{err});
     };
+
+    // Output can move the cursor while composing; keep the candidate
+    // list with it.
+    self.positionImeWindow();
 }
 
 fn sendImeText(self: *Surface, utf16: []const u16) void {
@@ -1581,28 +1820,72 @@ fn sendImeText(self: *Surface, utf16: []const u16) void {
     };
 }
 
-/// Position the IME candidate/composition window near the terminal cursor.
+/// Anchor the IME windows at the terminal cursor, in client pixels: the
+/// composition window (hidden, the composition is drawn inline, but its
+/// position tells the IME where the text is) at the cursor cell, and the
+/// candidate list below that cell without covering it (above it when the
+/// screen has no room below). Called when a composition starts or
+/// changes, after a resize during a composition and after a DPI change.
 fn positionImeWindow(self: *Surface) void {
+    if (!self.core_surface_ready) return;
     const hwnd = self.hwnd orelse return;
+    const cell = imeCellRect(
+        self.core_surface.imePoint(),
+        self.scale,
+        self.core_surface.size.cell.width,
+        self.core_surface.size.cell.height,
+        self.width,
+        self.height,
+    );
+
     const himc = w32.ImmGetContext(hwnd) orelse return;
     defer _ = w32.ImmReleaseContext(hwnd, himc);
-
-    // Use the core surface's imePoint() which calculates the cursor
-    // position in pixels from the terminal grid, accounting for padding
-    // and content scale.
-    var pos = w32.POINT{ .x = 0, .y = 0 };
-    if (self.core_surface_ready) {
-        const ime_pos = self.core_surface.imePoint();
-        pos.x = @intFromFloat(ime_pos.x);
-        pos.y = @intFromFloat(ime_pos.y);
-    }
-
-    const cf = w32.COMPOSITIONFORM{
+    _ = w32.ImmSetCompositionWindow(himc, &.{
         .dwStyle = w32.CFS_POINT,
-        .ptCurrentPos = pos,
+        .ptCurrentPos = .{ .x = cell.left, .y = cell.top },
         .rcArea = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-    };
-    _ = w32.ImmSetCompositionWindow(himc, &cf);
+    });
+    _ = w32.ImmSetCandidateWindow(himc, &.{
+        .dwIndex = 0,
+        .dwStyle = w32.CFS_EXCLUDE,
+        .ptCurrentPos = .{ .x = cell.left, .y = cell.bottom },
+        .rcArea = cell,
+    });
+}
+
+/// The cursor cell in client pixels from the core's `imePoint`, which is
+/// in unscaled points (divided by the content scale): the middle of the
+/// cell horizontally and its bottom edge vertically. Clamped to the
+/// surface, since the cursor can be outside the viewport (scrolled back).
+fn imeCellRect(
+    point: apprt.IMEPos,
+    scale: f32,
+    cell_width: u32,
+    cell_height: u32,
+    surface_width: u32,
+    surface_height: u32,
+) w32.RECT {
+    const cw: i32 = @intCast(@max(cell_width, 1));
+    const ch: i32 = @intCast(@max(cell_height, 1));
+    const max_x: i32 = @max(@as(i32, @intCast(surface_width)) - cw, 0);
+    const max_bottom: i32 = @max(@as(i32, @intCast(surface_height)), ch);
+    const center_x: i32 = @intFromFloat(@round(point.x * scale));
+    const bottom_y: i32 = @intFromFloat(@round(point.y * scale));
+    const left = std.math.clamp(center_x - @divTrunc(cw, 2), 0, max_x);
+    const bottom = std.math.clamp(bottom_y, ch, max_bottom);
+    return .{ .left = left, .top = bottom - ch, .right = left + cw, .bottom = bottom };
+}
+
+test "imeCellRect scales points to pixels" {
+    // A 10x20 px cell at 1.5x: imePoint reports the cell's center x and
+    // bottom y divided by the scale.
+    const rect = imeCellRect(.{ .x = 25, .y = 40, .width = 0, .height = 0 }, 1.5, 10, 20, 800, 600);
+    try std.testing.expectEqual(w32.RECT{ .left = 33, .top = 40, .right = 43, .bottom = 60 }, rect);
+}
+
+test "imeCellRect clamps to the surface" {
+    const rect = imeCellRect(.{ .x = 2000, .y = 2000, .width = 0, .height = 0 }, 1, 10, 20, 800, 600);
+    try std.testing.expectEqual(w32.RECT{ .left = 790, .top = 580, .right = 800, .bottom = 600 }, rect);
 }
 
 /// Called by the renderer thread after SwapBuffers to signal that a
@@ -1612,6 +1895,100 @@ pub fn signalFrameDrawn(self: *Surface) void {
     if (self.frame_event) |event| {
         _ = w32.SetEvent(event);
     }
+}
+
+/// Posted to the surface window by `gpuContextReset`.
+pub const WM_APP_GPU_RESET: u32 = w32.WM_APP + 30;
+
+/// Test-only message: SendMessage(surface, WM_GHOSTTY_SIMULATE_GPU_RESET,
+/// 0, 0) makes the renderer treat its next frame as if the GPU had been
+/// reset, exercising the context recovery (`gpuContextReset`).
+pub const WM_GHOSTTY_SIMULATE_GPU_RESET: u32 = w32.WM_USER + 0x48;
+
+/// Timer of `recoverGpuResources`.
+const GPU_RESET_TIMER: usize = 0x4752; // 'GR'
+
+/// Called by the renderer thread (src/renderer/opengl/wgl.zig) inside a
+/// frame, with the renderer's draw mutex held, after it replaced an
+/// OpenGL context lost to a GPU reset: every GPU object the renderer made
+/// belongs to the dead context. Like `Renderer.threadExit`, mark the
+/// display unrealized (nothing is drawn with those objects, and the next
+/// render releases the swap chain and shaders while the new context is
+/// still empty, so no name of a new object is deleted by mistake) and
+/// drop the uploaded images; then let the GUI thread realize it again
+/// (`recoverGpuResources`).
+pub fn gpuContextReset(self: *Surface) void {
+    const renderer = &self.core_surface.renderer;
+    renderer.display_realized = false;
+    renderer.images.deinit(renderer.alloc);
+    renderer.images = .empty;
+    if (renderer.bg_image) |image| {
+        image.deinit(renderer.alloc);
+        renderer.bg_image = null;
+    }
+    if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_GPU_RESET, 0, 0);
+}
+
+/// Rebuild the renderer's GPU resources after a GPU reset: wake the
+/// renderer so it releases the dead objects (it is unrealized), then,
+/// from a timer once they are gone, realize the display again so the next
+/// frame recreates everything.
+pub fn recoverGpuResources(self: *Surface) void {
+    if (!self.core_surface_ready) return;
+    log.warn("the GPU context was reset, rebuilding the renderer resources", .{});
+    self.core_surface.renderer_thread.wakeup.notify() catch {};
+    if (self.hwnd) |hwnd| _ = w32.SetTimer(hwnd, GPU_RESET_TIMER, 16, null);
+}
+
+fn onGpuResetTimer(self: *Surface) void {
+    if (!self.core_surface_ready) {
+        if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
+        return;
+    }
+    // Unrealized, the renderer releases its swap chain and shaders
+    // together, under the draw mutex.
+    const renderer = &self.core_surface.renderer;
+    const released = released: {
+        renderer.draw_mutex.lockUncancelable(global.io());
+        defer renderer.draw_mutex.unlock(global.io());
+        break :released renderer.swap_chain == null;
+    };
+    if (!released) {
+        self.core_surface.renderer_thread.wakeup.notify() catch {};
+        return;
+    }
+    if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
+    self.core_surface.displayRealized() catch |err| {
+        log.warn("displayRealized failed err={}", .{err});
+    };
+    self.core_surface.renderer_thread.wakeup.notify() catch {};
+    log.info("renderer resources rebuilt after the GPU reset", .{});
+}
+
+/// Called by the renderer thread (wgl.zig) on every frame: whether to
+/// treat this frame as if the GPU had been reset (test-only).
+pub fn takeSimulatedGpuReset(self: *Surface) bool {
+    return self.simulate_gpu_reset.swap(false, .acq_rel);
+}
+
+/// Make the renderer draw a complete new frame even though the terminal
+/// did not change: it releases its frame buffers (swap chain) and builds
+/// them again, as when the surface is hidden and shown. Used after
+/// sleep/resume, display changes and GPU resets, which can lose the
+/// window contents; an unchanged terminal is otherwise never redrawn. A
+/// hidden surface needs nothing: it is rebuilt when shown.
+pub fn refreshRenderer(self: *Surface) void {
+    if (!self.core_surface_ready) return;
+    if (self.last_reported_visible != true) return;
+    self.core_surface.occlusionCallback(false) catch |err| {
+        log.warn("occlusionCallback failed err={}", .{err});
+        return;
+    };
+    self.core_surface.occlusionCallback(true) catch |err| {
+        // The renderer believes it is hidden; the next layout retries.
+        self.last_reported_visible = null;
+        log.warn("occlusionCallback failed err={}", .{err});
+    };
 }
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.

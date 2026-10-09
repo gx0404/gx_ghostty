@@ -841,20 +841,8 @@ pub fn onRightButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool
     var pt = w32.POINT{ .x = x, .y = y };
     _ = w32.ClientToScreen(hwnd, &pt);
 
-    const command = Menu.showTabContextMenu(hwnd, pt, .{
-        .tab = clicked_tab,
-        .tab_count = win.tab_count,
-    }) orelse return true;
-    switch (command) {
-        .close => if (clicked_tab) |tab| win.closeTabByIndex(tab),
-        .close_others => if (clicked_tab) |tab| win.closeOtherTabs(tab),
-        .close_right => if (clicked_tab) |tab| win.closeTabsRightOf(tab),
-        .new_tab => {
-            _ = win.addTab() catch |err| {
-                log.err("failed to create new tab: {}", .{err});
-            };
-        },
-    }
+    const command = Menu.showTabContextMenu(win, pt, clicked_tab) orelse return true;
+    Menu.performTabCommand(win, clicked_tab, command);
     return true;
 }
 

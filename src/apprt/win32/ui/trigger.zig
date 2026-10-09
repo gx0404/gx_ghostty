@@ -43,11 +43,31 @@ pub fn find(set: *const Binding.Set, action: Binding.Action) ?Trigger {
     return null;
 }
 
-/// The formatted trigger of `action` in `set` (see `find`), or null.
+/// The formatted trigger of `action` in `set`, or null: the one `find`
+/// returns, or when that key has no display name (such as the `paste` media
+/// key) another binding of the action.
 pub fn formatAction(set: *const Binding.Set, action: Binding.Action, buf: []u8) ?[]const u8 {
-    const trigger = find(set, action) orelse return null;
-    const text = format(trigger, buf);
-    return if (text.len == 0) null else text;
+    if (find(set, action)) |trigger| {
+        if (displayable(trigger)) return format(trigger, buf);
+    }
+    var it = set.bindings.iterator();
+    while (it.next()) |entry| switch (entry.value_ptr.*) {
+        .leaf => |leaf| if (leaf.action.equal(action) and displayable(entry.key_ptr.*)) {
+            return format(entry.key_ptr.*, buf);
+        },
+        .leader, .leaf_chained => {},
+    };
+    return null;
+}
+
+/// Whether `format` writes a display name for the key of `trigger`, not
+/// just a tag name (`keyName`) or nothing.
+fn displayable(trigger: Trigger) bool {
+    return switch (trigger.key) {
+        .unicode => |cp| cp >= 0x20 and cp != 0x7F,
+        .physical => |k| namedKey(k) != null,
+        .catch_all => false,
+    };
 }
 
 fn write(trigger: Trigger, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -112,8 +132,14 @@ fn writeCodepoint(writer: *std.Io.Writer, cp: u21) std.Io.Writer.Error!void {
     try writer.writeAll(buf[0..len]);
 }
 
-/// Map physical key enum to display name.
+/// Map physical key enum to display name: `namedKey`, else the key's tag
+/// name (media and browser keys such as `paste`).
 pub fn keyName(k: input.Key) []const u8 {
+    return namedKey(k) orelse @tagName(k);
+}
+
+/// The display name of physical key `k`, or null when it has none.
+fn namedKey(k: input.Key) ?[]const u8 {
     return switch (k) {
         .key_a => "A",
         .key_b => "B",
@@ -225,7 +251,7 @@ pub fn keyName(k: input.Key) []const u8 {
         .print_screen => "PrtSc",
         .pause => "Pause",
         .context_menu => "Menu",
-        else => @tagName(k),
+        else => null,
     };
 }
 
@@ -399,6 +425,20 @@ test "format modifiers and keys" {
         .key = .{ .unicode = 0xE4 },
         .mods = .{ .ctrl = true },
     }, &buf));
+}
+
+test "formatAction skips keys without a display name" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: input.Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "paste=paste_from_clipboard");
+    try set.parseAndPut(alloc, "ctrl+shift+v=paste_from_clipboard");
+    try set.parseAndPut(alloc, "copy=copy_to_clipboard");
+
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("Ctrl+Shift+V", formatAction(&set, .paste_from_clipboard, &buf).?);
+    try testing.expectEqual(@as(?[]const u8, null), formatAction(&set, .{ .copy_to_clipboard = .mixed }, &buf));
 }
 
 test "format cuts off at the buffer end" {

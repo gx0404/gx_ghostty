@@ -7,7 +7,7 @@
 //!   - the window's tabs ("Switch to Tab: <title>");
 //!   - the launch profiles ("New Tab: <profile>", like
 //!     `gx:new_tab_profile`);
-//!   - the settings sections (`Settings.show`) and the UI language;
+//!   - the settings sections (`Settings.showSection`) and the UI language;
 //!   - the themes ("Theme: <name>"), saved to `gui-settings.ghostty`;
 //!     while the selection rests on a theme the terminals preview it, and
 //!     closing the palette without picking it restores the saved one.
@@ -120,7 +120,7 @@ const Target = union(enum) {
     tab: *Surface,
     /// A launch profile id.
     profile: [:0]const u8,
-    settings,
+    settings: Settings.Section,
     language: i18n.Language,
     theme: []const u8,
 };
@@ -454,15 +454,23 @@ fn supported(action: Action) bool {
 }
 
 fn addSettings(self: *Palette, a: Allocator) !void {
-    const sections = [_][:0]const u8{ "Language", "Appearance", "Font", "Interaction", "Shell", "About" };
-    inline for (sections) |section| {
+    const sections = [_]struct { [:0]const u8, Settings.Section }{
+        .{ "Language", .language },
+        .{ "Appearance", .appearance },
+        .{ "Font", .font },
+        .{ "Interaction", .interaction },
+        .{ "Shell", .shell },
+        .{ "About", .about },
+    };
+    inline for (sections) |entry| {
+        const section = entry[0];
         try self.items.append(a, .{
             .group = .settings,
             .icon = icons.settings,
             .title = try i18n.fill(a, i18n.tr("Settings: {section}"), .{ .section = i18n.tr(section) }),
             .title_en = try i18n.fill(a, "Settings: {section}", .{ .section = section }),
             .key = "settings:" ++ section,
-            .target = .settings,
+            .target = .{ .settings = entry[1] },
         });
     }
 
@@ -767,7 +775,7 @@ fn run(self: *Palette, index: usize) void {
             window.invalidateTabBar();
         },
         .profile => |id| _ = app.openProfile(window, id, .tab),
-        .settings => _ = Settings.show(window),
+        .settings => |section| _ = Settings.showSection(window, section),
         .language => |language| saveSetting(window, "language", language.configValue()),
         .theme => |name| saveSetting(window, "theme", name),
     }
