@@ -5725,6 +5725,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .io => self.queueIo(.{ .crash = {} }, .unlocked),
         },
 
+        // fork(gx): GX-0014 begin: Ghostty GX actions are performed by the app runtime
+        .gx => |gx_action| {
+            if (comptime @hasDecl(apprt.App, "gxAction")) {
+                return try self.rt_app.gxAction(.{ .surface = self }, gx_action);
+            }
+
+            log.warn("app runtime does not perform GX actions action=gx:{f}", .{gx_action});
+            return false;
+        },
+        // fork(gx): GX-0014 end
+
         .adjust_selection => |direction| {
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());

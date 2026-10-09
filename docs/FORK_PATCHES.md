@@ -45,6 +45,10 @@
 | GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
+| GX-0014 | `src/Surface.zig` | `fork(gx): GX-0014` | active |
+| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | active |
+| GX-0014 | `src/input/Binding.zig` | `fork(gx): GX-0014` | active |
+| GX-0014 | `src/input/command.zig` | `fork(gx): GX-0014` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -373,3 +377,48 @@ python3 -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 `scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0010：标记必须存在于 `src/config/Config.zig`，四对 `begin`/`end` 成对且不嵌套。行为由 `src/gx/config_layers.zig` 的单测锁定，其中两条覆盖诊断重放（GX 分层与上游路径各一条）。
+
+## GX-0014 gx: 绑定动作分发到应用运行时
+
+- 文件：`src/input/Binding.zig`（导入 `src/gx/action.zig`；`Action` 字段区末尾、`crash` 之后新增 `gx` 字段与文档注释；`scope` 把 `.gx` 归入 surface；`formatValue`、`cloneValue` 各加一个 union 分支）、`src/input/command.zig`（`actionCommands` 的 `.gx` 分支，没有内置命令）、`src/Surface.zig`（`performBindingAction` 的 `.gx` 分支）、`src/apprt/gtk/class/command_palette.zig`（`isActionSupportedOnGtk` 把 `.gx` 归为不支持）。动作类型、解析与格式化在新路径 `src/gx/action.zig`。
+- 标记：`fork(gx): GX-0014`；全部是纯新增块，用 `begin`/`end` 包住（`Binding.zig` 五块，其余三个文件各一块）。
+- 状态：active，未回馈上游。
+- 改动量：4 个文件，`git diff --numstat` 合计 +65/−0（含注释与文档注释）。
+
+### 原因
+
+Ghostty GX 的 Windows 界面需要能绑定到键位与命令面板的应用操作：打开设置、主菜单、快捷键速查，按启动配置新建标签页或窗口。上游的绑定动作是 `input.Binding.Action` 闭集，`keybind` 与 `command-palette-entry` 只接受其中的动作；若加进 `src/apprt/action.zig` 的 apprt 动作表，就要改 C ABI（`include/ghostty.h`）并波及 macOS 与 GTK。所以只给 `Binding.Action` 加一个携带 GX 子动作的成员，由核心 Surface 直接交给 apprt 的 `gxAction`，不经过 apprt 动作表。`Binding.Action` 的格式化与克隆只支持标量、字符串和结构体参数，携带 union 需要两个通用分支；`scope`、`actionCommands`、`performBindingAction` 是穷举 switch，不补分支就编译失败。
+
+### 行为
+
+- 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。
+- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。目前只有 win32 apprt 实现 `gxAction`；GTK、embedded（macOS）与 none 没有实现。
+- GTK 命令面板不列出 `gx` 条目。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
+
+### 上游状态
+
+未回馈上游，只服务 Ghostty GX 的界面。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+先取上游版本，再放回各纯新增块：`Binding.zig` 的导入、`gx` 字段（留在 `Action` 字段区末尾；上游追加动作时把块挪到新的最后一个字段之后，文档注释必须紧贴字段，helpgen 按字段名取文档）、`scope` 的 surface 列表、`formatValue`/`cloneValue` 的 union 分支（上游自己支持 union 参数后删掉这两块）；`command.zig` 与 `Surface.zig` 的 `.gx` 分支；GTK 命令面板的过滤。上游给 `Binding.Action` 新增穷举 switch 时，编译会指出缺少 `.gx` 的位置，同样用 `begin`/`end` 块补上并在此登记。
+
+### 移除条件
+
+Ghostty GX 不再需要绑定到键位或命令面板的 GX 操作（或上游提供可由 apprt 扩展的绑定动作）时移除：删除四个文件中的块与 `src/gx/action.zig`，去掉 GX 默认值（`src/gx/defaults.ghostty`）里的 `gx:` 绑定与命令面板条目，把登记行改为 `removed`。GTK 实现 `gxAction` 后，单独删掉 GTK 命令面板的过滤块。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+python scripts/zigw.py build -Demit-lib-vt
+python -m unittest scripts.test_fork_patches -v
+just wsl build --gtk --clone '~/src/gx_ghostty-S'
+just wsl test --clone '~/src/gx_ghostty-S' --filter Binding --filter gx.
+```
+
+单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。
+
+### 测试锁定
+
+`scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0014：标记必须存在于四个文件，`begin`/`end` 成对且不嵌套。行为由 `src/gx/action.zig` 的单测锁定。
