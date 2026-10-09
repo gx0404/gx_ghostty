@@ -386,14 +386,11 @@ test "seeded GX strings are translated" {
         "Tabbed",
         "Font Size",
         "Right-Click Menu",
-        "Scrollbar",
         "Bell",
         "Close Confirmation",
         "Default Shell",
         "Open Configuration File",
         "Search themes…",
-        "Chinese",
-        "English",
         "Split Right",
         "Split Down",
         "Split Left",
@@ -407,21 +404,14 @@ test "seeded GX strings are translated" {
         "Quit",
         "New tab",
         "Main menu",
-        "Minimize",
-        "Maximize",
-        "Restore",
         "Close",
         "Command Prompt",
         "WSL: {name}",
-        "Yes",
-        "No",
         "Cancel",
         "Find…",
         "No results",
         "{current}/{total}",
         "Command finished",
-        "Exit code: {code}",
-        "herdr App Mode",
     }) |msgid| {
         if (lookup(.zh_CN, msgid) == null) {
             std.debug.print("missing zh-CN translation for {s}\n", .{msgid});
@@ -474,9 +464,9 @@ test "fill allocates the result" {
     defer setCurrent(saved);
     setCurrent(.zh_CN);
 
-    const result = try fill(testing.allocator, tr("Exit code: {code}"), .{ .code = 127 });
+    const result = try fill(testing.allocator, tr("The shell process exited with code {code}."), .{ .code = 127 });
     defer testing.allocator.free(result);
-    try testing.expectEqualStrings("退出码：127", result);
+    try testing.expectEqualStrings("Shell 进程已退出，退出码 127。", result);
 
     const empty = try fill(testing.allocator, "", .{});
     defer testing.allocator.free(empty);

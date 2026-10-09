@@ -67,9 +67,6 @@ msgstr "窗口材质需要 Windows 11。"
 msgid "Show Scrollbar"
 msgstr "显示滚动条"
 
-msgid "Scrollbar"
-msgstr "滚动条"
-
 #. Settings: font
 msgid "Font Family"
 msgstr "字体族"
@@ -86,9 +83,6 @@ msgstr "响铃"
 
 msgid "Close Confirmation"
 msgstr "关闭确认"
-
-msgid "herdr App Mode"
-msgstr "herdr 应用模式"
 
 #. Settings: shell
 msgid "Default Shell"
@@ -213,13 +207,6 @@ msgstr "无法重新加载配置：{reason}"
 msgid "Could not preview the theme: {reason}"
 msgstr "无法预览主题：{reason}"
 
-#. Language names are shown in their own language in the language picker
-msgid "Chinese"
-msgstr "中文"
-
-msgid "English"
-msgstr "English"
-
 #. Menus
 msgid "New Tab"
 msgstr "新建标签页"
@@ -290,15 +277,6 @@ msgstr "关闭标签页"
 
 msgid "Main menu"
 msgstr "主菜单"
-
-msgid "Minimize"
-msgstr "最小化"
-
-msgid "Maximize"
-msgstr "最大化"
-
-msgid "Restore"
-msgstr "还原"
 
 msgid "Close"
 msgstr "关闭"
@@ -371,12 +349,6 @@ msgstr "此终端中仍有进程在运行，仍要关闭吗？"
 msgid "The shell process exited with code {code}."
 msgstr "Shell 进程已退出，退出码 {code}。"
 
-msgid "Yes"
-msgstr "是"
-
-msgid "No"
-msgstr "否"
-
 msgid "Cancel"
 msgstr "取消"
 
@@ -414,21 +386,12 @@ msgstr "无结果"
 msgid "{current}/{total}"
 msgstr "{current}/{total}"
 
-msgid "Previous Match"
-msgstr "上一个匹配项"
-
-msgid "Next Match"
-msgstr "下一个匹配项"
-
 #. Notifications
 msgid "Command finished"
 msgstr "命令已完成"
 
 msgid "Command failed"
 msgstr "命令执行失败"
-
-msgid "Exit code: {code}"
-msgstr "退出码：{code}"
 
 #. GTK: language switching
 msgid "Language changed. Reopen the window to update all labels."
@@ -544,9 +507,6 @@ msgstr "重置终端"
 
 msgid "Close Tabs to the Right"
 msgstr "关闭右侧标签页"
-
-msgid "Execute a command…"
-msgstr "选择要执行的命令…"
 
 msgid "Export Terminal IO Events"
 msgstr "导出终端 IO 事件"
