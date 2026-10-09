@@ -613,7 +613,7 @@ msgstr "显示全部键盘快捷键。"
 msgid "Open the main menu."
 msgstr "打开主菜单。"
 
-#. win32 W3: command palette entries and groups, keyboard shortcut sheet
+#. Windows apprt: command palette entries and groups, keyboard shortcut sheet
 msgid "Type a command…"
 msgstr "输入命令…"
 
