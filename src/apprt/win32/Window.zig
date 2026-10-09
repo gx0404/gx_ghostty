@@ -2,15 +2,17 @@
 //! Win32 Window. Each Window is a top-level container HWND that owns
 //! one or more Surface child HWNDs as tabs (each tab a split tree).
 //!
-//! The Window owns the tab model (split trees, active surfaces, titles),
-//! split layout and window-level state (DPI scale, size limits) and
-//! orchestrates the chrome modules:
+//! The Window owns the tab model (split trees, active surfaces, titles,
+//! unread flags), split layout and window-level state (DPI scale, size
+//! limits, placement) and orchestrates the chrome modules:
 //!
-//!   - `chrome/TitleBar.zig` (`title_bar`): non-client frame, caption,
-//!     fullscreen and decorations; gets the first look at every message.
-//!   - `chrome/TabBar.zig` (`tab_bar`): tab bar painting, hit-testing,
-//!     drag, context menu and inline rename.
-//!   - `chrome/Backdrop.zig`: DWM theme, opacity and blur.
+//!   - `chrome/TitleBar.zig` (`title_bar`): non-client frame, the
+//!     integrated title bar row (caption buttons, main menu button,
+//!     tooltip), fullscreen and decorations; gets the first look at every
+//!     message and paints the chrome row.
+//!   - `chrome/TabBar.zig` (`tab_bar`): the tabs in that row: painting,
+//!     hit-testing, drag, context menu, inline rename, unread badges.
+//!   - `chrome/Backdrop.zig`: DWM theme, border, material, opacity, blur.
 //!   - `ui/ResizeOverlay.zig` (`resize_overlay`): the size overlay.
 //!   - `ui/Menu.zig`: the main menu, opened through `queueMainMenu`.
 //!
@@ -19,7 +21,17 @@
 //! a terminal runs a program (core `needsConfirmQuit`). herdr app mode
 //! (`updateAppMode`) hides the tab bar while the only tab runs herdr.
 //!
-//! Language changes reach the window through `onLanguageChanged`.
+//! The chrome is a single row at the top of the client area
+//! (`chromeHeight`); the terminals fill the rest. A new window is placed
+//! at about 80% of the work area of the monitor under the cursor
+//! (cascading from other windows) unless `window-position-*` or
+//! `window-width`/`window-height` say otherwise, and stays cloaked until
+//! its first terminal frame is presented (at most `first_frame_timeout_ms`)
+//! so it never flashes an unpainted frame.
+//!
+//! Language changes reach the window through `onLanguageChanged`, DPI
+//! changes through `WM_DPICHANGED` and configuration changes through
+//! `onConfigChange`.
 const Window = @This();
 
 const std = @import("std");
@@ -38,6 +50,7 @@ const TitleBar = @import("chrome/TitleBar.zig");
 const Dialogs = @import("ui/Dialogs.zig");
 const Menu = @import("ui/Menu.zig");
 const ResizeOverlay = @import("ui/ResizeOverlay.zig");
+const style = @import("ui/style.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -68,6 +81,10 @@ tab_titles: [MAX_TABS][256]u16 = undefined,
 
 /// Length of each tab title in UTF-16 code units.
 tab_title_lens: [MAX_TABS]u16 = undefined,
+
+/// Whether each tab received output (or rang the bell) since it was last
+/// the active tab (the tab bar shows a badge).
+tab_unread: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
 
 /// Explicit top-level window title override. Null follows the active tab.
 window_title_override_len: ?u16 = null,
@@ -120,6 +137,21 @@ app_mode: bool = false,
 /// Whether the herdr app mode timer (`app_mode_timer_id`) runs.
 app_mode_timer: bool = false,
 
+/// The window is shown but cloaked until its first frame (see
+/// `showWhenReady`); the surface whose frame it waits for and since when.
+first_frame_surface: ?*Surface = null,
+first_frame_since_ms: u64 = 0,
+
+/// Whether `window-position-x/-y` placed the window (no re-centering).
+position_configured: bool = false,
+
+/// The terminal size from `window-width`/`window-height` (`initial_size`,
+/// DIPs), restored by `reset_window_size`.
+initial_content_size: ?[2]u32 = null,
+
+/// Whether the window has been shown (`showWhenReady`).
+shown: bool = false,
+
 /// Posted by `queueMainMenu`; opens the main menu.
 const WM_APP_MAIN_MENU: u32 = w32.WM_APP + 20;
 
@@ -134,6 +166,21 @@ const app_mode_interval_ms: u32 = 1500;
 /// The most terminals of a tab whose processes the app mode check reads.
 const app_mode_max_terminals = 32;
 
+/// Polls for the first frame of a new window (`showWhenReady`).
+const FIRST_FRAME_TIMER_ID: usize = 0x4646; // 'FF'
+const first_frame_poll_ms: u32 = 10;
+/// Show the window even without a frame after this long.
+pub const first_frame_timeout_ms: u64 = 300;
+
+/// Drives the tab bar's unread badges and program labels.
+const CHROME_TIMER_ID: usize = 0x4348; // 'CH'
+const chrome_timer_ms: u32 = 1000;
+
+/// Share of the monitor work area a new window covers.
+const default_size_ratio: f32 = 0.8;
+/// Offset between cascaded windows in DIPs.
+const cascade_step: f32 = 30;
+
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
     /// If true, start fully opaque regardless of `background-opacity`. Set
@@ -143,9 +190,17 @@ pub const InitOptions = struct {
 };
 
 /// Called from App.config_change so the chrome tracks live config
-/// reloads (background color in particular).
+/// reloads: theme colors, border, material, decorations and tab bar.
 pub fn onConfigChange(self: *Window) void {
-    if (self.hwnd) |hwnd| Backdrop.onConfigChange(hwnd, &self.app.config);
+    const hwnd = self.hwnd orelse return;
+    const config = &self.app.config;
+    Backdrop.onConfigChange(hwnd, config);
+    if (!self.is_quick_terminal) {
+        const decoration = TitleBar.Decoration.fromConfig(config.@"window-decoration");
+        if (decoration != self.title_bar.decoration) self.title_bar.applyDecoration(config);
+    }
+    self.title_bar.onConfigChange();
+    self.onFrameChanged();
     self.updateAppMode();
 }
 
@@ -170,61 +225,31 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     };
 
     const window_style = TitleBar.windowStyle(&app.config, options.is_quick_terminal);
-    const style = window_style.style;
-    const ex_style = window_style.ex_style;
 
-    // Cascade non-quick-terminal windows: stack each new window 30px
-    // down/right of the most recently created window. Stops once the
-    // offset would push the window off the work area, then resets.
     // Quick terminals are positioned by QuickTerminal.calculateRects.
-    const cascade_step: i32 = 30;
-    var cx: i32 = w32.CW_USEDEFAULT;
-    var cy: i32 = w32.CW_USEDEFAULT;
-    // Honor an explicit configured window position; it takes precedence over
-    // the cascade below. Only when BOTH coordinates are set — passing
-    // CW_USEDEFAULT for one axis is not a valid literal coordinate (Win32
-    // only special-cases it on x, and would use a huge negative y or treat
-    // y as nCmdShow), so a partial config falls back to full default.
+    // Others start centered at 80% of the work area (`initialRect`).
+    // Honor an explicit configured window position only when BOTH
+    // coordinates are set; a partial config falls back to the default.
+    var rect = w32.RECT{ .left = w32.CW_USEDEFAULT, .top = w32.CW_USEDEFAULT, .right = 800, .bottom = 600 };
     if (!options.is_quick_terminal) {
+        var position: ?w32.POINT = null;
         if (app.config.@"window-position-x") |px| {
-            if (app.config.@"window-position-y") |py| {
-                cx = px;
-                cy = py;
-            }
+            if (app.config.@"window-position-y") |py| position = .{ .x = px, .y = py };
         }
-    }
-    if (!options.is_quick_terminal and
-        cx == w32.CW_USEDEFAULT and cy == w32.CW_USEDEFAULT and
-        app.windows.items.len > 0)
-    {
-        // Find the previously created window's position and bump.
-        const prev = app.windows.items[app.windows.items.len - 1];
-        if (prev.hwnd) |ph| {
-            var prev_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-            if (w32.GetWindowRect(ph, &prev_rect) != 0) {
-                cx = prev_rect.left + cascade_step;
-                cy = prev_rect.top + cascade_step;
-                // Reset the cascade if it would push off-screen.
-                if (cx + 800 > w32.GetSystemMetrics(0) or
-                    cy + 600 > w32.GetSystemMetrics(1))
-                {
-                    cx = w32.CW_USEDEFAULT;
-                    cy = w32.CW_USEDEFAULT;
-                }
-            }
-        }
+        self.position_configured = position != null;
+        rect = initialRect(position);
     }
 
     // Create the top-level container window using the GhosttyWindow class.
     const hwnd = w32.CreateWindowExW(
-        ex_style,
+        window_style.ex_style,
         App.WINDOW_CLASS_NAME,
         std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-        style,
-        cx,
-        cy,
-        800,
-        600,
+        window_style.style,
+        rect.left,
+        rect.top,
+        if (options.is_quick_terminal) rect.right else rect.right - rect.left,
+        if (options.is_quick_terminal) rect.bottom else rect.bottom - rect.top,
         null,
         null,
         app.hinstance,
@@ -237,34 +262,223 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.hwnd = null;
     }
 
+    // Keep the window invisible to the user until its first frame is
+    // presented (`showWhenReady`), so it never shows an unpainted frame.
+    if (!options.is_quick_terminal) setCloaked(hwnd, true);
+
     // Store the Window pointer in GWLP_USERDATA for the WndProc.
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
     Backdrop.apply(hwnd, &app.config, .{ .force_opaque = options.force_opaque });
 
-    // Query DPI scale. The default size above is in 96 DPI pixels.
+    // Query DPI scale (the window was created on its monitor already).
     const dpi = w32.GetDpiForWindow(hwnd);
     if (dpi != 0) {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
-    if (self.scale != 1.0 and !options.is_quick_terminal) {
-        _ = w32.SetWindowPos(
-            hwnd,
-            null,
-            0,
-            0,
-            @intFromFloat(@round(800.0 * self.scale)),
-            @intFromFloat(@round(600.0 * self.scale)),
-            w32.SWP_NOZORDER | w32.SWP_NOMOVE | w32.SWP_NOACTIVATE,
-        );
-    }
 
     self.tab_bar.createFont();
+    if (!options.is_quick_terminal) {
+        // WM_NCCALCSIZE reaches the title bar from now on.
+        self.title_bar.applyDecoration(&app.config);
+        _ = self.tab_bar.updateVisibility();
+        self.applyFrameMargins();
+        if (!self.position_configured) self.cascade();
+        _ = w32.SetTimer(hwnd, CHROME_TIMER_ID, chrome_timer_ms, null);
+    }
 
     // Don't show the window yet — addTab() will show the child
     // surface which triggers ShowWindow on the parent as needed.
     // Showing the parent before the terminal is ready can cause
     // timing issues with ConPTY.
+}
+
+/// The rectangle (screen pixels) of a new window: 80% of the work area of
+/// the monitor under the cursor (or under `position`), centered there or
+/// at `position`.
+fn initialRect(position: ?w32.POINT) w32.RECT {
+    var anchor: w32.POINT = .{ .x = 0, .y = 0 };
+    if (position) |p| {
+        anchor = p;
+    } else if (w32.GetCursorPos_(&anchor) == 0) {
+        anchor = .{ .x = 0, .y = 0 };
+    }
+    const work = workAreaAt(anchor);
+    const work_w = work.right - work.left;
+    const work_h = work.bottom - work.top;
+    const w: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(work_w)) * default_size_ratio));
+    const h: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(work_h)) * default_size_ratio));
+    if (position) |p| return .{ .left = p.x, .top = p.y, .right = p.x + w, .bottom = p.y + h };
+    const x = work.left + @divTrunc(work_w - w, 2);
+    const y = work.top + @divTrunc(work_h - h, 2);
+    return .{ .left = x, .top = y, .right = x + w, .bottom = y + h };
+}
+
+/// The work area of the monitor nearest to `pt`.
+fn workAreaAt(pt: w32.POINT) w32.RECT {
+    var mi: w32.MONITORINFO = undefined;
+    mi.cbSize = @sizeOf(w32.MONITORINFO);
+    if (w32.MonitorFromPoint(pt, w32.MONITOR_DEFAULTTONEAREST)) |monitor| {
+        if (w32.GetMonitorInfoW(monitor, &mi) != 0) return mi.rcWork;
+    }
+    return .{ .left = 0, .top = 0, .right = 1280, .bottom = 800 };
+}
+
+/// The work area of the monitor the window is on.
+fn workArea(hwnd: w32.HWND) w32.RECT {
+    var mi: w32.MONITORINFO = undefined;
+    mi.cbSize = @sizeOf(w32.MONITORINFO);
+    const monitor = w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST);
+    if (w32.GetMonitorInfoW(monitor, &mi) != 0) return mi.rcWork;
+    return .{ .left = 0, .top = 0, .right = 1280, .bottom = 800 };
+}
+
+/// Center the window on its work area at its current size and step it
+/// down-right past other windows already sitting there.
+fn cascade(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &rect) == 0) return;
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    const work = workArea(hwnd);
+    const center_x = work.left + @divTrunc(work.right - work.left - w, 2);
+    const center_y = work.top + @divTrunc(work.bottom - work.top - h, 2);
+    var x = center_x;
+    var y = center_y;
+    const step = style.px(cascade_step, self.scale);
+    var tries: usize = 0;
+    while (tries < 64 and self.positionTaken(x, y, @divTrunc(step, 2))) : (tries += 1) {
+        x += step;
+        y += step;
+        if (x + w > work.right or y + h > work.bottom) {
+            x = center_x;
+            y = center_y;
+            break;
+        }
+    }
+    if (x != rect.left or y != rect.top) {
+        _ = w32.SetWindowPos(hwnd, null, x, y, 0, 0, w32.SWP_NOZORDER | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE);
+    }
+}
+
+/// Whether another visible window has its top-left corner near (x, y).
+fn positionTaken(self: *const Window, x: i32, y: i32, tolerance: i32) bool {
+    for (self.app.windows.items) |other| {
+        if (other == self) continue;
+        const h = other.hwnd orelse continue;
+        if (w32.IsWindowVisible_(h) == 0) continue;
+        var r: w32.RECT = undefined;
+        if (w32.GetWindowRect(h, &r) == 0) continue;
+        if (@abs(r.left - x) <= tolerance and @abs(r.top - y) <= tolerance) return true;
+    }
+    return false;
+}
+
+/// The terminal size `window-width`/`window-height` ask for (the
+/// `initial_size` action, in DIPs). Like a GTK default size it only sizes
+/// the window before it is shown (clamped to the work area and centered
+/// again unless the position is configured); later updates (font size
+/// changes) only change what `reset_window_size` restores.
+pub fn setInitialSize(self: *Window, width: u32, height: u32) void {
+    self.initial_content_size = .{ width, height };
+    if (!self.shown) self.applyContentSize(width, height, !self.position_configured);
+}
+
+/// Restore the size the window started with (`reset_window_size`).
+pub fn resetWindowSize(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.initial_content_size) |size| {
+        self.applyContentSize(size[0], size[1], false);
+        return;
+    }
+    if (self.is_quick_terminal or self.title_bar.is_fullscreen) return;
+    if (w32.IsZoomed(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+    var rect: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &rect) == 0) return;
+    const default = initialRect(.{ .x = rect.left, .y = rect.top });
+    _ = w32.SetWindowPos(hwnd, null, 0, 0, default.right - default.left, default.bottom - default.top, w32.SWP_NOZORDER | w32.SWP_NOMOVE | w32.SWP_NOACTIVATE);
+}
+
+fn applyContentSize(self: *Window, width: u32, height: u32, recenter: bool) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.is_quick_terminal or self.title_bar.is_fullscreen) return;
+    if (w32.IsZoomed(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+    var window_rect: w32.RECT = undefined;
+    var client: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &window_rect) == 0) return;
+    if (w32.GetClientRect(hwnd, &client) == 0) return;
+    const nc_w = (window_rect.right - window_rect.left) - (client.right - client.left);
+    const nc_h = (window_rect.bottom - window_rect.top) - (client.bottom - client.top);
+    const work = workArea(hwnd);
+    const content_w: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(width)) * self.scale));
+    const content_h: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(height)) * self.scale));
+    const w = @min(content_w + nc_w, work.right - work.left);
+    const h = @min(content_h + self.chromeHeight() + nc_h, work.bottom - work.top);
+    _ = w32.SetWindowPos(hwnd, null, 0, 0, w, h, w32.SWP_NOZORDER | w32.SWP_NOMOVE | w32.SWP_NOACTIVATE);
+    if (recenter) self.cascade();
+}
+
+/// Cloak or uncloak the window (DWMWA_CLOAK): a cloaked window is shown
+/// and painted as usual but DWM keeps it off the screen.
+fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
+    const value: u32 = @intFromBool(cloaked);
+    _ = w32.DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, @ptrCast(&value), @sizeOf(u32));
+}
+
+const DWMWA_CLOAK: u32 = 13;
+
+/// Show the (cloaked) window and uncloak it once `surface` presented a
+/// frame, or after `first_frame_timeout_ms`.
+fn showWhenReady(self: *Window, surface: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    // Wait for a frame presented after the window is shown, not one
+    // drawn into the hidden window.
+    if (surface.frame_event) |event| _ = w32.ResetEvent(event);
+    self.shown = true;
+    _ = w32.ShowWindow(hwnd, if (self.app.config.maximize) SW_SHOWMAXIMIZED else w32.SW_SHOW);
+    _ = w32.UpdateWindow(hwnd);
+    self.first_frame_surface = surface;
+    self.first_frame_since_ms = GetTickCount64();
+    _ = w32.SetTimer(hwnd, FIRST_FRAME_TIMER_ID, first_frame_poll_ms, null);
+}
+
+/// WM_TIMER for `showWhenReady`.
+fn checkFirstFrame(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const surface = self.first_frame_surface orelse {
+        _ = w32.KillTimer(hwnd, FIRST_FRAME_TIMER_ID);
+        return;
+    };
+    const elapsed = GetTickCount64() -| self.first_frame_since_ms;
+    const drawn = if (surface.frame_event) |event|
+        w32.WaitForSingleObject(event, 0) == w32.WAIT_OBJECT_0
+    else
+        true;
+    if (!drawn and elapsed < first_frame_timeout_ms) return;
+    _ = w32.KillTimer(hwnd, FIRST_FRAME_TIMER_ID);
+    self.first_frame_surface = null;
+    setCloaked(hwnd, false);
+    log.debug("window shown after {d}ms first_frame={}", .{ elapsed, drawn });
+}
+
+const SW_SHOWMAXIMIZED: i32 = 3;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+/// Extend the DWM frame under the chrome row when the window material
+/// shows through it (`Backdrop.extendFrame`).
+pub fn applyFrameMargins(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    Backdrop.extendFrame(hwnd, &self.app.config, if (self.title_bar.translucent()) self.chromeHeight() else 0);
+}
+
+/// The frame changed (fullscreen, decorations, configuration): update the
+/// tab visibility, the DWM frame and the layout, and repaint.
+pub fn onFrameChanged(self: *Window) void {
+    _ = self.tab_bar.updateVisibility();
+    self.applyFrameMargins();
+    self.layoutSplits();
+    if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
 /// Handle WM_DPICHANGED, which only top-level windows receive: adopt the
@@ -294,9 +508,11 @@ fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     }
 
     // The new rect can have the same size in pixels, in which case no
-    // WM_SIZE arrives to lay the surfaces out again.
+    // WM_SIZE arrives to lay the surfaces out again. The chrome row and
+    // the DWM frame under it scale with the DPI.
+    self.applyFrameMargins();
     self.layoutSplits();
-    self.invalidateTabBar();
+    if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
 /// Resize the window so that `surface` gets the requested size in points
@@ -345,8 +561,9 @@ pub fn deinit(self: *Window) void {
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
 
-    // Delete the tab bar fonts.
+    // Delete the tab bar fonts and the title bar canvas and tooltip.
     self.tab_bar.deinit();
+    self.title_bar.deinit();
 
     // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
     if (self.hwnd) |hwnd| {
@@ -356,16 +573,16 @@ pub fn deinit(self: *Window) void {
     }
 }
 
-/// Returns the tab bar height in pixels, accounting for DPI scale.
-/// Returns 0 if the tab bar is not visible.
+/// Returns the height in pixels of the chrome row while it shows tabs,
+/// else 0.
 pub fn tabBarHeight(self: *const Window) i32 {
-    return self.tab_bar.height();
+    return if (self.tab_bar.visible) self.title_bar.height() else 0;
 }
 
-/// Height of the chrome above the terminals: the client-area part of the
-/// title bar plus the tab bar.
+/// Height of the chrome above the terminals: the single chrome row (the
+/// integrated title bar with the tabs, or a plain tab row).
 pub fn chromeHeight(self: *const Window) i32 {
-    return self.title_bar.height() + self.tab_bar.height();
+    return self.title_bar.height();
 }
 
 /// Returns the client rect available for the active surface, which is
@@ -422,6 +639,34 @@ pub fn queueMainMenu(self: *Window, anchor: ?w32.POINT) bool {
     return w32.PostMessageW(hwnd, WM_APP_MAIN_MENU, 0, 0) != 0;
 }
 
+/// Alt+Space (without Ctrl, Shift or Win) opens the window menu of the
+/// window that owns `msg.hwnd`, like in every Windows app, unless a
+/// keybind uses alt+space. The message loop calls this before
+/// dispatching keys; returns true when the key was used.
+pub fn handleSystemMenuKey(app: *App, msg: *const w32.MSG) bool {
+    if (msg.message != w32.WM_SYSKEYDOWN or (msg.wParam & 0xFFFF) != w32.VK_SPACE) return false;
+    if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0 or
+        w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0 or
+        w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+        w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0) return false;
+    const target = msg.hwnd orelse return false;
+    const root = GetAncestor(target, GA_ROOT) orelse return false;
+    const set = &app.config.keybind.set;
+    const mods: input.Mods = .{ .alt = true };
+    if (set.get(.{ .key = .{ .physical = .space }, .mods = mods }) != null or
+        set.get(.{ .key = .{ .unicode = ' ' }, .mods = mods }) != null) return false;
+    for (app.windows.items) |window| {
+        if (window.hwnd != root or window.closing) continue;
+        window.title_bar.openSystemMenuFromKeyboard();
+        return true;
+    }
+    return false;
+}
+
+const input = @import("../../input.zig");
+const GA_ROOT: u32 = 2;
+extern "user32" fn GetAncestor(hwnd: w32.HWND, gaFlags: u32) callconv(.winapi) ?w32.HWND;
+
 /// Find the tab index containing a given surface.
 /// Checks tab_active_surface first, then scans all trees.
 pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
@@ -444,6 +689,38 @@ fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surfa
         if (entry.view == surface) return entry.handle;
     }
     return null;
+}
+
+/// Everything the window keeps per tab, for moving tabs between slots.
+const TabSlot = struct {
+    tree: SplitTree(Surface),
+    active_surface: *Surface,
+    title: [256]u16,
+    title_len: u16,
+    unread: bool,
+};
+
+fn getSlot(self: *const Window, i: usize) TabSlot {
+    return .{
+        .tree = self.tab_trees[i],
+        .active_surface = self.tab_active_surface[i],
+        .title = self.tab_titles[i],
+        .title_len = self.tab_title_lens[i],
+        .unread = self.tab_unread[i],
+    };
+}
+
+fn setSlot(self: *Window, i: usize, slot: TabSlot) void {
+    self.tab_trees[i] = slot.tree;
+    self.tab_active_surface[i] = slot.active_surface;
+    self.tab_titles[i] = slot.title;
+    self.tab_title_lens[i] = slot.title_len;
+    self.tab_unread[i] = slot.unread;
+}
+
+/// Copy tab slot `src` over slot `dst`.
+fn copySlot(self: *Window, dst: usize, src: usize) void {
+    self.setSlot(dst, self.getSlot(src));
 }
 
 /// Add a new tab surface to this window. The surface is created,
@@ -480,14 +757,10 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
 
     // Shift elements right to make room at pos.
     var i: usize = self.tab_count;
-    while (i > pos) : (i -= 1) {
-        self.tab_trees[i] = self.tab_trees[i - 1];
-        self.tab_active_surface[i] = self.tab_active_surface[i - 1];
-        self.tab_titles[i] = self.tab_titles[i - 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i - 1];
-    }
+    while (i > pos) : (i -= 1) self.copySlot(i, i - 1);
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
+    self.tab_unread[pos] = false;
     self.tab_count += 1;
 
     // Set default title.
@@ -496,15 +769,12 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.tab_title_lens[pos] = @intCast(default_title.len);
 
     if (self.tab_count == 1) {
-        // First tab — show the parent window now that the terminal is ready.
-        // Quick terminal windows are shown by QuickTerminal.animateIn() instead.
-        if (!self.is_quick_terminal) {
-            if (self.hwnd) |h| {
-                _ = w32.ShowWindow(h, w32.SW_SHOW);
-                _ = w32.UpdateWindow(h);
-            }
-        }
+        // First tab — show the parent window now that the terminal is
+        // ready, uncloaking it with the first frame. Quick terminal
+        // windows are shown by QuickTerminal.animateIn() instead.
         self.active_tab = pos;
+        self.updateTabBarVisibility();
+        if (!self.is_quick_terminal) self.showWhenReady(surface);
         self.updateWindowTitle();
         // Set keyboard focus to the child surface so it receives input.
         if (!self.is_quick_terminal) {
@@ -628,12 +898,7 @@ fn removeTab(self: *Window, idx: usize) void {
     var tree = self.tab_trees[idx];
     tree.deinit(); // This unrefs all surfaces → Surface.unref frees when ref_count=0
     var i: usize = idx;
-    while (i + 1 < self.tab_count) : (i += 1) {
-        self.tab_trees[i] = self.tab_trees[i + 1];
-        self.tab_active_surface[i] = self.tab_active_surface[i + 1];
-        self.tab_titles[i] = self.tab_titles[i + 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i + 1];
-    }
+    while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
     self.tab_count -= 1;
     if (self.tab_count == 0) {
         self.closing = true;
@@ -760,10 +1025,12 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
         }
     }
     self.active_tab = idx;
+    self.tab_unread[idx] = false;
     const surface = self.tab_active_surface[idx];
     self.layoutSplits();
     if (surface.hwnd) |h| _ = w32.SetFocus(h);
     self.updateWindowTitle();
+    self.invalidateTabBar();
 }
 
 /// Layout split panes for the active tab.
@@ -1143,10 +1410,9 @@ pub fn moveTab(self: *Window, amount: isize) void {
     if (new_index == self.active_tab) return;
 
     // Swap all tab state between active_tab and new_index.
-    std.mem.swap(SplitTree(Surface), &self.tab_trees[self.active_tab], &self.tab_trees[new_index]);
-    std.mem.swap(*Surface, &self.tab_active_surface[self.active_tab], &self.tab_active_surface[new_index]);
-    std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
-    std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
+    const moved = self.getSlot(self.active_tab);
+    self.copySlot(self.active_tab, new_index);
+    self.setSlot(new_index, moved);
     self.active_tab = new_index;
     self.invalidateTabBar();
 }
@@ -1198,17 +1464,12 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
         }
     }
 
-    const moved_active = self.tab_active_surface[tab_idx];
-    const moved_title = self.tab_titles[tab_idx];
-    const moved_title_len = self.tab_title_lens[tab_idx];
+    var moved = self.getSlot(tab_idx);
+    moved.unread = false;
+    const moved_active = moved.active_surface;
 
     var i = tab_idx;
-    while (i + 1 < self.tab_count) : (i += 1) {
-        self.tab_trees[i] = self.tab_trees[i + 1];
-        self.tab_active_surface[i] = self.tab_active_surface[i + 1];
-        self.tab_titles[i] = self.tab_titles[i + 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i + 1];
-    }
+    while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
     self.tab_count -= 1;
     if (self.active_tab > tab_idx) {
         self.active_tab -= 1;
@@ -1216,10 +1477,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
         self.active_tab = self.tab_count - 1;
     }
 
-    destination.tab_trees[0] = moved_tree;
-    destination.tab_active_surface[0] = moved_active;
-    destination.tab_titles[0] = moved_title;
-    destination.tab_title_lens[0] = moved_title_len;
+    destination.setSlot(0, moved);
     destination.tab_count = 1;
     destination.active_tab = 0;
 
@@ -1233,9 +1491,8 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     destination.updateTabBarVisibility();
     destination.updateWindowTitle();
-    _ = w32.ShowWindow(destination_hwnd, w32.SW_SHOW);
-    _ = w32.UpdateWindow(destination_hwnd);
     destination.layoutSplits();
+    destination.showWhenReady(moved_active);
     if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
     destination.updateAppMode();
 
@@ -1283,9 +1540,13 @@ pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) 
     self.invalidateTabBar();
 }
 
-/// Update tab bar visibility based on config and tab count.
+/// Update tab bar visibility based on config and tab count. The chrome row
+/// can change height with it.
 fn updateTabBarVisibility(self: *Window) void {
-    if (self.tab_bar.updateVisibility()) self.handleResize();
+    if (!self.tab_bar.updateVisibility()) return;
+    self.applyFrameMargins();
+    self.handleResize();
+    if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
 /// Hide the tab bar regardless of `window-show-tab-bar`, or stop hiding
@@ -1401,36 +1662,20 @@ pub fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_bar.cancelRename();
 
     // Save the source tab state
-    const saved_tree = self.tab_trees[from];
-    const saved_surface = self.tab_active_surface[from];
-    const saved_title = self.tab_titles[from];
-    const saved_title_len = self.tab_title_lens[from];
+    const saved = self.getSlot(from);
 
     if (from < to) {
         // Shift left: move [from+1..to+1] to [from..to]
         var i: usize = from;
-        while (i < to) : (i += 1) {
-            self.tab_trees[i] = self.tab_trees[i + 1];
-            self.tab_active_surface[i] = self.tab_active_surface[i + 1];
-            self.tab_titles[i] = self.tab_titles[i + 1];
-            self.tab_title_lens[i] = self.tab_title_lens[i + 1];
-        }
+        while (i < to) : (i += 1) self.copySlot(i, i + 1);
     } else {
         // Shift right: move [to..from] to [to+1..from+1]
         var i: usize = from;
-        while (i > to) : (i -= 1) {
-            self.tab_trees[i] = self.tab_trees[i - 1];
-            self.tab_active_surface[i] = self.tab_active_surface[i - 1];
-            self.tab_titles[i] = self.tab_titles[i - 1];
-            self.tab_title_lens[i] = self.tab_title_lens[i - 1];
-        }
+        while (i > to) : (i -= 1) self.copySlot(i, i - 1);
     }
 
     // Place the saved tab at the destination
-    self.tab_trees[to] = saved_tree;
-    self.tab_active_surface[to] = saved_surface;
-    self.tab_titles[to] = saved_title;
-    self.tab_title_lens[to] = saved_title_len;
+    self.setSlot(to, saved);
 
     self.active_tab = to;
     self.invalidateTabBar();
@@ -1502,6 +1747,7 @@ fn onDestroy(self: *Window) void {
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
     if (self.is_quick_terminal) {
         self.tab_bar.deinit();
+        self.title_bar.deinit();
         self.hwnd = null;
         // QuickTerminal handles the rest of cleanup (freeing self, quit timer).
         if (app.quick_terminal) |qt| {
@@ -1520,6 +1766,7 @@ fn onDestroy(self: *Window) void {
 
     // Clean up Window-level resources.
     self.tab_bar.deinit();
+    self.title_bar.deinit();
     self.hwnd = null;
 
     // Free the Window allocation.
@@ -1532,15 +1779,52 @@ fn onDestroy(self: *Window) void {
 }
 
 /// Handle WM_PAINT: the client area outside the terminals is the chrome
-/// (title bar and tab bar).
+/// row (title bar with the tabs).
 fn paint(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
     self.title_bar.paint(hdc);
-    self.tab_bar.paint(hdc);
 }
+
+/// Client coordinates of a mouse message.
+fn mousePoint(lparam: isize) w32.POINT {
+    return .{
+        .x = @as(i16, @truncate(lparam & 0xFFFF)),
+        .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+    };
+}
+
+/// Whether client `y` lies in the chrome row.
+fn inChrome(self: *const Window, y: i32) bool {
+    return y >= 0 and y < self.chromeHeight();
+}
+
+/// The tab of `surface` rang the bell: badge it unless it is the active
+/// tab.
+pub fn onBell(self: *Window, surface: *Surface) void {
+    self.tab_bar.markUnread(surface);
+}
+
+/// A right click in the client part of the chrome row: the tab menus, or
+/// just "New Tab" on an empty part (a fullscreen tab row; the empty title
+/// bar is a caption with the window menu).
+fn onChromeRightClick(self: *Window, pt: w32.POINT) void {
+    if (self.tab_bar.onRightButtonUp(self.title_bar.layout(), pt.x, pt.y)) return;
+    const hwnd = self.hwnd orelse return;
+    var screen = pt;
+    _ = w32.ClientToScreen(hwnd, &screen);
+    const command = Menu.showTabContextMenu(hwnd, screen, .{
+        .tab = null,
+        .tab_count = self.tab_count,
+    }) orelse return;
+    if (command == .new_tab) _ = self.addTab() catch |err| {
+        log.err("failed to create new tab: {}", .{err});
+    };
+}
+
+const WM_CAPTURECHANGED: u32 = 0x0215;
 
 /// Window procedure for top-level container HWNDs (GhosttyWindow class).
 /// GWLP_USERDATA stores a *Window pointer.
@@ -1567,6 +1851,7 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDBLCLK,
         w32.WM_RBUTTONUP,
         w32.WM_MBUTTONDOWN,
+        w32.WM_MBUTTONUP,
         w32.WM_MOUSEMOVE,
         w32.WM_MOUSELEAVE,
         w32.WM_MOUSEWHEEL,
@@ -1598,11 +1883,14 @@ pub fn windowWndProc(
         },
         w32.WM_TIMER => {
             if (window.resize_overlay.onTimer(wparam)) return 0;
-            if (wparam == app_mode_timer_id) {
-                window.updateAppMode();
-                return 0;
+            if (window.title_bar.onTimer(wparam)) return 0;
+            switch (wparam) {
+                FIRST_FRAME_TIMER_ID => window.checkFirstFrame(),
+                CHROME_TIMER_ID => window.tab_bar.onTimer(),
+                app_mode_timer_id => window.updateAppMode(),
+                else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
             }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            return 0;
         },
 
         WM_APP_MAIN_MENU => {
@@ -1641,6 +1929,10 @@ pub fn windowWndProc(
             if (wparam == w32.SIZE_RESTORED or wparam == w32.SIZE_MAXIMIZED) {
                 window.setActiveTabVisible(true);
             }
+            // Maximizing moves the tabs (no left margin) and swaps the
+            // maximize glyph: repaint the whole chrome row.
+            window.title_bar.tooltip.hide();
+            window.title_bar.invalidate();
             window.handleResize();
             return 0;
         },
@@ -1750,15 +2042,12 @@ pub fn windowWndProc(
         },
         w32.WM_ERASEBKGND => return 1,
         w32.WM_LBUTTONDOWN => {
-            const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
-            const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
-            if (window.hitTestDivider(x, y)) |hit| {
+            const pt = mousePoint(lparam);
+            if (window.hitTestDivider(pt.x, pt.y)) |hit| {
                 window.startDividerDrag(hit.handle, hit.layout);
                 return 0;
             }
-            if (window.tab_bar.contains(y)) {
-                window.tab_bar.onLeftButtonDown(@truncate(x), @truncate(y));
-            }
+            _ = window.title_bar.onLeftButtonDown(pt.x, pt.y);
             return 0;
         },
         w32.WM_LBUTTONUP => {
@@ -1766,18 +2055,18 @@ pub fn windowWndProc(
                 window.endDividerDrag();
                 return 0;
             }
-            _ = window.tab_bar.onLeftButtonUp();
+            const pt = mousePoint(lparam);
+            _ = window.title_bar.onLeftButtonUp(pt.x, pt.y);
             return 0;
         },
         w32.WM_LBUTTONDBLCLK => {
-            const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
-            const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
-            // Double-click on tab bar starts inline rename
-            if (window.tab_bar.contains(y)) {
-                window.tab_bar.onDoubleClick(x);
+            const pt = mousePoint(lparam);
+            // Double-click on a tab starts inline rename.
+            if (window.inChrome(pt.y)) {
+                _ = window.tab_bar.onDoubleClick(window.title_bar.layout(), pt.x, pt.y);
                 return 0;
             }
-            if (window.hitTestDivider(x, y)) |hit| {
+            if (window.hitTestDivider(pt.x, pt.y)) |hit| {
                 window.tab_trees[window.active_tab].resizeInPlace(hit.handle, @as(f16, 0.5));
                 window.layoutSplits();
                 return 0;
@@ -1785,23 +2074,33 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_RBUTTONUP => {
-            const x: i16 = @truncate(lparam & 0xFFFF);
-            const y: i16 = @truncate((lparam >> 16) & 0xFFFF);
-            if (window.tab_bar.contains(y)) {
-                window.tab_bar.onRightButtonUp(x, y);
+            const pt = mousePoint(lparam);
+            if (window.inChrome(pt.y)) {
+                window.onChromeRightClick(pt);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_MBUTTONUP => {
+            const pt = mousePoint(lparam);
+            if (window.inChrome(pt.y)) {
+                _ = window.tab_bar.onMiddleButtonUp(window.title_bar.layout(), pt.x, pt.y);
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_MOUSEMOVE => {
-            const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
-            const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            const pt = mousePoint(lparam);
             if (window.dragging_split) {
-                window.updateDividerDrag(x, y);
+                window.updateDividerDrag(pt.x, pt.y);
                 return 0;
             }
-            // Tab drag reorder and tab bar hover.
-            _ = window.tab_bar.onMouseMove(x, y);
+            // Tab drag reorder and chrome hover.
+            _ = window.title_bar.onMouseMove(pt.x, pt.y);
+            return 0;
+        },
+        WM_CAPTURECHANGED => {
+            window.tab_bar.onCaptureLost();
             return 0;
         },
         w32.WM_SETCURSOR => {
@@ -1819,7 +2118,7 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_MOUSELEAVE => {
-            window.tab_bar.onMouseLeave();
+            window.title_bar.onMouseLeave();
             return 0;
         },
         w32.WM_ACTIVATE => {

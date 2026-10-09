@@ -39,6 +39,18 @@ pub const Tokens = struct {
     /// Hairline borders and separators.
     border: Color,
 
+    /// Fill of the title bar row with the solid window material: a shade
+    /// darker than the terminal background (lighter for near-black
+    /// backgrounds), so the active tab, which has the terminal
+    /// background, stands out of the strip.
+    title_bar: Color,
+    /// The 1px Windows 11 window border.
+    window_border: Color,
+    /// Translucent overlays for hovered and pressed chrome buttons and
+    /// tabs; they work on the solid strip and over a backdrop material.
+    overlay_hover: Color,
+    overlay_pressed: Color,
+
     text: Color,
     text_secondary: Color,
     text_disabled: Color,
@@ -46,6 +58,8 @@ pub const Tokens = struct {
     /// The red of a hovered close button (Windows 11 caption close).
     close_hover: Color = Color.hex(0xc42b1c),
     close_hover_text: Color = Color.hex(0xffffff),
+    /// The pressed caption close button.
+    close_pressed: Color = Color.hex(0xc42b1c).withAlpha(0.9),
 
     pub fn fromConfig(config: *const Config) Tokens {
         const bg = fromConfigColor(config.background);
@@ -64,8 +78,10 @@ pub const Tokens = struct {
     pub fn fromColors(bg: Color, fg: Color, accent: Color) Tokens {
         const surface = mix(bg, fg, 0.06);
         const surface_raised = mix(bg, fg, 0.10);
+        const dark = luminance(bg) < 0.5;
+        const black = Color.hex(0x000000);
         return .{
-            .dark = luminance(bg) < 0.5,
+            .dark = dark,
             .background = bg,
             .foreground = fg,
             .accent = accent,
@@ -76,6 +92,15 @@ pub const Tokens = struct {
             .pressed = mix(surface_raised, fg, 0.14),
             .selected = mix(surface_raised, accent, 0.28),
             .border = mix(bg, fg, 0.16),
+            .title_bar = if (!dark)
+                mix(bg, black, 0.08)
+            else if (luminance(bg) < 0.03)
+                mix(bg, fg, 0.08)
+            else
+                mix(bg, black, 0.32),
+            .window_border = mix(bg, fg, if (dark) 0.18 else 0.22),
+            .overlay_hover = fg.withAlpha(if (dark) 0.08 else 0.06),
+            .overlay_pressed = fg.withAlpha(if (dark) 0.05 else 0.04),
             .text = fg,
             .text_secondary = mix(fg, bg, 0.35),
             .text_disabled = mix(fg, bg, 0.6),
@@ -114,7 +139,15 @@ pub fn luminance(c: Color) f32 {
 
 /// Metrics in DIPs (pixels at 96 DPI); scale with `px`.
 pub const metrics = struct {
-    /// Height of the tab bar.
+    /// Height of the title bar row that holds the tabs and the caption
+    /// buttons (Windows 11 tabbed apps).
+    pub const title_bar_height: f32 = 40;
+    /// Width of a caption button (minimize, maximize/restore, close).
+    pub const caption_button_width: f32 = 46;
+    /// Size of the caption button glyphs.
+    pub const caption_glyph_size: f32 = 10;
+    /// Height of the tab bar without caption buttons (native title bar,
+    /// borderless and fullscreen windows).
     pub const tab_bar_height: f32 = 36;
     /// Corner radius of tabs, buttons and list items.
     pub const corner_radius: f32 = 8;
@@ -174,6 +207,20 @@ test "tokens follow the background" {
     try testing.expect(!light.dark);
     try testing.expect(luminance(light.surface) < luminance(light.background));
     try testing.expectEqual(@as(u32, 0xffffff), light.on_accent.colorRef());
+}
+
+test "the title bar strip contrasts with the active tab" {
+    const testing = std.testing;
+    // The active tab has the terminal background; the strip is darker.
+    const dark = Tokens.fromColors(Color.hex(0x1f1f28), Color.hex(0xffffff), Color.hex(0xf5e0dc));
+    try testing.expect(luminance(dark.title_bar) < luminance(dark.background));
+    const light = Tokens.fromColors(Color.hex(0xeff1f5), Color.hex(0x4c4f69), Color.hex(0x1e66f5));
+    try testing.expect(luminance(light.title_bar) < luminance(light.background));
+    // A black background cannot get darker: the strip is lighter.
+    const black = Tokens.fromColors(Color.hex(0x000000), Color.hex(0xcccccc), Color.hex(0x3d8ef8));
+    try testing.expect(luminance(black.title_bar) > luminance(black.background));
+    // Overlays are translucent foreground.
+    try testing.expect(dark.overlay_hover.a > 0 and dark.overlay_hover.a < 0.5);
 }
 
 test "px rounds" {

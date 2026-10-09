@@ -898,6 +898,8 @@ pub const Canvas = struct {
     pixel_size: SizeU = .{ .width = 0, .height = 0 },
     dpi: f32 = 96,
     drawing: bool = false,
+    /// Whether the DC target keeps per-pixel alpha (`beginDcAlpha`).
+    dc_alpha: bool = false,
 
     const Target = union(enum) {
         none,
@@ -978,12 +980,26 @@ pub const Canvas = struct {
     /// Begin drawing into `rect` (pixels) of a GDI device context, e.g.
     /// the memory DC of a double-buffered WM_PAINT.
     pub fn beginDc(self: *Canvas, hdc: w32.HDC, rect: w32.RECT, dpi: u32) bool {
+        return self.beginDcMode(hdc, rect, dpi, false);
+    }
+
+    /// Like `beginDc`, but keeps per-pixel alpha (premultiplied) so the
+    /// result can be blitted over a DWM backdrop. `hdc` must have a 32bpp
+    /// DIB section selected.
+    pub fn beginDcAlpha(self: *Canvas, hdc: w32.HDC, rect: w32.RECT, dpi: u32) bool {
+        return self.beginDcMode(hdc, rect, dpi, true);
+    }
+
+    fn beginDcMode(self: *Canvas, hdc: w32.HDC, rect: w32.RECT, dpi: u32, alpha: bool) bool {
         const dpi_f: f32 = @floatFromInt(if (dpi == 0) 96 else dpi);
-        if (self.target == .hwnd) self.discardTarget();
+        if (self.target == .hwnd or (self.target == .dc and self.dc_alpha != alpha)) self.discardTarget();
         if (self.target == .none) {
             var rt: ?*ID2D1DCRenderTarget = null;
             const props: RenderTargetProperties = .{
-                .pixel_format = .{ .format = DXGI_FORMAT_B8G8R8A8_UNORM, .alpha_mode = D2D1_ALPHA_MODE_IGNORE },
+                .pixel_format = .{
+                    .format = DXGI_FORMAT_B8G8R8A8_UNORM,
+                    .alpha_mode = if (alpha) D2D1_ALPHA_MODE_PREMULTIPLIED else D2D1_ALPHA_MODE_IGNORE,
+                },
                 .dpi_x = dpi_f,
                 .dpi_y = dpi_f,
             };
@@ -992,6 +1008,7 @@ pub const Canvas = struct {
                 return false;
             }
             self.target = .{ .dc = rt orelse return false };
+            self.dc_alpha = alpha;
             self.dpi = dpi_f;
         }
         const rt = self.target.dc;
@@ -1169,4 +1186,5 @@ pub const icons = struct {
     pub const restore: u21 = 0xE923;
     pub const close: u21 = 0xE8BB;
     pub const more: u21 = 0xE712;
+    pub const shield: u21 = 0xEA18;
 };
