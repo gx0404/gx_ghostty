@@ -6,9 +6,11 @@ pub const Backend = enum {
     /// FreeType for font rendering with no font discovery enabled.
     freetype,
 
-    /// FreeType for font rendering with a built-in Windows font directory
-    /// scanner (C:\Windows\Fonts + %LOCALAPPDATA%\Microsoft\Windows\Fonts).
-    /// Used when DirectWrite is not available; matches by family_name and
+    // fork(gx): GX-0009 discovery is DirectWrite with the directory scanner as fallback
+    /// FreeType for font rendering with DirectWrite font discovery
+    /// (src/font/directwrite/). If DirectWrite is not available, a built-in
+    /// Windows font directory scanner (C:\Windows\Fonts +
+    /// %LOCALAPPDATA%\Microsoft\Windows\Fonts) matches by family_name and
     /// SFNT name table without any external index.
     freetype_windows,
 
@@ -48,9 +50,8 @@ pub const Backend = enum {
 
         if (target.os.tag == .windows) {
             // Avoid fontconfig on Windows because its libxml2 dependency
-            // may not unpack due to symlinks. Use the FreeType-based
-            // Windows font-directory scanner for discovery. A future
-            // DirectWrite backend can replace this if needed.
+            // may not unpack due to symlinks.
+            // fork(gx): GX-0009 freetype_windows discovers fonts through DirectWrite
             return .freetype_windows;
         }
 

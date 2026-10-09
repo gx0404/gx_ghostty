@@ -19,7 +19,8 @@ const log = std.log.scoped(.discovery);
 /// Discover implementation for the compile options.
 pub const Discover = switch (options.backend) {
     .freetype => void, // no discovery
-    .freetype_windows => Windows,
+    // fork(gx): GX-0009 discover through DirectWrite instead of scanning directories
+    .freetype_windows => DirectWrite,
     .fontconfig_freetype => Fontconfig,
     .web_canvas => void, // no discovery
     .coretext,
@@ -950,6 +951,14 @@ pub const CoreText = struct {
         }
     };
 };
+
+// fork(gx): GX-0009 begin: DirectWrite font discovery for freetype_windows
+pub const DirectWrite = @import("directwrite/discovery.zig").DirectWrite;
+
+test {
+    _ = @import("directwrite/match.zig");
+}
+// fork(gx): GX-0009 end
 
 /// Windows font discovery. Enumerates font files in the system and
 /// per-user font directories and matches them to a descriptor via
