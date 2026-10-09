@@ -1307,6 +1307,8 @@ pub fn updateAppMode(self: *Window) void {
     const watch = enabled and !self.closing and self.tab_count == 1;
     self.setAppModeTimer(watch);
 
+    // Each answer lists the processes, so stop at the first terminal that
+    // runs herdr: one is enough.
     var answers: [app_mode_max_terminals]?bool = undefined;
     var count: usize = 0;
     if (watch) {
@@ -1314,13 +1316,15 @@ pub fn updateAppMode(self: *Window) void {
         while (it.next()) |entry| {
             if (count == answers.len) break;
             const surface = entry.view;
-            answers[count] = if (surface.core_surface_ready) gx.app_mode.terminalRunsHerdr(
+            const answer = if (surface.core_surface_ready) gx.app_mode.terminalRunsHerdr(
                 self.app.core_app.alloc,
                 global.io(),
                 surface.core_surface.getProcessInfo(.foreground_pid),
                 true,
             ) else null;
+            answers[count] = answer;
             count += 1;
+            if (answer orelse false) break;
         }
     }
 
