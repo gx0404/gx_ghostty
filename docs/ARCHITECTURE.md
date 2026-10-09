@@ -11,7 +11,7 @@ fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器
 - **GTK 的 GX 层** `src/apprt/gtk/gx/`：运行时切换界面语言、GX 菜单与启动配置、设置对话框、快捷键速查、herdr 应用模式与 GX 样式（第 8 节）。
 - **打包、发布与开发框架**：Windows 便携 zip 与 Inno Setup 安装包、GX Shell 组件 stage、`gx-release` 发布链（第 13 节），以及 `docs/`、`scripts/`、`justfile` 组成的 AI 协作框架。
 
-改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021，共 40 个上游文件；GX-0013 与 GX-0017～GX-0020 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
+改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021，共 39 个上游文件；GX-0013 与 GX-0017～GX-0020 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
 
 | 产物 | 说明 | 根文件 / 构建逻辑 |
 |---|---|---|
@@ -191,7 +191,7 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 
 ## 8. GTK 的 GX 层
 
-`src/apprt/gtk/gx/main.zig` 汇总，上游 GTK 文件只在带 GX-0011、GX-0015、GX-0016 标记的钩子里调用它（另有 GX-0014 在 GTK 命令面板里过滤掉 `gx:` 条目）：
+`src/apprt/gtk/gx/main.zig` 汇总，上游 GTK 文件只在带 GX-0011、GX-0015、GX-0016 标记的钩子里调用它：
 
 | 模块 | 作用 |
 |---|---|
@@ -200,6 +200,8 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 | `shortcuts.zig`、`shortcuts_dialog.zig` | 快捷键速查表（`Adw.Dialog`，可搜索） |
 | `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`，运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
 | `app_mode.zig`、`style.zig`、`style.css` | herdr 应用模式隐藏标签栏、GX 样式的 CSS provider 与 `window-theme` 随配置重设（GX-0016） |
+
+命令面板用上游原样的 `class/command_palette.zig`：它列出 `command-palette-entry` 里的 `gx:` 条目，选中后与绑定一样经 `Surface.performBindingAction`（GX-0014）交给 `App.gxAction`；这些条目的标题是 GX 默认值里的英文 msgid，GTK 上原样显示、不翻译。
 
 GTK 的上游文字仍走 gettext（`_`/`N_`/`C_` 与 `po/`），只有装了对应 UTF-8 locale 才跟随 `language`；GX 自有文字一律用英文 msgid 经 `gx.i18n` 翻译，不进上游 pot。
 
@@ -286,7 +288,7 @@ Windows 包的第三方下载都在 `scripts/gx_windows_package.py::DOWNLOADS`/`
 |---|---|---|
 | fork 独占 | 第 2 节列出的 fork 新增路径 | 不冲突；上游新路径要在 `routes.toml` 登记 |
 | 上游文件 + 追加段 | 根 `AGENTS.md`（`<!-- gx-fork: … -->` 以下）、`.gitignore`、`.prettierignore`（`# --- GX fork：` 段） | 标记以上取上游，标记段原样保留 |
-| 上游文件 + 补丁 | [FORK_PATCHES.md](FORK_PATCHES.md) 登记表里的 40 个文件，集中在 `src/Surface.zig`、`src/config/Config.zig`、`src/termio/`、`src/apprt/gtk/class/`、`src/renderer/`、`src/font/` 与 `build.zig` | 按补丁小节的「同步冲突处理」复核，热点见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」 |
+| 上游文件 + 补丁 | [FORK_PATCHES.md](FORK_PATCHES.md) 登记表里状态为 `active` 的 39 个文件，集中在 `src/Surface.zig`、`src/config/Config.zig`、`src/termio/`、`src/apprt/gtk/class/`、`src/renderer/`、`src/font/` 与 `build.zig` | 按补丁小节的「同步冲突处理」复核，热点见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」 |
 | 上游文件移位 | 15 个上游 workflow 原样移到 `.github/workflows-archive/` | 上游新增的 workflow 也 `git mv` 进归档，不启用 |
 | 上游独占 | 其余全部，含 `.agents/`、9 份嵌套 `AGENTS.md`、`CODEOWNERS`、lint 配置、`dependabot.yml` | 取上游 |
 

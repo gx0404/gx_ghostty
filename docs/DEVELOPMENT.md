@@ -232,7 +232,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 - **fork 补丁**：按 `docs/FORK_PATCHES.md` 逐条核对补丁是否仍然需要、是否仍然成立，冲突按该补丁小节的「同步冲突处理」放回，标记与登记由 `scripts/test_fork_patches.py` 检查。热点见下表。
 - **其余上游文件**：取上游版本。不用整文件 ours/theirs 糊过冲突，也不用 squash、cherry-pick 或 rebase 代替合并。
 
-**补丁热点**：40 个上游文件带 GX 补丁，其中 `src/Surface.zig`（GX-0005、GX-0006、GX-0012、GX-0014）与 `src/apprt/gtk/class/application.zig`（GX-0011、GX-0015、GX-0016）各叠了多个补丁，最容易冲突。
+**补丁热点**：39 个上游文件带 GX 补丁，其中 `src/Surface.zig`（GX-0005、GX-0006、GX-0012、GX-0014）与 `src/apprt/gtk/class/application.zig`（GX-0011、GX-0015、GX-0016）各叠了多个补丁，最容易冲突。
 
 | 补丁 | 上游文件 | 冲突时核对 |
 |---|---|---|
@@ -248,7 +248,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 | GX-0010 | `src/config/Config.zig` | `gx-*` 字段块留在字段区末尾；`Config.load`、`Replay`、`loadCliArgs` 改动后核对 `src/gx/config_layers.zig::loadWith` 的分层下标 |
 | GX-0011、GX-0015、GX-0016 | `src/apprt/gtk/class/{application,window,tab,surface}.zig`、`src/apprt/gtk/App.zig`、`src/apprt/gtk/build/gresource.zig` | `Application.new`/`startupActionMap`/`propConfig`、`Window.getTabsVisible` 等钩子位置；上游改菜单时同步 `src/apprt/gtk/ui/1.5/gx/menus.blp` |
 | GX-0012 | `src/Surface.zig`、`src/termio/Exec.zig` | `needsConfirmQuit` 的 `.true` 分支、`Subprocess.getProcessInfo` 的 Windows 分支 |
-| GX-0014 | `src/input/Binding.zig`、`src/input/command.zig`、`src/Surface.zig`、`src/apprt/gtk/class/command_palette.zig` | `Binding.Action` 新增穷举 switch 时补 `.gx` |
+| GX-0014 | `src/input/Binding.zig`、`src/input/command.zig`、`src/Surface.zig` | `Binding.Action` 新增穷举 switch 时补 `.gx`；`src/apprt/gtk/class/command_palette.zig` 的过滤块已移除（登记为 `removed`），该文件取上游 |
 | GX-0021 | `src/renderer/generic.zig` | 预编辑追赶循环的 `< len` 上界；上游自己修好后按移除条件删除 |
 
 合并后，`gx-ci` 的 `windows-app` 只构建 app、不跑单测，`linux-main` 只编译 `-Dapp-runtime=none`、不含 GTK apprt，所以 Windows 上的单测与 GTK apprt 的编译和单测要在本机补齐：Windows 上 `just build` 与 `just test`，WSL 里 `just wsl build --gtk` 与 `just wsl test --gtk`。

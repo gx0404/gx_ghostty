@@ -34,7 +34,7 @@ Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应�
 
 - 配置分层（GX-0010）：GX 默认值 < 用户配置（含 `config-file` 引入的文件）< 设置界面写的 `gui-settings.ghostty`（与 `config.ghostty` 同目录）< 命令行；用户的 `theme` 与显式颜色照常覆盖默认值，`GHOSTTY_GX_DEFAULTS=0` 恢复上游加载方式。
 - 新配置键 `gx-launch-profile`（`名称=命令` 的自定义启动配置）、`gx-herdr-app-mode`、`gx-window-material`（仅 Windows）、`gx-idle-processes`、`gx-open-config-ui`（默认 `settings` 打开设置界面，`editor` 照上游打开配置文件）；`language` 只认 `zh-CN` 与 `en`，可在运行时切换。
-- `gx:` 绑定动作（GX-0014）：`keybind` 与 `command-palette-entry` 可用 `gx:settings`、`gx:main_menu`（默认 Ctrl+Shift+M）、`gx:keybinds`（默认 Ctrl+Shift+/）、`gx:new_tab_profile:<id>`、`gx:new_window_profile:<id>`（`<id>` 如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`）；默认命令面板追加「设置」「键盘快捷键」「主菜单」，GTK 命令面板不列出 `gx:` 条目。
+- `gx:` 绑定动作（GX-0014）：`keybind` 与 `command-palette-entry` 可用 `gx:settings`、`gx:main_menu`（默认 Ctrl+Shift+M）、`gx:keybinds`（默认 Ctrl+Shift+/）、`gx:new_tab_profile:<id>`、`gx:new_window_profile:<id>`（`<id>` 如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`）；默认命令面板追加「设置」「键盘快捷键」「主菜单」，Windows 与 GTK 的命令面板都列出并执行 `gx:` 条目（GTK 上这三条的标题显示英文原文）。
 - 关闭确认识别空闲进程（GX-0012）：`confirm-close-surface = true` 时，终端里只有 shell、shell 启动器与控制台辅助进程（`gx-idle-processes` 或内置列表）就直接关闭，运行 `vim`、`herdr` 或后台任务时照常确认；Linux 与 Windows 之外保持上游行为。
 - 内置主题 `GX Mocha`（Catppuccin Mocha 调色板，`#1f1f28` 背景），加载时写入用户主题目录。
 
