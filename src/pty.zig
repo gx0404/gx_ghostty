@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 const windows = @import("os/main.zig").windows;
 const posix = std.posix;
 const assert = @import("quirks.zig").inlineAssert;
+// fork(gx): GX-0007 begin: bundled ConPTY
+const gx_conpty = @import("gx/conpty.zig");
+// fork(gx): GX-0007 end
 
 const log = std.log.scoped(.pty);
 
@@ -336,6 +339,9 @@ const WindowsPty = struct {
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.HPCON,
+    // fork(gx): GX-0007 begin: the ConPTY that created pseudo_console
+    gx_conpty: gx_conpty.Instance,
+    // fork(gx): GX-0007 end
     size: winsize,
 
     pub const OpenError = error{Unexpected};
@@ -440,14 +446,13 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        // fork(gx): GX-0007 the bundled ConPTY first, kernel32 as the fallback
+        pty.gx_conpty = try gx_conpty.Instance.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
-            0,
             &pty.pseudo_console,
         );
-        if (result != windows.S_OK) return error.Unexpected;
 
         pty.size = size;
         return pty;
@@ -458,7 +463,8 @@ const WindowsPty = struct {
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        // fork(gx): GX-0007 closed by the ConPTY that created it
+        self.gx_conpty.close(self.pseudo_console);
         self.* = undefined;
     }
 
@@ -473,7 +479,8 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
+        // fork(gx): GX-0007 resized by the ConPTY that created it
+        const result = self.gx_conpty.resize(
             self.pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );

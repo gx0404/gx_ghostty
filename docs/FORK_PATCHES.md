@@ -50,6 +50,7 @@
 | GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |
 | GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |
 | GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |
+| GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
 <!-- fork-patches:end -->
 
@@ -379,6 +380,52 @@ python -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 登记表与闭集检查之外，`src/terminal/modes.zig` 与 `src/terminal/stream_terminal.zig` 各一条单测锁定 9001 的识别、DECRQM 与复位，`TERMINAL mode bit layout` 锁定位序；`src/gx/win32_input.zig` 的单测锁定编码（Ctrl+C 向量 `ESC[67;46;3;1;8;1_ESC[67;46;3;0;8;1_`、规范里的 Shift+A 与 Ctrl+F1、AltGr、ENHANCED_KEY、重复计数、死键、代理对、VK=0 文字）与分流条件。
+
+## GX-0007 优先使用随包 ConPTY
+
+- 文件：`src/pty.zig`（导入与 `WindowsPty.gx_conpty` 字段两个纯新增块；`open`、`deinit`、`setSize` 三处调用改为经 `gx_conpty.Instance`）。实现在新路径 `src/gx/conpty.zig`。
+- 标记：`fork(gx): GX-0007`；纯新增块用 begin/end 包住，三处改动的调用上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +12/−5（含注释）。
+
+### 原因
+
+Windows 自带的 ConPTY（kernel32 `CreatePseudoConsole` 加 System32 的 conhost.exe）随系统版本冻结，落后 microsoft/terminal 的开源实现多个版本。微软的 NuGet 包 `Microsoft.Windows.Console.ConPTY` 提供新版：`conpty.dll` 以 `ConptyCreatePseudoConsole`、`ConptyResizePseudoConsole`、`ConptyClosePseudoConsole` 导出与 kernel32 同签名的函数，并从自身目录启动 `OpenConsole.exe`（缺失时静默退回系统 conhost.exe）。上游 `WindowsPty` 直接调用 kernel32，而伪控制台必须由创建它的实现缩放和关闭，所以 `WindowsPty` 要记住所用的实现。
+
+### 行为
+
+- `WindowsPty.open` 调 `gx_conpty.Instance.create`：exe 同目录同时存在 `conpty.dll` 与 `OpenConsole.exe`、且环境变量 `GHOSTTY_GX_CONPTY` 不是 `system` 时，以绝对路径 `LoadLibraryExW` 载入 `conpty.dll`（它的依赖只在 DLL 目录与 System32 查找）并取三个导出；缺 `OpenConsole.exe`、载入失败、导出缺失或创建失败时退回 kernel32。`GHOSTTY_GX_CONPTY=system`（不区分大小写）强制用系统 ConPTY；空值或 `bundled` 为默认；其他值记 warning 后按默认处理。
+- flags：随包 ConPTY 用 `PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE`（0x6）。1.22 起的 conpty.dll 总是这样工作并忽略这两位（其 `src/winconpty/winconpty.cpp` 只解析 INHERIT_CURSOR 与 GLYPH_WIDTH 的 0x18 两组），所以对 1.24 无害，只对更老的 conpty.dll 生效；系统 ConPTY 保持上游的 0。`PSEUDOCONSOLE_INHERIT_CURSOR`（0x1）不开：宿主会在启动时发 `CSI 6 n` 并等终端回答光标位置。实测临时加上 0x1 时 OpenConsole 以 `--inheritcursor` 启动，Ghostty 正确回答，启动耗时与输入都正常；但每个表面启动时屏幕为空、光标在原点，没有可继承的位置，旧宿主得不到回答时还会无限期阻塞输入，Windows Terminal 默认也不开。
+- 每个伪控制台记住创建它的实现（`WindowsPty.gx_conpty`），缩放与关闭都走同一实现，关闭后释放这次 `LoadLibraryExW` 的引用。`HPCON` 照常交给 `src/Command.zig` 的 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`（conpty.dll 的伪控制台结构与 kernelbase 相同，Windows Terminal 也这样用）。
+- 每次创建记一条 info 日志：`ConPTY: bundled <路径> flags=0x6`，或 `ConPTY: system (kernel32) flags=0x0, <原因>`（例如 `conpty.dll is not next to the executable`、`GHOSTTY_GX_CONPTY=system`）；随包实现失败时另记 warning。
+- 文件布局：`conpty.dll` 与 `OpenConsole.exe` 成对来自同一个包版本，与 `ghostty.exe` 平铺在同一目录（x64 取包内 `runtimes/win-x64/native/conpty.dll` 与 `build/native/runtimes/x64/OpenConsole.exe`）。本补丁不改构建与打包，放置文件由发布流程负责。
+
+### 上游状态
+
+未回馈上游。上游 Windows pty 只用系统 ConPTY。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游改动 `WindowsPty` 的创建、缩放或关闭时，取上游版本后保持：创建由 `gx_conpty.Instance.create` 完成并存进 `gx_conpty`，缩放与关闭用同一实例。上游自己支持可替换的 ConPTY 时按移除条件处理。
+
+### 移除条件
+
+上游 Windows pty 支持随包 ConPTY，或 Ghostty GX 不再随包分发 ConPTY 时移除：删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>
+python scripts/zigw.py build test-bin -Dtarget=x86_64-windows-gnu -Dapp-runtime=none
+python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --filter gx.conpty --filter pty.test
+python -m unittest scripts.test_fork_patches -v
+```
+
+把 NuGet 包 1.24.261001001 的 x64 `conpty.dll` 与 `OpenConsole.exe`（sha256 见 wezterm 资产 README）复制到 `<prefix>\bin\` 后运行 `ghostty.exe`：日志为 `ConPTY: bundled …\conpty.dll flags=0x6`，shell 的父进程是 `OpenConsole.exe`；删掉 `OpenConsole.exe` 或设 `GHOSTTY_GX_CONPTY=system` 后为 `ConPTY: system (kernel32) …`。上游的 `pty.test_0`（open 与 resize）在 Windows 测试二进制里经同一入口走系统 ConPTY。
+
+### 测试锁定
+
+只有登记表与闭集检查；`src/gx/conpty.zig` 的单测锁定 `GHOSTTY_GX_CONPTY` 的解析、同目录路径拼接与 flags 取值。
 
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 

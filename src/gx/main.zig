@@ -1,9 +1,11 @@
 //! Ghostty GX core modules shared by the win32 and GTK apprts: UI language
 //! and translations, the settings overlay, configuration layering, launch
 //! profiles, process inspection and process policies, plus the Windows
-//! terminal support behind fork patches: win32-input-mode key records.
+//! terminal support behind fork patches: win32-input-mode key records and
+//! the bundled ConPTY.
 pub const config_layers = @import("config_layers.zig");
 pub const config_types = @import("config_types.zig");
+pub const conpty = @import("conpty.zig");
 pub const gui_settings = @import("gui_settings.zig");
 pub const i18n = @import("i18n.zig");
 pub const policy = @import("policy.zig");
@@ -15,6 +17,7 @@ pub const win32_input = @import("win32_input.zig");
 test {
     _ = config_layers;
     _ = config_types;
+    _ = conpty;
     _ = gui_settings;
     _ = i18n;
     _ = policy;
