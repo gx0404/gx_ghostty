@@ -46,14 +46,14 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
 
    或在 Actions → gx-release → Run workflow 里选同样的输入；要附 macOS 产物时加 `-f macos=true`。workflow 文件取默认分支 `gx_ghostty` 上的版本，`ref` 在 prepare 里解析成完整 SHA，后续 job 只构建这个 SHA。`ref` 可以是分支、tag 或提交；提交必须写完整的 40 位 SHA，`actions/checkout` 取不到缩写 SHA（如 `ref=4f4e0e128`），prepare 会在检出这一步失败。这次运行从头构建全部资产，`verify` 通过后 `publish` 才发布；任何 job 失败都不会发布。agent 不运行这条命令（见下文）。
 
-   可选的预检：`windows-app` 与 `linux-gtk-noble` 还没在 GitHub 上跑过，第一次发版前可以先用 `-f publish=false` 跑一次只构建验收，从该运行的 Artifacts 下载 `verified-release`（保留 14 天）与 `evidence-linux-gtk-noble` 检查；发布那次仍会重新构建，不复用这次的产物。
+   可选的预检：改过打包、`windows-app` 或 `linux-gtk-noble` 之后，发版前可以先用 `-f publish=false` 跑一次只构建验收，从该运行的 Artifacts 下载 `verified-release`（保留 14 天）与 `evidence-linux-gtk-noble` 检查；发布那次仍会重新构建，不复用这次的产物。0.0.1 发版前的只构建运行见下文「首跑记录」。
 5. **核对资产**：发布完成后只读地检查——
    - `gh release view gx-v0.0.1 --repo gx0404/gx_ghostty --json isDraft,isPrerelease,tagName,targetCommitish,assets`：`isDraft` 与 `isPrerelease` 都为 false，tag 指向定版提交，资产恰好是下文「资产」表里的 12 个（`macos=true` 时 14 个）。
    - 下载全部资产，`sha256sum -c SHA256SUMS` 通过；`manifest.json` 的 `schema_version` 为 2，`source_commit` 等于定版提交，`version_string` 为 `1.3.2-gx.0.0.1`。
    - 发布说明以 CHANGELOG 的 0.0.1 段开头，后面是「构建与资产」表。
    - 读回这次运行的 `evidence-linux-gtk-noble` 截图（见下文）；条件允许时在一台 Windows 上解压便携 zip 或运行安装包，启动后截图。
 6. **开新版本**：在 `CHANGELOG.md` 顶部加下一个 `## X.Y.Z(TBD)` 标题，运行 `just version-check` 与 `just kb`，把 CHANGELOG 与重建的 `docs/kb/chunks.json` 一起提交（KB 语料包含 CHANGELOG 开头，见「CHANGELOG 规则」）。
-7. **GX Shell 跟进**：GX Shell 0.4.0 以 Ghostty GX 取代 WezTerm GX，它的来源锁 `components.lock.json` 里 `gx_ghostty` 的 revision 还是占位，要等 `gx-v0.0.1` 发布后才能换成正式修订。在 GX Shell 仓只改这一项（不要用更新全部组件的 `update`），写入 `gx-v0.0.1` 指向的完整 SHA，再按 GX Shell 自己的文档运行 `python scripts/gx_shell_sources.py check --lock components.lock.json --require-remote`，然后走 GX Shell 的发版流程。GX Shell 按 `scripts/gx_package.py` 模块文档「Consumer contract」的命令从这个修订构建 stage，契约有变时要先告知 GX Shell。
+7. **GX Shell 跟进**：GX Shell 从 0.4.0 起随包 Ghostty GX，它的来源锁 `components.lock.json` 用完整 SHA 钉住 `gx_ghostty`（0.4.0 钉的是 0.0.1 的定版提交 `5525f8bc`）。要随包新版本时，在 GX Shell 仓只改这一项（不要用更新全部组件的 `update`），写入新 `gx-vX.Y.Z` 指向的完整 SHA，再按 GX Shell 自己的文档运行 `python scripts/gx_shell_sources.py check --lock components.lock.json --require-remote`，然后走 GX Shell 的发版流程。GX Shell 按 `scripts/gx_package.py` 模块文档「Consumer contract」的命令从这个修订构建 stage，契约有变时要先告知 GX Shell。
 
 agent 可以准备定版提交并在本地验证；push、运行 workflow 与发布由用户决定。不要手工创建 `gx-v*` tag 或 GitHub release，tag 只由 publish job 创建。agent 执行 `gh workflow run … gx-release`、`gh release create|edit|delete|upload` 与写型 `gh api` 会被拒绝（`docs/AGENT_RULES/ci-release.md`）。
 
@@ -181,8 +181,12 @@ Actions 已启用，以下结果都在 2026-10-07 取得，早于正式 Release�
 
 缓存新实现的真实验收：同一提交 `48b73e018` 的 [push 37601186564](https://github.com/gx0404/gx_ghostty/actions/runs/37601186564) 与 [手动 37603432582](https://github.com/gx0404/gx_ghostty/actions/runs/37603432582)（`cache_probe=true`）均全绿。三个测试 job 的工具链 exe/lib 路径两轮一致，第二轮恢复目录字节数与首轮结束值逐项相等，`stable-toolchain-v1` 缓存和完整 timings 确实恢复，post 均 `keeping intact`、未清空。同 runner probe 全 cached，分别为 0.315、0.416、1.094 s，且没有重复执行用例。固定路径、实际恢复与同机复建记 **PASS**；构建和用例明细见 [TESTING.md](TESTING.md)「两轮真实 CI 验收」。
 
+0.0.1 的发布（定版提交 `5525f8bc6ff1fd46c961f81cb07ecb1aaa7e085e`，2026-10-10）：
+
+- `gx-ci` push [37968060267](https://github.com/gx0404/gx_ghostty/actions/runs/37968060267) 全绿，`windows-app` 首次在 push 上构建通过。手动 [37968079357](https://github.com/gx0404/gx_ghostty/actions/runs/37968079357)（`gtk_smoke`、`win_smoke`）全绿，两张截图都已读回：`gtk-smoke` 在 Xvfb 下正常绘制窗口与提示符；`win_smoke` 在 windows-2025 runner 上用 Mesa llvmpipe（软件 OpenGL 4.6）打开窗口，runner 上没有 GX Zsh，默认启动配置回退到 `pwsh`。
+- `gx-release` 只构建 [37968075531](https://github.com/gx0404/gx_ghostty/actions/runs/37968075531)（`publish=false`）全绿，`windows-app` 与 `linux-gtk-noble` 在 GitHub 上首跑通过。`evidence-linux-gtk-noble` 已读回：`ubuntu:24.04` 容器里 GTK 4.14.5、libadwaita 1.5.0，`+version` 为 `1.3.2-gx.0.0.1`，截图正常。从该运行下载的便携 zip 在本机 Windows 11 上解压运行（隔离配置）：硬件 OpenGL、随包 ConPTY（`flags=0x6`）、默认启动配置 GX Zsh，设置浮层的中英文切换与命令面板正常。更早的 run 37948705479 用缩写 SHA 作 `ref`，在检出一步失败，此后 `ref` 的说明改为必须写完整 SHA。
+- `gx-release` 发布 [37970698127](https://github.com/gx0404/gx_ghostty/actions/runs/37970698127)（`publish=true`）全绿，创建 tag `gx-v0.0.1`（指向定版提交）与正式 Release [Ghostty GX 0.0.1](https://github.com/gx0404/gx_ghostty/releases/tag/gx-v0.0.1)：`isDraft` 与 `isPrerelease` 都为 false，标为 Latest，资产 12 个，GitHub 给出的 `digest` 与 `SHA256SUMS` 一致；下载后 `sha256sum -c SHA256SUMS` 全部 OK，`manifest.json` 为 schema 2，`source_commit` 为定版提交，`version_string` 为 `1.3.2-gx.0.0.1`；说明以 CHANGELOG 的 0.0.1 段开头。Release 里的便携 zip 也在本机解压运行，主窗口与主菜单截图已读回。
+
 仍待确认（PENDING）：
 
-- **新 job 与正式发布**：2026-10-09 时 `origin/gx_ghostty` 仍是 `0ac89c301`，Windows app、GX 层与发布改造都还没 push。`gx-ci` 的 `windows-app`（含 `win_smoke`）、`gx-release` 的 `windows-app` 与 `linux-gtk-noble`、schema 2 的 `manifest.json`、正式 Release 的创建（GitHub 资产 `digest` 字段的读回、草稿发布时 tag 的创建）都还没有在 GitHub 上跑过，要等用户 push 并运行后读回结果。本轮不为补验触发发布。
-- **`linux-gtk-noble` 的 GitHub 结果**：同样的命令已在本机 WSL 的全新 `ubuntu:24.04` podman 容器里跑通（2026-10-09，见 [TESTING.md](TESTING.md)），GitHub runner 上的结果与截图要读回 artifact 后才算数。
 - **跨 runner 完整复用与缓存增长控制**：第二轮首次构建只有 10/45、49/100、10/45 节点 cached，translate-c 与测试编译仍未 cached，`o` 分区继续增长。`linux-vt`、`windows` 的 CPU 从 AMD EPYC 9V74 换成 7763 已由快照确认；`linux-main` 同为 9V74，仍有 miss。源码能解释工具产物差异如何经 `Run.artifact` hash 向下游传播，但初始 native 工具差异原因未定。旧 run 37587736223 的 `linux-vt` 曾达 5,078,327,232 字节、超过 4096 MiB 被清空，下一轮只恢复 186 字节；新实现不删除旧 cache，也未提高上限，未来仍可能超限。本次 PASS 不能写成跨运行全命中或所有缓存问题已解决，更不能代证全 CI 两分钟。

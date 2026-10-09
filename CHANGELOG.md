@@ -9,6 +9,8 @@
 - 每个版本按 `### Added` / `### Changed` / `### Fixed` 分节（没有条目的节省略），只写使用者能观察到的效果。
 - 本文件开头 6000 字符是知识库语料：每次修改后运行 `just kb`，把 `docs/kb/chunks.json` 与本文件放进同一个提交，否则 `gx-ci` 的 `framework` job 失败。
 
+## 0.0.2(TBD)
+
 ## 0.0.1(2026-10-10)
 
 Ghostty GX 的首个版本：新增 Windows 原生应用，改进 Linux GTK 应用，两端共用 GX 核心与默认配置，并有 fork 自己的发布链与开发框架。括号里的 GX-NNNN 是 `docs/FORK_PATCHES.md` 登记的上游源码补丁。
