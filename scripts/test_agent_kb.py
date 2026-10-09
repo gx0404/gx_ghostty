@@ -72,7 +72,14 @@ GOLDEN_QUERIES = [
         ["docs/AGENT_RULES/development.md", "docs/MAKE_COMMANDS.md", "docs/README.md", "docs/DEVELOPMENT.md"],
     ),
     ("GTK 截图 gtk-smoke PENDING", ["docs/AGENT_RULES/testing.md", "docs/TESTING.md", "docs/AGENT_RULES/ci-release.md"]),
-    ("Windows 只有库 没有 app", ["docs/ARCHITECTURE.md", "AGENTS.md", "docs/AGENT_RULES/build-system.md", "docs/TESTING.md"]),
+    (
+        "Windows just test win32 windows-gnu ghostty-test",
+        ["docs/AGENT_RULES/testing.md", "docs/AGENT_RULES/build-system.md", "AGENTS.md", "docs/TESTING.md"],
+    ),
+    ("Windows win32 apprt WGL Direct2D 消息循环", ["docs/AGENT_RULES/apprt-win32.md"]),
+    ("GUI 截图 kimi-cu 隔离 LOCALAPPDATA", ["docs/AGENT_RULES/apprt-win32.md"]),
+    ("gui-settings.ghostty 配置分层 GX 默认值", ["docs/AGENT_RULES/gx-core.md", "docs/FORK_PATCHES.md"]),
+    ("gx.i18n.tr 翻译 gx.zh_CN.po just i18n", ["docs/AGENT_RULES/gx-core.md", "docs/AGENT_RULES/apprt-gtk.md"]),
 ]
 GARBAGE_QUERY = "zzqqxxw qqzzwwk"
 
