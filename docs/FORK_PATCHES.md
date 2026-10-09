@@ -66,7 +66,7 @@
 | GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |
 | GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |
 | GX-0014 | `src/Surface.zig` | `fork(gx): GX-0014` | active |
-| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | active |
+| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | removed |
 | GX-0014 | `src/input/Binding.zig` | `fork(gx): GX-0014` | active |
 | GX-0014 | `src/input/command.zig` | `fork(gx): GX-0014` | active |
 | GX-0015 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0015` | active |
@@ -707,10 +707,10 @@ GTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprof
 
 ## GX-0014 gx: 绑定动作分发到应用运行时
 
-- 文件：`src/input/Binding.zig`（导入 `src/gx/action.zig`；`Action` 字段区末尾、`crash` 之后新增 `gx` 字段与文档注释；`scope` 把 `.gx` 归入 surface；`formatValue`、`cloneValue` 各加一个 union 分支）、`src/input/command.zig`（`actionCommands` 的 `.gx` 分支，没有内置命令）、`src/Surface.zig`（`performBindingAction` 的 `.gx` 分支）、`src/apprt/gtk/class/command_palette.zig`（`isActionSupportedOnGtk` 把 `.gx` 归为不支持）。动作类型、解析与格式化在新路径 `src/gx/action.zig`。
-- 标记：`fork(gx): GX-0014`；全部是纯新增块，用 `begin`/`end` 包住（`Binding.zig` 五块，其余三个文件各一块）。
-- 状态：active，未回馈上游。
-- 改动量：4 个文件，`git diff --numstat` 合计 +65/−0（含注释与文档注释）。
+- 文件：`src/input/Binding.zig`（导入 `src/gx/action.zig`；`Action` 字段区末尾、`crash` 之后新增 `gx` 字段与文档注释；`scope` 把 `.gx` 归入 surface；`formatValue`、`cloneValue` 各加一个 union 分支）、`src/input/command.zig`（`actionCommands` 的 `.gx` 分支，没有内置命令）、`src/Surface.zig`（`performBindingAction` 的 `.gx` 分支）。动作类型、解析与格式化在新路径 `src/gx/action.zig`。
+- 标记：`fork(gx): GX-0014`；全部是纯新增块，用 `begin`/`end` 包住（`Binding.zig` 五块，其余两个文件各一块）。
+- 状态：active，未回馈上游。`src/apprt/gtk/class/command_palette.zig` 原有一块（`isActionSupportedOnGtk` 把 `.gx` 归为不支持，GTK 命令面板因此不列出 `gx:` 条目）已在 GTK 实现 `gxAction`（GX-0011）后删除，登记行改为 `removed`，该文件与上游一致。
+- 改动量：3 个文件，`git diff --numstat` 合计 +62/−0（含注释与文档注释）。
 
 ### 原因
 
@@ -720,7 +720,7 @@ Ghostty GX 的 Windows 界面需要能绑定到键位与命令面板的应用操
 
 - 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。
 - `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行全部五个动作；embedded（macOS）与 none 没有实现。
-- GTK 命令面板仍由本补丁的过滤块排除 `gx` 条目（GTK 实现 `gxAction` 之后，这个块已满足下文的单独移除条件，但尚未删除）。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
+- 命令面板：win32 与 GTK 都列出 `command-palette-entry` 里的 `gx:` 条目（GX 默认值带「设置」「键盘快捷键」「主菜单」三条），选中后同样经 `performBindingAction` 交给 `gxAction`。GTK 用的是未改动的上游命令面板，按标题或动作（如 `gx:settings`）搜索，标题原样显示：GX 条目的标题是默认值里的英文 msgid，GTK 上不翻译（win32 面板显示时经 `gx.i18n` 翻译）。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
 
 ### 上游状态
 
@@ -728,11 +728,11 @@ Ghostty GX 的 Windows 界面需要能绑定到键位与命令面板的应用操
 
 ### 同步冲突处理
 
-先取上游版本，再放回各纯新增块：`Binding.zig` 的导入、`gx` 字段（留在 `Action` 字段区末尾；上游追加动作时把块挪到新的最后一个字段之后，文档注释必须紧贴字段，helpgen 按字段名取文档）、`scope` 的 surface 列表、`formatValue`/`cloneValue` 的 union 分支（上游自己支持 union 参数后删掉这两块）；`command.zig` 与 `Surface.zig` 的 `.gx` 分支；GTK 命令面板的过滤。上游给 `Binding.Action` 新增穷举 switch 时，编译会指出缺少 `.gx` 的位置，同样用 `begin`/`end` 块补上并在此登记。
+先取上游版本，再放回各纯新增块：`Binding.zig` 的导入、`gx` 字段（留在 `Action` 字段区末尾；上游追加动作时把块挪到新的最后一个字段之后，文档注释必须紧贴字段，helpgen 按字段名取文档）、`scope` 的 surface 列表、`formatValue`/`cloneValue` 的 union 分支（上游自己支持 union 参数后删掉这两块）；`command.zig` 与 `Surface.zig` 的 `.gx` 分支。`src/apprt/gtk/class/command_palette.zig` 一律取上游版本，不再放回过滤块。上游给 `Binding.Action` 新增穷举 switch 时，编译会指出缺少 `.gx` 的位置，同样用 `begin`/`end` 块补上并在此登记。
 
 ### 移除条件
 
-Ghostty GX 不再需要绑定到键位或命令面板的 GX 操作（或上游提供可由 apprt 扩展的绑定动作）时移除：删除四个文件中的块与 `src/gx/action.zig`，去掉 GX 默认值（`src/gx/defaults.ghostty`）里的 `gx:` 绑定与命令面板条目，把登记行改为 `removed`。GTK 实现 `gxAction` 后，单独删掉 GTK 命令面板的过滤块。
+Ghostty GX 不再需要绑定到键位或命令面板的 GX 操作（或上游提供可由 apprt 扩展的绑定动作）时移除：删除三个文件中的块与 `src/gx/action.zig`，去掉 GX 默认值（`src/gx/defaults.ghostty`）里的 `gx:` 绑定与命令面板条目，把登记行改为 `removed`。原先单独列出的「GTK 实现 `gxAction` 后删掉 GTK 命令面板的过滤块」已经满足并执行，`command_palette.zig` 的登记行为 `removed`。
 
 ### 验证
 
@@ -745,11 +745,11 @@ just wsl build --gtk --clone '~/src/gx_ghostty-S'
 just wsl test --clone '~/src/gx_ghostty-S' --filter Binding --filter gx.
 ```
 
-单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。
+单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。GTK 上用 `just wsl smoke --xdotool <脚本>`：Ctrl+Shift+P 打开命令面板，输入 `gx:` 列出三条 GX 条目，回车后打开对应的对话框；读图后才算通过。
 
 ### 测试锁定
 
-`scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0014：标记必须存在于四个文件，`begin`/`end` 成对且不嵌套。行为由 `src/gx/action.zig` 的单测锁定。
+`scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0014：标记必须存在于三个 active 文件，并且已从登记为 `removed` 的 `src/apprt/gtk/class/command_palette.zig` 消失；`begin`/`end` 成对且不嵌套。行为由 `src/gx/action.zig` 的单测锁定。
 
 ## GX-0015 GTK 上的 Ghostty GX 设置对话框
 

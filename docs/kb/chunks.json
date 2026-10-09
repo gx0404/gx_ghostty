@@ -3204,8 +3204,8 @@
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0014-gx-绑定动作分发到应用运行时",
-   "source_sha256": "7cfd4f872004c16583d8ea4013b6c57db3f86367d915e7f0f32ec1ed672d747d",
-   "text": "## GX-0014 gx: 绑定动作分发到应用运行时\n\n- 文件：`src/input/Binding.zig`（导入 `src/gx/action.zig`；`Action` 字段区末尾、`crash` 之后新增 `gx` 字段与文档注释；`scope` 把 `.gx` 归入 surface；`formatValue`、`cloneValue` 各加一个 union 分支）、`src/input/command.zig`（`actionCommands` 的 `.gx` 分支，没有内置命令）、`src/Surface.zig`（`performBindingAction` 的 `.gx` 分支）、`src/apprt/gtk/class/command_palette.zig`（`isActionSupportedOnGtk` 把 `.gx` 归为不支持）。动作类型、解析与格式化在新路径 `src/gx/action.zig`。\n- 标记：`fork(gx): GX-0014`；全部是纯新增块，用 `begin`/`end` 包住（`Binding.zig` 五块，其余三个文件各一块）。\n- 状态：active，未回馈上游。\n- 改动量：4 个文件，`git diff --numstat` 合计 +65/−0（含注释与文档注释）。"
+   "source_sha256": "255474e0aaf8b4e46631f9779a48f558b88bd48109b21d49eda56a1cae822980",
+   "text": "## GX-0014 gx: 绑定动作分发到应用运行时\n\n- 文件：`src/input/Binding.zig`（导入 `src/gx/action.zig`；`Action` 字段区末尾、`crash` 之后新增 `gx` 字段与文档注释；`scope` 把 `.gx` 归入 surface；`formatValue`、`cloneValue` 各加一个 union 分支）、`src/input/command.zig`（`actionCommands` 的 `.gx` 分支，没有内置命令）、`src/Surface.zig`（`performBindingAction` 的 `.gx` 分支）。动作类型、解析与格式化在新路径 `src/gx/action.zig`。\n- 标记：`fork(gx): GX-0014`；全部是纯新增块，用 `begin`/`end` 包住（`Binding.zig` 五块，其余两个文件各一块）。\n- 状态：active，未回馈上游。`src/apprt/gtk/class/command_palette.zig` 原有一块（`isActionSupportedOnGtk` 把 `.gx` 归为不支持，GTK 命令面板因此不列出 `gx:` 条目）已在 GTK 实现 `gxAction`（GX-0011）后删除，登记行改为 `removed`，该文件与上游一致。\n- 改动量：3 个文件，`git diff --numstat` 合计 +62/−0（含注释与文档注释）。"
   },
   {
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时 > 上游状态",
@@ -3225,36 +3225,36 @@
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时 > 同步冲突处理",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0014-gx-绑定动作分发到应用运行时-同步冲突处理",
-   "source_sha256": "c0d4e202e698db7c5224c3a87e9fb8be64f92be0e71e3fbdf2923c720b94f9f1",
-   "text": "### 同步冲突处理\n\n先取上游版本，再放回各纯新增块：`Binding.zig` 的导入、`gx` 字段（留在 `Action` 字段区末尾；上游追加动作时把块挪到新的最后一个字段之后，文档注释必须紧贴字段，helpgen 按字段名取文档）、`scope` 的 surface 列表、`formatValue`/`cloneValue` 的 union 分支（上游自己支持 union 参数后删掉这两块）；`command.zig` 与 `Surface.zig` 的 `.gx` 分支；GTK 命令面板的过滤。上游给 `Binding.Action` 新增穷举 switch 时，编译会指出缺少 `.gx` 的位置，同样用 `begin`/`end` 块补上并在此登记。"
+   "source_sha256": "b9a8bf2408db13686e157fef64037cbf7e3df0cc640dfceb83c1f4dc7ff433a6",
+   "text": "### 同步冲突处理\n\n先取上游版本，再放回各纯新增块：`Binding.zig` 的导入、`gx` 字段（留在 `Action` 字段区末尾；上游追加动作时把块挪到新的最后一个字段之后，文档注释必须紧贴字段，helpgen 按字段名取文档）、`scope` 的 surface 列表、`formatValue`/`cloneValue` 的 union 分支（上游自己支持 union 参数后删掉这两块）；`command.zig` 与 `Surface.zig` 的 `.gx` 分支。`src/apprt/gtk/class/command_palette.zig` 一律取上游版本，不再放回过滤块。上游给 `Binding.Action` 新增穷举 switch 时，编译会指出缺少 `.gx` 的位置，同样用 `begin`/`end` 块补上并在此登记。"
   },
   {
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时 > 测试锁定",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0014-gx-绑定动作分发到应用运行时-测试锁定",
-   "source_sha256": "ea3fc7e238f2490dc4c36fcdd4d1146d1a820980c62798a4a0eebdb05ff98650",
-   "text": "### 测试锁定\n\n`scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0014：标记必须存在于四个文件，`begin`/`end` 成对且不嵌套。行为由 `src/gx/action.zig` 的单测锁定。"
+   "source_sha256": "5563cd3862aa55c508b52774d46befd20ec6ab2a1b4f925fa17abbd7508d17f1",
+   "text": "### 测试锁定\n\n`scripts/test_fork_patches.py` 的登记表与闭集检查覆盖 GX-0014：标记必须存在于三个 active 文件，并且已从登记为 `removed` 的 `src/apprt/gtk/class/command_palette.zig` 消失；`begin`/`end` 成对且不嵌套。行为由 `src/gx/action.zig` 的单测锁定。"
   },
   {
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时 > 移除条件",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0014-gx-绑定动作分发到应用运行时-移除条件",
-   "source_sha256": "6799ed77d01e5fd63b9adac999f32e92bda14a09c093a287dde54da7ccb21ab0",
-   "text": "### 移除条件\n\nGhostty GX 不再需要绑定到键位或命令面板的 GX 操作（或上游提供可由 apprt 扩展的绑定动作）时移除：删除四个文件中的块与 `src/gx/action.zig`，去掉 GX 默认值（`src/gx/defaults.ghostty`）里的 `gx:` 绑定与命令面板条目，把登记行改为 `removed`。GTK 实现 `gxAction` 后，单独删掉 GTK 命令面板的过滤块。"
+   "source_sha256": "6816d42b4e58ac7e272b814f16b17c5a466064a3620b60d0aac5b51e928e83e5",
+   "text": "### 移除条件\n\nGhostty GX 不再需要绑定到键位或命令面板的 GX 操作（或上游提供可由 apprt 扩展的绑定动作）时移除：删除三个文件中的块与 `src/gx/action.zig`，去掉 GX 默认值（`src/gx/defaults.ghostty`）里的 `gx:` 绑定与命令面板条目，把登记行改为 `removed`。原先单独列出的「GTK 实现 `gxAction` 后删掉 GTK 命令面板的过滤块」已经满足并执行，`command_palette.zig` 的登记行为 `removed`。"
   },
   {
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时 > 行为",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0014-gx-绑定动作分发到应用运行时-行为",
-   "source_sha256": "e5f5220a51a4d8c5b50681203f05adb5ed6b03226ef56bf39860feab41e5f422",
-   "text": "### 行为\n\n- 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。\n- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行全部五个动作；embedded（macOS）与 none 没有实现。\n- GTK 命令面板仍由本补丁的过滤块排除 `gx` 条目（GTK 实现 `gxAction` 之后，这个块已满足下文的单独移除条件，但尚未删除）。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。"
+   "source_sha256": "5e5fb8802a197f5c5a2f4cf98ef6f966442e094d6edf9fd0e96a6038c51efa41",
+   "text": "### 行为\n\n- 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。\n- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行全部五个动作；embedded（macOS）与 none 没有实现。\n- 命令面板：win32 与 GTK 都列出 `command-palette-entry` 里的 `gx:` 条目（GX 默认值带「设置」「键盘快捷键」「主菜单」三条），选中后同样经 `performBindingAction` 交给 `gxAction`。GTK 用的是未改动的上游命令面板，按标题或动作（如 `gx:settings`）搜索，标题原样显示：GX 条目的标题是默认值里的英文 msgid，GTK 上不翻译（win32 面板显示时经 `gx.i18n` 翻译）。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。"
   },
   {
    "anchor": "fork 补丁登记 > GX-0014 gx: 绑定动作分发到应用运行时 > 验证",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-gx-0014-gx-绑定动作分发到应用运行时-验证",
-   "source_sha256": "ad574268488090930c277db8fefad4e5452b7cb47c1becbfc1e21c65e9ab7a50",
-   "text": "### 验证\n\n```bash\npython scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu\npython scripts/zigw.py build -Demit-lib-vt\npython -m unittest scripts.test_fork_patches -v\njust test --filter Binding --filter gx.action                 # Windows 本机（win32 apprt）\njust wsl build --gtk --clone '~/src/gx_ghostty-S'\njust wsl test --clone '~/src/gx_ghostty-S' --filter Binding --filter gx.\n```\n\n单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。"
+   "source_sha256": "fe117560be3ebbf884afc84c30b33b600860b6ee057f593befaf9678916f1522",
+   "text": "### 验证\n\n```bash\npython scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu\npython scripts/zigw.py build -Demit-lib-vt\npython -m unittest scripts.test_fork_patches -v\njust test --filter Binding --filter gx.action                 # Windows 本机（win32 apprt）\njust wsl build --gtk --clone '~/src/gx_ghostty-S'\njust wsl test --clone '~/src/gx_ghostty-S' --filter Binding --filter gx.\n```\n\n单测在 `src/gx/action.zig`：GX 动作的解析、错误、格式化往返、克隆与比较，`Binding.Action` 的 `parse`/`format`/`hash`/`clone`，`Binding.Set` 解析 `keybind` 语法与反查，以及 `command-palette-entry` 的解析与 C 镜像。Windows 上运行 `ghostty.exe`，`keybind = ctrl+shift+m=gx:main_menu` 打开主菜单，`keybind = ctrl+alt+p=gx:new_tab_profile:pwsh` 打开 PowerShell 7 标签页。GTK 上用 `just wsl smoke --xdotool <脚本>`：Ctrl+Shift+P 打开命令面板，输入 `gx:` 列出三条 GX 条目，回车后打开对应的对话框；读图后才算通过。"
   },
   {
    "anchor": "fork 补丁登记 > GX-0015 GTK 上的 Ghostty GX 设置对话框",
@@ -3435,22 +3435,22 @@
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part1",
-   "source_sha256": "9e3878e6647587c798784ca0472467e104b66f7bca585e6f3b65bed22f92ce2d",
+   "source_sha256": "ff524ea4e649a5f18eb0a8553ec4a3c98fe1b5375e629e00c37f3762be356b0d",
    "text": "## 登记表\n\n格式约定（`scripts/test_fork_patches.py` 按此解析）：\n\n- 表格位于 `fork-patches:begin` 与 `fork-patches:end` 两行注释之间，表头固定为 `ID | 文件 | 标记 | 状态`。\n- `ID` 形如 `GX-0001`；`文件` 是仓库相对的 POSIX 路径；`标记` 必须等于 `fork(gx): <ID>`；`文件` 与 `标记` 写在反引号里。\n- `状态` 取 `active`（标记必须存在于该文件）或 `removed`（标记必须已从该文件消失）。\n- 同一个 (ID, 文件) 只登记一行；每个 ID 在下文都有以 `## <ID>` 开头的小节。\n\n<!-- fork-patches:begin -->\n| ID | 文件 | 标记 | 状态 |\n|---|---|---|---|\n| GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |\n| GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |\n| GX-0003 | `src/apprt.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/action.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/runtime.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/structs.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/surface.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/build/SharedDeps.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/config/Config.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/datastruct/split_tree.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/font/face.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/input/Binding.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/main_ghostty.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |\n| GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |\n| GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part2",
-   "source_sha256": "9e3878e6647587c798784ca0472467e104b66f7bca585e6f3b65bed22f92ce2d",
+   "source_sha256": "ff524ea4e649a5f18eb0a8553ec4a3c98fe1b5375e629e00c37f3762be356b0d",
    "text": "| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |\n| GX-0006 | `include/ghostty/vt/modes.h` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/Surface.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/modes.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |\n| GX-0008 | `src/os/hostname.zig` | `fork(gx): GX-0008` | active |\n| GX-0008 | `src/termio/stream_handler.zig` | `fork(gx): GX-0008` | active |\n| GX-0009 | `src/font/DeferredFace.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/backend.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/discovery.zig` | `fork(gx): GX-0009` | active |\n| GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |\n| GX-0011 | `src/apprt/gtk/App.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0011` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part3",
-   "source_sha256": "9e3878e6647587c798784ca0472467e104b66f7bca585e6f3b65bed22f92ce2d",
-   "text": "| GX-0011 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0014 | `src/Surface.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/input/Binding.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/input/command.zig` | `fork(gx): GX-0014` | active |\n| GX-0015 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0015` | active |\n| GX-0015 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0015` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |\n| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n| GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
+   "source_sha256": "ff524ea4e649a5f18eb0a8553ec4a3c98fe1b5375e629e00c37f3762be356b0d",
+   "text": "| GX-0011 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0014 | `src/Surface.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | removed |\n| GX-0014 | `src/input/Binding.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/input/command.zig` | `fork(gx): GX-0014` | active |\n| GX-0015 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0015` | active |\n| GX-0015 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0015` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |\n| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n| GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
   },
   {
    "anchor": "fork 补丁登记 > 规则",
