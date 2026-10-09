@@ -92,6 +92,10 @@ Name: "{autoprograms}\Ghostty GX"; Filename: "{app}\ghostty.exe"; WorkingDir: "{
 Name: "{autodesktop}\Ghostty GX"; Filename: "{app}\ghostty.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
 
 [Registry]
+; For a drive root %V is "C:\", whose closing \" the command-line rules read as an escaped quote,
+; so ghostty.exe receives --working-directory=C:" and restores the backslash
+; (src/apprt/win32/App.zig::restoreTrailingBackslash). "%V\." would also work but leaves
+; non-canonical paths such as C:\Users\me\. as the initial working directory.
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\ghostty.exe"; ValueType: string; ValueData: "{app}\ghostty.exe"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\ghostty.exe"; ValueType: string; ValueName: "Path"; ValueData: "{app}"
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\GhosttyGX"; ValueType: string; ValueData: "{cm:OpenHere}"; Flags: uninsdeletekey; Tasks: contextmenu

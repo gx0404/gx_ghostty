@@ -301,6 +301,9 @@ pub fn initWithOptions(
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
         config.@"shell-integration" = .detect;
+    } else if (app.default_command) |command| {
+        // `command` is not configured: the default launch profile.
+        config.command = try command.clone(config.arenaAlloc());
     }
     if (options.title) |title| {
         config.title = try config.arenaAlloc().dupeZ(u8, title);
