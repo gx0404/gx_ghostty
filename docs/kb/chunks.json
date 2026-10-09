@@ -1,5 +1,5 @@
 {
- "chunk_count": 1458,
+ "chunk_count": 1467,
  "chunks": [
   {
    "anchor": "Agent Development Guide",
@@ -3509,32 +3509,95 @@
    "text": "### 验证\n\n```bash\npython scripts/zig_test.py --suite vt --filter \"semantic prompt\" --filter \"scrollback pull\"\npython scripts/zig_test.py --suite main --filter \"semantic prompt\" --filter \"scrollback pull\" --filter initTerminal --filter execCommand --filter pty.test\npython scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>\npython -m unittest scripts.test_fork_patches -v\n```\n\nGUI：\n\n- fresh-line：设 `GHOSTTY_GX_CONPTY=system` 启动 `<prefix>\\bin\\ghostty.exe`，以 GX Zsh（p10k 两行提示符、transient prompt、提示符前空行）依次执行 `sleep 4` 与 `false`：折叠后的 `❯ sleep 4` 与 `❯ false` 留在屏幕顶部相邻两行，上方没有空行；补丁之前 `❯ sleep 4` 消失、顶部出现空行。\n- 缩放：`<prefix>\\bin` 里放好随包的 `conpty.dll` 与 `OpenConsole.exe`，以 `window-width = 80`、`window-height = 20` 启动 cmd.exe，执行 `for /L %i in (1,1,120) do @echo line %i`，把窗口拉高后执行 `echo after-grow` 与 `dir /w`，再缩小、最大化各执行一条命令：命令与输出紧接在提示符之后，没有与旧行交错的内容或残留的提示符，滚轮往上能连续翻回 `line 1`。再设 `GHOSTTY_GX_CONPTY=system`、换 GX Zsh 各做一遍。补丁之前随包 ConPTY 下命令写在被拉回的历史行上，系统 ConPTY 下回滚区缺一段历史。"
   },
   {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css",
+   "source_sha256": "07fc96c7aea969b1f81c3c9d43c22e888c8b19985aa6b2f9cf015b5e07bd51a2",
+   "text": "## GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS\n\n- 文件：`src/apprt/gtk/css/style.css`（`.surface .readonly_overlay` 的 `color`，`.drop-overlay.drop-left`/`-right`/`-top`/`-bottom` 的四个 `background`）与 `src/apprt/gtk/class/application.zig`（`Application.loadRuntimeCss414` 中 `windowhandle:backdrop` 的背景色，`Application.loadRuntimeCss416` 中四个 `.drop-overlay` 渐变）。\n- 标记：`fork(gx): GX-0023`。`style.css` 在每个改动的声明上一行写 `/* fork(gx): GX-0023 <说明> */`；`application.zig` 的改动都在 Zig 多行字符串里，标记是紧贴在改动行之上的 `//` 注释行（夹在多行字符串的行之间，不进入生成的 CSS）。\n- 状态：active，未回馈上游。\n- 改动量：2 个文件，`git diff --numstat` 合计 +20/−14（含 10 行标记）。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 上游状态",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-上游状态",
+   "source_sha256": "6a4856234233fce36115a137a64e420b08c1b67c24f084a36ab50a9517b7842b",
+   "text": "### 上游状态\n\n未回馈上游。三处都是上游的通用缺陷（上游的 GTK 构建同样支持 4.14，并为它保留了 `loadRuntimeCss414`），适合回馈；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 原因",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-原因",
+   "source_sha256": "3c89692f40668b5116761a916b5ae0d98d176d6be81b96048c10513286cdaad3",
+   "text": "### 原因\n\nGTK 解析 CSS 时整条丢弃不认识的声明并记一条警告：没有 `parsing-error` 处理函数的 provider（libadwaita 自动加载的 `style.css`）由 GTK 记 `Gtk: Theme parser error: style.css:<行>:<列>: …`，Ghostty 的运行时 CSS 由 `Application.signalCssParsingError` 记 `css parsing failed at <data>:…`。上游（main 246f70287 仍是如此）有三类写法要较新的 GTK 才能解析：\n\n- 渐变的色标过渡提示（color transition hint，两个色标之间单独的 `50%`）：GTK 4.19.2 起才解析（`gtk/gtkcssimagelinear.c` 的 `transition_hint`，第一个稳定版是 4.20.0）。上游 1d053bd6e 为拖动分屏加的四条 `.drop-overlay` 规则因此在 GTK 4.20 以前整条被丢弃：Ubuntu 24.04（GTK 4.14.5）每次启动记 4 条 `Expected a valid color.`，拖动分屏时目标终端上没有任何高亮；GTK 4.16–4.18（如 Debian 13 的 4.18.6）上 `loadRuntimeCss416` 里同样的四条也被丢弃，每次加载运行时 CSS 再记 4 条 `css parsing failed`。\n- 空格分隔的 `hsl(25 50 75)`（CSS Color 4 写法）：GTK 4.16 起才支持（GTK NEWS 4.15.1「Support modern syntax and calc in rgb() and hsl()」），GTK 4.14 记 `Unexpected data at end of hsl() argument`，只读提示（`.readonly_overlay`）的文字颜色失效。\n- 相对颜色 `oklab(from …)`：GTK 4.16 起才支持，却写在专为 GTK 4.16 以前准备的 `loadRuntimeCss414` 里（`window-theme = ghostty` 时失焦窗口的标题栏变暗），GTK 4.14 上每次加载运行时 CSS 都记 `css parsing failed at <data>:6:20-26: … Expected a valid color.`。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 同步冲突处理",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-同步冲突处理",
+   "source_sha256": "ea52ebb47163cf6df37d29b218ee2f37b98275fd7416f7b88d8fc97aa667f525",
+   "text": "### 同步冲突处理\n\n上游改动这些规则时先取上游版本，再确认：渐变参数里没有单独的长度或百分比（过渡提示），`rgb()`、`hsl()` 用逗号分隔，`style.css` 与 `loadRuntimeCss414` 不用 `color-mix()`、`oklab()`、`from` 相对颜色与 `var()` 这类 GTK 4.16 才有的语法。`style.css` 由下方的测试锁定，`application.zig` 的运行时 CSS 靠 GTK 冒烟日志确认。上游新增的 CSS 只要 GTK 4.14 解析不了，也按同样的方法改写，加标记并补进本节。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 测试锁定",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-测试锁定",
+   "source_sha256": "fc4e01134df9c5b60043b59db6ba4589bc56812628066c01ffb0b1f2e26faed4",
+   "text": "### 测试锁定\n\n登记表与闭集检查之外，`scripts/test_fork_patches.py::gtk414_css_problems` 锁定 `style.css` 去掉注释后没有 GTK 4.14 解析不了的写法：渐变的过渡提示、空格分隔的 `rgb()`/`hsl()`，以及 `color-mix()`、`oklab()` 等新的颜色函数与 `var()`；夹具用例覆盖上游原来的写法、本补丁的写法与注释里的旧写法。`application.zig` 里的运行时 CSS 不在锁定范围内，由 GTK 冒烟验证。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 移除条件",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-移除条件",
+   "source_sha256": "cbb4c7dfcad39a792d1d7ad43b210b330e0823e893ea2271fb7004e3bddce3c4",
+   "text": "### 移除条件\n\n逐项移除：上游自己改成 GTK 4.14 能解析的写法时，删掉对应改动与标记；GX 的 GTK 下限提到 4.16 后，删掉 `hsl()` 与 `loadRuntimeCss414` 的改动（上游届时多半已删除该函数）；提到 4.20 后，删掉渐变的改动。全部删除后把两行登记改为 `removed`，并删掉 `scripts/test_fork_patches.py` 的 `gtk414_css_problems` 与对应测试。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 行为",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-行为",
+   "source_sha256": "e3ab93ec13dbcf0b33be112bf964cf3251b8d71ba03203896a3eda4ecaac46b5",
+   "text": "### 行为\n\n- 拖放高亮：`transparent, 50%, <颜色> 50%` 改为 `transparent 50%, <颜色> 50%`。按 CSS Images 4，过渡提示与下一个色标在同一位置时，前一个颜色保持到该位置再硬切换，与两个色标都在 50% 的写法渲染相同，GTK 4.20 起结果不变。GTK 4.20 以前拖动分屏时，目标终端靠近指针的那一半显示蓝色高亮：GTK 4.14 用 `style.css` 的 `rgba(53, 132, 228, 0.2)`，GTK 4.16 起由运行时 CSS 换成 libadwaita 强调色，与上游设计一致。\n- 只读提示：`hsl(25 50 75)` 改为等价的传统写法 `hsl(25, 50%, 75%)`（新写法里饱和度与亮度的数字按百分比解释），GTK 4.14 上文字恢复为浅橙色，GTK 4.16 起不变。\n- `window-theme = ghostty` 且 GTK 低于 4.16：失焦窗口的标题栏背景由 `oklab(from <背景> calc(l * 0.9) a b / alpha)` 改为 GTK 自有的 `shade(<背景>, 0.9)`。两者都把背景调暗约一成，但 `shade` 把 HSL 的亮度与饱和度各乘 0.9，不是 OKLab 亮度，所以与 GTK 4.16 起的上游效果略有差别（`#1f1f28` 上前者为 `rgb(28,28,36)`，后者约为 `rgb(25,25,34)`）；补丁前这条规则被丢弃，失焦时不变暗。GTK 4.16 起走 `loadRuntimeCss416`，不受影响。\n- 结果：GTK 4.14 上的启动日志不再有 `Theme parser error`，`window-theme = ghostty` 时也没有 `css parsing failed`；GTK 4.16–4.18 上不再有拖放高亮的 `css parsing failed`。其余 CSS 与上游相同。"
+  },
+  {
+   "anchor": "fork 补丁登记 > GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS > 验证",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-gx-0023-gtk-4-20-以前的版本能解析-ghostty-的-css-验证",
+   "source_sha256": "a2565d723736da0d704ffe61cceedc2f9b3eed4090993ed3730808f591769e94",
+   "text": "### 验证\n\n```bash\npython -m unittest scripts.test_fork_patches -v\njust wsl sync <worktree> --dirty\njust wsl build --gtk\njust wsl smoke --out <目录> --lang zh_CN --xdotool <拖动分屏的脚本>\njust wsl smoke --out <目录> --name ghostty-theme --config <写有 window-theme = ghostty 的文件>\n```\n\n- 两次冒烟的日志都没有 `Theme parser error` 与 `css parsing failed`；补丁前 GTK 4.14 每次启动有 5 条 `Theme parser error`，`window-theme = ghostty` 时另有 `css parsing failed at <data>:6:20-26`。\n- 拖动分屏（xdotool 脚本）：Ctrl+Shift+O 分出右侧终端，指针移到它顶端中部的拖动柄，按住拖到左侧终端靠左处，用 `exec --sync scrot <文件>` 截图：左侧终端的左半边是蓝色高亮；再拖到靠下处，下半边高亮；松开后两个终端交换位置、高亮消失。补丁前拖动时没有高亮，交换照常。\n- GTK 4.16–4.18 上的运行时 CSS 无法在本机（Ubuntu 24.04）运行，需在对应发行版（如 Debian 13，gx-ci `gtk-smoke` 用的容器）上确认日志没有 `css parsing failed`。"
+  },
+  {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part1",
-   "source_sha256": "f618a9e078192e8c21da58d8493765e027d18cf9b54720a99335e26358064a47",
+   "source_sha256": "5d1c1eca56c373d4f8e578c2cbd3bc36f2b22806c67fb27b18c2b9a895ff040f",
    "text": "## 登记表\n\n格式约定（`scripts/test_fork_patches.py` 按此解析）：\n\n- 表格位于 `fork-patches:begin` 与 `fork-patches:end` 两行注释之间，表头固定为 `ID | 文件 | 标记 | 状态`。\n- `ID` 形如 `GX-0001`；`文件` 是仓库相对的 POSIX 路径；`标记` 必须等于 `fork(gx): <ID>`；`文件` 与 `标记` 写在反引号里。\n- `状态` 取 `active`（标记必须存在于该文件）或 `removed`（标记必须已从该文件消失）。\n- 同一个 (ID, 文件) 只登记一行；每个 ID 在下文都有以 `## <ID>` 开头的小节。\n\n<!-- fork-patches:begin -->\n| ID | 文件 | 标记 | 状态 |\n|---|---|---|---|\n| GX-0001 | `src/build/Config.zig` | `fork(gx): GX-0001` | active |\n| GX-0002 | `build.zig` | `fork(gx): GX-0002` | active |\n| GX-0003 | `src/apprt.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/action.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/runtime.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/structs.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/apprt/surface.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/build/SharedDeps.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/config/Config.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/datastruct/split_tree.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/font/face.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/input/Binding.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/main_ghostty.zig` | `fork(gx): GX-0003` | active |\n| GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |\n| GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |\n| GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part2",
-   "source_sha256": "f618a9e078192e8c21da58d8493765e027d18cf9b54720a99335e26358064a47",
+   "source_sha256": "5d1c1eca56c373d4f8e578c2cbd3bc36f2b22806c67fb27b18c2b9a895ff040f",
    "text": "| GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |\n| GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |\n| GX-0006 | `include/ghostty/vt/modes.h` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/Surface.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/modes.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |\n| GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |\n| GX-0008 | `src/os/hostname.zig` | `fork(gx): GX-0008` | active |\n| GX-0008 | `src/termio/stream_handler.zig` | `fork(gx): GX-0008` | active |\n| GX-0009 | `src/font/DeferredFace.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/backend.zig` | `fork(gx): GX-0009` | active |\n| GX-0009 | `src/font/discovery.zig` | `fork(gx): GX-0009` | active |\n| GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |\n| GX-0011 | `src/apprt/gtk/App.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0011` | active |"
   },
   {
    "anchor": "fork 补丁登记 > 登记表",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-登记表-part3",
-   "source_sha256": "f618a9e078192e8c21da58d8493765e027d18cf9b54720a99335e26358064a47",
-   "text": "| GX-0011 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0014 | `src/Surface.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | removed |\n| GX-0014 | `src/input/Binding.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/input/command.zig` | `fork(gx): GX-0014` | active |\n| GX-0015 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0015` | active |\n| GX-0015 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0015` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |\n| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n| GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |\n| GX-0022 | `src/terminal/Terminal.zig` | `fork(gx): GX-0022` | active |\n| GX-0022 | `src/termio/Exec.zig` | `fork(gx): GX-0022` | active |\n<!-- fork-patches:end -->\n\n闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
+   "source_sha256": "5d1c1eca56c373d4f8e578c2cbd3bc36f2b22806c67fb27b18c2b9a895ff040f",
+   "text": "| GX-0011 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0011` | active |\n| GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |\n| GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |\n| GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |\n| GX-0014 | `src/Surface.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/apprt/gtk/class/command_palette.zig` | `fork(gx): GX-0014` | removed |\n| GX-0014 | `src/input/Binding.zig` | `fork(gx): GX-0014` | active |\n| GX-0014 | `src/input/command.zig` | `fork(gx): GX-0014` | active |\n| GX-0015 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0015` | active |\n| GX-0015 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0015` | active |\n| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |\n| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |\n| GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |\n| GX-0022 | `src/terminal/Terminal.zig` | `fork(gx): GX-0022` | active |\n| GX-0022 | `src/termio/Exec.zig` | `fork(gx): GX-0022` | active |\n| GX-0023 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0023` | active |\n| GX-0023 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0023` | active |\n<!-- fork-patches:end -->"
+  },
+  {
+   "anchor": "fork 补丁登记 > 登记表",
+   "doc": "docs/FORK_PATCHES.md",
+   "id": "docs-fork-patches-md-fork-补丁登记-登记表-part4",
+   "source_sha256": "5d1c1eca56c373d4f8e578c2cbd3bc36f2b22806c67fb27b18c2b9a895ff040f",
+   "text": "闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。"
   },
   {
    "anchor": "fork 补丁登记 > 规则",
    "doc": "docs/FORK_PATCHES.md",
    "id": "docs-fork-patches-md-fork-补丁登记-规则",
-   "source_sha256": "1399a48bd9a6b4afd5999de99f990f6d29bbd1ab90489fb34a62758f92da8cce",
-   "text": "## 规则\n\n- 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。\n- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0022）之后的号。在册的 17 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021 与 GX-0022，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。\n- 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。\n- 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。\n- 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。\n- 移除：删掉改动与标记，把登记行的状态改为 `removed`，补丁小节保留作历史。"
+   "source_sha256": "ccbf840800f1832c0e78fc16fc492d8863838fac1ae4da8acb4a39c3189e80a1",
+   "text": "## 规则\n\n- 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。\n- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0023）之后的号。在册的 18 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016 与 GX-0021～GX-0023，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。\n- 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。\n- 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。\n- 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。\n- 移除：删掉改动与标记，把登记行的状态改为 `removed`，补丁小节保留作历史。"
   },
   {
    "anchor": "Ghostty GX 功能清单与 WezTerm GX 对照",

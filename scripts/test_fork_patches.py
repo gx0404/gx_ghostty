@@ -1,7 +1,8 @@
 """Lock tests for the fork patch registry in docs/FORK_PATCHES.md.
 
 The registry table is the closed set of ``fork(gx)`` markers in upstream
-source (src/, include/, pkg/, macos/ and build.zig). Pure additions are
+source (src/, include/, pkg/, macos/ and build.zig), whatever the comment
+syntax (``//`` or ``/* */``, e.g. in GTK CSS). Pure additions are
 wrapped in ``fork(gx): GX-NNNN begin`` / ``fork(gx): GX-NNNN end`` comment
 lines, so dropping those hunks must give back the merged upstream file.
 Run from the repo root:
@@ -74,6 +75,13 @@ GX0002_HUNKS = (
          "test_bin_step.dependOn(&test_exe_bin_install.step);",
      )),
 )
+
+GTK_CSS = "src/apprt/gtk/css/style.css"
+CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
+CSS_RGB_HSL_RE = re.compile(r"\b(?:rgba?|hsla?)\(")
+CSS_GTK416_RE = re.compile(r"\b(?:color-mix|color|hwb|lab|lch|oklab|oklch|var)\(")
+CSS_DIMENSION_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:%|[a-z]+)?")
 
 
 @dataclass(frozen=True)
@@ -366,6 +374,49 @@ def gx0002_problems(source: str) -> list[str]:
     return problems
 
 
+def css_call_args(css: str, paren: int) -> list[str]:
+    """Top-level, comma-separated arguments of the call whose '(' is at ``paren``."""
+    args: list[str] = []
+    depth, start = 0, paren + 1
+    for index in range(paren, len(css)):
+        if css[index] == "(":
+            depth += 1
+        elif css[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return [*args, css[start:index].strip()]
+        elif css[index] == "," and depth == 1:
+            args.append(css[start:index].strip())
+            start = index + 1
+    raise ValueError(f"unclosed call at offset {paren}")
+
+
+def gtk414_css_problems(source: str) -> list[str]:
+    """Shape lock for GX-0023: CSS outside comments that GTK 4.14 cannot parse.
+
+    GTK drops such a declaration and logs a theme parser error. Color
+    transition hints in gradients parse from GTK 4.20 on; the space-separated
+    rgb()/hsl() syntax, color-mix(), the newer color functions and var()
+    from GTK 4.16 on.
+    """
+    css = CSS_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), source)
+    problems: list[str] = []
+
+    def line(offset: int) -> int:
+        return css.count("\n", 0, offset) + 1
+
+    for match in CSS_GTK416_RE.finditer(css):
+        problems.append(f"line {line(match.start())}: {match.group()} needs GTK 4.16")
+    for match in CSS_RGB_HSL_RE.finditer(css):
+        if len(css_call_args(css, match.end() - 1)) == 1:
+            problems.append(f"line {line(match.start())}: {match.group()} without commas needs GTK 4.16")
+    for match in CSS_GRADIENT_RE.finditer(css):
+        for arg in css_call_args(css, match.end() - 1)[1:]:
+            if CSS_DIMENSION_RE.fullmatch(arg):
+                problems.append(f"line {line(match.start())}: color hint {arg!r} needs GTK 4.20")
+    return problems
+
+
 class RealRepoTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -387,6 +438,7 @@ class RealRepoTests(unittest.TestCase):
         files = git_visible_files(ROOT, SCAN_PATHSPECS)
         self.assertIn(CONFIG_ZIG, files)
         self.assertIn("build.zig", files)
+        self.assertIn(GTK_CSS, files)
         for path in files:
             self.assertTrue(path == "build.zig" or path.split("/", 1)[0] in SCAN_PATHSPECS, path)
 
@@ -400,6 +452,10 @@ class RealRepoTests(unittest.TestCase):
     def test_build_zig_keeps_the_gx0002_hunks(self):
         source = (ROOT / BUILD_ZIG).read_text(encoding="utf-8")
         self.assertEqual(gx0002_problems(source), [])
+
+    def test_gtk_stylesheet_parses_on_gtk_4_14(self):
+        source = (ROOT / GTK_CSS).read_text(encoding="utf-8")
+        self.assertEqual(gtk414_css_problems(source), [])
 
 
 class Gx0001ShapeTests(unittest.TestCase):
@@ -545,6 +601,33 @@ class HunkTests(unittest.TestCase):
         self.assertEqual(squash("f(.{\n    // note\n    .a = 1,\n});"), squash("f(.{ .a = 1 });"))
 
 
+class Gtk414CssTests(unittest.TestCase):
+    def test_gtk_4_14_syntax_passes(self):
+        css = (".a { color: hsl(25, 50%, 75%); border-color: rgba(53, 132, 228, 0.5); }\n"
+               ".b {\n  background: linear-gradient(\n    to left,\n    transparent 50%,\n"
+               "    rgba(53, 132, 228, 0.2) 50%\n  );\n}\n"
+               ".c { background: radial-gradient(10px, red, blue); background-image: image(rgb(1,2,3)); }\n"
+               "/* background: linear-gradient(to left, transparent, 50%, color-mix(in srgb,"
+               " var(--accent-color), transparent 50%) 50%); */\n")
+        self.assertEqual(gtk414_css_problems(css), [])
+        self.assertEqual(gtk414_css_problems(css.replace("\n", "\r\n")), [])
+
+    def test_newer_syntax_is_rejected(self):
+        cases = {
+            "line 3: color hint '50%' needs GTK 4.20":
+                "/* x */\n.a {\n  background: linear-gradient(\n    to left,\n    transparent,\n"
+                "    50%,\n    rgba(53, 132, 228, 0.2) 50%\n  );\n}\n",
+            "line 1: hsl( without commas needs GTK 4.16": ".a { color: hsl(25 50 75); }\n",
+            "line 1: rgb( without commas needs GTK 4.16": ".a { color: rgb(1 2 3 / 50%); }\n",
+            "line 1: color-mix( needs GTK 4.16": ".a { color: color-mix(in srgb, red, blue); }\n",
+            "line 1: var( needs GTK 4.16": ".a { color: var(--accent-color); }\n",
+            "line 1: oklab( needs GTK 4.16": ".a { color: oklab(from red calc(l * 0.9) a b); }\n",
+        }
+        for expected, css in cases.items():
+            with self.subTest(expected):
+                self.assertIn(expected, gtk414_css_problems(css))
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则
@@ -645,6 +728,19 @@ class FixtureTests(unittest.TestCase):
         self.write("src/a.zig", "const a = 1;\n// fork(gx): GX-0001\n", newline="\r\n")
         self.assertEqual(check(self.root, ["src/a.zig"]), [])
         self.assertEqual(find_markers(self.root, ["src/a.zig"]), [("src/a.zig", 2, "GX-0001")])
+
+    def test_css_block_comment_markers(self):
+        css = "src/x/style.css"
+        self.registry([("GX-0001", css, "active")])
+        self.write(css, ".a {\n  /* fork(gx): GX-0001 legacy hsl() syntax */\n  color: hsl(25, 50%, 75%);\n}\n",
+                   newline="\r\n")
+        self.assertEqual(check(self.root, [css]), [])
+        self.assertEqual(find_markers(self.root, [css]), [(css, 2, "GX-0001")])
+        self.write(css, "/* fork(gx) legacy syntax */\n/* fork(gx): GX-0002 legacy syntax */\n")
+        problems = check(self.root, [css])
+        self.assertIn(f"{css}:1: malformed marker, expected 'fork(gx): GX-NNNN'", problems)
+        self.assertTrue(any(p.startswith(f"{css}:2: GX-0002 is not registered") for p in problems), problems)
+        self.assertTrue(any("GX-0001" in p and "missing" in p for p in problems), problems)
 
     def test_balanced_hunks_pass(self):
         self.registry([("GX-0001", "build.zig", "active")])

@@ -991,7 +991,8 @@ pub const Application = extern struct {
                 \\  color: rgb({d},{d},{d});
                 \\}}
                 \\windowhandle:backdrop {{
-                \\ background-color: oklab(from rgb({d},{d},{d}) calc(l * 0.9) a b / alpha);
+                // fork(gx): GX-0023 shade(), GTK < 4.16 has no relative color syntax
+                \\ background-color: shade(rgb({d},{d},{d}), 0.9);
                 \\}}
                 \\
             , .{
@@ -1067,28 +1068,32 @@ pub const Application = extern struct {
             \\.drop-overlay.drop-left {
             \\  background: linear-gradient(
             \\    to left,
-            \\    transparent, 50%,
+            // fork(gx): GX-0023 the same hard stop without a color hint, GTK < 4.20 rejects hints
+            \\    transparent 50%,
             \\    color-mix(in srgb, var(--accent-bg-color), transparent 80%) 50%
             \\  );
             \\}
             \\.drop-overlay.drop-right {
             \\  background: linear-gradient(
             \\    to right,
-            \\    transparent, 50%,
+            // fork(gx): GX-0023 the same hard stop without a color hint, GTK < 4.20 rejects hints
+            \\    transparent 50%,
             \\    color-mix(in srgb, var(--accent-bg-color), transparent 80%) 50%
             \\  );
             \\}
             \\.drop-overlay.drop-top {
             \\  background: linear-gradient(
             \\    to top,
-            \\    transparent, 50%,
+            // fork(gx): GX-0023 the same hard stop without a color hint, GTK < 4.20 rejects hints
+            \\    transparent 50%,
             \\    color-mix(in srgb, var(--accent-bg-color), transparent 80%) 50%
             \\  );
             \\}
             \\.drop-overlay.drop-bottom {
             \\  background: linear-gradient(
             \\    to bottom,
-            \\    transparent, 50%,
+            // fork(gx): GX-0023 the same hard stop without a color hint, GTK < 4.20 rejects hints
+            \\    transparent 50%,
             \\    color-mix(in srgb, var(--accent-bg-color), transparent 80%) 50%
             \\  );
             \\}

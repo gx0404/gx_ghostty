@@ -5,8 +5,8 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0022）之后的号。在册的 17 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021 与 GX-0022，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
-- 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0023）之后的号。在册的 18 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016 与 GX-0021～GX-0023，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
 - 移除：删掉改动与标记，把登记行的状态改为 `removed`，补丁小节保留作历史。
@@ -76,6 +76,8 @@
 | GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |
 | GX-0022 | `src/terminal/Terminal.zig` | `fork(gx): GX-0022` | active |
 | GX-0022 | `src/termio/Exec.zig` | `fork(gx): GX-0022` | active |
+| GX-0023 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0023` | active |
+| GX-0023 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0023` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -950,3 +952,55 @@ GUI：
 - `Terminal: resize without scrollback pull stays in sync with ConPTY` 用两种 ConPTY 缩放后的实际输出形状锁定关闭拉回后的同步：随包 ConPTY 缩放时不输出、之后用绝对坐标回显输入，命令落在提示符所在行；系统 ConPTY 缩放后立即重绘整个缓冲，回滚区的行不被覆盖，光标回到提示符。
 - `initTerminal: ConPTY screen buffer sync on Windows` 锁定 `Exec.initTerminal` 在 Windows 上关闭这两个字段，其他平台保持上游默认。
 - 另有登记表与闭集检查。
+
+## GX-0023 GTK 4.20 以前的版本能解析 Ghostty 的 CSS
+
+- 文件：`src/apprt/gtk/css/style.css`（`.surface .readonly_overlay` 的 `color`，`.drop-overlay.drop-left`/`-right`/`-top`/`-bottom` 的四个 `background`）与 `src/apprt/gtk/class/application.zig`（`Application.loadRuntimeCss414` 中 `windowhandle:backdrop` 的背景色，`Application.loadRuntimeCss416` 中四个 `.drop-overlay` 渐变）。
+- 标记：`fork(gx): GX-0023`。`style.css` 在每个改动的声明上一行写 `/* fork(gx): GX-0023 <说明> */`；`application.zig` 的改动都在 Zig 多行字符串里，标记是紧贴在改动行之上的 `//` 注释行（夹在多行字符串的行之间，不进入生成的 CSS）。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，`git diff --numstat` 合计 +20/−14（含 10 行标记）。
+
+### 原因
+
+GTK 解析 CSS 时整条丢弃不认识的声明并记一条警告：没有 `parsing-error` 处理函数的 provider（libadwaita 自动加载的 `style.css`）由 GTK 记 `Gtk: Theme parser error: style.css:<行>:<列>: …`，Ghostty 的运行时 CSS 由 `Application.signalCssParsingError` 记 `css parsing failed at <data>:…`。上游（main 246f70287 仍是如此）有三类写法要较新的 GTK 才能解析：
+
+- 渐变的色标过渡提示（color transition hint，两个色标之间单独的 `50%`）：GTK 4.19.2 起才解析（`gtk/gtkcssimagelinear.c` 的 `transition_hint`，第一个稳定版是 4.20.0）。上游 1d053bd6e 为拖动分屏加的四条 `.drop-overlay` 规则因此在 GTK 4.20 以前整条被丢弃：Ubuntu 24.04（GTK 4.14.5）每次启动记 4 条 `Expected a valid color.`，拖动分屏时目标终端上没有任何高亮；GTK 4.16–4.18（如 Debian 13 的 4.18.6）上 `loadRuntimeCss416` 里同样的四条也被丢弃，每次加载运行时 CSS 再记 4 条 `css parsing failed`。
+- 空格分隔的 `hsl(25 50 75)`（CSS Color 4 写法）：GTK 4.16 起才支持（GTK NEWS 4.15.1「Support modern syntax and calc in rgb() and hsl()」），GTK 4.14 记 `Unexpected data at end of hsl() argument`，只读提示（`.readonly_overlay`）的文字颜色失效。
+- 相对颜色 `oklab(from …)`：GTK 4.16 起才支持，却写在专为 GTK 4.16 以前准备的 `loadRuntimeCss414` 里（`window-theme = ghostty` 时失焦窗口的标题栏变暗），GTK 4.14 上每次加载运行时 CSS 都记 `css parsing failed at <data>:6:20-26: … Expected a valid color.`。
+
+### 行为
+
+- 拖放高亮：`transparent, 50%, <颜色> 50%` 改为 `transparent 50%, <颜色> 50%`。按 CSS Images 4，过渡提示与下一个色标在同一位置时，前一个颜色保持到该位置再硬切换，与两个色标都在 50% 的写法渲染相同，GTK 4.20 起结果不变。GTK 4.20 以前拖动分屏时，目标终端靠近指针的那一半显示蓝色高亮：GTK 4.14 用 `style.css` 的 `rgba(53, 132, 228, 0.2)`，GTK 4.16 起由运行时 CSS 换成 libadwaita 强调色，与上游设计一致。
+- 只读提示：`hsl(25 50 75)` 改为等价的传统写法 `hsl(25, 50%, 75%)`（新写法里饱和度与亮度的数字按百分比解释），GTK 4.14 上文字恢复为浅橙色，GTK 4.16 起不变。
+- `window-theme = ghostty` 且 GTK 低于 4.16：失焦窗口的标题栏背景由 `oklab(from <背景> calc(l * 0.9) a b / alpha)` 改为 GTK 自有的 `shade(<背景>, 0.9)`。两者都把背景调暗约一成，但 `shade` 把 HSL 的亮度与饱和度各乘 0.9，不是 OKLab 亮度，所以与 GTK 4.16 起的上游效果略有差别（`#1f1f28` 上前者为 `rgb(28,28,36)`，后者约为 `rgb(25,25,34)`）；补丁前这条规则被丢弃，失焦时不变暗。GTK 4.16 起走 `loadRuntimeCss416`，不受影响。
+- 结果：GTK 4.14 上的启动日志不再有 `Theme parser error`，`window-theme = ghostty` 时也没有 `css parsing failed`；GTK 4.16–4.18 上不再有拖放高亮的 `css parsing failed`。其余 CSS 与上游相同。
+
+### 上游状态
+
+未回馈上游。三处都是上游的通用缺陷（上游的 GTK 构建同样支持 4.14，并为它保留了 `loadRuntimeCss414`），适合回馈；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游改动这些规则时先取上游版本，再确认：渐变参数里没有单独的长度或百分比（过渡提示），`rgb()`、`hsl()` 用逗号分隔，`style.css` 与 `loadRuntimeCss414` 不用 `color-mix()`、`oklab()`、`from` 相对颜色与 `var()` 这类 GTK 4.16 才有的语法。`style.css` 由下方的测试锁定，`application.zig` 的运行时 CSS 靠 GTK 冒烟日志确认。上游新增的 CSS 只要 GTK 4.14 解析不了，也按同样的方法改写，加标记并补进本节。
+
+### 移除条件
+
+逐项移除：上游自己改成 GTK 4.14 能解析的写法时，删掉对应改动与标记；GX 的 GTK 下限提到 4.16 后，删掉 `hsl()` 与 `loadRuntimeCss414` 的改动（上游届时多半已删除该函数）；提到 4.20 后，删掉渐变的改动。全部删除后把两行登记改为 `removed`，并删掉 `scripts/test_fork_patches.py` 的 `gtk414_css_problems` 与对应测试。
+
+### 验证
+
+```bash
+python -m unittest scripts.test_fork_patches -v
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl smoke --out <目录> --lang zh_CN --xdotool <拖动分屏的脚本>
+just wsl smoke --out <目录> --name ghostty-theme --config <写有 window-theme = ghostty 的文件>
+```
+
+- 两次冒烟的日志都没有 `Theme parser error` 与 `css parsing failed`；补丁前 GTK 4.14 每次启动有 5 条 `Theme parser error`，`window-theme = ghostty` 时另有 `css parsing failed at <data>:6:20-26`。
+- 拖动分屏（xdotool 脚本）：Ctrl+Shift+O 分出右侧终端，指针移到它顶端中部的拖动柄，按住拖到左侧终端靠左处，用 `exec --sync scrot <文件>` 截图：左侧终端的左半边是蓝色高亮；再拖到靠下处，下半边高亮；松开后两个终端交换位置、高亮消失。补丁前拖动时没有高亮，交换照常。
+- GTK 4.16–4.18 上的运行时 CSS 无法在本机（Ubuntu 24.04）运行，需在对应发行版（如 Debian 13，gx-ci `gtk-smoke` 用的容器）上确认日志没有 `css parsing failed`。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gtk414_css_problems` 锁定 `style.css` 去掉注释后没有 GTK 4.14 解析不了的写法：渐变的过渡提示、空格分隔的 `rgb()`/`hsl()`，以及 `color-mix()`、`oklab()` 等新的颜色函数与 `var()`；夹具用例覆盖上游原来的写法、本补丁的写法与注释里的旧写法。`application.zig` 里的运行时 CSS 不在锁定范围内，由 GTK 冒烟验证。
