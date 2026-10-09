@@ -390,13 +390,14 @@ types:
       Each named instance exposes one bit from the little-endian integer.
       Arithmetic division is used instead of bitwise operations because the
       JavaScript target implements those operations with signed 32-bit values.
-      All values remain exact because the registry occupies only 43 bits,
+      All values remain exact because the registry occupies only 44 bits,
       within JavaScript's 53-bit safe integer range.
+    # fork(gx): GX-0006 win32_input_mode (bit 43) widened the registry from 43 to 44 bits
     seq:
       - id: raw
         type: u8
         valid:
-          max: 8796093022207
+          max: 17592186044415
     instances:
       disable_keyboard:
         value: (raw / 1) % 2 != 0
@@ -484,6 +485,9 @@ types:
         value: (raw / 2199023255552) % 2 != 0
       kitty_paste_events:
         value: (raw / 4398046511104) % 2 != 0
+      # fork(gx): GX-0006 win32-input-mode (DECSET 9001)
+      win32_input_mode:
+        value: (raw / 8796093022208) % 2 != 0
 
   tab_stops:
     params:

@@ -5421,6 +5421,45 @@ test "request mode DECRQM with write_pty callback" {
     }
 }
 
+// fork(gx): GX-0006 begin: win32-input-mode through the stream
+test "DECSET 9001 win32-input-mode and its DECRQM report" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [64]u8 = undefined;
+        var response_len: usize = 0;
+        fn writePty(_: *Handler, data: []const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+        }
+    };
+    S.response_len = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B[?9001$p");
+    try testing.expectEqualStrings("\x1B[?9001;2$y", S.response[0..S.response_len]);
+
+    // ConPTY's startup request.
+    s.nextSlice("\x1B[c\x1B[?1004h\x1B[?9001h");
+    try testing.expect(t.modes.get(.win32_input_mode));
+    s.nextSlice("\x1B[?9001$p");
+    try testing.expectEqualStrings("\x1B[?9001;1$y", S.response[0..S.response_len]);
+
+    // ConPTY's shutdown.
+    s.nextSlice("\x1B[?1004l\x1B[?9001l");
+    try testing.expect(!t.modes.get(.win32_input_mode));
+
+    // A full reset clears it like any other mode.
+    s.nextSlice("\x1B[?9001h\x1Bc");
+    try testing.expect(!t.modes.get(.win32_input_mode));
+}
+// fork(gx): GX-0006 end
+
 test "request mode DECRQM ANSI responses" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);

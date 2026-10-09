@@ -44,6 +44,15 @@
 | GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Termio.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/stream_handler.zig` | `fork(gx): GX-0005` | active |
+| GX-0006 | `include/ghostty/vt/modes.h` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/Surface.zig` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/modes.zig` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/snapshot/snapshot.ksy` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/snapshot/terminal.zig` | `fork(gx): GX-0006` | active |
+| GX-0006 | `src/terminal/stream_terminal.zig` | `fork(gx): GX-0006` | active |
+| GX-0007 | `src/pty.zig` | `fork(gx): GX-0007` | active |
+| GX-0008 | `src/os/hostname.zig` | `fork(gx): GX-0008` | active |
+| GX-0008 | `src/termio/stream_handler.zig` | `fork(gx): GX-0008` | active |
 | GX-0009 | `src/font/DeferredFace.zig` | `fork(gx): GX-0009` | active |
 | GX-0009 | `src/font/backend.zig` | `fork(gx): GX-0009` | active |
 | GX-0009 | `src/font/discovery.zig` | `fork(gx): GX-0009` | active |
@@ -330,6 +339,147 @@ python -m unittest scripts.test_fork_patches -v
 ### 测试锁定
 
 只有登记表与闭集检查；`src/termio/Exec.zig` 新增 `execCommand windows: quoted path with spaces stays one argument` 用例。
+
+## GX-0006 win32-input-mode（DECSET 9001）
+
+- 文件：`src/terminal/modes.zig`（`entries` 末尾追加 `win32_input_mode`，值 9001，另加一条单测）、`include/ghostty/vt/modes.h`（`GHOSTTY_MODE_WIN32_INPUT`）、`src/terminal/snapshot/terminal.zig`（模式位登记表与编码注释改为 44 位，`TERMINAL mode bit layout` 单测改为 44 位并检查第 43 位）、`src/terminal/snapshot/snapshot.ksy`（`mode_set` 的说明、`valid.max` 与新实例）、`src/terminal/stream_terminal.zig`（一条经解析流的 DECSET/DECRQM 单测）、`src/Surface.zig`（导入、`gx_win32_key` 字段、`gxWin32KeyCallback` 入口、`encodeKey` 开头的分流）。编码器、记录构造与 apprt 接入契约在新路径 `src/gx/win32_input.zig`。
+- 标记：`fork(gx): GX-0006`；纯新增块用 begin/end 包住，改动的上游行（快照的登记表、编码注释与单测位宽，ksy 的说明与上限）上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：6 个文件，`git diff --numstat` 合计 +136/−13（含注释与单测）。
+
+### 原因
+
+ConPTY 启动时向宿主终端发送 `CSI ? 9001 h`（Windows Terminal 定义的 win32-input-mode），关闭时发送 `CSI ? 9001 l`（microsoft/terminal `src/host/VtIo.cpp`）。终端支持该模式时，每次按下与抬起（修饰键也算）都以完整的 KEY_EVENT_RECORD 交给 ConPTY，控制台程序（PSReadLine、herdr 等）才能区分 Shift+Enter、Ctrl+Space、Ctrl+Break、单独的修饰键与按键抬起；否则 ConPTY 只能从 VT 序列反推，信息有损。上游 Ghostty 不认识 9001：日志记 `unimplemented mode: 9001`，DECRQM 报告未识别。模式表 `entries` 是 `Mode`、`ModePacked`、DECRQM 与 XTSAVE 的唯一来源，只能改上游文件；快照把 `ModePacked` 的位序当作线格式登记表，必须同步；按键编码的入口在 `Surface.encodeKey`。
+
+### 行为
+
+- `CSI ? 9001 h/l` 设置与清除 `win32_input_mode`，DECRQM（`CSI ? 9001 $ p`）报告 1 或 2，XTSAVE/XTRESTORE 与 RIS 与其他模式相同；DECSTR 不改它（Ghostty 的 DECSTR 只复位固定的几个模式）。C API 用 `GHOSTTY_MODE_WIN32_INPUT` 查询与设置；libghostty-vt 只记录模式，不提供 Win32 按键编码。
+- 快照：`ModePacked` 由 43 位变为 44 位（仍是 8 字节），新模式占第 43 位，即上游 v1 里恒为 0、解码时被忽略的保留位。第 0–42 位不变，所以上游写的快照在 fork 里解码后该位为 0，上游解码器读 fork 的快照时丢弃该位，现有金样全部不变。上游注释要求新增模式时升快照版本，fork 不升：解码器只认单一版本，升版要为全部 v1 金样另建新版本并在每次同步时冲突，而上面两个方向本来就兼容；快照格式 v1 也明确不承诺稳定，应用本身不持久化快照。
+- 编码（`src/gx/win32_input.zig`）：每条记录写成 `CSI Vk;Sc;Uc;Kd;Cs;Rc _`，六个参数总是写全（与 Windows Terminal `TerminalInput::_makeWin32Output` 相同，herdr 的 `parse_win32_input_mode_key_record` 也要求六个）。Uc 是一个 UTF-16 码元，按键产生多个码元时每个码元一条记录；死键 Uc=0；Cs 是 dwControlKeyState 的低 16 位，ENHANCED_KEY 取自 lParam 第 24 位；Sc 取 lParam 第 16–23 位；Rc 取 lParam 低 16 位（0 按 1）。没有按键的文字（WM_CHAR、输入法结果）每个码元一对 VK=0、Sc=0 的按下与抬起记录。kitty 键盘协议标志非 0 时让位给 kitty 编码，与 Windows Terminal 相同（ConPTY 从不关闭 9001）。
+- 分流：`Surface.gxWin32KeyCallback(event, message)` 把本次事件的 Win32 消息记进 `gx_win32_key`，再调用原 `keyCallback`；`encodeKey` 开头的 `gx_win32_input.surfaceWriteReq` 只在「事件与记录匹配、子进程未退出、9001 已开且没有 kitty 标志」时用记录替换常规编码，否则照常编码。apprt 只调用 `keyCallback` 时（目前的 win32 apprt 与 GTK）行为与上游完全相同，所以接入之前打字不受影响。绑定、按键序列、KAM、只读模式、滚动到底与清除选区都沿用 `keyCallback`；绑定执行期间产生的其他按键事件（例如失焦时补发的抬起）与记录不匹配，走常规编码；关闭表面的绑定返回 `.closed` 后不再触碰表面。
+- win32 apprt 的接入（`src/apprt/win32/**` 由其他任务改动，本补丁只提供接口，契约写在 `src/gx/win32_input.zig` 文件头）：`handleKeyEvent` 对每条 WM_KEYDOWN/WM_SYSKEYDOWN/WM_KEYUP/WM_SYSKEYUP（VK_PROCESSKEY、VK_PACKET 仍提前返回）读取 `GetKeyboardState`，构造 `KeyMessage{ .vk = wParam, .lparam, .down, .state = .fromKeyboardState(&keyboard_state), .text, .dead }`，其中 `text` 是 ToUnicode 的原始 UTF-16 输出（含 Ctrl+C 的 0x03 这类控制字符；抬起时用 wFlags 0x4 不消耗死键状态再译一次，或留空），ToUnicode 返回负数时 `dead = true`，然后改调 `core_surface.gxWin32KeyCallback(event, message)`；`handleCharEvent`（WM_CHAR）与 `sendImeText`（输入法结果）改调 `gxWin32KeyCallback(event, null)`；粘贴与拖放文件保持原样发原始文本（与 Windows Terminal 相同）。记录经常规的 `Surface.queueIo` 写入 pty，apprt 不直接写 pty。
+
+### 上游状态
+
+未回馈上游。上游没有 Windows 运行时，也不识别 win32-input-mode。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+- `entries` 里的 fork 块保持在最后：上游在末尾新增模式时，把上游条目放在 fork 块之前，`win32_input_mode` 顺延一位，并同步快照登记表注释、编码注释、ksy 的说明、实例除数与 `valid.max`、`TERMINAL mode bit layout` 单测的位宽与位号（fork 快照里该位随之移动，v1 不承诺兼容）。上游若升了快照版本，按新版本重新检查保留位与金样。
+- 上游自己支持 9001 时，删掉 fork 的条目、宏与快照改动，`src/gx/win32_input.zig::active` 改用上游的模式名。
+- `Surface.keyCallback`、`encodeKey` 被上游重构时，保持两点：编码前先问 `gx_win32_input.surfaceWriteReq`；`gxWin32KeyCallback` 包住 `keyCallback`，返回 `.closed` 后不碰表面。
+
+### 移除条件
+
+上游实现 win32-input-mode（识别 9001 并在按键编码中输出 KEY_EVENT_RECORD）之后移除：删除各处改动与标记，把登记行改为 `removed`，win32 apprt 改用上游接口。
+
+### 验证
+
+```bash
+python scripts/zig_test.py --suite vt --filter 9001 --filter "mode bit layout" --filter modes --filter DECRQM --filter "TERMINAL header"
+python scripts/zigw.py build test-bin -Dtarget=x86_64-windows-gnu -Dapp-runtime=none
+python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --filter gx.win32_input
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+python -m unittest scripts.test_fork_patches -v
+```
+
+- 第一条在 `ghostty-vt`、`ghostty-vt-c` 两个模块里运行模式、DECRQM 与快照单测；全量 `just test-vt` 同样覆盖。Linux 上主套件用 `python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx.win32_input`。
+- 运行 `ghostty.exe` 并启动任意 shell：日志不再出现 `unimplemented mode: 9001`。按键改走记录要等 win32 apprt 接入后在 GUI 里验证（PSReadLine 的 Shift+Enter、GX Zsh 的 herdr 探针）。
+
+### 测试锁定
+
+登记表与闭集检查之外，`src/terminal/modes.zig` 与 `src/terminal/stream_terminal.zig` 各一条单测锁定 9001 的识别、DECRQM 与复位，`TERMINAL mode bit layout` 锁定位序；`src/gx/win32_input.zig` 的单测锁定编码（Ctrl+C 向量 `ESC[67;46;3;1;8;1_ESC[67;46;3;0;8;1_`、规范里的 Shift+A 与 Ctrl+F1、AltGr、ENHANCED_KEY、重复计数、死键、代理对、VK=0 文字）与分流条件。
+
+## GX-0007 优先使用随包 ConPTY
+
+- 文件：`src/pty.zig`（导入与 `WindowsPty.gx_conpty` 字段两个纯新增块；`open`、`deinit`、`setSize` 三处调用改为经 `gx_conpty.Instance`）。实现在新路径 `src/gx/conpty.zig`。
+- 标记：`fork(gx): GX-0007`；纯新增块用 begin/end 包住，三处改动的调用上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +12/−5（含注释）。
+
+### 原因
+
+Windows 自带的 ConPTY（kernel32 `CreatePseudoConsole` 加 System32 的 conhost.exe）随系统版本冻结，落后 microsoft/terminal 的开源实现多个版本。微软的 NuGet 包 `Microsoft.Windows.Console.ConPTY` 提供新版：`conpty.dll` 以 `ConptyCreatePseudoConsole`、`ConptyResizePseudoConsole`、`ConptyClosePseudoConsole` 导出与 kernel32 同签名的函数，并从自身目录启动 `OpenConsole.exe`（缺失时静默退回系统 conhost.exe）。上游 `WindowsPty` 直接调用 kernel32，而伪控制台必须由创建它的实现缩放和关闭，所以 `WindowsPty` 要记住所用的实现。
+
+### 行为
+
+- `WindowsPty.open` 调 `gx_conpty.Instance.create`：exe 同目录同时存在 `conpty.dll` 与 `OpenConsole.exe`、且环境变量 `GHOSTTY_GX_CONPTY` 不是 `system` 时，以绝对路径 `LoadLibraryExW` 载入 `conpty.dll`（它的依赖只在 DLL 目录与 System32 查找）并取三个导出；缺 `OpenConsole.exe`、载入失败、导出缺失或创建失败时退回 kernel32。`GHOSTTY_GX_CONPTY=system`（不区分大小写）强制用系统 ConPTY；空值或 `bundled` 为默认；其他值记 warning 后按默认处理。
+- flags：随包 ConPTY 用 `PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE`（0x6）。1.22 起的 conpty.dll 总是这样工作并忽略这两位（其 `src/winconpty/winconpty.cpp` 只解析 INHERIT_CURSOR 与 GLYPH_WIDTH 的 0x18 两组），所以对 1.24 无害，只对更老的 conpty.dll 生效；系统 ConPTY 保持上游的 0。`PSEUDOCONSOLE_INHERIT_CURSOR`（0x1）不开：宿主会在启动时发 `CSI 6 n` 并等终端回答光标位置。实测临时加上 0x1 时 OpenConsole 以 `--inheritcursor` 启动，Ghostty 正确回答，启动耗时与输入都正常；但每个表面启动时屏幕为空、光标在原点，没有可继承的位置，旧宿主得不到回答时还会无限期阻塞输入，Windows Terminal 默认也不开。
+- 每个伪控制台记住创建它的实现（`WindowsPty.gx_conpty`），缩放与关闭都走同一实现，关闭后释放这次 `LoadLibraryExW` 的引用。`HPCON` 照常交给 `src/Command.zig` 的 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`（conpty.dll 的伪控制台结构与 kernelbase 相同，Windows Terminal 也这样用）。
+- 每次创建记一条 info 日志：`ConPTY: bundled <路径> flags=0x6`，或 `ConPTY: system (kernel32) flags=0x0, <原因>`（例如 `conpty.dll is not next to the executable`、`GHOSTTY_GX_CONPTY=system`）；随包实现失败时另记 warning。
+- 文件布局：`conpty.dll` 与 `OpenConsole.exe` 成对来自同一个包版本，与 `ghostty.exe` 平铺在同一目录（x64 取包内 `runtimes/win-x64/native/conpty.dll` 与 `build/native/runtimes/x64/OpenConsole.exe`）。本补丁不改构建与打包，放置文件由发布流程负责。
+
+### 上游状态
+
+未回馈上游。上游 Windows pty 只用系统 ConPTY。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游改动 `WindowsPty` 的创建、缩放或关闭时，取上游版本后保持：创建由 `gx_conpty.Instance.create` 完成并存进 `gx_conpty`，缩放与关闭用同一实例。上游自己支持可替换的 ConPTY 时按移除条件处理。
+
+### 移除条件
+
+上游 Windows pty 支持随包 ConPTY，或 Ghostty GX 不再随包分发 ConPTY 时移除：删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>
+python scripts/zigw.py build test-bin -Dtarget=x86_64-windows-gnu -Dapp-runtime=none
+python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --filter gx.conpty --filter pty.test
+python -m unittest scripts.test_fork_patches -v
+```
+
+把 NuGet 包 1.24.261001001 的 x64 `conpty.dll` 与 `OpenConsole.exe`（sha256 见 wezterm 资产 README）复制到 `<prefix>\bin\` 后运行 `ghostty.exe`：日志为 `ConPTY: bundled …\conpty.dll flags=0x6`，shell 的父进程是 `OpenConsole.exe`；删掉 `OpenConsole.exe` 或设 `GHOSTTY_GX_CONPTY=system` 后为 `ConPTY: system (kernel32) …`。上游的 `pty.test_0`（open 与 resize）在 Windows 测试二进制里经同一入口走系统 ConPTY。
+
+### 测试锁定
+
+只有登记表与闭集检查；`src/gx/conpty.zig` 的单测锁定 `GHOSTTY_GX_CONPTY` 的解析、同目录路径拼接与 flags 取值。
+
+## GX-0008 Windows 上解析 OSC 7 工作目录
+
+- 文件：`src/termio/stream_handler.zig`（导入；`reportPwd` 去掉 Windows 的提前返回，缺主机名按空主机名处理，解码后的路径经 `gx_osc7.nativePath`）、`src/os/hostname.zig`（`isLocal` 接受空主机名；Windows 上不区分大小写并接受 DNS 主机名；两条单测）。路径转换在新路径 `src/gx/osc7.zig`。
+- 标记：`fork(gx): GX-0008`；纯新增块用 begin/end 包住，改动的上游行上一行写单行标记，删去的 Windows 提前返回处留一行单行标记。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，`git diff --numstat` 合计 +58/−10（含注释与单测）。
+
+### 原因
+
+`StreamHandler.reportPwd` 在 Windows 上直接返回（日志 `reportPwd unimplemented on windows`），终端从不记录 shell 报告的工作目录，新标签页、分屏与窗口只能继承启动目录。Windows shell 报告的形式也与 POSIX 不同：GX Zsh 发 `file://localhost/C:/…`（百分号编码；本机已安装的旧版发 `file:///cygdrive/c/…`），herdr 发 `file://<大写的 COMPUTERNAME>/C:/…`，MSYS2 系的 shell 可能发 `/c/…`；而 `hostname.isLocal` 区分大小写，并拒绝空主机名（`file:///C:/…`）。
+
+### 行为
+
+- 所有平台：`file:///path`（以及没有 authority 的 `file:/path`）的空主机名视为本机，`isLocal("")` 返回 true；`localhost` 与其他平台上的主机名比较不变。
+- Windows：主机名与 `GetComputerNameA`（NetBIOS 名）或 `GetComputerNameExA(ComputerNameDnsHostname)`（DNS 主机名，MSYS2 `hostname` 打印的那个）不区分大小写地比较。
+- Windows：URI 路径照常百分号解码（`kitty-shell-cwd://` 照常不解码），再由 `src/gx/osc7.zig::windowsPath` 转成本机路径：`/C:/Users/x`、`/c/Users/x` 与 Cygwin 的 `/cygdrive/c/Users/x` 都变成 `C:\Users\x`，`/C:`、`/c`、`/cygdrive/c` 变成 `C:\`；盘符转大写，`/` 与 `\` 都算分隔符，重复与末尾的分隔符去掉。相对路径、UNC 与设备路径（`//server/share`、`//?/…`）、POSIX 路径（`/home/me`、`/mnt/c/…`）、盘符相对路径（`/C:x`）以及含控制字符或 `<>:"|?*` 的路径记 warning 后忽略，pwd 不变。
+- 之后与其他平台相同：`Terminal.setPwd`、`pwd_change` 消息、没有标题时以路径为标题。新表面的继承不需要 apprt 改动：`apprt.surface.newConfig` 取 `App.focusedSurface()` 的 `Surface.pwd`，按 `window-/tab-/split-inherit-working-directory`（默认都开）写进 `working-directory`；`termio.Exec` 能访问该目录时把它作为 `CreateProcessW` 的当前目录并设 `PWD`，不能访问时记 warning 后用默认目录。win32 apprt 新建标签页、分屏与窗口时已用对应的 `context` 调 `newConfig`，并在获得焦点时调 `focusCallback(true)`，所以 OSC 7 报告之后新建的表面直接从该目录启动。
+- libghostty-vt 的 `stream_terminal.Handler.reportPwd` 原样保存 URL、由嵌入方解码，不受影响。
+
+### 上游状态
+
+未回馈上游。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游实现 Windows 上的 OSC 7 时以上游为准，确认 `localhost`、空主机名、大写主机名与 `/C:/…`、`/c/…` 的行为后删除对应改动。上游改写 `reportPwd` 的解析步骤时保持：主机检查之后、`setPwd` 之前把解码后的路径交给 `gx_osc7.nativePath`。
+
+### 移除条件
+
+上游在 Windows 上把 OSC 7 路径转成本机路径，且 `isLocal` 接受空主机名并在 Windows 上不区分大小写之后移除：删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zigw.py build test-bin -Dtarget=x86_64-windows-gnu -Dapp-runtime=none
+python scripts/zig_test.py --no-build --binary zig-out/test/ghostty-test.exe --filter gx.osc7 --filter os.hostname
+python -m unittest scripts.test_fork_patches -v
+```
+
+Linux 上用 `python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx.osc7 --filter os.hostname`。GUI：在 pwsh 中运行 ``Write-Host -NoNewline "`e]7;file://localhost/C:/Windows`a"`` 后按 Ctrl+Shift+T，新标签页从 `C:\Windows` 启动；GX Zsh 与 herdr 的报告同样生效。
+
+### 测试锁定
+
+登记表与闭集检查之外：`src/gx/osc7.zig` 的单测锁定路径转换与拒绝规则，并在 Windows 上把 GX Zsh、herdr、MSYS、kitty 形式的 URL 走一遍与 `reportPwd` 相同的解析、主机检查与转换；`src/os/hostname.zig` 新增空主机名与 Windows 大小写两条单测（`src/os/main.zig` 不引用该文件的单测，由 `src/gx/osc7.zig` 引入）。
 
 ## GX-0009 Windows 字体发现改用 DirectWrite
 

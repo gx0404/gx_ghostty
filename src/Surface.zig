@@ -38,6 +38,9 @@ const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
 const ProcessInfo = @import("pty.zig").ProcessInfo;
+// fork(gx): GX-0006 begin: win32-input-mode (DECSET 9001)
+const gx_win32_input = @import("gx/win32_input.zig");
+// fork(gx): GX-0006 end
 
 const log = std.log.scoped(.surface);
 
@@ -129,6 +132,12 @@ pressed_key: ?input.KeyEvent = null,
 /// and performed it. This is used to prevent sending release/repeat events
 /// for handled bindings.
 last_binding_trigger: u64 = 0,
+
+// fork(gx): GX-0006 begin: win32-input-mode (DECSET 9001)
+/// The Win32 key message behind the key event in keyCallback, set only
+/// by gxWin32KeyCallback for the duration of that call.
+gx_win32_key: ?gx_win32_input.Pending = null,
+// fork(gx): GX-0006 end
 
 /// The terminal IO handler.
 io: termio.Termio,
@@ -2780,6 +2789,33 @@ pub fn keyEventIsBinding(
     };
 }
 
+// fork(gx): GX-0006 begin: win32-input-mode (DECSET 9001)
+/// keyCallback for an apprt that can describe its key input as Win32 key
+/// messages: `message` is the WM_KEYDOWN/WM_KEYUP behind `event`, or null
+/// for text input (WM_CHAR, IME results). While the terminal has
+/// win32-input-mode enabled, the event reaches the pty as KEY_EVENT_RECORDs
+/// instead of the regular encoding. See src/gx/win32_input.zig.
+pub fn gxWin32KeyCallback(
+    self: *Surface,
+    event: input.KeyEvent,
+    message: ?gx_win32_input.KeyMessage,
+) !InputEffect {
+    self.gx_win32_key = .{
+        .key = event.key,
+        .action = event.action,
+        .message = message,
+    };
+    const effect = self.keyCallback(event) catch |err| {
+        self.gx_win32_key = null;
+        return err;
+    };
+
+    // A closing binding may have freed this surface.
+    if (effect != .closed) self.gx_win32_key = null;
+    return effect;
+}
+// fork(gx): GX-0006 end
+
 /// Called for any key events. This handles keybindings, encoding and
 /// sending to the terminal, etc.
 pub fn keyCallback(
@@ -3322,6 +3358,10 @@ fn encodeKey(
     insp_ev: ?*inspectorpkg.KeyEvent,
 ) !?termio.Message.WriteReq {
     const write_req: termio.Message.WriteReq = req: {
+        // fork(gx): GX-0006 begin: win32-input-mode records replace the encoding
+        if (try gx_win32_input.surfaceWriteReq(self, event)) |records| break :req records;
+        // fork(gx): GX-0006 end
+
         // Build our encoding options, which requires the lock.
         const encoding_opts = self.encodeKeyOpts();
 
