@@ -43,9 +43,9 @@
 
 | 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
 |---|---|---|---|---|
-| `just kb` | `build_agent_kb.py --confirm`：重建知识库 | Python、Git | 原子写入 `docs/kb/chunks.json`（确定性 JSON，入库，审 diff） | 0；语料读取失败 2 |
-| `just kb-check` | `build_agent_kb.py`：内存重建后与产物逐字节比较，列出变化来源 | Python、Git | 只读 | 0 新鲜；缺失或过期 1；语料读取失败 2 |
-| `just kb-query <词…>` | `agent_kb.py`：BM25 检索知识库，中英文都可；`--top <n>` 改返回条数（默认 8），`--json` 输出 JSON。查询词含 `&`、`>` 等 shell 元字符时直接调用 `python scripts/agent_kb.py "<查询>"`（见「约定」） | 已有 `docs/kb/chunks.json` | stdout，每条命中带 `doc` 与 `anchor` 便于回源 | 0，没有命中时输出「(无命中)」也是 0；KB 缺失或损坏、没给查询词时 2 |
+| `just kb` | `build_agent_kb.py --confirm`：重建知识库 | Python、Git | 原子写入 `docs/kb/chunks.json`（确定性的 schema 2 JSON：每个文档一行头、每片一行；入库，审 diff），打印文档数、片数与体积 | 0；语料读取失败 2 |
+| `just kb-check` | `build_agent_kb.py`：内存重建后与产物逐字节比较，列出变化来源；旧 schema 的产物报「格式或 schema 变化」 | Python、Git | 只读 | 0 新鲜；缺失或过期 1；语料读取失败 2 |
+| `just kb-query <词…>` | `agent_kb.py`：BM25 检索知识库，中英文都可；`--top <n>` 改返回条数（默认 8），`--json` 输出 JSON（`id` 为 `path#anchor`）。查询词含 `&`、`>` 等 shell 元字符时直接调用 `python scripts/agent_kb.py "<查询>"`（见「约定」） | 已有 `docs/kb/chunks.json` | stdout，每条命中带 `doc` 与 `anchor` 便于回源 | 0，没有命中时输出「(无命中)」也是 0；KB 缺失、损坏或 schema 不符，以及没给查询词时 2 |
 | `just graph` | `graphify.py rebuild`：全量重建代码图谱，随后写入并校验指纹 | `just setup` 装好的 graphifyy 0.9.73；耗时数分钟 | 写 `graphify-out/`：入库的 `GRAPH_REPORT.md`、`source-fingerprint.json`，以及本机的 `graph.json` | 0；graphify 缺失、版本不符或抽取失败时非 0 |
 | `just graph-check` | `graphify.py check`：校验源码、管线与入库产物的指纹 | Python、Git；不需要 graphify 与 `graph.json` | 只读；`graph.json` 缺失时只提示 | 0 新鲜；过期或缺产物 2 |
 | `just graph-query <问题…>` | `graphify.py query`：在本机图谱上查询，多个词合并为一句；路径与解释查询没有配方，直接用 `python scripts/graphify.py path …` 或 `python scripts/graphify.py explain …` | 本机已有 `graph.json`（先 `just graph`） | stdout | 透传 graphify；缺 `graph.json` 时 1 |

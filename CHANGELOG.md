@@ -11,6 +11,10 @@
 
 ## 0.0.2(TBD)
 
+### Changed
+
+- 知识库产物 `docs/kb/chunks.json` 改为 schema 2，体积从约 2.3 MiB 降到约 1.8 MiB（预算仍是 2.5 MiB）：每个文档一行头（路径与逐文档的 `source_sha256`），其后每片一行，diff 按行对应小节；Markdown 正文不变，Zig 结构省略 `pub` 前缀、超长模块文档截断，Zig 与 C 头文件的文档注释只留摘要句。`just kb-query --json` 的 `id` 改为 `path#anchor`；旧格式的产物由 `just kb-check` 报「格式或 schema 变化」，运行 `just kb` 重建即可。
+
 ### Fixed
 
 - GTK 应用（GX-0023）：GTK 4.20 以前（如 Ubuntu 24.04 的 GTK 4.14）启动时不再记录 `Theme parser error: style.css:…`。拖动分屏时，目标终端靠近指针的那一半重新显示蓝色高亮；只读提示的文字恢复浅橙色；`window-theme = ghostty` 时 GTK 4.14 不再报 `css parsing failed`，失焦窗口的标题栏略微变暗；GTK 4.16–4.18 上拖放高亮的运行时 CSS 也不再报错。

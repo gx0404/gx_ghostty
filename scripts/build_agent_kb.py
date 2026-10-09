@@ -6,18 +6,24 @@
 语料是 Git 可见文件的闭集（git ls-files --cached --others --exclude-standard）：
 1. 文档：根与嵌套 AGENTS.md、CLAUDE.md、README.md、HACKING.md、CONTRIBUTING.md、
    PACKAGING.md、AI_POLICY.md、CHANGELOG.md（前 6000 字符，锚点 recent）、docs/*.md、
-   docs/AGENT_RULES/*.md。按 Markdown 标题切块（围栏代码块内不切），锚点为标题路径。
-2. Zig 结构：src/**/*.zig 的 //! 模块文档与 pub 声明签名（函数截到 `{`；常量与变量截到 `=`，
-   右侧是类型定义、类型构造、@import 或别名时保留到 `{` 或 `;`），每条附最多 3 行 ///；
-   跳过 test 块与测试专用文件，排除生成与第三方代码。
-3. C 头文件：include/ghostty/**/*.h 的 GHOSTTY_API 原型与 static inline 签名、typedef
-   （附枚举值与结构字段名）、宏名，以及 @file / @defgroup / @mainpage 简介，
-   各附前导文档注释的前 3 行。
-每片文档最多 1500 字符、代码 4000 字符。chunk = {id, doc, anchor, text, source_sha256}，
-source_sha256 是所在小节（切片前）文本的哈希；函数体与常量值改动不会让知识库过期，
-公开签名与文档改动才会。
+   docs/AGENT_RULES/*.md。按 Markdown 标题切块（围栏代码块内不切），锚点为标题路径，正文原样。
+2. Zig 结构（锚点 structure）：src/**/*.zig 开头的 //! 模块文档（去掉标记，丢弃不含词的
+   分隔线与字形表，超过 3000 字符在行边界截断），空一行后是 pub 声明签名（省略 pub 前缀；
+   函数截到 `{`；常量与变量截到 `=`，右侧是类型定义、类型构造、@import 或别名时保留到
+   `{` 或 `;`），每条附 /// 摘要；跳过 test 块与测试专用文件，排除生成与第三方代码。
+3. C 头文件（锚点 declarations）：include/ghostty/**/*.h 的 GHOSTTY_API 原型与 static inline
+   签名、typedef（附枚举值与结构字段名）、宏名，以及 @file / @defgroup / @mainpage 简介，
+   各附前导文档注释的摘要。
+文档注释摘要取前 3 行里的首句，其后的整句在摘要不超过 120 字符时续接。每片文档最多
+1500 字符、代码 4000 字符。
 
-输出确定：排序键、LF、无时间戳、无绝对路径，同一语料在任何平台都得到同样的字节。
+产物（schema 2）是一个 JSON 对象：文件头一行（schema_version、doc_fields、chunk_fields、
+doc_count、chunk_count），docs 按路径排序，每个文档一行 [path, source_sha256, [，其后每片
+一行 [anchor, text]（按文中顺序）。source_sha256 是该文档被索引文本的哈希（Markdown 为全文，
+CHANGELOG 为开头一段，Zig 与 C 为上面抽取的结构），函数体与常量值改动不会让知识库过期，
+公开签名与文档改动才会。chunk id 不入库，由检索器按 path#anchor 推导。
+
+输出确定：键序固定、LF、无时间戳、无绝对路径，同一语料在任何平台都得到同样的字节。
 默认 check 模式：内存重建后与产物逐字节比较（CRLF 检出视同 LF），缺失或过期退出 1
 并列出变化来源；--confirm 原子写入；--output 指定产物路径（测试用）；语料或写入失败退出 2。
 """
@@ -33,18 +39,20 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = "docs/kb/chunks.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+DOC_FIELDS = ("path", "source_sha256", "chunks")
+CHUNK_FIELDS = ("anchor", "text")
 MAX_DOC_CHARS = 1500
 MAX_CODE_CHARS = 4000
 CHANGELOG_HEAD_CHARS = 6000
-MAX_ID_CHARS = 160
 MAX_SIGNATURE_CHARS = 240
 MAX_DOC_LINES = 3
+MAX_SUMMARY_CHARS = 120
+MAX_MODULE_DOC_CHARS = 3000
 ROOT_DOCS = (
     "AGENTS.md",
     "CLAUDE.md",
@@ -68,7 +76,10 @@ _GIT_LOCATION_ENV = (
 
 _HEADING = re.compile(r"^(#{1,4})\s+(.+?)\s*#*\s*$")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-_SLUG_DROP = re.compile(r"[^a-z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+# 摘要的句子边界：句末标点、空白，下一句以大写字母、反引号、括号、引号或 @ 开头。
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-Z`(\"'@])")
+# 模块文档里至少含一个“词”（两个连续的字母数字或一个 CJK 字）的行才保留。
+_DOC_WORD = re.compile(r"[A-Za-z0-9]{2}|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _ZIG_PUB = re.compile(
     r"^pub\s+(?:(?:inline|noinline|export|extern(?:\s+\"[^\"]*\")?|threadlocal|comptime)\s+)*"
     r"(fn|const|var|usingnamespace)\b"
@@ -169,11 +180,6 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def slugify(value: str) -> str:
-    slug = _SLUG_DROP.sub("-", value.lower()).strip("-")
-    return slug[:MAX_ID_CHARS].strip("-")
-
-
 def _hard_wrap(line: str, max_chars: int) -> list[str]:
     pieces: list[str] = []
     while len(line) > max_chars:
@@ -216,23 +222,12 @@ def split_parts(text: str, max_chars: int) -> list[str]:
     return parts
 
 
-def emit_chunks(chunks: list[dict], doc: str, anchor: str, text: str, max_chars: int) -> None:
+def section_chunks(anchor: str, text: str, max_chars: int) -> list[list[str]]:
+    """一个小节切成若干 [anchor, text] 片；只含空白的小节不产出。"""
     clean = text.strip("\n")
     if not clean.strip():
-        return
-    parts = split_parts(clean, max_chars)
-    base_id = slugify(f"{doc}#{anchor}") or slugify(doc) or "chunk"
-    digest = sha256_text(clean)
-    for index, part in enumerate(parts, start=1):
-        chunks.append(
-            {
-                "id": base_id if len(parts) == 1 else f"{base_id}-part{index}",
-                "doc": doc,
-                "anchor": anchor,
-                "text": part,
-                "source_sha256": digest,
-            }
-        )
+        return []
+    return [[anchor, part] for part in split_parts(clean, max_chars)]
 
 
 def split_markdown(text: str) -> list[tuple[str, str]]:
@@ -290,12 +285,31 @@ def changelog_head(text: str) -> str:
     return head[:newline] if newline > 0 else head
 
 
-def doc_chunks(rel: str, text: str, chunks: list[dict]) -> None:
+def doc_source(rel: str, text: str) -> str:
+    """文档的被索引文本：CHANGELOG 只取开头一段，其余 Markdown 取全文。"""
+    return changelog_head(text) if rel == CHANGELOG else text
+
+
+def doc_chunks(rel: str, source: str) -> list[list[str]]:
     if rel == CHANGELOG:
-        emit_chunks(chunks, rel, "recent", changelog_head(text), MAX_DOC_CHARS)
-        return
-    for anchor, body in split_markdown(text):
-        emit_chunks(chunks, rel, anchor, body, MAX_DOC_CHARS)
+        return section_chunks("recent", source, MAX_DOC_CHARS)
+    return [
+        chunk
+        for anchor, body in split_markdown(source)
+        for chunk in section_chunks(anchor, body, MAX_DOC_CHARS)
+    ]
+
+
+def doc_brief(lines: list[str]) -> str:
+    """文档注释摘要：前 MAX_DOC_LINES 行连成一段，保留首句，其后的整句在总长不超过
+    MAX_SUMMARY_CHARS 时续接。"""
+    sentences = _SENTENCE_BREAK.split(" ".join(lines[:MAX_DOC_LINES]))
+    brief = sentences[0]
+    for sentence in sentences[1:]:
+        if len(brief) + 1 + len(sentence) > MAX_SUMMARY_CHARS:
+            break
+        brief += " " + sentence
+    return brief
 
 
 # ---------------------------------------------------------------- Zig 结构
@@ -352,7 +366,7 @@ def brace_delta(line: str) -> int:
 
 
 def _cut_signature(lines: list[str], start: int, is_fn: bool) -> str:
-    """从 pub 声明行起取签名，在括号外第一个 `{` 或 `;` 处截断。
+    """从 pub 声明行起取签名（去掉 pub 前缀），在括号外第一个 `{` 或 `;` 处截断。
 
     函数可跨多行（参数列表）。常量与变量只取首行，并在顶层 `=` 处截断，
     只有右侧是类型定义、类型构造、@import 或别名时才保留右侧（_ZIG_TYPE_RHS），
@@ -406,24 +420,49 @@ def _cut_signature(lines: list[str], start: int, is_fn: bool) -> str:
     signature = re.sub(r",?\s*\)", ")", signature)
     signature = re.sub(r"\s*=\s*\.?$", "", signature)
     signature = re.sub(r"\s*\($", "", signature)
+    signature = re.sub(r"^pub\s+", "", signature)
     if len(signature) > MAX_SIGNATURE_CHARS:
         signature = signature[: MAX_SIGNATURE_CHARS - 1].rstrip() + "…"
     return signature
 
 
-def zig_structure(text: str) -> str:
-    lines = text.splitlines()
-    out: list[str] = []
+def zig_module_doc(lines: list[str]) -> list[str]:
+    """文件开头 //! 模块文档的正文行：去掉标记，丢弃不含词的行（分隔线、字形表），
+    连续空行并成一行；超过 MAX_MODULE_DOC_CHARS 时在行边界截断并以 … 结尾。"""
+    doc: list[str] = []
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("//!"):
-            out.append("//! " + stripped[3:].strip() if stripped[3:].strip() else "//!")
+            body = stripped[3:].strip()
+            if not body:
+                if doc and doc[-1]:
+                    doc.append("")
+            elif _DOC_WORD.search(body):
+                doc.append(body)
         elif not stripped or (stripped.startswith("//") and not stripped.startswith("///")):
             continue
         else:
             break
-    while out and out[-1] == "//!":
-        out.pop()
+    kept: list[str] = []
+    size = 0
+    for line in doc:
+        size += len(line) + 1
+        if size > MAX_MODULE_DOC_CHARS:
+            while kept and not kept[-1]:
+                kept.pop()
+            kept.append("…")
+            break
+        kept.append(line)
+    while kept and not kept[-1]:
+        kept.pop()
+    return kept
+
+
+def zig_structure(text: str) -> str:
+    lines = text.splitlines()
+    out = zig_module_doc(lines)
+    if out:
+        out.append("")
 
     depth = 0
     test_floor: int | None = None
@@ -448,14 +487,16 @@ def zig_structure(text: str) -> str:
         match = _ZIG_PUB.match(stripped)
         if match:
             signature = _cut_signature(lines, index, is_fn=match.group(1) == "fn")
-            docs = [doc for doc in pending_doc if doc][:MAX_DOC_LINES]
+            docs = [doc for doc in pending_doc if doc]
             entry = "  " * min(max(depth, 0), 4) + signature
             if docs:
-                entry += " — " + " ".join(docs)
+                entry += " — " + doc_brief(docs)
             out.append(entry)
         if stripped:
             pending_doc = []
         depth += delta
+    while out and not out[-1]:
+        out.pop()
     return "\n".join(out)
 
 
@@ -659,7 +700,7 @@ def header_structure(text: str) -> str:
         if len(summary) > MAX_SIGNATURE_CHARS * 4:
             summary = summary[: MAX_SIGNATURE_CHARS * 4 - 1].rstrip() + "…"
         brief = _doc_summary(doc)
-        out.append(summary + (" — " + " ".join(brief) if brief else ""))
+        out.append(summary + (" — " + doc_brief(brief) if brief else ""))
     return "\n".join(out)
 
 
@@ -668,49 +709,70 @@ def header_structure(text: str) -> str:
 
 def build_payload(root: Path = REPO_ROOT) -> dict:
     docs, zig, headers = select_corpus(git_visible_files(root))
-    chunks: list[dict] = []
+    sources: list[tuple[str, str, list[list[str]]]] = []
     for rel in docs:
-        doc_chunks(rel, read_text(root, rel), chunks)
+        source = doc_source(rel, read_text(root, rel))
+        sources.append((rel, source, doc_chunks(rel, source)))
     for rel in zig:
-        emit_chunks(chunks, rel, "structure", zig_structure(read_text(root, rel)), MAX_CODE_CHARS)
+        source = zig_structure(read_text(root, rel))
+        sources.append((rel, source, section_chunks("structure", source, MAX_CODE_CHARS)))
     for rel in headers:
-        emit_chunks(chunks, rel, "declarations", header_structure(read_text(root, rel)), MAX_CODE_CHARS)
-    chunks.sort(key=lambda chunk: (chunk["id"], chunk["doc"], chunk["anchor"], chunk["text"]))
-    seen: dict[str, int] = {}
-    used = {chunk["id"] for chunk in chunks}
-    for chunk in chunks:
-        base = chunk["id"]
-        if base not in seen:
-            seen[base] = 0
-            continue
-        while True:
-            seen[base] += 1
-            candidate = f"{base}-x{seen[base]}"
-            if candidate not in used:
-                break
-        chunk["id"] = candidate
-        used.add(candidate)
-    chunks.sort(key=lambda chunk: chunk["id"])
-    return {"schema_version": SCHEMA_VERSION, "chunk_count": len(chunks), "chunks": chunks}
+        source = header_structure(read_text(root, rel))
+        sources.append((rel, source, section_chunks("declarations", source, MAX_CODE_CHARS)))
+    entries = sorted(
+        ([rel, sha256_text(source), chunks] for rel, source, chunks in sources if chunks),
+        key=lambda entry: entry[0],
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "doc_fields": list(DOC_FIELDS),
+        "chunk_fields": list(CHUNK_FIELDS),
+        "doc_count": len(entries),
+        "chunk_count": sum(len(entry[2]) for entry in entries),
+        "docs": entries,
+    }
 
 
 def render(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+    """文件头一行；每个文档一行 [path, source_sha256, [，其后每片一行 [anchor, text]。"""
+
+    def dumps(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    header = dumps({key: value for key, value in payload.items() if key != "docs"})
+    lines = [header[:-1] + ',"docs":[']
+    docs = payload["docs"]
+    for doc_index, (path, digest, chunks) in enumerate(docs):
+        lines.append(f"[{dumps(path)},{dumps(digest)},[")
+        for chunk_index, chunk in enumerate(chunks):
+            if chunk_index + 1 < len(chunks):
+                tail = ","
+            else:
+                tail = "]]," if doc_index + 1 < len(docs) else "]]"
+            lines.append(" " + dumps(chunk) + tail)
+    lines.append("]}")
+    return "\n".join(lines) + "\n"
 
 
 def changed_sources(old: object, new: dict) -> list[str]:
-    def by_doc(payload: object) -> dict[str, list[tuple]]:
-        groups: dict[str, list[tuple]] = defaultdict(list)
-        chunks = payload.get("chunks", []) if isinstance(payload, dict) else []
-        for chunk in chunks if isinstance(chunks, list) else []:
-            if isinstance(chunk, dict):
-                groups[str(chunk.get("doc"))].append(
-                    tuple(str(chunk.get(key)) for key in ("id", "anchor", "text", "source_sha256"))
-                )
-        return {doc: sorted(items) for doc, items in groups.items()}
+    """按文档比较两份产物，返回来源哈希或分片有变化的路径；旧产物不是当前 schema 时返回空列表。"""
 
-    before, after = by_doc(old), by_doc(new)
-    return sorted(doc for doc in set(before) | set(after) if before.get(doc) != after.get(doc))
+    def by_path(payload: object) -> dict[str, list] | None:
+        if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+            return None
+        docs = payload.get("docs")
+        if not isinstance(docs, list):
+            return None
+        return {
+            entry[0]: entry[1:]
+            for entry in docs
+            if isinstance(entry, list) and entry and isinstance(entry[0], str)
+        }
+
+    before, after = by_path(old), by_path(new)
+    if before is None or after is None:
+        return []
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
 
 
 def write_atomic(target: Path, content: str) -> None:
@@ -765,21 +827,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     content = render(payload)
-    size_kib = len(content.encode("utf-8")) / 1024
+    summary = (
+        f"{payload['doc_count']} docs，{payload['chunk_count']} chunks，"
+        f"{len(content.encode('utf-8')) / 1024:.0f} KiB"
+    )
     if args.confirm:
         try:
             write_atomic(target, content)
         except OSError as exc:
             print(f"error: 无法写入 {shown}：{exc}", file=sys.stderr)
             return 2
-        print(f"written: {shown}（{payload['chunk_count']} chunks，{size_kib:.0f} KiB）")
+        print(f"written: {shown}（{summary}）")
         return 0
     if not target.is_file():
         print(f"error: 缺少 {shown}；运行 just kb 生成后提交", file=sys.stderr)
         return 1
     on_disk = target.read_bytes().replace(b"\r\n", b"\n")
     if on_disk == content.encode("utf-8"):
-        print(f"OK: {shown} 与语料一致（{payload['chunk_count']} chunks，{size_kib:.0f} KiB）")
+        print(f"OK: {shown} 与语料一致（{summary}）")
         return 0
     try:
         old = json.loads(on_disk.decode("utf-8"))

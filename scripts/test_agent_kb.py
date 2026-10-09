@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """知识库行为测试。
 
-1. 单元测试（临时语料，任何时候都应通过）：Markdown 切块、分片上限、id、Zig 与 C 头文件的
-   结构抽取、语料闭集、check/--confirm 退出码与原子写入、确定性、BM25 检索器与 CLI。
+1. 单元测试（临时语料，任何时候都应通过）：Markdown 切块、分片上限、文档注释摘要、Zig 与
+   C 头文件的结构抽取、语料闭集、schema 2 布局与逐文档来源哈希、check/--confirm 退出码与
+   原子写入、确定性、BM25 检索器、chunk id 推导与 CLI。
 2. 真实语料测试：docs/kb/chunks.json 与当前语料一致（缺失即失败，提示运行 just kb）、
-   每份领域文档都在库、schema 与体积预算、≥12 条中英文检索回归、乱码查询无命中。
+   每份领域文档都在库、schema 与体积预算、≥12 条中英文与代码符号检索回归、乱码查询无命中。
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 KB_PATH = REPO_ROOT / "docs" / "kb" / "chunks.json"
 SIZE_BUDGET_BYTES = int(2.5 * 1024 * 1024)
-CHUNK_KEYS = {"id", "doc", "anchor", "text", "source_sha256"}
+PAYLOAD_KEYS = ["schema_version", "doc_fields", "chunk_fields", "doc_count", "chunk_count", "docs"]
 
 # (查询, 期望命中：任一文档出现在 top-8 即通过)
 GOLDEN_QUERIES = [
@@ -80,12 +81,22 @@ GOLDEN_QUERIES = [
     ("GUI 截图 kimi-cu 隔离 LOCALAPPDATA", ["docs/AGENT_RULES/apprt-win32.md"]),
     ("gui-settings.ghostty 配置分层 GX 默认值", ["docs/AGENT_RULES/gx-core.md", "docs/FORK_PATCHES.md"]),
     ("gx.i18n.tr 翻译 gx.zh_CN.po just i18n", ["docs/AGENT_RULES/gx-core.md", "docs/AGENT_RULES/apprt-gtk.md"]),
+    ("GX-0007 随包 ConPTY", ["docs/FORK_PATCHES.md"]),
+    ("ghostty_key_encoder_encode", ["include/ghostty/vt/key/encoder.h"]),
+    ("lockDemand unlockDemand", ["src/renderer/State.zig"]),
+    ("updateFrame drawFrame", ["src/renderer/generic.zig"]),
+    ("WM_DPICHANGED handleDpiChange", ["src/apprt/win32/Window.zig"]),
 ]
 GARBAGE_QUERY = "zzqqxxw qqzzwwk"
 
 ZIG_SAMPLE = """\
 //! Terminal core module.
 //! Second line.
+//!
+//!
+//! +------+------+
+//! | cols | rows |
+//! \U0001cc00 \U0001cc01 \U0001cc02
 
 const std = @import("std");
 
@@ -128,6 +139,8 @@ test "helper" {
     _ = Helper;
 }
 
+/// Global flag summary sentence. This second sentence is long enough that appending it would push
+/// the summary past the budget.
 pub var global_flag: bool = false;
 
 pub const Mailbox = BlockingQueue(Message, 64);
@@ -143,23 +156,26 @@ pub extern "c" fn ghostty_ext(x: c_int) c_int;
 """
 
 ZIG_EXPECTED = """\
-//! Terminal core module.
-//! Second line.
-pub fn init(alloc: std.mem.Allocator, opts: Options) !Terminal — Doc line one. Doc line two. Doc line three.
-pub const Options = struct
-  pub fn validate(self: Options) bool — Nested doc.
-pub const max_cols: u16
-pub var global_flag: bool
-pub const Mailbox = BlockingQueue(Message, 64)
-pub const Screen = @import("Screen.zig")
-pub const Alias = terminal.Terminal
-pub const log
-pub const enabled
-pub const Kind = enum(u8)
-pub const Error = error
-pub const Callback = *const fn (u8) void
-pub const default: Options
-pub extern "c" fn ghostty_ext(x: c_int) c_int"""
+Terminal core module.
+Second line.
+
+| cols | rows |
+
+fn init(alloc: std.mem.Allocator, opts: Options) !Terminal — Doc line one. Doc line two. Doc line three.
+const Options = struct
+  fn validate(self: Options) bool — Nested doc.
+const max_cols: u16
+var global_flag: bool — Global flag summary sentence.
+const Mailbox = BlockingQueue(Message, 64)
+const Screen = @import("Screen.zig")
+const Alias = terminal.Terminal
+const log
+const enabled
+const Kind = enum(u8)
+const Error = error
+const Callback = *const fn (u8) void
+const default: Options
+extern "c" fn ghostty_ext(x: c_int) c_int"""
 
 HEADER_SAMPLE = """\
 /**
@@ -291,21 +307,33 @@ def run_cli(main, argv: list[str]) -> tuple[int, str, str]:
 
 
 def assert_payload_shape(case: unittest.TestCase, payload: dict) -> None:
-    case.assertEqual(set(payload), {"schema_version", "chunk_count", "chunks"})
+    case.assertEqual(list(payload), PAYLOAD_KEYS)
     case.assertEqual(payload["schema_version"], build_agent_kb.SCHEMA_VERSION)
-    chunks = payload["chunks"]
-    case.assertEqual(payload["chunk_count"], len(chunks))
-    ids = [chunk["id"] for chunk in chunks]
-    case.assertEqual(len(ids), len(set(ids)), "chunk id 必须唯一")
-    case.assertEqual(ids, sorted(ids), "chunks 必须按 id 排序")
-    for chunk in chunks:
-        case.assertEqual(set(chunk), CHUNK_KEYS, chunk["id"])
-        case.assertTrue(chunk["text"].strip(), chunk["id"])
-        case.assertNotIn("\r", chunk["text"], chunk["id"])
-        case.assertRegex(chunk["source_sha256"], r"^[0-9a-f]{64}$")
-        case.assertFalse(Path(chunk["doc"]).is_absolute(), chunk["doc"])
-        cap = build_agent_kb.MAX_DOC_CHARS if chunk["doc"].endswith(".md") else build_agent_kb.MAX_CODE_CHARS
-        case.assertLessEqual(len(chunk["text"]), cap, chunk["id"])
+    case.assertEqual(payload["schema_version"], agent_kb.SCHEMA_VERSION)
+    case.assertEqual(payload["doc_fields"], ["path", "source_sha256", "chunks"])
+    case.assertEqual(payload["chunk_fields"], ["anchor", "text"])
+    docs = payload["docs"]
+    paths = [entry[0] for entry in docs]
+    case.assertEqual(paths, sorted(set(paths)), "docs 必须按路径排序且不重复")
+    case.assertEqual(payload["doc_count"], len(docs))
+    case.assertEqual(payload["chunk_count"], sum(len(entry[2]) for entry in docs))
+    for entry in docs:
+        case.assertEqual(len(entry), 3, entry[0])
+        path, digest, chunks = entry
+        case.assertFalse(Path(path).is_absolute(), path)
+        case.assertNotIn("\\", path)
+        case.assertRegex(digest, r"^[0-9a-f]{64}$")
+        case.assertTrue(chunks, path)
+        cap = build_agent_kb.MAX_DOC_CHARS if path.endswith(".md") else build_agent_kb.MAX_CODE_CHARS
+        for chunk in chunks:
+            case.assertEqual(len(chunk), 2, path)
+            anchor, text = chunk
+            case.assertTrue(anchor and text.strip(), path)
+            case.assertNotIn("\r", text, path)
+            case.assertLessEqual(len(text), cap, f"{path}#{anchor}")
+    case.assertEqual(json.loads(build_agent_kb.render(payload)), payload, "render 必须无损")
+    ids = [chunk["id"] for chunk in agent_kb.expand_docs(docs)]
+    case.assertEqual(len(ids), len(set(ids)), "推导的 chunk id 必须唯一")
 
 
 class ChunkingTests(unittest.TestCase):
@@ -333,30 +361,51 @@ class ChunkingTests(unittest.TestCase):
         self.assertTrue(all(len(part) <= 1500 for part in wrapped))
         self.assertEqual(" ".join(" ".join(wrapped).split()), long_line.strip())
 
-    def test_ids_hashes_and_cjk_slugs(self) -> None:
-        chunks: list[dict] = []
-        build_agent_kb.emit_chunks(chunks, "docs/说明.md", "范围 > 不变量", "alpha\n\nbeta", 100)
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0]["id"], "docs-说明-md-范围-不变量")
-        self.assertEqual(chunks[0]["source_sha256"], hashlib.sha256(b"alpha\n\nbeta").hexdigest())
-        chunks = []
-        build_agent_kb.emit_chunks(chunks, "doc.md", "anchor", "a" * 8 + "\n" + "b" * 8, 10)
-        self.assertEqual([chunk["id"] for chunk in chunks], ["doc-md-anchor-part1", "doc-md-anchor-part2"])
-        self.assertEqual(len({chunk["source_sha256"] for chunk in chunks}), 1)
-        chunks = []
-        build_agent_kb.emit_chunks(chunks, "doc.md", "anchor", "\n  \n", 10)
-        self.assertEqual(chunks, [])
+    def test_section_chunks_and_derived_ids(self) -> None:
+        self.assertEqual(
+            build_agent_kb.section_chunks("范围 > 不变量", "\nalpha\n\nbeta\n", 100),
+            [["范围 > 不变量", "alpha\n\nbeta"]],
+        )
+        self.assertEqual(
+            build_agent_kb.section_chunks("anchor", "a" * 8 + "\n" + "b" * 8, 10),
+            [["anchor", "a" * 8], ["anchor", "b" * 8]],
+        )
+        self.assertEqual(build_agent_kb.section_chunks("anchor", "\n  \n", 10), [])
+        docs = [["docs/说明.md", "0" * 64, [["范围 > 不变量", "x"], ["范围 > 不变量", "y"], ["其他", "z"]]]]
+        chunks = agent_kb.expand_docs(docs)
+        self.assertEqual(
+            [chunk["id"] for chunk in chunks],
+            ["docs/说明.md#范围 > 不变量", "docs/说明.md#范围 > 不变量~2", "docs/说明.md#其他"],
+        )
+        self.assertEqual(chunks[1], {"id": "docs/说明.md#范围 > 不变量~2", "doc": "docs/说明.md",
+                                     "anchor": "范围 > 不变量", "text": "y"})
+        for bad in ([["a.md", "0" * 64]], [["a.md", "0" * 64, [["anchor"]]]], [{"path": "a.md"}]):
+            with self.assertRaises(ValueError):
+                agent_kb.expand_docs(bad)
 
     def test_changelog_keeps_recent_head_only(self) -> None:
         lines = [f"- entry {index:04d} " + "x" * 40 for index in range(200)]
-        chunks: list[dict] = []
-        build_agent_kb.doc_chunks("CHANGELOG.md", "# Changelog\n" + "\n".join(lines), chunks)
-        self.assertEqual({chunk["anchor"] for chunk in chunks}, {"recent"})
-        joined = "\n".join(chunk["text"] for chunk in chunks)
+        source = build_agent_kb.doc_source("CHANGELOG.md", "# Changelog\n" + "\n".join(lines))
+        self.assertLessEqual(len(source), build_agent_kb.CHANGELOG_HEAD_CHARS)
+        chunks = build_agent_kb.doc_chunks("CHANGELOG.md", source)
+        self.assertEqual({anchor for anchor, _ in chunks}, {"recent"})
+        joined = "\n".join(text for _, text in chunks)
         self.assertLessEqual(len(joined), build_agent_kb.CHANGELOG_HEAD_CHARS)
         self.assertIn("entry 0000", joined)
         self.assertNotIn("entry 0199", joined)
         self.assertTrue(all(line.endswith("x") for line in joined.splitlines()[1:]))
+        self.assertEqual(build_agent_kb.doc_source("docs/guide.md", "x" * 7000), "x" * 7000)
+
+    def test_doc_brief_keeps_whole_sentences_within_budget(self) -> None:
+        brief = build_agent_kb.doc_brief
+        self.assertEqual(brief(["A one.", "B two.", "C three.", "D four."]), "A one. B two. C three.")
+        long_tail = "Second sentence " + "y" * build_agent_kb.MAX_SUMMARY_CHARS + "."
+        self.assertEqual(brief(["First sentence.", long_tail]), "First sentence.")
+        first = "Long first sentence " + "z" * build_agent_kb.MAX_SUMMARY_CHARS + "."
+        self.assertEqual(brief([first, "Short."]), first)
+        self.assertEqual(brief(["Use e.g. lowercase continuations.", "Then `ticks`."]),
+                         "Use e.g. lowercase continuations. Then `ticks`.")
+        self.assertEqual(brief(["Create a demo.", "@param out Where to store"]), "Create a demo. @param out Where to store")
 
 
 class CodeStructureTests(unittest.TestCase):
@@ -365,6 +414,16 @@ class CodeStructureTests(unittest.TestCase):
 
     def test_zig_structure_ignores_crlf(self) -> None:
         self.assertEqual(build_agent_kb.zig_structure(ZIG_SAMPLE.replace("\n", "\r\n")), ZIG_EXPECTED)
+
+    def test_zig_module_doc_is_capped_at_a_line_boundary(self) -> None:
+        cap = build_agent_kb.MAX_MODULE_DOC_CHARS
+        lines = [f"//! Paragraph line {index:05d} " + "w" * 50 for index in range(cap // 40)]
+        doc = build_agent_kb.zig_module_doc(lines + ["", "pub fn after() void {}"])
+        self.assertEqual(doc[-1], "…")
+        self.assertLessEqual(sum(len(line) + 1 for line in doc[:-1]), cap)
+        self.assertEqual(doc[:-1], [line[4:] for line in lines[: len(doc) - 1]])
+        self.assertEqual(build_agent_kb.zig_module_doc(["//! Short.", "//!", "pub fn x() void {}"]), ["Short."])
+        self.assertEqual(build_agent_kb.zig_structure("pub fn x() void {}\n"), "fn x() void")
 
     def test_zig_exclusions(self) -> None:
         for rel in ("src/font/nerd_font_tables.zig", "src/font/nerd_font_attributes.zig", "src/stb/main.zig",
@@ -388,36 +447,49 @@ class BuildTests(unittest.TestCase):
         root = make_repo(self.base, files)
         payload = build_agent_kb.build_payload(root)
         assert_payload_shape(self, payload)
-        docs = {chunk["doc"] for chunk in payload["chunks"]}
+        by_doc = {path: (digest, chunks) for path, digest, chunks in payload["docs"]}
         self.assertEqual(
-            docs,
-            {
+            sorted(by_doc),
+            [
                 "AGENTS.md",
-                "src/terminal/c/AGENTS.md",
-                "README.md",
                 "CHANGELOG.md",
-                "docs/guide.md",
+                "README.md",
                 "docs/AGENT_RULES/renderer.md",
-                "src/terminal/Terminal.zig",
-                "src/build/Config.zig",
+                "docs/guide.md",
                 "include/ghostty/vt/demo.h",
-            },
+                "src/build/Config.zig",
+                "src/terminal/Terminal.zig",
+                "src/terminal/c/AGENTS.md",
+            ],
         )
-        by_doc = {chunk["doc"]: chunk for chunk in payload["chunks"]}
-        self.assertEqual(by_doc["src/terminal/Terminal.zig"]["anchor"], "structure")
-        self.assertEqual(by_doc["include/ghostty/vt/demo.h"]["anchor"], "declarations")
-        self.assertEqual(by_doc["CHANGELOG.md"]["anchor"], "recent")
+        self.assertEqual(by_doc["src/terminal/Terminal.zig"][1], [["structure", "Terminal.\n\nfn init() void"]])
+        self.assertEqual({anchor for anchor, _ in by_doc["include/ghostty/vt/demo.h"][1]}, {"declarations"})
+        self.assertEqual(by_doc["CHANGELOG.md"][1], [["recent", "# Changelog\n\n## 0.1.0(TBD)\n\n- first"]])
+        self.assertEqual(by_doc["docs/guide.md"][1], [["指南 > 范围", "## 范围\n渲染线程 mailbox"]])
+        guide = TEMP_CORPUS["docs/guide.md"].rstrip("\n")
+        self.assertEqual(by_doc["docs/guide.md"][0], hashlib.sha256(guide.encode("utf-8")).hexdigest())
+        structure = "Terminal.\n\nfn init() void"
+        self.assertEqual(by_doc["src/terminal/Terminal.zig"][0], hashlib.sha256(structure.encode("utf-8")).hexdigest())
 
     def test_output_is_deterministic_and_platform_neutral(self) -> None:
         root = make_repo(self.base, TEMP_CORPUS)
-        first = build_agent_kb.render(build_agent_kb.build_payload(root))
+        payload = build_agent_kb.build_payload(root)
+        first = build_agent_kb.render(payload)
         self.assertEqual(first, build_agent_kb.render(build_agent_kb.build_payload(root)))
         self.assertTrue(first.endswith("\n"))
         self.assertNotIn("\r", first)
         self.assertNotIn(root.as_posix(), first)
         self.assertNotIn(json.dumps(str(root))[1:-1], first)
-        payload = json.loads(first)
-        self.assertEqual(first, json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+        self.assertEqual(json.loads(first), payload)
+        lines = first.splitlines()
+        self.assertTrue(lines[0].startswith('{"schema_version":2,'), lines[0])
+        self.assertTrue(lines[0].endswith('"docs":['), lines[0])
+        self.assertEqual(lines[-1], "]}")
+        doc_lines = [line for line in lines[1:-1] if not line.startswith(" ")]
+        chunk_lines = [line for line in lines[1:-1] if line.startswith(" ")]
+        self.assertEqual(len(doc_lines), payload["doc_count"])
+        self.assertEqual(len(chunk_lines), payload["chunk_count"])
+        self.assertEqual(doc_lines[0], f'["AGENTS.md","{payload["docs"][0][1]}",[')
         for rel in TEMP_CORPUS:
             path = root / rel
             path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
@@ -447,6 +519,7 @@ class BuildTests(unittest.TestCase):
         self.assertIn("just kb", err)
         code, out, _ = run_cli(build_agent_kb.main, [*argv, "--confirm"])
         self.assertEqual(code, 0)
+        self.assertIn("9 docs", out)
         self.assertIn("chunks", out)
         raw = output.read_bytes()
         self.assertNotIn(b"\r", raw)
@@ -468,6 +541,11 @@ class BuildTests(unittest.TestCase):
         code, _, err = run_cli(build_agent_kb.main, argv)
         self.assertEqual(code, 1)
         self.assertIn("JSON", err)
+        output.write_text(json.dumps({"schema_version": 1, "chunk_count": 0, "chunks": []}), encoding="utf-8")
+        code, _, err = run_cli(build_agent_kb.main, argv)
+        self.assertEqual(code, 1)
+        self.assertIn("schema", err)
+        self.assertIn("just kb", err)
 
     def test_default_output_path(self) -> None:
         self.assertEqual(build_agent_kb.DEFAULT_OUTPUT, "docs/kb/chunks.json")
@@ -475,15 +553,25 @@ class BuildTests(unittest.TestCase):
 
 
 TOY_CHUNKS = [
-    {"id": "a", "doc": "docs/AGENT_RULES/renderer.md", "anchor": "renderer > 线程", "text": "渲染线程 mailbox 唤醒",
-     "source_sha256": "0" * 64},
-    {"id": "b", "doc": "docs/AGENT_RULES/terminal-core.md", "anchor": "terminal", "text": "terminal parser state machine",
-     "source_sha256": "0" * 64},
+    {"id": "a", "doc": "docs/AGENT_RULES/renderer.md", "anchor": "renderer > 线程", "text": "渲染线程 mailbox 唤醒"},
+    {"id": "b", "doc": "docs/AGENT_RULES/terminal-core.md", "anchor": "terminal", "text": "terminal parser state machine"},
     {"id": "c", "doc": "src/renderer/Thread.zig", "anchor": "structure",
-     "text": "pub fn threadMain(self: *Thread) void — The main entrypoint for the thread.", "source_sha256": "0" * 64},
-    {"id": "d", "doc": "docs/RELEASE.md", "anchor": "发版", "text": "发版 tag 为 gx-vX.Y.Z，经 gx-release 发布",
-     "source_sha256": "0" * 64},
+     "text": "fn threadMain(self: *Thread) void — The main entrypoint for the thread."},
+    {"id": "d", "doc": "docs/RELEASE.md", "anchor": "发版", "text": "发版 tag 为 gx-vX.Y.Z，经 gx-release 发布"},
 ]
+
+
+def toy_kb_text() -> str:
+    """TOY_CHUNKS 按 schema 2 写出的知识库文本。"""
+    docs = sorted([chunk["doc"], "0" * 64, [[chunk["anchor"], chunk["text"]]]] for chunk in TOY_CHUNKS)
+    return build_agent_kb.render({
+        "schema_version": build_agent_kb.SCHEMA_VERSION,
+        "doc_fields": list(build_agent_kb.DOC_FIELDS),
+        "chunk_fields": list(build_agent_kb.CHUNK_FIELDS),
+        "doc_count": len(docs),
+        "chunk_count": len(docs),
+        "docs": docs,
+    })
 
 
 class RetrieverTests(unittest.TestCase):
@@ -527,8 +615,8 @@ class RetrieverTests(unittest.TestCase):
         self.assertEqual(agent_kb.expand_query(GARBAGE_QUERY), {"zzqqxxw": 1.0, "qqzzwwk": 1.0})
 
     def test_results_are_capped_per_doc(self) -> None:
-        same = [{"id": f"s{index}", "doc": "docs/same.md", "anchor": "s", "text": "renderer mailbox",
-                 "source_sha256": "0" * 64} for index in range(3)]
+        same = [{"id": f"s{index}", "doc": "docs/same.md", "anchor": "s", "text": "renderer mailbox"}
+                for index in range(3)]
         index = agent_kb.KBIndex(same + TOY_CHUNKS)
         docs = [item["doc"] for item in index.search("renderer mailbox", 8)]
         self.assertEqual(docs.count("docs/same.md"), agent_kb.MAX_PER_DOC)
@@ -542,7 +630,7 @@ class RetrieverTests(unittest.TestCase):
         self.assertEqual(agent_kb.KBIndex([]).search("renderer", 8), [])
 
     def test_ranking_is_deterministic_and_top_is_respected(self) -> None:
-        twin = {"anchor": "same", "text": "terminal parser", "source_sha256": "0" * 64}
+        twin = {"anchor": "same", "text": "terminal parser"}
         twins = [dict(twin, id="t2", doc="x/two.md"), dict(twin, id="t1", doc="x/one.md")]
         index = agent_kb.KBIndex(twins + TOY_CHUNKS)
         first = index.search("terminal parser", 8)
@@ -555,13 +643,14 @@ class RetrieverTests(unittest.TestCase):
     def test_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             kb = Path(tmp) / "chunks.json"
-            kb.write_text(json.dumps({"schema_version": 1, "chunk_count": len(TOY_CHUNKS), "chunks": TOY_CHUNKS}),
-                          encoding="utf-8")
+            kb.write_text(toy_kb_text(), encoding="utf-8")
             code, out, _ = run_cli(agent_kb.main, ["renderer", "--top", "1", "mailbox", "--json", "--kb", str(kb)])
             self.assertEqual(code, 0)
             results = json.loads(out)
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["doc"], "docs/AGENT_RULES/renderer.md")
+            self.assertEqual(results[0]["anchor"], "renderer > 线程")
+            self.assertEqual(results[0]["id"], "docs/AGENT_RULES/renderer.md#renderer > 线程")
             code, out, _ = run_cli(agent_kb.main, ["渲染线程", "--kb", str(kb)])
             self.assertEqual(code, 0)
             self.assertIn("docs/AGENT_RULES/renderer.md", out)
@@ -572,6 +661,18 @@ class RetrieverTests(unittest.TestCase):
             self.assertIn("just kb", err)
             kb.write_text("[]", encoding="utf-8")
             self.assertEqual(run_cli(agent_kb.main, ["renderer", "--kb", str(kb)])[0], 2)
+            kb.write_text(json.dumps({"schema_version": 1, "chunk_count": len(TOY_CHUNKS), "chunks": TOY_CHUNKS}),
+                          encoding="utf-8")
+            code, _, err = run_cli(agent_kb.main, ["renderer", "--kb", str(kb)])
+            self.assertEqual(code, 2)
+            self.assertIn("schema", err)
+            self.assertIn("just kb", err)
+            bad = json.loads(toy_kb_text())
+            bad["docs"][0][2].append(["anchor only"])
+            kb.write_text(json.dumps(bad), encoding="utf-8")
+            code, _, err = run_cli(agent_kb.main, ["renderer", "--kb", str(kb)])
+            self.assertEqual(code, 2)
+            self.assertIn("格式错误", err)
 
 
 class RealCorpusTests(unittest.TestCase):
@@ -581,8 +682,8 @@ class RealCorpusTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.payload = build_agent_kb.build_payload(REPO_ROOT)
         cls.rendered = build_agent_kb.render(cls.payload)
-        cls.index = agent_kb.KBIndex(cls.payload["chunks"])
-        cls.docs = {chunk["doc"] for chunk in cls.payload["chunks"]}
+        cls.index = agent_kb.KBIndex(agent_kb.expand_docs(cls.payload["docs"]))
+        cls.docs = {entry[0] for entry in cls.payload["docs"]}
 
     def test_checked_in_kb_is_fresh(self) -> None:
         if not KB_PATH.is_file():
@@ -591,6 +692,7 @@ class RealCorpusTests(unittest.TestCase):
             KB_PATH.read_bytes().replace(b"\r\n", b"\n") == self.rendered.encode("utf-8"),
             "docs/kb/chunks.json 与当前语料不一致：run just kb 重建并审 diff",
         )
+        self.assertEqual(len(agent_kb.load_chunks(KB_PATH)), self.payload["chunk_count"])
 
     def test_build_is_deterministic(self) -> None:
         self.assertEqual(build_agent_kb.render(build_agent_kb.build_payload(REPO_ROOT)), self.rendered)
