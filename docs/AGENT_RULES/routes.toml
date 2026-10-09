@@ -45,6 +45,7 @@ paths = [
   "src/Surface.zig",
   "src/apprt.zig",
   "src/apprt/*.zig",
+  "src/apprt/win32/**",
   "src/crash/**",
   "src/global.zig",
   "src/main.zig",
