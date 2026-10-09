@@ -1332,7 +1332,7 @@ pub const Application = extern struct {
             );
         };
         // fork(gx): GX-0016 begin: the GX stylesheet and window-theme follow every config change
-        self.private().gx_style.apply(self.as(adw.Application), self.private().config.get());
+        self.private().gx_style.apply(self.private().config.get());
         // fork(gx): GX-0016 end
     }
 

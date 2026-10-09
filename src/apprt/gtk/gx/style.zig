@@ -2,8 +2,9 @@
 //! rules in `style.css` plus colors derived from the terminal theme
 //! (`src/gx/gtk_css.zig`), in a CSS provider of its own. `Style.apply` runs
 //! from `Application.propConfig` on startup and on every configuration
-//! change; it also applies `window-theme` to the style manager, which
-//! upstream does only once in `Application.startupStyleManager`.
+//! change; it also applies `window-theme` to the style manager (from an
+//! idle callback), which upstream does only once in
+//! `Application.startupStyleManager`.
 const std = @import("std");
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -23,15 +24,53 @@ pub const priority = gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2;
 /// The static rules, independent of the configuration.
 pub const static_css = @embedFile("style.css");
 
-/// The Ghostty GX stylesheet of the application.
+/// The Ghostty GX stylesheet and color scheme of the application.
 pub const Style = struct {
     provider: ?*gtk.CssProvider = null,
 
-    /// Applies `window-theme` and loads the stylesheet for `config`,
-    /// adding the provider to the default display the first time.
-    pub fn apply(self: *Style, app: *adw.Application, config: *const CoreConfig) void {
-        app.getStyleManager().setColorScheme(colorScheme(config));
+    /// The color scheme that `idle` sets on the style manager.
+    scheme: adw.ColorScheme = .default,
 
+    /// The pending idle source that sets `scheme`.
+    idle: ?c_uint = null,
+
+    /// Whether `apply` ran before.
+    applied: bool = false,
+
+    /// Loads the stylesheet for `config`, adding the provider to the
+    /// default display the first time, and applies `window-theme`.
+    pub fn apply(self: *Style, config: *const CoreConfig) void {
+        self.load(config);
+
+        // The first call comes from `Application.new`, like
+        // `startupStyleManager`. Later calls leave a circular scheme alone:
+        // deriving it again could switch light and dark back and forth.
+        if (!self.applied or !circularScheme(config)) {
+            // A new scheme can reload the configuration right away
+            // (`Application.handleStyleManagerDark`), which frees `config`
+            // and nests a configuration change inside this one, so the
+            // scheme is set from the main loop instead.
+            self.scheme = colorScheme(config);
+            if (self.idle == null) self.idle = glib.idleAdd(setScheme, self);
+        }
+        self.applied = true;
+    }
+
+    /// Removes the provider from the display and drops a pending scheme.
+    pub fn deinit(self: *Style) void {
+        if (self.idle) |idle| {
+            _ = glib.Source.remove(idle);
+            self.idle = null;
+        }
+        const provider = self.provider orelse return;
+        if (gdk.Display.getDefault()) |display| {
+            gtk.StyleContext.removeProviderForDisplay(display, provider.as(gtk.StyleProvider));
+        }
+        provider.unref();
+        self.provider = null;
+    }
+
+    fn load(self: *Style, config: *const CoreConfig) void {
         const provider = self.provider orelse provider: {
             const display = gdk.Display.getDefault() orelse {
                 log.warn("no default display, Ghostty GX styles not loaded", .{});
@@ -62,17 +101,14 @@ pub const Style = struct {
         defer bytes.unref();
         provider.loadFromBytes(bytes);
     }
-
-    /// Removes the provider from the display.
-    pub fn deinit(self: *Style) void {
-        const provider = self.provider orelse return;
-        if (gdk.Display.getDefault()) |display| {
-            gtk.StyleContext.removeProviderForDisplay(display, provider.as(gtk.StyleProvider));
-        }
-        provider.unref();
-        self.provider = null;
-    }
 };
+
+fn setScheme(ud: ?*anyopaque) callconv(.c) c_int {
+    const self: *Style = @ptrCast(@alignCast(ud orelse return @intFromBool(glib.SOURCE_REMOVE)));
+    self.idle = null;
+    adw.StyleManager.getDefault().setColorScheme(self.scheme);
+    return @intFromBool(glib.SOURCE_REMOVE);
+}
 
 fn cssParsingError(
     _: *gtk.CssProvider,
@@ -96,6 +132,17 @@ pub fn colorScheme(config: *const CoreConfig) adw.ColorScheme {
         .system => .prefer_light,
         .dark => .force_dark,
         .light => .force_light,
+    };
+}
+
+/// True if `window-theme` derives the color scheme from the background
+/// while the background follows the color scheme (different light and
+/// dark themes). Upstream turns `auto` into `system` in that case but
+/// keeps `ghostty`.
+fn circularScheme(config: *const CoreConfig) bool {
+    return switch (config.@"window-theme") {
+        .auto, .ghostty => config._conditional_set.contains(.theme),
+        .system, .light, .dark => false,
     };
 }
 

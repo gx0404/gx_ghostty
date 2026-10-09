@@ -443,7 +443,7 @@ GTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprof
 - `gtk-titlebar-style = tabs` 时窗口控制按钮、新建标签与主菜单都在标签栏里，隐藏它会让窗口无法拖动和关闭，所以应用模式下 `getHeaderbarVisible` 改为显示标题栏（启用 CSD 时）顶替标签栏；`native` 风格只隐藏标签栏。最大化且 `gtk-titlebar-hide-when-maximized` 时两者都隐藏，与上游一致。
 - 重新判断的时机：标签页数量与选中页变化、标签页分屏变化、任一终端标题变化（只读前台进程名，不扫描 `/proc`），以及窗口恰好一个标签页时每 1.5 s 一次的定时器（可扫描）。定时器在其他标签页数量时停止，`dispose` 时移除；状态变化时通知 `tabs-visible` 与 `headerbar-visible`。
 - GX 样式：独立的 CSS provider，优先级 `GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2`，高于 libadwaita 与 Ghostty 的 `style.css`，低于 Ghostty 的运行时 CSS（`+3`）与 `gtk-custom-css`（`USER`），两者仍能覆盖它。静态规则（`style.css`）：标签 8 px 圆角；默认的 `raised` 工具栏风格去掉标题栏与标签栏下方的阴影（`raised-border` 保留边线）；分屏线 1 px；滚动条变细，只作位置指示时更细。`window-theme = auto` 或 `ghostty` 时再追加由终端主题生成的颜色（`src/gx/gtk_css.zig`）：标题栏与标签栏取 `window-titlebar-background`/`-foreground`（缺省为终端背景与前景），标签悬停、按下与选中色由二者混合，选中标签描一圈 palette 4 的半透明边，分屏线取背景与前景的 15% 混合（用户设了 `split-divider-color` 时由运行时 CSS 覆盖）；`system`、`light`、`dark` 不改颜色。每次配置变化重新生成。
-- `window-theme`：每次配置变化（含启动时的首次）按 `startupStyleManager` 的同一规则重设 libadwaita 配色方案，运行时修改即时生效。
+- `window-theme`：每次配置变化（含启动时的首次）按 `startupStyleManager` 的同一规则重设 libadwaita 配色方案，运行时修改即时生效。设置放在空闲回调里：配色方案一变，`handleStyleManagerDark` 就同步发起一次软重载，若在 `propConfig` 里直接设置，会在这次配置变化里嵌套另一次，并释放 `propConfig` 正在读的配置。例外：`window-theme` 为 `ghostty`（或 `auto`，上游此时已改成 `system`）且明暗主题不同时，配色方案取决于背景、背景又随配色方案切换，启动后不再重设，以免明暗来回切换；这与上游只在启动时设置一次的行为一致。
 
 ### 上游状态
 
