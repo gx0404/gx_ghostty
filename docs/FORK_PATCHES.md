@@ -98,7 +98,7 @@ fork 的发布 tag 是 `gx-vX.Y.Z`（见 `docs/RELEASE.md`）。未传 `-Dversio
 | 无，或 `tip` | 分支预发布版本 `X.Y.Z-<branch>+<hash>` | 不变 |
 | `vX.Y.Z`，且与产品版本一致 | 正式版本 `X.Y.Z` | 不变 |
 | 其他以 `v` 开头的 tag | panic | 不变，仍然 panic |
-| 不以 `v` 开头的 tag，如 `gx-v0.1.0` | panic | 分支预发布版本 `X.Y.Z-<branch>+<hash>` |
+| 不以 `v` 开头的 tag，如 `gx-v0.0.1` | panic | 分支预发布版本 `X.Y.Z-<branch>+<hash>` |
 
 - 传了 `-Dversion-string` 时直接使用它；作为依赖构建时跳过 git 推导。这两条路径都不受补丁影响，`gx-release` 的构建本来就显式传 `-Dversion-string=<X.Y.Z>-gx.<fork 版本>`。
 - `<branch>` 来自 `git rev-parse --abbrev-ref HEAD`，其中不属于 `[0-9A-Za-z-]` 的字符替换为 `-`：在 `gx_ghostty` 分支上是 `gx-ghostty`，分离 HEAD（例如 CI 检出 tag）时是 `HEAD`。
