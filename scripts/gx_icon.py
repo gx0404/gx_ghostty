@@ -22,6 +22,7 @@ ico 内含 16、20、24、32、40、48、64、96、128、256 像素：256 像素
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import struct
 import sys
@@ -150,7 +151,7 @@ def coverage(distance: float) -> float:
     return clamp(0.5 - distance)
 
 
-def over(dst: list[float], color: tuple[int, int, int], alpha: float) -> None:
+def over(dst: list[float], color: tuple[float, float, float], alpha: float) -> None:
     """Composite a straight-alpha color over a premultiplied RGBA pixel in place."""
     if alpha <= 0.0:
         return
@@ -163,6 +164,7 @@ def lerp(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[fl
     return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
 
 
+@functools.cache
 def render(size: int) -> bytes:
     """Straight-alpha RGBA rows, top to bottom."""
     layout = Layout(size)
@@ -177,7 +179,7 @@ def render(size: int) -> bytes:
             edge = layout.background(px, py)
             body = coverage(edge)
             if body > 0.0:
-                over(pixel, shade, body)  # type: ignore[arg-type]
+                over(pixel, shade, body)
                 over(pixel, RIM, min(body, coverage(-(edge + layout.rim))))
                 over(pixel, PROMPT, min(body, coverage(layout.prompt_distance(px, py))))
                 over(pixel, CURSOR, min(body, coverage(layout.cursor_distance(px, py))))
