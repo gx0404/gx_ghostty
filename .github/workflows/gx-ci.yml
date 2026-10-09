@@ -19,6 +19,10 @@ on:
         description: 在同一 runner 复建测试二进制以诊断缓存，不重复执行用例
         type: boolean
         default: false
+      win_smoke:
+        description: 在 windows-2025 上用钉版 Mesa llvmpipe 启动 win32 app，截图并检查日志，上传证据 artifact
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -275,6 +279,85 @@ jobs:
           name: gx-zig-test-windows
           path: ${{ runner.temp }}/gx-zig-test/
           if-no-files-found: ignore
+          retention-days: 14
+
+  windows-app:
+    needs: [framework, zig-fmt]
+    runs-on: windows-2025
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Keep repository line endings
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # setup-zig saves an empty cache once .zig-cache exceeds cache-size-limit MiB (default 2048).
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          cache-size-limit: 4096
+          use-tool-cache: true
+          cache-key: stable-toolchain-v1
+      - name: Build the win32 app
+        run: |
+          zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke test on the pinned Mesa llvmpipe
+        if: github.event_name == 'workflow_dispatch' && inputs.win_smoke
+        timeout-minutes: 15
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'gx-windows-smoke'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP 'mesa3d-26.2.4-release-msvc.7z'
+          Invoke-WebRequest 'https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z' -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne '351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695') { throw 'Mesa checksum mismatch' }
+          $extracted = Join-Path $env:RUNNER_TEMP 'gx-mesa'
+          New-Item -ItemType Directory -Force -Path $extracted | Out-Null
+          & "$env:SystemRoot\System32\tar.exe" -xf $archive -C $extracted x64/opengl32.dll x64/libgallium_wgl.dll
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The app loads Mesa only from the mesa directory next to ghostty.exe.
+          $mesa = Join-Path (Resolve-Path 'zig-out/bin') 'mesa'
+          New-Item -ItemType Directory -Force -Path $mesa | Out-Null
+          $pins = @{
+            'opengl32.dll' = '75b295fc80df0eaa8f1264c28663f6932c8b72d36513eb092556608858b7f5e0'
+            'libgallium_wgl.dll' = '53e49adf87590d5b0cab8553b1e98084812040cc1fca8c487695b17b7af3702e'
+          }
+          foreach ($name in $pins.Keys) {
+            $file = Join-Path $extracted "x64/$name"
+            if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $pins[$name]) { throw "$name checksum mismatch" }
+            Copy-Item -LiteralPath $file -Destination $mesa
+          }
+          $log = Join-Path $env:LOCALAPPDATA 'ghostty\logs\ghostty.log'
+          $env:GALLIUM_DRIVER = 'llvmpipe'
+          $env:GHOSTTY_GX_OPENGL = 'software'
+          $app = Start-Process -FilePath (Resolve-Path 'zig-out/bin/ghostty.exe') -PassThru -RedirectStandardOutput (Join-Path $evidence 'stdout.log') -RedirectStandardError (Join-Path $evidence 'stderr.log')
+          Start-Sleep -Seconds 20
+          $app.Refresh()
+          $alive = -not $app.HasExited
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bitmap.Save((Join-Path $evidence 'ghostty-windows.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+          $graphics.Dispose()
+          $bitmap.Dispose()
+          if ($alive) { Stop-Process -Id $app.Id -Force }
+          if (Test-Path -LiteralPath $log) { Copy-Item -LiteralPath $log -Destination (Join-Path $evidence 'ghostty.log') }
+          if (-not $alive) { throw "ghostty.exe exited before the screenshot (exit code $($app.ExitCode)); see the evidence logs" }
+          if (-not (Select-String -LiteralPath (Join-Path $evidence 'ghostty.log') -SimpleMatch -Quiet 'loaded OpenGL 4.')) { throw 'the app log has no "loaded OpenGL 4." line' }
+      - name: Upload smoke evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.win_smoke
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence-windows-smoke
+          path: ${{ runner.temp }}/gx-windows-smoke/
+          if-no-files-found: warn
           retention-days: 14
 
   gtk-smoke:
