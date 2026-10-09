@@ -31,6 +31,9 @@ HUNK_BEGIN_RE = re.compile(r"^[ \t]*// fork\(gx\): (GX-\d{4}) begin(?::.*)?$")
 HUNK_END_RE = re.compile(r"^[ \t]*// fork\(gx\): (GX-\d{4}) end$")
 UPSTREAM_REFS = ("main", "origin/main", "upstream/main")
 
+GHOSTTY_EXE_ZIG = "src/build/GhosttyExe.zig"
+GX0026_RC = 'b.path("dist/windows/gx/ghostty-gx.rc")'
+
 CONFIG_ZIG = "src/build/Config.zig"
 GX0001_MARKER = "fork(gx): GX-0001"
 GX0001_GUARD_CALL = 'std.mem.startsWith(u8, tag, "v")'
@@ -392,6 +395,13 @@ class RealRepoTests(unittest.TestCase):
 
     def test_markers_registered_and_closed(self):
         self.assertEqual(check(ROOT), [])
+
+    def test_ghostty_exe_embeds_the_fork_resources(self):
+        lines = (ROOT / GHOSTTY_EXE_ZIG).read_text(encoding="utf-8").splitlines()
+        selected = [i for i, line in enumerate(lines) if GX0026_RC in line]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("fork(gx): GX-0026", lines[selected[0] - 1])
+        self.assertFalse(any('"dist/windows/ghostty.rc"' in line for line in lines))
 
     def test_config_zig_keeps_the_gx0001_guard(self):
         source = (ROOT / CONFIG_ZIG).read_text(encoding="utf-8")

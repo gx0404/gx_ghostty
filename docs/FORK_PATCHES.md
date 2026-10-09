@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0022）之后的号。在册的 17 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021 与 GX-0022，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；GX-0023～GX-0025 预留给并行开发的分支，合入后各自登记；新补丁取当前最大编号（GX-0026）之后的号。在册的 18 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021、GX-0022 与 GX-0026，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -76,6 +76,7 @@
 | GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |
 | GX-0022 | `src/terminal/Terminal.zig` | `fork(gx): GX-0022` | active |
 | GX-0022 | `src/termio/Exec.zig` | `fork(gx): GX-0022` | active |
+| GX-0026 | `src/build/GhosttyExe.zig` | `fork(gx): GX-0026` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -950,3 +951,46 @@ GUI：
 - `Terminal: resize without scrollback pull stays in sync with ConPTY` 用两种 ConPTY 缩放后的实际输出形状锁定关闭拉回后的同步：随包 ConPTY 缩放时不输出、之后用绝对坐标回显输入，命令落在提示符所在行；系统 ConPTY 缩放后立即重绘整个缓冲，回滚区的行不被覆盖，光标回到提示符。
 - `initTerminal: ConPTY screen buffer sync on Windows` 锁定 `Exec.initTerminal` 在 Windows 上关闭这两个字段，其他平台保持上游默认。
 - 另有登记表与闭集检查。
+
+## GX-0026 Windows exe 改用 Ghostty GX 的图标与版本信息
+
+- 文件：`src/build/GhosttyExe.zig`，`init` 的 Windows 分支里 `addWin32ResourceFile` 的 `.file`。
+- 标记：`fork(gx): GX-0026`，写在改动行的上一行。
+- 状态：active，不回馈上游。
+- 改动量：改 1 行路径，加 1 行注释。
+
+### 原因
+
+上游的 `dist/windows/ghostty.rc` 把 Ghostty 官方图标 `dist/windows/ghostty.ico` 编进 `ghostty.exe`，产品名写作 `Ghostty`。Ghostty 维护者要求非官方的构建、移植与分支不使用 Ghostty 的品牌，至少要讲明未获 Ghostty 团队认可（ghostty-org/ghostty discussions #2563）。Ghostty GX 的 Windows app 因此改用 fork 自己的图标与版本信息；资源文件只能经 `addWin32ResourceFile` 选定，没有构建参数可以替换，所以改这一行，资源本身放在 fork 路径。
+
+### 行为
+
+- `ghostty.exe` 编入 `dist/windows/gx/ghostty-gx.rc`：同一份上游 manifest（`../ghostty.manifest`，PerMonitorV2 DPI）与同一个图标 ID 1（`src/apprt/win32/win32.zig::IDI_GHOSTTY`），图标换成 `scripts/gx_icon.py` 生成的 `dist/windows/gx/ghostty-gx.ico`；版本信息的 `ProductName` 与 `FileDescription` 为 `Ghostty GX`，`CompanyName` 为 `gx0404`，`Comments` 是非官方分支声明。上游 rc 里的 `VS_VERSION_INFO` 没有定义成 1（没有包含 `winver.h`），Windows 读不到那份版本信息；fork 的 rc 补上了这个定义。
+- 资源管理器、任务栏、标题栏、托盘气泡与安装包（`SetupIconFile` 也换成同一个 ico）都显示 Ghostty GX 图标。非 Windows 目标不受影响；`dist/windows/ghostty.rc` 与 `ghostty.ico` 保持上游原样，不再编进 fork 的 exe。
+
+### 上游状态
+
+不回馈上游：这是 fork 的品牌区分，上游继续使用自己的资源文件。
+
+### 同步冲突处理
+
+上游改动这段 Windows 资源代码时取上游版本，再把 `.file` 指回 `dist/windows/gx/ghostty-gx.rc` 并保留标记。上游改了 `ghostty.rc`（例如新增资源或改 manifest 名）时，把同样的变化搬进 `dist/windows/gx/ghostty-gx.rc`，图标与版本信息保持 fork 的。
+
+### 移除条件
+
+Ghostty GX 不再发布 Windows app，或改由不经过 `src/build/GhosttyExe.zig` 的构建产出 exe 时，删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/gx_icon.py --check
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>
+python -m unittest scripts.test_fork_patches scripts.test_gx_icon -v
+```
+
+PowerShell 里 `[System.Diagnostics.FileVersionInfo]::GetVersionInfo('<prefix>\bin\ghostty.exe')` 的 `ProductName` 为 `Ghostty GX`；`[System.Drawing.Icon]::ExtractAssociatedIcon` 取出的是 `>_` 图标。GUI：启动 `<prefix>\bin\ghostty.exe`，截图读图确认标题栏左侧、任务栏按钮与 Alt+Tab 都是 Ghostty GX 图标。
+
+### 测试锁定
+
+- `scripts/test_fork_patches.py` 锁定标记与登记的闭集。
+- `scripts/test_gx_icon.py` 锁定已提交的 ico 与生成器逐像素一致、尺寸齐全（16～256）、只有 256 像素是 PNG。

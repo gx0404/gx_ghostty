@@ -44,7 +44,8 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         .windows => {
             exe.subsystem = .Windows;
             exe.root_module.addWin32ResourceFile(.{
-                .file = b.path("dist/windows/ghostty.rc"),
+                // fork(gx): GX-0026 the Ghostty GX icon and version information
+                .file = b.path("dist/windows/gx/ghostty-gx.rc"),
             });
         },
 
