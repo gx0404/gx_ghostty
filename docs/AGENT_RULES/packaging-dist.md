@@ -4,7 +4,7 @@
 
 - 构建侧：`src/build/GhosttyDist.zig`（`dist`/`distcheck`）、`src/build/GhosttyResources.zig`（安装资源）。
 - 上游打包面：`PACKAGING.md`、`flatpak/**`、`snap/**`、`nix/package.nix`、`images/**`。
-- `dist/**`：`linux/` 桌面集成模板（与 `apprt-gtk.md` 共管）、`macos/` appcast 脚本（与 `macos-app.md` 共管）、`windows/` 顶层编进 exe 的 rc、ico 与 manifest（与 `apprt-win32.md` 共管）、fork 的 `windows/gx/`（Inno Setup 脚本 `ghostty-gx.iss` 与随包许可证）、`cmake/` 与 `doxygen/`（规则见 `libghostty-vt.md`）。
+- `dist/**`：`linux/` 桌面集成模板（与 `apprt-gtk.md` 共管）、`macos/` appcast 脚本（与 `macos-app.md` 共管）、`windows/` 顶层的上游 rc、ico 与 manifest（只有 manifest 还编进 exe）、fork 的 `windows/gx/`（编进 exe 的 `ghostty-gx.rc` 与 `ghostty-gx.ico`，GX-0026；Inno Setup 脚本 `ghostty-gx.iss` 与随包许可证；rc、ico 与 manifest 与 `apprt-win32.md` 共管）、`cmake/` 与 `doxygen/`（规则见 `libghostty-vt.md`）。
 - fork 打包脚本：`scripts/gx_windows_package.py`（`just package-windows`）、`scripts/gx_package.py`（`just stage`）、`scripts/gx_linux_build.py`、`scripts/gx_icon.py` 及其测试。
 - fork 发布资产的内容与命名；`gx-release` 流程、`$VS` 版本串与 tag 见 `ci-release.md` 与 `docs/RELEASE.md`。
 

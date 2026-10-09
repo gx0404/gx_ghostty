@@ -79,6 +79,8 @@ id = "apprt-win32"
 doc = "docs/AGENT_RULES/apprt-win32.md"
 paths = [
   "dist/windows/*",
+  "dist/windows/gx/ghostty-gx.ico",
+  "dist/windows/gx/ghostty-gx.rc",
   "src/apprt/win32.zig",
   "src/apprt/win32/**",
   "src/renderer/opengl/wgl.zig",

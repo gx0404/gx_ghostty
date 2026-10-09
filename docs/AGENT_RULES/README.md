@@ -141,7 +141,7 @@ Linux/macOS 直接调用脚本时用 `python3`。其他参数：
 |---|---|
 | `app-core` | `src/App.zig`、`src/Surface.zig`、`src/surface_mouse.zig`、`src/apprt.zig` 与 `src/apprt/*.zig`、入口 `src/main.zig`/`main_ghostty.zig`/`main_wasm.zig`、`src/global.zig`、`src/crash/`、`pkg/{sentry,breakpad}/` |
 | `apprt-gtk` | `src/apprt/gtk.zig` 与 `src/apprt/gtk/`（含 GX 层 `src/apprt/gtk/gx/` 与 GX 的 `.blp`）、`po/`、`dist/linux/`、`src/build/{gtk,GhosttyI18n}.zig`、`src/os/` 下的 cgroup/flatpak/i18n、`pkg/{gtk4-layer-shell,libintl}/`、翻译与 Blueprint 检查脚本 |
-| `apprt-win32` | `src/apprt/win32.zig` 与 `src/apprt/win32/`、WGL 渲染钩子 `src/renderer/opengl/wgl.zig`、`dist/windows/` 顶层的 rc、ico 与 manifest |
+| `apprt-win32` | `src/apprt/win32.zig` 与 `src/apprt/win32/`、WGL 渲染钩子 `src/renderer/opengl/wgl.zig`、`dist/windows/` 顶层的 rc、ico 与 manifest，以及编进 exe 的 `dist/windows/gx/ghostty-gx.{rc,ico}` |
 | `build-system` | `build.zig`、`build.zig.zon` 及其 `.json/.nix/.txt`、`src/build/`、`src/build_config.zig`、`src/helpgen.zig`、`src/main_build_data.zig`、`pkg/`、`vendor/`、`nix/`、flake 与 nix 入口、`Makefile`、`CMakeLists.txt`、`HACKING.md`、`.envrc`、`.gitignore`、`.gitattributes`、`just build` 的入口 `scripts/zig_build.py` |
 | `ci-release` | `.github/`、`CHANGELOG.md`、`CODEOWNERS`、`CONTRIBUTING.md`、`HACKING.md`、`typos.toml`、格式与 lint 配置、`src/build/docker/debian/`、`docs/RELEASE.md`、发版/版本/提交校验脚本（`scripts/gx_release.py`、`scripts/version.py`、`scripts/conventional_commits.py` 等）；任务 `release`、`sync` |
 | `cli-inspector` | `src/cli.zig`、`src/cli/`、`src/inspector/`、`src/extra/`、`pkg/dcimgui/` |
