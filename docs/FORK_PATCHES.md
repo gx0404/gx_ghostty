@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0021）之后的号。在册的 16 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016 与 GX-0021，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013 与 GX-0017～GX-0020 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0022）之后的号。在册的 17 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021 与 GX-0022，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -74,6 +74,8 @@
 | GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |
 | GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |
 | GX-0021 | `src/renderer/generic.zig` | `fork(gx): GX-0021` | active |
+| GX-0022 | `src/terminal/Terminal.zig` | `fork(gx): GX-0022` | active |
+| GX-0022 | `src/termio/Exec.zig` | `fork(gx): GX-0022` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -884,3 +886,51 @@ GUI：微软拼音中文模式下，在 Ghostty GX 里运行 herdr，在窗格�
 ### 测试锁定
 
 只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。
+
+## GX-0022 Windows 上 OSC 133 不做 fresh-line
+
+- 文件：`src/terminal/Terminal.zig`（`flags` 新增 `semantic_prompt_fresh_line` 字段的纯新增块；`fullReset` 保留该字段的一行；`semanticPromptFreshLine` 开头的一处早退；一个回归测试的纯新增块）与 `src/termio/Exec.zig`（`initTerminal` 开头在 Windows 上关闭该字段的一行）。
+- 标记：`fork(gx): GX-0022`；字段与测试用 begin/end 包住，`fullReset`、`semanticPromptFreshLine` 与 `initTerminal` 的改动上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，`git diff --numstat` 合计 +56/−0（含注释与测试）。
+
+### 原因
+
+GX Zsh 在 Ghostty 里启用 powerlevel10k 的 shell 集成，每个提示符前发 `OSC 133;A`。Ghostty 按语义提示符规范把 A、N、L 当作 fresh-line：光标不在左边界时先回车再换行（`Terminal.semanticPromptFreshLine`），在最底行就会滚屏。Windows 上 shell 的输出先经过 ConPTY，ConPTY 宿主（conhost 或 OpenConsole）维护自己的屏幕缓冲，`OSC 133;A` 在它那里只是标记，不移动光标（microsoft/terminal 的 `AdaptDispatch::DoFinalTermAction` 只调用 `StartPrompt`），Windows Terminal 同样不做 fresh-line。
+
+系统自带的 ConPTY（实测 Windows 11 build 26300 的 conhost 10.0.26100.8875）按屏幕差异重绘之后才把透传的 OSC 送出，这时光标停在重绘的最后一行，例如 `\e[K\e[215C\e]133;A\a\e[2;1H❯ `。Ghostty 的 fresh-line 在底行滚动一行，ConPTY 的缓冲却没有滚动；之后 ConPTY 用绝对坐标画的折叠提示符（p10k 的 transient prompt）比 Ghostty 屏幕上的内容高一行，上一条命令折叠后的 `❯ sleep 4` 被滚进回滚区，屏幕顶部留下空行，每执行一条命令错一行。关掉 transient prompt 或 `POWERLEVEL9K_PROMPT_ADD_NEWLINE` 仍会错位，关掉 OSC 133 则不会。
+
+随包 ConPTY（1.22 起）按应用的输出顺序透传，`OSC 133;A` 到达时光标已在列 0，fresh-line 不起作用，所以带随包 ConPTY 的发布包看不到这个问题；开发构建（`just build` 不放 `conpty.dll`）、`GHOSTTY_GX_CONPTY=system` 以及随包 ConPTY 载入失败回退到系统 ConPTY 时都会出现。同样实现 fresh-line 的 WezTerm 在系统 ConPTY 上也会错位。
+
+### 行为
+
+- `Terminal.flags.semantic_prompt_fresh_line` 默认 true，与上游行为相同；为 false 时 `OSC 133;A`、`133;N` 与 `133;L` 不再移动光标，提示符标记、`redraw`、`click_events` 与 `cl` 等其余语义不变。它与上游的 `resize_pull_scrollback` 一样是随 pty 而定的配置，`fullReset` 保留它。
+- `Exec.initTerminal` 在 Windows 上把它设为 false，随包与系统 ConPTY 都是：ConPTY 的缓冲从不执行 fresh-line，终端也不做才能与之同步，与 Windows Terminal 一致。zsh 的 `PROMPT_CR`/`PROMPT_SP` 本来就让提示符从行首开始；不以换行结尾的输出之后，提示符接在输出后面，与 Windows Terminal 相同。
+- 其他平台与 libghostty-vt 的默认行为不变；C API 没有新增选项。
+
+### 上游状态
+
+未回馈上游。上游 Ghostty 的 Windows pty 同样只用 ConPTY，适合作为与 `resize_pull_scrollback` 并列的 pty 配置回馈（届时应同时为 libghostty-vt 的 C API 增加选项）；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+上游改动 `Terminal.flags`、`fullReset` 或 `semanticPromptFreshLine` 时取上游版本后放回：字段块紧跟 `resize_pull_scrollback`，`fullReset` 保留该字段，`semanticPromptFreshLine` 开头在字段为 false 时返回；`Exec.initTerminal` 开头保留 Windows 上的赋值。上游新增 OSC 133 动作且会移动光标时，同样受这个字段控制。
+
+### 移除条件
+
+上游提供等价的配置（ConPTY 下不做 OSC 133 的 fresh-line）并在 Windows 上启用后，删除改动与标记，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+python scripts/zig_test.py --suite vt --filter "semantic prompt"
+python scripts/zig_test.py --suite main --filter "semantic prompt" --filter execCommand --filter pty.test
+python scripts/zigw.py build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -p <prefix>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GUI：设 `GHOSTTY_GX_CONPTY=system` 启动 `<prefix>\bin\ghostty.exe`，以 GX Zsh（p10k 两行提示符、transient prompt、提示符前空行）依次执行 `sleep 4` 与 `false`：折叠后的 `❯ sleep 4` 与 `❯ false` 留在屏幕顶部相邻两行，上方没有空行；补丁之前 `❯ sleep 4` 消失、顶部出现空行。
+
+### 测试锁定
+
+`Terminal: semantic prompt without fresh-line` 用 ConPTY 的实际输出形状（重绘到底行之后才透传 `OSC 133;A`，再用绝对坐标画提示符）锁定：关闭 fresh-line 后上一条命令行仍在屏幕上，`133;N` 与 `133;L` 也不移动光标，该字段在 `fullReset` 后保留。另有登记表与闭集检查。

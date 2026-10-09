@@ -142,6 +142,18 @@ flags: packed struct {
     /// rather than terminal state so it is preserved across a full reset.
     resize_pull_scrollback: bool = true,
 
+    // fork(gx): GX-0022 begin: OSC 133 fresh-line can be disabled for ConPTY
+    /// Whether OSC 133 A, N and L perform their fresh-line (move to the
+    /// start of the next line unless the cursor is at the left margin).
+    /// This should be false if the pty keeps its own screen buffer that
+    /// ignores these requests (e.g. Windows ConPTY), so that we stay in
+    /// sync with it. ConPTY can also pass the sequence through while the
+    /// cursor it has sent us is not yet where the program put it, and the
+    /// fresh-line would then scroll the screen. This is configuration
+    /// rather than terminal state so it is preserved across a full reset.
+    semantic_prompt_fresh_line: bool = true,
+    // fork(gx): GX-0022 end
+
     /// True if the terminal is in a password entry mode. This is set
     /// to true based on termios state. This is set
     /// to true based on termios state.
@@ -2274,6 +2286,8 @@ pub fn semanticPrompt(
 
 // OSC 133;L
 fn semanticPromptFreshLine(self: *Terminal) !void {
+    // fork(gx): GX-0022 skipped when the pty's own screen buffer does not do it
+    if (!self.flags.semantic_prompt_fresh_line) return;
     const left_margin = if (self.screens.active.cursor.x < self.scrolling_region.left)
         0
     else
@@ -4999,6 +5013,8 @@ pub fn fullReset(self: *Terminal) void {
         // This is configuration based on the pty rather than terminal
         // state, so a terminal reset must not change it.
         .resize_pull_scrollback = self.flags.resize_pull_scrollback,
+        // fork(gx): GX-0022 also configuration based on the pty
+        .semantic_prompt_fresh_line = self.flags.semantic_prompt_fresh_line,
 
         .xt_checksum = self.default_xt_checksum,
     };
@@ -15480,6 +15496,43 @@ test "Terminal: semantic prompt continuations" {
         try testing.expectEqual(.prompt_continuation, row.semantic_prompt);
     }
 }
+
+// fork(gx): GX-0022 begin: OSC 133 fresh-line disabled for ConPTY
+test "Terminal: semantic prompt without fresh-line" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    t.flags.semantic_prompt_fresh_line = false;
+
+    // This is configuration so it should survive a reset.
+    t.fullReset();
+    try testing.expect(!t.flags.semantic_prompt_fresh_line);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // What ConPTY sends when a shell redraws its prompt: it repaints the
+    // rows below the previous command, passes OSC 133;A through while the
+    // cursor is still after the last repainted row, and only then moves
+    // the cursor to where the prompt starts.
+    s.nextSlice("> one\r\n\r\n$ two");
+    s.nextSlice("\x1b[2;1H\x1b[K\r\n\x1b[K\x1b[10C\x1b]133;A\x07");
+    try testing.expectEqual(.prompt, t.screens.active.cursor.semantic_content);
+    try testing.expectEqual(@as(size.CellCountInt, 9), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 2), t.screens.active.cursor.y);
+    s.nextSlice("\x1b[2;1H> two");
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("> one\n> two", str);
+    }
+
+    // N and L do not move the cursor either.
+    s.nextSlice("\x1b]133;N\x07\x1b]133;L\x07");
+    try testing.expectEqual(@as(size.CellCountInt, 5), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+}
+// fork(gx): GX-0022 end
 
 test "Terminal: index in prompt mode marks new row as prompt continuation" {
     // This tests the Fish shell workaround: when in prompt mode and we get

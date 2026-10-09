@@ -49,7 +49,7 @@
 ### 平台与库约束
 
 - Windows 分支由 win32 app 实际运行（`apprt-win32.md`）。渲染唤醒句柄按指针传递（`termio.Options.renderer_wakeup` 是 `*xev.Async`，GX-0005）：libxev 的 IOCP `Async` 把等待者存在结构体里，复制出的副本唤不醒渲染线程。读线程遇到管道断开、EOF 或零字节读即正常退出，退出管道用 `WriteFile`/`CloseHandle` 操作 Win32 句柄（GX-0005）。
-- ConPTY：`WindowsPty.open` 经 `src/gx/conpty.zig::Instance.create` 优先载入 exe 旁成对的 `conpty.dll` 与 `OpenConsole.exe`（flags 0x6），缺任一或失败时退回 kernel32；`GHOSTTY_GX_CONPTY=system` 强制系统 ConPTY；缩放与关闭必须用创建它的同一实现（GX-0007）。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）。
+- ConPTY：`WindowsPty.open` 经 `src/gx/conpty.zig::Instance.create` 优先载入 exe 旁成对的 `conpty.dll` 与 `OpenConsole.exe`（flags 0x6），缺任一或失败时退回 kernel32；`GHOSTTY_GX_CONPTY=system` 强制系统 ConPTY；缩放与关闭必须用创建它的同一实现（GX-0007）。ConPTY 自己的屏幕缓冲不执行 OSC 133 的 fresh-line，系统 ConPTY 还会在重绘到底行之后才透传 `OSC 133;A`，所以 `Exec.initTerminal` 在 Windows 上关闭 `Terminal.flags.semantic_prompt_fresh_line`（GX-0022），否则提示符上方的命令行会被滚出屏幕。`WindowsPty` 的输入端必须是带 `FILE_FLAG_OVERLAPPED` 的命名管道（libxev 的 IOCP 后端只用 overlapped 操作）。
 - `WindowsPty.getProcessInfo` 返回 null；GX-0012 让 `Exec.Subprocess.getProcessInfo(.foreground_pid)` 在 Windows 上改报子进程（shell）的 pid，供关闭确认与 herdr 应用模式列进程（`src/gx/confirm.zig`、`src/gx/app_mode.zig`）。OSC 7 在 Windows 上经 `src/gx/osc7.zig::nativePath` 转成盘符路径后存为 pwd，新标签与分屏据此继承工作目录（GX-0008）。
 - lib-vt 闭包里的 `os` 文件（见「范围」）不得引入 libc、`global.zig`、termio 或 apprt 依赖，必须能编到 `wasm32-freestanding`。
 - `src/os/` 新代码优先显式接收 `io`、`alloc`、`environ_map`（参照 `src/os/xdg.zig`、`src/os/homedir.zig`），不读全局环境。`src/os/locale.zig::ensureLocale` 会改进程环境，只在 `global.init` 里调用，并断言非测试。
