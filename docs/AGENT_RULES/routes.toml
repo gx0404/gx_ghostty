@@ -288,6 +288,7 @@ paths = [
   "flatpak/**",
   "images/**",
   "nix/package.nix",
+  "scripts/gx_package.py",
   "scripts/gx_windows_package.py",
   "scripts/test_gx_package.py",
   "snap/**",

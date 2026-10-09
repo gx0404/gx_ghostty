@@ -1,10 +1,11 @@
-"""Tests for scripts/gx_windows_package.py: fake prefixes and pins, no network."""
+"""Tests for scripts/gx_windows_package.py and scripts/gx_package.py: fake prefixes and pins, no network."""
 
 from __future__ import annotations
 
 import dataclasses
 import hashlib
 import io
+import json
 import os
 import shutil
 import struct
@@ -21,6 +22,7 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import gx_package as stage_mod  # noqa: E402
 import gx_release as release  # noqa: E402
 import gx_windows_package as pkg  # noqa: E402
 
@@ -30,6 +32,7 @@ SHA = "a" * 40
 ROOT_FILES = (
     "LICENSE", "CHANGELOG.md", "build.zig.zon", "scripts/setup_zig.py", "dist/windows/ghostty.ico",
     "dist/windows/gx/ghostty-gx.iss", *(item.member for item in pkg.PAYLOAD if item.source == pkg.REPO),
+    *(f"images/gnome/{size}.png" for size in stage_mod.ICON_SIZES),
 )
 
 
@@ -85,6 +88,11 @@ def fake_pe(imports: tuple[str, ...] = (), machine: int = 0x8664, version: str =
     return bytes(data) + version.encode("ascii") + b"\0"
 
 
+def fake_elf(machine: int = 0x3E, version: str = VS) -> bytes:
+    header = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8) + struct.pack("<HH", 2, machine)
+    return header + bytes(44) + version.encode("ascii")
+
+
 def write(path: Path, data: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
@@ -114,6 +122,22 @@ def windows_prefix(base: Path, *, imports: tuple[str, ...] = ("KERNEL32.dll", "h
     for relative, data in extra.items():
         write(prefix / relative, data)
     return prefix
+
+
+def deb_prefix(base: Path) -> Path:
+    destdir = base / "destdir"
+    usr = destdir / "usr"
+    write(usr / "bin/ghostty", fake_elf())
+    write(usr / "bin/ghostty-extra", b"#!/bin/sh\n")
+    write(usr / "share/ghostty/themes/Builtin Dark", b"background = #000000\n")
+    write(usr / "share/terminfo/g/ghostty", b"compiled terminfo")
+    write(usr / "share/locale/zh_CN/LC_MESSAGES/com.mitchellh.ghostty.mo", b"mo")
+    write(usr / "share/applications/com.mitchellh.ghostty.desktop", b"[Desktop Entry]\n")
+    write(usr / "share/dbus-1/services/com.mitchellh.ghostty.service", b"[D-BUS Service]\n")
+    write(usr / "share/icons/hicolor/16x16/apps/com.mitchellh.ghostty.png", b"png")
+    write(usr / "share/systemd/user/app-com.mitchellh.ghostty.service", b"[Unit]\n")
+    write(usr / "share/pkgconfig/libghostty-vt.pc", b"Name: libghostty-vt\n")
+    return destdir
 
 
 class Fixtures:
@@ -520,6 +544,7 @@ class BinaryFormatTests(unittest.TestCase):
             ttc = write(Path(temp) / "b.ttc", sfnt("Noto Sans CJK JP", ttc=True))
             self.assertEqual(pkg.font_name(ttf), "JetBrainsMono NF Regular")
             self.assertEqual(pkg.font_name(ttc), "Noto Sans CJK JP")
+            self.assertEqual(stage_mod.font_copyright(ttc), "Copyright 2020 Test Font Authors")
             write(ttf, b"\0\1\0\0" + bytes(8))
             with self.assertRaises(pkg.PackageError):
                 pkg.font_name(ttf)
@@ -577,6 +602,205 @@ class InstallerScriptTests(unittest.TestCase):
                 self.assertIn(f'Root: HKA; Subkey: "Software\\Classes\\{key}\\command"; ValueType: string; '
                               'ValueData: """{app}\\ghostty.exe"" --working-directory=""%V"""; Tasks: contextmenu',
                               registry)
+
+
+class WindowsStageTests(Case):
+    def build(self, stage: Path | None = None, **kwargs) -> tuple[Path, dict]:
+        stage = stage or self.base / "stages" / "windows"
+        manifest = stage_mod.build_stage("windows", stage, windows_prefix(self.base), root=self.root,
+                                         cache=self.cache, source_info=lambda root: (SHA, True),
+                                         seven_zip=self.fixtures.seven_zip, **{**self.common(), **kwargs})
+        return stage, manifest
+
+    def test_layout_and_manifest(self):
+        stage, manifest = self.build()
+        self.assertEqual({path.name for path in stage.iterdir()}, {"app", "fonts", "build-inputs", "stage-manifest.json"})
+        self.assertEqual(sorted(path.name for path in (stage / "fonts").iterdir()), sorted(release.WINDOWS_FONTS))
+        self.assertFalse((stage / "app/fonts").exists())
+        self.assertEqual((stage / "build-inputs/ghostty.ico").read_bytes(), (ROOT / "dist/windows/ghostty.ico").read_bytes())
+        info = release.release_info(self.root)
+        self.assertEqual({key: manifest[key] for key in ("schema", "platform", "architecture", "source_repository",
+                                                           "source_commit", "source_dirty", "package_version",
+                                                           "product_version", "zig_version")},
+                         {"schema": 3, "platform": "windows", "architecture": "amd64",
+                          "source_repository": "gx0404/gx_ghostty", "source_commit": SHA, "source_dirty": True,
+                          "package_version": info.fork_version, "product_version": VS, "zig_version": info.zig_version})
+        self.assertEqual(manifest["binaries"], {"ghostty.exe": sha((stage / "app/ghostty.exe").read_bytes())})
+        self.assertNotIn("deb_depends", manifest)
+        on_disk = json.loads((stage / "stage-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk, manifest)
+        self.assertEqual(stage_mod.verify_stage(stage), manifest)
+        self.assertEqual([path.name for path in stage.parent.iterdir()], ["windows"])
+
+    def test_existing_stage_and_failures_leave_nothing(self):
+        existing = write(self.base / "stages" / "taken" / "file", b"x").parent
+        with self.assertRaisesRegex(pkg.PackageError, "must not exist"):
+            self.build(existing)
+        with self.assertRaisesRegex(pkg.PackageError, "differs from"):
+            self.build(version_string="9.9.9-gx.9.9.9")
+        payload = [dataclasses.replace(item, sha256="2" * 64) if item.target == "conpty.dll" else item
+                   for item in self.fixtures.payload]
+        with self.assertRaises(pkg.PackageError):
+            self.build(payload=payload)
+        self.assertEqual([path.name for path in (self.base / "stages").iterdir()], ["taken"])
+
+
+class VerifyStageTests(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        self.stage = self.base / "stage"
+        stage_mod.build_stage("windows", self.stage, windows_prefix(self.base), root=self.root, cache=self.cache,
+                              source_info=lambda root: (SHA, False), seven_zip=self.fixtures.seven_zip,
+                              **self.common())
+        self.manifest_path = self.stage / "stage-manifest.json"
+        self.original = self.manifest_path.read_bytes()
+
+    def rewrite(self, change) -> None:
+        manifest = json.loads(self.original)
+        change(manifest)
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_tampering_is_detected(self):
+        cases = (
+            ("schema", lambda m: m.update(schema=2), "schema must be 3"),
+            ("bool schema", lambda m: m.update(schema=True), "schema must be 3"),
+            ("platform", lambda m: m.update(platform="mac"), "unsupported stage platform"),
+            ("extra key", lambda m: m.update(deb_depends="libc6"), "manifest keys differ"),
+            ("commit", lambda m: m.update(source_commit="abc"), "source_commit"),
+            ("dirty", lambda m: m.update(source_dirty="no"), "source_dirty"),
+            ("product", lambda m: m.update(product_version="1.3.2-gx.9.9.9"), "product_version"),
+            ("binaries", lambda m: m.update(binaries={"ghostty.exe": "0" * 64}), "differs from app/ghostty.exe"),
+            ("binary name", lambda m: m.update(binaries={"ghostty": "0" * 64}), "binaries must be exactly"),
+            ("unsorted", lambda m: m["files"].reverse(), "sorted"),
+            ("bad path", lambda m: m["files"].append({"path": "../x", "size": 1, "sha256": "0" * 64}), "unsafe"),
+            ("symlink", lambda m: m["files"].append({"path": "root/usr/bin/ghostty-gx",
+                                                      "symlink": "../lib/ghostty-gx/bin/ghostty"}), "symlink"),
+        )
+        for label, change, message in cases:
+            with self.subTest(case=label):
+                self.rewrite(change)
+                with self.assertRaisesRegex(pkg.PackageError, message):
+                    stage_mod.verify_stage(self.stage)
+        self.manifest_path.write_bytes(self.original)
+        stage_mod.verify_stage(self.stage)
+
+    def test_inventory_changes_are_detected(self):
+        target = self.stage / "app/conpty.dll"
+        data = target.read_bytes()
+        target.write_bytes(data + b"!")
+        with self.assertRaisesRegex(pkg.PackageError, "differ from"):
+            stage_mod.verify_stage(self.stage)
+        target.write_bytes(data)
+        write(self.stage / "app/extra.txt", b"x")
+        with self.assertRaisesRegex(pkg.PackageError, "extra"):
+            stage_mod.verify_stage(self.stage)
+        (self.stage / "app/extra.txt").unlink()
+        write(self.stage / "notes/x", b"x")
+        with self.assertRaisesRegex(pkg.PackageError, "extra"):
+            stage_mod.verify_stage(self.stage)
+        shutil.rmtree(self.stage / "notes")
+        (self.stage / "fonts/NotoSansCJK-Bold.ttc").unlink()
+        with self.assertRaisesRegex(pkg.PackageError, "missing"):
+            stage_mod.verify_stage(self.stage)
+
+    def test_duplicate_keys_and_invalid_json(self):
+        text = self.original.decode("utf-8")
+        self.manifest_path.write_text(text.replace('"schema": 3,', '"schema": 3,\n  "schema": 3,', 1), encoding="utf-8")
+        with self.assertRaisesRegex(pkg.PackageError, "duplicate manifest key"):
+            stage_mod.verify_stage(self.stage)
+        self.manifest_path.write_bytes(b"\xff not json")
+        with self.assertRaisesRegex(pkg.PackageError, "not valid UTF-8 JSON"):
+            stage_mod.verify_stage(self.stage)
+
+    def test_command_line(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            self.assertEqual(stage_mod.main(["verify-stage", str(self.stage)]), 0)
+            self.assertEqual(stage_mod.main(["windows", "--stage-dir", str(self.stage)]), 1)
+        self.assertIn("PASS stage", out.getvalue())
+        self.assertIn("must not exist", err.getvalue())
+        for argv in ([], ["windows"], ["windows", "--stage-dir", "x", "--deb-depends", "libc6"], ["mac", "--stage-dir", "x"],
+                     ["verify-stage"]):
+            with self.subTest(argv=argv), mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    stage_mod.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+
+
+@unittest.skipUnless(symlinks_supported(), "deb stages need symlinks (Developer Mode on Windows)")
+class DebStageTests(Case):
+    def build(self, stage: Path | None = None, **kwargs) -> tuple[Path, dict]:
+        stage = stage or self.base / "deb-stage"
+        options = {"root": make_root(self.base / "themed", themes={"GX Mocha": b"palette\r\n"}), "cache": self.cache,
+                   "source_info": lambda root: (SHA, False), **self.common()}
+        options.update(kwargs)
+        if "deb_depends" not in options and "depends" not in options:
+            options["depends"] = lambda binary: "libc6 (>= 2.39), libgtk-4-1 (>= 4.14.0)"
+        manifest = stage_mod.build_stage("deb", stage, deb_prefix(self.base), **options)
+        return stage, manifest
+
+    def test_layout_manifest_and_desktop_integration(self):
+        stage, manifest = self.build()
+        self.assertEqual({path.name for path in stage.iterdir()}, {"root", "fonts", "stage-manifest.json"})
+        lib = stage / "root/usr/lib/ghostty-gx"
+        self.assertEqual((lib / "bin/ghostty").read_bytes(), fake_elf())
+        self.assertFalse((lib / "bin/ghostty-extra").exists())
+        self.assertTrue((lib / "share/terminfo/g/ghostty").is_file())
+        self.assertTrue((lib / "share/locale/zh_CN/LC_MESSAGES/com.mitchellh.ghostty.mo").is_file())
+        self.assertEqual((lib / "share/ghostty/themes/GX Mocha").read_bytes(), b"palette\n")
+        for skipped in stage_mod.SKIPPED_SHARE:
+            self.assertFalse((lib / "share" / skipped).exists(), skipped)
+        link = stage / "root/usr/bin/ghostty-gx"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), "../lib/ghostty-gx/bin/ghostty")
+        desktop = (stage / "root/usr/share/applications/com.gx0404.ghostty-gx.desktop").read_text(encoding="utf-8")
+        for line in ("Name=Ghostty GX", "Exec=ghostty-gx", "Icon=com.gx0404.ghostty-gx",
+                     "StartupWMClass=com.mitchellh.ghostty", "Terminal=false"):
+            self.assertIn(line + "\n", desktop)
+        for size in stage_mod.ICON_SIZES:
+            icon = stage / f"root/usr/share/icons/hicolor/{size}x{size}/apps/com.gx0404.ghostty-gx.png"
+            self.assertEqual(icon.read_bytes(), (ROOT / f"images/gnome/{size}.png").read_bytes())
+        copyright_text = (stage / "root/usr/share/doc/ghostty-gx/copyright").read_text(encoding="utf-8")
+        for needle in ("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+                       "Copyright: 2024 Mitchell Hashimoto, Ghostty contributors", "License: MIT",
+                       "License: OFL-1.1", "Files: */NotoSansCJK-*.ttc", "Copyright: 2020 Test Font Authors\n",
+                       " Permission is hereby granted, free of charge"):
+            self.assertIn(needle, copyright_text)
+        self.assertEqual(manifest["deb_depends"], "libc6 (>= 2.39), libgtk-4-1 (>= 4.14.0)")
+        self.assertEqual(manifest["binaries"], {"ghostty": sha(fake_elf())})
+        self.assertIn({"path": "root/usr/bin/ghostty-gx", "symlink": "../lib/ghostty-gx/bin/ghostty"}, manifest["files"])
+        self.assertEqual(stage_mod.verify_stage(stage)["platform"], "deb")
+        os.unlink(link)
+        os.symlink("../../etc/passwd", link)
+        with self.assertRaisesRegex(pkg.PackageError, "unexpected stage symlink"):
+            stage_mod.verify_stage(stage)
+
+    def test_depends_override_and_prefix_checks(self):
+        _, manifest = self.build(deb_depends="libc6, libadwaita-1-0")
+        self.assertEqual(manifest["deb_depends"], "libc6, libadwaita-1-0")
+        destdir = deb_prefix(self.base / "broken")
+        (destdir / "usr/share/terminfo/g/ghostty").unlink()
+        with self.assertRaisesRegex(pkg.PackageError, "compiled terminfo"):
+            stage_mod.build_stage("deb", self.base / "other", destdir, root=self.root, cache=self.cache,
+                                  source_info=lambda root: (SHA, False), deb_depends="libc6", **self.common())
+        write(destdir / "usr/bin/ghostty", fake_elf(machine=0xB7))
+        with self.assertRaisesRegex(pkg.PackageError, "not x86-64"):
+            stage_mod.check_elf(destdir / "usr/bin/ghostty", VS)
+
+    def test_shlibdeps_output_is_parsed(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, Path(kwargs["cwd"], "debian", "control").read_text(encoding="utf-8")))
+            return subprocess.CompletedProcess(command, 0, "shlibs:Depends=libc6 (>= 2.39), libgtk-4-1\n", "")
+
+        with mock.patch.object(stage_mod.shutil, "which", return_value="/usr/bin/dpkg-shlibdeps"):
+            self.assertEqual(stage_mod.shlibdeps(Path("/x/ghostty"), runner), "libc6 (>= 2.39), libgtk-4-1")
+        self.assertEqual(calls[0][0], ["/usr/bin/dpkg-shlibdeps", "-O", f"-e{Path('/x/ghostty')}"])
+        self.assertIn("Package: ghostty-gx", calls[0][1])
+        with mock.patch.object(stage_mod.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(pkg.PackageError, "dpkg-dev"):
+                stage_mod.shlibdeps(Path("/x/ghostty"))
 
 
 if __name__ == "__main__":

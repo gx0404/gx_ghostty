@@ -122,6 +122,10 @@ dist-vt:
 package-windows *a:
     {{python}} scripts/gx_windows_package.py --build {{a}}
 
+# GX Shell stage（schema 3）：just stage windows|deb <新目录>；校验已有 stage 用 python scripts/gx_package.py verify-stage <目录>
+stage platform dir *a:
+    {{python}} scripts/gx_package.py {{platform}} --stage-dir {{dir}} {{a}}
+
 # zig fmt 格式化全仓（排除 .local/ 与构建产生的 zig-pkg/、zig-out/、.zig-cache/）
 fmt:
     {{python}} scripts/zigw.py fmt --exclude .local --exclude zig-pkg --exclude zig-out --exclude .zig-cache .
