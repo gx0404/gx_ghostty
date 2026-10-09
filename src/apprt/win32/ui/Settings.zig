@@ -206,6 +206,15 @@ pub fn show(window: *Window) bool {
     return self.openOverlay();
 }
 
+/// Like `show`, then switch to `section` (the command palette's
+/// "Settings: <section>" entries).
+pub fn showSection(window: *Window, section: Section) bool {
+    if (!show(window)) return false;
+    const self = instance orelse return false;
+    if (self.section != section) self.enterSection(section);
+    return true;
+}
+
 /// `window` is going away: save pending changes, end a theme preview and
 /// destroy the overlay if it belongs to that window.
 pub fn onWindowDestroyed(window: *Window) void {
@@ -663,7 +672,8 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
 // Sections and rows
 // -----------------------------------------------------------------------
 
-const Section = enum {
+/// The sections of the overlay, in sidebar order.
+pub const Section = enum {
     language,
     appearance,
     font,
@@ -857,7 +867,7 @@ fn buildRows(self: *Settings, buf: *[max_rows]Row) []Row {
                 "";
             var note: std.Io.Writer.Allocating = .init(scratch);
             i18n.format(&note.writer, i18n.tr("Current default: {name}"), .{ .name = current }) catch {};
-            if (self.app.config.command) |command| {
+            if (self.app.defaultTerminalCommand()) |command| {
                 const line = command.string(scratch) catch "";
                 if (line.len > 0) note.writer.print(" \u{2014} {s}", .{line}) catch {};
             }

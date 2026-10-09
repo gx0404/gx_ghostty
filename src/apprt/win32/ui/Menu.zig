@@ -669,7 +669,7 @@ const ProfileItems = struct {
         self.default = gx.settings_map.commandProfile(
             self.arena.allocator(),
             self.all(),
-            app.config.command,
+            app.defaultTerminalCommand(),
             profiles.Platform.native,
         ) catch null;
         return self;

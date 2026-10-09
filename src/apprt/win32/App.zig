@@ -1497,6 +1497,14 @@ fn findProfile(list: *const gx.profiles.List, id: []const u8) ?*const gx.profile
     return list.find(custom_id);
 }
 
+/// The command new terminals run unless a launch profile or `-e` passes
+/// their own: the default launch profile's (`default_command`) when
+/// `command` is not configured, else `command`. The menus and the settings
+/// show it as the current default.
+pub fn defaultTerminalCommand(self: *const App) ?configpkg.Command {
+    return self.default_command orelse self.config.command;
+}
+
 /// Pick the command of new terminals (first window, tabs, splits and
 /// windows) for when `command` is not configured on the command line, in
 /// a configuration file or by the settings: the default launch profile,
