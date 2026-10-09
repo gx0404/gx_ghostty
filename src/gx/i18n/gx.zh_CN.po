@@ -728,3 +728,16 @@ msgstr "正在预览：{name}"
 
 msgid "Settings saved."
 msgstr "设置已保存。"
+
+#. win32 W4
+msgid "Duplicate Tab"
+msgstr "复制标签页"
+
+msgid "Open Current Directory in File Explorer"
+msgstr "在资源管理器中打开当前目录"
+
+msgid "Set Default Shell…"
+msgstr "设置默认 Shell…"
+
+msgid "Default"
+msgstr "默认"

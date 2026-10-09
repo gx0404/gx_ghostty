@@ -1976,13 +1976,8 @@ fn onChromeRightClick(self: *Window, pt: w32.POINT) void {
     const hwnd = self.hwnd orelse return;
     var screen = pt;
     _ = w32.ClientToScreen(hwnd, &screen);
-    const command = Menu.showTabContextMenu(hwnd, screen, .{
-        .tab = null,
-        .tab_count = self.tab_count,
-    }) orelse return;
-    if (command == .new_tab) _ = self.addTab() catch |err| {
-        log.err("failed to create new tab: {}", .{err});
-    };
+    const command = Menu.showTabContextMenu(self, screen, null) orelse return;
+    Menu.performTabCommand(self, null, command);
 }
 
 const WM_CAPTURECHANGED: u32 = 0x0215;

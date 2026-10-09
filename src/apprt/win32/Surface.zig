@@ -169,6 +169,11 @@ palette: Palette = .{},
 pending_clipboard_read: ?PendingClipboardRead = null,
 pending_clipboard_write: ?PendingClipboardWrite = null,
 
+/// The command this terminal was started with instead of the configured
+/// one (`InitOptions.command`, e.g. a launch profile), so that its tab can
+/// be duplicated (see ui/Menu.zig).
+launch_command: ?configpkg.Command = null,
+
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
 ref_count: u32 = 0,
@@ -322,10 +327,15 @@ pub fn initWithOptions(
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
         config.@"shell-integration" = .detect;
+        self.launch_command = try command.clone(alloc);
     } else if (app.default_command) |command| {
         // `command` is not configured: the default launch profile.
         config.command = try command.clone(config.arenaAlloc());
     }
+    errdefer if (self.launch_command) |*command| {
+        command.deinit(alloc);
+        self.launch_command = null;
+    };
     if (options.title) |title| {
         config.title = try config.arenaAlloc().dupeZ(u8, title);
     }
@@ -364,6 +374,11 @@ pub fn deinit(self: *Surface) void {
         self.frame_event = null;
     }
     log.debug("surface deinit: frame_event closed", .{});
+
+    if (self.launch_command) |*command| {
+        command.deinit(self.app.core_app.alloc);
+        self.launch_command = null;
+    }
 
     if (self.hdc) |hdc| {
         if (self.hwnd) |hwnd| {
@@ -1492,7 +1507,7 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
         _ = w32.ReleaseCapture();
     }
 
-    // TrackPopupMenuEx's modal loop takes capture and swallows the physical
+    // The menu's modal loop takes capture and swallows the physical
     // WM_RBUTTONUP, so the core would never see the right-button release and
     // would leave click_state[right] stuck at .press (corrupting later mouse
     // motion). Synthesize the release now.
@@ -1506,11 +1521,8 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     };
     _ = w32.ClientToScreen(hwnd, &pt);
 
-    const binding = Menu.showSurfaceContextMenu(
-        hwnd,
-        pt,
-        self.core_surface.hasSelection(),
-    ) orelse return;
+    // Null also when this terminal closed while the menu was open.
+    const binding = Menu.showSurfaceContextMenu(self, pt) orelse return;
     _ = self.core_surface.performBindingAction(binding) catch |err| {
         log.err("context menu action failed err={}", .{err});
     };

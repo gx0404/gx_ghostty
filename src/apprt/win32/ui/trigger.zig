@@ -43,11 +43,27 @@ pub fn find(set: *const Binding.Set, action: Binding.Action) ?Trigger {
     return null;
 }
 
-/// The formatted trigger of `action` in `set` (see `find`), or null.
+/// The formatted trigger of `action` in `set`, or null: the one `find`
+/// returns, or when that key has no display name (such as the `paste` media
+/// key) another binding of the action.
 pub fn formatAction(set: *const Binding.Set, action: Binding.Action, buf: []u8) ?[]const u8 {
-    const trigger = find(set, action) orelse return null;
-    const text = format(trigger, buf);
-    return if (text.len == 0) null else text;
+    if (find(set, action)) |trigger| {
+        if (displayable(trigger)) return format(trigger, buf);
+    }
+    var it = set.bindings.iterator();
+    while (it.next()) |entry| switch (entry.value_ptr.*) {
+        .leaf => |leaf| if (leaf.action.equal(action) and displayable(entry.key_ptr.*)) {
+            return format(entry.key_ptr.*, buf);
+        },
+        .leader, .leaf_chained => {},
+    };
+    return null;
+}
+
+/// Whether `format` writes a name for the key of `trigger`.
+fn displayable(trigger: Trigger) bool {
+    const caps: Keycaps = .init(trigger);
+    return caps.key_len > 0;
 }
 
 fn write(trigger: Trigger, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -399,6 +415,20 @@ test "format modifiers and keys" {
         .key = .{ .unicode = 0xE4 },
         .mods = .{ .ctrl = true },
     }, &buf));
+}
+
+test "formatAction skips keys without a display name" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: input.Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "paste=paste_from_clipboard");
+    try set.parseAndPut(alloc, "ctrl+shift+v=paste_from_clipboard");
+    try set.parseAndPut(alloc, "copy=copy_to_clipboard");
+
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("Ctrl+Shift+V", formatAction(&set, .paste_from_clipboard, &buf).?);
+    try testing.expectEqual(@as(?[]const u8, null), formatAction(&set, .{ .copy_to_clipboard = .mixed }, &buf));
 }
 
 test "format cuts off at the buffer end" {
