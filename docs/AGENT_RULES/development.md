@@ -6,7 +6,7 @@
 - 工具面：`.claude/**`、`.codex/**`、`.zcode/**`、`.githooks/**`，以及上游自带的 `.agents/**`。
 - 命令、脚本与生成物：`justfile`、`scripts/**`、`graphify-out/**`、`.graphifyignore`，`.gitignore` 与 `.prettierignore` 的 fork 追加段。
 - 原样保留的上游政策文件：`AI_POLICY.md`、`HACKING.md`。
-- `--task sync`（上游同步）同时加载本文档与 `ci-release.md`。一个文件命中多个领域时取并集，例如 `scripts/gx_release.py` 也属于 `ci-release`，`scripts/zig_test.py` 与 `scripts/gx_wsl.py` 也属于 `testing`，`scripts/gx_i18n.py` 也属于 `gx-core`，`.gitignore` 也属于 `build-system`。
+- `--task sync`（上游同步）同时加载本文档与 `ci-release.md`。多领域文件取并集，如 `scripts/gx_release.py` 也属 `ci-release`，`scripts/zig_test.py`、`scripts/gx_wsl.py` 也属 `testing`，`scripts/gx_i18n.py` 也属 `gx-core`，`.gitignore` 也属 `build-system`。
 
 ## 符号真源
 
@@ -27,7 +27,7 @@
 - 闭集：`git ls-files --cached --others --exclude-standard` 的每个文件至少命中一个领域，或落在 `root_only`，二者不重叠；未跟踪但未忽略的新文件也要有路由。`root_only` 只放没有领域不变量的仓库元文件，不能借它绕过闭集。
 - glob 语义与排序见 `docs/AGENT_RULES/README.md`：每个 pattern 至少命中一个文件，不写 `**` 万能兜底，`rules` 按 `id` 排序，各数组内部排序。
 - 文档：`docs/AGENT_RULES/` 下除 `README.md` 外每份 `*.md` 恰好登记一次，≤16 KiB（目标 4–10 KiB），用五段式（可加只放链接的「上游指令」段）；领域文档之间不得出现 ≥160 字符的相同段落或列表项，跨域内容写链接。
-- 嵌套 AGENTS：`nested_agents` 必须等于实际的嵌套 `AGENTS.md` 集合；上游增删时 `--check` 失败，按 `docs/AGENT_RULES/README.md` 的步骤更新登记与「上游指令」链接，不复制、不改写上游正文。fork 规则只写进 `docs/AGENT_RULES/`，不新建嵌套 `AGENTS.md`。
+- 嵌套 AGENTS：`nested_agents` 必须等于实际的嵌套 `AGENTS.md` 集合；上游增删时 `--check` 失败，按 `docs/AGENT_RULES/README.md` 的步骤更新登记与「上游指令」链接，不复制、不改写上游正文。
 - resolver 无状态：scope 扩大后用完整集合重跑；退出码 2 要求补登记，不是可绕开的障碍。
 
 ### 根 AGENTS.md 与同步冲突
@@ -56,8 +56,8 @@
 - `justfile` 在 Windows 经 `cmd.exe` 执行（`set windows-shell`），解释器在 Windows 取 `python`、其余取 `python3`；配方体只写单条命令（Python 脚本调用，`install-hooks` 是 `git config`），串联的门用配方依赖表达，不写 POSIX 守卫或多行 shell。`.githooks/commit-msg` 必须以可执行模式入库（`git add --chmod=+x`），由提交规范测试锁定。上游 `Makefile` 不改，也不作 fork 入口。
 - `just framework-check`：rules-check → version-check → framework-test → kb-check → i18n-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
 - `just generated-check`：kb-check → i18n-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑 kb、graph 两项。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
-- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含完整单测 `just test`），需要钉版 Zig；本机热缓存实测约 100 s，改过 Zig 源码另加约 2 min 编译。「所有测试 ≤2 min」尚未完全达成，不得自行排除冷编译或用本机结果代证 CI，详见 `docs/TESTING.md`。
-- `just doctor`：`setup_env.py --check` 只读诊断（FOUND / MISSING / OPTIONAL），缺必需项（zig、python、git、venv、graphify，Windows 另需 MSVC）退出 1，hooksPath、符号链接权限、Inno Setup 与各 CLI 只作可选项；只报告并给修复命令，不隐式安装。配方参数不加引号拼进命令行，含 shell 元字符的自由文本直接调用脚本。
+- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含完整单测 `just test`），需要钉版 Zig，热缓存约 100 s，改过 Zig 源码另加约 2 min 编译；不得自行排除冷编译或用本机结果代证 CI（`docs/TESTING.md`）。
+- `just doctor`：`setup_env.py --check` 只读诊断，缺必需项（zig、python、git、venv、graphify，Windows 另需 MSVC）退出 1，其余（hooksPath、符号链接权限、Inno Setup、各 CLI）只报可选；只给修复命令，不隐式安装。配方参数不加引号拼进命令行，含 shell 元字符的自由文本直接调用脚本。
 
 ### 工具链本地性
 
@@ -69,7 +69,7 @@
 
 ### 生成物默认只检查
 
-- 入库的图谱产物只有 `graphify-out/GRAPH_REPORT.md` 与 `source-fingerprint.json`；`graph.json` 本机重建并被忽略，缺它 graph-check 照常运行。KB 产物是 `docs/kb/chunks.json`。编辑工具写这些路径会被 hook 拒绝，只能经 `just graph` / `just kb` 生成；有意重建后审 diff，检查失败时不得手改产物或放宽排除表来「变绿」。`GRAPH_REPORT.md` 里「Run `graphify update .`」的提示不适用：`scripts/graphify.py` 拒绝 `update`，重建一律 `just graph`。
+- 入库的图谱产物只有 `graphify-out/GRAPH_REPORT.md` 与 `source-fingerprint.json`；`graph.json` 本机重建并被忽略，缺它 graph-check 照常运行。KB 产物是 `docs/kb/chunks.json`。编辑工具写这些路径会被 hook 拒绝，只能经 `just graph` / `just kb` 生成；有意重建后审 diff，检查失败时不得手改产物或放宽排除表来「变绿」。`GRAPH_REPORT.md` 提示的 `graphify update .` 不适用（`scripts/graphify.py` 拒绝 `update`），重建一律 `just graph`。
 - KB 触发：语料变化，即各级 AGENTS 与根目录说明文档（含 `CHANGELOG.md`）、`docs/` 与 `docs/AGENT_RULES/` 的 Markdown、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含 `///`）、`include/ghostty/**/*.h` 的声明；清单、格式与裁剪规则以 `scripts/build_agent_kb.py` 为准，函数体改动不会让 KB 过期。kb-check 在 framework-check 里，过期即失败，修法是 `just kb`。体积预算 2.5 MiB 不放宽（`scripts/test_agent_kb.py::SIZE_BUDGET_BYTES`）。
 - 图谱触发：未被 `.graphifyignore` 排除的被索引源文件增删改（扩展名见 `scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS`），或管线输入 `scripts/graphify_fingerprint.py::PIPELINE_INPUTS`（两个图谱脚本与 `.graphifyignore`）变化。日常可不立即重建；发版前与同步后 `just graph`，再 `just generated-check`。已知盲区：graphify 跳过名为 `build` 的目录（`src/build/**` 不在图里），拿不到 `include/` 头文件的符号，这两处直接读源码或用 `just kb-query`。graphify 一律经 venv 的 `python -m graphify` 运行，不直接执行 `graphify.exe`（Windows 智能应用控制会拦截）。
 
@@ -83,8 +83,8 @@
 
 1. `main` 只快进到 `upstream/main`；在 `gx_ghostty` 上 `git merge --no-ff main -m "chore(sync): 合并上游 main（<sha>）"`。
 2. 冲突：根 AGENTS 按上文处理；追加段原样保留；新 workflow 移入归档（见 `ci-release.md`）；对照 `docs/FORK_PATCHES.md` 逐条确认补丁仍成立、移除条件是否已满足。
-3. 上游改了 `build.zig.zon` 的 `minimum_zig_version` 时，按 `https://ziglang.org/download/index.json` 中各平台的 `shasum` 更新 `scripts/setup_zig.py` 的 `ZIG_VERSION` 与 `PINS`，`just setup` 后跑 `just framework-test`（`scripts/test_setup_zig.py` 锁定两者相等），再改文档与注释里写死的 `0.16.0` 并在 `CHANGELOG.md` 记一条；不得用 `GX_GHOSTTY_ZIG` 指向另装的 Zig 绕过钉版。
-4. `just framework-check`（捕获新路径与新增嵌套 AGENTS）与 `just ci-check`；Windows 上再跑 `just build` 与 `just test`（上游新增按 `app_runtime` 穷举的 switch 时 win32 编译会报错，按 GX-0003 补 `.win32`），Linux 侧 `just wsl test`；按需 `just kb` / `just graph` 后 `just generated-check`。
+3. 上游改了 `build.zig.zon` 的 `minimum_zig_version` 时，按 `docs/DEVELOPMENT.md`「上游同步」第 5 步升级钉版（`scripts/setup_zig.py` 的 `ZIG_VERSION` 与 `PINS`，`scripts/test_setup_zig.py` 锁定二者相等）；不得用 `GX_GHOSTTY_ZIG` 指向另装的 Zig 绕过钉版。
+4. `just framework-check`（捕获新路径与新增嵌套 AGENTS）与 `just ci-check`；Windows 上再跑 `just build` 与 `just test`（新的 `app_runtime` 穷举 switch 让 win32 编译报错时按 GX-0003 补 `.win32`），Linux 侧 `just wsl test`；按需 `just kb` / `just graph` 后 `just generated-check`。
 
 ### 保留的上游政策
 
@@ -94,12 +94,12 @@
 
 ## 禁止项
 
-- 不把领域规则正文复制进根 `AGENTS.md`、`CLAUDE.md`、工具目录或 reviewer 定义；不把嵌套 AGENTS 的内容抄进领域文档；不新增嵌套 `AGENTS.md`。
+- 不把领域规则正文复制进根 `AGENTS.md`、`CLAUDE.md`、工具目录或 reviewer 定义；不把嵌套 AGENTS 的内容抄进领域文档；不新增嵌套 `AGENTS.md`，fork 规则只写进 `docs/AGENT_RULES/`。
 - 不改上游原文：根 `AGENTS.md` 标记之前、9 份嵌套 `AGENTS.md`、`.agents/**`、`AI_POLICY.md`、`HACKING.md`、`CONTRIBUTING.md`。
 - 不手改 `graphify-out/**`、`docs/kb/chunks.json`；不提交 `graph.json`、`.local/`、`.graphify-memory/`、`__pycache__/`。
 - 框架脚本不引入第三方依赖。
 - 不吞退出码：不加 `|| true`、`--exit-zero`，不把验收命令接 `| tail` 或 `| head`。
-- 不建 issue / PR，不 force push，不推 `upstream`；未经用户要求不 commit、不 push。
+- 不 force push，不推 `upstream`；未经用户要求不 commit、不 push。
 
 ## 验证
 

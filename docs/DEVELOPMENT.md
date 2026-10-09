@@ -235,7 +235,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 - **fork 补丁**：按 `docs/FORK_PATCHES.md` 逐条核对补丁是否仍然需要、是否仍然成立，冲突按该补丁小节的「同步冲突处理」放回，标记与登记由 `scripts/test_fork_patches.py` 检查。热点见下表。
 - **其余上游文件**：取上游版本。不用整文件 ours/theirs 糊过冲突，也不用 squash、cherry-pick 或 rebase 代替合并。
 
-**补丁热点**：41 个上游文件带 GX 补丁，其中 `src/Surface.zig`（GX-0005、GX-0006、GX-0012、GX-0014）与 `src/apprt/gtk/class/application.zig`（GX-0011、GX-0015、GX-0016、GX-0023）各叠了多个补丁，最容易冲突。
+**补丁热点**：42 个上游文件带 GX 补丁（登记表另有一个已恢复上游原样的 `removed` 文件），其中 `src/Surface.zig`（GX-0005、GX-0006、GX-0012、GX-0014）、`src/apprt/gtk/class/application.zig`（GX-0011、GX-0015、GX-0016、GX-0023）、`src/config/Config.zig`（GX-0003、GX-0010、GX-0024）与 `src/termio/Exec.zig`（GX-0005、GX-0012、GX-0022）各叠了多个补丁，最容易冲突。
 
 | 补丁 | 上游文件 | 冲突时核对 |
 |---|---|---|
@@ -255,6 +255,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 | GX-0021 | `src/renderer/generic.zig` | 预编辑追赶循环的 `< len` 上界；上游自己修好后按移除条件删除 |
 | GX-0022 | `src/terminal/Terminal.zig`、`src/termio/Exec.zig` | `flags.semantic_prompt_fresh_line` 紧跟 `resize_pull_scrollback` 且 `fullReset` 保留它；`semanticPromptFreshLine` 开头的早退；`Exec.initTerminal` 在 Windows 上关闭它与 `resize_pull_scrollback`；上游改 `PageList.resize` 的拉回语义时跑 `scrollback pull` 用例 |
 | GX-0023 | `src/apprt/gtk/css/style.css`、`src/apprt/gtk/class/application.zig` | GTK 4.14 能解析的 CSS：渐变不用过渡提示、`hsl()` 用逗号、`loadRuntimeCss414` 不用 `oklab(from …)`；上游新增的 CSS 跑 `scripts/test_fork_patches.py` 并看 `just wsl smoke` 日志有无 `Theme parser error` |
+| GX-0024 | `src/config/Config.zig` | `background-opacity` 文档注释末尾的 Windows 段落与其上方的标记行留在字段之前；上游改写这段文档时取上游再放回 |
 | GX-0026 | `src/build/GhosttyExe.zig` | Windows 分支的 `addWin32ResourceFile` 仍指向 `dist/windows/gx/ghostty-gx.rc`；上游改了 `dist/windows/ghostty.rc` 时把同样的变化搬进 fork 的 rc |
 
 合并后，`gx-ci` 的 `windows-app` 只构建 app、不跑单测，`linux-main` 只编译 `-Dapp-runtime=none`、不含 GTK apprt，所以 Windows 上的单测与 GTK apprt 的编译和单测要在本机补齐：Windows 上 `just build` 与 `just test`，WSL 里 `just wsl build --gtk` 与 `just wsl test --gtk`。

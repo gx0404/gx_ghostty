@@ -2,7 +2,7 @@
 
 > Ghostty GX 是 Ghostty 的非官方分支，由 gx0404 维护，与 Ghostty 团队无关，未获其认可或背书。本页的「Ghostty GX」均指这个分支，不指 Ghostty 官方发布。
 
-Ghostty GX 0.0.1 是 GX Shell 新的终端组件，接替 WezTerm GX（GX Shell 0.4.0 起）。本页按功能对照 WezTerm GX 与 Ghostty GX 在 Windows、Linux GTK 上的实现，并列出借鉴自社区项目的做法。代码结构见 [ARCHITECTURE.md](ARCHITECTURE.md)，可观察变更的完整描述见根 `CHANGELOG.md`，验证情况见 [TESTING.md](TESTING.md)。
+Ghostty GX 是 GX Shell 新的终端组件（0.0.1 起），接替 WezTerm GX（GX Shell 0.4.0 起）。本页按功能对照 WezTerm GX 与 Ghostty GX 在 Windows、Linux GTK 上的实现，并列出借鉴自社区项目的做法。代码结构见 [ARCHITECTURE.md](ARCHITECTURE.md)，可观察变更的完整描述见根 `CHANGELOG.md`，验证情况见 [TESTING.md](TESTING.md)。
 
 口径：
 
@@ -20,7 +20,7 @@ Ghostty GX 0.0.1 是 GX Shell 新的终端组件，接替 WezTerm GX（GX Shell 
 | 窗口材质 | 有：`window_material` 取壁纸、Mica、Acrylic 或纯色，非 Windows 降级为壁纸 | 有：`gx-window-material` 取 `solid`、`mica`、`acrylic`、`tabbed`；Windows 11 22H2 起生效（更早的系统按 `solid` 处理并记日志）。材质透到整个窗口：DWM 按像素合成（顶层窗口 `DwmEnableBlurBehindWindow` 空区域），终端背景按 `background-opacity` 透出材质，文字、光标、选区与图片不透明，分屏间隙一样；没设 `background-opacity` 时 Mica、Tabbed 取 0.3，Acrylic 取 0.75（同 WezTerm GX），设成 1 则只透在标题栏。`solid` 配 `background-opacity` 小于 1 时桌面透过终端背景、文字不透明，`background-blur` 把它模糊；`toggle_background_opacity` 所有窗口一起切换。更早的系统、Mesa 软件渲染或像素格式无 alpha 时保持 0.0.1 的做法：材质只在标题栏，`background-opacity` 整窗半透明（连文字），日志记一行原因 | 部分：没有系统材质；设置里的「纯色、半透明、毛玻璃」写 `background-opacity` 与 `background-blur`，毛玻璃是否生效取决于合成器（未验证） | 上游的 `background-opacity`、`background-blur` | — |
 | 壁纸 | 有：壁纸浮层（列出、预览、添加、删除）与 16 张内置壁纸 | 未移植。上游的 `background-image`（与 `-opacity`、`-position`、`-fit`、`-repeat`）可以设背景图，Windows 上没有专门验证过 | 未移植；同样可用上游的 `background-image` | 上游的 `background-image` | GX Shell 0.4.0 随 WezTerm GX 移除了壁纸 |
 | 标签栏外观 | 有：fancy 圆角标签栏、集成标题栏按钮、关闭按钮悬停 `#c42b1c`、未读计数、☰ 按钮 | 有：标签并入标题栏，Direct2D 绘制：8 DIP 圆角、活动标签与终端背景相连、`程序 ~ 标题`、未读圆点、管理员盾牌与 WSL 图标；拖动排序、双击改名、中键关闭；自绘最小化、最大化、关闭（悬停 `#c42b1c`），贴靠布局与窗口菜单；新窗口约占显示器工作区 80%，首帧前不显示 | 有（GX-0016）：libadwaita 标签栏加 GX 样式：8 px 圆角、取自主题的标题栏与标签配色、1 px 分屏线、细滚动条 | 上游原样 | — |
-| 主菜单 | 有：☰ 主菜单（命令面板、快捷键、设置、重载配置、隐藏窗口、退出），`ShowMainMenu` | 有：☰ 主菜单是按主题自绘的弹出菜单：新建标签页与窗口、启动配置子菜单、分屏、命令面板、设置、键盘快捷键、语言、重新加载配置、打开配置文件、关于、退出；`gx:main_menu`（默认 Ctrl+Shift+M） | 有（GX-0011）：上游 ☰ 菜单加 GX 分区（设置…、键盘快捷键、语言）；`gx:main_menu` 从 ☰ 按钮弹出 | 上游菜单栏 | Windows 的标签页右键与终端右键菜单也是同一套自绘菜单 |
+| 主菜单 | 有：☰ 主菜单（命令面板、快捷键、设置、重载配置、隐藏窗口、退出），`ShowMainMenu` | 有：☰ 主菜单是按主题自绘的弹出菜单：新建标签页与窗口、启动配置子菜单、分屏、命令面板、设置、键盘快捷键、语言、重新加载配置、打开配置文件、关于、退出；`gx:main_menu`（默认 Ctrl+Shift+M） | 有（GX-0011）：上游 ☰ 菜单加 GX 分区（设置…、键盘快捷键、语言）；「关于 Ghostty GX」打开 GX 自己的关于对话框（写明非官方分支），代替上游的关于；`gx:main_menu` 从 ☰ 按钮弹出 | 上游菜单栏 | Windows 的标签页右键与终端右键菜单也是同一套自绘菜单；两边的「关于」与设置的关于页都写明 Ghostty GX 是非官方分支 |
 | 命令面板 | 有：汉化的命令面板，中文模糊搜索，frecency 排序，鼠标悬停与点击 | 有：Direct2D 弹层，分组列出最近使用、标签页、启动配置、命令、设置、主题；同时匹配译文与英文原文；本次运行内的 frecency；选中主题即预览；键盘与鼠标 | 上游 GTK 命令面板，上游条目随界面语言翻译；GX 默认值的三条 `gx:` 条目也列出，可按标题或 `gx:` 动作搜索、回车执行（GX-0014），标题与描述在加载配置时按 `language` 翻译（中文为设置、键盘快捷键、主菜单），切换语言后随配置重载更新；用户自己写的条目按原文显示 | 上游 | Windows 的使用记录只保存在进程内，重启后清空 |
 | 快捷键速查表 | 有：快捷键速查浮层 | 有：`gx:keybinds`（默认 Ctrl+Shift+/）：按类别列出全部绑定，前导键序列显示为 `A → B`，可按标题、动作与按键搜索；被其他程序或输入法占用的按键带警告标记并说明原因（见下文「快捷键冲突」） | 有（GX-0011）：`Adw.Dialog`，按类别分组，可搜索 | 无 | — |
 | 快捷键冲突 | 无 | 有：启动后与每次重载配置时检测被其他程序注册为全局快捷键的组合键，以及当前输入法保留的按键；日志逐条警告，速查表标出，菜单与命令面板不再提示收不到的按键，默认的复制、粘贴、查找、分屏键受影响时每次运行提示一次替代方式；Shift+Insert 粘贴剪贴板、Ctrl+Insert 复制 | 无（上游行为；Shift+Insert 仍是上游的粘贴选择内容） | 无 | 见下文「快捷键冲突」 |
@@ -31,7 +31,7 @@ Ghostty GX 0.0.1 是 GX Shell 新的终端组件，接替 WezTerm GX（GX Shell 
 | 通知、响铃与进度 | 有：响铃聚焦抑制、请求注意与节流；Windows 任务栏闪烁与 OSC 9;4 进度 | 有：OSC 9 与 OSC 777 的桌面通知显示为托盘气泡，点击回到对应终端；`bell-features` 的 `system` 发系统提示音、`attention` 在窗口不在前台时闪烁任务栏，后台标签显示未读圆点；`progress-style` 开启时 OSC 9;4 进度显示在任务栏按钮；支持 `notify-on-command-finish` | 上游 GTK 行为 | 上游 | — |
 | 剪贴板图片粘贴 | 有：Ctrl+V 粘贴剪贴板图片，以 OSC 1337 内联或写临时文件（`clipboard_image_paste`） | 未移植：只粘贴文本；拖放文件与粘贴文件列表时插入按当前 shell 引用的路径（`gx.path_quote`：cmd、PowerShell、MSYS2/Git Bash/GX Zsh、WSL） | 未移植（上游行为） | 上游 | GX Shell 0.4.0 把它列为随 WezTerm GX 移除的功能 |
 | 字体包 | 有：JetBrainsMono Nerd Font 6 个字重与 Noto Sans CJK Regular/Bold，随配置快照与安装包分发 | 有：同一组 8 个字体文件（其中 Oh My Zsh GX 也带的 4 个与它逐字节相同，GX Shell 只在字节一致时合并组件字体）；安装包按与程序相同的范围（当前用户或所有用户）安装，已有同名字体时跳过，卸载不删；便携 zip 只附带不安装。默认 `font-family = JetBrainsMono Nerd Font`，CJK 经 `font-codepoint-map` 交给 `Noto Sans CJK SC`；字体发现用 DirectWrite（GX-0009） | 部分：deb stage 带 `fonts/`，由 GX Shell 安装；Debian 13 tarball 不带字体；默认配置相同，字体缺失时退到内嵌的 JetBrains Mono 与系统回退 | 上游 | — |
-| 安装包 | 有：0.3.0 起的原生安装包（Windows EXE 与 Ubuntu deb），后来改由 GX Shell 统一打包 | 有：Inno Setup 7.1 安装包与便携 zip（`just package-windows`；`gx-release` 的 `windows-app`），带随包 ConPTY、Mesa 软件渲染后备、字体与许可证；可选「在此处打开 Ghostty GX」右键菜单 | 无独立安装包：发布实验性的 Debian 13 tarball；Ubuntu 24.04 的 deb 由 GX Shell 用 stage 构建 | `gx-release` 可选构建只做 ad-hoc 签名的 app zip | 全部资产都没有代码签名 |
+| 安装包 | 有：0.3.0 起的原生安装包（Windows EXE 与 Ubuntu deb），后来改由 GX Shell 统一打包 | 有：Inno Setup 7.1 安装包与便携 zip（`just package-windows`；`gx-release` 的 `windows-app`），带随包 ConPTY、Mesa 软件渲染后备、字体与许可证；可选「在此处打开 Ghostty GX」右键菜单；exe 与安装包用 Ghostty GX 自己的图标（GX-0026），欢迎页、「应用和功能」与便携包 `README.txt` 写明非官方分支声明 | 无独立安装包：发布实验性的 Debian 13 tarball；Ubuntu 24.04 的 deb 由 GX Shell 用 stage 构建 | `gx-release` 可选构建只做 ad-hoc 签名的 app zip | 全部资产都没有代码签名 |
 | GX Shell 集成 | GX Shell 0.4.0 之前的终端组件 | 有：GX Shell 0.4.0 的终端组件（来源锁等 `gx-v0.0.1` 发布后才写正式修订）；`scripts/gx_package.py windows` 产出 stage；在 `<exe>\..\bin`、`%LOCALAPPDATA%\Programs\GXShell\bin`、`%LOCALAPPDATA%\Programs\OhMyZshGX\bin` 与 PATH 中找 GX Zsh 与 herdr | 有：`scripts/gx_package.py deb` 产出 Ubuntu 24.04 的 stage，装到 `/usr/lib/ghostty-gx`，命令 `ghostty-gx`；在 `/usr/lib/ohmyzsh-gx/bin` 与 PATH 中找 GX Zsh 与 herdr | 无 | 消费方契约写在 `scripts/gx_package.py` 模块文档 |
 | 随包 ConPTY | 有：随包的 `conpty.dll` 与 `OpenConsole.exe`（同一个 1.24.261001001 版本） | 有（GX-0007）：两者都在 exe 旁时优先使用，`GHOSTTY_GX_CONPTY=system` 强制用系统 ConPTY | 不适用 | 不适用 | 开发构建（`just build`）不带这两个文件，走系统 ConPTY |
 | 工作目录继承（OSC 7） | 有（上游 WezTerm 支持 OSC 7） | 有（GX-0008）：解析 `file:///C:/…`、`/c/…`、`/cygdrive/c/…` 与本机主机名，新标签页、分屏与窗口从 shell 报告的目录启动 | 上游行为 | 上游行为 | — |
@@ -44,6 +44,19 @@ Windows 把别的程序用 `RegisterHotKey` 注册的全局快捷键直接交给
 - 局限：输入法在本线程激活后才登记保留键，启动时的检测可能还看不到；微软拼音的 Ctrl+Shift+F 由它的按键处理直接吃掉，不是保留键（2026-10 本机实测：拼音激活时 `GetPreservedKey` 对它返回 `S_FALSE`，遍历全部虚拟键与常见修饰组合只发现无修饰的 `VK_CONVERT`），所以检测不到，查找请用命令面板、右键菜单，或在拼音设置里关掉简繁切换快捷键。
 - 呈现：日志 `%LOCALAPPDATA%\ghostty\logs\ghostty.log` 对每个受影响的绑定记一条警告；速查表在对应按键前加警告标记，并写明「被其他程序注册为全局快捷键」或「被输入法占用」；右键菜单、主菜单与命令面板改为提示同一动作的其他可用按键，没有就不提示；默认的复制、粘贴、查找或分屏键受影响时，每次运行在窗口底部提示一次（约 20 秒后自动消失），列出被占用的键与替代方式，并可打开速查表。
 - 替代方式：Windows 默认 Ctrl+Insert 复制、Shift+Insert 粘贴（Windows 没有选择剪贴板，上游的 `shift+insert=paste_from_selection` 在这里无效，GX 的 Windows 默认值改为粘贴剪贴板）；也可用终端右键菜单与命令面板（Ctrl+Shift+P），或在 `config.ghostty` 用 `keybind` 改到未被占用的组合键。输入法的保留键随当前输入法变化，检测结果以最近一次检测时的输入法为准。
+
+### 实机上遇到的冲突
+
+GX Shell 的 Windows 用户最常碰到的就是这类冲突：按键被抢走时 Ghostty GX 什么也收不到，看起来像是快捷键失灵。下表是 2026-10 在一台装有常见桌面软件的 Windows 11 上实际遇到的冲突。「影响」一列对照 Ghostty GX 在 Windows 上的默认绑定；默认未绑定的组合键只有用户自己绑定时才受影响，但被全局热键占用的组合键同样到不了终端里的程序（例如 shell 与 Vim 的 Alt 组合键）。优先在占用的程序里改键或关闭热键；改不了时用上面的替代方式，或用 `keybind` 把动作换到别的组合键。
+
+| 程序 | 占用的组合键 | 影响 | 解除办法 |
+|---|---|---|---|
+| bilibili 桌面客户端 | Ctrl+Shift+C（老板键） | 复制（`copy_to_clipboard`）；能检测到，窗口底部会提示 | 客户端「设置 → 快捷键 → 老板键」改成别的组合键或清空；临时可用 Ctrl+Insert 或右键菜单复制 |
+| AMD Software（性能指标叠加层） | Ctrl+Shift+O、Ctrl+Shift+X、Ctrl+Alt+L | Ctrl+Shift+O 是向右分屏（`new_split:right`），能检测到，窗口底部会提示；另两个默认未绑定 | 在 AMD Software 设置的热键里改掉或清除这些热键，或关闭性能指标叠加层；分屏也可从右键菜单或命令面板执行 |
+| 微软拼音输入法 | Ctrl+Shift+F（简繁切换） | 查找（`start_search`）；它不是 TSF 保留键，检测不到，速查表与提示条都不会标出 | 设置 → 时间和语言 → 语言和区域 → 微软拼音 → 按键 → 热键，关闭简繁切换；或把注册表 `HKCU\Software\Microsoft\InputMethod\Settings\CHS` 的 `EnableSimplifiedTraditionalOutputSwitch`（DWORD）设为 `0`；查找也可从命令面板或右键菜单打开 |
+| Kimi Code | Ctrl+Shift+S、Ctrl+Shift+Space | 默认未绑定 | 在 Kimi Code 的设置里修改它的全局快捷键 |
+| 微信 | Ctrl+Alt+W、Alt+A | 默认未绑定；Alt+A 到不了终端里的程序 | 微信「设置 → 快捷键」修改或清除 |
+| NVIDIA App | Ctrl+Alt+M、Alt+Shift+R | 默认未绑定 | 在 NVIDIA App 叠加层的快捷键设置里修改或停用 |
 
 ## 借鉴的社区做法
 

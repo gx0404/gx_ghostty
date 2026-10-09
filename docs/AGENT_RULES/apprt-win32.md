@@ -74,7 +74,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 ## 验证
 
 - 构建：`just build`（Windows 主机自动补 `-Dtarget=x86_64-windows-gnu`，Windows 目标默认 `-Dapp-runtime=win32`）产出 `zig-out/bin/ghostty.exe`；发布形态 `just package-windows`（见 `packaging-dist.md`）。
-- 单测：`just test --filter apprt.win32`（2026-10 本机 81 条，热缓存墙钟约 3 s），共享核心 `just test --filter gx.`；只依赖 std 的文件（如 `ui/settings/fuzzy.zig`）也可 `just zig test <文件>`。
+- 单测：`just test --filter apprt.win32`（2026-10 本机 82 条，热缓存墙钟约 3 s），共享核心 `just test --filter gx.`；只依赖 std 的文件（如 `ui/settings/fuzzy.zig`）也可 `just zig test <文件>`。
 - GUI 证据，GUI 可见改动必做：
   1. 隔离：`LOCALAPPDATA` 与 `XDG_CONFIG_HOME` 都指向 `.local/evidence/<任务>/env/<场景>`，配置写在其下的 `ghostty\config.ghostty`，日志在 `ghostty\logs\ghostty.log`。隔离后，只装在真实 `%LOCALAPPDATA%\Programs` 下、不在 `PATH` 上的 GX Zsh 探测不到，默认 shell 会退到 PowerShell；需要时在配置里写 `command`。
   2. agent shell 常带 `NO_COLOR=1` 与 `TERM=dumb`：启动 `ghostty.exe` 前去掉 `NO_COLOR`，否则 pwsh 等不输出颜色与粗斜体。

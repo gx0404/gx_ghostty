@@ -26,7 +26,7 @@
 | 框架单测 | `just framework-test`（`scripts/run_unittests.py`） | 脚本、hook、workflow 形状、版本与补丁标记的契约 / 任何 Zig 行为 | `framework` | 可跑 |
 | 格式 | `just fmt-check` | 符合 `zig fmt` / 能否编译 | `zig-fmt` | 可跑 |
 | lib-vt 单测 | `just test-vt` | vt 两个模块的单测 / app、渲染、字体、apprt | `linux-vt`、`windows`；`macos` 仅 dispatch | 可跑，主力 |
-| 完整单测 | `just test`；Linux 用 `just wsl test` | `src/main.zig` 根的单测（Debug、baseline CPU）/ test-lib-vt、macOS app 的 `xcodebuild test`；只编译所选 apprt 与目标平台的分支（`-Dapp-runtime=none` 不含 GTK，Windows 构建不含 POSIX 分支） | `linux-main`（`-Dapp-runtime=none`） | 可跑：win32 + windows-gnu，2026-10 本机 4133 条，热缓存约 45 s |
+| 完整单测 | `just test`；Linux 用 `just wsl test` | `src/main.zig` 根的单测（Debug、baseline CPU）/ test-lib-vt、macOS app 的 `xcodebuild test`；只编译所选 apprt 与目标平台的分支（`-Dapp-runtime=none` 不含 GTK，Windows 构建不含 POSIX 分支） | `linux-main`（`-Dapp-runtime=none`） | 可跑：win32 + windows-gnu，2026-10 本机 4194 条，热缓存约 50 s |
 | 上游串行对照 | `just zig build test-lib-vt` | 同一批用例在单进程逐条运行也通过，排除运行器的影响 / 同 lib-vt 单测 | 无 | 可跑，6–8 min |
 | ABI 清单 | `just zig build test-lib-vt-schema` | 导出清单符合 schema / 头文件声明 | `linux-vt` | 需 `python3` 与 `jsonschema` |
 | 构建与交叉 | `just build-vt`、`just vt-wasm`、`just build-vt -Dtarget=<triple>` | 能编译链接 / 目标上的运行 | `lib-vt-cross` | 可跑 |
