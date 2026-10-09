@@ -52,7 +52,7 @@
 - `src/main_ghostty.zig::main` 的注释说明：全局状态存在是因为 C API 需要访问它，其他 Zig 代码都不应访问。它只由 exe 的 `main`（`.main`）、工具二进制（`.tool`，跳过 app CLI 动作检测）或 libghostty 的 `ghostty_init`（`.c`，Windows 返回 `error.UnsupportedOSForCApi`）初始化。
 - `src/global.zig` 在 `terminal_options.artifact == .lib` 时 `@compileError`，libghostty-vt 可达代码只要 import 它就编译失败。
 - 现状：Zig 0.16 迁移后很多模块经 `global.io()`、`global.alloc()` 取 I/O 与分配器。测试构建中 `io`、`alloc`、`environ`、`environMap` 回退到 `std.testing` 的对应物，`args`、`resourcesDir`、`rlimits` 返回空值；`tmpDirPath`、`logging`、`action` 没有测试回退，`syncEnviron` 断言非测试。上游正把依赖改成显式传参，例如 `src/crash/sentry.zig::init` 接收 `environ_map`，`src/os/xdg.zig` 接收 `io`、`alloc`、`environ_map`。
-- 进程环境只在启动阶段修改：`global.init`（`ensureLocale` 之后 `syncEnviron`）与 GTK `Application` 初始化（设 `LANG`、`GDK_DEBUG`、`GDK_DISABLE` 后同样 `global.syncEnviron`）。`syncEnviron` 没有并发控制，启动之后改用 `std.process.Environ.Map`。`GHOSTTY_LOG` 控制日志去向；`Surface.init` 启动子进程前移除它，并注入 `GHOSTTY_SURFACE_ID`。
+- 进程环境只在启动阶段修改：`global.init`（`ensureLocale` 之后 `syncEnviron`）与 GTK `Application` 初始化（设 `LANG`、`LANGUAGE`、`GDK_DEBUG`、`GDK_DISABLE` 后同样 `global.syncEnviron`）。`syncEnviron` 没有并发控制，启动之后改用 `std.process.Environ.Map`。唯一的例外是 GX 界面语言的运行时切换（补丁 GX-0011）：gettext 每次查词都读 `LANGUAGE`，所以它在主线程 `setenv` 后 `syncEnviron`。`GHOSTTY_LOG` 控制日志去向；`Surface.init` 启动子进程前移除它，并注入 `GHOSTTY_SURFACE_ID`。
 
 ### 崩溃上报
 
@@ -71,7 +71,7 @@
 - 不在非主线程调用 App/Surface 的公共方法；跨线程只发自带内存的消息。
 - 不绕过 `Surface.queueIo` 直接调用 `io.queueMessage`，否则只读模式失效。
 - 不在 `apprt.Action.Key`、`ipc.Action` 中间插入或重排成员；不改 C 可见类型而不同步 `include/ghostty.h`。
-- 不新增全局可变状态；libghostty-vt 可达代码不 import `src/global.zig`；不在启动阶段之外修改进程环境（`setenv`、`syncEnviron`）。
+- 不新增全局可变状态；libghostty-vt 可达代码不 import `src/global.zig`；除上文 GX 界面语言切换外，不在启动阶段之外修改进程环境（`setenv`、`syncEnviron`）。
 - 不让崩溃上报默认上传数据；不假设 Windows 上有 Sentry。
 - 不先释放再 join；不跨 tick 保存未经 `hasSurface` 校验的 surface 指针。
 
