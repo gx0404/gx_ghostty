@@ -1,0 +1,188 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
+  // The Ghostty GX settings dialog (src/apprt/gtk/gx/settings_dialog.zig).
+  // Its text comes from the Ghostty GX translation tables at runtime, so
+  // nothing here is marked for gettext.
+  content-width: 720;
+  content-height: 640;
+  search-enabled: false;
+  closed => $closed();
+
+  Adw.PreferencesPage language_page {
+    name: "language";
+    icon-name: "preferences-desktop-locale-symbolic";
+
+    Adw.PreferencesGroup language_group {
+      Adw.ComboRow language_row {
+        notify::selected => $language_selected();
+      }
+    }
+  }
+
+  Adw.PreferencesPage appearance_page {
+    name: "appearance";
+    icon-name: "preferences-desktop-appearance-symbolic";
+
+    Adw.PreferencesGroup theme_group {
+      header-suffix: Gtk.Button theme_apply_button {
+        valign: center;
+        sensitive: false;
+        clicked => $theme_apply_clicked();
+
+        styles [
+          "suggested-action",
+        ]
+      };
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 12;
+
+        Gtk.SearchEntry theme_search {
+          search-changed => $theme_search_changed();
+          activate => $theme_search_activated();
+        }
+
+        Gtk.ScrolledWindow {
+          hscrollbar-policy: never;
+          min-content-height: 280;
+
+          styles [
+            "card",
+          ]
+
+          Gtk.ListBox theme_list {
+            selection-mode: single;
+            activate-on-single-click: false;
+            map => $theme_list_mapped();
+            row-selected => $theme_row_selected();
+            row-activated => $theme_row_activated();
+
+            styles [
+              "navigation-sidebar",
+            ]
+          }
+        }
+      }
+    }
+
+    Adw.PreferencesGroup material_group {
+      Adw.ComboRow material_row {
+        notify::selected => $material_selected();
+      }
+    }
+  }
+
+  Adw.PreferencesPage font_page {
+    name: "font";
+    icon-name: "preferences-desktop-font-symbolic";
+
+    Adw.PreferencesGroup font_size_group {
+      Adw.SpinRow font_size_row {
+        digits: 1;
+        numeric: true;
+
+        adjustment: Gtk.Adjustment {
+          lower: 6;
+          upper: 100;
+          step-increment: 0.5;
+          page-increment: 2;
+        };
+
+        notify::value => $font_size_changed();
+      }
+    }
+
+    Adw.PreferencesGroup font_family_group {
+      Adw.EntryRow font_family_row {
+        show-apply-button: true;
+        apply => $font_family_applied();
+      }
+    }
+  }
+
+  Adw.PreferencesPage interaction_page {
+    name: "interaction";
+    icon-name: "input-mouse-symbolic";
+
+    Adw.PreferencesGroup interaction_group {
+      Adw.ComboRow right_click_row {
+        notify::selected => $right_click_selected();
+      }
+
+      Adw.SwitchRow scrollbar_row {
+        notify::active => $scrollbar_toggled();
+      }
+
+      Adw.ComboRow close_confirmation_row {
+        notify::selected => $close_confirmation_selected();
+      }
+    }
+
+    Adw.PreferencesGroup bell_group {
+      Adw.SwitchRow bell_system_row {
+        notify::active => $bell_toggled();
+      }
+
+      Adw.SwitchRow bell_audio_row {
+        notify::active => $bell_toggled();
+      }
+
+      Adw.SwitchRow bell_attention_row {
+        notify::active => $bell_toggled();
+      }
+
+      Adw.SwitchRow bell_title_row {
+        notify::active => $bell_toggled();
+      }
+
+      Adw.SwitchRow bell_border_row {
+        notify::active => $bell_toggled();
+      }
+    }
+  }
+
+  Adw.PreferencesPage shell_page {
+    name: "shell";
+    icon-name: "utilities-terminal-symbolic";
+
+    Adw.PreferencesGroup shell_group {
+      Adw.ComboRow shell_row {
+        use-markup: false;
+        notify::selected => $shell_selected();
+      }
+    }
+  }
+
+  Adw.PreferencesPage about_page {
+    name: "about";
+    icon-name: "help-about-symbolic";
+
+    Adw.PreferencesGroup about_group {
+      Adw.ActionRow version_row {
+        use-markup: false;
+        subtitle-selectable: true;
+      }
+
+      Adw.ActionRow config_path_row {
+        use-markup: false;
+        subtitle-selectable: true;
+
+        [suffix]
+        Gtk.Button open_config_button {
+          valign: center;
+          clicked => $open_config_clicked();
+        }
+      }
+    }
+
+    Adw.PreferencesGroup settings_file_group {
+      Adw.ActionRow settings_path_row {
+        use-markup: false;
+        subtitle-selectable: true;
+      }
+    }
+  }
+}

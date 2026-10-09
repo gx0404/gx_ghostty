@@ -44,6 +44,9 @@ const Tab = @import("tab.zig").Tab;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
+// fork(gx): GX-0015 begin: Ghostty GX settings dialog
+const GxSettingsDialog = @import("../gx/settings_dialog.zig").GxSettingsDialog;
+// fork(gx): GX-0015 end
 const OpenURI = @import("../portal.zig").OpenURI;
 const media = @import("../media.zig");
 const Overrides = @import("Overrides.zig");
@@ -1529,6 +1532,9 @@ pub const Application = extern struct {
             .init("reload-config", actionReloadConfig, null),
             .init("toggle-quick-terminal", actionToggleQuickTerminal, null),
             .init("ring-bell", actionRingBell, null),
+            // fork(gx): GX-0015 begin: app.gx-settings shows the Ghostty GX settings dialog
+            .init("gx-settings", GxSettingsDialog.actionShow, null),
+            // fork(gx): GX-0015 end
         };
 
         ext.actions.add(Self, self, &actions);
@@ -2681,6 +2687,9 @@ const Action = struct {
     }
 
     pub fn openConfig(self: *Application, value: apprt.action.OpenConfig) bool {
+        // fork(gx): GX-0015 begin: gx-open-config-ui = settings shows the settings dialog instead of the editor
+        if (value == .os_open and GxSettingsDialog.openConfig(self)) return true;
+        // fork(gx): GX-0015 end
         const alloc = self.allocator();
 
         // Get the config file path

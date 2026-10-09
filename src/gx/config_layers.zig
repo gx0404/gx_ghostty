@@ -81,6 +81,13 @@ pub fn load(alloc_gpa: Allocator) !Config {
     return try loadWith(alloc_gpa, SystemSources{});
 }
 
+/// Loads the configuration like `load`, with `overrides` (`--key=value`
+/// arguments) applied above the command line and below `-e`. Settings UIs
+/// use it to preview a setting, such as a theme, without writing it.
+pub fn loadWithOverrides(alloc_gpa: Allocator, overrides: []const [:0]const u8) !Config {
+    return try loadWith(alloc_gpa, SystemSources{ .overrides = overrides });
+}
+
 /// A configuration with only the Ghostty GX defaults applied, not
 /// finalized; e.g. the values the settings UI resets to.
 pub fn defaultConfig(alloc_gpa: Allocator) !Config {
@@ -105,6 +112,8 @@ pub fn overlayPath(alloc: Allocator) ![]u8 {
 
 /// Where the layers come from when loading for real.
 const SystemSources = struct {
+    overrides: []const [:0]const u8 = &.{},
+
     fn defaultsText(_: SystemSources) []const u8 {
         return defaults;
     }
@@ -192,6 +201,7 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
     try appendLayer(arena, &ordered, user.items);
     try appendLayer(arena, &ordered, steps[overlay_start..overlay_end]);
     try appendLayer(arena, &ordered, steps[cli_begin..command_start]);
+    try appendLayer(arena, &ordered, try argSteps(arena, sources.overrides));
     try ordered.appendSlice(arena, steps[includes_end .. includes_end + command_len]);
 
     var result = try live.cloneEmpty(alloc_gpa);
@@ -206,6 +216,14 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
     }
 
     try result.finalize();
+    return result;
+}
+
+/// The steps of command-line style arguments. The arguments are not
+/// copied; replaying copies them into the new configuration.
+fn argSteps(arena: Allocator, args: []const [:0]const u8) Allocator.Error![]const Step {
+    const result = try arena.alloc(Step, args.len);
+    for (args, result) |arg, *step| step.* = .{ .arg = arg };
     return result;
 }
 
@@ -249,12 +267,14 @@ fn replacedKey(arg: []const u8) ?usize {
 }
 
 /// Layer sources for tests: explicit defaults text, at most one user file
-/// (absolute path), command-line arguments and an overlay file.
+/// (absolute path), command-line arguments, an overlay file and
+/// overrides.
 const TestSources = struct {
     defaults_text: []const u8,
     user_path: ?[]const u8 = null,
     args: []const []const u8 = &.{},
     overlay_path: ?[]const u8 = null,
+    overrides: []const [:0]const u8 = &.{},
 
     fn defaultsText(self: TestSources) []const u8 {
         return self.defaults_text;
@@ -633,6 +653,49 @@ test "the -e command stays last" {
     try testing.expectEqualStrings("htop", command[0]);
     try testing.expectEqualStrings("--font-size=99", command[1]);
     try testing.expect(cfg.@"quit-after-last-window-closed");
+}
+
+test "overrides rank above the command line and below -e" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const theme_a = try dir.write(arena, "theme-a", "background = #111111\n");
+    const theme_b = try dir.write(arena, "theme-b", "background = #222222\n");
+    const overlay = try dir.write(
+        arena,
+        "overlay.ghostty",
+        try std.fmt.allocPrint(arena, "theme = {s}\nfont-size = 14\n", .{theme_a}),
+    );
+
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = "font-size = 12\n",
+        .overlay_path = overlay,
+        .args = &.{ "--font-size=15", "-e", "htop" },
+        .overrides = &.{
+            try std.fmt.allocPrintSentinel(arena, "--theme={s}", .{theme_b}, 0),
+            "--font-size=16",
+        },
+    });
+    defer cfg.deinit();
+    try expectNoDiagnostics(&cfg);
+    try testing.expectEqualStrings(theme_b, cfg.theme.?.light);
+    try testing.expectEqual(Config.Color{ .r = 0x22, .g = 0x22, .b = 0x22 }, cfg.background);
+    try testing.expectEqual(@as(f32, 16), cfg.@"font-size");
+    const command = cfg.@"initial-command".?.direct;
+    try testing.expectEqual(@as(usize, 1), command.len);
+    try testing.expectEqualStrings("htop", command[0]);
+
+    var plain = try loadWith(testing.allocator, TestSources{
+        .defaults_text = "font-size = 12\n",
+        .overlay_path = overlay,
+    });
+    defer plain.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, plain.background);
+    try testing.expectEqual(@as(f32, 14), plain.@"font-size");
 }
 
 test "config-default-files=false skips user files and the overlay, not the defaults" {

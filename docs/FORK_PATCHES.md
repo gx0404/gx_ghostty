@@ -65,6 +65,8 @@
 | GX-0011 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0011` | active |
 | GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |
 | GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |
+| GX-0015 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0015` | active |
+| GX-0015 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0015` | active |
 | GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |
 | GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |
 <!-- fork-patches:end -->
@@ -693,6 +695,53 @@ GTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprof
 ### 测试锁定
 
 只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定由 `src/gx/confirm.zig` 的单测锁定，经 GX-0010 的 `test` 块进入 `ghostty-test`。
+
+## GX-0015 GTK 上的 Ghostty GX 设置对话框
+
+- 文件：`src/apprt/gtk/class/application.zig`（三个纯新增块：导入 `../gx/settings_dialog.zig`；`Application.startupActionMap` 的 `actions` 数组末尾登记 `app.gx-settings`；`Action.openConfig` 函数体开头把 `.os_open` 转交设置对话框）、`src/apprt/gtk/build/gresource.zig`（`blueprints` 数组末尾登记 `1.5/gx-settings-dialog`）。对话框本体在新路径 `src/apprt/gtk/gx/settings_dialog.zig` 与 `src/apprt/gtk/ui/1.5/gx-settings-dialog.blp`（模板只能放在 `gresource.zig::ui_path` 的版本目录下），与界面无关的选项映射在 `src/gx/settings_map.zig`，主题预览用的 `src/gx/config_layers.zig::loadWithOverrides` 也是 fork 路径，都不是源码补丁。
+- 标记：`fork(gx): GX-0015`；四处都用 `// fork(gx): GX-0015 begin: <说明>` 与 `// fork(gx): GX-0015 end` 整块包住，删掉这些块就是上游原文。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，新增 12 行（含标记），不改、不删上游行。
+
+### 原因
+
+`gx-open-config-ui = settings`（默认值，GX-0010 新增）要求「打开配置」显示 Ghostty GX 设置界面而不是编辑器；主菜单的 GX 分区与 `gx:settings` 绑定动作也需要一个固定的 app action 打开它。GTK 的 app action 表（`Application.startupActionMap`）与 `open_config` 的处理（`Action.openConfig`）都在上游 `application.zig` 里；Blueprint 模板必须登记在 `gresource.zig::blueprints` 才会被编译进 gresource（`docs/AGENT_RULES/apprt-gtk.md`「Blueprint 登记」）。所以只能在这两个上游文件里各加入口，其余逻辑全部放在新路径。
+
+### 行为
+
+- `app.gx-settings`（无参数）显示设置对话框，挂在当前活动窗口上（`gtk.Application.getActiveWindow`，没有窗口时独立显示）；对话框已打开时把它提到前面。运行期 libadwaita 低于 1.5（没有 `AdwDialog`）时只记日志。
+- `open_config` 的 `.os_open` 目标（默认 `ctrl+,`、主菜单的 `app.open-config::os-open`）：`gx-open-config-ui = settings` 时显示设置对话框；`editor` 或 libadwaita 低于 1.5 时与上游相同，用系统编辑器打开配置文件。`.new_window` 目标（在新窗口里用终端编辑器打开）不受影响。
+- 对话框分六页：语言（`language`）；外观（主题列表带搜索，在列表中移动即实时预览，「应用」或回车写入 `theme`，未应用就关闭对话框则恢复；窗口材质纯色 / 半透明 / 毛玻璃分别写 `background-opacity = 1` / `0.9` / `0.85` 与 `background-blur = false` / `false` / `true`，`gx-window-material` 只在 Windows 生效所以不写）；字体（`font-size` 6–100、步进 0.5、恢复默认 12；`font-family`，留空则删除）；交互（`right-click-action`、`scrollbar`、`confirm-close-surface`、`bell-features`）；Shell（`command`，取 `gx.profiles.detectSystem` 探测到的启动配置，参数不含空白时写 `direct:` 形式；选 GX Zsh 且探测到 herdr 时在后台运行 `herdr --gx-set-default-shell <gx-zsh>`，退出码 3 表示用户自管 herdr 配置，只提示不报错）；关于（版本、配置文件与 `gui-settings.ghostty` 的路径，「打开配置文件」按钮走上游 `.os_open` 的编辑器路径）。
+- 改动在 300 ms 内合并，经 `gx.gui_settings.Overlay` 写入 `gui-settings.ghostty`（从不写用户的 `config.ghostty`），再重新加载配置；保存、加载失败时在对话框里以 toast 提示。预览不写文件：用内存中的 `--theme=<名称>` 与去掉 `config-reload` 的 `--app-notifications` 覆盖加载配置后调用 `App.updateConfig`，所以不弹出「已重新加载配置」。环境变量 `GHOSTTY_GX_DEFAULTS=0` 关闭 GX 分层时不预览。
+- 界面文字用 Ghostty GX 翻译表（`src/gx/i18n.zig`），不经 gettext，`po/` 与 pot 不变；语言取对话框打开时配置的 `language`，每次打开都重新构建，所以切换语言后再打开即生效。
+
+### 上游状态
+
+未回馈上游，只服务 Ghostty GX 的设置界面。如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+四个块都是纯新增：导入块放在其他 `class/*.zig` 的导入旁；action 块放在 `startupActionMap` 的 `actions` 数组末尾；`openConfig` 块放在 `Action.openConfig` 函数体开头；登记块放在 `blueprints` 数组末尾。上游改名或重组 `startupActionMap`、`Action.openConfig`、`apprt.action.OpenConfig` 的 `.os_open` 或 `gresource.zig::blueprints` 时，按上述语义放回；上游若自己定义了名为 `gx-settings` 的 action，改 fork 的 action 名并同步主菜单。
+
+### 移除条件
+
+Ghostty GX 不再需要 GTK 设置界面，或上游提供可以挂接的设置界面与 `open_config` 扩展点时移除：删掉四个块与标记，把登记行改为 `removed`，删除 `src/apprt/gtk/gx/settings_dialog.zig` 与 `gx-settings-dialog.blp`。
+
+### 验证
+
+`ghostty-test` 与 GTK 构建都在 Linux（或 WSL）上运行：
+
+```bash
+python3 scripts/zigw.py build -Dapp-runtime=gtk                                  # 含 Blueprint 编译
+python3 scripts/zig_test.py --suite main -Dapp-runtime=none --filter gx.settings_map --filter gx.config_layers
+python3 -m unittest scripts.test_fork_patches -v
+```
+
+在 Windows 上经 `just wsl build --gtk` 与 `just wsl smoke --xdotool <脚本>` 截图：脚本把鼠标移进窗口后按 `ctrl+,` 打开对话框，再点选各页；截图须读图后才算通过。
+
+### 测试锁定
+
+只有登记表与闭集检查。选项与配置键的映射由 `src/gx/settings_map.zig` 的单测锁定，预览覆盖的层序由 `src/gx/config_layers.zig` 的 `overrides rank above the command line and below -e` 锁定。
 
 ## GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载
 

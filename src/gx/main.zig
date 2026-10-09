@@ -16,6 +16,7 @@ pub const osc7 = @import("osc7.zig");
 pub const policy = @import("policy.zig");
 pub const proc = @import("proc.zig");
 pub const profiles = @import("profiles.zig");
+pub const settings_map = @import("settings_map.zig");
 pub const theme = @import("theme.zig");
 pub const win32_input = @import("win32_input.zig");
 
@@ -32,6 +33,7 @@ test {
     _ = policy;
     _ = proc;
     _ = profiles;
+    _ = settings_map;
     _ = theme;
     _ = win32_input;
 }

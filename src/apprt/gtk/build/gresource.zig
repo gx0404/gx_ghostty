@@ -54,6 +54,9 @@ pub const blueprints: []const Blueprint = &.{
     // fork(gx): GX-0011 begin: the Ghostty GX menus (src/apprt/gtk/gx/menus.zig)
     .{ .major = 1, .minor = 5, .name = "gx/menus" },
     // fork(gx): GX-0011 end
+    // fork(gx): GX-0015 begin: Ghostty GX settings dialog
+    .{ .major = 1, .minor = 5, .name = "gx-settings-dialog" },
+    // fork(gx): GX-0015 end
 };
 
 /// CSS files in css_path
