@@ -1,0 +1,49 @@
+/*
+ * Ghostty GX stylesheet for the GTK app.
+ *
+ * src/apprt/gtk/gx/style.zig loads this file into its own CSS provider at
+ * GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2: above libadwaita and
+ * Ghostty's css/style.css, below Ghostty's runtime CSS (+3) and the
+ * gtk-custom-css files (USER), which both still override it. When the
+ * window follows the terminal colors (window-theme = auto or ghostty), the
+ * colors derived from the terminal theme are appended (src/gx/gtk_css.zig).
+ */
+
+/* Rounded tabs. */
+.window tabbar tab {
+  border-radius: 8px;
+}
+
+/*
+ * A flat header bar: the default raised toolbar style draws no shadow
+ * between the header bar, the tab bar and the terminal. raised-border
+ * keeps its border line.
+ */
+.window toolbarview > .top-bar.raised:not(.border),
+.window toolbarview > .bottom-bar.raised:not(.border),
+.window headerbar {
+  box-shadow: none;
+}
+
+/* 1 px split dividers. */
+.window .split paned > separator {
+  min-width: 1px;
+  min-height: 1px;
+}
+
+/* Slimmer scrollbars, thinner still while only indicating the position. */
+.window scrollbar.vertical slider {
+  min-width: 5px;
+}
+
+.window scrollbar.horizontal slider {
+  min-height: 5px;
+}
+
+.window scrollbar.vertical.overlay-indicator:not(.hovering) slider {
+  min-width: 2px;
+}
+
+.window scrollbar.horizontal.overlay-indicator:not(.hovering) slider {
+  min-height: 2px;
+}

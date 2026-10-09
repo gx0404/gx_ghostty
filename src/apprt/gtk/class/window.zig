@@ -31,6 +31,9 @@ const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const Overrides = @import("Overrides.zig");
+// fork(gx): GX-0016 begin: Ghostty GX herdr app mode (src/apprt/gtk/gx/app_mode.zig)
+const gx_app_mode = @import("../gx/app_mode.zig");
+// fork(gx): GX-0016 end
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
@@ -280,6 +283,10 @@ pub const Window = extern struct {
 
         /// The manually overridden title.
         title_override: ?[:0]const u8 = null,
+
+        // fork(gx): GX-0016 begin: herdr app mode state (zero-initialized like the rest)
+        gx_app_mode: gx_app_mode.AppMode = .{},
+        // fork(gx): GX-0016 end
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -856,6 +863,9 @@ pub const Window = extern struct {
                 self,
                 .{},
             );
+            // fork(gx): GX-0016 begin: titles change as herdr starts and exits
+            gx_app_mode.connectSurface(self, surface);
+            // fork(gx): GX-0016 end
 
             // If we've never had a surface initialize yet, then we register
             // this signal. Its theoretically possible to launch multiple surfaces
@@ -952,6 +962,12 @@ pub const Window = extern struct {
     pub fn getTabView(self: *Self) *adw.TabView {
         return self.private().tab_view;
     }
+
+    // fork(gx): GX-0016 begin: herdr app mode state for src/apprt/gtk/gx/app_mode.zig
+    pub fn gxAppMode(self: *Self) *gx_app_mode.AppMode {
+        return &self.private().gx_app_mode;
+    }
+    // fork(gx): GX-0016 end
 
     /// Get the current window decoration value for this window.
     pub fn getWindowDecoration(self: *Self) configpkg.WindowDecoration {
@@ -1104,6 +1120,10 @@ pub const Window = extern struct {
             return false;
         }
 
+        // fork(gx): GX-0016 begin: herdr app mode hides a tabs-style titlebar, so show the header bar instead
+        if (priv.gx_app_mode.active and config.@"gtk-titlebar-style" == .tabs) return true;
+        // fork(gx): GX-0016 end
+
         return switch (config.@"gtk-titlebar-style") {
             // If the titlebar style is tabs never show the titlebar.
             .tabs => false,
@@ -1138,6 +1158,9 @@ pub const Window = extern struct {
 
     fn getTabsVisible(self: *Self) bool {
         const priv = self.private();
+        // fork(gx): GX-0016 begin: herdr app mode hides the tab bar
+        if (priv.gx_app_mode.active) return false;
+        // fork(gx): GX-0016 end
         const config = if (priv.config) |v| v.get() else return true;
 
         switch (config.@"gtk-titlebar-style") {
@@ -1444,6 +1467,10 @@ pub const Window = extern struct {
             priv.handle_active_state_source = null;
         }
 
+        // fork(gx): GX-0016 begin: stop the herdr app mode timer before the tabs go away
+        priv.gx_app_mode.deinit();
+        // fork(gx): GX-0016 end
+
         priv.command_palette.deinit();
 
         if (priv.config) |v| {
@@ -1714,6 +1741,9 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+        // fork(gx): GX-0016 begin: re-evaluate herdr app mode
+        priv.gx_app_mode.update(self, true);
+        // fork(gx): GX-0016 end
 
         // Always reset our binding source in case we have no pages.
         priv.tab_bindings.setSource(null);
@@ -1835,6 +1865,9 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+        // fork(gx): GX-0016 begin: re-evaluate herdr app mode, start or stop its timer
+        priv.gx_app_mode.update(self, true);
+        // fork(gx): GX-0016 end
         if (priv.tab_view.getNPages() == 0) {
             // If we have no pages left then we want to close window.
 
@@ -1998,6 +2031,9 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+        // fork(gx): GX-0016 begin: re-evaluate herdr app mode
+        self.private().gx_app_mode.update(self, true);
+        // fork(gx): GX-0016 end
     }
 
     fn actionAbout(

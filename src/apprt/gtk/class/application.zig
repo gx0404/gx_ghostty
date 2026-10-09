@@ -47,6 +47,9 @@ const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
 const media = @import("../media.zig");
 const Overrides = @import("Overrides.zig");
+// fork(gx): GX-0016 begin: Ghostty GX look (src/apprt/gtk/gx/style.zig)
+const gx_style = @import("../gx/style.zig");
+// fork(gx): GX-0016 end
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -222,6 +225,10 @@ pub const Application = extern struct {
 
         /// Providers for loading custom stylesheets defined by user
         custom_css_providers: std.ArrayListUnmanaged(*gtk.CssProvider) = .empty,
+
+        // fork(gx): GX-0016 begin: the Ghostty GX stylesheet
+        gx_style: gx_style.Style = .{},
+        // fork(gx): GX-0016 end
 
         /// A copy of the LANG environment variable that was provided to Ghostty
         /// by the system. If this is null, the LANG environment variable did
@@ -476,6 +483,9 @@ pub const Application = extern struct {
         priv.css_provider.unref();
         for (priv.custom_css_providers.items) |provider| provider.unref();
         priv.custom_css_providers.deinit(alloc);
+        // fork(gx): GX-0016 begin: remove the Ghostty GX stylesheet
+        priv.gx_style.deinit();
+        // fork(gx): GX-0016 end
     }
 
     /// The global allocator that all other classes should use by
@@ -1321,6 +1331,9 @@ pub const Application = extern struct {
                 .{err},
             );
         };
+        // fork(gx): GX-0016 begin: the GX stylesheet and window-theme follow every config change
+        self.private().gx_style.apply(self.as(adw.Application), self.private().config.get());
+        // fork(gx): GX-0016 end
     }
 
     /// Log CSS parsing error

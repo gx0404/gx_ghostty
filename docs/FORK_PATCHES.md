@@ -47,6 +47,8 @@
 | GX-0010 | `src/config/Config.zig` | `fork(gx): GX-0010` | active |
 | GX-0012 | `src/Surface.zig` | `fork(gx): GX-0012` | active |
 | GX-0012 | `src/termio/Exec.zig` | `fork(gx): GX-0012` | active |
+| GX-0016 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0016` | active |
+| GX-0016 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0016` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -422,3 +424,49 @@ GTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprof
 
 只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定由 `src/gx/confirm.zig` 的单测锁定，经 GX-0010 的 `test` 块进入 `ghostty-test`。
 
+## GX-0016 GTK：herdr 应用模式、GX 样式与 window-theme 随配置重载
+
+- 文件：`src/apprt/gtk/class/window.zig`，十个纯新增块：导入、`Private.gx_app_mode`、公开访问器 `gxAppMode`、`getTabsVisible` 与 `getHeaderbarVisible` 的判断、`connectSurfaceHandlers` 里的标题信号、`tabViewSelectedPage`、`tabViewNPages`、`tabSplitTreeChanged` 的重新判断、`dispose` 里停掉定时器；`src/apprt/gtk/class/application.zig`，四个纯新增块：导入、`Private.gx_style`、`deinit` 移除样式、`propConfig` 应用样式与 `window-theme`。逻辑在新路径 `src/apprt/gtk/gx/app_mode.zig`、`src/apprt/gtk/gx/style.zig`、`src/apprt/gtk/gx/style.css`，与平台无关的部分在共享核心 `src/gx/app_mode.zig`、`src/gx/gtk_css.zig`。
+- 标记：`fork(gx): GX-0016`，十四块都以 `// fork(gx): GX-0016 begin: <说明>` 开头、`// fork(gx): GX-0016 end` 结尾。
+- 状态：active，未回馈上游。
+- 改动量：2 个文件，新增 49 行（含注释），不改、不删上游行。
+
+### 原因
+
+- herdr 应用模式（`gx-herdr-app-mode`）：窗口唯一的标签页运行 herdr 时，窗口应像独立的 herdr 应用一样呈现。标签栏是否显示由上游 `Window.getTabsVisible` 决定，判断入口、重新判断的时机（标签页增减与切换、分屏变化、终端标题变化）与窗口释放都在上游的 `window.zig` 里。
+- GX 外观：圆角标签、跟随终端主题的标签与标题栏配色、1 px 分屏线、更细的滚动条、平直的标题栏。上游的运行时 CSS 只覆盖少数配置项，`gtk-custom-css` 属于用户；GX 需要自己的 CSS provider，并在每次配置变化时重新生成颜色，加载入口 `Application.propConfig` 与清理入口 `Application.deinit` 都是上游函数。
+- `window-theme`：上游只在 `Application.startupStyleManager` 设置一次 libadwaita 的配色方案，运行时改 `window-theme` 或主题背景要重启才生效；GX 的设置界面会在运行时改配置。
+
+### 行为
+
+- herdr 应用模式：`gx-herdr-app-mode = true`、窗口恰好一个标签页，且该标签页某个终端运行 herdr 时进入。判断由 `src/gx/app_mode.zig` 完成：Linux 取 `Surface.getProcessInfo(.foreground_pid)`（pty 前台进程组组长），名字是 herdr 即命中，是 shell 等内置空闲进程即未命中（herdr 至多是后台或已停止的任务），其他程序（如包装脚本）再经 `/proc` 查它下面有没有 herdr。进入后 `getTabsVisible` 返回 false，即使 `window-show-tab-bar = always` 也隐藏标签栏；退出 herdr、新开第二个标签页或关掉 `gx-herdr-app-mode` 后恢复。
+- `gtk-titlebar-style = tabs` 时窗口控制按钮、新建标签与主菜单都在标签栏里，隐藏它会让窗口无法拖动和关闭，所以应用模式下 `getHeaderbarVisible` 改为显示标题栏（启用 CSD 时）顶替标签栏；`native` 风格只隐藏标签栏。最大化且 `gtk-titlebar-hide-when-maximized` 时两者都隐藏，与上游一致。
+- 重新判断的时机：标签页数量与选中页变化、标签页分屏变化、任一终端标题变化（只读前台进程名，不扫描 `/proc`），以及窗口恰好一个标签页时每 1.5 s 一次的定时器（可扫描）。定时器在其他标签页数量时停止，`dispose` 时移除；状态变化时通知 `tabs-visible` 与 `headerbar-visible`。
+- GX 样式：独立的 CSS provider，优先级 `GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2`，高于 libadwaita 与 Ghostty 的 `style.css`，低于 Ghostty 的运行时 CSS（`+3`）与 `gtk-custom-css`（`USER`），两者仍能覆盖它。静态规则（`style.css`）：标签 8 px 圆角；默认的 `raised` 工具栏风格去掉标题栏与标签栏下方的阴影（`raised-border` 保留边线）；分屏线 1 px；滚动条变细，只作位置指示时更细。`window-theme = auto` 或 `ghostty` 时再追加由终端主题生成的颜色（`src/gx/gtk_css.zig`）：标题栏与标签栏取 `window-titlebar-background`/`-foreground`（缺省为终端背景与前景），标签悬停、按下与选中色由二者混合，选中标签描一圈 palette 4 的半透明边，分屏线取背景与前景的 15% 混合（用户设了 `split-divider-color` 时由运行时 CSS 覆盖）；`system`、`light`、`dark` 不改颜色。每次配置变化重新生成。
+- `window-theme`：每次配置变化（含启动时的首次）按 `startupStyleManager` 的同一规则重设 libadwaita 配色方案，运行时修改即时生效。
+
+### 上游状态
+
+未回馈上游。herdr 应用模式与 GX 外观只服务 Ghostty GX；`window-theme` 运行时重载是上游可接受的改进，如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+十四块都是纯新增，只依赖这些上游接口：`Window.getTabsVisible`、`getHeaderbarVisible`、`connectSurfaceHandlers`（与 `disconnectSurfaceHandlers` 按 `data = self` 断开全部信号）、`tabViewSelectedPage`、`tabViewNPages`、`tabSplitTreeChanged`、`dispose`、`getTabView`、`getConfig`，以及 `Application.propConfig`、`deinit`、`startupStyleManager` 的配色规则。上游重组这些函数时，把对应块放回同一语义的位置；`startupStyleManager` 的配色规则变化时同步 `src/apprt/gtk/gx/style.zig::colorScheme`。上游改动标签栏、工具栏或分屏的 CSS 节点（`tabbar tab`、`toolbarview > .top-bar`、`.split paned > separator`）时，核对 `style.css` 与 `src/gx/gtk_css.zig` 的选择器。
+
+### 移除条件
+
+Ghostty GX 不再需要 GTK 的 herdr 应用模式与 GX 外观时移除：删除全部块与标记、`src/apprt/gtk/gx/`、`src/gx/gtk_css.zig`（`src/gx/app_mode.zig` 仍供 win32 使用时保留），把两行登记改为 `removed`。上游实现运行时重设 `window-theme` 后，删除 `Style.apply` 里的配色方案调用。
+
+### 验证
+
+```bash
+just wsl build --gtk
+just wsl test --filter gx.app_mode --filter gx.gtk_css    # 共享核心单测（-Dapp-runtime=none）
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟（Xvfb，`just wsl smoke`）：开 2–3 个标签页与一个分屏，看圆角标签、标签配色、1 px 分屏线；`window-show-tab-bar = always` 时在唯一的标签页运行 `cp /bin/sleep /tmp/herdr && /tmp/herdr 60`，标签栏在 1.5 s 内隐藏，herdr 退出或新开标签页后恢复；`gtk-titlebar-style = tabs` 时应用模式显示标题栏。
+
+### 测试锁定
+
+只有登记表与闭集检查（见 GX-0001 的「测试锁定」）。判定与配色由 `src/gx/app_mode.zig`、`src/gx/gtk_css.zig` 的单测锁定；GTK 胶水代码（`src/apprt/gtk/gx/`）没有单测，靠 GTK 构建与冒烟截图验证。
