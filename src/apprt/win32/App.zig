@@ -2679,13 +2679,18 @@ fn surfaceWndProc(
             return 0;
         },
 
+        w32.WM_MOUSELEAVE => {
+            surface.handleMouseLeave();
+            return 0;
+        },
+
         w32.WM_MOUSEWHEEL => {
-            surface.handleMouseWheel(wparam, .vertical);
+            surface.handleMouseWheel(wparam, lparam, .vertical);
             return 0;
         },
 
         w32.WM_MOUSEHWHEEL => {
-            surface.handleMouseWheel(wparam, .horizontal);
+            surface.handleMouseWheel(wparam, lparam, .horizontal);
             // TRUE: some mouse drivers (Logitech) send the following tilt
             // messages only to windows that answer TRUE.
             return 1;

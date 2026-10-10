@@ -100,6 +100,16 @@ mouse_button_mask: u3 = 0,
 /// for the next WM_MOUSEHWHEEL (`wheelNotches`).
 hwheel_accum: i32 = 0,
 
+/// The pointer position last reported to the core, in client pixels, and
+/// what `getCursorPos` answers: (-1, -1) once the pointer left the terminal
+/// (`handleMouseLeave`), as before it first entered.
+cursor_pos: apprt.CursorPos = .{ .x = -1, .y = -1 },
+
+/// Whether WM_MOUSELEAVE was requested (`trackPointerLeave`) and has not
+/// come yet. Windows forgets the request around a mouse capture, so it is
+/// made again after one (`handleMouseButton`, `handleCaptureChanged`).
+tracking_leave: bool = false,
+
 /// Whether an IME composition session is active. When true, handleKeyEvent
 /// skips VK_PROCESSKEY events (the IME is intercepting keys), and composed
 /// text is extracted from WM_IME_COMPOSITION instead.
@@ -264,6 +274,9 @@ pub fn initWithOptions(
     self.* = .{
         .app = app,
         .parent_window = parent,
+        // The core's pointer starts as the text cursor (`MouseShape.text`)
+        // and reports changes only.
+        .current_cursor = w32.LoadCursorW(null, cursorIdFor(.text)),
     };
 
     // Create a manual-reset event for synchronizing resize with the
@@ -498,21 +511,11 @@ pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
     return .{ .width = self.width, .height = self.height };
 }
 
+/// The pointer position the core was told last (`cursor_pos`), so its
+/// answers agree with the events it got: (-1, -1), which it treats as
+/// outside the terminal, while the pointer is elsewhere.
 pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
-    if (self.hwnd) |hwnd| {
-        var point: w32.POINT = undefined;
-        if (w32.GetCursorPos_(&point) != 0) {
-            _ = w32.ScreenToClient(hwnd, &point);
-            return .{
-                .x = @floatFromInt(point.x),
-                .y = @floatFromInt(point.y),
-            };
-        }
-    }
-    // Signal failure rather than returning a bogus {0,0} origin, so the
-    // core skips the mouse computation instead of resolving it against the
-    // top-left cell (which produced spurious hover/selection at 0,0).
-    return error.GetCursorPosFailed;
+    return self.cursor_pos;
 }
 
 pub fn getTitle(self: *const Surface) ?[:0]const u8 {
@@ -1174,21 +1177,60 @@ pub fn toggleFullscreen(self: *Surface) void {
 /// Set the mouse cursor shape. Caches the handle so WM_SETCURSOR can
 /// restore it (Windows resets the cursor on every mouse move otherwise).
 pub fn setMouseShape(self: *Surface, shape: terminal.MouseShape) void {
-    const cursor = switch (shape) {
-        .text => w32.LoadCursorW(null, w32.IDC_IBEAM),
-        .pointer => w32.LoadCursorW(null, w32.IDC_HAND),
-        .crosshair => w32.LoadCursorW(null, w32.IDC_CROSS),
-        .e_resize, .w_resize, .ew_resize => w32.LoadCursorW(null, w32.IDC_SIZEWE),
-        .n_resize, .s_resize, .ns_resize => w32.LoadCursorW(null, w32.IDC_SIZENS),
-        .nwse_resize, .nw_resize, .se_resize => w32.LoadCursorW(null, w32.IDC_SIZENWSE),
-        .nesw_resize, .ne_resize, .sw_resize => w32.LoadCursorW(null, w32.IDC_SIZENESW),
-        .not_allowed => w32.LoadCursorW(null, w32.IDC_NO),
-        .progress => w32.LoadCursorW(null, w32.IDC_APPSTARTING),
-        .wait => w32.LoadCursorW(null, w32.IDC_WAIT),
-        else => w32.LoadCursorW(null, w32.IDC_ARROW),
+    self.current_cursor = w32.LoadCursorW(null, cursorIdFor(shape));
+    // A hidden pointer (`mouse_visible`, typing) stays hidden; WM_SETCURSOR
+    // shows the new shape once it is visible again.
+    if (self.mouse_visible and self.pointerOver()) {
+        if (self.current_cursor) |cursor| _ = w32.SetCursor(cursor);
+    }
+}
+
+/// Whether the pointer is over the terminal's window, or captured by it
+/// for a drag. `SetCursor` changes the pointer wherever it is, so the
+/// terminal only sets it then.
+fn pointerOver(self: *const Surface) bool {
+    const hwnd = self.hwnd orelse return false;
+    if (w32.GetCapture() == hwnd) return true;
+    var point: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&point) == 0) return false;
+    return w32.WindowFromPoint(point) == hwnd;
+}
+
+/// The system cursor (`IDC_*`) closest to the CSS cursor `shape`; Windows
+/// has no cell, alias, copy, grab or zoom cursors.
+fn cursorIdFor(shape: terminal.MouseShape) usize {
+    return switch (shape) {
+        .default, .context_menu, .alias, .copy, .zoom_in, .zoom_out => w32.IDC_ARROW,
+        .help => w32.IDC_HELP,
+        .pointer => w32.IDC_HAND,
+        .progress => w32.IDC_APPSTARTING,
+        .wait => w32.IDC_WAIT,
+        .cell, .crosshair => w32.IDC_CROSS,
+        .text, .vertical_text => w32.IDC_IBEAM,
+        .move, .grab, .grabbing, .all_scroll => w32.IDC_SIZEALL,
+        .no_drop, .not_allowed => w32.IDC_NO,
+        .col_resize, .e_resize, .w_resize, .ew_resize => w32.IDC_SIZEWE,
+        .row_resize, .n_resize, .s_resize, .ns_resize => w32.IDC_SIZENS,
+        .nw_resize, .se_resize, .nwse_resize => w32.IDC_SIZENWSE,
+        .ne_resize, .sw_resize, .nesw_resize => w32.IDC_SIZENESW,
     };
-    self.current_cursor = cursor;
-    if (cursor) |c| _ = w32.SetCursor(c);
+}
+
+test "cursorIdFor maps every shape to a system cursor" {
+    const testing = std.testing;
+    try testing.expectEqual(w32.IDC_IBEAM, cursorIdFor(.text));
+    try testing.expectEqual(w32.IDC_HAND, cursorIdFor(.pointer));
+    try testing.expectEqual(w32.IDC_HELP, cursorIdFor(.help));
+    try testing.expectEqual(w32.IDC_SIZEALL, cursorIdFor(.move));
+    try testing.expectEqual(w32.IDC_SIZEALL, cursorIdFor(.grabbing));
+    try testing.expectEqual(w32.IDC_SIZEWE, cursorIdFor(.col_resize));
+    try testing.expectEqual(w32.IDC_SIZENS, cursorIdFor(.row_resize));
+    try testing.expectEqual(w32.IDC_SIZENWSE, cursorIdFor(.se_resize));
+    try testing.expectEqual(w32.IDC_SIZENESW, cursorIdFor(.sw_resize));
+    try testing.expectEqual(w32.IDC_ARROW, cursorIdFor(.default));
+    for (std.enums.values(terminal.MouseShape)) |shape| {
+        try testing.expect(cursorIdFor(shape) >= w32.IDC_ARROW);
+    }
 }
 
 /// Handle WM_SETCURSOR — restore our cached cursor so Windows doesn't
@@ -1629,15 +1671,17 @@ pub fn handleMouseButton(
         if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
     } else if (prev != 0 and event.mask == 0) {
         _ = w32.ReleaseCapture();
+        self.tracking_leave = false;
     }
     if (!event.forward) return;
 
-    const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
-    const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
+    const pos = lparamPos(lparam);
     const mods = getModifiers();
 
-    // Update cursor position first
-    self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
+    // Update cursor position first: the core reads it back
+    // (`getCursorPos`) for the click.
+    self.cursor_pos = pos;
+    self.core_surface.cursorPosCallback(pos, mods) catch |err| {
         log.err("cursor pos callback error: {}", .{err});
     };
 
@@ -1652,7 +1696,33 @@ pub fn handleMouseButton(
     // (same contract the GTK apprt follows).
     if (!consumed and button == .right and action == .press) {
         self.showContextMenu(lparam);
+        return;
     }
+
+    // The capture ended: watch for the pointer leaving again, or report
+    // that a drag ended outside the terminal (`handleMouseLeave` leaves
+    // that to the release).
+    if (prev != 0 and event.mask == 0) {
+        if (self.clientContains(pos)) self.trackPointerLeave() else self.reportPointerLeft();
+    }
+}
+
+/// The client position packed in the lparam of a mouse message (signed:
+/// negative to the left of or above the window while the mouse is
+/// captured).
+fn lparamPos(lparam: isize) apprt.CursorPos {
+    return .{
+        .x = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF))),
+        .y = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF))),
+    };
+}
+
+/// Whether `pos` (client pixels) is inside the terminal's window.
+fn clientContains(self: *const Surface, pos: apprt.CursorPos) bool {
+    const size = self.clientSize() orelse return false;
+    return pos.x >= 0 and pos.y >= 0 and
+        pos.x < @as(f32, @floatFromInt(size.width)) and
+        pos.y < @as(f32, @floatFromInt(size.height));
 }
 
 /// The bit of `button` in `mouse_button_mask`, 0 for a button it does not
@@ -1729,12 +1799,14 @@ pub fn handleCaptureChanged(self: *Surface) void {
     const released = self.mouse_button_mask;
     if (released == 0) return;
     self.mouse_button_mask = 0;
+    self.tracking_leave = false;
     const hwnd = self.hwnd orelse return;
     _ = w32.PostMessageW(hwnd, WM_APP_RELEASE_BUTTONS, released, 0);
 }
 
 /// Report the release of the `released` buttons (`mouse_button_mask` bits,
-/// see `handleCaptureChanged`) that were not pressed again meanwhile.
+/// see `handleCaptureChanged`) that were not pressed again meanwhile, and
+/// that the pointer left when it is over whatever took the capture now.
 pub fn releaseButtons(self: *Surface, released: u3) void {
     if (!self.core_surface_ready) return;
     const pending = released & ~self.mouse_button_mask;
@@ -1745,6 +1817,7 @@ pub fn releaseButtons(self: *Surface, released: u3) void {
             log.err("mouse button callback error: {}", .{err});
         };
     }
+    if (self.mouse_button_mask == 0 and !self.pointerOver()) self.reportPointerLeft();
 }
 
 /// Show the surface right-click context menu at the given client coords
@@ -1785,13 +1858,55 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
 /// Handle WM_MOUSEMOVE.
 pub fn handleMouseMove(self: *Surface, lparam: isize) void {
     if (!self.core_surface_ready) return;
-    const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
-    const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
+    self.trackPointerLeave();
+    self.pointerMoved(lparamPos(lparam));
+}
+
+/// The pointer is at `pos` (client pixels) over the terminal. Windows also
+/// reports a "move" when the pointer stood still (a window appeared or
+/// moved under it, focus changes): only real moves reach the core, so they
+/// cannot unhide a pointer hidden while typing.
+fn pointerMoved(self: *Surface, pos: apprt.CursorPos) void {
+    if (pos.x == self.cursor_pos.x and pos.y == self.cursor_pos.y) return;
+    self.cursor_pos = pos;
 
     // Pass modifiers so the core can detect Ctrl+hover for link highlighting.
-    const mods = getModifiers();
+    self.core_surface.cursorPosCallback(pos, getModifiers()) catch |err| {
+        log.err("cursor pos callback error: {}", .{err});
+    };
+}
 
-    self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
+/// Ask for WM_MOUSELEAVE once the pointer moved over the terminal. Not
+/// while buttons are held: the captured pointer keeps reporting moves
+/// outside the window, and the release asks again (`handleMouseButton`).
+fn trackPointerLeave(self: *Surface) void {
+    if (self.tracking_leave or self.mouse_button_mask != 0) return;
+    const hwnd = self.hwnd orelse return;
+    var tme: w32.TRACKMOUSEEVENT = .{
+        .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+        .dwFlags = w32.TME_LEAVE,
+        .hwndTrack = hwnd,
+        .dwHoverTime = 0,
+    };
+    if (w32.TrackMouseEvent(&tme) != 0) self.tracking_leave = true;
+}
+
+/// Handle WM_MOUSELEAVE: the pointer left the terminal's window (for
+/// another window, a popup over the terminal or another split). The core
+/// gets (-1, -1), as from GTK, and drops the link under the pointer and its
+/// preview. While buttons are held the drag goes on with the captured
+/// pointer; its release reports the leave (`handleMouseButton`).
+pub fn handleMouseLeave(self: *Surface) void {
+    self.tracking_leave = false;
+    if (!self.core_surface_ready or self.mouse_button_mask != 0) return;
+    self.reportPointerLeft();
+}
+
+/// Tell the core that the pointer is outside the terminal.
+fn reportPointerLeft(self: *Surface) void {
+    if (self.cursor_pos.x == -1 and self.cursor_pos.y == -1) return;
+    self.cursor_pos = .{ .x = -1, .y = -1 };
+    self.core_surface.cursorPosCallback(self.cursor_pos, getModifiers()) catch |err| {
         log.err("cursor pos callback error: {}", .{err});
     };
 }
@@ -1910,10 +2025,22 @@ fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP, quoting: path_quote.Styl
 
 /// Handle WM_MOUSEWHEEL (vertical) and WM_MOUSEHWHEEL (horizontal).
 /// `axis` selects which scroll axis to deliver the delta on.
-pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, horizontal }) void {
+pub fn handleMouseWheel(self: *Surface, wparam: usize, lparam: isize, axis: enum { vertical, horizontal }) void {
     if (!self.core_surface_ready) return;
     // The high word of wparam contains the wheel delta (signed).
     const raw_delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
+
+    // A mouse report of the scroll carries the pointer position
+    // (`getCursorPos`): the wheel message has it, in screen pixels.
+    if (self.hwnd) |hwnd| {
+        const screen = lparamPos(lparam);
+        var point: w32.POINT = .{ .x = @intFromFloat(screen.x), .y = @intFromFloat(screen.y) };
+        if (w32.ScreenToClient(hwnd, &point) != 0) {
+            const pos: apprt.CursorPos = .{ .x = @floatFromInt(point.x), .y = @floatFromInt(point.y) };
+            if (self.clientContains(pos)) self.pointerMoved(pos);
+        }
+    }
+
     const scroll_mods: input.ScrollMods = .{};
 
     var xoff: f64 = 0;
