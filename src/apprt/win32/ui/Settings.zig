@@ -1050,6 +1050,7 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
 fn typedElsewhere(self: *Settings, popup: *Popup) void {
     const typed = popup.input.text(self.alloc) catch return popup.input.clear();
     defer self.alloc.free(typed);
+    if (fuzzy.isBlank(typed)) return popup.input.clear();
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
     if (typed.len > 0 and self.focus < rows.len and rows[self.focus].action == .font_size and model.startsFontSize(typed[0])) {
@@ -3554,6 +3555,40 @@ test "theme previews read back other settings without committing the preview" {
     try testing.expectEqual(@as(?u32, 7), self.saved_theme);
     try testing.expect(std.meta.eql(notifications, self.notifications));
     try testing.expect(self.changes.isEmpty());
+}
+
+test "activation spaces outside a field do not change focus or start a preview" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+        .focus = 2,
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.input.deinit(testing.allocator);
+    defer self.search_query.deinit(testing.allocator);
+    defer self.theme_query.deinit(testing.allocator);
+    for ([_][]const u8{ " ", "\t", "\u{3000}" }) |text| {
+        try self.popup.input.setText(testing.allocator, text);
+        self.typedElsewhere(&self.popup);
+        try testing.expectEqual(@as(usize, 2), self.focus);
+        try testing.expect(self.text_field == null);
+        try testing.expect(self.preview_theme == null);
+        try testing.expectEqual(@as(usize, 0), self.popup.input.buf.items.len);
+        try testing.expectEqual(@as(usize, 0), self.search_query.items.len);
+        try testing.expectEqual(@as(usize, 0), self.theme_query.items.len);
+    }
 }
 
 test {
