@@ -259,10 +259,35 @@ fn combinedTooltip(indicator: Indicator, kind: gx.leader.Kind, buf: []u8) [:0]co
     return std.fmt.bufPrintZ(buf, "{s} · {s}", .{ status, text }) catch status;
 }
 
+fn tabTooltip(base: [:0]const u8, indicator: Indicator, kind: gx.leader.Kind, buf: []u8) [:0]const u8 {
+    var detail_buf: [256]u8 = undefined;
+    const detail = combinedTooltip(indicator, kind, &detail_buf);
+    if (detail.len == 0) return base;
+    if (base.len == 0) return std.fmt.bufPrintZ(buf, "{s}", .{detail}) catch base;
+    return std.fmt.bufPrintZ(buf, "{s}\n{s}", .{ base, detail }) catch base;
+}
+
+fn tabTooltipChanged(_: *gobject.Object, _: *gobject.ParamSpec, tab: *Tab) callconv(.c) void {
+    syncTab(tab);
+}
+
 fn setTooltip(page: *adw.TabPage, indicator: Indicator) void {
     const kind = std.enums.fromInt(gx.leader.Kind, @intFromPtr(page.as(gobject.Object).getData(kind_key))) orelse .local;
     var buf: [256]u8 = undefined;
     page.setIndicatorTooltip(combinedTooltip(indicator, kind, &buf));
+    const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+    const object = tab.as(gobject.Object);
+    const key = "gx-progress-tab-watch";
+    if (object.getData(key) == null) {
+        object.setData(key, @ptrFromInt(1));
+        _ = gobject.Object.signals.notify.connect(object, *Tab, tabTooltipChanged, tab, .{ .detail = "tooltip", .after = true });
+    }
+    var value = gobject.ext.Value.new(?[*:0]const u8);
+    defer value.unset();
+    object.getProperty("tooltip", &value);
+    const base = if (value.getString()) |ptr| std.mem.span(ptr) else "";
+    var page_buf: [1024]u8 = undefined;
+    page.setTooltip(tabTooltip(base, indicator, kind, &page_buf));
 }
 
 fn tabIndicator(tab: *Tab) Indicator {
@@ -436,6 +461,10 @@ test "status and progress tooltips coexist and translate" {
     try testing.expectEqualStrings("超级用户会话 · 出错", combinedTooltip(.{ .busy = true }, .superuser, &buf));
     var tiny: [2]u8 = undefined;
     try testing.expectEqualStrings("远程会话", combinedTooltip(value, .remote, &tiny));
+    try testing.expectEqualStrings("<b>title</b>\n远程会话 · 进度：42%", tabTooltip("<b>title</b>", value, .remote, &buf));
+    try testing.expectEqualStrings("进行中", tabTooltip("", .{ .busy = false }, .local, &buf));
+    try testing.expectEqualStrings("title", tabTooltip("title", .none, .local, &buf));
+    try testing.expectEqualStrings("title", tabTooltip("title", value, .remote, &tiny));
 }
 
 test "errorColor follows the style" {
