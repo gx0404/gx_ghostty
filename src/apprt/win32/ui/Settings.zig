@@ -55,9 +55,10 @@
 //!
 //! The theme list and its swatches and the font families stay between
 //! openings. The font families are listed on a thread of their own
-//! (`system.FontLoader`, `WM_FONTS_READY` when done) every time the Font
-//! section is first shown after opening, and again on `WM_FONTCHANGE`; the
-//! last list shows meanwhile ("Loading…" before the first one).
+//! (`system.FontLoader`, `WM_FONTS_READY` when done) on the first visit to
+//! Font and again after `WM_FONTCHANGE`; the last list shows meanwhile.
+//! F6 focuses the sidebar search; labels, section names and configuration
+//! keys match across all six sections, and Enter reveals a result.
 //!
 //! There is one overlay per process, shown over one window at a time.
 //! `Window` calls `onWindowDestroyed` when a window goes away.
@@ -137,8 +138,6 @@ const herdr_poll_ms = 200;
 const herdr_timeout_ms = 30_000;
 /// The darkness of the backdrop (0-255).
 const scrim_alpha: u8 = 90;
-/// Swatch files read in one paint before the rest wait for `.prefetch`.
-const swatch_reads_per_paint = 16;
 
 const max_rows = 64;
 const max_hits = 192;
@@ -198,6 +197,7 @@ layers: ?Layers = null,
 /// `inputsDigest` of the configuration the app ran with when the overlay
 /// last opened or applied one (`followReload`).
 applied_inputs: u64 = 0,
+applying: bool = false,
 /// Whether the configuration is loaded with the Ghostty GX layers; theme
 /// previews need them.
 layered: bool = true,
@@ -222,7 +222,7 @@ swatches_pending: bool = false,
 fonts: ?system.FontFamilies = null,
 /// Lists the font families in the background.
 font_loader: ?*system.FontLoader = null,
-/// The font families were listed since the overlay opened.
+/// The cached font list is current, until WM_FONTCHANGE.
 fonts_checked: bool = false,
 /// What the font list shows: `fonts` and the configured family.
 font_picker: system.Picker = .{ .names = &.{}, .local_names = &.{} },
@@ -230,6 +230,7 @@ font_picker: system.Picker = .{ .names = &.{}, .local_names = &.{} },
 font_arena: ArenaAllocator,
 font_list: List = .{},
 font_query: std.ArrayList(u8) = .empty,
+search_query: std.ArrayList(u8) = .empty,
 
 shells: []const Shell = &.{},
 shell_selected: usize = 0,
@@ -239,8 +240,6 @@ herdr_run: ?system.HerdrRun = null,
 config_path: []const u8 = "",
 overlay_path: []const u8 = "",
 
-/// The field that receives the typing, if any: a list's filter box or the
-/// font size.
 text_field: ?Field = null,
 
 changes: settings_map.Changes,
@@ -248,6 +247,7 @@ changes: settings_map.Changes,
 save_attempts: u32 = 0,
 timers: std.EnumSet(Timer) = .initEmpty(),
 reset_all: model.Confirm = .{},
+measurements: draw.Measurements = .{},
 
 status_kind: StatusKind = .none,
 status_buf: [512]u8 = undefined,
@@ -275,10 +275,10 @@ const Tip = union(enum) {
 // Opening and closing
 // -----------------------------------------------------------------------
 
-/// Show the settings for `window`; without Direct2D, open the
-/// configuration file instead. Returns false if nothing was shown.
+/// Show the settings for `window`; without Direct2D or GX configuration
+/// layering, open the configuration file instead.
 pub fn show(window: *Window) bool {
-    if (window.app.uiFactory() == null) return openConfigInstead(window.app);
+    if (!gx.config_layers.enabled(window.app.core_app.alloc) or window.app.uiFactory() == null) return openConfigInstead(window.app);
     if (instance) |self| {
         if (self.window == window) {
             if (self.open) {
@@ -314,7 +314,7 @@ pub fn showSection(window: *Window, section: Section) bool {
     if (!show(window)) return false;
     const self = instance orelse return true;
     if (!self.open) return true;
-    if (self.section != section) self.enterSection(section);
+    if (self.section != section or self.searching() or self.text_field == .search) self.enterSection(section);
     return true;
 }
 
@@ -326,9 +326,23 @@ pub fn onWindowDestroyed(window: *Window) void {
     self.destroy();
 }
 
-/// The settings file instead of the overlay (no Direct2D).
+pub fn onConfigChange(app: *App) void {
+    const self = instance orelse return;
+    if (self.app != app or !self.open or self.applying) return;
+    self.stopTimer(.preview);
+    self.preview_theme = null;
+    self.applied_preview = null;
+    self.followReload();
+    self.applied_inputs = inputsDigest(&app.config);
+    self.swatches.deinit(self.alloc);
+    self.loadThemes(&app.config);
+    self.loadShells();
+    self.configApplied(false);
+    self.popup.setAccessibleName(i18n.tr(msg.settings));
+}
+
 fn openConfigInstead(app: *App) bool {
-    log.info("Direct2D is unavailable, opening the configuration file instead of the settings", .{});
+    log.info("opening the configuration file instead of the unavailable settings overlay", .{});
     return app.openConfigFile(.os_open) catch |err| {
         log.warn("cannot open the configuration file err={}", .{err});
         return false;
@@ -357,6 +371,7 @@ fn destroy(self: *Settings) void {
     self.swatches.deinit(self.alloc);
     self.theme_query.deinit(self.alloc);
     self.font_query.deinit(self.alloc);
+    self.search_query.deinit(self.alloc);
     self.theme_list.deinit(self.alloc);
     self.font_list.deinit(self.alloc);
     self.changes.deinit();
@@ -606,7 +621,6 @@ fn loadData(self: *Settings) void {
 
     self.loadThemes(config);
     self.loadShells();
-    self.fonts_checked = false;
     self.updateFontPicker();
 }
 
@@ -625,6 +639,7 @@ fn releaseData(self: *Settings) void {
     self.font_list.clear();
     self.theme_query.clearRetainingCapacity();
     self.font_query.clearRetainingCapacity();
+    self.search_query.clearRetainingCapacity();
     self.shells = &.{};
     self.theme_dirs = &.{};
     self.herdr_exe = null;
@@ -736,14 +751,12 @@ fn overlayValue(self: *Settings, alloc: Allocator, key: []const u8) ?[]const u8 
 // Font families
 // -----------------------------------------------------------------------
 
-/// Lists the font families in the background, once per opening (fonts
-/// can be installed between openings), unless a listing runs.
 fn ensureFonts(self: *Settings) void {
     if (self.fonts_checked or self.font_loader != null) return;
     const hwnd = self.popup.hwnd orelse return;
-    self.font_loader = system.FontLoader.start(self.alloc, hwnd, WM_FONTS_READY, i18n.current() == .zh_CN) catch |err| loader: {
+    self.font_loader = system.FontLoader.start(self.alloc, hwnd, WM_FONTS_READY, true) catch |err| {
         log.warn("cannot list the font families in the background err={}", .{err});
-        break :loader null;
+        return;
     };
     self.fonts_checked = true;
 }
@@ -751,21 +764,22 @@ fn ensureFonts(self: *Settings) void {
 /// `WM_FONTS_READY`: take the new list, keeping the cursor on its family.
 fn onFontsReady(self: *Settings) void {
     const loader = self.font_loader orelse return;
+    var failed = false;
     switch (loader.take()) {
         .running => return,
         .ready => |families| {
-            // The picker points into the old list: note the family under
-            // the cursor before freeing it.
             var keep_buf: [256]u8 = undefined;
             const keep = self.cursorFamily(&keep_buf);
             if (self.fonts) |*old| old.deinit();
             self.fonts = families;
             self.rebuildFontPicker(keep);
         },
-        .failed, .taken => {},
+        .failed, .taken => failed = true,
     }
     loader.detach();
     self.font_loader = null;
+    if (!failed and !self.fonts_checked and self.open and self.section == .font) self.ensureFonts();
+    if (failed) self.fonts_checked = false;
     self.invalidate();
 }
 
@@ -773,6 +787,7 @@ fn onFontsReady(self: *Settings) void {
 fn onFontChange(ctx: *anyopaque) void {
     const self: *Settings = @ptrCast(@alignCast(ctx));
     self.fonts_checked = false;
+    self.measurements.clear();
     if (self.open and self.section == .font) self.ensureFonts();
 }
 
@@ -811,7 +826,7 @@ fn rebuildFontPicker(self: *Settings, keep: ?[]const u8) void {
 // Lists and their filter boxes
 // -----------------------------------------------------------------------
 
-const Field = enum { themes, fonts, font_size };
+const Field = enum { themes, fonts, font_size, search };
 
 /// A filtered list with a cursor.
 const List = struct {
@@ -881,6 +896,7 @@ fn listOf(self: *Settings, field: Field) *List {
     return switch (field) {
         .themes => &self.theme_list,
         .fonts, .font_size => &self.font_list,
+        .search => unreachable,
     };
 }
 
@@ -888,6 +904,7 @@ fn queryOf(self: *Settings, field: Field) *std.ArrayList(u8) {
     return switch (field) {
         .themes => &self.theme_query,
         .fonts, .font_size => &self.font_query,
+        .search => &self.search_query,
     };
 }
 
@@ -895,6 +912,7 @@ fn namesOf(self: *Settings, field: Field) []const [:0]const u8 {
     return switch (field) {
         .themes => if (self.themes) |list| list.names else &.{},
         .fonts, .font_size => self.font_picker.names,
+        .search => unreachable,
     };
 }
 
@@ -910,11 +928,20 @@ fn listField(action: Action) ?Field {
 /// Matches the names of `field` against its filter text; font families
 /// also by their name in the user's language.
 fn refilter(self: *Settings, field: Field) void {
+    if (field == .search) {
+        var buf: [max_rows]Row = undefined;
+        const rows = self.buildRows(&buf);
+        self.focus = firstFocusable(rows) orelse 0;
+        self.body_scroll = 0;
+        self.reveal_focus = true;
+        return;
+    }
     const list = self.listOf(field);
     const query = self.queryOf(field).items;
     const result = switch (field) {
         .themes => fuzzy.filter(self.alloc, self.namesOf(field), query, &list.matches),
         .fonts, .font_size => filterNames(self.alloc, self.font_picker.names, self.font_picker.local_names, query, &list.matches),
+        .search => unreachable,
     };
     result catch |err| {
         log.warn("cannot filter the list err={}", .{err});
@@ -979,6 +1006,7 @@ fn filterNames(
 /// Gives the filter box of the focused list, if any, the text input; a
 /// size being typed is applied when the focus moves on.
 fn syncTextField(self: *Settings) void {
+    if (self.searching()) return;
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
     const want: ?Field = if (self.focus < rows.len) listField(rows[self.focus].action) else null;
@@ -993,6 +1021,15 @@ fn syncTextField(self: *Settings) void {
     } else {
         self.popup.input.clear();
     }
+}
+
+fn focusSearch(self: *Settings, select: bool) void {
+    self.endSizeEdit(true);
+    if (self.text_field != .search) self.popup.input.setText(self.alloc, self.search_query.items) catch {};
+    self.text_field = .search;
+    if (select) self.popup.input.anchor = 0;
+    self.stopTimer(.preview);
+    self.invalidate();
 }
 
 fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
@@ -1010,8 +1047,6 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
     self.invalidate();
 }
 
-/// Typing outside a text field: digits on the font size start typing a
-/// size; on a page with a list, the text goes to its filter box.
 fn typedElsewhere(self: *Settings, popup: *Popup) void {
     const typed = popup.input.text(self.alloc) catch return popup.input.clear();
     defer self.alloc.free(typed);
@@ -1020,13 +1055,13 @@ fn typedElsewhere(self: *Settings, popup: *Popup) void {
     if (typed.len > 0 and self.focus < rows.len and rows[self.focus].action == .font_size and model.startsFontSize(typed[0])) {
         return self.beginSizeEdit(typed, false);
     }
-    const list_index = for (rows, 0..) |row, i| {
+    const list_index: ?usize = for (rows, 0..) |row, i| {
         if (listField(row.action) != null) break i;
-    } else return popup.input.clear();
-    const field = listField(rows[list_index].action).?;
+    } else null;
+    const field: Field = if (list_index) |index| listField(rows[index].action).? else .search;
     const query = self.queryOf(field);
     query.appendSlice(self.alloc, typed) catch {};
-    self.focus = list_index;
+    if (list_index) |index| self.focus = index;
     self.focus_visible = true;
     self.reveal_focus = true;
     self.text_field = field;
@@ -1099,10 +1134,19 @@ const RowKind = enum {
     button,
     /// A line of text in the font being picked.
     sample,
+    /// A setting the search found, with the section it is in.
+    result,
+};
+
+/// A row of a section, as a search result points at it.
+const Goto = struct {
+    section: Section,
+    row: u16,
 };
 
 const Action = union(enum) {
     none,
+    goto: Goto,
     language: i18n.Language,
     material,
     opacity,
@@ -1250,12 +1294,75 @@ const keys_ctrl_scroll_zoom: []const []const u8 = &.{settings_map.ctrl_scroll_zo
 const keys_bell: []const []const u8 = &.{"bell-features"};
 const keys_command: []const []const u8 = &.{"command"};
 
-/// The rows of the current section. Dynamic strings live in `scratch`
+/// The rows of the body: the settings the search finds while it has text,
+/// else the rows of the current section. Dynamic strings live in `scratch`
 /// until the next paint.
 fn buildRows(self: *Settings, buf: *[max_rows]Row) []Row {
+    if (self.searching()) return self.buildSearchRows(buf);
+    return self.buildSectionRows(self.section, buf);
+}
+
+/// Whether the search has text, so the body shows what it finds.
+fn searching(self: *const Settings) bool {
+    return !fuzzy.isBlank(self.search_query.items);
+}
+
+/// The settings of every section whose title, or the title of the group
+/// it is in, matches the search: a group row per section, a result row
+/// per setting pointing at its row (`Goto`).
+fn buildSearchRows(self: *Settings, buf: *[max_rows]Row) []Row {
+    var rows: RowList = .{ .buf = buf };
+    const query: fuzzy.Query = .init(self.search_query.items);
+    var section_buf: [max_rows]Row = undefined;
+    for (std.enums.values(Section)) |section| {
+        const section_rows = self.buildSectionRows(section, &section_buf);
+        appendSearchRows(&rows, section, sectionTitle(section), section_rows, &query, self.scratch.allocator());
+    }
+    if (rows.len == 0) rows.add(.{ .kind = .note, .detail = i18n.tr("No matching settings") });
+    return rows.items();
+}
+
+fn appendSearchRows(out: *RowList, section: Section, section_title: []const u8, rows: []const Row, query: *const fuzzy.Query, alloc: Allocator) void {
+    var group: []const u8 = "";
+    var found = false;
+    for (rows, 0..) |row, i| {
+        switch (row.kind) {
+            .group => {
+                group = row.title;
+                continue;
+            },
+            .radio, .toggle, .choice, .stepper, .list, .button => {},
+            .note, .info, .sample, .result => continue,
+        }
+        const title = if (row.kind == .list or row.title.len == 0) group else row.title;
+        if (title.len == 0) continue;
+        var text: std.Io.Writer.Allocating = .init(alloc);
+        defer text.deinit();
+        text.writer.print("{s} {s} {s}", .{ section_title, group, title }) catch continue;
+        for (row.keys) |key| text.writer.print(" {s}", .{key}) catch {};
+        if (fuzzy.score(query, text.written()) == null) continue;
+        if (!found) {
+            found = true;
+            out.add(.{ .kind = .group, .title = section_title });
+        }
+        const where = if (group.len > 0 and !std.mem.eql(u8, group, title))
+            std.fmt.allocPrint(alloc, "{s} \u{203A} {s}", .{ section_title, group }) catch section_title
+        else
+            section_title;
+        out.add(.{
+            .kind = .result,
+            .action = .{ .goto = .{ .section = section, .row = @intCast(i) } },
+            .title = title,
+            .detail = where,
+        });
+    }
+}
+
+/// The rows of `section`.
+fn buildSectionRows(self: *Settings, section: Section, buf: *[max_rows]Row) []Row {
     var rows: RowList = .{ .buf = buf };
     const scratch = self.scratch.allocator();
-    switch (self.section) {
+    switch (section) {
         .language => {
             rows.add(self.settingGroup(scratch, i18n.tr(msg.interface_language), keys_language, "", &.{}));
             for (std.enums.values(i18n.Language)) |lang| {
@@ -1459,13 +1566,13 @@ fn buildRows(self: *Settings, buf: *[max_rows]Row) []Row {
             rows.add(.{
                 .kind = .button,
                 .action = .reset_all,
-                .title = i18n.tr("Reset All Settings"),
+                .title = i18n.tr("Reset Interface Settings"),
                 .icon = draw.icons.reset,
             });
             rows.add(.{
                 .kind = .note,
                 .detail = if (self.reset_all.armed(system.nowMs()))
-                    i18n.tr("Press Reset All Settings again to confirm.")
+                    i18n.tr("Press Reset Interface Settings again to confirm.")
                 else
                     i18n.tr("Removes every setting made here, so the configuration file and the defaults apply again."),
                 .detail_warning = self.reset_all.armed(system.nowMs()),
@@ -1544,8 +1651,24 @@ fn firstFocusable(rows: []const Row) ?usize {
     return null;
 }
 
+fn gotoSetting(self: *Settings, target: Goto) void {
+    self.enterSection(target.section);
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildRows(&buf);
+    if (target.row >= rows.len or !rows[target.row].focusable()) return;
+    self.focus = target.row;
+    self.focus_button = 0;
+    self.focus_visible = true;
+    self.reveal_focus = true;
+    self.syncTextField();
+    self.invalidate();
+}
+
 fn enterSection(self: *Settings, section: Section) void {
     self.endSizeEdit(true);
+    self.search_query.clearRetainingCapacity();
+    self.text_field = null;
+    self.popup.input.clear();
     self.section = section;
     self.body_scroll = 0;
     self.hover = null;
@@ -1600,6 +1723,7 @@ fn firstFocusableBefore(rows: []const Row, end: usize) ?usize {
 fn activate(self: *Settings, row: Row) void {
     switch (row.action) {
         .none, .font_size => {},
+        .goto => |target| self.gotoSetting(target),
         .language => |lang| self.setLanguage(lang),
         .material, .opacity, .padding, .cursor_style, .close_confirmation => self.stepChoice(row, 1),
         .themes => self.applyTheme(),
@@ -1773,20 +1897,15 @@ fn resetRow(self: *Settings, row: Row) void {
     _ = self.saveNow();
 }
 
-/// "Reset All Settings", pressed twice: removes every key of the settings
-/// file.
 fn resetAll(self: *Settings) void {
     if (!self.reset_all.press(system.nowMs())) return self.invalidate();
     if (self.overlay_path.len == 0) return;
-    var overlay = gx.gui_settings.Overlay.load(self.alloc, global.io(), self.overlay_path) catch |err| {
-        log.warn("cannot read {s} err={}", .{ self.overlay_path, err });
-        return self.setStatusReason(.err, msg.save_failed, err);
-    };
-    defer overlay.deinit();
-    for (overlay.lines.items) |line| {
-        const key = model.lineKey(line) orelse continue;
-        self.queueReset(&.{key});
-    }
+    for ([_][]const []const u8{
+        keys_language,     keys_material, keys_opacity,             keys_padding,          keys_cursor_style,
+        keys_cursor_blink, keys_theme,    keys_font_size,           keys_font_family,      keys_right_click,
+        keys_scrollbar,    keys_close,    keys_focus_follows_mouse, keys_ctrl_scroll_zoom, keys_bell,
+        keys_command,
+    }) |keys| self.queueReset(keys);
     self.stopTimer(.preview);
     self.preview_theme = null;
     self.applied_preview = null;
@@ -1859,8 +1978,8 @@ fn previewNow(self: *Settings) void {
     const index = self.preview_theme orelse return;
     if (self.applied_preview == index) return;
     const name = self.themeName(index) orelse return;
-    // Pending changes go to the file first so the preview keeps them; a
-    // failed save leaves its message.
+    const span: gx.perf.Span = .begin(global.io());
+    defer _ = span.end(global.io(), "settings_preview");
     const saved = self.commitChanges();
     if (self.applyConfig(name)) {
         self.applied_preview = index;
@@ -1983,6 +2102,8 @@ fn applyConfig(self: *Settings, theme: ?[]const u8) bool {
     self.followReload();
     var config = self.buildConfig(args[0..len]) catch |err| return self.applyFailed(preview, err);
     defer config.deinit();
+    self.applying = true;
+    defer self.applying = false;
     self.app.applyConfig(&config) catch |err| return self.applyFailed(preview, err);
     self.applied_inputs = inputsDigest(&self.app.config);
     if (!preview) self.applied_preview = null;
@@ -2249,6 +2370,7 @@ fn clearStatus(self: *Settings) void {
 
 const Target = union(enum) {
     section: Section,
+    search,
     close,
     row: u16,
     chip: struct { row: u16, index: u8 },
@@ -2333,6 +2455,30 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
     }
     if (key.alt) return false;
     self.tooltip.hide();
+    if (key.vk == w32.VK_F6 or (key.ctrl and key.vk == 'F')) {
+        self.focusSearch(true);
+        return true;
+    }
+    if (self.text_field == .search) {
+        switch (key.vk) {
+            w32.VK_LEFT, w32.VK_RIGHT, w32.VK_HOME, w32.VK_END, w32.VK_BACK, w32.VK_DELETE, w32.VK_SPACE => return false,
+            w32.VK_RETURN => {
+                var buf: [max_rows]Row = undefined;
+                const rows = self.buildRows(&buf);
+                if (self.searching() and self.focus < rows.len) self.activate(rows[self.focus]);
+                return true;
+            },
+            w32.VK_UP, w32.VK_DOWN => if (!self.searching()) {
+                self.text_field = null;
+                self.popup.input.clear();
+                self.syncTextField();
+                self.focus_visible = true;
+                self.invalidate();
+                return true;
+            },
+            else => {},
+        }
+    }
 
     if (self.text_field == .font_size) {
         switch (key.vk) {
@@ -2480,6 +2626,10 @@ fn clearQuery(self: *Settings, field: Field) void {
     switch (field) {
         .themes => if (self.preview_theme orelse self.saved_theme) |index| self.theme_list.select(index),
         .fonts, .font_size => if (self.font_picker.indexOf(self.font_family)) |index| self.font_list.select(index),
+        .search => {
+            var buf: [max_rows]Row = undefined;
+            self.focus = self.defaultFocus(self.buildRows(&buf));
+        },
     }
     self.invalidate();
 }
@@ -2532,6 +2682,7 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
     switch (target) {
+        .search => self.focusSearch(false),
         .item => |item| {
             if (item.row >= rows.len) return;
             self.focusRow(item.row);
@@ -2582,7 +2733,7 @@ fn click(self: *Settings, target: Target) void {
             if (i >= rows.len) return;
             self.focusRow(i);
             switch (rows[i].kind) {
-                .radio, .toggle, .button => self.activate(rows[i]),
+                .radio, .toggle, .button, .result => self.activate(rows[i]),
                 else => {},
             }
         },
@@ -2591,7 +2742,7 @@ fn click(self: *Settings, target: Target) void {
             self.focusRow(chip.row);
             self.setChoice(rows[chip.row], chip.index);
         },
-        .step, .value, .item, .field => {},
+        .step, .value, .item, .field, .search => {},
     }
     self.invalidate();
 }
@@ -2668,6 +2819,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     self.hit_count = 0;
     self.hit_clip = null;
     self.list_area = null;
+    self.popup.input.field = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     const t = self.tokens();
     const size = popup.sizeDip();
     const w = size.width;
@@ -2713,10 +2865,23 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
         .color = t.text,
     });
 
-    var y: f32 = 64;
+    const search: d2d.Rect = .{ .x = 10, .y = 58, .w = sidebar_width - 20, .h = field_height };
+    if (self.text_field == .search) {
+        self.popup.drawTextInputEx(canvas, search, t, .{ .placeholder = i18n.tr("Search settings…"), .focused = true });
+    } else {
+        canvas.fillRoundedRect(search, 4, t.surface_raised);
+        canvas.strokeRoundedRect(search, 4, t.border, 1);
+        canvas.drawText(i18n.tr("Search settings…"), search.inset(style.metrics.padding_x, 0), .{
+            .size = style.font_size.body,
+            .color = t.text_placeholder,
+        });
+    }
+    self.addHit(search, .search);
+
+    var y: f32 = 104;
     for (std.enums.values(Section)) |section| {
         const item: d2d.Rect = .{ .x = 10, .y = y, .w = sidebar_width - 20, .h = 36 };
-        const selected = section == self.section;
+        const selected = section == self.section and !self.searching();
         const state = self.stateOf(.{ .section = section }, true);
         if (selected) {
             canvas.fillRoundedRect(item, 4, t.selected);
@@ -2738,7 +2903,7 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
 }
 
 fn paintHeader(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, w: f32) void {
-    canvas.drawText(sectionTitle(self.section), .{
+    canvas.drawText(if (self.searching()) i18n.tr("Search Settings") else sectionTitle(self.section), .{
         .x = sidebar_width + content_pad,
         .y = 16,
         .w = @max(0, w - sidebar_width - content_pad - 64),
@@ -2767,20 +2932,18 @@ fn paintFooter(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, rect: d2d.
     else
         i18n.tr("Close");
     const hints = [_]struct { []const u8, []const u8 }{
-        .{ "Tab", i18n.tr("Switch Section") },
+        .{ if (self.searching()) "Enter" else "Tab", if (self.searching()) i18n.tr("Open") else i18n.tr("Switch Section") },
         .{ "Esc", esc },
     };
     var hints_w: f32 = 0;
     var widths: [hints.len]f32 = undefined;
     for (hints, &widths, 0..) |hint, *width, i| {
-        width.* = draw.keyHintWidth(canvas, hint[0], hint[1]);
+        width.* = draw.keyHintWidth(canvas, &self.measurements, hint[0], hint[1]);
         hints_w += width.* + if (i > 0) @as(f32, 16) else 0;
     }
 
-    // A message that does not fit next to the key hints takes the whole
-    // line, wrapped.
     const full_w = @max(0, rect.w - 2 * content_pad);
-    const fits = canvas.measureText(text, text_style, 10_000).width <= full_w - hints_w - 16;
+    const fits = self.measurements.measure(canvas, text, text_style, 10_000).width <= full_w - hints_w - 16;
     if (!fits) text_style.wrap = true;
     canvas.drawText(text, .{
         .x = rect.x + content_pad,
@@ -2791,7 +2954,7 @@ fn paintFooter(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, rect: d2d.
     if (!fits) return;
     var x = rect.x + rect.w - content_pad - hints_w;
     for (hints, widths) |hint, width| {
-        _ = draw.keyHint(canvas, x, rect.y, rect.h, hint[0], hint[1], t);
+        _ = draw.keyHint(canvas, &self.measurements, x, rect.y, rect.h, hint[0], hint[1], t);
         x += width + 16;
     }
 }
@@ -2871,7 +3034,6 @@ fn paintBody(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, body: d2d.Re
 }
 
 fn rowGeometry(self: *Settings, canvas: *d2d.Canvas, row: Row, width: f32) Geometry {
-    _ = self;
     return switch (row.kind) {
         .group => {
             var h: f32 = 34;
@@ -2879,16 +3041,16 @@ fn rowGeometry(self: *Settings, canvas: *d2d.Canvas, row: Row, width: f32) Geome
             return .{ .height = h };
         },
         .note => .{ .height = measureWrapped(canvas, row.detail, width) + 4 },
-        .radio, .toggle => .{ .height = if (row.detail.len > 0) card_height_detail else card_height },
+        .radio, .toggle, .result => .{ .height = if (row.detail.len > 0) card_height_detail else card_height },
         .stepper => .{ .height = if (row.detail.len > 0) card_height_detail else choice_height },
         .choice => {
             const base: f32 = if (row.detail.len > 0) card_height_detail else choice_height;
             const body_style: d2d.TextStyle = .{ .size = style.font_size.body, .ellipsis = false };
             const caption_style: d2d.TextStyle = .{ .size = style.font_size.caption, .ellipsis = false };
-            var title_w = canvas.measureText(row.title, body_style, 10_000).width;
-            if (row.detail.len > 0) title_w = @max(title_w, canvas.measureText(row.detail, caption_style, 10_000).width);
+            var title_w = self.measurements.measure(canvas, row.title, body_style, 10_000).width;
+            if (row.detail.len > 0) title_w = @max(title_w, self.measurements.measure(canvas, row.detail, caption_style, 10_000).width);
             const reset_w: f32 = if (row.resettable) draw.icon_button_size + 8 else 0;
-            const wrap = model.chipsWrap(title_w, draw.chipsWidth(canvas, row.choices) + reset_w, 16, width - 32);
+            const wrap = model.chipsWrap(title_w, draw.chipsWidth(canvas, &self.measurements, row.choices) + reset_w, 16, width - 32);
             return .{ .height = if (wrap) base + chip_line else base, .wrap = wrap };
         },
         .info => .{ .height = card_height_detail },
@@ -2936,7 +3098,7 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
                     self.addHit(brect, target);
                 } else {
                     const label = i18n.tr(msg.apply);
-                    const bw = draw.buttonWidth(canvas, label, null);
+                    const bw = draw.buttonWidth(canvas, &self.measurements, label, null);
                     bx -= bw;
                     const brect: d2d.Rect = .{ .x = bx, .y = rect.y + 2, .w = bw, .h = draw.button_height };
                     draw.button(canvas, brect, label, null, .primary, state, t);
@@ -2953,6 +3115,12 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
             return;
         },
         .note => return canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 2, .w = rect.w, .h = rect.h }, captionStyle(t, row.detail_warning)),
+        .result => {
+            draw.card(canvas, rect, t, row_state);
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = rect.w - 60, .h = rect.h });
+            canvas.drawIcon(0xE76C, .{ .x = rect.x + rect.w - 32, .y = rect.y, .w = 20, .h = rect.h }, 12, t.text_secondary);
+            self.addHit(rect, .{ .row = index });
+        },
         .radio => {
             draw.card(canvas, rect, t, row_state);
             draw.radio(canvas, .{ .x = rect.x + 12, .y = rect.y, .w = 24, .h = rect.h }, row.on, row_state, t);
@@ -2977,13 +3145,13 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
             draw.card(canvas, rect, t, .{});
             self.addHit(rect, .{ .row = index });
             const head_h = if (geometry.wrap) rect.h - chip_line else rect.h;
-            const chips_w = draw.chipsWidth(canvas, row.choices);
+            const chips_w = draw.chipsWidth(canvas, &self.measurements, row.choices);
             const chips_left = rect.x + rect.w - 12 - chips_w;
             var cx = if (geometry.wrap) rect.x + 16 else chips_left;
             const cy = if (geometry.wrap) rect.y + head_h - 2 else rect.y + (rect.h - draw.chip_height) / 2;
             for (row.choices, 0..) |label, i| {
                 if (i >= 8) break;
-                const chip_w = draw.chipWidth(canvas, label);
+                const chip_w = draw.chipWidth(canvas, &self.measurements, label);
                 const chip_rect: d2d.Rect = .{ .x = cx, .y = cy, .w = chip_w, .h = draw.chip_height };
                 const enabled = row.disabled & (@as(u8, 1) << @intCast(i)) == 0;
                 const target: Target = .{ .chip = .{ .row = index, .index = @intCast(i) } };
@@ -3036,7 +3204,7 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
             return;
         },
         .button => {
-            const bw = draw.buttonWidth(canvas, row.title, row.icon);
+            const bw = draw.buttonWidth(canvas, &self.measurements, row.title, row.icon);
             const brect: d2d.Rect = .{ .x = rect.x, .y = rect.y + 4, .w = bw, .h = draw.button_height };
             var state = row_state;
             state.focused = ring;
@@ -3108,6 +3276,7 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     const placeholder = switch (field) {
         .themes => i18n.tr(msg.search_themes),
         .fonts, .font_size => i18n.tr("Search font families…"),
+        .search => unreachable,
     };
 
     // The filter box.
@@ -3148,6 +3317,7 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
                 i18n.tr("Loading font families…")
             else
                 i18n.tr("No matching fonts"),
+            .search => unreachable,
         };
         canvas.drawText(empty, box, .{ .size = style.font_size.body, .color = t.text_secondary, .align_x = .center });
         return;
@@ -3159,8 +3329,8 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     const saved: ?u32 = switch (field) {
         .themes => self.saved_theme,
         .fonts, .font_size => self.font_picker.indexOf(self.font_family),
+        .search => unreachable,
     };
-    var reads: usize = 0;
     var i = list.top;
     while (i < matches.len and i < list.top + visible) : (i += 1) {
         const name_index = matches[i];
@@ -3189,9 +3359,6 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
             };
             if (self.swatches.map.get(name_index)) |colors| {
                 draw.themeSwatch(canvas, swatch_rect, colors, t);
-            } else if (reads < swatch_reads_per_paint) {
-                reads += 1;
-                draw.themeSwatch(canvas, swatch_rect, self.swatches.get(self.alloc, global.io(), self.theme_dirs, name_index, names[name_index]), t);
             } else {
                 draw.swatchPlaceholder(canvas, swatch_rect, t);
                 self.swatches_pending = true;
@@ -3277,6 +3444,73 @@ test "the inputs digest follows the recorded inputs" {
     try testing.expectEqual(inputsDigest(&a), inputsDigest(&b));
     try gx.config_layers.applyArg(&b, testing.allocator, "--font-size=15");
     try testing.expect(inputsDigest(&a) != inputsDigest(&b));
+}
+
+test "settings search matches labels, sections, keys and pinyin" {
+    const testing = std.testing;
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const source = [_]Row{
+        .{ .kind = .group, .title = "字体" },
+        .{ .kind = .stepper, .action = .font_size, .title = "字号", .keys = keys_font_size },
+        .{ .kind = .list, .action = .font_family, .keys = keys_font_family },
+        .{ .kind = .note, .detail = "font-size" },
+    };
+    for ([_][]const u8{ "font-size", "字号", "zihao", "zh", "字体 字号", "ＦＯＮＴ－ＳＩＺＥ" }) |pattern| {
+        var buf: [max_rows]Row = undefined;
+        var out: RowList = .{ .buf = &buf };
+        const query: fuzzy.Query = .init(pattern);
+        appendSearchRows(&out, .font, "Font", &source, &query, alloc);
+        if (std.mem.eql(u8, pattern, "zihao")) {
+            try testing.expectEqual(@as(usize, 0), out.len);
+            continue;
+        }
+        try testing.expect(out.len >= 2);
+        try testing.expectEqual(RowKind.group, out.items()[0].kind);
+        try testing.expectEqual(RowKind.result, out.items()[1].kind);
+        try testing.expectEqual(Section.font, out.items()[1].action.goto.section);
+        try testing.expectEqual(@as(u16, 1), out.items()[1].action.goto.row);
+    }
+    var buf: [max_rows]Row = undefined;
+    var out: RowList = .{ .buf = &buf };
+    const query: fuzzy.Query = .init("font-family");
+    appendSearchRows(&out, .font, "Font", &source, &query, alloc);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(u16, 2), out.items()[1].action.goto.row);
+    try testing.expectEqualStrings("字体", out.items()[1].title);
+}
+
+test "a search result clears the query and reveals its setting without changing it" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+        .text_field = .search,
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.search_query.deinit(testing.allocator);
+    try self.search_query.appendSlice(testing.allocator, "font-size");
+    const original = self.values.font_size;
+    self.gotoSetting(.{ .section = .font, .row = 0 });
+    try testing.expectEqual(Section.font, self.section);
+    try testing.expectEqual(@as(usize, 0), self.focus);
+    try testing.expect(self.focus_visible and self.reveal_focus);
+    try testing.expectEqual(@as(usize, 0), self.search_query.items.len);
+    try testing.expect(self.text_field == null);
+    try testing.expectEqual(original, self.values.font_size);
+    try testing.expect(self.changes.isEmpty());
 }
 
 test {

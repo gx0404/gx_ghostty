@@ -3,7 +3,60 @@
 //! the Fluent look of `ui/style.zig`, with the hover, pressed and disabled
 //! states of `ui/controls.zig` (pressed fainter than hovered). Everything
 //! is in DIPs on a `d2d.Canvas`.
+const std = @import("std");
+const i18n = @import("../../../../gx/i18n.zig");
 const ui_color = @import("../../../../gx/ui_color.zig");
+
+pub const Measurements = struct {
+    entries: [128]Entry = undefined,
+    len: usize = 0,
+    next: usize = 0,
+
+    const Entry = struct { key: u64, size: d2d.Size };
+
+    pub fn clear(self: *Measurements) void {
+        self.len = 0;
+        self.next = 0;
+    }
+
+    fn get(self: *const Measurements, key: u64) ?d2d.Size {
+        for (self.entries[0..self.len]) |entry| if (entry.key == key) return entry.size;
+        return null;
+    }
+
+    fn put(self: *Measurements, key: u64, size: d2d.Size) void {
+        self.entries[self.next] = .{ .key = key, .size = size };
+        self.len = @min(self.len + 1, self.entries.len);
+        self.next = (self.next + 1) % self.entries.len;
+    }
+
+    pub fn measure(self: *Measurements, canvas: *d2d.Canvas, text: []const u8, text_style: d2d.TextStyle, width: f32) d2d.Size {
+        const key = measurementKey(text, text_style, width, canvas.dpi, i18n.current());
+        if (self.get(key)) |size| return size;
+        const size = canvas.measureText(text, text_style, width);
+        self.put(key, size);
+        return size;
+    }
+};
+
+fn measurementKey(text: []const u8, text_style: d2d.TextStyle, width: f32, dpi: f32, language: i18n.Language) u64 {
+    var hash: std.hash.Wyhash = .init(0);
+    const parameters = [_]u32{
+        @intFromEnum(text_style.font),
+        @intFromEnum(text_style.weight),
+        @intFromBool(text_style.wrap),
+        @bitCast(text_style.size),
+        @bitCast(text_style.line_height),
+        @bitCast(width),
+        @bitCast(dpi),
+        @intFromEnum(language),
+        @intCast(text_style.family.len),
+    };
+    hash.update(std.mem.asBytes(&parameters));
+    hash.update(text_style.family);
+    hash.update(text);
+    return hash.final();
+}
 const d2d = @import("../d2d.zig");
 const controls = @import("../controls.zig");
 const style = @import("../style.zig");
@@ -143,17 +196,17 @@ fn labelStyle(t: Tokens) d2d.TextStyle {
 
 /// The width of a chip showing `label` (measured semibold, like a selected
 /// chip).
-pub fn chipWidth(canvas: *d2d.Canvas, label: []const u8) f32 {
+pub fn chipWidth(canvas: *d2d.Canvas, measurements: *Measurements, label: []const u8) f32 {
     var s = label_style;
     s.weight = .semibold;
-    return @ceil(canvas.measureText(label, s, 1000).width) + 24;
+    return @ceil(measurements.measure(canvas, label, s, 1000).width) + 24;
 }
 
 /// The width of the chips for `labels`, with `chip_gap` between them.
-pub fn chipsWidth(canvas: *d2d.Canvas, labels: []const []const u8) f32 {
+pub fn chipsWidth(canvas: *d2d.Canvas, measurements: *Measurements, labels: []const []const u8) f32 {
     var total: f32 = 0;
     for (labels, 0..) |label, i| {
-        total += chipWidth(canvas, label);
+        total += chipWidth(canvas, measurements, label);
         if (i > 0) total += chip_gap;
     }
     return total;
@@ -187,8 +240,8 @@ pub fn chip(canvas: *d2d.Canvas, rect: Rect, label: []const u8, selected: bool, 
 pub const ButtonKind = enum { normal, primary, subtle };
 
 /// The width of a button with an optional icon and a label.
-pub fn buttonWidth(canvas: *d2d.Canvas, label: []const u8, icon: ?u21) f32 {
-    var w = @ceil(canvas.measureText(label, label_style, 1000).width) + 28;
+pub fn buttonWidth(canvas: *d2d.Canvas, measurements: *Measurements, label: []const u8, icon: ?u21) f32 {
+    var w = @ceil(measurements.measure(canvas, label, label_style, 1000).width) + 28;
     if (icon != null) w += 22;
     if (label.len == 0) w = button_height;
     return w;
@@ -234,24 +287,24 @@ pub fn iconButton(canvas: *d2d.Canvas, rect: Rect, glyph: u21, state: State, t: 
 
 /// A key cap like `Esc`, followed by its description; returns the width
 /// used.
-pub fn keyHint(canvas: *d2d.Canvas, x: f32, y: f32, h: f32, key: []const u8, label: []const u8, t: Tokens) f32 {
+pub fn keyHint(canvas: *d2d.Canvas, measurements: *Measurements, x: f32, y: f32, h: f32, key: []const u8, label: []const u8, t: Tokens) f32 {
     const small: d2d.TextStyle = .{ .size = style.font_size.caption, .color = t.text_secondary, .align_y = .center, .ellipsis = false };
     var cap_style = small;
     cap_style.align_x = .center;
-    const cap_w = @ceil(canvas.measureText(key, cap_style, 200).width) + 12;
+    const cap_w = @ceil(measurements.measure(canvas, key, cap_style, 200).width) + 12;
     const cap: Rect = .{ .x = x, .y = y + (h - 20) / 2, .w = cap_w, .h = 20 };
     canvas.fillRoundedRect(cap, 4, t.surface);
     canvas.strokeRoundedRect(cap, 4, t.border, 1);
     canvas.drawText(key, cap, cap_style);
-    const label_w = @ceil(canvas.measureText(label, small, 400).width);
+    const label_w = @ceil(measurements.measure(canvas, label, small, 400).width);
     canvas.drawText(label, .{ .x = x + cap_w + 6, .y = y, .w = label_w + 2, .h = h }, small);
     return cap_w + 6 + label_w;
 }
 
 /// The width `keyHint` uses.
-pub fn keyHintWidth(canvas: *d2d.Canvas, key: []const u8, label: []const u8) f32 {
+pub fn keyHintWidth(canvas: *d2d.Canvas, measurements: *Measurements, key: []const u8, label: []const u8) f32 {
     const small: d2d.TextStyle = .{ .size = style.font_size.caption, .ellipsis = false };
-    return @ceil(canvas.measureText(key, small, 200).width) + 12 + 6 + @ceil(canvas.measureText(label, small, 400).width);
+    return @ceil(measurements.measure(canvas, key, small, 200).width) + 12 + 6 + @ceil(measurements.measure(canvas, label, small, 400).width);
 }
 
 /// The colors of a theme: its background with "Aa" in the foreground and
@@ -302,4 +355,36 @@ pub fn fontSample(canvas: *d2d.Canvas, rect: Rect, family: []const u8, size: f32
 
 fn rgb(c: swatch.Rgb) Color {
     return Color.rgb(c.r, c.g, c.b);
+}
+
+test "measurement keys follow layout, locale and DPI but not colors" {
+    const expect = std.testing.expect;
+    const s: d2d.TextStyle = .{};
+    const key = measurementKey("Apply", s, 400, 144, .en);
+    var changed = s;
+    changed.color = Color.rgb(0, 0, 0);
+    try expect(key == measurementKey("Apply", changed, 400, 144, .en));
+    try expect(key != measurementKey("Close", s, 400, 144, .en));
+    try expect(key != measurementKey("Apply", s, 300, 144, .en));
+    try expect(key != measurementKey("Apply", s, 400, 96, .en));
+    try expect(key != measurementKey("Apply", s, 400, 144, .zh_CN));
+    changed = s;
+    changed.size = 18;
+    try expect(key != measurementKey("Apply", changed, 400, 144, .en));
+    changed = s;
+    changed.family = "Consolas";
+    try expect(key != measurementKey("Apply", changed, 400, 144, .en));
+}
+
+test "measurement cache is bounded and can be invalidated" {
+    var cache: Measurements = .{};
+    cache.put(1, .{ .width = 20, .height = 18 });
+    try std.testing.expectEqual(@as(f32, 20), cache.get(1).?.width);
+    for (2..130) |key| cache.put(key, .{ .width = @floatFromInt(key), .height = 18 });
+    try std.testing.expectEqual(cache.entries.len, cache.len);
+    try std.testing.expect(cache.get(1) == null);
+    try std.testing.expect(cache.get(129) != null);
+    cache.clear();
+    try std.testing.expectEqual(@as(usize, 0), cache.len);
+    try std.testing.expect(cache.get(129) == null);
 }

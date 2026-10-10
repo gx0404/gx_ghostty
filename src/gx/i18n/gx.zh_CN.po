@@ -898,3 +898,18 @@ msgstr "删除在这里做的全部设置，重新使用配置文件和默认值
 
 msgid "Every setting made here was removed."
 msgstr "已删除在这里做的全部设置。"
+
+msgid "Search settings…"
+msgstr "搜索设置…"
+
+msgid "Search Settings"
+msgstr "搜索设置"
+
+msgid "No matching settings"
+msgstr "没有匹配的设置"
+
+msgid "Reset Interface Settings"
+msgstr "重置界面设置"
+
+msgid "Press Reset Interface Settings again to confirm."
+msgstr "再按一次“重置界面设置”以确认。"
