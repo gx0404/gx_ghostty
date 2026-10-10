@@ -189,14 +189,21 @@ const ProcessName = struct {
     /// The program is the shell or another idle process.
     idle: bool = false,
     kind: gx.leader.Kind = .local,
+    /// The shell (the process the terminal started).
+    shell_len: u8 = 0,
+    shell_buf: [32]u8 = undefined,
 
     fn name(self: *const ProcessName) []const u8 {
         return self.buf[0..self.len];
     }
 
+    fn shell(self: *const ProcessName) []const u8 {
+        return self.shell_buf[0..self.shell_len];
+    }
+
     fn eql(a: *const ProcessName, b: *const ProcessName) bool {
         return a.surface == b.surface and a.wsl == b.wsl and a.idle == b.idle and a.kind == b.kind and
-            std.mem.eql(u8, a.name(), b.name());
+            std.mem.eql(u8, a.name(), b.name()) and std.mem.eql(u8, a.shell(), b.shell());
     }
 };
 
@@ -415,6 +422,18 @@ fn scrollBy(self: *TabBar, lay: TitleBar.Layout, dips: f32) void {
     self.scroll = next;
     self.reveal_pending = false;
     self.invalidate();
+    self.rehover(lay);
+}
+
+/// The tabs moved under a pointer that stayed: hover what is under it now.
+fn rehover(self: *TabBar, lay: TitleBar.Layout) void {
+    if (self.drag != null) return;
+    const hwnd = self.window().hwnd orelse return;
+    var cursor: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&cursor) == 0) return;
+    _ = w32.ScreenToClient(hwnd, &cursor);
+    const g = self.geometry(lay);
+    self.setHover(self.partAt(&g, cursor.x, cursor.y));
 }
 
 // -----------------------------------------------------------------------
@@ -951,20 +970,26 @@ fn labelOf(self: *const TabBar, i: usize, buf: []u8) tab_layout.Label {
     const win = self.windowConst();
     const title = utf16ToUtf8(buf, win.tab_titles[i][0..win.tab_title_lens[i]]);
     const entry = self.processFor(i);
-    const program: ?tab_layout.Program = if (entry) |e| .{ .name = e.name(), .idle = e.idle, .wsl = e.wsl } else null;
+    const program: ?tab_layout.Program = if (entry) |e| .{ .name = e.name(), .idle = e.idle, .wsl = e.wsl, .shell = e.shell() } else null;
     var default_buf: [16]u8 = undefined;
     const default_title = utf16ToUtf8(&default_buf, tabs.default_title);
     return tab_layout.label(win.tab_title_overrides[i] != null, title, default_title, program);
 }
 
+/// The label tab `i` shows, as one line in `buf` (`program · title`), or
+/// null past the last tab: for lists of the tabs such as
+/// `Menu.showTabList`.
+pub fn labelText(self: *const TabBar, i: usize, buf: []u8) ?[]const u8 {
+    if (i >= self.windowConst().tab_count) return null;
+    var title_buf: [768]u8 = undefined;
+    return self.labelOf(i, &title_buf).write(buf);
+}
+
 /// The tooltip of tab `i`: its full label, and the shortcut that selects
 /// it when one is bound.
 pub fn tooltipText(self: *const TabBar, i: usize, buf: []u8) ?[]const u8 {
-    if (i >= self.windowConst().tab_count) return null;
-    var title_buf: [768]u8 = undefined;
-    const lbl = self.labelOf(i, &title_buf);
     var label_buf: [600]u8 = undefined;
-    const text = lbl.write(&label_buf);
+    const text = self.labelText(i, &label_buf) orelse return null;
     if (text.len == 0) return null;
     return withShortcut(buf, text, self.shortcut(.{ .goto_tab = i + 1 }));
 }
@@ -1708,6 +1733,12 @@ fn refreshPrograms(self: *TabBar, table: *gx.proc.Table) bool {
                 entry.wsl = program.wsl;
                 entry.idle = gx.policy.isIdle(&.{program.name}, idle_list);
                 entry.kind = gx.leader.treeKind(alloc, tree, pid) catch .local;
+                if (tree.find(pid)) |index| {
+                    const shell = gx.policy.displayName(tree.processes[index].name);
+                    const shell_len = @min(shell.len, entry.shell_buf.len);
+                    @memcpy(entry.shell_buf[0..shell_len], shell[0..shell_len]);
+                    entry.shell_len = @intCast(shell_len);
+                }
             }
         } else |_| {}
     }

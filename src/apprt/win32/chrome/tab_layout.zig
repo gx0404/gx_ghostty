@@ -368,6 +368,10 @@ pub const Program = struct {
     idle: bool = false,
     /// WSL, whose programs Windows does not see: `wsl` is no program name.
     wsl: bool = false,
+    /// The display name of the terminal's shell, if known. A title that
+    /// names it is the shell's own: the program just exited and the label
+    /// is the title alone until the next lookup.
+    shell: []const u8 = "",
 };
 
 /// The text of a tab: `program` (drawn in the secondary color) and
@@ -390,10 +394,10 @@ pub const Label = struct {
 /// The label of a tab (D4) whose title is `title_raw` (UTF-8): an
 /// `overridden` title (renamed, `set_tab_title`) shows as it is. Otherwise
 /// the title is simplified (`simplifyTitle`) and counts as none when it is
-/// empty or `default_title`; an idle shell or WSL shows the title alone, a
-/// running program shows as `program · title` unless the title already
-/// names it. Without a title the program names the tab, and without either
-/// `default_title` does.
+/// empty or `default_title`; an idle shell, WSL or a title that names the
+/// shell shows the title alone, a running program shows as
+/// `program · title` unless the title already names it. Without a title the
+/// program names the tab, and without either `default_title` does.
 pub fn label(overridden: bool, title_raw: []const u8, default_title: []const u8, program: ?Program) Label {
     if (overridden) return .{ .title = title_raw };
     const simplified = simplifyTitle(title_raw);
@@ -402,6 +406,7 @@ pub fn label(overridden: bool, title_raw: []const u8, default_title: []const u8,
     if (p.name.len == 0) return .{ .title = title orelse default_title };
     const t = title orelse return .{ .title = p.name };
     if (p.idle or p.wsl) return .{ .title = t };
+    if (p.shell.len > 0 and std.ascii.eqlIgnoreCase(t, p.shell)) return .{ .title = t };
     if (std.ascii.eqlIgnoreCase(t, p.name)) return .{ .title = p.name };
     if (t.len > p.name.len and std.ascii.startsWithIgnoreCase(t, p.name) and
         (t[p.name.len] == ' ' or t[p.name.len] == ':'))
@@ -643,6 +648,11 @@ test "labels show the title of an idle shell and the program otherwise" {
     try testing.expectEqualStrings("vim", label(false, "Ghostty", ghostty, vim).write(&buf));
     const ping: Program = .{ .name = "PING" };
     try testing.expectEqualStrings("ping  -t 127.0.0.1", label(false, "C:\\WINDOWS\\SYSTEM32\\cmd.exe - ping  -t 127.0.0.1", ghostty, ping).write(&buf));
+    // The program exited and the shell took its title back before the
+    // next lookup.
+    const ping_in_cmd: Program = .{ .name = "PING", .shell = "cmd" };
+    try testing.expectEqualStrings("cmd", label(false, "C:\\WINDOWS\\SYSTEM32\\cmd.exe", ghostty, ping_in_cmd).write(&buf));
+    try testing.expectEqualStrings("PING \u{00B7} ~/src", label(false, "~/src", ghostty, ping_in_cmd).write(&buf));
 
     // WSL: the title alone.
     const wsl: Program = .{ .name = "wsl", .wsl = true };
