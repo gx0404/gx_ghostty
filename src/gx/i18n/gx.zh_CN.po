@@ -865,3 +865,34 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. Windows apprt: dialogs (src/apprt/win32/ui/Dialogs.zig)
+msgid "Closing this terminal will end the processes running in it."
+msgstr "关闭此终端会结束其中正在运行的进程。"
+
+msgid "Closing this tab will end the processes running in it."
+msgstr "关闭此标签页会结束其中正在运行的进程。"
+
+msgid "Closing these tabs will end the processes running in them."
+msgstr "关闭这些标签页会结束其中正在运行的进程。"
+
+msgid "Closing this window will end the processes running in its tabs."
+msgstr "关闭此窗口会结束各标签页中正在运行的进程。"
+
+msgid "Quitting will end the processes running in all windows."
+msgstr "退出会结束所有窗口中正在运行的进程。"
+
+msgid "The text is empty."
+msgstr "文本为空。"
+
+msgid "Lines: {lines} · Characters: {chars}"
+msgstr "行数：{lines} · 字符数：{chars}"
+
+msgid "Report an Issue"
+msgstr "反馈问题"
+
+msgid "Graphics: {renderer}, OpenGL {version}"
+msgstr "图形：{renderer}，OpenGL {version}"
+
+msgid "Graphics: {renderer}, OpenGL {version} (software rendering)"
+msgstr "图形：{renderer}，OpenGL {version}（软件渲染）"
