@@ -15,11 +15,14 @@ test {
     _ = @import("win32/App.zig");
     _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/Surface.zig");
+    _ = @import("win32/Window.zig");
     _ = @import("win32/chrome/Backdrop.zig");
     _ = @import("win32/chrome/TabBar.zig");
+    _ = @import("win32/chrome/caption_layout.zig");
     _ = @import("win32/clipboard.zig");
     _ = @import("win32/shortcut_conflicts.zig");
     _ = @import("win32/splits.zig");
+    _ = @import("win32/tab_status.zig");
     _ = @import("win32/tabs.zig");
     _ = @import("win32/win32.zig");
     _ = @import("win32/ui/Dialogs.zig");
@@ -36,6 +39,7 @@ test {
     _ = @import("win32/ui/Keybinds.zig");
     _ = @import("win32/ui/trigger.zig");
     _ = @import("win32/ui/fuzzy.zig");
+    _ = @import("win32/ui/Menu.zig");
     _ = @import("win32/ui/MenuPopup.zig");
     _ = @import("win32/ui/settings/fuzzy.zig");
     _ = @import("win32/ui/settings/hit_test.zig");

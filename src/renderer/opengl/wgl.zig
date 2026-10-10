@@ -6,6 +6,9 @@
 //! shipped in a `mesa` directory next to the executable. Setting
 //! `GHOSTTY_GX_OPENGL=software` skips the system driver. The WGL
 //! extension entry points are loaded through a hidden dummy window.
+//! `Device.backend` reports the vendor, renderer and version the probe saw;
+//! `Device.wait` returns once the implementation is chosen (at once, since
+//! `init` probes on the calling thread).
 //!
 //! `Context` is the per-surface state. The apprt owns the window and its
 //! device context (DC) and sets the pixel format once through
@@ -96,6 +99,25 @@ pub const Device = struct {
         self.* = undefined;
     }
 
+    /// Wait until the OpenGL implementation is chosen. `init` probes on the
+    /// calling thread, so the choice is made by the time it returns and
+    /// this returns at once; `error.OpenGLUnavailable` is for a probe that
+    /// runs on a thread of its own and finds no usable OpenGL.
+    pub fn wait(self: *Device) error{OpenGLUnavailable}!void {
+        _ = self;
+    }
+
+    /// What renders the frames, as the probe saw it (`wait` first).
+    pub fn backend(self: *const Device) Backend {
+        const lib = &self.lib;
+        return .{
+            .vendor = lib.vendor_buf[0..lib.vendor_len],
+            .renderer = lib.renderer_buf[0..lib.renderer_len],
+            .version = lib.version,
+            .software = lib.software,
+        };
+    }
+
     /// Whether the frames presented to windows of this device carry an
     /// alpha channel that the desktop compositor can blend with what is
     /// behind the window (the renderer writes premultiplied alpha), or
@@ -127,6 +149,20 @@ pub const Device = struct {
             return error.SetPixelFormatFailed;
         }
     }
+};
+
+/// The OpenGL implementation behind a `Device` (`Device.backend`), for
+/// the about page and the logs.
+pub const Backend = struct {
+    /// GL_VENDOR and GL_RENDERER of the probe context, e.g. "Mesa" and
+    /// "llvmpipe (LLVM 19.1.7, 256 bits)"; cut to 63 and 127 bytes.
+    vendor: []const u8,
+    renderer: []const u8,
+    /// The core profile version the probe context got.
+    version: Version,
+    /// The Mesa software fallback (`mesa\opengl32.dll`) rather than the
+    /// system driver.
+    software: bool,
 };
 
 /// The pixel format for a window: through WGL_ARB_pixel_format an
@@ -364,7 +400,7 @@ pub const Context = struct {
 
         // Let an apprt that waits for frames during a live resize go on.
         if (comptime @hasDecl(apprt.Surface, "signalFrameDrawn")) {
-            self.surface.signalFrameDrawn();
+            self.surface.signalFrameDrawn(@intCast(target.width), @intCast(target.height));
         }
     }
 };
@@ -403,6 +439,14 @@ const Lib = struct {
     createContextAttribs: ?CreateContextAttribsFn = null,
     choosePixelFormatArb: ?ChoosePixelFormatArbFn = null,
     swapInterval: ?SwapIntervalFn = null,
+
+    /// GL_VERSION, GL_VENDOR and GL_RENDERER of the probe context
+    /// (`Device.backend`).
+    version: Version = .{ .major = 0, .minor = 0 },
+    vendor_buf: [63]u8 = undefined,
+    vendor_len: u8 = 0,
+    renderer_buf: [127]u8 = undefined,
+    renderer_len: u8 = 0,
 
     const CreateContextAttribsFn = *const fn (HDC, ?HGLRC, [*]const c_int) callconv(.winapi) ?HGLRC;
     const ChoosePixelFormatArbFn = *const fn (HDC, [*]const c_int, ?[*]const f32, u32, [*]c_int, *u32) callconv(.winapi) BOOL;
@@ -530,12 +574,14 @@ fn probe(kind: Lib.Kind) !Lib {
 
     const get_string = try symbol(lib.module, "glGetString", gl.c.PFNGLGETSTRINGPROC);
     const version = parseVersion(glString(get_string, gl.c.GL_VERSION));
+    const vendor = glString(get_string, gl.c.GL_VENDOR);
+    const renderer = glString(get_string, gl.c.GL_RENDERER);
     log.info("{t} OpenGL {d}.{d} vendor={s} renderer={s}", .{
         kind,
         version.major,
         version.minor,
-        glString(get_string, gl.c.GL_VENDOR),
-        glString(get_string, gl.c.GL_RENDERER),
+        vendor,
+        renderer,
     });
     if (version.major < OpenGL.MIN_VERSION_MAJOR or
         (version.major == OpenGL.MIN_VERSION_MAJOR and version.minor < OpenGL.MIN_VERSION_MINOR))
@@ -543,7 +589,19 @@ fn probe(kind: Lib.Kind) !Lib {
         return error.OpenGLOutdated;
     }
 
+    lib.version = version;
+    lib.vendor_len = copyText(&lib.vendor_buf, vendor);
+    lib.renderer_len = copyText(&lib.renderer_buf, renderer);
     return lib;
+}
+
+/// Copy `text` into `buf`, cut at a character boundary when it is longer;
+/// returns the number of bytes copied.
+fn copyText(buf: []u8, text: []const u8) u8 {
+    var len = @min(text.len, buf.len, std.math.maxInt(u8));
+    while (len < text.len and len > 0 and text[len] & 0xC0 == 0x80) len -= 1;
+    @memcpy(buf[0..len], text[0..len]);
+    return @intCast(len);
 }
 
 /// Load the Mesa DLL from the `mesa` directory next to the executable.
@@ -611,7 +669,7 @@ fn glString(get_string: gl.c.PFNGLGETSTRINGPROC, name: gl.c.GLenum) []const u8 {
     return std.mem.sliceTo(ptr orelse return "", 0);
 }
 
-const Version = struct { major: u32, minor: u32 };
+pub const Version = struct { major: u32, minor: u32 };
 
 /// Parse the leading "major.minor" of a GL_VERSION string.
 fn parseVersion(s: []const u8) Version {
@@ -635,6 +693,27 @@ test parseVersion {
     try testing.expectEqual(Version{ .major = 4, .minor = 6 }, parseVersion("4.6.0 NVIDIA 555.85"));
     try testing.expectEqual(Version{ .major = 4, .minor = 5 }, parseVersion("4.5 (Core Profile) Mesa 24.2.0"));
     try testing.expectEqual(Version{ .major = 0, .minor = 0 }, parseVersion(""));
+}
+
+test "Device.backend reports what the probe saw" {
+    const testing = std.testing;
+    var device: Device = undefined;
+    device.lib.software = true;
+    device.lib.version = .{ .major = 4, .minor = 5 };
+    device.lib.vendor_len = copyText(&device.lib.vendor_buf, "Mesa");
+    device.lib.renderer_len = copyText(&device.lib.renderer_buf, "llvmpipe (LLVM 19.1.7, 256 bits)");
+    try device.wait();
+    const backend = device.backend();
+    try testing.expectEqualStrings("Mesa", backend.vendor);
+    try testing.expectEqualStrings("llvmpipe (LLVM 19.1.7, 256 bits)", backend.renderer);
+    try testing.expectEqual(Version{ .major = 4, .minor = 5 }, backend.version);
+    try testing.expect(backend.software);
+
+    // Long strings are cut at a character boundary.
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("1234567", buf[0..copyText(&buf, "1234567\u{00E9}")]);
+    try testing.expectEqualStrings("12345678", buf[0..copyText(&buf, "123456789")]);
+    try testing.expectEqualStrings("", buf[0..copyText(&buf, "")]);
 }
 
 const PIXELFORMATDESCRIPTOR = extern struct {

@@ -1379,6 +1379,7 @@ pub extern "kernel32" fn QueryPerformanceFrequency(
 
 pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WA_INACTIVE: u16 = 0;
+pub const WM_ACTIVATEAPP: u32 = 0x001C;
 
 pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
 
@@ -1517,7 +1518,77 @@ pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;
 // -----------------------------------------------------------------------
 
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
+pub const WM_SYSCOLORCHANGE: u32 = 0x0015;
+pub const WM_THEMECHANGED: u32 = 0x031A;
+pub const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
+
+/// A system-wide change that Windows broadcasts to top-level windows
+/// (child windows never get these): a setting (WM_SETTINGCHANGE), the
+/// system colors (WM_SYSCOLORCHANGE), the visual style (WM_THEMECHANGED)
+/// or the DWM colorization color (WM_DWMCOLORIZATIONCOLORCHANGED).
+pub const SystemChange = union(enum) {
+    setting: Setting,
+    sys_colors,
+    theme,
+    colorization: Colorization,
+
+    pub const Setting = struct {
+        /// The SPI_* code of a `SystemParametersInfo` change, else 0.
+        action: u32,
+        /// The changed area, e.g. "ImmersiveColorSet" (the apps light or
+        /// dark theme), "Environment", "Policy" or "intl"; null when the
+        /// broadcast names none. Valid only while the message is handled.
+        area: ?[*:0]const u16,
+    };
+
+    pub const Colorization = struct {
+        /// The new colorization color, 0xAARRGGBB.
+        color: u32,
+        /// Whether it is blended opaquely.
+        opaque_blend: bool,
+    };
+
+    /// The change a window message announces, or null for other messages.
+    pub fn fromMessage(msg: u32, wparam: usize, lparam: isize) ?SystemChange {
+        return switch (msg) {
+            WM_SETTINGCHANGE => .{ .setting = .{
+                .action = @truncate(wparam),
+                .area = settingArea(lparam),
+            } },
+            WM_SYSCOLORCHANGE => .sys_colors,
+            WM_THEMECHANGED => .theme,
+            WM_DWMCOLORIZATIONCOLORCHANGED => .{ .colorization = .{
+                .color = @truncate(wparam),
+                .opaque_blend = lparam != 0,
+            } },
+            else => null,
+        };
+    }
+
+    /// The area string a WM_SETTINGCHANGE lparam points to. Any program can
+    /// broadcast the message: take only what can be a string pointer.
+    fn settingArea(lparam: isize) ?[*:0]const u16 {
+        const address: usize = @bitCast(lparam);
+        if (address % @alignOf(u16) != 0) return null;
+        return @ptrFromInt(address);
+    }
+
+    /// Whether this is a WM_SETTINGCHANGE for the area `name` (ASCII,
+    /// compared ignoring case), e.g. `isArea("ImmersiveColorSet")`.
+    pub fn isArea(self: SystemChange, name: []const u8) bool {
+        const area = switch (self) {
+            .setting => |setting| setting.area orelse return false,
+            .sys_colors, .theme, .colorization => return false,
+        };
+        for (name, 0..) |c, i| {
+            const unit = area[i];
+            if (unit == 0 or unit > 0x7F) return false;
+            if (std.ascii.toLower(@intCast(unit)) != std.ascii.toLower(c)) return false;
+        }
+        return area[name.len] == 0;
+    }
+};
 
 // -----------------------------------------------------------------------
 // Power management broadcast
@@ -1655,4 +1726,32 @@ test "objectId reads the DWORD of a WM_GETOBJECT lparam" {
     try testing.expectEqual(@as(i32, -25), objectId(-25));
     try testing.expect(objectId(0) != OBJID_CLIENT);
     try testing.expect(objectId(0xFFFFFFE7) != OBJID_CLIENT);
+}
+
+test "SystemChange decodes the system broadcasts" {
+    const testing = std.testing;
+    const color_set = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet");
+    const theme = SystemChange.fromMessage(WM_SETTINGCHANGE, 0, @bitCast(@intFromPtr(color_set))).?;
+    try testing.expect(theme.isArea("ImmersiveColorSet"));
+    try testing.expect(theme.isArea("immersivecolorset"));
+    try testing.expect(!theme.isArea("Immersive"));
+    try testing.expect(!theme.isArea("ImmersiveColorSets"));
+    try testing.expect(!theme.isArea("Environment"));
+
+    // A SystemParametersInfo change that names no area.
+    const spi = SystemChange.fromMessage(WM_SETTINGCHANGE, 0x2016, 0).?;
+    try testing.expectEqual(@as(u32, 0x2016), spi.setting.action);
+    try testing.expectEqual(@as(?[*:0]const u16, null), spi.setting.area);
+    try testing.expect(!spi.isArea("ImmersiveColorSet"));
+    const odd = SystemChange.fromMessage(WM_SETTINGCHANGE, 0, 1).?;
+    try testing.expectEqual(@as(?[*:0]const u16, null), odd.setting.area);
+
+    try testing.expect(SystemChange.fromMessage(WM_SYSCOLORCHANGE, 0, 0).? == .sys_colors);
+    try testing.expect(SystemChange.fromMessage(WM_THEMECHANGED, 0, 0).? == .theme);
+    const accent = SystemChange.fromMessage(WM_DWMCOLORIZATIONCOLORCHANGED, 0xC40078D4, 1).?;
+    try testing.expectEqual(@as(u32, 0xC40078D4), accent.colorization.color);
+    try testing.expect(accent.colorization.opaque_blend);
+    try testing.expect(!accent.isArea("ImmersiveColorSet"));
+
+    try testing.expectEqual(@as(?SystemChange, null), SystemChange.fromMessage(WM_PAINT, 0, 0));
 }

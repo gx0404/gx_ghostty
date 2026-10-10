@@ -6,9 +6,10 @@
 //! and launch profile buttons, the right-click menu, middle-click close and
 //! inline renaming of tab and window titles.
 //!
-//! The tab model (split trees, active surfaces, titles, unread flags)
-//! stays in `Window`; the tab bar reads it and asks the window to change it
-//! (`selectTabIndex`, `closeTabByIndex`, `moveTabTo`, ...). Tab geometry is
+//! The tab model (split trees, active surfaces, titles, unread flags; the
+//! status of a tab in `Window.tabStatus`) stays in `Window`; the tab bar
+//! reads it and asks the window to change it (`selectTabIndex`,
+//! `closeTabByIndex`, `moveTabTo`, ...). Tab geometry is
 //! derived from the title bar `Layout` on demand (`geometry`), so hit tests
 //! never depend on a previous paint.
 //!
@@ -788,6 +789,20 @@ pub fn onMiddleButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) boo
     return true;
 }
 
+/// The mouse wheel turned over the chrome row (client point `x`, `y`):
+/// `delta` is the wheel distance (`WHEEL_DELTA` per notch, positive away
+/// from the user, or to the right when `horizontal`). Returns true when
+/// the tab bar used it; it does not scroll yet.
+pub fn onMouseWheel(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32, delta: i16, horizontal: bool) bool {
+    _ = self;
+    _ = lay;
+    _ = x;
+    _ = y;
+    _ = delta;
+    _ = horizontal;
+    return false;
+}
+
 /// Handle a right-button release on the tab bar: the launch profile menu
 /// over the new-tab buttons, else the tab context menu for the clicked
 /// tab. Returns false when the point is not on a tab or button.
@@ -863,6 +878,21 @@ pub fn markUnread(self: *TabBar, surface: *Surface) void {
     if (i == win.active_tab or win.tab_unread[i]) return;
     win.tab_unread[i] = true;
     self.invalidate();
+}
+
+/// Tab `tab` stopped being shown (`Window.selectTabIndex` hid its panes):
+/// the moment to remember what its terminals show (`gx.unread.Tracker`).
+/// GUI thread. Nothing uses it yet.
+pub fn onTabHidden(self: *TabBar, tab: usize) void {
+    _ = self;
+    _ = tab;
+}
+
+/// Tab `tab` became the active tab (`Window.selectTabIndex`). GUI thread.
+/// Nothing uses it yet.
+pub fn onTabShown(self: *TabBar, tab: usize) void {
+    _ = self;
+    _ = tab;
 }
 
 /// Whether the terminal of an occluded surface changed since its renderer
