@@ -4,11 +4,14 @@ using Adw 1;
 template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
   // The Ghostty GX settings dialog (src/apprt/gtk/gx/settings_dialog.zig).
   // Its text comes from the Ghostty GX translation tables at runtime, so
-  // nothing here is marked for gettext.
-  content-width: 720;
-  content-height: 640;
+  // nothing here is marked for gettext. Wide enough that the page switcher
+  // of six pages stays in the header bar.
+  content-width: 920;
+  content-height: 680;
   search-enabled: false;
+  close-attempt => $close_attempted();
   closed => $closed();
+  notify::visible-page => $page_changed();
 
   Adw.PreferencesPage language_page {
     name: "language";
@@ -26,44 +29,38 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
     icon-name: "preferences-desktop-appearance-symbolic";
 
     Adw.PreferencesGroup theme_group {
-      header-suffix: Gtk.Button theme_apply_button {
-        valign: center;
-        sensitive: false;
-        clicked => $theme_apply_clicked();
+      Adw.ActionRow theme_row {
+        activatable: true;
+        use-markup: false;
+        activated => $theme_row_activated();
 
-        styles [
-          "suggested-action",
-        ]
-      };
-
-      Gtk.Box {
-        orientation: vertical;
-        spacing: 12;
-
-        Gtk.SearchEntry theme_search {
-          search-changed => $theme_search_changed();
-          activate => $theme_search_activated();
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
         }
+      }
 
-        Gtk.ScrolledWindow {
-          hscrollbar-policy: never;
-          min-content-height: 280;
+      Adw.ActionRow theme_light_row {
+        visible: false;
+        activatable: true;
+        use-markup: false;
+        activated => $theme_row_activated();
 
-          styles [
-            "card",
-          ]
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
+        }
+      }
 
-          Gtk.ListBox theme_list {
-            selection-mode: single;
-            activate-on-single-click: false;
-            map => $theme_list_mapped();
-            row-selected => $theme_row_selected();
-            row-activated => $theme_row_activated();
+      Adw.ActionRow theme_dark_row {
+        visible: false;
+        activatable: true;
+        use-markup: false;
+        activated => $theme_row_activated();
 
-            styles [
-              "navigation-sidebar",
-            ]
-          }
+        [suffix]
+        Gtk.Image {
+          icon-name: "go-next-symbolic";
         }
       }
     }
@@ -71,6 +68,26 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
     Adw.PreferencesGroup material_group {
       Adw.ComboRow material_row {
         notify::selected => $material_selected();
+      }
+
+      Adw.ComboRow opacity_row {
+        notify::selected => $opacity_selected();
+      }
+    }
+
+    Adw.PreferencesGroup cursor_group {
+      Adw.ComboRow cursor_style_row {
+        notify::selected => $cursor_style_selected();
+      }
+
+      Adw.SwitchRow cursor_blink_row {
+        notify::active => $cursor_blink_toggled();
+      }
+    }
+
+    Adw.PreferencesGroup padding_group {
+      Adw.ComboRow padding_row {
+        notify::selected => $padding_selected();
       }
     }
   }
@@ -92,10 +109,44 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
         };
 
         notify::value => $font_size_changed();
+        output => $font_size_output();
+
+        [suffix]
+        Gtk.Button font_size_reset_button {
+          icon-name: "edit-undo-symbolic";
+          valign: center;
+          clicked => $font_size_reset_clicked();
+
+          styles [
+            "flat",
+          ]
+        }
       }
     }
 
     Adw.PreferencesGroup font_family_group {
+      Adw.ActionRow font_choice_row {
+        [suffix]
+        Gtk.FontDialogButton font_choose_button {
+          level: family;
+          use-font: false;
+          use-size: false;
+          valign: center;
+          notify::font-desc => $font_family_selected();
+        }
+
+        [suffix]
+        Gtk.Button font_clear_button {
+          icon-name: "edit-clear-symbolic";
+          valign: center;
+          clicked => $font_clear_clicked();
+
+          styles [
+            "flat",
+          ]
+        }
+      }
+
       Adw.EntryRow font_family_row {
         show-apply-button: true;
         apply => $font_family_applied();
@@ -118,6 +169,10 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
 
       Adw.ComboRow close_confirmation_row {
         notify::selected => $close_confirmation_selected();
+      }
+
+      Adw.SwitchRow focus_follows_mouse_row {
+        notify::active => $focus_follows_mouse_toggled();
       }
     }
 
@@ -171,6 +226,17 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
         subtitle-selectable: true;
 
         [suffix]
+        Gtk.Button open_folder_button {
+          icon-name: "folder-open-symbolic";
+          valign: center;
+          clicked => $open_folder_clicked();
+
+          styles [
+            "flat",
+          ]
+        }
+
+        [suffix]
         Gtk.Button open_config_button {
           valign: center;
           clicked => $open_config_clicked();
@@ -185,4 +251,110 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
       }
     }
   }
+}
+
+// The theme list, pushed over the pages from the theme rows of the
+// appearance page. Its list model and row factory are set up in code.
+Adw.NavigationPage theme_subpage {
+  tag: "themes";
+  shown => $theme_subpage_shown();
+  hidden => $theme_subpage_hidden();
+
+  child: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {}
+
+    [top]
+    Adw.Clamp {
+      maximum-size: 720;
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 6;
+        margin-start: 12;
+        margin-end: 12;
+        margin-bottom: 6;
+
+        Gtk.Box {
+          orientation: horizontal;
+          spacing: 6;
+
+          Gtk.SearchEntry theme_search {
+            hexpand: true;
+            search-changed => $theme_search_changed();
+            activate => $theme_search_activated();
+            stop-search => $theme_search_stopped();
+          }
+
+          Gtk.Button theme_revert_button {
+            sensitive: false;
+            clicked => $theme_revert_clicked();
+          }
+
+          Gtk.Button theme_apply_button {
+            sensitive: false;
+            clicked => $theme_apply_clicked();
+
+            styles [
+              "suggested-action",
+            ]
+          }
+        }
+
+        Gtk.Label theme_hint {
+          xalign: 0;
+          wrap: true;
+
+          styles [
+            "dim-label",
+            "caption",
+          ]
+        }
+      }
+    }
+
+    content: Adw.Clamp {
+      maximum-size: 720;
+
+      Gtk.Stack theme_stack {
+        margin-start: 12;
+        margin-end: 12;
+        margin-bottom: 12;
+
+        Gtk.StackPage {
+          name: "list";
+
+          child: Gtk.ScrolledWindow {
+            hscrollbar-policy: never;
+            vexpand: true;
+
+            styles [
+              "card",
+            ]
+
+            Gtk.ListView theme_list {
+              activate => $theme_list_activated();
+
+              styles [
+                "navigation-sidebar",
+              ]
+            }
+          };
+        }
+
+        Gtk.StackPage {
+          name: "empty";
+
+          child: Gtk.Label theme_empty {
+            valign: start;
+            margin-top: 24;
+
+            styles [
+              "dim-label",
+            ]
+          };
+        }
+      }
+    };
+  };
 }

@@ -355,6 +355,20 @@ class SettingsDialogTests(unittest.TestCase):
         self.assertEqual(handlers - callbacks, set(), "blueprint handlers without bindTemplateCallback")
         self.assertEqual(callbacks - handlers, set(), "bound callbacks the blueprint never uses")
 
+    def test_settings_use_a_virtual_theme_subpage_and_family_font_chooser(self):
+        root = blueprint("1.5/gx-settings-dialog.blp")
+        declared = ids(root)
+        self.assertEqual("Gtk.ListView", declared["theme_list"].kind)
+        self.assertEqual("Adw.NavigationPage", declared["theme_subpage"].kind)
+        chooser = declared["font_choose_button"]
+        self.assertEqual("Gtk.FontDialogButton", chooser.kind)
+        self.assertEqual("family", chooser.props["level"])
+        self.assertEqual("Adw.ActionRow", declared["font_choice_row"].kind)
+        self.assertEqual("Adw.EntryRow", declared["font_family_row"].kind)
+        self.assertGreaterEqual(int(template(root).props["content-width"]), 900)
+        pages = [node.props["name"] for node in root.walk() if node.kind == "Adw.PreferencesPage"]
+        self.assertEqual(pages, ["language", "appearance", "font", "interaction", "shell", "about"])
+
 
 if __name__ == "__main__":
     unittest.main()
