@@ -1,0 +1,53 @@
+id = "W12"
+title = "WSL: losing the mouse capture mid-press reports one release, the later button up none"
+requires = ["wsl:Ubuntu-24.04"]
+config = """
+command = wsl.exe -d Ubuntu-24.04 -e bash --noprofile --norc
+language = en
+"""
+expect = [
+  "one-release: cat -v shows one ^[[<0;…M press and exactly one ^[[<0;…m release (sent when WM_CANCELMODE took the capture); the physical button up adds no second release",
+]
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "type"
+text = "printf '\\e[?1000h\\e[?1006h'; cat -v\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "mouse_down"
+in = "terminal:0"
+x = "50%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "cancel_mode"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "mouse_up"
+in = "terminal:0"
+x = "50%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "one-release"

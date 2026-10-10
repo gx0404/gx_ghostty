@@ -1,0 +1,124 @@
+id = "W15"
+title = "goto_tab counts from 1, last_tab reaches the end, move_tab moves one tab (not a swap)"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+keybind = ctrl+shift+u=set_tab_title:Build
+keybind = f7=goto_tab:1
+keybind = f8=goto_tab:2
+"""
+expect = [
+  "three-tabs: tabs one, two, Build; Build is active",
+  "goto-1: F7 (goto_tab:1) selected tab one",
+  "goto-2: F8 (goto_tab:2) selected tab two",
+  "moved: after Alt+9 (last_tab) and Ctrl+Shift+PageUp (move_tab:-1) the order is one, Build, two with Build active",
+  "goto-2-after-move: F8 now selects Build, the tab that moved to position 2",
+]
+
+[[step]]
+action = "type"
+text = "title one\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^one$"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "type"
+text = "title two\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^two$"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+u"
+
+[[step]]
+action = "wait_title"
+pattern = "^Build$"
+
+[[step]]
+action = "capture"
+name = "three-tabs"
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_title"
+pattern = "^one$"
+
+[[step]]
+action = "capture"
+name = "goto-1"
+
+[[step]]
+action = "key"
+keys = "f8"
+
+[[step]]
+action = "wait_title"
+pattern = "^two$"
+
+[[step]]
+action = "capture"
+name = "goto-2"
+
+[[step]]
+action = "key"
+keys = "alt+9"
+
+[[step]]
+action = "wait_title"
+pattern = "^Build$"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+pageup"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "moved"
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_title"
+pattern = "^one$"
+
+[[step]]
+action = "key"
+keys = "f8"
+
+[[step]]
+action = "wait_title"
+pattern = "^Build$"
+
+[[step]]
+action = "capture"
+name = "goto-2-after-move"

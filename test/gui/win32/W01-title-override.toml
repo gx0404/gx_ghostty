@@ -1,0 +1,61 @@
+id = "W01"
+title = "Tab title override survives terminal titles and an empty title clears it"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+keybind = ctrl+shift+u=set_tab_title:Build
+keybind = ctrl+shift+y=set_tab_title:
+"""
+expect = [
+  "override: the tab label and the window title read Build",
+  "after-osc: after `title from-osc` in cmd the tab still reads Build",
+  "cleared: after the empty set_tab_title the tab follows the terminal title from-osc again",
+]
+
+[[step]]
+action = "type"
+text = "title first\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^first$"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+u"
+
+[[step]]
+action = "wait_title"
+pattern = "^Build$"
+
+[[step]]
+action = "capture"
+name = "override"
+
+[[step]]
+action = "type"
+text = "title from-osc\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "assert_title"
+pattern = "^Build$"
+
+[[step]]
+action = "capture"
+name = "after-osc"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+y"
+
+[[step]]
+action = "wait_title"
+pattern = "^from-osc$"
+
+[[step]]
+action = "capture"
+name = "cleared"

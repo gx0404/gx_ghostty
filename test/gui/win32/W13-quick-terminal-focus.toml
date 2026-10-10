@@ -1,0 +1,44 @@
+id = "W13"
+title = "The quick terminal has the keyboard focus as soon as it starts sliding in"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+keybind = global:ctrl+grave_accent=toggle_quick_terminal
+quick-terminal-animation-duration = 0.5
+"""
+expect = [
+  "quick: the quick terminal shows `echo typed-into-quick` and its output, typed right after the hotkey",
+  "main-unchanged: the main window's prompt line is still empty",
+]
+
+[[step]]
+action = "wait_log"
+pattern = "registered global hotkey"
+
+# Type immediately after the hotkey, while the quick terminal is still sliding in.
+[[step]]
+action = "key"
+keys = "ctrl+grave"
+
+[[step]]
+action = "type"
+text = "echo typed-into-quick\n"
+
+[[step]]
+action = "wait_window"
+window = "quick"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "quick"
+what = "quick"
+
+[[step]]
+action = "capture"
+name = "main-unchanged"
+method = "print"

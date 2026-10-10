@@ -306,6 +306,19 @@ jobs:
         run: |
           zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # The win32 apprt, the GX core and DirectWrite only compile into a Windows test binary.
+      - name: win32 apprt, GX core and DirectWrite tests, sharded across processes
+        run: |
+          python scripts/zig_test.py --suite main -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu --filter apprt.win32 --filter gx. --filter font.directwrite --zig-arg=--summary --zig-arg=all --json "$env:RUNNER_TEMP/gx-zig-test/windows-app.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gx-zig-test-windows-app
+          path: ${{ runner.temp }}/gx-zig-test/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Smoke test on the pinned Mesa llvmpipe
         if: github.event_name == 'workflow_dispatch' && inputs.win_smoke
         timeout-minutes: 15
@@ -380,7 +393,7 @@ jobs:
             blueprint-compiler build-essential curl libbz2-dev libonig-dev \
             libxml2-utils lintian lsb-release pandoc \
             libadwaita-1-dev libgtk-4-dev libgtk4-layer-shell-dev \
-            git ca-certificates xz-utils gettext \
+            git ca-certificates xz-utils gettext python3 \
             xvfb xauth scrot libgl1-mesa-dri
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -423,6 +436,9 @@ jobs:
             wait "$pid" || true
           ' bash "$evidence"
           test -s "$evidence/ghostty-xvfb.png"
+      # The GX layer of the GTK apprt only compiles into a test binary with the GTK runtime.
+      - name: GTK GX layer tests, sharded across processes
+        run: python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx --zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-gtk-smoke/zig-test.json"
       - name: Upload smoke evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -1,0 +1,19 @@
+id = "G04"
+title = "The keyboard shortcuts cheat sheet opens with Ctrl+Shift+/ and filters by text"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.5
+key ctrl+shift+slash
+sleep 2
+type --delay 60 "split"
+sleep 1.5
+"""
+expect = [
+  "G04-after.png: the shortcuts dialog lists only split actions for the query split, with their key caps",
+]

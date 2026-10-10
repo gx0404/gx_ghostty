@@ -1,0 +1,148 @@
+id = "W05"
+title = "Opening the command palette does not preview its first theme row; Esc restores the theme"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+theme = Nord
+keybind = ctrl+shift+r=reload_config
+"""
+expect = [
+  "empty-query: the palette is open with an empty query, its first row is Theme: Dracula (recently used, not the current theme) and the terminal behind it is still Nord (#2e3440)",
+  "down: Down moved the selection off Dracula",
+  "restored: after Esc the palette is closed and the terminal is Nord",
+]
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 2
+label = "Nord at start"
+
+# Apply Dracula from the palette, which records it as recently used and writes it to
+# gui-settings.ghostty; then drop that file and reload, so Nord (config.ghostty) is the current
+# theme again while Dracula stays the first recently used row.
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "Dracula"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#282a36"
+tolerance = 2
+label = "Dracula applied"
+
+[[step]]
+action = "file"
+path = "ghostty/gui-settings.ghostty"
+text = ""
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 2
+label = "Nord after the reload"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "empty-query"
+what = "all"
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 2
+label = "Nord behind the empty palette"
+
+[[step]]
+action = "key"
+keys = "down"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "down"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 2
+label = "Nord after Esc"
+
+[[step]]
+action = "capture"
+name = "restored"

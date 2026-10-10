@@ -1,0 +1,21 @@
+id = "G02"
+title = "Chinese UI: the main menu opened with gx:main_menu is translated"
+lang = "zh_CN"
+config = """
+command = /bin/bash --noprofile --norc
+language = zh-CN
+"""
+# Click into the terminal for the keyboard focus (Xvfb has no window manager), then
+# Ctrl+Shift+M (gx:main_menu in the GX defaults).
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.5
+key ctrl+shift+m
+sleep 1.5
+"""
+expect = [
+  "G02.png: the window at startup, no menu yet",
+  "G02-after.png: the main menu is open and every label is Chinese (复制 … 设置…, 键盘快捷键, 语言, 关于 Ghostty GX, 退出), Han characters render (no boxes)",
+  "The black rectangle behind the popover is Xvfb without a compositor (no alpha), not a rendering bug",
+]
