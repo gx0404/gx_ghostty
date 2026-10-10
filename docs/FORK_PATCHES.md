@@ -39,6 +39,7 @@
 | GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |
 | GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |
 | GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |
+| GX-0004 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0004` | active |
 | GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
@@ -265,10 +266,10 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0004 OpenGL 渲染器在 Windows 上用 WGL
 
-- 文件：`src/renderer/OpenGL.zig`（导入、`Device` 与 `egl_context` 两处类型、新增 `wgl_context` 字段，`init`、`deinit`、`threadEnter`、`threadExit`、`present` 开头各一个 Windows 分支，`ExportedFrame` 在 Windows 上为 `void`）、`src/renderer/opengl/Frame.zig`（`ExportedFrame` 为 `void` 时不再推送 `.redraw`）。WGL 实现在新路径 `src/renderer/opengl/wgl.zig`。
-- 标记：`fork(gx): GX-0004`；纯新增块用 begin/end，三处改动的单行上一行写单行标记。
+- 文件：`src/renderer/OpenGL.zig`（导入、`Device` 与 `egl_context` 两处类型、`swap_chain_count` 在 Windows 上为 1、新增 `wgl_context` 字段，`init`、`deinit`、`threadEnter`、`threadExit`、`present` 开头各一个 Windows 分支，`ExportedFrame` 在 Windows 上为 `void`）、`src/renderer/opengl/Frame.zig`（`ExportedFrame` 为 `void` 时不再推送 `.redraw`）、`src/renderer/opengl/Target.zig`（导入 `builtin`；`init` 在 Windows 上建完渲染用的纹理与 framebuffer 就返回，不建导出纹理）。WGL 实现在新路径 `src/renderer/opengl/wgl.zig`。
+- 标记：`fork(gx): GX-0004`；纯新增块用 begin/end，单行改动（`Device`、`egl_context`、`swap_chain_count`、`ExportedFrame` 与 `Frame.complete` 里的 `.redraw`）在上一行写单行标记。
 - 状态：active，未回馈上游。
-- 改动量：2 个文件，`git diff --numstat` 合计 +51/−4（含注释）。
+- 改动量：3 个文件，`git diff --numstat` 合计 +69/−5（含注释）。
 
 ### 原因
 
@@ -276,10 +277,11 @@ python -m unittest scripts.test_fork_patches -v
 
 ### 行为
 
-- Windows 上 `OpenGL.Device` 即 `wgl.Device`：进程启动时用一个隐藏的探测窗口载入 `wglCreateContextAttribsARB`、`wglChoosePixelFormatARB`、`wglSwapIntervalEXT`，并确认能建 OpenGL 4.3 core context；系统驱动不满足时改用 exe 同目录 `mesa\opengl32.dll`（Mesa llvmpipe），环境变量 `GHOSTTY_GX_OPENGL=software` 直接用 Mesa。两者都不可用时弹出说明对话框，`App` 初始化以 `DeviceFailed` 失败。
-- apprt 为每个子窗口（`CS_OWNDC`）调用一次 `Device.setPixelFormat`，优先选 sRGB-capable 的双缓冲 RGBA8 格式。
-- `OpenGL.init`（主线程）只记录 surface 的 HDC，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、设 swap interval 1，并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
-- `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer（尺寸不一致时按左上角对齐，其余区域清为透明黑），再 `SwapBuffers`；没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
+- Windows 上 `OpenGL.Device` 即 `wgl.Device`：`Device.init` 起一个探测线程就返回，主线程同时做别的启动工作；探测用一个隐藏窗口载入 `wglCreateContextAttribsARB`、`wglChoosePixelFormatARB`、`wglSwapIntervalEXT`，并确认能建 OpenGL 4.3 core context；系统驱动不满足时改用 exe 同目录 `mesa\opengl32.dll`，环境变量 `GHOSTTY_GX_OPENGL=software` 直接用 Mesa。载入 Mesa 前若用户没设，临时设 `GALLIUM_DRIVER=llvmpipe`（否则有 `dxil.dll` 与 D3D12 适配器时 Mesa 先用 D3D12 驱动，虚拟机里是 WARP），CPU 多于 4 个时设 `LP_NUM_THREADS=4`（llvmpipe 每个 context 按 CPU 数起光栅线程，每个终端一个 context），探测完删掉。`Device.wait` 等探测结果，两者都不可用时返回 `error.OpenGLUnavailable`，由 apprt 告诉用户；`alphaFrames`、`setPixelFormat`、`backend` 自己也会等，`setPixelFormat` 同样返回 `error.OpenGLUnavailable`，渲染层不再显示错误对话框。探测耗时记为 `gx.perf` 的 `wgl.probe`，主线程等它的时间记为 `wgl.probe_wait`。
+- apprt 为每个子窗口（`CS_OWNDC`）调用一次 `Device.setPixelFormat`，优先选 sRGB-capable 的双缓冲 RGBA8 格式，同等条件下取没有深度与模板缓冲的格式（渲染器画在自己的 target 里，窗口缓冲只接收拷贝）；探测时记日志 `window pixel format=… srgb=… alpha=… depth=… stencil=…`。
+- `OpenGL.init`（主线程）只记录 surface 的 HDC 与 `window-vsync`，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、按 `window-vsync` 设 swap interval 1 或 0，非 Debug 构建关掉 NOTIFICATION 级的 GL 调试消息（`wgl.quietDebugOutput`，Release 本来也不记 debug 日志），并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
+- Windows 上 `swap_chain_count` 为 1：`present` 同步呈现、`Frame.complete` 随后 `gl.finish`，帧不会在 GPU 上重叠；`Target.init` 也不建导出纹理。每个终端的渲染目标从 3 帧 × 2 张降到 1 张，字形 atlas 也只传一份。GTK 仍是 3 帧。
+- `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer，再 `SwapBuffers`；窗口尺寸取 apprt 发布的 `Surface.clientSize`（渲染线程不调用 HWND API）。尺寸一致时只有这一次 blit、不清屏；窗口大于 target 时（拖动改尺寸的间隙、常显滚动条占掉的一列）帧贴左上角，最后一列、最后一行与右下角像素拉伸补满其余部分（`wgl.edgeFills`）。apprt 经 `Surface.unfocusedDim` 要求给未聚焦分屏变暗时，blit 之后用一个小着色程序把预乘色按 `rgb = dim.rgb·dst.a + dst.rgb·(1−dim.a)` 混合到整个窗口、alpha 不变（着色程序首次需要时建立，随 context 销毁、GPU 重置后重建）。没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
 - 交换成功后调用 apprt 的 `signalFrameDrawn`（win32 apprt 在拖动改尺寸时最多等 16 ms 新帧）。驱动支持 `WGL_ARB_create_context_robustness` 时上下文按「重置即丢失」创建；GPU 重置（驱动超时恢复、驱动更新）后 `wgl.Context.present` 换上新上下文、调 apprt 的 `gpuContextReset` 让渲染器重建 GPU 资源，本帧以 `error.ContextLost` 放弃。这些都在新路径 `wgl.zig` 与 win32 apprt 里，补丁行不变。
 - 非 Windows 目标的行为与产物不变。
 
@@ -289,7 +291,7 @@ python -m unittest scripts.test_fork_patches -v
 
 ### 同步冲突处理
 
-先取上游版本，再把各 Windows 分支放回对应函数开头（`init`、`deinit`、`threadEnter`、`threadExit`、`present`），恢复 `Device`、`egl_context`、`ExportedFrame` 三处类型选择与 `wgl_context` 字段、`Frame.complete` 里 `.redraw` 的守卫。上游改动这些函数的签名、`Device` 接口（`init`/`deinit`）或帧呈现协议时，同步调整 `src/renderer/opengl/wgl.zig`。
+先取上游版本，再把各 Windows 分支放回对应函数开头（`init`、`deinit`、`threadEnter`、`threadExit`、`present`），恢复 `Device`、`egl_context`、`ExportedFrame` 三处类型选择、`swap_chain_count` 的 Windows 取值与 `wgl_context` 字段、`Frame.complete` 里 `.redraw` 的守卫，以及 `Target.init` 里建完渲染 framebuffer 之后的 Windows 提前返回。上游改动这些函数的签名、`Device` 接口（`init`/`deinit`）、`Target` 的字段、swap chain 的帧数假设或帧呈现协议时，同步调整 `src/renderer/opengl/wgl.zig`。
 
 ### 移除条件
 
@@ -303,11 +305,11 @@ python scripts/zigw.py build -Dtarget=x86_64-linux-gnu -Dapp-runtime=none
 python -m unittest scripts.test_fork_patches -v
 ```
 
-运行 `zig-out/bin/ghostty.exe`：日志有 `loaded OpenGL 4.x vendor=… renderer=… software=false`，窗口正常渲染、缩放后重绘，Ctrl+Shift+T 新建的标签页同样渲染。把 Mesa 的 `opengl32.dll` 与 `libgallium_wgl.dll` 放进 `zig-out/bin/mesa/` 并以 `GHOSTTY_GX_OPENGL=software` 启动，日志应为 `software=true`、renderer 为 llvmpipe。GTK 的 EGL 路径需在 Linux 上验证。
+运行 `zig-out/bin/ghostty.exe`：日志有 `loaded OpenGL 4.x vendor=… renderer=… software=false`，窗口正常渲染、缩放后重绘（边缘没有黑边），Ctrl+Shift+T 新建的标签页同样渲染。把 Mesa 的 `opengl32.dll`、`libgallium_wgl.dll` 与 `dxil.dll` 放进 `zig-out/bin/mesa/` 并以 `GHOSTTY_GX_OPENGL=software` 启动，日志应为 `software=true`、renderer 为 llvmpipe（不是 D3D12）。GTK 的 EGL 路径需在 Linux 上验证。
 
 ### 测试锁定
 
-只有登记表与闭集检查；`wgl.zig` 带一个版本串解析的单元测试。
+只有登记表与闭集检查；`wgl.zig` 的单元测试覆盖版本串解析、`Device.wait` 等待探测线程与失败、`frameBlit` 加 `edgeFills` 不重不漏地铺满窗口、变暗颜色换算、无深度与模板格式的挑选和 llvmpipe 线程上限。
 
 ## GX-0005 Windows 下的 termio 与核心修正
 

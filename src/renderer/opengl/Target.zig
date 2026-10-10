@@ -20,6 +20,9 @@
 const Self = @This();
 
 const std = @import("std");
+// fork(gx): GX-0004 begin: Windows exports no frames
+const builtin = @import("builtin");
+// fork(gx): GX-0004 end
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
 const egl = gl.egl;
@@ -89,6 +92,18 @@ pub fn init(opts: Options) !Self {
             },
         }
     }
+
+    // fork(gx): GX-0004 begin: Windows blits the target into the window and exports nothing
+    if (comptime builtin.os.tag == .windows) return .{
+        .framebuffer = fbo,
+        .texture = texture,
+        // Name 0: deleting it does nothing.
+        .export_framebuffer = .{ .id = 0 },
+        .export_texture = .{ .id = 0 },
+        .width = opts.width,
+        .height = opts.height,
+    };
+    // fork(gx): GX-0004 end
 
     // --- Export texture (plain RGBA8, for dma-buf export) ---
     const export_texture = try gl.Texture.create();

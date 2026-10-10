@@ -36,7 +36,8 @@ pub const custom_shader_y_is_down = false;
 
 /// Triple-buffering gives the GPU room to pipeline renders without
 /// having to wait on the apprt consuming previous frames.
-pub const swap_chain_count = 3;
+// fork(gx): GX-0004 Windows presents (and finishes) every frame before the next, so one is enough
+pub const swap_chain_count = if (builtin.os.tag == .windows) 1 else 3;
 
 const log = std.log.scoped(.opengl);
 
@@ -70,7 +71,7 @@ pub fn init(
         .blending = opts.config.blending,
         .device = device,
         .egl_context = {},
-        .wgl_context = try .init(opts.rt_surface),
+        .wgl_context = try .init(opts.rt_surface, opts.config.vsync),
     };
     // fork(gx): GX-0004 end
     const display = device.display;
@@ -231,6 +232,7 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
         try self.wgl_context.threadEnter(self.device);
         errdefer self.wgl_context.threadExit(self.device);
         try prepareContext(&wgl.getProcAddress);
+        wgl.quietDebugOutput();
         self.wgl_context.logImplementation(self.device);
         return;
     }
