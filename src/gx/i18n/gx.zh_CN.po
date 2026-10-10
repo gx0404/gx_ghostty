@@ -913,3 +913,54 @@ msgstr ""
 "\n"
 "请更新显卡驱动，或在 ghostty.exe 所在目录的“mesa”文件夹中放入 Mesa 的 "
 "opengl32.dll。"
+
+msgid "Clear Search"
+msgstr "清除搜索"
+
+msgid "Graphics"
+msgstr "图形"
+
+msgid "Software rendering"
+msgstr "软件渲染"
+
+msgid "Loading font families…"
+msgstr "正在加载字体…"
+
+msgid "On this system the whole window becomes translucent."
+msgstr "在此系统上整个窗口会一起变得半透明。"
+
+msgid "The material shows in the title bar only: the terminals are drawn by software rendering."
+msgstr "材质只显示在标题栏：终端由软件渲染绘制。"
+
+msgid "The material shows in the title bar only: the graphics driver draws the terminals without transparency."
+msgstr "材质只显示在标题栏：显卡驱动绘制的终端不带透明度。"
+
+msgid "Reset All Settings"
+msgstr "重置全部设置"
+
+msgid "Press Reset All Settings again to confirm."
+msgstr "再按一次“重置全部设置”以确认。"
+
+msgid "Removes every setting made here, so the configuration file and the defaults apply again."
+msgstr "删除在这里做的全部设置，重新使用配置文件和默认值。"
+
+msgid "Every setting made here was removed."
+msgstr "已删除在这里做的全部设置。"
+
+msgid "Search settings…"
+msgstr "搜索设置…"
+
+msgid "Search Settings"
+msgstr "搜索设置"
+
+msgid "No matching settings"
+msgstr "没有匹配的设置"
+
+msgid "Reset Interface Settings"
+msgstr "重置界面设置"
+
+msgid "Press Reset Interface Settings again to confirm."
+msgstr "再按一次“重置界面设置”以确认。"
+
+msgid "An unexpected error occurred."
+msgstr "发生了未知错误。"
