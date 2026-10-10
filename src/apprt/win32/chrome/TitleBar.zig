@@ -297,19 +297,12 @@ fn queryNativeBounds(self: *const TitleBar) ?w32.RECT {
     var bounds: w32.RECT = undefined;
     if (DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, &bounds, @sizeOf(w32.RECT)) < 0) return null;
     if (bounds.right <= bounds.left) return null;
-    // The bounds are relative to the window rectangle.
-    var window_rect: w32.RECT = undefined;
-    if (w32.GetWindowRect(hwnd, &window_rect) == 0) return null;
+    var visible_frame: w32.RECT = undefined;
+    if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &visible_frame, @sizeOf(w32.RECT)) < 0 and
+        w32.GetWindowRect(hwnd, &visible_frame) == 0) return null;
     var origin = w32.POINT{ .x = 0, .y = 0 };
-    _ = w32.ClientToScreen(hwnd, &origin);
-    const dx = window_rect.left - origin.x;
-    const dy = window_rect.top - origin.y;
-    return .{
-        .left = bounds.left + dx,
-        .top = bounds.top + dy,
-        .right = bounds.right + dx,
-        .bottom = bounds.bottom + dy,
-    };
+    if (w32.ClientToScreen(hwnd, &origin) == 0) return null;
+    return caption_layout.toClientBounds(bounds, visible_frame, origin.x, origin.y);
 }
 
 fn isZoomed(self: *const TitleBar) bool {
@@ -972,11 +965,25 @@ pub fn paint(self: *TitleBar, hdc: w32.HDC) void {
     // not drawn at all (a hovered caption button repaints only itself).
     canvas.pushClip(ctx.dipRect(dirty));
     canvas.clear(colors.strip_fill);
+    const native = self.nativeButtons();
+    if (native and colors.strip_fill.a > 0) {
+        var caption_area = lay.bar;
+        caption_area.left = std.math.clamp(
+            if (self.nativeButtonBounds()) |bounds| bounds.left else lay.bar.right - style.px(3 * style.metrics.caption_button_width, lay.scale),
+            lay.bar.left,
+            lay.bar.right,
+        );
+        if (overlaps(dirty, caption_area)) {
+            canvas.pushClip(ctx.dipRect(caption_area));
+            canvas.clear(d2d.Color.black.withAlpha(0));
+            canvas.popClip();
+        }
+    }
     const tab_area: w32.RECT = .{ .left = 0, .top = 0, .right = lay.menu.left, .bottom = lay.bar.bottom };
     if (overlaps(dirty, tab_area) or lay.menu.right <= lay.menu.left) win.tab_bar.paint(ctx);
     const now = anim.now();
     if (overlaps(dirty, lay.menu)) self.paintMenuButton(ctx, now);
-    if (lay.caption and !self.nativeButtons()) self.paintCaptionButtons(ctx, dirty, now);
+    if (lay.caption and !native) self.paintCaptionButtons(ctx, dirty, now);
     canvas.popClip();
     switch (canvas.finish()) {
         .ok => {},
@@ -1510,6 +1517,7 @@ pub const WINDOWPLACEMENT = extern struct {
 };
 
 const DWMWA_CAPTION_BUTTON_BOUNDS: u32 = 5;
+const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
 
 extern "dwmapi" fn DwmDefWindowProc(hWnd: w32.HWND, msg: u32, wParam: usize, lParam: isize, plResult: *isize) callconv(.winapi) i32;
 extern "dwmapi" fn DwmGetWindowAttribute(hwnd: w32.HWND, dwAttribute: u32, pvAttribute: *anyopaque, cbAttribute: u32) callconv(.winapi) i32;

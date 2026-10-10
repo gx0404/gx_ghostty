@@ -168,6 +168,17 @@ pub fn contains(rect: RECT, x: i32, y: i32) bool {
     return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
 }
 
+pub fn toClientBounds(bounds: RECT, visible_frame: RECT, client_x: i32, client_y: i32) RECT {
+    const dx = visible_frame.left - client_x;
+    const dy = visible_frame.top - client_y;
+    return .{
+        .left = bounds.left + dx,
+        .top = bounds.top + dy,
+        .right = bounds.right + dx,
+        .bottom = bounds.bottom + dy,
+    };
+}
+
 /// The chrome row for `in`.
 pub fn compute(in: Input) Layout {
     const s = in.scale;
@@ -445,4 +456,24 @@ test "minTrackSize fits the caption buttons, the main menu button, a tab and a d
         try testing.expect(lay.menu.right <= lay.minimize.left);
         try testing.expect(lay.menu.left - lay.tabs.right >= px(drag_reserve_caption, s));
     }
+}
+
+test "DWM button bounds follow the visible frame without the invisible resize border" {
+    const restored = toClientBounds(
+        .{ .left = 1050, .top = 0, .right = 1270, .bottom = 44 },
+        .{ .left = 2009, .top = 900, .right = 3271, .bottom = 1611 },
+        2011,
+        900,
+    );
+    try testing.expectEqual(@as(i32, 1048), restored.left);
+    try testing.expectEqual(@as(i32, 0), restored.top);
+    const maximized = toClientBounds(
+        .{ .left = 3630, .top = 0, .right = 3850, .bottom = 44 },
+        .{ .left = 0, .top = 0, .right = 3840, .bottom = 2088 },
+        0,
+        0,
+    );
+    const lay = compute(.{ .width = 3840, .bar_height = 60, .frame = .custom, .scale = 1.5, .zoomed = true, .buttons = .{ .dwm = maximized } });
+    try testing.expectEqual(@as(i32, 44), lay.menu.top + lay.menu.bottom);
+    try testing.expectEqual(@as(i32, 3624), lay.menu.right);
 }
