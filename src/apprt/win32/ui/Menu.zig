@@ -1011,6 +1011,7 @@ const ProfileItems = struct {
             .tab => tab_ids,
             .window => window_ids,
         };
+        var used: MenuPopup.AccessSet = .initEmpty();
         for (self.all(), 0..) |profile, i| {
             const action: input.Binding.Action = .{ .gx = switch (where) {
                 .tab => .{ .new_tab_profile = profile.id },
@@ -1019,11 +1020,14 @@ const ProfileItems = struct {
             var buf: [64]u8 = undefined;
             const shortcut = hints.text(action, &buf);
             const icon = profileIcon(profile.kind);
+            const access = MenuPopup.pickAccessKey(profile.name, used);
+            if (access) |key| used.set(if (key >= 'A') 10 + @as(usize, key - 'A') else key - '0');
             try menu.add(list, .{
                 .id = first + i,
                 .label = profiles.displayName(alloc, profile) catch profile.name,
                 .icon = icon.glyph,
                 .icon_text = icon.text,
+                .access = access,
                 .shortcut = if (self.default == i) try defaultTag(alloc, shortcut) else shortcut,
             });
         }
@@ -1349,6 +1353,32 @@ test "profile icons tell WSL, custom commands and herdr apart" {
     try testing.expectEqualStrings(wsl_emoji, profileIcon(.wsl).text.?);
     try testing.expectEqual(@as(?u21, icons.profile_custom), profileIcon(.custom).glyph);
     try testing.expectEqual(@as(?u21, icons.profile), profileIcon(.pwsh).glyph);
+}
+
+test "profile access keys use English names in either UI language" {
+    const saved = i18n.current();
+    defer i18n.setCurrent(saved);
+    var launch: ProfileItems = .{
+        .arena = .init(testing.allocator),
+        .list = .{
+            .arena = .init(testing.allocator),
+            .profiles = &.{
+                .{ .id = "cmd", .name = "Command Prompt", .command = .{ .command_line = "cmd.exe" }, .kind = .cmd },
+                .{ .id = "custom:Copy", .name = "Copy", .command = .{ .command_line = "cmd.exe" }, .kind = .custom },
+            },
+        },
+    };
+    defer launch.deinit();
+    const set: input.Binding.Set = .{};
+    for ([_]i18n.Language{ .en, .zh_CN }) |lang| {
+        i18n.setCurrent(lang);
+        var menu: MenuPopup.Builder = .init(testing.allocator);
+        defer menu.deinit();
+        try launch.append(&menu, &menu.root, .{ .set = &set }, .tab);
+        try testing.expectEqual(@as(?u8, 'C'), menu.root.items.items[0].access);
+        try testing.expectEqual(@as(?u8, 'O'), menu.root.items.items[1].access);
+        try testing.expectEqualStrings(i18n.tr("Command Prompt"), menu.root.items.items[0].label);
+    }
 }
 
 test {
