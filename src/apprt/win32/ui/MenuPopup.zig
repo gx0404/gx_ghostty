@@ -1,30 +1,53 @@
 //! A custom-drawn popup menu in the Windows 11 style, themed from the
 //! terminal colors (`style.Tokens`): the widget behind `ui/Menu.zig`. Each
-//! menu level is a `Popup` window painted with a `d2d.Canvas`: a rounded
-//! container with a 1 px border and the system shadow, rows with an
-//! optional icon glyph or check/radio mark, a label, right-aligned
-//! shortcut text and a submenu chevron, separators, section headers and
-//! disabled items. The highlighted row gets a hover fill and an accent bar.
+//! open menu level is a `Popup` window painted with a `d2d.Canvas`, laid
+//! out on whole device pixels: rows with an optional icon (or emoji) or a
+//! check/radio mark, a label, right-aligned shortcut text and a submenu
+//! chevron, separators, section headers and disabled items. The
+//! highlighted row gets the hover fill; a row highlighted from the
+//! keyboard also gets the accent selection indicator.
 //!
 //! Build the items with a `Builder` and `run` them. `run` opens the menu
-//! at an anchor point, flipped and clamped to stay within the work area of
-//! the anchor's monitor and sized for the owner's DPI (or the content
-//! scale in `Options.owner_scale`), and blocks in a modal message loop
-//! until an action is picked (its `Item.id` is returned) or the menu is
-//! dismissed (null). A new popup stays cloaked
-//! until it has been painted twice: DWM may drop the first frame of a
-//! window presented right after it is shown.
+//! below an anchor rectangle (a point is an empty one, `Options.at`), lined
+//! up with its left or right edge (`Options.alignment`), above the anchor
+//! or flipped to its other edge when it does not fit (`placeRoot`), within
+//! the work area of the anchor's monitor and sized for the owner's DPI (or
+//! the content scale in `Options.owner_scale`). A menu taller than the
+//! work area scrolls: the wheel, the keyboard, and the arrow strips at its
+//! ends, which scroll while the pointer rests on them. `run` blocks in a
+//! modal message loop until an action is picked (its `Item.id` is
+//! returned) or the menu is dismissed (null). The popups of one run are
+//! created once per level and reused for every submenu shown at that
+//! level; `Popup.show` keeps a popup cloaked until it has painted.
 //!
 //! Like a native menu, the menu takes neither activation nor keyboard
-//! focus. The loop handles the keyboard itself (Up/Down, Home/End,
-//! Enter/Space, Right to open and Left to close a submenu, Escape,
-//! Alt/F10; no mnemonics) on the deepest open menu, and routes the mouse
-//! by screen position while the root popup holds the mouse capture:
-//! hovering a submenu item opens it after the system menu show delay, a
-//! press outside the menus, losing the capture or a change of the
-//! foreground window dismisses the menu. Releasing a button over an item
-//! picks it when a button went down inside the menu or the pointer moved
-//! since it opened (press, drag, release).
+//! focus. The loop handles the keyboard itself on the deepest open menu:
+//! Up/Down, Home/End, Page Up/Page Down, Enter/Space, Right to open and
+//! Left to close a submenu, Escape, Alt/F10, and access keys (`Item.access`,
+//! else a letter or digit of the label): the key is underlined in its
+//! label while access keys are shown (opened from the keyboard, a key was
+//! pressed, or the system always underlines them), and a label without it
+//! (a translation) shows it as "(T)" when the menu was opened from the
+//! keyboard. A key an input method takes (`VK_PROCESSKEY`) is read back
+//! with `ImmGetVirtualKey`, and its composition is canceled when the menu
+//! uses the key. Keys that were down when the menu opened do nothing while
+//! they stay down (their auto-repeat), and their releases go on to the
+//! focused window, which saw them go down.
+//!
+//! The mouse is routed by screen position while the root popup holds the
+//! mouse capture: hovering a submenu item opens it after the system menu
+//! show delay; while the pointer heads for an open submenu across other
+//! rows of its parent (`inAimTriangle`), the parent keeps its highlight;
+//! a parent menu always highlights the item whose submenu the pointer or
+//! the keyboard is in (`highlightPath`). A press outside the menus, losing
+//! the capture or a change of the foreground window dismisses the menu.
+//! Releasing a button over an item picks it when a button went down inside
+//! the menu or the pointer moved since it opened (press, drag, release).
+//! Between messages the loop sleeps until the next deadline (the submenu
+//! delay, the aim, auto-scrolling), at most `watch_ms`.
+//!
+//! Without Direct2D, or for screen readers (`preferNative`), `runNative`
+//! shows the same items as a native menu (`TrackPopupMenuEx`).
 //!
 //! Re-entrancy: one menu runs at a time; `run` returns null while another
 //! menu is open, and `cancel` closes the open one (for example when the UI
@@ -36,10 +59,14 @@
 //! pointers after it returns.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const global = @import("../../../global.zig");
+const perf = @import("../../../gx/perf.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
+const controls = @import("controls.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
+const wstr = @import("wstr.zig");
 
 const log = std.log.scoped(.win32_menu);
 
@@ -59,10 +86,17 @@ pub const Item = struct {
     label: []const u8 = "",
     /// A glyph of the icon font (`d2d.icons`).
     icon: ?u21 = null,
+    /// Text in the icon column instead of a glyph, in the UI font (an
+    /// emoji).
+    icon_text: ?[]const u8 = null,
     mark: Mark = .none,
     /// Right-aligned secondary text, usually a keyboard shortcut.
     shortcut: ?[]const u8 = null,
     enabled: bool = true,
+    /// The access key, an ASCII letter or digit; null takes a letter or
+    /// digit of the label that no other item of the menu has
+    /// (`pickAccessKey`).
+    access: ?u8 = null,
     /// The items of a submenu (set by `Builder.submenu`).
     submenu: ?*const List = null,
 
@@ -104,6 +138,8 @@ pub const Builder = struct {
         var copy = item;
         copy.label = try alloc.dupe(u8, item.label);
         if (item.shortcut) |text| copy.shortcut = try alloc.dupe(u8, text);
+        if (item.icon_text) |text| copy.icon_text = try alloc.dupe(u8, text);
+        if (item.access) |key| copy.access = std.ascii.toUpper(key);
         try list.items.append(alloc, copy);
     }
 
@@ -139,27 +175,39 @@ pub const Host = struct {
     quit_requested: *const bool,
 };
 
+/// The edge of its anchor a menu lines up with.
+pub const Align = enum { left, right };
+
 pub const Options = struct {
-    /// The top-left corner of the menu in screen pixels. The menu opens
-    /// to the left of and above it instead when it does not fit.
-    anchor: w32.POINT,
-    /// Highlight the first item, for menus opened from the keyboard.
-    select_first: bool = false,
+    /// What the menu opens at, in screen pixels: below it, or above it
+    /// when only that fits, lined up with its `alignment` edge (`placeRoot`).
+    /// A point is an empty rectangle (`at`).
+    anchor: w32.RECT,
+    alignment: Align = .left,
+    /// Opened from the keyboard: highlight the first item and show the
+    /// access keys.
+    keyboard: bool = false,
     /// The owner's content scale (`Window.scale` for the menus of a
-    /// window's chrome), when the menu follows it (`Popup.setOwnerScale`).
+    /// window), when the menu follows it (`Popup.setOwnerScale`).
     owner_scale: ?f32 = null,
+
+    /// The anchor of a menu that opens at a point.
+    pub fn at(pt: w32.POINT) w32.RECT {
+        return .{ .left = pt.x, .top = pt.y, .right = pt.x, .bottom = pt.y };
+    }
 };
 
-/// Dismiss the open menu, if any; its `run` returns null.
+/// Dismiss the open menu, if any; its `run` (or `runNative`) returns null.
 pub fn cancel() void {
     if (current) |state| state.dismiss();
+    if (native_open) _ = EndMenu();
 }
 
 /// Show the menu `root` for `owner` and run it until it is closed.
 /// Returns the id of the picked item, or null when the menu was dismissed,
 /// another menu is open or the owner went away.
 pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?usize {
-    if (current != null) {
+    if (current != null or native_open) {
         log.debug("a menu is already open", .{});
         return null;
     }
@@ -168,7 +216,7 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
     var arena: std.heap.ArenaAllocator = .init(host.factory.alloc);
     defer arena.deinit();
 
-    var cursor = options.anchor;
+    var cursor: w32.POINT = .{ .x = options.anchor.left, .y = options.anchor.bottom };
     _ = w32.GetCursorPos_(&cursor);
 
     var state: State = .{
@@ -176,6 +224,7 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
         .owner = owner,
         .alloc = arena.allocator(),
         .anchor = options.anchor,
+        .alignment = options.alignment,
         .owner_scale = options.owner_scale,
         .foreground = w32.GetForegroundWindow(),
         .start_pt = cursor,
@@ -184,10 +233,12 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
         .drag_y = @intCast(@max(w32.GetSystemMetrics(SM_CYDRAG), 1)),
         .show_delay = menuShowDelay(),
         .held_keys = heldKeys(),
+        .cues = options.keyboard or keyboardCues(),
+        .suffixes = options.keyboard,
     };
-    defer state.closeFrom(0);
+    defer state.destroyPopups();
 
-    if (!state.open(root, null, options.select_first)) return null;
+    if (!state.open(root, null, options.keyboard)) return null;
     current = &state;
     defer current = null;
 
@@ -206,23 +257,29 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
 /// The menu that is running.
 var current: ?*State = null;
 
+/// A native menu (`runNative`) is running.
+var native_open = false;
+
 /// Nested submenus beyond this depth do not open.
 const max_depth = 4;
 
-/// How often the loop checks the owner, the foreground window, the
-/// submenu show delay and popups to reveal while no other message arrives.
-const tick_ms = 20;
+/// The longest the loop sleeps without a message before it checks the
+/// owner and the foreground window again; activation changes wake it
+/// anyway, since they reach the owner.
+const watch_ms = 250;
 
-/// How long a new popup stays cloaked after its first paint. DWM can drop
-/// a frame presented right after a window is shown, which leaves the
-/// popup empty; the popup is painted again before it is uncloaked.
-const reveal_ms = 40;
+/// How long the pointer may rest in the aim triangle before the row under
+/// it takes the highlight.
+const aim_ms = 100;
 
-const DWMWA_CLOAK: u32 = 13;
+/// Auto-scrolling over an arrow strip moves the content once per frame.
+const autoscroll_ms = 16;
 
 const SM_CXDRAG: i32 = 68;
 const SM_CYDRAG: i32 = 69;
 const SPI_GETMENUSHOWDELAY: u32 = 0x006A;
+const SPI_GETKEYBOARDCUES: u32 = 0x100A;
+const SPI_GETSCREENREADER: u32 = 0x0046;
 
 const WM_NCMOUSEMOVE: u32 = 0x00A0;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
@@ -242,20 +299,60 @@ const WM_MBUTTONDBLCLK: u32 = 0x0209;
 const WM_XBUTTONDBLCLK: u32 = 0x020D;
 const WM_UNICHAR: u32 = 0x0109;
 
+const NI_COMPOSITIONSTR: u32 = 0x0015;
+const CPS_CANCEL: u32 = 0x0004;
+
 extern "user32" fn SystemParametersInfoW(
     uiAction: u32,
     uiParam: u32,
     pvParam: ?*anyopaque,
     fWinIni: u32,
 ) callconv(.winapi) i32;
-
+extern "user32" fn EndMenu() callconv(.winapi) i32;
+extern "imm32" fn ImmGetVirtualKey(hWnd: w32.HWND) callconv(.winapi) u32;
+extern "imm32" fn ImmNotifyIME(hIMC: w32.HIMC, dwAction: u32, dwIndex: u32, dwValue: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const u16, lpBuffer: [*]u16, nSize: u32) callconv(.winapi) u32;
 
 /// The system delay before a hovered submenu opens (`MenuShowDelay`).
 fn menuShowDelay() u64 {
     var delay: u32 = 400;
     if (SystemParametersInfoW(SPI_GETMENUSHOWDELAY, 0, &delay, 0) == 0) return 400;
     return @min(delay, 2000);
+}
+
+/// Whether Windows always underlines access keys ("Underline access keys
+/// when available").
+fn keyboardCues() bool {
+    var on: i32 = 0;
+    if (SystemParametersInfoW(SPI_GETKEYBOARDCUES, 0, @ptrCast(&on), 0) == 0) return false;
+    return on != 0;
+}
+
+/// Whether menus should be native (`runNative`): a screen reader is
+/// running, or `GHOSTTY_GX_A11Y` names `screen-reader` (to see the native
+/// menus without one).
+pub fn preferNative() bool {
+    var running: i32 = 0;
+    if (SystemParametersInfoW(SPI_GETSCREENREADER, 0, @ptrCast(&running), 0) != 0 and running != 0) return true;
+    return a11yOverride();
+}
+
+var a11y_read = false;
+var a11y_screen_reader = false;
+
+fn a11yOverride() bool {
+    if (!a11y_read) {
+        a11y_read = true;
+        var buf: [64]u16 = undefined;
+        const n = GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_A11Y"), &buf, buf.len);
+        if (n > 0 and n < buf.len) {
+            var ascii: [64]u8 = undefined;
+            for (buf[0..n], 0..) |unit, i| ascii[i] = if (unit < 0x80) @intCast(unit) else '?';
+            a11y_screen_reader = std.ascii.findIgnoreCase(ascii[0..n], "screen-reader") != null;
+        }
+    }
+    return a11y_screen_reader;
 }
 
 /// The keys that are down now, from the thread's keyboard state.
@@ -267,13 +364,6 @@ fn heldKeys() std.StaticBitSet(256) {
         if (value & 0x80 != 0) keys.set(vk);
     }
     return keys;
-}
-
-/// Hide (`cloaked`) or show a window in DWM composition only; it keeps
-/// painting while cloaked.
-fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
-    const value: u32 = @intFromBool(cloaked);
-    _ = w32.DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, @ptrCast(&value), @sizeOf(u32));
 }
 
 /// Whether `owner` still exists with its object attached.
@@ -300,6 +390,215 @@ fn workArea(pt: w32.POINT) w32.RECT {
     return info.rcWork;
 }
 
+var build_number: ?u32 = null;
+
+/// Whether DWM leaves the popups without the 1 px border and the rounded
+/// corners of Windows 11 (before build 22000), so the menu draws its own
+/// border.
+fn ownBorder() bool {
+    const build = build_number orelse blk: {
+        var info: std.os.windows.RTL_OSVERSIONINFOW = undefined;
+        info.dwOSVersionInfoSize = @sizeOf(std.os.windows.RTL_OSVERSIONINFOW);
+        const value: u32 = if (std.os.windows.ntdll.RtlGetVersion(&info) == .SUCCESS) info.dwBuildNumber else 0;
+        build_number = value;
+        break :blk value;
+    };
+    return build != 0 and build < 22000;
+}
+
+// -----------------------------------------------------------------------
+// Placement, aiming and access keys (pure)
+// -----------------------------------------------------------------------
+
+/// Where a root menu `width` × `height` pixels opens for `anchor` (screen
+/// pixels; an empty rectangle is a point) within the work area `work`:
+/// lined up with the anchor's `alignment` edge, or with its other edge when
+/// that would leave the work area; below the anchor, else above it, else
+/// (taller than the room on either side) moved into the work area over the
+/// anchor. A menu taller than the work area gets its height and scrolls.
+pub fn placeRoot(anchor: w32.RECT, width: i32, height: i32, work: w32.RECT, alignment: Align) w32.RECT {
+    const h = @min(height, @max(work.bottom - work.top, 0));
+    var x = switch (alignment) {
+        .left => anchor.left,
+        .right => anchor.right - width,
+    };
+    switch (alignment) {
+        .left => if (x + width > work.right) {
+            x = anchor.right - width;
+        },
+        .right => if (x < work.left) {
+            x = anchor.left;
+        },
+    }
+    x = clampStart(x, width, work.left, work.right);
+    const y = if (anchor.bottom + h <= work.bottom)
+        anchor.bottom
+    else if (anchor.top - h >= work.top)
+        anchor.top - h
+    else
+        clampStart(anchor.bottom, h, work.top, work.bottom);
+    return .{ .left = x, .top = y, .right = x + width, .bottom = y + h };
+}
+
+/// Where a submenu `width` × `height` pixels opens beside its parent menu
+/// `parent` (screen pixels) for the item whose top is at `item_top`: to the
+/// right, overlapping the parent by `overlap`, else to the left; its first
+/// row level with the item (`pad` is the space above it); within `work`,
+/// and as tall as the work area at most.
+pub fn placeSubmenu(parent: w32.RECT, item_top: i32, width: i32, height: i32, work: w32.RECT, overlap: i32, pad: i32) w32.RECT {
+    const h = @min(height, @max(work.bottom - work.top, 0));
+    var x = parent.right - overlap;
+    if (x + width > work.right) x = parent.left + overlap - width;
+    x = clampStart(x, width, work.left, work.right);
+    const y = clampStart(item_top - pad, h, work.top, work.bottom);
+    return .{ .left = x, .top = y, .right = x + width, .bottom = y + h };
+}
+
+/// `start` moved so that `start` .. `start + len` lies within `lo` .. `hi`;
+/// `lo` when it does not fit.
+fn clampStart(start: i32, len: i32, lo: i32, hi: i32) i32 {
+    return @max(lo, @min(start, hi - len));
+}
+
+/// Whether the pointer moving from `from` to `to` heads for a submenu
+/// whose near edge is the vertical segment at `edge_x` from `top` to
+/// `bottom` (screen pixels): `to` lies in the triangle of `from` and the
+/// two ends of that edge (its sides included).
+pub fn inAimTriangle(from: w32.POINT, to: w32.POINT, edge_x: i32, top: i32, bottom: i32) bool {
+    if (from.x == edge_x or bottom <= top) return false;
+    if (from.x == to.x and from.y == to.y) return false;
+    const a: [2]f32 = .{ @floatFromInt(from.x), @floatFromInt(from.y) };
+    const b: [2]f32 = .{ @floatFromInt(edge_x), @floatFromInt(top) };
+    const c: [2]f32 = .{ @floatFromInt(edge_x), @floatFromInt(bottom) };
+    const p: [2]f32 = .{ @floatFromInt(to.x), @floatFromInt(to.y) };
+    const d1 = cross(a, b, p);
+    const d2 = cross(b, c, p);
+    const d3 = cross(c, a, p);
+    const negative = d1 < 0 or d2 < 0 or d3 < 0;
+    const positive = d1 > 0 or d2 > 0 or d3 > 0;
+    return !(negative and positive);
+}
+
+fn cross(o: [2]f32, a: [2]f32, b: [2]f32) f32 {
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+}
+
+/// Light the path to menu `active` of `levels` (the open menus, root
+/// first): every menu above it highlights the item that opened the next
+/// one, so each open menu shows one highlighted row and Left or Escape
+/// return to that row. The levels have `parent_item` and
+/// `setHot(item, keyboard)`.
+fn highlightPath(levels: anytype, active: usize) void {
+    if (levels.len == 0) return;
+    var i = @min(active, levels.len - 1);
+    while (i > 0) : (i -= 1) levels[i - 1].setHot(levels[i].parent_item, false);
+}
+
+/// Access keys taken in one menu: a bit per digit, then per letter.
+pub const AccessSet = std.StaticBitSet(36);
+
+fn accessBit(key: u8) ?usize {
+    return switch (key) {
+        '0'...'9' => key - '0',
+        'A'...'Z' => 10 + @as(usize, key - 'A'),
+        'a'...'z' => 10 + @as(usize, key - 'a'),
+        else => null,
+    };
+}
+
+fn isWordStart(label: []const u8, i: usize) bool {
+    return i == 0 or !std.ascii.isAlphanumeric(label[i - 1]);
+}
+
+/// The access key a label without one gets: its first ASCII letter or
+/// digit that starts a word and is not `used`, else its first one that is
+/// not `used`; uppercase.
+pub fn pickAccessKey(label: []const u8, used: AccessSet) ?u8 {
+    for ([_]bool{ true, false }) |word_start| {
+        for (label, 0..) |c, i| {
+            const bit = accessBit(c) orelse continue;
+            if (used.isSet(bit)) continue;
+            if (word_start and !isWordStart(label, i)) continue;
+            return std.ascii.toUpper(c);
+        }
+    }
+    return null;
+}
+
+/// Where access key `key` is in `label` (bytes): its first occurrence that
+/// starts a word, else its first one, ignoring ASCII case; null when the
+/// label lacks it.
+pub fn accessIndex(label: []const u8, key: u8) ?usize {
+    const lower = std.ascii.toLower(key);
+    var first: ?usize = null;
+    for (label, 0..) |c, i| {
+        if (std.ascii.toLower(c) != lower) continue;
+        if (isWordStart(label, i)) return i;
+        if (first == null) first = i;
+    }
+    return first;
+}
+
+/// A label as drawn with its access key: the text and the byte offset of
+/// the key to underline.
+pub const Cue = struct {
+    text: []const u8,
+    underline: ?usize,
+};
+
+/// `label` with access key `key`: unchanged when it holds the key; else,
+/// with `suffix`, followed by "(K)" (before a trailing ellipsis, as in
+/// "设置(S)…"), allocated with `alloc`.
+pub fn cueLabel(alloc: Allocator, label: []const u8, key: u8, suffix: bool) Allocator.Error!Cue {
+    if (accessIndex(label, key)) |i| return .{ .text = label, .underline = i };
+    if (!suffix) return .{ .text = label, .underline = null };
+    const ellipses = [_][]const u8{ "\u{2026}", "..." };
+    var head = label;
+    var tail: []const u8 = "";
+    for (ellipses) |ellipsis| {
+        if (std.mem.endsWith(u8, label, ellipsis)) {
+            head = label[0 .. label.len - ellipsis.len];
+            tail = ellipsis;
+            break;
+        }
+    }
+    const upper = std.ascii.toUpper(key);
+    const text = try std.fmt.allocPrint(alloc, "{s}({c}){s}", .{ head, upper, tail });
+    return .{ .text = text, .underline = head.len + 1 };
+}
+
+/// What pressing access key `key` does in a menu whose rows have the
+/// access keys `keys` (null for rows that cannot be picked) and `hot`
+/// highlighted: highlight `item`, and pick it when it is the only row
+/// with that key; with several, each press moves to the next one.
+pub const AccessHit = struct {
+    item: usize,
+    unique: bool,
+};
+
+pub fn accessTarget(keys: []const ?u8, hot: ?usize, key: u8) ?AccessHit {
+    const wanted = std.ascii.toUpper(key);
+    var first: ?usize = null;
+    var after_hot: ?usize = null;
+    var count: usize = 0;
+    for (keys, 0..) |k, i| {
+        const have = k orelse continue;
+        if (have != wanted) continue;
+        count += 1;
+        if (first == null) first = i;
+        if (after_hot == null) if (hot) |h| if (i > h) {
+            after_hot = i;
+        };
+    }
+    const item = first orelse return null;
+    if (count == 1) return .{ .item = item, .unique = true };
+    return .{ .item = after_hot orelse item, .unique = false };
+}
+
+// -----------------------------------------------------------------------
+// Drawing
+// -----------------------------------------------------------------------
+
 /// Layout metrics in DIPs.
 const metrics = struct {
     /// Space above the first and below the last row.
@@ -308,46 +607,71 @@ const metrics = struct {
     const inset: f32 = 4;
     /// Space between the menu edges and the row content.
     const pad_x: f32 = 12;
-    const item_height: f32 = style.metrics.item_height;
+    const item_height: f32 = style.row.menu;
     const header_height: f32 = 28;
     const separator_height: f32 = 9;
-    const icon_size: f32 = style.metrics.icon_size;
+    const icon_size: f32 = style.icon.standard;
     const icon_gap: f32 = 12;
     /// Label indent when no row has an icon or mark.
     const plain_indent: f32 = 4;
-    /// The least space between a label and its shortcut.
-    const shortcut_gap: f32 = 32;
-    const chevron_size: f32 = 12;
+    /// The least space between a label and its shortcut (WinUI
+    /// MenuFlyout).
+    const shortcut_gap: f32 = 24;
+    const chevron_size: f32 = style.icon.small;
     const chevron_gap: f32 = 8;
     const min_width: f32 = 200;
     const max_width: f32 = 480;
     /// How far a submenu overlaps its parent menu.
     const submenu_overlap: f32 = 4;
-    const highlight_radius: f32 = 4;
-    const accent_width: f32 = 3;
-    const accent_height: f32 = 16;
     const radio_size: f32 = 6;
+    /// The height of the arrow strips at the ends of a scrolling menu.
+    const arrow_height: f32 = 16;
+    /// How far a wheel notch scrolls, in rows.
+    const wheel_rows: f32 = 3;
+    /// How far auto-scrolling moves per frame.
+    const autoscroll_step: f32 = 8;
+    /// How far a root menu slides toward its place while it fades in.
+    const slide: f32 = 4;
 };
 
-/// The check mark glyph of the icon font.
-const check_glyph: u21 = 0xE73E;
+const chevron_up_glyph: u21 = 0xE70E;
 
 fn labelStyle(color: d2d.Color) d2d.TextStyle {
     return .{ .size = style.font_size.body, .color = color };
 }
 
+/// Shortcuts: the caption size in the secondary text color (WinUI).
 fn shortcutStyle(color: d2d.Color) d2d.TextStyle {
-    return .{ .size = style.font_size.body, .color = color, .align_x = .trailing, .ellipsis = false };
+    return .{ .size = style.font_size.caption, .color = color, .align_x = .trailing, .ellipsis = false };
 }
 
 fn headerStyle(color: d2d.Color) d2d.TextStyle {
     return .{ .size = style.font_size.caption, .weight = .semibold, .color = color };
 }
 
-/// A DIP coordinate snapped to the pixel grid at `scale`.
-fn snap(value: f32, scale: f32) f32 {
-    return @round(value * scale) / scale;
-}
+/// The fills of a menu. Windows 11 raises flyouts above the window in both
+/// modes, lighter than it; the shared popup surface steps toward the
+/// foreground, which raises it in a dark theme but darkens it in a light
+/// one, so a light theme's menu blends its background toward white
+/// instead, with hover and pressed shades of that.
+pub const Fills = struct {
+    surface: d2d.Color,
+    hover: d2d.Color,
+    pressed: d2d.Color,
+
+    /// How far a light theme's menu moves from the background to white.
+    pub const light_lift: f32 = 0.6;
+
+    pub fn of(t: style.Tokens) Fills {
+        if (t.dark or t.high_contrast) return .{ .surface = t.surface_raised, .hover = t.hover, .pressed = t.pressed };
+        const surface = style.mix(t.background, d2d.Color.white, light_lift);
+        return .{
+            .surface = surface,
+            .hover = style.hoverOf(surface, t),
+            .pressed = style.pressedOf(surface, t),
+        };
+    }
+};
 
 const Result = union(enum) {
     open,
@@ -371,48 +695,113 @@ const Pending = struct {
 
 const Direction = enum { next, previous };
 
+const Scroll = enum { up, down };
+
+/// Scrolling while the pointer rests on an arrow strip.
+const AutoScroll = struct {
+    level: usize,
+    direction: Scroll,
+    due: u64,
+};
+
+/// The selectable item about a view of `view` pixels after (`next`) or
+/// before `from` in rows `rows` of items `all`: the farthest one whose top
+/// is within the view, or the next one when none is; `from` at the end.
+fn pageFrom(rows: []const Row, all: []const Item, from: usize, view: i32, direction: Direction) usize {
+    var best: ?usize = null;
+    switch (direction) {
+        .next => {
+            const limit = rows[from].top + view;
+            var i = from + 1;
+            while (i < all.len) : (i += 1) {
+                if (!all[i].selectable()) continue;
+                if (rows[i].top + rows[i].height > limit) {
+                    if (best == null) best = i;
+                    break;
+                }
+                best = i;
+            }
+        },
+        .previous => {
+            const limit = rows[from].top + rows[from].height - view;
+            var i = from;
+            while (i > 0) {
+                i -= 1;
+                if (!all[i].selectable()) continue;
+                if (rows[i].top < limit) {
+                    if (best == null) best = i;
+                    break;
+                }
+                best = i;
+            }
+        },
+    }
+    return best orelse from;
+}
+
 const Row = struct {
-    y: f32,
-    height: f32,
+    /// Top (from the top of the content) and height in pixels.
+    top: i32 = 0,
+    height: i32 = 0,
     shortcut_width: f32 = 0,
+    /// The label as drawn: with "(K)" when its access key is shown that
+    /// way.
+    text: []const u8 = "",
+    /// The access key, and its byte offset in `text` when it is there.
+    access: ?u8 = null,
+    underline: ?usize = null,
+    label_layout: ?d2d.TextLayout = null,
+    label_width: f32 = 0,
+    shortcut_layout: ?d2d.TextLayout = null,
+    shortcut_layout_width: f32 = 0,
 };
 
 /// One open menu: the root or a submenu.
 const Level = struct {
     state: *State,
     index: usize,
+    popup: *Popup,
     list: *const List,
     /// The item of the parent menu that opened this submenu.
     parent_item: ?usize,
-    popup: Popup = .{},
     rows: []Row = &.{},
-    /// Size in DIPs.
-    width: f32 = 0,
-    height: f32 = 0,
+    /// The scale of the layout, and the size of the content in pixels.
+    scale: f32 = 1,
+    width_px: i32 = 0,
+    content_px: i32 = 0,
     label_x: f32 = 0,
     /// Whether a row is a submenu (reserves the chevron column).
     chevron: bool = false,
-    /// The highlighted item.
+    /// The highlighted item, and whether the keyboard chose it.
     hot: ?usize = null,
-    /// The popup in screen pixels, and the scale of its layout.
+    hot_keyboard: bool = false,
+    /// The popup in screen pixels.
     bounds: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
-    scale: f32 = 1,
-    /// When the cloaked popup is painted again and uncloaked.
-    reveal_at: ?u64 = null,
+    /// A menu taller than its popup scrolls: the pixels of content above
+    /// the view, and the height of the arrow strips (0 when it does not
+    /// scroll).
+    scroll_px: i32 = 0,
+    arrow_px: i32 = 0,
 
     fn items(self: *const Level) []const Item {
         return self.list.items.items;
     }
 
-    /// Measure the rows and the menu size in DIPs.
+    /// Lay the rows out in whole pixels at `scale`, with their access
+    /// keys, and measure the menu.
     fn layout(self: *Level) void {
-        const factory = self.state.host.factory;
-        const tokens = self.state.host.tokens;
+        const state = self.state;
+        const factory = state.host.factory;
+        const text = state.host.tokens.text;
+        const s = self.scale;
+        self.releaseLayouts();
         var lead = false;
         self.chevron = false;
+        var used: AccessSet = .initEmpty();
         for (self.items()) |item| {
-            if (item.icon != null or item.mark != .none) lead = true;
+            if (item.icon != null or item.icon_text != null or item.mark != .none) lead = true;
             if (item.kind == .submenu) self.chevron = true;
+            if (item.access) |key| if (accessBit(key)) |bit| used.set(bit);
         }
         self.label_x = metrics.pad_x + if (lead)
             metrics.icon_size + metrics.icon_gap
@@ -420,65 +809,143 @@ const Level = struct {
             metrics.plain_indent;
 
         var content: f32 = 0;
-        var y: f32 = metrics.pad_y;
+        var y = style.px(metrics.pad_y, s);
         for (self.items(), self.rows) |item, *row| {
-            row.* = .{ .y = y, .height = switch (item.kind) {
+            const height = style.px(switch (item.kind) {
                 .separator => metrics.separator_height,
                 .header => metrics.header_height,
                 .action, .submenu => metrics.item_height,
-            } };
+            }, s);
+            row.* = .{ .top = y, .height = height, .text = item.label };
+            y += height;
             switch (item.kind) {
                 .separator => {},
-                .header => content = @max(content, factory.measureText(item.label, headerStyle(tokens.text), 100_000).width),
+                .header => content = @max(content, factory.measureText(item.label, headerStyle(text), 100_000).width),
                 .action, .submenu => {
-                    var width = factory.measureText(item.label, labelStyle(tokens.text), 100_000).width;
-                    if (item.shortcut) |text| {
-                        row.shortcut_width = factory.measureText(text, shortcutStyle(tokens.text), 100_000).width;
+                    row.access = item.access orelse if (item.selectable()) pick: {
+                        const key = pickAccessKey(item.label, used) orelse break :pick null;
+                        used.set(accessBit(key).?);
+                        break :pick key;
+                    } else null;
+                    if (row.access) |key| {
+                        const cue = cueLabel(state.alloc, item.label, key, state.suffixes) catch
+                            Cue{ .text = item.label, .underline = accessIndex(item.label, key) };
+                        row.text = cue.text;
+                        row.underline = cue.underline;
+                    }
+                    var width = factory.measureText(row.text, labelStyle(text), 100_000).width;
+                    if (item.shortcut) |shortcut| {
+                        row.shortcut_width = factory.measureText(shortcut, shortcutStyle(text), 100_000).width;
                         width += metrics.shortcut_gap + row.shortcut_width;
                     }
                     content = @max(content, width);
                 },
             }
-            y += row.height;
         }
-        self.height = y + metrics.pad_y;
+        self.content_px = y + style.px(metrics.pad_y, s);
         const trailing = metrics.pad_x + if (self.chevron) metrics.chevron_size + metrics.chevron_gap else 0;
-        self.width = std.math.clamp(@ceil(self.label_x + content + trailing), metrics.min_width, metrics.max_width);
+        self.width_px = std.math.clamp(
+            style.pxCeil(self.label_x + content + trailing, s),
+            style.px(metrics.min_width, s),
+            style.px(metrics.max_width, s),
+        );
     }
 
     /// Compute `bounds`: at the anchor for the root, beside the parent
-    /// item for a submenu, kept within the monitor's work area.
+    /// item for a submenu, within the monitor's work area.
     fn place(self: *Level) void {
         const state = self.state;
-        const w = style.px(self.width, self.scale);
-        const h = style.px(self.height, self.scale);
-        var x: i32 = undefined;
-        var y: i32 = undefined;
-        var work: w32.RECT = undefined;
         if (self.index == 0) {
             const anchor = state.anchor;
-            work = workArea(anchor);
-            x = if (anchor.x + w <= work.right) anchor.x else anchor.x - w;
-            y = if (anchor.y + h <= work.bottom) anchor.y else anchor.y - h;
+            const work = workArea(.{
+                .x = anchor.left + @divTrunc(anchor.right - anchor.left, 2),
+                .y = anchor.top + @divTrunc(anchor.bottom - anchor.top, 2),
+            });
+            self.bounds = placeRoot(anchor, self.width_px, self.content_px, work, state.alignment);
         } else {
             const parent = &state.levels[self.index - 1];
-            const row = parent.rows[self.parent_item.?];
-            const overlap = style.px(metrics.submenu_overlap, self.scale);
-            const item_top = parent.bounds.top + style.px(row.y, parent.scale);
-            work = workArea(.{ .x = @divTrunc(parent.bounds.left + parent.bounds.right, 2), .y = item_top });
-            x = parent.bounds.right - overlap;
-            if (x + w > work.right) x = parent.bounds.left + overlap - w;
-            y = item_top - style.px(metrics.pad_y, self.scale);
+            const item_top = parent.screenTop(self.parent_item.?);
+            const work = workArea(.{ .x = @divTrunc(parent.bounds.left + parent.bounds.right, 2), .y = item_top });
+            self.bounds = placeSubmenu(
+                parent.bounds,
+                item_top,
+                self.width_px,
+                self.content_px,
+                work,
+                style.px(metrics.submenu_overlap, self.scale),
+                style.px(metrics.pad_y, self.scale),
+            );
         }
-        x = @max(work.left, @min(x, work.right - w));
-        y = @max(work.top, @min(y, work.bottom - h));
-        self.bounds = .{ .left = x, .top = y, .right = x + w, .bottom = y + h };
+        const view = self.bounds.bottom - self.bounds.top;
+        self.arrow_px = if (self.content_px > view) style.px(metrics.arrow_height, self.scale) else 0;
+        self.scroll_px = std.math.clamp(self.scroll_px, 0, self.maxScroll());
     }
 
-    fn setHot(self: *Level, item: ?usize) void {
-        if (self.hot == item) return;
-        self.hot = item;
+    fn releaseLayouts(self: *Level) void {
+        for (self.rows) |*row| {
+            if (row.label_layout) |*text_layout| text_layout.deinit();
+            if (row.shortcut_layout) |*text_layout| text_layout.deinit();
+            row.label_layout = null;
+            row.shortcut_layout = null;
+        }
+    }
+
+    /// The top of row `item` on the screen.
+    fn screenTop(self: *const Level, item: usize) i32 {
+        return self.bounds.top + self.arrow_px + self.rows[item].top - self.scroll_px;
+    }
+
+    /// The height of the rows' view in pixels (between the arrow strips).
+    fn viewHeight(self: *const Level) i32 {
+        return self.bounds.bottom - self.bounds.top - 2 * self.arrow_px;
+    }
+
+    fn maxScroll(self: *const Level) i32 {
+        if (self.arrow_px == 0) return 0;
+        return @max(0, self.content_px - self.viewHeight());
+    }
+
+    /// Scroll to `offset` pixels; whether that moved the content.
+    fn scrollTo(self: *Level, offset: i32) bool {
+        const value = std.math.clamp(offset, 0, self.maxScroll());
+        if (value == self.scroll_px) return false;
+        self.scroll_px = value;
         self.popup.invalidate();
+        return true;
+    }
+
+    /// Scroll row `item` into the view.
+    fn ensureVisible(self: *Level, item: usize) void {
+        if (self.arrow_px == 0) return;
+        const row = self.rows[item];
+        const pad = style.px(metrics.pad_y, self.scale);
+        if (row.top < self.scroll_px) {
+            _ = self.scrollTo(row.top - pad);
+        } else if (row.top + row.height > self.scroll_px + self.viewHeight()) {
+            _ = self.scrollTo(row.top + row.height + pad - self.viewHeight());
+        }
+    }
+
+    /// The row at `y` pixels from the top of the content.
+    fn rowAt(self: *const Level, y: i32) ?usize {
+        for (self.rows, 0..) |row, index| {
+            if (y >= row.top and y < row.top + row.height) return index;
+        }
+        return null;
+    }
+
+    fn setHot(self: *Level, item: ?usize, keyboard: bool) void {
+        const by_keyboard = keyboard and item != null;
+        if (self.hot == item and self.hot_keyboard == by_keyboard) return;
+        self.hot = item;
+        self.hot_keyboard = by_keyboard;
+        self.popup.invalidate();
+    }
+
+    /// Highlight `item` from the keyboard and scroll it into view.
+    fn select(self: *Level, item: ?usize) void {
+        self.setHot(item, true);
+        if (item) |i| self.ensureVisible(i);
     }
 
     /// The next selectable item after `from` (or the first/last one),
@@ -501,99 +968,160 @@ const Level = struct {
         return from;
     }
 
-    /// Whether `item` is drawn highlighted: it is hot, or its submenu is
-    /// open.
-    fn highlighted(self: *const Level, item: usize) bool {
-        if (self.hot == item) return true;
-        const state = self.state;
-        return state.depth > self.index + 1 and state.levels[self.index + 1].parent_item == item;
+    /// The item Page Up or Page Down moves to from `from`: about a view
+    /// further in a scrolling menu, else the first or last item.
+    fn page(self: *const Level, from: ?usize, direction: Direction) ?usize {
+        const start = from orelse return self.step(null, direction);
+        if (self.arrow_px == 0) return self.step(null, switch (direction) {
+            .next => .previous,
+            .previous => .next,
+        });
+        return pageFrom(self.rows, self.items(), start, self.viewHeight(), direction);
+    }
+
+    /// The access keys of the rows that can be picked.
+    fn accessKeys(self: *const Level, buf: []?u8) []const ?u8 {
+        const n = @min(buf.len, self.rows.len);
+        for (self.items()[0..n], self.rows[0..n], buf[0..n]) |item, row, *key| {
+            key.* = if (item.selectable()) row.access else null;
+        }
+        return buf[0..n];
     }
 
     fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
         const self: *Level = @ptrCast(@alignCast(ctx));
         const tokens = self.state.host.tokens;
         const size = popup.sizeDip();
-        const scale = popup.scale();
-        canvas.fillRect(.{ .x = 0, .y = 0, .w = size.width, .h = size.height }, tokens.surface_raised);
+        const s = self.scale;
+        canvas.fillRect(.{ .x = 0, .y = 0, .w = size.width, .h = size.height }, Fills.of(tokens).surface);
 
-        for (self.items(), self.rows, 0..) |item, row, i| switch (item.kind) {
-            .separator => canvas.fillRect(.{
-                .x = metrics.inset,
-                .y = snap(row.y + row.height / 2, scale),
-                .w = size.width - 2 * metrics.inset,
-                .h = 1 / scale,
-            }, tokens.border),
-            .header => canvas.drawText(item.label, .{
-                .x = self.label_x,
-                .y = row.y,
-                .w = @max(size.width - self.label_x - metrics.pad_x, 0),
-                .h = row.height,
-            }, headerStyle(tokens.text_secondary)),
-            .action, .submenu => self.paintItem(canvas, item, row, i, size.width),
-        };
+        const arrow = style.dip(self.arrow_px, s);
+        const scrolls = self.arrow_px > 0;
+        if (scrolls) canvas.pushClip(.{ .x = 0, .y = arrow, .w = size.width, .h = @max(0, size.height - 2 * arrow) });
+        for (self.items(), self.rows, 0..) |item, *row, i| {
+            const top = style.dip(row.top + self.arrow_px - self.scroll_px, s);
+            const height = style.dip(row.height, s);
+            if (top + height <= arrow or top >= size.height - arrow) continue;
+            switch (item.kind) {
+                .separator => canvas.hairlineH(
+                    metrics.inset,
+                    top + style.dip(@divTrunc(row.height, 2), s),
+                    size.width - 2 * metrics.inset,
+                    tokens.border,
+                ),
+                .header => canvas.drawText(item.label, .{
+                    .x = self.label_x,
+                    .y = top,
+                    .w = @max(size.width - self.label_x - metrics.pad_x, 0),
+                    .h = height,
+                }, headerStyle(tokens.text_secondary)),
+                .action, .submenu => self.paintItem(canvas, item, row, top, height, i, size.width),
+            }
+        }
+        if (scrolls) {
+            canvas.popClip();
+            const up = if (self.scroll_px > 0) tokens.text_secondary else tokens.text_disabled;
+            const down = if (self.scroll_px < self.maxScroll()) tokens.text_secondary else tokens.text_disabled;
+            canvas.drawIcon(chevron_up_glyph, .{ .x = 0, .y = 0, .w = size.width, .h = arrow }, style.icon.small, up);
+            canvas.drawIcon(d2d.icons.chevron_down, .{ .x = 0, .y = size.height - arrow, .w = size.width, .h = arrow }, style.icon.small, down);
+        }
+        if (ownBorder()) canvas.strokeRoundedRectPx(.{ .x = 0, .y = 0, .w = size.width, .h = size.height }, 0, tokens.border, 1);
     }
 
-    fn paintItem(self: *Level, canvas: *d2d.Canvas, item: Item, row: Row, index: usize, width: f32) void {
-        const tokens = self.state.host.tokens;
-        if (item.selectable() and self.highlighted(index)) {
-            const pressed = if (self.state.press) |p| p.level == self.index and p.item == index else false;
-            canvas.fillRoundedRect(.{
+    fn paintItem(self: *Level, canvas: *d2d.Canvas, item: Item, row: *Row, top: f32, height: f32, index: usize, width: f32) void {
+        const state = self.state;
+        const tokens = state.host.tokens;
+        const hot = item.selectable() and self.hot == index;
+        if (hot) {
+            const pressed = if (state.press) |p| p.level == self.index and p.item == index else false;
+            const fill = canvas.snapRect(.{
                 .x = metrics.inset,
-                .y = row.y + 2,
+                .y = top + 2,
                 .w = width - 2 * metrics.inset,
-                .h = row.height - 4,
-            }, metrics.highlight_radius, if (pressed) tokens.pressed else tokens.hover);
-            canvas.fillRoundedRect(.{
-                .x = metrics.inset,
-                .y = row.y + (row.height - metrics.accent_height) / 2,
-                .w = metrics.accent_width,
-                .h = metrics.accent_height,
-            }, metrics.accent_width / 2, tokens.accent);
+                .h = height - 4,
+            });
+            const fills = Fills.of(tokens);
+            canvas.fillRoundedRect(fill, style.radius.control, if (pressed) fills.pressed else fills.hover);
+            // Only the keyboard's choice gets the indicator, as in the
+            // command palette; the pointer is its own.
+            if (self.hot_keyboard) controls.selectionIndicator(canvas, fill, tokens);
         }
 
-        const text_color = if (item.enabled) tokens.text else tokens.text_disabled;
-        const secondary = if (item.enabled) tokens.text_secondary else tokens.text_disabled;
+        const on_hover = hot and tokens.high_contrast;
+        const text_color = if (!item.enabled) tokens.text_disabled else if (on_hover) tokens.hover_text else tokens.text;
+        const secondary = if (!item.enabled) tokens.text_disabled else if (on_hover) tokens.hover_text else tokens.text_secondary;
 
-        const lead: d2d.Rect = .{ .x = metrics.pad_x, .y = row.y, .w = metrics.icon_size, .h = row.height };
+        const lead: d2d.Rect = .{ .x = metrics.pad_x, .y = top, .w = metrics.icon_size, .h = height };
         switch (item.mark) {
-            .check => canvas.drawIcon(check_glyph, lead, 14, text_color),
+            .check => canvas.drawIcon(d2d.icons.check_mark, lead, style.icon.small, text_color),
             .radio => {
                 const d = metrics.radio_size;
-                canvas.fillRoundedRect(.{
+                canvas.fillRoundedRect(canvas.snapRect(.{
                     .x = lead.x + (lead.w - d) / 2,
-                    .y = row.y + (row.height - d) / 2,
+                    .y = top + (height - d) / 2,
                     .w = d,
                     .h = d,
-                }, d / 2, text_color);
+                }), d / 2, text_color);
             },
-            .none => if (item.icon) |glyph| canvas.drawIcon(glyph, lead, metrics.icon_size, text_color),
+            .none => if (item.icon_text) |emoji| {
+                canvas.drawText(emoji, lead, .{
+                    .size = style.font_size.body,
+                    .color = text_color,
+                    .align_x = .center,
+                    .ellipsis = false,
+                });
+            } else if (item.icon) |glyph| canvas.drawIcon(glyph, lead, metrics.icon_size, text_color),
         }
 
         var right = width - metrics.pad_x;
         if (self.chevron) {
             if (item.kind == .submenu) canvas.drawIcon(d2d.icons.chevron_right, .{
                 .x = right - metrics.chevron_size,
-                .y = row.y,
+                .y = top,
                 .w = metrics.chevron_size,
-                .h = row.height,
-            }, 10, secondary);
+                .h = height,
+            }, metrics.chevron_size, secondary);
             right -= metrics.chevron_size + metrics.chevron_gap;
         }
         if (item.shortcut) |text| {
-            canvas.drawText(text, .{
+            const shortcut_rect: d2d.Rect = .{
                 .x = self.label_x,
-                .y = row.y,
+                .y = top,
                 .w = @max(right - self.label_x, 0),
-                .h = row.height,
-            }, shortcutStyle(secondary));
+                .h = height,
+            };
+            if (row.shortcut_layout == null or row.shortcut_layout_width != shortcut_rect.w) {
+                if (row.shortcut_layout) |*text_layout| text_layout.deinit();
+                row.shortcut_layout = d2d.TextLayout.initUtf8(canvas.factory, text, shortcutStyle(secondary), shortcut_rect.w, height);
+                row.shortcut_layout_width = shortcut_rect.w;
+            }
+            if (row.shortcut_layout) |*text_layout| {
+                canvas.drawLayout(text_layout, .{ .x = shortcut_rect.x, .y = top }, secondary, &.{});
+            } else canvas.drawText(text, shortcut_rect, shortcutStyle(secondary));
             right -= row.shortcut_width + metrics.shortcut_gap;
         }
-        canvas.drawText(item.label, .{
+        const label_rect: d2d.Rect = .{
             .x = self.label_x,
-            .y = row.y,
+            .y = top,
             .w = @max(right - self.label_x, 0),
-            .h = row.height,
-        }, labelStyle(text_color));
+            .h = height,
+        };
+        if (row.label_layout == null or row.label_width != label_rect.w) {
+            if (row.label_layout) |*text_layout| text_layout.deinit();
+            row.label_layout = d2d.TextLayout.initUtf8(canvas.factory, row.text, labelStyle(text_color), label_rect.w, height);
+            row.label_width = label_rect.w;
+        }
+        if (row.label_layout) |*text_layout| {
+            var runs: [1]d2d.LayoutRun = undefined;
+            const underline = if (state.cues) row.underline else null;
+            if (underline) |at| {
+                const start = wstr.utf16Index(row.text, at);
+                const len = std.unicode.utf8ByteSequenceLength(row.text[at]) catch 1;
+                const stop = wstr.utf16Index(row.text, at + len);
+                runs[0] = .{ .start = @intCast(start), .len = @intCast(stop - start), .underline = true };
+            }
+            canvas.drawLayout(text_layout, .{ .x = label_rect.x, .y = top }, text_color, if (underline != null) &runs else &.{});
+        } else canvas.drawText(row.text, label_rect, labelStyle(text_color));
     }
 
     /// The root popup lost the mouse capture.
@@ -608,6 +1136,7 @@ const Level = struct {
     fn dpiChanged(ctx: *anyopaque, popup: *Popup) void {
         const self: *Level = @ptrCast(@alignCast(ctx));
         self.scale = popup.scale();
+        self.layout();
         self.place();
         popup.setBounds(self.bounds);
     }
@@ -617,14 +1146,22 @@ const State = struct {
     host: Host,
     owner: w32.HWND,
     alloc: Allocator,
-    anchor: w32.POINT,
+    anchor: w32.RECT,
+    alignment: Align,
     owner_scale: ?f32,
+    /// The popup of each level, created when the level first opens and
+    /// reused by every submenu shown there until the menu closes.
+    popups: [max_depth]Popup = @splat(.{}),
     levels: [max_depth]Level = undefined,
     depth: usize = 0,
     result: Result = .open,
     /// The foreground window when the menu opened.
     foreground: ?w32.HWND,
     pending: ?Pending = null,
+    /// The pointer rests in the aim triangle of an open submenu: when to
+    /// let the row under it take the highlight.
+    aim_due: ?u64 = null,
+    autoscroll: ?AutoScroll = null,
     /// The item a mouse button is held on.
     press: ?ItemRef = null,
     /// A mouse button went down inside the menu.
@@ -638,82 +1175,99 @@ const State = struct {
     drag_x: u32,
     drag_y: u32,
     show_delay: u64,
-    /// The keys that were down when the menu opened. Their releases go on
-    /// to the focused window, which saw them go down.
+    /// The keys that were down when the menu opened. While they stay down
+    /// their auto-repeat does nothing, and their releases go on to the
+    /// focused window, which saw them go down.
     held_keys: std.StaticBitSet(256),
+    /// Underline the access keys (opened from the keyboard, a key was
+    /// pressed, or Windows always underlines them).
+    cues: bool,
+    /// Show the access key of a label without it as "(K)": opened from
+    /// the keyboard.
+    suffixes: bool,
 
     /// Open `list` as the next level; `parent_item` is the item of the
     /// current deepest level it belongs to.
-    fn open(self: *State, list: *const List, parent_item: ?usize, select_first: bool) bool {
+    fn open(self: *State, list: *const List, parent_item: ?usize, keyboard: bool) bool {
         if (self.depth >= max_depth) return false;
+        const span = if (perf.enabled()) perf.Span.begin(global.io()) else null;
+        defer if (span) |value| {
+            _ = value.end(global.io(), "menu.open");
+        };
         const index = self.depth;
         const level = &self.levels[index];
-        level.* = .{ .state = self, .index = index, .list = list, .parent_item = parent_item };
+        const popup = &self.popups[index];
+        level.* = .{ .state = self, .index = index, .popup = popup, .list = list, .parent_item = parent_item };
         level.rows = self.alloc.alloc(Row, list.items.items.len) catch return false;
-        const tokens = self.host.tokens;
-        level.popup.create(self.host.hinstance, self.owner, self.host.factory, .{
-            .activate = false,
-            .capture_mouse = index == 0,
-            .dismiss_on_escape = false,
-            .dismiss_on_outside_click = index == 0,
-            .corners = .round,
-            .shadow = true,
-            .border_color = tokens.border,
-            .dark = tokens.dark,
-        }, .{
-            .ctx = level,
-            .paint = Level.paint,
-            .dismissed = Level.dismissed,
-            .dpi_changed = Level.dpiChanged,
-        }) catch |err| {
-            log.warn("failed to create a menu popup err={}", .{err});
-            return false;
-        };
+        @memset(level.rows, .{});
+        if (popup.hwnd == null) {
+            const tokens = self.host.tokens;
+            popup.create(self.host.hinstance, self.owner, self.host.factory, .{
+                .activate = false,
+                .capture_mouse = index == 0,
+                .dismiss_on_escape = false,
+                .dismiss_on_outside_click = index == 0,
+                .corners = .round,
+                .shadow = true,
+                .border_color = tokens.border,
+                .dark = tokens.dark,
+                // Fade in (`anim.enabled`); `open` sets the direction.
+                .motion = .{},
+            }, .{
+                .ctx = level,
+                .paint = Level.paint,
+                .dismissed = Level.dismissed,
+                .dpi_changed = Level.dpiChanged,
+            }) catch |err| {
+                log.warn("failed to create a menu popup err={}", .{err});
+                return false;
+            };
+            if (self.owner_scale) |owner_scale| popup.setOwnerScale(owner_scale);
+        }
         self.depth += 1;
 
-        if (self.owner_scale) |owner_scale| level.popup.setOwnerScale(owner_scale);
-        level.scale = level.popup.ownerScale();
+        level.scale = popup.ownerScale();
         level.layout();
-        if (select_first) level.hot = level.step(null, .next);
+        if (keyboard) level.hot = level.step(null, .next);
+        level.hot_keyboard = level.hot != null;
         level.place();
-        const hwnd = level.popup.hwnd.?;
-        setCloaked(hwnd, true);
-        level.popup.show(level.bounds);
-        if (level.popup.scale() != level.scale) {
-            level.scale = level.popup.scale();
+        popup.options.motion = .{ .offset_y = if (index == 0) self.slideFor(level.bounds) else 0 };
+        popup.show(level.bounds);
+        if (popup.scale() != level.scale) {
+            level.scale = popup.scale();
+            level.layout();
             level.place();
-            level.popup.setBounds(level.bounds);
+            popup.setBounds(level.bounds);
         }
-        _ = w32.UpdateWindow(hwnd);
-        level.reveal_at = GetTickCount64() + reveal_ms;
+        if (level.hot) |item| level.ensureVisible(item);
         if (index > 0) self.levels[index - 1].popup.invalidate();
         return true;
     }
 
-    /// Paint popups that are due again and uncloak them.
-    fn reveal(self: *State, now: u64) void {
-        for (self.levels[0..self.depth]) |*level| {
-            const due = level.reveal_at orelse continue;
-            if (now < due) continue;
-            level.reveal_at = null;
-            const hwnd = level.popup.hwnd orelse continue;
-            level.popup.invalidate();
-            _ = w32.UpdateWindow(hwnd);
-            setCloaked(hwnd, false);
-        }
+    fn slideFor(self: *const State, bounds: w32.RECT) f32 {
+        return if (bounds.top >= self.anchor.bottom) -metrics.slide else metrics.slide;
     }
 
-    /// Close the levels from `index` on.
+    /// Close the levels from `index` on; their popups hide for reuse.
     fn closeFrom(self: *State, index: usize) void {
         if (self.depth <= index) return;
         while (self.depth > index) {
             self.depth -= 1;
-            self.levels[self.depth].popup.destroy();
+            self.popups[self.depth].hide();
+            self.levels[self.depth].releaseLayouts();
         }
         if (self.press) |p| if (p.level >= index) {
             self.press = null;
         };
+        if (self.autoscroll) |a| if (a.level >= index) {
+            self.autoscroll = null;
+        };
         if (index > 0) self.levels[index - 1].popup.invalidate();
+    }
+
+    fn destroyPopups(self: *State) void {
+        self.closeFrom(0);
+        for (&self.popups) |*popup| popup.destroy();
     }
 
     fn dismiss(self: *State) void {
@@ -722,16 +1276,23 @@ const State = struct {
         for (self.levels[0..self.depth]) |*level| level.popup.hide();
     }
 
+    /// Show the access key underlines (a key was pressed).
+    fn showCues(self: *State) void {
+        if (self.cues) return;
+        self.cues = true;
+        for (self.levels[0..self.depth]) |*level| level.popup.invalidate();
+    }
+
     fn openSubmenu(self: *State, level_index: usize, item: usize, keyboard: bool) void {
         self.pending = null;
         const level = &self.levels[level_index];
         const entry = level.items()[item];
         if (!entry.selectable() or entry.kind != .submenu) return;
-        level.setHot(item);
+        level.setHot(item, keyboard);
         if (self.depth > level_index + 1 and self.levels[level_index + 1].parent_item == item) {
             if (keyboard) {
                 const child = &self.levels[level_index + 1];
-                if (child.hot == null) child.setHot(child.step(null, .next));
+                if (child.hot == null) child.select(child.step(null, .next));
             }
             return;
         }
@@ -757,14 +1318,15 @@ const State = struct {
     }
 
     fn loop(self: *State) void {
-        const timer = w32.SetTimer(null, 0, tick_ms, null);
-        defer if (timer != 0) {
-            _ = w32.KillTimer(null, timer);
-        };
         var msg: w32.MSG = undefined;
         while (self.result == .open) {
-            const got = w32.GetMessageW(&msg, null, 0, 0);
-            if (got == 0) {
+            if (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) == 0) {
+                const wait = self.waitMs(GetTickCount64());
+                _ = w32.MsgWaitForMultipleObjectsEx(0, null, wait, w32.QS_ALLINPUT, w32.MWMO_INPUTAVAILABLE);
+                self.tick();
+                continue;
+            }
+            if (msg.message == w32.WM_QUIT) {
                 // Leave a requested quit for the main loop; drop a
                 // withdrawn one.
                 const code = Popup.modalQuitCode(self.host.quit_requested.*, msg.wParam) orelse continue;
@@ -772,18 +1334,23 @@ const State = struct {
                 w32.PostQuitMessage(code);
                 break;
             }
-            if (got < 0) {
-                self.dismiss();
-                break;
-            }
-            const own_tick = msg.message == w32.WM_TIMER and msg.hwnd == null and msg.wParam == timer;
-            if (!own_tick and !self.input(&msg)) _ = w32.DispatchMessageW(&msg);
+            if (!self.input(&msg)) _ = w32.DispatchMessageW(&msg);
             self.tick();
         }
     }
 
+    /// How long the loop may sleep: until the next deadline, at most
+    /// `watch_ms`.
+    fn waitMs(self: *const State, now: u64) u32 {
+        var due = now + watch_ms;
+        if (self.pending) |p| due = @min(due, p.due);
+        if (self.aim_due) |aim| due = @min(due, aim);
+        if (self.autoscroll) |a| due = @min(due, a.due);
+        return @intCast(due -| now);
+    }
+
     /// Dismiss the menu when its owner went away or another window came
-    /// to the foreground, reveal new popups and apply a due submenu change.
+    /// to the foreground, and act on the deadlines that passed.
     fn tick(self: *State) void {
         if (self.result != .open) return;
         if (!ownerAlive(self.owner) or w32.GetForegroundWindow() != self.foreground) {
@@ -791,7 +1358,14 @@ const State = struct {
             return;
         }
         const now = GetTickCount64();
-        self.reveal(now);
+        if (self.aim_due) |due| if (now >= due) {
+            self.aim_due = null;
+            if (self.hitTest(self.last_pt)) |hit| self.pointAt(hit);
+        };
+        if (self.autoscroll) |*auto| if (now >= auto.due) {
+            auto.due = now + autoscroll_ms;
+            self.autoscrollStep(auto.*);
+        };
         const pending = self.pending orelse return;
         if (now < pending.due) return;
         self.pending = null;
@@ -803,11 +1377,29 @@ const State = struct {
         }
     }
 
+    fn autoscrollStep(self: *State, auto: AutoScroll) void {
+        if (auto.level >= self.depth) {
+            self.autoscroll = null;
+            return;
+        }
+        const level = &self.levels[auto.level];
+        const step_px = style.px(metrics.autoscroll_step, level.scale);
+        const target = switch (auto.direction) {
+            .up => level.scroll_px - step_px,
+            .down => level.scroll_px + step_px,
+        };
+        if (!level.scrollTo(target)) {
+            self.autoscroll = null;
+            return;
+        }
+        self.closeFrom(auto.level + 1);
+    }
+
     /// Handle keyboard and mouse input. Returns false for messages to
     /// dispatch normally.
     fn input(self: *State, msg: *const w32.MSG) bool {
         switch (msg.message) {
-            w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => self.key(@truncate(msg.wParam)),
+            w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => self.key(@truncate(msg.wParam), msg.hwnd),
             w32.WM_KEYUP, w32.WM_SYSKEYUP => {
                 const vk: u8 = @truncate(msg.wParam);
                 if (self.held_keys.isSet(vk)) {
@@ -815,12 +1407,12 @@ const State = struct {
                     return false;
                 }
             },
+            w32.WM_MOUSEWHEEL => self.wheel(msg),
             w32.WM_CHAR,
             w32.WM_DEADCHAR,
             w32.WM_SYSCHAR,
             w32.WM_SYSDEADCHAR,
             WM_UNICHAR,
-            w32.WM_MOUSEWHEEL,
             w32.WM_MOUSEHWHEEL,
             => {},
             w32.WM_MOUSEMOVE, WM_NCMOUSEMOVE => self.mouseMove(msg.pt),
@@ -855,50 +1447,114 @@ const State = struct {
         return true;
     }
 
-    fn key(self: *State, vk: u16) void {
+    /// A key went down in `target` (the focused window).
+    fn key(self: *State, raw: u16, target: ?w32.HWND) void {
+        var vk = raw;
+        if (vk == w32.VK_PROCESSKEY) {
+            // The input method took the key: act on the key itself.
+            const hwnd = target orelse return;
+            const real = ImmGetVirtualKey(hwnd);
+            if (real == 0 or real > 0xFF or real == w32.VK_PROCESSKEY) return;
+            vk = @intCast(real);
+        }
+        // The auto-repeat of a key that opened the menu.
+        if (vk < 256 and self.held_keys.isSet(vk)) return;
+        if (!self.handleKey(vk)) return;
+        if (raw == w32.VK_PROCESSKEY) if (target) |hwnd| cancelComposition(hwnd);
+    }
+
+    /// Act on key `vk` in the deepest menu; whether the menu used it.
+    fn handleKey(self: *State, vk: u16) bool {
         const level = &self.levels[self.depth - 1];
+        highlightPath(self.levels[0..self.depth], level.index);
         self.pending = null;
+        self.aim_due = null;
+        self.autoscroll = null;
         switch (vk) {
-            w32.VK_UP => level.setHot(level.step(level.hot, .previous)),
-            w32.VK_DOWN => level.setHot(level.step(level.hot, .next)),
-            w32.VK_HOME, w32.VK_PRIOR => level.setHot(level.step(null, .next)),
-            w32.VK_END, w32.VK_NEXT => level.setHot(level.step(null, .previous)),
+            w32.VK_UP => level.select(level.step(level.hot, .previous)),
+            w32.VK_DOWN => level.select(level.step(level.hot, .next)),
+            w32.VK_HOME => level.select(level.step(null, .next)),
+            w32.VK_END => level.select(level.step(null, .previous)),
+            w32.VK_PRIOR => level.select(level.page(level.hot, .previous)),
+            w32.VK_NEXT => level.select(level.page(level.hot, .next)),
             w32.VK_RIGHT => if (level.hot) |item| {
                 if (level.items()[item].kind == .submenu) self.openSubmenu(level.index, item, true);
             },
-            w32.VK_LEFT => if (self.depth > 1) self.closeFrom(self.depth - 1),
-            w32.VK_ESCAPE => if (self.depth > 1) self.closeFrom(self.depth - 1) else self.dismiss(),
+            w32.VK_LEFT, w32.VK_ESCAPE => {
+                if (self.depth > 1) {
+                    const parent = &self.levels[self.depth - 2];
+                    self.closeFrom(self.depth - 1);
+                    parent.select(parent.hot);
+                } else if (vk == w32.VK_ESCAPE) self.dismiss();
+            },
             w32.VK_RETURN, w32.VK_SPACE => if (level.hot) |item| self.activate(level.index, item),
             w32.VK_MENU, w32.VK_F10 => self.dismiss(),
-            else => {},
+            else => {
+                const key_char = accessChar(vk) orelse return false;
+                if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) return false;
+                self.accessKey(level, key_char);
+            },
         }
+        self.showCues();
+        return true;
+    }
+
+    fn accessKey(self: *State, level: *Level, key_char: u8) void {
+        const buf = self.alloc.alloc(?u8, level.rows.len) catch return;
+        defer self.alloc.free(buf);
+        const target = accessTarget(level.accessKeys(buf), level.hot, key_char) orelse return;
+        level.select(target.item);
+        if (target.unique) self.activate(level.index, target.item);
+    }
+
+    /// The wheel turned (`WM_MOUSEWHEEL`): scroll the menu under the
+    /// pointer.
+    fn wheel(self: *State, msg: *const w32.MSG) void {
+        const pt: w32.POINT = .{
+            .x = @as(i16, @truncate(msg.lParam & 0xFFFF)),
+            .y = @as(i16, @truncate((msg.lParam >> 16) & 0xFFFF)),
+        };
+        const delta: i16 = @bitCast(@as(u16, @truncate(msg.wParam >> 16)));
+        const hit = self.hitTest(pt) orelse return;
+        const level = &self.levels[hit.level];
+        if (level.arrow_px == 0) return;
+        const notches = @as(f32, @floatFromInt(delta)) / @as(f32, @floatFromInt(w32.WHEEL_DELTA));
+        const distance = style.px(notches * metrics.wheel_rows * metrics.item_height, level.scale);
+        if (!level.scrollTo(level.scroll_px - distance)) return;
+        self.closeFrom(hit.level + 1);
+        // The rows moved under the pointer.
+        if (self.hitTest(self.last_pt)) |now| self.pointAt(now);
     }
 
     const Hit = struct {
         level: usize,
         /// The row under the point, of any kind.
-        item: ?usize,
+        item: ?usize = null,
+        /// The arrow strip under the point.
+        arrow: ?Scroll = null,
     };
 
-    /// The menu (deepest first) and row at screen point `pt`.
-    fn hitTest(self: *State, pt: w32.POINT) ?Hit {
+    /// The menu (deepest first) and row or arrow strip at screen point
+    /// `pt`.
+    fn hitTest(self: *const State, pt: w32.POINT) ?Hit {
         var i = self.depth;
         while (i > 0) {
             i -= 1;
             const level = &self.levels[i];
             const b = level.bounds;
             if (pt.x < b.left or pt.x >= b.right or pt.y < b.top or pt.y >= b.bottom) continue;
-            const y = @as(f32, @floatFromInt(pt.y - b.top)) / level.scale;
-            for (level.rows, 0..) |row, index| {
-                if (y >= row.y and y < row.y + row.height) return .{ .level = i, .item = index };
+            const y = pt.y - b.top;
+            if (level.arrow_px > 0) {
+                if (y < level.arrow_px) return .{ .level = i, .arrow = .up };
+                if (y >= b.bottom - b.top - level.arrow_px) return .{ .level = i, .arrow = .down };
             }
-            return .{ .level = i, .item = null };
+            return .{ .level = i, .item = level.rowAt(y - level.arrow_px + level.scroll_px) };
         }
         return null;
     }
 
     /// The selectable item of a hit, if any.
-    fn hitItem(self: *State, hit: Hit) ?usize {
+    fn hitItem(self: *const State, hit: Hit) ?usize {
         const index = hit.item orelse return null;
         return if (self.levels[hit.level].items()[index].selectable()) index else null;
     }
@@ -907,19 +1563,56 @@ const State = struct {
         // Windows also reports a move when windows change under a resting
         // pointer; only real movement changes the highlight.
         if (pt.x == self.last_pt.x and pt.y == self.last_pt.y) return;
+        const from = self.last_pt;
         self.last_pt = pt;
         if (@abs(pt.x - self.start_pt.x) > self.drag_x or
             @abs(pt.y - self.start_pt.y) > self.drag_y) self.dragged = true;
 
         const hit = self.hitTest(pt) orelse {
-            self.levels[self.depth - 1].setHot(null);
+            self.aim_due = null;
+            self.autoscroll = null;
+            self.levels[self.depth - 1].setHot(null, false);
             self.pending = null;
             return;
         };
+        if (self.aiming(from, pt, hit)) {
+            self.aim_due = GetTickCount64() + aim_ms;
+            return;
+        }
+        self.aim_due = null;
+        self.pointAt(hit);
+    }
+
+    /// Whether the pointer, moving from `from` to `to` over another row of
+    /// a menu with an open submenu, heads for that submenu.
+    fn aiming(self: *const State, from: w32.POINT, to: w32.POINT, hit: Hit) bool {
+        if (hit.arrow != null or hit.level + 1 >= self.depth) return false;
+        const child = &self.levels[hit.level + 1];
+        if (self.hitItem(hit)) |item| if (item == child.parent_item) return false;
+        const parent = &self.levels[hit.level];
+        const b = child.bounds;
+        const right = b.left >= @divTrunc(parent.bounds.left + parent.bounds.right, 2);
+        return inAimTriangle(from, to, if (right) b.left else b.right, b.top, b.bottom);
+    }
+
+    /// The pointer is at `hit`: highlight the row (and the path to its
+    /// menu), auto-scroll on an arrow strip, and open or close submenus
+    /// after the show delay.
+    fn pointAt(self: *State, hit: Hit) void {
         const level = &self.levels[hit.level];
+        if (hit.arrow) |direction| {
+            level.setHot(null, false);
+            highlightPath(self.levels[0..self.depth], hit.level);
+            self.pending = null;
+            const same = if (self.autoscroll) |a| a.level == hit.level and a.direction == direction else false;
+            if (!same) self.autoscroll = .{ .level = hit.level, .direction = direction, .due = GetTickCount64() };
+            return;
+        }
+        self.autoscroll = null;
         const item = self.hitItem(hit);
-        level.setHot(item);
-        for (self.levels[hit.level + 1 .. self.depth]) |*deeper| deeper.setHot(null);
+        level.setHot(item, false);
+        for (self.levels[hit.level + 1 .. self.depth]) |*deeper| deeper.setHot(null, false);
+        highlightPath(self.levels[0..self.depth], hit.level);
 
         const submenu_item: ?usize = if (item) |i|
             (if (level.items()[i].kind == .submenu) i else null)
@@ -949,7 +1642,8 @@ const State = struct {
         switch (level.items()[item].kind) {
             .submenu => self.openSubmenu(hit.level, item, false),
             .action => {
-                level.setHot(item);
+                level.setHot(item, false);
+                highlightPath(self.levels[0..self.depth], hit.level);
                 self.press = .{ .level = hit.level, .item = item };
                 level.popup.invalidate();
             },
@@ -973,14 +1667,146 @@ const State = struct {
     }
 };
 
+/// The access key a virtual key types: its letter or digit (the main
+/// keyboard and the number pad).
+fn accessChar(vk: u16) ?u8 {
+    return switch (vk) {
+        '0'...'9', 'A'...'Z' => @intCast(vk),
+        w32.VK_NUMPAD0...w32.VK_NUMPAD9 => @intCast('0' + (vk - w32.VK_NUMPAD0)),
+        else => null,
+    };
+}
+
+/// Drop the composition the input method started with a key the menu
+/// used.
+fn cancelComposition(hwnd: w32.HWND) void {
+    const himc = w32.ImmGetContext(hwnd) orelse return;
+    defer _ = w32.ImmReleaseContext(hwnd, himc);
+    _ = ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+}
+
+// -----------------------------------------------------------------------
+// Native menus
+// -----------------------------------------------------------------------
+
+const TPMPARAMS = extern struct {
+    cbSize: u32 = @sizeOf(TPMPARAMS),
+    rcExclude: w32.RECT,
+};
+
+const MF_CHECKED: u32 = 0x0008;
+const MF_DISABLED: u32 = 0x0002;
+const MF_BYCOMMAND: u32 = 0x0000;
+const TPM_RIGHTBUTTON: u32 = 0x0002;
+const TPM_RIGHTALIGN: u32 = 0x0008;
+const TPM_VERTICAL: u32 = 0x0040;
+const TPM_NONOTIFY: u32 = 0x0080;
+
+extern "user32" fn CheckMenuRadioItem(hmenu: w32.HMENU, first: u32, last: u32, check: u32, flags: u32) callconv(.winapi) i32;
+
+/// Show the menu `root` as a native menu (`TrackPopupMenuEx`), for screen
+/// readers and when Direct2D is unavailable: the same items, access keys
+/// and shortcuts, with the same anchor and alignment. Returns like `run`.
+pub fn runNative(alloc: Allocator, owner: w32.HWND, root: *const List, options: Options) ?usize {
+    if (current != null or native_open) return null;
+    if (root.items.items.len == 0) return null;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const menu = nativeMenu(arena.allocator(), root) catch |err| {
+        log.err("failed to build a native menu err={}", .{err});
+        return null;
+    };
+    defer _ = w32.DestroyMenu(menu);
+
+    const anchor = options.anchor;
+    var flags: u32 = w32.TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | w32.TPM_TOPALIGN;
+    const x = switch (options.alignment) {
+        .left => anchor.left,
+        .right => anchor.right,
+    };
+    if (options.alignment == .right) flags |= TPM_RIGHTALIGN;
+    const empty = anchor.right <= anchor.left and anchor.bottom <= anchor.top;
+    if (!empty) flags |= TPM_VERTICAL;
+    const params: TPMPARAMS = .{ .rcExclude = anchor };
+    // Highlight the first item of a menu opened from the keyboard.
+    if (options.keyboard) _ = w32.PostMessageW(owner, w32.WM_KEYDOWN, w32.VK_DOWN, 0);
+
+    native_open = true;
+    defer native_open = false;
+    const cmd = w32.TrackPopupMenuEx(menu, flags, x, anchor.bottom, owner, if (empty) null else @ptrCast(&params));
+    if (!ownerAlive(owner) or cmd <= 0) return null;
+    return @intCast(cmd);
+}
+
+fn nativeMenu(alloc: Allocator, list: *const List) error{ Win32Error, OutOfMemory }!w32.HMENU {
+    const menu = w32.CreatePopupMenu() orelse return error.Win32Error;
+    errdefer _ = w32.DestroyMenu(menu);
+    var used: AccessSet = .initEmpty();
+    for (list.items.items) |item| if (item.access) |key| if (accessBit(key)) |bit| used.set(bit);
+    for (list.items.items) |item| {
+        switch (item.kind) {
+            .separator => _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null),
+            .header => {
+                const text = try nativeLabel(alloc, item.label, null, null);
+                _ = w32.AppendMenuW(menu, w32.MF_STRING | w32.MF_GRAYED | MF_DISABLED, 0, text);
+            },
+            .action, .submenu => {
+                const key = item.access orelse if (item.selectable()) pick: {
+                    const k = pickAccessKey(item.label, used) orelse break :pick null;
+                    used.set(accessBit(k).?);
+                    break :pick k;
+                } else null;
+                const text = try nativeLabel(alloc, item.label, key, item.shortcut);
+                var flags: u32 = w32.MF_STRING;
+                if (!item.selectable()) flags |= w32.MF_GRAYED;
+                if (item.mark != .none) flags |= MF_CHECKED;
+                var id: usize = item.id;
+                if (item.kind == .submenu) {
+                    const child = try nativeMenu(alloc, item.submenu.?);
+                    flags |= w32.MF_POPUP;
+                    id = @intFromPtr(child);
+                }
+                if (w32.AppendMenuW(menu, flags, id, text) == 0 and item.kind == .submenu) {
+                    _ = w32.DestroyMenu(@ptrFromInt(id));
+                }
+                if (item.kind == .action and item.mark == .radio) {
+                    const command: u32 = @intCast(item.id);
+                    _ = CheckMenuRadioItem(menu, command, command, command, MF_BYCOMMAND);
+                }
+            },
+        }
+    }
+    return menu;
+}
+
+/// A native menu label: `label` with `&` doubled, the access key marked
+/// with `&` (or appended as "(&K)"), then a tab and the shortcut.
+fn nativeLabel(alloc: Allocator, label: []const u8, key: ?u8, shortcut: ?[]const u8) Allocator.Error![*:0]const u16 {
+    var text: std.ArrayList(u8) = .empty;
+    const at = if (key) |k| accessIndex(label, k) else null;
+    for (label, 0..) |c, i| {
+        if (at != null and i == at.?) try text.append(alloc, '&');
+        if (c == '&') try text.append(alloc, '&');
+        try text.append(alloc, c);
+    }
+    if (key != null and at == null) try text.print(alloc, "(&{c})", .{std.ascii.toUpper(key.?)});
+    if (shortcut) |keys| try text.print(alloc, "\t{s}", .{keys});
+    return try wstr.allocZ(alloc, text.items);
+}
+
+// -----------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------
+
+const testing = std.testing;
+
 test "Builder copies text and nests submenus" {
-    const testing = std.testing;
     var builder: Builder = .init(testing.allocator);
     defer builder.deinit();
 
     var label_buf = "Copy".*;
     var shortcut_buf = "Ctrl+C".*;
-    try builder.add(&builder.root, .{ .id = 1, .label = &label_buf, .shortcut = &shortcut_buf });
+    try builder.add(&builder.root, .{ .id = 1, .label = &label_buf, .shortcut = &shortcut_buf, .access = 'c' });
     label_buf[0] = 'X';
     shortcut_buf[0] = 'X';
     try builder.separator(&builder.root);
@@ -993,6 +1819,7 @@ test "Builder copies text and nests submenus" {
     try testing.expectEqual(@as(usize, 5), items.len);
     try testing.expectEqualStrings("Copy", items[0].label);
     try testing.expectEqualStrings("Ctrl+C", items[0].shortcut.?);
+    try testing.expectEqual(@as(?u8, 'C'), items[0].access);
     try testing.expect(items[0].selectable());
     try testing.expect(!items[1].selectable());
     try testing.expect(!items[2].selectable());
@@ -1000,4 +1827,270 @@ test "Builder copies text and nests submenus" {
     try testing.expect(items[3].selectable());
     try testing.expectEqualStrings("Right", items[3].submenu.?.items.items[0].label);
     try testing.expect(!items[4].selectable());
+}
+
+fn rect(left: i32, top: i32, right: i32, bottom: i32) w32.RECT {
+    return .{ .left = left, .top = top, .right = right, .bottom = bottom };
+}
+
+test "placeRoot lines up with the anchor and flips at the work area edges" {
+    const work = rect(0, 0, 1920, 1040);
+    // A button at the right: right-aligned below it.
+    const button = rect(1800, 0, 1836, 40);
+    try testing.expectEqual(rect(1536, 40, 1836, 440), placeRoot(button, 300, 400, work, .right));
+    // Left-aligned, it would leave the screen: flipped to the right edge.
+    try testing.expectEqual(rect(1536, 40, 1836, 440), placeRoot(button, 300, 400, work, .left));
+    // A button at the left edge, right-aligned: flipped to its left edge.
+    const left_button = rect(10, 0, 46, 40);
+    try testing.expectEqual(rect(10, 40, 310, 440), placeRoot(left_button, 300, 400, work, .right));
+    // A point: below and to the right of it, else above or to the left.
+    const point = Options.at(.{ .x = 100, .y = 100 });
+    try testing.expectEqual(rect(100, 100, 400, 500), placeRoot(point, 300, 400, work, .left));
+    const corner = Options.at(.{ .x = 1900, .y = 1000 });
+    try testing.expectEqual(rect(1600, 600, 1900, 1000), placeRoot(corner, 300, 400, work, .left));
+    // No room below a button near the bottom: above it.
+    const low = rect(500, 900, 540, 940);
+    try testing.expectEqual(rect(500, 500, 800, 900), placeRoot(low, 300, 400, work, .left));
+}
+
+test "placeRoot keeps a tall menu on the screen and limits its height" {
+    const work = rect(0, 40, 1920, 1080);
+    // Fits neither below nor above the point: moved over it.
+    const middle = Options.at(.{ .x = 100, .y = 560 });
+    try testing.expectEqual(rect(100, 380, 400, 1080), placeRoot(middle, 300, 700, work, .left));
+    // Taller than the work area: as tall as it, from its top.
+    try testing.expectEqual(rect(100, 40, 400, 1080), placeRoot(middle, 300, 5000, work, .left));
+    // Wider than the work area: at its left edge.
+    try testing.expectEqual(@as(i32, 0), placeRoot(middle, 3000, 100, work, .right).left);
+    // A work area on a monitor left of the primary one.
+    const left_monitor = rect(-1920, 0, 0, 1040);
+    const anchor = rect(-60, 0, -24, 40);
+    try testing.expectEqual(rect(-324, 40, -24, 240), placeRoot(anchor, 300, 200, left_monitor, .right));
+}
+
+test "placeSubmenu opens beside the item and flips to the left" {
+    const work = rect(0, 0, 1920, 1040);
+    const parent = rect(100, 100, 400, 600);
+    try testing.expectEqual(rect(396, 196, 646, 496), placeSubmenu(parent, 200, 250, 300, work, 4, 4));
+    // No room on the right.
+    const right_parent = rect(1600, 100, 1900, 600);
+    try testing.expectEqual(rect(1354, 196, 1604, 496), placeSubmenu(right_parent, 200, 250, 300, work, 4, 4));
+    // Near the bottom: moved up to stay on the screen.
+    try testing.expectEqual(rect(396, 740, 646, 1040), placeSubmenu(parent, 900, 250, 300, work, 4, 4));
+}
+
+test "inAimTriangle follows a pointer heading for the submenu" {
+    // A submenu whose left edge runs at x = 300 from y = 100 to y = 400.
+    const from: w32.POINT = .{ .x = 200, .y = 150 };
+    // Diagonally down toward the submenu: in the triangle.
+    try testing.expect(inAimTriangle(from, .{ .x = 220, .y = 170 }, 300, 100, 400));
+    // Straight down along the parent: out of it.
+    try testing.expect(!inAimTriangle(from, .{ .x = 200, .y = 190 }, 300, 100, 400));
+    // Away from the submenu.
+    try testing.expect(!inAimTriangle(from, .{ .x = 180, .y = 160 }, 300, 100, 400));
+    // Too steep: below the line to the submenu's bottom corner.
+    try testing.expect(!inAimTriangle(from, .{ .x = 210, .y = 300 }, 300, 100, 400));
+    // No movement is no aim.
+    try testing.expect(!inAimTriangle(from, from, 300, 100, 400));
+    // A submenu on the left (its right edge at x = 100).
+    try testing.expect(inAimTriangle(from, .{ .x = 180, .y = 160 }, 100, 100, 400));
+}
+
+const FakeLevel = struct {
+    hot: ?usize = null,
+    keyboard: bool = false,
+    parent_item: ?usize = null,
+
+    fn setHot(self: *FakeLevel, item: ?usize, keyboard: bool) void {
+        self.hot = item;
+        self.keyboard = keyboard;
+    }
+};
+
+test "highlightPath lights the entries of the open submenus" {
+    // Root, a submenu opened from root item 2, and one from its item 1;
+    // the root's highlight had moved to item 5 on the way.
+    var levels = [_]FakeLevel{
+        .{ .hot = 5 },
+        .{ .hot = 3, .parent_item = 2 },
+        .{ .hot = null, .parent_item = 1 },
+    };
+    highlightPath(levels[0..], 2);
+    try testing.expectEqual(@as(?usize, 2), levels[0].hot);
+    try testing.expectEqual(@as(?usize, 1), levels[1].hot);
+    try testing.expectEqual(@as(?usize, null), levels[2].hot);
+    // In the middle level only the root follows.
+    levels[0].hot = 7;
+    levels[1].hot = 4;
+    highlightPath(levels[0..], 1);
+    try testing.expectEqual(@as(?usize, 2), levels[0].hot);
+    try testing.expectEqual(@as(?usize, 4), levels[1].hot);
+    // The root alone has no path.
+    highlightPath(levels[0..1], 0);
+    try testing.expectEqual(@as(?usize, 2), levels[0].hot);
+}
+
+test "pickAccessKey prefers word starts and skips taken keys" {
+    var used: AccessSet = .initEmpty();
+    try testing.expectEqual(@as(?u8, 'N'), pickAccessKey("New Tab", used));
+    used.set(accessBit('N').?);
+    try testing.expectEqual(@as(?u8, 'T'), pickAccessKey("New Tab", used));
+    used.set(accessBit('T').?);
+    try testing.expectEqual(@as(?u8, 'E'), pickAccessKey("New Tab", used));
+    try testing.expectEqual(@as(?u8, '7'), pickAccessKey("pwsh 7", blk: {
+        var s: AccessSet = .initEmpty();
+        s.set(accessBit('P').?);
+        break :blk s;
+    }));
+    // No ASCII letters: no key.
+    try testing.expectEqual(@as(?u8, null), pickAccessKey("简体中文", .initEmpty()));
+    try testing.expectEqual(@as(?u8, 'G'), pickAccessKey("新建 GX Zsh", .initEmpty()));
+}
+
+test "access keys in labels and the (K) suffix" {
+    const alloc = testing.allocator;
+    try testing.expectEqual(@as(?usize, 4), accessIndex("New Tab", 'T'));
+    // A word start wins over an earlier letter.
+    try testing.expectEqual(@as(?usize, 19), accessIndex("Open Configuration File", 'F'));
+    try testing.expectEqual(@as(?usize, 1), accessIndex("Settings…", 'E'));
+    try testing.expectEqual(@as(?usize, null), accessIndex("设置…", 'E'));
+
+    const in_label = try cueLabel(alloc, "New Tab", 't', true);
+    try testing.expectEqualStrings("New Tab", in_label.text);
+    try testing.expectEqual(@as(?usize, 4), in_label.underline);
+
+    const suffixed = try cueLabel(alloc, "新建标签页", 't', true);
+    defer alloc.free(suffixed.text);
+    try testing.expectEqualStrings("新建标签页(T)", suffixed.text);
+    try testing.expectEqual('T', suffixed.text[suffixed.underline.?]);
+
+    const ellipsis = try cueLabel(alloc, "设置…", 'E', true);
+    defer alloc.free(ellipsis.text);
+    try testing.expectEqualStrings("设置(E)…", ellipsis.text);
+    try testing.expectEqual('E', ellipsis.text[ellipsis.underline.?]);
+
+    // Without the suffix a translated label stays as it is.
+    const plain = try cueLabel(alloc, "设置…", 'E', false);
+    try testing.expectEqualStrings("设置…", plain.text);
+    try testing.expectEqual(@as(?usize, null), plain.underline);
+}
+
+test "accessTarget picks a unique key and cycles through shared ones" {
+    const keys = [_]?u8{ 'N', null, 'S', 'P', 'S', null };
+    try testing.expectEqual(AccessHit{ .item = 0, .unique = true }, accessTarget(&keys, null, 'n').?);
+    try testing.expectEqual(AccessHit{ .item = 3, .unique = true }, accessTarget(&keys, 4, 'P').?);
+    try testing.expectEqual(AccessHit{ .item = 2, .unique = false }, accessTarget(&keys, null, 'S').?);
+    try testing.expectEqual(AccessHit{ .item = 4, .unique = false }, accessTarget(&keys, 2, 'S').?);
+    // Wraps around after the last one.
+    try testing.expectEqual(AccessHit{ .item = 2, .unique = false }, accessTarget(&keys, 4, 'S').?);
+    try testing.expectEqual(@as(?AccessHit, null), accessTarget(&keys, null, 'X'));
+}
+
+test "native labels mark the access key and keep ampersands" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    try testing.expectEqualSlices(u16, L("New &Tab\tCtrl+Shift+T"), std.mem.span(try nativeLabel(alloc, "New Tab", 'T', "Ctrl+Shift+T")));
+    try testing.expectEqualSlices(u16, L("R&&D &Tools"), std.mem.span(try nativeLabel(alloc, "R&D Tools", 'T', null)));
+    try testing.expectEqualSlices(u16, L("设置(&E)"), std.mem.span(try nativeLabel(alloc, "设置", 'E', null)));
+    try testing.expectEqualSlices(u16, L("Header"), std.mem.span(try nativeLabel(alloc, "Header", null, null)));
+}
+
+test "accessChar reads letters, digits and the number pad" {
+    try testing.expectEqual(@as(?u8, 'A'), accessChar('A'));
+    try testing.expectEqual(@as(?u8, '7'), accessChar('7'));
+    try testing.expectEqual(@as(?u8, '3'), accessChar(w32.VK_NUMPAD3));
+    try testing.expectEqual(@as(?u8, null), accessChar(w32.VK_F5));
+}
+
+test "pageFrom moves by a viewport and skips disabled rows" {
+    var items: [12]Item = @splat(.{ .label = "row" });
+    items[3].enabled = false;
+    var rows: [12]Row = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .top = @intCast(i * 48), .height = 48 };
+    try testing.expectEqual(@as(usize, 2), pageFrom(&rows, &items, 0, 192, .next));
+    try testing.expectEqual(@as(usize, 5), pageFrom(&rows, &items, 2, 192, .next));
+    try testing.expectEqual(@as(usize, 2), pageFrom(&rows, &items, 5, 192, .previous));
+    try testing.expectEqual(@as(usize, 11), pageFrom(&rows, &items, 11, 192, .next));
+    try testing.expectEqual(@as(usize, 0), pageFrom(&rows, &items, 0, 192, .previous));
+}
+
+test "scrolling a long menu keeps the selected row visible" {
+    var popup: Popup = .{};
+    var rows: [40]Row = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .top = @intCast(6 + i * 48), .height = 48 };
+    var level: Level = .{
+        .state = undefined,
+        .index = 0,
+        .popup = &popup,
+        .list = undefined,
+        .parent_item = null,
+        .rows = &rows,
+        .scale = 1.5,
+        .content_px = 1932,
+        .bounds = rect(0, 0, 300, 600),
+        .arrow_px = 24,
+    };
+    level.ensureVisible(39);
+    try testing.expect(level.scroll_px > 0);
+    try testing.expect(rows[39].top + rows[39].height <= level.scroll_px + level.viewHeight());
+    level.ensureVisible(0);
+    try testing.expectEqual(@as(i32, 0), level.scroll_px);
+    try testing.expectEqual(@as(?usize, 0), level.rowAt(6));
+    try testing.expectEqual(@as(?usize, 1), level.rowAt(54));
+    try testing.expect(!level.scrollTo(0));
+}
+
+test "waitMs sleeps until a deadline rather than polling at 50 Hz" {
+    var state: State = undefined;
+    state.pending = null;
+    state.aim_due = null;
+    state.autoscroll = null;
+    try testing.expectEqual(@as(u32, 250), state.waitMs(1000));
+    state.pending = .{ .level = 0, .item = 1, .due = 1400 };
+    try testing.expectEqual(@as(u32, 250), state.waitMs(1000));
+    state.aim_due = 1100;
+    try testing.expectEqual(@as(u32, 100), state.waitMs(1000));
+    state.autoscroll = .{ .level = 0, .direction = .down, .due = 1016 };
+    try testing.expectEqual(@as(u32, 16), state.waitMs(1000));
+    try testing.expectEqual(@as(u32, 0), state.waitMs(1020));
+}
+
+test "light menus lift toward white without changing dark surfaces" {
+    const light = style.Tokens.fromColors(d2d.Color.hex(0xeeeeee), d2d.Color.hex(0x202020), d2d.Color.hex(0x0067c0));
+    const fills = Fills.of(light);
+    try testing.expect(fills.surface.r > light.background.r);
+    try testing.expect(style.contrast(light.text_secondary, fills.surface) >= 4.5);
+    const dark = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
+    try testing.expectEqual(dark.surface_raised, Fills.of(dark).surface);
+}
+
+test "Left restores the parent entry after hovering a sibling" {
+    var state: State = undefined;
+    state.depth = 2;
+    state.result = .open;
+    state.popups = @splat(.{});
+    state.press = null;
+    state.pending = null;
+    state.aim_due = null;
+    state.autoscroll = null;
+    state.cues = true;
+    for (0..2) |i| state.levels[i] = .{
+        .state = &state,
+        .index = i,
+        .popup = &state.popups[i],
+        .list = undefined,
+        .parent_item = if (i == 0) null else 2,
+        .hot = if (i == 0) 5 else null,
+    };
+    try testing.expect(state.handleKey(w32.VK_LEFT));
+    try testing.expectEqual(@as(usize, 1), state.depth);
+    try testing.expectEqual(@as(?usize, 2), state.levels[0].hot);
+    try testing.expect(state.levels[0].hot_keyboard);
+}
+
+test "inAimTriangle rejects degenerate edges" {
+    try testing.expect(!inAimTriangle(.{ .x = 300, .y = 150 }, .{ .x = 300, .y = 500 }, 300, 100, 400));
+    try testing.expect(!inAimTriangle(.{ .x = 200, .y = 150 }, .{ .x = 220, .y = 170 }, 300, 400, 400));
 }
