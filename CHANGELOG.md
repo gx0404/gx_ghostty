@@ -11,6 +11,12 @@
 
 ## 0.0.3(TBD)
 
+### Added
+
+- Windows 弹层输入框（查找栏、命令面板、快捷键速查表与设置浮层的搜索框）的编辑能力：撤销与重做（Ctrl+Z、Alt+Backspace 撤销，Ctrl+Y、Ctrl+Shift+Z 重做）、按词移动与删除（Ctrl+←/→、Ctrl+Backspace、Ctrl+Delete，连续的汉字算一个词）、Shift+Insert / Ctrl+Insert / Shift+Delete、双击选词与三击全选；插入符按系统频率闪烁，且只在输入框获得焦点时显示。
+- Windows 命令面板与设置浮层（主题、字体列表）的过滤支持拼音首字母（例如输入 `zt` 能找到「主题」），多个词按任意顺序匹配，全角字母数字按半角匹配；名称以输入开头或完全相同的条目排在前面。
+- 开发框架：`just win-gui`（Windows GUI 场景回放与截图取证，场景在 `test/gui/win32/`）、`just wsl scenario`（GTK 场景，在 `test/gui/gtk/`）、`just perf`（新旧构建交替测启动、新建标签、分屏与缩放耗时，报中位数与 p90）、`just pinyin` / `just pinyin-check`（拼音首字母表的生成与校验，`pinyin-check` 并入 `framework-check` 与 `generated-check`）；设 `GHOSTTY_GX_PERF=1` 时日志输出 `info(gx_perf)` 耗时打点；`gx-ci` 的 `windows-app` 与 `gtk-smoke` 增跑 GX 层单测。
+
 ### Changed
 
 - Windows 标签页标题：`set_tab_title` 与双击改名设的名字不再被程序标题（OSC 0/2）冲掉，改名留空或 `set_tab_title:`（空值）即恢复显示程序标题；标签页显示其中聚焦分屏的标题，切换分屏时随之更新。
@@ -19,6 +25,13 @@
 - Windows 分屏：关闭聚焦的分屏后，焦点落到它前一个分屏，没有时落到后一个（与 Linux、macOS 版一致）；放大（zoom）状态下切换分屏遵守 `split-preserve-zoom`；上一个、下一个分屏到头后回绕。
 - Windows 命令面板：空查询打开时不再自动预览主题（哪怕第一项是最近用过的主题），用方向键移动选择或输入筛选后才预览；按 Esc、关闭面板或面板所在终端关闭时恢复已保存的主题。
 - Windows 鼠标与编辑框：鼠标侧键报告为第 8、9 键（SGR 128/129），横向滚轮方向与 Linux 版一致并累积高精度滚动；查找栏、命令面板等弹层输入框里未绑定的 Ctrl 组合键不再漏进 shell，已绑定的动作（含 `chain`）照常执行。
+- Windows 界面配色：强调色改为依次从光标色、palette 4、palette 12 中挑第一个彩度与对比度都合格的颜色（GX Mocha 下由玫瑰白变为蓝色 `#89b4fa`，此前 657 个内置主题里有 362 个的强调色近乎灰色）；次要文字、占位符与边框按 WCAG 保证对比度；控件按下态比悬停态更淡；界面小字改用 Segoe UI Variable 的光学尺寸。
+- 关闭确认里列出的进程名不再带 `.exe`；终端里只剩 `wslrelay.exe` 时视为空闲，关闭 WSL 标签不再多问一次（`gx-idle-processes` 的内置名单同步写明）。
+- 启动配置不再列出 Docker Desktop、Rancher Desktop 的内部 WSL 发行版（名称以 `docker-desktop`、`rancher-desktop` 开头）。
+- Windows 标签栏每次刷新只拍一次系统进程快照（原来每个标签拍一次），标签多时 CPU 占用更低。
+- 配置诊断：`language` 填了不支持的值、`gui-settings.ghostty` 读不出来时会报告配置错误，`ghostty +validate-config` 因此返回 1。
+- GTK 切换界面语言与重新加载配置时在内存里重建配置，不再重新读盘。
+- Windows 便携包、安装包与 Linux deb 附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本。
 
 ### Fixed
 
@@ -31,6 +44,10 @@
 - Windows 鼠标：拖动中鼠标捕获被对话框等夺走时，向终端补发松开，按键不再卡在按下状态，之后的物理松开也不再重复报告。
 - Windows 上 `toggle_background_opacity` 切到不透明后，预览主题或从设置界面、命令面板重新加载配置不再把窗口变回半透明。
 - Windows 查找栏关闭后搜索高亮不再残留；新建窗口失败时不再留下不可见的窗口；设置浮层被页眉、页脚遮住的行不再能点中；`scrollbar = never` 生效，滚动条跟随系统「自动隐藏滚动条」设置，拖动中失去捕获时结束拖动；快速终端滑入时立即获得键盘焦点，创建失败不再崩溃。
+- Windows 对话框（关闭确认、关于等）被外部程序关闭（不带 `/F` 的 `taskkill`、UI 自动化的「关闭」等）时整个程序卡死、所有窗口点不动：现在按「取消」处理。
+- 外部程序批量发送关闭消息时，「关闭窗口？」确认框会弹两次。
+- 弹层输入框粘贴超长单行文本（MB 级）时明显卡顿：粘贴上限为 4096 个 UTF-16 单元，超出部分截断。
+- 界面里路径与标题的中间省略不再把组合字符、emoji 序列或国旗拆开。
 
 ## 0.0.2(2026-10-10)
 
