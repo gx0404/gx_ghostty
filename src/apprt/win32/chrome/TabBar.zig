@@ -119,6 +119,10 @@ painted_area_w: i32 = 0,
 /// The widths kept since a tab closed through its close button.
 frozen: ?tab_layout.Frozen = null,
 
+geometry_cache: tab_layout.Cache = .{},
+labels: [max_tabs]CachedLabel = [_]CachedLabel{.{}} ** max_tabs,
+polling: tab_layout.Polling = .{},
+
 /// Inline renaming: what is renamed, the text field over it (a popup, or
 /// an Edit control and its font without Direct2D) and where the popup
 /// shows (screen pixels).
@@ -238,6 +242,35 @@ const ChromeCache = struct {
     chrome: gx.chrome.Chrome,
 };
 
+const CachedLabel = struct {
+    layout: ?d2d.TextLayout = null,
+    text: [tabs.max_title_len * 3 + 64]u8 = undefined,
+    len: usize = 0,
+    width: f32 = 0,
+    height: f32 = 0,
+
+    fn get(self: *CachedLabel, factory: *d2d.Factory, text: []const u8, area: d2d.Rect) ?*const d2d.TextLayout {
+        if (self.layout == null or self.width != area.w or self.height != area.h or !std.mem.eql(u8, self.text[0..self.len], text)) {
+            self.deinit();
+            const span: ?gx.perf.Span = if (gx.perf.enabled()) .begin(global.io()) else null;
+            defer if (span) |s| {
+                _ = s.end(global.io(), "tabs.layout_create");
+            };
+            self.layout = d2d.TextLayout.initUtf8(factory, text, .{ .size = title_font_size }, area.w, area.h) orelse return null;
+            @memcpy(self.text[0..text.len], text);
+            self.len = text.len;
+            self.width = area.w;
+            self.height = area.h;
+        }
+        return &self.layout.?;
+    }
+
+    fn deinit(self: *CachedLabel) void {
+        if (self.layout) |*layout| layout.deinit();
+        self.layout = null;
+    }
+};
+
 /// A part of the tab bar.
 pub const Part = union(enum) {
     none,
@@ -292,9 +325,9 @@ fn windowConst(self: *const TabBar) *const Window {
     return @alignCast(@fieldParentPtr("tab_bar", self));
 }
 
-/// Release what the tab bar holds: the rename field, the drag hook and
-/// animation, and the cached outline.
+/// Release the rename field, drag hook, animation and drawing caches.
 pub fn deinit(self: *TabBar) void {
+    for (&self.labels) |*label| label.deinit();
     self.rename_target = .none;
     self.rename_popup.destroy();
     if (self.rename_font) |font| {
@@ -343,8 +376,12 @@ pub fn invalidate(self: *TabBar) void {
 /// when they are hidden).
 pub fn geometry(self: *const TabBar, lay: TitleBar.Layout) tab_layout.Layout {
     if (!self.visible or lay.height() <= 0) return .{ .scale = lay.scale };
+    return self.geometry_cache.get(self.geometryInput(lay));
+}
+
+fn geometryInput(self: *const TabBar, lay: TitleBar.Layout) tab_layout.Input {
     const win = self.windowConst();
-    return tab_layout.compute(.{
+    return .{
         .area = .{ .left = lay.tabs.left, .top = lay.tabs.top, .right = lay.tabs.right, .bottom = lay.bar.bottom },
         .hit_top = if (self.reachesTop()) lay.bar.top else lay.tabs.top,
         .scale = lay.scale,
@@ -353,7 +390,7 @@ pub fn geometry(self: *const TabBar, lay: TitleBar.Layout) tab_layout.Layout {
         .badge = self.elevated orelse false,
         .frozen = self.frozen,
         .scroll = self.scroll,
-    });
+    };
 }
 
 /// Whether the tabs take clicks up to the top of the window: it is
@@ -509,12 +546,16 @@ fn colorsFor(self: *TabBar, ctx: TitleBar.PaintContext) Colors {
 
     // The active tab joins the terminal: with per-pixel translucency it
     // has the terminal's own translucent background.
-    var active_fill = chrome.active_tab;
+    var active_fill = if (@hasField(TitleBar.PaintContext, "tab_fill")) ctx.tab_fill else chrome.active_tab;
     const see_through = ctx.translucent and Backdrop.perPixel(config, win.app.alpha_frames);
     if (see_through and !t.high_contrast) {
-        const bg = config.background;
-        const f = tab_layout.straightFill(.{ bg.r, bg.g, bg.b }, config.@"background-opacity", config.@"alpha-blending".isLinear());
-        active_fill = .{ .r = f.r, .g = f.g, .b = f.b, .a = f.a };
+        if (@hasDecl(Backdrop, "straightColor")) {
+            active_fill = Backdrop.straightColor(config);
+        } else {
+            const bg = config.background;
+            const f = tab_layout.straightFill(.{ bg.r, bg.g, bg.b }, config.@"background-opacity", config.@"alpha-blending".isLinear());
+            active_fill = .{ .r = f.r, .g = f.g, .b = f.b, .a = f.a };
+        }
     }
 
     var c: Colors = undefined;
@@ -566,6 +607,10 @@ fn colorsFor(self: *TabBar, ctx: TitleBar.PaintContext) Colors {
 /// Paint the tabs (or, when they are hidden, the window title) into the
 /// chrome row.
 pub fn paint(self: *TabBar, ctx: TitleBar.PaintContext) void {
+    const span: ?gx.perf.Span = if (gx.perf.enabled()) .begin(global.io()) else null;
+    defer if (span) |s| {
+        _ = s.end(global.io(), "tabs.paint");
+    };
     const win = self.window();
     const lay = ctx.layout;
     if (!self.visible) {
@@ -589,7 +634,7 @@ pub fn paint(self: *TabBar, ctx: TitleBar.PaintContext) void {
         if (g0.overflow) self.scroll = g0.revealScroll(win.active_tab);
     }
 
-    const g = self.geometry(lay);
+    const g = self.geometry_cache.update(self.geometryInput(lay));
     const colors = self.colorsFor(ctx);
     const canvas = ctx.canvas;
     self.new_tab_rect = rect(g.new_tab);
@@ -744,7 +789,7 @@ fn paintTab(
             .tab_close => |h| h == i,
             else => false,
         };
-        const close_pressed = switch (self.pressed) {
+        const close_pressed = close_hovered and switch (self.pressed) {
             .tab_close => |p| p == i,
             else => false,
         };
@@ -799,32 +844,17 @@ fn paintTab(
     if (text_right - x < 4) return;
     var title_buf: [768]u8 = undefined;
     const lbl = self.labelOf(i, &title_buf);
-    drawLabel(canvas, .{ .x = x, .y = r.y, .w = text_right - x, .h = r.h }, lbl, program_color, title_color);
+    self.drawLabel(canvas, i, .{ .x = x, .y = r.y, .w = text_right - x, .h = r.h }, lbl, program_color, title_color);
 }
 
-/// Draw a label in `rect`: the program part in its color, then the title,
-/// trimmed with an ellipsis.
-fn drawLabel(canvas: *d2d.Canvas, area: d2d.Rect, lbl: tab_layout.Label, program_color: d2d.Color, title_color: d2d.Color) void {
-    const text_style = struct {
-        fn of(color: d2d.Color) d2d.TextStyle {
-            return .{ .size = title_font_size, .color = color };
-        }
-    };
-    if (lbl.program.len == 0) {
-        canvas.drawText(lbl.title, area, text_style.of(title_color));
-        return;
-    }
-    var buf: [96]u8 = undefined;
-    const head = std.fmt.bufPrint(&buf, "{s}{s}", .{ lbl.program, tab_layout.separator }) catch lbl.program;
-    const head_w = canvas.measureText(head, text_style.of(program_color), 100_000).width;
-    if (head_w >= area.w * 0.6) {
-        canvas.drawText(lbl.program, area, text_style.of(program_color));
-        return;
-    }
-    var head_style = text_style.of(program_color);
-    head_style.ellipsis = false;
-    canvas.drawText(head, .{ .x = area.x, .y = area.y, .w = head_w + 1, .h = area.h }, head_style);
-    canvas.drawText(lbl.title, .{ .x = area.x + head_w, .y = area.y, .w = area.w - head_w, .h = area.h }, text_style.of(title_color));
+/// Draw the complete label with one kept layout and a secondary program run.
+fn drawLabel(self: *TabBar, canvas: *d2d.Canvas, i: usize, area: d2d.Rect, lbl: tab_layout.Label, program_color: d2d.Color, title_color: d2d.Color) void {
+    var buf: [tabs.max_title_len * 3 + 64]u8 = undefined;
+    const text = lbl.write(&buf);
+    const layout = self.labels[i].get(canvas.factory, text, area) orelse return;
+    const program_len = @import("../ui/wstr.zig").utf16Index(text, @min(lbl.program.len, text.len));
+    const runs = [_]d2d.LayoutRun{.{ .start = 0, .len = @intCast(program_len), .color = program_color }};
+    canvas.drawLayout(layout, .{ .x = area.x, .y = area.y }, title_color, if (program_len == 0) &.{} else &runs);
 }
 
 /// A progress ring in `area`: the share done in the accent (red for an
@@ -971,9 +1001,7 @@ fn labelOf(self: *const TabBar, i: usize, buf: []u8) tab_layout.Label {
     const title = utf16ToUtf8(buf, win.tab_titles[i][0..win.tab_title_lens[i]]);
     const entry = self.processFor(i);
     const program: ?tab_layout.Program = if (entry) |e| .{ .name = e.name(), .idle = e.idle, .wsl = e.wsl, .shell = e.shell() } else null;
-    var default_buf: [16]u8 = undefined;
-    const default_title = utf16ToUtf8(&default_buf, tabs.default_title);
-    return tab_layout.label(win.tab_title_overrides[i] != null, title, default_title, program);
+    return tab_layout.label(win.tab_title_overrides[i] != null, title, "Ghostty", program);
 }
 
 /// The label tab `i` shows, as one line in `buf` (`program · title`), or
@@ -1006,11 +1034,11 @@ pub const Tip = struct {
 pub fn tooltip(self: *const TabBar, target: TitleBar.TooltipTarget, lay: TitleBar.Layout, buf: []u8) ?Tip {
     const i18n = gx.i18n;
     return switch (target) {
-        .none, .menu => null,
         .new_tab => .{ .text = withShortcut(buf, i18n.tr("New tab"), self.shortcut(.new_tab)), .anchor = self.new_tab_rect },
         .profiles => .{ .text = withShortcut(buf, i18n.tr("New Tab with Profile"), null), .anchor = self.profile_rect },
         .tab_close => |i| .{ .text = withShortcut(buf, i18n.tr("Close tab"), self.shortcut(.{ .close_tab = .this })), .anchor = self.closeRect(lay, i) },
         .tab => |i| .{ .text = self.tooltipText(i, buf) orelse return null, .anchor = self.tabRect(i) },
+        else => null,
     };
 }
 
@@ -1037,22 +1065,31 @@ const Shortcut = struct {
 /// `text`, followed by ` (Ctrl+Shift+T)` when there is a shortcut, in
 /// `buf`.
 fn withShortcut(buf: []u8, text: []const u8, keys: ?Shortcut) []const u8 {
+    const kept = tab_layout.utf8Prefix(text, buf.len);
     var writer: std.Io.Writer = .fixed(buf);
-    writer.writeAll(text) catch return writer.buffered();
-    if (keys) |k| writer.print(" ({s})", .{k.text()}) catch {};
+    writer.writeAll(kept) catch unreachable;
+    if (kept.len == text.len) {
+        if (keys) |k| {
+            var key_buf: [64]u8 = undefined;
+            const suffix = std.fmt.bufPrint(&key_buf, " ({s})", .{k.text()}) catch return writer.buffered();
+            writer.writeAll(tab_layout.utf8Prefix(suffix, buf.len - kept.len)) catch unreachable;
+        }
+    }
     return writer.buffered();
 }
 
 fn utf16ToUtf8(buf: []u8, units: []const u16) []const u8 {
-    var out: std.Io.Writer = .fixed(buf);
+    var used: usize = 0;
     var it = std.unicode.Utf16LeIterator.init(units);
     while (true) {
         const cp = it.nextCodepoint() catch 0xFFFD orelse break;
         var tmp: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(cp, &tmp) catch continue;
-        out.writeAll(tmp[0..len]) catch break;
+        if (len > buf.len - used) break;
+        @memcpy(buf[used..][0..len], tmp[0..len]);
+        used += len;
     }
-    return out.buffered();
+    return buf[0..used];
 }
 
 // -----------------------------------------------------------------------
@@ -1536,16 +1573,16 @@ const escape_hook = struct {
 // Status: new output, bell, programs
 // -----------------------------------------------------------------------
 
-/// Called once per second by the window: mark background tabs whose
-/// terminals printed something, refresh the programs every two seconds,
-/// and repaint when a tab's status changed (a progress report went stale).
+/// Poll visible tabs; inactive windows check content and programs every
+/// five seconds, but stale progress always clears on the next tick.
 pub fn onTimer(self: *TabBar) void {
     const win = self.window();
     const hwnd = win.hwnd orelse return;
     if (w32.IsWindowVisible_(hwnd) == 0 or IsIconic(hwnd) != 0) return;
     self.ticks +%= 1;
     escape_hook.collect();
-    var changed = self.checkUnread();
+    var changed = false;
+    if (self.polling.unreadDue(GetTickCount64(), win.title_bar.active, self.visible, win.tab_count)) changed = self.checkUnread();
     if (self.visible) {
         refreshProgramsOfApp(win.app);
         for (0..@min(win.tab_count, max_tabs)) |i| {
@@ -1563,6 +1600,10 @@ pub fn onTimer(self: *TabBar) void {
 fn checkUnread(self: *TabBar) bool {
     const win = self.window();
     const io = global.io();
+    const span: ?gx.perf.Span = if (gx.perf.enabled()) .begin(io) else null;
+    defer if (span) |s| {
+        _ = s.end(io, "tabs.unread_check");
+    };
     var changed = false;
     for (0..win.tab_count) |i| {
         if (i == win.active_tab or win.tab_unread[i]) continue;
@@ -1678,23 +1719,38 @@ fn processFor(self: *const TabBar, i: usize) ?*const ProcessName {
 /// How often the programs are looked up.
 const programs_period_ms: u64 = 2000;
 
-/// The period of the last lookup, shared by every window: the first window
-/// whose timer fires in a period looks up the programs of all windows, so
-/// there is one process table per period however many windows and tabs
-/// there are, and none while every window is minimized.
-var programs_period: u64 = 0;
+/// A single lookup shared by all windows, at least two seconds apart.
+var programs_last_refresh_ms: ?u64 = null;
+
+fn programsDue(win: *Window, now: u64) bool {
+    const hwnd = win.hwnd orelse return false;
+    return win.tab_bar.visible and w32.IsWindowVisible_(hwnd) != 0 and IsIconic(hwnd) == 0 and
+        win.tab_bar.polling.programsDue(now, win.title_bar.active);
+}
 
 fn refreshProgramsOfApp(app: *App) void {
-    const period = GetTickCount64() / programs_period_ms;
-    if (period == programs_period) return;
-    programs_period = period;
+    const now = GetTickCount64();
+    if (!tab_layout.due(programs_last_refresh_ms, now, programs_period_ms)) return;
+    var needed = false;
+    for (app.windows.items) |win| {
+        if (programsDue(win, now)) {
+            needed = true;
+            break;
+        }
+    }
+    if (!needed) return;
+    programs_last_refresh_ms = now;
+    const span: ?gx.perf.Span = if (gx.perf.enabled()) .begin(global.io()) else null;
+    defer if (span) |s| {
+        _ = s.end(global.io(), "tabs.process_poll");
+    };
     const table = app.processTable() catch |err| {
         log.debug("cannot list the processes for the tab labels err={}", .{err});
         return;
     };
     for (app.windows.items) |win| {
-        const hwnd = win.hwnd orelse continue;
-        if (!win.tab_bar.visible or w32.IsWindowVisible_(hwnd) == 0 or IsIconic(hwnd) != 0) continue;
+        if (!programsDue(win, now)) continue;
+        win.tab_bar.polling.programs_ms = now;
         if (win.tab_bar.refreshPrograms(table)) win.tab_bar.invalidate();
     }
 }
@@ -1727,17 +1783,16 @@ fn refreshPrograms(self: *TabBar, table: *gx.proc.Table) bool {
             for (roots[0..count], next[0..count]) |root, *entry| {
                 const pid = root orelse continue;
                 const program = (tree.program(alloc, pid) catch null) orelse continue;
-                const len = @min(program.name.len, entry.buf.len);
-                @memcpy(entry.buf[0..len], program.name[0..len]);
-                entry.len = @intCast(len);
+                const name = tab_layout.utf8Prefix(program.name, entry.buf.len);
+                @memcpy(entry.buf[0..name.len], name);
+                entry.len = @intCast(name.len);
                 entry.wsl = program.wsl;
                 entry.idle = gx.policy.isIdle(&.{program.name}, idle_list);
                 entry.kind = gx.leader.treeKind(alloc, tree, pid) catch .local;
                 if (tree.find(pid)) |index| {
-                    const shell = gx.policy.displayName(tree.processes[index].name);
-                    const shell_len = @min(shell.len, entry.shell_buf.len);
-                    @memcpy(entry.shell_buf[0..shell_len], shell[0..shell_len]);
-                    entry.shell_len = @intCast(shell_len);
+                    const shell = tab_layout.utf8Prefix(gx.policy.displayName(tree.processes[index].name), entry.shell_buf.len);
+                    @memcpy(entry.shell_buf[0..shell.len], shell);
+                    entry.shell_len = @intCast(shell.len);
                 }
             }
         } else |_| {}
@@ -2122,6 +2177,7 @@ pub fn onCommand(self: *TabBar, wparam: usize) bool {
 /// The UI language changed: repaint (labels come from the model; the
 /// tooltips are translated when shown).
 pub fn onLanguageChanged(self: *TabBar) void {
+    for (&self.labels) |*label| label.deinit();
     self.invalidate();
     self.rename_popup.invalidate();
 }
@@ -2175,6 +2231,22 @@ test "tooltips append the shortcut" {
     keys.len = text.len;
     try testing.expectEqualStrings("New tab (Ctrl+Shift+T)", withShortcut(&buf, "New tab", keys));
     try testing.expectEqualStrings("New tab", withShortcut(&buf, "New tab", null));
+}
+
+test "tooltip and title buffers keep complete utf8 codepoints" {
+    const testing = std.testing;
+    var keys: Shortcut = .{};
+    const chord = "Ctrl+\u{2192}";
+    @memcpy(keys.buf[0..chord.len], chord);
+    keys.len = chord.len;
+    var buf: [40]u8 = undefined;
+    const title = "\u{6C49}\u{1F47B}";
+    const units = std.unicode.utf8ToUtf16LeStringLiteral(title);
+    for (0..buf.len + 1) |limit| {
+        try testing.expect(std.unicode.utf8ValidateSlice(withShortcut(buf[0..limit], title, keys)));
+        try testing.expect(std.unicode.utf8ValidateSlice(utf16ToUtf8(buf[0..limit], units)));
+    }
+    try testing.expectEqualStrings("\u{6C49}", utf16ToUtf8(buf[0..6], units));
 }
 
 test {
