@@ -913,3 +913,6 @@ msgstr "重置界面设置"
 
 msgid "Press Reset Interface Settings again to confirm."
 msgstr "再按一次“重置界面设置”以确认。"
+
+msgid "An unexpected error occurred."
+msgstr "发生了未知错误。"

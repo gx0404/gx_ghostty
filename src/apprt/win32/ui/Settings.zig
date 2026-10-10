@@ -2355,7 +2355,18 @@ fn setStatus(self: *Settings, kind: StatusKind, comptime msgid: [:0]const u8, ar
 
 /// `setStatus` with the translated reason of `err` as `{reason}`.
 fn setStatusReason(self: *Settings, kind: StatusKind, comptime msgid: [:0]const u8, err: anyerror) void {
-    self.setStatus(kind, msgid, .{ .reason = i18n.trRuntime(settings_map.errorReason(err)) });
+    self.setStatus(kind, msgid, .{ .reason = i18n.trRuntime(errorMessage(err)) });
+}
+
+fn errorMessage(err: anyerror) [:0]const u8 {
+    const reason = settings_map.errorReason(err);
+    return if (std.mem.eql(u8, reason, @errorName(err))) "An unexpected error occurred." else reason;
+}
+
+test "settings errors keep known reasons and localize unknown errors" {
+    try std.testing.expectEqualStrings("Permission denied.", errorMessage(error.PermissionDenied));
+    try std.testing.expectEqualStrings("The file is in use by another program.", errorMessage(error.SharingViolation));
+    try std.testing.expectEqualStrings("An unexpected error occurred.", errorMessage(error.Unexpected));
 }
 
 fn clearStatus(self: *Settings) void {

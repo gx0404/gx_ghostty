@@ -31,6 +31,7 @@ pub const entries = [_]Entry{
     .{ .key = "Always", .msgstr = "总是" },
     .{ .key = "An application is attempting to read from the clipboard. The current clipboard contents are shown below.", .msgstr = "一个应用正在试图从剪贴板读取内容。剪贴板目前的内容如下：" },
     .{ .key = "An application is attempting to write to the clipboard. The current clipboard contents are shown below.", .msgstr = "一个应用正在试图向剪贴板写入内容。剪贴板目前的内容如下：" },
+    .{ .key = "An unexpected error occurred.", .msgstr = "发生了未知错误。" },
     .{ .key = "Another program changed the file at the same time. Try again.", .msgstr = "另一个程序同时修改了该文件，请重试。" },
     .{ .key = "Appearance", .msgstr = "外观" },
     .{ .key = "Application", .msgstr = "应用" },
