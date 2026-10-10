@@ -1020,7 +1020,8 @@ const ProfileItems = struct {
             var buf: [64]u8 = undefined;
             const shortcut = hints.text(action, &buf);
             const icon = profileIcon(profile.kind);
-            const access = MenuPopup.pickAccessKey(profile.name, used);
+            const access = MenuPopup.pickAccessKey(profile.name_arg orelse profile.name, used) orelse
+                (if (profile.kind == .wsl) MenuPopup.pickAccessKey("WSL", used) else null);
             if (access) |key| used.set(if (key >= 'A') 10 + @as(usize, key - 'A') else key - '0');
             try menu.add(list, .{
                 .id = first + i,
@@ -1365,6 +1366,7 @@ test "profile access keys use English names in either UI language" {
             .profiles = &.{
                 .{ .id = "cmd", .name = "Command Prompt", .command = .{ .command_line = "cmd.exe" }, .kind = .cmd },
                 .{ .id = "custom:Copy", .name = "Copy", .command = .{ .command_line = "cmd.exe" }, .kind = .custom },
+                .{ .id = "wsl:Fedora", .name = "WSL: {name}", .name_arg = "Fedora", .command = .{ .command_line = "wsl.exe" }, .kind = .wsl },
             },
         },
     };
@@ -1377,6 +1379,8 @@ test "profile access keys use English names in either UI language" {
         try launch.append(&menu, &menu.root, .{ .set = &set }, .tab);
         try testing.expectEqual(@as(?u8, 'C'), menu.root.items.items[0].access);
         try testing.expectEqual(@as(?u8, 'O'), menu.root.items.items[1].access);
+        try testing.expectEqual(@as(?u8, 'F'), menu.root.items.items[2].access);
+        try testing.expect(MenuPopup.accessIndex(menu.root.items.items[2].label, 'F') != null);
         try testing.expectEqualStrings(i18n.tr("Command Prompt"), menu.root.items.items[0].label);
     }
 }

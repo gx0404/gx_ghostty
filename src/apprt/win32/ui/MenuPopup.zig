@@ -1457,6 +1457,9 @@ const State = struct {
             if (real == 0 or real > 0xFF or real == w32.VK_PROCESSKEY) return;
             vk = @intCast(real);
         }
+        if (perf.enabled()) log.debug("menu key raw={} vk={} held={} ctrl={} depth={}", .{
+            raw, vk, vk < 256 and self.held_keys.isSet(vk), w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0, self.depth,
+        });
         // The auto-repeat of a key that opened the menu.
         if (vk < 256 and self.held_keys.isSet(vk)) return;
         if (!self.handleKey(vk)) return;
