@@ -17,9 +17,10 @@
 //! Lifecycle: `show` from hidden keeps the window cloaked until it painted
 //! once (synchronously) and a frame passed (timer `RV`), so DWM never
 //! shows it empty; `show` and `setBounds` leave an unchanged window alone.
-//! WM_CLOSE (Alt+F4, the system close) hides the popup instead of
-//! destroying it and, with `Options.close_owner_on_close`, closes the
-//! window it belongs to. When Windows destroys the popup with its owner
+//! WM_CLOSE (Alt+F4, the system close) hides a shown popup instead of
+//! destroying it, reports `.owner` and, for an activating popup with
+//! `Options.close_owner_on_close`, closes the window it belongs to; a
+//! hidden popup ignores it. When Windows destroys the popup with its owner
 //! (WM_NCDESTROY), `hwnd` becomes null and the render target goes; the
 //! owner frees the rest with `destroy` or recreates it with `create`.
 //! With `Options.keep_owner_active` an activating popup sends
@@ -172,8 +173,11 @@ pub const Options = struct {
     accessible_name: []const u8 = "",
     /// Release the render target while hidden (popups shown rarely).
     release_target_on_hide: bool = false,
-    /// On WM_CLOSE also close the root owner window (Alt+F4 closes the
-    /// window, not just the popup); modal dialogs turn it off.
+    /// When an activating popup gets WM_CLOSE (Alt+F4, the system close),
+    /// also close its root owner window: Alt+F4 closes the window, not just
+    /// the popup. Modal dialogs turn it off and treat the close as Cancel
+    /// (`Callbacks.dismissed` with `.owner`). Popups that never take the
+    /// focus only hide.
     close_owner_on_close: bool = true,
 };
 
@@ -1252,14 +1256,19 @@ fn setCursorShape(cursor: Cursor) void {
     _ = w32.SetCursor(w32.LoadCursorW(null, id));
 }
 
-/// WM_CLOSE (Alt+F4, the system close): hide instead of being destroyed,
-/// and close the window the popup belongs to when asked to.
-fn handleClose(self: *Popup) void {
+/// WM_CLOSE (Alt+F4, the system close, a close sent from outside): hide
+/// instead of being destroyed, report `.owner`, and close the window the
+/// popup belongs to when asked to (`Options.close_owner_on_close`). A
+/// popup that is not shown ignores it: a close sent to every window of
+/// the app (`taskkill` without /F) reaches that window itself, and passing
+/// it on as well would ask to close it twice.
+fn handleClose(self: *Popup, hwnd: w32.HWND) void {
+    if (!self.visible and w32.IsWindowVisible_(hwnd) == 0) return;
     const root = self.rootOwner();
-    self.dismiss(.owner);
-    if (!self.options.close_owner_on_close) return;
+    if (self.visible) self.dismiss(.owner) else self.hide();
+    if (!self.options.close_owner_on_close or !self.options.activate) return;
     const target = root orelse return;
-    if (self.hwnd) |hwnd| if (hwnd == target) return;
+    if (hwnd == target) return;
     _ = w32.PostMessageW(target, w32.WM_CLOSE, 0, 0);
 }
 
@@ -1491,13 +1500,13 @@ fn wndProc(
         },
         WM_SYSCOMMAND => {
             if (wparam & 0xFFF0 == SC_CLOSE) {
-                self.handleClose();
+                self.handleClose(hwnd);
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CLOSE => {
-            self.handleClose();
+            self.handleClose(hwnd);
             return 0;
         },
         w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => {

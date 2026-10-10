@@ -20,7 +20,8 @@
 //! activates the focused button (initially the default button, which is
 //! Cancel for anything destructive), Tab, Shift+Tab and the arrow keys
 //! move the focus, Space activates it, Escape and Alt+F4 cancel and
-//! Ctrl+C copies the text. Without Direct2D, or without a Ghostty window
+//! Ctrl+C copies the text. A close sent to the dialog from outside
+//! (WM_CLOSE) cancels too. Without Direct2D, or without a Ghostty window
 //! as owner, the confirmations fall back to MessageBoxW.
 //!
 //! Text is translated with `gx.i18n` at call time.
@@ -895,6 +896,7 @@ fn run(owner_: ?w32.HWND, spec: Spec) Choice {
         .activate = true,
         .dismiss_on_escape = false,
         .dismiss_on_outside_click = false,
+        .close_owner_on_close = false,
         .corners = .round,
         .shadow = true,
         .border_color = dialog.tokens.border,
@@ -904,6 +906,7 @@ fn run(owner_: ?w32.HWND, spec: Spec) Choice {
         .paint = onPaint,
         .key = onKey,
         .mouse = onMouse,
+        .dismissed = onDismissed,
         .dpi_changed = onDpiChanged,
     }) catch |err| {
         log.warn("failed to create a dialog window err={}", .{err});
@@ -1074,6 +1077,16 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
         },
         .double_click, .wheel => {},
     }
+}
+
+/// The popup was closed from outside (WM_CLOSE or the system close, such
+/// as `taskkill` without /F or an automation tool) and is hidden: answer
+/// like Cancel, which ends the modal loop.
+fn onDismissed(ctx: *anyopaque, popup: *Popup, reason: Popup.DismissReason) void {
+    _ = popup;
+    _ = reason;
+    const self = dialogOf(ctx);
+    if (self.result == null) self.result = .cancel;
 }
 
 fn onDpiChanged(ctx: *anyopaque, popup: *Popup) void {
