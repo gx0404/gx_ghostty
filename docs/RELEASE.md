@@ -188,6 +188,11 @@ Actions 已启用，以下结果都在 2026-10-07 取得，早于正式 Release�
 - `gx-release` 只构建 [37968075531](https://github.com/gx0404/gx_ghostty/actions/runs/37968075531)（`publish=false`）全绿，`windows-app` 与 `linux-gtk-noble` 在 GitHub 上首跑通过。`evidence-linux-gtk-noble` 已读回：`ubuntu:24.04` 容器里 GTK 4.14.5、libadwaita 1.5.0，`+version` 为 `1.3.2-gx.0.0.1`，截图正常。从该运行下载的便携 zip 在本机 Windows 11 上解压运行（隔离配置）：硬件 OpenGL、随包 ConPTY（`flags=0x6`）、默认启动配置 GX Zsh，设置浮层的中英文切换与命令面板正常。更早的 run 37948705479 用缩写 SHA 作 `ref`，在检出一步失败，此后 `ref` 的说明改为必须写完整 SHA。
 - `gx-release` 发布 [37970698127](https://github.com/gx0404/gx_ghostty/actions/runs/37970698127)（`publish=true`）全绿，创建 tag `gx-v0.0.1`（指向定版提交）与正式 Release [Ghostty GX 0.0.1](https://github.com/gx0404/gx_ghostty/releases/tag/gx-v0.0.1)：`isDraft` 与 `isPrerelease` 都为 false，标为 Latest，资产 12 个，GitHub 给出的 `digest` 与 `SHA256SUMS` 一致；下载后 `sha256sum -c SHA256SUMS` 全部 OK，`manifest.json` 为 schema 2，`source_commit` 为定版提交，`version_string` 为 `1.3.2-gx.0.0.1`；说明以 CHANGELOG 的 0.0.1 段开头。Release 里的便携 zip 也在本机解压运行，主窗口与主菜单截图已读回。
 
+0.0.2 的发布（定版提交 `1be3d19fc75f012317c09a7d55fa4be2380fb4a4`，2026-10-10）没有先跑只构建验收：
+
+- `gx-ci` push [38006962997](https://github.com/gx0404/gx_ghostty/actions/runs/38006962997) 全绿。手动 [38006996759](https://github.com/gx0404/gx_ghostty/actions/runs/38006996759)（`gtk_smoke`、`win_smoke`）全绿，截图已读回：`gtk-smoke` 日志里 `Theme parser error` 与 `css parsing failed` 都是 0 条；`win_smoke` 的任务栏显示 Ghostty GX 的新图标，Mesa 软件渲染下日志记了一行「窗口材质只透在标题栏」的退路说明。
+- `gx-release` 发布 [38007956849](https://github.com/gx0404/gx_ghostty/actions/runs/38007956849)（`publish=true`）全绿，创建 tag `gx-v0.0.2` 与正式 Release [Ghostty GX 0.0.2](https://github.com/gx0404/gx_ghostty/releases/tag/gx-v0.0.2)：非草稿、非预发布，标为 Latest，资产 12 个；下载后 `sha256sum -c SHA256SUMS` 的 11 个文件全部 OK，`manifest.json` 为 schema 2，`source_commit` 为定版提交，`version_string` 为 `1.3.2-gx.0.0.2`；说明以 CHANGELOG 的 0.0.2 段开头、以非官方分支声明结尾。Release 里的便携 zip 在本机解压运行（隔离配置、`gx-window-material = mica`）：硬件 OpenGL、随包 ConPTY，任务栏显示新图标。
+
 仍待确认（PENDING）：
 
 - **跨 runner 完整复用与缓存增长控制**：第二轮首次构建只有 10/45、49/100、10/45 节点 cached，translate-c 与测试编译仍未 cached，`o` 分区继续增长。`linux-vt`、`windows` 的 CPU 从 AMD EPYC 9V74 换成 7763 已由快照确认；`linux-main` 同为 9V74，仍有 miss。源码能解释工具产物差异如何经 `Run.artifact` hash 向下游传播，但初始 native 工具差异原因未定。旧 run 37587736223 的 `linux-vt` 曾达 5,078,327,232 字节、超过 4096 MiB 被清空，下一轮只恢复 186 字节；新实现不删除旧 cache，也未提高上限，未来仍可能超限。本次 PASS 不能写成跨运行全命中或所有缓存问题已解决，更不能代证全 CI 两分钟。
