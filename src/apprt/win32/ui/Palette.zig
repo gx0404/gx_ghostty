@@ -10,13 +10,16 @@
 //!   - the settings sections (`Settings.showSection`) and the UI language;
 //!   - the themes ("Theme: <name>"), saved to `gui-settings.ghostty`;
 //!     while the selection rests on a theme the terminals preview it, and
-//!     closing the palette without picking it restores the saved one.
+//!     closing the palette without picking it restores the saved one. The
+//!     entry an empty filter selects by itself (e.g. a recently used theme)
+//!     previews nothing until the user moves the selection or types.
 //!
 //! Titles are shown in the UI language and matched (`fuzzy.zig`) against
 //! both the translation and the English msgid. Picks are remembered for
 //! the process (`history`, a `fuzzy.Frecency`), keyed by the English msgid
 //! or action string: with an empty filter the recently used entries come
-//! first, and they rank higher in filtered results.
+//! first (`Frecency.rank`: the latest of equal picks first), and they rank
+//! higher in filtered results.
 //!
 //! The owning `Surface` embeds this struct as `palette` and calls
 //! `setActive` (from `toggle_command_palette`), `reposition` (on resize),
@@ -81,6 +84,11 @@ const max_recent = 5;
 const preview_delay_ms = 150;
 const preview_timer_id: usize = 1;
 
+/// The timer on the app's message window (`App.msg_hwnd`) that reloads the
+/// saved configuration after a palette went away while previewing a theme
+/// (see `deinit`).
+const restore_timer_id: usize = 0x5054; // 'PT'
+
 /// Segoe Fluent Icons / MDL2 Assets glyphs of the entry kinds.
 const icons = struct {
     const command: u21 = 0xE945;
@@ -139,6 +147,8 @@ const Item = struct {
     current: bool = false,
     target: Target,
     frecency: u32 = 0,
+    /// The place among the recently used entries (`Frecency.rank`).
+    rank: u64 = 0,
     score: i32 = 0,
 };
 
@@ -152,6 +162,30 @@ const Row = struct {
     /// Position in the list content.
     y: f32 = 0,
     h: f32 = 0,
+};
+
+/// Whether the selected theme is previewed. An empty filter starts on its
+/// first entry, which can be a recently used theme, and opening the palette
+/// must not change the theme: the selection previews only once the user
+/// moved it with the keyboard or typed a filter.
+const PreviewGate = struct {
+    armed: bool = false,
+
+    /// The filter changed and selected its first entry.
+    fn filtered(self: *PreviewGate, query_empty: bool) void {
+        self.armed = !query_empty;
+    }
+
+    /// The user moved the selection.
+    fn navigated(self: *PreviewGate) void {
+        self.armed = true;
+    }
+
+    /// The theme the terminals should show while the theme `selected` (if
+    /// any) is selected: it once armed, else the saved one (null).
+    fn target(self: PreviewGate, selected: ?[]const u8) ?[]const u8 {
+        return if (self.armed) selected else null;
+    }
 };
 
 popup: Popup = .{},
@@ -181,6 +215,7 @@ pressed: ?usize = null,
 /// it (`preview_buf[0..preview_len]`), or null.
 preview_len: ?usize = null,
 preview_buf: [256]u8 = undefined,
+preview_gate: PreviewGate = .{},
 /// The in-app notifications when the palette opened; previews keep them
 /// without the "reloaded" notification.
 notifications: Config.AppNotifications = .{},
@@ -193,9 +228,12 @@ fn alloc(self: *Palette) Allocator {
     return self.surface().app.core_app.alloc;
 }
 
-/// Destroy the popups and free the entries.
+/// Destroy the popups and free the entries. A theme preview still showing
+/// (the terminal went away under the open palette) ends from the message
+/// loop (`restoreSavedTheme`): the window is taking its tab apart now.
 pub fn deinit(self: *Palette) void {
     self.keybinds.deinit();
+    if (self.preview_len != null) restoreSavedTheme(self.surface().app);
     self.endPreview(false);
     releasePopup(&self.popup);
     self.rows.deinit(self.alloc());
@@ -348,7 +386,10 @@ fn buildItems(self: *Palette) void {
     self.addSettings(a) catch |err| log.warn("palette settings unavailable err={}", .{err});
     self.addThemes(a) catch |err| log.warn("palette themes unavailable err={}", .{err});
 
-    for (self.items.items) |*item| item.frecency = history.get(item.key);
+    for (self.items.items) |*item| {
+        item.frecency = history.get(item.key);
+        item.rank = history.rank(item.key);
+    }
 }
 
 fn keybindSet(self: *Palette) *const input.Binding.Set {
@@ -555,6 +596,7 @@ fn refilter(self: *Palette) void {
     self.content_height = if (self.rows.items.len == 0) 0 else y + layout.list_pad;
     self.scroll = 0;
     self.selected = self.nextItemRow(0, 1);
+    self.preview_gate.filtered(query.isEmpty());
     self.schedulePreview();
 }
 
@@ -564,10 +606,10 @@ fn listAll(self: *Palette, gpa: Allocator) !void {
     var recent: [max_recent]usize = undefined;
     var recent_len: usize = 0;
     for (self.items.items, 0..) |item, i| {
-        if (item.frecency == 0) continue;
-        // Insert into the top list, most frecent first.
+        if (item.rank == 0) continue;
+        // Insert into the top list, highest rank first.
         var pos = recent_len;
-        while (pos > 0 and self.items.items[recent[pos - 1]].frecency < item.frecency) pos -= 1;
+        while (pos > 0 and self.items.items[recent[pos - 1]].rank < item.rank) pos -= 1;
         if (pos >= max_recent) continue;
         const end = @min(recent_len, max_recent - 1);
         var k = end;
@@ -703,6 +745,7 @@ fn select(self: *Palette, row: ?usize) void {
     self.selected = r;
     self.reveal(r);
     self.popup.invalidate();
+    self.preview_gate.navigated();
     self.schedulePreview();
 }
 
@@ -827,6 +870,11 @@ fn previewTheme(self: *const Palette) ?[]const u8 {
     return self.preview_buf[0..len];
 }
 
+/// The theme the terminals should show now (null: the saved one).
+fn wantedTheme(self: *Palette) ?[]const u8 {
+    return self.preview_gate.target(self.selectedTheme());
+}
+
 fn sameTheme(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -836,7 +884,7 @@ fn sameTheme(a: ?[]const u8, b: ?[]const u8) bool {
 /// on it, or show the saved theme again when it moved off the themes.
 fn schedulePreview(self: *Palette) void {
     const hwnd = self.popup.hwnd orelse return;
-    if (!self.active or sameTheme(self.selectedTheme(), self.previewTheme())) {
+    if (!self.active or sameTheme(self.wantedTheme(), self.previewTheme())) {
         _ = w32.KillTimer(hwnd, preview_timer_id);
         return;
     }
@@ -850,7 +898,7 @@ fn previewTimer(hwnd: w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) voi
     const popup: *Popup = @ptrFromInt(@as(usize, @bitCast(userdata)));
     const self: *Palette = @alignCast(@fieldParentPtr("popup", popup));
     if (!self.active) return;
-    const theme = self.selectedTheme();
+    const theme = self.wantedTheme();
     if (sameTheme(theme, self.previewTheme())) return;
     self.applyTheme(theme);
 }
@@ -879,7 +927,7 @@ fn applyTheme(self: *Palette, theme: ?[]const u8) void {
         return;
     };
     defer config.deinit();
-    app.core_app.updateConfig(app, &config) catch |err| {
+    app.applyConfig(&config) catch |err| {
         log.warn("cannot apply a theme preview err={}", .{err});
         return;
     };
@@ -903,6 +951,27 @@ fn endPreview(self: *Palette, restore: bool) void {
     if (self.preview_len == null) return;
     if (restore) self.applyTheme(null);
     self.preview_len = null;
+}
+
+/// Show the saved theme again from the message loop: `restoreTimer` reloads
+/// the configuration like `reload_config`. For a palette that goes away
+/// while previewing, during the teardown of its terminal, when reloading
+/// right away would lay out a tab whose terminals are being freed.
+fn restoreSavedTheme(app: *App) void {
+    if (app.quit_requested) return;
+    const hwnd = app.msg_hwnd orelse return;
+    _ = w32.SetTimer(hwnd, restore_timer_id, 0, @ptrCast(&restoreTimer));
+}
+
+fn restoreTimer(hwnd: w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void {
+    _ = w32.KillTimer(hwnd, id);
+    const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    if (userdata == 0) return;
+    const app: *App = @ptrFromInt(@as(usize, @bitCast(userdata)));
+    if (app.quit_requested) return;
+    app.core_app.performAction(app, .reload_config) catch |err| {
+        log.warn("cannot restore the saved theme err={}", .{err});
+    };
 }
 
 // -----------------------------------------------------------------------
@@ -1286,3 +1355,23 @@ pub fn ensurePopup(
 /// The palette picks of the process, keyed by the English msgid or action
 /// string of the entry. Only the GUI thread uses it.
 var history: fuzzy.Frecency = .{};
+
+test "PreviewGate previews only a selection the user chose" {
+    const testing = std.testing;
+    var gate: PreviewGate = .{};
+    // Opening: the empty filter selects its first entry, a recent theme.
+    gate.filtered(true);
+    try testing.expectEqual(@as(?[]const u8, null), gate.target("Dracula"));
+    // Moving the selection onto a theme previews it.
+    gate.navigated();
+    try testing.expectEqualStrings("Dracula", gate.target("Dracula").?);
+    // So does the first entry of a typed filter.
+    gate.filtered(false);
+    try testing.expectEqualStrings("Nord", gate.target("Nord").?);
+    // Clearing the filter shows the saved theme again.
+    gate.filtered(true);
+    try testing.expectEqual(@as(?[]const u8, null), gate.target("Dracula"));
+    // Off the themes the saved one shows, too.
+    gate.navigated();
+    try testing.expectEqual(@as(?[]const u8, null), gate.target(null));
+}

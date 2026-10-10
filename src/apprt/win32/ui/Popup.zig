@@ -23,6 +23,7 @@ const Popup = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const clipboard = @import("../clipboard.zig");
 const w32 = @import("../win32.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
@@ -297,6 +298,15 @@ pub fn invalidate(self: *Popup) void {
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
+/// What the modal loop of a dialog or menu does with a WM_QUIT (exit code
+/// `wparam`) it retrieves: a quit the app asked for (`App.quit_requested`)
+/// ends the loop, which posts the code again for `App.run`; one that
+/// `App.stopQuitTimer` withdrew is dropped (null), as `App.run` drops it.
+pub fn modalQuitCode(quit_requested: bool, wparam: usize) ?i32 {
+    if (!quit_requested) return null;
+    return @bitCast(@as(u32, @truncate(wparam)));
+}
+
 fn dpiOf(hwnd: w32.HWND) u32 {
     const dpi = w32.GetDpiForWindow(hwnd);
     return if (dpi == 0) 96 else dpi;
@@ -568,7 +578,7 @@ pub const TextInput = struct {
     }
 
     fn pasteFromClipboard(self: *TextInput, alloc: Allocator, hwnd: w32.HWND) !void {
-        if (w32.OpenClipboard(hwnd) == 0) return;
+        if (!clipboard.open(hwnd)) return error.ClipboardBusy;
         defer _ = w32.CloseClipboard();
         const handle = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse return;
         const ptr = w32.GlobalLock(handle) orelse return;
@@ -593,13 +603,10 @@ fn copyToClipboard(hwnd: w32.HWND, units: []const u16) void {
     @memcpy(dst[0..units.len], units);
     dst[units.len] = 0;
     _ = w32.GlobalUnlock(handle);
-    if (w32.OpenClipboard(hwnd) == 0) {
+    clipboard.setUnicodeText(hwnd, handle) catch |err| {
+        log.warn("copy from popup input failed err={}", .{err});
         _ = w32.GlobalFree(handle);
-        return;
-    }
-    defer _ = w32.CloseClipboard();
-    _ = w32.EmptyClipboard();
-    if (w32.SetClipboardData(w32.CF_UNICODETEXT, handle) == null) _ = w32.GlobalFree(handle);
+    };
 }
 
 fn keyFromWparam(wparam: usize) Key {
@@ -883,4 +890,15 @@ fn buttonOf(msg: u32) MouseButton {
         w32.WM_MBUTTONDOWN, w32.WM_MBUTTONUP => .middle,
         else => .none,
     };
+}
+
+test "modalQuitCode drops a withdrawn quit" {
+    const testing = std.testing;
+    // The WM_QUIT of a quit that a new terminal withdrew: the dialog stays.
+    try testing.expectEqual(@as(?i32, null), modalQuitCode(false, 0));
+    try testing.expectEqual(@as(?i32, null), modalQuitCode(false, 3));
+    // A requested quit ends the loop and keeps its exit code.
+    try testing.expectEqual(@as(?i32, 0), modalQuitCode(true, 0));
+    try testing.expectEqual(@as(?i32, 3), modalQuitCode(true, 3));
+    try testing.expectEqual(@as(?i32, -1), modalQuitCode(true, 0xFFFF_FFFF));
 }

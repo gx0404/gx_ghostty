@@ -30,6 +30,8 @@ const i18n = @import("../../../gx/i18n.zig");
 const branding = @import("../../../gx/branding.zig");
 const App = @import("../App.zig");
 const Window = @import("../Window.zig");
+const clipboard = @import("../clipboard.zig");
+const open_url = @import("../open_url.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
 const d2d = @import("d2d.zig");
@@ -444,7 +446,7 @@ const Dialog = struct {
 
     fn activate(self: *Dialog, index: usize) void {
         switch (self.target(index)) {
-            .link => |i| openUrl(self.spec.links[i].url),
+            .link => |i| open_url.open(self.spec.links[i].url),
             .button => |i| {
                 const button = self.spec.buttons[i];
                 if (button.copies) {
@@ -932,7 +934,8 @@ fn run(owner_: ?w32.HWND, spec: Spec) Choice {
 }
 
 /// Pump messages until the dialog has a result, its window is gone (its
-/// owner was destroyed) or WM_QUIT arrives. Returns the WM_QUIT exit code,
+/// owner was destroyed) or a requested quit arrives (`Popup.modalQuitCode`;
+/// a withdrawn one leaves the dialog open). Returns the WM_QUIT exit code,
 /// which the caller posts again once the dialog is closed.
 fn modalLoop(dialog: *Dialog) ?i32 {
     while (dialog.result == null) {
@@ -941,7 +944,8 @@ fn modalLoop(dialog: *Dialog) ?i32 {
         var msg: w32.MSG = undefined;
         while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
             if (msg.message == w32.WM_QUIT) {
-                return @bitCast(@as(u32, @truncate(msg.wParam)));
+                if (Popup.modalQuitCode(dialog.app.quit_requested, msg.wParam)) |code| return code;
+                continue;
             }
             // The dialog handles Alt+F4 itself; translating system keys
             // would only produce WM_SYSCHAR menu beeps.
@@ -1090,18 +1094,6 @@ fn onDpiChanged(ctx: *anyopaque, popup: *Popup) void {
     });
 }
 
-fn openUrl(url: [:0]const u8) void {
-    var buf: [512]u16 = undefined;
-    _ = w32.ShellExecuteW(
-        null,
-        std.unicode.utf8ToUtf16LeStringLiteral("open"),
-        wstr.bufZ(&buf, url),
-        null,
-        null,
-        w32.SW_SHOW,
-    );
-}
-
 fn copyToClipboard(hwnd: w32.HWND, text: []const u8) void {
     const units = wstr.utf16Len(text) + 1;
     const handle = w32.GlobalAlloc(w32.GMEM_MOVEABLE, units * @sizeOf(u16)) orelse return;
@@ -1112,13 +1104,10 @@ fn copyToClipboard(hwnd: w32.HWND, text: []const u8) void {
     const dst: [*]u16 = @ptrCast(@alignCast(ptr));
     _ = wstr.bufZ(dst[0..units], text);
     _ = w32.GlobalUnlock(handle);
-    if (w32.OpenClipboard(hwnd) == 0) {
+    clipboard.setUnicodeText(hwnd, handle) catch |err| {
+        log.warn("copy from dialog failed err={}", .{err});
         _ = w32.GlobalFree(handle);
-        return;
-    }
-    defer _ = w32.CloseClipboard();
-    _ = w32.EmptyClipboard();
-    if (w32.SetClipboardData(w32.CF_UNICODETEXT, handle) == null) _ = w32.GlobalFree(handle);
+    };
 }
 
 /// A MessageBoxW stand-in for `spec` when the custom dialog cannot be

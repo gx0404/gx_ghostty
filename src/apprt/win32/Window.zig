@@ -4,7 +4,10 @@
 //!
 //! The Window owns the tab model (split trees, active surfaces, titles,
 //! unread flags), split layout and window-level state (DPI scale, size
-//! limits, placement) and orchestrates the chrome modules:
+//! limits, placement) and orchestrates the chrome modules. A tab shows its
+//! title override (`set_tab_title`, renaming) or else the title of its
+//! focused split (`refreshTabTitle`); the focused split is the one that
+//! last got the keyboard focus (`setActiveSurface`). The chrome modules:
 //!
 //!   - `chrome/TitleBar.zig` (`title_bar`): non-client frame, the
 //!     integrated title bar row (caption buttons, main menu button,
@@ -64,6 +67,8 @@ const gx = @import("../../gx/main.zig");
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const splits = @import("splits.zig");
+const tabs = @import("tabs.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const TabBar = @import("chrome/TabBar.zig");
@@ -74,6 +79,7 @@ const ResizeOverlay = @import("ui/ResizeOverlay.zig");
 const ShortcutNotice = @import("ui/ShortcutNotice.zig");
 const style = @import("ui/style.zig");
 const Settings = @import("ui/Settings.zig");
+const wstr = @import("ui/wstr.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -101,11 +107,16 @@ active_tab: usize = 0,
 /// with it, not with `GetDpiForWindow`.
 scale: f32 = 1.0,
 
-/// UTF-16 title buffers for each tab (for painting the tab bar).
+/// The title each tab shows (UTF-16, for painting the tab bar), from its
+/// override and its focused terminal (`refreshTabTitle`).
 tab_titles: [MAX_TABS][256]u16 = undefined,
 
 /// Length of each tab title in UTF-16 code units.
 tab_title_lens: [MAX_TABS]u16 = undefined,
+
+/// The title each tab shows instead of its focused terminal's
+/// (`set_tab_title`, renaming the tab), or null.
+tab_title_overrides: [MAX_TABS]?tabs.Title = [_]?tabs.Title{null} ** MAX_TABS,
 
 /// Whether each tab received output (or rang the bell) since it was last
 /// the active tab (the tab bar shows a badge).
@@ -124,11 +135,16 @@ tab_bar: TabBar = .{},
 /// Whether this window is a quick terminal (borderless popup, no tabs).
 is_quick_terminal: bool = false,
 
-/// Split divider drag state.
+/// Split divider drag state: the tab, the split node and its rectangle
+/// (client pixels) when the drag started, and how far from the divider
+/// line the pointer grabbed it. Replacing the tab's split tree ends the
+/// drag (`replaceTree`).
 dragging_split: bool = false,
+drag_split_tab: usize = 0,
 drag_split_handle: SplitTree(Surface).Node.Handle = .root,
 drag_split_layout: SplitTree(Surface).Split.Layout = .horizontal,
-drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+drag_split_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+drag_grab_offset: i32 = 0,
 
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
@@ -665,6 +681,16 @@ pub fn focusActiveSurface(self: *Window) void {
     }
 }
 
+/// Whether this window is the active window or the keyboard focus is in
+/// it or in a popup it owns. Moving the focus into a window that has
+/// neither would activate it, taking it from the window the user is in.
+fn hasFocus(self: *const Window) bool {
+    const hwnd = self.hwnd orelse return false;
+    if (w32.GetActiveWindow() == hwnd) return true;
+    const focus = w32.GetFocus() orelse return false;
+    return GetAncestor(focus, GA_ROOTOWNER) == hwnd;
+}
+
 /// Perform a binding action on behalf of the window's chrome (menus,
 /// buttons): on the active surface, or app-scoped when there is none.
 pub fn performBindingAction(self: *Window, action: @import("../../input.zig").Binding.Action) void {
@@ -720,14 +746,11 @@ pub fn handleSystemMenuKey(app: *App, msg: *const w32.MSG) bool {
 
 const input = @import("../../input.zig");
 const GA_ROOT: u32 = 2;
+const GA_ROOTOWNER: u32 = 3;
 extern "user32" fn GetAncestor(hwnd: w32.HWND, gaFlags: u32) callconv(.winapi) ?w32.HWND;
 
-/// Find the tab index containing a given surface.
-/// Checks tab_active_surface first, then scans all trees.
+/// The index of the tab whose split tree holds `surface`.
 pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
-    for (self.tab_active_surface[0..self.tab_count], 0..) |s, i| {
-        if (s == surface) return i;
-    }
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
@@ -735,6 +758,33 @@ pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
         }
     }
     return null;
+}
+
+/// `surface` got the keyboard focus (WM_SETFOCUS): make it the focused
+/// terminal of the tab whose split tree holds it, which may not be the
+/// active tab, and show its title on the tab. A zoomed tab moves its zoom
+/// to it or unzooms (`split-preserve-zoom`), so a focused pane is never
+/// hidden. Returns false when no tab of this window holds `surface`.
+pub fn setActiveSurface(self: *Window, surface: *Surface) bool {
+    const tab = self.findTabIndex(surface) orelse return false;
+    const tree = &self.tab_trees[tab];
+    if (tree.zoomed) |zoomed| {
+        const handle = tree.locate(surface) orelse return false;
+        if (handle != zoomed) {
+            tree.zoom(splits.zoomAfterFocus(
+                SplitTree(Surface).Node.Handle,
+                zoomed,
+                handle,
+                self.app.config.@"split-preserve-zoom".navigation,
+            ));
+            if (tab == self.active_tab) self.layoutSplits();
+        }
+    }
+    if (self.tab_active_surface[tab] != surface) {
+        self.tab_active_surface[tab] = surface;
+        self.refreshTabTitle(tab);
+    }
+    return true;
 }
 
 /// Find the Node.Handle for a surface in a given tab's tree.
@@ -752,6 +802,7 @@ const TabSlot = struct {
     active_surface: *Surface,
     title: [256]u16,
     title_len: u16,
+    title_override: ?tabs.Title,
     unread: bool,
 };
 
@@ -761,6 +812,7 @@ fn getSlot(self: *const Window, i: usize) TabSlot {
         .active_surface = self.tab_active_surface[i],
         .title = self.tab_titles[i],
         .title_len = self.tab_title_lens[i],
+        .title_override = self.tab_title_overrides[i],
         .unread = self.tab_unread[i],
     };
 }
@@ -770,6 +822,7 @@ fn setSlot(self: *Window, i: usize, slot: TabSlot) void {
     self.tab_active_surface[i] = slot.active_surface;
     self.tab_titles[i] = slot.title;
     self.tab_title_lens[i] = slot.title_len;
+    self.tab_title_overrides[i] = slot.title_override;
     self.tab_unread[i] = slot.unread;
 }
 
@@ -794,7 +847,11 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.initWithOptions(self.app, self, options);
+    surface.initWithOptions(self.app, self, options) catch |err| {
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
     // After surface.init succeeds, create the SplitTree which takes ownership
     // via ref(). If this fails, we manually clean up.
     var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
@@ -816,12 +873,14 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
     self.tab_unread[pos] = false;
+    self.tab_title_overrides[pos] = null;
+    self.tab_title_lens[pos] = 0;
+    if (self.tab_count > 0 and self.active_tab >= pos) self.active_tab += 1;
     self.tab_count += 1;
+    self.cancelDividerDrag();
 
-    // Set default title.
-    const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-    @memcpy(self.tab_titles[pos][0..default_title.len], default_title);
-    self.tab_title_lens[pos] = @intCast(default_title.len);
+    // The terminal may have its title already (the `title` option).
+    self.refreshTabTitle(pos);
 
     if (self.tab_count == 1) {
         // First tab — show the parent window now that the terminal is
@@ -841,6 +900,27 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.updateTabBarVisibility();
     self.updateAppMode();
     return surface;
+}
+
+/// Open a new tab that runs the command of the focused terminal of tab
+/// `index` (its launch profile, if it was opened with one), with the same
+/// title override. Selecting the tab first makes the new tab inherit that
+/// terminal's working directory (`tab-inherit-working-directory`) and,
+/// with the default `window-new-tab-position = current`, open next to it.
+pub fn duplicateTab(self: *Window, index: usize) void {
+    if (index >= self.tab_count) return;
+    const surface = self.tab_active_surface[index];
+    const title_override = self.tab_title_overrides[index];
+    self.selectTabIndex(index);
+    const duplicate = self.addTabWithOptions(.{
+        .context = .tab,
+        .command = if (surface.launch_command) |*command| command else null,
+    }) catch |err| {
+        log.err("failed to duplicate the tab err={}", .{err});
+        return;
+    };
+    const title = title_override orelse return;
+    if (self.findTabIndex(duplicate)) |tab| self.setTabTitleOverride(tab, title);
 }
 
 /// Close a tab by surface pointer. Removes from the tab list,
@@ -904,6 +984,12 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
         check.tab(self, i);
     }
     if (count == 0) return;
+    // The tab that stays when the active one closes with others.
+    const keep: usize = switch (selection) {
+        .one => self.tab_count,
+        .all_but, .right_of => |i| i,
+    };
+    const keep_id: ?u64 = if (keep < self.tab_count) self.tab_active_surface[keep].core_surface.id else null;
 
     if (check.needed) {
         const choice = if (count == 1)
@@ -913,13 +999,22 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
         if (choice != .accept or !isAlive(hwnd, self)) return;
     }
 
+    // Activate the tab that stays first, instead of each neighbor of the
+    // active tab that closes next.
+    if (keep_id != null and self.active_tab < self.tab_count) {
+        const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
+        if (std.mem.indexOfScalar(u64, ids[0..count], active_id) != null) {
+            if (self.findTabBySurfaceId(keep_id.?)) |idx| self.selectTabIndex(idx);
+        }
+    }
     for (ids[0..count]) |id| {
         if (self.findTabBySurfaceId(id)) |idx| self.removeTab(idx);
     }
 }
 
-/// The index of the tab with the terminal whose core surface id is `id`.
-fn findTabBySurfaceId(self: *Window, id: u64) ?usize {
+/// The index of the tab with the terminal whose core surface id is `id`,
+/// e.g. to find a tab again after a modal loop.
+pub fn findTabBySurfaceId(self: *Window, id: u64) ?usize {
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
@@ -937,27 +1032,33 @@ fn isAlive(hwnd: w32.HWND, window: *const Window) bool {
 }
 
 /// Remove the tab at `idx` without asking, deinitializing its split tree.
+/// The active tab hands over to its neighbor (`tabs.closeNeighbor`)
+/// before it goes; closing another tab leaves the active one as it is.
 fn removeTab(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
-    // Cancel any in-progress rename (the edit control may belong to this tab).
+    // Cancel any in-progress rename (the edit control may belong to this
+    // tab) and tab drag (the dragged index shifts).
     self.tab_bar.cancelRename();
+    self.tab_bar.cancelDrag();
+    self.cancelDividerDrag();
+    if (idx == self.active_tab) {
+        if (tabs.closeNeighbor(idx, self.tab_count)) |neighbor| self.selectTabIndex(neighbor);
+    }
+    // Take the tab out of the model before its terminals go away: their
+    // windows hide and pass the focus on meanwhile.
     var tree = self.tab_trees[idx];
-    tree.deinit(); // This unrefs all surfaces → Surface.unref frees when ref_count=0
     var i: usize = idx;
     while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
     self.tab_count -= 1;
     if (self.tab_count == 0) {
         self.closing = true;
         self.setAppModeTimer(false);
+        tree.deinit();
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
-    if (self.active_tab >= self.tab_count) {
-        self.active_tab = self.tab_count - 1;
-    } else if (self.active_tab > idx) {
-        self.active_tab -= 1;
-    }
-    self.selectTabIndex(self.active_tab);
+    self.active_tab = tabs.indexAfterRemove(self.active_tab, idx);
+    tree.deinit(); // This unrefs all surfaces → Surface.unref frees when ref_count=0
     self.updateTabBarVisibility();
     // The tab bar stays visible with `window-show-tab-bar = always`, so
     // nothing else repaints it without the removed tab.
@@ -1019,7 +1120,11 @@ fn onCloseTabRequest(self: *Window, wparam: usize, lparam: isize) void {
 }
 
 /// Close a single surface within a split tree. If it's the last surface
-/// in the tab, close the entire tab instead.
+/// in the tab, close the entire tab instead. The focus stays where it is
+/// unless the closing surface is the tab's focused one; then the pane
+/// before it in the tree's order, or after it when it was the first,
+/// takes over (`splits.focusAfterClose`, as in the GTK and macOS apps),
+/// and gets the keyboard focus if the tab is shown and the window has it.
 pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     const alloc = self.app.core_app.alloc;
     const tab = self.findTabIndex(surface) orelse {
@@ -1034,55 +1139,62 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         return;
     }
 
-    const handle = self.findHandle(tab, surface) orelse {
+    const handle = tree.locate(surface) orelse {
         log.debug("closeSplitSurface: handle not found", .{});
         return;
     };
     log.debug("closeSplitSurface: removing handle={} from tab={}", .{ handle.idx(), tab });
 
-    // Find next focus target BEFORE removing.
-    const next_handle = (tree.goto(alloc, handle, .next) catch null) orelse
-        (tree.goto(alloc, handle, .previous) catch null);
-
-    // Extract the surface pointer from the next handle before we modify the tree.
-    const next_surface: ?*Surface = if (next_handle) |nh| blk: {
-        break :blk switch (tree.nodes[nh.idx()]) {
-            .leaf => |v| v,
-            .split => null,
+    const was_active = self.tab_active_surface[tab] == surface;
+    const next: *Surface = if (!was_active) self.tab_active_surface[tab] else next: {
+        const next_handle = splits.focusAfterClose(SplitTree(Surface), alloc, tree, handle) orelse {
+            self.removeTab(tab);
+            return;
         };
-    } else null;
-    log.debug("closeSplitSurface: has_next={}", .{next_surface != null});
+        break :next tree.nodes[next_handle.idx()].leaf;
+    };
+    const focused = was_active and self.hasFocus();
 
     const new_tree = tree.remove(alloc, handle) catch {
         log.err("failed to remove surface from split tree", .{});
         return;
     };
-    log.debug("closeSplitSurface: remove returned, new_tree nodes={}", .{new_tree.nodes.len});
 
-    var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
-    self.tab_trees[tab] = new_tree;
-
-    if (next_surface) |ns| {
-        log.debug("closeSplitSurface: focusing next surface", .{});
-        self.tab_active_surface[tab] = ns;
+    // Before the closing terminal hides: its focus goes to this window,
+    // which passes it to the active surface.
+    self.tab_active_surface[tab] = next;
+    self.replaceTree(tab, new_tree);
+    self.refreshTabTitle(tab);
+    if (tab == self.active_tab) {
         self.layoutSplits();
-        if (ns.hwnd) |h| _ = w32.SetFocus(h);
-        self.updateAppMode();
-    } else {
-        log.debug("closeSplitSurface: no next surface, closing tab", .{});
-        self.removeTab(tab);
+        if (focused) {
+            if (next.hwnd) |h| _ = w32.SetFocus(h);
+        }
     }
+    self.updateAppMode();
 }
 
-/// Switch to the tab at the given index.
-/// Set the visibility (occlusion) of every surface in the active tab. Used on
-/// window minimize/restore so the renderer stops rebuilding frames while the
+/// Set the visibility (occlusion) of the surfaces of the active tab that
+/// are shown (only the zoomed one of a zoomed tab). Used on window
+/// minimize/restore so the renderer stops rebuilding frames while the
 /// window is minimized.
 fn setActiveTabVisible(self: *Window, visible: bool) void {
     if (self.active_tab >= self.tab_count) return;
-    var it = self.tab_trees[self.active_tab].iterator();
-    while (it.next()) |entry| entry.view.setVisible(visible);
+    const tree = &self.tab_trees[self.active_tab];
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const shown = if (tree.zoomed) |zoomed| entry.handle == zoomed else true;
+        entry.view.setVisible(visible and shown);
+    }
+}
+
+/// Hide the panes of tab `tab`, which is no longer shown.
+fn hideTabPanes(self: *Window, tab: usize) void {
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        entry.view.setVisible(false);
+        if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+    }
 }
 
 /// Make every visible terminal draw a complete new frame (see
@@ -1104,23 +1216,27 @@ fn repositionPopups(self: *Window) void {
     self.shortcut_notice.reposition();
 }
 
+/// Switch to the tab at `idx`: show its panes, move the keyboard focus to
+/// its focused terminal when this window has the focus, then hide the
+/// panes of the previous tab, so the focus never passes through a hidden
+/// pane. Selecting the active tab again only gives its terminal the focus.
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
     self.tab_bar.cancelRename();
     // Clear any in-progress tab drag
     self.tab_bar.cancelDrag();
-    if (self.active_tab < self.tab_count) {
-        var it = self.tab_trees[self.active_tab].iterator();
-        while (it.next()) |entry| {
-            entry.view.setVisible(false);
-            if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
-        }
+    const previous = self.active_tab;
+    if (idx == previous) {
+        self.focusActiveSurface();
+        return;
     }
+    const focused = self.hasFocus();
+    self.cancelDividerDrag();
     self.active_tab = idx;
     self.tab_unread[idx] = false;
-    const surface = self.tab_active_surface[idx];
     self.layoutSplits();
-    if (surface.hwnd) |h| _ = w32.SetFocus(h);
+    if (focused) self.focusActiveSurface();
+    if (previous < self.tab_count) self.hideTabPanes(previous);
     self.updateWindowTitle();
     self.invalidateTabBar();
 }
@@ -1172,22 +1288,48 @@ fn layoutNode(self: *Window, panes: *PaneLayout, tree: SplitTree(Surface), handl
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| panes.add(view, rect),
         .split => |s| {
-            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
-            if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.layoutNode(panes, tree, s.left, left_rect);
-                self.layoutNode(panes, tree, s.right, right_rect);
-            } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.layoutNode(panes, tree, s.left, top_rect);
-                self.layoutNode(panes, tree, s.right, bottom_rect);
-            }
+            const parts = self.splitRects(rect, s);
+            self.layoutNode(panes, tree, s.left, parts.first);
+            self.layoutNode(panes, tree, s.right, parts.second);
+        },
+    }
+}
+
+/// The gap between split panes, in pixels.
+fn splitGap(self: *const Window) i32 {
+    return @intFromFloat(@round(5.0 * self.scale));
+}
+
+/// A split node laid out over its rectangle: where its divider line is
+/// (x for a horizontal split, y for a vertical one) and the rectangles of
+/// its two children.
+const SplitRects = struct {
+    divider: i32,
+    first: w32.RECT,
+    second: w32.RECT,
+};
+
+fn splitRects(self: *const Window, rect: w32.RECT, s: SplitTree(Surface).Split) SplitRects {
+    const gap = self.splitGap();
+    const ratio: f32 = @floatCast(s.ratio);
+    switch (s.layout) {
+        .horizontal => {
+            const divider = splits.dividerPos(rect.left, rect.right - rect.left, ratio);
+            const spans = splits.childSpans(rect.left, rect.right, divider, gap);
+            return .{
+                .divider = divider,
+                .first = .{ .left = spans[0].start, .top = rect.top, .right = spans[0].end, .bottom = rect.bottom },
+                .second = .{ .left = spans[1].start, .top = rect.top, .right = spans[1].end, .bottom = rect.bottom },
+            };
+        },
+        .vertical => {
+            const divider = splits.dividerPos(rect.top, rect.bottom - rect.top, ratio);
+            const spans = splits.childSpans(rect.top, rect.bottom, divider, gap);
+            return .{
+                .divider = divider,
+                .first = .{ .left = rect.left, .top = spans[0].start, .right = rect.right, .bottom = spans[0].end },
+                .second = .{ .left = rect.left, .top = spans[1].start, .right = rect.right, .bottom = spans[1].end },
+            };
         },
     }
 }
@@ -1318,33 +1460,26 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
     switch (tree.nodes[handle.idx()]) {
         .leaf => {},
         .split => |s| {
-            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
             const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
-
-            if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                self.drawDivider(hdc, split_x, rect.top, split_x, rect.bottom, line_w);
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, left_rect);
-                self.paintDividerNode(hdc, tree, s.right, right_rect);
-            } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                self.drawDivider(hdc, rect.left, split_y, rect.right, split_y, line_w);
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, top_rect);
-                self.paintDividerNode(hdc, tree, s.right, bottom_rect);
+            const parts = self.splitRects(rect, s);
+            switch (s.layout) {
+                .horizontal => self.drawDivider(hdc, parts.divider, rect.top, parts.divider, rect.bottom, line_w),
+                .vertical => self.drawDivider(hdc, rect.left, parts.divider, rect.right, parts.divider, line_w),
             }
+            self.paintDividerNode(hdc, tree, s.left, parts.first);
+            self.paintDividerNode(hdc, tree, s.right, parts.second);
         },
     }
 }
 
+/// The divider of a split of the active tab under the pointer.
 const DividerHit = struct {
     handle: SplitTree(Surface).Node.Handle,
     layout: SplitTree(Surface).Split.Layout,
+    /// The rectangle of the split node in client pixels.
+    rect: w32.RECT,
+    /// How far the pointer is from the divider line, along the split.
+    grab: i32,
 };
 
 fn hitTestDivider(self: *Window, x: i32, y: i32) ?DividerHit {
@@ -1368,68 +1503,79 @@ fn hitTestDividerNode(
     switch (tree.nodes[handle.idx()]) {
         .leaf => return null,
         .split => |s| {
-            const gap: i32 = @as(i32, @intFromFloat(@round(5.0 * self.scale)));
             const hit_area: i32 = @max(@as(i32, @intFromFloat(@round(3.0 * self.scale))), 3);
-
-            if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                if (x >= split_x - hit_area and x <= split_x + hit_area and y >= rect.top and y <= rect.bottom) {
-                    return .{ .handle = handle, .layout = .horizontal };
-                }
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                return self.hitTestDividerNode(tree, s.left, left_rect, x, y) orelse
-                    self.hitTestDividerNode(tree, s.right, right_rect, x, y);
-            } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                if (y >= split_y - hit_area and y <= split_y + hit_area and x >= rect.left and x <= rect.right) {
-                    return .{ .handle = handle, .layout = .vertical };
-                }
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                return self.hitTestDividerNode(tree, s.left, top_rect, x, y) orelse
-                    self.hitTestDividerNode(tree, s.right, bottom_rect, x, y);
+            const parts = self.splitRects(rect, s);
+            const horizontal = s.layout == .horizontal;
+            const along = if (horizontal) x else y;
+            const across = if (horizontal) y else x;
+            const across_start = if (horizontal) rect.top else rect.left;
+            const across_end = if (horizontal) rect.bottom else rect.right;
+            if (along >= parts.divider - hit_area and along <= parts.divider + hit_area and
+                across >= across_start and across <= across_end)
+            {
+                return .{ .handle = handle, .layout = s.layout, .rect = rect, .grab = along - parts.divider };
             }
+            return self.hitTestDividerNode(tree, s.left, parts.first, x, y) orelse
+                self.hitTestDividerNode(tree, s.right, parts.second, x, y);
         },
     }
 }
 
-fn startDividerDrag(self: *Window, handle: SplitTree(Surface).Node.Handle, layout: SplitTree(Surface).Split.Layout) void {
+/// The least a pane keeps of its split while a divider is dragged, in DIPs.
+const min_pane_size: f32 = 40;
+
+fn startDividerDrag(self: *Window, hit: DividerHit) void {
     self.dragging_split = true;
-    self.drag_split_handle = handle;
-    self.drag_split_layout = layout;
-    self.drag_start_rect = self.surfaceRect();
+    self.drag_split_tab = self.active_tab;
+    self.drag_split_handle = hit.handle;
+    self.drag_split_layout = hit.layout;
+    self.drag_split_rect = hit.rect;
+    self.drag_grab_offset = hit.grab;
     if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
 }
 
+/// Move the dragged divider to follow the pointer at (x, y): the ratio of
+/// its split comes from the split's own rectangle, keeping the offset at
+/// which the divider was grabbed. The drag ends instead when its split is
+/// gone.
 fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
     if (!self.dragging_split) return;
-    const rect = self.drag_start_rect;
+    const tab = self.drag_split_tab;
+    if (tab != self.active_tab or tab >= self.tab_count) return self.cancelDividerDrag();
+    const tree = &self.tab_trees[tab];
     const handle = self.drag_split_handle;
+    if (handle.idx() >= tree.nodes.len) return self.cancelDividerDrag();
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => return self.cancelDividerDrag(),
+        .split => |s| if (s.layout != self.drag_split_layout) return self.cancelDividerDrag(),
+    }
 
-    const new_ratio: f16 = switch (self.drag_split_layout) {
-        .horizontal => ratio: {
-            const total: f32 = @floatFromInt(@max(rect.right - rect.left, 1));
-            const pos: f32 = @floatFromInt(x - rect.left);
-            break :ratio @floatCast(std.math.clamp(pos / total, 0.1, 0.9));
-        },
-        .vertical => ratio: {
-            const total: f32 = @floatFromInt(@max(rect.bottom - rect.top, 1));
-            const pos: f32 = @floatFromInt(y - rect.top);
-            break :ratio @floatCast(std.math.clamp(pos / total, 0.1, 0.9));
-        },
+    const rect = self.drag_split_rect;
+    const min_size = style.px(min_pane_size, self.scale) + self.splitGap();
+    const ratio = switch (self.drag_split_layout) {
+        .horizontal => splits.ratioAt(rect.left, rect.right - rect.left, x - self.drag_grab_offset, min_size),
+        .vertical => splits.ratioAt(rect.top, rect.bottom - rect.top, y - self.drag_grab_offset, min_size),
     };
-
-    self.tab_trees[self.active_tab].resizeInPlace(handle, new_ratio);
+    tree.resizeInPlace(handle, @floatCast(ratio));
     self.layoutSplits();
 }
 
-fn endDividerDrag(self: *Window) void {
+/// End a divider drag: the button went up, the capture went elsewhere or
+/// the split tree changed under it.
+fn cancelDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
-    _ = w32.ReleaseCapture();
+    const hwnd = self.hwnd orelse return;
+    if (w32.GetCapture() == hwnd) _ = w32.ReleaseCapture();
+}
+
+/// Replace the split tree of tab `tab` and free the old one. A divider
+/// drag in that tab ends: its node belongs to the old tree.
+fn replaceTree(self: *Window, tab: usize, tree: SplitTree(Surface)) void {
+    if (self.drag_split_tab == tab) self.cancelDividerDrag();
+    var old = self.tab_trees[tab];
+    self.tab_trees[tab] = tree;
+    old.deinit();
 }
 
 /// Create a new split in the active tab.
@@ -1441,16 +1587,19 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
     const active_surface = self.tab_active_surface[tab];
     const handle = self.findHandle(tab, active_surface) orelse return;
 
-    // Create new surface.
+    // Create new surface. Once the single-node tree holds it, freeing the
+    // tree frees the surface.
     const new_surface = try alloc.create(Surface);
-    errdefer {
+    new_surface.init(self.app, self, .split) catch |err| {
         new_surface.deinit();
         alloc.destroy(new_surface);
-    }
-    try new_surface.init(self.app, self, .split);
-
-    // Create a single-node tree for the new surface.
-    var insert_tree = try SplitTree(Surface).init(alloc, new_surface);
+        return err;
+    };
+    var insert_tree = SplitTree(Surface).init(alloc, new_surface) catch |err| {
+        new_surface.deinit();
+        alloc.destroy(new_surface);
+        return err;
+    };
     defer insert_tree.deinit();
 
     // Split the current tree at the active surface.
@@ -1462,58 +1611,68 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
         &insert_tree,
     );
 
-    // Replace old tree.
-    var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
-    self.tab_trees[tab] = new_tree;
-
     // Focus the new surface.
     self.tab_active_surface[tab] = new_surface;
+    self.replaceTree(tab, new_tree);
+    self.refreshTabTitle(tab);
 
     self.layoutSplits();
     if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
     self.updateAppMode();
 }
 
-/// Navigate to a split in the given direction.
-pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
-    if (self.tab_count == 0) return;
-    const alloc = self.app.core_app.alloc;
-    const tab = self.active_tab;
+/// Focus the split in direction `goto_target` from the focused split of
+/// the tab of `surface` (`goto_split`); previous and next wrap around.
+/// Returns false when there is none, so that the key reaches the
+/// terminal. A zoomed tab moves its zoom to the newly focused split with
+/// `split-preserve-zoom = navigation` and unzooms otherwise, so the focus
+/// never lands on a hidden split.
+pub fn gotoSplit(self: *Window, surface: *Surface, goto_target: apprt.action.GotoSplit) bool {
+    const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
-
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    if (!tree.isSplit()) return false;
+    const from = tree.locate(self.tab_active_surface[tab]) orelse return false;
 
     const target: SplitTree(Surface).Goto = switch (goto_target) {
-        .previous => .previous,
-        .next => .next,
+        .previous => .previous_wrapped,
+        .next => .next_wrapped,
         .up => .{ .spatial = .up },
         .down => .{ .spatial = .down },
         .left => .{ .spatial = .left },
         .right => .{ .spatial = .right },
     };
+    const dest = (tree.goto(self.app.core_app.alloc, from, target) catch return false) orelse return false;
+    if (dest == from) return false;
+    const next = switch (tree.nodes[dest.idx()]) {
+        .leaf => |view| view,
+        .split => return false,
+    };
 
-    const dest_handle = (tree.goto(alloc, handle, target) catch return) orelse return;
-
-    switch (tree.nodes[dest_handle.idx()]) {
-        .leaf => |surface| {
-            self.tab_active_surface[tab] = surface;
-            if (surface.hwnd) |h| _ = w32.SetFocus(h);
-        },
-        .split => {},
+    const zoomed = tree.zoomed != null;
+    if (zoomed) tree.zoom(splits.zoomAfterFocus(
+        SplitTree(Surface).Node.Handle,
+        tree.zoomed,
+        dest,
+        self.app.config.@"split-preserve-zoom".navigation,
+    ));
+    self.tab_active_surface[tab] = next;
+    self.refreshTabTitle(tab);
+    if (tab == self.active_tab) {
+        if (zoomed) self.layoutSplits();
+        if (next.hwnd) |h| _ = w32.SetFocus(h);
     }
+    return true;
 }
 
-/// Resize the nearest split in the given direction by the given pixel amount.
-pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
-    if (self.tab_count == 0) return;
-    const alloc = self.app.core_app.alloc;
-    const tab = self.active_tab;
+/// Resize the split nearest to the focused split of the tab of `surface`
+/// in the given direction by the given pixel amount (`resize_split`).
+/// Returns false, letting the key reach the terminal, when the tab has no
+/// splits.
+pub fn resizeSplit(self: *Window, surface: *Surface, rs: apprt.action.ResizeSplit) bool {
+    const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
-
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
+    if (!tree.isSplit() or rs.amount == 0) return false;
+    const handle = tree.locate(self.tab_active_surface[tab]) orelse return false;
 
     const layout: SplitTree(Surface).Split.Layout = switch (rs.direction) {
         .left, .right => .horizontal,
@@ -1529,86 +1688,66 @@ pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
         .left, .up => -1.0,
         .right, .down => 1.0,
     };
-    const delta: f16 = @floatCast(sign * @as(f32, @floatFromInt(rs.amount)) / dimension);
+    const delta: f16 = @floatCast(std.math.clamp(sign * @as(f32, @floatFromInt(rs.amount)) / dimension, -1, 1));
 
-    const new_tree = tree.resize(alloc, handle, layout, delta) catch return;
-    var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
-    self.tab_trees[tab] = new_tree;
-    self.layoutSplits();
+    const new_tree = tree.resize(self.app.core_app.alloc, handle, layout, delta) catch return false;
+    self.replaceTree(tab, new_tree);
+    if (tab == self.active_tab) self.layoutSplits();
+    return true;
 }
 
-/// Equalize all splits in the active tab.
-pub fn equalizeSplits(self: *Window) void {
-    if (self.tab_count == 0) return;
-    const alloc = self.app.core_app.alloc;
-    const tab = self.active_tab;
-
-    const new_tree = self.tab_trees[tab].equalize(alloc) catch return;
-    var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
-    self.tab_trees[tab] = new_tree;
-    self.layoutSplits();
+/// Equalize all splits in the tab of `surface` (`equalize_splits`).
+/// Returns false when the tab has no splits.
+pub fn equalizeSplits(self: *Window, surface: *Surface) bool {
+    const tab = self.findTabIndex(surface) orelse return false;
+    if (!self.tab_trees[tab].isSplit()) return false;
+    const new_tree = self.tab_trees[tab].equalize(self.app.core_app.alloc) catch return false;
+    self.replaceTree(tab, new_tree);
+    if (tab == self.active_tab) self.layoutSplits();
+    return true;
 }
 
-/// Toggle zoom on the active split surface.
-pub fn toggleSplitZoom(self: *Window) void {
-    if (self.tab_count == 0) return;
-    const tab = self.active_tab;
-    var tree = &self.tab_trees[tab];
-
-    if (!tree.isSplit()) return;
-
-    const active_surface = self.tab_active_surface[tab];
-    const handle = self.findHandle(tab, active_surface) orelse return;
-
-    if (tree.zoomed) |z| {
-        if (z == handle) {
-            tree.zoom(null);
-        } else {
-            tree.zoom(handle);
-        }
-    } else {
-        tree.zoom(handle);
-    }
-    self.layoutSplits();
+/// Toggle the zoom of the focused split in the tab of `surface`
+/// (`toggle_split_zoom`). Returns false when the tab has no splits.
+pub fn toggleSplitZoom(self: *Window, surface: *Surface) bool {
+    const tab = self.findTabIndex(surface) orelse return false;
+    const tree = &self.tab_trees[tab];
+    if (!tree.isSplit()) return false;
+    const handle = tree.locate(self.tab_active_surface[tab]) orelse return false;
+    tree.zoom(if (tree.zoomed == handle) null else handle);
+    if (tab == self.active_tab) self.layoutSplits();
+    return true;
 }
 
-/// Navigate to a tab by GotoTab target (previous, next, last, or index).
+/// Navigate to a tab by GotoTab target (previous, next, last, or a tab
+/// number starting from 1). Returns false when the window has a single
+/// tab or the target is the active tab (which only gets the focus), like
+/// GTK, so that the key reaches the terminal.
 pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
-    if (self.tab_count <= 1) return false;
-    const idx: usize = switch (target) {
-        .previous => if (self.active_tab > 0) self.active_tab - 1 else self.tab_count - 1,
-        .next => if (self.active_tab + 1 < self.tab_count) self.active_tab + 1 else 0,
-        .last => self.tab_count - 1,
-        _ => blk: {
-            // GotoTab carries a c_int; clamp non-negative before casting
-            // so a negative sentinel doesn't panic the @intCast.
-            const raw = @intFromEnum(target);
-            if (raw < 0) return false;
-            const n: usize = @intCast(raw);
-            break :blk if (n < self.tab_count) n else return false;
-        },
+    const goto: tabs.Goto = switch (target) {
+        .previous => .previous,
+        .next => .next,
+        .last => .last,
+        _ => .{ .number = std.math.cast(usize, @intFromEnum(target)) orelse return false },
     };
+    const idx = tabs.gotoIndex(self.active_tab, self.tab_count, goto) orelse return false;
+    if (idx == self.active_tab) {
+        self.focusActiveSurface();
+        return false;
+    }
     self.selectTabIndex(idx);
     self.invalidateTabBar();
     return true;
 }
 
-/// Move the active tab by a relative offset, wrapping cyclically.
-pub fn moveTab(self: *Window, amount: isize) void {
-    if (self.tab_count <= 1) return;
-    const n: isize = @intCast(self.active_tab);
-    const count: isize = @intCast(self.tab_count);
-    const new_index: usize = @intCast(@mod(n + amount, count));
-    if (new_index == self.active_tab) return;
-
-    // Swap all tab state between active_tab and new_index.
-    const moved = self.getSlot(self.active_tab);
-    self.copySlot(self.active_tab, new_index);
-    self.setSlot(new_index, moved);
-    self.active_tab = new_index;
-    self.invalidateTabBar();
+/// Move the tab of `surface` by a relative offset, wrapping cyclically
+/// (`move_tab`). Returns false when it stays where it is (a single tab),
+/// so that the key reaches the terminal.
+pub fn moveTab(self: *Window, surface: *Surface, amount: isize) bool {
+    const from = self.findTabIndex(surface) orelse return false;
+    const to = tabs.moveIndex(from, self.tab_count, amount) orelse return false;
+    self.moveTabTo(from, to);
+    return true;
 }
 
 /// Move the tab containing `surface`, including all of its splits, into a new
@@ -1658,18 +1797,20 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
         }
     }
 
+    self.tab_bar.cancelRename();
+    self.tab_bar.cancelDrag();
+    self.cancelDividerDrag();
+    // The slot carries the title override along.
     var moved = self.getSlot(tab_idx);
     moved.unread = false;
     const moved_active = moved.active_surface;
+    const next_active = tabs.activeAfterClose(self.active_tab, tab_idx, self.tab_count).?;
+    const was_active = tab_idx == self.active_tab;
 
     var i = tab_idx;
     while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
     self.tab_count -= 1;
-    if (self.active_tab > tab_idx) {
-        self.active_tab -= 1;
-    } else if (self.active_tab >= self.tab_count) {
-        self.active_tab = self.tab_count - 1;
-    }
+    self.active_tab = next_active;
 
     destination.setSlot(0, moved);
     destination.tab_count = 1;
@@ -1678,7 +1819,13 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     it = destination.tab_trees[0].iterator();
     while (it.next()) |entry| entry.view.parent_window = destination;
 
-    self.selectTabIndex(self.active_tab);
+    // The panes of the moved tab belong to the destination now: show the
+    // tab that takes its place without hiding them.
+    if (was_active) {
+        self.tab_unread[self.active_tab] = false;
+        self.layoutSplits();
+        self.updateWindowTitle();
+    }
     self.updateTabBarVisibility();
     self.invalidateTabBar();
     self.updateAppMode();
@@ -1694,20 +1841,24 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     return true;
 }
 
-/// Update the top-level window title to match the active tab's title.
+/// Update the top-level window title to match the active tab's title (or
+/// the window title override). Nothing happens when it is the same.
 pub fn updateWindowTitle(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     if (self.tab_count == 0) return;
-    const len = self.window_title_override_len orelse
-        self.tab_title_lens[self.active_tab];
-    var buf: [257]u16 = undefined;
-    if (self.window_title_override_len != null) {
-        @memcpy(buf[0..len], self.window_title_override[0..len]);
-    } else {
-        @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
-    }
-    buf[len] = 0;
+    const title: []const u16 = if (self.window_title_override_len) |len|
+        self.window_title_override[0..len]
+    else
+        self.tab_titles[self.active_tab][0..self.tab_title_lens[self.active_tab]];
+    var current: [tabs.max_title_len + 2]u16 = undefined;
+    const current_len: usize = @intCast(@max(0, w32.GetWindowTextW(hwnd, &current, current.len)));
+    if (std.mem.eql(u16, current[0..current_len], title)) return;
+    var buf: [tabs.max_title_len + 1]u16 = undefined;
+    @memcpy(buf[0..title.len], title);
+    buf[title.len] = 0;
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
+    // Without the tabs the title bar shows the window title.
+    if (!self.tab_bar.visible) self.title_bar.invalidate();
 }
 
 /// Set or clear the explicit top-level window title override.
@@ -1715,23 +1866,42 @@ pub fn setWindowTitle(self: *Window, title: [:0]const u8) void {
     if (title.len == 0) {
         self.window_title_override_len = null;
     } else {
-        const len = std.unicode.utf8ToUtf16Le(&self.window_title_override, title) catch 0;
-        self.window_title_override_len = @intCast(@min(len, self.window_title_override.len));
+        self.window_title_override_len = @intCast(wstr.bufZ(&self.window_title_override, title).len);
     }
     self.updateWindowTitle();
 }
 
-/// Called when a tab's title changes. Updates the stored title
-/// and refreshes the window title bar / tab bar if needed.
-pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) void {
-    const tab_idx = self.findTabIndex(surface) orelse return;
-    var wbuf: [256]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
-    const len: u16 = @intCast(@min(wlen, 255));
-    @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
-    self.tab_title_lens[tab_idx] = len;
-    if (tab_idx == self.active_tab) self.updateWindowTitle();
+/// Show on tab `tab` the title it should have now (`tabs.displayTitle`:
+/// its override, else its focused terminal's title), repainting the tab
+/// bar and the window title only when it changed.
+fn refreshTabTitle(self: *Window, tab: usize) void {
+    if (tab >= self.tab_count) return;
+    const terminal: tabs.Title = .fromUtf8(self.tab_active_surface[tab].getTitle() orelse "");
+    const override: ?[]const u16 = if (self.tab_title_overrides[tab]) |*title| title.slice() else null;
+    const title = tabs.displayTitle(override, terminal.slice());
+    if (std.mem.eql(u16, self.tab_titles[tab][0..self.tab_title_lens[tab]], title)) return;
+    @memcpy(self.tab_titles[tab][0..title.len], title);
+    self.tab_title_lens[tab] = @intCast(title.len);
+    if (tab == self.active_tab) self.updateWindowTitle();
     self.invalidateTabBar();
+}
+
+/// The terminal `surface` has a new title (`set_title`): its tab shows it
+/// while `surface` is the focused terminal of the tab and the tab has no
+/// title override.
+pub fn onSurfaceTitleChanged(self: *Window, surface: *Surface) void {
+    const tab = self.findTabIndex(surface) orelse return;
+    if (self.tab_active_surface[tab] != surface) return;
+    self.refreshTabTitle(tab);
+}
+
+/// Set the title override of tab `tab` (`set_tab_title`, renaming the
+/// tab); an empty title clears it, so the tab shows its terminal's title
+/// again.
+pub fn setTabTitleOverride(self: *Window, tab: usize, title: tabs.Title) void {
+    if (tab >= self.tab_count) return;
+    self.tab_title_overrides[tab] = if (title.len == 0) null else title;
+    self.refreshTabTitle(tab);
 }
 
 /// Update tab bar visibility based on config and tab count. The chrome row
@@ -1805,25 +1975,15 @@ pub fn invalidateTabBar(self: *Window) void {
     self.tab_bar.invalidate();
 }
 
-/// Replace the title of the tab at `tab_idx` (UTF-16, truncated to 255
-/// code units).
-pub fn setTabTitle(self: *Window, tab_idx: usize, title: []const u16) void {
-    if (tab_idx >= self.tab_count) return;
-    const len: u16 = @intCast(@min(title.len, 255));
-    @memcpy(self.tab_titles[tab_idx][0..len], title[0..len]);
-    self.tab_title_lens[tab_idx] = len;
-    if (tab_idx == self.active_tab) self.updateWindowTitle();
-}
-
 /// Set (or clear, when empty) the explicit window title override (UTF-16,
-/// truncated to 255 code units).
+/// cut to `tabs.max_title_len` code units at a codepoint boundary).
 pub fn setWindowTitleOverride(self: *Window, title: []const u16) void {
-    if (title.len == 0) {
+    const units = wstr.truncate(title, tabs.max_title_len);
+    if (units.len == 0) {
         self.window_title_override_len = null;
     } else {
-        const len: u16 = @intCast(@min(title.len, 255));
-        @memcpy(self.window_title_override[0..len], title[0..len]);
-        self.window_title_override_len = len;
+        @memcpy(self.window_title_override[0..units.len], units);
+        self.window_title_override_len = @intCast(units.len);
     }
     self.updateWindowTitle();
 }
@@ -1855,6 +2015,7 @@ pub fn moveTabTo(self: *Window, from: usize, to: usize) void {
     // Cancel any in-progress rename: the edit control's tab index
     // would otherwise point at the wrong tab after the move.
     self.tab_bar.cancelRename();
+    self.cancelDividerDrag();
 
     // Save the source tab state
     const saved = self.getSlot(from);
@@ -1872,7 +2033,7 @@ pub fn moveTabTo(self: *Window, from: usize, to: usize) void {
     // Place the saved tab at the destination
     self.setSlot(to, saved);
 
-    self.active_tab = to;
+    self.active_tab = tabs.movedIndex(self.active_tab, from, to);
     self.invalidateTabBar();
 }
 
@@ -1918,15 +2079,17 @@ pub fn close(self: *Window) void {
 
 /// Deinit and free all tab trees (which unrefs and frees surfaces).
 fn cleanupAllSurfaces(self: *Window) void {
-    // Deinit in place and reset to .empty. SplitTree.deinit sets self.*
-    // to undefined; deinit'ing a local copy would only mark the copy,
-    // leaving stale arena/node pointers in tab_trees that any post-WM_CLOSE
-    // message walking the slot could dereference.
-    for (self.tab_trees[0..self.tab_count]) |*tree| {
-        tree.deinit();
-        tree.* = .empty;
-    }
+    self.cancelDividerDrag();
+    // Empty the tab model before any terminal goes away: freeing one can
+    // dispatch messages that walk the tabs, which then find none instead
+    // of trees being freed (SplitTree.deinit leaves its tree undefined).
+    const count = self.tab_count;
     self.tab_count = 0;
+    for (self.tab_trees[0..count]) |*slot| {
+        var tree = slot.*;
+        slot.* = .empty;
+        tree.deinit();
+    }
 }
 
 /// Handle WM_DESTROY: remove this window from the App's list,
@@ -2015,8 +2178,6 @@ fn onChromeRightClick(self: *Window, pt: w32.POINT) void {
     Menu.performTabCommand(self, null, command);
 }
 
-const WM_CAPTURECHANGED: u32 = 0x0215;
-
 /// Window procedure for top-level container HWNDs (GhosttyWindow class).
 /// GWLP_USERDATA stores a *Window pointer.
 pub fn windowWndProc(
@@ -2069,7 +2230,7 @@ pub fn windowWndProc(
             // prevents oleacc from creating an AccWrap proxy whose
             // later destruction can re-enter our WindowProc via
             // SetFocus and deadlock on a COM marshaling reply.
-            if (lparam == w32.OBJID_CLIENT) return 0;
+            if (w32.objectId(lparam) == w32.OBJID_CLIENT) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_TIMER => {
@@ -2238,7 +2399,7 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const pt = mousePoint(lparam);
             if (window.hitTestDivider(pt.x, pt.y)) |hit| {
-                window.startDividerDrag(hit.handle, hit.layout);
+                window.startDividerDrag(hit);
                 return 0;
             }
             _ = window.title_bar.onLeftButtonDown(pt.x, pt.y);
@@ -2246,7 +2407,7 @@ pub fn windowWndProc(
         },
         w32.WM_LBUTTONUP => {
             if (window.dragging_split) {
-                window.endDividerDrag();
+                window.cancelDividerDrag();
                 return 0;
             }
             const pt = mousePoint(lparam);
@@ -2286,15 +2447,21 @@ pub fn windowWndProc(
         w32.WM_MOUSEMOVE => {
             const pt = mousePoint(lparam);
             if (window.dragging_split) {
-                window.updateDividerDrag(pt.x, pt.y);
-                return 0;
+                // The button went up where the window did not see it.
+                if (wparam & w32.MK_LBUTTON == 0) {
+                    window.cancelDividerDrag();
+                } else {
+                    window.updateDividerDrag(pt.x, pt.y);
+                    return 0;
+                }
             }
             // Tab drag reorder and chrome hover.
             _ = window.title_bar.onMouseMove(pt.x, pt.y);
             return 0;
         },
-        WM_CAPTURECHANGED => {
+        w32.WM_CAPTURECHANGED => {
             window.tab_bar.onCaptureLost();
+            window.cancelDividerDrag();
             return 0;
         },
         w32.WM_SETCURSOR => {

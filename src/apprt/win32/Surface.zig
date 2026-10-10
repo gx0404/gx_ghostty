@@ -30,6 +30,7 @@ const path_quote = @import("../../gx/path_quote.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const clipboard = @import("clipboard.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const Dialogs = @import("ui/Dialogs.zig");
@@ -37,6 +38,7 @@ const LinkPreview = @import("ui/LinkPreview.zig");
 const Menu = @import("ui/Menu.zig");
 const Palette = @import("ui/Palette.zig");
 const SearchBar = @import("ui/SearchBar.zig");
+const wstr = @import("ui/wstr.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -87,7 +89,13 @@ high_surrogate: u16 = 0,
 /// 0→nonzero and nonzero→0 transitions; without this, a right-click
 /// in the middle of a left-button drag would call SetCapture again
 /// (replacing capture) and the next button-up would release prematurely.
+/// The release of one of these buttons reaches the core only while its
+/// bit is set (`buttonEvent`).
 mouse_button_mask: u3 = 0,
+
+/// Horizontal wheel movement short of a whole notch (`WHEEL_DELTA`), kept
+/// for the next WM_MOUSEHWHEEL (`wheelNotches`).
+hwheel_accum: i32 = 0,
 
 /// Whether an IME composition session is active. When true, handleKeyEvent
 /// skips VK_PROCESSKEY events (the IME is intercepting keys), and composed
@@ -301,7 +309,7 @@ pub fn initWithOptions(
     const alloc = app.core_app.alloc;
 
     // Create the themed scrollbar popup (owned by the surface HWND).
-    self.scrollbar = try Scrollbar.create(alloc, hwnd, self);
+    self.scrollbar = try Scrollbar.create(alloc, hwnd, self, app.config.scrollbar != .never);
     errdefer if (self.scrollbar) |sb| {
         sb.destroy();
         self.scrollbar = null;
@@ -313,6 +321,8 @@ pub fn initWithOptions(
             app.config.background.toTerminalRGB(),
             app.config.foreground.toTerminalRGB(),
         );
+        // An always-visible scrollbar takes its column from the first grid.
+        self.width = Scrollbar.gridWidth(self.width, sb.currentReservedWidth());
     }
 
     // Register this surface with the core app.
@@ -359,6 +369,10 @@ pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
     if (self.core_surface_initialized) {
+        // Messages that arrive while the core surface shuts down must not
+        // reach it.
+        self.core_surface_ready = false;
+
         // This joins the renderer thread, which destroys its GL context.
         log.debug("surface deinit: core_surface.deinit start", .{});
         self.core_surface.deinit();
@@ -509,6 +523,11 @@ pub fn setVisible(self: *Surface, visible: bool) void {
 /// surfaceWndProc hands it to `confirmClose`.
 pub const WM_APP_CONFIRM_CLOSE: u32 = w32.WM_APP + 0x60;
 
+/// Posted when the command of this terminal failed to start (`App`'s
+/// `show_child_exited`); wparam is its exit code. surfaceWndProc tells the
+/// user from the message loop, not from the core callback.
+pub const WM_APP_CHILD_EXITED: u32 = w32.WM_APP + 32;
+
 /// Close this terminal. `process_active` is the core's
 /// `needsConfirmQuit`: with the GX idle-process check, true only while a
 /// program other than an idle shell runs, so then the user is asked
@@ -630,10 +649,11 @@ pub fn clipboardRequest(
 const CLIPBOARD_READ_TIMER: usize = 0x4352; // 'CR'
 const CLIPBOARD_WRITE_TIMER: usize = 0x4357; // 'CW'
 
-/// Opening a clipboard that another application holds open (clipboard
-/// managers, remote desktop) is retried this many times from a timer,
-/// after 10, 20, 40, ... ms (about 0.6 s in total), so a busy clipboard
-/// never blocks the GUI thread.
+/// Each access waits briefly for a clipboard that another application holds
+/// open (`clipboard.open`); when it stays busy longer (clipboard managers,
+/// remote desktop), the access is retried this many times from a timer,
+/// after 10, 20, 40, ... ms (about 0.6 s in total), rather than blocking
+/// the GUI thread for that long.
 const clipboard_retries = 6;
 
 fn clipboardRetryDelay(attempt: u8) u32 {
@@ -648,7 +668,7 @@ fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.Clipboard
     // Win32 exposes files and Unicode text as a text/plain representation.
     if (state == .list) {
         const has_text = has_text: {
-            if (w32.OpenClipboard(self.hwnd) == 0) return error.ClipboardBusy;
+            if (!clipboard.open(self.hwnd)) return error.ClipboardBusy;
             defer _ = w32.CloseClipboard();
             break :has_text w32.GetClipboardData(w32.CF_HDROP) != null or
                 w32.GetClipboardData(w32.CF_UNICODETEXT) != null;
@@ -675,7 +695,7 @@ fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.Clipboard
     // dialog can be up for an unbounded time and would otherwise block every
     // other process's clipboard access.
     const utf8z: [:0]const u8 = blk: {
-        if (w32.OpenClipboard(self.hwnd) == 0) return error.ClipboardBusy;
+        if (!clipboard.open(self.hwnd)) return error.ClipboardBusy;
         defer _ = w32.CloseClipboard();
 
         // Files copied in Explorer land on the clipboard as CF_HDROP with no
@@ -949,7 +969,7 @@ fn writeClipboard(self: *Surface, data: *anyopaque, attempt: u8) void {
     }
 
     // null owner: the write is not tied to the surface hwnd.
-    if (w32.OpenClipboard(null) == 0) {
+    clipboard.setUnicodeText(null, data) catch {
         if (attempt + 1 < clipboard_retries) {
             if (self.hwnd) |hwnd| {
                 if (w32.SetTimer(hwnd, CLIPBOARD_WRITE_TIMER, clipboardRetryDelay(attempt), null) != 0) {
@@ -960,17 +980,7 @@ fn writeClipboard(self: *Surface, data: *anyopaque, attempt: u8) void {
         }
         log.warn("OpenClipboard failed for clipboard write", .{});
         _ = w32.GlobalFree(data);
-        return;
-    }
-    defer _ = w32.CloseClipboard();
-
-    _ = w32.EmptyClipboard();
-
-    // SetClipboardData takes ownership of the data on success.
-    if (w32.SetClipboardData(w32.CF_UNICODETEXT, data) == null) {
-        log.warn("SetClipboardData failed", .{});
-        _ = w32.GlobalFree(data);
-    }
+    };
 }
 
 fn onClipboardWriteTimer(self: *Surface) void {
@@ -990,13 +1000,14 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
     return env;
 }
 
-/// Set the window title. Called from performAction(.set_title).
+/// Set the terminal title, which its tab shows while this is the tab's
+/// focused terminal. Called from performAction(.set_title).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
     const len = @min(title.len, self.title.len - 1);
     @memcpy(self.title[0..len], title[0..len]);
     self.title[len] = 0;
     self.title_len = len;
-    self.parent_window.onTabTitleChanged(self, title);
+    self.parent_window.onSurfaceTitleChanged(self);
 }
 
 /// Toggle fullscreen mode. Delegates to the parent Window.
@@ -1069,10 +1080,13 @@ pub fn toggleWindowDecorations(self: *Surface) void {
 /// Follow a config change reported for this surface. Its conditional
 /// configuration (e.g. a light/dark theme) can differ from the app's.
 pub fn onConfigChange(self: *Surface, config: *const configpkg.Config) void {
-    if (self.scrollbar) |sb| sb.setTheme(
-        config.background.toTerminalRGB(),
-        config.foreground.toTerminalRGB(),
-    );
+    if (self.scrollbar) |sb| {
+        sb.setTheme(
+            config.background.toTerminalRGB(),
+            config.foreground.toTerminalRGB(),
+        );
+        if (sb.setEnabled(config.scrollbar != .never)) self.refitGrid();
+    }
 }
 
 /// Update the themed scrollbar to reflect the terminal's scroll state.
@@ -1104,12 +1118,7 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     // Pre-flight the scrollbar so we know whether to subtract its width.
     // This must happen before sizeCallback so the grid gets the right width.
     var grid_width = width;
-    if (self.scrollbar) |sb| {
-        const sub = sb.repositionAndResize();
-        if (sub > 0 and grid_width > @as(u32, @intCast(sub))) {
-            grid_width -= @as(u32, @intCast(sub));
-        }
-    }
+    if (self.scrollbar) |sb| grid_width = Scrollbar.gridWidth(width, sb.repositionAndResize());
     self.width = grid_width;
 
     // Reposition popups with corrected width.
@@ -1150,6 +1159,17 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
         // just wake the renderer asynchronously.
         self.core_surface.renderer_thread.wakeup.notify() catch {};
     }
+}
+
+/// Lay the grid out again for the current client area: the scrollbar
+/// started or stopped taking a column of it (`scrollbar = never`, the
+/// system scrollbar mode). The window size did not change, so no WM_SIZE
+/// comes; this also works for the hidden terminals of background tabs.
+pub fn refitGrid(self: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return;
+    self.handleResize(@intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
 }
 
 /// How long a live resize waits for the renderer to present a frame at
@@ -1431,7 +1451,8 @@ pub fn handleCharEvent(self: *Surface, wparam: usize) void {
 }
 
 /// Handle WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN /
-/// WM_LBUTTONUP / WM_RBUTTONUP / WM_MBUTTONUP.
+/// WM_XBUTTONDOWN and the matching button-up messages. A release only
+/// reaches the core for a button pressed in this terminal (`buttonEvent`).
 pub fn handleMouseButton(
     self: *Surface,
     button: input.MouseButton,
@@ -1439,35 +1460,24 @@ pub fn handleMouseButton(
     lparam: isize,
 ) void {
     if (!self.core_surface_ready) return;
-    const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
-    const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
-
-    const mods = getModifiers();
 
     // Capture mouse on the first pressed button; release only when all
     // buttons are up. Otherwise a right-click in the middle of a left-
     // button drag clobbers capture, and the next up-event releases it
     // for everyone.
-    const bit: u3 = switch (button) {
-        .left => 1,
-        .right => 2,
-        .middle => 4,
-        else => 0,
-    };
-    if (bit != 0) {
-        const prev = self.mouse_button_mask;
-        if (action == .press) {
-            self.mouse_button_mask |= bit;
-            if (prev == 0) {
-                if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
-            }
-        } else {
-            self.mouse_button_mask &= ~bit;
-            if (prev != 0 and self.mouse_button_mask == 0) {
-                _ = w32.ReleaseCapture();
-            }
-        }
+    const prev = self.mouse_button_mask;
+    const event = buttonEvent(prev, buttonBit(button), action);
+    self.mouse_button_mask = event.mask;
+    if (prev == 0 and event.mask != 0) {
+        if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
+    } else if (prev != 0 and event.mask == 0) {
+        _ = w32.ReleaseCapture();
     }
+    if (!event.forward) return;
+
+    const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
+    const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
+    const mods = getModifiers();
 
     // Update cursor position first
     self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
@@ -1485,6 +1495,98 @@ pub fn handleMouseButton(
     // (same contract the GTK apprt follows).
     if (!consumed and button == .right and action == .press) {
         self.showContextMenu(lparam);
+    }
+}
+
+/// The bit of `button` in `mouse_button_mask`, 0 for a button it does not
+/// track.
+fn buttonBit(button: input.MouseButton) u3 {
+    return switch (button) {
+        .left => 1,
+        .right => 2,
+        .middle => 4,
+        else => 0,
+    };
+}
+
+/// A press or release in `handleMouseButton` (`buttonEvent`).
+const ButtonEvent = struct {
+    /// `mouse_button_mask` afterwards.
+    mask: u3,
+    /// Whether the core gets the event.
+    forward: bool,
+};
+
+/// The press or release (`action`) of the button with mask bit `bit` (0:
+/// a button the mask does not track, such as the side buttons) while the
+/// buttons `mask` are pressed in this terminal. Like a GTK gesture, a
+/// release only reaches the core for a button pressed here and not
+/// released yet: not once `handleCaptureChanged` reported its release, nor
+/// for a press that happened elsewhere.
+fn buttonEvent(mask: u3, bit: u3, action: input.MouseButtonState) ButtonEvent {
+    return switch (action) {
+        .press => .{ .mask = mask | bit, .forward = true },
+        .release => .{ .mask = mask & ~bit, .forward = bit == 0 or mask & bit != 0 },
+    };
+}
+
+test "buttonEvent forwards a release only for a button pressed here" {
+    const testing = std.testing;
+    const left = buttonBit(.left);
+    const right = buttonBit(.right);
+    const middle = buttonBit(.middle);
+
+    // A click.
+    try testing.expectEqual(ButtonEvent{ .mask = left, .forward = true }, buttonEvent(0, left, .press));
+    try testing.expectEqual(ButtonEvent{ .mask = 0, .forward = true }, buttonEvent(left, left, .release));
+
+    // Buttons held together are released one by one.
+    try testing.expectEqual(ButtonEvent{ .mask = left | right, .forward = true }, buttonEvent(left, right, .press));
+    try testing.expectEqual(ButtonEvent{ .mask = right, .forward = true }, buttonEvent(left | right, left, .release));
+    try testing.expectEqual(ButtonEvent{ .mask = 0, .forward = true }, buttonEvent(right, right, .release));
+
+    // The capture was lost while the left button was held:
+    // `handleCaptureChanged` cleared the mask and reported the release,
+    // so the physical release is not reported again.
+    try testing.expectEqual(ButtonEvent{ .mask = 0, .forward = false }, buttonEvent(0, left, .release));
+    // Nor is the release of a press that happened elsewhere.
+    try testing.expectEqual(ButtonEvent{ .mask = middle, .forward = false }, buttonEvent(middle, right, .release));
+
+    // The side buttons are not tracked: always reported, the mask stays.
+    try testing.expectEqual(ButtonEvent{ .mask = 0, .forward = true }, buttonEvent(0, buttonBit(.eight), .press));
+    try testing.expectEqual(ButtonEvent{ .mask = 0, .forward = true }, buttonEvent(0, buttonBit(.nine), .release));
+    try testing.expectEqual(ButtonEvent{ .mask = left, .forward = true }, buttonEvent(left, buttonBit(.eight), .release));
+}
+
+/// Posted by `handleCaptureChanged` with the `mouse_button_mask` bits of
+/// the buttons whose release the terminal missed; surfaceWndProc hands it
+/// to `releaseButtons`.
+pub const WM_APP_RELEASE_BUTTONS: u32 = w32.WM_APP + 35;
+
+/// Handle WM_CAPTURECHANGED: another window took the mouse capture while
+/// buttons were held (a menu or dialog, switching windows mid-drag), so
+/// their releases will not come here. Forget them, and report the releases
+/// to the core from the message loop rather than now, when a core callback
+/// may be running the modal loop that took the capture.
+pub fn handleCaptureChanged(self: *Surface) void {
+    const released = self.mouse_button_mask;
+    if (released == 0) return;
+    self.mouse_button_mask = 0;
+    const hwnd = self.hwnd orelse return;
+    _ = w32.PostMessageW(hwnd, WM_APP_RELEASE_BUTTONS, released, 0);
+}
+
+/// Report the release of the `released` buttons (`mouse_button_mask` bits,
+/// see `handleCaptureChanged`) that were not pressed again meanwhile.
+pub fn releaseButtons(self: *Surface, released: u3) void {
+    if (!self.core_surface_ready) return;
+    const pending = released & ~self.mouse_button_mask;
+    const mods = getModifiers();
+    for ([_]input.MouseButton{ .left, .right, .middle }) |button| {
+        if (pending & buttonBit(button) == 0) continue;
+        _ = self.core_surface.mouseButtonCallback(.release, button, mods) catch |err| {
+            log.err("mouse button callback error: {}", .{err});
+        };
     }
 }
 
@@ -1655,16 +1757,58 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, axis: enum { vertical, ho
     if (!self.core_surface_ready) return;
     // The high word of wparam contains the wheel delta (signed).
     const raw_delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
-    const delta: f64 = @as(f64, @floatFromInt(raw_delta)) / @as(f64, @floatFromInt(w32.WHEEL_DELTA));
-
     const scroll_mods: input.ScrollMods = .{};
 
-    // Win32 horizontal wheel positive-right; core API positive-right also.
-    const xoff: f64 = if (axis == .horizontal) delta else 0;
-    const yoff: f64 = if (axis == .vertical) delta else 0;
+    var xoff: f64 = 0;
+    var yoff: f64 = 0;
+    switch (axis) {
+        .vertical => yoff = @as(f64, @floatFromInt(raw_delta)) / @as(f64, @floatFromInt(w32.WHEEL_DELTA)),
+        // The core rounds horizontal scrolls to whole notches, which drops
+        // the small steps of smooth wheels and touchpads, so they add up
+        // here first. Windows reports a tilt to the right as positive, the
+        // core takes it as negative (button 7), like the GTK apprt sends it.
+        .horizontal => {
+            const notches = wheelNotches(&self.hwheel_accum, raw_delta);
+            if (notches == 0) return;
+            xoff = @floatFromInt(-notches);
+        },
+    }
     self.core_surface.scrollCallback(xoff, yoff, scroll_mods) catch |err| {
         log.err("scroll callback error: {}", .{err});
     };
+}
+
+/// Add the wheel movement `delta` to `accum` and return the whole notches
+/// (`WHEEL_DELTA` each) it completes, keeping the rest in `accum`.
+/// Movement against the direction of what `accum` keeps starts over.
+fn wheelNotches(accum: *i32, delta: i32) i32 {
+    const notch: i32 = w32.WHEEL_DELTA;
+    if ((accum.* < 0 and delta > 0) or (accum.* > 0 and delta < 0)) accum.* = 0;
+    accum.* += delta;
+    const notches = @divTrunc(accum.*, notch);
+    accum.* -= notches * notch;
+    return notches;
+}
+
+test "wheelNotches adds up small steps" {
+    const testing = std.testing;
+    var accum: i32 = 0;
+    // A smooth wheel reporting quarter notches.
+    try testing.expectEqual(@as(i32, 0), wheelNotches(&accum, 30));
+    try testing.expectEqual(@as(i32, 0), wheelNotches(&accum, 30));
+    try testing.expectEqual(@as(i32, 0), wheelNotches(&accum, 30));
+    try testing.expectEqual(@as(i32, 1), wheelNotches(&accum, 30));
+    try testing.expectEqual(@as(i32, 0), accum);
+    // Whole notches pass at once, keeping the rest.
+    try testing.expectEqual(@as(i32, 2), wheelNotches(&accum, 250));
+    try testing.expectEqual(@as(i32, 10), accum);
+    // Turning back drops what was kept for the other direction.
+    try testing.expectEqual(@as(i32, -1), wheelNotches(&accum, -120));
+    try testing.expectEqual(@as(i32, 0), accum);
+    try testing.expectEqual(@as(i32, 0), wheelNotches(&accum, -60));
+    try testing.expectEqual(@as(i32, -1), wheelNotches(&accum, -60));
+    try testing.expectEqual(@as(i32, 0), wheelNotches(&accum, 60));
+    try testing.expectEqual(@as(i32, 60), accum);
 }
 
 /// Handle WM_IME_STARTCOMPOSITION — an IME composition session has begun.
@@ -1791,14 +1935,16 @@ fn updateImePreedit(self: *Surface) void {
 }
 
 fn sendImeText(self: *Surface, utf16: []const u16) void {
-    // Convert UTF-16LE to UTF-8 in a stack buffer (256 bytes covers
-    // even long CJK phrases — each CJK char is 3 bytes in UTF-8).
-    var utf8_buf: [256]u8 = undefined;
-    const len = std.unicode.utf16LeToUtf8(&utf8_buf, utf16) catch |err| {
+    // Convert UTF-16LE to UTF-8 on the stack when it fits (each CJK
+    // character takes 3 bytes in UTF-8), on the heap when it does not.
+    var fallback = std.heap.stackFallback(256, self.app.core_app.alloc);
+    const alloc = fallback.get();
+    const utf8 = wstr.utf8Alloc(alloc, utf16) catch |err| {
         log.warn("IME utf16→utf8 error: {}", .{err});
         return;
     };
-    if (len == 0) return;
+    defer alloc.free(utf8);
+    if (utf8.len == 0) return;
 
     // Send through keyCallback with .unidentified key — this is the
     // standard path for IME/text input (same as GTK's imCommit); VK = 0
@@ -1809,7 +1955,7 @@ fn sendImeText(self: *Surface, utf16: []const u16) void {
         .mods = .{},
         .consumed_mods = .{},
         .composing = false,
-        .utf8 = utf8_buf[0..len],
+        .utf8 = utf8,
     }, null) catch |err| {
         log.err("IME text callback error: {}", .{err});
     };

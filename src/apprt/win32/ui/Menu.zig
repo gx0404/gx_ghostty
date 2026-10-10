@@ -79,6 +79,7 @@ fn menuHost(app: *App) ?MenuPopup.Host {
         .hinstance = app.hinstance,
         .factory = factory,
         .tokens = style.Tokens.fromConfig(&app.config),
+        .quit_requested = &app.quit_requested,
     };
 }
 
@@ -368,8 +369,12 @@ fn buildTabMenu(
     });
 }
 
-/// Perform a pick of the tab context menu for the tab at index `tab`.
-pub fn performTabCommand(window: *Window, tab: ?usize, command: TabCommand) void {
+/// Perform a pick of the tab context menu for the tab holding the terminals
+/// with core surface ids `tab` (null: the empty part of the tab bar). The
+/// menu ran a modal loop, so the tab is found again by any of those ids
+/// (its focused split can close meanwhile); nothing happens when all of
+/// them closed.
+pub fn performTabCommand(window: *Window, tab: ?[]const u64, command: TabCommand) void {
     if (command == .new_tab) {
         _ = window.addTab() catch |err| {
             log.err("failed to create new tab: {}", .{err});
@@ -377,9 +382,9 @@ pub fn performTabCommand(window: *Window, tab: ?usize, command: TabCommand) void
         };
         return;
     }
-    // Tabs can close while the menu is open.
-    const index = tab orelse return;
-    if (index >= window.tab_count) return;
+    const index = for (tab orelse return) |id| {
+        if (window.findTabBySurfaceId(id)) |i| break i;
+    } else return;
     switch (command) {
         .rename => window.tab_bar.startRename(index),
         .close => window.closeTabByIndex(index),
@@ -389,26 +394,9 @@ pub fn performTabCommand(window: *Window, tab: ?usize, command: TabCommand) void
             log.err("failed to move the tab to a new window err={}", .{err});
             break :failed false;
         },
-        .duplicate => duplicateTab(window, index),
+        .duplicate => window.duplicateTab(index),
         .new_tab => unreachable,
     }
-}
-
-/// Open a new tab that runs the command of the focused terminal of tab
-/// `index` (its launch profile, if it was opened with one). Selecting the
-/// tab first makes the new tab inherit that terminal's working directory
-/// (`tab-inherit-working-directory`) and, with the default
-/// `window-new-tab-position = current`, open next to it.
-fn duplicateTab(window: *Window, index: usize) void {
-    const surface = window.tab_active_surface[index];
-    window.selectTabIndex(index);
-    _ = window.addTabWithOptions(.{
-        .context = .tab,
-        .command = if (surface.launch_command) |*command| command else null,
-    }) catch |err| {
-        log.err("failed to duplicate the tab err={}", .{err});
-        return;
-    };
 }
 
 const MainItem = enum(usize) {

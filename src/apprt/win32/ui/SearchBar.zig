@@ -9,11 +9,12 @@
 //!
 //! The owning `Surface` embeds this struct as `search_bar` and forwards the
 //! `start_search`/`end_search`/`search_total`/`search_selected` apprt
-//! actions (`setActive`, `setTotal`, `setSelected`), resizes and window
-//! moves (`reposition`), its visibility (`setOwnerVisible`), DPI changes
-//! and `deinit`. The app's message loop gives keys typed into the bar to
-//! `handleKey` first (see `App.run`, `ownsEdit`), which also lets
-//! keybindings with Ctrl reach the terminal.
+//! actions (`setActive`, `onSearchEnded`, `setTotal`, `setSelected`),
+//! resizes and window moves (`reposition`), its visibility
+//! (`setOwnerVisible`), DPI changes and `deinit`. The app's message loop
+//! gives keys typed into the bar to `handleKey` first (see `App.run`,
+//! `ownsEdit`), then lets keybindings with Ctrl reach the terminal, which
+//! takes the focus while the bar stays open.
 const SearchBar = @This();
 
 const std = @import("std");
@@ -86,21 +87,14 @@ fn tokens(self: *SearchBar) style.Tokens {
     return style.Tokens.fromConfig(&self.surface().app.config);
 }
 
-/// Show (pre-filled with `needle` when it is not empty) or hide the find
+/// Show (pre-filled with `needle` when it is not empty) or close the find
 /// bar. Opening it without a needle keeps the previous text, selected and
-/// searched again.
+/// searched again. Closing it ends the search in the core, which clears
+/// the highlighted matches and then hides the bar (`onSearchEnded`).
 pub fn setActive(self: *SearchBar, active: bool, needle: [:0]const u8) void {
     const s = self.surface();
     if (!active) {
-        const had_focus = self.popup.hwnd != null and w32.GetFocus() == self.popup.hwnd;
-        self.active = false;
-        self.total = null;
-        self.selected = null;
-        self.popup.hide();
-        // Return the focus to the terminal, unless it went elsewhere.
-        if (had_focus or w32.GetFocus() == null) {
-            if (s.hwnd) |hwnd| _ = w32.SetFocus(hwnd);
-        }
+        self.endSearch();
         return;
     }
 
@@ -248,12 +242,26 @@ fn navigate(self: *SearchBar, direction: input.Binding.Action.NavigateSearch) vo
 fn endSearch(self: *SearchBar) void {
     const s = self.surface();
     if (!s.core_surface_ready) {
-        self.setActive(false, "");
+        self.onSearchEnded();
         return;
     }
     _ = s.core_surface.performBindingAction(.end_search) catch |err| {
         log.err("end_search error: {}", .{err});
     };
+}
+
+/// The search ended (the `end_search` apprt action): hide the bar and
+/// give the focus back to the terminal, unless it went elsewhere.
+pub fn onSearchEnded(self: *SearchBar) void {
+    const s = self.surface();
+    const had_focus = self.popup.hwnd != null and w32.GetFocus() == self.popup.hwnd;
+    self.active = false;
+    self.total = null;
+    self.selected = null;
+    self.popup.hide();
+    if (had_focus or w32.GetFocus() == null) {
+        if (s.hwnd) |hwnd| _ = w32.SetFocus(hwnd);
+    }
 }
 
 /// Handle a key typed into the bar. Returns true if handled; other keys
