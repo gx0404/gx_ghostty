@@ -38,6 +38,7 @@ TEMPLATE_CHILDREN = {
     ("Window", "toolbar"): "Adw.ToolbarView",
     ("Window", "toast_overlay"): "Adw.ToastOverlay",
     ("Surface", "context_menu"): "PopoverMenu",
+    ("Surface", "progress_bar_overlay"): "ProgressBar",
 }
 
 # The upstream menus the GX menus replace: (blueprint, upstream menu id, GX menu id).
