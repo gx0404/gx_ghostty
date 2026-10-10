@@ -606,13 +606,11 @@ pub fn terminate(self: *App) void {
 }
 
 /// The Direct2D/DirectWrite factory of the custom-drawn UI, created on
-/// first use. Null when Direct2D is unavailable.
+/// first use. Null when Direct2D is unavailable (`d2d.Factory.create`
+/// logs that once and does not retry).
 pub fn uiFactory(self: *App) ?*d2d.Factory {
     if (self.ui_factory) |factory| return factory;
-    self.ui_factory = d2d.Factory.create(self.core_app.alloc) catch |err| {
-        log.warn("Direct2D UI unavailable err={}", .{err});
-        return null;
-    };
+    self.ui_factory = d2d.Factory.create(self.core_app.alloc) catch return null;
     return self.ui_factory;
 }
 
@@ -1470,6 +1468,15 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
         .keybinds => Keybinds.show(window),
         .new_tab_profile => |id| self.openProfile(window, id, .tab),
         .new_window_profile => |id| self.openProfile(window, id, .window),
+        // Not implemented yet: report them as not performed so that a
+        // `performable:` binding passes its key on to the terminal.
+        .settings_page,
+        .new_tab_menu,
+        .context_menu,
+        .move_split_to_tab,
+        .move_split_to_window,
+        .tab_switcher,
+        => false,
     };
 }
 

@@ -66,9 +66,10 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 |---|---|
 | libghostty-vt（根模块 `src/lib_vt.zig`、`src/terminal/c/**`、`include/ghostty/**`） | `just test-vt --filter <名>` |
 | 其他 Zig 核心代码与 `src/gx/` | `just test --filter <名>`（Windows 上运行器按 win32 apprt、`x86_64-windows-gnu` 构建）；只在 Linux 上编译的分支（`/proc`、`tcgetpgrp`）再跑 `just wsl test --filter <名>`；改动也编进 libghostty-vt 时（如 `src/terminal/`）先跑 `just test-vt` |
-| win32 apprt（`src/apprt/win32/**`）与 Windows 专有代码 | `just build`、`just test --filter apprt.win32`，GUI 可见的改动按 TESTING.md「Windows GUI 验证」截图 |
-| GTK apprt 与 GTK 的 GX 层 | `just wsl sync <worktree> --dirty`、`just wsl build --gtk`、`just wsl test --gtk --filter apprt.gtk`，GUI 可见的改动再 `just wsl smoke` 截图 |
+| win32 apprt（`src/apprt/win32/**`）与 Windows 专有代码 | `just build`、`just test --filter apprt.win32`，GUI 可见的改动用 `just win-gui run --out <目录> [W01 …]` 回放相关场景并读图（TESTING.md「Windows GUI 验证」） |
+| GTK apprt 与 GTK 的 GX 层 | `just wsl sync <worktree> --dirty`、`just wsl build --gtk`、`just wsl test --gtk --filter apprt.gtk`，GUI 可见的改动再 `just wsl smoke` 或 `just wsl scenario` 截图；GX 层对上游模板、菜单与 action 的引用由 `python scripts/run_unittests.py test_gtk_gx_contract` 检查 |
 | GX 译文（`src/gx/i18n/gx.zh_CN.po`、`po/zh_CN.po`） | `just i18n` 后 `just i18n-check` |
+| 拼音首字母表（升级钉版 pinyin-data 或改 `scripts/gx_pinyin.py`） | `python scripts/run_unittests.py test_gx_pinyin`，`just pinyin` 后审 diff，再 `just pinyin-check` |
 | 打包与发布脚本 | `python scripts/run_unittests.py test_gx_package test_gx_release test_gx_linux_build`，Windows 包再实跑 `just package-windows` |
 | 任意 `.zig` 文件 | `just fmt-check`，需要改格式时 `just fmt` |
 | 框架脚本、hook、workflow | `python scripts/run_unittests.py test_<名>`（Linux 用 `python3`；看单个方法用 `python -m unittest scripts.test_<名>.<类>.<方法> -v`），再 `just framework-test` |
@@ -81,12 +82,12 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 按改动面挑选；不适用的写明原因。
 
 - 本机聚合门：`just ci-check`（framework-check → fmt-check → test-vt），提交前必跑；热缓存约 100 s。改了 lib-vt 以外的 Zig 代码，再跑完整单测 `just test`（它只跑 `ghostty-test`，macOS app 的单测另用 `macos/build.nu --action test`）。
-- Windows app：`just build` 后按 TESTING.md「Windows GUI 验证」操作并截图；打包相关改动跑 `just package-windows`（需 `just setup --innosetup`，只要 zip 时加 `--skip-installer`）。
-- GTK：`just wsl build --gtk` 与 `just wsl smoke --out <目录>`，截图读图后才算数。
+- Windows app：`just build` 后按 TESTING.md「Windows GUI 验证」用 `just win-gui` 操作并截图；耗时相关的改动用 `just perf win32 --exe <旧> --exe <新> --out <目录>` 交替对比；打包相关改动跑 `just package-windows`（需 `just setup --innosetup`，只要 zip 时加 `--skip-installer`）。
+- GTK：`just wsl build --gtk` 与 `just wsl smoke --out <目录>`、`just wsl scenario --out <目录>`，截图读图后才算数。
 - C API 或头文件：`just build-vt`；示例在各自目录里用钉版 Zig 构建，例如在 `example/c-vt-static` 下执行 `python ../../scripts/zigw.py build`（Linux/macOS 用 `python3`；`just` 的配方总在仓库根执行，进不了示例目录）；ABI 清单用 `just zig build test-lib-vt-schema`，前置见 TESTING.md。
 - wasm：`just vt-wasm`，再用 `node test/wasm-alloc.mjs zig-out/bin/ghostty-vt.wasm` 做分配器冒烟。
 - 其他目标：`just build-vt -Dtarget=<triple>`；源码包：`just dist-vt`。
-- push 到 `gx_ghostty` 后 `gx-ci` 运行 Linux 完整测试、交叉矩阵、Windows 的 lib-vt 测试与 app 构建；GTK 截图冒烟（`gtk_smoke`）、Windows 截图冒烟（`win_smoke`）与 macOS 上的 lib-vt 测试只在手动触发 `gx-ci` 并打开对应输入时运行；发布资产（含 Windows 便携包与安装包、Ubuntu 24.04 的 `linux-gtk-noble` 验证）只在手动运行 `gx-release` 时构建。push 与手动触发由用户执行（fork 上要先启用 Actions，见 RELEASE.md「首次启用」），结果出来之前这些项记 PENDING；截图类证据要下载 artifact 并实际读图后才能记 PASS。
+- push 到 `gx_ghostty` 后 `gx-ci` 运行 Linux 完整测试、交叉矩阵、Windows 的 lib-vt 测试、app 构建与 win32、GX、DirectWrite 单测；GTK 截图冒烟（`gtk_smoke`）、Windows 截图冒烟（`win_smoke`）与 macOS 上的 lib-vt 测试只在手动触发 `gx-ci` 并打开对应输入时运行；发布资产（含 Windows 便携包与安装包、Ubuntu 24.04 的 `linux-gtk-noble` 验证）只在手动运行 `gx-release` 时构建。push 与手动触发由用户执行（fork 上要先启用 Actions，见 RELEASE.md「首次启用」），结果出来之前这些项记 PENDING；截图类证据要下载 artifact 并实际读图后才能记 PASS。
 
 ### 6. 修复复测
 
@@ -96,6 +97,7 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 
 - KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。产物是 schema 2 的紧凑 JSON：首行文件头，每个文档一行 `[path, source_sha256, [`（逐文档的来源哈希），其后每片一行 `[anchor, text]`，所以 diff 里变化的行就是变化的小节；chunk id 不入库，`kb-query --json` 的 `id` 由 `path#anchor` 推导。Markdown 正文原样收录；代码层为控制体积做了裁剪：Zig 结构省略 `pub` 前缀，模块文档丢掉分隔线与字形表、超过 3000 字符截断，`///` 与头文件注释只留首句及 120 字符内的后续整句。体积预算 2.5 MiB 由 `scripts/test_agent_kb.py` 锁定，逼近时收紧代码层裁剪、用 `just kb-query` 对照代表查询的前后结果，不放宽预算，也不删 Markdown 语料。
 - GX 译表：改了两份 `.po` 就 `just i18n`，`src/gx/i18n/zh_CN.zig` 随改动提交。
+- 拼音首字母表：只在升级钉版 pinyin-data 或改生成规则时 `just pinyin`（联网），`src/gx/pinyin/initials.zig` 随改动提交；平时 `just pinyin-check` 离线校验。数据编进 exe，随包许可由打包脚本写进 Windows 包的 `licenses/` 与 deb stage 的 copyright（`packaging-dist.md`）。
 - 图谱：日常不强制重建；发版前和上游同步后必须 `just graph`，再跑 `just generated-check`。
 - 版本：CHANGELOG 标题格式用 `just version-check` 校验；CHANGELOG 前 6000 字符也是 KB 语料，改完同样要 `just kb`。产品版本仍以 `build.zig.zon` 为真源，不做同步。
 - 上游生成物只用各自的生成器更新，不手改。
@@ -319,6 +321,7 @@ just generated-check
 | `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` | 被索引源码增删改：Git 可见、未被 `.graphifyignore` 排除、扩展名在 `scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS` 内的文件（如 `.zig .swift .c .h .cpp .m .py .sh`），实际主要是 `src/`、`pkg/`、`include/`、`macos/` 与 `build.zig`；或者管线输入 `scripts/graphify.py`、`scripts/graphify_fingerprint.py`、`.graphifyignore` 变化 | `just graph` | `just graph-check`，只在 `gx-release` 的 prepare 阶段与上游同步后强制 | 是 |
 | `graphify-out/graph.json` | 同上，约 20 MB | `just graph` | 无 | 否，仅本机 |
 | `src/gx/i18n/zh_CN.zig` | `po/zh_CN.po` 或 `src/gx/i18n/gx.zh_CN.po` 变化（上游同步改了 `po/zh_CN.po` 也算） | `just i18n` | `just i18n-check`，属于 framework-check 与 generated-check；`scripts/test_gx_i18n.py` 也校验，随框架单测进 `gx-ci` 的 `framework` job | 是 |
+| `src/gx/pinyin/initials.zig` | 升级钉版 pinyin-data（`scripts/gx_pinyin.py` 的 `SOURCE_VERSION` 与 `SOURCE_FILES`，同时核对同目录的两份许可原文）或改了生成规则 | `just pinyin`（联网下载钉版源数据） | `just pinyin-check`，属于 framework-check 与 generated-check；`scripts/test_gx_pinyin.py` 也校验 | 是 |
 | `CHANGELOG.md` 版本标题 | fork 可观察变化、定版 | 手写 | `just version-check` | 是 |
 | `build.zig.zon.json`、`build.zig.zon.nix`、`build.zig.zon.txt`、`flatpak/zig-packages.json` | `build.zig.zon` 依赖变化 | `nix/build-support/check-zig-cache.sh --update`（要 `nix develop` 提供的 zon2nix、alejandra、prettier） | 同一脚本不带参数 | 是，上游生成物 |
 | `po/com.mitchellh.ghostty.pot` 与 `po/*.po` | 源码或 Blueprint 中的可翻译字符串变化 | `zig build update-translations`（需要启用 i18n，Windows 不可用） | `.github/scripts/check-translations.sh` | 是，上游生成物 |

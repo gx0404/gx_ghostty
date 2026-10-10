@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Tests for scripts/gx_win_gui.py: chords, coordinates, isolation, PNG output, the scenario files and
+the input guard. Nothing here starts Ghostty or sends input; the Win32 backend is replaced by a fake.
+"""
+
+from __future__ import annotations
+
+import struct
+import sys
+import tempfile
+import unittest
+import zlib
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import gx_win_gui as gui  # noqa: E402
+
+# The R0 acceptance checks every Windows scenario set must keep covering (W01-W15).
+R0_COVERAGE = {
+    "W01": "title-override", "W02": "edit-keys", "W03": "search-highlight", "W04": "split-focus",
+    "W05": "palette-preview", "W06": "ctrl-click", "W07": "startup-failure", "W08": "clipboard",
+    "W09": "wsl-focus", "W10": "wsl-horizontal-wheel", "W11": "wsl-side-buttons", "W12": "capture-loss",
+    "W13": "quick-terminal", "W14": "opacity", "W15": "goto-and-move-tab",
+}
+
+
+class ChordTests(unittest.TestCase):
+    def test_modifiers_and_keys(self):
+        self.assertEqual(([0x11, 0x10], ord("T")), gui.parse_chord("ctrl+shift+t"))
+        self.assertEqual(([0x12], 0x73), gui.parse_chord("Alt+F4"))
+        self.assertEqual(([0x11], 0xC0), gui.parse_chord("ctrl+grave"))
+        self.assertEqual(([], 0x87), gui.parse_chord("f24"))
+        self.assertEqual(([], 0x63), gui.parse_chord("numpad3"))
+        self.assertEqual(([0x11, 0x10], 0x21), gui.parse_chord("ctrl+shift+page_up"))
+        self.assertEqual(([0x11], ord("9")), gui.parse_chord("control+9"))
+        self.assertEqual(([0x11], ord("A")), gui.parse_chord("ctrl+ctrl+a"))
+
+    def test_rejections(self):
+        for chord in ("", "ctrl+", "+a", "hyper+a", "ctrl+f25", "ctrl+nosuchkey"):
+            with self.subTest(chord=chord), self.assertRaises(gui.UsageError):
+                gui.parse_chord(chord)
+
+    def test_utf16_units(self):
+        self.assertEqual([0x61], gui.utf16_units("a"))
+        self.assertEqual([0x4E2D], gui.utf16_units("中"))
+        self.assertEqual([0xD83D, 0xDE00], gui.utf16_units("\U0001F600"))
+
+
+class GeometryTests(unittest.TestCase):
+    ANCHOR = (100, 200, 1100, 800)  # 1000 x 600 physical pixels
+
+    def test_resolve_point(self):
+        self.assertEqual((600, 500), gui.resolve_point(None, None, self.ANCHOR, 1.5))
+        self.assertEqual((115, 230), gui.resolve_point(10, 20, self.ANCHOR, 1.5))
+        self.assertEqual((1070, 785), gui.resolve_point(-20, -10, self.ANCHOR, 1.5))
+        self.assertEqual((350, 320), gui.resolve_point("25%", "20%", self.ANCHOR, 2.0))
+        with self.assertRaises(gui.UsageError):
+            gui.resolve_point("left", 0, self.ANCHOR, 1.0)
+
+    def test_normalize_absolute_on_a_desktop_left_of_the_primary(self):
+        virtual = (-3840, -419, 7680, 2579)
+        self.assertEqual((0, 0), gui.normalize_absolute(-3840, -419, virtual))
+        self.assertEqual((65535, 65535), gui.normalize_absolute(3839, 2159, virtual))
+        x, y = gui.normalize_absolute(0, 0, virtual)
+        self.assertAlmostEqual(32772, x, delta=2)
+        self.assertAlmostEqual(10652, y, delta=2)
+
+    def test_rect_gap(self):
+        self.assertEqual(("vertical", 503, (0, 400)), gui.rect_gap((0, 0, 500, 400), (506, 0, 1000, 600)))
+        self.assertEqual(("horizontal", 302, (500, 1000)), gui.rect_gap((500, 0, 1000, 300), (500, 305, 1000, 600)))
+        self.assertEqual(gui.rect_gap((506, 0, 1000, 600), (0, 0, 500, 400)), gui.rect_gap((0, 0, 500, 400), (506, 0, 1000, 600)))
+        for a, b in (((0, 0, 10, 10), (5, 5, 20, 20)), ((0, 0, 10, 10), (20, 20, 30, 30))):
+            with self.subTest(a=a, b=b), self.assertRaises(gui.GuiError):
+                gui.rect_gap(a, b)
+
+    def test_colors(self):
+        self.assertEqual((0x2E, 0x34, 0x40), gui.parse_color("#2e3440"))
+        self.assertEqual((0x1F, 0x1F, 0x28), gui.parse_color("1F1F28"))
+        self.assertEqual("#2e3440", gui.color_hex((46, 52, 64)))
+        self.assertTrue(gui.color_close((10, 20, 30), (11, 19, 30), 1))
+        self.assertFalse(gui.color_close((10, 20, 30), (12, 20, 30), 1))
+        for bad in ("#12345", "red", "#1234567"):
+            with self.subTest(color=bad), self.assertRaises(gui.UsageError):
+                gui.parse_color(bad)
+
+
+class IsolationTests(unittest.TestCase):
+    def test_isolated_environment(self):
+        base = {"PATH": "C:/bin", "NO_COLOR": "1", "TERM": "dumb", "ColorTerm": "truecolor", "TERM_PROGRAM": "x",
+                "GHOSTTY_RESOURCES_DIR": "r", "ghostty_gx_opengl": "software", "LocalAppData": "C:/real",
+                "XDG_CONFIG_HOME": "C:/real/xdg", "HOME": "C:/h"}
+        env = gui.isolated_environment(base, Path("E:/ev/env"), {"GHOSTTY_GX_OPENGL": "software"})
+        self.assertEqual({"PATH": "C:/bin", "HOME": "C:/h", "LOCALAPPDATA": str(Path("E:/ev/env")),
+                          "XDG_CONFIG_HOME": str(Path("E:/ev/env")), "GHOSTTY_GX_OPENGL": "software"}, env)
+
+    def test_env_assignments(self):
+        self.assertEqual({"A": "1=2", "B_": ""}, gui.env_assignments(["A=1=2", "B_="]))
+        for bad in ("A", "=1", "1A=2", "A-B=1"):
+            with self.subTest(value=bad), self.assertRaises(gui.UsageError):
+                gui.env_assignments([bad])
+
+    def test_profile_paths_and_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "env"
+            path = gui.write_config(env, "a = 1\r\nb = 2\n")
+            self.assertEqual(env / "ghostty" / "config.ghostty", path)
+            self.assertEqual(b"a = 1\nb = 2\n", path.read_bytes())
+            self.assertEqual(env / "ghostty" / "logs" / "ghostty.log", gui.log_path(env))
+
+    def test_prepare_env_dir_only_empties_its_own_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            foreign = Path(tmp) / "foreign"
+            foreign.mkdir()
+            (foreign / "keep.txt").write_text("x", encoding="utf-8")
+            with self.assertRaises(gui.UsageError):
+                gui.prepare_env_dir(foreign, fresh=True)
+            self.assertTrue((foreign / "keep.txt").is_file())
+            own = Path(tmp) / "own"
+            gui.prepare_env_dir(own, fresh=True)
+            (own / "old.txt").write_text("x", encoding="utf-8")
+            gui.prepare_env_dir(own, fresh=True)
+            self.assertFalse((own / "old.txt").exists())
+            self.assertTrue((own / gui.ENV_MARKER).is_file())
+
+
+class ImageTests(unittest.TestCase):
+    def test_png_bytes_round_trip(self):
+        rgb = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30])
+        data = gui.png_bytes(2, 2, rgb)
+        self.assertEqual(b"\x89PNG\r\n\x1a\n", data[:8])
+        length, kind = struct.unpack(">I4s", data[8:16])
+        self.assertEqual((13, b"IHDR"), (length, kind))
+        self.assertEqual((2, 2, 8, 2, 0, 0, 0), struct.unpack(">IIBBBBB", data[16:29]))
+        idat = data.index(b"IDAT")
+        size = struct.unpack(">I", data[idat - 4:idat])[0]
+        raw = zlib.decompress(data[idat + 4:idat + 4 + size])
+        self.assertEqual(b"\x00" + rgb[:6] + b"\x00" + rgb[6:], raw)
+        self.assertTrue(data.endswith(b"IEND\xaeB`\x82"))
+        with self.assertRaises(ValueError):
+            gui.png_bytes(3, 2, rgb)
+
+    def test_image_pixels_and_crop(self):
+        bgra = bytes([0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 30, 20, 10, 255])
+        image = gui.Image(2, 2, bgra, left=-100, top=50)
+        self.assertEqual((255, 0, 0), image.pixel(-100, 50))
+        self.assertEqual((10, 20, 30), image.pixel(-99, 51))
+        self.assertEqual(bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30]), image.rgb())
+        with self.assertRaises(gui.GuiError):
+            image.pixel(0, 0)
+        part = gui.crop(image, (-99, 0, 500, 51))
+        self.assertEqual((1, 1, -99, 50), (part.width, part.height, part.left, part.top))
+        self.assertEqual((0, 255, 0), part.pixel(-99, 50))
+        with self.assertRaises(gui.GuiError):
+            gui.crop(image, (0, 0, 10, 10))
+
+
+class ScenarioFileTests(unittest.TestCase):
+    def test_the_windows_scenarios_cover_the_r0_checks(self):
+        paths = gui.scenario_paths([])
+        scenarios = [gui.load_scenario(path) for path in paths]
+        ids = [scenario.id for scenario in scenarios]
+        self.assertEqual([f"W{number:02d}" for number in range(1, len(ids) + 1)], ids)
+        self.assertLessEqual(R0_COVERAGE.keys(), set(ids))
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario.id):
+                if scenario.id in R0_COVERAGE:
+                    self.assertIn(R0_COVERAGE[scenario.id], scenario.path.name)
+                self.assertTrue(scenario.expect, "list what the screenshots must show")
+                self.assertTrue(scenario.title)
+                self.assertTrue(scenario.full_config().endswith(gui.HARNESS_CONFIG))
+                self.assertRegex(scenario.config, r"(?m)^language = (en|zh-CN)$")
+                for requirement in scenario.requires:
+                    self.assertRegex(requirement, r"^(wsl:|file:|windows-build:)")
+
+    def test_selectors(self):
+        self.assertEqual("W03", gui.load_scenario(gui.scenario_paths(["W03"])[0]).id)
+        with self.assertRaises(gui.UsageError):
+            gui.scenario_paths(["W99"])
+
+
+class ScenarioValidationTests(unittest.TestCase):
+    BASE = 'id = "W90"\ntitle = "t"\nconfig = "language = en"\n'
+
+    def load(self, body: str, name: str = "W90-x.toml"):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_text(self.BASE + body, encoding="utf-8")
+            return gui.load_scenario(path)
+
+    def test_valid_scenario(self):
+        scenario = self.load('harness = false\n[[step]]\naction = "key"\nkeys = "ctrl+shift+t"\n'
+                             '[[step]]\naction = "capture"\nname = "x"\nwhat = "all"\n')
+        self.assertEqual(["key", "capture"], [step.action for step in scenario.steps])
+        self.assertEqual("language = en\n", scenario.full_config())
+
+    def test_rejections(self):
+        capture = '[[step]]\naction = "capture"\nname = "x"\n'
+        cases = {
+            "unknown action": '[[step]]\naction = "explode"\n' + capture,
+            "needs keys": '[[step]]\naction = "key"\n' + capture,
+            "does not take": '[[step]]\naction = "sleep"\nseconds = 1\nfoo = 2\n' + capture,
+            "unknown key": '[[step]]\naction = "key"\nkeys = "ctrl+nope"\n' + capture,
+            "bad color": '[[step]]\naction = "pixel"\nexpect = "blue"\n' + capture,
+            "capture at least one": '[[step]]\naction = "sleep"\nseconds = 1\n',
+            "unknown keys": 'colour = 1\n' + capture,
+            "button": '[[step]]\naction = "click"\nbutton = "x3"\n' + capture,
+            "what": '[[step]]\naction = "capture"\nname = "x"\nwhat = "desktop"\n',
+            "pattern": '[[step]]\naction = "wait_log"\npattern = "("\n' + capture,
+        }
+        for expected, body in cases.items():
+            with self.subTest(case=expected), self.assertRaisesRegex(gui.UsageError, expected):
+                self.load(body)
+        with self.assertRaisesRegex(gui.UsageError, "file name"):
+            self.load(capture, name="W91-x.toml")
+
+
+class RequirementTests(unittest.TestCase):
+    def test_requirements(self):
+        distros = lambda: ["Ubuntu-24.04", "docker-desktop"]  # noqa: E731
+        self.assertIsNone(gui.missing_requirement("wsl:Ubuntu-24.04", distros))
+        self.assertIn("not installed", gui.missing_requirement("wsl:Debian", distros))
+        self.assertIn("does not exist", gui.missing_requirement("file:Z:/no/such/file", distros))
+        self.assertIsNone(gui.missing_requirement("windows-build:0", distros))
+        self.assertIn("older than", gui.missing_requirement("windows-build:999999", distros))
+        self.assertIn("unknown requirement", gui.missing_requirement("gpu:nvidia", distros))
+
+
+class WaitFileTests(unittest.TestCase):
+    def test_the_whole_text_must_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.txt"
+            run = gui.ScenarioRun(None, Path("ghostty.exe"), Path(tmp))  # type: ignore[arg-type]
+            step = {"path": str(path), "pattern": r"\A\^\[\[O\^\[\[I\Z", "timeout": 0.2}
+            with self.assertRaisesRegex(gui.GuiError, "missing"):
+                run.do_wait_file(step)
+            path.write_text("^[[O^[[I^[[O", encoding="utf-8")
+            with self.assertRaisesRegex(gui.GuiError, "holds"):
+                run.do_wait_file(step)
+            path.write_text("^[[O^[[I", encoding="utf-8")
+            self.assertIn("out.txt", run.do_wait_file(step))
+
+    def test_validation(self):
+        self.assertEqual("wait_file", gui.validate_step("s", {"action": "wait_file", "path": "p", "pattern": "x"}).action)
+        for raw in ({"action": "wait_file", "path": "p"}, {"action": "wait_file", "path": "p", "pattern": "("}):
+            with self.subTest(raw=raw), self.assertRaises(gui.UsageError):
+                gui.validate_step("s", raw)
+
+
+class FakeWin32:
+    """Stands in for Win32: windows of other processes are in front; every SendInput is recorded."""
+
+    def __init__(self, foreground_pid: int, point_pid: int) -> None:
+        self.foreground_pid = foreground_pid
+        self.point_pid = point_pid
+        self.sent: list = []
+
+    def foreground(self):
+        return 0x1000
+
+    def window_at(self, x, y):
+        return 0x2000
+
+    def window_pid(self, hwnd):
+        return self.foreground_pid if hwnd == 0x1000 else self.point_pid
+
+    def root_owner_pid(self, hwnd):
+        return self.window_pid(hwnd)
+
+    def class_name(self, hwnd):
+        return "Chrome_WidgetWin_1"
+
+    def key_input(self, vk, up):
+        return ("key", vk, up)
+
+    def unicode_input(self, unit, up):
+        return ("unicode", unit, up)
+
+    def mouse_input(self, flags, x=0, y=0, data=0):
+        return ("mouse", flags, x, y, data)
+
+    def send(self, inputs):
+        self.sent.append(list(inputs))
+
+
+class InputGuardTests(unittest.TestCase):
+    PID = 4242
+
+    def instance(self) -> gui.Instance:
+        return gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+
+    def test_nothing_is_sent_while_another_process_is_in_front(self):
+        fake = FakeWin32(foreground_pid=16136, point_pid=self.PID)
+        with mock.patch.object(gui, "win32", return_value=fake):
+            instance = self.instance()
+            for action in (lambda: instance.type_text("echo hi\n"), lambda: instance.press("ctrl+shift+t"),
+                           lambda: instance.mouse(10, 10), lambda: instance.wheel(10, 10)):
+                with self.subTest(action=action), self.assertRaisesRegex(gui.InputBlocked, "no input was sent"):
+                    action()
+        self.assertEqual([], fake.sent)
+
+    def test_mouse_input_needs_the_instance_under_the_pointer(self):
+        fake = FakeWin32(foreground_pid=self.PID, point_pid=999)
+        with mock.patch.object(gui, "win32", return_value=fake):
+            with self.assertRaisesRegex(gui.InputBlocked, r"window at \(5, 6\)"):
+                self.instance().mouse(5, 6, button="x1")
+        self.assertEqual([], fake.sent)
+
+    def test_events_when_the_instance_is_in_front(self):
+        fake = FakeWin32(foreground_pid=self.PID, point_pid=self.PID)
+        with mock.patch.object(gui, "win32", return_value=fake):
+            instance = self.instance()
+            instance.press("ctrl+shift+t")
+            instance.type_text("a中", delay=0)
+            instance.mouse(5, 6, button="x2", mods=["ctrl"])
+        chord, a, han, click = fake.sent
+        self.assertEqual([("key", 0x11, False), ("key", 0x10, False), ("key", ord("T"), False), ("key", ord("T"), True),
+                          ("key", 0x10, True), ("key", 0x11, True)], chord)
+        self.assertEqual([("unicode", 0x61, False), ("unicode", 0x61, True)], a)
+        self.assertEqual([("unicode", 0x4E2D, False), ("unicode", 0x4E2D, True)], han)
+        self.assertEqual([("key", 0x11, False), ("mouse", 0xC001, 5, 6, 0), ("mouse", 0x80, 0, 0, 2),
+                          ("mouse", 0x100, 0, 0, 2), ("key", 0x11, True)], click)
+
+
+@unittest.skipUnless(sys.platform == "win32", "the ctypes structures are Windows only")
+class Win32StructureTests(unittest.TestCase):
+    def test_input_structure_size_matches_the_platform(self):
+        import ctypes
+
+        backend = gui.win32()
+        self.assertEqual(40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28, ctypes.sizeof(backend.INPUT))
+        self.assertEqual(4, len(backend.virtual_screen()))
+
+
+if __name__ == "__main__":
+    unittest.main()

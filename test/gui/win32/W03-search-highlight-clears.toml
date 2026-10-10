@@ -1,0 +1,56 @@
+id = "W03"
+title = "Search highlights matches and Esc clears the highlight"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "highlight: both needle words in the output are highlighted and the bar counts the matches",
+  "cleared: after Esc the search bar is gone and no match is highlighted",
+]
+
+[[step]]
+action = "type"
+text = "echo needle-one and needle-two\n"
+
+[[step]]
+action = "ime_off"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "needle"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "highlight"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "cleared"

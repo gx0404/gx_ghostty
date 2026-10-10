@@ -1,5 +1,8 @@
 //! UTF-8 to NUL-terminated UTF-16 conversion for Win32 calls whose text is
-//! only known at runtime (translated strings, titles, paths), and back.
+//! only known at runtime (translated strings, titles, paths), and back, and
+//! offsets between the two encodings (DirectWrite ranges are in UTF-16
+//! code units). Both directions decode the same way: an invalid UTF-8 byte
+//! or an unpaired surrogate becomes one U+FFFD.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -107,6 +110,53 @@ pub fn utf8Alloc(alloc: Allocator, units: []const u16) Allocator.Error![]u8 {
         i += d.len;
     }
     return out;
+}
+
+/// Convert UTF-16 `units` into `buf` as UTF-8, like `utf8Alloc`; text that
+/// does not fit is cut at a codepoint boundary.
+pub fn utf8Buf(buf: []u8, units: []const u16) []const u8 {
+    var written: usize = 0;
+    var i: usize = 0;
+    while (i < units.len) {
+        const d = decode16(units[i..]);
+        const len = std.unicode.utf8CodepointSequenceLength(d.cp) catch unreachable;
+        if (written + len > buf.len) break;
+        _ = std.unicode.utf8Encode(d.cp, buf[written..]) catch unreachable;
+        written += len;
+        i += d.len;
+    }
+    return buf[0..written];
+}
+
+/// The UTF-16 offset of byte `byte_index` of UTF-8 `text`: the number of
+/// code units `bufZ` makes of `text[0..byte_index]`. An index inside a
+/// multi-byte sequence counts from the start of that sequence.
+pub fn utf16Index(text: []const u8, byte_index: usize) usize {
+    const end = @min(byte_index, text.len);
+    var units: usize = 0;
+    var i: usize = 0;
+    while (i < end) {
+        const d = decode(text[i..]);
+        if (i + d.len > end) break;
+        units += if (d.cp >= 0x10000) 2 else 1;
+        i += d.len;
+    }
+    return units;
+}
+
+/// The byte offset in UTF-8 `text` of UTF-16 offset `unit_index`; an
+/// offset inside a surrogate pair maps to the start of its codepoint.
+pub fn byteIndex(text: []const u8, unit_index: usize) usize {
+    var units: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const d = decode(text[i..]);
+        const n: usize = if (d.cp >= 0x10000) 2 else 1;
+        if (units + n > unit_index) break;
+        units += n;
+        i += d.len;
+    }
+    return i;
 }
 
 test "bufZ converts and terminates" {
@@ -239,4 +289,45 @@ test "utf8Alloc through a stack fallback allocator" {
     const long = try utf8Alloc(alloc, &([_]u16{0x6C49} ** 200));
     defer alloc.free(long);
     try testing.expectEqual(@as(usize, 600), long.len);
+}
+
+test "utf8Buf converts into a fixed buffer and cuts at a codepoint" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("a\u{6C49}\u{1F47B}", utf8Buf(&buf, &.{ 'a', 0x6C49, 0xD83D, 0xDC7B }));
+    // An unpaired surrogate becomes U+FFFD, as in utf8Alloc.
+    try testing.expectEqualStrings("\u{FFFD}b", utf8Buf(&buf, &.{ 0xDC7B, 'b' }));
+    // Three bytes do not fit into two: the CJK character is left out.
+    var small: [2]u8 = undefined;
+    try testing.expectEqualStrings("a", utf8Buf(&small, &.{ 'a', 0x6C49 }));
+    try testing.expectEqual(@as(usize, 0), utf8Buf(&small, &.{}).len);
+}
+
+test "utf16Index and byteIndex convert offsets both ways" {
+    const testing = std.testing;
+    // a (1 byte, 1 unit), 汉 (3 bytes, 1 unit), ghost (4 bytes, 2 units), b.
+    const text = "a\u{6C49}\u{1F47B}b";
+    try testing.expectEqual(@as(usize, 0), utf16Index(text, 0));
+    try testing.expectEqual(@as(usize, 1), utf16Index(text, 1));
+    try testing.expectEqual(@as(usize, 2), utf16Index(text, 4));
+    try testing.expectEqual(@as(usize, 4), utf16Index(text, 8));
+    try testing.expectEqual(@as(usize, 5), utf16Index(text, 9));
+    try testing.expectEqual(@as(usize, 5), utf16Index(text, 100));
+    // Inside a sequence: from its start.
+    try testing.expectEqual(@as(usize, 1), utf16Index(text, 2));
+    try testing.expectEqual(@as(usize, 2), utf16Index(text, 6));
+
+    try testing.expectEqual(@as(usize, 0), byteIndex(text, 0));
+    try testing.expectEqual(@as(usize, 1), byteIndex(text, 1));
+    try testing.expectEqual(@as(usize, 4), byteIndex(text, 2));
+    // Inside the surrogate pair: the start of the ghost.
+    try testing.expectEqual(@as(usize, 4), byteIndex(text, 3));
+    try testing.expectEqual(@as(usize, 8), byteIndex(text, 4));
+    try testing.expectEqual(@as(usize, 9), byteIndex(text, 5));
+    try testing.expectEqual(@as(usize, 9), byteIndex(text, 50));
+    // Invalid bytes count as one unit each, like bufZ.
+    try testing.expectEqual(@as(usize, 3), utf16Index("a\xffb", 3));
+    try testing.expectEqual(@as(usize, 2), byteIndex("a\xffb", 2));
+    var buf: [8]u16 = undefined;
+    try testing.expectEqual(utf16Len("a\xffb"), bufZ(&buf, "a\xffb").len);
 }

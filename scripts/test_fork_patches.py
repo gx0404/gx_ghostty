@@ -93,7 +93,23 @@ CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
 CSS_RGB_HSL_RE = re.compile(r"\b(?:rgba?|hsla?)\(")
 CSS_GTK416_RE = re.compile(r"\b(?:color-mix|color|hwb|lab|lch|oklab|oklch|var)\(")
+CSS_CUSTOM_PROPERTY_RE = re.compile(r"(?<![\w-])--[A-Za-z_][\w-]*\s*:")
+CSS_ROOT_RE = re.compile(r":root\b")
 CSS_DIMENSION_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:%|[a-z]+)?")
+
+# The Ghostty GX stylesheets of the GTK app (not upstream patches, held to the same GTK 4.14
+# floor): every static *.css below GX_CSS_DIR, and the CSS that GX_CSS_GENERATORS write at
+# runtime. Only Zig functions whose name ends in `416` (like upstream's
+# `Application.loadRuntimeCss416`) may write CSS that needs GTK 4.16; their callers check the
+# runtime GTK version.
+GX_CSS_DIR = "src/apprt/gtk/gx"
+GX_CSS_GENERATORS = ("src/gx/gtk_css.zig", "src/apprt/gtk/gx/style.zig")
+ZIG_FN_RE = re.compile(r"^(?:pub\s+)?(?:inline\s+)?fn\s+([A-Za-z_]\w*)\s*\(", re.M)
+ZIG_TEST_RE = re.compile(r"^test\b", re.M)
+ZIG_STRING_RE = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
+ZIG_CHAR_RE = re.compile(r"'(?:[^'\\\n]|\\.)*'")
+ZIG_FORMAT_ESCAPE_RE = re.compile(r"\{\{|\}\}")
+ZIG_PLACEHOLDER_RE = re.compile(r"\{[^{}\s]*\}")
 
 
 @dataclass(frozen=True)
@@ -404,12 +420,12 @@ def css_call_args(css: str, paren: int) -> list[str]:
 
 
 def gtk414_css_problems(source: str) -> list[str]:
-    """Shape lock for GX-0023: CSS outside comments that GTK 4.14 cannot parse.
+    """Shape lock for GX-0023 and the GX stylesheets: CSS outside comments that GTK 4.14 cannot parse.
 
     GTK drops such a declaration and logs a theme parser error. Color
     transition hints in gradients parse from GTK 4.20 on; the space-separated
-    rgb()/hsl() syntax, color-mix(), the newer color functions and var()
-    from GTK 4.16 on.
+    rgb()/hsl() syntax, color-mix(), the newer color functions, var(),
+    custom properties (`--name: value`) and :root from GTK 4.16 on.
     """
     css = CSS_COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), source)
     problems: list[str] = []
@@ -419,6 +435,10 @@ def gtk414_css_problems(source: str) -> list[str]:
 
     for match in CSS_GTK416_RE.finditer(css):
         problems.append(f"line {line(match.start())}: {match.group()} needs GTK 4.16")
+    for match in CSS_CUSTOM_PROPERTY_RE.finditer(css):
+        problems.append(f"line {line(match.start())}: custom property {match.group().rstrip(': ')} needs GTK 4.16")
+    for match in CSS_ROOT_RE.finditer(css):
+        problems.append(f"line {line(match.start())}: :root needs GTK 4.16")
     for match in CSS_RGB_HSL_RE.finditer(css):
         if len(css_call_args(css, match.end() - 1)) == 1:
             problems.append(f"line {line(match.start())}: {match.group()} without commas needs GTK 4.16")
@@ -426,6 +446,67 @@ def gtk414_css_problems(source: str) -> list[str]:
         for arg in css_call_args(css, match.end() - 1)[1:]:
             if CSS_DIMENSION_RE.fullmatch(arg):
                 problems.append(f"line {line(match.start())}: color hint {arg!r} needs GTK 4.20")
+    return problems
+
+
+def zig_css_text(source: str) -> str:
+    """The string literals of a Zig CSS generator that GTK 4.14 may receive, as one CSS text.
+
+    Multiline (`\\\\`) and quoted literals outside `test` declarations and outside functions
+    named `*416` are kept one per line; format escapes `{{`/`}}` become braces and
+    placeholders such as `{[bar_bg]f}` become `0`, so a color written by a `format` method
+    stays a valid value.
+    """
+    lines = source.replace("\r\n", "\n").split("\n")
+    fragments: list[str] = []
+    skipping = False
+    for line in lines:
+        if line.startswith("}"):
+            skipping = False
+            continue
+        fn = ZIG_FN_RE.match(line)
+        if fn or ZIG_TEST_RE.match(line):
+            gated = fn is None or fn.group(1).endswith("416")
+            skipping = gated and not line.rstrip().endswith("}")
+            if gated:
+                continue
+        if skipping:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("\\\\"):
+            fragments.append(stripped[2:])
+            continue
+        code = ZIG_CHAR_RE.sub("' '", line)
+        comment = None
+        for match in re.finditer(r'"(?:[^"\\\n]|\\.)*"|//', code):
+            if match.group() == "//":
+                comment = match.start()
+                break
+        code = code if comment is None else code[:comment]
+        fragments.extend(match.group(1) for match in ZIG_STRING_RE.finditer(code))
+    text = "\n".join(fragments)
+    text = ZIG_FORMAT_ESCAPE_RE.sub(lambda m: m.group()[0], text)
+    return ZIG_PLACEHOLDER_RE.sub("0", text)
+
+
+def gx_css_problems(root: Path) -> list[str]:
+    """GTK 4.14 problems in the Ghostty GX static stylesheets and in the CSS its Zig code writes."""
+    problems: list[str] = []
+    sheets = sorted((root / GX_CSS_DIR).rglob("*.css"))
+    if not sheets:
+        problems.append(f"no stylesheet under {GX_CSS_DIR}")
+    sources = [(path.relative_to(root).as_posix(), path.read_text(encoding="utf-8")) for path in sheets]
+    for rel in GX_CSS_GENERATORS:
+        path = root / rel
+        if not path.is_file():
+            problems.append(f"{rel} is missing")
+            continue
+        sources.append((rel, zig_css_text(path.read_text(encoding="utf-8"))))
+    for rel, css in sources:
+        try:
+            problems.extend(f"{rel}: {problem}" for problem in gtk414_css_problems(css))
+        except ValueError as exc:
+            problems.append(f"{rel}: {exc}")
     return problems
 
 
@@ -484,6 +565,15 @@ class RealRepoTests(unittest.TestCase):
     def test_gtk_stylesheet_parses_on_gtk_4_14(self):
         source = (ROOT / GTK_CSS).read_text(encoding="utf-8")
         self.assertEqual(gtk414_css_problems(source), [])
+
+    def test_gx_stylesheets_parse_on_gtk_4_14(self):
+        self.assertEqual(gx_css_problems(ROOT), [])
+
+    def test_gx_css_generator_text_is_extracted(self):
+        css = zig_css_text((ROOT / GX_CSS_GENERATORS[0]).read_text(encoding="utf-8"))
+        self.assertIn("background-color: 0;", css)
+        self.assertIn(".window tabbar tab:selected {", css)
+        self.assertIn("rgb(0,0,0)", css)
 
 
 class Gx0001ShapeTests(unittest.TestCase):
@@ -654,6 +744,73 @@ class Gtk414CssTests(unittest.TestCase):
         for expected, css in cases.items():
             with self.subTest(expected):
                 self.assertIn(expected, gtk414_css_problems(css))
+
+    def test_custom_properties_and_root_are_rejected(self):
+        problems = gtk414_css_problems(":root { --accent-bg-color: #3584e4; }\n"
+                                       "window.window {\n  --headerbar-bg-color : rgb(1,2,3);\n}\n")
+        self.assertIn("line 1: :root needs GTK 4.16", problems)
+        self.assertIn("line 1: custom property --accent-bg-color needs GTK 4.16", problems)
+        self.assertIn("line 3: custom property --headerbar-bg-color needs GTK 4.16", problems)
+        self.assertEqual(gtk414_css_problems("@define-color window_bg_color rgb(1,2,3);\n"
+                                             ".a { margin: -1px; transition: --x; }\n"), [])
+
+
+class GxCssGeneratorTests(unittest.TestCase):
+    ZIG = "\n".join((
+        "const std = @import(\"std\");",
+        "pub const Rgb = struct {",
+        "    pub fn format(self: Rgb, w: *W) !void {",
+        "        try w.print(\"rgb({d},{d},{d})\", .{ self.r, self.g, self.b }); // not var(--x)",
+        "    }",
+        "};",
+        "pub fn write(w: *W, c: Colors) !void {",
+        "    try w.print(",
+        "        \\\\.window headerbar {{",
+        "        \\\\  background-color: {[bg]f};",
+        "        \\\\}}",
+        "    , .{ .bg = c.bg });",
+        "    const quote = '\"';",
+        "}",
+        "pub fn writeVariables416(w: *W) !void {",
+        "    try w.writeAll(",
+        "        \\\\window.window { --accent-bg-color: var(--blue); }",
+        "    );",
+        "}",
+        "test \"write\" {",
+        "    try std.testing.expect(std.mem.indexOf(u8, css, \"color-mix(\") == null);",
+        "}",
+        "test \"one line\" {}",
+        "const tail = \"--late: 1;\";",
+        "",
+    ))
+
+    def test_text_skips_tests_comments_and_gtk_4_16_functions(self):
+        css = zig_css_text(self.ZIG.replace("\n", "\r\n"))
+        self.assertEqual(css.splitlines(), [
+            "std",
+            "rgb(0,0,0)",
+            ".window headerbar {",
+            "  background-color: 0;",
+            "}",
+            "--late: 1;",
+        ])
+
+    def test_generators_and_sheets_are_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIn(f"no stylesheet under {GX_CSS_DIR}", gx_css_problems(root))
+            sheet = root / GX_CSS_DIR / "style.css"
+            sheet.parent.mkdir(parents=True)
+            sheet.write_text(".a { color: hsl(25 50 75); }\n", encoding="utf-8")
+            for rel in GX_CSS_GENERATORS:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(self.ZIG, encoding="utf-8")
+            problems = gx_css_problems(root)
+            self.assertIn(f"{GX_CSS_DIR}/style.css: line 1: hsl( without commas needs GTK 4.16", problems)
+            self.assertIn(f"{GX_CSS_GENERATORS[0]}: line 6: custom property --late needs GTK 4.16", problems)
+            self.assertEqual(len(problems), 1 + len(GX_CSS_GENERATORS), problems)
+            sheet.write_text(".a { color: rgb(1 2 3; }\n", encoding="utf-8")
+            self.assertTrue(any("unclosed call" in problem for problem in gx_css_problems(root)))
 
 
 REGISTRY_TEMPLATE = """# fork 补丁登记

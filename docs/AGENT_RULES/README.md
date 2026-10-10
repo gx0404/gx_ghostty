@@ -140,8 +140,8 @@ Linux/macOS 直接调用脚本时用 `python3`。其他参数：
 | id | 覆盖 |
 |---|---|
 | `app-core` | `src/App.zig`、`src/Surface.zig`、`src/surface_mouse.zig`、`src/apprt.zig` 与 `src/apprt/*.zig`、入口 `src/main.zig`/`main_ghostty.zig`/`main_wasm.zig`、`src/global.zig`、`src/crash/`、`pkg/{sentry,breakpad}/` |
-| `apprt-gtk` | `src/apprt/gtk.zig` 与 `src/apprt/gtk/`（含 GX 层 `src/apprt/gtk/gx/` 与 GX 的 `.blp`）、`po/`、`dist/linux/`、`src/build/{gtk,GhosttyI18n}.zig`、`src/os/` 下的 cgroup/flatpak/i18n、`pkg/{gtk4-layer-shell,libintl}/`、翻译与 Blueprint 检查脚本 |
-| `apprt-win32` | `src/apprt/win32.zig` 与 `src/apprt/win32/`、WGL 渲染钩子 `src/renderer/opengl/wgl.zig`、`dist/windows/` 顶层的 rc、ico 与 manifest，以及编进 exe 的 `dist/windows/gx/ghostty-gx.{rc,ico}` |
+| `apprt-gtk` | `src/apprt/gtk.zig` 与 `src/apprt/gtk/`（含 GX 层 `src/apprt/gtk/gx/` 与 GX 的 `.blp`）、`po/`、`dist/linux/`、`src/build/{gtk,GhosttyI18n}.zig`、`src/os/` 下的 cgroup/flatpak/i18n、`pkg/{gtk4-layer-shell,libintl}/`、翻译与 Blueprint 检查脚本、GX 层契约测试、GUI 场景 `test/gui/gtk/` |
+| `apprt-win32` | `src/apprt/win32.zig` 与 `src/apprt/win32/`、WGL 渲染钩子 `src/renderer/opengl/wgl.zig`、`dist/windows/` 顶层的 rc、ico 与 manifest，以及编进 exe 的 `dist/windows/gx/ghostty-gx.{rc,ico}`、GUI 场景 `test/gui/win32/` |
 | `build-system` | `build.zig`、`build.zig.zon` 及其 `.json/.nix/.txt`、`src/build/`、`src/build_config.zig`、`src/helpgen.zig`、`src/main_build_data.zig`、`pkg/`、`vendor/`、`nix/`、flake 与 nix 入口、`Makefile`、`CMakeLists.txt`、`HACKING.md`、`.envrc`、`.gitignore`、`.gitattributes`、`just build` 的入口 `scripts/zig_build.py` |
 | `ci-release` | `.github/`、`CHANGELOG.md`、`CODEOWNERS`、`CONTRIBUTING.md`、`HACKING.md`、`typos.toml`、格式与 lint 配置、`src/build/docker/debian/`、`docs/RELEASE.md`、发版/版本/提交校验脚本（`scripts/gx_release.py`、`scripts/version.py`、`scripts/conventional_commits.py` 等）；任务 `release`、`sync` |
 | `cli-inspector` | `src/cli.zig`、`src/cli/`、`src/inspector/`、`src/extra/`、`pkg/dcimgui/` |
@@ -149,7 +149,7 @@ Linux/macOS 直接调用脚本时用 `python3`。其他参数：
 | `config` | `src/config.zig`、`src/config/`、`src/helpgen.zig`，以及 `src/gx/` 的配置分层、`gx-*` 值类型、默认值文件与覆盖文件模块 |
 | `development` | 根与嵌套 `AGENTS.md`、`CLAUDE.md`、`README.md`（开头的 fork 声明块）、`AI_POLICY.md`、`HACKING.md`、`.agents/`、`.claude/`、`.codex/`、`.zcode/`、`.githooks/`、`docs/`、`scripts/`、`graphify-out/`、`justfile`、`.graphifyignore`、`.gitignore`、`.prettierignore`；任务 `sync` |
 | `font` | `src/font/`（含 DirectWrite 发现 `src/font/directwrite/`）、`pkg/{fontconfig,freetype,harfbuzz}/`、`vendor/nerd-fonts/` |
-| `gx-core` | `src/gx/`（GX 共享核心）、翻译表生成器 `scripts/gx_i18n.py`、`po/zh_CN.po` |
+| `gx-core` | `src/gx/`（GX 共享核心）、翻译表生成器 `scripts/gx_i18n.py`、拼音首字母表生成器 `scripts/gx_pinyin.py`、`po/zh_CN.po` |
 | `input` | `src/input.zig`、`src/input/`、`src/surface_mouse.zig`、`src/gx/{action,win32_input}.zig` |
 | `libghostty-embedding` | `include/ghostty.h`、`include/module.modulemap`、`src/main_c.zig`、`src/apprt/embedded.zig`、`src/config/{CApi,c_get}.zig`、`src/build/GhosttyLib.zig`、`src/benchmark/CApi.zig` |
 | `libghostty-vt` | `include/ghostty/`、`src/terminal/c/`、`src/lib_vt.zig`、`src/lib/`、`src/os/wasm/`、`src/input/` 的 key/mouse/paste 编码器及其传递导入 `{config,function_keys,key_mods,kitty}.zig`、随库编译的 `src/os/{mach,stderr,string_encoding,windows}.zig` 与 `src/renderer/size.zig`、`example/`、`dist/{cmake,doxygen}/`、CMake 与 Doxygen 配置、`test/fuzz-libghostty/` 的顶层文件与 `src/`、`pkg/android-ndk/` 等 |
@@ -160,7 +160,7 @@ Linux/macOS 直接调用脚本时用 `python3`。其他参数：
 | `support-libs` | `src/datastruct/`、`src/lib/`、`src/stb/`，以及 `src/` 下的 crc32c、fastmem、fastprint、math、file_type、quirks、tripwire 等小模块 |
 | `terminal-core` | `src/terminal/`、`src/simd/`、`src/unicode/`、`pkg/{simdutf,highway}/` |
 | `termio-pty-os` | `src/termio.zig`、`src/termio/`、`src/pty.zig`、`src/pty.c`、`src/Command.zig`、`src/os/`、`src/gx/{conpty,osc7}.zig` |
-| `testing` | `test/`、`src/benchmark/`、`src/synthetic/`、`src/main_{bench,gen}.zig`、`src/build/GhosttyBench.zig`、`pkg/afl++/`、`nix/tests.nix`、`nix/vm/`、`nix/test-src/`、`valgrind.supp`、测试运行器 `scripts/zig_test.py` 与 WSL 入口 `scripts/gx_wsl.py`；任务 `test` |
+| `testing` | `test/`、`src/benchmark/`、`src/synthetic/`、`src/main_{bench,gen}.zig`、`src/build/GhosttyBench.zig`、`pkg/afl++/`、`nix/tests.nix`、`nix/vm/`、`nix/test-src/`、`valgrind.supp`、测试运行器 `scripts/zig_test.py`、WSL 入口 `scripts/gx_wsl.py`、Windows GUI 自动化 `scripts/gx_win_gui.py` 与耗时度量 `scripts/gx_perf.py`；任务 `test` |
 
 ## 任务表
 

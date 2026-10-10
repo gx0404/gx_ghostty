@@ -63,6 +63,7 @@ paths = [
   "pkg/gtk4-layer-shell/**",
   "pkg/libintl/**",
   "po/**",
+  "scripts/test_gtk_gx_contract.py",
   "src/apprt/gtk.zig",
   "src/apprt/gtk/**",
   "src/build/GhosttyI18n.zig",
@@ -71,6 +72,7 @@ paths = [
   "src/os/flatpak.zig",
   "src/os/i18n.zig",
   "src/os/i18n_locales.zig",
+  "test/gui/gtk/**",
 ]
 tasks = []
 
@@ -81,9 +83,12 @@ paths = [
   "dist/windows/*",
   "dist/windows/gx/ghostty-gx.ico",
   "dist/windows/gx/ghostty-gx.rc",
+  "scripts/gx_win_gui.py",
+  "scripts/test_gx_test_roots.py",
   "src/apprt/win32.zig",
   "src/apprt/win32/**",
   "src/renderer/opengl/wgl.zig",
+  "test/gui/win32/**",
 ]
 tasks = []
 
@@ -219,7 +224,9 @@ doc = "docs/AGENT_RULES/gx-core.md"
 paths = [
   "po/zh_CN.po",
   "scripts/gx_i18n.py",
+  "scripts/gx_pinyin.py",
   "scripts/test_gx_i18n.py",
+  "scripts/test_gx_pinyin.py",
   "src/gx/**",
 ]
 tasks = []
@@ -416,7 +423,12 @@ paths = [
   "nix/tests.nix",
   "nix/vm/**",
   "pkg/afl++/**",
+  "scripts/gx_perf.py",
+  "scripts/gx_win_gui.py",
   "scripts/gx_wsl.py",
+  "scripts/test_gx_perf.py",
+  "scripts/test_gx_test_roots.py",
+  "scripts/test_gx_win_gui.py",
   "scripts/test_gx_wsl.py",
   "scripts/test_zig_test.py",
   "scripts/zig_test.py",

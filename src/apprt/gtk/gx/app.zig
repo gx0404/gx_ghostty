@@ -155,9 +155,10 @@ fn setLanguageState(app: *Application, lang: gx.i18n.Language) void {
     simple.setState(glib.Variant.newString(lang.configValue()));
 }
 
-/// Loads the configuration again once the current configuration change is
-/// handled, so that `Config.default` translates the default command
-/// palette entries in the new language.
+/// Rebuilds the configuration in memory once the current configuration
+/// change is handled, so that `Config.default` translates the default
+/// command palette entries in the new language. Nothing is read from disk
+/// again (`gx.config_layers.rebuild`).
 fn reloadLater(app: *Application) void {
     const object = app.as(gobject.Object);
     if (object.getData(reload_key) != null) return;
@@ -168,8 +169,15 @@ fn reloadLater(app: *Application) void {
 fn reload(data: ?*anyopaque) callconv(.c) c_int {
     const app: *Application = @ptrCast(@alignCast(data orelse return 0));
     app.as(gobject.Object).setData(reload_key, null);
-    app.core().performAction(app.rt(), .reload_config) catch |err| {
-        log.warn("error reloading config for the UI language err={}", .{err});
+    const config = app.getConfig();
+    defer config.unref();
+    var rebuilt = gx.config_layers.rebuild(config.get(), app.allocator(), &.{}) catch |err| {
+        log.warn("error rebuilding config for the UI language err={}", .{err});
+        return 0;
+    };
+    defer rebuilt.deinit();
+    app.core().updateConfig(app.rt(), &rebuilt) catch |err| {
+        log.warn("error applying config for the UI language err={}", .{err});
     };
     return 0;
 }

@@ -1,0 +1,54 @@
+id = "W07"
+title = "A command that fails right away shows the failure dialog, which stays until OK"
+config = """
+command = cmd.exe /c exit 3
+language = en
+"""
+expect = [
+  "dialog: a themed dialog says the command failed with exit code 3, over the Ghostty window",
+  "after-ok: the dialog is gone and the window answers and draws (the exited terminal stays)",
+]
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 10
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 1
+
+[[step]]
+action = "capture"
+name = "dialog"
+what = "all"
+
+# The modal dialog disables the main window; activating the window activates the dialog,
+# as a click on the window would.
+[[step]]
+action = "activate"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "after-ok"

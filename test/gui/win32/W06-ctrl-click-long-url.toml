@@ -1,0 +1,72 @@
+id = "W06"
+title = "Ctrl+click on a 4,100 character URL opens it without hanging the window"
+side_effects = ["opens the default web browser on http://127.0.0.1:9/ (a refused connection)"]
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "long-url: the long URL fills the top rows of the terminal",
+  "after-ctrl-click: Ghostty still answers and draws normally after the browser opened the URL",
+]
+
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "type"
+text = "echo http://127.0.0.1:9/gx-r1c-long-url-"
+
+[[step]]
+action = "type"
+text = "0123456789"
+repeat = 410
+delay = 0.001
+
+[[step]]
+action = "type"
+text = "\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "long-url"
+
+# The URL wraps over the first ~20 rows: a fifth of the way down is inside it.
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "20%"
+mods = ["ctrl"]
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "assert_responsive"
+timeout = 2
+
+[[step]]
+action = "activate"
+
+[[step]]
+action = "assert_responsive"
+timeout = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "after-ctrl-click"

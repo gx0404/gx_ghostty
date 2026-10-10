@@ -5,13 +5,24 @@
 //! (`src/apprt/gtk/gx/settings_dialog.zig`) and the Windows settings
 //! overlay (`src/apprt/win32/ui/Settings.zig`) only render it; the Windows
 //! command palette uses its theme list and changes as well.
+//!
+//! "Reset to Default" removes the key from the settings file
+//! (`Changes.reset`), so the user configuration applies again where it sets
+//! the key, else the Ghostty GX default; a UI shows the value the reloaded
+//! configuration has. `config_layers.Layers.provenance` tells where a value
+//! comes from (`provenanceLabel`).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const build_config = @import("../build_config.zig");
 const Config = @import("../config/Config.zig");
+const action = @import("action.zig");
 const branding = @import("branding.zig");
+const config_layers = @import("config_layers.zig");
 const gui_settings = @import("gui_settings.zig");
 const profiles = @import("profiles.zig");
+
+const log = std.log.scoped(.gx_settings);
 
 /// The msgids of the settings UI strings, translated in
 /// `i18n/gx.zh_CN.po`. Placeholders are filled with `i18n.fill`.
@@ -59,7 +70,85 @@ pub const msg = struct {
     pub const save_failed = "Could not save the settings: {reason}";
     pub const reload_failed = "Could not reload the configuration: {reason}";
     pub const preview_failed = "Could not preview the theme: {reason}";
+    pub const light_theme = "Light Theme";
+    pub const dark_theme = "Dark Theme";
+    pub const theme_pair_hint = "Windows follow the light or dark mode of the system.";
+    pub const opacity = "Background Opacity";
+    pub const opacity_hint = "Automatic keeps the opacity that goes with the window material.";
+    pub const cursor = "Cursor";
+    pub const cursor_style = "Cursor Style";
+    pub const cursor_blink = "Blinking Cursor";
+    pub const padding = "Window Padding";
+    pub const padding_hint = "Applies to new terminals.";
+    pub const focus_follows_mouse = "Focus Follows Mouse";
+    pub const focus_follows_mouse_hint = "Moving the mouse over a split focuses it.";
+    pub const ctrl_scroll_zoom = "Zoom with Ctrl+Wheel";
+    pub const ctrl_scroll_zoom_hint = "Hold Ctrl and turn the mouse wheel, or pinch on a touchpad, to change the font size.";
+    pub const from_defaults = "Ghostty GX default";
+    pub const from_user = "From the configuration file";
+    pub const from_overlay = "From the settings file";
+    pub const from_cli = "From the command line, which overrides the settings here";
+    pub const from_nothing = "Ghostty default";
 };
+
+/// The settings pages, in display order; `gx:settings_page:<page>` opens
+/// one.
+pub const Page = action.SettingsPage;
+
+/// The msgid of the title of `page`.
+pub fn pageLabel(page: Page) [:0]const u8 {
+    return switch (page) {
+        .language => msg.language,
+        .appearance => msg.appearance,
+        .font => msg.font,
+        .interaction => msg.interaction,
+        .shell => msg.shell,
+        .about => msg.about,
+    };
+}
+
+/// The msgid that tells where the value of a setting comes from, for the
+/// layer `config_layers.Layers.provenance` returns.
+pub fn provenanceLabel(layer: ?config_layers.Layer) [:0]const u8 {
+    return switch (layer orelse return msg.from_nothing) {
+        .defaults => msg.from_defaults,
+        .user => msg.from_user,
+        .overlay => msg.from_overlay,
+        .cli => msg.from_cli,
+    };
+}
+
+/// The msgid of a short reason for `err`, for the `{reason}` of messages
+/// such as `msg.save_failed`; errors without one give their name.
+pub fn errorReason(err: anyerror) [:0]const u8 {
+    return switch (err) {
+        error.AccessDenied, error.PermissionDenied => "Permission denied.",
+        error.FileNotFound => "The file or folder does not exist.",
+        error.NoSpaceLeft, error.DiskQuota => "The disk is full.",
+        error.ReadOnlyFileSystem => "The disk is read-only.",
+        error.PathAlreadyExists => "Another program changed the file at the same time. Try again.",
+        error.FileBusy,
+        error.SharingViolation,
+        error.LockViolation,
+        error.AntivirusInterference,
+        => "The file is in use by another program.",
+        error.InvalidSetting => "The value cannot be written to the settings file.",
+        error.OutOfMemory => "Out of memory.",
+        error.NameTooLong,
+        error.BadPathName,
+        error.InvalidPath,
+        error.InvalidUtf8,
+        error.InvalidWtf8,
+        error.NotDir,
+        error.IsDir,
+        => "The path is not valid.",
+        error.FileTooBig, error.StreamTooLong => "The file is too large.",
+        error.InputOutput, error.ReadFailed, error.WriteFailed => "Reading or writing the disk failed.",
+        error.NetworkNotFound => "The network location is not available.",
+        error.NoHomeDir, error.HomeDirectoryNotFound => "The configuration folder could not be found.",
+        else => @errorName(err),
+    };
+}
 
 /// A choice of a settings UI: a configuration value and the msgid of its
 /// label.
@@ -94,17 +183,179 @@ pub const close_confirmation_choices = [_]Choice(Config.ConfirmCloseSurface){
     .{ .value = .false, .label = "Never" },
 };
 
-/// The `bell-features` flags, in display order, with the msgids of their
-/// labels.
-pub const bell_features = [_]struct {
+/// The app runtimes with a settings UI.
+pub const Runtime = enum {
+    win32,
+    gtk,
+
+    /// The app runtime of this build; null for those without a settings
+    /// UI.
+    pub const native: ?Runtime = switch (build_config.app_runtime) {
+        .win32 => .win32,
+        .gtk => .gtk,
+        else => null,
+    };
+};
+
+/// A `bell-features` flag of the settings UIs.
+pub const BellFeature = struct {
     field: [:0]const u8,
+
+    /// The msgid of the label.
     label: [:0]const u8,
-}{
-    .{ .field = "system", .label = "System Sound" },
-    .{ .field = "audio", .label = "Audio File" },
-    .{ .field = "attention", .label = "Request Attention" },
-    .{ .field = "title", .label = "Bell Icon in Title" },
-    .{ .field = "border", .label = "Border Highlight" },
+
+    /// The app runtimes that implement the flag; a settings UI lists only
+    /// the flags its runtime implements.
+    runtimes: std.EnumSet(Runtime),
+
+    pub fn supports(self: BellFeature, runtime: Runtime) bool {
+        return self.runtimes.contains(runtime);
+    }
+};
+
+/// The `bell-features` flags, in display order. On Windows the bell plays
+/// the system sound and flashes the taskbar button and badges the tab
+/// (`attention`); GTK implements every flag.
+pub const bell_features = [_]BellFeature{
+    .{ .field = "system", .label = "System Sound", .runtimes = .initFull() },
+    .{ .field = "audio", .label = "Audio File", .runtimes = .initOne(.gtk) },
+    .{ .field = "attention", .label = "Request Attention", .runtimes = .initFull() },
+    .{ .field = "title", .label = "Bell Icon in Title", .runtimes = .initOne(.gtk) },
+    .{ .field = "border", .label = "Border Highlight", .runtimes = .initOne(.gtk) },
+};
+
+/// The value type of `cursor-style`.
+pub const CursorStyle = @FieldType(Config, "cursor-style");
+
+/// The `cursor-style` choices, in display order.
+pub const cursor_style_choices = [_]Choice(CursorStyle){
+    .{ .value = .block, .label = "Block" },
+    .{ .value = .bar, .label = "Bar" },
+    .{ .value = .underline, .label = "Underline" },
+    .{ .value = .block_hollow, .label = "Hollow Block" },
+};
+
+/// A switch of a settings UI: a boolean configuration key.
+pub const Switch = struct {
+    key: [:0]const u8,
+
+    /// The msgids of the label and of the line under it ("" for none).
+    label: [:0]const u8,
+    hint: [:0]const u8 = "",
+
+    /// The value a switch in the state `on` writes.
+    pub fn value(on: bool) [:0]const u8 {
+        return if (on) "true" else "false";
+    }
+};
+
+/// Whether the cursor blinks (`cursor-style-blink`).
+pub const cursor_blink: Switch = .{ .key = "cursor-style-blink", .label = msg.cursor_blink };
+
+/// Whether moving the mouse over a split focuses it.
+pub const focus_follows_mouse: Switch = .{
+    .key = "focus-follows-mouse",
+    .label = msg.focus_follows_mouse,
+    .hint = msg.focus_follows_mouse_hint,
+};
+
+/// Whether Ctrl and the mouse wheel change the font size.
+pub const ctrl_scroll_zoom: Switch = .{
+    .key = "gx-ctrl-scroll-zoom",
+    .label = msg.ctrl_scroll_zoom,
+    .hint = msg.ctrl_scroll_zoom_hint,
+};
+
+/// The `background-opacity` choices, in display order.
+pub const Opacity = enum {
+    /// Removes `background-opacity` from the settings file: the user
+    /// configuration applies, else the opacity that goes with the window
+    /// material (`config_layers.materialOpacity`), else opaque.
+    automatic,
+    @"100",
+    @"90",
+    @"80",
+    @"70",
+
+    /// The msgid of the label; the percentages need no translation.
+    pub fn label(self: Opacity) [:0]const u8 {
+        return switch (self) {
+            .automatic => "Automatic",
+            inline else => |tag| @tagName(tag) ++ "%",
+        };
+    }
+
+    /// The value written, or null to remove the key.
+    pub fn value(self: Opacity) ?[:0]const u8 {
+        return switch (self) {
+            .automatic => null,
+            .@"100" => "1",
+            .@"90" => "0.9",
+            .@"80" => "0.8",
+            .@"70" => "0.7",
+        };
+    }
+
+    /// The choice that shows `opacity`: `automatic` unless a layer above
+    /// the defaults sets it (`configured`, see
+    /// `config_layers.Layers.provenance`), else the choice with that value,
+    /// or null for a value no choice offers.
+    pub fn fromConfig(opacity: f64, configured: bool) ?Opacity {
+        if (!configured) return .automatic;
+        for (std.enums.values(Opacity)) |choice| {
+            const text = choice.value() orelse continue;
+            const number = std.fmt.parseFloat(f64, text) catch continue;
+            if (@abs(number - opacity) < 0.005) return choice;
+        }
+        return null;
+    }
+};
+
+/// The window padding presets, in display order. Each sets both keys of
+/// `keys`, in points; padding applies to new terminals.
+pub const Padding = enum {
+    /// Keeps the horizontal padding the overlay scrollbar needs.
+    compact,
+
+    /// Removes both keys: the user configuration applies, else the Ghostty
+    /// GX default (10 × 8 points).
+    default,
+
+    spacious,
+
+    pub const keys = [2][:0]const u8{ "window-padding-x", "window-padding-y" };
+
+    /// The msgid of the label.
+    pub fn label(self: Padding) [:0]const u8 {
+        return switch (self) {
+            .compact => "Compact",
+            .default => "Default",
+            .spacious => "Spacious",
+        };
+    }
+
+    /// The values of `keys`, or null to remove them.
+    pub fn values(self: Padding) ?[2][:0]const u8 {
+        return switch (self) {
+            .compact => .{ "9", "4" },
+            .default => null,
+            .spacious => .{ "16", "12" },
+        };
+    }
+
+    /// The preset that shows the padding `x` and `y`: `default` unless a
+    /// layer above the defaults sets either key (`configured`), else the
+    /// preset with these values, or null for values no preset has.
+    pub fn fromConfig(x: Config.WindowPadding, y: Config.WindowPadding, configured: bool) ?Padding {
+        if (!configured) return .default;
+        for (std.enums.values(Padding)) |preset| {
+            const texts = preset.values() orelse continue;
+            const px = std.fmt.parseInt(u32, texts[0], 10) catch continue;
+            const py = std.fmt.parseInt(u32, texts[1], 10) catch continue;
+            if (x.top_left == px and x.bottom_right == px and y.top_left == py and y.bottom_right == py) return preset;
+        }
+        return null;
+    }
 };
 
 /// A configuration line a choice writes.
@@ -163,7 +414,9 @@ pub const FontSize = struct {
     pub const max: f32 = 100;
     pub const step: f32 = 0.5;
 
-    /// The Ghostty GX default (`defaults.ghostty`) that "reset" restores.
+    /// The Ghostty GX default (`defaults.ghostty`). "Reset to Default"
+    /// does not write it but removes `font-size` (`Changes.reset`), so a
+    /// size in the user configuration applies again.
     pub const default: f32 = 12;
 
     /// Clamps `value` to the range and rounds it to one decimal.
@@ -183,6 +436,25 @@ pub const FontSize = struct {
 /// The `scrollbar` value for a "show scrollbar" switch.
 pub fn scrollbar(show: bool) Config.Scrollbar {
     return if (show) .system else .never;
+}
+
+/// The `font-family` values that make `new` the first font family and
+/// keep the fallback families of `current` (the configured list) after it,
+/// without repeating `new`. A UI that picks one family must keep the
+/// others, because the settings file replaces the whole list of the lower
+/// layers. An empty `new` gives no values, which removes the key so the
+/// lower layers apply again. Only the returned slice is allocated.
+pub fn fontFamilies(alloc: Allocator, new: []const u8, current: []const []const u8) Allocator.Error![]const []const u8 {
+    const name = std.mem.trim(u8, new, &std.ascii.whitespace);
+    if (name.len == 0) return &.{};
+    var result: std.ArrayList([]const u8) = .empty;
+    errdefer result.deinit(alloc);
+    try result.append(alloc, name);
+    for (current[@min(current.len, 1)..]) |family| {
+        if (family.len == 0 or std.ascii.eqlIgnoreCase(family, name)) continue;
+        try result.append(alloc, family);
+    }
+    return try result.toOwnedSlice(alloc);
 }
 
 /// Formats a packed struct of flags (such as `bell-features`) as a
@@ -216,12 +488,44 @@ pub fn themeArg(alloc: Allocator, name: []const u8) Allocator.Error![:0]u8 {
 }
 
 /// The theme a theme list shows as selected for a `theme` value: the
-/// theme when light and dark use the same one, otherwise null.
+/// theme when light and dark use the same one, otherwise null (see
+/// `ThemePair`).
 pub fn themeName(theme: ?Config.Theme) ?[]const u8 {
     const value = theme orelse return null;
     if (!std.mem.eql(u8, value.light, value.dark)) return null;
     return value.light;
 }
+
+/// The light and the dark theme of a `theme` value; both are the same
+/// theme unless the configuration follows the system's light or dark
+/// mode with two.
+pub const ThemePair = struct {
+    light: []const u8,
+    dark: []const u8,
+
+    pub fn fromConfig(theme: ?Config.Theme) ?ThemePair {
+        const configured = theme orelse return null;
+        return .{ .light = configured.light, .dark = configured.dark };
+    }
+
+    pub fn isPair(self: ThemePair) bool {
+        return !std.mem.eql(u8, self.light, self.dark);
+    }
+
+    /// The `theme` value: the name of one theme, `light:<light>,dark:<dark>`
+    /// for two. Names must pass `isThemeName`.
+    pub fn value(self: ThemePair, alloc: Allocator) Allocator.Error![:0]u8 {
+        if (!self.isPair()) return try alloc.dupeZ(u8, self.light);
+        return try std.fmt.allocPrintSentinel(alloc, "light:{s},dark:{s}", .{ self.light, self.dark }, 0);
+    }
+
+    /// The command-line override that previews the pair.
+    pub fn arg(self: ThemePair, alloc: Allocator) Allocator.Error![:0]u8 {
+        const theme = try self.value(alloc);
+        defer alloc.free(theme);
+        return try themeArg(alloc, theme);
+    }
+};
 
 /// Whether the theme file `name` can be written as a `theme` value: not
 /// hidden, and free of the separators of a light/dark pair (`,`, `=` and
@@ -259,9 +563,10 @@ pub const ThemeList = struct {
 
 /// Lists the theme files in `dirs`, highest priority first (the order of
 /// `src/config/theme.zig::LocationIterator`). A name found in several
-/// directories is listed once; missing directories are skipped, and
-/// files that `isThemeName` rejects are left out.
-pub fn listThemes(alloc: Allocator, io: std.Io, dirs: []const []const u8) !ThemeList {
+/// directories is listed once; files that `isThemeName` rejects are left
+/// out. A directory that is missing or cannot be read is skipped, with the
+/// themes of the others still listed.
+pub fn listThemes(alloc: Allocator, io: std.Io, dirs: []const []const u8) Allocator.Error!ThemeList {
     var arena: ArenaAllocator = .init(alloc);
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
@@ -271,12 +576,18 @@ pub fn listThemes(alloc: Allocator, io: std.Io, dirs: []const []const u8) !Theme
     for (dirs) |path| {
         var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => continue,
-            else => return err,
+            else => {
+                log.warn("cannot list the themes in {s} err={}", .{ path, err });
+                continue;
+            },
         };
         defer dir.close(io);
 
         var it = dir.iterate();
-        while (try it.next(io)) |entry| {
+        while (it.next(io) catch |err| {
+            log.warn("cannot list the themes in {s} err={}", .{ path, err });
+            break;
+        }) |entry| {
             switch (entry.kind) {
                 .file, .sym_link => {},
                 else => continue,
@@ -518,9 +829,24 @@ pub const Changes = struct {
         try self.setAll(key, &.{});
     }
 
+    /// "Reset to Default": removes `key` from the overlay, so the user
+    /// configuration applies again where it sets `key`, else the Ghostty GX
+    /// default.
+    pub fn reset(self: *Changes, key: []const u8) Allocator.Error!void {
+        try self.delete(key);
+    }
+
     /// Applies the changes to `overlay`.
     pub fn apply(self: *const Changes, overlay: *gui_settings.Overlay) (Allocator.Error || gui_settings.Error)!void {
         for (self.entries.items) |entry| try overlay.setAll(entry.key, entry.values);
+    }
+
+    /// Applies the changes to the overlay layer of `layers` the way
+    /// `commit` writes them to the file, so a UI that previews from
+    /// `layers` keeps them. Call it before `commit`, which clears the
+    /// changes.
+    pub fn applyToLayers(self: *const Changes, layers: *config_layers.Layers) Allocator.Error!void {
+        for (self.entries.items) |entry| try layers.setOverlay(entry.key, entry.values);
     }
 
     /// Writes the changes to the overlay file at `path` (load, apply,
@@ -592,6 +918,7 @@ test "choices offer every value once and parse back" {
     inline for (.{
         .{ Config.RightClickAction, &right_click_choices, "right-click-action" },
         .{ Config.ConfirmCloseSurface, &close_confirmation_choices, "confirm-close-surface" },
+        .{ CursorStyle, &cursor_style_choices, "cursor-style" },
     }) |case| {
         const T = case[0];
         const choices: []const Choice(T) = case[1];
@@ -617,6 +944,150 @@ test "bell feature labels cover every flag" {
         } else false;
         try testing.expect(found);
     }
+}
+
+test "bell features name the app runtimes that implement them" {
+    for (bell_features) |feature| try testing.expect(feature.supports(.gtk));
+    var windows: std.ArrayList([]const u8) = .empty;
+    defer windows.deinit(testing.allocator);
+    for (bell_features) |feature| {
+        if (feature.supports(.win32)) try windows.append(testing.allocator, feature.field);
+    }
+    try testing.expectEqual(@as(usize, 2), windows.items.len);
+    try testing.expectEqualStrings("system", windows.items[0]);
+    try testing.expectEqualStrings("attention", windows.items[1]);
+
+    const expected: ?Runtime = switch (build_config.app_runtime) {
+        .win32 => .win32,
+        .gtk => .gtk,
+        else => null,
+    };
+    try testing.expectEqual(expected, Runtime.native);
+}
+
+test "switches write booleans their keys parse" {
+    for ([_]Switch{ cursor_blink, focus_follows_mouse, ctrl_scroll_zoom }) |item| {
+        for ([_]bool{ true, false }) |on| {
+            var buf: [64]u8 = undefined;
+            var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--{s}={s}", .{ item.key, Switch.value(on) })});
+            defer cfg.deinit();
+        }
+    }
+    var cfg = try testConfig(&.{ "--cursor-style-blink=false", "--focus-follows-mouse=true", "--gx-ctrl-scroll-zoom=false" });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?bool, false), cfg.@"cursor-style-blink");
+    try testing.expect(cfg.@"focus-follows-mouse");
+    try testing.expect(!cfg.@"gx-ctrl-scroll-zoom");
+
+    var defaults = try testConfig(&.{});
+    defer defaults.deinit();
+    try testing.expect(defaults.@"gx-ctrl-scroll-zoom");
+}
+
+test "opacity choices write values that parse back" {
+    for (std.enums.values(Opacity)) |choice| {
+        const text = choice.value() orelse {
+            try testing.expectEqual(Opacity.automatic, choice);
+            continue;
+        };
+        var buf: [64]u8 = undefined;
+        var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--background-opacity={s}", .{text})});
+        defer cfg.deinit();
+        try testing.expectEqual(@as(?Opacity, choice), Opacity.fromConfig(cfg.@"background-opacity", true));
+    }
+    try testing.expectEqualStrings("90%", Opacity.@"90".label());
+    try testing.expectEqual(@as(?Opacity, .automatic), Opacity.fromConfig(0.3, false));
+    try testing.expectEqual(@as(?Opacity, null), Opacity.fromConfig(0.85, true));
+}
+
+test "padding presets write values that parse back" {
+    for (std.enums.values(Padding)) |preset| {
+        const texts = preset.values() orelse {
+            try testing.expectEqual(Padding.default, preset);
+            continue;
+        };
+        var bufs: [2][64]u8 = undefined;
+        var cfg = try testConfig(&.{
+            try std.fmt.bufPrint(&bufs[0], "--{s}={s}", .{ Padding.keys[0], texts[0] }),
+            try std.fmt.bufPrint(&bufs[1], "--{s}={s}", .{ Padding.keys[1], texts[1] }),
+        });
+        defer cfg.deinit();
+        try testing.expectEqual(@as(?Padding, preset), Padding.fromConfig(cfg.@"window-padding-x", cfg.@"window-padding-y", true));
+    }
+    try testing.expectEqual(@as(?Padding, .default), Padding.fromConfig(.{}, .{}, false));
+    try testing.expectEqual(@as(?Padding, null), Padding.fromConfig(.{ .top_left = 9, .bottom_right = 2 }, .{ .top_left = 4, .bottom_right = 4 }, true));
+}
+
+test "fontFamilies keeps the fallback families" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { []const u8, []const []const u8, []const []const u8 }{
+        .{ "Cascadia Mono", &.{"JetBrainsMono Nerd Font"}, &.{"Cascadia Mono"} },
+        .{ "Cascadia Code", &.{ "Iosevka", "Sarasa Mono SC", "Symbols" }, &.{ "Cascadia Code", "Sarasa Mono SC", "Symbols" } },
+        .{ " sarasa mono sc ", &.{ "Iosevka", "Sarasa Mono SC" }, &.{"sarasa mono sc"} },
+        .{ "Iosevka", &.{}, &.{"Iosevka"} },
+        .{ "", &.{ "Iosevka", "Sarasa Mono SC" }, &.{} },
+        .{ "  ", &.{"Iosevka"}, &.{} },
+    };
+    for (cases) |case| {
+        const families = try fontFamilies(alloc, case[0], case[1]);
+        defer alloc.free(families);
+        try testing.expectEqual(case[2].len, families.len);
+        for (case[2], families) |expected, actual| try testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "errorReason explains common errors and names the others" {
+    try testing.expectEqualStrings("Permission denied.", errorReason(error.AccessDenied));
+    try testing.expectEqualStrings("The disk is full.", errorReason(error.NoSpaceLeft));
+    try testing.expectEqualStrings("SomethingRare", errorReason(error.SomethingRare));
+}
+
+test "ThemePair writes one theme or a light and dark pair" {
+    const alloc = testing.allocator;
+    try testing.expectEqual(@as(?ThemePair, null), ThemePair.fromConfig(null));
+    for ([_]ThemePair{
+        .{ .light = "GX Mocha", .dark = "GX Mocha" },
+        .{ .light = "Builtin Solarized Light", .dark = "Builtin Solarized Dark" },
+    }) |pair| {
+        const arg = try pair.arg(alloc);
+        defer alloc.free(arg);
+        var cfg = try testConfig(&.{arg});
+        defer cfg.deinit();
+        const parsed = ThemePair.fromConfig(cfg.theme).?;
+        try testing.expectEqualStrings(pair.light, parsed.light);
+        try testing.expectEqualStrings(pair.dark, parsed.dark);
+        try testing.expectEqual(pair.isPair(), parsed.isPair());
+        try testing.expectEqual(pair.isPair(), themeName(cfg.theme) == null);
+    }
+}
+
+test "pages and provenance have labels" {
+    try testing.expectEqualStrings(msg.font, pageLabel(.font));
+    try testing.expectEqual(@as(usize, 6), std.enums.values(Page).len);
+    try testing.expectEqualStrings(msg.from_nothing, provenanceLabel(null));
+    try testing.expectEqualStrings(msg.from_cli, provenanceLabel(.cli));
+}
+
+test "Changes reach a layers snapshot like the settings file" {
+    var layers: config_layers.Layers = .{ .arena = .init(testing.allocator) };
+    defer layers.deinit();
+    var changes: Changes = .init(testing.allocator);
+    defer changes.deinit();
+
+    try changes.set("font-size", "15");
+    try changes.setAll("font-family", &.{ "A", "B" });
+    try changes.applyToLayers(&layers);
+    try testing.expect(layers.sets(.overlay, "font-size"));
+    var cfg = try layers.build(testing.allocator, &.{});
+    defer cfg.deinit();
+    try testing.expectEqual(@as(f32, 15), cfg.@"font-size");
+    try testing.expectEqual(@as(usize, 2), cfg.@"font-family".list.items.len);
+
+    changes.clear();
+    try changes.reset("font-size");
+    try changes.applyToLayers(&layers);
+    try testing.expect(!layers.sets(.overlay, "font-size"));
+    try testing.expectEqual(@as(?config_layers.Layer, null), layers.provenance("font-size"));
 }
 
 test "formatFlags round-trips through the parser" {
@@ -685,7 +1156,6 @@ test "font sizes are clamped, rounded and formatted" {
 }
 
 test "the font size default is the Ghostty GX default" {
-    const config_layers = @import("config_layers.zig");
     var cfg = try config_layers.defaultConfig(testing.allocator);
     defer cfg.deinit();
     try testing.expectEqual(FontSize.default, cfg.@"font-size");
@@ -744,6 +1214,28 @@ test "listThemes merges directories by priority" {
     for (expected, list.names) |e, a| try testing.expectEqualStrings(e, a);
     try testing.expectEqual(@as(?usize, 2), list.indexOf("b"));
     try testing.expectEqual(@as(?usize, null), list.indexOf("B"));
+}
+
+test "listThemes skips directories it cannot read" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "resources");
+    try tmp.dir.writeFile(io, .{ .sub_path = "resources/b", .data = "background = #000000\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const resources = try std.fs.path.join(testing.allocator, &.{ root, "resources" });
+    defer testing.allocator.free(resources);
+    const file = try std.fs.path.join(testing.allocator, &.{ root, "file" });
+    defer testing.allocator.free(file);
+    const long = try std.fs.path.join(testing.allocator, &.{ root, "x" ** 300 });
+    defer testing.allocator.free(long);
+
+    var list = try listThemes(testing.allocator, io, &.{ long, file, resources });
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 1), list.names.len);
+    try testing.expectEqualStrings("b", list.names[0]);
 }
 
 test "profileCommand writes direct commands when it can" {
@@ -917,7 +1409,25 @@ test "settings strings are translated" {
     inline for (@typeInfo(msg).@"struct".decls) |decl| check(@field(msg, decl.name), &missing);
     for (right_click_choices) |choice| check(choice.label, &missing);
     for (close_confirmation_choices) |choice| check(choice.label, &missing);
+    for (cursor_style_choices) |choice| check(choice.label, &missing);
     for (bell_features) |feature| check(feature.label, &missing);
     for (std.enums.values(Material)) |material| check(material.label(), &missing);
+    for (std.enums.values(Padding)) |preset| check(preset.label(), &missing);
+    check(Opacity.automatic.label(), &missing);
+    for ([_]anyerror{
+        error.AccessDenied,
+        error.FileNotFound,
+        error.NoSpaceLeft,
+        error.ReadOnlyFileSystem,
+        error.PathAlreadyExists,
+        error.SharingViolation,
+        error.InvalidSetting,
+        error.OutOfMemory,
+        error.InvalidPath,
+        error.FileTooBig,
+        error.InputOutput,
+        error.NetworkNotFound,
+        error.NoHomeDir,
+    }) |err| check(errorReason(err), &missing);
     try testing.expectEqual(@as(usize, 0), missing);
 }

@@ -1,0 +1,251 @@
+//! A short confirmation centered at the bottom of a window ("Copied",
+//! "Configuration reloaded"): a rounded capsule with an optional icon
+//! that stays for 3 seconds. It fades in (`Popup.Options.motion`), lets
+//! the pointer through, never takes the focus, waits while a modal dialog
+//! has its window disabled, and showing it again replaces the text and
+//! starts the time over.
+//!
+//! Usage: embed a `Toast` in an address-stable owner (the window); call
+//! `show` from the message loop or `post` from a core callback (it shows
+//! from the message loop, through `WM_SHOW_POSTED` on its own popup
+//! window), with a `Notice.Placement`. Move it with `reposition`, free it
+//! with `deinit`. Timers `TS` (hide) and `TW` (waiting for a dialog) live
+//! on its popup window. The caller decides whether to show one at all
+//! (`app-notifications`); without Direct2D it shows nothing.
+const Toast = @This();
+
+const std = @import("std");
+const App = @import("../App.zig");
+const w32 = @import("../win32.zig");
+const Notice = @import("Notice.zig");
+const Popup = @import("Popup.zig");
+const d2d = @import("d2d.zig");
+const style = @import("style.zig");
+
+const log = std.log.scoped(.win32_toast);
+
+pub const Content = struct {
+    text: []const u8,
+    /// An icon glyph (`d2d.icons`) before the text, in the accent color.
+    icon: ?u21 = null,
+};
+
+pub const Placement = Notice.Placement;
+
+/// Posted to the toast's own popup window by `post`.
+pub const WM_SHOW_POSTED: u32 = w32.WM_APP + 40;
+pub const HIDE_TIMER_ID: usize = 0x5453; // 'TS'
+pub const WAIT_TIMER_ID: usize = 0x5457; // 'TW'
+pub const duration_ms: u32 = 3000;
+const wait_ms = 250;
+
+const layout = struct {
+    const height: f32 = style.row.list;
+    const pad: f32 = style.space.l;
+    const icon_gap: f32 = style.space.s;
+    const margin: f32 = style.space.xl;
+};
+
+popup: Popup = .{},
+app: ?*App = null,
+placement: ?Placement = null,
+text: [256]u8 = undefined,
+text_len: usize = 0,
+icon: ?u21 = null,
+pending: bool = false,
+
+/// Show `content` now (from the message loop).
+pub fn show(self: *Toast, app: *App, placement: Placement, content: Content) void {
+    self.app = app;
+    self.placement = placement;
+    self.store(content);
+    self.pending = true;
+    self.showStored();
+}
+
+/// Show `content` from the message loop: safe to call from core callbacks.
+pub fn post(self: *Toast, app: *App, placement: Placement, content: Content) void {
+    self.app = app;
+    self.placement = placement;
+    self.store(content);
+    self.pending = true;
+    if (!self.ensurePopup()) return;
+    const hwnd = self.popup.hwnd orelse return;
+    if (w32.PostMessageW(hwnd, WM_SHOW_POSTED, 0, 0) == 0) log.warn("cannot post a toast", .{});
+}
+
+pub fn hide(self: *Toast) void {
+    self.pending = false;
+    if (self.popup.hwnd) |hwnd| {
+        _ = w32.KillTimer(hwnd, HIDE_TIMER_ID);
+        _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
+    }
+    self.popup.hide();
+}
+
+pub fn isVisible(self: *const Toast) bool {
+    return self.popup.visible;
+}
+
+/// Follow the window (moved, resized, another DPI).
+pub fn reposition(self: *Toast, placement: Placement) void {
+    self.placement = placement;
+    if (!self.popup.visible) return;
+    const rect = self.bounds() orelse return;
+    self.popup.setBounds(rect);
+}
+
+pub fn deinit(self: *Toast) void {
+    self.popup.destroy();
+    self.* = .{};
+}
+
+fn store(self: *Toast, content: Content) void {
+    var len = @min(content.text.len, self.text.len);
+    while (len < content.text.len and len > 0 and content.text[len] & 0xC0 == 0x80) len -= 1;
+    @memcpy(self.text[0..len], content.text[0..len]);
+    self.text_len = len;
+    self.icon = content.icon;
+}
+
+fn tokens(self: *const Toast) style.Tokens {
+    const app = self.app orelse return style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
+    return style.Tokens.fromConfig(&app.config);
+}
+
+fn ensurePopup(self: *Toast) bool {
+    const app = self.app orelse return false;
+    const placement = self.placement orelse return false;
+    if (self.popup.hwnd != null) {
+        if (self.popup.owner == placement.owner) return true;
+        self.popup.destroy();
+    }
+    const factory = app.uiFactory() orelse return false;
+    const t = self.tokens();
+    self.popup.create(app.hinstance, placement.owner, factory, .{
+        .activate = false,
+        .dismiss_on_escape = false,
+        .dismiss_on_outside_click = false,
+        .click_through = true,
+        .corners = .round,
+        .shadow = true,
+        .border_color = t.border,
+        .dark = t.dark,
+        .motion = .{ .offset_y = 8 },
+    }, .{
+        .ctx = self,
+        .paint = paint,
+        .timer = onTimer,
+        .message = onMessage,
+    }) catch |err| {
+        log.warn("cannot create a toast err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
+fn showStored(self: *Toast) void {
+    if (!self.pending) return;
+    if (!self.ensurePopup()) return;
+    const placement = self.placement orelse return;
+    const hwnd = self.popup.hwnd orelse return;
+    if (w32.IsWindowEnabled(placement.owner) == 0) {
+        _ = w32.SetTimer(hwnd, WAIT_TIMER_ID, wait_ms, null);
+        return;
+    }
+    _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
+    self.pending = false;
+    self.popup.applyTheme(self.tokens());
+    self.popup.setAccessibleName(self.text[0..self.text_len]);
+    const rect = self.bounds() orelse return;
+    self.popup.show(rect);
+    _ = w32.SetTimer(hwnd, HIDE_TIMER_ID, duration_ms, null);
+}
+
+fn textStyle(color: d2d.Color) d2d.TextStyle {
+    return .{ .size = style.font_size.body, .color = color, .ellipsis = true };
+}
+
+/// The width of a toast with text `text_w` wide, with or without an icon,
+/// fitted into `max_w` (DIPs).
+pub fn widthFor(text_w: f32, icon: bool, max_w: f32) f32 {
+    const icon_w: f32 = if (icon) style.icon.standard + layout.icon_gap else 0;
+    return @max(0, @min(max_w, @ceil(text_w) + icon_w + 2 * layout.pad));
+}
+
+fn bounds(self: *Toast) ?w32.RECT {
+    const placement = self.placement orelse return null;
+    const app = self.app orelse return null;
+    const factory = app.uiFactory() orelse return null;
+    self.popup.setOwnerScale(placement.scale);
+    const scale = self.popup.ownerScale();
+    const area = placement.area;
+    const area_w = style.dip(area.right - area.left, scale);
+    const text_w = factory.measureText(self.text[0..self.text_len], textStyle(.{ .r = 0, .g = 0, .b = 0 }), 10_000).width;
+    const width = widthFor(text_w, self.icon != null, area_w - 2 * layout.margin);
+    const w = style.px(width, scale);
+    const h = style.px(layout.height, scale);
+    var pt: w32.POINT = .{
+        .x = area.left + @divTrunc(area.right - area.left - w, 2),
+        .y = area.bottom - h - style.px(layout.margin, scale),
+    };
+    _ = w32.ClientToScreen(placement.owner, &pt);
+    return .{ .left = pt.x, .top = pt.y, .right = pt.x + w, .bottom = pt.y + h };
+}
+
+fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
+    const self: *Toast = @ptrCast(@alignCast(ctx));
+    const t = self.tokens();
+    const size = popup.sizeDip();
+    const full: d2d.Rect = .{ .x = 0, .y = 0, .w = size.width, .h = size.height };
+    canvas.fillRect(full, t.surface_raised);
+    if (t.high_contrast) canvas.strokeRoundedRectPx(full, 0, t.border, 1);
+    var x = layout.pad;
+    if (self.icon) |glyph| {
+        canvas.drawIcon(glyph, .{ .x = x, .y = 0, .w = style.icon.standard, .h = size.height }, style.icon.standard, t.accent);
+        x += style.icon.standard + layout.icon_gap;
+    }
+    canvas.drawText(self.text[0..self.text_len], .{ .x = x, .y = 0, .w = @max(0, size.width - x - layout.pad), .h = size.height }, textStyle(t.text));
+}
+
+fn onTimer(ctx: *anyopaque, popup: *Popup, id: usize) void {
+    const self: *Toast = @ptrCast(@alignCast(ctx));
+    switch (id) {
+        HIDE_TIMER_ID => self.hide(),
+        WAIT_TIMER_ID => self.showStored(),
+        else => if (popup.hwnd) |hwnd| {
+            _ = w32.KillTimer(hwnd, id);
+        },
+    }
+}
+
+fn onMessage(ctx: *anyopaque, _: *Popup, msg: u32, _: usize, _: isize) bool {
+    const self: *Toast = @ptrCast(@alignCast(ctx));
+    if (msg != WM_SHOW_POSTED) return false;
+    self.showStored();
+    return true;
+}
+
+test "toast width fits the text and the window" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(f32, 60 + 32), widthFor(60, false, 1000));
+    try testing.expectEqual(@as(f32, 60 + 16 + 8 + 32), widthFor(59.2, true, 1000));
+    try testing.expectEqual(@as(f32, 200), widthFor(500, true, 200));
+    try testing.expectEqual(@as(f32, 0), widthFor(10, false, -5));
+}
+
+test "toast text is stored up to a character boundary" {
+    const testing = std.testing;
+    var toast: Toast = .{};
+    toast.store(.{ .text = "Copied", .icon = d2d.icons.check_mark });
+    try testing.expectEqualStrings("Copied", toast.text[0..toast.text_len]);
+    try testing.expectEqual(@as(?u21, d2d.icons.check_mark), toast.icon);
+    toast.store(.{ .text = "\u{6C49}" ** 100 });
+    try testing.expect(toast.text_len <= toast.text.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(toast.text[0..toast.text_len]));
+    try testing.expectEqual(@as(?u21, null), toast.icon);
+}
+
+test {
+    @import("../../../lib/compat/testing.zig").refAllDeclsRecursive(@This());
+}

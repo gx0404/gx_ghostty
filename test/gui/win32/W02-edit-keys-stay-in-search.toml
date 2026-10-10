@@ -1,0 +1,74 @@
+id = "W02"
+title = "Editing chords in the search bar stay in the search box and never reach the shell"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "search-box: the typed text and the editing chords stayed in the search box (word-wise editing removes the words abc and x; until the text editor gets word boundaries Ctrl+Backspace and Ctrl+Delete remove one character, leaving `needle ab`)",
+  "shell-clean: after Esc the prompt line `> ` is empty: no needle, abc, ^Q or stray characters",
+]
+
+# Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch.
+[[step]]
+action = "ime_off"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "needle abc"
+
+# Ctrl+Backspace deletes the word abc in the box; Ctrl+Q is unbound and must be swallowed.
+[[step]]
+action = "key"
+keys = "ctrl+backspace"
+
+[[step]]
+action = "key"
+keys = "ctrl+q"
+
+[[step]]
+action = "type"
+text = "x"
+
+[[step]]
+action = "key"
+keys = "ctrl+left"
+
+[[step]]
+action = "key"
+keys = "ctrl+delete"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "capture"
+name = "search-box"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "capture"
+name = "shell-clean"

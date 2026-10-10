@@ -43,6 +43,7 @@ const Config = configpkg.Config;
 const gx_config = @import("../../../gx/config_types.zig");
 const renderer = @import("../../../renderer.zig");
 const w32 = @import("../win32.zig");
+const d2d = @import("../ui/d2d.zig");
 const style = @import("../ui/style.zig");
 
 const log = std.log.scoped(.win32_backdrop);
@@ -296,7 +297,7 @@ pub fn extendFrame(hwnd: w32.HWND, config: *const Config, chrome_height: i32) vo
 /// the background and the foreground, like the chrome separators.
 fn applyBorderColor(hwnd: w32.HWND, config: *const Config) void {
     const tokens = style.Tokens.fromConfig(config);
-    const ref: u32 = tokens.window_border.colorRef();
+    const ref: u32 = d2d.colorRef(tokens.window_border);
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_BORDER_COLOR, @ptrCast(&ref), @sizeOf(u32));
 }
 

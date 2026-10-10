@@ -23,12 +23,24 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         python3 scripts/zig_test.py; the main suite (default) gets -Dapp-runtime=none like the
         gx-ci linux-main job, or the GTK runtime flags with --gtk.
   smoke --out DIR [--lang zh_CN|en] [--xdotool FILE] [--config FILE] [--wait SECONDS]
-        [--name PREFIX] [-- GHOSTTY ARGS...]
-        Start zig-out/bin/ghostty under xvfb-run exactly like the gx-ci gtk-smoke job
-        (GDK_BACKEND=x11, LIBGL_ALWAYS_SOFTWARE=1, NO_AT_BRIDGE=1, 1280x800x24,
-        --gtk-single-instance=false), screenshot it with scrot after --wait seconds (default
-        20), optionally run an xdotool script (the Ghostty PID is its $1) and screenshot again,
-        then copy PNGs, log, version and metadata to the Windows directory DIR.
+        [--settle SECONDS] [--name PREFIX] [--env NAME=VALUE]... [--perf] [-- GHOSTTY ARGS...]
+        Start zig-out/bin/ghostty under xvfb-run like the gx-ci gtk-smoke job (GDK_BACKEND=x11,
+        LIBGL_ALWAYS_SOFTWARE=1, NO_AT_BRIDGE=1, 1280x800x24, --gtk-single-instance=false) with
+        the --env variables, wait up to --wait seconds (default 20) for its window (an
+        `xdotool search` every 50 ms; it stops early if Ghostty exits), screenshot it with
+        scrot --settle seconds later (default 3),
+        optionally run an xdotool script (the Ghostty PID is its $1) and screenshot again, then
+        copy PNGs, log, version and metadata to the Windows directory DIR. --perf sets
+        GHOSTTY_GX_PERF=1, runs `seq 1 3000000` in the terminal (`-e sh workload.sh`) after the
+        first screenshot and writes PREFIX-perf.txt: the time to the window and of the workload,
+        CPU time and page faults per Ghostty thread (from /proc/<pid>/task/*/stat) and the DMABUF
+        warnings in the log, as `metric NAME VALUE [UNIT]` lines that scripts/gx_perf.py reads.
+  scenario --out DIR [SCENARIO...]
+        Run the GTK scenarios test/gui/gtk/G*.toml (ids such as G01 or file paths; default
+        all): each writes its config and xdotool script to DIR/<id>/, runs one smoke named
+        <id> there and fails when the log has a line matching its `forbid` patterns (default
+        `Theme parser error` and `css parsing failed`). DIR/<id>/notes.txt lists what the
+        screenshots must show; DIR/SUMMARY.txt has one line per scenario.
   run [--lang zh_CN|en] [--config FILE] [--x11] [-- GHOSTTY ARGS...]
         Start zig-out/bin/ghostty on the WSLg desktop (Wayland, or XWayland with --x11) in the
         background and print its PID.
@@ -115,6 +127,14 @@ GTK_BUILD_ARGS = ("-Dapp-runtime=gtk", "-fno-sys=gtk4-layer-shell")
 MAIN_SUITE_ARGS = ("-Dapp-runtime=none",)
 SMOKE_SCREEN = "1280x800x24"
 SMOKE_WAIT_SECONDS = 20.0
+SMOKE_SETTLE_SECONDS = 3.0
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+GTK_SCENARIO_DIR = REPO_ROOT / "test" / "gui" / "gtk"
+GTK_SCENARIO_ID = re.compile(r"^G\d{2}$")
+GTK_SCENARIO_KEYS = frozenset(("id", "title", "lang", "config", "xdotool", "wait", "settle", "env", "args", "expect",
+                               "forbid"))
+# GTK and the GX layer log these when a stylesheet does not parse.
+SCENARIO_FORBID = ("Theme parser error", "css parsing failed")
 # --lang value -> (LANG and LC_ALL, LANGUAGE)
 LANGS = {"en": ("en_US.UTF-8", "en"), "zh_CN": ("zh_CN.UTF-8", "zh_CN:zh")}
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -506,6 +526,129 @@ require_ghostty() {
 }
 """
 
+# Runs inside WSL as `python3 - <tasks before> <tasks after> <times> <ghostty log>` and prints the
+# report of `smoke --perf`: per-thread CPU time and page faults of Ghostty across the workload
+# (threads grouped by name without a trailing -N, the main thread as "main"), the timings and the
+# log counters. Ghostty's own threads always get a `metric cpu.<group>` line, others only when busy.
+PERF_DELIMITER = "GX_WSL_PERF"
+PERF_PROGRAM = r"""
+import os
+import re
+import sys
+
+FIRST = ("main", "renderer", "io", "io-reader", "io-gather")
+COUNTERS = ("utime", "stime", "minflt", "majflt")
+DMABUF_WARNINGS = ("failed to export DMABUF", "failed to build dmabuf")
+
+
+def group_name(comm):
+    return re.sub(r"-\d+$", "", comm).replace(" ", "_") or "unnamed"
+
+
+def parse_tasks(text):
+    tasks = {}
+    for line in text.splitlines():
+        tid, _, stat = line.partition("\t")
+        if "(" not in stat or ")" not in stat:
+            continue
+        fields = stat[stat.rindex(")") + 1 :].split()
+        if len(fields) < 13:
+            continue
+        tasks[tid.strip()] = {
+            "comm": stat[stat.index("(") + 1 : stat.rindex(")")],
+            "minflt": int(fields[7]),
+            "majflt": int(fields[9]),
+            "utime": int(fields[11]),
+            "stime": int(fields[12]),
+        }
+    return tasks
+
+
+def parse_times(text):
+    values = {}
+    for line in text.splitlines():
+        key, _, value = line.strip().partition(" ")
+        if key:
+            values[key] = value.strip()
+    return values
+
+
+def deltas(before, after, pid):
+    groups = {}
+    for tid, now in after.items():
+        then = before.get(tid, dict.fromkeys(COUNTERS, 0))
+        group = groups.setdefault("main" if tid == pid else group_name(now["comm"]), dict.fromkeys(("threads",) + COUNTERS, 0))
+        group["threads"] += 1
+        for key in COUNTERS:
+            group[key] += now[key] - then[key]
+    return groups, sorted(set(before) - set(after), key=int)
+
+
+def report(before_text, after_text, times_text, log_text, clk_tck):
+    times = parse_times(times_text)
+    groups, gone = deltas(parse_tasks(before_text), parse_tasks(after_text), times.get("pid", ""))
+    order = [name for name in FIRST if name in groups]
+    rest = [name for name in groups if name not in FIRST]
+    order += sorted(rest, key=lambda name: -(groups[name]["utime"] + groups[name]["stime"]))
+    total = {key: sum(group[key] for group in groups.values()) for key in ("threads",) + COUNTERS}
+    finished = times.get("workload_finished") == "1"
+    lines = [
+        "# gx-wsl smoke --perf",
+        "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
+        "finished: " + ("yes" if finished else "no (timed out or Ghostty exited)"),
+    ]
+    for key in ("window_seconds", "workload_seconds"):
+        if key in times:
+            lines.append(f"metric {key} {float(times[key]):.3f} s")
+    for name in order + ["total"]:
+        group = total if name == "total" else groups[name]
+        ticks = group["utime"] + group["stime"]
+        if ticks or name in FIRST or name == "total":
+            lines.append(f"metric cpu.{name} {ticks / clk_tck:.3f} s")
+    lines.append(f"metric minflt.total {total['minflt']}")
+    lines.append(f"metric majflt.total {total['majflt']}")
+    lines.append(f"metric dmabuf_warnings {sum(log_text.count(needle) for needle in DMABUF_WARNINGS)}")
+    lines.append(f"metric gx_perf_lines {sum('(gx_perf):' in line for line in log_text.splitlines())}")
+    lines.append("")
+    lines.append(f"{'thread':<24} {'threads':>7} {'cpu_s':>8} {'user_s':>8} {'sys_s':>8} {'minflt':>9} {'majflt':>7}")
+    for name in order + ["total"]:
+        group = total if name == "total" else groups[name]
+        cpu = (group["utime"] + group["stime"]) / clk_tck
+        lines.append(
+            f"{name:<24} {group['threads']:>7} {cpu:>8.3f} {group['utime'] / clk_tck:>8.3f} "
+            f"{group['stime'] / clk_tck:>8.3f} {group['minflt']:>9} {group['majflt']:>7}"
+        )
+    if gone:
+        lines.append(f"threads that exited during the workload (not counted): {', '.join(gone)}")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv):
+    texts = []
+    for path in argv[1:5]:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            texts.append(handle.read())
+    if not parse_tasks(texts[1]):
+        print("[gx-wsl] error: no thread statistics after the workload", file=sys.stderr)
+        return 1
+    clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    sys.stdout.write(report(*texts, clk_tck))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+"""
+
+# smoke --perf runs this as `ghostty -e sh workload.sh`: it waits for the file `go` next to it,
+# writes the load to the terminal, then marks `done` and keeps the terminal open.
+PERF_WORKLOAD = r"""dir=${0%/*}
+while [ ! -e "$dir/go" ]; do sleep 0.05; done
+seq 1 3000000
+touch "$dir/done"
+exec sleep 3600
+"""
+
 SMOKE_BODY = r"""out_win=$1
 lang=$2
 language=$3
@@ -514,15 +657,16 @@ config_win=$5
 wait_seconds=$6
 name=$7
 screen=$8
-shift 8
+settle=$9
+perf=${10}
+env_spec=${11}
+workload=${12}
+shift 12
 enter_clone
 require_ghostty
-for tool in xvfb-run xauth scrot; do
+for tool in xvfb-run xauth scrot xdotool; do
   command -v "$tool" >/dev/null || die "$tool is not installed; run: python scripts/gx_wsl.py setup --apt" 2
 done
-if [ -n "$xdotool_win" ]; then
-  command -v xdotool >/dev/null || die "xdotool is not installed; run: python scripts/gx_wsl.py setup --apt" 2
-fi
 out=$(wslpath -u "$out_win")
 work=$(mktemp -d "${TMPDIR:-/tmp}/gx-wsl-smoke.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -538,21 +682,64 @@ apply_lang "$lang" "$language"
 export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
 export LD_LIBRARY_PATH=$clone/zig-out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 unset WAYLAND_DISPLAY
+if [ "$perf" = 1 ]; then
+  export GHOSTTY_GX_PERF=1
+  printf '%s' "$workload" >"$work/workload.sh"
+fi
+while IFS= read -r assignment; do
+  if [ -n "$assignment" ]; then
+    export "$assignment"
+  fi
+done <<<"$env_spec"
 env -u DISPLAY ./zig-out/bin/ghostty +version >"$evidence/$name-version.txt" 2>&1
 session=$(cat <<'GX_WSL_SESSION'
 evidence=$1
 name=$2
 wait_seconds=$3
 xdo=$4
-shift 4
+settle=$5
+perf=$6
+work=$7
+shift 7
 alive() {
   local state
   state=$(awk '/^State:/ {print $2}' "/proc/$1/status" 2>/dev/null || true)
   [ -n "$state" ] && [ "$state" != Z ]
 }
-./zig-out/bin/ghostty --gtk-single-instance=false "$@" >"$evidence/$name.log" 2>&1 &
+now() { date +%s.%N; }
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
+started=$(now)
+if [ "$perf" = 1 ]; then
+  ./zig-out/bin/ghostty --gtk-single-instance=false "$@" -e sh "$work/workload.sh" >"$evidence/$name.log" 2>&1 &
+else
+  ./zig-out/bin/ghostty --gtk-single-instance=false "$@" >"$evidence/$name.log" 2>&1 &
+fi
 pid=$!
-sleep "$wait_seconds"
+printf 'pid %s\n' "$pid" >"$work/times"
+# Poll every 50 ms: xdotool's own sync mode sleeps 0.5 s between searches, too coarse for window_seconds.
+window=
+tries=$(awk -v s="$wait_seconds" 'BEGIN { printf "%d", s * 20 + 1 }')
+for _ in $(seq 1 "$tries"); do
+  found=$(xdotool search --onlyvisible --pid "$pid" 2>/dev/null) || found=
+  window=${found%%$'\n'*}
+  if [ -n "$window" ] || ! alive "$pid"; then
+    break
+  fi
+  sleep 0.05
+done
+if [ -z "$window" ]; then
+  scrot "$evidence/$name.png" 2>/dev/null || true
+  if alive "$pid"; then
+    printf '[gx-wsl] error: ghostty showed no window within %ss; see %s.log\n' "$wait_seconds" "$name" >&2
+    kill "$pid" 2>/dev/null || true
+  else
+    printf '[gx-wsl] error: ghostty exited before showing a window; see %s.log\n' "$name" >&2
+  fi
+  wait "$pid" || true
+  exit 1
+fi
+printf 'window_seconds %s\n' "$(elapsed "$started" "$(now)")" >>"$work/times"
+sleep "$settle"
 if ! alive "$pid"; then
   wait "$pid" || true
   printf '[gx-wsl] error: ghostty exited before the screenshot; see %s.log\n' "$name" >&2
@@ -560,37 +747,88 @@ if ! alive "$pid"; then
 fi
 scrot "$evidence/$name.png"
 status=0
+if [ "$perf" = 1 ]; then
+  snapshot() {
+    local task
+    for task in /proc/"$pid"/task/*; do
+      printf '%s\t%s\n' "${task##*/}" "$(cat "$task/stat" 2>/dev/null || true)"
+    done
+  }
+  snapshot >"$evidence/$name-tasks-before.txt"
+  begin=$(now)
+  touch "$work/go"
+  finished=0
+  for _ in $(seq 1 6000); do
+    if [ -e "$work/done" ]; then
+      finished=1
+      break
+    fi
+    alive "$pid" || break
+    sleep 0.05
+  done
+  printf 'workload_seconds %s\nworkload_finished %s\n' "$(elapsed "$begin" "$(now)")" "$finished" >>"$work/times"
+  sleep 1
+  if alive "$pid"; then
+    snapshot >"$evidence/$name-tasks-after.txt"
+    scrot "$evidence/$name-perf.png"
+  fi
+  if [ "$finished" != 1 ]; then
+    printf '[gx-wsl] error: the perf workload did not finish; see %s.log\n' "$name" >&2
+    status=1
+  fi
+fi
 if [ -n "$xdo" ]; then
-  xdotool "$xdo" "$pid" || status=$?
+  if ! xdotool "$xdo" "$pid"; then
+    printf '[gx-wsl] error: the xdotool script failed\n' >&2
+    status=1
+  fi
   sleep 1
   scrot "$evidence/$name-after.png"
 fi
 kill "$pid" 2>/dev/null || true
 wait "$pid" || true
-if [ "$status" -ne 0 ]; then
-  printf '[gx-wsl] error: the xdotool script exited with %s\n' "$status" >&2
-  exit 1
-fi
+[ "$status" -eq 0 ] || exit 1
 test -s "$evidence/$name.png"
 GX_WSL_SESSION
 )
 started=$(date +%s)
 status=0
 xvfb-run --auto-servernum --server-args="-screen 0 $screen" bash -euo pipefail -c "$session" smoke \
-  "$evidence" "$name" "$wait_seconds" "$xdo" "$@" || status=$?
+  "$evidence" "$name" "$wait_seconds" "$xdo" "$settle" "$perf" "$work" "$@" || status=$?
+if [ "$perf" = 1 ]; then
+  if [ -s "$evidence/$name-tasks-after.txt" ]; then
+    perf_report "$evidence/$name-tasks-before.txt" "$evidence/$name-tasks-after.txt" "$work/times" \
+      "$evidence/$name.log" >"$evidence/$name-perf.txt" || status=1
+  else
+    warn "no thread statistics after the perf workload"
+    if [ "$status" -eq 0 ]; then status=1; fi
+  fi
+fi
 extra_args=
 if [ $# -gt 0 ]; then
   extra_args=$(printf ' %q' "$@")
 fi
+if [ "$perf" = 1 ]; then
+  extra_args="$extra_args -e sh workload.sh"
+fi
+window_seconds=$(awk '$1 == "window_seconds" {print $2}' "$work/times" 2>/dev/null || true)
 {
   printf 'commit: %s\n' "$(git log -1 --format='%H %s')"
   printf 'started: %s\n' "$(date -u -d "@$started" +%Y-%m-%dT%H:%M:%SZ)"
   printf 'seconds: %s\n' "$(($(date +%s) - started))"
   printf 'exit: %s\n' "$status"
   printf 'display: xvfb-run -screen 0 %s, GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1\n' "$screen"
-  printf 'wait: %ss\n' "$wait_seconds"
+  printf 'wait: a visible window within %ss (xdotool search every 50 ms), then %ss before the screenshot\n' \
+    "$wait_seconds" "$settle"
+  printf 'window: %s\n' "${window_seconds:-none}${window_seconds:+s after start}"
   printf 'lang: %s\n' "${lang:-inherited (${LANG:-unset})}"
   printf 'config: %s\n' "${config_win:-none}"
+  printf 'env: %s\n' "$(printf '%s' "$env_spec" | paste -sd' ' -)"
+  if [ "$perf" = 1 ]; then
+    printf 'perf: seq 1 3000000 workload, GHOSTTY_GX_PERF=1\n'
+  else
+    printf 'perf: off\n'
+  fi
   printf 'xdotool: %s\n' "${xdotool_win:-none}"
   printf 'ghostty args: --gtk-single-instance=false%s\n' "$extra_args"
 } >"$evidence/$name-meta.txt"
@@ -683,6 +921,19 @@ def prefetch_function() -> str:
     )
 
 
+def perf_function() -> str:
+    """Bash function `perf_report BEFORE AFTER TIMES LOG` that pipes PERF_PROGRAM into python3."""
+    if PERF_DELIMITER in PERF_PROGRAM.splitlines():
+        raise AssertionError("PERF_PROGRAM contains its heredoc delimiter")
+    return (
+        "perf_report() {\n"
+        f"  python3 - \"$@\" <<'{PERF_DELIMITER}'\n"
+        f"{PERF_PROGRAM.strip()}\n"
+        f"{PERF_DELIMITER}\n"
+        "}\n"
+    )
+
+
 def compose(*parts: str) -> str:
     return "\n".join(part.rstrip("\n") for part in parts) + "\n"
 
@@ -762,6 +1013,19 @@ def smoke_name(name: str | None, lang: str | None) -> str:
     return result
 
 
+def env_assignments(values: Sequence[str]) -> str:
+    """The --env NAME=VALUE assignments, one per line; names are shell variable names, values one line."""
+    lines = []
+    for value in values:
+        name, sep, rest = value.partition("=")
+        if not sep or not ENV_NAME_PATTERN.match(name):
+            raise GxWslError(f"--env takes NAME=VALUE with a shell variable name, got {value!r}")
+        if "\n" in rest or "\r" in rest or "\0" in rest:
+            raise GxWslError(f"--env values must be a single line, got {value!r}")
+        lines.append(value)
+    return "\n".join(lines)
+
+
 def smoke_invocation(
     clone: str,
     *,
@@ -772,6 +1036,9 @@ def smoke_invocation(
     wait: float,
     name: str | None,
     ghostty_args: Sequence[str],
+    settle: float = SMOKE_SETTLE_SECONDS,
+    perf: bool = False,
+    env: Sequence[str] = (),
 ) -> Invocation:
     lang_value, language = lang_values(lang)
     args = (
@@ -784,9 +1051,13 @@ def smoke_invocation(
         f"{wait:g}",
         smoke_name(name, lang),
         SMOKE_SCREEN,
+        f"{settle:g}",
+        "1" if perf else "0",
+        env_assignments(env),
+        PERF_WORKLOAD,
         *ghostty_args,
     )
-    return Invocation(compose(PRELUDE, GHOSTTY_HELPERS, SMOKE_BODY), args)
+    return Invocation(compose(PRELUDE, GHOSTTY_HELPERS, perf_function(), SMOKE_BODY), args)
 
 
 def run_invocation(clone: str, *, lang: str | None, config: str | None, x11: bool, ghostty_args: Sequence[str]) -> Invocation:
@@ -966,6 +1237,16 @@ def positive_seconds(text: str) -> float:
     return value
 
 
+def non_negative_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+    if not value >= 0:
+        raise argparse.ArgumentTypeError(f"must not be negative: {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     doc = __doc__ or ""
     common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -1003,9 +1284,17 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--lang", choices=sorted(LANGS), help="LANG/LC_ALL/LANGUAGE for Ghostty")
     smoke.add_argument("--xdotool", metavar="FILE", help="xdotool script run after the first screenshot ($1 is the Ghostty PID)")
     smoke.add_argument("--config", metavar="FILE", help="Ghostty config file to use instead of an empty one")
-    smoke.add_argument("--wait", type=positive_seconds, default=SMOKE_WAIT_SECONDS, metavar="SECONDS", help="delay before the screenshot (default 20)")
+    smoke.add_argument("--wait", type=positive_seconds, default=SMOKE_WAIT_SECONDS, metavar="SECONDS", help="how long to wait for the window to appear (default 20)")
+    smoke.add_argument("--settle", type=non_negative_seconds, default=SMOKE_SETTLE_SECONDS, metavar="SECONDS", help="delay between the window appearing and the screenshot (default 3)")
     smoke.add_argument("--name", metavar="PREFIX", help="evidence file prefix (default ghostty-xvfb[-LANG])")
+    smoke.add_argument("--env", action="append", default=[], metavar="NAME=VALUE", help="environment variable for Ghostty, repeatable")
+    smoke.add_argument("--perf", action="store_true", help="time a seq 1 3000000 workload and report per-thread CPU time")
     smoke.add_argument("ghostty_args", nargs="*", metavar="GHOSTTY_ARG", help="extra Ghostty arguments, after --")
+
+    scenario = commands.add_parser("scenario", parents=[common], allow_abbrev=False,
+                                   help="run test/gui/gtk scenarios, one smoke each")
+    scenario.add_argument("--out", required=True, metavar="DIR", help="Windows directory; scenario <id> writes DIR/<id>/")
+    scenario.add_argument("scenarios", nargs="*", metavar="SCENARIO", help="ids such as G01 or .toml files (default all)")
 
     run = commands.add_parser("run", parents=[common], allow_abbrev=False, help="start zig-out/bin/ghostty on the WSLg desktop")
     run.add_argument("--lang", choices=sorted(LANGS), help="LANG/LC_ALL/LANGUAGE for Ghostty")
@@ -1056,11 +1345,148 @@ def plan(args: argparse.Namespace) -> list[Invocation]:
                 wait=args.wait,
                 name=args.name,
                 ghostty_args=args.ghostty_args,
+                settle=args.settle,
+                perf=args.perf,
+                env=args.env,
             )
         ]
     if args.command == "run":
         return [run_invocation(clone, lang=args.lang, config=args.config, x11=args.x11, ghostty_args=args.ghostty_args)]
     raise GxWslError(f"unknown command {args.command}")
+
+
+@dataclass(frozen=True)
+class GtkScenario:
+    """A test/gui/gtk/G*.toml scenario: one `smoke` run plus the log lines it must not have."""
+
+    path: Path
+    id: str
+    title: str
+    config: str
+    lang: str | None = None
+    xdotool: str = ""
+    wait: float = SMOKE_WAIT_SECONDS
+    settle: float = SMOKE_SETTLE_SECONDS
+    env: tuple[str, ...] = ()
+    args: tuple[str, ...] = ()
+    expect: tuple[str, ...] = ()
+    forbid: tuple[str, ...] = SCENARIO_FORBID
+
+
+def load_toml(path: Path) -> dict:
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # Python 3.10
+        try:
+            import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+        except ModuleNotFoundError:
+            raise GxWslError("reading scenarios needs Python 3.11+ (tomllib) or the tomli package") from None
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise GxWslError(f"{path}: {exc}") from None
+
+
+def load_gtk_scenario(path: Path) -> GtkScenario:
+    data = load_toml(path)
+    unknown = sorted(data.keys() - GTK_SCENARIO_KEYS)
+    if unknown:
+        raise GxWslError(f"{path}: unknown keys {', '.join(unknown)}")
+    for key in ("id", "title", "config"):
+        if not isinstance(data.get(key), str):
+            raise GxWslError(f"{path}: {key} must be a string")
+    if not GTK_SCENARIO_ID.match(data["id"]) or not path.name.startswith(data["id"] + "-"):
+        raise GxWslError(f"{path}: id must look like G01 and start the file name")
+    lang = data.get("lang")
+    if lang is not None and lang not in LANGS:
+        raise GxWslError(f"{path}: lang must be one of {', '.join(sorted(LANGS))}")
+    env = data.get("env", {})
+    if not isinstance(env, dict) or not all(isinstance(value, str) for value in env.values()):
+        raise GxWslError(f"{path}: env must map variable names to strings")
+    assignments = tuple(f"{name}={value}" for name, value in env.items())
+    env_assignments(assignments)
+    forbid = tuple(data.get("forbid", SCENARIO_FORBID))
+    for pattern in forbid:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise GxWslError(f"{path}: bad forbid pattern {pattern!r}: {exc}") from None
+    return GtkScenario(path, data["id"], data["title"], data["config"], lang, data.get("xdotool", ""),
+                       float(data.get("wait", SMOKE_WAIT_SECONDS)), float(data.get("settle", SMOKE_SETTLE_SECONDS)),
+                       assignments, tuple(data.get("args", ())), tuple(data.get("expect", ())), forbid)
+
+
+def gtk_scenario_paths(selectors: Sequence[str], directory: Path = GTK_SCENARIO_DIR) -> list[Path]:
+    available = sorted(directory.glob("G*.toml"))
+    if not selectors:
+        return available
+    paths = []
+    for selector in selectors:
+        if selector.endswith(".toml") and os.path.isfile(selector):
+            paths.append(Path(selector))
+            continue
+        matches = [path for path in available if path.name.startswith(selector + "-")]
+        if len(matches) != 1:
+            raise GxWslError(f"no single scenario {selector!r} in {directory}")
+        paths.extend(matches)
+    return paths
+
+
+def forbidden_lines(log_text: str, patterns: Sequence[str]) -> list[str]:
+    regexes = [re.compile(pattern) for pattern in patterns]
+    return [line for line in log_text.splitlines() if any(regex.search(line) for regex in regexes)]
+
+
+def run_gtk_scenarios(args: argparse.Namespace) -> int:
+    """`scenario`: each scenario's config and xdotool script go to OUT/<id>/, then one smoke run named <id>."""
+    clone = check_clone_path(args.clone)
+    scenarios = [load_gtk_scenario(path) for path in gtk_scenario_paths(args.scenarios)]
+    out = Path(args.out)
+    summary = []
+    failed = 0
+    for scenario in scenarios:
+        target = out / scenario.id
+        target.mkdir(parents=True, exist_ok=True)
+        config = target / "config.ghostty"
+        config.write_text(scenario.config.lstrip("\n"), encoding="utf-8", newline="\n")
+        script = None
+        if scenario.xdotool.strip():
+            script = target / "script.xdo"
+            script.write_text(scenario.xdotool.lstrip("\n"), encoding="utf-8", newline="\n")
+        invocation = smoke_invocation(
+            clone,
+            out=str(target),
+            lang=scenario.lang,
+            xdotool=str(script) if script else None,
+            config=str(config),
+            wait=scenario.wait,
+            name=scenario.id,
+            ghostty_args=scenario.args,
+            settle=scenario.settle,
+            env=scenario.env,
+        )
+        code = execute(args.distro, invocation, dry_run=args.dry_run)
+        if args.dry_run:
+            continue
+        log = target / f"{scenario.id}.log"
+        status = "OK" if code == 0 else f"FAILED (smoke exit {code})"
+        if code == 0 and not log.is_file():
+            status = "FAILED (no log was copied back)"
+        bad = forbidden_lines(log.read_text(encoding="utf-8", errors="replace"), scenario.forbid) if log.is_file() else []
+        if bad:
+            status = f"FAILED ({len(bad)} forbidden log lines, first: {bad[0].strip()})"
+        failed += not status.startswith("OK")
+        notes = [f"{scenario.id} {scenario.title}", f"status: {status}", "",
+                 "Read every screenshot before recording PASS. Expected:"]
+        notes += [f"- {item}" for item in scenario.expect] or ["- (no expectations listed)"]
+        (target / "notes.txt").write_text("\n".join(notes) + "\n", encoding="utf-8")
+        summary.append(f"{scenario.id} {status} {scenario.title}")
+        print(f"{TAG} {summary[-1]}", flush=True)
+    if not args.dry_run:
+        out.mkdir(parents=True, exist_ok=True)
+        text = "\n".join(summary) + "\n\nScreenshots prove nothing until they are read; see <id>/notes.txt.\n"
+        (out / "SUMMARY.txt").write_text(text, encoding="utf-8")
+    return 1 if failed else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1072,6 +1498,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "shell":
             return shell(args.distro, check_clone_path(args.clone), dry_run=args.dry_run)
+        if args.command == "scenario":
+            return run_gtk_scenarios(args)
         for invocation in plan(args):
             code = execute(args.distro, invocation, dry_run=args.dry_run)
             if code != 0:

@@ -1,0 +1,38 @@
+id = "W18"
+title = "Twelve tabs: how the tab bar shrinks and overflows"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "three-tabs: three equal tabs with titles",
+  "twelve-tabs: twelve tabs; note how narrow they get, whether the active one keeps its close button and whether any is clipped",
+]
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+repeat = 2
+delay = 0.6
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "three-tabs"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+repeat = 9
+delay = 0.5
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "twelve-tabs"

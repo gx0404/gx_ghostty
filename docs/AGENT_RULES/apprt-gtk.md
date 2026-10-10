@@ -4,7 +4,7 @@
 
 - Linux/FreeBSD 默认的 GTK 运行时（`src/apprt/runtime.zig::Runtime.default`）：`src/apprt/gtk.zig` 与 `src/apprt/gtk/**`，含 `class/` 下的 GObject 类、`ui/<major>.<minor>/*.blp` Blueprint 模板、`css/`、`winproto/`（X11/Wayland）、`ipc/`（D-Bus）、portal、cgroup 与 Flatpak 辅助、`build/` 下的构建期小程序。
 - i18n：`src/os/i18n.zig`、`src/os/i18n_locales.zig`、`src/build/GhosttyI18n.zig`、`po/**`，以及 Apple 平台捆绑的 `pkg/libintl/**`。
-- 其余：`src/build/gtk.zig`、`pkg/gtk4-layer-shell/**`、`dist/linux/**`、`src/os/cgroup.zig`、`src/os/flatpak.zig`，检查脚本 `.github/scripts/check-translations.sh` 与 `nix/build-support/check-blueprints.sh`。
+- 其余：`src/build/gtk.zig`、`pkg/gtk4-layer-shell/**`、`dist/linux/**`、`src/os/cgroup.zig`、`src/os/flatpak.zig`，检查脚本 `.github/scripts/check-translations.sh`、`nix/build-support/check-blueprints.sh` 与 GX 层契约测试 `scripts/test_gtk_gx_contract.py`，GUI 场景 `test/gui/gtk/**`（同属 `testing`）。
 - 这些路径同时命中 app-core、build-system、packaging-dist、termio-pty-os、ci-release，通用规则以那些文档为准，本文只写 GTK 专属约束。
 
 ## 符号真源
@@ -13,8 +13,8 @@
 
 ### 入口与主循环
 
-- `src/apprt/gtk.zig` 导出 apprt 必需的 `App`、`Surface`、`resourcesDir`（即 `src/apprt/gtk/flatpak.zig::resourcesDir`），另导出 `class`、`WeakRef`、`pre_exec`、`post_fork`。`App.zig::App` 是外壳，工作委托给 `class/application.zig::Application`（GObject 名 `GhosttyApplication`，父类 `adw.Application`）；`Surface.zig` 同样转发给 `class/surface.zig::Surface`。
-- `Application.new` 的顺序：加载配置（失败用默认配置并记诊断）→ 保存原 `LANG`，`gx/language.zig::startup` 按 `language` 设定界面语言（补丁 GX-0011，见下文 i18n）→ `i18n.initGlobalDomain` → `setGtkEnv` → `adw.init` → 选 app id（合法的 `class` 配置优先，否则 `build/info.zig::application_id`）→ `winproto.App.init`（失败退回 `none`）。
+- `src/apprt/gtk.zig` 导出 apprt 必需的 `App`、`Surface`、`resourcesDir`（来自 `flatpak.zig`），另导出 `class`、`WeakRef`、`pre_exec`、`post_fork`。`App.zig::App` 是外壳，工作委托给 `class/application.zig::Application`（GObject 名 `GhosttyApplication`，父类 `adw.Application`）；`Surface.zig` 同样转发给 `class/surface.zig::Surface`。
+- `Application.new` 的顺序：加载配置（失败用默认配置并记诊断）→ 保存原 `LANG`，`gx/language.zig::startup` 按 `language` 设定界面语言（GX-0011，见下文 i18n）→ `i18n.initGlobalDomain` → `setGtkEnv` → `adw.init` → 选 app id（合法的 `class` 配置优先，否则 `build/info.zig::application_id`）→ `winproto.App.init`（失败退回 `none`）。
 - `Application.run` 取代 `gio.Application.run`：注册、按 `initial-window` 决定是否 activate、非主实例直接返回、`systemd.notify.ready()`，然后循环执行 `glib.MainContext.iteration` 与 `core_app.tick`。`Application.wakeup` 只调 `glib.MainContext.wakeup(null)`。
 
 ### GObject、Blueprint 与资源
@@ -28,37 +28,37 @@
 
 ### 窗口系统与系统集成
 
-- `winproto.zig::App`、`winproto.zig::Window` 是 `none`/`wayland`/`x11` 的 tagged union，后端是否编入取决于 `build_options.wayland`/`x11`；`-Dgtk-x11`、`-Dgtk-wayland` 默认值来自 `src/build/gtk.zig::targets`（pkg-config 失败时全为 false，保证无 GTK 也能 `zig build --help`）。Wayland 协议在 `src/build/SharedDeps.zig::addGtkNg` 注册，含仓内 `winproto/wayland/protocols/vicinae-hotkey-v1.xml`。
+- `winproto.zig::App`、`winproto.zig::Window` 是 `none`/`wayland`/`x11` 的 tagged union，后端是否编入取决于 `build_options.wayland`/`x11`；`-Dgtk-x11`、`-Dgtk-wayland` 默认值来自 `src/build/gtk.zig::targets`（pkg-config 失败时全为 false，无 GTK 也能 `zig build --help`）。Wayland 协议在 `src/build/SharedDeps.zig::addGtkNg` 注册。
 - quick terminal 依赖 gtk4-layer-shell：`src/build/Config.zig::init` 把它的系统集成默认设为 true（链接系统 `gtk4-layer-shell-0`），`-fno-sys=gtk4-layer-shell` 时构建并安装 `pkg/gtk4-layer-shell` 的动态库。
-- `ipc/*.zig` 经 D-Bus `org.gtk.Actions.Activate` 调用运行中实例的 app action，action 在 `Application.startupActionMap` 注册（`new-window`、`new-tab`、`toggle-quick-terminal` 等）。
-- cgroup：`src/apprt/gtk/cgroup.zig::createScope` 经 systemd `StartTransientUnit` 建 scope；父进程侧 `post_fork.zig::postFork`，子进程侧 `pre_exec.zig::preExec`（最多等 250ms，hard-fail 以 127 退出），二者由 `src/termio/Exec.zig` 经 `@hasDecl(apprt.runtime, …)` 探测后挂到 `src/Command.zig` 的 `rt_post_fork`/`rt_pre_exec`；`src/os/cgroup.zig::current` 读 `/proc/<pid>/cgroup`。
+- `ipc/*.zig` 经 D-Bus `org.gtk.Actions.Activate` 调用运行中实例的 app action，action 在 `Application.startupActionMap` 注册（如 `new-window`）。
+- cgroup：`cgroup.zig::createScope` 经 systemd `StartTransientUnit` 建 scope；`post_fork.zig::postFork`（父进程）与 `pre_exec.zig::preExec`（子进程，最多等 250ms，hard-fail 以 127 退出）由 `src/termio/Exec.zig` 经 `@hasDecl` 探测后挂到 `src/Command.zig` 的 `rt_post_fork`/`rt_pre_exec`；`src/os/cgroup.zig::current` 读 `/proc/<pid>/cgroup`。
 - Flatpak：`src/os/flatpak.zig::isFlatpak` 运行期检测 `/.flatpak-info`，`FlatpakHostCommand` 经 `org.freedesktop.Flatpak.Development` 在宿主执行命令；只有 `-Dflatpak` 构建链接 `gio_c`。
 - `dist/linux/*.in` 是 cmake 风格模板（`@NAME@`、`@APPID@`、`@GHOSTTY@`），由 `src/build/GhosttyResources.zig::addLinuxAppResources` 渲染安装 desktop entry、D-Bus service（Flatpak 用 `dbus.service.flatpak.in`）、systemd user service（仅非 Flatpak）与 AppStream metainfo，另装 Dolphin/Nautilus 右键菜单与图标。
 
 ### GX 层
 
-- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`：GX 主菜单的「关于 Ghostty GX」，写明 gx0404 维护的非官方分支，代替上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单、提示与启动配置下拉随语言重建）、`launch.zig`、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，运行期 libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
+- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`，写明非官方分支，代替上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单与启动配置下拉随语言重建）、`launch.zig`、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
 
 ### i18n
 
 - `src/os/i18n.zig`：`init` 由 `src/global.zig` 以资源目录调用，把 gettext domain 绑到资源目录同级的 `locale/`（Windows 直接返回）；`initGlobalDomain` 只给完整拥有应用的 apprt 用；`_` 在 comptime 调用时原样返回 msgid，`N_` 只做标记；`canonicalizeLocale` 依赖 `pkg/libintl` 导出的 `_libintl_locale_name_canonicalize`。
 - `src/os/i18n_locales.zig::locales`：受支持的 locale 列表，顺序有语义（只知语言码时取第一个匹配）；单独成文件是为减少构建程序的传递依赖。
-- `src/build/GhosttyI18n.zig`：`init` 对每个 locale 跑 `msgfmt`，装到 `share/locale/<locale>/LC_MESSAGES/com.mitchellh.ghostty.mo`。`createUpdateStep` 用 `xgettext --language=C --keyword=_ --keyword=N_ --keyword=C_:1c,2` 扫描已登记的 `.blp`、`src/apprt/gtk` 下全部 `.zig`（排序后）与 `src/input/command.zig`，再以 Python 模式扫 `dist/linux/ghostty_nautilus.py`，合并写回 `po/com.mitchellh.ghostty.pot`，并对每个 locale `msgmerge --no-fuzzy-matching`。`build.zig` 把它挂在 `update-translations` 步骤，i18n 关闭时该步骤报错。
-- `-Di18n` 默认（`src/build/Config.zig::init`）：macOS/iOS 开；Linux/FreeBSD 只在 glibc 开；其余关。musl 要开需 gettext-tiny 一类 stub（`po/README_CONTRIBUTORS.md`），`src/os/i18n.zig` 手写 gettext extern 声明也是因为 musl 未必有 `libintl.h`。
-- 界面语言（GX-0011，`src/apprt/gtk/gx/`）：`language` 经 `gx.i18n.resolve` 取 `zh-CN` 或 `en`；启动时 locale 已安装才写 `LANG`，`LANGUAGE` 选 gettext 目录，禁用 GTK 自己的 `setlocale` 后把 `LC_MESSAGES` 设为真实 UTF-8 locale（glibc 在 `C`/`C.UTF-8` 下忽略 `LANGUAGE`）。运行时 `language` 变化由 `Application.propConfig` 切换 `LANGUAGE`、`LC_MESSAGES`、`textdomain` 与 `gx.i18n`，命令面板译文变了就再硬重载一次配置；菜单来自 `ui/1.5/gx/menus.blp`（不带 `_()` 的英文 msgid，由 `gx.i18n` 翻译），窗口在 `propConfig` 时整套替换。fork 自有字符串一律走 `gx.i18n.tr`/`trRuntime` 与 `src/gx/i18n/gx.zh_CN.po`，不用 `_`/`N_`/`C_`，以免流入上游 pot。
+- `src/build/GhosttyI18n.zig`：`init` 对每个 locale 跑 `msgfmt`，装到 `share/locale/<locale>/LC_MESSAGES/com.mitchellh.ghostty.mo`。`createUpdateStep` 用 xgettext（关键字 `_`、`N_`、`C_:1c,2`）扫描已登记的 `.blp`、`src/apprt/gtk` 下全部 `.zig` 与 `src/input/command.zig`，再以 Python 模式扫 `dist/linux/ghostty_nautilus.py`，合并写回 `po/com.mitchellh.ghostty.pot` 并对每个 locale `msgmerge --no-fuzzy-matching`；`build.zig` 把它挂在 `update-translations`，i18n 关闭时该步骤报错。
+- `-Di18n` 默认（`src/build/Config.zig::init`）：macOS/iOS 开；Linux/FreeBSD 只在 glibc 开；其余关。musl 要开需 gettext-tiny 一类 stub（`po/README_CONTRIBUTORS.md`；`src/os/i18n.zig` 因此手写 gettext extern 声明）。
+- 界面语言（GX-0011，`src/apprt/gtk/gx/`）：`language` 经 `gx.i18n.resolve` 取 `zh-CN` 或 `en`；启动时 locale 已安装才写 `LANG`，`LANGUAGE` 选 gettext 目录，禁用 GTK 自己的 `setlocale` 后把 `LC_MESSAGES` 设为真实 UTF-8 locale（glibc 在 `C`/`C.UTF-8` 下忽略 `LANGUAGE`）。运行时 `language` 变化由 `Application.propConfig`（经 `gx/app.zig::configChanged`）切换 `LANGUAGE`、`LC_MESSAGES`、`textdomain` 与 `gx.i18n`；默认命令面板条目的译文因此变了，就经 `gx.config_layers.rebuild` 在内存重建配置再 `updateConfig`，除主题外不读盘（启动时 `gx/language.zig::startup` 同理）；菜单来自 `ui/1.5/gx/menus.blp`（不带 `_()` 的英文 msgid，由 `gx.i18n` 翻译），窗口在 `propConfig` 时整套替换。fork 自有字符串一律走 `gx.i18n.tr`/`trRuntime` 与 `src/gx/i18n/gx.zh_CN.po`，不用 `_`/`N_`/`C_`，以免流入上游 pot。
 - `pkg/libintl` 用 GNU gettext 源码构建静态 libintl，只在 Darwin 目标由 `src/build/SharedDeps.zig` 链接；它的 `config.h` 在 macOS 上手工生成，升级 gettext 时要复核末尾手工补的 `xlocale.h` include。
 
 ## 不变量
 
 - **主线程**：GTK、GLib、libadwaita 对象只在 `Application.run` 所在的主线程上操作，私有状态 `running` 只由主循环写。termio、渲染线程不调 GTK，只向核心 mailbox 投递；`src/App.zig` 投递后调 `rt_app.wakeup()`，主循环在下一次 `core_app.tick` 处理。
-- **渲染交接**：`class/render_surface.zig::RenderSurface` 在主线程的 `snapshot` 里用 `renderer.takeFrame()` 取渲染线程导出的最新帧建 `GdkTexture`；渲染初始化在渲染线程完成后才创建 core surface。帧优先以 DMABUF 导出，导入失败时调 `reportPresentationHealth(.unhealthy)`，渲染器改发 CPU 内存帧。终端 surface 不用 `GtkGLArea`（只有 inspector 的 `class/imgui_widget.zig` 在用）。
+- **渲染交接**：`class/render_surface.zig::RenderSurface` 在主线程的 `snapshot` 里用 `renderer.takeFrame()` 取渲染线程导出的最新帧建 `GdkTexture`；渲染初始化在渲染线程完成后才创建 core surface。帧优先以 DMABUF 导出，导入失败时调 `reportPresentationHealth(.unhealthy)`，渲染器改发 CPU 内存帧。`GtkGLArea` 只有 inspector（`class/imgui_widget.zig`）在用。
 - **GObject 生命周期**：使用模板的类在 `dispose` 里先 `gtk.Widget.disposeTemplate` 再链式调父类；属性访问器持有的私有字符串、boxed、对象在 `finalize` 释放（访问器只在 set 时替换旧值）；`WeakRef` 在宿主 `dispose` 中 `deinit`，`WeakRef.get` 返回的强引用用完要 `unref`；模板回调返回 `c_int` 而不是 Zig `bool`（`bindTemplateCallback` 编译期拒绝 `bool`）。
-- **Blueprint 登记**：每个 `.blp` 都登记在 `gresource.blueprints`，未登记的既不进 gresource 也不被 xgettext 扫描。构建要求 libadwaita 头文件不低于登记表最高版本，新增更高版本目录会抬高整个 GTK 构建的下限；多版本变体（如 `clipboard-confirmation-dialog`、`debug-warning`）在 `Class.init` 用 comptime 版本门挑选。
+- **Blueprint 登记**：每个 `.blp` 都登记在 `gresource.blueprints`，未登记的既不进 gresource 也不被 xgettext 扫描。构建要求 libadwaita 头文件不低于登记表最高版本，新增更高版本目录会抬高整个 GTK 构建的下限；多版本变体（如 `debug-warning`）在 `Class.init` 用 comptime 版本门挑选。
 - **可翻译字符串**：Zig 里立即翻译用 `i18n._("…")`，先存 msgid、展示时再翻译用 `i18n.N_("…")`；带上下文的 `C_("ctx", "…")` 只能写在 `.blp`（`src/os/i18n.zig` 没有 `C_`）。只有 `createUpdateStep` 列出的输入会被抽取，在其外新增可翻译字面量时必须把文件加进该步骤。命令面板条目在 `src/input/command.zig` 用 `i18n.N_` 标记，由 `src/config/Config.zig::RepeatableCommand.init` 只在 `app_runtime == .gtk` 时翻译。
 - **pot 与 po**：pot 只由 `update-translations` 生成，必须与源码同步；`.po` 归译者，update 只做 `msgmerge`。新增 locale 要同时提交 `po/<locale>.po` 与 `locales` 条目（构建按列表逐项读取 `.po`）；上游流程还要改 `CODEOWNERS`，fork 不编辑它（`ci-release.md`），新语种宜回馈上游。
-- **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与 desktop/D-Bus/systemd 启动器注入的变量，并把 `LANG` 与 `LANGUAGE`（`gx/language.zig::restoreChildEnv`）恢复为启动时的值；新增 GUI 侧环境改动要同步这张清理表。原始 `LANGUAGE` 由 `gx/language.zig::startup` 记录一次（先于 `Application` 创建，此后只读的模块级状态）；启动后只有界面语言切换在主线程改 `LANGUAGE`（`setenv` 后 `global.syncEnviron`）。
+- **环境变量**：`class/application.zig::setGtkEnv` 必须在 GTK 初始化前调用（有断言），改完调 `global.syncEnviron()`。`class/surface.zig::Surface.defaultTermioEnv` 从子进程环境剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 与启动器注入的变量，并把 `LANG`、`LANGUAGE` 恢复为启动时的值（`gx/language.zig::restoreChildEnv`）；新增 GUI 侧环境改动要同步这张清理表。原始 `LANGUAGE` 由 `gx/language.zig::startup` 在 `Application` 创建前记录一次；此后只有界面语言切换在主线程改 `LANGUAGE`（`setenv` 后 `global.syncEnviron`）。
 - **对外接口**：app id `com.mitchellh.ghostty` 同时用于 `build_config.bundle_id`、`build/info.zig`、gettext domain、`dist/linux` 安装文件名、D-Bus 名与 systemd `BusName`。app action 名被 desktop entry 的 `[Desktop Action new-window]` 与 `ipc/*.zig` 共同依赖。systemd 单元必须叫 `app-<appid>.service`，否则 XDG portal 认不出 app id；单元声明 `Type=notify-reload` 与 `ReloadSignal=SIGUSR2`，所以 `Application.startupSignals` 必须先于任何 systemd 通知注册 SIGUSR2。Nautilus 扩展安装名必须是 `ghostty.py`。
-- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`src/apprt/gtk/gx/style.zig`，`APPLICATION + 2`，GX-0016 接入 `class/application.zig`）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）；新增 provider 按此排位。静态 CSS 与 GX CSS 都须能被 GTK 4.14 解析（GX-0023），4.16 起的写法只进运行期版本门控的 CSS。
+- **CSS 层次**：libadwaita 主题与 `css/style.css`（`APPLICATION`）< GX 样式（`gx/style.zig`，`APPLICATION + 2`，GX-0016）< 运行时 CSS（`APPLICATION + 3`）< `gtk-custom-css`（`USER`）；新增 provider 按此排位。静态 CSS 与 GX CSS 都须能被 GTK 4.14 解析（GX-0023）：GX 的 `.css` 与 `src/gx/gtk_css.zig`、`gx/style.zig` 生成的 CSS 不用 `--x:` 自定义属性、`var()`、`:root` 与新颜色函数，4.16 起的写法只放进名字以 `416` 结尾、调用方先查运行期版本的函数（`scripts/test_fork_patches.py` 守门）。
 - **门控与链接**：Flatpak 专用路径同时受编译期 `build_config.flatpak` 与运行期 `isFlatpak()` 门控。`preExec` 跑在 fork 后、exec 前的子进程里，只读 `/proc` 并有限等待，不碰 GTK/GLib 对象。gtk4-layer-shell 只能动态链接，且先于 `wayland-client` 链接（它 shim 了 libwayland）。
 
 ## 禁止项
@@ -76,11 +76,11 @@
 
 ## 验证
 
-- **Windows 主机经 WSL**（`just wsl`，Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 `zh_CN.UTF-8`、`en_US.UTF-8` locale）：`just wsl sync <worktree> --dirty` 同步改动，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑 GTK 单测（GX 层用 `--filter apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图并拷回 Windows，读图且日志无 `Theme parser error`、`css parsing failed` 才记 PASS。Windows 本身没有 GTK 与 gettext（默认 `-Di18n=false`），只能跑 `just fmt-check`。
+- **Windows 主机经 WSL**（Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 zh_CN、en_US 的 UTF-8 locale）：`just wsl sync <worktree> --dirty` 同步，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑单测（GX 层 `apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图，`just wsl scenario --out <目录> [G01 …]` 回放 `test/gui/gtk/G*.toml`；读图且日志无 `Theme parser error`、`css parsing failed` 才记 PASS。Windows 本身没有 GTK 与 gettext，只能跑 `just fmt-check` 与 `python scripts/run_unittests.py test_gtk_gx_contract`（GX 层对上游模板、菜单与 action 的引用；改 GX 层或同步上游后跑）。
 - **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.16、gettext、pkg-config）：
   - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`；Ubuntu 24.04 的打包配方见 `packaging-dist.md`。
   - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.16.0）。
   - Blueprint：`nix/build-support/check-blueprints.sh` 后 `git diff --exit-code`（沿用上游 CI）。
   - 看译文：`zig-out/bin/ghostty --language=zh-CN`（或 `en`）。
-- **CI**：gx-ci 的 push/PR 路径只跑 `-Dapp-runtime=none`，不编译 GTK；GTK 改动手动触发 gx-ci 并打开 `gtk_smoke`，`gtk-smoke` job 构建并截图。
-- **发版**：`gx-release` 的 `linux-gtk` 从 `zig build dist` 源码包构建 GTK tarball（实验性，源码包自带 `ghostty_resources.{c,h}`），`linux-gtk-noble` 在 Ubuntu 24.04 验证 GX Shell 的 deb 流程；见 `docs/RELEASE.md`。
+- **CI**：gx-ci 的 push/PR 路径只跑 `-Dapp-runtime=none`，不编译 GTK；GTK 改动手动触发 gx-ci 并打开 `gtk_smoke`，`gtk-smoke` job 构建、截图并跑 `--filter apprt.gtk.gx` 单测（报告进 `gx-gtk-smoke-evidence`）。
+- **发版**：`gx-release` 的 `linux-gtk` 从源码包构建 GTK tarball（实验性），`linux-gtk-noble` 在 Ubuntu 24.04 验证 GX Shell 的 deb 流程（`docs/RELEASE.md`）。

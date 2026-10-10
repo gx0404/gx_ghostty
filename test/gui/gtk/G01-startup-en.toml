@@ -1,0 +1,11 @@
+id = "G01"
+title = "English startup: the GX look of the header bar and the terminal"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+"""
+expect = [
+  "G01.png: one window with the header bar and the tab area in the terminal background (not Adwaita grey), the bash prompt in the terminal",
+  "G01.log: no `Theme parser error` and no `css parsing failed` (checked by the runner)",
+]

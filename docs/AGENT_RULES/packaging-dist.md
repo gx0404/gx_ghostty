@@ -25,11 +25,11 @@
 
 ### 下游渠道（上游维护，fork 原样保留）
 
-- `PACKAGING.md`：打包者以源码包为输入，唯一联网步骤是 `nix/build-support/fetch-zig-cache.sh`（按 `build.zig.zon.txt` 逐个 `zig fetch`），之后用 `DESTDIR=… zig build --prefix /usr --system <缓存>/p -Doptimize=ReleaseFast -Dcpu=baseline` 离线构建。它的「Zig Version」一节已过时（指向 `build.zig` 中已不存在的 `required_zig` 常量，并写着 Zig 0.14.0），真源见 `build-system.md`。另据归档的上游 `test.yml` 的 System Build 注释，Zig 0.16 起全局缓存只存压缩包，`--system` 要指向解包后的 `zig-pkg/` 式目录，`<缓存>/p` 的写法早于这一变化（本机未验证）。
+- `PACKAGING.md`：打包者以源码包为输入，唯一联网步骤是 `nix/build-support/fetch-zig-cache.sh`（按 `build.zig.zon.txt` 逐个 `zig fetch`），之后用 `DESTDIR=… zig build --prefix /usr --system <缓存>/p -Doptimize=ReleaseFast -Dcpu=baseline` 离线构建。它的「Zig Version」一节已过时（指向不存在的 `required_zig` 常量、写着 Zig 0.14.0），真源见 `build-system.md`；据归档的上游 `test.yml` 的 System Build 注释，Zig 0.16 起全局缓存只存压缩包，`--system` 要指向解包后的 `zig-pkg/` 式目录，`<缓存>/p` 的写法早于这一变化（本机未验证）。
 - Flatpak：`flatpak/com.mitchellh.ghostty.yml`（ReleaseFast）与 `com.mitchellh.ghostty-debug.yml`（Debug）以仓库目录为源，用 `-Dflatpak=true --system $PWD/vendor/p` 构建，依赖源取自生成的 `flatpak/zig-packages.json`；`flatpak/dependencies.yml` 用 sha256 钉住 Zig 0.16.0 官方包。
 - Snap：`snap/snapcraft.yaml` 从 ziglang.org 下载 Zig 0.16.0（不校验摘要），用 `craftctl set version=$(cat VERSION)` 取版本，所以输入必须是源码包；`-Dsnap -Doptimize=ReleaseFast -Dcpu=baseline`，classic confinement，启动器 `snap/local/launcher`。
 - Nix：`nix/package.nix` 以 `build.zig.zon.nix` 为离线依赖，传硬编码的 `-Dversion-string=1.3.2-dev+<rev>-nix` 与 `-Dcpu=baseline`，只声明 Linux 平台。
-- 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程；fork 的 exe 编入 `dist/windows/gx/ghostty-gx.rc`（GX-0026），不用上游 `dist/windows/ghostty.rc` 与其图标，manifest 仍取上游。图标：`images/gnome/` 供 Linux 安装、GTK gresource 与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
+- 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程。图标：`images/gnome/` 供 Linux 安装、GTK gresource 与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
 
 ### fork 发布资产（`gx-release`）
 
@@ -49,7 +49,7 @@
 ### Windows 便携包与安装包（`scripts/gx_windows_package.py`）
 
 - `just package-windows`（`--build`）先把 ReleaseFast 的 win32 app 装进前缀（`-Dtarget=x86_64-windows-gnu`、`-Dversion-string=$VS`），再在 `zig-out/dist/` 产出 `ghostty-gx-$VS-x86_64-windows.zip`（单一顶层目录：`ghostty.exe`、随包 ConPTY 的 `conpty.dll` 与 `OpenConsole.exe`、软件渲染 `mesa/`、`share/`、`fonts/`、`licenses/`、中英文 `README.txt`）与 Inno Setup 7.1 安装包；`--skip-installer` 只出 zip。
-- 第三方输入（ConPTY 1.24.261001001、Mesa llvmpipe、JetBrainsMono Nerd Font 6 款与 Noto Sans CJK 2 款、许可证文本）在模块文档里钉 SHA-256，下载到缓存（默认 `.local/cache/gx-package`，`--offline` 不联网），任一不符即失败。ISCC 依次取 `--iscc`、`$ISCC`、`.local/tools/innosetup/ISCC.exe`（`just setup --innosetup`）与 `PATH`。报告成功前两个产物都按 `expected_assets` 核对。
+- 第三方输入（ConPTY 1.24.261001001、Mesa llvmpipe、JetBrainsMono Nerd Font 6 款与 Noto Sans CJK 2 款、许可证文本）在模块文档里钉 SHA-256，下载到缓存（默认 `.local/cache/gx-package`，`--offline` 不联网），任一不符即失败。编进 exe 的拼音表（`src/gx/pinyin/`，数据 pinyin-data 为 MIT，读音取自 Unihan 为 Unicode License V3）的两份许可原文打包为 `licenses/pinyin-data-MIT.txt`、`licenses/Unicode-License-V3.txt` 并列入 `THIRD-PARTY.txt`；deb stage 的 `copyright` 有 `src/gx/pinyin/*` 段。ISCC 依次取 `--iscc`、`$ISCC`、`.local/tools/innosetup/ISCC.exe`（`just setup --innosetup`）与 `PATH`。报告成功前两个产物都按 `expected_assets` 核对。
 - 安装包（`dist/windows/gx/ghostty-gx.iss`）：欢迎页（`DisableWelcomePage=no`）与「应用和功能」的 `AppComments` 写明非官方分支声明；默认按用户装到 `%LOCALAPPDATA%\Programs\Ghostty GX`，也可为所有用户安装；开始菜单、可选桌面图标、App Paths、可选的资源管理器右键菜单；字体按用户安装，已存在就跳过，卸载时保留；卸载不删用户配置。`just stage windows <新目录>` 用同一棵树生成 GX Shell 的 Windows stage。
 
 ### Ghostty GX 图标（`scripts/gx_icon.py`）

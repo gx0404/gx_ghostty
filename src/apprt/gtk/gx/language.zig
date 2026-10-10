@@ -72,7 +72,8 @@ var original_language: OriginalLanguage = .{};
 ///
 /// `config` was loaded before the language was known, so its command
 /// palette entries were translated for the previous messages language;
-/// when that changes the translation, the configuration is loaded again.
+/// when that changes the translation, the configuration is rebuilt in
+/// memory from the inputs it recorded (`gx.config_layers.rebuild`).
 pub fn startup(alloc: Allocator, config: *configpkg.Config) void {
     const lang = gx.i18n.resolve(config.language);
     const palette_before = paletteFingerprint();
@@ -100,12 +101,12 @@ pub fn startup(alloc: Allocator, config: *configpkg.Config) void {
     log.info("UI language={s} LC_MESSAGES={s}", .{ lang.configValue(), messagesLocale() });
 
     if (paletteFingerprint() != palette_before) {
-        const reloaded = configpkg.Config.load(alloc) catch |err| {
-            log.warn("reloading the configuration for the UI language failed err={}", .{err});
+        const rebuilt = gx.config_layers.rebuild(config, alloc, &.{}) catch |err| {
+            log.warn("rebuilding the configuration for the UI language failed err={}", .{err});
             return;
         };
         config.deinit();
-        config.* = reloaded;
+        config.* = rebuilt;
     }
 }
 

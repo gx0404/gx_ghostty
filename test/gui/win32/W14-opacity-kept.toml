@@ -1,0 +1,112 @@
+id = "W14"
+title = "Background opacity: toggled opaque stays opaque through a palette theme preview"
+# Window materials need Windows 11 22H2 (chrome/Backdrop.zig).
+requires = ["windows-build:22621"]
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+gx-window-material = mica
+background-opacity = 0.8
+keybind = ctrl+shift+u=toggle_background_opacity
+"""
+expect = [
+  "translucent: the terminal shows the mica material through the background (not the solid GX Mocha #1f1f28)",
+  "opaque: after toggle_background_opacity the terminal is solid #1f1f28",
+  "preview: the palette previews Nord and the terminal is solid Nord #2e3440",
+  "restored: after Esc the terminal is solid GX Mocha #1f1f28 again, not translucent",
+]
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+differs = "#1f1f28"
+tolerance = 1
+label = "translucent at start"
+
+[[step]]
+action = "capture"
+name = "translucent"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+u"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#1f1f28"
+tolerance = 1
+label = "opaque GX Mocha"
+
+[[step]]
+action = "capture"
+name = "opaque"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "Nord"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 1
+label = "opaque Nord preview"
+
+[[step]]
+action = "capture"
+name = "preview"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#1f1f28"
+tolerance = 1
+label = "opaque GX Mocha after Esc"
+
+[[step]]
+action = "capture"
+name = "restored"

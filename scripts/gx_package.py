@@ -85,7 +85,8 @@ Windows layout (top level exactly app/, fonts/, build-inputs/ and the manifest)
   app/                  the portable directory of gx_windows_package.build_tree without fonts/:
                         ghostty.exe, conpty.dll, OpenConsole.exe, mesa/, share/ (with
                         share/terminfo/ghostty.terminfo and fork themes), licenses/ (Ghostty-MIT.txt,
-                        THIRD-PARTY.txt and the ConPTY, Mesa, LLVM and font license texts), README.txt
+                        THIRD-PARTY.txt and the ConPTY, Mesa, LLVM, font, pinyin-data and Unicode
+                        license texts), README.txt
   fonts/                the 8 pinned fonts of gx_release.WINDOWS_FONTS; GX Shell merges component fonts
                         only when the bytes match, so the four Oh My Zsh GX also ships are identical
   build-inputs/ghostty.ico   dist/windows/gx/ghostty-gx.ico (the Ghostty GX icon, see scripts/gx_icon.py)
@@ -103,7 +104,8 @@ Deb layout (top level exactly root/, fonts/ and the manifest)
   root/usr/share/applications/com.gx0404.ghostty-gx.desktop   Name=Ghostty GX, Exec=ghostty-gx,
                              Icon=com.gx0404.ghostty-gx, StartupWMClass=com.mitchellh.ghostty
   root/usr/share/icons/hicolor/<N>x<N>/apps/com.gx0404.ghostty-gx.png   from images/gnome/<N>.png
-  root/usr/share/doc/ghostty-gx/copyright   machine-readable copyright (Ghostty MIT, fonts OFL-1.1)
+  root/usr/share/doc/ghostty-gx/copyright   machine-readable copyright (Ghostty MIT, fonts OFL-1.1,
+                             the pinyin table compiled into bin/ghostty MIT and Unicode-3.0)
   fonts/                     the same 8 pinned fonts
 The deb --prefix is a plain prefix (bin/ghostty, share/, lib/) or a DESTDIR tree whose usr/ is that
 prefix; the binary must be an x86-64 ELF that embeds VS, without DT_RPATH and with no RUNPATH entry
@@ -144,6 +146,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import gx_linux_build as linux  # noqa: E402  (scripts/gx_linux_build.py)
+import gx_pinyin  # noqa: E402  (scripts/gx_pinyin.py)
 import gx_release  # noqa: E402  (scripts/gx_release.py)
 import gx_windows_package as windows  # noqa: E402  (scripts/gx_windows_package.py)
 
@@ -432,12 +435,21 @@ def holder(notice: str) -> str:
     return re.sub(r"^(Copyright\s*)?(\(c\)|©)?\s*", "", notice.strip(), flags=re.IGNORECASE)
 
 
+def copyright_holder(text: str, name: str) -> str:
+    """The holder named by the first "Copyright" line of a license text."""
+    line = next((line for line in text.splitlines() if line.startswith("Copyright")), None)
+    if line is None:
+        raise PackageError(f"{name} has no Copyright line")
+    return holder(line)
+
+
 def copyright_file(root: Path, fonts: Path, ofl: str) -> str:
     license_text = (Path(root) / "LICENSE").read_text(encoding="utf-8")
-    ghostty = next((line for line in license_text.splitlines() if line.startswith("Copyright")), None)
-    if ghostty is None:
-        raise PackageError("LICENSE has no Copyright line")
-    ghostty = holder(ghostty)
+    ghostty = copyright_holder(license_text, "LICENSE")
+    pinyin_text = (Path(root) / windows.PINYIN_LICENSE).read_text(encoding="utf-8")
+    unicode_text = (Path(root) / windows.UNICODE_LICENSE).read_text(encoding="utf-8")
+    pinyin = copyright_holder(pinyin_text, windows.PINYIN_LICENSE)
+    unicode = copyright_holder(unicode_text, windows.UNICODE_LICENSE)
     jetbrains = holder(font_copyright(fonts / "JetBrainsMonoNerdFont-Regular.ttf"))
     noto = holder(font_copyright(fonts / "NotoSansCJK-Regular.ttc"))
     lines = [
@@ -460,11 +472,22 @@ def copyright_file(root: Path, fonts: Path, ofl: str) -> str:
         f"Copyright: {noto}",
         "License: OFL-1.1",
         "",
+        "Files: src/gx/pinyin/*",
+        f"Copyright: {pinyin}",
+        f" {unicode}",
+        "License: MIT and Unicode-3.0",
+        "Comment: The pinyin initials compiled into bin/ghostty, generated from pinyin-data",
+        f" {gx_pinyin.SOURCE_VERSION} (https://github.com/mozillazg/pinyin-data, MIT), whose readings come",
+        " from the Unicode Unihan database (Unicode License V3).",
+        "",
         "License: MIT",
         *dep5_text(license_text),
         "",
         "License: OFL-1.1",
         *dep5_text(ofl),
+        "",
+        "License: Unicode-3.0",
+        *dep5_text(unicode_text),
         "",
     ]
     return "\n".join(lines)

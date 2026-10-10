@@ -692,3 +692,176 @@ msgstr "可改用右键菜单或命令面板。"
 
 msgid "Keyboard Shortcuts ({keys})"
 msgstr "查看快捷键（{keys}）"
+
+#. GX binding actions (src/gx/action.zig): titles in menus and shortcut sheets
+msgid "Settings Page"
+msgstr "设置页面"
+
+msgid "New Tab Menu"
+msgstr "新建标签页菜单"
+
+msgid "Context Menu"
+msgstr "右键菜单"
+
+msgid "Move Split to New Tab"
+msgstr "将分屏移至新标签页"
+
+msgid "Move Split to New Window"
+msgstr "将分屏移至新窗口"
+
+msgid "Tab Switcher"
+msgstr "标签页切换器"
+
+#. Settings (src/gx/settings_map.zig): themes, appearance and interaction
+msgid "Light Theme"
+msgstr "浅色主题"
+
+msgid "Dark Theme"
+msgstr "深色主题"
+
+msgid "Windows follow the light or dark mode of the system."
+msgstr "窗口跟随系统的浅色或深色模式。"
+
+msgid "Background Opacity"
+msgstr "背景不透明度"
+
+msgid "Automatic keeps the opacity that goes with the window material."
+msgstr "选择“自动”时使用与窗口材质相配的不透明度。"
+
+msgid "Automatic"
+msgstr "自动"
+
+msgid "Cursor"
+msgstr "光标"
+
+msgid "Cursor Style"
+msgstr "光标样式"
+
+msgid "Block"
+msgstr "方块"
+
+msgid "Bar"
+msgstr "竖线"
+
+msgid "Underline"
+msgstr "下划线"
+
+msgid "Hollow Block"
+msgstr "空心方块"
+
+msgid "Blinking Cursor"
+msgstr "光标闪烁"
+
+msgid "Window Padding"
+msgstr "窗口内边距"
+
+msgid "Compact"
+msgstr "紧凑"
+
+msgid "Spacious"
+msgstr "宽松"
+
+msgid "Applies to new terminals."
+msgstr "对新打开的终端生效。"
+
+msgid "Focus Follows Mouse"
+msgstr "焦点跟随鼠标"
+
+msgid "Moving the mouse over a split focuses it."
+msgstr "鼠标移到分屏上即聚焦该分屏。"
+
+msgid "Zoom with Ctrl+Wheel"
+msgstr "Ctrl+滚轮缩放"
+
+msgid "Hold Ctrl and turn the mouse wheel, or pinch on a touchpad, to change the font size."
+msgstr "按住 Ctrl 转动鼠标滚轮，或在触控板上双指缩放，即可调整字号。"
+
+#. Settings: where the value of a setting comes from
+msgid "Ghostty GX default"
+msgstr "Ghostty GX 默认值"
+
+msgid "From the configuration file"
+msgstr "来自配置文件"
+
+msgid "From the settings file"
+msgstr "来自设置文件"
+
+msgid "From the command line, which overrides the settings here"
+msgstr "来自命令行，优先于此处的设置"
+
+msgid "Ghostty default"
+msgstr "Ghostty 默认值"
+
+#. Settings: reasons for {reason} in error messages
+msgid "Permission denied."
+msgstr "没有权限。"
+
+msgid "The file or folder does not exist."
+msgstr "文件或文件夹不存在。"
+
+msgid "The disk is full."
+msgstr "磁盘已满。"
+
+msgid "The disk is read-only."
+msgstr "磁盘为只读。"
+
+msgid "Another program changed the file at the same time. Try again."
+msgstr "另一个程序同时修改了该文件，请重试。"
+
+msgid "The file is in use by another program."
+msgstr "文件正被另一个程序使用。"
+
+msgid "The value cannot be written to the settings file."
+msgstr "该值无法写入设置文件。"
+
+msgid "Out of memory."
+msgstr "内存不足。"
+
+msgid "The path is not valid."
+msgstr "路径无效。"
+
+msgid "The file is too large."
+msgstr "文件过大。"
+
+msgid "Reading or writing the disk failed."
+msgstr "读写磁盘失败。"
+
+msgid "The network location is not available."
+msgstr "网络位置不可用。"
+
+msgid "The configuration folder could not be found."
+msgstr "找不到配置文件夹。"
+
+#. Links in terminal output (src/gx/url_policy.zig)
+msgid "Open Link?"
+msgstr "打开链接吗？"
+
+msgid "Open"
+msgstr "打开"
+
+msgid "Link Not Opened"
+msgstr "未打开链接"
+
+msgid "The link opens a file on this computer."
+msgstr "该链接会打开此电脑上的文件。"
+
+msgid "The link opens a file on another computer, which may connect to it."
+msgstr "该链接会打开另一台电脑上的文件，可能会连接到那台电脑。"
+
+msgid "The link opens the application registered for {scheme} links."
+msgstr "该链接会打开处理 {scheme} 链接的应用程序。"
+
+msgid "The link target is not a valid URL."
+msgstr "链接目标不是有效的 URL。"
+
+msgid "The link target contains invisible or line-breaking characters."
+msgstr "链接目标含有不可见字符或换行字符。"
+
+msgid "The web address has no host."
+msgstr "该网址缺少主机名。"
+
+msgid "Opening this file could run a program."
+msgstr "打开此文件可能会运行程序。"
+
+msgid "Links of this type can run programs."
+msgstr "此类链接可能运行程序。"
