@@ -21,6 +21,7 @@ const Palette = @import("Palette.zig");
 const Popup = @import("Popup.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
+const text_edit = @import("text_edit.zig");
 const w32 = @import("../win32.zig");
 
 /// The longest text shown, in bytes: the elided URL fits in it.
@@ -286,15 +287,17 @@ pub fn hostEnd(url: []const u8) usize {
 /// measures text), written to `buf`: all of it when it fits; else its
 /// scheme and host (`hostEnd`), "…" and as much of its end as fits (the
 /// host shows where the link goes); else, when not even the host fits,
-/// as much of its start and its end around "…" as fits. Cuts fall on
-/// code point boundaries.
+/// as much of its start and its end around "…" as fits. Cuts use the
+/// shared `text_edit` grapheme boundaries, including the authority cut.
 pub fn elide(buf: []u8, url: []const u8, max_w: f32, measurer: anytype) []const u8 {
     if (url.len <= buf.len and measurer.width(url) <= max_w) {
         @memcpy(buf[0..url.len], url);
         return buf[0..url.len];
     }
 
-    const head_end = hostEnd(url);
+    const authority_end = hostEnd(url);
+    var head_end: usize = 0;
+    while (head_end < authority_end) head_end = text_edit.nextCharUtf8(url, head_end);
     if (head_end > 0) {
         const head = url[0..head_end];
         const rest = url[head_end..];
@@ -306,7 +309,7 @@ pub fn elide(buf: []u8, url: []const u8, max_w: f32, measurer: anytype) []const 
             }
         };
         const tail: Tail = .{ .head = head, .rest = rest };
-        if (longest(buf, tail, codepoints(rest), max_w, measurer)) |text| return text;
+        if (longest(buf, tail, characterCount(rest), max_w, measurer)) |text| return text;
     }
 
     const Around = struct {
@@ -318,15 +321,15 @@ pub fn elide(buf: []u8, url: []const u8, max_w: f32, measurer: anytype) []const 
         }
     };
     const around: Around = .{ .url = url };
-    if (longest(buf, around, codepoints(url), max_w, measurer)) |text| return text;
+    if (longest(buf, around, characterCount(url), max_w, measurer)) |text| return text;
     if (buf.len < ellipsis.len) return buf[0..0];
     @memcpy(buf[0..ellipsis.len], ellipsis);
     return buf[0..ellipsis.len];
 }
 
-/// The text of `parts.build(buf, k)` for the largest `k` in 0..`n` whose
-/// text fits in `buf` and `max_w`, or null when not even `k` = 0 fits.
-/// The width grows with `k`.
+/// The largest number `k` of whole grapheme clusters in 0..`n` for which
+/// `parts.build(buf, k)` fits both `buf` and the measured `max_w`, or null
+/// when not even `k` = 0 fits. The width grows with `k`.
 fn longest(buf: []u8, parts: anytype, n: usize, max_w: f32, measurer: anytype) ?[]const u8 {
     if (!fitsWith(buf, parts, 0, max_w, measurer)) return null;
     var lo: usize = 0;
@@ -353,33 +356,23 @@ fn join(buf: []u8, head: []const u8, tail: []const u8) ?[]const u8 {
     return buf[0..len];
 }
 
-fn codepoints(text: []const u8) usize {
+fn characterCount(text: []const u8) usize {
     var n: usize = 0;
-    for (text) |c| {
-        if (c & 0xC0 != 0x80) n += 1;
-    }
+    var i: usize = 0;
+    while (i < text.len) : (n += 1) i = text_edit.nextCharUtf8(text, i);
     return n;
 }
 
-/// The byte index where the last `k` code points of `text` start.
+/// The byte index where the last `k` whole grapheme clusters start.
 fn startOfLast(text: []const u8, k: usize) usize {
-    var i = text.len;
-    var left = k;
-    while (left > 0 and i > 0) : (left -= 1) {
-        i -= 1;
-        while (i > 0 and text[i] & 0xC0 == 0x80) i -= 1;
-    }
-    return i;
+    return endOfFirst(text, characterCount(text) -| k);
 }
 
-/// The byte index where the first `k` code points of `text` end.
+/// The byte index where the first `k` whole grapheme clusters end.
 fn endOfFirst(text: []const u8, k: usize) usize {
     var i: usize = 0;
     var left = k;
-    while (left > 0 and i < text.len) : (left -= 1) {
-        i += 1;
-        while (i < text.len and text[i] & 0xC0 == 0x80) i += 1;
-    }
+    while (left > 0 and i < text.len) : (left -= 1) i = text_edit.nextCharUtf8(text, i);
     return i;
 }
 
@@ -403,12 +396,110 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     }, textStyle(t));
 }
 
-/// Measures one unit per code point.
+fn codepoints(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |c| {
+        if (c & 0xC0 != 0x80) n += 1;
+    }
+    return n;
+}
+
+/// Measures one unit per code point, independent of grapheme boundaries.
 const TestMeasurer = struct {
     pub fn width(_: TestMeasurer, text: []const u8) f32 {
         return @floatFromInt(codepoints(text));
     }
 };
+
+fn isCharacterBoundary(text: []const u8, pos: usize) bool {
+    if (pos > text.len) return false;
+    var i: usize = 0;
+    while (i < pos) i = text_edit.nextCharUtf8(text, i);
+    return i == pos;
+}
+
+fn expectWholeCharacters(url: []const u8, text: []const u8) !void {
+    const testing = std.testing;
+    try testing.expect(std.unicode.utf8ValidateSlice(text));
+    if (text.len == 0) return;
+    const cut = std.mem.indexOf(u8, text, ellipsis) orelse {
+        try testing.expectEqualStrings(url, text);
+        return;
+    };
+    const head = text[0..cut];
+    const tail = text[cut + ellipsis.len ..];
+    try testing.expect(std.mem.startsWith(u8, url, head));
+    try testing.expect(std.mem.endsWith(u8, url, tail));
+    try testing.expect(isCharacterBoundary(url, head.len));
+    try testing.expect(isCharacterBoundary(url, url.len - tail.len));
+}
+
+test "elide preserves complete combining and emoji URL tails" {
+    const testing = std.testing;
+    const host = "https://example.com";
+    for ([_][]const u8{
+        "e\u{0301}",
+        "\u{1f469}\u{200d}\u{1f4bb}",
+        "\u{1f44d}\u{1f3fd}",
+        "\u{1f1e8}\u{1f1f3}",
+        "\u{2764}\u{fe0f}",
+    }) |cluster| {
+        var url_buf: [256]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "{s}/aaa/{s}", .{ host, cluster });
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings(host ++ ellipsis, elide(&buf, url, 21, TestMeasurer{}));
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "{s}{s}{s}", .{ host, ellipsis, cluster });
+        const budget: f32 = @floatFromInt(20 + codepoints(cluster));
+        const text = elide(&buf, url, budget, TestMeasurer{});
+        try testing.expectEqualStrings(expected, text);
+        try expectWholeCharacters(url, text);
+    }
+}
+
+test "elide fallback and buffer limits keep character boundaries" {
+    const testing = std.testing;
+    for ([_][]const u8{
+        "e\u{0301}/" ++ "x" ** 32 ++ "/\u{1f469}\u{200d}\u{1f4bb}",
+        "\u{1f44d}\u{1f3fd}/" ++ "x" ** 32 ++ "/\u{1f1e8}\u{1f1f3}\u{1f1ef}\u{1f1f5}",
+        "https://example.com/aaa/e\u{0301}",
+        "https://example.com\u{200d}/aaa/e\u{0301}",
+    }) |url| {
+        var buf: [256]u8 = undefined;
+        for (0..codepoints(url) + 2) |budget| {
+            const text = elide(&buf, url, @floatFromInt(budget), TestMeasurer{});
+            try testing.expect((TestMeasurer{}).width(text) <= @as(f32, @floatFromInt(@max(1, budget))));
+            try expectWholeCharacters(url, text);
+        }
+        for (0..url.len + 1) |len| {
+            const text = elide(buf[0..len], url, 1000, TestMeasurer{});
+            try testing.expect(text.len <= len);
+            try expectWholeCharacters(url, text);
+        }
+    }
+}
+
+test "elide fits complete characters in measured DirectWrite DPI budgets" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const t = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
+    const measurer: Measurer = .{ .factory = factory, .text_style = textStyle(t) };
+    const url = "https://example.com/" ++ "segment/" ** 32 ++ "e\u{0301}/\u{1f469}\u{200d}\u{1f4bb}/\u{1f44d}\u{1f3fd}/\u{1f1e8}\u{1f1f3}/troubleshooting.html";
+    for ([_]f32{ 1, 1.25, 1.5, 2 }) |scale| {
+        const cap: i32 = 519;
+        const budget = textBudget(cap, scale);
+        var buf: [max_text_len]u8 = undefined;
+        const text = elide(&buf, url, budget, measurer);
+        const width = measurer.width(text);
+        try testing.expect(width > 0 and width <= budget);
+        try testing.expect(bubbleWidth(width, cap, scale) <= cap);
+        try testing.expect(text.len <= buf.len);
+        try expectWholeCharacters(url, text);
+        try testing.expect(std.mem.startsWith(u8, text, "https://example.com"));
+        try testing.expect(std.mem.endsWith(u8, text, ".html"));
+    }
+}
 
 test "the bubble reserves rounding room within its physical width cap" {
     const testing = std.testing;
@@ -461,14 +552,14 @@ test "elide falls back to both ends when the host does not fit" {
     try testing.expectEqualStrings("\u{2026}", elide(&buf, url, 0, TestMeasurer{}));
 }
 
-test "elide cuts on code point boundaries" {
+test "elide cuts on grapheme boundaries within measured code point widths" {
     const testing = std.testing;
     var buf: [128]u8 = undefined;
     const url = "https://例子.测试/路径/很长的文件名.html";
     for (0..40) |w| {
         const text = elide(&buf, url, @floatFromInt(w), TestMeasurer{});
-        try testing.expect(std.unicode.utf8ValidateSlice(text));
         try testing.expect(codepoints(text) <= @max(w, 1));
+        try expectWholeCharacters(url, text);
     }
     try testing.expectEqualStrings("https://例子.测试\u{2026}名.html", elide(&buf, url, 20, TestMeasurer{}));
 }
