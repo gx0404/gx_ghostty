@@ -53,6 +53,7 @@ const wstr = @import("wstr.zig");
 const Scrim = @import("settings/Scrim.zig");
 const draw = @import("settings/draw.zig");
 const fuzzy = @import("settings/fuzzy.zig");
+const hit_test = @import("settings/hit_test.zig");
 const swatch = @import("settings/swatch.zig");
 const system = @import("settings/system.zig");
 
@@ -169,6 +170,9 @@ status_len: usize = 0,
 /// Hit-test rectangles of the last paint, later ones on top.
 hits: [max_hits]Hit = undefined,
 hit_count: usize = 0,
+/// While the body paints: the body, which the hit rectangles of its rows
+/// are cut to (`hit_test.clip`).
+hit_clip: ?d2d.Rect = null,
 /// Where the last paint put the list of the section, for the wheel.
 list_area: ?d2d.Rect = null,
 
@@ -1289,7 +1293,7 @@ fn reloadFromDisk(self: *Settings) bool {
         return false;
     };
     defer config.deinit();
-    self.app.core_app.updateConfig(self.app, &config) catch |err| {
+    self.app.applyConfig(&config) catch |err| {
         log.warn("cannot apply the configuration err={}", .{err});
         self.setStatus(.err, msg.reload_failed, .{ .reason = @errorName(err) });
         return false;
@@ -1325,7 +1329,7 @@ fn reloadWith(self: *Settings, theme: ?[]const u8) bool {
         return false;
     };
     defer config.deinit();
-    self.app.core_app.updateConfig(self.app, &config) catch |err| {
+    self.app.applyConfig(&config) catch |err| {
         log.warn("cannot apply the configuration err={}", .{err});
         self.setStatus(.err, msg.preview_failed, .{ .reason = @errorName(err) });
         return false;
@@ -1473,8 +1477,9 @@ const Hit = struct {
 };
 
 fn addHit(self: *Settings, rect: d2d.Rect, target: Target) void {
+    const visible = hit_test.clip(rect, self.hit_clip) orelse return;
     if (self.hit_count >= self.hits.len) return;
-    self.hits[self.hit_count] = .{ .rect = rect, .target = target };
+    self.hits[self.hit_count] = .{ .rect = visible, .target = target };
     self.hit_count += 1;
 }
 
@@ -1724,6 +1729,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     const self: *Settings = @ptrCast(@alignCast(ctx));
     _ = self.scratch.reset(.retain_capacity);
     self.hit_count = 0;
+    self.hit_clip = null;
     self.list_area = null;
     const t = self.tokens();
     const size = popup.sizeDip();
@@ -1897,6 +1903,8 @@ fn paintBody(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, body: d2d.Re
 
     canvas.pushClip(body);
     defer canvas.popClip();
+    self.hit_clip = body;
+    defer self.hit_clip = null;
     var y = body.y + top_pad - self.body_scroll;
     for (rows, 0..) |row, i| {
         const height = layout.heights[i];
@@ -2119,7 +2127,7 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     const box: d2d.Rect = .{ .x = rect.x, .y = rect.y + field_height + 8, .w = rect.w, .h = @max(0, rect.h - field_height - 8) };
     canvas.fillRoundedRect(box, draw.radius, t.surface);
     canvas.strokeRoundedRect(box, draw.radius, if (focused) style.mix(t.border, t.accent, 0.5) else t.border, 1);
-    const visible_box = intersect(box, body);
+    const visible_box = hit_test.intersect(box, body);
     self.list_area = visible_box;
 
     const matches = list.matches.items;
@@ -2186,7 +2194,7 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
             .color = t.text,
             .weight = if (saved == name_index) .semibold else .normal,
         });
-        self.addHit(intersect(item_rect, body), target);
+        self.addHit(item_rect, target);
     }
 
     if (scrollbar_w > 0) {
@@ -2204,12 +2212,4 @@ fn fontIndex(self: *Settings, family: []const u8) ?u32 {
         if (std.mem.eql(u8, name, family)) return @intCast(i);
     }
     return null;
-}
-
-fn intersect(a: d2d.Rect, b: d2d.Rect) d2d.Rect {
-    const x0 = @max(a.x, b.x);
-    const y0 = @max(a.y, b.y);
-    const x1 = @min(a.x + a.w, b.x + b.w);
-    const y1 = @min(a.y + a.h, b.y + b.h);
-    return .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
 }

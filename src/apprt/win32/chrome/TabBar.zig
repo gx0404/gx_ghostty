@@ -796,7 +796,7 @@ pub fn onRightButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool
     const hwnd = win.hwnd orelse return false;
     const g = self.geometry(lay);
     const part = self.partAt(&g, lay.scale, x, y);
-    const clicked_tab: ?usize = switch (part) {
+    const clicked_tab: usize = switch (part) {
         .none => return false,
         .new_tab, .profiles => {
             self.openProfileMenu();
@@ -810,8 +810,19 @@ pub fn onRightButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool
     var pt = w32.POINT{ .x = x, .y = y };
     _ = w32.ClientToScreen(hwnd, &pt);
 
+    // Tabs and splits can close or move while the menu runs its modal
+    // loop: the pick applies to the tab found again by any of its
+    // terminals.
+    var ids: [64]u64 = undefined;
+    var count: usize = 0;
+    var it = win.tab_trees[clicked_tab].iterator();
+    while (it.next()) |entry| {
+        if (count == ids.len) break;
+        ids[count] = entry.view.core_surface.id;
+        count += 1;
+    }
     const command = Menu.showTabContextMenu(win, pt, clicked_tab) orelse return true;
-    Menu.performTabCommand(win, clicked_tab, command);
+    Menu.performTabCommand(win, ids[0..count], command);
     return true;
 }
 
@@ -1097,8 +1108,8 @@ pub fn startWindowRename(self: *TabBar) void {
     _ = w32.SendMessageW(edit, 0x00B1, 0, -1); // EM_SETSEL(0, -1)
 }
 
-/// Apply the edit text as the new tab (or window) title and destroy the
-/// edit control.
+/// Apply the edit text as the title override of the tab (or window) and
+/// destroy the edit control. An empty text removes the override.
 pub fn finishRename(self: *TabBar) void {
     const edit = self.rename_edit orelse return;
     const tab_idx = self.rename_tab;
@@ -1106,11 +1117,11 @@ pub fn finishRename(self: *TabBar) void {
 
     // Read the edit control text
     var wbuf: [256]u16 = undefined;
-    const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, 256));
+    const wlen: usize = @intCast(@max(0, w32.GetWindowTextW(edit, &wbuf, 256)));
     if (self.rename_window) {
         win.setWindowTitleOverride(wbuf[0..wlen]);
-    } else if (wlen > 0) {
-        win.setTabTitle(tab_idx, wbuf[0..wlen]);
+    } else {
+        win.setTabTitleOverride(tab_idx, .fromUtf16(wbuf[0..wlen]));
     }
 
     // Clear our state BEFORE DestroyWindow: the Edit synchronously emits

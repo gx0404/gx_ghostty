@@ -1,7 +1,10 @@
 // Ported from shiweis/ghostty-windows@119b9270c (MIT). Copyright (c) Shiwei Song and Ghostty contributors.
 //! Themed scrollbar for the Win32 apprt: a layered popup owned by the
 //! surface window that follows the system scrollbar mode ("Always show
-//! scrollbars" in the accessibility settings).
+//! scrollbars" in the accessibility settings). Being a top-level window,
+//! the popup receives the WM_SETTINGCHANGE broadcast that announces a mode
+//! change (the terminal's child window does not). `scrollbar = never`
+//! turns it off (`setEnabled`).
 //!
 //! The thumb is a thin rounded bar in the terminal's foreground color,
 //! drawn translucent so it blends with any theme: 3 DIPs wide at rest,
@@ -156,6 +159,17 @@ pub fn readMode() Mode {
     return parseMode(readDynamicScrollbars());
 }
 
+/// The pixels a scrollbar `width` pixels wide takes from the grid: its
+/// column when it is enabled and always visible; an overlay scrollbar
+/// floats over the grid, a disabled one is hidden.
+pub fn reservedWidth(enabled: bool, mode: Mode, width: i32) i32 {
+    if (!enabled) return 0;
+    return switch (mode) {
+        .always_visible => width,
+        .overlay => 0,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Scrollbar window class + struct
 // ---------------------------------------------------------------------------
@@ -166,6 +180,9 @@ pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyScr
 /// returns the current visibility state as an LRESULT.
 /// 0=hidden, 1=fading_in, 2=shown, 3=fading_out.
 pub const WM_GHOSTTY_SCROLLBAR_QUERY: u32 = w32.WM_USER + 1;
+
+const WM_CAPTURECHANGED: u32 = 0x0215;
+const MK_LBUTTON: usize = 0x0001;
 
 pub const Visibility = enum(isize) {
     hidden = 0,
@@ -187,6 +204,8 @@ pub const Scrollbar = struct {
 
     /// Current mode; re-read on WM_SETTINGCHANGE.
     mode: Mode = .overlay,
+    /// False with `scrollbar = never`: hidden, reserving no width.
+    enabled: bool = true,
 
     /// Cached theme colors. Updated via setTheme.
     bg: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 },
@@ -213,6 +232,7 @@ pub const Scrollbar = struct {
         alloc: std.mem.Allocator,
         owner: w32.HWND,
         surface: *Surface,
+        enabled: bool,
     ) !*Scrollbar {
         try registerClassOnce(surface.app.hinstance);
 
@@ -225,6 +245,7 @@ pub const Scrollbar = struct {
             .owner = owner,
             .hwnd = undefined,
             .scale = surface.scale,
+            .enabled = enabled,
         };
 
         // WS_EX_LAYERED — DWM-composited above OpenGL.
@@ -282,25 +303,11 @@ pub const Scrollbar = struct {
             self.state.len != state.len;
         self.state = state;
         self.first_update = false;
+        if (!self.enabled) return;
 
         if (was_first) {
-            switch (self.mode) {
-                .overlay => {
-                    // Initial state — silent. Start hidden + transparent.
-                    // The popup is already painted with .zero placeholder (alpha=0 = invisible).
-                    self.visibility = .hidden;
-                    self.fade = 0;
-                    self.setTransparent();
-                    self.repaint(); // Re-paint with new alpha=0 + transparent style.
-                },
-                .always_visible => {
-                    // Always-visible: show immediately at full opacity.
-                    self.visibility = .shown;
-                    self.fade = 255;
-                    self.clearTransparent();
-                    self.repaint();
-                },
-            }
+            // Initial state — silent.
+            self.resetVisibility();
             return;
         }
 
@@ -321,8 +328,9 @@ pub const Scrollbar = struct {
     }
 
     /// Reposition and resize the popup to stay glued to the surface.
-    /// Returns the new scrollbar width.
+    /// Returns the width it takes from the grid (`reservedWidth`).
     pub fn repositionAndResize(self: *Scrollbar) i32 {
+        if (!self.enabled) return 0;
         var rect: w32.RECT = undefined;
         if (w32.GetClientRect(self.owner, &rect) == 0) return 0;
 
@@ -348,16 +356,47 @@ pub const Scrollbar = struct {
 
         self.repaint();
 
-        // Return the width that the caller should subtract from the grid area.
-        // Always-visible steals a column of grid space; overlay floats on top.
-        return switch (self.mode) {
-            .always_visible => width,
-            .overlay => 0,
-        };
+        return reservedWidth(self.enabled, self.mode, width);
+    }
+
+    /// The width of the grid of a surface `surface_width` pixels wide whose
+    /// scrollbar reserves `reserved` pixels (`repositionAndResize`); a
+    /// surface too narrow to spare them keeps its width.
+    pub fn gridWidth(surface_width: u32, reserved: i32) u32 {
+        if (reserved <= 0) return surface_width;
+        const sub: u32 = @intCast(reserved);
+        return if (surface_width > sub) surface_width - sub else surface_width;
+    }
+
+    /// The width the scrollbar takes from the grid now.
+    pub fn currentReservedWidth(self: *const Scrollbar) i32 {
+        return reservedWidth(self.enabled, self.mode, self.currentWidth());
+    }
+
+    /// Turn the scrollbar on or off (`scrollbar = never`): hidden and
+    /// reserving no width while off. Returns whether the width it takes
+    /// from the grid changed, so the caller must lay the grid out again.
+    pub fn setEnabled(self: *Scrollbar, enabled: bool) bool {
+        if (enabled == self.enabled) return false;
+        const before = self.currentReservedWidth();
+        self.enabled = enabled;
+        if (enabled) {
+            self.resetVisibility();
+            _ = self.repositionAndResize();
+        } else {
+            self.endDrag();
+            _ = w32.KillTimer(self.hwnd, FADE_TIMER_ID);
+            _ = w32.KillTimer(self.hwnd, IDLE_TIMER_ID);
+            self.hover = false;
+            self.grow = 0;
+            _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
+        }
+        return self.currentReservedWidth() != before;
     }
 
     /// Show or hide the popup when the owner surface is shown/hidden.
     pub fn setOwnerVisible(self: *Scrollbar, visible: bool) void {
+        if (!self.enabled) return;
         _ = w32.ShowWindow(self.hwnd, if (visible) w32.SW_SHOWNOACTIVATE else w32.SW_HIDE);
     }
 
@@ -530,8 +569,9 @@ pub const Scrollbar = struct {
         );
     }
 
-    fn onMouseMove(self: *Scrollbar, x: i32, y: i32) void {
-        _ = x;
+    fn onMouseMove(self: *Scrollbar, y: i32, left_down: bool) void {
+        // The button went up where the scrollbar did not see it.
+        if (self.dragging and !left_down) self.endDrag();
         if (self.visibility == .hidden or self.visibility == .fading_out) {
             self.startFadeIn();
         }
@@ -546,6 +586,7 @@ pub const Scrollbar = struct {
                 self.state.total,
                 self.state.len,
             )) |off| {
+                if (off == self.state.offset) return;
                 self.state.offset = off;
                 self.surface.scrollToOffset(off);
                 self.repaint();
@@ -595,40 +636,51 @@ pub const Scrollbar = struct {
     }
 
     fn onLeftUp(self: *Scrollbar) void {
-        if (self.dragging) {
-            _ = w32.ReleaseCapture();
-            self.dragging = false;
-            self.animateGrow();
-            self.repaint();
-        }
+        self.endDrag();
     }
 
-    /// Called on WM_SETTINGCHANGE. Returns true if a mode change
-    /// requires the terminal grid to be re-flowed.
+    /// End a drag: on button release, and when the capture went elsewhere
+    /// (WM_CAPTURECHANGED) or the button is found released.
+    fn endDrag(self: *Scrollbar) void {
+        if (!self.dragging) return;
+        // First, so the WM_CAPTURECHANGED of the release finds no drag.
+        self.dragging = false;
+        if (w32.GetCapture() == self.hwnd) _ = w32.ReleaseCapture();
+        self.animateGrow();
+        self.restartIdleTimer();
+        self.repaint();
+    }
+
+    /// Called on WM_SETTINGCHANGE: follow the system scrollbar mode.
+    /// Returns true when the width the scrollbar takes from the grid
+    /// changed, so the grid must be laid out again (`Surface.refitGrid`).
     pub fn onSettingsChange(self: *Scrollbar) bool {
         const new_mode = readMode();
         if (new_mode == self.mode) return false;
 
+        const before = self.currentReservedWidth();
         self.mode = new_mode;
+        if (self.enabled) self.resetVisibility();
+        return self.currentReservedWidth() != before;
+    }
 
-        // Apply the initial state for the new mode.
-        switch (new_mode) {
+    /// Start over in the resting state of the mode: an overlay scrollbar
+    /// hidden and transparent to the mouse until the terminal scrolls, an
+    /// always-visible one shown at full opacity.
+    fn resetVisibility(self: *Scrollbar) void {
+        switch (self.mode) {
             .overlay => {
                 self.visibility = .hidden;
                 self.fade = 0;
                 self.setTransparent();
-                self.repaint();
             },
             .always_visible => {
                 self.visibility = .shown;
                 self.fade = 255;
                 self.clearTransparent();
-                self.repaint();
             },
         }
-
-        // Mode changed — caller must reflow the grid (trigger WM_SIZE).
-        return true;
+        self.repaint();
     }
 
     /// Update the DPI scale factor and resize to it.
@@ -685,7 +737,9 @@ pub const Scrollbar = struct {
 
     fn onIdleTick(self: *Scrollbar) void {
         _ = w32.KillTimer(self.hwnd, IDLE_TIMER_ID);
-        if (self.dragging or self.hover) return;
+        // An always-visible scrollbar never fades: faded out, it would let
+        // the mouse through.
+        if (self.mode != .overlay or self.dragging or self.hover) return;
         self.startFadeOut();
     }
 
@@ -824,9 +878,8 @@ fn scrollbarWndProc(
         },
 
         w32.WM_MOUSEMOVE => {
-            const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) & 0xFFFF))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @truncate((@as(usize, @bitCast(lparam)) >> 16) & 0xFFFF))));
-            self.onMouseMove(x, y);
+            self.onMouseMove(y, wparam & MK_LBUTTON != 0);
             return 0;
         },
 
@@ -844,6 +897,16 @@ fn scrollbarWndProc(
         w32.WM_LBUTTONUP => {
             self.onLeftUp();
             return 0;
+        },
+
+        WM_CAPTURECHANGED => {
+            self.endDrag();
+            return 0;
+        },
+
+        w32.WM_SETTINGCHANGE => {
+            if (self.onSettingsChange()) self.surface.refitGrid();
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
         WM_GHOSTTY_SCROLLBAR_QUERY => return @intFromEnum(self.visibility),
@@ -992,4 +1055,19 @@ test "Capsule coverage is full inside and fades at the edge" {
 test "parseMode: non-{0,1} value treated as overlay" {
     try testing.expectEqual(Mode.overlay, parseMode(2));
     try testing.expectEqual(Mode.overlay, parseMode(99));
+}
+
+test "reservedWidth: only an enabled always-visible scrollbar takes a column" {
+    try testing.expectEqual(@as(i32, 14), reservedWidth(true, .always_visible, 14));
+    try testing.expectEqual(@as(i32, 0), reservedWidth(true, .overlay, 12));
+    // scrollbar = never
+    try testing.expectEqual(@as(i32, 0), reservedWidth(false, .always_visible, 14));
+    try testing.expectEqual(@as(i32, 0), reservedWidth(false, .overlay, 12));
+}
+
+test "gridWidth: subtracts the reserved width when the surface can spare it" {
+    try testing.expectEqual(@as(u32, 800), Scrollbar.gridWidth(800, 0));
+    try testing.expectEqual(@as(u32, 779), Scrollbar.gridWidth(800, 21));
+    try testing.expectEqual(@as(u32, 21), Scrollbar.gridWidth(21, 21));
+    try testing.expectEqual(@as(u32, 10), Scrollbar.gridWidth(10, 21));
 }

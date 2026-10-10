@@ -2,8 +2,8 @@
 //! shortcut sheet: text ("Ctrl+Shift+T") for menu hints, keycap chips for
 //! the custom-drawn popups (`Keycaps`, `drawSequence`, key sequences shown
 //! as `A → B`), the trigger that runs an action (`find`), the hint that
-//! still works when another program takes a key (`Hints`) and the action
-//! a key press is bound to (`actionForKey`).
+//! still works when another program takes a key (`Hints`) and the binding
+//! a key press performs (`actionForKey`, `isBound`).
 const std = @import("std");
 const input = @import("../../../input.zig");
 const shortcut_conflicts = @import("../shortcut_conflicts.zig");
@@ -385,10 +385,29 @@ const MAPVK_VK_TO_VSC_EX: u32 = 4;
 extern "user32" fn MapVirtualKeyW(code: u32, map_type: u32) callconv(.winapi) u32;
 
 /// The action a single-key binding of `set` performs for the virtual key
-/// `vk` with `mods`, matched like the core matches key events: by the
-/// physical key, then by the unshifted character of the key. Leader keys
-/// and chained bindings are not considered.
+/// `vk` with `mods` (`bindingForKey`). Leader keys and chained bindings
+/// have none.
 pub fn actionForKey(set: *const Binding.Set, vk: u16, mods: input.Mods) ?Binding.Action {
+    return switch (bindingForKey(set, vk, mods) orelse return null) {
+        .leaf => |leaf| leaf.action,
+        .leader, .leaf_chained => null,
+    };
+}
+
+/// Whether the virtual key `vk` with `mods` performs a binding of `set`
+/// (`bindingForKey`), a single action or a chain of them. A leader key
+/// only starts a sequence, so it does not count.
+pub fn isBound(set: *const Binding.Set, vk: u16, mods: input.Mods) bool {
+    return switch (bindingForKey(set, vk, mods) orelse return false) {
+        .leaf, .leaf_chained => true,
+        .leader => false,
+    };
+}
+
+/// The binding of `set` for the virtual key `vk` with `mods`, matched like
+/// the core matches key events (`Binding.Set.getEvent`): by the physical
+/// key, then by the unshifted character of the key.
+fn bindingForKey(set: *const Binding.Set, vk: u16, mods: input.Mods) ?Binding.Set.Value {
     var t: Trigger = .{ .mods = mods.binding() };
 
     const scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
@@ -396,7 +415,7 @@ pub fn actionForKey(set: *const Binding.Set, vk: u16, mods: input.Mods) ?Binding
         for (input.keycodes.entries) |entry| {
             if (entry.native != scan or entry.key == .unidentified) continue;
             t.key = .{ .physical = entry.key };
-            if (leafAction(set, t)) |action| return action;
+            if (set.get(t)) |binding| return binding.value_ptr.*;
             break;
         }
     }
@@ -405,17 +424,9 @@ pub fn actionForKey(set: *const Binding.Set, vk: u16, mods: input.Mods) ?Binding
     if (char >= 0x20) {
         const cp: u21 = @intCast(if (char >= 'A' and char <= 'Z') char + 32 else char);
         t.key = .{ .unicode = cp };
-        if (leafAction(set, t)) |action| return action;
+        if (set.get(t)) |binding| return binding.value_ptr.*;
     }
     return null;
-}
-
-fn leafAction(set: *const Binding.Set, t: Trigger) ?Binding.Action {
-    const entry = set.get(t) orelse return null;
-    return switch (entry.value_ptr.*) {
-        .leaf => |leaf| leaf.action,
-        .leader, .leaf_chained => null,
-    };
 }
 
 test "format modifiers and keys" {
@@ -485,6 +496,30 @@ test "Hints leave out blocked triggers" {
     const open: Hints = .{ .set = &set };
     try testing.expectEqualStrings("Ctrl+Shift+O", open.text(.{ .new_split = .right }, &buf).?);
     try testing.expect(open.lookup(.start_search) != null);
+}
+
+test "isBound counts single actions and chains, not leader keys" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // Function keys map to the same physical key with every layout.
+    const w32 = @import("../win32.zig");
+    var set: input.Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "ctrl+f5=new_tab");
+    try set.parseAndPut(alloc, "ctrl+f6=new_tab");
+    try set.parseAndPut(alloc, "chain=new_window");
+    try set.parseAndPut(alloc, "ctrl+f7>a=new_tab");
+
+    const ctrl: input.Mods = .{ .ctrl = true };
+    try testing.expect(isBound(&set, w32.VK_F5, ctrl));
+    try testing.expect(actionForKey(&set, w32.VK_F5, ctrl) != null);
+    // A chain performs its actions but has no single one.
+    try testing.expect(isBound(&set, w32.VK_F6, ctrl));
+    try testing.expect(actionForKey(&set, w32.VK_F6, ctrl) == null);
+    // A leader key waits for the next key.
+    try testing.expect(!isBound(&set, w32.VK_F7, ctrl));
+    try testing.expect(!isBound(&set, w32.VK_F8, ctrl));
+    try testing.expect(!isBound(&set, w32.VK_F5, .{}));
 }
 
 test "format cuts off at the buffer end" {

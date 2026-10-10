@@ -277,12 +277,26 @@ pub const Frecency = struct {
     /// The frecency of `key`: higher for frequent and recent picks, 0 when
     /// it was never picked.
     pub fn get(self: *const Frecency, key: []const u8) u32 {
-        if (key.len == 0) return 0;
+        const entry = self.find(key) orelse return 0;
+        return self.weight(entry);
+    }
+
+    /// The place of `key` in a list of recent picks, higher first: by
+    /// frecency, the latest pick first among equal ones (picks one after
+    /// another weigh the same). 0 when it was never picked.
+    pub fn rank(self: *const Frecency, key: []const u8) u64 {
+        const entry = self.find(key) orelse return 0;
+        const age = self.clock -% entry.last;
+        return (@as(u64, self.weight(entry)) << 32) | (std.math.maxInt(u32) - age);
+    }
+
+    fn find(self: *const Frecency, key: []const u8) ?Entry {
+        if (key.len == 0) return null;
         const hash = hashOf(key);
         for (self.entries[0..self.len]) |entry| {
-            if (entry.hash == hash) return self.weight(entry);
+            if (entry.hash == hash) return entry;
         }
-        return 0;
+        return null;
     }
 
     fn weight(self: *const Frecency, entry: Entry) u32 {
@@ -367,6 +381,34 @@ test "Frecency ranks frequent and recent picks" {
     try testing.expect(f.get("copy_to_clipboard:mixed") > f.get("new_tab"));
     f.record("");
     try testing.expectEqual(@as(u32, 0), f.get(""));
+}
+
+test "Frecency.rank puts the latest of equal picks first" {
+    const testing = std.testing;
+    var f: Frecency = .{};
+    try testing.expectEqual(@as(u64, 0), f.rank("theme:A"));
+    f.record("theme:A");
+    f.record("theme:B");
+    // Picked one after the other, both weigh the same.
+    try testing.expectEqual(f.get("theme:A"), f.get("theme:B"));
+    try testing.expect(f.rank("theme:B") > f.rank("theme:A"));
+    f.record("theme:A");
+    try testing.expect(f.rank("theme:A") > f.rank("theme:B"));
+    // Frecency comes before recency.
+    for (0..3) |_| f.record("new_tab");
+    f.record("theme:B");
+    try testing.expect(f.get("new_tab") > f.get("theme:B"));
+    try testing.expect(f.rank("new_tab") > f.rank("theme:B"));
+    try testing.expectEqual(@as(u64, 0), f.rank(""));
+}
+
+test "Frecency.rank survives the pick counter wrapping around" {
+    const testing = std.testing;
+    var f: Frecency = .{ .clock = std.math.maxInt(u32) - 1 };
+    f.record("theme:A");
+    f.record("theme:B");
+    try testing.expectEqual(@as(u32, 0), f.clock);
+    try testing.expect(f.rank("theme:B") > f.rank("theme:A"));
 }
 
 test "Frecency replaces the weakest key when full" {

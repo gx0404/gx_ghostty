@@ -19,6 +19,8 @@ const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const tabs = @import("tabs.zig");
+const open_url = @import("open_url.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
@@ -26,6 +28,7 @@ const Keybinds = @import("ui/Keybinds.zig");
 const Settings = @import("ui/Settings.zig");
 const d2d = @import("ui/d2d.zig");
 const trigger = @import("ui/trigger.zig");
+const wstr = @import("ui/wstr.zig");
 const key_conflicts = @import("shortcut_conflicts.zig");
 const gx = @import("../../gx/main.zig");
 const i18n = gx.i18n;
@@ -105,6 +108,13 @@ quit_timer_state: enum { off, active, expired } = .off,
 
 /// Whether quit has been requested.
 quit_requested: bool = false,
+
+/// Whether `run` runs the message loop. `main` starts the quit timer
+/// before `run`, while the app has no terminal yet; `startQuitTimer`
+/// ignores that call, since `run` opens the first window right away and a
+/// WM_QUIT posted before the loop would end the first modal loop instead
+/// (the dialog about a command that failed to start).
+running: bool = false,
 
 /// The quick terminal instance (if active).
 quick_terminal: ?*QuickTerminal = null,
@@ -295,6 +305,9 @@ pub fn init(
 }
 
 pub fn run(self: *App) !void {
+    self.running = true;
+    defer self.running = false;
+
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
     const window = try alloc.create(Window);
@@ -311,9 +324,10 @@ pub fn run(self: *App) !void {
         if (result == 0) {
             // WM_QUIT received. Check if it's still wanted — stopQuitTimer()
             // resets quit_requested if a new surface opened after
-            // PostQuitMessage was called (e.g. during startup).
-            // GetMessageW consumes the quit flag, so the next call will
-            // block normally for real messages.
+            // PostQuitMessage was called; the modal loops of the dialogs
+            // and menus drop such a WM_QUIT likewise
+            // (`Popup.modalQuitCode`). GetMessageW consumes the quit flag,
+            // so the next call will block normally for real messages.
             if (!self.quit_requested) continue;
             break;
         }
@@ -406,8 +420,9 @@ fn findEditOwnerIn(win: *Window, hwnd: w32.HWND) ?EditOwner {
 
 /// Handle a WM_KEYDOWN for one of the chrome/popup Edit controls before
 /// it is translated: Enter/Escape/arrows drive the rename, palette and
-/// search popups, and Ctrl/Ctrl+Shift keybindings bubble up to the
-/// surface. Returns true when the message was consumed.
+/// search popups, then `editKeyRoute` decides between the edit control,
+/// the surface's keybindings and nothing. Returns true when the message
+/// was consumed.
 fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
     const hwnd = msg.hwnd orelse return false;
     const owner = self.findEditOwner(hwnd) orelse return false;
@@ -426,15 +441,20 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
         .palette => |surface| if (surface.palette.handleKey(vk)) return true,
     }
 
-    // Bubble global keybindings from popup edit controls (tab rename,
-    // command palette, search) up to the surface so that e.g.
-    // `Ctrl+Shift+P` while renaming actually toggles the palette instead
-    // of being eaten by the Edit. Excludes Ctrl-only A/C/V/X/Y/Z so
-    // standard text-edit shortcuts keep working inside the popup.
-    const ctrl_held = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
-    const shift_held = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
-    if (!(ctrl_held and (shift_held or !isEditShortcutVk(vk)))) return false;
+    const mods: input.Mods = .{
+        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
+        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
+        .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
+    };
+    const bound = mods.ctrl and trigger.isBound(&self.config.keybind.set, vk, mods);
+    switch (editKeyRoute(vk, mods, bound)) {
+        .edit => return false,
+        .swallow => return true,
+        .bubble => {},
+    }
 
+    // A keybinding: e.g. `Ctrl+Shift+P` while renaming toggles the palette
+    // instead of being eaten by the edit control.
     const target: ?*Surface = switch (owner) {
         // Commit (not cancel) — matches standard Win32 inline rename
         // convention (Explorer, Edge): any action that takes focus away
@@ -447,14 +467,77 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
             surface.palette.setActive(false);
             break :target surface;
         },
+        // The search goes on: the bar stays open, the terminal gets the
+        // focus and the key.
         .search => |surface| target: {
-            surface.search_bar.setActive(false, &[_:0]u8{});
+            if (surface.hwnd) |h| _ = w32.SetFocus(h);
             break :target surface;
         },
     };
     const surface = target orelse return false;
     surface.handleKeyEvent(msg.wParam, msg.lParam, .press);
     return true;
+}
+
+/// Where a key typed into a popup edit control goes after the popup's own
+/// keys (`routeEditKey`).
+const EditKeyRoute = enum {
+    /// The edit control or popup handles it, or ignores it.
+    edit,
+    /// The surface performs the keybinding it is bound to.
+    bubble,
+    /// Nothing: the key never reaches the shell.
+    swallow,
+};
+
+/// Route the key `vk` pressed with `mods` in a popup edit control (tab
+/// rename, command palette, find bar); `bound` tells whether a keybinding
+/// takes it (`trigger.isBound`). Keys without Ctrl and editing keys
+/// stay with the edit control (moving, selecting and deleting, the
+/// clipboard, undo and redo, also with Ctrl or Ctrl+Shift); bound Ctrl
+/// chords go to the surface's keybindings; other Ctrl chords do nothing,
+/// except Ctrl+Alt, which is AltGr typing a character.
+fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
+    if (!mods.ctrl) return .edit;
+    switch (vk) {
+        w32.VK_LEFT,
+        w32.VK_RIGHT,
+        w32.VK_UP,
+        w32.VK_DOWN,
+        w32.VK_HOME,
+        w32.VK_END,
+        w32.VK_BACK,
+        w32.VK_DELETE,
+        w32.VK_INSERT,
+        'A',
+        'C',
+        'V',
+        'X',
+        'Y',
+        'Z',
+        // The input method's and injected keys, and modifiers on their own.
+        w32.VK_PROCESSKEY,
+        w32.VK_PACKET,
+        w32.VK_SHIFT,
+        w32.VK_CONTROL,
+        w32.VK_MENU,
+        w32.VK_LSHIFT,
+        w32.VK_RSHIFT,
+        w32.VK_LCONTROL,
+        w32.VK_RCONTROL,
+        w32.VK_LMENU,
+        w32.VK_RMENU,
+        w32.VK_LWIN,
+        w32.VK_RWIN,
+        w32.VK_CAPITAL,
+        w32.VK_NUMLOCK,
+        w32.VK_SCROLL,
+        => return .edit,
+        else => {},
+    }
+    if (bound) return .bubble;
+    if (mods.alt) return .edit;
+    return .swallow;
 }
 
 pub fn terminate(self: *App) void {
@@ -597,6 +680,9 @@ pub fn performAction(
             };
             _ = window.addTab() catch |err| {
                 log.err("failed to add tab to new window err={}", .{err});
+                // The window never showed: the message loop destroys it,
+                // which also drops it from `windows`.
+                window.requestClose();
                 return true;
             };
             return true;
@@ -726,22 +812,9 @@ pub fn performAction(
         },
 
         .open_url => {
-            // Open a URL using ShellExecuteW — the native Windows way.
-            // internal_os.open() uses std.process.Child which can hit
-            // unreachable on Windows, so we use ShellExecuteW directly.
-            var wbuf: [2048]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, value.url) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
-            }
+            // The core asks with the terminal locked when a link is
+            // clicked; the shell opens the URL on a thread of its own.
+            open_url.open(value.url);
             return true;
         },
 
@@ -771,7 +844,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.search_bar.setActive(false, "");
+                    core_surface.rt_surface.search_bar.onSearchEnded();
                 },
             }
             return true;
@@ -831,27 +904,23 @@ pub fn performAction(
             return true;
         },
 
-        .goto_tab => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    _ = core_surface.rt_surface.parent_window.selectTab(value);
-                },
-            }
-            return true;
+        // The tab, split and window navigation actions return whether they
+        // did something: the core passes the keys of `performable:`
+        // bindings that did nothing on to the terminal.
+        .goto_tab => return switch (target) {
+            .app => false,
+            .surface => |core_surface| core_surface.rt_surface.parent_window.selectTab(value),
         },
 
-        .set_tab_title => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.onTabTitleChanged(
-                        core_surface.rt_surface,
-                        value.title,
-                    );
-                },
-            }
-            return true;
+        .set_tab_title => return switch (target) {
+            .app => false,
+            .surface => |core_surface| title: {
+                const surface = core_surface.rt_surface;
+                const window = surface.parent_window;
+                const tab = window.findTabIndex(surface) orelse break :title false;
+                window.setTabTitleOverride(tab, .fromUtf8(value.title));
+                break :title true;
+            },
         },
 
         .set_window_title => {
@@ -864,14 +933,10 @@ pub fn performAction(
             return true;
         },
 
-        .move_tab => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.moveTab(value.amount);
-                },
-            }
-            return true;
+        .move_tab => return switch (target) {
+            .app => false,
+            .surface => |core_surface| core_surface.rt_surface.parent_window
+                .moveTab(core_surface.rt_surface, value.amount),
         },
 
         .move_tab_to_new_window => {
@@ -912,27 +977,29 @@ pub fn performAction(
                     return true;
                 };
                 defer new_config.deinit();
-                if (self.opaque_restore != null) self.holdOpaque(&new_config);
-                self.core_app.updateConfig(self, &new_config) catch |err| {
+                self.applyConfig(&new_config) catch |err| {
                     log.err("config update error: {}", .{err});
                 };
             }
             return true;
         },
 
-        .show_child_exited => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    if (value.exit_code != 0) {
-                        Dialogs.showChildExited(
-                            core_surface.rt_surface.parent_window.hwnd,
-                            value.exit_code,
-                        );
-                    }
+        // A command that ran is left to the core, which prints "Process
+        // exited" in the terminal (and closes it unless
+        // `wait-after-command`). A command that failed to start is told
+        // from the message loop: no modal loop inside a core callback.
+        .show_child_exited => return switch (target) {
+            .app => false,
+            .surface => |core_surface| switch (childExitKind(
+                value,
+                core_surface.config.abnormal_command_exit_runtime_ms,
+            )) {
+                .normal => false,
+                .abnormal => abnormal: {
+                    const hwnd = core_surface.rt_surface.hwnd orelse break :abnormal false;
+                    break :abnormal w32.PostMessageW(hwnd, Surface.WM_APP_CHILD_EXITED, value.exit_code, 0) != 0;
                 },
-            }
-            return true;
+            },
         },
 
         .toggle_window_decorations => {
@@ -965,11 +1032,7 @@ pub fn performAction(
             return true;
         },
 
-        .goto_window => {
-            // With no tab bar, each "tab" is a window — goto_window
-            // and goto_tab behave the same. Just acknowledge.
-            return true;
-        },
+        .goto_window => return self.gotoWindow(target, value),
 
         .resize_window => return switch (target) {
             .app => false,
@@ -1308,44 +1371,28 @@ pub fn performAction(
             return true;
         },
 
-        .goto_split => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.gotoSplit(value);
-                },
-            }
-            return true;
+        .goto_split => return switch (target) {
+            .app => false,
+            .surface => |core_surface| core_surface.rt_surface.parent_window
+                .gotoSplit(core_surface.rt_surface, value),
         },
 
-        .resize_split => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.resizeSplit(value);
-                },
-            }
-            return true;
+        .resize_split => return switch (target) {
+            .app => false,
+            .surface => |core_surface| core_surface.rt_surface.parent_window
+                .resizeSplit(core_surface.rt_surface, value),
         },
 
-        .equalize_splits => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.equalizeSplits();
-                },
-            }
-            return true;
+        .equalize_splits => return switch (target) {
+            .app => false,
+            .surface => |core_surface| core_surface.rt_surface.parent_window
+                .equalizeSplits(core_surface.rt_surface),
         },
 
-        .toggle_split_zoom => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.toggleSplitZoom();
-                },
-            }
-            return true;
+        .toggle_split_zoom => return switch (target) {
+            .app => false,
+            .surface => |core_surface| core_surface.rt_surface.parent_window
+                .toggleSplitZoom(core_surface.rt_surface),
         },
 
         .prompt_title => {
@@ -1440,6 +1487,28 @@ fn targetWindow(self: *App, target: apprt.Target) ?*Window {
             return self.windows.items[self.windows.items.len - 1];
         },
     }
+}
+
+/// `goto_window`: bring the next (or previous) visible window after the
+/// window of `target` to the front, wrapping around. Returns false when
+/// there is no other window, so that the key reaches the terminal.
+fn gotoWindow(self: *App, target: apprt.Target, direction: apprt.action.GotoWindow) bool {
+    const windows = self.windows.items;
+    if (windows.len < 2) return false;
+    const current = self.targetWindow(target) orelse return false;
+    var index = std.mem.indexOfScalar(*Window, windows, current) orelse return false;
+    for (1..windows.len) |_| {
+        index = tabs.cycleIndex(index, windows.len, direction == .next);
+        const window = windows[index];
+        if (window.closing) continue;
+        const hwnd = window.hwnd orelse continue;
+        if (w32.IsWindowVisible_(hwnd) == 0) continue;
+        if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+        _ = w32.SetForegroundWindow(hwnd);
+        window.focusActiveSurface();
+        return true;
+    }
+    return false;
 }
 
 /// Create and track a top-level window without tabs. It is shown with its
@@ -1736,6 +1805,16 @@ fn toggleBackgroundOpaque(self: *App) void {
     };
 }
 
+/// Apply a configuration loaded anew (`reload_config`, the settings, a
+/// theme preview) to the app and every surface. While
+/// `toggle_background_opacity` holds the terminals opaque they stay so,
+/// and the new `background-opacity` is what the next toggle restores.
+/// Not for re-applying `config` itself, which is already held opaque.
+pub fn applyConfig(self: *App, config: *Config) !void {
+    if (self.opaque_restore != null) self.holdOpaque(config);
+    try self.core_app.updateConfig(self, config);
+}
+
 /// Make `config` opaque while `toggle_background_opacity` holds the
 /// terminals opaque, remembering its opacity for the next toggle.
 fn holdOpaque(self: *App, config: *Config) void {
@@ -1815,21 +1894,66 @@ fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
         .command = &command,
         .title = title,
     }) catch |err| {
-        window.close();
+        // `open_config` asks from a core callback: the message loop
+        // destroys the window that never showed.
+        window.requestClose();
         return err;
     };
     return true;
 }
 
-/// Present a native Save As dialog and write the borrowed terminal-I/O log
-/// before returning from the action callback.
-fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool {
-    const owner = switch (target) {
-        .app => return false,
-        .surface => |core_surface| core_surface.rt_surface.parent_window.hwnd,
-    };
+/// Posted to `msg_hwnd` by `exportTerminalIo`; lparam is a
+/// `TerminalIoExport`.
+const WM_APP_EXPORT_TERMINAL_IO: u32 = w32.WM_APP + 36;
 
+/// A terminal-I/O log waiting for the message loop to save it.
+const TerminalIoExport = struct {
+    /// The core surface that asked: the Save As dialog belongs to its window.
+    surface_id: u64,
+    contents: []u8,
+
+    fn destroy(self: *TerminalIoExport, alloc: Allocator) void {
+        alloc.free(self.contents);
+        alloc.destroy(self);
+    }
+};
+
+/// The `export_terminal_io` action: save the terminal-I/O log the inspector
+/// lends. The inspector asks while it holds the terminal lock, so the log
+/// is copied and the Save As dialog runs from the message loop
+/// (`saveTerminalIo`), as the GTK app's file chooser runs after the action.
+fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool {
+    const core_surface = switch (target) {
+        .app => return false,
+        .surface => |v| v,
+    };
+    const hwnd = self.msg_hwnd orelse return false;
     const alloc = self.core_app.alloc;
+    const request = alloc.create(TerminalIoExport) catch return false;
+    request.* = .{
+        .surface_id = core_surface.id,
+        .contents = alloc.dupe(u8, contents) catch {
+            alloc.destroy(request);
+            return false;
+        },
+    };
+    if (w32.PostMessageW(hwnd, WM_APP_EXPORT_TERMINAL_IO, 0, @bitCast(@intFromPtr(request))) == 0) {
+        request.destroy(alloc);
+        return false;
+    }
+    return true;
+}
+
+/// Handle `WM_APP_EXPORT_TERMINAL_IO`: ask where to save the log, write it
+/// there and free the request.
+fn saveTerminalIo(self: *App, request: *TerminalIoExport) void {
+    const alloc = self.core_app.alloc;
+    defer request.destroy(alloc);
+
+    const owner = if (self.core_app.findSurfaceByID(request.surface_id)) |cs|
+        cs.rt_surface.parent_window.hwnd
+    else
+        null;
     const path = Dialogs.saveFilePath(alloc, owner, .{
         .title = i18n.tr("Export Terminal IO Events"),
         .default_name = "ghostty-terminal-io.txt",
@@ -1840,39 +1964,39 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
         },
     }) catch |err| {
         log.warn("unable to choose the terminal IO export path: {}", .{err});
-        return false;
-    } orelse {
-        // Cancellation is a handled action, just with no file written.
-        return true;
-    };
+        return;
+    } orelse return;
     defer alloc.free(path);
 
     var file = std.Io.Dir.createFileAbsolute(global.io(), path, .{ .truncate = true }) catch |err| {
         log.warn("unable to create terminal IO export file: {}", .{err});
-        return false;
+        return;
     };
     defer file.close(global.io());
     var write_buf: [4096]u8 = undefined;
     var writer = file.writer(global.io(), &write_buf);
-    writer.interface.writeAll(contents) catch |err| {
+    writer.interface.writeAll(request.contents) catch |err| {
         log.warn("unable to write terminal IO export file: {}", .{err});
-        return false;
+        return;
     };
     writer.interface.flush() catch |err| {
         log.warn("unable to flush terminal IO export file: {}", .{err});
-        return false;
     };
-    return true;
 }
 
-/// Ctrl-modified VKs that should remain with the focused Edit control
-/// rather than bubbling to the surface as a keybinding. Select-all,
-/// copy, paste, cut, redo, undo.
-fn isEditShortcutVk(vk: u16) bool {
-    return switch (vk) {
-        'A', 'C', 'V', 'X', 'Y', 'Z' => true,
-        else => false,
-    };
+const ChildExitKind = enum {
+    /// The command ran: the core reports the exit in the terminal.
+    normal,
+    /// The command failed to start: it exited with a nonzero code within
+    /// `abnormal-command-exit-runtime`.
+    abnormal,
+};
+
+/// How the child process of a terminal exited, judged like the core does
+/// (`Surface.childExited`) with its `abnormal-command-exit-runtime`.
+fn childExitKind(info: apprt.surface.Message.ChildExited, abnormal_runtime_ms: u32) ChildExitKind {
+    if (info.runtime_ms > abnormal_runtime_ms or info.exit_code == 0) return .normal;
+    return .abnormal;
 }
 
 /// Lazily create (and cache) the shell ITaskbarList3 used for taskbar-button
@@ -2020,26 +2144,46 @@ const NOTIF_DESKTOP_TIMER_ID: usize = 2;
 
 extern "user32" fn IsIconic(hWnd: w32.HWND) callconv(.winapi) i32;
 
-/// Start the quit timer. Called when the last surface closes.
+/// What `startQuitTimer` does (`quitTimerStart`).
+const QuitTimerStart = union(enum) {
+    /// Nothing: the message loop has not started, or the app stays open.
+    none,
+    /// Quit once the configured delay (milliseconds) has passed.
+    timer: u32,
+    /// Quit right away.
+    quit,
+};
+
+/// What `startQuitTimer` does while the message loop is `running` or not,
+/// with `quit-after-last-window-closed` (`enabled`) and its delay.
+fn quitTimerStart(running: bool, enabled: bool, delay_ms: ?u32) QuitTimerStart {
+    if (!running or !enabled) return .none;
+    const ms = delay_ms orelse return .quit;
+    return .{ .timer = ms };
+}
+
+/// Start the quit timer. Called when the last surface closes; `main` also
+/// calls it before `run`, which this ignores (see `running`).
 pub fn startQuitTimer(self: *App) void {
     // Cancel any existing timer first.
     self.stopQuitTimer();
 
-    // Check if we should quit at all.
-    if (!self.config.@"quit-after-last-window-closed") return;
-
-    // If a delay is configured, start a Win32 timer.
-    if (self.config.@"quit-after-last-window-closed-delay") |v| {
-        const ms = v.asMilliseconds();
-        if (self.msg_hwnd) |hwnd| {
+    const delay = self.config.@"quit-after-last-window-closed-delay";
+    switch (quitTimerStart(
+        self.running,
+        self.config.@"quit-after-last-window-closed",
+        if (delay) |v| v.asMilliseconds() else null,
+    )) {
+        .none => {},
+        .timer => |ms| if (self.msg_hwnd) |hwnd| {
             _ = w32.SetTimer(hwnd, QUIT_TIMER_ID, ms, null);
             self.quit_timer_state = .active;
-        }
-    } else {
-        // No delay — quit immediately.
-        self.quit_timer_state = .expired;
-        self.quit_requested = true;
-        w32.PostQuitMessage(0);
+        },
+        .quit => {
+            self.quit_timer_state = .expired;
+            self.quit_requested = true;
+            w32.PostQuitMessage(0);
+        },
     }
 }
 
@@ -2051,12 +2195,12 @@ pub fn stopQuitTimer(self: *App) void {
             self.quit_timer_state = .off;
             // Reset quit_requested. The WM_QUIT posted by startQuitTimer's
             // no-delay path can't be removed from the queue (it's a flag,
-            // not a real message). Instead, the message loop checks
-            // quit_requested when GetMessageW returns 0 — if false, it
-            // ignores the spurious WM_QUIT and continues. This handles
-            // the normal startup sequence: main_ghostty calls
-            // startQuitTimer() before any surfaces exist, then run()
-            // creates the first surface which triggers stopQuitTimer().
+            // not a real message). Instead, the loop that retrieves it
+            // checks quit_requested — if false, it ignores the spurious
+            // WM_QUIT and continues: `run`, and the modal loops of the
+            // dialogs and menus (`Popup.modalQuitCode`). This happens when
+            // a terminal opens after the last one closed, before the loop
+            // got to the WM_QUIT.
             self.quit_requested = false;
         },
         .active => {
@@ -2137,17 +2281,10 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     nid.dwInfoFlags = w32.NIIF_INFO;
     nid.uVersion_or_uTimeout = 5000; // 5 second timeout
 
-    // Copy title (UTF-8 → UTF-16LE)
-    const title_z = title;
-    var title_len = std.unicode.utf8ToUtf16Le(&nid.szInfoTitle, title_z) catch 0;
-    if (title_len >= nid.szInfoTitle.len) title_len = nid.szInfoTitle.len - 1;
-    nid.szInfoTitle[title_len] = 0;
-
-    // Copy body (UTF-8 → UTF-16LE)
-    const body_z = body;
-    var body_len = std.unicode.utf8ToUtf16Le(&nid.szInfo, body_z) catch 0;
-    if (body_len >= nid.szInfo.len) body_len = nid.szInfo.len - 1;
-    nid.szInfo[body_len] = 0;
+    // Title and body (UTF-8 → UTF-16LE), cut to the fixed fields at a
+    // codepoint boundary.
+    _ = wstr.bufZ(&nid.szInfoTitle, title);
+    _ = wstr.bufZ(&nid.szInfo, body);
 
     // Tooltip
     const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -2222,19 +2359,6 @@ fn surfaceWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
-        w32.WM_SETTINGCHANGE => {
-            if (surface.scrollbar) |sb| {
-                if (sb.onSettingsChange()) {
-                    // Re-flow the grid to accommodate a mode change.
-                    const width: u32 = surface.width;
-                    const height: u32 = surface.height;
-                    const lp_size: isize = @intCast((@as(usize, height) << 16) | @as(usize, width));
-                    _ = w32.PostMessageW(hwnd, w32.WM_SIZE, 0, lp_size);
-                }
-            }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
         w32.WM_CLOSE => {
             // Posted by Surface.close() to defer destruction to the
             // message loop. This is the safe place to call closeSplitSurface
@@ -2247,6 +2371,23 @@ fn surfaceWndProc(
 
         Surface.WM_APP_CONFIRM_CLOSE => {
             surface.confirmClose();
+            return 0;
+        },
+
+        Surface.WM_APP_CHILD_EXITED => {
+            // The dialog runs a modal loop; nothing uses the surface after
+            // it.
+            Dialogs.showChildExited(surface.parent_window.hwnd, @truncate(wparam));
+            return 0;
+        },
+
+        Surface.WM_APP_RELEASE_BUTTONS => {
+            surface.releaseButtons(@truncate(wparam));
+            return 0;
+        },
+
+        w32.WM_CAPTURECHANGED => {
+            surface.handleCaptureChanged();
             return 0;
         },
 
@@ -2370,7 +2511,7 @@ fn surfaceWndProc(
             // AccWraps for surface windows. Terminal cells are not exposed
             // to accessibility tools anyway, so this only drops the generic
             // window-frame proxy that screen readers would otherwise see.
-            if (lparam == w32.OBJID_CLIENT) return 0;
+            if (w32.objectId(lparam) == w32.OBJID_CLIENT) return 0;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
@@ -2435,17 +2576,18 @@ fn surfaceWndProc(
             return 0;
         },
         w32.WM_XBUTTONDOWN => {
-            // X1 = back (button four), X2 = forward (button five). Deliver to
-            // the terminal for mouse reporting instead of the shell nav.
+            // X1 = back (button eight), X2 = forward (button nine), as in
+            // the GTK and macOS apprts. Deliver to the terminal for mouse
+            // reporting instead of the shell navigation.
             _ = w32.SetFocus(hwnd);
             const btn: input.MouseButton =
-                if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .five else .four;
+                if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .nine else .eight;
             surface.handleMouseButton(btn, .press, lparam);
             return 1; // TRUE: handled; suppresses the default WM_APPCOMMAND.
         },
         w32.WM_XBUTTONUP => {
             const btn: input.MouseButton =
-                if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .five else .four;
+                if ((wparam >> 16) & 0xFFFF == w32.XBUTTON2) .nine else .eight;
             surface.handleMouseButton(btn, .release, lparam);
             return 1;
         },
@@ -2462,7 +2604,9 @@ fn surfaceWndProc(
 
         w32.WM_MOUSEHWHEEL => {
             surface.handleMouseWheel(wparam, .horizontal);
-            return 0;
+            // TRUE: some mouse drivers (Logitech) send the following tilt
+            // messages only to windows that answer TRUE.
+            return 1;
         },
 
         w32.WM_DROPFILES => {
@@ -2481,9 +2625,9 @@ fn surfaceWndProc(
         },
 
         w32.WM_SETFOCUS => {
-            // Update the active surface for this tab when a split pane gains focus.
-            const tab = surface.parent_window.active_tab;
-            surface.parent_window.tab_active_surface[tab] = surface;
+            // The pane becomes the focused one of the tab that holds it,
+            // which is not necessarily the active tab.
+            _ = surface.parent_window.setActiveSurface(surface);
             surface.handleFocus(true);
             return 0;
         },
@@ -2515,6 +2659,11 @@ fn msgWndProc(
 
     if (msg == WM_APP_QUIT) {
         app.confirmQuit();
+        return 0;
+    }
+
+    if (msg == WM_APP_EXPORT_TERMINAL_IO) {
+        app.saveTerminalIo(@ptrFromInt(@as(usize, @bitCast(lparam))));
         return 0;
     }
 
@@ -2579,6 +2728,72 @@ fn msgWndProc(
 test "export terminal IO requires a surface target" {
     var app: App = undefined;
     try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
+}
+
+test "editKeyRoute keeps editing keys and unbound chords out of the shell" {
+    const testing = std.testing;
+    const ctrl: input.Mods = .{ .ctrl = true };
+    const ctrl_shift: input.Mods = .{ .ctrl = true, .shift = true };
+    const altgr: input.Mods = .{ .ctrl = true, .alt = true };
+
+    // Typing, with or without Shift, and keys a binding may use without
+    // Ctrl stay with the edit control.
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute('Q', .{}, false));
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute('Q', .{ .shift = true }, false));
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_INSERT, .{ .shift = true }, true));
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_F3, .{}, true));
+
+    // Editing keys stay with the edit control even when bound
+    // (Ctrl+Shift+V pastes, Ctrl+Shift+Left selects a word).
+    for ([_]u16{ w32.VK_LEFT, w32.VK_RIGHT, w32.VK_HOME, w32.VK_END, w32.VK_BACK, w32.VK_DELETE, w32.VK_INSERT, 'A', 'C', 'V', 'X', 'Y', 'Z' }) |vk| {
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(vk, ctrl, true));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(vk, ctrl_shift, true));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(vk, ctrl_shift, false));
+    }
+    // So do keys for the input method and modifiers on their own.
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_PROCESSKEY, ctrl, false));
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_CONTROL, ctrl, false));
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_SHIFT, ctrl_shift, false));
+
+    // Bound chords reach the terminal's bindings.
+    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute('T', ctrl_shift, true));
+    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(w32.VK_PRIOR, ctrl, true));
+    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(w32.VK_TAB, ctrl, true));
+
+    // Unbound Ctrl chords do nothing.
+    try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute('Q', ctrl, false));
+    try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute('T', ctrl_shift, false));
+    try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute(w32.VK_F3, ctrl, false));
+
+    // Ctrl+Alt is AltGr typing a character unless a binding takes it.
+    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute('Q', altgr, false));
+    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute('Q', altgr, true));
+}
+
+test "childExitKind follows the core's abnormal exit rule" {
+    const testing = std.testing;
+    const threshold: u32 = 250;
+    // A failed command: a nonzero exit within the threshold.
+    try testing.expectEqual(ChildExitKind.abnormal, childExitKind(.{ .exit_code = 1, .runtime_ms = 20 }, threshold));
+    try testing.expectEqual(ChildExitKind.abnormal, childExitKind(.{ .exit_code = 1, .runtime_ms = 250 }, threshold));
+    // A command that ran, whatever its exit code (`exit 1` in a shell).
+    try testing.expectEqual(ChildExitKind.normal, childExitKind(.{ .exit_code = 1, .runtime_ms = 251 }, threshold));
+    try testing.expectEqual(ChildExitKind.normal, childExitKind(.{ .exit_code = 130, .runtime_ms = 60_000 }, threshold));
+    // A quick but successful exit.
+    try testing.expectEqual(ChildExitKind.normal, childExitKind(.{ .exit_code = 0, .runtime_ms = 5 }, threshold));
+}
+
+test "quitTimerStart ignores the call before the message loop runs" {
+    const testing = std.testing;
+    const none: QuitTimerStart = .none;
+    // `main` starts the quit timer before `run`: no WM_QUIT, no timer.
+    try testing.expectEqual(none, quitTimerStart(false, true, null));
+    try testing.expectEqual(none, quitTimerStart(false, true, 500));
+    // The last terminal closed.
+    try testing.expectEqual(@as(QuitTimerStart, .quit), quitTimerStart(true, true, null));
+    try testing.expectEqual(@as(QuitTimerStart, .{ .timer = 500 }), quitTimerStart(true, true, 500));
+    try testing.expectEqual(none, quitTimerStart(true, false, null));
+    try testing.expectEqual(none, quitTimerStart(true, false, 500));
 }
 
 test "commandConfigured reads the recorded configuration inputs" {

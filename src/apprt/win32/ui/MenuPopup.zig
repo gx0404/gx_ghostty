@@ -134,6 +134,9 @@ pub const Host = struct {
     hinstance: w32.HINSTANCE,
     factory: *d2d.Factory,
     tokens: style.Tokens,
+    /// `App.quit_requested`: whether a WM_QUIT the loop retrieves closes
+    /// the menu (`Popup.modalQuitCode`).
+    quit_requested: *const bool,
 };
 
 pub const Options = struct {
@@ -762,9 +765,11 @@ const State = struct {
         while (self.result == .open) {
             const got = w32.GetMessageW(&msg, null, 0, 0);
             if (got == 0) {
-                // Leave WM_QUIT for the main loop.
+                // Leave a requested quit for the main loop; drop a
+                // withdrawn one.
+                const code = Popup.modalQuitCode(self.host.quit_requested.*, msg.wParam) orelse continue;
                 self.dismiss();
-                w32.PostQuitMessage(@bitCast(@as(u32, @truncate(msg.wParam))));
+                w32.PostQuitMessage(code);
                 break;
             }
             if (got < 0) {

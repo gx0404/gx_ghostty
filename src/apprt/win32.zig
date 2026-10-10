@@ -10,13 +10,25 @@ const internal_os = @import("../os/main.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 test {
+    _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/chrome/Backdrop.zig");
+    _ = @import("win32/chrome/TabBar.zig");
+    _ = @import("win32/clipboard.zig");
     _ = @import("win32/shortcut_conflicts.zig");
+    _ = @import("win32/splits.zig");
+    _ = @import("win32/tabs.zig");
+    _ = @import("win32/win32.zig");
+    _ = @import("win32/ui/Dialogs.zig");
+    _ = @import("win32/ui/Palette.zig");
+    _ = @import("win32/ui/Popup.zig");
+    _ = @import("win32/ui/style.zig");
+    _ = @import("win32/ui/wstr.zig");
     _ = @import("win32/ui/Keybinds.zig");
     _ = @import("win32/ui/trigger.zig");
     _ = @import("win32/ui/fuzzy.zig");
     _ = @import("win32/ui/MenuPopup.zig");
     _ = @import("win32/ui/settings/fuzzy.zig");
+    _ = @import("win32/ui/settings/hit_test.zig");
     _ = @import("win32/ui/settings/swatch.zig");
     _ = @import("win32/ui/settings/system.zig");
 }

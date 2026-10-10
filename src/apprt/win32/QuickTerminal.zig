@@ -52,6 +52,7 @@ pub fn init(app: *App) !*QuickTerminal {
     const window = try alloc.create(Window);
     errdefer alloc.destroy(window);
     try window.init(app, .{ .is_quick_terminal = true });
+    errdefer window.deinit();
     self.window = window;
 
     // Add a single tab (surface) to the window.
@@ -90,6 +91,7 @@ pub fn toggle(self: *QuickTerminal) void {
         const progress = @min(elapsed / self.animation_duration, 1.0);
         const remaining = (1.0 - progress) * self.animation_duration;
         self.animation_start_time = self.now() - @as(i64, @intFromFloat(remaining * @as(f64, @floatFromInt(self.perf_freq))));
+        if (self.animation_direction == .in) self.activate();
         return;
     }
 
@@ -118,6 +120,9 @@ fn animateIn(self: *QuickTerminal) void {
     );
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+    // Take the keyboard now, not after the slide: what is typed right
+    // after the hotkey belongs to the terminal.
+    self.activate();
 
     if (self.animation_duration <= 0) {
         // Instant: jump to target.
@@ -131,7 +136,6 @@ fn animateIn(self: *QuickTerminal) void {
             w32.SWP_NOACTIVATE,
         );
         self.visible = true;
-        self.forceForeground();
         return;
     }
 
@@ -185,7 +189,6 @@ pub fn onAnimationTick(self: *QuickTerminal) void {
 
         if (self.animation_direction == .in) {
             self.visible = true;
-            self.forceForeground();
         } else {
             self.visible = false;
             _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
@@ -320,29 +323,26 @@ fn getMonitor(self: *QuickTerminal) ?w32.HMONITOR {
 // Animation helpers
 // -----------------------------------------------------------------------
 
-/// Force the quick terminal to the foreground, even when Ghostty is a
-/// background process. Uses AttachThreadInput to work around the Win32
-/// SetForegroundWindow restriction.
-fn forceForeground(self: *QuickTerminal) void {
+/// Bring the quick terminal to the foreground and give its terminal the
+/// keyboard. Windows lets the process handling the global hotkey take the
+/// foreground; when it refuses anyway, `forceForeground` tries again.
+fn activate(self: *QuickTerminal) void {
     const hwnd = self.window.hwnd orelse return;
-    const fg = w32.GetForegroundWindow();
-    if (fg) |fg_hwnd| {
-        const fg_tid = w32.GetWindowThreadProcessId(fg_hwnd, null);
-        const our_tid = w32.GetCurrentThreadId();
-        if (fg_tid != our_tid) {
-            _ = w32.AttachThreadInput(our_tid, fg_tid, 1);
-            _ = w32.SetForegroundWindow(hwnd);
-            _ = w32.AttachThreadInput(our_tid, fg_tid, 0);
-        } else {
-            _ = w32.SetForegroundWindow(hwnd);
-        }
-    } else {
-        _ = w32.SetForegroundWindow(hwnd);
-    }
-    // Focus the terminal surface inside the window.
-    if (self.window.getActiveSurface()) |s| {
-        if (s.hwnd) |sh| _ = w32.SetFocus(sh);
-    }
+    if (w32.SetForegroundWindow(hwnd) == 0) forceForeground(hwnd);
+    self.window.focusActiveSurface();
+}
+
+/// The fallback of `activate`: SetForegroundWindow while attached to the
+/// input of the foreground window's thread, which works around the Win32
+/// SetForegroundWindow restriction.
+fn forceForeground(hwnd: w32.HWND) void {
+    const fg_hwnd = w32.GetForegroundWindow() orelse return;
+    const fg_tid = w32.GetWindowThreadProcessId(fg_hwnd, null);
+    const our_tid = w32.GetCurrentThreadId();
+    if (fg_tid == 0 or fg_tid == our_tid) return;
+    if (w32.AttachThreadInput(our_tid, fg_tid, 1) == 0) return;
+    _ = w32.SetForegroundWindow(hwnd);
+    _ = w32.AttachThreadInput(our_tid, fg_tid, 0);
 }
 
 fn now(_: *QuickTerminal) i64 {

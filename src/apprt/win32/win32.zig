@@ -109,9 +109,19 @@ pub const WM_GETOBJECT: u32 = 0x003D;
 /// main one — returning 0 (not -4 as some docs suggest) before reaching
 /// DefWindowProc skips the oleacc default proxy that otherwise causes
 /// re-entrant focus / IME deadlocks under our multi-HWND split layout.
-/// Typed as isize so it compares cleanly with the LPARAM the WindowProc
-/// receives.
-pub const OBJID_CLIENT: isize = -4;
+/// Object IDs are 32-bit: compare them with `objectId(lparam)`.
+pub const OBJID_CLIENT: i32 = -4;
+
+/// The object ID a WM_GETOBJECT `lparam` asks for. The ID is a DWORD, so
+/// only the low 32 bits of the 64-bit LPARAM count: callers pass it sign-
+/// or zero-extended.
+pub fn objectId(lparam: isize) i32 {
+    return @bitCast(@as(u32, @truncate(@as(usize, @bitCast(lparam)))));
+}
+
+pub const WM_CAPTURECHANGED: u32 = 0x0215;
+/// WM_MOUSEMOVE wParam flag: the left mouse button is down.
+pub const MK_LBUTTON: usize = 0x0001;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_PAINT: u32 = 0x000F;
 pub const WM_TIMER: u32 = 0x0113;
@@ -773,6 +783,8 @@ pub extern "kernel32" fn WaitForMultipleObjects(
     bWaitAll: i32,
     dwMilliseconds: u32,
 ) callconv(.winapi) u32;
+
+pub extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 
 pub extern "kernel32" fn CloseHandle(
     hObject: HANDLE,
@@ -1558,8 +1570,10 @@ pub const BOOL = std.os.windows.BOOL;
 
 pub const CLSCTX_INPROC_SERVER: u32 = 0x1;
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
+pub const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
 
 pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.winapi) HRESULT;
+pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 pub extern "ole32" fn CoCreateInstance(
     rclsid: *const GUID,
     pUnkOuter: ?*anyopaque,
@@ -1628,3 +1642,17 @@ pub const ITaskbarList3 = extern struct {
         _ = self.vtable.SetProgressValue(self, hwnd, completed, total);
     }
 };
+
+test "objectId reads the DWORD of a WM_GETOBJECT lparam" {
+    const testing = std.testing;
+    // OBJID_CLIENT sign-extended and zero-extended to 64 bits.
+    try testing.expectEqual(OBJID_CLIENT, objectId(-4));
+    try testing.expectEqual(OBJID_CLIENT, objectId(0xFFFFFFFC));
+    try testing.expect(objectId(0xFFFFFFFC) == objectId(-4));
+    // Bits above the DWORD do not count.
+    try testing.expectEqual(OBJID_CLIENT, objectId(@bitCast(@as(usize, 0x1_FFFF_FFFC))));
+    // UiaRootObjectId and OBJID_WINDOW are other objects.
+    try testing.expectEqual(@as(i32, -25), objectId(-25));
+    try testing.expect(objectId(0) != OBJID_CLIENT);
+    try testing.expect(objectId(0xFFFFFFE7) != OBJID_CLIENT);
+}
