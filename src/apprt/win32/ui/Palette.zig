@@ -2513,3 +2513,20 @@ test "theme names reuse an unchanged directory and refresh missing directories" 
     try testing.expectEqualStrings("Nord", names.get(io, &.{path})[0]);
     try testing.expectEqual(generation, names.generation);
 }
+
+test "pressed rows require the pointer and keep selection distinct" {
+    const testing = std.testing;
+    var palette: Palette = .{ .selected = 1, .hover = 2, .pressed = .{ .row = 2 } };
+    try testing.expectEqual(RowState.selected, palette.rowState(1));
+    try testing.expectEqual(RowState.pressed, palette.rowState(2));
+    palette.hover = 3;
+    try testing.expectEqual(RowState.normal, palette.rowState(2));
+    try testing.expectEqual(RowState.hover, palette.rowState(3));
+    palette.hover = 1;
+    palette.pressed = .{ .row = 1 };
+    try testing.expectEqual(RowState.selected_pressed, palette.rowState(1));
+    const t = style.Tokens.fromColors(d2d.Color.hex(0x2e3440), d2d.Color.hex(0xd8dee9), d2d.Color.hex(0x81a1c1));
+    const hover = RowColors.of(t, .hover);
+    const pressed = RowColors.of(t, .pressed);
+    try testing.expect(style.contrast(pressed.fill.?, t.surface_raised) < style.contrast(hover.fill.?, t.surface_raised));
+}
