@@ -269,6 +269,7 @@ pub const InitOptions = struct {
     context: apprt.surface.NewSurfaceContext,
     command: ?*const configpkg.Command = null,
     title: ?[:0]const u8 = null,
+    font_size: ?f32 = null,
     /// Where the terminal's window goes, in client pixels of the parent
     /// window (e.g. a new split's part of the terminal area); null for the
     /// whole terminal area (`Window.surfaceRect`). The pty starts with the
@@ -391,6 +392,15 @@ pub fn initWithOptions(
     // Create a config copy for this surface.
     var config = try apprt.surface.newConfig(app.core_app, &app.config, options.context);
     defer config.deinit();
+    const inherited_font_size: ?f32 = if (options.font_size) |points|
+        points
+    else if (app.core_app.focusedSurface()) |previous|
+        previous.rt_surface.inheritedFontSize(options.context)
+    else
+        null;
+    if (inherited_font_size) |points| {
+        if (std.math.isFinite(points) and points > 0) config.@"font-size" = points;
+    }
 
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
@@ -509,6 +519,26 @@ pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
 
 pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
     return .{ .width = self.width, .height = self.height };
+}
+
+pub fn inheritedFontSize(self: *const Surface, context: apprt.surface.NewSurfaceContext) ?f32 {
+    if (!self.core_surface_ready or !inheritsFontSize(context, self.app.config.@"window-inherit-font-size")) return null;
+    return self.core_surface.font_size.points;
+}
+
+fn inheritsFontSize(context: apprt.surface.NewSurfaceContext, enabled: bool) bool {
+    return switch (context) {
+        .split => true,
+        .tab, .window => enabled,
+    };
+}
+
+test "split fonts inherit independently of the new window font preference" {
+    try std.testing.expect(inheritsFontSize(.split, false));
+    try std.testing.expect(inheritsFontSize(.tab, true));
+    try std.testing.expect(inheritsFontSize(.window, true));
+    try std.testing.expect(!inheritsFontSize(.tab, false));
+    try std.testing.expect(!inheritsFontSize(.window, false));
 }
 
 /// The pointer position the core was told last (`cursor_pos`), so its
@@ -949,8 +979,9 @@ pub fn setClipboard(
 /// programs can paste it.
 fn writeClipboardText(self: *Surface, text: ?[]const u8, html: ?[]const u8) void {
     const alloc = self.app.core_app.alloc;
-    var blocks: ClipboardBlocks = .{};
-    blocks.text = clipboard.unicodeTextBlock(alloc, text orelse html orelse return) catch null;
+    const plain_text = text orelse html orelse return;
+    var blocks: ClipboardBlocks = .{ .empty = plain_text.len == 0 };
+    blocks.text = clipboard.unicodeTextBlock(alloc, plain_text) catch null;
     if (html) |fragment| html: {
         if (clipboard.htmlFormat() == 0) break :html;
         const document = clipboard.htmlDocument(alloc, fragment) catch break :html;
@@ -968,6 +999,7 @@ const ClipboardBlocks = struct {
     text: ?*anyopaque = null,
     /// "HTML Format".
     html: ?*anyopaque = null,
+    empty: bool = false,
 
     fn free(self: ClipboardBlocks) void {
         if (self.text) |data| _ = w32.GlobalFree(data);
@@ -994,7 +1026,7 @@ fn writeClipboard(self: *Surface, blocks: ClipboardBlocks, attempt: u8) void {
         blocks.free();
         return;
     };
-    clipboard.setData(owner, items.items) catch {
+    const written = clipboard.setDataChecked(owner, items.items) catch {
         if (attempt + 1 < clipboard_retries) {
             if (self.hwnd) |hwnd| {
                 if (w32.SetTimer(hwnd, CLIPBOARD_WRITE_TIMER, clipboardRetryDelay(attempt), null) != 0) {
@@ -1005,7 +1037,11 @@ fn writeClipboard(self: *Surface, blocks: ClipboardBlocks, attempt: u8) void {
         }
         log.warn("OpenClipboard failed for clipboard write", .{});
         blocks.free();
+        return;
     };
+    if (comptime @hasDecl(App, "notifyClipboardCopy")) {
+        if (written) self.app.notifyClipboardCopy(self.parent_window, .standard, blocks.empty);
+    }
 }
 
 fn onClipboardWriteTimer(self: *Surface) void {
@@ -1988,6 +2024,9 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
 fn pointerMoved(self: *Surface, pos: apprt.CursorPos) void {
     if (pos.x == self.cursor_pos.x and pos.y == self.cursor_pos.y) return;
     self.cursor_pos = pos;
+    if (comptime @hasDecl(Scrollbar, "onOwnerMouseMove")) {
+        if (self.scrollbar) |sb| sb.onOwnerMouseMove(@intFromFloat(pos.x));
+    }
 
     self.followPointerFocus();
 
@@ -2626,17 +2665,21 @@ pub fn onReparented(self: *Surface, window: *Window) void {
     self.handleDpiChange(@intFromFloat(@round(window.scale * 96)));
 
     if (self.scrollbar) |sb| {
-        const state = sb.state;
-        const enabled = sb.enabled;
-        const bg = sb.bg;
-        const fg = sb.fg;
-        sb.destroy();
-        self.scrollbar = null;
-        if (self.hwnd) |hwnd| {
-            self.scrollbar = Scrollbar.create(self.app.core_app.alloc, hwnd, self, enabled) catch null;
-            if (self.scrollbar) |next| {
-                next.setTheme(bg, fg);
-                next.update(state);
+        if (comptime @hasDecl(Scrollbar, "onReparented")) {
+            sb.onReparented();
+        } else {
+            const state = sb.state;
+            const enabled = sb.enabled;
+            const bg = sb.bg;
+            const fg = sb.fg;
+            sb.destroy();
+            self.scrollbar = null;
+            if (self.hwnd) |hwnd| {
+                self.scrollbar = Scrollbar.create(self.app.core_app.alloc, hwnd, self, enabled) catch null;
+                if (self.scrollbar) |next| {
+                    next.setTheme(bg, fg);
+                    next.update(state);
+                }
             }
         }
     }

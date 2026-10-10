@@ -40,15 +40,62 @@ pub const Item = struct {
 /// afterwards (a block it does not take is freed). Fails without touching
 /// them when the clipboard stays busy.
 pub fn setData(owner: ?w32.HWND, items: []const Item) error{ClipboardBusy}!void {
+    _ = try setDataChecked(owner, items);
+}
+
+/// As setData, but true only when the clipboard accepted a representation.
+pub fn setDataChecked(owner: ?w32.HWND, items: []const Item) error{ClipboardBusy}!bool {
     if (!open(owner)) return error.ClipboardBusy;
     defer _ = w32.CloseClipboard();
-    _ = w32.EmptyClipboard();
+    if (w32.EmptyClipboard() == 0) {
+        for (items) |item| _ = w32.GlobalFree(item.data);
+        return false;
+    }
+    return transferItems({}, items, transferItem, freeItem);
+}
+
+fn transferItems(context: anytype, items: []const Item, comptime transfer: fn (@TypeOf(context), Item) bool, comptime release: fn (@TypeOf(context), Item) void) bool {
+    var accepted = false;
     for (items) |item| {
-        if (w32.SetClipboardData(item.format, item.data) == null) {
-            log.warn("SetClipboardData failed format={d}", .{item.format});
-            _ = w32.GlobalFree(item.data);
+        if (transfer(context, item)) {
+            accepted = true;
+        } else {
+            release(context, item);
         }
     }
+    return accepted;
+}
+
+fn transferItem(_: void, item: Item) bool {
+    if (w32.SetClipboardData(item.format, item.data) != null) return true;
+    log.warn("SetClipboardData failed format={d}", .{item.format});
+    return false;
+}
+
+fn freeItem(_: void, item: Item) void {
+    _ = w32.GlobalFree(item.data);
+}
+
+test "clipboard copy feedback requires a successful format transfer" {
+    const Fake = struct {
+        accepted_format: u32,
+        released: usize = 0,
+
+        fn transfer(self: *@This(), item: Item) bool {
+            return item.format == self.accepted_format;
+        }
+
+        fn release(self: *@This(), _: Item) void {
+            self.released += 1;
+        }
+    };
+    const items = [_]Item{ .{ .format = 1, .data = @ptrFromInt(1) }, .{ .format = 2, .data = @ptrFromInt(2) } };
+    var failed: Fake = .{ .accepted_format = 3 };
+    try std.testing.expect(!transferItems(&failed, &items, Fake.transfer, Fake.release));
+    try std.testing.expectEqual(@as(usize, 2), failed.released);
+    var partial: Fake = .{ .accepted_format = 1 };
+    try std.testing.expect(transferItems(&partial, &items, Fake.transfer, Fake.release));
+    try std.testing.expectEqual(@as(usize, 1), partial.released);
 }
 
 /// Replace the clipboard contents with `data`, a moveable CF_UNICODETEXT
