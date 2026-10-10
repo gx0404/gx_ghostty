@@ -1,0 +1,117 @@
+id = "W20"
+title = "Split drag, closed HWND and deferred background-tab DPI"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+window-save-state = never
+resize-overlay = after-first
+keybind = f6=new_split:right
+keybind = f7=new_split:down
+keybind = f8=goto_tab:1
+keybind = f9=goto_tab:2
+"""
+expect = [
+  "startup: one pane, no columns-by-rows overlay or unpainted area",
+  "hover: three panes with the horizontal divider hovered in the accent color",
+  "dragged: nested divider at three quarters of the right column; size overlay in the focused pane",
+  "closed: exit closes the bottom-right pane and focus-here prints in its surviving sibling",
+  "background-dpi: selecting the first tab after a DPI change gives its split panes the new scale",
+]
+
+[[step]]
+action = "capture"
+name = "startup"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "move"
+in = "terminal:1"
+x = "50%"
+y = "100%"
+
+[[step]]
+action = "capture"
+name = "hover"
+
+[[step]]
+action = "drag_divider"
+between = [1, 2]
+fraction = 0.75
+
+[[step]]
+action = "capture"
+name = "dragged"
+what = "all"
+
+[[step]]
+action = "type"
+text = "exit\n"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "type"
+text = "echo focus-here\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "closed"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "resize"
+width = 900
+height = 550
+
+[[step]]
+action = "dpi"
+value = 96
+
+[[step]]
+action = "key"
+keys = "f8"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "background-dpi"
