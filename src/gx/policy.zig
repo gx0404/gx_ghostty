@@ -1,11 +1,24 @@
-//! Process policies shared by the Ghostty GX apprts: herdr app mode and
-//! whether the processes running in a terminal count as idle (so closing
-//! it needs no confirmation).
+//! Process policies shared by the Ghostty GX apprts: whether the processes
+//! running in a terminal count as idle (so closing it needs no
+//! confirmation), which of them are console helpers rather than the
+//! program a terminal runs, and how process names compare and display.
 const std = @import("std");
 
+/// Console helpers that run next to the program in a terminal: they never
+/// count as the program it runs (`proc.Tree.program`, the tab labels) and
+/// are idle (`builtin_idle_processes`). Matched with `nameMatches`.
+pub const helper_processes = [_][:0]const u8{
+    "wslhost.exe",
+    "wslrelay.exe",
+    "conhost.exe",
+    "OpenConsole.exe",
+    "gitstatusd*",
+};
+
 /// Processes that count as idle when nothing else runs in a terminal:
-/// shells, shell launchers and console helpers. Used when
-/// `gx-idle-processes` is empty; matched with `nameMatches`.
+/// shells, shell launchers and the console helpers
+/// (`helper_processes`). Used when `gx-idle-processes` is empty; matched
+/// with `nameMatches`.
 pub const builtin_idle_processes = [_][:0]const u8{
     "cmd.exe",
     "pwsh.exe",
@@ -17,12 +30,8 @@ pub const builtin_idle_processes = [_][:0]const u8{
     "nu",
     "gx-zsh",
     "wsl.exe",
-    "wslhost.exe",
-    "conhost.exe",
-    "OpenConsole.exe",
-    "gitstatusd*",
     "env.exe",
-};
+} ++ helper_processes;
 
 /// Returns true if the process `name` matches `pattern`. Both are compared
 /// by basename, ASCII case-insensitively and without a trailing `.exe`,
@@ -69,15 +78,11 @@ pub fn isIdle(names: []const []const u8, idle_list: []const [:0]const u8) bool {
     return true;
 }
 
-/// Returns true if a window should be in herdr app mode: the feature is
-/// enabled (`gx-herdr-app-mode`), the window has exactly one tab, and
-/// herdr runs in that tab (`names` are the processes of its terminal).
-pub fn herdrAppMode(enabled: bool, tab_count: usize, names: []const []const u8) bool {
-    if (!enabled or tab_count != 1) return false;
-    for (names) |name| {
-        if (nameMatches(name, "herdr")) return true;
-    }
-    return false;
+/// The process `name` as the user interface shows it: the basename
+/// without a trailing `.exe` or a login shell's leading `-`, so
+/// `PING.EXE` shows as `PING`. A slice of `name`.
+pub fn displayName(name: []const u8) []const u8 {
+    return normalize(name);
 }
 
 test "nameMatches ignores case, paths, .exe and login dashes" {
@@ -112,7 +117,7 @@ test "isIdle with the built-in list" {
     try testing.expect(isIdle(&.{ "pwsh.exe", "conhost.exe" }, &.{}));
     try testing.expect(isIdle(&.{ "gx-zsh.exe", "zsh.exe", "gitstatusd-windows-x86_64.exe" }, &.{}));
     try testing.expect(isIdle(&.{ "zsh", "gitstatusd-linu" }, &.{}));
-    try testing.expect(isIdle(&.{ "wsl.exe", "wslhost.exe", "env.exe", "nu.exe" }, &.{}));
+    try testing.expect(isIdle(&.{ "wsl.exe", "wslhost.exe", "wslrelay.exe", "env.exe", "nu.exe" }, &.{}));
     try testing.expect(isIdle(&.{ "-bash", "sh", "fish" }, &.{}));
     try testing.expect(!isIdle(&.{ "pwsh.exe", "vim.exe" }, &.{}));
     try testing.expect(!isIdle(&.{ "zsh", "herdr" }, &.{}));
@@ -126,14 +131,23 @@ test "isIdle with a configured list replaces the built-in list" {
     try testing.expect(!isIdle(&.{ "zsh", "bash" }, &configured));
 }
 
-test "herdrAppMode needs a single tab running herdr" {
+test "console helpers are idle, shells are not helpers" {
     const testing = std.testing;
-    try testing.expect(herdrAppMode(true, 1, &.{ "gx-zsh.exe", "zsh.exe", "herdr.exe" }));
-    try testing.expect(herdrAppMode(true, 1, &.{"herdr"}));
-    try testing.expect(herdrAppMode(true, 1, &.{ "zsh", "/usr/lib/ohmyzsh-gx/lib/herdr/herdr" }));
-    try testing.expect(!herdrAppMode(false, 1, &.{"herdr"}));
-    try testing.expect(!herdrAppMode(true, 2, &.{"herdr"}));
-    try testing.expect(!herdrAppMode(true, 0, &.{"herdr"}));
-    try testing.expect(!herdrAppMode(true, 1, &.{ "zsh", "herdr-helper" }));
-    try testing.expect(!herdrAppMode(true, 1, &.{}));
+    for (helper_processes) |helper| try testing.expect(isIdle(&.{helper}, &.{}));
+    try testing.expect(matchesAny("gitstatusd-linux-x86_64", &helper_processes));
+    try testing.expect(matchesAny("WSLRELAY.EXE", &helper_processes));
+    try testing.expect(!matchesAny("wsl.exe", &helper_processes));
+    try testing.expect(!matchesAny("pwsh.exe", &helper_processes));
+    try testing.expect(!matchesAny("zsh", &helper_processes));
+}
+
+test "displayName drops directories, .exe and login dashes" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("PING", displayName("PING.EXE"));
+    try testing.expectEqualStrings("vim", displayName("vim.exe"));
+    try testing.expectEqualStrings("pwsh", displayName("C:\\Program Files\\PowerShell\\7\\pwsh.exe"));
+    try testing.expectEqualStrings("zsh", displayName("-zsh"));
+    try testing.expectEqualStrings("herdr", displayName("/usr/lib/ohmyzsh-gx/lib/herdr/herdr"));
+    try testing.expectEqualStrings("tmux: server", displayName("tmux: server"));
+    try testing.expectEqualStrings(".exe", displayName(".exe"));
 }

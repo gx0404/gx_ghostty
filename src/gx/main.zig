@@ -11,9 +11,10 @@
 //! - UI language and translations (`i18n`); the name, links and
 //!   non-affiliation notice of the About surfaces (`branding`).
 //! - `gx:` binding actions (`action`) and launch profiles (`profiles`).
-//! - Processes: inspection (`proc`), the idle and herdr policies
-//!   (`policy`), close confirmation (`confirm`) and herdr app mode
-//!   (`app_mode`).
+//! - Processes: inspection (`proc`), the idle and helper policies
+//!   (`policy`), close confirmation (`confirm`), herdr app mode
+//!   (`app_mode`) and the kind of program in the foreground (`leader`).
+//! - New output in tabs that are not shown (`unread`).
 //! - The colors of the GTK look, as CSS (`gtk_css`).
 //! - Windows terminal support: win32-input-mode key records
 //!   (`win32_input`), the bundled ConPTY (`conpty`), OSC 7 working
@@ -29,6 +30,7 @@ pub const conpty = @import("conpty.zig");
 pub const gtk_css = @import("gtk_css.zig");
 pub const gui_settings = @import("gui_settings.zig");
 pub const i18n = @import("i18n.zig");
+pub const leader = @import("leader.zig");
 pub const osc7 = @import("osc7.zig");
 pub const path_quote = @import("path_quote.zig");
 pub const policy = @import("policy.zig");
@@ -36,6 +38,7 @@ pub const proc = @import("proc.zig");
 pub const profiles = @import("profiles.zig");
 pub const settings_map = @import("settings_map.zig");
 pub const theme = @import("theme.zig");
+pub const unread = @import("unread.zig");
 pub const win32_input = @import("win32_input.zig");
 
 test {
@@ -49,6 +52,7 @@ test {
     _ = gtk_css;
     _ = gui_settings;
     _ = i18n;
+    _ = leader;
     _ = osc7;
     _ = path_quote;
     _ = policy;
@@ -56,5 +60,6 @@ test {
     _ = profiles;
     _ = settings_map;
     _ = theme;
+    _ = unread;
     _ = win32_input;
 }

@@ -1,11 +1,15 @@
 //! Process inspection for Ghostty GX: process names and the processes
-//! running below a terminal's shell, used for herdr app mode and to decide
-//! whether closing a terminal needs confirmation.
+//! running below a terminal's shell, used for herdr app mode, the tab
+//! labels and to decide whether closing a terminal needs confirmation.
 //!
-//! `snapshot` captures the processes reachable from a root pid (normally
-//! the terminal's shell) with Toolhelp32 on Windows and `/proc` on Linux;
-//! `Tree` answers questions about the root's descendants and guards
-//! against pid reuse by comparing creation times.
+//! `Table` reads every process of the system in one pass (Toolhelp32 on
+//! Windows, `/proc` on Linux): pids and parent pids up front, names and
+//! Windows creation times only for the processes that a `Table.tree`
+//! keeps, so one table answers for the terminals of every tab. `Tree`
+//! answers questions about the descendants of a root (normally a
+//! terminal's shell) and guards against pid reuse by comparing creation
+//! times. `Shared` keeps one table for the periodic checks of the GUI
+//! thread; `snapshot` captures a table for a single root.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -36,6 +40,17 @@ pub const Process = struct {
 pub const Descendant = struct {
     index: usize,
     depth: usize,
+};
+
+/// What a terminal shows as the program it runs (see `Tree.program`).
+pub const Program = struct {
+    /// The program's name for display (`policy.displayName`, so without a
+    /// directory or `.exe`).
+    name: []const u8,
+
+    /// Whether the terminal runs WSL: `wsl.exe` is its shell or its
+    /// program.
+    wsl: bool,
 };
 
 /// A set of processes and the parent/child relation between them.
@@ -115,26 +130,39 @@ pub const Tree = struct {
         return false;
     }
 
-    /// The deepest descendant of `root`, typically the program the user is
-    /// running in the shell. Among equally deep processes the newest one
-    /// wins. Returns null if `root` has no descendants.
-    pub fn deepestDescendant(self: Tree, alloc: Allocator, root: Pid) Allocator.Error!?Process {
+    /// The program running in the terminal whose shell is `root`, for its
+    /// tab label: the deepest descendant that is not a console helper
+    /// (`policy.helper_processes`), the newest among equally deep ones,
+    /// else `root` itself. Null if `root` is not in the tree. The name
+    /// points into the tree.
+    pub fn program(self: Tree, alloc: Allocator, root: Pid) Allocator.Error!?Program {
+        const index = try self.programIndex(alloc, root) orelse return null;
+        const root_name = self.processes[self.find(root).?].name;
+        const name = self.processes[index].name;
+        return .{
+            .name = policy.displayName(name),
+            .wsl = policy.nameMatches(root_name, "wsl.exe") or policy.nameMatches(name, "wsl.exe"),
+        };
+    }
+
+    /// The index in `processes` of the process that `program` names, or
+    /// null if `root` is not in the tree.
+    pub fn programIndex(self: Tree, alloc: Allocator, root: Pid) Allocator.Error!?usize {
+        const root_index = self.find(root) orelse return null;
         const list = try self.descendants(alloc, root);
         defer alloc.free(list);
         var best: ?Descendant = null;
         for (list) |candidate| {
-            const current = best orelse {
-                best = candidate;
-                continue;
-            };
-            if (candidate.depth > current.depth or
-                (candidate.depth == current.depth and
-                    newer(self.processes[candidate.index], self.processes[current.index])))
-            {
-                best = candidate;
+            const process = self.processes[candidate.index];
+            if (policy.matchesAny(process.name, &policy.helper_processes)) continue;
+            if (best) |current| {
+                if (candidate.depth < current.depth) continue;
+                if (candidate.depth == current.depth and
+                    !newer(process, self.processes[current.index])) continue;
             }
+            best = candidate;
         }
-        return if (best) |found| self.processes[found.index] else null;
+        return if (best) |found| found.index else root_index;
     }
 
     fn newer(a: Process, b: Process) bool {
@@ -144,60 +172,352 @@ pub const Tree = struct {
     }
 };
 
-/// Processes captured by `snapshot`. Call `deinit` to free it.
-pub const Snapshot = struct {
-    arena: std.heap.ArenaAllocator,
-    tree: Tree,
+pub const SnapshotError = Allocator.Error || error{ Unsupported, SnapshotFailed };
 
-    pub fn deinit(self: *Snapshot) void {
+/// Every process of the system, read in one pass. Parent pids are known
+/// up front; names and Windows creation times are read when a `tree`
+/// first keeps a process and are then cached in the table, so build
+/// trees for several terminals from one table (`tree` takes several
+/// roots). Not thread-safe; free it with `deinit`.
+pub const Table = struct {
+    arena: std.heap.ArenaAllocator,
+
+    /// The processes, sorted by pid.
+    entries: []Entry,
+
+    /// Indexes into `entries` sorted by parent pid, built by the first
+    /// `tree`.
+    by_parent: ?[]const u32 = null,
+
+    /// Where the names come from.
+    names: Names,
+
+    const Entry = struct {
+        pid: Pid,
+        ppid: Pid,
+
+        /// The raw name: this range of the table's name buffer.
+        name_start: u32,
+        name_len: u32,
+
+        /// The creation time, valid once `created_read`.
+        created: ?u64 = null,
+        created_read: bool = false,
+
+        /// The UTF-8 name, once read.
+        name: ?[]const u8 = null,
+    };
+
+    const Names = union(enum) {
+        /// Complete UTF-8 names (`fromProcesses`).
+        utf8: []const u8,
+
+        /// Windows `szExeFile` names (UTF-16), converted when read.
+        utf16: []const u16,
+
+        /// Linux `comm` names from `<pid>/stat`, completed from
+        /// `<pid>/cmdline` when the kernel truncated them.
+        procfs: Procfs,
+    };
+
+    const Procfs = struct {
+        comm: []const u8,
+        io: std.Io,
+        dir: std.Io.Dir,
+
+        /// Whether the table opened `dir` and closes it in `deinit`.
+        owned: bool,
+    };
+
+    /// Reads every process of the running system: Toolhelp32 on Windows,
+    /// `/proc` (kept open until `deinit`) on Linux.
+    pub fn capture(alloc: Allocator, io: std.Io) SnapshotError!Table {
+        switch (builtin.os.tag) {
+            .windows => return try windows.capture(alloc),
+            .linux => {
+                var dir = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch |err| {
+                    log.warn("cannot open /proc err={}", .{err});
+                    return error.SnapshotFailed;
+                };
+                errdefer dir.close(io);
+                var table = try readProc(alloc, io, dir);
+                table.names.procfs.owned = true;
+                return table;
+            },
+            else => return error.Unsupported,
+        }
+    }
+
+    /// Reads a Linux procfs layout from `proc_dir`: an iterable directory
+    /// with `<pid>/stat` and `<pid>/cmdline` entries, which must stay open
+    /// while the table is in use.
+    pub fn readProc(alloc: Allocator, io: std.Io, proc_dir: std.Io.Dir) Allocator.Error!Table {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var entries: std.ArrayList(Entry) = .empty;
+        var comm: std.ArrayList(u8) = .empty;
+        var it = proc_dir.iterate();
+        while (it.next(io) catch null) |dir_entry| {
+            const pid = std.fmt.parseInt(Pid, dir_entry.name, 10) catch continue;
+            var path_buf: [32]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{d}/stat", .{pid}) catch continue;
+            var stat_buf: [1024]u8 = undefined;
+            const data = proc_dir.readFile(io, path, &stat_buf) catch continue;
+            const stat = parseStat(data) orelse continue;
+            try entries.append(a, .{
+                .pid = pid,
+                .ppid = stat.ppid,
+                .name_start = @intCast(comm.items.len),
+                .name_len = @intCast(stat.comm.len),
+                .created = stat.starttime,
+                .created_read = true,
+            });
+            try comm.appendSlice(a, stat.comm);
+        }
+        sortByPid(entries.items);
+        return .{
+            .arena = arena,
+            .entries = entries.items,
+            .names = .{ .procfs = .{ .comm = comm.items, .io = io, .dir = proc_dir, .owned = false } },
+        };
+    }
+
+    /// A table of `processes`, for callers that list processes
+    /// themselves and for tests.
+    pub fn fromProcesses(alloc: Allocator, processes: []const Process) Allocator.Error!Table {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const entries = try a.alloc(Entry, processes.len);
+        var names: std.ArrayList(u8) = .empty;
+        for (processes, entries) |process, *entry| {
+            entry.* = .{
+                .pid = process.pid,
+                .ppid = process.ppid,
+                .name_start = @intCast(names.items.len),
+                .name_len = @intCast(process.name.len),
+                .created = process.created,
+                .created_read = true,
+            };
+            try names.appendSlice(a, process.name);
+        }
+        sortByPid(entries);
+        return .{ .arena = arena, .entries = entries, .names = .{ .utf8 = names.items } };
+    }
+
+    pub fn deinit(self: *Table) void {
+        switch (self.names) {
+            .procfs => |procfs| if (procfs.owned) procfs.dir.close(procfs.io),
+            .utf8, .utf16 => {},
+        }
         self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// The number of processes in the table.
+    pub fn count(self: *const Table) usize {
+        return self.entries.len;
+    }
+
+    /// The processes reachable from any of `roots` through parent pids
+    /// (the roots in the table and all of their descendants), with names
+    /// and creation times, in pid order. Like the OS, this follows parent
+    /// pids regardless of creation times; the `Tree` applies them.
+    /// Everything, names included, is allocated with `arena` (a tree has
+    /// no `deinit`), so the tree stays valid after the table is freed.
+    pub fn tree(self: *Table, arena: Allocator, roots: []const Pid) Allocator.Error!Tree {
+        const keep = try arena.alloc(bool, self.entries.len);
+        @memset(keep, false);
+        var kept: usize = 0;
+        var pending: std.ArrayList(u32) = .empty;
+        for (roots) |root| {
+            const i = self.indexOf(root) orelse continue;
+            if (keep[i]) continue;
+            keep[i] = true;
+            kept += 1;
+            try pending.append(arena, @intCast(i));
+        }
+        if (kept > 0) {
+            const by_parent = try self.parentIndex();
+            while (pending.pop()) |i| {
+                const parent = self.entries[i].pid;
+                for (childrenOf(self.entries, by_parent, parent)) |child| {
+                    if (keep[child] or self.entries[child].pid == parent) continue;
+                    keep[child] = true;
+                    kept += 1;
+                    try pending.append(arena, child);
+                }
+            }
+        }
+
+        const processes = try arena.alloc(Process, kept);
+        var n: usize = 0;
+        for (keep, 0..) |k, i| {
+            if (!k) continue;
+            processes[n] = .{
+                .pid = self.entries[i].pid,
+                .ppid = self.entries[i].ppid,
+                .created = self.createdAt(i),
+                .name = try arena.dupe(u8, try self.nameAt(i)),
+            };
+            n += 1;
+        }
+        return .{ .processes = processes };
+    }
+
+    fn sortByPid(entries: []Entry) void {
+        std.mem.sortUnstable(Entry, entries, {}, lessByPid);
+    }
+
+    fn lessByPid(_: void, a: Entry, b: Entry) bool {
+        return a.pid < b.pid;
+    }
+
+    fn indexOf(self: *const Table, pid: Pid) ?usize {
+        const i = std.sort.lowerBound(Entry, self.entries, pid, orderPid);
+        if (i < self.entries.len and self.entries[i].pid == pid) return i;
+        return null;
+    }
+
+    fn orderPid(pid: Pid, entry: Entry) std.math.Order {
+        return std.math.order(pid, entry.pid);
+    }
+
+    fn parentIndex(self: *Table) Allocator.Error![]const u32 {
+        if (self.by_parent) |index| return index;
+        const index = try self.arena.allocator().alloc(u32, self.entries.len);
+        for (index, 0..) |*slot, i| slot.* = @intCast(i);
+        std.mem.sortUnstable(u32, index, self.entries, lessByParent);
+        self.by_parent = index;
+        return index;
+    }
+
+    fn lessByParent(entries: []const Entry, a: u32, b: u32) bool {
+        if (entries[a].ppid != entries[b].ppid) return entries[a].ppid < entries[b].ppid;
+        return a < b;
+    }
+
+    const ParentKey = struct {
+        entries: []const Entry,
+        ppid: Pid,
+    };
+
+    /// The indexes of the entries whose parent pid is `ppid`.
+    fn childrenOf(entries: []const Entry, by_parent: []const u32, ppid: Pid) []const u32 {
+        const range = std.sort.equalRange(u32, by_parent, ParentKey{ .entries = entries, .ppid = ppid }, orderParent);
+        return by_parent[range[0]..range[1]];
+    }
+
+    fn orderParent(key: ParentKey, index: u32) std.math.Order {
+        return std.math.order(key.ppid, key.entries[index].ppid);
+    }
+
+    fn createdAt(self: *Table, i: usize) ?u64 {
+        const entry = &self.entries[i];
+        if (!entry.created_read) {
+            entry.created = if (builtin.os.tag == .windows) windows.creationTime(entry.pid) else null;
+            entry.created_read = true;
+        }
+        return entry.created;
+    }
+
+    fn nameAt(self: *Table, i: usize) Allocator.Error![]const u8 {
+        const entry = &self.entries[i];
+        if (entry.name) |name| return name;
+        const start = entry.name_start;
+        const end = start + entry.name_len;
+        const name: []const u8 = switch (self.names) {
+            .utf8 => |names| names[start..end],
+            .utf16 => |names| try std.unicode.wtf16LeToWtf8Alloc(self.arena.allocator(), names[start..end]),
+            .procfs => |procfs| try fullName(self.arena.allocator(), procfs.io, procfs.dir, entry.pid, procfs.comm[start..end]),
+        };
+        entry.name = name;
+        return name;
+    }
+};
+
+/// One process table for the periodic checks of a thread (the GUI
+/// thread): the tab labels and herdr app mode of every window read the
+/// table that the first of them captured, until it is `ttl` old. Close
+/// confirmations need the current processes and use `confirm.Scope`
+/// instead. Keep one per app; not thread-safe.
+pub const Shared = struct {
+    /// How long a captured table answers.
+    ttl: std.Io.Duration = .fromMilliseconds(default_ttl_ms),
+
+    table: ?Table = null,
+
+    /// When `table` was captured, on the `awake` clock.
+    captured_at: std.Io.Timestamp = .zero,
+
+    /// The number of tables captured, for diagnostics.
+    captures: u64 = 0,
+
+    pub const default_ttl_ms = 1000;
+
+    /// The shared table, captured now if there is none or it is `ttl`
+    /// old. It stays valid until the next `get`, `invalidate` or `deinit`;
+    /// trees built from it (`Table.tree`) stay valid after that.
+    pub fn get(self: *Shared, alloc: Allocator, io: std.Io) SnapshotError!*Table {
+        return self.getAt(alloc, io, std.Io.Timestamp.now(io, .awake));
+    }
+
+    /// `get` at the time `now` (the `awake` clock).
+    pub fn getAt(self: *Shared, alloc: Allocator, io: std.Io, now: std.Io.Timestamp) SnapshotError!*Table {
+        if (self.table) |*table| {
+            const age = self.captured_at.durationTo(now).nanoseconds;
+            if (age >= 0 and age < self.ttl.nanoseconds) return table;
+        }
+        const table = try Table.capture(alloc, io);
+        self.invalidate();
+        self.table = table;
+        self.captured_at = now;
+        self.captures += 1;
+        return &self.table.?;
+    }
+
+    /// Drops the table, so that the next `get` reads the processes again.
+    pub fn invalidate(self: *Shared) void {
+        if (self.table) |*table| table.deinit();
+        self.table = null;
+    }
+
+    pub fn deinit(self: *Shared) void {
+        self.invalidate();
         self.* = undefined;
     }
 };
 
-pub const SnapshotError = Allocator.Error || error{ Unsupported, SnapshotFailed };
+/// Processes captured by `snapshot`. Call `deinit` to free it.
+pub const Snapshot = struct {
+    table: Table,
+    tree: Tree,
+
+    pub fn deinit(self: *Snapshot) void {
+        self.table.deinit();
+        self.* = undefined;
+    }
+};
 
 /// Captures `root` and every process reachable from it through parent
 /// pids, with names and creation times. `io` is used on Linux to read
-/// `/proc`.
+/// `/proc`. To ask about several terminals, build one `Table.tree` with
+/// all of their roots instead.
 pub fn snapshot(alloc: Allocator, io: std.Io, root: Pid) SnapshotError!Snapshot {
-    var arena: std.heap.ArenaAllocator = .init(alloc);
-    errdefer arena.deinit();
-    const processes = switch (builtin.os.tag) {
-        .windows => try windows.snapshot(arena.allocator(), root),
-        .linux => linux: {
-            var dir = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch |err| {
-                log.warn("cannot open /proc err={}", .{err});
-                return error.SnapshotFailed;
-            };
-            defer dir.close(io);
-            break :linux try procSnapshot(arena.allocator(), io, dir, root);
-        },
-        else => return error.Unsupported,
-    };
-    return .{ .arena = arena, .tree = .{ .processes = processes } };
+    var table = try Table.capture(alloc, io);
+    errdefer table.deinit();
+    const tree = try table.tree(table.arena.allocator(), &.{root});
+    return .{ .table = table, .tree = tree };
 }
 
-/// Like `snapshot`, but reads a Linux procfs layout from `proc_dir` (an
-/// iterable directory with `<pid>/stat` and `<pid>/cmdline` entries).
-pub fn procSnapshot(arena: Allocator, io: std.Io, proc_dir: std.Io.Dir, root: Pid) Allocator.Error![]Process {
-    var all: std.ArrayList(Process) = .empty;
-    var it = proc_dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        const pid = std.fmt.parseInt(Pid, entry.name, 10) catch continue;
-        var path_buf: [32]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{d}/stat", .{pid}) catch continue;
-        var stat_buf: [1024]u8 = undefined;
-        const data = proc_dir.readFile(io, path, &stat_buf) catch continue;
-        const stat = parseStat(data) orelse continue;
-        try all.append(arena, .{
-            .pid = pid,
-            .ppid = stat.ppid,
-            .created = stat.starttime,
-            .name = try fullName(arena, io, proc_dir, pid, stat.comm),
-        });
-    }
-    return try reachable(arena, all.items, root);
+/// Like `snapshot`, but reads a Linux procfs layout from `proc_dir` (see
+/// `Table.readProc`) and allocates with `arena`.
+pub fn procSnapshot(arena: Allocator, io: std.Io, proc_dir: std.Io.Dir, root: Pid) Allocator.Error![]const Process {
+    var table = try Table.readProc(arena, io, proc_dir);
+    defer table.deinit();
+    const tree = try table.tree(arena, &.{root});
+    return tree.processes;
 }
 
 /// The kernel truncates `comm` to 15 bytes.
@@ -239,8 +559,8 @@ fn argv0Name(arena: Allocator, io: std.Io, proc_dir: std.Io.Dir, pid: Pid) Alloc
     return try arena.dupe(u8, base);
 }
 
-/// `comm`, or the basename of argv[0] when the kernel truncated `comm`
-/// and argv[0] extends it. Allocated in `arena`.
+/// `comm` itself, or the basename of argv[0] (allocated in `arena`) when
+/// the kernel truncated `comm` and argv[0] extends it.
 fn fullName(
     arena: Allocator,
     io: std.Io,
@@ -253,7 +573,7 @@ fn fullName(
             if (std.mem.startsWith(u8, argv0, comm)) return argv0;
         }
     }
-    return try arena.dupe(u8, comm);
+    return comm;
 }
 
 /// The name of the Linux process `pid` read from `proc_dir` (normally
@@ -269,33 +589,6 @@ pub fn processName(alloc: Allocator, io: std.Io, proc_dir: std.Io.Dir, pid: Pid)
     defer arena.deinit();
     const name = try fullName(arena.allocator(), io, proc_dir, pid, std.mem.trimEnd(u8, data, "\n"));
     return try alloc.dupe(u8, name);
-}
-
-/// `root` and the processes reachable from it through parent pids,
-/// ignoring creation times (the `Tree` applies them). Keeps the order of
-/// `all`; returns an empty list if `root` is not in `all`.
-fn reachable(arena: Allocator, all: []const Process, root: Pid) Allocator.Error![]Process {
-    const keep = try arena.alloc(bool, all.len);
-    @memset(keep, false);
-    var pending: std.ArrayList(Pid) = .empty;
-    for (all, 0..) |process, i| {
-        if (process.pid == root) {
-            keep[i] = true;
-            try pending.append(arena, root);
-        }
-    }
-    while (pending.pop()) |parent| {
-        for (all, 0..) |process, i| {
-            if (keep[i] or process.ppid != parent or process.pid == parent) continue;
-            keep[i] = true;
-            try pending.append(arena, process.pid);
-        }
-    }
-    var result: std.ArrayList(Process) = .empty;
-    for (all, keep) |process, kept| {
-        if (kept) try result.append(arena, process);
-    }
-    return try result.toOwnedSlice(arena);
 }
 
 const windows = if (builtin.os.tag == .windows) struct {
@@ -343,28 +636,38 @@ const windows = if (builtin.os.tag == .windows) struct {
     ) callconv(.winapi) win.BOOL;
     extern "kernel32" fn CloseHandle(hObject: win.HANDLE) callconv(.winapi) win.BOOL;
 
-    fn snapshot(arena: Allocator, root: Pid) SnapshotError![]Process {
+    /// A typical system has a few hundred processes with short names;
+    /// reserving room for them up front keeps the arena from collecting
+    /// the outgrown buffers.
+    const expected_processes = 1024;
+    const expected_name_len = 24;
+
+    fn capture(alloc: Allocator) SnapshotError!Table {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
         const handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (handle == win.INVALID_HANDLE_VALUE) return error.SnapshotFailed;
         defer _ = CloseHandle(handle);
 
-        var all: std.ArrayList(Process) = .empty;
+        var entries: std.ArrayList(Table.Entry) = try .initCapacity(a, expected_processes);
+        var names: std.ArrayList(u16) = try .initCapacity(a, expected_processes * expected_name_len);
         var entry: PROCESSENTRY32W = undefined;
         entry.dwSize = @sizeOf(PROCESSENTRY32W);
         var more = Process32FirstW(handle, &entry).toBool();
         while (more) : (more = Process32NextW(handle, &entry).toBool()) {
             const name = std.mem.sliceTo(&entry.szExeFile, 0);
-            try all.append(arena, .{
+            try entries.append(a, .{
                 .pid = entry.th32ProcessID,
                 .ppid = entry.th32ParentProcessID,
-                .created = null,
-                .name = try std.unicode.wtf16LeToWtf8Alloc(arena, name),
+                .name_start = @intCast(names.items.len),
+                .name_len = @intCast(name.len),
             });
+            try names.appendSlice(a, name);
         }
-
-        const processes = try reachable(arena, all.items, root);
-        for (processes) |*process| process.created = creationTime(process.pid);
-        return processes;
+        Table.sortByPid(entries.items);
+        return .{ .arena = arena, .entries = entries.items, .names = .{ .utf16 = names.items } };
     }
 
     fn creationTime(pid: Pid) ?u64 {
@@ -445,7 +748,7 @@ test "descendants survives cycles and self parents" {
     try testing.expectEqualStrings("b", tree.processes[cycle[0].index].name);
 }
 
-test "names, containsProcess and deepestDescendant" {
+test "names and containsProcess" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const tree: Tree = .{ .processes = &.{
@@ -462,16 +765,11 @@ test "names, containsProcess and deepestDescendant" {
     try testing.expectEqual(@as(usize, 6), all.len);
     try testing.expectEqualStrings("gx-zsh.exe", all[0]);
     try testing.expect(!policy.isIdle(all, &.{}));
-    try testing.expect(policy.herdrAppMode(true, 1, all));
 
     try testing.expect(try tree.containsProcess(alloc, 10, "herdr"));
     try testing.expect(try tree.containsProcess(alloc, 12, "HERDR.EXE"));
     try testing.expect(!try tree.containsProcess(alloc, 14, "herdr"));
     try testing.expect(!try tree.containsProcess(alloc, 99, "herdr"));
-
-    const deepest = (try tree.deepestDescendant(alloc, 10)).?;
-    try testing.expectEqualStrings("node.exe", deepest.name);
-    try testing.expectEqual(@as(?Process, null), try tree.deepestDescendant(alloc, 14));
 
     const missing = try tree.names(alloc, 99);
     defer alloc.free(missing);
@@ -488,25 +786,94 @@ test "idle shell tree" {
     const all = try tree.names(alloc, 10);
     defer alloc.free(all);
     try testing.expect(policy.isIdle(all, &.{}));
-    try testing.expect(!policy.herdrAppMode(true, 1, all));
+    try testing.expect(!try tree.containsProcess(alloc, 10, "herdr"));
 }
 
-test "reachable keeps the root and its pid-linked processes" {
+test "program is the deepest process that is not a helper" {
     const testing = std.testing;
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const all = [_]Process{
+    const alloc = testing.allocator;
+    const tree: Tree = .{ .processes = &.{
+        testProcess(10, 1, 10, "gx-zsh.exe"),
+        testProcess(11, 10, 11, "zsh.exe"),
+        testProcess(12, 11, 12, "herdr.exe"),
+        testProcess(13, 11, 13, "gitstatusd-windows-x86_64.exe"),
+        testProcess(14, 12, 14, "nvim.exe"),
+        testProcess(15, 12, 15, "node.exe"),
+        testProcess(16, 15, 16, "conhost.exe"),
+        testProcess(20, 1, 20, "pwsh.exe"),
+        testProcess(21, 20, 21, "OpenConsole.exe"),
+        testProcess(30, 1, 30, "wsl.exe"),
+        testProcess(31, 30, 31, "wslhost.exe"),
+        testProcess(32, 30, 32, "wslrelay.exe"),
+        testProcess(40, 1, 40, "cmd.exe"),
+        testProcess(41, 40, null, "PING.EXE"),
+        testProcess(42, 40, 42, "timeout.exe"),
+    } };
+
+    // The newest of the deepest non-helper processes.
+    const herdr = (try tree.program(alloc, 10)).?;
+    try testing.expectEqualStrings("node", herdr.name);
+    try testing.expect(!herdr.wsl);
+
+    // Only helpers below the shell: the shell itself.
+    const pwsh = (try tree.program(alloc, 20)).?;
+    try testing.expectEqualStrings("pwsh", pwsh.name);
+    const wsl = (try tree.program(alloc, 30)).?;
+    try testing.expectEqualStrings("wsl", wsl.name);
+    try testing.expect(wsl.wsl);
+
+    // A known creation time wins over an unknown one at the same depth.
+    const cmd = (try tree.program(alloc, 40)).?;
+    try testing.expectEqualStrings("timeout", cmd.name);
+
+    try testing.expectEqual(@as(?Program, null), try tree.program(alloc, 99));
+}
+
+test "Table.tree follows several roots in one pass" {
+    const testing = std.testing;
+    var table: Table = try .fromProcesses(testing.allocator, &.{
+        testProcess(20, 1, 20, "other"),
+        testProcess(12, 11, 12, "zsh"),
         testProcess(1, 0, 1, "init"),
         testProcess(10, 1, 10, "zsh"),
         testProcess(11, 10, 11, "herdr"),
-        testProcess(12, 11, 12, "zsh"),
-        testProcess(20, 1, 20, "other"),
-    };
-    const kept = try reachable(arena.allocator(), &all, 10);
-    try testing.expectEqual(@as(usize, 3), kept.len);
-    try testing.expectEqual(@as(Pid, 10), kept[0].pid);
-    try testing.expectEqual(@as(Pid, 12), kept[2].pid);
-    try testing.expectEqual(@as(usize, 0), (try reachable(arena.allocator(), &all, 99)).len);
+        testProcess(30, 1, 30, "pwsh.exe"),
+        testProcess(31, 30, 31, "vim.exe"),
+        testProcess(40, 40, 40, "self-parent"),
+    });
+    defer table.deinit();
+    try testing.expectEqual(@as(usize, 8), table.count());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const tree = try table.tree(arena.allocator(), &.{ 30, 10, 99, 10, 40 });
+    const pids = [_]Pid{ 10, 11, 12, 30, 31, 40 };
+    try testing.expectEqual(pids.len, tree.processes.len);
+    for (pids, tree.processes) |pid, process| try testing.expectEqual(pid, process.pid);
+    try testing.expect(try tree.containsProcess(arena.allocator(), 10, "herdr"));
+    try testing.expect(!try tree.containsProcess(arena.allocator(), 30, "herdr"));
+    try testing.expectEqualStrings("vim", (try tree.program(arena.allocator(), 30)).?.name);
+
+    const none = try table.tree(arena.allocator(), &.{});
+    try testing.expectEqual(@as(usize, 0), none.processes.len);
+    const missing = try table.tree(arena.allocator(), &.{99});
+    try testing.expectEqual(@as(usize, 0), missing.processes.len);
+}
+
+test "Table.tree outlives the table" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var table: Table = try .fromProcesses(testing.allocator, &.{
+        testProcess(10, 1, 10, "bash"),
+        testProcess(11, 10, 11, "sleep"),
+    });
+    const tree = try table.tree(arena.allocator(), &.{10});
+    table.deinit();
+    const names = try tree.names(arena.allocator(), 10);
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("bash", names[0]);
+    try testing.expectEqualStrings("sleep", names[1]);
 }
 
 test "parseStat handles spaces and parentheses in comm" {
@@ -567,6 +934,32 @@ test "procSnapshot and processName read a procfs layout" {
     try testing.expectEqual(@as(?[]u8, null), try processName(testing.allocator, testing.io, tmp.dir, 999));
 }
 
+test "Table.readProc reads the names of kept processes only" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const stat = " S {d} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {d} 0 0\n";
+    try writeTestFile(tmp.dir, "300/stat", "300 (bash)" ++ comptime std.fmt.comptimePrint(stat, .{ 1, 500 }));
+    try writeTestFile(tmp.dir, "301/stat", "301 (a-very-long-pro)" ++ comptime std.fmt.comptimePrint(stat, .{ 300, 600 }));
+    try writeTestFile(tmp.dir, "301/cmdline", "/opt/a-very-long-program-name\x00");
+    try writeTestFile(tmp.dir, "400/stat", "400 (another-long-na)" ++ comptime std.fmt.comptimePrint(stat, .{ 1, 700 }));
+    try writeTestFile(tmp.dir, "400/cmdline", "/opt/another-long-name\x00");
+
+    var table: Table = try .readProc(testing.allocator, testing.io, tmp.dir);
+    defer table.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const tree = try table.tree(arena.allocator(), &.{300});
+    try testing.expectEqual(@as(usize, 2), tree.processes.len);
+    try testing.expectEqualStrings("a-very-long-program-name", tree.processes[1].name);
+    try testing.expectEqual(@as(?u64, 600), tree.processes[1].created);
+
+    // The process outside the tree kept its truncated name unread.
+    const outside = table.indexOf(400).?;
+    try testing.expectEqual(@as(?[]const u8, null), table.entries[outside].name);
+}
+
 test "snapshot of the current process" {
     const testing = std.testing;
     if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
@@ -580,4 +973,33 @@ test "snapshot of the current process" {
     const index = snap.tree.find(self_pid) orelse return error.TestUnexpectedResult;
     try testing.expect(snap.tree.processes[index].name.len > 0);
     try testing.expect(snap.tree.processes[index].created != null);
+    try testing.expect(snap.table.count() > 1);
+}
+
+test "Shared reuses a table until it is ttl old" {
+    const testing = std.testing;
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var shared: Shared = .{};
+    defer shared.deinit();
+    const start: std.Io.Timestamp = .fromNanoseconds(10 * std.time.ns_per_s);
+    const first = try shared.getAt(testing.allocator, testing.io, start);
+    try testing.expect(first.count() > 0);
+    try testing.expectEqual(@as(u64, 1), shared.captures);
+
+    const later = start.addDuration(.fromMilliseconds(Shared.default_ttl_ms - 1));
+    _ = try shared.getAt(testing.allocator, testing.io, later);
+    try testing.expectEqual(@as(u64, 1), shared.captures);
+
+    // A clock that went backwards does not keep the table forever.
+    _ = try shared.getAt(testing.allocator, testing.io, .fromNanoseconds(0));
+    try testing.expectEqual(@as(u64, 2), shared.captures);
+
+    const expired: std.Io.Timestamp = .fromNanoseconds(std.time.ns_per_ms * Shared.default_ttl_ms);
+    _ = try shared.getAt(testing.allocator, testing.io, expired);
+    try testing.expectEqual(@as(u64, 3), shared.captures);
+
+    shared.invalidate();
+    _ = try shared.getAt(testing.allocator, testing.io, expired);
+    try testing.expectEqual(@as(u64, 4), shared.captures);
 }

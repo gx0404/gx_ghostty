@@ -15,9 +15,10 @@
 //! Unread output: a background tab gets an accent dot when its terminal
 //! changed since it was last shown (`onTimer` polls the terminal dirty
 //! state, which the renderer of an occluded surface leaves untouched) or
-//! rang the bell (`markUnread`). Labels: every two seconds `onTimer` looks
-//! up the program running in each tab's focused terminal (the deepest
-//! process below its shell, ignoring helpers) and shows `program ~ title`.
+//! rang the bell (`markUnread`). Labels: every two seconds `onTimer` lists
+//! the processes once and looks up the program running in each tab's
+//! focused terminal (`gx.proc.Tree.program`: the deepest process below its
+//! shell, ignoring console helpers) and shows `program ~ title`.
 //!
 //! The owning `Window` embeds this struct as `tab_bar` and forwards the
 //! chrome row input to it through `TitleBar`.
@@ -34,7 +35,6 @@ const TitleBar = @import("TitleBar.zig");
 const global = @import("../../../global.zig");
 const terminal = @import("../../../terminal/main.zig");
 const gx_proc = @import("../../../gx/proc.zig");
-const policy = @import("../../../gx/policy.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -894,15 +894,6 @@ fn anyFlag(flags: anytype) bool {
     return @as(Int, @bitCast(flags)) != 0;
 }
 
-/// Helper processes that never count as the program running in a tab.
-const helper_processes = [_][:0]const u8{
-    "conhost.exe",
-    "OpenConsole.exe",
-    "gitstatusd*",
-    "wslhost.exe",
-    "wslrelay.exe",
-};
-
 fn processForConst(self: *const TabBar, i: usize) ?*const ProcessName {
     const win = self.windowConst();
     if (i >= win.tab_count) return null;
@@ -921,17 +912,17 @@ fn processFor(self: *TabBar, i: usize) ?*const ProcessName {
 /// when a label changed.
 fn refreshProcesses(self: *TabBar) bool {
     const win = self.window();
-    const alloc = win.app.core_app.alloc;
     var changed = false;
     var next: [max_tabs]ProcessName = [_]ProcessName{.{}} ** max_tabs;
+    var roots: [max_tabs]?gx_proc.Pid = [_]?gx_proc.Pid{null} ** max_tabs;
     for (0..win.tab_count) |i| {
         const surface = win.tab_active_surface[i];
         next[i].surface = surface;
         if (!surface.core_surface_ready) continue;
         const pid64 = surface.core_surface.getProcessInfo(.foreground_pid) orelse continue;
-        const pid = std.math.cast(gx_proc.Pid, pid64) orelse continue;
-        lookupProgram(alloc, pid, &next[i]);
+        roots[i] = std.math.cast(gx_proc.Pid, pid64);
     }
+    lookupPrograms(win.app.core_app.alloc, roots[0..win.tab_count], next[0..win.tab_count]);
     for (0..max_tabs) |i| {
         const old = &self.processes[i];
         const new = &next[i];
@@ -941,37 +932,29 @@ fn refreshProcesses(self: *TabBar) bool {
     return changed;
 }
 
-/// The program running in the terminal whose child process is `pid`: the
-/// deepest descendant that is not a helper (newest first), else the
-/// child process itself.
-fn lookupProgram(alloc: std.mem.Allocator, pid: gx_proc.Pid, out: *ProcessName) void {
-    var snapshot = gx_proc.snapshot(alloc, global.io(), pid) catch return;
-    defer snapshot.deinit();
-    const tree = snapshot.tree;
-    const root = tree.find(pid) orelse return;
-    var best: ?gx_proc.Descendant = null;
-    const list = tree.descendants(alloc, pid) catch return;
-    defer alloc.free(list);
-    for (list) |candidate| {
-        const process = tree.processes[candidate.index];
-        if (policy.matchesAny(process.name, &helper_processes)) continue;
-        if (best) |current| {
-            if (candidate.depth < current.depth) continue;
-            if (candidate.depth == current.depth) {
-                const a = process.created orelse continue;
-                const b = tree.processes[current.index].created orelse 0;
-                if (a <= b) continue;
-            }
-        }
-        best = candidate;
+/// Fill in the program running in each terminal whose child process is
+/// in `roots` (`gx.proc.Tree.program`), listing the processes once for
+/// all of them.
+fn lookupPrograms(alloc: std.mem.Allocator, roots: []const ?gx_proc.Pid, out: []ProcessName) void {
+    var pids: [max_tabs]gx_proc.Pid = undefined;
+    var count: usize = 0;
+    for (roots) |root| {
+        pids[count] = root orelse continue;
+        count += 1;
     }
-    const name = if (best) |found| tree.processes[found.index].name else tree.processes[root].name;
-    const root_name = tree.processes[root].name;
-    out.wsl = policy.nameMatches(root_name, "wsl.exe") or policy.nameMatches(name, "wsl.exe");
-    const bare = if (std.ascii.endsWithIgnoreCase(name, ".exe")) name[0 .. name.len - 4] else name;
-    const len = @min(bare.len, out.buf.len);
-    @memcpy(out.buf[0..len], bare[0..len]);
-    out.len = @intCast(len);
+    if (count == 0) return;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var table = gx_proc.Table.capture(alloc, global.io()) catch return;
+    defer table.deinit();
+    const tree = table.tree(arena.allocator(), pids[0..count]) catch return;
+    for (roots, out) |root, *entry| {
+        const program = (tree.program(arena.allocator(), root orelse continue) catch null) orelse continue;
+        entry.wsl = program.wsl;
+        const len = @min(program.name.len, entry.buf.len);
+        @memcpy(entry.buf[0..len], program.name[0..len]);
+        entry.len = @intCast(len);
+    }
 }
 
 // -----------------------------------------------------------------------

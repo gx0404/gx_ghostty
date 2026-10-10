@@ -3,7 +3,10 @@
 //!
 //! Detection is a pure function of an `Environment` (platform, environment
 //! variables, executable directory, WSL distributions and a file probe),
-//! so both the Windows and the Linux rules are testable on any host.
+//! so both the Windows and the Linux rules are testable on any host. It
+//! probes files along `PATH`; a `Cache` keeps the detected shells of an
+//! app and adds the custom profiles of the current configuration on every
+//! use (`List.appendCustom`).
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -159,7 +162,87 @@ pub const List = struct {
         }
         return null;
     }
+
+    /// The profile that `query` names, as in `gx:new_tab_profile:<query>`
+    /// and `gx:new_window_profile:<query>`: the profile with that id, else
+    /// the custom profile with that name (so `Python` finds
+    /// `custom:Python`), else the profile whose name, in English or in the
+    /// current UI language with `{name}` filled in, equals `query` ignoring
+    /// ASCII case.
+    pub fn resolve(self: *const List, query: []const u8) ?*const Profile {
+        if (self.find(query)) |profile| return profile;
+        for (self.profiles) |*profile| {
+            if (profile.kind == .custom and std.mem.eql(u8, profile.name, query)) return profile;
+        }
+        for (self.profiles) |*profile| {
+            if (nameIs(profile.*, query)) return profile;
+        }
+        return null;
+    }
+
+    /// Appends `custom` profiles (`gx-launch-profile`) in order.
+    pub fn appendCustom(self: *List, custom: []const Custom) Allocator.Error!void {
+        if (custom.len == 0) return;
+        const alloc = self.arena.allocator();
+        const profiles = try alloc.alloc(Profile, self.profiles.len + custom.len);
+        @memcpy(profiles[0..self.profiles.len], self.profiles);
+        for (custom, profiles[self.profiles.len..]) |entry, *profile| {
+            profile.* = try customProfile(alloc, entry);
+        }
+        self.profiles = profiles;
+    }
+
+    /// A copy of the list with memory of its own.
+    pub fn clone(self: *const List, alloc: Allocator) Allocator.Error!List {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const profiles = try a.alloc(Profile, self.profiles.len);
+        for (self.profiles, profiles) |profile, *copy| {
+            copy.* = .{
+                .id = try a.dupeZ(u8, profile.id),
+                .name = try a.dupeZ(u8, profile.name),
+                .name_arg = if (profile.name_arg) |arg| try a.dupeZ(u8, arg) else null,
+                .command = switch (profile.command) {
+                    .argv => |argv| .{ .argv = try dupeArgv(a, argv) },
+                    .command_line => |line| .{ .command_line = try a.dupeZ(u8, line) },
+                },
+                .kind = profile.kind,
+            };
+        }
+        return .{ .arena = arena, .profiles = profiles };
+    }
 };
+
+/// Whether the name of `profile` equals `query`, ignoring ASCII case: the
+/// name of a custom profile, or the English or translated name of a
+/// detected one with `{name}` filled in.
+fn nameIs(profile: Profile, query: []const u8) bool {
+    if (profile.kind == .custom) return std.ascii.eqlIgnoreCase(profile.name, query);
+    const arg = profile.name_arg orelse "";
+    return filledEql(profile.name, arg, query) or
+        filledEql(i18n.trRuntime(profile.name), arg, query);
+}
+
+/// Whether `template` with its `{name}` placeholder replaced by `arg`
+/// equals `query`, ignoring ASCII case.
+fn filledEql(template: []const u8, arg: []const u8, query: []const u8) bool {
+    const placeholder = "{name}";
+    const at = std.mem.indexOf(u8, template, placeholder) orelse
+        return std.ascii.eqlIgnoreCase(template, query);
+    const head = template[0..at];
+    const tail = template[at + placeholder.len ..];
+    if (query.len != head.len + arg.len + tail.len) return false;
+    return std.ascii.eqlIgnoreCase(query[0..head.len], head) and
+        std.ascii.eqlIgnoreCase(query[head.len..][0..arg.len], arg) and
+        std.ascii.eqlIgnoreCase(query[head.len + arg.len ..], tail);
+}
+
+fn dupeArgv(alloc: Allocator, argv: []const [:0]const u8) Allocator.Error![]const [:0]const u8 {
+    const result = try alloc.alloc([:0]const u8, argv.len);
+    for (argv, result) |arg, *out| out.* = try alloc.dupeZ(u8, arg);
+    return result;
+}
 
 /// A user profile from `gx-launch-profile` (`name=command`).
 pub const Custom = struct {
@@ -167,8 +250,26 @@ pub const Custom = struct {
     command: []const u8,
 };
 
+fn customProfile(alloc: Allocator, entry: Custom) Allocator.Error!Profile {
+    return .{
+        .id = try std.fmt.allocPrintSentinel(alloc, "custom:{s}", .{entry.name}, 0),
+        .name = try alloc.dupeZ(u8, entry.name),
+        .command = .{ .command_line = try alloc.dupeZ(u8, entry.command) },
+        .kind = .custom,
+    };
+}
+
 /// Detects the shells available in `environment` and appends `custom`
-/// profiles in order.
+/// profiles in order: `detectShells`, then `List.appendCustom`.
+pub fn detect(alloc: Allocator, environment: Environment, custom: []const Custom) Allocator.Error!List {
+    var list = try detectShells(alloc, environment);
+    errdefer list.deinit();
+    try list.appendCustom(custom);
+    return list;
+}
+
+/// Detects the shells available in `environment`, without custom
+/// profiles.
 ///
 /// Windows: GX Zsh and herdr (from `<exe dir>\..\bin`,
 /// `%LOCALAPPDATA%\Programs\GXShell\bin`,
@@ -177,7 +278,7 @@ pub const Custom = struct {
 /// one profile per WSL distribution. Linux: GX Zsh and herdr (from
 /// `/usr/lib/ohmyzsh-gx/bin`, then `PATH`), the login shell (`$SHELL`),
 /// then zsh, bash and fish from `PATH`.
-pub fn detect(alloc: Allocator, environment: Environment, custom: []const Custom) Allocator.Error!List {
+pub fn detectShells(alloc: Allocator, environment: Environment) Allocator.Error!List {
     var arena: std.heap.ArenaAllocator = .init(alloc);
     errdefer arena.deinit();
     var detector: Detector = .{ .alloc = arena.allocator(), .environment = environment };
@@ -185,7 +286,6 @@ pub fn detect(alloc: Allocator, environment: Environment, custom: []const Custom
         .windows => try detector.windows(),
         .linux => try detector.linux(),
     }
-    for (custom) |entry| try detector.addCustom(entry);
     return .{ .arena = arena, .profiles = detector.profiles.items };
 }
 
@@ -274,15 +374,6 @@ const Detector = struct {
             if (login_shell) |login| if (std.mem.eql(u8, login, path)) continue;
             try self.add(shell[0], shell[1], shell[2], &.{path});
         }
-    }
-
-    fn addCustom(self: *Detector, entry: Custom) Allocator.Error!void {
-        try self.profiles.append(self.alloc, .{
-            .id = try std.fmt.allocPrintSentinel(self.alloc, "custom:{s}", .{entry.name}, 0),
-            .name = try self.alloc.dupeZ(u8, entry.name),
-            .command = .{ .command_line = try self.alloc.dupeZ(u8, entry.command) },
-            .kind = .custom,
-        });
     }
 
     fn add(
@@ -385,34 +476,182 @@ pub fn displayName(alloc: Allocator, profile: Profile) Allocator.Error![]u8 {
     });
 }
 
-/// Detects the profiles of the running system. `env` is the process
-/// environment (e.g. from `global.environMap()`); on Windows the WSL
-/// distributions come from the registry.
+/// Detects the profiles of the running system: `detectSystemShells`, then
+/// `custom`.
 pub fn detectSystem(
     alloc: Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
     custom: []const Custom,
 ) Allocator.Error!List {
+    var list = try detectSystemShells(alloc, io, env);
+    errdefer list.deinit();
+    try list.appendCustom(custom);
+    return list;
+}
+
+/// Detects the shells of the running system. `env` is the process
+/// environment (e.g. from `global.environMap()`); on Windows the WSL
+/// distributions come from the registry.
+pub fn detectSystemShells(
+    alloc: Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+) Allocator.Error!List {
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     const exe_dir = std.process.executableDirPathAlloc(io, arena.allocator()) catch null;
     const distros = try wslDistros(arena.allocator());
-    return try detect(alloc, .{
+    return try detectShells(alloc, .{
         .env = env,
         .exe_dir = exe_dir,
         .wsl_distros = distros,
         .probe = .{ .io = io },
-    }, custom);
+    });
+}
+
+/// The shells detected on the system, kept so that menus, the command
+/// palette, the settings and new terminals do not probe the file system
+/// on every use. Detection runs again when the environment variables it
+/// reads change (`fingerprint`) or after `invalidate`, which apprts call
+/// when the user reloads the configuration, so that shells installed in
+/// the meantime show up. Keep one per app, on its UI thread.
+pub const Cache = struct {
+    shells: ?List = null,
+
+    /// The `fingerprint` of the environment `shells` was detected in.
+    key: u64 = 0,
+
+    /// The number of detections, for diagnostics.
+    detections: u64 = 0,
+
+    /// The launch profiles of the running system: the detected shells,
+    /// then `custom`. The caller owns the returned list.
+    pub fn list(
+        self: *Cache,
+        alloc: Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        custom: []const Custom,
+    ) Allocator.Error!List {
+        const key = fingerprint(.native, env);
+        if (self.shells == null or self.key != key) {
+            self.store(try detectSystemShells(alloc, io, env), key);
+        }
+        return try self.withCustom(alloc, custom);
+    }
+
+    /// `list` for the shells of `environment` instead of the running
+    /// system. Changes to its executable directory and WSL distributions
+    /// also detect again; changes that only its probe sees do not.
+    pub fn listFor(
+        self: *Cache,
+        alloc: Allocator,
+        environment: Environment,
+        custom: []const Custom,
+    ) Allocator.Error!List {
+        var hasher: std.hash.Wyhash = .init(fingerprint(environment.platform, environment.env));
+        hashValue(&hasher, environment.exe_dir);
+        for (environment.wsl_distros) |distro| hashValue(&hasher, distro);
+        const key = hasher.final();
+        if (self.shells == null or self.key != key) {
+            self.store(try detectShells(alloc, environment), key);
+        }
+        return try self.withCustom(alloc, custom);
+    }
+
+    /// Forgets the detected shells; the next `list` detects them again.
+    pub fn invalidate(self: *Cache) void {
+        if (self.shells) |*shells| shells.deinit();
+        self.shells = null;
+    }
+
+    pub fn deinit(self: *Cache) void {
+        self.invalidate();
+        self.* = undefined;
+    }
+
+    fn store(self: *Cache, shells: List, key: u64) void {
+        self.invalidate();
+        self.shells = shells;
+        self.key = key;
+        self.detections += 1;
+    }
+
+    fn withCustom(self: *const Cache, alloc: Allocator, custom: []const Custom) Allocator.Error!List {
+        var result = try self.shells.?.clone(alloc);
+        errdefer result.deinit();
+        try result.appendCustom(custom);
+        return result;
+    }
+};
+
+/// A hash of the environment variables that shell detection reads on
+/// `platform`.
+pub fn fingerprint(platform: Platform, env: *const std.process.Environ.Map) u64 {
+    const names: []const []const u8 = switch (platform) {
+        .windows => &.{ "PATH", "LOCALAPPDATA", "ProgramFiles", "SystemRoot", "ComSpec" },
+        .linux => &.{ "PATH", "SHELL" },
+    };
+    var hasher: std.hash.Wyhash = .init(@intFromEnum(platform));
+    for (names) |name| hashValue(&hasher, env.get(name));
+    return hasher.final();
+}
+
+/// Hashes `value` so that a missing value, an empty one and the
+/// boundaries between values all differ.
+fn hashValue(hasher: *std.hash.Wyhash, value: ?[]const u8) void {
+    const bytes = value orelse {
+        hasher.update(&.{0});
+        return;
+    };
+    hasher.update(&.{1});
+    hasher.update(std.mem.asBytes(&bytes.len));
+    hasher.update(bytes);
+}
+
+/// Whether the recorded configuration inputs `steps`
+/// (`Config._replay_steps`) set `command`, so that the default launch
+/// profile does not apply: the last `--command=` value before `-e` (whose
+/// arguments are the initial command) is not empty. The loaded value
+/// cannot tell, because `Config.finalize` falls back to a default shell.
+pub fn commandConfigured(steps: anytype) bool {
+    const prefix = "--command=";
+    var configured = false;
+    for (steps) |step| {
+        const arg: []const u8 = switch (step) {
+            .@"-e" => break,
+            .arg => |arg| arg,
+            .conditional_arg => |conditional| conditional.arg,
+            else => continue,
+        };
+        if (std.mem.startsWith(u8, arg, prefix)) {
+            configured = std.mem.trim(u8, arg[prefix.len..], " ").len > 0;
+        }
+    }
+    return configured;
 }
 
 /// The installed WSL distributions from
 /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`, default
-/// distribution first, skipping Docker Desktop's internal ones. Returns an
-/// empty list when WSL is not installed or on other platforms.
+/// distribution first, skipping the internal ones of container tools
+/// (`isUtilityDistro`). Returns an empty list when WSL is not installed
+/// or on other platforms.
 pub fn wslDistros(alloc: Allocator) Allocator.Error![]const []const u8 {
     if (comptime builtin.os.tag != .windows) return &.{};
     return try registry.wslDistros(alloc);
+}
+
+/// Whether the WSL distribution `name` belongs to a container tool
+/// (Docker Desktop's `docker-desktop` and `docker-desktop-data`, Rancher
+/// Desktop's `rancher-desktop` and `rancher-desktop-data`) rather than
+/// being a Linux system to open a shell in.
+pub fn isUtilityDistro(name: []const u8) bool {
+    const prefixes = [_][]const u8{ "docker-desktop", "rancher-desktop" };
+    for (prefixes) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(name, prefix)) return true;
+    }
+    return false;
 }
 
 const registry = if (builtin.os.tag == .windows) struct {
@@ -481,7 +720,7 @@ const registry = if (builtin.os.tag == .windows) struct {
             var value_buf: [max_key_len:0]u16 = undefined;
             const distro = readString(key, guid, L("DistributionName"), &value_buf) orelse continue;
             const name = try std.unicode.wtf16LeToWtf8Alloc(alloc, distro);
-            if (std.mem.startsWith(u8, name, "docker-desktop")) continue;
+            if (isUtilityDistro(name)) continue;
 
             const is_default = if (default_guid) |d| std.ascii.eqlIgnoreCase(
                 std.mem.sliceAsBytes(d),
@@ -728,6 +967,176 @@ test "displayName translates detected profiles only" {
     try testing.expectEqualStrings("Command Prompt", name);
 }
 
+test "List.resolve finds ids, custom names and display names" {
+    const testing = std.testing;
+    const saved = i18n.current();
+    defer i18n.setCurrent(saved);
+
+    var env = try testEnv(testing.allocator, &.{
+        .{ "SystemRoot", "C:\\Windows" },
+        .{ "ComSpec", "C:\\Windows\\system32\\cmd.exe" },
+    });
+    defer env.deinit();
+    var list = try detect(testing.allocator, .{
+        .platform = .windows,
+        .env = &env,
+        .wsl_distros = &.{"Ubuntu-24.04"},
+        .probe = .{ .paths = &.{"C:\\Windows\\system32\\cmd.exe"} },
+    }, &.{
+        .{ .name = "Python", .command = "direct:python -i" },
+        .{ .name = "cmd", .command = "cmd.exe /k echo custom" },
+    });
+    defer list.deinit();
+
+    i18n.setCurrent(.zh_CN);
+    try testing.expectEqualStrings("cmd", list.resolve("cmd").?.id);
+    try testing.expectEqualStrings("custom:cmd", list.resolve("custom:cmd").?.id);
+    try testing.expectEqualStrings("custom:Python", list.resolve("Python").?.id);
+    try testing.expectEqualStrings("custom:Python", list.resolve("python").?.id);
+    try testing.expectEqualStrings("cmd", list.resolve("命令提示符").?.id);
+    try testing.expectEqualStrings("cmd", list.resolve("command prompt").?.id);
+    try testing.expectEqualStrings("wsl:Ubuntu-24.04", list.resolve("wsl:Ubuntu-24.04").?.id);
+    try testing.expectEqualStrings("wsl:Ubuntu-24.04", list.resolve("WSL: ubuntu-24.04").?.id);
+    try testing.expectEqual(@as(?*const Profile, null), list.resolve("WSL: Debian"));
+    try testing.expectEqual(@as(?*const Profile, null), list.resolve("wsl"));
+    try testing.expectEqual(@as(?*const Profile, null), list.resolve(""));
+}
+
+test "appendCustom and clone keep the profiles apart" {
+    const testing = std.testing;
+    var env = try testEnv(testing.allocator, &.{.{ "SHELL", "/bin/bash" }});
+    defer env.deinit();
+    var shells = try detectShells(testing.allocator, .{
+        .platform = .linux,
+        .env = &env,
+        .probe = .{ .paths = &.{"/bin/bash"} },
+    });
+    var copy = try shells.clone(testing.allocator);
+    defer copy.deinit();
+    try shells.appendCustom(&.{});
+    try testing.expectEqual(@as(usize, 1), shells.profiles.len);
+    shells.deinit();
+
+    try copy.appendCustom(&.{
+        .{ .name = "Logs", .command = "tail -f /tmp/x.log" },
+        .{ .name = "Top", .command = "htop" },
+    });
+    const ids = [_][]const u8{ "login-shell", "custom:Logs", "custom:Top" };
+    try testing.expectEqual(ids.len, copy.profiles.len);
+    for (ids, copy.profiles) |id, profile| try testing.expectEqualStrings(id, profile.id);
+    try expectArgv(&.{"/bin/bash"}, copy.profiles[0].command);
+    try testing.expectEqualStrings("htop", copy.profiles[2].command.command_line);
+}
+
+test "Cache detects again only when the environment changes" {
+    const testing = std.testing;
+    var env = try testEnv(testing.allocator, &.{
+        .{ "SHELL", "/bin/bash" },
+        .{ "PATH", "/usr/bin" },
+    });
+    defer env.deinit();
+    const environment: Environment = .{
+        .platform = .linux,
+        .env = &env,
+        .probe = .{ .paths = &.{ "/bin/bash", "/usr/bin/zsh" } },
+    };
+
+    var cache: Cache = .{};
+    defer cache.deinit();
+    {
+        var list = try cache.listFor(testing.allocator, environment, &.{});
+        defer list.deinit();
+        try testing.expectEqual(@as(usize, 2), list.profiles.len);
+    }
+    {
+        // New custom profiles do not need a new detection.
+        var list = try cache.listFor(testing.allocator, environment, &.{.{ .name = "Top", .command = "htop" }});
+        defer list.deinit();
+        try testing.expectEqual(@as(usize, 3), list.profiles.len);
+        try testing.expectEqualStrings("custom:Top", list.profiles[2].id);
+    }
+    try testing.expectEqual(@as(u64, 1), cache.detections);
+
+    // A changed PATH, a forced refresh and new WSL distributions do.
+    try env.put("PATH", "/usr/local/bin:/usr/bin");
+    var list = try cache.listFor(testing.allocator, environment, &.{});
+    list.deinit();
+    try testing.expectEqual(@as(u64, 2), cache.detections);
+    cache.invalidate();
+    list = try cache.listFor(testing.allocator, environment, &.{});
+    list.deinit();
+    try testing.expectEqual(@as(u64, 3), cache.detections);
+    var with_distro = environment;
+    with_distro.wsl_distros = &.{"Ubuntu"};
+    list = try cache.listFor(testing.allocator, with_distro, &.{});
+    list.deinit();
+    try testing.expectEqual(@as(u64, 4), cache.detections);
+    list = try cache.listFor(testing.allocator, with_distro, &.{});
+    list.deinit();
+    try testing.expectEqual(@as(u64, 4), cache.detections);
+}
+
+test "fingerprint covers the variables detection reads" {
+    const testing = std.testing;
+    var env = try testEnv(testing.allocator, &.{.{ "PATH", "/usr/bin" }});
+    defer env.deinit();
+    const base = fingerprint(.linux, &env);
+    try testing.expect(base != fingerprint(.windows, &env));
+
+    try env.put("HOME", "/home/u");
+    try testing.expectEqual(base, fingerprint(.linux, &env));
+    try env.put("SHELL", "");
+    const empty_shell = fingerprint(.linux, &env);
+    try testing.expect(base != empty_shell);
+    try env.put("SHELL", "/bin/zsh");
+    try testing.expect(empty_shell != fingerprint(.linux, &env));
+    try testing.expectEqual(fingerprint(.windows, &env), fingerprint(.windows, &env));
+}
+
+test "isUtilityDistro skips the distributions of container tools" {
+    const testing = std.testing;
+    try testing.expect(isUtilityDistro("docker-desktop"));
+    try testing.expect(isUtilityDistro("docker-desktop-data"));
+    try testing.expect(isUtilityDistro("rancher-desktop"));
+    try testing.expect(isUtilityDistro("rancher-desktop-data"));
+    try testing.expect(isUtilityDistro("Rancher-Desktop"));
+    try testing.expect(!isUtilityDistro("Ubuntu-24.04"));
+    try testing.expect(!isUtilityDistro("docker"));
+    try testing.expect(!isUtilityDistro(""));
+}
+
+test "commandConfigured reads the recorded configuration inputs" {
+    const testing = std.testing;
+    const Config = @import("../config/Config.zig");
+    const cli = @import("../cli.zig");
+
+    var config: Config = try .default(testing.allocator);
+    defer config.deinit();
+    try testing.expect(!commandConfigured(config._replay_steps.items));
+
+    const Load = struct {
+        fn lines(cfg: *Config, text: []const u8) !void {
+            var reader: std.Io.Reader = .fixed(text);
+            var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+            try cfg.loadIter(testing.allocator, &iter);
+        }
+    };
+    try Load.lines(&config, "font-size = 13\n");
+    try testing.expect(!commandConfigured(config._replay_steps.items));
+    try Load.lines(&config, "command = pwsh -NoLogo\n");
+    try testing.expect(commandConfigured(config._replay_steps.items));
+    // An empty value resets `command` to its default.
+    try Load.lines(&config, "command =\n");
+    try testing.expect(!commandConfigured(config._replay_steps.items));
+    try Load.lines(&config, "command = direct:cmd.exe\n");
+    try testing.expect(commandConfigured(config._replay_steps.items));
+
+    // The arguments after `-e` are the initial command, not configuration.
+    const Step = std.meta.Elem(@TypeOf(config._replay_steps.items));
+    try testing.expect(!commandConfigured(&[_]Step{ .@"-e", .{ .arg = "--command=pwsh" } }));
+    try testing.expect(commandConfigured(&[_]Step{ .{ .arg = "--command=pwsh" }, .@"-e", .{ .arg = "--command=" } }));
+}
+
 test "wslDistros reads the registry" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
@@ -736,7 +1145,7 @@ test "wslDistros reads the registry" {
     const distros = try wslDistros(arena.allocator());
     for (distros) |distro| {
         try testing.expect(distro.len > 0);
-        try testing.expect(!std.mem.startsWith(u8, distro, "docker-desktop"));
+        try testing.expect(!isUtilityDistro(distro));
     }
 }
 
