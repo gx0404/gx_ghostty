@@ -15,8 +15,9 @@
 //!   dragged takes the strip colors. Split dividers, an outline around the
 //!   focused terminal when a tab has splits, and the bars of windows with
 //!   the `.gx-superuser` or `.gx-remote` class tinted with palette 1 or 5.
-//!   Over a translucent background with `background-blur`, the bars and
-//!   the selected tab are frosted like the terminal (`min_bar_opacity`).
+//!   Over a translucent background with `background-blur`, the bars,
+//!   selected tab and popovers are frosted (`min_bar_opacity`); dialog
+//!   surfaces stay opaque so their headers and bodies match.
 //! - Dialogs, popovers and the rest of libadwaita through its named colors
 //!   (`@define-color`, which libadwaita 1.5 on GTK 4.14 reads): one raised
 //!   surface for dialog bodies, their header bars, popovers and views, so
@@ -47,7 +48,7 @@ const floor = ui_tokens.floor;
 /// the bars of a window whose active terminal runs such a session.
 pub const status_tint: f32 = 0.24;
 
-/// The least opacity of the window's bars and selected tab over a blurred
+/// The least opacity of the window's bars, selected tab and popovers over a blurred
 /// translucent background, so their text stays readable.
 pub const min_bar_opacity: f32 = 0.85;
 
@@ -87,7 +88,7 @@ pub const Colors = struct {
     superuser: Color,
     remote: Color,
 
-    /// The opacity of the window's bars and selected tab: frosted like the
+    /// The opacity of the window's bars, selected tab and popovers: frosted like the
     /// terminal (`background-opacity`, at least `min_bar_opacity`) when
     /// `background-blur` is on, else 1.
     bar_opacity: f32 = 1,
@@ -218,7 +219,7 @@ pub const Named = struct {
             .card_fg_color = t.text,
             .dialog_bg_color = surface,
             .dialog_fg_color = text,
-            .popover_bg_color = surface,
+            .popover_bg_color = surface.withAlpha(colors.bar_opacity),
             .popover_fg_color = text,
             .thumbnail_bg_color = surface,
             .thumbnail_fg_color = text,
@@ -552,6 +553,34 @@ test "the bars are frosted only over a blurred translucent background" {
     try testing.expect(has(out, try std.fmt.bufPrint(&buf, ".bottom-bar {{\n  background-color: rgba({d},{d},{d},0.90);", .{ strip.r, strip.g, strip.b })));
     try testing.expect(has(out, "tab:selected {\n  background-color: rgba(31,31,40,0.90);"));
     try testing.expect(has(out, try std.fmt.bufPrint(&buf, "dnd tab {{\n  background-color: rgb({d},{d},{d});", .{ strip.r, strip.g, strip.b })));
+}
+
+test "frosted popovers retain an opacity floor and leave dialog headers opaque" {
+    var config = try gxMochaConfig();
+    defer config.deinit();
+    config.@"background-opacity" = 0.5;
+    try testing.expectEqual(@as(f32, 1), Named.fromColors(fromConfig(&config).?).popover_bg_color.a);
+    config.@"background-blur" = .true;
+
+    for ([_]Config.WindowTheme{ .auto, .ghostty }) |theme| {
+        config.@"window-theme" = theme;
+        const colors = fromConfig(&config).?;
+        const named: Named = .fromColors(colors);
+        try testing.expectEqual(min_bar_opacity, named.popover_bg_color.a);
+        try testing.expectEqual(colors.surface.toHex(), named.popover_bg_color.toHex());
+        try testing.expectEqual(colors.surface, named.dialog_bg_color);
+        try testing.expectEqual(named.dialog_bg_color, named.headerbar_bg_color);
+        try testing.expectEqual(named.dialog_bg_color, named.window_bg_color);
+        try testing.expectEqual(colors.surface_text, named.popover_fg_color);
+
+        const out = try written(colors, false);
+        defer testing.allocator.free(out);
+        const variables = try written(colors, true);
+        defer testing.allocator.free(variables);
+        var buf: [128]u8 = undefined;
+        try testing.expect(has(out, try std.fmt.bufPrint(&buf, "@define-color popover_bg_color {f};\n", .{css(named.popover_bg_color)})));
+        try testing.expect(has(variables, try std.fmt.bufPrint(&buf, "  --popover-bg-color: {f};\n", .{css(named.popover_bg_color)})));
+    }
 }
 
 test "status tints mix palette 1 and 5 into the strip" {

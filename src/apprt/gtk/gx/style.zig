@@ -131,6 +131,7 @@ pub const Style = struct {
         defer bytes.unref();
         provider.loadFromBytes(bytes);
         self.loaded = hash;
+        log.debug("Ghostty GX stylesheet reloaded ({d} bytes)", .{css.len});
     }
 
     /// Adds the provider to the default display and follows high contrast
