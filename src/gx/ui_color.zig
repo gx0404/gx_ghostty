@@ -3,7 +3,9 @@
 //!
 //! - WCAG 2 contrast from linearized sRGB (`luminance`, `contrast`), and
 //!   the smallest change that reaches a contrast ratio: of the OKLab
-//!   lightness (`ensureContrast`) or of a mix (`mixToContrast`).
+//!   lightness (`ensureContrast`, against several surfaces with
+//!   `ensureContrastAll`) or of a mix (`mixToContrast`). Whether a
+//!   background is dark goes by its gamma-encoded luma instead (`isDark`).
 //! - The OKLab and OKLCH spaces (Björn Ottosson,
 //!   https://bottosson.github.io/posts/oklab/) for perceptual lightness
 //!   and chroma. Colors converted back that fall outside sRGB keep their
@@ -20,7 +22,9 @@
 //! depends on `std`.
 const std = @import("std");
 
-pub const Color = struct {
+/// An extern struct: it has the layout of Direct2D's D2D1_COLOR_F, so the
+/// win32 UI draws with it as it is (`d2d.Color`).
+pub const Color = extern struct {
     r: f32,
     g: f32,
     b: f32,
@@ -257,6 +261,28 @@ pub fn ensureContrast(c: Color, against: Color, ratio: f32) Color {
     return best.withAlpha(c.a);
 }
 
+/// `ensureContrast` against every color of `against`, such as all the
+/// surfaces a text is drawn on: adjusted against the one it contrasts
+/// least with. For surfaces on the same side of `c` (all darker or all
+/// lighter) that one decides and the others follow; otherwise up to three
+/// rounds, keeping the last adjustment.
+pub fn ensureContrastAll(c: Color, against: []const Color, ratio: f32) Color {
+    var out = c;
+    for (0..3) |_| {
+        var worst: ?Color = null;
+        var lowest = ratio;
+        for (against) |surface| {
+            const value = contrast(out, surface);
+            if (value < lowest) {
+                lowest = value;
+                worst = surface;
+            }
+        }
+        out = ensureContrast(out, worst orelse break, ratio);
+    }
+    return out;
+}
+
 /// `mix(a, b, t)` with the smallest `t` from `t_min` up that contrasts at
 /// least `ratio` with `against`, rounded to 8-bit components when `t`
 /// had to grow; null when even `b` does not reach `ratio`. Assumes the
@@ -459,6 +485,37 @@ test "ensureContrast crosses to the other side when it must" {
     try testing.expectEqual(Color.black, ensureContrast(Color.hex(0x707070), mid, 21));
 }
 
+test "ensureContrast reaches the floor for hard pairs, as displayed" {
+    for ([_][2]u24{
+        .{ 0x585b70, 0x1e1e2e }, // dim text on a dark theme
+        .{ 0xacb0be, 0xeff1f5 }, // dim text on a light theme
+        .{ 0x0000ee, 0x000000 }, // xterm blue on black
+        .{ 0x808080, 0x808080 }, // the same color
+    }) |pair| {
+        const c = Color.hex(pair[0]);
+        const against = Color.hex(pair[1]);
+        for ([_]f32{ 3, 4.5 }) |ratio| {
+            const out = ensureContrast(c, against, ratio);
+            try testing.expect(contrast(out, against) >= ratio);
+            try testing.expect(contrast(out.quantize(), against) >= ratio);
+        }
+    }
+}
+
+test "ensureContrastAll meets every surface" {
+    const dark_bg = Color.hex(0x1e1e2e);
+    const raised = mix(dark_bg, Color.white, 0.10);
+    const dim = Color.hex(0x585b70);
+    const out = ensureContrastAll(dim, &.{ dark_bg, raised }, 4.5);
+    try testing.expect(contrast(out, dark_bg) >= 4.5);
+    try testing.expect(contrast(out, raised) >= 4.5);
+    // The closest surface decides: the same as against it alone.
+    try testing.expectEqual(ensureContrast(dim, raised, 4.5), out);
+    // Enough everywhere: unchanged.
+    try testing.expectEqual(Color.white, ensureContrastAll(Color.white, &.{ dark_bg, raised }, 4.5));
+    try testing.expectEqual(dim, ensureContrastAll(dim, &.{}, 4.5));
+}
+
 test "mixToContrast finds the smallest mix that reaches a ratio" {
     const bg = Color.hex(0x1f1f28);
     // Enough already at t_min.
@@ -496,6 +553,13 @@ test "pickAccent moves a colorful candidate to the readable side" {
     const lighter = pickAccent(&.{navy}, dark);
     try testing.expect(contrast(lighter, dark) >= accent_min_contrast);
     try testing.expect(toOklch(lighter).l >= 0.85 - 0.01);
+    // A gray cursor color is skipped for the colorful candidate, which
+    // stays blue.
+    const popup = Color.hex(0x2a2b3c);
+    const dark_blue = Color.hex(0x00006b);
+    const blue = pickAccent(&.{ Color.hex(0xcccccc), dark_blue, dark_blue }, popup);
+    try testing.expect(contrast(blue, popup) >= accent_min_contrast);
+    try testing.expect(blue.b > blue.r);
 }
 
 test "pickAccent falls back for gray themes and without candidates" {
@@ -503,6 +567,10 @@ test "pickAccent falls back for gray themes and without candidates" {
     const gray = pickAccent(&.{ Color.hex(0x303030), Color.hex(0x3a3a3a) }, dark);
     try testing.expect(contrast(gray, dark) >= accent_min_contrast);
     try testing.expect(chroma(gray) < accent_min_chroma);
+    const popup = Color.hex(0x2a2b3c);
+    const grays = pickAccent(&.{ Color.hex(0x444444), Color.hex(0x555555), Color.hex(0x666666) }, popup);
+    try testing.expect(contrast(grays, popup) >= accent_min_contrast);
+    try testing.expect(chroma(grays) < 0.02);
     const fallback = pickAccent(&.{}, Color.white);
     try testing.expectEqual(default_accent.toHex(), fallback.toHex());
     try testing.expect(contrast(pickAccent(&.{ null, null }, Color.hex(0x0060c0)), Color.hex(0x0060c0)) >= accent_min_contrast);

@@ -1,10 +1,11 @@
 //! Motion of the Ghostty GX interface, the same on win32 and GTK: the
-//! Fluent durations (83, 167 and 250 ms), the entrance and exit curves as
-//! CSS `cubic-bezier` timing functions, and whether to animate at all
-//! (the system's animation setting, remote sessions, and the
-//! `GHOSTTY_GX_ANIMATIONS` override). Animations are driven by elapsed
-//! time (`fraction`), not by frame counts, and jump to their end state
-//! when animations are off. Only depends on `std`.
+//! Fluent durations (83, 167 and 250 ms), the entrance, exit and
+//! movement curves as CSS `cubic-bezier` timing functions, and whether to
+//! animate at all (the system's animation setting, remote sessions, and
+//! the `GHOSTTY_GX_ANIMATIONS` override). Animations are driven by
+//! elapsed time (`fraction`), not by frame counts, and jump to their end
+//! state when animations are off. The win32 frame clock and tweens are in
+//! `src/apprt/win32/ui/anim.zig`. Only depends on `std`.
 const std = @import("std");
 
 /// Durations in milliseconds.
@@ -71,6 +72,10 @@ pub const enter: CubicBezier = .{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 1 };
 /// Exiting and disappearing elements: slow out, fast in (accelerate).
 pub const exit: CubicBezier = .{ .x1 = 1, .y1 = 0, .x2 = 1, .y2 = 1 };
 
+/// Moving between two places on screen, such as a selection indicator
+/// going to another row (Fluent 2 easy ease).
+pub const ease: CubicBezier = .{ .x1 = 0.33, .y1 = 0, .x2 = 0.67, .y2 = 1 };
+
 pub const linear: CubicBezier = .{ .x1 = 0, .y1 = 0, .x2 = 1, .y2 = 1 };
 
 /// The fraction of an animation of `total_ms` done after `elapsed_ms`,
@@ -121,7 +126,7 @@ pub fn parseOverride(value: []const u8) ?bool {
 const testing = std.testing;
 
 test "curves start at 0, end at 1 and only grow" {
-    for ([_]CubicBezier{ enter, exit, linear }) |curve| {
+    for ([_]CubicBezier{ enter, exit, ease, linear }) |curve| {
         try testing.expectEqual(@as(f32, 0), curve.at(0));
         try testing.expectEqual(@as(f32, 1), curve.at(1));
         try testing.expectEqual(@as(f32, 0), curve.at(-1));
@@ -142,10 +147,14 @@ test "enter decelerates, exit accelerates" {
     try testing.expectApproxEqAbs(@as(f32, 0.3), linear.at(0.3), 1e-4);
     try testing.expect(enter.at(0.2) > 0.5);
     try testing.expect(exit.at(0.8) < 0.5);
+    // Easy ease is symmetric: slow at both ends, half way at half time.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ease.at(0.5), 1e-3);
+    try testing.expectApproxEqAbs(1 - ease.at(0.8), ease.at(0.2), 1e-3);
+    try testing.expect(ease.at(0.1) < 0.1);
 }
 
 test "timeAt inverts at" {
-    for ([_]CubicBezier{ enter, exit, linear }) |curve| {
+    for ([_]CubicBezier{ enter, exit, ease, linear }) |curve| {
         for ([_]f32{ 0, 0.1, 0.25, 0.5, 0.75, 0.9, 1 }) |p| {
             try testing.expectApproxEqAbs(p, curve.at(curve.timeAt(p)), 1e-3);
         }

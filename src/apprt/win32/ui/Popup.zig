@@ -27,8 +27,9 @@
 //! `WM_GX_OWNER_ACTIVE_LOCK` (wparam 1) to its root owner before it takes
 //! activation and (wparam 0) once it hid or lost activation, so the owner
 //! can keep painting its frame as active; the owner re-evaluates its
-//! frame on unlock. With `Options.motion` the popup fades in over 167 ms
-//! (`anim`) as a layered window painted through a `d2d.DibTarget`.
+//! frame on unlock. With `Options.motion` the popup fades in (`anim`, the
+//! 167 ms entrance of `gx.motion`) as a layered window painted through a
+//! `d2d.DibTarget`.
 //!
 //! Text input: with `Options.text_input` the popup keeps a `TextInput`
 //! (`popup.input`) that receives typing, editing keys (`text_edit`: words,
@@ -349,7 +350,7 @@ pub fn destroy(self: *Popup) void {
 /// Set the 1px DWM border color (Windows 11).
 pub fn setBorderColor(self: *Popup, color: d2d.Color) void {
     const hwnd = self.hwnd orelse return;
-    const ref: u32 = color.colorRef();
+    const ref: u32 = d2d.colorRef(color);
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_BORDER_COLOR, @ptrCast(&ref), @sizeOf(u32));
 }
 
@@ -575,7 +576,7 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
     setCloaked(hwnd, false);
     if (!self.fade_pending) return;
     self.fade_pending = false;
-    self.fade = anim.Tween.begin(anim.now(), anim.duration_ms.fast, anim.Curve.decelerate);
+    self.fade = anim.Tween.begin(anim.now(), anim.motion.duration.fast, anim.motion.enter);
     if (!anim.start(&self.animator)) self.finishMotion(hwnd);
 }
 

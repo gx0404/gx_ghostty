@@ -17,7 +17,10 @@
 //!   close button.
 //!
 //! `window-titlebar-background` and `-foreground` replace the strip
-//! colors where the GTK app honors them (`Options.fromConfig`).
+//! colors where the GTK app honors them (`Options.fromConfig`). In high
+//! contrast the chrome takes the system colors (`Chrome.fromSystem`).
+const chrome = @This();
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("../config/Config.zig");
@@ -84,6 +87,10 @@ pub const Chrome = struct {
     divider_active: Color,
     /// The 1px window border.
     window_border: Color,
+    /// The hovered caption close button, its glyph, and the pressed one.
+    close_hover: Color = chrome.close_hover,
+    close_hover_text: Color = chrome.close_hover_text,
+    close_pressed: Color = chrome.close_pressed,
 
     pub fn derive(tokens: *const ui_tokens.Tokens, options: Options) Chrome {
         const bg = tokens.background;
@@ -103,6 +110,27 @@ pub const Chrome = struct {
             .divider = options.divider orelse divider(bg, fg),
             .divider_active = tokens.accent,
             .window_border = ui_color.mix(bg, fg, if (tokens.dark) 0.18 else 0.22),
+        };
+    }
+
+    /// The chrome in the high contrast colors `c`: the window colors, with
+    /// the highlight for hovered, pressed and active parts.
+    pub fn fromSystem(c: ui_tokens.SystemColors) Chrome {
+        return .{
+            .dark = ui_color.isDark(c.window),
+            .title_bar = c.window,
+            .text = c.window_text,
+            .text_inactive = c.window_text,
+            .active_tab = c.window,
+            .hover = c.highlight,
+            .pressed = c.highlight,
+            .tab_separator = c.window_text,
+            .divider = c.window_text,
+            .divider_active = c.highlight,
+            .window_border = c.window_text,
+            .close_hover = c.highlight,
+            .close_hover_text = c.highlight_text,
+            .close_pressed = c.highlight,
         };
     }
 };
@@ -210,6 +238,21 @@ test "title bar options replace the strip colors" {
     try testing.expectEqual(@as(u24, 0x202020), c.hover.toHex());
     // The active tab still joins the terminal.
     try testing.expectEqual(@as(u24, 0x1f1f28), c.active_tab.toHex());
+}
+
+test "the caption close button is red, or the highlight in high contrast" {
+    const c = chromeFor(0x1f1f28, 0xffffff);
+    try testing.expectEqual(close_hover, c.close_hover);
+    try testing.expectEqual(close_hover_text, c.close_hover_text);
+    try testing.expectEqual(close_pressed, c.close_pressed);
+    const system: ui_tokens.SystemColors = .{};
+    const hc: Chrome = .fromSystem(system);
+    try testing.expectEqual(system.window, hc.title_bar);
+    try testing.expectEqual(system.window_text, hc.window_border);
+    try testing.expectEqual(system.highlight, hc.hover);
+    try testing.expectEqual(system.highlight, hc.close_hover);
+    try testing.expectEqual(system.highlight_text, hc.close_hover_text);
+    try testing.expect(hc.dark);
 }
 
 test "Options.fromConfig" {

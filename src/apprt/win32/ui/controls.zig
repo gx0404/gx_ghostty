@@ -6,9 +6,11 @@
 //!
 //! Geometry is in DIPs; edges are snapped to device pixels by the canvas
 //! and strokes are whole pixels, so 125 % and 150 % stay sharp. Pressed
-//! fills are fainter than hovered ones (Fluent); the focus ring is drawn
-//! only for keyboard focus (callers pass `State.focused` then). The pure
-//! parts (`buttonColors`, `focusRingRects`, `indicatorRect`, the
+//! fills are fainter than hovered ones for every kind of button (Fluent;
+//! the tokens `pressed` and `control_fill_pressed` of `gx.ui_tokens`); the
+//! focus ring, WinUI's foreground outer and surface inner stroke, is
+//! drawn only for keyboard focus (callers pass `State.focused` then). The
+//! pure parts (`buttonColors`, `focusRingRects`, `indicatorRect`, the
 //! `ScrollIndicator` geometry) are unit tested.
 const std = @import("std");
 const d2d = @import("d2d.zig");
@@ -314,6 +316,13 @@ test "buttons: pressed is fainter than hovered, disabled is disabled" {
     try testing.expect(style.contrast(hover.fill.?, base) > style.contrast(rest.fill.?, base));
     try testing.expect(style.contrast(pressed.fill.?, base) < style.contrast(hover.fill.?, base));
     try testing.expectEqual(t.control_border, rest.border.?);
+    // Subtle and accent buttons too.
+    const subtle_hover = buttonColors(.subtle, .{ .hover = true }, t);
+    const subtle_pressed = buttonColors(.subtle, .{ .hover = true, .pressed = true }, t);
+    try testing.expect(style.contrast(subtle_pressed.fill.?, base) < style.contrast(subtle_hover.fill.?, base));
+    const accent_hover = buttonColors(.accent, .{ .hover = true }, t);
+    const accent_pressed = buttonColors(.accent, .{ .hover = true, .pressed = true }, t);
+    try testing.expect(style.contrast(accent_pressed.fill.?, base) < style.contrast(accent_hover.fill.?, base));
     const disabled = buttonColors(.accent, .{ .disabled = true, .hover = true }, t);
     try testing.expectEqual(t.text_disabled, disabled.text);
     // Subtle buttons have no fill at rest.

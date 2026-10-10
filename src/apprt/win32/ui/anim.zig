@@ -1,6 +1,9 @@
-//! Motion for the custom-drawn UI: the Fluent durations and easing curves,
-//! time-based `Tween`s, whether to animate at all (`enabled`), and a frame
-//! clock that calls running animations once per display refresh.
+//! The frame clock of the custom-drawn UI: time-based `Tween`s, whether
+//! to animate at all (`enabled`), and a clock that calls running
+//! animations once per display refresh. The durations and easing curves
+//! are the shared ones of `gx.motion` (re-exported as `motion`): Fluent's
+//! 83/167/250 ms, entering elements `motion.enter`, leaving ones
+//! `motion.exit`, movements `motion.ease`.
 //!
 //! The clock: while an `Animator` runs, a background thread waits for the
 //! next DWM composition (`DwmFlush`) and posts one `WM_TICK` to a
@@ -8,116 +11,36 @@
 //! thread then calls every running animator. The next tick is posted only
 //! after the GUI thread handled the previous one, so a busy GUI thread gets
 //! fewer ticks rather than a queue of them, and without running animators
-//! the thread sleeps on an event. Animations compute their progress from
-//! the elapsed time (`Tween`), so a late frame skips ahead instead of
-//! slowing the animation down.
+//! the thread sleeps on an event. The thread starts with the first
+//! animation and is detached: it lives until the process exits. Animations
+//! compute their progress from the elapsed time (`Tween`), so a late frame
+//! skips ahead instead of slowing the animation down. The clock thread
+//! follows the idea of Zed's Windows vsync thread (Apache-2.0, idea only):
+//! DwmFlush in a loop, sleeping a refresh period when it returns at once.
 //!
-//! `enabled` follows the Windows "Animation effects" setting
-//! (`SPI_GETCLIENTAREAANIMATION`), is off in remote sessions
-//! (`SM_REMOTESESSION`), and the environment variable
-//! `GHOSTTY_GX_ANIMATIONS` (`1`/`0`, `on`/`off`, ...) overrides both.
-//! Callers ask it when an animation would start and jump to the end state
-//! when it says no.
-//!
-//! Durations and curves are the Fluent motion values: 83/167/250 ms (WinUI
-//! ControlFaster/Fast/NormalAnimationDuration), entering elements
-//! `cubic-bezier(0,0,0,1)`, leaving ones `cubic-bezier(1,0,1,1)`. The clock
-//! thread follows the idea of Zed's Windows vsync thread (Apache-2.0,
-//! idea only): DwmFlush in a loop, sleeping a refresh period when it
-//! returns at once.
+//! `enabled` is `motion.enabled` for this system: the Windows "Animation
+//! effects" setting (`SPI_GETCLIENTAREAANIMATION`), off in remote sessions
+//! (`SM_REMOTESESSION`), and `GHOSTTY_GX_ANIMATIONS` (read once) overrides
+//! both. Callers ask it when an animation would start and jump to the end
+//! state when it says no.
 //!
 //! Everything except the clock thread runs on the GUI thread.
 const std = @import("std");
 const w32 = @import("../win32.zig");
 
+/// The shared durations and curves (`gx.motion`).
+pub const motion = @import("../../../gx/motion.zig");
+
 const log = std.log.scoped(.win32_anim);
-
-/// Animation durations in milliseconds.
-pub const duration_ms = struct {
-    /// Hover and press feedback.
-    pub const faster: u32 = 83;
-    /// Popups fading in, a selection moving.
-    pub const fast: u32 = 167;
-    /// Larger movements.
-    pub const normal: u32 = 250;
-};
-
-/// A cubic Bézier easing curve from (0,0) to (1,1), as in CSS
-/// `cubic-bezier(x1, y1, x2, y2)`.
-pub const Curve = struct {
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-
-    pub const linear: Curve = .{ .x1 = 0, .y1 = 0, .x2 = 1, .y2 = 1 };
-    /// Entering elements: fast start, slow end (Fluent decelerate).
-    pub const decelerate: Curve = .{ .x1 = 0, .y1 = 0, .x2 = 0, .y2 = 1 };
-    /// Leaving elements: slow start, fast end (Fluent accelerate).
-    pub const accelerate: Curve = .{ .x1 = 1, .y1 = 0, .x2 = 1, .y2 = 1 };
-    /// Moving between two places on screen (Fluent easy ease).
-    pub const ease: Curve = .{ .x1 = 0.33, .y1 = 0, .x2 = 0.67, .y2 = 1 };
-
-    /// One coordinate of the curve at parameter `t`.
-    fn sample(a1: f32, a2: f32, t: f32) f32 {
-        const u = 1 - t;
-        return 3 * u * u * t * a1 + 3 * u * t * t * a2 + t * t * t;
-    }
-
-    fn slope(a1: f32, a2: f32, t: f32) f32 {
-        const u = 1 - t;
-        return 3 * u * u * a1 + 6 * u * t * (a2 - a1) + 3 * t * t * (1 - a2);
-    }
-
-    /// The parameter where the coordinate with control values a1, a2 is
-    /// `v` (it rises monotonically from 0 to 1).
-    fn solve(a1: f32, a2: f32, v: f32) f32 {
-        var t = v;
-        for (0..8) |_| {
-            const err = sample(a1, a2, t) - v;
-            if (@abs(err) < 1e-6) return t;
-            const d = slope(a1, a2, t);
-            if (@abs(d) < 1e-6) break;
-            t -= err / d;
-            if (t < 0 or t > 1) break;
-        }
-        var lo: f32 = 0;
-        var hi: f32 = 1;
-        t = v;
-        for (0..40) |_| {
-            const s = sample(a1, a2, t);
-            if (@abs(s - v) < 1e-6) return t;
-            if (s < v) lo = t else hi = t;
-            t = (lo + hi) / 2;
-        }
-        return t;
-    }
-
-    /// The eased progress for linear progress `x` (0..1).
-    pub fn at(self: Curve, x: f32) f32 {
-        if (x <= 0) return 0;
-        if (x >= 1) return 1;
-        return sample(self.y1, self.y2, solve(self.x1, self.x2, x));
-    }
-
-    /// The linear progress whose eased value is `y`: where an animation
-    /// with this curve stands when it should continue from `y`, e.g. one
-    /// that reverses halfway.
-    pub fn inverse(self: Curve, y: f32) f32 {
-        if (y <= 0) return 0;
-        if (y >= 1) return 1;
-        return sample(self.x1, self.x2, solve(self.y1, self.y2, y));
-    }
-};
 
 /// Progress of an animation over time: started at `start_ns` (see
 /// `now`), lasting `duration_ns`, eased by `curve`.
 pub const Tween = struct {
     start_ns: u64,
     duration_ns: u64,
-    curve: Curve = Curve.decelerate,
+    curve: motion.CubicBezier = motion.enter,
 
-    pub fn begin(now_ns: u64, ms: u32, curve: Curve) Tween {
+    pub fn begin(now_ns: u64, ms: u32, curve: motion.CubicBezier) Tween {
         return .{ .start_ns = now_ns, .duration_ns = @as(u64, ms) * std.time.ns_per_ms, .curve = curve };
     }
 
@@ -152,46 +75,31 @@ pub const Tween = struct {
 /// Whether animations should run now (see the file header). Ask when an
 /// animation would start.
 pub fn enabled() bool {
-    return decide(envOverride(), clientAreaAnimation(), remoteSession());
+    return motion.enabled(.{
+        .system = clientAreaAnimation(),
+        .remote_session = remoteSession(),
+        .override = envOverride(),
+    });
 }
 
-/// Animations run when `GHOSTTY_GX_ANIMATIONS` says so (`env`), else when
-/// the system setting is on and the session is local.
-pub fn decide(env: ?bool, client_area_animation: bool, remote_session: bool) bool {
-    if (env) |forced| return forced;
-    return client_area_animation and !remote_session;
-}
+var env_read = false;
+var env_buf: [16]u8 = undefined;
+var env_len: usize = 0;
 
-/// The value of `GHOSTTY_GX_ANIMATIONS`: null when unset or unrecognized.
-pub fn parseOverride(value: []const u8) ?bool {
-    const on = [_][]const u8{ "1", "true", "on", "yes" };
-    const off = [_][]const u8{ "0", "false", "off", "no" };
-    const trimmed = std.mem.trim(u8, value, " \t");
-    for (on) |word| if (std.ascii.eqlIgnoreCase(trimmed, word)) return true;
-    for (off) |word| if (std.ascii.eqlIgnoreCase(trimmed, word)) return false;
-    return null;
-}
-
-const EnvState = enum { unread, unset, on, off };
-var env_state: EnvState = .unread;
-
-fn envOverride() ?bool {
-    if (env_state == .unread) {
-        env_state = .unset;
-        var buf: [16]u16 = undefined;
-        const name = std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_ANIMATIONS");
+/// The value of `motion.env_override`, read once; null when unset or too
+/// long to be a valid value.
+fn envOverride() ?[]const u8 {
+    if (!env_read) {
+        env_read = true;
+        var buf: [env_buf.len]u16 = undefined;
+        const name = std.unicode.utf8ToUtf16LeStringLiteral(motion.env_override);
         const n = GetEnvironmentVariableW(name, &buf, buf.len);
         if (n > 0 and n < buf.len) {
-            var ascii: [16]u8 = undefined;
-            for (buf[0..n], 0..) |unit, i| ascii[i] = if (unit < 0x80) @intCast(unit) else '?';
-            if (parseOverride(ascii[0..n])) |value| env_state = if (value) .on else .off;
+            for (buf[0..n], 0..) |unit, i| env_buf[i] = if (unit < 0x80) @intCast(unit) else '?';
+            env_len = n;
         }
     }
-    return switch (env_state) {
-        .on => true,
-        .off => false,
-        .unread, .unset => null,
-    };
+    return if (env_len > 0) env_buf[0..env_len] else null;
 }
 
 const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
@@ -236,7 +144,11 @@ pub fn now() u64 {
 // -----------------------------------------------------------------------
 
 /// A running animation, embedded in its owner (find the owner with
-/// `@fieldParentPtr`). Stop it before the owner goes away.
+/// `@fieldParentPtr`). The owner stops it before it goes away, also from
+/// inside its own tick: a tick may `stop` its animator and then free the
+/// owner, and the clock does not touch a stopped animator again. A tick
+/// that returns false without stopping is stopped by the clock after it
+/// returns, so its owner must still be alive then.
 pub const Animator = struct {
     /// Called on the GUI thread once per frame with the frame time while
     /// running; return false when the animation is over (it stops).
@@ -309,7 +221,12 @@ fn onTick() void {
     clock.cursor = 0;
     while (clock.cursor < clock.count) {
         const animator = clock.animators[clock.cursor];
-        if (!animator.tick(animator, t)) stop(animator);
+        if (!animator.tick(animator, t)) {
+            // Unless the tick stopped it itself: then `stop` moved the
+            // cursor and the animator, whose owner may be gone, is left
+            // alone.
+            if (clock.cursor < clock.count and clock.animators[clock.cursor] == animator) stop(animator);
+        }
         clock.cursor +%= 1;
     }
     clock.dispatching = false;
@@ -358,6 +275,8 @@ fn ensureClock() bool {
         _ = w32.DestroyWindow(hwnd);
         return false;
     };
+    // Never joined: the thread waits on `wake` while nothing animates and
+    // ends with the process.
     thread.detach();
     clock.hwnd = hwnd;
     clock.wake = wake;
@@ -374,6 +293,7 @@ fn clockWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv
 }
 
 /// The clock thread: one tick per composed frame while animations run.
+/// It never returns; the process exit ends it.
 fn clockThread(hwnd: w32.HWND, wake: w32.HANDLE) void {
     while (true) {
         if (!clock.active.load(.acquire)) {
@@ -400,49 +320,10 @@ extern "user32" fn SystemParametersInfoW(
     fWinIni: u32,
 ) callconv(.winapi) i32;
 
-test "curves start at 0, end at 1 and ease the right way" {
-    const testing = std.testing;
-    inline for (.{ Curve.linear, Curve.decelerate, Curve.accelerate, Curve.ease }) |curve| {
-        try testing.expectEqual(@as(f32, 0), curve.at(0));
-        try testing.expectEqual(@as(f32, 1), curve.at(1));
-        try testing.expectEqual(@as(f32, 0), curve.at(-1));
-        try testing.expectEqual(@as(f32, 1), curve.at(2));
-        // Monotonic.
-        var last: f32 = 0;
-        for (1..100) |i| {
-            const v = curve.at(@as(f32, @floatFromInt(i)) / 100);
-            try testing.expect(v >= last - 1e-5);
-            last = v;
-        }
-    }
-    try testing.expectApproxEqAbs(@as(f32, 0.5), Curve.linear.at(0.5), 1e-4);
-    // cubic-bezier(0,0,0,1) at x = 0.5: t = cbrt(0.5), y = 3t^2 - 2t^3.
-    const t = std.math.cbrt(@as(f32, 0.5));
-    try testing.expectApproxEqAbs(3 * t * t - 2 * t * t * t, Curve.decelerate.at(0.5), 1e-4);
-    // Decelerate is ahead of linear, accelerate behind it.
-    try testing.expect(Curve.decelerate.at(0.25) > 0.6);
-    try testing.expect(Curve.accelerate.at(0.25) < 0.2);
-    try testing.expectApproxEqAbs(@as(f32, 0.5), Curve.ease.at(0.5), 1e-3);
-}
-
-test "inverse finds where a curve reaches a value" {
-    const testing = std.testing;
-    inline for (.{ Curve.linear, Curve.decelerate, Curve.accelerate, Curve.ease }) |curve| {
-        for ([_]f32{ 0.1, 0.25, 0.5, 0.8, 0.95 }) |x| {
-            try testing.expectApproxEqAbs(x, curve.inverse(curve.at(x)), 2e-3);
-        }
-    }
-    // A slide-in reversed at 70 % continues from the same position with
-    // the accelerating curve.
-    const shown = Curve.decelerate.at(0.4);
-    const out_start = Curve.accelerate.inverse(1 - shown);
-    try testing.expectApproxEqAbs(1 - shown, Curve.accelerate.at(out_start), 1e-3);
-}
-
 test "tweens follow the clock, not the frames" {
     const testing = std.testing;
     const ms = std.time.ns_per_ms;
-    const tween = Tween.begin(1000 * ms, duration_ms.fast, Curve.linear);
+    const tween = Tween.begin(1000 * ms, motion.duration.fast, motion.linear);
     try testing.expectEqual(@as(f32, 0), tween.progress(1000 * ms));
     try testing.expectEqual(@as(f32, 0), tween.progress(900 * ms));
     try testing.expectApproxEqAbs(@as(f32, 0.5), tween.linear(1000 * ms + 83 * ms + ms / 2), 1e-3);
@@ -452,25 +333,12 @@ test "tweens follow the clock, not the frames" {
     try testing.expectEqual(@as(f32, 1), tween.progress(5000 * ms));
     try testing.expectApproxEqAbs(@as(f32, 128), tween.lerp(1000 * ms + 83 * ms + ms / 2, 0, 255), 0.5);
     // Zero duration is done at once.
-    const instant = Tween.begin(0, 0, Curve.decelerate);
+    const instant = Tween.begin(0, 0, motion.enter);
     try testing.expect(instant.done(0));
     try testing.expectEqual(@as(f32, 1), instant.progress(0));
-}
-
-test "animations follow the system setting, remote sessions and the override" {
-    const testing = std.testing;
-    try testing.expect(decide(null, true, false));
-    try testing.expect(!decide(null, false, false));
-    try testing.expect(!decide(null, true, true));
-    try testing.expect(decide(true, false, true));
-    try testing.expect(!decide(false, true, false));
-
-    try testing.expectEqual(@as(?bool, true), parseOverride("1"));
-    try testing.expectEqual(@as(?bool, true), parseOverride(" On "));
-    try testing.expectEqual(@as(?bool, false), parseOverride("0"));
-    try testing.expectEqual(@as(?bool, false), parseOverride("FALSE"));
-    try testing.expectEqual(@as(?bool, null), parseOverride(""));
-    try testing.expectEqual(@as(?bool, null), parseOverride("maybe"));
+    // The default curve decelerates, like the popup fade-in.
+    const fade = Tween.begin(0, motion.duration.fast, motion.enter);
+    try testing.expectEqual(motion.enter.at(0.5), fade.progress(83 * ms + ms / 2));
 }
 
 test "stopping animators while the clock calls them" {
@@ -514,6 +382,42 @@ test "stopping animators while the clock calls them" {
     try testing.expectEqual(@as(u32, 3), b.ticks);
     try testing.expectEqual(@as(usize, 0), clock.count);
     try testing.expect(!busy());
+}
+
+test "a tick that stops its own animator is not touched again" {
+    const testing = std.testing;
+    const Owner = struct {
+        animator: Animator = .{ .tick = tick },
+        ticks: u32 = 0,
+
+        fn tick(animator: *Animator, _: u64) bool {
+            const self: *@This() = @fieldParentPtr("animator", animator);
+            self.ticks += 1;
+            stop(animator);
+            // What a freed owner could hold: the clock must not stop it
+            // again or read it.
+            animator.running = true;
+            return false;
+        }
+    };
+    const saved = clock;
+    defer clock = saved;
+    clock = .{};
+
+    var first: Owner = .{};
+    var second: Owner = .{};
+    for ([_]*Owner{ &first, &second }) |owner| {
+        clock.animators[clock.count] = &owner.animator;
+        clock.count += 1;
+        owner.animator.running = true;
+    }
+    onTick();
+    // Both ran once and left the clock; the clock left their (garbage)
+    // state alone.
+    try testing.expectEqual(@as(u32, 1), first.ticks);
+    try testing.expectEqual(@as(u32, 1), second.ticks);
+    try testing.expectEqual(@as(usize, 0), clock.count);
+    try testing.expect(first.animator.running and second.animator.running);
 }
 
 test {

@@ -31,6 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const w32 = @import("../win32.zig");
 const i18n = @import("../../../gx/i18n.zig");
+const ui_color = @import("../../../gx/ui_color.zig");
 const text_edit = @import("text_edit.zig");
 const wstr = @import("wstr.zig");
 
@@ -54,50 +55,20 @@ fn succeeded(hr: HRESULT) bool {
 // Value types
 // -----------------------------------------------------------------------
 
-/// A straight-alpha RGBA color with components in 0..1 (D2D1_COLOR_F).
-pub const Color = extern struct {
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32 = 1.0,
+/// A straight-alpha RGBA color with components in 0..1 (D2D1_COLOR_F):
+/// the GX interface color `gx.ui_color.Color`, an extern struct with this
+/// layout, so the tokens of `gx.ui_tokens` draw as they are.
+pub const Color = ui_color.Color;
 
-    /// A color from 8-bit sRGB components.
-    pub fn rgb(r: u8, g: u8, b: u8) Color {
-        return .{
-            .r = @as(f32, @floatFromInt(r)) / 255.0,
-            .g = @as(f32, @floatFromInt(g)) / 255.0,
-            .b = @as(f32, @floatFromInt(b)) / 255.0,
-        };
-    }
+comptime {
+    std.debug.assert(@sizeOf(Color) == 16 and @offsetOf(Color, "a") == 12);
+}
 
-    /// A color from 0xRRGGBB.
-    pub fn hex(value: u24) Color {
-        return rgb(@truncate(value >> 16), @truncate(value >> 8), @truncate(value));
-    }
-
-    pub fn withAlpha(self: Color, a: f32) Color {
-        var c = self;
-        c.a = a;
-        return c;
-    }
-
-    /// The GDI COLORREF (0x00BBGGRR) of this color, ignoring alpha.
-    pub fn colorRef(self: Color) u32 {
-        const r: u32 = to8(self.r);
-        const g: u32 = to8(self.g);
-        const b: u32 = to8(self.b);
-        return r | (g << 8) | (b << 16);
-    }
-
-    /// The color as 0xRRGGBB, ignoring alpha.
-    pub fn toHex(self: Color) u24 {
-        return (@as(u24, to8(self.r)) << 16) | (@as(u24, to8(self.g)) << 8) | to8(self.b);
-    }
-
-    fn to8(v: f32) u8 {
-        return @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
-    }
-};
+/// The GDI COLORREF (0x00BBGGRR) of a color, ignoring alpha.
+pub fn colorRef(c: Color) u32 {
+    const rgb = c.toRgb8();
+    return @as(u32, rgb.r) | (@as(u32, rgb.g) << 8) | (@as(u32, rgb.b) << 16);
+}
 
 pub const Point = extern struct { x: f32, y: f32 };
 pub const Size = extern struct { width: f32, height: f32 };

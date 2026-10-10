@@ -1,491 +1,180 @@
-//! Design tokens of the win32 UI, derived from the terminal colors so the
-//! chrome and popups match the active theme: colors (`Tokens`), sizes in
-//! DIPs (`space`, `radius`, `control`, `row`, `type_ramp`, `icon`,
+//! Design tokens of the win32 UI: the colors (`Tokens`) and sizes in DIPs
+//! (`space`, `radius`, `control`, `row`, `type_ramp`, `icon`,
 //! `close_button`, `selection_indicator`, `focus_ring`; the older
-//! `metrics` and `font_size` stay for existing callers) and the helpers to
-//! scale them to pixels and to derive hover/pressed shades. Spacing,
-//! radii and control, row and button sizes are multiples of 4 DIPs
-//! (checked at compile time); hairlines are one device pixel
+//! `metrics` and `font_size` stay for existing callers), and the helpers
+//! to scale them to pixels and to shade a fill for hover and press.
+//! Spacing, radii and control, row and button sizes are multiples of 4
+//! DIPs (checked at compile time); hairlines are one device pixel
 //! (`d2d.Canvas.hairline`).
 //!
-//! Contrast: contrast ratios are WCAG's, on linear-light luminance
-//! (`contrast`), and colors are adjusted along OKLab lightness
-//! (`ensureContrast`). Secondary text and placeholders get at least 4.5:1
-//! on panels and popups, tertiary text, the accent, the focus stroke and
-//! the selection indicator 3:1, borders 1.4:1. The accent is the first of
-//! the cursor color, palette 4 and palette 12 that is colorful (OKLCH
-//! chroma >= 0.05) and contrasts 3:1 with popups, else the first colorful
-//! one with its lightness adjusted (`pickAccent`). Surfaces mix the
-//! background with the foreground limited to OKLCH chroma 0.04, so a
-//! saturated foreground does not tint them. The title bar strip differs
-//! from the terminal background by at least 1.12:1, darker when it can.
+//! The colors come from the interface library the GTK app shares:
+//! `gx.ui_tokens` derives them from the terminal colors with the color
+//! math of `gx.ui_color` (contrast floors on every surface, the accent,
+//! pressed fainter than hovered, the WinUI focus ring of a foreground
+//! outer and a surface inner stroke), and `gx.chrome` the title bar strip,
+//! its overlays, the window border and the caption close button. `Tokens`
+//! carries both: every field of `gx.ui_tokens.Tokens` under the same name
+//! (a comptime check keeps them in step) and the chrome colors the title
+//! bar and tab bar draw. `Color` is `gx.ui_color.Color`. A theme is dark
+//! when the gamma-encoded luma of its background is under one half
+//! (`ui_color.isDark`); contrast ratios use WCAG luminance
+//! (`ui_color.luminance`).
 //!
-//! High contrast: while Windows high contrast is on (`system`, GUI thread
-//! state that the window refreshes on WM_SETTINGCHANGE, WM_SYSCOLORCHANGE
-//! and WM_THEMECHANGED), `fromConfig` returns `fromSystem`, the system
-//! colors, with `high_contrast` set so cards and inputs get borders.
+//! High contrast: while Windows high contrast is on (`system`),
+//! `fromConfig` returns `fromSystem`, the system colors, with
+//! `high_contrast` set so cards and inputs get borders. `system` is GUI
+//! thread state read on first use; `System.refresh` reads it again, to be
+//! called after WM_SETTINGCHANGE, WM_SYSCOLORCHANGE or WM_THEMECHANGED.
 //!
 //! `fromConfig` caches the tokens of the last colors it saw (the color
 //! values, not the config) on the GUI thread; call it when painting.
 const std = @import("std");
 const configpkg = @import("../../../config.zig");
 const Config = configpkg.Config;
+const chrome = @import("../../../gx/chrome.zig");
+const ui_color = @import("../../../gx/ui_color.zig");
+const ui_tokens = @import("../../../gx/ui_tokens.zig");
 const d2d = @import("d2d.zig");
 
 pub const Color = d2d.Color;
 
+/// `a` moved toward `b` by `t` (0 is `a`, 1 is `b`), alpha too
+/// (`gx.ui_color.mix`).
+pub const mix = ui_color.mix;
+
+/// The WCAG contrast ratio of two colors, 1 to 21 (`gx.ui_color.contrast`).
+pub const contrast = ui_color.contrast;
+
 /// The UI colors for one terminal theme.
 pub const Tokens = struct {
-    /// Whether the theme is dark (from the background's gamma luminance).
+    // The fields of `gx.ui_tokens.Tokens`, which documents them; `combine`
+    // copies them by name.
     dark: bool,
-    /// The Windows high contrast colors are in use: draw borders on cards
-    /// and inputs, do not rely on fills alone.
     high_contrast: bool = false,
-
-    /// The terminal background and foreground.
     background: Color,
     foreground: Color,
-
-    /// Accent (`pickAccent`): selection indicators, focus underlines,
-    /// primary buttons; at least 3:1 on `surface_raised`.
-    accent: Color,
-    /// Text and glyphs on `accent` (black or white, whichever contrasts
-    /// more; always at least 4.5:1).
-    on_accent: Color,
-    /// The accent where it is text (links, the current item's note): at
-    /// least 4.5:1 on `surface_raised`.
-    accent_text: Color,
-
-    /// Fill of chrome bars (tab bar) and panels, slightly off the
-    /// terminal background.
     surface: Color,
-    /// Fill of popups and flyouts, a step further from the background.
     surface_raised: Color,
-    /// Hover and pressed fills for items on `surface`/`surface_raised`.
     hover: Color,
     pressed: Color,
-    /// Text on `hover` and `pressed` (differs from `text` in high
-    /// contrast).
     hover_text: Color,
-    /// Selected item fill (accent tinted, subtle: the selection indicator
-    /// carries the contrast).
     selected: Color,
-    /// Text on `selected`.
     selected_text: Color,
-    /// Hairline borders and separators: at least 1.4:1 on the background
-    /// and on `surface_raised`.
     border: Color,
-
-    /// Fill of buttons and similar controls at rest, hovered and pressed
-    /// (pressed is fainter than hovered, as in Fluent), and their border.
     control_fill: Color,
     control_fill_hover: Color,
     control_fill_pressed: Color,
     control_border: Color,
-
-    /// The keyboard focus ring: the outer stroke (at least 3:1) and the
-    /// inner one that separates it from the control.
+    accent: Color,
+    on_accent: Color,
+    accent_text: Color,
     focus_stroke: Color,
     focus_stroke_inner: Color,
-    /// The selection of a text input and the text on it.
+    focus_stroke_accent: Color,
     text_selection: Color,
     on_text_selection: Color,
-
-    /// Fill of the title bar row with the solid window material: darker
-    /// than the terminal background (lighter for near-black backgrounds)
-    /// by at least 1.12:1, so the active tab, which has the terminal
-    /// background, stands out of the strip.
-    title_bar: Color,
-    /// The 1px Windows 11 window border.
-    window_border: Color,
-    /// Translucent overlays for hovered and pressed chrome buttons and
-    /// tabs; they work on the solid strip and over a backdrop material.
-    overlay_hover: Color,
-    overlay_pressed: Color,
-
     text: Color,
-    /// Secondary text: at least 4.5:1 on `surface` and `surface_raised`.
     text_secondary: Color,
-    /// Hints and less important labels: at least 3:1.
     text_tertiary: Color,
-    /// Placeholders of empty inputs: at least 4.5:1.
     text_placeholder: Color,
-    /// Disabled items only (not for text that has to be read).
     text_disabled: Color,
-
-    /// Warning markers and text (the Fluent caution color), success and
-    /// error markers; at least 3:1 on `surface_raised`.
     caution: Color,
     success: Color,
     critical: Color,
 
-    /// The red of a hovered close button (Windows 11 caption close).
-    close_hover: Color = Color.hex(0xc42b1c),
-    close_hover_text: Color = Color.hex(0xffffff),
-    /// The pressed caption close button.
-    close_pressed: Color = Color.hex(0xc42b1c).withAlpha(0.9),
+    /// Fill of the title bar row with the solid window material
+    /// (`gx.chrome.titleBar`): at least 1.12:1 from the terminal
+    /// background, darker when it can, so the active tab, which has the
+    /// terminal background, stands out of the strip.
+    title_bar: Color,
+    /// The 1px Windows 11 window border.
+    window_border: Color,
+    /// Translucent overlays for hovered and pressed chrome buttons and
+    /// tabs, pressed fainter; they work on the solid strip and over a
+    /// backdrop material.
+    overlay_hover: Color,
+    overlay_pressed: Color,
+    /// The red of a hovered caption close button (Windows 11), its glyph,
+    /// and the pressed button.
+    close_hover: Color,
+    close_hover_text: Color,
+    close_pressed: Color,
+
+    /// The fields `combine` sets from `gx.chrome.Chrome`.
+    const chrome_fields = 7;
+
+    comptime {
+        const shared = @typeInfo(ui_tokens.Tokens).@"struct".fields;
+        if (@typeInfo(Tokens).@"struct".fields.len != shared.len + chrome_fields) {
+            @compileError("style.Tokens must have the fields of gx.ui_tokens.Tokens and the chrome colors");
+        }
+    }
 
     /// The tokens for the current config: the system colors in high
     /// contrast, else derived from the terminal colors (cached by them).
     pub fn fromConfig(config: *const Config) Tokens {
         if (system.highContrast()) return fromSystem(system.colors);
-        return cached(Inputs.fromConfig(config));
+        return cached(ui_tokens.Scheme.fromConfig(config));
     }
 
     /// Tokens for a background, foreground and accent candidate.
     pub fn fromColors(bg: Color, fg: Color, accent: Color) Tokens {
-        return fromInputs(.{ .background = bg, .foreground = fg, .accents = .{ accent, accent, accent } });
+        return derive(.{ .background = bg, .foreground = fg, .cursor = accent, .blue = accent, .bright_blue = accent });
     }
 
     /// Tokens for a theme: background, foreground and the accent
     /// candidates in order (cursor color when set, palette 4, palette 12).
     pub fn fromTheme(bg: Color, fg: Color, cursor: ?Color, blue: Color, bright_blue: Color) Tokens {
-        return fromInputs(.{ .background = bg, .foreground = fg, .accents = .{ cursor orelse blue, blue, bright_blue } });
-    }
-
-    fn fromInputs(in: Inputs) Tokens {
-        const bg = in.background;
-        const fg = in.foreground;
-        const dark = luminance(bg) < 0.5;
-        const neutral = limitChroma(fg, 0.04);
-
-        const surface = mix(bg, neutral, 0.06);
-        const surface_raised = mix(bg, neutral, 0.10);
-        const fills = [_]Color{ surface, surface_raised };
-
-        const accent = pickAccent(&in.accents, surface_raised);
-        const on_accent = onColor(accent);
-        const selected = mix(surface_raised, accent, 0.28);
-        const border = ensureContrastAll(mix(bg, neutral, 0.16), &.{ bg, surface_raised }, 1.4);
-        const caution = if (dark) Color.hex(0xfce100) else Color.hex(0x9d5d00);
-        const success = if (dark) Color.hex(0x6ccb5f) else Color.hex(0x0f7b0f);
-        const critical = if (dark) Color.hex(0xff99a4) else Color.hex(0xc42b1c);
-
-        return .{
-            .dark = dark,
-            .background = bg,
-            .foreground = fg,
-            .accent = accent,
-            .on_accent = on_accent,
-            .accent_text = ensureContrast(accent, surface_raised, 4.5),
-            .surface = surface,
-            .surface_raised = surface_raised,
-            .hover = mix(surface_raised, neutral, 0.08),
-            .pressed = mix(surface_raised, neutral, 0.14),
-            .hover_text = fg,
-            .selected = selected,
-            .selected_text = ensureContrast(fg, selected, 4.5),
-            .border = border,
-            .control_fill = mix(surface_raised, neutral, 0.06),
-            .control_fill_hover = mix(surface_raised, neutral, 0.09),
-            .control_fill_pressed = mix(surface_raised, neutral, 0.04),
-            .control_border = border,
-            .focus_stroke = ensureContrastAll(fg, &fills, 3),
-            .focus_stroke_inner = surface_raised,
-            .text_selection = accent,
-            .on_text_selection = on_accent,
-            .title_bar = titleBar(bg, neutral, dark),
-            .window_border = mix(bg, neutral, if (dark) 0.18 else 0.22),
-            .overlay_hover = fg.withAlpha(if (dark) 0.08 else 0.06),
-            .overlay_pressed = fg.withAlpha(if (dark) 0.05 else 0.04),
-            .text = fg,
-            .text_secondary = ensureContrastAll(mix(fg, bg, 0.35), &fills, 4.5),
-            .text_tertiary = ensureContrastAll(mix(fg, bg, 0.5), &fills, 3),
-            .text_placeholder = ensureContrastAll(mix(fg, bg, 0.4), &fills, 4.5),
-            .text_disabled = mix(fg, bg, 0.6),
-            .caution = ensureContrast(caution, surface_raised, 3),
-            .success = ensureContrast(success, surface_raised, 3),
-            .critical = ensureContrast(critical, surface_raised, 3),
-        };
+        return derive(.{ .background = bg, .foreground = fg, .cursor = cursor, .blue = blue, .bright_blue = bright_blue });
     }
 
     /// The tokens for the Windows high contrast colors.
     pub fn fromSystem(c: SystemColors) Tokens {
-        return .{
-            .dark = luminance(c.window) < 0.5,
-            .high_contrast = true,
-            .background = c.window,
-            .foreground = c.window_text,
-            .accent = c.highlight,
-            .on_accent = c.highlight_text,
-            .accent_text = c.hotlight,
-            .surface = c.window,
-            .surface_raised = c.window,
-            .hover = c.highlight,
-            .pressed = c.highlight,
-            .hover_text = c.highlight_text,
-            .selected = c.highlight,
-            .selected_text = c.highlight_text,
-            .border = c.window_text,
-            .control_fill = c.button_face,
-            .control_fill_hover = c.highlight,
-            .control_fill_pressed = c.highlight,
-            .control_border = c.button_text,
-            .focus_stroke = c.window_text,
-            .focus_stroke_inner = c.window,
-            .text_selection = c.highlight,
-            .on_text_selection = c.highlight_text,
-            .title_bar = c.window,
-            .window_border = c.window_text,
-            .overlay_hover = c.highlight,
-            .overlay_pressed = c.highlight,
-            .text = c.window_text,
-            .text_secondary = c.window_text,
-            .text_tertiary = c.window_text,
-            .text_placeholder = c.gray_text,
-            .text_disabled = c.gray_text,
-            .caution = c.window_text,
-            .success = c.window_text,
-            .critical = c.window_text,
-            .close_hover = c.highlight,
-            .close_hover_text = c.highlight_text,
-            .close_pressed = c.highlight,
-        };
+        return combine(ui_tokens.Tokens.fromSystem(c), chrome.Chrome.fromSystem(c));
+    }
+
+    fn derive(scheme: ui_tokens.Scheme) Tokens {
+        const shared: ui_tokens.Tokens = .derive(scheme);
+        return combine(shared, .derive(&shared, .{}));
+    }
+
+    fn combine(shared: ui_tokens.Tokens, colors: chrome.Chrome) Tokens {
+        var out: Tokens = undefined;
+        inline for (@typeInfo(ui_tokens.Tokens).@"struct".fields) |field| {
+            @field(out, field.name) = @field(shared, field.name);
+        }
+        out.title_bar = colors.title_bar;
+        out.window_border = colors.window_border;
+        out.overlay_hover = colors.hover;
+        out.overlay_pressed = colors.pressed;
+        out.close_hover = colors.close_hover;
+        out.close_hover_text = colors.close_hover_text;
+        out.close_pressed = colors.close_pressed;
+        return out;
     }
 };
 
-/// The colors tokens are derived from.
-const Inputs = struct {
-    background: Color,
-    foreground: Color,
-    /// Accent candidates in order of preference.
-    accents: [3]Color,
-
-    fn fromConfig(config: *const Config) Inputs {
-        const cursor: ?Color = cursor: {
-            if (config.@"cursor-color") |cursor| switch (cursor) {
-                .color => |c| break :cursor fromConfigColor(c),
-                .@"cell-foreground", .@"cell-background" => {},
-            };
-            break :cursor null;
-        };
-        const blue = config.palette.value[4];
-        const bright_blue = config.palette.value[12];
-        const p4 = Color.rgb(blue.r, blue.g, blue.b);
-        return .{
-            .background = fromConfigColor(config.background),
-            .foreground = fromConfigColor(config.foreground),
-            .accents = .{ cursor orelse p4, p4, Color.rgb(bright_blue.r, bright_blue.g, bright_blue.b) },
-        };
-    }
-
-    fn eql(a: Inputs, b: Inputs) bool {
-        return std.meta.eql(a, b);
-    }
-};
-
-const CacheEntry = struct { inputs: Inputs, tokens: Tokens };
+const CacheEntry = struct { scheme: ui_tokens.Scheme, tokens: Tokens };
 
 /// The last tokens `fromConfig` derived (GUI thread).
 var last: ?CacheEntry = null;
 
-fn cached(inputs: Inputs) Tokens {
-    if (last) |entry| if (entry.inputs.eql(inputs)) return entry.tokens;
-    const tokens = Tokens.fromInputs(inputs);
-    last = .{ .inputs = inputs, .tokens = tokens };
+fn cached(scheme: ui_tokens.Scheme) Tokens {
+    if (last) |entry| if (std.meta.eql(entry.scheme, scheme)) return entry.tokens;
+    const tokens = Tokens.derive(scheme);
+    last = .{ .scheme = scheme, .tokens = tokens };
     return tokens;
 }
 
-fn fromConfigColor(c: Config.Color) Color {
-    return Color.rgb(c.r, c.g, c.b);
-}
-
-/// The title bar strip: the background darkened (a 32 % mix toward black
-/// on dark themes, 8 % on light ones) or, when that is not 1.12:1 away,
-/// darkened further or lightened toward the foreground until it is.
-fn titleBar(bg: Color, neutral: Color, dark: bool) Color {
-    const min = 1.12;
-    const black = Color.hex(0x000000);
-    const preferred = mix(bg, black, if (dark) 0.32 else 0.08);
-    if (contrast(preferred, bg) >= min) return preferred;
-    if (contrast(black, bg) >= min) return bisectMix(bg, black, bg, min);
-    if (contrast(neutral, bg) >= min) return bisectMix(bg, neutral, bg, min);
-    return mix(bg, neutral, 0.08);
-}
-
-/// The smallest mix of `from` toward `to` that contrasts `min` with
-/// `against` (contrast(to, against) >= min).
-fn bisectMix(from: Color, to: Color, against: Color, min: f32) Color {
-    var lo: f32 = 0;
-    var hi: f32 = 1;
-    for (0..24) |_| {
-        const mid = (lo + hi) / 2;
-        if (contrast(mix(from, to, mid), against) >= min) hi = mid else lo = mid;
-    }
-    return mix(from, to, hi);
-}
-
-// -----------------------------------------------------------------------
-// Color math
-// -----------------------------------------------------------------------
-
-/// Linear mix of two colors: `t` = 0 gives `a`, 1 gives `b`.
-pub fn mix(a: Color, b: Color, t: f32) Color {
-    return .{
-        .r = a.r + (b.r - a.r) * t,
-        .g = a.g + (b.g - a.g) * t,
-        .b = a.b + (b.b - a.b) * t,
-        .a = a.a + (b.a - a.a) * t,
-    };
-}
-
-/// The hover shade of `base` (moved toward the foreground).
+/// The hover shade of `base`: moved toward the foreground by
+/// `gx.ui_tokens.hover_share`.
 pub fn hoverOf(base: Color, tokens: Tokens) Color {
-    return mix(base, tokens.foreground, 0.08);
+    return mix(base, tokens.foreground, ui_tokens.hover_share);
 }
 
-/// The pressed shade of `base`.
+/// The pressed shade of `base`, fainter than the hover shade (Fluent).
 pub fn pressedOf(base: Color, tokens: Tokens) Color {
-    return mix(base, tokens.foreground, 0.14);
-}
-
-/// Luminance (Rec. 709 weights on the gamma-encoded components), 0..1:
-/// what decides whether a theme is dark. Contrast uses
-/// `relativeLuminance`.
-pub fn luminance(c: Color) f32 {
-    return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-}
-
-fn toLinear(v: f32) f32 {
-    const c = std.math.clamp(v, 0, 1);
-    return if (c <= 0.04045) c / 12.92 else std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
-}
-
-fn fromLinear(v: f32) f32 {
-    const c = std.math.clamp(v, 0, 1);
-    return if (c <= 0.0031308) c * 12.92 else 1.055 * std.math.pow(f32, c, 1.0 / 2.4) - 0.055;
-}
-
-/// WCAG relative luminance (linear light), 0..1.
-pub fn relativeLuminance(c: Color) f32 {
-    return 0.2126 * toLinear(c.r) + 0.7152 * toLinear(c.g) + 0.0722 * toLinear(c.b);
-}
-
-/// The WCAG contrast ratio of two colors, 1..21.
-pub fn contrast(a: Color, b: Color) f32 {
-    const la = relativeLuminance(a);
-    const lb = relativeLuminance(b);
-    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
-}
-
-/// A color in OKLab (Björn Ottosson): lightness 0..1 and two opponent
-/// axes.
-pub const Oklab = struct { l: f32, a: f32, b: f32 };
-
-pub fn toOklab(c: Color) Oklab {
-    const r = toLinear(c.r);
-    const g = toLinear(c.g);
-    const b = toLinear(c.b);
-    const l = std.math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
-    const m = std.math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
-    const s = std.math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
-    return .{
-        .l = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-        .a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-        .b = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
-    };
-}
-
-/// The sRGB color of `lab` (out-of-gamut components clipped).
-pub fn fromOklab(lab: Oklab, alpha: f32) Color {
-    const l_ = lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b;
-    const m_ = lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b;
-    const s_ = lab.l - 0.0894841775 * lab.a - 1.2914855480 * lab.b;
-    const l = l_ * l_ * l_;
-    const m = m_ * m_ * m_;
-    const s = s_ * s_ * s_;
-    return .{
-        .r = fromLinear(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
-        .g = fromLinear(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
-        .b = fromLinear(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s),
-        .a = alpha,
-    };
-}
-
-/// The OKLCH chroma of a color: 0 for grays.
-pub fn chroma(c: Color) f32 {
-    const lab = toOklab(c);
-    return @sqrt(lab.a * lab.a + lab.b * lab.b);
-}
-
-/// `c` with its OKLCH chroma limited to `max`, lightness and hue kept.
-pub fn limitChroma(c: Color, max: f32) Color {
-    const lab = toOklab(c);
-    const ch = @sqrt(lab.a * lab.a + lab.b * lab.b);
-    if (ch <= max) return c;
-    const k = max / ch;
-    return fromOklab(.{ .l = lab.l, .a = lab.a * k, .b = lab.b * k }, c.a);
-}
-
-/// `c` moved along OKLab lightness (its chroma fading toward white or
-/// black) just far enough to contrast `min` with `against`: away from
-/// `against` when that can reach it, else the other way; white or black
-/// when neither can.
-pub fn ensureContrast(c: Color, against: Color, min: f32) Color {
-    if (contrast(c, against) >= min) return c;
-    const lab = toOklab(c);
-    const lighter_first = relativeLuminance(c) >= relativeLuminance(against);
-    const targets = if (lighter_first) [2]f32{ 1, 0 } else [2]f32{ 0, 1 };
-    for (targets) |target| {
-        if (contrast(toward(lab, target, 1, c.a), against) < min) continue;
-        var lo: f32 = 0;
-        var hi: f32 = 1;
-        for (0..24) |_| {
-            const mid = (lo + hi) / 2;
-            if (contrast(toward(lab, target, mid, c.a), against) >= min) hi = mid else lo = mid;
-        }
-        return toward(lab, target, hi, c.a);
-    }
-    const white = Color.hex(0xffffff);
-    const black = Color.hex(0x000000);
-    return if (contrast(white, against) >= contrast(black, against)) white else black;
-}
-
-/// `ensureContrast` against every color of `against`.
-pub fn ensureContrastAll(c: Color, against: []const Color, min: f32) Color {
-    var out = c;
-    for (0..3) |_| {
-        var ok = true;
-        for (against) |bg| {
-            if (contrast(out, bg) >= min) continue;
-            ok = false;
-            out = ensureContrast(out, bg, min);
-        }
-        if (ok) break;
-    }
-    return out;
-}
-
-/// `lab` with lightness `t` of the way to `target` (1 white, 0 black) and
-/// its chroma faded by the same share.
-fn toward(lab: Oklab, target: f32, t: f32, alpha: f32) Color {
-    return fromOklab(.{
-        .l = lab.l + (target - lab.l) * t,
-        .a = lab.a * (1 - t),
-        .b = lab.b * (1 - t),
-    }, alpha);
-}
-
-/// Black or white, whichever contrasts more with `c`.
-pub fn onColor(c: Color) Color {
-    const white = Color.hex(0xffffff);
-    const black = Color.hex(0x000000);
-    return if (contrast(white, c) >= contrast(black, c)) white else black;
-}
-
-/// The accent among `candidates` (in order of preference) for UI on
-/// `against`: the first colorful one (OKLCH chroma >= 0.05) that
-/// contrasts 3:1, else the first colorful one adjusted to 3:1, else the
-/// first one adjusted (gray themes keep a gray accent).
-pub fn pickAccent(candidates: []const Color, against: Color) Color {
-    const min_chroma = 0.05;
-    for (candidates) |c| {
-        if (chroma(c) >= min_chroma and contrast(c, against) >= 3) return c;
-    }
-    for (candidates) |c| {
-        if (chroma(c) >= min_chroma) return ensureContrast(c, against, 3);
-    }
-    return ensureContrast(candidates[0], against, 3);
+    return mix(base, tokens.foreground, ui_tokens.pressed_share);
 }
 
 // -----------------------------------------------------------------------
@@ -493,16 +182,7 @@ pub fn pickAccent(candidates: []const Color, against: Color) Color {
 // -----------------------------------------------------------------------
 
 /// The Windows system colors high contrast uses.
-pub const SystemColors = struct {
-    window: Color = Color.hex(0x000000),
-    window_text: Color = Color.hex(0xffffff),
-    highlight: Color = Color.hex(0x1aebff),
-    highlight_text: Color = Color.hex(0x000000),
-    button_face: Color = Color.hex(0x000000),
-    button_text: Color = Color.hex(0xffffff),
-    gray_text: Color = Color.hex(0x3ff23f),
-    hotlight: Color = Color.hex(0xffff00),
-};
+pub const SystemColors = ui_tokens.SystemColors;
 
 /// System UI settings the tokens follow, read on the GUI thread.
 pub const System = struct {
@@ -512,7 +192,7 @@ pub const System = struct {
     /// A test hook forces high contrast on or off; null follows Windows.
     forced_high_contrast: ?bool = null,
 
-    /// Read the settings again (on WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    /// Read the settings again (after WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
     /// WM_THEMECHANGED).
     pub fn refresh(self: *System) void {
         self.loaded = true;
@@ -740,30 +420,55 @@ pub fn dip(pixels: i32, scale: f32) f32 {
 /// `v` (DIPs) on the nearest device pixel at `scale`.
 pub const snap = d2d.snapValue;
 
+const testing = std.testing;
+const luminance = ui_color.luminance;
+
 test "mix" {
-    const testing = std.testing;
     const black = Color.hex(0x000000);
     const white = Color.hex(0xffffff);
     const mid = mix(black, white, 0.5);
     try testing.expectApproxEqAbs(@as(f32, 0.5), mid.r, 0.001);
-    try testing.expectEqual(@as(u32, 0x808080), mix(black, white, 0.5).colorRef());
+    try testing.expectEqual(@as(u32, 0x808080), d2d.colorRef(mix(black, white, 0.5)));
+}
+
+test "the tokens are the shared tokens and the chrome colors" {
+    const bg = Color.hex(0x1f1f28);
+    const fg = Color.hex(0xffffff);
+    const t = Tokens.fromTheme(bg, fg, Color.hex(0xf5e0dc), Color.hex(0x89b4fa), Color.hex(0x89b4fa));
+    const shared: ui_tokens.Tokens = .derive(.{
+        .background = bg,
+        .foreground = fg,
+        .cursor = Color.hex(0xf5e0dc),
+        .blue = Color.hex(0x89b4fa),
+        .bright_blue = Color.hex(0x89b4fa),
+    });
+    inline for (@typeInfo(ui_tokens.Tokens).@"struct".fields) |field| {
+        try testing.expectEqual(@field(shared, field.name), @field(t, field.name));
+    }
+    const colors: chrome.Chrome = .derive(&shared, .{});
+    try testing.expectEqual(colors.title_bar, t.title_bar);
+    try testing.expectEqual(colors.window_border, t.window_border);
+    try testing.expectEqual(colors.hover, t.overlay_hover);
+    try testing.expectEqual(colors.pressed, t.overlay_pressed);
+    try testing.expectEqual(chrome.close_hover, t.close_hover);
 }
 
 test "tokens follow the background" {
-    const testing = std.testing;
     const dark = Tokens.fromColors(Color.hex(0x1e1e2e), Color.hex(0xcdd6f4), Color.hex(0x89b4fa));
     try testing.expect(dark.dark);
     try testing.expect(luminance(dark.surface) > luminance(dark.background));
     try testing.expect(luminance(dark.hover) > luminance(dark.surface_raised));
+    // Pressed is fainter than hovered (Fluent).
+    try testing.expect(contrast(dark.pressed, dark.surface_raised) < contrast(dark.hover, dark.surface_raised));
+    try testing.expect(contrast(pressedOf(dark.surface, dark), dark.surface) < contrast(hoverOf(dark.surface, dark), dark.surface));
 
     const light = Tokens.fromColors(Color.hex(0xffffff), Color.hex(0x000000), Color.hex(0x0067c0));
     try testing.expect(!light.dark);
     try testing.expect(luminance(light.surface) < luminance(light.background));
-    try testing.expectEqual(@as(u32, 0xffffff), light.on_accent.colorRef());
+    try testing.expectEqual(@as(u32, 0xffffff), d2d.colorRef(light.on_accent));
 }
 
 test "the title bar strip contrasts with the active tab" {
-    const testing = std.testing;
     // The active tab has the terminal background; the strip is darker.
     const dark = Tokens.fromColors(Color.hex(0x1f1f28), Color.hex(0xffffff), Color.hex(0xf5e0dc));
     try testing.expect(luminance(dark.title_bar) < luminance(dark.background));
@@ -772,79 +477,23 @@ test "the title bar strip contrasts with the active tab" {
     // A black background cannot get darker: the strip is lighter.
     const black = Tokens.fromColors(Color.hex(0x000000), Color.hex(0xcccccc), Color.hex(0x3d8ef8));
     try testing.expect(luminance(black.title_bar) > luminance(black.background));
-    // Overlays are translucent foreground.
+    // Overlays are translucent foreground, pressed fainter.
     try testing.expect(dark.overlay_hover.a > 0 and dark.overlay_hover.a < 0.5);
+    try testing.expect(dark.overlay_pressed.a < dark.overlay_hover.a);
 }
 
 test "the title bar strip has no jump near black" {
-    const testing = std.testing;
     // The old formula switched from lightening to a 32 % darkening at a
     // luminance of 0.03, leaving #0c0c0c-like backgrounds at 1.02:1.
     var level: u8 = 0;
     while (level < 0x40) : (level += 1) {
         const bg = Color.rgb(level, level, level);
         const t = Tokens.fromColors(bg, Color.hex(0xcccccc), Color.hex(0x3d8ef8));
-        try testing.expect(contrast(t.title_bar, bg) >= 1.119);
+        try testing.expect(contrast(t.title_bar, bg) >= chrome.strip_min_contrast);
     }
-}
-
-test "contrast follows WCAG" {
-    const testing = std.testing;
-    const white = Color.hex(0xffffff);
-    const black = Color.hex(0x000000);
-    try testing.expectApproxEqAbs(@as(f32, 21), contrast(white, black), 0.01);
-    try testing.expectApproxEqAbs(@as(f32, 1), contrast(Color.hex(0x336699), Color.hex(0x336699)), 0.001);
-    // #767676 is the lightest gray with 4.5:1 on white.
-    try testing.expect(contrast(Color.hex(0x767676), white) >= 4.5);
-    try testing.expect(contrast(Color.hex(0x777777), white) < 4.5);
-    try testing.expectApproxEqAbs(@as(f32, 0.2126), relativeLuminance(Color.hex(0xff0000)), 0.001);
-}
-
-test "OKLab round trip and chroma" {
-    const testing = std.testing;
-    for ([_]u24{ 0x89b4fa, 0xf5e0dc, 0x1e1e2e, 0xffffff, 0x000000, 0x00ff00 }) |hex| {
-        const c = Color.hex(hex);
-        const back = fromOklab(toOklab(c), 1);
-        try testing.expectApproxEqAbs(c.r, back.r, 0.002);
-        try testing.expectApproxEqAbs(c.g, back.g, 0.002);
-        try testing.expectApproxEqAbs(c.b, back.b, 0.002);
-    }
-    try testing.expectApproxEqAbs(@as(f32, 1), toOklab(Color.hex(0xffffff)).l, 0.001);
-    try testing.expect(chroma(Color.hex(0x808080)) < 0.001);
-    // GX Mocha: the rosewater cursor is nearly gray, the blue is not.
-    try testing.expect(chroma(Color.hex(0xf5e0dc)) < 0.05);
-    try testing.expect(chroma(Color.hex(0x89b4fa)) > 0.05);
-    const limited = limitChroma(Color.hex(0x00ff00), 0.04);
-    try testing.expectApproxEqAbs(@as(f32, 0.04), chroma(limited), 0.002);
-    try testing.expectApproxEqAbs(toOklab(Color.hex(0x00ff00)).l, toOklab(limited).l, 0.002);
-}
-
-test "ensureContrast reaches the floor along lightness" {
-    const testing = std.testing;
-    const pairs = [_][2]u24{
-        .{ 0x585b70, 0x1e1e2e }, // dim text on a dark theme
-        .{ 0xacb0be, 0xeff1f5 }, // dim text on a light theme
-        .{ 0x0000ee, 0x000000 }, // xterm blue on black
-        .{ 0x808080, 0x808080 }, // the same color
-    };
-    for (pairs) |pair| {
-        const c = Color.hex(pair[0]);
-        const against = Color.hex(pair[1]);
-        for ([_]f32{ 3, 4.5 }) |min| {
-            const out = ensureContrast(c, against, min);
-            try testing.expect(contrast(out, against) >= min - 0.01);
-        }
-    }
-    // Already enough: unchanged.
-    const fine = Color.hex(0xcdd6f4);
-    try testing.expectEqual(fine, ensureContrast(fine, Color.hex(0x1e1e2e), 4.5));
-    // Mid gray cannot reach 21:1: the stronger extreme.
-    const extreme = ensureContrast(Color.hex(0x808080), Color.hex(0x7f7f7f), 21);
-    try testing.expect(extreme.r == 0 or extreme.r == 1);
 }
 
 test "the GX Mocha accent is the palette blue" {
-    const testing = std.testing;
     const t = Tokens.fromTheme(
         Color.hex(0x1e1e2e),
         Color.hex(0xcdd6f4),
@@ -862,22 +511,7 @@ test "the GX Mocha accent is the palette blue" {
     try testing.expectEqual(@as(u24, 0x5c5cff), dim_blue.accent.toHex());
 }
 
-test "pickAccent adjusts a colorful accent that lacks contrast" {
-    const testing = std.testing;
-    const against = Color.hex(0x2a2b3c);
-    const dark_blue = Color.hex(0x00006b);
-    const accent = pickAccent(&.{ Color.hex(0xcccccc), dark_blue, dark_blue }, against);
-    try testing.expect(contrast(accent, against) >= 2.99);
-    // Still blue: more blue than red.
-    try testing.expect(accent.b > accent.r);
-    // A gray theme keeps a gray accent, with contrast.
-    const gray = pickAccent(&.{ Color.hex(0x444444), Color.hex(0x555555), Color.hex(0x666666) }, against);
-    try testing.expect(chroma(gray) < 0.02);
-    try testing.expect(contrast(gray, against) >= 2.99);
-}
-
 test "derived colors meet their contrast floors across themes" {
-    const testing = std.testing;
     // bg, fg, cursor (0 = none), palette 4, palette 12.
     const themes = [_][5]u24{
         .{ 0x1e1e2e, 0xcdd6f4, 0xf5e0dc, 0x89b4fa, 0x89b4fa }, // GX Mocha
@@ -889,33 +523,32 @@ test "derived colors meet their contrast floors across themes" {
         .{ 0x0f191c, 0x00ff9c, 0x00ff9c, 0x00ff9c, 0x00ff9c }, // a saturated matrix theme
         .{ 0x0c0c0c, 0xcccccc, 0xffffff, 0x0037da, 0x3b78ff }, // Campbell
     };
+    const floor = ui_tokens.floor;
     for (themes) |th| {
         const cursor: ?Color = if (th[2] == 0) null else Color.hex(th[2]);
         const t = Tokens.fromTheme(Color.hex(th[0]), Color.hex(th[1]), cursor, Color.hex(th[3]), Color.hex(th[4]));
-        for ([_]Color{ t.surface, t.surface_raised }) |fill| {
-            try testing.expect(contrast(t.text_secondary, fill) >= 4.49);
-            try testing.expect(contrast(t.text_placeholder, fill) >= 4.49);
-            try testing.expect(contrast(t.text_tertiary, fill) >= 2.99);
-            try testing.expect(contrast(t.focus_stroke, fill) >= 2.99);
+        for ([_]Color{ t.background, t.surface, t.surface_raised }) |fill| {
+            try testing.expect(contrast(t.text_secondary, fill) >= floor.text);
+            try testing.expect(contrast(t.text_placeholder, fill) >= floor.text);
+            try testing.expect(contrast(t.text_tertiary, fill) >= floor.text_tertiary);
+            try testing.expect(contrast(t.focus_stroke, fill) >= floor.non_text);
+            try testing.expect(contrast(t.border, fill) >= floor.border);
         }
-        try testing.expect(contrast(t.accent, t.surface_raised) >= 2.99);
-        try testing.expect(contrast(t.accent_text, t.surface_raised) >= 4.49);
-        try testing.expect(contrast(t.on_accent, t.accent) >= 4.5);
-        try testing.expect(contrast(t.on_text_selection, t.text_selection) >= 4.5);
-        try testing.expect(contrast(t.border, t.background) >= 1.39);
-        try testing.expect(contrast(t.border, t.surface_raised) >= 1.39);
-        try testing.expect(contrast(t.selected_text, t.selected) >= 4.49);
-        try testing.expect(contrast(t.title_bar, t.background) >= 1.119);
+        try testing.expect(contrast(t.accent, t.surface_raised) >= floor.non_text);
+        try testing.expect(contrast(t.accent_text, t.surface_raised) >= floor.text);
+        try testing.expect(contrast(t.on_accent, t.accent) >= floor.text);
+        try testing.expect(contrast(t.on_text_selection, t.text_selection) >= floor.text);
+        try testing.expect(contrast(t.selected_text, t.selected) >= floor.text);
+        try testing.expect(contrast(t.title_bar, t.background) >= chrome.strip_min_contrast);
         for ([_]Color{ t.caution, t.success, t.critical }) |marker| {
-            try testing.expect(contrast(marker, t.surface_raised) >= 2.99);
+            try testing.expect(contrast(marker, t.surface_raised) >= floor.non_text);
         }
         // Surfaces stay neutral under a saturated foreground.
-        try testing.expect(chroma(t.surface_raised) <= chroma(t.background) + 0.02);
+        try testing.expect(ui_color.chroma(t.surface_raised) <= ui_color.chroma(t.background) + 0.02);
     }
 }
 
 test "high contrast uses the system colors" {
-    const testing = std.testing;
     const colors: SystemColors = .{
         .window = Color.hex(0xffffff),
         .window_text = Color.hex(0x000000),
@@ -936,30 +569,33 @@ test "high contrast uses the system colors" {
     try testing.expectEqual(colors.window_text, t.border);
     try testing.expectEqual(colors.hotlight, t.accent_text);
     try testing.expectEqual(colors.gray_text, t.text_disabled);
+    try testing.expectEqual(colors.window, t.title_bar);
+    try testing.expectEqual(colors.highlight, t.close_hover);
+    try testing.expectEqual(colors.highlight_text, t.close_hover_text);
 }
 
 test "fromConfig caches by color values" {
-    const testing = std.testing;
     const saved = last;
     defer last = saved;
     last = null;
-    const in: Inputs = .{
+    const scheme: ui_tokens.Scheme = .{
         .background = Color.hex(0x1e1e2e),
         .foreground = Color.hex(0xcdd6f4),
-        .accents = .{ Color.hex(0xf5e0dc), Color.hex(0x89b4fa), Color.hex(0x89b4fa) },
+        .cursor = Color.hex(0xf5e0dc),
+        .blue = Color.hex(0x89b4fa),
+        .bright_blue = Color.hex(0x89b4fa),
     };
-    const first = cached(in);
+    const first = cached(scheme);
     try testing.expect(last != null);
-    try testing.expectEqual(first.accent, cached(in).accent);
-    var other = in;
+    try testing.expectEqual(first.accent, cached(scheme).accent);
+    var other = scheme;
     other.background = Color.hex(0xeff1f5);
     const second = cached(other);
     try testing.expect(!second.dark);
-    try testing.expect(last.?.inputs.eql(other));
+    try testing.expect(std.meta.eql(last.?.scheme, other));
 }
 
 test "px rounds" {
-    const testing = std.testing;
     try testing.expectEqual(@as(i32, 36), px(metrics.tab_bar_height, 1.0));
     try testing.expectEqual(@as(i32, 54), px(metrics.tab_bar_height, 1.5));
     try testing.expectEqual(@as(i32, 12), px(8, 1.5));
