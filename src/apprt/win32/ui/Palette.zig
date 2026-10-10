@@ -106,6 +106,11 @@ const layout = struct {
 /// How many recently used entries an empty filter shows.
 const max_recent = 5;
 
+/// The score an entry that opens a page gets on top of its match, so that
+/// "theme" finds "Change Theme…" before the themes, which also match it
+/// (and start with it: "Theme: Nord").
+const page_bonus: i32 = 30;
+
 /// The timer on the popup window that waits for the selection to rest on a
 /// theme before previewing it.
 const preview_timer_id: usize = 1;
@@ -266,6 +271,17 @@ const Pressed = union(enum) {
     back,
 };
 
+const ItemCache = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    entries: []const Item = &.{},
+    stamp: ?u64 = null,
+
+    fn deinit(self: *ItemCache) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+};
+
 popup: Popup = .{},
 
 /// The keyboard shortcut sheet of the window (see `Keybinds.show`).
@@ -275,10 +291,17 @@ keybinds: Keybinds.Sheet = .{},
 active: bool = false,
 page: Page = .root,
 
-/// The entries of the current session; they and their strings live in
-/// `arena`, which is reset each time the palette opens.
+/// Session rows borrow static entries from `item_cache`; tab and theme
+/// entries live in the session arena.
 arena: ?std.heap.ArenaAllocator = null,
 items: std.ArrayList(Item) = .empty,
+item_cache: ItemCache = .{},
+
+/// Where the themes start in `items` (they come last), and whether all of
+/// them are there: until a filter or the theme page needs them, only the
+/// recently used ones are (`ensureThemes`).
+themes_start: usize = 0,
+themes_expanded: bool = false,
 /// The theme directories of the session, highest priority first.
 theme_dirs: []const []const u8 = &.{},
 /// The colors of the theme rows by theme index, for the `theme_names`
@@ -336,6 +359,7 @@ pub fn deinit(self: *Palette) void {
     releasePopup(&self.popup);
     self.rows.deinit(self.alloc());
     self.swatches.deinit(self.alloc());
+    self.item_cache.deinit();
     if (self.arena) |*arena| arena.deinit();
     self.arena = null;
     self.items = .empty;
@@ -510,15 +534,102 @@ fn buildItems(self: *Palette) void {
     self.theme_dirs = &.{};
     loadHistory(self.alloc());
 
+    self.refreshItemCache() catch |err| log.warn("palette entries unavailable err={}", .{err});
     self.addTabs(a) catch |err| log.warn("palette tabs unavailable err={}", .{err});
-    self.addPages(a) catch |err| log.warn("palette pages unavailable err={}", .{err});
-    self.addCommands(a) catch |err| log.warn("palette commands unavailable err={}", .{err});
-    self.addSettings(a) catch |err| log.warn("palette settings unavailable err={}", .{err});
-    self.addProfiles(a) catch |err| log.warn("palette launch profiles unavailable err={}", .{err});
-    self.addThemes(a) catch |err| log.warn("palette themes unavailable err={}", .{err});
+    self.items.appendSlice(a, self.item_cache.entries) catch |err| log.warn("palette entries unavailable err={}", .{err});
+    self.themes_start = self.items.items.len;
+    self.themes_expanded = false;
+    if (!history.isEmpty()) self.addThemes(a, .recent) catch |err| log.warn("palette themes unavailable err={}", .{err});
+    self.loadRanks(0);
+}
 
+fn itemStamp(self: *Palette) u64 {
+    const app = self.surface().app;
+    var hasher: std.hash.Wyhash = .init(configStamp(&app.config, self.hints()));
+    std.hash.autoHash(&hasher, app.profiles_cache.detections);
+    std.hash.autoHash(&hasher, app.profiles_cache.shells != null);
+    std.hash.autoHash(&hasher, history.isEmpty());
+    return hasher.final();
+}
+
+fn refreshItemCache(self: *Palette) !void {
+    const stamp = self.itemStamp();
+    if (self.item_cache.stamp == stamp) return;
+    const span: gx.perf.Span = .begin(global.io());
+    var fresh: ItemCache = .{ .arena = .init(self.alloc()) };
+    errdefer fresh.deinit();
+    const a = fresh.arena.?.allocator();
+    const session_items = self.items;
+    defer self.items = session_items;
+    self.items = .empty;
+    try self.addPages(a);
+    try self.addCommands(a);
+    try self.addSettings(a);
+    try self.addProfiles(a);
+    fresh.entries = self.items.items;
+    fresh.stamp = self.itemStamp();
+    self.item_cache.deinit();
+    self.item_cache = fresh;
+    _ = span.end(global.io(), "palette_entries_build");
+}
+
+fn configStamp(config: *const Config, hints_: trigger.Hints) u64 {
+    var hasher: std.hash.Wyhash = .init(@intFromEnum(i18n.current()));
+    for (config.@"command-palette-entry".value.items) |command| {
+        hashText(&hasher, command.title);
+        hashText(&hasher, command.description);
+        std.hash.autoHash(&hasher, command.action.hash());
+    }
+    const profiles = &config.@"gx-launch-profile".map;
+    for (profiles.keys(), profiles.values()) |name, command| {
+        hashText(&hasher, name);
+        hashText(&hasher, command);
+    }
+    hashText(&hasher, gx.settings_map.themeName(config.theme) orelse "");
+    var bindings = hints_.set.bindings.iterator();
+    while (bindings.next()) |entry| {
+        std.hash.autoHash(&hasher, entry.key_ptr.hash());
+        std.hash.autoHash(&hasher, std.meta.activeTag(entry.value_ptr.*));
+        switch (entry.value_ptr.*) {
+            .leaf => |leaf| {
+                std.hash.autoHash(&hasher, leaf.action.hash());
+                std.hash.autoHash(&hasher, leaf.flags);
+            },
+            .leader, .leaf_chained => {},
+        }
+    }
+    var reverse = hints_.set.reverse.iterator();
+    while (reverse.next()) |entry| {
+        std.hash.autoHash(&hasher, entry.key_ptr.hash());
+        std.hash.autoHash(&hasher, entry.value_ptr.hash());
+    }
+    if (hints_.blocked) |blocked| for (blocked.list.items) |conflict| {
+        std.hash.autoHash(&hasher, conflict);
+    };
+    return hasher.final();
+}
+
+fn hashText(hasher: *std.hash.Wyhash, text: []const u8) void {
+    std.hash.autoHash(hasher, text.len);
+    hasher.update(text);
+}
+
+/// All the themes, for a filter or the theme page: the hundreds of them
+/// take the place of the recently used ones `buildItems` added.
+fn ensureThemes(self: *Palette) void {
+    if (self.themes_expanded) return;
+    self.themes_expanded = true;
+    const a = self.arena.?.allocator();
+    self.items.shrinkRetainingCapacity(self.themes_start);
+    self.addThemes(a, .all) catch |err| log.warn("palette themes unavailable err={}", .{err});
+    self.loadRanks(self.themes_start);
+}
+
+/// The places among the recently used entries and the score bonuses of the
+/// entries from `start` (`gx.palette_history`).
+fn loadRanks(self: *Palette, start: usize) void {
     const now = unixNow();
-    for (self.items.items) |*item| {
+    for (self.items.items[start..]) |*item| {
         if (item.key.len == 0) continue;
         item.rank = history.rank(item.key);
         item.bonus = history.bonus(item.key, now);
@@ -748,20 +859,28 @@ fn commandText(a: Allocator, command: gx.profiles.Command) ![]const u8 {
     };
 }
 
-fn addThemes(self: *Palette, a: Allocator) !void {
+/// The themes: `all` of them, or only the `recent`ly used ones.
+fn addThemes(self: *Palette, a: Allocator, which: enum { recent, all }) !void {
     const app = self.surface().app;
-    var dirs: std.ArrayList([]const u8) = .empty;
-    var it: themepkg.LocationIterator = .{ .arena_alloc = a };
-    while (it.next() catch null) |location| try dirs.append(a, location.dir);
-    self.theme_dirs = dirs.items;
+    if (self.theme_dirs.len == 0) {
+        var dirs: std.ArrayList([]const u8) = .empty;
+        var it: themepkg.LocationIterator = .{ .arena_alloc = a };
+        while (it.next() catch null) |location| try dirs.append(a, location.dir);
+        self.theme_dirs = dirs.items;
+    }
 
-    const names = theme_names.get(global.io(), dirs.items);
+    const names = theme_names.get(global.io(), self.theme_dirs);
     if (theme_names.generation != self.swatch_generation) {
         self.swatches.deinit(self.alloc());
         self.swatch_generation = theme_names.generation;
     }
     const current = gx.settings_map.themeName(app.config.theme);
+    var key_buf: [320]u8 = undefined;
     for (names, 0..) |theme, i| {
+        if (which == .recent) {
+            const key = std.fmt.bufPrint(&key_buf, "theme:{s}", .{theme}) catch continue;
+            if (history.rank(key) == 0) continue;
+        }
         const name = try a.dupe(u8, theme);
         const is_current = if (current) |c| std.mem.eql(u8, c, name) else false;
         try self.items.append(a, .{
@@ -794,6 +913,7 @@ fn refilter(self: *Palette, cause: model.PreviewCause) void {
 
     const text = self.readFilter();
     self.query = .init(text);
+    if (self.page == .themes or (self.page == .root and !self.query.isEmpty())) self.ensureThemes();
     const result = if (self.query.isEmpty()) self.listAll(gpa) else self.listMatches(gpa, text);
     result catch |err| log.warn("palette filter failed err={}", .{err});
 
@@ -951,7 +1071,7 @@ fn collectMatches(self: *Palette, gpa: Allocator, query: *const fuzzy.Query, out
         const by_english = english != null and (translated == null or english.? > translated.?);
         const score = (if (by_english) english else translated) orelse continue;
         item.english = by_english;
-        item.score = score + item.bonus;
+        item.score = score + item.bonus + if (item.target == .page) page_bonus else 0;
         try out.append(gpa, .{
             .index = @intCast(i),
             .order = if (self.page == .tabs) std.math.maxInt(u64) - item.recency else i,
@@ -1234,6 +1354,7 @@ fn remember(self: *Palette, item: Item) void {
     const typed = self.filterText();
     if (typed.len > 0) history.recordInput(typed, item.key);
     commitHistory(self.alloc());
+    self.loadRanks(0);
 }
 
 /// Shift+Delete: forget the selected entry when it is remembered. Returns
@@ -2338,4 +2459,57 @@ test "cutText cuts at a character" {
     var buf: [4]u8 = undefined;
     try testing.expectEqualStrings("ab", cutText(&buf, "ab"));
     try testing.expectEqualStrings("a新", cutText(&buf, "a新建"));
+}
+
+test "entry cache stamp tracks commands profiles bindings and language" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var copy = try config.clone(testing.allocator);
+    defer copy.deinit();
+    const hints_: trigger.Hints = .{ .set = &config.keybind.set };
+    const original = configStamp(&config, hints_);
+    try testing.expectEqual(original, configStamp(&copy, .{ .set = &copy.keybind.set }));
+    config.@"font-size" = 18;
+    try testing.expectEqual(original, configStamp(&config, hints_));
+    config.@"command-palette-entry".value.items[0].title = "Changed title";
+    const commands = configStamp(&config, hints_);
+    try testing.expect(commands != original);
+    const a = config._arena.?.allocator();
+    try config.@"gx-launch-profile".map.put(a, "Test Shell", "cmd.exe /d");
+    const profiles = configStamp(&config, hints_);
+    try testing.expect(profiles != commands);
+    try config.keybind.set.parseAndPut(a, "ctrl+f9=new_tab");
+    const bindings = configStamp(&config, hints_);
+    try testing.expect(bindings != profiles);
+    var blocked: @import("../shortcut_conflicts.zig").Conflicts = .{};
+    defer blocked.deinit(testing.allocator);
+    try blocked.list.append(testing.allocator, .{ .chord = .{ .mods = w32.MOD_CONTROL, .vk = w32.VK_F9 }, .reason = .hotkey });
+    try testing.expect(bindings != configStamp(&config, .{ .set = hints_.set, .blocked = &blocked }));
+    const language = i18n.current();
+    defer i18n.setCurrent(language);
+    i18n.setCurrent(if (language == .en) .zh_CN else .en);
+    try testing.expect(bindings != configStamp(&config, hints_));
+}
+
+test "theme names reuse an unchanged directory and refresh missing directories" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "themes" });
+    defer testing.allocator.free(path);
+    var names: ThemeNames = .{};
+    defer if (names.list) |*list| list.deinit();
+    try testing.expectEqual(@as(usize, 0), names.get(io, &.{path}).len);
+    const missing = names.generation;
+    try tmp.dir.createDirPath(io, "themes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "themes/Nord", .data = "background = #2e3440\n" });
+    try testing.expectEqualStrings("Nord", names.get(io, &.{path})[0]);
+    try testing.expect(names.generation != missing);
+    const generation = names.generation;
+    try testing.expectEqualStrings("Nord", names.get(io, &.{path})[0]);
+    try testing.expectEqual(generation, names.generation);
 }
