@@ -79,7 +79,7 @@ Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领�
 ## 项目模型
 
 - Zig 0.16.0（`build.zig.zon` 的 `minimum_zig_version`）。共享核心在 `src/`；产品版本在 `build.zig.zon`，最终版本由 `src/build/Config.zig::init` 推导。
-- 产物：Windows app（win32 apprt `src/apprt/win32/`，Windows 目标的默认 apprt，WGL 渲染、Direct2D 自绘界面）、GTK app（Linux/FreeBSD，`src/apprt/gtk`，GX 层在 `src/apprt/gtk/gx/`）、macOS Swift app（`macos/`，经 `include/ghostty.h`）、libghostty-vt（`src/lib_vt.zig` 与 `include/ghostty/`，可构建到 wasm32）。两个 GX apprt 共用 `src/gx/`：配置分层、界面语言、启动配置、`gx:` 动作与进程判断。
+- 产物：Windows app（win32 apprt `src/apprt/win32/`，Windows 目标的默认 apprt，WGL 渲染、Direct2D 自绘界面）、GTK app（Linux/FreeBSD，`src/apprt/gtk`，GX 层在 `src/apprt/gtk/gx/`）、macOS Swift app（`macos/`，经 `include/ghostty.h`）、libghostty-vt（`src/lib_vt.zig` 与 `include/ghostty/`，可构建到 wasm32）。两个 GX apprt 共用 `src/gx/`：配置分层、界面语言、界面库（颜色、token、动效、模糊匹配）、启动配置、`gx:` 动作与进程判断。
 - 入口：`src/main.zig::entrypoint` 按 `exe_entrypoint` 分派；`src/main_ghostty.zig::main` 先 `global.init` 再 `App.create`；`src/apprt.zig::runtime` 编译期选定 apprt。
 - 数据流：pty → `src/termio/Exec.zig::ReadThread` → `src/termio/Termio.zig::processOutput` → `terminal.Stream` → `Terminal`/`Screen`/`PageList` → `src/renderer/generic.zig::Renderer.updateFrame` → `drawFrame`。每个 surface 有 termio 写线程、pty 读取线程（POSIX 另有 `io-gather`）与渲染线程，搜索时按需另起 search 线程。全貌见 `docs/ARCHITECTURE.md`。
 
@@ -93,7 +93,8 @@ zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitigno
 | `just test-vt <a>` / `just test <a>` | lib-vt 单测 / 完整单测，经 `scripts/zig_test.py` 并行分片 |
 | `just build <a>` / `just build-vt <a>` | `zig build`（Windows 主机补 `-Dtarget=x86_64-windows-gnu`，产出 win32 app）/ `zig build -Demit-lib-vt` |
 | `just package-windows <a>` / `just stage <平台> <目录>` | Windows 便携 zip 与安装包 / GX Shell 组件 stage |
-| `just wsl <子命令>` | 经 WSL 做 Linux GTK 构建、完整单测与 Xvfb 截图（`setup`、`sync`、`build`、`test`、`smoke`、`run`） |
+| `just wsl <子命令>` | 经 WSL 做 Linux GTK 构建、完整单测、Xvfb 截图与 GTK 场景（`setup`、`sync`、`build`、`test`、`smoke`、`scenario`、`run`） |
+| `just win-gui <a>` / `just perf <a>` | Windows GUI 场景回放与截图（`test/gui/win32/`）/ 耗时度量与新旧构建交替对比 |
 | `just vt-wasm` / `just dist-vt` | lib-vt wasm32 构建 / lib-vt 源码包 |
 | `just fmt` / `just fmt-check` / `just zig <a>` | 格式化 / 只检查 / 直通钉版 zig |
 | `just rules <p>` / `just rules-review <p>` / `just rules-check` | resolver |
@@ -102,7 +103,8 @@ zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitigno
 | `just graph` / `just graph-check` / `just graph-query <q>` | 图谱重建 / 新鲜度 / 查询 |
 | `just kb` / `just kb-check` / `just kb-query <q>` | 知识库构建 / 校验 / 检索 |
 | `just i18n` / `just i18n-check` | 由 `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` 重建 / 校验 GX 翻译表 |
-| `just generated-check` | kb-check、i18n-check 与 graph-check（同步后、发版前） |
+| `just pinyin` / `just pinyin-check` | 联网重建 / 离线校验拼音首字母表 `src/gx/pinyin/initials.zig` |
+| `just generated-check` | kb-check、i18n-check、pinyin-check 与 graph-check（同步后、发版前；framework-check 也含 pinyin-check） |
 | `just install-hooks` / `just commit-check <a>` | 启用 `.githooks` / 校验提交信息 |
 
 Windows 上 `just build` 产出 `zig-out/bin/ghostty.exe`，`just test` 构建同一组合（`-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`）的 `ghostty-test`，不含 POSIX 分支，Linux 侧用 `just wsl test` 或 gx-ci 的 `linux-main`；libghostty-internal（`-Dapp-runtime=none`）在 Windows 上仍链接失败。改过 Zig 源码后测试二进制要用 LLVM 重编约 2–4 min，属正常耗时（`docs/TESTING.md`）。Windows 未开开发者模式时，`src/lib/tinyio` 的符号链接用例报 `PermissionDenied`（`just test-vt` 4 处、`just test` 2 处）：这是环境前置，不是回归，记 FAIL 并写明原因，不跳过、不改用例。全表与副作用见 `docs/MAKE_COMMANDS.md`。
@@ -146,7 +148,7 @@ fix(build): 非 v 前缀 tag 不再触发版本号 panic
 | `config` | 配置字段、解析与 helpgen，GX 配置层的接口 |
 | `development` | 框架自身：AGENTS、工具面、`docs/`、`scripts/`、`justfile`（`--task sync`） |
 | `font` | 字体发现（含 DirectWrite）、栅格化、shaping 与相关 `pkg/` |
-| `gx-core` | GX 共享核心 `src/gx/`：配置分层、i18n 与生成器、`gx:` 动作、启动配置、进程策略 |
+| `gx-core` | GX 共享核心 `src/gx/`：配置分层、i18n 与生成器、界面库、`gx:` 动作、启动配置、进程策略 |
 | `input` | 键鼠输入、绑定、编码（含 win32-input-mode） |
 | `libghostty-embedding` | `include/ghostty.h`、embedded apprt、`src/main_c.zig` |
 | `libghostty-vt` | `include/ghostty/`、`src/terminal/c/`、`src/lib_vt.zig`、`example/`、CMake/Doxygen |
@@ -157,7 +159,7 @@ fix(build): 非 v 前缀 tag 不再触发版本号 panic
 | `support-libs` | `src/datastruct/`、`src/lib/` 与通用小模块 |
 | `terminal-core` | `src/terminal/` 状态机与页存储、simd、unicode |
 | `termio-pty-os` | termio、Exec、pty（含随包 ConPTY）、`src/os/` |
-| `testing` | `test/`、benchmark、synthetic、fuzz、测试运行器与 `just wsl`（`--task test`） |
+| `testing` | `test/`（含 GUI 场景）、benchmark、synthetic、fuzz、测试运行器、`just wsl`、`just win-gui` 与 `just perf`（`--task test`） |
 
 ## 完成门
 
@@ -165,6 +167,6 @@ fix(build): 非 v 前缀 tag 不再触发版本号 panic
 2. 按 resolver 列出的领域文档「验证」段跑最小针对性测试：libghostty-vt 用 `just test-vt --filter <子串>`，其他 Zig 用 `just test --filter <子串>`（Windows 与 POSIX 分支各自验证，POSIX 用 `just wsl test` 或 gx-ci 的 `linux-main`），框架脚本用 `python scripts/run_unittests.py test_<name>`；合并前跑 `just framework-check` 与 `just ci-check`。
 3. 改 Zig 跑 `just fmt-check`；改 Swift 按 `macos/AGENTS.md` 跑 swiftlint。
 4. 触及生成物必须用对应生成器重建并审 diff，或说明为何无影响；改公开签名或文档后跑 `just kb`，上游同步后跑 `just generated-check`。
-5. GUI 可见变更要有读过的截图才记 PASS：win32 用 `just build` 的 app 在隔离配置下启动，经 kimi-cu 桌面自动化（或 PowerShell）截图并逐张读图；GTK 用 `just wsl smoke` 截图，或 gx-ci 的 `gtk-smoke`；macOS 记 PENDING（`apprt-win32.md`、`testing.md`）。
+5. GUI 可见变更要有读过的截图才记 PASS：win32 用 `just build` 的 app 在隔离配置下启动，经 `just win-gui`（或 kimi-cu 桌面自动化、PowerShell）截图并逐张读图；GTK 用 `just wsl smoke` / `just wsl scenario` 截图，或 gx-ci 的 `gtk-smoke`；macOS 记 PENDING（`apprt-win32.md`、`testing.md`）。
 6. `git diff --check` 干净。
 7. 交付说明列出改动、真源、实际运行的命令与结果，逐项标 PASS / FAIL / PENDING / N/A；未运行项附补验命令与理由，不写假绿。
