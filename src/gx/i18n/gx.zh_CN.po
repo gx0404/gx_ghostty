@@ -865,3 +865,51 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. Windows apprt: feedback at the bottom of a window (App.zig)
+msgid "Configuration Errors"
+msgstr "配置错误"
+
+msgid "…and {count} more."
+msgstr "……另有 {count} 条。"
+
+msgid "Reloaded the configuration"
+msgstr "已重新加载配置"
+
+msgid "Cleared clipboard"
+msgstr "已清空剪贴板"
+
+msgid "Command Failed"
+msgstr "命令执行失败"
+
+msgid "Press any key to close the terminal."
+msgstr "按任意键关闭此终端。"
+
+msgid "Read-only"
+msgstr "只读"
+
+msgid ""
+"This terminal is in read-only mode. You can still view, select, and scroll "
+"through the content, but no input events will be sent to the running "
+"application."
+msgstr ""
+"本终端当前处于只读模式。你仍可浏览、选择、并滚动其中内容，但任何用户输入都不"
+"会传给运行中的程序。"
+
+msgid "Read-only mode is off"
+msgstr "已退出只读模式"
+
+msgid "Key table {name}"
+msgstr "按键表 {name}"
+
+msgid ""
+"Ghostty GX requires OpenGL 4.3 or newer, but no usable OpenGL driver was "
+"found.\n"
+"\n"
+"Update the graphics driver, or put a Mesa opengl32.dll in the \"mesa\" "
+"folder next to ghostty.exe."
+msgstr ""
+"Ghostty GX 需要 OpenGL 4.3 或更高版本，但未找到可用的 OpenGL 驱动。\n"
+"\n"
+"请更新显卡驱动，或在 ghostty.exe 所在目录的“mesa”文件夹中放入 Mesa 的 "
+"opengl32.dll。"

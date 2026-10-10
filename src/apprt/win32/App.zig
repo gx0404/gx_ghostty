@@ -10,6 +10,7 @@ const App = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const cli = @import("../../cli.zig");
 const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
@@ -20,13 +21,17 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const tabs = @import("tabs.zig");
+const tab_status = @import("tab_status.zig");
 const open_url = @import("open_url.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
 const Keybinds = @import("ui/Keybinds.zig");
+const Menu = @import("ui/Menu.zig");
+const Notice = @import("ui/Notice.zig");
 const Settings = @import("ui/Settings.zig");
 const d2d = @import("ui/d2d.zig");
+const style = @import("ui/style.zig");
 const trigger = @import("ui/trigger.zig");
 const wstr = @import("ui/wstr.zig");
 const key_conflicts = @import("shortcut_conflicts.zig");
@@ -36,8 +41,9 @@ const i18n = gx.i18n;
 const input = @import("../../input.zig");
 
 /// A registered global system hotkey: the RegisterHotKey id, its chord and
-/// the binding action to perform when WM_HOTKEY delivers that id.
-const GlobalHotkey = struct { id: i32, chord: key_conflicts.Chord, action: input.Binding.Action };
+/// the trigger whose binding WM_HOTKEY performs, as it is configured when
+/// the hotkey is pressed (`onHotkey`).
+const GlobalHotkey = struct { id: i32, chord: key_conflicts.Chord, trigger: input.Binding.Trigger };
 
 const log = std.log.scoped(.win32);
 
@@ -54,6 +60,16 @@ const QUIT_TIMER_ID: usize = 1;
 /// Timer ID and delay of the keybinding conflict probe (`probeShortcuts`).
 const SHORTCUT_PROBE_TIMER_ID: usize = 4;
 const shortcut_probe_delay_ms: u32 = 1000;
+
+/// Posted to the message-only window by `deferGx`: a GX action that opens a
+/// menu, which runs a modal loop, waits for the message loop. wparam is the
+/// `DeferredGx`, lparam the core id of the surface it is for.
+const WM_APP_DEFERRED_GX: u32 = w32.WM_APP + 6;
+
+/// Timer of the taskbar progress, every second while a taskbar button shows
+/// progress, so the reports that stopped coming end (`onProgressTimer`).
+const PROGRESS_TIMER_ID: usize = 5;
+const progress_timer_ms: u32 = 1000;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
@@ -119,9 +135,14 @@ running: bool = false,
 /// The quick terminal instance (if active).
 quick_terminal: ?*QuickTerminal = null,
 
-/// Registered global system hotkeys (RegisterHotKey). Maps the id delivered in
-/// WM_HOTKEY back to the binding action to perform. Generalized from the old
-/// single quick-terminal hotkey to every keybind flagged `global:`.
+/// The window that was in front when `toggle_visibility` hid the windows;
+/// it comes back to the front with them.
+hidden_front: ?w32.HWND = null,
+
+/// Registered global system hotkeys (RegisterHotKey on `msg_hwnd`, so the
+/// modal loops of menus and dialogs dispatch them too). Maps the id
+/// delivered in WM_HOTKEY back to the binding to perform. Generalized from
+/// the old single quick-terminal hotkey to every keybind flagged `global:`.
 global_hotkeys: std.ArrayList(GlobalHotkey) = .empty,
 
 /// The keybinding chords another program or the input method takes, from
@@ -165,6 +186,47 @@ proc_shared: gx.proc.Shared = .{},
 /// detects them again on the next use.
 profiles_cache: gx.profiles.Cache = .{},
 
+/// Whether `default_command` is to be picked again on the next
+/// configuration change (`reload_config` detects the shells anew).
+default_command_stale: bool = false,
+
+/// Whether a `WM_APP_WAKEUP` is on its way: `wakeup` posts one only when it
+/// sets this, so a burst of wakeups from the terminal threads queues a
+/// single message; `msgWndProc` clears it before the core's tick.
+wakeup_pending: std.atomic.Value(bool) = .init(false),
+
+/// The color scheme `Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME` forces
+/// instead of the system's (`appsUseLightTheme`); null follows Windows.
+simulated_scheme: ?apprt.ColorScheme = null,
+
+/// `gx.config_layers.diagnosticsDigest` of the configuration errors last
+/// reported (0: none), so a reload that keeps them says nothing again.
+diagnostics_reported: u64 = 0,
+
+/// The leader keys typed so far of a key sequence (`key_sequence`), shown
+/// in a toast until the sequence ends.
+key_sequence: [128]u8 = undefined,
+key_sequence_len: usize = 0,
+
+/// What the taskbar buttons show (`showTaskbarProgress`), so an unchanged
+/// state is not set again; buttons without an entry show nothing.
+taskbar_shown: std.ArrayList(TaskbarShown) = .empty,
+
+/// Whether `PROGRESS_TIMER_ID` runs.
+progress_timer: bool = false,
+
+/// The message Explorer sends a window when its taskbar button exists, also
+/// after Explorer restarted (`isTaskbarButtonCreated`).
+taskbar_button_created: u32 = 0,
+
+/// The large icon of desktop notifications, loaded on first use (shared,
+/// never destroyed).
+balloon_icon: ?w32.HICON = null,
+
+/// `bell-audio-path` in UTF-16 for `PlaySoundW`, which plays it
+/// asynchronously.
+bell_audio_path: [1024]u16 = undefined,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -176,8 +238,10 @@ pub fn init(
         return error.Win32Error;
 
     // The Ghostty GX defaults give a window material a background opacity
-    // only where the material can show behind the terminals.
-    const alpha_frames = Backdrop.alphaFramesSupported(&core_app.device);
+    // only where the material can show behind the terminals, which the
+    // OpenGL device decides once its probe is done (`settleDevice`); until
+    // then this guesses.
+    const alpha_frames = expectAlphaFrames(core_app.alloc);
     gx.config_layers.setMaterialOpacity(alpha_frames);
 
     // Load the configuration for this application.
@@ -309,7 +373,9 @@ pub fn init(
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    // Register global hotkey for quick terminal (if configured).
+    self.taskbar_button_created = RegisterWindowMessageW(std.unicode.utf8ToUtf16LeStringLiteral("TaskbarButtonCreated"));
+
+    // Register the `global:` keybinds as system hotkeys.
     self.registerGlobalHotkey();
 }
 
@@ -317,11 +383,20 @@ pub fn run(self: *App) !void {
     self.running = true;
     defer self.running = false;
 
+    // The first window and its terminal start in the theme for the light or
+    // dark app mode of Windows (`theme = light:…,dark:…`).
+    self.syncColorScheme();
+
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
     const window = try alloc.create(Window);
     errdefer alloc.destroy(window);
     try window.init(self, .{});
+    // The OpenGL device may probe until now, in parallel with the above.
+    self.settleDevice(window) catch |err| {
+        window.deinit();
+        return err;
+    };
     try self.windows.append(alloc, window);
     _ = try window.addTab();
     self.scheduleShortcutProbe();
@@ -342,20 +417,6 @@ pub fn run(self: *App) !void {
         }
         if (result < 0) return error.Win32Error;
         if (self.quit_requested) break;
-
-        // Dispatch a global hotkey to its bound action.
-        if (msg.message == w32.WM_HOTKEY) {
-            const id: i32 = @intCast(msg.wParam);
-            for (self.global_hotkeys.items) |hk| {
-                if (hk.id != id) continue;
-                // apprt.App is this win32 App, so `self` is the rt_app.
-                self.core_app.performAllAction(self, hk.action) catch |err| {
-                    log.warn("global hotkey action failed err={}", .{err});
-                };
-                break;
-            }
-            continue;
-        }
 
         // Intercept keystrokes destined for popup edit controls so
         // Enter/Escape/Arrow keys can be handled by our code.
@@ -397,6 +458,56 @@ pub fn run(self: *App) !void {
         _ = w32.DispatchMessageW(&msg);
     }
 }
+
+/// What `Backdrop.alphaFramesSupported` most likely says once the OpenGL
+/// device has probed: per-pixel translucency on the Windows builds with
+/// materials, unless software OpenGL is asked for (`GHOSTTY_GX_OPENGL`).
+fn expectAlphaFrames(alloc: Allocator) bool {
+    if (!Backdrop.supportsMaterials()) return false;
+    const value = global.environ().getAlloc(alloc, "GHOSTTY_GX_OPENGL") catch return true;
+    defer alloc.free(value);
+    return !std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " "), "software");
+}
+
+/// Wait for the OpenGL device (`wgl.Device.wait`) once the first window
+/// exists, and act on what it found. Without OpenGL nothing can render:
+/// the app says so and fails. When per-pixel translucency is not what
+/// `init` guessed, the configuration is loaded again for it and `window`,
+/// which shows nothing yet, is made anew.
+fn settleDevice(self: *App, window: *Window) !void {
+    self.core_app.device.wait() catch |err| {
+        reportOpenGLUnavailable();
+        return err;
+    };
+    const supported = Backdrop.alphaFramesSupported(&self.core_app.device);
+    if (supported == self.alpha_frames) return;
+    log.info("per-pixel translucency={} unlike guessed, loading the configuration again", .{supported});
+    self.alpha_frames = supported;
+    gx.config_layers.setMaterialOpacity(supported);
+    if (Config.load(self.core_app.alloc)) |loaded| {
+        var config = loaded;
+        defer config.deinit();
+        self.core_app.updateConfig(self, &config) catch |err| {
+            log.err("config update error: {}", .{err});
+        };
+    } else |err| log.err("failed to reload config: {}", .{err});
+    window.deinit();
+    try window.init(self, .{});
+}
+
+/// Without OpenGL nothing renders, and there is no window to say so in.
+fn reportOpenGLUnavailable() void {
+    var text: [512]u16 = undefined;
+    var caption: [64]u16 = undefined;
+    _ = w32.MessageBoxW(
+        null,
+        wstr.bufZ(&text, i18n.tr("Ghostty GX requires OpenGL 4.3 or newer, but no usable OpenGL driver was found.\n\nUpdate the graphics driver, or put a Mesa opengl32.dll in the \"mesa\" folder next to ghostty.exe.")),
+        wstr.bufZ(&caption, gx.branding.name),
+        MB_ICONERROR,
+    );
+}
+
+const MB_ICONERROR: u32 = 0x00000010;
 
 /// The chrome or popup element that owns a focused Edit control.
 const EditOwner = union(enum) {
@@ -552,10 +663,22 @@ fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
 pub fn terminate(self: *App) void {
     self.stopQuitTimer();
 
-    // Unregister all global hotkeys.
-    for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
+    // Out of sight first: below, the terminals of every window shut down
+    // one after the other, which takes a moment each.
+    for (self.windows.items) |window| {
+        if (window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+    }
+    if (self.quick_terminal) |qt| {
+        if (qt.window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+    }
+    // The icon of the last desktop notification would stay in the
+    // notification area until the pointer passes over it.
+    self.removeNotificationIcon();
+
+    self.unregisterGlobalHotkeys();
     self.global_hotkeys.deinit(self.core_app.alloc);
     self.shortcut_conflicts.deinit(self.core_app.alloc);
+    self.taskbar_shown.deinit(self.core_app.alloc);
 
     // Release the taskbar COM object if we created one.
     if (self.taskbar) |tb| {
@@ -569,6 +692,16 @@ pub fn terminate(self: *App) void {
         self.quick_terminal = null;
     }
 
+    // Deinit and free all Window containers.
+    const alloc = self.core_app.alloc;
+    for (self.windows.items) |window| {
+        window.deinit();
+        alloc.destroy(window);
+    }
+    self.windows.deinit(alloc);
+
+    // Last: the threads of the terminals wake the message loop through it
+    // until they are gone.
     if (self.msg_hwnd) |hwnd| {
         // Clear GWLP_USERDATA before destroying so msgWndProc sees
         // userdata=0 and falls through to DefWindowProc for any
@@ -577,14 +710,6 @@ pub fn terminate(self: *App) void {
         _ = w32.DestroyWindow(hwnd);
         self.msg_hwnd = null;
     }
-
-    // Deinit and free all Window containers.
-    const alloc = self.core_app.alloc;
-    for (self.windows.items) |window| {
-        window.deinit();
-        alloc.destroy(window);
-    }
-    self.windows.deinit(alloc);
 
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
@@ -625,22 +750,68 @@ pub fn uiFactory(self: *App) ?*d2d.Factory {
     return self.ui_factory;
 }
 
-/// Wake up the message loop from any thread by posting a message
-/// to the message-only window.
+/// Wake up the message loop from any thread so that it runs the core's
+/// tick. Wakeups coalesce: while one `WM_APP_WAKEUP` waits in the queue,
+/// more do not post another, so a burst of terminal output does not crowd
+/// out painting, timers and input with wakeup messages.
 pub fn wakeup(self: *App) void {
-    if (self.msg_hwnd) |hwnd| {
-        _ = w32.PostMessageW(hwnd, WM_APP_WAKEUP, 0, 0);
-    }
+    // Acquire-release: the mailbox push before this call happens before
+    // the tick that clears the flag (`msgWndProc`), so that tick drains it.
+    if (self.wakeup_pending.swap(true, .acq_rel)) return;
+    const hwnd = self.msg_hwnd orelse {
+        self.wakeup_pending.store(false, .release);
+        return;
+    };
+    if (w32.PostMessageW(hwnd, WM_APP_WAKEUP, 0, 0) == 0) self.wakeup_pending.store(false, .release);
 }
 
 /// A system broadcast (`w32.SystemChange`) reached the top-level `window`
-/// (`Window.onSystemSettingChange`): every window hears each broadcast, so
-/// one change arrives once per window. GUI thread. The app does not follow
-/// them yet (the apps light or dark theme is "ImmersiveColorSet").
+/// (`Window.onSystemSettingChange`). GUI thread. Every window hears each
+/// broadcast, so the app acts for one of them (`primaryWindow`): the light
+/// or dark app mode ("ImmersiveColorSet") goes to the core and the
+/// terminals (`syncColorScheme`), and changed environment variables
+/// ("Environment") detect the shells of the launch profiles again.
 pub fn onSystemSettingChange(self: *App, window: *Window, change: w32.SystemChange) void {
-    _ = self;
-    _ = window;
-    _ = change;
+    if (window != self.primaryWindow()) return;
+    if (change.isArea("ImmersiveColorSet")) self.syncColorScheme();
+    if (change.isArea("Environment")) {
+        self.profiles_cache.invalidate();
+        self.updateDefaultCommand();
+    }
+}
+
+/// The window that answers system broadcasts for the app: the first one,
+/// else the quick terminal.
+fn primaryWindow(self: *App) ?*Window {
+    if (self.windows.items.len > 0) return self.windows.items[0];
+    if (self.quick_terminal) |qt| return qt.window;
+    return null;
+}
+
+/// Whether apps use the light theme: "Choose your app mode" in the Windows
+/// settings (`Backdrop.systemUsesLightTheme`), or what
+/// `Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME` forces. GUI thread.
+pub fn appsUseLightTheme(self: *const App) bool {
+    if (self.simulated_scheme) |scheme| return scheme == .light;
+    return Backdrop.systemUsesLightTheme();
+}
+
+/// Tell the core and every terminal whether apps use the light or the dark
+/// theme (`appsUseLightTheme`): `theme = light:…,dark:…` and the other
+/// conditional configuration follow it, and programs that ask for the
+/// color scheme (DSR 996, mode 2031) get the truth. The core does nothing
+/// when it did not change.
+fn syncColorScheme(self: *App) void {
+    const scheme: apprt.ColorScheme = if (self.appsUseLightTheme()) .light else .dark;
+    self.core_app.colorSchemeEvent(self, scheme) catch |err| {
+        log.warn("cannot apply the color scheme err={}", .{err});
+    };
+    for (self.core_app.surfaces.items) |surface| {
+        if (!surface.core_surface_ready) continue;
+        surface.core_surface.colorSchemeCallback(scheme) catch |err| {
+            log.warn("cannot apply the color scheme to a terminal err={}", .{err});
+        };
+    }
 }
 
 /// What `Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME` asks to simulate, packed
@@ -654,12 +825,46 @@ pub const SimulatedSystemTheme = packed struct(usize) {
 
 /// Test hook (`Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME`, GUI thread): act
 /// as if Windows switched to the color scheme and high contrast state that
-/// `wparam` asks for (`SimulatedSystemTheme`). Returns whether it did so;
-/// it does not yet.
+/// `wparam` asks for (`SimulatedSystemTheme`), without touching the
+/// settings of Windows. Every window then hears the broadcasts Windows
+/// would send. Returns false for a wparam that is not a
+/// `SimulatedSystemTheme`.
 pub fn simulateSystemTheme(self: *App, wparam: usize) bool {
-    _ = self;
-    _ = wparam;
-    return false;
+    const wanted = simulatedTheme(wparam) orelse return false;
+    self.simulated_scheme = wanted.scheme;
+    style.system.forced_high_contrast = wanted.high_contrast;
+    for (self.windows.items) |window| broadcastSystemTheme(window);
+    if (self.quick_terminal) |qt| broadcastSystemTheme(qt.window);
+    return true;
+}
+
+/// What `SimulatedSystemTheme` `wparam` forces: the color scheme and high
+/// contrast, null where it follows Windows. Null for an invalid wparam.
+fn simulatedTheme(wparam: usize) ?struct { scheme: ?apprt.ColorScheme, high_contrast: ?bool } {
+    const wanted: SimulatedSystemTheme = @bitCast(wparam);
+    if (wanted.reserved != 0) return null;
+    return .{
+        .scheme = switch (wanted.scheme) {
+            .system => null,
+            .light => .light,
+            .dark => .dark,
+            _ => return null,
+        },
+        .high_contrast = switch (wanted.high_contrast) {
+            .system => null,
+            .on => true,
+            .off => false,
+            _ => return null,
+        },
+    };
+}
+
+/// Send `window` the broadcasts of an app mode or high contrast change.
+fn broadcastSystemTheme(window: *Window) void {
+    const hwnd = window.hwnd orelse return;
+    const area = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet");
+    _ = w32.SendMessageW(hwnd, w32.WM_SETTINGCHANGE, 0, @bitCast(@intFromPtr(area)));
+    _ = w32.SendMessageW(hwnd, w32.WM_SYSCOLORCHANGE, 0, 0);
 }
 
 /// IPC from external processes. Not yet implemented for Win32.
@@ -716,7 +921,8 @@ pub fn performAction(
                 alloc.destroy(window);
                 return true;
             };
-            _ = window.addTab() catch |err| {
+            // The window context: `window-inherit-working-directory`.
+            _ = window.addTabWithOptions(.{ .context = .window }) catch |err| {
                 log.err("failed to add tab to new window err={}", .{err});
                 // The window never showed: the message loop destroys it,
                 // which also drops it from `windows`.
@@ -738,32 +944,10 @@ pub fn performAction(
         },
 
         .ring_bell => {
-            const features = self.config.@"bell-features";
-            // `system`: the Windows default beep sound.
-            if (features.system) _ = w32.MessageBeep(0xFFFFFFFF);
-            // `attention`: flash the taskbar button until the window comes
-            // to the foreground, if the window owning this surface isn't
-            // the foreground window. Without this, BEL on a backgrounded
-            // terminal is invisible.
-            if (features.attention) switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    // Badge the tab when it is in the background.
-                    core_surface.rt_surface.parent_window.onBell(core_surface.rt_surface);
-                    if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
-                        if (w32.GetForegroundWindow() != win_hwnd) {
-                            var fwi: w32.FLASHWINFO = .{
-                                .cbSize = @sizeOf(w32.FLASHWINFO),
-                                .hwnd = win_hwnd,
-                                .dwFlags = w32.FLASHW_ALL | w32.FLASHW_TIMERNOFG,
-                                .uCount = 2,
-                                .dwTimeout = 0,
-                            };
-                            _ = w32.FlashWindowEx(&fwi);
-                        }
-                    }
-                },
-            };
+            self.ringBell(switch (target) {
+                .app => null,
+                .surface => |core_surface| core_surface.rt_surface,
+            });
             return true;
         },
 
@@ -852,7 +1036,11 @@ pub fn performAction(
         .open_url => {
             // The core asks with the terminal locked when a link is
             // clicked; the shell opens the URL on a thread of its own.
-            open_url.open(value.url);
+            // Links the terminal output chose go through the link policy.
+            switch (value.kind) {
+                .osc8 => self.openLink(target, value.url),
+                .unknown, .text, .html => open_url.open(value.url),
+            }
             return true;
         },
 
@@ -985,9 +1173,8 @@ pub fn performAction(
             };
         },
 
-        .toggle_tab_overview => {
-            return true;
-        },
+        // The tab switcher of the command palette is not there yet.
+        .toggle_tab_overview => return false,
 
         .initial_size => {
             switch (target) {
@@ -1000,32 +1187,29 @@ pub fn performAction(
         },
 
         .reload_config => {
-            // Reload config and push to the core, which triggers
-            // config_change actions on all surfaces.
-            const alloc = self.core_app.alloc;
-            if (value.soft) {
-                // Soft reload: re-apply existing config (for conditional state changes)
-                self.core_app.updateConfig(self, &self.config) catch |err| {
+            if (!value.soft) {
+                self.reloadConfigFromDisk(target);
+                return true;
+            }
+            // A soft reload applies the configuration again for a changed
+            // conditional state (the color scheme): of one terminal, or of
+            // the app and so every terminal. Each terminal asks for its
+            // own, so the app is not reloaded once per terminal.
+            switch (target) {
+                .surface => |core_surface| core_surface.updateConfig(&self.config) catch |err| {
                     log.err("soft config reload error: {}", .{err});
-                };
-            } else {
-                // Hard reload: read config from disk
-                var new_config = Config.load(alloc) catch |err| {
-                    log.err("failed to reload config: {}", .{err});
-                    return true;
-                };
-                defer new_config.deinit();
-                self.applyConfig(&new_config) catch |err| {
-                    log.err("config update error: {}", .{err});
-                };
+                },
+                .app => self.core_app.updateConfig(self, &self.config) catch |err| {
+                    log.err("soft config reload error: {}", .{err});
+                },
             }
             return true;
         },
 
         // A command that ran is left to the core, which prints "Process
         // exited" in the terminal (and closes it unless
-        // `wait-after-command`). A command that failed to start is told
-        // from the message loop: no modal loop inside a core callback.
+        // `wait-after-command`). A command that failed to start is told in
+        // a notice at the bottom of the window, which blocks nothing.
         .show_child_exited => return switch (target) {
             .app => false,
             .surface => |core_surface| switch (childExitKind(
@@ -1033,10 +1217,7 @@ pub fn performAction(
                 core_surface.config.abnormal_command_exit_runtime_ms,
             )) {
                 .normal => false,
-                .abnormal => abnormal: {
-                    const hwnd = core_surface.rt_surface.hwnd orelse break :abnormal false;
-                    break :abnormal w32.PostMessageW(hwnd, Surface.WM_APP_CHILD_EXITED, value.exit_code, 0) != 0;
-                },
+                .abnormal => showChildExited(core_surface.rt_surface.parent_window, value.exit_code),
             },
         },
 
@@ -1087,33 +1268,9 @@ pub fn performAction(
             return true;
         },
 
-        .copy_title_to_clipboard => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Get the window title and put it on the clipboard
-                        var wbuf: [512]u16 = undefined;
-                        const wlen: usize = @intCast(w32.GetWindowTextW(h, &wbuf, @intCast(wbuf.len)));
-                        if (wlen > 0) {
-                            var utf8_buf: [1024]u8 = undefined;
-                            const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
-                            if (utf8_len > 0) {
-                                // Copy to clipboard via the core surface
-                                const alloc = self.core_app.alloc;
-                                const text = alloc.dupeZ(u8, utf8_buf[0..utf8_len]) catch return true;
-                                defer alloc.free(text);
-                                core_surface.rt_surface.setClipboard(
-                                    .standard,
-                                    &.{.{ .mime = "text/plain", .data = text }},
-                                    false,
-                                ) catch {};
-                            }
-                        }
-                    }
-                },
-            }
-            return true;
+        .copy_title_to_clipboard => return switch (target) {
+            .app => false,
+            .surface => |core_surface| self.copyTitle(core_surface.rt_surface),
         },
 
         .export_terminal_io => return self.exportTerminalIo(target, value.contents),
@@ -1121,13 +1278,36 @@ pub fn performAction(
         // The renderer presents directly to the surface window.
         .render => return true,
 
+        // The leader keys typed so far, the active key table and read-only
+        // mode show at the bottom of the window.
+        .key_sequence => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| self.showKeySequence(core_surface.rt_surface.parent_window, value),
+            }
+            return true;
+        },
+
+        .key_table => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| showKeyTable(core_surface.rt_surface.parent_window, value),
+            }
+            return true;
+        },
+
+        .readonly => {
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| showReadonly(core_surface.rt_surface.parent_window, value),
+            }
+            return true;
+        },
+
         // Acknowledge actions that don't need Win32-specific handling.
         // The core handles the logic; we just confirm receipt.
-        .key_sequence,
-        .key_table,
         .pwd,
         .cell_size,
-        .readonly,
         // Platform-specific actions that don't apply on Windows:
         .secure_input, // macOS EnableSecureEventInput
         .undo, // macOS NSUndoManager
@@ -1155,32 +1335,17 @@ pub fn performAction(
         },
 
         .progress_report => {
-            // Reflect shell/TUI progress (OSC 9;4) on the taskbar button, the
-            // Windows equivalent of the macOS Dock progress. Gated on
-            // progress-style; the win32 apprt has no progress bar of its own.
+            // Shell and TUI progress (OSC 9;4): the terminal's tab keeps it
+            // and the window's taskbar button shows what all its terminals
+            // report, the Windows equivalent of the macOS Dock progress.
+            // Gated on progress-style.
             if (!self.config.@"progress-style") return true;
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const hwnd = core_surface.rt_surface.parent_window.hwnd orelse
-                        return true;
-                    const tb = self.taskbarList() orelse return true;
-                    switch (value.state) {
-                        .remove => tb.SetProgressState(hwnd, w32.TBPF_NOPROGRESS),
-                        .indeterminate => tb.SetProgressState(hwnd, w32.TBPF_INDETERMINATE),
-                        .set => {
-                            tb.SetProgressState(hwnd, w32.TBPF_NORMAL);
-                            if (value.progress) |p| tb.SetProgressValue(hwnd, p, 100);
-                        },
-                        .@"error" => {
-                            tb.SetProgressState(hwnd, w32.TBPF_ERROR);
-                            if (value.progress) |p| tb.SetProgressValue(hwnd, p, 100);
-                        },
-                        .pause => {
-                            tb.SetProgressState(hwnd, w32.TBPF_PAUSED);
-                            if (value.progress) |p| tb.SetProgressValue(hwnd, p, 100);
-                        },
-                    }
+                    const window = core_surface.rt_surface.parent_window;
+                    window.setSurfaceProgress(core_surface.rt_surface, value);
+                    self.updateTaskbarProgress(window);
                 },
             }
             return true;
@@ -1227,28 +1392,7 @@ pub fn performAction(
         },
 
         .toggle_visibility => {
-            // Hide all visible top-level Ghostty windows; if any are
-            // already hidden, show + restore them. Equivalent to macOS
-            // NSApp hide / show.
-            var any_visible = false;
-            for (self.windows.items) |w| {
-                if (w.hwnd) |h| {
-                    if (w32.IsWindowVisible_(h) != 0) {
-                        any_visible = true;
-                        break;
-                    }
-                }
-            }
-            for (self.windows.items) |w| {
-                if (w.hwnd) |h| {
-                    if (any_visible) {
-                        _ = w32.ShowWindow(h, w32.SW_HIDE);
-                    } else {
-                        _ = w32.ShowWindow(h, w32.SW_SHOWNOACTIVATE);
-                    }
-                }
-            }
-            // The quick terminal manages its own visibility separately.
+            self.toggleVisibility();
             return true;
         },
 
@@ -1298,23 +1442,8 @@ pub fn performAction(
                         return true;
 
                     const act = self.config.@"notify-on-command-finish-action";
-                    if (act.bell) {
-                        _ = w32.MessageBeep(0xFFFFFFFF);
-                        // Flash the taskbar button when backgrounded so the
-                        // bell is visible too.
-                        if (core_surface.rt_surface.parent_window.hwnd) |win_hwnd| {
-                            if (w32.GetForegroundWindow() != win_hwnd) {
-                                var fwi: w32.FLASHWINFO = .{
-                                    .cbSize = @sizeOf(w32.FLASHWINFO),
-                                    .hwnd = win_hwnd,
-                                    .dwFlags = w32.FLASHW_ALL | w32.FLASHW_TIMERNOFG,
-                                    .uCount = 3,
-                                    .dwTimeout = 0,
-                                };
-                                _ = w32.FlashWindowEx(&fwi);
-                            }
-                        }
-                    }
+                    // The bell as `bell-features` has it.
+                    if (act.bell) self.ringBell(core_surface.rt_surface);
                     if (act.notify) {
                         const title: []const u8 = if (value.exit_code) |code|
                             (if (code == 0) i18n.tr("Command succeeded") else i18n.tr("Command failed"))
@@ -1350,15 +1479,19 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
+                    const surface = core_surface.rt_surface;
                     const visible = value == .visible;
-                    core_surface.rt_surface.mouse_visible = visible;
-                    // Force the next WM_SETCURSOR to apply the new state
-                    // by issuing SetCursor immediately if the cursor is
-                    // currently in our client area.
-                    if (!visible) {
-                        _ = w32.SetCursor(null);
-                    } else if (core_surface.rt_surface.current_cursor) |c| {
-                        _ = w32.SetCursor(c);
+                    surface.mouse_visible = visible;
+                    // WM_SETCURSOR applies it from the next pointer move;
+                    // apply it now only while the pointer is over this
+                    // terminal, so it stays on the tab bar, a popup or
+                    // another window.
+                    if (pointerOver(surface.hwnd)) {
+                        if (!visible) {
+                            _ = w32.SetCursor(null);
+                        } else if (surface.current_cursor) |c| {
+                            _ = w32.SetCursor(c);
+                        }
                     }
                 },
             }
@@ -1366,27 +1499,9 @@ pub fn performAction(
         },
 
         .present_terminal => {
-            // Raise the window containing the target surface and select
-            // its tab. Restores from minimized/iconic state if necessary.
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    const win = core_surface.rt_surface.parent_window;
-                    if (win.hwnd) |hwnd| {
-                        // SW_RESTORE brings the window back from minimized;
-                        // it would also un-maximize, so only when minimized.
-                        if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
-                        _ = w32.SetForegroundWindow(hwnd);
-                        // Make sure the tab containing this surface is active.
-                        if (win.findTabIndex(core_surface.rt_surface)) |idx| {
-                            if (idx != win.active_tab) win.selectTabIndex(idx);
-                        }
-                        // Focus the surface's child HWND.
-                        if (core_surface.rt_surface.hwnd) |sh| {
-                            _ = w32.SetFocus(sh);
-                        }
-                    }
-                },
+                .surface => |core_surface| self.presentSurface(core_surface.rt_surface),
             }
             return true;
         },
@@ -1508,15 +1623,83 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
         .keybinds => Keybinds.show(window),
         .new_tab_profile => |id| self.openProfile(window, id, .tab),
         .new_window_profile => |id| self.openProfile(window, id, .window),
+        .new_tab_menu => self.deferGx(.new_tab_menu, window),
+        .context_menu => self.deferGx(.context_menu, window),
         // Not implemented yet: report them as not performed so that a
         // `performable:` binding passes its key on to the terminal.
         .settings_page,
-        .new_tab_menu,
-        .context_menu,
         .move_split_to_tab,
         .move_split_to_window,
         .tab_switcher,
         => false,
+    };
+}
+
+/// A GX action that opens a menu (`WM_APP_DEFERRED_GX`).
+const DeferredGx = enum(usize) {
+    /// The launch profile menu of the new tab button.
+    new_tab_menu,
+    /// The terminal's context menu, at its cursor.
+    context_menu,
+};
+
+/// Open the menu of `kind` for the focused terminal of `window` once the
+/// message loop is back: a menu runs a modal loop, which must not run in
+/// the key binding that asks for it. Returns false if it cannot.
+fn deferGx(self: *App, kind: DeferredGx, window: *Window) bool {
+    const hwnd = self.msg_hwnd orelse return false;
+    if (window.closing) return false;
+    const surface = window.getActiveSurface() orelse return false;
+    if (!surface.core_surface_initialized) return false;
+    return w32.PostMessageW(hwnd, WM_APP_DEFERRED_GX, @intFromEnum(kind), @bitCast(surface.core_surface.id)) != 0;
+}
+
+/// Handle `WM_APP_DEFERRED_GX` (`deferGx`), if the terminal is still there.
+fn onDeferredGx(self: *App, wparam: usize, lparam: isize) void {
+    const kind = std.enums.fromInt(DeferredGx, wparam) orelse return;
+    const core_surface = self.core_app.findSurfaceByID(@bitCast(lparam)) orelse return;
+    const surface = core_surface.rt_surface;
+    const window = surface.parent_window;
+    if (window.closing) return;
+    switch (kind) {
+        .new_tab_menu => Menu.showProfileMenu(window, newTabMenuAnchor(window)),
+        .context_menu => openContextMenu(surface),
+    }
+}
+
+/// Where the launch profile menu opens from the keyboard: below the new tab
+/// button, or at the top left of the terminal area without a tab bar.
+fn newTabMenuAnchor(window: *Window) w32.POINT {
+    const hwnd = window.hwnd orelse return .{ .x = 0, .y = 0 };
+    const button = window.tab_bar.new_tab_rect;
+    var pt: w32.POINT = if (window.tab_bar.visible and button.right > button.left)
+        .{ .x = button.left, .y = button.bottom }
+    else at: {
+        const area = window.surfaceRect();
+        break :at .{ .x = area.left, .y = area.top };
+    };
+    _ = w32.ClientToScreen(hwnd, &pt);
+    return pt;
+}
+
+/// The terminal's context menu from the keyboard (`gx:context_menu`),
+/// opened at its cursor, as the IME candidate window is.
+fn openContextMenu(surface: *Surface) void {
+    if (!surface.core_surface_ready) return;
+    const hwnd = surface.hwnd orelse return;
+    const cursor = surface.core_surface.imePoint();
+    const scale = surface.getContentScale() catch apprt.ContentScale{ .x = 1, .y = 1 };
+    var pt: w32.POINT = .{
+        .x = @intFromFloat(@round(cursor.x * @as(f64, scale.x))),
+        .y = @intFromFloat(@round(cursor.y * @as(f64, scale.y))),
+    };
+    _ = w32.ClientToScreen(hwnd, &pt);
+    const app = surface.app;
+    const id = surface.core_surface.id;
+    const binding = Menu.showSurfaceContextMenu(surface, pt) orelse return;
+    const core_surface = app.core_app.findSurfaceByID(id) orelse return;
+    _ = core_surface.performBindingAction(binding) catch |err| {
+        log.err("context menu action failed err={}", .{err});
     };
 }
 
@@ -1526,15 +1709,20 @@ fn targetWindow(self: *App, target: apprt.Target) ?*Window {
     switch (target) {
         .surface => |core_surface| return core_surface.rt_surface.parent_window,
         .app => {
-            const foreground = w32.GetForegroundWindow();
+            const foreground = if (w32.GetForegroundWindow()) |hwnd| GetAncestor(hwnd, 3) else null;
             for (self.windows.items) |window| {
                 if (window.hwnd != null and window.hwnd == foreground) return window;
             }
-            if (self.windows.items.len == 0) return null;
-            return self.windows.items[self.windows.items.len - 1];
+            if (self.quick_terminal) |qt| {
+                if (qt.window.hwnd != null and qt.window.hwnd == foreground) return qt.window;
+            }
+            if (self.windows.items.len > 0) return self.windows.items[self.windows.items.len - 1];
+            return if (self.quick_terminal) |qt| qt.window else null;
         },
     }
 }
+
+extern "user32" fn GetAncestor(hwnd: w32.HWND, flags: u32) callconv(.winapi) ?w32.HWND;
 
 /// `goto_window`: bring the next (or previous) visible window after the
 /// window of `target` to the front, wrapping around. Returns false when
@@ -1557,6 +1745,195 @@ fn gotoWindow(self: *App, target: apprt.Target, direction: apprt.action.GotoWind
     }
     return false;
 }
+
+/// The window of the core surface `id`, if it still exists.
+fn windowOfSurface(self: *App, id: u64) ?*Window {
+    if (id == 0) return null;
+    const core_surface = self.core_app.findSurfaceByID(id) orelse return null;
+    return core_surface.rt_surface.parent_window;
+}
+
+/// Whether `hwnd` is on screen: visible and not minimized.
+fn onScreen(hwnd: w32.HWND) bool {
+    return w32.IsWindowVisible_(hwnd) != 0 and w32.IsIconic(hwnd) == 0;
+}
+
+/// `toggle_visibility`: hide every window, or when none is on screen (a
+/// minimized window counts as hidden) show them all again, each in its
+/// size and state (a maximized one stays maximized), and bring back to the
+/// front the one that was in front. Hidden windows stop rendering. The
+/// quick terminal toggles on its own (`toggle_quick_terminal`).
+fn toggleVisibility(self: *App) void {
+    const any_shown = for (self.windows.items) |window| {
+        const hwnd = window.hwnd orelse continue;
+        if (onScreen(hwnd)) break true;
+    } else false;
+
+    if (any_shown) {
+        const front = self.targetWindow(.app);
+        self.hidden_front = if (front) |window| window.hwnd else null;
+        for (self.windows.items) |window| {
+            const hwnd = window.hwnd orelse continue;
+            window.setActiveTabVisible(false);
+            _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+        }
+        return;
+    }
+
+    var front: ?*Window = null;
+    for (self.windows.items) |window| {
+        const hwnd = window.hwnd orelse continue;
+        if (window.closing) continue;
+        if (w32.IsWindowVisible_(hwnd) == 0) _ = w32.ShowWindow(hwnd, SW_SHOWNA);
+        if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+        window.setActiveTabVisible(true);
+        if (front == null or hwnd == self.hidden_front) front = window;
+    }
+    self.hidden_front = null;
+    const window = front orelse return;
+    if (window.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
+    window.focusActiveSurface();
+}
+
+/// `present_terminal`: bring `surface` to the user. Its window comes back
+/// from hidden or minimized (the quick terminal slides in) to the front,
+/// with the surface's tab selected and the surface focused.
+fn presentSurface(self: *App, surface: *Surface) void {
+    const window = surface.parent_window;
+    const hwnd = window.hwnd orelse return;
+    if (window.is_quick_terminal) {
+        if (self.quick_terminal) |qt| {
+            if (qt.window == window and w32.IsWindowVisible_(hwnd) == 0) qt.toggle();
+        }
+    } else {
+        if (w32.IsWindowVisible_(hwnd) == 0) {
+            _ = w32.ShowWindow(hwnd, SW_SHOWNA);
+            window.setActiveTabVisible(true);
+        }
+        // SW_RESTORE would also un-maximize, so only when minimized.
+        if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+    }
+    _ = w32.SetForegroundWindow(hwnd);
+    if (window.findTabIndex(surface)) |idx| {
+        if (idx != window.active_tab) window.selectTabIndex(idx);
+    }
+    if (surface.hwnd) |h| _ = w32.SetFocus(h);
+}
+
+/// Whether the pointer is over the window `hwnd` itself (not a window in
+/// front of it).
+fn pointerOver(hwnd: ?w32.HWND) bool {
+    const target = hwnd orelse return false;
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0) return false;
+    return WindowFromPoint(pt) == target;
+}
+
+/// Posted to `msg_hwnd` by `openLink`; lparam is a `LinkRequest`.
+const WM_APP_OPEN_LINK: u32 = w32.WM_APP + 34;
+
+/// A link the link policy holds back, waiting for the message loop to ask
+/// about it or to tell why it stays closed (`onLinkRequest`).
+const LinkRequest = struct {
+    /// The core surface whose terminal showed the link; 0 for none.
+    surface_id: u64,
+    decision: gx.url_policy.Decision,
+    url: []u8,
+
+    fn destroy(self: *LinkRequest, alloc: Allocator) void {
+        alloc.free(self.url);
+        alloc.destroy(self);
+    }
+};
+
+/// Open a link that terminal output chose (OSC 8) as `gx.url_policy`
+/// decides: web and mail links right away; files on this or another
+/// computer and the applications of other schemes once the user agrees;
+/// nothing that can run code. The core asks with the terminal locked, so
+/// the question and the refusal wait for the message loop
+/// (`WM_APP_OPEN_LINK`).
+fn openLink(self: *App, target: apprt.Target, url: []const u8) void {
+    var name_buf: [host_name_size]u8 = undefined;
+    const decision = gx.url_policy.decide(url, .{ .host_name = hostName(&name_buf) });
+    if (decision == .allow) return open_url.open(url);
+    log.info("link held back decision={t} len={}", .{ decision, url.len });
+
+    const hwnd = self.msg_hwnd orelse return;
+    const alloc = self.core_app.alloc;
+    const request = alloc.create(LinkRequest) catch return;
+    request.* = .{
+        .surface_id = switch (target) {
+            .app => 0,
+            .surface => |core_surface| core_surface.id,
+        },
+        .decision = decision,
+        .url = alloc.dupe(u8, url) catch {
+            alloc.destroy(request);
+            return;
+        },
+    };
+    if (w32.PostMessageW(hwnd, WM_APP_OPEN_LINK, 0, @bitCast(@intFromPtr(request))) == 0) {
+        request.destroy(alloc);
+    }
+}
+
+/// Handle `WM_APP_OPEN_LINK`: ask before opening the link, or tell in a
+/// notice why it is not opened, in the window of the terminal that showed
+/// it. Frees the request.
+fn onLinkRequest(self: *App, request: *LinkRequest) void {
+    const alloc = self.core_app.alloc;
+    defer request.destroy(alloc);
+    const window = self.windowOfSurface(request.surface_id) orelse self.targetWindow(.app);
+
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    switch (request.decision) {
+        .allow => return open_url.open(request.url),
+        .confirm => |reason| {
+            const scheme = gx.url_policy.scheme(request.url) orelse "";
+            i18n.format(&body.writer, i18n.trRuntime(reason.msgid()), .{ .scheme = scheme }) catch return;
+            body.writer.writeAll("\n\n") catch return;
+            gx.url_policy.writeDisplay(&body.writer, request.url) catch return;
+            const owner = if (window) |w| w.hwnd else null;
+            // A modal loop: nothing here uses the window after it.
+            if (Dialogs.confirm(owner, body.written(), i18n.tr(gx.url_policy.msg.confirm_title)) != .accept) return;
+            var name_buf: [host_name_size]u8 = undefined;
+            const path = gx.url_policy.filePath(alloc, request.url, .{ .host_name = hostName(&name_buf) }) catch null;
+            defer if (path) |p| alloc.free(p);
+            // A `file:` URL opens as the path it names.
+            open_url.open(path orelse request.url);
+        },
+        .deny => |reason| {
+            const w = window orelse return;
+            body.writer.writeAll(i18n.trRuntime(reason.msgid())) catch return;
+            body.writer.writeAll("\n") catch return;
+            gx.url_policy.writeDisplay(&body.writer, request.url) catch return;
+            w.showNotice(.{
+                .severity = .warning,
+                .title = i18n.tr(gx.url_policy.msg.denied_title),
+                .body = body.written(),
+            }, null);
+        },
+    }
+}
+
+/// Room for `hostName` (a DNS host name in UTF-8).
+const host_name_size = 3 * 64;
+
+/// The DNS host name of this computer, which `file:` URLs may name for a
+/// local file (`ls --hyperlink` does); "" when unknown.
+fn hostName(buf: *[host_name_size]u8) []const u8 {
+    var wide: [64]u16 = undefined;
+    var len: u32 = wide.len;
+    if (GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, &wide, &len) == 0) return "";
+    const n = std.unicode.utf16LeToUtf8(buf, wide[0..@min(len, wide.len)]) catch return "";
+    return buf[0..n];
+}
+
+const COMPUTER_NAME_DNS_HOSTNAME: c_int = 1;
+const SW_SHOWNA: i32 = 8;
+extern "kernel32" fn GetComputerNameExW(name_type: c_int, buffer: [*]u16, size: *u32) callconv(.winapi) i32;
+extern "user32" fn WindowFromPoint(point: w32.POINT) callconv(.winapi) ?w32.HWND;
 
 /// Create and track a top-level window without tabs. It is shown with its
 /// first tab (`Window.addTab*`).
@@ -1624,12 +2001,12 @@ pub const ProfileTarget = enum { tab, window };
 /// logging why, when there is no such profile or the terminal could not
 /// be created.
 pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTarget) bool {
-    var list = self.launchProfiles() catch |err| {
+    var list = self.cachedLaunchProfiles() catch |err| {
         log.err("launch profile detection failed err={}", .{err});
         return false;
     };
     defer list.deinit();
-    const profile = findProfile(&list, id) orelse {
+    const profile = list.resolve(id) orelse {
         log.warn("no launch profile with id={s}", .{id});
         return false;
     };
@@ -1669,13 +2046,6 @@ pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTa
     return true;
 }
 
-fn findProfile(list: *const gx.profiles.List, id: []const u8) ?*const gx.profiles.Profile {
-    if (list.find(id)) |profile| return profile;
-    var buf: [256]u8 = undefined;
-    const custom_id = std.fmt.bufPrint(&buf, "custom:{s}", .{id}) catch return null;
-    return list.find(custom_id);
-}
-
 /// The command new terminals run unless a launch profile or `-e` passes
 /// their own: the default launch profile's (`default_command`) when
 /// `command` is not configured, else `command`. The menus and the settings
@@ -1691,11 +2061,12 @@ pub fn defaultTerminalCommand(self: *const App) ?configpkg.Command {
 /// (`gx.profiles.defaultProfile`). `-e` still runs its command in the
 /// first terminal, and launch profiles pass their own command.
 fn updateDefaultCommand(self: *App) void {
+    self.default_command_stale = false;
     self.default_command = null;
     _ = self.default_command_arena.reset(.free_all);
-    if (commandConfigured(self.config._replay_steps.items)) return;
+    if (gx.profiles.commandConfigured(self.config._replay_steps.items)) return;
 
-    var list = self.launchProfiles() catch |err| {
+    var list = self.cachedLaunchProfiles() catch |err| {
         log.warn("cannot detect the default shell err={}", .{err});
         return;
     };
@@ -1721,28 +2092,6 @@ fn updateDefaultCommand(self: *App) void {
         return;
     };
     log.info("default shell profile={s}", .{profile.id});
-}
-
-/// Whether the recorded configuration inputs `steps`
-/// (`Config._replay_steps`) set `command`: the last `--command=` value
-/// before `-e` (whose arguments are the initial command) is not empty.
-/// The loaded value cannot tell, because `Config.finalize` falls back to
-/// `cmd.exe` on Windows.
-fn commandConfigured(steps: anytype) bool {
-    const prefix = "--command=";
-    var configured = false;
-    for (steps) |step| {
-        const arg: []const u8 = switch (step) {
-            .@"-e" => break,
-            .arg => |arg| arg,
-            .conditional_arg => |conditional| conditional.arg,
-            else => continue,
-        };
-        if (std.mem.startsWith(u8, arg, prefix)) {
-            configured = std.mem.trim(u8, arg[prefix.len..], " ").len > 0;
-        }
-    }
-    return configured;
 }
 
 /// Repair a `working-directory` path that lost its trailing backslash to
@@ -1795,7 +2144,7 @@ fn restoreTrailingBackslash(alloc: Allocator, path: []const u8) Allocator.Error!
 
 /// Open the configuration file: `.os_open` with the Windows file
 /// association; `.new_window` in a new window running $VISUAL or $EDITOR,
-/// else with the file association.
+/// else with the file association. Returns whether it is being opened.
 pub fn openConfigFile(self: *App, mode: apprt.action.OpenConfig) !bool {
     const config_path = configpkg.edit.openPath(
         self.core_app.alloc,
@@ -1806,26 +2155,36 @@ pub fn openConfigFile(self: *App, mode: apprt.action.OpenConfig) !bool {
     defer self.core_app.alloc.free(config_path);
 
     return switch (mode) {
-        .os_open => self.openConfigWithOs(config_path),
+        .os_open => openConfigWithOs(config_path),
         .new_window => (try self.openConfigInNewWindow(config_path)) or
-            self.openConfigWithOs(config_path),
+            openConfigWithOs(config_path),
     };
 }
 
 /// Replace the app config after a reload and refresh the app-wide GUI
-/// state that depends on it.
+/// state that depends on it. Every theme preview step and conditional
+/// reload comes here, so only what depends on a changed value is redone:
+/// the default shell, the global hotkeys and the shortcut probe, the
+/// background brush.
 fn updateConfig(self: *App, config: *const Config) void {
     const new_config = config.clone(self.core_app.alloc) catch |err| {
         log.err("error updating app config err={}", .{err});
         return;
     };
-    self.config.deinit();
+    var old = self.config;
+    defer old.deinit();
     self.config = new_config;
     repairWorkingDirectory(&self.config);
-    self.updateDefaultCommand();
 
-    // Switch the UI language when `language` changed and rebuild the
-    // translated chrome.
+    if (self.default_command_stale or
+        old.changed(&self.config, .command) or
+        old.changed(&self.config, .@"gx-launch-profile") or
+        gx.profiles.commandConfigured(old._replay_steps.items) !=
+            gx.profiles.commandConfigured(self.config._replay_steps.items))
+    {
+        self.updateDefaultCommand();
+    }
+
     const language = i18n.resolve(self.config.language);
     if (language != i18n.current()) {
         i18n.setCurrent(language);
@@ -1834,28 +2193,61 @@ fn updateConfig(self: *App, config: *const Config) void {
         if (self.quick_terminal) |qt| qt.window.onLanguageChanged();
     }
 
-    // Recreate the background brush from the new config.
-    if (self.bg_brush) |old_brush| {
-        _ = w32.DeleteObject(@ptrCast(old_brush));
+    if (old.changed(&self.config, .background)) {
+        if (self.bg_brush) |old_brush| _ = w32.DeleteObject(@ptrCast(old_brush));
+        const bg = self.config.background;
+        self.bg_brush = w32.CreateSolidBrush(w32.RGB(bg.r, bg.g, bg.b));
     }
-    const bg = self.config.background;
-    self.bg_brush = w32.CreateSolidBrush(w32.RGB(bg.r, bg.g, bg.b));
 
-    // Refresh DWM chrome (dark/light, caption color) on every live
-    // window so a config reload that changes the background color
-    // updates the title bar.
     for (self.windows.items) |w| w.onConfigChange();
 
-    // Re-register global hotkeys against the new keybinds.
-    for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
-    self.global_hotkeys.clearRetainingCapacity();
-    self.registerGlobalHotkey();
-    self.scheduleShortcutProbe();
+    if (old.changed(&self.config, .keybind)) {
+        self.unregisterGlobalHotkeys();
+        self.shortcut_conflicts.deinit(self.core_app.alloc);
+        self.registerGlobalHotkey();
+        self.scheduleShortcutProbe();
+    }
 
-    // Update quick terminal config.
     if (self.quick_terminal) |qt| {
         qt.onConfigChange(&self.config);
+        qt.window.onConfigChange();
     }
+    if (old.changed(&self.config, .@"progress-style")) self.onProgressTimer();
+
+    self.reportConfigDiagnostics(.post);
+}
+
+/// `reload_config`: read the configuration files again and apply them, then
+/// say in the window that asked how it went: the configuration errors, if
+/// there are any (`reportConfigDiagnostics`), else a short confirmation
+/// (`app-notifications = config-reload`). The shells are detected again, so
+/// one installed in the meantime shows up in the launch profiles and can be
+/// the default now. From a core callback: the feedback is posted.
+fn reloadConfigFromDisk(self: *App, target: apprt.Target) void {
+    const alloc = self.core_app.alloc;
+    self.profiles_cache.invalidate();
+    self.default_command_stale = true;
+    var new_config = Config.load(alloc) catch |err| {
+        log.err("failed to reload config: {}", .{err});
+        const window = self.targetWindow(target) orelse return;
+        var buf: [256]u8 = undefined;
+        var title: std.Io.Writer = .fixed(&buf);
+        i18n.format(&title, i18n.tr("Could not reload the configuration: {reason}"), .{
+            .reason = i18n.trRuntime(gx.settings_map.errorReason(err)),
+        }) catch {};
+        window.postNotice(.{ .severity = .@"error", .title = title.buffered() }, null);
+        return;
+    };
+    defer new_config.deinit();
+    self.applyConfig(&new_config) catch |err| {
+        log.err("config update error: {}", .{err});
+        return;
+    };
+    // The errors are in a notice already.
+    if (self.diagnostics_reported != 0) return;
+    if (!self.config.@"app-notifications".@"config-reload") return;
+    const window = self.targetWindow(target) orelse return;
+    window.postToast(.{ .text = i18n.tr("Reloaded the configuration"), .icon = d2d.icons.check_mark });
 }
 
 /// `toggle_background_opacity` with per-pixel translucency: every window
@@ -1907,24 +2299,12 @@ fn setBackgroundOpacity(self: *App, config: *Config, opacity: f64) void {
     };
 }
 
-/// Open the configuration with the Windows file association.
-fn openConfigWithOs(self: *App, path: [:0]const u8) bool {
-    const alloc = self.core_app.alloc;
-    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| {
-        log.warn("unable to encode config path: {}", .{err});
-        return false;
-    };
-    defer alloc.free(path_w);
-
-    const result = w32.ShellExecuteW(
-        null,
-        std.unicode.utf8ToUtf16LeStringLiteral("open"),
-        path_w,
-        null,
-        null,
-        w32.SW_SHOW,
-    );
-    return result > 32;
+/// Open the configuration with the Windows file association, or the "Open
+/// with" dialog or Notepad when `.ghostty` files have none, on a thread of
+/// its own (`open_url.openFile`): the shell may pump messages, and the core
+/// asks from its tick.
+fn openConfigWithOs(path: [:0]const u8) bool {
+    return open_url.openFile(path);
 }
 
 /// Open the configuration in a new Ghostty window using VISUAL or EDITOR.
@@ -2105,9 +2485,12 @@ fn taskbarList(self: *App) ?*w32.ITaskbarList3 {
 }
 
 /// Register a system-wide hotkey (RegisterHotKey) for every keybind with
-/// the `global` flag.
+/// the `global` flag, on the message-only window: the hotkeys work while a
+/// menu or a dialog runs its modal loop too. A chord another program holds
+/// goes into `shortcut_conflicts` right away, for the shortcut sheet.
 fn registerGlobalHotkey(self: *App) void {
     const alloc = self.core_app.alloc;
+    const hwnd = self.msg_hwnd orelse return;
     var next_id: i32 = 1;
     var it = self.config.keybind.set.bindings.iterator();
     while (it.next()) |entry| {
@@ -2124,18 +2507,55 @@ fn registerGlobalHotkey(self: *App) void {
         };
 
         const id = next_id;
-        if (w32.RegisterHotKey(null, id, chord.mods | w32.MOD_NOREPEAT, chord.vk) == 0) {
-            log.warn("failed to register global hotkey (may be in use) action={s}", .{@tagName(leaf.action)});
+        if (w32.RegisterHotKey(hwnd, id, chord.mods | w32.MOD_NOREPEAT, chord.vk) == 0) {
+            const err = GetLastError();
+            log.warn("failed to register global hotkey action={s} err={}", .{ @tagName(leaf.action), err });
+            if (err == ERROR_HOTKEY_ALREADY_REGISTERED) self.noteShortcutConflict(chord, .hotkey);
             continue;
         }
-        self.global_hotkeys.append(alloc, .{ .id = id, .chord = chord, .action = leaf.action }) catch {
-            _ = w32.UnregisterHotKey(null, id);
+        self.global_hotkeys.append(alloc, .{ .id = id, .chord = chord, .trigger = entry.key_ptr.* }) catch {
+            _ = w32.UnregisterHotKey(hwnd, id);
             continue;
         };
         next_id += 1;
         log.info("registered global hotkey id={} action={s}", .{ id, @tagName(leaf.action) });
     }
 }
+
+/// Unregister the hotkeys of `registerGlobalHotkey`.
+fn unregisterGlobalHotkeys(self: *App) void {
+    for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(self.msg_hwnd, hk.id);
+    self.global_hotkeys.clearRetainingCapacity();
+}
+
+/// WM_HOTKEY `id`: perform the binding of that global hotkey as the
+/// configuration has it now.
+fn onHotkey(self: *App, id: usize) void {
+    for (self.global_hotkeys.items) |hk| {
+        if (@as(usize, @intCast(hk.id)) != id) continue;
+        const entry = self.config.keybind.set.get(hk.trigger) orelse return;
+        const action = switch (entry.value_ptr.*) {
+            .leaf => |leaf| leaf.action,
+            .leader, .leaf_chained => return,
+        };
+        // apprt.App is this win32 App, so `self` is the rt_app.
+        self.core_app.performAllAction(self, action) catch |err| {
+            log.warn("global hotkey action failed err={}", .{err});
+        };
+        return;
+    }
+}
+
+/// Record that `chord` never reaches Ghostty GX, unless it is known.
+fn noteShortcutConflict(self: *App, chord: key_conflicts.Chord, reason: key_conflicts.Reason) void {
+    for (self.shortcut_conflicts.list.items) |conflict| {
+        if (conflict.chord.eql(chord)) return;
+    }
+    self.shortcut_conflicts.list.append(self.core_app.alloc, .{ .chord = chord, .reason = reason }) catch {};
+}
+
+const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
 /// Probe the keybindings for chords another program or the input method
 /// takes (`shortcut_conflicts`) a moment from now: after the first window
@@ -2206,6 +2626,402 @@ fn showShortcutNotice(self: *App) void {
     self.shortcut_notice_shown = true;
     log.info("shortcut conflict notice shown keys={s}", .{keys.buffered()});
 }
+
+// -----------------------------------------------------------------------
+// Feedback: notices and toasts at the bottom of a window
+// -----------------------------------------------------------------------
+
+/// Whether a notice shows now (from the message loop) or is posted (from a
+/// core callback, which must not show windows).
+const NoticeTiming = enum { now, post };
+
+/// The most configuration errors a notice lists.
+const max_listed_diagnostics = 3;
+
+/// Report the configuration errors in a notice that stays until it is
+/// closed, with buttons to open the configuration file and to reload it.
+/// Once for each set of errors (`gx.config_layers.diagnosticsDigest`), so
+/// the reloads and theme preview steps that keep them say nothing again;
+/// closes the notice once they are fixed. Waits for a window to exist.
+fn reportConfigDiagnostics(self: *App, timing: NoticeTiming) void {
+    const digest = gx.config_layers.diagnosticsDigest(&self.config);
+    if (digest == self.diagnostics_reported) return;
+    if (digest == 0) {
+        self.diagnostics_reported = 0;
+        for (self.windows.items) |window| {
+            if (showsNotice(window, diagnosticsClosed)) window.hideNotice();
+        }
+        return;
+    }
+    const window = self.targetWindow(.app) orelse return;
+    self.diagnostics_reported = digest;
+    const diagnostics = self.config._diagnostics.items();
+    var body_buf: [1024]u8 = undefined;
+    const actions = [_][]const u8{ i18n.tr("Open Configuration File"), i18n.tr("Reload Configuration") };
+    const content: Notice.Content = .{
+        .severity = .@"error",
+        .title = i18n.tr("Configuration Errors"),
+        .body = diagnosticsText(&body_buf, diagnostics, i18n.tr("…and {count} more.")),
+        .actions = &actions,
+        .duration_ms = null,
+    };
+    const callbacks: Notice.Callbacks = .{ .ctx = self, .action = diagnosticsAction, .closed = diagnosticsClosed };
+    switch (timing) {
+        .now => window.showNotice(content, callbacks),
+        .post => window.postNotice(content, callbacks),
+    }
+    log.info("configuration errors reported count={}", .{diagnostics.len});
+}
+
+/// The configuration errors `diagnostics` for a notice: the first
+/// `max_listed_diagnostics`, one per line, then `more` (a template with a
+/// `{count}` placeholder) for the rest. Cut to `buf`.
+fn diagnosticsText(buf: []u8, diagnostics: []const cli.Diagnostic, more: []const u8) []const u8 {
+    var writer: std.Io.Writer = .fixed(buf);
+    const listed = @min(diagnostics.len, max_listed_diagnostics);
+    for (diagnostics[0..listed], 0..) |*diagnostic, i| {
+        if (i > 0) writer.writeAll("\n") catch break;
+        diagnostic.format(&writer) catch break;
+    }
+    if (diagnostics.len > listed) {
+        writer.writeAll("\n") catch return writer.buffered();
+        i18n.format(&writer, more, .{ .count = diagnostics.len - listed }) catch {};
+    }
+    return writer.buffered();
+}
+
+/// A button of the configuration errors notice.
+fn diagnosticsAction(ctx: *anyopaque, notice: *Notice, index: usize) void {
+    _ = notice;
+    const self: *App = @ptrCast(@alignCast(ctx));
+    switch (index) {
+        0 => _ = self.openConfigFile(.os_open) catch false,
+        1 => self.core_app.performAction(self, .reload_config) catch |err| {
+            log.warn("cannot reload the configuration err={}", .{err});
+        },
+        else => {},
+    }
+}
+
+/// The configuration errors notice closed: closed with its close button,
+/// the errors are ignored until they change; closed for one of its buttons,
+/// they are reported again if they stay.
+fn diagnosticsClosed(ctx: *anyopaque, notice: *Notice, reason: Notice.CloseReason) void {
+    _ = notice;
+    const self: *App = @ptrCast(@alignCast(ctx));
+    if (reason == .action) self.diagnostics_reported = 0;
+}
+
+const NoticeClosedFn = *const fn (ctx: *anyopaque, notice: *Notice, reason: Notice.CloseReason) void;
+
+/// Whether the notice of `window` is (or is about to show) the one whose
+/// `Notice.Callbacks.closed` is `closed`.
+fn showsNotice(window: *const Window, closed: NoticeClosedFn) bool {
+    const callbacks = window.notice.callbacks orelse return false;
+    const f = callbacks.closed orelse return false;
+    return f == closed;
+}
+
+/// A terminal's command failed to start (an abnormal exit): say so in a
+/// notice at the bottom of its window, which blocks nothing, unlike a
+/// dialog. It stays until it is closed; any key closes the terminal. From a
+/// core callback. Returns whether it is shown, which keeps the core from
+/// printing its own message.
+fn showChildExited(window: *Window, exit_code: u32) bool {
+    if (window.hwnd == null) return false;
+    var buf: [512]u8 = undefined;
+    var body: std.Io.Writer = .fixed(&buf);
+    i18n.format(&body, i18n.tr("The shell process exited with code {code}."), .{ .code = exit_code }) catch {};
+    body.writeAll("\n") catch {};
+    body.writeAll(i18n.tr("Press any key to close the terminal.")) catch {};
+    window.postNotice(.{
+        .severity = .@"error",
+        .title = i18n.tr("Command Failed"),
+        .body = body.buffered(),
+        .duration_ms = null,
+    }, null);
+    return true;
+}
+
+/// `key_sequence`: show the leader keys typed so far in a toast until the
+/// sequence ends. From a core callback.
+fn showKeySequence(self: *App, window: *Window, value: apprt.action.KeySequence) void {
+    switch (value) {
+        .trigger => |key| {
+            var key_buf: [64]u8 = undefined;
+            const text = trigger.format(key, &key_buf);
+            var writer: std.Io.Writer = .fixed(self.key_sequence[self.key_sequence_len..]);
+            if (self.key_sequence_len > 0) writer.writeAll(" \u{2192} ") catch {};
+            writer.writeAll(text) catch {};
+            self.key_sequence_len += writer.buffered().len;
+            var toast_buf: [160]u8 = undefined;
+            const keys = self.key_sequence[0..self.key_sequence_len];
+            const toast_text = std.fmt.bufPrint(&toast_buf, "{s} \u{2026}", .{keys}) catch keys;
+            window.postToast(.{ .text = toast_text, .icon = d2d.icons.keyboard });
+        },
+        .end => {
+            const active = self.key_sequence_len > 0;
+            self.key_sequence_len = 0;
+            if (active) hideKeyHint(window);
+        },
+    }
+}
+
+fn hideKeyHint(window: *Window) void {
+    if (window.toast.icon == d2d.icons.keyboard) window.toast.hide();
+}
+
+/// `key_table`: name the key table that is active in a toast. From a core
+/// callback.
+fn showKeyTable(window: *Window, value: apprt.action.KeyTable) void {
+    switch (value) {
+        .activate => |name| {
+            var buf: [160]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            i18n.format(&writer, i18n.tr("Key table {name}"), .{ .name = name }) catch {};
+            window.postToast(.{ .text = writer.buffered(), .icon = d2d.icons.keyboard });
+        },
+        .deactivate, .deactivate_all => hideKeyHint(window),
+    }
+}
+
+/// `readonly`: a terminal went read-only (a notice says what that means)
+/// or writable again (a toast). From a core callback.
+fn showReadonly(window: *Window, value: apprt.action.Readonly) void {
+    switch (value) {
+        .on => window.postNotice(.{
+            .title = i18n.tr("Read-only"),
+            .body = i18n.tr("This terminal is in read-only mode. You can still view, select, and scroll through the content, but no input events will be sent to the running application."),
+            .duration_ms = null,
+        }, .{ .ctx = window, .closed = readonlyClosed }),
+        .off => {
+            if (showsNotice(window, readonlyClosed)) window.hideNotice();
+            window.postToast(.{ .text = i18n.tr("Read-only mode is off"), .icon = d2d.icons.check_mark });
+        },
+    }
+}
+
+/// Marks the read-only notice (`showsNotice`).
+fn readonlyClosed(ctx: *anyopaque, notice: *Notice, reason: Notice.CloseReason) void {
+    _ = ctx;
+    _ = notice;
+    _ = reason;
+}
+
+/// Confirm a write to the clipboard in a toast at the bottom of `window`,
+/// as `app-notifications = clipboard-copy` (the default) asks: "Copied to
+/// clipboard", or "Cleared clipboard" for an empty text. For the standard
+/// clipboard only. For the terminal's clipboard writes
+/// (`Surface.setClipboard`), from core callbacks too.
+pub fn notifyClipboardCopy(self: *App, window: *Window, clipboard: apprt.Clipboard, empty: bool) void {
+    if (clipboard != .standard) return;
+    if (!self.config.@"app-notifications".@"clipboard-copy") return;
+    window.postToast(.{
+        .text = if (empty) i18n.tr("Cleared clipboard") else i18n.tr("Copied to clipboard"),
+        .icon = d2d.icons.copy,
+    });
+}
+
+/// `copy_title_to_clipboard`: copy the effective title of `surface`, the
+/// tab title set by renaming the tab, else the title the terminal set.
+/// Returns false when there is none.
+fn copyTitle(self: *App, surface: *Surface) bool {
+    const alloc = self.core_app.alloc;
+    const window = surface.parent_window;
+    var override: ?[]u8 = null;
+    defer if (override) |text| alloc.free(text);
+    if (window.findTabIndex(surface)) |tab| {
+        if (window.tab_title_overrides[tab]) |*title| {
+            override = std.unicode.wtf16LeToWtf8Alloc(alloc, title.slice()) catch return false;
+        }
+    }
+    const title: []const u8 = if (override) |text| text else (surface.getTitle() orelse return false);
+    if (title.len == 0) return false;
+    const text = alloc.dupeZ(u8, title) catch return false;
+    defer alloc.free(text);
+    surface.setClipboard(.standard, &.{.{ .mime = "text/plain", .data = text }}, false) catch return false;
+    self.notifyClipboardCopy(window, .standard, false);
+    return true;
+}
+
+// -----------------------------------------------------------------------
+// Bell and taskbar progress
+// -----------------------------------------------------------------------
+
+/// The bell of `surface` (BEL, or a finished command with
+/// `notify-on-command-finish-action = bell`), as `bell-features` asks:
+/// `system` plays the Windows default sound, `audio` the
+/// `bell-audio-path` sound (WAV; `bell-audio-volume` does not apply),
+/// `attention` badges the tab and flashes the taskbar button of a window
+/// in the background, `title` marks the tab with a bell until it is
+/// selected. `border` is not implemented on Windows.
+fn ringBell(self: *App, surface: ?*Surface) void {
+    const features = self.config.@"bell-features";
+    if (features.system) _ = w32.MessageBeep(0xFFFFFFFF);
+    if (features.audio) self.playBellAudio();
+    const s = surface orelse return;
+    const window = s.parent_window;
+    if (features.attention) {
+        window.onBell(s);
+        flashTaskbarButton(window);
+    }
+    if (features.title) window.ringTab(s);
+}
+
+/// Flash the taskbar button of `window` until it comes to the front,
+/// unless it is the foreground window.
+fn flashTaskbarButton(window: *Window) void {
+    const hwnd = window.hwnd orelse return;
+    if (w32.GetForegroundWindow() == hwnd) return;
+    var info: w32.FLASHWINFO = .{
+        .cbSize = @sizeOf(w32.FLASHWINFO),
+        .hwnd = hwnd,
+        .dwFlags = w32.FLASHW_ALL | w32.FLASHW_TIMERNOFG,
+        .uCount = 2,
+        .dwTimeout = 0,
+    };
+    _ = w32.FlashWindowEx(&info);
+}
+
+/// Play `bell-audio-path` without waiting for it.
+fn playBellAudio(self: *App) void {
+    const path = self.config.@"bell-audio-path" orelse return;
+    const text = switch (path) {
+        inline else => |p| p,
+    };
+    const path_w = wstr.bufZ(&self.bell_audio_path, text);
+    if (PlaySoundW(path_w.ptr, null, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) == 0) {
+        log.warn("cannot play bell-audio-path (Windows plays WAV files only) path={s}", .{text});
+    }
+}
+
+/// What a taskbar button shows: a `TBPF_*` state and, for the states with a
+/// bar, its percent.
+const TaskbarValue = struct {
+    state: c_int,
+    percent: ?u8,
+};
+
+/// A taskbar button and what it shows.
+const TaskbarShown = struct {
+    hwnd: w32.HWND,
+    value: TaskbarValue,
+};
+
+/// The taskbar button state for `progress`. A bar without a value is empty
+/// while running and full when paused or failed, so that its color shows.
+fn taskbarValue(progress: tab_status.Progress) TaskbarValue {
+    return switch (progress.state) {
+        .none => .{ .state = w32.TBPF_NOPROGRESS, .percent = null },
+        .indeterminate => .{ .state = w32.TBPF_INDETERMINATE, .percent = null },
+        .normal => .{ .state = w32.TBPF_NORMAL, .percent = progress.percent orelse 0 },
+        .paused => .{ .state = w32.TBPF_PAUSED, .percent = progress.percent orelse 100 },
+        .@"error" => .{ .state = w32.TBPF_ERROR, .percent = progress.percent orelse 100 },
+    };
+}
+
+/// The progress that the terminals of all tabs of `window` report together
+/// (`tab_status.merge`: error, then paused, normal and indeterminate),
+/// leaving out the reports older than `tab_status.stale_after_ms`.
+fn windowProgress(window: *const Window, now_ms: u64) tab_status.Progress {
+    if (!window.app.config.@"progress-style") return .none;
+    var acc: tab_status.Progress = .none;
+    for (0..window.tab_count) |i| acc = tab_status.merge(acc, window.tabStatus(i).progress, now_ms);
+    return acc;
+}
+
+/// Show the progress of `window` (`windowProgress`) on its taskbar button
+/// and keep `PROGRESS_TIMER_ID` running while there is some.
+fn updateTaskbarProgress(self: *App, window: *Window) void {
+    const hwnd = window.hwnd orelse return;
+    const progress = windowProgress(window, GetTickCount64());
+    self.showTaskbarProgress(hwnd, taskbarValue(progress));
+    if (progress.state != .none) self.startProgressTimer();
+}
+
+/// Set `value` on the taskbar button of `hwnd` unless it shows it already.
+fn showTaskbarProgress(self: *App, hwnd: w32.HWND, value: TaskbarValue) void {
+    for (self.taskbar_shown.items) |*shown| {
+        if (shown.hwnd != hwnd) continue;
+        if (std.meta.eql(shown.value, value)) return;
+        if (self.setTaskbarValue(hwnd, value)) shown.value = value;
+        return;
+    }
+    if (value.state == w32.TBPF_NOPROGRESS) return;
+    if (!self.setTaskbarValue(hwnd, value)) return;
+    self.taskbar_shown.append(self.core_app.alloc, .{ .hwnd = hwnd, .value = value }) catch {};
+}
+
+fn setTaskbarValue(self: *App, hwnd: w32.HWND, value: TaskbarValue) bool {
+    const taskbar = self.taskbarList() orelse return false;
+    taskbar.SetProgressState(hwnd, value.state);
+    if (value.percent) |percent| taskbar.SetProgressValue(hwnd, percent, 100);
+    return true;
+}
+
+fn startProgressTimer(self: *App) void {
+    if (self.progress_timer) return;
+    const hwnd = self.msg_hwnd orelse return;
+    if (w32.SetTimer(hwnd, PROGRESS_TIMER_ID, progress_timer_ms, null) != 0) self.progress_timer = true;
+}
+
+/// `PROGRESS_TIMER_ID`: end on the taskbar buttons the progress of the
+/// terminals that stopped reporting or closed, and stop once no button
+/// shows progress.
+fn onProgressTimer(self: *App) void {
+    const now = GetTickCount64();
+    var active = false;
+    for (self.windows.items) |window| {
+        const hwnd = window.hwnd orelse continue;
+        const progress = windowProgress(window, now);
+        self.showTaskbarProgress(hwnd, taskbarValue(progress));
+        if (progress.state != .none) active = true;
+    }
+    // Buttons that show nothing, and the buttons of closed windows.
+    var i: usize = 0;
+    while (i < self.taskbar_shown.items.len) {
+        const shown = self.taskbar_shown.items[i];
+        if (shown.value.state == w32.TBPF_NOPROGRESS or self.windowOfHwnd(shown.hwnd) == null) {
+            _ = self.taskbar_shown.swapRemove(i);
+        } else i += 1;
+    }
+    if (active) return;
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, PROGRESS_TIMER_ID);
+    self.progress_timer = false;
+}
+
+fn windowOfHwnd(self: *App, hwnd: w32.HWND) ?*Window {
+    for (self.windows.items) |window| {
+        if (window.hwnd == hwnd) return window;
+    }
+    return null;
+}
+
+/// Whether `msg` is the message Explorer sends a window when its taskbar
+/// button exists (`TaskbarButtonCreated`): the window passes it to
+/// `onTaskbarButtonCreated`.
+pub fn isTaskbarButtonCreated(self: *const App, msg: u32) bool {
+    return self.taskbar_button_created != 0 and msg == self.taskbar_button_created;
+}
+
+/// Explorer made the taskbar button of `window`, again after it restarted:
+/// show the window's progress on it anew.
+pub fn onTaskbarButtonCreated(self: *App, window: *Window) void {
+    const hwnd = window.hwnd orelse return;
+    for (self.taskbar_shown.items, 0..) |shown, i| {
+        if (shown.hwnd != hwnd) continue;
+        _ = self.taskbar_shown.swapRemove(i);
+        break;
+    }
+    self.updateTaskbarProgress(window);
+}
+
+const SND_ASYNC: u32 = 0x0001;
+const SND_NODEFAULT: u32 = 0x0002;
+const SND_FILENAME: u32 = 0x00020000;
+extern "winmm" fn PlaySoundW(sound: ?[*:0]const u16, module: ?*anyopaque, flags: u32) callconv(.winapi) i32;
+extern "user32" fn RegisterWindowMessageW(name: [*:0]const u16) callconv(.winapi) u32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 // -----------------------------------------------------------------------
 // Notifications
@@ -2293,6 +3109,9 @@ pub fn stopQuitTimer(self: *App) void {
 /// actions). The core asks from its tick, so the confirmation runs from
 /// the message loop (`WM_APP_QUIT`, `confirmQuit`).
 fn requestQuit(self: *App) void {
+    // The core leaves the rest of its mailbox after a quit to the next
+    // tick, and wakeups coalesce: ask for that tick.
+    self.wakeup();
     if (self.msg_hwnd) |hwnd| {
         if (w32.PostMessageW(hwnd, WM_APP_QUIT, 0, 0) != 0) return;
     }
@@ -2301,18 +3120,24 @@ fn requestQuit(self: *App) void {
 
 /// Quit, after asking when a terminal still runs a program (core
 /// `needsConfirmQuit`, which with the GX idle-process check lets idle
-/// shells pass), listing those processes. The dialog runs a modal loop;
-/// nothing here uses a surface after it.
+/// shells pass), listing those processes. Every terminal reads one process
+/// table (`gx.confirm.Scope`). The dialog runs a modal loop; nothing here
+/// uses a surface after it.
 fn confirmQuit(self: *App) void {
     var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
     defer arena.deinit();
     var processes: std.ArrayList([]const u8) = .empty;
     var needs = false;
+    var scope: gx.confirm.Scope = undefined;
+    scope.begin(self.core_app.alloc, global.io());
+    defer scope.end();
     for (self.core_app.surfaces.items) |surface| {
         if (!surface.core_surface_ready or !surface.core_surface.needsConfirmQuit()) continue;
         needs = true;
         surface.appendBusyProcesses(arena.allocator(), &processes);
     }
+    // Before the dialog, whose modal loop may run other confirmations.
+    scope.end();
     if (needs) {
         const owner = if (self.targetWindow(.app)) |window| window.hwnd else null;
         if (Dialogs.confirmQuit(owner, processes.items) != .accept) return;
@@ -2348,31 +3173,30 @@ fn showDesktopNotification(
 fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) void {
     const hwnd = self.msg_hwnd orelse return;
 
-    var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
-    nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
+    var nid: w32.NOTIFYICONDATAW_V3 = std.mem.zeroes(w32.NOTIFYICONDATAW_V3);
+    nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW_V3);
     nid.hWnd = hwnd;
     nid.uID = NOTIF_DESKTOP_UID;
     nid.uFlags = w32.NIF_INFO | w32.NIF_ICON | w32.NIF_TIP | w32.NIF_MESSAGE;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = w32.LoadIconW(self.hinstance, w32.IDI_GHOSTTY) orelse w32.LoadIconW(null, w32.IDI_APPLICATION);
-    nid.dwInfoFlags = w32.NIIF_INFO;
+    // The app icon, large, rather than the generic information icon.
+    nid.hBalloonIcon = self.balloonIcon();
+    nid.dwInfoFlags = if (nid.hBalloonIcon != null) w32.NIIF_USER | w32.NIIF_LARGE_ICON else w32.NIIF_INFO;
     nid.uVersion_or_uTimeout = 5000; // 5 second timeout
 
     // Title and body (UTF-8 → UTF-16LE), cut to the fixed fields at a
     // codepoint boundary.
     _ = wstr.bufZ(&nid.szInfoTitle, title);
     _ = wstr.bufZ(&nid.szInfo, body);
-
-    // Tooltip
-    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-    @memcpy(nid.szTip[0..tip.len], tip);
-    nid.szTip[tip.len] = 0;
+    _ = wstr.bufZ(&nid.szTip, gx.branding.name);
 
     // Add the icon with the balloon, then remove the icon. While the icon
     // of an earlier notification still exists adding fails and modifying
     // it shows the new balloon; doing both would show it twice.
-    const shown = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0 or
-        w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid) != 0;
+    const data: *w32.NOTIFYICONDATAW = @ptrCast(&nid);
+    const shown = w32.Shell_NotifyIconW(w32.NIM_ADD, data) != 0 or
+        w32.Shell_NotifyIconW(w32.NIM_MODIFY, data) != 0;
     if (shown) {
         log.info("desktop notification shown surface_id={x}", .{self.notif_desktop_surface_id});
     } else {
@@ -2381,6 +3205,47 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
 
     // Schedule icon removal via a timer.
     _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
+}
+
+/// The app icon at the size of large icons, for desktop notifications.
+fn balloonIcon(self: *App) ?w32.HICON {
+    if (self.balloon_icon) |icon| return icon;
+    const handle = LoadImageW(
+        self.hinstance,
+        w32.IDI_GHOSTTY,
+        IMAGE_ICON,
+        w32.GetSystemMetrics(SM_CXICON),
+        w32.GetSystemMetrics(SM_CYICON),
+        LR_SHARED,
+    ) orelse return null;
+    const icon: w32.HICON = @ptrCast(handle);
+    self.balloon_icon = icon;
+    return icon;
+}
+
+const IMAGE_ICON: u32 = 1;
+const LR_SHARED: u32 = 0x00008000;
+const SM_CXICON: i32 = 11;
+const SM_CYICON: i32 = 12;
+extern "user32" fn LoadImageW(
+    instance: ?w32.HINSTANCE,
+    name: usize,
+    image_type: u32,
+    width: i32,
+    height: i32,
+    load: u32,
+) callconv(.winapi) ?*anyopaque;
+
+/// Remove the notification area icon a desktop notification added, if it
+/// is still there.
+fn removeNotificationIcon(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    _ = w32.KillTimer(hwnd, NOTIF_DESKTOP_TIMER_ID);
+    var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
+    nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
+    nid.hWnd = hwnd;
+    nid.uID = NOTIF_DESKTOP_UID;
+    _ = w32.Shell_NotifyIconW(w32.NIM_DELETE, &nid);
 }
 
 /// Notify the core app of a tick.
@@ -2730,6 +3595,8 @@ fn msgWndProc(
     const app: *App = @ptrFromInt(@as(usize, @bitCast(userdata)));
 
     if (msg == WM_APP_WAKEUP) {
+        // Cleared before the tick: what is pushed during it wakes again.
+        _ = app.wakeup_pending.swap(false, .acq_rel);
         app.tick();
         return 0;
     }
@@ -2739,8 +3606,23 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == w32.WM_HOTKEY) {
+        app.onHotkey(wparam);
+        return 0;
+    }
+
+    if (msg == WM_APP_DEFERRED_GX) {
+        app.onDeferredGx(wparam, lparam);
+        return 0;
+    }
+
     if (msg == WM_APP_EXPORT_TERMINAL_IO) {
         app.saveTerminalIo(@ptrFromInt(@as(usize, @bitCast(lparam))));
+        return 0;
+    }
+
+    if (msg == WM_APP_OPEN_LINK) {
+        app.onLinkRequest(@ptrFromInt(@as(usize, @bitCast(lparam))));
         return 0;
     }
 
@@ -2785,17 +3667,19 @@ fn msgWndProc(
     if (msg == w32.WM_TIMER and wparam == SHORTCUT_PROBE_TIMER_ID) {
         _ = w32.KillTimer(hwnd, SHORTCUT_PROBE_TIMER_ID);
         app.probeShortcuts();
+        // The configuration errors of the start, once the window is up.
+        app.reportConfigDiagnostics(.now);
         return 0;
     }
 
     // Notification icon cleanup timer.
     if (msg == w32.WM_TIMER and wparam == NOTIF_DESKTOP_TIMER_ID) {
-        _ = w32.KillTimer(hwnd, wparam);
-        var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
-        nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
-        nid.hWnd = hwnd;
-        nid.uID = NOTIF_DESKTOP_UID;
-        _ = w32.Shell_NotifyIconW(w32.NIM_DELETE, &nid);
+        app.removeNotificationIcon();
+        return 0;
+    }
+
+    if (msg == w32.WM_TIMER and wparam == PROGRESS_TIMER_ID) {
+        app.onProgressTimer();
         return 0;
     }
 
@@ -2890,35 +3774,87 @@ test "quitTimerStart ignores the call before the message loop runs" {
     try testing.expectEqual(none, quitTimerStart(true, false, 500));
 }
 
-test "commandConfigured reads the recorded configuration inputs" {
+test "ending key hints preserves action feedback" {
+    var app: App = undefined;
+    app.key_sequence_len = 4;
+    var window: Window = undefined;
+    window.toast = .{ .pending = true, .icon = d2d.icons.copy };
+    app.showKeySequence(&window, .end);
+    try std.testing.expect(window.toast.pending);
+    try std.testing.expectEqual(@as(usize, 0), app.key_sequence_len);
+    showKeyTable(&window, .deactivate_all);
+    try std.testing.expect(window.toast.pending);
+
+    window.toast.icon = d2d.icons.keyboard;
+    app.showKeySequence(&window, .end);
+    try std.testing.expect(window.toast.pending);
+    app.key_sequence_len = 4;
+    app.showKeySequence(&window, .end);
+    try std.testing.expect(!window.toast.pending);
+    window.toast.pending = true;
+    showKeyTable(&window, .deactivate);
+    try std.testing.expect(!window.toast.pending);
+}
+
+test "simulatedTheme decodes the test hook and rejects invalid values" {
     const testing = std.testing;
-    const cli = @import("../../cli.zig");
+    const follow = simulatedTheme(0).?;
+    try testing.expectEqual(@as(?apprt.ColorScheme, null), follow.scheme);
+    try testing.expectEqual(@as(?bool, null), follow.high_contrast);
+    const dark_hc = simulatedTheme(@bitCast(SimulatedSystemTheme{ .scheme = .dark, .high_contrast = .on })).?;
+    try testing.expectEqual(@as(?apprt.ColorScheme, .dark), dark_hc.scheme);
+    try testing.expectEqual(@as(?bool, true), dark_hc.high_contrast);
+    const light_off = simulatedTheme(@bitCast(SimulatedSystemTheme{ .scheme = .light, .high_contrast = .off })).?;
+    try testing.expectEqual(@as(?apprt.ColorScheme, .light), light_off.scheme);
+    try testing.expectEqual(@as(?bool, false), light_off.high_contrast);
+    // The unused values of each field and the reserved bits.
+    try testing.expect(simulatedTheme(0b0011) == null);
+    try testing.expect(simulatedTheme(0b1100) == null);
+    try testing.expect(simulatedTheme(0b1_0000) == null);
+}
 
-    var config: Config = try .default(testing.allocator);
-    defer config.deinit();
-    try testing.expect(!commandConfigured(config._replay_steps.items));
-
-    const Load = struct {
-        fn lines(cfg: *Config, text: []const u8) !void {
-            var reader: std.Io.Reader = .fixed(text);
-            var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
-            try cfg.loadIter(testing.allocator, &iter);
-        }
+test "diagnosticsText lists the first configuration errors and counts the rest" {
+    const testing = std.testing;
+    var diagnostics: [5]cli.Diagnostic = undefined;
+    for (&diagnostics, 0..) |*diagnostic, i| diagnostic.* = .{
+        .location = .{ .file = .{ .path = "C:\\cfg\\config.ghostty", .line = i + 1 } },
+        .key = "font-size",
+        .message = "invalid value",
     };
-    try Load.lines(&config, "font-size = 13\n");
-    try testing.expect(!commandConfigured(config._replay_steps.items));
-    try Load.lines(&config, "command = pwsh -NoLogo\n");
-    try testing.expect(commandConfigured(config._replay_steps.items));
-    // An empty value resets `command` to its default.
-    try Load.lines(&config, "command =\n");
-    try testing.expect(!commandConfigured(config._replay_steps.items));
-    try Load.lines(&config, "command = direct:cmd.exe\n");
-    try testing.expect(commandConfigured(config._replay_steps.items));
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings(
+        "C:\\cfg\\config.ghostty:1:font-size: invalid value",
+        diagnosticsText(&buf, diagnostics[0..1], "…and {count} more."),
+    );
+    try testing.expectEqualStrings(
+        "C:\\cfg\\config.ghostty:1:font-size: invalid value\n" ++
+            "C:\\cfg\\config.ghostty:2:font-size: invalid value\n" ++
+            "C:\\cfg\\config.ghostty:3:font-size: invalid value\n" ++
+            "…and 2 more.",
+        diagnosticsText(&buf, &diagnostics, "…and {count} more."),
+    );
+    // Cut to the buffer.
+    var small: [16]u8 = undefined;
+    const cut = diagnosticsText(&small, &diagnostics, "…and {count} more.");
+    try testing.expect(cut.len <= small.len);
+    try testing.expect(std.mem.startsWith(u8, "C:\\cfg\\config.ghostty:1:", cut));
+    try testing.expectEqualStrings("", diagnosticsText(&buf, &.{}, "…and {count} more."));
+}
 
-    // The arguments after `-e` are the initial command, not configuration.
-    const Step = std.meta.Elem(@TypeOf(config._replay_steps.items));
-    try testing.expect(!commandConfigured(&[_]Step{ .@"-e", .{ .arg = "--command=pwsh" } }));
-    try testing.expect(commandConfigured(&[_]Step{ .{ .arg = "--command=pwsh" }, .@"-e", .{ .arg = "--command=" } }));
+test "taskbarValue shows the merged progress on the taskbar button" {
+    const testing = std.testing;
+    const none = taskbarValue(.none);
+    try testing.expectEqual(w32.TBPF_NOPROGRESS, none.state);
+    try testing.expectEqual(@as(?u8, null), none.percent);
+    try testing.expectEqual(w32.TBPF_INDETERMINATE, taskbarValue(.{ .state = .indeterminate, .percent = 40 }).state);
+    try testing.expectEqual(@as(?u8, null), taskbarValue(.{ .state = .indeterminate, .percent = 40 }).percent);
+    try testing.expectEqual(TaskbarValue{ .state = w32.TBPF_NORMAL, .percent = 40 }, taskbarValue(.{ .state = .normal, .percent = 40 }));
+    // A bar without a value: empty while running, full and colored when
+    // paused or failed.
+    try testing.expectEqual(TaskbarValue{ .state = w32.TBPF_NORMAL, .percent = 0 }, taskbarValue(.{ .state = .normal }));
+    try testing.expectEqual(TaskbarValue{ .state = w32.TBPF_PAUSED, .percent = 100 }, taskbarValue(.{ .state = .paused }));
+    try testing.expectEqual(TaskbarValue{ .state = w32.TBPF_ERROR, .percent = 100 }, taskbarValue(.{ .state = .@"error" }));
+    try testing.expectEqual(TaskbarValue{ .state = w32.TBPF_ERROR, .percent = 7 }, taskbarValue(.{ .state = .@"error", .percent = 7 }));
 }
 
 test "restoreTrailingBackslash repairs quoted drive roots" {
