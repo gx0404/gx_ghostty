@@ -268,6 +268,7 @@ laying_out: bool = false,
 /// What the last `layoutSplits` laid out, so `relayout` can tell whether
 /// the panes still are where they belong.
 layout_key: ?LayoutKey = null,
+layout_passes: usize = 0,
 
 /// The terminal (core surface id) and grid of a size overlay.
 const OverlayGrid = struct { id: u64, columns: u16, rows: u16 };
@@ -1448,12 +1449,24 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
         if (choice != .accept or !isAlive(hwnd, self)) return;
     }
 
-    // Activate the tab that stays first, instead of each neighbor of the
-    // active tab that closes next.
-    if (keep_id != null and self.active_tab < self.tab_count) {
-        const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
-        if (std.mem.indexOfScalar(u64, ids[0..count], active_id) != null) {
-            if (self.findTabBySurfaceId(keep_id.?)) |idx| self.selectTabIndex(idx);
+    if (self.tab_count == 0) return;
+    const focused = self.hasFocus();
+    const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
+    const active_closed = std.mem.indexOfScalar(u64, ids[0..count], active_id) != null;
+    if (active_closed) {
+        const preferred = if (keep_id) |id| self.findTabBySurfaceId(id) else null;
+        if (preferred) |index| {
+            self.active_tab = index;
+        } else {
+            const start = tabs.closeNeighbor(self.active_tab, self.tab_count) orelse self.active_tab;
+            for (0..self.tab_count) |offset| {
+                const index = (start + offset) % self.tab_count;
+                const id = self.tab_active_surface[index].core_surface.id;
+                if (std.mem.indexOfScalar(u64, ids[0..count], id) == null) {
+                    self.active_tab = index;
+                    break;
+                }
+            }
         }
     }
     self.tab_bar.cancelRename();
@@ -1462,22 +1475,42 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     var trees: [MAX_TABS]Tree = undefined;
     var detached: usize = 0;
     for (ids[0..count]) |id| {
-        const idx = self.findTabBySurfaceId(id) orelse continue;
-        // The last tab closes the window.
-        if (self.tab_count == 1) {
-            freeTrees(trees[0..detached]);
-            return self.removeTab(idx);
-        }
-        if (idx == self.active_tab) {
-            if (tabs.closeNeighbor(idx, self.tab_count)) |neighbor| self.selectTabIndex(neighbor);
-        }
-        trees[detached] = self.detachTab(idx);
+        const index = self.findTabBySurfaceId(id) orelse continue;
+        trees[detached] = self.detachTab(index);
         detached += 1;
     }
     if (detached == 0) return;
-    self.updateTabBarVisibility();
-    // The tab bar stays visible with `window-show-tab-bar = always`, so
-    // nothing else repaints it without the removed tabs.
+    if (self.tab_count == 0) {
+        self.hide();
+        freeTrees(trees[0..detached]);
+        _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+        return;
+    }
+    for (trees[0..detached]) |*tree| {
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            entry.view.setVisible(false);
+            if (entry.view.hwnd) |child| _ = w32.ShowWindow(child, w32.SW_HIDE);
+        }
+    }
+    const visibility_changed = self.tab_bar.updateVisibility();
+    if (visibility_changed) self.applyFrameMargins();
+    if (active_closed) {
+        self.tab_unread[self.active_tab] = false;
+        self.tab_bell[self.active_tab] = false;
+        self.noteTabActivated(self.active_tab);
+        self.applyScale(self.active_tab);
+        self.layoutSplits();
+        self.repositionTabPopups(self.active_tab);
+        self.tab_bar.onTabShown(self.active_tab);
+        if (focused) self.focusActiveSurface();
+        self.updateWindowTitle();
+    } else if (visibility_changed) {
+        self.relayout();
+    } else if (self.layout_key) |*key| {
+        key.tab = self.active_tab;
+    }
+    self.repositionOverlays();
     self.invalidateTabBar();
     self.updateAppMode();
     freeTrees(trees[0..detached]);
@@ -1899,6 +1932,7 @@ pub fn ringTab(self: *Window, surface: *Surface) void {
 /// frame at the new size.
 pub fn layoutSplits(self: *Window) void {
     if (self.tab_count == 0) return;
+    self.layout_passes +|= 1;
     const tree = &self.tab_trees[self.active_tab];
     self.layout_key = self.layoutKey();
     var panes: PaneLayout = .{ .visible = self.terminalsSeen() };
@@ -2068,6 +2102,9 @@ fn eraseSurfaceArea(self: *Window, hdc: w32.HDC) void {
 /// Repaint the gaps between the split panes of the active tab and their
 /// divider lines, outside WM_PAINT.
 fn repaintSplitGaps(self: *Window) void {
+    if (self.tab_count == 0) return;
+    const tree = &self.tab_trees[self.active_tab];
+    if (!tree.isSplit() or tree.zoomed != null) return;
     const hwnd = self.hwnd orelse return;
     const dc = w32.GetDC(hwnd) orelse return;
     defer _ = w32.ReleaseDC(hwnd, dc);
@@ -2921,6 +2958,16 @@ pub fn setWindowTitleOverride(self: *Window, title: []const u16) void {
     self.updateWindowTitle();
 }
 
+pub fn toggleMaximize(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.title_bar.is_fullscreen) {
+        self.toggleFullscreen();
+        _ = w32.ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+    } else {
+        _ = w32.ShowWindow(hwnd, if (w32.IsZoomed(hwnd) != 0) w32.SW_RESTORE else SW_SHOWMAXIMIZED);
+    }
+}
+
 /// Toggle fullscreen mode on the top-level window.
 pub fn toggleFullscreen(self: *Window) void {
     self.title_bar.toggleFullscreen();
@@ -3295,6 +3342,12 @@ pub fn windowWndProc(
                 5 => @intFromBool(window.app_mode_soon),
                 6 => if (window.getActiveSurface()) |surface| @intFromBool(window.moveSplitToTab(surface) catch false) else 0,
                 7 => if (window.getActiveSurface()) |surface| @intFromBool(window.moveSplitToNewWindow(surface) catch false) else 0,
+                8 => @intCast(@min(window.layout_passes, std.math.maxInt(isize))),
+                9 => blk: {
+                    window.toggleMaximize();
+                    break :blk 1;
+                },
+                10 => @intCast(window.active_tab),
                 else => 0,
             };
         },
