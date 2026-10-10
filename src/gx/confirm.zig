@@ -34,13 +34,18 @@ const log = std.log.scoped(.gx_confirm);
 /// `needsConfirmQuit` and listing the busy processes of the terminals to
 /// close, and end it before showing the confirmation: a modal loop can
 /// run other confirmations, which need the processes of their own time.
+/// `end` may run again (a `defer` after an explicit `end`).
+///
 /// A scope that begins inside another one (closing a window while
-/// quitting) reads the table of the outermost scope.
+/// quitting) reads the table of the outermost scope. Its caller cannot end
+/// the outer scope before its own dialog, so a confirmation shown inside
+/// another scope lists the processes of the outer scope's table, which can
+/// be older than that dialog.
 ///
 /// ```
 /// var scope: gx.confirm.Scope = undefined;
 /// scope.begin(alloc, io);
-/// defer scope.end(); // or end it explicitly before the dialog
+/// defer scope.end(); // and end it explicitly before the dialog
 /// ```
 pub const Scope = struct {
     alloc: Allocator,
@@ -54,6 +59,9 @@ pub const Scope = struct {
     /// The scope that was active when this one began.
     previous: ?*Scope = null,
 
+    /// `end` ran.
+    ended: bool = false,
+
     threadlocal var current: ?*Scope = null;
 
     /// Makes `self` the active scope of this thread.
@@ -63,12 +71,16 @@ pub const Scope = struct {
     }
 
     /// Frees the table and restores the scope that was active before.
-    /// Scopes end in the reverse order they began.
+    /// Scopes end in the reverse order they began; ending a scope again
+    /// does nothing.
     pub fn end(self: *Scope) void {
+        if (self.ended) return;
         std.debug.assert(current == self);
         current = self.previous;
         if (self.table) |*table| table.deinit();
-        self.* = undefined;
+        self.table = null;
+        self.previous = null;
+        self.ended = true;
     }
 
     /// The active scope of this thread, if any.
@@ -317,4 +329,28 @@ test "a scope reads one process table for every question" {
 
     // Without a scope every question lists the processes again.
     try testing.expect(terminalNeedsConfirm(testing.allocator, testing.io, self_pid, &.{}));
+}
+
+test "ending a scope again does nothing" {
+    const testing = std.testing;
+    var outer: Scope = undefined;
+    outer.begin(testing.allocator, testing.io);
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        // A captured table is freed once.
+        _ = terminalNeedsConfirm(testing.allocator, testing.io, 1, &.{});
+        try testing.expect(outer.table != null or outer.failed);
+    }
+    {
+        var inner: Scope = undefined;
+        inner.begin(testing.allocator, testing.io);
+        defer inner.end();
+        inner.end();
+        try testing.expectEqual(@as(?*Scope, &outer), Scope.active());
+    }
+    // The deferred second end of the inner scope left the outer one active.
+    try testing.expectEqual(@as(?*Scope, &outer), Scope.active());
+    outer.end();
+    outer.end();
+    try testing.expectEqual(@as(?*Scope, null), Scope.active());
+    try testing.expect(outer.table == null);
 }
