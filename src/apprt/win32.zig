@@ -9,8 +9,12 @@ pub const file_log = @import("win32/file_log.zig");
 const internal_os = @import("../os/main.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
+// Every file below win32/ that declares tests is imported here, so its tests
+// run even when no other code analyzes it (scripts/test_gx_test_roots.py).
 test {
+    _ = @import("win32/App.zig");
     _ = @import("win32/Scrollbar.zig");
+    _ = @import("win32/Surface.zig");
     _ = @import("win32/chrome/Backdrop.zig");
     _ = @import("win32/chrome/TabBar.zig");
     _ = @import("win32/clipboard.zig");

@@ -35,7 +35,7 @@
 | `just version` | `version.py`：打印 fork 版本，即 `CHANGELOG.md` 中数值最大的 SemVer | Python | stdout 一行 `X.Y.Z` | 0；标题非法或读不到 CHANGELOG 时 1 |
 | `just version-check` | `version.py --check`：所有二级标题都是合法版本标题、版本不重复、至少一个 | Python | 只读 | 0 / 1 |
 | `just framework-test` | `run_unittests.py`：并行运行 `scripts/test_*.py` 全部框架单测。每个 `TestCase` 类是一个单元、各起一个 `python -m unittest` 子进程（定义了 `load_tests` 的模块整体算一个单元）；并发默认取逻辑核数与 8 的较小值，按耗时缓存从慢到快调度，类属性 `RUN_LAST = True` 的单元最后启动。配方不接参数；只跑一部分或改并发时直接调用 `python scripts/run_unittests.py [-j N] [--list] [--timeout 秒] [PATTERN…]`，PATTERN 取 `test_x`、`scripts/test_x.py`、`test_x.Class` 或通配符，单元时限默认 600 s；单个测试方法用 `python -m unittest scripts.test_x.Class.test_y` | Python | 测试只用临时目录，不改仓库；写耗时缓存 `.local/test-timings/unittest.json`；本机约 500 个测试、约 13 s | 0 全部通过（跳过不算失败）；1 有失败、错误、崩溃或超时；2 用法或发现错误（模块导入失败、PATTERN 未命中）；130 被中断：Ctrl+C，POSIX 上 SIGTERM、SIGHUP 也按 Ctrl+C 处理，清理子进程后退出 |
-| `just framework-check` | 聚合门：rules-check → version-check → framework-test → kb-check → i18n-check，不需要 Zig | Python、Git、已生成的 KB | 只读；本机约 15 s | 首个失败子项的退出码 |
+| `just framework-check` | 聚合门：rules-check → version-check → framework-test → kb-check → i18n-check → pinyin-check，不需要 Zig | Python、Git、已生成的 KB | 只读；本机约 15 s | 首个失败子项的退出码 |
 | `just ci-check` | 聚合门：framework-check → fmt-check → test-vt，本机复现 CI 主干（不含完整单测 `just test`） | 以上，加钉版 Zig；Windows 需 MSVC | 构建缓存、`zig-out/` 与 `.local/test-timings/`；热缓存约 100 s，改过 Zig 源码另加约 2 min 编译（见 TESTING.md「并行运行器与耗时」） | 首个失败子项的退出码 |
 | `just commit-check <参数…>` | `conventional_commits.py`：校验提交标题，用 `--message-file <文件>` 或 `--range <A>..<B>`（`git log --first-parent`；A 为全零 SHA 时只查 B）；`fixup!`、`squash!`、`amend!` 提交一律不合规。脚本也接受直接给出的标题，但标题必含空格，经 just 传入会被拆成几段而误报，`>`、`&` 等字符还会被配方 shell 解释（见「约定」），单条标题改用 `python scripts/conventional_commits.py "<标题>"` | Python；`--range` 需要 Git 历史 | 只读；不合规时列出标题与原因 | 0 全部合规；1 有违规；2 用法错误或读不到输入 |
 
@@ -51,7 +51,9 @@
 | `just graph-query <问题…>` | `graphify.py query`：在本机图谱上查询，多个词合并为一句；路径与解释查询没有配方，直接用 `python scripts/graphify.py path …` 或 `python scripts/graphify.py explain …` | 本机已有 `graph.json`（先 `just graph`） | stdout | 透传 graphify；缺 `graph.json` 时 1 |
 | `just i18n` | `gx_i18n.py`：由上游 `po/zh_CN.po` 与 fork 的 `src/gx/i18n/gx.zh_CN.po`（同一 msgid 以 fork 为准）重新生成 GX 界面的 zh-CN 翻译表；跳过 fuzzy、废弃与空译文，带 msgctxt 的条目以 `<msgctxt>\x04<msgid>` 为键，fork 条目的 `{name}` 占位符必须与原文一致 | Python | 写 `src/gx/i18n/zh_CN.zig`（按键的 UTF-8 字节序排序、LF、无时间戳，入库，审 diff）；内容不变时不写 | 0；源文件缺失、语法错误、键重复或占位符不一致 2 |
 | `just i18n-check` | `gx_i18n.py --check`：内存重新生成后与已提交的翻译表比较（CRLF 检出视同 LF） | Python | 只读 | 0 新鲜；缺失或过期 1；源文件问题 2 |
-| `just generated-check` | 聚合门：kb-check → i18n-check → graph-check | 同上三项 | 只读 | 首个失败子项的退出码 |
+| `just pinyin` | `gx_pinyin.py --download`：联网取拼音源数据，重新生成 GX 的拼音首字母表 | Python；网络 | 写 `src/gx/pinyin/initials.zig`（生成物，入库，审 diff） | 见 `scripts/gx_pinyin.py` 的模块文档 |
+| `just pinyin-check` | `gx_pinyin.py --check`：离线校验拼音首字母表与生成器一致，不联网 | Python | 只读 | 0 新鲜；非 0 过期或出错，细节见脚本文档 |
+| `just generated-check` | 聚合门：kb-check → i18n-check → pinyin-check → graph-check | 同上各项 | 只读 | 首个失败子项的退出码 |
 
 ### 产品构建与测试
 
@@ -75,6 +77,13 @@
 - `--no-build` 跑的是 `zig-out/test/` 里上次安装的二进制；用过 `-Dtest-filter` 之后，那里可能只剩裁剪后的用例，裁空时报「测试二进制本身没有用例」。这类运行只把实测并入耗时缓存，不删记录（见 TESTING.md「并行运行器与耗时」）。
 - 上游串行路径原样保留，用于与运行器的结论对照：`just zig build test-lib-vt`（每个二进制在单个进程里逐条运行，本机全量 6–8 min）与 `just zig build test`（Windows 上要自己写 `-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`；macOS 上不带 `-Dtest-filter` 时还多跑 app 的 `xcodebuild test`）；`-Dtest-filter` 在这两条路径上同样可用。
 
+### Windows GUI 与耗时
+
+| 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
+|---|---|---|---|---|
+| `just win-gui <子命令> <参数…>` | `scripts/gx_win_gui.py`：隔离启动 win32 app，守门后用 SendInput 输入、截图、取像素、等日志行。场景子命令：`list [<场景>…]`；`run [--out <目录>] [--exe <ghostty.exe>] [--allow-side-effects] [--retries <n>] [--keep-open] [<场景>…]`，场景是 `test/gui/win32/W*.toml` 的编号或 `.toml` 路径，省略时跑全部（格式见 `test/gui/README.md`）。单步子命令驱动一个实例，状态在 `<ENV_DIR>/session.json`：`start <ENV_DIR> [--exe] [--config <文件>] [--env 名=值]… [--timeout <秒>] [-- <ghostty 参数…>]`、`stop`、`windows`、`activate`、`capture <ENV_DIR> <输出.png> [--popups] [--quick] [--method screen\|print]`、`pixel <ENV_DIR> X Y [--in <锚点>]`、`type`、`key <ENV_DIR> <组合键> [--repeat n]`、`click`、`wheel`、`drag`、`wait-log <ENV_DIR> <正则> [--timeout <秒>]`、`dpi <ENV_DIR> <DPI>`、`ime-off`、`cancel-mode`。坐标是 DIP，`--in` 取 `client`（默认）、`window` 或 `terminal:N` | Windows 交互式桌面；先 `just build`（`--exe` 默认 `zig-out/bin/ghostty.exe`）；读场景要 Python ≥ 3.11（`tomllib`），或装了 `tomli` 的 3.10 | `run` 写 `--out`（默认 `.local/evidence/win-gui/<时间>/`）下每个场景的 `<id>/`：截图、`run.json`、日志副本、`notes.txt` 与隔离配置 `env/`，以及 `SUMMARY.txt`；只关闭自己启动的实例；前台或指针下的窗口不属于该实例时不发送输入 | 0 全部 OK 或 SKIPPED；1 有步骤、断言或场景失败；2 用法错误、找不到 exe 或不是 Windows |
+| `just perf <子命令> <参数…>` | `scripts/gx_perf.py`：`summarize <路径…> [--json <文件>]` 汇总样本的 n、中位数、p90、最小与最大；`compare --old <路径…> --new <路径…> [--json]` 并列两组并给出中位数之差；`win32 --exe <A> [--exe <B>] [--label <名>]… --out <目录> [--runs 10] [--resizes 6] [--config <文件>] [--env 名=值]… [--json]` 交替测量一到两个 Windows 构建（先丢弃一轮预热）；`gtk --clone <克隆> [--clone <克隆>] [--label]… --out <目录> [--runs 10] [--env 名=值]… [--distro]` 每轮调一次 `just wsl smoke --perf`。样本来源与指标见 TESTING.md「耗时度量与基线」 | `summarize`、`compare` 只要 Python；`win32` 要 Windows 交互式桌面与 ReleaseFast 构建；`gtk` 要 WSL 克隆里有 GTK 构建 | `win32`、`gtk` 写 `--out/<标签>/`（每轮的 `run-NN.txt` 与日志副本，或 `run-NN/` 证据目录）与 `--out/SUMMARY.txt` | 0；有测量轮失败 1；用法错误或没有样本 2 |
+
 ### 打包
 
 | 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
@@ -94,7 +103,8 @@
 | `sync [<ref> \| <worktree 目录>] [--dirty]` | 把本仓的一个提交取进克隆并 detached 检出：目录参数按 worktree 处理（取其 HEAD），其余按本仓 ref 解析，省略时取脚本所在的 worktree。`--dirty` 用临时 index 把该 worktree 的未提交与未跟踪（未被忽略）文件快照成一个提交对象再同步，不动它的 index、ref 与文件，快照对象留在对象库里直到 gc。克隆有本地改动、或检出会孤立克隆里的本地提交时拒绝；同步结果记在克隆的 `refs/gx-wsl/synced` |
 | `build [--gtk] <zig build 参数…>` | 克隆内 `python3 scripts/zigw.py build …`；`--gtk` 追加 `-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell`：Ubuntu 24.04 没有 gtk4-layer-shell 开发包，改由 `pkg/gtk4-layer-shell` 构建动态库并装到 `zig-out/lib/` |
 | `test [--suite main\|vt] [--gtk] [--filter <子串>]… <zig_test 参数…>` | 克隆内 `python3 scripts/zig_test.py`；`main`（默认）与 gx-ci `linux-main` 一样加 `-Dapp-runtime=none`，`--gtk` 改为 GTK 运行时（含 `src/apprt/gtk/gx/` 的单测） |
-| `smoke --out <Windows 目录> [--lang zh_CN\|en] [--xdotool <文件>] [--config <文件>] [--wait <秒>] [--name <前缀>] [-- <ghostty 参数…>]` | 与 gx-ci `gtk-smoke` 相同的 `xvfb-run`（`1280x800x24`）、`GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1` 与 `--gtk-single-instance=false`，等 `--wait` 秒（默认 20）后 scrot 截图；给了 xdotool 脚本就执行它（`$1` 是 Ghostty 的 PID）再截一张。`<前缀>.png`、`<前缀>-after.png`、`<前缀>.log`、`<前缀>-version.txt`、`<前缀>-meta.txt` 复制到 `--out`，前缀默认 `ghostty-xvfb[-<lang>]`；Ghostty 提前退出或截图为空时退出 1 |
+| `smoke --out <Windows 目录> [--lang zh_CN\|en] [--xdotool <文件>] [--config <文件>] [--wait <秒>] [--settle <秒>] [--name <前缀>] [--env <名>=<值>]… [--perf] [-- <ghostty 参数…>]` | 与 gx-ci `gtk-smoke` 相同的 `xvfb-run`（`1280x800x24`）、`GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1` 与 `--gtk-single-instance=false`，另加 `--env` 的变量；每 50 ms 用 `xdotool search --onlyvisible --pid` 查一次窗口，最多等 `--wait` 秒（默认 20，Ghostty 提前退出就立即停），窗口出现 `--settle` 秒（默认 3）后 scrot 截图；给了 xdotool 脚本就执行它（`$1` 是 Ghostty 的 PID）再截一张。`--perf` 设 `GHOSTTY_GX_PERF=1`，让终端（`-e sh workload.sh`）在第一张截图后输出 `seq 1 3000000`，前后各取一次 `/proc/<pid>/task/*/stat`，写 `<前缀>-perf.txt`（`metric 名 值 [单位]` 行：窗口出现与负载墙钟、各线程组 CPU 时间、缺页、DMABUF 警告数）与 `<前缀>-perf.png`。`<前缀>.png`、`<前缀>-after.png`、`<前缀>.log`、`<前缀>-version.txt`、`<前缀>-meta.txt` 复制到 `--out`，前缀默认 `ghostty-xvfb[-<lang>]`；Ghostty 提前退出、截图为空或负载没跑完时退出 1 |
+| `scenario --out <Windows 目录> [<场景>…]` | 逐个运行 `test/gui/gtk/G*.toml`（编号如 `G01` 或 `.toml` 路径，省略时全部；格式见 `test/gui/README.md`）：场景的配置与 xdotool 脚本写到 `<目录>/<id>/`，再在那里跑一次名为 `<id>` 的 `smoke`；日志有一行匹配场景的 `forbid` 正则（默认 `Theme parser error`、`css parsing failed`）就判失败。每个场景写 `notes.txt`（读图要点与状态），`<目录>/SUMMARY.txt` 每个场景一行；任一场景失败时退出 1 |
 | `run [--lang zh_CN\|en] [--config <文件>] [--x11] [-- <ghostty 参数…>]` | 在 WSLg 桌面后台启动 `zig-out/bin/ghostty`（默认 Wayland，`--x11` 走 XWayland），打印 PID 与停止命令；每次的私有配置与日志在 `~/.cache/gx-wsl/run/<时间>-<pid>/`，只保留最近 10 次。本机截不到 WSLg 窗口的内容，截图证据用 `smoke` |
 | `shell` | 打印进入克隆、手工构建与运行的命令 |
 
@@ -103,6 +113,7 @@
 - 配置隔离：`smoke`、`run` 给 Ghostty 一个私有的 `XDG_CONFIG_HOME`，其中 `ghostty/config.ghostty` 是 `--config` 文件（CRLF 转为 LF）或空文件，并用 `env = XDG_CONFIG_HOME=…` 把原值交还给终端里的 shell；不读写 WSL 用户自己的 Ghostty 配置，也不在 `~/.config/ghostty` 生成模板。
 - WSL 内的环境：去掉 PATH 中的 `/mnt/*` 项、把 `~/.local/bin` 放在最前，并 unset `ZIG` 与 `GX_GHOSTTY_ZIG`，一律使用克隆内的钉版 Zig。
 - 一个克隆同一时间只给一个任务用；其他任务用 `--clone '~/src/gx_ghostty-<id>'`（或 `GX_WSL_CLONE`）各自建克隆，`setup` 会负责克隆。
+- 透传给 WSL 内脚本的路径参数（如 `test` 的 `--json`）在 WSL 里解释：Git Bash 会把以 `/` 开头的参数改写成 Windows 路径（`/tmp/x.json` 变成 `C:/Users/.../x.json`，在克隆里生成一个 `C:` 目录，下次 `sync` 因克隆有改动而拒绝）。写成相对克隆根的路径（如 `--json .local/gtk-tests.json`），或设 `MSYS_NO_PATHCONV=1`。
 
 ## 环境变量
 

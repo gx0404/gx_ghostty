@@ -1,0 +1,81 @@
+id = "W16"
+title = "Chrome tour: main menu, shortcuts cheat sheet and settings overlay"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "main-menu: opened from the keyboard, the main menu sits below the chrome at the window's left edge with its first item highlighted, its items and the shortcut column",
+  "keybinds: the keyboard shortcuts cheat sheet lists categories and key caps",
+  "settings: the settings overlay shows its six sections (Language, Appearance, Font, Interaction, Shell, About)",
+]
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+m"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "main-menu"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+slash"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "keybinds"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "ctrl+comma"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings"
+what = "all"

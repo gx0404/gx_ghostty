@@ -41,6 +41,14 @@ ZIG_TEST_COMMANDS = {
     "windows": 'python scripts/zig_test.py --suite vt --zig-arg=--summary --zig-arg=all '
                '--json "$env:RUNNER_TEMP/gx-zig-test/windows.json"',
 }
+# Jobs that also run the main suite filtered to the fork code only their platform compiles.
+FILTERED_TEST_COMMANDS = {
+    "windows-app": 'python scripts/zig_test.py --suite main -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu '
+                   '--filter apprt.win32 --filter gx. --filter font.directwrite --zig-arg=--summary --zig-arg=all '
+                   '--json "$env:RUNNER_TEMP/gx-zig-test/windows-app.json"',
+    "gtk-smoke": 'python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx '
+                 '--zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-gtk-smoke/zig-test.json"',
+}
 # The only mlugg/setup-zig inputs in gx-ci; no job sets version, so every job installs minimum_zig_version.
 SETUP_ZIG_INPUTS = {
     "linux-vt": {"cache-size-limit": "4096", "use-tool-cache": "true", "cache-key": "stable-toolchain-v1"},
@@ -477,7 +485,46 @@ class CiWorkflowTests(unittest.TestCase):
                 })
                 self.assertEqual(sum((field(step, "uses", 8) or "").startswith("actions/upload-artifact@")
                                      for step in steps(job)), 1)
-        self.assertEqual(sum("scripts/zig_test.py" in script for script in CI.scripts()), len(ZIG_TEST_COMMANDS))
+        self.assertEqual(sum("scripts/zig_test.py" in script for script in CI.scripts()),
+                         len(ZIG_TEST_COMMANDS) + len(FILTERED_TEST_COMMANDS))
+
+    def test_platform_jobs_run_the_fork_tests_only_they_compile(self):
+        for name, command in FILTERED_TEST_COMMANDS.items():
+            with self.subTest(job=name):
+                job_steps = steps(CI.job(name))
+                candidates = [step for step in job_steps if any(command in script for script in run_scripts(step))]
+                self.assertEqual(len(candidates), 1)
+                step = candidates[0]
+                keys = [match[1] for line in step if (match := re.match(r"^        ([\w-]+):", line))]
+                self.assertEqual(keys, ["name", "run"], f"{name} test step must not override if, env or shell")
+                expected = command + ("\n          " + PWSH_CHECK if name == "windows-app" else "")
+                self.assertEqual([script.strip() for script in run_scripts(step)], [expected])
+                self.assertEqual(sum("scripts/zig_test.py" in script for script in CI.scripts(name)), 1)
+                for forbidden in ("--no-build", "--dedupe", "-Dtest-filter", "--serial-filter"):
+                    self.assertNotIn(forbidden, command)
+                position = job_steps.index(step)
+                uploads = [index for index, candidate in enumerate(job_steps)
+                           if (field(candidate, "uses", 8) or "").startswith("actions/upload-artifact@")]
+                report = next(index for index in uploads if index > position)
+                self.assertEqual(field(job_steps[report], "if", 8), "always()")
+        text = CI.job_text("windows-app")
+        order = [text.index(needle) for needle in (WIN32_BUILD + "\n", FILTERED_TEST_COMMANDS["windows-app"],
+                                                   "name: gx-zig-test-windows-app", "CopyFromScreen")]
+        self.assertEqual(order, sorted(order))
+        report = next(step for step in steps(CI.job("windows-app"))
+                      if mapping(step, "with", 8).get("name") == "gx-zig-test-windows-app")
+        self.assertEqual(mapping(report, "with", 8), {
+            "name": "gx-zig-test-windows-app",
+            "path": "${{ runner.temp }}/gx-zig-test/",
+            "if-no-files-found": "ignore",
+            "retention-days": "14",
+        })
+        smoke = CI.job_text("gtk-smoke")
+        order = [smoke.index(needle) for needle in ("zig build -Doptimize=ReleaseFast -Dcpu=baseline",
+                                                    'scrot "$evidence/ghostty-xvfb.png"',
+                                                    FILTERED_TEST_COMMANDS["gtk-smoke"], "name: gx-gtk-smoke-evidence")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("python3", apt_packages(CI.scripts("gtk-smoke")[0]))
 
     def test_cache_diagnostics_wrap_full_tests_and_probe_is_manual_build_only(self):
         for name, command in ZIG_TEST_COMMANDS.items():
@@ -544,7 +591,7 @@ class CiWorkflowTests(unittest.TestCase):
         order = [text.index(needle) for needle in (
             "git config --global core.autocrlf false", "uses: actions/checkout@", "uses: mlugg/setup-zig@",
             WIN32_BUILD + "\n", "Invoke-WebRequest", "-RedirectStandardError", "CopyFromScreen",
-            "'loaded OpenGL 4.'", "uses: actions/upload-artifact@")]
+            "'loaded OpenGL 4.'", "name: evidence-windows-smoke")]
         self.assertEqual(order, sorted(order))
         job_steps = steps(job)
         smoke = next(step for step in job_steps if "CopyFromScreen" in "\n".join(step))
@@ -579,7 +626,7 @@ class CiWorkflowTests(unittest.TestCase):
                         self.assertEqual(artifact.startswith("gx-"), name in ASSET_JOBS)
         uploads = [mapping(step, "with", 8)["name"] for step in steps(CI.job("windows-app"))
                    if (field(step, "uses", 8) or "").startswith("actions/upload-artifact@")]
-        self.assertEqual(uploads, ["evidence-windows-smoke"])
+        self.assertEqual(uploads, ["gx-zig-test-windows-app", "evidence-windows-smoke"])
 
     def test_gtk_smoke_is_manual_and_mirrors_the_debian_dockerfile(self):
         job = CI.job("gtk-smoke")

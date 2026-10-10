@@ -1,0 +1,121 @@
+id = "W08"
+title = "Five clipboard pastes in a row land in the search box, and Ctrl+Shift+V pastes into the shell"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "search-pasted: the search box reads a1b2c3d4e5 (every paste landed, in order)",
+  "shell-pasted: the shell ran `echo pasted-into-shell` and printed pasted-into-shell",
+]
+
+[[step]]
+action = "ime_off"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+# SendInput only queues the keys: wait for each paste before the clipboard changes again.
+[[step]]
+action = "clipboard"
+text = "a1"
+
+[[step]]
+action = "key"
+keys = "ctrl+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "clipboard"
+text = "b2"
+
+[[step]]
+action = "key"
+keys = "ctrl+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "clipboard"
+text = "c3"
+
+[[step]]
+action = "key"
+keys = "ctrl+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "clipboard"
+text = "d4"
+
+[[step]]
+action = "key"
+keys = "ctrl+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "clipboard"
+text = "e5"
+
+[[step]]
+action = "key"
+keys = "ctrl+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "search-pasted"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "clipboard"
+text = "echo pasted-into-shell"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "shell-pasted"

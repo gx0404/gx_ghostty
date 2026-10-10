@@ -1,0 +1,19 @@
+id = "G06"
+title = "A light theme: GX colors follow it and the command palette opens over it"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+theme = Catppuccin Latte
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.5
+key ctrl+shift+p
+sleep 2
+"""
+expect = [
+  "G06.png: the header bar and terminal use the light Catppuccin Latte colors",
+  "G06-after.png: the command palette is open over the light window and readable",
+]

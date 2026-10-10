@@ -1,0 +1,17 @@
+id = "G03"
+title = "The Ghostty GX settings dialog opens with Ctrl+,"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.5
+key ctrl+comma
+sleep 2.5
+"""
+expect = [
+  "G03-after.png: the settings dialog shows its pages (Language, Appearance, Font, Interaction, Shell, About) and the first page's rows",
+]

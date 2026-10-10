@@ -1,0 +1,20 @@
+id = "G05"
+title = "Two tabs and a split: the GX tab bar and the 1 px split divider"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.5
+key ctrl+shift+t
+sleep 1.5
+key ctrl+shift+o
+sleep 1.5
+"""
+expect = [
+  "G05.png: a single tab, so the tab bar stays hidden",
+  "G05-after.png: two tabs, the second selected (outlined, with its close button) and split left/right by a thin divider in the terminal colors",
+]

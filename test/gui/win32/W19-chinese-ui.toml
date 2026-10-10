@@ -1,0 +1,36 @@
+id = "W19"
+title = "Chinese UI: the window and the main menu in zh-CN"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = zh-CN
+"""
+expect = [
+  "window: the window chrome after a zh-CN start",
+  "main-menu: every main menu item is Chinese and the Han characters render without boxes",
+]
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "window"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+m"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "main-menu"
+what = "all"

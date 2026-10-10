@@ -1,0 +1,66 @@
+id = "W17"
+title = "Simulated DPI 96 -> 144 -> 192: the chrome and terminal rescale"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+# The simulated DPI change scales the window around its center like Windows suggests, so a
+# large window grows past the screen at 192 dpi: start from a small window and capture with
+# PrintWindow, which also renders the parts outside the screen.
+expect = [
+  "dpi-96: title bar, tab and terminal text at 100% scale",
+  "dpi-144: everything at 150%: tab bar height, caption buttons and terminal font grow together",
+  "dpi-192: everything at 200%, nothing clipped or misaligned",
+]
+
+[[step]]
+action = "resize"
+width = 1280
+height = 720
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "type"
+text = "echo scale check\n"
+
+[[step]]
+action = "dpi"
+value = 96
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "dpi-96"
+method = "print"
+
+[[step]]
+action = "dpi"
+value = 144
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "dpi-144"
+method = "print"
+
+[[step]]
+action = "dpi"
+value = 192
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "dpi-192"
+method = "print"

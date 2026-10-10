@@ -1,0 +1,73 @@
+id = "W04"
+title = "Nested split divider follows the pointer; closing a pane focuses its sibling"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+"""
+expect = [
+  "nested: three panes A | (B / C), the bottom-right pane C is focused",
+  "dragged: the divider between B and C sits under the pointer at three quarters of the right column (not further down)",
+  "focus-after-exit: after `exit` in C, `echo focus-here` ran in B (top right), not in A",
+]
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+e"
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "nested"
+
+# Terminals are ordered top to bottom, then left to right: 0 = A, 1 = B, 2 = C.
+[[step]]
+action = "drag_divider"
+between = [1, 2]
+fraction = 0.75
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "dragged"
+
+[[step]]
+action = "type"
+text = "exit\n"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "type"
+text = "echo focus-here\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "focus-after-exit"

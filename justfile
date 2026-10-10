@@ -49,11 +49,11 @@ version-check:
 framework-test:
     {{python}} scripts/run_unittests.py
 
-# 框架门：rules-check、version-check、framework-test、kb-check、i18n-check（改公开签名或文档后先 just kb）
-framework-check: rules-check version-check framework-test kb-check i18n-check
+# 框架门：rules-check、version-check、framework-test、kb-check、i18n-check、pinyin-check（改公开签名或文档后先 just kb）
+framework-check: rules-check version-check framework-test kb-check i18n-check pinyin-check
 
-# 生成物新鲜度门：kb-check、i18n-check、graph-check（上游同步后与发版前）
-generated-check: kb-check i18n-check graph-check
+# 生成物新鲜度门：kb-check、i18n-check、pinyin-check、graph-check（上游同步后与发版前）
+generated-check: kb-check i18n-check pinyin-check graph-check
 
 # 本地 CI 门：framework-check、fmt-check、test-vt
 ci-check: framework-check fmt-check test-vt
@@ -89,6 +89,14 @@ i18n:
 # 只读校验 GX 翻译表与两份 .po 一致
 i18n-check:
     {{python}} scripts/gx_i18n.py --check
+
+# 联网取拼音源数据，重新生成拼音首字母表 src/gx/pinyin/initials.zig
+pinyin:
+    {{python}} scripts/gx_pinyin.py --download
+
+# 离线只读校验拼音首字母表 src/gx/pinyin/initials.zig
+pinyin-check:
+    {{python}} scripts/gx_pinyin.py --check
 
 # 启用仓库内 git 钩子（commit-msg 校验提交标题）
 install-hooks:
@@ -151,3 +159,14 @@ zig *a:
 # WSL 里的 Linux GTK 构建、完整单测与 Xvfb 截图（例：just wsl build --gtk；just wsl smoke --out <Windows 目录>）
 wsl *a:
     {{python}} scripts/gx_wsl.py {{a}}
+
+# gx_win_gui.py 只在 Windows 主机上可用：隔离启动 win32 app，守门后用 SendInput 输入并截图；
+# 场景是 test/gui/win32/W*.toml（list / run），单步子命令（start、key、capture、stop 等）见 docs/MAKE_COMMANDS.md「Windows GUI」
+# Windows GUI 自动化：场景回放与截图取证（例：just win-gui run --out <目录> W01 W03）
+win-gui *a:
+    {{python}} scripts/gx_win_gui.py {{a}}
+
+# gx_perf.py summarize / compare 只读样本；win32 交替测量一到两个 ghostty.exe，gtk 经 gx_wsl.py smoke --perf 测 WSL 克隆
+# 耗时度量：中位数与 p90、新旧构建交替对比（例：just perf compare --old <基线目录> --new <新目录>）
+perf *a:
+    {{python}} scripts/gx_perf.py {{a}}

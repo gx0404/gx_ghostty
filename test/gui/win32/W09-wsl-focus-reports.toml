@@ -1,0 +1,60 @@
+id = "W09"
+title = "WSL: focus reporting sends exactly one ^[[O / ^[[I pair per tab round trip"
+requires = ["wsl:Ubuntu-24.04"]
+config = """
+command = wsl.exe -d Ubuntu-24.04 -e bash --noprofile --norc
+language = en
+keybind = f7=goto_tab:1
+keybind = f8=goto_tab:2
+"""
+expect = [
+  "focus-events: tab 1 shows cat -v output with exactly two ^[[O^[[I pairs (two round trips), no extra events",
+]
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "type"
+text = "printf '\\e[?1004h'; cat -v\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "f8"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "focus-events"
