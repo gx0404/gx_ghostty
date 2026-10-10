@@ -700,7 +700,7 @@ class RealRepoTests(unittest.TestCase):
     def test_gx_css_generator_text_is_extracted(self):
         css = zig_css_text((ROOT / GX_CSS_GENERATORS[0]).read_text(encoding="utf-8"))
         self.assertIn("background-color: 0;", css)
-        self.assertIn(".window tabbar tab:selected {", css)
+        self.assertIn("toolbarview.gx-chrome tabbar tabbox:not(.single-tab) tab:selected {", css)
         self.assertIn("rgb(0,0,0)", css)
 
 

@@ -43,6 +43,7 @@ pub fn sync(window: *Window) void {
     const app = Application.default();
     const alloc = app.allocator();
     const object = window.as(gobject.Object);
+    if (toolbar(window)) |widget| widget.addCssClass("gx-chrome");
 
     const lang = gx.i18n.current();
     const previous: usize = if (object.getData(language_key)) |data| @intFromPtr(data) else 0;

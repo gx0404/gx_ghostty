@@ -24,4 +24,5 @@ test {
     _ = shortcuts;
     _ = shortcuts_dialog;
     _ = window;
+    _ = @import("style.zig");
 }
