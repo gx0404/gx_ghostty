@@ -18,11 +18,14 @@
 //! `src/font/discovery.zig` (MIT, commit 119b9270c).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const windows = std.os.windows;
+const uucode = @import("uucode");
 const com = @import("com.zig");
 const match = @import("match.zig");
 const font = @import("../main.zig");
 const discovery = @import("../discovery.zig");
 const global = @import("../../global.zig");
+const config_layers = @import("../../gx/config_layers.zig");
 const DeferredFace = font.DeferredFace;
 const Descriptor = discovery.Descriptor;
 const Face = font.Face;
@@ -51,6 +54,33 @@ pub const DirectWrite = struct {
     pub fn deinit(self: *DirectWrite) void {
         if (self.api) |*api| api.deinit();
         self.scanner.deinit();
+    }
+
+    /// Preloads the shared factory and default font faces on App's detached
+    /// startup thread, without depending on Ghostty's global lifetime.
+    pub fn warmup() void {
+        const timed = comptime std.log.logEnabled(.debug, .discovery);
+        var start: windows.LARGE_INTEGER = 0;
+        if (timed) _ = windows.ntdll.RtlQueryPerformanceCounter(&start);
+
+        var api = Api.init() catch return;
+        defer api.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena.deinit();
+        for (default_families) |family| {
+            warmFamily(arena.allocator(), &api, family) catch return;
+        }
+
+        if (timed) {
+            var end: windows.LARGE_INTEGER = 0;
+            var frequency: windows.LARGE_INTEGER = 1;
+            _ = windows.ntdll.RtlQueryPerformanceCounter(&end);
+            _ = windows.ntdll.RtlQueryPerformanceFrequency(&frequency);
+            log.debug("directwrite warmup families={d} time={d}us", .{
+                default_families.len,
+                @divTrunc((end - start) * std.time.us_per_s, frequency),
+            });
+        }
     }
 
     /// Discover fonts from a descriptor: the faces of `family` best match
@@ -195,6 +225,70 @@ const Api = struct {
     }
 };
 
+/// The font families of the Ghostty GX defaults for this platform, which
+/// the first surface discovers unless the user configures others.
+const default_families = configFamilies(config_layers.defaults);
+
+/// The `font-family` values of configuration text, collected the way the
+/// configuration collects them: each value is appended and an empty value
+/// clears the list.
+fn configFamilies(comptime text: []const u8) []const [:0]const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var families: []const [:0]const u8 = &.{};
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, &std.ascii.whitespace);
+            if (line.len == 0 or line[0] == '#') continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = std.mem.trimEnd(u8, line[0..eq], &std.ascii.whitespace);
+            if (!std.mem.eql(u8, key, "font-family")) continue;
+            var value = std.mem.trimStart(u8, line[eq + 1 ..], &std.ascii.whitespace);
+            if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                value = value[1 .. value.len - 1];
+            }
+            if (value.len == 0) {
+                families = &.{};
+                continue;
+            }
+            const family = value[0..value.len].* ++ [_:0]u8{};
+            families = families ++ .{&family};
+        }
+        return families;
+    }
+}
+
+/// Collects the faces of `family` for each style the way `discover` does,
+/// and creates the font face of each style's best match, the one `next`
+/// loads first.
+fn warmFamily(alloc: Allocator, api: *const Api, family: [:0]const u8) !void {
+    for ([_]bool{ false, true }) |bold| {
+        for ([_]bool{ false, true }) |italic| {
+            var it: Iterator = .{
+                .alloc = alloc,
+                // Only `load` reads it, and no face is loaded here.
+                .lib = undefined,
+                .api = api,
+                .codepoint = 0,
+                .variations = &.{},
+            };
+            defer it.deinit();
+            try it.addFamily(family, .{ .bold = bold, .italic = italic });
+            if (it.candidates.items.len == 0) continue;
+            com.release(try it.candidates.items[0].fontFace());
+        }
+    }
+}
+
+/// Avoid a full collection scan for unassigned code points, noncharacters
+/// and surrogates; private-use characters still need installed font fallback.
+fn scanFallback(cp: u21) bool {
+    return switch (uucode.get(.general_category, cp)) {
+        .other_not_assigned, .other_surrogate => false,
+        else => true,
+    };
+}
+
 const Iterator = struct {
     alloc: Allocator,
     lib: Library,
@@ -267,12 +361,12 @@ const Iterator = struct {
         }, null);
     }
 
-    /// The system fallback font for `desc.codepoint`; `next` scans every
-    /// family after it.
+    /// System fallback first, then a family scan for assigned code points.
+    /// System mapping can support characters newer than the Unicode tables.
     fn addFallback(self: *Iterator, desc: Descriptor) !void {
         const cp = std.math.cast(u21, desc.codepoint) orelse return;
-        if (cp > 0x10FFFF) return;
-        self.scan_pending = true;
+        if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return;
+        self.scan_pending = scanFallback(cp);
 
         const fallback = self.api.fallback orelse return;
         var buf: [2]u16 = undefined;
@@ -503,13 +597,7 @@ const Iterator = struct {
     }
 
     fn load(self: *Iterator, candidate: Candidate) !DeferredFace {
-        const face = switch (candidate.source) {
-            .font => |f| try f.createFontFace(),
-            .face => |f| face: {
-                com.addRef(f);
-                break :face f;
-            },
-        };
+        const face = try candidate.fontFace();
         defer com.release(face);
 
         const path = try self.facePath(face);
@@ -577,6 +665,17 @@ const Candidate = struct {
         switch (self.source) {
             inline else => |obj| com.release(obj),
         }
+    }
+
+    /// The candidate's font face, with a new reference.
+    fn fontFace(self: Candidate) !*com.IDWriteFontFace {
+        return switch (self.source) {
+            .font => |f| try f.createFontFace(),
+            .face => |f| face: {
+                com.addRef(f);
+                break :face f;
+            },
+        };
     }
 };
 
@@ -902,4 +1001,78 @@ test "directwrite falls back by codepoint" {
     var face = (try it.next()) orelse return error.TestFontNotFound;
     defer face.deinit();
     try testing.expect(face.hasCodepoint(0x3A9, null));
+}
+
+test "directwrite skips collection scans for unassigned code points" {
+    const testing = std.testing;
+
+    for ([_]u21{ 'A', 0x3A9, 0x4E00, 0x1F600, 0xE000, 0xF0000, 0x10FFFD }) |cp| {
+        try testing.expect(scanFallback(cp));
+    }
+    for ([_]u21{ 0x378, 0x50000, 0xD800, 0xDFFF }) |cp| {
+        try testing.expect(!scanFallback(cp));
+    }
+    for (0xFDD0..0xFDF0) |cp| try testing.expect(!scanFallback(@intCast(cp)));
+    for (0..17) |plane| {
+        try testing.expect(!scanFallback(@intCast((plane << 16) | 0xFFFE)));
+        try testing.expect(!scanFallback(@intCast((plane << 16) | 0xFFFF)));
+    }
+
+    if (font.options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var dw: DirectWrite = .init(lib);
+    defer dw.deinit();
+    if (dw.api == null) return error.SkipZigTest;
+
+    for ([_]u32{ 0x378, 0x50000, 0xFDD0, 0xFFFE, 0x10FFFF, 0xD800, 0x110000, 0x200000 }) |cp| {
+        var it = try dw.discover(alloc, .{ .codepoint = cp });
+        defer it.deinit();
+        try testing.expect(!it.dwrite.scan_pending);
+        while (try it.next()) |result| {
+            var face = result;
+            defer face.deinit();
+            try testing.expect(face.hasCodepoint(cp, null));
+        }
+    }
+    {
+        var it = try dw.discover(alloc, .{ .codepoint = 0x3A9 });
+        defer it.deinit();
+        try testing.expect(it.dwrite.scan_pending);
+    }
+}
+
+test "directwrite collects the font families of configuration text" {
+    const testing = std.testing;
+
+    const families = comptime configFamilies(
+        \\# font-family = Commented
+        \\font-family = A
+        \\font-family-bold = Bold
+        \\  font-family  =  "B C"
+        \\font-family =
+        \\font-family=D
+        \\font-family = "E F"
+        \\
+    );
+    try testing.expectEqual(2, families.len);
+    try testing.expectEqualStrings("D", families[0]);
+    try testing.expectEqualStrings("E F", families[1]);
+    try testing.expectEqual(0, families[1][families[1].len]);
+    try testing.expectEqual(0, comptime configFamilies("theme = x\n").len);
+}
+
+test "directwrite warmup loads the faces of a family" {
+    if (font.options.backend != .freetype_windows) return error.SkipZigTest;
+
+    var api = Api.init() catch return error.SkipZigTest;
+    defer api.deinit();
+
+    // The testing allocator checks that every candidate is freed.
+    try warmFamily(std.testing.allocator, &api, "Arial");
+    try warmFamily(std.testing.allocator, &api, "No Such Family For Ghostty");
+
+    DirectWrite.warmup();
 }
