@@ -30,7 +30,15 @@
 //! (`Window.scale`) and keeps the window painted as active
 //! (`Popup.Options.keep_owner_active`). The keycaps are measured once when
 //! the sheet opens and their text layouts are kept (`KeycapCache`), so
-//! hovering and scrolling lay out no text.
+//! hovering and scrolling reuse their layouts.
+//!
+//! While a screen reader runs (`SPI_GETSCREENREADER`, or
+//! `GHOSTTY_GX_A11Y=screen-reader` for testing), or when Direct2D is not
+//! available, a native TaskDialogIndirect lists and copies the shortcuts.
+//! It is posted through `List` so its modal loop never runs in a core
+//! callback; its text is copied before the loop. If the API is unavailable,
+//! `List` shows a read-only edit control in the system colors instead.
+//! Escape closes either native view.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const global = @import("../../../global.zig");
@@ -50,6 +58,7 @@ const Popup = @import("Popup.zig");
 const controls = @import("controls.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
+const wstr = @import("wstr.zig");
 
 const log = std.log.scoped(.win32);
 const Binding = input.Binding;
@@ -320,6 +329,9 @@ pub const Sheet = struct {
     scrollbar: controls.ScrollIndicator = .{},
     recording: Recording = .{},
     keycaps: KeycapCache = .{},
+    /// The native window that stands in for the sheet (see the file
+    /// header).
+    list: List = .{},
 
     fn palette(self: *Sheet) *Palette {
         return @alignCast(@fieldParentPtr("keybinds", self));
@@ -342,6 +354,7 @@ pub const Sheet = struct {
     }
 
     pub fn deinit(self: *Sheet) void {
+        self.list.destroy();
         Palette.releasePopup(&self.popup);
         const alloc = self.gpa();
         self.rows.deinit(alloc);
@@ -355,8 +368,11 @@ pub const Sheet = struct {
         self.measured = false;
     }
 
-    /// Show the sheet, freshly built from the configuration.
+    /// Show the sheet, freshly built from the configuration: the popup, or
+    /// the native list for a screen reader, without Direct2D, or while the
+    /// list is open.
     fn open(self: *Sheet) bool {
+        if (self.list.hwnd != null or screenReaderRunning()) return self.openList(true);
         const s = self.surface();
         const window = s.parent_window;
         const owner = window.hwnd orelse return false;
@@ -369,7 +385,7 @@ pub const Sheet = struct {
             .text_changed = onTextChanged,
             .dismissed = onDismissed,
             .dpi_changed = onPopupDpiChanged,
-        })) return false;
+        })) return self.openList(true);
         self.popup.setBorderColor(t.border);
         self.popup.setAccessibleName(i18n.tr("Keyboard Shortcuts"));
 
@@ -416,6 +432,7 @@ pub const Sheet = struct {
 
     /// The UI language changed: retranslate the titles.
     pub fn onLanguageChanged(self: *Sheet) void {
+        if (self.list.hwnd != null) _ = self.openList(false);
         if (!self.popup.visible) return;
         self.popup.setAccessibleName(i18n.tr("Keyboard Shortcuts"));
         self.build();
@@ -662,6 +679,25 @@ pub const Sheet = struct {
         };
         self.refilter();
         self.popup.invalidate();
+    }
+
+    // -------------------------------------------------------------------
+    // The native list
+    // -------------------------------------------------------------------
+
+    /// Show the shortcuts in the native list window (see the file header),
+    /// or refresh the text of the open one; `activate` brings it to the
+    /// front. Returns false when it cannot be shown.
+    fn openList(self: *Sheet, activate: bool) bool {
+        const s = self.surface();
+        const window = s.parent_window;
+        const owner = window.hwnd orelse return false;
+        if (self.popup.visible) self.close(false);
+        self.build();
+        const a = if (self.arena) |*arena| arena.allocator() else return false;
+        const text = listText(a, self.entries.items, "\r\n") catch return false;
+        const units = wstr.allocZ(a, text) catch return false;
+        return self.list.show(s.app.hinstance, owner, window.scale, units, activate);
     }
 
     // -------------------------------------------------------------------
@@ -1549,6 +1585,481 @@ fn perform(s: *Surface, actions: []const Action) void {
 }
 
 // -----------------------------------------------------------------------
+// The native list
+// -----------------------------------------------------------------------
+
+/// The environment variable that makes the sheet act as if a screen reader
+/// ran (`screen-reader`), for testing.
+const a11y_env = "GHOSTTY_GX_A11Y";
+
+const TaskDialogCallback = *const fn (w32.HWND, u32, usize, isize, isize) callconv(.winapi) i32;
+const TaskDialogButton = extern struct {
+    id: i32 align(1),
+    text: [*:0]const u16 align(1),
+};
+const TaskDialogConfig = extern struct {
+    cbSize: u32 align(1) = @sizeOf(TaskDialogConfig),
+    hwndParent: ?w32.HWND align(1) = null,
+    hInstance: ?w32.HINSTANCE align(1) = null,
+    dwFlags: u32 align(1) = 0,
+    dwCommonButtons: u32 align(1) = 0,
+    pszWindowTitle: ?[*:0]const u16 align(1) = null,
+    mainIcon: ?*anyopaque align(1) = null,
+    pszMainInstruction: ?[*:0]const u16 align(1) = null,
+    pszContent: ?[*:0]const u16 align(1) = null,
+    cButtons: u32 align(1) = 0,
+    pButtons: ?[*]const TaskDialogButton align(1) = null,
+    nDefaultButton: i32 align(1) = 0,
+    cRadioButtons: u32 align(1) = 0,
+    pRadioButtons: ?[*]const TaskDialogButton align(1) = null,
+    nDefaultRadioButton: i32 align(1) = 0,
+    pszVerificationText: ?[*:0]const u16 align(1) = null,
+    pszExpandedInformation: ?[*:0]const u16 align(1) = null,
+    pszExpandedControlText: ?[*:0]const u16 align(1) = null,
+    pszCollapsedControlText: ?[*:0]const u16 align(1) = null,
+    footerIcon: ?*anyopaque align(1) = null,
+    pszFooter: ?[*:0]const u16 align(1) = null,
+    pfCallback: ?TaskDialogCallback align(1) = null,
+    lpCallbackData: isize align(1) = 0,
+    cxWidth: u32 align(1) = 0,
+};
+const TaskDialogIndirect = *const fn (*const TaskDialogConfig, ?*i32, ?*i32, ?*i32) callconv(.winapi) i32;
+const TaskDialogData = struct {
+    source: w32.HWND,
+    text: [:0]const u16,
+};
+const task_copy_id = 1001;
+
+fn taskDialog(source: w32.HWND, owner: ?w32.HWND, edit: w32.HWND) bool {
+    const library = w32.LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral("comctl32.dll"), null, w32.LOAD_LIBRARY_SEARCH_SYSTEM32) orelse return false;
+    defer _ = w32.FreeLibrary(library);
+    const run: TaskDialogIndirect = @ptrCast(w32.GetProcAddress(library, "TaskDialogIndirect") orelse return false);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const len: usize = @intCast(@max(0, w32.GetWindowTextLengthW(edit)));
+    const text = a.allocSentinel(u16, len, 0) catch return false;
+    _ = w32.GetWindowTextW(edit, text.ptr, @intCast(len + 1));
+    const title = wstr.allocZ(a, i18n.tr("Keyboard Shortcuts")) catch return false;
+    const copy = wstr.allocZ(a, i18n.tr("Copy")) catch return false;
+    const close = wstr.allocZ(a, i18n.tr("Close")) catch return false;
+    var data: TaskDialogData = .{ .source = source, .text = text };
+    const buttons = [_]TaskDialogButton{
+        .{ .id = task_copy_id, .text = copy.ptr },
+        .{ .id = w32.IDCANCEL, .text = close.ptr },
+    };
+    const config: TaskDialogConfig = .{
+        .hwndParent = owner,
+        .dwFlags = 0x0008 | 0x0800 | 0x1000,
+        .pszWindowTitle = title.ptr,
+        .pszMainInstruction = title.ptr,
+        .pszContent = text.ptr,
+        .cButtons = buttons.len,
+        .pButtons = &buttons,
+        .nDefaultButton = w32.IDCANCEL,
+        .pfCallback = taskDialogCallback,
+        .lpCallbackData = @bitCast(@intFromPtr(&data)),
+        .cxWidth = 420,
+    };
+    const hr = run(&config, null, null, null);
+    if (hr < 0) log.warn("native shortcut TaskDialogIndirect failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+    return hr >= 0;
+}
+
+fn taskDialogCallback(hwnd: w32.HWND, msg: u32, wparam: usize, _: isize, ref_data: isize) callconv(.winapi) i32 {
+    const data: *const TaskDialogData = @ptrFromInt(@as(usize, @bitCast(ref_data)));
+    if (msg == 4 and w32.IsWindow(data.source) == 0) {
+        _ = w32.SendMessageW(hwnd, w32.WM_USER + 102, w32.IDCANCEL, 0);
+    }
+    if (msg != 2 or wparam != task_copy_id) return 0;
+    const units = data.text.len + 1;
+    const handle = w32.GlobalAlloc(w32.GMEM_MOVEABLE, units * @sizeOf(u16)) orelse return 1;
+    const ptr = w32.GlobalLock(handle) orelse {
+        _ = w32.GlobalFree(handle);
+        return 1;
+    };
+    const dst: [*]u16 = @ptrCast(@alignCast(ptr));
+    @memcpy(dst[0..units], data.text[0..units]);
+    _ = w32.GlobalUnlock(handle);
+    @import("../clipboard.zig").setUnicodeText(hwnd, handle) catch |err| {
+        log.warn("copy from shortcut dialog failed err={}", .{err});
+        _ = w32.GlobalFree(handle);
+    };
+    return 1;
+}
+
+/// Whether a screen reader runs (`SPI_GETSCREENREADER`), or `a11y_env`
+/// asks to act as if one did.
+fn screenReaderRunning() bool {
+    if (a11yOverride()) return true;
+    var on: i32 = 0;
+    return SystemParametersInfoW(SPI_GETSCREENREADER, 0, @ptrCast(&on), 0) != 0 and on != 0;
+}
+
+fn a11yOverride() bool {
+    const wide = global.environ().getWindows(std.unicode.utf8ToUtf16LeStringLiteral(a11y_env)) orelse return false;
+    var buf: [32]u8 = undefined;
+    if (wide.len > buf.len) return false;
+    for (wide, buf[0..wide.len]) |c, *out| {
+        out.* = std.math.cast(u8, c) orelse return false;
+    }
+    return isScreenReaderValue(buf[0..wide.len]);
+}
+
+/// Whether a value of `a11y_env` asks for the screen reader behavior.
+fn isScreenReaderValue(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, &std.ascii.whitespace), "screen-reader");
+}
+
+/// The text of the native list: why keys are taken, once per reason, then
+/// each category with its rows, one per line (`New Tab — Ctrl+Shift+T`),
+/// the keys that never reach Ghostty GX named after them. Lines end with
+/// `newline`.
+fn listText(a: Allocator, entries: []const Entry, newline: []const u8) std.Io.Writer.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    var reasons: std.EnumSet(Reason) = .initEmpty();
+    for (entries) |entry| {
+        if (entry.conflict) |reason| reasons.insert(reason);
+    }
+    var notices = reasons.iterator();
+    while (notices.next()) |reason| {
+        try w.writeAll(noticeText(reason));
+        try w.writeAll(newline);
+    }
+    var current: ?shortcuts.Category = null;
+    for (entries) |entry| {
+        if (current != entry.category) {
+            if (current != null or reasons.count() > 0) try w.writeAll(newline);
+            try w.writeAll(i18n.trRuntime(entry.category.title()));
+            try w.writeAll(newline);
+            current = entry.category;
+        }
+        try w.writeAll("    ");
+        try w.writeAll(entry.title);
+        try w.writeAll(" \u{2014} ");
+        for (entry.sequences, 0..) |sequence, i| {
+            if (i > 0) try w.writeAll(", ");
+            try shortcuts.writeSequence(w, sequence, .windows, " " ++ keycap.arrow ++ " ");
+        }
+        if (entry.conflict != null) try w.print(" ({s})", .{entry.conflict_note});
+        try w.writeAll(newline);
+    }
+    return out.written();
+}
+
+/// The keyboard shortcuts as plain text in a native window owned by the
+/// terminal's window (see the file header): a read-only multi-line edit
+/// control in the system colors, so it follows high contrast. Escape or
+/// closing the window gives the keyboard back to the terminal.
+const List = struct {
+    hwnd: ?w32.HWND = null,
+    owner: ?w32.HWND = null,
+    edit: ?w32.HWND = null,
+    font: ?*anyopaque = null,
+    task_open: bool = false,
+    native_fallback: bool = false,
+    /// The scale the text and padding are sized for: the window's content
+    /// scale, then the DPI of the monitor the list moved to.
+    scale: f32 = 1,
+
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyGxShortcutList");
+    const WM_SHOW_TASK_DIALOG = w32.WM_USER + 1;
+    var class_registered = false;
+
+    /// The size of the window and the room around the text, in DIPs.
+    const width: f32 = 640;
+    const height: f32 = 600;
+    const padding: f32 = style.space.m;
+
+    fn sheet(self: *List) *Sheet {
+        return @alignCast(@fieldParentPtr("list", self));
+    }
+
+    fn show(self: *List, hinstance: w32.HINSTANCE, owner: w32.HWND, scale: f32, text: [:0]const u16, bring_to_front: bool) bool {
+        const created = self.hwnd == null;
+        if (created and !self.create(hinstance, owner, scale)) return false;
+        const hwnd = self.hwnd orelse return false;
+        self.owner = owner;
+        var title: [128]u16 = undefined;
+        _ = w32.SetWindowTextW(hwnd, wstr.bufZ(&title, i18n.tr("Keyboard Shortcuts")));
+        if (self.edit) |edit| {
+            _ = w32.SetWindowTextW(edit, text.ptr);
+            _ = w32.SendMessageW(edit, EM_SETSEL, 0, 0);
+        }
+        if (created or bring_to_front) {
+            if (self.native_fallback) {
+                self.activate();
+            } else if (!self.task_open) {
+                return w32.PostMessageW(hwnd, WM_SHOW_TASK_DIALOG, 0, 0) != 0;
+            }
+        }
+        return true;
+    }
+
+    fn activate(self: *List) void {
+        const hwnd = self.hwnd orelse return;
+        _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
+        _ = w32.SetForegroundWindow(hwnd);
+        if (self.edit) |edit| _ = w32.SetFocus(edit);
+    }
+
+    fn runTaskDialog(self: *List) void {
+        if (self.task_open) return;
+        const hwnd = self.hwnd orelse return;
+        const edit = self.edit orelse return;
+        self.task_open = true;
+        const shown = taskDialog(hwnd, self.owner, edit);
+        if (w32.IsWindow(hwnd) == 0) return;
+        const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+        if (userdata == 0) return;
+        const current: *List = @ptrFromInt(@as(usize, @bitCast(userdata)));
+        current.task_open = false;
+        if (shown) {
+            current.close();
+        } else {
+            current.native_fallback = true;
+            current.activate();
+        }
+    }
+
+    fn create(self: *List, hinstance: w32.HINSTANCE, owner: w32.HWND, scale: f32) bool {
+        if (!registerClass(hinstance)) return false;
+        var frame: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = w32.GetWindowRect(owner, &frame);
+        const w = style.px(width, scale);
+        const h = style.px(height, scale);
+        const hwnd = w32.CreateWindowExW(
+            0,
+            class_name,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            w32.WS_OVERLAPPEDWINDOW,
+            @divTrunc(frame.left + frame.right - w, 2),
+            @divTrunc(frame.top + frame.bottom - h, 2),
+            w,
+            h,
+            owner,
+            null,
+            hinstance,
+            null,
+        ) orelse return false;
+        _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+        self.hwnd = hwnd;
+        const edit = w32.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            null,
+            hinstance,
+            null,
+        ) orelse {
+            _ = w32.DestroyWindow(hwnd);
+            return false;
+        };
+        self.edit = edit;
+        // Subclassed for Escape; the edit control's own procedure is kept
+        // in its user data.
+        const original = w32.SetWindowLongPtrW(edit, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
+        _ = w32.SetWindowLongPtrW(edit, w32.GWLP_USERDATA, original);
+        self.setScale(scale);
+        return true;
+    }
+
+    /// Close the window and give the keyboard back to the terminal.
+    fn close(self: *List) void {
+        const hwnd = self.hwnd orelse return;
+        const terminal = self.sheet().surface().hwnd;
+        _ = w32.DestroyWindow(hwnd);
+        if (terminal) |h| _ = w32.SetFocus(h);
+    }
+
+    /// Destroy the window with the sheet; `WM_NCDESTROY` frees the rest.
+    fn destroy(self: *List) void {
+        const hwnd = self.hwnd orelse return;
+        _ = w32.DestroyWindow(hwnd);
+    }
+
+    /// The text size and padding for `scale`.
+    fn setScale(self: *List, scale: f32) void {
+        self.scale = scale;
+        const edit = self.edit orelse return;
+        if (w32.CreateFontW(
+            -style.px(style.font_size.body, scale),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            0,
+            0,
+            CLEARTYPE_QUALITY,
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        )) |font| {
+            _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(font), 1);
+            if (self.font) |old| _ = w32.DeleteObject(old);
+            self.font = font;
+        }
+        self.layout();
+    }
+
+    /// Fill the window with the edit control, the text `padding` from its
+    /// edges.
+    fn layout(self: *List) void {
+        const hwnd = self.hwnd orelse return;
+        const edit = self.edit orelse return;
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(hwnd, &client) == 0) return;
+        _ = w32.MoveWindow(edit, 0, 0, client.right, client.bottom, 1);
+        var text: w32.RECT = undefined;
+        if (w32.GetClientRect(edit, &text) == 0) return;
+        const pad = style.px(padding, self.scale);
+        text = .{
+            .left = text.left + pad,
+            .top = text.top + pad,
+            .right = @max(text.left + pad, text.right - pad),
+            .bottom = @max(text.top + pad, text.bottom - pad),
+        };
+        _ = w32.SendMessageW(edit, EM_SETRECT, 0, @bitCast(@intFromPtr(&text)));
+    }
+
+    fn registerClass(hinstance: w32.HINSTANCE) bool {
+        if (class_registered) return true;
+        const wc = w32.WNDCLASSEXW{
+            .cbSize = @sizeOf(w32.WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = &wndProc,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = hinstance,
+            .hIcon = null,
+            .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = class_name,
+            .hIconSm = null,
+        };
+        if (w32.RegisterClassExW(&wc) == 0) return false;
+        class_registered = true;
+        return true;
+    }
+
+    fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+        const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+        if (userdata == 0) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        const self: *List = @ptrFromInt(@as(usize, @bitCast(userdata)));
+        switch (msg) {
+            WM_SHOW_TASK_DIALOG => {
+                self.runTaskDialog();
+                return 0;
+            },
+            w32.WM_SIZE => {
+                self.layout();
+                return 0;
+            },
+            w32.WM_SETFOCUS => {
+                if (self.edit) |edit| _ = w32.SetFocus(edit);
+                return 0;
+            },
+            // A read-only edit control asks for its colors like a static
+            // control: the window colors, not the dialog face.
+            w32.WM_CTLCOLORSTATIC => {
+                const hdc: w32.HDC = @ptrFromInt(wparam);
+                _ = w32.SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                _ = w32.SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+                return @bitCast(@intFromPtr(GetSysColorBrush(COLOR_WINDOW)));
+            },
+            w32.WM_DPICHANGED => {
+                const suggested: *const w32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                _ = w32.SetWindowPos(
+                    hwnd,
+                    null,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+                );
+                self.setScale(@as(f32, @floatFromInt((wparam >> 16) & 0xFFFF)) / 96.0);
+                return 0;
+            },
+            w32.WM_CLOSE => {
+                self.close();
+                return 0;
+            },
+            WM_NCDESTROY => {
+                _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+                if (self.font) |font| _ = w32.DeleteObject(font);
+                self.* = .{};
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            },
+            else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// The edit control's procedure: Escape closes the window, Ctrl+A
+    /// selects everything; the rest goes to the edit control.
+    fn editProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+        const original = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+        if (original == 0) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        switch (msg) {
+            w32.WM_KEYDOWN => switch (wparam & 0xFFFF) {
+                w32.VK_ESCAPE => {
+                    if (w32.GetParent(hwnd)) |parent| _ = w32.PostMessageW(parent, w32.WM_CLOSE, 0, 0);
+                    return 0;
+                },
+                'A' => if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) {
+                    _ = w32.SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                },
+                else => {},
+            },
+            // The characters of those keys, which a read-only edit control
+            // would beep at.
+            w32.WM_CHAR => if (wparam == 0x1B or wparam == 0x01) return 0,
+            else => {},
+        }
+        return CallWindowProcW(@ptrFromInt(@as(usize, @bitCast(original))), hwnd, msg, wparam, lparam);
+    }
+};
+
+const SPI_GETSCREENREADER: u32 = 0x0046;
+const ES_MULTILINE: u32 = 0x0004;
+const ES_AUTOVSCROLL: u32 = 0x0040;
+const ES_READONLY: u32 = 0x0800;
+const EM_SETSEL: u32 = 0x00B1;
+const EM_SETRECT: u32 = 0x00B3;
+const WM_NCDESTROY: u32 = 0x0082;
+const COLOR_WINDOW: i32 = 5;
+const COLOR_WINDOWTEXT: i32 = 8;
+const DEFAULT_CHARSET: u32 = 1;
+const CLEARTYPE_QUALITY: u32 = 5;
+extern "user32" fn SystemParametersInfoW(
+    uiAction: u32,
+    uiParam: u32,
+    pvParam: ?*anyopaque,
+    fWinIni: u32,
+) callconv(.winapi) i32;
+extern "user32" fn GetSysColor(nIndex: i32) callconv(.winapi) u32;
+extern "user32" fn GetSysColorBrush(nIndex: i32) callconv(.winapi) ?w32.HBRUSH;
+extern "user32" fn CallWindowProcW(
+    lpPrevWndFunc: *const anyopaque,
+    hWnd: w32.HWND,
+    Msg: u32,
+    wParam: usize,
+    lParam: isize,
+) callconv(.winapi) isize;
+
+// -----------------------------------------------------------------------
 // Collecting the bindings
 // -----------------------------------------------------------------------
 
@@ -1966,6 +2477,64 @@ test "recording goes on with a sequence after a leader key" {
     recording.add(&set, .{ .vk = w32.VK_F7, .mods = ctrl });
     try testing.expectEqual(@as(usize, 1), recording.len);
     try testing.expectEqualStrings("\"Ctrl+F7\"", recording.query(&buf));
+}
+
+test "the native list has one line per row under its category, notices first" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try testEntries(a, &.{
+        "ctrl+shift+t=new_tab",
+        "ctrl+a>n=new_window",
+        "ctrl+shift+o=new_split:right",
+        "ctrl+shift+c=copy_to_clipboard",
+        "ctrl+insert=copy_to_clipboard",
+    }, &.{.{ "ctrl+shift+o", .hotkey }});
+    try testing.expectEqual(@as(usize, 4), entries.len);
+    const new_tab = entryNamed(entries, "new_tab").?;
+    const split = entryNamed(entries, "new_split:right").?;
+    const new_window = entryNamed(entries, "new_window").?;
+    const copy = entryNamed(entries, "copy_to_clipboard:mixed").?;
+
+    const expected = [_][]const u8{
+        noticeText(.hotkey),
+        "",
+        i18n.trRuntime(shortcuts.Category.tabs.title()),
+        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+Shift+T", .{new_tab.title}),
+        "",
+        i18n.trRuntime(shortcuts.Category.splits.title()),
+        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+Shift+O ({s})", .{ split.title, split.conflict_note }),
+        "",
+        i18n.trRuntime(shortcuts.Category.windows.title()),
+        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+A \u{2192} N", .{new_window.title}),
+        "",
+        i18n.trRuntime(shortcuts.Category.clipboard.title()),
+        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+Insert, Ctrl+Shift+C", .{copy.title}),
+        "",
+    };
+    const text = try listText(a, entries, "\r\n");
+    var lines = std.mem.splitSequence(u8, text, "\r\n");
+    for (expected) |line| try testing.expectEqualStrings(line, lines.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), lines.next());
+
+    // Without taken keys the list starts with its first category.
+    const plain = try listText(a, entries[0..1], "\n");
+    try testing.expect(std.mem.startsWith(u8, plain, i18n.trRuntime(shortcuts.Category.tabs.title())));
+}
+
+test "TaskDialog structures use the packed Windows ABI" {
+    try testing.expectEqual(@as(usize, 1), @alignOf(TaskDialogConfig));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(TaskDialogConfig, "hwndParent"));
+    try testing.expectEqual(@as(usize, 4 + @sizeOf(usize)), @sizeOf(TaskDialogButton));
+    try testing.expectEqual(@as(usize, if (@sizeOf(usize) == 8) 160 else 96), @sizeOf(TaskDialogConfig));
+}
+
+test "GHOSTTY_GX_A11Y=screen-reader turns the native list on" {
+    try testing.expect(isScreenReaderValue("screen-reader"));
+    try testing.expect(isScreenReaderValue(" Screen-Reader\n"));
+    try testing.expect(!isScreenReaderValue("1"));
+    try testing.expect(!isScreenReaderValue(""));
+    try testing.expect(!isScreenReaderValue("screen"));
 }
 
 test "the sheet takes the keyboard and keeps its window painted as active" {
