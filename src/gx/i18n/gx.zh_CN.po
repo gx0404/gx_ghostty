@@ -865,3 +865,46 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. Windows apprt: command palette pages, footer key hints and messages
+msgid "New Tab…"
+msgstr "新建标签页…"
+
+msgid "Change Theme…"
+msgstr "更换主题…"
+
+msgid "Search launch profiles…"
+msgstr "搜索启动配置…"
+
+msgid "Search tabs…"
+msgstr "搜索标签页…"
+
+msgid "Clear Recently Used"
+msgstr "清除最近使用"
+
+msgid "Forget the entries the command palette remembers."
+msgstr "清除命令面板记住的最近使用项。"
+
+msgid "Cleared the recently used entries."
+msgstr "已清除最近使用记录。"
+
+msgid "Run"
+msgstr "运行"
+
+msgid "Switch"
+msgstr "切换"
+
+msgid "Back"
+msgstr "返回"
+
+msgid "Remove"
+msgstr "移除"
+
+msgid "Apply Without Closing"
+msgstr "应用但不关闭"
+
+msgid "No results for “{query}”"
+msgstr "没有与“{query}”匹配的结果"
+
+msgid "Try the English name or the pinyin initials."
+msgstr "可尝试英文名称或拼音首字母。"

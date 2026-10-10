@@ -1,33 +1,48 @@
 //! The command palette of a terminal surface: a `Popup` centered near the
-//! top of its window, with a filter input (IME-capable) over a grouped,
-//! scrollable list of what can be run from the keyboard:
+//! top of its window, with a filter input (IME-capable) over a scrollable
+//! list and a footer that describes the selected entry and the keys that
+//! act on it. It has pages (`Page`):
 //!
-//!   - the configured `command-palette-entry` commands, with the keycaps
-//!     of their bindings;
-//!   - the window's tabs ("Switch to Tab: <title>");
-//!   - the launch profiles ("New Tab: <profile>", like
-//!     `gx:new_tab_profile`);
-//!   - the settings sections (`Settings.showSection`) and the UI language;
-//!   - the themes ("Theme: <name>"), saved to `gui-settings.ghostty`;
-//!     while the selection rests on a theme the terminals preview it, and
-//!     closing the palette without picking it restores the saved one. The
-//!     entry an empty filter selects by itself (e.g. a recently used theme)
-//!     previews nothing until the user moves the selection or types.
+//!   - the root lists the recently used entries, the window's other tabs
+//!     ("Switch to Tab: <title>"), the configured `command-palette-entry`
+//!     commands with the keycaps of their bindings, the settings sections
+//!     (`Settings.showSection`) and the UI language. "New Tab…" and "Change
+//!     Theme…" open the next two pages; a filter also finds their entries;
+//!   - "New Tab…" lists the launch profiles (like `gx:new_tab_profile`);
+//!     Ctrl+Enter opens one in a new window;
+//!   - "Change Theme…" lists the themes with their colors. While the
+//!     selection rests on a theme the terminals preview it, and leaving the
+//!     page or closing the palette without picking one restores the saved
+//!     theme. The page opens on the current theme and previews nothing
+//!     until the user moves the selection or types. Enter saves the theme
+//!     to `gui-settings.ghostty` and closes the palette, Shift+Enter keeps
+//!     it open;
+//!   - the tab switcher (`toggle(.tabs)`, for `toggle_tab_overview` and
+//!     `gx:tab_switcher`) lists the window's tabs, the most recently used
+//!     first, with the previous one selected.
 //!
-//! Titles are shown in the UI language and matched (`fuzzy.zig`) against
-//! both the translation and the English msgid. Picks are remembered for
-//! the process (`history`, a `fuzzy.Frecency`), keyed by the English msgid
-//! or action string: with an empty filter the recently used entries come
-//! first (`Frecency.rank`: the latest of equal picks first), and they rank
-//! higher in filtered results.
+//! Backspace in an empty filter goes back to the root. Entries match
+//! (`gx.fuzzy`: words in any order, pinyin initials) in the UI language and
+//! in English, also while an input method composes; when nothing matches,
+//! the filter is tried again with two neighboring characters swapped. The
+//! matched characters are highlighted, and an entry found by its English
+//! title shows that title on a second line. Matches are grouped, the groups
+//! ordered by their best match (`palette_model.sortMatches`).
+//!
+//! Picks are kept between runs (`gx.palette_history`, in the state file),
+//! keyed by the English msgid, action or theme name: the recently used
+//! entries come first in the root and rank higher in filtered results,
+//! and the entry picked most after typing the same text comes first.
+//! Shift+Delete forgets the selected entry, "Clear Recently Used" all.
 //!
 //! The owning `Surface` embeds this struct as `palette` and calls
 //! `setActive` (from `toggle_command_palette`), `reposition` (on resize),
 //! `onDpiChanged`, `onLanguageChanged` and `deinit`. The app's message
 //! loop gives `handleKey` the first look at key presses in the popup
 //! (`ownsEdit`); chords bound to other actions then bubble up to the
-//! surface. The palette also hosts the window's keyboard shortcut sheet
-//! (`keybinds`, see `Keybinds.zig`), which shares its lifetime.
+//! surface, and editing chords stay with the filter (`text_edit`). The
+//! palette also hosts the window's keyboard shortcut sheet (`keybinds`,
+//! see `Keybinds.zig`), which shares its lifetime.
 const Palette = @This();
 
 const std = @import("std");
@@ -38,6 +53,8 @@ const Config = @import("../../../config.zig").Config;
 const themepkg = @import("../../../config/theme.zig");
 const gx = @import("../../../gx/main.zig");
 const i18n = gx.i18n;
+const fuzzy = gx.fuzzy;
+const ui_color = gx.ui_color;
 const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
 const Window = @import("../Window.zig");
@@ -45,43 +62,52 @@ const w32 = @import("../win32.zig");
 const Keybinds = @import("Keybinds.zig");
 const Popup = @import("Popup.zig");
 const Settings = @import("Settings.zig");
+const controls = @import("controls.zig");
 const d2d = @import("d2d.zig");
-const fuzzy = @import("fuzzy.zig");
+const model = @import("palette_model.zig");
 const style = @import("style.zig");
 const trigger = @import("trigger.zig");
 
 const log = std.log.scoped(.win32);
 const Action = input.Binding.Action;
+const History = gx.palette_history.History;
+const floor = gx.ui_tokens.floor;
 
 /// Layout in DIPs.
 const layout = struct {
     const width_max: f32 = 640;
     const width_min: f32 = 360;
     /// Distance from the window edges and below the chrome.
-    const margin: f32 = 12;
-    const top_gap: f32 = 8;
-    const pad: f32 = 8;
+    const margin: f32 = style.space.m;
+    const top_gap: f32 = style.space.s;
+    const pad: f32 = style.space.s;
     const input_height: f32 = 36;
     /// The top of the list, below the input and its separator.
-    const list_top: f32 = pad + input_height + pad + 1;
-    const list_pad: f32 = 4;
-    const list_height_max: f32 = 470;
-    const empty_height: f32 = 56;
-    const header_height: f32 = 28;
-    const item_height: f32 = 36;
-    const item_height_described: f32 = 50;
-    const row_radius: f32 = 6;
-    const icon_size: f32 = 16;
-    const text_x: f32 = 12 + icon_size + 10;
+    const list_top: f32 = pad + input_height + pad;
+    const list_pad: f32 = style.space.xs;
+    const list_height_max: f32 = 440;
+    const empty_height: f32 = 76;
+    const header_height: f32 = style.row.header;
+    const item_height: f32 = style.row.list;
+    const item_height_two_line: f32 = style.row.two_line;
+    const footer_height: f32 = style.control.height;
+    const icon_x: f32 = style.space.m;
+    const text_x: f32 = icon_x + style.icon.standard + style.space.m;
+    const gap: f32 = style.space.m;
+    /// The widest share of a row the keycaps and details at its end take.
+    const end_share: f32 = 0.45;
+    /// The widest share of the footer its key hints take.
+    const hints_share: f32 = 0.6;
+    const swatch_width: f32 = 72;
+    const swatch_height: f32 = 20;
     const wheel_step: f32 = 3 * item_height;
 };
 
 /// How many recently used entries an empty filter shows.
 const max_recent = 5;
 
-/// How long the selection rests on a theme before the terminals preview
-/// it, and the timer that waits for it (on the popup window).
-const preview_delay_ms = 150;
+/// The timer on the popup window that waits for the selection to rest on a
+/// theme before previewing it.
 const preview_timer_id: usize = 1;
 
 /// The timer on the app's message window (`App.msg_hwnd`) that reloads the
@@ -89,17 +115,23 @@ const preview_timer_id: usize = 1;
 /// (see `deinit`).
 const restore_timer_id: usize = 0x5054; // 'PT'
 
+const vk_lbutton: i32 = 0x01;
+
 /// Segoe Fluent Icons / MDL2 Assets glyphs of the entry kinds.
 const icons = struct {
     const command: u21 = 0xE945;
     const tab: u21 = 0xE7C4;
+    const bell: u21 = 0xE7ED;
     const profile: u21 = 0xE756;
+    const new_tab: u21 = d2d.icons.add;
     const settings: u21 = 0xE713;
     const language: u21 = 0xE774;
     const theme: u21 = 0xE790;
+    const clear: u21 = 0xE894;
+    const back: u21 = 0xE76B;
 };
 
-const Group = enum {
+const Group = enum(u8) {
     recent,
     tabs,
     profiles,
@@ -119,7 +151,49 @@ const Group = enum {
     }
 };
 
-const group_count = @typeInfo(Group).@"enum".fields.len;
+comptime {
+    std.debug.assert(@typeInfo(Group).@"enum".fields.len <= model.max_groups);
+}
+
+/// What the palette lists.
+pub const Page = enum {
+    /// Commands, settings, tabs and the recently used entries.
+    root,
+    /// The launch profiles.
+    new_tab,
+    /// The themes, previewed while selected.
+    themes,
+    /// The window's tabs, most recently used first.
+    tabs,
+
+    /// The group a page other than the root lists.
+    fn group(self: Page) ?Group {
+        return switch (self) {
+            .root => null,
+            .new_tab => .profiles,
+            .themes => .themes,
+            .tabs => .tabs,
+        };
+    }
+
+    fn title(self: Page) [:0]const u8 {
+        return switch (self) {
+            .root => "",
+            .new_tab => i18n.tr("New Tab"),
+            .themes => i18n.tr("Themes"),
+            .tabs => i18n.tr("Tab Switcher"),
+        };
+    }
+
+    fn placeholder(self: Page) [:0]const u8 {
+        return switch (self) {
+            .root => i18n.tr("Type a command…"),
+            .new_tab => i18n.tr("Search launch profiles…"),
+            .themes => i18n.tr("Search themes…"),
+            .tabs => i18n.tr("Search tabs…"),
+        };
+    }
+};
 
 /// What an entry does when it runs.
 const Target = union(enum) {
@@ -130,7 +204,10 @@ const Target = union(enum) {
     profile: [:0]const u8,
     settings: Settings.Section,
     language: i18n.Language,
-    theme: []const u8,
+    /// A theme name and its index in `theme_names`.
+    theme: struct { name: []const u8, index: u32 },
+    page: Page,
+    clear_history,
 };
 
 const Item = struct {
@@ -139,53 +216,54 @@ const Item = struct {
     /// The title in the UI language, and in English for matching.
     title: []const u8,
     title_en: []const u8,
+    /// The title on the entry's own page, which leaves out the prefix of
+    /// the root ("Theme: "): a name, also in English.
+    name: []const u8,
+    name_en: []const u8,
+    /// What the footer says about the entry when it is selected.
     description: []const u8 = "",
-    /// The `History` key; empty for entries that are not remembered.
+    /// A short note at the end of the row: a launch profile's program, the
+    /// current theme or tab.
+    detail: []const u8 = "",
+    /// The `gx.palette_history` key; empty for entries that are not
+    /// remembered.
     key: []const u8 = "",
     shortcut: ?input.Binding.Trigger = null,
+    /// The width of the shortcut's keycaps, once measured.
+    shortcut_width: ?f32 = null,
     /// The current tab or theme.
     current: bool = false,
+    /// A tab with output the user has not seen.
+    unread: bool = false,
+    /// How recently a tab was selected (`Window.tabRecency`), the current
+    /// one highest.
+    recency: u64 = 0,
     target: Target,
-    frecency: u32 = 0,
-    /// The place among the recently used entries (`Frecency.rank`).
+
+    /// The place among the recently used entries (`History.rank`) and the
+    /// score bonus of the picks.
     rank: u64 = 0,
+    bonus: i32 = 0,
+    /// The score of the current filter, and whether the entry matched by
+    /// its English title rather than the translated one.
     score: i32 = 0,
+    english: bool = false,
 };
 
 const Row = struct {
     kind: union(enum) {
         header: Group,
         item: usize,
-        /// "Type to search N themes…".
-        theme_hint,
     },
     /// Position in the list content.
     y: f32 = 0,
     h: f32 = 0,
 };
 
-/// Whether the selected theme is previewed. An empty filter starts on its
-/// first entry, which can be a recently used theme, and opening the palette
-/// must not change the theme: the selection previews only once the user
-/// moved it with the keyboard or typed a filter.
-const PreviewGate = struct {
-    armed: bool = false,
-
-    /// The filter changed and selected its first entry.
-    fn filtered(self: *PreviewGate, query_empty: bool) void {
-        self.armed = !query_empty;
-    }
-
-    /// The user moved the selection.
-    fn navigated(self: *PreviewGate) void {
-        self.armed = true;
-    }
-
-    /// The theme the terminals should show while the theme `selected` (if
-    /// any) is selected: it once armed, else the saved one (null).
-    fn target(self: PreviewGate, selected: ?[]const u8) ?[]const u8 {
-        return if (self.armed) selected else null;
-    }
+/// What the left button went down on.
+const Pressed = union(enum) {
+    row: usize,
+    back,
 };
 
 popup: Popup = .{},
@@ -193,29 +271,49 @@ popup: Popup = .{},
 /// The keyboard shortcut sheet of the window (see `Keybinds.show`).
 keybinds: Keybinds.Sheet = .{},
 
-/// Whether the palette is shown.
+/// Whether the palette is shown, and the page it shows.
 active: bool = false,
+page: Page = .root,
 
 /// The entries of the current session; they and their strings live in
 /// `arena`, which is reset each time the palette opens.
 arena: ?std.heap.ArenaAllocator = null,
 items: std.ArrayList(Item) = .empty,
-theme_count: usize = 0,
+/// The theme directories of the session, highest priority first.
+theme_dirs: []const []const u8 = &.{},
+/// The colors of the theme rows by theme index, for the `theme_names`
+/// list of generation `swatch_generation`.
+swatches: gx.theme_swatch.Cache = .{},
+swatch_generation: u64 = 0,
 
 /// The rows on display for the current filter.
 rows: std.ArrayList(Row) = .empty,
 content_height: f32 = 0,
 scroll: f32 = 0,
+scrollbar: controls.ScrollIndicator = .{},
 /// Row indices (item rows only).
 selected: ?usize = null,
 hover: ?usize = null,
-pressed: ?usize = null,
+pressed: ?Pressed = null,
+/// The pointer over the popup (DIPs), to find the row under it again after
+/// the list scrolled.
+mouse: ?d2d.Point = null,
+/// The back button of a page, where the last paint put it.
+back_rect: ?d2d.Rect = null,
+back_hover: bool = false,
+
+/// The query the rows matched: the filter, or one with two characters
+/// swapped when the filter matched nothing. The filter as typed is
+/// `filter_buf[0..filter_len]`.
+query: fuzzy.Query = .{},
+filter_buf: [256]u8 = undefined,
+filter_len: usize = 0,
 
 /// The theme the terminals show as a preview while the selection rests on
 /// it (`preview_buf[0..preview_len]`), or null.
 preview_len: ?usize = null,
 preview_buf: [256]u8 = undefined,
-preview_gate: PreviewGate = .{},
+preview_gate: model.PreviewGate = .{},
 /// The in-app notifications when the palette opened; previews keep them
 /// without the "reloaded" notification.
 notifications: Config.AppNotifications = .{},
@@ -237,9 +335,11 @@ pub fn deinit(self: *Palette) void {
     self.endPreview(false);
     releasePopup(&self.popup);
     self.rows.deinit(self.alloc());
+    self.swatches.deinit(self.alloc());
     if (self.arena) |*arena| arena.deinit();
     self.arena = null;
     self.items = .empty;
+    self.theme_dirs = &.{};
     self.active = false;
 }
 
@@ -250,15 +350,37 @@ pub fn ownsEdit(self: *const Palette, hwnd: ?w32.HWND) bool {
     return hwnd != null and hwnd.? == popup;
 }
 
-/// Show or hide the command palette.
+/// Show the command palette (on its root page) or hide it.
 pub fn setActive(self: *Palette, active: bool) void {
     if (!active) {
         self.close(true);
         return;
     }
+    self.open(.root);
+}
+
+/// Show the palette on `page`, or hide it when it shows that page already:
+/// `toggle(.tabs)` is the tab switcher of `toggle_tab_overview` and
+/// `gx:tab_switcher`.
+pub fn toggle(self: *Palette, page: Page) void {
+    if (self.active and self.page == page) {
+        self.close(true);
+        return;
+    }
+    self.open(page);
+}
+
+/// Show the palette on `page` (switching to it when the palette is shown).
+pub fn open(self: *Palette, page: Page) void {
+    if (self.active) {
+        self.setPage(page);
+        return;
+    }
+    const span: gx.perf.Span = .begin(global.io());
     const s = self.surface();
     if (s.search_bar.active) s.search_bar.setActive(false, &[_:0]u8{});
-    const owner = s.parent_window.hwnd orelse return;
+    const window = s.parent_window;
+    const owner = window.hwnd orelse return;
     const t = self.tokens();
     if (!ensurePopup(&self.popup, s.app, owner, .{
         .activate = true,
@@ -269,24 +391,32 @@ pub fn setActive(self: *Palette, active: bool) void {
         .shadow = true,
         .border_color = t.border,
         .dark = t.dark,
+        .keep_owner_active = true,
+        .accessible_name = i18n.tr("Command Palette"),
     }, .{
         .ctx = self,
         .paint = paint,
         .key = onKey,
         .mouse = onMouse,
         .text_changed = onTextChanged,
+        .composition_changed = onCompositionChanged,
         .dismissed = onDismissed,
         .dpi_changed = onPopupDpiChanged,
     })) return;
-    self.popup.setBorderColor(t.border);
+    self.popup.applyTheme(t);
+    self.popup.setOwnerScale(window.scale);
+    self.popup.setAccessibleName(i18n.tr("Command Palette"));
 
     self.active = true;
+    self.page = page;
     self.notifications = s.app.config.@"app-notifications";
     self.popup.input.clear();
+    self.mouse = null;
     self.buildItems();
-    self.refilter();
+    self.refilter(.navigation);
     const rect = self.bounds() orelse return;
     self.popup.show(rect);
+    _ = span.end(global.io(), "palette_open");
 }
 
 /// Hide the palette, ending a theme preview; `restore_focus` gives the
@@ -296,6 +426,8 @@ fn close(self: *Palette, restore_focus: bool) void {
     self.active = false;
     self.hover = null;
     self.pressed = null;
+    self.mouse = null;
+    self.scrollbar = .{};
     self.popup.hide();
     self.endPreview(true);
     if (was_active and restore_focus) self.focusSurface();
@@ -308,6 +440,7 @@ fn focusSurface(self: *Palette) void {
 /// Move and size the palette for its window (after a resize).
 pub fn reposition(self: *Palette) void {
     if (!self.active or !popupAlive(&self.popup)) return;
+    self.popup.setOwnerScale(self.surface().parent_window.scale);
     const rect = self.bounds() orelse return;
     self.popup.setBounds(rect);
 }
@@ -323,7 +456,7 @@ pub fn onLanguageChanged(self: *Palette) void {
     self.keybinds.onLanguageChanged();
     if (!self.active) return;
     self.buildItems();
-    self.refilter();
+    self.refilter(.navigation);
     self.reposition();
     self.popup.invalidate();
 }
@@ -333,19 +466,20 @@ fn tokens(self: *Palette) style.Tokens {
 }
 
 /// The palette's place in screen pixels: centered below the window's
-/// chrome, as tall as the rows need up to a limit.
+/// chrome, as tall as the rows need up to a limit, at the window's scale.
 fn bounds(self: *Palette) ?w32.RECT {
     const window = self.surface().parent_window;
     const hwnd = window.hwnd orelse return null;
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0) return null;
-    const scale = windowScale(hwnd);
+    const scale = window.scale;
     const client_w = style.dip(client.right - client.left, scale);
     const client_h = style.dip(client.bottom - client.top, scale);
     const top = style.dip(window.chromeHeight(), scale) + layout.top_gap;
 
     const width = std.math.clamp(client_w - 2 * layout.margin, layout.width_min, layout.width_max);
-    const list_max = @max(layout.empty_height, @min(layout.list_height_max, client_h - top - layout.margin - layout.list_top));
+    const room = client_h - top - layout.margin - layout.list_top - layout.footer_height;
+    const list_max = @max(layout.empty_height, @min(layout.list_height_max, room));
     const list_h = std.math.clamp(self.content_height, layout.empty_height, list_max);
 
     var origin: w32.POINT = .{ .x = 0, .y = 0 };
@@ -356,13 +490,8 @@ fn bounds(self: *Palette) ?w32.RECT {
         .left = left,
         .top = y,
         .right = left + style.px(width, scale),
-        .bottom = y + style.px(layout.list_top + list_h, scale),
+        .bottom = y + style.px(layout.list_top + list_h + layout.footer_height, scale),
     };
-}
-
-fn windowScale(hwnd: w32.HWND) f32 {
-    const dpi = w32.GetDpiForWindow(hwnd);
-    return @as(f32, @floatFromInt(if (dpi == 0) 96 else dpi)) / 96.0;
 }
 
 // -----------------------------------------------------------------------
@@ -378,17 +507,21 @@ fn buildItems(self: *Palette) void {
     }
     const a = self.arena.?.allocator();
     self.items = .empty;
-    self.theme_count = 0;
+    self.theme_dirs = &.{};
+    loadHistory(self.alloc());
 
     self.addTabs(a) catch |err| log.warn("palette tabs unavailable err={}", .{err});
-    self.addProfiles(a) catch |err| log.warn("palette launch profiles unavailable err={}", .{err});
+    self.addPages(a) catch |err| log.warn("palette pages unavailable err={}", .{err});
     self.addCommands(a) catch |err| log.warn("palette commands unavailable err={}", .{err});
     self.addSettings(a) catch |err| log.warn("palette settings unavailable err={}", .{err});
+    self.addProfiles(a) catch |err| log.warn("palette launch profiles unavailable err={}", .{err});
     self.addThemes(a) catch |err| log.warn("palette themes unavailable err={}", .{err});
 
+    const now = unixNow();
     for (self.items.items) |*item| {
-        item.frecency = history.get(item.key);
+        if (item.key.len == 0) continue;
         item.rank = history.rank(item.key);
+        item.bonus = history.bonus(item.key, now);
     }
 }
 
@@ -397,7 +530,7 @@ fn keybindSet(self: *Palette) *const input.Binding.Set {
 }
 
 /// The shortcuts shown next to the items: none that another program or
-/// the input method takes.
+/// the input method takes, and none without a key name.
 fn hints(self: *Palette) trigger.Hints {
     return .{ .set = self.keybindSet(), .blocked = &self.surface().app.shortcut_conflicts };
 }
@@ -411,21 +544,167 @@ fn addTabs(self: *Palette, a: Allocator) !void {
             else => "",
         };
         const label = if (name.len > 0) name else "Ghostty GX";
+        const current = i == window.active_tab;
+        const status = window.tabStatus(i);
         try self.items.append(a, .{
             .group = .tabs,
-            .icon = icons.tab,
+            .icon = if (status.bell) icons.bell else icons.tab,
             .title = try i18n.fill(a, i18n.tr("Switch to Tab: {title}"), .{ .title = label }),
             .title_en = try i18n.fill(a, "Switch to Tab: {title}", .{ .title = label }),
-            .description = if (i == window.active_tab) i18n.tr("Current Tab") else "",
+            .name = label,
+            .name_en = label,
+            .description = label,
+            .detail = if (current) i18n.tr("Current Tab") else "",
             .shortcut = self.hints().lookup(.{ .goto_tab = i + 1 }),
-            .current = i == window.active_tab,
+            .current = current,
+            .unread = status.unread,
+            .recency = if (current) std.math.maxInt(u64) else window.tabRecency(i),
             .target = .{ .tab = window.tab_active_surface[i] },
         });
     }
 }
 
+/// The entries that open the launch profile and theme pages.
+fn addPages(self: *Palette, a: Allocator) !void {
+    const app = self.surface().app;
+    const new_tab = i18n.tr("New Tab…");
+    try self.items.append(a, .{
+        .group = .commands,
+        .icon = icons.new_tab,
+        .title = new_tab,
+        .title_en = "New Tab…",
+        .name = new_tab,
+        .name_en = "New Tab…",
+        .key = "page:new_tab",
+        .target = .{ .page = .new_tab },
+    });
+    const theme = i18n.tr("Change Theme…");
+    try self.items.append(a, .{
+        .group = .commands,
+        .icon = icons.theme,
+        .title = theme,
+        .title_en = "Change Theme…",
+        .name = theme,
+        .name_en = "Change Theme…",
+        .detail = if (gx.settings_map.themeName(app.config.theme)) |current| try a.dupe(u8, current) else "",
+        .key = "page:themes",
+        .target = .{ .page = .themes },
+    });
+}
+
+fn addCommands(self: *Palette, a: Allocator) !void {
+    const app = self.surface().app;
+    for (app.config.@"command-palette-entry".value.items) |command| {
+        if (!supported(command.action)) continue;
+        // Copied: a configuration reload frees the originals.
+        const action = try command.action.clone(a);
+        const title = try a.dupe(u8, i18n.trRuntime(command.title));
+        const title_en = try a.dupe(u8, command.title);
+        try self.items.append(a, .{
+            .group = .commands,
+            .icon = icons.command,
+            .title = title,
+            .title_en = title_en,
+            .name = title,
+            .name_en = title_en,
+            .description = if (command.description.len > 0)
+                try a.dupe(u8, i18n.trRuntime(command.description))
+            else
+                "",
+            .key = try std.fmt.allocPrint(a, "{f}", .{action}),
+            .shortcut = self.hints().lookup(action),
+            .target = .{ .command = action },
+        });
+    }
+}
+
+/// Whether running `action` from the palette does something on Windows.
+fn supported(action: Action) bool {
+    return switch (action) {
+        .toggle_command_palette,
+        .show_gtk_inspector,
+        .show_on_screen_keyboard,
+        .check_for_updates,
+        .toggle_secure_input,
+        .inspector,
+        .undo,
+        .redo,
+        => false,
+        else => true,
+    };
+}
+
+/// Whether `action` opens the tab switcher, which the palette shows
+/// itself.
+fn opensTabSwitcher(action: Action) bool {
+    return switch (action) {
+        .toggle_tab_overview => true,
+        .gx => |gx_action| gx_action == .tab_switcher,
+        else => false,
+    };
+}
+
+fn addSettings(self: *Palette, a: Allocator) !void {
+    const sections = [_]struct { [:0]const u8, Settings.Section }{
+        .{ "Language", .language },
+        .{ "Appearance", .appearance },
+        .{ "Font", .font },
+        .{ "Interaction", .interaction },
+        .{ "Shell", .shell },
+        .{ "About", .about },
+    };
+    inline for (sections) |entry| {
+        const section = entry[0];
+        const title = try i18n.fill(a, i18n.tr("Settings: {section}"), .{ .section = i18n.tr(section) });
+        const title_en = try i18n.fill(a, "Settings: {section}", .{ .section = section });
+        try self.items.append(a, .{
+            .group = .settings,
+            .icon = icons.settings,
+            .title = title,
+            .title_en = title_en,
+            .name = title,
+            .name_en = title_en,
+            .key = "settings:" ++ section,
+            .target = .{ .settings = entry[1] },
+        });
+    }
+
+    const current = i18n.current();
+    const next: i18n.Language = switch (current) {
+        .zh_CN => .en,
+        .en => .zh_CN,
+    };
+    const title = try i18n.fill(a, i18n.tr("Switch Language to {language}"), .{ .language = next.nativeName() });
+    const title_en = try i18n.fill(a, "Switch Language to {language}", .{ .language = next.nativeName() });
+    try self.items.append(a, .{
+        .group = .settings,
+        .icon = icons.language,
+        .title = title,
+        .title_en = title_en,
+        .name = title,
+        .name_en = title_en,
+        .description = try i18n.fill(a, i18n.tr("Current language: {language}"), .{ .language = current.nativeName() }),
+        .key = "language",
+        .target = .{ .language = next },
+    });
+
+    if (!history.isEmpty()) {
+        const clear = i18n.tr("Clear Recently Used");
+        try self.items.append(a, .{
+            .group = .settings,
+            .icon = icons.clear,
+            .title = clear,
+            .title_en = "Clear Recently Used",
+            .name = clear,
+            .name_en = "Clear Recently Used",
+            .description = i18n.tr("Forget the entries the command palette remembers."),
+            .target = .clear_history,
+        });
+    }
+}
+
 fn addProfiles(self: *Palette, a: Allocator) !void {
-    var list = try self.surface().app.launchProfiles();
+    var list = try self.surface().app.cachedLaunchProfiles();
     defer list.deinit();
     for (list.profiles) |profile| {
         const id = try a.dupeZ(u8, profile.id);
@@ -434,12 +713,20 @@ fn addProfiles(self: *Palette, a: Allocator) !void {
             name
         else
             try i18n.fill(a, profile.name, .{ .name = profile.name_arg orelse "" });
+        var detail_buf: [256]u8 = undefined;
+        const detail = switch (profile.command) {
+            .argv => |argv| model.commandLabel(&detail_buf, argv),
+            .command_line => |line| model.lineLabel(&detail_buf, line),
+        };
         try self.items.append(a, .{
             .group = .profiles,
             .icon = icons.profile,
             .title = try i18n.fill(a, i18n.tr("New Tab: {name}"), .{ .name = name }),
             .title_en = try i18n.fill(a, "New Tab: {name}", .{ .name = name_en }),
+            .name = name,
+            .name_en = name_en,
             .description = try commandText(a, profile.command),
+            .detail = try a.dupe(u8, detail),
             .key = try std.fmt.allocPrint(a, "gx:new_tab_profile:{s}", .{id}),
             .shortcut = self.hints().lookup(.{ .gx = .{ .new_tab_profile = id } }),
             .target = .{ .profile = id },
@@ -461,92 +748,20 @@ fn commandText(a: Allocator, command: gx.profiles.Command) ![]const u8 {
     };
 }
 
-fn addCommands(self: *Palette, a: Allocator) !void {
-    const app = self.surface().app;
-    for (app.config.@"command-palette-entry".value.items) |command| {
-        if (!supported(command.action)) continue;
-        // Copied: a configuration reload frees the originals.
-        const action = try command.action.clone(a);
-        try self.items.append(a, .{
-            .group = .commands,
-            .icon = icons.command,
-            .title = try a.dupe(u8, i18n.trRuntime(command.title)),
-            .title_en = try a.dupe(u8, command.title),
-            .description = if (command.description.len > 0)
-                try a.dupe(u8, i18n.trRuntime(command.description))
-            else
-                "",
-            .key = try std.fmt.allocPrint(a, "{f}", .{action}),
-            .shortcut = self.hints().lookup(action),
-            .target = .{ .command = action },
-        });
-    }
-}
-
-/// Whether running `action` from the palette does something on Windows.
-fn supported(action: Action) bool {
-    return switch (action) {
-        .toggle_command_palette,
-        .toggle_tab_overview,
-        .show_gtk_inspector,
-        .show_on_screen_keyboard,
-        .check_for_updates,
-        .toggle_secure_input,
-        .inspector,
-        .undo,
-        .redo,
-        => false,
-        else => true,
-    };
-}
-
-fn addSettings(self: *Palette, a: Allocator) !void {
-    const sections = [_]struct { [:0]const u8, Settings.Section }{
-        .{ "Language", .language },
-        .{ "Appearance", .appearance },
-        .{ "Font", .font },
-        .{ "Interaction", .interaction },
-        .{ "Shell", .shell },
-        .{ "About", .about },
-    };
-    inline for (sections) |entry| {
-        const section = entry[0];
-        try self.items.append(a, .{
-            .group = .settings,
-            .icon = icons.settings,
-            .title = try i18n.fill(a, i18n.tr("Settings: {section}"), .{ .section = i18n.tr(section) }),
-            .title_en = try i18n.fill(a, "Settings: {section}", .{ .section = section }),
-            .key = "settings:" ++ section,
-            .target = .{ .settings = entry[1] },
-        });
-    }
-
-    const current = i18n.current();
-    const next: i18n.Language = switch (current) {
-        .zh_CN => .en,
-        .en => .zh_CN,
-    };
-    try self.items.append(a, .{
-        .group = .settings,
-        .icon = icons.language,
-        .title = try i18n.fill(a, i18n.tr("Switch Language to {language}"), .{ .language = next.nativeName() }),
-        .title_en = try i18n.fill(a, "Switch Language to {language}", .{ .language = next.nativeName() }),
-        .description = try i18n.fill(a, i18n.tr("Current language: {language}"), .{ .language = current.nativeName() }),
-        .key = "language",
-        .target = .{ .language = next },
-    });
-}
-
 fn addThemes(self: *Palette, a: Allocator) !void {
     const app = self.surface().app;
     var dirs: std.ArrayList([]const u8) = .empty;
     var it: themepkg.LocationIterator = .{ .arena_alloc = a };
     while (it.next() catch null) |location| try dirs.append(a, location.dir);
+    self.theme_dirs = dirs.items;
 
-    var list = try gx.settings_map.listThemes(self.alloc(), global.io(), dirs.items);
-    defer list.deinit();
+    const names = theme_names.get(global.io(), dirs.items);
+    if (theme_names.generation != self.swatch_generation) {
+        self.swatches.deinit(self.alloc());
+        self.swatch_generation = theme_names.generation;
+    }
     const current = gx.settings_map.themeName(app.config.theme);
-    for (list.names) |theme| {
+    for (names, 0..) |theme, i| {
         const name = try a.dupe(u8, theme);
         const is_current = if (current) |c| std.mem.eql(u8, c, name) else false;
         try self.items.append(a, .{
@@ -554,12 +769,13 @@ fn addThemes(self: *Palette, a: Allocator) !void {
             .icon = icons.theme,
             .title = try i18n.fill(a, i18n.tr("Theme: {name}"), .{ .name = name }),
             .title_en = try i18n.fill(a, "Theme: {name}", .{ .name = name }),
-            .description = if (is_current) i18n.tr("Current Theme") else "",
+            .name = name,
+            .name_en = name,
+            .detail = if (is_current) i18n.tr("Current Theme") else "",
             .key = try std.fmt.allocPrint(a, "theme:{s}", .{name}),
             .current = is_current,
-            .target = .{ .theme = name },
+            .target = .{ .theme = .{ .name = name, .index = @intCast(i) } },
         });
-        self.theme_count += 1;
     }
 }
 
@@ -567,17 +783,18 @@ fn addThemes(self: *Palette, a: Allocator) !void {
 // Filtering
 // -----------------------------------------------------------------------
 
-/// Rebuild the rows for the filter text and select the first entry.
-fn refilter(self: *Palette) void {
+/// Rebuild the rows for the filter text and select the page's first
+/// entry; `cause` sets how long a theme preview waits.
+fn refilter(self: *Palette, cause: model.PreviewCause) void {
+    const span: gx.perf.Span = .begin(global.io());
     const gpa = self.alloc();
     self.rows.clearRetainingCapacity();
-    self.hover = null;
     self.pressed = null;
+    for (self.items.items) |*item| item.english = false;
 
-    var buf: [1024]u8 = undefined;
-    const text = self.popup.input.utf8Range(&buf, 0, self.popup.input.buf.items.len);
-    const query: fuzzy.Query = .init(text);
-    const result = if (query.isEmpty()) self.listAll(gpa) else self.listMatches(gpa, &query);
+    const text = self.readFilter();
+    self.query = .init(text);
+    const result = if (self.query.isEmpty()) self.listAll(gpa) else self.listMatches(gpa, text);
     result catch |err| log.warn("palette filter failed err={}", .{err});
 
     var y: f32 = layout.list_pad;
@@ -585,115 +802,184 @@ fn refilter(self: *Palette) void {
         row.y = y;
         row.h = switch (row.kind) {
             .header => layout.header_height,
-            .theme_hint => layout.header_height,
-            .item => |i| if (self.items.items[i].description.len > 0)
-                layout.item_height_described
-            else
-                layout.item_height,
+            .item => |i| if (self.items.items[i].english) layout.item_height_two_line else layout.item_height,
         };
         y += row.h;
     }
     self.content_height = if (self.rows.items.len == 0) 0 else y + layout.list_pad;
     self.scroll = 0;
-    self.selected = self.nextItemRow(0, 1);
-    self.preview_gate.filtered(query.isEmpty());
-    self.schedulePreview();
+    self.selected = self.initialRow();
+    if (self.selected) |row| {
+        if (self.page == .themes and self.query.isEmpty()) self.center(row) else self.reveal(row);
+    }
+    self.updateHover();
+    self.preview_gate.filtered(self.query.isEmpty());
+    self.schedulePreview(cause);
+    _ = span.end(global.io(), "palette_filter");
 }
 
-/// Every entry by group, the recently used ones first. Themes are
-/// hundreds, so only the current one is listed until the user types.
+/// The filter text, with an IME composition in progress, kept in
+/// `filter_buf`.
+fn readFilter(self: *Palette) []const u8 {
+    const in = &self.popup.input;
+    const text = model.compositionQuery(&self.filter_buf, in.buf.items, in.caret, in.composition.items);
+    self.filter_len = text.len;
+    return text;
+}
+
+fn filterText(self: *const Palette) []const u8 {
+    return self.filter_buf[0..self.filter_len];
+}
+
+/// The entries of the page without a filter. The root lists the recently
+/// used entries, the other tabs, the commands and the settings.
 fn listAll(self: *Palette, gpa: Allocator) !void {
-    var recent: [max_recent]usize = undefined;
-    var recent_len: usize = 0;
-    for (self.items.items, 0..) |item, i| {
-        if (item.rank == 0) continue;
-        // Insert into the top list, highest rank first.
-        var pos = recent_len;
-        while (pos > 0 and self.items.items[recent[pos - 1]].rank < item.rank) pos -= 1;
-        if (pos >= max_recent) continue;
-        const end = @min(recent_len, max_recent - 1);
-        var k = end;
-        while (k > pos) : (k -= 1) recent[k] = recent[k - 1];
-        recent[pos] = i;
-        recent_len = @min(recent_len + 1, max_recent);
+    switch (self.page) {
+        .root => try self.listRoot(gpa),
+        .tabs => {
+            var tabs: std.ArrayList(usize) = .empty;
+            defer tabs.deinit(gpa);
+            var recency: std.ArrayList(u64) = .empty;
+            defer recency.deinit(gpa);
+            for (self.items.items, 0..) |item, i| {
+                if (item.group != .tabs) continue;
+                try tabs.append(gpa, i);
+                try recency.append(gpa, item.recency);
+            }
+            const order = try gpa.alloc(usize, tabs.items.len);
+            defer gpa.free(order);
+            model.mruOrder(recency.items, order);
+            for (order) |k| try self.rows.append(gpa, .{ .kind = .{ .item = tabs.items[k] } });
+        },
+        .new_tab, .themes => {
+            const group = self.page.group().?;
+            for (self.items.items, 0..) |item, i| {
+                if (item.group == group) try self.rows.append(gpa, .{ .kind = .{ .item = i } });
+            }
+        },
     }
-    if (recent_len > 0) {
+}
+
+fn listRoot(self: *Palette, gpa: Allocator) !void {
+    const ranks = try gpa.alloc(u64, self.items.items.len);
+    defer gpa.free(ranks);
+    for (self.items.items, ranks) |item, *rank| {
+        rank.* = if (item.current or item.group == .tabs) 0 else item.rank;
+    }
+    var top: [max_recent]usize = undefined;
+    const recent = model.recentTop(ranks, &top);
+    if (recent.len > 0) {
         try self.rows.append(gpa, .{ .kind = .{ .header = .recent } });
-        for (recent[0..recent_len]) |i| try self.rows.append(gpa, .{ .kind = .{ .item = i } });
+        for (recent) |i| try self.rows.append(gpa, .{ .kind = .{ .item = i } });
     }
 
-    for ([_]Group{ .tabs, .profiles, .commands, .settings, .themes }) |group| {
+    for ([_]Group{ .tabs, .commands, .settings }) |group| {
         var header = false;
         for (self.items.items, 0..) |item, i| {
             if (item.group != group) continue;
-            if (std.mem.indexOfScalar(usize, recent[0..recent_len], i) != null) continue;
-            if (group == .themes and !item.current) continue;
+            if (std.mem.indexOfScalar(usize, recent, i) != null) continue;
+            if (group == .tabs and item.current) continue;
             if (!header) {
                 try self.rows.append(gpa, .{ .kind = .{ .header = group } });
                 header = true;
             }
             try self.rows.append(gpa, .{ .kind = .{ .item = i } });
         }
-        if (group == .themes and self.theme_count > 0) {
-            if (!header) try self.rows.append(gpa, .{ .kind = .{ .header = group } });
-            try self.rows.append(gpa, .{ .kind = .theme_hint });
-        }
     }
 }
 
-/// The entries matching `query`: groups ordered by their best match,
-/// entries by score.
-fn listMatches(self: *Palette, gpa: Allocator, query: *const fuzzy.Query) !void {
-    var best: [group_count]?i32 = @splat(null);
-    var matched: std.ArrayList(usize) = .empty;
-    defer matched.deinit(gpa);
+/// The entries matching the filter `text`: grouped in the root, the groups
+/// and entries in the order of `model.sortMatches`. When nothing matches,
+/// the variant of the filter with two characters swapped that matches best
+/// takes its place (`query`).
+fn listMatches(self: *Palette, gpa: Allocator, text: []const u8) !void {
+    var matches: std.ArrayList(model.Match) = .empty;
+    defer matches.deinit(gpa);
+    try self.collectMatches(gpa, &self.query, &matches);
 
+    if (matches.items.len == 0) {
+        var variants: model.Transpositions = .init(text);
+        var best: ?struct { query: fuzzy.Query, top: i32 } = null;
+        while (variants.next()) |variant| {
+            const q: fuzzy.Query = .init(variant);
+            matches.clearRetainingCapacity();
+            try self.collectMatches(gpa, &q, &matches);
+            const top = topScore(matches.items) orelse continue;
+            if (best == null or top > best.?.top) best = .{ .query = q, .top = top };
+        }
+        matches.clearRetainingCapacity();
+        if (best) |b| {
+            self.query = b.query;
+            try self.collectMatches(gpa, &self.query, &matches);
+        }
+    }
+
+    self.promoteInputMatch(text, matches.items);
+    model.sortMatches(matches.items);
+
+    const headers = self.page == .root;
+    var group: ?u8 = null;
+    for (matches.items) |m| {
+        if (headers and group != m.group) {
+            try self.rows.append(gpa, .{ .kind = .{ .header = @enumFromInt(m.group) } });
+            group = m.group;
+        }
+        try self.rows.append(gpa, .{ .kind = .{ .item = m.index } });
+    }
+}
+
+/// Score the entries of the page against `query` (the title and the
+/// English one; on a page of its own, the name), keeping the score and
+/// whether English matched better in each entry.
+fn collectMatches(self: *Palette, gpa: Allocator, query: *const fuzzy.Query, out: *std.ArrayList(model.Match)) !void {
+    const only = self.page.group();
+    var buf: fuzzy.Buffer = undefined;
     for (self.items.items, 0..) |*item, i| {
-        const translated = fuzzy.score(query, item.title);
-        const english = if (std.mem.eql(u8, item.title, item.title_en)) null else fuzzy.score(query, item.title_en);
-        const score = maxScore(translated, english) orelse continue;
-        item.score = score + @as(i32, @intCast(@min(item.frecency / 8, 24)));
-        const g = @intFromEnum(item.group);
-        best[g] = if (best[g]) |b| @max(b, item.score) else item.score;
-        try matched.append(gpa, i);
-    }
-
-    const Context = struct {
-        items: []const Item,
-        best: *const [group_count]?i32,
-
-        fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-            const ia = ctx.items[a];
-            const ib = ctx.items[b];
-            if (ia.group != ib.group) {
-                const ba = ctx.best[@intFromEnum(ia.group)].?;
-                const bb = ctx.best[@intFromEnum(ib.group)].?;
-                if (ba != bb) return ba > bb;
-                return @intFromEnum(ia.group) < @intFromEnum(ib.group);
-            }
-            if (ia.score != ib.score) return ia.score > ib.score;
-            // Equal matches: the shorter title first (it matches more of
-            // it), except for themes, which stay in name order.
-            if (ia.group != .themes and ia.title.len != ib.title.len) return ia.title.len < ib.title.len;
-            return a < b;
+        if (only) |g| if (item.group != g) continue;
+        const text = if (only != null) item.name else item.title;
+        const text_en = if (only != null) item.name_en else item.title_en;
+        const p = buf.prepare(text);
+        const len: u32 = @intCast(p.cps.len);
+        const translated = fuzzy.scorePrepared(query, &p);
+        var english: ?i32 = null;
+        var len_en: u32 = len;
+        if (!std.mem.eql(u8, text, text_en)) {
+            const pe = buf.prepare(text_en);
+            len_en = @intCast(pe.cps.len);
+            english = fuzzy.scorePrepared(query, &pe);
         }
-    };
-    std.mem.sort(usize, matched.items, Context{ .items = self.items.items, .best = &best }, Context.lessThan);
-
-    var group: ?Group = null;
-    for (matched.items) |i| {
-        const item_group = self.items.items[i].group;
-        if (group != item_group) {
-            try self.rows.append(gpa, .{ .kind = .{ .header = item_group } });
-            group = item_group;
-        }
-        try self.rows.append(gpa, .{ .kind = .{ .item = i } });
+        const by_english = english != null and (translated == null or english.? > translated.?);
+        const score = (if (by_english) english else translated) orelse continue;
+        item.english = by_english;
+        item.score = score + item.bonus;
+        try out.append(gpa, .{
+            .index = @intCast(i),
+            .order = if (self.page == .tabs) std.math.maxInt(u64) - item.recency else i,
+            .group = @intFromEnum(item.group),
+            .score = item.score,
+            .len = if (by_english) len_en else len,
+        });
     }
 }
 
-fn maxScore(a: ?i32, b: ?i32) ?i32 {
-    if (a) |x| return if (b) |y| @max(x, y) else x;
-    return b;
+fn topScore(matches: []const model.Match) ?i32 {
+    var top: ?i32 = null;
+    for (matches) |m| top = if (top) |t| @max(t, m.score) else m.score;
+    return top;
+}
+
+/// The entry picked most often after typing `text` (`History.inputMatch`)
+/// comes first.
+fn promoteInputMatch(self: *Palette, text: []const u8, matches: []model.Match) void {
+    const hash = history.inputMatch(text) orelse return;
+    const top = topScore(matches) orelse return;
+    for (matches) |*m| {
+        const item = &self.items.items[m.index];
+        if (item.key.len == 0 or gx.palette_history.keyHash(item.key) != hash) continue;
+        m.score = top + 1;
+        item.score = m.score;
+        return;
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -714,8 +1000,51 @@ fn nextItemRow(self: *const Palette, start: usize, dir: i32) ?usize {
     return null;
 }
 
+fn lastItemRow(self: *const Palette) ?usize {
+    if (self.rows.items.len == 0) return null;
+    return self.nextItemRow(self.rows.items.len - 1, -1);
+}
+
+/// The row a new filter selects: the first entry; without a filter the
+/// current theme on the theme page, and the previous tab in the tab
+/// switcher.
+fn initialRow(self: *const Palette) ?usize {
+    const first = self.nextItemRow(0, 1) orelse return null;
+    if (!self.query.isEmpty()) return first;
+    switch (self.page) {
+        .themes => for (self.rows.items, 0..) |row, i| switch (row.kind) {
+            .item => |index| if (self.items.items[index].current) return i,
+            .header => {},
+        },
+        .tabs => return self.nextItemRow(first + 1, 1) orelse first,
+        .root, .new_tab => {},
+    }
+    return first;
+}
+
+fn selectedItem(self: *const Palette) ?*Item {
+    const row = self.selected orelse return null;
+    if (!self.isItemRow(row)) return null;
+    return &self.items.items[self.rows.items[row].kind.item];
+}
+
+/// The list below the filter and above the footer, in DIPs.
+fn listView(self: *const Palette) d2d.Rect {
+    const size = self.popup.sizeDip();
+    return .{
+        .x = 0,
+        .y = layout.list_top,
+        .w = size.width,
+        .h = @max(0, size.height - layout.list_top - layout.footer_height),
+    };
+}
+
+/// The height of the list once the popup has the size of its rows
+/// (`bounds`), which it gets after a new filter.
 fn viewHeight(self: *Palette) f32 {
-    return @max(0, self.popup.sizeDip().height - layout.list_top);
+    const rect = self.bounds() orelse return self.listView().h;
+    const height = style.dip(rect.bottom - rect.top, self.surface().parent_window.scale);
+    return @max(0, height - layout.list_top - layout.footer_height);
 }
 
 fn maxScroll(self: *Palette) f32 {
@@ -740,13 +1069,25 @@ fn reveal(self: *Palette, row: usize) void {
     }
 }
 
+/// Scroll `row` to the middle of the list.
+fn center(self: *Palette, row: usize) void {
+    const r = self.rows.items[row];
+    self.scrollTo(r.y + r.h / 2 - self.viewHeight() / 2);
+}
+
+/// The row under the pointer, after the pointer or the list moved.
+fn updateHover(self: *Palette) void {
+    self.hover = if (self.mouse) |pos| self.rowAt(pos) else null;
+}
+
 fn select(self: *Palette, row: ?usize) void {
     const r = row orelse return;
     self.selected = r;
     self.reveal(r);
+    self.updateHover();
     self.popup.invalidate();
     self.preview_gate.navigated();
-    self.schedulePreview();
+    self.schedulePreview(.navigation);
 }
 
 /// Move the selection by `delta` entries, wrapping around at the ends.
@@ -759,13 +1100,8 @@ fn move(self: *Palette, delta: i32) void {
     self.select(next);
 }
 
-fn lastItemRow(self: *const Palette) ?usize {
-    if (self.rows.items.len == 0) return null;
-    return self.nextItemRow(self.rows.items.len - 1, -1);
-}
-
 /// Move the selection by about one view height.
-fn page(self: *Palette, dir: i32) void {
+fn pageBy(self: *Palette, dir: i32) void {
     const current = self.selected orelse return;
     const target_y = self.rows.items[current].y + @as(f32, @floatFromInt(dir)) * (self.viewHeight() - layout.item_height);
     var best = current;
@@ -781,30 +1117,75 @@ fn page(self: *Palette, dir: i32) void {
     self.select(best);
 }
 
-/// The item row at `pos` (DIPs in the popup), if any.
-fn rowAt(self: *Palette, pos: d2d.Point) ?usize {
-    if (pos.y < layout.list_top or pos.x < 0 or pos.x >= self.popup.sizeDip().width) return null;
-    const y = pos.y - layout.list_top + self.scroll;
+/// The item row at `pos` (DIPs in the popup), if any; not over the scroll
+/// indicator of a list that scrolls.
+fn rowAt(self: *const Palette, pos: d2d.Point) ?usize {
+    const view = self.listView();
+    if (!view.contains(pos)) return null;
+    if (self.content_height > view.h and controls.ScrollIndicator.track(view).contains(pos)) return null;
+    const y = pos.y - view.y + self.scroll;
     for (self.rows.items, 0..) |row, i| {
         if (y >= row.y and y < row.y + row.h) return if (row.kind == .item) i else null;
     }
     return null;
 }
 
+/// Show `next` instead of the current page, with an empty filter. Leaving
+/// the theme page ends its preview.
+fn setPage(self: *Palette, next: Page) void {
+    if (self.page == .themes and next != .themes) self.endPreview(true);
+    self.page = next;
+    self.popup.input.clear();
+    self.scrollbar.release();
+    self.refilter(.navigation);
+    self.reposition();
+    self.updateHover();
+    self.popup.invalidate();
+}
+
 // -----------------------------------------------------------------------
 // Running entries
 // -----------------------------------------------------------------------
 
-fn runSelected(self: *Palette) void {
+fn runSelected(self: *Palette, how: model.EnterAction) void {
     const row = self.selected orelse return;
     if (!self.isItemRow(row)) return;
-    self.run(self.rows.items[row].kind.item);
+    self.run(self.rows.items[row].kind.item, how);
 }
 
-/// Close the palette and run entry `index`.
-fn run(self: *Palette, index: usize) void {
+/// Run entry `index`: open its page, or close the palette and perform it.
+/// `how` is `.new_window` to open a launch profile in a new window and
+/// `.keep_open` to apply a theme with the palette open.
+fn run(self: *Palette, index: usize, how: model.EnterAction) void {
     const item = self.items.items[index];
-    history.record(item.key);
+    switch (item.target) {
+        .page => |next| {
+            self.remember(item);
+            self.setPage(next);
+            return;
+        },
+        .command => |action| if (opensTabSwitcher(action)) {
+            self.remember(item);
+            self.setPage(.tabs);
+            return;
+        },
+        .theme => |theme| if (how == .keep_open) {
+            self.remember(item);
+            self.applyKeepOpen(index, theme.name);
+            return;
+        },
+        .clear_history => {
+            const window = self.surface().parent_window;
+            self.close(true);
+            history.clear();
+            commitHistory(self.alloc());
+            window.showToast(.{ .text = i18n.tr("Cleared the recently used entries."), .icon = d2d.icons.completed });
+            return;
+        },
+        else => {},
+    }
+
+    self.remember(item);
     const s = self.surface();
     const window = s.parent_window;
     const app = s.app;
@@ -823,44 +1204,106 @@ fn run(self: *Palette, index: usize) void {
             window.selectTabIndex(i);
             window.invalidateTabBar();
         },
-        .profile => |id| _ = app.openProfile(window, id, .tab),
+        .profile => |id| _ = app.openProfile(window, id, if (how == .new_window) .window else .tab),
         .settings => |section| _ = Settings.showSection(window, section),
-        .language => |language| saveSetting(window, "language", language.configValue()),
-        .theme => |name| saveSetting(window, "theme", name),
+        .language => |language| _ = saveSetting(window, "language", language.configValue()),
+        .theme => |theme| _ = saveSetting(window, "theme", theme.name),
+        .page, .clear_history => {},
     }
 }
 
+/// Save theme `index` as the theme and keep the palette open on it.
+fn applyKeepOpen(self: *Palette, index: usize, name: []const u8) void {
+    const window = self.surface().parent_window;
+    self.endPreview(false);
+    if (!saveSetting(window, "theme", name)) return;
+    for (self.items.items, 0..) |*item, i| {
+        if (item.group != .themes) continue;
+        item.current = i == index;
+        item.detail = if (item.current) i18n.tr("Current Theme") else "";
+    }
+    if (!self.active) return;
+    self.popup.applyTheme(self.tokens());
+    self.popup.invalidate();
+}
+
+/// Remember a pick of `item` and what was typed before it.
+fn remember(self: *Palette, item: Item) void {
+    if (item.key.len == 0) return;
+    history.record(item.key, unixNow());
+    const typed = self.filterText();
+    if (typed.len > 0) history.recordInput(typed, item.key);
+    commitHistory(self.alloc());
+}
+
+/// Shift+Delete: forget the selected entry when it is remembered. Returns
+/// whether it was.
+fn forgetSelected(self: *Palette) bool {
+    const row = self.selected orelse return false;
+    const item = self.selectedItem() orelse return false;
+    if (item.key.len == 0 or item.rank == 0) return false;
+    history.remove(item.key);
+    commitHistory(self.alloc());
+    item.rank = 0;
+    item.bonus = 0;
+    const scroll = self.scroll;
+    self.refilter(.navigation);
+    // Keep the selection where it was, on the entry now there.
+    self.selected = self.nextItemRow(@min(row, self.rows.items.len -| 1), 1) orelse self.lastItemRow();
+    self.scrollTo(scroll);
+    if (self.selected) |r| self.reveal(r);
+    self.updateHover();
+    self.reposition();
+    self.popup.invalidate();
+    return true;
+}
+
 /// Write `key = value` to `gui-settings.ghostty` and reload the
-/// configuration, like the settings UI does.
-fn saveSetting(window: *Window, key: []const u8, value: []const u8) void {
+/// configuration, like the settings UI does. Returns whether it was saved;
+/// a toast tells why not.
+fn saveSetting(window: *Window, key: []const u8, value: []const u8) bool {
     const alloc_ = window.app.core_app.alloc;
     const path = gx.config_layers.overlayPath(alloc_) catch |err| {
         log.err("cannot locate {s} err={}", .{ gx.gui_settings.file_name, err });
-        return;
+        showSaveError(window, err);
+        return false;
     };
     defer alloc_.free(path);
     var changes: gx.settings_map.Changes = .init(alloc_);
     defer changes.deinit();
-    changes.set(key, value) catch return;
+    changes.set(key, value) catch |err| {
+        showSaveError(window, err);
+        return false;
+    };
     changes.commit(alloc_, global.io(), path) catch |err| {
         log.err("cannot save {s} err={}", .{ path, err });
-        return;
+        showSaveError(window, err);
+        return false;
     };
     window.performBindingAction(.reload_config);
+    return true;
+}
+
+fn showSaveError(window: *Window, err: anyerror) void {
+    var buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    i18n.format(&writer, i18n.tr("Could not save the settings: {reason}"), .{
+        .reason = i18n.trRuntime(gx.settings_map.errorReason(err)),
+    }) catch {};
+    window.showToast(.{ .text = writer.buffered(), .icon = d2d.icons.warning });
 }
 
 // -----------------------------------------------------------------------
 // Theme preview
 // -----------------------------------------------------------------------
 
-/// The theme of the selected entry, if it is one other than the saved
-/// theme.
+/// The theme of the selected entry on the theme page, if it is one other
+/// than the saved theme.
 fn selectedTheme(self: *Palette) ?[]const u8 {
-    const row = self.selected orelse return null;
-    if (!self.isItemRow(row)) return null;
-    const item = &self.items.items[self.rows.items[row].kind.item];
+    if (self.page != .themes) return null;
+    const item = self.selectedItem() orelse return null;
     return switch (item.target) {
-        .theme => |name| if (item.current) null else name,
+        .theme => |theme| if (item.current) null else theme.name,
         else => null,
     };
 }
@@ -882,13 +1325,13 @@ fn sameTheme(a: ?[]const u8, b: ?[]const u8) bool {
 
 /// Preview the selected theme in the terminals once the selection rests
 /// on it, or show the saved theme again when it moved off the themes.
-fn schedulePreview(self: *Palette) void {
+fn schedulePreview(self: *Palette, cause: model.PreviewCause) void {
     const hwnd = self.popup.hwnd orelse return;
     if (!self.active or sameTheme(self.wantedTheme(), self.previewTheme())) {
         _ = w32.KillTimer(hwnd, preview_timer_id);
         return;
     }
-    _ = w32.SetTimer(hwnd, preview_timer_id, preview_delay_ms, @ptrCast(&previewTimer));
+    _ = w32.SetTimer(hwnd, preview_timer_id, model.previewDelayMs(cause), @ptrCast(&previewTimer));
 }
 
 fn previewTimer(hwnd: w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void {
@@ -939,7 +1382,7 @@ fn applyTheme(self: *Palette, theme: ?[]const u8) void {
         self.preview_len = null;
     }
     if (self.active) {
-        self.popup.setBorderColor(self.tokens().border);
+        self.popup.applyTheme(self.tokens());
         self.popup.invalidate();
     }
 }
@@ -997,10 +1440,14 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
     return self.keyPress(key, false);
 }
 
-/// Handle a key press: navigation, running and closing, editing chords
-/// for the filter and the chords bound to actions. `routed` is true when
-/// the app's message loop asks first (`handleKey`) and false when the
-/// popup's window procedure asks.
+fn modelKey(key: Popup.Key) model.Key {
+    return .{ .vk = key.vk, .ctrl = key.ctrl, .shift = key.shift, .alt = key.alt };
+}
+
+/// Handle a key press: navigation, running and closing, the pages, and the
+/// chords bound to actions; editing keys go to the filter. `routed` is
+/// true when the app's message loop asks first (`handleKey`) and false
+/// when the popup's window procedure asks.
 fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
     if (!self.active or key.vk == w32.VK_PROCESSKEY) return false;
     const plain = !key.ctrl and !key.alt;
@@ -1010,8 +1457,11 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
             return true;
         },
         w32.VK_RETURN => {
-            self.runSelected();
-            return true;
+            const how = model.enterAction(modelKey(key));
+            if (how != .none) {
+                self.runSelected(how);
+                return true;
+            }
         },
         w32.VK_UP, w32.VK_DOWN => if (!key.alt) {
             self.move(if (key.vk == w32.VK_UP) -1 else 1);
@@ -1022,7 +1472,7 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
             return true;
         },
         w32.VK_PRIOR, w32.VK_NEXT => if (!key.alt) {
-            self.page(if (key.vk == w32.VK_PRIOR) -1 else 1);
+            self.pageBy(if (key.vk == w32.VK_PRIOR) -1 else 1);
             return true;
         },
         w32.VK_HOME => if (!key.shift and !key.alt) {
@@ -1032,15 +1482,19 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
         w32.VK_END => if (!key.shift and !key.alt) {
             self.select(self.lastItemRow());
             self.scrollTo(self.maxScroll());
+            self.updateHover();
             return true;
         },
         'P', 'N' => if (key.ctrl and !key.shift and !key.alt) {
             self.move(if (key.vk == 'P') -1 else 1);
             return true;
         },
-        w32.VK_BACK => if (key.ctrl and !key.alt) {
-            self.deleteWordBack();
+        w32.VK_BACK => if (plain and self.page != .root and self.filterEmpty()) {
+            self.setPage(.root);
             return true;
+        },
+        w32.VK_DELETE => if (key.shift and plain) {
+            if (self.forgetSelected()) return true;
         },
         w32.VK_F4 => if (key.alt and !key.ctrl) {
             // Alt+F4 closes the window, not just the palette.
@@ -1053,14 +1507,19 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
     }
     if (plain) return false;
 
-    // Ctrl+A/C/V/X/Y/Z edit the filter; the app never bubbles them.
-    if (key.ctrl and !key.shift and !key.alt and isEditVk(key.vk)) return false;
+    // Ctrl+Backspace, Ctrl+arrows, the clipboard and undo edit the filter;
+    // the app never bubbles them.
+    if (model.isEditChord(modelKey(key))) return false;
 
     const mods: input.Mods = .{ .ctrl = key.ctrl, .shift = key.shift, .alt = key.alt };
     const action = trigger.actionForKey(self.keybindSet(), key.vk, mods) orelse {
         // Unbound chords do nothing here instead of reaching the terminal.
         return true;
     };
+    if (opensTabSwitcher(action)) {
+        if (self.page == .tabs) self.close(true) else self.setPage(.tabs);
+        return true;
+    }
     switch (action) {
         .toggle_command_palette => {
             self.close(true);
@@ -1086,27 +1545,10 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
     }
 }
 
-fn isEditVk(vk: u16) bool {
-    return switch (vk) {
-        'A', 'C', 'V', 'X', 'Y', 'Z' => true,
-        else => false,
-    };
-}
-
-/// Ctrl+Backspace: delete the selection, else the word before the caret.
-fn deleteWordBack(self: *Palette) void {
+/// Whether the filter is empty, with no composition in progress.
+fn filterEmpty(self: *const Palette) bool {
     const in = &self.popup.input;
-    var start = @min(in.anchor, in.caret);
-    const end = @max(in.anchor, in.caret);
-    if (start == end) {
-        while (start > 0 and in.buf.items[start - 1] == ' ') start -= 1;
-        while (start > 0 and in.buf.items[start - 1] != ' ') start -= 1;
-    }
-    if (start == end) return;
-    in.buf.replaceRangeAssumeCapacity(start, end - start, &.{});
-    in.caret = start;
-    in.anchor = start;
-    self.textChanged();
+    return in.buf.items.len == 0 and in.composition.items.len == 0;
 }
 
 fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
@@ -1115,44 +1557,114 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
     self.textChanged();
 }
 
+/// An input method composes: filter with the composition as well.
+fn onCompositionChanged(ctx: *anyopaque, popup: *Popup) void {
+    const self: *Palette = @ptrCast(@alignCast(ctx));
+    if (adoptShown(popup)) self.active = true;
+    self.textChanged();
+}
+
 fn textChanged(self: *Palette) void {
     if (!self.active) return;
-    self.refilter();
+    self.refilter(.typing);
     self.reposition();
+    self.updateHover();
     self.popup.invalidate();
+}
+
+/// How a click runs an entry: with Ctrl in a new window, with Shift
+/// keeping the palette open, like Enter.
+fn clickAction() model.EnterAction {
+    const how = model.enterAction(.{
+        .vk = w32.VK_RETURN,
+        .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
+        .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
+    });
+    return if (how == .none) .run else how;
 }
 
 fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
     const self: *Palette = @ptrCast(@alignCast(ctx));
     if (adoptShown(popup)) self.active = true;
+    const view = self.listView();
     switch (event.kind) {
         .move => {
+            self.mouse = event.pos;
+            if (self.scrollbar.dragging()) {
+                if (w32.GetKeyState(vk_lbutton) < 0) {
+                    if (self.scrollbar.drag(view, self.content_height, view.h, event.pos)) |offset| {
+                        self.scrollTo(offset);
+                        popup.invalidate();
+                    }
+                    return;
+                }
+                // The button went up elsewhere (the capture was taken).
+                self.scrollbar.release();
+            }
+            var changed = self.content_height > view.h and self.scrollbar.updateHover(view, event.pos);
             const row = self.rowAt(event.pos);
             if (row != self.hover) {
                 self.hover = row;
-                popup.invalidate();
+                changed = true;
             }
+            const back = if (self.back_rect) |r| r.contains(event.pos) else false;
+            if (back != self.back_hover) {
+                self.back_hover = back;
+                changed = true;
+            }
+            if (changed) popup.invalidate();
         },
-        .leave => if (self.hover != null) {
+        .leave => {
+            self.mouse = null;
+            if (self.scrollbar.dragging()) return;
             self.hover = null;
+            self.back_hover = false;
+            self.scrollbar.hover = false;
             popup.invalidate();
         },
         .down => if (event.button == .left) {
-            self.pressed = self.rowAt(event.pos);
+            if (self.scrollbar.press(view, self.content_height, view.h, self.scroll, event.pos)) |offset| {
+                self.scrollTo(offset);
+                self.updateHover();
+                if (popup.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
+                popup.invalidate();
+                return;
+            }
+            if (self.back_rect) |r| if (r.contains(event.pos)) {
+                self.pressed = .back;
+                popup.invalidate();
+                return;
+            };
+            if (self.rowAt(event.pos)) |row| {
+                self.pressed = .{ .row = row };
+                popup.invalidate();
+            }
         },
         .up => if (event.button == .left) {
-            const row = self.rowAt(event.pos);
-            const pressed = self.pressed;
+            if (self.scrollbar.dragging()) {
+                self.scrollbar.release();
+                if (popup.hwnd) |hwnd| if (w32.GetCapture() == hwnd) {
+                    _ = w32.ReleaseCapture();
+                };
+                popup.invalidate();
+                return;
+            }
+            const pressed = self.pressed orelse return;
             self.pressed = null;
-            if (row != null and row == pressed) {
-                self.selected = row;
-                self.run(self.rows.items[row.?].kind.item);
+            popup.invalidate();
+            switch (pressed) {
+                .back => if (self.back_rect) |r| if (r.contains(event.pos)) self.setPage(.root),
+                .row => |row| if (self.rowAt(event.pos)) |at| if (at == row) {
+                    self.selected = row;
+                    self.run(self.rows.items[row].kind.item, clickAction());
+                },
             }
         },
         .double_click => {},
         .wheel => {
             self.scrollTo(self.scroll - event.wheel * layout.wheel_step);
-            self.hover = self.rowAt(event.pos);
+            self.mouse = event.pos;
+            self.updateHover();
             popup.invalidate();
         },
     }
@@ -1163,6 +1675,8 @@ fn onDismissed(ctx: *anyopaque, _: *Popup, reason: Popup.DismissReason) void {
     self.active = false;
     self.hover = null;
     self.pressed = null;
+    self.mouse = null;
+    self.scrollbar = .{};
     self.endPreview(true);
     // Clicking elsewhere moved the focus already.
     if (reason != .deactivated and reason != .outside_click) self.focusSurface();
@@ -1177,121 +1691,441 @@ fn onPopupDpiChanged(ctx: *anyopaque, _: *Popup) void {
 // Painting
 // -----------------------------------------------------------------------
 
+/// How a row is drawn.
+const RowState = enum { normal, hover, pressed, selected, selected_pressed };
+
+/// The colors of a row in one state: its fill and what is drawn on it.
+/// Text on the fill contrasts at least 4.5:1 with it, the icon, the
+/// selection indicator and marks 3:1; in high contrast the system colors
+/// stay as they are.
+const RowColors = struct {
+    fill: ?d2d.Color,
+    text: d2d.Color,
+    secondary: d2d.Color,
+    /// Matched characters and the current tab or theme.
+    accent: d2d.Color,
+    icon: d2d.Color,
+    /// The selection indicator and the dot of a tab with new output.
+    mark: d2d.Color,
+    indicator: bool,
+
+    fn of(t: style.Tokens, state: RowState) RowColors {
+        const selected = state == .selected or state == .selected_pressed;
+        if (t.high_contrast) {
+            if (state == .normal) return .{
+                .fill = null,
+                .text = t.text,
+                .secondary = t.text_secondary,
+                .accent = t.accent_text,
+                .icon = t.text_secondary,
+                .mark = t.accent,
+                .indicator = false,
+            };
+            return .{
+                .fill = t.selected,
+                .text = t.selected_text,
+                .secondary = t.selected_text,
+                .accent = t.selected_text,
+                .icon = t.selected_text,
+                .mark = t.selected_text,
+                .indicator = selected,
+            };
+        }
+        const fill: ?d2d.Color = switch (state) {
+            .normal => null,
+            .hover => t.hover,
+            .pressed => t.pressed,
+            .selected => t.selected,
+            .selected_pressed => style.mix(t.selected, t.surface_raised, 0.3),
+        };
+        const bg = fill orelse t.surface_raised;
+        const text = switch (state) {
+            .normal => t.text,
+            .hover, .pressed => t.hover_text,
+            .selected, .selected_pressed => t.selected_text,
+        };
+        return .{
+            .fill = fill,
+            .text = ui_color.ensureContrast(text, bg, floor.text),
+            .secondary = ui_color.ensureContrast(t.text_secondary, bg, floor.text),
+            .accent = ui_color.ensureContrast(t.accent_text, bg, floor.text),
+            .icon = ui_color.ensureContrast(if (selected) t.accent else t.text_secondary, bg, floor.non_text),
+            .mark = ui_color.ensureContrast(t.accent, bg, floor.non_text),
+            .indicator = selected,
+        };
+    }
+
+    /// The fill under the row's text.
+    fn background(self: RowColors, t: style.Tokens) d2d.Color {
+        return self.fill orelse t.surface_raised;
+    }
+};
+
+const Palettes = std.EnumArray(RowState, RowColors);
+
+fn rowColors(t: style.Tokens) Palettes {
+    var out: Palettes = undefined;
+    for (std.enums.values(RowState)) |state| out.set(state, .of(t, state));
+    return out;
+}
+
+fn rowState(self: *const Palette, row: usize) RowState {
+    const pressed = if (self.pressed) |p| switch (p) {
+        .row => |r| r == row and self.hover == row,
+        .back => false,
+    } else false;
+    if (self.selected == row) return if (pressed) .selected_pressed else .selected;
+    if (pressed) return .pressed;
+    if (self.hover == row) return .hover;
+    return .normal;
+}
+
 fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     const self: *Palette = @ptrCast(@alignCast(ctx));
     const t = self.tokens();
     const size = popup.sizeDip();
     canvas.fillRect(.{ .x = 0, .y = 0, .w = size.width, .h = size.height }, t.surface_raised);
 
+    // A page's back button, then the filter.
+    var input_x = layout.pad;
+    self.back_rect = null;
+    if (self.page != .root) {
+        const back = self.backRect(canvas);
+        self.paintBack(canvas, back, t);
+        self.back_rect = back;
+        input_x = back.x + back.w + style.space.xs;
+    }
     popup.drawTextInput(canvas, .{
-        .x = layout.pad,
+        .x = input_x,
         .y = layout.pad,
-        .w = size.width - 2 * layout.pad,
+        .w = @max(0, size.width - input_x - layout.pad),
         .h = layout.input_height,
-    }, t, i18n.tr("Type a command…"));
-    canvas.fillRect(.{ .x = 0, .y = layout.list_top - 1, .w = size.width, .h = 1 }, t.border);
+    }, t, self.page.placeholder());
+    controls.hairline(canvas, 0, layout.list_top - canvas.hairline(), size.width, t);
 
-    const view: d2d.Rect = .{ .x = 0, .y = layout.list_top, .w = size.width, .h = @max(0, size.height - layout.list_top) };
-    canvas.pushClip(view);
-    defer canvas.popClip();
-
-    if (self.rows.items.len == 0) {
-        canvas.drawText(i18n.tr("No results"), view, .{
-            .size = style.font_size.body,
-            .color = t.text_secondary,
-            .align_x = .center,
-        });
-        return;
-    }
-
-    const scale = popup.scale();
+    const view = self.listView();
     const chips = trigger.ChipColors.fromTokens(t);
-    for (self.rows.items, 0..) |row, i| {
-        const y = snap(view.y + row.y - self.scroll, scale);
-        if (y + row.h < view.y) continue;
-        if (y > view.y + view.h) break;
-        const rect: d2d.Rect = .{ .x = layout.pad, .y = y, .w = view.w - 2 * layout.pad, .h = row.h };
-        switch (row.kind) {
-            .header => |group| paintHeader(canvas, rect, group, t),
-            .theme_hint => self.paintThemeHint(canvas, rect, t),
-            .item => |index| self.paintItem(canvas, rect, i, &self.items.items[index], t, chips),
+    canvas.pushClip(view);
+    if (self.rows.items.len == 0) {
+        self.paintEmpty(canvas, view, t);
+    } else {
+        const scale = popup.scale();
+        const colors = rowColors(t);
+        for (self.rows.items, 0..) |row, i| {
+            const y = style.snap(view.y + row.y - self.scroll, scale);
+            if (y + row.h < view.y) continue;
+            if (y > view.y + view.h) break;
+            const rect: d2d.Rect = .{ .x = layout.pad, .y = y, .w = view.w - 2 * layout.pad, .h = row.h };
+            switch (row.kind) {
+                .header => |group| paintHeader(canvas, rect, group, t),
+                .item => |index| self.paintItem(canvas, rect, &self.items.items[index], colors.get(self.rowState(i)), chips, t),
+            }
         }
+        self.scrollbar.draw(canvas, view, self.content_height, view.h, self.scroll, t);
     }
-    self.paintScrollbar(canvas, view, t);
+    canvas.popClip();
+
+    self.paintFooter(canvas, .{
+        .x = 0,
+        .y = size.height - layout.footer_height,
+        .w = size.width,
+        .h = layout.footer_height,
+    }, chips, t);
 }
 
-fn snap(v: f32, scale: f32) f32 {
-    return @round(v * scale) / scale;
+const back_label_style: d2d.TextStyle = .{ .size = style.font_size.body, .ellipsis = false };
+
+/// The back button of a page: a chevron and the page's title, left of the
+/// filter.
+fn backRect(self: *const Palette, canvas: *d2d.Canvas) d2d.Rect {
+    const label_w = canvas.measureTextCeil(self.page.title(), back_label_style, 400).width;
+    return .{
+        .x = layout.pad,
+        .y = layout.pad,
+        .w = style.space.s + style.icon.small + style.space.s + label_w + style.space.m,
+        .h = layout.input_height,
+    };
+}
+
+fn paintBack(self: *const Palette, canvas: *d2d.Canvas, rect: d2d.Rect, t: style.Tokens) void {
+    const pressed = if (self.pressed) |p| p == .back and self.back_hover else false;
+    const state: controls.State = .{ .hover = self.back_hover, .pressed = pressed };
+    const colors = controls.buttonColors(.subtle, state, t);
+    const r = canvas.snapRect(rect);
+    if (colors.fill) |fill| canvas.fillRoundedRect(r, style.radius.control, fill);
+    if (colors.border) |border| canvas.strokeRoundedRectPx(r, style.radius.control, border, 1);
+    const glyph_x = r.x + style.space.s;
+    canvas.drawIcon(icons.back, .{ .x = glyph_x, .y = r.y, .w = style.icon.small, .h = r.h }, style.icon.small, colors.text);
+    var label = back_label_style;
+    label.color = colors.text;
+    const text_x = glyph_x + style.icon.small + style.space.s;
+    canvas.drawText(self.page.title(), .{ .x = text_x, .y = r.y, .w = @max(0, r.x + r.w - text_x), .h = r.h }, label);
 }
 
 fn paintHeader(canvas: *d2d.Canvas, rect: d2d.Rect, group: Group, t: style.Tokens) void {
-    canvas.drawText(group.title(), .{ .x = rect.x + 12, .y = rect.y + 6, .w = rect.w - 24, .h = rect.h - 6 }, .{
+    const text_y = rect.y + style.space.s;
+    canvas.drawText(group.title(), .{ .x = rect.x + layout.icon_x, .y = text_y, .w = rect.w - 2 * layout.icon_x, .h = rect.y + rect.h - text_y }, .{
         .size = style.font_size.caption,
         .weight = .semibold,
         .color = t.text_secondary,
     });
 }
 
-fn paintThemeHint(self: *Palette, canvas: *d2d.Canvas, rect: d2d.Rect, t: style.Tokens) void {
-    var buf: [128]u8 = undefined;
+/// The no-results message, naming the filter; in Chinese, a hint to try
+/// English or pinyin initials.
+fn paintEmpty(self: *const Palette, canvas: *d2d.Canvas, view: d2d.Rect, t: style.Tokens) void {
+    var buf: [192]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    i18n.format(&writer, i18n.tr("Type to search {count} themes…"), .{ .count = self.theme_count }) catch {};
-    canvas.drawText(writer.buffered(), .{ .x = rect.x + layout.text_x, .y = rect.y, .w = rect.w - layout.text_x - 12, .h = rect.h }, .{
-        .size = style.font_size.caption,
-        .color = t.text_disabled,
+    const filter = self.filterText();
+    if (filter.len == 0) {
+        writer.writeAll(i18n.tr("No results")) catch {};
+    } else {
+        var cut: [96]u8 = undefined;
+        i18n.format(&writer, i18n.tr("No results for “{query}”"), .{ .query = cutText(&cut, filter) }) catch {};
+    }
+    const line_h = style.type_ramp.body.line;
+    var y = view.y + style.space.l;
+    canvas.drawText(writer.buffered(), .{ .x = view.x + style.space.m, .y = y, .w = view.w - 2 * style.space.m, .h = line_h }, .{
+        .size = style.font_size.body,
+        .color = t.text_secondary,
+        .align_x = .center,
     });
+    if (filter.len == 0 or i18n.current() == .en) return;
+    y += line_h + style.space.xs;
+    canvas.drawText(i18n.tr("Try the English name or the pinyin initials."), .{
+        .x = view.x + style.space.m,
+        .y = y,
+        .w = view.w - 2 * style.space.m,
+        .h = style.type_ramp.caption.line,
+    }, .{ .size = style.font_size.caption, .color = t.text_secondary, .align_x = .center });
+}
+
+/// The start of `text` that fits `buf`, cut at a character.
+fn cutText(buf: []u8, text: []const u8) []const u8 {
+    if (text.len <= buf.len) return text;
+    var end = buf.len;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    @memcpy(buf[0..end], text[0..end]);
+    return buf[0..end];
 }
 
 fn paintItem(
     self: *Palette,
     canvas: *d2d.Canvas,
     rect: d2d.Rect,
-    row: usize,
-    item: *const Item,
-    t: style.Tokens,
+    item: *Item,
+    c: RowColors,
     chips: trigger.ChipColors,
+    t: style.Tokens,
 ) void {
-    const selected = self.selected == row;
-    const fill = rect.inset(0, 1);
-    if (selected) {
-        canvas.fillRoundedRect(fill, layout.row_radius, style.mix(t.surface_raised, t.accent, 0.16));
-        canvas.fillRoundedRect(.{ .x = fill.x, .y = fill.y + 8, .w = 2, .h = @max(0, fill.h - 16) }, 1, t.accent);
-    } else if (self.hover == row) {
-        canvas.fillRoundedRect(fill, layout.row_radius, t.hover);
+    const fill_rect = canvas.snapRect(rect.inset(0, 1));
+    if (c.fill) |fill| canvas.fillRoundedRect(fill_rect, style.radius.control, fill);
+    if (c.indicator) {
+        const bar = canvas.snapRect(controls.indicatorRect(fill_rect));
+        canvas.fillRoundedRect(bar, bar.w / 2, c.mark);
     }
 
-    canvas.drawIcon(item.icon, .{ .x = rect.x + 12, .y = rect.y, .w = layout.icon_size, .h = rect.h }, 14, if (selected) t.accent else t.text_secondary);
+    const two_line = item.english;
+    const title_h = layout.item_height;
+    const title_y = if (two_line) rect.y + style.space.xs else rect.y;
+    const icon_rect: d2d.Rect = .{ .x = rect.x + layout.icon_x, .y = title_y, .w = style.icon.standard, .h = title_h - (if (two_line) style.space.xs else 0) };
+    canvas.drawIcon(item.icon, icon_rect, style.icon.standard, c.icon);
+    if (item.unread and !item.current) {
+        const dot: f32 = 6;
+        canvas.fillRoundedRect(canvas.snapRect(.{
+            .x = icon_rect.x + icon_rect.w - dot / 2,
+            .y = icon_rect.y + icon_rect.h / 2 - style.icon.standard / 2 - dot / 4,
+            .w = dot,
+            .h = dot,
+        }), dot / 2, c.mark);
+    }
 
-    var right = rect.x + rect.w - 10;
+    // The end of the row: a theme's colors, the keycaps, a detail.
+    var right = rect.x + rect.w - style.space.m;
+    const center_y = title_y + (title_h - (if (two_line) style.space.xs else 0)) / 2;
+    if (item.target == .theme) {
+        const swatch_rect: d2d.Rect = .{ .x = right - layout.swatch_width, .y = center_y - layout.swatch_height / 2, .w = layout.swatch_width, .h = layout.swatch_height };
+        self.paintSwatch(canvas, swatch_rect, item.target.theme.index, item.target.theme.name, t);
+        right = swatch_rect.x - layout.gap;
+    }
+    const budget = rect.w * layout.end_share;
     if (item.shortcut) |shortcut| {
         const sequence = [_]input.Binding.Trigger{shortcut};
-        const w = trigger.measureSequence(canvas, &sequence);
-        if (w < rect.w / 2) {
-            _ = trigger.drawSequence(canvas, &sequence, right - w, rect.y + rect.h / 2, chips);
-            right -= w + 12;
+        const w = item.shortcut_width orelse measured: {
+            const measured = trigger.measureSequence(canvas, &sequence);
+            item.shortcut_width = measured;
+            break :measured measured;
+        };
+        if (w <= budget) {
+            _ = trigger.drawSequence(canvas, &sequence, right - w, center_y, chips);
+            right -= w + layout.gap;
+        }
+    }
+    if (item.detail.len > 0) {
+        const detail_style: d2d.TextStyle = .{
+            .size = style.font_size.caption,
+            .color = if (item.current) c.accent else c.secondary,
+            .align_x = .trailing,
+        };
+        const room = @max(0, @min(budget, right - (rect.x + layout.text_x) - 2 * layout.gap));
+        const w = @min(room, canvas.measureTextCeil(item.detail, detail_style, 10_000).width);
+        if (w > 0) {
+            canvas.drawText(item.detail, .{ .x = right - w, .y = title_y, .w = w, .h = title_h - (if (two_line) style.space.xs else 0) }, detail_style);
+            right -= w + layout.gap;
         }
     }
 
+    const own = self.page != .root;
+    const title = if (own) item.name else item.title;
     const x = rect.x + layout.text_x;
     const w = @max(0, right - x);
-    const title_style: d2d.TextStyle = .{ .size = style.font_size.body, .color = t.text };
-    if (item.description.len == 0) {
-        canvas.drawText(item.title, .{ .x = x, .y = rect.y, .w = w, .h = rect.h }, title_style);
-        return;
+    const title_rect: d2d.Rect = .{ .x = x, .y = title_y, .w = w, .h = title_h - (if (two_line) style.space.xs else 0) };
+    self.drawMatched(canvas, title, title_rect, .{ .size = style.font_size.body, .color = c.text }, c.accent);
+    if (two_line) {
+        const english = if (own) item.name_en else item.title_en;
+        const line_y = title_rect.y + title_rect.h - style.space.xs;
+        self.drawMatched(canvas, english, .{ .x = x, .y = line_y, .w = w, .h = style.type_ramp.caption.line + style.space.xs }, .{ .size = style.font_size.caption, .color = c.secondary }, c.accent);
     }
-    canvas.drawText(item.title, .{ .x = x, .y = rect.y + 6, .w = w, .h = 22 }, title_style);
-    canvas.drawText(item.description, .{ .x = x, .y = rect.y + 27, .w = w, .h = 17 }, .{
-        .size = style.font_size.caption,
-        .color = if (item.current) t.accent else t.text_secondary,
-    });
 }
 
-fn paintScrollbar(self: *Palette, canvas: *d2d.Canvas, view: d2d.Rect, t: style.Tokens) void {
-    if (self.content_height <= view.h or view.h <= 0) return;
-    const thumb_h = @max(24, view.h * view.h / self.content_height);
-    const range = view.h - thumb_h;
-    const y = view.y + range * (self.scroll / self.maxScroll());
-    canvas.fillRoundedRect(.{ .x = view.x + view.w - 5, .y = y + 2, .w = 3, .h = thumb_h - 4 }, 1.5, t.text_disabled.withAlpha(0.6));
+/// Draw `text` with the characters the query matched in `accent`,
+/// semibold.
+fn drawMatched(self: *const Palette, canvas: *d2d.Canvas, text: []const u8, rect: d2d.Rect, text_style: d2d.TextStyle, accent: d2d.Color) void {
+    if (self.query.isEmpty()) return canvas.drawText(text, rect, text_style);
+    var runs: [16]d2d.TextRun = undefined;
+    canvas.drawTextRuns(text, rect, text_style, matchRuns(&self.query, text, accent, &runs));
+}
+
+/// The runs of `text` the query matched (`fuzzy.positions`), in `color`
+/// and semibold, in `out`.
+fn matchRuns(query: *const fuzzy.Query, text: []const u8, color: d2d.Color, out: []d2d.TextRun) []d2d.TextRun {
+    var buf: fuzzy.Buffer = undefined;
+    const prepared = buf.prepare(text);
+    var matched: fuzzy.Positions = undefined;
+    _ = fuzzy.positions(query, &prepared, &matched) orelse return out[0..0];
+    var it: fuzzy.Runs = .init(text, &matched);
+    var n: usize = 0;
+    while (it.next()) |range| {
+        if (n == out.len) break;
+        out[n] = .{ .start = range.byte_start, .len = range.byte_end - range.byte_start, .color = color, .weight = .semibold };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// A theme's colors: its background with "Aa" in its foreground and six of
+/// its palette colors.
+fn paintSwatch(self: *Palette, canvas: *d2d.Canvas, rect: d2d.Rect, index: u32, name: []const u8, t: style.Tokens) void {
+    const swatch = self.swatches.get(self.alloc(), global.io(), self.theme_dirs, index, name);
+    const r = canvas.snapRect(rect);
+    canvas.fillRoundedRect(r, style.radius.control, rgb(swatch.background));
+    canvas.strokeRoundedRectPx(r, style.radius.control, t.border, 1);
+    canvas.drawText("Aa", .{ .x = r.x + 2, .y = r.y, .w = 22, .h = r.h }, .{
+        .size = 11,
+        .weight = .semibold,
+        .color = rgb(swatch.foreground),
+        .align_x = .center,
+        .ellipsis = false,
+    });
+    const dot: f32 = 6;
+    var x = r.x + 26;
+    const y = r.y + (r.h - dot) / 2;
+    for (1..7) |i| {
+        canvas.fillRoundedRect(canvas.snapRect(.{ .x = x, .y = y, .w = dot, .h = dot }), 1.5, rgb(swatch.color(i)));
+        x += dot + 1.5;
+    }
+}
+
+fn rgb(c: gx.theme_swatch.Rgb) d2d.Color {
+    return d2d.Color.rgb(c.r, c.g, c.b);
+}
+
+/// A key and what it does to the selected entry, in the footer.
+const Hint = struct {
+    trigger: input.Binding.Trigger,
+    label: []const u8,
+};
+
+/// The keys that act on the selected entry, most useful first.
+fn footerHints(self: *const Palette, item: ?*const Item, out: *[4]Hint) []Hint {
+    var n: usize = 0;
+    if (item) |it| {
+        const enter: input.Binding.Trigger = .{ .key = .{ .physical = .enter } };
+        out[n] = .{ .trigger = enter, .label = switch (it.target) {
+            .theme => i18n.tr("Apply"),
+            .tab => i18n.tr("Switch"),
+            .profile, .page => i18n.tr("Open"),
+            else => i18n.tr("Run"),
+        } };
+        n += 1;
+        switch (it.target) {
+            .profile => {
+                out[n] = .{ .trigger = .{ .key = .{ .physical = .enter }, .mods = .{ .ctrl = true } }, .label = i18n.tr("New Window") };
+                n += 1;
+            },
+            .theme => {
+                out[n] = .{ .trigger = .{ .key = .{ .physical = .enter }, .mods = .{ .shift = true } }, .label = i18n.tr("Apply Without Closing") };
+                n += 1;
+            },
+            else => {},
+        }
+        if (it.rank > 0) {
+            out[n] = .{ .trigger = .{ .key = .{ .physical = .delete }, .mods = .{ .shift = true } }, .label = i18n.tr("Remove") };
+            n += 1;
+        }
+    }
+    if (self.page != .root and self.filterEmpty() and n < out.len) {
+        out[n] = .{ .trigger = .{ .key = .{ .physical = .backspace } }, .label = i18n.tr("Back") };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// The footer: what the selected entry is (a command's description, a
+/// launch profile's command line) and the keys that act on it.
+fn paintFooter(self: *Palette, canvas: *d2d.Canvas, rect: d2d.Rect, chips: trigger.ChipColors, t: style.Tokens) void {
+    controls.hairline(canvas, rect.x, rect.y, rect.w, t);
+    const item = self.selectedItem();
+    const label_style: d2d.TextStyle = .{ .size = style.font_size.caption, .color = t.text_secondary, .ellipsis = false };
+    const center_y = rect.y + rect.h / 2;
+
+    var hint_buf: [4]Hint = undefined;
+    const all = self.footerHints(item, &hint_buf);
+    // As many hints as fit, from the most useful one.
+    var widths: [4]f32 = undefined;
+    var count: usize = 0;
+    var total: f32 = 0;
+    for (all, 0..) |hint, i| {
+        const keys = trigger.measureSequence(canvas, &.{hint.trigger});
+        const label = canvas.measureTextCeil(hint.label, label_style, 400).width;
+        const w = keys + style.space.xs + label;
+        const next = total + w + (if (i > 0) style.space.m else 0);
+        if (next > rect.w * layout.hints_share) break;
+        widths[i] = w;
+        total = next;
+        count += 1;
+    }
+    var x = rect.x + rect.w - style.space.m - total;
+    const hints_x = x;
+    for (all[0..count], widths[0..count]) |hint, w| {
+        const keys_right = trigger.drawSequence(canvas, &.{hint.trigger}, x, center_y, chips);
+        const label_x = keys_right + style.space.xs;
+        canvas.drawText(hint.label, .{ .x = label_x, .y = rect.y, .w = x + w - label_x, .h = rect.h }, label_style);
+        x += w + style.space.m;
+    }
+
+    const it = item orelse return;
+    if (it.description.len == 0) return;
+    const desc_x = rect.x + style.space.m;
+    const desc_w = hints_x - desc_x - style.space.m;
+    if (desc_w < 48) return;
+    const desc_rect: d2d.Rect = .{ .x = desc_x, .y = rect.y, .w = desc_w, .h = rect.h };
+    const desc_style: d2d.TextStyle = .{ .size = style.font_size.caption, .color = t.text_secondary };
+    if (it.target == .profile) {
+        canvas.drawTextMiddle(it.description, desc_rect, desc_style);
+    } else {
+        canvas.drawText(it.description, desc_rect, desc_style);
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1318,16 +2152,11 @@ pub fn adoptShown(popup: *Popup) bool {
     return true;
 }
 
-/// Destroy `popup`, or only free its resources when Windows destroyed
-/// its window already (the handle may belong to another window by now).
+/// Destroy `popup` and free its resources. A window Windows destroyed with
+/// its owner left `popup.hwnd` null (`WM_NCDESTROY`), so a handle that is
+/// set is the popup's own.
 pub fn releasePopup(popup: *Popup) void {
-    if (popup.hwnd == null or popupAlive(popup)) {
-        popup.destroy();
-        return;
-    }
-    if (popup.canvas) |*canvas| canvas.deinit();
-    popup.input.deinit(popup.alloc);
-    popup.* = .{};
+    popup.destroy();
 }
 
 /// Make `popup` a live popup owned by `owner`: create it, or recreate it
@@ -1352,26 +2181,161 @@ pub fn ensurePopup(
     return true;
 }
 
-/// The palette picks of the process, keyed by the English msgid or action
-/// string of the entry. Only the GUI thread uses it.
-var history: fuzzy.Frecency = .{};
+// -----------------------------------------------------------------------
+// State shared by the palettes of the process (GUI thread)
+// -----------------------------------------------------------------------
 
-test "PreviewGate previews only a selection the user chose" {
+/// The palette history (`gx.palette_history`): loaded from its state file
+/// when a palette first opens, written back after every pick or removal.
+var history: History = .{};
+var history_loaded = false;
+
+fn loadHistory(alloc_: Allocator) void {
+    if (history_loaded) return;
+    history_loaded = true;
+    const path = History.defaultPath(alloc_) catch |err| {
+        log.warn("cannot locate the palette history err={}", .{err});
+        return;
+    };
+    defer alloc_.free(path);
+    history = History.load(alloc_, global.io(), path) catch |err| {
+        log.warn("cannot read the palette history err={}", .{err});
+        return;
+    };
+}
+
+fn commitHistory(alloc_: Allocator) void {
+    const path = History.defaultPath(alloc_) catch |err| {
+        log.warn("cannot locate the palette history err={}", .{err});
+        return;
+    };
+    defer alloc_.free(path);
+    history.commit(alloc_, global.io(), path) catch |err| {
+        log.warn("cannot save the palette history err={}", .{err});
+    };
+}
+
+/// The wall clock in seconds since the Unix epoch, for the history.
+fn unixNow() i64 {
+    const ns = std.Io.Clock.real.now(global.io()).nanoseconds;
+    return @intCast(@divFloor(ns, std.time.ns_per_s));
+}
+
+/// The theme names of the theme directories, listed again only when a
+/// directory changed (its modification time), so opening a palette does
+/// not list hundreds of files every time. The list's memory is its own.
+const ThemeNames = struct {
+    list: ?gx.settings_map.ThemeList = null,
+    /// The directories and their modification times the list is of.
+    stamp: u64 = 0,
+    /// Counts the lists, so theme indices of an older one are not used.
+    generation: u64 = 0,
+
+    fn get(self: *ThemeNames, io: std.Io, dirs: []const []const u8) []const [:0]const u8 {
+        const stamp = dirStamp(io, dirs);
+        if (self.list == null or stamp != self.stamp) {
+            if (gx.settings_map.listThemes(std.heap.page_allocator, io, dirs)) |fresh| {
+                if (self.list) |*old| old.deinit();
+                self.list = fresh;
+                self.stamp = stamp;
+                self.generation +%= 1;
+            } else |err| log.warn("cannot list the themes err={}", .{err});
+        }
+        return if (self.list) |list| list.names else &.{};
+    }
+
+    fn dirStamp(io: std.Io, dirs: []const []const u8) u64 {
+        var hasher: std.hash.Wyhash = .init(0);
+        for (dirs) |path| {
+            hasher.update(path);
+            var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch {
+                hasher.update("\x00missing");
+                continue;
+            };
+            defer dir.close(io);
+            const stat = dir.stat(io) catch {
+                hasher.update("\x00unknown");
+                continue;
+            };
+            const mtime: i128 = stat.mtime.nanoseconds;
+            hasher.update(std.mem.asBytes(&mtime));
+        }
+        return hasher.final();
+    }
+};
+
+var theme_names: ThemeNames = .{};
+
+test "row colors keep text readable on every row fill" {
     const testing = std.testing;
-    var gate: PreviewGate = .{};
-    // Opening: the empty filter selects its first entry, a recent theme.
-    gate.filtered(true);
-    try testing.expectEqual(@as(?[]const u8, null), gate.target("Dracula"));
-    // Moving the selection onto a theme previews it.
-    gate.navigated();
-    try testing.expectEqualStrings("Dracula", gate.target("Dracula").?);
-    // So does the first entry of a typed filter.
-    gate.filtered(false);
-    try testing.expectEqualStrings("Nord", gate.target("Nord").?);
-    // Clearing the filter shows the saved theme again.
-    gate.filtered(true);
-    try testing.expectEqual(@as(?[]const u8, null), gate.target("Dracula"));
-    // Off the themes the saved one shows, too.
-    gate.navigated();
-    try testing.expectEqual(@as(?[]const u8, null), gate.target(null));
+    // bg, fg, cursor (0 = none), palette 4, palette 12.
+    const themes = [_][5]u24{
+        .{ 0x2e3440, 0xd8dee9, 0xd8dee9, 0x81a1c1, 0x81a1c1 }, // Nord
+        .{ 0x1e1e2e, 0xcdd6f4, 0xf5e0dc, 0x89b4fa, 0x89b4fa }, // GX Mocha
+        .{ 0xeff1f5, 0x4c4f69, 0xdc8a78, 0x1e66f5, 0x1e66f5 }, // Catppuccin Latte
+        .{ 0xfdf6e3, 0x657b83, 0x657b83, 0x268bd2, 0x839496 }, // Solarized Light
+        .{ 0x000000, 0xffffff, 0, 0x0000ee, 0x5c5cff }, // xterm
+    };
+    for (themes) |th| {
+        const cursor: ?d2d.Color = if (th[2] == 0) null else d2d.Color.hex(th[2]);
+        const t = style.Tokens.fromTheme(d2d.Color.hex(th[0]), d2d.Color.hex(th[1]), cursor, d2d.Color.hex(th[3]), d2d.Color.hex(th[4]));
+        const all = rowColors(t);
+        for (std.enums.values(RowState)) |state| {
+            const c = all.get(state);
+            const bg = c.background(t);
+            try testing.expect(style.contrast(c.text, bg) >= floor.text);
+            try testing.expect(style.contrast(c.secondary, bg) >= floor.text);
+            try testing.expect(style.contrast(c.accent, bg) >= floor.text);
+            try testing.expect(style.contrast(c.icon, bg) >= floor.non_text);
+            try testing.expect(style.contrast(c.mark, bg) >= floor.non_text);
+        }
+        // The selected row has the selection fill and indicator; hover and
+        // pressed only shade.
+        try testing.expect(all.get(.selected).indicator);
+        try testing.expect(!all.get(.hover).indicator);
+        try testing.expectEqual(t.selected, all.get(.selected).fill.?);
+        try testing.expectEqual(t.hover, all.get(.hover).fill.?);
+        try testing.expectEqual(@as(?d2d.Color, null), all.get(.normal).fill);
+    }
+}
+
+test "row colors use the system colors in high contrast" {
+    const testing = std.testing;
+    const t = style.Tokens.fromSystem(.{});
+    const selected = RowColors.of(t, .selected);
+    try testing.expectEqual(t.selected, selected.fill.?);
+    try testing.expectEqual(t.selected_text, selected.text);
+    try testing.expectEqual(t.selected_text, selected.accent);
+    try testing.expect(selected.indicator);
+    const normal = RowColors.of(t, .normal);
+    try testing.expectEqual(t.text, normal.text);
+    try testing.expectEqual(@as(?d2d.Color, null), normal.fill);
+}
+
+test "matchRuns marks what the query matched" {
+    const testing = std.testing;
+    const query: fuzzy.Query = .init("ntab");
+    var runs: [16]d2d.TextRun = undefined;
+    const color = d2d.Color.hex(0x89b4fa);
+    const out = matchRuns(&query, "New Tab", color, &runs);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(usize, 0), out[0].start);
+    try testing.expectEqual(@as(usize, 1), out[0].len);
+    try testing.expectEqual(@as(usize, 4), out[1].start);
+    try testing.expectEqual(@as(usize, 3), out[1].len);
+    try testing.expectEqual(d2d.FontWeight.semibold, out[1].weight.?);
+    // Pinyin initials mark the characters, in bytes.
+    const pinyin: fuzzy.Query = .init("xjbq");
+    const cjk = matchRuns(&pinyin, "新建标签页", color, &runs);
+    try testing.expectEqual(@as(usize, 1), cjk.len);
+    try testing.expectEqual(@as(usize, 12), cjk[0].len);
+    const none: fuzzy.Query = .init("xyz");
+    try testing.expectEqual(@as(usize, 0), matchRuns(&none, "New Tab", color, &runs).len);
+}
+
+test "cutText cuts at a character" {
+    const testing = std.testing;
+    var buf: [4]u8 = undefined;
+    try testing.expectEqualStrings("ab", cutText(&buf, "ab"));
+    try testing.expectEqualStrings("a新", cutText(&buf, "a新建"));
 }
