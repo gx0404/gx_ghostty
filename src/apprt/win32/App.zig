@@ -2502,30 +2502,13 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Fill with the configured background color (at the
-            // background opacity when DWM composes the window per pixel)
-            // to prevent a visible flash during resize. The OpenGL
-            // renderer will overwrite the entire client area on the next
-            // frame.
-            const hdc_erase: w32.HDC = @ptrFromInt(wparam);
-            var rect: w32.RECT = undefined;
-            if (w32.GetClientRect(hwnd, &rect) != 0) {
-                const config = &surface.app.config;
-                if (Backdrop.perPixel(config, surface.app.alpha_frames)) {
-                    Backdrop.fillBackground(hdc_erase, rect, config);
-                } else if (surface.app.bg_brush) |brush| {
-                    _ = w32.FillRect(hdc_erase, &rect, brush);
-                }
-            }
+            surface.eraseBackground(@ptrFromInt(wparam));
             return 1;
         },
 
         w32.WM_PAINT => {
-            // Validate the paint region to stop Windows from
-            // sending more WM_PAINT messages, then wake the
-            // renderer thread to redraw.
             _ = w32.ValidateRect(hwnd, null);
-            if (surface.core_surface_ready) {
+            if (surface.core_surface_ready and !surface.in_live_resize) {
                 surface.core_surface.renderer_thread.wakeup.notify() catch {};
             }
             return 0;
@@ -2604,6 +2587,10 @@ fn surfaceWndProc(
             // unaffected and still anchors to ImmSetCompositionWindow.
             const cleared = lparam & ~w32.ISC_SHOWUICOMPOSITIONWINDOW;
             return w32.DefWindowProcW(hwnd, msg, wparam, cleared);
+        },
+
+        w32.WM_IME_REQUEST => {
+            return surface.handleImeRequest(wparam, lparam) orelse w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
         w32.WM_IME_STARTCOMPOSITION => {

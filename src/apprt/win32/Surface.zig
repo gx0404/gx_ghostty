@@ -118,11 +118,10 @@ tracking_leave: bool = false,
 /// skips VK_PROCESSKEY events (the IME is intercepting keys), and composed
 /// text is extracted from WM_IME_COMPOSITION instead.
 ime_composing: bool = false,
+ime_text: []u16 = &.{},
+dead_key_preedit: bool = false,
 
-/// Set to true when handleKeyEvent produced text via ToUnicode. Any
-/// subsequent WM_CHAR (from IME, SendInput Unicode/VK_PACKET, or
-/// PostMessage) is then suppressed to avoid double input. Reset to false
-/// when WM_CHAR arrives (whether suppressed or processed).
+/// Cleared before the next press, including VK_PACKET and VK_PROCESSKEY.
 key_event_produced_text: bool = false,
 
 /// ToUnicode output of the latest key message, the text of its
@@ -143,18 +142,26 @@ win32_input_logged: bool = false,
 /// visual flicker from the DWM stretching stale content.
 in_live_resize: bool = false,
 
-/// Manual-reset event signaled by the renderer thread after presenting
-/// a frame (see `signalFrameDrawn`). The main thread waits on this during
-/// live resize to synchronize rendering with the DWM compositor.
+/// A presented frame at `wanted_size`, or any frame before a resize.
 frame_event: ?w32.HANDLE = null,
+resize_deadline: ?w32.HANDLE = null,
+wanted_size: std.atomic.Value(u64) = .init(0),
+presented_size: std.atomic.Value(u64) = .init(0),
+first_frame_hwnd: std.atomic.Value(usize) = .init(0),
 
-/// Set by `handleResize` during a live resize after it asked the renderer
-/// for a frame at the new size, until something waited for that frame.
+/// A changed grid waiting for a frame during live resize.
 resize_frame_pending: bool = false,
+
+erase_color: configpkg.Config.Color = .{ .r = 0, .g = 0, .b = 0 },
+erase_opacity: f64 = 1,
+erase_linear: bool = false,
+erase_brush: ?w32.HBRUSH = null,
 
 /// Set by WM_GHOSTTY_SIMULATE_GPU_RESET, taken by the renderer thread
 /// (`takeSimulatedGpuReset`).
 simulate_gpu_reset: std.atomic.Value(bool) = .init(false),
+gpu_reset_pending: bool = false,
+gpu_reset_attempts: u8 = 0,
 
 /// The `DimColor` the renderer blends over the frames of this terminal
 /// while it is an unfocused split, `DimColor.none` otherwise. Written on
@@ -171,9 +178,12 @@ client_size: std.atomic.Value(u64) = .init(0),
 /// written through `Window.setSurfaceProgress` on the GUI thread.
 progress: tab_status.Progress = .none,
 
-/// Themed scrollbar (custom layered-popup overlay).
-/// Created lazily after the surface HWND exists.
+/// No popup until an enabled scrollbar has scrollback to display.
 scrollbar: ?*Scrollbar = null,
+scrollbar_enabled: bool = false,
+scrollbar_mode: @import("Scrollbar.zig").Mode = .overlay,
+scrollbar_state: terminal.Scrollbar = .zero,
+scrollbar_fg: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 },
 
 /// The current mouse cursor. Cached so WM_SETCURSOR can restore it
 /// (DefWindowProc resets the cursor to the class cursor on every
@@ -278,14 +288,31 @@ pub fn initWithOptions(
     self.* = .{
         .app = app,
         .parent_window = parent,
-        // The core's pointer starts as the text cursor (`MouseShape.text`)
-        // and reports changes only.
         .current_cursor = w32.LoadCursorW(null, cursorIdFor(.text)),
+        .erase_color = app.config.background,
+        .erase_opacity = app.config.@"background-opacity",
+        .erase_linear = app.config.@"alpha-blending".isLinear(),
+        .scrollbar_enabled = app.config.scrollbar != .never,
+        .scrollbar_mode = @import("Scrollbar.zig").readMode(),
+        .scrollbar_fg = app.config.foreground.toTerminalRGB(),
+    };
+    self.erase_brush = w32.CreateSolidBrush(w32.RGB(self.erase_color.r, self.erase_color.g, self.erase_color.b));
+    errdefer if (self.erase_brush) |brush| {
+        _ = w32.DeleteObject(brush);
+        self.erase_brush = null;
     };
 
-    // Create a manual-reset event for synchronizing resize with the
-    // renderer thread. Manual-reset so we control exactly when it's reset.
     self.frame_event = w32.CreateEventW(null, 1, 0, null);
+    errdefer if (self.frame_event) |event| {
+        _ = w32.CloseHandle(event);
+        self.frame_event = null;
+    };
+    self.resize_deadline = w32.CreateWaitableTimerExW(null, null, w32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, w32.TIMER_ALL_ACCESS) orelse
+        w32.CreateWaitableTimerExW(null, null, 0, w32.TIMER_ALL_ACCESS);
+    errdefer if (self.resize_deadline) |timer| {
+        _ = w32.CloseHandle(timer);
+        self.resize_deadline = null;
+    };
 
     // Create a WS_CHILD window inside the parent Window container. OpenGL
     // windows must clip their siblings and children.
@@ -330,6 +357,7 @@ pub fn initWithOptions(
 
     // A window's pixel format can only be set once; the renderer creates
     // its context for this DC later, on the render thread.
+    try app.core_app.device.wait();
     try app.core_app.device.setPixelFormat(self.hdc.?);
 
     // Query the initial DPI and size
@@ -354,22 +382,7 @@ pub fn initWithOptions(
     // --- Core terminal surface initialization ---
     const alloc = app.core_app.alloc;
 
-    // Create the themed scrollbar popup (owned by the surface HWND).
-    self.scrollbar = try Scrollbar.create(alloc, hwnd, self, app.config.scrollbar != .never);
-    errdefer if (self.scrollbar) |sb| {
-        sb.destroy();
-        self.scrollbar = null;
-    };
-
-    // Seed initial theme colors from the app config.
-    if (self.scrollbar) |sb| {
-        sb.setTheme(
-            app.config.background.toTerminalRGB(),
-            app.config.foreground.toTerminalRGB(),
-        );
-        // An always-visible scrollbar takes its column from the first grid.
-        self.width = Scrollbar.gridWidth(self.width, sb.currentReservedWidth());
-    }
+    self.width = Scrollbar.gridWidth(self.width, self.scrollbarReservedWidth());
 
     // Register this surface with the core app.
     try app.core_app.addSurface(self);
@@ -412,52 +425,37 @@ pub fn initWithOptions(
 }
 
 pub fn deinit(self: *Surface) void {
-    log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
-
+    self.core_surface_ready = false;
+    self.first_frame_hwnd.store(0, .release);
     if (self.core_surface_initialized) {
-        // Messages that arrive while the core surface shuts down must not
-        // reach it.
-        self.core_surface_ready = false;
-
-        // This joins the renderer thread, which destroys its GL context.
-        log.debug("surface deinit: core_surface.deinit start", .{});
         self.core_surface.deinit();
-        log.debug("surface deinit: core_surface.deinit done", .{});
-
         self.app.core_app.deleteSurface(self);
-        log.debug("surface deinit: deleteSurface done", .{});
+        self.core_surface_initialized = false;
     }
-
     if (self.frame_event) |event| {
         _ = w32.CloseHandle(event);
         self.frame_event = null;
     }
-    log.debug("surface deinit: frame_event closed", .{});
-
+    if (self.resize_deadline) |timer| {
+        _ = w32.CloseHandle(timer);
+        self.resize_deadline = null;
+    }
     if (self.launch_command) |*command| {
         command.deinit(self.app.core_app.alloc);
         self.launch_command = null;
     }
-
     if (self.hdc) |hdc| {
-        if (self.hwnd) |hwnd| {
-            log.debug("surface deinit: ReleaseDC", .{});
-            _ = w32.ReleaseDC(hwnd, hdc);
-        }
+        if (self.hwnd) |hwnd| _ = w32.ReleaseDC(hwnd, hdc);
         self.hdc = null;
     }
-    log.debug("surface deinit: DC released", .{});
-
     self.deinitGui();
 }
 
-/// Destroy resources only the GUI thread touches: the scrollbar, popup
-/// windows, GDI objects, and the GWLP_USERDATA back-pointer.
 fn deinitGui(self: *Surface) void {
-    // Drop clipboard accesses still waiting for the clipboard.
     if (self.hwnd) |hwnd| {
         _ = w32.KillTimer(hwnd, CLIPBOARD_READ_TIMER);
         _ = w32.KillTimer(hwnd, CLIPBOARD_WRITE_TIMER);
+        _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
     }
     if (self.pending_clipboard_read) |pending| destroyClipboardRequest(pending.state);
     self.pending_clipboard_read = null;
@@ -465,25 +463,23 @@ fn deinitGui(self: *Surface) void {
     self.pending_clipboard_write = null;
     self.dropClipboardConfirms();
 
-    // Destroy the themed scrollbar before the surface HWND is gone.
     if (self.scrollbar) |sb| {
         sb.destroy();
         self.scrollbar = null;
     }
-
-    // Destroy popup windows and their GDI resources.
     self.search_bar.deinit();
     self.link_preview.deinit();
     self.palette.deinit();
-
-    // Don't call DestroyWindow on the child HWND here; it is destroyed
-    // with its parent Window HWND. Just null the hwnd field so nothing
-    // else tries to use it.
+    self.clearImeText();
+    if (self.erase_brush) |brush| {
+        _ = w32.DeleteObject(brush);
+        self.erase_brush = null;
+    }
     if (self.hwnd) |hwnd| {
         _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+        _ = w32.DestroyWindow(hwnd);
     }
     self.hwnd = null;
-    log.debug("surface deinit: complete", .{});
 }
 
 /// Start at the content scale of the parent window (`Window.scale`), like
@@ -542,6 +538,7 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     // preview doesn't float over the newly-active tab, and the find bar
     // with the surface (it stays open and comes back with it).
     if (!visible) self.link_preview.hide();
+    if (self.scrollbar) |sb| sb.setOwnerVisible(visible);
     self.search_bar.setOwnerVisible(visible);
     if (!self.core_surface_ready) return;
     if (self.last_reported_visible == visible) return;
@@ -584,17 +581,25 @@ pub fn close(self: *Surface, process_active: bool) void {
 /// dialog's modal loop keeps dispatching messages and can close the
 /// terminal meanwhile.
 pub fn confirmClose(self: *Surface) void {
-    const hwnd = self.hwnd orelse return;
-    if (self.core_surface_ready and self.core_surface.needsConfirmQuit()) {
-        var arena: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
+    if (self.hwnd == null or !self.core_surface_ready) return;
+    const app = self.app;
+    const id = self.core_surface.id;
+    var scope: gx_confirm.Scope = undefined;
+    scope.begin(app.core_app.alloc, global.io());
+    defer scope.end();
+    if (self.core_surface.needsConfirmQuit()) {
+        var arena: std.heap.ArenaAllocator = .init(app.core_app.alloc);
         defer arena.deinit();
         var processes: std.ArrayList([]const u8) = .empty;
         self.appendBusyProcesses(arena.allocator(), &processes);
-        if (Dialogs.confirmCloseSurface(self.parent_window.hwnd, processes.items) != .accept) return;
-        const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
-        if (userdata == 0 or @as(usize, @bitCast(userdata)) != @intFromPtr(self)) return;
+        const owner = self.parent_window.hwnd;
+        scope.end();
+        if (Dialogs.confirmCloseSurface(owner, processes.items) != .accept) return;
     }
-    self.parent_window.closeSplitSurface(self);
+    const core_surface = app.core_app.findSurfaceByID(id) orelse return;
+    const surface = core_surface.rt_surface;
+    scope.end();
+    surface.parent_window.closeSplitSurface(surface);
 }
 
 /// Append the processes of this terminal that make closing it need a
@@ -985,8 +990,11 @@ fn writeClipboard(self: *Surface, blocks: ClipboardBlocks, attempt: u8) void {
     if (blocks.text) |data| items.appendAssumeCapacity(.{ .format = w32.CF_UNICODETEXT, .data = data });
     if (blocks.html) |data| items.appendAssumeCapacity(.{ .format = clipboard.htmlFormat(), .data = data });
 
-    // null owner: the write is not tied to the surface hwnd.
-    clipboard.setData(null, items.items) catch {
+    const owner = self.hwnd orelse {
+        blocks.free();
+        return;
+    };
+    clipboard.setData(owner, items.items) catch {
         if (attempt + 1 < clipboard_retries) {
             if (self.hwnd) |hwnd| {
                 if (w32.SetTimer(hwnd, CLIPBOARD_WRITE_TIMER, clipboardRetryDelay(attempt), null) != 0) {
@@ -1154,12 +1162,9 @@ fn dropClipboardConfirms(self: *Surface) void {
 }
 
 pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
-    _ = self;
-    const env = try global.environMap();
-
-    // TERM and COLORTERM are set by termio/Exec.zig with platform-aware
-    // logic (checking for terminfo, resources_dir, etc.). Do not set them here.
-
+    var env = try global.environMap();
+    errdefer env.deinit();
+    if (self.parent_window.is_quick_terminal) try env.put("GHOSTTY_QUICK_TERMINAL", "1");
     return env;
 }
 
@@ -1187,6 +1192,12 @@ pub fn setMouseShape(self: *Surface, shape: terminal.MouseShape) void {
     if (self.mouse_visible and self.pointerOver()) {
         if (self.current_cursor) |cursor| _ = w32.SetCursor(cursor);
     }
+}
+
+pub fn setMouseVisibility(self: *Surface, visible: bool) void {
+    self.mouse_visible = visible;
+    if (!self.pointerOver()) return;
+    _ = w32.SetCursor(if (visible) self.current_cursor else null);
 }
 
 /// Whether the pointer is over the terminal's window, or captured by it
@@ -1282,19 +1293,92 @@ pub fn toggleWindowDecorations(self: *Surface) void {
 /// Follow a config change reported for this surface. Its conditional
 /// configuration (e.g. a light/dark theme) can differ from the app's.
 pub fn onConfigChange(self: *Surface, config: *const configpkg.Config) void {
-    if (self.scrollbar) |sb| {
-        sb.setTheme(
-            config.background.toTerminalRGB(),
-            config.foreground.toTerminalRGB(),
-        );
-        if (sb.setEnabled(config.scrollbar != .never)) self.refitGrid();
+    self.setEraseColor(config.background);
+    self.erase_opacity = config.@"background-opacity";
+    self.erase_linear = config.@"alpha-blending".isLinear();
+    const reserved = self.scrollbarReservedWidth();
+    self.scrollbar_enabled = config.scrollbar != .never;
+    self.scrollbar_mode = @import("Scrollbar.zig").readMode();
+    self.scrollbar_fg = config.foreground.toTerminalRGB();
+    if (!self.scrollbar_enabled) {
+        if (self.scrollbar) |sb| sb.destroy();
+        self.scrollbar = null;
+    } else {
+        self.ensureScrollbar();
+        if (self.scrollbar) |sb| sb.setTheme(self.erase_color.toTerminalRGB(), self.scrollbar_fg);
+    }
+    if (reserved != self.scrollbarReservedWidth()) self.refitGrid();
+}
+
+/// GUI-thread target for the background color_change action (OSC 11).
+pub fn setEraseColor(self: *Surface, color: configpkg.Config.Color) void {
+    if (std.meta.eql(self.erase_color, color) and self.erase_brush != null) return;
+    self.erase_color = color;
+    const brush = w32.CreateSolidBrush(w32.RGB(color.r, color.g, color.b));
+    if (self.erase_brush) |old| _ = w32.DeleteObject(old);
+    self.erase_brush = brush;
+}
+
+pub fn eraseBackground(self: *Surface, hdc: w32.HDC) void {
+    const Backdrop = @import("chrome/Backdrop.zig");
+    const hwnd = self.hwnd orelse return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return;
+    if (Backdrop.perPixel(&self.app.config, self.app.alpha_frames)) {
+        var config = self.app.config;
+        config.background = self.erase_color;
+        config.@"background-opacity" = self.erase_opacity;
+        config.@"alpha-blending" = if (self.erase_linear) .linear else .native;
+        Backdrop.fillBackground(hdc, rect, &config);
+    } else if (self.erase_brush) |brush| {
+        _ = w32.FillRect(hdc, &rect, brush);
+    } else {
+        Backdrop.fillOpaque(hdc, rect, self.erase_color);
     }
 }
 
 /// Update the themed scrollbar to reflect the terminal's scroll state.
 /// Called from performAction(.scrollbar) when the viewport changes.
 pub fn setScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
+    self.scrollbar_state = scrollbar;
+    self.ensureScrollbar();
     if (self.scrollbar) |sb| sb.update(scrollbar);
+}
+
+fn ensureScrollbar(self: *Surface) void {
+    if (self.scrollbar != null or !self.scrollbar_enabled or self.scrollbar_state.total <= self.scrollbar_state.len) return;
+    const hwnd = self.hwnd orelse return;
+    self.scrollbar = Scrollbar.create(self.app.core_app.alloc, hwnd, self, true) catch |err| {
+        log.warn("cannot create the scrollbar err={}", .{err});
+        return;
+    };
+    const sb = self.scrollbar.?;
+    self.scrollbar_mode = sb.mode;
+    sb.setTheme(self.erase_color.toTerminalRGB(), self.scrollbar_fg);
+    sb.update(self.scrollbar_state);
+    if (self.last_reported_visible == false) sb.setOwnerVisible(false);
+}
+
+fn scrollbarReservedWidth(self: *Surface) i32 {
+    if (self.scrollbar) |sb| return sb.currentReservedWidth();
+    const hwnd = self.hwnd orelse return 0;
+    const geometry: Scrollbar = .{
+        .alloc = self.app.core_app.alloc,
+        .surface = self,
+        .owner = hwnd,
+        .hwnd = hwnd,
+        .scale = self.scale,
+        .enabled = self.scrollbar_enabled,
+        .mode = self.scrollbar_mode,
+    };
+    return geometry.currentReservedWidth();
+}
+
+/// Forwarded from the parent window for surfaces without a scrollbar popup.
+pub fn refreshScrollbarMode(self: *Surface) void {
+    const reserved = self.scrollbarReservedWidth();
+    self.scrollbar_mode = @import("Scrollbar.zig").readMode();
+    if (self.scrollbar == null and reserved != self.scrollbarReservedWidth()) self.refitGrid();
 }
 
 /// Scroll the terminal to the given absolute row offset.
@@ -1312,55 +1396,27 @@ pub fn scrollToOffset(self: *Surface, offset: usize) void {
 
 /// Handle WM_SIZE.
 pub fn handleResize(self: *Surface, width: u32, height: u32) void {
-    // Skip zero-size events (minimized windows).
     if (width == 0 or height == 0) return;
-
     self.publishClientSize(width, height);
-    self.height = height;
-
-    // Pre-flight the scrollbar so we know whether to subtract its width.
-    // This must happen before sizeCallback so the grid gets the right width.
-    var grid_width = width;
-    if (self.scrollbar) |sb| grid_width = Scrollbar.gridWidth(width, sb.repositionAndResize());
+    const reserved = if (self.scrollbar) |sb| sb.repositionAndResize() else self.scrollbarReservedWidth();
+    const grid_width = Scrollbar.gridWidth(width, reserved);
+    const changed = self.width != grid_width or self.height != height;
     self.width = grid_width;
-
-    // Reposition popups with corrected width.
+    self.height = height;
     if (self.search_bar.active) self.search_bar.reposition();
     if (self.palette.active) self.palette.reposition();
+    if (!changed or !self.core_surface_ready) return;
 
-    if (!self.core_surface_ready) return;
-
-    // Notify the core surface so it recalculates the terminal grid,
-    // updates the renderer viewport, and sends SIGWINCH to the PTY.
+    self.wanted_size.store(packSize(grid_width, height), .release);
+    if (self.frame_event) |event| _ = w32.ResetEvent(event);
     self.core_surface.sizeCallback(.{ .width = grid_width, .height = height }) catch |err| {
         log.err("sizeCallback error: {}", .{err});
         return;
     };
     if (self.ime_composing) self.positionImeWindow();
-
-    // During live resize (user dragging the border), block until the
-    // renderer has presented one frame at the new size. This prevents
-    // the DWM from stretching stale framebuffer content to fill the
-    // new window area, which causes visible flicker.
     if (self.in_live_resize) {
-        if (self.frame_event) |event| {
-            // Reset the event before waking the renderer, so we
-            // wait for a NEW frame, not a previously drawn one.
-            _ = w32.ResetEvent(event);
-        }
-
-        // Wake the renderer to redraw at the new size.
-        self.core_surface.renderer_thread.wakeup.notify() catch {};
-
-        // When the window lays out its panes it waits for all of them at
-        // once afterwards (`Window.layoutSplits`), so split panes render
-        // in parallel.
         self.resize_frame_pending = true;
-        if (!self.parent_window.laying_out) self.awaitResizeFrame();
-    } else {
-        // Outside live resize (programmatic resize, initial layout),
-        // just wake the renderer asynchronously.
-        self.core_surface.renderer_thread.wakeup.notify() catch {};
+        if (!self.parent_window.laying_out) _ = awaitResizeFrames(&.{self});
     }
 }
 
@@ -1379,10 +1435,62 @@ pub fn refitGrid(self: *Surface) void {
 /// the new size. Short, so a slow renderer never stalls the UI.
 pub const resize_frame_timeout_ms: u32 = 16;
 
-/// Wait for the frame `handleResize` asked for during a live resize.
-fn awaitResizeFrame(self: *Surface) void {
-    self.resize_frame_pending = false;
-    if (self.frame_event) |event| _ = w32.WaitForSingleObject(event, resize_frame_timeout_ms);
+/// Wait for resized panes in parallel, with one deadline and no message pump.
+/// Window.PaneLayout calls this after positioning every pane.
+pub fn awaitResizeFrames(surfaces: []const *Surface) bool {
+    const perf = @import("../../gx/perf.zig");
+    const span = perf.Span.begin(global.io());
+    defer _ = span.end(global.io(), "surface.resize_wait");
+    defer for (surfaces) |surface| {
+        surface.resize_frame_pending = false;
+    };
+
+    var timer: ?w32.HANDLE = null;
+    for (surfaces) |surface| {
+        if (surface.resize_frame_pending) {
+            timer = surface.resize_deadline;
+            if (timer != null) break;
+        }
+    }
+    const due: i64 = -@as(i64, resize_frame_timeout_ms) * 10_000;
+    const armed = if (timer) |t| w32.SetWaitableTimer(t, &due, 0, null, null, 0) != 0 else false;
+    defer {
+        if (armed) _ = w32.CancelWaitableTimer(timer.?);
+    }
+
+    while (true) {
+        var events: [64]w32.HANDLE = undefined;
+        var owners: [63]*Surface = undefined;
+        var count: usize = 0;
+        for (surfaces) |surface| {
+            if (!surface.resize_frame_pending) continue;
+            if (surface.presented_size.load(.acquire) == surface.wanted_size.load(.acquire)) {
+                surface.resize_frame_pending = false;
+                continue;
+            }
+            const event = surface.frame_event orelse continue;
+            if (count == owners.len) continue;
+            events[count] = event;
+            owners[count] = surface;
+            count += 1;
+        }
+        if (count == 0) return true;
+        const remaining_us = perf.sinceUs(global.io(), span.start);
+        if (remaining_us >= resize_frame_timeout_ms * 1000) break;
+        const timeout: u32 = if (armed) w32.INFINITE else @intCast(@divTrunc(resize_frame_timeout_ms * 1000 - remaining_us + 999, 1000));
+        if (armed) events[count] = timer.?;
+        const result = w32.WaitForMultipleObjects(@intCast(count + @intFromBool(armed)), &events, 0, timeout);
+        if (result >= count) break;
+        const surface = owners[result];
+        if (surface.presented_size.load(.acquire) == surface.wanted_size.load(.acquire)) {
+            surface.resize_frame_pending = false;
+        } else {
+            _ = w32.ResetEvent(events[result]);
+            if (surface.presented_size.load(.acquire) == surface.wanted_size.load(.acquire)) surface.resize_frame_pending = false;
+        }
+    }
+    perf.record("surface.resize_timeout", 1);
+    return false;
 }
 
 /// Called by the parent Window when it moved to a monitor with another
@@ -1397,9 +1505,8 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
         }) catch |err| log.err("contentScaleCallback error: {}", .{err});
     }
 
-    // Popup fonts were created at the previous DPI. Rebuild them at
-    // the new scale so search-bar / palette text doesn't render
-    // tiny/huge after dragging the window between monitors.
+    self.search_bar.popup.setOwnerScale(self.scale);
+    self.palette.popup.setOwnerScale(self.scale);
     self.search_bar.onDpiChanged();
     self.palette.onDpiChanged();
     self.link_preview.hide();
@@ -1421,6 +1528,7 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
 pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
     if (!self.core_surface_ready) return;
     const vk: u16 = @intCast(wparam & 0xFFFF);
+    if (action == .press) self.key_event_produced_text = false;
     // Bits 16-23 of lparam. Bit 24 is the extended-key flag, not part of
     // the scancode; including it broke ToUnicode for AltGr layouts
     // (German, Polish) and arrow/numpad keys.
@@ -1471,10 +1579,6 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     // below may clear ctrl+alt on this copy without disturbing `mods`.
     var event_mods = mods;
 
-    // Reset the flag — WM_CHAR should be allowed through unless
-    // ToUnicode produces text below.
-    self.key_event_produced_text = false;
-
     // The modifier and lock state for this message, read for every key
     // (modifiers and releases included) as the console host would.
     var keyboard_state: [256]u8 = undefined;
@@ -1506,9 +1610,17 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
                 utf16_buf.len,
                 0,
             );
-            if (result < 0) message.dead = true;
+            if (result < 0) {
+                message.dead = true;
+                self.dead_key_preedit = true;
+                const text = wstr.utf8Buf(&utf8_buf, utf16_buf[0..@min(@as(usize, @intCast(@abs(result))), utf16_buf.len)]);
+                self.core_surface.preeditCallback(if (text.len == 0) null else text) catch {};
+            } else if (result > 0 or vk == w32.VK_ESCAPE or vk == w32.VK_BACK) {
+                if (self.dead_key_preedit) self.core_surface.preeditCallback(null) catch {};
+                self.dead_key_preedit = false;
+            }
             if (result > 0) {
-                const utf16_slice = utf16_buf[0..@intCast(result)];
+                const utf16_slice = utf16_buf[0..@min(@as(usize, @intCast(result)), utf16_buf.len)];
                 message.text = utf16_slice;
                 // Skip Ctrl-induced control chars (0x01-0x1A): the core
                 // handles modifier combos via key + mods, and emitting
@@ -1560,6 +1672,7 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
         .key = key,
         .mods = event_mods,
         .consumed_mods = consumed_mods,
+        .composing = message.dead,
         .utf8 = utf8_text,
         .unshifted_codepoint = unshifted_codepoint,
     };
@@ -1672,6 +1785,7 @@ pub fn handleMouseButton(
     const event = buttonEvent(prev, buttonBit(button), action);
     self.mouse_button_mask = event.mask;
     if (prev == 0 and event.mask != 0) {
+        self.tracking_leave = false;
         if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
     } else if (prev != 0 and event.mask == 0) {
         _ = w32.ReleaseCapture();
@@ -1801,9 +1915,9 @@ pub const WM_APP_RELEASE_BUTTONS: u32 = w32.WM_APP + 35;
 /// may be running the modal loop that took the capture.
 pub fn handleCaptureChanged(self: *Surface) void {
     const released = self.mouse_button_mask;
+    self.tracking_leave = false;
     if (released == 0) return;
     self.mouse_button_mask = 0;
-    self.tracking_leave = false;
     const hwnd = self.hwnd orelse return;
     _ = w32.PostMessageW(hwnd, WM_APP_RELEASE_BUTTONS, released, 0);
 }
@@ -1980,9 +2094,9 @@ fn pathQuoting(self: *Surface) path_quote.Style {
     const pid = std.math.cast(gx_proc.Pid, root) orelse return .windows;
     var arena: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
     defer arena.deinit();
-    var snapshot = gx_proc.snapshot(arena.allocator(), global.io(), pid) catch return .windows;
-    defer snapshot.deinit();
-    const names = snapshot.tree.names(arena.allocator(), pid) catch return .windows;
+    const table = self.app.processTable() catch return .windows;
+    const tree = table.tree(arena.allocator(), &.{pid}) catch return .windows;
+    const names = tree.names(arena.allocator(), pid) catch return .windows;
     return path_quote.styleFor(names);
 }
 
@@ -2169,126 +2283,73 @@ test "wheelNotches adds up small steps" {
     try testing.expectEqual(@as(i32, 60), accum);
 }
 
-/// Handle WM_IME_STARTCOMPOSITION — an IME composition session has begun.
-/// Position the candidate window near the terminal cursor and let Windows
-/// show its default composition UI.
 pub fn handleImeStartComposition(self: *Surface) void {
+    if (!self.core_surface_ready) return;
     self.ime_composing = true;
-    // Drop any buffered high surrogate so it can't pair with IME output.
     self.high_surrogate = 0;
+    self.key_event_produced_text = false;
+    self.dead_key_preedit = false;
+    self.clearImeText();
+    self.core_surface.preeditCallback(null) catch {};
     self.positionImeWindow();
 }
 
-/// Handle WM_IME_ENDCOMPOSITION — the IME composition session has ended.
 pub fn handleImeEndComposition(self: *Surface) void {
     self.ime_composing = false;
-    // Clear any leftover inline preedit (e.g. composition cancelled with Esc).
-    if (self.core_surface_ready) {
-        self.core_surface.preeditCallback(null) catch {};
-    }
+    self.clearImeText();
+    if (self.core_surface_ready) self.core_surface.preeditCallback(null) catch {};
 }
 
-/// Handle WM_IME_COMPOSITION — intermediate or final text from the IME.
-/// When the result string is available (GCS_RESULTSTR), extract it and
-/// send it to the terminal. Returns true if we handled the result string.
 pub fn handleImeComposition(self: *Surface, lparam: isize) bool {
     if (!self.core_surface_ready) return false;
-
-    const flags: u32 = @intCast(lparam & 0xFFFFFFFF);
-
-    // Intermediate composition text: mirror it inline at the cursor via the
-    // core's preedit (underlined, like macOS/GTK) instead of the default
-    // floating composition window (suppressed via WM_IME_SETCONTEXT).
-    if (flags & w32.GCS_RESULTSTR == 0) {
-        if (flags & w32.GCS_COMPSTR != 0) {
-            self.updateImePreedit();
-            return true;
-        }
-        return false;
+    const flags: u32 = @truncate(@as(usize, @bitCast(lparam)));
+    if (flags & w32.GCS_RESULTSTR != 0) {
+        self.core_surface.preeditCallback(null) catch {};
+        self.clearImeText();
+        const hwnd = self.hwnd orelse return false;
+        const himc = w32.ImmGetContext(hwnd) orelse return false;
+        defer _ = w32.ImmReleaseContext(hwnd, himc);
+        const result = self.readImeString(himc, w32.GCS_RESULTSTR) catch return false;
+        defer self.app.core_app.alloc.free(result);
+        self.sendImeText(result);
     }
-
-    // Result string: clear the inline preedit, then commit the text below.
-    self.core_surface.preeditCallback(null) catch {};
-
-    const hwnd = self.hwnd orelse return false;
-    const himc = w32.ImmGetContext(hwnd) orelse return false;
-    defer _ = w32.ImmReleaseContext(hwnd, himc);
-
-    // Query the length of the result string (in bytes).
-    const byte_len = w32.ImmGetCompositionStringW(himc, w32.GCS_RESULTSTR, null, 0);
-    if (byte_len <= 0) return false;
-    // The W variant always returns an even byte count, but reject odd
-    // values defensively rather than panicking via @divExact.
-    if (byte_len & 1 != 0) return false;
-
-    const u16_len: usize = @intCast(@divTrunc(byte_len, 2));
-
-    // Stack buffer for typical IME results (up to 64 UTF-16 code units).
-    var stack_buf: [64]u16 = undefined;
-
-    if (u16_len <= stack_buf.len) {
-        const got = w32.ImmGetCompositionStringW(himc, w32.GCS_RESULTSTR, &stack_buf, @intCast(byte_len));
-        if (got <= 0) return false;
-        if (got & 1 != 0) return false;
-        const actual_len: usize = @intCast(@divTrunc(got, 2));
-        self.sendImeText(stack_buf[0..actual_len]);
-    } else {
-        // Unusual: very long composition. Allocate on the heap.
-        const alloc = self.app.core_app.alloc;
-        const buf = alloc.alloc(u16, u16_len) catch return false;
-        defer alloc.free(buf);
-        const got = w32.ImmGetCompositionStringW(himc, w32.GCS_RESULTSTR, buf.ptr, @intCast(byte_len));
-        if (got <= 0) return false;
-        if (got & 1 != 0) return false;
-        const actual_len: usize = @intCast(@divTrunc(got, 2));
-        self.sendImeText(buf[0..actual_len]);
-    }
-
-    // GCS_RESULTSTR and GCS_COMPSTR can arrive together (e.g. an IME commits
-    // a syllable while starting the next). We cleared the preedit above for
-    // the result; re-mirror the new composition so it isn't invisible until
-    // the next keystroke.
     if (flags & w32.GCS_COMPSTR != 0) self.updateImePreedit();
-
-    // Reposition the IME window for the next composition
     self.positionImeWindow();
-    return true;
+    return flags & (w32.GCS_RESULTSTR | w32.GCS_COMPSTR) != 0;
 }
 
-/// Convert a UTF-16 IME result to UTF-8 and send it to the terminal.
-/// Read the current GCS_COMPSTR composition string and mirror it into the
-/// core's preedit so it renders inline at the cursor. An empty composition
-/// clears the preedit.
+fn clearImeText(self: *Surface) void {
+    self.app.core_app.alloc.free(self.ime_text);
+    self.ime_text = &.{};
+}
+
+fn readImeString(self: *Surface, himc: w32.HIMC, kind: u32) ![]u16 {
+    const byte_len = w32.ImmGetCompositionStringW(himc, kind, null, 0);
+    if (byte_len < 0 or byte_len & 1 != 0) return error.InvalidComposition;
+    if (byte_len == 0) return &.{};
+    const alloc = self.app.core_app.alloc;
+    const buf = try alloc.alloc(u16, @intCast(@divTrunc(byte_len, 2)));
+    errdefer alloc.free(buf);
+    const got = w32.ImmGetCompositionStringW(himc, kind, buf.ptr, @intCast(byte_len));
+    if (got < 0 or got > byte_len or got & 1 != 0) return error.InvalidComposition;
+    return try alloc.realloc(buf, @intCast(@divTrunc(got, 2)));
+}
+
 fn updateImePreedit(self: *Surface) void {
     const hwnd = self.hwnd orelse return;
     const himc = w32.ImmGetContext(hwnd) orelse return;
     defer _ = w32.ImmReleaseContext(hwnd, himc);
-
-    var buf16: [128]u16 = undefined;
-    const byte_len = w32.ImmGetCompositionStringW(himc, w32.GCS_COMPSTR, null, 0);
-    if (byte_len <= 0 or byte_len & 1 != 0) {
+    self.clearImeText();
+    self.ime_text = self.readImeString(himc, w32.GCS_COMPSTR) catch {
         self.core_surface.preeditCallback(null) catch {};
         return;
-    }
-    const u16_len: usize = @intCast(@divTrunc(byte_len, 2));
-    if (u16_len > buf16.len) {
-        // Absurdly long composition; clear rather than truncate mid-pair.
-        self.core_surface.preeditCallback(null) catch {};
-        return;
-    }
-    const got = w32.ImmGetCompositionStringW(himc, w32.GCS_COMPSTR, &buf16, @intCast(byte_len));
-    if (got <= 0 or got & 1 != 0) return;
-    const n: usize = @intCast(@divTrunc(got, 2));
-
-    // Worst case 3 bytes of UTF-8 per UTF-16 code unit.
-    var buf8: [buf16.len * 3]u8 = undefined;
-    const len8 = std.unicode.utf16LeToUtf8(&buf8, buf16[0..n]) catch return;
-    self.core_surface.preeditCallback(if (len8 == 0) null else buf8[0..len8]) catch |err| {
+    };
+    const alloc = self.app.core_app.alloc;
+    const text = wstr.utf8Alloc(alloc, self.ime_text) catch return;
+    defer alloc.free(text);
+    self.core_surface.preeditCallback(if (text.len == 0) null else text) catch |err| {
         log.warn("preeditCallback failed err={}", .{err});
     };
-
-    // Output can move the cursor while composing; keep the candidate
-    // list with it.
     self.positionImeWindow();
 }
 
@@ -2348,8 +2409,74 @@ fn positionImeWindow(self: *Surface) void {
         .dwIndex = 0,
         .dwStyle = w32.CFS_EXCLUDE,
         .ptCurrentPos = .{ .x = cell.left, .y = cell.bottom },
-        .rcArea = cell,
+        .rcArea = imeCompositionRect(cell, self.core_surface.size.cell.width, imeColumns(self.ime_text, self.ime_text.len), self.width),
     });
+}
+
+pub fn handleImeRequest(self: *Surface, request: usize, data: isize) ?isize {
+    if (request != w32.IMR_QUERYCHARPOSITION) return null;
+    if (!self.core_surface_ready or data == 0) return 0;
+    const address: usize = @bitCast(data);
+    if (address % @alignOf(w32.IMECHARPOSITION) != 0) return 0;
+    const position: *w32.IMECHARPOSITION = @ptrFromInt(address);
+    if (position.dwSize < @sizeOf(w32.IMECHARPOSITION) or position.dwCharPos > self.ime_text.len) return 0;
+    const hwnd = self.hwnd orelse return 0;
+    const cell = imeCellRect(self.core_surface.imePoint(), self.scale, self.core_surface.size.cell.width, self.core_surface.size.cell.height, self.width, self.height);
+    const columns = imeColumns(self.ime_text, position.dwCharPos);
+    const prefix = imeCompositionRect(cell, self.core_surface.size.cell.width, columns, self.width);
+    position.pt = .{ .x = if (columns == 0) cell.left else prefix.right, .y = cell.top };
+    position.cLineHeight = @intCast(cell.bottom - cell.top);
+    if (w32.ClientToScreen(hwnd, &position.pt) == 0) return 0;
+    var top_left: w32.POINT = .{ .x = 0, .y = 0 };
+    var bottom_right: w32.POINT = .{ .x = @intCast(self.width), .y = @intCast(self.height) };
+    if (w32.ClientToScreen(hwnd, &top_left) == 0 or w32.ClientToScreen(hwnd, &bottom_right) == 0) return 0;
+    position.rcDocument = .{ .left = top_left.x, .top = top_left.y, .right = bottom_right.x, .bottom = bottom_right.y };
+    return 1;
+}
+
+fn imeColumns(units: []const u16, offset: usize) usize {
+    const unicode = @import("../../unicode/main.zig");
+    const end = @min(offset, units.len);
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < end) {
+        const unit = units[index];
+        const cp: u21 = if (std.unicode.utf16IsHighSurrogate(unit) and index + 1 < units.len and std.unicode.utf16IsLowSurrogate(units[index + 1])) pair: {
+            if (index + 1 >= end) break;
+            const low = units[index + 1];
+            index += 2;
+            break :pair 0x10000 + (@as(u21, unit - 0xD800) << 10) + (low - 0xDC00);
+        } else replacement: {
+            index += 1;
+            break :replacement if (std.unicode.utf16IsHighSurrogate(unit) or std.unicode.utf16IsLowSurrogate(unit)) 0xFFFD else unit;
+        };
+        columns +|= unicode.codepointWidth(cp);
+    }
+    return columns;
+}
+
+fn imeCompositionRect(cell: w32.RECT, cell_width: u32, columns: usize, surface_width: u32) w32.RECT {
+    const width = @max(@as(u64, cell_width), 1) *| @max(@as(u64, columns), 1);
+    const available: u64 = @intCast(@max(@as(i64, surface_width) - cell.left, 0));
+    var rect = cell;
+    rect.right = rect.left + @as(i32, @intCast(@min(width, available)));
+    return rect;
+}
+
+test "IME positions count UTF16 pairs and wide cells without truncating long compositions" {
+    const testing = std.testing;
+    const text = [_]u16{ 'a', 0x4E2D, 0xD83D, 0xDE00, 0x0301 };
+    try testing.expectEqual(@as(usize, 1), imeColumns(&text, 1));
+    try testing.expectEqual(@as(usize, 3), imeColumns(&text, 2));
+    try testing.expectEqual(@as(usize, 3), imeColumns(&text, 3));
+    try testing.expectEqual(@as(usize, 5), imeColumns(&text, 4));
+    try testing.expectEqual(@as(usize, 5), imeColumns(&text, 5));
+    const long = [_]u16{0x4E2D} ** 512;
+    try testing.expectEqual(@as(usize, 1024), imeColumns(&long, long.len));
+    try testing.expectEqual(@as(usize, 1), imeColumns(&.{0xD800}, 1));
+    const cell: w32.RECT = .{ .left = 20, .top = 20, .right = 30, .bottom = 40 };
+    try testing.expectEqual(@as(i32, 70), imeCompositionRect(cell, 10, 5, 800).right);
+    try testing.expectEqual(@as(i32, 800), imeCompositionRect(cell, 10, 1024, 800).right);
 }
 
 /// The cursor cell in client pixels from the core's `imePoint`, which is
@@ -2387,28 +2514,50 @@ test "imeCellRect clamps to the surface" {
     try std.testing.expectEqual(w32.RECT{ .left = 790, .top = 580, .right = 800, .bottom = 600 }, rect);
 }
 
-/// Called by the renderer thread (`wgl.Context.present`) after SwapBuffers
-/// presented a `width` × `height` pixel frame: the render target, the size
-/// last passed to `sizeCallback`. Thread-safe. Sets `frame_event`, which
-/// wakes the main thread if it is blocking in handleResize during live
-/// resize and which a new window polls for its first frame; the size is not
-/// compared with the one it waits for yet.
+/// Render-thread completion; the event never deliberately accepts a stale size.
 pub fn signalFrameDrawn(self: *Surface, width: u32, height: u32) void {
-    _ = width;
-    _ = height;
-    if (self.frame_event) |event| {
-        _ = w32.SetEvent(event);
+    const size = packSize(width, height);
+    self.presented_size.store(size, .release);
+    const wanted = self.wanted_size.load(.acquire);
+    if (wanted != 0 and wanted != size) return;
+    if (self.frame_event) |event| _ = w32.SetEvent(event);
+    const owner = self.first_frame_hwnd.swap(0, .acq_rel);
+    if (owner != 0) {
+        _ = w32.PostMessageW(@ptrFromInt(owner), Window.WM_APP_FIRST_FRAME, 0, @bitCast(self.core_surface.id));
     }
 }
 
-/// Ask for `Window.WM_APP_FIRST_FRAME` to be posted to `window` (the
-/// terminal's top-level window) once the render thread presented the next
-/// frame (`signalFrameDrawn`), with the core surface id in lparam. GUI
-/// thread (`Window.showWhenReady`). Nothing is posted yet: the window polls
-/// `frame_event` instead.
+/// GUI-thread arming for the first correctly sized presented frame.
 pub fn requestFirstFrameMessage(self: *Surface, window: w32.HWND) void {
-    _ = self;
-    _ = window;
+    self.first_frame_hwnd.store(@intFromPtr(window), .release);
+    if (self.core_surface_ready) self.core_surface.renderer_thread.draw_now.notify() catch {};
+}
+
+fn packSize(width: u32, height: u32) u64 {
+    return @as(u64, height) << 32 | width;
+}
+
+test "only a correctly sized frame signals the resize event" {
+    const testing = std.testing;
+    var surface: Surface = .{ .app = undefined };
+    surface.frame_event = w32.CreateEventW(null, 1, 0, null) orelse return error.Win32Error;
+    defer _ = w32.CloseHandle(surface.frame_event.?);
+    surface.wanted_size.store(packSize(800, 600), .release);
+    surface.signalFrameDrawn(640, 480);
+    try testing.expectEqual(w32.WAIT_TIMEOUT, w32.WaitForSingleObject(surface.frame_event.?, 0));
+    surface.signalFrameDrawn(800, 600);
+    try testing.expectEqual(w32.WAIT_OBJECT_0, w32.WaitForSingleObject(surface.frame_event.?, 0));
+    surface.resize_frame_pending = true;
+    try testing.expect(awaitResizeFrames(&.{&surface}));
+    try testing.expect(!surface.resize_frame_pending);
+}
+
+test "unchanged size does not ask for a resize frame" {
+    var surface: Surface = .{ .app = undefined, .width = 800, .height = 600, .in_live_resize = true };
+    surface.handleResize(800, 600);
+    try std.testing.expect(!surface.resize_frame_pending);
+    try std.testing.expectEqual(@as(u64, 0), surface.wanted_size.load(.acquire));
+    try std.testing.expectEqual(apprt.SurfaceSize{ .width = 800, .height = 600 }, surface.clientSize().?);
 }
 
 /// A color the renderer blends over the frames of an unfocused split
@@ -2434,11 +2583,11 @@ pub const DimColor = packed struct(u32) {
     }
 };
 
-/// Set the dim the renderer blends over this terminal's frames
-/// (`DimColor.none` for none). GUI thread. The renderer picks it up with the
-/// next frame it draws; this does not ask for one.
+/// Publish a changed dim and request a frame even if the terminal is idle.
 pub fn setUnfocusedDim(self: *Surface, dim: DimColor) void {
-    self.unfocused_dim.store(@bitCast(dim), .release);
+    const value: u32 = @bitCast(dim);
+    if (self.unfocused_dim.swap(value, .acq_rel) == value) return;
+    if (self.core_surface_ready) self.core_surface.renderer_thread.draw_now.notify() catch {};
 }
 
 /// The dim to blend over this terminal's frames (`setUnfocusedDim`). Any
@@ -2462,12 +2611,52 @@ pub fn clientSize(self: *const Surface) ?apprt.SurfaceSize {
     return .{ .width = @truncate(packed_size), .height = @truncate(packed_size >> 32) };
 }
 
-/// The tab holding this terminal moved to `window`
-/// (`Window.moveTabToNewWindow`), which made the terminal's window one of
-/// its children already. GUI thread. For now this only follows the new
-/// parent (`parent_window`); popups the old window owns stay with it.
+/// Rebuild owned popups after SetParent, without ending an active search.
 pub fn onReparented(self: *Surface, window: *Window) void {
+    if (self.parent_window == window) return;
+    self.first_frame_hwnd.store(0, .release);
+    const search_active = self.search_bar.active;
+    var saved_input = self.search_bar.popup.input;
+    self.search_bar.popup.input = .{};
+    self.search_bar.deinit();
+    self.link_preview.deinit();
+    self.link_preview.url_len = 0;
+    self.palette.deinit();
     self.parent_window = window;
+    self.handleDpiChange(@intFromFloat(@round(window.scale * 96)));
+
+    if (self.scrollbar) |sb| {
+        const state = sb.state;
+        const enabled = sb.enabled;
+        const bg = sb.bg;
+        const fg = sb.fg;
+        sb.destroy();
+        self.scrollbar = null;
+        if (self.hwnd) |hwnd| {
+            self.scrollbar = Scrollbar.create(self.app.core_app.alloc, hwnd, self, enabled) catch null;
+            if (self.scrollbar) |next| {
+                next.setTheme(bg, fg);
+                next.update(state);
+            }
+        }
+    }
+    if (search_active) {
+        self.search_bar.setActive(true, "");
+        if (self.search_bar.popup.hwnd != null) {
+            self.search_bar.popup.input.deinit(self.app.core_app.alloc);
+            self.search_bar.popup.input = saved_input;
+            self.search_bar.popup.setOwnerScale(window.scale);
+            self.search_bar.reposition();
+            self.search_bar.popup.invalidate();
+        } else {
+            if (saved_input.alloc) |alloc| saved_input.deinit(alloc);
+            self.search_bar.setActive(false, "");
+            log.warn("cannot reopen the search bar after reparenting", .{});
+        }
+    } else if (saved_input.alloc) |alloc| {
+        saved_input.deinit(alloc);
+    }
+    self.refitGrid();
 }
 
 test "DimColor premultiplies the color by its coverage" {
@@ -2482,9 +2671,7 @@ test "DimColor premultiplies the color by its coverage" {
 
 test "the unfocused dim and the client size cross threads as atomics" {
     const testing = std.testing;
-    var surface: Surface = undefined;
-    surface.unfocused_dim = .init(0);
-    surface.client_size = .init(0);
+    var surface: Surface = .{ .app = undefined };
     try testing.expectEqual(DimColor.none, surface.unfocusedDim());
     const dim: DimColor = .init(0x11, 0x11, 0x1b, 0.3);
     surface.setUnfocusedDim(dim);
@@ -2534,19 +2721,30 @@ pub fn gpuContextReset(self: *Surface) void {
 /// from a timer once they are gone, realize the display again so the next
 /// frame recreates everything.
 pub fn recoverGpuResources(self: *Surface) void {
-    if (!self.core_surface_ready) return;
+    if (!self.core_surface_ready or self.gpu_reset_pending) return;
+    self.gpu_reset_pending = true;
+    self.gpu_reset_attempts = 0;
+    const state = &self.core_surface.renderer_state;
+    state.mutex.lockUncancelable(global.io());
+    var screens = state.terminal.screens.all.iterator();
+    while (screens.next()) |entry| entry.value.*.kitty_images.dirty = true;
+    state.mutex.unlock(global.io());
     log.warn("the GPU context was reset, rebuilding the renderer resources", .{});
     self.core_surface.renderer_thread.wakeup.notify() catch {};
-    if (self.hwnd) |hwnd| _ = w32.SetTimer(hwnd, GPU_RESET_TIMER, 16, null);
+    const hwnd = self.hwnd orelse return;
+    if (w32.SetTimer(hwnd, GPU_RESET_TIMER, 16, null) == 0) self.failGpuRecovery();
 }
 
+const gpu_reset_max_attempts: u8 = 60;
+
 fn onGpuResetTimer(self: *Surface) void {
+    if (!self.gpu_reset_pending) return;
     if (!self.core_surface_ready) {
         if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
+        self.gpu_reset_pending = false;
         return;
     }
-    // Unrealized, the renderer releases its swap chain and shaders
-    // together, under the draw mutex.
+    self.gpu_reset_attempts += 1;
     const renderer = &self.core_surface.renderer;
     const released = released: {
         renderer.draw_mutex.lockUncancelable(global.io());
@@ -2554,15 +2752,26 @@ fn onGpuResetTimer(self: *Surface) void {
         break :released renderer.swap_chain == null;
     };
     if (!released) {
+        if (self.gpu_reset_attempts >= gpu_reset_max_attempts) return self.failGpuRecovery();
         self.core_surface.renderer_thread.wakeup.notify() catch {};
         return;
     }
-    if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
     self.core_surface.displayRealized() catch |err| {
         log.warn("displayRealized failed err={}", .{err});
+        if (self.gpu_reset_attempts >= gpu_reset_max_attempts) self.failGpuRecovery();
+        return;
     };
+    if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
+    self.gpu_reset_pending = false;
     self.core_surface.renderer_thread.wakeup.notify() catch {};
     log.info("renderer resources rebuilt after the GPU reset", .{});
+}
+
+fn failGpuRecovery(self: *Surface) void {
+    if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, GPU_RESET_TIMER);
+    self.gpu_reset_pending = false;
+    log.warn("GPU recovery stopped after {d} attempts", .{self.gpu_reset_attempts});
+    _ = self.app.performAction(.{ .surface = &self.core_surface }, .renderer_health, .unhealthy) catch {};
 }
 
 /// Called by the renderer thread (wgl.zig) on every frame: whether to
@@ -2598,6 +2807,10 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
     // otherwise they would combine with the next character when focus returns.
     if (!focused) {
         self.high_surrogate = 0;
+        self.key_event_produced_text = false;
+        self.clearImeText();
+        if (self.dead_key_preedit) self.core_surface.preeditCallback(null) catch {};
+        self.dead_key_preedit = false;
         // Composition messages follow keyboard focus, so a split losing
         // focus mid-composition never gets its own WM_IME_ENDCOMPOSITION.
         // Cancel the composition and clear its inline preedit now.
@@ -2815,6 +3028,7 @@ fn mapVirtualKey(vk: u16, extended: bool) input.Key {
         w32.VK_OEM_5 => .backslash,
         w32.VK_OEM_6 => .bracket_right,
         w32.VK_OEM_7 => .quote,
+        w32.VK_OEM_102 => .intl_backslash,
 
         // Numpad keys
         w32.VK_NUMPAD0 => .numpad_0,
@@ -2850,4 +3064,29 @@ pub fn core(self: *Surface) *CoreSurface {
 /// Return a reference to the App for use by core code.
 pub fn rtApp(self: *Surface) *App {
     return self.app;
+}
+
+test "ISO extra key and unowned pointer visibility" {
+    try std.testing.expectEqual(input.Key.intl_backslash, mapVirtualKey(w32.VK_OEM_102, false));
+    var surface: Surface = .{ .app = undefined };
+    surface.setMouseVisibility(false);
+    try std.testing.expect(!surface.mouse_visible);
+    surface.setMouseVisibility(true);
+    try std.testing.expect(surface.mouse_visible);
+    surface.tracking_leave = true;
+    surface.handleCaptureChanged();
+    try std.testing.expect(!surface.tracking_leave);
+    try std.testing.expectEqual(@as(?isize, null), surface.handleImeRequest(0, 0));
+    try std.testing.expectEqual(@as(?isize, 0), surface.handleImeRequest(w32.IMR_QUERYCHARPOSITION, 0));
+}
+
+test "a stale signaled event cannot complete a changed resize" {
+    var surface: Surface = .{ .app = undefined };
+    surface.frame_event = w32.CreateEventW(null, 1, 1, null) orelse return error.Win32Error;
+    defer _ = w32.CloseHandle(surface.frame_event.?);
+    surface.presented_size.store(packSize(800, 600), .release);
+    surface.wanted_size.store(packSize(900, 700), .release);
+    surface.resize_frame_pending = true;
+    try std.testing.expect(!awaitResizeFrames(&.{&surface}));
+    try std.testing.expect(!surface.resize_frame_pending);
 }
