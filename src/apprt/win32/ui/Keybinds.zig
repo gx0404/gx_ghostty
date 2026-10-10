@@ -772,13 +772,7 @@ fn title(action: Action, commands: []const input.Command) ?Title {
     }
     if (count == 1) return .{ .msgid = same_name.?, .exact = false };
 
-    if (action == .gx) return .{ .msgid = switch (action.gx) {
-        .settings => "Settings…",
-        .main_menu => "Main Menu",
-        .keybinds => "Keyboard Shortcuts",
-        .new_tab_profile => "New Tab with Profile",
-        .new_window_profile => "New Window with Profile",
-    }, .exact = false };
+    if (action == .gx) return .{ .msgid = action.gx.title(), .exact = false };
     const msgid = fallback_titles.get(@tagName(tag)) orelse return null;
     return .{ .msgid = msgid, .exact = false };
 }

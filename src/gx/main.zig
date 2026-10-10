@@ -8,6 +8,9 @@
 //!   (`gui_settings`); the settings model that the GTK settings dialog
 //!   and the Windows settings overlay render (`settings_map`); the
 //!   built-in GX Mocha theme (`theme`).
+//! - State kept between runs outside the configuration (`state_file`):
+//!   the place of the last window (`window_state`) and the command palette
+//!   history (`palette_history`).
 //! - UI language and translations (`i18n`); the name, links and
 //!   non-affiliation notice of the About surfaces (`branding`).
 //! - `gx:` binding actions (`action`) and launch profiles (`profiles`).
@@ -15,6 +18,8 @@
 //!   (`policy`), close confirmation (`confirm`), herdr app mode
 //!   (`app_mode`) and the kind of program in the foreground (`leader`).
 //! - New output in tabs that are not shown (`unread`).
+//! - The policy for opening links from terminal output (`url_policy`).
+//! - Performance measurements, on with `GHOSTTY_GX_PERF=1` (`perf`).
 //! - The colors of the GTK look, as CSS (`gtk_css`).
 //! - The interface library of both apprts: color math and the accent
 //!   (`ui_color`), the design tokens (`ui_tokens`) and window chrome
@@ -41,19 +46,24 @@ pub const i18n = @import("i18n.zig");
 pub const leader = @import("leader.zig");
 pub const motion = @import("motion.zig");
 pub const osc7 = @import("osc7.zig");
+pub const palette_history = @import("palette_history.zig");
 pub const path_quote = @import("path_quote.zig");
+pub const perf = @import("perf.zig");
 pub const pinyin = @import("pinyin.zig");
 pub const policy = @import("policy.zig");
 pub const proc = @import("proc.zig");
 pub const profiles = @import("profiles.zig");
 pub const settings_map = @import("settings_map.zig");
 pub const shortcuts = @import("shortcuts.zig");
+pub const state_file = @import("state_file.zig");
 pub const theme = @import("theme.zig");
 pub const theme_swatch = @import("theme_swatch.zig");
 pub const ui_color = @import("ui_color.zig");
 pub const ui_tokens = @import("ui_tokens.zig");
 pub const unread = @import("unread.zig");
+pub const url_policy = @import("url_policy.zig");
 pub const win32_input = @import("win32_input.zig");
+pub const window_state = @import("window_state.zig");
 
 test {
     _ = action;
@@ -71,17 +81,22 @@ test {
     _ = leader;
     _ = motion;
     _ = osc7;
+    _ = palette_history;
     _ = path_quote;
+    _ = perf;
     _ = pinyin;
     _ = policy;
     _ = proc;
     _ = profiles;
     _ = settings_map;
     _ = shortcuts;
+    _ = state_file;
     _ = theme;
     _ = theme_swatch;
     _ = ui_color;
     _ = ui_tokens;
     _ = unread;
+    _ = url_policy;
     _ = win32_input;
+    _ = window_state;
 }

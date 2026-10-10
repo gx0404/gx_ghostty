@@ -18,6 +18,19 @@
 //! replace the list from lower layers instead of extending it, the same
 //! way command-line font families replace configured ones upstream.
 //!
+//! `Layers` keeps the recorded steps of every layer: it reads the files
+//! once and then builds configurations in memory (`Layers.build`), e.g. for
+//! every step of a theme preview, and tells which layer a key comes from
+//! (`Layers.provenance`). `rebuild` builds a loaded configuration again
+//! from the steps it recorded, without reading any file.
+//!
+//! Problems loading cannot report through a parser are recorded as
+//! `.diagnostic` steps, so every later replay reports them again: an
+//! overlay file that cannot be read, and a `language` value Ghostty GX
+//! does not support. `diagnosticsDigest` tells app runtimes whether the
+//! diagnostics changed. The built-in theme is installed into the user's
+//! theme directory once per process.
+//!
 //! A window material (`gx-window-material`) that shows behind the
 //! terminals comes with a `background-opacity` in the defaults layer
 //! (`materialOpacity`) unless a layer sets `background-opacity`; only the
@@ -41,6 +54,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const build_config = @import("../build_config.zig");
 const Config = @import("../config/Config.zig");
+const conditional = @import("../config/conditional.zig");
 const file_load = @import("../config/file_load.zig");
 const themepkg = @import("../config/theme.zig");
 const cli = @import("../cli.zig");
@@ -49,6 +63,7 @@ const inputpkg = @import("../input.zig");
 const config_types = @import("config_types.zig");
 const gui_settings = @import("gui_settings.zig");
 const i18n = @import("i18n.zig");
+const perf = @import("perf.zig");
 const gx_theme = @import("theme.zig");
 
 const log = std.log.scoped(.gx_config);
@@ -82,6 +97,17 @@ pub fn materialOpacity(material: config_types.WindowMaterial) ?[:0]const u8 {
 /// layer and below `-e`, and finalizes it again. The argument is recorded
 /// like any other input, so theme and conditional reloads keep it.
 pub fn applyArg(config: *Config, alloc_gpa: Allocator, arg: [:0]const u8) !void {
+    const result = try rebuild(config, alloc_gpa, &.{arg});
+    config.deinit();
+    config.* = result;
+}
+
+/// Builds `config` again from the inputs it recorded, with `args`
+/// (`--key=value`) above every layer and below `-e`, without reading any
+/// file but the theme. `Config.default` runs again, so the GTK app runtime
+/// rebuilds to translate the default command palette entries after the
+/// messages language changed. The conditional state of `config` is kept.
+pub fn rebuild(config: *const Config, alloc_gpa: Allocator, args: []const [:0]const u8) !Config {
     const steps = config._replay_steps.items;
     const command_start = for (steps, 0..) |step, i| {
         if (step == .@"-e") break i;
@@ -96,7 +122,7 @@ pub fn applyArg(config: *Config, alloc_gpa: Allocator, arg: [:0]const u8) !void 
     for (steps[0..command_start]) |step| {
         if (step != .conditional_arg) try ordered.append(arena, step);
     }
-    try ordered.append(arena, .{ .arg = arg });
+    try ordered.appendSlice(arena, try argSteps(arena, args));
     try ordered.appendSlice(arena, steps[command_start..]);
 
     var result = try config.cloneEmpty(alloc_gpa);
@@ -104,8 +130,35 @@ pub fn applyArg(config: *Config, alloc_gpa: Allocator, arg: [:0]const u8) !void 
     try result.gxReplay(alloc_gpa, ordered.items);
     result.@"_xdg-terminal-exec" = config.@"_xdg-terminal-exec";
     try result.finalize();
-    config.deinit();
-    config.* = result;
+    return result;
+}
+
+/// A digest of the diagnostics of `config`: 0 without any, otherwise the
+/// same nonzero value for the same diagnostics in the same order. App
+/// runtimes compare it to report configuration problems once per change,
+/// not again for every reload that keeps them (such as each step of a
+/// theme preview).
+pub fn diagnosticsDigest(config: *const Config) u64 {
+    const items = config._diagnostics.items();
+    if (items.len == 0) return 0;
+    var hasher: std.hash.Wyhash = .init(0);
+    for (items) |diag| {
+        hasher.update(@tagName(diag.location));
+        switch (diag.location) {
+            .none => {},
+            .cli => |index| hasher.update(std.mem.asBytes(&index)),
+            .file => |file| {
+                hasher.update(file.path);
+                hasher.update(std.mem.asBytes(&file.line));
+            },
+        }
+        hasher.update(&.{0});
+        hasher.update(diag.key);
+        hasher.update(&.{0});
+        hasher.update(diag.message);
+        hasher.update(&.{0});
+    }
+    return @max(hasher.final(), 1);
 }
 
 /// The Ghostty GX defaults for this platform, in configuration file
@@ -151,18 +204,21 @@ fn isOff(value: []const u8) bool {
 
 /// Loads the configuration with the Ghostty GX layers and finalizes it.
 pub fn load(alloc_gpa: Allocator) !Config {
+    const span: perf.Span = .begin(global.io());
+    defer _ = span.end(global.io(), "config_load");
     return try loadWith(alloc_gpa, SystemSources{});
 }
 
 /// Loads the configuration like `load`, with `overrides` (`--key=value`
 /// arguments) applied above the command line and below `-e`. Settings UIs
-/// use it to preview a setting, such as a theme, without writing it.
+/// use it to preview a setting, such as a theme, without writing it; to
+/// preview repeatedly, read the files once with `Layers.load` instead.
 pub fn loadWithOverrides(alloc_gpa: Allocator, overrides: []const [:0]const u8) !Config {
     return try loadWith(alloc_gpa, SystemSources{ .overrides = overrides });
 }
 
 /// A configuration with only the Ghostty GX defaults applied, not
-/// finalized; e.g. the values the settings UI resets to.
+/// finalized.
 pub fn defaultConfig(alloc_gpa: Allocator) !Config {
     var cfg = try Config.default(alloc_gpa);
     errdefer cfg.deinit();
@@ -181,6 +237,266 @@ pub fn overlayPath(alloc: Allocator) ![]u8 {
     defer alloc.free(config_path);
     const dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
     return try std.fs.path.join(alloc, &.{ dir, gui_settings.file_name });
+}
+
+/// A layer of the configuration, lowest first.
+pub const Layer = enum {
+    /// The Ghostty GX defaults.
+    defaults,
+
+    /// The user configuration files and every file they or the command
+    /// line include.
+    user,
+
+    /// The settings overlay `gui-settings.ghostty`.
+    overlay,
+
+    /// The command line, without `-e` and its command.
+    cli,
+};
+
+/// The configuration inputs of every layer, read from disk once and then
+/// built into configurations in memory as often as needed: a settings UI
+/// keeps one while it is open and builds every theme preview from it
+/// instead of loading everything again. Building gives the same
+/// configuration as loading (`build` with the same overrides as
+/// `loadWithOverrides`), as long as the files did not change.
+pub const Layers = struct {
+    /// Owns the steps and the paths.
+    arena: ArenaAllocator,
+
+    /// The recorded inputs of each layer, in the order they were read.
+    steps: std.EnumArray(Layer, std.ArrayList(Step)) = .initFill(.empty),
+
+    /// `-e` and the command after it, last in every build.
+    command: []const Step = &.{},
+
+    /// The directory of the overlay file, against which `setOverlay`
+    /// expands relative paths; null when there is no overlay.
+    overlay_dir: ?[]const u8 = null,
+
+    /// Whether builds translate the palette entries of the defaults
+    /// (`translatePalette`), add the `background-opacity` of a window
+    /// material (`materialOpacityStep`) and install the built-in theme.
+    translate_palette: bool = false,
+    material_opacity: bool = false,
+    install_theme: bool = false,
+
+    xdg_terminal_exec: bool = false,
+
+    /// Reads every layer from disk. Fails with `error.LayeringDisabled`
+    /// when `GHOSTTY_GX_DEFAULTS` turns the layering off (`enabled`).
+    pub fn load(alloc_gpa: Allocator) !Layers {
+        if (!enabled(alloc_gpa)) return error.LayeringDisabled;
+        return try read(alloc_gpa, SystemSources{});
+    }
+
+    pub fn deinit(self: *Layers) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// A finalized configuration of all layers, with `overrides`
+    /// (`--key=value`) above the command line and below `-e`. Reads no
+    /// file but the theme.
+    pub fn build(self: *const Layers, alloc_gpa: Allocator, overrides: []const [:0]const u8) !Config {
+        const span: perf.Span = .begin(global.io());
+        defer _ = span.end(global.io(), "config_build");
+
+        var scratch: ArenaAllocator = .init(alloc_gpa);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        var ordered: std.ArrayList(Step) = .empty;
+        try appendLayer(arena, &ordered, self.steps.get(.defaults).items);
+        const defaults_end = ordered.items.len;
+        try appendLayer(arena, &ordered, self.steps.get(.user).items);
+        try appendLayer(arena, &ordered, self.steps.get(.overlay).items);
+        try appendLayer(arena, &ordered, self.steps.get(.cli).items);
+        try appendLayer(arena, &ordered, try argSteps(arena, overrides));
+        if (try languageDiagnostic(arena, ordered.items)) |step| try ordered.append(arena, step);
+        try ordered.appendSlice(arena, self.command);
+
+        if (self.translate_palette) {
+            try translatePalette(arena, ordered.items[0..defaults_end], configuredLanguage(ordered.items));
+        }
+        if (self.material_opacity) {
+            if (materialOpacityStep(ordered.items)) |step| try ordered.insert(arena, defaults_end, step);
+        }
+
+        var result = try Config.default(alloc_gpa);
+        errdefer result.deinit();
+        try result.gxReplay(alloc_gpa, ordered.items);
+        result.@"_xdg-terminal-exec" = self.xdg_terminal_exec;
+
+        if (self.install_theme) {
+            if (result.theme) |theme| {
+                if (gx_theme.isBuiltin(theme.light) or gx_theme.isBuiltin(theme.dark)) installThemeOnce(alloc_gpa);
+            }
+        }
+
+        try result.finalize();
+        return result;
+    }
+
+    /// The highest layer that sets `key` (a configuration key without
+    /// `--`), which is where its value comes from; null when no layer sets
+    /// it, so it is Ghostty's default or comes from the theme. A
+    /// `background-opacity` the defaults add for a window material counts
+    /// as set by the defaults.
+    pub fn provenance(self: *const Layers, key: []const u8) ?Layer {
+        var result: ?Layer = null;
+        for (std.enums.values(Layer)) |layer| {
+            if (self.sets(layer, key)) result = layer;
+        }
+        if (result == null and self.material_opacity and std.mem.eql(u8, key, "background-opacity")) {
+            var material: config_types.WindowMaterial = .solid;
+            for (std.enums.values(Layer)) |layer| material = lastMaterial(material, self.steps.get(layer).items);
+            if (materialOpacity(material) != null) return .defaults;
+        }
+        return result;
+    }
+
+    /// Whether `layer` sets `key` (a configuration key without `--`).
+    pub fn sets(self: *const Layers, layer: Layer, key: []const u8) bool {
+        for (self.steps.get(layer).items) |step| switch (step) {
+            .arg => |arg| if (argKey(arg)) |name| {
+                if (std.mem.eql(u8, name, key)) return true;
+            },
+            else => {},
+        };
+        return false;
+    }
+
+    /// Sets `key` to `values` in the overlay layer, one value per line like
+    /// `gui_settings.Overlay.setAll` writes the file (an empty `values`
+    /// removes the key), so later builds follow what a settings UI saved
+    /// without reading the file again.
+    pub fn setOverlay(self: *Layers, key: []const u8, values: []const []const u8) Allocator.Error!void {
+        const arena = self.arena.allocator();
+        const list = self.steps.getPtr(.overlay);
+
+        var position: ?usize = null;
+        var i: usize = 0;
+        while (i < list.items.len) {
+            const matches = switch (list.items[i]) {
+                .arg => |arg| if (argKey(arg)) |name| std.mem.eql(u8, name, key) else false,
+                else => false,
+            };
+            if (!matches) {
+                i += 1;
+                continue;
+            }
+            if (position == null) position = i;
+            _ = list.orderedRemove(i);
+        }
+
+        // New lines go where the key was, else before the expansion of
+        // relative paths that ends the steps of the file.
+        const expand: ?usize = for (list.items, 0..) |step, index| {
+            if (step == .expand) break index;
+        } else null;
+        const at = position orelse expand orelse list.items.len;
+        for (values, 0..) |value, n| {
+            const arg = try std.fmt.allocPrintSentinel(arena, "--{s}={s}", .{ key, value }, 0);
+            try list.insert(arena, at + n, .{ .arg = arg });
+        }
+        if (values.len > 0 and expand == null) {
+            if (self.overlay_dir) |dir| try list.append(arena, .{ .expand = dir });
+        }
+    }
+
+    /// Reads the layers from `sources` (see `SystemSources` for the
+    /// interface).
+    fn read(alloc_gpa: Allocator, sources: anytype) !Layers {
+        var live = try Config.default(alloc_gpa);
+        defer live.deinit();
+
+        try sources.loadUserFiles(&live, alloc_gpa);
+        // `config-default-files` only has an effect on the command line.
+        live.@"config-default-files" = true;
+        const cli_start = live._replay_steps.items.len;
+        try sources.loadCli(&live, alloc_gpa);
+
+        // `--config-default-files=false` makes the command-line loader
+        // rebuild the configuration from the command-line steps alone.
+        const default_files = live.@"config-default-files";
+        const cli_begin = if (default_files) cli_start else 0;
+        const cli_end = live._replay_steps.items.len;
+        const command_start = for (live._replay_steps.items[cli_begin..cli_end], cli_begin..) |step, i| {
+            if (step == .@"-e") break i;
+        } else cli_end;
+        const command_len = cli_end - command_start;
+
+        // Includes are recorded before the `-e` command.
+        try live.loadRecursiveFiles(alloc_gpa);
+        const includes_end = live._replay_steps.items.len - command_len;
+
+        var self: Layers = .{
+            .arena = .init(alloc_gpa),
+            .translate_palette = sources.translatesPalette(),
+            .material_opacity = sources.materialOpacity(),
+            .install_theme = sources.installsTheme(),
+            .xdg_terminal_exec = live.@"_xdg-terminal-exec",
+        };
+        errdefer self.deinit();
+        const arena = self.arena.allocator();
+
+        const overlay_start = live._replay_steps.items.len;
+        var overlay_error: ?cli.Diagnostic = null;
+        if (default_files) {
+            if (sources.overlay(alloc_gpa)) |path| {
+                defer alloc_gpa.free(path);
+                if (std.fs.path.dirname(path)) |dir| self.overlay_dir = try arena.dupe(u8, dir);
+                overlay_error = try loadOverlay(&live, alloc_gpa, arena, path);
+            }
+        }
+        const overlay_end = live._replay_steps.items.len;
+        const steps = live._replay_steps.items;
+
+        try self.steps.getPtr(.defaults).appendSlice(arena, try defaultSteps(arena, sources.defaultsText()));
+        if (default_files) try self.appendCopies(.user, steps[0..cli_start]);
+        try self.appendCopies(.user, steps[command_start..includes_end]);
+        try self.appendCopies(.overlay, steps[overlay_start..overlay_end]);
+        if (overlay_error) |diag| try self.steps.getPtr(.overlay).append(arena, .{ .diagnostic = diag });
+        try self.appendCopies(.cli, steps[cli_begin..command_start]);
+
+        var command: std.ArrayList(Step) = .empty;
+        for (steps[includes_end .. includes_end + command_len]) |step| {
+            try command.append(arena, try cloneStep(arena, step));
+        }
+        self.command = command.items;
+        return self;
+    }
+
+    fn appendCopies(self: *Layers, layer: Layer, steps: []const Step) Allocator.Error!void {
+        const arena = self.arena.allocator();
+        const list = self.steps.getPtr(layer);
+        for (steps) |step| try list.append(arena, try cloneStep(arena, step));
+    }
+};
+
+/// Loads the overlay file at `path` into `live`. A missing or empty file
+/// is no overlay; a file that cannot be read gives a diagnostic (allocated
+/// with `arena`), so settings that silently do not apply show up.
+fn loadOverlay(live: *Config, alloc_gpa: Allocator, arena: Allocator, path: []const u8) Allocator.Error!?cli.Diagnostic {
+    const failure: anyerror = failure: {
+        if (!std.fs.path.isAbsolute(path)) break :failure error.InvalidPath;
+        // `Config.loadFile` only logs a path that is not a file.
+        const file = file_load.open(global.io(), path) catch |err| switch (err) {
+            error.FileNotFound, error.FileIsEmpty => return null,
+            else => break :failure err,
+        };
+        file.close(global.io());
+        live.loadFile(alloc_gpa, path) catch |err| switch (err) {
+            error.FileNotFound, error.FileIsEmpty => return null,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => break :failure err,
+        };
+        return null;
+    };
+    log.warn("cannot read {s} err={}", .{ path, failure });
+    return .{ .message = try std.fmt.allocPrintSentinel(arena, "error reading {s}: {}", .{ path, failure }, 0) };
 }
 
 /// Where the layers come from when loading for real.
@@ -216,101 +532,97 @@ const SystemSources = struct {
         return material_opacity.load(.monotonic);
     }
 
-    fn installTheme(_: SystemSources, alloc: Allocator) void {
-        var arena: ArenaAllocator = .init(alloc);
-        defer arena.deinit();
-        const dir = themepkg.Location.user.dir(arena.allocator()) catch null orelse {
-            log.warn("no user theme directory for the {s} theme", .{gx_theme.name});
-            return;
-        };
-        const result = gx_theme.install(alloc, global.io(), dir) catch |err| {
-            log.warn("cannot install the {s} theme into {s} err={}", .{ gx_theme.name, dir, err });
-            return;
-        };
-        switch (result) {
-            .created, .updated => log.info("installed the {s} theme into {s}", .{ gx_theme.name, dir }),
-            .unchanged => {},
-            .user_file => log.info("keeping the user's {s} theme in {s}", .{ gx_theme.name, dir }),
-        }
+    fn installsTheme(_: SystemSources) bool {
+        return true;
     }
 };
+
+/// Whether the built-in theme was installed (or tried to be) in this
+/// process.
+var theme_installed: std.atomic.Value(bool) = .init(false);
+
+/// Installs the built-in theme into the user's theme directory, once per
+/// process: later loads find it there.
+fn installThemeOnce(alloc: Allocator) void {
+    if (theme_installed.swap(true, .acq_rel)) return;
+    var arena: ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const dir = themepkg.Location.user.dir(arena.allocator()) catch null orelse {
+        log.warn("no user theme directory for the {s} theme", .{gx_theme.name});
+        return;
+    };
+    const result = gx_theme.install(alloc, global.io(), dir) catch |err| {
+        log.warn("cannot install the {s} theme into {s} err={}", .{ gx_theme.name, dir, err });
+        return;
+    };
+    switch (result) {
+        .created, .updated => log.info("installed the {s} theme into {s}", .{ gx_theme.name, dir }),
+        .unchanged => {},
+        .user_file => log.info("keeping the user's {s} theme in {s}", .{ gx_theme.name, dir }),
+    }
+}
 
 /// Loads the layers from `sources` (see `SystemSources` for the
 /// interface), rebuilds the configuration in layer order and finalizes
 /// it.
 fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
-    var live = try Config.default(alloc_gpa);
-    defer live.deinit();
-
-    try sources.loadUserFiles(&live, alloc_gpa);
-    // `config-default-files` only has an effect on the command line.
-    live.@"config-default-files" = true;
-    const cli_start = live._replay_steps.items.len;
-    try sources.loadCli(&live, alloc_gpa);
-
-    // `--config-default-files=false` makes the command-line loader rebuild
-    // the configuration from the command-line steps alone.
-    const default_files = live.@"config-default-files";
-    const cli_begin = if (default_files) cli_start else 0;
-    const cli_end = live._replay_steps.items.len;
-    const command_start = for (live._replay_steps.items[cli_begin..cli_end], cli_begin..) |step, i| {
-        if (step == .@"-e") break i;
-    } else cli_end;
-    const command_len = cli_end - command_start;
-
-    // Includes are recorded before the `-e` command.
-    try live.loadRecursiveFiles(alloc_gpa);
-    const includes_end = live._replay_steps.items.len - command_len;
-
-    const overlay_start = live._replay_steps.items.len;
-    if (default_files) {
-        if (sources.overlay(alloc_gpa)) |path| {
-            defer alloc_gpa.free(path);
-            _ = live.loadOptionalFile(alloc_gpa, path);
-        }
-    }
-    const overlay_end = live._replay_steps.items.len;
-
-    var scratch: ArenaAllocator = .init(alloc_gpa);
-    defer scratch.deinit();
-    const arena = scratch.allocator();
-    const steps = live._replay_steps.items;
-
-    var ordered: std.ArrayList(Step) = .empty;
-    try appendLayer(arena, &ordered, try defaultSteps(arena, sources.defaultsText()));
-    const defaults_end = ordered.items.len;
-    var user: std.ArrayList(Step) = .empty;
-    if (default_files) try user.appendSlice(arena, steps[0..cli_start]);
-    try user.appendSlice(arena, steps[command_start..includes_end]);
-    try appendLayer(arena, &ordered, user.items);
-    try appendLayer(arena, &ordered, steps[overlay_start..overlay_end]);
-    try appendLayer(arena, &ordered, steps[cli_begin..command_start]);
-    try appendLayer(arena, &ordered, try argSteps(arena, sources.overrides));
-    try ordered.appendSlice(arena, steps[includes_end .. includes_end + command_len]);
-
-    if (sources.translatesPalette()) {
-        try translatePalette(arena, ordered.items[0..defaults_end], configuredLanguage(ordered.items));
-    }
-    if (sources.materialOpacity()) {
-        if (materialOpacityStep(ordered.items)) |step| try ordered.insert(arena, defaults_end, step);
-    }
-
-    var result = try live.cloneEmpty(alloc_gpa);
-    errdefer result.deinit();
-    try result.gxReplay(alloc_gpa, ordered.items);
-    result.@"_xdg-terminal-exec" = live.@"_xdg-terminal-exec";
-
-    if (result.theme) |theme| {
-        if (gx_theme.isBuiltin(theme.light) or gx_theme.isBuiltin(theme.dark)) {
-            sources.installTheme(alloc_gpa);
-        }
-    }
-
-    try result.finalize();
-    return result;
+    var layers = try Layers.read(alloc_gpa, sources);
+    defer layers.deinit();
+    return try layers.build(alloc_gpa, sources.overrides);
 }
 
-/// The steps of command-line style arguments. The arguments are not
+/// A copy of `step` allocated with `arena`.
+fn cloneStep(arena: Allocator, step: Step) Allocator.Error!Step {
+    return switch (step) {
+        .arg => |arg| .{ .arg = try arena.dupeZ(u8, arg) },
+        .expand => |base| .{ .expand = try arena.dupe(u8, base) },
+        .conditional_arg => |value| .{ .conditional_arg = .{
+            .conditions = conditions: {
+                const copies = try arena.alloc(conditional.Conditional, value.conditions.len);
+                for (value.conditions, copies) |cond, *copy| copy.* = try cond.clone(arena);
+                break :conditions copies;
+            },
+            .arg = try arena.dupe(u8, value.arg),
+        } },
+        .diagnostic => |diag| .{ .diagnostic = try diag.clone(arena) },
+        .@"-e" => .@"-e",
+    };
+}
+
+/// The key of a `--key=value` (or `--key`) argument.
+fn argKey(arg: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, arg, "--")) return null;
+    const rest = arg[2..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '=') orelse rest.len];
+}
+
+/// A diagnostic step for a `language` that Ghostty GX does not support,
+/// which then shows in `zh-CN` (`i18n.resolve`); null when the last
+/// `language` before `-e` is supported or not set.
+fn languageDiagnostic(arena: Allocator, steps: []const Step) Allocator.Error!?Step {
+    const prefix = "--language=";
+    var value: ?[]const u8 = null;
+    for (steps) |step| switch (step) {
+        .arg => |arg| if (std.mem.startsWith(u8, arg, prefix)) {
+            value = if (arg.len > prefix.len) arg[prefix.len..] else null;
+        },
+        .@"-e" => break,
+        else => {},
+    };
+    const language = value orelse return null;
+    if (i18n.parseLanguage(language) != null) return null;
+    return .{ .diagnostic = .{
+        .key = "language",
+        .message = try std.fmt.allocPrintSentinel(
+            arena,
+            "unsupported value \"{s}\", using {s}",
+            .{ language, i18n.Language.default.configValue() },
+            0,
+        ),
+    } };
+}
+
+// The steps of command-line style arguments. The arguments are not
 /// copied; replaying copies them into the new configuration.
 fn argSteps(arena: Allocator, args: []const [:0]const u8) Allocator.Error![]const Step {
     const result = try arena.alloc(Step, args.len);
@@ -361,23 +673,32 @@ fn replacedKey(arg: []const u8) ?usize {
 /// layered `steps` configure (`materialOpacity`), or null without a
 /// material or when a layer sets `background-opacity` itself.
 fn materialOpacityStep(steps: []const Step) ?Step {
-    const material_prefix = "--gx-window-material=";
-    var material: config_types.WindowMaterial = .solid;
     for (steps) |step| switch (step) {
-        .arg => |arg| {
-            if (std.mem.startsWith(u8, arg, "--background-opacity=")) return null;
-            if (std.mem.startsWith(u8, arg, material_prefix)) {
-                const value = arg[material_prefix.len..];
-                material = if (value.len == 0)
-                    .solid
-                else
-                    std.meta.stringToEnum(config_types.WindowMaterial, value) orelse material;
-            }
+        .arg => |arg| if (std.mem.startsWith(u8, arg, "--background-opacity=")) return null,
+        .@"-e" => break,
+        else => {},
+    };
+    return .{ .arg = materialOpacity(lastMaterial(.solid, steps)) orelse return null };
+}
+
+/// The window material after `steps`, starting from `material`: the last
+/// `gx-window-material` value before `-e`; an empty value resets it to
+/// `solid` and an invalid one leaves it unchanged.
+fn lastMaterial(material: config_types.WindowMaterial, steps: []const Step) config_types.WindowMaterial {
+    const prefix = "--gx-window-material=";
+    var result = material;
+    for (steps) |step| switch (step) {
+        .arg => |arg| if (std.mem.startsWith(u8, arg, prefix)) {
+            const value = arg[prefix.len..];
+            result = if (value.len == 0)
+                .solid
+            else
+                std.meta.stringToEnum(config_types.WindowMaterial, value) orelse result;
         },
         .@"-e" => break,
         else => {},
     };
-    return .{ .arg = materialOpacity(material) orelse return null };
+    return result;
 }
 
 /// The UI language that layered `steps` configure: the last `language`
@@ -484,7 +805,9 @@ const TestSources = struct {
         return alloc.dupe(u8, path) catch null;
     }
 
-    fn installTheme(_: TestSources, _: Allocator) void {}
+    fn installsTheme(_: TestSources) bool {
+        return false;
+    }
 };
 
 /// A temporary directory with helpers to write files and get their
@@ -1257,4 +1580,338 @@ test "applyArg ranks above every layer and keeps the -e command" {
 
     try applyArg(&cfg, testing.allocator, "--background-opacity=0.8");
     try testing.expectEqual(@as(f64, 0.8), cfg.@"background-opacity");
+}
+
+/// Fails, naming the keys, when two configurations differ in any key or in
+/// their number of diagnostics.
+fn expectSameConfig(expected: *const Config, actual: *const Config) !void {
+    var changes = expected.changeIterator(actual);
+    var same = true;
+    while (changes.next()) |key| {
+        // `Path.equal` compares the pointers of the paths, so separately
+        // loaded configurations always differ there; compare the text.
+        if (key == .@"config-file") {
+            const a = expected.@"config-file".value.items;
+            const b = actual.@"config-file".value.items;
+            if (a.len == b.len) {
+                for (a, b) |x, y| {
+                    if (std.meta.activeTag(x) != std.meta.activeTag(y)) break;
+                    const x_path, const y_path = switch (x) {
+                        inline else => |path, tag| .{ path, @field(y, @tagName(tag)) },
+                    };
+                    if (!std.mem.eql(u8, x_path, y_path)) break;
+                } else continue;
+            }
+        }
+        std.debug.print("configurations differ in {t}\n", .{key});
+        same = false;
+    }
+    try std.testing.expect(same);
+    try std.testing.expectEqual(expected._diagnostics.items().len, actual._diagnostics.items().len);
+}
+
+test "Layers.build gives what loading gives, without reading the files again" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const light = try dir.write(arena, "light", "background = #eeeeee\nforeground = #010101\n");
+    const dark = try dir.write(arena, "dark", "background = #111111\n");
+    _ = try dir.write(arena, "include.ghostty", "window-padding-y = 7\nfont-family = I\n");
+    const sources: TestSources = .{
+        .defaults_text = try std.fmt.allocPrint(
+            arena,
+            "theme = light:{s},dark:{s}\nfont-size = 12\nfont-family = A\nlanguage = zh-CN\n",
+            .{ light, dark },
+        ),
+        .user_path = try dir.write(arena, "config.ghostty", "font-size = 13\nconfig-file = include.ghostty\n"),
+        .overlay_path = try dir.write(arena, gui_settings.file_name, "language = en\nfont-family = O\n"),
+        .args = &.{ "--window-padding-x=20", "-e", "htop", "--font-size=99" },
+        .overrides = &.{"--font-size=17"},
+        .translate_palette = true,
+        .material_opacity = true,
+    };
+
+    var loaded = try loadWith(testing.allocator, sources);
+    defer loaded.deinit();
+    var layers = try Layers.read(testing.allocator, sources);
+    defer layers.deinit();
+
+    // Builds keep what was read.
+    _ = try dir.write(arena, "config.ghostty", "font-size = 30\n");
+    _ = try dir.write(arena, "include.ghostty", "window-padding-y = 1\n");
+    _ = try dir.write(arena, gui_settings.file_name, "language = zh-CN\n");
+
+    var built = try layers.build(testing.allocator, sources.overrides);
+    defer built.deinit();
+    try expectSameConfig(&loaded, &built);
+    try expectNoDiagnostics(&built);
+    try testing.expectEqual(@as(f32, 17), built.@"font-size");
+    try testing.expectEqualStrings("en", built.language.?);
+    try expectFamilies(&.{"O"}, built.@"font-family");
+    try testing.expectEqual(@as(u32, 7), built.@"window-padding-y".top_left);
+    try testing.expectEqual(@as(u32, 20), built.@"window-padding-x".top_left);
+    try testing.expectEqualStrings("htop", built.@"initial-command".?.direct[0]);
+
+    // Other overrides, such as a theme preview, need no files either.
+    var preview = try layers.build(testing.allocator, &.{try std.fmt.allocPrintSentinel(arena, "--theme={s}", .{dark}, 0)});
+    defer preview.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, preview.background);
+    try testing.expectEqual(@as(f32, 13), preview.@"font-size");
+
+    var dark_cfg = (try built.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark_cfg.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, dark_cfg.background);
+    try testing.expectEqual(@as(f32, 17), dark_cfg.@"font-size");
+}
+
+test "provenance names the highest layer that sets a key" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    var layers = try Layers.read(testing.allocator, TestSources{
+        .defaults_text = "font-size = 12\ncursor-style = block\nfont-family = A\nlanguage = zh-CN\n",
+        .user_path = try dir.write(arena, "config.ghostty", "font-size = 13\nlanguage = en\nfont-family-bold = B\n"),
+        .overlay_path = try dir.write(arena, gui_settings.file_name, "language = zh-CN\ntheme =\n"),
+        .args = &.{ "--window-padding-x=4", "-e", "vim", "--cursor-style=bar" },
+    });
+    defer layers.deinit();
+
+    try testing.expectEqual(@as(?Layer, .defaults), layers.provenance("cursor-style"));
+    try testing.expectEqual(@as(?Layer, .defaults), layers.provenance("font-family"));
+    try testing.expectEqual(@as(?Layer, .user), layers.provenance("font-size"));
+    try testing.expectEqual(@as(?Layer, .user), layers.provenance("font-family-bold"));
+    try testing.expectEqual(@as(?Layer, .overlay), layers.provenance("language"));
+    try testing.expectEqual(@as(?Layer, .overlay), layers.provenance("theme"));
+    try testing.expectEqual(@as(?Layer, .cli), layers.provenance("window-padding-x"));
+    try testing.expectEqual(@as(?Layer, null), layers.provenance("background"));
+    try testing.expectEqual(@as(?Layer, null), layers.provenance("font"));
+    try testing.expectEqual(@as(?Layer, null), layers.provenance("background-opacity"));
+
+    try testing.expect(layers.sets(.user, "language"));
+    try testing.expect(layers.sets(.overlay, "language"));
+    try testing.expect(!layers.sets(.cli, "language"));
+    try testing.expect(!layers.sets(.user, "font-family"));
+}
+
+test "provenance of the background opacity of a window material" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const mica = try dir.write(arena, "config.ghostty", "gx-window-material = mica\n");
+    var material = try Layers.read(testing.allocator, TestSources{
+        .defaults_text = "font-size = 12\n",
+        .user_path = mica,
+        .material_opacity = true,
+    });
+    defer material.deinit();
+    try testing.expectEqual(@as(?Layer, .defaults), material.provenance("background-opacity"));
+
+    var hidden = try Layers.read(testing.allocator, TestSources{ .defaults_text = "font-size = 12\n", .user_path = mica });
+    defer hidden.deinit();
+    try testing.expectEqual(@as(?Layer, null), hidden.provenance("background-opacity"));
+
+    try material.setOverlay("background-opacity", &.{"0.9"});
+    try testing.expectEqual(@as(?Layer, .overlay), material.provenance("background-opacity"));
+}
+
+test "setOverlay changes the overlay layer like saving the settings file" {
+    const testing = std.testing;
+    const io = testing.io;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const overlay_path = try dir.write(arena, gui_settings.file_name, "# mine\nfont-size = 14\ntheme =\n");
+    const sources: TestSources = .{
+        .defaults_text = "font-size = 12\nfont-family = A\n",
+        .user_path = try dir.write(arena, "config.ghostty", "font-size = 13\nfont-family = U\n"),
+        .overlay_path = overlay_path,
+    };
+    var layers = try Layers.read(testing.allocator, sources);
+    defer layers.deinit();
+
+    const edits = [_]struct { []const u8, []const []const u8 }{
+        .{ "font-size", &.{"16"} },
+        .{ "font-family", &.{ "X", "Y" } },
+        .{ "language", &.{"en"} },
+        .{ "font-size", &.{} },
+        .{ "theme", &.{} },
+    };
+    for (edits) |edit| {
+        try layers.setOverlay(edit[0], edit[1]);
+
+        var overlay = try gui_settings.Overlay.load(testing.allocator, io, overlay_path);
+        defer overlay.deinit();
+        try overlay.setAll(edit[0], edit[1]);
+        try overlay.save(io, overlay_path);
+
+        var built = try layers.build(testing.allocator, &.{});
+        defer built.deinit();
+        var loaded = try loadWith(testing.allocator, sources);
+        defer loaded.deinit();
+        try expectSameConfig(&loaded, &built);
+    }
+
+    var built = try layers.build(testing.allocator, &.{});
+    defer built.deinit();
+    // Without the overlay's line, the user configuration applies again.
+    try testing.expectEqual(@as(f32, 13), built.@"font-size");
+    try testing.expectEqual(@as(?Layer, .user), layers.provenance("font-size"));
+    try expectFamilies(&.{ "X", "Y" }, built.@"font-family");
+    try testing.expectEqualStrings("en", built.language.?);
+}
+
+test "setOverlay without an overlay file" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const missing = try std.fs.path.join(arena, &.{ dir.root, gui_settings.file_name });
+    var layers = try Layers.read(testing.allocator, TestSources{ .defaults_text = "font-size = 12\n", .overlay_path = missing });
+    defer layers.deinit();
+    try layers.setOverlay("font-size", &.{"15"});
+    try layers.setOverlay("font-size", &.{"16"});
+    var built = try layers.build(testing.allocator, &.{});
+    defer built.deinit();
+    try testing.expectEqual(@as(f32, 16), built.@"font-size");
+    try testing.expectEqual(@as(?Layer, .overlay), layers.provenance("font-size"));
+}
+
+test "an unreadable overlay and an unsupported language are reported" {
+    const testing = std.testing;
+    const io = testing.io;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    // A directory where the overlay file belongs.
+    try dir.tmp.dir.createDirPath(io, gui_settings.file_name);
+    const overlay = try std.fs.path.join(arena, &.{ dir.root, gui_settings.file_name });
+    const theme = try dir.write(arena, "theme", "background = #111111\n");
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\nlanguage = zh-CN\n", .{theme}),
+        .user_path = try dir.write(arena, "config.ghostty", "language = fr\n"),
+        .overlay_path = overlay,
+    });
+    defer cfg.deinit();
+
+    const diags = cfg._diagnostics.items();
+    try testing.expectEqual(@as(usize, 2), diags.len);
+    try testing.expect(std.mem.indexOf(u8, diags[0].message, gui_settings.file_name) != null);
+    try testing.expectEqualStrings("language", diags[1].key);
+    try testing.expect(std.mem.indexOf(u8, diags[1].message, "\"fr\"") != null);
+    // The language still falls back to zh-CN.
+    try testing.expectEqual(i18n.Language.zh_CN, i18n.resolve(cfg.language));
+
+    // Replays report them again, once.
+    var cloned = try cfg.clone(testing.allocator);
+    defer cloned.deinit();
+    try cloned.finalize();
+    try testing.expectEqual(@as(usize, 2), cloned._diagnostics.items().len);
+    var rebuilt = try rebuild(&cfg, testing.allocator, &.{});
+    defer rebuilt.deinit();
+    try testing.expectEqual(@as(usize, 2), rebuilt._diagnostics.items().len);
+    try testing.expectEqual(diagnosticsDigest(&cfg), diagnosticsDigest(&rebuilt));
+}
+
+test "supported, unset and reset languages are not reported" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    for ([_][]const u8{ "language = en\n", "language = zh_CN.UTF-8\n", "language = EN-us\n", "language =\n", "font-size = 13\n" }) |text| {
+        var cfg = try loadWith(testing.allocator, TestSources{
+            .defaults_text = "language = zh-CN\n",
+            .user_path = try dir.write(arena, "config.ghostty", text),
+        });
+        defer cfg.deinit();
+        try expectNoDiagnostics(&cfg);
+    }
+    // The last value counts, -e and its command aside.
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = "language = de\n",
+        .args = &.{ "--language=en", "-e", "--language=xx" },
+    });
+    defer cfg.deinit();
+    try expectNoDiagnostics(&cfg);
+}
+
+test "diagnosticsDigest changes with the diagnostics only" {
+    const testing = std.testing;
+    var a = try Config.default(testing.allocator);
+    defer a.deinit();
+    var b = try Config.default(testing.allocator);
+    defer b.deinit();
+    try testing.expectEqual(@as(u64, 0), diagnosticsDigest(&a));
+
+    try a.addDiagnosticFmt("one {d}", .{1});
+    try b.addDiagnosticFmt("one {d}", .{1});
+    try testing.expect(diagnosticsDigest(&a) != 0);
+    try testing.expectEqual(diagnosticsDigest(&a), diagnosticsDigest(&b));
+
+    try b.addDiagnosticFmt("two", .{});
+    try testing.expect(diagnosticsDigest(&a) != diagnosticsDigest(&b));
+    try a.addDiagnosticFmt("two", .{});
+    try testing.expectEqual(diagnosticsDigest(&a), diagnosticsDigest(&b));
+}
+
+test "rebuild keeps the inputs, the conditional state and the command" {
+    const testing = std.testing;
+    var arena_state: ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+
+    const light = try dir.write(arena, "light", "background = #eeeeee\n");
+    const dark = try dir.write(arena, "dark", "background = #111111\n");
+    const user = try dir.write(arena, "config.ghostty", "font-size = 13\nfont-family = U\n");
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\nfont-family = A\n", .{ light, dark }),
+        .user_path = user,
+        .args = &.{ "--font-size=15", "-e", "htop" },
+    });
+    defer cfg.deinit();
+    var dark_cfg = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer dark_cfg.deinit();
+
+    try dir.tmp.dir.deleteFile(testing.io, "config.ghostty");
+    var rebuilt = try rebuild(&dark_cfg, testing.allocator, &.{});
+    defer rebuilt.deinit();
+    try expectSameConfig(&dark_cfg, &rebuilt);
+    try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, rebuilt.background);
+
+    var light_cfg = (try rebuilt.changeConditionalState(.{ .theme = .light })).?;
+    defer light_cfg.deinit();
+    try testing.expectEqual(Config.Color{ .r = 0xee, .g = 0xee, .b = 0xee }, light_cfg.background);
+    try testing.expectEqual(@as(f32, 15), light_cfg.@"font-size");
+    try expectFamilies(&.{"U"}, light_cfg.@"font-family");
+    try testing.expectEqualStrings("htop", light_cfg.@"initial-command".?.direct[0]);
+
+    var quiet = try rebuild(&cfg, testing.allocator, &.{"--app-notifications=no-config-reload"});
+    defer quiet.deinit();
+    try testing.expect(!quiet.@"app-notifications".@"config-reload");
+    try testing.expectEqual(@as(f32, 15), quiet.@"font-size");
 }

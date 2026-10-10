@@ -1468,6 +1468,15 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
         .keybinds => Keybinds.show(window),
         .new_tab_profile => |id| self.openProfile(window, id, .tab),
         .new_window_profile => |id| self.openProfile(window, id, .window),
+        // Not implemented yet: report them as not performed so that a
+        // `performable:` binding passes its key on to the terminal.
+        .settings_page,
+        .new_tab_menu,
+        .context_menu,
+        .move_split_to_tab,
+        .move_split_to_window,
+        .tab_switcher,
+        => false,
     };
 }
 
