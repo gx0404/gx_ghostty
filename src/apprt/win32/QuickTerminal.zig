@@ -1,5 +1,5 @@
 // Ported from shiweis/ghostty-windows@119b9270c (MIT). Copyright (c) Shiwei Song and Ghostty contributors.
-//! Quick Terminal: a borderless, topmost popup window with one terminal
+//! Quick Terminal: a borderless, topmost popup window with one tab
 //! that slides in from an edge of a monitor (`quick-terminal-position`,
 //! `quick-terminal-screen`) and out again. Owned by App, separate from the
 //! normal windows list.
@@ -94,10 +94,6 @@ waiting_since_ns: u64 = 0,
 target_rect: w32.RECT = empty_rect,
 hidden_rect: w32.RECT = empty_rect,
 work_rect: w32.RECT = empty_rect,
-
-/// Whether slides need a window region: beyond its edge there is another
-/// monitor or the taskbar.
-clip_slides: bool = false,
 
 /// The window region set (window coordinates), null for none.
 clip: ?w32.RECT = null,
@@ -280,13 +276,15 @@ pub fn relayout(self: *QuickTerminal) void {
     };
     if (w32.GetMonitorInfoW(monitor, &mi) == 0) return;
     const scale = monitorScale(monitor) orelse self.window.scale;
+    if (self.window.tab_count == 0) self.window.scale = scale;
     const places = placesFor(position, config.@"quick-terminal-size", mi.rcWork, scale);
     self.target_rect = places.target;
     self.hidden_rect = places.hidden;
     self.work_rect = mi.rcWork;
-    self.clip_slides = w32.MonitorFromRect(&places.hidden, w32.MONITOR_DEFAULTTONULL) != null;
     self.setRoundCorners(position == .center);
     if (self.phase != .sliding) self.moveTo(self.target_rect);
+    self.window.setActiveTabVisible(self.visible);
+    if (self.animating or !self.visible) self.suspendPopups();
 }
 
 // -----------------------------------------------------------------------
@@ -294,19 +292,20 @@ pub fn relayout(self: *QuickTerminal) void {
 // -----------------------------------------------------------------------
 
 fn show(self: *QuickTerminal) void {
-    // Its last tab closed: it is on its way out for good.
     if (self.close_when_hidden) return;
     switch (self.phase) {
         .waiting, .shown => return self.activate(),
         .sliding => {
-            if (!self.slide.opening) {
-                const now = anim.now();
-                self.slide = .from(self.slide.openness(now + frame_lead_ns), true, now + frame_lead_ns, self.durationNs());
-                self.setPhase(.sliding);
-                self.rememberForeground();
-                self.window.setActiveTabVisible(true);
-            }
-            return self.activate();
+            if (self.slide.opening) return self.activate();
+            const now = anim.now();
+            self.slide = .from(self.slide.openness(now + frame_lead_ns), true, now + frame_lead_ns, self.durationNs());
+            self.setPhase(.sliding);
+            self.rememberForeground();
+            self.window.setActiveTabVisible(true);
+            self.suspendPopups();
+            self.activate();
+            if (self.step(now) and !anim.start(&self.animator)) self.finishShow();
+            return;
         },
         .hidden => {},
     }
@@ -315,20 +314,16 @@ fn show(self: *QuickTerminal) void {
     self.relayout();
     setCloaked(hwnd, true);
     _ = w32.SetWindowPos(hwnd, w32.HWND_TOPMOST, 0, 0, 0, 0, w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE);
-    // Wait for a frame presented from now on, not one drawn before.
     if (self.window.getActiveSurface()) |surface| {
         if (surface.frame_event) |event| _ = w32.ResetEvent(event);
     }
-    _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
-    self.window.setActiveTabVisible(true);
-    // The find bar and the scrollbar come back once the terminal is in.
-    self.setTerminalPopupsShown(false);
-    // Take the keyboard now, not after the slide: what is typed right
-    // after the hotkey belongs to the terminal.
-    self.activate();
     self.waiting_since_ns = anim.now();
     self.setPhase(.waiting);
-    if (!anim.start(&self.animator)) self.finishShow();
+    _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+    self.window.setActiveTabVisible(true);
+    self.suspendPopups();
+    self.activate();
+    if (self.step(anim.now()) and !anim.start(&self.animator)) self.finishShow();
 }
 
 /// Slide out, or hide at once without a slide.
@@ -347,12 +342,10 @@ fn hide(self: *QuickTerminal, reason: HideReason) void {
         .waiting => {},
     }
     const slides = (self.phase == .sliding or self.phase == .shown) and duration > 0;
-    // Set before the keyboard moves: the deactivation it causes finds the
-    // quick terminal going already.
     self.setPhase(if (slides) .sliding else .hidden);
     if (reason != .focus_lost) self.restoreForeground();
     self.window.setActiveTabVisible(false);
-    self.setTerminalPopupsShown(false);
+    self.suspendPopups();
     if (!slides) return self.hideWindow();
     if (!self.step(now)) return;
     if (!anim.start(&self.animator)) self.hideWindow();
@@ -370,6 +363,7 @@ fn reveal(self: *QuickTerminal, now_ns: u64) bool {
     }
     self.slide = .from(0, true, now_ns, duration);
     self.setPhase(.sliding);
+    self.applyClip(empty_rect);
     self.place(self.slide.openness(now_ns + frame_lead_ns));
     setCloaked(hwnd, false);
     return true;
@@ -377,16 +371,18 @@ fn reveal(self: *QuickTerminal, now_ns: u64) bool {
 
 /// In place: no region, uncloaked, the terminal's popups back.
 fn finishShow(self: *QuickTerminal) void {
+    const clipped = self.phase == .sliding;
     anim.stop(&self.animator);
     self.setPhase(.shown);
     const hwnd = self.window.hwnd orelse return;
     self.moveTo(self.target_rect);
-    const clipped = self.clip != null;
     self.applyClip(null);
     setCloaked(hwnd, false);
-    // Popups that did not follow the window while it slid.
-    if (comptime @hasDecl(Window, "repositionPopups")) self.window.repositionPopups();
+    _ = w32.ShowOwnedPopups(hwnd, 1);
     self.setTerminalPopupsShown(true);
+    const placement: @import("ui/Notice.zig").Placement = .{ .owner = hwnd, .area = self.window.surfaceRect(), .scale = self.window.scale };
+    self.window.notice.reposition(placement);
+    self.window.toast.reposition(placement);
     reshowPopup(&self.window.notice.popup);
     reshowPopup(&self.window.toast.popup);
     // A terminal whose frames the region cut short draws a whole one.
@@ -467,7 +463,7 @@ fn frameReady(self: *QuickTerminal) bool {
 /// in between.
 fn place(self: *QuickTerminal, openness: f32) void {
     const rect = lerpRect(self.hidden_rect, self.target_rect, openness);
-    const clip = if (self.clip_slides) clipFor(rect, self.work_rect) else null;
+    const clip = clipFor(rect, self.work_rect);
     if (!self.slide.opening) self.applyClip(clip);
     self.moveTo(rect);
     if (self.slide.opening) self.applyClip(clip);
@@ -525,6 +521,12 @@ fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
 // Popups and the keyboard
 // -----------------------------------------------------------------------
 
+fn suspendPopups(self: *QuickTerminal) void {
+    self.setTerminalPopupsShown(false);
+    _ = self.window.resize_overlay.onTimer(ResizeOverlay.TIMER_ID);
+    if (self.window.hwnd) |hwnd| _ = w32.ShowOwnedPopups(hwnd, 0);
+}
+
 /// Show or hide the find bar and the scrollbar of the shown terminals.
 fn setTerminalPopupsShown(self: *QuickTerminal, shown: bool) void {
     const window = self.window;
@@ -534,6 +536,7 @@ fn setTerminalPopupsShown(self: *QuickTerminal, shown: bool) void {
     while (it.next()) |entry| {
         const pane_shown = if (tree.zoomed) |zoomed| entry.handle == zoomed else true;
         const surface = entry.view;
+        if (shown and pane_shown) surface.repositionPopups() else surface.link_preview.hide();
         surface.search_bar.setOwnerVisible(shown and pane_shown);
         if (surface.scrollbar) |sb| sb.setOwnerVisible(shown and pane_shown);
     }
@@ -918,4 +921,37 @@ test "slides enter decelerating, leave accelerating, turn around in place" {
     // No duration: there at once.
     try testing.expectEqual(@as(f32, 1), Slide.from(0, true, start, 0).openness(start));
     try testing.expect(Slide.from(1, false, start, 0).done(start));
+}
+
+test "quick terminal phases preserve toggle intent and DPI ownership" {
+    const testing = std.testing;
+    var quick: QuickTerminal = .{ .app = undefined, .window = undefined };
+    const Case = struct { phase: Phase, opening: bool, visible: bool, animating: bool };
+    for ([_]Case{
+        .{ .phase = .hidden, .opening = true, .visible = false, .animating = false },
+        .{ .phase = .waiting, .opening = true, .visible = true, .animating = true },
+        .{ .phase = .sliding, .opening = true, .visible = true, .animating = true },
+        .{ .phase = .sliding, .opening = false, .visible = false, .animating = true },
+        .{ .phase = .shown, .opening = true, .visible = true, .animating = false },
+    }) |case| {
+        quick.slide.opening = case.opening;
+        quick.setPhase(case.phase);
+        try testing.expectEqual(case.visible, quick.visible);
+        try testing.expectEqual(case.animating, quick.animating);
+        try testing.expectEqual(case.phase == .sliding, quick.ignoresDpiChange());
+    }
+}
+
+test "slides retain position at the immediate reversal frame" {
+    const testing = std.testing;
+    const start: u64 = 10 * std.time.ns_per_s;
+    const duration: u64 = 200 * std.time.ns_per_ms;
+    const in = Slide.from(0, true, start, duration);
+    const now = start + 50 * std.time.ns_per_ms;
+    const displayed = in.openness(now + frame_lead_ns);
+    const out = Slide.from(displayed, false, now + frame_lead_ns, duration);
+    try testing.expectApproxEqAbs(displayed, out.openness(now + frame_lead_ns), 2e-3);
+    const again = Slide.from(out.openness(now + 2 * frame_lead_ns), true, now + 2 * frame_lead_ns, duration);
+    try testing.expectApproxEqAbs(out.openness(now + 2 * frame_lead_ns), again.openness(now + 2 * frame_lead_ns), 2e-3);
+    try testing.expectEqual(@as(f32, 1), again.openness(now + duration));
 }
