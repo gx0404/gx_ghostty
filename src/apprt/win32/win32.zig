@@ -1755,3 +1755,16 @@ test "SystemChange decodes the system broadcasts" {
 
     try testing.expectEqual(@as(?SystemChange, null), SystemChange.fromMessage(WM_PAINT, 0, 0));
 }
+
+// R2-Surface
+// -----------------------------------------------------------------------
+// Terminal surface: clipboard formats.
+// -----------------------------------------------------------------------
+
+pub extern "user32" fn RegisterClipboardFormatW(
+    lpszFormat: [*:0]const u16,
+) callconv(.winapi) u32;
+
+pub extern "kernel32" fn GlobalSize(
+    hMem: *anyopaque,
+) callconv(.winapi) usize;

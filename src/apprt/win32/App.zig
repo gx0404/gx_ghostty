@@ -2451,6 +2451,11 @@ fn surfaceWndProc(
             return 0;
         },
 
+        Surface.WM_APP_CONFIRM_CLIPBOARD => {
+            surface.confirmClipboard();
+            return 0;
+        },
+
         Surface.WM_APP_CHILD_EXITED => {
             // The dialog runs a modal loop; nothing uses the surface after
             // it.

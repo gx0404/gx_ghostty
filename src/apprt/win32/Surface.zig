@@ -194,6 +194,11 @@ palette: Palette = .{},
 pending_clipboard_read: ?PendingClipboardRead = null,
 pending_clipboard_write: ?PendingClipboardWrite = null,
 
+/// Clipboard accesses waiting for the user's answer, oldest first, and
+/// whether the dialog of one is up (see `confirmClipboard`).
+clipboard_confirms: std.ArrayList(ClipboardConfirm) = .empty,
+confirming_clipboard: bool = false,
+
 /// The command this terminal was started with instead of the configured
 /// one (`InitOptions.command`, e.g. a launch profile), so that its tab can
 /// be duplicated (see ui/Menu.zig).
@@ -439,8 +444,9 @@ fn deinitGui(self: *Surface) void {
     }
     if (self.pending_clipboard_read) |pending| destroyClipboardRequest(pending.state);
     self.pending_clipboard_read = null;
-    if (self.pending_clipboard_write) |pending| _ = w32.GlobalFree(pending.data);
+    if (self.pending_clipboard_write) |pending| pending.blocks.free();
     self.pending_clipboard_write = null;
+    self.dropClipboardConfirms();
 
     // Destroy the themed scrollbar before the surface HWND is gone.
     if (self.scrollbar) |sb| {
@@ -690,13 +696,11 @@ fn clipboardRetryDelay(attempt: u8) u32 {
 fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.ClipboardReadResult {
     // Paste events request a target listing without reading clipboard data.
     // Win32 exposes files and Unicode text as a text/plain representation.
+    // Asking whether a format is there needs neither the clipboard open nor
+    // its data rendered (CF_TEXT counts, Windows converts it).
     if (state == .list) {
-        const has_text = has_text: {
-            if (!clipboard.open(self.hwnd)) return error.ClipboardBusy;
-            defer _ = w32.CloseClipboard();
-            break :has_text w32.GetClipboardData(w32.CF_HDROP) != null or
-                w32.GetClipboardData(w32.CF_UNICODETEXT) != null;
-        };
+        const has_text = w32.IsClipboardFormatAvailable(w32.CF_HDROP) != 0 or
+            w32.IsClipboardFormatAvailable(w32.CF_UNICODETEXT) != 0;
         if (!has_text) return .unavailable;
 
         return self.completeClipboardRequestWithConfirmation(
@@ -746,18 +750,10 @@ fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.Clipboard
 
         const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse
             return .unavailable;
-        const ptr16 = w32.GlobalLock(hglobal) orelse {
+        // Unpaired surrogates (text cut in the middle of an emoji) become
+        // U+FFFD instead of failing the whole paste.
+        const utf8 = try clipboard.unicodeText(alloc, hglobal) orelse {
             log.warn("GlobalLock failed", .{});
-            return .unavailable;
-        };
-        defer _ = w32.GlobalUnlock(hglobal);
-
-        const wptr: [*]const u16 = @ptrCast(@alignCast(ptr16));
-        var wlen: usize = 0;
-        while (wptr[wlen] != 0) wlen += 1;
-
-        const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, wptr[0..wlen]) catch |err| {
-            log.warn("utf16LeToUtf8Alloc failed: {}", .{err});
             return .unavailable;
         };
         defer alloc.free(utf8);
@@ -782,10 +778,10 @@ const PendingClipboardRead = struct {
     attempt: u8,
 };
 
-/// A clipboard write waiting likewise: a CF_UNICODETEXT HGLOBAL that the
-/// surface owns until it is handed to the clipboard.
+/// A clipboard write waiting likewise, with the memory blocks the surface
+/// owns until they are handed to the clipboard.
 const PendingClipboardWrite = struct {
-    data: *anyopaque,
+    blocks: ClipboardBlocks,
     attempt: u8,
 };
 
@@ -847,18 +843,17 @@ pub fn handleTimer(self: *Surface, id: usize) bool {
     return true;
 }
 
-/// Complete a structured clipboard request and run the native authorization
-/// prompt when the core requires it. The modal dialog can destroy the surface,
-/// so all post-dialog access re-resolves the core surface by id.
+/// Complete a structured clipboard request. When the core wants the user
+/// to agree first (an unsafe paste with `clipboard-paste-protection`, a
+/// read or Kitty write with `clipboard-read`/`clipboard-write = ask`), the
+/// request waits for the answer (`queueClipboardConfirm`): the core calls
+/// here from its callbacks, where no dialog may run.
 fn completeClipboardRequestWithConfirmation(
     self: *Surface,
     state: apprt.ClipboardRequest,
     contents: []const terminal.clipboard.Content,
     available: []const []const u8,
 ) apprt.ClipboardReadResult {
-    const core_app = self.app.core_app;
-    const surface_id = self.core_surface.id;
-
     // Complete with confirmed=false so the core runs its safety checks. If it
     // flags the paste as unsafe (paste-protection) or the OSC 52 read as
     // unauthorized (clipboard-read = ask), prompt and only re-complete with
@@ -868,49 +863,24 @@ fn completeClipboardRequestWithConfirmation(
         .contents = contents,
         .available = available,
     }) catch |err| {
-        // `self` may be freed while the modal dialog pumps messages, so
-        // re-resolve the surface by id before re-completing.
-        const owner = self.parent_window.hwnd;
-        // The dialogs show the text being pasted, read or written; a Kitty
-        // write carries its text in the request.
-        const text = switch (state) {
-            .kitty_write => |kitty| clipboardText(kitty.contents),
-            else => clipboardText(contents),
-        };
-        const choice: Dialogs.Choice = switch (err) {
-            error.UnsafePaste => Dialogs.confirmUnsafePaste(owner, text),
+        const kind: ClipboardConfirm.Kind = switch (err) {
+            error.UnsafePaste => .unsafe_paste,
             error.UnauthorizedPaste => switch (state) {
-                .kitty_write, .osc_52_write => Dialogs.confirmClipboardAccess(owner, .write, text),
-                else => Dialogs.confirmClipboardAccess(owner, .read, text),
+                .kitty_write, .osc_52_write => .write,
+                else => .read,
             },
             else => {
                 log.err("completeClipboardRequest error: {}", .{err});
                 return .started;
             },
         };
-
-        const cs = core_app.findSurfaceByID(surface_id) orelse {
-            // Kitty requests own arenas that the apprt must release even if
-            // their surface disappeared while the modal dialog was open.
-            switch (state) {
-                .kitty_read => |kitty| kitty.destroy(),
-                .kitty_write => |kitty| kitty.destroy(),
-                else => {},
-            }
-            return .started;
+        // The dialogs show the text being pasted, read or written; a Kitty
+        // write carries its text in the request.
+        const text = switch (state) {
+            .kitty_write => |kitty| clipboardText(kitty.contents),
+            else => clipboardText(contents),
         };
-
-        if (choice == .accept) {
-            cs.completeClipboardRequest(state, .{
-                .contents = contents,
-                .available = available,
-                .confirmed = true,
-            }) catch |e| {
-                log.err("completeClipboardRequest (confirmed) error: {}", .{e});
-            };
-        } else {
-            cs.denyClipboardRequest(state);
-        }
+        self.queueClipboardConfirm(kind, state, text, "");
     };
 
     return .started;
@@ -930,6 +900,14 @@ fn clipboardText(contents: anytype) []const u8 {
     return findClipboardText(contents) orelse "";
 }
 
+/// The HTML representation of clipboard contents, if any.
+fn findClipboardHtml(contents: []const apprt.ClipboardContent) ?[]const u8 {
+    for (contents) |content| {
+        if (std.mem.eql(u8, content.mime, "text/html")) return content.data;
+    }
+    return null;
+}
+
 pub fn setClipboard(
     self: *Surface,
     clipboard_type: apprt.Clipboard,
@@ -939,71 +917,79 @@ pub fn setClipboard(
     // Only the standard clipboard is supported on Win32.
     if (clipboard_type != .standard) return;
 
+    const text = findClipboardText(contents);
+    const html = findClipboardHtml(contents);
     // Without a text representation there is nothing to write.
-    const text = findClipboardText(contents) orelse return;
+    if (text == null and html == null) return;
 
-    // When the core requests confirmation (e.g. an OSC 52 clipboard write
-    // with clipboard-write = ask), prompt before writing. Previously the
-    // flag was discarded, so remote apps could write the clipboard silently.
-    // The dialog pumps messages and can free `self` (child exit → surface
-    // close), so the surface is re-resolved by id afterwards.
-    var surface = self;
+    // When the core requests confirmation (an OSC 52 write with
+    // `clipboard-write = ask`), ask from the message loop: the core calls
+    // here from its callbacks.
     if (confirm) {
-        const app = self.app;
-        const id = self.core_surface.id;
-        if (Dialogs.confirmClipboardAccess(self.parent_window.hwnd, .write, text) != .accept) return;
-        const cs = app.core_app.findSurfaceByID(id) orelse return;
-        surface = cs.rt_surface;
+        self.queueClipboardConfirm(.write, null, text orelse html.?, html orelse "");
+        return;
     }
-
-    const data = (try unicodeTextGlobal(surface.app.core_app.alloc, text)) orelse return;
-    surface.writeClipboard(data, 0);
+    self.writeClipboardText(text, html);
 }
 
-/// `text` as a moveable CF_UNICODETEXT memory block (UTF-16LE, NUL
-/// terminated), or null when it could not be allocated.
-fn unicodeTextGlobal(alloc: Allocator, text: []const u8) !?*anyopaque {
-    const utf16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
-    defer alloc.free(utf16);
-
-    const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, (utf16.len + 1) * @sizeOf(u16)) orelse {
-        log.warn("GlobalAlloc failed for clipboard write", .{});
-        return null;
-    };
-    const dst_bytes = w32.GlobalLock(hglobal) orelse {
-        log.warn("GlobalLock failed for clipboard write", .{});
-        _ = w32.GlobalFree(hglobal);
-        return null;
-    };
-    const dst16: [*]u16 = @ptrCast(@alignCast(dst_bytes));
-    @memcpy(dst16[0..utf16.len], utf16);
-    dst16[utf16.len] = 0;
-    _ = w32.GlobalUnlock(hglobal);
-    return hglobal;
+/// Put `text` on the clipboard, and `html` (an HTML fragment) as rich text
+/// with it; HTML alone goes on as its source text too, so plain-text
+/// programs can paste it.
+fn writeClipboardText(self: *Surface, text: ?[]const u8, html: ?[]const u8) void {
+    const alloc = self.app.core_app.alloc;
+    var blocks: ClipboardBlocks = .{};
+    blocks.text = clipboard.unicodeTextBlock(alloc, text orelse html orelse return) catch null;
+    if (html) |fragment| html: {
+        if (clipboard.htmlFormat() == 0) break :html;
+        const document = clipboard.htmlDocument(alloc, fragment) catch break :html;
+        defer alloc.free(document);
+        blocks.html = clipboard.bytesBlock(document);
+    }
+    if (blocks.text == null and blocks.html == null) return;
+    self.writeClipboard(blocks, 0);
 }
 
-/// Put `data` (from `unicodeTextGlobal`, owned by this call) on the
-/// clipboard. While another application holds the clipboard open the
-/// write is retried from a timer; a newer write replaces a waiting one.
-fn writeClipboard(self: *Surface, data: *anyopaque, attempt: u8) void {
+/// The memory blocks of one clipboard write, owned until they are handed
+/// to the clipboard (`writeClipboard`).
+const ClipboardBlocks = struct {
+    /// CF_UNICODETEXT.
+    text: ?*anyopaque = null,
+    /// "HTML Format".
+    html: ?*anyopaque = null,
+
+    fn free(self: ClipboardBlocks) void {
+        if (self.text) |data| _ = w32.GlobalFree(data);
+        if (self.html) |data| _ = w32.GlobalFree(data);
+    }
+};
+
+/// Put `blocks` (owned by this call) on the clipboard. While another
+/// application holds the clipboard open the write is retried from a timer;
+/// a newer write replaces a waiting one.
+fn writeClipboard(self: *Surface, blocks: ClipboardBlocks, attempt: u8) void {
     if (self.pending_clipboard_write) |pending| {
-        if (pending.data != data) _ = w32.GlobalFree(pending.data);
+        if (!std.meta.eql(pending.blocks, blocks)) pending.blocks.free();
         self.pending_clipboard_write = null;
         if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, CLIPBOARD_WRITE_TIMER);
     }
 
+    var items_buf: [2]clipboard.Item = undefined;
+    var items: std.ArrayList(clipboard.Item) = .initBuffer(&items_buf);
+    if (blocks.text) |data| items.appendAssumeCapacity(.{ .format = w32.CF_UNICODETEXT, .data = data });
+    if (blocks.html) |data| items.appendAssumeCapacity(.{ .format = clipboard.htmlFormat(), .data = data });
+
     // null owner: the write is not tied to the surface hwnd.
-    clipboard.setUnicodeText(null, data) catch {
+    clipboard.setData(null, items.items) catch {
         if (attempt + 1 < clipboard_retries) {
             if (self.hwnd) |hwnd| {
                 if (w32.SetTimer(hwnd, CLIPBOARD_WRITE_TIMER, clipboardRetryDelay(attempt), null) != 0) {
-                    self.pending_clipboard_write = .{ .data = data, .attempt = attempt };
+                    self.pending_clipboard_write = .{ .blocks = blocks, .attempt = attempt };
                     return;
                 }
             }
         }
         log.warn("OpenClipboard failed for clipboard write", .{});
-        _ = w32.GlobalFree(data);
+        blocks.free();
     };
 }
 
@@ -1011,7 +997,153 @@ fn onClipboardWriteTimer(self: *Surface) void {
     if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, CLIPBOARD_WRITE_TIMER);
     const pending = self.pending_clipboard_write orelse return;
     self.pending_clipboard_write = null;
-    self.writeClipboard(pending.data, pending.attempt + 1);
+    self.writeClipboard(pending.blocks, pending.attempt + 1);
+}
+
+/// Posted by `queueClipboardConfirm`; surfaceWndProc hands it to
+/// `confirmClipboard`, which asks the user from the message loop.
+pub const WM_APP_CONFIRM_CLIPBOARD: u32 = w32.WM_APP + 33;
+
+/// The most clipboard accesses that wait for the user's answer at a time;
+/// a program asking for more meanwhile is refused (`refuseClipboard`).
+const max_clipboard_confirms = 8;
+
+/// A clipboard access waiting for the user's answer (`confirmClipboard`).
+const ClipboardConfirm = struct {
+    kind: Kind,
+    /// The request to complete or deny; null for a write (`setClipboard`).
+    request: ?apprt.ClipboardRequest,
+    /// The text the dialog shows and a paste or read hands over; owned.
+    text: []u8,
+    /// A write's HTML representation, owned; empty for none.
+    html: []u8,
+
+    const Kind = enum { unsafe_paste, read, write };
+
+    /// Free the texts; the request is completed or denied separately.
+    fn freeText(self: *ClipboardConfirm, alloc: Allocator) void {
+        alloc.free(self.text);
+        alloc.free(self.html);
+    }
+};
+
+/// Ask the user about a clipboard access from the message loop
+/// (`WM_APP_CONFIRM_CLIPBOARD`): the core asks for it in its callbacks,
+/// where no modal loop may run. `text` and `html` are copied. Accesses
+/// wait one after the other, except that a write replaces a write still
+/// waiting (only the last one would stay on the clipboard); when too many
+/// wait, or memory runs out, the access is refused at once.
+fn queueClipboardConfirm(
+    self: *Surface,
+    kind: ClipboardConfirm.Kind,
+    request: ?apprt.ClipboardRequest,
+    text: []const u8,
+    html: []const u8,
+) void {
+    const alloc = self.app.core_app.alloc;
+    const hwnd = self.hwnd orelse return self.refuseClipboard(request);
+    const owned_text = alloc.dupe(u8, text) catch return self.refuseClipboard(request);
+    const owned_html = alloc.dupe(u8, html) catch {
+        alloc.free(owned_text);
+        return self.refuseClipboard(request);
+    };
+    if (request == null) {
+        for (self.clipboard_confirms.items) |*pending| {
+            if (pending.request != null) continue;
+            pending.freeText(alloc);
+            pending.text = owned_text;
+            pending.html = owned_html;
+            return;
+        }
+    }
+    if (self.clipboard_confirms.items.len >= max_clipboard_confirms) {
+        log.warn("too many clipboard accesses wait for an answer; refusing one", .{});
+        alloc.free(owned_text);
+        alloc.free(owned_html);
+        return self.refuseClipboard(request);
+    }
+    self.clipboard_confirms.append(alloc, .{
+        .kind = kind,
+        .request = request,
+        .text = owned_text,
+        .html = owned_html,
+    }) catch {
+        alloc.free(owned_text);
+        alloc.free(owned_html);
+        return self.refuseClipboard(request);
+    };
+    // While a dialog is up its answer posts the next one.
+    if (!self.confirming_clipboard) _ = w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0);
+}
+
+/// Deny a clipboard access without asking (a write needs nothing).
+fn refuseClipboard(self: *Surface, request: ?apprt.ClipboardRequest) void {
+    const state = request orelse return;
+    if (self.core_surface_ready) {
+        self.core_surface.denyClipboardRequest(state);
+    } else {
+        destroyClipboardRequest(state);
+    }
+}
+
+/// Handle `WM_APP_CONFIRM_CLIPBOARD`: ask about the oldest waiting
+/// clipboard access, then complete or deny it. The dialog's modal loop
+/// keeps dispatching messages and can close the terminal meanwhile.
+pub fn confirmClipboard(self: *Surface) void {
+    if (self.confirming_clipboard or self.clipboard_confirms.items.len == 0) return;
+    var pending = self.clipboard_confirms.orderedRemove(0);
+    const app = self.app;
+    const alloc = app.core_app.alloc;
+    const id = self.core_surface.id;
+    const owner = self.parent_window.hwnd;
+
+    self.confirming_clipboard = true;
+    const choice = switch (pending.kind) {
+        .unsafe_paste => Dialogs.confirmUnsafePaste(owner, pending.text),
+        .read => Dialogs.confirmClipboardAccess(owner, .read, pending.text),
+        .write => Dialogs.confirmClipboardAccess(owner, .write, pending.text),
+    };
+    defer pending.freeText(alloc);
+
+    const surface: *Surface = if (app.core_app.findSurfaceByID(id)) |cs| cs.rt_surface else {
+        // Kitty requests own arenas that the apprt releases even when their
+        // terminal closed while the dialog was open.
+        if (pending.request) |state| destroyClipboardRequest(state);
+        return;
+    };
+    surface.confirming_clipboard = false;
+    surface.answerClipboard(pending, choice == .accept);
+    if (surface.clipboard_confirms.items.len > 0) {
+        if (surface.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0);
+    }
+}
+
+/// Complete (`accept`) or deny the clipboard access `pending`.
+fn answerClipboard(self: *Surface, pending: ClipboardConfirm, accept: bool) void {
+    const state = pending.request orelse {
+        if (accept) self.writeClipboardText(pending.text, if (pending.html.len > 0) pending.html else null);
+        return;
+    };
+    if (!self.core_surface_ready) return destroyClipboardRequest(state);
+    if (!accept) return self.core_surface.denyClipboardRequest(state);
+    self.core_surface.completeClipboardRequest(state, .{
+        .contents = &.{.{ .mime = "text/plain", .data = pending.text }},
+        .confirmed = true,
+    }) catch |err| {
+        log.err("completeClipboardRequest (confirmed) error: {}", .{err});
+    };
+}
+
+/// Drop the clipboard accesses still waiting for an answer (the terminal is
+/// going away).
+fn dropClipboardConfirms(self: *Surface) void {
+    const alloc = self.app.core_app.alloc;
+    for (self.clipboard_confirms.items) |*pending| {
+        if (pending.request) |state| destroyClipboardRequest(state);
+        pending.freeText(alloc);
+    }
+    self.clipboard_confirms.deinit(alloc);
+    self.clipboard_confirms = .empty;
 }
 
 pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
