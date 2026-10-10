@@ -380,14 +380,17 @@ pub const Label = struct {
     program: []const u8 = "",
     title: []const u8 = "",
 
-    /// Write the label as one line into `buf` (cut off when it does not
-    /// fit).
+    /// Write the label as one line into `buf`, cut at a codepoint boundary.
     pub fn write(self: Label, buf: []u8) []const u8 {
-        var writer: std.Io.Writer = .fixed(buf);
-        writer.writeAll(self.program) catch return writer.buffered();
-        if (self.program.len > 0 and self.title.len > 0) writer.writeAll(separator) catch return writer.buffered();
-        writer.writeAll(self.title) catch {};
-        return writer.buffered();
+        const parts = [_][]const u8{ self.program, if (self.program.len > 0 and self.title.len > 0) separator else "", self.title };
+        var len: usize = 0;
+        for (parts) |part| {
+            const kept = utf8Prefix(part, buf.len - len);
+            @memcpy(buf[len..][0..kept.len], kept);
+            len += kept.len;
+            if (kept.len < part.len) break;
+        }
+        return buf[0..len];
     }
 };
 
@@ -466,11 +469,121 @@ fn linearToSrgb(v: f64) f64 {
     return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f64, v, 1.0 / 2.4) - 0.055;
 }
 
+pub const Cache = struct {
+    input: ?Input = null,
+    layout: Layout = .{},
+
+    pub fn get(self: *const Cache, input: Input) Layout {
+        if (self.input) |old| {
+            if (std.meta.eql(old, input)) return self.layout;
+        }
+        return compute(input);
+    }
+
+    pub fn update(self: *Cache, input: Input) Layout {
+        const result = self.get(input);
+        self.* = .{ .input = input, .layout = result };
+        return result;
+    }
+};
+
+pub const Polling = struct {
+    unread_ms: ?u64 = null,
+    programs_ms: ?u64 = null,
+
+    pub fn unreadDue(self: *Polling, now: u64, active: bool, visible: bool, count: usize) bool {
+        if (!visible or count <= 1) return false;
+        if (!due(self.unread_ms, now, if (active) 1000 else 5000)) return false;
+        self.unread_ms = now;
+        return true;
+    }
+
+    pub fn programsDue(self: *const Polling, now: u64, active: bool) bool {
+        return due(self.programs_ms, now, if (active) 2000 else 5000);
+    }
+};
+
+pub fn due(last: ?u64, now: u64, interval: u64) bool {
+    return if (last) |previous| now -| previous >= interval else true;
+}
+
+pub fn utf8Prefix(text: []const u8, limit: usize) []const u8 {
+    var end = @min(text.len, limit);
+    while (end < text.len and end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+    return text[0..end];
+}
+
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "cached geometry follows every layout input" {
+    var cache: Cache = .{};
+    var input = testInput(800, 30);
+    _ = cache.update(input);
+    try testing.expectEqualDeep(compute(input), cache.get(input));
+    input.active = 12;
+    input.scroll = 50;
+    input.hit_top = 0;
+    input.scale = 1.5;
+    input.badge = true;
+    try testing.expectEqualDeep(compute(input), cache.get(input));
+    _ = cache.update(input);
+    input.frozen = freeze(&cache.layout, input.area.width());
+    input.count -= 1;
+    try testing.expectEqualDeep(compute(input), cache.get(input));
+    input.area.right += 100;
+    try testing.expectEqualDeep(compute(input), cache.get(input));
+}
+
+test "unread polling skips hidden and single tab bars and slows inactive windows" {
+    var polling: Polling = .{};
+    try testing.expect(!polling.unreadDue(0, true, false, 10));
+    try testing.expect(!polling.unreadDue(0, true, true, 1));
+    try testing.expectEqual(@as(?u64, null), polling.unread_ms);
+    try testing.expect(polling.unreadDue(0, true, true, 2));
+    try testing.expect(!polling.unreadDue(999, true, true, 2));
+    try testing.expect(polling.unreadDue(1000, true, true, 2));
+    try testing.expect(!polling.unreadDue(5999, false, true, 2));
+    try testing.expect(polling.unreadDue(6000, false, true, 2));
+    try testing.expect(polling.unreadDue(7000, true, true, 2));
+}
+
+test "program polling never refreshes twice around a time bucket boundary" {
+    var polling: Polling = .{};
+    try testing.expect(polling.programsDue(1999, true));
+    polling.programs_ms = 1999;
+    try testing.expect(!polling.programsDue(2000, true));
+    try testing.expect(!polling.programsDue(3998, true));
+    try testing.expect(polling.programsDue(3999, true));
+    try testing.expect(!polling.programsDue(6998, false));
+    try testing.expect(polling.programsDue(6999, false));
+    try testing.expect(!due(1999, 100, 2000));
+}
+
+test "utf8 prefixes never split a codepoint" {
+    const text = "a\u{6C49}\u{1F47B}z";
+    for (0..text.len + 2) |limit| {
+        const kept = utf8Prefix(text, limit);
+        try testing.expect(kept.len <= limit);
+        try testing.expect(std.unicode.utf8ValidateSlice(kept));
+        try testing.expect(std.mem.startsWith(u8, text, kept));
+    }
+    try testing.expectEqualStrings("a", utf8Prefix(text, 3));
+    try testing.expectEqualStrings("a\u{6C49}", utf8Prefix(text, 7));
+}
+
+test "labels truncate at codepoint boundaries" {
+    const lbl: Label = .{ .program = "\u{6C49}", .title = "\u{1F47B}notes" };
+    var buffer: [20]u8 = undefined;
+    for (0..buffer.len + 1) |limit| {
+        const text = lbl.write(buffer[0..limit]);
+        try testing.expect(std.unicode.utf8ValidateSlice(text));
+        try testing.expect(std.mem.startsWith(u8, "\u{6C49} \u{00B7} \u{1F47B}notes", text));
+    }
+}
 
 fn testInput(right: i32, count: usize) Input {
     return .{
