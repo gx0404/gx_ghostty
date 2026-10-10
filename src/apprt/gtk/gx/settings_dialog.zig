@@ -1659,6 +1659,7 @@ pub const GxSettingsDialog = extern struct {
         const st = &self.private().state;
         if (st.disposed or !st.layered) return;
         const index = self.selectedTheme() orelse return;
+        if (self.isSavedTheme(index)) return;
         const value = themeValue(st.alloc, st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return;
         defer st.alloc.free(value);
         self.cancelPreview();

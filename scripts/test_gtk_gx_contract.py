@@ -369,6 +369,14 @@ class SettingsDialogTests(unittest.TestCase):
         pages = [node.props["name"] for node in root.walk() if node.kind == "Adw.PreferencesPage"]
         self.assertEqual(pages, ["language", "appearance", "font", "interaction", "shell", "about"])
 
+    def test_theme_enter_keeps_the_saved_theme_read_only(self):
+        source = (GX / "settings_dialog.zig").read_text(encoding="utf-8")
+        body = re.search(r"fn applyTheme\(self: \*Self\) void \{(.*?)\n    \}", source, re.S)
+        self.assertIsNotNone(body)
+        guard = "if (self.isSavedTheme(index)) return;"
+        self.assertIn(guard, body.group(1))
+        self.assertLess(body.group(1).index(guard), body.group(1).index('self.queueSet("theme"'))
+
 
 if __name__ == "__main__":
     unittest.main()
