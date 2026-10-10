@@ -53,7 +53,7 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
    - 发布说明以 CHANGELOG 的 0.0.1 段开头，后面是「构建与资产」表。
    - 读回这次运行的 `evidence-linux-gtk-noble` 截图（见下文）；条件允许时在一台 Windows 上解压便携 zip 或运行安装包，启动后截图。
 6. **开新版本**：在 `CHANGELOG.md` 顶部加下一个 `## X.Y.Z(TBD)` 标题，运行 `just version-check` 与 `just kb`，把 CHANGELOG 与重建的 `docs/kb/chunks.json` 一起提交（KB 语料包含 CHANGELOG 开头，见「CHANGELOG 规则」）。
-7. **GX Shell 跟进**：GX Shell 从 0.4.0 起随包 Ghostty GX，它的来源锁 `components.lock.json` 用完整 SHA 钉住 `gx_ghostty`（0.4.0 钉的是 0.0.1 的定版提交 `5525f8bc`）。要随包新版本时，在 GX Shell 仓只改这一项（不要用更新全部组件的 `update`），写入新 `gx-vX.Y.Z` 指向的完整 SHA，再按 GX Shell 自己的文档运行 `python scripts/gx_shell_sources.py check --lock components.lock.json --require-remote`，然后走 GX Shell 的发版流程。GX Shell 按 `scripts/gx_package.py` 模块文档「Consumer contract」的命令从这个修订构建 stage，契约有变时要先告知 GX Shell。
+7. **GX Shell 跟进**：GX Shell 从 0.4.0 起随包 Ghostty GX，它的来源锁 `components.lock.json` 用完整 SHA 钉住 `gx_ghostty`（0.4.0 钉的是 0.0.1 的定版提交 `5525f8bc`，0.4.1 钉的是 0.0.2 的定版提交 `1be3d19f`）。要随包新版本时，在 GX Shell 仓只改这一项（不要用更新全部组件的 `update`），写入新 `gx-vX.Y.Z` 指向的完整 SHA，再按 GX Shell 自己的文档运行 `python scripts/gx_shell_sources.py check --lock components.lock.json --require-remote`，然后走 GX Shell 的发版流程。GX Shell 按 `scripts/gx_package.py` 模块文档「Consumer contract」的命令从这个修订构建 stage，契约有变时要先告知 GX Shell。
 
 agent 可以准备定版提交并在本地验证；push、运行 workflow 与发布由用户决定。不要手工创建 `gx-v*` tag 或 GitHub release，tag 只由 publish job 创建。agent 执行 `gh workflow run … gx-release`、`gh release create|edit|delete|upload` 与写型 `gh api` 会被拒绝（`docs/AGENT_RULES/ci-release.md`）。
 
