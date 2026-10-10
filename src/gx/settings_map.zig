@@ -214,13 +214,14 @@ pub const BellFeature = struct {
 };
 
 /// The `bell-features` flags, in display order. On Windows the bell plays
-/// the system sound and flashes the taskbar button and badges the tab
-/// (`attention`); GTK implements every flag.
+/// the system sound or a WAV file (`audio`), flashes the taskbar button and
+/// badges the tab (`attention`) and marks the tab with a bell (`title`);
+/// GTK implements every flag.
 pub const bell_features = [_]BellFeature{
     .{ .field = "system", .label = "System Sound", .runtimes = .initFull() },
-    .{ .field = "audio", .label = "Audio File", .runtimes = .initOne(.gtk) },
+    .{ .field = "audio", .label = "Audio File", .runtimes = .initFull() },
     .{ .field = "attention", .label = "Request Attention", .runtimes = .initFull() },
-    .{ .field = "title", .label = "Bell Icon in Title", .runtimes = .initOne(.gtk) },
+    .{ .field = "title", .label = "Bell Icon in Title", .runtimes = .initFull() },
     .{ .field = "border", .label = "Border Highlight", .runtimes = .initOne(.gtk) },
 };
 
@@ -953,9 +954,11 @@ test "bell features name the app runtimes that implement them" {
     for (bell_features) |feature| {
         if (feature.supports(.win32)) try windows.append(testing.allocator, feature.field);
     }
-    try testing.expectEqual(@as(usize, 2), windows.items.len);
+    try testing.expectEqual(@as(usize, 4), windows.items.len);
     try testing.expectEqualStrings("system", windows.items[0]);
-    try testing.expectEqualStrings("attention", windows.items[1]);
+    try testing.expectEqualStrings("audio", windows.items[1]);
+    try testing.expectEqualStrings("attention", windows.items[2]);
+    try testing.expectEqualStrings("title", windows.items[3]);
 
     const expected: ?Runtime = switch (build_config.app_runtime) {
         .win32 => .win32,

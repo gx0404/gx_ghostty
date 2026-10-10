@@ -1755,3 +1755,37 @@ test "SystemChange decodes the system broadcasts" {
 
     try testing.expectEqual(@as(?SystemChange, null), SystemChange.fromMessage(WM_PAINT, 0, 0));
 }
+
+// R2-App
+// -----------------------------------------------------------------------
+// Notification area icon with the members of Windows Vista and later
+// -----------------------------------------------------------------------
+
+/// `NOTIFYICONDATAW` with `guidItem` and `hBalloonIcon`: with `cbSize` set
+/// to its size, `NIIF_USER` shows `hBalloonIcon` in the notification. Pass
+/// it to `Shell_NotifyIconW` through a pointer cast.
+pub const NOTIFYICONDATAW_V3 = extern struct {
+    cbSize: u32,
+    hWnd: ?HWND,
+    uID: u32,
+    uFlags: u32,
+    uCallbackMessage: u32,
+    hIcon: ?HICON,
+    szTip: [128]u16,
+    dwState: u32,
+    dwStateMask: u32,
+    szInfo: [256]u16,
+    uVersion_or_uTimeout: u32,
+    szInfoTitle: [64]u16,
+    dwInfoFlags: u32,
+    guidItem: GUID,
+    hBalloonIcon: ?HICON,
+};
+
+pub const NIIF_USER: u32 = 0x00000004;
+pub const NIIF_LARGE_ICON: u32 = 0x00000020;
+
+test "NOTIFYICONDATAW_V3 has the size of the Windows SDK structure" {
+    const expected: usize = if (@sizeOf(usize) == 8) 976 else 956;
+    try std.testing.expectEqual(expected, @sizeOf(NOTIFYICONDATAW_V3));
+}
