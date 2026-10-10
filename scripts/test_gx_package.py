@@ -25,6 +25,7 @@ if str(SCRIPTS) not in sys.path:
 
 import gx_linux_build as linux  # noqa: E402
 import gx_package as stage_mod  # noqa: E402
+import gx_pinyin as pinyin  # noqa: E402
 import gx_release as release  # noqa: E402
 import gx_windows_package as pkg  # noqa: E402
 from test_gx_linux_build import LAYER_SHELL, make_elf  # noqa: E402
@@ -271,6 +272,21 @@ class PinTests(unittest.TestCase):
                     self.assertNotIn(b"\r", data)
                     self.assertEqual(sha(data), item.sha256)
 
+    def test_embedded_data_ships_its_licenses(self):
+        # The pinyin table is compiled into ghostty.exe: both license texts next to it ship.
+        targets = {item.target: item for item in pkg.PAYLOAD}
+        shipped = {targets[target].member for component in pkg.EMBEDDED for target in component.licenses}
+        self.assertEqual(shipped, {pkg.PINYIN_LICENSE, pkg.UNICODE_LICENSE})
+        for component in pkg.EMBEDDED:
+            for target in component.licenses:
+                self.assertEqual(targets[target].source, pkg.REPO)
+                self.assertIn(f"({target})", component.license)
+        self.assertIn(f"pinyin-data {pinyin.SOURCE_VERSION}", pkg.EMBEDDED[0].component)
+        self.assertIn(pinyin.OUTPUT, pkg.EMBEDDED[0].component)
+        # A license text missing from the payload is refused.
+        with self.assertRaisesRegex(pkg.PackageError, "not in the payload"):
+            pkg.third_party(pkg.DOWNLOADS, [item for item in pkg.PAYLOAD if item.member != pkg.UNICODE_LICENSE])
+
     def test_fonts_and_runtime_match_the_release_contract(self):
         fonts = sorted(item.target.split("/", 1)[1] for item in pkg.font_payload())
         self.assertEqual(fonts, sorted(release.WINDOWS_FONTS))
@@ -361,8 +377,12 @@ class PortableTreeTests(Case):
                          "share/ghostty/themes/Builtin Dark", "README.txt", "licenses/Ghostty-MIT.txt",
                          "licenses/THIRD-PARTY.txt", "licenses/ConPTY-MIT.txt", "licenses/Mesa-MIT.txt",
                          "licenses/LLVM-Apache-2.0-WITH-LLVM-exception.txt", "licenses/JetBrainsMono-OFL-1.1.txt",
-                         "licenses/NotoSansCJK-OFL-1.1.txt", *(f"fonts/{name}" for name in release.WINDOWS_FONTS)):
+                         "licenses/NotoSansCJK-OFL-1.1.txt", "licenses/pinyin-data-MIT.txt",
+                         "licenses/Unicode-License-V3.txt", *(f"fonts/{name}" for name in release.WINDOWS_FONTS)):
             self.assertIn(relative, files)
+        self.assertEqual((tree / "licenses/pinyin-data-MIT.txt").read_bytes(), (ROOT / pkg.PINYIN_LICENSE).read_bytes())
+        self.assertEqual((tree / "licenses/Unicode-License-V3.txt").read_bytes(),
+                         (ROOT / pkg.UNICODE_LICENSE).read_bytes())
         for skipped in ("ghostty-vt.dll", "ghostty-vt.pdb", "share/pkgconfig/libghostty-vt.pc", "include/ghostty/vt.h"):
             self.assertNotIn(skipped, files)
         self.assertIn("skipped bin/ghostty-vt.dll", self.stdout.getvalue())
@@ -382,6 +402,11 @@ class PortableTreeTests(Case):
         for download in self.fixtures.downloads:
             self.assertIn(download.url, third_party)
             self.assertIn(download.sha256, third_party)
+        for needle in (f"pinyin-data {pinyin.SOURCE_VERSION}", "compiled into ghostty.exe", pinyin.SOURCE_URL,
+                       "MIT (licenses/pinyin-data-MIT.txt)", "Unicode License V3 (licenses/Unicode-License-V3.txt)",
+                       f"licenses/pinyin-data-MIT.txt  sha256 {sha((ROOT / pkg.PINYIN_LICENSE).read_bytes())}",
+                       f"licenses/Unicode-License-V3.txt  sha256 {sha((ROOT / pkg.UNICODE_LICENSE).read_bytes())}"):
+            self.assertIn(needle, third_party)
 
     def test_fork_themes_are_added_with_lf_unless_the_prefix_has_them(self):
         root = make_root(self.base / "themed", themes={"GX Mocha": b"# GX theme\r\nbackground = #1f1f28\r\n",
@@ -562,6 +587,20 @@ class BinaryFormatTests(unittest.TestCase):
             write(ttf, b"\0\1\0\0" + bytes(8))
             with self.assertRaises(pkg.PackageError):
                 pkg.font_name(ttf)
+
+    def test_deb_copyright_lists_the_pinyin_data(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fonts = Path(temp)
+            write(fonts / "JetBrainsMonoNerdFont-Regular.ttf", sfnt("JetBrainsMono NF Regular"))
+            write(fonts / "NotoSansCJK-Regular.ttc", sfnt("Noto Sans CJK JP", ttc=True))
+            text = stage_mod.copyright_file(ROOT, fonts, "SIL Open Font License 1.1\n")
+        stanza = text.split("Files: src/gx/pinyin/*\n", 1)[1].split("\n\n", 1)[0]
+        self.assertTrue(stanza.startswith("Copyright: 2016 mozillazg\n "))
+        self.assertIn("Unicode, Inc.\nLicense: MIT and Unicode-3.0\nComment: ", stanza)
+        self.assertIn(pinyin.SOURCE_VERSION, stanza)
+        unicode_text = (ROOT / pkg.UNICODE_LICENSE).read_text(encoding="utf-8")
+        self.assertIn("\n".join(["License: Unicode-3.0", *stage_mod.dep5_text(unicode_text)]), text)
+        self.assertTrue(text.endswith("\n"))
 
 
 class InstallerScriptTests(unittest.TestCase):
@@ -956,7 +995,10 @@ class DebStageTests(Case):
         for needle in ("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
                        "Copyright: 2024 Mitchell Hashimoto, Ghostty contributors", "License: MIT",
                        "License: OFL-1.1", "Files: */NotoSansCJK-*.ttc", "Copyright: 2020 Test Font Authors\n",
-                       " Permission is hereby granted, free of charge"):
+                       " Permission is hereby granted, free of charge",
+                       "Files: src/gx/pinyin/*\nCopyright: 2016 mozillazg\n", "Unicode, Inc.\n",
+                       "License: MIT and Unicode-3.0\n", f" {pinyin.SOURCE_VERSION} (https://github.com/mozillazg/pinyin-data",
+                       "\nLicense: Unicode-3.0\n UNICODE LICENSE V3\n"):
             self.assertIn(needle, copyright_text)
         self.assertEqual(manifest["deb_depends"], "libc6 (>= 2.39), libgtk-4-1 (>= 4.14.0)")
         self.assertEqual(manifest["binaries"], {"ghostty": sha(linux_binary())})
