@@ -7,10 +7,16 @@
  * gtk-custom-css files (USER), which both still override it. When the
  * window follows the terminal colors (window-theme = auto or ghostty), the
  * colors derived from the terminal theme are appended (src/gx/gtk_css.zig).
+ *
+ * The rules select below the main window's toolbar view, which has the
+ * gx-chrome class (src/apprt/gtk/gx/window.zig), so dialogs shown inside
+ * the window keep their own look. Scrollbars keep the libadwaita sizes.
  */
 
-/* Rounded tabs. */
-.window tabbar tab {
+/* Rounded tabs, with the keyboard focus ring following the corners. */
+toolbarview.gx-chrome tabbar tab,
+toolbarview.gx-chrome tabbar tabbox > tabboxchild,
+dnd tab {
   border-radius: 8px;
 }
 
@@ -19,31 +25,13 @@
  * between the header bar, the tab bar and the terminal. raised-border
  * keeps its border line.
  */
-.window toolbarview > .top-bar.raised:not(.border),
-.window toolbarview > .bottom-bar.raised:not(.border),
-.window headerbar {
+toolbarview.gx-chrome > .top-bar.raised:not(.border),
+toolbarview.gx-chrome > .bottom-bar.raised:not(.border) {
   box-shadow: none;
 }
 
 /* 1 px split dividers. */
-.window .split paned > separator {
+toolbarview.gx-chrome .split paned > separator {
   min-width: 1px;
   min-height: 1px;
-}
-
-/* Slimmer scrollbars, thinner still while only indicating the position. */
-.window scrollbar.vertical slider {
-  min-width: 5px;
-}
-
-.window scrollbar.horizontal slider {
-  min-height: 5px;
-}
-
-.window scrollbar.vertical.overlay-indicator:not(.hovering) slider {
-  min-width: 2px;
-}
-
-.window scrollbar.horizontal.overlay-indicator:not(.hovering) slider {
-  min-height: 2px;
 }
