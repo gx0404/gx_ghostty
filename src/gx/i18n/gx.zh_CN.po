@@ -865,3 +865,10 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. Search bar: the message when it cannot open without Direct2D
+msgid "Find"
+msgstr "查找"
+
+msgid "Find is not available: Direct2D could not be started."
+msgstr "查找不可用：无法启动 Direct2D。"

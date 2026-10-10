@@ -45,4 +45,7 @@ test {
     _ = @import("win32/ui/settings/hit_test.zig");
     _ = @import("win32/ui/settings/swatch.zig");
     _ = @import("win32/ui/settings/system.zig");
+    _ = @import("win32/ui/LinkPreview.zig");
+    _ = @import("win32/ui/ResizeOverlay.zig");
+    _ = @import("win32/ui/SearchBar.zig");
 }
