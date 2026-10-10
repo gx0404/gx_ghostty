@@ -556,22 +556,22 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 
-- 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（5 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
+- 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（6 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
 - 标记：`fork(gx): GX-0010`；四个纯新增块以 `// fork(gx): GX-0010 begin: <说明>` 开头、`// fork(gx): GX-0010 end` 结尾，`language` 注释上方是单行标记。
 - 状态：active，未回馈上游。
-- 改动量：改写 `language` 的 18 行文档注释为 25 行；新增约 115 行（键与文档约 90 行、钩子、包装与诊断重放约 25 行），不改、不删其他上游行。
+- 改动量：改写 `language` 的 18 行文档注释为 25 行；新增约 125 行（键与文档约 100 行、钩子、包装与诊断重放约 25 行），不改、不删其他上游行。
 
 ### 原因
 
-Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/defaults.ghostty`，Windows 另加 `src/gx/defaults-windows.ghostty`）、设置界面写的覆盖文件 `gui-settings.ghostty`，以及固定的优先级「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< `gui-settings.ghostty` < 命令行」。上游 `Config.load` 依次读默认文件、命令行、再读 `config-file`，引入的文件会盖过命令行；`theme` 的加载与明暗切换（`loadTheme`、`changeConditionalState`）都靠重放 `_replay_steps` 重建配置。要让 `theme = GX Mocha` 这种默认值像普通配置一样被用户的 `theme` 与显式颜色覆盖，并在每次重放后保持层序，只能按层重排重放步骤再重建，而 `Replay` 是 `Config.zig` 的私有类型，所以需要一个公开入口。fork 配置键（`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`）必须是 `Config` 的字段，才能走同一套解析、`+show-config`、补全与文档生成；`language` 的语义在 GX 里也变了（只认 `zh-CN`/`en`，默认 `zh-CN`，Windows 与 GTK 可运行时切换），文档注释即用户文档，必须同步改写。
+Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/defaults.ghostty`，Windows 另加 `src/gx/defaults-windows.ghostty`）、设置界面写的覆盖文件 `gui-settings.ghostty`，以及固定的优先级「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< `gui-settings.ghostty` < 命令行」。上游 `Config.load` 依次读默认文件、命令行、再读 `config-file`，引入的文件会盖过命令行；`theme` 的加载与明暗切换（`loadTheme`、`changeConditionalState`）都靠重放 `_replay_steps` 重建配置。要让 `theme = GX Mocha` 这种默认值像普通配置一样被用户的 `theme` 与显式颜色覆盖，并在每次重放后保持层序，只能按层重排重放步骤再重建，而 `Replay` 是 `Config.zig` 的私有类型，所以需要一个公开入口。fork 配置键（`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`）必须是 `Config` 的字段，才能走同一套解析、`+show-config`、补全与文档生成；`language` 的语义在 GX 里也变了（只认 `zh-CN`/`en`，默认 `zh-CN`，Windows 与 GTK 可运行时切换），文档注释即用户文档，必须同步改写。
 
 ### 行为
 
 - `GHOSTTY_GX_DEFAULTS` 未设置或不是 `0`/`false`/`off`/`no` 时，`Config.load` 改由 `src/gx/config_layers.zig::load` 完成：先按上游顺序读用户默认文件、命令行与 `config-file`，再读覆盖文件（`--config-default-files=false` 时不读用户文件与覆盖文件，但保留 GX 默认值），然后把重放步骤排成「GX 默认值 → 用户文件与全部 include → 覆盖文件 → 命令行 → `-e` 及其命令」，用 `gxReplay` 在空配置上重建，最后 `finalize`。某层设置 `font-family*` 时在该层第一处值前插入重置步骤，高层的字体列表替换低层而不是追加。
-- 重放诊断：上游 `Replay.Iterator` 重放 `.diagnostic` 步骤（`config-file` 打不开、循环引用、不是文件）时只把诊断加进新配置，不再记入新配置的 `_replay_steps`，于是设置了 `theme` 后第二次重放（明暗切换的 `changeConditionalState`、`ghostty +validate-config` 在 `Config.load` 之后再调一次 `finalize`）会丢掉这些诊断。GX 默认带主题，这个缺陷会让 `+validate-config` 漏报缺失的 include，所以补丁让重放把诊断步骤一并记回；每次重放都从空配置开始，诊断不会重复。上游路径（`GHOSTTY_GX_DEFAULTS=0`）同样受益。
+- 重放诊断：上游 `Replay.Iterator` 重放 `.diagnostic` 步骤（`config-file` 打不开、循环引用、不是文件）时只把诊断加进新配置，不再记入新配置的 `_replay_steps`，于是设置了 `theme` 后第二次重放（明暗切换的 `changeConditionalState`、`ghostty +validate-config` 在 `Config.load` 之后再调一次 `finalize`）会丢掉这些诊断。GX 默认带主题，这个缺陷会让 `+validate-config` 漏报缺失的 include，所以补丁让重放把诊断步骤一并记回；每次重放都从空配置开始，诊断不会重复。上游路径（`GHOSTTY_GX_DEFAULTS=0`）同样受益。GX 分层还把读不出的 `gui-settings.ghostty` 与不受支持的 `language` 记成 `.diagnostic` 重放步骤，同样靠这处补丁在之后的每次重放、克隆与 `rebuild` 中保留（`+validate-config` 因此退出 1）。
 - 默认值引用内置主题 `GX Mocha` 时，加载前把 `src/gx/themes/GX Mocha` 写进用户主题目录（`<配置目录>/ghostty/themes`；文件首行带 GX 标记，内容变化才原子替换，同名但没有标记的用户文件不动），没有资源目录也能解析主题。
 - `GHOSTTY_GX_DEFAULTS=0` 时 `Config.load` 与上游完全一致。`Config.default`、`loadDefaultFiles`、`loadCliArgs`、`loadRecursiveFiles`、`finalize` 等其余入口不变，上游单测不经过 GX 分层。
-- 新增 5 个键都有默认值（`gx-herdr-app-mode = true`、`gx-window-material = solid`、`gx-open-config-ui = settings`，两个列表为空）；它们出现在 `+show-config`、shell 补全与生成的配置文档里。C API 按字符串键读取：布尔与枚举照常可读，两个列表类型返回 false（与上游同类键一致）。
+- 新增 6 个键都有默认值（`gx-herdr-app-mode = true`、`gx-window-material = solid`、`gx-open-config-ui = settings`、`gx-ctrl-scroll-zoom = true`，两个列表为空）；它们出现在 `+show-config`、shell 补全与生成的配置文档里。`gx-ctrl-scroll-zoom`（Ctrl+滚轮或触控板捏合缩放字号，文档写明只在 Windows 生效、自 Ghostty GX 0.0.3 起）目前只有键与设置项，win32 apprt 尚未按它处理滚轮。C API 按字符串键读取：布尔与枚举照常可读，两个列表类型返回 false（与上游同类键一致）。
 - 已知差异：经 GX 分层加载的配置诊断不带文件与行号。上游只要设置了 `theme` 就会在 `loadTheme` 重放时丢掉位置信息，GX 默认带主题，所以总是如此。
 
 ### 上游状态
@@ -716,7 +716,7 @@ GTK 冒烟：配置 `shell-integration = none` 与 `command = /bin/bash --noprof
 - 文件：`src/input/Binding.zig`（导入 `src/gx/action.zig`；`Action` 字段区末尾、`crash` 之后新增 `gx` 字段与文档注释；`scope` 把 `.gx` 归入 surface；`formatValue`、`cloneValue` 各加一个 union 分支）、`src/input/command.zig`（`actionCommands` 的 `.gx` 分支，没有内置命令）、`src/Surface.zig`（`performBindingAction` 的 `.gx` 分支）。动作类型、解析与格式化在新路径 `src/gx/action.zig`。
 - 标记：`fork(gx): GX-0014`；全部是纯新增块，用 `begin`/`end` 包住（`Binding.zig` 五块，其余两个文件各一块）。
 - 状态：active，未回馈上游。`src/apprt/gtk/class/command_palette.zig` 原有一块（`isActionSupportedOnGtk` 把 `.gx` 归为不支持，GTK 命令面板因此不列出 `gx:` 条目）已在 GTK 实现 `gxAction`（GX-0011）后删除，登记行改为 `removed`，该文件与上游一致。
-- 改动量：3 个文件，`git diff --numstat` 合计 +62/−0（含注释与文档注释）。
+- 改动量：3 个文件，`git diff --numstat` 合计约 +85/−0（含注释与文档注释；`gx` 字段的文档注释随新增动作扩写）。
 
 ### 原因
 
@@ -724,9 +724,9 @@ Ghostty GX 的 Windows 界面需要能绑定到键位与命令面板的应用操
 
 ### 行为
 
-- 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。
-- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行全部五个动作；embedded（macOS）与 none 没有实现。
-- 命令面板：win32 与 GTK 都列出 `command-palette-entry` 里的 `gx:` 条目（GX 默认值带「设置」「键盘快捷键」「主菜单」三条），选中后同样经 `performBindingAction` 交给 `gxAction`。GTK 用的是未改动的上游命令面板，按标题或动作（如 `gx:settings`）搜索，原样显示配置里的标题与描述：GX 默认值写的是英文 msgid，GTK 构建在加载配置时（fork 路径 `src/gx/config_layers.zig::translatePalette`，不是源码补丁）把默认值层的这些条目按 `language` 换成译文，切换语言重载配置后随之更新；win32 面板在显示时经 `gx.i18n` 翻译。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
+- 语法 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`，以及 `settings_page:<页>`（`language`、`appearance`、`font`、`interaction`、`shell`、`about`）、`new_tab_menu`、`context_menu`、`move_split_to_tab`、`move_split_to_window`、`tab_switcher`；全部动作都写在 `Binding.zig` 中 `gx` 字段的文档注释里，即用户文档。`<id>` 是 `src/gx/profiles.zig` 的 `Profile.id`（如 `pwsh`、`wsl:Ubuntu`、`custom:<名称>`），取第一个冒号之后的全部内容，可以含冒号。`keybind` 中未知名称报 `InvalidAction`，缺参数、空参数或给无参动作带参数报 `InvalidFormat`；`command-palette-entry` 经 `src/cli/args.zig` 解析，同样的错误报 `InvalidValue`。
+- `gx` 动作的作用域是 surface。核心 `Surface.performBindingAction` 在 `apprt.App` 声明了 `gxAction` 时调用 `rt_app.gxAction(.{ .surface = self }, action)` 并返回其结果；否则记一条 warn 日志并返回 false（未执行），带 `performable:` 前缀的绑定因而把按键交给终端。win32 apprt（`src/apprt/win32/App.zig::gxAction`）与 GTK apprt（GX-0011 的 `src/apprt/gtk/App.zig::gxAction`，转到 `src/apprt/gtk/gx/app.zig::performGxAction`）执行前五个动作；后六个动作已能解析与格式化（可写进 `keybind` 与 `command-palette-entry`），两个 apprt 都还没有实现，`gxAction` 对它们返回 false（未执行）；embedded（macOS）与 none 没有实现任何 GX 动作。动作的标题 msgid 在 `src/gx/action.zig::Action.title`（win32 快捷键速查表已用，GTK 的 `shortcuts.zig::gxTitle` 仍是自己的一份）。
+- 命令面板：win32 与 GTK 都列出 `command-palette-entry` 里的 `gx:` 条目（GX 默认值带「设置」「键盘快捷键」「主菜单」三条），选中后同样经 `performBindingAction` 交给 `gxAction`。GTK 用的是未改动的上游命令面板，按标题或动作（如 `gx:settings`）搜索，原样显示配置里的标题与描述：GX 默认值写的是英文 msgid，GTK 构建在加载配置时（fork 路径 `src/gx/config_layers.zig::translatePalette`，不是源码补丁）把默认值层的这些条目按 `language` 换成译文，切换语言后经 `gx.config_layers.rebuild` 在内存重建配置即随之更新；win32 面板在显示时经 `gx.i18n` 翻译。格式化（`+list-keybinds`、`+show-config`、命令面板条目的 C 镜像）输出 `gx:<name>[:<argument>]`，可原样再解析；哈希与比较包含参数。`src/apprt/action.zig` 与 `include/ghostty.h` 不变，其他上游动作的行为不变。
 
 ### 上游状态
 

@@ -7,7 +7,7 @@
 fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器、字体栈、GTK app 与 macOS app 跟随上游，fork 在其上增加四块：
 
 - **Windows 原生应用**：win32 apprt（`src/apprt/win32.zig` 与 `src/apprt/win32/**`），移植自 MIT 许可的 shiweis/ghostty-windows@119b9270c（移植的文件头注明出处），之后按模块拆分并改写，界面改为 Direct2D 自绘（第 6 节）。配套的上游补丁：apprt 接线 GX-0003、WGL 渲染 GX-0004、termio 修正 GX-0005、win32-input-mode GX-0006、随包 ConPTY GX-0007、OSC 7 GX-0008、DirectWrite 字体发现 GX-0009。
-- **GX 共享核心** `src/gx/`：配置分层与 GX 默认值、界面语言与翻译、启动配置、进程检查、关闭确认、herdr 应用模式、`gx:` 绑定动作，win32 与 GTK 两个 apprt 共用（第 7 节）。
+- **GX 共享核心** `src/gx/`：配置分层与 GX 默认值、界面语言与翻译、界面库（颜色与对比度、设计 token、标签条配色、动效、模糊匹配与拼音首字母）、启动配置、进程检查、关闭确认、herdr 应用模式、`gx:` 绑定动作、状态文件，win32 与 GTK 两个 apprt 共用（第 7 节）。
 - **GTK 的 GX 层** `src/apprt/gtk/gx/`：运行时切换界面语言、GX 菜单与启动配置、设置对话框、快捷键速查、herdr 应用模式与 GX 样式（第 8 节）。
 - **打包、发布与开发框架**：Windows 便携 zip 与 Inno Setup 安装包、GX Shell 组件 stage、`gx-release` 发布链（第 13 节），以及 `docs/`、`scripts/`、`justfile` 组成的 AI 协作框架。
 
@@ -51,8 +51,9 @@ fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器
 
 fork 新增的路径（上游没有，同步时不冲突）：
 
-- 源码：`src/apprt/win32.zig` 与 `src/apprt/win32/**`（win32 apprt，含 `chrome/`、`ui/`、`ui/settings/`）；`src/gx/**`（共享核心，含 `i18n/`、`themes/`、两份 `defaults*.ghostty`）；`src/apprt/gtk/gx/**` 与 `src/apprt/gtk/ui/1.5/gx-settings-dialog.blp`、`src/apprt/gtk/ui/1.5/gx/menus.blp`（GTK 的 GX 层）；`src/font/directwrite/**`（DirectWrite 发现，`com.zig` 与 `discovery.zig` 移植自 shiweis/ghostty-windows）；`src/renderer/opengl/wgl.zig`。这些是新文件，不是补丁，只经登记过的补丁接进上游代码。
+- 源码：`src/apprt/win32.zig` 与 `src/apprt/win32/**`（win32 apprt，含 `chrome/`、`ui/`、`ui/settings/`）；`src/gx/**`（共享核心，含 `i18n/`、`pinyin/`、`themes/`、两份 `defaults*.ghostty`）；`src/apprt/gtk/gx/**` 与 `src/apprt/gtk/ui/1.5/gx-settings-dialog.blp`、`src/apprt/gtk/ui/1.5/gx/menus.blp`（GTK 的 GX 层）；`src/font/directwrite/**`（DirectWrite 发现，`com.zig` 与 `discovery.zig` 移植自 shiweis/ghostty-windows）；`src/renderer/opengl/wgl.zig`。这些是新文件，不是补丁，只经登记过的补丁接进上游代码。
 - 分发：`dist/windows/gx/`（Inno Setup 脚本 `ghostty-gx.iss` 与随包第三方组件的许可证）。
+- 测试：`test/gui/`（win32 与 GTK 的 GUI 场景，由 `just win-gui`、`just wsl scenario` 回放）。
 - 框架：`docs/`、`scripts/`、`justfile`、`CLAUDE.md`、`CHANGELOG.md`、`.claude/`、`.codex/`、`.zcode/`、`.githooks/`、`.graphifyignore`、`graphify-out/`、`.github/workflows/gx-*.yml`、`.github/workflows-archive/`（上游 15 个 workflow 原样归档）；本机状态在 gitignored 的 `.local/`。
 
 ## 3. 入口与构建产物
@@ -157,10 +158,10 @@ Surface（src/Surface.zig）
 | `chrome/TitleBar.zig` | 非客户区与集成标题栏：`WM_NCCALCSIZE` 把客户区延伸到标题栏，`WM_NCHITTEST` 报 `HTCAPTION`、`HTTOP` 与 `HTMINBUTTON`/`HTMAXBUTTON`（Windows 11 贴靠布局）/`HTCLOSE`；`window-decoration` 各模式、全屏；整行用 Direct2D 画进带逐像素 alpha 的 32bpp DIB 再贴到窗口 |
 | `chrome/TabBar.zig` | 标题栏行里的标签页：绘制、命中测试、拖动排序、右键菜单、双击改名、未读圆点、`程序 ~ 标题` 标签 |
 | `chrome/Backdrop.zig` | DWM 深浅色与边框色、`gx-window-material`（`mica`/`acrylic`/`tabbed`，Windows 11 22H2 起，标题栏一行延伸 DWM 边框，此时标题栏按钮交给 DWM 绘制）、按像素合成（`perPixel`：材质与 `background-opacity` 从终端背景透出；GDI 不写 alpha，窗口自己画的部分经 `fillBackground`、`fillOpaque` 贴预乘 DIB）、退路（更早的系统、Mesa、无 alpha 格式：`background-opacity` 整窗 `WS_EX_LAYERED`）、`background-blur`（只用于纯色材质） |
-| `ui/d2d.zig`、`ui/style.zig` | 手写的 Direct2D 1.1/DirectWrite COM 绑定与 `Canvas`（`Factory` 由 `App.uiFactory` 持有，只在 GUI 线程使用）；从终端主题推导的设计令牌 |
+| `ui/d2d.zig`、`ui/style.zig`、`ui/anim.zig` | 手写的 Direct2D 1.1/DirectWrite COM 绑定与 `Canvas`（`Factory` 由 `App.uiFactory` 持有，只在 GUI 线程使用）；设计令牌（颜色逐字段取自 `gx.ui_tokens` 与 `gx.chrome`）；帧时钟与 `Tween`（时长与曲线取自 `gx.motion`） |
 | `ui/Popup.zig` | 可复用的自绘弹出窗口：属主窗口、DWM 圆角与系统阴影、按显示器 DPI、键鼠、带 IME 的单行输入 |
 | `ui/MenuPopup.zig`、`ui/Menu.zig` | Windows 11 风格的主题化弹出菜单（子菜单、键盘导航、靠屏幕边缘翻转）；主菜单、启动配置菜单、标签页与终端右键菜单 |
-| `ui/Palette.zig`、`ui/fuzzy.zig`、`ui/trigger.zig`、`ui/Keybinds.zig` | 命令面板（分组、中英文模糊匹配、本次运行内的 frecency、主题预览）；按键显示与反查（菜单提示经 `trigger.Hints` 跳过被占用的按键）；快捷键速查表（被占用的按键带警告标记与原因） |
+| `ui/Palette.zig`、`ui/trigger.zig`、`ui/Keybinds.zig` | 命令面板（分组、`gx.fuzzy` 的中英文与拼音首字母模糊匹配、本次运行内的 frecency、主题预览；`ui/fuzzy.zig` 只是转发到 `gx.fuzzy` 的过渡文件）；按键显示与反查（菜单提示经 `trigger.Hints` 跳过被占用的按键）；快捷键速查表（被占用的按键带警告标记与原因） |
 | `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层：模态、背后变暗，六个分区，改动写入 `gui-settings.ghostty` 后重载 |
 | `ui/Dialogs.zig` | 主题化模态对话框：关闭与退出确认（列出仍在运行的进程）、剪贴板授权与不安全粘贴（带预览）、子进程退出、关于（带非官方分支声明）；任务模态，嵌套上限 4 层，对话框期间推迟 `WM_CLOSE`；另存为用系统对话框 |
 | `ui/SearchBar.zig`、`ui/LinkPreview.zig`、`ui/ResizeOverlay.zig`、`ui/ShortcutNotice.zig`、`ui/wstr.zig` | 查找栏（`当前/总数` 计数）、链接预览气泡、改尺寸时的列×行提示、默认复制/粘贴/查找/分屏键被占用时窗口底部的提示条（每次运行一次）；UTF-8 → UTF-16 |
@@ -175,21 +176,29 @@ Surface（src/Surface.zig）
 
 | 模块 | 作用 |
 |---|---|
-| `config_layers.zig`、`config_types.zig`、`defaults.ghostty`、`defaults-windows.ghostty`、`theme.zig`、`themes/` | 配置分层（下文）、`gx-*` 键的值类型、内嵌的 GX 默认值、内置主题 `GX Mocha` |
-| `gui_settings.zig`、`settings_map.zig` | 设置界面的覆盖文件 `gui-settings.ghostty`（逐行编辑、原子替换）；与界面无关的设置模型（选项、写入的键、待保存的改动） |
+| `config_layers.zig`、`config_types.zig`、`defaults.ghostty`、`defaults-windows.ghostty`、`theme.zig`、`themes/` | 配置分层与各层输入的快照 `Layers`（下文）、`gx-*` 键的值类型、内嵌的 GX 默认值、内置主题 `GX Mocha` |
+| `gui_settings.zig`、`settings_map.zig` | 设置界面的覆盖文件 `gui-settings.ghostty`（逐行编辑、原子替换）；与界面无关的设置模型（选项、写入的键、待保存的改动；「恢复默认」删键） |
+| `state_file.zig`、`window_state.zig`、`palette_history.zig` | 状态目录（Windows `%LOCALAPPDATA%\ghostty\`，Linux `$XDG_STATE_HOME/ghostty/`）的原子读写、窗口位置记忆、命令面板使用记录（只存键的哈希）；尚无 apprt 调用 |
 | `i18n.zig`、`i18n/gx.zh_CN.po`、`i18n/zh_CN.zig` | 界面语言（`zh-CN`/`en`，进程级，可运行时切换）与 zh-CN 译表；译表由 `just i18n` 从 `po/zh_CN.po` 与 `gx.zh_CN.po` 生成 |
+| `ui_color.zig`、`ui_tokens.zig`、`chrome.zig`、`motion.zig` | 界面库：WCAG 对比度与只调 OKLab 明度的对比度修正、由终端颜色派生的设计 token（含高对比度的系统色）、标签条与窗口边框配色、Fluent 时长与缓动曲线；win32 的 `ui/style.zig`、`ui/anim.zig` 以它们为真源，GTK 尚未接入 |
+| `fuzzy.zig`、`pinyin.zig`、`pinyin/initials.zig` | 模糊匹配与 frecency，汉字可按拼音首字母匹配；首字母表由 `just pinyin` 从钉版 pinyin-data 生成 |
+| `theme_swatch.zig`、`shortcuts.zig` | 主题文件的颜色与列表色块缓存；快捷键速查的模型、键名与搜索 |
 | `branding.zig` | 两个 apprt 的「关于」用的产品名、维护者、链接与非官方分支声明（msgid） |
 | `profiles.zig` | 启动配置探测（Windows：GX Zsh、herdr、PowerShell 7、Windows PowerShell、命令提示符、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版；Linux：GX Zsh、herdr、登录 shell、zsh、bash、fish）加 `gx-launch-profile`，以及默认启动配置的顺序 |
-| `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 列进程（Linux `/proc`，Windows Toolhelp32）、空闲进程策略、关闭确认（GX-0012）、herdr 应用模式判定 |
-| `action.zig` | `gx:<name>[:<argument>]` 动作的类型、解析与格式化（GX-0014） |
+| `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 列进程（Linux `/proc`，Windows Toolhelp32）、空闲进程策略、关闭确认（GX-0012）、herdr 应用模式判定；另有共享进程表快照 `Shared`、一次确认只拍一张表的 `Scope` 与应用模式迟滞 `State`，尚无 apprt 调用 |
+| `leader.zig`、`unread.zig`、`url_policy.zig` | 前台程序归类（远程、超级用户、容器）、后台标签的新输出、OSC 8 链接放行策略；尚无 apprt 调用 |
+| `perf.zig` | `GHOSTTY_GX_PERF=1` 时的耗时样本（`info(gx_perf)` 日志行，`just perf` 汇总），现记配置加载与构建 |
+| `action.zig` | `gx:<name>[:<argument>]` 动作的类型、解析、格式化与标题 msgid（GX-0014） |
 | `win32_input.zig`、`conpty.zig`、`osc7.zig`、`path_quote.zig` | Windows 终端支持：KEY_EVENT_RECORD 编码（GX-0006）、随包 ConPTY（GX-0007）、OSC 7 路径转换（GX-0008）、拖放路径的 shell 引用 |
 | `gtk_css.zig` | 由终端主题生成 GTK 的 GX 配色 CSS（GX-0016） |
 
-**配置分层**（`src/gx/config_layers.zig`，GX-0010）：从低到高依次是内嵌的 GX 默认值（`defaults.ghostty`，Windows 另加 `defaults-windows.ghostty`）、用户配置文件及其 `config-file` 引入的文件、设置界面写的 `gui-settings.ghostty`（与用户配置在同一目录）、命令行（`-e` 及其命令最后）。各文件仍按上游顺序读取，重放步骤再按层排序重建，所以主题加载与明暗切换的重放保持层序；某层设置 `font-family*` 时替换而不是追加低层的列表。环境变量 `GHOSTTY_GX_DEFAULTS=0`（或 `false`、`off`、`no`）时按上游方式加载。配置目录：Linux 为 `$XDG_CONFIG_HOME/ghostty`（缺省 `~/.config/ghostty`）；Windows 为 `%XDG_CONFIG_HOME%\ghostty`，未设时 `%LOCALAPPDATA%\ghostty`（`src/os/xdg.zig::config`）。`GX Mocha` 在加载前写进 `<配置目录>/themes`，文件首行带 GX 标记，同名但没有标记的用户文件不动。
+**配置分层**（`src/gx/config_layers.zig`，GX-0010）：从低到高依次是内嵌的 GX 默认值（`defaults.ghostty`，Windows 另加 `defaults-windows.ghostty`）、用户配置文件及其 `config-file` 引入的文件、设置界面写的 `gui-settings.ghostty`（与用户配置在同一目录）、命令行（`-e` 及其命令最后）。各文件仍按上游顺序读取，重放步骤再按层排序重建，所以主题加载与明暗切换的重放保持层序；某层设置 `font-family*` 时替换而不是追加低层的列表。环境变量 `GHOSTTY_GX_DEFAULTS=0`（或 `false`、`off`、`no`）时按上游方式加载。配置目录：Linux 为 `$XDG_CONFIG_HOME/ghostty`（缺省 `~/.config/ghostty`）；Windows 为 `%XDG_CONFIG_HOME%\ghostty`，未设时 `%LOCALAPPDATA%\ghostty`（`src/os/xdg.zig::config`）。`GX Mocha` 在加载前写进 `<配置目录>/themes`（每个进程只写一次），文件首行带 GX 标记，同名但没有标记的用户文件不动。
 
-GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrainsMono Nerd Font` 并把 CJK 区段经 `font-codepoint-map` 交给 `Noto Sans CJK SC`、12 号字、内边距 10/8、闪烁块光标、右键菜单、`confirm-close-surface = true`、`gx-herdr-app-mode = true`、解绑 Alt+1～8、`gx:` 快捷键与三个命令面板条目；Windows 另设 `quit-after-last-window-closed = true` 与 `shift+insert=paste_from_clipboard`（Windows 没有选择剪贴板）。win32 apprt 能让窗口材质透到终端时（加载前调 `src/gx/config_layers.zig::setMaterialOpacity`），各层都没设 `background-opacity` 的材质在默认值层补一条：`mica`、`tabbed` 为 0.3，`acrylic` 为 0.75（`materialOpacity`）。fork 配置键：`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`；`language` 只认 `zh-CN` 与 `en`，默认 `zh-CN`。
+`Layers` 读一次各层输入后可在内存里按覆盖重建，并说明某个键的值来自哪一层；`rebuild` 按配置记录的输入在内存里重建、除主题外不再读盘，GTK 的语言切换与 win32 的 `toggle_background_opacity` 都经它。覆盖文件读不出、`language` 不受支持时记为诊断，此后每次重放与重建都会再报（`+validate-config` 因此退出 1）。
 
-**GX 绑定动作**：`gx:settings`、`gx:main_menu`（默认 Ctrl+Shift+M）、`gx:keybinds`（默认 Ctrl+Shift+/）、`gx:new_tab_profile:<id>`、`gx:new_window_profile:<id>`。核心 `Surface.performBindingAction` 把它交给 apprt 的 `gxAction`（`src/apprt/win32/App.zig::gxAction`、`src/apprt/gtk/App.zig::gxAction`）；没有实现的 apprt 记日志并返回未执行，带 `performable:` 的绑定把按键交给终端。
+GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrainsMono Nerd Font` 并把 CJK 区段经 `font-codepoint-map` 交给 `Noto Sans CJK SC`、12 号字、内边距 10/8、闪烁块光标、右键菜单、`confirm-close-surface = true`、`gx-herdr-app-mode = true`、解绑 Alt+1～8、`gx:` 快捷键与三个命令面板条目；Windows 另设 `quit-after-last-window-closed = true` 与 `shift+insert=paste_from_clipboard`（Windows 没有选择剪贴板）。win32 apprt 能让窗口材质透到终端时（加载前调 `src/gx/config_layers.zig::setMaterialOpacity`），各层都没设 `background-opacity` 的材质在默认值层补一条：`mica`、`tabbed` 为 0.3，`acrylic` 为 0.75（`materialOpacity`）。fork 配置键：`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`（只在 Windows，默认 true，尚未实现）；`language` 只认 `zh-CN` 与 `en`，默认 `zh-CN`。
+
+**GX 绑定动作**：`gx:settings`、`gx:main_menu`（默认 Ctrl+Shift+M）、`gx:keybinds`（默认 Ctrl+Shift+/）、`gx:new_tab_profile:<id>`、`gx:new_window_profile:<id>`；`gx:settings_page:<页>`、`gx:new_tab_menu`、`gx:context_menu`、`gx:move_split_to_tab`、`gx:move_split_to_window`、`gx:tab_switcher` 已能解析，两个 apprt 尚未实现，执行时返回未执行。核心 `Surface.performBindingAction` 把它交给 apprt 的 `gxAction`（`src/apprt/win32/App.zig::gxAction`、`src/apprt/gtk/App.zig::gxAction`）；没有实现的 apprt 记日志并返回未执行，带 `performable:` 的绑定把按键交给终端。
 
 ## 8. GTK 的 GX 层
 
@@ -197,13 +206,13 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 
 | 模块 | 作用 |
 |---|---|
-| `language.zig`、`app.zig` | 启动与运行时应用 `language`：改写 `LANGUAGE` 与 `LC_MESSAGES`、让 gettext 缓存失效、切换 `gx.i18n`，子进程拿回原来的 `LANG`/`LANGUAGE`；app action `app.gx-language`、`app.gx-keybinds`、`app.gx-about`（`about.zig` 的 Ghostty GX 关于对话框，GX 主菜单用它代替上游 `win.about`）；`performGxAction` 执行五个 `gx:` 动作 |
+| `language.zig`、`app.zig` | 启动与运行时应用 `language`：改写 `LANGUAGE` 与 `LC_MESSAGES`、让 gettext 缓存失效、切换 `gx.i18n`，子进程拿回原来的 `LANG`/`LANGUAGE`；app action `app.gx-language`、`app.gx-keybinds`、`app.gx-about`（`about.zig` 的 Ghostty GX 关于对话框，GX 主菜单用它代替上游 `win.about`）；`performGxAction` 执行前五个 `gx:` 动作，其余返回未执行；语言切换让默认命令面板条目的译文变化时，经 `gx.config_layers.rebuild` 在内存重建配置 |
 | `window.zig`、`menus.zig`、`ui/1.5/gx/menus.blp`、`launch.zig` | 菜单与按钮提示随语言重建（复刻上游菜单并加 GX 分区：设置…、键盘快捷键、语言）；新建标签页下拉的启动配置与「用启动配置新建窗口」 |
 | `shortcuts.zig`、`shortcuts_dialog.zig` | 快捷键速查表（`Adw.Dialog`，可搜索） |
 | `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`，运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
 | `app_mode.zig`、`style.zig`、`style.css` | herdr 应用模式隐藏标签栏、GX 样式的 CSS provider 与 `window-theme` 随配置重设（GX-0016） |
 
-命令面板用上游原样的 `class/command_palette.zig`：它列出 `command-palette-entry` 里的 `gx:` 条目，选中后与绑定一样经 `Surface.performBindingAction`（GX-0014）交给 `App.gxAction`。面板原样显示配置里的标题与描述，GX 默认值写的是英文 msgid，所以 GTK 构建在加载配置时（`src/gx/config_layers.zig::translatePalette`）把默认值层的这些条目按 `language` 换成译文，重载配置即随语言更新；win32 面板则在显示时经 `gx.i18n` 翻译。
+命令面板用上游原样的 `class/command_palette.zig`：它列出 `command-palette-entry` 里的 `gx:` 条目，选中后与绑定一样经 `Surface.performBindingAction`（GX-0014）交给 `App.gxAction`。面板原样显示配置里的标题与描述，GX 默认值写的是英文 msgid，所以 GTK 构建在加载配置时（`src/gx/config_layers.zig::translatePalette`）把默认值层的这些条目按 `language` 换成译文，语言切换后在内存重建配置即随之更新；win32 面板则在显示时经 `gx.i18n` 翻译。
 
 GTK 的上游文字仍走 gettext（`_`/`N_`/`C_` 与 `po/`），只有装了对应 UTF-8 locale 才跟随 `language`；GX 自有文字一律用英文 msgid 经 `gx.i18n` 翻译，不进上游 pot。
 
@@ -246,6 +255,7 @@ GTK 的上游文字仍走 gettext（`_`/`N_`/`C_` 与 `po/`），只有装了对
 | `build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json` | `build.zig.zon` → `nix/build-support/check-zig-cache.sh --update`（需要 Nix） | 同一脚本不带参数 |
 | `po/com.mitchellh.ghostty.pot`、`po/*.po` | `src/apprt/gtk/` 的 `.zig` 与 `.blp`、`src/input/command.zig`、`dist/linux/ghostty_nautilus.py` → `zig build update-translations` | `.github/scripts/check-translations.sh` |
 | `src/gx/i18n/zh_CN.zig` | `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` → `just i18n` | `just i18n-check` |
+| `src/gx/pinyin/initials.zig` | 钉版 pinyin-data 0.15.0 的三个文件（sha256 钉在 `scripts/gx_pinyin.py`）→ `just pinyin`（联网） | `just pinyin-check`（离线） |
 | `vendor/glad/` | `glad.zip` → `Makefile` 的 `glad` 目标 | 无 |
 | `build.zig.zon` 的 `iterm2_themes` 条目 | 上游每周的 `update-colorschemes.yml`（已归档，随同步获得） | 同第一行 |
 | `CODEOWNERS`、`.github/VOUCHED.td` | 上游 vouch 机器人（已归档） | 只随同步更新 |

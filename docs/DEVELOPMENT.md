@@ -66,9 +66,10 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 |---|---|
 | libghostty-vt（根模块 `src/lib_vt.zig`、`src/terminal/c/**`、`include/ghostty/**`） | `just test-vt --filter <名>` |
 | 其他 Zig 核心代码与 `src/gx/` | `just test --filter <名>`（Windows 上运行器按 win32 apprt、`x86_64-windows-gnu` 构建）；只在 Linux 上编译的分支（`/proc`、`tcgetpgrp`）再跑 `just wsl test --filter <名>`；改动也编进 libghostty-vt 时（如 `src/terminal/`）先跑 `just test-vt` |
-| win32 apprt（`src/apprt/win32/**`）与 Windows 专有代码 | `just build`、`just test --filter apprt.win32`，GUI 可见的改动按 TESTING.md「Windows GUI 验证」截图 |
-| GTK apprt 与 GTK 的 GX 层 | `just wsl sync <worktree> --dirty`、`just wsl build --gtk`、`just wsl test --gtk --filter apprt.gtk`，GUI 可见的改动再 `just wsl smoke` 截图 |
+| win32 apprt（`src/apprt/win32/**`）与 Windows 专有代码 | `just build`、`just test --filter apprt.win32`，GUI 可见的改动用 `just win-gui run --out <目录> [W01 …]` 回放相关场景并读图（TESTING.md「Windows GUI 验证」） |
+| GTK apprt 与 GTK 的 GX 层 | `just wsl sync <worktree> --dirty`、`just wsl build --gtk`、`just wsl test --gtk --filter apprt.gtk`，GUI 可见的改动再 `just wsl smoke` 或 `just wsl scenario` 截图；GX 层对上游模板、菜单与 action 的引用由 `python scripts/run_unittests.py test_gtk_gx_contract` 检查 |
 | GX 译文（`src/gx/i18n/gx.zh_CN.po`、`po/zh_CN.po`） | `just i18n` 后 `just i18n-check` |
+| 拼音首字母表（升级钉版 pinyin-data 或改 `scripts/gx_pinyin.py`） | `python scripts/run_unittests.py test_gx_pinyin`，`just pinyin` 后审 diff，再 `just pinyin-check` |
 | 打包与发布脚本 | `python scripts/run_unittests.py test_gx_package test_gx_release test_gx_linux_build`，Windows 包再实跑 `just package-windows` |
 | 任意 `.zig` 文件 | `just fmt-check`，需要改格式时 `just fmt` |
 | 框架脚本、hook、workflow | `python scripts/run_unittests.py test_<名>`（Linux 用 `python3`；看单个方法用 `python -m unittest scripts.test_<名>.<类>.<方法> -v`），再 `just framework-test` |
@@ -81,12 +82,12 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 按改动面挑选；不适用的写明原因。
 
 - 本机聚合门：`just ci-check`（framework-check → fmt-check → test-vt），提交前必跑；热缓存约 100 s。改了 lib-vt 以外的 Zig 代码，再跑完整单测 `just test`（它只跑 `ghostty-test`，macOS app 的单测另用 `macos/build.nu --action test`）。
-- Windows app：`just build` 后按 TESTING.md「Windows GUI 验证」操作并截图；打包相关改动跑 `just package-windows`（需 `just setup --innosetup`，只要 zip 时加 `--skip-installer`）。
-- GTK：`just wsl build --gtk` 与 `just wsl smoke --out <目录>`，截图读图后才算数。
+- Windows app：`just build` 后按 TESTING.md「Windows GUI 验证」用 `just win-gui` 操作并截图；耗时相关的改动用 `just perf win32 --exe <旧> --exe <新> --out <目录>` 交替对比；打包相关改动跑 `just package-windows`（需 `just setup --innosetup`，只要 zip 时加 `--skip-installer`）。
+- GTK：`just wsl build --gtk` 与 `just wsl smoke --out <目录>`、`just wsl scenario --out <目录>`，截图读图后才算数。
 - C API 或头文件：`just build-vt`；示例在各自目录里用钉版 Zig 构建，例如在 `example/c-vt-static` 下执行 `python ../../scripts/zigw.py build`（Linux/macOS 用 `python3`；`just` 的配方总在仓库根执行，进不了示例目录）；ABI 清单用 `just zig build test-lib-vt-schema`，前置见 TESTING.md。
 - wasm：`just vt-wasm`，再用 `node test/wasm-alloc.mjs zig-out/bin/ghostty-vt.wasm` 做分配器冒烟。
 - 其他目标：`just build-vt -Dtarget=<triple>`；源码包：`just dist-vt`。
-- push 到 `gx_ghostty` 后 `gx-ci` 运行 Linux 完整测试、交叉矩阵、Windows 的 lib-vt 测试与 app 构建；GTK 截图冒烟（`gtk_smoke`）、Windows 截图冒烟（`win_smoke`）与 macOS 上的 lib-vt 测试只在手动触发 `gx-ci` 并打开对应输入时运行；发布资产（含 Windows 便携包与安装包、Ubuntu 24.04 的 `linux-gtk-noble` 验证）只在手动运行 `gx-release` 时构建。push 与手动触发由用户执行（fork 上要先启用 Actions，见 RELEASE.md「首次启用」），结果出来之前这些项记 PENDING；截图类证据要下载 artifact 并实际读图后才能记 PASS。
+- push 到 `gx_ghostty` 后 `gx-ci` 运行 Linux 完整测试、交叉矩阵、Windows 的 lib-vt 测试、app 构建与 win32、GX、DirectWrite 单测；GTK 截图冒烟（`gtk_smoke`）、Windows 截图冒烟（`win_smoke`）与 macOS 上的 lib-vt 测试只在手动触发 `gx-ci` 并打开对应输入时运行；发布资产（含 Windows 便携包与安装包、Ubuntu 24.04 的 `linux-gtk-noble` 验证）只在手动运行 `gx-release` 时构建。push 与手动触发由用户执行（fork 上要先启用 Actions，见 RELEASE.md「首次启用」），结果出来之前这些项记 PENDING；截图类证据要下载 artifact 并实际读图后才能记 PASS。
 
 ### 6. 修复复测
 
