@@ -865,3 +865,28 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. GTK settings dialog (src/apprt/gtk/gx/settings_dialog.zig)
+msgid "Revert"
+msgstr "还原"
+
+msgid "Retry"
+msgstr "重试"
+
+msgid "Choose a Monospace Font…"
+msgstr "选择等宽字体…"
+
+msgid "Use the Default Font"
+msgstr "使用默认字体"
+
+msgid "Open Folder"
+msgstr "打开文件夹"
+
+msgid "Custom: {value}"
+msgstr "自定义：{value}"
+
+msgid "Settings cannot be changed here because {variable} turns off the Ghostty GX settings. Edit the configuration file instead."
+msgstr "{variable} 关闭了 Ghostty GX 设置，此处无法更改设置。请改为编辑配置文件。"
+
+msgid "Set bell-audio-path in the configuration file to choose the sound."
+msgstr "在配置文件中设置 bell-audio-path 以选择声音。"
