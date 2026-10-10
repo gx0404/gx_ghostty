@@ -119,6 +119,10 @@ running: bool = false,
 /// The quick terminal instance (if active).
 quick_terminal: ?*QuickTerminal = null,
 
+/// The window that was in front when `toggle_visibility` hid the windows;
+/// it comes back to the front with them.
+hidden_front: ?w32.HWND = null,
+
 /// Registered global system hotkeys (RegisterHotKey). Maps the id delivered in
 /// WM_HOTKEY back to the binding action to perform. Generalized from the old
 /// single quick-terminal hotkey to every keybind flagged `global:`.
@@ -552,6 +556,18 @@ fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
 pub fn terminate(self: *App) void {
     self.stopQuitTimer();
 
+    // Out of sight first: below, the terminals of every window shut down
+    // one after the other, which takes a moment each.
+    for (self.windows.items) |window| {
+        if (window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+    }
+    if (self.quick_terminal) |qt| {
+        if (qt.window.hwnd) |hwnd| _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+    }
+    // The icon of the last desktop notification would stay in the
+    // notification area until the pointer passes over it.
+    self.removeNotificationIcon();
+
     // Unregister all global hotkeys.
     for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
     self.global_hotkeys.deinit(self.core_app.alloc);
@@ -569,6 +585,16 @@ pub fn terminate(self: *App) void {
         self.quick_terminal = null;
     }
 
+    // Deinit and free all Window containers.
+    const alloc = self.core_app.alloc;
+    for (self.windows.items) |window| {
+        window.deinit();
+        alloc.destroy(window);
+    }
+    self.windows.deinit(alloc);
+
+    // Last: the threads of the terminals wake the message loop through it
+    // until they are gone.
     if (self.msg_hwnd) |hwnd| {
         // Clear GWLP_USERDATA before destroying so msgWndProc sees
         // userdata=0 and falls through to DefWindowProc for any
@@ -577,14 +603,6 @@ pub fn terminate(self: *App) void {
         _ = w32.DestroyWindow(hwnd);
         self.msg_hwnd = null;
     }
-
-    // Deinit and free all Window containers.
-    const alloc = self.core_app.alloc;
-    for (self.windows.items) |window| {
-        window.deinit();
-        alloc.destroy(window);
-    }
-    self.windows.deinit(alloc);
 
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
@@ -716,7 +734,8 @@ pub fn performAction(
                 alloc.destroy(window);
                 return true;
             };
-            _ = window.addTab() catch |err| {
+            // The window context: `window-inherit-working-directory`.
+            _ = window.addTabWithOptions(.{ .context = .window }) catch |err| {
                 log.err("failed to add tab to new window err={}", .{err});
                 // The window never showed: the message loop destroys it,
                 // which also drops it from `windows`.
@@ -852,7 +871,11 @@ pub fn performAction(
         .open_url => {
             // The core asks with the terminal locked when a link is
             // clicked; the shell opens the URL on a thread of its own.
-            open_url.open(value.url);
+            // Links the terminal output chose go through the link policy.
+            switch (value.kind) {
+                .osc8 => self.openLink(target, value.url),
+                .unknown, .text, .html => open_url.open(value.url),
+            }
             return true;
         },
 
@@ -985,9 +1008,8 @@ pub fn performAction(
             };
         },
 
-        .toggle_tab_overview => {
-            return true;
-        },
+        // The tab switcher of the command palette is not there yet.
+        .toggle_tab_overview => return false,
 
         .initial_size => {
             switch (target) {
@@ -1227,28 +1249,7 @@ pub fn performAction(
         },
 
         .toggle_visibility => {
-            // Hide all visible top-level Ghostty windows; if any are
-            // already hidden, show + restore them. Equivalent to macOS
-            // NSApp hide / show.
-            var any_visible = false;
-            for (self.windows.items) |w| {
-                if (w.hwnd) |h| {
-                    if (w32.IsWindowVisible_(h) != 0) {
-                        any_visible = true;
-                        break;
-                    }
-                }
-            }
-            for (self.windows.items) |w| {
-                if (w.hwnd) |h| {
-                    if (any_visible) {
-                        _ = w32.ShowWindow(h, w32.SW_HIDE);
-                    } else {
-                        _ = w32.ShowWindow(h, w32.SW_SHOWNOACTIVATE);
-                    }
-                }
-            }
-            // The quick terminal manages its own visibility separately.
+            self.toggleVisibility();
             return true;
         },
 
@@ -1350,15 +1351,19 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
+                    const surface = core_surface.rt_surface;
                     const visible = value == .visible;
-                    core_surface.rt_surface.mouse_visible = visible;
-                    // Force the next WM_SETCURSOR to apply the new state
-                    // by issuing SetCursor immediately if the cursor is
-                    // currently in our client area.
-                    if (!visible) {
-                        _ = w32.SetCursor(null);
-                    } else if (core_surface.rt_surface.current_cursor) |c| {
-                        _ = w32.SetCursor(c);
+                    surface.mouse_visible = visible;
+                    // WM_SETCURSOR applies it from the next pointer move;
+                    // apply it now only while the pointer is over this
+                    // terminal, so it stays on the tab bar, a popup or
+                    // another window.
+                    if (pointerOver(surface.hwnd)) {
+                        if (!visible) {
+                            _ = w32.SetCursor(null);
+                        } else if (surface.current_cursor) |c| {
+                            _ = w32.SetCursor(c);
+                        }
                     }
                 },
             }
@@ -1366,27 +1371,9 @@ pub fn performAction(
         },
 
         .present_terminal => {
-            // Raise the window containing the target surface and select
-            // its tab. Restores from minimized/iconic state if necessary.
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    const win = core_surface.rt_surface.parent_window;
-                    if (win.hwnd) |hwnd| {
-                        // SW_RESTORE brings the window back from minimized;
-                        // it would also un-maximize, so only when minimized.
-                        if (IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
-                        _ = w32.SetForegroundWindow(hwnd);
-                        // Make sure the tab containing this surface is active.
-                        if (win.findTabIndex(core_surface.rt_surface)) |idx| {
-                            if (idx != win.active_tab) win.selectTabIndex(idx);
-                        }
-                        // Focus the surface's child HWND.
-                        if (core_surface.rt_surface.hwnd) |sh| {
-                            _ = w32.SetFocus(sh);
-                        }
-                    }
-                },
+                .surface => |core_surface| self.presentSurface(core_surface.rt_surface),
             }
             return true;
         },
@@ -1557,6 +1544,195 @@ fn gotoWindow(self: *App, target: apprt.Target, direction: apprt.action.GotoWind
     }
     return false;
 }
+
+/// The window of the core surface `id`, if it still exists.
+fn windowOfSurface(self: *App, id: u64) ?*Window {
+    if (id == 0) return null;
+    const core_surface = self.core_app.findSurfaceByID(id) orelse return null;
+    return core_surface.rt_surface.parent_window;
+}
+
+/// Whether `hwnd` is on screen: visible and not minimized.
+fn onScreen(hwnd: w32.HWND) bool {
+    return w32.IsWindowVisible_(hwnd) != 0 and w32.IsIconic(hwnd) == 0;
+}
+
+/// `toggle_visibility`: hide every window, or when none is on screen (a
+/// minimized window counts as hidden) show them all again, each in its
+/// size and state (a maximized one stays maximized), and bring back to the
+/// front the one that was in front. Hidden windows stop rendering. The
+/// quick terminal toggles on its own (`toggle_quick_terminal`).
+fn toggleVisibility(self: *App) void {
+    const any_shown = for (self.windows.items) |window| {
+        const hwnd = window.hwnd orelse continue;
+        if (onScreen(hwnd)) break true;
+    } else false;
+
+    if (any_shown) {
+        const front = self.targetWindow(.app);
+        self.hidden_front = if (front) |window| window.hwnd else null;
+        for (self.windows.items) |window| {
+            const hwnd = window.hwnd orelse continue;
+            window.setActiveTabVisible(false);
+            _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+        }
+        return;
+    }
+
+    var front: ?*Window = null;
+    for (self.windows.items) |window| {
+        const hwnd = window.hwnd orelse continue;
+        if (window.closing) continue;
+        if (w32.IsWindowVisible_(hwnd) == 0) _ = w32.ShowWindow(hwnd, SW_SHOWNA);
+        if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+        window.setActiveTabVisible(true);
+        if (front == null or hwnd == self.hidden_front) front = window;
+    }
+    self.hidden_front = null;
+    const window = front orelse return;
+    if (window.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
+    window.focusActiveSurface();
+}
+
+/// `present_terminal`: bring `surface` to the user. Its window comes back
+/// from hidden or minimized (the quick terminal slides in) to the front,
+/// with the surface's tab selected and the surface focused.
+fn presentSurface(self: *App, surface: *Surface) void {
+    const window = surface.parent_window;
+    const hwnd = window.hwnd orelse return;
+    if (window.is_quick_terminal) {
+        if (self.quick_terminal) |qt| {
+            if (qt.window == window and w32.IsWindowVisible_(hwnd) == 0) qt.toggle();
+        }
+    } else {
+        if (w32.IsWindowVisible_(hwnd) == 0) {
+            _ = w32.ShowWindow(hwnd, SW_SHOWNA);
+            window.setActiveTabVisible(true);
+        }
+        // SW_RESTORE would also un-maximize, so only when minimized.
+        if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+    }
+    _ = w32.SetForegroundWindow(hwnd);
+    if (window.findTabIndex(surface)) |idx| {
+        if (idx != window.active_tab) window.selectTabIndex(idx);
+    }
+    if (surface.hwnd) |h| _ = w32.SetFocus(h);
+}
+
+/// Whether the pointer is over the window `hwnd` itself (not a window in
+/// front of it).
+fn pointerOver(hwnd: ?w32.HWND) bool {
+    const target = hwnd orelse return false;
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0) return false;
+    return WindowFromPoint(pt) == target;
+}
+
+/// Posted to `msg_hwnd` by `openLink`; lparam is a `LinkRequest`.
+const WM_APP_OPEN_LINK: u32 = w32.WM_APP + 34;
+
+/// A link the link policy holds back, waiting for the message loop to ask
+/// about it or to tell why it stays closed (`onLinkRequest`).
+const LinkRequest = struct {
+    /// The core surface whose terminal showed the link; 0 for none.
+    surface_id: u64,
+    decision: gx.url_policy.Decision,
+    url: []u8,
+
+    fn destroy(self: *LinkRequest, alloc: Allocator) void {
+        alloc.free(self.url);
+        alloc.destroy(self);
+    }
+};
+
+/// Open a link that terminal output chose (OSC 8) as `gx.url_policy`
+/// decides: web and mail links right away; files on this or another
+/// computer and the applications of other schemes once the user agrees;
+/// nothing that can run code. The core asks with the terminal locked, so
+/// the question and the refusal wait for the message loop
+/// (`WM_APP_OPEN_LINK`).
+fn openLink(self: *App, target: apprt.Target, url: []const u8) void {
+    var name_buf: [host_name_size]u8 = undefined;
+    const decision = gx.url_policy.decide(url, .{ .host_name = hostName(&name_buf) });
+    if (decision == .allow) return open_url.open(url);
+    log.info("link held back decision={t} len={}", .{ decision, url.len });
+
+    const hwnd = self.msg_hwnd orelse return;
+    const alloc = self.core_app.alloc;
+    const request = alloc.create(LinkRequest) catch return;
+    request.* = .{
+        .surface_id = switch (target) {
+            .app => 0,
+            .surface => |core_surface| core_surface.id,
+        },
+        .decision = decision,
+        .url = alloc.dupe(u8, url) catch {
+            alloc.destroy(request);
+            return;
+        },
+    };
+    if (w32.PostMessageW(hwnd, WM_APP_OPEN_LINK, 0, @bitCast(@intFromPtr(request))) == 0) {
+        request.destroy(alloc);
+    }
+}
+
+/// Handle `WM_APP_OPEN_LINK`: ask before opening the link, or tell in a
+/// notice why it is not opened, in the window of the terminal that showed
+/// it. Frees the request.
+fn onLinkRequest(self: *App, request: *LinkRequest) void {
+    const alloc = self.core_app.alloc;
+    defer request.destroy(alloc);
+    const window = self.windowOfSurface(request.surface_id) orelse self.targetWindow(.app);
+
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    switch (request.decision) {
+        .allow => return open_url.open(request.url),
+        .confirm => |reason| {
+            const scheme = gx.url_policy.scheme(request.url) orelse "";
+            i18n.format(&body.writer, i18n.trRuntime(reason.msgid()), .{ .scheme = scheme }) catch return;
+            body.writer.writeAll("\n\n") catch return;
+            gx.url_policy.writeDisplay(&body.writer, request.url) catch return;
+            const owner = if (window) |w| w.hwnd else null;
+            // A modal loop: nothing here uses the window after it.
+            if (Dialogs.confirm(owner, body.written(), i18n.tr(gx.url_policy.msg.confirm_title)) != .accept) return;
+            var name_buf: [host_name_size]u8 = undefined;
+            const path = gx.url_policy.filePath(alloc, request.url, .{ .host_name = hostName(&name_buf) }) catch null;
+            defer if (path) |p| alloc.free(p);
+            // A `file:` URL opens as the path it names.
+            open_url.open(path orelse request.url);
+        },
+        .deny => |reason| {
+            const w = window orelse return;
+            body.writer.writeAll(i18n.trRuntime(reason.msgid())) catch return;
+            body.writer.writeAll("\n") catch return;
+            gx.url_policy.writeDisplay(&body.writer, request.url) catch return;
+            w.showNotice(.{
+                .severity = .warning,
+                .title = i18n.tr(gx.url_policy.msg.denied_title),
+                .body = body.written(),
+            }, null);
+        },
+    }
+}
+
+/// Room for `hostName` (a DNS host name in UTF-8).
+const host_name_size = 3 * 64;
+
+/// The DNS host name of this computer, which `file:` URLs may name for a
+/// local file (`ls --hyperlink` does); "" when unknown.
+fn hostName(buf: *[host_name_size]u8) []const u8 {
+    var wide: [64]u16 = undefined;
+    var len: u32 = wide.len;
+    if (GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, &wide, &len) == 0) return "";
+    const n = std.unicode.utf16LeToUtf8(buf, wide[0..@min(len, wide.len)]) catch return "";
+    return buf[0..n];
+}
+
+const COMPUTER_NAME_DNS_HOSTNAME: c_int = 1;
+const SW_SHOWNA: i32 = 8;
+extern "kernel32" fn GetComputerNameExW(name_type: c_int, buffer: [*]u16, size: *u32) callconv(.winapi) i32;
+extern "user32" fn WindowFromPoint(point: w32.POINT) callconv(.winapi) ?w32.HWND;
 
 /// Create and track a top-level window without tabs. It is shown with its
 /// first tab (`Window.addTab*`).
@@ -1795,7 +1971,7 @@ fn restoreTrailingBackslash(alloc: Allocator, path: []const u8) Allocator.Error!
 
 /// Open the configuration file: `.os_open` with the Windows file
 /// association; `.new_window` in a new window running $VISUAL or $EDITOR,
-/// else with the file association.
+/// else with the file association. Returns whether it is being opened.
 pub fn openConfigFile(self: *App, mode: apprt.action.OpenConfig) !bool {
     const config_path = configpkg.edit.openPath(
         self.core_app.alloc,
@@ -1806,9 +1982,9 @@ pub fn openConfigFile(self: *App, mode: apprt.action.OpenConfig) !bool {
     defer self.core_app.alloc.free(config_path);
 
     return switch (mode) {
-        .os_open => self.openConfigWithOs(config_path),
+        .os_open => openConfigWithOs(config_path),
         .new_window => (try self.openConfigInNewWindow(config_path)) or
-            self.openConfigWithOs(config_path),
+            openConfigWithOs(config_path),
     };
 }
 
@@ -1907,24 +2083,12 @@ fn setBackgroundOpacity(self: *App, config: *Config, opacity: f64) void {
     };
 }
 
-/// Open the configuration with the Windows file association.
-fn openConfigWithOs(self: *App, path: [:0]const u8) bool {
-    const alloc = self.core_app.alloc;
-    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| {
-        log.warn("unable to encode config path: {}", .{err});
-        return false;
-    };
-    defer alloc.free(path_w);
-
-    const result = w32.ShellExecuteW(
-        null,
-        std.unicode.utf8ToUtf16LeStringLiteral("open"),
-        path_w,
-        null,
-        null,
-        w32.SW_SHOW,
-    );
-    return result > 32;
+/// Open the configuration with the Windows file association, or the "Open
+/// with" dialog or Notepad when `.ghostty` files have none, on a thread of
+/// its own (`open_url.openFile`): the shell may pump messages, and the core
+/// asks from its tick.
+fn openConfigWithOs(path: [:0]const u8) bool {
+    return open_url.openFile(path);
 }
 
 /// Open the configuration in a new Ghostty window using VISUAL or EDITOR.
@@ -2383,6 +2547,18 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
 }
 
+/// Remove the notification area icon a desktop notification added, if it
+/// is still there.
+fn removeNotificationIcon(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    _ = w32.KillTimer(hwnd, NOTIF_DESKTOP_TIMER_ID);
+    var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
+    nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
+    nid.hWnd = hwnd;
+    nid.uID = NOTIF_DESKTOP_UID;
+    _ = w32.Shell_NotifyIconW(w32.NIM_DELETE, &nid);
+}
+
 /// Notify the core app of a tick.
 fn tick(self: *App) void {
     self.core_app.tick(self) catch |err| {
@@ -2744,6 +2920,11 @@ fn msgWndProc(
         return 0;
     }
 
+    if (msg == WM_APP_OPEN_LINK) {
+        app.onLinkRequest(@ptrFromInt(@as(usize, @bitCast(lparam))));
+        return 0;
+    }
+
     if (msg == WM_APP_TRAY) {
         // wparam = uID, lparam = NIN_* event. We only act on
         // NIN_BALLOONUSERCLICK on the desktop notification.
@@ -2790,12 +2971,7 @@ fn msgWndProc(
 
     // Notification icon cleanup timer.
     if (msg == w32.WM_TIMER and wparam == NOTIF_DESKTOP_TIMER_ID) {
-        _ = w32.KillTimer(hwnd, wparam);
-        var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
-        nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
-        nid.hWnd = hwnd;
-        nid.uID = NOTIF_DESKTOP_UID;
-        _ = w32.Shell_NotifyIconW(w32.NIM_DELETE, &nid);
+        app.removeNotificationIcon();
         return 0;
     }
 
