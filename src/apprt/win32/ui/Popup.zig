@@ -32,8 +32,9 @@
 //!
 //! Text input: with `Options.text_input` the popup keeps a `TextInput`
 //! (`popup.input`) that receives typing, editing keys (`text_edit`: words,
-//! undo, Shift+Insert/Ctrl+Insert/Shift+Delete), clipboard, mouse
-//! selection and IME composition; draw it with `drawTextInput` (or
+//! undo, Shift+Insert/Ctrl+Insert/Shift+Delete), clipboard (a paste keeps
+//! the field within `text_edit.max_len` code units), mouse selection and
+//! IME composition; draw it with `drawTextInput` (or
 //! `drawTextInputEx`) in the paint callback and read it with
 //! `TextInput.text`. Keys go to `Callbacks.key` first, so owners can take
 //! Up/Down/Enter before the input sees them. The caret blinks at the
@@ -1039,18 +1040,21 @@ fn copyToClipboard(hwnd: w32.HWND, units: []const u16) void {
     };
 }
 
-/// Insert the clipboard text (its first line) into the input.
+/// Insert the clipboard text into the input: its first line, as much as
+/// fits in `text_edit.max_len` code units (`text_edit.paste`).
 fn pasteFromClipboard(self: *Popup, hwnd: w32.HWND) !void {
     if (!clipboard.open(hwnd)) return error.ClipboardBusy;
     defer _ = w32.CloseClipboard();
     const handle = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse return;
     const ptr = w32.GlobalLock(handle) orelse return;
     defer _ = w32.GlobalUnlock(handle);
-    // Bounded by the block size, in case the text lacks its terminator.
-    const max_units = GlobalSize(handle) / @sizeOf(u16);
+    // Bounded by the block size, in case the text lacks its terminator,
+    // and by what a paste can use: the first line, one unit past
+    // `text_edit.max_len` to see where the character at the limit ends.
+    const max_units = @min(GlobalSize(handle) / @sizeOf(u16), text_edit.max_len + 1);
     const units: [*]const u16 = @ptrCast(@alignCast(ptr));
     var len: usize = 0;
-    while (len < max_units and units[len] != 0) len += 1;
+    while (len < max_units and units[len] != 0 and units[len] != '\r' and units[len] != '\n') len += 1;
     try text_edit.paste(self.alloc, &self.input, units[0..len]);
 }
 

@@ -7,15 +7,17 @@
 //!
 //! Pure functions without Win32 calls: `handleKey` reports clipboard keys
 //! as a `Clipboard` intent and the caller moves the text (`deleteSelection`
-//! after a cut, `paste` with the clipboard text). The functions take any
-//! struct with the fields of `Text` (`buf`, `caret`, `anchor`, `history`),
-//! such as `Popup.TextInput`.
+//! after a cut, `paste` with the clipboard text, which keeps the field
+//! within `max_len` code units). The functions take any struct with the
+//! fields of `Text` (`buf`, `caret`, `anchor`, `history`), such as
+//! `Popup.TextInput`.
 //!
 //! Characters: the caret never lands inside a surrogate pair, and combining
 //! marks, variation selectors, emoji modifiers, zero-width joiner sequences
 //! and regional indicator pairs move with their base character (an
-//! approximation of grapheme clusters; callers that laid the text out pass
-//! the DirectWrite cluster stops instead). Words: a run of letters and
+//! approximation of grapheme clusters, also for UTF-8 text with
+//! `nextCharUtf8`; callers that laid the text out pass the DirectWrite
+//! cluster stops instead). Words: a run of letters and
 //! digits, a run of Han characters (Chinese has no spaces between words,
 //! so a run of Hanzi counts as one word), a run of hiragana, katakana or
 //! Hangul, or a run of punctuation; whitespace separates them.
@@ -113,6 +115,24 @@ fn codePointAt(text: []const u16, pos: usize) CodePoint {
     return .{ .cp = unit, .len = 1 };
 }
 
+/// The code point at byte `pos` of UTF-8 text (< text.len); a byte that
+/// does not start a valid sequence is U+FFFD of its own.
+fn codePointAtUtf8(text: []const u8, pos: usize) CodePoint {
+    const invalid: CodePoint = .{ .cp = 0xFFFD, .len = 1 };
+    const len = std.unicode.utf8ByteSequenceLength(text[pos]) catch return invalid;
+    if (pos + len > text.len) return invalid;
+    const cp = std.unicode.utf8Decode(text[pos..][0..len]) catch return invalid;
+    return .{ .cp = cp, .len = len };
+}
+
+fn codePointIn(comptime Unit: type, text: []const Unit, pos: usize) CodePoint {
+    return switch (Unit) {
+        u16 => codePointAt(text, pos),
+        u8 => codePointAtUtf8(text, pos),
+        else => @compileError("text is UTF-16 or UTF-8"),
+    };
+}
+
 /// Code points that belong to the character before them.
 fn isExtend(cp: u21) bool {
     return switch (cp) {
@@ -160,20 +180,29 @@ const zwj: u21 = 0x200D;
 
 /// The end of the character that starts at `pos`.
 pub fn nextChar(text: []const u16, pos: usize) usize {
+    return nextCharIn(u16, text, pos);
+}
+
+/// `nextChar` for UTF-8 text, in bytes.
+pub fn nextCharUtf8(text: []const u8, pos: usize) usize {
+    return nextCharIn(u8, text, pos);
+}
+
+fn nextCharIn(comptime Unit: type, text: []const Unit, pos: usize) usize {
     if (pos >= text.len) return text.len;
     var p = pos;
-    const first = codePointAt(text, p);
+    const first = codePointIn(Unit, text, p);
     p += first.len;
     if (isRegionalIndicator(first.cp) and p < text.len) {
-        const second = codePointAt(text, p);
+        const second = codePointIn(Unit, text, p);
         if (isRegionalIndicator(second.cp)) p += second.len;
     }
     while (p < text.len) {
-        const next = codePointAt(text, p);
+        const next = codePointIn(Unit, text, p);
         if (next.cp == zwj) {
             // A zero-width joiner joins the following character.
             p += next.len;
-            if (p < text.len) p += codePointAt(text, p).len;
+            if (p < text.len) p += codePointIn(Unit, text, p).len;
             continue;
         }
         if (!isExtend(next.cp)) break;
@@ -599,11 +628,22 @@ pub fn insertText(alloc: Allocator, t: anytype, units: []const u16) Allocator.Er
     try replace(alloc, t, sel.start, sel.end, units, .other);
 }
 
-/// Insert clipboard text: the first line only, as one step.
+/// The most UTF-16 code units `paste` leaves in a field. Layout, hit
+/// testing and painting go over the whole text, so a megabyte on the
+/// clipboard would stall the UI.
+pub const max_len: usize = 4096;
+
+/// Insert clipboard text as one step: the first line, cut at a character
+/// boundary so the text stays within `max_len` code units. Nothing changes
+/// when none of it fits.
 pub fn paste(alloc: Allocator, t: anytype, units: []const u16) Allocator.Error!void {
     var end: usize = 0;
     while (end < units.len and units[end] != '\r' and units[end] != '\n') end += 1;
-    try insertText(alloc, t, units[0..end]);
+    const line = units[0..end];
+    const room = max_len -| (t.buf.items.len - selection(t).len());
+    const fit = if (line.len <= room) line.len else charStart(line, room);
+    if (fit == 0 and line.len > 0) return;
+    try insertText(alloc, t, line[0..fit]);
 }
 
 /// Delete the selection; whether there was one.
@@ -1025,6 +1065,56 @@ test "paste inserts the first line over the selection" {
     try paste(alloc, &t, L("you\r\nand more"));
     try expectText(&t, "find you");
     try testing.expectEqual(@as(usize, 8), t.caret);
+}
+
+test "paste keeps the field within max_len" {
+    const alloc = testing.allocator;
+    var t: Text = .{};
+    defer t.deinit(alloc);
+    const huge = try alloc.alloc(u16, max_len * 3);
+    defer alloc.free(huge);
+    @memset(huge, 'x');
+    try paste(alloc, &t, huge);
+    try testing.expectEqual(max_len, t.buf.items.len);
+    try testing.expectEqual(max_len, t.caret);
+    // Full: nothing more goes in, and a failed paste is not an undo step.
+    const steps = t.history.records.items.len;
+    try paste(alloc, &t, L("y"));
+    try testing.expectEqual(max_len, t.buf.items.len);
+    try testing.expectEqual(steps, t.history.records.items.len);
+    // The selection makes room for what replaces it.
+    t.anchor = 0;
+    t.caret = 10;
+    try paste(alloc, &t, huge);
+    try testing.expectEqual(max_len, t.buf.items.len);
+    try testing.expectEqual(@as(usize, 10), t.caret);
+
+    // The cut never splits a character: a surrogate pair or an accented
+    // letter across the limit is left out whole.
+    try reset(alloc, &t, huge[0 .. max_len - 1]);
+    try paste(alloc, &t, L("\u{1F47B}"));
+    try testing.expectEqual(max_len - 1, t.buf.items.len);
+    try paste(alloc, &t, L("e\u{301}"));
+    try testing.expectEqual(max_len - 1, t.buf.items.len);
+    try paste(alloc, &t, L("ae\u{301}"));
+    try testing.expectEqual(max_len, t.buf.items.len);
+    try testing.expectEqual(@as(u16, 'a'), t.buf.items[max_len - 1]);
+}
+
+test "UTF-8 characters keep combining marks, sequences and flags" {
+    const text = "a\u{1F468}\u{200D}\u{1F469}e\u{301}\u{1F1E8}\u{1F1F3}\xffb";
+    var stops: [8]usize = undefined;
+    var n: usize = 0;
+    var p: usize = 0;
+    while (p < text.len) : (n += 1) {
+        stops[n] = p;
+        p = nextCharUtf8(text, p);
+    }
+    // a, the joined pair, e with its accent, the flag, the invalid byte, b.
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 12, 15, 23, 24 }, stops[0..n]);
+    try testing.expectEqual(text.len, nextCharUtf8(text, text.len));
+    // A sequence cut off at the end is one invalid byte at a time.
+    try testing.expectEqual(@as(usize, 1), nextCharUtf8("\xe4\xb8", 0));
 }
 
 test "undo merges typing per word and redo replays it" {

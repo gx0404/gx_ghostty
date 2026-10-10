@@ -31,6 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const w32 = @import("../win32.zig");
 const i18n = @import("../../../gx/i18n.zig");
+const text_edit = @import("text_edit.zig");
 const wstr = @import("wstr.zig");
 
 const log = std.log.scoped(.win32_d2d);
@@ -1398,8 +1399,10 @@ const ellipsis_text = "\u{2026}";
 
 /// `text` fitted into `max_w` with "…" in the middle when it is too wide:
 /// its start and as much as possible of its end, keeping the whole last
-/// path component ("C:\Users\…\config.ghostty") when that fits. `measure`
-/// returns the width of a string; the result lives in `buf` or is `text`.
+/// path component ("C:\Users\…\config.ghostty") when that fits. It cuts
+/// between characters (`text_edit.nextCharUtf8`), so an accent stays with
+/// its letter and an emoji sequence stays whole. `measure` returns the
+/// width of a string; the result lives in `buf` or is `text`.
 pub fn middleEllipsis(
     buf: []u8,
     text: []const u8,
@@ -1409,22 +1412,22 @@ pub fn middleEllipsis(
 ) []const u8 {
     if (measure(ctx, text) <= max_w) return text;
 
-    // Codepoint starts, enough for any path the UI shows.
+    // Character starts, enough for any path the UI shows.
     var starts_buf: [512]usize = undefined;
     var n: usize = 0;
     var i: usize = 0;
     while (i < text.len and n < starts_buf.len) {
         starts_buf[n] = i;
         n += 1;
-        i += std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        i = text_edit.nextCharUtf8(text, i);
     }
     if (i < text.len) return text;
     const starts = starts_buf[0..n];
 
     const Fit = struct {
-        /// The byte offset of codepoint `k` (the end for `k` past the last).
-        fn at(cps: []const usize, src: []const u8, k: usize) usize {
-            return if (k < cps.len) cps[k] else src.len;
+        /// The byte offset of character `k` (the end for `k` past the last).
+        fn at(chars: []const usize, src: []const u8, k: usize) usize {
+            return if (k < chars.len) chars[k] else src.len;
         }
 
         fn compose(out: []u8, src: []const u8, head_end: usize, tail_start: usize) ?[]const u8 {
@@ -1440,7 +1443,7 @@ pub fn middleEllipsis(
     // Keep the last path component and as much of the start as fits.
     if (std.mem.findLastAny(u8, text, "\\/")) |sep| if (sep > 0) {
         if (Fit.compose(buf, text, 0, sep)) |only_tail| if (measure(ctx, only_tail) <= max_w) {
-            // The most codepoints of the head before `sep` that fit.
+            // The most characters of the head before `sep` that fit.
             var lo: usize = 0;
             var hi: usize = 0;
             while (hi < starts.len and starts[hi] < sep) hi += 1;
@@ -1453,7 +1456,7 @@ pub fn middleEllipsis(
         };
     };
 
-    // Otherwise keep the same number of codepoints at both ends.
+    // Otherwise keep the same number of characters at both ends.
     var lo: usize = 0;
     var hi: usize = starts.len;
     while (lo < hi) {
@@ -2254,6 +2257,23 @@ test "middleEllipsis keeps the start and the file name" {
     try testing.expect(std.mem.endsWith(u8, cut, "\\\u{6587}\u{4EF6}.txt"));
     // Nothing fits: just the ellipsis.
     try testing.expectEqualStrings("\u{2026}", middleEllipsis(&buf, name, 1, {}, Measure.width));
+
+    // Characters stay whole: no accent without its letter, no emoji
+    // sequence cut apart.
+    const accents = "e\u{301}" ** 12;
+    var width: f32 = 4;
+    while (width < accents.len) : (width += 1) {
+        const fitted_accents = middleEllipsis(&buf, accents, width, {}, Measure.width);
+        const sides = std.mem.indexOf(u8, fitted_accents, "\u{2026}").?;
+        for ([_][]const u8{ fitted_accents[0..sides], fitted_accents[sides + "\u{2026}".len ..] }) |side| {
+            try testing.expectEqual(@as(usize, 0), side.len % "e\u{301}".len);
+            try testing.expectEqual(side.len / "e\u{301}".len, std.mem.count(u8, side, "e\u{301}"));
+        }
+    }
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    const families = family ** 3;
+    const fitted_families = middleEllipsis(&buf, families, 2 * family.len + 3, {}, Measure.width);
+    try testing.expectEqualStrings(family ++ "\u{2026}" ++ family, fitted_families);
 }
 
 test "DibTarget reuses a buffer that fits" {
