@@ -100,6 +100,10 @@ mouse_button_mask: u3 = 0,
 /// for the next WM_MOUSEHWHEEL (`wheelNotches`).
 hwheel_accum: i32 = 0,
 
+/// Wheel movement with only Ctrl held (or a touchpad pinch) short of a
+/// whole notch, kept for the next one (`handleMouseWheel`).
+zoom_accum: i32 = 0,
+
 /// The pointer position last reported to the core, in client pixels, and
 /// what `getCursorPos` answers: (-1, -1) once the pointer left the terminal
 /// (`handleMouseLeave`), as before it first entered.
@@ -1865,10 +1869,13 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
 /// The pointer is at `pos` (client pixels) over the terminal. Windows also
 /// reports a "move" when the pointer stood still (a window appeared or
 /// moved under it, focus changes): only real moves reach the core, so they
-/// cannot unhide a pointer hidden while typing.
+/// cannot unhide a pointer hidden while typing or move the focus with
+/// `focus-follows-mouse`.
 fn pointerMoved(self: *Surface, pos: apprt.CursorPos) void {
     if (pos.x == self.cursor_pos.x and pos.y == self.cursor_pos.y) return;
     self.cursor_pos = pos;
+
+    self.followPointerFocus();
 
     // Pass modifiers so the core can detect Ctrl+hover for link highlighting.
     self.core_surface.cursorPosCallback(pos, getModifiers()) catch |err| {
@@ -1909,6 +1916,28 @@ fn reportPointerLeft(self: *Surface) void {
     self.core_surface.cursorPosCallback(self.cursor_pos, getModifiers()) catch |err| {
         log.err("cursor pos callback error: {}", .{err});
     };
+}
+
+/// `focus-follows-mouse`: the pointer moved onto this split while another
+/// split of the same tab has the focus, in the foreground window, with no
+/// button held. Neither the find bar, the palette nor another program loses
+/// the focus this way.
+fn followPointerFocus(self: *Surface) void {
+    if (!self.app.config.@"focus-follows-mouse") return;
+    if (self.mouse_button_mask != 0) return;
+    const hwnd = self.hwnd orelse return;
+    const window = self.parent_window;
+    const window_hwnd = window.hwnd orelse return;
+    if (w32.GetForegroundWindow() != window_hwnd) return;
+    const focus = w32.GetFocus() orelse return;
+    if (focus == hwnd or window.tab_count == 0) return;
+    var it = window.tab_trees[window.active_tab].iterator();
+    while (it.next()) |entry| {
+        if (entry.view != self and entry.view.hwnd == focus) {
+            _ = w32.SetFocus(hwnd);
+            return;
+        }
+    }
 }
 
 /// Handle WM_DROPFILES — a file (or files) was dropped onto this
@@ -2041,6 +2070,16 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, lparam: isize, axis: enum
         }
     }
 
+    // Ctrl+wheel, and a touchpad pinch (which Windows sends as Ctrl+wheel
+    // in small steps), change the font size one step per notch, like the
+    // font size bindings (`gx-ctrl-scroll-zoom`).
+    if (axis == .vertical and wheelZooms(self.app.config.@"gx-ctrl-scroll-zoom", wparam, getModifiers())) {
+        const steps = wheelNotches(&self.zoom_accum, raw_delta);
+        if (steps != 0) self.zoomFont(steps);
+        return;
+    }
+    self.zoom_accum = 0;
+
     const scroll_mods: input.ScrollMods = .{};
 
     var xoff: f64 = 0;
@@ -2059,6 +2098,41 @@ pub fn handleMouseWheel(self: *Surface, wparam: usize, lparam: isize, axis: enum
     }
     self.core_surface.scrollCallback(xoff, yoff, scroll_mods) catch |err| {
         log.err("scroll callback error: {}", .{err});
+    };
+}
+
+/// Whether a vertical wheel message with the key flags of its wparam
+/// (`MK_*`) and the modifiers `mods` changes the font size: Ctrl alone
+/// held, with `gx-ctrl-scroll-zoom` (`enabled`). Ctrl with other
+/// modifiers, AltGr included, scrolls as usual.
+fn wheelZooms(enabled: bool, wparam: usize, mods: input.Mods) bool {
+    if (!enabled) return false;
+    const ctrl = wparam & w32.MK_CONTROL != 0 or mods.ctrl;
+    const shift = wparam & w32.MK_SHIFT != 0 or mods.shift;
+    return ctrl and !shift and !mods.alt and !mods.super;
+}
+
+test "wheelZooms with Ctrl alone" {
+    const testing = std.testing;
+    try testing.expect(wheelZooms(true, w32.MK_CONTROL, .{ .ctrl = true }));
+    // A pinch can arrive with the flag but no Ctrl key state.
+    try testing.expect(wheelZooms(true, w32.MK_CONTROL, .{}));
+    try testing.expect(!wheelZooms(false, w32.MK_CONTROL, .{ .ctrl = true }));
+    try testing.expect(!wheelZooms(true, 0, .{}));
+    try testing.expect(!wheelZooms(true, w32.MK_CONTROL | w32.MK_SHIFT, .{ .ctrl = true, .shift = true }));
+    try testing.expect(!wheelZooms(true, w32.MK_CONTROL, .{ .ctrl = true, .alt = true }));
+    try testing.expect(!wheelZooms(true, w32.MK_CONTROL, .{ .ctrl = true, .super = true }));
+}
+
+/// Change the font size by `steps` points (negative: smaller).
+fn zoomFont(self: *Surface, steps: i32) void {
+    const amount: f32 = @floatFromInt(@abs(steps));
+    const action: input.Binding.Action = if (steps > 0)
+        .{ .increase_font_size = amount }
+    else
+        .{ .decrease_font_size = amount };
+    _ = self.core_surface.performBindingAction(action) catch |err| {
+        log.warn("font size change failed err={}", .{err});
     };
 }
 

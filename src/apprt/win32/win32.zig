@@ -1758,7 +1758,7 @@ test "SystemChange decodes the system broadcasts" {
 
 // R2-Surface
 // -----------------------------------------------------------------------
-// Terminal surface: clipboard formats and cursors.
+// Terminal surface: clipboard formats, cursors and mouse wheel flags.
 // -----------------------------------------------------------------------
 
 pub extern "user32" fn RegisterClipboardFormatW(
@@ -1772,3 +1772,7 @@ pub extern "kernel32" fn GlobalSize(
 pub const IDC_HELP: usize = 32651;
 
 pub extern "user32" fn WindowFromPoint(point: POINT) callconv(.winapi) ?HWND;
+
+// WM_MOUSEWHEEL / WM_MOUSEMOVE wParam key flags.
+pub const MK_SHIFT: usize = 0x0004;
+pub const MK_CONTROL: usize = 0x0008;
