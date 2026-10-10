@@ -22,4 +22,6 @@ test {
     _ = shortcuts;
     _ = shortcuts_dialog;
     _ = window;
+    _ = @import("app_mode.zig");
+    _ = @import("progress.zig");
 }
