@@ -4,8 +4,9 @@
 //! Each `show*` function builds its menu on demand and runs it modally at
 //! a screen position. The context menus return what the user picked (null
 //! when the menu was dismissed) and the caller performs the choice, the
-//! tab bar with `performTabCommand`; the main and launch profile menus
-//! perform the picked item themselves. Because menus are built on every
+//! tab bar with `performTabCommand`; the main, launch profile, tab list
+//! and window menus perform the picked item themselves (the window menu is
+//! still the native system menu). Because menus are built on every
 //! invocation they always use the current UI language (labels are English
 //! msgids translated with `gx.i18n.tr`); a menu that is open while the
 //! language switches closes (`onLanguageChanged`).
@@ -399,6 +400,44 @@ pub fn performTabCommand(window: *Window, tab: ?[]const u64, command: TabCommand
     }
 }
 
+/// The menu of all tabs of `window`, for a tab strip that cannot show them
+/// all: one item per tab with its title, the active tab marked. Picking
+/// one selects that tab. Opens below `anchor` (screen pixels, e.g. the
+/// overflow button), at its left edge for now. Same calling rules as
+/// `showMainMenu`.
+pub fn showTabList(window: *Window, anchor: w32.RECT) void {
+    const hwnd = window.hwnd orelse return;
+    if (window.closing or window.tab_count == 0) return;
+    const app = window.app;
+    const host = menuHost(app) orelse return;
+
+    var menu: MenuPopup.Builder = .init(app.core_app.alloc);
+    defer menu.deinit();
+    // Tabs can close or move while the menu runs: the pick selects the tab
+    // found again by the terminal that was focused in it.
+    var ids: [Window.MAX_TABS]u64 = undefined;
+    const count = window.tab_count;
+    for (0..count) |i| {
+        ids[i] = window.tab_active_surface[i].core_surface.id;
+        var buf: [768]u8 = undefined;
+        menu.add(&menu.root, .{
+            .id = i + 1,
+            .label = wstr.utf8Buf(&buf, window.tab_titles[i][0..window.tab_title_lens[i]]),
+            .mark = if (i == window.active_tab) .radio else .none,
+        }) catch |err| {
+            log.err("failed to build the tab list err={}", .{err});
+            return;
+        };
+    }
+
+    const id = MenuPopup.run(host, hwnd, &menu.root, .{
+        .anchor = .{ .x = anchor.left, .y = anchor.bottom },
+        .owner_scale = window.scale,
+    }) orelse return;
+    if (!windowOpen(app, window) or id == 0 or id > count) return;
+    if (window.findTabBySurfaceId(ids[id - 1])) |index| window.selectTabIndex(index);
+}
+
 const MainItem = enum(usize) {
     new_tab = 1,
     new_window,
@@ -417,6 +456,20 @@ const MainItem = enum(usize) {
 
 /// Ids of the Language submenu items: this plus the `i18n.Language` value.
 const language_ids: usize = 0x3000;
+
+/// The edge of its anchor rectangle a menu lines up with.
+pub const Align = enum { left, right };
+
+/// The application menu opened from a button: below `anchor` (screen
+/// pixels: the button, down to the bottom of the chrome row), lined up
+/// with its `alignment` edge; null opens it like `showMainMenu` does from
+/// the keyboard. Same calling rules as `showMainMenu`. For now it opens at
+/// the left end of the anchor's bottom edge whatever `alignment` says.
+pub fn showMain(window: *Window, anchor: ?w32.RECT, alignment: Align) void {
+    _ = alignment;
+    const rect = anchor orelse return showMainMenu(window, null);
+    showMainMenu(window, .{ .x = rect.left, .y = rect.bottom });
+}
 
 /// The application menu (`gx:main_menu`): new tabs and windows, a launch
 /// profile submenu, splits, the command palette, settings, keyboard
@@ -747,8 +800,62 @@ fn defaultTag(alloc: Allocator, shortcut: ?[]const u8) Allocator.Error![]const u
     return try std.fmt.allocPrint(alloc, "{s} · {s}", .{ tag, keys });
 }
 
+/// The window menu of `window` at `screen_pt` (screen pixels), as a right
+/// click on the title bar and Alt+Space open it: Restore, Move, Size,
+/// Minimize, Maximize and Close, enabled for the window's state. The pick
+/// is posted to the window (WM_SYSCOMMAND). Runs a modal loop: call it from
+/// a window message. For now this is the native system menu
+/// (`GetSystemMenu`).
+pub fn showWindowMenu(window: *Window, screen_pt: w32.POINT) void {
+    const hwnd = window.hwnd orelse return;
+    const menu = GetSystemMenu(hwnd, 0) orelse return;
+    const zoomed = w32.IsZoomed(hwnd) != 0;
+    const fullscreen = window.title_bar.is_fullscreen;
+    const movable = !zoomed and !fullscreen;
+    setMenuItemEnabled(menu, SC_RESTORE, zoomed or fullscreen);
+    setMenuItemEnabled(menu, SC_MOVE, movable);
+    setMenuItemEnabled(menu, SC_SIZE, movable);
+    setMenuItemEnabled(menu, SC_MINIMIZE, true);
+    setMenuItemEnabled(menu, SC_MAXIMIZE, !zoomed);
+    setMenuItemEnabled(menu, SC_CLOSE, true);
+    _ = SetMenuDefaultItem(menu, std.math.maxInt(u32), 0);
+
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        screen_pt.x,
+        screen_pt.y,
+        hwnd,
+        null,
+    );
+    if (cmd > 0) _ = w32.PostMessageW(hwnd, WM_SYSCOMMAND, @intCast(cmd), 0);
+}
+
+fn setMenuItemEnabled(menu: w32.HMENU, item: u32, enabled: bool) void {
+    _ = EnableMenuItem(menu, item, MF_BYCOMMAND | if (enabled) MF_ENABLED else w32.MF_GRAYED);
+}
+
 /// Hook for a language change. Menus are built on demand, so the next one
 /// uses the new language; a menu that is open closes.
 pub fn onLanguageChanged() void {
     MenuPopup.cancel();
+}
+
+const WM_SYSCOMMAND: u32 = 0x0112;
+const SC_SIZE: u32 = 0xF000;
+const SC_MOVE: u32 = 0xF010;
+const SC_MINIMIZE: u32 = 0xF020;
+const SC_MAXIMIZE: u32 = 0xF030;
+const SC_CLOSE: u32 = 0xF060;
+const SC_RESTORE: u32 = 0xF120;
+const TPM_RIGHTBUTTON: u32 = 0x0002;
+const MF_BYCOMMAND: u32 = 0x00000000;
+const MF_ENABLED: u32 = 0x00000000;
+
+extern "user32" fn GetSystemMenu(hWnd: w32.HWND, bRevert: i32) callconv(.winapi) ?w32.HMENU;
+extern "user32" fn EnableMenuItem(hMenu: w32.HMENU, uIDEnableItem: u32, uEnable: u32) callconv(.winapi) i32;
+extern "user32" fn SetMenuDefaultItem(hMenu: w32.HMENU, uItem: u32, fByPos: u32) callconv(.winapi) i32;
+
+test {
+    std.testing.refAllDecls(@This());
 }

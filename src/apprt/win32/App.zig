@@ -156,6 +156,15 @@ default_command: ?configpkg.Command = null,
 /// Owns `default_command`.
 default_command_arena: std.heap.ArenaAllocator,
 
+/// The process table the periodic checks of the GUI thread share (the tab
+/// labels and herdr app mode of every window): read it with `processTable`.
+proc_shared: gx.proc.Shared = .{},
+
+/// The shells detected on this system, kept between uses: read the launch
+/// profiles with `cachedLaunchProfiles`; `profiles_cache.invalidate()`
+/// detects them again on the next use.
+profiles_cache: gx.profiles.Cache = .{},
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -601,6 +610,8 @@ pub fn terminate(self: *App) void {
         self.class_atom = 0;
     }
 
+    self.proc_shared.deinit();
+    self.profiles_cache.deinit();
     self.default_command_arena.deinit();
     self.config.deinit();
 }
@@ -620,6 +631,35 @@ pub fn wakeup(self: *App) void {
     if (self.msg_hwnd) |hwnd| {
         _ = w32.PostMessageW(hwnd, WM_APP_WAKEUP, 0, 0);
     }
+}
+
+/// A system broadcast (`w32.SystemChange`) reached the top-level `window`
+/// (`Window.onSystemSettingChange`): every window hears each broadcast, so
+/// one change arrives once per window. GUI thread. The app does not follow
+/// them yet (the apps light or dark theme is "ImmersiveColorSet").
+pub fn onSystemSettingChange(self: *App, window: *Window, change: w32.SystemChange) void {
+    _ = self;
+    _ = window;
+    _ = change;
+}
+
+/// What `Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME` asks to simulate, packed
+/// into its wparam: the apps color scheme and Windows high contrast, each
+/// following the system or forced.
+pub const SimulatedSystemTheme = packed struct(usize) {
+    scheme: enum(u2) { system = 0, light = 1, dark = 2, _ } = .system,
+    high_contrast: enum(u2) { system = 0, on = 1, off = 2, _ } = .system,
+    reserved: std.meta.Int(.unsigned, @bitSizeOf(usize) - 4) = 0,
+};
+
+/// Test hook (`Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME`, GUI thread): act
+/// as if Windows switched to the color scheme and high contrast state that
+/// `wparam` asks for (`SimulatedSystemTheme`). Returns whether it did so;
+/// it does not yet.
+pub fn simulateSystemTheme(self: *App, wparam: usize) bool {
+    _ = self;
+    _ = wparam;
+    return false;
 }
 
 /// IPC from external processes. Not yet implemented for Win32.
@@ -1531,19 +1571,49 @@ pub fn newWindow(self: *App, options: Window.InitOptions) !*Window {
 }
 
 /// The launch profiles: the shells detected on this system followed by the
-/// `gx-launch-profile` entries. The caller owns the list (`deinit`).
+/// `gx-launch-profile` entries. The caller owns the list (`deinit`). This
+/// probes the file system on every call; `cachedLaunchProfiles` does not.
 pub fn launchProfiles(self: *App) !gx.profiles.List {
     const alloc = self.core_app.alloc;
-    const map = &self.config.@"gx-launch-profile".map;
-    const custom = try alloc.alloc(gx.profiles.Custom, map.count());
+    const custom = try self.customProfiles(alloc);
     defer alloc.free(custom);
-    for (map.keys(), map.values(), custom) |name, command, *entry| {
-        entry.* = .{ .name = name, .command = command };
-    }
 
     var env = try global.environMap();
     defer env.deinit();
     return try gx.profiles.detectSystem(alloc, global.io(), &env, custom);
+}
+
+/// `launchProfiles` with the detected shells kept in `profiles_cache`:
+/// detected again when the environment variables detection reads change or
+/// after `profiles_cache.invalidate()`. GUI thread. The caller owns the
+/// list (`deinit`).
+pub fn cachedLaunchProfiles(self: *App) !gx.profiles.List {
+    const alloc = self.core_app.alloc;
+    const custom = try self.customProfiles(alloc);
+    defer alloc.free(custom);
+
+    var env = try global.environMap();
+    defer env.deinit();
+    return try self.profiles_cache.list(alloc, global.io(), &env, custom);
+}
+
+/// The `gx-launch-profile` entries, allocated with `alloc` (the strings
+/// stay in the configuration).
+fn customProfiles(self: *const App, alloc: Allocator) ![]gx.profiles.Custom {
+    const map = &self.config.@"gx-launch-profile".map;
+    const custom = try alloc.alloc(gx.profiles.Custom, map.count());
+    for (map.keys(), map.values(), custom) |name, command, *entry| {
+        entry.* = .{ .name = name, .command = command };
+    }
+    return custom;
+}
+
+/// The process table the tab labels and herdr app mode of every window
+/// share (`gx.proc.Shared`), captured anew when it is older than its TTL
+/// (one second). GUI thread; valid until the next call. Close
+/// confirmations read a table of their own (`gx.confirm.Scope`).
+pub fn processTable(self: *App) gx.proc.SnapshotError!*gx.proc.Table {
+    return self.proc_shared.get(self.core_app.alloc, global.io());
 }
 
 pub const ProfileTarget = enum { tab, window };
@@ -2732,9 +2802,26 @@ fn msgWndProc(
     return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+test {
+    std.testing.refAllDecls(@This());
+}
+
 test "export terminal IO requires a surface target" {
     var app: App = undefined;
     try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
+}
+
+test "SimulatedSystemTheme packs the scheme and high contrast" {
+    const testing = std.testing;
+    const follow: SimulatedSystemTheme = @bitCast(@as(usize, 0));
+    try testing.expect(follow.scheme == .system and follow.high_contrast == .system);
+    const dark: SimulatedSystemTheme = @bitCast(@as(usize, 2));
+    try testing.expect(dark.scheme == .dark and dark.high_contrast == .system);
+    const light_hc: SimulatedSystemTheme = @bitCast(@as(usize, 0b0101));
+    try testing.expect(light_hc.scheme == .light and light_hc.high_contrast == .on);
+    const hc_off: SimulatedSystemTheme = @bitCast(@as(usize, 0b1000));
+    try testing.expect(hc_off.scheme == .system and hc_off.high_contrast == .off);
+    try testing.expectEqual(@as(usize, 0b0110), @as(usize, @bitCast(SimulatedSystemTheme{ .scheme = .dark, .high_contrast = .on })));
 }
 
 test "editKeyRoute keeps editing keys and unbound chords out of the shell" {

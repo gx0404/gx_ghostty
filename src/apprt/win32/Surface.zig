@@ -12,7 +12,9 @@
 //! Clipboard access that another application blocks is retried from
 //! timers; dropped and pasted files are quoted for the shell running in
 //! the terminal (`gx.path_quote`). The renderer thread reports frames
-//! (`signalFrameDrawn`) and GPU resets (`gpuContextReset`) back here.
+//! (`signalFrameDrawn`) and GPU resets (`gpuContextReset`) back here, and
+//! reads the dim of an unfocused split (`unfocusedDim`) and the client size
+//! (`clientSize`) that the GUI thread publishes in atomics.
 const Surface = @This();
 
 const std = @import("std");
@@ -31,6 +33,7 @@ const path_quote = @import("../../gx/path_quote.zig");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const clipboard = @import("clipboard.zig");
+const tab_status = @import("tab_status.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const Dialogs = @import("ui/Dialogs.zig");
@@ -139,6 +142,21 @@ resize_frame_pending: bool = false,
 /// (`takeSimulatedGpuReset`).
 simulate_gpu_reset: std.atomic.Value(bool) = .init(false),
 
+/// The `DimColor` the renderer blends over the frames of this terminal
+/// while it is an unfocused split, `DimColor.none` otherwise. Written on
+/// the GUI thread (`setUnfocusedDim`), read by the render thread
+/// (`unfocusedDim`).
+unfocused_dim: std.atomic.Value(u32) = .init(0),
+
+/// The client size of the terminal's window that the GUI thread laid out
+/// last (`publishClientSize`), for the render thread (`clientSize`):
+/// height in the high 32 bits, width in the low ones; zero until known.
+client_size: std.atomic.Value(u64) = .init(0),
+
+/// The progress the terminal reported last (OSC 9;4), which its tab shows;
+/// written through `Window.setSurfaceProgress` on the GUI thread.
+progress: tab_status.Progress = .none,
+
 /// Themed scrollbar (custom layered-popup overlay).
 /// Created lazily after the surface HWND exists.
 scrollbar: ?*Scrollbar = null,
@@ -222,6 +240,11 @@ pub const InitOptions = struct {
     context: apprt.surface.NewSurfaceContext,
     command: ?*const configpkg.Command = null,
     title: ?[:0]const u8 = null,
+    /// Where the terminal's window goes, in client pixels of the parent
+    /// window (e.g. a new split's part of the terminal area); null for the
+    /// whole terminal area (`Window.surfaceRect`). The pty starts with the
+    /// size of this rectangle.
+    rect: ?w32.RECT = null,
 };
 
 /// Initialize a surface with optional per-surface config overrides. The
@@ -245,7 +268,7 @@ pub fn initWithOptions(
     // Create a WS_CHILD window inside the parent Window container. OpenGL
     // windows must clip their siblings and children.
     const parent_hwnd = parent.hwnd orelse return error.Win32Error;
-    const sr = parent.surfaceRect();
+    const sr = options.rect orelse parent.surfaceRect();
     const hwnd = w32.CreateWindowExW(
         0,
         App.TERMINAL_CLASS_NAME,
@@ -290,6 +313,7 @@ pub fn initWithOptions(
     // Query the initial DPI and size
     self.updateDpiScale();
     self.updateClientSize();
+    self.publishClientSize(self.width, self.height);
 
     log.debug("Win32 surface created: {}x{} scale={d:.2}", .{
         self.width,
@@ -1113,6 +1137,7 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     // Skip zero-size events (minimized windows).
     if (width == 0 or height == 0) return;
 
+    self.publishClientSize(width, height);
     self.height = height;
 
     // Pre-flight the scrollbar so we know whether to subtract its width.
@@ -2029,13 +2054,114 @@ test "imeCellRect clamps to the surface" {
     try std.testing.expectEqual(w32.RECT{ .left = 790, .top = 580, .right = 800, .bottom = 600 }, rect);
 }
 
-/// Called by the renderer thread after SwapBuffers to signal that a
-/// frame has been presented. Wakes the main thread if it's blocking
-/// in handleResize during live resize.
-pub fn signalFrameDrawn(self: *Surface) void {
+/// Called by the renderer thread (`wgl.Context.present`) after SwapBuffers
+/// presented a `width` × `height` pixel frame: the render target, the size
+/// last passed to `sizeCallback`. Thread-safe. Sets `frame_event`, which
+/// wakes the main thread if it is blocking in handleResize during live
+/// resize and which a new window polls for its first frame; the size is not
+/// compared with the one it waits for yet.
+pub fn signalFrameDrawn(self: *Surface, width: u32, height: u32) void {
+    _ = width;
+    _ = height;
     if (self.frame_event) |event| {
         _ = w32.SetEvent(event);
     }
+}
+
+/// Ask for `Window.WM_APP_FIRST_FRAME` to be posted to `window` (the
+/// terminal's top-level window) once the render thread presented the next
+/// frame (`signalFrameDrawn`), with the core surface id in lparam. GUI
+/// thread (`Window.showWhenReady`). Nothing is posted yet: the window polls
+/// `frame_event` instead.
+pub fn requestFirstFrameMessage(self: *Surface, window: w32.HWND) void {
+    _ = self;
+    _ = window;
+}
+
+/// A color the renderer blends over the frames of an unfocused split
+/// (`unfocused-split-opacity`, `unfocused-split-fill`), premultiplied: `a`
+/// is the share of the frame it covers and `r`, `g`, `b` are the sRGB color
+/// times `a`. All zero (`none`) leaves the frames alone.
+pub const DimColor = packed struct(u32) {
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
+    a: u8 = 0,
+
+    pub const none: DimColor = .{};
+
+    /// The sRGB color `r`, `g`, `b` covering `amount` (0 to 1) of the frame.
+    pub fn init(r: u8, g: u8, b: u8, amount: f32) DimColor {
+        const a: u8 = @intFromFloat(@round(std.math.clamp(amount, 0, 1) * 255));
+        return .{ .r = premultiply(r, a), .g = premultiply(g, a), .b = premultiply(b, a), .a = a };
+    }
+
+    fn premultiply(channel: u8, a: u8) u8 {
+        return @intCast((@as(u16, channel) * a + 127) / 255);
+    }
+};
+
+/// Set the dim the renderer blends over this terminal's frames
+/// (`DimColor.none` for none). GUI thread. The renderer picks it up with the
+/// next frame it draws; this does not ask for one.
+pub fn setUnfocusedDim(self: *Surface, dim: DimColor) void {
+    self.unfocused_dim.store(@bitCast(dim), .release);
+}
+
+/// The dim to blend over this terminal's frames (`setUnfocusedDim`). Any
+/// thread; the render thread reads it when it presents a frame.
+pub fn unfocusedDim(self: *const Surface) DimColor {
+    return @bitCast(self.unfocused_dim.load(.acquire));
+}
+
+/// Publish the client size of the terminal's window for the render thread
+/// (`clientSize`). GUI thread.
+fn publishClientSize(self: *Surface, width: u32, height: u32) void {
+    self.client_size.store(@as(u64, height) << 32 | width, .release);
+}
+
+/// The client size of the terminal's window that the GUI thread laid out
+/// last, or null before the first layout. Any thread: the render thread
+/// can read it when it presents a frame instead of asking the window.
+pub fn clientSize(self: *const Surface) ?apprt.SurfaceSize {
+    const packed_size = self.client_size.load(.acquire);
+    if (packed_size == 0) return null;
+    return .{ .width = @truncate(packed_size), .height = @truncate(packed_size >> 32) };
+}
+
+/// The tab holding this terminal moved to `window`
+/// (`Window.moveTabToNewWindow`), which made the terminal's window one of
+/// its children already. GUI thread. For now this only follows the new
+/// parent (`parent_window`); popups the old window owns stay with it.
+pub fn onReparented(self: *Surface, window: *Window) void {
+    self.parent_window = window;
+}
+
+test "DimColor premultiplies the color by its coverage" {
+    const testing = std.testing;
+    try testing.expectEqual(DimColor.none, DimColor.init(0x1e, 0x1e, 0x2e, 0));
+    try testing.expectEqual(DimColor{ .r = 255, .g = 255, .b = 255, .a = 255 }, DimColor.init(255, 255, 255, 1));
+    try testing.expectEqual(DimColor{ .r = 9, .g = 9, .b = 14, .a = 77 }, DimColor.init(0x1e, 0x1e, 0x2e, 0.3));
+    try testing.expectEqual(DimColor.init(10, 20, 30, 1), DimColor.init(10, 20, 30, 7));
+    try testing.expectEqual(DimColor.none, DimColor.init(10, 20, 30, -1));
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(DimColor.none)));
+}
+
+test "the unfocused dim and the client size cross threads as atomics" {
+    const testing = std.testing;
+    var surface: Surface = undefined;
+    surface.unfocused_dim = .init(0);
+    surface.client_size = .init(0);
+    try testing.expectEqual(DimColor.none, surface.unfocusedDim());
+    const dim: DimColor = .init(0x11, 0x11, 0x1b, 0.3);
+    surface.setUnfocusedDim(dim);
+    try testing.expectEqual(dim, surface.unfocusedDim());
+    surface.setUnfocusedDim(.none);
+    try testing.expectEqual(DimColor.none, surface.unfocusedDim());
+
+    try testing.expectEqual(@as(?apprt.SurfaceSize, null), surface.clientSize());
+    surface.publishClientSize(1920, 1080);
+    try testing.expectEqual(apprt.SurfaceSize{ .width = 1920, .height = 1080 }, surface.clientSize().?);
 }
 
 /// Posted to the surface window by `gpuContextReset`.

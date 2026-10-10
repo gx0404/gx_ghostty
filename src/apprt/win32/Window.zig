@@ -3,11 +3,13 @@
 //! one or more Surface child HWNDs as tabs (each tab a split tree).
 //!
 //! The Window owns the tab model (split trees, active surfaces, titles,
-//! unread flags), split layout and window-level state (DPI scale, size
+//! unread and bell flags, the progress its terminals report, when each tab
+//! was last selected), split layout and window-level state (DPI scale, size
 //! limits, placement) and orchestrates the chrome modules. A tab shows its
 //! title override (`set_tab_title`, renaming) or else the title of its
 //! focused split (`refreshTabTitle`); the focused split is the one that
-//! last got the keyboard focus (`setActiveSurface`). The chrome modules:
+//! last got the keyboard focus (`setActiveSurface`). The tab bar reads
+//! the rest of a tab's state from `tabStatus`. The chrome modules:
 //!
 //!   - `chrome/TitleBar.zig` (`title_bar`): non-client frame, the
 //!     integrated title bar row (caption buttons, main menu button,
@@ -19,7 +21,14 @@
 //!   - `ui/ResizeOverlay.zig` (`resize_overlay`): the size overlay.
 //!   - `ui/ShortcutNotice.zig` (`shortcut_notice`): the notice about
 //!     shortcuts other programs take.
+//!   - `ui/Notice.zig` (`notice`) and `ui/Toast.zig` (`toast`): the
+//!     window's notice and toast at the bottom of the terminals
+//!     (`showNotice`, `showToast`).
 //!   - `ui/Menu.zig`: the main menu, opened through `queueMainMenu`.
+//!
+//! The system broadcasts top-level windows get (settings, system colors,
+//! visual style, accent color) go to `onSystemSettingChange`, which passes
+//! them on to the design tokens, the app, the backdrop and the title bar.
 //!
 //! Closing tabs (`closeTabByIndex`, `closeOtherTabs`, `closeTabsRightOf`,
 //! the `close_tab` action) and the window (WM_CLOSE) asks first only when
@@ -68,15 +77,20 @@ const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const splits = @import("splits.zig");
+const tab_status = @import("tab_status.zig");
 const tabs = @import("tabs.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const TabBar = @import("chrome/TabBar.zig");
 const TitleBar = @import("chrome/TitleBar.zig");
+const caption_layout = @import("chrome/caption_layout.zig");
 const Dialogs = @import("ui/Dialogs.zig");
 const Menu = @import("ui/Menu.zig");
+const Notice = @import("ui/Notice.zig");
+const Popup = @import("ui/Popup.zig");
 const ResizeOverlay = @import("ui/ResizeOverlay.zig");
 const ShortcutNotice = @import("ui/ShortcutNotice.zig");
+const Toast = @import("ui/Toast.zig");
 const style = @import("ui/style.zig");
 const Settings = @import("ui/Settings.zig");
 const wstr = @import("ui/wstr.zig");
@@ -121,6 +135,17 @@ tab_title_overrides: [MAX_TABS]?tabs.Title = [_]?tabs.Title{null} ** MAX_TABS,
 /// Whether each tab received output (or rang the bell) since it was last
 /// the active tab (the tab bar shows a badge).
 tab_unread: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+
+/// Whether a terminal of each tab rang the bell since the tab was last
+/// selected (`ringTab`, `tabStatus`).
+tab_bell: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+
+/// When each tab was last selected, as the `activation_count` of that
+/// selection (`tabRecency`); 0 for never.
+tab_activated: [MAX_TABS]u64 = [_]u64{0} ** MAX_TABS,
+
+/// Tab selections so far, for `tab_activated`.
+activation_count: u64 = 0,
 
 /// Explicit top-level window title override. Null follows the active tab.
 window_title_override_len: ?u16 = null,
@@ -167,6 +192,11 @@ resize_overlay: ResizeOverlay = .{},
 /// The notice about default shortcuts other programs take.
 shortcut_notice: ShortcutNotice = .{},
 
+/// The window's notice and toast at the bottom of the terminal area
+/// (`showNotice`, `showToast`).
+notice: Notice = .{},
+toast: Toast = .{},
+
 /// Where the main menu queued by `queueMainMenu` opens (null: below the
 /// chrome at the left edge).
 main_menu_anchor: ?w32.POINT = null,
@@ -207,6 +237,14 @@ const WM_APP_MAIN_MENU: u32 = w32.WM_APP + 20;
 /// lparam the core id of the surface whose tab it refers to.
 const WM_APP_CLOSE_TAB: u32 = w32.WM_APP + 0x61;
 
+/// For the render thread of a terminal of this window to post when the
+/// terminal presented its first frame after `showWhenReady` asked for one
+/// (`Surface.requestFirstFrameMessage`), so the window uncloaks at once:
+/// wparam 0, lparam the terminal's core surface id (`CoreSurface.id`).
+/// Nothing posts it yet; the `FIRST_FRAME_TIMER_ID` poll uncloaks the
+/// window.
+pub const WM_APP_FIRST_FRAME: u32 = w32.WM_APP + 31;
+
 /// The timer that re-checks herdr app mode while the window has one tab.
 const app_mode_timer_id: usize = 0x4844; // 'HD'
 const app_mode_interval_ms: u32 = 1500;
@@ -235,6 +273,12 @@ const cascade_step: f32 = 30;
 /// be exercised without a monitor of another DPI. The windows themselves
 /// keep their real DPI (`GetDpiForWindow`). Returns 1 when handled.
 pub const WM_GHOSTTY_SIMULATE_DPI: u32 = w32.WM_USER + 0x47;
+
+/// Test-only message: SendMessage(window, WM_GHOSTTY_SIMULATE_SYSTEM_THEME,
+/// theme, 0) makes the app act as if Windows switched its apps color scheme
+/// or high contrast (`App.SimulatedSystemTheme` in wparam,
+/// `App.simulateSystemTheme`). Returns 1 when simulated.
+pub const WM_GHOSTTY_SIMULATE_SYSTEM_THEME: u32 = w32.WM_USER + 0x49;
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
@@ -270,6 +314,7 @@ pub fn onLanguageChanged(self: *Window) void {
         while (it.next()) |entry| entry.view.onLanguageChanged();
     }
     self.shortcut_notice.reposition();
+    self.repositionOverlays();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
@@ -490,6 +535,7 @@ fn showWhenReady(self: *Window, surface: *Surface) void {
     // Wait for a frame presented after the window is shown, not one
     // drawn into the hidden window.
     if (surface.frame_event) |event| _ = w32.ResetEvent(event);
+    surface.requestFirstFrameMessage(hwnd);
     self.shown = true;
     _ = w32.ShowWindow(hwnd, if (self.app.config.maximize) SW_SHOWMAXIMIZED else w32.SW_SHOW);
     _ = w32.UpdateWindow(hwnd);
@@ -566,6 +612,7 @@ fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     // the DWM frame under it scale with the DPI.
     self.applyFrameMargins();
     self.layoutSplits();
+    self.repositionOverlays();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
@@ -641,6 +688,8 @@ pub fn deinit(self: *Window) void {
     self.title_bar.deinit();
     self.resize_overlay.deinit();
     self.shortcut_notice.deinit();
+    self.notice.deinit();
+    self.toast.deinit();
 
     // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
     if (self.hwnd) |hwnd| {
@@ -718,6 +767,55 @@ pub fn queueMainMenu(self: *Window, anchor: ?w32.POINT) bool {
     if (self.closing) return false;
     self.main_menu_anchor = anchor;
     return w32.PostMessageW(hwnd, WM_APP_MAIN_MENU, 0, 0) != 0;
+}
+
+/// Where the notice and the toast show: centered at the bottom of the
+/// terminal area, at the window's content scale.
+fn overlayPlacement(self: *const Window) ?Notice.Placement {
+    const hwnd = self.hwnd orelse return null;
+    return .{ .owner = hwnd, .area = self.surfaceRect(), .scale = self.scale };
+}
+
+/// Show `content` in the window's notice, replacing the one on display.
+/// `callbacks` report the button picked and why it closed. GUI thread,
+/// from the message loop; from a core callback use `postNotice`.
+pub fn showNotice(self: *Window, content: Notice.Content, callbacks: ?Notice.Callbacks) void {
+    const placement = self.overlayPlacement() orelse return;
+    self.notice.show(self.app, placement, content, callbacks);
+}
+
+/// `showNotice` from a core callback (on the GUI thread): the notice shows
+/// from the message loop (`Notice.post`).
+pub fn postNotice(self: *Window, content: Notice.Content, callbacks: ?Notice.Callbacks) void {
+    const placement = self.overlayPlacement() orelse return;
+    self.notice.post(self.app, placement, content, callbacks);
+}
+
+/// Close the window's notice (reported as `Notice.CloseReason.owner`).
+pub fn hideNotice(self: *Window) void {
+    self.notice.hide();
+}
+
+/// Show `content` in the window's toast for a few seconds. GUI thread, from
+/// the message loop; from a core callback use `postToast`.
+pub fn showToast(self: *Window, content: Toast.Content) void {
+    const placement = self.overlayPlacement() orelse return;
+    self.toast.show(self.app, placement, content);
+}
+
+/// `showToast` from a core callback (on the GUI thread): the toast shows
+/// from the message loop (`Toast.post`).
+pub fn postToast(self: *Window, content: Toast.Content) void {
+    const placement = self.overlayPlacement() orelse return;
+    self.toast.post(self.app, placement, content);
+}
+
+/// Keep the notice and the toast on the terminal area after a move, a
+/// resize, a DPI or language change or another tab.
+fn repositionOverlays(self: *Window) void {
+    const placement = self.overlayPlacement() orelse return;
+    self.notice.reposition(placement);
+    self.toast.reposition(placement);
 }
 
 /// Alt+Space (without Ctrl, Shift or Win) opens the window menu of the
@@ -804,6 +902,8 @@ const TabSlot = struct {
     title_len: u16,
     title_override: ?tabs.Title,
     unread: bool,
+    bell: bool,
+    activated: u64,
 };
 
 fn getSlot(self: *const Window, i: usize) TabSlot {
@@ -814,6 +914,8 @@ fn getSlot(self: *const Window, i: usize) TabSlot {
         .title_len = self.tab_title_lens[i],
         .title_override = self.tab_title_overrides[i],
         .unread = self.tab_unread[i],
+        .bell = self.tab_bell[i],
+        .activated = self.tab_activated[i],
     };
 }
 
@@ -824,6 +926,8 @@ fn setSlot(self: *Window, i: usize, slot: TabSlot) void {
     self.tab_title_lens[i] = slot.title_len;
     self.tab_title_overrides[i] = slot.title_override;
     self.tab_unread[i] = slot.unread;
+    self.tab_bell[i] = slot.bell;
+    self.tab_activated[i] = slot.activated;
 }
 
 /// Copy tab slot `src` over slot `dst`.
@@ -873,6 +977,8 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
     self.tab_unread[pos] = false;
+    self.tab_bell[pos] = false;
+    self.tab_activated[pos] = 0;
     self.tab_title_overrides[pos] = null;
     self.tab_title_lens[pos] = 0;
     if (self.tab_count > 0 and self.active_tab >= pos) self.active_tab += 1;
@@ -887,6 +993,8 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
         // ready, uncloaking it with the first frame. Quick terminal
         // windows are shown by QuickTerminal.animateIn() instead.
         self.active_tab = pos;
+        self.noteTabActivated(pos);
+        self.tab_bar.onTabShown(pos);
         self.updateTabBarVisibility();
         if (!self.is_quick_terminal) self.showWhenReady(surface);
         self.updateWindowTitle();
@@ -1177,8 +1285,9 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
 /// Set the visibility (occlusion) of the surfaces of the active tab that
 /// are shown (only the zoomed one of a zoomed tab). Used on window
 /// minimize/restore so the renderer stops rebuilding frames while the
-/// window is minimized.
-fn setActiveTabVisible(self: *Window, visible: bool) void {
+/// window is minimized; also for a window that is hidden otherwise (the
+/// quick terminal). GUI thread.
+pub fn setActiveTabVisible(self: *Window, visible: bool) void {
     if (self.active_tab >= self.tab_count) return;
     const tree = &self.tab_trees[self.active_tab];
     var it = tree.iterator();
@@ -1195,6 +1304,7 @@ fn hideTabPanes(self: *Window, tab: usize) void {
         entry.view.setVisible(false);
         if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
     }
+    self.tab_bar.onTabHidden(tab);
 }
 
 /// Make every visible terminal draw a complete new frame (see
@@ -1214,6 +1324,7 @@ fn repositionPopups(self: *Window) void {
         while (it.next()) |entry| entry.view.repositionPopups();
     }
     self.shortcut_notice.reposition();
+    self.repositionOverlays();
 }
 
 /// Switch to the tab at `idx`: show its panes, move the keyboard focus to
@@ -1234,10 +1345,77 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.cancelDividerDrag();
     self.active_tab = idx;
     self.tab_unread[idx] = false;
+    self.tab_bell[idx] = false;
+    self.noteTabActivated(idx);
     self.layoutSplits();
     if (focused) self.focusActiveSurface();
     if (previous < self.tab_count) self.hideTabPanes(previous);
+    self.tab_bar.onTabShown(idx);
     self.updateWindowTitle();
+    self.invalidateTabBar();
+    self.repositionOverlays();
+}
+
+/// Tab `tab` was selected: it is the most recent one now (`tabRecency`).
+fn noteTabActivated(self: *Window, tab: usize) void {
+    self.activation_count += 1;
+    self.tab_activated[tab] = self.activation_count;
+}
+
+/// How recently tab `i` was selected: higher is more recent, 0 for never.
+/// Sort by it, highest first, for the tabs in the order of their last use.
+/// GUI thread.
+pub fn tabRecency(self: *const Window, i: usize) u64 {
+    if (i >= self.tab_count) return 0;
+    return self.tab_activated[i];
+}
+
+/// What the tab bar shows on tab `i` besides its title: unread output, the
+/// bell, zoom and the progress its terminals report (`tab_status.merge`).
+/// GUI thread.
+pub fn tabStatus(self: *const Window, i: usize) tab_status.TabStatus {
+    if (i >= self.tab_count) return .{};
+    const now = GetTickCount64();
+    var progress: tab_status.Progress = .none;
+    var it = self.tab_trees[i].iterator();
+    while (it.next()) |entry| progress = tab_status.merge(progress, entry.view.progress, now);
+    return .{
+        .unread = self.tab_unread[i],
+        .bell = self.tab_bell[i],
+        .zoomed = self.tab_trees[i].zoomed != null,
+        .progress = progress,
+    };
+}
+
+/// The terminal `surface` reported progress (OSC 9;4, the `progress_report`
+/// action): keep it as the terminal's latest report (`Surface.progress`)
+/// for its tab (`tabStatus`), and repaint the tab bar when it changed.
+/// GUI thread.
+pub fn setSurfaceProgress(self: *Window, surface: *Surface, report: apprt.Action.Value(.progress_report)) void {
+    const progress: tab_status.Progress = .{
+        .state = switch (report.state) {
+            .remove => .none,
+            .set => .normal,
+            .@"error" => .@"error",
+            .indeterminate => .indeterminate,
+            .pause => .paused,
+        },
+        .percent = if (report.progress) |percent| @min(percent, 100) else null,
+        .updated_ms = GetTickCount64(),
+    };
+    const changed = progress.state != surface.progress.state or
+        !std.meta.eql(progress.percent, surface.progress.percent);
+    surface.progress = progress;
+    if (changed and self.findTabIndex(surface) != null) self.invalidateTabBar();
+}
+
+/// The terminal `surface` rang the bell: mark its tab (`tabStatus`) until
+/// the tab is selected, unless it is the active tab, and repaint the tab
+/// bar. GUI thread.
+pub fn ringTab(self: *Window, surface: *Surface) void {
+    const tab = self.findTabIndex(surface) orelse return;
+    if (tab == self.active_tab or self.tab_bell[tab]) return;
+    self.tab_bell[tab] = true;
     self.invalidateTabBar();
 }
 
@@ -1803,6 +1981,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     // The slot carries the title override along.
     var moved = self.getSlot(tab_idx);
     moved.unread = false;
+    moved.bell = false;
     const moved_active = moved.active_surface;
     const next_active = tabs.activeAfterClose(self.active_tab, tab_idx, self.tab_count).?;
     const was_active = tab_idx == self.active_tab;
@@ -1815,15 +1994,20 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     destination.setSlot(0, moved);
     destination.tab_count = 1;
     destination.active_tab = 0;
+    destination.noteTabActivated(0);
 
     it = destination.tab_trees[0].iterator();
-    while (it.next()) |entry| entry.view.parent_window = destination;
+    while (it.next()) |entry| entry.view.onReparented(destination);
+    destination.tab_bar.onTabShown(0);
 
     // The panes of the moved tab belong to the destination now: show the
     // tab that takes its place without hiding them.
     if (was_active) {
         self.tab_unread[self.active_tab] = false;
+        self.tab_bell[self.active_tab] = false;
+        self.noteTabActivated(self.active_tab);
         self.layoutSplits();
+        self.tab_bar.onTabShown(self.active_tab);
         self.updateWindowTitle();
     }
     self.updateTabBarVisibility();
@@ -2005,6 +2189,7 @@ fn handleResize(self: *Window) void {
     self.invalidateTabBar();
     self.resize_overlay.show();
     self.shortcut_notice.reposition();
+    self.repositionOverlays();
 }
 
 /// Move a tab from one index to another, shifting intermediate tabs.
@@ -2105,6 +2290,8 @@ fn onDestroy(self: *Window) void {
         self.title_bar.deinit();
         self.resize_overlay.deinit();
         self.shortcut_notice.deinit();
+        self.notice.deinit();
+        self.toast.deinit();
         self.hwnd = null;
         // QuickTerminal handles the rest of cleanup (freeing self, quit timer).
         if (app.quick_terminal) |qt| {
@@ -2126,6 +2313,8 @@ fn onDestroy(self: *Window) void {
     self.title_bar.deinit();
     self.resize_overlay.deinit();
     self.shortcut_notice.deinit();
+    self.notice.deinit();
+    self.toast.deinit();
     self.hwnd = null;
 
     // Free the Window allocation.
@@ -2178,6 +2367,23 @@ fn onChromeRightClick(self: *Window, pt: w32.POINT) void {
     Menu.performTabCommand(self, null, command);
 }
 
+/// A system broadcast reached this window (only top-level windows hear
+/// them; every window hears each one): read the system colors and high
+/// contrast state of the design tokens again (`style.system`), then tell
+/// the app, the backdrop and the title bar. GUI thread. `.theme` also
+/// comes from `SetWindowTheme` on this window: `Backdrop.apply` sends one
+/// from `init`, before the window has tabs.
+fn onSystemSettingChange(self: *Window, change: w32.SystemChange) void {
+    const hwnd = self.hwnd orelse return;
+    switch (change) {
+        .setting, .sys_colors, .theme => style.system.refresh(),
+        .colorization => {},
+    }
+    self.app.onSystemSettingChange(self, change);
+    Backdrop.onSystemSettingChange(hwnd, &self.app.config, self.app.alpha_frames, change);
+    self.title_bar.onSystemSettingChange(change);
+}
+
 /// Window procedure for top-level container HWNDs (GhosttyWindow class).
 /// GWLP_USERDATA stores a *Window pointer.
 pub fn windowWndProc(
@@ -2219,6 +2425,9 @@ pub fn windowWndProc(
         else => {},
     };
 
+    // System broadcasts go on to the default handling afterwards.
+    if (w32.SystemChange.fromMessage(msg, wparam, lparam)) |change| window.onSystemSettingChange(change);
+
     // The title bar owns the non-client frame and sees every message first.
     if (window.title_bar.handleMessage(msg, wparam, lparam)) |result| return result;
 
@@ -2256,6 +2465,28 @@ pub fn windowWndProc(
             return 0;
         },
 
+        // Nothing posts it yet: `checkFirstFrame` uncloaks the window.
+        WM_APP_FIRST_FRAME => return 0,
+
+        Popup.WM_GX_OWNER_ACTIVE_LOCK => {
+            window.title_bar.onOwnerActiveLock(wparam != 0);
+            return 0;
+        },
+
+        WM_GHOSTTY_SIMULATE_SYSTEM_THEME => return @intFromBool(window.app.simulateSystemTheme(wparam)),
+
+        w32.WM_MOUSEWHEEL, w32.WM_MOUSEHWHEEL => {
+            // The pointer is in screen coordinates.
+            var pt = mousePoint(lparam);
+            _ = w32.ScreenToClient(hwnd, &pt);
+            if (window.inChrome(pt.y)) {
+                const delta: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
+                const horizontal = msg == w32.WM_MOUSEHWHEEL;
+                if (window.tab_bar.onMouseWheel(window.title_bar.layout(), pt.x, pt.y, delta, horizontal)) return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_SIZE => {
             // Minimizing does not hide child surface HWNDs, so tell the core
             // to stop rendering the active tab while minimized. Return early:
@@ -2269,10 +2500,7 @@ pub fn windowWndProc(
             if (wparam == w32.SIZE_RESTORED or wparam == w32.SIZE_MAXIMIZED) {
                 window.setActiveTabVisible(true);
             }
-            // Maximizing moves the tabs (no left margin) and swaps the
-            // maximize glyph: repaint the whole chrome row.
-            window.title_bar.tooltip.hide();
-            window.title_bar.invalidate();
+            window.title_bar.onSize();
             window.handleResize();
             return 0;
         },
@@ -2327,14 +2555,18 @@ pub fn windowWndProc(
             return 1;
         },
         w32.WM_GETMINMAXINFO => {
-            // Apply user-configured size limits if any. lparam points
-            // to a MINMAXINFO the OS will consult for resize clamping.
-            if (window.min_track_w > 0 or window.min_track_h > 0 or
+            // Apply the size limits (the chrome's own minimum and the
+            // user-configured ones) if any. lparam points to a MINMAXINFO
+            // the OS will consult for resize clamping.
+            const chrome = caption_layout.minTrackSize(window.scale);
+            const min_w = @max(window.min_track_w, chrome.width);
+            const min_h = @max(window.min_track_h, chrome.height);
+            if (min_w > 0 or min_h > 0 or
                 window.max_track_w > 0 or window.max_track_h > 0)
             {
                 const mmi: *w32.MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
-                if (window.min_track_w > 0) mmi.ptMinTrackSize.x = window.min_track_w;
-                if (window.min_track_h > 0) mmi.ptMinTrackSize.y = window.min_track_h;
+                if (min_w > 0) mmi.ptMinTrackSize.x = min_w;
+                if (min_h > 0) mmi.ptMinTrackSize.y = min_h;
                 if (window.max_track_w > 0) mmi.ptMaxTrackSize.x = window.max_track_w;
                 if (window.max_track_h > 0) mmi.ptMaxTrackSize.y = window.max_track_h;
                 return 0;
@@ -2486,12 +2718,23 @@ pub fn windowWndProc(
             const activated = @as(u16, @truncate(wparam & 0xFFFF));
             if (activated == w32.WA_INACTIVE and window.is_quick_terminal) {
                 if (window.app.quick_terminal) |qt| {
-                    qt.onFocusLost();
+                    // lparam is the window being activated instead, if any.
+                    qt.onFocusLost(@ptrFromInt(@as(usize, @bitCast(lparam))));
                 }
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
+        w32.WM_ACTIVATEAPP => {
+            if (wparam == 0 and window.is_quick_terminal) {
+                if (window.app.quick_terminal) |qt| qt.onAppDeactivated();
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

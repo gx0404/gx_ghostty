@@ -196,13 +196,23 @@ pub fn onAnimationTick(self: *QuickTerminal) void {
     }
 }
 
-/// Called when the quick terminal window loses focus.
-pub fn onFocusLost(self: *QuickTerminal) void {
+/// Called when the quick terminal window is deactivated (WM_ACTIVATE);
+/// `next_active` is the window that is activated instead, if Windows names
+/// it (one of the quick terminal's own popups, another window).
+pub fn onFocusLost(self: *QuickTerminal, next_active: ?w32.HWND) void {
+    _ = next_active;
     if (!self.visible) return;
     if (self.animating and self.animation_direction == .out) return;
     if (!self.app.config.@"quick-terminal-autohide") return;
 
     self.animateOut();
+}
+
+/// Called when another application is activated (WM_ACTIVATEAPP), which
+/// the quick terminal window hears even while one of its popups was the
+/// active window. Does nothing yet.
+pub fn onAppDeactivated(self: *QuickTerminal) void {
+    _ = self;
 }
 
 /// Called when the quick terminal's window is destroyed (shell exited).

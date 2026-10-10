@@ -25,8 +25,13 @@
 //! per-pixel alpha and blits it into the window: opaque with the solid
 //! material, transparent where the DWM backdrop shows through otherwise
 //! (`chrome/Backdrop.zig`). The title bar also owns the chrome tooltip
-//! (`Tooltip`), shared with the tab bar. The owning `Window` embeds this
+//! (`ui/Tooltip.zig`), shared with the tab bar, and opens the window menu
+//! and the main menu (`ui/Menu.zig`). The owning `Window` embeds this
 //! struct as `title_bar`.
+//!
+//! Popups that keep the window painted as active while they have the focus
+//! (`Popup.Options.keep_owner_active`) lock it (`onOwnerActiveLock`); the
+//! frame does not follow those locks yet (`ownerActiveLocked`).
 //!
 //! Sizes, fonts, icons, hit-test rectangles, the canvas DPI and the
 //! tooltip follow the window's content scale (`Window.scale`), like the
@@ -42,11 +47,9 @@ const Window = @import("../Window.zig");
 const w32 = @import("../win32.zig");
 const d2d = @import("../ui/d2d.zig");
 const style = @import("../ui/style.zig");
-const Popup = @import("../ui/Popup.zig");
 const Menu = @import("../ui/Menu.zig");
+const tooltips = @import("../ui/Tooltip.zig");
 const Backdrop = @import("Backdrop.zig");
-
-const log = std.log.scoped(.win32_title_bar);
 
 /// Whether the window is currently in fullscreen mode.
 is_fullscreen: bool = false,
@@ -75,14 +78,14 @@ tracking_nc: bool = false,
 /// paint).
 canvas: ?d2d.Canvas = null,
 
-/// The tooltip of the chrome buttons and tabs.
+/// The tooltip of the chrome buttons and tabs (its delay timer `TT` runs
+/// on the window).
 tooltip: Tooltip = .{},
 
-/// Timer for the tooltip delay (WM_TIMER on the window).
-pub const TOOLTIP_TIMER_ID: usize = 0x5454; // 'TT'
+/// How many popups hold the window active (`onOwnerActiveLock`).
+owner_active_locks: u16 = 0,
 
-/// Hover time before a tooltip shows.
-const tooltip_delay_ms: u32 = 600;
+pub const Tooltip = tooltips.Tooltip(TooltipTarget);
 
 pub const Decoration = enum {
     /// The integrated title bar (`window-decoration = auto|client`).
@@ -426,7 +429,7 @@ pub fn handleMessage(
     // Track activation before DWM gets the message: the glyphs dim while
     // the window is inactive.
     if (msg == WM_NCACTIVATE) {
-        const active = wparam != 0;
+        const active = wparam != 0 or self.ownerActiveLocked();
         if (active != self.active) {
             self.active = active;
             self.invalidate();
@@ -598,9 +601,18 @@ fn performButton(self: *TitleBar, button: Button) void {
         .maximize => _ = w32.PostMessageW(hwnd, WM_SYSCOMMAND, if (w32.IsZoomed(hwnd) != 0) SC_RESTORE else SC_MAXIMIZE, 0),
         .close => _ = w32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0),
         .menu => {
-            var anchor = w32.POINT{ .x = self.layout().menu.left, .y = self.layout().bar.bottom };
-            _ = w32.ClientToScreen(hwnd, &anchor);
-            Menu.showMainMenu(win, anchor);
+            // The button's column down to the bottom of the row.
+            const lay = self.layout();
+            var top_left = w32.POINT{ .x = lay.menu.left, .y = lay.menu.top };
+            var bottom_right = w32.POINT{ .x = lay.menu.right, .y = lay.bar.bottom };
+            _ = w32.ClientToScreen(hwnd, &top_left);
+            _ = w32.ClientToScreen(hwnd, &bottom_right);
+            Menu.showMain(win, .{
+                .left = top_left.x,
+                .top = top_left.y,
+                .right = bottom_right.x,
+                .bottom = bottom_right.y,
+            }, .right);
         },
     }
 }
@@ -674,30 +686,10 @@ pub fn onMouseLeave(self: *TitleBar) void {
 // System menu
 // -----------------------------------------------------------------------
 
-/// Open the window menu at `screen_pt` (right-click on the title bar) and
-/// perform the picked command.
+/// Open the window menu at `screen_pt` (right-click on the title bar); it
+/// performs the picked command (`Menu.showWindowMenu`).
 pub fn openSystemMenu(self: *TitleBar, screen_pt: w32.POINT) void {
-    const hwnd = self.window().hwnd orelse return;
-    const menu = GetSystemMenu(hwnd, 0) orelse return;
-    const zoomed = w32.IsZoomed(hwnd) != 0;
-    const movable = !zoomed and !self.is_fullscreen;
-    setMenuItemEnabled(menu, SC_RESTORE, zoomed or self.is_fullscreen);
-    setMenuItemEnabled(menu, SC_MOVE, movable);
-    setMenuItemEnabled(menu, SC_SIZE, movable);
-    setMenuItemEnabled(menu, SC_MINIMIZE, true);
-    setMenuItemEnabled(menu, SC_MAXIMIZE, !zoomed);
-    setMenuItemEnabled(menu, SC_CLOSE, true);
-    _ = SetMenuDefaultItem(menu, std.math.maxInt(u32), 0);
-
-    const cmd = w32.TrackPopupMenuEx(
-        menu,
-        w32.TPM_RETURNCMD | TPM_RIGHTBUTTON,
-        screen_pt.x,
-        screen_pt.y,
-        hwnd,
-        null,
-    );
-    if (cmd > 0) _ = w32.PostMessageW(hwnd, WM_SYSCOMMAND, @intCast(cmd), 0);
+    Menu.showWindowMenu(self.window(), screen_pt);
 }
 
 /// Open the window menu below the left end of the title bar (Alt+Space).
@@ -708,8 +700,47 @@ pub fn openSystemMenuFromKeyboard(self: *TitleBar) void {
     self.openSystemMenu(pt);
 }
 
-fn setMenuItemEnabled(menu: w32.HMENU, item: u32, enabled: bool) void {
-    _ = EnableMenuItem(menu, item, MF_BYCOMMAND | if (enabled) MF_ENABLED else w32.MF_GRAYED);
+// -----------------------------------------------------------------------
+// Activation lock and system changes
+// -----------------------------------------------------------------------
+
+/// `Popup.WM_GX_OWNER_ACTIVE_LOCK` reached the window: a popup with
+/// `keep_owner_active` is about to take the activation (`locked`), or it
+/// hid or lost it. Popups send it from `show` and `WM_MOUSEACTIVATE`
+/// (SendMessage), so this must not pump messages. GUI thread. Only counts
+/// the locks for now.
+pub fn onOwnerActiveLock(self: *TitleBar, locked: bool) void {
+    if (locked) {
+        self.owner_active_locks +|= 1;
+    } else {
+        self.owner_active_locks -|= 1;
+    }
+}
+
+/// Whether a popup holds the window active, so `WM_NCACTIVATE(FALSE)`
+/// leaves the frame active. Always false for now.
+pub fn ownerActiveLocked(self: *const TitleBar) bool {
+    _ = self;
+    return false;
+}
+
+/// A system broadcast reached the window (`Window.onSystemSettingChange`),
+/// after the design tokens read the system colors again (`style.system`):
+/// repaint the row when the system colors or the visual style changed
+/// (high contrast on or off).
+pub fn onSystemSettingChange(self: *TitleBar, change: w32.SystemChange) void {
+    switch (change) {
+        .sys_colors, .theme => self.invalidate(),
+        .setting, .colorization => {},
+    }
+}
+
+/// The window was resized (WM_SIZE, not minimized): drop the tooltip and
+/// repaint the row (maximizing moves the tabs and swaps the maximize
+/// glyph).
+pub fn onSize(self: *TitleBar) void {
+    self.tooltip.hide();
+    self.invalidate();
 }
 
 // -----------------------------------------------------------------------
@@ -847,10 +878,6 @@ pub const TooltipTarget = union(enum) {
     profiles,
     tab_close: usize,
     tab: usize,
-
-    fn eql(a: TooltipTarget, b: TooltipTarget) bool {
-        return std.meta.eql(a, b);
-    }
 };
 
 /// The tab bar part under the mouse changed: point the tooltip at it, or
@@ -866,19 +893,14 @@ pub fn setTabTooltipTarget(self: *TitleBar, target: TooltipTarget) void {
 /// Point the tooltip at `target`: it shows after the hover delay and
 /// hides when the target changes.
 pub fn setTooltipTarget(self: *TitleBar, target: TooltipTarget) void {
-    if (target.eql(self.tooltip.target)) return;
     const hwnd = self.window().hwnd orelse return;
-    self.tooltip.target = target;
-    self.tooltip.hide();
-    _ = w32.KillTimer(hwnd, TOOLTIP_TIMER_ID);
-    if (target != .none) _ = w32.SetTimer(hwnd, TOOLTIP_TIMER_ID, tooltip_delay_ms, null);
+    self.tooltip.setTarget(hwnd, target);
 }
 
-/// WM_TIMER for the tooltip; returns true when it was the tooltip timer.
+/// WM_TIMER for the tooltip; returns true when it was the tooltip delay.
 pub fn onTimer(self: *TitleBar, id: usize) bool {
-    if (id != TOOLTIP_TIMER_ID) return false;
-    const win = self.window();
-    if (win.hwnd) |hwnd| _ = w32.KillTimer(hwnd, TOOLTIP_TIMER_ID);
+    const hwnd = self.window().hwnd orelse return false;
+    if (!self.tooltip.delayElapsed(hwnd, id)) return false;
     self.showTooltip();
     return true;
 }
@@ -906,7 +928,7 @@ fn showTooltip(self: *TitleBar) void {
     var bottom_right = w32.POINT{ .x = anchor.right, .y = anchor.bottom };
     _ = w32.ClientToScreen(hwnd, &top_left);
     _ = w32.ClientToScreen(hwnd, &bottom_right);
-    self.tooltip.show(win, text, .{
+    self.tooltip.show(win.app, hwnd, win.scale, text, .{
         .left = top_left.x,
         .top = top_left.y,
         .right = bottom_right.x,
@@ -931,108 +953,6 @@ pub fn onConfigChange(self: *TitleBar) void {
     self.tooltip.hide();
     self.invalidate();
 }
-
-/// A small non-activating, click-through tooltip popup below an anchor
-/// rectangle, drawn with Direct2D in the chrome colors.
-pub const Tooltip = struct {
-    popup: Popup = .{},
-    target: TooltipTarget = .none,
-    text_buf: [512]u8 = undefined,
-    text_len: usize = 0,
-    tokens: ?style.Tokens = null,
-
-    const font_size: f32 = 12;
-    const pad_x: f32 = 8;
-    const pad_y: f32 = 5;
-    const max_width: f32 = 420;
-
-    pub fn visible(self: *const Tooltip) bool {
-        return self.popup.visible;
-    }
-
-    pub fn hide(self: *Tooltip) void {
-        self.popup.hide();
-    }
-
-    pub fn destroy(self: *Tooltip) void {
-        self.popup.destroy();
-        self.target = .none;
-    }
-
-    fn text(self: *const Tooltip) []const u8 {
-        return self.text_buf[0..self.text_len];
-    }
-
-    /// Show `text` centered below `anchor` (screen pixels), kept on the
-    /// anchor's monitor.
-    fn show(self: *Tooltip, win: *Window, value: []const u8, anchor: w32.RECT) void {
-        const owner = win.hwnd orelse return;
-        const factory = win.app.uiFactory() orelse return;
-        const tokens = style.Tokens.fromConfig(&win.app.config);
-        self.tokens = tokens;
-        if (self.popup.hwnd == null) {
-            self.popup.create(win.app.hinstance, owner, factory, .{
-                .activate = false,
-                .click_through = true,
-                .dismiss_on_escape = false,
-                .dismiss_on_outside_click = false,
-                .corners = .round_small,
-                .border_color = tokens.border,
-                .dark = tokens.dark,
-            }, .{
-                .ctx = @ptrCast(self),
-                .paint = paintCallback,
-            }) catch |err| {
-                log.warn("cannot create the tooltip err={}", .{err});
-                return;
-            };
-        } else {
-            self.popup.setBorderColor(tokens.border);
-        }
-
-        const len = @min(value.len, self.text_buf.len);
-        @memcpy(self.text_buf[0..len], value[0..len]);
-        self.text_len = len;
-
-        self.popup.setOwnerScale(win.scale);
-        const s = self.popup.ownerScale();
-        const size = factory.measureText(self.text(), textStyle(tokens), max_width - 2 * pad_x);
-        const w = style.px(@min(size.width + 2 * pad_x + 1, max_width), s);
-        const h = style.px(size.height + 2 * pad_y, s);
-        const gap = style.px(6, s);
-
-        const center_x = @divTrunc(anchor.left + anchor.right, 2);
-        var x = center_x - @divTrunc(w, 2);
-        var y = anchor.bottom + gap;
-        var mi: w32.MONITORINFO = undefined;
-        mi.cbSize = @sizeOf(w32.MONITORINFO);
-        const monitor = w32.MonitorFromWindow(owner, w32.MONITOR_DEFAULTTONEAREST);
-        if (w32.GetMonitorInfoW(monitor, &mi) != 0) {
-            const work = mi.rcWork;
-            x = std.math.clamp(x, work.left + 2, @max(work.left + 2, work.right - w - 2));
-            if (y + h > work.bottom) y = anchor.top - gap - h;
-        }
-        self.popup.show(.{ .left = x, .top = y, .right = x + w, .bottom = y + h });
-    }
-
-    fn textStyle(tokens: style.Tokens) d2d.TextStyle {
-        return .{
-            .size = font_size,
-            .color = tokens.text,
-            .wrap = true,
-            .ellipsis = false,
-        };
-    }
-
-    fn paintCallback(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
-        const self: *Tooltip = @ptrCast(@alignCast(ctx));
-        const tokens = self.tokens orelse return;
-        const size = popup.sizeDip();
-        const r: d2d.Rect = .{ .x = 0, .y = 0, .w = size.width, .h = size.height };
-        canvas.fillRect(r, tokens.surface_raised);
-        canvas.drawText(self.text(), r.inset(pad_x, pad_y), textStyle(tokens));
-    }
-};
 
 // -----------------------------------------------------------------------
 // Fullscreen and decorations
@@ -1112,17 +1032,12 @@ const HTTOPLEFT: isize = 13;
 const HTTOPRIGHT: isize = 14;
 const HTCLOSE: isize = 20;
 
-const SC_SIZE: u32 = 0xF000;
-const SC_MOVE: u32 = 0xF010;
 const SC_MINIMIZE: u32 = 0xF020;
 const SC_MAXIMIZE: u32 = 0xF030;
 const SC_CLOSE: u32 = 0xF060;
 const SC_RESTORE: u32 = 0xF120;
 
 const TME_NONCLIENT: u32 = 0x00000010;
-const TPM_RIGHTBUTTON: u32 = 0x0002;
-const MF_BYCOMMAND: u32 = 0x00000000;
-const MF_ENABLED: u32 = 0x00000000;
 
 const SM_CYSIZEFRAME: i32 = 33;
 const SM_CXPADDEDBORDER: i32 = 92;
@@ -1146,9 +1061,6 @@ const DWMWA_CAPTION_BUTTON_BOUNDS: u32 = 5;
 extern "dwmapi" fn DwmDefWindowProc(hWnd: w32.HWND, msg: u32, wParam: usize, lParam: isize, plResult: *isize) callconv(.winapi) i32;
 extern "dwmapi" fn DwmGetWindowAttribute(hwnd: w32.HWND, dwAttribute: u32, pvAttribute: *anyopaque, cbAttribute: u32) callconv(.winapi) i32;
 extern "user32" fn GetSystemMetricsForDpi(nIndex: i32, dpi: u32) callconv(.winapi) i32;
-extern "user32" fn GetSystemMenu(hWnd: w32.HWND, bRevert: i32) callconv(.winapi) ?w32.HMENU;
-extern "user32" fn EnableMenuItem(hMenu: w32.HMENU, uIDEnableItem: u32, uEnable: u32) callconv(.winapi) i32;
-extern "user32" fn SetMenuDefaultItem(hMenu: w32.HMENU, uItem: u32, fByPos: u32) callconv(.winapi) i32;
 extern "user32" fn WindowFromPoint(point: w32.POINT) callconv(.winapi) ?w32.HWND;
 pub extern "user32" fn GetWindowPlacement(hWnd: w32.HWND, lpwndpl: *WINDOWPLACEMENT) callconv(.winapi) i32;
 extern "user32" fn SetWindowPlacement(hWnd: w32.HWND, lpwndpl: *const WINDOWPLACEMENT) callconv(.winapi) i32;

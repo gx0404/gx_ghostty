@@ -34,9 +34,9 @@
 //!
 //! Stateless: everything lives on the HWND. `Window` calls `apply` once
 //! after creating its HWND, `onConfigChange` after every app-level
-//! configuration change and `extendFrame` whenever the height of its chrome
-//! changes; `App` uses `toggleOpacity` for `toggle_background_opacity` in
-//! the fallback.
+//! configuration change, `onSystemSettingChange` for the system broadcasts
+//! and `extendFrame` whenever the height of its chrome changes; `App` uses
+//! `toggleOpacity` for `toggle_background_opacity` in the fallback.
 const std = @import("std");
 const configpkg = @import("../../../config.zig");
 const Config = configpkg.Config;
@@ -106,6 +106,18 @@ pub fn onConfigChange(hwnd: w32.HWND, config: *const Config, alpha_frames: bool)
     applyMaterial(hwnd, config);
     if (alpha_frames) setPerPixel(hwnd, perPixel(config, true));
     applyBackgroundBlur(hwnd, blurEnabled(config));
+}
+
+/// A system broadcast reached the top-level window `hwnd`
+/// (`Window.onSystemSettingChange`): the apps light or dark theme
+/// ("ImmersiveColorSet", for `window-theme = system`), the system colors,
+/// the visual style or the accent color changed. GUI thread. The DWM state
+/// does not follow these yet.
+pub fn onSystemSettingChange(hwnd: w32.HWND, config: *const Config, alpha_frames: bool, change: w32.SystemChange) void {
+    _ = hwnd;
+    _ = config;
+    _ = alpha_frames;
+    _ = change;
 }
 
 /// Whether the terminals of this process present frames whose alpha DWM
