@@ -633,11 +633,11 @@ fn performButton(self: *TitleBar, button: Button) void {
 pub fn onMouseMove(self: *TitleBar, x: i32, y: i32) bool {
     const lay = self.layout();
     const hit = self.hitTest(lay, x, y);
-    _ = self.window().tab_bar.onMouseMove(lay, x, lay.tabY(y));
     self.setHover(switch (hit) {
         .button => |button| if (button == .menu) .menu else .none,
         else => .none,
     });
+    _ = self.window().tab_bar.onMouseMove(lay, x, lay.tabY(y));
     return hit != .none;
 }
 
