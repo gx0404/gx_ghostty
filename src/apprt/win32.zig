@@ -46,4 +46,5 @@ test {
     _ = @import("win32/ui/settings/swatch.zig");
     _ = @import("win32/ui/settings/system.zig");
     _ = @import("win32/ui/settings/model.zig");
+    _ = @import("win32/ui/Settings.zig");
 }
