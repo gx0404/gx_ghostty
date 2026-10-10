@@ -17,8 +17,9 @@
 | `settings_map.zig` | 与 UI 工具包无关的设置模型：选项、写入的键与值、标签 msgid，`Changes` 一次提交到覆盖文件 |
 | `i18n.zig`、`i18n/` | 界面语言与翻译 |
 | `branding.zig` | 产品名、维护者、链接与非官方分支声明（Ghostty 维护者要求非官方构建写明未获认可）；两个 apprt 的关于对话框与设置的关于页都显示它 |
-| `action.zig`、`profiles.zig` | `gx:` 绑定动作；启动配置探测 |
-| `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 进程快照（Windows 用 Toolhelp32，Linux 读 `/proc`，比较创建时间防 pid 复用）、空闲与 herdr 策略、关闭确认（GX-0012）、herdr 应用模式 |
+| `action.zig`、`profiles.zig` | `gx:` 绑定动作；启动配置探测、缓存与解析 |
+| `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 进程表 `Table`（Windows 用 Toolhelp32，Linux 读 `/proc`；一次遍历，多根 `tree`，比较创建时间防 pid 复用）与 `Shared`、空闲与辅助进程名单、关闭确认（GX-0012）、herdr 应用模式 |
+| `leader.zig`、`unread.zig` | 前台程序归类（远程、超级用户、容器）；后台标签的新输出 |
 | `win32_input.zig`、`conpty.zig`、`osc7.zig`、`path_quote.zig` | Windows 终端支持：KEY_EVENT_RECORD 编码（GX-0006）、随包 ConPTY（GX-0007）、OSC 7 的盘符路径（GX-0008）、拖放与粘贴路径按 shell 引用 |
 | `gtk_css.zig` | GTK 外观的配色 CSS，纯文本生成、不依赖 GTK |
 
@@ -40,15 +41,18 @@
 ### gx: 动作与启动配置
 
 - `action.zig::Action` 的语法是 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`。GX-0014 给 `input.Binding.Action` 加 `gx` 成员；核心 `Surface.performBindingAction` 在 apprt 声明了 `gxAction` 时调用 `rt_app.gxAction(target, action)`（win32 的 `App.gxAction`，GTK 的 `App.gxAction` 转给 `src/apprt/gtk/gx/app.zig`），否则记 warn 并返回 false，`performable:` 绑定因而把按键交还终端。
-- `profiles.zig::detect` 是 `Environment` 的纯函数。Windows：GX Zsh 与 herdr（依次查 `<exe>\..\bin`、`%LOCALAPPDATA%\Programs\GXShell\bin`、`%LOCALAPPDATA%\Programs\OhMyZshGX\bin`，再查 `PATH`）、PowerShell 7、Windows PowerShell、cmd、Git Bash、MSYS2 UCRT64、Nushell、注册表里的每个 WSL 发行版；Linux：GX Zsh 与 herdr（`/usr/lib/ohmyzsh-gx/bin`，再 `PATH`）、登录 shell、zsh、bash、fish；最后是 `gx-launch-profile` 的 `custom:<名称>`。`defaultProfile`：Windows 依次 GX Zsh、pwsh、powershell、cmd，Linux 依次 GX Zsh、登录 shell。
+- `profiles.zig::detect` 是 `Environment` 的纯函数。Windows：GX Zsh 与 herdr（依次查 `<exe>\..\bin`、`%LOCALAPPDATA%\Programs\GXShell\bin`、`%LOCALAPPDATA%\Programs\OhMyZshGX\bin`，再查 `PATH`）、PowerShell 7、Windows PowerShell、cmd、Git Bash、MSYS2 UCRT64、Nushell、注册表里的每个 WSL 发行版（跳过 Docker/Rancher Desktop 的内部发行版，`isUtilityDistro`）；Linux：GX Zsh 与 herdr（`/usr/lib/ohmyzsh-gx/bin`，再 `PATH`）、登录 shell、zsh、bash、fish；最后是 `gx-launch-profile` 的 `custom:<名称>`。`defaultProfile`：Windows 依次 GX Zsh、pwsh、powershell、cmd，Linux 依次 GX Zsh、登录 shell；`commandConfigured` 判断各层是否设了 `command`。
+- `profiles.Cache`（app 一份）按探测读取的环境变量指纹缓存 shell，重载配置时 `invalidate`；`list` 复制缓存再追加自定义配置。`List.resolve` 是 `gx:new_*_profile:<参数>` 的解析规则：id，再自定义配置名，再英文或当前语言的显示名（忽略大小写）。
 
 ## 不变量
 
-- 可在任何主机上测：探测与判断写成注入 `Environment`、`io` 或 `/proc` 目录的纯函数（`profiles.detect`、`proc.procSnapshot`、`app_mode.procRunsHerdr`），两个平台的规则都能单测；Windows 专属代码按 `builtin.os.tag` 编译期门控（`conpty`、`confirm.windows`、`profiles.wslDistros`）。
+- 可在任何主机上测：探测与判断写成注入 `Environment`、`io` 或 `/proc` 目录的纯函数（`profiles.detect`、`proc.Table.readProc`、`app_mode.procRunsHerdr`、`leader.procKind`），两个平台的规则都能单测；Windows 专属代码按 `builtin.os.tag` 编译期门控（`conpty`、`confirm.windows`、`profiles.wslDistros`）。
 - 与 UI 工具包无关：`src/gx` 不导入 GTK、Win32 UI 模块或 apprt；`settings_map`、`gtk_css` 只产出数据与文本，界面在各 apprt 里。`src/gx` 只属于 app 产物（`config_layers` 读 `src/global.zig`），libghostty-vt 可达的代码不得导入它。
 - 层序是用户契约：改层或排序要同时更新 `config_layers.zig` 的文件头、`defaults.ghostty` 的注释与单测。默认值文件不写颜色（颜色来自主题）。`gui-settings.ghostty` 只由设置界面经 `Overlay` 或 `settings_map.Changes` 写入；任何代码都不写用户的 `config.ghostty`。
 - fork 的界面文字是英文 msgid 加 `gx.i18n`：编译期字面量用 `tr`，运行期才知道的 msgid（如启动配置名）用 `trRuntime`。新 msgid 先查 `po/zh_CN.po` 有没有上游译文，没有才加进 `gx.zh_CN.po`，再 `just i18n`，`.po` 与生成表进同一提交。
-- 进程判断保守：读不到进程（pid 未知、组长已退出、`/proc` 打不开、Linux 与 Windows 以外的系统）按「忙」处理，保持上游结论。只在关闭与退出确认、应用模式轮询时列进程，在 GUI 线程同步进行，不持 `renderer_state.mutex`。
+- 进程判断保守：读不到进程（pid 未知、组长已退出、`/proc` 打不开、Linux 与 Windows 以外的系统）按「忙」处理，保持上游结论。列进程只在 GUI 线程同步进行，不持 `renderer_state.mutex`，不移到工作线程。
+- 控制列进程次数：一次检查只读一张 `proc.Table`（多个终端用多根 `Table.tree`）；周期检查（win32 标签栏每 2 s、应用模式）应共用 app 持有的 `proc.Shared`（1 s 内复用）。应用模式连续两次命中才进入（`app_mode.State`），间隔按 `nextDelay` 从 500 ms 退到 10 s。关闭确认不读 `Shared`：一次确认在 `confirm.Scope` 内只拍一张表，模态框前结束；进程名不带 `.exe`（`policy.displayName`）。
+- 后台标签新输出用 `unread.Tracker`：隐藏时记基线，此后脏且内容（回滚行数、光标、光标行）变了才算；周期检查只 `tryLock`。
 - `gx:` 动作名与 `Profile.id`（`gx-zsh`、`pwsh`、`wsl:<发行版>`、`custom:<名称>` 等）出现在用户的 `keybind`、`command-palette-entry` 里，改名属于破坏性变更。
 
 ## 禁止项
@@ -60,7 +64,7 @@
 
 ## 验证
 
-- 单测：`just test --filter gx.`。Windows 本机跑 win32 构建的 `ghostty-test`（2026-10 本机 142 条，热缓存墙钟约 3 s），覆盖 Windows 分支；Linux 分支用 `just wsl test --filter gx.`（`-Dapp-runtime=none`，与 gx-ci 的 `linux-main` 相同）。改平台专属代码时两边都跑。
+- 单测：`just test --filter gx.`。Windows 本机跑 win32 构建的 `ghostty-test`（2026-10 本机 166 条，热缓存墙钟约 3 s），覆盖 Windows 分支；Linux 分支用 `just wsl test --filter gx.`（`-Dapp-runtime=none`，与 gx-ci 的 `linux-main` 相同）。改平台专属代码时两边都跑。
 - 翻译：`just i18n` 后 `just i18n-check`；改生成器跑 `python scripts/run_unittests.py test_gx_i18n`。
 - 改配置键、默认值或分层：`just test --filter gx.config_layers --filter gx.settings_map`，再按 `config.md` 的验证生成文档（`just build -Demit-webdata`），并用隔离配置启动 app 核对效果（GUI 证据见 `apprt-win32.md`、`apprt-gtk.md`）。
 - 改 Zig 跑 `just fmt-check`；改了 `pub` 签名或 `//!` 文档跑 `just kb`。

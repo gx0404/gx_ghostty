@@ -11,9 +11,10 @@
 //! - UI language and translations (`i18n`); the name, links and
 //!   non-affiliation notice of the About surfaces (`branding`).
 //! - `gx:` binding actions (`action`) and launch profiles (`profiles`).
-//! - Processes: inspection (`proc`), the idle and herdr policies
-//!   (`policy`), close confirmation (`confirm`) and herdr app mode
-//!   (`app_mode`).
+//! - Processes: inspection (`proc`), the idle and helper policies
+//!   (`policy`), close confirmation (`confirm`), herdr app mode
+//!   (`app_mode`) and the kind of program in the foreground (`leader`).
+//! - New output in tabs that are not shown (`unread`).
 //! - The colors of the GTK look, as CSS (`gtk_css`).
 //! - The interface library of both apprts: color math and the accent
 //!   (`ui_color`), the design tokens (`ui_tokens`) and window chrome
@@ -37,6 +38,7 @@ pub const fuzzy = @import("fuzzy.zig");
 pub const gtk_css = @import("gtk_css.zig");
 pub const gui_settings = @import("gui_settings.zig");
 pub const i18n = @import("i18n.zig");
+pub const leader = @import("leader.zig");
 pub const motion = @import("motion.zig");
 pub const osc7 = @import("osc7.zig");
 pub const path_quote = @import("path_quote.zig");
@@ -50,6 +52,7 @@ pub const theme = @import("theme.zig");
 pub const theme_swatch = @import("theme_swatch.zig");
 pub const ui_color = @import("ui_color.zig");
 pub const ui_tokens = @import("ui_tokens.zig");
+pub const unread = @import("unread.zig");
 pub const win32_input = @import("win32_input.zig");
 
 test {
@@ -65,6 +68,7 @@ test {
     _ = gtk_css;
     _ = gui_settings;
     _ = i18n;
+    _ = leader;
     _ = motion;
     _ = osc7;
     _ = path_quote;
@@ -78,5 +82,6 @@ test {
     _ = theme_swatch;
     _ = ui_color;
     _ = ui_tokens;
+    _ = unread;
     _ = win32_input;
 }
