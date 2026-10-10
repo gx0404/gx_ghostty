@@ -135,6 +135,7 @@ pub fn reposition(self: *ShortcutNotice) void {
     if (!self.popup.visible or !Palette.popupAlive(&self.popup)) return;
     const rect = self.bounds() orelse return;
     self.popup.setBounds(rect);
+    self.popup.invalidate();
 }
 
 fn piece(self: *const ShortcutNotice, p: Piece) []const u8 {

@@ -19,9 +19,15 @@ test {
     _ = @import("win32/tabs.zig");
     _ = @import("win32/win32.zig");
     _ = @import("win32/ui/Dialogs.zig");
+    _ = @import("win32/ui/Notice.zig");
     _ = @import("win32/ui/Palette.zig");
     _ = @import("win32/ui/Popup.zig");
+    _ = @import("win32/ui/Toast.zig");
+    _ = @import("win32/ui/anim.zig");
+    _ = @import("win32/ui/controls.zig");
+    _ = @import("win32/ui/d2d.zig");
     _ = @import("win32/ui/style.zig");
+    _ = @import("win32/ui/text_edit.zig");
     _ = @import("win32/ui/wstr.zig");
     _ = @import("win32/ui/Keybinds.zig");
     _ = @import("win32/ui/trigger.zig");
