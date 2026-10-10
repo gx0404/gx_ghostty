@@ -104,6 +104,15 @@ fn textStyle(t: style.Tokens) d2d.TextStyle {
 /// The width of the bubble besides its text: the link icon and the
 /// paddings, in DIPs.
 const chrome_width = 2 * style.metrics.padding_x + style.metrics.icon_size + style.metrics.gap;
+const text_slack_px: i32 = 2;
+
+fn textBudget(max_pixels: i32, scale: f32) f32 {
+    return @max(0, style.dip(@max(0, max_pixels - text_slack_px), scale) - chrome_width);
+}
+
+fn bubbleWidth(text_width: f32, max_pixels: i32, scale: f32) i32 {
+    return @min(@max(0, max_pixels), style.pxCeil(text_width + chrome_width, scale) + text_slack_px);
+}
 
 /// Measures text in the bubble's font for `elide`, outside the factory's
 /// text cache: the candidates of one URL would only push out the texts
@@ -169,11 +178,11 @@ pub fn show(self: *LinkPreview, url: []const u8) void {
         const factory = s.app.uiFactory() orelse return;
         const surface_w = style.dip(@intCast(s.width), scale);
         const max_w = @max(0, @min(surface_w * max_width_share, surface_w - 2 * margin));
+        const max_pixels: i32 = @intFromFloat(@floor(max_w * scale));
         const measurer: Measurer = .{ .factory = factory, .text_style = textStyle(t) };
-        const text = elide(&self.text_buf, url, @max(0, max_w - chrome_width), measurer);
+        const text = elide(&self.text_buf, url, textBudget(max_pixels, scale), measurer);
         self.text_len = text.len;
-        const want_w = measurer.width(text) + chrome_width;
-        break :width @min(style.pxCeil(want_w, scale), @as(i32, @intFromFloat(@floor(max_w * scale))));
+        break :width bubbleWidth(measurer.width(text), max_pixels, scale);
     };
 
     const pointer: ?Point = pointer: {
@@ -386,15 +395,12 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     canvas.drawIcon(d2d.icons.link, .{ .x = pad, .y = 0, .w = icon, .h = size.height }, 14, t.accent);
 
     const text_x = pad + icon + style.metrics.gap;
-    var text_style = textStyle(t);
-    // A text cut by rounding still ends in an ellipsis.
-    text_style.ellipsis = true;
     canvas.drawText(self.text_buf[0..self.text_len], .{
         .x = text_x,
         .y = 0,
         .w = @max(size.width - text_x - pad, 0),
         .h = size.height,
-    }, text_style);
+    }, textStyle(t));
 }
 
 /// Measures one unit per code point.
@@ -403,6 +409,21 @@ const TestMeasurer = struct {
         return @floatFromInt(codepoints(text));
     }
 };
+
+test "the bubble reserves rounding room within its physical width cap" {
+    const testing = std.testing;
+    for ([_]f32{ 1, 1.25, 1.5, 2 }) |scale| {
+        const cap: i32 = 519;
+        const budget = textBudget(cap, scale);
+        for ([_]f32{ 0, budget / 2, budget }) |width| {
+            const pixels = bubbleWidth(width, cap, scale);
+            try testing.expect(pixels <= cap);
+            try testing.expect(textBudget(pixels, scale) + 1e-4 >= width);
+        }
+        try testing.expectEqual(@as(i32, 0), bubbleWidth(0, 0, scale));
+        try testing.expectEqual(@as(f32, 0), textBudget(1, scale));
+    }
+}
 
 test "elide keeps a URL that fits" {
     const testing = std.testing;
