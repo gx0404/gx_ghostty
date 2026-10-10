@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0026）之后的号。在册的 20 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0027）之后的号。在册的 21 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0027，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -80,6 +80,7 @@
 | GX-0023 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0023` | active |
 | GX-0024 | `src/config/Config.zig` | `fork(gx): GX-0024` | active |
 | GX-0026 | `src/build/GhosttyExe.zig` | `fork(gx): GX-0026` | active |
+| GX-0027 | `src/apprt/gtk/class/close_confirmation_dialog.zig` | `fork(gx): GX-0027` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1089,3 +1090,49 @@ PowerShell 里 `[System.Diagnostics.FileVersionInfo]::GetVersionInfo('<prefix>\b
 
 - `scripts/test_fork_patches.py` 锁定标记与登记的闭集。
 - `scripts/test_gx_icon.py` 锁定已提交的 ico 与生成器逐像素一致、尺寸齐全（16～256）、只有 256 像素是 PNG。
+
+## GX-0027 GTK 的关闭确认列出仍在运行的进程
+
+- 文件：`src/apprt/gtk/class/close_confirmation_dialog.zig`，`CloseConfirmationDialog.present` 设好标题与正文之后的一个纯新增块，调用新路径 `src/apprt/gtk/gx/confirm.zig::listProcesses`。
+- 标记：`fork(gx): GX-0027`，以 `// fork(gx): GX-0027 begin: <说明>` 开头、`// fork(gx): GX-0027 end` 结尾，包住一行调用。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，新增 3 行（含 2 行标记），不改、不删上游行。
+
+### 原因
+
+上游 GTK 的关闭确认（退出、关窗口、关标签页、关分屏）只有固定的标题与正文，例如「此标签页中的所有终端会话都将被终止」，不说哪些程序会被终止；Windows 的确认框列出正在运行的进程（`src/apprt/win32/ui/Dialogs.zig`）。GTK 对话框只知道关闭对象（`Target`）与调用方传入的父控件，正文在 `present` 里设置，所以只能在这里接入；按关闭对象收集终端与列进程都在 fork 路径。
+
+### 行为
+
+- `present` 设好标题与正文后，`listProcesses(dialog, target, parent)` 按关闭对象收集终端：退出（`.app`）取核心 App 的全部终端；关窗口（`.window`，父控件是 `Window`）取每个标签页分屏树里的终端；关标签页（`.tab`，父控件是 `Tab`）取它的分屏树；关分屏（`.surface`，父控件是 `SplitTree`）取分屏树的活动终端，即 `split-tree.close-split` 与关闭快捷键关闭的那个。父控件不是预期的类型时不列。
+- 只看需要确认的终端（`CoreSurface.needsConfirmQuit`，含 GX-0012 的空闲进程判断），对它们调 `gx.confirm.appendBusyProcesses`：前台进程及其子孙中不空闲的那些，名字按界面显示的形式（去掉路径与 `.exe`）、按出现顺序去重，与 Windows 相同。整个过程在一个 `gx.confirm.Scope` 里，只读一次进程表；列进程在主线程同步进行，显示对话框之前结束。
+- 有进程时用 `setExtraChild` 在正文下方放一段：标题「正在运行的进程：」（`gx.i18n`，与 Windows 共用译文）加 libadwaita 的 `boxed-list` 列表，每个进程一行，过长时末尾省略；超过 6 个时列前 5 个，最后一行写「……另有 N 个」（N 至少为 2）。没有进程或读不到（Linux 以外的系统、`/proc` 打不开）时，对话框与上游完全相同。
+- 标题、正文、按钮、响应与关闭流程都不变。
+
+### 上游状态
+
+未回馈上游。空闲进程的判断与界面译文来自 Ghostty GX 的共享核心；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+块是纯新增：放在 `present` 里设置正文之后、`self.as(Dialog).present(parent)` 之前。上游改动 `Target`、`present` 的签名，或调用方传入的父控件（`window.zig::windowCloseRequest`、`window.zig::tabViewClosePage`、`split_tree.zig::surfaceCloseRequest`、`application.zig::quit`）时，同步 `src/apprt/gtk/gx/confirm.zig::Processes.collect` 的取终端规则；上游自己给确认框加了 extra child 时，把进程列表并进去，不要覆盖。
+
+### 移除条件
+
+上游的关闭确认列出将被终止的进程，或 Ghostty GX 不再需要该功能时移除：删除块与标记、`src/apprt/gtk/gx/confirm.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl test --gtk --filter apprt.gtk.gx
+just wsl smoke --out <目录> --config <配置> --xdotool <脚本>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟（`shell-integration = none`、`command = /bin/bash --noprofile --norc`）：在终端里运行 `sleep 300` 后按 Ctrl+Shift+W，关闭标签页的确认框在正文下方列出 `sleep`；同时运行 8 个不同名的程序后按 Ctrl+Shift+Q，退出确认列出前 5 个与「……另有 3 个」；空闲的终端照常不确认。读图后才算通过。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0027_problems` 锁定 `close_confirmation_dialog.zig` 只有一个 GX-0027 纯新增块：块里调用 `listProcesses`，位于设置正文之后、显示对话框之前；删掉它就与 `HEAD` 和 `main` 的 merge-base 上的上游版本相同（没有 `main` 时跳过）。`src/apprt/gtk/gx/confirm.zig` 的单测锁定行数规则（不会出现「另有 1 个」，`just wsl test --gtk --filter apprt.gtk.gx`）。

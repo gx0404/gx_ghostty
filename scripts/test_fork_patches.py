@@ -88,6 +88,12 @@ GX0002_HUNKS = (
      )),
 )
 
+CLOSE_DIALOG_ZIG = "src/apprt/gtk/class/close_confirmation_dialog.zig"
+GX0027 = "GX-0027"
+GX0027_CALL = '@import("../gx/confirm.zig").listProcesses(self, priv.target, parent);'
+GX0027_AFTER = "self.as(Dialog.Parent).setBody(priv.target.body());"
+GX0027_BEFORE = "self.as(Dialog).present(parent);"
+
 GTK_CSS = "src/apprt/gtk/css/style.css"
 CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
@@ -402,6 +408,28 @@ def gx0002_problems(source: str) -> list[str]:
     return problems
 
 
+def gx0027_problems(source: str) -> list[str]:
+    """Shape lock for GX-0027: one pure-addition hunk in CloseConfirmationDialog.present."""
+    try:
+        upstream, hunks = marked_hunks(source, GX0027)
+    except ValueError as err:
+        return [str(err)]
+    problems: list[str] = []
+    if "fork(gx)" in upstream:
+        problems.append(f"{CLOSE_DIALOG_ZIG} carries fork(gx) markers outside the {GX0027} hunk")
+    if len(hunks) != 1:
+        return [*problems, f"expected one {GX0027} hunk, found {len(hunks)}"]
+    lines = source.splitlines()
+    begin, end = hunks[0]
+    if squash(GX0027_CALL) not in squash("\n".join(lines[begin + 1:end])):
+        problems.append(f"the {GX0027} hunk must call {GX0027_CALL!r}")
+    after = [i for i, line in enumerate(lines) if line.strip() == GX0027_AFTER]
+    before = [i for i, line in enumerate(lines) if line.strip() == GX0027_BEFORE]
+    if len(after) != 1 or len(before) != 1 or not after[0] < begin < end < before[0]:
+        problems.append(f"the {GX0027} hunk must sit between {GX0027_AFTER!r} and {GX0027_BEFORE!r}")
+    return problems
+
+
 def css_call_args(css: str, paren: int) -> list[str]:
     """Top-level, comma-separated arguments of the call whose '(' is at ``paren``."""
     args: list[str] = []
@@ -684,6 +712,32 @@ class Gx0002ShapeTests(unittest.TestCase):
         crlf = self.source.replace("\n", "\r\n")
         self.assertEqual(gx0002_problems(crlf), [])
         self.assertEqual(marked_hunks(crlf, GX0002)[0].replace("\r\n", "\n"), self.upstream)
+
+
+class Gx0027ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / CLOSE_DIALOG_ZIG).read_text(encoding="utf-8")
+        cls.lines = cls.source.splitlines(keepends=True)
+        cls.upstream, cls.hunks = marked_hunks(cls.source, GX0027)
+
+    def test_close_dialog_keeps_the_hunk(self):
+        self.assertEqual(gx0027_problems(self.source), [])
+        self.assertEqual(gx0027_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_hunk_is_the_only_change_against_merged_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, CLOSE_DIALOG_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        self.assertEqual(self.upstream.replace("\r\n", "\n"), upstream)
+
+    def test_missing_or_moved_hunk_is_rejected(self):
+        self.assertIn(f"expected one {GX0027} hunk, found 0", gx0027_problems(self.upstream))
+        begin, end = self.hunks[0]
+        rest = self.lines[:begin] + self.lines[end + 1:]
+        at = next(i for i, line in enumerate(rest) if line.strip() == GX0027_BEFORE) + 1
+        moved = "".join(rest[:at] + self.lines[begin:end + 1] + rest[at:])
+        self.assertTrue(any("must sit between" in p for p in gx0027_problems(moved)))
 
 
 class HunkTests(unittest.TestCase):
