@@ -1,18 +1,24 @@
 //! The Ghostty GX keyboard shortcuts cheat sheet: an `Adw.Dialog` that
-//! lists the keybindings of the configuration by category (see
-//! `shortcuts.zig`) with a search field. Built in code, in the current UI
-//! language, each time it is opened.
+//! lists the keybindings of the configuration by category and key table
+//! (`shortcuts.zig`). Each action shows up to two key sequences as keycaps,
+//! modifiers in the `gx.shortcuts` order, and folds the others into "+N".
+//! The search field filters by title, with pinyin initials, and by keys
+//! (`gx.shortcuts.Search`); Escape clears it, or closes the sheet when it
+//! is empty. Built in code, in the current UI language, each time it opens.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const adw = @import("adw");
-const glib = @import("glib");
+const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const input = @import("../../../input.zig");
 const gx = @import("../../../gx/main.zig");
-const key = @import("../key.zig");
+const Common = @import("../class.zig").Common;
 const shortcuts = @import("shortcuts.zig");
+
+const sheet = gx.shortcuts;
+const Trigger = input.Binding.Trigger;
 
 const log = std.log.scoped(.gtk_gx_shortcuts);
 const tr = gx.i18n.tr;
@@ -28,21 +34,25 @@ pub fn present(alloc: Allocator, config: *const configpkg.Config, parent: *gtk.W
     };
 }
 
-/// What the search filter needs; freed with the search entry.
+/// What the search needs; freed with the search entry.
 const State = struct {
     alloc: Allocator,
     arena: std.heap.ArenaAllocator,
+    dialog: *adw.Dialog = undefined,
+    page: *adw.PreferencesPage = undefined,
+    stack: *gtk.Stack = undefined,
     groups: std.ArrayList(*gtk.Widget) = .empty,
+    group_visible: []bool = &.{},
     rows: std.ArrayList(Row) = .empty,
-    page: *gtk.Widget = undefined,
-    empty: *gtk.Widget = undefined,
 
     const Row = struct {
         widget: *gtk.Widget,
         group: usize,
 
-        /// Everything the row matches, lowercased.
-        haystack: []const u8,
+        /// The title in the UI language and in English, and the actions
+        /// in configuration syntax.
+        titles: [3][]const u8,
+        sequences: []const []const Trigger,
     };
 
     fn destroy(self: *State) void {
@@ -57,47 +67,65 @@ const State = struct {
 
 fn build(state: *State, config: *const configpkg.Config, parent: *gtk.Widget) Allocator.Error!void {
     const arena = state.arena.allocator();
-    const rows = try shortcuts.collect(arena, &config.keybind.set);
+    const commands = config.@"command-palette-entry".value.items;
+    const all = try shortcuts.sections(arena, &config.keybind);
 
     const page = adw.PreferencesPage.new();
-    var current: ?shortcuts.Category = null;
-    var group: *adw.PreferencesGroup = undefined;
-    for (rows) |row| {
-        if (current != row.category) {
-            current = row.category;
-            group = adw.PreferencesGroup.new();
-            group.setTitle(trRuntime(row.category.title()));
-            page.add(group);
-            try state.groups.append(arena, group.as(gtk.Widget));
+    for (all) |section| {
+        const group = adw.PreferencesGroup.new();
+        group.setTitle(try sectionTitle(arena, section));
+        page.add(group);
+        try state.groups.append(arena, group.as(gtk.Widget));
+        for (section.rows) |row| {
+            const built = try buildRow(arena, row, commands);
+            group.add(built.widget);
+            try state.rows.append(arena, .{
+                .widget = built.widget,
+                .group = state.groups.items.len - 1,
+                .titles = built.titles,
+                .sequences = row.sequences,
+            });
         }
-        const widget = try buildRow(arena, row);
-        group.add(widget.widget);
-        try state.rows.append(arena, .{
-            .widget = widget.widget,
-            .group = state.groups.items.len - 1,
-            .haystack = widget.haystack,
-        });
     }
+    state.group_visible = try arena.alloc(bool, state.groups.items.len);
+    state.page = page;
 
-    const empty = gtk.Label.new(tr("No results"));
-    empty.as(gtk.Widget).addCssClass("dim-label");
-    empty.as(gtk.Widget).setVexpand(1);
-    empty.as(gtk.Widget).setVisible(@intFromBool(rows.len == 0));
-    state.page = page.as(gtk.Widget);
-    state.empty = empty.as(gtk.Widget);
+    const empty = adw.StatusPage.new();
+    empty.setIconName("edit-find-symbolic");
+    empty.setTitle(tr("No results"));
 
-    const content = gtk.Box.new(.vertical, 0);
-    page.as(gtk.Widget).setVexpand(1);
-    page.as(gtk.Widget).setVisible(@intFromBool(rows.len > 0));
-    content.append(page.as(gtk.Widget));
-    content.append(empty.as(gtk.Widget));
+    const stack = gtk.Stack.new();
+    _ = stack.addNamed(page.as(gtk.Widget), "list");
+    _ = stack.addNamed(empty.as(gtk.Widget), "empty");
+    stack.setVisibleChildName(if (state.rows.items.len > 0) "list" else "empty");
+    state.stack = stack;
 
+    // The clamp lines the search field up with the groups, which the
+    // preferences page clamps the same way.
     const search = gtk.SearchEntry.new();
     search.setPlaceholderText(tr("Search keyboard shortcuts…"));
     search.as(gtk.Widget).setHexpand(1);
     search.as(gtk.Widget).setMarginStart(12);
     search.as(gtk.Widget).setMarginEnd(12);
     search.as(gtk.Widget).setMarginBottom(6);
+    const search_clamp = adw.Clamp.new();
+    search_clamp.setChild(search.as(gtk.Widget));
+
+    const header = adw.HeaderBar.new();
+    header.setTitleWidget(adw.WindowTitle.new(tr("Keyboard Shortcuts"), "").as(gtk.Widget));
+
+    const toolbar = adw.ToolbarView.new();
+    toolbar.addTopBar(header.as(gtk.Widget));
+    toolbar.addTopBar(search_clamp.as(gtk.Widget));
+    toolbar.setContent(stack.as(gtk.Widget));
+
+    const dialog = adw.Dialog.new();
+    dialog.setTitle(tr("Keyboard Shortcuts"));
+    dialog.setContentWidth(680);
+    dialog.setContentHeight(560);
+    dialog.setChild(toolbar.as(gtk.Widget));
+    state.dialog = dialog;
+
     _ = gtk.SearchEntry.signals.search_changed.connect(
         search,
         *State,
@@ -105,120 +133,173 @@ fn build(state: *State, config: *const configpkg.Config, parent: *gtk.Widget) Al
         state,
         .{ .destroyData = State.destroyData },
     );
-
-    const header = adw.HeaderBar.new();
-    header.setTitleWidget(adw.WindowTitle.new(tr("Keyboard Shortcuts"), "").as(gtk.Widget));
-
-    const toolbar = adw.ToolbarView.new();
-    toolbar.addTopBar(header.as(gtk.Widget));
-    toolbar.addTopBar(search.as(gtk.Widget));
-    toolbar.setContent(content.as(gtk.Widget));
-
-    const dialog = adw.Dialog.new();
-    dialog.setTitle(tr("Keyboard Shortcuts"));
-    dialog.setContentWidth(640);
-    dialog.setContentHeight(560);
-    dialog.setChild(toolbar.as(gtk.Widget));
+    _ = gtk.SearchEntry.signals.stop_search.connect(search, *State, stopSearch, state, .{});
     search.setKeyCaptureWidget(dialog.as(gtk.Widget));
+
     dialog.present(parent);
     _ = search.as(gtk.Widget).grabFocus();
 }
 
+fn sectionTitle(arena: Allocator, section: shortcuts.Section) Allocator.Error![:0]const u8 {
+    const msgid = shortcuts.sectionTitle(section);
+    return switch (section.kind) {
+        .category => trRuntime(msgid),
+        .table => |name| try fillZ(arena, trRuntime(msgid), .{ .name = name }),
+    };
+}
+
 const BuiltRow = struct {
     widget: *gtk.Widget,
-    haystack: []const u8,
+    titles: [3][]const u8,
 };
 
-fn buildRow(arena: Allocator, row: shortcuts.Row) Allocator.Error!BuiltRow {
-    var haystack: std.Io.Writer.Allocating = .init(arena);
-    const hay = &haystack.writer;
-
-    var formatted: std.Io.Writer.Allocating = .init(arena);
-    for (row.actions, 0..) |action, i| {
-        if (i > 0) formatted.writer.writeAll(", ") catch return error.OutOfMemory;
-        formatted.writer.print("{f}", .{action}) catch return error.OutOfMemory;
-    }
-    const actions_text = try formatted.toOwnedSliceSentinel(0);
+fn buildRow(arena: Allocator, row: sheet.Row, commands: []const input.Command) Allocator.Error!BuiltRow {
+    const text = try arena.dupeZ(u8, row.text);
+    var titles: [3][]const u8 = .{ "", "", text };
 
     const widget = adw.ActionRow.new();
     widget.as(adw.PreferencesRow).setUseMarkup(0);
-    const msgid = shortcuts.title(row.actions[0], actions_text);
-    if (msgid) |id| {
-        const title = trRuntime(id);
-        widget.as(adw.PreferencesRow).setTitle(title);
-        widget.setSubtitle(actions_text);
-        hay.print("{s}\n", .{title}) catch return error.OutOfMemory;
+    if (try shortcuts.title(arena, row, commands)) |found| {
+        const translated = try titleText(arena, trRuntime(found.msgid), tr("{title}: {argument}"), found.argument);
+        titles[0] = translated;
+        titles[1] = try titleText(arena, found.msgid, "{title}: {argument}", found.argument);
+        widget.as(adw.PreferencesRow).setTitle(translated);
+        widget.setSubtitle(text);
     } else {
-        widget.as(adw.PreferencesRow).setTitle(actions_text);
+        widget.as(adw.PreferencesRow).setTitle(text);
     }
-    hay.print("{s}\n{s}\n", .{ actions_text, trRuntime(row.category.title()) }) catch
-        return error.OutOfMemory;
-
-    const keys = gtk.Box.new(.vertical, 4);
-    keys.as(gtk.Widget).setValign(.center);
-    for (row.sequences.items) |sequence| {
-        keys.append(try buildSequence(arena, sequence, hay));
-    }
-    widget.addSuffix(keys.as(gtk.Widget));
-
-    const text = haystack.written();
-    for (text) |*ch| ch.* = std.ascii.toLower(ch.*);
-    return .{ .widget = widget.as(gtk.Widget), .haystack = text };
+    widget.addSuffix(try keysWidget(arena, row.sequences));
+    return .{ .widget = widget.as(gtk.Widget), .titles = titles };
 }
 
-/// One key sequence: the keys as keycaps, leader keys first.
-fn buildSequence(
+fn titleText(
     arena: Allocator,
-    sequence: []const input.Binding.Trigger,
-    hay: *std.Io.Writer,
-) Allocator.Error!*gtk.Widget {
-    const box = gtk.Box.new(.horizontal, 6);
-    box.as(gtk.Widget).setHalign(.end);
-    for (sequence, 0..) |trigger, i| {
-        if (i > 0) {
-            const next = gtk.Label.new("›");
-            next.as(gtk.Widget).addCssClass("dim-label");
-            box.append(next.as(gtk.Widget));
-        }
+    title: [:0]const u8,
+    template: []const u8,
+    argument: ?[]const u8,
+) Allocator.Error![:0]const u8 {
+    const arg = argument orelse return title;
+    return try fillZ(arena, template, .{ .title = title, .argument = arg });
+}
 
-        var label_buf: [128]u8 = undefined;
-        var label_writer: std.Io.Writer = .fixed(&label_buf);
-        const has_label = key.labelFromTrigger(&label_writer, trigger) catch false;
-        const label = if (has_label) label_writer.buffered() else "?";
-        hay.print("{s} ", .{label}) catch return error.OutOfMemory;
-
-        var accel_buf: [128]u8 = undefined;
-        const accel = key.accelFromTrigger(&accel_buf, trigger) catch null;
-        if (accel) |value| {
-            box.append(gtk.ShortcutLabel.new(value).as(gtk.Widget));
-        } else {
-            const text = try arena.dupeZ(u8, label);
-            const fallback = gtk.Label.new(text);
-            fallback.as(gtk.Widget).addCssClass("monospace");
-            box.append(fallback.as(gtk.Widget));
-        }
+/// The first key sequences of a row side by side, then "+N" for the
+/// others, which its tooltip lists.
+fn keysWidget(arena: Allocator, sequences: []const []const Trigger) Allocator.Error!*gtk.Widget {
+    const box = gtk.Box.new(.horizontal, 12);
+    box.as(gtk.Widget).setValign(.center);
+    const shown = @min(sequences.len, shortcuts.shown_sequences);
+    for (sequences[0..shown], 0..) |sequence, i| {
+        if (i > 0) box.append(dimLabel("/"));
+        box.append(try sequenceWidget(arena, sequence));
     }
-    hay.writeByte('\n') catch return error.OutOfMemory;
+    if (sequences.len > shown) {
+        const more = dimLabel(try std.fmt.allocPrintSentinel(arena, "+{d}", .{sequences.len - shown}, 0));
+        more.setTooltipText(try sequencesText(arena, sequences[shown..]));
+        box.append(more);
+    }
     return box.as(gtk.Widget);
 }
 
-fn searchChanged(entry: *gtk.SearchEntry, state: *State) callconv(.c) void {
-    var needle_buf: [256]u8 = undefined;
-    const text = std.mem.span(entry.as(gtk.Editable).getText());
-    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
-    const needle = std.ascii.lowerString(&needle_buf, trimmed[0..@min(trimmed.len, needle_buf.len)]);
+/// A key sequence: the keycaps of each step, leader keys first.
+fn sequenceWidget(arena: Allocator, sequence: []const Trigger) Allocator.Error!*gtk.Widget {
+    if (sequence.len == 1) return try keycapsWidget(arena, sequence[0]);
+    const box = gtk.Box.new(.horizontal, 6);
+    for (sequence, 0..) |trigger, i| {
+        if (i > 0) box.append(dimLabel("›"));
+        box.append(try keycapsWidget(arena, trigger));
+    }
+    return box.as(gtk.Widget);
+}
 
+fn keycapsWidget(arena: Allocator, trigger: Trigger) Allocator.Error!*gtk.Widget {
+    const caps: sheet.Keycaps = .init(trigger, .gtk);
+    const keycaps = gobject.ext.newInstance(Keycaps, .{});
+    const box = keycaps.as(gtk.Box);
+    box.setSpacing(6);
+    for (0..caps.count()) |i| {
+        if (i > 0) box.append(dimLabel("+"));
+        const label = gtk.Label.new(try arena.dupeZ(u8, caps.get(i)));
+        label.as(gtk.Widget).addCssClass("keycap");
+        box.append(label.as(gtk.Widget));
+    }
+    return keycaps.as(gtk.Widget);
+}
+
+fn sequencesText(arena: Allocator, sequences: []const []const Trigger) Allocator.Error![:0]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (sequences, 0..) |sequence, i| {
+        if (i > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;
+        sheet.writeSequence(&out.writer, sequence, .gtk, " › ") catch return error.OutOfMemory;
+    }
+    return try out.toOwnedSliceSentinel(0);
+}
+
+/// `gx.i18n.format` into a new string for GTK.
+fn fillZ(arena: Allocator, template: []const u8, args: anytype) Allocator.Error![:0]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    gx.i18n.format(&out.writer, template, args) catch return error.OutOfMemory;
+    return try out.toOwnedSliceSentinel(0);
+}
+
+fn dimLabel(text: [:0]const u8) *gtk.Widget {
+    const label = gtk.Label.new(text);
+    label.as(gtk.Widget).addCssClass("dim-label");
+    return label.as(gtk.Widget);
+}
+
+fn searchChanged(entry: *gtk.SearchEntry, state: *State) callconv(.c) void {
+    const search: sheet.Search = .init(std.mem.span(entry.as(gtk.Editable).getText()));
+    @memset(state.group_visible, false);
     var visible_rows: usize = 0;
-    var group_visible = [_]bool{false} ** @typeInfo(shortcuts.Category).@"enum".fields.len;
     for (state.rows.items) |row| {
-        const visible = needle.len == 0 or std.mem.indexOf(u8, row.haystack, needle) != null;
+        const visible = search.score(&row.titles, row.sequences) != null;
         row.widget.setVisible(@intFromBool(visible));
         if (visible) {
             visible_rows += 1;
-            group_visible[row.group] = true;
+            state.group_visible[row.group] = true;
         }
     }
-    for (state.groups.items, 0..) |group, i| group.setVisible(@intFromBool(group_visible[i]));
-    state.page.setVisible(@intFromBool(visible_rows > 0));
-    state.empty.setVisible(@intFromBool(visible_rows == 0));
+    for (state.groups.items, state.group_visible) |group, visible| group.setVisible(@intFromBool(visible));
+    state.stack.setVisibleChildName(if (visible_rows > 0) "list" else "empty");
+    state.page.scrollToTop();
 }
+
+/// Escape clears the search, or closes the sheet when there is nothing to
+/// clear.
+fn stopSearch(entry: *gtk.SearchEntry, state: *State) callconv(.c) void {
+    const editable = entry.as(gtk.Editable);
+    if (std.mem.span(editable.getText()).len > 0) {
+        editable.setText("");
+        return;
+    }
+    _ = state.dialog.close();
+}
+
+/// The keycaps of one key combination. Its CSS name is `shortcut`, so
+/// libadwaita styles the `.keycap` labels as in a `Gtk.ShortcutLabel`,
+/// whose modifier order would differ from `gx.shortcuts`.
+const Keycaps = extern struct {
+    const Self = @This();
+    parent_instance: Parent,
+    pub const Parent = gtk.Box;
+    pub const getGObjectType = gobject.ext.defineClass(Self, .{
+        .name = "GhosttyGxKeycaps",
+        .classInit = &Class.init,
+        .parent_class = &Class.parent,
+    });
+
+    const C = Common(Self, null);
+    pub const as = C.as;
+
+    pub const Class = extern struct {
+        parent_class: Parent.Class,
+        var parent: *Parent.Class = undefined;
+        pub const Instance = Self;
+
+        fn init(class: *Class) callconv(.c) void {
+            gtk.Widget.Class.setCssName(class.as(gtk.Widget.Class), "shortcut");
+        }
+
+        pub const as = C.Class.as;
+    };
+};
