@@ -389,15 +389,22 @@ pub fn run(self: *App) !void {
 
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
-    const window = try alloc.create(Window);
-    errdefer alloc.destroy(window);
-    try window.init(self, .{});
-    // The OpenGL device may probe until now, in parallel with the above.
-    self.settleDevice(window) catch |err| {
-        window.deinit();
-        return err;
+    const window = window: {
+        const window = try alloc.create(Window);
+        errdefer alloc.destroy(window);
+        var initialized = false;
+        errdefer if (initialized) window.deinit();
+        try window.init(self, .{});
+        initialized = true;
+        if (try self.settleDevice()) {
+            window.deinit();
+            initialized = false;
+            try window.init(self, .{});
+            initialized = true;
+        }
+        try self.windows.append(alloc, window);
+        break :window window;
     };
-    try self.windows.append(alloc, window);
     _ = try window.addTab();
     self.scheduleShortcutProbe();
 
@@ -469,30 +476,23 @@ fn expectAlphaFrames(alloc: Allocator) bool {
     return !std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " "), "software");
 }
 
-/// Wait for the OpenGL device (`wgl.Device.wait`) once the first window
-/// exists, and act on what it found. Without OpenGL nothing can render:
-/// the app says so and fails. When per-pixel translucency is not what
-/// `init` guessed, the configuration is loaded again for it and `window`,
-/// which shows nothing yet, is made anew.
-fn settleDevice(self: *App, window: *Window) !void {
+/// Wait on the GUI thread after the first hidden window exists, before
+/// creating any surface or taking renderer locks. Reports missing OpenGL;
+/// returns true when the window must be rebuilt with the settled opacity.
+fn settleDevice(self: *App) !bool {
     self.core_app.device.wait() catch |err| {
         reportOpenGLUnavailable();
         return err;
     };
     const supported = Backdrop.alphaFramesSupported(&self.core_app.device);
-    if (supported == self.alpha_frames) return;
+    if (supported == self.alpha_frames) return false;
     log.info("per-pixel translucency={} unlike guessed, loading the configuration again", .{supported});
     self.alpha_frames = supported;
     gx.config_layers.setMaterialOpacity(supported);
-    if (Config.load(self.core_app.alloc)) |loaded| {
-        var config = loaded;
-        defer config.deinit();
-        self.core_app.updateConfig(self, &config) catch |err| {
-            log.err("config update error: {}", .{err});
-        };
-    } else |err| log.err("failed to reload config: {}", .{err});
-    window.deinit();
-    try window.init(self, .{});
+    var config = try Config.load(self.core_app.alloc);
+    defer config.deinit();
+    try self.core_app.updateConfig(self, &config);
+    return true;
 }
 
 /// Without OpenGL nothing renders, and there is no window to say so in.

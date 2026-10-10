@@ -86,37 +86,55 @@ pub const Device = struct {
 
     /// The probe thread, until `wait` or `deinit` joins it.
     thread: ?std.Thread = null,
+    owner_thread: std.Thread.Id,
 
     pub const State = enum(u32) { probing, ready, unavailable };
 
+    const tw_spawn = @import("../../tripwire.zig").module(enum { spawn }, std.Thread.SpawnError);
+
     /// Start choosing the OpenGL implementation on a thread of its own.
-    /// `wait` reports the outcome; the methods that need it wait for it.
+    /// `wait` reports probe and thread-start failures after the apprt is ready.
     pub fn init(self: *Device, alloc: Allocator) error{OpenGLUnavailable}!void {
         _ = alloc;
-        self.* = .{};
-        self.thread = std.Thread.spawn(.{}, probeThread, .{self}) catch |err| {
+        self.* = .{ .owner_thread = std.Thread.getCurrentId() };
+        self.thread = self.spawnProbe() catch |err| {
             self.state.store(.unavailable, .release);
             log.warn("cannot start a thread for the OpenGL probe err={}", .{err});
-            return error.OpenGLUnavailable;
+            return;
         };
     }
 
+    fn spawnProbe(self: *Device) std.Thread.SpawnError!std.Thread {
+        try tw_spawn.check(.spawn);
+        return std.Thread.spawn(.{}, probeThread, .{self});
+    }
+
     pub fn deinit(self: *Device) void {
+        self.assertOwnerThread();
         if (self.thread) |thread| thread.join();
         if (self.state.load(.acquire) == .ready) _ = FreeLibrary(self.lib.module);
         self.* = undefined;
     }
 
-    /// Wait until the OpenGL implementation is chosen. Main thread.
+    /// Wait until the OpenGL implementation is chosen, on the initializing
+    /// GUI thread, outside core callbacks and without holding renderer locks.
+    /// The probe owns its hidden window and never waits for the GUI thread.
     /// `error.OpenGLUnavailable` when there is no usable one: the app
     /// cannot render anything then, and the apprt tells the user.
     pub fn wait(self: *Device) error{OpenGLUnavailable}!void {
+        self.assertOwnerThread();
         const state = self.awaitProbe();
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
         if (state != .ready) return error.OpenGLUnavailable;
+    }
+
+    fn assertOwnerThread(self: *const Device) void {
+        if (std.Thread.getCurrentId() != self.owner_thread) {
+            @panic("WGL device wait and deinit must run on the initializing thread");
+        }
     }
 
     /// The outcome of the probe, blocking until there is one. Any thread.
@@ -1071,7 +1089,7 @@ test parseVersion {
 
 test "Device.backend reports what the probe saw" {
     const testing = std.testing;
-    var device: Device = .{ .state = .init(.ready) };
+    var device: Device = .{ .state = .init(.ready), .owner_thread = std.Thread.getCurrentId() };
     device.lib.software = true;
     device.lib.alpha = false;
     device.lib.version = .{ .major = 4, .minor = 5 };
@@ -1105,7 +1123,7 @@ test "Device.wait publishes a completed probe and joins once" {
             global.io().futexWake(Device.State, &device.state.raw, std.math.maxInt(u32));
         }
     };
-    var device: Device = .{};
+    var device: Device = .{ .owner_thread = std.Thread.getCurrentId() };
     device.thread = try std.Thread.spawn(.{}, Probe.finish, .{&device});
     defer if (device.thread) |thread| thread.join();
     try device.wait();
@@ -1126,7 +1144,7 @@ test "Device.wait waits for the probe thread and reports a missing OpenGL" {
             global.io().futexWake(Device.State, &device.state.raw, std.math.maxInt(u32));
         }
     };
-    var device: Device = .{};
+    var device: Device = .{ .owner_thread = std.Thread.getCurrentId() };
     device.thread = try std.Thread.spawn(.{}, Probe.finish, .{&device});
 
     try testing.expectEqual(Device.AlphaFrames.no_alpha_channel, device.alphaFrames());
@@ -1138,6 +1156,41 @@ test "Device.wait waits for the probe thread and reports a missing OpenGL" {
     try testing.expectError(error.OpenGLUnavailable, device.wait());
     try testing.expectError(error.OpenGLUnavailable, device.setPixelFormat(&hdc));
     device.deinit();
+}
+
+test "Device.init defers probe thread startup failures to wait" {
+    const testing = std.testing;
+    for ([_]std.Thread.SpawnError{ error.ThreadQuotaExceeded, error.SystemResources, error.OutOfMemory }) |err| {
+        Device.tw_spawn.errorAlways(.spawn, err);
+        defer Device.tw_spawn.reset();
+        var device: Device = undefined;
+        try device.init(testing.allocator);
+        defer device.deinit();
+        try Device.tw_spawn.end(.reset);
+        try testing.expectEqual(std.Thread.getCurrentId(), device.owner_thread);
+        try testing.expectEqual(Device.State.unavailable, device.state.load(.acquire));
+        try testing.expect(device.thread == null);
+        try testing.expectError(error.OpenGLUnavailable, device.wait());
+        try testing.expectError(error.OpenGLUnavailable, device.wait());
+    }
+}
+
+test "Device accessors wait from another thread without taking join ownership" {
+    const testing = std.testing;
+    const Reader = struct {
+        fn read(device: *Device, thread_differs: *bool) void {
+            thread_differs.* = std.Thread.getCurrentId() != device.owner_thread;
+            _ = device.backend();
+            _ = device.alphaFrames();
+        }
+    };
+    var device: Device = .{ .state = .init(.unavailable), .owner_thread = std.Thread.getCurrentId() };
+    defer device.deinit();
+    var thread_differs = false;
+    device.thread = try std.Thread.spawn(.{}, Reader.read, .{ &device, &thread_differs });
+    try testing.expectError(error.OpenGLUnavailable, device.wait());
+    try testing.expect(thread_differs);
+    try testing.expect(device.thread == null);
 }
 
 test "frameBlit and edgeFills cover the window once" {
