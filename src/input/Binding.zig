@@ -1018,11 +1018,34 @@ pub const Action = union(enum) {
     ///
     ///     Open a new window with the launch profile `<id>`.
     ///
+    ///   - `settings_page:<page>`
+    ///
+    ///     Open the Ghostty GX settings at a page: `language`, `appearance`,
+    ///     `font`, `interaction`, `shell` or `about`.
+    ///
+    ///   - `new_tab_menu`
+    ///
+    ///     Open the new tab menu with the launch profiles.
+    ///
+    ///   - `context_menu`
+    ///
+    ///     Open the context menu of the focused terminal at the cursor.
+    ///
+    ///   - `move_split_to_tab`, `move_split_to_window`
+    ///
+    ///     Move the focused split into a new tab or a new window.
+    ///
+    ///   - `tab_switcher`
+    ///
+    ///     Search the tabs of the window and switch to one, the most
+    ///     recently used first.
+    ///
     /// For example: `keybind = ctrl+shift+m=gx:main_menu`.
     ///
-    /// GX actions are performed by app runtimes that implement them (the
-    /// Windows app). Elsewhere they are not performed, so a binding with the
-    /// `performable:` prefix passes its key on to the terminal.
+    /// GX actions are performed by the app runtimes that implement them.
+    /// An action an app runtime does not implement is not performed, so a
+    /// binding with the `performable:` prefix passes its key on to the
+    /// terminal.
     gx: gx_action.Action,
     // fork(gx): GX-0014 end
 

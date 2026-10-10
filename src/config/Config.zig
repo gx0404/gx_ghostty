@@ -4092,9 +4092,10 @@ term: []const u8 = "xterm-ghostty",
 ///
 /// If no names are set, a built-in list of shells and console helpers is
 /// used: `cmd.exe`, `pwsh.exe`, `powershell.exe`, `zsh`, `bash`, `sh`,
-/// `fish`, `nu`, `gx-zsh`, `wsl.exe`, `wslhost.exe`, `conhost.exe`,
-/// `OpenConsole.exe`, `gitstatusd*` and `env.exe`. Setting any name
-/// replaces the whole built-in list, and an empty value restores it.
+/// `fish`, `nu`, `gx-zsh`, `wsl.exe`, `env.exe`, `wslhost.exe`,
+/// `wslrelay.exe`, `conhost.exe`, `OpenConsole.exe` and `gitstatusd*`.
+/// Setting any name replaces the whole built-in list, and an empty value
+/// restores it.
 ///
 /// Available since Ghostty GX 0.0.1.
 @"gx-idle-processes": RepeatableString = .{},
@@ -4110,6 +4111,20 @@ term: []const u8 = "xterm-ghostty",
 ///
 /// Available since Ghostty GX 0.0.1.
 @"gx-open-config-ui": gx_config_types.OpenConfigUi = .settings,
+
+/// Whether turning the mouse wheel with Ctrl held, or pinching on a
+/// touchpad, changes the font size of the terminal under the pointer, one
+/// step per notch of the wheel, like the `increase_font_size` and
+/// `decrease_font_size` actions.
+///
+/// When this is `false`, the wheel scrolls with Ctrl held as it does
+/// without it, and programs that use the mouse receive the Ctrl modifier.
+///
+/// The default is `true`.
+///
+/// Windows only.
+/// Available since Ghostty GX 0.0.3.
+@"gx-ctrl-scroll-zoom": bool = true,
 // fork(gx): GX-0010 end
 
 /// This is set by the CLI parser for deinit.
