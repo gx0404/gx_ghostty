@@ -82,6 +82,11 @@ pub fn confirmCloseTab(owner: ?w32.HWND, processes: []const []const u8) Choice {
     return confirmClose(owner, .tab, processes, &.{});
 }
 
+/// `confirmCloseTab` listing the processes under the tab title.
+pub fn confirmCloseTabWithTitle(owner: ?w32.HWND, group: ProcessGroup) Choice {
+    return confirmClose(owner, .tab, &.{}, &.{group});
+}
+
 /// Closing several tabs (the other tabs, the tabs to the right) while a
 /// process in one of them is running.
 pub fn confirmCloseTabs(owner: ?w32.HWND, processes: []const []const u8) Choice {
