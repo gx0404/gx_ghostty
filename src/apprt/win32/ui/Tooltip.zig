@@ -10,6 +10,10 @@
 //! when that returns true it looks up the text and the rectangle of
 //! `target` and calls `show`. `hide` the tooltip when the part goes away
 //! and `destroy` it with the owner.
+//!
+//! The delay is the one of the system's tooltips (`delayFor`): the
+//! double-click time before the first tooltip, a fifth of it when the
+//! pointer moves on to a neighbor while a tooltip shows or just showed.
 const std = @import("std");
 const App = @import("../App.zig");
 const w32 = @import("../win32.zig");
@@ -22,8 +26,26 @@ const log = std.log.scoped(.win32_tooltip);
 /// The delay timer, on the owner window.
 pub const timer_id: usize = 0x5454; // 'TT'
 
-/// Hover time before a tooltip shows.
-pub const delay_ms: u32 = 600;
+/// Hover time before a first tooltip shows when the system reports no
+/// double-click time (the Windows default).
+pub const delay_ms: u32 = 500;
+
+/// The hover delay before a tooltip shows, as the system's tooltips have
+/// it (`TTDT_INITIAL`, `TTDT_RESHOW`): `initial_ms` (the double-click
+/// time), or a fifth of it when a tooltip of another target shows or
+/// showed less than `initial_ms` ago (`last_shown_ms`; times in ms on one
+/// clock), so moving along a row of buttons does not wait the full delay
+/// at each.
+pub fn delayFor(initial_ms: u32, now_ms: u64, last_shown_ms: ?u64) u32 {
+    const recent = if (last_shown_ms) |t| now_ms -| t < initial_ms else false;
+    return if (recent) @max(initial_ms / 5, 1) else initial_ms;
+}
+
+/// The first-tooltip delay: the double-click time.
+fn initialDelay() u32 {
+    const value = GetDoubleClickTime();
+    return if (value == 0) delay_ms else value;
+}
 
 pub fn Tooltip(comptime Target: type) type {
     return struct {
@@ -35,6 +57,9 @@ pub fn Tooltip(comptime Target: type) type {
         text_buf: [512]u8 = undefined,
         text_len: usize = 0,
         tokens: ?style.Tokens = null,
+        timer_owner: ?w32.HWND = null,
+        /// When the tooltip last hid after showing (GetTickCount64).
+        hidden_ms: ?u64 = null,
 
         const font_size: f32 = 12;
         const pad_x: f32 = 8;
@@ -46,31 +71,37 @@ pub fn Tooltip(comptime Target: type) type {
         }
 
         pub fn hide(self: *Self) void {
+            if (self.timer_owner) |owner| _ = w32.KillTimer(owner, timer_id);
+            self.timer_owner = null;
+            self.target = .none;
+            if (self.popup.visible) self.hidden_ms = GetTickCount64();
             self.popup.hide();
         }
 
         pub fn destroy(self: *Self) void {
+            self.hide();
             self.popup.destroy();
-            self.target = .none;
         }
 
-        /// Point the tooltip at `target`, the part of `owner` under the
-        /// pointer (`.none` for nothing). When it changed, the tooltip
-        /// hides and shows for the new target after `delay_ms`.
+        /// Point the tooltip at `target`, hiding the old target and starting
+        /// its hover delay (`delayFor`). Hiding also cancels a pending delay.
         pub fn setTarget(self: *Self, owner: w32.HWND, target: Target) void {
             if (std.meta.eql(target, self.target)) return;
-            self.target = target;
+            const now = GetTickCount64();
+            const last_shown = if (self.visible()) now else self.hidden_ms;
             self.hide();
-            _ = w32.KillTimer(owner, timer_id);
-            if (target != .none) _ = w32.SetTimer(owner, timer_id, delay_ms, null);
+            self.target = target;
+            if (target != .none and w32.SetTimer(owner, timer_id, delayFor(initialDelay(), now, last_shown), null) != 0) {
+                self.timer_owner = owner;
+            }
         }
 
-        /// Whether the WM_TIMER `id` of `owner` is the delay `setTarget`
-        /// started, which it stops; show the tooltip of `target` then.
+        /// Whether WM_TIMER belongs to the tooltip delay. Canceled or stale
+        /// timers are consumed without showing a target.
         pub fn delayElapsed(self: *Self, owner: w32.HWND, id: usize) bool {
-            _ = self;
             if (id != timer_id) return false;
             _ = w32.KillTimer(owner, timer_id);
+            self.timer_owner = null;
             return true;
         }
 
@@ -105,7 +136,10 @@ pub fn Tooltip(comptime Target: type) type {
                 self.popup.setBorderColor(tokens.border);
             }
 
-            const len = @min(value.len, self.text_buf.len);
+            var len = @min(value.len, self.text_buf.len);
+            if (len < value.len) {
+                while (len > 0 and value[len] & 0xc0 == 0x80) : (len -= 1) {}
+            }
             @memcpy(self.text_buf[0..len], value[0..len]);
             self.text_len = len;
 
@@ -148,4 +182,33 @@ pub fn Tooltip(comptime Target: type) type {
             canvas.drawText(self.text(), r.inset(pad_x, pad_y), textStyle(tokens));
         }
     };
+}
+
+extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+test delayFor {
+    const testing = std.testing;
+    // The first tooltip waits the double-click time.
+    try testing.expectEqual(@as(u32, 500), delayFor(500, 10_000, null));
+    // Moving on while one shows, or soon after it hid: a fifth.
+    try testing.expectEqual(@as(u32, 100), delayFor(500, 10_000, 10_000));
+    try testing.expectEqual(@as(u32, 100), delayFor(500, 10_000, 9_600));
+    // Long after: the full delay again.
+    try testing.expectEqual(@as(u32, 500), delayFor(500, 10_000, 9_500));
+    try testing.expectEqual(@as(u32, 500), delayFor(500, 10_000, 2_000));
+    // A clock that went backwards counts as recent; tiny delays stay positive.
+    try testing.expectEqual(@as(u32, 100), delayFor(500, 10_000, 12_000));
+    try testing.expectEqual(@as(u32, 1), delayFor(3, 10, 10));
+    try testing.expectEqual(@as(u32, 200), delayFor(1000, 0, 0));
+}
+
+test "hiding a pending tooltip clears its target before a stale timer" {
+    const Target = enum { none, button };
+    var tooltip: Tooltip(Target) = .{ .target = .button };
+    tooltip.hide();
+    try std.testing.expectEqual(Target.none, tooltip.target);
+    try std.testing.expectEqual(@as(?w32.HWND, null), tooltip.timer_owner);
+    tooltip.destroy();
+    try std.testing.expectEqual(Target.none, tooltip.target);
 }

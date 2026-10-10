@@ -45,4 +45,6 @@ test {
     _ = @import("win32/ui/settings/hit_test.zig");
     _ = @import("win32/ui/settings/swatch.zig");
     _ = @import("win32/ui/settings/system.zig");
+    _ = @import("win32/chrome/TitleBar.zig");
+    _ = @import("win32/ui/Tooltip.zig");
 }
