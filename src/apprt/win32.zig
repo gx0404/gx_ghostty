@@ -21,6 +21,7 @@ test {
     _ = @import("win32/chrome/caption_layout.zig");
     _ = @import("win32/clipboard.zig");
     _ = @import("win32/shortcut_conflicts.zig");
+    _ = @import("win32/split_layout.zig");
     _ = @import("win32/splits.zig");
     _ = @import("win32/tab_status.zig");
     _ = @import("win32/tabs.zig");
