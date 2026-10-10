@@ -2163,17 +2163,16 @@ fn applyFailed(self: *Settings, preview: bool, err: anyerror) bool {
     return false;
 }
 
-/// The application now runs with a new configuration: follow its colors
-/// and language and, unless it is a preview, show its values.
 fn configApplied(self: *Settings, preview: bool) void {
+    const config = &self.app.config;
     self.popup.applyTheme(self.tokens());
+    self.popup.setAccessibleName(i18n.tr(msg.settings));
+    self.values = .fromConfig(config, self.layersPtr());
+    self.font_family = self.configuredFamily(self.arena.allocator());
+    self.updateFontPicker();
     if (!preview) {
-        const config = &self.app.config;
-        self.values = .fromConfig(config, self.layersPtr());
         self.notifications = config.@"app-notifications";
-        self.font_family = self.configuredFamily(self.arena.allocator());
         self.saved_theme = self.configuredTheme(config);
-        self.updateFontPicker();
         if (self.saved_theme) |saved| {
             if (self.theme_list.current() == null) self.theme_list.select(saved);
         }
@@ -3510,6 +3509,39 @@ test "a search result clears the query and reveals its setting without changing 
     try testing.expectEqual(@as(usize, 0), self.search_query.items.len);
     try testing.expect(self.text_field == null);
     try testing.expectEqual(original, self.values.font_size);
+    try testing.expect(self.changes.isEmpty());
+}
+
+test "theme previews read back other settings without committing the preview" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    config.@"font-size" = 17;
+    config.@"app-notifications".@"config-reload" = false;
+    var app: App = undefined;
+    app.config = config;
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = &app,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+        .saved_theme = 7,
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.font_list.deinit(testing.allocator);
+    const notifications = self.notifications;
+    self.values.font_size = 13;
+    self.configApplied(true);
+    try testing.expectEqual(@as(f32, 17), self.values.font_size);
+    try testing.expectEqual(@as(?u32, 7), self.saved_theme);
+    try testing.expect(std.meta.eql(notifications, self.notifications));
     try testing.expect(self.changes.isEmpty());
 }
 
