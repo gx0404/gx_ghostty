@@ -94,6 +94,9 @@ GX0027_CALL = '@import("../gx/confirm.zig").listProcesses(self, priv.target, par
 GX0027_AFTER = "self.as(Dialog.Parent).setBody(priv.target.body());"
 GX0027_BEFORE = "self.as(Dialog).present(parent);"
 
+APPLICATION_ZIG = "src/apprt/gtk/class/application.zig"
+GX0028 = "GX-0028"
+
 GTK_CSS = "src/apprt/gtk/css/style.css"
 CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
@@ -408,6 +411,18 @@ def gx0002_problems(source: str) -> list[str]:
     return problems
 
 
+def zig_fn_lines(lines: list[str], header: str) -> tuple[int, int] | None:
+    """0-based [start, end) lines of the one function whose first line starts with ``header``
+    (after indentation), up to its closing brace at the same indentation; None otherwise."""
+    starts = [i for i, line in enumerate(lines) if line.strip().startswith(header)]
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i] == f"{indent}}}"), None)
+    return None if end is None else (start, end + 1)
+
+
 def gx0027_problems(source: str) -> list[str]:
     """Shape lock for GX-0027: one pure-addition hunk in CloseConfirmationDialog.present."""
     try:
@@ -427,6 +442,50 @@ def gx0027_problems(source: str) -> list[str]:
     before = [i for i, line in enumerate(lines) if line.strip() == GX0027_BEFORE]
     if len(after) != 1 or len(before) != 1 or not after[0] < begin < end < before[0]:
         problems.append(f"the {GX0027} hunk must sit between {GX0027_AFTER!r} and {GX0027_BEFORE!r}")
+    return problems
+
+
+def gx0028_problems(source: str) -> list[str]:
+    """Shape lock for GX-0028 in class/application.zig: the configuration errors dialog shows
+    each set of diagnostics once, and only its own reload button shows remaining errors again."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    show = zig_fn_lines(lines, "fn showConfigErrorsDialog(")
+    reload = zig_fn_lines(lines, "fn handleReloadConfig(")
+    if show is None or reload is None:
+        return ["showConfigErrorsDialog and handleReloadConfig must each be defined once"]
+    problems: list[str] = []
+    show_body = [line.strip() for line in lines[show[0]:show[1]]]
+    reload_body = [line.strip() for line in lines[reload[0]:reload[1]]]
+
+    def single(body: list[str], name: str, needle: str) -> int | None:
+        hits = [i for i, line in enumerate(body) if line == needle]
+        if len(hits) != 1:
+            problems.append(f"{name}: expected exactly one line {needle!r}, found {len(hits)}")
+            return None
+        return hits[0]
+
+    name = "showConfigErrorsDialog"
+    update = single(show_body, name, "const gx_new_errors = priv.gx_config_errors.update(priv.config.get());")
+    existing = single(show_body, name, "if (priv.config_errors_dialog.get()) |diag| {")
+    present = single(show_body, name, "if (gx_new_errors) diag.present(null);")
+    no_diagnostics = single(show_body, name, "if (!priv.config.hasDiagnostics()) return;")
+    reported = single(show_body, name, "if (!gx_new_errors) return;")
+    create = single(show_body, name, "const dialog: *ConfigErrorsDialog = .new(priv.config);")
+    if "diag.present(null);" in show_body:
+        problems.append(f"{name}: the open dialog is presented without checking gx_new_errors")
+    if None not in (update, existing) and not update < existing:
+        problems.append(f"{name}: gx_config_errors.update must run before the open dialog is handled")
+    if present is not None and GX0028 not in show_body[present - 1]:
+        problems.append(f"{name}: the changed present line needs a fork(gx): {GX0028} comment above it")
+    if None not in (no_diagnostics, reported, create) and not no_diagnostics < reported < create:
+        problems.append(f"{name}: diagnostics reported before must return before a new dialog is created")
+
+    forget = single(reload_body, "handleReloadConfig", "priv.gx_config_errors.forget();")
+    call = next((i for i, line in enumerate(reload_body) if line.startswith("Action.reloadConfig(")), None)
+    if forget is not None and (call is None or not forget < call):
+        problems.append("handleReloadConfig: forget() must run before Action.reloadConfig")
+    if sum("gx_config_errors.forget()" in line for line in lines) != 1:
+        problems.append("only the reload button of the configuration errors dialog may forget reported diagnostics")
     return problems
 
 
@@ -738,6 +797,35 @@ class Gx0027ShapeTests(unittest.TestCase):
         at = next(i for i, line in enumerate(rest) if line.strip() == GX0027_BEFORE) + 1
         moved = "".join(rest[:at] + self.lines[begin:end + 1] + rest[at:])
         self.assertTrue(any("must sit between" in p for p in gx0027_problems(moved)))
+
+
+class Gx0028ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
+
+    def problems_after(self, old: str, new: str) -> list[str]:
+        self.assertIn(old, self.source)
+        return gx0028_problems(self.source.replace(old, new, 1))
+
+    def test_application_keeps_the_hooks(self):
+        self.assertEqual(gx0028_problems(self.source), [])
+        self.assertEqual(gx0028_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_open_dialog_is_not_raised_for_reported_diagnostics(self):
+        problems = self.problems_after("if (gx_new_errors) diag.present(null);", "diag.present(null);")
+        self.assertTrue(any("without checking gx_new_errors" in p for p in problems), problems)
+
+    def test_reported_diagnostics_stay_dismissed(self):
+        problems = self.problems_after("        if (!gx_new_errors) return;\n", "")
+        self.assertTrue(any("'if (!gx_new_errors) return;'" in p for p in problems), problems)
+
+    def test_only_the_dialog_reload_forgets(self):
+        problems = self.problems_after("        priv.gx_config_errors.forget();\n", "")
+        self.assertTrue(any(p.startswith("handleReloadConfig:") for p in problems), problems)
+        problems = self.problems_after("        defer config.unref();\n",
+                                       "        defer config.unref();\n        self.private().gx_config_errors.forget();\n")
+        self.assertTrue(any("only the reload button" in p for p in problems), problems)
 
 
 class HunkTests(unittest.TestCase):

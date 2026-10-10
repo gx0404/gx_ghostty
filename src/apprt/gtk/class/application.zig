@@ -53,6 +53,9 @@ const Overrides = @import("Overrides.zig");
 // fork(gx): GX-0016 begin: Ghostty GX look (src/apprt/gtk/gx/style.zig)
 const gx_style = @import("../gx/style.zig");
 // fork(gx): GX-0016 end
+// fork(gx): GX-0028 begin: configuration errors are reported once (src/apprt/gtk/gx/config_errors.zig)
+const gx_config_errors = @import("../gx/config_errors.zig");
+// fork(gx): GX-0028 end
 
 const log = std.log.scoped(.gtk_ghostty_application);
 // fork(gx): GX-0011 begin: the Ghostty GX layer of the GTK apprt
@@ -225,6 +228,10 @@ pub const Application = extern struct {
         /// This is a WeakRef because the dialog can close on its own
         /// outside of our own lifecycle and that's okay.
         config_errors_dialog: WeakRef(ConfigErrorsDialog) = .empty,
+
+        // fork(gx): GX-0028 begin: the configuration errors already reported
+        gx_config_errors: gx_config_errors.Reports = .{},
+        // fork(gx): GX-0028 end
 
         /// glib source for our signal handler.
         signal_source: ?c_uint = null,
@@ -1721,6 +1728,9 @@ pub const Application = extern struct {
         // after response handling and we don't want to reuse it.
         const priv = self.private();
         priv.config_errors_dialog.set(null);
+        // fork(gx): GX-0028 begin: errors that remain after this reload are shown again
+        priv.gx_config_errors.forget();
+        // fork(gx): GX-0028 end
 
         // Reload our config as if the app reloaded.
         Action.reloadConfig(
@@ -1739,6 +1749,9 @@ pub const Application = extern struct {
     /// has diagnostics.
     fn showConfigErrorsDialog(self: *Self) void {
         const priv = self.private();
+        // fork(gx): GX-0028 begin: show each set of diagnostics once, not for every configuration change
+        const gx_new_errors = priv.gx_config_errors.update(priv.config.get());
+        // fork(gx): GX-0028 end
 
         // If we already have a dialog, just update the config.
         if (priv.config_errors_dialog.get()) |diag| {
@@ -1755,7 +1768,8 @@ pub const Application = extern struct {
             if (!priv.config.hasDiagnostics()) {
                 diag.close();
             } else {
-                diag.present(null);
+                // fork(gx): GX-0028 raise (and focus) the open dialog only for new diagnostics
+                if (gx_new_errors) diag.present(null);
             }
 
             return;
@@ -1763,6 +1777,9 @@ pub const Application = extern struct {
 
         // No diagnostics, do nothing.
         if (!priv.config.hasDiagnostics()) return;
+        // fork(gx): GX-0028 begin: diagnostics reported before stay dismissed
+        if (!gx_new_errors) return;
+        // fork(gx): GX-0028 end
 
         // No dialog yet, initialize a new one. There's no need to unref
         // here because the widget that it becomes a part of takes ownership.
