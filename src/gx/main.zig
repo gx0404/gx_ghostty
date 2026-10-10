@@ -31,6 +31,8 @@
 //!   (`win32_input`), the bundled ConPTY (`conpty`), OSC 7 working
 //!   directories (`osc7`) and shell quoting of dropped or pasted file
 //!   paths (`path_quote`).
+//! - The DMABUF export of the OpenGL renderer once it cannot work
+//!   (`dmabuf_export`).
 pub const action = @import("action.zig");
 pub const app_mode = @import("app_mode.zig");
 pub const branding = @import("branding.zig");
@@ -39,6 +41,7 @@ pub const config_layers = @import("config_layers.zig");
 pub const config_types = @import("config_types.zig");
 pub const confirm = @import("confirm.zig");
 pub const conpty = @import("conpty.zig");
+pub const dmabuf_export = @import("dmabuf_export.zig");
 pub const fuzzy = @import("fuzzy.zig");
 pub const gtk_css = @import("gtk_css.zig");
 pub const gui_settings = @import("gui_settings.zig");
@@ -74,6 +77,7 @@ test {
     _ = config_types;
     _ = confirm;
     _ = conpty;
+    _ = dmabuf_export;
     _ = fuzzy;
     _ = gtk_css;
     _ = gui_settings;

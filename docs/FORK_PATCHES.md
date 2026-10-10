@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0028）之后的号。在册的 22 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0028，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0029）之后的号。在册的 23 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0029，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -82,6 +82,7 @@
 | GX-0026 | `src/build/GhosttyExe.zig` | `fork(gx): GX-0026` | active |
 | GX-0027 | `src/apprt/gtk/class/close_confirmation_dialog.zig` | `fork(gx): GX-0027` | active |
 | GX-0028 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0028` | active |
+| GX-0029 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0029` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1183,3 +1184,49 @@ GTK 冒烟：配置里写一个未知键（如 `fontsize = 12`），启动后弹
 ### 测试锁定
 
 登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0028_problems` 锁定钩子的形状：`showConfigErrorsDialog` 先 `gx_config_errors.update` 再处理已打开的对话框，上游的 `diag.present(null)` 只剩带 `gx_new_errors` 条件、上方有标记的一处，报告过的诊断在新建对话框之前返回；整个文件只有 `handleReloadConfig` 在 `Action.reloadConfig` 之前 `forget`。`src/apprt/gtk/gx/config_errors.zig` 的单测锁定去重、清空与容量规则（`just wsl test --gtk --filter apprt.gtk.gx`）。
+
+## GX-0029 DMABUF 导出不可用后不再逐帧重试
+
+- 文件：`src/renderer/OpenGL.zig`，`OpenGL` 的 `gx_dmabuf` 字段（纯新增块）与 `present` 里导出的三处改动：条件加上 `self.gx_dmabuf.enabled(...)`，导出结果经 `self.gx_dmabuf.track(...)` 传回，每帧一条的 `log.warn` 换成一行说明。逻辑在新路径 `src/gx/dmabuf_export.zig`（只依赖 std，`gl` 以编译期参数传入，用于在警告里写出 GL 渲染器）。
+- 标记：`fork(gx): GX-0029`；字段用 begin/end 包住，三处改动的上一行写单行标记（删去的警告处留一行标记）。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +8/−3（含标记）。
+
+### 原因
+
+GTK 能显示 DMABUF 时（`presentation_health == .healthy`），上游 `OpenGL.present` 每帧都先把渲染目标整帧 blit 到导出纹理、建 EGLImage 再导出；失败就记一条 warning，回读到 CPU 内存，下一帧再试。EGL 显示没有 `EGL_MESA_image_dma_buf_export` 时每次都失败：Mesa 的软件渲染（llvmpipe）在 surfaceless 显示上就是这样（Xvfb、没有 GPU 的虚拟机与远程桌面，gx-ci 的 `gtk-smoke` 也是），每帧白做一次整帧 blit 与 EGLImage，日志被同一条警告刷屏（`just wsl smoke --perf` 的 300 万行负载期间 600 多条）。导出逻辑与它的状态都在上游 `present` 里，只能在这里接入（A37）。
+
+### 行为
+
+- 每个渲染器的第一帧检查 EGL 显示的扩展串：没有 `EGL_MESA_image_dma_buf_export` 时直接关掉导出，之后每帧直接回读，不再 blit、不建 EGLImage、不记警告。
+- 扩展存在时照常导出；连续失败 3 次（`max_failures`）关掉导出，成功一次就重新计数。前两次失败只记 debug 日志。关掉之后这个渲染器（终端）一直回读，直到它被销毁；新终端的渲染器重新检查。
+- 整个进程只有第一个关掉导出的渲染器记一条 warning：`failed to export DMABUF (<原因>), presenting frames from CPU memory from now on renderer=<GL_RENDERER>`，原因是缺少的扩展，或连续失败的次数与最后一次的错误；其余渲染器只记 debug。
+- `presentation_health` 不是 `healthy`（GTK 导入 DMABUF 失败后的上游回退）时与上游相同，不检查也不计数。Windows 走 GX-0004 的 WGL 分支，不受影响。
+
+### 上游状态
+
+未回馈上游。这是上游的通用问题（软件 GL 下每帧白做导出并刷屏），适合回馈；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+字段块放在 `alloc` 字段之后（与 GX-0004 的字段与 Windows 分支隔开，两个补丁互不相邻）。上游改动 `present` 的导出分支时，取上游版本后保持三点：只在 `presentation_health == .healthy` 且 `self.gx_dmabuf.enabled(self.device.display)` 时尝试导出；导出结果经 `self.gx_dmabuf.track(...)`；导出失败不再每帧记警告。上游改了 `Target.exportDmabuf` 需要的 EGL 扩展时，同步 `src/gx/dmabuf_export.zig::extension`；上游自己限制了重试或警告时，按「移除条件」处理。
+
+### 移除条件
+
+上游在 DMABUF 导出不可用时不再逐帧重试与警告之后移除：删除字段块与三处改动、`src/gx/dmabuf_export.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just test --filter gx.dmabuf_export                     # Windows 本机（win32 apprt），纯逻辑单测
+just wsl sync <worktree> --dirty
+just wsl build --gtk -Doptimize=ReleaseFast
+just wsl smoke --out <目录> --perf                      # <名字>-perf.txt 的 dmabuf_warnings 为 1
+python -m unittest scripts.test_fork_patches -v
+```
+
+`smoke --perf` 的日志只有一条 `failed to export DMABUF (the EGL display does not support EGL_MESA_image_dma_buf_export) … renderer=llvmpipe …`；补丁前同一负载有 600 多条。有 GPU 与 `EGL_MESA_image_dma_buf_export` 的 Linux 桌面上应照常走 DMABUF（日志没有这条警告），需在真机确认。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0029_problems` 锁定形状：字段、导出条件与导出调用各一处、上方都有标记，条件里有 `self.gx_dmabuf.enabled(`，导出经 `self.gx_dmabuf.track(`，都在 `present` 里、GX-0004 的 Windows 分支之后；上游每帧一条的警告文字不再出现。`src/gx/dmabuf_export.zig` 的单测锁定扩展检查、连续失败计数、警告里的 GL 渲染器名与只警告一次（`just test --filter gx.dmabuf_export`，Linux 上 `just wsl test --filter gx.dmabuf_export`）。

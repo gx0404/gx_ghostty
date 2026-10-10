@@ -45,6 +45,9 @@ pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
 
 alloc: std.mem.Allocator,
+// fork(gx): GX-0029 begin: stop exporting DMABUFs once that cannot work (src/gx/dmabuf_export.zig)
+gx_dmabuf: @import("../gx/dmabuf_export.zig").Export(gl) = .{},
+// fork(gx): GX-0029 end
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -326,11 +329,13 @@ pub fn present(
     // fork(gx): GX-0004 end
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
-    if (presentation_health == .healthy) {
-        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
+    // fork(gx): GX-0029 and only while exporting can work
+    if (presentation_health == .healthy and self.gx_dmabuf.enabled(self.device.display)) {
+        // fork(gx): GX-0029 count the failures; enough of them in a row switch exporting off
+        if (self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))) |dmabuf| {
             return .{ .dmabuf = dmabuf };
         } else |_| {
-            log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+            // fork(gx): GX-0029 `track` warns once, when exporting switches off, not for every frame
         }
     }
 

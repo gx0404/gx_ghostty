@@ -97,6 +97,13 @@ GX0027_BEFORE = "self.as(Dialog).present(parent);"
 APPLICATION_ZIG = "src/apprt/gtk/class/application.zig"
 GX0028 = "GX-0028"
 
+OPENGL_ZIG = "src/renderer/OpenGL.zig"
+GX0029 = "GX-0029"
+GX0029_FIELD = 'gx_dmabuf: @import("../gx/dmabuf_export.zig").Export(gl) = .{},'
+GX0029_CONDITION = "if (presentation_health == .healthy and self.gx_dmabuf.enabled(self.device.display)) {"
+GX0029_EXPORT = "if (self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))) |dmabuf| {"
+UPSTREAM_DMABUF_WARNING = "failed to export DMABUF, falling back to CPU presentation"
+
 GTK_CSS = "src/apprt/gtk/css/style.css"
 CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
@@ -489,6 +496,40 @@ def gx0028_problems(source: str) -> list[str]:
     return problems
 
 
+def gx0029_problems(source: str) -> list[str]:
+    """Shape lock for GX-0029 in src/renderer/OpenGL.zig: present() stops exporting DMABUFs
+    once that cannot work, after the Windows (GX-0004) branch has returned."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    problems: list[str] = []
+
+    def marked(needle: str) -> int | None:
+        hits = [i for i, line in enumerate(lines) if line.strip() == needle]
+        if len(hits) != 1:
+            problems.append(f"expected exactly one line {needle!r}, found {len(hits)}")
+            return None
+        if GX0029 not in lines[hits[0] - 1]:
+            problems.append(f"{needle!r} needs a fork(gx): {GX0029} comment on the line above")
+        return hits[0]
+
+    marked(GX0029_FIELD)
+    condition = marked(GX0029_CONDITION)
+    export = marked(GX0029_EXPORT)
+    if UPSTREAM_DMABUF_WARNING in source:
+        problems.append("present() must not warn for every frame whose export fails")
+    present = zig_fn_lines(lines, "pub fn present(")
+    if present is None:
+        return [*problems, "expected one top-level `pub fn present(`"]
+    start, end = present
+    if any(at is not None and not start < at < end for at in (condition, export)):
+        problems.append("the DMABUF export must stay in present()")
+    if None not in (condition, export) and not condition < export:
+        problems.append("the DMABUF export must be inside the GX-0029 condition")
+    windows = next((i for i in range(start, end) if "builtin.os.tag == .windows" in lines[i]), None)
+    if windows is None or (condition is not None and not windows < condition):
+        problems.append("the Windows (GX-0004) branch of present() must return before the DMABUF export")
+    return problems
+
+
 def css_call_args(css: str, paren: int) -> list[str]:
     """Top-level, comma-separated arguments of the call whose '(' is at ``paren``."""
     args: list[str] = []
@@ -826,6 +867,29 @@ class Gx0028ShapeTests(unittest.TestCase):
         problems = self.problems_after("        defer config.unref();\n",
                                        "        defer config.unref();\n        self.private().gx_config_errors.forget();\n")
         self.assertTrue(any("only the reload button" in p for p in problems), problems)
+
+
+class Gx0029ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / OPENGL_ZIG).read_text(encoding="utf-8")
+
+    def test_present_keeps_the_hooks(self):
+        self.assertEqual(gx0029_problems(self.source), [])
+        self.assertEqual(gx0029_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_unchecked_or_untracked_export_is_rejected(self):
+        for old, new in ((" and self.gx_dmabuf.enabled(self.device.display)", ""),
+                         ("self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))",
+                          "target.exportDmabuf(self.device.display, self.egl_context)")):
+            with self.subTest(old):
+                self.assertIn(old, self.source)
+                problems = gx0029_problems(self.source.replace(old, new, 1))
+                self.assertTrue(any("found 0" in p for p in problems), problems)
+
+    def test_per_frame_warning_is_rejected(self):
+        problems = gx0029_problems(self.source + f'\n// log.warn("{UPSTREAM_DMABUF_WARNING}", .{{}});\n')
+        self.assertIn("present() must not warn for every frame whose export fails", problems)
 
 
 class HunkTests(unittest.TestCase):
