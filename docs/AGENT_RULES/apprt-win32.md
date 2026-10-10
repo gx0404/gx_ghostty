@@ -3,7 +3,7 @@
 ## 范围
 
 - fork 新路径 `src/apprt/win32.zig` 与 `src/apprt/win32/**`：Windows 目标默认的 apprt（补丁 GX-0003 在 `src/apprt/runtime.zig::Runtime` 加入 `win32` 并设为 Windows 默认值），移植自 MIT 许可的 shiweis/ghostty-windows@119b9270c 后按模块拆分，文件头注明出处。
-- 渲染钩子 `src/renderer/opengl/wgl.zig`（补丁 GX-0004，同属 `renderer`），以及编进 exe 的资源：fork 的 `dist/windows/gx/ghostty-gx.rc`（GX-0026 让 `src/build/GhosttyExe.zig` 选用它）引用 Ghostty GX 图标 `dist/windows/gx/ghostty-gx.ico` 与上游的 `dist/windows/ghostty.manifest`；上游的 `ghostty.rc`、`ghostty.ico` 不再编进 exe（同属 `packaging-dist`）。
+- 渲染钩子 `src/renderer/opengl/wgl.zig`（补丁 GX-0004，同属 `renderer`）与编进 exe 的资源：fork 的 `dist/windows/gx/ghostty-gx.rc`（GX-0026 让 `src/build/GhosttyExe.zig` 选用）引用 GX 图标 `dist/windows/gx/ghostty-gx.ico` 与上游 `dist/windows/ghostty.manifest`；上游 `ghostty.rc`、`ghostty.ico` 不再编进 exe（同属 `packaging-dist`）。
 - 分界：apprt 接口、Surface 生命周期与 `needsConfirmQuit` 见 `app-core.md`；共享核心 `src/gx/**`（UI 语言、配置分层、启动配置、`gx:` 动作、进程判断、win32-input-mode 编码、ConPTY、OSC 7）见 `gx-core.md`；DirectWrite 字体发现见 `font.md`；ConPTY 与 termio 的 Windows 分支见 `termio-pty-os.md`；便携包与安装包见 `packaging-dist.md`。
 
 ## 符号真源
@@ -17,7 +17,7 @@
 | `Window.zig` | 顶层窗口：标签模型（每个标签一棵 split tree）、分屏布局、DPI、窗口位置（首窗约为显示器工作区的 80%）、首帧前 cloak、herdr 应用模式（`updateAppMode`）、关闭标签与窗口；纯函数在 `tabs.zig`（标签下标、标题）与 `splits.zig`（分屏几何、关闭后的焦点） |
 | `Surface.zig` | 每个终端一个子 HWND：按键、IME、鼠标、拖放、剪贴板、标题与光标；持有 `palette`、`search_bar`、`link_preview`、`scrollbar` 与 `frame_event` |
 | `chrome/TitleBar.zig`、`chrome/TabBar.zig`、`chrome/Backdrop.zig` | 集成标题栏（`WM_NCCALCSIZE`、`WM_NCHITTEST`、Snap Layouts、系统菜单）；Direct2D 标签栏；DWM 主题、窗口材质（`gx-window-material`）与按像素透明（`background-opacity`） |
-| `ui/d2d.zig`、`ui/style.zig`、`ui/Popup.zig` | 手写的 Direct2D/DirectWrite COM 绑定与 `Canvas`（单位 DIP）；由终端配色派生的设计 token；可复用弹层（DWM 圆角、每显示器 DPI、可接输入法的 `TextInput`） |
+| `ui/d2d.zig`、`ui/style.zig`、`ui/Popup.zig`、`ui/controls.zig`、`ui/anim.zig`、`ui/text_edit.zig`、`ui/Notice.zig`、`ui/Toast.zig` | D2D/DirectWrite 绑定与 `Canvas`（DIP、像素对齐、文字缓存）；有对比度下限与高对比度的设计 token；弹层（首帧揭幕、输入法 `TextInput`）；共用控件；帧时钟与 Tween；编辑模型；提示条与 Toast |
 | `ui/Palette.zig`、`ui/Keybinds.zig`、`ui/fuzzy.zig`、`ui/trigger.zig` | 命令面板、快捷键速查表（标出冲突按键）、模糊匹配与 frecency、绑定键帽与菜单提示（`Hints` 跳过冲突按键） |
 | `ui/Menu.zig`、`ui/MenuPopup.zig` | 主菜单、启动配置菜单、标签与终端右键菜单；按主题自绘的模态菜单 |
 | `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层（语言、外观、字体、交互、Shell、关于；关于页与关于对话框都显示 `src/gx/branding.zig` 的非官方分支声明），写 `gui-settings.ghostty` 后重载配置 |
@@ -39,25 +39,26 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 | HWND | 自定义消息 | 计时器 |
 |---|---|---|
 | `GhosttyMsg`（`App.msg_hwnd`） | `WM_APP+1` WAKEUP、`WM_APP+3` TRAY、`WM_APP+36` EXPORT_TERMINAL_IO、`WM_APP+0x62` QUIT | 1 退出延时、2 通知气泡、3 `QuickTerminal.ANIM_TIMER_ID`、4 快捷键冲突检测、`PT` 命令面板随终端关闭时撤销主题预览（`ui/Palette.zig` 的 TIMERPROC，不经 `msgWndProc`） |
-| `GhosttyWindow` | `WM_APP+20` MAIN_MENU、`WM_APP+0x61` CLOSE_TAB、`WM_USER+0x47` SIMULATE_DPI（测试钩子） | `HD` 应用模式、`FF` 首帧、`CH` 标签栏轮询、`TT` 提示、`RG` 尺寸提示、`SN` 快捷键冲突提示条 |
+| `GhosttyWindow` | `WM_APP+20` MAIN_MENU、`WM_APP+38` OWNER_ACTIVE_LOCK（`Popup` 发来）、`WM_APP+0x61` CLOSE_TAB、`WM_USER+0x47` SIMULATE_DPI（测试钩子） | `HD` 应用模式、`FF` 首帧、`CH` 标签栏轮询、`TT` 提示、`RG` 尺寸提示、`SN` 快捷键冲突提示条 |
 | `GhosttyTerminal` | `WM_APP+0x60` CONFIRM_CLOSE、`WM_APP+30` GPU_RESET、`WM_APP+32` CHILD_EXITED、`WM_APP+35` RELEASE_BUTTONS、`WM_USER+0x48` SIMULATE_GPU_RESET（测试钩子） | `CR`、`CW` 剪贴板重试，`GR` GPU 重置 |
 | 滚动条弹层 | `WM_USER+1` SCROLLBAR_QUERY | 1 淡出、2 空闲 |
-| 其他弹层 | 无 | 命令面板与设置浮层在自己的弹层 HWND 上用带 TIMERPROC 的小整数；`MenuPopup` 用线程计时器（`SetTimer(null, 0, …)`） |
+| 其他弹层（`Popup`） | `WM_APP+39`、`+40` Notice、Toast 投递后显示 | `RV` 首帧揭幕、`CB` 插入符、`RP` 按住连发；Notice `NT`、`NW`，Toast `TS`、`TW`；命令面板与设置浮层另用带 TIMERPROC 的小整数；`MenuPopup` 用线程计时器 |
+| `GhosttyGxAnimClock`（`ui/anim.zig`） | `WM_APP+37` TICK | 无 |
 
 ### 输入、IME、DPI 与文字
 
 - 按键：`App.run` 对 `GhosttyTerminal` 的按键消息跳过 `TranslateMessage`（`Surface.handleKeyEvent` 自己调 `ToUnicode`，两者共用死键状态），但 `VK_PROCESSKEY`（交给输入法）与 `VK_PACKET`（SendInput 的 Unicode 注入）必须经过它。按键、`WM_CHAR` 与输入法上屏文字都经核心 `Surface.gxWin32KeyCallback` 进入（补丁 GX-0006，接入契约在 `src/gx/win32_input.zig` 文件头）；终端开着 DECSET 9001 时按 KEY_EVENT_RECORD 发出。粘贴与拖放不走记录，拖放的路径按 shell 引用（`gx.path_quote`）。
 - 弹层编辑框：`App.routeEditKey` 先把 Enter、Esc 与方向键交给标签改名、命令面板与查找栏，其余按键由纯函数 `App.editKeyRoute` 分流：不带 Ctrl 的键、编辑键（方向键、Home/End、Backspace/Delete/Insert、Ctrl 或 Ctrl+Shift 加 A/C/V/X/Y/Z）、输入法与修饰键本身留给编辑框；`trigger.isBound` 命中绑定（单个动作或 `chain=` 链，不含 leader 键）的 Ctrl 组合冒泡给终端绑定（查找栏只把焦点交给终端、不结束搜索）；其余 Ctrl 组合吞掉，不进 pty；Ctrl+Alt 未绑定时按 AltGr 输入字符。查找栏从外部关闭（`SearchBar.setActive(false)`）一律经核心 `end_search`，不留匹配高亮。Alt+Space 由 `Window.handleSystemMenuKey` 打开窗口菜单。
-- 快捷键冲突：其他程序的全局热键与输入法的 TSF 保留键到不了窗口。`App.probeShortcuts` 在首窗显示约 1 s 后与每次重载配置后（`GhosttyMsg` 计时器 4，GUI 线程，不阻塞首帧）逐个试注册带修饰键的绑定并查询 TSF，结果存于 `App.shortcut_conflicts`：速查表标记，菜单与命令面板经 `trigger.Hints` 跳过，默认的复制、粘贴、查找、分屏键受影响时每次运行显示一次 `ShortcutNotice`。自己的 `global:` 热键与 Windows 保留但仍会送达的 Alt+F4、F12、Shift+F12 不检测。TSF 只报告输入法用 `PreserveKey` 登记的键：微软拼音的 Ctrl+Shift+F 不是保留键，检测不到（下文「已知坑」照旧）。
+- 快捷键冲突：其他程序的全局热键与输入法的 TSF 保留键到不了窗口。`App.probeShortcuts` 在首窗显示约 1 s 后与每次重载配置后（`GhosttyMsg` 计时器 4，GUI 线程，不阻塞首帧）逐个试注册带修饰键的绑定并查询 TSF，结果存于 `App.shortcut_conflicts`：速查表标记，菜单与命令面板经 `trigger.Hints` 跳过，默认的复制、粘贴、查找、分屏键受影响时每次运行显示一次 `ShortcutNotice`。自己的 `global:` 热键与 Windows 保留但仍会送达的 Alt+F4、F12、Shift+F12 不检测。TSF 只报告输入法用 `PreserveKey` 登记的键：微软拼音的 Ctrl+Shift+F 不是保留键，检测不到。
 - IME：组字串作为 preedit 交给核心内联显示，候选窗由 `Surface.positionImeWindow` 按 DPI 放到光标处；终端失焦时取消组字。
-- 剪贴板：剪贴板管理器与远程桌面（RustDesk、ToDesk）会短暂占用剪贴板，`OpenClipboard` 一律经 `clipboard.open`（最多 10 次、间隔 5 ms，参考 Windows Terminal）；终端读写另由 `CR`、`CW` 计时器再试约 0.6 s，弹层与对话框最终失败记 warn。标签改名的原生 EDIT 控件自己粘贴，不经它。
+- 剪贴板：剪贴板管理器与远程桌面（RustDesk、ToDesk）会短暂占用剪贴板，`OpenClipboard` 一律经 `clipboard.open`（有界重试，参考 Windows Terminal）；终端读写另由 `CR`、`CW` 计时器再试约 0.6 s，弹层与对话框最终失败记 warn。标签改名的原生 EDIT 控件自己粘贴，不经它。
 - 系统设置广播 `WM_SETTINGCHANGE` 只发给顶层窗口，终端子窗口收不到：系统滚动条模式由滚动条弹层自己处理（`Scrollbar.zig`），预留宽度变了经 `Surface.refitGrid` 重排网格。
 - DPI：manifest 声明 PerMonitorV2。只有顶层窗口收到 `WM_DPICHANGED`，`Window.handleDpiChange` 重排 chrome 并调用每个 Surface 的 `handleDpiChange`；弹层本身是顶层窗口，自己处理。chrome（标题栏、标签栏、它们的提示、尺寸提示与从标题栏打开的菜单）的尺寸、字体、命中区、Direct2D 画布 DPI 以及新建终端的初始缩放一律取 `Window.scale`（弹层经 `Popup.setOwnerScale`），只有 Windows 与 DWM 自己画的部分（顶部缩放带、材质下 DWM 的标题按钮）取 `GetDpiForWindow`；`WM_GHOSTTY_SIMULATE_DPI` 只改 `Window.scale`，混用两者在模拟时就会错位。
 - 界面文字：一律写英文 msgid，经 `gx.i18n.tr`（编译期 msgid）或 `trRuntime` 在使用时翻译；菜单与对话框每次显示时重建，语言切换经各模块的 `onLanguageChanged` 下发。规则与生成器见 `gx-core.md`。
 
 ## 不变量
 
-- 线程：其他线程进入 apprt 的入口（`wakeup`、`signalFrameDrawn`、`gpuContextReset`）只投递消息、置位事件或改渲染器自身的状态，不碰 HWND、Direct2D 与 apprt 的 UI 状态；GL 调用只在渲染线程（`renderer.md`）。
+- 线程：其他线程进入 apprt 的入口（`wakeup`、`signalFrameDrawn`、`gpuContextReset`、`anim` 时钟线程）只投递消息、置位事件或改渲染器自身的状态，不碰 HWND、Direct2D 与 apprt 的 UI 状态；GL 调用只在渲染线程（`renderer.md`）。
 - 关闭：`Surface.close` 只投递 `WM_CLOSE` 或 `WM_APP_CONFIRM_CLOSE`，销毁一律在消息循环里进行，不在核心回调中关窗或释放 Surface。关闭分屏、标签、窗口与退出都先问核心 `needsConfirmQuit`（含 GX-0012 的空闲进程判断）。
 - 模态循环：菜单、对话框、`MessageBoxW` 与另存为对话框都会继续派发消息，任何对象都可能在其间被释放。返回后重新解析 Window 与 Surface，不沿用调用前的裸指针；对话框打开期间窗口推迟自己的 `WM_CLOSE`，最外层对话框返回后再投递。窗口与终端销毁时清零 `GWLP_USERDATA`，窗口过程据此丢弃迟到的消息。自绘对话框与菜单取到 WM_QUIT 时，仅当 `App.quit_requested` 为真才结束并重投，否则丢弃（`Popup.modalQuitCode`）；`run` 之前的 `startQuitTimer` 被忽略（`App.running`）。
 - 持锁回调：核心持有 `renderer_state.mutex` 时会回调 apprt，如点链接的 `open_url`、复制选区的 `setClipboard`、`mouse_shape`、`mouse_over_link`、`selection_changed` 与 inspector 的 `export_terminal_io`。它们不得泵消息或跑模态循环（窗口过程重入核心再取锁即自锁）：URL 交给 `open_url.zig` 的工作线程，另存为对话框经 `WM_APP_EXPORT_TERMINAL_IO` 回到消息循环。
@@ -78,11 +79,11 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 ## 验证
 
 - 构建：`just build`（Windows 主机自动补 `-Dtarget=x86_64-windows-gnu`，Windows 目标默认 `-Dapp-runtime=win32`）产出 `zig-out/bin/ghostty.exe`；发布形态 `just package-windows`（见 `packaging-dist.md`）。
-- 单测：`just test --filter apprt.win32`（2026-10 本机 120 条，热缓存墙钟约 3 s），共享核心 `just test --filter gx.`；只依赖 std 的文件（如 `ui/settings/fuzzy.zig`）也可 `just zig test <文件>`。带测试的文件在 `src/apprt/win32.zig` 的 `test` 块显式引用，否则测试会随调用链变化悄悄漏收。
+- 单测：`just test --filter apprt.win32`（2026-10 本机 183 条，热缓存墙钟约 3 s），共享核心 `just test --filter gx.`；只依赖 std 的文件（如 `ui/settings/fuzzy.zig`）也可 `just zig test <文件>`。带测试的文件在 `src/apprt/win32.zig` 的 `test` 块显式引用，否则测试会随调用链变化悄悄漏收。
 - GUI 证据，GUI 可见改动必做：
   1. 隔离：`LOCALAPPDATA` 与 `XDG_CONFIG_HOME` 都指向 `.local/evidence/<任务>/env/<场景>`，配置写在其下的 `ghostty\config.ghostty`，日志在 `ghostty\logs\ghostty.log`。隔离后，只装在真实 `%LOCALAPPDATA%\Programs` 下、不在 `PATH` 上的 GX Zsh 探测不到，默认 shell 会退到 PowerShell；需要时在配置里写 `command`。
   2. agent shell 常带 `NO_COLOR=1` 与 `TERM=dumb`：启动 `ghostty.exe` 前去掉 `NO_COLOR`，否则 pwsh 等不输出颜色与粗斜体。
   3. 用 kimi-cu 桌面自动化截取 `GhosttyWindow`（`get_app_state` 截图，`click`、`press_key` 操作），或用 PowerShell `CopyFromScreen` 截图；图片存到 `.local/evidence/<任务>/`，逐张读图核对后才记 PASS。
-  4. 已知坑：微软拼音把 Ctrl+Shift+F 当作简繁切换吞掉，自动化测试查找栏前先切到英文键盘布局，或从命令面板打开查找；GUI 子系统的 exe 没有控制台，`+version`、`+list-fonts` 的输出要重定向或接管道（PowerShell 用 `| Out-String`）；复现 CI 的软件渲染设 `GHOSTTY_GX_OPENGL=software`。
+  4. 已知坑：微软拼音把 Ctrl+Shift+F 当作简繁切换吞掉，自动化测试查找栏前先切到英文键盘布局，或从命令面板打开查找；GUI 子系统的 exe 没有控制台，`+version`、`+list-fonts` 的输出要重定向或接管道（PowerShell 用 `| Out-String`）。
 - CI：`gx-ci` 的 `windows-app` job 在 push 与 PR 上构建 win32 app，手动输入 `win_smoke` 为真时用随包 Mesa llvmpipe 启动并截图（artifact `evidence-windows-smoke`）；`gx-release` 的 `windows-app` 产出 zip 与安装包。读回截图前 CI 证据记 PENDING。
 - 改 Zig 跑 `just fmt-check`；改了 `pub` 签名或 `//!` 文档跑 `just kb`。

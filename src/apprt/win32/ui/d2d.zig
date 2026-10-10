@@ -8,10 +8,23 @@
 //! never called.
 //!
 //! `Factory` holds the process-wide D2D/DirectWrite factories, the
-//! resolved UI/icon/monospace font families, the CJK font fallback and a text format
-//! cache; the app owns one (`App.uiFactory`). A `Canvas` belongs to one
-//! render target (an HWND or a GDI DC) and draws in DIPs: 1 unit = 1 pixel
-//! at 96 DPI.
+//! resolved UI/icon/monospace font families (Segoe UI Variable in its
+//! Small, Text and Display optical sizes when installed), the CJK font
+//! fallback (chosen from the UI language and the user locale), a text
+//! format cache and a cache of laid-out text (`TextCache`); the app owns
+//! one (`App.uiFactory`), and a failed creation is logged and remembered
+//! once. A `Canvas` belongs to one render target (an HWND or a GDI DC) and
+//! draws in DIPs: 1 unit = 1 pixel at 96 DPI. HWND targets present without
+//! waiting for the vertical blank; DC targets render in software (their
+//! pixels go back to GDI anyway). `Canvas.snap*`, `hairline*` and
+//! `strokeRoundedRectPx` put edges on device pixels so thin lines stay
+//! sharp at 125 % and 150 %.
+//!
+//! Text: `drawText`/`measureText` lay out UTF-8 through the cache;
+//! `TextLayout` is a layout the caller keeps, with hit testing, caret
+//! positions and cluster stops for text inputs; `drawTextRuns` and
+//! `drawLayout` color or embolden ranges (match highlights);
+//! `drawTextMiddle` puts the ellipsis in the middle (paths).
 //!
 //! All of it is single-threaded and must only be used on the GUI thread.
 const std = @import("std");
@@ -30,6 +43,7 @@ pub const BOOL = i32;
 const Unused = *const anyopaque;
 
 pub const D2DERR_RECREATE_TARGET: HRESULT = @bitCast(@as(u32, 0x8899000C));
+const E_NOT_SUFFICIENT_BUFFER: HRESULT = @bitCast(@as(u32, 0x8007007A));
 
 fn succeeded(hr: HRESULT) bool {
     return hr >= 0;
@@ -74,6 +88,11 @@ pub const Color = extern struct {
         return r | (g << 8) | (b << 16);
     }
 
+    /// The color as 0xRRGGBB, ignoring alpha.
+    pub fn toHex(self: Color) u24 {
+        return (@as(u24, to8(self.r)) << 16) | (@as(u24, to8(self.g)) << 8) | to8(self.b);
+    }
+
     fn to8(v: f32) u8 {
         return @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
     }
@@ -103,6 +122,29 @@ pub const Rect = struct {
     }
 };
 
+/// `v` (DIPs) moved to the nearest device pixel at `scale` (DPI / 96).
+pub fn snapValue(v: f32, scale: f32) f32 {
+    if (scale <= 0) return v;
+    return @round(v * scale) / scale;
+}
+
+/// `rect` with each edge on the nearest device pixel at `scale`, so it
+/// covers whole pixels (its size can differ by a pixel from `rect`'s).
+pub fn snapRectTo(rect: Rect, scale: f32) Rect {
+    const left = snapValue(rect.x, scale);
+    const top = snapValue(rect.y, scale);
+    const right = snapValue(rect.x + rect.w, scale);
+    const bottom = snapValue(rect.y + rect.h, scale);
+    return .{ .x = left, .y = top, .w = @max(0, right - left), .h = @max(0, bottom - top) };
+}
+
+/// `v` (DIPs) rounded up to whole device pixels at `scale`.
+pub fn ceilValue(v: f32, scale: f32) f32 {
+    if (scale <= 0) return @ceil(v);
+    // A tiny tolerance keeps 13.0000001 px from becoming 14 px.
+    return @ceil(v * scale - 0.001) / scale;
+}
+
 const RectF = extern struct { left: f32, top: f32, right: f32, bottom: f32 };
 const RoundedRect = extern struct { rect: RectF, radius_x: f32, radius_y: f32 };
 const Matrix3x2 = extern struct {
@@ -115,7 +157,7 @@ const Matrix3x2 = extern struct {
 };
 const PixelFormat = extern struct { format: u32, alpha_mode: u32 };
 const RenderTargetProperties = extern struct {
-    type: u32 = 0, // D2D1_RENDER_TARGET_TYPE_DEFAULT
+    type: u32 = D2D1_RENDER_TARGET_TYPE_DEFAULT,
     pixel_format: PixelFormat,
     dpi_x: f32 = 0,
     dpi_y: f32 = 0,
@@ -136,7 +178,29 @@ const ArcSegment = extern struct {
 };
 const BezierSegment = extern struct { point1: Point, point2: Point, point3: Point };
 const FactoryOptions = extern struct { debug_level: u32 = 0 };
+const TextRange = extern struct { start: u32, length: u32 };
 
+const HitTestMetrics = extern struct {
+    text_position: u32,
+    length: u32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    bidi_level: u32,
+    is_text: BOOL,
+    is_trimmed: BOOL,
+};
+
+const ClusterMetrics = extern struct {
+    width: f32,
+    length: u16,
+    flags: u16,
+};
+
+const D2D1_RENDER_TARGET_TYPE_DEFAULT: u32 = 0;
+const D2D1_RENDER_TARGET_TYPE_SOFTWARE: u32 = 1;
+const D2D1_PRESENT_OPTIONS_IMMEDIATELY: u32 = 2;
 const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 const D2D1_ALPHA_MODE_PREMULTIPLIED: u32 = 1;
 const D2D1_ALPHA_MODE_IGNORE: u32 = 3;
@@ -155,6 +219,7 @@ const DWRITE_FONT_STRETCH_NORMAL: u32 = 5;
 const DWRITE_WORD_WRAPPING_WRAP: u32 = 0;
 const DWRITE_WORD_WRAPPING_NO_WRAP: u32 = 1;
 const DWRITE_TRIMMING_GRANULARITY_CHARACTER: u32 = 1;
+const DWRITE_LINE_SPACING_METHOD_UNIFORM: u32 = 1;
 
 const Trimming = extern struct {
     granularity: u32,
@@ -440,7 +505,7 @@ const TextFormatVTable = extern struct {
     SetFlowDirection: Unused,
     SetIncrementalTabStop: Unused,
     SetTrimming: *const fn (*anyopaque, *const Trimming, ?*anyopaque) callconv(.winapi) HRESULT,
-    SetLineSpacing: Unused,
+    SetLineSpacing: *const fn (*anyopaque, u32, f32, f32) callconv(.winapi) HRESULT,
     GetTextAlignment: Unused,
     GetParagraphAlignment: Unused,
     GetWordWrapping: Unused,
@@ -487,13 +552,13 @@ const IDWriteTextLayout = extern struct {
         SetMaxHeight: Unused,
         SetFontCollection: Unused,
         SetFontFamilyName: Unused,
-        SetFontWeight: Unused,
+        SetFontWeight: *const fn (*IDWriteTextLayout, u32, TextRange) callconv(.winapi) HRESULT,
         SetFontStyle: Unused,
         SetFontStretch: Unused,
         SetFontSize: Unused,
-        SetUnderline: Unused,
+        SetUnderline: *const fn (*IDWriteTextLayout, BOOL, TextRange) callconv(.winapi) HRESULT,
         SetStrikethrough: Unused,
-        SetDrawingEffect: Unused,
+        SetDrawingEffect: *const fn (*IDWriteTextLayout, ?*anyopaque, TextRange) callconv(.winapi) HRESULT,
         SetInlineObject: Unused,
         SetTypography: Unused,
         SetLocaleName: Unused,
@@ -517,10 +582,10 @@ const IDWriteTextLayout = extern struct {
         GetLineMetrics: Unused,
         GetMetrics: *const fn (*IDWriteTextLayout, *TextMetrics) callconv(.winapi) HRESULT,
         GetOverhangMetrics: Unused,
-        GetClusterMetrics: Unused,
+        GetClusterMetrics: *const fn (*IDWriteTextLayout, ?[*]ClusterMetrics, u32, *u32) callconv(.winapi) HRESULT,
         DetermineMinWidth: Unused,
-        HitTestPoint: Unused,
-        HitTestTextPosition: Unused,
+        HitTestPoint: *const fn (*IDWriteTextLayout, f32, f32, *BOOL, *BOOL, *HitTestMetrics) callconv(.winapi) HRESULT,
+        HitTestTextPosition: *const fn (*IDWriteTextLayout, u32, BOOL, *f32, *f32, *HitTestMetrics) callconv(.winapi) HRESULT,
         HitTestTextRange: Unused,
     };
 };
@@ -542,6 +607,9 @@ comptime {
     std.debug.assert(@sizeOf(TextFormatVTable) == 28 * slot);
     std.debug.assert(@sizeOf(IDWriteTextFormat1.VTable) == 36 * slot);
     std.debug.assert(@sizeOf(IDWriteTextLayout.VTable) == 67 * slot);
+    // DWRITE_HIT_TEST_METRICS and DWRITE_CLUSTER_METRICS.
+    std.debug.assert(@sizeOf(HitTestMetrics) == 36);
+    std.debug.assert(@sizeOf(ClusterMetrics) == 8);
 }
 
 extern "d2d1" fn D2D1CreateFactory(
@@ -557,14 +625,19 @@ extern "dwrite" fn DWriteCreateFactory(
     factory: *?*anyopaque,
 ) callconv(.winapi) HRESULT;
 
+pub extern "kernel32" fn GetUserDefaultLocaleName(
+    name: [*]u16,
+    len: c_int,
+) callconv(.winapi) c_int;
+
 // -----------------------------------------------------------------------
-// Factory
+// Fonts
 // -----------------------------------------------------------------------
 
 /// Which font a text style uses.
 pub const FontKind = enum {
-    /// The UI font ("Segoe UI Variable Text", else "Segoe UI") with
-    /// "Microsoft YaHei UI" for CJK text.
+    /// The UI font ("Segoe UI Variable" in the optical size for the font
+    /// size, else "Segoe UI") with the CJK fallback.
     ui,
 
     /// The icon font ("Segoe Fluent Icons", else "Segoe MDL2 Assets").
@@ -606,12 +679,167 @@ pub const TextStyle = struct {
     wrap: bool = false,
     /// Trim overflowing text with an ellipsis.
     ellipsis: bool = true,
+    /// Line height in DIPs (e.g. 20 for the 14/20 body style); 0 keeps
+    /// the font's own line spacing.
+    line_height: f32 = 0,
+    /// A font family by name (e.g. to preview a font), overriding `font`
+    /// but keeping its CJK fallback; empty for the `font` family.
+    family: []const u8 = "",
 };
+
+/// The optical size of Segoe UI Variable for a font size (Fluent type
+/// ramp): Small below 13 DIPs, Display from 20 DIPs, Text in between.
+pub const OpticalSize = enum { small, text, display };
+
+pub fn opticalSize(size: f32) OpticalSize {
+    if (size < 13) return .small;
+    if (size >= 20) return .display;
+    return .text;
+}
+
+/// The CJK font of the UI text.
+pub const CjkFont = enum {
+    yahei,
+    jhenghei,
+    yu_gothic,
+    malgun,
+
+    fn family(self: CjkFont) [:0]const u16 {
+        const L = std.unicode.utf8ToUtf16LeStringLiteral;
+        return switch (self) {
+            .yahei => L("Microsoft YaHei UI"),
+            .jhenghei => L("Microsoft JhengHei UI"),
+            .yu_gothic => L("Yu Gothic UI"),
+            .malgun => L("Malgun Gothic"),
+        };
+    }
+};
+
+/// The CJK font for the UI language and the user locale (BCP 47, from
+/// `GetUserDefaultLocaleName`): the Chinese UI uses Microsoft YaHei UI;
+/// the English one draws CJK text (titles, paths) in the font of the
+/// user's region.
+pub fn cjkFontFor(language: i18n.Language, locale: []const u8) CjkFont {
+    if (language == .zh_CN) return .yahei;
+    if (startsWithIgnoreCase(locale, "ja")) return .yu_gothic;
+    if (startsWithIgnoreCase(locale, "ko")) return .malgun;
+    if (startsWithIgnoreCase(locale, "zh")) {
+        if (std.ascii.findIgnoreCase(locale, "hant") != null) return .jhenghei;
+        for ([_][]const u8{ "zh-TW", "zh-HK", "zh-MO" }) |prefix| {
+            if (startsWithIgnoreCase(locale, prefix)) return .jhenghei;
+        }
+    }
+    return .yahei;
+}
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    if (text.len < prefix.len) return false;
+    if (!std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix)) return false;
+    // "ja" must not match "jav": the language subtag ends here.
+    return text.len == prefix.len or text[prefix.len] == '-' or text[prefix.len] == '_';
+}
+
+fn userLocale(buf: []u8) []const u8 {
+    var units: [85]u16 = undefined;
+    const n = GetUserDefaultLocaleName(&units, units.len);
+    if (n <= 1) return "";
+    return wstr.utf8Buf(buf, units[0..@intCast(n - 1)]);
+}
+
+// -----------------------------------------------------------------------
+// Generational cache
+// -----------------------------------------------------------------------
+
+/// A cache of byte-string keys that holds at most 2 × `capacity` entries
+/// and forgets the least recently used ones a generation at a time:
+/// entries live in the young generation; a hit in the old one moves the
+/// entry back; when the young generation is full, the old one is dropped
+/// (`release` frees its values) and the young one becomes old.
+pub fn GenerationalCache(comptime V: type, comptime release_value: fn (V) void) type {
+    return struct {
+        const Self = @This();
+        const Map = std.StringHashMapUnmanaged(V);
+
+        young: Map = .empty,
+        old: Map = .empty,
+        capacity: u32,
+
+        pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.clear(alloc);
+            self.young.deinit(alloc);
+            self.old.deinit(alloc);
+        }
+
+        /// Drop every entry.
+        pub fn clear(self: *Self, alloc: Allocator) void {
+            drop(alloc, &self.young);
+            drop(alloc, &self.old);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return self.young.count() + self.old.count();
+        }
+
+        fn drop(alloc: Allocator, map: *Map) void {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                release_value(entry.value_ptr.*);
+            }
+            map.clearRetainingCapacity();
+        }
+
+        fn rotate(self: *Self, alloc: Allocator) void {
+            drop(alloc, &self.old);
+            std.mem.swap(Map, &self.young, &self.old);
+        }
+
+        /// The value for `key`, valid until the next `put` or `get`.
+        pub fn get(self: *Self, alloc: Allocator, key: []const u8) ?*V {
+            if (self.young.getPtr(key)) |value| return value;
+            const entry = self.old.fetchRemove(key) orelse return null;
+            if (self.young.count() >= self.capacity) self.rotate(alloc);
+            self.young.putNoClobber(alloc, entry.key, entry.value) catch {
+                alloc.free(entry.key);
+                release_value(entry.value);
+                return null;
+            };
+            return self.young.getPtr(entry.key);
+        }
+
+        /// Add `value` for `key` (not in the cache); the cache owns it from
+        /// now on, also when adding fails (it is released then).
+        pub fn put(self: *Self, alloc: Allocator, key: []const u8, value: V) ?*V {
+            if (self.young.count() >= self.capacity) self.rotate(alloc);
+            const owned = alloc.dupe(u8, key) catch {
+                release_value(value);
+                return null;
+            };
+            self.young.putNoClobber(alloc, owned, value) catch {
+                alloc.free(owned);
+                release_value(value);
+                return null;
+            };
+            return self.young.getPtr(owned);
+        }
+    };
+}
+
+// -----------------------------------------------------------------------
+// Factory
+// -----------------------------------------------------------------------
 
 const FormatKey = struct {
     font: FontKind,
     size: f32,
     weight: FontWeight,
+    /// `TextStyle.family`; owned by the cache once stored.
+    family: []const u8 = "",
+
+    fn eql(a: FormatKey, b: FormatKey) bool {
+        return a.font == b.font and a.size == b.size and a.weight == b.weight and
+            std.mem.eql(u8, a.family, b.family);
+    }
 };
 
 const CachedFormat = struct {
@@ -619,6 +847,72 @@ const CachedFormat = struct {
     format: *IDWriteTextFormat,
     ellipsis: ?*anyopaque,
 };
+
+/// A laid-out text kept by `TextCache`, with its metrics once measured.
+const CachedLayout = struct {
+    layout: *IDWriteTextLayout,
+    metrics: ?TextMetrics = null,
+};
+
+fn releaseCachedLayout(entry: CachedLayout) void {
+    release(entry.layout);
+}
+
+/// Laid-out text by format, layout box and text (`Factory.text_cache`).
+pub const TextCache = GenerationalCache(CachedLayout, releaseCachedLayout);
+
+/// The layout parameters of a `TextCache` key; all fields are 4 bytes
+/// wide, so the struct has no padding and hashes deterministically.
+const LayoutKey = extern struct {
+    font: u32,
+    weight: u32,
+    align_x: u32,
+    align_y: u32,
+    wrap: u32,
+    ellipsis: u32,
+    size: f32,
+    max_w: f32,
+    max_h: f32,
+    line_height: f32,
+    family_len: u32,
+
+    fn of(style: TextStyle, max_w: f32, max_h: f32) LayoutKey {
+        return .{
+            .font = @intFromEnum(style.font),
+            .weight = @intFromEnum(style.weight),
+            .align_x = @intFromEnum(style.align_x),
+            .align_y = @intFromEnum(style.align_y),
+            .wrap = @intFromBool(style.wrap),
+            .ellipsis = @intFromBool(style.ellipsis),
+            .size = style.size,
+            .max_w = @max(max_w, 0),
+            .max_h = @max(max_h, 0),
+            .line_height = style.line_height,
+            .family_len = @intCast(style.family.len),
+        };
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(LayoutKey) == 11 * 4);
+}
+
+/// The cache key of a layout: the parameters, the family and the text;
+/// null when it does not fit `buf` (such text is laid out uncached).
+fn layoutKey(buf: []u8, text: []const u8, style: TextStyle, max_w: f32, max_h: f32) ?[]const u8 {
+    const params = LayoutKey.of(style, max_w, max_h);
+    const head = std.mem.asBytes(&params);
+    const len = head.len + style.family.len + text.len;
+    if (len > buf.len) return null;
+    @memcpy(buf[0..head.len], head);
+    @memcpy(buf[head.len..][0..style.family.len], style.family);
+    @memcpy(buf[head.len + style.family.len ..][0..text.len], text);
+    return buf[0..len];
+}
+
+/// Why creating the factory failed, so later calls fail at once without
+/// another log line (GUI thread only).
+var create_failure: ?Factory.Error = null;
 
 /// The process-wide D2D and DirectWrite state of the UI.
 pub const Factory = struct {
@@ -628,10 +922,23 @@ pub const Factory = struct {
     d2d_1_1: bool,
     dwrite: *IDWriteFactory,
     fallback: ?*IDWriteFontFallback = null,
+    /// The CJK font `fallback` maps to.
+    cjk: ?CjkFont = null,
     ui_family: [:0]const u16,
+    /// The optical sizes of Segoe UI Variable, when installed.
+    ui_small: ?[:0]const u16 = null,
+    ui_display: ?[:0]const u16 = null,
     icon_family: [:0]const u16,
     mono_family: [:0]const u16,
     formats: std.ArrayList(CachedFormat) = .empty,
+    text_cache: TextCache = .{ .capacity = text_cache_capacity },
+
+    pub const Error = error{ Direct2DUnavailable, DirectWriteUnavailable, OutOfMemory };
+
+    /// Entries per `TextCache` generation.
+    pub const text_cache_capacity = 256;
+    /// Formats with a custom family kept at most (font previews).
+    const max_family_formats = 64;
 
     const cjk_ranges = [_]UnicodeRange{
         .{ .first = 0x2E80, .last = 0x2FDF },
@@ -649,7 +956,18 @@ pub const Factory = struct {
 
     const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
-    pub fn create(alloc: Allocator) !*Factory {
+    /// Create the factory; a failure is logged once and returned again by
+    /// later calls without retrying.
+    pub fn create(alloc: Allocator) Error!*Factory {
+        if (create_failure) |err| return err;
+        return createNew(alloc) catch |err| {
+            create_failure = err;
+            log.warn("Direct2D UI unavailable err={}", .{err});
+            return err;
+        };
+    }
+
+    fn createNew(alloc: Allocator) Error!*Factory {
         var d2d_ptr: ?*anyopaque = null;
         var d2d_1_1 = true;
         if (!succeeded(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory1, null, &d2d_ptr))) {
@@ -679,31 +997,42 @@ pub const Factory = struct {
 
         if (self.systemFontCollection()) |collection| {
             defer release(collection);
-            if (hasFamily(collection, L("Segoe UI Variable Text"))) self.ui_family = L("Segoe UI Variable Text");
+            if (hasFamily(collection, L("Segoe UI Variable Text"))) {
+                self.ui_family = L("Segoe UI Variable Text");
+                if (hasFamily(collection, L("Segoe UI Variable Small"))) self.ui_small = L("Segoe UI Variable Small");
+                if (hasFamily(collection, L("Segoe UI Variable Display"))) self.ui_display = L("Segoe UI Variable Display");
+            }
             if (hasFamily(collection, L("Segoe Fluent Icons"))) self.icon_family = L("Segoe Fluent Icons");
             if (hasFamily(collection, L("Cascadia Mono"))) self.mono_family = L("Cascadia Mono");
         }
-        self.fallback = self.createFallback();
+        self.updateFallback();
         return self;
     }
 
     pub fn destroy(self: *Factory) void {
         self.flushFormats();
         self.formats.deinit(self.alloc);
+        self.text_cache.deinit(self.alloc);
         if (self.fallback) |f| release(f);
         release(self.dwrite);
         release(self.d2d);
         self.alloc.destroy(self);
     }
 
-    /// Drop the cached text formats, e.g. after a UI language change
-    /// (formats carry the locale).
+    /// Drop the cached text formats and laid-out text, e.g. after a UI
+    /// language change (formats carry the locale, and the CJK fallback
+    /// follows the language).
     pub fn flushFormats(self: *Factory) void {
-        for (self.formats.items) |cached| {
-            if (cached.ellipsis) |sign| release(sign);
-            release(cached.format);
-        }
+        self.text_cache.clear(self.alloc);
+        for (self.formats.items) |cached| freeFormat(self.alloc, cached);
         self.formats.clearRetainingCapacity();
+        self.updateFallback();
+    }
+
+    fn freeFormat(alloc: Allocator, cached: CachedFormat) void {
+        if (cached.ellipsis) |sign| release(sign);
+        release(cached.format);
+        if (cached.key.family.len > 0) alloc.free(cached.key.family);
     }
 
     fn systemFontCollection(self: *Factory) ?*IDWriteFontCollection {
@@ -719,9 +1048,20 @@ pub const Factory = struct {
         return exists != 0;
     }
 
-    /// A font fallback that maps CJK text to "Microsoft YaHei UI" before
-    /// the system fallback. Null before Windows 8.1 (no IDWriteFactory2).
-    fn createFallback(self: *Factory) ?*IDWriteFontFallback {
+    /// Build the font fallback for the current UI language and user locale
+    /// when it changed.
+    fn updateFallback(self: *Factory) void {
+        var locale_buf: [96]u8 = undefined;
+        const cjk = cjkFontFor(i18n.current(), userLocale(&locale_buf));
+        if (self.cjk == cjk and self.fallback != null) return;
+        if (self.fallback) |f| release(f);
+        self.fallback = self.createFallback(cjk);
+        self.cjk = cjk;
+    }
+
+    /// A font fallback that maps CJK text to `cjk` before the system
+    /// fallback. Null before Windows 8.1 (no IDWriteFactory2).
+    fn createFallback(self: *Factory, cjk: CjkFont) ?*IDWriteFontFallback {
         const factory2: *IDWriteFactory2 = @ptrCast(@alignCast(queryInterface(self.dwrite, &IID_IDWriteFactory2) orelse return null));
         defer release(factory2);
 
@@ -730,7 +1070,7 @@ pub const Factory = struct {
         const b = builder orelse return null;
         defer release(b);
 
-        const families = [_][*:0]const u16{L("Microsoft YaHei UI")};
+        const families = [_][*:0]const u16{cjk.family()};
         if (!succeeded(b.vtable.AddMapping(b, &cjk_ranges, cjk_ranges.len, &families, families.len, null, null, null, 1.0))) return null;
 
         var system: ?*IDWriteFontFallback = null;
@@ -746,14 +1086,27 @@ pub const Factory = struct {
         return fallback;
     }
 
-    /// The (cached) text format for a font, size and weight.
+    /// The UI family for a font size: Segoe UI Variable in its optical
+    /// size when installed.
+    fn uiFamily(self: *const Factory, size: f32) [:0]const u16 {
+        return switch (opticalSize(size)) {
+            .small => self.ui_small orelse self.ui_family,
+            .text => self.ui_family,
+            .display => self.ui_display orelse self.ui_family,
+        };
+    }
+
+    /// The (cached) text format for a font, size, weight and family.
     fn textFormat(self: *Factory, key: FormatKey) ?*CachedFormat {
         for (self.formats.items) |*cached| {
-            if (std.meta.eql(cached.key, key)) return cached;
+            if (cached.key.eql(key)) return cached;
         }
 
-        const family = switch (key.font) {
-            .ui => self.ui_family,
+        var family_buf: [128]u16 = undefined;
+        const family: [:0]const u16 = if (key.family.len > 0)
+            wstr.bufZ(&family_buf, key.family)
+        else switch (key.font) {
+            .ui => self.uiFamily(key.size),
             .icon => self.icon_family,
             .mono => self.mono_family,
         };
@@ -775,7 +1128,7 @@ pub const Factory = struct {
         ))) return null;
         const f = format orelse return null;
 
-        if (key.font != .icon) {
+        if (key.font != .icon or key.family.len > 0) {
             if (self.fallback) |fallback| {
                 if (queryInterface(f, &IID_IDWriteTextFormat1)) |ptr| {
                     const format1: *IDWriteTextFormat1 = @ptrCast(@alignCast(ptr));
@@ -788,33 +1141,52 @@ pub const Factory = struct {
         var sign: ?*anyopaque = null;
         if (!succeeded(self.dwrite.vtable.CreateEllipsisTrimmingSign(self.dwrite, f, &sign))) sign = null;
 
-        self.formats.append(self.alloc, .{ .key = key, .format = f, .ellipsis = sign }) catch {
-            if (sign) |s| release(s);
-            release(f);
+        var stored = key;
+        if (key.family.len > 0) {
+            self.dropFamilyFormats();
+            stored.family = self.alloc.dupe(u8, key.family) catch {
+                if (sign) |s| release(s);
+                release(f);
+                return null;
+            };
+        }
+        self.formats.append(self.alloc, .{ .key = stored, .format = f, .ellipsis = sign }) catch {
+            freeFormat(self.alloc, .{ .key = stored, .format = f, .ellipsis = sign });
             return null;
         };
         return &self.formats.items[self.formats.items.len - 1];
     }
 
-    /// Lay out UTF-8 `text` in a box; the caller releases the layout.
-    fn layout(self: *Factory, text: []const u8, style: TextStyle, max_w: f32, max_h: f32) ?*IDWriteTextLayout {
-        const cached = self.textFormat(.{ .font = style.font, .size = style.size, .weight = style.weight }) orelse return null;
+    /// Keep the formats of custom families (previews of many fonts) from
+    /// piling up: drop them all past `max_family_formats`.
+    fn dropFamilyFormats(self: *Factory) void {
+        var families: usize = 0;
+        for (self.formats.items) |cached| {
+            if (cached.key.family.len > 0) families += 1;
+        }
+        if (families < max_family_formats) return;
+        var i: usize = 0;
+        while (i < self.formats.items.len) {
+            const cached = self.formats.items[i];
+            if (cached.key.family.len > 0) {
+                freeFormat(self.alloc, cached);
+                _ = self.formats.swapRemove(i);
+            } else i += 1;
+        }
+    }
 
-        var stack: [512]u16 = undefined;
-        var heap: ?[:0]u16 = null;
-        defer if (heap) |h| self.alloc.free(h);
-        const text16: []const u16 = if (wstr.utf16Len(text) < stack.len)
-            wstr.bufZ(&stack, text)
-        else blk: {
-            heap = wstr.allocZ(self.alloc, text) catch return null;
-            break :blk heap.?;
-        };
+    fn formatOf(self: *Factory, style: TextStyle) ?*CachedFormat {
+        return self.textFormat(.{ .font = style.font, .size = style.size, .weight = style.weight, .family = style.family });
+    }
 
+    /// Lay out UTF-16 `text` in a box; the caller releases the layout.
+    fn createLayout16(self: *Factory, text: []const u16, style: TextStyle, max_w: f32, max_h: f32) ?*IDWriteTextLayout {
+        const cached = self.formatOf(style) orelse return null;
         var out: ?*IDWriteTextLayout = null;
         if (!succeeded(self.dwrite.vtable.CreateTextLayout(
             self.dwrite,
-            text16.ptr,
-            @intCast(text16.len),
+            text.ptr,
+            @intCast(text.len),
             cached.format,
             @max(max_w, 0),
             @max(max_h, 0),
@@ -829,7 +1201,39 @@ pub const Factory = struct {
         if (style.ellipsis) {
             _ = vt.SetTrimming(l, &.{ .granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER }, cached.ellipsis);
         }
+        if (style.line_height > 0) {
+            // Baseline at 80 % of the line centers Segoe UI's ascent and
+            // descent in the line.
+            _ = vt.SetLineSpacing(l, DWRITE_LINE_SPACING_METHOD_UNIFORM, style.line_height, style.line_height * 0.8);
+        }
         return l;
+    }
+
+    /// Lay out UTF-8 `text`; the caller releases the layout.
+    fn createLayout(self: *Factory, text: []const u8, style: TextStyle, max_w: f32, max_h: f32) ?*IDWriteTextLayout {
+        var stack: [512]u16 = undefined;
+        var heap: ?[:0]u16 = null;
+        defer if (heap) |h| self.alloc.free(h);
+        const text16: []const u16 = if (wstr.utf16Len(text) < stack.len)
+            wstr.bufZ(&stack, text)
+        else blk: {
+            heap = wstr.allocZ(self.alloc, text) catch return null;
+            break :blk heap.?;
+        };
+        return self.createLayout16(text16, style, max_w, max_h);
+    }
+
+    /// A layout of UTF-8 `text` from the text cache, laid out on a miss.
+    fn layout(self: *Factory, text: []const u8, style: TextStyle, max_w: f32, max_h: f32) ?LayoutRef {
+        var key_buf: [1024]u8 = undefined;
+        const key = layoutKey(&key_buf, text, style, max_w, max_h) orelse {
+            const l = self.createLayout(text, style, max_w, max_h) orelse return null;
+            return .{ .layout = l, .entry = null };
+        };
+        if (self.text_cache.get(self.alloc, key)) |entry| return .{ .layout = entry.layout, .entry = entry };
+        const l = self.createLayout(text, style, max_w, max_h) orelse return null;
+        const entry = self.text_cache.put(self.alloc, key, .{ .layout = l }) orelse return null;
+        return .{ .layout = entry.layout, .entry = entry };
     }
 
     /// Measure UTF-8 `text` laid out with `style`, at most `max_width`
@@ -837,13 +1241,235 @@ pub const Factory = struct {
     pub fn measureText(self: *Factory, text: []const u8, style: TextStyle, max_width: f32) Size {
         var s = style;
         s.ellipsis = false;
-        const l = self.layout(text, s, max_width, 100_000) orelse return .{ .width = 0, .height = 0 };
-        defer release(l);
-        var metrics: TextMetrics = undefined;
-        if (!succeeded(l.vtable.GetMetrics(l, &metrics))) return .{ .width = 0, .height = 0 };
+        const ref = self.layout(text, s, max_width, 100_000) orelse return .{ .width = 0, .height = 0 };
+        defer ref.deinit();
+        const metrics = ref.metrics() orelse return .{ .width = 0, .height = 0 };
         return .{ .width = metrics.width_including_trailing_whitespace, .height = metrics.height };
     }
+
+    /// `measureText` rounded up to whole device pixels at `scale`, so
+    /// boxes sized from it never cut the last pixel column of the text.
+    pub fn measureTextCeil(self: *Factory, text: []const u8, style: TextStyle, max_width: f32, scale: f32) Size {
+        const s = self.measureText(text, style, max_width);
+        return .{ .width = ceilValue(s.width, scale), .height = ceilValue(s.height, scale) };
+    }
+
+    /// The number of laid-out texts in the cache.
+    pub fn cachedLayouts(self: *const Factory) usize {
+        return self.text_cache.count();
+    }
 };
+
+/// A laid-out text: from the cache (`entry`, not released) or not.
+const LayoutRef = struct {
+    layout: *IDWriteTextLayout,
+    entry: ?*CachedLayout,
+
+    fn deinit(self: LayoutRef) void {
+        if (self.entry == null) release(self.layout);
+    }
+
+    fn metrics(self: LayoutRef) ?TextMetrics {
+        if (self.entry) |entry| if (entry.metrics) |m| return m;
+        var m: TextMetrics = undefined;
+        if (!succeeded(self.layout.vtable.GetMetrics(self.layout, &m))) return null;
+        if (self.entry) |entry| entry.metrics = m;
+        return m;
+    }
+};
+
+// -----------------------------------------------------------------------
+// Text layouts kept by the caller
+// -----------------------------------------------------------------------
+
+/// A range of a `TextLayout` (UTF-16 code units) drawn differently.
+pub const LayoutRun = struct {
+    start: u32,
+    len: u32,
+    /// Draw the range in this color instead of the default one.
+    color: ?Color = null,
+    weight: ?FontWeight = null,
+    underline: bool = false,
+};
+
+/// A range of UTF-8 text (bytes) drawn differently by `drawTextRuns`.
+pub const TextRun = struct {
+    start: usize,
+    len: usize,
+    color: ?Color = null,
+    weight: ?FontWeight = null,
+    underline: bool = false,
+};
+
+/// A laid-out UTF-16 text the caller keeps (a text input lays its text out
+/// once per change): measure it, hit-test points, find caret positions and
+/// cluster stops, draw it with `Canvas.drawLayout`. Positions are UTF-16
+/// code units from the start of the text.
+pub const TextLayout = struct {
+    ptr: *IDWriteTextLayout,
+    /// The length of the text in code units.
+    len: u32,
+    weight: FontWeight,
+
+    pub fn initUtf16(factory: *Factory, text: []const u16, style: TextStyle, max_w: f32, max_h: f32) ?TextLayout {
+        const l = factory.createLayout16(text, style, max_w, max_h) orelse return null;
+        return .{ .ptr = l, .len = @intCast(text.len), .weight = style.weight };
+    }
+
+    pub fn initUtf8(factory: *Factory, text: []const u8, style: TextStyle, max_w: f32, max_h: f32) ?TextLayout {
+        const l = factory.createLayout(text, style, max_w, max_h) orelse return null;
+        return .{ .ptr = l, .len = @intCast(wstr.utf16Len(text)), .weight = style.weight };
+    }
+
+    pub fn deinit(self: *TextLayout) void {
+        release(self.ptr);
+        self.* = undefined;
+    }
+
+    /// The size of the text, trailing whitespace included.
+    pub fn size(self: *const TextLayout) Size {
+        var m: TextMetrics = undefined;
+        if (!succeeded(self.ptr.vtable.GetMetrics(self.ptr, &m))) return .{ .width = 0, .height = 0 };
+        return .{ .width = m.width_including_trailing_whitespace, .height = m.height };
+    }
+
+    pub const Hit = struct {
+        /// The caret position closest to the point.
+        position: u32,
+        /// Whether the point is on the text.
+        inside: bool,
+    };
+
+    /// The caret position for a point relative to the layout origin.
+    pub fn hitTest(self: *const TextLayout, x: f32, y: f32) Hit {
+        var trailing: BOOL = 0;
+        var inside: BOOL = 0;
+        var m: HitTestMetrics = undefined;
+        if (!succeeded(self.ptr.vtable.HitTestPoint(self.ptr, x, y, &trailing, &inside, &m)))
+            return .{ .position = 0, .inside = false };
+        const pos = m.text_position + if (trailing != 0) m.length else 0;
+        return .{ .position = @min(pos, self.len), .inside = inside != 0 };
+    }
+
+    /// The x of the caret before code unit `position` (after the text at
+    /// its end), relative to the layout origin.
+    pub fn caretX(self: *const TextLayout, position: u32) f32 {
+        if (self.len == 0) return 0;
+        var x: f32 = 0;
+        var y: f32 = 0;
+        var m: HitTestMetrics = undefined;
+        const at_end = position >= self.len;
+        const pos = if (at_end) self.len - 1 else position;
+        if (!succeeded(self.ptr.vtable.HitTestTextPosition(self.ptr, pos, @intFromBool(at_end), &x, &y, &m))) return 0;
+        return x;
+    }
+
+    /// The grapheme cluster stops of the text: 0, the end of each cluster,
+    /// the last one `len` (see `text_edit.handleKey`).
+    pub fn clusterStops(self: *const TextLayout, alloc: Allocator, out: *std.ArrayList(u32)) Allocator.Error!void {
+        out.clearRetainingCapacity();
+        var stack: [256]ClusterMetrics = undefined;
+        var heap: ?[]ClusterMetrics = null;
+        defer if (heap) |h| alloc.free(h);
+        var actual: u32 = 0;
+        var clusters: []ClusterMetrics = &stack;
+        var hr = self.ptr.vtable.GetClusterMetrics(self.ptr, &stack, stack.len, &actual);
+        if (hr == E_NOT_SUFFICIENT_BUFFER) {
+            heap = try alloc.alloc(ClusterMetrics, actual);
+            clusters = heap.?;
+            hr = self.ptr.vtable.GetClusterMetrics(self.ptr, clusters.ptr, actual, &actual);
+        }
+        if (!succeeded(hr)) return;
+        try out.ensureTotalCapacity(alloc, actual + 1);
+        var pos: u32 = 0;
+        out.appendAssumeCapacity(0);
+        for (clusters[0..actual]) |cluster| {
+            pos += cluster.length;
+            out.appendAssumeCapacity(pos);
+        }
+    }
+};
+
+// -----------------------------------------------------------------------
+// Middle ellipsis
+// -----------------------------------------------------------------------
+
+const ellipsis_text = "\u{2026}";
+
+/// `text` fitted into `max_w` with "…" in the middle when it is too wide:
+/// its start and as much as possible of its end, keeping the whole last
+/// path component ("C:\Users\…\config.ghostty") when that fits. `measure`
+/// returns the width of a string; the result lives in `buf` or is `text`.
+pub fn middleEllipsis(
+    buf: []u8,
+    text: []const u8,
+    max_w: f32,
+    ctx: anytype,
+    comptime measure: fn (@TypeOf(ctx), []const u8) f32,
+) []const u8 {
+    if (measure(ctx, text) <= max_w) return text;
+
+    // Codepoint starts, enough for any path the UI shows.
+    var starts_buf: [512]usize = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and n < starts_buf.len) {
+        starts_buf[n] = i;
+        n += 1;
+        i += std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+    }
+    if (i < text.len) return text;
+    const starts = starts_buf[0..n];
+
+    const Fit = struct {
+        /// The byte offset of codepoint `k` (the end for `k` past the last).
+        fn at(cps: []const usize, src: []const u8, k: usize) usize {
+            return if (k < cps.len) cps[k] else src.len;
+        }
+
+        fn compose(out: []u8, src: []const u8, head_end: usize, tail_start: usize) ?[]const u8 {
+            const len = head_end + ellipsis_text.len + (src.len - tail_start);
+            if (len > out.len) return null;
+            @memcpy(out[0..head_end], src[0..head_end]);
+            @memcpy(out[head_end..][0..ellipsis_text.len], ellipsis_text);
+            @memcpy(out[head_end + ellipsis_text.len ..][0 .. src.len - tail_start], src[tail_start..]);
+            return out[0..len];
+        }
+    };
+
+    // Keep the last path component and as much of the start as fits.
+    if (std.mem.findLastAny(u8, text, "\\/")) |sep| if (sep > 0) {
+        if (Fit.compose(buf, text, 0, sep)) |only_tail| if (measure(ctx, only_tail) <= max_w) {
+            // The most codepoints of the head before `sep` that fit.
+            var lo: usize = 0;
+            var hi: usize = 0;
+            while (hi < starts.len and starts[hi] < sep) hi += 1;
+            while (lo < hi) {
+                const mid = (lo + hi + 1) / 2;
+                const candidate = Fit.compose(buf, text, Fit.at(starts, text, mid), sep) orelse break;
+                if (measure(ctx, candidate) <= max_w) lo = mid else hi = mid - 1;
+            }
+            return Fit.compose(buf, text, Fit.at(starts, text, lo), sep).?;
+        };
+    };
+
+    // Otherwise keep the same number of codepoints at both ends.
+    var lo: usize = 0;
+    var hi: usize = starts.len;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) / 2;
+        const head = (mid + 1) / 2;
+        const tail = mid / 2;
+        const candidate = Fit.compose(buf, text, Fit.at(starts, text, head), Fit.at(starts, text, starts.len - tail)) orelse {
+            hi = mid - 1;
+            continue;
+        };
+        if (measure(ctx, candidate) <= max_w) lo = mid else hi = mid - 1;
+    }
+    const head = (lo + 1) / 2;
+    const tail = lo / 2;
+    return Fit.compose(buf, text, Fit.at(starts, text, head), Fit.at(starts, text, starts.len - tail)) orelse ellipsis_text;
+}
 
 // -----------------------------------------------------------------------
 // Canvas
@@ -895,19 +1521,43 @@ pub const Path = struct {
     }
 };
 
+/// How a frame ended (`Canvas.finish`).
+pub const EndResult = enum {
+    /// Drawn and presented.
+    ok,
+    /// The device was lost: the target is gone; paint again to draw on a
+    /// new one.
+    recreate,
+    /// Drawing failed for another reason (logged once per canvas).
+    failed,
+};
+
+fn endResultOf(hr: HRESULT) EndResult {
+    if (hr == D2DERR_RECREATE_TARGET) return .recreate;
+    if (!succeeded(hr)) return .failed;
+    return .ok;
+}
+
 /// Draws on one render target in DIPs. Create it with the app's
-/// `Factory`, call `beginHwnd` (or `beginDc`) / draw / `end` from the
-/// paint handler and `deinit` when the target window goes away.
+/// `Factory`, call `beginHwnd` (or `beginDc`) / draw / `finish` (or `end`)
+/// from the paint handler and `deinit` when the target window goes away.
 pub const Canvas = struct {
     factory: *Factory,
     target: Target = .none,
     brush: ?*ID2D1SolidColorBrush = null,
+    /// Brushes of `drawLayout` runs with their own color.
+    run_brushes: [max_run_colors]?*ID2D1SolidColorBrush = @splat(null),
     /// Pixel size and DPI of the current HWND target.
     pixel_size: SizeU = .{ .width = 0, .height = 0 },
     dpi: f32 = 96,
     drawing: bool = false,
     /// Whether the DC target keeps per-pixel alpha (`beginDcAlpha`).
     dc_alpha: bool = false,
+    /// Whether a failure was logged already.
+    warned: bool = false,
+
+    /// Distinct run colors one `drawLayout` call can use.
+    pub const max_run_colors = 4;
 
     const Target = union(enum) {
         none,
@@ -932,16 +1582,32 @@ pub const Canvas = struct {
     }
 
     /// Release the render target and its resources; the next begin
-    /// recreates them (needed after D2DERR_RECREATE_TARGET).
+    /// recreates them (after D2DERR_RECREATE_TARGET, or to free a hidden
+    /// popup's target).
     pub fn discardTarget(self: *Canvas) void {
         if (self.brush) |b| release(b);
         self.brush = null;
+        for (&self.run_brushes) |*slot| {
+            if (slot.*) |b| release(b);
+            slot.* = null;
+        }
         switch (self.target) {
             .none => {},
             .hwnd => |rt| release(rt),
             .dc => |rt| release(rt),
         }
         self.target = .none;
+    }
+
+    /// Whether the canvas holds a render target.
+    pub fn hasTarget(self: *const Canvas) bool {
+        return self.target != .none;
+    }
+
+    fn warnOnce(self: *Canvas, comptime fmt: []const u8, args: anytype) void {
+        if (self.warned) return;
+        self.warned = true;
+        log.warn(fmt, args);
     }
 
     /// Begin drawing into the client area of `hwnd` (`dpi` from
@@ -956,6 +1622,16 @@ pub const Canvas = struct {
         const dpi_f: f32 = @floatFromInt(if (dpi == 0) 96 else dpi);
 
         if (self.target == .dc) self.discardTarget();
+        if (self.target == .hwnd) {
+            const rt = self.target.hwnd;
+            if (client_size.width != self.pixel_size.width or client_size.height != self.pixel_size.height) {
+                if (succeeded(rt.vtable.Resize(rt, &client_size))) {
+                    self.pixel_size = client_size;
+                } else {
+                    self.discardTarget();
+                }
+            }
+        }
         if (self.target == .none) {
             var rt: ?*ID2D1HwndRenderTarget = null;
             const props: RenderTargetProperties = .{
@@ -963,30 +1639,30 @@ pub const Canvas = struct {
                 .dpi_x = dpi_f,
                 .dpi_y = dpi_f,
             };
-            const hwnd_props: HwndRenderTargetProperties = .{ .hwnd = hwnd, .pixel_size = client_size };
+            // Present without waiting for the vertical blank: DWM composes
+            // the popup anyway, and waiting would block the GUI thread.
+            const hwnd_props: HwndRenderTargetProperties = .{
+                .hwnd = hwnd,
+                .pixel_size = client_size,
+                .present_options = D2D1_PRESENT_OPTIONS_IMMEDIATELY,
+            };
             if (!succeeded(self.factory.d2d.vtable.CreateHwndRenderTarget(self.factory.d2d, &props, &hwnd_props, &rt))) {
-                log.warn("CreateHwndRenderTarget failed", .{});
+                self.warnOnce("CreateHwndRenderTarget failed", .{});
                 return false;
             }
             self.target = .{ .hwnd = rt orelse return false };
             self.pixel_size = client_size;
             self.dpi = dpi_f;
-        } else if (self.target == .hwnd) {
+        } else if (dpi_f != self.dpi) {
             const rt = self.target.hwnd;
-            if (client_size.width != self.pixel_size.width or client_size.height != self.pixel_size.height) {
-                _ = rt.vtable.Resize(rt, &client_size);
-                self.pixel_size = client_size;
-            }
-            if (dpi_f != self.dpi) {
-                rt.vtable.render_target.SetDpi(@ptrCast(rt), dpi_f, dpi_f);
-                self.dpi = dpi_f;
-            }
+            rt.vtable.render_target.SetDpi(@ptrCast(rt), dpi_f, dpi_f);
+            self.dpi = dpi_f;
         }
         return self.beginDraw();
     }
 
     /// Begin drawing into `rect` (pixels) of a GDI device context, e.g.
-    /// the memory DC of a double-buffered WM_PAINT.
+    /// the memory DC of a double-buffered WM_PAINT (see `DibTarget`).
     pub fn beginDc(self: *Canvas, hdc: w32.HDC, rect: w32.RECT, dpi: u32) bool {
         return self.beginDcMode(hdc, rect, dpi, false);
     }
@@ -1002,20 +1678,15 @@ pub const Canvas = struct {
         const dpi_f: f32 = @floatFromInt(if (dpi == 0) 96 else dpi);
         if (self.target == .hwnd or (self.target == .dc and self.dc_alpha != alpha)) self.discardTarget();
         if (self.target == .none) {
-            var rt: ?*ID2D1DCRenderTarget = null;
-            const props: RenderTargetProperties = .{
-                .pixel_format = .{
-                    .format = DXGI_FORMAT_B8G8R8A8_UNORM,
-                    .alpha_mode = if (alpha) D2D1_ALPHA_MODE_PREMULTIPLIED else D2D1_ALPHA_MODE_IGNORE,
-                },
-                .dpi_x = dpi_f,
-                .dpi_y = dpi_f,
-            };
-            if (!succeeded(self.factory.d2d.vtable.CreateDCRenderTarget(self.factory.d2d, &props, &rt))) {
-                log.warn("CreateDCRenderTarget failed", .{});
-                return false;
-            }
-            self.target = .{ .dc = rt orelse return false };
+            // The pixels go back to GDI, so render in software: a hardware
+            // target would only add a device and a read-back.
+            const rt = self.createDcTarget(D2D1_RENDER_TARGET_TYPE_SOFTWARE, alpha, dpi_f) orelse
+                self.createDcTarget(D2D1_RENDER_TARGET_TYPE_DEFAULT, alpha, dpi_f) orelse
+                {
+                    self.warnOnce("CreateDCRenderTarget failed", .{});
+                    return false;
+                };
+            self.target = .{ .dc = rt };
             self.dc_alpha = alpha;
             self.dpi = dpi_f;
         }
@@ -1024,8 +1695,26 @@ pub const Canvas = struct {
             rt.vtable.render_target.SetDpi(@ptrCast(rt), dpi_f, dpi_f);
             self.dpi = dpi_f;
         }
+        const w = rect.right - rect.left;
+        const h = rect.bottom - rect.top;
+        if (w > 0 and h > 0) self.pixel_size = .{ .width = @intCast(w), .height = @intCast(h) };
         if (!succeeded(rt.vtable.BindDC(rt, hdc, &rect))) return false;
         return self.beginDraw();
+    }
+
+    fn createDcTarget(self: *Canvas, kind: u32, alpha: bool, dpi: f32) ?*ID2D1DCRenderTarget {
+        var rt: ?*ID2D1DCRenderTarget = null;
+        const props: RenderTargetProperties = .{
+            .type = kind,
+            .pixel_format = .{
+                .format = DXGI_FORMAT_B8G8R8A8_UNORM,
+                .alpha_mode = if (alpha) D2D1_ALPHA_MODE_PREMULTIPLIED else D2D1_ALPHA_MODE_IGNORE,
+            },
+            .dpi_x = dpi,
+            .dpi_y = dpi,
+        };
+        if (!succeeded(self.factory.d2d.vtable.CreateDCRenderTarget(self.factory.d2d, &props, &rt))) return null;
+        return rt;
     }
 
     fn beginDraw(self: *Canvas) bool {
@@ -1046,27 +1735,56 @@ pub const Canvas = struct {
         return true;
     }
 
-    /// Finish drawing; recreates the target on the next begin when the
-    /// device was lost.
-    pub fn end(self: *Canvas) void {
-        if (!self.drawing) return;
+    /// Finish drawing and report how it went: on `.recreate` the target is
+    /// discarded, and the caller paints again (invalidates) to draw on a
+    /// new one.
+    pub fn finish(self: *Canvas) EndResult {
+        if (!self.drawing) return .ok;
         self.drawing = false;
-        const rt = self.renderTarget() orelse return;
+        const rt = self.renderTarget() orelse return .failed;
         const hr = rt.vtable.EndDraw(rt, null, null);
-        if (hr == D2DERR_RECREATE_TARGET) {
-            self.discardTarget();
-        } else if (!succeeded(hr)) {
-            log.warn("EndDraw failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+        const result = endResultOf(hr);
+        switch (result) {
+            .ok => {},
+            .recreate => self.discardTarget(),
+            .failed => self.warnOnce("EndDraw failed hr=0x{x}", .{@as(u32, @bitCast(hr))}),
         }
+        return result;
     }
 
-    /// The size of the current HWND target in DIPs.
+    /// Finish drawing (see `finish`); the next begin recreates a lost
+    /// target.
+    pub fn end(self: *Canvas) void {
+        _ = self.finish();
+    }
+
+    /// The size of the current target in DIPs.
     pub fn size(self: *const Canvas) Size {
-        const scale = self.dpi / 96.0;
+        const s = self.scale();
         return .{
-            .width = @as(f32, @floatFromInt(self.pixel_size.width)) / scale,
-            .height = @as(f32, @floatFromInt(self.pixel_size.height)) / scale,
+            .width = @as(f32, @floatFromInt(self.pixel_size.width)) / s,
+            .height = @as(f32, @floatFromInt(self.pixel_size.height)) / s,
         };
+    }
+
+    /// The scale (DPI / 96) the canvas draws at.
+    pub fn scale(self: *const Canvas) f32 {
+        return self.dpi / 96.0;
+    }
+
+    /// `v` (DIPs) on the nearest device pixel.
+    pub fn snap(self: *const Canvas, v: f32) f32 {
+        return snapValue(v, self.scale());
+    }
+
+    /// `rect` with its edges on device pixels.
+    pub fn snapRect(self: *const Canvas, rect: Rect) Rect {
+        return snapRectTo(rect, self.scale());
+    }
+
+    /// One device pixel in DIPs: the width of a hairline.
+    pub fn hairline(self: *const Canvas) f32 {
+        return 1.0 / self.scale();
     }
 
     fn brushFor(self: *Canvas, color: Color) ?*ID2D1SolidColorBrush {
@@ -1093,12 +1811,39 @@ pub const Canvas = struct {
     }
 
     /// Stroke a rounded rectangle with the stroke centered inside `rect`
-    /// (so a 1 DIP border stays within the rectangle).
+    /// (so a 1 DIP border stays within the rectangle and its outer edge
+    /// follows the corner radius of a fill of `rect`).
     pub fn strokeRoundedRect(self: *Canvas, rect: Rect, radius: f32, color: Color, width: f32) void {
         const rt = self.renderTarget() orelse return;
         const brush = self.brushFor(color) orelse return;
         const r = rect.inset(width / 2, width / 2);
-        rt.vtable.DrawRoundedRectangle(rt, &.{ .rect = r.d2d(), .radius_x = radius, .radius_y = radius }, brush, width, null);
+        const rr = @max(0, radius - width / 2);
+        rt.vtable.DrawRoundedRectangle(rt, &.{ .rect = r.d2d(), .radius_x = rr, .radius_y = rr }, brush, width, null);
+    }
+
+    /// Stroke a rounded rectangle `width_px` device pixels wide on whole
+    /// pixels inside `rect` (snapped): a sharp border at any scale.
+    pub fn strokeRoundedRectPx(self: *Canvas, rect: Rect, radius: f32, color: Color, width_px: u32) void {
+        const w = @as(f32, @floatFromInt(@max(width_px, 1))) * self.hairline();
+        self.strokeRoundedRect(self.snapRect(rect), radius, color, w);
+    }
+
+    /// A horizontal hairline of one device pixel at `y` (snapped down to a
+    /// pixel row), from `x` for `w` DIPs.
+    pub fn hairlineH(self: *Canvas, x: f32, y: f32, w: f32, color: Color) void {
+        const s = self.scale();
+        const top = @floor(y * s) / s;
+        const left = self.snap(x);
+        self.fillRect(.{ .x = left, .y = top, .w = @max(0, self.snap(x + w) - left), .h = self.hairline() }, color);
+    }
+
+    /// A vertical hairline of one device pixel at `x` (snapped down to a
+    /// pixel column), from `y` for `h` DIPs.
+    pub fn hairlineV(self: *Canvas, x: f32, y: f32, h: f32, color: Color) void {
+        const s = self.scale();
+        const left = @floor(x * s) / s;
+        const top = self.snap(y);
+        self.fillRect(.{ .x = left, .y = top, .w = self.hairline(), .h = @max(0, self.snap(y + h) - top) }, color);
     }
 
     pub fn drawLine(self: *Canvas, p0: Point, p1: Point, color: Color, width: f32) void {
@@ -1145,21 +1890,127 @@ pub const Canvas = struct {
         rt.vtable.PopAxisAlignedClip(rt);
     }
 
+    fn textOptions(self: *const Canvas) u32 {
+        var options: u32 = D2D1_DRAW_TEXT_OPTIONS_CLIP;
+        if (self.factory.d2d_1_1) options |= D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
+        return options;
+    }
+
     /// Draw UTF-8 `text` inside `rect`, aligned and trimmed per `style`.
     pub fn drawText(self: *Canvas, text: []const u8, rect: Rect, style: TextStyle) void {
         if (text.len == 0) return;
         const rt = self.renderTarget() orelse return;
-        const l = self.factory.layout(text, style, rect.w, rect.h) orelse return;
-        defer release(l);
+        const ref = self.factory.layout(text, style, rect.w, rect.h) orelse return;
+        defer ref.deinit();
         const brush = self.brushFor(style.color) orelse return;
-        var options: u32 = D2D1_DRAW_TEXT_OPTIONS_CLIP;
-        if (self.factory.d2d_1_1) options |= D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
-        rt.vtable.DrawTextLayout(rt, .{ .x = rect.x, .y = rect.y }, l, brush, options);
+        rt.vtable.DrawTextLayout(rt, .{ .x = rect.x, .y = rect.y }, ref.layout, brush, self.textOptions());
+    }
+
+    /// Draw UTF-8 `text` like `drawText` with some byte ranges in other
+    /// colors or weights (e.g. the characters a search matched).
+    pub fn drawTextRuns(self: *Canvas, text: []const u8, rect: Rect, style: TextStyle, runs: []const TextRun) void {
+        if (text.len == 0) return;
+        if (runs.len == 0) return self.drawText(text, rect, style);
+        var layout = TextLayout.initUtf8(self.factory, text, style, rect.w, rect.h) orelse return;
+        defer layout.deinit();
+        var converted: [32]LayoutRun = undefined;
+        const n = @min(runs.len, converted.len);
+        for (runs[0..n], converted[0..n]) |run, *out| {
+            const start = wstr.utf16Index(text, run.start);
+            const stop = wstr.utf16Index(text, run.start + run.len);
+            out.* = .{
+                .start = @intCast(start),
+                .len = @intCast(stop - start),
+                .color = run.color,
+                .weight = run.weight,
+                .underline = run.underline,
+            };
+        }
+        self.drawLayout(&layout, .{ .x = rect.x, .y = rect.y }, style.color, converted[0..n]);
+    }
+
+    /// Draw UTF-8 `text` in `rect` with an ellipsis in the middle when it
+    /// does not fit (`middleEllipsis`), for paths.
+    pub fn drawTextMiddle(self: *Canvas, text: []const u8, rect: Rect, style: TextStyle) void {
+        const Measure = struct {
+            factory: *Factory,
+            style: TextStyle,
+            fn width(ctx: @This(), s: []const u8) f32 {
+                return ctx.factory.measureText(s, ctx.style, 100_000).width;
+            }
+        };
+        var single = style;
+        single.wrap = false;
+        var buf: [1024]u8 = undefined;
+        const fitted = middleEllipsis(&buf, text, rect.w, Measure{ .factory = self.factory, .style = single }, Measure.width);
+        self.drawText(fitted, rect, single);
+    }
+
+    /// Draw a kept `TextLayout` at `origin` in `color`, with `runs` in
+    /// their own colors, weights or underline. The runs apply to this draw
+    /// only.
+    pub fn drawLayout(self: *Canvas, layout: *const TextLayout, origin: Point, color: Color, runs: []const LayoutRun) void {
+        const rt = self.renderTarget() orelse return;
+        const l = layout.ptr;
+        var colors: [max_run_colors]Color = undefined;
+        var used: usize = 0;
+        var weighted = false;
+        var underlined = false;
+        var colored = false;
+        for (runs) |run| {
+            if (run.len == 0) continue;
+            const range: TextRange = .{ .start = run.start, .length = run.len };
+            if (run.weight) |w| {
+                _ = l.vtable.SetFontWeight(l, @intFromEnum(w), range);
+                weighted = true;
+            }
+            if (run.underline) {
+                _ = l.vtable.SetUnderline(l, 1, range);
+                underlined = true;
+            }
+            if (run.color) |c| {
+                const b = self.runBrush(&colors, &used, c) orelse continue;
+                _ = l.vtable.SetDrawingEffect(l, @ptrCast(b), range);
+                colored = true;
+            }
+        }
+        if (self.brushFor(color)) |brush| rt.vtable.DrawTextLayout(rt, origin, l, brush, self.textOptions());
+        // Leave the layout as it was: no brush of this target stays in it.
+        const all: TextRange = .{ .start = 0, .length = layout.len };
+        if (colored) _ = l.vtable.SetDrawingEffect(l, null, all);
+        if (weighted) _ = l.vtable.SetFontWeight(l, @intFromEnum(layout.weight), all);
+        if (underlined) _ = l.vtable.SetUnderline(l, 0, all);
+    }
+
+    /// The brush for run color `color` in this draw: a run brush already
+    /// set to it, or the next free one.
+    fn runBrush(self: *Canvas, colors: *[max_run_colors]Color, used: *usize, color: Color) ?*ID2D1SolidColorBrush {
+        for (colors[0..used.*], 0..) |c, i| {
+            if (std.meta.eql(c, color)) return self.run_brushes[i];
+        }
+        if (used.* == max_run_colors) return null;
+        const rt = self.renderTarget() orelse return null;
+        const i = used.*;
+        if (self.run_brushes[i] == null) {
+            var brush: ?*ID2D1SolidColorBrush = null;
+            if (!succeeded(rt.vtable.CreateSolidColorBrush(rt, &color, null, &brush))) return null;
+            self.run_brushes[i] = brush;
+        }
+        const brush = self.run_brushes[i] orelse return null;
+        brush.vtable.SetColor(brush, &color);
+        colors[i] = color;
+        used.* += 1;
+        return brush;
     }
 
     /// Measure UTF-8 `text` (see `Factory.measureText`).
     pub fn measureText(self: *Canvas, text: []const u8, style: TextStyle, max_width: f32) Size {
         return self.factory.measureText(text, style, max_width);
+    }
+
+    /// Measure UTF-8 `text` rounded up to whole pixels of this canvas.
+    pub fn measureTextCeil(self: *Canvas, text: []const u8, style: TextStyle, max_width: f32) Size {
+        return self.factory.measureTextCeil(text, style, max_width, self.scale());
     }
 
     /// Draw an icon glyph of the icon font centered in `rect`.
@@ -1174,6 +2025,68 @@ pub const Canvas = struct {
             .align_y = .center,
             .ellipsis = false,
         });
+    }
+};
+
+// -----------------------------------------------------------------------
+// DIB target
+// -----------------------------------------------------------------------
+
+/// A memory DC with a 32bpp top-down DIB section kept between paints, for
+/// `Canvas.beginDc`/`beginDcAlpha` and a BitBlt to the window: no new DIB
+/// per paint while the size fits.
+pub const DibTarget = struct {
+    dc: ?w32.HDC = null,
+    bitmap: ?w32.HANDLE = null,
+    old_bitmap: ?*anyopaque = null,
+    /// The pixels (premultiplied BGRA rows, top-down, `width` wide).
+    bits: ?*anyopaque = null,
+    width: i32 = 0,
+    height: i32 = 0,
+
+    /// The memory DC with a DIB of at least `w` × `h` pixels selected,
+    /// compatible with `reference`; null on failure. The DIB is kept and
+    /// replaced only when it is too small or far too big.
+    pub fn ensure(self: *DibTarget, reference: ?w32.HDC, w: i32, h: i32) ?w32.HDC {
+        if (w <= 0 or h <= 0) return null;
+        if (self.dc) |dc| {
+            if (fits(self.width, self.height, w, h)) return dc;
+        }
+        self.deinit();
+        const dc = w32.CreateCompatibleDC(reference) orelse return null;
+        const bmi: w32.BITMAPINFO = .{ .bmiHeader = .{ .biWidth = w, .biHeight = -h } };
+        var bits: ?*anyopaque = null;
+        const bitmap = w32.CreateDIBSection(dc, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse {
+            _ = w32.DeleteDC(dc);
+            return null;
+        };
+        self.* = .{
+            .dc = dc,
+            .bitmap = bitmap,
+            .old_bitmap = w32.SelectObject(dc, bitmap),
+            .bits = bits,
+            .width = w,
+            .height = h,
+        };
+        return dc;
+    }
+
+    pub fn deinit(self: *DibTarget) void {
+        if (self.dc) |dc| {
+            _ = w32.SelectObject(dc, self.old_bitmap);
+            _ = w32.DeleteDC(dc);
+        }
+        if (self.bitmap) |bitmap| _ = w32.DeleteObject(bitmap);
+        self.* = .{};
+    }
+
+    /// Whether a DIB of `have_w` × `have_h` serves `w` × `h`: big enough,
+    /// and not more than four times the area.
+    fn fits(have_w: i32, have_h: i32, w: i32, h: i32) bool {
+        if (w > have_w or h > have_h) return false;
+        const have: i64 = @as(i64, have_w) * have_h;
+        const need: i64 = @as(i64, w) * h;
+        return have <= 4 * need;
     }
 };
 
@@ -1196,4 +2109,163 @@ pub const icons = struct {
     pub const more: u21 = 0xE712;
     pub const shield: u21 = 0xEA18;
     pub const warning: u21 = 0xE7BA;
+    pub const info: u21 = 0xE946;
+    pub const completed: u21 = 0xE930;
+    pub const error_badge: u21 = 0xE783;
+    pub const check_mark: u21 = 0xE73E;
+    pub const copy: u21 = 0xE8C8;
 };
+
+test "snapValue and snapRectTo put edges on device pixels" {
+    const testing = std.testing;
+    // 150 %: 1 DIP is 1.5 px; 10.3 DIP = 15.45 px -> 15 px = 10 DIP.
+    try testing.expectApproxEqAbs(@as(f32, 10), snapValue(10.3, 1.5), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 10.6667), snapValue(10.5, 1.5), 1e-3);
+    try testing.expectEqual(@as(f32, 7), snapValue(7.2, 1.0));
+    const r = snapRectTo(.{ .x = 0.4, .y = 1.1, .w = 10.3, .h = 0.4 }, 1.25);
+    // Each edge is a multiple of 0.8 DIP (one pixel at 125 %).
+    for ([_]f32{ r.x, r.y, r.x + r.w, r.y + r.h }) |edge| {
+        const px = edge * 1.25;
+        try testing.expectApproxEqAbs(@round(px), px, 1e-4);
+    }
+    try testing.expectApproxEqAbs(@as(f32, 14), ceilValue(13.2, 1.0), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 13), ceilValue(13.0000001, 1.0), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 20.0 / 1.5), ceilValue(13.2, 1.5), 1e-4);
+}
+
+test "endResultOf maps EndDraw results" {
+    const testing = std.testing;
+    try testing.expectEqual(EndResult.ok, endResultOf(0));
+    try testing.expectEqual(EndResult.recreate, endResultOf(D2DERR_RECREATE_TARGET));
+    try testing.expectEqual(EndResult.failed, endResultOf(@bitCast(@as(u32, 0x80004005))));
+}
+
+test "opticalSize follows the Fluent type ramp" {
+    const testing = std.testing;
+    try testing.expectEqual(OpticalSize.small, opticalSize(10));
+    try testing.expectEqual(OpticalSize.small, opticalSize(12));
+    try testing.expectEqual(OpticalSize.text, opticalSize(13));
+    try testing.expectEqual(OpticalSize.text, opticalSize(14));
+    try testing.expectEqual(OpticalSize.text, opticalSize(18));
+    try testing.expectEqual(OpticalSize.display, opticalSize(20));
+    try testing.expectEqual(OpticalSize.display, opticalSize(28));
+}
+
+test "cjkFontFor picks the font of the language, then of the region" {
+    const testing = std.testing;
+    try testing.expectEqual(CjkFont.yahei, cjkFontFor(.zh_CN, "ja-JP"));
+    try testing.expectEqual(CjkFont.yu_gothic, cjkFontFor(.en, "ja-JP"));
+    try testing.expectEqual(CjkFont.malgun, cjkFontFor(.en, "ko-KR"));
+    try testing.expectEqual(CjkFont.jhenghei, cjkFontFor(.en, "zh-TW"));
+    try testing.expectEqual(CjkFont.jhenghei, cjkFontFor(.en, "zh-HK"));
+    try testing.expectEqual(CjkFont.jhenghei, cjkFontFor(.en, "zh-Hant-SG"));
+    try testing.expectEqual(CjkFont.yahei, cjkFontFor(.en, "zh-CN"));
+    try testing.expectEqual(CjkFont.yahei, cjkFontFor(.en, "zh-SG"));
+    try testing.expectEqual(CjkFont.yahei, cjkFontFor(.en, "en-US"));
+    try testing.expectEqual(CjkFont.yahei, cjkFontFor(.en, ""));
+    // A language subtag that only starts like one.
+    try testing.expectEqual(CjkFont.yahei, cjkFontFor(.en, "jv-ID"));
+    try testing.expectEqual(CjkFont.yu_gothic, cjkFontFor(.en, "JA"));
+}
+
+test "layoutKey is deterministic and tells styles apart" {
+    const testing = std.testing;
+    var a: [1024]u8 = undefined;
+    var b: [1024]u8 = undefined;
+    const style: TextStyle = .{ .size = 14 };
+    const k1 = layoutKey(&a, "Settings", style, 100, 20).?;
+    const k2 = layoutKey(&b, "Settings", style, 100, 20).?;
+    try testing.expectEqualSlices(u8, k1, k2);
+    var c: [1024]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, k1, layoutKey(&c, "Settings", .{ .size = 12 }, 100, 20).?));
+    try testing.expect(!std.mem.eql(u8, k1, layoutKey(&c, "Settings", style, 101, 20).?));
+    try testing.expect(!std.mem.eql(u8, k1, layoutKey(&c, "Settings", .{ .size = 14, .weight = .semibold }, 100, 20).?));
+    try testing.expect(!std.mem.eql(u8, k1, layoutKey(&c, "Settings", .{ .size = 14, .family = "Consolas" }, 100, 20).?));
+    // The family length is part of the key: "ab"+"c" differs from "a"+"bc".
+    var d: [1024]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, layoutKey(&c, "c", .{ .family = "ab" }, 1, 1).?, layoutKey(&d, "bc", .{ .family = "a" }, 1, 1).?));
+    // Text too long for the buffer is not cached.
+    var small: [48]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), layoutKey(&small, "a long piece of text", style, 1, 1));
+}
+
+var test_released: usize = 0;
+
+fn testRelease(_: u32) void {
+    test_released += 1;
+}
+
+test "GenerationalCache keeps recent entries and drops a generation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Cache = GenerationalCache(u32, testRelease);
+    var cache: Cache = .{ .capacity = 2 };
+    defer cache.deinit(alloc);
+    test_released = 0;
+
+    _ = cache.put(alloc, "a", 1).?;
+    _ = cache.put(alloc, "b", 2).?;
+    try testing.expectEqual(@as(usize, 2), cache.count());
+    // Young is full: "c" starts a new generation; "a" and "b" are old.
+    _ = cache.put(alloc, "c", 3).?;
+    try testing.expectEqual(@as(usize, 3), cache.count());
+    try testing.expectEqual(@as(usize, 0), test_released);
+    // A hit on "a" moves it back to the young generation.
+    try testing.expectEqual(@as(u32, 1), cache.get(alloc, "a").?.*);
+    // The next put rotates: old ("b") is dropped, young ("c", "a") ages.
+    _ = cache.put(alloc, "d", 4).?;
+    try testing.expectEqual(@as(usize, 1), test_released);
+    try testing.expectEqual(@as(?*u32, null), cache.get(alloc, "b"));
+    try testing.expectEqual(@as(u32, 3), cache.get(alloc, "c").?.*);
+    try testing.expectEqual(@as(u32, 1), cache.get(alloc, "a").?.*);
+    try testing.expectEqual(@as(u32, 4), cache.get(alloc, "d").?.*);
+    try testing.expect(cache.count() <= 4);
+    cache.clear(alloc);
+    try testing.expectEqual(@as(usize, 0), cache.count());
+    try testing.expectEqual(@as(usize, 4), test_released);
+}
+
+test "middleEllipsis keeps the start and the file name" {
+    const testing = std.testing;
+    // One unit of width per byte, "…" (3 bytes) counted as 3.
+    const Measure = struct {
+        fn width(_: void, s: []const u8) f32 {
+            return @floatFromInt(s.len);
+        }
+    };
+    var buf: [256]u8 = undefined;
+    const path = "C:\\Users\\someone\\AppData\\Local\\ghostty\\config.ghostty";
+    try testing.expectEqualStrings(path, middleEllipsis(&buf, path, 100, {}, Measure.width));
+    const fitted = middleEllipsis(&buf, path, 30, {}, Measure.width);
+    try testing.expect(fitted.len <= 30);
+    try testing.expect(std.mem.endsWith(u8, fitted, "\\config.ghostty"));
+    try testing.expect(std.mem.startsWith(u8, fitted, "C:\\Use"));
+    try testing.expect(std.mem.indexOf(u8, fitted, "\u{2026}") != null);
+    // A file name that does not fit alone: both ends kept evenly.
+    const name = "a-very-long-file-name-without-separators.txt";
+    const short = middleEllipsis(&buf, name, 15, {}, Measure.width);
+    try testing.expect(short.len <= 15);
+    try testing.expect(std.mem.startsWith(u8, short, "a-ver"));
+    try testing.expect(std.mem.endsWith(u8, short, ".txt"));
+    // Multi-byte text is cut at codepoints.
+    const cjk = "\u{914D}\u{7F6E}\u{6587}\u{4EF6}\u{5939}\\\u{6587}\u{4EF6}.txt";
+    const cut = middleEllipsis(&buf, cjk, 20, {}, Measure.width);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try testing.expect(std.mem.endsWith(u8, cut, "\\\u{6587}\u{4EF6}.txt"));
+    // Nothing fits: just the ellipsis.
+    try testing.expectEqualStrings("\u{2026}", middleEllipsis(&buf, name, 1, {}, Measure.width));
+}
+
+test "DibTarget reuses a buffer that fits" {
+    const testing = std.testing;
+    try testing.expect(DibTarget.fits(100, 40, 100, 40));
+    try testing.expect(DibTarget.fits(100, 40, 80, 30));
+    try testing.expect(!DibTarget.fits(100, 40, 101, 40));
+    try testing.expect(!DibTarget.fits(100, 40, 100, 41));
+    // Far too big: replaced so a shrunk title bar does not keep 4K pixels.
+    try testing.expect(!DibTarget.fits(3840, 80, 800, 80));
+}
+
+test {
+    @import("../../../lib/compat/testing.zig").refAllDeclsRecursive(@This());
+}
