@@ -16,6 +16,8 @@ pub const window = @import("window.zig");
 
 test {
     _ = app;
+    _ = @import("config_errors.zig");
+    _ = @import("confirm.zig");
     _ = language;
     _ = launch;
     _ = menus;

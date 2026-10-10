@@ -85,6 +85,9 @@ pub const CloseConfirmationDialog = extern struct {
         const priv = self.private();
         self.as(Dialog.Parent).setHeading(priv.target.title());
         self.as(Dialog.Parent).setBody(priv.target.body());
+        // fork(gx): GX-0027 begin: list the running processes that closing terminates (src/apprt/gtk/gx/confirm.zig)
+        @import("../gx/confirm.zig").listProcesses(self, priv.target, parent);
+        // fork(gx): GX-0027 end
 
         // Show it
         self.as(Dialog).present(parent);

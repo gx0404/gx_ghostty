@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0026）之后的号。在册的 20 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0029）之后的号。在册的 23 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0029，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -81,6 +81,9 @@
 | GX-0023 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0023` | active |
 | GX-0024 | `src/config/Config.zig` | `fork(gx): GX-0024` | active |
 | GX-0026 | `src/build/GhosttyExe.zig` | `fork(gx): GX-0026` | active |
+| GX-0027 | `src/apprt/gtk/class/close_confirmation_dialog.zig` | `fork(gx): GX-0027` | active |
+| GX-0028 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0028` | active |
+| GX-0029 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0029` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1091,3 +1094,141 @@ PowerShell 里 `[System.Diagnostics.FileVersionInfo]::GetVersionInfo('<prefix>\b
 
 - `scripts/test_fork_patches.py` 锁定标记与登记的闭集。
 - `scripts/test_gx_icon.py` 锁定已提交的 ico 与生成器逐像素一致、尺寸齐全（16～256）、只有 256 像素是 PNG。
+
+## GX-0027 GTK 的关闭确认列出仍在运行的进程
+
+- 文件：`src/apprt/gtk/class/close_confirmation_dialog.zig`，`CloseConfirmationDialog.present` 设好标题与正文之后的一个纯新增块，调用新路径 `src/apprt/gtk/gx/confirm.zig::listProcesses`。
+- 标记：`fork(gx): GX-0027`，以 `// fork(gx): GX-0027 begin: <说明>` 开头、`// fork(gx): GX-0027 end` 结尾，包住一行调用。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，新增 3 行（含 2 行标记），不改、不删上游行。
+
+### 原因
+
+上游 GTK 的关闭确认（退出、关窗口、关标签页、关分屏）只有固定的标题与正文，例如「此标签页中的所有终端会话都将被终止」，不说哪些程序会被终止；Windows 的确认框列出正在运行的进程（`src/apprt/win32/ui/Dialogs.zig`）。GTK 对话框只知道关闭对象（`Target`）与调用方传入的父控件，正文在 `present` 里设置，所以只能在这里接入；按关闭对象收集终端与列进程都在 fork 路径。
+
+### 行为
+
+- `present` 设好标题与正文后，`listProcesses(dialog, target, parent)` 按关闭对象收集终端：退出（`.app`）取核心 App 的全部终端；关窗口（`.window`，父控件是 `Window`）取每个标签页分屏树里的终端；关标签页（`.tab`，父控件是 `Tab`）取它的分屏树；关分屏（`.surface`，父控件是 `SplitTree`）取分屏树的活动终端，即 `split-tree.close-split` 与关闭快捷键关闭的那个。父控件不是预期的类型时不列。
+- 只看需要确认的终端（`CoreSurface.needsConfirmQuit`，含 GX-0012 的空闲进程判断），对它们调 `gx.confirm.appendBusyProcesses`：前台进程及其子孙中不空闲的那些，名字按界面显示的形式（去掉路径与 `.exe`）、按出现顺序去重，与 Windows 相同。整个过程在一个 `gx.confirm.Scope` 里，只读一次进程表；列进程在主线程同步进行，显示对话框之前结束。
+- 有进程时用 `setExtraChild` 在正文下方放一段：标题「正在运行的进程：」（`gx.i18n`，与 Windows 共用译文）加 libadwaita 的 `boxed-list` 列表，每个进程一行，过长时末尾省略；超过 6 个时列前 5 个，最后一行写「……另有 N 个」（N 至少为 2）。没有进程或读不到（Linux 以外的系统、`/proc` 打不开）时，对话框与上游完全相同。
+- 标题、正文、按钮、响应与关闭流程都不变。
+
+### 上游状态
+
+未回馈上游。空闲进程的判断与界面译文来自 Ghostty GX 的共享核心；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+块是纯新增：放在 `present` 里设置正文之后、`self.as(Dialog).present(parent)` 之前。上游改动 `Target`、`present` 的签名，或调用方传入的父控件（`window.zig::windowCloseRequest`、`window.zig::tabViewClosePage`、`split_tree.zig::surfaceCloseRequest`、`application.zig::quit`）时，同步 `src/apprt/gtk/gx/confirm.zig::Processes.collect` 的取终端规则；上游自己给确认框加了 extra child 时，把进程列表并进去，不要覆盖。
+
+### 移除条件
+
+上游的关闭确认列出将被终止的进程，或 Ghostty GX 不再需要该功能时移除：删除块与标记、`src/apprt/gtk/gx/confirm.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl test --gtk --filter apprt.gtk.gx
+just wsl smoke --out <目录> --config <配置> --xdotool <脚本>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟（`shell-integration = none`、`command = /bin/bash --noprofile --norc`）：在终端里运行 `sleep 300` 后按 Ctrl+Shift+W，关闭标签页的确认框在正文下方列出 `sleep`；同时运行 8 个不同名的程序后按 Ctrl+Shift+Q，退出确认列出前 5 个与「……另有 3 个」；空闲的终端照常不确认。读图后才算通过。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0027_problems` 锁定 `close_confirmation_dialog.zig` 只有一个 GX-0027 纯新增块：块里调用 `listProcesses`，位于设置正文之后、显示对话框之前；删掉它就与 `HEAD` 和 `main` 的 merge-base 上的上游版本相同（没有 `main` 时跳过）。`src/apprt/gtk/gx/confirm.zig` 的单测锁定行数规则（不会出现「另有 1 个」，`just wsl test --gtk --filter apprt.gtk.gx`）。
+
+## GX-0028 GTK 的配置错误对话框按诊断去重
+
+- 文件：`src/apprt/gtk/class/application.zig`，五个纯新增块与一行改动：导入 `src/apprt/gtk/gx/config_errors.zig`；`Private` 的 `gx_config_errors` 字段；`showConfigErrorsDialog` 开头记下这次的诊断是否没报告过，已打开的对话框只在有新诊断时 `present`（改动的一行），没打开时报告过的诊断不再弹出；`handleReloadConfig`（配置错误对话框的「重新加载配置」按钮）在重新加载之前清空记录。
+- 标记：`fork(gx): GX-0028`；纯新增块用 begin/end 包住，改动的一行上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +18/−1（含标记）。
+
+### 原因
+
+上游 `Application.showConfigErrorsDialog` 在 App 的每次配置变化（`setConfig`）时运行：配置有诊断就弹出配置错误对话框，已打开时再 `present` 一次，把它提到前面并夺走键盘焦点；用户点「忽略」关掉之后，下一次配置变化又弹出来。Ghostty GX 改配置的次数远多于用户编辑配置：设置对话框里主题预览的每一步（`App.updateConfig`）、每次保存（写 `gui-settings.ghostty` 后经 `reload_config` 重新读取）、切换界面语言、系统明暗切换，都会触发 `config_change`。用户的配置文件里只要有一处错误，用方向键浏览主题时对话框就每一步都弹出、焦点离开主题列表，每保存一项设置又弹一次（A10）。判断与记录放在 fork 路径，钩子只在对话框的显示入口与对话框自己的重新加载按钮。
+
+### 行为
+
+- `src/apprt/gtk/gx/config_errors.zig::Reports` 记住已报告过的诊断的摘要（`gx.config_layers.diagnosticsDigest`：没有诊断为 0，内容与顺序相同则值相同），最多 8 组，满了替换最早的一组；主题预览在几组诊断之间来回（用户文件的错误，加上某个出错的主题文件）时，回到报告过的那组不再弹出。
+- `showConfigErrorsDialog`：没报告过的诊断照上游显示（新建对话框，或把已打开的对话框提到前面）并记为已报告；报告过的诊断只更新已打开对话框的内容（上游原有的 `config` 属性更新），不再 `present`、不抢焦点，对话框已被关掉时不再弹出。配置没有诊断时照上游关掉对话框，并清空记录，所以之后再出现同样的错误会再次弹出。
+- 重新加载配置（`reload_config` 绑定、主菜单「重新加载配置」、systemd 的 SIGUSR2，以及 GX 设置对话框保存后的重新读取）只在诊断变了时弹出：改了配置文件、错误变多或变少都会报告新的那组；什么都没改时不重复报告已经看过的错误。只有配置错误对话框自己的「重新加载配置」按钮先清空记录：按下后错误仍在，就照上游再弹出一次，不会让人误以为已经修好。
+- 对话框本身、文字与按钮不变；Windows 不受影响。
+
+### 上游状态
+
+未回馈上游。按内容去重对上游同样有益（上游的 soft 重载也会重弹），但摘要函数在 Ghostty GX 的共享核心里；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+五个纯新增块分别放在：GX-0016 导入块之后；`Private.config_errors_dialog` 之后；`showConfigErrorsDialog` 取得 `priv` 之后，以及「No diagnostics, do nothing.」的提前返回之后；`handleReloadConfig` 里 `priv.config_errors_dialog.set(null);` 之后、`Action.reloadConfig` 之前。改动的一行是已打开对话框分支里的 `diag.present(null)`。上游重写 `showConfigErrorsDialog`（例如改成按诊断内容比较）或对话框的重新加载流程时，保持两点：只有没报告过的诊断才新建或 `present` 对话框；对话框自己的重新加载先 `forget`。上游自己去重之后按「移除条件」处理。
+
+### 移除条件
+
+上游的配置错误对话框不再为相同的诊断重复弹出或抢焦点时移除：删除五个块、恢复改动的一行，连同标记与 `src/apprt/gtk/gx/config_errors.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl test --gtk --filter apprt.gtk.gx
+just wsl smoke --out <目录> --config <有错误的配置> --xdotool <脚本>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟：配置里写一个未知键（如 `fontsize = 12`），启动后弹出配置错误对话框；按 Esc 忽略后打开设置对话框（Ctrl+,），到外观页在主题列表里按方向键浏览几步：配置错误对话框不再弹出，焦点留在主题列表；补丁前每一步都弹回来。读图后才算通过。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0028_problems` 锁定钩子的形状：`showConfigErrorsDialog` 先 `gx_config_errors.update` 再处理已打开的对话框，上游的 `diag.present(null)` 只剩带 `gx_new_errors` 条件、上方有标记的一处，报告过的诊断在新建对话框之前返回；整个文件只有 `handleReloadConfig` 在 `Action.reloadConfig` 之前 `forget`。`src/apprt/gtk/gx/config_errors.zig` 的单测锁定去重、清空与容量规则（`just wsl test --gtk --filter apprt.gtk.gx`）。
+
+## GX-0029 DMABUF 导出不可用后不再逐帧重试
+
+- 文件：`src/renderer/OpenGL.zig`，`OpenGL` 的 `gx_dmabuf` 字段（纯新增块）与 `present` 里导出的三处改动：条件加上 `self.gx_dmabuf.enabled(...)`，导出结果经 `self.gx_dmabuf.track(...)` 传回，每帧一条的 `log.warn` 换成一行说明。逻辑在新路径 `src/gx/dmabuf_export.zig`（只依赖 std，`gl` 以编译期参数传入，用于在警告里写出 GL 渲染器）。
+- 标记：`fork(gx): GX-0029`；字段用 begin/end 包住，三处改动的上一行写单行标记（删去的警告处留一行标记）。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +8/−3（含标记）。
+
+### 原因
+
+GTK 能显示 DMABUF 时（`presentation_health == .healthy`），上游 `OpenGL.present` 每帧都先把渲染目标整帧 blit 到导出纹理、建 EGLImage 再导出；失败就记一条 warning，回读到 CPU 内存，下一帧再试。EGL 显示没有 `EGL_MESA_image_dma_buf_export` 时每次都失败：Mesa 的软件渲染（llvmpipe）在 surfaceless 显示上就是这样（Xvfb、没有 GPU 的虚拟机与远程桌面，gx-ci 的 `gtk-smoke` 也是），每帧白做一次整帧 blit 与 EGLImage，日志被同一条警告刷屏（`just wsl smoke --perf` 的 300 万行负载期间 600 多条）。导出逻辑与它的状态都在上游 `present` 里，只能在这里接入（A37）。
+
+### 行为
+
+- 每个渲染器的第一帧检查 EGL 显示的扩展串：没有 `EGL_MESA_image_dma_buf_export` 时直接关掉导出，之后每帧直接回读，不再 blit、不建 EGLImage、不记警告。
+- 扩展存在时照常导出；连续失败 3 次（`max_failures`）关掉导出，成功一次就重新计数。前两次失败只记 debug 日志。关掉之后这个渲染器（终端）一直回读，直到它被销毁；新终端的渲染器重新检查。
+- 整个进程只有第一个关掉导出的渲染器记一条 warning：`failed to export DMABUF (<原因>), presenting frames from CPU memory from now on renderer=<GL_RENDERER>`，原因是缺少的扩展，或连续失败的次数与最后一次的错误；其余渲染器只记 debug。
+- `presentation_health` 不是 `healthy`（GTK 导入 DMABUF 失败后的上游回退）时与上游相同，不检查也不计数。Windows 走 GX-0004 的 WGL 分支，不受影响。
+
+### 上游状态
+
+未回馈上游。这是上游的通用问题（软件 GL 下每帧白做导出并刷屏），适合回馈；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+字段块放在 `alloc` 字段之后（与 GX-0004 的字段与 Windows 分支隔开，两个补丁互不相邻）。上游改动 `present` 的导出分支时，取上游版本后保持三点：只在 `presentation_health == .healthy` 且 `self.gx_dmabuf.enabled(self.device.display)` 时尝试导出；导出结果经 `self.gx_dmabuf.track(...)`；导出失败不再每帧记警告。上游改了 `Target.exportDmabuf` 需要的 EGL 扩展时，同步 `src/gx/dmabuf_export.zig::extension`；上游自己限制了重试或警告时，按「移除条件」处理。
+
+### 移除条件
+
+上游在 DMABUF 导出不可用时不再逐帧重试与警告之后移除：删除字段块与三处改动、`src/gx/dmabuf_export.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just test --filter gx.dmabuf_export                     # Windows 本机（win32 apprt），纯逻辑单测
+just wsl sync <worktree> --dirty
+just wsl build --gtk -Doptimize=ReleaseFast
+just wsl smoke --out <目录> --perf                      # <名字>-perf.txt 的 dmabuf_warnings 为 1
+python -m unittest scripts.test_fork_patches -v
+```
+
+`smoke --perf` 的日志只有一条 `failed to export DMABUF (the EGL display does not support EGL_MESA_image_dma_buf_export) … renderer=llvmpipe …`；补丁前同一负载有 600 多条。有 GPU 与 `EGL_MESA_image_dma_buf_export` 的 Linux 桌面上应照常走 DMABUF（日志没有这条警告），需在真机确认。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0029_problems` 锁定形状：字段、导出条件与导出调用各一处、上方都有标记，条件里有 `self.gx_dmabuf.enabled(`，导出经 `self.gx_dmabuf.track(`，都在 `present` 里、GX-0004 的 Windows 分支之后；上游每帧一条的警告文字不再出现。`src/gx/dmabuf_export.zig` 的单测锁定扩展检查、连续失败计数、警告里的 GL 渲染器名与只警告一次（`just test --filter gx.dmabuf_export`，Linux 上 `just wsl test --filter gx.dmabuf_export`）。

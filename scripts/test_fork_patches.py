@@ -88,6 +88,22 @@ GX0002_HUNKS = (
      )),
 )
 
+CLOSE_DIALOG_ZIG = "src/apprt/gtk/class/close_confirmation_dialog.zig"
+GX0027 = "GX-0027"
+GX0027_CALL = '@import("../gx/confirm.zig").listProcesses(self, priv.target, parent);'
+GX0027_AFTER = "self.as(Dialog.Parent).setBody(priv.target.body());"
+GX0027_BEFORE = "self.as(Dialog).present(parent);"
+
+APPLICATION_ZIG = "src/apprt/gtk/class/application.zig"
+GX0028 = "GX-0028"
+
+OPENGL_ZIG = "src/renderer/OpenGL.zig"
+GX0029 = "GX-0029"
+GX0029_FIELD = 'gx_dmabuf: @import("../gx/dmabuf_export.zig").Export(gl) = .{},'
+GX0029_CONDITION = "if (presentation_health == .healthy and self.gx_dmabuf.enabled(self.device.display)) {"
+GX0029_EXPORT = "if (self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))) |dmabuf| {"
+UPSTREAM_DMABUF_WARNING = "failed to export DMABUF, falling back to CPU presentation"
+
 GTK_CSS = "src/apprt/gtk/css/style.css"
 CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
@@ -402,6 +418,118 @@ def gx0002_problems(source: str) -> list[str]:
     return problems
 
 
+def zig_fn_lines(lines: list[str], header: str) -> tuple[int, int] | None:
+    """0-based [start, end) lines of the one function whose first line starts with ``header``
+    (after indentation), up to its closing brace at the same indentation; None otherwise."""
+    starts = [i for i, line in enumerate(lines) if line.strip().startswith(header)]
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i] == f"{indent}}}"), None)
+    return None if end is None else (start, end + 1)
+
+
+def gx0027_problems(source: str) -> list[str]:
+    """Shape lock for GX-0027: one pure-addition hunk in CloseConfirmationDialog.present."""
+    try:
+        upstream, hunks = marked_hunks(source, GX0027)
+    except ValueError as err:
+        return [str(err)]
+    problems: list[str] = []
+    if "fork(gx)" in upstream:
+        problems.append(f"{CLOSE_DIALOG_ZIG} carries fork(gx) markers outside the {GX0027} hunk")
+    if len(hunks) != 1:
+        return [*problems, f"expected one {GX0027} hunk, found {len(hunks)}"]
+    lines = source.splitlines()
+    begin, end = hunks[0]
+    if squash(GX0027_CALL) not in squash("\n".join(lines[begin + 1:end])):
+        problems.append(f"the {GX0027} hunk must call {GX0027_CALL!r}")
+    after = [i for i, line in enumerate(lines) if line.strip() == GX0027_AFTER]
+    before = [i for i, line in enumerate(lines) if line.strip() == GX0027_BEFORE]
+    if len(after) != 1 or len(before) != 1 or not after[0] < begin < end < before[0]:
+        problems.append(f"the {GX0027} hunk must sit between {GX0027_AFTER!r} and {GX0027_BEFORE!r}")
+    return problems
+
+
+def gx0028_problems(source: str) -> list[str]:
+    """Shape lock for GX-0028 in class/application.zig: the configuration errors dialog shows
+    each set of diagnostics once, and only its own reload button shows remaining errors again."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    show = zig_fn_lines(lines, "fn showConfigErrorsDialog(")
+    reload = zig_fn_lines(lines, "fn handleReloadConfig(")
+    if show is None or reload is None:
+        return ["showConfigErrorsDialog and handleReloadConfig must each be defined once"]
+    problems: list[str] = []
+    show_body = [line.strip() for line in lines[show[0]:show[1]]]
+    reload_body = [line.strip() for line in lines[reload[0]:reload[1]]]
+
+    def single(body: list[str], name: str, needle: str) -> int | None:
+        hits = [i for i, line in enumerate(body) if line == needle]
+        if len(hits) != 1:
+            problems.append(f"{name}: expected exactly one line {needle!r}, found {len(hits)}")
+            return None
+        return hits[0]
+
+    name = "showConfigErrorsDialog"
+    update = single(show_body, name, "const gx_new_errors = priv.gx_config_errors.update(priv.config.get());")
+    existing = single(show_body, name, "if (priv.config_errors_dialog.get()) |diag| {")
+    present = single(show_body, name, "if (gx_new_errors) diag.present(null);")
+    no_diagnostics = single(show_body, name, "if (!priv.config.hasDiagnostics()) return;")
+    reported = single(show_body, name, "if (!gx_new_errors) return;")
+    create = single(show_body, name, "const dialog: *ConfigErrorsDialog = .new(priv.config);")
+    if "diag.present(null);" in show_body:
+        problems.append(f"{name}: the open dialog is presented without checking gx_new_errors")
+    if None not in (update, existing) and not update < existing:
+        problems.append(f"{name}: gx_config_errors.update must run before the open dialog is handled")
+    if present is not None and GX0028 not in show_body[present - 1]:
+        problems.append(f"{name}: the changed present line needs a fork(gx): {GX0028} comment above it")
+    if None not in (no_diagnostics, reported, create) and not no_diagnostics < reported < create:
+        problems.append(f"{name}: diagnostics reported before must return before a new dialog is created")
+
+    forget = single(reload_body, "handleReloadConfig", "priv.gx_config_errors.forget();")
+    call = next((i for i, line in enumerate(reload_body) if line.startswith("Action.reloadConfig(")), None)
+    if forget is not None and (call is None or not forget < call):
+        problems.append("handleReloadConfig: forget() must run before Action.reloadConfig")
+    if sum("gx_config_errors.forget()" in line for line in lines) != 1:
+        problems.append("only the reload button of the configuration errors dialog may forget reported diagnostics")
+    return problems
+
+
+def gx0029_problems(source: str) -> list[str]:
+    """Shape lock for GX-0029 in src/renderer/OpenGL.zig: present() stops exporting DMABUFs
+    once that cannot work, after the Windows (GX-0004) branch has returned."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    problems: list[str] = []
+
+    def marked(needle: str) -> int | None:
+        hits = [i for i, line in enumerate(lines) if line.strip() == needle]
+        if len(hits) != 1:
+            problems.append(f"expected exactly one line {needle!r}, found {len(hits)}")
+            return None
+        if GX0029 not in lines[hits[0] - 1]:
+            problems.append(f"{needle!r} needs a fork(gx): {GX0029} comment on the line above")
+        return hits[0]
+
+    marked(GX0029_FIELD)
+    condition = marked(GX0029_CONDITION)
+    export = marked(GX0029_EXPORT)
+    if UPSTREAM_DMABUF_WARNING in source:
+        problems.append("present() must not warn for every frame whose export fails")
+    present = zig_fn_lines(lines, "pub fn present(")
+    if present is None:
+        return [*problems, "expected one top-level `pub fn present(`"]
+    start, end = present
+    if any(at is not None and not start < at < end for at in (condition, export)):
+        problems.append("the DMABUF export must stay in present()")
+    if None not in (condition, export) and not condition < export:
+        problems.append("the DMABUF export must be inside the GX-0029 condition")
+    windows = next((i for i in range(start, end) if "builtin.os.tag == .windows" in lines[i]), None)
+    if windows is None or (condition is not None and not windows < condition):
+        problems.append("the Windows (GX-0004) branch of present() must return before the DMABUF export")
+    return problems
+
+
 def css_call_args(css: str, paren: int) -> list[str]:
     """Top-level, comma-separated arguments of the call whose '(' is at ``paren``."""
     args: list[str] = []
@@ -684,6 +812,84 @@ class Gx0002ShapeTests(unittest.TestCase):
         crlf = self.source.replace("\n", "\r\n")
         self.assertEqual(gx0002_problems(crlf), [])
         self.assertEqual(marked_hunks(crlf, GX0002)[0].replace("\r\n", "\n"), self.upstream)
+
+
+class Gx0027ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / CLOSE_DIALOG_ZIG).read_text(encoding="utf-8")
+        cls.lines = cls.source.splitlines(keepends=True)
+        cls.upstream, cls.hunks = marked_hunks(cls.source, GX0027)
+
+    def test_close_dialog_keeps_the_hunk(self):
+        self.assertEqual(gx0027_problems(self.source), [])
+        self.assertEqual(gx0027_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_hunk_is_the_only_change_against_merged_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, CLOSE_DIALOG_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        self.assertEqual(self.upstream.replace("\r\n", "\n"), upstream)
+
+    def test_missing_or_moved_hunk_is_rejected(self):
+        self.assertIn(f"expected one {GX0027} hunk, found 0", gx0027_problems(self.upstream))
+        begin, end = self.hunks[0]
+        rest = self.lines[:begin] + self.lines[end + 1:]
+        at = next(i for i, line in enumerate(rest) if line.strip() == GX0027_BEFORE) + 1
+        moved = "".join(rest[:at] + self.lines[begin:end + 1] + rest[at:])
+        self.assertTrue(any("must sit between" in p for p in gx0027_problems(moved)))
+
+
+class Gx0028ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
+
+    def problems_after(self, old: str, new: str) -> list[str]:
+        self.assertIn(old, self.source)
+        return gx0028_problems(self.source.replace(old, new, 1))
+
+    def test_application_keeps_the_hooks(self):
+        self.assertEqual(gx0028_problems(self.source), [])
+        self.assertEqual(gx0028_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_open_dialog_is_not_raised_for_reported_diagnostics(self):
+        problems = self.problems_after("if (gx_new_errors) diag.present(null);", "diag.present(null);")
+        self.assertTrue(any("without checking gx_new_errors" in p for p in problems), problems)
+
+    def test_reported_diagnostics_stay_dismissed(self):
+        problems = self.problems_after("        if (!gx_new_errors) return;\n", "")
+        self.assertTrue(any("'if (!gx_new_errors) return;'" in p for p in problems), problems)
+
+    def test_only_the_dialog_reload_forgets(self):
+        problems = self.problems_after("        priv.gx_config_errors.forget();\n", "")
+        self.assertTrue(any(p.startswith("handleReloadConfig:") for p in problems), problems)
+        problems = self.problems_after("        defer config.unref();\n",
+                                       "        defer config.unref();\n        self.private().gx_config_errors.forget();\n")
+        self.assertTrue(any("only the reload button" in p for p in problems), problems)
+
+
+class Gx0029ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / OPENGL_ZIG).read_text(encoding="utf-8")
+
+    def test_present_keeps_the_hooks(self):
+        self.assertEqual(gx0029_problems(self.source), [])
+        self.assertEqual(gx0029_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_unchecked_or_untracked_export_is_rejected(self):
+        for old, new in ((" and self.gx_dmabuf.enabled(self.device.display)", ""),
+                         ("self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))",
+                          "target.exportDmabuf(self.device.display, self.egl_context)")):
+            with self.subTest(old):
+                self.assertIn(old, self.source)
+                problems = gx0029_problems(self.source.replace(old, new, 1))
+                self.assertTrue(any("found 0" in p for p in problems), problems)
+
+    def test_per_frame_warning_is_rejected(self):
+        problems = gx0029_problems(self.source + f'\n// log.warn("{UPSTREAM_DMABUF_WARNING}", .{{}});\n')
+        self.assertIn("present() must not warn for every frame whose export fails", problems)
 
 
 class HunkTests(unittest.TestCase):
