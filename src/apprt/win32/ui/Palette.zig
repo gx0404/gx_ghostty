@@ -1687,6 +1687,9 @@ fn onCompositionChanged(ctx: *anyopaque, popup: *Popup) void {
 
 fn textChanged(self: *Palette) void {
     if (!self.active) return;
+    const in = &self.popup.input;
+    var buf: [256]u8 = undefined;
+    if (!model.queryChanged(self.filterText(), &buf, in.buf.items, in.caret, in.composition.items)) return;
     self.refilter(.typing);
     self.reposition();
     self.updateHover();

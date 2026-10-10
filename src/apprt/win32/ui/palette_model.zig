@@ -154,6 +154,10 @@ pub fn compositionQuery(buf: []u8, text: []const u16, caret: usize, composition:
     return out.written();
 }
 
+pub fn queryChanged(previous: []const u8, buf: []u8, text: []const u16, caret: usize, composition: []const u16) bool {
+    return !std.mem.eql(u8, previous, compositionQuery(buf, text, caret, composition));
+}
+
 const Utf8Out = struct {
     buf: []u8,
     len: usize = 0,
@@ -486,5 +490,17 @@ test "PreviewGate previews only a selection the user chose" {
     // Off the themes the saved one shows, too.
     gate.navigated();
     try testing.expectEqual(@as(?[]const u8, null), gate.target(null));
-    try testing.expect(previewDelayMs(.typing) > previewDelayMs(.navigation));
+    try testing.expectEqual(@as(u32, 400), previewDelayMs(.typing));
+    try testing.expectEqual(@as(u32, 150), previewDelayMs(.navigation));
+}
+
+test "unchanged composition preserves the list interaction" {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var buf: [256]u8 = undefined;
+    try testing.expect(!queryChanged("", &buf, &.{}, 0, &.{}));
+    try testing.expect(!queryChanged("xjbq", &buf, &.{}, 0, L("xj'b'q")));
+    try testing.expect(!queryChanged("a新建", &buf, L("a新建"), 3, &.{}));
+    try testing.expect(queryChanged("xjbq", &buf, L("新建标签"), 4, &.{}));
+    try testing.expect(queryChanged("Nord", &buf, L("Nord Light"), 10, &.{}));
+    try testing.expect(queryChanged("xjbq", &buf, &.{}, 0, &.{}));
 }
