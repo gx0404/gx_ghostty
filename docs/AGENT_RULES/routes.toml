@@ -224,7 +224,9 @@ doc = "docs/AGENT_RULES/gx-core.md"
 paths = [
   "po/zh_CN.po",
   "scripts/gx_i18n.py",
+  "scripts/gx_pinyin.py",
   "scripts/test_gx_i18n.py",
+  "scripts/test_gx_pinyin.py",
   "src/gx/**",
 ]
 tasks = []

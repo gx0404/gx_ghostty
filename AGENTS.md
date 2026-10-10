@@ -119,7 +119,7 @@ Windows 上 `just build` 产出 `zig-out/bin/ghostty.exe`，`just test` 构建�
 - **配置即文档**：`src/config/Config.zig` 字段的 doc comment 生成用户文档，用 Pandoc Markdown 写（`config.md`）。
 - **i18n**：上游 GTK 字符串用 gettext 的 `_`/`N_`/`C_` 标记，pot 经 `update-translations` 同步；fork 字符串（GTK 的 GX 层、win32 全部界面）一律是英文 msgid 经 `gx.i18n.tr`/`trRuntime` 翻译，不得用 `_`，新译文写进 `src/gx/i18n/gx.zh_CN.po` 后 `just i18n`；macOS 未本地化（`apprt-gtk.md`、`gx-core.md`）。
 - **配置分层**：GX 默认值 < 用户配置（含 include）< `gui-settings.ghostty` < 命令行；设置界面只写 `gui-settings.ghostty`，不写用户的 `config.ghostty`；fork 配置键一律 `gx-*`（`gx-core.md`、`config.md`）。
-- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json`、`src/gx/i18n/zh_CN.zig` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
+- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json`、`src/gx/i18n/zh_CN.zig`、`src/gx/pinyin/initials.zig` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
 - **工具链本地性**：Zig、graphify 与 Inno Setup 只经 `just setup`（后者加 `--innosetup`）装进 `.local/`，禁止 winget/choco/scoop/msiexec 等系统级安装（`development.md`）。
 
 ## 提交规范
