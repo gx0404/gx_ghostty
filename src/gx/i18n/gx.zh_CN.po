@@ -865,3 +865,22 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. Windows apprt: keyboard shortcut sheet (src/apprt/win32/ui/Keybinds.zig)
+msgid "Record Keys"
+msgstr "录制按键"
+
+msgid "Press the keys to look up; Esc stops recording"
+msgstr "按下要查找的按键；按 Esc 停止录制"
+
+msgid "Global hotkeys of other programs: Windows gives these keys to the program that registered them, so Ghostty GX does not receive them."
+msgstr "其他程序的全局快捷键：Windows 会把这些按键交给注册它们的程序，Ghostty GX 收不到。"
+
+msgid "Kept by the input method: Ghostty GX does not receive these keys while the input method is on."
+msgstr "被输入法占用：输入法开启时，Ghostty GX 收不到这些按键。"
+
+msgid "{keys}: global hotkey of another program"
+msgstr "{keys}：其他程序的全局快捷键"
+
+msgid "{keys}: kept by the input method"
+msgstr "{keys}：被输入法占用"
