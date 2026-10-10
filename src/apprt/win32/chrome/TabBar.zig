@@ -214,8 +214,42 @@ const ProcessName = struct {
 const max_tracked = 256;
 
 const Tracked = struct {
+    const RendererState = @import("../../../renderer/State.zig");
+
     id: u64,
     tracker: gx.unread.Tracker = .{},
+    grid: ?[2]usize = null,
+
+    fn capture(self: *Tracked, state: *RendererState) void {
+        self.tracker = .{ .baseline = gx.unread.baseline(state.terminal) };
+        self.grid = .{ state.terminal.cols, state.terminal.rows };
+    }
+
+    fn hide(self: *Tracked, state: *RendererState, io: std.Io) void {
+        state.lockDemand(io);
+        defer state.unlockDemand(io);
+        self.capture(state);
+    }
+
+    fn show(self: *Tracked) void {
+        self.tracker.show();
+        self.grid = null;
+    }
+
+    fn check(self: *Tracked, state: *RendererState, io: std.Io) bool {
+        if (!state.mutex.tryLock()) {
+            self.tracker.busy +|= 1;
+            return self.tracker.busy >= gx.unread.busy_checks;
+        }
+        defer state.mutex.unlock(io);
+        const grid: [2]usize = .{ state.terminal.cols, state.terminal.rows };
+        if (self.grid == null or !std.meta.eql(self.grid.?, grid) or self.tracker.baseline == null) {
+            self.capture(state);
+            return false;
+        }
+        self.tracker.busy = 0;
+        return gx.unread.changed(state.terminal, self.tracker.baseline);
+    }
 };
 
 /// What the status marks of a tab show.
@@ -1615,7 +1649,7 @@ fn checkUnread(self: *TabBar) bool {
             const tracker = self.findTracker(surface.core_surface.id) orelse {
                 if (!state.mutex.tryLock()) continue;
                 defer state.mutex.unlock(io);
-                self.trackerOf(surface.core_surface.id).* = .{ .baseline = gx.unread.baseline(state.terminal) };
+                self.trackerOf(surface.core_surface.id).capture(state);
                 continue;
             };
             if (tracker.check(state, io)) {
@@ -1662,16 +1696,16 @@ pub fn onTabShown(self: *TabBar, tab: usize) void {
     self.reveal_pending = true;
 }
 
-fn findTracker(self: *TabBar, id: u64) ?*gx.unread.Tracker {
+fn findTracker(self: *TabBar, id: u64) ?*Tracked {
     for (self.tracked[0..self.tracked_len]) |*entry| {
-        if (entry.id == id) return &entry.tracker;
+        if (entry.id == id) return entry;
     }
     return null;
 }
 
 /// The tracker of the terminal with core surface id `id`, added when it
 /// has none.
-fn trackerOf(self: *TabBar, id: u64) *gx.unread.Tracker {
+fn trackerOf(self: *TabBar, id: u64) *Tracked {
     if (self.findTracker(id)) |tracker| return tracker;
     if (self.tracked_len == max_tracked) self.pruneTrackers();
     if (self.tracked_len == max_tracked) {
@@ -1681,7 +1715,7 @@ fn trackerOf(self: *TabBar, id: u64) *gx.unread.Tracker {
     }
     self.tracked[self.tracked_len] = .{ .id = id };
     self.tracked_len += 1;
-    return &self.tracked[self.tracked_len - 1].tracker;
+    return &self.tracked[self.tracked_len - 1];
 }
 
 /// Forget the trackers of terminals that are gone.
@@ -2247,6 +2281,41 @@ test "tooltip and title buffers keep complete utf8 codepoints" {
         try testing.expect(std.unicode.utf8ValidateSlice(utf16ToUtf8(buf[0..limit], units)));
     }
     try testing.expectEqualStrings("\u{6C49}", utf16ToUtf8(buf[0..6], units));
+}
+
+test "hidden tracking ignores reflow but sees subsequent output" {
+    const testing = std.testing;
+    const Terminal = @import("../../../terminal/main.zig").Terminal;
+    var terminal: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer terminal.deinit(testing.allocator);
+    var mutex: std.Io.Mutex = .init;
+    var state: Tracked.RendererState = .{ .mutex = &mutex, .terminal = &terminal };
+    var tracked: Tracked = .{ .id = 1 };
+    try terminal.printString("$ ");
+    tracked.hide(&state, testing.io);
+    try testing.expect(!tracked.check(&state, testing.io));
+    try terminal.resize(testing.allocator, .{ .cols = 40, .rows = 7 });
+    try testing.expect(!tracked.check(&state, testing.io));
+    try terminal.printString("new output\n");
+    try testing.expect(tracked.check(&state, testing.io));
+    tracked.show();
+    try testing.expect(!tracked.check(&state, testing.io));
+}
+
+test "hidden tracking never waits for a busy terminal" {
+    const testing = std.testing;
+    const Terminal = @import("../../../terminal/main.zig").Terminal;
+    var terminal: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer terminal.deinit(testing.allocator);
+    var mutex: std.Io.Mutex = .init;
+    var state: Tracked.RendererState = .{ .mutex = &mutex, .terminal = &terminal };
+    var tracked: Tracked = .{ .id = 1 };
+    tracked.hide(&state, testing.io);
+    try testing.expect(mutex.tryLock());
+    for (1..gx.unread.busy_checks) |_| try testing.expect(!tracked.check(&state, testing.io));
+    try testing.expect(tracked.check(&state, testing.io));
+    mutex.unlock(testing.io);
+    try testing.expect(!tracked.check(&state, testing.io));
 }
 
 test {
