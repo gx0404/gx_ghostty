@@ -1789,3 +1789,18 @@ test "NOTIFYICONDATAW_V3 has the size of the Windows SDK structure" {
     const expected: usize = if (@sizeOf(usize) == 8) 976 else 956;
     try std.testing.expectEqual(expected, @sizeOf(NOTIFYICONDATAW_V3));
 }
+
+// R2-Quick
+pub const MONITOR_DEFAULTTONULL: u32 = 0x00000000;
+pub extern "user32" fn MonitorFromRect(lprc: *const RECT, dwFlags: u32) callconv(.winapi) ?HMONITOR;
+pub const MDT_EFFECTIVE_DPI: i32 = 0;
+pub extern "shcore" fn GetDpiForMonitor(hmonitor: HMONITOR, dpiType: i32, dpiX: *u32, dpiY: *u32) callconv(.winapi) i32;
+pub const GA_ROOTOWNER: u32 = 3;
+pub extern "user32" fn GetAncestor(hwnd: HWND, gaFlags: u32) callconv(.winapi) ?HWND;
+/// The system owns `hRgn` once the call succeeds.
+pub extern "user32" fn SetWindowRgn(hWnd: HWND, hRgn: ?*anyopaque, bRedraw: i32) callconv(.winapi) i32;
+pub extern "user32" fn ShowOwnedPopups(hWnd: HWND, fShow: i32) callconv(.winapi) i32;
+pub const DWMWA_CLOAK: u32 = 13;
+pub const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+pub const DWMWCP_DONOTROUND: u32 = 1;
+pub const DWMWCP_ROUND: u32 = 2;
