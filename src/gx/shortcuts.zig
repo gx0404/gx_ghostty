@@ -334,10 +334,11 @@ pub const Title = struct {
     exact: bool,
 };
 
-/// The title of `action`: that of an equal command palette entry,
-/// configured (`commands`) or default, else of the only default entry
-/// with the same action name, else a Ghostty GX title for the action
-/// name. Null when there is none; callers show the action itself.
+/// The title of `action`: that of an equal configured (`commands`) command
+/// palette entry, else an equal default entry. Text, CSI and ESC actions
+/// then use their generic titles; other actions use the only default entry
+/// with the same action name, else a Ghostty GX title for the action name.
+/// Null when there is none; callers show the action itself.
 pub fn title(action: Action, commands: []const input.Command) ?Title {
     for (commands) |command| {
         if (command.action.equal(action)) return .{ .msgid = command.title, .exact = true };
@@ -347,6 +348,10 @@ pub fn title(action: Action, commands: []const input.Command) ?Title {
     }
 
     const tag = std.meta.activeTag(action);
+    switch (tag) {
+        .text, .csi, .esc => return .{ .msgid = fallback_titles.get(@tagName(tag)).?, .exact = false },
+        else => {},
+    }
     var same_name: ?[:0]const u8 = null;
     var count: usize = 0;
     for (input.command.defaults) |command| {
@@ -1088,6 +1093,103 @@ test "title prefers the command palette titles" {
 
     const configured = [_]input.Command{.{ .title = "My Split", .action = .{ .new_split = .right } }};
     try testing.expectEqualStrings("My Split", title(.{ .new_split = .right }, &configured).?.msgid);
+}
+
+test "title uses generic names for free-form arguments" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "text:hello", "Send Text" },
+        .{ "text:world:👻", "Send Text" },
+        .{ "text:", "Send Text" },
+        .{ "csi:0m", "Send Control Sequence" },
+        .{ "csi:2J", "Send Control Sequence" },
+        .{ "csi:", "Send Control Sequence" },
+        .{ "esc:c", "Send Escape Sequence" },
+        .{ "esc:7", "Send Escape Sequence" },
+        .{ "esc:", "Send Escape Sequence" },
+    };
+    for (cases) |case| {
+        const action = try Action.parse(case[0]);
+        const named = title(action, &.{}).?;
+        try testing.expectEqualStrings(case[1], named.msgid);
+        try testing.expect(!named.exact);
+    }
+    const ghost = title(try Action.parse("text:👻"), &.{}).?;
+    try testing.expectEqualStrings("Ghostty", ghost.msgid);
+    try testing.expect(ghost.exact);
+}
+
+test "title matches configured free-form arguments exactly" {
+    const commands = [_]input.Command{
+        .{ .title = "Greeting", .action = try Action.parse("text:hello") },
+        .{ .title = "Farewell", .action = try Action.parse("text:bye") },
+        .{ .title = "Reset Style", .action = try Action.parse("csi:0m") },
+        .{ .title = "Clear Display", .action = try Action.parse("csi:2J") },
+        .{ .title = "Reset Terminal", .action = try Action.parse("esc:c") },
+        .{ .title = "Save Cursor", .action = try Action.parse("esc:7") },
+        .{ .title = "My Ghost", .action = try Action.parse("text:👻") },
+        .{ .title = "Another Greeting", .action = try Action.parse("text:hello") },
+    };
+    for (commands[0 .. commands.len - 1]) |command| {
+        const text = try std.fmt.allocPrint(testing.allocator, "{f}", .{command.action});
+        defer testing.allocator.free(text);
+        const action = try Action.parse(text);
+        try testing.expect(action.equal(command.action));
+        const named = title(action, &commands).?;
+        try testing.expectEqualStrings(command.title, named.msgid);
+        try testing.expect(named.exact);
+    }
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "text:other", "Send Text" },
+        .{ "csi:1m", "Send Control Sequence" },
+        .{ "esc:8", "Send Escape Sequence" },
+    };
+    for (cases) |case| {
+        const named = title(try Action.parse(case[0]), &commands).?;
+        try testing.expectEqualStrings(case[1], named.msgid);
+        try testing.expect(!named.exact);
+    }
+    const ghost = title(try Action.parse("text:👻"), commands[0..6]).?;
+    try testing.expectEqualStrings("Ghostty", ghost.msgid);
+    try testing.expect(ghost.exact);
+}
+
+test "title preserves fixed action and enum fallback priorities" {
+    const commands = [_]input.Command{
+        .{ .title = "My Reload", .action = try Action.parse("reload_config") },
+        .{ .title = "My Inspector", .action = try Action.parse("inspector:toggle") },
+        .{ .title = "My Split", .action = try Action.parse("new_split:right") },
+    };
+    for (commands) |command| {
+        const named = title(command.action, &commands).?;
+        try testing.expectEqualStrings(command.title, named.msgid);
+        try testing.expect(named.exact);
+    }
+    const exact_cases = [_]struct { []const u8, []const u8 }{
+        .{ "reload_config", "Reload Config" },
+        .{ "inspector:toggle", "Toggle Inspector" },
+        .{ "new_split:right", "Split Right" },
+    };
+    for (exact_cases) |case| {
+        const named = title(try Action.parse(case[0]), &.{}).?;
+        try testing.expectEqualStrings(case[1], named.msgid);
+        try testing.expect(named.exact);
+    }
+    const fallback_cases = [_]struct { []const u8, []const u8 }{
+        .{ "inspector:show", "Toggle Inspector" },
+        .{ "inspector:hide", "Toggle Inspector" },
+        .{ "increase_font_size:3", "Increase Font Size" },
+        .{ "new_split:auto", "New Split" },
+    };
+    for (fallback_cases) |case| {
+        const action = try Action.parse(case[0]);
+        for ([_][]const input.Command{ &.{}, &commands }) |configured| {
+            const named = title(action, configured).?;
+            try testing.expectEqualStrings(case[1], named.msgid);
+            try testing.expect(!named.exact);
+        }
+    }
+    try testing.expectEqual(@as(?Title, null), title(try Action.parse("gx:tab_switcher"), &commands));
+    try testing.expectError(error.InvalidAction, Action.parse("gx:unknown"));
 }
 
 test "argument" {
