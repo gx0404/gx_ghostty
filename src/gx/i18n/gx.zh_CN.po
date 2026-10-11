@@ -1050,6 +1050,16 @@ msgstr "查找"
 msgid "Find is not available: Direct2D could not be started."
 msgstr "查找不可用：无法启动 Direct2D。"
 
+#. Window menu (src/apprt/win32/ui/Menu.zig)
+msgid "Restore"
+msgstr "还原"
+
+msgid "Move"
+msgstr "移动"
+
+msgid "Size"
+msgstr "大小"
+
 #. Windows apprt: tooltips of the caption buttons
 msgid "Minimize"
 msgstr "最小化"
