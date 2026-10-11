@@ -1866,3 +1866,9 @@ pub const IMECHARPOSITION = extern struct {
     /// The editable area.
     rcDocument: RECT,
 };
+
+// R2-Keybinds
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x00000800;
+pub extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?*anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn FreeLibrary(module: *anyopaque) callconv(.winapi) i32;
+pub extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
