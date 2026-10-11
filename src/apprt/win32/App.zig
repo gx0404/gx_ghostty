@@ -1625,9 +1625,16 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
         .new_window_profile => |id| self.openProfile(window, id, .window),
         .new_tab_menu => self.deferGx(.new_tab_menu, window),
         .context_menu => self.deferGx(.context_menu, window),
+        .settings_page => |page| Settings.showSection(window, switch (page) {
+            .language => .language,
+            .appearance => .appearance,
+            .font => .font,
+            .interaction => .interaction,
+            .shell => .shell,
+            .about => .about,
+        }),
         // Not implemented yet: report them as not performed so that a
         // `performable:` binding passes its key on to the terminal.
-        .settings_page,
         .move_split_to_tab,
         .move_split_to_window,
         .tab_switcher,
@@ -2208,13 +2215,11 @@ fn updateConfig(self: *App, config: *const Config) void {
         self.scheduleShortcutProbe();
     }
 
-    if (self.quick_terminal) |qt| {
-        qt.onConfigChange(&self.config);
-        qt.window.onConfigChange();
-    }
+    if (self.quick_terminal) |qt| qt.onConfigChange(&self.config);
     if (old.changed(&self.config, .@"progress-style")) self.onProgressTimer();
 
     self.reportConfigDiagnostics(.post);
+    Settings.onConfigChange(self);
 }
 
 /// `reload_config`: read the configuration files again and apply them, then
@@ -2247,7 +2252,7 @@ fn reloadConfigFromDisk(self: *App, target: apprt.Target) void {
     if (self.diagnostics_reported != 0) return;
     if (!self.config.@"app-notifications".@"config-reload") return;
     const window = self.targetWindow(target) orelse return;
-    window.postToast(.{ .text = i18n.tr("Reloaded the configuration"), .icon = d2d.icons.check_mark });
+    window.postToast(.{ .text = i18n.tr("Reloaded the configuration"), .icon = d2d.icons.check_mark, .duration_ms = 2000 });
 }
 
 /// `toggle_background_opacity` with per-pixel translucency: every window
@@ -2757,7 +2762,7 @@ fn showKeySequence(self: *App, window: *Window, value: apprt.action.KeySequence)
             var toast_buf: [160]u8 = undefined;
             const keys = self.key_sequence[0..self.key_sequence_len];
             const toast_text = std.fmt.bufPrint(&toast_buf, "{s} \u{2026}", .{keys}) catch keys;
-            window.postToast(.{ .text = toast_text, .icon = d2d.icons.keyboard });
+            window.postToast(.{ .text = toast_text, .icon = d2d.icons.keyboard, .duration_ms = null });
         },
         .end => {
             const active = self.key_sequence_len > 0;
@@ -2779,7 +2784,7 @@ fn showKeyTable(window: *Window, value: apprt.action.KeyTable) void {
             var buf: [160]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&buf);
             i18n.format(&writer, i18n.tr("Key table {name}"), .{ .name = name }) catch {};
-            window.postToast(.{ .text = writer.buffered(), .icon = d2d.icons.keyboard });
+            window.postToast(.{ .text = writer.buffered(), .icon = d2d.icons.keyboard, .duration_ms = null });
         },
         .deactivate, .deactivate_all => hideKeyHint(window),
     }

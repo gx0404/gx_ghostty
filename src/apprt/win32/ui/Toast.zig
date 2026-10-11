@@ -1,6 +1,7 @@
 //! A short confirmation centered at the bottom of a window ("Copied",
 //! "Configuration reloaded"): a rounded capsule with an optional icon
-//! that stays for 3 seconds. It fades in (`Popup.Options.motion`), lets
+//! that stays for 3 seconds by default (or until hidden for key hints).
+//! It fades in (`Popup.Options.motion`), lets
 //! the pointer through, never takes the focus, waits while a modal dialog
 //! has its window disabled, and showing it again replaces the text and
 //! starts the time over.
@@ -28,6 +29,8 @@ pub const Content = struct {
     text: []const u8,
     /// An icon glyph (`d2d.icons`) before the text, in the accent color.
     icon: ?u21 = null,
+    /// Null keeps the hint until its caller hides it.
+    duration_ms: ?u32 = Toast.duration_ms,
 };
 
 pub const Placement = Notice.Placement;
@@ -52,6 +55,7 @@ placement: ?Placement = null,
 text: [256]u8 = undefined,
 text_len: usize = 0,
 icon: ?u21 = null,
+timeout_ms: ?u32 = duration_ms,
 pending: bool = false,
 
 /// Show `content` now (from the message loop).
@@ -106,6 +110,8 @@ fn store(self: *Toast, content: Content) void {
     @memcpy(self.text[0..len], content.text[0..len]);
     self.text_len = len;
     self.icon = content.icon;
+    self.timeout_ms = content.duration_ms;
+    if (self.popup.hwnd) |hwnd| _ = w32.KillTimer(hwnd, HIDE_TIMER_ID);
 }
 
 fn tokens(self: *const Toast) style.Tokens {
@@ -159,7 +165,8 @@ fn showStored(self: *Toast) void {
     self.popup.setAccessibleName(self.text[0..self.text_len]);
     const rect = self.bounds() orelse return;
     self.popup.show(rect);
-    _ = w32.SetTimer(hwnd, HIDE_TIMER_ID, duration_ms, null);
+    _ = w32.KillTimer(hwnd, HIDE_TIMER_ID);
+    if (self.timeout_ms) |ms| _ = w32.SetTimer(hwnd, HIDE_TIMER_ID, ms, null);
 }
 
 fn textStyle(color: d2d.Color) d2d.TextStyle {
@@ -211,7 +218,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
 fn onTimer(ctx: *anyopaque, popup: *Popup, id: usize) void {
     const self: *Toast = @ptrCast(@alignCast(ctx));
     switch (id) {
-        HIDE_TIMER_ID => self.hide(),
+        HIDE_TIMER_ID => if (self.timeout_ms != null and !self.pending) self.hide(),
         WAIT_TIMER_ID => self.showStored(),
         else => if (popup.hwnd) |hwnd| {
             _ = w32.KillTimer(hwnd, id);
@@ -244,6 +251,22 @@ test "toast text is stored up to a character boundary" {
     try testing.expect(toast.text_len <= toast.text.len);
     try testing.expect(std.unicode.utf8ValidateSlice(toast.text[0..toast.text_len]));
     try testing.expectEqual(@as(?u21, null), toast.icon);
+}
+
+test "toast duration defaults, replaces and keeps persistent hints" {
+    const testing = std.testing;
+    var toast: Toast = .{};
+    toast.store(.{ .text = "Copied" });
+    try testing.expectEqual(@as(?u32, 3000), toast.timeout_ms);
+    toast.store(.{ .text = "Reloaded", .duration_ms = 2000 });
+    try testing.expectEqual(@as(?u32, 2000), toast.timeout_ms);
+    toast.store(.{ .text = "Leader", .duration_ms = null });
+    toast.pending = true;
+    onTimer(&toast, &toast.popup, HIDE_TIMER_ID);
+    try testing.expectEqual(@as(?u32, null), toast.timeout_ms);
+    try testing.expect(toast.pending);
+    toast.store(.{ .text = "Copied again" });
+    try testing.expectEqual(@as(?u32, 3000), toast.timeout_ms);
 }
 
 test {
