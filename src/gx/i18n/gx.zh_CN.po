@@ -1049,3 +1049,13 @@ msgstr "查找"
 
 msgid "Find is not available: Direct2D could not be started."
 msgstr "查找不可用：无法启动 Direct2D。"
+
+#. Windows apprt: tooltips of the caption buttons
+msgid "Minimize"
+msgstr "最小化"
+
+msgid "Maximize"
+msgstr "最大化"
+
+msgid "Restore Down"
+msgstr "向下还原"
