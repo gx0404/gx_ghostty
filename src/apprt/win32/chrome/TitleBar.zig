@@ -1218,10 +1218,9 @@ fn paintCaptionButtons(self: *TitleBar, ctx: PaintContext, dirty: w32.RECT, now:
 }
 
 /// Caption buttons fading out of their hover look after the pointer left
-/// them. WinUI's caption buttons fade the fill in 150 ms and the glyph in
-/// 100 ms; these take the nearest shared Fluent durations (`gx.motion`).
-/// Painting reads the progress from the clock; the ticks repaint the
-/// fading buttons only.
+/// them, using `gx.motion`'s WinUI durations: 150 ms fill, 100 ms glyph.
+/// The main menu keeps the generic Fluent durations. Painting reads the
+/// progress from the clock; the ticks repaint the fading buttons only.
 const Fades = struct {
     animator: anim.Animator = .{ .tick = tick },
     /// When each of `buttons` started fading (`anim.now`), 0 when it does
@@ -1236,8 +1235,8 @@ const Fades = struct {
         return std.mem.indexOfScalar(Button, &buttons, button);
     }
 
-    fn fillTween(start: u64) anim.Tween {
-        return .begin(start, anim.motion.duration.fast, anim.motion.linear);
+    fn fillTween(button: Button, start: u64) anim.Tween {
+        return .begin(start, if (button == .menu) anim.motion.duration.fast else anim.motion.duration.caption_fill, anim.motion.linear);
     }
 
     /// Fade `button` out from now on, when animations are on.
@@ -1263,9 +1262,9 @@ const Fades = struct {
         const i = index(button) orelse return null;
         const start = self.started[i];
         if (start == 0) return null;
-        const fill = fillTween(start);
+        const fill = fillTween(button, start);
         if (fill.done(now)) return null;
-        const glyph: anim.Tween = .begin(start, anim.motion.duration.faster, anim.motion.linear);
+        const glyph: anim.Tween = .begin(start, if (button == .menu) anim.motion.duration.faster else anim.motion.duration.caption_glyph, anim.motion.linear);
         return .{ .fill = fill.progress(now), .glyph = glyph.progress(now) };
     }
 
@@ -1277,7 +1276,7 @@ const Fades = struct {
         for (&self.started, buttons) |*start, button| {
             if (start.* == 0) continue;
             title_bar.invalidateRect(lay.buttonRect(button));
-            if (fillTween(start.*).done(now)) start.* = 0 else running = true;
+            if (fillTween(button, start.*).done(now)) start.* = 0 else running = true;
         }
         return running;
     }
@@ -1527,24 +1526,68 @@ extern "user32" fn WindowFromPoint(point: w32.POINT) callconv(.winapi) ?w32.HWND
 pub extern "user32" fn GetWindowPlacement(hWnd: w32.HWND, lpwndpl: *WINDOWPLACEMENT) callconv(.winapi) i32;
 extern "user32" fn SetWindowPlacement(hWnd: w32.HWND, lpwndpl: *const WINDOWPLACEMENT) callconv(.winapi) i32;
 
-test "the button fades end where the hover look ends" {
+test "caption hover fades use 150 ms fill and 100 ms glyph" {
     const testing = std.testing;
     const ms = std.time.ns_per_ms;
-    var fades: Fades = .{};
-    try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(.close, 1000 * ms));
-    fades.started[Fades.index(.close).?] = 1000 * ms;
-    const start = fades.progress(.close, 1000 * ms).?;
-    try testing.expectEqual(@as(f32, 0), start.fill);
-    // The glyph is back first; the fill a little later.
-    const mid = fades.progress(.close, 1000 * ms + anim.motion.duration.faster * ms).?;
-    try testing.expectEqual(@as(f32, 1), mid.glyph);
-    try testing.expect(mid.fill > 0.4 and mid.fill < 0.6);
-    try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(.close, 1000 * ms + anim.motion.duration.fast * ms));
-    // Other buttons are not fading.
-    try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(.minimize, 1000 * ms));
-    fades.cancel(.close);
-    try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(.close, 1000 * ms));
+    const started = 1000 * ms;
+    const samples = [_]struct { elapsed_ms: u64, fill: f32, glyph: f32 }{
+        .{ .elapsed_ms = 83, .fill = 83.0 / 150.0, .glyph = 0.83 },
+        .{ .elapsed_ms = 99, .fill = 0.66, .glyph = 0.99 },
+        .{ .elapsed_ms = 100, .fill = 100.0 / 150.0, .glyph = 1 },
+        .{ .elapsed_ms = 149, .fill = 149.0 / 150.0, .glyph = 1 },
+    };
+    for ([_]Button{ .minimize, .maximize, .close }) |button| {
+        var fades: Fades = .{};
+        try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(button, started));
+        fades.started[Fades.index(button).?] = started;
+        const start = fades.progress(button, started).?;
+        try testing.expectEqual(@as(f32, 0), start.fill);
+        try testing.expectEqual(@as(f32, 0), start.glyph);
+        for (samples) |sample| {
+            const progress = fades.progress(button, started + sample.elapsed_ms * ms).?;
+            try testing.expectApproxEqAbs(sample.fill, progress.fill, 1e-6);
+            try testing.expectApproxEqAbs(sample.glyph, progress.glyph, 1e-6);
+        }
+        try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(button, started + 150 * ms));
+        for (Fades.buttons) |other| {
+            if (other == button) continue;
+            try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(other, started));
+        }
+        fades.cancel(button);
+        try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(button, started));
+    }
     try testing.expectEqual(@as(?usize, null), Fades.index(.none));
+}
+
+test "caption fade ticks and cancellation keep the menu independent" {
+    const testing = std.testing;
+    const ms = std.time.ns_per_ms;
+    const started = 1000 * ms;
+    var win: Window = undefined;
+    win.hwnd = null;
+    win.title_bar = .{};
+    const fades = &win.title_bar.fades;
+    fades.started = @splat(started);
+    const menu = fades.progress(.menu, started + 83 * ms).?;
+    try testing.expectApproxEqAbs(@as(f32, 83.0 / 167.0), menu.fill, 1e-6);
+    try testing.expectEqual(@as(f32, 1), menu.glyph);
+    try testing.expect(Fades.tick(&fades.animator, started + 149 * ms));
+    for (fades.started) |start| try testing.expectEqual(started, start);
+    try testing.expect(Fades.tick(&fades.animator, started + 150 * ms));
+    for ([_]Button{ .minimize, .maximize, .close }) |button| {
+        try testing.expectEqual(@as(u64, 0), fades.started[Fades.index(button).?]);
+    }
+    try testing.expectEqual(started, fades.started[Fades.index(.menu).?]);
+    try testing.expect(fades.progress(.menu, started + 166 * ms) != null);
+    try testing.expect(!Fades.tick(&fades.animator, started + 167 * ms));
+    try testing.expectEqual(@as(?Fades.Progress, null), fades.progress(.menu, started + 167 * ms));
+    fades.started = @splat(started);
+    fades.cancel(.close);
+    for ([_]Button{ .minimize, .maximize, .menu }) |button| {
+        try testing.expect(fades.progress(button, started + 99 * ms) != null);
+    }
+    fades.stop();
+    try testing.expectEqual(@as([Fades.buttons.len]u64, @splat(0)), fades.started);
 }
 
 const TestWindows = struct {

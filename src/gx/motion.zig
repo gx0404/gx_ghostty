@@ -1,10 +1,11 @@
 //! Motion of the Ghostty GX interface, the same on win32 and GTK: the
-//! Fluent durations (83, 167 and 250 ms), the entrance, exit and
-//! movement curves as CSS `cubic-bezier` timing functions, and whether to
-//! animate at all (the system's animation setting, remote sessions, and
-//! the `GHOSTTY_GX_ANIMATIONS` override). Animations are driven by
-//! elapsed time (`fraction`), not by frame counts, and jump to their end
-//! state when animations are off. The win32 frame clock and tweens are in
+//! Fluent durations (83, 167 and 250 ms), caption hover exits (150 ms
+//! fill, 100 ms glyph), the entrance, exit and movement curves as CSS
+//! `cubic-bezier` timing functions, and whether to animate at all (the
+//! system's animation setting, remote sessions, and the
+//! `GHOSTTY_GX_ANIMATIONS` override). Animations are driven by elapsed
+//! time (`fraction`), not by frame counts, and jump to their end state
+//! when animations are off. The win32 frame clock and tweens are in
 //! `src/apprt/win32/ui/anim.zig`. Only depends on `std`.
 const std = @import("std");
 
@@ -16,6 +17,10 @@ pub const duration = struct {
     pub const fast: u32 = 167;
     /// Larger movements, such as panels sliding in.
     pub const normal: u32 = 250;
+    /// Caption button fill fading out of hover.
+    pub const caption_fill: u32 = 150;
+    /// Caption button glyph returning from hover.
+    pub const caption_glyph: u32 = 100;
 };
 
 /// A CSS `cubic-bezier(x1, y1, x2, y2)` timing function: the curve from
@@ -168,6 +173,25 @@ test "fraction" {
     try testing.expectEqual(@as(f32, 1), fraction(duration.fast, duration.fast));
     try testing.expectEqual(@as(f32, 1), fraction(10_000, duration.fast));
     try testing.expectEqual(@as(f32, 1), fraction(0, 0));
+}
+
+test "caption hover durations leave generic Fluent durations unchanged" {
+    try testing.expectEqual(@as(u32, 83), duration.faster);
+    try testing.expectEqual(@as(u32, 167), duration.fast);
+    try testing.expectEqual(@as(u32, 250), duration.normal);
+    try testing.expectEqual(@as(u32, 150), duration.caption_fill);
+    try testing.expectEqual(@as(u32, 100), duration.caption_glyph);
+    const samples = [_]struct { elapsed_ms: u64, fill: f32, glyph: f32 }{
+        .{ .elapsed_ms = 83, .fill = 83.0 / 150.0, .glyph = 0.83 },
+        .{ .elapsed_ms = 99, .fill = 0.66, .glyph = 0.99 },
+        .{ .elapsed_ms = 100, .fill = 100.0 / 150.0, .glyph = 1 },
+        .{ .elapsed_ms = 149, .fill = 149.0 / 150.0, .glyph = 1 },
+        .{ .elapsed_ms = 150, .fill = 1, .glyph = 1 },
+    };
+    for (samples) |sample| {
+        try testing.expectApproxEqAbs(sample.fill, fraction(sample.elapsed_ms, duration.caption_fill), 1e-6);
+        try testing.expectApproxEqAbs(sample.glyph, fraction(sample.elapsed_ms, duration.caption_glyph), 1e-6);
+    }
 }
 
 test "enabled follows the system, remote sessions and the override" {
