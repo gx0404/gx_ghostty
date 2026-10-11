@@ -239,6 +239,8 @@ pub const GxSettingsDialog = extern struct {
         scrollbar_row: *adw.SwitchRow,
         close_confirmation_row: *adw.ComboRow,
         focus_follows_mouse_row: *adw.SwitchRow,
+        ctrl_scroll_zoom_row: *adw.SwitchRow,
+        ctrl_scroll_zoom_reset_button: *gtk.Button,
         bell_group: *adw.PreferencesGroup,
         bell_system_row: *adw.SwitchRow,
         bell_audio_row: *adw.SwitchRow,
@@ -585,6 +587,8 @@ pub const GxSettingsDialog = extern struct {
         setSwitch(priv.cursor_blink_row, config.@"cursor-style-blink" orelse true);
         setSwitch(priv.scrollbar_row, config.scrollbar == .system);
         setSwitch(priv.focus_follows_mouse_row, config.@"focus-follows-mouse");
+        setSwitch(priv.ctrl_scroll_zoom_row, config.@"gx-ctrl-scroll-zoom");
+        priv.ctrl_scroll_zoom_reset_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets(settings_map.ctrl_scroll_zoom.key)));
         const rows = self.bellRows();
         inline for (settings_map.bell_features, 0..) |feature, i| {
             rows[i].as(gtk.Widget).setVisible(@intFromBool(feature.supports(.gtk)));
@@ -1110,6 +1114,8 @@ pub const GxSettingsDialog = extern struct {
         setTitle(priv.scrollbar_row, self.tr(msg.show_scrollbar));
         setTitle(priv.close_confirmation_row, self.tr(msg.close_confirmation));
         setTitle(priv.focus_follows_mouse_row, self.tr(settings_map.focus_follows_mouse.label));
+        setTitle(priv.ctrl_scroll_zoom_row, self.tr(settings_map.ctrl_scroll_zoom.label));
+        setIconLabel(priv.ctrl_scroll_zoom_reset_button, self.tr(msg.reset_to_default));
         priv.bell_group.setTitle(self.tr(msg.bell));
         const rows = self.bellRows();
         inline for (settings_map.bell_features, 0..) |feature, i| {
@@ -1184,6 +1190,11 @@ pub const GxSettingsDialog = extern struct {
             priv.focus_follows_mouse_row,
             self.tr(settings_map.focus_follows_mouse.hint),
             self.fromCli(&.{settings_map.focus_follows_mouse.key}),
+        );
+        self.setNote(
+            priv.ctrl_scroll_zoom_row,
+            self.tr(settings_map.ctrl_scroll_zoom.hint),
+            self.fromCli(&.{settings_map.ctrl_scroll_zoom.key}),
         );
 
         const bell_cli = self.fromCli(&.{"bell-features"});
@@ -1430,13 +1441,20 @@ pub const GxSettingsDialog = extern struct {
         self.unref();
     }
 
-    /// Follows the configuration of the application: a new language
-    /// translates the dialog.
+    /// Follows the zoom switch and UI language without overwriting pending edits.
     fn appConfigChanged(app: *Application, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
         const st = &self.private().state;
         if (st.disposed) return;
         const config = app.getConfig();
         defer config.unref();
+        if (st.changes.isEmpty() and !st.apply_pending) {
+            const loading = st.loading;
+            st.loading = true;
+            defer st.loading = loading;
+            const priv = self.private();
+            setSwitch(priv.ctrl_scroll_zoom_row, config.get().@"gx-ctrl-scroll-zoom");
+            priv.ctrl_scroll_zoom_reset_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets(settings_map.ctrl_scroll_zoom.key)));
+        }
         const lang = gx.i18n.resolve(config.get().language);
         if (lang == st.lang) return;
         st.lang = lang;
@@ -2115,6 +2133,19 @@ pub const GxSettingsDialog = extern struct {
         self.queueSet(item.key, settings_map.Switch.value(row.getActive() != 0));
     }
 
+    fn ctrlScrollZoomToggled(row: *adw.SwitchRow, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
+        if (!self.recording()) return;
+        const item = settings_map.ctrl_scroll_zoom;
+        self.queueSet(item.key, settings_map.Switch.value(row.getActive() != 0));
+        self.private().ctrl_scroll_zoom_reset_button.as(gtk.Widget).setSensitive(1);
+    }
+
+    fn ctrlScrollZoomResetClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        if (!self.recording()) return;
+        button.as(gtk.Widget).setSensitive(0);
+        self.queueReset(settings_map.ctrl_scroll_zoom.key);
+    }
+
     fn bellToggled(_: *adw.SwitchRow, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
         if (!self.recording()) return;
         var features: CoreConfig.BellFeatures = .{};
@@ -2286,6 +2317,8 @@ pub const GxSettingsDialog = extern struct {
             class.bindTemplateChildPrivate("scrollbar_row", .{});
             class.bindTemplateChildPrivate("close_confirmation_row", .{});
             class.bindTemplateChildPrivate("focus_follows_mouse_row", .{});
+            class.bindTemplateChildPrivate("ctrl_scroll_zoom_row", .{});
+            class.bindTemplateChildPrivate("ctrl_scroll_zoom_reset_button", .{});
             class.bindTemplateChildPrivate("bell_group", .{});
             class.bindTemplateChildPrivate("bell_system_row", .{});
             class.bindTemplateChildPrivate("bell_audio_row", .{});
@@ -2333,6 +2366,8 @@ pub const GxSettingsDialog = extern struct {
             class.bindTemplateCallback("scrollbar_toggled", &scrollbarToggled);
             class.bindTemplateCallback("close_confirmation_selected", &closeConfirmationSelected);
             class.bindTemplateCallback("focus_follows_mouse_toggled", &focusFollowsMouseToggled);
+            class.bindTemplateCallback("ctrl_scroll_zoom_toggled", &ctrlScrollZoomToggled);
+            class.bindTemplateCallback("ctrl_scroll_zoom_reset_clicked", &ctrlScrollZoomResetClicked);
             class.bindTemplateCallback("bell_toggled", &bellToggled);
             class.bindTemplateCallback("shell_selected", &shellSelected);
             class.bindTemplateCallback("open_folder_clicked", &openFolderClicked);

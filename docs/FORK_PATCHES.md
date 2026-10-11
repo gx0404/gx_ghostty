@@ -87,6 +87,8 @@
 | GX-0030 | `src/Surface.zig` | `fork(gx): GX-0030` | active |
 | GX-0030 | `src/terminal/search/Thread.zig` | `fork(gx): GX-0030` | active |
 | GX-0030 | `src/termio/Termio.zig` | `fork(gx): GX-0030` | active |
+| GX-0031 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0031` | active |
+| GX-0032 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0032` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1247,3 +1249,21 @@ python -m unittest scripts.test_fork_patches -v
 - 移除条件：上游有等价的用户视口来源通知时移除私有钩子，登记改为 removed。
 - 验证：`just test --filter D11:`、`just test --filter apprt.win32 --filter gx.`、Windows `just build`/`just test`；独立 WSL clone 的 GTK build、GTK/GX 与 POSIX/GX/core/termio 单测；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff 守门。锁屏时真实 GUI 记 PENDING，解锁后在隔离配置下复验持续输出/满裁剪不揭幕、实际视口移动及右缘揭幕。
 - 最小锁定：`scripts/test_fork_patches.py::Gx0030ShapeTests` 检查核心/Termio 原有 5/2 对 mutation 钩子及搜索接线；Thread 来源限于 opts.mutex 内 select 的当前 active viewport，opt-in 默认 false，不入消息队列。钩子禁止 UI/临时解锁；不锁定其他补丁的源码。
+
+## GX-0031 GTK 滚轮与捏合字号缩放
+
+- 文件：`src/apprt/gtk/class/surface.zig`；active，未回馈上游。导入与 `propConfig`、`ecMouseScrollVertical`、`dispose` 各留一处薄委托；滚轮控制器参数由匿名改为命名。
+- 原因：GTK 原本无 Ctrl 滚轮／捏合字号缩放，现有 `gx-ctrl-scroll-zoom` 只在 Windows 消费。
+- 真源：共享 `src/gx/font_zoom.zig::WheelAccumulator`／`PinchState`；GTK `src/apprt/gtk/gx/font_zoom.zig::sync`／`scroll`／`dispose`。仅 Ctrl 单独按下时拦截滚轮，保留原始 wheel-unit 分数，surface-unit 以 GTK 页面步长（逻辑高度的 2/3 次方）换算；方向反转、停止、Ctrl 释放、失焦、重载与禁用清累计。捏合基于开始字号与累计 scale，半点目标去重；结束／取消／禁用清状态，关闭不 claim。只走核心 `set_font_size`，不碰分屏 zoom，不写字号配置。
+- 设置：现有 Adw 1.5 模板增加开关、提示与恢复按钮，复用共享设置模型和译文；恢复只删覆盖键。GX-0010 字段文档更新为 Windows 与 GTK；资源下限不变。
+- 移除条件：上游提供同等滚轮／捏合语义后删除钩子，将登记改为 removed。
+- 验证：`just test --filter gx.`、POSIX/GX 与 GTK/GX 单测、GTK 构建、隔离场景的上下滚／修饰键组合／禁用／分屏／重载与中文截图；native pinch 与 smooth 设备灵敏度仍须真实硬件。`test_gtk_gx_contract`、`test_gx_test_roots` 与 `test_fork_patches` 锁定接线和闭集。
+
+## GX-0032 GTK 渲染环境保留用户标记
+
+- 文件：`src/apprt/gtk/class/application.zig::setGtkEnv`；active，未回馈上游。仅将两段固定缓冲区 setenv 改为两行 `gx/environment.zig::append`，仍在 `adw.init` 前执行，最后同步全局环境。
+- 原因：上游覆盖 `GDK_DEBUG`／`GDK_DISABLE`，丢失用户和未知标记。
+- 真源：共享 `src/gx/environment.zig::appendFlags` 分配可增长的 NUL 终止值，原文保留、按 token 查缺、幂等追加；GTK `src/apprt/gtk/gx/environment.zig::append` 使用运行期 GTK `<4.16` 门追加 `vulkan-disable`，保留必需的 `GDK_DISABLE=vulkan`。不修改 `GSK_RENDERER`，不据 Mesa／Xvfb／DMABUF 失败判软件 GL。
+- 子进程：沿用 `Surface.defaultTermioEnv` 剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 的清理表。
+- 移除条件：上游保留并幂等追加必要环境标记后移除委托，将登记改为 removed。
+- 验证：共享及 GTK 模块的长值／未知 token／幂等／OOM／4.14 与新版本行为单测，GTK 4.14 构建和真实启动的进程环境／子进程清理；`scripts/test_fork_patches.py::GtkInputShapeTests` 锁定两处薄调用、初始化顺序与版本门。

@@ -105,4 +105,6 @@ test {
     _ = viewport_activity;
     _ = win32_input;
     _ = window_state;
+    _ = @import("font_zoom.zig");
+    _ = @import("environment.zig");
 }

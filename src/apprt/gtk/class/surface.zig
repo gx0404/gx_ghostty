@@ -41,6 +41,9 @@ const global = @import("../../../global.zig");
 const gtk_version = @import("../gtk_version.zig");
 const Overrides = @import("Overrides.zig");
 const scale_util = @import("../scale.zig");
+// fork(gx): GX-0031 begin
+const gx_font_zoom = @import("../gx/font_zoom.zig");
+// fork(gx): GX-0031 end
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -1880,6 +1883,10 @@ pub const Surface = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
 
+        // fork(gx): GX-0031 begin
+        gx_font_zoom.dispose(self);
+        // fork(gx): GX-0031 end
+
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -2345,6 +2352,10 @@ pub const Surface = extern struct {
     ) callconv(.c) void {
         const priv = self.private();
         const config = if (priv.config) |c| c.get() else return;
+
+        // fork(gx): GX-0031 begin
+        gx_font_zoom.sync(self, priv.render_surface.as(gtk.Widget), config.@"gx-ctrl-scroll-zoom");
+        // fork(gx): GX-0031 end
 
         // resize-overlay-duration
         {
@@ -3051,13 +3062,17 @@ pub const Surface = extern struct {
     }
 
     fn ecMouseScrollVertical(
-        _: *gtk.EventControllerScroll,
+        ec: *gtk.EventControllerScroll, // fork(gx): GX-0031
         x: f64,
         y: f64,
         self: *Self,
     ) callconv(.c) c_int {
         const priv: *Private = self.private();
         const surface = priv.core_surface orelse return 0;
+
+        // fork(gx): GX-0031 begin
+        if (gx_font_zoom.scroll(self, ec, y)) return 1;
+        // fork(gx): GX-0031 end
 
         // Multiply precision scrolls by 10 to get a better response from
         // touchpad scrolling
