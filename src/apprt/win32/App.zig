@@ -221,6 +221,33 @@ balloon_icon: ?w32.HICON = null,
 
 bell_audio: ?*BellAudio.Player = null,
 
+pub fn sampleSystemCursorBlink() ?bool {
+    const value = caretBlinkPreference(w32.GetCaretBlinkTime());
+    gx.config_layers.setSystemCursorBlink(value);
+    return value;
+}
+
+fn loadConfig(alloc: Allocator) !Config {
+    _ = sampleSystemCursorBlink();
+    return try Config.load(alloc);
+}
+
+pub fn loadLayers(alloc: Allocator) !gx.config_layers.Layers {
+    _ = sampleSystemCursorBlink();
+    return try gx.config_layers.Layers.load(alloc);
+}
+
+fn caretBlinkPreference(milliseconds: u32) ?bool {
+    if (milliseconds == 0) return null;
+    return milliseconds != w32.INFINITE;
+}
+
+test "R4 caret blink disables only at INFINITE" {
+    try std.testing.expectEqual(@as(?bool, false), caretBlinkPreference(w32.INFINITE));
+    try std.testing.expectEqual(@as(?bool, null), caretBlinkPreference(0));
+    try std.testing.expectEqual(@as(?bool, true), caretBlinkPreference(500));
+}
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -240,7 +267,7 @@ pub fn init(
 
     // Load the configuration for this application.
     const alloc = core_app.alloc;
-    var config = Config.load(alloc) catch |err| err: {
+    var config = loadConfig(alloc) catch |err| err: {
         log.err("failed to load config: {}", .{err});
         var def: Config = try .default(alloc);
         errdefer def.deinit();
@@ -483,7 +510,7 @@ fn settleDevice(self: *App) !bool {
     log.info("per-pixel translucency={} unlike guessed, loading the configuration again", .{supported});
     self.alpha_frames = supported;
     gx.config_layers.setMaterialOpacity(supported);
-    var config = try Config.load(self.core_app.alloc);
+    var config = try loadConfig(self.core_app.alloc);
     defer config.deinit();
     try self.core_app.updateConfig(self, &config);
     return true;
@@ -2177,7 +2204,7 @@ fn reloadConfigFromDisk(self: *App, target: apprt.Target) void {
     const alloc = self.core_app.alloc;
     self.profiles_cache.invalidate();
     self.default_command_stale = true;
-    var new_config = Config.load(alloc) catch |err| {
+    var new_config = loadConfig(alloc) catch |err| {
         log.err("failed to reload config: {}", .{err});
         const window = self.targetWindow(target) orelse return;
         var buf: [256]u8 = undefined;

@@ -900,6 +900,7 @@ pub extern "user32" fn SetFocus(
 ) callconv(.winapi) ?HWND;
 
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+pub extern "user32" fn GetCaretBlinkTime() callconv(.winapi) u32;
 
 pub extern "user32" fn GetWindowTextW(
     hWnd: HWND,

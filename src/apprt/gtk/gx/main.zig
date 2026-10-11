@@ -7,6 +7,7 @@
 //! and are imported by their own hooks. Upstream GTK files only call into
 //! these modules from small marked hooks.
 pub const app = @import("app.zig");
+pub const defaults = @import("defaults.zig");
 pub const language = @import("language.zig");
 pub const launch = @import("launch.zig");
 pub const menus = @import("menus.zig");
@@ -16,6 +17,7 @@ pub const window = @import("window.zig");
 
 test {
     _ = app;
+    _ = defaults;
     _ = @import("config_errors.zig");
     _ = @import("confirm.zig");
     _ = language;

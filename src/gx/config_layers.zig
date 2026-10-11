@@ -16,7 +16,12 @@
 //! user `theme` replaces `theme = GX Mocha`, and explicit colors still
 //! override the theme. When a layer sets a `font-family*` key, its values
 //! replace the list from lower layers instead of extending it, the same
-//! way command-line font families replace configured ones upstream.
+//! way command-line font families replace configured ones upstream. Ordinary
+//! `font-family` input above the defaults also suppresses only the defaults'
+//! CJK maps before replay; the original steps remain available for GUI resets.
+//! Style-specific font input does not suppress those maps. An explicitly
+//! disabled system cursor blink appends a default-layer input, below every
+//! user layer; app runtimes sample it with `setSystemCursorBlink`.
 //!
 //! `Layers` keeps the recorded steps of every layer: it reads the files
 //! once and then builds configurations in memory (`Layers.build`), e.g. for
@@ -71,6 +76,21 @@ const log = std.log.scoped(.gx_config);
 /// Whether a window material shows behind the terminals
 /// (`setMaterialOpacity`).
 var material_opacity: std.atomic.Value(bool) = .init(false);
+
+const CursorBlink = enum(u8) { unknown, enabled, disabled };
+var system_cursor_blink: std.atomic.Value(CursorBlink) = .init(.unknown);
+
+pub fn setSystemCursorBlink(value: ?bool) void {
+    system_cursor_blink.store(if (value) |blink| if (blink) .enabled else .disabled else .unknown, .monotonic);
+}
+
+pub fn systemCursorBlink() ?bool {
+    return switch (system_cursor_blink.load(.monotonic)) {
+        .unknown => null,
+        .enabled => true,
+        .disabled => false,
+    };
+}
 
 /// Tells loading whether a window material (`gx-window-material`) shows
 /// behind the terminals, which the Windows version and the OpenGL driver
@@ -204,6 +224,7 @@ fn isOff(value: []const u8) bool {
 
 /// Loads the configuration with the Ghostty GX layers and finalizes it.
 pub fn load(alloc_gpa: Allocator) !Config {
+    if (!enabled(alloc_gpa)) return error.LayeringDisabled;
     const span: perf.Span = .begin(global.io());
     defer _ = span.end(global.io(), "config_load");
     return try loadWith(alloc_gpa, SystemSources{});
@@ -213,18 +234,20 @@ pub fn load(alloc_gpa: Allocator) !Config {
 /// arguments) applied above the command line and below `-e`. Settings UIs
 /// use it to preview a setting, such as a theme, without writing it; to
 /// preview repeatedly, read the files once with `Layers.load` instead.
+/// Returns `error.LayeringDisabled` without the Ghostty GX layers.
 pub fn loadWithOverrides(alloc_gpa: Allocator, overrides: []const [:0]const u8) !Config {
+    if (!enabled(alloc_gpa)) return error.LayeringDisabled;
     return try loadWith(alloc_gpa, SystemSources{ .overrides = overrides });
 }
 
 /// A configuration with only the Ghostty GX defaults applied, not
-/// finalized.
+/// finalized; upstream defaults when layering is disabled.
 pub fn defaultConfig(alloc_gpa: Allocator) !Config {
     var cfg = try Config.default(alloc_gpa);
     errdefer cfg.deinit();
-    var reader: std.Io.Reader = .fixed(defaults);
-    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = defaults_location };
-    try cfg.loadIter(alloc_gpa, &iter);
+    if (!enabled(alloc_gpa)) return cfg;
+    const arena = cfg._arena.?.allocator();
+    try cfg.gxReplay(alloc_gpa, try effectiveDefaults(arena, try defaultSteps(arena, defaults), false, systemCursorBlink()));
     return cfg;
 }
 
@@ -283,6 +306,13 @@ pub const Layers = struct {
     install_theme: bool = false,
 
     xdg_terminal_exec: bool = false,
+    system_cursor_blink: ?bool = null,
+
+    pub fn setSystemCursorBlink(self: *Layers, value: ?bool) bool {
+        const changed = (self.system_cursor_blink == false) != (value == false);
+        self.system_cursor_blink = value;
+        return changed;
+    }
 
     /// Reads every layer from disk. Fails with `error.LayeringDisabled`
     /// when `GHOSTTY_GX_DEFAULTS` turns the layering off (`enabled`).
@@ -307,13 +337,19 @@ pub const Layers = struct {
         defer scratch.deinit();
         const arena = scratch.allocator();
 
+        const preview_steps = try argSteps(arena, overrides);
         var ordered: std.ArrayList(Step) = .empty;
-        try appendLayer(arena, &ordered, self.steps.get(.defaults).items);
+        try appendLayer(arena, &ordered, try effectiveDefaults(
+            arena,
+            self.steps.get(.defaults).items,
+            self.userFont(preview_steps),
+            self.system_cursor_blink,
+        ));
         const defaults_end = ordered.items.len;
         try appendLayer(arena, &ordered, self.steps.get(.user).items);
         try appendLayer(arena, &ordered, self.steps.get(.overlay).items);
         try appendLayer(arena, &ordered, self.steps.get(.cli).items);
-        try appendLayer(arena, &ordered, try argSteps(arena, overrides));
+        try appendLayer(arena, &ordered, preview_steps);
         if (try languageDiagnostic(arena, ordered.items)) |step| try ordered.append(arena, step);
         try ordered.appendSlice(arena, self.command);
 
@@ -359,13 +395,18 @@ pub const Layers = struct {
 
     /// Whether `layer` sets `key` (a configuration key without `--`).
     pub fn sets(self: *const Layers, layer: Layer, key: []const u8) bool {
-        for (self.steps.get(layer).items) |step| switch (step) {
-            .arg => |arg| if (argKey(arg)) |name| {
-                if (std.mem.eql(u8, name, key)) return true;
-            },
-            else => {},
-        };
-        return false;
+        if (layer == .defaults) {
+            if (std.mem.eql(u8, key, "font-codepoint-map") and self.userFont(&.{})) return false;
+            if (std.mem.eql(u8, key, "cursor-style-blink") and self.system_cursor_blink == false) return true;
+        }
+        return stepsSet(self.steps.get(layer).items, key);
+    }
+
+    fn userFont(self: *const Layers, overrides: []const Step) bool {
+        for ([_]Layer{ .user, .overlay, .cli }) |layer| {
+            if (stepsSet(self.steps.get(layer).items, "font-family")) return true;
+        }
+        return stepsSet(overrides, "font-family");
     }
 
     /// Sets `key` to `values` in the overlay layer, one value per line like
@@ -436,6 +477,7 @@ pub const Layers = struct {
             .arena = .init(alloc_gpa),
             .translate_palette = sources.translatesPalette(),
             .material_opacity = sources.materialOpacity(),
+            .system_cursor_blink = sources.cursorBlink(),
             .install_theme = sources.installsTheme(),
             .xdg_terminal_exec = live.@"_xdg-terminal-exec",
         };
@@ -530,6 +572,10 @@ const SystemSources = struct {
 
     fn materialOpacity(_: SystemSources) bool {
         return material_opacity.load(.monotonic);
+    }
+
+    fn cursorBlink(_: SystemSources) ?bool {
+        return systemCursorBlink();
     }
 
     fn installsTheme(_: SystemSources) bool {
@@ -636,6 +682,27 @@ fn defaultSteps(arena: Allocator, text: []const u8) Allocator.Error![]const Step
     var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = defaults_location };
     var result: std.ArrayList(Step) = .empty;
     while (iter.next()) |arg| try result.append(arena, .{ .arg = try arena.dupeZ(u8, arg) });
+    return result.items;
+}
+
+fn stepsSet(steps: []const Step, key: []const u8) bool {
+    for (steps) |step| switch (step) {
+        .arg => |arg| if (argKey(arg)) |name| {
+            if (std.mem.eql(u8, name, key)) return true;
+        },
+        .@"-e" => break,
+        else => {},
+    };
+    return false;
+}
+
+fn effectiveDefaults(arena: Allocator, raw: []const Step, user_font: bool, blink: ?bool) Allocator.Error![]const Step {
+    var result: std.ArrayList(Step) = .empty;
+    for (raw) |step| {
+        if (user_font and step == .arg and stepsSet(&.{step}, "font-codepoint-map")) continue;
+        try result.append(arena, step);
+    }
+    if (blink == false) try result.append(arena, .{ .arg = "--cursor-style-blink=false" });
     return result.items;
 }
 
@@ -765,6 +832,7 @@ const TestSources = struct {
     overrides: []const [:0]const u8 = &.{},
     translate_palette: bool = false,
     material_opacity: bool = false,
+    system_cursor_blink: ?bool = null,
 
     fn defaultsText(self: TestSources) []const u8 {
         return self.defaults_text;
@@ -776,6 +844,10 @@ const TestSources = struct {
 
     fn materialOpacity(self: TestSources) bool {
         return self.material_opacity;
+    }
+
+    fn cursorBlink(self: TestSources) ?bool {
+        return self.system_cursor_blink;
     }
 
     fn loadUserFiles(self: TestSources, cfg: *Config, alloc: Allocator) !void {
@@ -862,7 +934,10 @@ test "the embedded defaults parse cleanly" {
     try testing.expectEqualStrings("GX Mocha", cfg.theme.?.light);
     try testing.expectEqualStrings("GX Mocha", cfg.theme.?.dark);
     try testing.expectEqualStrings("zh-CN", cfg.language.?);
-    try expectFamilies(&.{"JetBrainsMono Nerd Font"}, cfg.@"font-family");
+    try expectFamilies(if (builtin.os.tag == .windows) &.{"JetBrainsMono Nerd Font"} else &.{}, cfg.@"font-family");
+    for ([_]u21{ 0x3200, 0x33ff, 0xfe10, 0xfe1f }) |codepoint| {
+        try testing.expect(cfg.@"font-codepoint-map".map.get(codepoint) != null);
+    }
     try testing.expectEqual(@as(f32, 12), cfg.@"font-size");
     try testing.expectEqual(@as(u32, 10), cfg.@"window-padding-x".top_left);
     try testing.expectEqual(@as(u32, 10), cfg.@"window-padding-x".bottom_right);
@@ -871,6 +946,7 @@ test "the embedded defaults parse cleanly" {
     try testing.expectEqual(Config.WindowPaddingBalance.true, cfg.@"window-padding-balance");
     try testing.expect(cfg.@"cursor-style" == .block);
     try testing.expectEqual(@as(?bool, true), cfg.@"cursor-style-blink");
+    try testing.expect(cfg.@"mouse-hide-while-typing");
     try testing.expectEqual(Config.RightClickAction.@"context-menu", cfg.@"right-click-action");
     try testing.expectEqual(Config.ConfirmCloseSurface.true, cfg.@"confirm-close-surface");
     try testing.expect(cfg.@"gx-herdr-app-mode");
@@ -1603,6 +1679,13 @@ fn expectSameConfig(expected: *const Config, actual: *const Config) !void {
                 } else continue;
             }
         }
+        if (key == .@"font-codepoint-map") {
+            const a = expected.@"font-codepoint-map".map.list.slice();
+            const b = actual.@"font-codepoint-map".map.list.slice();
+            try std.testing.expectEqual(a.len, b.len);
+            for (0..a.len) |i| try std.testing.expectEqualDeep(a.get(i), b.get(i));
+            continue;
+        }
         std.debug.print("configurations differ in {t}\n", .{key});
         same = false;
     }
@@ -1914,4 +1997,237 @@ test "rebuild keeps the inputs, the conditional state and the command" {
     defer quiet.deinit();
     try testing.expect(!quiet.@"app-notifications".@"config-reload");
     try testing.expectEqual(@as(f32, 15), quiet.@"font-size");
+}
+
+test "R4 user font suppresses only defaults maps" {
+    const testing = std.testing;
+    var cfg = try loadWith(testing.allocator, TestSources{
+        .defaults_text = "font-family = Default\nfont-codepoint-map = U+4E00-U+9FFF=Default CJK\n",
+        .args = &.{ "--font-family=User", "--font-codepoint-map=U+E000=Symbols" },
+    });
+    defer cfg.deinit();
+    try expectNoDiagnostics(&cfg);
+    try testing.expect(cfg.@"font-codepoint-map".map.get(0x4e00) == null);
+    try testing.expect(cfg.@"font-codepoint-map".map.get(0xe000) != null);
+}
+
+test "R4 ordinary font input matrix preserves layer maps and raw defaults" {
+    const alloc = std.testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const map = "font-codepoint-map = U+4E00-U+9FFF=Default CJK\n";
+    const raw = "font-family = Default\n" ++ map;
+    const user = try dir.write(arena, "font.ghostty", "font-family = User\n");
+    const empty = try dir.write(arena, "empty.ghostty", "font-family =\n");
+    _ = try dir.write(arena, "nested.ghostty", "font-family = Included\n");
+    const include = try dir.write(arena, "include.ghostty", "config-file = nested.ghostty\n");
+    const include_arg = try std.fmt.allocPrint(arena, "--config-file={s}", .{include});
+    const custom = try dir.write(arena, "maps.ghostty", "font-family = User\nfont-codepoint-map = U+E000=User Symbols\n");
+    const overlay = try dir.write(arena, "overlay.ghostty", "font-codepoint-map = U+E001=GUI Symbols\n");
+    const identical = try dir.write(arena, "identical.ghostty", "font-family = User\n" ++ map);
+    const cases = [_]struct { sources: TestSources, maps: usize, provenance: ?Layer }{
+        .{ .sources = .{ .defaults_text = raw }, .maps = 1, .provenance = .defaults },
+        .{ .sources = .{ .defaults_text = raw, .user_path = user }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .user_path = empty }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .user_path = include }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{include_arg} }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .overlay_path = user }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{"--font-family=CLI"} }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .overrides = &.{"--font-family=Preview"} }, .maps = 0, .provenance = .defaults },
+        .{ .sources = .{ .defaults_text = raw, .overrides = &.{"--font-family="} }, .maps = 0, .provenance = .defaults },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{ "--font-family-bold=Bold", "--font-family-italic=Italic", "--font-family-bold-italic=Both" } }, .maps = 1, .provenance = .defaults },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{ "-e", "sh", "--font-family=Not Config" } }, .maps = 1, .provenance = .defaults },
+        .{ .sources = .{ .defaults_text = raw, .user_path = user, .overlay_path = user, .args = &.{"--config-default-files=false"} }, .maps = 1, .provenance = .defaults },
+        .{ .sources = .{ .defaults_text = raw, .user_path = user, .args = &.{ "--config-default-files=false", include_arg } }, .maps = 0, .provenance = null },
+        .{ .sources = .{ .defaults_text = raw, .user_path = custom, .overlay_path = overlay, .args = &.{"--font-codepoint-map=U+E002=CLI Symbols"} }, .maps = 3, .provenance = .cli },
+        .{ .sources = .{ .defaults_text = raw, .user_path = identical }, .maps = 1, .provenance = .user },
+    };
+    for (cases) |case| {
+        var loaded = try loadWith(alloc, case.sources);
+        defer loaded.deinit();
+        try expectNoDiagnostics(&loaded);
+        try std.testing.expectEqual(case.maps, loaded.@"font-codepoint-map".map.list.len);
+        var layers = try Layers.read(alloc, case.sources);
+        defer layers.deinit();
+        try std.testing.expect(stepsSet(layers.steps.get(.defaults).items, "font-codepoint-map"));
+        try std.testing.expectEqual(case.provenance, layers.provenance("font-codepoint-map"));
+        var built = try layers.build(alloc, case.sources.overrides);
+        defer built.deinit();
+        try expectSameConfig(&loaded, &built);
+    }
+}
+
+test "R4 deleting GUI font restores defaults only without lower user font" {
+    const alloc = std.testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const user = try dir.write(arena, "font.ghostty", "font-family = User\n");
+    for ([_]?[]const u8{ null, user }) |path| {
+        var layers = try Layers.read(alloc, TestSources{
+            .defaults_text = "font-codepoint-map = U+4E00-U+9FFF=Default CJK\n",
+            .user_path = path,
+        });
+        defer layers.deinit();
+        try layers.setOverlay("font-codepoint-map", &.{"U+E000=Symbols"});
+        try layers.setOverlay("font-family", &.{"GUI"});
+        var chosen = try layers.build(alloc, &.{});
+        defer chosen.deinit();
+        try std.testing.expect(chosen.@"font-codepoint-map".map.get(0x4e00) == null);
+        try std.testing.expect(chosen.@"font-codepoint-map".map.get(0xe000) != null);
+        try layers.setOverlay("font-family", &.{});
+        var restored = try layers.build(alloc, &.{});
+        defer restored.deinit();
+        try std.testing.expectEqual(path == null, restored.@"font-codepoint-map".map.get(0x4e00) != null);
+        try std.testing.expect(restored.@"font-codepoint-map".map.get(0xe000) != null);
+        try layers.setOverlay("font-codepoint-map", &.{});
+        try std.testing.expectEqual(@as(?Layer, if (path == null) .defaults else null), layers.provenance("font-codepoint-map"));
+    }
+}
+
+test "R4 effective defaults survive conditional replay clone finalize and rebuild" {
+    const alloc = std.testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const light = try dir.write(arena, "light", "background = #eeeeee\n");
+    const dark = try dir.write(arena, "dark", "background = #111111\n");
+    var config = try loadWith(alloc, TestSources{
+        .defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\ncursor-style-blink = true\nfont-codepoint-map = U+4E00-U+9FFF=Default CJK\n", .{ light, dark }),
+        .args = &.{ "--font-family=User", "--font-codepoint-map=U+E000=Symbols", "-e", "sh", "--font-family=Command" },
+        .system_cursor_blink = false,
+    });
+    defer config.deinit();
+    var switched = (try config.changeConditionalState(.{ .theme = .dark })).?;
+    defer switched.deinit();
+    var clone = try switched.clone(alloc);
+    defer clone.deinit();
+    try clone.finalize();
+    try clone.finalize();
+    var rebuilt = try rebuild(&clone, alloc, &.{"--language=en"});
+    defer rebuilt.deinit();
+    for ([_]*const Config{ &config, &switched, &clone, &rebuilt }) |cfg| {
+        try expectNoDiagnostics(cfg);
+        try std.testing.expect(cfg.@"font-codepoint-map".map.get(0x4e00) == null);
+        try std.testing.expect(cfg.@"font-codepoint-map".map.get(0xe000) != null);
+        try std.testing.expectEqual(@as(?bool, false), cfg.@"cursor-style-blink");
+        try std.testing.expectEqualStrings("--font-family=Command", cfg.@"initial-command".?.direct[1]);
+    }
+}
+
+test "R4 system blink is a default below every user layer and preview" {
+    const alloc = std.testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const raw = "cursor-style-blink = true\n";
+    const Place = enum { user, include, overlay, cli, preview };
+    const values = [_]struct { text: []const u8, expected: ?bool }{
+        .{ .text = "true", .expected = true },
+        .{ .text = "false", .expected = false },
+        .{ .text = "", .expected = null },
+    };
+    for ([_]?bool{ null, true, false }) |system| {
+        var defaults_only = try loadWith(alloc, TestSources{ .defaults_text = raw, .system_cursor_blink = system });
+        defer defaults_only.deinit();
+        try std.testing.expectEqual(@as(?bool, system != false), defaults_only.@"cursor-style-blink");
+        for (std.enums.values(Place)) |place| {
+            for (values) |value| {
+                const text = try std.fmt.allocPrint(arena, "cursor-style-blink = {s}\n", .{value.text});
+                const path = try dir.write(arena, "blink.ghostty", text);
+                const arg = try std.fmt.allocPrintSentinel(arena, "--cursor-style-blink={s}", .{value.text}, 0);
+                var sources: TestSources = .{ .defaults_text = raw, .system_cursor_blink = system };
+                switch (place) {
+                    .user => sources.user_path = path,
+                    .include => sources.user_path = try dir.write(arena, "include.ghostty", "config-file = blink.ghostty\n"),
+                    .overlay => sources.overlay_path = path,
+                    .cli => sources.args = &.{arg},
+                    .preview => sources.overrides = &.{arg},
+                }
+                var config = try loadWith(alloc, sources);
+                defer config.deinit();
+                try expectNoDiagnostics(&config);
+                try std.testing.expectEqual(value.expected, config.@"cursor-style-blink");
+                var layers = try Layers.read(alloc, sources);
+                defer layers.deinit();
+                var built = try layers.build(alloc, sources.overrides);
+                defer built.deinit();
+                try expectSameConfig(&config, &built);
+                const origin: Layer = switch (place) {
+                    .user, .include => .user,
+                    .overlay => .overlay,
+                    .cli => .cli,
+                    .preview => .defaults,
+                };
+                try std.testing.expectEqual(@as(?Layer, origin), layers.provenance("cursor-style-blink"));
+            }
+        }
+    }
+}
+
+test "R4 blink snapshot updates without rereading and GUI reset follows system" {
+    const alloc = std.testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    _ = try dir.write(arena, "included.ghostty", "font-size = 17\n");
+    const user = try dir.write(arena, "config.ghostty", "config-file = included.ghostty\n");
+    const overlay = try dir.write(arena, "gui-settings.ghostty", "cursor-style-blink = true\n");
+    var layers = try Layers.read(alloc, TestSources{ .defaults_text = "font-size = 12\n", .user_path = user, .overlay_path = overlay });
+    defer layers.deinit();
+    try dir.tmp.dir.deleteFile(std.testing.io, "config.ghostty");
+    try dir.tmp.dir.deleteFile(std.testing.io, "included.ghostty");
+    try dir.tmp.dir.deleteFile(std.testing.io, "gui-settings.ghostty");
+    try std.testing.expect(layers.setSystemCursorBlink(false));
+    var config = try layers.build(alloc, &.{});
+    defer config.deinit();
+    try std.testing.expectEqual(@as(?bool, true), config.@"cursor-style-blink");
+    try std.testing.expectEqual(@as(f32, 17), config.@"font-size");
+    try layers.setOverlay("cursor-style-blink", &.{});
+    var restored = try layers.build(alloc, &.{});
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(?bool, false), restored.@"cursor-style-blink");
+    try std.testing.expectEqual(@as(?Layer, .defaults), layers.provenance("cursor-style-blink"));
+    try std.testing.expect(!layers.setSystemCursorBlink(false));
+    try std.testing.expect(layers.setSystemCursorBlink(null));
+    try std.testing.expectEqual(@as(?Layer, null), layers.provenance("cursor-style-blink"));
+}
+
+test "R4 defaultConfig uses the same system blink defaults" {
+    defer setSystemCursorBlink(null);
+    for ([_]?bool{ null, true, false }) |system| {
+        setSystemCursorBlink(system);
+        var config = try defaultConfig(std.testing.allocator);
+        defer config.deinit();
+        try std.testing.expectEqual(@as(?bool, system != false), config.@"cursor-style-blink");
+    }
+}
+
+test "R4 migrated theme is loaded with corrected ANSI whites" {
+    const alloc = std.testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const path = try dir.write(arena, gx_theme.name, gx_theme.marker ++ "\n# gx-theme-version: 1\npalette = 7=#bac2de\npalette = 15=#a6adc8\n");
+    try std.testing.expectEqual(gx_theme.InstallResult.updated, try gx_theme.install(alloc, std.testing.io, dir.root));
+    var config = try loadWith(alloc, TestSources{ .defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\n", .{path}) });
+    defer config.deinit();
+    try expectNoDiagnostics(&config);
+    const RGB = @TypeOf(config.palette.value[7]);
+    try std.testing.expectEqual(RGB{ .r = 0xa6, .g = 0xad, .b = 0xc8 }, config.palette.value[7]);
+    try std.testing.expectEqual(RGB{ .r = 0xba, .g = 0xc2, .b = 0xde }, config.palette.value[15]);
+    try std.testing.expect(config.palette.value[15].luminance() >= config.palette.value[7].luminance());
 }
