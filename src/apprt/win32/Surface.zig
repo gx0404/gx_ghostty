@@ -3533,3 +3533,200 @@ test "D11: selection autoscroll records before a full queue unlocks for output" 
     try std.testing.expect(work.output_ok);
     try std.testing.expectEqual(@as(usize, 105), fixture.surface.takeScrollbarActivity().?.total);
 }
+
+const SearchScrollTest = struct {
+    fixture: ScrollTest,
+    events: Events,
+
+    const Events = struct {
+        original_callback: terminal.search.Thread.EventCallback,
+        original_userdata: ?*anyopaque,
+        complete: std.Io.Event = .unset,
+        selected: std.Io.Event = .unset,
+        viewport: std.Io.Event = .unset,
+
+        fn callback(event: terminal.search.Thread.Event, userdata: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.original_callback(event, self.original_userdata);
+            switch (event) {
+                .complete => self.complete.set(std.testing.io),
+                .selected_match => self.selected.set(std.testing.io),
+                .viewport_matches => self.viewport.set(std.testing.io),
+                else => {},
+            }
+        }
+    };
+
+    fn init(self: *SearchScrollTest) !void {
+        try self.fixture.init();
+        errdefer self.fixture.deinit();
+        const cs = &self.fixture.surface.core_surface;
+        cs.search = null;
+        self.fixture.core_app.mailbox = .{};
+        cs.renderer_thread.mailbox = try @import("../../renderer.zig").Thread.Mailbox.create(std.testing.allocator);
+        errdefer cs.renderer_thread.mailbox.destroy(std.testing.allocator);
+        const t = &cs.io.terminal;
+        t.deinit(std.testing.allocator);
+        t.* = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+        for (0..100) |i| {
+            try t.printString(if (i == 10 or i == 80 or i == 82) "D11needle" else "output");
+            if (i < 99) {
+                t.carriageReturn();
+                try t.linefeed();
+            }
+        }
+        try std.testing.expect(try cs.performBindingAction(.{ .search = "D11-bootstrap" }));
+        const options = cs.search.?.state.opts;
+        cs.search.?.deinit();
+        cs.search = null;
+        self.drain();
+        self.events = .{ .original_callback = options.event_cb.?, .original_userdata = options.event_userdata };
+        var observed = options;
+        observed.event_cb = Events.callback;
+        observed.event_userdata = &self.events;
+        cs.search = .{ .state = try .init(std.testing.allocator, observed), .thread = undefined };
+        errdefer cs.search.?.state.deinit();
+        cs.search.?.thread = try std.Thread.spawn(.{}, terminal.search.Thread.threadMain, .{&cs.search.?.state});
+    }
+
+    fn deinit(self: *SearchScrollTest) void {
+        const cs = &self.fixture.surface.core_surface;
+        cs.search.?.deinit();
+        cs.search = null;
+        self.drain();
+        cs.renderer_thread.mailbox.destroy(std.testing.allocator);
+        self.fixture.deinit();
+    }
+
+    fn drain(self: *SearchScrollTest) void {
+        const cs = &self.fixture.surface.core_surface;
+        while (cs.renderer_thread.mailbox.pop(std.testing.io)) |message| switch (message) {
+            .search_selected_match => |match| if (match) |owned| owned.arena.deinit(),
+            .search_viewport_matches => |owned| owned.arena.deinit(),
+            else => message.deinit(),
+        };
+        while (self.fixture.core_app.mailbox.pop(std.testing.io)) |_| {}
+    }
+
+    fn wait(event: *std.Io.Event) !void {
+        try event.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+    }
+
+    fn query(self: *SearchScrollTest, needle: []const u8) !void {
+        self.events.complete.reset();
+        try std.testing.expect(try self.fixture.surface.core_surface.performBindingAction(.{ .search = needle }));
+        try wait(&self.events.complete);
+        self.drain();
+    }
+
+    fn select(self: *SearchScrollTest, nav: input.Binding.Action.NavigateSearch) !void {
+        self.events.selected.reset();
+        try std.testing.expect(try self.fixture.surface.core_surface.performBindingAction(.{ .navigate_search = nav }));
+        try wait(&self.events.selected);
+        self.drain();
+    }
+};
+
+test "D11-search: real search thread moving to an outside match records a source" {
+    var fixture: SearchScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.query("D11needle");
+    const surface = fixture.fixture.surface;
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    try fixture.select(.previous);
+    const t = &surface.core_surface.io.terminal;
+    fixture.fixture.mutex.lockUncancelable(std.testing.io);
+    const offset = t.screens.active.pages.scrollbar().offset;
+    fixture.fixture.mutex.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 10), offset);
+    const activity = surface.takeScrollbarActivity();
+    try std.testing.expect(activity != null);
+    try std.testing.expectEqual(@as(usize, 10), activity.?.offset);
+}
+
+test "D11-search-next-history: real next history match records a source" {
+    var fixture: SearchScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.query("D11needle");
+    const surface = fixture.fixture.surface;
+    for (0..2) |_| {
+        try fixture.select(.next);
+        try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    }
+    try fixture.select(.next);
+    fixture.fixture.mutex.lockUncancelable(std.testing.io);
+    const offset = surface.core_surface.io.terminal.screens.active.pages.scrollbar().offset;
+    fixture.fixture.mutex.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 10), offset);
+    const activity = surface.takeScrollbarActivity();
+    try std.testing.expect(activity != null);
+    try std.testing.expectEqual(@as(usize, 10), activity.?.offset);
+}
+
+test "D11-search: hidden and never gate actual search movement" {
+    var fixture: SearchScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.query("D11needle");
+    const surface = fixture.fixture.surface;
+    surface.setScrollbarOwnerVisible(false);
+    try fixture.select(.previous);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    surface.setScrollbarOwnerVisible(true);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    surface.scrollbar_enabled = false;
+    surface.updateScrollbarGate();
+    try fixture.select(.next);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    surface.scrollbar_enabled = true;
+    surface.updateScrollbarGate();
+    try fixture.select(.previous);
+    try std.testing.expect(surface.takeScrollbarActivity() != null);
+}
+
+test "D11-search: viewport next prev and no matches do not produce a source" {
+    var fixture: SearchScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.query("D11needle");
+    const surface = fixture.fixture.surface;
+    for ([_]input.Binding.Action.NavigateSearch{ .next, .next, .previous }) |nav| {
+        try fixture.select(nav);
+        try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    }
+    try fixture.query("D11missing");
+    try std.testing.expect(try surface.core_surface.performBindingAction(.{ .navigate_search = .next }));
+    try fixture.query("D11no-match-barrier");
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+}
+
+test "D11-search: output refresh and inactive primary matches stay silent" {
+    var fixture: SearchScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.query("D11needle");
+    const surface = fixture.fixture.surface;
+    const t = &surface.core_surface.io.terminal;
+    fixture.events.viewport.reset();
+    fixture.fixture.mutex.lockUncancelable(std.testing.io);
+    try t.printString("new output");
+    t.carriageReturn();
+    try t.linefeed();
+    t.flags.search_viewport_dirty = true;
+    fixture.fixture.mutex.unlock(std.testing.io);
+    try SearchScrollTest.wait(&fixture.events.viewport);
+    fixture.fixture.mutex.lockUncancelable(std.testing.io);
+    const refreshed = !t.flags.search_viewport_dirty;
+    fixture.fixture.mutex.unlock(std.testing.io);
+    try std.testing.expect(refreshed);
+    fixture.drain();
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    fixture.fixture.mutex.lockUncancelable(std.testing.io);
+    _ = try t.switchScreen(.alternate);
+    try std.testing.expect(try surface.core_surface.performBindingAction(.{ .navigate_search = .previous }));
+    fixture.fixture.mutex.unlock(std.testing.io);
+    try fixture.query("D11inactive-barrier");
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+}

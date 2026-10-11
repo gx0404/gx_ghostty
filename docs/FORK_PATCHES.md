@@ -85,6 +85,7 @@
 | GX-0028 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0028` | active |
 | GX-0029 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0029` | active |
 | GX-0030 | `src/Surface.zig` | `fork(gx): GX-0030` | active |
+| GX-0030 | `src/terminal/search/Thread.zig` | `fork(gx): GX-0030` | active |
 | GX-0030 | `src/termio/Termio.zig` | `fork(gx): GX-0030` | active |
 <!-- fork-patches:end -->
 
@@ -1237,11 +1238,12 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0030 用户视口移动的私有来源钩子
 
-- 文件：`src/Surface.zig`、`src/termio/Termio.zig`；状态 active，未回馈上游。
+- 文件：`src/Surface.zig`、`src/termio/Termio.zig`、app-only `src/terminal/search/Thread.zig`；状态 active，未回馈上游。
+- 查找接线：`navigate_search` 的真实 Thread.select 在同 mutex 下夹住 TerminalSearch.select；只比较当前 active viewport 的实际移动，发默认关闭、由 win32 opt-in 的内部 `gx_user_scroll` callback 事件。Core.searchCallback 直接复用纯数据来源 hook，不加锁、不进 UI 或消息队列。selected/initial/feed/refresh 不发来源；纯库 search/terminal.zig 与库 ABI 不变。
 - 原因：输出裁剪与用户上滚可产生相同三元组，滚动条报告本身不能表达来源。
 - 钩子：仅在实际用户变更处、同一 renderer mutex 下取紧邻的前后快照；`@hasDecl(apprt.Surface, "gxUserScrolled")` 可选调用。Termio 经既有 `surface_mailbox.surface.rt_surface` 取得稳定运行时指针。选区自动滚动在可能临时解锁的 queueIo 之前取 after。
 - fork 真源：`src/gx/viewport_activity.zig::Pending` 只记录有来源的实际移动；win32 `Surface` 持锁记 pending 与投递 wakeup，GUI `App.tick` 取清当前快照后锁外同步并调用 `Scrollbar.userScrolled`。普通报告仅同步当前锁内状态，不揭幕；hidden/never 关闭写入门并清 pending，销毁先关门再 join，可见 reparent 保留状态。
 - 不变：C ABI、`terminal.Scrollbar`、40 字节 `termio.Message`、renderer 协议不变；GTK/none 编译期无钩子。
 - 移除条件：上游有等价的用户视口来源通知时移除私有钩子，登记改为 removed。
 - 验证：`just test --filter D11:`、`just test --filter apprt.win32 --filter gx.`、Windows `just build`/`just test`；独立 WSL clone 的 GTK build、GTK/GX 与 POSIX/GX/core/termio 单测；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff 守门。锁屏时真实 GUI 记 PENDING，解锁后在隔离配置下复验持续输出/满裁剪不揭幕、实际视口移动及右缘揭幕。
-- 最小锁定：`scripts/test_fork_patches.py::Gx0030ShapeTests` 检查两个文件恰有 5/2 对可选钩子、夹住实际 mutation、其间不发 queueIo 或解锁，并禁止 UI 调用；不锁定其他补丁的源码。
+- 最小锁定：`scripts/test_fork_patches.py::Gx0030ShapeTests` 检查核心/Termio 原有 5/2 对 mutation 钩子及搜索接线；Thread 来源限于 opts.mutex 内 select 的当前 active viewport，opt-in 默认 false，不入消息队列。钩子禁止 UI/临时解锁；不锁定其他补丁的源码。

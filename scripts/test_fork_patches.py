@@ -1031,7 +1031,7 @@ class Gx0030ShapeTests(unittest.TestCase):
                 self.assertIn(Patch("GX-0030", rel, "fork(gx): GX-0030", "active"), patches)
                 source = (ROOT / rel).read_text(encoding="utf-8")
                 stripped, hunks = marked_hunks(source, "GX-0030")
-                self.assertEqual(len(hunks), count * 2)
+                self.assertEqual(len(hunks), count * 2 + (2 if rel == "src/Surface.zig" else 0))
                 self.assertNotIn("gxUserScrolled", stripped)
                 self.assertNotIn("gx_before", stripped)
                 self.assertEqual(source.count("const gx_before = if (comptime @hasDecl(apprt.Surface,"), count)
@@ -1040,7 +1040,10 @@ class Gx0030ShapeTests(unittest.TestCase):
                     for begin, end in hunks:
                         self.assertNotIn(forbidden, "\n".join(source.splitlines()[begin:end + 1]))
                 lines = source.splitlines()
-                for before, after in zip(hunks[::2], hunks[1::2]):
+                mutations = [(begin, end) for begin, end in hunks
+                             if "gx_before" in "\n".join(lines[begin + 1:end])]
+                self.assertEqual(len(mutations), count * 2)
+                for before, after in zip(mutations[::2], mutations[1::2]):
                     mutation = "\n".join(lines[before[1] + 1:after[0]])
                     self.assertTrue(any(call in mutation for call in
                                         ("autoscrollTick(", ".scrollViewport(", ".scroll(")), mutation)
@@ -1048,6 +1051,33 @@ class Gx0030ShapeTests(unittest.TestCase):
                     self.assertNotIn(".unlock(", mutation)
         termio = (ROOT / "src/termio/Termio.zig").read_text(encoding="utf-8")
         self.assertEqual(termio.count("self.surface_mailbox.surface.rt_surface.gxUserScrolled("), 2)
+
+    def test_search_selection_source_stays_inside_the_mutex(self):
+        rel = "src/terminal/search/Thread.zig"
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch("GX-0030", rel, "fork(gx): GX-0030", "active"), patches)
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        stripped, hunks = marked_hunks(source, "GX-0030")
+        self.assertEqual(len(hunks), 5)
+        self.assertNotIn("gx_user_scroll", stripped)
+        lines = source.splitlines()
+        bounds = zig_fn_lines(lines, "fn select(")
+        self.assertIsNotNone(bounds)
+        body = "\n".join(lines[bounds[0]:bounds[1]])
+        lock = body.index("self.opts.mutex.lockUncancelable(")
+        before = body.index("const gx_before =")
+        mutation = body.index("try s.select(")
+        after = body.index("const gx_after =")
+        notify = body.index("cb(.{ .gx_user_scroll")
+        self.assertTrue(lock < before < mutation < after < notify)
+        self.assertIn("defer self.opts.mutex.unlock(", body)
+        self.assertIn("if (gx_before.offset != gx_after.offset)", body)
+        self.assertNotIn(".push(", body)
+        self.assertEqual(body.count("screens.active.pages.scrollbar()"), 2)
+        self.assertIn("gx_user_scroll_enabled: bool = false", source)
+        core = (ROOT / "src/Surface.zig").read_text(encoding="utf-8")
+        self.assertIn('.gx_user_scroll_enabled = @hasDecl(apprt.Surface, "gxUserScrolled"),', core)
+        self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
 REGISTRY_TEMPLATE = """# fork 补丁登记
