@@ -217,6 +217,7 @@ app_mode: bool = false,
 /// delay before the next periodic check and when it is due
 /// (`GetTickCount64`), and whether `app_mode_soon_timer_id` runs.
 app_mode_state: gx.app_mode.State = .{},
+app_mode_samples: AppModeSamples = .{},
 app_mode_delay_ms: u32 = 0,
 app_mode_due_ms: u64 = 0,
 app_mode_soon: bool = false,
@@ -2856,7 +2857,7 @@ fn checkAppMode(self: *Window, reset: bool) void {
     const count = if (watched) self.appModeAnswers(&answers) else 0;
 
     const was = self.app_mode;
-    const app_mode = self.app_mode_state.update(enabled, self.tab_count, answers[0..count]);
+    const app_mode = self.app_mode_samples.update(&self.app_mode_state, enabled, self.tab_count, answers[0..count], self.app.proc_shared.captures);
     if (app_mode != was) log.info("herdr app mode {s}", .{if (app_mode) "on" else "off"});
     self.app_mode = app_mode;
     self.setTabBarSuppressed(app_mode);
@@ -3348,6 +3349,8 @@ pub fn windowWndProc(
                     break :blk 1;
                 },
                 10 => @intCast(window.active_tab),
+                11 => @intFromBool(window.app_mode),
+                12 => window.app_mode_state.hits,
                 else => 0,
             };
         },
@@ -3805,6 +3808,54 @@ test "display notifications reject other settings and damaged payloads" {
     setting.length = 4;
     setting.guid.Data1 = 0;
     try std.testing.expectEqual(@as(?bool, null), V.displayOff(&setting));
+}
+
+const AppModeSamples = struct {
+    positive_capture: ?u64 = null,
+
+    fn update(self: *AppModeSamples, state: *gx.app_mode.State, enabled: bool, count: usize, answers: []const ?bool, capture: u64) bool {
+        if (!enabled or count != 1) {
+            self.positive_capture = null;
+            return state.update(enabled, count, answers);
+        }
+        const positive = for (answers) |answer| {
+            if (answer orelse false) break true;
+        } else false;
+        if (positive and state.pending() and self.positive_capture == capture) return state.active;
+        const active = state.update(enabled, count, answers);
+        if (positive) {
+            self.positive_capture = capture;
+        } else if (!state.pending()) {
+            self.positive_capture = null;
+        }
+        return active;
+    }
+};
+
+test "app mode hysteresis needs two independently captured process tables" {
+    var state: gx.app_mode.State = .{};
+    var samples: AppModeSamples = .{};
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expectEqual(@as(u8, 1), state.hits);
+    try std.testing.expect(!samples.update(&state, true, 1, &.{null}, 2));
+    try std.testing.expect(samples.update(&state, true, 1, &.{true}, 2));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{false}, 2));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 2));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 2));
+    try std.testing.expect(samples.update(&state, true, 1, &.{true}, 3));
+}
+
+test "app mode samples reset when the feature is disabled or another tab opens" {
+    var state: gx.app_mode.State = .{};
+    var samples: AppModeSamples = .{};
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, true, 2, &.{true}, 1));
+    try std.testing.expectEqual(@as(?u64, null), samples.positive_capture);
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, false, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(samples.update(&state, true, 1, &.{true}, 2));
 }
 
 test {
