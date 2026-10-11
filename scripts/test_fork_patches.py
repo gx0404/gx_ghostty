@@ -1114,6 +1114,21 @@ class Gx0031ShapeTests(unittest.TestCase):
         self.assertLess(callback.index('if (!t.renderer.display_realized)'), callback.index('if (!t.flags.visible) return .disarm;'))
 
 
+class Gx0032ShapeTests(unittest.TestCase):
+    def test_background_is_prepared_under_draw_mutex_before_realization(self):
+        source = (ROOT / 'src/renderer/generic.zig').read_text(encoding='utf-8')
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, 'pub fn displayRealized(')
+        body = '\n'.join(lines[start:end])
+        self.assertIn('fork(gx): GX-0032', body)
+        self.assertLess(body.index('draw_mutex.lockUncancelable'), body.index('prepareBackground('))
+        self.assertLess(body.index('prepareBackground('), body.index('self.display_realized = true;'))
+        self.assertNotIn('uploadBackgroundImage(', body)
+        helper = (ROOT / 'src/gx/renderer_recovery.zig').read_text(encoding='utf-8')
+        self.assertIn('renderer.config.bg_image != null and renderer.bg_image == null', helper)
+        self.assertIn('try prepare(renderer);', helper)
+
+
 
 REGISTRY_TEMPLATE = """# fork 补丁登记
 

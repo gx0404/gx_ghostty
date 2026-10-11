@@ -106,4 +106,5 @@ test {
     _ = win32_input;
     _ = window_state;
     _ = @import("cursor_blink.zig");
+    _ = @import("renderer_recovery.zig");
 }

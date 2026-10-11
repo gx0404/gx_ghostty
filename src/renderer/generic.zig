@@ -969,6 +969,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
+            // fork(gx): GX-0032 begin: restore CPU image data before committing realization.
+            try @import("../gx/renderer_recovery.zig").prepareBackground(self, Self.prepBackgroundImage);
+            // fork(gx): GX-0032 end
 
             // Mark the display as realized. The render thread will lazily
             // rebuild the swap chain and shaders on the next `drawFrame`,
@@ -979,6 +982,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.target_config_modified = 1;
         }
 
+        // fork(gx): GX-0032 begin: test the CPU recovery path without GPU calls.
+        test "renderer recovery: background survives context reset and reparent" {
+            try @import("../gx/renderer_recovery.zig").testRenderer(Self);
+        }
+        // fork(gx): GX-0032 end
 
         /// This is called when the surface is being unrealized.
         /// This can happen because the surface is being closed but
