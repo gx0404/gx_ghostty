@@ -40,7 +40,8 @@
 //! rows of its parent (`inAimTriangle`), the parent keeps its highlight;
 //! a parent menu always highlights the item whose submenu the pointer or
 //! the keyboard is in (`highlightPath`). A press outside the menus, losing
-//! the capture or a change of the foreground window dismisses the menu.
+//! the capture, hiding or minimizing its owner, or a change of the
+//! foreground window dismisses the menu.
 //! Releasing a button over an item picks it when a button went down inside
 //! the menu or the pointer moved since it opened (press, drag, release).
 //! Between messages the loop sleeps until the next deadline (the submenu
@@ -309,6 +310,7 @@ extern "user32" fn SystemParametersInfoW(
     fWinIni: u32,
 ) callconv(.winapi) i32;
 extern "user32" fn EndMenu() callconv(.winapi) i32;
+extern "user32" fn GetAncestor(hWnd: w32.HWND, gaFlags: u32) callconv(.winapi) ?w32.HWND;
 extern "imm32" fn ImmGetVirtualKey(hWnd: w32.HWND) callconv(.winapi) u32;
 extern "imm32" fn ImmNotifyIME(hIMC: w32.HIMC, dwAction: u32, dwIndex: u32, dwValue: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
@@ -369,6 +371,10 @@ fn heldKeys() std.StaticBitSet(256) {
 /// Whether `owner` still exists with its object attached.
 fn ownerAlive(owner: w32.HWND) bool {
     return w32.GetWindowLongPtrW(owner, w32.GWLP_USERDATA) != 0;
+}
+
+fn ownerAvailable(alive: bool, visible: bool, minimized: bool, active: bool) bool {
+    return alive and visible and !minimized and active;
 }
 
 /// The work area of the monitor nearest to `pt`.
@@ -1349,11 +1355,17 @@ const State = struct {
         return @intCast(due -| now);
     }
 
-    /// Dismiss the menu when its owner went away or another window came
-    /// to the foreground, and act on the deadlines that passed.
+    /// Dismiss when the owner is gone, hidden or minimized, or the
+    /// foreground changed, and act on the deadlines that passed.
     fn tick(self: *State) void {
         if (self.result != .open) return;
-        if (!ownerAlive(self.owner) or w32.GetForegroundWindow() != self.foreground) {
+        const root = GetAncestor(self.owner, 2) orelse self.owner;
+        if (!ownerAvailable(
+            ownerAlive(self.owner),
+            w32.IsWindowVisible_(self.owner) != 0,
+            w32.IsIconic(root) != 0,
+            w32.GetForegroundWindow() == self.foreground,
+        )) {
             self.dismiss();
             return;
         }
@@ -2096,4 +2108,12 @@ test "Left restores the parent entry after hovering a sibling" {
 test "inAimTriangle rejects degenerate edges" {
     try testing.expect(!inAimTriangle(.{ .x = 300, .y = 150 }, .{ .x = 300, .y = 500 }, 300, 100, 400));
     try testing.expect(!inAimTriangle(.{ .x = 200, .y = 150 }, .{ .x = 220, .y = 170 }, 300, 400, 400));
+}
+
+test "a hidden or minimized owner cancels the menu even while foreground" {
+    try testing.expect(ownerAvailable(true, true, false, true));
+    try testing.expect(!ownerAvailable(true, false, false, true));
+    try testing.expect(!ownerAvailable(true, true, true, true));
+    try testing.expect(!ownerAvailable(false, true, false, true));
+    try testing.expect(!ownerAvailable(true, true, false, false));
 }
