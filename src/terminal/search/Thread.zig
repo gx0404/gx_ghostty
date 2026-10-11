@@ -273,7 +273,18 @@ fn select(self: *Thread, sel: ScreenSearch.Select) !void {
     self.opts.mutex.lockUncancelable(global.io());
     defer self.opts.mutex.unlock(global.io());
 
+    // fork(gx): GX-0030 begin: bracket only explicit selection on the active viewport
+    const gx_before = if (self.opts.gx_user_scroll_enabled) self.opts.terminal.screens.active.pages.scrollbar() else @import("../PageList.zig").Scrollbar.zero;
+    // fork(gx): GX-0030 end
     if (try s.select(self.opts.terminal, sel, .if_needed)) {
+        // fork(gx): GX-0030 begin: callback stays under opts.mutex, before any queued notifications
+        if (self.opts.gx_user_scroll_enabled) {
+            const gx_after = self.opts.terminal.screens.active.pages.scrollbar();
+            if (gx_before.offset != gx_after.offset) if (self.opts.event_cb) |cb| {
+                cb(.{ .gx_user_scroll = .{ .before = gx_before, .after = gx_after } }, self.opts.event_userdata);
+            };
+        }
+        // fork(gx): GX-0030 end
         // No matter what we reset our selected match cache. This will
         // trigger a callback which will trigger the renderer to wake up
         // so it can be notified the screen scrolled.
@@ -516,6 +527,9 @@ pub const Options = struct {
     /// should use our search structures directly then).
     event_cb: ?EventCallback = null,
     event_userdata: ?*anyopaque = null,
+    // fork(gx): GX-0030 begin: opt in only for runtimes with the private user-scroll hook
+    gx_user_scroll_enabled: bool = false,
+    // fork(gx): GX-0030 end
 };
 
 pub const EventCallback = *const fn (event: Event, userdata: ?*anyopaque) void;
@@ -557,6 +571,12 @@ pub const Event = union(enum) {
     /// search thread and is only valid during the callback.
     viewport_matches: []const FlattenedHighlight,
 
+    // fork(gx): GX-0030 begin: private app callback, emitted with Options.mutex held
+    gx_user_scroll: struct {
+        before: @import("../PageList.zig").Scrollbar,
+        after: @import("../PageList.zig").Scrollbar,
+    },
+    // fork(gx): GX-0030 end
     pub const SelectedMatch = struct {
         idx: usize,
         highlight: FlattenedHighlight,
@@ -603,6 +623,9 @@ const TestUserData = struct {
             .complete => ud.reset.set(global.io()),
             .total_matches => |v| ud.total = v,
             .selected_match => |v| ud.selected = v,
+            // fork(gx): GX-0030 begin
+            .gx_user_scroll => {},
+            // fork(gx): GX-0030 end
             .viewport_matches => |v| {
                 for (ud.viewport) |*hl| hl.deinit(testing.allocator);
                 testing.allocator.free(ud.viewport);

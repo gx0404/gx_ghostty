@@ -1605,6 +1605,11 @@ fn searchCallback_(
             );
         },
 
+        // fork(gx): GX-0030 begin: search selection delivers this while holding renderer_state.mutex
+        .gx_user_scroll => |scroll| {
+            if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.rt_surface.gxUserScrolled(scroll.before, scroll.after);
+        },
+        // fork(gx): GX-0030 end
         // Unhandled, so far.
         .complete => {},
     }
@@ -5151,6 +5156,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                         .terminal = self.renderer_state.terminal,
                         .event_cb = &searchCallback,
                         .event_userdata = self,
+                        // fork(gx): GX-0030 begin
+                        .gx_user_scroll_enabled = @hasDecl(apprt.Surface, "gxUserScrolled"),
+                        // fork(gx): GX-0030 end
                     }),
                     .thread = undefined,
                 };

@@ -3878,7 +3878,6 @@ test "D11: native wakeup dispatch drains the GUI snapshot and rearms" {
         const scroll: @import("../../terminal/main.zig").Terminal.ScrollViewport = .{ .delta = delta };
         const worker = try std.Thread.spawn(.{}, @import("../../termio.zig").Termio.scrollViewport, .{ &core_surface.io, scroll });
         worker.join();
-        app.wakeup();
         try testing.expect(app.wakeup_pending.load(.acquire));
         var msg: w32.MSG = undefined;
         try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_WAKEUP, WM_APP_WAKEUP, w32.PM_REMOVE) != 0);
