@@ -2803,7 +2803,7 @@ fn copyTitle(self: *App, surface: *Surface) bool {
 /// `bell-audio-volume` before PCM16 playback),
 /// `attention` badges the tab and flashes the taskbar button of a window
 /// in the background, `title` marks the tab with a bell until it is
-/// selected. `border` is not implemented on Windows.
+/// selected. `border` highlights an unfocused terminal until focus or input.
 fn ringBell(self: *App, surface: ?*Surface) void {
     const features = self.config.@"bell-features";
     if (features.system) _ = w32.MessageBeep(0xFFFFFFFF);
@@ -2815,6 +2815,32 @@ fn ringBell(self: *App, surface: ?*Surface) void {
         flashTaskbarButton(window);
     }
     if (features.title) window.ringTab(s);
+    if (features.border) s.ringBellBorder();
+}
+
+test "bell border App routes only to its unfocused terminal" {
+    var config = try Config.default(std.testing.allocator);
+    defer config.deinit();
+    config.@"bell-features" = .{ .system = false, .audio = false, .attention = false, .title = false, .border = true };
+    var app: App = .{ .core_app = undefined, .config = config, .hinstance = undefined, .default_command_arena = .init(std.testing.allocator) };
+    defer app.default_command_arena.deinit();
+    var window: Window = .{ .app = &app };
+    var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_ready = true };
+    surface.bell_border_state.configure(true);
+    surface.core_surface.focused = false;
+    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.draw_now.deinit();
+    app.ringBell(&surface);
+    try std.testing.expect(surface.bellBorder().active);
+    app.ringBell(null);
+    try std.testing.expect(surface.bellBorder().active);
+    surface.core_surface.focused = true;
+    app.ringBell(&surface);
+    try std.testing.expect(!surface.bellBorder().active);
+    surface.core_surface.focused = false;
+    app.config.@"bell-features".border = false;
+    app.ringBell(&surface);
+    try std.testing.expect(!surface.bellBorder().active);
 }
 
 /// Flash the taskbar button of `window` until it comes to the front,

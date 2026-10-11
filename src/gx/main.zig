@@ -35,6 +35,7 @@
 //!   (`dmabuf_export`).
 pub const action = @import("action.zig");
 pub const app_mode = @import("app_mode.zig");
+pub const bell_border = @import("bell_border.zig");
 pub const branding = @import("branding.zig");
 pub const chrome = @import("chrome.zig");
 pub const config_layers = @import("config_layers.zig");
@@ -72,6 +73,7 @@ pub const window_state = @import("window_state.zig");
 test {
     _ = action;
     _ = app_mode;
+    _ = bell_border;
     _ = branding;
     _ = chrome;
     _ = config_layers;

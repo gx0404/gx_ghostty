@@ -22,6 +22,8 @@
 //! column and row are stretched over the rest (`edgeFills`). The apprt
 //! publishes the window size and the dim of an unfocused split, which is
 //! blended over the frame (`Surface.clientSize`, `Surface.unfocusedDim`).
+//! Its atomic `Surface.bellBorder` snapshot draws an opaque, thin inner edge
+//! after the dim, without changing the terminal grid or its render target.
 //! The window pixel format has an alpha channel when the driver offers
 //! one, so the frames keep the renderer's premultiplied alpha;
 //! `Device.alphaFrames` tells the apprt whether it can let the desktop
@@ -41,6 +43,7 @@ const gl = @import("opengl");
 const apprt = @import("../../apprt.zig");
 const global = @import("../../global.zig");
 const perf = @import("../../gx/perf.zig");
+const bell_border = @import("../../gx/bell_border.zig");
 const OpenGL = @import("../OpenGL.zig");
 const Target = @import("Target.zig");
 
@@ -406,6 +409,9 @@ pub const Context = struct {
     /// Making `dim_pass` failed on this GL context; frames stay undimmed.
     dim_failed: bool = false,
 
+    border_pass: ?BorderPass = null,
+    border_failed: bool = false,
+
     /// Called on the main thread when the renderer is created. Only
     /// records the device context; it makes no GL calls.
     pub fn init(rt_surface: *apprt.Surface, vsync: bool) !Context {
@@ -468,6 +474,7 @@ pub const Context = struct {
         if (attempt > 1) log.info("wglMakeCurrent succeeded attempts={}", .{attempt});
 
         self.hglrc = hglrc;
+        gl.glad.context = std.mem.zeroes(gl.glad.Context);
         thread_lib = lib;
         if (lib.swapInterval) |swapInterval| _ = swapInterval(@intFromBool(self.vsync));
         self.get_reset_status = if (robust)
@@ -483,6 +490,9 @@ pub const Context = struct {
         if (self.dim_pass) |pass| pass.deinit();
         self.dim_pass = null;
         self.dim_failed = false;
+        if (self.border_pass) |pass| pass.deinit();
+        self.border_pass = null;
+        self.border_failed = false;
         if (device.state.load(.acquire) != .ready) return;
         const lib = &device.lib;
         _ = lib.makeCurrent(null, null);
@@ -583,6 +593,9 @@ pub const Context = struct {
         for (fills.slice()) |fill| try blit(fill);
 
         if (self.unfocusedDim()) |color| self.dim(color, window);
+        if (comptime @hasDecl(apprt.Surface, "bellBorder")) {
+            self.border(self.surface.bellBorder(), window);
+        }
 
         if (!device.lib.swapBuffers(self.hdc).toBool()) {
             log.warn("SwapBuffers failed err={}", .{windows.GetLastError()});
@@ -631,6 +644,110 @@ pub const Context = struct {
         pass.draw(color, window) catch |err| {
             log.warn("error dimming the frame err={}", .{err});
         };
+    }
+
+    fn border(self: *Context, snapshot: bell_border.Snapshot, window: Size) void {
+        if (!snapshot.active or snapshot.width == 0 or self.border_failed) return;
+        if (window.width == 0 or window.height == 0) return;
+        const pass = self.border_pass orelse pass: {
+            const pass = BorderPass.init() catch |err| {
+                self.border_failed = true;
+                log.warn("cannot draw bell borders on this GL context err={}", .{err});
+                return;
+            };
+            self.border_pass = pass;
+            break :pass pass;
+        };
+        pass.draw(snapshot, window) catch |err| {
+            self.border_failed = true;
+            log.warn("bell border disabled until the GL context is rebuilt err={}", .{err});
+        };
+    }
+};
+
+const BorderPass = struct {
+    program: gl.Program,
+    vao: gl.VertexArray,
+
+    const fragment_source =
+        \\#version 430 core
+        \\layout(location = 0) uniform vec4 ring;
+        \\layout(location = 1) uniform vec3 bounds;
+        \\layout(location = 0) out vec4 color;
+        \\void main() {
+        \\    vec2 p = gl_FragCoord.xy;
+        \\    if (p.x >= bounds.z && p.y >= bounds.z && p.x < bounds.x - bounds.z && p.y < bounds.y - bounds.z) discard;
+        \\    color = vec4(ring.rgb, 1.0);
+        \\}
+    ;
+
+    fn init() !BorderPass {
+        const program = try gl.Program.createVF(DimPass.vertex_source, fragment_source);
+        errdefer program.destroy();
+        const vao = try gl.VertexArray.create();
+        return .{ .program = program, .vao = vao };
+    }
+
+    fn deinit(self: BorderPass) void {
+        self.vao.destroy();
+        self.program.destroy();
+    }
+
+    fn draw(self: BorderPass, snapshot: bell_border.Snapshot, window: Size) !void {
+        const thickness = bell_border.thickness(window.width, window.height, snapshot.width);
+        if (!snapshot.active or thickness == 0) return;
+        const state = BorderDrawState.capture();
+        defer state.restore();
+        const ctx = &gl.glad.context;
+        for (BorderDrawState.capabilities) |cap| ctx.Disable.?(cap);
+        ctx.ColorMask.?(gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE);
+        try gl.viewport(0, 0, @intCast(window.width), @intCast(window.height));
+        _ = try self.program.use();
+        _ = try self.vao.bind();
+        const color = snapshot.color();
+        ctx.Uniform4f.?(0, color[0], color[1], color[2], color[3]);
+        ctx.Uniform3f.?(1, @floatFromInt(window.width), @floatFromInt(window.height), @floatFromInt(thickness));
+        // Opaque source-over also covers a fully transparent terminal background.
+        try gl.drawArrays(gl.c.GL_TRIANGLES, 0, 3);
+    }
+};
+
+const BorderDrawState = struct {
+    viewport: [4]gl.c.GLint,
+    program: gl.c.GLint,
+    vao: gl.c.GLint,
+    enabled: [capabilities.len]bool,
+    color_mask: [4]gl.c.GLboolean,
+
+    const capabilities = [_]gl.c.GLenum{
+        gl.c.GL_BLEND,
+        gl.c.GL_SCISSOR_TEST,
+        gl.c.GL_DEPTH_TEST,
+        gl.c.GL_STENCIL_TEST,
+        gl.c.GL_CULL_FACE,
+        gl.c.GL_RASTERIZER_DISCARD,
+    };
+
+    fn capture() BorderDrawState {
+        const ctx = &gl.glad.context;
+        var state: BorderDrawState = undefined;
+        ctx.GetIntegerv.?(gl.c.GL_VIEWPORT, &state.viewport);
+        ctx.GetIntegerv.?(gl.c.GL_CURRENT_PROGRAM, &state.program);
+        ctx.GetIntegerv.?(gl.c.GL_VERTEX_ARRAY_BINDING, &state.vao);
+        ctx.GetBooleanv.?(gl.c.GL_COLOR_WRITEMASK, &state.color_mask);
+        for (capabilities, &state.enabled) |cap, *enabled| enabled.* = ctx.IsEnabled.?(cap) == gl.c.GL_TRUE;
+        return state;
+    }
+
+    fn restore(self: BorderDrawState) void {
+        const ctx = &gl.glad.context;
+        ctx.Viewport.?(self.viewport[0], self.viewport[1], self.viewport[2], self.viewport[3]);
+        ctx.UseProgram.?(@intCast(self.program));
+        ctx.BindVertexArray.?(@intCast(self.vao));
+        ctx.ColorMask.?(self.color_mask[0], self.color_mask[1], self.color_mask[2], self.color_mask[3]);
+        for (capabilities, self.enabled) |cap, enabled| {
+            if (enabled) ctx.Enable.?(cap) else ctx.Disable.?(cap);
+        }
     }
 };
 
@@ -1079,6 +1196,161 @@ fn basePixelFormat() PIXELFORMATDESCRIPTOR {
         .cAlphaBits = 8,
     };
 }
+
+test "bell border failure latch resets with the context without touching GUI state" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var context: Context = .{ .surface = undefined, .hdc = undefined, .vsync = false, .border_failed = true };
+    context.border(.{ .r = 20, .g = 40, .b = 60, .width = 1, .active = true }, .{ .width = 8, .height = 8 });
+    try std.testing.expect(context.border_failed);
+    try std.testing.expect(context.border_pass == null);
+    const device: Device = .{ .state = .init(.unavailable), .owner_thread = std.Thread.getCurrentId() };
+    context.threadExit(&device);
+    try std.testing.expect(!context.border_failed);
+}
+
+test "native bell border hidden FBO pixels state restore and context rebuild" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
+    var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer report.deinit();
+    const outcome = NativeBellBorder.run(&report.writer);
+    try report.writer.print("outcome={s} last_error={}\n", .{ if (outcome) |_| "PASS" else |err| @errorName(err), windows.GetLastError() });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ".local");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = if (softwareRequested()) ".local/native-border-software.txt" else ".local/native-border-system.txt",
+        .data = report.written(),
+    });
+    try outcome;
+}
+
+const NativeBellBorder = struct {
+    fn run(report: *std.Io.Writer) !void {
+        const kind: Lib.Kind = if (softwareRequested()) .software else .system;
+        const lib = try probe(kind);
+        defer _ = FreeLibrary(lib.module);
+        try report.print("kind={t} vendor={s} renderer={s} version={}.{} hidden=true shown=false activated=false\n", .{
+            kind, lib.vendor_buf[0..lib.vendor_len], lib.renderer_buf[0..lib.renderer_len], lib.version.major, lib.version.minor,
+        });
+        const instance = GetModuleHandleW(null);
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyBellBorderNative");
+        const class: WNDCLASSEXW = .{ .style = CS_OWNDC, .lpfnWndProc = &DefWindowProcW, .hInstance = instance, .lpszClassName = name };
+        if (RegisterClassExW(&class) == 0) return error.RegisterClassFailed;
+        defer _ = UnregisterClassW(name, instance);
+        const hwnd = CreateWindowExW(0, name, name, WS_OVERLAPPEDWINDOW, 0, 0, 32, 32, null, null, instance, null) orelse return error.CreateWindowFailed;
+        defer _ = DestroyWindow(hwnd);
+        const hdc = GetDC(hwnd) orelse return error.GetDCFailed;
+        defer _ = ReleaseDC(hwnd, hdc);
+        const device: Device = .{ .lib = lib, .state = .init(.ready), .owner_thread = std.Thread.getCurrentId() };
+        try device.setPixelFormat(hdc);
+        var surface: apprt.Surface = .{ .app = undefined, .hdc = @ptrCast(hdc) };
+        const snapshot: bell_border.Snapshot = .{ .r = 211, .g = 159, .b = 62, .width = 1, .active = true };
+        surface.bell_border_snapshot.store(@bitCast(snapshot), .release);
+        var context = try Context.init(&surface, false);
+        defer context.deinit();
+        defer gl.glad.unload();
+        try context.threadEnter(&device);
+        defer context.threadExit(&device);
+        _ = try gl.glad.load(&getProcAddress);
+        for ([_]Size{ .{ .width = 13, .height = 11 }, .{ .width = 1, .height = 1 }, .{ .width = 2, .height = 3 }, .{ .width = 1, .height = 7 } }) |size| {
+            for ([_]u7{ 1, 2, 127 }) |width| {
+                var current = snapshot;
+                current.width = width;
+                try drawCase(&context, current, size, report);
+            }
+        }
+        var themed = snapshot;
+        themed.r = 17;
+        themed.g = 112;
+        themed.b = 226;
+        themed.width = 2;
+        try drawCase(&context, themed, .{ .width = 13, .height = 11 }, report);
+        try drawCase(&context, .none, .{ .width = 13, .height = 11 }, report);
+        gl.glad.context.Enable.?(std.math.maxInt(gl.c.GLenum));
+        context.border(snapshot, .{ .width = 13, .height = 11 });
+        try std.testing.expect(context.border_failed);
+        context.border(snapshot, .{ .width = 13, .height = 11 });
+        try std.testing.expect(context.border_failed);
+        try report.writeAll("failure_latched=true retry_suppressed=true\n");
+        context.threadExit(&device);
+        gl.glad.unload();
+        try std.testing.expect(context.border_pass == null);
+        try std.testing.expect(!context.border_failed);
+        try std.testing.expectEqual(snapshot, surface.bellBorder());
+        try context.threadEnter(&device);
+        _ = try gl.glad.load(&getProcAddress);
+        try drawCase(&context, surface.bellBorder(), .{ .width = 13, .height = 11 }, report);
+        try report.writeAll("context_recreated=true ringing_preserved=true pass_rebuilt=true\n");
+    }
+
+    fn extraState() [12]gl.c.GLint {
+        var result: [12]gl.c.GLint = undefined;
+        const ctx = &gl.glad.context;
+        ctx.GetIntegerv.?(gl.c.GL_SCISSOR_BOX, @ptrCast(&result));
+        for ([_]gl.c.GLenum{
+            gl.c.GL_BLEND_SRC_RGB,      gl.c.GL_BLEND_DST_RGB,        gl.c.GL_BLEND_SRC_ALPHA,          gl.c.GL_BLEND_DST_ALPHA,
+            gl.c.GL_BLEND_EQUATION_RGB, gl.c.GL_BLEND_EQUATION_ALPHA, gl.c.GL_DRAW_FRAMEBUFFER_BINDING, gl.c.GL_READ_FRAMEBUFFER_BINDING,
+        }, result[4..]) |parameter, *value| ctx.GetIntegerv.?(parameter, value);
+        return result;
+    }
+
+    fn drawCase(context: *Context, snapshot: bell_border.Snapshot, size: Size, report: *std.Io.Writer) !void {
+        const ctx = &gl.glad.context;
+        var framebuffer: gl.c.GLuint = 0;
+        var storage: gl.c.GLuint = 0;
+        ctx.GenFramebuffers.?(1, &framebuffer);
+        defer ctx.DeleteFramebuffers.?(1, &framebuffer);
+        ctx.GenRenderbuffers.?(1, &storage);
+        defer ctx.DeleteRenderbuffers.?(1, &storage);
+        ctx.BindFramebuffer.?(gl.c.GL_FRAMEBUFFER, framebuffer);
+        ctx.BindRenderbuffer.?(gl.c.GL_RENDERBUFFER, storage);
+        ctx.RenderbufferStorage.?(gl.c.GL_RENDERBUFFER, gl.c.GL_RGBA8, @intCast(size.width), @intCast(size.height));
+        ctx.FramebufferRenderbuffer.?(gl.c.GL_FRAMEBUFFER, gl.c.GL_COLOR_ATTACHMENT0, gl.c.GL_RENDERBUFFER, storage);
+        try std.testing.expectEqual(@as(gl.c.GLenum, gl.c.GL_FRAMEBUFFER_COMPLETE), ctx.CheckFramebufferStatus.?(gl.c.GL_FRAMEBUFFER));
+        for (BorderDrawState.capabilities) |cap| ctx.Disable.?(cap);
+        ctx.Disable.?(gl.c.GL_FRAMEBUFFER_SRGB);
+        ctx.ColorMask.?(gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+        const sentinel = try DimPass.init();
+        defer sentinel.deinit();
+        _ = try sentinel.program.use();
+        _ = try sentinel.vao.bind();
+        try gl.viewport(3, 2, 5, 4);
+        for (BorderDrawState.capabilities) |cap| ctx.Enable.?(cap);
+        ctx.Scissor.?(4, 3, 1, 1);
+        ctx.BlendFuncSeparate.?(gl.c.GL_SRC_ALPHA, gl.c.GL_ONE_MINUS_SRC_ALPHA, gl.c.GL_ONE, gl.c.GL_ZERO);
+        ctx.BlendEquationSeparate.?(gl.c.GL_FUNC_REVERSE_SUBTRACT, gl.c.GL_MAX);
+        ctx.ColorMask.?(gl.c.GL_FALSE, gl.c.GL_TRUE, gl.c.GL_FALSE, gl.c.GL_FALSE);
+        const before = BorderDrawState.capture();
+        const extra_before = extraState();
+        context.border(snapshot, size);
+        try std.testing.expect(!context.border_failed);
+        try std.testing.expectEqualDeep(before, BorderDrawState.capture());
+        try std.testing.expectEqualDeep(extra_before, extraState());
+        var bytes: [13 * 11 * 4]u8 = undefined;
+        ctx.PixelStorei.?(gl.c.GL_PACK_ALIGNMENT, 1);
+        ctx.ReadPixels.?(0, 0, @intCast(size.width), @intCast(size.height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, &bytes);
+        try gl.errors.getError();
+        for (0..size.height) |y| {
+            for (0..size.width) |x| {
+                const offset = (y * size.width + x) * 4;
+                const expected: [4]u8 = if (snapshot.active and bell_border.covers(size.width, size.height, snapshot.width, @intCast(x), @intCast(y)))
+                    .{ snapshot.r, snapshot.g, snapshot.b, 255 }
+                else
+                    .{ 0, 0, 0, 0 };
+                try std.testing.expectEqualSlices(u8, &expected, bytes[offset..][0..4]);
+            }
+        }
+        try report.print("FBO={}x{} padding=0 requested={} active={} four_edges={} alpha=255 center_unchanged=true restore=true samples={x}\n", .{
+            size.width, size.height, snapshot.width, snapshot.active, snapshot.active, bytes[0..@min(@as(usize, size.width) * size.height * 4, 32)],
+        });
+        ctx.UseProgram.?(0);
+        ctx.BindVertexArray.?(0);
+        for (BorderDrawState.capabilities) |cap| ctx.Disable.?(cap);
+        ctx.ColorMask.?(gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE);
+        ctx.BindFramebuffer.?(gl.c.GL_FRAMEBUFFER, 0);
+    }
+};
 
 test parseVersion {
     const testing = std.testing;

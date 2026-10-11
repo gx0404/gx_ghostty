@@ -13,8 +13,8 @@
 //! timers; dropped and pasted files are quoted for the shell running in
 //! the terminal (`gx.path_quote`). The renderer thread reports frames
 //! (`signalFrameDrawn`) and GPU resets (`gpuContextReset`) back here, and
-//! reads the dim of an unfocused split (`unfocusedDim`) and the client size
-//! (`clientSize`) that the GUI thread publishes in atomics.
+//! reads the unfocused dim (`unfocusedDim`), bell border (`bellBorder`)
+//! and client size (`clientSize`) that the GUI thread publishes in atomics.
 const Surface = @This();
 
 const std = @import("std");
@@ -29,6 +29,10 @@ const gx_win32_input = @import("../../gx/win32_input.zig");
 const gx_confirm = @import("../../gx/confirm.zig");
 const gx_proc = @import("../../gx/proc.zig");
 const path_quote = @import("../../gx/path_quote.zig");
+const bell_border = @import("../../gx/bell_border.zig");
+const ui_color = @import("../../gx/ui_color.zig");
+const ui_tokens = @import("../../gx/ui_tokens.zig");
+const style = @import("ui/style.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
@@ -172,6 +176,14 @@ gpu_reset_attempts: u8 = 0,
 /// the GUI thread (`setUnfocusedDim`), read by the render thread
 /// (`unfocusedDim`).
 unfocused_dim: std.atomic.Value(u32) = .init(0),
+
+/// GUI-owned lifecycle; only the packed snapshot crosses to WGL.
+bell_border_state: bell_border.State = .{},
+bell_border_theme: ui_color.Rgb8 = .{ .r = 0, .g = 0, .b = 0 },
+bell_border_color: ui_color.Rgb8 = .{ .r = 0, .g = 0, .b = 0 },
+bell_border_requested_visible: bool = true,
+bell_border_owner_shown: bool = true,
+bell_border_snapshot: std.atomic.Value(u32) = .init(0),
 
 /// The client size of the terminal's window that the GUI thread laid out
 /// last (`publishClientSize`), for the render thread (`clientSize`):
@@ -425,6 +437,8 @@ pub fn initWithOptions(
         config.title = try config.arenaAlloc().dupeZ(u8, title);
     }
 
+    self.configureBellBorder(&config);
+
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
     // and spawns the renderer + IO threads.
     try self.core_surface.init(
@@ -443,6 +457,7 @@ pub fn initWithOptions(
 }
 
 pub fn deinit(self: *Surface) void {
+    self.stopBellBorder();
     self.setScrollbarOwnerVisible(false);
     self.core_surface_ready = false;
     self.first_frame_hwnd.store(0, .release);
@@ -577,7 +592,11 @@ pub fn getTitle(self: *const Surface) ?[:0]const u8 {
 /// would fill the queue and stall the GUI thread for the push timeout each,
 /// then drop.
 pub fn setVisible(self: *Surface, visible: bool) void {
+    self.bell_border_requested_visible = visible;
     const state = self.visibilityState(visible);
+    if (self.parent_window.closing) self.bell_border_state.stop();
+    if (self.parent_window.is_quick_terminal and !state.popups) self.bell_border_state.clear();
+    self.publishBellBorder();
     if (!state.render and self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);
     if (!state.popups) self.link_preview.hide();
     self.search_bar.setOwnerVisible(state.popups);
@@ -915,6 +934,7 @@ fn completeClipboardRequestWithConfirmation(
     contents: []const terminal.clipboard.Content,
     available: []const []const u8,
 ) apprt.ClipboardReadResult {
+    if (state == .paste) self.clearBellBorder();
     // Complete with confirmed=false so the core runs its safety checks. If it
     // flags the paste as unsafe (paste-protection) or the OSC 52 read as
     // unauthorized (clipboard-read = ask), prompt and only re-complete with
@@ -1358,6 +1378,7 @@ pub fn toggleWindowDecorations(self: *Surface) void {
 /// Follow a config change reported for this surface. Its conditional
 /// configuration (e.g. a light/dark theme) can differ from the app's.
 pub fn onConfigChange(self: *Surface, config: *const configpkg.Config) void {
+    self.configureBellBorder(config);
     self.setEraseColor(config.background);
     self.erase_opacity = config.@"background-opacity";
     self.erase_linear = config.@"alpha-blending".isLinear();
@@ -1451,6 +1472,8 @@ fn updateScrollbarGate(self: *Surface) void {
 }
 
 pub fn onShowWindow(self: *Surface, showing: bool) void {
+    self.bell_border_owner_shown = showing;
+    self.publishBellBorder();
     self.setScrollbarOwnerVisible(self.visibilityState(showing).popups);
 }
 
@@ -1489,8 +1512,9 @@ fn scrollbarReservedWidth(self: *Surface) i32 {
     return geometry.currentReservedWidth();
 }
 
-/// Forwarded from the parent window for surfaces without a scrollbar popup.
+/// Forwarded system settings refresh, including surfaces without a scrollbar.
 pub fn refreshScrollbarMode(self: *Surface) void {
+    self.refreshBellBorderColor();
     const reserved = self.scrollbarReservedWidth();
     self.scrollbar_mode = @import("Scrollbar.zig").readMode();
     if (self.scrollbar == null and reserved != self.scrollbarReservedWidth()) self.refitGrid();
@@ -1612,6 +1636,7 @@ pub fn awaitResizeFrames(surfaces: []const *Surface) bool {
 /// DPI. Child windows never receive WM_DPICHANGED themselves.
 pub fn handleDpiChange(self: *Surface, dpi: u32) void {
     self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+    self.publishBellBorder();
 
     if (self.core_surface_ready) {
         self.core_surface.contentScaleCallback(.{
@@ -1643,6 +1668,7 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
 pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
     if (!self.core_surface_ready) return;
     const vk: u16 = @intCast(wparam & 0xFFFF);
+    if (action == .press or action == .repeat) self.clearBellBorder();
     if (action == .press) self.key_event_produced_text = false;
     // Bits 16-23 of lparam. Bit 24 is the extended-key flag, not part of
     // the scancode; including it broke ToUnicode for AltGr layouts
@@ -1841,6 +1867,7 @@ pub fn handleCharEvent(self: *Surface, wparam: usize) void {
 
     // Skip control characters that are handled via WM_KEYDOWN
     if (char_code < 0x20 and char_code != '\t' and char_code != '\r' and char_code != '\n') return;
+    self.clearBellBorder();
 
     // Handle UTF-16 surrogate pairs for codepoints > U+FFFF (e.g. emoji).
     const codepoint: u21 = if (char_code >= 0xD800 and char_code <= 0xDBFF) {
@@ -1891,6 +1918,7 @@ pub fn handleMouseButton(
     lparam: isize,
 ) void {
     if (!self.core_surface_ready) return;
+    if (action == .press) self.clearBellBorder();
 
     // Capture mouse on the first pressed button; release only when all
     // buttons are up. Otherwise a right-click in the middle of a left-
@@ -2185,6 +2213,7 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
     }) orelse return;
     defer alloc.free(text);
 
+    self.clearBellBorder();
     // Send through keyCallback as text (PTY-bound, encoding-correct).
     // Like a paste, and as in Windows Terminal, the paths stay raw text
     // even while win32-input-mode is on, so this is not gxWin32KeyCallback.
@@ -2401,6 +2430,7 @@ test "wheelNotches adds up small steps" {
 
 pub fn handleImeStartComposition(self: *Surface) void {
     if (!self.core_surface_ready) return;
+    self.clearBellBorder();
     self.ime_composing = true;
     self.high_surrogate = 0;
     self.key_event_produced_text = false;
@@ -2419,6 +2449,7 @@ pub fn handleImeEndComposition(self: *Surface) void {
 pub fn handleImeComposition(self: *Surface, lparam: isize) bool {
     if (!self.core_surface_ready) return false;
     const flags: u32 = @truncate(@as(usize, @bitCast(lparam)));
+    if (flags & (w32.GCS_RESULTSTR | w32.GCS_COMPSTR) != 0) self.clearBellBorder();
     if (flags & w32.GCS_RESULTSTR != 0) {
         self.core_surface.preeditCallback(null) catch {};
         self.clearImeText();
@@ -2699,8 +2730,60 @@ pub const DimColor = packed struct(u32) {
     }
 };
 
+pub fn ringBellBorder(self: *Surface) void {
+    if (!self.core_surface_ready or !self.bell_border_state.accepting) return;
+    if (self.parent_window.closing) {
+        self.stopBellBorder();
+        return;
+    }
+    if (self.parent_window.is_quick_terminal and self.parent_window.feedbackDisposition() != .ready) return;
+    self.bell_border_state.ring(self.core_surface.focused);
+    self.publishBellBorder();
+}
+
+fn configureBellBorder(self: *Surface, config: *const configpkg.Config) void {
+    self.bell_border_state.configure(config.@"bell-features".border);
+    const tokens: ui_tokens.Tokens = .derive(.fromConfig(config));
+    self.bell_border_theme = tokens.caution.toRgb8();
+    self.refreshBellBorderColor();
+}
+
+fn refreshBellBorderColor(self: *Surface) void {
+    self.bell_border_color = if (style.system.highContrast())
+        style.Tokens.fromSystem(style.system.colors).caution.toRgb8()
+    else
+        self.bell_border_theme;
+    self.publishBellBorder();
+}
+
+fn publishBellBorder(self: *Surface) void {
+    const visible = self.bell_border_state.ringing and self.bell_border_state.accepting and
+        !self.parent_window.closing and
+        self.visibilityState(self.bell_border_requested_visible and self.bell_border_owner_shown).popups;
+    const snapshot = self.bell_border_state.snapshot(visible, self.bell_border_color, self.scale);
+    const value: u32 = @bitCast(snapshot);
+    if (self.bell_border_snapshot.swap(value, .acq_rel) == value) return;
+    if (self.core_surface_ready) self.core_surface.renderer_thread.draw_now.notify() catch {};
+}
+
+fn clearBellBorder(self: *Surface) void {
+    self.bell_border_state.clear();
+    self.publishBellBorder();
+}
+
+fn stopBellBorder(self: *Surface) void {
+    self.bell_border_state.stop();
+    self.publishBellBorder();
+}
+
+/// Render-thread snapshot; no GUI state or configuration is read here.
+pub fn bellBorder(self: *const Surface) bell_border.Snapshot {
+    return @bitCast(self.bell_border_snapshot.load(.acquire));
+}
+
 /// Publish a changed dim and request a frame even if the terminal is idle.
 pub fn setUnfocusedDim(self: *Surface, dim: DimColor) void {
+    self.refreshBellBorderColor();
     const value: u32 = @bitCast(dim);
     if (self.unfocused_dim.swap(value, .acq_rel) == value) return;
     if (self.core_surface_ready) self.core_surface.renderer_thread.draw_now.notify() catch {};
@@ -2730,6 +2813,7 @@ pub fn clientSize(self: *const Surface) ?apprt.SurfaceSize {
 /// Rebuild owned popups after SetParent, without ending an active search.
 pub fn onReparented(self: *Surface, window: *Window) void {
     if (self.parent_window == window) return;
+    self.bell_border_snapshot.store(0, .release);
     if (self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);
     self.first_frame_hwnd.store(0, .release);
     const search_active = self.search_bar.active;
@@ -2759,6 +2843,134 @@ pub fn onReparented(self: *Surface, window: *Window) void {
         saved_input.deinit(alloc);
     }
     self.refitGrid();
+}
+
+test "bell border color follows conditional themes and high contrast" {
+    const saved_system = style.system;
+    defer style.system = saved_system;
+    style.system.forced_high_contrast = false;
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    config.@"bell-features".border = true;
+    var window: Window = .{ .app = undefined };
+    var surface: Surface = .{ .app = undefined, .parent_window = &window };
+    surface.configureBellBorder(&config);
+    surface.bell_border_state.ring(false);
+    surface.publishBellBorder();
+    const dark = surface.bellBorder();
+    try std.testing.expect(dark.active);
+    config.background = .{ .r = 248, .g = 248, .b = 248 };
+    config.foreground = .{ .r = 16, .g = 16, .b = 16 };
+    surface.configureBellBorder(&config);
+    const light = surface.bellBorder();
+    try std.testing.expect(light.active);
+    try std.testing.expect(!std.meta.eql(dark, light));
+    style.system.forced_high_contrast = true;
+    surface.refreshScrollbarMode();
+    const color = style.Tokens.fromSystem(style.system.colors).caution.toRgb8();
+    try std.testing.expectEqual(color.r, surface.bellBorder().r);
+    try std.testing.expectEqual(color.g, surface.bellBorder().g);
+    try std.testing.expectEqual(color.b, surface.bellBorder().b);
+    style.system.forced_high_contrast = false;
+    surface.refreshScrollbarMode();
+    try std.testing.expectEqual(light, surface.bellBorder());
+    config.@"bell-features".border = false;
+    surface.configureBellBorder(&config);
+    try std.testing.expect(!surface.bellBorder().active);
+}
+
+test "bell border surface publication follows visibility config DPI and shutdown" {
+    var window: Window = .{ .app = undefined };
+    var surface: Surface = .{ .app = undefined, .parent_window = &window };
+    surface.bell_border_state.configure(true);
+    surface.bell_border_color = .{ .r = 190, .g = 120, .b = 60 };
+    surface.bell_border_state.ring(false);
+    surface.publishBellBorder();
+    try std.testing.expect(surface.bellBorder().active);
+    surface.setVisible(false);
+    try std.testing.expect(!surface.bellBorder().active);
+    try std.testing.expect(surface.bell_border_state.ringing);
+    surface.onShowWindow(true);
+    try std.testing.expect(!surface.bellBorder().active);
+    surface.setVisible(true);
+    try std.testing.expect(surface.bellBorder().active);
+    surface.handleDpiChange(192);
+    try std.testing.expectEqual(@as(u7, 2), surface.bellBorder().width);
+    surface.bell_border_state.configure(false);
+    surface.publishBellBorder();
+    surface.bell_border_state.configure(true);
+    surface.publishBellBorder();
+    try std.testing.expect(!surface.bellBorder().active);
+    surface.bell_border_state.ring(false);
+    surface.publishBellBorder();
+    window.closing = true;
+    surface.setVisible(true);
+    try std.testing.expect(!surface.bellBorder().active);
+    window.closing = false;
+    surface.bell_border_state.ring(false);
+    surface.publishBellBorder();
+    try std.testing.expect(!surface.bellBorder().active);
+}
+
+test "bell border VK_PACKET VK_PROCESSKEY and text clear only the addressed split" {
+    var window: Window = .{ .app = undefined };
+    var surface: Surface = .{ .app = undefined, .parent_window = &window, .core_surface_ready = true };
+    var other: Surface = .{ .app = undefined, .parent_window = &window };
+    surface.core_surface.focused = false;
+    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.draw_now.deinit();
+    surface.bell_border_state.configure(true);
+    other.bell_border_state.configure(true);
+    other.bell_border_state.ring(false);
+    other.publishBellBorder();
+    for ([_]u16{ w32.VK_PACKET, w32.VK_PROCESSKEY }) |vk| {
+        surface.ringBellBorder();
+        surface.handleKeyEvent(vk, 0, .release);
+        try std.testing.expect(surface.bellBorder().active);
+        surface.handleKeyEvent(vk, 0, .press);
+        try std.testing.expect(!surface.bellBorder().active);
+        try std.testing.expect(other.bellBorder().active);
+    }
+    surface.ringBellBorder();
+    surface.handleCharEvent(0xD83D);
+    try std.testing.expect(!surface.bellBorder().active);
+    try std.testing.expect(other.bellBorder().active);
+    surface.ringBellBorder();
+    surface.stopBellBorder();
+    surface.ringBellBorder();
+    try std.testing.expect(!surface.bellBorder().active);
+}
+
+test "bell border Quick hidden moving and detached owners reject late bells" {
+    var app: App = undefined;
+    app.quick_terminal = null;
+    var window: Window = .{ .app = &app, .is_quick_terminal = true };
+    var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_ready = true };
+    surface.core_surface.focused = false;
+    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.draw_now.deinit();
+    surface.bell_border_state.configure(true);
+    surface.ringBellBorder();
+    try std.testing.expect(!surface.bellBorder().active);
+    var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &window };
+    app.quick_terminal = &quick;
+    for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, true } }) |state| {
+        quick.visible = state[0];
+        quick.animating = state[1];
+        surface.ringBellBorder();
+        try std.testing.expect(!surface.bell_border_state.ringing);
+        try std.testing.expect(!surface.bellBorder().active);
+    }
+    quick.visible = true;
+    quick.animating = false;
+    surface.ringBellBorder();
+    try std.testing.expect(surface.bellBorder().active);
+    quick.visible = false;
+    surface.core_surface_ready = false;
+    surface.setVisible(false);
+    surface.onShowWindow(true);
+    try std.testing.expect(!surface.bellBorder().active);
+    try std.testing.expect(!surface.bell_border_state.ringing);
 }
 
 test "DimColor premultiplies the color by its coverage" {
@@ -2905,6 +3117,8 @@ pub fn refreshRenderer(self: *Surface) void {
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
 pub fn handleFocus(self: *Surface, focused: bool) void {
     if (!self.core_surface_ready) return;
+    self.bell_border_state.setFocused(focused);
+    self.publishBellBorder();
     // Drop any buffered high surrogate and pending dead key on focus loss —
     // otherwise they would combine with the next character when focus returns.
     if (!focused) {
@@ -3216,9 +3430,12 @@ test "reparenting a terminal cancels its old window hint, not destination feedba
     var app: App = .{ .core_app = &core_app, .config = config, .hinstance = undefined, .default_command_arena = .init(std.testing.allocator) };
     defer app.default_command_arena.deinit();
     var source: Window = .{ .app = &app };
-    var destination: Window = .{ .app = &app };
+    var destination: Window = .{ .app = &app, .scale = 2 };
     var surface: Surface = .{ .app = &app, .parent_window = &source, .core_surface_initialized = true, .key_sequence_len = 4 };
     surface.core_surface.id = 1;
+    surface.bell_border_state.configure(true);
+    surface.bell_border_state.ring(false);
+    surface.publishBellBorder();
     source.toast = .{ .pending = true, .owner = .{ .surface_id = 1, .kind = .table } };
     destination.toast = .{ .pending = true };
     surface.onReparented(&source);
@@ -3228,6 +3445,9 @@ test "reparenting a terminal cancels its old window hint, not destination feedba
     try std.testing.expect(destination.toast.pending);
     try std.testing.expect(surface.parent_window == &destination);
     try std.testing.expectEqual(@as(usize, 4), surface.key_sequence_len);
+    try std.testing.expect(surface.bellBorder().active);
+    try std.testing.expect(surface.bell_border_state.ringing);
+    try std.testing.expectEqual(@as(u7, 2), surface.bellBorder().width);
 }
 
 test "ISO extra key and unowned pointer visibility" {
