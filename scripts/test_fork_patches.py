@@ -1080,7 +1080,7 @@ class Gx0030ShapeTests(unittest.TestCase):
         self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
-class Gx0031ShapeTests(unittest.TestCase):
+class Gx0037ShapeTests(unittest.TestCase):
     GENERATORS = (
         ("src/build/webgen/main_config.zig", "try genConfig(stdout);"),
         ("src/build/webgen/main_actions.zig",
@@ -1104,14 +1104,14 @@ class Gx0031ShapeTests(unittest.TestCase):
         for rel, generate in self.GENERATORS:
             with self.subTest(rel):
                 source = (ROOT / rel).read_text(encoding="utf-8")
-                stripped, hunks = marked_hunks(source, "GX-0031")
+                stripped, hunks = marked_hunks(source, "GX-0037")
                 self.assertEqual(len(hunks), 1)
                 begin, end = hunks[0]
                 lines = source.splitlines()
                 self.assertEqual(lines[begin - 1].strip(), generate)
                 self.assertEqual(squash("\n".join(lines[begin + 1:end])), squash("try stdout.flush();"))
-                self.assertIn(Patch("GX-0031", rel, "fork(gx): GX-0031", "active"), patches)
-                self.assertEqual(marked_hunks(source.replace("\n", "\r\n"), "GX-0031")[0]
+                self.assertIn(Patch("GX-0037", rel, "fork(gx): GX-0037", "active"), patches)
+                self.assertEqual(marked_hunks(source.replace("\n", "\r\n"), "GX-0037")[0]
                                  .replace("\r\n", "\n"), stripped)
                 upstream, reason = merged_upstream_text(ROOT, rel)
                 if upstream is None:

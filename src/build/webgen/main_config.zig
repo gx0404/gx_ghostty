@@ -7,9 +7,9 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &buffer);
     const stdout = &stdout_writer.interface;
     try genConfig(stdout);
-    // fork(gx): GX-0031 begin: Flush buffered website data before exiting.
+    // fork(gx): GX-0037 begin: Flush buffered website data before exiting.
     try stdout.flush();
-    // fork(gx): GX-0031 end
+    // fork(gx): GX-0037 end
 }
 
 pub fn genConfig(writer: *std.Io.Writer) !void {
