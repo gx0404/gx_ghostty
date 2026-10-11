@@ -377,8 +377,13 @@ fn finishShow(self: *QuickTerminal) void {
     self.moveTo(self.target_rect);
     self.applyClip(null);
     setCloaked(hwnd, false);
+    // Feedback and terminal popups were explicitly hidden before the paired
+    // native hide. Only its remaining recorded popups, including a live
+    // modal dialog, are restored here.
+    _ = w32.ShowOwnedPopups(hwnd, 1);
     self.setTerminalPopupsShown(true);
     self.window.resumeFeedback();
+    if (w32.IsWindowEnabled(hwnd) == 0) self.activate();
     // A terminal whose frames the region cut short draws a whole one.
     if (clipped) _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | w32.RDW_ALLCHILDREN);
 }
@@ -562,13 +567,36 @@ fn restoreForeground(self: *QuickTerminal) void {
     _ = w32.SetForegroundWindow(previous);
 }
 
-/// Bring the quick terminal to the foreground and give its terminal the
-/// keyboard. Windows lets the process handling the global hotkey take the
-/// foreground; when it refuses anyway, `forceForeground` tries again.
+/// Give the keyboard to the terminal, or to its live modal while the owner
+/// is disabled. A hidden modal waits for the settled native restore.
 fn activate(self: *QuickTerminal) void {
     const hwnd = self.window.hwnd orelse return;
+    if (w32.IsWindowEnabled(hwnd) == 0) {
+        const popup = GetWindow(hwnd, GW_ENABLEDPOPUP) orelse return;
+        if (!canFocusModal(false, popup != hwnd and self.ownsWindow(popup), w32.IsWindowEnabled(popup) != 0, w32.IsWindowVisible_(popup) != 0)) return;
+        if (w32.SetForegroundWindow(popup) == 0) forceForeground(popup);
+        const focus = w32.GetFocus();
+        if (focus == null or w32.GetAncestor(focus.?, 2) != popup) _ = w32.SetFocus(popup);
+        return;
+    }
     if (w32.SetForegroundWindow(hwnd) == 0) forceForeground(hwnd);
     self.window.focusActiveSurface();
+}
+
+const GW_ENABLEDPOPUP: u32 = 6;
+extern "user32" fn GetWindow(hwnd: w32.HWND, command: u32) callconv(.winapi) ?w32.HWND;
+
+fn canFocusModal(owner_enabled: bool, owned: bool, enabled: bool, visible: bool) bool {
+    return !owner_enabled and owned and enabled and visible;
+}
+
+test "modal activation rejects an enabled owner, hidden or unrelated popups" {
+    const testing = std.testing;
+    try testing.expect(canFocusModal(false, true, true, true));
+    try testing.expect(!canFocusModal(true, true, true, true));
+    try testing.expect(!canFocusModal(false, false, true, true));
+    try testing.expect(!canFocusModal(false, true, false, true));
+    try testing.expect(!canFocusModal(false, true, true, false));
 }
 
 /// The fallback of `activate`: SetForegroundWindow while attached to the
