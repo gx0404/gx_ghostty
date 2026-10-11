@@ -1080,6 +1080,41 @@ class Gx0030ShapeTests(unittest.TestCase):
         self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
+class Gx0031ShapeTests(unittest.TestCase):
+    def test_cursor_gate_only_changes_the_timer_notify(self):
+        source = (ROOT / "src/renderer/Thread.zig").read_text(encoding="utf-8")
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, "fn cursorTimerCallback(")
+        body = "\n".join(lines[start:end])
+        self.assertIn('fork(gx): GX-0031', body)
+        self.assertIn('@import("../gx/cursor_blink.zig").notify(t, global.io());', body)
+        self.assertIn('t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;', body)
+        self.assertIn('t.cursor_h.run(', body)
+        self.assertIn('const CURSOR_BLINK_INTERVAL = 600;', source)
+        self.assertNotIn('t.state', body)
+        self.assertNotIn('t.wakeup.notify()', body)
+        focus = source[source.index('.focus =>'):source.index('.reset_cursor_blink =>')]
+        self.assertIn('self.cursor_h.cancel(', focus)
+        animation = source[source.index('fn animationTimerCallback('):source.index('fn cursorTimerCallback(')]
+        self.assertNotIn('cursor_blink.zig', animation)
+
+    def test_blink_cache_uses_the_successful_frame_snapshot(self):
+        source = (ROOT / "src/renderer/generic.zig").read_text(encoding="utf-8")
+        self.assertIn('gx_cursor_blink_affects: bool = true', source)
+        self.assertIn('errdefer @import("../gx/cursor_blink.zig").invalidate(self, global.io());', source)
+        cache = source.index('self.gx_cursor_blink_affects = !gx_rebuilt')
+        self.assertLess(source.index('self.terminal_state.endUpdate();'), cache)
+        self.assertLess(source.index('self.rebuildCells('), cache)
+        self.assertIn('.preedit = critical.preedit != null,', source[cache:cache + 280])
+        self.assertIn('.focused = self.focused,', source[cache:cache + 280])
+        outside = source[source.index('self.terminal_state.endUpdate();'):source.index('pub fn drawFrame(')]
+        self.assertNotIn('state.preedit', outside)
+        self.assertNotIn('state.mouse', outside)
+        callback = (ROOT / 'src/renderer/Thread.zig').read_text(encoding='utf-8')
+        self.assertLess(callback.index('if (!t.renderer.display_realized)'), callback.index('if (!t.flags.visible) return .disarm;'))
+
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则

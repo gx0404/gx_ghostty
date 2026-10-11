@@ -105,4 +105,5 @@ test {
     _ = viewport_activity;
     _ = win32_input;
     _ = window_state;
+    _ = @import("cursor_blink.zig");
 }

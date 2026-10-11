@@ -139,6 +139,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if the window is visible.
         visible: bool,
 
+        // fork(gx): GX-0031 begin: last successful frame's cursor/preedit snapshot.
+        gx_cursor_blink_affects: bool = true,
+        // fork(gx): GX-0031 end
+
         /// Flag to indicate that our focus state changed for custom
         /// shaders to update their state.
         custom_shader_focused_changed: bool = false,
@@ -965,6 +969,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
+
             // Mark the display as realized. The render thread will lazily
             // rebuild the swap chain and shaders on the next `drawFrame`,
             // which is the right place for GL resource creation (it
@@ -973,6 +978,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.reinitialize_shaders = true;
             self.target_config_modified = 1;
         }
+
 
         /// This is called when the surface is being unrealized.
         /// This can happen because the surface is being closed but
@@ -1348,6 +1354,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the course of a frame. Always flush those objects, including
             // when rebuilding the frame fails due to memory pressure.
             defer self.font_shaper.endFrame();
+            // fork(gx): GX-0031 begin: allocation failure cannot publish a false negative.
+            errdefer @import("../gx/cursor_blink.zig").invalidate(self, global.io());
+            // fork(gx): GX-0031 end
 
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
@@ -1542,8 +1551,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 arena_alloc,
                 &critical.links,
                 &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                // fork(gx): GX-0031 use the captured mouse state outside State.mutex.
+                critical.mouse.point,
+                critical.mouse.mods,
             ) catch |err| {
                 log.warn("error searching for regex links err={}", .{err});
             };
@@ -1617,6 +1627,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
+                // fork(gx): GX-0031 begin: only publish from successfully rebuilt cells.
+                var gx_rebuilt = true;
+                // fork(gx): GX-0031 end
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1632,7 +1645,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // our old buffer (frozen contents) and log it.
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
+                    // fork(gx): GX-0031 begin: retain conservative timer wakes after failure.
+                    gx_rebuilt = false;
+                    // fork(gx): GX-0031 end
                 };
+                // fork(gx): GX-0031 begin: use the same terminal and cloned preedit as the cells.
+                self.gx_cursor_blink_affects = !gx_rebuilt or @import("cursor.zig").blinkAffects(&self.terminal_state, .{
+                    .preedit = critical.preedit != null,
+                    .focused = self.focused,
+                });
+                // fork(gx): GX-0031 end
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
