@@ -25,4 +25,5 @@ test {
     _ = shortcuts_dialog;
     _ = window;
     _ = @import("style.zig");
+    _ = @import("settings_dialog.zig");
 }
