@@ -23,6 +23,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const tabs = @import("tabs.zig");
 const tab_status = @import("tab_status.zig");
 const open_url = @import("open_url.zig");
+const BellAudio = @import("BellAudio.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
@@ -218,9 +219,7 @@ taskbar_button_created: u32 = 0,
 /// never destroyed).
 balloon_icon: ?w32.HICON = null,
 
-/// `bell-audio-path` in UTF-16 for `PlaySoundW`, which plays it
-/// asynchronously.
-bell_audio_path: [1024]u16 = undefined,
+bell_audio: ?*BellAudio.Player = null,
 
 pub fn init(
     self: *App,
@@ -657,6 +656,10 @@ fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
 
 pub fn terminate(self: *App) void {
     self.stopQuitTimer();
+    if (self.bell_audio) |player| {
+        player.destroy();
+        self.bell_audio = null;
+    }
 
     // Out of sight first: below, the terminals of every window shut down
     // one after the other, which takes a moment each.
@@ -2118,6 +2121,12 @@ fn updateConfig(self: *App, config: *const Config) void {
     defer old.deinit();
     self.config = new_config;
     repairWorkingDirectory(&self.config);
+    if (old.changed(&self.config, .@"bell-audio-path") or
+        old.changed(&self.config, .@"bell-audio-volume") or
+        old.changed(&self.config, .@"bell-features"))
+    {
+        if (self.bell_audio) |player| player.invalidate();
+    }
 
     if (self.default_command_stale or
         old.changed(&self.config, .command) or
@@ -2790,7 +2799,8 @@ fn copyTitle(self: *App, surface: *Surface) bool {
 /// The bell of `surface` (BEL, or a finished command with
 /// `notify-on-command-finish-action = bell`), as `bell-features` asks:
 /// `system` plays the Windows default sound, `audio` the
-/// `bell-audio-path` sound (WAV; `bell-audio-volume` does not apply),
+/// `bell-audio-path` sound (mono/stereo PCM or float WAV, scaled by
+/// `bell-audio-volume` before PCM16 playback),
 /// `attention` badges the tab and flashes the taskbar button of a window
 /// in the background, `title` marks the tab with a bell until it is
 /// selected. `border` is not implemented on Windows.
@@ -2822,16 +2832,73 @@ fn flashTaskbarButton(window: *Window) void {
     _ = w32.FlashWindowEx(&info);
 }
 
-/// Play `bell-audio-path` without waiting for it.
+/// Play `bell-audio-path` without waiting for file I/O or playback.
 fn playBellAudio(self: *App) void {
+    if (self.config.@"bell-audio-path" == null) return;
+    const player = self.bell_audio orelse blk: {
+        const player = BellAudio.create(global.io()) catch |err| {
+            log.warn("cannot create bell audio player err={}", .{err});
+            return;
+        };
+        self.bell_audio = player;
+        break :blk player;
+    };
+    self.queueBellAudio(player);
+}
+
+fn queueBellAudio(self: *App, player: anytype) void {
     const path = self.config.@"bell-audio-path" orelse return;
     const text = switch (path) {
         inline else => |p| p,
     };
-    const path_w = wstr.bufZ(&self.bell_audio_path, text);
-    if (PlaySoundW(path_w.ptr, null, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) == 0) {
-        log.warn("cannot play bell-audio-path (Windows plays WAV files only) path={s}", .{text});
+    player.request(text, self.config.@"bell-audio-volume") catch |err| {
+        log.warn("cannot queue bell audio err={}", .{err});
+    };
+}
+
+test "bell audio App playback passes configured relative volume and resolved path" {
+    var app: App = undefined;
+    app.config = try Config.default(std.testing.allocator);
+    defer app.config.deinit();
+    app.config.@"bell-audio-path" = .{ .required = "C:\\isolated\\bell.wav" };
+    const Spy = struct {
+        volume: f64 = -1,
+        path: ?[]const u8 = null,
+        fn request(self: *@This(), path: []const u8, volume: f64) !void {
+            self.path = path;
+            self.volume = volume;
+        }
+    };
+    var spy: Spy = .{};
+    app.queueBellAudio(&spy);
+    try std.testing.expectEqualStrings("C:\\isolated\\bell.wav", spy.path.?);
+    try std.testing.expectEqual(@as(f64, 0.5), spy.volume);
+    for ([_]f64{ 0, 0.01, 0.1, 0.3, 0.75, 1 }) |volume| {
+        app.config.@"bell-audio-volume" = volume;
+        app.queueBellAudio(&spy);
+        try std.testing.expectEqual(volume, spy.volume);
     }
+    app.config.@"bell-audio-path" = null;
+    spy.path = null;
+    app.queueBellAudio(&spy);
+    try std.testing.expect(spy.path == null);
+}
+
+test "bell audio App ring routes the enabled custom feature to a joined silent player" {
+    var app: App = undefined;
+    app.config = try Config.default(std.testing.allocator);
+    defer app.config.deinit();
+    app.bell_audio = null;
+    defer if (app.bell_audio) |player| player.destroy();
+    app.config.@"bell-audio-path" = .{ .required = "C:\\isolated\\not-opened-at-zero-volume.wav" };
+    app.config.@"bell-audio-volume" = 0;
+    app.config.@"bell-features" = .{ .audio = false, .system = false };
+    app.ringBell(null);
+    try std.testing.expect(app.bell_audio == null);
+    app.config.@"bell-features".audio = true;
+    app.ringBell(null);
+    try std.testing.expect(app.bell_audio != null);
+    app.bell_audio.?.invalidate();
 }
 
 /// What a taskbar button shows: a `TBPF_*` state and, for the states with a
@@ -2955,10 +3022,6 @@ pub fn onTaskbarButtonCreated(self: *App, window: *Window) void {
     self.updateTaskbarProgress(window);
 }
 
-const SND_ASYNC: u32 = 0x0001;
-const SND_NODEFAULT: u32 = 0x0002;
-const SND_FILENAME: u32 = 0x00020000;
-extern "winmm" fn PlaySoundW(sound: ?[*:0]const u16, module: ?*anyopaque, flags: u32) callconv(.winapi) i32;
 extern "user32" fn RegisterWindowMessageW(name: [*:0]const u16) callconv(.winapi) u32;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
