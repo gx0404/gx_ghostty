@@ -18,6 +18,7 @@ test {
     _ = @import("win32/Window.zig");
     _ = @import("win32/chrome/Backdrop.zig");
     _ = @import("win32/chrome/TabBar.zig");
+    _ = @import("win32/chrome/alpha.zig");
     _ = @import("win32/chrome/caption_layout.zig");
     _ = @import("win32/clipboard.zig");
     _ = @import("win32/shortcut_conflicts.zig");

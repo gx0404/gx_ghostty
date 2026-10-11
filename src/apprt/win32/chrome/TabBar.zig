@@ -531,8 +531,8 @@ const Colors = struct {
     on_hover: ?d2d.Color,
     /// The ring behind progress.
     track: d2d.Color,
-    active_fill: d2d.Color,
-    /// The opaque strip the fades blend into, or null over a material.
+    active_fill: u32,
+    /// The strip the fades replace towards, or null over a bare material.
     strip: ?d2d.Color,
 };
 
@@ -575,19 +575,7 @@ fn colorsFor(self: *TabBar, ctx: TitleBar.PaintContext) Colors {
     const chrome = self.chromeOf(t);
     const strip_dark = if (ctx.translucent) Backdrop.isDark(config.@"window-theme", config.background) else chrome.dark;
 
-    // The active tab joins the terminal: with per-pixel translucency it
-    // has the terminal's own translucent background.
-    var active_fill = if (@hasField(TitleBar.PaintContext, "tab_fill")) ctx.tab_fill else chrome.active_tab;
-    const see_through = ctx.translucent and Backdrop.perPixel(config, win.app.alpha_frames);
-    if (see_through and !t.high_contrast) {
-        if (@hasDecl(Backdrop, "straightColor")) {
-            active_fill = Backdrop.straightColor(config);
-        } else {
-            const bg = config.background;
-            const f = tab_layout.straightFill(.{ bg.r, bg.g, bg.b }, config.@"background-opacity", config.@"alpha-blending".isLinear());
-            active_fill = .{ .r = f.r, .g = f.g, .b = f.b, .a = f.a };
-        }
-    }
+    const active_fill = ctx.tab_fill;
 
     var c: Colors = undefined;
     if (ctx.translucent and !t.high_contrast) {
@@ -616,7 +604,7 @@ fn colorsFor(self: *TabBar, ctx: TitleBar.PaintContext) Colors {
     }
     // The active tab's text: on its own fill, or over the material when
     // that shows through it.
-    if (active_fill.a < 1) {
+    if (active_fill >> 24 < 255) {
         c.active_text = materialText(strip_dark, if (ctx.active) 0 else 1);
         c.active_program = materialText(strip_dark, 2);
     } else if (ctx.active) {
@@ -778,17 +766,18 @@ fn paintSeparators(self: *TabBar, ctx: TitleBar.PaintContext, g: *const tab_layo
     }
 }
 
-/// A fade of the strip color over the tabs at a scrolled edge: one device
-/// pixel column at a time, from opaque at `edge` to clear inward.
+/// Replace towards the strip at a scrolled edge, including its alpha.
 fn paintFade(canvas: *d2d.Canvas, edge: f32, height: f32, strip: d2d.Color, at_start: bool) void {
+    if (!canvas.beginReplacement(d2d.colorPixel(strip))) return;
     const px_w = canvas.hairline();
     const steps: usize = @intFromFloat(@max(1, @round(fade_width / px_w)));
     for (0..steps) |k| {
         const share = 1 - @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(steps));
         const offset = @as(f32, @floatFromInt(k)) * px_w;
         const x = if (at_start) edge + offset else edge - offset - px_w;
-        canvas.fillRect(.{ .x = x, .y = 0, .w = px_w, .h = height }, strip.withAlpha(strip.a * share * share));
+        canvas.fillRect(.{ .x = x, .y = 0, .w = px_w, .h = height }, d2d.Color.white.withAlpha(share * share));
     }
+    canvas.endReplacement();
 }
 
 fn isHoveredTab(self: *const TabBar, i: usize) bool {
@@ -954,18 +943,20 @@ fn strokeArc(canvas: *d2d.Canvas, cx: f32, cy: f32, r: f32, share: f32, color: d
 /// The active tab: rounded top corners and concave flares at the bottom
 /// so it flows into the terminal below. The outline is kept while the tab
 /// stays where it is.
-fn fillActiveTab(self: *TabBar, canvas: *d2d.Canvas, r: d2d.Rect, color: d2d.Color) void {
+fn fillActiveTab(self: *TabBar, canvas: *d2d.Canvas, r: d2d.Rect, pixel: u32) void {
     const key: [4]f32 = .{ r.x, r.y, r.w, r.h };
     if (self.active_path == null or !std.mem.eql(f32, &key, &self.active_path_key)) {
         if (self.active_path) |*old| old.deinit();
         self.active_path = activeOutline(canvas, r);
         self.active_path_key = key;
     }
+    if (!canvas.beginReplacement(pixel)) return;
     if (self.active_path) |*path| {
-        canvas.fillPath(path, color);
+        canvas.fillPath(path, .white);
     } else {
-        canvas.fillRoundedRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h + tab_radius }, tab_radius, color);
+        canvas.fillRoundedRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h + tab_radius }, tab_radius, .white);
     }
+    canvas.endReplacement();
 }
 
 fn activeOutline(canvas: *d2d.Canvas, r: d2d.Rect) ?d2d.Path {
@@ -2373,6 +2364,255 @@ test "caption colors are consumed without tinting a bare material" {
     applyCaptionColors(&colors, ctx);
     try testing.expectEqual(ctx.tokens.hover_text, colors.hover_text);
     try testing.expectEqual(ctx.tokens.hover_text, colors.on_hover.?);
+}
+
+fn testActivePixel(strip: d2d.Color, rgb: [3]u8, opacity: f64, expected: u32) !void {
+    const factory = try d2d.Factory.create(std.testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    _ = target.ensure(null, 64, 32) orelse return error.CreateDibFailed;
+    try std.testing.expect(canvas.beginDib(&target, .{ .width = 64, .height = 32 }, 96));
+    canvas.clear(strip);
+    var bar: TabBar = .{};
+    defer if (bar.active_path) |*path| path.deinit();
+    const pixel = tab_layout.backgroundPixel(rgb, opacity, true);
+    bar.fillActiveTab(&canvas, .{ .x = 8, .y = 4, .w = 48, .h = 28 }, pixel);
+    try std.testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+    try std.testing.expect(GdiFlush() != 0);
+    const pixels: [*]u32 = @ptrCast(@alignCast(target.bits.?));
+    const actual = pixels[16 * 64 + 32];
+    std.debug.print("ChromeAlpha native expected=0x{x:0>8} actual=0x{x:0>8}\n", .{ expected, actual });
+    try std.testing.expectEqual(expected, actual);
+}
+
+extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
+
+test "ChromeAlpha native light linear active fill matches terminal stored bytes" {
+    try testActivePixel(d2d.Color.black.withAlpha(0), .{ 255, 255, 255 }, 0.3, 0x4d959595);
+}
+
+test "ChromeAlpha native active fill replaces translucent strip without double alpha" {
+    try testActivePixel(d2d.Color.white.withAlpha(0.3), .{ 0, 0, 0 }, 0.3, 0x4d000000);
+}
+
+test "ChromeAlpha native active coverage matches rounded outline at every DPI and opacity" {
+    const testing = std.testing;
+    const alpha = @import("alpha.zig");
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var mask_canvas = d2d.Canvas.init(factory);
+    defer mask_canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    var mask: d2d.DibTarget = .{};
+    defer mask.deinit();
+    var bar: TabBar = .{};
+    defer if (bar.active_path) |*path| path.deinit();
+    const r: d2d.Rect = .{ .x = 24, .y = 4, .w = 80, .h = 36 };
+    for ([_]u32{ 96, 120, 144, 192 }) |dpi| {
+        const s = @as(f32, @floatFromInt(dpi)) / 96;
+        const w = style.px(128, s);
+        const h = style.px(40, s);
+        const size: d2d.SizeU = .{ .width = @intCast(w), .height = @intCast(h) };
+        _ = target.ensure(null, w, h) orelse return error.CreateDibFailed;
+        const mask_dc = mask.ensure(null, w, h) orelse return error.CreateDibFailed;
+        try testing.expect(mask_canvas.beginDcAlpha(mask_dc, .{ .left = 0, .top = 0, .right = w, .bottom = h }, dpi));
+        mask_canvas.clear(d2d.Color.black.withAlpha(0));
+        var outline = activeOutline(&mask_canvas, r) orelse return error.CreateGeometryFailed;
+        defer outline.deinit();
+        mask_canvas.fillPath(&outline, .white);
+        try testing.expectEqual(d2d.EndResult.ok, mask_canvas.finish());
+        try testing.expect(GdiFlush() != 0);
+        const coverage: [*]const u32 = @ptrCast(@alignCast(mask.bits.?));
+        var partial: usize = 0;
+        for (0..@intCast(h)) |y| {
+            for (0..@intCast(w)) |x| {
+                const a = coverage[y * @as(usize, @intCast(mask.width)) + x] >> 24;
+                if (a > 0 and a < 255) partial += 1;
+            }
+        }
+        try testing.expect(partial > 0);
+        for ([_][3]u8{ .{ 0, 0, 0 }, .{ 31, 31, 40 }, .{ 240, 248, 255 }, .{ 255, 255, 255 } }) |rgb| {
+            const tokens = style.Tokens.fromColors(d2d.Color.rgb(rgb[0], rgb[1], rgb[2]), .white, .white);
+            for ([_]f64{ 0, 0.01, 0.1, 0.3, 0.75, 1 }) |opacity| {
+                for ([_]bool{ false, true }) |linear| {
+                    const pixel = tab_layout.backgroundPixel(rgb, opacity, linear);
+                    const strip = tokens.title_bar.withAlpha(@floatCast(opacity));
+                    const below = d2d.colorPixel(strip);
+                    try testing.expect(canvas.beginDib(&target, size, dpi));
+                    canvas.pushClip(.{ .x = 0, .y = 0, .w = 128, .h = 40 });
+                    canvas.clear(strip);
+                    bar.fillActiveTab(&canvas, r, pixel);
+                    canvas.popClip();
+                    try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+                    try testing.expect(GdiFlush() != 0);
+                    const actual: [*]const u32 = @ptrCast(@alignCast(target.bits.?));
+                    const stride: usize = @intCast(target.width);
+                    for (0..@intCast(h)) |y| {
+                        for (0..@intCast(w)) |x| {
+                            const a = coverage[y * @as(usize, @intCast(mask.width)) + x] >> 24;
+                            try testing.expectEqual(alpha.replace(below, pixel, a), actual[y * stride + x]);
+                        }
+                    }
+                    const center: usize = @intCast(style.px(64, s));
+                    try testing.expectEqual(pixel, actual[(@as(usize, @intCast(h)) - 1) * stride + center]);
+                }
+            }
+        }
+    }
+}
+
+fn testChromeScene(canvas: *d2d.Canvas, bar: *TabBar, tokens: style.Tokens, strip: d2d.Color, pixel: u32, dirty: d2d.Rect, state: u2) void {
+    canvas.pushClip(dirty);
+    canvas.clear(strip);
+    canvas.drawText("Inactive", .{ .x = 0, .y = 0, .w = 24, .h = 40 }, .{ .size = 12, .color = tokens.text });
+    bar.fillActiveTab(canvas, .{ .x = 24, .y = 4, .w = 80, .h = 36 }, pixel);
+    const close: d2d.Rect = .{ .x = 78, .y = 10, .w = 24, .h = 24 };
+    if (state > 0) canvas.fillRoundedRect(close, style.radius.control, if (state == 2) tokens.overlay_pressed else tokens.overlay_hover);
+    canvas.drawText("Active", .{ .x = 32, .y = 4, .w = 42, .h = 36 }, .{ .size = 12, .color = tokens.text });
+    canvas.drawIcon(glyph.close, close, close_glyph_size, if (tokens.high_contrast and state > 0) tokens.hover_text else tokens.text);
+    canvas.pushClip(.{ .x = 112, .y = 0, .w = 16, .h = 40 });
+    canvas.clear(d2d.Color.black.withAlpha(0));
+    canvas.popClip();
+    canvas.popClip();
+}
+
+test "ChromeAlpha native dirty repaints preserve glyphs caption transparency and cached DC" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    var bar: TabBar = .{};
+    defer if (bar.active_path) |*path| path.deinit();
+    for ([_]u32{ 96, 120, 144, 192 }) |dpi| {
+        const s = @as(f32, @floatFromInt(dpi)) / 96;
+        const w = style.px(128, s);
+        const h = style.px(40, s);
+        const size: d2d.SizeU = .{ .width = @intCast(w), .height = @intCast(h) };
+        _ = target.ensure(null, w, h) orelse return error.CreateDibFailed;
+        for ([_]bool{ false, true }) |high_contrast| {
+            const tokens = if (high_contrast) style.Tokens.fromSystem(.{
+                .window = .black,
+                .window_text = .white,
+                .highlight = d2d.Color.hex(0x1aebff),
+                .highlight_text = .black,
+                .button_face = .black,
+                .button_text = .white,
+                .gray_text = d2d.Color.hex(0x3ff23f),
+                .hotlight = d2d.Color.hex(0xffff00),
+            }) else style.Tokens.fromColors(d2d.Color.hex(0xf0f8ff), .black, .black);
+            const strip = if (high_contrast) tokens.title_bar else tokens.title_bar.withAlpha(0.3);
+            const pixel = if (high_contrast) d2d.colorPixel(tokens.background) else tab_layout.backgroundPixel(.{ 240, 248, 255 }, 0.3, true);
+            for ([_]u2{ 0, 1, 2 }) |state| {
+                try testing.expect(canvas.beginDib(&target, size, dpi));
+                testChromeScene(&canvas, &bar, tokens, strip, pixel, .{ .x = 0, .y = 0, .w = 128, .h = 40 }, state);
+                try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+                try testing.expect(GdiFlush() != 0);
+                const pixels: [*]const u32 = @ptrCast(@alignCast(target.bits.?));
+                const len: usize = @intCast(target.width * target.height);
+                const saved = try testing.allocator.dupe(u32, pixels[0..len]);
+                defer testing.allocator.free(saved);
+                const dc = canvas.dib_stage.dc;
+                const bitmap = canvas.dib_stage.bitmap;
+                const caption_x: usize = @intCast(style.px(120, s));
+                try testing.expectEqual(@as(u32, 0), pixels[caption_x]);
+                var glyph_pixels: usize = 0;
+                for (0..@intCast(h)) |y| {
+                    for (@as(usize, @intCast(style.px(32, s)))..@intCast(style.px(74, s))) |x| {
+                        if (pixels[y * @as(usize, @intCast(target.width)) + x] != pixel and y > @as(usize, @intCast(style.px(12, s)))) glyph_pixels += 1;
+                    }
+                }
+                try testing.expect(glyph_pixels > 0);
+                for (0..5) |_| {
+                    try testing.expect(canvas.beginDib(&target, size, dpi));
+                    testChromeScene(&canvas, &bar, tokens, strip, pixel, .{ .x = 46 / s, .y = 6 / s, .w = 44 / s, .h = 30 / s }, state);
+                    try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+                    try testing.expect(GdiFlush() != 0);
+                    try testing.expectEqualSlices(u32, saved, pixels[0..len]);
+                    try testing.expectEqual(dc, canvas.dib_stage.dc);
+                    try testing.expectEqual(bitmap, canvas.dib_stage.bitmap);
+                }
+            }
+        }
+    }
+}
+
+test "ChromeAlpha native replacement leaves neighboring antialiased glyphs outside coverage" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    _ = target.ensure(null, 128, 40) orelse return error.CreateDibFailed;
+    var bar: TabBar = .{};
+    defer if (bar.active_path) |*path| path.deinit();
+    const strip = d2d.Color.black.withAlpha(0.3);
+    try testing.expect(canvas.beginDib(&target, .{ .width = 128, .height = 40 }, 96));
+    canvas.clear(strip);
+    canvas.drawText("Neighbor W", .{ .x = 0, .y = 0, .w = 40, .h = 24 }, .{ .size = 16, .color = .white });
+    try testing.expect(canvas.beginReplacement(0));
+    canvas.endReplacement();
+    const pixels: [*]const u32 = @ptrCast(@alignCast(target.bits.?));
+    var saved: [128 * 40]u32 = undefined;
+    @memcpy(&saved, pixels[0..saved.len]);
+    bar.fillActiveTab(&canvas, .{ .x = 24, .y = 4, .w = 80, .h = 36 }, 0x4d959595);
+    try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+    try testing.expect(GdiFlush() != 0);
+    var antialiased: usize = 0;
+    for (0..24) |y| {
+        for (0..24) |x| {
+            const old = saved[y * 128 + x];
+            try testing.expectEqual(old, pixels[y * 128 + x]);
+            if (old >> 24 > 77 and old >> 24 < 255) antialiased += 1;
+        }
+    }
+    try testing.expect(antialiased > 0);
+    try testing.expectEqual(@as(u32, 0x4d959595), pixels[39 * 128 + 64]);
+}
+
+test "ChromeAlpha native fade replaces strip alpha without accumulating underlay" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    for ([_]u32{ 96, 120, 144, 192 }) |dpi| {
+        const s = @as(f32, @floatFromInt(dpi)) / 96;
+        const w = style.px(64, s);
+        const h = style.px(16, s);
+        _ = target.ensure(null, w, h) orelse return error.CreateDibFailed;
+        for ([_]f32{ 0, 0.01, 0.1, 0.3, 0.75, 1 }) |opacity| {
+            const strip = d2d.Color.white.withAlpha(opacity);
+            const pixel = d2d.colorPixel(strip);
+            for ([_]bool{ false, true }) |blank| {
+                try testing.expect(canvas.beginDib(&target, .{ .width = @intCast(w), .height = @intCast(h) }, dpi));
+                canvas.clear(if (blank) strip else d2d.Color.black.withAlpha(opacity));
+                paintFade(&canvas, 0, 16, strip, true);
+                paintFade(&canvas, 64, 16, strip, false);
+                try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+                try testing.expect(GdiFlush() != 0);
+                const pixels: [*]const u32 = @ptrCast(@alignCast(target.bits.?));
+                try testing.expectEqual(pixel, pixels[0]);
+                try testing.expectEqual(pixel, pixels[@intCast(w - 1)]);
+                for (0..@intCast(w)) |x| {
+                    try testing.expectEqual(pixel >> 24, pixels[x] >> 24);
+                    if (blank) try testing.expectEqual(pixel, pixels[x]);
+                }
+            }
+        }
+    }
 }
 
 test {

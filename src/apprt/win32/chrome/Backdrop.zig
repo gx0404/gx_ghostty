@@ -7,8 +7,8 @@
 //! Materials: `mica`, `acrylic` and `tabbed` set `DWMWA_SYSTEMBACKDROP_TYPE`
 //! (Windows 11 22H2, build 22621, and later; older systems fall back to
 //! `solid` and log it). `extendFrame` extends the frame over the title bar
-//! row, which `TitleBar` draws with per-pixel alpha (transparent strip and
-//! inactive tabs, opaque active tab). DWM then draws its own caption
+//! row, which `TitleBar` draws with per-pixel alpha (the strip and inactive
+//! tabs show the material; active tabs follow terminal opacity). DWM draws its caption
 //! buttons in that row, so the title bar uses them instead of its
 //! custom-drawn ones (`TitleBar.nativeButtons`).
 //!
@@ -273,37 +273,10 @@ pub fn fillOpaque(hdc: w32.HDC, rect: w32.RECT, color: Config.Color) void {
     fillPixels(hdc, rect, premultiplied(color, 1, false));
 }
 
-/// The terminal background as a straight (not premultiplied) color for
-/// Direct2D drawing into a premultiplied target that DWM composes per
-/// pixel (the title bar): Direct2D premultiplies it into exactly the pixel
-/// the renderers write for the background (`fillBackground`), so an active
-/// tab filled with it joins the terminal below without a seam. Channels
-/// the linear-light premultiplication of a light background at a low
-/// opacity pushes above its alpha are clamped.
-pub fn straightColor(config: *const Config) d2d.Color {
-    return straight(premultiplied(
-        config.background,
-        config.@"background-opacity",
-        config.@"alpha-blending".isLinear(),
-    ));
-}
-
-/// The straight color of the premultiplied BGRA `pixel`.
-fn straight(pixel: u32) d2d.Color {
-    const a8 = pixel >> 24;
-    if (a8 == 0) return .{ .r = 0, .g = 0, .b = 0, .a = 0 };
-    const a: f32 = @floatFromInt(a8);
-    const Channel = struct {
-        fn f(value: u32, alpha: f32) f32 {
-            return @min(@as(f32, @floatFromInt(value & 0xff)) / alpha, 1);
-        }
-    };
-    return .{
-        .r = Channel.f(pixel >> 16, a),
-        .g = Channel.f(pixel >> 8, a),
-        .b = Channel.f(pixel, a),
-        .a = a / 255,
-    };
+/// Stored BGRA of the terminal background, including linear-light channels
+/// above alpha. Draw it with `Canvas.beginDib`'s coverage replacement.
+pub fn backgroundPixel(config: *const Config) u32 {
+    return premultiplied(config.background, config.@"background-opacity", config.@"alpha-blending".isLinear());
 }
 
 /// GDI writes no alpha (a `FillRect` in a window DWM composes per pixel
@@ -344,29 +317,8 @@ pub fn releaseFillCache() void {
 /// OpenGL renderer writes it: the alpha quantized to 8 bits first, and
 /// with `linear` the color multiplied in linear light, then encoded as
 /// sRGB again.
-fn premultiplied(color: Config.Color, alpha: f64, linear: bool) u32 {
-    const a8: u32 = @intFromFloat(@round(std.math.clamp(alpha, 0, 1) * 255));
-    const a = @as(f64, @floatFromInt(a8)) / 255;
-    const Channel = struct {
-        a: f64,
-        linear: bool,
-
-        fn f(self: @This(), value: u8) u32 {
-            const c = @as(f64, @floatFromInt(value)) / 255;
-            const p = if (self.linear) linearToSrgb(srgbToLinear(c) * self.a) else c * self.a;
-            return @intFromFloat(@round(p * 255));
-        }
-    };
-    const ch: Channel = .{ .a = a, .linear = linear };
-    return (a8 << 24) | (ch.f(color.r) << 16) | (ch.f(color.g) << 8) | ch.f(color.b);
-}
-
-fn srgbToLinear(v: f64) f64 {
-    return if (v <= 0.04045) v / 12.92 else std.math.pow(f64, (v + 0.055) / 1.055, 2.4);
-}
-
-fn linearToSrgb(v: f64) f64 {
-    return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f64, v, 1.0 / 2.4) - 0.055;
+fn premultiplied(color: Config.Color, opacity: f64, linear: bool) u32 {
+    return @import("alpha.zig").backgroundPixel(.{ color.r, color.g, color.b }, opacity, linear);
 }
 
 /// The accent blur only applies to the solid material: the system
@@ -662,42 +614,50 @@ test premultiplied {
     try testing.expectEqual(@as(u32, 0xcc1b1b23), premultiplied(.{ .r = 0x1f, .g = 0x1f, .b = 0x28 }, 0.8, true));
 }
 
-/// What Direct2D writes into a premultiplied target for the straight
-/// `color`: each channel times alpha, rounded to 8 bits.
-fn premultiplyLikeDirect2D(color: d2d.Color) u32 {
-    const a8: u32 = @intFromFloat(@round(color.a * 255));
-    const ch = struct {
-        fn f(c: f32, a: f32) u32 {
-            return @intFromFloat(@round(c * a * 255));
-        }
-    };
-    return (a8 << 24) | (ch.f(color.r, color.a) << 16) | (ch.f(color.g, color.a) << 8) | ch.f(color.b, color.a);
+test "ChromeAlpha light linear fill retains channels above alpha" {
+    const pixel = premultiplied(.{ .r = 255, .g = 255, .b = 255 }, 0.3, true);
+    try std.testing.expectEqual(@as(u32, 0x4d959595), pixel);
+    try std.testing.expect((pixel & 255) > pixel >> 24);
 }
 
-test straight {
+test "ChromeAlpha native DIB replacement matches background tile bytes" {
     const testing = std.testing;
-    // Painted with Direct2D, the straight color gives the renderer's pixel
-    // back: the active tab and the terminal background match exactly.
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    var tile: d2d.DibTarget = .{};
+    defer tile.deinit();
+    defer releaseFillCache();
+    _ = target.ensure(null, 16, 16) orelse return error.CreateDibFailed;
+    const tile_dc = tile.ensure(null, 16, 16) orelse return error.CreateDibFailed;
+    const rect: w32.RECT = .{ .left = 0, .top = 0, .right = 16, .bottom = 16 };
     const backgrounds = [_]Config.Color{
-        .{ .r = 0x1f, .g = 0x1f, .b = 0x28 }, // GX Mocha
-        .{ .r = 0x1e, .g = 0x1e, .b = 0x2e },
-        .{ .r = 0x00, .g = 0x00, .b = 0x00 },
-        .{ .r = 0x28, .g = 0x2c, .b = 0x34 },
+        .{ .r = 31, .g = 31, .b = 40 },
+        .{ .r = 240, .g = 248, .b = 255 },
+        .{ .r = 0, .g = 0, .b = 0 },
+        .{ .r = 255, .g = 255, .b = 255 },
     };
     for (backgrounds) |bg| {
-        for ([_]f64{ 0.3, 0.75, 0.8, 1 }) |opacity| {
+        for ([_]f64{ 0, 0.01, 0.1, 0.3, 0.75, 1 }) |opacity| {
             for ([_]bool{ true, false }) |linear| {
                 const pixel = premultiplied(bg, opacity, linear);
-                try testing.expectEqual(pixel, premultiplyLikeDirect2D(straight(pixel)));
+                fillPixels(tile_dc, rect, pixel);
+                try testing.expect(canvas.beginDib(&target, .{ .width = 16, .height = 16 }, 96));
+                canvas.clear(d2d.Color.white.withAlpha(0.3));
+                try testing.expect(canvas.beginReplacement(pixel));
+                canvas.fillRect(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, .white);
+                canvas.endReplacement();
+                try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+                try testing.expect(GdiFlush() != 0);
+                const painted: [*]const u32 = @ptrCast(@alignCast(target.bits.?));
+                const tiled: [*]const u32 = @ptrCast(@alignCast(tile.bits.?));
+                try testing.expectEqualSlices(u32, tiled[0..256], painted[0..256]);
             }
         }
     }
-    try testing.expectEqual(@as(f32, 0.8), straight(0xcc1b1b23).a);
-    try testing.expectEqual(d2d.Color{ .r = 0, .g = 0, .b = 0, .a = 0 }, straight(0));
-    // A light background at a low opacity in linear light has channels
-    // above its alpha, which a straight color cannot reach: clamped.
-    const light = straight(premultiplied(.{ .r = 0xff, .g = 0xff, .b = 0xff }, 0.3, true));
-    try testing.expectEqual(@as(f32, 1), light.r);
 }
 
 test "background tiles reuse their DC and bitmap across rectangles and colors" {
