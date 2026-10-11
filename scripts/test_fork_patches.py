@@ -1019,6 +1019,37 @@ class GxCssGeneratorTests(unittest.TestCase):
             self.assertTrue(any("unclosed call" in problem for problem in gx_css_problems(root)))
 
 
+class Gx0030ShapeTests(unittest.TestCase):
+    def test_optional_hooks_bracket_only_user_mutations(self):
+        expected = {
+            "src/Surface.zig": 5,
+            "src/termio/Termio.zig": 2,
+        }
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for rel, count in expected.items():
+            with self.subTest(rel):
+                self.assertIn(Patch("GX-0030", rel, "fork(gx): GX-0030", "active"), patches)
+                source = (ROOT / rel).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0030")
+                self.assertEqual(len(hunks), count * 2)
+                self.assertNotIn("gxUserScrolled", stripped)
+                self.assertNotIn("gx_before", stripped)
+                self.assertEqual(source.count("const gx_before = if (comptime @hasDecl(apprt.Surface,"), count)
+                self.assertEqual(source.count(".gxUserScrolled(gx_before,"), count)
+                for forbidden in ("ShowWindow", "PostMessage"):
+                    for begin, end in hunks:
+                        self.assertNotIn(forbidden, "\n".join(source.splitlines()[begin:end + 1]))
+                lines = source.splitlines()
+                for before, after in zip(hunks[::2], hunks[1::2]):
+                    mutation = "\n".join(lines[before[1] + 1:after[0]])
+                    self.assertTrue(any(call in mutation for call in
+                                        ("autoscrollTick(", ".scrollViewport(", ".scroll(")), mutation)
+                    self.assertNotIn("queueIo(", mutation)
+                    self.assertNotIn(".unlock(", mutation)
+        termio = (ROOT / "src/termio/Termio.zig").read_text(encoding="utf-8")
+        self.assertEqual(termio.count("self.surface_mailbox.surface.rt_surface.gxUserScrolled("), 2)
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则

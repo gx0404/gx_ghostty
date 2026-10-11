@@ -65,6 +65,7 @@ pub const ui_color = @import("ui_color.zig");
 pub const ui_tokens = @import("ui_tokens.zig");
 pub const unread = @import("unread.zig");
 pub const url_policy = @import("url_policy.zig");
+pub const viewport_activity = @import("viewport_activity.zig");
 pub const win32_input = @import("win32_input.zig");
 pub const window_state = @import("window_state.zig");
 
@@ -101,6 +102,7 @@ test {
     _ = ui_tokens;
     _ = unread;
     _ = url_policy;
+    _ = viewport_activity;
     _ = win32_input;
     _ = window_state;
 }

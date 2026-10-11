@@ -3197,6 +3197,7 @@ fn tick(self: *App) void {
     self.core_app.tick(self) catch |err| {
         log.err("core app tick error: {}", .{err});
     };
+    for (self.core_app.surfaces.items) |surface| surface.drainScrollbarActivity();
 }
 
 /// Window procedure for terminal surface child HWNDs (GhosttyTerminal class).
@@ -3241,7 +3242,7 @@ fn surfaceWndProc(
         },
 
         w32.WM_SHOWWINDOW => {
-            if (surface.scrollbar) |sb| sb.setOwnerVisible(wparam != 0);
+            surface.onShowWindow(wparam != 0);
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
@@ -3838,4 +3839,53 @@ test "quick terminal tab profiles are rejected before shell detection" {
     var window: Window = .{ .app = &app, .is_quick_terminal = true };
     try std.testing.expect(!app.openProfile(&window, "cmd", .tab));
     try std.testing.expect(!app.performGx(&window, .{ .new_tab_profile = "cmd" }));
+}
+
+test "D11: native wakeup dispatch drains the GUI snapshot and rearms" {
+    const testing = std.testing;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = testing.allocator;
+    core_app.mailbox = .{};
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(testing.allocator);
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.wakeup_pending = .init(false);
+    app.msg_hwnd = null;
+    var surface: Surface = .{ .app = &app, .core_surface_ready = true };
+    const core_surface = &surface.core_surface;
+    core_surface.io.terminal = try @import("../../terminal/main.zig").Terminal.init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+    defer core_surface.io.terminal.deinit(testing.allocator);
+    for (0..99) |_| try core_surface.io.terminal.linefeed();
+    var mutex: std.Io.Mutex = .init;
+    core_surface.renderer_state = .{ .mutex = &mutex, .terminal = &core_surface.io.terminal };
+    core_surface.rt_surface = &surface;
+    core_surface.io.renderer_state = &core_surface.renderer_state;
+    core_surface.io.surface_mailbox = .{ .surface = core_surface, .app = undefined };
+    surface.scrollbar_activity.setAccepting(true);
+    try core_app.surfaces.append(testing.allocator, &surface);
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyD11WakeTest");
+    var wc = std.mem.zeroes(w32.WNDCLASSEXW);
+    wc.cbSize = @sizeOf(w32.WNDCLASSEXW);
+    wc.lpfnWndProc = msgWndProc;
+    wc.lpszClassName = class;
+    try testing.expect(w32.RegisterClassExW(&wc) != 0);
+    const hwnd = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+    app.msg_hwnd = hwnd;
+    _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    for ([_]isize{ -1, 1 }) |delta| {
+        const scroll: @import("../../terminal/main.zig").Terminal.ScrollViewport = .{ .delta = delta };
+        const worker = try std.Thread.spawn(.{}, @import("../../termio.zig").Termio.scrollViewport, .{ &core_surface.io, scroll });
+        worker.join();
+        app.wakeup();
+        try testing.expect(app.wakeup_pending.load(.acquire));
+        var msg: w32.MSG = undefined;
+        try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_WAKEUP, WM_APP_WAKEUP, w32.PM_REMOVE) != 0);
+        _ = w32.DispatchMessageW(&msg);
+        try testing.expect(!app.wakeup_pending.load(.acquire));
+        try testing.expect(!surface.scrollbar_activity.pending);
+        try testing.expectEqual(@as(usize, if (delta < 0) 75 else 76), surface.scrollbar_state.offset);
+        try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_WAKEUP, WM_APP_WAKEUP, w32.PM_REMOVE) == 0);
+    }
 }
