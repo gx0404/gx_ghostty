@@ -2836,7 +2836,7 @@ fn flashTaskbarButton(window: *Window) void {
 fn playBellAudio(self: *App) void {
     if (self.config.@"bell-audio-path" == null) return;
     const player = self.bell_audio orelse blk: {
-        const player = BellAudio.create(global.io()) catch |err| {
+        const player = BellAudio.create() catch |err| {
             log.warn("cannot create bell audio player err={}", .{err});
             return;
         };
@@ -2851,8 +2851,9 @@ fn queueBellAudio(self: *App, player: anytype) void {
     const text = switch (path) {
         inline else => |p| p,
     };
-    player.request(text, self.config.@"bell-audio-volume") catch |err| {
-        log.warn("cannot queue bell audio err={}", .{err});
+    player.request(text, self.config.@"bell-audio-volume") catch |err| switch (err) {
+        error.PlayerFaulted, error.PlayerStopped => {},
+        else => log.warn("cannot queue bell audio err={}", .{err}),
     };
 }
 
