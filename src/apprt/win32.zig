@@ -56,4 +56,5 @@ test {
     _ = @import("win32/ui/SearchBar.zig");
     _ = @import("win32/chrome/TitleBar.zig");
     _ = @import("win32/ui/Tooltip.zig");
+    _ = @import("win32/chrome/tab_layout.zig");
 }
