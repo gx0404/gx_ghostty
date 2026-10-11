@@ -3317,6 +3317,11 @@ fn surfaceWndProc(
             return 0;
         },
 
+        Surface.WM_APP_CONFIRM_CLIPBOARD => {
+            surface.confirmClipboard();
+            return 0;
+        },
+
         Surface.WM_APP_CHILD_EXITED => {
             _ = showChildExited(surface.parent_window, @truncate(wparam));
             return 0;
@@ -3361,30 +3366,13 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Fill with the configured background color (at the
-            // background opacity when DWM composes the window per pixel)
-            // to prevent a visible flash during resize. The OpenGL
-            // renderer will overwrite the entire client area on the next
-            // frame.
-            const hdc_erase: w32.HDC = @ptrFromInt(wparam);
-            var rect: w32.RECT = undefined;
-            if (w32.GetClientRect(hwnd, &rect) != 0) {
-                const config = &surface.app.config;
-                if (Backdrop.perPixel(config, surface.app.alpha_frames)) {
-                    Backdrop.fillBackground(hdc_erase, rect, config);
-                } else if (surface.app.bg_brush) |brush| {
-                    _ = w32.FillRect(hdc_erase, &rect, brush);
-                }
-            }
+            surface.eraseBackground(@ptrFromInt(wparam));
             return 1;
         },
 
         w32.WM_PAINT => {
-            // Validate the paint region to stop Windows from
-            // sending more WM_PAINT messages, then wake the
-            // renderer thread to redraw.
             _ = w32.ValidateRect(hwnd, null);
-            if (surface.core_surface_ready) {
+            if (surface.core_surface_ready and !surface.in_live_resize) {
                 surface.core_surface.renderer_thread.wakeup.notify() catch {};
             }
             return 0;
@@ -3465,6 +3453,10 @@ fn surfaceWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, cleared);
         },
 
+        w32.WM_IME_REQUEST => {
+            return surface.handleImeRequest(wparam, lparam) orelse w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_IME_STARTCOMPOSITION => {
             surface.handleImeStartComposition();
             // Consume: we draw the composition inline; no default window.
@@ -3538,13 +3530,18 @@ fn surfaceWndProc(
             return 0;
         },
 
+        w32.WM_MOUSELEAVE => {
+            surface.handleMouseLeave();
+            return 0;
+        },
+
         w32.WM_MOUSEWHEEL => {
-            surface.handleMouseWheel(wparam, .vertical);
+            surface.handleMouseWheel(wparam, lparam, .vertical);
             return 0;
         },
 
         w32.WM_MOUSEHWHEEL => {
-            surface.handleMouseWheel(wparam, .horizontal);
+            surface.handleMouseWheel(wparam, lparam, .horizontal);
             // TRUE: some mouse drivers (Logitech) send the following tilt
             // messages only to windows that answer TRUE.
             return 1;

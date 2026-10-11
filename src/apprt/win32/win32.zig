@@ -1804,3 +1804,65 @@ pub const DWMWA_CLOAK: u32 = 13;
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 pub const DWMWCP_DONOTROUND: u32 = 1;
 pub const DWMWCP_ROUND: u32 = 2;
+
+// R2-Surface
+// -----------------------------------------------------------------------
+// Terminal surface: clipboard formats, cursors, mouse wheel flags,
+// waitable timers and IME queries.
+// -----------------------------------------------------------------------
+
+pub extern "user32" fn RegisterClipboardFormatW(
+    lpszFormat: [*:0]const u16,
+) callconv(.winapi) u32;
+
+pub extern "kernel32" fn GlobalSize(
+    hMem: *anyopaque,
+) callconv(.winapi) usize;
+
+pub const IDC_HELP: usize = 32651;
+
+pub extern "user32" fn WindowFromPoint(point: POINT) callconv(.winapi) ?HWND;
+
+// WM_MOUSEWHEEL / WM_MOUSEMOVE wParam key flags.
+pub const MK_SHIFT: usize = 0x0004;
+pub const MK_CONTROL: usize = 0x0008;
+
+// The extra key of 102-key keyboards (`<>|` left of Z on ISO layouts).
+pub const VK_OEM_102: u16 = 0xE2;
+
+pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x00000002;
+pub const TIMER_ALL_ACCESS: u32 = 0x001F0003;
+
+pub extern "kernel32" fn CreateWaitableTimerExW(
+    lpTimerAttributes: ?*anyopaque,
+    lpTimerName: ?[*:0]const u16,
+    dwFlags: u32,
+    dwDesiredAccess: u32,
+) callconv(.winapi) ?HANDLE;
+
+/// `lpDueTime` is in 100 ns units: negative for a time relative to now.
+pub extern "kernel32" fn SetWaitableTimer(
+    hTimer: HANDLE,
+    lpDueTime: *const i64,
+    lPeriod: i32,
+    pfnCompletionRoutine: ?*const anyopaque,
+    lpArgToCompletionRoutine: ?*anyopaque,
+    fResume: i32,
+) callconv(.winapi) i32;
+
+pub extern "kernel32" fn CancelWaitableTimer(hTimer: HANDLE) callconv(.winapi) i32;
+
+pub const WM_IME_REQUEST: u32 = 0x0288;
+pub const IMR_QUERYCHARPOSITION: usize = 0x0006;
+
+/// The answer to `IMR_QUERYCHARPOSITION`: where character `dwCharPos` of
+/// the composition is, in screen coordinates.
+pub const IMECHARPOSITION = extern struct {
+    dwSize: u32,
+    dwCharPos: u32,
+    /// The top-left corner of the character.
+    pt: POINT,
+    cLineHeight: u32,
+    /// The editable area.
+    rcDocument: RECT,
+};
