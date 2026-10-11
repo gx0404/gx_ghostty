@@ -1042,3 +1042,10 @@ msgstr "超级用户会话"
 
 msgid "Container session"
 msgstr "容器会话"
+
+#. Search bar: the message when it cannot open without Direct2D
+msgid "Find"
+msgstr "查找"
+
+msgid "Find is not available: Direct2D could not be started."
+msgstr "查找不可用：无法启动 Direct2D。"

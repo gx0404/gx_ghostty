@@ -198,6 +198,8 @@ pub const entries = [_]Entry{
     .{ .key = "Execute a command…", .msgstr = "选择要执行的命令…" },
     .{ .key = "Export", .msgstr = "导出" },
     .{ .key = "Export Terminal IO Events", .msgstr = "导出终端 IO 事件" },
+    .{ .key = "Find", .msgstr = "查找" },
+    .{ .key = "Find is not available: Direct2D could not be started.", .msgstr = "查找不可用：无法启动 Direct2D。" },
     .{ .key = "Find…", .msgstr = "查找…" },
     .{ .key = "Fish", .msgstr = "Fish" },
     .{ .key = "Focus Follows Mouse", .msgstr = "焦点跟随鼠标" },

@@ -51,4 +51,7 @@ test {
     _ = @import("win32/ui/Settings.zig");
     _ = @import("win32/ui/settings/draw.zig");
     _ = @import("win32/QuickTerminal.zig");
+    _ = @import("win32/ui/LinkPreview.zig");
+    _ = @import("win32/ui/ResizeOverlay.zig");
+    _ = @import("win32/ui/SearchBar.zig");
 }
