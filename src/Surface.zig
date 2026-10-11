@@ -1267,6 +1267,9 @@ fn selectionScrollTick(self: *Surface) !void {
     defer self.renderer_state.mutex.unlock(global.io());
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
+    // fork(gx): GX-0030 begin: snapshot the user mutation under the terminal lock
+    const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) t.screens.active.pages.scrollbar() else terminal.Scrollbar.zero;
+    // fork(gx): GX-0030 end
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
         .viewport = pos_vp,
         .xpos = pos.x,
@@ -1280,6 +1283,9 @@ fn selectionScrollTick(self: *Surface) !void {
             .screen_height = self.size.screen.height,
         },
     });
+    // fork(gx): GX-0030 begin: finish before queueIo can temporarily unlock
+    if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.rt_surface.gxUserScrolled(gx_before, t.screens.active.pages.scrollbar());
+    // fork(gx): GX-0030 end
 
     // If we're no longer autoscrolling for whatever reason, disable it.
     if (self.mouse.selection_gesture.left_drag_autoscroll == .none) {
@@ -3786,7 +3792,13 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
+            // fork(gx): GX-0030 begin: observe actual wheel scrolling, not mouse reports
+            const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.io.terminal.screens.active.pages.scrollbar() else terminal.Scrollbar.zero;
+            // fork(gx): GX-0030 end
             self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            // fork(gx): GX-0030 begin
+            if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.rt_surface.gxUserScrolled(gx_before, self.io.terminal.screens.active.pages.scrollbar());
+            // fork(gx): GX-0030 end
         }
     }
 
@@ -5408,7 +5420,13 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 self.renderer_state.mutex.lockUncancelable(global.io());
                 defer self.renderer_state.mutex.unlock(global.io());
                 const t: *terminal.Terminal = self.renderer_state.terminal;
+                // fork(gx): GX-0030 begin
+                const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) t.screens.active.pages.scrollbar() else terminal.Scrollbar.zero;
+                // fork(gx): GX-0030 end
                 t.screens.active.scroll(.{ .row = n });
+                // fork(gx): GX-0030 begin
+                if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.rt_surface.gxUserScrolled(gx_before, t.screens.active.pages.scrollbar());
+                // fork(gx): GX-0030 end
             }
 
             try self.queueRender();
@@ -5420,7 +5438,13 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 defer self.renderer_state.mutex.unlock(global.io());
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
+                // fork(gx): GX-0030 begin
+                const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.io.terminal.screens.active.pages.scrollbar() else terminal.Scrollbar.zero;
+                // fork(gx): GX-0030 end
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
+                // fork(gx): GX-0030 begin
+                if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.rt_surface.gxUserScrolled(gx_before, self.io.terminal.screens.active.pages.scrollbar());
+                // fork(gx): GX-0030 end
             }
 
             try self.queueRender();
@@ -5845,7 +5869,13 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 else
                     sel.end().up(screen.pages.rows - 1) orelse sel.end();
 
+                // fork(gx): GX-0030 begin
+                const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) screen.pages.scrollbar() else terminal.Scrollbar.zero;
+                // fork(gx): GX-0030 end
                 screen.scroll(.{ .pin = target });
+                // fork(gx): GX-0030 begin
+                if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.rt_surface.gxUserScrolled(gx_before, screen.pages.scrollbar());
+                // fork(gx): GX-0030 end
             }
 
             // Queue a render so its shown

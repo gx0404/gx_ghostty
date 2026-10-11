@@ -188,6 +188,9 @@ scrollbar_enabled: bool = false,
 scrollbar_mode: @import("Scrollbar.zig").Mode = .overlay,
 scrollbar_state: terminal.Scrollbar = .zero,
 scrollbar_fg: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 },
+scrollbar_owner_visible: bool = true,
+/// Protected by renderer_state.mutex; kept until core threads are joined.
+scrollbar_activity: @import("../../gx/viewport_activity.zig").Pending = .{},
 
 /// The current mouse cursor. Cached so WM_SETCURSOR can restore it
 /// (DefWindowProc resets the cursor to the class cursor on every
@@ -436,9 +439,11 @@ pub fn initWithOptions(
     // (triggered by ShowWindow etc.) must be ignored.
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
+    self.updateScrollbarGate();
 }
 
 pub fn deinit(self: *Surface) void {
+    self.setScrollbarOwnerVisible(false);
     self.core_surface_ready = false;
     self.first_frame_hwnd.store(0, .release);
     if (self.core_surface_initialized) {
@@ -576,7 +581,7 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     if (!state.render and self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);
     if (!state.popups) self.link_preview.hide();
     self.search_bar.setOwnerVisible(state.popups);
-    if (self.scrollbar) |sb| sb.setOwnerVisible(state.popups);
+    self.setScrollbarOwnerVisible(state.popups);
     if (!self.core_surface_ready) return;
     if (self.last_reported_visible == state.render) return;
     self.last_reported_visible = state.render;
@@ -1358,6 +1363,7 @@ pub fn onConfigChange(self: *Surface, config: *const configpkg.Config) void {
     self.erase_linear = config.@"alpha-blending".isLinear();
     const reserved = self.scrollbarReservedWidth();
     self.scrollbar_enabled = config.scrollbar != .never;
+    self.updateScrollbarGate();
     self.scrollbar_mode = @import("Scrollbar.zig").readMode();
     self.scrollbar_fg = config.foreground.toTerminalRGB();
     if (!self.scrollbar_enabled) {
@@ -1397,12 +1403,61 @@ pub fn eraseBackground(self: *Surface, hdc: w32.HDC) void {
     }
 }
 
-/// Update the themed scrollbar to reflect the terminal's scroll state.
-/// Called from performAction(.scrollbar) when the viewport changes.
+/// Reports may be older than input already executed on the IO thread.
 pub fn setScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
-    self.scrollbar_state = scrollbar;
+    _ = scrollbar;
+    if (!self.core_surface_ready) return;
+    const state = &self.core_surface.renderer_state;
+    const snapshot = snapshot: {
+        state.lockDemand(global.io());
+        defer state.unlockDemand(global.io());
+        break :snapshot state.terminal.screens.active.pages.scrollbar();
+    };
+    self.syncScrollbar(snapshot);
+}
+
+/// Caller holds renderer_state.mutex. This hook only records and posts.
+pub fn gxUserScrolled(self: *Surface, before: terminal.Scrollbar, after: terminal.Scrollbar) void {
+    if (self.scrollbar_activity.record(before, after)) self.app.wakeup();
+}
+
+pub fn drainScrollbarActivity(self: *Surface) void {
+    const snapshot = self.takeScrollbarActivity() orelse return;
+    self.syncScrollbar(snapshot);
+    if (self.scrollbar) |sb| sb.userScrolled();
+}
+
+fn takeScrollbarActivity(self: *Surface) ?terminal.Scrollbar {
+    if (!self.core_surface_ready) return null;
+    const state = &self.core_surface.renderer_state;
+    state.lockDemand(global.io());
+    defer state.unlockDemand(global.io());
+    if (!self.scrollbar_activity.take()) return null;
+    return state.terminal.screens.active.pages.scrollbar();
+}
+
+fn syncScrollbar(self: *Surface, snapshot: terminal.Scrollbar) void {
+    self.scrollbar_state = snapshot;
     self.ensureScrollbar();
-    if (self.scrollbar) |sb| sb.update(scrollbar);
+    if (self.scrollbar) |sb| sb.update(snapshot);
+}
+
+fn updateScrollbarGate(self: *Surface) void {
+    if (!self.core_surface_ready) return;
+    const state = &self.core_surface.renderer_state;
+    state.lockDemand(global.io());
+    defer state.unlockDemand(global.io());
+    self.scrollbar_activity.setAccepting(self.scrollbar_enabled and self.scrollbar_owner_visible);
+}
+
+pub fn onShowWindow(self: *Surface, showing: bool) void {
+    self.setScrollbarOwnerVisible(self.visibilityState(showing).popups);
+}
+
+fn setScrollbarOwnerVisible(self: *Surface, visible: bool) void {
+    self.scrollbar_owner_visible = visible;
+    self.updateScrollbarGate();
+    if (self.scrollbar) |sb| sb.setOwnerVisible(visible);
 }
 
 fn ensureScrollbar(self: *Surface) void {
@@ -1414,9 +1469,9 @@ fn ensureScrollbar(self: *Surface) void {
     };
     const sb = self.scrollbar.?;
     self.scrollbar_mode = sb.mode;
+    sb.setOwnerVisible(self.scrollbar_owner_visible);
     sb.setTheme(self.erase_color.toTerminalRGB(), self.scrollbar_fg);
     sb.update(self.scrollbar_state);
-    if (self.last_reported_visible == false) sb.setOwnerVisible(false);
 }
 
 fn scrollbarReservedWidth(self: *Surface) i32 {
@@ -3198,4 +3253,283 @@ test "a stale signaled event cannot complete a changed resize" {
     surface.resize_frame_pending = true;
     try std.testing.expect(!awaitResizeFrames(&.{&surface}));
     try std.testing.expect(!surface.resize_frame_pending);
+}
+
+const ScrollTest = struct {
+    surface: *Surface,
+    app: App,
+    window: Window,
+    core_app: @import("../../App.zig"),
+    mutex: std.Io.Mutex = .init,
+
+    fn init(self: *ScrollTest) !void {
+        const alloc = std.testing.allocator;
+        self.surface = try alloc.create(Surface);
+        errdefer alloc.destroy(self.surface);
+        self.app = .{
+            .core_app = &self.core_app,
+            .config = try configpkg.Config.default(alloc),
+            .hinstance = undefined,
+            .default_command_arena = .init(alloc),
+        };
+        errdefer self.app.config.deinit();
+        self.core_app = undefined;
+        self.core_app.alloc = alloc;
+        self.window = .{ .app = &self.app };
+        self.surface.* = .{
+            .app = &self.app,
+            .parent_window = &self.window,
+            .core_surface_ready = true,
+            .scrollbar_enabled = true,
+        };
+        const core_surface = &self.surface.core_surface;
+        core_surface.id = 1;
+        core_surface.alloc = alloc;
+        core_surface.app = &self.core_app;
+        core_surface.rt_app = &self.app;
+        core_surface.rt_surface = self.surface;
+        core_surface.readonly = false;
+        core_surface.mouse = .{};
+        core_surface.selection_scroll_active = false;
+        core_surface.config.mouse_reporting = true;
+        core_surface.config.mouse_scroll_multiplier = self.app.config.@"mouse-scroll-multiplier";
+        core_surface.config.selection_word_chars = &.{};
+        core_surface.size = .{
+            .screen = .{ .width = 800, .height = 240 },
+            .cell = .{ .width = 10, .height = 10 },
+            .padding = .{},
+        };
+        core_surface.io.terminal = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+        errdefer core_surface.io.terminal.deinit(alloc);
+        self.mutex = .init;
+        core_surface.renderer_state = .{ .mutex = &self.mutex, .terminal = &core_surface.io.terminal };
+        core_surface.io.renderer_state = &core_surface.renderer_state;
+        core_surface.io.surface_mailbox = .{ .surface = core_surface, .app = undefined };
+        core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+        errdefer core_surface.renderer_thread.wakeup.deinit();
+        core_surface.io.renderer_wakeup = &core_surface.renderer_thread.wakeup;
+        core_surface.io.mailbox = try @import("../../termio.zig").Mailbox.initSPSC(alloc);
+        errdefer core_surface.io.mailbox.deinit(alloc);
+        for (0..99) |_| try core_surface.io.terminal.linefeed();
+        self.surface.updateScrollbarGate();
+    }
+
+    fn deinit(self: *ScrollTest) void {
+        const core_surface = &self.surface.core_surface;
+        core_surface.mouse.selection_gesture.deinit(&core_surface.io.terminal);
+        core_surface.io.mailbox.deinit(std.testing.allocator);
+        core_surface.renderer_thread.wakeup.deinit();
+        core_surface.io.terminal.deinit(std.testing.allocator);
+        self.app.config.deinit();
+        self.app.default_command_arena.deinit();
+        std.testing.allocator.destroy(self.surface);
+    }
+
+    fn reset(self: *ScrollTest) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        self.surface.core_surface.io.terminal.scrollViewport(.bottom);
+        _ = self.surface.scrollbar_activity.take();
+    }
+};
+
+test "D11: core wheel and row binding record only actual movement" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const surface = fixture.surface;
+    const core_surface = &surface.core_surface;
+    try core_surface.scrollCallback(0, 1, .{});
+    try std.testing.expect(surface.takeScrollbarActivity() != null);
+    try core_surface.scrollCallback(0, 0, .{});
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    try std.testing.expect(try core_surface.performBindingAction(.{ .scroll_to_row = 50 }));
+    const snapshot = surface.takeScrollbarActivity().?;
+    try std.testing.expectEqual(@as(usize, 50), snapshot.offset);
+    try std.testing.expect(try core_surface.performBindingAction(.{ .scroll_to_row = 50 }));
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    try std.testing.expect(try core_surface.performBindingAction(.{ .scroll_to_row = 0 }));
+    _ = surface.takeScrollbarActivity();
+    try core_surface.scrollCallback(0, 1, .{});
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    fixture.reset();
+    core_surface.io.terminal.flags.mouse_event = .normal;
+    try core_surface.scrollCallback(0, 1, .{});
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    core_surface.io.terminal.flags.mouse_event = .none;
+    _ = try core_surface.io.terminal.switchScreen(.alternate);
+    core_surface.io.terminal.modes.set(.mouse_alternate_scroll, true);
+    try core_surface.scrollCallback(0, 1, .{});
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+}
+
+test "D11: queued viewport bindings retain their execution point" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const core_surface = &fixture.surface.core_surface;
+    const Case = struct { action: input.Binding.Action, scroll: terminal.Terminal.ScrollViewport };
+    for ([_]Case{
+        .{ .action = .scroll_to_top, .scroll = .top },
+        .{ .action = .scroll_to_bottom, .scroll = .bottom },
+        .{ .action = .scroll_page_up, .scroll = .{ .delta = -24 } },
+        .{ .action = .scroll_page_down, .scroll = .{ .delta = 24 } },
+        .{ .action = .{ .scroll_page_fractional = -0.5 }, .scroll = .{ .delta = -12 } },
+        .{ .action = .{ .scroll_page_lines = -1 }, .scroll = .{ .delta = -1 } },
+    }) |case| {
+        try std.testing.expect(try core_surface.performBindingAction(case.action));
+        const message = core_surface.io.mailbox.spsc.queue.pop(global.io()).?;
+        try std.testing.expectEqualDeep(case.scroll, message.scroll_viewport);
+        try std.testing.expectEqual(@as(?terminal.Scrollbar, null), fixture.surface.takeScrollbarActivity());
+    }
+    try std.testing.expect(try core_surface.performBindingAction(.{ .jump_to_prompt = -1 }));
+    try std.testing.expectEqual(@as(isize, -1), core_surface.io.mailbox.spsc.queue.pop(global.io()).?.jump_to_prompt);
+}
+
+test "D11: real worker executes Termio scrolling and stable mailbox hook" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const core_surface = &fixture.surface.core_surface;
+    const worker = try std.Thread.spawn(.{}, struct {
+        fn run(io: *@import("../../termio.zig").Termio) void {
+            io.scrollViewport(.{ .delta = -1 });
+            io.scrollViewport(.{ .delta = 1 });
+        }
+    }.run, .{&core_surface.io});
+    worker.join();
+    try std.testing.expectEqual(@as(usize, 76), fixture.surface.takeScrollbarActivity().?.offset);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), fixture.surface.takeScrollbarActivity());
+    core_surface.io.scrollViewport(.bottom);
+    core_surface.io.scrollViewport(.{ .delta = 0 });
+    try core_surface.io.jumpToPrompt(0);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), fixture.surface.takeScrollbarActivity());
+    const pin = core_surface.io.terminal.screens.active.pages.pin(.{ .screen = .{ .y = 10 } }).?;
+    pin.rowAndCell().row.semantic_prompt = .prompt;
+    try core_surface.io.jumpToPrompt(-1);
+    try std.testing.expectEqual(@as(usize, 10), fixture.surface.takeScrollbarActivity().?.offset);
+}
+
+test "D11: selection and adjusted endpoint hooks move the viewport" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const core_surface = &fixture.surface.core_surface;
+    try std.testing.expect(!try core_surface.performBindingAction(.scroll_to_selection));
+    try std.testing.expect(!try core_surface.performBindingAction(.{ .adjust_selection = .home }));
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), fixture.surface.takeScrollbarActivity());
+    const screen = core_surface.io.terminal.screens.active;
+    const pin = screen.pages.pin(.{ .screen = .{ .y = 10 } }).?;
+    try screen.select(.init(pin, pin, false));
+    try std.testing.expect(try core_surface.performBindingAction(.scroll_to_selection));
+    try std.testing.expectEqual(@as(usize, 10), fixture.surface.takeScrollbarActivity().?.offset);
+    fixture.reset();
+    try std.testing.expect(try core_surface.performBindingAction(.{ .adjust_selection = .home }));
+    try std.testing.expect(fixture.surface.takeScrollbarActivity() != null);
+}
+
+test "D11: hidden never shutdown gates and late reports cannot replay activity" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const surface = fixture.surface;
+    const core_surface = &surface.core_surface;
+    core_surface.io.scrollViewport(.top);
+    surface.setScrollbarOwnerVisible(false);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    core_surface.io.scrollViewport(.bottom);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    surface.setScrollbarOwnerVisible(true);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    surface.scrollbar_enabled = false;
+    surface.updateScrollbarGate();
+    core_surface.io.scrollViewport(.top);
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    surface.scrollbar_enabled = true;
+    surface.updateScrollbarGate();
+    core_surface.io.scrollViewport(.bottom);
+    surface.drainScrollbarActivity();
+    const latest = surface.scrollbar_state;
+    surface.setScrollbar(.{ .total = 100, .offset = 0, .len = 24 });
+    try std.testing.expectEqualDeep(latest, surface.scrollbar_state);
+    surface.setScrollbarOwnerVisible(false);
+    const worker = try std.Thread.spawn(.{}, @import("../../termio.zig").Termio.scrollViewport, .{ &core_surface.io, .top });
+    worker.join();
+    try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+}
+
+test "D11: actual output pruning is silent" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const surface = fixture.surface;
+    const t = &surface.core_surface.io.terminal;
+    t.deinit(std.testing.allocator);
+    t.* = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null, .max_scrollback_lines = 100 });
+    var pruned = false;
+    const output_rows = 3 * t.screens.active.pages.limits.max(.lines) + 24;
+    for (0..output_rows) |i| {
+        if (i == 100) t.scrollViewport(.top);
+        const before = t.screens.active.pages.scrollbar();
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+        const after = t.screens.active.pages.scrollbar();
+        pruned = pruned or after.total < before.total;
+        surface.setScrollbar(after);
+        try std.testing.expectEqual(@as(?terminal.Scrollbar, null), surface.takeScrollbarActivity());
+    }
+    try std.testing.expect(pruned);
+    try std.testing.expectEqual(@as(?*Scrollbar, null), surface.scrollbar);
+}
+
+test "D11: selection autoscroll records before a full queue unlocks for output" {
+    var fixture: ScrollTest = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const core_surface = &fixture.surface.core_surface;
+    fixture.surface.cursor_pos = .{ .x = 10, .y = 10 };
+    const t = &core_surface.io.terminal;
+    _ = try core_surface.mouse.selection_gesture.press(t, .{
+        .time = .now(std.testing.io, .awake),
+        .pin = t.screens.active.pages.pin(.{ .viewport = .{ .x = 1, .y = 1 } }).?,
+        .xpos = 10,
+        .ypos = 10,
+        .max_distance = 10,
+        .repeat_interval = 100_000_000,
+        .word_boundary_codepoints = &.{},
+    });
+    core_surface.mouse.selection_gesture.left_drag_autoscroll = .up;
+    for (0..64) |_| try std.testing.expect(core_surface.io.mailbox.spsc.queue.push(std.testing.io, .{ .selection_scroll = false }, .instant) != 0);
+    const Work = struct {
+        fixture: *ScrollTest,
+        saw_pending: bool = false,
+        output_ok: bool = false,
+
+        fn run(self: *@This()) void {
+            const io = &self.fixture.surface.core_surface.io;
+            for (0..100_000) |_| {
+                self.fixture.mutex.lockUncancelable(global.io());
+                if (self.fixture.surface.scrollbar_activity.pending) {
+                    self.saw_pending = true;
+                    self.output_ok = true;
+                    for (0..5) |_| io.terminal.linefeed() catch {
+                        self.output_ok = false;
+                    };
+                    self.fixture.mutex.unlock(global.io());
+                    break;
+                }
+                self.fixture.mutex.unlock(global.io());
+                std.atomic.spinLoopHint();
+            }
+            _ = io.mailbox.spsc.queue.pop(global.io());
+        }
+    };
+    var work: Work = .{ .fixture = &fixture };
+    const worker = try std.Thread.spawn(.{}, Work.run, .{&work});
+    try core_surface.handleMessage(.{ .selection_scroll_tick = true });
+    worker.join();
+    try std.testing.expect(work.saw_pending);
+    try std.testing.expect(work.output_ok);
+    try std.testing.expectEqual(@as(usize, 105), fixture.surface.takeScrollbarActivity().?.total);
 }

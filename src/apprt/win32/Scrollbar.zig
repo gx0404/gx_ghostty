@@ -13,7 +13,7 @@
 //! (`scrollable`). With always-visible scrollbars it reserves a column of
 //! the grid and stays. In overlay mode (the default) it floats over the
 //! terminal's right edge, hidden until there is something to scroll and
-//! the user scrolls (`revealsOnUpdate`; output alone does not show it) or
+//! the user moves the viewport (`userScrolled`; reports never reveal it) or
 //! rests the pointer on that edge (`onOwnerMouseMove`), and fades out
 //! after a second without use. The fades and the widening run on the
 //! `anim` frame clock and jump to their end when animations are off.
@@ -127,23 +127,6 @@ pub fn dragOffset(
 /// and something to scroll.
 pub fn scrollable(state: terminal.Scrollbar) bool {
     return state.total > state.len;
-}
-
-/// The rows of the scrollback below the viewport.
-fn rowsBelow(state: terminal.Scrollbar) usize {
-    return state.total -| (state.offset +| state.len);
-}
-
-/// Whether an overlay scrollbar shows for the scroll state `next` that
-/// follows `prev` (the GX scrollbar rule): only when there is something
-/// to scroll and the viewport moved through the scrollback, its top row
-/// (`offset`) and the rows below it both changed. Output alone does not
-/// show it, neither while the viewport follows the end (the offset grows,
-/// nothing is below) nor while it stays where the user scrolled to
-/// (only the rows below grow).
-pub fn revealsOnUpdate(prev: terminal.Scrollbar, next: terminal.Scrollbar) bool {
-    if (!scrollable(next)) return false;
-    return next.offset != prev.offset and rowsBelow(next) != rowsBelow(prev);
 }
 
 /// A direction to page in.
@@ -529,31 +512,28 @@ pub const Scrollbar = struct {
         self.placed = null;
     }
 
-    /// Update the cached scroll state; show an overlay scrollbar when the
-    /// user scrolled (`revealsOnUpdate`) and repaint a shown one.
+    /// Synchronize a current terminal snapshot without inferring its source.
     pub fn update(self: *Scrollbar, state: terminal.Scrollbar) void {
-        var next = state;
-        // While the thumb is dragged the pointer says where the viewport
-        // is: a report from before the last move would pull the thumb back.
-        if (self.press == .thumb) next.offset = @min(self.state.offset, next.total -| next.len);
         const prev = self.state;
-        self.state = next;
+        self.state = state;
         if (self.first_update) {
             // Initial state — silent.
             self.first_update = false;
             if (self.enabled) self.resetVisibility();
             return;
         }
-        if (!self.enabled or prev.eql(next)) return;
+        if (!self.enabled or prev.eql(state)) return;
 
-        if (!scrollable(next)) {
+        if (!scrollable(state)) {
             // Nothing to scroll any more (a full-screen program, a clear).
             _ = self.releasePress();
             if (self.mode == .overlay) self.conceal();
-        } else if (self.mode == .overlay and revealsOnUpdate(prev, next)) {
-            return self.reveal();
         }
         self.flush();
+    }
+
+    pub fn userScrolled(self: *Scrollbar) void {
+        self.reveal();
     }
 
     /// Follow the surface after it moved or was resized: a shown popup
@@ -1437,29 +1417,27 @@ test "dragOffset: rounds half to nearest" {
     try testing.expect(off == 477 or off == 478);
 }
 
-test "revealsOnUpdate: scrolling shows the scrollbar, output does not" {
-    const s = struct {
-        fn of(total: usize, offset: usize, len: usize) terminal.Scrollbar {
-            return .{ .total = total, .offset = offset, .len = len };
-        }
+test "D11: full scrollback pruning must not reveal the scrollbar" {
+    var sb: Scrollbar = .{
+        .alloc = testing.allocator,
+        .surface = undefined,
+        .owner = undefined,
+        .hwnd = undefined,
+        .window_lost = true,
+        .first_update = false,
+        .state = .{ .total = 100, .offset = 50, .len = 24 },
     };
-    // Output while the viewport follows the end: the offset grows with
-    // the scrollback, nothing is below the viewport.
-    try testing.expect(!revealsOnUpdate(s.of(100, 76, 24), s.of(101, 77, 24)));
-    // Output while scrolled back: the viewport stays, more is below.
-    try testing.expect(!revealsOnUpdate(s.of(100, 50, 24), s.of(101, 50, 24)));
-    // The user scrolls (wheel, keys, jumping to a prompt or a match).
-    try testing.expect(revealsOnUpdate(s.of(100, 76, 24), s.of(100, 73, 24)));
-    try testing.expect(revealsOnUpdate(s.of(100, 50, 24), s.of(100, 76, 24)));
-    try testing.expect(revealsOnUpdate(s.of(100, 76, 24), s.of(102, 0, 24)));
-    // Nothing to scroll: a full-screen program, a cleared scrollback, the
-    // first screen of output.
-    try testing.expect(!revealsOnUpdate(s.of(100, 50, 24), s.of(24, 0, 24)));
-    try testing.expect(!revealsOnUpdate(s.of(10, 0, 24), s.of(20, 0, 24)));
-    try testing.expect(!revealsOnUpdate(s.of(24, 0, 24), s.of(25, 1, 24)));
-    // A resize at the end keeps nothing below.
-    try testing.expect(!revealsOnUpdate(s.of(100, 76, 24), s.of(100, 70, 30)));
-    try testing.expect(!revealsOnUpdate(s.of(100, 76, 24), s.of(100, 76, 24)));
+    sb.update(.{ .total = 100, .offset = 49, .len = 24 });
+    try testing.expectEqual(Visibility.hidden, sb.visibility);
+    for ([_]terminal.Scrollbar{
+        .{ .total = 101, .offset = 77, .len = 24 },
+        .{ .total = 102, .offset = 77, .len = 24 },
+        .{ .total = 100, .offset = 70, .len = 30 },
+        .{ .total = 24, .offset = 0, .len = 24 },
+    }) |state| {
+        sb.update(state);
+        try testing.expectEqual(Visibility.hidden, sb.visibility);
+    }
 }
 
 test "scrollable: only with more rows than fit" {
