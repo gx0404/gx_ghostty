@@ -1799,6 +1799,31 @@ pub const Application = extern struct {
         dialog.present(null);
     }
 
+    // fork(gx): GX-0028 begin: show the configuration errors of the startup in the first window
+    /// Shows the configuration errors dialog in `win`. Startup presents it
+    /// before there is any window, without a parent, and the first window
+    /// covers it, so that one is closed and a new one is shown in `win`.
+    fn gxShowConfigErrorsIn(self: *Self, win: *Window) void {
+        const priv = self.private();
+        if (priv.config_errors_dialog.get()) |diag| {
+            priv.config_errors_dialog.set(null);
+            diag.close();
+            diag.unref();
+        }
+        if (!priv.gx_config_errors.update(priv.config.get())) return;
+        const dialog: *ConfigErrorsDialog = .new(priv.config);
+        priv.config_errors_dialog.set(dialog);
+        _ = ConfigErrorsDialog.signals.@"reload-config".connect(
+            dialog,
+            *Application,
+            handleReloadConfig,
+            self,
+            .{},
+        );
+        dialog.present(win.as(gtk.Widget));
+    }
+    // fork(gx): GX-0028 end
+
     fn globalShortcutTrigger(
         _: *GlobalShortcuts,
         action: *const Binding.Action,
@@ -2706,6 +2731,9 @@ const Action = struct {
 
         // Show the window
         gtk.Window.present(win.as(gtk.Window));
+        // fork(gx): GX-0028 begin: configuration errors found before the first window are shown in it
+        if (self.private().gx_config_errors.windowShown()) self.gxShowConfigErrorsIn(win);
+        // fork(gx): GX-0028 end
     }
 
     pub fn openConfig(self: *Application, value: apprt.action.OpenConfig) bool {

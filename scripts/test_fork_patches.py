@@ -493,6 +493,19 @@ def gx0028_problems(source: str) -> list[str]:
         problems.append("handleReloadConfig: forget() must run before Action.reloadConfig")
     if sum("gx_config_errors.forget()" in line for line in lines) != 1:
         problems.append("only the reload button of the configuration errors dialog may forget reported diagnostics")
+
+    window = zig_fn_lines(lines, "fn initAndShowWindow(")
+    shown_in = zig_fn_lines(lines, "fn gxShowConfigErrorsIn(")
+    if window is None or shown_in is None:
+        return [*problems, "initAndShowWindow and gxShowConfigErrorsIn must each be defined once"]
+    window_body = [line.strip() for line in lines[window[0]:window[1]]]
+    name = "initAndShowWindow"
+    shown = single(window_body, name, "gtk.Window.present(win.as(gtk.Window));")
+    hook = single(window_body, name, "if (self.private().gx_config_errors.windowShown()) self.gxShowConfigErrorsIn(win);")
+    if None not in (shown, hook) and not shown < hook:
+        problems.append(f"{name}: the errors of the startup must be shown after the window is")
+    if "dialog.present(win.as(gtk.Widget));" not in (line.strip() for line in lines[shown_in[0]:shown_in[1]]):
+        problems.append("gxShowConfigErrorsIn: the dialog must be presented in the window")
     return problems
 
 
@@ -867,6 +880,13 @@ class Gx0028ShapeTests(unittest.TestCase):
         problems = self.problems_after("        defer config.unref();\n",
                                        "        defer config.unref();\n        self.private().gx_config_errors.forget();\n")
         self.assertTrue(any("only the reload button" in p for p in problems), problems)
+
+    def test_startup_errors_are_shown_in_the_first_window(self):
+        hook = "        if (self.private().gx_config_errors.windowShown()) self.gxShowConfigErrorsIn(win);\n"
+        problems = self.problems_after(hook, "")
+        self.assertTrue(any(p.startswith("initAndShowWindow:") for p in problems), problems)
+        problems = self.problems_after("dialog.present(win.as(gtk.Widget));", "dialog.present(null);")
+        self.assertTrue(any(p.startswith("gxShowConfigErrorsIn:") for p in problems), problems)
 
 
 class Gx0029ShapeTests(unittest.TestCase):
