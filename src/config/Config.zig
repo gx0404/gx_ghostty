@@ -2096,7 +2096,14 @@ keybind: Keybinds = .{},
 ///
 /// Changing this value at runtime will only affect new terminals.
 ///
-/// This setting is only supported currently on macOS.
+// fork(gx): GX-0033 begin: document the existing Windows WGL swap-control request.
+/// This setting is supported on macOS and Windows. On Windows, a WGL
+/// context with swap-control support requests interval 1 when true and 0
+/// when false. Driver settings may override or reject this request.
+/// Rebuilding a Windows GPU context preserves its original request.
+/// Disabling this setting does not remove the OpenGL `gl.finish()` at frame
+/// completion and does not guarantee a particular redraw frequency.
+// fork(gx): GX-0033 end
 @"window-vsync": bool = true,
 
 /// If true, new windows will inherit the working directory of the

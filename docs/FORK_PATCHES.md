@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0032）之后的号。在册的 26 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0032，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0033）之后的号。在册的 27 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0033，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -91,6 +91,7 @@
 | GX-0031 | `src/renderer/cursor.zig` | `fork(gx): GX-0031` | active |
 | GX-0031 | `src/renderer/generic.zig` | `fork(gx): GX-0031` | active |
 | GX-0032 | `src/renderer/generic.zig` | `fork(gx): GX-0032` | active |
+| GX-0033 | `src/config/Config.zig` | `fork(gx): GX-0033` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1269,3 +1270,11 @@ python -m unittest scripts.test_fork_patches -v
 - 错误边界：文件打不开或读失败沿用原警告并无图片降级；坏图解码与解码 OOM 返回错误，realized 不半提交。CPU 解码在 GUI 线程持 draw mutex，大图片可能阻塞，未擅自扩展异步架构。
 - 移除条件：上游 realized 链有同等背景恢复时删除钩子和共享模块，登记改为 removed。
 - 验证：纯 helper 单测与真实 Renderer.displayRealized CPU 回归（pending、重复 reparent 不读盘、缺图/坏图/OOM 后重试）；Windows actual context-reset 在 NVIDIA/Mesa 上逐图确认背景＋Kitty、连续 reset/resize/tab/input。锁屏时真实 GUI 记 PENDING；CPU 单测不代证驱动 TDR。
+
+## GX-0033 Windows window-vsync 的既有行为文档
+
+- 文件：`src/config/Config.zig::window-vsync` 字段 doc comment；状态 active，未回馈上游。替换「仅 macOS」段，新增 begin/end 标记。
+- 原因：GX-0004 已把请求接到 Windows WGL，字段文档却仍写只支持 macOS。
+- 行为不变：支持 swap-control 的 context 请求 0/1；驱动可能覆盖或拒绝。reload 仅影响新终端，context reset 保留原请求；关闭 vsync 不移除 `gl.finish()`，不保证任意刷新率。
+- 移除条件：上游字段文档覆盖同等 Windows 实现时移除，登记改为 removed。
+- 验证：`just build -Demit-webdata` 的生成文档及隔离 `+show-config --default --docs`；`Gx0033ShapeTests` 锁定请求/重载/恢复/finish 边界。驱动是否接受需渲染线程实测，日志参数不能代证。

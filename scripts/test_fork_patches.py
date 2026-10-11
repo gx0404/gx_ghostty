@@ -1129,6 +1129,14 @@ class Gx0032ShapeTests(unittest.TestCase):
         self.assertIn('try prepare(renderer);', helper)
 
 
+class Gx0033ShapeTests(unittest.TestCase):
+    def test_vsync_documentation_describes_a_request_not_a_driver_guarantee(self):
+        source = (ROOT / 'src/config/Config.zig').read_text(encoding='utf-8')
+        doc = source[source.index('/// Synchronize rendering with the screen refresh rate.'):source.index('@"window-vsync": bool = true,')]
+        for text in ('fork(gx): GX-0033', 'WGL', 'interval 1', 'when false', 'Driver settings', 'original request', 'gl.finish()', 'only affect new terminals'):
+            self.assertIn(text, doc)
+        self.assertNotIn('only supported currently on macOS', doc)
+
 
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
