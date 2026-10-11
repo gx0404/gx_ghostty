@@ -49,9 +49,9 @@
 //!
 //! DPI (per-monitor v2, `dist/windows/ghostty.manifest`): only top-level
 //! windows get WM_DPICHANGED. `handleDpiChange` rescales the chrome, gives
-//! every surface of every tab the new content scale (terminal fonts, find
-//! bar, scrollbar, IME position; `Surface.handleDpiChange`), adopts the
-//! rect Windows suggests and lays the panes out again. The popups are
+//! the active tab's surfaces the new content scale (`Surface.handleDpiChange`),
+//! leaving hidden tabs to follow when selected (`applyScale`). It adopts
+//! the rect Windows suggests and lays the panes out once. The popups are
 //! top-level windows themselves: they get their own WM_DPICHANGED when
 //! they land on another monitor (`ui/Popup.zig`), and size themselves
 //! with their owner's DPI when shown; those of the chrome (the title bar
@@ -76,6 +76,7 @@ const gx = @import("../../gx/main.zig");
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
+const split_layout = @import("split_layout.zig");
 const splits = @import("splits.zig");
 const tab_status = @import("tab_status.zig");
 const tabs = @import("tabs.zig");
@@ -160,16 +161,20 @@ tab_bar: TabBar = .{},
 /// Whether this window is a quick terminal (borderless popup, no tabs).
 is_quick_terminal: bool = false,
 
-/// Split divider drag state: the tab, the split node and its rectangle
-/// (client pixels) when the drag started, and how far from the divider
-/// line the pointer grabbed it. Replacing the tab's split tree ends the
-/// drag (`replaceTree`).
+/// Split divider drag state: the tab, the split node and how far from the
+/// divider line the pointer grabbed it. Replacing the tab's split tree ends
+/// the drag (`replaceTree`).
 dragging_split: bool = false,
 drag_split_tab: usize = 0,
 drag_split_handle: SplitTree(Surface).Node.Handle = .root,
 drag_split_layout: SplitTree(Surface).Split.Layout = .horizontal,
-drag_split_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 drag_grab_offset: i32 = 0,
+
+/// The split of the active tab whose divider is under the pointer, drawn
+/// highlighted (`updateDividerHover`), and whether WM_MOUSELEAVE is
+/// requested for it.
+divider_hover: ?SplitTree(Surface).Node.Handle = null,
+divider_tracking: bool = false,
 
 /// True after the last tab has been closed and WM_CLOSE has been posted.
 /// Input handlers must bail when this is set — between PostMessage(WM_CLOSE)
@@ -208,16 +213,47 @@ tab_bar_suppressed: bool = false,
 /// Whether the window is in herdr app mode (see `updateAppMode`).
 app_mode: bool = false,
 
-/// Whether the herdr app mode timer (`app_mode_timer_id`) runs.
-app_mode_timer: bool = false,
+/// The herdr app mode checks (`checkAppMode`): the entry hysteresis, the
+/// delay before the next periodic check and when it is due
+/// (`GetTickCount64`), and whether `app_mode_soon_timer_id` runs.
+app_mode_state: gx.app_mode.State = .{},
+app_mode_samples: AppModeSamples = .{},
+app_mode_delay_ms: u32 = 0,
+app_mode_due_ms: u64 = 0,
+app_mode_soon: bool = false,
 
-/// The window is shown but cloaked until its first frame (see
-/// `showWhenReady`); the surface whose frame it waits for and since when.
+/// The surface whose first frame the cloaked window waits for, and since when.
 first_frame_surface: ?*Surface = null,
 first_frame_since_ms: u64 = 0,
 
+/// When the window became visible to the user (`uncloak`,
+/// `GetTickCount64`); 0 before. The size overlay waits for it
+/// (`showResizeOverlay`).
+uncloaked_ms: u64 = 0,
+
+/// The terminal and grid the size overlay showed or would have shown
+/// last, so it shows only for a grid that changed (`showResizeOverlay`).
+overlay_grid: ?OverlayGrid = null,
+
+/// Why the terminals of the active tab are not seen although they are laid
+/// out (`setOcclusion`).
+occlusion: Occlusion = .{},
+visibility: VisibilitySubscriptions = .{},
+
 /// Whether `window-position-x/-y` placed the window (no re-centering).
 position_configured: bool = false,
+
+/// Whether the window took its place from the remembered window state
+/// (`restoredRect`; no re-centering), and whether it opens maximized
+/// because the remembered window was.
+position_restored: bool = false,
+start_maximized: bool = false,
+
+/// Where the window is while it is neither maximized, minimized nor
+/// fullscreen (screen pixels), and whether it is maximized, for the window
+/// state (`trackPlacement`, `saveWindowState`).
+normal_rect: ?w32.RECT = null,
+maximized: bool = false,
 
 /// The terminal size from `window-width`/`window-height` (`initial_size`,
 /// DIPs), restored by `reset_window_size`.
@@ -230,6 +266,45 @@ shown: bool = false,
 /// live resize then leaves waiting for its new frame to the window.
 laying_out: bool = false,
 
+/// What the last `layoutSplits` laid out, so `relayout` can tell whether
+/// the panes still are where they belong.
+layout_key: ?LayoutKey = null,
+layout_passes: usize = 0,
+
+/// The terminal (core surface id) and grid of a size overlay.
+const OverlayGrid = struct { id: u64, columns: u16, rows: u16 };
+
+/// What a layout of the panes depends on, besides split ratios changed in
+/// place (whose callers lay out themselves): the terminal area, the scale,
+/// the tab and its tree.
+const LayoutKey = struct {
+    area: w32.RECT,
+    scale: f32,
+    tab: usize,
+    nodes: usize,
+    zoomed: ?SplitTree(Surface).Node.Handle,
+};
+
+/// Reasons nobody sees the window's terminals: the renderers stop drawing
+/// while any is set (`setOcclusion`).
+const Occlusion = packed struct(u8) {
+    /// Hidden (`toggle_visibility`, the quick terminal).
+    hidden: bool = false,
+    minimized: bool = false,
+    locked: bool = false,
+    display_off: bool = false,
+    desktop: bool = false,
+    _padding: u3 = 0,
+
+    fn any(self: Occlusion) bool {
+        return @as(u8, @bitCast(self)) != 0;
+    }
+};
+
+/// How long after the window became visible resizes show no size overlay:
+/// those are the window settling (maximizing, its tab bar), not the user.
+const overlay_delay_ms: u64 = 250;
+
 /// Posted by `queueMainMenu`; opens the main menu.
 const WM_APP_MAIN_MENU: u32 = w32.WM_APP + 20;
 
@@ -240,22 +315,25 @@ const WM_APP_CLOSE_TAB: u32 = w32.WM_APP + 0x61;
 /// For the render thread of a terminal of this window to post when the
 /// terminal presented its first frame after `showWhenReady` asked for one
 /// (`Surface.requestFirstFrameMessage`), so the window uncloaks at once:
-/// wparam 0, lparam the terminal's core surface id (`CoreSurface.id`).
-/// Nothing posts it yet; the `FIRST_FRAME_TIMER_ID` poll uncloaks the
-/// window.
+/// wparam 0, lparam the terminal's core surface id (`CoreSurface.id`). The
+/// `FIRST_FRAME_TIMER_ID` fallback uncloaks the window as well, so it shows
+/// when the message does not come.
 pub const WM_APP_FIRST_FRAME: u32 = w32.WM_APP + 31;
 
-/// The timer that re-checks herdr app mode while the window has one tab.
-const app_mode_timer_id: usize = 0x4844; // 'HD'
-const app_mode_interval_ms: u32 = 1500;
+/// A one-shot timer for an herdr app mode check sooner than the next tick
+/// of `CHROME_TIMER_ID` (`checkAppModeIn`): after a terminal title changed,
+/// or while an entry waits for its second check.
+const app_mode_soon_timer_id: usize = 0x4851; // 'HQ'
+
+/// How long after a title change the app mode check runs (herdr sets the
+/// title as it starts).
+const app_mode_title_delay_ms: u32 = 300;
 
 /// The most terminals of a tab whose processes the app mode check reads.
 const app_mode_max_terminals = 32;
 
-/// Polls for the first frame of a new window (`showWhenReady`).
+/// One-shot fallback when no first-frame message arrives.
 const FIRST_FRAME_TIMER_ID: usize = 0x4646; // 'FF'
-const first_frame_poll_ms: u32 = 10;
-/// Show the window even without a frame after this long.
 pub const first_frame_timeout_ms: u64 = 300;
 
 /// Drives the tab bar's unread badges and program labels.
@@ -299,6 +377,7 @@ pub fn onConfigChange(self: *Window) void {
         if (decoration != self.title_bar.decoration) self.title_bar.applyDecoration(config);
     }
     self.title_bar.onConfigChange();
+    self.updateDims();
     self.onFrameChanged();
     self.updateAppMode();
 }
@@ -328,9 +407,11 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     const window_style = TitleBar.windowStyle(&app.config, options.is_quick_terminal);
 
     // Quick terminals are positioned by QuickTerminal.calculateRects.
-    // Others start centered at 80% of the work area (`initialRect`).
-    // Honor an explicit configured window position only when BOTH
-    // coordinates are set; a partial config falls back to the default.
+    // Others start centered at 80% of the work area (`initialRect`), or
+    // where the window that closed last was, when no other window is open
+    // (`restoredRect`). Honor an explicit configured window position only
+    // when BOTH coordinates are set; a partial config falls back to the
+    // default.
     var rect = w32.RECT{ .left = w32.CW_USEDEFAULT, .top = w32.CW_USEDEFAULT, .right = 800, .bottom = 600 };
     if (!options.is_quick_terminal) {
         var position: ?w32.POINT = null;
@@ -339,6 +420,9 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         }
         self.position_configured = position != null;
         rect = initialRect(position);
+        if (app.windows.items.len == 0) {
+            if (self.restoredRect(rect)) |restored| rect = restored;
+        }
     }
 
     // Create the top-level container window using the GhosttyWindow class.
@@ -383,14 +467,143 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.title_bar.applyDecoration(&app.config);
         _ = self.tab_bar.updateVisibility();
         self.applyFrameMargins();
-        if (!self.position_configured) self.cascade();
+        if (!self.position_configured and !self.position_restored) self.cascade();
+        var placed: w32.RECT = undefined;
+        if (w32.GetWindowRect(hwnd, &placed) != 0) self.normal_rect = placed;
         _ = w32.SetTimer(hwnd, CHROME_TIMER_ID, chrome_timer_ms, null);
     }
+    self.visibility.init(hwnd);
+    VisibilitySubscriptions.refreshShell(self);
 
     // Don't show the window yet — addTab() will show the child
     // surface which triggers ShowWindow on the parent as needed.
     // Showing the parent before the terminal is ready can cause
     // timing issues with ConPTY.
+}
+
+/// The least size, in DIPs, a remembered window opens with.
+const restore_min_dip: [2]i32 = .{ 320, 200 };
+
+/// Where the window opens from the remembered window state
+/// (`gx.window_state`, the window that closed last), instead of `default`:
+/// the parts `window_state.use` leaves to it under the configuration. The
+/// remembered place counts only while it is on a monitor
+/// (`MonitorFromRect`); there the window keeps its size in DIPs, moves into
+/// the work area and gets at least `restore_min_dip` (`window_state.restore`).
+/// Otherwise, a remembered size opens at the default place. Sets
+/// `start_maximized` and `position_restored`. Null when nothing applies.
+fn restoredRect(self: *Window, default: w32.RECT) ?w32.RECT {
+    const ws = gx.window_state;
+    const use = ws.use(&self.app.config);
+    if (!use.any()) return null;
+    const alloc = self.app.core_app.alloc;
+    const path = ws.defaultPath(alloc) catch return null;
+    defer alloc.free(path);
+    const state = (ws.load(alloc, global.io(), path) catch |err| {
+        log.warn("cannot read the window state err={}", .{err});
+        return null;
+    }) orelse return null;
+    if (use.maximized) self.start_maximized = state.maximized;
+
+    // The monitor of the remembered place if it is on one, else the
+    // monitor of the default place.
+    const saved: ?w32.RECT = if (state.rect()) |r| .{ .left = r.x, .top = r.y, .right = r.right(), .bottom = r.bottom() } else null;
+    const remembered: ?w32.HMONITOR = if (use.position) if (saved) |r| MonitorFromRect(&r, MONITOR_DEFAULTTONULL) else null else null;
+    const monitor = remembered orelse MonitorFromRect(&default, MONITOR_DEFAULTTONEAREST) orelse return null;
+    var mi: w32.MONITORINFO = undefined;
+    mi.cbSize = @sizeOf(w32.MONITORINFO);
+    if (w32.GetMonitorInfoW(monitor, &mi) == 0) return null;
+    const work: ws.Rect = .{
+        .x = mi.rcWork.left,
+        .y = mi.rcWork.top,
+        .width = mi.rcWork.right - mi.rcWork.left,
+        .height = mi.rcWork.bottom - mi.rcWork.top,
+    };
+    const dpi = monitorDpi(monitor);
+    const scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+    const chrome = caption_layout.minTrackSize(scale);
+    const min: ws.Size = .{
+        .width = @max(ws.scale(restore_min_dip[0], dpi), chrome.width),
+        .height = @max(ws.scale(restore_min_dip[1], dpi), chrome.height),
+    };
+
+    const default_rect: ws.Rect = .{
+        .x = default.left,
+        .y = default.top,
+        .width = default.right - default.left,
+        .height = default.bottom - default.top,
+    };
+    const placed: ws.Rect = placed: {
+        if (remembered != null) {
+            if (ws.restore(state, work, dpi, min, &.{})) |at| {
+                self.position_restored = true;
+                if (use.size) break :placed at;
+                break :placed ws.fit(.{ .x = at.x, .y = at.y, .width = default_rect.width, .height = default_rect.height }, work);
+            }
+        }
+        if (!use.size) return null;
+        // The remembered size at the default place, in DIPs.
+        const sized = ws.rescale(.{ .x = 0, .y = 0, .width = state.size.width, .height = state.size.height }, state.dpi, dpi);
+        const width = @max(sized.width, min.width);
+        const height = @max(sized.height, min.height);
+        const x = if (self.position_configured) default_rect.x else work.x + @divTrunc(work.width - width, 2);
+        const y = if (self.position_configured) default_rect.y else work.y + @divTrunc(work.height - height, 2);
+        break :placed ws.fit(.{ .x = x, .y = y, .width = width, .height = height }, work);
+    };
+    return .{ .left = placed.x, .top = placed.y, .right = placed.right(), .bottom = placed.bottom() };
+}
+
+/// The effective DPI of `monitor` (96 when unknown).
+fn monitorDpi(monitor: w32.HMONITOR) u32 {
+    var x: u32 = 0;
+    var y: u32 = 0;
+    if (GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &x, &y) < 0 or x == 0) return 96;
+    return x;
+}
+
+const MONITOR_DEFAULTTONULL: u32 = 0;
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
+const MDT_EFFECTIVE_DPI: u32 = 0;
+extern "user32" fn MonitorFromRect(lprc: *const w32.RECT, dwFlags: u32) callconv(.winapi) ?w32.HMONITOR;
+extern "shcore" fn GetDpiForMonitor(hmonitor: w32.HMONITOR, dpiType: u32, dpiX: *u32, dpiY: *u32) callconv(.winapi) i32;
+
+/// Remember where the window is (`gx.window_state`), for the next window
+/// that opens when none is open (`restoredRect`): when the last window
+/// closes, or the app quits. `window-save-state = never` remembers nothing.
+fn saveWindowState(self: *Window) void {
+    if (self.is_quick_terminal or !self.shown) return;
+    if (self.app.config.@"window-save-state" == .never) return;
+    const hwnd = self.hwnd orelse return;
+    const rect = self.normal_rect orelse return;
+    const dpi = w32.GetDpiForWindow(hwnd);
+    const state: gx.window_state.State = .{
+        .position = .{ .x = rect.left, .y = rect.top },
+        .size = .{ .width = rect.right - rect.left, .height = rect.bottom - rect.top },
+        .dpi = if (dpi != 0) dpi else 96,
+        .maximized = self.maximized,
+    };
+    const alloc = self.app.core_app.alloc;
+    const path = gx.window_state.defaultPath(alloc) catch |err| {
+        log.warn("cannot find the window state file err={}", .{err});
+        return;
+    };
+    defer alloc.free(path);
+    gx.window_state.save(global.io(), path, state) catch |err| {
+        log.warn("cannot save the window state err={}", .{err});
+    };
+}
+
+/// The window moved or changed its size or state (WM_WINDOWPOSCHANGED):
+/// keep its place for the window state, while it is neither minimized nor
+/// fullscreen: whether it is maximized, and its rectangle when it is not.
+fn trackPlacement(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.is_quick_terminal or self.title_bar.is_fullscreen or self.closing) return;
+    if (w32.IsIconic(hwnd) != 0) return;
+    self.maximized = w32.IsZoomed(hwnd) != 0;
+    if (self.maximized) return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &rect) != 0) self.normal_rect = rect;
 }
 
 /// The rectangle (screen pixels) of a new window: 80% of the work area of
@@ -482,7 +695,7 @@ fn positionTaken(self: *const Window, x: i32, y: i32, tolerance: i32) bool {
 /// changes) only change what `reset_window_size` restores.
 pub fn setInitialSize(self: *Window, width: u32, height: u32) void {
     self.initial_content_size = .{ width, height };
-    if (!self.shown) self.applyContentSize(width, height, !self.position_configured);
+    if (!self.shown) self.applyContentSize(width, height, !self.position_configured and !self.position_restored);
 }
 
 /// Restore the size the window started with (`reset_window_size`).
@@ -529,38 +742,100 @@ fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
 const DWMWA_CLOAK: u32 = 13;
 
 /// Show the (cloaked) window and uncloak it once `surface` presented a
-/// frame, or after `first_frame_timeout_ms`.
+/// frame, or after `first_frame_timeout_ms`. With `fullscreen` set, the
+/// window goes fullscreen while it is still cloaked (after it is shown, so
+/// leaving fullscreen restores it as shown), and its terminals show at
+/// their final size.
 fn showWhenReady(self: *Window, surface: *Surface) void {
     const hwnd = self.hwnd orelse return;
-    // Wait for a frame presented after the window is shown, not one
-    // drawn into the hidden window.
+    self.first_frame_surface = surface;
+    self.first_frame_since_ms = GetTickCount64();
     if (surface.frame_event) |event| _ = w32.ResetEvent(event);
     surface.requestFirstFrameMessage(hwnd);
     self.shown = true;
-    _ = w32.ShowWindow(hwnd, if (self.app.config.maximize) SW_SHOWMAXIMIZED else w32.SW_SHOW);
+    const maximized = self.app.config.maximize or self.start_maximized;
+    _ = w32.ShowWindow(hwnd, if (maximized) SW_SHOWMAXIMIZED else w32.SW_SHOW);
+    if (self.app.config.fullscreen != .false and !self.title_bar.is_fullscreen) {
+        self.title_bar.toggleFullscreen();
+    }
     _ = w32.UpdateWindow(hwnd);
-    self.first_frame_surface = surface;
-    self.first_frame_since_ms = GetTickCount64();
-    _ = w32.SetTimer(hwnd, FIRST_FRAME_TIMER_ID, first_frame_poll_ms, null);
+    if (self.first_frame_surface != null and w32.SetTimer(hwnd, FIRST_FRAME_TIMER_ID, @intCast(first_frame_timeout_ms), null) == 0) {
+        self.uncloak(false);
+    }
 }
 
-/// WM_TIMER for `showWhenReady`.
 fn checkFirstFrame(self: *Window) void {
     const hwnd = self.hwnd orelse return;
-    const surface = self.first_frame_surface orelse {
-        _ = w32.KillTimer(hwnd, FIRST_FRAME_TIMER_ID);
-        return;
-    };
-    const elapsed = GetTickCount64() -| self.first_frame_since_ms;
-    const drawn = if (surface.frame_event) |event|
-        w32.WaitForSingleObject(event, 0) == w32.WAIT_OBJECT_0
-    else
-        true;
-    if (!drawn and elapsed < first_frame_timeout_ms) return;
+    _ = w32.KillTimer(hwnd, FIRST_FRAME_TIMER_ID);
+    const surface = self.firstFrameSurface() orelse return self.uncloak(false);
+    const drawn = if (surface.frame_event) |event| w32.WaitForSingleObject(event, 0) == w32.WAIT_OBJECT_0 else false;
+    self.uncloak(drawn);
+}
+
+/// `WM_APP_FIRST_FRAME`: the terminal with core id `id` presented a frame.
+fn onFirstFrame(self: *Window, id: u64) void {
+    const surface = self.firstFrameSurface() orelse return;
+    if (!surface.core_surface_initialized or surface.core_surface.id != id) return;
+    self.uncloak(true);
+}
+
+/// The terminal whose first frame the cloaked window waits for, if it is
+/// still one of the window's (it can close before its first frame).
+fn firstFrameSurface(self: *Window) ?*Surface {
+    const surface = self.first_frame_surface orelse return null;
+    if (self.findTabIndex(surface) == null) return null;
+    return surface;
+}
+
+/// Show the window to the user: the first frame of its terminal (`drawn`)
+/// or the timeout is there. Resizes show the size overlay from shortly
+/// after (`showResizeOverlay`); with `resize-overlay = always` it shows
+/// now.
+fn uncloak(self: *Window, drawn: bool) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.first_frame_surface == null) return;
     _ = w32.KillTimer(hwnd, FIRST_FRAME_TIMER_ID);
     self.first_frame_surface = null;
     setCloaked(hwnd, false);
-    log.debug("window shown after {d}ms first_frame={}", .{ elapsed, drawn });
+    self.uncloaked_ms = GetTickCount64();
+    // The layouts before were the window opening: they are the first one
+    // `resize-overlay = after-first` leaves out.
+    self.resize_overlay.seen_first = true;
+    self.overlay_grid = self.activeGrid();
+    if (self.app.config.@"resize-overlay" == .always) self.resize_overlay.show();
+    log.debug("window shown after {d}ms first_frame={}", .{ self.uncloaked_ms -| self.first_frame_since_ms, drawn });
+}
+
+/// The terminal and grid of the active tab's focused terminal.
+fn activeGrid(self: *Window) ?OverlayGrid {
+    const surface = self.getActiveSurface() orelse return null;
+    if (!surface.core_surface_ready) return null;
+    const grid = surface.core_surface.size.grid();
+    return .{ .id = surface.core_surface.id, .columns = grid.columns, .rows = grid.rows };
+}
+
+/// A resize: show the size overlay (`ResizeOverlay.show`, which follows
+/// `resize-overlay`) when the grid of the focused terminal changed, but not
+/// before the window is visible and has settled (`overlay_delay_ms`).
+fn showResizeOverlay(self: *Window) void {
+    if (self.uncloaked_ms == 0 and !self.is_quick_terminal) return;
+    const grid = self.activeGrid() orelse return;
+    if (self.overlay_grid) |last| if (std.meta.eql(last, grid)) return;
+    self.overlay_grid = grid;
+    if (GetTickCount64() -| self.uncloaked_ms < overlay_delay_ms) return;
+    self.showActiveResizeOverlay();
+}
+
+fn showActiveResizeOverlay(self: *Window) void {
+    const surface = self.getActiveSurface() orelse return;
+    if (comptime @hasDecl(ResizeOverlay, "showIn")) {
+        const tree = &self.tab_trees[self.active_tab];
+        const handle = tree.locate(surface) orelse return;
+        const area = split_layout.paneRect(Tree, tree, self.splitArea(), self.splitMetrics().gap, handle) orelse return;
+        self.resize_overlay.showIn(surface, @bitCast(area));
+    } else {
+        self.resize_overlay.show();
+    }
 }
 
 const SW_SHOWMAXIMIZED: i32 = 3;
@@ -574,28 +849,28 @@ pub fn applyFrameMargins(self: *Window) void {
 }
 
 /// The frame changed (fullscreen, decorations, configuration): update the
-/// tab visibility, the DWM frame and the layout, and repaint.
+/// tab visibility, the DWM frame and the layout, and repaint. The WM_SIZE of
+/// a frame change lays the panes out with the new tab bar already
+/// (`handleResize`), so this lays them out only when no WM_SIZE did
+/// (`relayout`).
 pub fn onFrameChanged(self: *Window) void {
     _ = self.tab_bar.updateVisibility();
     self.applyFrameMargins();
-    self.layoutSplits();
+    self.relayout();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
 /// Handle WM_DPICHANGED, which only top-level windows receive: adopt the
-/// suggested window rect, rescale the window chrome, and tell every
-/// surface (in every tab) about its new content scale.
+/// suggested window rect, rescale the window chrome, and tell the
+/// terminals of the active tab about their new content scale; the other
+/// tabs follow when they are selected (`applyScale`).
 fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     if (dpi == 0) return;
     const quick = self.quickTerminal();
     if (quick) |qt| if (qt.ignoresDpiChange()) return;
     self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     self.title_bar.onDpiChanged();
-
-    for (0..self.tab_count) |i| {
-        var it = self.tab_trees[i].iterator();
-        while (it.next()) |entry| entry.view.handleDpiChange(dpi);
-    }
+    if (self.tab_count > 0) self.applyScale(self.active_tab);
 
     if (self.is_quick_terminal) {
         if (quick) |qt| qt.relayout();
@@ -615,7 +890,7 @@ fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     // WM_SIZE arrives to lay the surfaces out again. The chrome row and
     // the DWM frame under it scale with the DPI.
     self.applyFrameMargins();
-    self.layoutSplits();
+    self.relayout();
     self.repositionOverlays();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
@@ -624,6 +899,19 @@ fn quickTerminal(self: *const Window) ?*@import("QuickTerminal.zig") {
     if (!self.is_quick_terminal) return null;
     const qt = self.app.quick_terminal orelse return null;
     return if (qt.window == self) qt else null;
+}
+
+/// Give the terminals of tab `tab` the window's content scale
+/// (`Surface.handleDpiChange`) if they missed a DPI change: the window
+/// rescales only the terminals of the active tab, the others when they are
+/// selected, and a tab moved from another window comes with its scale.
+fn applyScale(self: *Window, tab: usize) void {
+    if (tab >= self.tab_count) return;
+    const dpi: u32 = @intFromFloat(@round(self.scale * 96));
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| {
+        if (entry.view.scale != self.scale) entry.view.handleDpiChange(dpi);
+    }
 }
 
 /// The rect Windows would suggest for a move to `dpi`: the window rect
@@ -687,10 +975,16 @@ pub fn resizeForSurface(
 }
 
 /// Deinitialize the Window: close all tabs, delete fonts, destroy HWND.
+/// When the app quits it deinitializes every window in `app.windows`; the
+/// last of them remembers its place for the next run.
 pub fn deinit(self: *Window) void {
+    self.visibility.deinit(self.hwnd);
     Settings.onWindowDestroyed(self);
+    const windows = self.app.windows.items;
+    if (windows.len > 0 and windows[windows.len - 1] == self) self.saveWindowState();
 
-    // Close all tab surfaces.
+    // Close all tab surfaces, off the screen.
+    self.hide();
     self.cleanupAllSurfaces();
 
     // Delete the tab bar fonts and the title bar canvas and tooltip.
@@ -886,6 +1180,18 @@ const GA_ROOT: u32 = 2;
 const GA_ROOTOWNER: u32 = 3;
 extern "user32" fn GetAncestor(hwnd: w32.HWND, gaFlags: u32) callconv(.winapi) ?w32.HWND;
 
+const WM_WINDOWPOSCHANGED: u32 = 0x0047;
+const SWP_HIDEWINDOW: u32 = 0x0080;
+const WINDOWPOS = extern struct {
+    hwnd: ?w32.HWND,
+    hwndInsertAfter: ?w32.HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: u32,
+};
+
 /// The index of the tab whose split tree holds `surface`.
 pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
     for (0..self.tab_count) |i| {
@@ -905,6 +1211,7 @@ pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
 pub fn setActiveSurface(self: *Window, surface: *Surface) bool {
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
+    const was_zoomed = tree.zoomed != null;
     if (tree.zoomed) |zoomed| {
         const handle = tree.locate(surface) orelse return false;
         if (handle != zoomed) {
@@ -920,8 +1227,41 @@ pub fn setActiveSurface(self: *Window, surface: *Surface) bool {
     if (self.tab_active_surface[tab] != surface) {
         self.tab_active_surface[tab] = surface;
         self.refreshTabTitle(tab);
+        self.updateTabDim(tab);
     }
+    if (was_zoomed != (tree.zoomed != null)) self.onTabZoomChanged(tab);
     return true;
+}
+
+/// Tell the renderers of the terminals of tab `tab` which of them to dim
+/// (`Surface.setUnfocusedDim`, drawn by the renderer): the panes of a split
+/// other than the tab's focused one (`split_layout.dimsPane`), covered by
+/// `1 - unfocused-split-opacity` of `unfocused-split-fill` (else the
+/// background). A tab that shows one pane, alone or zoomed, dims none, and
+/// neither does the window losing the focus.
+fn updateTabDim(self: *Window, tab: usize) void {
+    if (tab >= self.tab_count) return;
+    const config = &self.app.config;
+    const fill = config.@"unfocused-split-fill" orelse config.background;
+    const dim: Surface.DimColor = .init(fill.r, fill.g, fill.b, @floatCast(1 - config.@"unfocused-split-opacity"));
+    const tree = &self.tab_trees[tab];
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const dims = split_layout.dimsPane(tree.isSplit(), tree.zoomed != null, entry.view == self.tab_active_surface[tab]);
+        entry.view.setUnfocusedDim(if (dims) dim else .none);
+    }
+}
+
+/// `updateTabDim` for every tab (the configuration changed).
+fn updateDims(self: *Window) void {
+    for (0..self.tab_count) |i| self.updateTabDim(i);
+}
+
+/// Tab `tab` zoomed one of its splits or stopped: its panes dim
+/// differently and the tab bar shows the zoom (`tabStatus`).
+fn onTabZoomChanged(self: *Window, tab: usize) void {
+    self.updateTabDim(tab);
+    self.invalidateTabBar();
 }
 
 /// Find the Node.Handle for a surface in a given tab's tree.
@@ -1011,7 +1351,7 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
         .end => self.tab_count,
     };
 
-    // Shift elements right to make room at pos.
+    self.cancelDividerDrag();
     var i: usize = self.tab_count;
     while (i > pos) : (i -= 1) self.copySlot(i, i - 1);
     self.tab_trees[pos] = tree;
@@ -1023,7 +1363,6 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.tab_title_lens[pos] = 0;
     if (self.tab_count > 0 and self.active_tab >= pos) self.active_tab += 1;
     self.tab_count += 1;
-    self.cancelDividerDrag();
 
     // The terminal may have its title already (the `title` option).
     self.refreshTabTitle(pos);
@@ -1119,6 +1458,8 @@ const TabSelection = union(enum) {
 /// shells close without asking; see `CloseCheck`). The dialog's modal
 /// loop keeps dispatching messages, which can close tabs or this whole
 /// window, so the tabs are found again by a terminal's core id afterwards.
+/// The tabs leave the tab model together and the window lays out once
+/// before their terminals stop (`freeTrees`).
 fn closeTabs(self: *Window, selection: TabSelection) void {
     const hwnd = self.hwnd orelse return;
     var ids: [MAX_TABS]u64 = undefined;
@@ -1138,6 +1479,7 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
         };
     }
     scope.end();
+    check.done();
     if (count == 0) return;
     // The tab that stays when the active one closes with others.
     const keep: usize = switch (selection) {
@@ -1154,17 +1496,71 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
         if (choice != .accept or !isAlive(hwnd, self)) return;
     }
 
-    // Activate the tab that stays first, instead of each neighbor of the
-    // active tab that closes next.
-    if (keep_id != null and self.active_tab < self.tab_count) {
-        const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
-        if (std.mem.indexOfScalar(u64, ids[0..count], active_id) != null) {
-            if (self.findTabBySurfaceId(keep_id.?)) |idx| self.selectTabIndex(idx);
+    if (self.tab_count == 0) return;
+    const focused = self.hasFocus();
+    const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
+    const active_closed = std.mem.indexOfScalar(u64, ids[0..count], active_id) != null;
+    if (active_closed) {
+        const preferred = if (keep_id) |id| self.findTabBySurfaceId(id) else null;
+        if (preferred) |index| {
+            self.active_tab = index;
+        } else {
+            const start = tabs.closeNeighbor(self.active_tab, self.tab_count) orelse self.active_tab;
+            for (0..self.tab_count) |offset| {
+                const index = (start + offset) % self.tab_count;
+                const id = self.tab_active_surface[index].core_surface.id;
+                if (std.mem.indexOfScalar(u64, ids[0..count], id) == null) {
+                    self.active_tab = index;
+                    break;
+                }
+            }
         }
     }
+    self.tab_bar.cancelRename();
+    self.tab_bar.cancelDrag();
+    self.cancelDividerDrag();
+    var trees: [MAX_TABS]Tree = undefined;
+    var detached: usize = 0;
     for (ids[0..count]) |id| {
-        if (self.findTabBySurfaceId(id)) |idx| self.removeTab(idx);
+        const index = self.findTabBySurfaceId(id) orelse continue;
+        trees[detached] = self.detachTab(index);
+        detached += 1;
     }
+    if (detached == 0) return;
+    if (self.tab_count == 0) {
+        self.hide();
+        freeTrees(trees[0..detached]);
+        _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+        return;
+    }
+    for (trees[0..detached]) |*tree| {
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            entry.view.setVisible(false);
+            if (entry.view.hwnd) |child| _ = w32.ShowWindow(child, w32.SW_HIDE);
+        }
+    }
+    const visibility_changed = self.tab_bar.updateVisibility();
+    if (visibility_changed) self.applyFrameMargins();
+    if (active_closed) {
+        self.tab_unread[self.active_tab] = false;
+        self.tab_bell[self.active_tab] = false;
+        self.noteTabActivated(self.active_tab);
+        self.applyScale(self.active_tab);
+        self.layoutSplits();
+        self.repositionTabPopups(self.active_tab);
+        self.tab_bar.onTabShown(self.active_tab);
+        if (focused) self.focusActiveSurface();
+        self.updateWindowTitle();
+    } else if (visibility_changed) {
+        self.relayout();
+    } else if (self.layout_key) |*key| {
+        key.tab = self.active_tab;
+    }
+    self.repositionOverlays();
+    self.invalidateTabBar();
+    self.updateAppMode();
+    freeTrees(trees[0..detached]);
 }
 
 /// The index of the tab with the terminal whose core surface id is `id`,
@@ -1210,44 +1606,109 @@ fn removeTab(self: *Window, idx: usize) void {
     }
     // Take the tab out of the model before its terminals go away: their
     // windows hide and pass the focus on meanwhile.
-    var tree = self.tab_trees[idx];
-    var i: usize = idx;
-    while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
-    self.tab_count -= 1;
+    var tree = [1]Tree{self.detachTab(idx)};
     if (self.tab_count == 0) {
-        self.closing = true;
-        self.setAppModeTimer(false);
-        tree.deinit();
+        // The window closes: off the screen before its terminals stop.
+        self.hide();
+        self.stopAppModeSoon();
+        freeTrees(&tree);
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
-    self.active_tab = tabs.indexAfterRemove(self.active_tab, idx);
-    tree.deinit(); // This unrefs all surfaces → Surface.unref frees when ref_count=0
     self.updateTabBarVisibility();
     // The tab bar stays visible with `window-show-tab-bar = always`, so
     // nothing else repaints it without the removed tab.
     self.invalidateTabBar();
     self.updateAppMode();
+    freeTrees(&tree);
+}
+
+/// Take the tab at `idx` out of the tab model, keeping the active tab, and
+/// return its split tree for the caller to free (`freeTrees`) or move.
+fn detachTab(self: *Window, idx: usize) Tree {
+    const tree = self.tab_trees[idx];
+    var i: usize = idx;
+    while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
+    self.tab_count -= 1;
+    if (self.tab_count > 0) self.active_tab = tabs.indexAfterRemove(self.active_tab, idx);
+    return tree;
+}
+
+/// Free the split trees `trees`, out of the tab model, and their
+/// terminals: all of them stop their renderer and IO threads at once
+/// first, so the terminals go in parallel rather than one after the other,
+/// then each terminal is freed and its window destroyed
+/// (`destroyFreedWindow`).
+fn freeTrees(trees: []Tree) void {
+    for (trees) |*tree| stopTerminalThreads(tree);
+    for (trees) |*tree| {
+        var windows: [PaneLayout.capacity]w32.HWND = undefined;
+        var count: usize = 0;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            if (count == windows.len) break;
+            windows[count] = entry.view.hwnd orelse continue;
+            count += 1;
+        }
+        tree.deinit(); // Unrefs all surfaces: Surface.unref frees them.
+        for (windows[0..count]) |hwnd| destroyFreedWindow(hwnd);
+    }
+}
+
+/// Ask the renderer and IO threads of the terminals that freeing `tree`
+/// frees (no other tree holds them) to stop, without waiting for them;
+/// `Surface.deinit` joins them.
+fn stopTerminalThreads(tree: *const Tree) void {
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const surface = entry.view;
+        if (!surface.core_surface_ready or surface.ref_count != 1) continue;
+        surface.core_surface.renderer_thread.stop.notify() catch {};
+        surface.core_surface.io_thread.stop.notify() catch {};
+    }
 }
 
 /// Collects whether closing some terminals needs a confirmation and the
-/// processes that make it so.
+/// processes that make it so. All the terminals of one check read one
+/// process table (`gx.confirm.Scope`), from the first terminal to `done`,
+/// which has to come before the confirmation: its modal loop can run
+/// other confirmations, which need the processes of their own time.
 const CloseCheck = struct {
     arena: std.heap.ArenaAllocator,
     groups: std.ArrayList(Dialogs.ProcessGroup) = .empty,
     needed: bool = false,
+    scope: gx.confirm.Scope = undefined,
+    scoped: bool = false,
 
     fn init(alloc: Allocator) CloseCheck {
         return .{ .arena = .init(alloc) };
     }
 
     fn deinit(self: *CloseCheck) void {
+        self.done();
         self.arena.deinit();
     }
 
     fn tab(self: *CloseCheck, window: *Window, index: usize) Allocator.Error!void {
         const group = try window.closeGroup(index, self.arena.allocator()) orelse return;
         try self.groups.append(self.arena.allocator(), group);
+        self.needed = true;
+    }
+
+    /// The terminals are checked: free the process table.
+    fn done(self: *CloseCheck) void {
+        if (!self.scoped) return;
+        self.scope.end();
+        self.scoped = false;
+    }
+
+    fn surface(self: *CloseCheck, s: *Surface) void {
+        if (!s.core_surface_ready) return;
+        if (!self.scoped) {
+            self.scope.begin(self.arena.child_allocator, global.io());
+            self.scoped = true;
+        }
+        if (!s.core_surface.needsConfirmQuit()) return;
         self.needed = true;
     }
 };
@@ -1345,6 +1806,7 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         break :next tree.nodes[next_handle.idx()].leaf;
     };
     const focused = was_active and self.hasFocus();
+    const was_zoomed = tree.zoomed != null;
 
     const new_tree = tree.remove(alloc, handle) catch {
         log.err("failed to remove surface from split tree", .{});
@@ -1353,9 +1815,13 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
 
     // Before the closing terminal hides: its focus goes to this window,
     // which passes it to the active surface.
+    const closed_hwnd = surface.hwnd;
     self.tab_active_surface[tab] = next;
     self.replaceTree(tab, new_tree);
+    destroyFreedWindow(closed_hwnd);
     self.refreshTabTitle(tab);
+    self.updateTabDim(tab);
+    if (was_zoomed != (self.tab_trees[tab].zoomed != null)) self.invalidateTabBar();
     if (tab == self.active_tab) {
         self.layoutSplits();
         if (focused) {
@@ -1365,11 +1831,21 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     self.updateAppMode();
 }
 
+/// Destroy the window `hwnd` of a terminal its split tree freed: the
+/// terminal let go of it (`Surface.deinit` clears its window's
+/// GWLP_USERDATA), its renderer and GL context are gone, and otherwise the
+/// hidden window and its private DC would stay until the top-level window
+/// closes. A terminal still alive (another tree holds it) keeps its window.
+fn destroyFreedWindow(hwnd: ?w32.HWND) void {
+    const h = hwnd orelse return;
+    if (w32.IsWindow(h) == 0 or w32.GetWindowLongPtrW(h, w32.GWLP_USERDATA) != 0) return;
+    _ = w32.DestroyWindow(h);
+}
+
 /// Set the visibility (occlusion) of the surfaces of the active tab that
-/// are shown (only the zoomed one of a zoomed tab). Used on window
-/// minimize/restore so the renderer stops rebuilding frames while the
-/// window is minimized; also for a window that is hidden otherwise (the
-/// quick terminal). GUI thread.
+/// are shown (only the zoomed one of a zoomed tab), so the renderers stop
+/// rebuilding frames nobody sees. The window does so itself for the
+/// reasons in `occlusion` (`setOcclusion`). GUI thread.
 pub fn setActiveTabVisible(self: *Window, visible: bool) void {
     if (self.active_tab >= self.tab_count) return;
     const tree = &self.tab_trees[self.active_tab];
@@ -1377,6 +1853,34 @@ pub fn setActiveTabVisible(self: *Window, visible: bool) void {
     while (it.next()) |entry| {
         const shown = if (tree.zoomed) |zoomed| entry.handle == zoomed else true;
         entry.view.setVisible(visible and shown);
+    }
+}
+
+/// Whether the terminals of the active tab can be seen (`occlusion`).
+fn terminalsSeen(self: *const Window) bool {
+    return !self.closing and !self.occlusion.any();
+}
+
+fn pollingVisible(self: *const Window) bool {
+    const hwnd = self.hwnd orelse return false;
+    return self.terminalsSeen() and w32.IsWindowVisible_(hwnd) != 0 and w32.IsIconic(hwnd) == 0;
+}
+
+/// Set one reason in `occlusion` and tell the renderers of the active tab
+/// whether their terminals are seen now.
+fn setOcclusion(self: *Window, comptime reason: []const u8, occluded: bool) void {
+    if (@field(self.occlusion, reason) == occluded) return;
+    @field(self.occlusion, reason) = occluded;
+    const seen = self.terminalsSeen();
+    self.setActiveTabVisible(seen);
+    if (self.hwnd) |hwnd| {
+        if (seen and !self.is_quick_terminal) {
+            _ = w32.SetTimer(hwnd, CHROME_TIMER_ID, chrome_timer_ms, null);
+            self.app_mode_due_ms = 0;
+        } else {
+            _ = w32.KillTimer(hwnd, CHROME_TIMER_ID);
+            self.stopAppModeSoon();
+        }
     }
 }
 
@@ -1398,17 +1902,20 @@ pub fn refreshRenderers(self: *Window) void {
     while (it.next()) |entry| entry.view.refreshRenderer();
 }
 
-/// Move the screen-positioned popups of every terminal (scrollbars, find
-/// bars) after the window moved, in all tabs so a hidden tab doesn't show
-/// a stale position when activated.
+/// Move the screen-positioned popups of the terminals of the active tab
+/// (scrollbars, find bars) and of the window after the window moved. The
+/// popups of the other tabs are hidden; they move when their tab is
+/// selected (`selectTabIndex`).
 fn repositionPopups(self: *Window) void {
     if (self.quickTerminal()) |qt| if (qt.animating or !qt.visible) return;
-    for (0..self.tab_count) |i| {
-        var it = self.tab_trees[i].iterator();
-        while (it.next()) |entry| entry.view.repositionPopups();
-    }
+    if (self.tab_count > 0) self.repositionTabPopups(self.active_tab);
     self.shortcut_notice.reposition();
     self.repositionOverlays();
+}
+
+fn repositionTabPopups(self: *Window, tab: usize) void {
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| entry.view.repositionPopups();
 }
 
 /// Switch to the tab at `idx`: show its panes, move the keyboard focus to
@@ -1427,11 +1934,15 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     }
     const focused = self.hasFocus();
     self.cancelDividerDrag();
+    self.divider_hover = null;
     self.active_tab = idx;
     self.tab_unread[idx] = false;
     self.tab_bell[idx] = false;
     self.noteTabActivated(idx);
+    self.applyScale(idx);
     self.layoutSplits();
+    // Its popups stayed where they were while the window moved.
+    self.repositionTabPopups(idx);
     if (focused) self.focusActiveSurface();
     if (previous < self.tab_count) self.hideTabPanes(previous);
     self.tab_bar.onTabShown(idx);
@@ -1503,97 +2014,81 @@ pub fn ringTab(self: *Window, surface: *Surface) void {
     self.invalidateTabBar();
 }
 
-/// Layout split panes for the active tab. The panes move in one
-/// DeferWindowPos batch, so they resize together instead of one after the
-/// other; during a live resize the window then waits once for all of them
-/// to present a frame at the new size.
+/// Layout split panes for the active tab (`split_layout.walk`): a zoomed
+/// tab shows only its zoomed pane. The panes move in one DeferWindowPos
+/// batch, so they resize together instead of one after the other; during a
+/// live resize the window then waits once for all of them to present a
+/// frame at the new size.
 pub fn layoutSplits(self: *Window) void {
     if (self.tab_count == 0) return;
-    const tree = self.tab_trees[self.active_tab];
-    const rect = self.surfaceRect();
-    var panes: PaneLayout = .{};
-    if (tree.zoomed) |zoomed_handle| {
+    self.layout_passes +|= 1;
+    const tree = &self.tab_trees[self.active_tab];
+    self.layout_key = self.layoutKey();
+    var panes: PaneLayout = .{ .visible = self.terminalsSeen() };
+    split_layout.walk(Tree, tree, self.splitArea(), self.splitMetrics().gap, &panes);
+    if (tree.zoomed != null) {
         var it = tree.iterator();
         while (it.next()) |entry| {
-            if (entry.handle == zoomed_handle) {
-                panes.add(entry.view, rect);
-            } else {
-                entry.view.setVisible(false);
-                if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
-            }
+            if (panes.holds(entry.view)) continue;
+            entry.view.setVisible(false);
+            if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
         }
-    } else {
-        self.layoutNode(&panes, tree, .root, rect);
     }
 
     self.laying_out = true;
     panes.apply();
     self.laying_out = false;
     panes.awaitResizeFrames();
-    if (tree.zoomed != null) return;
 
-    // Repaint the gaps and the divider lines directly using GetDC (not
-    // BeginPaint, which clips to the invalid region and misses the content
-    // area gaps), so no line of a previous layout or background of a
+    // The panes of a single pane or a zoomed tab cover the whole area.
+    // Between split panes, repaint the gaps and the divider lines directly
+    // using GetDC (not BeginPaint, which clips to the invalid region and
+    // misses the gaps), so no line of a previous layout or background of a
     // previous opacity stays behind.
-    if (self.hwnd) |hwnd| {
-        const hdc = w32.GetDC(hwnd);
-        if (hdc) |dc| {
-            self.eraseSurfaceArea(dc);
-            _ = w32.ReleaseDC(hwnd, dc);
-        }
-    }
+    if (!tree.isSplit() or tree.zoomed != null) return;
+    self.repaintSplitGaps();
 }
 
-fn layoutNode(self: *Window, panes: *PaneLayout, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
-    if (handle.idx() >= tree.nodes.len) return;
-    switch (tree.nodes[handle.idx()]) {
-        .leaf => |view| panes.add(view, rect),
-        .split => |s| {
-            const parts = self.splitRects(rect, s);
-            self.layoutNode(panes, tree, s.left, parts.first);
-            self.layoutNode(panes, tree, s.right, parts.second);
-        },
-    }
+/// The split tree of a tab.
+const Tree = SplitTree(Surface);
+
+fn layoutKey(self: *const Window) LayoutKey {
+    const tree = &self.tab_trees[self.active_tab];
+    return .{
+        .area = self.surfaceRect(),
+        .scale = self.scale,
+        .tab = self.active_tab,
+        .nodes = @intFromPtr(tree.nodes.ptr),
+        .zoomed = tree.zoomed,
+    };
 }
 
-/// The gap between split panes, in pixels.
-fn splitGap(self: *const Window) i32 {
-    return @intFromFloat(@round(5.0 * self.scale));
+/// Lay the panes out again (`layoutSplits`) unless the last layout still
+/// holds (a WM_SIZE on the way here did it); repaint the split gaps either
+/// way, for a new background or divider color.
+fn relayout(self: *Window) void {
+    if (self.tab_count == 0) return;
+    if (self.layout_key) |key| if (std.meta.eql(key, self.layoutKey())) return self.repaintSplitGaps();
+    self.layoutSplits();
 }
 
-/// A split node laid out over its rectangle: where its divider line is
-/// (x for a horizontal split, y for a vertical one) and the rectangles of
-/// its two children.
-const SplitRects = struct {
-    divider: i32,
-    first: w32.RECT,
-    second: w32.RECT,
-};
+/// A divider of the active tab laid out over the terminal area.
+const Divider = split_layout.Divider(Tree);
 
-fn splitRects(self: *const Window, rect: w32.RECT, s: SplitTree(Surface).Split) SplitRects {
-    const gap = self.splitGap();
-    const ratio: f32 = @floatCast(s.ratio);
-    switch (s.layout) {
-        .horizontal => {
-            const divider = splits.dividerPos(rect.left, rect.right - rect.left, ratio);
-            const spans = splits.childSpans(rect.left, rect.right, divider, gap);
-            return .{
-                .divider = divider,
-                .first = .{ .left = spans[0].start, .top = rect.top, .right = spans[0].end, .bottom = rect.bottom },
-                .second = .{ .left = spans[1].start, .top = rect.top, .right = spans[1].end, .bottom = rect.bottom },
-            };
-        },
-        .vertical => {
-            const divider = splits.dividerPos(rect.top, rect.bottom - rect.top, ratio);
-            const spans = splits.childSpans(rect.top, rect.bottom, divider, gap);
-            return .{
-                .divider = divider,
-                .first = .{ .left = rect.left, .top = spans[0].start, .right = rect.right, .bottom = spans[0].end },
-                .second = .{ .left = rect.left, .top = spans[1].start, .right = rect.right, .bottom = spans[1].end },
-            };
-        },
-    }
+/// The terminal area the panes of the active tab share.
+fn splitArea(self: *const Window) split_layout.Rect {
+    return @bitCast(self.surfaceRect());
+}
+
+/// The gap between split panes and the divider lines, in pixels.
+fn splitMetrics(self: *const Window) split_layout.Metrics {
+    return .forScale(self.scale);
+}
+
+/// How far from its line a divider takes the mouse, in pixels: at least
+/// the whole gap.
+fn dividerReach(self: *const Window) i32 {
+    return @max(style.px(3, self.scale), @divTrunc(self.splitMetrics().gap + 1, 2));
 }
 
 /// The visible panes of one layout pass and where they go.
@@ -1603,10 +2098,23 @@ const PaneLayout = struct {
     surfaces: [capacity]*Surface = undefined,
     rects: [capacity]w32.RECT = undefined,
     len: usize = 0,
+    /// What the panes tell their renderers (`Surface.setVisible`): false
+    /// while the window is occluded.
+    visible: bool = true,
+
+    /// `split_layout.walk` visitor.
+    pub fn pane(self: *PaneLayout, _: Tree.Node.Handle, surface: *Surface, rect: split_layout.Rect) void {
+        self.add(surface, @bitCast(rect));
+    }
+
+    /// Whether the pass shows `surface`, for a zoomed tab (one pane).
+    fn holds(self: *const PaneLayout, surface: *Surface) bool {
+        return std.mem.indexOfScalar(*Surface, self.surfaces[0..self.len], surface) != null;
+    }
 
     fn add(self: *PaneLayout, surface: *Surface, rect: w32.RECT) void {
         if (self.len == capacity) {
-            surface.setVisible(true);
+            surface.setVisible(self.visible);
             place(surface, rect);
             return;
         }
@@ -1617,12 +2125,15 @@ const PaneLayout = struct {
 
     const flags = w32.SWP_NOZORDER | w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW;
 
-    /// Mark the panes visible, then move and show them in one batch, or
-    /// one by one when the batch fails.
+    /// Mark the panes visible (unless the window is occluded), then move
+    /// and show them in one batch, or one by one when the batch fails.
     fn apply(self: *const PaneLayout) void {
         const surfaces = self.surfaces[0..self.len];
         const rects = self.rects[0..self.len];
-        for (surfaces) |surface| surface.setVisible(true);
+        for (surfaces) |surface| surface.setVisible(self.visible);
+        defer {
+            if (!self.visible) for (surfaces) |surface| surface.setVisible(false);
+        }
 
         batch: {
             var hdwp = w32.BeginDeferWindowPos(@intCast(self.len)) orelse break :batch;
@@ -1668,132 +2179,175 @@ const PaneLayout = struct {
 };
 
 /// Paint the part of the client area below the chrome that no pane covers
-/// with the terminal background, then the split dividers. When DWM
-/// composes the window per pixel the background gets the terminals'
-/// `background-opacity`, so the material shows through the gaps alike.
+/// with the terminal background, then the split dividers (WM_ERASEBKGND;
+/// the panes are clipped out). When DWM composes the window per pixel the
+/// background gets the terminals' `background-opacity`, so the material
+/// shows through the gaps alike.
 fn eraseSurfaceArea(self: *Window, hdc: w32.HDC) void {
-    const rect = self.surfaceRect();
+    self.fillTerminalBackground(hdc, self.surfaceRect());
+    self.paintDividers(hdc, false);
+}
+
+/// Repaint the gaps between the split panes of the active tab and their
+/// divider lines, outside WM_PAINT.
+fn repaintSplitGaps(self: *Window) void {
+    if (self.tab_count == 0) return;
+    const tree = &self.tab_trees[self.active_tab];
+    if (!tree.isSplit() or tree.zoomed != null) return;
+    const hwnd = self.hwnd orelse return;
+    const dc = w32.GetDC(hwnd) orelse return;
+    defer _ = w32.ReleaseDC(hwnd, dc);
+    self.paintDividers(dc, true);
+}
+
+/// Paint the divider lines of the active tab, the hovered or dragged one
+/// thicker in the accent color, after filling the gaps they lie in with
+/// the terminal background when `fill_gaps`.
+fn paintDividers(self: *Window, hdc: w32.HDC, fill_gaps: bool) void {
+    if (self.tab_count == 0) return;
+    const tree = &self.tab_trees[self.active_tab];
+    if (!tree.isSplit() or tree.zoomed != null) return;
+    const Painter = struct {
+        window: *Window,
+        hdc: w32.HDC,
+        fill_gaps: bool,
+        metrics: split_layout.Metrics,
+        colors: DividerColors,
+
+        pub fn divider(painter: *@This(), d: Divider) void {
+            if (painter.fill_gaps) painter.window.fillTerminalBackground(painter.hdc, @bitCast(d.band));
+            const active = painter.window.dividerActive(d.handle);
+            const line = d.line(if (active) painter.metrics.line_active else painter.metrics.line);
+            painter.window.fillColor(painter.hdc, @bitCast(line), if (active) painter.colors.active else painter.colors.normal);
+        }
+    };
+    const metrics = self.splitMetrics();
+    var painter: Painter = .{
+        .window = self,
+        .hdc = hdc,
+        .fill_gaps = fill_gaps,
+        .metrics = metrics,
+        .colors = self.dividerColors(),
+    };
+    split_layout.walk(Tree, tree, self.splitArea(), metrics.gap, &painter);
+}
+
+/// Fill `rect` of the window DC `hdc` with the terminal background.
+fn fillTerminalBackground(self: *Window, hdc: w32.HDC, rect: w32.RECT) void {
     const config = &self.app.config;
     if (Backdrop.perPixel(config, self.app.alpha_frames)) {
         Backdrop.fillBackground(hdc, rect, config);
-    } else {
-        const brush = self.app.bg_brush orelse return;
+    } else if (self.app.bg_brush) |brush| {
         _ = w32.FillRect(hdc, &rect, brush);
     }
-    self.paintDividers(hdc);
 }
 
-/// Color of the split dividers.
-const divider_color: configpkg.Config.Color = .{ .r = 0x80, .g = 0x80, .b = 0x80 };
-
-/// Paint divider lines between split panes in the active tab.
-fn paintDividers(self: *Window, hdc: w32.HDC) void {
-    if (self.tab_count == 0) return;
-    const tree = self.tab_trees[self.active_tab];
-    if (!tree.isSplit()) return;
-    if (tree.zoomed != null) return;
-    const rect = self.surfaceRect();
-    self.paintDividerNode(hdc, tree, .root, rect);
-}
-
-/// Draw one divider line of `width` pixels from (x0, y0) to (x1, y1), a
-/// vertical or horizontal line, opaque even when DWM composes the window
-/// per pixel (where a GDI pen would leave it transparent).
-fn drawDivider(self: *Window, hdc: w32.HDC, x0: i32, y0: i32, x1: i32, y1: i32, width: i32) void {
+/// Fill `rect` of the window DC `hdc` with the opaque `color`, also when
+/// DWM composes the window per pixel (where GDI leaves its pixels
+/// transparent).
+fn fillColor(self: *Window, hdc: w32.HDC, rect: w32.RECT, color: configpkg.Config.Color) void {
     if (Backdrop.perPixel(&self.app.config, self.app.alpha_frames)) {
-        const offset = @divTrunc(width, 2);
-        const line: w32.RECT = if (x0 == x1)
-            .{ .left = x0 - offset, .top = y0, .right = x0 - offset + width, .bottom = y1 }
-        else
-            .{ .left = x0, .top = y0 - offset, .right = x1, .bottom = y0 - offset + width };
-        Backdrop.fillOpaque(hdc, line, divider_color);
+        Backdrop.fillOpaque(hdc, rect, color);
         return;
     }
-    const pen = w32.CreatePen(0, width, w32.RGB(divider_color.r, divider_color.g, divider_color.b)) orelse return;
-    defer _ = w32.DeleteObject(pen);
-    const old_pen = w32.SelectObject(hdc, pen);
-    defer _ = w32.SelectObject(hdc, old_pen);
-    _ = w32.MoveToEx(hdc, x0, y0, null);
-    _ = w32.LineTo(hdc, x1, y1);
+    const brush = w32.GetStockObject(DC_BRUSH) orelse return;
+    _ = SetDCBrushColor(hdc, w32.RGB(color.r, color.g, color.b));
+    _ = w32.FillRect(hdc, &rect, @ptrCast(brush));
 }
 
-fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
-    if (handle.idx() >= tree.nodes.len) return;
-    switch (tree.nodes[handle.idx()]) {
-        .leaf => {},
-        .split => |s| {
-            const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
-            const parts = self.splitRects(rect, s);
-            switch (s.layout) {
-                .horizontal => self.drawDivider(hdc, parts.divider, rect.top, parts.divider, rect.bottom, line_w),
-                .vertical => self.drawDivider(hdc, rect.left, parts.divider, rect.right, parts.divider, line_w),
-            }
-            self.paintDividerNode(hdc, tree, s.left, parts.first);
-            self.paintDividerNode(hdc, tree, s.right, parts.second);
-        },
-    }
-}
-
-/// The divider of a split of the active tab under the pointer.
-const DividerHit = struct {
-    handle: SplitTree(Surface).Node.Handle,
-    layout: SplitTree(Surface).Split.Layout,
-    /// The rectangle of the split node in client pixels.
-    rect: w32.RECT,
-    /// How far the pointer is from the divider line, along the split.
-    grab: i32,
+/// The colors of the split dividers: `split-divider-color`, else the
+/// foreground mixed into the background (`gx.chrome.divider`), and the
+/// accent for the one hovered or dragged; the system colors in high
+/// contrast.
+const DividerColors = struct {
+    normal: configpkg.Config.Color,
+    active: configpkg.Config.Color,
 };
 
-fn hitTestDivider(self: *Window, x: i32, y: i32) ?DividerHit {
-    if (self.tab_count == 0) return null;
-    const tree = self.tab_trees[self.active_tab];
-    if (!tree.isSplit()) return null;
-    if (tree.zoomed != null) return null;
-    const rect = self.surfaceRect();
-    return self.hitTestDividerNode(tree, .root, rect, x, y);
+fn dividerColors(self: *const Window) DividerColors {
+    const config = &self.app.config;
+    if (style.system.highContrast()) {
+        const colors: gx.chrome.Chrome = .fromSystem(style.system.colors);
+        return .{ .normal = rgb8(colors.divider), .active = rgb8(colors.divider_active) };
+    }
+    const tokens = style.Tokens.fromConfig(config);
+    const options = gx.chrome.Options.fromConfig(config);
+    return .{
+        .normal = rgb8(options.divider orelse gx.chrome.divider(tokens.background, tokens.foreground)),
+        .active = rgb8(tokens.accent),
+    };
 }
 
-fn hitTestDividerNode(
-    self: *Window,
-    tree: SplitTree(Surface),
-    handle: SplitTree(Surface).Node.Handle,
-    rect: w32.RECT,
-    x: i32,
-    y: i32,
-) ?DividerHit {
-    if (handle.idx() >= tree.nodes.len) return null;
-    switch (tree.nodes[handle.idx()]) {
-        .leaf => return null,
-        .split => |s| {
-            const hit_area: i32 = @max(@as(i32, @intFromFloat(@round(3.0 * self.scale))), 3);
-            const parts = self.splitRects(rect, s);
-            const horizontal = s.layout == .horizontal;
-            const along = if (horizontal) x else y;
-            const across = if (horizontal) y else x;
-            const across_start = if (horizontal) rect.top else rect.left;
-            const across_end = if (horizontal) rect.bottom else rect.right;
-            if (along >= parts.divider - hit_area and along <= parts.divider + hit_area and
-                across >= across_start and across <= across_end)
-            {
-                return .{ .handle = handle, .layout = s.layout, .rect = rect, .grab = along - parts.divider };
-            }
-            return self.hitTestDividerNode(tree, s.left, parts.first, x, y) orelse
-                self.hitTestDividerNode(tree, s.right, parts.second, x, y);
-        },
-    }
+fn rgb8(color: style.Color) configpkg.Config.Color {
+    const c = color.toRgb8();
+    return .{ .r = c.r, .g = c.g, .b = c.b };
+}
+
+const DC_BRUSH: i32 = 18;
+extern "gdi32" fn SetDCBrushColor(hdc: w32.HDC, color: u32) callconv(.winapi) u32;
+
+/// Whether the divider of the split `handle` of the active tab is hovered
+/// or dragged.
+fn dividerActive(self: *const Window, handle: Tree.Node.Handle) bool {
+    if (self.dragging_split) return self.drag_split_tab == self.active_tab and self.drag_split_handle == handle;
+    return self.divider_hover == handle;
+}
+
+/// The divider of the active tab at client (x, y), if any.
+fn hitTestDivider(self: *Window, x: i32, y: i32) ?Divider {
+    if (self.tab_count == 0) return null;
+    const tree = &self.tab_trees[self.active_tab];
+    if (!tree.isSplit() or tree.zoomed != null) return null;
+    return split_layout.hitTest(Tree, tree, self.splitArea(), self.splitMetrics().gap, self.dividerReach(), x, y);
+}
+
+/// The pointer moved over the client area at (x, y) without dragging a
+/// divider: highlight the divider under it, if any.
+fn updateDividerHover(self: *Window, x: i32, y: i32) void {
+    const hit = self.hitTestDivider(x, y);
+    self.setDividerHover(if (hit) |d| d.handle else null);
+    if (hit == null or self.divider_tracking) return;
+    const hwnd = self.hwnd orelse return;
+    var tme = w32.TRACKMOUSEEVENT{
+        .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+        .dwFlags = w32.TME_LEAVE,
+        .hwndTrack = hwnd,
+        .dwHoverTime = 0,
+    };
+    if (w32.TrackMouseEvent(&tme) != 0) self.divider_tracking = true;
+}
+
+/// Highlight the divider of the split `handle` of the active tab (none for
+/// null) and repaint the dividers when that changed.
+fn setDividerHover(self: *Window, handle: ?Tree.Node.Handle) void {
+    if (self.divider_hover == handle) return;
+    self.divider_hover = handle;
+    if (!self.dragging_split) self.repaintSplitGaps();
 }
 
 /// The least a pane keeps of its split while a divider is dragged, in DIPs.
 const min_pane_size: f32 = 40;
 
-fn startDividerDrag(self: *Window, hit: DividerHit) void {
+/// Start dragging the divider `hit`, grabbed at the pointer offset `grab`
+/// from its line: the panes of the tab resize like in a live resize of the
+/// window, each layout waiting for their frames at the new size.
+fn startDividerDrag(self: *Window, hit: Divider, grab: i32) void {
     self.dragging_split = true;
     self.drag_split_tab = self.active_tab;
     self.drag_split_handle = hit.handle;
     self.drag_split_layout = hit.layout;
-    self.drag_split_rect = hit.rect;
-    self.drag_grab_offset = hit.grab;
+    self.drag_grab_offset = grab;
+    self.setPanesLiveResize(self.active_tab, true);
     if (self.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
+    self.repaintSplitGaps();
+}
+
+/// Mark the panes of tab `tab` as in a live resize (`Surface.handleResize`
+/// then waits for a frame at each new size), or not.
+fn setPanesLiveResize(self: *Window, tab: usize, live: bool) void {
+    if (tab >= self.tab_count) return;
+    var it = self.tab_trees[tab].iterator();
+    while (it.next()) |entry| entry.view.in_live_resize = live;
 }
 
 /// Move the dragged divider to follow the pointer at (x, y): the ratio of
@@ -1807,19 +2361,24 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
     const tree = &self.tab_trees[tab];
     const handle = self.drag_split_handle;
     if (handle.idx() >= tree.nodes.len) return self.cancelDividerDrag();
-    switch (tree.nodes[handle.idx()]) {
+    const current = switch (tree.nodes[handle.idx()]) {
         .leaf => return self.cancelDividerDrag(),
-        .split => |s| if (s.layout != self.drag_split_layout) return self.cancelDividerDrag(),
-    }
-
-    const rect = self.drag_split_rect;
-    const min_size = style.px(min_pane_size, self.scale) + self.splitGap();
-    const ratio = switch (self.drag_split_layout) {
-        .horizontal => splits.ratioAt(rect.left, rect.right - rect.left, x - self.drag_grab_offset, min_size),
-        .vertical => splits.ratioAt(rect.top, rect.bottom - rect.top, y - self.drag_grab_offset, min_size),
+        .split => |s| if (s.layout != self.drag_split_layout) return self.cancelDividerDrag() else s.ratio,
     };
-    tree.resizeInPlace(handle, @floatCast(ratio));
+    const metrics = self.splitMetrics();
+    const divider = split_layout.findDivider(Tree, tree, self.splitArea(), metrics.gap, handle) orelse
+        return self.cancelDividerDrag();
+
+    const rect = divider.rect;
+    const min_size = style.px(min_pane_size, self.scale) + metrics.gap;
+    const ratio: f16 = @floatCast(switch (self.drag_split_layout) {
+        .horizontal => splits.ratioAt(rect.left, rect.width(), x - self.drag_grab_offset, min_size),
+        .vertical => splits.ratioAt(rect.top, rect.height(), y - self.drag_grab_offset, min_size),
+    });
+    if (ratio == current) return;
+    tree.resizeInPlace(handle, ratio);
     self.layoutSplits();
+    self.showResizeOverlay();
 }
 
 /// End a divider drag: the button went up, the capture went elsewhere or
@@ -1827,20 +2386,28 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
 fn cancelDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
-    const hwnd = self.hwnd orelse return;
-    if (w32.GetCapture() == hwnd) _ = w32.ReleaseCapture();
+    self.setPanesLiveResize(self.drag_split_tab, false);
+    self.divider_hover = null;
+    if (self.hwnd) |hwnd| {
+        if (w32.GetCapture() == hwnd) _ = w32.ReleaseCapture();
+    }
+    if (self.drag_split_tab == self.active_tab) self.repaintSplitGaps();
 }
 
 /// Replace the split tree of tab `tab` and free the old one. A divider
-/// drag in that tab ends: its node belongs to the old tree.
+/// drag in that tab ends and its divider is no longer hovered: their nodes
+/// belong to the old tree.
 fn replaceTree(self: *Window, tab: usize, tree: SplitTree(Surface)) void {
     if (self.drag_split_tab == tab) self.cancelDividerDrag();
+    if (tab == self.active_tab) self.divider_hover = null;
     var old = self.tab_trees[tab];
     self.tab_trees[tab] = tree;
     old.deinit();
 }
 
-/// Create a new split in the active tab.
+/// Create a new split in the active tab. The new terminal starts in the
+/// half of the focused pane it takes (`split_layout.insertRect`), so its pty
+/// starts at its final size rather than the size of the whole tab.
 pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !void {
     if (self.tab_count == 0) return;
     const alloc = self.app.core_app.alloc;
@@ -1848,20 +2415,35 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
 
     const active_surface = self.tab_active_surface[tab];
     const handle = self.findHandle(tab, active_surface) orelse return;
+    const was_zoomed = self.tab_trees[tab].zoomed != null;
+
+    // Splitting unzooms the tab.
+    const metrics = self.splitMetrics();
+    var geometry = self.tab_trees[tab];
+    geometry.zoomed = null;
+    const area = self.splitArea();
+    const pane = split_layout.paneRect(Tree, &geometry, area, metrics.gap, handle) orelse area;
+    const rect: w32.RECT = @bitCast(split_layout.insertRect(Tree.Split.Direction, pane, direction, metrics.gap));
 
     // Create new surface. Once the single-node tree holds it, freeing the
     // tree frees the surface.
     const new_surface = try alloc.create(Surface);
-    new_surface.init(self.app, self, .split) catch |err| {
+    new_surface.initWithOptions(self.app, self, .{ .context = .split, .rect = rect }) catch |err| {
+        const new_hwnd = new_surface.hwnd;
         new_surface.deinit();
         alloc.destroy(new_surface);
+        destroyFreedWindow(new_hwnd);
         return err;
     };
+    const new_hwnd = new_surface.hwnd;
     var insert_tree = SplitTree(Surface).init(alloc, new_surface) catch |err| {
         new_surface.deinit();
         alloc.destroy(new_surface);
+        destroyFreedWindow(new_hwnd);
         return err;
     };
+    // On an error the terminal is freed with `insert_tree`, then its window.
+    errdefer destroyFreedWindow(new_hwnd);
     defer insert_tree.deinit();
 
     // Split the current tree at the active surface.
@@ -1877,6 +2459,8 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
     self.tab_active_surface[tab] = new_surface;
     self.replaceTree(tab, new_tree);
     self.refreshTabTitle(tab);
+    self.updateTabDim(tab);
+    if (was_zoomed) self.invalidateTabBar();
 
     self.layoutSplits();
     if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
@@ -1919,6 +2503,8 @@ pub fn gotoSplit(self: *Window, surface: *Surface, goto_target: apprt.action.Got
     ));
     self.tab_active_surface[tab] = next;
     self.refreshTabTitle(tab);
+    self.updateTabDim(tab);
+    if (zoomed and tree.zoomed == null) self.invalidateTabBar();
     if (tab == self.active_tab) {
         if (zoomed) self.layoutSplits();
         if (next.hwnd) |h| _ = w32.SetFocus(h);
@@ -1952,8 +2538,10 @@ pub fn resizeSplit(self: *Window, surface: *Surface, rs: apprt.action.ResizeSpli
     };
     const delta: f16 = @floatCast(std.math.clamp(sign * @as(f32, @floatFromInt(rs.amount)) / dimension, -1, 1));
 
+    const was_zoomed = tree.zoomed != null;
     const new_tree = tree.resize(self.app.core_app.alloc, handle, layout, delta) catch return false;
     self.replaceTree(tab, new_tree);
+    if (was_zoomed != (self.tab_trees[tab].zoomed != null)) self.onTabZoomChanged(tab);
     if (tab == self.active_tab) self.layoutSplits();
     return true;
 }
@@ -1977,6 +2565,7 @@ pub fn toggleSplitZoom(self: *Window, surface: *Surface) bool {
     if (!tree.isSplit()) return false;
     const handle = tree.locate(self.tab_active_surface[tab]) orelse return false;
     tree.zoom(if (tree.zoomed == handle) null else handle);
+    self.onTabZoomChanged(tab);
     if (tab == self.active_tab) self.layoutSplits();
     return true;
 }
@@ -2010,6 +2599,131 @@ pub fn moveTab(self: *Window, surface: *Surface, amount: isize) bool {
     const to = tabs.moveIndex(from, self.tab_count, amount) orelse return false;
     self.moveTabTo(from, to);
     return true;
+}
+
+pub fn moveSplitToTab(self: *Window, surface: *Surface) !bool {
+    if (self.closing or self.is_quick_terminal or self.tab_count >= MAX_TABS) return false;
+    const tab = self.findTabIndex(surface) orelse return false;
+    const tree = &self.tab_trees[tab];
+    if (!tree.isSplit()) return false;
+    const handle = tree.locate(surface) orelse return false;
+    const next = self.focusAfterMove(tab, handle);
+    const detached = try splits.detachPane(Tree, self.app.core_app.alloc, tree, handle);
+    self.finishSplitMove(tab, next, detached.remaining);
+    const pos = switch (self.app.config.@"window-new-tab-position") {
+        .current => tab + 1,
+        .end => self.tab_count,
+    };
+    self.insertMovedSlot(pos, .{
+        .tree = detached.moved,
+        .active_surface = surface,
+        .title = [_]u16{0} ** 256,
+        .title_len = 0,
+        .title_override = null,
+        .unread = false,
+        .bell = false,
+        .activated = 0,
+    });
+    self.refreshTabTitle(pos);
+    self.updateTabDim(pos);
+    self.selectTabIndex(pos);
+    self.updateTabBarVisibility();
+    self.invalidateTabBar();
+    self.updateAppMode();
+    return true;
+}
+
+pub fn moveSplitToNewWindow(self: *Window, surface: *Surface) !bool {
+    if (self.closing or self.is_quick_terminal) return false;
+    const tab = self.findTabIndex(surface) orelse return false;
+    const tree = &self.tab_trees[tab];
+    if (!tree.isSplit()) return false;
+    const handle = tree.locate(surface) orelse return false;
+    const next = self.focusAfterMove(tab, handle);
+    var detached = try splits.detachPane(Tree, self.app.core_app.alloc, tree, handle);
+    errdefer detached.remaining.deinit();
+    errdefer detached.moved.deinit();
+    const destination = try self.createMoveWindow();
+    errdefer self.discardMoveWindow(destination);
+    const child = surface.hwnd orelse return error.Win32Error;
+    const parent = destination.hwnd orelse return error.Win32Error;
+    self.cancelDividerDrag();
+    if (w32.SetParent(child, parent) == null) return error.Win32Error;
+    self.finishSplitMove(tab, next, detached.remaining);
+    destination.insertMovedSlot(0, .{
+        .tree = detached.moved,
+        .active_surface = surface,
+        .title = [_]u16{0} ** 256,
+        .title_len = 0,
+        .title_override = null,
+        .unread = false,
+        .bell = false,
+        .activated = 0,
+    });
+    surface.onReparented(destination);
+    destination.applyScale(0);
+    destination.updateTabDim(0);
+    destination.refreshTabTitle(0);
+    destination.noteTabActivated(0);
+    destination.tab_bar.onTabShown(0);
+    self.relayout();
+    self.repositionPopups();
+    self.invalidateTabBar();
+    self.updateAppMode();
+    destination.updateTabBarVisibility();
+    destination.layoutSplits();
+    destination.showWhenReady(surface);
+    destination.focusActiveSurface();
+    destination.updateAppMode();
+    return true;
+}
+
+fn focusAfterMove(self: *Window, tab: usize, handle: Tree.Node.Handle) *Surface {
+    const tree = &self.tab_trees[tab];
+    const surface = tree.nodes[handle.idx()].leaf;
+    if (self.tab_active_surface[tab] != surface) return self.tab_active_surface[tab];
+    const next = splits.focusAfterClose(Tree, self.app.core_app.alloc, tree, handle).?;
+    return tree.nodes[next.idx()].leaf;
+}
+
+fn finishSplitMove(self: *Window, tab: usize, next: *Surface, tree: Tree) void {
+    self.tab_bar.cancelRename();
+    self.tab_bar.cancelDrag();
+    self.cancelDividerDrag();
+    self.tab_active_surface[tab] = next;
+    self.replaceTree(tab, tree);
+    self.refreshTabTitle(tab);
+    self.updateTabDim(tab);
+}
+
+fn insertMovedSlot(self: *Window, pos: usize, slot: TabSlot) void {
+    self.cancelDividerDrag();
+    var index = self.tab_count;
+    while (index > pos) : (index -= 1) self.copySlot(index, index - 1);
+    self.setSlot(pos, slot);
+    if (self.tab_count > 0 and self.active_tab >= pos) self.active_tab += 1;
+    self.tab_count += 1;
+}
+
+fn createMoveWindow(self: *Window) !*Window {
+    const alloc = self.app.core_app.alloc;
+    const destination = try alloc.create(Window);
+    errdefer alloc.destroy(destination);
+    try destination.init(self.app, .{});
+    errdefer destination.deinit();
+    try self.app.windows.append(alloc, destination);
+    return destination;
+}
+
+fn discardMoveWindow(self: *Window, destination: *Window) void {
+    for (self.app.windows.items, 0..) |window, index| {
+        if (window == destination) {
+            _ = self.app.windows.orderedRemove(index);
+            break;
+        }
+    }
+    destination.deinit();
+    self.app.core_app.alloc.destroy(destination);
 }
 
 /// Move the tab containing `surface`, including all of its splits, into a new
@@ -2082,25 +2796,27 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     it = destination.tab_trees[0].iterator();
     while (it.next()) |entry| entry.view.onReparented(destination);
+    destination.applyScale(0);
+    destination.updateTabDim(0);
     destination.tab_bar.onTabShown(0);
 
-    // The panes of the moved tab belong to the destination now: show the
-    // tab that takes its place without hiding them.
     if (was_active) {
         self.tab_unread[self.active_tab] = false;
         self.tab_bell[self.active_tab] = false;
         self.noteTabActivated(self.active_tab);
-        self.layoutSplits();
+        self.applyScale(self.active_tab);
         self.tab_bar.onTabShown(self.active_tab);
         self.updateWindowTitle();
     }
     self.updateTabBarVisibility();
+    self.relayout();
+    self.repositionPopups();
     self.invalidateTabBar();
     self.updateAppMode();
 
     destination.updateTabBarVisibility();
     destination.updateWindowTitle();
-    destination.layoutSplits();
+    destination.relayout();
     destination.showWhenReady(moved_active);
     if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
     destination.updateAppMode();
@@ -2156,9 +2872,11 @@ fn refreshTabTitle(self: *Window, tab: usize) void {
 
 /// The terminal `surface` has a new title (`set_title`): its tab shows it
 /// while `surface` is the focused terminal of the tab and the tab has no
-/// title override.
+/// title override. A program may have started or exited in it, which herdr
+/// app mode looks at (`onAppModeTitle`).
 pub fn onSurfaceTitleChanged(self: *Window, surface: *Surface) void {
     const tab = self.findTabIndex(surface) orelse return;
+    self.onAppModeTitle();
     if (self.tab_active_surface[tab] != surface) return;
     self.refreshTabTitle(tab);
 }
@@ -2173,11 +2891,15 @@ pub fn setTabTitleOverride(self: *Window, tab: usize, title: tabs.Title) void {
 }
 
 /// Update tab bar visibility based on config and tab count. The chrome row
-/// can change height with it.
+/// can change height with it; the terminals follow without a size overlay
+/// (the user did not resize the window).
 fn updateTabBarVisibility(self: *Window) void {
     if (!self.tab_bar.updateVisibility()) return;
     self.applyFrameMargins();
-    self.handleResize();
+    self.layoutSplits();
+    self.overlay_grid = self.activeGrid();
+    self.shortcut_notice.reposition();
+    self.repositionOverlays();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
@@ -2192,50 +2914,119 @@ pub fn setTabBarSuppressed(self: *Window, suppressed: bool) void {
 /// herdr app mode (`gx-herdr-app-mode`, see src/gx/app_mode.zig): while
 /// the only tab of the window runs herdr in one of its terminals, the tab
 /// bar is hidden so the window presents herdr like an application of its
-/// own. Checked when tabs or splits change and, while the window has a
-/// single tab, on a timer (`app_mode_interval_ms`); a second tab or herdr
-/// exiting restores the tab bar.
+/// own; a second tab or herdr exiting restores the tab bar at once, while
+/// entering takes two checks in a row that find herdr (`gx.app_mode.State`).
+/// This checks now (tabs, splits or the configuration changed). Besides,
+/// a window with a single tab that is seen checks again shortly after a
+/// terminal title changes and on the tab bar's tick, less often while
+/// nothing changes (`gx.app_mode.nextDelay`). The checks read the process
+/// table the app shares (`App.processTable`).
 pub fn updateAppMode(self: *Window) void {
-    const enabled = self.app.config.@"gx-herdr-app-mode" and !self.is_quick_terminal;
-    const watch = enabled and !self.closing and self.tab_count == 1;
-    self.setAppModeTimer(watch);
-
-    // Each answer lists the processes, so stop at the first terminal that
-    // runs herdr: one is enough.
-    var answers: [app_mode_max_terminals]?bool = undefined;
-    var count: usize = 0;
-    if (watch) {
-        var it = self.tab_trees[0].iterator();
-        while (it.next()) |entry| {
-            if (count == answers.len) break;
-            const surface = entry.view;
-            const answer = if (surface.core_surface_ready) gx.app_mode.terminalRunsHerdr(
-                self.app.core_app.alloc,
-                global.io(),
-                surface.core_surface.getProcessInfo(.foreground_pid),
-                true,
-            ) else null;
-            answers[count] = answer;
-            count += 1;
-            if (answer orelse false) break;
-        }
-    }
-
-    const app_mode = gx.app_mode.decide(enabled, self.tab_count, answers[0..count], self.app_mode);
-    if (app_mode != self.app_mode) log.info("herdr app mode {s}", .{if (app_mode) "on" else "off"});
-    self.app_mode = app_mode;
-    self.setTabBarSuppressed(app_mode);
+    self.checkAppMode(true);
 }
 
-fn setAppModeTimer(self: *Window, run: bool) void {
-    if (self.app_mode_timer == run) return;
-    const hwnd = self.hwnd orelse return;
-    if (run) {
-        if (w32.SetTimer(hwnd, app_mode_timer_id, app_mode_interval_ms, null) == 0) return;
-    } else {
-        _ = w32.KillTimer(hwnd, app_mode_timer_id);
+/// Whether the window checks for herdr app mode: the feature is on and the
+/// window has a single tab.
+fn appModeWatched(self: *const Window) bool {
+    return self.app.config.@"gx-herdr-app-mode" and !self.is_quick_terminal and
+        !self.closing and self.tab_count == 1;
+}
+
+/// Check for herdr app mode and plan the next periodic check, sooner when
+/// something that can start or stop herdr happened (`reset`).
+fn checkAppMode(self: *Window, reset: bool) void {
+    const enabled = self.app.config.@"gx-herdr-app-mode" and !self.is_quick_terminal;
+    const watched = self.appModeWatched();
+    if (watched and !self.pollingVisible()) {
+        self.app_mode_due_ms = 0;
+        return self.stopAppModeSoon();
     }
-    self.app_mode_timer = run;
+    var answers: [app_mode_max_terminals]?bool = undefined;
+    const count = if (watched) self.appModeAnswers(&answers) else 0;
+
+    const was = self.app_mode;
+    const app_mode = self.app_mode_samples.update(&self.app_mode_state, enabled, self.tab_count, answers[0..count], self.app.proc_shared.captures);
+    if (app_mode != was) log.info("herdr app mode {s}", .{if (app_mode) "on" else "off"});
+    self.app_mode = app_mode;
+    self.setTabBarSuppressed(app_mode);
+
+    if (!watched) return self.stopAppModeSoon();
+    self.app_mode_delay_ms = gx.app_mode.nextDelay(
+        self.app_mode_delay_ms,
+        reset or app_mode != was or self.app_mode_state.pending(),
+    );
+    self.app_mode_due_ms = GetTickCount64() + self.app_mode_delay_ms;
+    // The tab bar ticks once a second; sooner checks need their own timer.
+    if (self.app_mode_delay_ms < chrome_timer_ms) self.checkAppModeIn(self.app_mode_delay_ms);
+}
+
+/// Whether each terminal of the only tab runs herdr, in `answers`, from the
+/// app's shared process table (`gx.app_mode.treeRunsHerdr`): null where it
+/// is unknown (a terminal that is not ready, no process table). Returns how
+/// many answers there are; they stop at the first terminal running herdr,
+/// as one is enough.
+fn appModeAnswers(self: *Window, answers: *[app_mode_max_terminals]?bool) usize {
+    var pids: [app_mode_max_terminals]?u64 = undefined;
+    var roots: [app_mode_max_terminals]gx.proc.Pid = undefined;
+    var count: usize = 0;
+    var root_count: usize = 0;
+    var it = self.tab_trees[0].iterator();
+    while (it.next()) |entry| {
+        if (count == answers.len) break;
+        const surface = entry.view;
+        pids[count] = if (surface.core_surface_ready) surface.core_surface.getProcessInfo(.foreground_pid) else null;
+        if (pids[count]) |pid| if (std.math.cast(gx.proc.Pid, pid)) |root| {
+            roots[root_count] = root;
+            root_count += 1;
+        };
+        answers[count] = null;
+        count += 1;
+    }
+
+    if (root_count == 0) return count;
+    const table = self.app.processTable() catch |err| {
+        log.warn("cannot list the processes for herdr app mode err={}", .{err});
+        return count;
+    };
+    var arena: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
+    defer arena.deinit();
+    const tree = table.tree(arena.allocator(), roots[0..root_count]) catch return count;
+    for (pids[0..count], 0..) |pid, i| {
+        if (pid == null) continue;
+        answers[i] = gx.app_mode.treeRunsHerdr(arena.allocator(), tree, pid, .native) catch null;
+        if (answers[i] orelse false) return i + 1;
+    }
+    return count;
+}
+
+/// The periodic app mode check shares the chrome tick.
+fn onAppModeTick(self: *Window) void {
+    if (!self.appModeWatched() or !self.pollingVisible() or self.app_mode_soon) return;
+    if (GetTickCount64() < self.app_mode_due_ms) return;
+    self.checkAppMode(false);
+}
+
+fn checkAppModeIn(self: *Window, delay_ms: u32) void {
+    if (!self.appModeWatched() or !self.pollingVisible() or self.app_mode_soon) return;
+    const hwnd = self.hwnd orelse return;
+    if (w32.SetTimer(hwnd, app_mode_soon_timer_id, delay_ms, null) != 0) self.app_mode_soon = true;
+}
+
+fn onAppModeSoon(self: *Window) void {
+    self.stopAppModeSoon();
+    if (self.pollingVisible()) self.checkAppMode(false);
+}
+
+fn onAppModeTitle(self: *Window) void {
+    if (!self.appModeWatched()) return;
+    self.app_mode_delay_ms = 0;
+    self.checkAppModeIn(app_mode_title_delay_ms);
+}
+
+fn stopAppModeSoon(self: *Window) void {
+    if (!self.app_mode_soon) return;
+    self.app_mode_soon = false;
+    if (self.hwnd) |hwnd| _ = w32.KillTimer(hwnd, app_mode_soon_timer_id);
 }
 
 /// Invalidate the tab bar region so it gets repainted.
@@ -2256,6 +3047,16 @@ pub fn setWindowTitleOverride(self: *Window, title: []const u16) void {
     self.updateWindowTitle();
 }
 
+pub fn toggleMaximize(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.title_bar.is_fullscreen) {
+        self.toggleFullscreen();
+        _ = w32.ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+    } else {
+        _ = w32.ShowWindow(hwnd, if (w32.IsZoomed(hwnd) != 0) w32.SW_RESTORE else SW_SHOWMAXIMIZED);
+    }
+}
+
 /// Toggle fullscreen mode on the top-level window.
 pub fn toggleFullscreen(self: *Window) void {
     self.title_bar.toggleFullscreen();
@@ -2267,11 +3068,14 @@ pub fn toggleWindowDecorations(self: *Window) void {
 }
 
 /// Handle WM_SIZE: re-layout the active tab's split panes, repaint the
-/// chrome and show the resize overlay.
+/// chrome and show the resize overlay (`showResizeOverlay`). Entering or
+/// leaving fullscreen can show or hide the tab bar: that is settled first,
+/// so the panes are laid out once.
 fn handleResize(self: *Window) void {
+    if (self.tab_bar.updateVisibility()) self.applyFrameMargins();
     self.layoutSplits();
     self.invalidateTabBar();
-    if (!self.is_quick_terminal) self.resize_overlay.show();
+    if (!self.is_quick_terminal) self.showResizeOverlay();
     self.shortcut_notice.reposition();
     self.repositionOverlays();
 }
@@ -2328,6 +3132,7 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
         return false;
     };
     scope.end();
+    check.done();
     if (!check.needed) return true;
 
     return Dialogs.confirmCloseWindowByTab(hwnd, check.groups.items) == .accept and isAlive(hwnd, self);
@@ -2345,6 +3150,11 @@ pub fn requestClose(self: *Window) void {
 /// because Win32 destroys child HWNDs during DestroyWindow and the
 /// OpenGL driver crashes if contexts are still active on destroyed windows.
 pub fn close(self: *Window) void {
+    // The last window remembers its place for the next one.
+    const windows = self.app.windows.items;
+    if (windows.len == 1 and windows[0] == self) self.saveWindowState();
+    // Off the screen at once: the terminals take a moment to stop.
+    self.hide();
     // First, cleanly shut down all surfaces (renderer/IO threads, WGL, DC).
     self.cleanupAllSurfaces();
 
@@ -2352,6 +3162,17 @@ pub fn close(self: *Window) void {
     if (self.hwnd) |hwnd| {
         _ = w32.DestroyWindow(hwnd);
     }
+}
+
+/// Hide the window for good, before its terminals stop: input no longer
+/// reaches it (`closing`) and its renderers are not told about the hide.
+fn hide(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    self.closing = true;
+    self.visibility.deinit(hwnd);
+    self.stopAppModeSoon();
+    _ = w32.KillTimer(hwnd, CHROME_TIMER_ID);
+    _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
 }
 
 /// Deinit and free all tab trees (which unrefs and frees surfaces).
@@ -2362,11 +3183,12 @@ fn cleanupAllSurfaces(self: *Window) void {
     // of trees being freed (SplitTree.deinit leaves its tree undefined).
     const count = self.tab_count;
     self.tab_count = 0;
-    for (self.tab_trees[0..count]) |*slot| {
-        var tree = slot.*;
+    var trees: [MAX_TABS]Tree = undefined;
+    for (self.tab_trees[0..count], trees[0..count]) |*slot, *tree| {
+        tree.* = slot.*;
         slot.* = .empty;
-        tree.deinit();
     }
+    freeTrees(trees[0..count]);
 }
 
 /// Handle WM_DESTROY: remove this window from the App's list,
@@ -2374,6 +3196,7 @@ fn cleanupAllSurfaces(self: *Window) void {
 /// Surfaces are already cleaned up by close() before DestroyWindow.
 fn onDestroy(self: *Window) void {
     const app = self.app;
+    self.visibility.deinit(self.hwnd);
     Settings.onWindowDestroyed(self);
 
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
@@ -2462,7 +3285,10 @@ fn onChromeRightClick(self: *Window, pt: w32.POINT) void {
 /// A system broadcast reached this window (only top-level windows hear
 /// them; every window hears each one): read the system colors and high
 /// contrast state of the design tokens again (`style.system`), then tell
-/// the app, the backdrop and the title bar. GUI thread. `.theme` also
+/// the app, the backdrop and the title bar, and repaint the split dividers
+/// after a change of the system colors (high contrast). The terminal
+/// windows draw nothing of the system colors; the popups are top-level
+/// windows and hear the broadcasts themselves. GUI thread. `.theme` also
 /// comes from `SetWindowTheme` on this window: `Backdrop.apply` sends one
 /// from `init`, before the window has tabs.
 fn onSystemSettingChange(self: *Window, change: w32.SystemChange) void {
@@ -2474,6 +3300,19 @@ fn onSystemSettingChange(self: *Window, change: w32.SystemChange) void {
     self.app.onSystemSettingChange(self, change);
     Backdrop.onSystemSettingChange(hwnd, &self.app.config, self.app.alpha_frames, change);
     self.title_bar.onSystemSettingChange(change);
+    self.repaintSplitGaps();
+    const message: u32, const wp: usize, const lp: isize = switch (change) {
+        .setting => |setting| .{ w32.WM_SETTINGCHANGE, setting.action, if (setting.area) |area| @bitCast(@intFromPtr(area)) else 0 },
+        .sys_colors => .{ w32.WM_SYSCOLORCHANGE, 0, 0 },
+        .theme => .{ w32.WM_THEMECHANGED, 0, 0 },
+        .colorization => |color| .{ w32.WM_DWMCOLORIZATIONCOLORCHANGED, color.color, @intFromBool(color.opaque_blend) },
+    };
+    for (0..self.tab_count) |tab| {
+        var it = self.tab_trees[tab].iterator();
+        while (it.next()) |entry| if (entry.view.hwnd) |child| {
+            _ = w32.SendMessageW(child, message, wp, lp);
+        };
+    }
 }
 
 /// Window procedure for top-level container HWNDs (GhosttyWindow class).
@@ -2520,6 +3359,9 @@ pub fn windowWndProc(
     // System broadcasts go on to the default handling afterwards.
     if (w32.SystemChange.fromMessage(msg, wparam, lparam)) |change| window.onSystemSettingChange(change);
 
+    if (msg == TitleBar.WM_SYSCOMMAND and wparam & 0xFFF0 == 0xF030 and window.title_bar.is_fullscreen) {
+        window.toggleFullscreen();
+    }
     // The title bar owns the non-client frame and sees every message first.
     if (window.title_bar.handleMessage(msg, wparam, lparam)) |result| return result;
 
@@ -2540,15 +3382,30 @@ pub fn windowWndProc(
             if (window.title_bar.onTimer(wparam)) return 0;
             switch (wparam) {
                 FIRST_FRAME_TIMER_ID => window.checkFirstFrame(),
-                CHROME_TIMER_ID => window.tab_bar.onTimer(),
-                app_mode_timer_id => window.updateAppMode(),
+                CHROME_TIMER_ID => {
+                    if (!window.pollingVisible()) return 0;
+                    window.tab_bar.onTimer();
+                    window.onAppModeTick();
+                },
+                app_mode_soon_timer_id => window.onAppModeSoon(),
                 else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
             }
             return 0;
         },
 
         WM_APP_MAIN_MENU => {
-            if (!window.closing) Menu.showMainMenu(window, window.main_menu_anchor);
+            if (window.closing) return 0;
+            if (window.main_menu_anchor) |anchor| {
+                Menu.showMainMenu(window, anchor);
+            } else {
+                const layout = window.title_bar.layout();
+                var top_left: w32.POINT = .{ .x = layout.menu.left, .y = layout.menu.top };
+                var bottom_right: w32.POINT = .{ .x = layout.menu.right, .y = layout.bar.bottom };
+                _ = w32.ClientToScreen(hwnd, &top_left);
+                _ = w32.ClientToScreen(hwnd, &bottom_right);
+                const anchor: w32.RECT = .{ .left = top_left.x, .top = top_left.y, .right = bottom_right.x, .bottom = bottom_right.y };
+                Menu.showMain(window, if (layout.menu.right > layout.menu.left) anchor else null, .right);
+            }
             return 0;
         },
 
@@ -2557,8 +3414,10 @@ pub fn windowWndProc(
             return 0;
         },
 
-        // Nothing posts it yet: `checkFirstFrame` uncloaks the window.
-        WM_APP_FIRST_FRAME => return 0,
+        WM_APP_FIRST_FRAME => {
+            window.onFirstFrame(@bitCast(lparam));
+            return 0;
+        },
 
         Popup.WM_GX_OWNER_ACTIVE_LOCK => {
             window.title_bar.onOwnerActiveLock(wparam != 0);
@@ -2566,6 +3425,45 @@ pub fn windowWndProc(
         },
 
         WM_GHOSTTY_SIMULATE_SYSTEM_THEME => return @intFromBool(window.app.simulateSystemTheme(wparam)),
+        WM_GHOSTTY_WINDOW_STATE => {
+            return switch (wparam) {
+                0 => @as(isize, @as(u8, @bitCast(window.occlusion))) |
+                    (@as(isize, @intFromBool(window.visibility.unregister_session != null)) << 8) |
+                    (@as(isize, @intFromBool(window.visibility.power != null)) << 9) |
+                    (@as(isize, @intFromBool(window.visibility.cloak_hook != null)) << 10) |
+                    (@as(isize, @intFromBool(window.title_bar.is_fullscreen)) << 16),
+                1 => @intCast(window.tab_count),
+                2 => @intFromFloat(window.scale * 96),
+                3 => if (window.getActiveSurface()) |surface| @intFromFloat(surface.scale * 96) else 0,
+                4 => if (window.getActiveSurface()) |surface| @intFromBool(surface.last_reported_visible orelse false) else 0,
+                5 => @intFromBool(window.app_mode_soon),
+                6 => if (window.getActiveSurface()) |surface| @intFromBool(window.moveSplitToTab(surface) catch false) else 0,
+                7 => if (window.getActiveSurface()) |surface| @intFromBool(window.moveSplitToNewWindow(surface) catch false) else 0,
+                8 => @intCast(@min(window.layout_passes, std.math.maxInt(isize))),
+                9 => blk: {
+                    window.toggleMaximize();
+                    break :blk 1;
+                },
+                10 => @intCast(window.active_tab),
+                11 => @intFromBool(window.app_mode),
+                12 => window.app_mode_state.hits,
+                else => 0,
+            };
+        },
+        WM_GHOSTTY_SIMULATE_OCCLUSION => {
+            window.setOcclusion("locked", wparam & 1 != 0);
+            window.setOcclusion("display_off", wparam & 2 != 0);
+            window.setOcclusion("desktop", wparam & 4 != 0);
+            return 1;
+        },
+        VisibilitySubscriptions.WM_WTSSESSION_CHANGE => {
+            switch (wparam) {
+                VisibilitySubscriptions.WTS_SESSION_LOCK => window.setOcclusion("locked", true),
+                VisibilitySubscriptions.WTS_SESSION_UNLOCK => window.setOcclusion("locked", false),
+                else => {},
+            }
+            return 0;
+        },
 
         w32.WM_MOUSEWHEEL, w32.WM_MOUSEHWHEEL => {
             // The pointer is in screen coordinates.
@@ -2586,15 +3484,36 @@ pub fn windowWndProc(
             // both re-mark the surfaces visible (undoing the occlusion) and
             // collapse the grid, and the resize overlay would flash offscreen.
             if (wparam == w32.SIZE_MINIMIZED) {
-                window.setActiveTabVisible(false);
+                window.setOcclusion("minimized", true);
                 return 0;
             }
             if (wparam == w32.SIZE_RESTORED or wparam == w32.SIZE_MAXIMIZED) {
-                window.setActiveTabVisible(true);
+                window.setOcclusion("minimized", false);
             }
             window.title_bar.onSize();
             window.handleResize();
             return 0;
+        },
+        w32.WM_SHOWWINDOW => {
+            if (!window.closing) window.setOcclusion("hidden", wparam == 0);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        WM_WINDOWPOSCHANGED => {
+            // Hidden (`toggle_visibility`, the quick terminal), the
+            // terminals draw nothing. ShowWindow and SetWindowPos both
+            // say so here; a minimized window stays shown.
+            const pos: *const WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (!window.closing) {
+                if (pos.flags & SWP_HIDEWINDOW != 0) {
+                    window.setOcclusion("hidden", true);
+                } else if (pos.flags & w32.SWP_SHOWWINDOW != 0) {
+                    window.setOcclusion("hidden", false);
+                }
+            }
+            // DefWindowProc sends WM_SIZE and WM_MOVE.
+            const result = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            window.trackPlacement();
+            return result;
         },
         w32.WM_POWERBROADCAST => {
             // After system sleep/resume nothing else kicks a re-present:
@@ -2609,16 +3528,22 @@ pub fn windowWndProc(
                 wparam == w32.PBT_APMRESUMESUSPEND)
             {
                 log.info("system resumed, redrawing the terminals", .{});
+                VisibilitySubscriptions.refreshShell(window);
                 window.refreshRenderers();
+                return 1;
+            }
+            if (wparam == VisibilitySubscriptions.PBT_POWERSETTINGCHANGE and lparam != 0) {
+                const setting: *const VisibilitySubscriptions.PowerSetting = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                if (VisibilitySubscriptions.displayOff(setting)) |off| window.setOcclusion("display_off", off);
                 return 1;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_DISPLAYCHANGE => {
-            // A resolution or monitor layout change can lose the window
-            // contents, and screen-positioned popups may now be off.
             log.info("display changed, redrawing the terminals", .{});
             if (window.quickTerminal()) |qt| qt.relayout();
+            window.fitFullscreen();
+            VisibilitySubscriptions.refreshShell(window);
             window.refreshRenderers();
             window.repositionPopups();
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2668,17 +3593,11 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_ENTERSIZEMOVE => {
-            if (window.tab_count > 0) {
-                var it = window.tab_trees[window.active_tab].iterator();
-                while (it.next()) |entry| entry.view.in_live_resize = true;
-            }
+            window.setPanesLiveResize(window.active_tab, true);
             return 0;
         },
         w32.WM_EXITSIZEMOVE => {
-            if (window.tab_count > 0) {
-                var it = window.tab_trees[window.active_tab].iterator();
-                while (it.next()) |entry| entry.view.in_live_resize = false;
-            }
+            window.setPanesLiveResize(window.active_tab, false);
             return 0;
         },
         w32.WM_CLOSE => {
@@ -2732,7 +3651,8 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const pt = mousePoint(lparam);
             if (window.hitTestDivider(pt.x, pt.y)) |hit| {
-                window.startDividerDrag(hit);
+                const along = if (hit.layout == .horizontal) pt.x else pt.y;
+                window.startDividerDrag(hit, along - hit.pos);
                 return 0;
             }
             _ = window.title_bar.onLeftButtonDown(pt.x, pt.y);
@@ -2754,8 +3674,11 @@ pub fn windowWndProc(
                 _ = window.tab_bar.onDoubleClick(window.title_bar.layout(), pt.x, pt.y);
                 return 0;
             }
+            // Double-click on a divider: the panes on both sides get the
+            // same share.
             if (window.hitTestDivider(pt.x, pt.y)) |hit| {
-                window.tab_trees[window.active_tab].resizeInPlace(hit.handle, @as(f16, 0.5));
+                const tree = &window.tab_trees[window.active_tab];
+                tree.resizeInPlace(hit.handle, split_layout.balancedRatio(Tree, tree, hit.handle));
                 window.layoutSplits();
                 return 0;
             }
@@ -2788,6 +3711,7 @@ pub fn windowWndProc(
                     return 0;
                 }
             }
+            window.updateDividerHover(pt.x, pt.y);
             // Tab drag reorder and chrome hover.
             _ = window.title_bar.onMouseMove(pt.x, pt.y);
             return 0;
@@ -2812,6 +3736,8 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_MOUSELEAVE => {
+            window.divider_tracking = false;
+            if (!window.dragging_split) window.setDividerHover(null);
             window.title_bar.onMouseLeave();
             return 0;
         },
@@ -2902,6 +3828,207 @@ test "feedback waits for a settled Quick owner and discards a closing owner" {
             window.closing = false;
         }
     }
+}
+
+const VisibilitySubscriptions = struct {
+    wts_module: ?w32.HINSTANCE = null,
+    unregister_session: ?*const fn (w32.HWND) callconv(.winapi) i32 = null,
+    power: ?*anyopaque = null,
+    unregister_power: ?*const fn (*anyopaque) callconv(.winapi) i32 = null,
+    cloak_hook: ?*anyopaque = null,
+    unhook: ?*const fn (*anyopaque) callconv(.winapi) i32 = null,
+
+    const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+    const WTS_SESSION_LOCK: usize = 7;
+    const WTS_SESSION_UNLOCK: usize = 8;
+    const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+    const EVENT_OBJECT_CLOAKED: u32 = 0x8017;
+    const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
+    const DWMWA_CLOAKED: u32 = 14;
+    const DWM_CLOAKED_SHELL: u32 = 2;
+    const display_state: w32.GUID = .{
+        .Data1 = 0x6FE69556,
+        .Data2 = 0x704A,
+        .Data3 = 0x47A0,
+        .Data4 = .{ 0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47 },
+    };
+    const PowerSetting = extern struct { guid: w32.GUID, length: u32, state: u32 };
+    const WinEventProc = *const fn (?*anyopaque, u32, ?w32.HWND, i32, i32, u32, u32) callconv(.winapi) void;
+
+    fn init(self: *VisibilitySubscriptions, hwnd: w32.HWND) void {
+        const RegisterSession = *const fn (w32.HWND, u32) callconv(.winapi) i32;
+        if (LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral("wtsapi32.dll"), null, 0x800)) |module| {
+            self.wts_module = module;
+            const register = proc(RegisterSession, module, "WTSRegisterSessionNotification");
+            const unregister = proc(@TypeOf(self.unregister_session.?), module, "WTSUnRegisterSessionNotification");
+            if (register != null and unregister != null and register.?(hwnd, 0) != 0) {
+                self.unregister_session = unregister;
+            }
+        }
+        const user = w32.GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("user32.dll")) orelse return;
+        const RegisterPower = *const fn (w32.HWND, *const w32.GUID, u32) callconv(.winapi) ?*anyopaque;
+        if (proc(RegisterPower, user, "RegisterPowerSettingNotification")) |register| {
+            if (proc(@TypeOf(self.unregister_power.?), user, "UnregisterPowerSettingNotification")) |unregister| {
+                self.unregister_power = unregister;
+                self.power = register(hwnd, &display_state, 0);
+            }
+        }
+        const SetHook = *const fn (u32, u32, ?w32.HINSTANCE, WinEventProc, u32, u32, u32) callconv(.winapi) ?*anyopaque;
+        if (proc(SetHook, user, "SetWinEventHook")) |set_hook| {
+            if (proc(@TypeOf(self.unhook.?), user, "UnhookWinEvent")) |unhook| {
+                self.unhook = unhook;
+                self.cloak_hook = set_hook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, null, onCloakEvent, GetCurrentProcessId(), 0, 0);
+            }
+        }
+        log.debug("visibility subscriptions session={} power={} cloak={}", .{
+            self.unregister_session != null, self.power != null, self.cloak_hook != null,
+        });
+    }
+
+    fn deinit(self: *VisibilitySubscriptions, hwnd: ?w32.HWND) void {
+        if (self.cloak_hook) |hook| {
+            if (self.unhook) |unhook| _ = unhook(hook);
+        }
+        if (self.power) |power| {
+            if (self.unregister_power) |unregister| _ = unregister(power);
+        }
+        if (hwnd) |h| {
+            if (self.unregister_session) |unregister| _ = unregister(h);
+        }
+        if (self.wts_module) |module| _ = FreeLibrary(module);
+        self.* = .{};
+    }
+
+    fn shellCloaked(flags: u32) bool {
+        return flags & DWM_CLOAKED_SHELL != 0;
+    }
+
+    fn refreshShell(window: *Window) void {
+        const hwnd = window.hwnd orelse return;
+        var flags: u32 = 0;
+        if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, @sizeOf(u32)) >= 0) {
+            window.setOcclusion("desktop", shellCloaked(flags));
+        }
+    }
+
+    fn onCloakEvent(hook: ?*anyopaque, _: u32, target: ?w32.HWND, object: i32, child: i32, _: u32, _: u32) callconv(.winapi) void {
+        if (object != 0 or child != 0) return;
+        const hwnd = target orelse return;
+        var name: [64]u16 = undefined;
+        const len = GetClassNameW(hwnd, &name, name.len);
+        if (len <= 0 or !std.mem.eql(u16, name[0..@intCast(len)], App.WINDOW_CLASS_NAME[0..])) return;
+        const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+        if (userdata == 0) return;
+        const window: *Window = @ptrFromInt(@as(usize, @bitCast(userdata)));
+        if (window.visibility.cloak_hook != hook) return;
+        refreshShell(window);
+    }
+
+    fn displayOff(setting: *const PowerSetting) ?bool {
+        if (setting.length != @sizeOf(u32) or !std.meta.eql(setting.guid, display_state)) return null;
+        return switch (setting.state) {
+            0, 2 => true,
+            1 => false,
+            else => null,
+        };
+    }
+
+    fn proc(comptime T: type, module: w32.HINSTANCE, name: [:0]const u8) ?T {
+        return @ptrCast(GetProcAddress(module, name.ptr));
+    }
+
+    extern "kernel32" fn LoadLibraryExW([*:0]const u16, ?*anyopaque, u32) callconv(.winapi) ?w32.HINSTANCE;
+    extern "kernel32" fn FreeLibrary(w32.HINSTANCE) callconv(.winapi) i32;
+    extern "kernel32" fn GetProcAddress(w32.HINSTANCE, [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "user32" fn GetClassNameW(w32.HWND, [*]u16, i32) callconv(.winapi) i32;
+    extern "dwmapi" fn DwmGetWindowAttribute(w32.HWND, u32, *anyopaque, u32) callconv(.winapi) i32;
+};
+
+pub const WM_GHOSTTY_WINDOW_STATE: u32 = w32.WM_USER + 0x4A;
+pub const WM_GHOSTTY_SIMULATE_OCCLUSION: u32 = w32.WM_USER + 0x4B;
+
+fn fitFullscreen(self: *Window) void {
+    if (!self.title_bar.is_fullscreen) return;
+    const hwnd = self.hwnd orelse return;
+    const monitor = w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST);
+    var info: w32.MONITORINFO = .{ .cbSize = @sizeOf(w32.MONITORINFO), .rcMonitor = undefined, .rcWork = undefined, .dwFlags = 0 };
+    if (w32.GetMonitorInfoW(monitor, &info) == 0) return;
+    const rect = info.rcMonitor;
+    _ = w32.SetWindowPos(hwnd, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+}
+
+test "only shell cloak pauses the renderers" {
+    try std.testing.expect(!VisibilitySubscriptions.shellCloaked(0));
+    try std.testing.expect(!VisibilitySubscriptions.shellCloaked(1));
+    try std.testing.expect(!VisibilitySubscriptions.shellCloaked(4));
+    try std.testing.expect(VisibilitySubscriptions.shellCloaked(2));
+    try std.testing.expect(VisibilitySubscriptions.shellCloaked(3));
+}
+
+test "display notifications reject other settings and damaged payloads" {
+    const V = VisibilitySubscriptions;
+    var setting: V.PowerSetting = .{ .guid = V.display_state, .length = 4, .state = 0 };
+    try std.testing.expectEqual(@as(?bool, true), V.displayOff(&setting));
+    setting.state = 1;
+    try std.testing.expectEqual(@as(?bool, false), V.displayOff(&setting));
+    setting.state = 2;
+    try std.testing.expectEqual(@as(?bool, true), V.displayOff(&setting));
+    setting.state = 3;
+    try std.testing.expectEqual(@as(?bool, null), V.displayOff(&setting));
+    setting.length = 1;
+    try std.testing.expectEqual(@as(?bool, null), V.displayOff(&setting));
+    setting.length = 4;
+    setting.guid.Data1 = 0;
+    try std.testing.expectEqual(@as(?bool, null), V.displayOff(&setting));
+}
+
+const AppModeSamples = struct {
+    positive_capture: ?u64 = null,
+
+    fn update(self: *AppModeSamples, state: *gx.app_mode.State, enabled: bool, count: usize, answers: []const ?bool, capture: u64) bool {
+        if (!enabled or count != 1) {
+            self.positive_capture = null;
+            return state.update(enabled, count, answers);
+        }
+        const positive = for (answers) |answer| {
+            if (answer orelse false) break true;
+        } else false;
+        if (positive and state.pending() and self.positive_capture == capture) return state.active;
+        const active = state.update(enabled, count, answers);
+        if (positive) {
+            self.positive_capture = capture;
+        } else if (!state.pending()) {
+            self.positive_capture = null;
+        }
+        return active;
+    }
+};
+
+test "app mode hysteresis needs two independently captured process tables" {
+    var state: gx.app_mode.State = .{};
+    var samples: AppModeSamples = .{};
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expectEqual(@as(u8, 1), state.hits);
+    try std.testing.expect(!samples.update(&state, true, 1, &.{null}, 2));
+    try std.testing.expect(samples.update(&state, true, 1, &.{true}, 2));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{false}, 2));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 2));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 2));
+    try std.testing.expect(samples.update(&state, true, 1, &.{true}, 3));
+}
+
+test "app mode samples reset when the feature is disabled or another tab opens" {
+    var state: gx.app_mode.State = .{};
+    var samples: AppModeSamples = .{};
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, true, 2, &.{true}, 1));
+    try std.testing.expectEqual(@as(?u64, null), samples.positive_capture);
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, false, 1, &.{true}, 1));
+    try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
+    try std.testing.expect(samples.update(&state, true, 1, &.{true}, 2));
 }
 
 test {

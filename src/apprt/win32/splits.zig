@@ -66,6 +66,22 @@ pub fn zoomAfterFocus(comptime Handle: type, zoomed: ?Handle, focus: Handle, pre
     return null;
 }
 
+pub fn Detached(comptime Tree: type) type {
+    return struct { remaining: Tree, moved: Tree };
+}
+
+pub fn detachPane(comptime Tree: type, alloc: std.mem.Allocator, tree: *Tree, handle: Tree.Node.Handle) !Detached(Tree) {
+    if (!tree.isSplit()) return error.OnlyPane;
+    if (handle.idx() >= tree.nodes.len) return error.InvalidPane;
+    const view = switch (tree.nodes[handle.idx()]) {
+        .leaf => |view| view,
+        .split => return error.InvalidPane,
+    };
+    var moved = try Tree.init(alloc, view);
+    errdefer moved.deinit();
+    return .{ .remaining = try tree.remove(alloc, handle), .moved = moved };
+}
+
 test "ratioAt is the inverse of dividerPos" {
     const testing = std.testing;
     for ([_]i32{ 1, 2, 3, 7, 100, 497, 1000, 1024, 2047 }) |extent| {
@@ -187,4 +203,41 @@ test "zoomAfterFocus" {
     try testing.expectEqual(@as(?H, a), zoomAfterFocus(H, a, a, false));
     try testing.expectEqual(@as(?H, null), zoomAfterFocus(H, a, b, false));
     try testing.expectEqual(@as(?H, b), zoomAfterFocus(H, a, b, true));
+}
+
+test "detachPane moves one view without changing the source on allocation failure" {
+    const Helper = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const Tree = @import("../../datastruct/split_tree.zig").SplitTree(TestView);
+            var a: TestView = .{ .label = 'A' };
+            var b: TestView = .{ .label = 'B' };
+            var c: TestView = .{ .label = 'C' };
+            var ta: Tree = try .init(alloc, &a);
+            defer ta.deinit();
+            var tb: Tree = try .init(alloc, &b);
+            defer tb.deinit();
+            var tc: Tree = try .init(alloc, &c);
+            defer tc.deinit();
+            var ab = try ta.split(alloc, .root, .right, 0.5, &tb);
+            defer ab.deinit();
+            var tree = try ab.split(alloc, ab.locate(&b).?, .down, 0.5, &tc);
+            defer tree.deinit();
+            tree.zoom(tree.locate(&c));
+            const original = tree.nodes.ptr;
+            var detached = try detachPane(Tree, alloc, &tree, tree.locate(&b).?);
+            defer detached.moved.deinit();
+            defer detached.remaining.deinit();
+            try std.testing.expectEqual(original, tree.nodes.ptr);
+            try std.testing.expect(tree.locate(&b) != null);
+            try std.testing.expect(detached.remaining.locate(&b) == null);
+            try std.testing.expect(detached.remaining.locate(&a) != null);
+            try std.testing.expect(detached.remaining.locate(&c) != null);
+            try std.testing.expectEqual(&b, detached.moved.nodes[0].leaf);
+            try std.testing.expect(!detached.moved.isSplit());
+            try std.testing.expectError(error.OnlyPane, detachPane(Tree, alloc, &ta, .root));
+            try std.testing.expectError(error.InvalidPane, detachPane(Tree, alloc, &tree, .root));
+            try std.testing.expectError(error.InvalidPane, detachPane(Tree, alloc, &tree, @enumFromInt(60)));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Helper.run, .{});
 }
