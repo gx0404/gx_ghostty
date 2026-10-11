@@ -1102,16 +1102,12 @@ pub fn performAction(
         },
 
         .new_tab => {
-            // Add a new tab to the parent window of the focused surface.
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    const parent = core_surface.rt_surface.parent_window;
-                    _ = parent.addTab() catch |err| {
-                        log.err("failed to add new tab err={}", .{err});
-                    };
-                },
-            }
+            const parent = self.targetWindow(target) orelse return false;
+            if (parent.is_quick_terminal) return false;
+            _ = parent.addTab() catch |err| {
+                log.err("failed to add new tab err={}", .{err});
+                return false;
+            };
             return true;
         },
 
@@ -1809,9 +1805,9 @@ fn presentSurface(self: *App, surface: *Surface) void {
     const window = surface.parent_window;
     const hwnd = window.hwnd orelse return;
     if (window.is_quick_terminal) {
-        if (self.quick_terminal) |qt| {
-            if (qt.window == window and w32.IsWindowVisible_(hwnd) == 0) qt.toggle();
-        }
+        const qt = self.quick_terminal orelse return;
+        if (qt.window != window) return;
+        qt.present();
     } else {
         if (w32.IsWindowVisible_(hwnd) == 0) {
             _ = w32.ShowWindow(hwnd, SW_SHOWNA);
@@ -2008,6 +2004,7 @@ pub const ProfileTarget = enum { tab, window };
 /// logging why, when there is no such profile or the terminal could not
 /// be created.
 pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTarget) bool {
+    if (where == .tab and window.is_quick_terminal) return false;
     var list = self.cachedLaunchProfiles() catch |err| {
         log.err("launch profile detection failed err={}", .{err});
         return false;
@@ -3123,31 +3120,36 @@ fn requestQuit(self: *App) void {
     self.quitNow();
 }
 
-/// Quit, after asking when a terminal still runs a program (core
-/// `needsConfirmQuit`, which with the GX idle-process check lets idle
-/// shells pass), listing those processes. Every terminal reads one process
-/// table (`gx.confirm.Scope`). The dialog runs a modal loop; nothing here
-/// uses a surface after it.
+/// Quit after one process snapshot and an arena-owned confirmation grouped
+/// by tab. The modal dialog does not borrow live window or surface data.
 fn confirmQuit(self: *App) void {
     var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
     defer arena.deinit();
-    var processes: std.ArrayList([]const u8) = .empty;
-    var needs = false;
+    var groups: std.ArrayList(Dialogs.ProcessGroup) = .empty;
     var scope: gx.confirm.Scope = undefined;
     scope.begin(self.core_app.alloc, global.io());
     defer scope.end();
-    for (self.core_app.surfaces.items) |surface| {
-        if (!surface.core_surface_ready or !surface.core_surface.needsConfirmQuit()) continue;
-        needs = true;
-        surface.appendBusyProcesses(arena.allocator(), &processes);
-    }
-    // Before the dialog, whose modal loop may run other confirmations.
+    for (self.windows.items) |window| appendQuitGroups(window, arena.allocator(), &groups) catch |err| {
+        log.err("cannot prepare the quit confirmation err={}", .{err});
+        return;
+    };
+    if (self.quick_terminal) |qt| appendQuitGroups(qt.window, arena.allocator(), &groups) catch |err| {
+        log.err("cannot prepare the quick terminal quit confirmation err={}", .{err});
+        return;
+    };
     scope.end();
-    if (needs) {
+    if (groups.items.len != 0) {
         const owner = if (self.targetWindow(.app)) |window| window.hwnd else null;
-        if (Dialogs.confirmQuit(owner, processes.items) != .accept) return;
+        if (Dialogs.confirmQuitByTab(owner, groups.items) != .accept) return;
     }
     self.quitNow();
+}
+
+fn appendQuitGroups(window: *Window, alloc: Allocator, groups: *std.ArrayList(Dialogs.ProcessGroup)) Allocator.Error!void {
+    for (0..window.tab_count) |i| {
+        const group = try window.closeGroup(i, alloc) orelse continue;
+        try groups.append(alloc, group);
+    }
 }
 
 fn quitNow(self: *App) void {
@@ -3891,4 +3893,11 @@ test "validWindowsPath rejects characters file names cannot contain" {
     try testing.expect(!validWindowsPath("C:\\a|b"));
     try testing.expect(!validWindowsPath("C:\\*"));
     try testing.expect(!validWindowsPath("C:\\a\nb"));
+}
+
+test "quick terminal tab profiles are rejected before shell detection" {
+    var app: App = undefined;
+    var window: Window = .{ .app = &app, .is_quick_terminal = true };
+    try std.testing.expect(!app.openProfile(&window, "cmd", .tab));
+    try std.testing.expect(!app.performGx(&window, .{ .new_tab_profile = "cmd" }));
 }

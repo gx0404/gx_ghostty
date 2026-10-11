@@ -389,6 +389,7 @@ pub const Scrollbar = struct {
     mode_override: ?Mode = null,
     /// False with `scrollbar = never`: hidden, reserving no width.
     enabled: bool = true,
+    owner_visible: bool = true,
 
     /// Cached theme colors. Updated via setTheme.
     bg: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 },
@@ -600,6 +601,7 @@ pub const Scrollbar = struct {
     /// the change, or the layout showing a tab's panes). Cheap when nothing
     /// changes, so it can be said again on every layout.
     pub fn setOwnerVisible(self: *Scrollbar, visible: bool) void {
+        self.owner_visible = visible;
         if (!self.enabled) return;
         if (visible) return self.flushOwner(true);
         _ = self.releasePress();
@@ -664,7 +666,7 @@ pub const Scrollbar = struct {
     /// Whether the popup should be on screen as far as the scrollbar is
     /// concerned (the surface may still be hidden).
     fn wantsVisible(self: *const Scrollbar) bool {
-        if (!self.enabled) return false;
+        if (!self.enabled or !self.owner_visible) return false;
         return switch (self.mode) {
             .always_visible => true,
             .overlay => self.visibility != .hidden,
@@ -675,6 +677,12 @@ pub const Scrollbar = struct {
     /// (`owner_showing`: is about to be) and the top-level window is not
     /// minimized.
     fn ownerShown(self: *const Scrollbar, owner_showing: bool) bool {
+        if (!self.owner_visible) return false;
+        const window = self.surface.parent_window;
+        if (window.is_quick_terminal) {
+            const qt = window.app.quick_terminal orelse return false;
+            if (qt.window != window or qt.animating or !qt.visible) return false;
+        }
         const root = GetAncestor(self.owner, GA_ROOT) orelse return false;
         if (w32.IsIconic(root) != 0) return false;
         if (owner_showing) return w32.IsWindowVisible_(root) != 0;
@@ -1624,6 +1632,30 @@ test "scrollTo: unchanged offset never touches the terminal or its window" {
     scrollbar.scrollTo(50);
     try testing.expectEqual(@as(u32, 0), scrollbar.scroll_requests);
     try testing.expectEqual(@as(u32, 0), scrollbar.paints);
+}
+
+test "owner visibility intent survives layout, output and disabled scrollbar" {
+    var scrollbar: Scrollbar = .{
+        .alloc = testing.allocator,
+        .surface = undefined,
+        .owner = undefined,
+        .hwnd = undefined,
+        .window_lost = true,
+        .enabled = false,
+        .mode = .always_visible,
+    };
+    scrollbar.setOwnerVisible(false);
+    try testing.expect(!scrollbar.owner_visible);
+    scrollbar.enabled = true;
+    try testing.expect(!scrollbar.wantsVisible());
+    try testing.expect(!scrollbar.ownerShown(true));
+    _ = scrollbar.repositionAndResize();
+    scrollbar.update(.{ .total = 100, .offset = 40, .len = 24 });
+    try testing.expect(!scrollbar.owner_visible);
+    try testing.expectEqual(@as(u32, 0), scrollbar.paints);
+    scrollbar.enabled = false;
+    scrollbar.setOwnerVisible(true);
+    try testing.expect(scrollbar.owner_visible);
 }
 
 test {

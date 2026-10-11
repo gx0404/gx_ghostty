@@ -525,15 +525,14 @@ pub fn getTitle(self: *const Surface) ?[:0]const u8 {
 /// would fill the queue and stall the GUI thread for the push timeout each,
 /// then drop.
 pub fn setVisible(self: *Surface, visible: bool) void {
-    // Hide the hovered-URL bubble when this surface is occluded so a stale
-    // preview doesn't float over the newly-active tab, and the find bar
-    // with the surface (it stays open and comes back with it).
-    if (!visible) self.link_preview.hide();
-    self.search_bar.setOwnerVisible(visible);
+    const state = self.visibilityState(visible);
+    if (!state.popups) self.link_preview.hide();
+    self.search_bar.setOwnerVisible(state.popups);
+    if (self.scrollbar) |sb| sb.setOwnerVisible(state.popups);
     if (!self.core_surface_ready) return;
-    if (self.last_reported_visible == visible) return;
-    self.last_reported_visible = visible;
-    self.core_surface.occlusionCallback(visible) catch |err| {
+    if (self.last_reported_visible == state.render) return;
+    self.last_reported_visible = state.render;
+    self.core_surface.occlusionCallback(state.render) catch |err| {
         // Not delivered (mailbox full or wakeup failed): clear the
         // latch so the next call retries instead of treating this
         // state as sent — otherwise a dropped .visible=true could
@@ -541,6 +540,13 @@ pub fn setVisible(self: *Surface, visible: bool) void {
         self.last_reported_visible = null;
         log.warn("occlusionCallback failed err={}", .{err});
     };
+}
+
+fn visibilityState(self: *const Surface, requested: bool) struct { render: bool, popups: bool } {
+    if (!self.parent_window.is_quick_terminal) return .{ .render = requested, .popups = requested };
+    const qt = self.app.quick_terminal orelse return .{ .render = false, .popups = false };
+    if (qt.window != self.parent_window) return .{ .render = false, .popups = false };
+    return .{ .render = requested and qt.visible, .popups = requested and qt.visible and !qt.animating };
 }
 
 /// Posted by `close` when the terminal to close still runs a program;
@@ -2517,4 +2523,31 @@ pub fn core(self: *Surface) *CoreSurface {
 /// Return a reference to the App for use by core code.
 pub fn rtApp(self: *Surface) *App {
     return self.app;
+}
+
+test "quick visibility separates frame rendering from popup animation" {
+    const testing = std.testing;
+    var app: App = undefined;
+    app.quick_terminal = null;
+    var window: Window = .{ .app = &app, .is_quick_terminal = true };
+    const surface: Surface = .{ .app = &app, .parent_window = &window };
+    try testing.expect(!surface.visibilityState(true).render);
+    var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &window };
+    app.quick_terminal = &quick;
+    const Case = struct { visible: bool, animating: bool, render: bool, popups: bool };
+    for ([_]Case{
+        .{ .visible = false, .animating = false, .render = false, .popups = false },
+        .{ .visible = false, .animating = true, .render = false, .popups = false },
+        .{ .visible = true, .animating = true, .render = true, .popups = false },
+        .{ .visible = true, .animating = false, .render = true, .popups = true },
+    }) |case| {
+        quick.visible = case.visible;
+        quick.animating = case.animating;
+        const state = surface.visibilityState(true);
+        try testing.expectEqual(case.render, state.render);
+        try testing.expectEqual(case.popups, state.popups);
+        try testing.expect(!surface.visibilityState(false).render);
+    }
+    window.is_quick_terminal = false;
+    try testing.expect(surface.visibilityState(true).popups);
 }

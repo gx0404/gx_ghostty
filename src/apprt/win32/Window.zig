@@ -587,6 +587,8 @@ pub fn onFrameChanged(self: *Window) void {
 /// surface (in every tab) about its new content scale.
 fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     if (dpi == 0) return;
+    const quick = self.quickTerminal();
+    if (quick) |qt| if (qt.ignoresDpiChange()) return;
     self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     self.title_bar.onDpiChanged();
 
@@ -595,7 +597,9 @@ fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
         while (it.next()) |entry| entry.view.handleDpiChange(dpi);
     }
 
-    if (self.hwnd) |hwnd| {
+    if (self.is_quick_terminal) {
+        if (quick) |qt| qt.relayout();
+    } else if (self.hwnd) |hwnd| {
         _ = w32.SetWindowPos(
             hwnd,
             null,
@@ -614,6 +618,12 @@ fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
     self.layoutSplits();
     self.repositionOverlays();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
+}
+
+fn quickTerminal(self: *const Window) ?*@import("QuickTerminal.zig") {
+    if (!self.is_quick_terminal) return null;
+    const qt = self.app.quick_terminal orelse return null;
+    return if (qt.window == self) qt else null;
 }
 
 /// The rect Windows would suggest for a move to `dpi`: the window rect
@@ -946,6 +956,7 @@ pub const AddTabOptions = Surface.InitOptions;
 /// Add a tab with per-surface configuration overrides.
 pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     if (self.closing) return error.WindowClosing;
+    if (self.is_quick_terminal and self.tab_count != 0) return error.QuickTerminalTabUnsupported;
     if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
     self.tab_bar.cancelRename();
 
@@ -1085,12 +1096,19 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     var count: usize = 0;
     var check: CloseCheck = .init(self.app.core_app.alloc);
     defer check.deinit();
+    var scope: @import("../../gx/confirm.zig").Scope = undefined;
+    scope.begin(self.app.core_app.alloc, @import("../../global.zig").io());
+    defer scope.end();
     for (0..self.tab_count) |i| {
         if (!selection.contains(i)) continue;
         ids[count] = self.tab_active_surface[i].core_surface.id;
         count += 1;
-        check.tab(self, i);
+        check.tab(self, i) catch |err| {
+            log.err("cannot prepare the tab close confirmation err={}", .{err});
+            return;
+        };
     }
+    scope.end();
     if (count == 0) return;
     // The tab that stays when the active one closes with others.
     const keep: usize = switch (selection) {
@@ -1101,9 +1119,9 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
 
     if (check.needed) {
         const choice = if (count == 1)
-            Dialogs.confirmCloseTab(hwnd, check.processes.items)
+            Dialogs.confirmCloseTabWithTitle(hwnd, check.groups.items[0])
         else
-            Dialogs.confirmCloseTabs(hwnd, check.processes.items);
+            Dialogs.confirmCloseTabsByTab(hwnd, check.groups.items);
         if (choice != .accept or !isAlive(hwnd, self)) return;
     }
 
@@ -1143,7 +1161,16 @@ fn isAlive(hwnd: w32.HWND, window: *const Window) bool {
 /// The active tab hands over to its neighbor (`tabs.closeNeighbor`)
 /// before it goes; closing another tab leaves the active one as it is.
 fn removeTab(self: *Window, idx: usize) void {
-    if (idx >= self.tab_count) return;
+    if (idx >= self.tab_count or self.closing) return;
+    if (self.is_quick_terminal and self.tab_count == 1) {
+        if (self.app.quick_terminal) |qt| {
+            if (qt.window == self) {
+                self.closing = true;
+                self.setAppModeTimer(false);
+                if (qt.onLastTabClosed()) return;
+            }
+        }
+    }
     // Cancel any in-progress rename (the edit control may belong to this
     // tab) and tab drag (the dragged index shifts).
     self.tab_bar.cancelRename();
@@ -1178,7 +1205,7 @@ fn removeTab(self: *Window, idx: usize) void {
 /// processes that make it so.
 const CloseCheck = struct {
     arena: std.heap.ArenaAllocator,
-    processes: std.ArrayList([]const u8) = .empty,
+    groups: std.ArrayList(Dialogs.ProcessGroup) = .empty,
     needed: bool = false,
 
     fn init(alloc: Allocator) CloseCheck {
@@ -1189,17 +1216,44 @@ const CloseCheck = struct {
         self.arena.deinit();
     }
 
-    fn surface(self: *CloseCheck, s: *Surface) void {
-        if (!s.core_surface_ready or !s.core_surface.needsConfirmQuit()) return;
+    fn tab(self: *CloseCheck, window: *Window, index: usize) Allocator.Error!void {
+        const group = try window.closeGroup(index, self.arena.allocator()) orelse return;
+        try self.groups.append(self.arena.allocator(), group);
         self.needed = true;
-        s.appendBusyProcesses(self.arena.allocator(), &self.processes);
-    }
-
-    fn tab(self: *CloseCheck, window: *Window, index: usize) void {
-        var it = window.tab_trees[index].iterator();
-        while (it.next()) |entry| self.surface(entry.view);
     }
 };
+
+/// The confirmation data of one tab, owned by `alloc`, or null when none
+/// of its terminals needs confirmation. Collect under a gx.confirm.Scope
+/// and end that scope before the modal dialog.
+pub fn closeGroup(self: *Window, index: usize, alloc: Allocator) Allocator.Error!?Dialogs.ProcessGroup {
+    if (index >= self.tab_count) return null;
+    var processes: std.ArrayList([]const u8) = .empty;
+    var needed = false;
+    var it = self.tab_trees[index].iterator();
+    while (it.next()) |entry| {
+        const surface = entry.view;
+        if (!surface.core_surface_ready or !surface.core_surface.needsConfirmQuit()) continue;
+        needed = true;
+        surface.appendBusyProcesses(alloc, &processes);
+    }
+    if (!needed) return null;
+    return try ownedCloseGroup(alloc, self.tab_titles[index][0..self.tab_title_lens[index]], processes.items);
+}
+
+fn ownedCloseGroup(alloc: Allocator, title: []const u16, processes: []const []const u8) Allocator.Error!Dialogs.ProcessGroup {
+    const copied_title = try std.unicode.wtf16LeToWtf8Alloc(alloc, title);
+    errdefer alloc.free(copied_title);
+    const copied_processes = try alloc.alloc([]const u8, processes.len);
+    errdefer alloc.free(copied_processes);
+    var copied: usize = 0;
+    errdefer for (copied_processes[0..copied]) |name| alloc.free(name);
+    for (processes, copied_processes) |name, *destination| {
+        destination.* = try alloc.dupe(u8, name);
+        copied += 1;
+    }
+    return .{ .title = copied_title, .processes = copied_processes };
+}
 
 /// The `close_tab` action: close the tab of `surface` (`this`, all of its
 /// splits), the other tabs or the tabs to its right. The core performs it
@@ -1319,6 +1373,7 @@ pub fn refreshRenderers(self: *Window) void {
 /// bars) after the window moved, in all tabs so a hidden tab doesn't show
 /// a stale position when activated.
 fn repositionPopups(self: *Window) void {
+    if (self.quickTerminal()) |qt| if (qt.animating or !qt.visible) return;
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| entry.view.repositionPopups();
@@ -2187,7 +2242,7 @@ pub fn toggleWindowDecorations(self: *Window) void {
 fn handleResize(self: *Window) void {
     self.layoutSplits();
     self.invalidateTabBar();
-    self.resize_overlay.show();
+    if (!self.is_quick_terminal) self.resize_overlay.show();
     self.shortcut_notice.reposition();
     self.repositionOverlays();
 }
@@ -2232,13 +2287,21 @@ pub fn moveTabTo(self: *Window, from: usize, to: usize) void {
 /// so this returns true silently. Returns false when the window was
 /// destroyed while the dialog was open; `self` is invalid then.
 pub fn confirmCloseIfNeeded(self: *Window) bool {
+    if (self.closing) return true;
     const hwnd = self.hwnd orelse return true;
     var check: CloseCheck = .init(self.app.core_app.alloc);
     defer check.deinit();
-    for (0..self.tab_count) |i| check.tab(self, i);
+    var scope: @import("../../gx/confirm.zig").Scope = undefined;
+    scope.begin(self.app.core_app.alloc, @import("../../global.zig").io());
+    defer scope.end();
+    for (0..self.tab_count) |i| check.tab(self, i) catch |err| {
+        log.err("cannot prepare the window close confirmation err={}", .{err});
+        return false;
+    };
+    scope.end();
     if (!check.needed) return true;
 
-    return Dialogs.confirmCloseWindow(hwnd, check.processes.items) == .accept and isAlive(hwnd, self);
+    return Dialogs.confirmCloseWindowByTab(hwnd, check.groups.items) == .accept and isAlive(hwnd, self);
 }
 
 /// Close this window from a core action (`close_window`): through
@@ -2526,6 +2589,7 @@ pub fn windowWndProc(
             // A resolution or monitor layout change can lose the window
             // contents, and screen-positioned popups may now be off.
             log.info("display changed, redrawing the terminals", .{});
+            if (window.quickTerminal()) |qt| qt.relayout();
             window.refreshRenderers();
             window.repositionPopups();
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2594,6 +2658,14 @@ pub fn windowWndProc(
             // a dialog's modal loop runs, the close waits for the dialog.
             if (Dialogs.deferClose(hwnd)) return 0;
             if (!window.confirmCloseIfNeeded()) return 0;
+            if (window.quickTerminal()) |qt| {
+                if (window.closing and qt.animating) return 0;
+                if (!window.closing) {
+                    window.closing = true;
+                    window.setAppModeTimer(false);
+                    if (qt.onLastTabClosed()) return 0;
+                }
+            }
             window.close();
             return 0;
         },
@@ -2733,6 +2805,51 @@ pub fn windowWndProc(
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+test "quick terminal rejects an additional tab before creating a surface" {
+    var window: Window = .{ .app = undefined, .is_quick_terminal = true, .tab_count = 1 };
+    try std.testing.expectError(error.QuickTerminalTabUnsupported, window.addTabWithOptions(.{ .context = .tab }));
+    window.closing = true;
+    try std.testing.expectError(error.WindowClosing, window.addTabWithOptions(.{ .context = .tab }));
+}
+
+test "quick last tab remains in the model until deferred window close" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    config.@"quick-terminal-animation-duration" = 0;
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.config = config;
+    var window: Window = .{ .app = &app, .is_quick_terminal = true, .tab_count = 1 };
+    window.tab_trees[0] = .empty;
+    var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &window, .phase = .shown, .visible = true };
+    app.quick_terminal = &quick;
+    window.removeTab(0);
+    try testing.expectEqual(@as(usize, 1), window.tab_count);
+    try testing.expect(window.closing);
+    try testing.expect(quick.close_when_hidden);
+    window.removeTab(0);
+    try testing.expectEqual(@as(usize, 1), window.tab_count);
+    try testing.expect(window.confirmCloseIfNeeded());
+}
+
+test "close confirmation groups own titles and process names" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var title = [_]u16{ 'B', 'u', 's', 'y' };
+    var process = [_]u8{ 'p', 'i', 'n', 'g' };
+    var names = [_][]const u8{&process};
+    const group = try ownedCloseGroup(arena.allocator(), &title, &names);
+    title[0] = 'X';
+    process[0] = 'X';
+    names[0] = "replaced";
+    try testing.expectEqualStrings("Busy", group.title);
+    try testing.expectEqualStrings("ping", group.processes[0]);
 }
 
 test {
