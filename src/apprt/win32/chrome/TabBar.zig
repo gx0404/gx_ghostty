@@ -94,10 +94,7 @@ profile_rect: w32.RECT = TitleBar.empty_rect,
 hover: Part = .none,
 pressed: Part = .none,
 
-/// The part the middle button went down on, and whether the window
-/// reports middle-button presses at all (`onMiddleButtonDown`).
-middle_pressed: Part = .none,
-middle_down_seen: bool = false,
+middle_press: tab_layout.MiddlePress = .{},
 
 /// A tab pressed and maybe dragged.
 drag: ?Drag = null,
@@ -633,9 +630,28 @@ fn colorsFor(self: *TabBar, ctx: TitleBar.PaintContext) Colors {
     c.accent = t.accent;
     c.critical = t.critical;
     c.caution = t.caution;
-    c.track = c.hover_text.withAlpha(0.22);
     c.active_fill = active_fill;
+    applyCaptionColors(&c, ctx);
+    c.track = c.hover_text.withAlpha(0.22);
     return c;
+}
+
+fn applyCaptionColors(colors: *Colors, ctx: anytype) void {
+    const Context = @TypeOf(ctx);
+    if (@hasField(Context, "strip_fill")) {
+        colors.strip = if (ctx.strip_fill.a > 0) ctx.strip_fill else null;
+    }
+    if (@hasField(Context, "strip_text") and @hasField(Context, "strip_text_inactive")) {
+        const glyph_color = if (ctx.active) ctx.strip_text else ctx.strip_text_inactive;
+        colors.glyph = glyph_color;
+        colors.glyph_disabled = ctx.strip_text_inactive;
+        colors.hover_text = if (ctx.tokens.high_contrast) ctx.tokens.hover_text else glyph_color;
+        if (!ctx.active) {
+            colors.text = ctx.strip_text_inactive;
+            colors.program = ctx.strip_text_inactive;
+        }
+    }
+    if (@hasDecl(Context, "hoverGlyphColor")) colors.on_hover = ctx.hoverGlyphColor();
 }
 
 /// Paint the tabs (or, when they are hidden, the window title) into the
@@ -1198,6 +1214,7 @@ fn unfreeze(self: *TabBar) void {
 
 /// Handle WM_MOUSELEAVE: reset the hover state and repaint.
 pub fn onMouseLeave(self: *TabBar) void {
+    self.middle_press.cancel();
     self.tracking_mouse = false;
     if (self.drag == null) {
         self.setHover(.none);
@@ -1378,6 +1395,7 @@ fn openTabList(self: *TabBar) void {
 /// The mouse capture went elsewhere: put a dragged tab back and forget
 /// presses.
 pub fn onCaptureLost(self: *TabBar) void {
+    self.middle_press.cancel();
     self.stopScrollRepeat();
     if (self.drag != null) self.cancelDragAnimated();
     if (self.pressed == .none) return;
@@ -1413,35 +1431,39 @@ pub fn onDoubleClick(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     return true;
 }
 
-/// A middle-button press: remember the tab it went down on, so only a
-/// release on the same tab closes it.
+/// A middle-button press, paired by terminal id rather than a movable slot.
 pub fn onMiddleButtonDown(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
-    self.middle_down_seen = true;
     const g = self.geometry(lay);
-    self.middle_pressed = self.partAt(&g, x, y);
-    return self.middle_pressed != .none;
+    const target = self.middleTarget(self.partAt(&g, x, y));
+    self.middle_press.down(target);
+    if (target != null) self.trackLeave();
+    return target != null;
 }
 
-/// Middle click: close the tab under the cursor when the press was on it
-/// too. Until the window reports middle-button presses
-/// (`onMiddleButtonDown`), any release on a tab closes it.
+fn middleTarget(self: *const TabBar, part: Part) ?u64 {
+    const i = switch (part) {
+        .tab, .tab_close => |i| i,
+        else => return null,
+    };
+    const win = self.windowConst();
+    if (i >= win.tab_count) return null;
+    const surface = win.tab_active_surface[i];
+    if (!surface.core_surface_initialized) return null;
+    return surface.core_surface.id;
+}
+
+/// A release consumes its press, including one outside a tab. Missing or
+/// mismatched presses never close a tab.
 pub fn onMiddleButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     const g = self.geometry(lay);
     const part = self.partAt(&g, x, y);
-    const pressed = self.middle_pressed;
-    self.middle_pressed = .none;
+    const matched = self.middle_press.release(self.middleTarget(part));
     const i = switch (part) {
         .tab, .tab_close => |i| i,
         .none => return false,
         else => return true,
     };
-    if (self.middle_down_seen) {
-        const on_same = switch (pressed) {
-            .tab, .tab_close => |p| p == i,
-            else => false,
-        };
-        if (!on_same) return true;
-    }
+    if (!matched) return true;
     self.frozen = tab_layout.freeze(&g, lay.tabs.right - lay.tabs.left);
     self.window().closeTabByIndex(i);
     return true;
@@ -2316,6 +2338,41 @@ test "hidden tracking never waits for a busy terminal" {
     try testing.expect(tracked.check(&state, testing.io));
     mutex.unlock(testing.io);
     try testing.expect(!tracked.check(&state, testing.io));
+}
+
+test "caption colors are consumed without tinting a bare material" {
+    const testing = std.testing;
+    const Context = struct {
+        active: bool = false,
+        tokens: struct {
+            high_contrast: bool = false,
+            hover_text: d2d.Color = .black,
+        } = .{},
+        strip_fill: d2d.Color = d2d.Color.black.withAlpha(0.8),
+        strip_text: d2d.Color = .white,
+        strip_text_inactive: d2d.Color = d2d.Color.white.withAlpha(0.36),
+
+        fn hoverGlyphColor(self: @This()) d2d.Color {
+            return if (self.tokens.high_contrast) self.tokens.hover_text else self.strip_text;
+        }
+    };
+    var ctx: Context = .{};
+    var colors: Colors = undefined;
+    applyCaptionColors(&colors, ctx);
+    try testing.expectEqual(ctx.strip_fill, colors.strip.?);
+    try testing.expectEqual(ctx.strip_text_inactive, colors.text);
+    try testing.expectEqual(ctx.strip_text_inactive, colors.program);
+    try testing.expectEqual(ctx.strip_text_inactive, colors.glyph);
+    try testing.expectEqual(ctx.strip_text, colors.on_hover.?);
+    ctx.active = true;
+    ctx.strip_fill.a = 0;
+    applyCaptionColors(&colors, ctx);
+    try testing.expectEqual(@as(?d2d.Color, null), colors.strip);
+    try testing.expectEqual(ctx.strip_text, colors.glyph);
+    ctx.tokens.high_contrast = true;
+    applyCaptionColors(&colors, ctx);
+    try testing.expectEqual(ctx.tokens.hover_text, colors.hover_text);
+    try testing.expectEqual(ctx.tokens.hover_text, colors.on_hover.?);
 }
 
 test {

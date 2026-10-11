@@ -503,6 +503,24 @@ pub const Polling = struct {
     }
 };
 
+pub const MiddlePress = struct {
+    target: ?u64 = null,
+
+    pub fn down(self: *MiddlePress, target: ?u64) void {
+        self.target = target;
+    }
+
+    pub fn cancel(self: *MiddlePress) void {
+        self.target = null;
+    }
+
+    pub fn release(self: *MiddlePress, target: ?u64) bool {
+        const pressed = self.target;
+        self.cancel();
+        return pressed != null and pressed == target;
+    }
+};
+
 pub fn due(last: ?u64, now: u64, interval: u64) bool {
     return if (last) |previous| now -| previous >= interval else true;
 }
@@ -518,6 +536,27 @@ pub fn utf8Prefix(text: []const u8, limit: usize) []const u8 {
 // -----------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "middle presses close only one matched live target" {
+    var press: MiddlePress = .{};
+    try testing.expect(!press.release(10));
+    press.down(10);
+    try testing.expect(press.release(10));
+    try testing.expect(!press.release(10));
+    press.down(10);
+    try testing.expect(!press.release(20));
+    try testing.expect(!press.release(10));
+    press.down(null);
+    try testing.expect(!press.release(10));
+    press.down(10);
+    try testing.expect(!press.release(null));
+    press.down(10);
+    press.cancel();
+    try testing.expect(!press.release(10));
+    press.down(10);
+    press.down(20);
+    try testing.expect(press.release(20));
+}
 
 test "cached geometry follows every layout input" {
     var cache: Cache = .{};
