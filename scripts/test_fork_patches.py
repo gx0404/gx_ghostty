@@ -1085,7 +1085,7 @@ class GtkInputShapeTests(unittest.TestCase):
         rel = "src/apprt/gtk/class/surface.zig"
         source = (ROOT / rel).read_text(encoding="utf-8")
         patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
-        self.assertIn(Patch("GX-0031", rel, "fork(gx): GX-0031", "active"), patches)
+        self.assertIn(Patch("GX-0035", rel, "fork(gx): GX-0035", "active"), patches)
         self.assertEqual(source.count("gx_font_zoom.sync("), 1)
         self.assertEqual(source.count("gx_font_zoom.scroll("), 1)
         self.assertEqual(source.count("gx_font_zoom.dispose("), 1)
@@ -1100,7 +1100,7 @@ class GtkInputShapeTests(unittest.TestCase):
     def test_environment_only_replaces_the_two_flag_writers(self):
         source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
         patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
-        self.assertIn(Patch("GX-0032", APPLICATION_ZIG, "fork(gx): GX-0032", "active"), patches)
+        self.assertIn(Patch("GX-0036", APPLICATION_ZIG, "fork(gx): GX-0036", "active"), patches)
         lines = source.splitlines()
         start, end = zig_fn_lines(lines, "fn setGtkEnv(")
         body = "\n".join(lines[start:end])

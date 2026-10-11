@@ -3355,9 +3355,9 @@ fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
         vulkan: bool = true,
     } = .{};
 
-    // fork(gx): GX-0032 append required flags without replacing user tokens.
+    // fork(gx): GX-0036 append required flags without replacing user tokens.
     try @import("../gx/environment.zig").append("GDK_DEBUG", gdk_debug);
-    // fork(gx): GX-0032 retain the Vulkan disable on old and new GTK.
+    // fork(gx): GX-0036 retain the Vulkan disable on old and new GTK.
     try @import("../gx/environment.zig").append("GDK_DISABLE", gdk_disable);
 
     // Sync environ after altering system env
