@@ -1080,6 +1080,45 @@ class Gx0030ShapeTests(unittest.TestCase):
         self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
+class Gx0031ShapeTests(unittest.TestCase):
+    GENERATORS = (
+        ("src/build/webgen/main_config.zig", "try genConfig(stdout);"),
+        ("src/build/webgen/main_actions.zig",
+         "try helpgen_actions.generate(stdout, .markdown, true, std.heap.page_allocator);"),
+        ("src/build/webgen/main_commands.zig", "try genActions(stdout);"),
+    )
+
+    def test_buffered_stdout_is_flushed_after_generation(self):
+        for rel, generate in self.GENERATORS:
+            with self.subTest(rel):
+                lines = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+                bounds = zig_fn_lines(lines, "pub fn main(")
+                self.assertIsNotNone(bounds)
+                body = [line.strip() for line in lines[bounds[0]:bounds[1]]]
+                self.assertEqual(body.count(generate), 1)
+                self.assertEqual(body.count("try stdout.flush();"), 1)
+                self.assertLess(body.index(generate), body.index("try stdout.flush();"))
+
+    def test_flush_hunks_are_registered_pure_additions(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for rel, generate in self.GENERATORS:
+            with self.subTest(rel):
+                source = (ROOT / rel).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0031")
+                self.assertEqual(len(hunks), 1)
+                begin, end = hunks[0]
+                lines = source.splitlines()
+                self.assertEqual(lines[begin - 1].strip(), generate)
+                self.assertEqual(squash("\n".join(lines[begin + 1:end])), squash("try stdout.flush();"))
+                self.assertIn(Patch("GX-0031", rel, "fork(gx): GX-0031", "active"), patches)
+                self.assertEqual(marked_hunks(source.replace("\n", "\r\n"), "GX-0031")[0]
+                                 .replace("\r\n", "\n"), stripped)
+                upstream, reason = merged_upstream_text(ROOT, rel)
+                if upstream is None:
+                    self.skipTest(reason)
+                self.assertEqual(stripped, upstream)
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则
