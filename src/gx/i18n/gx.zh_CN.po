@@ -1020,3 +1020,25 @@ msgstr "{variable} 关闭了 Ghostty GX 设置，此处无法更改设置。请�
 
 msgid "Set bell-audio-path in the configuration file to choose the sound."
 msgstr "在配置文件中设置 bell-audio-path 以选择声音。"
+
+#. GTK tabs: progress reports (src/apprt/gtk/gx/progress.zig)
+msgid "Progress: {percent}%"
+msgstr "进度：{percent}%"
+
+msgid "Error: {percent}%"
+msgstr "出错：{percent}%"
+
+msgid "Error"
+msgstr "出错"
+
+msgid "In progress"
+msgstr "进行中"
+
+msgid "Remote session"
+msgstr "远程会话"
+
+msgid "Superuser session"
+msgstr "超级用户会话"
+
+msgid "Container session"
+msgstr "容器会话"

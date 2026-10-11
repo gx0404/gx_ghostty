@@ -26,4 +26,6 @@ test {
     _ = window;
     _ = @import("style.zig");
     _ = @import("settings_dialog.zig");
+    _ = @import("app_mode.zig");
+    _ = @import("progress.zig");
 }
