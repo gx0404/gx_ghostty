@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0030）之后的号。在册的 24 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0030，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0031）之后的号。在册的 25 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0031，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -87,6 +87,9 @@
 | GX-0030 | `src/Surface.zig` | `fork(gx): GX-0030` | active |
 | GX-0030 | `src/terminal/search/Thread.zig` | `fork(gx): GX-0030` | active |
 | GX-0030 | `src/termio/Termio.zig` | `fork(gx): GX-0030` | active |
+| GX-0031 | `src/font/CodepointResolver.zig` | `fork(gx): GX-0031` | active |
+| GX-0031 | `src/font/SharedGridSet.zig` | `fork(gx): GX-0031` | active |
+| GX-0031 | `src/font/discovery.zig` | `fork(gx): GX-0031` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1247,3 +1250,14 @@ python -m unittest scripts.test_fork_patches -v
 - 移除条件：上游有等价的用户视口来源通知时移除私有钩子，登记改为 removed。
 - 验证：`just test --filter D11:`、`just test --filter apprt.win32 --filter gx.`、Windows `just build`/`just test`；独立 WSL clone 的 GTK build、GTK/GX 与 POSIX/GX/core/termio 单测；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff 守门。锁屏时真实 GUI 记 PENDING，解锁后在隔离配置下复验持续输出/满裁剪不揭幕、实际视口移动及右缘揭幕。
 - 最小锁定：`scripts/test_fork_patches.py::Gx0030ShapeTests` 检查核心/Termio 原有 5/2 对 mutation 钩子及搜索接线；Thread 来源限于 opts.mutex 内 select 的当前 active viewport，opt-in 默认 false，不入消息队列。钩子禁止 UI/临时解锁；不锁定其他补丁的源码。
+
+## GX-0031 映射字体按同族真实样式解析
+
+- 文件：`src/font/CodepointResolver.zig`（样式参数、算法说明、缓存别名与转发）；`src/font/discovery.zig::Fontconfig.discoverMappedFamily`（纯新增 adapter 转发）；`src/font/SharedGridSet.zig`（四个纯新增块：resolver 策略、Key 字段、初始化与 hash）。状态 active，未回馈上游。
+- 原因：上游的 `font-codepoint-map` 把所有请求缓存到常规体；Fontconfig 的排序首项并不保证是真粗体或同族字面。synthetic 与禁用样式未进入 grid key 还会串用旧策略。
+- 真源：`src/gx/font_codepoint_map.zig::Policy/State/Batch`。descriptor 逐字段内容判等，请求按有效样式缓存；实际常规体锁定字体族，先找覆盖码位的真样式，再在独立拥有的 face 上合成缺失 traits，最后退同族常规体。粗斜体的 synthetic 开关独立于粗体与斜体；缺 glyph 继续同族候选，OOM 不记成不存在。
+- adapter：新路径 `src/gx/font_map_fontconfig.zig` 检查原始 pattern 的 family/weight/slant/file/index 后才 render-prepare；fork-owned `src/font/directwrite/discovery.zig` 重用真实字面选择，并保留命名实例和实际轴坐标；`src/gx/font_map_freetype.zig` 重新打开物理源，不调用会共享 FT_Face 的 syntheticBold/syntheticItalic。无发现后端保持普通回退；未支持专用 adapter 的后端保持常规映射。
+- 不变：普通 `Collection.completeStyles`、C ABI、GPU 算法、默认映射、alpha-blending 与 FreeType 默认值；`SharedGrid` 的 codepoint/glyph 键无需扩展。
+- 同步：上游取原文后仅保留 resolver 的样式转发和缓存别名、Fontconfig 转发、grid Policy 及其 hash；普通发现不可改成映射专用过滤。编号是本分支下一空号，集成时由协调者按合入顺序调整。
+- 移除条件：上游映射原生支持同族样式、独立合成、内容缓存判等及策略隔离后，移除这些薄钩子和 GX 模块，将三条登记行改为 removed。
+- 验证：`just test --filter gx.font_codepoint_map --filter directwrite --filter getIndex --filter Key`；独占 WSL clone 的同过滤 POSIX/GTK 测试及 GTK build；`just test -Dfont-backend=freetype --filter gx.font_codepoint_map` 验证无发现退路；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff。真实 CJK 终端四样式需 Windows 96 DPI/100% 与 GTK scale=1 原尺寸图，锁屏或仅 Xvfb 时记 PENDING，不以设置预览代证。

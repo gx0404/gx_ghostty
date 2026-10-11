@@ -1080,6 +1080,36 @@ class Gx0030ShapeTests(unittest.TestCase):
         self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
+class Gx0031ShapeTests(unittest.TestCase):
+    def test_mapping_style_and_cache_are_thin_hooks(self):
+        source = (ROOT / "src/font/CodepointResolver.zig").read_text(encoding="utf-8")
+        self.assertIn("self.getIndexCodepointOverride(alloc, cp, style)", source)
+        self.assertIn('const DescriptorCache = @import("../gx/font_codepoint_map.zig").State;', source)
+        self.assertIn("self.descriptor_cache.resolve(alloc, &self.collection, discover, map, cp, style)", source)
+        self.assertNotIn("return ctx.hash(a) == ctx.hash(b);", source)
+        self.assertNotIn(".style = .regular,", source.split("fn getIndexCodepointOverride(", 1)[1].split("\n}", 1)[0])
+        for line in ("if (self.getIndexCodepointOverride(alloc, cp, style))", "fn getIndexCodepointOverride(", "const DescriptorCache ="):
+            lines = source.splitlines()
+            pos = next(i for i, text in enumerate(lines) if line in text)
+            self.assertIn("fork(gx): GX-0031", lines[pos - 1])
+
+    def test_fontconfig_and_grid_additions_have_closed_hunks(self):
+        expected = {"src/font/discovery.zig": 1, "src/font/SharedGridSet.zig": 4}
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for path, count in expected.items():
+            with self.subTest(path=path):
+                self.assertIn(Patch("GX-0031", path, "fork(gx): GX-0031", "active"), patches)
+                source = (ROOT / path).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0031")
+                self.assertEqual(len(hunks), count)
+                self.assertNotIn("font_policy", stripped)
+                self.assertNotIn("discoverMappedFamily", stripped)
+        grid = (ROOT / "src/font/SharedGridSet.zig").read_text(encoding="utf-8")
+        self.assertIn(".descriptor_cache = .{ .policy = key.font_policy }", grid)
+        self.assertIn('Policy.fromConfig(config)', grid)
+        self.assertIn("autoHash(hasher, @as(u8, @bitCast(self.font_policy)));", grid)
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则
