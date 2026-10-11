@@ -1598,20 +1598,22 @@ class ScenarioRun:
     def do_capture(self, p):
         what, method = p.get("what", "window"), p.get("method", "screen")
         step = self.capture_steps + 1
+        path = self.capture_name(p["name"], step)
         saved = []
         if what in ("window", "all"):
             image = self.gui.capture_window(self.gui.require_window("main"), method)
-            saved.append(image.save_png(self.capture_name(p["name"], step)))
+            saved.append(image.save_png(path))
         if what == "quick":
             image = self.gui.capture_window(self.gui.require_window("quick"), method)
-            saved.append(image.save_png(self.capture_name(p["name"], step)))
+            saved.append(image.save_png(path))
         if what in ("popups", "all"):
             popups = self.gui.popups()
             if not popups and what == "popups":
                 raise GuiError("no visible popup to capture")
             for index, info in enumerate(popups, 1):
                 image = self.gui.capture_window(info, method)
-                saved.append(image.save_png(self.capture_name(f"{p['name']}-{info.cls}-{index}", step)))
+                cls = re.sub(r"[^A-Za-z0-9._-]", lambda match: f"_{ord(match[0]):x}_", info.cls) or "unknown"
+                saved.append(image.save_png(self.capture_name(f"{p['name']}-{cls}-{index}", step)))
         self.capture_steps = step
         for path in saved:
             self.captures.append(path.name)

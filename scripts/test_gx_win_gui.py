@@ -251,6 +251,85 @@ class WaitFileTests(unittest.TestCase):
                 gui.validate_step("s", raw)
 
 
+class CaptureTests(unittest.TestCase):
+    def runner(self, out_dir: Path, classes: list[str]) -> gui.ScenarioRun:
+        run = gui.ScenarioRun(None, Path("ghostty.exe"), out_dir)  # type: ignore[arg-type]
+        run.instance = mock.Mock(spec=gui.Instance)
+        run.instance.require_window.return_value = gui.WindowInfo(0, gui.WINDOW_CLASS, "main", (0, 0, 1, 1),
+                                                                 True, False, False)
+        run.instance.popups.return_value = [gui.WindowInfo(index, cls, "popup", (0, 0, 1, 1), True, False, True)
+                                            for index, cls in enumerate(classes, 1)]
+        run.instance.capture_window.side_effect = lambda info, method: gui.Image(1, 1, bytes((info.hwnd, 0, 0, 255)))
+        return run
+
+    def test_native_task_dialog_capture_keeps_the_real_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            run = self.runner(out, ["#32770"])
+            main = run.gui.require_window.return_value
+            popup = run.gui.popups.return_value[0]
+            result = run.do_capture({"name": "native", "what": "all"})
+            self.assertEqual(["01-native.png", "01-native-_23_32770-1.png"], run.captures)
+            self.assertEqual(", ".join(run.captures), result)
+            self.assertTrue(all((out / name).is_file() for name in run.captures))
+            self.assertEqual(1, run.capture_steps)
+            run.gui.capture_window.assert_has_calls([mock.call(main, "screen"), mock.call(popup, "screen")])
+            self.assertEqual("#32770", popup.cls)
+            self.assertIn("#32770", run.do_wait_popup({"cls": "#32770"}))
+
+    def test_plain_popup_file_names_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.runner(Path(tmp), ["GhosttyGxPopupShadow"])
+            run.do_capture({"name": "popup", "what": "popups", "method": "print"})
+            self.assertEqual(["01-popup-GhosttyGxPopupShadow-1.png"], run.captures)
+            run.gui.capture_window.assert_called_once_with(run.gui.popups.return_value[0], "print")
+
+    def test_internal_class_fragments_stay_ascii_and_inside_out(self):
+        classes = ["#32770", "弹窗😀", "../outside\\evil", "", "/", "\\", "\x00\n\r\t:*?\"<>|", "\ud800"]
+        with tempfile.TemporaryDirectory() as tmp:
+            for cls in classes:
+                with self.subTest(cls=cls):
+                    out = Path(tmp) / "out"
+                    run = self.runner(out, [cls])
+                    run.do_capture({"name": "popup", "what": "popups"})
+                    run.do_capture({"name": "popup", "what": "popups"})
+                    first, second = run.captures
+                    self.assertRegex(first, r"\A01-popup-[A-Za-z0-9._-]+-1\.png\Z")
+                    self.assertEqual(first[3:], second[3:])
+                    for name in run.captures:
+                        path = out / name
+                        self.assertEqual(out.resolve(), path.resolve().parent)
+                        self.assertTrue(path.is_file())
+                    self.assertEqual(cls, run.gui.popups.return_value[0].cls)
+            self.assertTrue(all(path.parent == out for path in Path(tmp).rglob("*.png")))
+
+    def test_duplicate_and_encoded_classes_do_not_overwrite_popups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            classes = ["#32770", "#32770", "_23_32770", "", "unknown"]
+            run = self.runner(out, classes)
+            run.do_capture({"name": "popup", "what": "popups"})
+            self.assertEqual(len(classes), len(set(run.captures)))
+            self.assertEqual(len(classes), len({(out / name).read_bytes() for name in run.captures}))
+            for index, name in enumerate(run.captures, 1):
+                self.assertTrue(name.endswith(f"-{index}.png"))
+            self.assertEqual(classes, [info.cls for info in run.gui.popups.return_value])
+
+    def test_user_capture_names_remain_strictly_validated(self):
+        bad_names = ["", ".hidden", "-name", "_name", "../escape", "a/b", "a\\b", "a#b", "弹窗", "a b", "a\n",
+                     "a\x00", "a:b", "a*", "a?", "a\"", "a<", "a>", "a|", "\ud800"]
+        with tempfile.TemporaryDirectory() as tmp:
+            for what in ("window", "quick", "popups", "all"):
+                for name in bad_names:
+                    with self.subTest(what=what, name=name):
+                        run = self.runner(Path(tmp), ["GhosttyGxPopupShadow"])
+                        with self.assertRaises(gui.UsageError):
+                            run.do_capture({"name": name, "what": what})
+                        self.assertEqual([], run.captures)
+                        self.assertEqual(0, run.capture_steps)
+            self.assertEqual([], list(Path(tmp).rglob("*.png")))
+
+
 class FakeWin32:
     """Stands in for Win32: windows of other processes are in front; every SendInput is recorded."""
 
