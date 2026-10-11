@@ -13,6 +13,8 @@ pub const resourcesDir = internal_os.resourcesDir;
 // run even when no other code analyzes it (scripts/test_gx_test_roots.py).
 test {
     _ = @import("win32/App.zig");
+    _ = @import("win32/BellAudio.zig");
+    _ = @import("win32/bell_wav.zig");
     _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/Surface.zig");
     _ = @import("win32/Window.zig");
