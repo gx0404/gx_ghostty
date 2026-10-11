@@ -8,7 +8,9 @@
 //! pointer is over it (and gives 5 more seconds after), lasts at least the
 //! system's notification time (`SPI_GETMESSAGEDURATION`), fades in over
 //! 167 ms (`Popup.Options.motion`) and waits while a modal dialog has its
-//! window disabled. Key names in the body stay on one line (`glueChord`).
+//! window disabled. Hidden or moving Quick owners defer feedback until
+//! their next settled show; closing owners discard it. Deadlines reject
+//! queued old timeout messages. Key names stay on one line (`glueChord`).
 //!
 //! Usage: embed a `Notice` in an address-stable owner (the window); call
 //! `show` from the message loop, or `post` from a core callback (it shows
@@ -72,7 +74,19 @@ pub const Placement = struct {
     area: w32.RECT,
     /// The owner's content scale (`Window.scale`).
     scale: f32,
+
+    pub fn disposition(self: Placement, app: *const App) Disposition {
+        if (app.quick_terminal) |qt| {
+            if (qt.window.hwnd == self.owner) return qt.window.feedbackDisposition();
+        }
+        for (app.windows.items) |window| {
+            if (window.hwnd == self.owner) return window.feedbackDisposition();
+        }
+        return .discard;
+    }
 };
+
+pub const Disposition = enum { ready, deferred, discard };
 
 /// Posted to the notice's own popup window by `post`.
 pub const WM_SHOW_POSTED: u32 = w32.WM_APP + 39;
@@ -99,7 +113,8 @@ actions: [max_actions]Range = @splat(.{}),
 action_count: u8 = 0,
 severity: Severity = .informational,
 duration_ms: ?u32 = null,
-/// Shown by `post`, or waiting for a dialog.
+timeout_deadline: ?u64 = null,
+/// Shown by `post`, or waiting for a dialog or a settled owner.
 pending: bool = false,
 
 hover: Target = .none,
@@ -133,6 +148,7 @@ pub fn post(self: *Notice, app: *App, placement: Placement, content: Content, ca
     self.callbacks = callbacks;
     self.store(content);
     self.pending = true;
+    if (!self.applyDisposition(placement.disposition(app))) return;
     if (!self.ensurePopup()) return;
     const hwnd = self.popup.hwnd orelse return;
     if (w32.PostMessageW(hwnd, WM_SHOW_POSTED, 0, 0) == 0) log.warn("cannot post a notice", .{});
@@ -143,6 +159,32 @@ pub fn hide(self: *Notice) void {
     self.close(.owner);
 }
 
+/// Defer feedback without dismissing it. Its timeout starts again only
+/// after the live owner finishes showing; closing owners discard it.
+pub fn deferUntilShown(self: *Notice) void {
+    self.pending = self.pending or self.popup.visible;
+    self.timeout_deadline = null;
+    if (self.popup.hwnd) |hwnd| {
+        _ = w32.KillTimer(hwnd, TIMEOUT_TIMER_ID);
+        _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
+    }
+    self.popup.hide();
+}
+
+pub fn onOwnerShown(self: *Notice, placement: Placement) void {
+    self.placement = placement;
+    self.showStored();
+}
+
+fn applyDisposition(self: *Notice, disposition: Disposition) bool {
+    switch (disposition) {
+        .ready => return true,
+        .deferred => self.deferUntilShown(),
+        .discard => self.hide(),
+    }
+    return false;
+}
+
 /// Whether the notice is on screen.
 pub fn isVisible(self: *const Notice) bool {
     return self.popup.visible;
@@ -151,6 +193,7 @@ pub fn isVisible(self: *const Notice) bool {
 /// Follow the window (moved, resized, another DPI or language).
 pub fn reposition(self: *Notice, placement: Placement) void {
     self.placement = placement;
+    if (self.app) |app| if (!self.applyDisposition(placement.disposition(app))) return;
     if (!self.popup.visible) return;
     const rect = self.bounds() orelse return;
     self.popup.setBounds(rect);
@@ -200,21 +243,22 @@ fn ensurePopup(self: *Notice) bool {
 
 fn showStored(self: *Notice) void {
     if (!self.pending) return;
-    if (!self.ensurePopup()) return;
     const placement = self.placement orelse return;
+    const app = self.app orelse return;
+    if (!self.applyDisposition(placement.disposition(app))) return;
+    if (!self.ensurePopup()) return;
     const hwnd = self.popup.hwnd orelse return;
-    // A modal dialog disabled the window: show after it closed.
     if (w32.IsWindowEnabled(placement.owner) == 0) {
         _ = w32.SetTimer(hwnd, WAIT_TIMER_ID, wait_ms, null);
         return;
     }
     _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
-    self.pending = false;
     self.hover = .none;
     self.pressed = .none;
     self.popup.applyTheme(self.tokens());
     self.popup.setAccessibleName(self.slice(self.title));
     const rect = self.bounds() orelse return;
+    self.pending = false;
     self.popup.show(rect);
     self.popup.invalidate();
     self.armTimeout(self.durationMs());
@@ -227,7 +271,15 @@ fn durationMs(self: *const Notice) ?u32 {
     return @max(ms, seconds * 1000);
 }
 
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+fn timeoutDue(self: *const Notice, now: u64) bool {
+    const deadline = self.timeout_deadline orelse return false;
+    return self.popup.visible and !self.pending and now >= deadline;
+}
+
 fn armTimeout(self: *Notice, ms: ?u32) void {
+    self.timeout_deadline = if (ms) |duration| GetTickCount64() +| duration else null;
     const hwnd = self.popup.hwnd orelse return;
     if (ms) |duration| {
         _ = w32.SetTimer(hwnd, TIMEOUT_TIMER_ID, duration, null);
@@ -239,6 +291,7 @@ fn armTimeout(self: *Notice, ms: ?u32) void {
 fn close(self: *Notice, reason: CloseReason) void {
     const was_shown = self.popup.visible or self.pending;
     self.pending = false;
+    self.timeout_deadline = null;
     if (self.popup.hwnd) |hwnd| {
         _ = w32.KillTimer(hwnd, TIMEOUT_TIMER_ID);
         _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
@@ -268,6 +321,8 @@ fn store(self: *Notice, content: Content) void {
     }
     self.severity = content.severity;
     self.duration_ms = content.duration_ms;
+    self.timeout_deadline = null;
+    if (self.popup.hwnd) |hwnd| _ = w32.KillTimer(hwnd, TIMEOUT_TIMER_ID);
 }
 
 fn append(self: *Notice, end: *usize, text: []const u8, limit: usize) Range {
@@ -489,6 +544,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
     switch (event.kind) {
         .move => {
             // The pointer is over the notice: hold the timeout.
+            self.timeout_deadline = null;
             if (popup.hwnd) |hwnd| _ = w32.KillTimer(hwnd, TIMEOUT_TIMER_ID);
             if (!target.eql(self.hover)) {
                 self.hover = target;
@@ -528,7 +584,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
 fn onTimer(ctx: *anyopaque, popup: *Popup, id: usize) void {
     const self: *Notice = @ptrCast(@alignCast(ctx));
     switch (id) {
-        TIMEOUT_TIMER_ID => self.close(.timeout),
+        TIMEOUT_TIMER_ID => if (self.timeoutDue(GetTickCount64())) self.close(.timeout),
         WAIT_TIMER_ID => self.showStored(),
         else => if (popup.hwnd) |hwnd| {
             _ = w32.KillTimer(hwnd, id);
@@ -620,6 +676,25 @@ test "notice targets and content storage" {
     notice.store(.{ .title = "\u{6C49}" ** 200 });
     try testing.expect(notice.title.len <= 256);
     try testing.expect(std.unicode.utf8ValidateSlice(notice.slice(notice.title)));
+}
+
+test "notice deferred feedback and stale timeout messages do not resurrect it" {
+    const testing = std.testing;
+    var notice: Notice = .{};
+    notice.popup.visible = true;
+    notice.timeout_deadline = 2000;
+    try testing.expect(!notice.timeoutDue(1999));
+    try testing.expect(notice.timeoutDue(2000));
+    try testing.expect(!notice.applyDisposition(.deferred));
+    try testing.expect(notice.pending and !notice.popup.visible);
+    try testing.expect(!notice.timeoutDue(10_000));
+    try testing.expect(!notice.applyDisposition(.discard));
+    _ = onMessage(&notice, &notice.popup, WM_SHOW_POSTED, 0, 0);
+    onTimer(&notice, &notice.popup, WAIT_TIMER_ID);
+    onTimer(&notice, &notice.popup, TIMEOUT_TIMER_ID);
+    try testing.expect(!notice.pending and !notice.popup.visible);
+    notice.store(.{ .title = "Persistent", .duration_ms = null });
+    try testing.expect(notice.timeout_deadline == null);
 }
 
 test {

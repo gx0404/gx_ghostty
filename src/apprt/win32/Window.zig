@@ -779,6 +779,35 @@ pub fn queueMainMenu(self: *Window, anchor: ?w32.POINT) bool {
     return w32.PostMessageW(hwnd, WM_APP_MAIN_MENU, 0, 0) != 0;
 }
 
+/// Feedback is deferred while a live Quick terminal is hidden or moving,
+/// and discarded once its owner starts closing.
+pub fn feedbackDisposition(self: *const Window) Notice.Disposition {
+    if (self.closing) return .discard;
+    if (!self.is_quick_terminal) return .ready;
+    const qt = self.quickTerminal() orelse return .deferred;
+    return if (qt.visible and !qt.animating) .ready else .deferred;
+}
+
+pub fn suspendFeedback(self: *Window) void {
+    if (self.closing) {
+        self.notice.hide();
+        self.toast.hide();
+        self.shortcut_notice.hide();
+    } else {
+        self.notice.deferUntilShown();
+        self.toast.deferUntilShown();
+        self.shortcut_notice.notice.deferUntilShown();
+    }
+}
+
+pub fn resumeFeedback(self: *Window) void {
+    const placement = self.overlayPlacement() orelse return;
+    self.notice.onOwnerShown(placement);
+    self.toast.onOwnerShown(placement);
+    self.shortcut_notice.reposition();
+    if (self.shortcut_notice.notice.placement) |where| self.shortcut_notice.notice.onOwnerShown(where);
+}
+
 /// Where the notice and the toast show: centered at the bottom of the
 /// terminal area, at the window's content scale.
 fn overlayPlacement(self: *const Window) ?Notice.Placement {
@@ -2850,6 +2879,29 @@ test "close confirmation groups own titles and process names" {
     names[0] = "replaced";
     try testing.expectEqualStrings("Busy", group.title);
     try testing.expectEqualStrings("ping", group.processes[0]);
+}
+
+test "feedback waits for a settled Quick owner and discards a closing owner" {
+    const testing = std.testing;
+    var app: App = undefined;
+    app.quick_terminal = null;
+    var window: Window = .{ .app = &app };
+    try testing.expectEqual(Notice.Disposition.ready, window.feedbackDisposition());
+    window.is_quick_terminal = true;
+    try testing.expectEqual(Notice.Disposition.deferred, window.feedbackDisposition());
+    var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &window };
+    app.quick_terminal = &quick;
+    for ([_]bool{ false, true }) |visible| {
+        for ([_]bool{ false, true }) |animating| {
+            quick.visible = visible;
+            quick.animating = animating;
+            const expected: Notice.Disposition = if (visible and !animating) .ready else .deferred;
+            try testing.expectEqual(expected, window.feedbackDisposition());
+            window.closing = true;
+            try testing.expectEqual(Notice.Disposition.discard, window.feedbackDisposition());
+            window.closing = false;
+        }
+    }
 }
 
 test {

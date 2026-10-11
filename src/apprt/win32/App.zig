@@ -203,11 +203,6 @@ simulated_scheme: ?apprt.ColorScheme = null,
 /// reported (0: none), so a reload that keeps them says nothing again.
 diagnostics_reported: u64 = 0,
 
-/// The leader keys typed so far of a key sequence (`key_sequence`), shown
-/// in a toast until the sequence ends.
-key_sequence: [128]u8 = undefined,
-key_sequence_len: usize = 0,
-
 /// What the taskbar buttons show (`showTaskbarProgress`), so an unchanged
 /// state is not set again; buttons without an entry show nothing.
 taskbar_shown: std.ArrayList(TaskbarShown) = .empty,
@@ -1279,7 +1274,7 @@ pub fn performAction(
         .key_sequence => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| self.showKeySequence(core_surface.rt_surface.parent_window, value),
+                .surface => |core_surface| showKeySequence(core_surface.rt_surface, value),
             }
             return true;
         },
@@ -1287,7 +1282,7 @@ pub fn performAction(
         .key_table => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| showKeyTable(core_surface.rt_surface.parent_window, value),
+                .surface => |core_surface| showKeyTable(core_surface.rt_surface, value),
             }
             return true;
         },
@@ -2745,45 +2740,44 @@ fn showChildExited(window: *Window, exit_code: u32) bool {
     return true;
 }
 
-/// `key_sequence`: show the leader keys typed so far in a toast until the
-/// sequence ends. From a core callback.
-fn showKeySequence(self: *App, window: *Window, value: apprt.action.KeySequence) void {
+/// The sequence belongs to its terminal. Other terminals ending a sequence
+/// cannot clear its buffer or a table/action toast that replaced its hint.
+fn showKeySequence(surface: *Surface, value: apprt.action.KeySequence) void {
+    const window = surface.parent_window;
+    const owner: @import("ui/Toast.zig").Owner = .{ .surface_id = surface.core_surface.id, .kind = .sequence };
     switch (value) {
         .trigger => |key| {
             var key_buf: [64]u8 = undefined;
             const text = trigger.format(key, &key_buf);
-            var writer: std.Io.Writer = .fixed(self.key_sequence[self.key_sequence_len..]);
-            if (self.key_sequence_len > 0) writer.writeAll(" \u{2192} ") catch {};
+            var writer: std.Io.Writer = .fixed(surface.key_sequence[surface.key_sequence_len..]);
+            if (surface.key_sequence_len > 0) writer.writeAll(" \u{2192} ") catch {};
             writer.writeAll(text) catch {};
-            self.key_sequence_len += writer.buffered().len;
+            surface.key_sequence_len += writer.buffered().len;
             var toast_buf: [160]u8 = undefined;
-            const keys = self.key_sequence[0..self.key_sequence_len];
+            const keys = surface.key_sequence[0..surface.key_sequence_len];
             const toast_text = std.fmt.bufPrint(&toast_buf, "{s} \u{2026}", .{keys}) catch keys;
-            window.postToast(.{ .text = toast_text, .icon = d2d.icons.keyboard, .duration_ms = null });
+            window.postToast(.{ .text = toast_text, .icon = d2d.icons.keyboard, .duration_ms = null, .owner = owner });
         },
         .end => {
-            const active = self.key_sequence_len > 0;
-            self.key_sequence_len = 0;
-            if (active) hideKeyHint(window);
+            surface.key_sequence_len = 0;
+            window.toast.hideOwned(owner);
         },
     }
 }
 
-fn hideKeyHint(window: *Window) void {
-    if (window.toast.icon == d2d.icons.keyboard) window.toast.hide();
-}
-
-/// `key_table`: name the key table that is active in a toast. From a core
-/// callback.
-fn showKeyTable(window: *Window, value: apprt.action.KeyTable) void {
+/// A table hint has a distinct owner from a sequence hint of the same
+/// terminal. Occlusion cancels the visual hint, not the core key state.
+fn showKeyTable(surface: *Surface, value: apprt.action.KeyTable) void {
+    const window = surface.parent_window;
+    const owner: @import("ui/Toast.zig").Owner = .{ .surface_id = surface.core_surface.id, .kind = .table };
     switch (value) {
         .activate => |name| {
             var buf: [160]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&buf);
             i18n.format(&writer, i18n.tr("Key table {name}"), .{ .name = name }) catch {};
-            window.postToast(.{ .text = writer.buffered(), .icon = d2d.icons.keyboard, .duration_ms = null });
+            window.postToast(.{ .text = writer.buffered(), .icon = d2d.icons.keyboard, .duration_ms = null, .owner = owner });
         },
-        .deactivate, .deactivate_all => hideKeyHint(window),
+        .deactivate, .deactivate_all => window.toast.hideOwned(owner),
     }
 }
 
@@ -3324,9 +3318,7 @@ fn surfaceWndProc(
         },
 
         Surface.WM_APP_CHILD_EXITED => {
-            // The dialog runs a modal loop; nothing uses the surface after
-            // it.
-            Dialogs.showChildExited(surface.parent_window.hwnd, @truncate(wparam));
+            _ = showChildExited(surface.parent_window, @truncate(wparam));
             return 0;
         },
 
@@ -3781,26 +3773,32 @@ test "quitTimerStart ignores the call before the message loop runs" {
     try testing.expectEqual(none, quitTimerStart(true, false, 500));
 }
 
-test "ending key hints preserves action feedback" {
-    var app: App = undefined;
-    app.key_sequence_len = 4;
-    var window: Window = undefined;
-    window.toast = .{ .pending = true, .icon = d2d.icons.copy };
-    app.showKeySequence(&window, .end);
+test "ending key hints preserves another terminal, table and action feedback" {
+    var window: Window = .{ .app = undefined };
+    var other_window: Window = .{ .app = undefined };
+    var surface: Surface = .{ .app = undefined, .parent_window = &window, .key_sequence_len = 4 };
+    var other: Surface = .{ .app = undefined, .parent_window = &other_window, .key_sequence_len = 7 };
+    surface.core_surface.id = 1;
+    other.core_surface.id = 2;
+    window.toast = .{ .pending = true, .owner = .{ .surface_id = 1, .kind = .sequence } };
+    showKeySequence(&other, .end);
+    try std.testing.expectEqual(@as(usize, 4), surface.key_sequence_len);
+    try std.testing.expectEqual(@as(usize, 0), other.key_sequence_len);
     try std.testing.expect(window.toast.pending);
-    try std.testing.expectEqual(@as(usize, 0), app.key_sequence_len);
-    showKeyTable(&window, .deactivate_all);
+    showKeyTable(&surface, .deactivate_all);
     try std.testing.expect(window.toast.pending);
+    showKeySequence(&surface, .end);
+    try std.testing.expect(!window.toast.pending);
 
-    window.toast.icon = d2d.icons.keyboard;
-    app.showKeySequence(&window, .end);
+    window.toast = .{ .pending = true, .owner = .{ .surface_id = 1, .kind = .table } };
+    showKeySequence(&surface, .end);
     try std.testing.expect(window.toast.pending);
-    app.key_sequence_len = 4;
-    app.showKeySequence(&window, .end);
+    showKeyTable(&surface, .deactivate);
     try std.testing.expect(!window.toast.pending);
-    window.toast.pending = true;
-    showKeyTable(&window, .deactivate);
-    try std.testing.expect(!window.toast.pending);
+    window.toast = .{ .pending = true, .icon = d2d.icons.copy };
+    showKeySequence(&surface, .end);
+    showKeyTable(&surface, .deactivate_all);
+    try std.testing.expect(window.toast.pending);
 }
 
 test "simulatedTheme decodes the test hook and rejects invalid values" {

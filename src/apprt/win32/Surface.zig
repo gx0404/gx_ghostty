@@ -70,6 +70,10 @@ parent_window: *Window = undefined,
 title_len: usize = 0,
 title: [4096]u8 = std.mem.zeroes([4096]u8),
 
+/// UI sequence text follows this terminal's key state, not the whole app.
+key_sequence: [128]u8 = undefined,
+key_sequence_len: usize = 0,
+
 /// The core terminal surface. Initialized by init() after creating
 /// the window and WGL context. Manages fonts, renderer, PTY, and IO.
 core_surface: CoreSurface = undefined,
@@ -393,6 +397,8 @@ pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
     if (self.core_surface_initialized) {
+        self.parent_window.toast.hideForSurface(self.core_surface.id);
+        self.key_sequence_len = 0;
         // Messages that arrive while the core surface shuts down must not
         // reach it.
         self.core_surface_ready = false;
@@ -526,6 +532,7 @@ pub fn getTitle(self: *const Surface) ?[:0]const u8 {
 /// then drop.
 pub fn setVisible(self: *Surface, visible: bool) void {
     const state = self.visibilityState(visible);
+    if (!state.render and self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);
     if (!state.popups) self.link_preview.hide();
     self.search_bar.setOwnerVisible(state.popups);
     if (self.scrollbar) |sb| sb.setOwnerVisible(state.popups);
@@ -553,9 +560,9 @@ fn visibilityState(self: *const Surface, requested: bool) struct { render: bool,
 /// surfaceWndProc hands it to `confirmClose`.
 pub const WM_APP_CONFIRM_CLOSE: u32 = w32.WM_APP + 0x60;
 
-/// Posted when the command of this terminal failed to start (`App`'s
-/// `show_child_exited`); wparam is its exit code. surfaceWndProc tells the
-/// user from the message loop, not from the core callback.
+/// Deferred child-exit feedback; wparam is an exit code, not a pointer.
+/// surfaceWndProc uses the same non-modal owner-gated notice as App's
+/// `show_child_exited` action.
 pub const WM_APP_CHILD_EXITED: u32 = w32.WM_APP + 32;
 
 /// Close this terminal. `process_active` is the core's
@@ -2135,11 +2142,10 @@ pub fn clientSize(self: *const Surface) ?apprt.SurfaceSize {
     return .{ .width = @truncate(packed_size), .height = @truncate(packed_size >> 32) };
 }
 
-/// The tab holding this terminal moved to `window`
-/// (`Window.moveTabToNewWindow`), which made the terminal's window one of
-/// its children already. GUI thread. For now this only follows the new
-/// parent (`parent_window`); popups the old window owns stay with it.
+/// Follow a moved tab's new parent on the GUI thread. Its key hint must
+/// not remain in the old window; other surface popups stay with it for now.
 pub fn onReparented(self: *Surface, window: *Window) void {
+    if (window != self.parent_window and self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);
     self.parent_window = window;
 }
 
@@ -2550,4 +2556,33 @@ test "quick visibility separates frame rendering from popup animation" {
     }
     window.is_quick_terminal = false;
     try testing.expect(surface.visibilityState(true).popups);
+}
+
+test "occluding one terminal cancels only its visual key hint" {
+    var window: Window = .{ .app = undefined };
+    var surface: Surface = .{ .app = undefined, .parent_window = &window, .core_surface_initialized = true, .key_sequence_len = 4 };
+    surface.core_surface.id = 1;
+    window.toast = .{ .pending = true, .owner = .{ .surface_id = 2, .kind = .table } };
+    surface.setVisible(false);
+    try std.testing.expect(window.toast.pending);
+    window.toast.owner = .{ .surface_id = 1, .kind = .sequence };
+    surface.setVisible(false);
+    try std.testing.expect(!window.toast.pending);
+    try std.testing.expectEqual(@as(usize, 4), surface.key_sequence_len);
+}
+
+test "reparenting a terminal cancels its old window hint, not destination feedback" {
+    var source: Window = .{ .app = undefined };
+    var destination: Window = .{ .app = undefined };
+    var surface: Surface = .{ .app = undefined, .parent_window = &source, .core_surface_initialized = true, .key_sequence_len = 4 };
+    surface.core_surface.id = 1;
+    source.toast = .{ .pending = true, .owner = .{ .surface_id = 1, .kind = .table } };
+    destination.toast = .{ .pending = true };
+    surface.onReparented(&source);
+    try std.testing.expect(source.toast.pending);
+    surface.onReparented(&destination);
+    try std.testing.expect(!source.toast.pending);
+    try std.testing.expect(destination.toast.pending);
+    try std.testing.expect(surface.parent_window == &destination);
+    try std.testing.expectEqual(@as(usize, 4), surface.key_sequence_len);
 }

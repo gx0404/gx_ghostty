@@ -38,7 +38,6 @@ const configpkg = @import("../../config.zig");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
-const Popup = @import("ui/Popup.zig");
 const ResizeOverlay = @import("ui/ResizeOverlay.zig");
 const anim = @import("ui/anim.zig");
 const motion = anim.motion;
@@ -378,13 +377,8 @@ fn finishShow(self: *QuickTerminal) void {
     self.moveTo(self.target_rect);
     self.applyClip(null);
     setCloaked(hwnd, false);
-    _ = w32.ShowOwnedPopups(hwnd, 1);
     self.setTerminalPopupsShown(true);
-    const placement: @import("ui/Notice.zig").Placement = .{ .owner = hwnd, .area = self.window.surfaceRect(), .scale = self.window.scale };
-    self.window.notice.reposition(placement);
-    self.window.toast.reposition(placement);
-    reshowPopup(&self.window.notice.popup);
-    reshowPopup(&self.window.toast.popup);
+    self.window.resumeFeedback();
     // A terminal whose frames the region cut short draws a whole one.
     if (clipped) _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | w32.RDW_ALLCHILDREN);
 }
@@ -522,6 +516,7 @@ fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
 // -----------------------------------------------------------------------
 
 fn suspendPopups(self: *QuickTerminal) void {
+    self.window.suspendFeedback();
     self.setTerminalPopupsShown(false);
     _ = self.window.resize_overlay.onTimer(ResizeOverlay.TIMER_ID);
     if (self.window.hwnd) |hwnd| _ = w32.ShowOwnedPopups(hwnd, 0);
@@ -540,14 +535,6 @@ fn setTerminalPopupsShown(self: *QuickTerminal, shown: bool) void {
         surface.search_bar.setOwnerVisible(shown and pane_shown);
         if (surface.scrollbar) |sb| sb.setOwnerVisible(shown and pane_shown);
     }
-}
-
-/// Show again a popup of the window that `hideWindow` hid while it was
-/// up (the notice, the toast).
-fn reshowPopup(popup: *const Popup) void {
-    if (!popup.visible) return;
-    const hwnd = popup.hwnd orelse return;
-    _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
 }
 
 /// Whether `hwnd` is the quick terminal's window or one it owns (a popup,
