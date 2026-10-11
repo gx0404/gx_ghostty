@@ -147,8 +147,8 @@ comptime {
 /// Posted after the last activation lock is released.
 pub const WM_APP_SYNC_ACTIVATION: u32 = w32.WM_APP + 42;
 pub const WM_APP_NATIVE_FALLBACK: u32 = w32.WM_APP + 43;
-pub const WM_GHOSTTY_SIMULATE_D2D_FAILURE: u32 = w32.WM_USER + 0x4A;
-pub const WM_GHOSTTY_CAPTION_QUERY: u32 = w32.WM_USER + 0x4B;
+pub const WM_GHOSTTY_SIMULATE_D2D_FAILURE: u32 = w32.WM_USER + 0x4C;
+pub const WM_GHOSTTY_CAPTION_QUERY: u32 = w32.WM_USER + 0x4D;
 
 pub const Decoration = enum {
     /// The integrated title bar (`window-decoration = auto|client`).
@@ -1341,10 +1341,10 @@ fn showTooltip(self: *TitleBar) void {
         .minimize => .{ i18n.tr("Minimize"), lay.minimize },
         .maximize => .{ if (self.isZoomed()) i18n.tr("Restore Down") else i18n.tr("Maximize"), lay.maximize },
         .close => .{ i18n.tr("Close"), lay.close },
-        .new_tab => .{ i18n.tr("New tab"), win.tab_bar.new_tab_rect },
-        .profiles => .{ i18n.tr("New Tab with Profile"), win.tab_bar.profile_rect },
-        .tab_close => |i| .{ i18n.tr("Close tab"), win.tab_bar.closeRect(lay, i) },
-        .tab => |i| .{ win.tab_bar.tooltipText(i, &buf) orelse return, win.tab_bar.tabRect(i) },
+        .new_tab, .profiles, .tab_close, .tab => tip: {
+            const tip = win.tab_bar.tooltip(self.tooltip.target, lay, &buf) orelse return;
+            break :tip .{ tip.text, tip.anchor };
+        },
     };
     if (text.len == 0 or anchor.right <= anchor.left) return;
     var top_left = w32.POINT{ .x = anchor.left, .y = anchor.top };

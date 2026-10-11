@@ -800,9 +800,11 @@ fn uncloak(self: *Window, drawn: bool) void {
     self.uncloaked_ms = GetTickCount64();
     // The layouts before were the window opening: they are the first one
     // `resize-overlay = after-first` leaves out.
-    self.resize_overlay.seen_first = true;
+    if (self.app.config.@"resize-overlay" != .always) {
+        if (self.getActiveSurface()) |surface| self.resize_overlay.remember(surface);
+    }
     self.overlay_grid = self.activeGrid();
-    if (self.app.config.@"resize-overlay" == .always) self.resize_overlay.show();
+    if (self.app.config.@"resize-overlay" == .always and !self.is_quick_terminal) self.showActiveResizeOverlay();
     log.debug("window shown after {d}ms first_frame={}", .{ self.uncloaked_ms -| self.first_frame_since_ms, drawn });
 }
 
@@ -828,14 +830,10 @@ fn showResizeOverlay(self: *Window) void {
 
 fn showActiveResizeOverlay(self: *Window) void {
     const surface = self.getActiveSurface() orelse return;
-    if (comptime @hasDecl(ResizeOverlay, "showIn")) {
-        const tree = &self.tab_trees[self.active_tab];
-        const handle = tree.locate(surface) orelse return;
-        const area = split_layout.paneRect(Tree, tree, self.splitArea(), self.splitMetrics().gap, handle) orelse return;
-        self.resize_overlay.showIn(surface, @bitCast(area));
-    } else {
-        self.resize_overlay.show();
-    }
+    const tree = &self.tab_trees[self.active_tab];
+    const handle = tree.locate(surface) orelse return;
+    const area = split_layout.paneRect(Tree, tree, self.splitArea(), self.splitMetrics().gap, handle) orelse return;
+    self.resize_overlay.showIn(surface, .{ .left = area.left, .top = area.top, .right = area.right, .bottom = area.bottom });
 }
 
 const SW_SHOWMAXIMIZED: i32 = 3;
@@ -1497,6 +1495,7 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     }
 
     if (self.tab_count == 0) return;
+    if (self.closeQuickSelection(ids[0..count])) return;
     const focused = self.hasFocus();
     const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
     const active_closed = std.mem.indexOfScalar(u64, ids[0..count], active_id) != null;
@@ -1563,6 +1562,14 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     freeTrees(trees[0..detached]);
 }
 
+fn closeQuickSelection(self: *Window, ids: []const u64) bool {
+    if (!self.is_quick_terminal or self.tab_count != 1) return false;
+    const surface = self.tab_active_surface[0];
+    if (!surface.core_surface_initialized or std.mem.indexOfScalar(u64, ids, surface.core_surface.id) == null) return false;
+    self.removeTab(0);
+    return true;
+}
+
 /// The index of the tab with the terminal whose core surface id is `id`,
 /// e.g. to find a tab again after a modal loop.
 pub fn findTabBySurfaceId(self: *Window, id: u64) ?usize {
@@ -1591,7 +1598,7 @@ fn removeTab(self: *Window, idx: usize) void {
         if (self.app.quick_terminal) |qt| {
             if (qt.window == self) {
                 self.closing = true;
-                self.setAppModeTimer(false);
+                self.stopAppModeSoon();
                 if (qt.onLastTabClosed()) return;
             }
         }
@@ -2165,16 +2172,7 @@ const PaneLayout = struct {
     /// presented a frame at its new size, so DWM does not stretch stale
     /// frames. The renderers draw in parallel.
     fn awaitResizeFrames(self: *const PaneLayout) void {
-        var events: [capacity]w32.HANDLE = undefined;
-        var count: u32 = 0;
-        for (self.surfaces[0..self.len]) |surface| {
-            if (!surface.resize_frame_pending) continue;
-            surface.resize_frame_pending = false;
-            const event = surface.frame_event orelse continue;
-            events[count] = event;
-            count += 1;
-        }
-        if (count > 0) _ = w32.WaitForMultipleObjects(count, &events, 1, Surface.resize_frame_timeout_ms);
+        _ = Surface.awaitResizeFrames(self.surfaces[0..self.len]);
     }
 };
 
@@ -3309,9 +3307,10 @@ fn onSystemSettingChange(self: *Window, change: w32.SystemChange) void {
     };
     for (0..self.tab_count) |tab| {
         var it = self.tab_trees[tab].iterator();
-        while (it.next()) |entry| if (entry.view.hwnd) |child| {
-            _ = w32.SendMessageW(child, message, wp, lp);
-        };
+        while (it.next()) |entry| {
+            entry.view.refreshScrollbarMode();
+            if (entry.view.hwnd) |child| _ = w32.SendMessageW(child, message, wp, lp);
+        }
     }
 }
 
@@ -3328,6 +3327,11 @@ pub fn windowWndProc(
         @ptrFromInt(@as(usize, @bitCast(userdata)))
     else
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    if (window.app.isTaskbarButtonCreated(msg)) {
+        window.app.onTaskbarButtonCreated(window);
+        return 0;
+    }
 
     // Once the last tab is closed and WM_CLOSE has been posted, drop any
     // input messages still queued for this window. They could otherwise
@@ -3610,7 +3614,7 @@ pub fn windowWndProc(
                 if (window.closing and qt.animating) return 0;
                 if (!window.closing) {
                     window.closing = true;
-                    window.setAppModeTimer(false);
+                    window.stopAppModeSoon();
                     if (qt.onLastTabClosed()) return 0;
                 }
             }
@@ -3688,6 +3692,14 @@ pub fn windowWndProc(
             const pt = mousePoint(lparam);
             if (window.inChrome(pt.y)) {
                 window.onChromeRightClick(pt);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_MBUTTONDOWN => {
+            const pt = mousePoint(lparam);
+            if (window.inChrome(pt.y)) {
+                _ = window.tab_bar.onMiddleButtonDown(window.title_bar.layout(), pt.x, pt.y);
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -3781,9 +3793,14 @@ test "quick last tab remains in the model until deferred window close" {
     app.config = config;
     var window: Window = .{ .app = &app, .is_quick_terminal = true, .tab_count = 1 };
     window.tab_trees[0] = .empty;
+    var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_initialized = true };
+    surface.core_surface.id = 1;
+    window.tab_active_surface[0] = &surface;
     var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &window, .phase = .shown, .visible = true };
     app.quick_terminal = &quick;
-    window.removeTab(0);
+    try testing.expect(!window.closeQuickSelection(&.{2}));
+    try testing.expect(!window.closing);
+    try testing.expect(window.closeQuickSelection(&.{1}));
     try testing.expectEqual(@as(usize, 1), window.tab_count);
     try testing.expect(window.closing);
     try testing.expect(quick.close_when_hidden);
@@ -4029,6 +4046,21 @@ test "app mode samples reset when the feature is disabled or another tab opens" 
     try std.testing.expect(!samples.update(&state, false, 1, &.{true}, 1));
     try std.testing.expect(!samples.update(&state, true, 1, &.{true}, 1));
     try std.testing.expect(samples.update(&state, true, 1, &.{true}, 2));
+}
+
+test "window and caption private message contracts do not collide" {
+    const messages = [_]u32{
+        WM_GHOSTTY_SIMULATE_DPI,
+        WM_GHOSTTY_SIMULATE_SYSTEM_THEME,
+        WM_GHOSTTY_WINDOW_STATE,
+        WM_GHOSTTY_SIMULATE_OCCLUSION,
+        TitleBar.WM_GHOSTTY_SIMULATE_D2D_FAILURE,
+        TitleBar.WM_GHOSTTY_CAPTION_QUERY,
+    };
+    for (messages, 0..) |message, i| {
+        try std.testing.expect(message >= w32.WM_USER);
+        for (messages[i + 1 ..]) |other| try std.testing.expect(message != other);
+    }
 }
 
 test {

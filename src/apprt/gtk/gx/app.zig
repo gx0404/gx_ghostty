@@ -280,11 +280,7 @@ fn openSettingsPage(app: *Application, page: []const u8) bool {
         log.warn("unknown settings page {s}", .{page});
         return false;
     };
-    _ = openSettings(app);
-    const window = activeWindow(app) orelse return true;
-    const dialog = window.as(adw.ApplicationWindow).getVisibleDialog() orelse return true;
-    const settings = gobject.ext.cast(GxSettingsDialog, dialog) orelse return true;
-    settings.as(adw.PreferencesDialog).setVisiblePageName(@tagName(settings_page));
+    GxSettingsDialog.showPage(app, settings_page);
     return true;
 }
 

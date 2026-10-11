@@ -885,6 +885,10 @@ pub fn performAction(
         },
 
         .new_window => {
+            const font_size = switch (target) {
+                .app => if (self.core_app.focusedSurface()) |surface| surface.rt_surface.inheritedFontSize(.window) else null,
+                .surface => |surface| surface.rt_surface.inheritedFontSize(.window),
+            };
             // Inherit opacity-toggle state from the parent window: if the
             // user toggled it to opaque via toggle_background_opacity, the
             // new window should start opaque too. Mirrors macOS behavior
@@ -917,7 +921,7 @@ pub fn performAction(
                 return true;
             };
             // The window context: `window-inherit-working-directory`.
-            _ = window.addTabWithOptions(.{ .context = .window }) catch |err| {
+            _ = window.addTabWithOptions(.{ .context = .window, .font_size = font_size }) catch |err| {
                 log.err("failed to add tab to new window err={}", .{err});
                 // The window never showed: the message loop destroys it,
                 // which also drops it from `windows`.
@@ -975,18 +979,8 @@ pub fn performAction(
         },
 
         .toggle_maximize => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |hwnd| {
-                        if (w32.IsZoomed(hwnd) != 0) {
-                            _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
-                        } else {
-                            _ = w32.ShowWindow(hwnd, w32.SW_MAXIMIZE);
-                        }
-                    }
-                },
-            }
+            const window = self.targetWindow(target) orelse return false;
+            window.toggleMaximize();
             return true;
         },
 
@@ -1164,8 +1158,10 @@ pub fn performAction(
             };
         },
 
-        // The tab switcher of the command palette is not there yet.
-        .toggle_tab_overview => return false,
+        .toggle_tab_overview => {
+            const window = self.targetWindow(target) orelse return false;
+            return self.performGx(window, .tab_switcher);
+        },
 
         .initial_size => {
             switch (target) {
@@ -1343,27 +1339,10 @@ pub fn performAction(
         },
 
         .color_change => {
-            // Track terminal background color changes (OSC 10/11) so the
-            // class background brush matches. The renderer paints the
-            // client area via OpenGL — the brush only affects the brief
-            // flash on resize before the renderer catches up.
             if (value.kind != .background) return true;
-            if (self.bg_brush) |old_brush| {
-                _ = w32.DeleteObject(@ptrCast(old_brush));
-            }
-            self.bg_brush = w32.CreateSolidBrush(w32.RGB(value.r, value.g, value.b));
-            // SetClassLongPtrW propagates the new brush to all existing
-            // windows of the class, not just future ones.
-            for (self.windows.items) |w| {
-                if (w.hwnd) |h| {
-                    if (self.bg_brush) |b| {
-                        _ = w32.SetClassLongPtrW(
-                            h,
-                            w32.GCLP_HBRBACKGROUND,
-                            @intCast(@intFromPtr(b)),
-                        );
-                    }
-                }
+            switch (target) {
+                .app => {},
+                .surface => |core_surface| core_surface.rt_surface.setEraseColor(.{ .r = value.r, .g = value.g, .b = value.b }),
             }
             return true;
         },
@@ -1469,22 +1448,7 @@ pub fn performAction(
         .mouse_visibility => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    const surface = core_surface.rt_surface;
-                    const visible = value == .visible;
-                    surface.mouse_visible = visible;
-                    // WM_SETCURSOR applies it from the next pointer move;
-                    // apply it now only while the pointer is over this
-                    // terminal, so it stays on the tab bar, a popup or
-                    // another window.
-                    if (pointerOver(surface.hwnd)) {
-                        if (!visible) {
-                            _ = w32.SetCursor(null);
-                        } else if (surface.current_cursor) |c| {
-                            _ = w32.SetCursor(c);
-                        }
-                    }
-                },
+                .surface => |core_surface| core_surface.rt_surface.setMouseVisibility(value == .visible),
             }
             return true;
         },
@@ -1624,12 +1588,25 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
             .shell => .shell,
             .about => .about,
         }),
-        // Not implemented yet: report them as not performed so that a
-        // `performable:` binding passes its key on to the terminal.
-        .move_split_to_tab,
-        .move_split_to_window,
-        .tab_switcher,
-        => false,
+        .move_split_to_tab => moved: {
+            const surface = window.getActiveSurface() orelse break :moved false;
+            break :moved window.moveSplitToTab(surface) catch |err| {
+                log.warn("cannot move split to tab err={}", .{err});
+                break :moved false;
+            };
+        },
+        .move_split_to_window => moved: {
+            const surface = window.getActiveSurface() orelse break :moved false;
+            break :moved window.moveSplitToNewWindow(surface) catch |err| {
+                log.warn("cannot move split to window err={}", .{err});
+                break :moved false;
+            };
+        },
+        .tab_switcher => tabs: {
+            const surface = window.getActiveSurface() orelse break :tabs false;
+            surface.palette.toggle(.tabs);
+            break :tabs true;
+        },
     };
 }
 
@@ -1660,45 +1637,9 @@ fn onDeferredGx(self: *App, wparam: usize, lparam: isize) void {
     const window = surface.parent_window;
     if (window.closing) return;
     switch (kind) {
-        .new_tab_menu => Menu.showProfileMenu(window, newTabMenuAnchor(window)),
-        .context_menu => openContextMenu(surface),
+        .new_tab_menu => Menu.showNewTabMenu(window),
+        .context_menu => Menu.showSurfaceContextMenuAtCursor(surface),
     }
-}
-
-/// Where the launch profile menu opens from the keyboard: below the new tab
-/// button, or at the top left of the terminal area without a tab bar.
-fn newTabMenuAnchor(window: *Window) w32.POINT {
-    const hwnd = window.hwnd orelse return .{ .x = 0, .y = 0 };
-    const button = window.tab_bar.new_tab_rect;
-    var pt: w32.POINT = if (window.tab_bar.visible and button.right > button.left)
-        .{ .x = button.left, .y = button.bottom }
-    else at: {
-        const area = window.surfaceRect();
-        break :at .{ .x = area.left, .y = area.top };
-    };
-    _ = w32.ClientToScreen(hwnd, &pt);
-    return pt;
-}
-
-/// The terminal's context menu from the keyboard (`gx:context_menu`),
-/// opened at its cursor, as the IME candidate window is.
-fn openContextMenu(surface: *Surface) void {
-    if (!surface.core_surface_ready) return;
-    const hwnd = surface.hwnd orelse return;
-    const cursor = surface.core_surface.imePoint();
-    const scale = surface.getContentScale() catch apprt.ContentScale{ .x = 1, .y = 1 };
-    var pt: w32.POINT = .{
-        .x = @intFromFloat(@round(cursor.x * @as(f64, scale.x))),
-        .y = @intFromFloat(@round(cursor.y * @as(f64, scale.y))),
-    };
-    _ = w32.ClientToScreen(hwnd, &pt);
-    const app = surface.app;
-    const id = surface.core_surface.id;
-    const binding = Menu.showSurfaceContextMenu(surface, pt) orelse return;
-    const core_surface = app.core_app.findSurfaceByID(id) orelse return;
-    _ = core_surface.performBindingAction(binding) catch |err| {
-        log.err("context menu action failed err={}", .{err});
-    };
 }
 
 /// The window an action applies to: the surface's window, or for app
@@ -2024,6 +1965,11 @@ pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTa
         },
     };
 
+    const context: apprt.surface.NewSurfaceContext = switch (where) {
+        .tab => .tab,
+        .window => .window,
+    };
+    const font_size = if (window.getActiveSurface()) |surface| surface.inheritedFontSize(context) else null;
     const destination = switch (where) {
         .tab => window,
         .window => self.newWindow(.{}) catch |err| {
@@ -2032,10 +1978,8 @@ pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTa
         },
     };
     _ = destination.addTabWithOptions(.{
-        .context = switch (where) {
-            .tab => .tab,
-            .window => .window,
-        },
+        .context = context,
+        .font_size = font_size,
         .command = &command,
     }) catch |err| {
         log.err("failed to open launch profile id={s} err={}", .{ profile.id, err });
@@ -2836,7 +2780,6 @@ fn copyTitle(self: *App, surface: *Surface) bool {
     const text = alloc.dupeZ(u8, title) catch return false;
     defer alloc.free(text);
     surface.setClipboard(.standard, &.{.{ .mime = "text/plain", .data = text }}, false) catch return false;
-    self.notifyClipboardCopy(window, .standard, false);
     return true;
 }
 

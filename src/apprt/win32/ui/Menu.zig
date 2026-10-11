@@ -600,12 +600,7 @@ pub fn showTabList(window: *Window, anchor: w32.RECT) void {
     for (0..count) |i| {
         ids[i] = window.tab_active_surface[i].core_surface.id;
         var title_buf: [768]u8 = undefined;
-        var label_buf: [64]u8 = undefined;
-        const title = wstr.utf8Buf(&title_buf, window.tab_titles[i][0..window.tab_title_lens[i]]);
-        const label = if (std.mem.trim(u8, title, " ").len > 0)
-            title
-        else
-            std.fmt.bufPrint(&label_buf, "{s} {d}", .{ i18n.tr("Tab"), i + 1 }) catch i18n.tr("Tab");
+        const label = window.tab_bar.labelText(i, &title_buf) orelse continue;
         var shortcut_buf: [64]u8 = undefined;
         menu.add(&menu.root, .{
             .id = i + 1,

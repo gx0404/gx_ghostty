@@ -1053,9 +1053,7 @@ fn writeClipboard(self: *Surface, blocks: ClipboardBlocks, attempt: u8) void {
         blocks.free();
         return;
     };
-    if (comptime @hasDecl(App, "notifyClipboardCopy")) {
-        if (written) self.app.notifyClipboardCopy(self.parent_window, .standard, blocks.empty);
-    }
+    if (written) self.app.notifyClipboardCopy(self.parent_window, .standard, blocks.empty);
 }
 
 fn onClipboardWriteTimer(self: *Surface) void {
@@ -1163,10 +1161,14 @@ pub fn confirmClipboard(self: *Surface) void {
     const owner = self.parent_window.hwnd;
 
     self.confirming_clipboard = true;
-    const choice = switch (pending.kind) {
-        .unsafe_paste => Dialogs.confirmUnsafePaste(owner, pending.text),
-        .read => Dialogs.confirmClipboardAccess(owner, .read, pending.text),
-        .write => Dialogs.confirmClipboardAccess(owner, .write, pending.text),
+    const can_remember = pending.kind != .unsafe_paste and if (pending.request) |request|
+        request == .osc_52_read or request == .osc_52_write
+    else
+        pending.kind == .write;
+    const answer: Dialogs.ClipboardAnswer = switch (pending.kind) {
+        .unsafe_paste => .{ .choice = Dialogs.confirmUnsafePaste(owner, pending.text) },
+        .read => Dialogs.askClipboardAccess(owner, .read, pending.text, can_remember),
+        .write => Dialogs.askClipboardAccess(owner, .write, pending.text, can_remember),
     };
     defer pending.freeText(alloc);
 
@@ -1177,7 +1179,15 @@ pub fn confirmClipboard(self: *Surface) void {
         return;
     };
     surface.confirming_clipboard = false;
-    surface.answerClipboard(pending, choice == .accept);
+    surface.answerClipboard(pending, answer.choice == .accept);
+    if (answer.remember and can_remember and surface.core_surface_ready) {
+        const policy: configpkg.Config.ClipboardAccess = if (answer.choice == .accept) .allow else .deny;
+        switch (pending.kind) {
+            .read => surface.core_surface.config.clipboard_read = policy,
+            .write => surface.core_surface.config.clipboard_write = policy,
+            .unsafe_paste => {},
+        }
+    }
     if (surface.clipboard_confirms.items.len > 0) {
         if (surface.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0);
     }
@@ -2038,9 +2048,7 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
 fn pointerMoved(self: *Surface, pos: apprt.CursorPos) void {
     if (pos.x == self.cursor_pos.x and pos.y == self.cursor_pos.y) return;
     self.cursor_pos = pos;
-    if (comptime @hasDecl(Scrollbar, "onOwnerMouseMove")) {
-        if (self.scrollbar) |sb| sb.onOwnerMouseMove(@intFromFloat(pos.x));
-    }
+    if (self.scrollbar) |sb| sb.onOwnerMouseMove(@intFromFloat(pos.x));
 
     self.followPointerFocus();
 
@@ -2678,25 +2686,7 @@ pub fn onReparented(self: *Surface, window: *Window) void {
     self.parent_window = window;
     self.handleDpiChange(@intFromFloat(@round(window.scale * 96)));
 
-    if (self.scrollbar) |sb| {
-        if (comptime @hasDecl(Scrollbar, "onReparented")) {
-            sb.onReparented();
-        } else {
-            const state = sb.state;
-            const enabled = sb.enabled;
-            const bg = sb.bg;
-            const fg = sb.fg;
-            sb.destroy();
-            self.scrollbar = null;
-            if (self.hwnd) |hwnd| {
-                self.scrollbar = Scrollbar.create(self.app.core_app.alloc, hwnd, self, enabled) catch null;
-                if (self.scrollbar) |next| {
-                    next.setTheme(bg, fg);
-                    next.update(state);
-                }
-            }
-        }
-    }
+    if (self.scrollbar) |sb| sb.onReparented();
     if (search_active) {
         self.search_bar.setActive(true, "");
         if (self.search_bar.popup.hwnd != null) {
@@ -3164,9 +3154,15 @@ test "occluding one terminal cancels only its visual key hint" {
 }
 
 test "reparenting a terminal cancels its old window hint, not destination feedback" {
-    var source: Window = .{ .app = undefined };
-    var destination: Window = .{ .app = undefined };
-    var surface: Surface = .{ .app = undefined, .parent_window = &source, .core_surface_initialized = true, .key_sequence_len = 4 };
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = std.testing.allocator;
+    var app: App = .{ .core_app = &core_app, .config = config, .hinstance = undefined, .default_command_arena = .init(std.testing.allocator) };
+    defer app.default_command_arena.deinit();
+    var source: Window = .{ .app = &app };
+    var destination: Window = .{ .app = &app };
+    var surface: Surface = .{ .app = &app, .parent_window = &source, .core_surface_initialized = true, .key_sequence_len = 4 };
     surface.core_surface.id = 1;
     source.toast = .{ .pending = true, .owner = .{ .surface_id = 1, .kind = .table } };
     destination.toast = .{ .pending = true };
