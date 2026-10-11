@@ -942,8 +942,7 @@ pub fn paint(self: *TitleBar, hdc: w32.HDC) void {
     const canvas = &self.canvas.?;
     const mem_dc = self.dib.ensure(hdc, w, h) orelse return;
 
-    const rect = w32.RECT{ .left = 0, .top = 0, .right = w, .bottom = h };
-    if (!canvas.beginDcAlpha(mem_dc, rect, self.canvasDpi())) {
+    if (!canvas.beginDib(&self.dib, .{ .width = @intCast(w), .height = @intCast(h) }, self.canvasDpi())) {
         self.queueNativeFallback();
         return;
     }
@@ -1029,7 +1028,7 @@ const StripColors = struct {
     strip_fill: d2d.Color,
     strip_text: d2d.Color,
     strip_text_inactive: d2d.Color,
-    tab_fill: d2d.Color,
+    tab_fill: u32,
 };
 
 /// The strip colors (`stripColors`) for this window.
@@ -1043,7 +1042,7 @@ fn paintColors(self: *const TitleBar, tokens: style.Tokens) StripColors {
         .per_pixel = per_pixel,
         .opacity = @floatCast(std.math.clamp(config.@"background-opacity", 0, 1)),
         .material_dark = Backdrop.materialIsDark(config),
-        .terminal = if (per_pixel) Backdrop.straightColor(config) else null,
+        .terminal = if (per_pixel) Backdrop.backgroundPixel(config) else null,
     });
 }
 
@@ -1059,9 +1058,8 @@ const StripBackdrop = struct {
     opacity: f32 = 1,
     /// Whether the material is dark (`Backdrop.materialIsDark`).
     material_dark: bool = true,
-    /// The terminal background as the terminals draw it
-    /// (`Backdrop.straightColor`), where DWM composes the window per pixel.
-    terminal: ?d2d.Color = null,
+    /// The terminal's stored BGRA (`Backdrop.backgroundPixel`).
+    terminal: ?u32 = null,
 };
 
 /// Bare materials use black or white glyphs according to `window-theme`.
@@ -1072,7 +1070,7 @@ fn stripColors(tokens: style.Tokens, through: StripBackdrop) StripColors {
         .strip_fill = tokens.title_bar,
         .strip_text = tokens.text,
         .strip_text_inactive = tokens.text_disabled,
-        .tab_fill = tokens.background,
+        .tab_fill = d2d.colorPixel(tokens.background),
     };
     if (tokens.high_contrast) return colors;
     if (through.terminal) |terminal| colors.tab_fill = terminal;
@@ -1120,10 +1118,9 @@ pub const PaintContext = struct {
     /// Text and glyphs on the strip, and dimmed for an inactive window.
     strip_text: d2d.Color,
     strip_text_inactive: d2d.Color,
-    /// The fill of the active tab, which joins the terminal below: the
-    /// terminal background as the terminals draw it
-    /// (`Backdrop.straightColor` where DWM composes the window per pixel).
-    tab_fill: d2d.Color,
+    /// Stored BGRA of the active tab (`Backdrop.backgroundPixel` where
+    /// DWM composes the window per pixel).
+    tab_fill: u32,
 
     /// A pixel rectangle in DIPs.
     pub fn dipRect(self: PaintContext, rect: w32.RECT) d2d.Rect {
@@ -1737,7 +1734,7 @@ test "the strip shows the material, the terminals' opacity or nothing" {
     // Solid and opaque.
     const solid = stripColors(tokens, .{});
     try testing.expectEqual(tokens.title_bar, solid.strip_fill);
-    try testing.expectEqual(tokens.background, solid.tab_fill);
+    try testing.expectEqual(d2d.colorPixel(tokens.background), solid.tab_fill);
 
     const mica = stripColors(tokens, .{ .material = .mica, .under_frame = true, .per_pixel = true, .opacity = 0.3 });
     try testing.expectEqual(@as(f32, 0), mica.strip_fill.a);
@@ -1757,7 +1754,7 @@ test "the strip shows the material, the terminals' opacity or nothing" {
 
     // No material under the row (solid, a borderless window), translucent
     // terminals: the strip as translucent, the active tab as they draw it.
-    const terminal: d2d.Color = .{ .r = 0.1, .g = 0.1, .b = 0.15, .a = 0.8 };
+    const terminal: u32 = 0xcc1b1b23;
     const see_through = stripColors(tokens, .{ .material = .mica, .per_pixel = true, .opacity = 0.8, .terminal = terminal });
     try testing.expectEqual(tokens.title_bar.withAlpha(0.8), see_through.strip_fill);
     try testing.expectEqual(terminal, see_through.tab_fill);

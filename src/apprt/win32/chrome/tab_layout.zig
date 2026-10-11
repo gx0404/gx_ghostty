@@ -1,9 +1,9 @@
 //! Tab bar geometry and labels that need no window: where the tabs and the
 //! buttons of a window's tab strip go (`compute`), which slot a dragged tab
 //! lands in (`dragTarget`, `dragSlotLeft`), the text a tab shows (`label`)
-//! and the straight-alpha fill of an active tab that joins a translucent
-//! terminal (`straightFill`). `chrome/TabBar.zig` paints and hit-tests with
-//! them. Only depends on std.
+//! and the stored BGRA fill of an active tab that joins a translucent
+//! terminal (`backgroundPixel`). `chrome/TabBar.zig` paints and hit-tests with
+//! them. Color math is shared with `Backdrop` through `alpha.zig`.
 //!
 //! The tabs share the strip in equal widths from `max_width` down to
 //! `min_width`; the active tab keeps at least `active_min_width`, enough for
@@ -437,37 +437,7 @@ pub fn simplifyTitle(title: []const u8) []const u8 {
 // Colors
 // -----------------------------------------------------------------------
 
-/// A color in sRGB components and alpha, 0 to 1.
-pub const Rgba = struct { r: f32, g: f32, b: f32, a: f32 };
-
-/// The straight-alpha color that Direct2D, premultiplying in gamma space,
-/// turns into the pixel the OpenGL renderer writes for the terminal
-/// background `rgb` at `opacity`: the alpha quantized to 8 bits first, the
-/// color premultiplied in linear light when `linear` (`alpha-blending`),
-/// as `Backdrop.fillBackground` writes the window background. The active
-/// tab filled with it over a transparent strip matches the terminal below.
-pub fn straightFill(rgb: [3]u8, opacity: f64, linear: bool) Rgba {
-    const a8 = @round(std.math.clamp(opacity, 0, 1) * 255);
-    const a = a8 / 255;
-    if (a8 == 0) return .{ .r = 0, .g = 0, .b = 0, .a = 0 };
-    var out: [3]f32 = undefined;
-    for (rgb, &out) |value, *channel| {
-        const c = @as(f64, @floatFromInt(value)) / 255;
-        const premultiplied = if (linear) linearToSrgb(srgbToLinear(c) * a) else c * a;
-        // The renderer writes whole 8-bit values.
-        const stored = @round(premultiplied * 255) / 255;
-        channel.* = @floatCast(@min(1, stored / a));
-    }
-    return .{ .r = out[0], .g = out[1], .b = out[2], .a = @floatCast(a) };
-}
-
-fn srgbToLinear(v: f64) f64 {
-    return if (v <= 0.04045) v / 12.92 else std.math.pow(f64, (v + 0.055) / 1.055, 2.4);
-}
-
-fn linearToSrgb(v: f64) f64 {
-    return if (v <= 0.0031308) v * 12.92 else 1.055 * std.math.pow(f64, v, 1.0 / 2.4) - 0.055;
-}
+pub const backgroundPixel = @import("alpha.zig").backgroundPixel;
 
 pub const Cache = struct {
     input: ?Input = null,
@@ -827,19 +797,9 @@ test "labels show the title of an idle shell and the program otherwise" {
 }
 
 test "the active tab fill premultiplies like the renderer" {
-    const opaque_fill = straightFill(.{ 0x1f, 0x1f, 0x28 }, 1, true);
-    try testing.expectApproxEqAbs(@as(f32, 0x1f) / 255, opaque_fill.r, 1e-6);
-    try testing.expectEqual(@as(f32, 1), opaque_fill.a);
-    try testing.expectEqual(@as(f32, 0), straightFill(.{ 0xff, 0xff, 0xff }, 0, true).a);
-
-    // GX Mocha at 0.8 in linear light: the renderer writes 0xcc1b1b23.
-    const fill = straightFill(.{ 0x1f, 0x1f, 0x28 }, 0.8, true);
-    try testing.expectApproxEqAbs(@as(f32, 0xcc) / 255, fill.a, 1e-6);
-    for ([_]f32{ fill.r, fill.g, fill.b }, [_]u8{ 0x1b, 0x1b, 0x23 }) |channel, expected| {
-        const stored: u8 = @intFromFloat(@round(channel * fill.a * 255));
-        try testing.expectEqual(expected, stored);
-    }
-    // Without linear blending it is the color itself.
-    const plain = straightFill(.{ 0x20, 0x40, 0xff }, 0.5, false);
-    try testing.expectApproxEqAbs(@as(f32, 0x10) / 255 / plain.a, plain.r, 1e-6);
+    try testing.expectEqual(@as(u32, 0xff1f1f28), backgroundPixel(.{ 0x1f, 0x1f, 0x28 }, 1, true));
+    try testing.expectEqual(@as(u32, 0), backgroundPixel(.{ 0xff, 0xff, 0xff }, 0, true));
+    try testing.expectEqual(@as(u32, 0xcc1b1b23), backgroundPixel(.{ 0x1f, 0x1f, 0x28 }, 0.8, true));
+    try testing.expectEqual(@as(u32, 0x80102080), backgroundPixel(.{ 0x20, 0x40, 0xff }, 0.5, false));
+    try testing.expectEqual(@as(u32, 0x4d959595), backgroundPixel(.{ 0xff, 0xff, 0xff }, 0.3, true));
 }
