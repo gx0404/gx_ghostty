@@ -1,0 +1,24 @@
+id = "G10"
+title = "R3-Window: shortcuts use horizontal keycaps, fold extra combinations and keep key tables separate"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+keybind = ctrl+alt+c=copy_to_clipboard
+keybind = ctrl+alt+x=copy_to_clipboard
+keybind = ctrl+alt+v=copy_to_clipboard
+keybind = demo/ctrl+c=copy_to_clipboard
+keybind = demo/escape=deactivate_key_table
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+shift+slash
+sleep 1
+type --delay 40 "copy"
+sleep 0.5
+"""
+expect = [
+  "G10-after.png: search and rows align; Copy has at most two horizontal keycap combinations plus +N; Key Table: demo is separate",
+]

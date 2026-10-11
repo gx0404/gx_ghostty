@@ -10,20 +10,8 @@ using Gtk 4.0;
 menu main_menu {
   section {
     item {
-      label: "Copy";
-      action: "win.copy";
-    }
-
-    item {
-      label: "Paste";
-      action: "win.paste";
-    }
-  }
-
-  section {
-    item {
-      label: "Change Window Title…";
-      action: "win.prompt-window-title";
+      label: "New Tab";
+      action: "win.new-tab";
     }
 
     item {
@@ -31,31 +19,10 @@ menu main_menu {
       action: "win.new-window";
     }
 
-    item {
-      label: "Close Window";
-      action: "win.close";
-    }
-  }
-
-  section {
-    item {
-      label: "Change Tab Title…";
-      action: "win.prompt-tab-title";
+    submenu gx_main_profiles_menu {
+      label: "New Tab with Profile";
     }
 
-    item {
-      label: "New Tab";
-      action: "win.new-tab";
-    }
-
-    item {
-      label: "Close Tab";
-      action: "win.close-tab";
-      target: "this";
-    }
-  }
-
-  section {
     submenu {
       label: "Split";
 
@@ -88,50 +55,10 @@ menu main_menu {
 
   section {
     item {
-      label: "Clear";
-      action: "win.clear";
-    }
-
-    item {
-      label: "Reset";
-      action: "win.reset";
-    }
-  }
-
-  section {
-    item {
       label: "Command Palette";
       action: "win.toggle-command-palette";
     }
 
-    item {
-      label: "Terminal Inspector";
-      action: "win.toggle-inspector";
-    }
-
-    submenu {
-      label: "Config";
-
-      item {
-        label: "Open Configuration in OS Editor";
-        action: "app.open-config";
-        target: "os-open";
-      }
-
-      item {
-        label: "Open Configuration in New Window";
-        action: "app.open-config";
-        target: "new-window";
-      }
-
-      item {
-        label: "Reload Configuration";
-        action: "app.reload-config";
-      }
-    }
-  }
-
-  section {
     item {
       label: "Settings…";
       action: "app.gx-settings";
@@ -145,6 +72,21 @@ menu main_menu {
     submenu gx_language_menu {
       label: "Language";
     }
+  }
+
+  section {
+    item {
+      label: "Reload Configuration";
+      action: "app.reload-config";
+    }
+
+    item {
+      label: "Open Configuration File";
+      action: "app.gx-open-config-file";
+    }
+  }
+
+  section gx_view_section {
   }
 
   section {
@@ -192,12 +134,59 @@ menu split_menu {
       action: "win.split-right";
     }
   }
+
+  section {
+    item {
+      label: "Set Default Shell…";
+      action: "app.gx-settings-page";
+      target: "shell";
+    }
+
+    item {
+      label: "Edit Launch Profiles…";
+      action: "app.gx-open-config-file";
+    }
+  }
 }
 
 menu tab_context_menu {
-  item {
-    label: "Change Tab Title…";
-    action: "win.prompt-context-tab-title";
+  section {
+    item {
+      label: "Change Tab Title…";
+      action: "win.prompt-context-tab-title";
+    }
+
+    item {
+      label: "Duplicate Tab";
+      action: "win.gx-tab-duplicate";
+    }
+
+    item {
+      label: "Move Tab to New Window";
+      action: "win.gx-tab-move-window";
+    }
+
+    item {
+      label: "Pin Tab";
+      action: "win.gx-tab-pin";
+    }
+  }
+
+  section {
+    item {
+      label: "Close Tab";
+      action: "win.gx-tab-close";
+    }
+
+    item {
+      label: "Close Other Tabs";
+      action: "win.gx-tab-close-others";
+    }
+
+    item {
+      label: "Close Tabs to the Right";
+      action: "win.gx-tab-close-right";
+    }
   }
 }
 
@@ -311,13 +300,17 @@ menu context_menu {
   }
 
   section {
+    item {
+      label: "Terminal Inspector";
+      action: "win.toggle-inspector";
+    }
+
     submenu {
       label: "Config";
 
       item {
-        label: "Open Configuration in OS Editor";
-        action: "app.open-config";
-        target: "os-open";
+        label: "Open Configuration File";
+        action: "app.gx-open-config-file";
       }
 
       item {

@@ -1131,3 +1131,33 @@ msgstr "没有与“{query}”匹配的结果"
 
 msgid "Try the English name or the pinyin initials."
 msgstr "可尝试英文名称或拼音首字母。"
+
+msgid "Key Table: {name}"
+msgstr "按键表：{name}"
+
+msgid "{name} (Default)"
+msgstr "{name}（默认）"
+
+msgid "Pin Tab"
+msgstr "固定标签页"
+
+msgid "Edit Launch Profiles…"
+msgstr "编辑启动配置…"
+
+msgid "Zoom Out"
+msgstr "缩小"
+
+msgid "Zoom In"
+msgstr "放大"
+
+msgid "Reset Zoom"
+msgstr "重置缩放"
+
+msgid "Full Screen"
+msgstr "全屏"
+
+msgid "Chinese glyphs are missing. Install fonts-noto-cjk to display the Chinese interface."
+msgstr "缺少汉字字形。请安装 fonts-noto-cjk 以显示中文界面。Install fonts-noto-cjk for Chinese glyphs."
+
+msgid "Graphics: {backend}"
+msgstr "图形：{backend}"

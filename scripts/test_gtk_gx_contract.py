@@ -50,7 +50,23 @@ REPLACED_MENUS = (
 )
 
 # Upstream actions the GX menus deliberately replace, with their replacement.
-RENAMED_ACTIONS = {("win.about", None): ("app.gx-about", None)}
+RENAMED_ACTIONS = {
+    ("win.about", None): ("app.gx-about", None),
+    ("app.open-config", "os-open"): ("app.gx-open-config-file", None),
+}
+
+MAIN_CONTEXT_ACTIONS = {
+    ("win.copy", None): ("win.copy", None),
+    ("win.paste", None): ("win.paste", None),
+    ("win.prompt-window-title", None): ("win.prompt-window-title", None),
+    ("win.close", None): ("win.close", None),
+    ("win.prompt-tab-title", None): ("tab.prompt-tab-title", None),
+    ("win.close-tab", "this"): ("tab.close", "this"),
+    ("win.clear", None): ("win.clear", None),
+    ("win.reset", None): ("win.reset", None),
+    ("win.toggle-inspector", None): ("win.toggle-inspector", None),
+    ("app.open-config", "new-window"): ("app.open-config", "new-window"),
+}
 
 # The upstream class that registers each action group the menus use.
 ACTION_GROUPS = {
@@ -324,9 +340,30 @@ class MenuTests(unittest.TestCase):
                 upstream = ids(blueprint(path)).get(upstream_id)
                 self.assertIsNotNone(upstream, f"{path} has no menu {upstream_id}")
                 self.assertEqual(upstream.kind, "menu")
-                expected = {RENAMED_ACTIONS.get(action, action) for action in menu_actions(upstream)}
+                actions = menu_actions(upstream)
+                moved = MAIN_CONTEXT_ACTIONS if gx_id == "main_menu" else {}
+                expected = {RENAMED_ACTIONS.get(action, action) for action in actions if action not in moved}
                 missing = expected - menu_actions(self.gx_ids[gx_id])
                 self.assertEqual(missing, set(), f"gx/menus.blp {gx_id} lacks actions of upstream {upstream_id}")
+                for action in actions & moved.keys():
+                    self.assertIn(moved[action], menu_actions(self.gx_ids["context_menu"]))
+
+    def test_main_menu_matches_the_windows_order_and_has_twelve_entries(self):
+        labels = [node.props["label"] for section in self.gx_ids["main_menu"].children
+                  for node in section.children if "label" in node.props]
+        self.assertEqual(labels, ["New Tab", "New Window", "New Tab with Profile", "Split",
+                                  "Command Palette", "Settings…", "Keyboard Shortcuts", "Language",
+                                  "Reload Configuration", "Open Configuration File", "About Ghostty GX", "Quit"])
+        self.assertEqual(self.gx_ids["gx_view_section"].kind, "section")
+
+    def test_tab_context_actions_are_distinct_from_active_tab_actions(self):
+        actions = menu_actions(self.gx_ids["tab_context_menu"])
+        wanted = {("win.gx-tab-" + name, None) for name in
+                  ("close", "close-others", "close-right", "duplicate", "move-window", "pin")}
+        self.assertTrue(wanted <= actions)
+        source = (GX / "window.zig").read_text(encoding="utf-8")
+        self.assertIn("adw.TabView.signals.setup_menu.connect", source)
+        self.assertIn("context_page_key", source)
 
     def test_gx_menu_actions_are_registered(self):
         registered = registered_actions()
