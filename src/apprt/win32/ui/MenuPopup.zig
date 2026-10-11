@@ -18,7 +18,9 @@
 //! modal message loop until an action is picked (its `Item.id` is
 //! returned) or the menu is dismissed (null). The popups of one run are
 //! created once per level and reused for every submenu shown at that
-//! level; `Popup.show` keeps a popup cloaked until it has painted.
+//! level; `Popup.show` keeps a popup cloaked until it has painted. Only the
+//! root's DC canvas and DIB may survive for three seconds between runs;
+//! no window, callback, menu model or text layout stays in that cache.
 //!
 //! Like a native menu, the menu takes neither activation nor keyboard
 //! focus. The loop handles the keyboard itself on the deepest open menu:
@@ -263,6 +265,82 @@ var native_open = false;
 
 /// Nested submenus beyond this depth do not open.
 const max_depth = 4;
+
+const RasterKey = struct {
+    factory: usize,
+    d2d_factory: usize,
+
+    fn from(factory: *d2d.Factory) RasterKey {
+        return .{ .factory = @intFromPtr(factory), .d2d_factory = @intFromPtr(factory.d2d) };
+    }
+};
+
+const RasterCache = struct {
+    canvas: ?d2d.Canvas = null,
+    dib: d2d.DibTarget = .{},
+    key: ?RasterKey = null,
+    timer: usize = 0,
+    expires_ms: u64 = 0,
+
+    const lifetime_ms: u32 = 3000;
+
+    fn clear(self: *RasterCache) void {
+        self.cancelTimer();
+        if (self.canvas) |*canvas| canvas.deinit();
+        self.dib.deinit();
+        self.* = .{};
+    }
+
+    fn cancelTimer(self: *RasterCache) void {
+        if (self.timer != 0) _ = w32.KillTimer(null, self.timer);
+        self.timer = 0;
+    }
+
+    fn capture(self: *RasterCache, popup: *Popup) bool {
+        if (!popup.layered or popup.canvas == null) return false;
+        if (popup.canvas.?.drawing) return false;
+        self.clear();
+        self.key = .from(popup.canvas.?.factory);
+        self.canvas = popup.canvas;
+        self.dib = popup.dib;
+        popup.canvas = null;
+        popup.dib = .{};
+        return true;
+    }
+
+    fn store(self: *RasterCache, popup: *Popup) void {
+        if (!self.capture(popup)) return;
+        self.expires_ms = GetTickCount64() + lifetime_ms;
+        self.timer = w32.SetTimer(null, 0, lifetime_ms, @ptrCast(&expireRaster));
+        if (self.timer == 0) self.clear();
+    }
+
+    fn restore(self: *RasterCache, popup: *Popup) bool {
+        const saved_key = self.key orelse return false;
+        const factory = if (popup.canvas) |canvas| canvas.factory else return false;
+        if (!popup.layered or !std.meta.eql(saved_key, RasterKey.from(factory))) {
+            self.clear();
+            return false;
+        }
+        self.cancelTimer();
+        if (popup.canvas) |*canvas| canvas.deinit();
+        popup.dib.deinit();
+        popup.canvas = self.canvas;
+        popup.dib = self.dib;
+        self.* = .{};
+        return true;
+    }
+};
+
+var raster_cache: RasterCache = .{};
+
+fn expireRaster(hwnd: ?w32.HWND, msg: u32, id: usize, time: u32) callconv(.winapi) void {
+    _ = hwnd;
+    _ = msg;
+    _ = time;
+    if (raster_cache.timer != id or GetTickCount64() < raster_cache.expires_ms) return;
+    raster_cache.clear();
+}
 
 /// The longest the loop sleeps without a message before it checks the
 /// owner and the foreground window again; activation changes wake it
@@ -1228,6 +1306,10 @@ const State = struct {
                 log.warn("failed to create a menu popup err={}", .{err});
                 return false;
             };
+            if (index == 0) {
+                const reused = raster_cache.restore(popup);
+                if (perf.enabled()) log.info("menu raster reused={}", .{reused});
+            }
             if (self.owner_scale) |owner_scale| popup.setOwnerScale(owner_scale);
         }
         self.depth += 1;
@@ -1273,6 +1355,7 @@ const State = struct {
 
     fn destroyPopups(self: *State) void {
         self.closeFrom(0);
+        raster_cache.store(&self.popups[0]);
         for (&self.popups) |*popup| popup.destroy();
     }
 
@@ -2116,4 +2199,51 @@ test "a hidden or minimized owner cancels the menu even while foreground" {
     try testing.expect(!ownerAvailable(true, true, true, true));
     try testing.expect(!ownerAvailable(false, true, false, true));
     try testing.expect(!ownerAvailable(true, true, false, false));
+}
+
+test "raster keys include the Direct2D factory identity" {
+    const key: RasterKey = .{ .factory = 1, .d2d_factory = 2 };
+    try testing.expect(std.meta.eql(key, RasterKey{ .factory = 1, .d2d_factory = 2 }));
+    try testing.expect(!std.meta.eql(key, RasterKey{ .factory = 1, .d2d_factory = 3 }));
+    try testing.expect(!std.meta.eql(key, RasterKey{ .factory = 4, .d2d_factory = 2 }));
+}
+
+test "raster resources transfer once without keeping a popup or callback" {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var factory: d2d.Factory = .{
+        .alloc = testing.allocator,
+        .d2d = @ptrFromInt(0x1000),
+        .d2d_1_1 = false,
+        .dwrite = @ptrFromInt(0x2000),
+        .ui_family = L("test"),
+        .icon_family = L("test"),
+        .mono_family = L("test"),
+    };
+    var source: Popup = .{ .layered = true, .canvas = .init(&factory) };
+    defer source.destroy();
+    source.canvas.?.warned = true;
+    var saved: RasterCache = .{};
+    defer saved.clear();
+    try testing.expect(saved.capture(&source));
+    try testing.expect(source.canvas == null);
+    try testing.expect(saved.canvas.?.warned);
+    try testing.expect(!saved.capture(&source));
+
+    var destination: Popup = .{ .layered = true, .canvas = .init(&factory) };
+    defer destination.destroy();
+    try testing.expect(saved.restore(&destination));
+    try testing.expect(destination.canvas.?.warned);
+    try testing.expect(saved.canvas == null and saved.key == null);
+    try testing.expect(!saved.restore(&destination));
+
+    try testing.expect(saved.capture(&destination));
+    destination.canvas = .init(&factory);
+    factory.d2d = @ptrFromInt(0x3000);
+    try testing.expect(!saved.restore(&destination));
+    try testing.expect(saved.canvas == null and saved.key == null);
+    try testing.expect(saved.capture(&destination));
+    destination.canvas = .init(&factory);
+    destination.layered = false;
+    try testing.expect(!saved.restore(&destination));
+    try testing.expect(saved.canvas == null and saved.key == null);
 }

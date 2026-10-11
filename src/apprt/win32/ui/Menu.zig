@@ -692,8 +692,10 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     if (window.closing) return;
     const app = window.app;
     const prepare = if (gx.perf.enabled()) gx.perf.Span.begin(global.io()) else null;
+    const detections = app.profiles_cache.detections;
 
     var launch: ProfileItems = .init(app);
+    if (prepare != null) log.info("menu profile detections={}", .{app.profiles_cache.detections - detections});
     defer launch.deinit();
     var menu: MenuPopup.Builder = .init(app.core_app.alloc);
     defer menu.deinit();
