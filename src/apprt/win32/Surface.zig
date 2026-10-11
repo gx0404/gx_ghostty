@@ -2763,7 +2763,7 @@ fn publishBellBorder(self: *Surface) void {
     const snapshot = self.bell_border_state.snapshot(visible, self.bell_border_color, self.scale);
     const value: u32 = @bitCast(snapshot);
     if (self.bell_border_snapshot.swap(value, .acq_rel) == value) return;
-    if (self.core_surface_ready) self.core_surface.renderer_thread.draw_now.notify() catch {};
+    if (self.core_surface_ready) self.core_surface.renderer_thread.wakeup.notify() catch {};
 }
 
 fn clearBellBorder(self: *Surface) void {
@@ -2917,8 +2917,8 @@ test "bell border VK_PACKET VK_PROCESSKEY and text clear only the addressed spli
     var surface: Surface = .{ .app = undefined, .parent_window = &window, .core_surface_ready = true };
     var other: Surface = .{ .app = undefined, .parent_window = &window };
     surface.core_surface.focused = false;
-    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
-    defer surface.core_surface.renderer_thread.draw_now.deinit();
+    surface.core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.wakeup.deinit();
     surface.bell_border_state.configure(true);
     other.bell_border_state.configure(true);
     other.bell_border_state.ring(false);
@@ -2947,8 +2947,8 @@ test "bell border Quick hidden moving and detached owners reject late bells" {
     var window: Window = .{ .app = &app, .is_quick_terminal = true };
     var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_ready = true };
     surface.core_surface.focused = false;
-    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
-    defer surface.core_surface.renderer_thread.draw_now.deinit();
+    surface.core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.wakeup.deinit();
     surface.bell_border_state.configure(true);
     surface.ringBellBorder();
     try std.testing.expect(!surface.bellBorder().active);

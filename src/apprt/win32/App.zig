@@ -2828,8 +2828,8 @@ test "bell border App routes only to its unfocused terminal" {
     var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_ready = true };
     surface.bell_border_state.configure(true);
     surface.core_surface.focused = false;
-    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
-    defer surface.core_surface.renderer_thread.draw_now.deinit();
+    surface.core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.wakeup.deinit();
     app.ringBell(&surface);
     try std.testing.expect(surface.bellBorder().active);
     app.ringBell(null);
