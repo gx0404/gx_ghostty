@@ -1080,6 +1080,64 @@ class Gx0030ShapeTests(unittest.TestCase):
         self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
+class Gx0031ShapeTests(unittest.TestCase):
+    def test_cursor_gate_only_changes_the_timer_notify(self):
+        source = (ROOT / "src/renderer/Thread.zig").read_text(encoding="utf-8")
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, "fn cursorTimerCallback(")
+        body = "\n".join(lines[start:end])
+        self.assertIn('fork(gx): GX-0031', body)
+        self.assertIn('@import("../gx/cursor_blink.zig").notify(t, global.io());', body)
+        self.assertIn('t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;', body)
+        self.assertIn('t.cursor_h.run(', body)
+        self.assertIn('const CURSOR_BLINK_INTERVAL = 600;', source)
+        self.assertNotIn('t.state', body)
+        self.assertNotIn('t.wakeup.notify()', body)
+        focus = source[source.index('.focus =>'):source.index('.reset_cursor_blink =>')]
+        self.assertIn('self.cursor_h.cancel(', focus)
+        animation = source[source.index('fn animationTimerCallback('):source.index('fn cursorTimerCallback(')]
+        self.assertNotIn('cursor_blink.zig', animation)
+
+    def test_blink_cache_uses_the_successful_frame_snapshot(self):
+        source = (ROOT / "src/renderer/generic.zig").read_text(encoding="utf-8")
+        self.assertIn('gx_cursor_blink_affects: bool = true', source)
+        self.assertIn('errdefer @import("../gx/cursor_blink.zig").invalidate(self, global.io());', source)
+        cache = source.index('self.gx_cursor_blink_affects = !gx_rebuilt')
+        self.assertLess(source.index('self.terminal_state.endUpdate();'), cache)
+        self.assertLess(source.index('self.rebuildCells('), cache)
+        self.assertIn('.preedit = critical.preedit != null,', source[cache:cache + 280])
+        self.assertIn('.focused = self.focused,', source[cache:cache + 280])
+        outside = source[source.index('self.terminal_state.endUpdate();'):source.index('pub fn drawFrame(')]
+        self.assertNotIn('state.preedit', outside)
+        self.assertNotIn('state.mouse', outside)
+        callback = (ROOT / 'src/renderer/Thread.zig').read_text(encoding='utf-8')
+        self.assertLess(callback.index('if (!t.renderer.display_realized)'), callback.index('if (!t.flags.visible) return .disarm;'))
+
+
+class Gx0032ShapeTests(unittest.TestCase):
+    def test_background_is_prepared_under_draw_mutex_before_realization(self):
+        source = (ROOT / 'src/renderer/generic.zig').read_text(encoding='utf-8')
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, 'pub fn displayRealized(')
+        body = '\n'.join(lines[start:end])
+        self.assertIn('fork(gx): GX-0032', body)
+        self.assertLess(body.index('draw_mutex.lockUncancelable'), body.index('prepareBackground('))
+        self.assertLess(body.index('prepareBackground('), body.index('self.display_realized = true;'))
+        self.assertNotIn('uploadBackgroundImage(', body)
+        helper = (ROOT / 'src/gx/renderer_recovery.zig').read_text(encoding='utf-8')
+        self.assertIn('renderer.config.bg_image != null and renderer.bg_image == null', helper)
+        self.assertIn('try prepare(renderer);', helper)
+
+
+class Gx0033ShapeTests(unittest.TestCase):
+    def test_vsync_documentation_describes_a_request_not_a_driver_guarantee(self):
+        source = (ROOT / 'src/config/Config.zig').read_text(encoding='utf-8')
+        doc = source[source.index('/// Synchronize rendering with the screen refresh rate.'):source.index('@"window-vsync": bool = true,')]
+        for text in ('fork(gx): GX-0033', 'WGL', 'interval 1', 'when false', 'Driver settings', 'original request', 'gl.finish()', 'only affect new terminals'):
+            self.assertIn(text, doc)
+        self.assertNotIn('only supported currently on macOS', doc)
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则
