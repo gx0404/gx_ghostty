@@ -1239,10 +1239,10 @@ class FixtureTests(unittest.TestCase):
                     parse_registry(text)
 
 
-class Gx0031ShapeTests(unittest.TestCase):
+class Gx0034ShapeTests(unittest.TestCase):
     def test_startup_retains_layers_and_samples_after_adw_init(self):
         source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
-        self.assertIn(Patch("GX-0031", APPLICATION_ZIG, "fork(gx): GX-0031", "active"),
+        self.assertIn(Patch("GX-0034", APPLICATION_ZIG, "fork(gx): GX-0034", "active"),
                       parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8")))
         self.assertEqual(source.count("var gx_defaults: gx_gtk.defaults.Startup = .{};"), 1)
         self.assertEqual(source.count("defer gx_defaults.deinit();"), 1)
@@ -1253,11 +1253,11 @@ class Gx0031ShapeTests(unittest.TestCase):
         reload = source.split("// Hard reload, load a new config completely.", 1)[1]
         self.assertLess(reload.index("gx_gtk.defaults.sampleSystemCursorBlink();"),
                         reload.index("CoreConfig.load(alloc)"))
-        replacement = ("        // fork(gx): GX-0031 load before GTK without reading GtkSettings\n"
+        replacement = ("        // fork(gx): GX-0034 load before GTK without reading GtkSettings\n"
                        "        var config = gx_defaults.load(alloc)")
         self.assertEqual(source.count(replacement), 1)
         restored = source.replace(replacement, "        var config = CoreConfig.load(alloc)")
-        stripped, hunks = marked_hunks(restored, "GX-0031")
+        stripped, hunks = marked_hunks(restored, "GX-0034")
         self.assertEqual(len(hunks), 3)
         self.assertNotIn("sampleSystemCursorBlink()", stripped)
 
