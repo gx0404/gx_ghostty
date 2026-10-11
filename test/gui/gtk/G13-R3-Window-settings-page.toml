@@ -1,0 +1,16 @@
+id = "G13"
+title = "R3-Window: gx:settings_page opens the Shell settings directly"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+keybind = ctrl+alt+s=gx:settings_page:shell
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+alt+s
+sleep 1.5
+"""
+expect = ["G13-after.png: the settings dialog opens on the Shell page with its default Shell control"]

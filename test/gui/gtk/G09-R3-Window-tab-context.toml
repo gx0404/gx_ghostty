@@ -1,0 +1,41 @@
+id = "G09"
+title = "R3-Window: a non-selected tab has its own context actions"
+lang = "zh_CN"
+config = """
+command = /bin/bash --noprofile --norc
+language = zh-CN
+keybind = ctrl+alt+r=prompt_tab_title
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+alt+r
+sleep 0.3
+key ctrl+a
+type --delay 10 "FIRST"
+key Return
+sleep 0.3
+key ctrl+shift+t
+sleep 0.6
+key ctrl+alt+r
+sleep 0.3
+key ctrl+a
+type --delay 10 "SECOND"
+key Return
+sleep 0.3
+key ctrl+shift+t
+sleep 0.6
+key ctrl+alt+r
+sleep 0.3
+key ctrl+a
+type --delay 10 "THIRD"
+key Return
+sleep 0.3
+mousemove 110 80
+click 3
+sleep 1
+"""
+expect = [
+  "G09-after.png: THREE tabs FIRST, SECOND, THIRD remain, THIRD is selected and FIRST's context menu offers rename, duplicate, move, pin, close, close others, close right",
+]

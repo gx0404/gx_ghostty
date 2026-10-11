@@ -200,10 +200,26 @@ fn menuOptions(alloc: std.mem.Allocator, config: *const configpkg.Config, profil
 }
 
 fn actionAccel(alloc: std.mem.Allocator, config: *const configpkg.Config, action: input.Binding.Action) !?[:0]const u8 {
-    const trigger = config.keybind.set.getTrigger(action) orelse return null;
+    const trigger = menuTrigger(&config.keybind.set, action) orelse return null;
     var buf: [128]u8 = undefined;
     const accel = try key.accelFromTrigger(&buf, trigger) orelse return null;
     return try alloc.dupeZ(u8, accel);
+}
+
+fn menuTrigger(set: *const input.Binding.Set, action: input.Binding.Action) ?input.Binding.Trigger {
+    if (set.getTrigger(action)) |trigger| return trigger;
+    var best: ?input.Binding.Trigger = null;
+    var it = set.bindings.iterator();
+    while (it.next()) |entry| {
+        const leaf = switch (entry.value_ptr.*) {
+            .leaf => |leaf| leaf,
+            else => continue,
+        };
+        if (!leaf.action.equal(action)) continue;
+        const trigger = entry.key_ptr.*;
+        if (best == null or trigger.hash() < best.?.hash()) best = trigger;
+    }
+    return best;
 }
 
 const context_page_key = "gx-context-tab-page";
@@ -323,7 +339,7 @@ fn addViewControls(popover: *gtk.PopoverMenu) void {
     box.as(gtk.Widget).setMarginEnd(6);
     const controls = [_]struct { action: [:0]const u8, label: ?[:0]const u8 = null, icon: ?[:0]const u8 = null, title: [:0]const u8 }{
         .{ .action = "win.gx-zoom-out", .label = "−", .title = tr("Zoom Out") },
-        .{ .action = "win.gx-zoom-reset", .label = tr("Reset"), .title = tr("Reset Zoom") },
+        .{ .action = "win.gx-zoom-reset", .label = tr("Reset Zoom"), .title = tr("Reset Zoom") },
         .{ .action = "win.gx-zoom-in", .label = "+", .title = tr("Zoom In") },
         .{ .action = "win.gx-find", .icon = "edit-find-symbolic", .title = tr("Find…") },
         .{ .action = "win.gx-fullscreen", .icon = "view-fullscreen-symbolic", .title = tr("Full Screen") },
@@ -510,3 +526,28 @@ extern fn gtk_widget_get_template_child(
     widget_type: usize,
     name: [*:0]const u8,
 ) ?*gobject.Object;
+
+test "menuTrigger shows performable GX shortcuts without adding them to the reverse map" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var keybinds: configpkg.Config.Keybinds = .{};
+    const action: input.Binding.Action = .{ .gx = .keybinds };
+    try keybinds.parseCLI(arena.allocator(), "performable:ctrl+shift+slash=gx:keybinds");
+    try testing.expectEqual(@as(?input.Binding.Trigger, null), keybinds.set.getTrigger(action));
+    var expected: configpkg.Config.Keybinds = .{};
+    try expected.parseCLI(arena.allocator(), "ctrl+shift+slash=gx:keybinds");
+    try testing.expect(menuTrigger(&keybinds.set, action).?.equal(expected.set.getTrigger(action).?));
+    try testing.expectEqual(@as(?input.Binding.Trigger, null), keybinds.set.getTrigger(action));
+    try keybinds.parseCLI(arena.allocator(), "ctrl+alt+k=gx:keybinds");
+    try testing.expect(menuTrigger(&keybinds.set, action).?.equal(keybinds.set.getTrigger(action).?));
+}
+
+test "menuTrigger never advertises a key sequence as a single menu accelerator" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var keybinds: configpkg.Config.Keybinds = .{};
+    try keybinds.parseCLI(arena.allocator(), "ctrl+x>ctrl+k=gx:keybinds");
+    try testing.expectEqual(@as(?input.Binding.Trigger, null), menuTrigger(&keybinds.set, .{ .gx = .keybinds }));
+}

@@ -1,0 +1,20 @@
+id = "G08"
+title = "R3-Window: Chinese launch profiles mark the configured default and offer settings and editing"
+lang = "zh_CN"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = zh-CN
+gx-launch-profile = Demo=direct:/bin/bash --noprofile --norc
+keybind = ctrl+alt+n=gx:new_tab_menu
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+alt+n
+sleep 1
+"""
+expect = [
+  "G08.png: the Chinese main window shows readable Han text",
+  "G08-after.png: the profile dropdown marks Demo as default and includes Set Default Shell and Edit Launch Profiles in Chinese",
+]
