@@ -34,8 +34,9 @@
 //!
 //! While a screen reader runs (`SPI_GETSCREENREADER`, or
 //! `GHOSTTY_GX_A11Y=screen-reader` for testing), or when Direct2D is not
-//! available, a native TaskDialogIndirect lists and copies the shortcuts.
-//! It is posted through `List` so its modal loop never runs in a core
+//! available, a native TaskDialogIndirect lists and copies the shortcuts;
+//! Windows keeps it inside its monitor's work area and scrolls a long
+//! list. It is posted through `List` so its modal loop never runs in a core
 //! callback; its text is copied before the loop. If the API is unavailable,
 //! `List` shows a read-only edit control in the system colors instead.
 //! Escape closes either native view.
@@ -51,6 +52,7 @@ const contrast_floor = gx.ui_tokens.floor;
 const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
 const Window = @import("../Window.zig");
+const clipboard = @import("../clipboard.zig");
 const shortcut_conflicts = @import("../shortcut_conflicts.zig");
 const w32 = @import("../win32.zig");
 const Palette = @import("Palette.zig");
@@ -1629,6 +1631,12 @@ const TaskDialogData = struct {
     text: [:0]const u16,
 };
 const task_copy_id = 1001;
+const TDF_ALLOW_DIALOG_CANCELLATION: u32 = 0x0008;
+const TDF_CALLBACK_TIMER: u32 = 0x0800;
+const TDF_POSITION_RELATIVE_TO_WINDOW: u32 = 0x1000;
+const TDN_BUTTON_CLICKED: u32 = 2;
+const TDN_TIMER: u32 = 4;
+const TDM_CLICK_BUTTON: u32 = w32.WM_USER + 102;
 
 fn taskDialog(source: w32.HWND, owner: ?w32.HWND, edit: w32.HWND) bool {
     const library = w32.LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral("comctl32.dll"), null, w32.LOAD_LIBRARY_SEARCH_SYSTEM32) orelse return false;
@@ -1650,7 +1658,7 @@ fn taskDialog(source: w32.HWND, owner: ?w32.HWND, edit: w32.HWND) bool {
     };
     const config: TaskDialogConfig = .{
         .hwndParent = owner,
-        .dwFlags = 0x0008 | 0x0800 | 0x1000,
+        .dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_CALLBACK_TIMER | TDF_POSITION_RELATIVE_TO_WINDOW,
         .pszWindowTitle = title.ptr,
         .pszMainInstruction = title.ptr,
         .pszContent = text.ptr,
@@ -1668,10 +1676,11 @@ fn taskDialog(source: w32.HWND, owner: ?w32.HWND, edit: w32.HWND) bool {
 
 fn taskDialogCallback(hwnd: w32.HWND, msg: u32, wparam: usize, _: isize, ref_data: isize) callconv(.winapi) i32 {
     const data: *const TaskDialogData = @ptrFromInt(@as(usize, @bitCast(ref_data)));
-    if (msg == 4 and w32.IsWindow(data.source) == 0) {
-        _ = w32.SendMessageW(hwnd, w32.WM_USER + 102, w32.IDCANCEL, 0);
+    // The list window went away with its terminal.
+    if (msg == TDN_TIMER and w32.IsWindow(data.source) == 0) {
+        _ = w32.SendMessageW(hwnd, TDM_CLICK_BUTTON, w32.IDCANCEL, 0);
     }
-    if (msg != 2 or wparam != task_copy_id) return 0;
+    if (msg != TDN_BUTTON_CLICKED or wparam != task_copy_id) return 0;
     const units = data.text.len + 1;
     const handle = w32.GlobalAlloc(w32.GMEM_MOVEABLE, units * @sizeOf(u16)) orelse return 1;
     const ptr = w32.GlobalLock(handle) orelse {
@@ -1681,7 +1690,7 @@ fn taskDialogCallback(hwnd: w32.HWND, msg: u32, wparam: usize, _: isize, ref_dat
     const dst: [*]u16 = @ptrCast(@alignCast(ptr));
     @memcpy(dst[0..units], data.text[0..units]);
     _ = w32.GlobalUnlock(handle);
-    @import("../clipboard.zig").setUnicodeText(hwnd, handle) catch |err| {
+    clipboard.setUnicodeText(hwnd, handle) catch |err| {
         log.warn("copy from shortcut dialog failed err={}", .{err});
         _ = w32.GlobalFree(handle);
     };
