@@ -12,6 +12,7 @@ pub const resourcesDir = internal_os.resourcesDir;
 // Every file below win32/ that declares tests is imported here, so its tests
 // run even when no other code analyzes it (scripts/test_gx_test_roots.py).
 test {
+    _ = @import("../renderer/opengl/wgl.zig");
     _ = @import("win32/App.zig");
     _ = @import("win32/BellAudio.zig");
     _ = @import("win32/bell_wav.zig");

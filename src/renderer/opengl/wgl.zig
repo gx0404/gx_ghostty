@@ -22,6 +22,8 @@
 //! column and row are stretched over the rest (`edgeFills`). The apprt
 //! publishes the window size and the dim of an unfocused split, which is
 //! blended over the frame (`Surface.clientSize`, `Surface.unfocusedDim`).
+//! Its atomic `Surface.bellBorder` snapshot draws an opaque, thin inner edge
+//! after the dim, without changing the terminal grid or its render target.
 //! The window pixel format has an alpha channel when the driver offers
 //! one, so the frames keep the renderer's premultiplied alpha;
 //! `Device.alphaFrames` tells the apprt whether it can let the desktop
@@ -41,6 +43,7 @@ const gl = @import("opengl");
 const apprt = @import("../../apprt.zig");
 const global = @import("../../global.zig");
 const perf = @import("../../gx/perf.zig");
+const bell_border = @import("../../gx/bell_border.zig");
 const OpenGL = @import("../OpenGL.zig");
 const Target = @import("Target.zig");
 
@@ -406,6 +409,9 @@ pub const Context = struct {
     /// Making `dim_pass` failed on this GL context; frames stay undimmed.
     dim_failed: bool = false,
 
+    border_pass: ?BorderPass = null,
+    border_failed: bool = false,
+
     /// Called on the main thread when the renderer is created. Only
     /// records the device context; it makes no GL calls.
     pub fn init(rt_surface: *apprt.Surface, vsync: bool) !Context {
@@ -468,6 +474,7 @@ pub const Context = struct {
         if (attempt > 1) log.info("wglMakeCurrent succeeded attempts={}", .{attempt});
 
         self.hglrc = hglrc;
+        gl.glad.context = std.mem.zeroes(gl.glad.Context);
         thread_lib = lib;
         if (lib.swapInterval) |swapInterval| _ = swapInterval(@intFromBool(self.vsync));
         self.get_reset_status = if (robust)
@@ -483,6 +490,9 @@ pub const Context = struct {
         if (self.dim_pass) |pass| pass.deinit();
         self.dim_pass = null;
         self.dim_failed = false;
+        if (self.border_pass) |pass| pass.deinit();
+        self.border_pass = null;
+        self.border_failed = false;
         if (device.state.load(.acquire) != .ready) return;
         const lib = &device.lib;
         _ = lib.makeCurrent(null, null);
@@ -583,6 +593,9 @@ pub const Context = struct {
         for (fills.slice()) |fill| try blit(fill);
 
         if (self.unfocusedDim()) |color| self.dim(color, window);
+        if (comptime @hasDecl(apprt.Surface, "bellBorder")) {
+            self.border(self.surface.bellBorder(), window);
+        }
 
         if (!device.lib.swapBuffers(self.hdc).toBool()) {
             log.warn("SwapBuffers failed err={}", .{windows.GetLastError()});
@@ -631,6 +644,110 @@ pub const Context = struct {
         pass.draw(color, window) catch |err| {
             log.warn("error dimming the frame err={}", .{err});
         };
+    }
+
+    fn border(self: *Context, snapshot: bell_border.Snapshot, window: Size) void {
+        if (!snapshot.active or snapshot.width == 0 or self.border_failed) return;
+        if (window.width == 0 or window.height == 0) return;
+        const pass = self.border_pass orelse pass: {
+            const pass = BorderPass.init() catch |err| {
+                self.border_failed = true;
+                log.warn("cannot draw bell borders on this GL context err={}", .{err});
+                return;
+            };
+            self.border_pass = pass;
+            break :pass pass;
+        };
+        pass.draw(snapshot, window) catch |err| {
+            self.border_failed = true;
+            log.warn("bell border disabled until the GL context is rebuilt err={}", .{err});
+        };
+    }
+};
+
+const BorderPass = struct {
+    program: gl.Program,
+    vao: gl.VertexArray,
+
+    const fragment_source =
+        \\#version 430 core
+        \\layout(location = 0) uniform vec4 ring;
+        \\layout(location = 1) uniform vec3 bounds;
+        \\layout(location = 0) out vec4 color;
+        \\void main() {
+        \\    vec2 p = gl_FragCoord.xy;
+        \\    if (p.x >= bounds.z && p.y >= bounds.z && p.x < bounds.x - bounds.z && p.y < bounds.y - bounds.z) discard;
+        \\    color = vec4(ring.rgb, 1.0);
+        \\}
+    ;
+
+    fn init() !BorderPass {
+        const program = try gl.Program.createVF(DimPass.vertex_source, fragment_source);
+        errdefer program.destroy();
+        const vao = try gl.VertexArray.create();
+        return .{ .program = program, .vao = vao };
+    }
+
+    fn deinit(self: BorderPass) void {
+        self.vao.destroy();
+        self.program.destroy();
+    }
+
+    fn draw(self: BorderPass, snapshot: bell_border.Snapshot, window: Size) !void {
+        const thickness = bell_border.thickness(window.width, window.height, snapshot.width);
+        if (!snapshot.active or thickness == 0) return;
+        const state = BorderDrawState.capture();
+        defer state.restore();
+        const ctx = &gl.glad.context;
+        for (BorderDrawState.capabilities) |cap| ctx.Disable.?(cap);
+        ctx.ColorMask.?(gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE);
+        try gl.viewport(0, 0, @intCast(window.width), @intCast(window.height));
+        _ = try self.program.use();
+        _ = try self.vao.bind();
+        const color = snapshot.color();
+        ctx.Uniform4f.?(0, color[0], color[1], color[2], color[3]);
+        ctx.Uniform3f.?(1, @floatFromInt(window.width), @floatFromInt(window.height), @floatFromInt(thickness));
+        // Opaque source-over also covers a fully transparent terminal background.
+        try gl.drawArrays(gl.c.GL_TRIANGLES, 0, 3);
+    }
+};
+
+const BorderDrawState = struct {
+    viewport: [4]gl.c.GLint,
+    program: gl.c.GLint,
+    vao: gl.c.GLint,
+    enabled: [capabilities.len]bool,
+    color_mask: [4]gl.c.GLboolean,
+
+    const capabilities = [_]gl.c.GLenum{
+        gl.c.GL_BLEND,
+        gl.c.GL_SCISSOR_TEST,
+        gl.c.GL_DEPTH_TEST,
+        gl.c.GL_STENCIL_TEST,
+        gl.c.GL_CULL_FACE,
+        gl.c.GL_RASTERIZER_DISCARD,
+    };
+
+    fn capture() BorderDrawState {
+        const ctx = &gl.glad.context;
+        var state: BorderDrawState = undefined;
+        ctx.GetIntegerv.?(gl.c.GL_VIEWPORT, &state.viewport);
+        ctx.GetIntegerv.?(gl.c.GL_CURRENT_PROGRAM, &state.program);
+        ctx.GetIntegerv.?(gl.c.GL_VERTEX_ARRAY_BINDING, &state.vao);
+        ctx.GetBooleanv.?(gl.c.GL_COLOR_WRITEMASK, &state.color_mask);
+        for (capabilities, &state.enabled) |cap, *enabled| enabled.* = ctx.IsEnabled.?(cap) == gl.c.GL_TRUE;
+        return state;
+    }
+
+    fn restore(self: BorderDrawState) void {
+        const ctx = &gl.glad.context;
+        ctx.Viewport.?(self.viewport[0], self.viewport[1], self.viewport[2], self.viewport[3]);
+        ctx.UseProgram.?(@intCast(self.program));
+        ctx.BindVertexArray.?(@intCast(self.vao));
+        ctx.ColorMask.?(self.color_mask[0], self.color_mask[1], self.color_mask[2], self.color_mask[3]);
+        for (capabilities, self.enabled) |cap, enabled| {
+            if (enabled) ctx.Enable.?(cap) else ctx.Disable.?(cap);
+        }
     }
 };
 
@@ -1079,6 +1196,475 @@ fn basePixelFormat() PIXELFORMATDESCRIPTOR {
         .cAlphaBits = 8,
     };
 }
+
+test "bell border failure latch resets with the context without touching GUI state" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var context: Context = .{ .surface = undefined, .hdc = undefined, .vsync = false, .border_failed = true };
+    context.border(.{ .r = 20, .g = 40, .b = 60, .width = 1, .active = true }, .{ .width = 8, .height = 8 });
+    try std.testing.expect(context.border_failed);
+    try std.testing.expect(context.border_pass == null);
+    const device: Device = .{ .state = .init(.unavailable), .owner_thread = std.Thread.getCurrentId() };
+    context.threadExit(&device);
+    try std.testing.expect(!context.border_failed);
+}
+
+test "native bell border hidden FBO pixels state restore and context rebuild" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
+    var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer report.deinit();
+    const outcome = NativeBellBorder.run(&report.writer, .none);
+    try report.writer.print("outcome={s} last_error={}\n", .{ if (outcome) |_| "PASS" else |err| @errorName(err), windows.GetLastError() });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ".local");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = if (softwareRequested()) ".local/native-border-software.txt" else ".local/native-border-system.txt",
+        .data = report.written(),
+    });
+    try outcome;
+}
+
+test "native bell border fixture first enter failure has no GLAD unload" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
+    var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer report.deinit();
+    gl.glad.context = undefined;
+    try std.testing.expectError(error.WglCreateContextFailed, NativeBellBorder.run(&report.writer, .first_enter));
+}
+
+test "native bell border fixture reenter failure after unload has no second unload" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
+    var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer report.deinit();
+    try std.testing.expectError(error.WglCreateContextFailed, NativeBellBorder.run(&report.writer, .reenter));
+}
+
+test "native bell border fixture failed loads release only entered contexts" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
+    for ([_]NativeBellBorder.Fault{ .first_load, .reload }) |fault| {
+        var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer report.deinit();
+        try std.testing.expectError(error.GLInitFailed, NativeBellBorder.run(&report.writer, fault));
+    }
+}
+
+const NativeBellBorder = struct {
+    const Fault = enum { none, first_enter, first_load, reenter, reload };
+
+    fn rejectContext(_: HDC, _: ?HGLRC, _: [*]const c_int) callconv(.winapi) ?HGLRC {
+        return null;
+    }
+
+    fn rejectProc(_: [*:0]const u8) callconv(.c) ?GlProc {
+        return null;
+    }
+
+    fn run(report: *std.Io.Writer, fault: Fault) !void {
+        const kind: Lib.Kind = if (softwareRequested()) .software else .system;
+        const lib = try probe(kind);
+        defer _ = FreeLibrary(lib.module);
+        try report.print("kind={t} vendor={s} renderer={s} version={}.{} hidden=true shown=false activated=false\n", .{
+            kind, lib.vendor_buf[0..lib.vendor_len], lib.renderer_buf[0..lib.renderer_len], lib.version.major, lib.version.minor,
+        });
+        const instance = GetModuleHandleW(null);
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyBellBorderNative");
+        const class: WNDCLASSEXW = .{ .style = CS_OWNDC, .lpfnWndProc = &DefWindowProcW, .hInstance = instance, .lpszClassName = name };
+        if (RegisterClassExW(&class) == 0) return error.RegisterClassFailed;
+        defer _ = UnregisterClassW(name, instance);
+        const hwnd = CreateWindowExW(0, name, name, WS_OVERLAPPEDWINDOW, 0, 0, 32, 32, null, null, instance, null) orelse return error.CreateWindowFailed;
+        defer _ = DestroyWindow(hwnd);
+        const hdc = GetDC(hwnd) orelse return error.GetDCFailed;
+        defer _ = ReleaseDC(hwnd, hdc);
+        var device: Device = .{ .lib = lib, .state = .init(.ready), .owner_thread = std.Thread.getCurrentId() };
+        if (fault == .first_enter) device.lib.createContextAttribs = &rejectContext;
+        try device.setPixelFormat(hdc);
+        var surface: apprt.Surface = .{ .app = undefined, .hdc = @ptrCast(hdc) };
+        const snapshot: bell_border.Snapshot = .{ .r = 211, .g = 159, .b = 62, .width = 1, .active = true };
+        surface.bell_border_snapshot.store(@bitCast(snapshot), .release);
+        var context = try Context.init(&surface, false);
+        defer context.deinit();
+        var entered = false;
+        var loaded = false;
+        defer {
+            if (entered) context.threadExit(&device);
+            if (loaded) gl.glad.unload();
+        }
+        try context.threadEnter(&device);
+        entered = true;
+        _ = if (fault == .first_load) try gl.glad.load(&rejectProc) else try gl.glad.load(&getProcAddress);
+        loaded = true;
+        for ([_]Size{ .{ .width = 13, .height = 11 }, .{ .width = 1, .height = 1 }, .{ .width = 2, .height = 3 }, .{ .width = 1, .height = 7 } }) |size| {
+            for ([_]u7{ 1, 2, 127 }) |width| {
+                var current = snapshot;
+                current.width = width;
+                try drawCase(&context, current, size, report);
+            }
+        }
+        var themed = snapshot;
+        themed.r = 17;
+        themed.g = 112;
+        themed.b = 226;
+        themed.width = 2;
+        try drawCase(&context, themed, .{ .width = 13, .height = 11 }, report);
+        try drawCase(&context, .none, .{ .width = 13, .height = 11 }, report);
+        gl.glad.context.Enable.?(std.math.maxInt(gl.c.GLenum));
+        context.border(snapshot, .{ .width = 13, .height = 11 });
+        try std.testing.expect(context.border_failed);
+        context.border(snapshot, .{ .width = 13, .height = 11 });
+        try std.testing.expect(context.border_failed);
+        try report.writeAll("failure_latched=true retry_suppressed=true\n");
+        context.threadExit(&device);
+        entered = false;
+        gl.glad.unload();
+        loaded = false;
+        try std.testing.expect(context.border_pass == null);
+        try std.testing.expect(!context.border_failed);
+        try std.testing.expectEqual(snapshot, surface.bellBorder());
+        if (fault == .reenter) device.lib.createContextAttribs = &rejectContext;
+        try context.threadEnter(&device);
+        entered = true;
+        _ = if (fault == .reload) try gl.glad.load(&rejectProc) else try gl.glad.load(&getProcAddress);
+        loaded = true;
+        try drawCase(&context, surface.bellBorder(), .{ .width = 13, .height = 11 }, report);
+        try report.writeAll("context_recreated=true ringing_preserved=true pass_rebuilt=true\n");
+    }
+
+    fn extraState() [12]gl.c.GLint {
+        var result: [12]gl.c.GLint = undefined;
+        const ctx = &gl.glad.context;
+        ctx.GetIntegerv.?(gl.c.GL_SCISSOR_BOX, @ptrCast(&result));
+        for ([_]gl.c.GLenum{
+            gl.c.GL_BLEND_SRC_RGB,      gl.c.GL_BLEND_DST_RGB,        gl.c.GL_BLEND_SRC_ALPHA,          gl.c.GL_BLEND_DST_ALPHA,
+            gl.c.GL_BLEND_EQUATION_RGB, gl.c.GL_BLEND_EQUATION_ALPHA, gl.c.GL_DRAW_FRAMEBUFFER_BINDING, gl.c.GL_READ_FRAMEBUFFER_BINDING,
+        }, result[4..]) |parameter, *value| ctx.GetIntegerv.?(parameter, value);
+        return result;
+    }
+
+    fn drawCase(context: *Context, snapshot: bell_border.Snapshot, size: Size, report: *std.Io.Writer) !void {
+        const ctx = &gl.glad.context;
+        var framebuffer: gl.c.GLuint = 0;
+        var storage: gl.c.GLuint = 0;
+        ctx.GenFramebuffers.?(1, &framebuffer);
+        defer ctx.DeleteFramebuffers.?(1, &framebuffer);
+        ctx.GenRenderbuffers.?(1, &storage);
+        defer ctx.DeleteRenderbuffers.?(1, &storage);
+        ctx.BindFramebuffer.?(gl.c.GL_FRAMEBUFFER, framebuffer);
+        ctx.BindRenderbuffer.?(gl.c.GL_RENDERBUFFER, storage);
+        ctx.RenderbufferStorage.?(gl.c.GL_RENDERBUFFER, gl.c.GL_RGBA8, @intCast(size.width), @intCast(size.height));
+        ctx.FramebufferRenderbuffer.?(gl.c.GL_FRAMEBUFFER, gl.c.GL_COLOR_ATTACHMENT0, gl.c.GL_RENDERBUFFER, storage);
+        try std.testing.expectEqual(@as(gl.c.GLenum, gl.c.GL_FRAMEBUFFER_COMPLETE), ctx.CheckFramebufferStatus.?(gl.c.GL_FRAMEBUFFER));
+        for (BorderDrawState.capabilities) |cap| ctx.Disable.?(cap);
+        ctx.Disable.?(gl.c.GL_FRAMEBUFFER_SRGB);
+        ctx.ColorMask.?(gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+        const sentinel = try DimPass.init();
+        defer sentinel.deinit();
+        _ = try sentinel.program.use();
+        _ = try sentinel.vao.bind();
+        try gl.viewport(3, 2, 5, 4);
+        for (BorderDrawState.capabilities) |cap| ctx.Enable.?(cap);
+        ctx.Scissor.?(4, 3, 1, 1);
+        ctx.BlendFuncSeparate.?(gl.c.GL_SRC_ALPHA, gl.c.GL_ONE_MINUS_SRC_ALPHA, gl.c.GL_ONE, gl.c.GL_ZERO);
+        ctx.BlendEquationSeparate.?(gl.c.GL_FUNC_REVERSE_SUBTRACT, gl.c.GL_MAX);
+        ctx.ColorMask.?(gl.c.GL_FALSE, gl.c.GL_TRUE, gl.c.GL_FALSE, gl.c.GL_FALSE);
+        const before = BorderDrawState.capture();
+        const extra_before = extraState();
+        context.border(snapshot, size);
+        try std.testing.expect(!context.border_failed);
+        try std.testing.expectEqualDeep(before, BorderDrawState.capture());
+        try std.testing.expectEqualDeep(extra_before, extraState());
+        var bytes: [13 * 11 * 4]u8 = undefined;
+        ctx.PixelStorei.?(gl.c.GL_PACK_ALIGNMENT, 1);
+        ctx.ReadPixels.?(0, 0, @intCast(size.width), @intCast(size.height), gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, &bytes);
+        try gl.errors.getError();
+        for (0..size.height) |y| {
+            for (0..size.width) |x| {
+                const offset = (y * size.width + x) * 4;
+                const expected: [4]u8 = if (snapshot.active and bell_border.covers(size.width, size.height, snapshot.width, @intCast(x), @intCast(y)))
+                    .{ snapshot.r, snapshot.g, snapshot.b, 255 }
+                else
+                    .{ 0, 0, 0, 0 };
+                try std.testing.expectEqualSlices(u8, &expected, bytes[offset..][0..4]);
+            }
+        }
+        try report.print("FBO={}x{} padding=0 requested={} active={} four_edges={} alpha=255 center_unchanged=true restore=true samples={x}\n", .{
+            size.width, size.height, snapshot.width, snapshot.active, snapshot.active, bytes[0..@min(@as(usize, size.width) * size.height * 4, 32)],
+        });
+        ctx.UseProgram.?(0);
+        ctx.BindVertexArray.?(0);
+        for (BorderDrawState.capabilities) |cap| ctx.Disable.?(cap);
+        ctx.ColorMask.?(gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE, gl.c.GL_TRUE);
+        ctx.BindFramebuffer.?(gl.c.GL_FRAMEBUFFER, 0);
+    }
+};
+
+test "native bell border idle worker publication reaches present without output or animation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
+    var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer report.deinit();
+    const outcome = NativeBellWorker.run(&report.writer);
+    try report.writer.print("outcome={s}\n", .{if (outcome) |_| "PASS" else |err| @errorName(err)});
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ".local");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = if (softwareRequested()) ".local/native-bell-worker-software.txt" else ".local/native-bell-worker-system.txt",
+        .data = report.written(),
+    });
+    try outcome;
+}
+
+const NativeBellWorker = struct {
+    const rendererpkg = @import("../../renderer.zig");
+    const font = @import("../../font/main.zig");
+    const configpkg = @import("../../config.zig");
+    const terminalpkg = @import("../../terminal/main.zig");
+    const CoreApp = @import("../../App.zig");
+    const WinApp = @import("../../apprt/win32/App.zig");
+    const WinWindow = @import("../../apprt/win32/Window.zig");
+    const win32 = @import("../../apprt/win32/win32.zig");
+    const xev = global.xev;
+    const width = 64;
+    const height = 48;
+    const gl_callconv = @typeInfo(@typeInfo(@typeInfo(gl.c.PFNGLBINDFRAMEBUFFERPROC).optional.child).pointer.child).@"fn".calling_convention;
+
+    thread: *rendererpkg.Thread,
+    renderer: *rendererpkg.Renderer,
+    surface: *apprt.Surface,
+    native_lib: *const Lib,
+    sink: gl.c.GLuint = 0,
+    storage: gl.c.GLuint = 0,
+    bind_framebuffer: gl.c.PFNGLBINDFRAMEBUFFERPROC = null,
+    frames: std.atomic.Value(u32) = .init(0),
+    snapshot_lock: std.Io.Mutex = .init,
+    pixels: [width * height * 4]u8 = undefined,
+    audit: Audit = .{},
+    control: xev.Async,
+    control_c: xev.Completion = .{},
+    ack: windows.HANDLE,
+
+    const Audit = struct {
+        updates: usize = 0,
+        cells_rebuilt: bool = true,
+        animation: bool = true,
+        cursor_timer: bool = true,
+        swap_chain: bool = false,
+    };
+
+    threadlocal var current: ?*NativeBellWorker = null;
+
+    fn loadProc(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque {
+        const self = current orelse return null;
+        const proc = self.native_lib.getProcAddress(name) orelse return null;
+        if (std.mem.eql(u8, std.mem.span(name), "glBindFramebuffer")) {
+            self.bind_framebuffer = @ptrCast(proc);
+            return @ptrCast(&bindFramebuffer);
+        }
+        return proc;
+    }
+
+    // Only the test worker maps framebuffer zero to an owned RGBA8 FBO.
+    fn bindFramebuffer(target: gl.c.GLenum, id: gl.c.GLuint) callconv(gl_callconv) void {
+        const self = current.?;
+        if (id == 0 and self.sink == 0) {
+            const ctx = &gl.glad.context;
+            ctx.GenFramebuffers.?(1, &self.sink);
+            self.bind_framebuffer.?(gl.c.GL_FRAMEBUFFER, self.sink);
+            ctx.GenRenderbuffers.?(1, &self.storage);
+            ctx.BindRenderbuffer.?(gl.c.GL_RENDERBUFFER, self.storage);
+            ctx.RenderbufferStorage.?(gl.c.GL_RENDERBUFFER, gl.c.GL_RGBA8, width, height);
+            ctx.FramebufferRenderbuffer.?(gl.c.GL_FRAMEBUFFER, gl.c.GL_COLOR_ATTACHMENT0, gl.c.GL_RENDERBUFFER, self.storage);
+        }
+        self.bind_framebuffer.?(target, if (id == 0) self.sink else id);
+    }
+
+    fn swap(_: HDC) callconv(.winapi) BOOL {
+        const self = current.?;
+        const ctx = &gl.glad.context;
+        var old_read: gl.c.GLint = 0;
+        ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &old_read);
+        self.bind_framebuffer.?(gl.c.GL_READ_FRAMEBUFFER, self.sink);
+        self.snapshot_lock.lockUncancelable(global.io());
+        ctx.ReadPixels.?(0, 0, width, height, gl.c.GL_RGBA, gl.c.GL_UNSIGNED_BYTE, &self.pixels);
+        self.snapshot_lock.unlock(global.io());
+        self.bind_framebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(old_read));
+        gl.finish();
+        const result: BOOL = if (gl.errors.getError()) .TRUE else |_| .FALSE;
+        if (result.toBool()) _ = self.frames.fetchAdd(1, .release);
+        return result;
+    }
+
+    fn workerMain(self: *NativeBellWorker) void {
+        current = self;
+        defer current = null;
+        self.control.wait(&self.thread.loop, &self.control_c, NativeBellWorker, self, auditCallback);
+        self.thread.threadMain();
+    }
+
+    fn auditCallback(self_: ?*NativeBellWorker, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
+        result catch return .rearm;
+        const self = self_.?;
+        self.snapshot_lock.lockUncancelable(global.io());
+        self.audit = .{
+            .updates = self.renderer.terminal_state_frame_count,
+            .cells_rebuilt = self.renderer.cells_rebuilt,
+            .animation = self.renderer.animationWake() != null,
+            .cursor_timer = self.thread.cursor_c.state() == .active,
+            .swap_chain = self.renderer.swap_chain != null,
+        };
+        self.snapshot_lock.unlock(global.io());
+        _ = win32.SetEvent(self.ack);
+        return .rearm;
+    }
+
+    fn checkIdle(self: *NativeBellWorker) !Audit {
+        _ = win32.ResetEvent(self.ack);
+        try self.control.notify();
+        if (win32.WaitForSingleObject(self.ack, 2000) != win32.WAIT_OBJECT_0) return error.WorkerAuditTimeout;
+        self.snapshot_lock.lockUncancelable(global.io());
+        defer self.snapshot_lock.unlock(global.io());
+        try std.testing.expect(!self.audit.cells_rebuilt);
+        try std.testing.expect(!self.audit.animation);
+        try std.testing.expect(!self.audit.cursor_timer);
+        try std.testing.expect(self.audit.swap_chain);
+        return self.audit;
+    }
+
+    fn awaitFrame(self: *NativeBellWorker, count: u32, report: *std.Io.Writer) !void {
+        for (0..200) |_| {
+            if (self.frames.load(.acquire) >= count) return;
+            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
+        }
+        try report.print("notification timeout: wanted={} observed={}\n", .{ count, self.frames.load(.acquire) });
+        return error.BellPublicationDidNotPresent;
+    }
+
+    fn checkPixels(self: *NativeBellWorker, snapshot: bell_border.Snapshot, report: *std.Io.Writer, label: []const u8) !void {
+        self.snapshot_lock.lockUncancelable(global.io());
+        defer self.snapshot_lock.unlock(global.io());
+        for (0..height) |y| {
+            for (0..width) |x| {
+                const edge = snapshot.active and bell_border.covers(width, height, snapshot.width, @intCast(x), @intCast(y));
+                const wanted: [4]u8 = if (edge) .{ snapshot.r, snapshot.g, snapshot.b, 255 } else .{ 0, 0, 0, 0 };
+                try std.testing.expectEqualSlices(u8, &wanted, self.pixels[(y * width + x) * 4 ..][0..4]);
+            }
+        }
+        try report.print("{s}: presents={} updates={} active={} RGBA={x} native_pixels=true\n", .{
+            label, self.frames.load(.acquire), self.audit.updates, snapshot.active, self.pixels[0..16],
+        });
+    }
+
+    fn run(report: *std.Io.Writer) !void {
+        const alloc = std.testing.allocator;
+        const lib = try probe(if (softwareRequested()) .software else .system);
+        defer _ = FreeLibrary(lib.module);
+        try report.print("vendor={s} renderer={s} hidden=true no_output=true sink=RGBA8 test_only_framebuffer_zero_mapping=true completion=native-glFinish/readPixels NOT-desktop-SwapBuffers\n", .{
+            lib.vendor_buf[0..lib.vendor_len], lib.renderer_buf[0..lib.renderer_len],
+        });
+        const instance = GetModuleHandleW(null);
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyBellWorkerNative");
+        const class: WNDCLASSEXW = .{ .style = CS_OWNDC, .lpfnWndProc = &DefWindowProcW, .hInstance = instance, .lpszClassName = name };
+        if (RegisterClassExW(&class) == 0) return error.RegisterClassFailed;
+        defer _ = UnregisterClassW(name, instance);
+        const hwnd = CreateWindowExW(0, name, name, 0x80000000, 0, 0, width, height, null, null, instance, null) orelse return error.CreateWindowFailed;
+        defer _ = DestroyWindow(hwnd);
+        const hdc = GetDC(hwnd) orelse return error.GetDCFailed;
+        defer _ = ReleaseDC(hwnd, hdc);
+        var device: Device = .{ .lib = lib, .state = .init(.ready), .owner_thread = std.Thread.getCurrentId() };
+        try device.setPixelFormat(hdc);
+        device.lib.getProcAddress = &loadProc;
+        device.lib.swapBuffers = &swap;
+        var config = try configpkg.Config.default(alloc);
+        defer config.deinit();
+        config.@"bell-features".border = true;
+        config.@"window-vsync" = false;
+        config.@"background-opacity" = 0;
+        config.@"scrollback-compression" = false;
+        config.scrollbar = .never;
+        config.background = .{ .r = 0, .g = 0, .b = 0 };
+        var mailbox: CoreApp.Mailbox.Queue = .{};
+        var app: WinApp = .{ .core_app = undefined, .config = config, .hinstance = undefined, .default_command_arena = .init(alloc) };
+        defer app.default_command_arena.deinit();
+        var window: WinWindow = .{ .app = &app };
+        const surface = try alloc.create(apprt.Surface);
+        defer alloc.destroy(surface);
+        surface.* = .{ .app = &app, .parent_window = &window, .hdc = @ptrCast(hdc), .width = width, .height = height, .core_surface_ready = true };
+        surface.core_surface.focused = false;
+        surface.client_size.store(@as(u64, height) << 32 | width, .release);
+        surface.bell_border_state.configure(true);
+        surface.bell_border_color = .{ .r = 211, .g = 159, .b = 62 };
+        var terminal = try terminalpkg.Terminal.init(std.testing.io, alloc, .{ .cols = 4, .rows = 2, .max_scrollback_bytes = null });
+        defer terminal.deinit(alloc);
+        terminal.modes.set(.cursor_visible, false);
+        var mutex: std.Io.Mutex = .init;
+        var state: rendererpkg.State = .{ .mutex = &mutex, .terminal = &terminal };
+        surface.core_surface.renderer_state = state;
+        var library = try font.Library.init(alloc);
+        defer library.deinit();
+        var collection = font.Collection.init();
+        collection.load_options = .{ .library = library };
+        _ = try collection.add(alloc, try font.Face.init(library, font.embedded.regular, .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } }), .{
+            .style = .regular,
+            .fallback = false,
+            .size_adjustment = .none,
+        });
+        var grid = try font.SharedGrid.init(alloc, .{ .collection = collection });
+        defer grid.deinit(alloc);
+        const render = try alloc.create(rendererpkg.Renderer);
+        defer alloc.destroy(render);
+        render.* = try rendererpkg.Renderer.init(alloc, .{
+            .device = &device,
+            .config = try .init(alloc, &config),
+            .font_grid = &grid,
+            .size = .{ .screen = .{ .width = width, .height = height }, .cell = grid.cellSize(), .padding = .{} },
+            .surface_mailbox = .{ .surface = &surface.core_surface, .app = .{ .rt_app = &app, .mailbox = &mailbox } },
+            .rt_surface = surface,
+            .thread = &surface.core_surface.renderer_thread,
+        });
+        defer render.deinit();
+        const thread = &surface.core_surface.renderer_thread;
+        thread.* = try rendererpkg.Thread.init(alloc, &config, surface, render, &state);
+        defer thread.deinit();
+        _ = thread.mailbox.push(global.io(), .{ .focus = false }, .instant);
+        var control = try xev.Async.init();
+        defer control.deinit();
+        const ack = win32.CreateEventW(null, 1, 0, null) orelse return error.Win32Error;
+        defer _ = win32.CloseHandle(ack);
+        var worker: NativeBellWorker = .{ .thread = thread, .renderer = render, .surface = surface, .native_lib = &lib, .control = control, .ack = @ptrCast(ack) };
+        const native_thread = try std.Thread.spawn(.{}, workerMain, .{&worker});
+        defer {
+            thread.stop.notify() catch {};
+            native_thread.join();
+        }
+        try worker.awaitFrame(1, report);
+        const before = try worker.checkIdle();
+        try worker.checkPixels(.none, report, "completed-idle-frame");
+        try std.Io.sleep(global.io(), .fromMilliseconds(700), .awake);
+        try std.testing.expectEqual(@as(u32, 1), worker.frames.load(.acquire));
+        surface.ringBellBorder();
+        try worker.awaitFrame(2, report);
+        const ring = try worker.checkIdle();
+        try std.testing.expect(ring.updates > before.updates);
+        try worker.checkPixels(surface.bellBorder(), report, "ring-notification");
+        surface.ringBellBorder();
+        try std.Io.sleep(global.io(), .fromMilliseconds(100), .awake);
+        try std.testing.expectEqual(@as(u32, 2), worker.frames.load(.acquire));
+        surface.bell_border_color = .{ .r = 17, .g = 112, .b = 226 };
+        surface.ringBellBorder();
+        try worker.awaitFrame(3, report);
+        const recolor = try worker.checkIdle();
+        try std.testing.expect(recolor.updates > ring.updates);
+        try worker.checkPixels(surface.bellBorder(), report, "color-notification");
+        surface.handleKeyEvent(win32.VK_PACKET, 0, .press);
+        try worker.awaitFrame(4, report);
+        const clear = try worker.checkIdle();
+        try std.testing.expect(clear.updates > recolor.updates);
+        try worker.checkPixels(.none, report, "clear-notification");
+        try report.writeAll("actual_chain=Surface-publication/xev-wakeup/Thread/updateFrame/rebuildCells/drawFrame/OpenGL-present/WGL-present/native-GL no_direct_border_call=true\n");
+    }
+};
 
 test parseVersion {
     const testing = std.testing;
