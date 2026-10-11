@@ -76,7 +76,7 @@ pub fn testThread(comptime Thread: type, comptime Renderer: type, comptime xev: 
         var renderer: Renderer = undefined;
         renderer.draw_mutex = .init;
         renderer.display_realized = gate != 2;
-        renderer.gx_cursor_blink_affects = gate == 0;
+        renderer.gx_cursor_blink_affects = gate != 1;
         var config = try std.meta.Child(@typeInfo(@TypeOf(Thread.init)).@"fn".params[1].type.?).default(std.testing.allocator);
         defer config.deinit();
         var thread = try Thread.init(std.testing.allocator, &config, undefined, &renderer, undefined);
