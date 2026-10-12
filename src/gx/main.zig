@@ -63,6 +63,7 @@ pub const state_file = @import("state_file.zig");
 pub const theme = @import("theme.zig");
 pub const theme_swatch = @import("theme_swatch.zig");
 pub const ui_color = @import("ui_color.zig");
+pub const ui_ref = @import("ui_ref.zig");
 pub const ui_tokens = @import("ui_tokens.zig");
 pub const unread = @import("unread.zig");
 pub const url_policy = @import("url_policy.zig");
@@ -103,6 +104,7 @@ test {
     _ = theme;
     _ = theme_swatch;
     _ = ui_color;
+    _ = ui_ref;
     _ = ui_tokens;
     _ = unread;
     _ = url_policy;
