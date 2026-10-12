@@ -24,6 +24,8 @@ pub const Reference = struct {
     }
 };
 
+/// A tab or surface view belongs to its window. A window root view belongs
+/// to that same window, never another window; every view gets its own revision.
 pub const Attachment = struct {
     object: Reference = .{},
     owner: Reference = .{},
@@ -31,7 +33,8 @@ pub const Attachment = struct {
 
     pub fn isValid(self: Attachment) bool {
         return self.object.isValid() and self.owner.isValid() and self.owner.kind == .window and
-            self.object.epoch == self.owner.epoch and self.revision != 0;
+            self.object.epoch == self.owner.epoch and self.revision != 0 and
+            (self.object.kind != .window or self.object.matches(self.owner));
     }
 
     /// A move away and back, or a hide/reopen, must publish a fresh attachment.
@@ -68,6 +71,7 @@ pub const Issuer = struct {
         if (!object.isValid() or !owner.isValid()) return error.InvalidReference;
         if (owner.kind != .window) return error.InvalidOwner;
         if (object.epoch != self.epoch or owner.epoch != self.epoch) return error.ForeignEpoch;
+        if (object.kind == .window and !object.matches(owner)) return error.InvalidOwner;
         return .{ .object = object, .owner = owner, .revision = try self.next() };
     }
 
@@ -166,6 +170,38 @@ test "invalid and foreign attachments do not consume identity serials" {
     const bad: Attachment = .{ .object = terminal, .owner = foreign_owner, .revision = 1 };
     try std.testing.expect(!bad.isValid());
     try std.testing.expect(!bad.matches(bad));
+}
+
+test "window root views attach only to their own window" {
+    var issuer = try Issuer.init(1);
+    const window = try issuer.create(.window);
+    const other = try issuer.create(.window);
+    const root = try issuer.attach(window, window);
+    try std.testing.expect(root.isValid());
+    const serial = issuer.serial;
+    try std.testing.expectError(error.InvalidOwner, issuer.attach(window, other));
+    try std.testing.expectEqual(serial, issuer.serial);
+    const crossed: Attachment = .{ .object = window, .owner = other, .revision = 1 };
+    try std.testing.expect(!crossed.isValid());
+}
+
+test "attachments with an otherwise valid identity still reject zero revision" {
+    var issuer = try Issuer.init(1);
+    const window = try issuer.create(.window);
+    const surface_ref = try issuer.surface(42);
+    for ([_]Reference{ window, surface_ref }) |object| {
+        const attachment: Attachment = .{ .object = object, .owner = window };
+        try std.testing.expect(!attachment.isValid());
+        try std.testing.expect(!attachment.matches(attachment));
+    }
+}
+
+test "external kind tags use checked decoding before constructing references" {
+    try std.testing.expectEqual(Kind.window, std.enums.fromInt(Kind, 1).?);
+    try std.testing.expectEqual(Kind.tab, std.enums.fromInt(Kind, 2).?);
+    try std.testing.expectEqual(Kind.surface, std.enums.fromInt(Kind, 3).?);
+    try std.testing.expect(std.enums.fromInt(Kind, 0) == null);
+    try std.testing.expect(std.enums.fromInt(Kind, 99) == null);
 }
 
 test "identity exhaustion fails closed without wrapping or reusing a generation" {
