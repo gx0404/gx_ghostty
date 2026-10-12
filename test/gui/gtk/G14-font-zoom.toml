@@ -1,0 +1,52 @@
+id = "G14"
+title = "Ctrl wheel font zoom: independent splits and modifier combinations"
+lang = "zh_CN"
+config = """
+command = /bin/bash --noprofile --norc
+language = zh-CN
+font-size = 12
+gx-ctrl-scroll-zoom = true
+keybind = f6=reload_config
+keybind = f7=reset_font_size
+"""
+xdotool = """
+mousemove 400 300
+click 1
+keydown ctrl
+click --repeat 4 --delay 150 4
+click --repeat 2 --delay 150 5
+keyup ctrl
+sleep 0.5
+key F7
+sleep 0.5
+key ctrl+shift+o
+sleep 1.5
+mousemove 200 300
+click 1
+keydown ctrl
+click --repeat 3 --delay 150 4
+keyup ctrl
+sleep 0.5
+mousemove 500 300
+click 1
+keydown ctrl
+click 5
+keyup ctrl
+sleep 0.5
+keydown ctrl shift
+click 4
+keyup shift ctrl
+keydown ctrl alt
+click 4
+keyup alt ctrl
+keydown ctrl super
+click 4
+keyup super ctrl
+key F6
+sleep 1.5
+"""
+expect = [
+  "G14.png: Chinese GTK main window with one terminal at configured 12 pt",
+  "G14-after.png: left and right terminal splits at different font sizes (left 15 pt, right 11 pt), preserved after reload; Ctrl+Shift/Alt/Super did not zoom",
+  "Native pinch and physical smooth-device sensitivity require real hardware; this discrete-wheel scenario does not prove them",
+]

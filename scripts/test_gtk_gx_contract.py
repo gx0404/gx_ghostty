@@ -407,6 +407,39 @@ class SettingsDialogTests(unittest.TestCase):
         pages = [node.props["name"] for node in root.walk() if node.kind == "Adw.PreferencesPage"]
         self.assertEqual(pages, ["language", "appearance", "font", "interaction", "shell", "about"])
 
+    def test_font_zoom_switch_sync_save_and_reset(self):
+        source = (GX / "settings_dialog.zig").read_text(encoding="utf-8")
+        declared = ids(blueprint("1.5/gx-settings-dialog.blp"))
+        self.assertEqual("Adw.SwitchRow", declared["ctrl_scroll_zoom_row"].kind)
+        self.assertEqual("Gtk.Button", declared["ctrl_scroll_zoom_reset_button"].kind)
+        for statement in (
+            'setSwitch(priv.ctrl_scroll_zoom_row, config.@"gx-ctrl-scroll-zoom");',
+            'self.queueSet(item.key, settings_map.Switch.value(row.getActive() != 0));',
+            'self.queueReset(settings_map.ctrl_scroll_zoom.key);',
+            'self.fromCli(&.{settings_map.ctrl_scroll_zoom.key})',
+        ):
+            self.assertIn(statement, source)
+
+    def test_surface_routes_raw_scroll_and_disposes_zoom(self):
+        source = (GTK / "class/surface.zig").read_text(encoding="utf-8")
+        for statement in (
+            'gx_font_zoom.sync(self, priv.render_surface.as(gtk.Widget), config.@"gx-ctrl-scroll-zoom");',
+            'if (gx_font_zoom.scroll(self, ec, y)) return 1;',
+            'gx_font_zoom.dispose(self);',
+        ):
+            self.assertIn(statement, source)
+        self.assertLess(source.index('if (gx_font_zoom.scroll(self, ec, y))'),
+                        source.index('const multiplier: f64 = if (priv.precision_scroll)'))
+
+    def test_environment_flags_are_appended_before_gtk_init(self):
+        source = (GTK / "class/application.zig").read_text(encoding="utf-8")
+        self.assertIn('try @import("../gx/environment.zig").append("GDK_DEBUG", gdk_debug);', source)
+        self.assertIn('try @import("../gx/environment.zig").append("GDK_DISABLE", gdk_disable);', source)
+        self.assertLess(source.index('setGtkEnv(&config)'), source.index('adw.init();'))
+        start = source.index('fn setGtkEnv(')
+        self.assertIn('global.syncEnviron();', source[start:])
+        self.assertNotIn('setenv("GDK_', source[start:])
+
     def test_theme_enter_keeps_the_saved_theme_read_only(self):
         source = (GX / "settings_dialog.zig").read_text(encoding="utf-8")
         body = re.search(r"fn applyTheme\(self: \*Self\) void \{(.*?)\n    \}", source, re.S)

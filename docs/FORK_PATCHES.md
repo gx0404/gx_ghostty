@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0034）之后的号。在册的 28 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0034，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0036）之后的号。在册的 30 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0036，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -93,6 +93,8 @@
 | GX-0032 | `src/renderer/generic.zig` | `fork(gx): GX-0032` | active |
 | GX-0033 | `src/config/Config.zig` | `fork(gx): GX-0033` | active |
 | GX-0034 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0034` | active |
+| GX-0035 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0035` | active |
+| GX-0036 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0036` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1289,3 +1291,21 @@ python -m unittest scripts.test_fork_patches -v
 - 移除条件：上游在 GTK 初始化后以低优先级默认层应用系统闪烁设置、且保留原始加载快照时移除；恢复原加载行并删除三个新增块，登记改为 removed。
 - 验证：`just test --filter gx.config_layers --filter gx.theme`；独立 WSL clone 的 `just wsl test --filter gx.`、`just wsl test --gtk --filter apprt.gtk.gx` 与 `just wsl build --gtk`；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots test_gtk_gx_contract`。两端隔离配置实际 load 与 GUI 优先级、主题迁移、系统属性证据保存在本机 `.local/evidence/R4/R4-Defaults/`；未读图的真实桌面验收记 PENDING。
 - 最小锁定：`scripts/test_fork_patches.py::Gx0034ShapeTests` 检查快照生命周期、首次 load 早于 adw、采样重建晚于 adw、硬重载先采样。GTK 模块单测验证重建保持用户输入、用户覆盖与 GUI 删除覆盖的回落。
+
+## GX-0035 GTK 滚轮与捏合字号缩放
+
+- 文件：`src/apprt/gtk/class/surface.zig`；active，未回馈上游。导入与 `propConfig`、`ecMouseScrollVertical`、`dispose` 各留一处薄委托；滚轮控制器参数由匿名改为命名。
+- 原因：GTK 原本无 Ctrl 滚轮／捏合字号缩放，现有 `gx-ctrl-scroll-zoom` 只在 Windows 消费。
+- 真源：共享 `src/gx/font_zoom.zig::WheelAccumulator`／`PinchState`；GTK `src/apprt/gtk/gx/font_zoom.zig::sync`／`scroll`／`dispose`。仅 Ctrl 单独按下时拦截滚轮，保留原始 wheel-unit 分数，surface-unit 以 GTK 页面步长（逻辑高度的 2/3 次方）换算；方向反转、停止、Ctrl 释放、失焦、重载与禁用清累计。捏合基于开始字号与累计 scale，半点目标去重；结束／取消／禁用清状态，关闭不 claim。只走核心 `set_font_size`，不碰分屏 zoom，不写字号配置。
+- 设置：现有 Adw 1.5 模板增加开关、提示与恢复按钮，复用共享设置模型和译文；恢复只删覆盖键。GX-0010 字段文档更新为 Windows 与 GTK；资源下限不变。
+- 移除条件：上游提供同等滚轮／捏合语义后删除钩子，将登记改为 removed。
+- 验证：`just test --filter gx.`、POSIX/GX 与 GTK/GX 单测、GTK 构建、隔离场景的上下滚／修饰键组合／禁用／分屏／重载与中文截图；native pinch 与 smooth 设备灵敏度仍须真实硬件。`test_gtk_gx_contract`、`test_gx_test_roots` 与 `test_fork_patches` 锁定接线和闭集。
+
+## GX-0036 GTK 渲染环境保留用户标记
+
+- 文件：`src/apprt/gtk/class/application.zig::setGtkEnv`；active，未回馈上游。仅将两段固定缓冲区 setenv 改为两行 `gx/environment.zig::append`，仍在 `adw.init` 前执行，最后同步全局环境。
+- 原因：上游覆盖 `GDK_DEBUG`／`GDK_DISABLE`，丢失用户和未知标记。
+- 真源：共享 `src/gx/environment.zig::appendFlags` 分配可增长的 NUL 终止值，原文保留、按 token 查缺、幂等追加；GTK `src/apprt/gtk/gx/environment.zig::append` 使用运行期 GTK `<4.16` 门追加 `vulkan-disable`，保留必需的 `GDK_DISABLE=vulkan`。不修改 `GSK_RENDERER`，不据 Mesa／Xvfb／DMABUF 失败判软件 GL。
+- 子进程：沿用 `Surface.defaultTermioEnv` 剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 的清理表。
+- 移除条件：上游保留并幂等追加必要环境标记后移除委托，将登记改为 removed。
+- 验证：共享及 GTK 模块的长值／未知 token／幂等／OOM／4.14 与新版本行为单测，GTK 4.14 构建和真实启动的进程环境／子进程清理；`scripts/test_fork_patches.py::GtkInputShapeTests` 锁定两处薄调用、初始化顺序与版本门。

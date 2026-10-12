@@ -3366,39 +3366,10 @@ fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
         vulkan: bool = true,
     } = .{};
 
-    {
-        var buf: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buf);
-        var first: bool = true;
-        inline for (@typeInfo(@TypeOf(gdk_debug)).@"struct".fields) |field| {
-            if (@field(gdk_debug, field.name)) {
-                if (!first) try writer.writeAll(",");
-                try writer.writeAll(field.name);
-                first = false;
-            }
-        }
-        try writer.writeByte(0);
-        const value = writer.buffered();
-        log.warn("setting GDK_DEBUG={s}", .{value[0 .. value.len - 1]});
-        _ = setenv("GDK_DEBUG", @ptrCast(value[0 .. value.len - 1 :0]), 1);
-    }
-
-    {
-        var buf: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buf);
-        var first: bool = true;
-        inline for (@typeInfo(@TypeOf(gdk_disable)).@"struct".fields) |field| {
-            if (@field(gdk_disable, field.name)) {
-                if (!first) try writer.writeAll(",");
-                try writer.writeAll(field.name);
-                first = false;
-            }
-        }
-        try writer.writeByte(0);
-        const value = writer.buffered();
-        log.warn("setting GDK_DISABLE={s}", .{value[0 .. value.len - 1]});
-        _ = setenv("GDK_DISABLE", @ptrCast(value[0 .. value.len - 1 :0]), 1);
-    }
+    // fork(gx): GX-0036 append required flags without replacing user tokens.
+    try @import("../gx/environment.zig").append("GDK_DEBUG", gdk_debug);
+    // fork(gx): GX-0036 retain the Vulkan disable on old and new GTK.
+    try @import("../gx/environment.zig").append("GDK_DISABLE", gdk_disable);
 
     // Sync environ after altering system env
     global.syncEnviron();

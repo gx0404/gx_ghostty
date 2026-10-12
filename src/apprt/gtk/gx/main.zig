@@ -30,4 +30,6 @@ test {
     _ = @import("settings_dialog.zig");
     _ = @import("app_mode.zig");
     _ = @import("progress.zig");
+    _ = @import("font_zoom.zig");
+    _ = @import("environment.zig");
 }

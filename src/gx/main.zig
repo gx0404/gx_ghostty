@@ -109,4 +109,6 @@ test {
     _ = window_state;
     _ = @import("cursor_blink.zig");
     _ = @import("renderer_recovery.zig");
+    _ = @import("font_zoom.zig");
+    _ = @import("environment.zig");
 }

@@ -1138,6 +1138,42 @@ class Gx0033ShapeTests(unittest.TestCase):
         self.assertNotIn('only supported currently on macOS', doc)
 
 
+class GtkInputShapeTests(unittest.TestCase):
+    def test_zoom_hooks_stay_thin_and_before_scroll_conversion(self):
+        rel = "src/apprt/gtk/class/surface.zig"
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch("GX-0035", rel, "fork(gx): GX-0035", "active"), patches)
+        self.assertEqual(source.count("gx_font_zoom.sync("), 1)
+        self.assertEqual(source.count("gx_font_zoom.scroll("), 1)
+        self.assertEqual(source.count("gx_font_zoom.dispose("), 1)
+        self.assertLess(source.index("gx_font_zoom.dispose("), source.index("gtk.Widget.disposeTemplate("))
+        self.assertLess(source.index("gx_font_zoom.scroll("), source.index("const multiplier: f64 = if (priv.precision_scroll)"))
+        zoom = (ROOT / "src/apprt/gtk/gx/font_zoom.zig").read_text(encoding="utf-8")
+        self.assertIn(".set_font_size = points", zoom)
+        self.assertNotIn(".setFontSize(", zoom)
+        self.assertNotIn("gui_settings", zoom)
+        self.assertNotIn(".getZoom(", zoom)
+
+    def test_environment_only_replaces_the_two_flag_writers(self):
+        source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch("GX-0036", APPLICATION_ZIG, "fork(gx): GX-0036", "active"), patches)
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, "fn setGtkEnv(")
+        body = "\n".join(lines[start:end])
+        self.assertEqual(body.count('@import("../gx/environment.zig").append('), 2)
+        self.assertIn("assert(gtk.isInitialized() == 0);", body)
+        self.assertIn("global.syncEnviron();", body)
+        self.assertNotIn('setenv("GDK_', body)
+        adapter = (ROOT / "src/apprt/gtk/gx/environment.zig").read_text(encoding="utf-8")
+        self.assertIn("gtk_version.runtimeAtLeast(4, 16, 0)", adapter)
+        self.assertNotIn('setenv("GSK_RENDERER"', adapter)
+        surface = (ROOT / "src/apprt/gtk/class/surface.zig").read_text(encoding="utf-8")
+        for variable in ("GDK_DEBUG", "GDK_DISABLE", "GSK_RENDERER"):
+            self.assertIn(f'"{variable}"', surface)
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则
