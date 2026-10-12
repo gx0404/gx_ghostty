@@ -22,6 +22,7 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         Only normal installs certify an image. Query/help/list/custom-step or unknown arguments
         write an ineligible attempt, with Zig output and exit status unchanged. Known valued options
         such as --summary all and inline -j4 are supported; pinned Zig rejects separated -j 4.
+        build --help/-h queries Zig; --help before COMMAND shows this driver's help.
   test [--suite main|vt] [--gtk] [--filter TEXT]... [ZIG_TEST ARGS...]
         python3 scripts/zig_test.py; the main suite (default) gets -Dapp-runtime=none like the
         gx-ci linux-main job, or the GTK runtime flags with --gtk.
@@ -1663,7 +1664,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("target", nargs="?", help="worktree directory or ref (default: this worktree)")
     sync.add_argument("--dirty", action="store_true", help="include the worktree's uncommitted and untracked files")
 
-    build = commands.add_parser("build", parents=[common], allow_abbrev=False, help="zig build in the clone (other arguments pass through)")
+    build = commands.add_parser("build", parents=[common], add_help=False, allow_abbrev=False,
+                                help="zig build in the clone (including -h/--help query arguments)")
     build.add_argument("--gtk", action="store_true", help="add " + " ".join(GTK_BUILD_ARGS))
 
     test = commands.add_parser("test", parents=[common], allow_abbrev=False, help="scripts/zig_test.py in the clone (other arguments pass through)")

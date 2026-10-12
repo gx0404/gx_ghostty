@@ -104,6 +104,15 @@ class ArgumentTests(unittest.TestCase):
             self.assertEqual(("A", "/home/u/c", True), (args.distro, args.clone, args.dry_run))
         self.assertEqual("B", self.parse("build", "--distro", "B", GX_WSL_DISTRO="A").distro)
 
+    def test_build_help_reaches_zig_instead_of_argparse(self):
+        for help_flag in ("--help", "-h", "--list-steps", "-l"):
+            with self.subTest(help_flag=help_flag), contextlib.redirect_stdout(io.StringIO()):
+                args = self.parse("build", "--gtk", "-Doptimize=ReleaseFast", help_flag)
+                self.assertEqual(["-Doptimize=ReleaseFast", help_flag], args.extra)
+                invocation = gx_wsl.plan(args)[0]
+                self.assertEqual(help_flag, invocation.args[-1])
+                self.assertIn("normal_build", invocation.script)
+
     def test_build_passes_unknown_arguments_through_in_order(self) -> None:
         args = self.parse("build", "--gtk", "-Doptimize=ReleaseFast", "test-lib-vt-schema", "-fno-sys=foo", "--summary", "all")
         self.assertTrue(args.gtk)
