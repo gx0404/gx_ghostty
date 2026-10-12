@@ -17,12 +17,14 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         DIR/<label>/run-NN.txt and a copy of its log; the summary or comparison follows.
         --env sets variables for every run, e.g. GHOSTTY_GX_PERF=1.
   gtk --clone PATH [--clone PATH] [--label NAME]... --out DIR [--runs N] [--env NAME=VALUE]...
-        The same for GTK builds through `scripts/gx_wsl.py smoke --perf` in WSL clones
-        (each clone must have a GTK build); DIR/<label>/run-NN/ holds each smoke's evidence.
+        Verified ReleaseFast GTK images through `scripts/gx_wsl.py smoke --perf` in WSL clones.
+        New/empty DIR only; no automatic warm-up; AB/BA order. DIR/<label>/run-NN/ holds raw evidence,
+        gtk-runs.json preserves every planned run, RESULT.json records validity (not a performance verdict).
+        Missing/failed/changed-identity runs cannot be filtered into success.
 
 Samples come from these lines:
-  - `info(gx_perf): <metric> <value><unit>` (unit ns, us, ms or s) written when
-    GHOSTTY_GX_PERF=1 (src/gx/perf.zig);
+  - `info(gx_perf): <metric> <value>us` written when GHOSTTY_GX_PERF=1 (src/gx/perf.zig);
+    historical ns/ms/s time lines are also accepted, not counts;
   - `metric <name> <value> [s|ms|us]` from `gx_wsl.py smoke --perf` and from this tool's runs;
   - the Debug-build log line `window shown after <n>ms first_frame=<bool>` (log.window_shown);
   - the `startup_ms` block of a scripts/gx_win_gui.py run.json (startup.<mark>).
@@ -33,6 +35,7 @@ Times are reported in milliseconds; metrics without a unit are counts. p90 is th
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -95,16 +98,25 @@ class Samples:
 
     values: dict[str, list[float]] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
+    gtk_runs: list[dict] = field(default_factory=list)
+    unverified: set[str] = field(default_factory=set)
 
     def add(self, name: str, value: float, unit: str | None) -> None:
-        self.values.setdefault(name, []).append(to_ms(value, unit))
-        self.units.setdefault(name, "" if unit is None else "ms")
+        normalized = "" if unit is None else "ms"
+        if name in self.units and self.units[name] != normalized:
+            raise PerfError(f"metric {name}: time/count unit conflict")
+        converted = to_ms(value, unit)
+        if not math.isfinite(converted) or (name.startswith("cpu.") and converted < 0):
+            raise PerfError(f"metric {name}: invalid or negative sample")
+        self.values.setdefault(name, []).append(converted)
+        self.units[name] = normalized
 
     def extend(self, other: "Samples") -> None:
         for name, values in other.values.items():
             for value in values:
-                self.values.setdefault(name, []).append(value)
-            self.units.setdefault(name, other.units[name])
+                self.add(name, value, "ms" if other.units[name] else None)
+        self.gtk_runs.extend(other.gtk_runs)
+        self.unverified.update(other.unverified)
 
     def __bool__(self) -> bool:
         return any(self.values.values())
@@ -161,29 +173,205 @@ def in_profile(path: Path, root: Path) -> bool:
     return False
 
 
+GTK_REQUIRED = ("cpu.main", "cpu.renderer", "cpu.total", "window_seconds", "workload_seconds")
+
+
 def sample_files(paths: Iterable[Path]) -> list[Path]:
-    files = []
+    files: dict[str, Path] = {}
     for path in paths:
+        path = path.resolve()
         if path.is_dir():
-            files += sorted(p for p in path.rglob("*") if p.is_file() and (p.suffix in SAMPLE_SUFFIXES or p.name == "run.json")
-                            and not in_profile(p, path))
+            candidates = sorted(p for p in path.rglob("*") if p.is_file() and
+                                (p.suffix in SAMPLE_SUFFIXES or p.name in ("run.json", "gtk-runs.json") or
+                                 p.name.endswith("-meta.json")) and not in_profile(p, path))
         elif path.is_file():
-            files.append(path)
+            candidates = [path] if not in_profile(path, path.parent) else []
         else:
             raise PerfError(f"{path} does not exist")
-    return files
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            files.setdefault(os.path.normcase(str(resolved)), resolved)
+    return list(files.values())
+
+
+def read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("expected object")
+        return data
+    except (OSError, ValueError) as exc:
+        raise PerfError(f"{path}: invalid evidence JSON: {exc}") from None
+
+
+def gtk_evidence(path: Path) -> tuple[dict, Samples]:
+    try:
+        return _gtk_evidence(path)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise PerfError(f"{path}: malformed GTK evidence: {exc}") from None
+
+
+def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
+    meta = read_json(path)
+    if meta.get("schema") != "gx-gtk-perf-v1":
+        raise PerfError(f"{path}: unknown GTK evidence schema")
+    if meta.get("valid") is not True or meta.get("exit") != 0 or meta.get("errors"):
+        raise PerfError(f"{path}: rejected GTK run: {meta.get('errors', [])}")
+    if meta.get("perf") is False:
+        return meta, Samples()
+    if meta.get("perf") is not True or \
+            meta.get("workload_finished") is not True or meta.get("workload_exit") != "0" or \
+            meta.get("build_mode") != "ReleaseFast" or meta.get("cleanup_identity") != "verified":
+        raise PerfError(f"{path}: rejected GTK run: {meta.get('errors', [])}")
+    for key, kind in (("identity", dict), ("identity_checks", list), ("files", list), ("artifact_sha256", dict),
+                      ("version", str), ("effective_env", dict)):
+        if not isinstance(meta.get(key), kind):
+            raise PerfError(f"{path}: incomplete evidence field {key}")
+    if not all(isinstance(item, dict) for item in meta["identity_checks"]) or not all(isinstance(name, str) for name in meta["files"]):
+        raise PerfError(f"{path}: malformed manifest or identity checks")
+    identity = meta["identity"]
+    if not isinstance(identity.get("pid"), int) or identity["pid"] <= 0 or not identity.get("starttime") or \
+            not re.fullmatch(r"[0-9a-f]{64}", identity.get("sha256", "")) or not identity.get("exe"):
+        raise PerfError(f"{path}: incomplete process identity")
+    checks = meta.get("identity_checks", [])
+    required_stages = {"launch", "before before", "before after", "after before", "after after", "finished", "cleanup"}
+    if not required_stages <= {item.get("stage") for item in checks} or any(
+            any(item.get(key) != value for key, value in identity.items()) for item in checks):
+        raise PerfError(f"{path}: incomplete or changed process identity checkpoints")
+    if any(not re.fullmatch(r"[0-9a-f]{40}", meta.get(key, "")) for key in ("commit", "tree")) or \
+            meta.get("dirty") is not False or meta.get("dirty_paths") != "":
+        raise PerfError(f"{path}: incomplete or dirty source identity")
+    if not re.fullmatch(r"[0-9a-f]{32}", meta.get("capture_id", "")) or type(meta.get("child_exit")) is not int or \
+            meta["child_exit"] not in (0, -15) or meta.get("cleanup") != "owned pidfd SIGTERM":
+        raise PerfError(f"{path}: inconsistent capture/child-exit/cleanup evidence")
+    executable = meta.get("executable", {})
+    if not isinstance(executable, dict) or executable.get("path") != identity["exe"] or \
+            any(identity.get(key) != value for key, value in executable.items() if key != "path") or \
+            not all(key in executable for key in ("sha256", "size", "inode", "device", "mtime_ns")):
+        raise PerfError(f"{path}: executable and process identity conflict")
+    prefix = path.name.removesuffix("-meta.json")
+    allowed = {prefix + suffix for suffix in (".log", ".png", "-perf.png", "-after.png", "-version.txt", "-perf.txt",
+               "-times.txt", "-tasks-before.txt", "-tasks-after.txt", "-status-before.txt", "-status-after.txt",
+               "-process-before.json", "-process-after.json", "-build-receipt.json")}
+    for name in meta["files"]:
+        artifact = path.parent / name
+        if name not in allowed or artifact.is_symlink() or not artifact.is_file() or \
+                hashlib.sha256(artifact.read_bytes()).hexdigest() != meta["artifact_sha256"].get(name):
+            raise PerfError(f"{path}: missing or changed artifact {name}")
+    def raw(suffix: str) -> str:
+        name = prefix + suffix
+        if name not in meta.get("files", []) or not (path.parent / name).is_file():
+            raise PerfError(f"{path}: missing artifact {name}")
+        return (path.parent / name).read_text(encoding="utf-8", errors="strict")
+    try:
+        version = raw("-version.txt")
+        if not re.search(r"build mode\s*:\s*(?:\w+\.)?\.?ReleaseFast\b", version):
+            raise ValueError("version does not verify ReleaseFast")
+        import gx_wsl
+        namespace: dict = {"__name__": "gx_perf_validator"}
+        exec(compile(gx_wsl.PERF_PROGRAM + gx_wsl.RECEIPT_PROGRAM, "gx_perf_validator", "exec"), namespace)
+        source = {key: meta[key] for key in ("commit", "tree", "dirty", "dirty_paths")}
+        receipt_text = raw("-build-receipt.json")
+        if hashlib.sha256(receipt_text.encode()).hexdigest() != meta.get("build_receipt_sha256") or meta.get("version") != version:
+            raise ValueError("build receipt/version raw hash conflict")
+        receipt = json.loads(receipt_text)
+        if receipt.get("perf_eligible") is not True or meta.get("source_end") != source:
+            raise ValueError("source changed since normal build or during smoke")
+        namespace["validate_receipt"](receipt, source, executable, version, meta.get("version_exit"))
+        before, after, times = raw("-tasks-before.txt"), raw("-tasks-after.txt"), raw("-times.txt")
+        namespace["measurement"](before, after, times)
+        for text in (before, after):
+            task = namespace["parse_tasks"](text).get(str(identity["pid"]), {})
+            if task.get("starttime") != identity["starttime"]:
+                raise ValueError("raw main birth differs from process identity")
+        if namespace["parse_times"](times).get("run_exit") != "0":
+            raise ValueError("missing or nonzero run_exit")
+        samples = parse_text(raw("-perf.txt"))
+        clk_tck = meta.get("clk_tck", 0)
+        if not isinstance(clk_tck, int) or clk_tck <= 0:
+            raise ValueError("missing CLK_TCK")
+        process_before, process_after = json.loads(raw("-process-before.json")), json.loads(raw("-process-after.json"))
+        accounting = namespace["cpu_accounting"](before, after, process_before, process_after, str(identity["pid"]), clk_tck)
+        if meta.get("cpu_accounting") != accounting:
+            raise ValueError("process CPU reconciliation differs from raw evidence")
+        expected = parse_text(namespace["report"](before, after, times, raw(".log"), clk_tck, process_before, process_after))
+        if samples.values != expected.values or samples.units != expected.units:
+            raise ValueError("reported metrics differ from raw task window")
+        for metric in GTK_REQUIRED:
+            if len(samples.values.get(metric, [])) != 1 or samples.units.get(metric) != "ms":
+                raise ValueError("missing or duplicate GTK metric " + metric)
+        for suffix in (".png", "-perf.png", "-status-before.txt", "-status-after.txt"):
+            name = prefix + suffix
+            if name not in meta.get("files", []) or not (path.parent / name).is_file():
+                raise ValueError("missing artifact " + name)
+        samples.extend(parse_text(raw(".log")))
+    except (OSError, ValueError) as exc:
+        raise PerfError(f"{path}: invalid GTK evidence: {exc}") from None
+    samples.gtk_runs.append(meta)
+    return meta, samples
 
 
 def collect(paths: Iterable[Path]) -> Samples:
     samples = Samples()
-    for path in sample_files(paths):
+    files = sample_files(paths)
+    for parent in {path.parent for path in files}:
+        for legacy in parent.glob("*-meta.txt"):
+            text = legacy.read_text(encoding="utf-8", errors="replace")
+            match = re.search(r"(?m)^exit:\s*(-?\d+)\s*$", text)
+            if match and int(match.group(1)) != 0:
+                raise PerfError(f"{legacy}: nonzero smoke exit; historical samples rejected")
+    manifests = {p for p in files if p.name.endswith("-meta.json")}
+    batches = set()
+    for path in files:
+        manifests.update(path.parent.glob("*-meta.json"))
+        for parent in path.parents:
+            batch = parent / "gtk-runs.json"
+            if batch.is_file():
+                batches.add(batch)
+                break
+    cached = {}
+    for batch_path in sorted(batches):
+        data = read_json(batch_path)
+        plan = canonical_plan(batch_path.parent, data, require_valid=True)
+        capture_ids = set()
+        by_label = {}
+        for item, target in plan:
+            manifest = target / "perf-meta.json"
+            if manifest.is_symlink() or not manifest.is_file() or hashlib.sha256(manifest.read_bytes()).hexdigest() != item["meta_sha256"]:
+                raise PerfError(f"{manifest}: changed or missing planned-run original")
+            meta, run = gtk_evidence(manifest)
+            if not meta.get("perf") or meta["capture_id"] in capture_ids:
+                raise PerfError(f"{manifest}: repeated or non-perf capture in declared batch")
+            capture_ids.add(meta["capture_id"])
+            cached[manifest] = (meta, run)
+            by_label.setdefault(item["label"], set()).add(manifest)
+        all_originals = set().union(*by_label.values())
+        selected = manifests & all_originals
+        if any(p.is_relative_to(batch_path.parent) and p not in all_originals for p in manifests):
+            raise PerfError(f"{batch_path}: selected original is not in the canonical plan")
+        for label, originals in by_label.items():
+            chosen = selected & originals
+            if chosen and chosen != originals:
+                raise PerfError(f"{batch_path}: {label} selected {len(chosen)}/{data['planned_runs']} planned runs; partial GTK subsets cannot be verified")
+    covered: set[Path] = set()
+    for manifest in sorted(manifests):
+        meta, run = cached[manifest] if manifest in cached else gtk_evidence(manifest)
+        if meta.get("perf"):
+            covered.update((manifest.parent / name).resolve() for name in meta.get("files", []))
+            samples.extend(run)
+    for path in files:
+        if path in covered or path.name.endswith("-meta.json") or path.name == "gtk-runs.json":
+            continue
         if path.name == "run.json":
-            try:
-                parse_run_json(json.loads(path.read_text(encoding="utf-8")), samples)
-            except (ValueError, OSError):
-                continue
+            parse_run_json(read_json(path), samples)
         else:
-            parse_text(path.read_text(encoding="utf-8", errors="replace"), samples)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if "valid: no" in text or ("# gx-wsl smoke --perf" in text and "finished: no" in text):
+                raise PerfError(f"{path}: explicitly rejected sample")
+            parsed = parse_text(text)
+            if parsed:
+                samples.unverified.add(str(path))
+                samples.extend(parsed)
     return samples
 
 
@@ -218,6 +406,9 @@ def summary_table(samples: Samples) -> tuple[str, dict]:
 
 def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", "new")) -> tuple[str, dict]:
     a, b = labels
+    for name in old.units.keys() & new.units.keys():
+        if old.units[name] != new.units[name]:
+            raise PerfError(f"metric {name}: time/count unit conflict")
     rows = [f"{'metric':<34} {'unit':<4} {a + ' n':>6} {a + ' med':>10} {a + ' p90':>10} "
             f"{b + ' n':>6} {b + ' med':>10} {b + ' p90':>10} {'Δ med':>10} {'Δ%':>7}"]
     report = {}
@@ -233,7 +424,7 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
         if left and right:
             delta = right["median"] - left["median"]
             percent = (delta / left["median"] * 100) if left["median"] else float("nan")
-            entry["delta_median"], entry["delta_percent"] = delta, percent
+            entry["delta_median"], entry["delta_percent"] = delta, percent if math.isfinite(percent) else None
             cells += [f"{('+' if delta >= 0 else '') + fmt(delta, unit):>10}",
                       f"{'n/a' if math.isnan(percent) else f'{percent:+.1f}':>7}"]
         else:
@@ -243,10 +434,40 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
     return "\n".join(rows) + "\n", report
 
 
+def comparison_errors(old: Samples, new: Samples, gtk: bool = False, runs: int | None = None) -> list[str]:
+    errors = []
+    if gtk or any(name.startswith("cpu.") for name in set(old.values) | set(new.values)):
+        for side, samples in (("old", old), ("new", new)):
+            for name in GTK_REQUIRED:
+                values = samples.values.get(name, [])
+                expected = runs if runs is not None else len(samples.values.get("cpu.main", []))
+                if not values or len(values) != expected or samples.units.get(name) != "ms" or any(value < 0 for value in values):
+                    errors.append(f"{side} {name}: requires {expected} time samples, got {len(values)}")
+    for name in sorted(set(old.values) | set(new.values)):
+        if not old.values.get(name) or not new.values.get(name):
+            errors.append(f"{name}: metric missing on one side")
+        elif len(old.values[name]) != len(new.values[name]):
+            errors.append(f"{name}: sample counts differ ({len(old.values[name])} vs {len(new.values[name])})")
+        elif old.units[name] != new.units[name]:
+            errors.append(f"{name}: time/count unit conflict")
+    return errors
+
+
+def validation(samples: Sequence[Samples]) -> dict:
+    return {"status": "valid", "identity": "unverified" if any(s.unverified for s in samples) else "verified",
+            "verified_gtk_runs": [len(s.gtk_runs) for s in samples],
+            "cpu_contract": "process/endpoint quantized ticks; residual bounds diagnostic-only and unproved" if any(s.gtk_runs for s in samples) else "unverified",
+            "unverified_files": sorted(set().union(*(s.unverified for s in samples)))}
+
+
 def write_json(path: Path | None, data: Mapping) -> None:
     if path is not None:
+        try:
+            text = json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        except ValueError as exc:
+            raise PerfError(f"{path}: non-finite report data: {exc}") from None
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        path.write_text(text, encoding="utf-8", newline="\n")
 
 
 def alternate(labels: Sequence[str], runs: int) -> list[tuple[int, str]]:
@@ -262,7 +483,7 @@ def labels_for(count: int, given: Sequence[str]) -> list[str]:
     if given and len(given) != count:
         raise PerfError(f"give one --label per build ({count}), got {len(given)}")
     labels = list(given) or (["old", "new"] if count == 2 else ["build"])
-    if len(set(labels)) != len(labels) or not all(re.fullmatch(r"[A-Za-z0-9._-]+", label) for label in labels):
+    if len(set(labels)) != len(labels) or not all(label not in (".", "..") and re.fullmatch(r"[A-Za-z0-9._-]+", label) for label in labels):
         raise PerfError("labels must be distinct and use letters, digits, '.', '_' or '-'")
     return labels
 
@@ -378,26 +599,143 @@ def run_gtk(args: argparse.Namespace) -> int:
         raise PerfError("give one or two --clone")
     labels = labels_for(len(clones), args.label)
     out = Path(args.out)
-    failures = 0
-    for run, label in alternate(labels, args.runs):
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise PerfError(f"{out}: GTK output must be new or empty; old evidence is never deleted")
+    out.mkdir(parents=True, exist_ok=True)
+    batch = {"schema": "gx-gtk-runs-v1", "planned_runs": args.runs, "labels": labels, "valid": False,
+             "warmup": "none (GTK has no automatic warm-up)", "order": "AB/BA",
+             "runs": [{"run": run, "label": label, "path": f"{label}/run-{run:02d}", "exit": None, "status": "pending"}
+                      for run, label in alternate(labels, args.runs)]}
+    write_json(out / "gtk-runs.json", batch)
+    print(f"{TAG} GTK: no automatic warm-up; planned {args.runs} runs per build, AB/BA", flush=True)
+    for item in batch["runs"]:
+        run, label = item["run"], item["label"]
         clone = clones[labels.index(label)]
-        target = out / label / f"run-{run:02d}"
+        target = out / item["path"]
         argv = ["--clone", clone, "smoke", "--perf", "--out", str(target), "--name", "perf"]
         for assignment in args.env:
             argv += ["--env", assignment]
         if args.distro:
             argv[:0] = ["--distro", args.distro]
         print(f"{TAG} {label} run {run}: gx_wsl.py {' '.join(argv)}", flush=True)
-        code = gx_wsl.main(argv)
-        failures += code != 0
-    return report_runs(out, labels, args.json) or (1 if failures else 0)
+        item["exit"] = gx_wsl.main(argv)
+        item["status"] = "completed" if item["exit"] == 0 else "failed"
+        write_json(out / "gtk-runs.json", batch)
+    return report_gtk_runs(out, batch, args.json)
+
+
+def canonical_plan(out: Path, batch: dict, require_valid: bool = False) -> list[tuple[dict, Path]]:
+    planned, labels, runs = batch.get("planned_runs"), batch.get("labels"), batch.get("runs")
+    if batch.get("schema") != "gx-gtk-runs-v1" or type(planned) is not int or planned < 1 or \
+            not isinstance(labels, list) or not 1 <= len(labels) <= 2 or \
+            labels_for(len(labels), labels) != labels or not isinstance(runs, list) or batch.get("order") != "AB/BA":
+        raise PerfError("malformed GTK canonical plan")
+    expected = alternate(labels, planned)
+    if len(runs) != len(expected):
+        raise PerfError("GTK plan length differs from planned_runs")
+    root = out.resolve()
+    paths = set()
+    result = []
+    for item, (run, label) in zip(runs, expected):
+        relative = f"{label}/run-{run:02d}"
+        if not isinstance(item, dict) or type(item.get("run")) is not int or \
+                (item.get("label"), item.get("run"), item.get("path")) != (label, run, relative):
+            raise PerfError("GTK plan is not the unique canonical AB/BA sequence")
+        target = root / label / f"run-{run:02d}"
+        resolved = target.resolve()
+        key = os.path.normcase(str(resolved))
+        if not resolved.is_relative_to(root) or (root / label).is_symlink() or target.is_symlink() or key in paths:
+            raise PerfError("GTK run path is not unique within owned output")
+        paths.add(key)
+        if require_valid and (batch.get("valid") is not True or item.get("exit") != 0 or item.get("status") != "valid" or
+                              not re.fullmatch(r"[0-9a-f]{64}", item.get("meta_sha256", ""))):
+            raise PerfError("incomplete or failed planned GTK runs")
+        result.append((item, target))
+    return result
+
+
+def report_gtk_runs(out: Path, batch: dict, json_path: Path | None) -> int:
+    try:
+        plan = canonical_plan(out, batch)
+    except PerfError as exc:
+        text = "GTK comparison rejected: " + str(exc) + "\n"
+        batch["valid"], batch["errors"] = False, [str(exc)]
+        write_json(out / "gtk-runs.json", batch)
+        write_json(out / "RESULT.json", {"validation": {"status": "rejected", "errors": [str(exc)]}})
+        write_json(json_path, {"validation": {"status": "rejected", "errors": [str(exc)]}})
+        (out / "SUMMARY.txt").write_text(text, encoding="utf-8")
+        print(text, end="")
+        return 1
+    sets = {label: Samples() for label in batch["labels"]}
+    identities = {}
+    captures = set()
+    errors = []
+    for item, target in plan:
+        try:
+            if item["exit"] != 0:
+                raise PerfError(f"run exit {item['exit']}")
+            manifest = target / "perf-meta.json"
+            digest = hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest.is_file() and not manifest.is_symlink() else ""
+            if not digest or item.get("meta_sha256", digest) != digest:
+                raise PerfError("missing or changed canonical run manifest")
+            meta, samples = gtk_evidence(manifest)
+            if not meta.get("perf"):
+                raise PerfError("not a GTK perf run")
+            if meta.get("capture_id") in captures:
+                raise PerfError("duplicate actual capture in GTK plan")
+            captures.add(meta.get("capture_id"))
+            item["meta_sha256"] = digest
+            signature = (meta["identity"]["sha256"], meta["version"], meta["commit"], meta["tree"], meta["dirty"],
+                         meta["effective_env"] | {"DISPLAY": None, "XDG_CONFIG_HOME": None, "XDG_STATE_HOME": None})
+            previous = identities.setdefault(item["label"], signature)
+            if previous != signature:
+                raise PerfError("build identity or effective environment changed within a label")
+            item["status"] = "valid"
+            sets[item["label"]].extend(samples)
+        except PerfError as exc:
+            item["status"], item["error"] = "rejected", str(exc)
+            errors.append(f"{item['label']} run {item['run']}: {exc}")
+    ordered = [sets[label] for label in batch["labels"]]
+    for label, samples in sets.items():
+        for name in GTK_REQUIRED:
+            if len(samples.values.get(name, [])) != batch["planned_runs"]:
+                errors.append(f"{label} {name}: {len(samples.values.get(name, []))}/{batch['planned_runs']} planned samples")
+    if len(ordered) == 2:
+        errors.extend(comparison_errors(*ordered, gtk=True, runs=batch["planned_runs"]))
+    batch["valid"] = not errors
+    batch["errors"] = errors
+    batch["valid_runs"] = {label: len(samples.gtk_runs) for label, samples in sets.items()}
+    write_json(out / "gtk-runs.json", batch)
+    result = {"validation": {"status": "rejected" if errors else "valid",
+                             "identity": "verified" if all(len(s.gtk_runs) == batch["planned_runs"] for s in ordered) else "incomplete",
+                             "renderer_path": "unknown", "performance_verdict": "not evaluated",
+                             "cpu_contract": "quantized process/endpoint ticks; residual bounds diagnostic-only and unproved",
+                             "planned_runs": batch["planned_runs"], "valid_runs": batch["valid_runs"], "errors": errors}}
+    if errors:
+        text = "GTK comparison rejected; no performance verdict.\n" + "\n".join(errors) + "\n"
+    else:
+        text, result["metrics"] = compare_table(*ordered, tuple(batch["labels"])) if len(ordered) == 2 else summary_table(ordered[0])
+    print(text, end="")
+    (out / "SUMMARY.txt").write_text(text, encoding="utf-8")
+    write_json(out / "RESULT.json", result)
+    write_json(json_path, result)
+    return (1 if any(ordered) or any(item["exit"] for item in batch["runs"]) else 2) if errors else 0
 
 
 def report_runs(out: Path, labels: Sequence[str], json_path: Path | None) -> int:
+    batch_path = out / "gtk-runs.json"
+    if batch_path.is_file():
+        return report_gtk_runs(out, read_json(batch_path), json_path)
     sets = [collect([out / label]) if (out / label).exists() else Samples() for label in labels]
     if not any(sets):
         print(f"{TAG} error: no samples in {out}", file=sys.stderr)
         return 2
+    if any(name.startswith("cpu.") for samples in sets for name in samples.values):
+        text = "GTK standard report rejected: missing planned-run manifest; identity unverified. Use compare for historical timing only.\n"
+        print(text, end="")
+        (out / "SUMMARY.txt").write_text(text, encoding="utf-8")
+        write_json(json_path, {"_validation": {"status": "rejected", "identity": "unverified", "errors": [text.strip()]}})
+        return 1
     if len(labels) == 2:
         text, report = compare_table(sets[0], sets[1], (labels[0], labels[1]))
     else:
@@ -461,15 +799,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{TAG} error: no samples in {', '.join(map(str, args.paths))}", file=sys.stderr)
                 return 2
             text, report = summary_table(samples)
+            report["_validation"] = validation([samples])
+            print(f"{TAG} identity: {report['_validation']['identity']} (summary is not a performance gate)")
             print(text, end="")
             write_json(args.json, report)
             return 0
         if args.command == "compare":
             old, new = collect(args.old), collect(args.new)
             if not old or not new:
-                print(f"{TAG} error: no samples on the {'old' if not old else 'new'} side", file=sys.stderr)
-                return 2
+                raise PerfError(f"no samples on the {'old' if not old else 'new'} side")
+            errors = comparison_errors(old, new)
+            if errors:
+                raise PerfError("comparison rejected: " + "; ".join(errors))
             text, report = compare_table(old, new)
+            report["_validation"] = validation([old, new])
+            print(f"{TAG} identity: {report['_validation']['identity']} (unverified history cannot prove the GTK gate)")
             print(text, end="")
             write_json(args.json, report)
             return 0
@@ -480,6 +824,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_gtk(args)
     except PerfError as exc:
         print(f"{TAG} error: {exc}", file=sys.stderr)
+        write_json(args.json, {"_validation": {"status": "rejected", "identity": "unverified", "errors": [str(exc)]}})
         return 2
 
 

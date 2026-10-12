@@ -19,6 +19,10 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
   build [--gtk] [ZIG BUILD ARGS...]
         python3 scripts/zigw.py build ...; --gtk adds -Dapp-runtime=gtk -fno-sys=gtk4-layer-shell
         (Ubuntu 24.04 has no gtk4-layer-shell development package, so it is built from pkg/).
+        Only normal installs certify an image. Query/help/list/custom-step or unknown arguments
+        write an ineligible attempt, with Zig output and exit status unchanged. Known valued options
+        such as --summary all and inline -j4 are supported; pinned Zig rejects separated -j 4.
+        build --help/-h queries Zig; --help before COMMAND shows this driver's help.
   test [--suite main|vt] [--gtk] [--filter TEXT]... [ZIG_TEST ARGS...]
         python3 scripts/zig_test.py; the main suite (default) gets -Dapp-runtime=none like the
         gx-ci linux-main job, or the GTK runtime flags with --gtk.
@@ -35,6 +39,11 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         first screenshot and writes PREFIX-perf.txt: the time to the window and of the workload,
         CPU time and page faults per Ghostty thread (from /proc/<pid>/task/*/stat) and the DMABUF
         warnings in the log, as `metric NAME VALUE [UNIT]` lines that scripts/gx_perf.py reads.
+        --perf requires actual ReleaseFast; ordinary GUI smoke still accepts Debug. PID/starttime/exe
+        and TID/starttime are guarded; process signals use an owned pidfd and unreaped Popen child.
+        Invalid/incomplete windows retain raw evidence but no accepted metrics. PREFIX-meta.json
+        records identity, source tree/dirty state, effective display environment and artifact hashes.
+        Existing evidence prefixes are refused, never overwritten.
   scenario --out DIR [SCENARIO...]
         Run the GTK scenarios test/gui/gtk/G*.toml (ids such as G01 or file paths; default
         all): each writes its config and xdotool script to DIR/<id>/, runs one smoke named
@@ -483,10 +492,173 @@ git checkout --quiet --detach "$sha"
 log "synced $clone to $(git log -1 --format='%h %s') from $label"
 """
 
+RECEIPT_PROGRAM = r'''
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BUILD_RECEIPT = Path(".local/gx-wsl/gtk-build-receipt.json")
+
+
+def image_info(path, digest=False):
+    with open(path, "rb") as handle:
+        stat = os.fstat(handle.fileno())
+        info = {"device": stat.st_dev, "inode": stat.st_ino, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        if digest:
+            sha = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha.update(chunk)
+            end = os.fstat(handle.fileno())
+            if (end.st_dev, end.st_ino, end.st_size, end.st_mtime_ns) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+                raise ValueError("executable changed while hashing")
+            info["sha256"] = sha.hexdigest()
+        return info
+
+
+def source_identity():
+    def git(*args):
+        return subprocess.check_output(["git", *args], text=True).strip()
+    dirty = git("status", "--porcelain", "--untracked-files=normal")
+    return {"commit": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}"),
+            "dirty": bool(dirty), "dirty_paths": dirty}
+
+
+def build_option(argv, key):
+    values = [arg.split("=", 1)[1] for arg in argv if arg.startswith("-D" + key + "=")]
+    return values[-1] if values else None
+
+
+def version_mode(version):
+    match = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\b", version)
+    return match.group(1) if match else "unknown"
+
+
+def build_kind(args):
+    if any(arg in ("-h", "--help", "-l", "--list-steps") for arg in args):
+        return "query"
+    values = {"--summary", "--color", "--seed", "--maxrss", "--sysroot", "--search-prefix", "--libc",
+              "--error-style", "--multiline-errors", "--debug-log", "--libc-runtimes", "--glibc-runtimes"}
+    flags = {"--verbose", "--verbose-link", "--verbose-cc", "--verbose-cimport", "--debug-pkg-config",
+             "--debug-compile-errors", "-fincremental", "-fno-incremental"}
+    steps = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg in values:
+            if index == len(args) or not args[index]:
+                return "unsupported"
+            value = args[index]
+            index += 1
+            if (arg == "--summary" and value not in ("all", "new", "failures", "line", "none")) or \
+                    (arg == "--color" and value not in ("auto", "on", "off")):
+                return "unsupported"
+        elif arg.startswith(("-Demit-", "-Dtarget=")):
+            return "custom"
+        elif arg.startswith("-D") and len(arg) > 2:
+            continue
+        elif arg.startswith(("-fsys=", "-fno-sys=")) and arg.rsplit("=", 1)[1]:
+            continue
+        elif re.fullmatch(r"-j\d+", arg) and 0 < int(arg[2:]) <= 0xffffffff:
+            continue
+        elif arg in flags:
+            continue
+        elif arg.startswith("-"):
+            return "unsupported"
+        else:
+            steps.append(arg)
+    return "install" if not steps or steps == ["install"] else "non-install"
+
+
+def validate_receipt(receipt, source, executable, version, version_exit):
+    if source.get("dirty") is not False or source.get("dirty_paths") != "" or \
+            any(not re.fullmatch(r"[0-9a-f]{40}", source.get(key, "")) for key in ("commit", "tree")):
+        raise ValueError("perf requires a clean committed source tree")
+    argv = receipt.get("build_argv", [])
+    if receipt.get("schema") != "gx-gtk-build-v1" or receipt.get("producer") != "gx_wsl.py build" or \
+            receipt.get("build_exit") != 0 or not isinstance(argv, list) or argv[:3] != ["python3", "scripts/zigw.py", "build"] or \
+            not all(isinstance(arg, str) for arg in argv) or build_option(argv, "optimize") != "ReleaseFast" or \
+            build_option(argv, "app-runtime") != "gtk":
+        raise ValueError("missing successful normal ReleaseFast GTK build receipt")
+    if build_kind(argv[3:]) != "install":
+        raise ValueError("build receipt does not describe the normal GTK install")
+    if receipt.get("source_before") != source or receipt.get("source_after") != source:
+        raise ValueError("source identity differs from build receipt")
+    if receipt.get("executable") != executable or receipt.get("version") != version or \
+            receipt.get("version_exit") != version_exit or version_exit != 0 or version_mode(version) != "ReleaseFast":
+        raise ValueError("actual executable/version differs from build receipt")
+    match = re.match(r"Ghostty (\S+)", version)
+    built_version = match.group(1) if match else ""
+    if not built_version.endswith("+" + source["commit"][:9]):
+        raise ValueError("binary version does not bind the source commit (unsafe version override)")
+    override = build_option(argv, "version-string")
+    if override is not None and override != built_version:
+        raise ValueError("version override differs from actual binary")
+    return receipt
+
+
+def build_main(argv):
+    args = argv[1:]
+    kind = build_kind(args)
+    standard_gtk = kind == "install" and build_option(args, "app-runtime") == "gtk"
+    receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_kind": kind,
+               "build_argv": ["python3", "scripts/zigw.py", "build", *args], "build_exit": None,
+               "started_realtime": time.time(), "perf_eligible": False}
+    lock = BUILD_RECEIPT.parent / "build.lock"
+    BUILD_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        print("[gx-wsl] error: own clone build is already in progress", file=sys.stderr)
+        return 1
+    try:
+        receipt["source_before"] = source_identity()
+        BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        if standard_gtk and build_option(args, "optimize") == "ReleaseFast" and receipt["source_before"]["dirty"]:
+            raise ValueError("perf build requires a clean committed source tree")
+        code = subprocess.run([sys.executable, "scripts/zigw.py", "build", *args], check=False).returncode
+        receipt["build_exit"] = code
+        if code != 0 or not standard_gtk:
+            return code
+        receipt["source_after"] = source_identity()
+        exe = str(Path("zig-out/bin/ghostty").resolve())
+        fd = os.open(exe, os.O_RDONLY)
+        try:
+            held = f"/proc/self/fd/{fd}"
+            receipt["executable"] = {"path": exe, **image_info(held, True)}
+            env = dict(os.environ, LD_LIBRARY_PATH=str(Path("zig-out/lib").resolve()))
+            env.pop("DISPLAY", None)
+            env.pop("WAYLAND_DISPLAY", None)
+            version = subprocess.run([held, "+version"], pass_fds=(fd,), env=env, capture_output=True, text=True, timeout=30)
+            receipt["version"], receipt["version_exit"] = version.stdout, version.returncode
+            if image_info(held, True) != {key: value for key, value in receipt["executable"].items() if key != "path"}:
+                raise ValueError("build image changed during version query")
+        finally:
+            os.close(fd)
+        if build_option(args, "optimize") == "ReleaseFast":
+            validate_receipt(receipt, receipt["source_after"], receipt["executable"], receipt["version"], receipt["version_exit"])
+            receipt["perf_eligible"] = True
+        print("[gx-wsl] build receipt: " + str(BUILD_RECEIPT), flush=True)
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        receipt["error"] = str(exc)
+        print("[gx-wsl] build receipt rejected: " + str(exc), file=sys.stderr)
+        return 1
+    finally:
+        receipt["finished_realtime"] = time.time()
+        BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        lock.rmdir()
+'''
+
 BUILD_BODY = r"""enter_clone
 prefetch || warn "some Zig packages could not be prefetched; zig build will try to fetch them itself"
 log "python3 scripts/zigw.py build $*"
-exec python3 scripts/zigw.py build "$@"
+normal_build "$@"
 """
 
 TEST_BODY = r"""enter_clone
@@ -526,12 +698,9 @@ require_ghostty() {
 }
 """
 
-# Runs inside WSL as `python3 - <tasks before> <tasks after> <times> <ghostty log>` and prints the
-# report of `smoke --perf`: per-thread CPU time and page faults of Ghostty across the workload
-# (threads grouped by name without a trailing -N, the main thread as "main"), the timings and the
-# log counters. Ghostty's own threads always get a `metric cpu.<group>` line, others only when busy.
 PERF_DELIMITER = "GX_WSL_PERF"
 PERF_PROGRAM = r"""
+import math
 import os
 import re
 import sys
@@ -542,25 +711,28 @@ DMABUF_WARNINGS = ("failed to export DMABUF", "failed to build dmabuf")
 
 
 def group_name(comm):
-    return re.sub(r"-\d+$", "", comm).replace(" ", "_") or "unnamed"
+    return re.sub(r"[^A-Za-z0-9_.:-]", "_", re.sub(r"-\d+$", "", comm)) or "unnamed"
 
 
 def parse_tasks(text):
     tasks = {}
     for line in text.splitlines():
-        tid, _, stat = line.partition("\t")
-        if "(" not in stat or ")" not in stat:
-            continue
+        tid, sep, stat = line.partition("\t")
+        tid = tid.strip()
+        if not sep or not tid.isdigit() or int(tid) <= 0 or tid in tasks or "(" not in stat or ")" not in stat:
+            raise ValueError("malformed or duplicate task stat: " + line)
+        if stat.split("(", 1)[0].strip() != tid:
+            raise ValueError("task stat TID mismatch: " + line)
         fields = stat[stat.rindex(")") + 1 :].split()
-        if len(fields) < 13:
-            continue
-        tasks[tid.strip()] = {
-            "comm": stat[stat.index("(") + 1 : stat.rindex(")")],
-            "minflt": int(fields[7]),
-            "majflt": int(fields[9]),
-            "utime": int(fields[11]),
-            "stime": int(fields[12]),
-        }
+        if len(fields) < 50 or fields[0] in ("Z", "X", "x"):
+            raise ValueError("partial or exited task stat: " + line)
+        task = {"comm": stat[stat.index("(") + 1 : stat.rindex(")")], "starttime": int(fields[19])}
+        task.update({key: int(fields[index]) for key, index in zip(COUNTERS, (11, 12, 7, 9))})
+        if task["starttime"] <= 0 or any(task[key] < 0 for key in COUNTERS):
+            raise ValueError("negative counters or missing task birth: " + tid)
+        tasks[tid] = task
+    if not tasks:
+        raise ValueError("no thread statistics")
     return tasks
 
 
@@ -574,66 +746,137 @@ def parse_times(text):
 
 
 def deltas(before, after, pid):
+    if pid not in before or pid not in after:
+        raise ValueError("missing main thread")
+    if set(before) != set(after):
+        raise ValueError(f"thread population changed: gone={sorted(set(before) - set(after))}, added={sorted(set(after) - set(before))}")
     groups = {}
+    names = {"main": "<main>", "total": "<process total>", "endpoint_threads": "<endpoint total>"}
     for tid, now in after.items():
-        then = before.get(tid, dict.fromkeys(COUNTERS, 0))
-        group = groups.setdefault("main" if tid == pid else group_name(now["comm"]), dict.fromkeys(("threads",) + COUNTERS, 0))
+        then = before[tid]
+        if (now["starttime"], now["comm"]) != (then["starttime"], then["comm"]):
+            raise ValueError("task identity changed: " + tid)
+        token = "main" if tid == pid else group_name(now["comm"])
+        base = "<main>" if tid == pid else re.sub(r"-\d+$", "", now["comm"])
+        if token in names and names[token] != base:
+            raise ValueError("thread metric token collision: " + token)
+        names[token] = base
+        group = groups.setdefault(token, dict.fromkeys(("threads",) + COUNTERS, 0))
         group["threads"] += 1
         for key in COUNTERS:
-            group[key] += now[key] - then[key]
-    return groups, sorted(set(before) - set(after), key=int)
+            change = now[key] - then[key]
+            if change < 0:
+                raise ValueError(f"negative {key} delta: {tid}")
+            group[key] += change
+    return groups, []
 
 
-def report(before_text, after_text, times_text, log_text, clk_tck):
+def measurement(before_text, after_text, times_text):
     times = parse_times(times_text)
-    groups, gone = deltas(parse_tasks(before_text), parse_tasks(after_text), times.get("pid", ""))
-    order = [name for name in FIRST if name in groups]
-    rest = [name for name in groups if name not in FIRST]
-    order += sorted(rest, key=lambda name: -(groups[name]["utime"] + groups[name]["stime"]))
-    total = {key: sum(group[key] for group in groups.values()) for key in ("threads",) + COUNTERS}
-    finished = times.get("workload_finished") == "1"
-    lines = [
-        "# gx-wsl smoke --perf",
-        "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
-        "finished: " + ("yes" if finished else "no (timed out or Ghostty exited)"),
-    ]
+    groups, _ = deltas(parse_tasks(before_text), parse_tasks(after_text), times.get("pid", ""))
+    if "renderer" not in groups:
+        raise ValueError("missing renderer thread")
+    if times.get("workload_finished") != "1":
+        raise ValueError("incomplete workload")
+    if times.get("run_exit", "0") != "0":
+        raise ValueError("nonzero run exit")
     for key in ("window_seconds", "workload_seconds"):
-        if key in times:
-            lines.append(f"metric {key} {float(times[key]):.3f} s")
+        value = float(times.get(key, "nan"))
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("missing or invalid " + key)
+    return groups
+
+
+def cpu_accounting(before_text, after_text, process_before, process_after, pid, clk_tck):
+    before, after = parse_tasks(before_text), parse_tasks(after_text)
+    deltas(before, after, pid)
+    if type(clk_tck) is not int or clk_tck <= 0:
+        raise ValueError("invalid CLK_TCK")
+    brackets = []
+    for sample in (process_before, process_after):
+        begin, end = sample["begin_ns"], sample["end_ns"]
+        if type(begin) is not int or type(end) is not int or begin < 0 or end < begin:
+            raise ValueError("invalid process/task snapshot read order")
+        low = parse_tasks(pid + "\t" + sample["pre_stat"])[pid]
+        high = parse_tasks(pid + "\t" + sample["post_stat"])[pid]
+        if any(task["starttime"] != before[pid]["starttime"] for task in (low, high)):
+            raise ValueError("process accounting identity changed")
+        if any(high[key] < low[key] for key in COUNTERS):
+            raise ValueError("process counter decreased within snapshot")
+        brackets.append((low, high))
+    if process_after["begin_ns"] < process_before["end_ns"]:
+        raise ValueError("overlapping process measurement endpoints")
+    total = {key: brackets[1][1][key] - brackets[0][1][key] for key in COUNTERS}
+    if any(value < 0 for value in total.values()):
+        raise ValueError("negative process counter delta")
+    endpoint = {key: sum(after[tid][key] - before[tid][key] for tid in before) for key in COUNTERS}
+    residual = {key: total[key] - endpoint[key] for key in ("utime", "stime")}
+    rounding = len(before) + len(after) + 2
+    skew = {key: sum(high[key] - low[key] for low, high in brackets) for key in residual}
+    bound = {key: rounding + skew[key] for key in residual}
+    return {"total_source": "process stat post-to-post (includes exited threads)",
+            "thread_population": "endpoint identities only; no full-lifetime population proof",
+            "comparison_contract": "quantized process/endpoint ticks; no full-population or rounding-bound guarantee",
+            "diagnostic_only": True, "bound_proof": "unproved for Linux adjusted CPU counters; not a sample-validity or benefit gate",
+            "clk_tck": clk_tck, "process_counters": total, "endpoint_counters": endpoint,
+            "residual_ticks": residual, "diagnostic_rounding_ticks_per_counter": rounding, "read_skew_ticks": skew,
+            "diagnostic_bound_ticks": bound, "diagnostic_within_bound": all(abs(residual[key]) <= bound[key] for key in residual),
+            "snapshot_durations_ns": [sample["end_ns"] - sample["begin_ns"] for sample in (process_before, process_after)],
+            "process_window_begin_ns": process_before["end_ns"], "process_window_end_ns": process_after["end_ns"]}
+
+
+def report(before_text, after_text, times_text, log_text, clk_tck, process_before=None, process_after=None):
+    times = parse_times(times_text)
+    lines = ["# gx-wsl smoke --perf",
+             "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
+             "finished: " + ("yes" if times.get("workload_finished") == "1" else "no")]
+    try:
+        groups = measurement(before_text, after_text, times_text)
+        if clk_tck <= 0:
+            raise ValueError("invalid CLK_TCK")
+        accounting = cpu_accounting(before_text, after_text, process_before, process_after, times["pid"], clk_tck) if process_before is not None else None
+    except (ValueError, KeyError, TypeError) as exc:
+        return "\n".join([*lines, "valid: no", "rejected: " + str(exc)]) + "\n"
+    lines += ["valid: yes (identity/build receipt must be checked in meta.json)",
+              "clock: realtime elapsed; window/done polling 50 ms; CPU includes the 1 s drain tail",
+              "population: endpoint identities only; transient population not proven",
+              "cpu.total: " + ("process aggregate including exited threads" if accounting else "unverified endpoint sum; no process reconciliation")]
+    order = [name for name in FIRST if name in groups]
+    order += sorted((name for name in groups if name not in FIRST), key=lambda name: -(groups[name]["utime"] + groups[name]["stime"]))
+    total = {key: sum(group[key] for group in groups.values()) for key in ("threads",) + COUNTERS}
+    if accounting:
+        endpoint_cpu = (total["utime"] + total["stime"]) / clk_tck
+        lines.append(f"metric cpu.endpoint_threads {endpoint_cpu:.3f} s")
+        total.update(accounting["process_counters"])
+        lines.append(f"diagnostic only: residual_ticks={accounting['residual_ticks']} candidate_bound_ticks={accounting['diagnostic_bound_ticks']} (Linux rounding proof missing; not a validity/benefit gate)")
+    for key in ("window_seconds", "workload_seconds"):
+        lines.append(f"metric {key} {float(times[key]):.3f} s")
     for name in order + ["total"]:
         group = total if name == "total" else groups[name]
-        ticks = group["utime"] + group["stime"]
-        if ticks or name in FIRST or name == "total":
-            lines.append(f"metric cpu.{name} {ticks / clk_tck:.3f} s")
+        lines.append(f"metric cpu.{name} {(group['utime'] + group['stime']) / clk_tck:.3f} s")
     lines.append(f"metric minflt.total {total['minflt']}")
     lines.append(f"metric majflt.total {total['majflt']}")
-    lines.append(f"metric dmabuf_warnings {sum(log_text.count(needle) for needle in DMABUF_WARNINGS)}")
+    lines.append(f"metric dmabuf_warnings {sum(any(needle in line for needle in DMABUF_WARNINGS) for line in log_text.splitlines())}")
     lines.append(f"metric gx_perf_lines {sum('(gx_perf):' in line for line in log_text.splitlines())}")
-    lines.append("")
-    lines.append(f"{'thread':<24} {'threads':>7} {'cpu_s':>8} {'user_s':>8} {'sys_s':>8} {'minflt':>9} {'majflt':>7}")
+    lines += ["", f"{'thread':<24} {'threads':>7} {'cpu_s':>8} {'user_s':>8} {'sys_s':>8} {'minflt':>9} {'majflt':>7}"]
     for name in order + ["total"]:
         group = total if name == "total" else groups[name]
-        cpu = (group["utime"] + group["stime"]) / clk_tck
-        lines.append(
-            f"{name:<24} {group['threads']:>7} {cpu:>8.3f} {group['utime'] / clk_tck:>8.3f} "
-            f"{group['stime'] / clk_tck:>8.3f} {group['minflt']:>9} {group['majflt']:>7}"
-        )
-    if gone:
-        lines.append(f"threads that exited during the workload (not counted): {', '.join(gone)}")
+        lines.append(f"{name:<24} {group['threads']:>7} {(group['utime'] + group['stime']) / clk_tck:>8.3f} "
+                     f"{group['utime'] / clk_tck:>8.3f} {group['stime'] / clk_tck:>8.3f} {group['minflt']:>9} {group['majflt']:>7}")
     return "\n".join(lines) + "\n"
 
 
 def main(argv):
-    texts = []
-    for path in argv[1:5]:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            texts.append(handle.read())
-    if not parse_tasks(texts[1]):
-        print("[gx-wsl] error: no thread statistics after the workload", file=sys.stderr)
-        return 1
-    clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-    sys.stdout.write(report(*texts, clk_tck))
-    return 0
+    try:
+        texts = []
+        for path in argv[1:5]:
+            with open(path, encoding="utf-8", errors="strict") as handle:
+                texts.append(handle.read())
+        result = report(*texts, os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError) as exc:
+        result = "valid: no\nrejected: " + str(exc) + "\n"
+    sys.stdout.write(result)
+    return 1 if "valid: no" in result else 0
 
 
 if __name__ == "__main__":
@@ -645,8 +888,278 @@ if __name__ == "__main__":
 PERF_WORKLOAD = r"""dir=${0%/*}
 while [ ! -e "$dir/go" ]; do sleep 0.05; done
 seq 1 3000000
-touch "$dir/done"
+result=$?
+printf '%s\n' "$result" >"$dir/workload-exit"
+[ "$result" -eq 0 ] && touch "$dir/done"
 exec sleep 3600
+"""
+
+SMOKE_PROGRAM = RECEIPT_PROGRAM.split("\ndef build_main(", 1)[0] + r"""
+import select
+import signal
+import uuid
+
+ENV_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "GDK_BACKEND", "GSK_RENDERER", "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER",
+            "MESA_LOADER_DRIVER_OVERRIDE", "MESA_GL_VERSION_OVERRIDE", "EGL_PLATFORM", "NO_AT_BRIDGE", "GHOSTTY_GX_PERF",
+            "LANG", "LC_ALL", "LANGUAGE", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_LIBRARY_PATH")
+
+
+def copy_evidence(source, target):
+    for path in sorted(Path(source).iterdir()):
+        with open(Path(target) / path.name, "xb") as handle:
+            handle.write(path.read_bytes())
+
+
+def process_identity(pid, digest=False):
+    root = Path("/proc") / str(pid)
+    task = parse_tasks(f"{pid}\t" + (root / "stat").read_text())[str(pid)]
+    return {"pid": pid, "starttime": task["starttime"], "exe": os.readlink(root / "exe"),
+            **image_info(root / "exe", digest)}
+
+
+def require_identity(pid, expected, pidfd, digest=False):
+    if select.select([pidfd], [], [], 0)[0]:
+        raise ValueError("controlled child exited")
+    identity = process_identity(pid, digest)
+    if any(identity.get(key) != value for key, value in expected.items() if key != "sha256" or digest):
+        raise ValueError("process identity changed")
+    return identity
+
+
+def stop_child(child, pidfd, meta):
+    if child is None:
+        return
+    if pidfd is None:
+        # Popen has never polled/waited: our unreaped direct child still owns this PID.
+        child.terminate()
+        meta["cleanup"] = "unreaped direct Popen child (pidfd_open failed)"
+    else:
+        try:
+            if "identity" not in meta:
+                raise ValueError("no launch identity")
+            current = require_identity(child.pid, meta["identity"], pidfd, True)
+            meta["identity_checks"].append({"stage": "cleanup", "realtime": time.time(), **current})
+            meta["cleanup_identity"] = "verified"
+        except (OSError, ValueError) as exc:
+            meta["errors"].append("cleanup: " + str(exc))
+            meta["cleanup_identity"] = "failed; owned pidfd only"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        meta["cleanup"] = "owned pidfd SIGTERM"
+    try:
+        meta["child_exit"] = child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if pidfd is None:
+            child.kill()
+        else:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        meta["cleanup"] += ", SIGKILL"
+        meta["errors"].append("child required forced cleanup")
+        meta["child_exit"] = child.wait(timeout=5)
+    if meta["child_exit"] not in (0, -signal.SIGTERM):
+        meta["errors"].append("unexpected child exit: " + str(meta["child_exit"]))
+    if pidfd is not None:
+        os.close(pidfd)
+
+
+def smoke_main(argv):
+    evidence, name, wait_seconds, xdo, settle, perf, work, screen, *extra = argv[1:]
+    evidence, work = Path(evidence), Path(work)
+    perf = perf == "1"
+    prefix = evidence / name
+    meta = {"schema": "gx-gtk-perf-v1", "perf": perf, "valid": False, "exit": 1, "errors": [],
+            "started_realtime": time.time(), "identity_checks": [], "workload_finished": False,
+            "effective_env": {key: os.environ.get(key) for key in ENV_KEYS}, "screen": screen,
+            "clock": "realtime elapsed; 50 ms polling; CPU includes 1 s drain tail", "warmup": "none",
+            "clk_tck": os.sysconf("SC_CLK_TCK"),
+            "renderer_evidence": {"egl": "unknown", "cpu_fallback": "unknown", "hardware": "unknown"}}
+    meta["capture_id"] = uuid.uuid4().hex
+    times = {}
+    child = pidfd = exe_fd = None
+    before = after = ""
+    process_before = process_after = None
+
+    def save(suffix, text):
+        (evidence / (name + suffix)).write_text(text, encoding="utf-8", newline="\n")
+
+    def guard(stage, digest=False):
+        current = require_identity(child.pid, meta["identity"], pidfd, digest)
+        if digest:
+            meta["identity_checks"].append({"stage": stage, "realtime": time.time(), **current})
+        return current
+
+    def checked(command, stage, check=True):
+        guard(stage + " before", stage == "xdotool script")
+        result = subprocess.run(command, capture_output=True, text=True, check=check, timeout=30)
+        guard(stage + " after", stage == "xdotool script")
+        return result
+
+    def capture(suffix):
+        checked(["scrot", str(prefix) + suffix], "screenshot " + suffix)
+        if (evidence / (name + suffix)).stat().st_size == 0:
+            raise ValueError("empty screenshot")
+
+    def snapshot(stage):
+        guard(stage + " before", True)
+        root = Path("/proc") / str(child.pid)
+        process = {"begin_ns": time.monotonic_ns(), "pre_stat": (root / "stat").read_text().strip()}
+        tids = sorted((root / "task").iterdir(), key=lambda p: int(p.name))
+        rows = []
+        for task in tids:
+            try:
+                stat = (task / "stat").read_text().strip()
+            except OSError:
+                stat = ""
+            rows.append(task.name + "\t" + stat)
+        process.update(post_stat=(root / "stat").read_text().strip(), end_ns=time.monotonic_ns())
+        text = "\n".join(rows) + "\n"
+        save("-tasks-" + stage + ".txt", text)
+        save("-process-" + stage + ".json", json.dumps(process, indent=2) + "\n")
+        save("-status-" + stage + ".txt", (root / "status").read_text())
+        if {p.name for p in (root / "task").iterdir()} != {p.name for p in tids}:
+            raise ValueError("thread population changed during snapshot")
+        guard(stage + " after", True)
+        parse_tasks(text)
+        return text, process
+
+    try:
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise ValueError("pidfd unavailable; refusing to launch")
+        probe = os.pidfd_open(os.getpid())
+        try:
+            signal.pidfd_send_signal(probe, 0)
+        finally:
+            os.close(probe)
+        meta.update(source_identity())
+        if perf and meta["dirty"]:
+            raise ValueError("perf requires a clean committed source tree")
+        exe = str(Path("zig-out/bin/ghostty").resolve())
+        exe_fd = os.open(exe, os.O_RDONLY)
+        held = f"/proc/self/fd/{exe_fd}"
+        meta["executable"] = {"path": exe, **image_info(held, True)}
+        version = subprocess.run([held, "+version"], pass_fds=(exe_fd,), capture_output=True, text=True, timeout=30)
+        save("-version.txt", version.stdout + version.stderr)
+        meta["version"] = version.stdout
+        meta["version_exit"] = version.returncode
+        mode = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\b", version.stdout)
+        meta["build_mode"] = mode.group(1) if mode else "unknown"
+        if version.returncode != 0 or (perf and meta["build_mode"] != "ReleaseFast"):
+            raise ValueError("perf requires verified ReleaseFast" if perf else "version failed")
+        if perf and os.environ.get("GHOSTTY_GX_PERF", "").strip().lower() not in ("1", "true", "on", "yes"):
+            raise ValueError("GHOSTTY_GX_PERF not enabled")
+        if perf:
+            if (BUILD_RECEIPT.parent / "build.lock").exists():
+                raise ValueError("normal build is still in progress")
+            receipt_text = BUILD_RECEIPT.read_text(encoding="utf-8")
+            receipt = json.loads(receipt_text)
+            source = {key: meta[key] for key in ("commit", "tree", "dirty", "dirty_paths")}
+            validate_receipt(receipt, source, meta["executable"], meta["version"], meta["version_exit"])
+            meta["build_receipt_sha256"] = hashlib.sha256(receipt_text.encode()).hexdigest()
+            save("-build-receipt.json", receipt_text)
+        command = [exe, "--gtk-single-instance=false", *extra]
+        if perf:
+            command += ["-e", "sh", str(work / "workload.sh")]
+        meta["command"] = command
+        times["launch_realtime"] = time.time()
+        with open(str(prefix) + ".log", "w") as log:
+            child = subprocess.Popen(command, executable=held, pass_fds=(exe_fd,), stdout=log, stderr=log)
+        pidfd = os.pidfd_open(child.pid)
+        identity = process_identity(child.pid, True)
+        meta["identity"] = identity
+        if any(identity[key] != value for key, value in meta["executable"].items() if key != "path"):
+            raise ValueError("launch executable mismatch")
+        times["pid"] = child.pid
+        guard("launch", True)
+        deadline = time.monotonic() + float(wait_seconds)
+        window = ""
+        while time.monotonic() < deadline:
+            found = checked(["xdotool", "search", "--onlyvisible", "--pid", str(child.pid)], "window search", False)
+            if found.returncode == 0 and found.stdout.strip():
+                window = found.stdout.splitlines()[0]
+                owner = checked(["xdotool", "getwindowpid", window], "window owner")
+                if owner.stdout.strip() != str(child.pid):
+                    raise ValueError("window PID mismatch")
+                break
+            time.sleep(0.05)
+        if not window:
+            raise ValueError("no visible window within " + wait_seconds + " s")
+        meta["window"] = window
+        times["window_seconds"] = time.time() - times["launch_realtime"]
+        time.sleep(float(settle))
+        capture(".png")
+        if perf:
+            before, process_before = snapshot("before")
+            times["workload_begin_realtime"] = time.time()
+            (work / "go").touch()
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                guard("workload")
+                if (work / "done").exists():
+                    meta["workload_finished"] = True
+                    break
+                time.sleep(0.05)
+            times["workload_end_realtime"] = time.time()
+            times["workload_seconds"] = times["workload_end_realtime"] - times["workload_begin_realtime"]
+            times["workload_finished"] = int(meta["workload_finished"])
+            meta["workload_exit"] = (work / "workload-exit").read_text().strip() if (work / "workload-exit").exists() else None
+            if meta["workload_exit"] != "0":
+                raise ValueError("workload failed or exit unavailable")
+            time.sleep(1)
+            after, process_after = snapshot("after")
+            times["cpu_end_realtime"] = time.time()
+            capture("-perf.png")
+            measurement(before, after, "\n".join(f"{key} {value}" for key, value in times.items()))
+            meta["cpu_accounting"] = cpu_accounting(before, after, process_before, process_after, str(child.pid), meta["clk_tck"])
+        if xdo:
+            checked(["xdotool", xdo, str(child.pid)], "xdotool script")
+            time.sleep(1)
+            capture("-after.png")
+        guard("finished", True)
+        if perf:
+            meta["source_end"] = source_identity()
+            if BUILD_RECEIPT.read_text(encoding="utf-8") != receipt_text:
+                raise ValueError("normal build receipt changed during smoke")
+            validate_receipt(receipt, meta["source_end"], meta["executable"], meta["version"], meta["version_exit"])
+        meta["exit"] = 0
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        meta["errors"].append(str(exc))
+    except KeyboardInterrupt:
+        meta["errors"].append("interrupted")
+    finally:
+        try:
+            stop_child(child, pidfd, meta)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            meta["errors"].append("cleanup failed: " + str(exc))
+        if exe_fd is not None:
+            os.close(exe_fd)
+        if meta["errors"]:
+            meta["exit"] = 1
+        meta["valid"] = meta["exit"] == 0
+        meta["finished_realtime"] = time.time()
+        times["run_exit"] = meta["exit"]
+        times_text = "\n".join(f"{key} {value}" for key, value in times.items()) + "\n"
+        save("-times.txt", times_text)
+        log_path = evidence / (name + ".log")
+        log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
+        meta["renderer_evidence"]["runtime_log_lines"] = [line for line in log_text.splitlines()
+            if any(token in line.lower() for token in ("opengl", "egl", "dmabuf", "llvmpipe", "cpu presentation"))]
+        if perf:
+            save("-perf.txt", report(before, after, times_text, log_text, os.sysconf("SC_CLK_TCK"), process_before, process_after))
+        meta["files"] = sorted(p.name for p in evidence.iterdir())
+        meta["artifact_sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence.iterdir()}
+        save("-meta.txt", "\n".join(f"{key}: {value}" for key, value in meta.items() if key not in ("renderer_evidence", "files")) + "\n")
+        save("-meta.json", json.dumps(meta, indent=2) + "\n")
+    print("[gx-wsl] " + ("smoke passed" if meta["valid"] else "smoke rejected: " + "; ".join(meta["errors"])), flush=True)
+    return meta["exit"]
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--copy"]:
+        copy_evidence(sys.argv[2], sys.argv[3])
+    else:
+        sys.exit(smoke_main(sys.argv))
 """
 
 SMOKE_BODY = r"""out_win=$1
@@ -668,8 +1181,14 @@ for tool in xvfb-run xauth scrot xdotool; do
   command -v "$tool" >/dev/null || die "$tool is not installed; run: python scripts/gx_wsl.py setup --apt" 2
 done
 out=$(wslpath -u "$out_win")
+mkdir -p "$out"
+if compgen -G "$out/$name*" >/dev/null; then die "evidence prefix already exists in $out; use a new directory" 2; fi
+lock=$out/.gx-wsl-$name
+mkdir "$lock" || die "evidence prefix is already in use: $out/$name" 2
 work=$(mktemp -d "${TMPDIR:-/tmp}/gx-wsl-smoke.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+keep_work=0
+trap '[ "$keep_work" = 1 ] || rm -rf "$work"; rmdir "$lock"' EXIT
+if compgen -G "$out/$name*" >/dev/null; then die "evidence prefix appeared while acquiring lock: $out/$name" 2; fi
 evidence=$work/evidence
 mkdir -p "$evidence"
 xdo=
@@ -678,6 +1197,7 @@ if [ -n "$xdotool_win" ]; then
   sed 's/\r$//' "$(wslpath -u "$xdotool_win")" >"$xdo"
 fi
 prepare_config "$work" "$config_win"
+export XDG_STATE_HOME=$work/xdg-state
 apply_lang "$lang" "$language"
 export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
 export LD_LIBRARY_PATH=$clone/zig-out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -687,157 +1207,18 @@ if [ "$perf" = 1 ]; then
   printf '%s' "$workload" >"$work/workload.sh"
 fi
 while IFS= read -r assignment; do
-  if [ -n "$assignment" ]; then
-    export "$assignment"
-  fi
+  if [ -n "$assignment" ]; then export "$assignment"; fi
 done <<<"$env_spec"
-env -u DISPLAY ./zig-out/bin/ghostty +version >"$evidence/$name-version.txt" 2>&1
-session=$(cat <<'GX_WSL_SESSION'
-evidence=$1
-name=$2
-wait_seconds=$3
-xdo=$4
-settle=$5
-perf=$6
-work=$7
-shift 7
-alive() {
-  local state
-  state=$(awk '/^State:/ {print $2}' "/proc/$1/status" 2>/dev/null || true)
-  [ -n "$state" ] && [ "$state" != Z ]
-}
-now() { date +%s.%N; }
-elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
-started=$(now)
-if [ "$perf" = 1 ]; then
-  ./zig-out/bin/ghostty --gtk-single-instance=false "$@" -e sh "$work/workload.sh" >"$evidence/$name.log" 2>&1 &
-else
-  ./zig-out/bin/ghostty --gtk-single-instance=false "$@" >"$evidence/$name.log" 2>&1 &
-fi
-pid=$!
-printf 'pid %s\n' "$pid" >"$work/times"
-# Poll every 50 ms: xdotool's own sync mode sleeps 0.5 s between searches, too coarse for window_seconds.
-window=
-tries=$(awk -v s="$wait_seconds" 'BEGIN { printf "%d", s * 20 + 1 }')
-for _ in $(seq 1 "$tries"); do
-  found=$(xdotool search --onlyvisible --pid "$pid" 2>/dev/null) || found=
-  window=${found%%$'\n'*}
-  if [ -n "$window" ] || ! alive "$pid"; then
-    break
-  fi
-  sleep 0.05
-done
-if [ -z "$window" ]; then
-  scrot "$evidence/$name.png" 2>/dev/null || true
-  if alive "$pid"; then
-    printf '[gx-wsl] error: ghostty showed no window within %ss; see %s.log\n' "$wait_seconds" "$name" >&2
-    kill "$pid" 2>/dev/null || true
-  else
-    printf '[gx-wsl] error: ghostty exited before showing a window; see %s.log\n' "$name" >&2
-  fi
-  wait "$pid" || true
+write_smoke_program >"$work/session.py"
+status=0
+xvfb-run --auto-servernum --server-args="-screen 0 $screen" python3 "$work/session.py" \
+  "$evidence" "$name" "$wait_seconds" "$xdo" "$settle" "$perf" "$work" "$screen" "$@" || status=$?
+if ! python3 "$work/session.py" --copy "$evidence" "$out"; then
+  keep_work=1
+  warn "evidence copy failed; original raw retained in $evidence"
   exit 1
 fi
-printf 'window_seconds %s\n' "$(elapsed "$started" "$(now)")" >>"$work/times"
-sleep "$settle"
-if ! alive "$pid"; then
-  wait "$pid" || true
-  printf '[gx-wsl] error: ghostty exited before the screenshot; see %s.log\n' "$name" >&2
-  exit 1
-fi
-scrot "$evidence/$name.png"
-status=0
-if [ "$perf" = 1 ]; then
-  snapshot() {
-    local task
-    for task in /proc/"$pid"/task/*; do
-      printf '%s\t%s\n' "${task##*/}" "$(cat "$task/stat" 2>/dev/null || true)"
-    done
-  }
-  snapshot >"$evidence/$name-tasks-before.txt"
-  begin=$(now)
-  touch "$work/go"
-  finished=0
-  for _ in $(seq 1 6000); do
-    if [ -e "$work/done" ]; then
-      finished=1
-      break
-    fi
-    alive "$pid" || break
-    sleep 0.05
-  done
-  printf 'workload_seconds %s\nworkload_finished %s\n' "$(elapsed "$begin" "$(now)")" "$finished" >>"$work/times"
-  sleep 1
-  if alive "$pid"; then
-    snapshot >"$evidence/$name-tasks-after.txt"
-    scrot "$evidence/$name-perf.png"
-  fi
-  if [ "$finished" != 1 ]; then
-    printf '[gx-wsl] error: the perf workload did not finish; see %s.log\n' "$name" >&2
-    status=1
-  fi
-fi
-if [ -n "$xdo" ]; then
-  if ! xdotool "$xdo" "$pid"; then
-    printf '[gx-wsl] error: the xdotool script failed\n' >&2
-    status=1
-  fi
-  sleep 1
-  scrot "$evidence/$name-after.png"
-fi
-kill "$pid" 2>/dev/null || true
-wait "$pid" || true
-[ "$status" -eq 0 ] || exit 1
-test -s "$evidence/$name.png"
-GX_WSL_SESSION
-)
-started=$(date +%s)
-status=0
-xvfb-run --auto-servernum --server-args="-screen 0 $screen" bash -euo pipefail -c "$session" smoke \
-  "$evidence" "$name" "$wait_seconds" "$xdo" "$settle" "$perf" "$work" "$@" || status=$?
-if [ "$perf" = 1 ]; then
-  if [ -s "$evidence/$name-tasks-after.txt" ]; then
-    perf_report "$evidence/$name-tasks-before.txt" "$evidence/$name-tasks-after.txt" "$work/times" \
-      "$evidence/$name.log" >"$evidence/$name-perf.txt" || status=1
-  else
-    warn "no thread statistics after the perf workload"
-    if [ "$status" -eq 0 ]; then status=1; fi
-  fi
-fi
-extra_args=
-if [ $# -gt 0 ]; then
-  extra_args=$(printf ' %q' "$@")
-fi
-if [ "$perf" = 1 ]; then
-  extra_args="$extra_args -e sh workload.sh"
-fi
-window_seconds=$(awk '$1 == "window_seconds" {print $2}' "$work/times" 2>/dev/null || true)
-{
-  printf 'commit: %s\n' "$(git log -1 --format='%H %s')"
-  printf 'started: %s\n' "$(date -u -d "@$started" +%Y-%m-%dT%H:%M:%SZ)"
-  printf 'seconds: %s\n' "$(($(date +%s) - started))"
-  printf 'exit: %s\n' "$status"
-  printf 'display: xvfb-run -screen 0 %s, GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1\n' "$screen"
-  printf 'wait: a visible window within %ss (xdotool search every 50 ms), then %ss before the screenshot\n' \
-    "$wait_seconds" "$settle"
-  printf 'window: %s\n' "${window_seconds:-none}${window_seconds:+s after start}"
-  printf 'lang: %s\n' "${lang:-inherited (${LANG:-unset})}"
-  printf 'config: %s\n' "${config_win:-none}"
-  printf 'env: %s\n' "$(printf '%s' "$env_spec" | paste -sd' ' -)"
-  if [ "$perf" = 1 ]; then
-    printf 'perf: seq 1 3000000 workload, GHOSTTY_GX_PERF=1\n'
-  else
-    printf 'perf: off\n'
-  fi
-  printf 'xdotool: %s\n' "${xdotool_win:-none}"
-  printf 'ghostty args: --gtk-single-instance=false%s\n' "$extra_args"
-} >"$evidence/$name-meta.txt"
-mkdir -p "$out"
-cp -f "$evidence"/* "$out"/
-for file in "$evidence"/*; do
-  log "evidence: $(wslpath -w "$out/${file##*/}")"
-done
-if [ "$status" -eq 0 ]; then log "smoke passed"; else warn "smoke failed with exit $status"; fi
+for file in "$evidence"/*; do log "evidence: $(wslpath -w "$out/${file##*/}")"; done
 exit "$status"
 """
 
@@ -934,6 +1315,16 @@ def perf_function() -> str:
     )
 
 
+def build_function() -> str:
+    return "normal_build() {\npython3 - \"$@\" <<'GX_WSL_BUILD'\n" + RECEIPT_PROGRAM.strip() + "\nsys.exit(build_main(sys.argv))\nGX_WSL_BUILD\n}\n"
+
+
+def smoke_function() -> str:
+    program = PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + SMOKE_PROGRAM
+    program = "\n".join(re.sub(r"^(?:    )+", lambda m: "  " * (len(m[0]) // 4), line) for line in program.splitlines())
+    return "write_smoke_program() {\ncat <<'GX_WSL_SESSION'\n" + program.strip() + "\nGX_WSL_SESSION\n}\n"
+
+
 def compose(*parts: str) -> str:
     return "\n".join(part.rstrip("\n") for part in parts) + "\n"
 
@@ -983,7 +1374,7 @@ def build_args(gtk: bool, extra: Sequence[str]) -> list[str]:
 
 
 def build_invocation(clone: str, gtk: bool, extra: Sequence[str]) -> Invocation:
-    return Invocation(compose(PRELUDE, prefetch_function(), BUILD_BODY), (clone, *build_args(gtk, extra)))
+    return Invocation(compose(PRELUDE, prefetch_function(), build_function(), BUILD_BODY), (clone, *build_args(gtk, extra)))
 
 
 def zig_test_args(suite: str, gtk: bool, filters: Sequence[str], extra: Sequence[str]) -> list[str]:
@@ -1022,6 +1413,8 @@ def env_assignments(values: Sequence[str]) -> str:
             raise GxWslError(f"--env takes NAME=VALUE with a shell variable name, got {value!r}")
         if "\n" in rest or "\r" in rest or "\0" in rest:
             raise GxWslError(f"--env values must be a single line, got {value!r}")
+        if name in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_CONFIG_HOME", "XDG_STATE_HOME") or (name == "GDK_BACKEND" and rest != "x11"):
+            raise GxWslError(f"--env cannot override smoke isolation: {name}")
         lines.append(value)
     return "\n".join(lines)
 
@@ -1057,7 +1450,7 @@ def smoke_invocation(
         PERF_WORKLOAD,
         *ghostty_args,
     )
-    return Invocation(compose(PRELUDE, GHOSTTY_HELPERS, perf_function(), SMOKE_BODY), args)
+    return Invocation(compose(PRELUDE, GHOSTTY_HELPERS, smoke_function(), SMOKE_BODY), args)
 
 
 def run_invocation(clone: str, *, lang: str | None, config: str | None, x11: bool, ghostty_args: Sequence[str]) -> Invocation:
@@ -1271,7 +1664,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("target", nargs="?", help="worktree directory or ref (default: this worktree)")
     sync.add_argument("--dirty", action="store_true", help="include the worktree's uncommitted and untracked files")
 
-    build = commands.add_parser("build", parents=[common], allow_abbrev=False, help="zig build in the clone (other arguments pass through)")
+    build = commands.add_parser("build", parents=[common], add_help=False, allow_abbrev=False,
+                                help="zig build in the clone (including -h/--help query arguments)")
     build.add_argument("--gtk", action="store_true", help="add " + " ".join(GTK_BUILD_ARGS))
 
     test = commands.add_parser("test", parents=[common], allow_abbrev=False, help="scripts/zig_test.py in the clone (other arguments pass through)")

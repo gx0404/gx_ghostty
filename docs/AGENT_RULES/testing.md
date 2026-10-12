@@ -72,6 +72,7 @@
 - 流程以 `src/benchmark/AGENTS.md` 为准：先生成数据，再对同一份文件测；同一台机器上不并行跑多个基准。
 - `ghostty-gen` 的通用入口以当前时间为种子（`src/synthetic/cli.zig::mainActionImpl`），只有 `+styled` 与 `+utf8` 接受 `--seed`。可复现的数据要么用这两个生成器加固定种子，要么生成一次保存后复用。生成器无限输出，用 `head -c <字节数>` 截断，大语料放仓库外。
 - 动作名带 `+` 前缀，如 `ghostty-gen +styled --seed=42`、`ghostty-bench +terminal-stream --data=<文件>`。
+- GTK 性能真源是 `gx_wsl.py::SMOKE_PROGRAM/PERF_PROGRAM` 与 `gx_perf.py::gtk_evidence/report_gtk_runs`；证据 schema、拒绝条件与补验入口见 `docs/TESTING.md`「耗时度量与基线」。普通 Debug GUI smoke 与实际 ReleaseFast 性能样本分开。正常 install receipt 绑定干净源树与实际映像；query/未知 argv 不签收，合法带值选项按钉版 parser 消耗。保留完整 canonical AB/BA planned_runs，不验部分选择。CPU total 用含退出线程的进程累计，线程指标仅端点量化计数；差额/候选界 diagnostic-only，Linux舍入推导未证，不作有效性/收益门。不滤补 n、不把历史 unverified 汇总写成性能门。渲染路径须有专门运行证据，环境与 Xvfb/Mesa 名称不代证；未知字段记 unknown。
 
 ### esctest、valgrind 与手测
 
