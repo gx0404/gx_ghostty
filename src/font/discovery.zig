@@ -260,7 +260,7 @@ pub const Fontconfig = struct {
         self.fc_config.destroy();
     }
 
-    // fork(gx): GX-0031 begin: raw same-family traits before Fontconfig render preparation
+    // fork(gx): GX-0038 begin: raw same-family traits before Fontconfig render preparation
     pub fn discoverMappedFamily(
         self: *const Fontconfig,
         alloc: Allocator,
@@ -271,7 +271,7 @@ pub const Fontconfig = struct {
     ) !@import("../gx/font_codepoint_map.zig").Batch {
         return try @import("../gx/font_map_fontconfig.zig").discover(self.fc_config, alloc, library, desc, family, style);
     }
-    // fork(gx): GX-0031 end
+    // fork(gx): GX-0038 end
 
     /// Discover fonts from a descriptor. This returns an iterator that can
     /// be used to build up the deferred fonts.

@@ -146,9 +146,9 @@ pub fn ref(
             .styles = styles,
             .discover = try self.discover(),
             .codepoint_map = key.codepoint_map,
-            // fork(gx): GX-0031 begin: immutable mapped-font policy for this grid
+            // fork(gx): GX-0038 begin: immutable mapped-font policy for this grid
             .descriptor_cache = .{ .policy = key.font_policy },
-            // fork(gx): GX-0031 end
+            // fork(gx): GX-0038 end
         };
     });
     errdefer grid.deinit(self.alloc);
@@ -578,9 +578,9 @@ pub const Key = struct {
     /// The codepoint map configuration.
     codepoint_map: CodepointMap = .{},
 
-    // fork(gx): GX-0031 begin: enabled styles and independent synthetic switches
+    // fork(gx): GX-0038 begin: enabled styles and independent synthetic switches
     font_policy: @import("../gx/font_codepoint_map.zig").Policy = .{},
-    // fork(gx): GX-0031 end
+    // fork(gx): GX-0038 end
 
     /// The metric modifier set configuration.
     metric_modifiers: Metrics.ModifierSet = .{},
@@ -715,9 +715,9 @@ pub const Key = struct {
                 bold_italic_offset,
             },
             .codepoint_map = codepoint_map,
-            // fork(gx): GX-0031 begin: share only grids with the same style policy
+            // fork(gx): GX-0038 begin: share only grids with the same style policy
             .font_policy = @import("../gx/font_codepoint_map.zig").Policy.fromConfig(config),
-            // fork(gx): GX-0031 end
+            // fork(gx): GX-0038 end
             .metric_modifiers = metric_modifiers,
             .font_size = font_size,
             .freetype_load_flags = if (font.face.FreetypeLoadFlags != void)
@@ -752,9 +752,9 @@ pub const Key = struct {
         autoHash(hasher, self.descriptors.len);
         for (self.descriptors) |d| d.hash(hasher);
         self.codepoint_map.hash(hasher);
-        // fork(gx): GX-0031 begin: synthetic and disabled styles affect resolver results
+        // fork(gx): GX-0038 begin: synthetic and disabled styles affect resolver results
         autoHash(hasher, @as(u8, @bitCast(self.font_policy)));
-        // fork(gx): GX-0031 end
+        // fork(gx): GX-0038 end
         autoHash(hasher, self.metric_modifiers.count());
         autoHash(hasher, self.freetype_load_flags);
         if (self.metric_modifiers.count() > 0) {

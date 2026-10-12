@@ -92,7 +92,7 @@ pub fn deinit(self: *CodepointResolver, alloc: Allocator) void {
 ///      cannot be disabled, but it can be replaced with a stylized font
 ///      face.
 ///
-// fork(gx): GX-0031 mapped styles stay in the resolved family
+// fork(gx): GX-0038 mapped styles stay in the resolved family
 ///   2. If there is a codepoint override, prefer a real face of the requested
 ///      style in its resolved family, then permitted synthetic traits, then
 ///      that family's regular face. Mappings accept any presentation.
@@ -132,7 +132,7 @@ pub fn getIndex(
     }
 
     // Codepoint overrides.
-    // fork(gx): GX-0031 pass the enabled request style to codepoint mappings
+    // fork(gx): GX-0038 pass the enabled request style to codepoint mappings
     if (self.getIndexCodepointOverride(alloc, cp, style)) |idx_| {
         if (idx_) |idx| return idx;
     } else |err| {
@@ -160,7 +160,7 @@ pub fn getIndex(
     };
 
     // If we can find the exact value, then return that.
-    // fork(gx): GX-0031 exclude mapping-private indices from ordinary fallback
+    // fork(gx): GX-0038 exclude mapping-private indices from ordinary fallback
     if (self.descriptor_cache.getOrdinaryIndex(&self.collection, cp, style, p_mode)) |value| return value;
 
     // If we're not a regular font style, try looking for a regular font
@@ -228,13 +228,13 @@ pub fn getIndex(
     if (style == .regular and p_mode == .any) return null;
 
     // For non-regular fonts, we fall back to regular with any presentation
-    // fork(gx): GX-0031 mapping-private faces also stay out of the last-resort search
+    // fork(gx): GX-0038 mapping-private faces also stay out of the last-resort search
     return self.descriptor_cache.getOrdinaryIndex(&self.collection, cp, .regular, .{ .any = {} });
 }
 
 /// Checks if the codepoint is in the map of codepoint overrides,
 /// finds the override font, and returns it.
-// fork(gx): GX-0031 delegate mapped-family style discovery and owned synthesis
+// fork(gx): GX-0038 delegate mapped-family style discovery and owned synthesis
 fn getIndexCodepointOverride(
     self: *CodepointResolver,
     alloc: Allocator,
@@ -308,7 +308,7 @@ pub const StyleStatus = std.EnumArray(Style, bool);
 /// for a regular style. That's just an inefficient choice made now because
 /// the implementation is simpler and codepoint maps matching a regular
 /// font is a rare case.
-// fork(gx): GX-0031 content-keyed per-style mapping cache owns discovery sources
+// fork(gx): GX-0038 content-keyed per-style mapping cache owns discovery sources
 const DescriptorCache = @import("../gx/font_codepoint_map.zig").State;
 
 test getIndex {

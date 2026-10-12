@@ -1080,7 +1080,7 @@ class Gx0030ShapeTests(unittest.TestCase):
         self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
 
 
-class Gx0031ShapeTests(unittest.TestCase):
+class Gx0038ShapeTests(unittest.TestCase):
     def test_mapping_style_and_cache_are_thin_hooks(self):
         source = (ROOT / "src/font/CodepointResolver.zig").read_text(encoding="utf-8")
         self.assertIn("self.getIndexCodepointOverride(alloc, cp, style)", source)
@@ -1098,16 +1098,16 @@ class Gx0031ShapeTests(unittest.TestCase):
         for line in ("if (self.getIndexCodepointOverride(alloc, cp, style))", "fn getIndexCodepointOverride(", "const DescriptorCache ="):
             lines = source.splitlines()
             pos = next(i for i, text in enumerate(lines) if line in text)
-            self.assertIn("fork(gx): GX-0031", lines[pos - 1])
+            self.assertIn("fork(gx): GX-0038", lines[pos - 1])
 
     def test_fontconfig_and_grid_additions_have_closed_hunks(self):
         expected = {"src/font/discovery.zig": 1, "src/font/SharedGridSet.zig": 4}
         patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
         for path, count in expected.items():
             with self.subTest(path=path):
-                self.assertIn(Patch("GX-0031", path, "fork(gx): GX-0031", "active"), patches)
+                self.assertIn(Patch("GX-0038", path, "fork(gx): GX-0038", "active"), patches)
                 source = (ROOT / path).read_text(encoding="utf-8")
-                stripped, hunks = marked_hunks(source, "GX-0031")
+                stripped, hunks = marked_hunks(source, "GX-0038")
                 self.assertEqual(len(hunks), count)
                 self.assertNotIn("font_policy", stripped)
                 self.assertNotIn("discoverMappedFamily", stripped)
