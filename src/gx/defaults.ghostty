@@ -6,12 +6,9 @@
 theme = GX Mocha
 language = zh-CN
 
-# The first family that exists sets the cell metrics, so only monospace
-# families belong here; a missing family falls through to the embedded
-# JetBrains Mono. CJK text is routed through font-codepoint-map instead, and
-# falls back to system font discovery when that family is not installed.
-font-family = JetBrainsMono Nerd Font
-font-codepoint-map = U+2E80-U+2FDF,U+3000-U+303F,U+3040-U+30FF,U+3100-U+312F,U+3190-U+31FF,U+3400-U+4DBF,U+4E00-U+9FFF,U+F900-U+FAFF,U+FE30-U+FE4F,U+FF00-U+FFEF=Noto Sans CJK SC
+# GTK uses the embedded font chain; Windows adds its monospace family.
+# CJK routing applies only without a user font-family in any higher layer.
+font-codepoint-map = U+2E80-U+2FDF,U+3000-U+303F,U+3040-U+30FF,U+3100-U+312F,U+3190-U+31FF,U+3200-U+33FF,U+3400-U+4DBF,U+4E00-U+9FFF,U+F900-U+FAFF,U+FE10-U+FE1F,U+FE30-U+FE4F,U+FF00-U+FFEF=Noto Sans CJK SC
 font-size = 12
 
 window-padding-x = 10
@@ -21,6 +18,7 @@ window-padding-balance = true
 cursor-style = block
 cursor-style-blink = true
 
+mouse-hide-while-typing = true
 right-click-action = context-menu
 confirm-close-surface = true
 gx-herdr-app-mode = true

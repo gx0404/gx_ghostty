@@ -295,8 +295,13 @@ pub const Application = extern struct {
         gtk_version.logVersion();
         adw_version.logVersion();
 
+        // fork(gx): GX-0034 begin: retain the startup configuration layers until GTK initializes
+        var gx_defaults: gx_gtk.defaults.Startup = .{};
+        defer gx_defaults.deinit();
+        // fork(gx): GX-0034 end
         // Load our configuration.
-        var config = CoreConfig.load(alloc) catch |err| err: {
+        // fork(gx): GX-0034 load before GTK without reading GtkSettings
+        var config = gx_defaults.load(alloc) catch |err| err: {
             // If we fail to load the configuration, then we should log
             // the error in the diagnostics so it can be shown to the user.
             // We can still load a default which only fails for OOM, allowing
@@ -344,6 +349,9 @@ pub const Application = extern struct {
             },
         };
         adw.init();
+        // fork(gx): GX-0034 begin: sample GtkSettings and rebuild from the retained layers
+        gx_defaults.initialized(alloc, &config);
+        // fork(gx): GX-0034 end
 
         const single_instance = switch (config.@"gtk-single-instance") {
             .true => true,
@@ -2901,6 +2909,9 @@ const Action = struct {
 
             // Hard reload, load a new config completely.
             const alloc = self.allocator();
+            // fork(gx): GX-0034 begin: refresh the default-layer cursor preference on hard reload
+            _ = gx_gtk.defaults.sampleSystemCursorBlink();
+            // fork(gx): GX-0034 end
             var config = try CoreConfig.load(alloc);
             defer config.deinit();
             break :config try .new(alloc, &config);

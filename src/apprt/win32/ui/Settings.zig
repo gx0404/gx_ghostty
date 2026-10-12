@@ -595,7 +595,7 @@ fn loadData(self: *Settings) void {
 
     self.layered = gx.config_layers.enabled(self.alloc);
     if (self.layered) {
-        self.layers = Layers.load(self.alloc) catch |err| layers: {
+        self.layers = App.loadLayers(self.alloc) catch |err| layers: {
             log.warn("cannot read the configuration layers, previews read the files err={}", .{err});
             break :layers null;
         };
@@ -2119,7 +2119,7 @@ fn followReload(self: *Settings) void {
     const layers = self.layersPtr() orelse return;
     if (inputsDigest(&self.app.config) == self.applied_inputs) return;
     log.info("the configuration was replaced, reading its layers again", .{});
-    var fresh = Layers.load(self.alloc) catch |err| {
+    var fresh = App.loadLayers(self.alloc) catch |err| {
         log.warn("cannot read the configuration layers again err={}", .{err});
         return;
     };
@@ -2149,7 +2149,11 @@ fn inputsDigest(config: *const Config) u64 {
 /// The configuration with `overrides`: built from the layers, else read
 /// from the files.
 fn buildConfig(self: *Settings, overrides: []const [:0]const u8) !Config {
-    if (self.layersPtr()) |layers| return try layers.build(self.alloc, overrides);
+    const blink = App.sampleSystemCursorBlink();
+    if (self.layersPtr()) |layers| {
+        _ = layers.setSystemCursorBlink(blink);
+        return try layers.build(self.alloc, overrides);
+    }
     if (overrides.len > 0) return try gx.config_layers.loadWithOverrides(self.alloc, overrides);
     return try Config.load(self.alloc);
 }

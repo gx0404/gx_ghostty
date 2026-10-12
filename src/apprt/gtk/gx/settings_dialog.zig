@@ -500,6 +500,7 @@ pub const GxSettingsDialog = extern struct {
     fn reloadLayers(self: *Self) void {
         const st = &self.private().state;
         if (st.layers) |*layers| layers.deinit();
+        _ = @import("defaults.zig").sampleSystemCursorBlink();
         st.layers = Layers.load(st.alloc) catch |err| layers: {
             log.warn("cannot read the configuration layers err={}", .{err});
             break :layers null;
@@ -1385,6 +1386,8 @@ pub const GxSettingsDialog = extern struct {
             len = 2;
         }
 
+        const blink = @import("defaults.zig").sampleSystemCursorBlink();
+        if (st.layers) |*layers| _ = layers.setSystemCursorBlink(blink);
         var config = (if (st.layers) |*layers|
             layers.build(st.alloc, args[0..len])
         else

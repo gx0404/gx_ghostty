@@ -165,6 +165,7 @@ fn reloadQuietly(app: *Application) void {
         log.warn("cannot keep the configuration reload quiet err={}", .{err});
         return reloadConfig(app);
     };
+    _ = @import("defaults.zig").sampleSystemCursorBlink();
     var config = gx.config_layers.loadWithOverrides(alloc, &.{quiet}) catch |err| {
         // Without the Ghostty GX layers (GHOSTTY_GX_DEFAULTS=0) the
         // upstream reload applies.
