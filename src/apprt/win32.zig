@@ -15,6 +15,7 @@ test {
     _ = @import("../renderer/opengl/wgl.zig");
     _ = @import("win32/App.zig");
     _ = @import("win32/BellAudio.zig");
+    _ = @import("win32/ComApartment.zig");
     _ = @import("win32/bell_wav.zig");
     _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/Surface.zig");

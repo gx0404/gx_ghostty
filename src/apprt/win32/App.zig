@@ -24,6 +24,7 @@ const tabs = @import("tabs.zig");
 const tab_status = @import("tab_status.zig");
 const open_url = @import("open_url.zig");
 const BellAudio = @import("BellAudio.zig");
+const ComApartment = @import("ComApartment.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
@@ -163,8 +164,8 @@ taskbar: ?*w32.ITaskbarList3 = null,
 /// A single id suffices: there is one NOTIF_DESKTOP_UID tray balloon and
 /// each new notification overwrites it.
 notif_desktop_surface_id: u64 = 0,
-/// Whether CoInitializeEx has been called on the main thread.
-com_initialized: bool = false,
+/// Owns this GUI thread's COM/OLE references; consumers share the owner.
+com_apartment: ComApartment = .{},
 
 /// Direct2D/DirectWrite state of the custom-drawn UI (popups, chrome),
 /// created on first use by `uiFactory`.
@@ -242,6 +243,31 @@ fn caretBlinkPreference(milliseconds: u32) ?bool {
     return milliseconds != w32.INFINITE;
 }
 
+test "closing taskbar callbacks leave retained state untouched" {
+    const alloc = std.testing.allocator;
+    var app: App = .{
+        .core_app = undefined,
+        .config = undefined,
+        .hinstance = undefined,
+        .default_command_arena = undefined,
+        .com_apartment = .init(),
+        .progress_timer = true,
+    };
+    defer app.com_apartment.deinit() catch {};
+    defer app.taskbar_shown.deinit(alloc);
+    var window: Window = .{ .app = &app, .hwnd = @ptrFromInt(1) };
+    try app.taskbar_shown.append(alloc, .{
+        .hwnd = window.hwnd.?,
+        .value = .{ .state = w32.TBPF_NORMAL, .percent = 50 },
+    });
+    try app.com_apartment.beginClose();
+    app.onTaskbarButtonCreated(&window);
+    try std.testing.expectEqual(@as(usize, 1), app.taskbar_shown.items.len);
+    app.onProgressTimer();
+    try std.testing.expectEqual(@as(usize, 1), app.taskbar_shown.items.len);
+    try std.testing.expect(app.progress_timer);
+}
+
 test "R4 caret blink disables only at INFINITE" {
     try std.testing.expectEqual(@as(?bool, false), caretBlinkPreference(w32.INFINITE));
     try std.testing.expectEqual(@as(?bool, null), caretBlinkPreference(0));
@@ -295,8 +321,10 @@ pub fn init(
         .hinstance = hinstance,
         .bg_brush = bg_brush,
         .alpha_frames = alpha_frames,
+        .com_apartment = .init(),
         .default_command_arena = .init(alloc),
     };
+    errdefer self.com_apartment.deinit() catch {};
     errdefer self.default_command_arena.deinit();
     self.updateDefaultCommand();
 
@@ -682,6 +710,9 @@ fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
 }
 
 pub fn terminate(self: *App) void {
+    self.com_apartment.beginClose() catch |err| log.err("COM apartment 关闭准备失败: {}", .{err});
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, PROGRESS_TIMER_ID);
+    self.progress_timer = false;
     self.stopQuitTimer();
     if (self.bell_audio) |player| {
         player.destroy();
@@ -701,14 +732,11 @@ pub fn terminate(self: *App) void {
     self.removeNotificationIcon();
 
     self.unregisterGlobalHotkeys();
-    self.global_hotkeys.deinit(self.core_app.alloc);
-    self.shortcut_conflicts.deinit(self.core_app.alloc);
-    self.taskbar_shown.deinit(self.core_app.alloc);
 
     // Release the taskbar COM object if we created one.
     if (self.taskbar) |tb| {
-        tb.Release();
         self.taskbar = null;
+        tb.Release();
     }
 
     // Destroy quick terminal if active.
@@ -760,6 +788,10 @@ pub fn terminate(self: *App) void {
         self.class_atom = 0;
     }
 
+    self.com_apartment.deinit() catch |err| log.err("COM apartment 清理失败: {}", .{err});
+    self.global_hotkeys.deinit(alloc);
+    self.shortcut_conflicts.deinit(alloc);
+    self.taskbar_shown.deinit(alloc);
     self.proc_shared.deinit();
     self.profiles_cache.deinit();
     self.default_command_arena.deinit();
@@ -2436,14 +2468,10 @@ fn childExitKind(info: apprt.surface.Message.ChildExited, abnormal_runtime_ms: u
 /// Lazily create (and cache) the shell ITaskbarList3 used for taskbar-button
 /// progress. Returns null if COM or the taskbar object is unavailable.
 fn taskbarList(self: *App) ?*w32.ITaskbarList3 {
-    if (self.taskbar) |tb| return tb;
-
     // COM must be initialized on this (the UI) thread before CoCreateInstance.
     // S_FALSE (already initialized) is fine; we only need it done once.
-    if (!self.com_initialized) {
-        _ = w32.CoInitializeEx(null, w32.COINIT_APARTMENTTHREADED);
-        self.com_initialized = true;
-    }
+    self.com_apartment.ensureCom() catch return null;
+    if (self.taskbar) |tb| return tb;
 
     var ptr: ?*anyopaque = null;
     const hr = w32.CoCreateInstance(
@@ -2993,6 +3021,7 @@ fn windowProgress(window: *const Window, now_ms: u64) tab_status.Progress {
 /// Show the progress of `window` (`windowProgress`) on its taskbar button
 /// and keep `PROGRESS_TIMER_ID` running while there is some.
 fn updateTaskbarProgress(self: *App, window: *Window) void {
+    if (self.com_apartment.isClosing()) return;
     const hwnd = window.hwnd orelse return;
     const progress = windowProgress(window, GetTickCount64());
     self.showTaskbarProgress(hwnd, taskbarValue(progress));
@@ -3001,6 +3030,7 @@ fn updateTaskbarProgress(self: *App, window: *Window) void {
 
 /// Set `value` on the taskbar button of `hwnd` unless it shows it already.
 fn showTaskbarProgress(self: *App, hwnd: w32.HWND, value: TaskbarValue) void {
+    if (self.com_apartment.isClosing()) return;
     for (self.taskbar_shown.items) |*shown| {
         if (shown.hwnd != hwnd) continue;
         if (std.meta.eql(shown.value, value)) return;
@@ -3020,7 +3050,7 @@ fn setTaskbarValue(self: *App, hwnd: w32.HWND, value: TaskbarValue) bool {
 }
 
 fn startProgressTimer(self: *App) void {
-    if (self.progress_timer) return;
+    if (self.com_apartment.isClosing() or self.progress_timer) return;
     const hwnd = self.msg_hwnd orelse return;
     if (w32.SetTimer(hwnd, PROGRESS_TIMER_ID, progress_timer_ms, null) != 0) self.progress_timer = true;
 }
@@ -3029,6 +3059,7 @@ fn startProgressTimer(self: *App) void {
 /// terminals that stopped reporting or closed, and stop once no button
 /// shows progress.
 fn onProgressTimer(self: *App) void {
+    if (self.com_apartment.isClosing()) return;
     const now = GetTickCount64();
     var active = false;
     for (self.windows.items) |window| {
@@ -3067,6 +3098,7 @@ pub fn isTaskbarButtonCreated(self: *const App, msg: u32) bool {
 /// Explorer made the taskbar button of `window`, again after it restarted:
 /// show the window's progress on it anew.
 pub fn onTaskbarButtonCreated(self: *App, window: *Window) void {
+    if (self.com_apartment.isClosing()) return;
     const hwnd = window.hwnd orelse return;
     for (self.taskbar_shown.items, 0..) |shown, i| {
         if (shown.hwnd != hwnd) continue;
