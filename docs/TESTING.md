@@ -112,10 +112,12 @@ GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来
 
 `scripts/gx_perf.py`（`just perf`）收集、汇总并对比 GUI 的耗时样本，只管测量与统计；结论要写明机器、构建类型与负载。
 
-- **样本**：`info(gx_perf): <指标> <值><单位>`（`GHOSTTY_GX_PERF=1` 时由 `src/gx/perf.zig` 写出，单位 ns、us、ms 或 s）；`metric <名> <值> [s|ms|us]` 行（`just wsl smoke --perf` 与本工具的 Windows 测量写出）；Debug 日志的 `window shown after <n>ms`；`gx_win_gui.py` 的 `run.json` 里的 `startup_ms`；Windows 文件日志按时间戳算出的里程碑，相对第一行：OpenGL 探测完成（`log.opengl_probed`）、读到配置、主字体加载、子进程启动、渲染线程拿到 GL 上下文（`log.renderer_context`）。时间一律换算成毫秒，p90 取最近秩。`summarize` 与 `compare` 递归读目录里的 `*.log`、`*.txt` 与 `run.json`，跳过隔离配置目录里的日志原件。
+- **样本**：`src/gx/perf.zig::record` 只写微秒时间 `info(gx_perf): <指标> <值>us`；解析器兼容 ns、ms、s 的历史时间行。计数必须另用无单位的 `metric <名> <值>`，同名 time/count 冲突拒绝。另收集 `metric <名> <值> [s|ms|us]`、Debug 的 `window shown after <n>ms`、`gx_win_gui.py` 的 `startup_ms`，以及 Windows 时间戳日志里的首次 OpenGL 探测、配置、字体、子进程与渲染上下文里程碑。时间换算为毫秒，p90 取最近秩；递归路径归一去重，父子目录重叠不会增加 n，跳过隔离配置目录中的日志原件。普通 `summarize` 仍可汇总任意指标，但不是性能通过门。
 - **Windows**：`just perf win32 --exe <旧> --exe <新> --out <目录> [--runs 10] [--resizes 6] [--env 名=值]`。每个构建一个隔离配置，先跑一轮丢弃的预热，此后都是热启动；两个构建按 A B、B A 交替，让机器状态的漂移同时作用于两边。每轮记录进程创建到主窗口创建、可见、取消 cloak 的时间（`startup.created`、`startup.visible`、`startup.shown`，1 ms 轮询），Ctrl+Shift+T 与 Ctrl+Shift+O 到新终端子窗口可见的时间（`new_tab.terminal_visible`、`split.terminal_visible`），`SetWindowPos` 改尺寸的同步耗时（`resize.setwindowpos`），以及窗口是否仍响应消息。每轮写 `<目录>/<标签>/run-NN.txt` 与日志副本，最后写 `SUMMARY.txt`。
-- **GTK**：`just perf gtk --clone <克隆> [--clone <克隆>] --out <目录> [--runs 10] [--env 名=值]`，每轮调一次 `just wsl smoke --perf`：窗口出现的时间（50 ms 轮询）、`seq 1 3000000` 负载的墙钟、负载期间各线程组的 CPU 时间（`/proc/<pid>/task/*/stat`，`llvmpipe-N` 这类编号线程合成一组）、缺页与 DMABUF 警告数。Xvfb 是软件渲染，`llvmpipe` 的 CPU 时间占大头，这些数字只能和同一环境比。
-- **对比**：`just perf compare --old <目录或文件…> --new <目录或文件…>` 输出两边的 n、中位数、p90 与中位数之差。负载对结果影响很大：同一个 ReleaseFast 构建，机器空闲时 `startup.shown` 的中位数比并行构建时低约 17%。所以接受改动的证据只能是同一台机器、同一时段交替测出的两个构建；与存档基线比较只作参考。性能验收（`GHOSTTY_GX_PERF=1`，新旧各 10 次）用 `--env GHOSTTY_GX_PERF=1`。
+- **GTK**：先 `just wsl build --gtk -Doptimize=ReleaseFast`，再 `just perf gtk --clone <克隆> [--clone <克隆>] --out <新目录> [--runs 10] [--env 名=值]`。GTK 没有自动预热；默认 AB/BA 各 10 轮，每轮都是新的私有配置和 Xvfb 会话。正常负载仍是 `seq 1 3000000`，不缩样本、不补跑失败轮。窗口出现及 done 文件都每 50 ms 轮询；elapsed 是 realtime 差，超时用 monotonic；CPU 窗口含结束后的 1 秒排空尾巴，不是与 workload_seconds 完全相同的区间。DMABUF 警告按匹配行计数，一行多个关键词只计一次。`llvmpipe-N` 合组，实际出现但未耗 CPU 的线程组仍记零；缺失不补零。
+- **GTK 有效性**：`smoke --perf` 从实际运行的固定映像 `+version` 验证 ReleaseFast，普通 GUI smoke 仍可用 Debug。每次启动、采样前后、xdotool 与清理核对 PID、stat 字段 22 创建时间及实际 exe 身份；运行期间持有未回收的直接 Popen child 和 pidfd，信号只发给受控 pidfd。pidfd 不可用则启动前拒绝；打开失败的受控 child 用未回收的 Popen 清理，不向未知 PID 发信号。TID 也按字段 22 核对；统计不完整、线程新增/消失/换身份、负增量、main/renderer 缺失、负载不完整或非零运行退出均拒绝，保留 raw，不纳入标准采集。
+- **证据合同**：每次 smoke 保存 `*-meta.json`（`gx-gtk-perf-v1`）、原始 tasks/status/times、退出与 finished 状态、exe SHA256/版本、commit/tree/dirty、身份检查点、实际传给子进程的显示/软件相关环境及制品哈希。按 manifest 核对原件与派生 metric；错误证据连带其日志时间样本一起拒绝。同名前缀不得覆盖；GTK 批次 out 必须不存在或为空，`gtk-runs.json` 保留原 planned_runs、顺序及所有失败轮，`RESULT.json` 输出有效轮数与机器可核拒绝原因。失败时不输出成功比较，不能静默过滤后缩小 n。渲染路径仅存可核运行日志：Xvfb、Mesa 名称、线程名或环境变量不证明 EGL/硬件/CPU fallback，未获专门诊断时字段为 unknown。
+- **对比**：`just perf compare --old <目录或文件…> --new <目录或文件…>` 要求两侧指标集合、单位类别与每项 n 对齐；GTK 必须两侧各有 runs 个 `cpu.main`、`cpu.renderer`、`cpu.total` 和窗口/负载时间。无 GTK 身份元数据的历史普通 timing 日志仍能统计，但文本与 JSON 明记 `unverified`，退出 0 不证明通过 GTK 门。有效身份也不是性能阈值判定：不内置下降百分比。同机同时间段交替证据才可用于判断，存档基线只作参考；性能验收仍是新旧各 10 次、`--env GHOSTTY_GX_PERF=1`。
 
 2026-10-10 的基线：提交 `a3535c2ed`（工作树只改了测试块），ReleaseFast，Windows 11 构建 26300，RTX 5080（`software=false`），系统 ConPTY（exe 旁没有随包的 `conpty.dll`）；当时还没有 `src/gx/perf.zig`，所以没有 `gx_perf` 指标。证据在 `.local/evidence/R1-C/baseline/`（不入库）。
 
@@ -130,7 +132,7 @@ GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来
 | `log.opengl_probed` | 171.5 / 178.0 | 203.5 / 217.0 |
 | `log.renderer_context` | 251.0 / 266.0 | 303.5 / 321.0 |
 
-同日 GTK（WSL Ubuntu 24.04 的 Xvfb，ReleaseFast，10 轮，中位数 / p90）：窗口出现 497 / 552 ms；负载墙钟 3152 / 3250 ms；负载期间 CPU 时间 main 635 / 660 ms、renderer 1060 / 1080 ms、io-reader 320 / 330 ms、io-gather 1355 / 1400 ms、llvmpipe 14.1 / 14.4 s；DMABUF 警告约 620 条（Xvfb 下导出 DMABUF 失败，渲染退回 CPU 呈现）。
+同日 GTK（WSL Ubuntu 24.04 的 Xvfb，ReleaseFast，10 轮，中位数 / p90）：窗口出现 497 / 552 ms；负载墙钟 3152 / 3250 ms；负载期间 CPU 时间 main 635 / 660 ms、renderer 1060 / 1080 ms、io-reader 320 / 330 ms、io-gather 1355 / 1400 ms、llvmpipe 14.1 / 14.4 s；DMABUF 警告约 620 条（当时日志报告导出失败与 CPU 呈现）。这组历史 GTK 数字没有当前进程/线程身份合同，按 unverified 保留参考，不补认成新性能门证据。
 
 ## 并行运行器与耗时
 

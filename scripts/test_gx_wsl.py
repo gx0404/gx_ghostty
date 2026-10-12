@@ -210,7 +210,8 @@ class ArgumentBuilderTests(unittest.TestCase):
     def test_env_assignments_are_validated(self) -> None:
         self.assertEqual("", gx_wsl.env_assignments([]))
         self.assertEqual("A=\n_b2=x=y", gx_wsl.env_assignments(["A=", "_b2=x=y"]))
-        for bad in ("A", "=x", "1A=x", "A-B=x", "A B=x", "A=x\ny", "A=x\ry"):
+        for bad in ("A", "=x", "1A=x", "A-B=x", "A B=x", "A=x\ny", "A=x\ry", "DISPLAY=:0",
+                    "WAYLAND_DISPLAY=wayland-0", "XDG_CONFIG_HOME=/other", "XDG_STATE_HOME=/other", "GDK_BACKEND=wayland"):
             with self.subTest(value=bad), self.assertRaises(gx_wsl.GxWslError):
                 gx_wsl.env_assignments([bad])
 
@@ -265,12 +266,12 @@ class ScriptTests(unittest.TestCase):
 
     def test_smoke_waits_for_the_window_instead_of_a_fixed_delay(self) -> None:
         script = all_invocations()["smoke"].script
-        self.assertIn('found=$(xdotool search --onlyvisible --pid "$pid" 2>/dev/null) || found=', script)
-        self.assertIn("sleep 0.05", script)
+        self.assertIn('["xdotool", "search", "--onlyvisible", "--pid", str(child.pid)]', script)
+        self.assertIn("time.sleep(0.05)", script)
         self.assertNotIn("--sync", script)
-        self.assertIn('if [ -n "$window" ] || ! alive "$pid"; then', script)
-        self.assertIn('sleep "$settle"', script)
-        self.assertNotIn('sleep "$wait_seconds"', script)
+        self.assertIn('require_identity(child.pid, meta["identity"], pidfd, digest)', script)
+        self.assertIn('time.sleep(float(settle))', script)
+        self.assertNotIn('time.sleep(float(wait_seconds))', script)
         for tool in ("xvfb-run", "xauth", "scrot", "xdotool"):
             self.assertIn(tool, script.split("for tool in ", 1)[1].split(";", 1)[0])
         self.assertIn("xdotool", gx_wsl.APT_PACKAGES)
@@ -280,9 +281,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn(gx_wsl.PERF_PROGRAM.strip(), function)
         self.assertEqual(1, function.splitlines().count(gx_wsl.PERF_DELIMITER))
         script = all_invocations()["smoke-perf"].script
-        self.assertIn(function, script)
+        self.assertIn(gx_wsl.smoke_function(), script)
         self.assertIn("export GHOSTTY_GX_PERF=1", script)
-        self.assertIn('-e sh "$work/workload.sh"', script)
+        self.assertIn('["-e", "sh", str(work / "workload.sh")]', script)
         self.assertIn('export "$assignment"', script)
 
     def test_ghostty_config_is_isolated(self) -> None:
@@ -421,9 +422,12 @@ def perf_namespace() -> dict:
     return namespace
 
 
-def stat_line(tid: int, comm: str, minflt: int, majflt: int, utime: int, stime: int) -> str:
+def stat_line(tid: int, comm: str, minflt: int, majflt: int, utime: int, stime: int,
+              starttime: int = 100) -> str:
     fields = ["S", "1", "1", "1", "0", "-1", "4194560", str(minflt), "0", str(majflt), "0", str(utime), str(stime)]
-    return f"{tid}\t{tid} ({comm}) {' '.join(fields + ['0'] * 39)}"
+    fields += ["0"] * 39
+    fields[19] = str(starttime)
+    return f"{tid}\t{tid} ({comm}) {' '.join(fields)}"
 
 
 class PerfProgramTests(unittest.TestCase):
@@ -431,14 +435,14 @@ class PerfProgramTests(unittest.TestCase):
         self.program = perf_namespace()
 
     def test_parse_tasks_reads_names_with_spaces_and_parentheses(self) -> None:
-        text = "\n".join((stat_line(10, "ghostty", 5, 1, 100, 20), stat_line(11, "a) b", 7, 0, 3, 4), "12\t", "13\tgarbage"))
+        text = "\r\n".join((stat_line(10, "ghostty", 5, 1, 100, 20), stat_line(11, "a) b", 7, 0, 3, 4)))
         tasks = self.program["parse_tasks"](text)
         self.assertEqual({"10", "11"}, set(tasks))
-        self.assertEqual({"comm": "a) b", "minflt": 7, "majflt": 0, "utime": 3, "stime": 4}, tasks["11"])
+        self.assertEqual({"comm": "a) b", "starttime": 100, "minflt": 7, "majflt": 0, "utime": 3, "stime": 4}, tasks["11"])
 
     def test_report_groups_threads_and_counts_log_lines(self) -> None:
         before = "\n".join((stat_line(10, "ghostty", 100, 1, 50, 10), stat_line(11, "renderer", 10, 0, 20, 5),
-                            stat_line(12, "io", 0, 0, 1, 1), stat_line(14, "pool-0", 0, 0, 0, 0),
+                            stat_line(12, "io", 0, 0, 1, 1), stat_line(13, "io", 0, 0, 0, 0),
                             stat_line(15, "llvmpipe-0", 0, 0, 0, 0), stat_line(16, "llvmpipe-1", 0, 0, 0, 0),
                             stat_line(17, "dconf worker", 0, 0, 0, 0)))
         after = "\n".join((stat_line(10, "ghostty", 150, 1, 150, 30), stat_line(11, "renderer", 30, 2, 320, 25),
@@ -457,28 +461,108 @@ class PerfProgramTests(unittest.TestCase):
                          "metric dmabuf_warnings 3", "metric gx_perf_lines 1"):
             self.assertIn(expected, lines)
         cpu = [line.split()[1] for line in lines if line.startswith("metric cpu.")]
-        self.assertEqual(["cpu.main", "cpu.renderer", "cpu.io", "cpu.llvmpipe", "cpu.total"], cpu)
-        rows = {line.split()[0]: line.split()[1] for line in lines if line and not line.startswith(("metric", "#"))
-                and ":" not in line.split()[0]}
-        self.assertEqual("2", rows["llvmpipe"])
-        self.assertEqual("1", rows["dconf_worker"])
-        self.assertIn("threads that exited during the workload (not counted): 14", report)
+        self.assertEqual(["cpu.main", "cpu.renderer", "cpu.io", "cpu.llvmpipe", "cpu.dconf_worker", "cpu.total"], cpu)
+        self.assertIn("dconf_worker", report)
         unfinished = self.program["report"](before, after, "pid 10\nworkload_finished 0\n", "", 100)
         self.assertIn("finished: no", unfinished)
+        self.assertNotIn("metric ", unfinished)
+
+    def test_tid_reuse_and_negative_counters_are_rejected(self) -> None:
+        before = self.program["parse_tasks"](stat_line(10, "ghostty", 0, 0, 100, 0, 100))
+        for birth in (100, 200):
+            after = self.program["parse_tasks"](stat_line(10, "ghostty", 0, 0, 2, 0, birth))
+            with self.subTest(starttime=birth), self.assertRaises(ValueError):
+                self.program["deltas"](before, after, "10")
+
+    def test_partial_stats_and_population_changes_are_rejected(self) -> None:
+        for text in ("12\t", "13\tgarbage", "1\t1 (x) S 1 2", stat_line(1, "x", 0, 0, 1, 0) + "\n1\t"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.program["parse_tasks"](text)
+        main = self.program["parse_tasks"](stat_line(10, "ghostty", 0, 0, 100, 0))
+        added = self.program["parse_tasks"](stat_line(10, "ghostty", 0, 0, 101, 0) + "\n" + stat_line(11, "renderer", 0, 0, 50, 0))
+        for before, after in ((main, added), (added, main)):
+            with self.assertRaises(ValueError):
+                self.program["deltas"](before, after, "10")
+
+    def test_invalid_workload_or_missing_renderer_has_no_metrics(self) -> None:
+        main = stat_line(10, "ghostty", 0, 0, 0, 0)
+        report = self.program["report"](main, main, "pid 10\nworkload_finished 0\n", "", 100)
+        self.assertIn("valid: no", report)
+        self.assertNotIn("metric ", report)
+
+    def test_zero_llvmpipe_and_warnings_count_lines(self) -> None:
+        tasks = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0), stat_line(11, "renderer", 0, 0, 0, 0),
+                            stat_line(12, "llvmpipe-0", 0, 0, 0, 0)))
+        times = "pid 10\nworkload_finished 1\nwindow_seconds 1\nworkload_seconds 1\n"
+        log = "failed to export DMABUF; failed to build dmabuf\n"
+        report = self.program["report"](tasks, tasks, times, log, 100)
+        self.assertIn("metric cpu.llvmpipe 0.000 s", report)
+        self.assertIn("metric dmabuf_warnings 1", report)
 
     def test_main_reads_files_and_fails_without_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = [Path(tmp) / name for name in ("before", "after", "times", "log")]
-            for path, text in zip(paths, (stat_line(1, "ghostty", 0, 0, 0, 0), stat_line(1, "ghostty", 0, 0, 7, 3),
-                                          "pid 1\n", "")):
+            renderer = "\n" + stat_line(2, "renderer", 0, 0, 0, 0)
+            for path, text in zip(paths, (stat_line(1, "ghostty", 0, 0, 0, 0) + renderer,
+                                          stat_line(1, "ghostty", 0, 0, 7, 3) + renderer,
+                                          "pid 1\nworkload_finished 1\nwindow_seconds 1\nworkload_seconds 1\n", "")):
                 path.write_text(text, encoding="utf-8")
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            with mock.patch.object(self.program["os"], "sysconf", return_value=100, create=True), contextlib.redirect_stdout(out):
                 self.assertEqual(0, self.program["main"](["-", *map(str, paths)]))
-            self.assertIn("metric cpu.main", out.getvalue())
-            paths[1].write_text("", encoding="utf-8")
-            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIn("metric cpu.main", out.getvalue())
+                paths[1].write_text("", encoding="utf-8")
                 self.assertEqual(1, self.program["main"](["-", *map(str, paths)]))
+
+    def supervisor(self):
+        program = perf_namespace()
+        exec(compile(gx_wsl.SMOKE_PROGRAM, "gx_wsl_smoke", "exec"), program)
+        return program
+
+    def test_process_identity_guard_rejects_reuse_and_exits(self):
+        program = self.supervisor()
+        expected = {"pid": 10, "starttime": 100, "exe": "/own/ghostty", "sha256": "a" * 64}
+        for observed, ready in ((expected | {"starttime": 200}, []), (expected, [39]),
+                                (expected | {"exe": "/other/ghostty"}, []), (expected | {"sha256": "b" * 64}, [])):
+            with self.subTest(observed=observed, ready=ready), \
+                    mock.patch.dict(program, {"process_identity": mock.Mock(return_value=observed)}), \
+                    mock.patch.object(program["select"], "select", return_value=(ready, [], [])):
+                with self.assertRaises(ValueError):
+                    program["require_identity"](10, expected, 39, True)
+
+    def test_cleanup_uses_owned_pidfd_even_after_identity_failure(self):
+        program = self.supervisor()
+        child = mock.Mock(pid=10)
+        child.wait.return_value = -15
+        meta = {"identity": {"pid": 10}, "errors": []}
+        with mock.patch.dict(program, {"require_identity": mock.Mock(side_effect=ValueError("PID reused"))}), \
+                mock.patch.object(program["signal"], "pidfd_send_signal", create=True) as send, \
+                mock.patch.object(program["os"], "close") as close:
+            program["stop_child"](child, 39, meta)
+        send.assert_called_once_with(39, program["signal"].SIGTERM)
+        close.assert_called_once_with(39)
+        child.terminate.assert_not_called()
+        child.kill.assert_not_called()
+        self.assertEqual("failed; owned pidfd only", meta["cleanup_identity"])
+        self.assertTrue(meta["errors"])
+
+    def test_pidfd_open_failure_cleans_unreaped_direct_child(self):
+        program = self.supervisor()
+        child = mock.Mock(pid=10)
+        child.wait.return_value = -15
+        meta = {"errors": []}
+        program["stop_child"](child, None, meta)
+        child.terminate.assert_called_once_with()
+        self.assertIn("unreaped direct Popen child", meta["cleanup"])
+
+    def test_smoke_program_compiles_and_has_no_numeric_signal_fallback(self):
+        self.supervisor()
+        script = gx_wsl.smoke_function()
+        self.assertNotIn('kill "$pid"', script)
+        self.assertNotIn("os.kill(", script)
+        self.assertNotIn("child.poll(", script)
+        self.assertIn("pidfd unavailable; refusing to launch", script)
+        self.assertIn("perf requires verified ReleaseFast", script)
 
 
 class SyncTargetTests(unittest.TestCase):

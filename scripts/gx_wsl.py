@@ -35,6 +35,11 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         first screenshot and writes PREFIX-perf.txt: the time to the window and of the workload,
         CPU time and page faults per Ghostty thread (from /proc/<pid>/task/*/stat) and the DMABUF
         warnings in the log, as `metric NAME VALUE [UNIT]` lines that scripts/gx_perf.py reads.
+        --perf requires actual ReleaseFast; ordinary GUI smoke still accepts Debug. PID/starttime/exe
+        and TID/starttime are guarded; process signals use an owned pidfd and unreaped Popen child.
+        Invalid/incomplete windows retain raw evidence but no accepted metrics. PREFIX-meta.json
+        records identity, source tree/dirty state, effective display environment and artifact hashes.
+        Existing evidence prefixes are refused, never overwritten.
   scenario --out DIR [SCENARIO...]
         Run the GTK scenarios test/gui/gtk/G*.toml (ids such as G01 or file paths; default
         all): each writes its config and xdotool script to DIR/<id>/, runs one smoke named
@@ -526,12 +531,9 @@ require_ghostty() {
 }
 """
 
-# Runs inside WSL as `python3 - <tasks before> <tasks after> <times> <ghostty log>` and prints the
-# report of `smoke --perf`: per-thread CPU time and page faults of Ghostty across the workload
-# (threads grouped by name without a trailing -N, the main thread as "main"), the timings and the
-# log counters. Ghostty's own threads always get a `metric cpu.<group>` line, others only when busy.
 PERF_DELIMITER = "GX_WSL_PERF"
 PERF_PROGRAM = r"""
+import math
 import os
 import re
 import sys
@@ -548,19 +550,22 @@ def group_name(comm):
 def parse_tasks(text):
     tasks = {}
     for line in text.splitlines():
-        tid, _, stat = line.partition("\t")
-        if "(" not in stat or ")" not in stat:
-            continue
+        tid, sep, stat = line.partition("\t")
+        tid = tid.strip()
+        if not sep or not tid.isdigit() or int(tid) <= 0 or tid in tasks or "(" not in stat or ")" not in stat:
+            raise ValueError("malformed or duplicate task stat: " + line)
+        if stat.split("(", 1)[0].strip() != tid:
+            raise ValueError("task stat TID mismatch: " + line)
         fields = stat[stat.rindex(")") + 1 :].split()
-        if len(fields) < 13:
-            continue
-        tasks[tid.strip()] = {
-            "comm": stat[stat.index("(") + 1 : stat.rindex(")")],
-            "minflt": int(fields[7]),
-            "majflt": int(fields[9]),
-            "utime": int(fields[11]),
-            "stime": int(fields[12]),
-        }
+        if len(fields) < 50 or fields[0] in ("Z", "X", "x"):
+            raise ValueError("partial or exited task stat: " + line)
+        task = {"comm": stat[stat.index("(") + 1 : stat.rindex(")")], "starttime": int(fields[19])}
+        task.update({key: int(fields[index]) for key, index in zip(COUNTERS, (11, 12, 7, 9))})
+        if task["starttime"] <= 0 or any(task[key] < 0 for key in COUNTERS):
+            raise ValueError("negative counters or missing task birth: " + tid)
+        tasks[tid] = task
+    if not tasks:
+        raise ValueError("no thread statistics")
     return tasks
 
 
@@ -574,66 +579,85 @@ def parse_times(text):
 
 
 def deltas(before, after, pid):
+    if pid not in before or pid not in after:
+        raise ValueError("missing main thread")
+    if set(before) != set(after):
+        raise ValueError(f"thread population changed: gone={sorted(set(before) - set(after))}, added={sorted(set(after) - set(before))}")
     groups = {}
     for tid, now in after.items():
-        then = before.get(tid, dict.fromkeys(COUNTERS, 0))
+        then = before[tid]
+        if (now["starttime"], now["comm"]) != (then["starttime"], then["comm"]):
+            raise ValueError("task identity changed: " + tid)
         group = groups.setdefault("main" if tid == pid else group_name(now["comm"]), dict.fromkeys(("threads",) + COUNTERS, 0))
         group["threads"] += 1
         for key in COUNTERS:
-            group[key] += now[key] - then[key]
-    return groups, sorted(set(before) - set(after), key=int)
+            change = now[key] - then[key]
+            if change < 0:
+                raise ValueError(f"negative {key} delta: {tid}")
+            group[key] += change
+    return groups, []
+
+
+def measurement(before_text, after_text, times_text):
+    times = parse_times(times_text)
+    groups, _ = deltas(parse_tasks(before_text), parse_tasks(after_text), times.get("pid", ""))
+    if "renderer" not in groups:
+        raise ValueError("missing renderer thread")
+    if times.get("workload_finished") != "1":
+        raise ValueError("incomplete workload")
+    if times.get("run_exit", "0") != "0":
+        raise ValueError("nonzero run exit")
+    for key in ("window_seconds", "workload_seconds"):
+        value = float(times.get(key, "nan"))
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("missing or invalid " + key)
+    return groups
 
 
 def report(before_text, after_text, times_text, log_text, clk_tck):
     times = parse_times(times_text)
-    groups, gone = deltas(parse_tasks(before_text), parse_tasks(after_text), times.get("pid", ""))
+    lines = ["# gx-wsl smoke --perf",
+             "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
+             "finished: " + ("yes" if times.get("workload_finished") == "1" else "no")]
+    try:
+        groups = measurement(before_text, after_text, times_text)
+        if clk_tck <= 0:
+            raise ValueError("invalid CLK_TCK")
+    except ValueError as exc:
+        return "\n".join([*lines, "valid: no", "rejected: " + str(exc)]) + "\n"
+    lines += ["valid: yes (task window only; process identity requires meta.json)",
+              "clock: realtime elapsed; window/done polling 50 ms; CPU includes the 1 s drain tail"]
     order = [name for name in FIRST if name in groups]
-    rest = [name for name in groups if name not in FIRST]
-    order += sorted(rest, key=lambda name: -(groups[name]["utime"] + groups[name]["stime"]))
+    order += sorted((name for name in groups if name not in FIRST), key=lambda name: -(groups[name]["utime"] + groups[name]["stime"]))
     total = {key: sum(group[key] for group in groups.values()) for key in ("threads",) + COUNTERS}
-    finished = times.get("workload_finished") == "1"
-    lines = [
-        "# gx-wsl smoke --perf",
-        "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
-        "finished: " + ("yes" if finished else "no (timed out or Ghostty exited)"),
-    ]
     for key in ("window_seconds", "workload_seconds"):
-        if key in times:
-            lines.append(f"metric {key} {float(times[key]):.3f} s")
+        lines.append(f"metric {key} {float(times[key]):.3f} s")
     for name in order + ["total"]:
         group = total if name == "total" else groups[name]
-        ticks = group["utime"] + group["stime"]
-        if ticks or name in FIRST or name == "total":
-            lines.append(f"metric cpu.{name} {ticks / clk_tck:.3f} s")
+        lines.append(f"metric cpu.{name} {(group['utime'] + group['stime']) / clk_tck:.3f} s")
     lines.append(f"metric minflt.total {total['minflt']}")
     lines.append(f"metric majflt.total {total['majflt']}")
-    lines.append(f"metric dmabuf_warnings {sum(log_text.count(needle) for needle in DMABUF_WARNINGS)}")
+    lines.append(f"metric dmabuf_warnings {sum(any(needle in line for needle in DMABUF_WARNINGS) for line in log_text.splitlines())}")
     lines.append(f"metric gx_perf_lines {sum('(gx_perf):' in line for line in log_text.splitlines())}")
-    lines.append("")
-    lines.append(f"{'thread':<24} {'threads':>7} {'cpu_s':>8} {'user_s':>8} {'sys_s':>8} {'minflt':>9} {'majflt':>7}")
+    lines += ["", f"{'thread':<24} {'threads':>7} {'cpu_s':>8} {'user_s':>8} {'sys_s':>8} {'minflt':>9} {'majflt':>7}"]
     for name in order + ["total"]:
         group = total if name == "total" else groups[name]
-        cpu = (group["utime"] + group["stime"]) / clk_tck
-        lines.append(
-            f"{name:<24} {group['threads']:>7} {cpu:>8.3f} {group['utime'] / clk_tck:>8.3f} "
-            f"{group['stime'] / clk_tck:>8.3f} {group['minflt']:>9} {group['majflt']:>7}"
-        )
-    if gone:
-        lines.append(f"threads that exited during the workload (not counted): {', '.join(gone)}")
+        lines.append(f"{name:<24} {group['threads']:>7} {(group['utime'] + group['stime']) / clk_tck:>8.3f} "
+                     f"{group['utime'] / clk_tck:>8.3f} {group['stime'] / clk_tck:>8.3f} {group['minflt']:>9} {group['majflt']:>7}")
     return "\n".join(lines) + "\n"
 
 
 def main(argv):
-    texts = []
-    for path in argv[1:5]:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            texts.append(handle.read())
-    if not parse_tasks(texts[1]):
-        print("[gx-wsl] error: no thread statistics after the workload", file=sys.stderr)
-        return 1
-    clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-    sys.stdout.write(report(*texts, clk_tck))
-    return 0
+    try:
+        texts = []
+        for path in argv[1:5]:
+            with open(path, encoding="utf-8", errors="strict") as handle:
+                texts.append(handle.read())
+        result = report(*texts, os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError) as exc:
+        result = "valid: no\nrejected: " + str(exc) + "\n"
+    sys.stdout.write(result)
+    return 1 if "valid: no" in result else 0
 
 
 if __name__ == "__main__":
@@ -645,8 +669,269 @@ if __name__ == "__main__":
 PERF_WORKLOAD = r"""dir=${0%/*}
 while [ ! -e "$dir/go" ]; do sleep 0.05; done
 seq 1 3000000
-touch "$dir/done"
+result=$?
+printf '%s\n' "$result" >"$dir/workload-exit"
+[ "$result" -eq 0 ] && touch "$dir/done"
 exec sleep 3600
+"""
+
+SMOKE_PROGRAM = r"""
+import hashlib
+import json
+import select
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+ENV_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "GDK_BACKEND", "GSK_RENDERER", "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER",
+            "MESA_LOADER_DRIVER_OVERRIDE", "MESA_GL_VERSION_OVERRIDE", "EGL_PLATFORM", "NO_AT_BRIDGE", "GHOSTTY_GX_PERF",
+            "LANG", "LC_ALL", "LANGUAGE", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_LIBRARY_PATH")
+
+
+def image_info(path, digest=False):
+    with open(path, "rb") as handle:
+        stat = os.fstat(handle.fileno())
+        info = {"device": stat.st_dev, "inode": stat.st_ino, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        if digest:
+            sha = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha.update(chunk)
+            end = os.fstat(handle.fileno())
+            if (end.st_dev, end.st_ino, end.st_size, end.st_mtime_ns) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+                raise ValueError("executable changed while hashing")
+            info["sha256"] = sha.hexdigest()
+        return info
+
+
+def process_identity(pid, digest=False):
+    root = Path("/proc") / str(pid)
+    task = parse_tasks(f"{pid}\t" + (root / "stat").read_text())[str(pid)]
+    return {"pid": pid, "starttime": task["starttime"], "exe": os.readlink(root / "exe"),
+            **image_info(root / "exe", digest)}
+
+
+def require_identity(pid, expected, pidfd, digest=False):
+    if select.select([pidfd], [], [], 0)[0]:
+        raise ValueError("controlled child exited")
+    identity = process_identity(pid, digest)
+    if any(identity.get(key) != value for key, value in expected.items() if key != "sha256" or digest):
+        raise ValueError("process identity changed")
+    return identity
+
+
+def stop_child(child, pidfd, meta):
+    if child is None:
+        return
+    if pidfd is None:
+        # Popen has never polled/waited: our unreaped direct child still owns this PID.
+        child.terminate()
+        meta["cleanup"] = "unreaped direct Popen child (pidfd_open failed)"
+    else:
+        try:
+            if "identity" not in meta:
+                raise ValueError("no launch identity")
+            require_identity(child.pid, meta["identity"], pidfd, True)
+            meta["cleanup_identity"] = "verified"
+        except (OSError, ValueError) as exc:
+            meta["errors"].append("cleanup: " + str(exc))
+            meta["cleanup_identity"] = "failed; owned pidfd only"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        meta["cleanup"] = "owned pidfd SIGTERM"
+    try:
+        meta["child_exit"] = child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if pidfd is None:
+            child.kill()
+        else:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        meta["cleanup"] += ", SIGKILL"
+        meta["errors"].append("child required forced cleanup")
+        meta["child_exit"] = child.wait(timeout=5)
+    if meta["child_exit"] not in (0, -signal.SIGTERM):
+        meta["errors"].append("unexpected child exit: " + str(meta["child_exit"]))
+    if pidfd is not None:
+        os.close(pidfd)
+
+
+def smoke_main(argv):
+    evidence, name, wait_seconds, xdo, settle, perf, work, screen, *extra = argv[1:]
+    evidence, work = Path(evidence), Path(work)
+    perf = perf == "1"
+    prefix = evidence / name
+    meta = {"schema": "gx-gtk-perf-v1", "perf": perf, "valid": False, "exit": 1, "errors": [],
+            "started_realtime": time.time(), "identity_checks": [], "workload_finished": False,
+            "effective_env": {key: os.environ.get(key) for key in ENV_KEYS}, "screen": screen,
+            "clock": "realtime elapsed; 50 ms polling; CPU includes 1 s drain tail", "warmup": "none",
+            "clk_tck": os.sysconf("SC_CLK_TCK"),
+            "renderer_evidence": {"egl": "unknown", "cpu_fallback": "unknown", "hardware": "unknown"}}
+    times = {}
+    child = pidfd = exe_fd = None
+    before = after = ""
+
+    def save(suffix, text):
+        (evidence / (name + suffix)).write_text(text, encoding="utf-8", newline="\n")
+
+    def guard(stage, digest=False):
+        current = require_identity(child.pid, meta["identity"], pidfd, digest)
+        if digest:
+            meta["identity_checks"].append({"stage": stage, "realtime": time.time(), **current})
+        return current
+
+    def checked(command, stage, check=True):
+        guard(stage + " before", stage == "xdotool script")
+        result = subprocess.run(command, capture_output=True, text=True, check=check, timeout=30)
+        guard(stage + " after", stage == "xdotool script")
+        return result
+
+    def capture(suffix):
+        checked(["scrot", str(prefix) + suffix], "screenshot " + suffix)
+        if (evidence / (name + suffix)).stat().st_size == 0:
+            raise ValueError("empty screenshot")
+
+    def snapshot(stage):
+        guard(stage + " before", True)
+        root = Path("/proc") / str(child.pid)
+        tids = sorted((root / "task").iterdir(), key=lambda p: int(p.name))
+        rows = []
+        for task in tids:
+            try:
+                stat = (task / "stat").read_text().strip()
+            except OSError:
+                stat = ""
+            rows.append(task.name + "\t" + stat)
+        text = "\n".join(rows) + "\n"
+        save("-tasks-" + stage + ".txt", text)
+        save("-status-" + stage + ".txt", (root / "status").read_text())
+        if {p.name for p in (root / "task").iterdir()} != {p.name for p in tids}:
+            raise ValueError("thread population changed during snapshot")
+        guard(stage + " after", True)
+        parse_tasks(text)
+        return text
+
+    try:
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise ValueError("pidfd unavailable; refusing to launch")
+        probe = os.pidfd_open(os.getpid())
+        try:
+            signal.pidfd_send_signal(probe, 0)
+        finally:
+            os.close(probe)
+        def git_value(*args):
+            return subprocess.check_output(["git", *args], text=True).strip()
+        meta.update(commit=git_value("rev-parse", "HEAD"), tree=git_value("rev-parse", "HEAD^{tree}"),
+                    dirty_paths=git_value("status", "--porcelain"))
+        meta["dirty"] = bool(meta["dirty_paths"])
+        exe = str(Path("zig-out/bin/ghostty").resolve())
+        exe_fd = os.open(exe, os.O_RDONLY)
+        held = f"/proc/self/fd/{exe_fd}"
+        meta["executable"] = {"path": exe, **image_info(held, True)}
+        version = subprocess.run([held, "+version"], pass_fds=(exe_fd,), capture_output=True, text=True, timeout=30)
+        save("-version.txt", version.stdout + version.stderr)
+        meta["version"] = version.stdout
+        meta["version_exit"] = version.returncode
+        mode = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\b", version.stdout)
+        meta["build_mode"] = mode.group(1) if mode else "unknown"
+        if version.returncode != 0 or (perf and meta["build_mode"] != "ReleaseFast"):
+            raise ValueError("perf requires verified ReleaseFast" if perf else "version failed")
+        if perf and os.environ.get("GHOSTTY_GX_PERF", "").strip().lower() not in ("1", "true", "on", "yes"):
+            raise ValueError("GHOSTTY_GX_PERF not enabled")
+        command = [exe, "--gtk-single-instance=false", *extra]
+        if perf:
+            command += ["-e", "sh", str(work / "workload.sh")]
+        meta["command"] = command
+        times["launch_realtime"] = time.time()
+        with open(str(prefix) + ".log", "w") as log:
+            child = subprocess.Popen(command, executable=held, pass_fds=(exe_fd,), stdout=log, stderr=log)
+        pidfd = os.pidfd_open(child.pid)
+        identity = process_identity(child.pid, True)
+        meta["identity"] = identity
+        if any(identity[key] != value for key, value in meta["executable"].items() if key != "path"):
+            raise ValueError("launch executable mismatch")
+        times["pid"] = child.pid
+        guard("launch", True)
+        deadline = time.monotonic() + float(wait_seconds)
+        window = ""
+        while time.monotonic() < deadline:
+            found = checked(["xdotool", "search", "--onlyvisible", "--pid", str(child.pid)], "window search", False)
+            if found.returncode == 0 and found.stdout.strip():
+                window = found.stdout.splitlines()[0]
+                owner = checked(["xdotool", "getwindowpid", window], "window owner")
+                if owner.stdout.strip() != str(child.pid):
+                    raise ValueError("window PID mismatch")
+                break
+            time.sleep(0.05)
+        if not window:
+            raise ValueError("no visible window within " + wait_seconds + " s")
+        meta["window"] = window
+        times["window_seconds"] = time.time() - times["launch_realtime"]
+        time.sleep(float(settle))
+        capture(".png")
+        if perf:
+            before = snapshot("before")
+            times["workload_begin_realtime"] = time.time()
+            (work / "go").touch()
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                guard("workload")
+                if (work / "done").exists():
+                    meta["workload_finished"] = True
+                    break
+                time.sleep(0.05)
+            times["workload_end_realtime"] = time.time()
+            times["workload_seconds"] = times["workload_end_realtime"] - times["workload_begin_realtime"]
+            times["workload_finished"] = int(meta["workload_finished"])
+            meta["workload_exit"] = (work / "workload-exit").read_text().strip() if (work / "workload-exit").exists() else None
+            if meta["workload_exit"] != "0":
+                raise ValueError("workload failed or exit unavailable")
+            time.sleep(1)
+            after = snapshot("after")
+            times["cpu_end_realtime"] = time.time()
+            capture("-perf.png")
+            measurement(before, after, "\n".join(f"{key} {value}" for key, value in times.items()))
+        if xdo:
+            checked(["xdotool", xdo, str(child.pid)], "xdotool script")
+            time.sleep(1)
+            capture("-after.png")
+        guard("finished", True)
+        meta["exit"] = 0
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        meta["errors"].append(str(exc))
+    except KeyboardInterrupt:
+        meta["errors"].append("interrupted")
+    finally:
+        try:
+            stop_child(child, pidfd, meta)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            meta["errors"].append("cleanup failed: " + str(exc))
+        if exe_fd is not None:
+            os.close(exe_fd)
+        if meta["errors"]:
+            meta["exit"] = 1
+        meta["valid"] = meta["exit"] == 0
+        meta["finished_realtime"] = time.time()
+        times["run_exit"] = meta["exit"]
+        times_text = "\n".join(f"{key} {value}" for key, value in times.items()) + "\n"
+        save("-times.txt", times_text)
+        log_path = evidence / (name + ".log")
+        log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
+        meta["renderer_evidence"]["runtime_log_lines"] = [line for line in log_text.splitlines()
+            if any(token in line.lower() for token in ("opengl", "egl", "dmabuf", "llvmpipe", "cpu presentation"))]
+        if perf:
+            save("-perf.txt", report(before, after, times_text, log_text, os.sysconf("SC_CLK_TCK")))
+        meta["files"] = sorted(p.name for p in evidence.iterdir())
+        meta["artifact_sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence.iterdir()}
+        save("-meta.txt", "\n".join(f"{key}: {value}" for key, value in meta.items() if key not in ("renderer_evidence", "files")) + "\n")
+        save("-meta.json", json.dumps(meta, indent=2) + "\n")
+    print("[gx-wsl] " + ("smoke passed" if meta["valid"] else "smoke rejected: " + "; ".join(meta["errors"])), flush=True)
+    return meta["exit"]
+
+
+if __name__ == "__main__":
+    sys.exit(smoke_main(sys.argv))
 """
 
 SMOKE_BODY = r"""out_win=$1
@@ -668,8 +953,12 @@ for tool in xvfb-run xauth scrot xdotool; do
   command -v "$tool" >/dev/null || die "$tool is not installed; run: python scripts/gx_wsl.py setup --apt" 2
 done
 out=$(wslpath -u "$out_win")
+mkdir -p "$out"
+if compgen -G "$out/$name*" >/dev/null; then die "evidence prefix already exists in $out; use a new directory" 2; fi
+lock=$out/.gx-wsl-$name
+mkdir "$lock" || die "evidence prefix is already in use: $out/$name" 2
 work=$(mktemp -d "${TMPDIR:-/tmp}/gx-wsl-smoke.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work"; rmdir "$lock"' EXIT
 evidence=$work/evidence
 mkdir -p "$evidence"
 xdo=
@@ -678,6 +967,7 @@ if [ -n "$xdotool_win" ]; then
   sed 's/\r$//' "$(wslpath -u "$xdotool_win")" >"$xdo"
 fi
 prepare_config "$work" "$config_win"
+export XDG_STATE_HOME=$work/xdg-state
 apply_lang "$lang" "$language"
 export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
 export LD_LIBRARY_PATH=$clone/zig-out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -687,157 +977,14 @@ if [ "$perf" = 1 ]; then
   printf '%s' "$workload" >"$work/workload.sh"
 fi
 while IFS= read -r assignment; do
-  if [ -n "$assignment" ]; then
-    export "$assignment"
-  fi
+  if [ -n "$assignment" ]; then export "$assignment"; fi
 done <<<"$env_spec"
-env -u DISPLAY ./zig-out/bin/ghostty +version >"$evidence/$name-version.txt" 2>&1
-session=$(cat <<'GX_WSL_SESSION'
-evidence=$1
-name=$2
-wait_seconds=$3
-xdo=$4
-settle=$5
-perf=$6
-work=$7
-shift 7
-alive() {
-  local state
-  state=$(awk '/^State:/ {print $2}' "/proc/$1/status" 2>/dev/null || true)
-  [ -n "$state" ] && [ "$state" != Z ]
-}
-now() { date +%s.%N; }
-elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
-started=$(now)
-if [ "$perf" = 1 ]; then
-  ./zig-out/bin/ghostty --gtk-single-instance=false "$@" -e sh "$work/workload.sh" >"$evidence/$name.log" 2>&1 &
-else
-  ./zig-out/bin/ghostty --gtk-single-instance=false "$@" >"$evidence/$name.log" 2>&1 &
-fi
-pid=$!
-printf 'pid %s\n' "$pid" >"$work/times"
-# Poll every 50 ms: xdotool's own sync mode sleeps 0.5 s between searches, too coarse for window_seconds.
-window=
-tries=$(awk -v s="$wait_seconds" 'BEGIN { printf "%d", s * 20 + 1 }')
-for _ in $(seq 1 "$tries"); do
-  found=$(xdotool search --onlyvisible --pid "$pid" 2>/dev/null) || found=
-  window=${found%%$'\n'*}
-  if [ -n "$window" ] || ! alive "$pid"; then
-    break
-  fi
-  sleep 0.05
-done
-if [ -z "$window" ]; then
-  scrot "$evidence/$name.png" 2>/dev/null || true
-  if alive "$pid"; then
-    printf '[gx-wsl] error: ghostty showed no window within %ss; see %s.log\n' "$wait_seconds" "$name" >&2
-    kill "$pid" 2>/dev/null || true
-  else
-    printf '[gx-wsl] error: ghostty exited before showing a window; see %s.log\n' "$name" >&2
-  fi
-  wait "$pid" || true
-  exit 1
-fi
-printf 'window_seconds %s\n' "$(elapsed "$started" "$(now)")" >>"$work/times"
-sleep "$settle"
-if ! alive "$pid"; then
-  wait "$pid" || true
-  printf '[gx-wsl] error: ghostty exited before the screenshot; see %s.log\n' "$name" >&2
-  exit 1
-fi
-scrot "$evidence/$name.png"
+write_smoke_program >"$work/session.py"
 status=0
-if [ "$perf" = 1 ]; then
-  snapshot() {
-    local task
-    for task in /proc/"$pid"/task/*; do
-      printf '%s\t%s\n' "${task##*/}" "$(cat "$task/stat" 2>/dev/null || true)"
-    done
-  }
-  snapshot >"$evidence/$name-tasks-before.txt"
-  begin=$(now)
-  touch "$work/go"
-  finished=0
-  for _ in $(seq 1 6000); do
-    if [ -e "$work/done" ]; then
-      finished=1
-      break
-    fi
-    alive "$pid" || break
-    sleep 0.05
-  done
-  printf 'workload_seconds %s\nworkload_finished %s\n' "$(elapsed "$begin" "$(now)")" "$finished" >>"$work/times"
-  sleep 1
-  if alive "$pid"; then
-    snapshot >"$evidence/$name-tasks-after.txt"
-    scrot "$evidence/$name-perf.png"
-  fi
-  if [ "$finished" != 1 ]; then
-    printf '[gx-wsl] error: the perf workload did not finish; see %s.log\n' "$name" >&2
-    status=1
-  fi
-fi
-if [ -n "$xdo" ]; then
-  if ! xdotool "$xdo" "$pid"; then
-    printf '[gx-wsl] error: the xdotool script failed\n' >&2
-    status=1
-  fi
-  sleep 1
-  scrot "$evidence/$name-after.png"
-fi
-kill "$pid" 2>/dev/null || true
-wait "$pid" || true
-[ "$status" -eq 0 ] || exit 1
-test -s "$evidence/$name.png"
-GX_WSL_SESSION
-)
-started=$(date +%s)
-status=0
-xvfb-run --auto-servernum --server-args="-screen 0 $screen" bash -euo pipefail -c "$session" smoke \
-  "$evidence" "$name" "$wait_seconds" "$xdo" "$settle" "$perf" "$work" "$@" || status=$?
-if [ "$perf" = 1 ]; then
-  if [ -s "$evidence/$name-tasks-after.txt" ]; then
-    perf_report "$evidence/$name-tasks-before.txt" "$evidence/$name-tasks-after.txt" "$work/times" \
-      "$evidence/$name.log" >"$evidence/$name-perf.txt" || status=1
-  else
-    warn "no thread statistics after the perf workload"
-    if [ "$status" -eq 0 ]; then status=1; fi
-  fi
-fi
-extra_args=
-if [ $# -gt 0 ]; then
-  extra_args=$(printf ' %q' "$@")
-fi
-if [ "$perf" = 1 ]; then
-  extra_args="$extra_args -e sh workload.sh"
-fi
-window_seconds=$(awk '$1 == "window_seconds" {print $2}' "$work/times" 2>/dev/null || true)
-{
-  printf 'commit: %s\n' "$(git log -1 --format='%H %s')"
-  printf 'started: %s\n' "$(date -u -d "@$started" +%Y-%m-%dT%H:%M:%SZ)"
-  printf 'seconds: %s\n' "$(($(date +%s) - started))"
-  printf 'exit: %s\n' "$status"
-  printf 'display: xvfb-run -screen 0 %s, GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1\n' "$screen"
-  printf 'wait: a visible window within %ss (xdotool search every 50 ms), then %ss before the screenshot\n' \
-    "$wait_seconds" "$settle"
-  printf 'window: %s\n' "${window_seconds:-none}${window_seconds:+s after start}"
-  printf 'lang: %s\n' "${lang:-inherited (${LANG:-unset})}"
-  printf 'config: %s\n' "${config_win:-none}"
-  printf 'env: %s\n' "$(printf '%s' "$env_spec" | paste -sd' ' -)"
-  if [ "$perf" = 1 ]; then
-    printf 'perf: seq 1 3000000 workload, GHOSTTY_GX_PERF=1\n'
-  else
-    printf 'perf: off\n'
-  fi
-  printf 'xdotool: %s\n' "${xdotool_win:-none}"
-  printf 'ghostty args: --gtk-single-instance=false%s\n' "$extra_args"
-} >"$evidence/$name-meta.txt"
-mkdir -p "$out"
-cp -f "$evidence"/* "$out"/
-for file in "$evidence"/*; do
-  log "evidence: $(wslpath -w "$out/${file##*/}")"
-done
-if [ "$status" -eq 0 ]; then log "smoke passed"; else warn "smoke failed with exit $status"; fi
+xvfb-run --auto-servernum --server-args="-screen 0 $screen" python3 "$work/session.py" \
+  "$evidence" "$name" "$wait_seconds" "$xdo" "$settle" "$perf" "$work" "$screen" "$@" || status=$?
+cp -n "$evidence"/* "$out"/
+for file in "$evidence"/*; do log "evidence: $(wslpath -w "$out/${file##*/}")"; done
 exit "$status"
 """
 
@@ -934,6 +1081,11 @@ def perf_function() -> str:
     )
 
 
+def smoke_function() -> str:
+    program = PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + SMOKE_PROGRAM
+    return "write_smoke_program() {\ncat <<'GX_WSL_SESSION'\n" + program.strip() + "\nGX_WSL_SESSION\n}\n"
+
+
 def compose(*parts: str) -> str:
     return "\n".join(part.rstrip("\n") for part in parts) + "\n"
 
@@ -1022,6 +1174,8 @@ def env_assignments(values: Sequence[str]) -> str:
             raise GxWslError(f"--env takes NAME=VALUE with a shell variable name, got {value!r}")
         if "\n" in rest or "\r" in rest or "\0" in rest:
             raise GxWslError(f"--env values must be a single line, got {value!r}")
+        if name in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_CONFIG_HOME", "XDG_STATE_HOME") or (name == "GDK_BACKEND" and rest != "x11"):
+            raise GxWslError(f"--env cannot override smoke isolation: {name}")
         lines.append(value)
     return "\n".join(lines)
 
@@ -1057,7 +1211,7 @@ def smoke_invocation(
         PERF_WORKLOAD,
         *ghostty_args,
     )
-    return Invocation(compose(PRELUDE, GHOSTTY_HELPERS, perf_function(), SMOKE_BODY), args)
+    return Invocation(compose(PRELUDE, GHOSTTY_HELPERS, smoke_function(), SMOKE_BODY), args)
 
 
 def run_invocation(clone: str, *, lang: str | None, config: str | None, x11: bool, ghostty_args: Sequence[str]) -> Invocation:
