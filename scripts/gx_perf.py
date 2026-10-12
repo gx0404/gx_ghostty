@@ -456,6 +456,7 @@ def comparison_errors(old: Samples, new: Samples, gtk: bool = False, runs: int |
 def validation(samples: Sequence[Samples]) -> dict:
     return {"status": "valid", "identity": "unverified" if any(s.unverified for s in samples) else "verified",
             "verified_gtk_runs": [len(s.gtk_runs) for s in samples],
+            "cpu_contract": "process/endpoint quantized ticks; residual bounds diagnostic-only and unproved" if any(s.gtk_runs for s in samples) else "unverified",
             "unverified_files": sorted(set().union(*(s.unverified for s in samples)))}
 
 
@@ -708,6 +709,7 @@ def report_gtk_runs(out: Path, batch: dict, json_path: Path | None) -> int:
     result = {"validation": {"status": "rejected" if errors else "valid",
                              "identity": "verified" if all(len(s.gtk_runs) == batch["planned_runs"] for s in ordered) else "incomplete",
                              "renderer_path": "unknown", "performance_verdict": "not evaluated",
+                             "cpu_contract": "quantized process/endpoint ticks; residual bounds diagnostic-only and unproved",
                              "planned_runs": batch["planned_runs"], "valid_runs": batch["valid_runs"], "errors": errors}}
     if errors:
         text = "GTK comparison rejected; no performance verdict.\n" + "\n".join(errors) + "\n"

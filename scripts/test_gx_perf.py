@@ -408,6 +408,17 @@ class CommandTests(unittest.TestCase):
         with self.assertRaises(gx_perf.PerfError):
             gx_perf.collect([out / "old/run-01/perf-perf.txt"])
 
+    def test_cpu_contract_does_not_certify_a_linux_rounding_bound(self):
+        root = self.root / "diagnostic"
+        meta = gtk_fixture(root)
+        samples = gx_perf.collect([root])
+        info = gx_perf.validation([samples])
+        self.assertIn("diagnostic-only", info["cpu_contract"])
+        self.assertIn("unproved", info["cpu_contract"])
+        self.assertTrue(meta["cpu_accounting"]["diagnostic_only"])
+        self.assertNotIn("comparable", meta["cpu_accounting"])
+        self.assertNotIn("error_bound_ticks", meta["cpu_accounting"])
+
     def test_contradictory_metadata_is_not_verified(self):
         root = self.root / "contradiction"
         for key, value in (("dirty", True), ("commit", "f" * 40), ("child_exit", -11),

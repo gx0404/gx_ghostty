@@ -309,6 +309,8 @@ class ScriptTests(unittest.TestCase):
         invocation = all_invocations()["smoke-perf"]
         length = len(subprocess.list2cmdline(gx_wsl.wsl_command("Ubuntu-24.04", invocation)))
         self.assertLess(length, 32767)
+        program = invocation.script.split("<<'GX_WSL_SESSION'\n", 1)[1].split("\nGX_WSL_SESSION", 1)[0]
+        compile(program, "generated-smoke-session", "exec")
 
     @unittest.skipUnless(find_bash(), "needs a bash for `bash -n`")
     def test_scripts_parse(self) -> None:
@@ -535,8 +537,18 @@ class PerfProgramTests(unittest.TestCase):
         def sample(ticks, start):
             stat = stat_line(10, "ghostty", 0, 0, ticks, 0).split("\t", 1)[1]
             return {"pre_stat": stat, "post_stat": stat, "begin_ns": start, "end_ns": start + 1_000_000}
-        with self.assertRaisesRegex(ValueError, "unattributed|transient"):
-            self.program["cpu_accounting"](tasks, tasks, sample(0, 1_000_000_000), sample(100, 3_000_000_000), "10", 100)
+        before, after = sample(0, 1_000_000_000), sample(100, 3_000_000_000)
+        accounting = self.program["cpu_accounting"](tasks, tasks, before, after, "10", 100)
+        self.assertEqual(100, accounting["process_counters"]["utime"])
+        self.assertEqual(0, accounting["endpoint_counters"]["utime"])
+        self.assertTrue(accounting["diagnostic_only"])
+        self.assertFalse(accounting["diagnostic_within_bound"])
+        self.assertNotIn("comparable", accounting)
+        report = self.program["report"](tasks, tasks, "pid 10\nworkload_finished 1\nwindow_seconds 1\nworkload_seconds 1\n", "", 100, before, after)
+        self.assertIn("metric cpu.total 1.000 s", report)
+        self.assertIn("diagnostic only", report)
+        with self.assertRaises(ValueError):
+            self.program["cpu_accounting"](tasks, tasks, after, sample(0, 5_000_000_000), "10", 100)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc accounting semantics")
     def test_linux_process_stat_keeps_exited_thread_cpu(self):
@@ -584,6 +596,48 @@ class PerfProgramTests(unittest.TestCase):
         program = perf_namespace()
         exec(compile(gx_wsl.SMOKE_PROGRAM, "gx_wsl_smoke", "exec"), program)
         return program
+
+    def test_query_or_noninstall_zero_exit_does_not_certify_old_image(self):
+        from types import SimpleNamespace
+        source = {"commit": "a" * 40, "tree": "b" * 40, "dirty": False, "dirty_paths": ""}
+        image = {"sha256": "c" * 64, "device": 1, "inode": 2, "size": 3, "mtime_ns": 4}
+        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .ReleaseFast\n"
+        for extra in (["--help"], ["-h"], ["--list-steps"], ["-l"], ["test"], ["--unknown-flag"], ["--skip-oom-steps"]):
+            program = {"__name__": "test_build_query"}
+            exec(gx_wsl.RECEIPT_PROGRAM, program)
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                receipt = Path(tmp) / "receipt.json"
+                receipt.write_text('{"perf_eligible": true, "executable": "old"}', encoding="utf-8")
+                with mock.patch.dict(program, {"BUILD_RECEIPT": receipt, "source_identity": lambda: source,
+                                               "image_info": mock.Mock(return_value=image)}), \
+                        mock.patch.object(program["os"], "open", return_value=42) as opened, \
+                        mock.patch.object(program["os"], "close"), \
+                        mock.patch.object(program["subprocess"], "run", return_value=SimpleNamespace(
+                            returncode=0, stdout=version, stderr="")) as run, contextlib.redirect_stdout(io.StringIO()):
+                    code = program["build_main"](["-", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast", *extra])
+                self.assertEqual(0, code, "ordinary query/non-install status is passed through")
+                data = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertIs(data["perf_eligible"], False)
+                self.assertNotIn("executable", data)
+                opened.assert_not_called()
+                self.assertEqual(1, run.call_count, "no held-image/GPU version probe for non-installs")
+
+    def test_legal_summary_value_and_inline_jobs_are_install_receipts(self):
+        program = self.supervisor()
+        source = {"commit": "a" * 40, "tree": "b" * 40, "dirty": False, "dirty_paths": ""}
+        image = {"path": "/own/ghostty", "sha256": "c" * 64}
+        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .ReleaseFast\n"
+        base = ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"]
+        for extra in (["--summary", "all"], ["install", "--summary", "all", "-j4"], ["--color", "off", "-j4"]):
+            receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0,
+                       "build_argv": base + extra, "source_before": source, "source_after": source,
+                       "executable": image, "version": version, "version_exit": 0}
+            with self.subTest(extra=extra):
+                self.assertEqual(receipt, program["validate_receipt"](receipt, source, image, version, 0))
+        for extra in (["--help"], ["--list-steps"], ["test"], ["uninstall"], ["--"], ["--unknown-flag"],
+                      ["-j", "4"], ["--summary"], ["--summary", "bad"], ["--skip-oom-steps"]):
+            with self.subTest(rejected=extra), self.assertRaises(ValueError):
+                program["validate_receipt"](receipt | {"build_argv": base + extra}, source, image, version, 0)
 
     def test_build_receipt_binds_source_binary_version_and_argv(self):
         program = self.supervisor()

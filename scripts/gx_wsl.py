@@ -19,6 +19,9 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
   build [--gtk] [ZIG BUILD ARGS...]
         python3 scripts/zigw.py build ...; --gtk adds -Dapp-runtime=gtk -fno-sys=gtk4-layer-shell
         (Ubuntu 24.04 has no gtk4-layer-shell development package, so it is built from pkg/).
+        Only normal installs certify an image. Query/help/list/custom-step or unknown arguments
+        write an ineligible attempt, with Zig output and exit status unchanged. Known valued options
+        such as --summary all and inline -j4 are supported; pinned Zig rejects separated -j 4.
   test [--suite main|vt] [--gtk] [--filter TEXT]... [ZIG_TEST ARGS...]
         python3 scripts/zig_test.py; the main suite (default) gets -Dapp-runtime=none like the
         gx-ci linux-main job, or the GTK runtime flags with --gtk.
@@ -534,6 +537,43 @@ def version_mode(version):
     return match.group(1) if match else "unknown"
 
 
+def build_kind(args):
+    if any(arg in ("-h", "--help", "-l", "--list-steps") for arg in args):
+        return "query"
+    values = {"--summary", "--color", "--seed", "--maxrss", "--sysroot", "--search-prefix", "--libc",
+              "--error-style", "--multiline-errors", "--debug-log", "--libc-runtimes", "--glibc-runtimes"}
+    flags = {"--verbose", "--verbose-link", "--verbose-cc", "--verbose-cimport", "--debug-pkg-config",
+             "--debug-compile-errors", "-fincremental", "-fno-incremental"}
+    steps = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg in values:
+            if index == len(args) or not args[index]:
+                return "unsupported"
+            value = args[index]
+            index += 1
+            if (arg == "--summary" and value not in ("all", "new", "failures", "line", "none")) or \
+                    (arg == "--color" and value not in ("auto", "on", "off")):
+                return "unsupported"
+        elif arg.startswith(("-Demit-", "-Dtarget=")):
+            return "custom"
+        elif arg.startswith("-D") and len(arg) > 2:
+            continue
+        elif arg.startswith(("-fsys=", "-fno-sys=")) and arg.rsplit("=", 1)[1]:
+            continue
+        elif re.fullmatch(r"-j\d+", arg) and 0 < int(arg[2:]) <= 0xffffffff:
+            continue
+        elif arg in flags:
+            continue
+        elif arg.startswith("-"):
+            return "unsupported"
+        else:
+            steps.append(arg)
+    return "install" if not steps or steps == ["install"] else "non-install"
+
+
 def validate_receipt(receipt, source, executable, version, version_exit):
     if source.get("dirty") is not False or source.get("dirty_paths") != "" or \
             any(not re.fullmatch(r"[0-9a-f]{40}", source.get(key, "")) for key in ("commit", "tree")):
@@ -544,8 +584,7 @@ def validate_receipt(receipt, source, executable, version, version_exit):
             not all(isinstance(arg, str) for arg in argv) or build_option(argv, "optimize") != "ReleaseFast" or \
             build_option(argv, "app-runtime") != "gtk":
         raise ValueError("missing successful normal ReleaseFast GTK build receipt")
-    if any(arg.startswith(("--prefix", "-p", "-Demit-", "-Dtarget=")) for arg in argv[3:]) or \
-            any(not arg.startswith("-") and arg != "install" for arg in argv[3:]):
+    if build_kind(argv[3:]) != "install":
         raise ValueError("build receipt does not describe the normal GTK install")
     if receipt.get("source_before") != source or receipt.get("source_after") != source:
         raise ValueError("source identity differs from build receipt")
@@ -564,24 +603,23 @@ def validate_receipt(receipt, source, executable, version, version_exit):
 
 def build_main(argv):
     args = argv[1:]
-    standard_gtk = build_option(args, "app-runtime") == "gtk" and not any(arg.startswith("-Demit-lib-vt") for arg in args)
-    receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build",
+    kind = build_kind(args)
+    standard_gtk = kind == "install" and build_option(args, "app-runtime") == "gtk"
+    receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_kind": kind,
                "build_argv": ["python3", "scripts/zigw.py", "build", *args], "build_exit": None,
                "started_realtime": time.time(), "perf_eligible": False}
     lock = BUILD_RECEIPT.parent / "build.lock"
-    if standard_gtk:
-        BUILD_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            lock.mkdir()
-        except FileExistsError:
-            print("[gx-wsl] error: own clone build is already in progress", file=sys.stderr)
-            return 1
+    BUILD_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if standard_gtk:
-            receipt["source_before"] = source_identity()
-            BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
-            if build_option(args, "optimize") == "ReleaseFast" and receipt["source_before"]["dirty"]:
-                raise ValueError("perf build requires a clean committed source tree")
+        lock.mkdir()
+    except FileExistsError:
+        print("[gx-wsl] error: own clone build is already in progress", file=sys.stderr)
+        return 1
+    try:
+        receipt["source_before"] = source_identity()
+        BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        if standard_gtk and build_option(args, "optimize") == "ReleaseFast" and receipt["source_before"]["dirty"]:
+            raise ValueError("perf build requires a clean committed source tree")
         code = subprocess.run([sys.executable, "scripts/zigw.py", "build", *args], check=False).returncode
         receipt["build_exit"] = code
         if code != 0 or not standard_gtk:
@@ -611,10 +649,9 @@ def build_main(argv):
         print("[gx-wsl] build receipt rejected: " + str(exc), file=sys.stderr)
         return 1
     finally:
-        if standard_gtk:
-            receipt["finished_realtime"] = time.time()
-            BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
-            lock.rmdir()
+        receipt["finished_realtime"] = time.time()
+        BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        lock.rmdir()
 '''
 
 BUILD_BODY = r"""enter_clone
@@ -757,8 +794,8 @@ def cpu_accounting(before_text, after_text, process_before, process_after, pid, 
     brackets = []
     for sample in (process_before, process_after):
         begin, end = sample["begin_ns"], sample["end_ns"]
-        if type(begin) is not int or type(end) is not int or begin < 0 or not 0 <= end - begin <= 50_000_000:
-            raise ValueError("process/task snapshot exceeds 50 ms precision budget")
+        if type(begin) is not int or type(end) is not int or begin < 0 or end < begin:
+            raise ValueError("invalid process/task snapshot read order")
         low = parse_tasks(pid + "\t" + sample["pre_stat"])[pid]
         high = parse_tasks(pid + "\t" + sample["post_stat"])[pid]
         if any(task["starttime"] != before[pid]["starttime"] for task in (low, high)):
@@ -776,17 +813,15 @@ def cpu_accounting(before_text, after_text, process_before, process_after, pid, 
     rounding = len(before) + len(after) + 2
     skew = {key: sum(high[key] - low[key] for low, high in brackets) for key in residual}
     bound = {key: rounding + skew[key] for key in residual}
-    if any(abs(residual[key]) > bound[key] for key in residual):
-        raise ValueError(f"unattributed/transient CPU exceeds tick+read-skew bound: residual={residual}, bound={bound}")
-    gap = sum(residual.values())
-    error = sum(bound.values())
     return {"total_source": "process stat post-to-post (includes exited threads)",
             "thread_population": "endpoint identities only; no full-lifetime population proof",
-            "comparable": True, "clk_tck": clk_tck, "process_counters": total, "endpoint_counters": endpoint,
-            "residual_ticks": residual, "rounding_ticks_per_counter": rounding, "read_skew_ticks": skew,
-            "error_bound_ticks": bound, "unattributed_cpu_range_ticks": [max(0, gap - error), max(0, gap + error)],
-            "snapshot_max_ns": 50_000_000, "process_window_begin_ns": process_before["end_ns"],
-            "process_window_end_ns": process_after["end_ns"]}
+            "comparison_contract": "quantized process/endpoint ticks; no full-population or rounding-bound guarantee",
+            "diagnostic_only": True, "bound_proof": "unproved for Linux adjusted CPU counters; not a sample-validity or benefit gate",
+            "clk_tck": clk_tck, "process_counters": total, "endpoint_counters": endpoint,
+            "residual_ticks": residual, "diagnostic_rounding_ticks_per_counter": rounding, "read_skew_ticks": skew,
+            "diagnostic_bound_ticks": bound, "diagnostic_within_bound": all(abs(residual[key]) <= bound[key] for key in residual),
+            "snapshot_durations_ns": [sample["end_ns"] - sample["begin_ns"] for sample in (process_before, process_after)],
+            "process_window_begin_ns": process_before["end_ns"], "process_window_end_ns": process_after["end_ns"]}
 
 
 def report(before_text, after_text, times_text, log_text, clk_tck, process_before=None, process_after=None):
@@ -812,7 +847,7 @@ def report(before_text, after_text, times_text, log_text, clk_tck, process_befor
         endpoint_cpu = (total["utime"] + total["stime"]) / clk_tck
         lines.append(f"metric cpu.endpoint_threads {endpoint_cpu:.3f} s")
         total.update(accounting["process_counters"])
-        lines.append(f"accounting: residual_ticks={accounting['residual_ticks']} error_bound_ticks={accounting['error_bound_ticks']}")
+        lines.append(f"diagnostic only: residual_ticks={accounting['residual_ticks']} candidate_bound_ticks={accounting['diagnostic_bound_ticks']} (Linux rounding proof missing; not a validity/benefit gate)")
     for key in ("window_seconds", "workload_seconds"):
         lines.append(f"metric {key} {float(times[key]):.3f} s")
     for name in order + ["total"]:
@@ -1285,6 +1320,7 @@ def build_function() -> str:
 
 def smoke_function() -> str:
     program = PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + SMOKE_PROGRAM
+    program = "\n".join(re.sub(r"^(?:    )+", lambda m: "  " * (len(m[0]) // 4), line) for line in program.splitlines())
     return "write_smoke_program() {\ncat <<'GX_WSL_SESSION'\n" + program.strip() + "\nGX_WSL_SESSION\n}\n"
 
 
