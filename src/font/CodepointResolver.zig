@@ -92,8 +92,10 @@ pub fn deinit(self: *CodepointResolver, alloc: Allocator) void {
 ///      cannot be disabled, but it can be replaced with a stylized font
 ///      face.
 ///
-///   2. If there is a codepoint override for the codepoint, we satisfy
-///      that requirement if we can, no matter what style or presentation.
+// fork(gx): GX-0038 mapped styles stay in the resolved family
+///   2. If there is a codepoint override, prefer a real face of the requested
+///      style in its resolved family, then permitted synthetic traits, then
+///      that family's regular face. Mappings accept any presentation.
 ///
 ///   3. If this is a sprite codepoint (such as an underline), then the
 ///      sprite font always is the result.
@@ -130,7 +132,8 @@ pub fn getIndex(
     }
 
     // Codepoint overrides.
-    if (self.getIndexCodepointOverride(alloc, cp)) |idx_| {
+    // fork(gx): GX-0038 pass the enabled request style to codepoint mappings
+    if (self.getIndexCodepointOverride(alloc, cp, style)) |idx_| {
         if (idx_) |idx| return idx;
     } else |err| {
         log.warn("codepoint override failed codepoint={} err={}", .{ cp, err });
@@ -157,7 +160,8 @@ pub fn getIndex(
     };
 
     // If we can find the exact value, then return that.
-    if (self.collection.getIndex(cp, style, p_mode)) |value| return value;
+    // fork(gx): GX-0038 exclude mapping-private indices from ordinary fallback
+    if (self.descriptor_cache.getOrdinaryIndex(&self.collection, cp, style, p_mode)) |value| return value;
 
     // If we're not a regular font style, try looking for a regular font
     // that will satisfy this request. Blindly looking for unmatched styled
@@ -224,78 +228,23 @@ pub fn getIndex(
     if (style == .regular and p_mode == .any) return null;
 
     // For non-regular fonts, we fall back to regular with any presentation
-    return self.collection.getIndex(cp, .regular, .{ .any = {} });
+    // fork(gx): GX-0038 mapping-private faces also stay out of the last-resort search
+    return self.descriptor_cache.getOrdinaryIndex(&self.collection, cp, .regular, .{ .any = {} });
 }
 
 /// Checks if the codepoint is in the map of codepoint overrides,
 /// finds the override font, and returns it.
+// fork(gx): GX-0038 delegate mapped-family style discovery and owned synthesis
 fn getIndexCodepointOverride(
     self: *CodepointResolver,
     alloc: Allocator,
     cp: u32,
+    style: Style,
 ) !?Collection.Index {
-    // If discovery is disabled then we can't do codepoint overrides
-    // since the override is based on discovery to find the font.
     if (comptime font.Discover == void) return null;
-
-    // Get our codepoint map. If we have no map set then we have no
-    // codepoint overrides and we're done.
     const map = self.codepoint_map orelse return null;
-
-    // If we have a codepoint too large or isn't in the map, then we
-    // don't have an override. The map returns a descriptor that can be
-    // used with font discovery to search for a matching font.
-    const cp_u21 = std.math.cast(u21, cp) orelse return null;
-    const desc = map.get(cp_u21) orelse return null;
-
-    // Fast path: the descriptor is already loaded. This means that we
-    // already did the search before and we have an exact font for this
-    // codepoint.
-    const idx_: ?Collection.Index = self.descriptor_cache.get(desc) orelse idx: {
-        // Slow path: we have to find this descriptor and load the font
-        const discover = self.discover orelse return null;
-        var disco_it = try discover.discover(alloc, desc);
-        defer disco_it.deinit();
-
-        const face = (try disco_it.next()) orelse {
-            log.warn(
-                "font lookup for codepoint map failed codepoint={} err=FontNotFound",
-                .{cp},
-            );
-
-            // Add null to the cache so we don't do a lookup again later.
-            try self.descriptor_cache.put(alloc, desc, null);
-            return null;
-        };
-
-        // Add the font to our list of fonts so we can get an index for it,
-        // and ensure the index is stored in the descriptor cache for next time.
-        const idx = try self.collection.addDeferred(alloc, face, .{
-            .style = .regular,
-            .fallback = false,
-            .size_adjustment = font.default_fallback_adjustment,
-        });
-        try self.descriptor_cache.put(alloc, desc, idx);
-
-        break :idx idx;
-    };
-
-    // The descriptor cache will populate null if the descriptor is not found
-    // to avoid expensive discoveries later, so if it is null then we already
-    // searched and found nothing.
-    const idx = idx_ orelse return null;
-
-    // We need to verify that this index has the codepoint we want.
-    if (self.collection.hasCodepoint(idx, cp, .{ .any = {} })) {
-        log.debug("codepoint override based on config codepoint={} family={s}", .{
-            cp,
-            desc.family orelse "",
-        });
-
-        return idx;
-    }
-
-    return null;
+    const discover = self.discover orelse return null;
+    return try self.descriptor_cache.resolve(alloc, &self.collection, discover, map, cp, style);
 }
 
 /// Returns the presentation for a specific font index. This is useful for
@@ -359,26 +308,8 @@ pub const StyleStatus = std.EnumArray(Style, bool);
 /// for a regular style. That's just an inefficient choice made now because
 /// the implementation is simpler and codepoint maps matching a regular
 /// font is a rare case.
-const DescriptorCache = std.HashMapUnmanaged(
-    DiscoveryDescriptor,
-    ?Collection.Index,
-    struct {
-        const KeyType = DiscoveryDescriptor;
-
-        pub fn hash(ctx: @This(), k: KeyType) u64 {
-            _ = ctx;
-            return k.hashcode();
-        }
-
-        pub fn eql(ctx: @This(), a: KeyType, b: KeyType) bool {
-            // Note that this means its possible to have two different
-            // descriptors match when there is a hash collision so we
-            // should button this up later.
-            return ctx.hash(a) == ctx.hash(b);
-        }
-    },
-    std.hash_map.default_max_load_percentage,
-);
+// fork(gx): GX-0038 content-keyed per-style mapping cache owns discovery sources
+const DescriptorCache = @import("../gx/font_codepoint_map.zig").State;
 
 test getIndex {
     const testing = std.testing;

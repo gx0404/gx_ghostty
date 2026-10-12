@@ -81,6 +81,8 @@ test {
     _ = confirm;
     _ = conpty;
     _ = dmabuf_export;
+    _ = @import("font_codepoint_map.zig");
+    _ = @import("font_map_fontconfig.zig");
     _ = fuzzy;
     _ = gtk_css;
     _ = gui_settings;

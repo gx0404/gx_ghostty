@@ -1213,6 +1213,43 @@ class Gx0037ShapeTests(unittest.TestCase):
                 self.assertEqual(stripped, upstream)
 
 
+class Gx0038ShapeTests(unittest.TestCase):
+    def test_mapping_style_and_cache_are_thin_hooks(self):
+        source = (ROOT / "src/font/CodepointResolver.zig").read_text(encoding="utf-8")
+        self.assertIn("self.getIndexCodepointOverride(alloc, cp, style)", source)
+        self.assertIn('const DescriptorCache = @import("../gx/font_codepoint_map.zig").State;', source)
+        self.assertIn("self.descriptor_cache.resolve(alloc, &self.collection, discover, map, cp, style)", source)
+        self.assertEqual(source.count("self.descriptor_cache.getOrdinaryIndex(&self.collection,"), 2)
+        resolver_body = source.split("pub fn getIndex(", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("self.collection.getIndex(", resolver_body)
+        mapping = (ROOT / "src/gx/font_codepoint_map.zig").read_text(encoding="utf-8")
+        self.assertIn("private_indices.contains(index.int())", mapping)
+        self.assertIn("private_indices.putAssumeCapacityNoClobber(idx.int(), {})", mapping)
+        self.assertLess(mapping.index("state.private_indices.ensureUnusedCapacity(alloc, 1)"), mapping.index("const idx = try collection.add(alloc, face,"))
+        self.assertNotIn("return ctx.hash(a) == ctx.hash(b);", source)
+        self.assertNotIn(".style = .regular,", source.split("fn getIndexCodepointOverride(", 1)[1].split("\n}", 1)[0])
+        for line in ("if (self.getIndexCodepointOverride(alloc, cp, style))", "fn getIndexCodepointOverride(", "const DescriptorCache ="):
+            lines = source.splitlines()
+            pos = next(i for i, text in enumerate(lines) if line in text)
+            self.assertIn("fork(gx): GX-0038", lines[pos - 1])
+
+    def test_fontconfig_and_grid_additions_have_closed_hunks(self):
+        expected = {"src/font/discovery.zig": 1, "src/font/SharedGridSet.zig": 4}
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for path, count in expected.items():
+            with self.subTest(path=path):
+                self.assertIn(Patch("GX-0038", path, "fork(gx): GX-0038", "active"), patches)
+                source = (ROOT / path).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0038")
+                self.assertEqual(len(hunks), count)
+                self.assertNotIn("font_policy", stripped)
+                self.assertNotIn("discoverMappedFamily", stripped)
+        grid = (ROOT / "src/font/SharedGridSet.zig").read_text(encoding="utf-8")
+        self.assertIn(".descriptor_cache = .{ .policy = key.font_policy }", grid)
+        self.assertIn('Policy.fromConfig(config)', grid)
+        self.assertIn("autoHash(hasher, @as(u8, @bitCast(self.font_policy)));", grid)
+
+
 REGISTRY_TEMPLATE = """# fork 补丁登记
 
 ## 规则

@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0037）之后的号。在册的 31 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0037，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0038）之后的号。在册的 32 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0038，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -98,6 +98,9 @@
 | GX-0037 | `src/build/webgen/main_config.zig` | `fork(gx): GX-0037` | active |
 | GX-0037 | `src/build/webgen/main_actions.zig` | `fork(gx): GX-0037` | active |
 | GX-0037 | `src/build/webgen/main_commands.zig` | `fork(gx): GX-0037` | active |
+| GX-0038 | `src/font/CodepointResolver.zig` | `fork(gx): GX-0038` | active |
+| GX-0038 | `src/font/SharedGridSet.zig` | `fork(gx): GX-0038` | active |
+| GX-0038 | `src/font/discovery.zig` | `fork(gx): GX-0038` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1334,3 +1337,16 @@ python -m unittest scripts.test_fork_patches -v
 
 - `just build -Demit-webdata` 后读取 `zig-out/share/ghostty/webdata/{config,actions,commands}.mdx`：逐项对照真源末项 doc comment，确认配置末字段全文、`gx` 绑定动作全文与最后 CLI 示例闭合；不能只用构建退出码代证。
 - `python scripts/run_unittests.py test_fork_patches test_gx_test_roots`；`Gx0037ShapeTests` 锁定刷新在生成调用之后、标记闭集与三个块的纯新增性（删块后与合入的上游版本相同）。
+
+## GX-0038 映射字体按同族真实样式解析
+
+- 文件：`src/font/CodepointResolver.zig`（样式参数、算法说明、缓存别名与转发，以及两个普通查找转发）；`src/font/discovery.zig::Fontconfig.discoverMappedFamily`（纯新增 adapter 转发）；`src/font/SharedGridSet.zig`（四个纯新增块：resolver 策略、Key 字段、初始化与 hash）。状态 active，未回馈上游。
+- 原因：上游的 `font-codepoint-map` 把所有请求缓存到常规体；Fontconfig 的排序首项并不保证是真粗体或同族字面。synthetic 与禁用样式未进入 grid key 还会串用旧策略。
+- 真源：`src/gx/font_codepoint_map.zig::Policy/State/Batch`。descriptor 逐字段内容判等，请求按有效样式缓存；实际常规体锁定字体族，先找覆盖码位的真样式，再在独立拥有的 face 上合成缺失 traits，最后退同族常规体。粗斜体的 synthetic 开关独立于粗体与斜体；缺 glyph 继续同族候选，OOM 不记成不存在。
+- adapter：新路径 `src/gx/font_map_fontconfig.zig` 检查原始 pattern 的 family/weight/slant/file/index 后才 render-prepare；fork-owned `src/font/directwrite/discovery.zig` 重用真实字面选择，并保留命名实例和实际轴坐标；`src/gx/font_map_freetype.zig` 重新打开物理源，不调用会共享 FT_Face 的 syntheticBold/syntheticItalic。无发现后端保持普通回退；未支持专用 adapter 的后端保持常规映射。
+- 隔离：映射插入前先预留私有 index 集合容量，成功添加后无分配登记 index。`State.getOrdinaryIndex` 通过现有公开只读 iterator 跳过这些 index；resolver 的精确查找与最终 any-presentation 查找仅作薄转发。映射仍通过直接 index 呈现；普通配置及后来发现的 fallback entry 不登记私有、仍按原先顺序遍历。不仅仅改变 fallback 标志，不修改 Collection 或 glyph cache。
+- 实证：真实 Windows 的微软雅黑 regular＋Consolas bold、只映射 U+4E2D，同 resolver 粗体「国→中→国」及 SharedGrid「国→中→家」保持未映射来源；Linux 用现有字体临时文件的等价缺 glyph 顺序。file/fromDeferred 在非 1 ic_width、96/144 DPI 下验证原生/合成 FT_Face、mutex、实际字号与 regular 前后 metrics，以及逐次分配失败。外国粗体测试仅暴露 Inconsolata 的 regular raw pattern（现有文件另含可变命名实例），强制 JetBrains Bold 排首；目标字体合成、不借外国真粗体。
+- 不变：普通 `Collection.completeStyles`、C ABI、GPU 算法、默认映射、alpha-blending 与 FreeType 默认值；`SharedGrid` 的 codepoint/glyph 键无需扩展。
+- 同步：上游取原文后仅保留 resolver 的样式、缓存与普通查找转发、Fontconfig 转发、grid Policy 及其 hash；普通发现不可改成映射专用过滤。编号按共同树合入顺序固定为 GX-0038，已有 GX-0031～GX-0037 保持不变。
+- 移除条件：上游映射原生支持同族样式、独立合成、内容缓存判等及策略隔离后，移除这些薄钩子和 GX 模块，将三条登记行改为 removed。
+- 验证：`just test --filter gx.font_codepoint_map --filter directwrite --filter getIndex --filter Key`；独占 WSL clone 的同过滤 POSIX/GTK 测试及 GTK build；`just test -Dfont-backend=freetype --filter gx.font_codepoint_map` 验证无发现退路；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff。真实 CJK 终端四样式需 Windows 96 DPI/100% 与 GTK scale=1 原尺寸图，锁屏或仅 Xvfb 时记 PENDING，不以设置预览代证。

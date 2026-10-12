@@ -136,6 +136,59 @@ pub const DirectWrite = struct {
         return try self.discover(alloc, desc);
     }
 
+    pub fn discoverMappedFamily(
+        self: *const DirectWrite,
+        alloc: Allocator,
+        library: Library,
+        descriptor: Descriptor,
+        family: ?[:0]const u8,
+        style: font.Style,
+    ) !@import("../../gx/font_codepoint_map.zig").Batch {
+        const mapped = @import("../../gx/font_codepoint_map.zig");
+        const ft = @import("../../gx/font_map_freetype.zig");
+        var request = descriptor;
+        request.codepoint = 0;
+        if (family) |locked| {
+            const desired = mapped.Traits.fromStyle(style);
+            request.family = locked;
+            request.style = null;
+            request.bold = desired.bold;
+            request.italic = desired.italic;
+        }
+        var result: mapped.Batch = .{};
+        errdefer result.deinit(alloc);
+        if (family) |locked| result.family = try alloc.dupeZ(u8, locked);
+        var it = try self.discover(alloc, request);
+        defer it.deinit();
+        var base_traits: ?mapped.Traits = null;
+        while (true) {
+            var candidate = (switch (it) {
+                .dwrite => |*native| try native.nextMapped(),
+                .scan => |*scan| blk: {
+                    var deferred = (try scan.next()) orelse break :blk null;
+                    break :blk ft.fromDeferred(alloc, library, deferred, descriptor.variations) catch |err| {
+                        deferred.deinit();
+                        return err;
+                    };
+                },
+            }) orelse break;
+            errdefer candidate.deinit(alloc);
+            var buf: [1024]u8 = undefined;
+            const actual_family = try candidate.source.deferred.familyName(&buf);
+            if (result.family == null) {
+                result.family = try alloc.dupeZ(u8, actual_family);
+                base_traits = candidate.traits;
+            }
+            const wanted = if (style == .regular) base_traits.? else mapped.Traits.fromStyle(style);
+            if (!std.ascii.eqlIgnoreCase(result.family.?, actual_family) or !candidate.traits.eql(wanted)) {
+                candidate.deinit(alloc);
+                continue;
+            }
+            try result.candidates.append(alloc, candidate);
+        }
+        return result;
+    }
+
     /// The family name of a discovered face. FreeType decodes the font's
     /// English names, unlike `Face.name`, which returns some name records
     /// as raw UTF-16.
@@ -330,6 +383,27 @@ const Iterator = struct {
                 },
             };
         }
+    }
+
+    fn nextMapped(self: *Iterator) !?@import("../../gx/font_codepoint_map.zig").Candidate {
+        const ft = @import("../../gx/font_map_freetype.zig");
+        if (self.i == self.candidates.items.len) return null;
+        const candidate = self.candidates.items[self.i];
+        self.i += 1;
+        defer candidate.release();
+        const face = try candidate.fontFace();
+        defer com.release(face);
+        var axes_buf: [16]match.AxisValue = undefined;
+        const axes = axisValues(face, &axes_buf);
+        var variations: std.ArrayList(Variation) = .empty;
+        defer variations.deinit(self.alloc);
+        for (axes) |axis| try variations.append(self.alloc, .{ .id = @bitCast(axis.tag), .value = axis.value });
+        try variations.appendSlice(self.alloc, self.variations);
+        var deferred = try self.load(candidate);
+        return ft.fromDeferred(self.alloc, self.lib, deferred, variations.items) catch |err| {
+            deferred.deinit();
+            return err;
+        };
     }
 
     /// The faces of the family named `family` that suit `desc`.
