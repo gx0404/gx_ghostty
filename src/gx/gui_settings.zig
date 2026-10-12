@@ -95,6 +95,10 @@ pub const Overlay = struct {
         return null;
     }
 
+    /// Returns all values for `key` in file order, including duplicates and
+    /// empty values. Bare keys have an empty value, as with `get`. Free the
+    /// returned slice with `alloc`; its values borrow overlay lines and become invalid
+    /// when those lines are replaced or removed, or this overlay is deinitialized.
     pub fn getAll(self: *const Overlay, alloc: Allocator, key: []const u8) Allocator.Error![]const []const u8 {
         var values: std.ArrayList([]const u8) = .empty;
         errdefer values.deinit(alloc);
