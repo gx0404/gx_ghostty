@@ -160,7 +160,8 @@ pub fn getIndex(
     };
 
     // If we can find the exact value, then return that.
-    if (self.collection.getIndex(cp, style, p_mode)) |value| return value;
+    // fork(gx): GX-0031 exclude mapping-private indices from ordinary fallback
+    if (self.descriptor_cache.getOrdinaryIndex(&self.collection, cp, style, p_mode)) |value| return value;
 
     // If we're not a regular font style, try looking for a regular font
     // that will satisfy this request. Blindly looking for unmatched styled
@@ -227,7 +228,8 @@ pub fn getIndex(
     if (style == .regular and p_mode == .any) return null;
 
     // For non-regular fonts, we fall back to regular with any presentation
-    return self.collection.getIndex(cp, .regular, .{ .any = {} });
+    // fork(gx): GX-0031 mapping-private faces also stay out of the last-resort search
+    return self.descriptor_cache.getOrdinaryIndex(&self.collection, cp, .regular, .{ .any = {} });
 }
 
 /// Checks if the codepoint is in the map of codepoint overrides,

@@ -1253,11 +1253,13 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0031 映射字体按同族真实样式解析
 
-- 文件：`src/font/CodepointResolver.zig`（样式参数、算法说明、缓存别名与转发）；`src/font/discovery.zig::Fontconfig.discoverMappedFamily`（纯新增 adapter 转发）；`src/font/SharedGridSet.zig`（四个纯新增块：resolver 策略、Key 字段、初始化与 hash）。状态 active，未回馈上游。
+- 文件：`src/font/CodepointResolver.zig`（样式参数、算法说明、缓存别名与转发，以及两个普通查找转发）；`src/font/discovery.zig::Fontconfig.discoverMappedFamily`（纯新增 adapter 转发）；`src/font/SharedGridSet.zig`（四个纯新增块：resolver 策略、Key 字段、初始化与 hash）。状态 active，未回馈上游。
 - 原因：上游的 `font-codepoint-map` 把所有请求缓存到常规体；Fontconfig 的排序首项并不保证是真粗体或同族字面。synthetic 与禁用样式未进入 grid key 还会串用旧策略。
 - 真源：`src/gx/font_codepoint_map.zig::Policy/State/Batch`。descriptor 逐字段内容判等，请求按有效样式缓存；实际常规体锁定字体族，先找覆盖码位的真样式，再在独立拥有的 face 上合成缺失 traits，最后退同族常规体。粗斜体的 synthetic 开关独立于粗体与斜体；缺 glyph 继续同族候选，OOM 不记成不存在。
 - adapter：新路径 `src/gx/font_map_fontconfig.zig` 检查原始 pattern 的 family/weight/slant/file/index 后才 render-prepare；fork-owned `src/font/directwrite/discovery.zig` 重用真实字面选择，并保留命名实例和实际轴坐标；`src/gx/font_map_freetype.zig` 重新打开物理源，不调用会共享 FT_Face 的 syntheticBold/syntheticItalic。无发现后端保持普通回退；未支持专用 adapter 的后端保持常规映射。
+- 隔离：映射插入前先预留私有 index 集合容量，成功添加后无分配登记 index。`State.getOrdinaryIndex` 通过现有公开只读 iterator 跳过这些 index；resolver 的精确查找与最终 any-presentation 查找仅作薄转发。映射仍通过直接 index 呈现；普通配置及后来发现的 fallback entry 不登记私有、仍按原先顺序遍历。不仅仅改变 fallback 标志，不修改 Collection 或 glyph cache。
+- 实证：真实 Windows 的微软雅黑 regular＋Consolas bold、只映射 U+4E2D，同 resolver 粗体「国→中→国」及 SharedGrid「国→中→家」保持未映射来源；Linux 用现有字体临时文件的等价缺 glyph 顺序。file/fromDeferred 在非 1 ic_width、96/144 DPI 下验证原生/合成 FT_Face、mutex、实际字号与 regular 前后 metrics，以及逐次分配失败。外国粗体测试仅暴露 Inconsolata 的 regular raw pattern（现有文件另含可变命名实例），强制 JetBrains Bold 排首；目标字体合成、不借外国真粗体。
 - 不变：普通 `Collection.completeStyles`、C ABI、GPU 算法、默认映射、alpha-blending 与 FreeType 默认值；`SharedGrid` 的 codepoint/glyph 键无需扩展。
-- 同步：上游取原文后仅保留 resolver 的样式转发和缓存别名、Fontconfig 转发、grid Policy 及其 hash；普通发现不可改成映射专用过滤。编号是本分支下一空号，集成时由协调者按合入顺序调整。
+- 同步：上游取原文后仅保留 resolver 的样式、缓存与普通查找转发、Fontconfig 转发、grid Policy 及其 hash；普通发现不可改成映射专用过滤。编号是本分支下一空号，集成时由协调者按合入顺序调整。
 - 移除条件：上游映射原生支持同族样式、独立合成、内容缓存判等及策略隔离后，移除这些薄钩子和 GX 模块，将三条登记行改为 removed。
 - 验证：`just test --filter gx.font_codepoint_map --filter directwrite --filter getIndex --filter Key`；独占 WSL clone 的同过滤 POSIX/GTK 测试及 GTK build；`just test -Dfont-backend=freetype --filter gx.font_codepoint_map` 验证无发现退路；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff。真实 CJK 终端四样式需 Windows 96 DPI/100% 与 GTK scale=1 原尺寸图，锁屏或仅 Xvfb 时记 PENDING，不以设置预览代证。

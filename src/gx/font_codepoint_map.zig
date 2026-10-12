@@ -94,12 +94,14 @@ pub const Candidate = struct {
         };
     }
 
-    fn index(self: *Candidate, alloc: Allocator, collection: *font.Collection, family: []const u8, style: Style, synthetic: Traits) !font.Collection.Index {
+    fn index(self: *Candidate, alloc: Allocator, collection: *font.Collection, state: *State, family: []const u8, style: Style, synthetic: Traits) !font.Collection.Index {
         if (self.indices.get(style)) |idx| return idx;
         const opts = collection.load_options orelse return error.DeferredLoadingUnavailable;
+        try state.private_indices.ensureUnusedCapacity(alloc, 1);
         var face = try self.load(self, opts.library, opts.faceOptions(), synthetic);
         errdefer face.deinit();
         const idx = try collection.add(alloc, face, .{ .style = style, .fallback = false, .size_adjustment = font.default_fallback_adjustment });
+        state.private_indices.putAssumeCapacityNoClobber(idx.int(), {});
         self.indices.set(style, idx);
         log.info("mapped face family={s} style={s} native-bold={} native-italic={} synthetic-bold={} synthetic-italic={} file={s} index=0x{X} axes={d}", .{
             family, @tagName(style), self.traits.bold, self.traits.italic, synthetic.bold, synthetic.italic, self.file orelse "<memory>", self.face_index, self.variations.len,
@@ -118,7 +120,7 @@ pub const Batch = struct {
         if (self.family) |family| alloc.free(family);
     }
 
-    fn find(self: *Batch, alloc: Allocator, collection: *font.Collection, cp: u32, style: Style, synthesize: bool) !?font.Collection.Index {
+    fn find(self: *Batch, alloc: Allocator, collection: *font.Collection, state: *State, cp: u32, style: Style, synthesize: bool) !?font.Collection.Index {
         const desired = Traits.fromStyle(style);
         for (self.candidates.items) |*candidate| {
             if (style != .regular) {
@@ -128,7 +130,7 @@ pub const Batch = struct {
             if (!candidate.hasCodepoint(cp)) continue;
             const missing: Traits = if (synthesize) desired.missing(candidate.traits) else .{};
             if (!missing.eql(.{}) and candidate.load == legacyLoad) continue;
-            const idx = candidate.index(alloc, collection, self.family orelse "", style, missing) catch |err| {
+            const idx = candidate.index(alloc, collection, state, self.family orelse "", style, missing) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 log.warn("mapped face load failed family={s} style={s} err={}", .{ self.family orelse "", @tagName(style), err });
                 continue;
@@ -183,6 +185,7 @@ fn optionalStringEqual(a: ?[:0]const u8, b: ?[:0]const u8) bool {
 pub const State = struct {
     policy: Policy = .{},
     requests: std.HashMapUnmanaged(Request, *Batch, RequestContext, std.hash_map.default_max_load_percentage) = .{},
+    private_indices: std.AutoHashMapUnmanaged(u16, void) = .{},
 
     pub fn deinit(self: *State, alloc: Allocator) void {
         var it = self.requests.valueIterator();
@@ -191,6 +194,19 @@ pub const State = struct {
             alloc.destroy(value.*);
         }
         self.requests.deinit(alloc);
+        self.private_indices.deinit(alloc);
+    }
+
+    pub fn getOrdinaryIndex(self: *const State, collection: *const font.Collection, cp: u32, style: Style, presentation: font.Collection.PresentationMode) ?font.Collection.Index {
+        if (self.private_indices.count() == 0) return collection.getIndex(cp, style, presentation);
+        var iterator = collection.faces.get(style).constIterator(0);
+        var i: usize = 0;
+        while (iterator.next()) |entry| : (i += 1) {
+            const index: font.Collection.Index = .{ .style = style, .idx = @intCast(i) };
+            if (self.private_indices.contains(index.int())) continue;
+            if (entry.getConstEntry().hasCodepoint(cp, presentation)) return index;
+        }
+        return null;
     }
 
     pub fn resolve(self: *State, alloc: Allocator, collection: *font.Collection, discover: anytype, map: font.CodepointMap, cp: u32, requested: Style) !?font.Collection.Index {
@@ -221,19 +237,19 @@ pub const State = struct {
         const family = regular.family orelse return null;
         if (style != .regular) {
             const native = try self.batch(alloc, library, discover, descriptor, style, family);
-            if (try native.find(alloc, collection, cp, style, false)) |idx| return idx;
-            if (try regular.find(alloc, collection, cp, style, false)) |idx| return idx;
+            if (try native.find(alloc, collection, self, cp, style, false)) |idx| return idx;
+            if (try regular.find(alloc, collection, self, cp, style, false)) |idx| return idx;
             if (self.policy.synthetic(style)) {
                 if (style == .bold_italic) {
                     for ([_]Style{ .bold, .italic }) |partial| {
                         const base = try self.batch(alloc, library, discover, descriptor, partial, family);
-                        if (try base.find(alloc, collection, cp, style, true)) |idx| return idx;
+                        if (try base.find(alloc, collection, self, cp, style, true)) |idx| return idx;
                     }
                 }
-                if (try regular.find(alloc, collection, cp, style, true)) |idx| return idx;
+                if (try regular.find(alloc, collection, self, cp, style, true)) |idx| return idx;
             }
         }
-        return try regular.find(alloc, collection, cp, .regular, false);
+        return try regular.find(alloc, collection, self, cp, .regular, false);
     }
 };
 
@@ -636,4 +652,224 @@ test "gx.font_codepoint_map: backend without discovery preserves regular fallbac
         try testing.expectEqual(@as(u16, 0), index.int());
     }
     try testing.expectEqual(@as(u32, 0), resolver.descriptor_cache.requests.count());
+}
+
+fn sequenceConfig(alloc: Allocator) !@import("../config.zig").Config {
+    var config = try @import("../config.zig").Config.default(alloc);
+    errdefer config.deinit();
+    const arena = config._arena.?.allocator();
+    try testing.expectEqual(@as(usize, 0), config.@"font-codepoint-map".map.list.len);
+    try config.@"font-family".list.append(arena, "Microsoft YaHei");
+    try config.@"font-family-bold".list.append(arena, "Consolas");
+    try config.@"font-codepoint-map".map.add(arena, .{ .range = .{ '中', '中' }, .descriptor = .{ .family = "Microsoft YaHei" } });
+    return config;
+}
+
+fn expectMicrosoftSource(face: *font.Face, bold: bool) !void {
+    try testing.expectEqualStrings("Microsoft YaHei", std.mem.span(face.face.handle.*.family_name));
+    try testing.expectEqual(@as(i32, 0), @as(i32, @intCast(face.face.handle.*.face_index)));
+    try testing.expectEqual(bold, face.face.handle.*.style_flags & 2 != 0);
+    try testing.expect(!face.synthetic.bold and !face.synthetic.italic);
+}
+
+fn expectMappedMicrosoftFile(resolver: *font.CodepointResolver, index: font.Collection.Index) !void {
+    const descriptor = resolver.codepoint_map.?.get('中').?;
+    const batch_value = resolver.descriptor_cache.requests.get(.{ .descriptor = descriptor, .style = .bold }).?;
+    for (batch_value.candidates.items) |candidate| {
+        if (candidate.indices.get(.bold)) |loaded| {
+            if (loaded.int() != index.int()) continue;
+            try testing.expect(std.ascii.eqlIgnoreCase(std.fs.path.basename(candidate.file.?), "MSYHBD.TTC"));
+            try testing.expectEqual(@as(i32, 0), candidate.face_index);
+            return;
+        }
+    }
+    return error.MappedPhysicalSourceNotFound;
+}
+
+test "gx.font_codepoint_map: resolver unmapped source stays unchanged across mapped output" {
+    if (font.options.backend != .freetype_windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var config = try sequenceConfig(alloc);
+    defer config.deinit();
+    var derived = try font.SharedGridSet.DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var set = try font.SharedGridSet.init(alloc);
+    defer set.deinit();
+    const key, const grid = try set.ref(&derived, .{ .points = 14, .xdpi = 96, .ydpi = 96 });
+    defer set.deref(key);
+    const resolver = &grid.resolver;
+    const before = resolver.getIndex(alloc, '国', .bold, null).?;
+    const before_face = try resolver.collection.getFace(before);
+    try expectMicrosoftSource(before_face, false);
+    const handle = before_face.face.handle;
+    const mapped_index = resolver.getIndex(alloc, '中', .bold, null).?;
+    try expectMicrosoftSource(try resolver.collection.getFace(mapped_index), true);
+    try expectMappedMicrosoftFile(resolver, mapped_index);
+    const after = resolver.getIndex(alloc, '国', .bold, null).?;
+    try testing.expectEqual(before.int(), after.int());
+    try testing.expectEqual(handle, (try resolver.collection.getFace(after)).face.handle);
+    try expectMicrosoftSource(try resolver.collection.getFace(after), false);
+}
+
+test "gx.font_codepoint_map: SharedGrid uncached unmapped source stays unchanged after mapped output" {
+    if (font.options.backend != .freetype_windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var config = try sequenceConfig(alloc);
+    defer config.deinit();
+    var derived = try font.SharedGridSet.DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var set = try font.SharedGridSet.init(alloc);
+    defer set.deinit();
+    const key, const grid = try set.ref(&derived, .{ .points = 14, .xdpi = 96, .ydpi = 96 });
+    defer set.deref(key);
+    const before = (try grid.getIndex(alloc, '国', .bold, null)).?;
+    const before_face = try grid.resolver.collection.getFace(before);
+    try expectMicrosoftSource(before_face, false);
+    try testing.expect(before_face.glyphIndex('家') != null);
+    const handle = before_face.face.handle;
+    const mapped_index = (try grid.getIndex(alloc, '中', .bold, null)).?;
+    try expectMicrosoftSource(try grid.resolver.collection.getFace(mapped_index), true);
+    try expectMappedMicrosoftFile(&grid.resolver, mapped_index);
+    const after = (try grid.getIndex(alloc, '家', .bold, null)).?;
+    try testing.expectEqual(before.int(), after.int());
+    try testing.expectEqual(handle, (try grid.resolver.collection.getFace(after)).face.handle);
+    try expectMicrosoftSource(try grid.resolver.collection.getFace(after), false);
+}
+
+fn fileDeferred(alloc: Allocator, library: font.Library, path: [:0]const u8) !font.DeferredFace {
+    if (comptime font.options.backend == .freetype_windows) {
+        const owned = try alloc.dupeZ(u8, path);
+        errdefer alloc.free(owned);
+        return .{ .win = .{ .path = owned, .face_index = 0, .variations = &.{}, .peek = try font.Face.initFile(library, path, 0, .{ .size = .{ .points = 12 } }), .presentation = .text, .alloc = alloc } };
+    } else {
+        const fc = @import("fontconfig");
+        const pattern = fc.Pattern.create();
+        errdefer pattern.destroy();
+        const charset = fc.CharSet.create();
+        defer charset.destroy();
+        const langset = fc.LangSet.create();
+        defer langset.destroy();
+        if (!charset.addChar('A') or !charset.addChar('M') or
+            !pattern.add(.family, .{ .string = "JetBrains Mono" }, false) or
+            !pattern.add(.file, .{ .string = path }, false) or
+            !pattern.add(.index, .{ .integer = 0 }, false) or
+            !pattern.add(.charset, .{ .char_set = charset }, false) or
+            !pattern.add(.lang, .{ .lang_set = langset }, false)) return error.OutOfMemory;
+        return .{ .fc = .{ .pattern = pattern, .charset = (try pattern.get(.charset, 0)).char_set, .langset = (try pattern.get(.lang, 0)).lang_set, .variations = &.{} } };
+    }
+}
+
+fn fileCandidate(alloc: Allocator, library: font.Library, path: [:0]const u8) !Candidate {
+    var deferred = try fileDeferred(alloc, library, path);
+    return @import("font_map_freetype.zig").fromDeferred(alloc, library, deferred, &.{}) catch |err| {
+        deferred.deinit();
+        return err;
+    };
+}
+
+const ActualSize = struct {
+    desired: font.face.DesiredSize,
+    x_ppem: u16,
+    y_ppem: u16,
+    x_scale: @import("freetype").c.FT_Fixed,
+    y_scale: @import("freetype").c.FT_Fixed,
+
+    fn read(face: *const font.Face) ActualSize {
+        const metrics = face.face.handle.*.size.*.metrics;
+        return .{ .desired = face.size, .x_ppem = metrics.x_ppem, .y_ppem = metrics.y_ppem, .x_scale = metrics.x_scale, .y_scale = metrics.y_scale };
+    }
+};
+
+test "gx.font_codepoint_map: deferred files own native and synthetic size at nonunit ic_width 96 and 144 DPI" {
+    if (font.options.backend != .freetype_windows and font.options.backend != .fontconfig_freetype) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var library = try font.Library.init(alloc);
+    defer library.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "regular.ttf", .data = font.embedded.regular });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "bold.ttf", .data = font.embedded.bold });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const regular_path = try std.fmt.allocPrintSentinel(alloc, "{s}/regular.ttf", .{root}, 0);
+    defer alloc.free(regular_path);
+    const bold_path = try std.fmt.allocPrintSentinel(alloc, "{s}/bold.ttf", .{root}, 0);
+    defer alloc.free(bold_path);
+    for ([_]u16{ 96, 144 }) |dpi| {
+        var collection = font.Collection.init();
+        defer collection.deinit(alloc);
+        collection.load_options = .{ .library = library, .size = .{ .points = 13, .xdpi = dpi, .ydpi = dpi } };
+        _ = try collection.add(alloc, try font.Face.init(library, font.embedded.inconsolata, collection.load_options.?.faceOptions()), .{ .style = .regular, .size_adjustment = .none, .fallback = false });
+        try collection.updateMetrics();
+        var state: State = .{};
+        defer state.deinit(alloc);
+        var regular_source = try fileCandidate(alloc, library, regular_path);
+        defer regular_source.deinit(alloc);
+        var bold_source = try fileCandidate(alloc, library, bold_path);
+        defer bold_source.deinit(alloc);
+        try testing.expectEqualStrings(regular_path, regular_source.file.?);
+        try testing.expectEqualStrings(bold_path, bold_source.file.?);
+        const regular_idx = try regular_source.index(alloc, &collection, &state, "JetBrains Mono", .regular, .{});
+        const regular = try collection.getFace(regular_idx);
+        const before_size = ActualSize.read(regular);
+        const before_metrics = regular.getMetrics();
+        const factor = (try collection.getEntry(regular_idx)).scale_factor.scale;
+        try testing.expect(@abs(factor - 1) > 0.01);
+        try testing.expect(@abs(regular.size.points - 13) > 0.01);
+        try testing.expectEqual(dpi, regular.size.xdpi);
+        try testing.expect(before_size.x_ppem > 0 and before_size.y_ppem > 0);
+        const native_idx = try bold_source.index(alloc, &collection, &state, "JetBrains Mono", .bold, .{});
+        const synthetic_idx = try regular_source.index(alloc, &collection, &state, "JetBrains Mono", .bold_italic, .{ .bold = true, .italic = true });
+        const native = try collection.getFace(native_idx);
+        const synthetic = try collection.getFace(synthetic_idx);
+        try expectTraits(&collection, regular_idx, .{}, .{});
+        try expectTraits(&collection, native_idx, .{ .bold = true }, .{});
+        try expectTraits(&collection, synthetic_idx, .{}, .{ .bold = true, .italic = true });
+        try testing.expect(regular.face.handle != native.face.handle and regular.face.handle != synthetic.face.handle and native.face.handle != synthetic.face.handle);
+        try testing.expect(regular.ft_mutex != native.ft_mutex and regular.ft_mutex != synthetic.ft_mutex and native.ft_mutex != synthetic.ft_mutex);
+        try testing.expectEqual(before_size, ActualSize.read(regular));
+        try testing.expectEqual(before_metrics, regular.getMetrics());
+        try testing.expectEqual(dpi, native.size.xdpi);
+        try testing.expectEqual(dpi, synthetic.size.xdpi);
+        const native_size = ActualSize.read(native);
+        const synthetic_size = ActualSize.read(synthetic);
+        try testing.expect(native_size.y_ppem > 0 and synthetic_size.y_ppem > 0);
+        try testing.expect(@abs(native_size.desired.points - 13) > 0.01 and @abs(synthetic_size.desired.points - 13) > 0.01);
+        try native.setSize(.{ .size = .{ .points = 25, .xdpi = dpi, .ydpi = dpi } });
+        try testing.expectEqual(synthetic_size, ActualSize.read(synthetic));
+        const resized_native = ActualSize.read(native);
+        try testing.expect(resized_native.y_ppem != native_size.y_ppem);
+        try synthetic.setSize(.{ .size = .{ .points = 27, .xdpi = dpi, .ydpi = dpi } });
+        try testing.expect(ActualSize.read(synthetic).y_ppem != synthetic_size.y_ppem);
+        try testing.expectEqual(resized_native, ActualSize.read(native));
+        try testing.expectEqual(before_size, ActualSize.read(regular));
+        try testing.expectEqual(before_metrics, regular.getMetrics());
+    }
+}
+
+fn deferredAllocationScenario(alloc: Allocator, path: [:0]const u8) !void {
+    var library = try font.Library.init(alloc);
+    defer library.deinit();
+    var deferred = try fileDeferred(alloc, library, path);
+    var candidate = @import("font_map_freetype.zig").fromDeferred(alloc, library, deferred, &.{}) catch |err| {
+        deferred.deinit();
+        return err;
+    };
+    defer candidate.deinit(alloc);
+    var face = try candidate.load(&candidate, library, .{ .size = .{ .points = 13, .xdpi = 144, .ydpi = 144 } }, .{ .italic = true });
+    defer face.deinit();
+    if (comptime font.options.backend == .freetype_windows) try testing.expect(face.face.handle != candidate.source.deferred.win.?.peek.face.handle);
+}
+
+test "gx.font_codepoint_map: fromDeferred file allocation failures release physical sources" {
+    if (font.options.backend != .freetype_windows and font.options.backend != .fontconfig_freetype) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "regular.ttf", .data = font.embedded.regular });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/regular.ttf", .{root}, 0);
+    defer alloc.free(path);
+    try testing.checkAllAllocationFailures(alloc, deferredAllocationScenario, .{path});
 }

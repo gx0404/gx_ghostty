@@ -220,3 +220,151 @@ test "gx.font_codepoint_map: Fontconfig variable named instances keep file index
         try testing.expectEqual(candidate.face_index, @as(i32, @intCast(face.face.handle.*.face_index)));
     }
 }
+
+fn addFixtureFile(config: *fontconfig.Config, alloc: Allocator, directory: std.Io.Dir, root: []const u8, name: []const u8, bytes: [:0]const u8) !void {
+    try directory.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ root, name }, 0);
+    defer alloc.free(path);
+    try std.testing.expect(fontconfig.c.FcConfigAppFontAddFile(config.cval(), path) != 0);
+}
+
+test "gx.font_codepoint_map: Fontconfig foreign real bold sorts first but target family is synthesized" {
+    if (font.options.backend != .fontconfig_freetype) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var library = try font.Library.init(alloc);
+    defer library.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const config: *fontconfig.Config = @ptrCast(fontconfig.c.FcConfigCreate() orelse return error.OutOfMemory);
+    defer config.destroy();
+    try addFixtureFile(config, alloc, tmp.dir, root, "foreign-bold.ttf", font.embedded.bold);
+    try addFixtureFile(config, alloc, tmp.dir, root, "target-regular.ttf", font.embedded.inconsolata);
+    const application: *fontconfig.FontSet = @ptrCast(fontconfig.c.FcConfigGetFonts(config.cval(), fontconfig.c.FcSetApplication) orelse return error.TestFontSetMissing);
+    const patterns = application.fonts();
+    var kept: usize = 0;
+    for (patterns) |pattern| {
+        if (try hasFamily(pattern, "Inconsolata")) {
+            const index = (try pattern.get(.index, 0)).integer;
+            const weight = try pattern.get(.weight, 0);
+            const regular_weight = switch (weight) {
+                .integer => weight.integer == @intFromEnum(fontconfig.Weight.regular),
+                .double => weight.double == @as(f64, @floatFromInt(@intFromEnum(fontconfig.Weight.regular))),
+                else => false,
+            };
+            if (index != 0 or !regular_weight) {
+                pattern.destroy();
+                continue;
+            }
+        }
+        patterns[kept] = pattern;
+        kept += 1;
+    }
+    application.cval().nfont = @intCast(kept);
+    const force_foreign = "<?xml version=\"1.0\"?><!DOCTYPE fontconfig SYSTEM \"fonts.dtd\"><fontconfig><match target=\"pattern\"><test name=\"weight\" compare=\"eq\"><int>200</int></test><edit name=\"family\" mode=\"assign\" binding=\"strong\"><string>JetBrains Mono</string></edit></match></fontconfig>";
+    try testing.expect(fontconfig.c.FcConfigParseAndLoadFromMemory(config.cval(), force_foreign, 1) != 0);
+    try testing.expect(fontconfig.c.FcConfigBuildFonts(config.cval()) != 0);
+    var discovery: font.Discover = .{ .fc_config = config };
+    var ordinary = try discovery.discover(alloc, .{ .family = "Inconsolata", .bold = true });
+    defer ordinary.deinit();
+    var foreign = (try ordinary.next()).?;
+    defer foreign.deinit();
+    var foreign_face = try foreign.load(library, .{ .size = .{ .points = 13 } });
+    defer foreign_face.deinit();
+    try testing.expectEqualStrings("JetBrains Mono", std.mem.span(foreign_face.face.handle.*.family_name));
+    try testing.expect((try ft.traits(&foreign_face)).bold);
+    var collection = font.Collection.init();
+    defer collection.deinit(alloc);
+    collection.load_options = .{ .library = library, .size = .{ .points = 13 } };
+    _ = try collection.add(alloc, try font.Face.init(library, font.embedded.regular, collection.load_options.?.faceOptions()), .{ .style = .regular, .size_adjustment = .none, .fallback = false });
+    try collection.updateMetrics();
+    var state: mapped.State = .{};
+    defer state.deinit(alloc);
+    const descriptor: font.Descriptor = .{ .family = "Inconsolata" };
+    const idx = (try state.resolveDescriptor(alloc, &collection, &discovery, descriptor, 'M', .bold)).?;
+    const face = try collection.getFace(idx);
+    try testing.expectEqualStrings("Inconsolata", std.mem.span(face.face.handle.*.family_name));
+    try testing.expectEqual(false, (try ft.traits(face)).bold);
+    try testing.expectEqual(true, face.synthetic.bold);
+    try testing.expectEqual(false, face.synthetic.italic);
+    const regular = state.requests.get(.{ .descriptor = descriptor, .style = .regular }).?;
+    try testing.expect(std.mem.endsWith(u8, regular.candidates.items[0].file.?, "target-regular.ttf"));
+    const native = state.requests.get(.{ .descriptor = descriptor, .style = .bold }).?;
+    try testing.expectEqual(@as(usize, 0), native.candidates.items.len);
+}
+
+test "gx.font_codepoint_map: Fontconfig resolver and uncached grid ordinary sources survive mapping" {
+    if (font.options.backend != .fontconfig_freetype) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var library = try font.Library.init(alloc);
+    defer library.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const config: *fontconfig.Config = @ptrCast(fontconfig.c.FcConfigCreate() orelse return error.OutOfMemory);
+    defer config.destroy();
+    try addFixtureFile(config, alloc, tmp.dir, root, "regular.ttf", font.embedded.regular);
+    try addFixtureFile(config, alloc, tmp.dir, root, "mapped-bold.ttf", font.embedded.bold);
+    try addFixtureFile(config, alloc, tmp.dir, root, "ordinary-bold.ttf", font.embedded.inconsolata);
+    try testing.expect(fontconfig.c.FcConfigBuildFonts(config.cval()) != 0);
+    var discovery: font.Discover = .{ .fc_config = config };
+    var regular_iterator = try discovery.discover(alloc, .{ .family = "JetBrains Mono" });
+    defer regular_iterator.deinit();
+    var ordinary_bold_iterator = try discovery.discover(alloc, .{ .family = "Inconsolata" });
+    defer ordinary_bold_iterator.deinit();
+    var collection = font.Collection.init();
+    var collection_owned = true;
+    defer if (collection_owned) collection.deinit(alloc);
+    collection.load_options = .{ .library = library, .size = .{ .points = 13 } };
+    _ = try collection.addDeferred(alloc, (try regular_iterator.next()).?, .{ .style = .regular, .size_adjustment = .none, .fallback = false });
+    _ = try collection.addDeferred(alloc, (try ordinary_bold_iterator.next()).?, .{ .style = .bold, .size_adjustment = .none, .fallback = false });
+    try collection.updateMetrics();
+    const ordinary_regular = try collection.getFace(.{ .style = .regular, .idx = 0 });
+    const ordinary_bold = try collection.getFace(.{ .style = .bold, .idx = 0 });
+    try testing.expectEqualStrings("JetBrains Mono", std.mem.span(ordinary_regular.face.handle.*.family_name));
+    try testing.expectEqualStrings("Inconsolata", std.mem.span(ordinary_bold.face.handle.*.family_name));
+    var mapped_bold = try font.Face.init(library, font.embedded.bold, collection.load_options.?.faceOptions());
+    defer mapped_bold.deinit();
+    var points: [2]u32 = undefined;
+    var count: usize = 0;
+    for (0x80..0x10000) |cp| {
+        const value: u32 = @intCast(cp);
+        if (ordinary_regular.glyphIndex(value) != null and ordinary_bold.glyphIndex(value) == null and mapped_bold.glyphIndex(value) != null) {
+            points[count] = value;
+            count += 1;
+            if (count == points.len) break;
+        }
+    }
+    try testing.expectEqual(points.len, count);
+    var map: font.CodepointMap = .{};
+    defer map.deinit(alloc);
+    try map.add(alloc, .{ .range = .{ 'M', 'M' }, .descriptor = .{ .family = "JetBrains Mono" } });
+    var grid = try font.SharedGrid.init(alloc, .{ .collection = collection, .discover = &discovery, .codepoint_map = map });
+    collection_owned = false;
+    defer grid.deinit(alloc);
+    const before = grid.resolver.getIndex(alloc, points[0], .bold, null).?;
+    const handle = (try grid.resolver.collection.getFace(before)).face.handle;
+    const mapped_idx = grid.resolver.getIndex(alloc, 'M', .bold, null).?;
+    const mapped_face = try grid.resolver.collection.getFace(mapped_idx);
+    try testing.expect((try ft.traits(mapped_face)).bold and !mapped_face.synthetic.bold);
+    try testing.expect(grid.resolver.collection.hasCodepoint(mapped_idx, points[0], .{ .any = {} }));
+    const after = grid.resolver.getIndex(alloc, points[0], .bold, null).?;
+    try testing.expectEqual(before.int(), after.int());
+    try testing.expectEqual(handle, (try grid.resolver.collection.getFace(after)).face.handle);
+    const fresh = (try grid.getIndex(alloc, points[1], .bold, null)).?;
+    try testing.expectEqual(before.int(), fresh.int());
+    try testing.expectEqual(handle, (try grid.resolver.collection.getFace(fresh)).face.handle);
+    var discovered = try discovery.discover(alloc, .{ .family = "JetBrains Mono", .bold = true });
+    defer discovered.deinit();
+    var fallback = (try discovered.next()).?;
+    const ordinary_new = grid.resolver.collection.addDeferred(alloc, fallback, .{ .style = .bold, .size_adjustment = .none, .fallback = true }) catch |err| {
+        fallback.deinit();
+        return err;
+    };
+    const newly_found = grid.resolver.getIndex(alloc, points[0], .bold, null).?;
+    try testing.expectEqual(ordinary_new.int(), newly_found.int());
+}

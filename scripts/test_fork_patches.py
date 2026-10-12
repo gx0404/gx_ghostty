@@ -1086,6 +1086,13 @@ class Gx0031ShapeTests(unittest.TestCase):
         self.assertIn("self.getIndexCodepointOverride(alloc, cp, style)", source)
         self.assertIn('const DescriptorCache = @import("../gx/font_codepoint_map.zig").State;', source)
         self.assertIn("self.descriptor_cache.resolve(alloc, &self.collection, discover, map, cp, style)", source)
+        self.assertEqual(source.count("self.descriptor_cache.getOrdinaryIndex(&self.collection,"), 2)
+        resolver_body = source.split("pub fn getIndex(", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("self.collection.getIndex(", resolver_body)
+        mapping = (ROOT / "src/gx/font_codepoint_map.zig").read_text(encoding="utf-8")
+        self.assertIn("private_indices.contains(index.int())", mapping)
+        self.assertIn("private_indices.putAssumeCapacityNoClobber(idx.int(), {})", mapping)
+        self.assertLess(mapping.index("state.private_indices.ensureUnusedCapacity(alloc, 1)"), mapping.index("const idx = try collection.add(alloc, face,"))
         self.assertNotIn("return ctx.hash(a) == ctx.hash(b);", source)
         self.assertNotIn(".style = .regular,", source.split("fn getIndexCodepointOverride(", 1)[1].split("\n}", 1)[0])
         for line in ("if (self.getIndexCodepointOverride(alloc, cp, style))", "fn getIndexCodepointOverride(", "const DescriptorCache ="):
