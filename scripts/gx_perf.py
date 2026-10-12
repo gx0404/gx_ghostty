@@ -234,16 +234,25 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
             not re.fullmatch(r"[0-9a-f]{64}", identity.get("sha256", "")) or not identity.get("exe"):
         raise PerfError(f"{path}: incomplete process identity")
     checks = meta.get("identity_checks", [])
-    required_stages = {"launch", "before before", "before after", "after before", "after after", "finished"}
+    required_stages = {"launch", "before before", "before after", "after before", "after after", "finished", "cleanup"}
     if not required_stages <= {item.get("stage") for item in checks} or any(
             any(item.get(key) != value for key, value in identity.items()) for item in checks):
         raise PerfError(f"{path}: incomplete or changed process identity checkpoints")
     if any(not re.fullmatch(r"[0-9a-f]{40}", meta.get(key, "")) for key in ("commit", "tree")) or \
-            not isinstance(meta.get("dirty"), bool):
-        raise PerfError(f"{path}: incomplete source identity")
+            meta.get("dirty") is not False or meta.get("dirty_paths") != "":
+        raise PerfError(f"{path}: incomplete or dirty source identity")
+    if not re.fullmatch(r"[0-9a-f]{32}", meta.get("capture_id", "")) or type(meta.get("child_exit")) is not int or \
+            meta["child_exit"] not in (0, -15) or meta.get("cleanup") != "owned pidfd SIGTERM":
+        raise PerfError(f"{path}: inconsistent capture/child-exit/cleanup evidence")
+    executable = meta.get("executable", {})
+    if not isinstance(executable, dict) or executable.get("path") != identity["exe"] or \
+            any(identity.get(key) != value for key, value in executable.items() if key != "path") or \
+            not all(key in executable for key in ("sha256", "size", "inode", "device", "mtime_ns")):
+        raise PerfError(f"{path}: executable and process identity conflict")
     prefix = path.name.removesuffix("-meta.json")
     allowed = {prefix + suffix for suffix in (".log", ".png", "-perf.png", "-after.png", "-version.txt", "-perf.txt",
-               "-times.txt", "-tasks-before.txt", "-tasks-after.txt", "-status-before.txt", "-status-after.txt")}
+               "-times.txt", "-tasks-before.txt", "-tasks-after.txt", "-status-before.txt", "-status-after.txt",
+               "-process-before.json", "-process-after.json", "-build-receipt.json")}
     for name in meta["files"]:
         artifact = path.parent / name
         if name not in allowed or artifact.is_symlink() or not artifact.is_file() or \
@@ -260,7 +269,15 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
             raise ValueError("version does not verify ReleaseFast")
         import gx_wsl
         namespace: dict = {"__name__": "gx_perf_validator"}
-        exec(compile(gx_wsl.PERF_PROGRAM, "gx_perf_validator", "exec"), namespace)
+        exec(compile(gx_wsl.PERF_PROGRAM + gx_wsl.RECEIPT_PROGRAM, "gx_perf_validator", "exec"), namespace)
+        source = {key: meta[key] for key in ("commit", "tree", "dirty", "dirty_paths")}
+        receipt_text = raw("-build-receipt.json")
+        if hashlib.sha256(receipt_text.encode()).hexdigest() != meta.get("build_receipt_sha256") or meta.get("version") != version:
+            raise ValueError("build receipt/version raw hash conflict")
+        receipt = json.loads(receipt_text)
+        if receipt.get("perf_eligible") is not True or meta.get("source_end") != source:
+            raise ValueError("source changed since normal build or during smoke")
+        namespace["validate_receipt"](receipt, source, executable, version, meta.get("version_exit"))
         before, after, times = raw("-tasks-before.txt"), raw("-tasks-after.txt"), raw("-times.txt")
         namespace["measurement"](before, after, times)
         for text in (before, after):
@@ -273,7 +290,11 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
         clk_tck = meta.get("clk_tck", 0)
         if not isinstance(clk_tck, int) or clk_tck <= 0:
             raise ValueError("missing CLK_TCK")
-        expected = parse_text(namespace["report"](before, after, times, raw(".log"), clk_tck))
+        process_before, process_after = json.loads(raw("-process-before.json")), json.loads(raw("-process-after.json"))
+        accounting = namespace["cpu_accounting"](before, after, process_before, process_after, str(identity["pid"]), clk_tck)
+        if meta.get("cpu_accounting") != accounting:
+            raise ValueError("process CPU reconciliation differs from raw evidence")
+        expected = parse_text(namespace["report"](before, after, times, raw(".log"), clk_tck, process_before, process_after))
         if samples.values != expected.values or samples.units != expected.units:
             raise ValueError("reported metrics differ from raw task window")
         for metric in GTK_REQUIRED:
@@ -300,27 +321,41 @@ def collect(paths: Iterable[Path]) -> Samples:
             if match and int(match.group(1)) != 0:
                 raise PerfError(f"{legacy}: nonzero smoke exit; historical samples rejected")
     manifests = {p for p in files if p.name.endswith("-meta.json")}
+    batches = set()
     for path in files:
         manifests.update(path.parent.glob("*-meta.json"))
         for parent in path.parents:
             batch = parent / "gtk-runs.json"
             if batch.is_file():
-                data = read_json(batch)
-                planned, labels, runs = data.get("planned_runs", 0), data.get("labels", []), data.get("runs", [])
-                if data.get("schema") != "gx-gtk-runs-v1" or data.get("valid") is not True or type(planned) is not int or \
-                        planned < 1 or not isinstance(labels, list) or not labels or not isinstance(runs, list) or \
-                        not all(isinstance(label, str) and label not in (".", "..") and re.fullmatch(r"[A-Za-z0-9._-]+", label) for label in labels) or \
-                        not all(isinstance(item, dict) for item in runs):
-                    raise PerfError(f"{batch}: incomplete or malformed planned GTK runs")
-                expected = {(label, run) for label in labels for run in range(1, planned + 1)}
-                if len(set(labels)) != len(labels) or len(runs) != len(expected) or \
-                        any(item.get("exit") != 0 or item.get("status") != "valid" or type(item.get("run")) is not int for item in runs) or \
-                        {(item.get("label"), item.get("run")) for item in runs} != expected:
-                    raise PerfError(f"{batch}: incomplete or failed planned GTK runs")
+                batches.add(batch)
                 break
+    cached = {}
+    for batch_path in sorted(batches):
+        data = read_json(batch_path)
+        plan = canonical_plan(batch_path.parent, data, require_valid=True)
+        capture_ids = set()
+        by_label = {}
+        for item, target in plan:
+            manifest = target / "perf-meta.json"
+            if manifest.is_symlink() or not manifest.is_file() or hashlib.sha256(manifest.read_bytes()).hexdigest() != item["meta_sha256"]:
+                raise PerfError(f"{manifest}: changed or missing planned-run original")
+            meta, run = gtk_evidence(manifest)
+            if not meta.get("perf") or meta["capture_id"] in capture_ids:
+                raise PerfError(f"{manifest}: repeated or non-perf capture in declared batch")
+            capture_ids.add(meta["capture_id"])
+            cached[manifest] = (meta, run)
+            by_label.setdefault(item["label"], set()).add(manifest)
+        all_originals = set().union(*by_label.values())
+        selected = manifests & all_originals
+        if any(p.is_relative_to(batch_path.parent) and p not in all_originals for p in manifests):
+            raise PerfError(f"{batch_path}: selected original is not in the canonical plan")
+        for label, originals in by_label.items():
+            chosen = selected & originals
+            if chosen and chosen != originals:
+                raise PerfError(f"{batch_path}: {label} selected {len(chosen)}/{data['planned_runs']} planned runs; partial GTK subsets cannot be verified")
     covered: set[Path] = set()
     for manifest in sorted(manifests):
-        meta, run = gtk_evidence(manifest)
+        meta, run = cached[manifest] if manifest in cached else gtk_evidence(manifest)
         if meta.get("perf"):
             covered.update((manifest.parent / name).resolve() for name in meta.get("files", []))
             samples.extend(run)
@@ -588,17 +623,67 @@ def run_gtk(args: argparse.Namespace) -> int:
     return report_gtk_runs(out, batch, args.json)
 
 
+def canonical_plan(out: Path, batch: dict, require_valid: bool = False) -> list[tuple[dict, Path]]:
+    planned, labels, runs = batch.get("planned_runs"), batch.get("labels"), batch.get("runs")
+    if batch.get("schema") != "gx-gtk-runs-v1" or type(planned) is not int or planned < 1 or \
+            not isinstance(labels, list) or not 1 <= len(labels) <= 2 or \
+            labels_for(len(labels), labels) != labels or not isinstance(runs, list) or batch.get("order") != "AB/BA":
+        raise PerfError("malformed GTK canonical plan")
+    expected = alternate(labels, planned)
+    if len(runs) != len(expected):
+        raise PerfError("GTK plan length differs from planned_runs")
+    root = out.resolve()
+    paths = set()
+    result = []
+    for item, (run, label) in zip(runs, expected):
+        relative = f"{label}/run-{run:02d}"
+        if not isinstance(item, dict) or type(item.get("run")) is not int or \
+                (item.get("label"), item.get("run"), item.get("path")) != (label, run, relative):
+            raise PerfError("GTK plan is not the unique canonical AB/BA sequence")
+        target = root / label / f"run-{run:02d}"
+        resolved = target.resolve()
+        key = os.path.normcase(str(resolved))
+        if not resolved.is_relative_to(root) or (root / label).is_symlink() or target.is_symlink() or key in paths:
+            raise PerfError("GTK run path is not unique within owned output")
+        paths.add(key)
+        if require_valid and (batch.get("valid") is not True or item.get("exit") != 0 or item.get("status") != "valid" or
+                              not re.fullmatch(r"[0-9a-f]{64}", item.get("meta_sha256", ""))):
+            raise PerfError("incomplete or failed planned GTK runs")
+        result.append((item, target))
+    return result
+
+
 def report_gtk_runs(out: Path, batch: dict, json_path: Path | None) -> int:
+    try:
+        plan = canonical_plan(out, batch)
+    except PerfError as exc:
+        text = "GTK comparison rejected: " + str(exc) + "\n"
+        batch["valid"], batch["errors"] = False, [str(exc)]
+        write_json(out / "gtk-runs.json", batch)
+        write_json(out / "RESULT.json", {"validation": {"status": "rejected", "errors": [str(exc)]}})
+        write_json(json_path, {"validation": {"status": "rejected", "errors": [str(exc)]}})
+        (out / "SUMMARY.txt").write_text(text, encoding="utf-8")
+        print(text, end="")
+        return 1
     sets = {label: Samples() for label in batch["labels"]}
     identities = {}
+    captures = set()
     errors = []
-    for item in batch["runs"]:
+    for item, target in plan:
         try:
             if item["exit"] != 0:
                 raise PerfError(f"run exit {item['exit']}")
-            meta, samples = gtk_evidence(out / item["path"] / "perf-meta.json")
+            manifest = target / "perf-meta.json"
+            digest = hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest.is_file() and not manifest.is_symlink() else ""
+            if not digest or item.get("meta_sha256", digest) != digest:
+                raise PerfError("missing or changed canonical run manifest")
+            meta, samples = gtk_evidence(manifest)
             if not meta.get("perf"):
                 raise PerfError("not a GTK perf run")
+            if meta.get("capture_id") in captures:
+                raise PerfError("duplicate actual capture in GTK plan")
+            captures.add(meta.get("capture_id"))
+            item["meta_sha256"] = digest
             signature = (meta["identity"]["sha256"], meta["version"], meta["commit"], meta["tree"], meta["dirty"],
                          meta["effective_env"] | {"DISPLAY": None, "XDG_CONFIG_HOME": None, "XDG_STATE_HOME": None})
             previous = identities.setdefault(item["label"], signature)

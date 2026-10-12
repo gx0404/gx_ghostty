@@ -488,10 +488,139 @@ git checkout --quiet --detach "$sha"
 log "synced $clone to $(git log -1 --format='%h %s') from $label"
 """
 
+RECEIPT_PROGRAM = r'''
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BUILD_RECEIPT = Path(".local/gx-wsl/gtk-build-receipt.json")
+
+
+def image_info(path, digest=False):
+    with open(path, "rb") as handle:
+        stat = os.fstat(handle.fileno())
+        info = {"device": stat.st_dev, "inode": stat.st_ino, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        if digest:
+            sha = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha.update(chunk)
+            end = os.fstat(handle.fileno())
+            if (end.st_dev, end.st_ino, end.st_size, end.st_mtime_ns) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+                raise ValueError("executable changed while hashing")
+            info["sha256"] = sha.hexdigest()
+        return info
+
+
+def source_identity():
+    def git(*args):
+        return subprocess.check_output(["git", *args], text=True).strip()
+    dirty = git("status", "--porcelain", "--untracked-files=normal")
+    return {"commit": git("rev-parse", "HEAD"), "tree": git("rev-parse", "HEAD^{tree}"),
+            "dirty": bool(dirty), "dirty_paths": dirty}
+
+
+def build_option(argv, key):
+    values = [arg.split("=", 1)[1] for arg in argv if arg.startswith("-D" + key + "=")]
+    return values[-1] if values else None
+
+
+def version_mode(version):
+    match = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\b", version)
+    return match.group(1) if match else "unknown"
+
+
+def validate_receipt(receipt, source, executable, version, version_exit):
+    if source.get("dirty") is not False or source.get("dirty_paths") != "" or \
+            any(not re.fullmatch(r"[0-9a-f]{40}", source.get(key, "")) for key in ("commit", "tree")):
+        raise ValueError("perf requires a clean committed source tree")
+    argv = receipt.get("build_argv", [])
+    if receipt.get("schema") != "gx-gtk-build-v1" or receipt.get("producer") != "gx_wsl.py build" or \
+            receipt.get("build_exit") != 0 or not isinstance(argv, list) or argv[:3] != ["python3", "scripts/zigw.py", "build"] or \
+            not all(isinstance(arg, str) for arg in argv) or build_option(argv, "optimize") != "ReleaseFast" or \
+            build_option(argv, "app-runtime") != "gtk":
+        raise ValueError("missing successful normal ReleaseFast GTK build receipt")
+    if any(arg.startswith(("--prefix", "-p", "-Demit-", "-Dtarget=")) for arg in argv[3:]) or \
+            any(not arg.startswith("-") and arg != "install" for arg in argv[3:]):
+        raise ValueError("build receipt does not describe the normal GTK install")
+    if receipt.get("source_before") != source or receipt.get("source_after") != source:
+        raise ValueError("source identity differs from build receipt")
+    if receipt.get("executable") != executable or receipt.get("version") != version or \
+            receipt.get("version_exit") != version_exit or version_exit != 0 or version_mode(version) != "ReleaseFast":
+        raise ValueError("actual executable/version differs from build receipt")
+    match = re.match(r"Ghostty (\S+)", version)
+    built_version = match.group(1) if match else ""
+    if not built_version.endswith("+" + source["commit"][:9]):
+        raise ValueError("binary version does not bind the source commit (unsafe version override)")
+    override = build_option(argv, "version-string")
+    if override is not None and override != built_version:
+        raise ValueError("version override differs from actual binary")
+    return receipt
+
+
+def build_main(argv):
+    args = argv[1:]
+    standard_gtk = build_option(args, "app-runtime") == "gtk" and not any(arg.startswith("-Demit-lib-vt") for arg in args)
+    receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build",
+               "build_argv": ["python3", "scripts/zigw.py", "build", *args], "build_exit": None,
+               "started_realtime": time.time(), "perf_eligible": False}
+    lock = BUILD_RECEIPT.parent / "build.lock"
+    if standard_gtk:
+        BUILD_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            print("[gx-wsl] error: own clone build is already in progress", file=sys.stderr)
+            return 1
+    try:
+        if standard_gtk:
+            receipt["source_before"] = source_identity()
+            BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            if build_option(args, "optimize") == "ReleaseFast" and receipt["source_before"]["dirty"]:
+                raise ValueError("perf build requires a clean committed source tree")
+        code = subprocess.run([sys.executable, "scripts/zigw.py", "build", *args], check=False).returncode
+        receipt["build_exit"] = code
+        if code != 0 or not standard_gtk:
+            return code
+        receipt["source_after"] = source_identity()
+        exe = str(Path("zig-out/bin/ghostty").resolve())
+        fd = os.open(exe, os.O_RDONLY)
+        try:
+            held = f"/proc/self/fd/{fd}"
+            receipt["executable"] = {"path": exe, **image_info(held, True)}
+            env = dict(os.environ, LD_LIBRARY_PATH=str(Path("zig-out/lib").resolve()))
+            env.pop("DISPLAY", None)
+            env.pop("WAYLAND_DISPLAY", None)
+            version = subprocess.run([held, "+version"], pass_fds=(fd,), env=env, capture_output=True, text=True, timeout=30)
+            receipt["version"], receipt["version_exit"] = version.stdout, version.returncode
+            if image_info(held, True) != {key: value for key, value in receipt["executable"].items() if key != "path"}:
+                raise ValueError("build image changed during version query")
+        finally:
+            os.close(fd)
+        if build_option(args, "optimize") == "ReleaseFast":
+            validate_receipt(receipt, receipt["source_after"], receipt["executable"], receipt["version"], receipt["version_exit"])
+            receipt["perf_eligible"] = True
+        print("[gx-wsl] build receipt: " + str(BUILD_RECEIPT), flush=True)
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        receipt["error"] = str(exc)
+        print("[gx-wsl] build receipt rejected: " + str(exc), file=sys.stderr)
+        return 1
+    finally:
+        if standard_gtk:
+            receipt["finished_realtime"] = time.time()
+            BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            lock.rmdir()
+'''
+
 BUILD_BODY = r"""enter_clone
 prefetch || warn "some Zig packages could not be prefetched; zig build will try to fetch them itself"
 log "python3 scripts/zigw.py build $*"
-exec python3 scripts/zigw.py build "$@"
+normal_build "$@"
 """
 
 TEST_BODY = r"""enter_clone
@@ -544,7 +673,7 @@ DMABUF_WARNINGS = ("failed to export DMABUF", "failed to build dmabuf")
 
 
 def group_name(comm):
-    return re.sub(r"-\d+$", "", comm).replace(" ", "_") or "unnamed"
+    return re.sub(r"[^A-Za-z0-9_.:-]", "_", re.sub(r"-\d+$", "", comm)) or "unnamed"
 
 
 def parse_tasks(text):
@@ -584,11 +713,17 @@ def deltas(before, after, pid):
     if set(before) != set(after):
         raise ValueError(f"thread population changed: gone={sorted(set(before) - set(after))}, added={sorted(set(after) - set(before))}")
     groups = {}
+    names = {"main": "<main>", "total": "<process total>", "endpoint_threads": "<endpoint total>"}
     for tid, now in after.items():
         then = before[tid]
         if (now["starttime"], now["comm"]) != (then["starttime"], then["comm"]):
             raise ValueError("task identity changed: " + tid)
-        group = groups.setdefault("main" if tid == pid else group_name(now["comm"]), dict.fromkeys(("threads",) + COUNTERS, 0))
+        token = "main" if tid == pid else group_name(now["comm"])
+        base = "<main>" if tid == pid else re.sub(r"-\d+$", "", now["comm"])
+        if token in names and names[token] != base:
+            raise ValueError("thread metric token collision: " + token)
+        names[token] = base
+        group = groups.setdefault(token, dict.fromkeys(("threads",) + COUNTERS, 0))
         group["threads"] += 1
         for key in COUNTERS:
             change = now[key] - then[key]
@@ -614,7 +749,47 @@ def measurement(before_text, after_text, times_text):
     return groups
 
 
-def report(before_text, after_text, times_text, log_text, clk_tck):
+def cpu_accounting(before_text, after_text, process_before, process_after, pid, clk_tck):
+    before, after = parse_tasks(before_text), parse_tasks(after_text)
+    deltas(before, after, pid)
+    if type(clk_tck) is not int or clk_tck <= 0:
+        raise ValueError("invalid CLK_TCK")
+    brackets = []
+    for sample in (process_before, process_after):
+        begin, end = sample["begin_ns"], sample["end_ns"]
+        if type(begin) is not int or type(end) is not int or begin < 0 or not 0 <= end - begin <= 50_000_000:
+            raise ValueError("process/task snapshot exceeds 50 ms precision budget")
+        low = parse_tasks(pid + "\t" + sample["pre_stat"])[pid]
+        high = parse_tasks(pid + "\t" + sample["post_stat"])[pid]
+        if any(task["starttime"] != before[pid]["starttime"] for task in (low, high)):
+            raise ValueError("process accounting identity changed")
+        if any(high[key] < low[key] for key in COUNTERS):
+            raise ValueError("process counter decreased within snapshot")
+        brackets.append((low, high))
+    if process_after["begin_ns"] < process_before["end_ns"]:
+        raise ValueError("overlapping process measurement endpoints")
+    total = {key: brackets[1][1][key] - brackets[0][1][key] for key in COUNTERS}
+    if any(value < 0 for value in total.values()):
+        raise ValueError("negative process counter delta")
+    endpoint = {key: sum(after[tid][key] - before[tid][key] for tid in before) for key in COUNTERS}
+    residual = {key: total[key] - endpoint[key] for key in ("utime", "stime")}
+    rounding = len(before) + len(after) + 2
+    skew = {key: sum(high[key] - low[key] for low, high in brackets) for key in residual}
+    bound = {key: rounding + skew[key] for key in residual}
+    if any(abs(residual[key]) > bound[key] for key in residual):
+        raise ValueError(f"unattributed/transient CPU exceeds tick+read-skew bound: residual={residual}, bound={bound}")
+    gap = sum(residual.values())
+    error = sum(bound.values())
+    return {"total_source": "process stat post-to-post (includes exited threads)",
+            "thread_population": "endpoint identities only; no full-lifetime population proof",
+            "comparable": True, "clk_tck": clk_tck, "process_counters": total, "endpoint_counters": endpoint,
+            "residual_ticks": residual, "rounding_ticks_per_counter": rounding, "read_skew_ticks": skew,
+            "error_bound_ticks": bound, "unattributed_cpu_range_ticks": [max(0, gap - error), max(0, gap + error)],
+            "snapshot_max_ns": 50_000_000, "process_window_begin_ns": process_before["end_ns"],
+            "process_window_end_ns": process_after["end_ns"]}
+
+
+def report(before_text, after_text, times_text, log_text, clk_tck, process_before=None, process_after=None):
     times = parse_times(times_text)
     lines = ["# gx-wsl smoke --perf",
              "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
@@ -623,13 +798,21 @@ def report(before_text, after_text, times_text, log_text, clk_tck):
         groups = measurement(before_text, after_text, times_text)
         if clk_tck <= 0:
             raise ValueError("invalid CLK_TCK")
-    except ValueError as exc:
+        accounting = cpu_accounting(before_text, after_text, process_before, process_after, times["pid"], clk_tck) if process_before is not None else None
+    except (ValueError, KeyError, TypeError) as exc:
         return "\n".join([*lines, "valid: no", "rejected: " + str(exc)]) + "\n"
-    lines += ["valid: yes (task window only; process identity requires meta.json)",
-              "clock: realtime elapsed; window/done polling 50 ms; CPU includes the 1 s drain tail"]
+    lines += ["valid: yes (identity/build receipt must be checked in meta.json)",
+              "clock: realtime elapsed; window/done polling 50 ms; CPU includes the 1 s drain tail",
+              "population: endpoint identities only; transient population not proven",
+              "cpu.total: " + ("process aggregate including exited threads" if accounting else "unverified endpoint sum; no process reconciliation")]
     order = [name for name in FIRST if name in groups]
     order += sorted((name for name in groups if name not in FIRST), key=lambda name: -(groups[name]["utime"] + groups[name]["stime"]))
     total = {key: sum(group[key] for group in groups.values()) for key in ("threads",) + COUNTERS}
+    if accounting:
+        endpoint_cpu = (total["utime"] + total["stime"]) / clk_tck
+        lines.append(f"metric cpu.endpoint_threads {endpoint_cpu:.3f} s")
+        total.update(accounting["process_counters"])
+        lines.append(f"accounting: residual_ticks={accounting['residual_ticks']} error_bound_ticks={accounting['error_bound_ticks']}")
     for key in ("window_seconds", "workload_seconds"):
         lines.append(f"metric {key} {float(times[key]):.3f} s")
     for name in order + ["total"]:
@@ -675,33 +858,20 @@ printf '%s\n' "$result" >"$dir/workload-exit"
 exec sleep 3600
 """
 
-SMOKE_PROGRAM = r"""
-import hashlib
-import json
+SMOKE_PROGRAM = RECEIPT_PROGRAM.split("\ndef build_main(", 1)[0] + r"""
 import select
 import signal
-import subprocess
-import time
-from pathlib import Path
+import uuid
 
 ENV_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "GDK_BACKEND", "GSK_RENDERER", "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER",
             "MESA_LOADER_DRIVER_OVERRIDE", "MESA_GL_VERSION_OVERRIDE", "EGL_PLATFORM", "NO_AT_BRIDGE", "GHOSTTY_GX_PERF",
             "LANG", "LC_ALL", "LANGUAGE", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "LD_LIBRARY_PATH")
 
 
-def image_info(path, digest=False):
-    with open(path, "rb") as handle:
-        stat = os.fstat(handle.fileno())
-        info = {"device": stat.st_dev, "inode": stat.st_ino, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-        if digest:
-            sha = hashlib.sha256()
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                sha.update(chunk)
-            end = os.fstat(handle.fileno())
-            if (end.st_dev, end.st_ino, end.st_size, end.st_mtime_ns) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
-                raise ValueError("executable changed while hashing")
-            info["sha256"] = sha.hexdigest()
-        return info
+def copy_evidence(source, target):
+    for path in sorted(Path(source).iterdir()):
+        with open(Path(target) / path.name, "xb") as handle:
+            handle.write(path.read_bytes())
 
 
 def process_identity(pid, digest=False):
@@ -731,7 +901,8 @@ def stop_child(child, pidfd, meta):
         try:
             if "identity" not in meta:
                 raise ValueError("no launch identity")
-            require_identity(child.pid, meta["identity"], pidfd, True)
+            current = require_identity(child.pid, meta["identity"], pidfd, True)
+            meta["identity_checks"].append({"stage": "cleanup", "realtime": time.time(), **current})
             meta["cleanup_identity"] = "verified"
         except (OSError, ValueError) as exc:
             meta["errors"].append("cleanup: " + str(exc))
@@ -768,9 +939,11 @@ def smoke_main(argv):
             "clock": "realtime elapsed; 50 ms polling; CPU includes 1 s drain tail", "warmup": "none",
             "clk_tck": os.sysconf("SC_CLK_TCK"),
             "renderer_evidence": {"egl": "unknown", "cpu_fallback": "unknown", "hardware": "unknown"}}
+    meta["capture_id"] = uuid.uuid4().hex
     times = {}
     child = pidfd = exe_fd = None
     before = after = ""
+    process_before = process_after = None
 
     def save(suffix, text):
         (evidence / (name + suffix)).write_text(text, encoding="utf-8", newline="\n")
@@ -795,6 +968,7 @@ def smoke_main(argv):
     def snapshot(stage):
         guard(stage + " before", True)
         root = Path("/proc") / str(child.pid)
+        process = {"begin_ns": time.monotonic_ns(), "pre_stat": (root / "stat").read_text().strip()}
         tids = sorted((root / "task").iterdir(), key=lambda p: int(p.name))
         rows = []
         for task in tids:
@@ -803,14 +977,16 @@ def smoke_main(argv):
             except OSError:
                 stat = ""
             rows.append(task.name + "\t" + stat)
+        process.update(post_stat=(root / "stat").read_text().strip(), end_ns=time.monotonic_ns())
         text = "\n".join(rows) + "\n"
         save("-tasks-" + stage + ".txt", text)
+        save("-process-" + stage + ".json", json.dumps(process, indent=2) + "\n")
         save("-status-" + stage + ".txt", (root / "status").read_text())
         if {p.name for p in (root / "task").iterdir()} != {p.name for p in tids}:
             raise ValueError("thread population changed during snapshot")
         guard(stage + " after", True)
         parse_tasks(text)
-        return text
+        return text, process
 
     try:
         if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
@@ -820,11 +996,9 @@ def smoke_main(argv):
             signal.pidfd_send_signal(probe, 0)
         finally:
             os.close(probe)
-        def git_value(*args):
-            return subprocess.check_output(["git", *args], text=True).strip()
-        meta.update(commit=git_value("rev-parse", "HEAD"), tree=git_value("rev-parse", "HEAD^{tree}"),
-                    dirty_paths=git_value("status", "--porcelain"))
-        meta["dirty"] = bool(meta["dirty_paths"])
+        meta.update(source_identity())
+        if perf and meta["dirty"]:
+            raise ValueError("perf requires a clean committed source tree")
         exe = str(Path("zig-out/bin/ghostty").resolve())
         exe_fd = os.open(exe, os.O_RDONLY)
         held = f"/proc/self/fd/{exe_fd}"
@@ -839,6 +1013,15 @@ def smoke_main(argv):
             raise ValueError("perf requires verified ReleaseFast" if perf else "version failed")
         if perf and os.environ.get("GHOSTTY_GX_PERF", "").strip().lower() not in ("1", "true", "on", "yes"):
             raise ValueError("GHOSTTY_GX_PERF not enabled")
+        if perf:
+            if (BUILD_RECEIPT.parent / "build.lock").exists():
+                raise ValueError("normal build is still in progress")
+            receipt_text = BUILD_RECEIPT.read_text(encoding="utf-8")
+            receipt = json.loads(receipt_text)
+            source = {key: meta[key] for key in ("commit", "tree", "dirty", "dirty_paths")}
+            validate_receipt(receipt, source, meta["executable"], meta["version"], meta["version_exit"])
+            meta["build_receipt_sha256"] = hashlib.sha256(receipt_text.encode()).hexdigest()
+            save("-build-receipt.json", receipt_text)
         command = [exe, "--gtk-single-instance=false", *extra]
         if perf:
             command += ["-e", "sh", str(work / "workload.sh")]
@@ -871,7 +1054,7 @@ def smoke_main(argv):
         time.sleep(float(settle))
         capture(".png")
         if perf:
-            before = snapshot("before")
+            before, process_before = snapshot("before")
             times["workload_begin_realtime"] = time.time()
             (work / "go").touch()
             deadline = time.monotonic() + 300
@@ -888,15 +1071,21 @@ def smoke_main(argv):
             if meta["workload_exit"] != "0":
                 raise ValueError("workload failed or exit unavailable")
             time.sleep(1)
-            after = snapshot("after")
+            after, process_after = snapshot("after")
             times["cpu_end_realtime"] = time.time()
             capture("-perf.png")
             measurement(before, after, "\n".join(f"{key} {value}" for key, value in times.items()))
+            meta["cpu_accounting"] = cpu_accounting(before, after, process_before, process_after, str(child.pid), meta["clk_tck"])
         if xdo:
             checked(["xdotool", xdo, str(child.pid)], "xdotool script")
             time.sleep(1)
             capture("-after.png")
         guard("finished", True)
+        if perf:
+            meta["source_end"] = source_identity()
+            if BUILD_RECEIPT.read_text(encoding="utf-8") != receipt_text:
+                raise ValueError("normal build receipt changed during smoke")
+            validate_receipt(receipt, meta["source_end"], meta["executable"], meta["version"], meta["version_exit"])
         meta["exit"] = 0
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         meta["errors"].append(str(exc))
@@ -921,7 +1110,7 @@ def smoke_main(argv):
         meta["renderer_evidence"]["runtime_log_lines"] = [line for line in log_text.splitlines()
             if any(token in line.lower() for token in ("opengl", "egl", "dmabuf", "llvmpipe", "cpu presentation"))]
         if perf:
-            save("-perf.txt", report(before, after, times_text, log_text, os.sysconf("SC_CLK_TCK")))
+            save("-perf.txt", report(before, after, times_text, log_text, os.sysconf("SC_CLK_TCK"), process_before, process_after))
         meta["files"] = sorted(p.name for p in evidence.iterdir())
         meta["artifact_sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence.iterdir()}
         save("-meta.txt", "\n".join(f"{key}: {value}" for key, value in meta.items() if key not in ("renderer_evidence", "files")) + "\n")
@@ -931,7 +1120,10 @@ def smoke_main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(smoke_main(sys.argv))
+    if sys.argv[1:2] == ["--copy"]:
+        copy_evidence(sys.argv[2], sys.argv[3])
+    else:
+        sys.exit(smoke_main(sys.argv))
 """
 
 SMOKE_BODY = r"""out_win=$1
@@ -958,7 +1150,9 @@ if compgen -G "$out/$name*" >/dev/null; then die "evidence prefix already exists
 lock=$out/.gx-wsl-$name
 mkdir "$lock" || die "evidence prefix is already in use: $out/$name" 2
 work=$(mktemp -d "${TMPDIR:-/tmp}/gx-wsl-smoke.XXXXXX")
-trap 'rm -rf "$work"; rmdir "$lock"' EXIT
+keep_work=0
+trap '[ "$keep_work" = 1 ] || rm -rf "$work"; rmdir "$lock"' EXIT
+if compgen -G "$out/$name*" >/dev/null; then die "evidence prefix appeared while acquiring lock: $out/$name" 2; fi
 evidence=$work/evidence
 mkdir -p "$evidence"
 xdo=
@@ -983,7 +1177,11 @@ write_smoke_program >"$work/session.py"
 status=0
 xvfb-run --auto-servernum --server-args="-screen 0 $screen" python3 "$work/session.py" \
   "$evidence" "$name" "$wait_seconds" "$xdo" "$settle" "$perf" "$work" "$screen" "$@" || status=$?
-cp -n "$evidence"/* "$out"/
+if ! python3 "$work/session.py" --copy "$evidence" "$out"; then
+  keep_work=1
+  warn "evidence copy failed; original raw retained in $evidence"
+  exit 1
+fi
 for file in "$evidence"/*; do log "evidence: $(wslpath -w "$out/${file##*/}")"; done
 exit "$status"
 """
@@ -1081,6 +1279,10 @@ def perf_function() -> str:
     )
 
 
+def build_function() -> str:
+    return "normal_build() {\npython3 - \"$@\" <<'GX_WSL_BUILD'\n" + RECEIPT_PROGRAM.strip() + "\nsys.exit(build_main(sys.argv))\nGX_WSL_BUILD\n}\n"
+
+
 def smoke_function() -> str:
     program = PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + SMOKE_PROGRAM
     return "write_smoke_program() {\ncat <<'GX_WSL_SESSION'\n" + program.strip() + "\nGX_WSL_SESSION\n}\n"
@@ -1135,7 +1337,7 @@ def build_args(gtk: bool, extra: Sequence[str]) -> list[str]:
 
 
 def build_invocation(clone: str, gtk: bool, extra: Sequence[str]) -> Invocation:
-    return Invocation(compose(PRELUDE, prefetch_function(), BUILD_BODY), (clone, *build_args(gtk, extra)))
+    return Invocation(compose(PRELUDE, prefetch_function(), build_function(), BUILD_BODY), (clone, *build_args(gtk, extra)))
 
 
 def zig_test_args(suite: str, gtk: bool, filters: Sequence[str], extra: Sequence[str]) -> list[str]:

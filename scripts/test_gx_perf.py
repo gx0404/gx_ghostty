@@ -31,20 +31,36 @@ def gtk_fixture(root: Path) -> dict:
     times = "pid 10\nwindow_seconds 1\nworkload_seconds 1\nworkload_finished 1\nrun_exit 0\n"
     program = {"__name__": "test_gtk_fixture"}
     exec(gx_wsl.PERF_PROGRAM, program)
-    version = "Ghostty 1.3.2-test\n  - build mode    : .ReleaseFast\n"
+    version = "Ghostty 1.3.2-HEAD+bbbbbbbbb\n  - build mode    : .ReleaseFast\n"
+    source = {"commit": "b" * 40, "tree": "c" * 40, "dirty": False, "dirty_paths": ""}
+    image = {"sha256": "a" * 64, "device": 1, "inode": 2, "size": 3, "mtime_ns": 4}
+    executable = {"path": "/own/ghostty", **image}
+    receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0, "perf_eligible": True,
+               "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"],
+               "source_before": source, "source_after": source, "executable": executable, "version": version, "version_exit": 0}
+    receipt_text = json.dumps(receipt, indent=2) + "\n"
+    def process(ticks, start):
+        stat = stat_line(10, "ghostty", 0, 0, ticks, 0).split("\t", 1)[1]
+        return {"pre_stat": stat, "post_stat": stat, "begin_ns": start, "end_ns": start + 1_000_000}
+    process_before, process_after = process(0, 1_000_000_000), process(100, 3_000_000_000)
     files = {"perf.log": "info(gx_perf): config_load 10us\n", "perf-version.txt": version,
              "perf-times.txt": times, "perf-tasks-before.txt": before, "perf-tasks-after.txt": after,
              "perf-status-before.txt": "Pid: 10\n", "perf-status-after.txt": "Pid: 10\n",
-             "perf.png": "image", "perf-perf.png": "image",
-             "perf-perf.txt": program["report"](before, after, times, "info(gx_perf): config_load 10us\n", 100)}
+             "perf.png": "image", "perf-perf.png": "image", "perf-build-receipt.json": receipt_text,
+             "perf-process-before.json": json.dumps(process_before), "perf-process-after.json": json.dumps(process_after),
+             "perf-perf.txt": program["report"](before, after, times, "info(gx_perf): config_load 10us\n", 100, process_before, process_after)}
     for name, text in files.items():
         (root / name).write_text(text, encoding="utf-8", newline="\n")
-    identity = {"pid": 10, "starttime": 100, "exe": "/own/ghostty", "sha256": "a" * 64}
+    identity = {"pid": 10, "starttime": 100, "exe": "/own/ghostty", **image}
     meta = {"schema": "gx-gtk-perf-v1", "perf": True, "valid": True, "exit": 0, "errors": [], "identity": identity,
             "workload_finished": True, "workload_exit": "0", "build_mode": "ReleaseFast", "cleanup_identity": "verified",
-            "commit": "b" * 40, "tree": "c" * 40, "dirty": False, "version": version, "effective_env": {}, "clk_tck": 100,
+            "cleanup": "owned pidfd SIGTERM", "child_exit": -15, "executable": executable, "version_exit": 0,
+            **source, "source_end": source, "version": version, "effective_env": {}, "clk_tck": 100,
+            "capture_id": gx_perf.hashlib.sha256(str(root).encode()).hexdigest()[:32],
+            "build_receipt_sha256": gx_perf.hashlib.sha256(receipt_text.encode()).hexdigest(),
+            "cpu_accounting": program["cpu_accounting"](before, after, process_before, process_after, "10", 100),
             "identity_checks": [identity | {"stage": stage} for stage in
-                                ("launch", "before before", "before after", "after before", "after after", "finished")],
+                                ("launch", "before before", "before after", "after before", "after after", "finished", "cleanup")],
             "files": list(files),
             "artifact_sha256": {name: gx_perf.hashlib.sha256((root / name).read_bytes()).hexdigest() for name in files}}
     (root / "perf-meta.json").write_text(json.dumps(meta), encoding="utf-8")
@@ -351,6 +367,56 @@ class CommandTests(unittest.TestCase):
         (self.root / "perf-meta.txt").write_text("commit: abc\nexit: 1\nperf: seq 1 3000000\n", encoding="utf-8")
         with self.assertRaises(gx_perf.PerfError):
             gx_perf.collect([self.root / "perf.log"])
+
+    def batch_fixture(self, out, planned=10):
+        batch = {"schema": "gx-gtk-runs-v1", "planned_runs": planned, "labels": ["old", "new"],
+                 "valid": True, "order": "AB/BA", "runs": []}
+        for run, label in gx_perf.alternate(batch["labels"], planned):
+            relative = f"{label}/run-{run:02d}"
+            gtk_fixture(out / relative)
+            batch["runs"].append({"label": label, "run": run, "path": relative, "exit": 0, "status": "valid"})
+        return batch
+
+    def test_reporter_rejects_duplicate_run01_and_noncanonical_order(self):
+        import copy
+        out = self.root / "plan"
+        original = self.batch_fixture(out)
+        cases = {}
+        duplicate = copy.deepcopy(original)
+        for item in duplicate["runs"]:
+            item.update(run=1, path=f"{item['label']}/run-01")
+        cases["repeat run01"] = duplicate
+        swapped = copy.deepcopy(original)
+        swapped["runs"][2:4] = reversed(swapped["runs"][2:4])
+        cases["AB instead of BA"] = swapped
+        escaped = copy.deepcopy(original)
+        escaped["runs"][0]["path"] = "../old/run-01"
+        cases["outside out"] = escaped
+        for reason, batch in cases.items():
+            with self.subTest(reason=reason), contextlib.redirect_stdout(io.StringIO()):
+                code = gx_perf.report_gtk_runs(out, batch, None)
+                self.assertNotEqual(0, code)
+                self.assertFalse(json.loads((out / "RESULT.json").read_text())["validation"]["status"] == "valid")
+
+    def test_declared_ten_pair_batch_cannot_compare_one_selected_round(self):
+        out = self.root / "selected"
+        batch = self.batch_fixture(out)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.report_gtk_runs(out, batch, None))
+        code, _, _ = self.run_main("compare", "--old", str(out / "old/run-01"), "--new", str(out / "new/run-01"))
+        self.assertNotEqual(0, code)
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.collect([out / "old/run-01/perf-perf.txt"])
+
+    def test_contradictory_metadata_is_not_verified(self):
+        root = self.root / "contradiction"
+        for key, value in (("dirty", True), ("commit", "f" * 40), ("child_exit", -11),
+                           ("executable", {"sha256": "b" * 64}), ("version_exit", 1)):
+            meta = gtk_fixture(root)
+            meta[key] = value
+            (root / "perf-meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            with self.subTest(field=key), self.assertRaises(gx_perf.PerfError):
+                gx_perf.collect([root])
 
 
 if __name__ == "__main__":

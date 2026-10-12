@@ -305,6 +305,11 @@ class ScriptTests(unittest.TestCase):
             "the pinned blueprint-compiler should be exactly the minimum the GTK build accepts",
         )
 
+    def test_smoke_argv_fits_windows_createprocess(self):
+        invocation = all_invocations()["smoke-perf"]
+        length = len(subprocess.list2cmdline(gx_wsl.wsl_command("Ubuntu-24.04", invocation)))
+        self.assertLess(length, 32767)
+
     @unittest.skipUnless(find_bash(), "needs a bash for `bash -n`")
     def test_scripts_parse(self) -> None:
         bash = find_bash()
@@ -514,10 +519,119 @@ class PerfProgramTests(unittest.TestCase):
                 paths[1].write_text("", encoding="utf-8")
                 self.assertEqual(1, self.program["main"](["-", *map(str, paths)]))
 
+    def test_metric_tokens_preserve_odd_names_and_detect_collisions(self):
+        tasks = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0), stat_line(11, "renderer", 0, 0, 0, 0),
+                            stat_line(12, "ghostty:disk$0", 0, 0, 0, 0)))
+        result = self.program["report"](tasks, tasks, "pid 10\nworkload_finished 1\nwindow_seconds 1\nworkload_seconds 1\n", "", 100)
+        import gx_perf
+        samples = gx_perf.parse_text(result)
+        self.assertIn("cpu.ghostty:disk_0", samples.values)
+        collision = tasks + "\n" + stat_line(13, "ghostty:disk_0", 0, 0, 0, 0)
+        with self.assertRaises(ValueError):
+            self.program["deltas"](self.program["parse_tasks"](collision), self.program["parse_tasks"](collision), "10")
+
+    def test_transient_cpu_cannot_hide_between_equal_task_endpoints(self):
+        tasks = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0), stat_line(11, "renderer", 0, 0, 0, 0)))
+        def sample(ticks, start):
+            stat = stat_line(10, "ghostty", 0, 0, ticks, 0).split("\t", 1)[1]
+            return {"pre_stat": stat, "post_stat": stat, "begin_ns": start, "end_ns": start + 1_000_000}
+        with self.assertRaisesRegex(ValueError, "unattributed|transient"):
+            self.program["cpu_accounting"](tasks, tasks, sample(0, 1_000_000_000), sample(100, 3_000_000_000), "10", 100)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc accounting semantics")
+    def test_linux_process_stat_keeps_exited_thread_cpu(self):
+        import threading
+        import time
+        root = Path("/proc/self")
+        pid = str(os.getpid())
+        def stat(path):
+            return self.program["parse_tasks"](pid + "\t" + path.read_text())[pid]
+        before_proc, before_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
+        population = {path.name for path in (root / "task").iterdir()}
+        cpu = []
+        def worker():
+            begin = time.thread_time()
+            total = 0
+            for index in range(8_000_000):
+                total += index % 19
+            cpu.append(time.thread_time() - begin)
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        after_proc, after_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
+        self.assertEqual(population, {path.name for path in (root / "task").iterdir()})
+        process_delta = sum(after_proc[key] - before_proc[key] for key in ("utime", "stime"))
+        main_delta = sum(after_main[key] - before_main[key] for key in ("utime", "stime"))
+        self.assertGreaterEqual(process_delta - main_delta, int(cpu[0] * os.sysconf("SC_CLK_TCK")) - 4)
+
+    def test_prefix_is_rechecked_inside_lock_and_copy_is_exclusive(self):
+        body = gx_wsl.SMOKE_BODY
+        locked = body.split('mkdir "$lock"', 1)[1]
+        self.assertIn('compgen -G "$out/$name*"', locked)
+        self.assertNotIn('cp -n ', body)
+        program = self.supervisor()
+        with tempfile.TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "source", Path(tmp) / "target"
+            source.mkdir()
+            target.mkdir()
+            (source / "perf.log").write_text("new", encoding="utf-8")
+            (target / "perf.log").write_text("old", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                program["copy_evidence"](source, target)
+            self.assertEqual("old", (target / "perf.log").read_text())
+
     def supervisor(self):
         program = perf_namespace()
         exec(compile(gx_wsl.SMOKE_PROGRAM, "gx_wsl_smoke", "exec"), program)
         return program
+
+    def test_build_receipt_binds_source_binary_version_and_argv(self):
+        program = self.supervisor()
+        source = {"commit": "a" * 40, "tree": "b" * 40, "dirty": False, "dirty_paths": ""}
+        image = {"path": "/own/ghostty", "sha256": "c" * 64}
+        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .ReleaseFast\n"
+        receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0,
+                   "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"],
+                   "source_before": source, "source_after": source, "executable": image, "version": version, "version_exit": 0}
+        self.assertEqual(receipt, program["validate_receipt"](receipt, source, image, version, 0))
+        for changed in (source | {"dirty": True}, source | {"commit": "d" * 40}, source | {"tree": "e" * 40}):
+            with self.assertRaises(ValueError):
+                program["validate_receipt"](receipt, changed, image, version, 0)
+        for changed in (receipt | {"build_exit": 1}, receipt | {"source_before": source | {"dirty": True}},
+                        receipt | {"executable": image | {"sha256": "d" * 64}},
+                        receipt | {"build_argv": receipt["build_argv"] + ["-Doptimize=Debug"]}):
+            with self.assertRaises(ValueError):
+                program["validate_receipt"](changed, source, image, version, 0)
+        wrong = version.replace("aaaaaaaaa", "fffffffff")
+        with self.assertRaisesRegex(ValueError, "source commit"):
+            program["validate_receipt"](receipt | {"version": wrong}, source, image, wrong, 0)
+
+    @unittest.skipUnless(find_bash(), "needs real bash")
+    def test_prefix_race_is_rejected_after_acquiring_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            script = r'''set -euo pipefail
+enter_clone() { :; }
+require_ghostty() { :; }
+die() { exit "${2:-1}"; }
+wslpath() { printf '%s\n' "$2"; }
+xvfb-run() { exit 99; }
+xauth() { :; }
+scrot() { :; }
+xdotool() { :; }
+mkdir() {
+ command mkdir "$@"
+ case "${@: -1}" in
+ */.gx-wsl-perf) printf 'raced\n' >"${1%/.gx-wsl-perf}/perf-raced.log" ;;
+ esac
+}
+''' + gx_wsl.SMOKE_BODY
+            args = [out.as_posix(), "", "", "", "", "20", "perf", "1280x800x24", "3", "0", "", gx_wsl.PERF_WORKLOAD]
+            result = subprocess.run([find_bash(), "-s", "--", *args], input=script, capture_output=True,
+                                    text=True, encoding="utf-8", check=False)
+            self.assertEqual(2, result.returncode, result.stderr)
+            self.assertEqual("raced\n", (out / "perf-raced.log").read_text())
 
     def test_process_identity_guard_rejects_reuse_and_exits(self):
         program = self.supervisor()
@@ -752,7 +866,9 @@ class MainTests(unittest.TestCase):
             "-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell -Doptimize=ReleaseFast",
             out,
         )
-        self.assertIn("exec python3 scripts/zigw.py build", out)
+        self.assertIn('normal_build "$@"', out)
+        self.assertIn('subprocess.run([sys.executable, "scripts/zigw.py", "build", *args]', out)
+        self.assertIn("gtk-build-receipt.json", out)
 
     def test_setup_apt_runs_root_first(self) -> None:
         code, out, _ = self.run_main("--dry-run", "setup", "--apt")
