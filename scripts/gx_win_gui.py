@@ -32,8 +32,10 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   cancel-mode ENV_DIR               SendMessage WM_CANCELMODE to the focused terminal
 
 Isolation: LOCALAPPDATA and XDG_CONFIG_HOME point at ENV_DIR, so the configuration is
-ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log; NO_COLOR, TERM,
-COLORTERM, TERM_PROGRAM*, GHOSTTY_* and GHOSTTY_GX_* of the calling shell are removed (pass
+ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log. APPDATA,
+XDG_STATE_HOME and XDG_CACHE_HOME use ENV_DIR/appdata, ENV_DIR/state and ENV_DIR/cache;
+--env cannot override these isolated paths. NO_COLOR, TERM, COLORTERM, TERM_PROGRAM*,
+GHOSTTY_* and GHOSTTY_GX_* of the calling shell are removed (pass
 GX switches such as GHOSTTY_GX_OPENGL=software with --env). Only the instance this tool
 started is ever closed: before terminating it checks that the process still has the image
 path and creation time it was started with.
@@ -240,17 +242,19 @@ def env_assignments(values: Iterable[str]) -> dict[str, str]:
 
 
 def isolated_environment(base: Mapping[str, str], env_dir: Path, extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for an isolated Ghostty: the profile in env_dir, the caller's terminal settings removed."""
+    """Keep config, state, cache and roaming data private; extra cannot override those paths."""
+    paths = {"LOCALAPPDATA": env_dir, "APPDATA": env_dir / "appdata", "XDG_CONFIG_HOME": env_dir,
+             "XDG_STATE_HOME": env_dir / "state", "XDG_CACHE_HOME": env_dir / "cache"}
+    for name in extra or {}:
+        if name.upper() in paths:
+            raise UsageError(f"不能通过 --env 覆盖隔离路径变量: {name}")
     env = {}
     for name, value in base.items():
         upper = name.upper()
-        if upper in STRIPPED_ENV or any(upper.startswith(prefix) for prefix in STRIPPED_ENV_PREFIXES):
+        if upper in paths or upper in STRIPPED_ENV or any(upper.startswith(prefix) for prefix in STRIPPED_ENV_PREFIXES):
             continue
         env[name] = value
-    for name in [name for name in env if name.upper() in ("LOCALAPPDATA", "XDG_CONFIG_HOME")]:
-        del env[name]
-    env["LOCALAPPDATA"] = str(env_dir)
-    env["XDG_CONFIG_HOME"] = str(env_dir)
+    env.update({name: str(path) for name, path in paths.items()})
     env.update(extra or {})
     return env
 

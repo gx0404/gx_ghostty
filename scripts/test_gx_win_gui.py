@@ -96,7 +96,32 @@ class IsolationTests(unittest.TestCase):
                 "XDG_CONFIG_HOME": "C:/real/xdg", "HOME": "C:/h"}
         env = gui.isolated_environment(base, Path("E:/ev/env"), {"GHOSTTY_GX_OPENGL": "software"})
         self.assertEqual({"PATH": "C:/bin", "HOME": "C:/h", "LOCALAPPDATA": str(Path("E:/ev/env")),
-                          "XDG_CONFIG_HOME": str(Path("E:/ev/env")), "GHOSTTY_GX_OPENGL": "software"}, env)
+                          "APPDATA": str(Path("E:/ev/env/appdata")),
+                          "XDG_CONFIG_HOME": str(Path("E:/ev/env")),
+                          "XDG_STATE_HOME": str(Path("E:/ev/env/state")),
+                          "XDG_CACHE_HOME": str(Path("E:/ev/env/cache")),
+                          "GHOSTTY_GX_OPENGL": "software"}, env)
+
+    def test_state_cache_and_roaming_paths_ignore_inherited_case_variants(self):
+        root = Path("E:/ev/env")
+        base = {"AppData": "C:/real/roaming", "xdg_state_home": "C:/real/state",
+                "Xdg_Cache_Home": "C:/real/cache", "LocalAppData": "C:/real/local",
+                "xdg_config_home": "C:/real/config", "PATH": "C:/bin"}
+        original = dict(base)
+        env = gui.isolated_environment(base, root)
+        expected = {"LOCALAPPDATA": root, "APPDATA": root / "appdata", "XDG_CONFIG_HOME": root,
+                    "XDG_STATE_HOME": root / "state", "XDG_CACHE_HOME": root / "cache"}
+        for name, path in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(str(path), env[name])
+                self.assertEqual([name], [key for key in env if key.upper() == name])
+        self.assertEqual(original, base)
+
+    def test_explicit_environment_cannot_escape_private_profile_paths(self):
+        for name in ("LOCALAPPDATA", "APPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+            for key in (name, name.lower()):
+                with self.subTest(key=key), self.assertRaises(gui.UsageError):
+                    gui.isolated_environment({}, Path("E:/ev/env"), {key: "C:/outside"})
 
     def test_env_assignments(self):
         self.assertEqual({"A": "1=2", "B_": ""}, gui.env_assignments(["A=1=2", "B_="]))
