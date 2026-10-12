@@ -939,6 +939,10 @@ class Instance:
     def alive(self) -> bool:
         return win32().process_alive(self.pid) and self.owned()
 
+    def ensure_owned(self) -> None:
+        if not self.alive():
+            raise InputBlocked(f"Ghostty 实例 {self.pid} 已结束或进程身份已变化；未发送输入或执行界面操作")
+
     def remember_children(self) -> None:
         w = win32()
         known = {entry[0] for entry in self.children}
@@ -975,6 +979,7 @@ class Instance:
     # -- windows ------------------------------------------------------------
 
     def windows(self) -> list[WindowInfo]:
+        self.ensure_owned()
         return win32().top_windows(self.pid)
 
     def window(self, kind: str = "main", shown: bool = True) -> WindowInfo | None:
@@ -1046,6 +1051,7 @@ class Instance:
     # -- guarded input --------------------------------------------------------
 
     def ensure_foreground(self) -> None:
+        self.ensure_owned()
         w = win32()
         hwnd = w.foreground()
         pid = w.window_pid(hwnd) if hwnd else 0
@@ -1055,6 +1061,7 @@ class Instance:
                                "no input was sent")
 
     def ensure_point(self, x: int, y: int) -> None:
+        self.ensure_owned()
         w = win32()
         hwnd = w.window_at(x, y)
         if not hwnd or (w.window_pid(hwnd) != self.pid and w.root_owner_pid(hwnd) != self.pid):
@@ -1063,6 +1070,7 @@ class Instance:
                                f"pid {pid}), not ghostty pid {self.pid}; no input was sent")
 
     def activate(self, kind: str = "main") -> None:
+        self.ensure_owned()
         if not win32().activate(self.require_window(kind).hwnd):
             raise GuiError("cannot bring the ghostty window to the foreground; click it once, then retry")
 
@@ -1196,6 +1204,7 @@ class Instance:
     # -- capture --------------------------------------------------------------
 
     def capture_window(self, info: WindowInfo, method: str = "screen") -> Image:
+        self.ensure_owned()
         w = win32()
         if method == "print":
             return w.capture_print(info.hwnd)
@@ -1719,6 +1728,7 @@ class ScenarioRun:
         try:
             self.instance = launch(self.exe, env_dir, config=scenario.full_config(), env=scenario.env, args=scenario.args)
             report["pid"] = self.instance.pid
+            report["creation_filetime_100ns"] = str(self.instance.creation)
             self.startup = self.gui.wait_window(20)
             report["startup_ms"] = self.startup
             self.gui.activate()

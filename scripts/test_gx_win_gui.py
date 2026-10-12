@@ -362,6 +362,18 @@ class FakeWin32:
         self.foreground_pid = foreground_pid
         self.point_pid = point_pid
         self.sent: list = []
+        self.alive = True
+        self.image = "C:/g/ghostty.exe"
+        self.creation = 1
+
+    def process_alive(self, pid):
+        return self.alive
+
+    def process_image(self, pid):
+        return self.image
+
+    def process_creation(self, pid):
+        return self.creation
 
     def foreground(self):
         return 0x1000
@@ -412,6 +424,44 @@ class InputGuardTests(unittest.TestCase):
         with mock.patch.object(gui, "win32", return_value=fake):
             with self.assertRaisesRegex(gui.InputBlocked, r"window at \(5, 6\)"):
                 self.instance().mouse(5, 6, button="x1")
+        self.assertEqual([], fake.sent)
+
+    def test_same_pid_with_stale_identity_never_receives_input(self):
+        for field, value in (("alive", False), ("creation", 2), ("image", "C:/other.exe"),
+                             ("creation", None), ("image", None)):
+            fake = FakeWin32(foreground_pid=self.PID, point_pid=self.PID)
+            setattr(fake, field, value)
+            with mock.patch.object(gui, "win32", return_value=fake):
+                instance = self.instance()
+                for action in (lambda: instance.type_text("x", delay=0), lambda: instance.press("enter"),
+                               lambda: instance.mouse(5, 6), lambda: instance.wheel(5, 6)):
+                    with self.subTest(field=field, value=value, action=action):
+                        with self.assertRaises(gui.InputBlocked):
+                            action()
+                        self.assertEqual([], fake.sent)
+
+    def test_identity_is_rechecked_between_text_input_events(self):
+        fake = FakeWin32(foreground_pid=self.PID, point_pid=self.PID)
+        send = fake.send
+
+        def replace_after_send(inputs):
+            send(inputs)
+            fake.creation = 2
+
+        fake.send = replace_after_send
+        with mock.patch.object(gui, "win32", return_value=fake), self.assertRaises(gui.InputBlocked):
+            self.instance().type_text("ab", delay=0)
+        self.assertEqual(1, len(fake.sent))
+
+    def test_stale_identity_blocks_window_lookup_activation_and_capture(self):
+        fake = FakeWin32(foreground_pid=self.PID, point_pid=self.PID)
+        fake.creation = 2
+        with mock.patch.object(gui, "win32", return_value=fake):
+            instance = self.instance()
+            for action in (instance.windows, instance.activate,
+                           lambda: instance.capture_window(mock.Mock(spec=gui.WindowInfo))):
+                with self.subTest(action=action), self.assertRaises(gui.InputBlocked):
+                    action()
         self.assertEqual([], fake.sent)
 
     def test_events_when_the_instance_is_in_front(self):
