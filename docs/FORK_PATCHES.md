@@ -1160,19 +1160,22 @@ GTK 冒烟（`shell-integration = none`、`command = /bin/bash --noprofile --nor
 
 ## GX-0028 GTK 的配置错误对话框按诊断去重
 
-- 文件：`src/apprt/gtk/class/application.zig`，五个纯新增块与一行改动：导入 `src/apprt/gtk/gx/config_errors.zig`；`Private` 的 `gx_config_errors` 字段；`showConfigErrorsDialog` 开头记下这次的诊断是否没报告过，已打开的对话框只在有新诊断时 `present`（改动的一行），没打开时报告过的诊断不再弹出；`handleReloadConfig`（配置错误对话框的「重新加载配置」按钮）在重新加载之前清空记录。
+- 文件：`src/apprt/gtk/class/application.zig`，七个纯新增块与一行改动：导入 `src/apprt/gtk/gx/config_errors.zig`；`Private` 的 `gx_config_errors` 字段；`showConfigErrorsDialog` 开头记下这次的诊断是否没报告过，已打开的对话框只在有新诊断时 `present`（改动的一行），没打开时报告过的诊断不再弹出；紧随 `showConfigErrorsDialog` 的私有函数 `gxShowConfigErrorsIn`；`initAndShowWindow` 显示窗口之后的钩子；`handleReloadConfig`（配置错误对话框的「重新加载配置」按钮）在重新加载之前清空记录。
 - 标记：`fork(gx): GX-0028`；纯新增块用 begin/end 包住，改动的一行上一行写单行标记。
 - 状态：active，未回馈上游。
-- 改动量：1 个文件，`git diff --numstat` 合计 +18/−1（含标记）。
+- 改动量：1 个文件，`git diff --numstat` 合计 +46/−1（含标记）。
 
 ### 原因
 
-上游 `Application.showConfigErrorsDialog` 在 App 的每次配置变化（`setConfig`）时运行：配置有诊断就弹出配置错误对话框，已打开时再 `present` 一次，把它提到前面并夺走键盘焦点；用户点「忽略」关掉之后，下一次配置变化又弹出来。Ghostty GX 改配置的次数远多于用户编辑配置：设置对话框里主题预览的每一步（`App.updateConfig`）、每次保存（写 `gui-settings.ghostty` 后经 `reload_config` 重新读取）、切换界面语言、系统明暗切换，都会触发 `config_change`。用户的配置文件里只要有一处错误，用方向键浏览主题时对话框就每一步都弹出、焦点离开主题列表，每保存一项设置又弹一次（A10）。判断与记录放在 fork 路径，钩子只在对话框的显示入口与对话框自己的重新加载按钮。
+上游 `Application.showConfigErrorsDialog` 在 App 的每次配置变化（`setConfig`）时运行：配置有诊断就弹出配置错误对话框，已打开时再 `present` 一次，把它提到前面并夺走键盘焦点；用户点「忽略」关掉之后，下一次配置变化又弹出来。Ghostty GX 改配置的次数远多于用户编辑配置：设置对话框里主题预览的每一步（`App.updateConfig`）、每次保存（写 `gui-settings.ghostty` 后经 `reload_config` 重新读取）、切换界面语言、系统明暗切换，都会触发 `config_change`。用户的配置文件里只要有一处错误，用方向键浏览主题时对话框就每一步都弹出、焦点离开主题列表，每保存一项设置又弹一次（A10）。
+
+启动时的那一次另有问题：`startup` 在任何窗口出现之前以无父窗口的方式显示对话框，它成了单独的顶层窗口，随后出现的第一个终端窗口把它挡住；上游靠之后随便哪一次配置变化再 `present` 一次，才把它提到前面（Xvfb 实测：启动 3 秒后看不到对话框，按一次重新加载才出现）。只做去重就会让它一直被挡住，所以第一个窗口出现时改在这个窗口里显示。判断与记录放在 fork 路径，钩子只在对话框的显示入口、新窗口的显示与对话框自己的重新加载按钮。
 
 ### 行为
 
 - `src/apprt/gtk/gx/config_errors.zig::Reports` 记住已报告过的诊断的摘要（`gx.config_layers.diagnosticsDigest`：没有诊断为 0，内容与顺序相同则值相同），最多 8 组，满了替换最早的一组；主题预览在几组诊断之间来回（用户文件的错误，加上某个出错的主题文件）时，回到报告过的那组不再弹出。
 - `showConfigErrorsDialog`：没报告过的诊断照上游显示（新建对话框，或把已打开的对话框提到前面）并记为已报告；报告过的诊断只更新已打开对话框的内容（上游原有的 `config` 属性更新），不再 `present`、不抢焦点，对话框已被关掉时不再弹出。配置没有诊断时照上游关掉对话框，并清空记录，所以之后再出现同样的错误会再次弹出。
+- 第一个终端窗口出现之前，诊断都不算已报告，这时的配置变化照上游再 `present`。`initAndShowWindow` 显示第一个窗口后，如果之前显示过诊断，就关掉启动时那个无父窗口的对话框，在这个窗口里新建一个（libadwaita 的窗口内对话框，不受窗口管理器叠放顺序与防抢焦点的影响），并从此记为已报告。之后的窗口与没有诊断的启动不受影响。
 - 重新加载配置（`reload_config` 绑定、主菜单「重新加载配置」、systemd 的 SIGUSR2，以及 GX 设置对话框保存后的重新读取）只在诊断变了时弹出：改了配置文件、错误变多或变少都会报告新的那组；什么都没改时不重复报告已经看过的错误。只有配置错误对话框自己的「重新加载配置」按钮先清空记录：按下后错误仍在，就照上游再弹出一次，不会让人误以为已经修好。
 - 对话框本身、文字与按钮不变；Windows 不受影响。
 
@@ -1182,11 +1185,11 @@ GTK 冒烟（`shell-integration = none`、`command = /bin/bash --noprofile --nor
 
 ### 同步冲突处理
 
-五个纯新增块分别放在：GX-0016 导入块之后；`Private.config_errors_dialog` 之后；`showConfigErrorsDialog` 取得 `priv` 之后，以及「No diagnostics, do nothing.」的提前返回之后；`handleReloadConfig` 里 `priv.config_errors_dialog.set(null);` 之后、`Action.reloadConfig` 之前。改动的一行是已打开对话框分支里的 `diag.present(null)`。上游重写 `showConfigErrorsDialog`（例如改成按诊断内容比较）或对话框的重新加载流程时，保持两点：只有没报告过的诊断才新建或 `present` 对话框；对话框自己的重新加载先 `forget`。上游自己去重之后按「移除条件」处理。
+七个纯新增块分别放在：GX-0016 导入块之后；`Private.config_errors_dialog` 之后；`showConfigErrorsDialog` 取得 `priv` 之后，以及「No diagnostics, do nothing.」的提前返回之后；`showConfigErrorsDialog` 之后（`gxShowConfigErrorsIn`）；`initAndShowWindow` 末尾 `gtk.Window.present` 之后；`handleReloadConfig` 里 `priv.config_errors_dialog.set(null);` 之后、`Action.reloadConfig` 之前。改动的一行是已打开对话框分支里的 `diag.present(null)`。上游重写 `showConfigErrorsDialog`（例如改成按诊断内容比较）、新窗口的显示或对话框的重新加载流程时，保持三点：只有没报告过的诊断才新建或 `present` 对话框；第一个窗口显示后把启动时的对话框换成窗口内的；对话框自己的重新加载先 `forget`。`gxShowConfigErrorsIn` 照抄了 `showConfigErrorsDialog` 新建对话框与连接 `reload-config` 的几行，上游改了那几行要同步。上游自己去重、并让启动时的对话框不被第一个窗口挡住之后，按「移除条件」处理。
 
 ### 移除条件
 
-上游的配置错误对话框不再为相同的诊断重复弹出或抢焦点时移除：删除五个块、恢复改动的一行，连同标记与 `src/apprt/gtk/gx/config_errors.zig`，把登记行改为 `removed`。
+上游的配置错误对话框不再为相同的诊断重复弹出或抢焦点时移除：删除七个块、恢复改动的一行，连同标记与 `src/apprt/gtk/gx/config_errors.zig`，把登记行改为 `removed`。
 
 ### 验证
 
@@ -1198,11 +1201,11 @@ just wsl smoke --out <目录> --config <有错误的配置> --xdotool <脚本>
 python -m unittest scripts.test_fork_patches -v
 ```
 
-GTK 冒烟：配置里写一个未知键（如 `fontsize = 12`），启动后弹出配置错误对话框；按 Esc 忽略后打开设置对话框（Ctrl+,），到外观页在主题列表里按方向键浏览几步：配置错误对话框不再弹出，焦点留在主题列表；补丁前每一步都弹回来。读图后才算通过。
+GTK 冒烟：配置里写一个未知键（如 `fontsize = 12`）。启动后配置错误对话框显示在主窗口里（补丁前它在主窗口后面，看不到）；按 Esc 忽略后按 Ctrl+Shift+, 重新加载配置，只出现「已重新加载配置」提示，对话框不再弹出（补丁前每次重新加载都把它提到前面）。读图后才算通过。
 
 ### 测试锁定
 
-登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0028_problems` 锁定钩子的形状：`showConfigErrorsDialog` 先 `gx_config_errors.update` 再处理已打开的对话框，上游的 `diag.present(null)` 只剩带 `gx_new_errors` 条件、上方有标记的一处，报告过的诊断在新建对话框之前返回；整个文件只有 `handleReloadConfig` 在 `Action.reloadConfig` 之前 `forget`。`src/apprt/gtk/gx/config_errors.zig` 的单测锁定去重、清空与容量规则（`just wsl test --gtk --filter apprt.gtk.gx`）。
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0028_problems` 锁定钩子的形状：`showConfigErrorsDialog` 先 `gx_config_errors.update` 再处理已打开的对话框，上游的 `diag.present(null)` 只剩带 `gx_new_errors` 条件、上方有标记的一处，报告过的诊断在新建对话框之前返回；整个文件只有 `handleReloadConfig` 在 `Action.reloadConfig` 之前 `forget`；`initAndShowWindow` 在 `gtk.Window.present` 之后调 `windowShown`，`gxShowConfigErrorsIn` 把对话框显示在窗口里。`src/apprt/gtk/gx/config_errors.zig` 的单测锁定去重、清空、容量与第一个窗口之前的规则（`just wsl test --gtk --filter apprt.gtk.gx`）。
 
 ## GX-0029 DMABUF 导出不可用后不再逐帧重试
 

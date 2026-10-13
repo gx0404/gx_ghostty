@@ -19,6 +19,13 @@
 //! later are reported. The dialog's own Reload Configuration button clears
 //! it too: the errors that are still there after that reload are shown
 //! again rather than the dialog just going away.
+//!
+//! Diagnostics only count as reported once a terminal window is shown.
+//! Startup presents the dialog before there is any window, without a
+//! parent, so it gets a window of its own that the first terminal window
+//! then covers; upstream only brings it to the front at the next
+//! configuration change, by presenting it again. `windowShown` tells the
+//! app to show those diagnostics in the first window instead.
 const std = @import("std");
 
 const gx = @import("../../../gx/main.zig");
@@ -34,15 +41,32 @@ pub const Reports = struct {
     /// The slot that the next digest replaces once `digests` is full.
     oldest: usize = 0,
 
+    /// A terminal window was shown; before that nothing counts as reported.
+    window_shown: bool = false,
+
+    /// Diagnostics were shown before the first terminal window.
+    unseen: bool = false,
+
     /// Sets of diagnostics remembered at once. A theme preview can switch
     /// between a few (those of the user's files, plus those of a theme file
     /// with errors), so returning to one of them does not show it again.
     pub const capacity = 8;
 
     /// Whether to show the diagnostics of `config` now: true for
-    /// diagnostics not reported before, which then count as reported.
+    /// diagnostics not reported before, which then count as reported once
+    /// a terminal window is shown.
     pub fn update(self: *Reports, config: *const CoreConfig) bool {
         return self.updateDigest(gx.config_layers.diagnosticsDigest(config));
+    }
+
+    /// Records that a terminal window is shown. True only for the first
+    /// window, and only when diagnostics were shown before it: the app then
+    /// shows them in that window, and `update` counts them as reported.
+    pub fn windowShown(self: *Reports) bool {
+        if (self.window_shown) return false;
+        self.window_shown = true;
+        defer self.unseen = false;
+        return self.unseen;
     }
 
     /// Lets the next diagnostics be shown even if they were reported
@@ -56,10 +80,15 @@ pub const Reports = struct {
     fn updateDigest(self: *Reports, digest: u64) bool {
         if (digest == 0) {
             self.forget();
+            self.unseen = false;
             return false;
         }
         for (self.digests[0..self.len]) |reported| {
             if (reported == digest) return false;
+        }
+        if (!self.window_shown) {
+            self.unseen = true;
+            return true;
         }
         if (self.len < capacity) {
             self.digests[self.len] = digest;
@@ -74,7 +103,7 @@ pub const Reports = struct {
 
 test "each set of diagnostics is shown once" {
     const testing = std.testing;
-    var reports: Reports = .{};
+    var reports: Reports = .{ .window_shown = true };
     try testing.expect(!reports.updateDigest(0));
     try testing.expect(reports.updateDigest(1));
     try testing.expect(!reports.updateDigest(1));
@@ -90,16 +119,43 @@ test "each set of diagnostics is shown once" {
 
 test "forget shows the same diagnostics again" {
     const testing = std.testing;
-    var reports: Reports = .{};
+    var reports: Reports = .{ .window_shown = true };
     try testing.expect(reports.updateDigest(5));
     reports.forget();
     try testing.expect(reports.updateDigest(5));
     try testing.expect(!reports.updateDigest(5));
 }
 
-test "the oldest diagnostics are forgotten first" {
+test "diagnostics shown before the first window are shown in it" {
     const testing = std.testing;
     var reports: Reports = .{};
+    // Startup and any configuration change before the first window: shown
+    // every time, as upstream does, because nothing counts as reported yet.
+    try testing.expect(reports.updateDigest(3));
+    try testing.expect(reports.updateDigest(3));
+    // The first window shows them, which reports them.
+    try testing.expect(reports.windowShown());
+    try testing.expect(reports.updateDigest(3));
+    try testing.expect(!reports.updateDigest(3));
+    try testing.expect(!reports.windowShown());
+
+    // Without diagnostics before the first window there is nothing to show.
+    var clean: Reports = .{};
+    try testing.expect(!clean.updateDigest(0));
+    try testing.expect(!clean.windowShown());
+    try testing.expect(clean.updateDigest(3));
+    try testing.expect(!clean.updateDigest(3));
+
+    // Diagnostics fixed before the first window are not shown in it.
+    var fixed: Reports = .{};
+    try testing.expect(fixed.updateDigest(3));
+    try testing.expect(!fixed.updateDigest(0));
+    try testing.expect(!fixed.windowShown());
+}
+
+test "the oldest diagnostics are forgotten first" {
+    const testing = std.testing;
+    var reports: Reports = .{ .window_shown = true };
     for (1..Reports.capacity + 1) |digest| try testing.expect(reports.updateDigest(digest));
     try testing.expect(reports.updateDigest(Reports.capacity + 1));
     for (2..Reports.capacity + 2) |digest| try testing.expect(!reports.updateDigest(digest));
@@ -111,7 +167,7 @@ test "update reads the diagnostics of a configuration" {
     const testing = std.testing;
     var config = try CoreConfig.default(testing.allocator);
     defer config.deinit();
-    var reports: Reports = .{};
+    var reports: Reports = .{ .window_shown = true };
     try testing.expect(!reports.update(&config));
 
     try config.addDiagnosticFmt("unknown field {s}", .{"fontsize"});
