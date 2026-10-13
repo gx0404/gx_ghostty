@@ -1,5 +1,6 @@
 # Ghostty GX defaults for Windows, appended to defaults.ghostty.
 
+font-family = JetBrainsMono Nerd Font
 quit-after-last-window-closed = true
 
 # Windows has no selection clipboard (upstream binds Shift+Insert to
@@ -7,3 +8,5 @@ quit-after-last-window-closed = true
 # counterpart of Ctrl+Insert copying. Both still work when another
 # program takes Ctrl+Shift+C or Ctrl+Shift+V as a global hotkey.
 keybind = shift+insert=paste_from_clipboard
+keybind = performable:f3=navigate_search:next
+keybind = performable:shift+f3=navigate_search:previous

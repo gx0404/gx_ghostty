@@ -100,6 +100,9 @@ test "content starts with the marker and sets no fonts" {
     try testing.expect(std.mem.indexOf(u8, content, "background = #1f1f28\n") != null);
     try testing.expect(std.mem.indexOf(u8, content, "foreground = #ffffff\n") != null);
     try testing.expect(std.mem.indexOf(u8, content, "font-") == null);
+    try testing.expect(std.mem.indexOf(u8, content, "# gx-theme-version: 2\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 7=#a6adc8\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 15=#bac2de\n") != null);
     try testing.expect(isBuiltin("GX Mocha"));
     try testing.expect(!isBuiltin("gx mocha"));
 }
@@ -135,9 +138,20 @@ test "install creates, keeps and updates the theme file" {
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = crlf });
     try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes));
 
-    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = marker ++ "\n# gx-theme-version: 0\nbackground = #000000\n" });
-    try testing.expectEqual(InstallResult.updated, try install(alloc, io, themes));
-    try testing.expectEqualStrings(content, try tmp.dir.readFile(io, path, &buf));
+    const old_version = try std.mem.replaceOwned(u8, alloc, content, "# gx-theme-version: 2", "# gx-theme-version: 1");
+    defer alloc.free(old_version);
+    const old_seven = try std.mem.replaceOwned(u8, alloc, old_version, "palette = 7=#a6adc8", "palette = 7=#bac2de");
+    defer alloc.free(old_seven);
+    const old_theme = try std.mem.replaceOwned(u8, alloc, old_seven, "palette = 15=#bac2de", "palette = 15=#a6adc8");
+    defer alloc.free(old_theme);
+    const old_crlf = try std.mem.replaceOwned(u8, alloc, old_theme, "\n", "\r\n");
+    defer alloc.free(old_crlf);
+    for ([_][]const u8{ old_theme, old_crlf }) |old| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = old });
+        try testing.expectEqual(InstallResult.updated, try install(alloc, io, themes));
+        try testing.expectEqualStrings(content, try tmp.dir.readFile(io, path, &buf));
+        try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes));
+    }
 
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "background = #123456\n" });
     try testing.expectEqual(InstallResult.user_file, try install(alloc, io, themes));

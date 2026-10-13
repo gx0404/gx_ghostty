@@ -674,7 +674,8 @@ fn cursorTimerCallback(
     };
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
-    t.wakeup.notify() catch {};
+    // fork(gx): GX-0031 gate only the cursor timer's extra wake.
+    @import("../gx/cursor_blink.zig").notify(t, global.io());
 
     t.cursor_h.run(
         &t.loop,
@@ -855,3 +856,14 @@ const Compression = struct {
         };
     }
 };
+
+// fork(gx): GX-0031 begin: exercise the real cursor callback and async handle.
+test "renderer Thread: cursor idle gates preserve phase rearm and output wake" {
+    try @import("../gx/cursor_blink.zig").testThread(Thread, rendererpkg.Renderer, xev, cursorTimerCallback);
+}
+
+test "renderer Thread: focus cancel reset and independent animations" {
+    if (comptime !@hasDecl(apprt.App, "wakeup")) return error.SkipZigTest;
+    try @import("../gx/cursor_blink.zig").testFocus(Thread, rendererpkg.Renderer, drainMailbox, cursorTimerCallback);
+}
+// fork(gx): GX-0031 end

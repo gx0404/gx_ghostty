@@ -67,6 +67,23 @@ pub fn style(
     return .fromTerminal(state.cursor.visual_style);
 }
 
+// fork(gx): GX-0031 begin: map the render snapshot to the shared blink model.
+pub fn blinkAffects(state: *const terminal.RenderState, opts: StyleOptions) bool {
+    return @import("../gx/cursor_blink.zig").blinkAffects(.{
+        .viewport = state.cursor.viewport != null,
+        .preedit = opts.preedit,
+        .password = state.cursor.password_input,
+        .visible = state.cursor.visible,
+        .focused = opts.focused,
+        .blinking = state.cursor.blinking,
+    });
+}
+
+test "cursor: blink model equals the visible style difference" {
+    try @import("../gx/cursor_blink.zig").testStyle(terminal.RenderState, style, blinkAffects);
+}
+// fork(gx): GX-0031 end
+
 test "cursor: default uses configured style" {
     const testing = std.testing;
     const alloc = testing.allocator;

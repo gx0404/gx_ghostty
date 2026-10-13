@@ -18,7 +18,9 @@
 //! waiting for the vertical blank; DC targets render in software (their
 //! pixels go back to GDI anyway). `Canvas.snap*`, `hairline*` and
 //! `strokeRoundedRectPx` put edges on device pixels so thin lines stay
-//! sharp at 125 % and 150 %.
+//! sharp at 125 % and 150 %. `beginDib` separates coverage and glyph
+//! rasterization from stored BGRA backgrounds: replacement keeps channels
+//! above alpha in the terminal's linear-light storage contract.
 //!
 //! Text: `drawText`/`measureText` lay out UTF-8 through the cache;
 //! `TextLayout` is a layout the caller keeps, with hit testing, caret
@@ -69,6 +71,12 @@ pub fn colorRef(c: Color) u32 {
     const rgb = c.toRgb8();
     return @as(u32, rgb.r) | (@as(u32, rgb.g) << 8) | (@as(u32, rgb.b) << 16);
 }
+
+pub fn colorPixel(color: Color) u32 {
+    return @import("../chrome/alpha.zig").colorPixel(.{ color.r, color.g, color.b, color.a });
+}
+
+extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
 
 pub const Point = extern struct { x: f32, y: f32 };
 pub const Size = extern struct { width: f32, height: f32 };
@@ -1527,6 +1535,12 @@ pub const Canvas = struct {
     drawing: bool = false,
     /// Whether the DC target keeps per-pixel alpha (`beginDcAlpha`).
     dc_alpha: bool = false,
+    dib_stage: DibTarget = .{},
+    dib_output: ?*DibTarget = null,
+    dib_result: EndResult = .ok,
+    replacement: ?u32 = null,
+    clips: [16]Rect = undefined,
+    clip_len: usize = 0,
     /// Whether a failure was logged already.
     warned: bool = false,
 
@@ -1545,9 +1559,11 @@ pub const Canvas = struct {
 
     pub fn deinit(self: *Canvas) void {
         self.discardTarget();
+        self.dib_stage.deinit();
     }
 
     fn renderTarget(self: *Canvas) ?*ID2D1RenderTarget {
+        if (self.dib_output != null and self.dib_result != .ok) return null;
         return switch (self.target) {
             .none => null,
             .hwnd => |rt| @ptrCast(rt),
@@ -1648,6 +1664,74 @@ pub const Canvas = struct {
         return self.beginDcMode(hdc, rect, dpi, true);
     }
 
+    /// D2D rasterizes masks and glyphs into a separate alpha DIB. The caller
+    /// owns `output` until `finish`; only this GUI thread may access its bits.
+    pub fn beginDib(self: *Canvas, output: *DibTarget, size_px: SizeU, dpi: u32) bool {
+        std.debug.assert(!self.drawing and self.dib_output == null);
+        const w: i32 = @intCast(size_px.width);
+        const h: i32 = @intCast(size_px.height);
+        if (w <= 0 or h <= 0 or w > output.width or h > output.height or output.bits == null) return false;
+        if (GdiFlush() == 0) return false;
+        const dc = self.dib_stage.ensure(output.dc, w, h) orelse return false;
+        if (!self.beginDcAlpha(dc, .{ .left = 0, .top = 0, .right = w, .bottom = h }, dpi)) return false;
+        self.dib_output = output;
+        self.dib_result = .ok;
+        self.replacement = null;
+        self.clip_len = 0;
+        const rt = self.renderTarget().?;
+        rt.vtable.Clear(rt, &Color.black.withAlpha(0));
+        return true;
+    }
+
+    pub fn beginReplacement(self: *Canvas, pixel: u32) bool {
+        std.debug.assert(self.dib_output != null and self.replacement == null);
+        if (!self.commitDib(null, true)) return false;
+        self.replacement = pixel;
+        return true;
+    }
+
+    pub fn endReplacement(self: *Canvas) void {
+        const pixel = self.replacement orelse return;
+        self.replacement = null;
+        _ = self.commitDib(pixel, true);
+    }
+
+    fn commitDib(self: *Canvas, replacement: ?u32, restart: bool) bool {
+        const output = self.dib_output orelse return false;
+        if (self.dib_result != .ok) return false;
+        const rt = self.renderTarget() orelse return false;
+        for (0..self.clip_len) |_| rt.vtable.PopAxisAlignedClip(rt);
+        self.dib_result = self.finishTarget();
+        if (self.dib_result != .ok) return false;
+        // EndDraw copies the software target to the DC; GDI must finish all
+        // queued access to both DIBs before the CPU reads or writes them.
+        if (GdiFlush() == 0) {
+            self.dib_result = .failed;
+            return false;
+        }
+        const alpha = @import("../chrome/alpha.zig");
+        const source: [*]const u32 = @ptrCast(@alignCast(self.dib_stage.bits.?));
+        const dest: [*]u32 = @ptrCast(@alignCast(output.bits.?));
+        const src_stride: usize = @intCast(self.dib_stage.width);
+        const dst_stride: usize = @intCast(output.width);
+        for (0..self.pixel_size.height) |y| {
+            for (0..self.pixel_size.width) |x| {
+                const top = source[y * src_stride + x];
+                const pixel = &dest[y * dst_stride + x];
+                pixel.* = if (replacement) |value| alpha.replace(pixel.*, value, top >> 24) else alpha.over(pixel.*, top);
+            }
+        }
+        if (!restart) return true;
+        if (!self.beginDraw()) {
+            self.dib_result = .failed;
+            return false;
+        }
+        const next = self.renderTarget().?;
+        next.vtable.Clear(next, &Color.black.withAlpha(0));
+        for (self.clips[0..self.clip_len]) |clip| next.vtable.PushAxisAlignedClip(next, &clip.d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        return true;
+    }
+
     fn beginDcMode(self: *Canvas, hdc: w32.HDC, rect: w32.RECT, dpi: u32, alpha: bool) bool {
         const dpi_f: f32 = @floatFromInt(if (dpi == 0) 96 else dpi);
         if (self.target == .hwnd or (self.target == .dc and self.dc_alpha != alpha)) self.discardTarget();
@@ -1713,6 +1797,17 @@ pub const Canvas = struct {
     /// discarded, and the caller paints again (invalidates) to draw on a
     /// new one.
     pub fn finish(self: *Canvas) EndResult {
+        if (self.dib_output != null) {
+            std.debug.assert(self.replacement == null);
+            _ = self.commitDib(null, false);
+            self.dib_output = null;
+            self.clip_len = 0;
+            return self.dib_result;
+        }
+        return self.finishTarget();
+    }
+
+    fn finishTarget(self: *Canvas) EndResult {
         if (!self.drawing) return .ok;
         self.drawing = false;
         const rt = self.renderTarget() orelse return .failed;
@@ -1768,6 +1863,13 @@ pub const Canvas = struct {
     }
 
     pub fn clear(self: *Canvas, color: Color) void {
+        if (self.dib_output != null) {
+            if (!self.beginReplacement(colorPixel(color))) return;
+            const rt = self.renderTarget().?;
+            rt.vtable.Clear(rt, &Color.white);
+            self.endReplacement();
+            return;
+        }
         const rt = self.renderTarget() orelse return;
         rt.vtable.Clear(rt, &color);
     }
@@ -1856,11 +1958,20 @@ pub const Canvas = struct {
     /// Clip drawing to `rect` until `popClip`.
     pub fn pushClip(self: *Canvas, rect: Rect) void {
         const rt = self.renderTarget() orelse return;
+        if (self.dib_output != null) {
+            std.debug.assert(self.clip_len < self.clips.len);
+            self.clips[self.clip_len] = rect;
+            self.clip_len += 1;
+        }
         rt.vtable.PushAxisAlignedClip(rt, &rect.d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     }
 
     pub fn popClip(self: *Canvas) void {
         const rt = self.renderTarget() orelse return;
+        if (self.dib_output != null) {
+            std.debug.assert(self.clip_len > 0);
+            self.clip_len -= 1;
+        }
         rt.vtable.PopAxisAlignedClip(rt);
     }
 
@@ -2112,6 +2223,40 @@ test "endResultOf maps EndDraw results" {
     try testing.expectEqual(EndResult.ok, endResultOf(0));
     try testing.expectEqual(EndResult.recreate, endResultOf(D2DERR_RECREATE_TARGET));
     try testing.expectEqual(EndResult.failed, endResultOf(@bitCast(@as(u32, 0x80004005))));
+}
+
+test "ChromeAlpha native explicitly software DC and BitBlt preserve linear BGRA" {
+    const testing = std.testing;
+    const factory = try Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = Canvas.init(factory);
+    defer canvas.deinit();
+    const software = canvas.createDcTarget(D2D1_RENDER_TARGET_TYPE_SOFTWARE, true, 96) orelse return error.SoftwareD2DUnavailable;
+    canvas.target = .{ .dc = software };
+    canvas.dc_alpha = true;
+    var output: DibTarget = .{};
+    defer output.deinit();
+    var copied: DibTarget = .{};
+    defer copied.deinit();
+    const output_dc = output.ensure(null, 32, 16) orelse return error.CreateDibFailed;
+    const copied_dc = copied.ensure(null, 32, 16) orelse return error.CreateDibFailed;
+    try testing.expect(canvas.beginDib(&output, .{ .width = 32, .height = 16 }, 96));
+    canvas.clear(Color.black.withAlpha(0));
+    for ([_]u32{ 0x031c1c1c, 0x4d959595 }, 0..) |pixel, i| {
+        try testing.expect(canvas.beginReplacement(pixel));
+        canvas.fillRect(.{ .x = @as(f32, @floatFromInt(i)) * 16, .y = 0, .w = 16, .h = 16 }, .white);
+        canvas.endReplacement();
+    }
+    try testing.expectEqual(EndResult.ok, canvas.finish());
+    try testing.expectEqual(software, canvas.target.dc);
+    try testing.expect(w32.BitBlt(copied_dc, 0, 0, 32, 16, output_dc, 0, 0, w32.SRCCOPY) != 0);
+    try testing.expect(GdiFlush() != 0);
+    const pixels: [*]const u32 = @ptrCast(@alignCast(copied.bits.?));
+    for (0..16) |y| {
+        for (0..32) |x| try testing.expectEqual(@as(u32, if (x < 16) 0x031c1c1c else 0x4d959595), pixels[y * 32 + x]);
+    }
+    try testing.expectEqualSlices(u8, &.{ 0x1c, 0x1c, 0x1c, 0x03 }, std.mem.asBytes(&pixels[0]));
+    try testing.expectEqualSlices(u8, &.{ 0x95, 0x95, 0x95, 0x4d }, std.mem.asBytes(&pixels[16]));
 }
 
 test "opticalSize follows the Fluent type ramp" {

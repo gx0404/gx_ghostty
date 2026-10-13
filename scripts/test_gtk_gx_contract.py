@@ -38,6 +38,7 @@ TEMPLATE_CHILDREN = {
     ("Window", "toolbar"): "Adw.ToolbarView",
     ("Window", "toast_overlay"): "Adw.ToastOverlay",
     ("Surface", "context_menu"): "PopoverMenu",
+    ("Surface", "progress_bar_overlay"): "ProgressBar",
 }
 
 # The upstream menus the GX menus replace: (blueprint, upstream menu id, GX menu id).
@@ -49,7 +50,23 @@ REPLACED_MENUS = (
 )
 
 # Upstream actions the GX menus deliberately replace, with their replacement.
-RENAMED_ACTIONS = {("win.about", None): ("app.gx-about", None)}
+RENAMED_ACTIONS = {
+    ("win.about", None): ("app.gx-about", None),
+    ("app.open-config", "os-open"): ("app.gx-open-config-file", None),
+}
+
+MAIN_CONTEXT_ACTIONS = {
+    ("win.copy", None): ("win.copy", None),
+    ("win.paste", None): ("win.paste", None),
+    ("win.prompt-window-title", None): ("win.prompt-window-title", None),
+    ("win.close", None): ("win.close", None),
+    ("win.prompt-tab-title", None): ("tab.prompt-tab-title", None),
+    ("win.close-tab", "this"): ("tab.close", "this"),
+    ("win.clear", None): ("win.clear", None),
+    ("win.reset", None): ("win.reset", None),
+    ("win.toggle-inspector", None): ("win.toggle-inspector", None),
+    ("app.open-config", "new-window"): ("app.open-config", "new-window"),
+}
 
 # The upstream class that registers each action group the menus use.
 ACTION_GROUPS = {
@@ -323,9 +340,30 @@ class MenuTests(unittest.TestCase):
                 upstream = ids(blueprint(path)).get(upstream_id)
                 self.assertIsNotNone(upstream, f"{path} has no menu {upstream_id}")
                 self.assertEqual(upstream.kind, "menu")
-                expected = {RENAMED_ACTIONS.get(action, action) for action in menu_actions(upstream)}
+                actions = menu_actions(upstream)
+                moved = MAIN_CONTEXT_ACTIONS if gx_id == "main_menu" else {}
+                expected = {RENAMED_ACTIONS.get(action, action) for action in actions if action not in moved}
                 missing = expected - menu_actions(self.gx_ids[gx_id])
                 self.assertEqual(missing, set(), f"gx/menus.blp {gx_id} lacks actions of upstream {upstream_id}")
+                for action in actions & moved.keys():
+                    self.assertIn(moved[action], menu_actions(self.gx_ids["context_menu"]))
+
+    def test_main_menu_matches_the_windows_order_and_has_twelve_entries(self):
+        labels = [node.props["label"] for section in self.gx_ids["main_menu"].children
+                  for node in section.children if "label" in node.props]
+        self.assertEqual(labels, ["New Tab", "New Window", "New Tab with Profile", "Split",
+                                  "Command Palette", "Settings…", "Keyboard Shortcuts", "Language",
+                                  "Reload Configuration", "Open Configuration File", "About Ghostty GX", "Quit"])
+        self.assertEqual(self.gx_ids["gx_view_section"].kind, "section")
+
+    def test_tab_context_actions_are_distinct_from_active_tab_actions(self):
+        actions = menu_actions(self.gx_ids["tab_context_menu"])
+        wanted = {("win.gx-tab-" + name, None) for name in
+                  ("close", "close-others", "close-right", "duplicate", "move-window", "pin")}
+        self.assertTrue(wanted <= actions)
+        source = (GX / "window.zig").read_text(encoding="utf-8")
+        self.assertIn("adw.TabView.signals.setup_menu.connect", source)
+        self.assertIn("context_page_key", source)
 
     def test_gx_menu_actions_are_registered(self):
         registered = registered_actions()
@@ -354,6 +392,61 @@ class SettingsDialogTests(unittest.TestCase):
         callbacks = set(CALLBACK_BIND_RE.findall(source))
         self.assertEqual(handlers - callbacks, set(), "blueprint handlers without bindTemplateCallback")
         self.assertEqual(callbacks - handlers, set(), "bound callbacks the blueprint never uses")
+
+    def test_settings_use_a_virtual_theme_subpage_and_family_font_chooser(self):
+        root = blueprint("1.5/gx-settings-dialog.blp")
+        declared = ids(root)
+        self.assertEqual("Gtk.ListView", declared["theme_list"].kind)
+        self.assertEqual("Adw.NavigationPage", declared["theme_subpage"].kind)
+        chooser = declared["font_choose_button"]
+        self.assertEqual("Gtk.FontDialogButton", chooser.kind)
+        self.assertEqual("family", chooser.props["level"])
+        self.assertEqual("Adw.ActionRow", declared["font_choice_row"].kind)
+        self.assertEqual("Adw.EntryRow", declared["font_family_row"].kind)
+        self.assertGreaterEqual(int(template(root).props["content-width"]), 900)
+        pages = [node.props["name"] for node in root.walk() if node.kind == "Adw.PreferencesPage"]
+        self.assertEqual(pages, ["language", "appearance", "font", "interaction", "shell", "about"])
+
+    def test_font_zoom_switch_sync_save_and_reset(self):
+        source = (GX / "settings_dialog.zig").read_text(encoding="utf-8")
+        declared = ids(blueprint("1.5/gx-settings-dialog.blp"))
+        self.assertEqual("Adw.SwitchRow", declared["ctrl_scroll_zoom_row"].kind)
+        self.assertEqual("Gtk.Button", declared["ctrl_scroll_zoom_reset_button"].kind)
+        for statement in (
+            'setSwitch(priv.ctrl_scroll_zoom_row, config.@"gx-ctrl-scroll-zoom");',
+            'self.queueSet(item.key, settings_map.Switch.value(row.getActive() != 0));',
+            'self.queueReset(settings_map.ctrl_scroll_zoom.key);',
+            'self.fromCli(&.{settings_map.ctrl_scroll_zoom.key})',
+        ):
+            self.assertIn(statement, source)
+
+    def test_surface_routes_raw_scroll_and_disposes_zoom(self):
+        source = (GTK / "class/surface.zig").read_text(encoding="utf-8")
+        for statement in (
+            'gx_font_zoom.sync(self, priv.render_surface.as(gtk.Widget), config.@"gx-ctrl-scroll-zoom");',
+            'if (gx_font_zoom.scroll(self, ec, y)) return 1;',
+            'gx_font_zoom.dispose(self);',
+        ):
+            self.assertIn(statement, source)
+        self.assertLess(source.index('if (gx_font_zoom.scroll(self, ec, y))'),
+                        source.index('const multiplier: f64 = if (priv.precision_scroll)'))
+
+    def test_environment_flags_are_appended_before_gtk_init(self):
+        source = (GTK / "class/application.zig").read_text(encoding="utf-8")
+        self.assertIn('try @import("../gx/environment.zig").append("GDK_DEBUG", gdk_debug);', source)
+        self.assertIn('try @import("../gx/environment.zig").append("GDK_DISABLE", gdk_disable);', source)
+        self.assertLess(source.index('setGtkEnv(&config)'), source.index('adw.init();'))
+        start = source.index('fn setGtkEnv(')
+        self.assertIn('global.syncEnviron();', source[start:])
+        self.assertNotIn('setenv("GDK_', source[start:])
+
+    def test_theme_enter_keeps_the_saved_theme_read_only(self):
+        source = (GX / "settings_dialog.zig").read_text(encoding="utf-8")
+        body = re.search(r"fn applyTheme\(self: \*Self\) void \{(.*?)\n    \}", source, re.S)
+        self.assertIsNotNone(body)
+        guard = "if (self.isSavedTheme(index)) return;"
+        self.assertIn(guard, body.group(1))
+        self.assertLess(body.group(1).index(guard), body.group(1).index('self.queueSet("theme"'))
 
 
 if __name__ == "__main__":

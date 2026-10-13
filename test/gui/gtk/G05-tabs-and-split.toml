@@ -16,5 +16,5 @@ sleep 1.5
 """
 expect = [
   "G05.png: a single tab, so the tab bar stays hidden",
-  "G05-after.png: two tabs, the second selected (outlined, with its close button) and split left/right by a thin divider in the terminal colors",
+  "G05-after.png: two tabs on the darker strip, the second selected in the terminal background (no outline, with its close button) and split left/right by a thin divider in the terminal colors, the focused split outlined in the accent blue",
 ]

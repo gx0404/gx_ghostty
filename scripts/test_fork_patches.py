@@ -88,6 +88,22 @@ GX0002_HUNKS = (
      )),
 )
 
+CLOSE_DIALOG_ZIG = "src/apprt/gtk/class/close_confirmation_dialog.zig"
+GX0027 = "GX-0027"
+GX0027_CALL = '@import("../gx/confirm.zig").listProcesses(self, priv.target, parent);'
+GX0027_AFTER = "self.as(Dialog.Parent).setBody(priv.target.body());"
+GX0027_BEFORE = "self.as(Dialog).present(parent);"
+
+APPLICATION_ZIG = "src/apprt/gtk/class/application.zig"
+GX0028 = "GX-0028"
+
+OPENGL_ZIG = "src/renderer/OpenGL.zig"
+GX0029 = "GX-0029"
+GX0029_FIELD = 'gx_dmabuf: @import("../gx/dmabuf_export.zig").Export(gl) = .{},'
+GX0029_CONDITION = "if (presentation_health == .healthy and self.gx_dmabuf.enabled(self.device.display)) {"
+GX0029_EXPORT = "if (self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))) |dmabuf| {"
+UPSTREAM_DMABUF_WARNING = "failed to export DMABUF, falling back to CPU presentation"
+
 GTK_CSS = "src/apprt/gtk/css/style.css"
 CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 CSS_GRADIENT_RE = re.compile(r"\b(?:repeating-)?(?:linear|radial|conic)-gradient\(")
@@ -402,6 +418,118 @@ def gx0002_problems(source: str) -> list[str]:
     return problems
 
 
+def zig_fn_lines(lines: list[str], header: str) -> tuple[int, int] | None:
+    """0-based [start, end) lines of the one function whose first line starts with ``header``
+    (after indentation), up to its closing brace at the same indentation; None otherwise."""
+    starts = [i for i, line in enumerate(lines) if line.strip().startswith(header)]
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i] == f"{indent}}}"), None)
+    return None if end is None else (start, end + 1)
+
+
+def gx0027_problems(source: str) -> list[str]:
+    """Shape lock for GX-0027: one pure-addition hunk in CloseConfirmationDialog.present."""
+    try:
+        upstream, hunks = marked_hunks(source, GX0027)
+    except ValueError as err:
+        return [str(err)]
+    problems: list[str] = []
+    if "fork(gx)" in upstream:
+        problems.append(f"{CLOSE_DIALOG_ZIG} carries fork(gx) markers outside the {GX0027} hunk")
+    if len(hunks) != 1:
+        return [*problems, f"expected one {GX0027} hunk, found {len(hunks)}"]
+    lines = source.splitlines()
+    begin, end = hunks[0]
+    if squash(GX0027_CALL) not in squash("\n".join(lines[begin + 1:end])):
+        problems.append(f"the {GX0027} hunk must call {GX0027_CALL!r}")
+    after = [i for i, line in enumerate(lines) if line.strip() == GX0027_AFTER]
+    before = [i for i, line in enumerate(lines) if line.strip() == GX0027_BEFORE]
+    if len(after) != 1 or len(before) != 1 or not after[0] < begin < end < before[0]:
+        problems.append(f"the {GX0027} hunk must sit between {GX0027_AFTER!r} and {GX0027_BEFORE!r}")
+    return problems
+
+
+def gx0028_problems(source: str) -> list[str]:
+    """Shape lock for GX-0028 in class/application.zig: the configuration errors dialog shows
+    each set of diagnostics once, and only its own reload button shows remaining errors again."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    show = zig_fn_lines(lines, "fn showConfigErrorsDialog(")
+    reload = zig_fn_lines(lines, "fn handleReloadConfig(")
+    if show is None or reload is None:
+        return ["showConfigErrorsDialog and handleReloadConfig must each be defined once"]
+    problems: list[str] = []
+    show_body = [line.strip() for line in lines[show[0]:show[1]]]
+    reload_body = [line.strip() for line in lines[reload[0]:reload[1]]]
+
+    def single(body: list[str], name: str, needle: str) -> int | None:
+        hits = [i for i, line in enumerate(body) if line == needle]
+        if len(hits) != 1:
+            problems.append(f"{name}: expected exactly one line {needle!r}, found {len(hits)}")
+            return None
+        return hits[0]
+
+    name = "showConfigErrorsDialog"
+    update = single(show_body, name, "const gx_new_errors = priv.gx_config_errors.update(priv.config.get());")
+    existing = single(show_body, name, "if (priv.config_errors_dialog.get()) |diag| {")
+    present = single(show_body, name, "if (gx_new_errors) diag.present(null);")
+    no_diagnostics = single(show_body, name, "if (!priv.config.hasDiagnostics()) return;")
+    reported = single(show_body, name, "if (!gx_new_errors) return;")
+    create = single(show_body, name, "const dialog: *ConfigErrorsDialog = .new(priv.config);")
+    if "diag.present(null);" in show_body:
+        problems.append(f"{name}: the open dialog is presented without checking gx_new_errors")
+    if None not in (update, existing) and not update < existing:
+        problems.append(f"{name}: gx_config_errors.update must run before the open dialog is handled")
+    if present is not None and GX0028 not in show_body[present - 1]:
+        problems.append(f"{name}: the changed present line needs a fork(gx): {GX0028} comment above it")
+    if None not in (no_diagnostics, reported, create) and not no_diagnostics < reported < create:
+        problems.append(f"{name}: diagnostics reported before must return before a new dialog is created")
+
+    forget = single(reload_body, "handleReloadConfig", "priv.gx_config_errors.forget();")
+    call = next((i for i, line in enumerate(reload_body) if line.startswith("Action.reloadConfig(")), None)
+    if forget is not None and (call is None or not forget < call):
+        problems.append("handleReloadConfig: forget() must run before Action.reloadConfig")
+    if sum("gx_config_errors.forget()" in line for line in lines) != 1:
+        problems.append("only the reload button of the configuration errors dialog may forget reported diagnostics")
+    return problems
+
+
+def gx0029_problems(source: str) -> list[str]:
+    """Shape lock for GX-0029 in src/renderer/OpenGL.zig: present() stops exporting DMABUFs
+    once that cannot work, after the Windows (GX-0004) branch has returned."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    problems: list[str] = []
+
+    def marked(needle: str) -> int | None:
+        hits = [i for i, line in enumerate(lines) if line.strip() == needle]
+        if len(hits) != 1:
+            problems.append(f"expected exactly one line {needle!r}, found {len(hits)}")
+            return None
+        if GX0029 not in lines[hits[0] - 1]:
+            problems.append(f"{needle!r} needs a fork(gx): {GX0029} comment on the line above")
+        return hits[0]
+
+    marked(GX0029_FIELD)
+    condition = marked(GX0029_CONDITION)
+    export = marked(GX0029_EXPORT)
+    if UPSTREAM_DMABUF_WARNING in source:
+        problems.append("present() must not warn for every frame whose export fails")
+    present = zig_fn_lines(lines, "pub fn present(")
+    if present is None:
+        return [*problems, "expected one top-level `pub fn present(`"]
+    start, end = present
+    if any(at is not None and not start < at < end for at in (condition, export)):
+        problems.append("the DMABUF export must stay in present()")
+    if None not in (condition, export) and not condition < export:
+        problems.append("the DMABUF export must be inside the GX-0029 condition")
+    windows = next((i for i in range(start, end) if "builtin.os.tag == .windows" in lines[i]), None)
+    if windows is None or (condition is not None and not windows < condition):
+        problems.append("the Windows (GX-0004) branch of present() must return before the DMABUF export")
+    return problems
+
+
 def css_call_args(css: str, paren: int) -> list[str]:
     """Top-level, comma-separated arguments of the call whose '(' is at ``paren``."""
     args: list[str] = []
@@ -572,7 +700,7 @@ class RealRepoTests(unittest.TestCase):
     def test_gx_css_generator_text_is_extracted(self):
         css = zig_css_text((ROOT / GX_CSS_GENERATORS[0]).read_text(encoding="utf-8"))
         self.assertIn("background-color: 0;", css)
-        self.assertIn(".window tabbar tab:selected {", css)
+        self.assertIn("toolbarview.gx-chrome tabbar tabbox:not(.single-tab) tab:selected {", css)
         self.assertIn("rgb(0,0,0)", css)
 
 
@@ -684,6 +812,84 @@ class Gx0002ShapeTests(unittest.TestCase):
         crlf = self.source.replace("\n", "\r\n")
         self.assertEqual(gx0002_problems(crlf), [])
         self.assertEqual(marked_hunks(crlf, GX0002)[0].replace("\r\n", "\n"), self.upstream)
+
+
+class Gx0027ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / CLOSE_DIALOG_ZIG).read_text(encoding="utf-8")
+        cls.lines = cls.source.splitlines(keepends=True)
+        cls.upstream, cls.hunks = marked_hunks(cls.source, GX0027)
+
+    def test_close_dialog_keeps_the_hunk(self):
+        self.assertEqual(gx0027_problems(self.source), [])
+        self.assertEqual(gx0027_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_hunk_is_the_only_change_against_merged_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, CLOSE_DIALOG_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        self.assertEqual(self.upstream.replace("\r\n", "\n"), upstream)
+
+    def test_missing_or_moved_hunk_is_rejected(self):
+        self.assertIn(f"expected one {GX0027} hunk, found 0", gx0027_problems(self.upstream))
+        begin, end = self.hunks[0]
+        rest = self.lines[:begin] + self.lines[end + 1:]
+        at = next(i for i, line in enumerate(rest) if line.strip() == GX0027_BEFORE) + 1
+        moved = "".join(rest[:at] + self.lines[begin:end + 1] + rest[at:])
+        self.assertTrue(any("must sit between" in p for p in gx0027_problems(moved)))
+
+
+class Gx0028ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
+
+    def problems_after(self, old: str, new: str) -> list[str]:
+        self.assertIn(old, self.source)
+        return gx0028_problems(self.source.replace(old, new, 1))
+
+    def test_application_keeps_the_hooks(self):
+        self.assertEqual(gx0028_problems(self.source), [])
+        self.assertEqual(gx0028_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_open_dialog_is_not_raised_for_reported_diagnostics(self):
+        problems = self.problems_after("if (gx_new_errors) diag.present(null);", "diag.present(null);")
+        self.assertTrue(any("without checking gx_new_errors" in p for p in problems), problems)
+
+    def test_reported_diagnostics_stay_dismissed(self):
+        problems = self.problems_after("        if (!gx_new_errors) return;\n", "")
+        self.assertTrue(any("'if (!gx_new_errors) return;'" in p for p in problems), problems)
+
+    def test_only_the_dialog_reload_forgets(self):
+        problems = self.problems_after("        priv.gx_config_errors.forget();\n", "")
+        self.assertTrue(any(p.startswith("handleReloadConfig:") for p in problems), problems)
+        problems = self.problems_after("        defer config.unref();\n",
+                                       "        defer config.unref();\n        self.private().gx_config_errors.forget();\n")
+        self.assertTrue(any("only the reload button" in p for p in problems), problems)
+
+
+class Gx0029ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / OPENGL_ZIG).read_text(encoding="utf-8")
+
+    def test_present_keeps_the_hooks(self):
+        self.assertEqual(gx0029_problems(self.source), [])
+        self.assertEqual(gx0029_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_unchecked_or_untracked_export_is_rejected(self):
+        for old, new in ((" and self.gx_dmabuf.enabled(self.device.display)", ""),
+                         ("self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))",
+                          "target.exportDmabuf(self.device.display, self.egl_context)")):
+            with self.subTest(old):
+                self.assertIn(old, self.source)
+                problems = gx0029_problems(self.source.replace(old, new, 1))
+                self.assertTrue(any("found 0" in p for p in problems), problems)
+
+    def test_per_frame_warning_is_rejected(self):
+        problems = gx0029_problems(self.source + f'\n// log.warn("{UPSTREAM_DMABUF_WARNING}", .{{}});\n')
+        self.assertIn("present() must not warn for every frame whose export fails", problems)
 
 
 class HunkTests(unittest.TestCase):
@@ -811,6 +1017,237 @@ class GxCssGeneratorTests(unittest.TestCase):
             self.assertEqual(len(problems), 1 + len(GX_CSS_GENERATORS), problems)
             sheet.write_text(".a { color: rgb(1 2 3; }\n", encoding="utf-8")
             self.assertTrue(any("unclosed call" in problem for problem in gx_css_problems(root)))
+
+
+class Gx0030ShapeTests(unittest.TestCase):
+    def test_optional_hooks_bracket_only_user_mutations(self):
+        expected = {
+            "src/Surface.zig": 5,
+            "src/termio/Termio.zig": 2,
+        }
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for rel, count in expected.items():
+            with self.subTest(rel):
+                self.assertIn(Patch("GX-0030", rel, "fork(gx): GX-0030", "active"), patches)
+                source = (ROOT / rel).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0030")
+                self.assertEqual(len(hunks), count * 2 + (2 if rel == "src/Surface.zig" else 0))
+                self.assertNotIn("gxUserScrolled", stripped)
+                self.assertNotIn("gx_before", stripped)
+                self.assertEqual(source.count("const gx_before = if (comptime @hasDecl(apprt.Surface,"), count)
+                self.assertEqual(source.count(".gxUserScrolled(gx_before,"), count)
+                for forbidden in ("ShowWindow", "PostMessage"):
+                    for begin, end in hunks:
+                        self.assertNotIn(forbidden, "\n".join(source.splitlines()[begin:end + 1]))
+                lines = source.splitlines()
+                mutations = [(begin, end) for begin, end in hunks
+                             if "gx_before" in "\n".join(lines[begin + 1:end])]
+                self.assertEqual(len(mutations), count * 2)
+                for before, after in zip(mutations[::2], mutations[1::2]):
+                    mutation = "\n".join(lines[before[1] + 1:after[0]])
+                    self.assertTrue(any(call in mutation for call in
+                                        ("autoscrollTick(", ".scrollViewport(", ".scroll(")), mutation)
+                    self.assertNotIn("queueIo(", mutation)
+                    self.assertNotIn(".unlock(", mutation)
+        termio = (ROOT / "src/termio/Termio.zig").read_text(encoding="utf-8")
+        self.assertEqual(termio.count("self.surface_mailbox.surface.rt_surface.gxUserScrolled("), 2)
+
+    def test_search_selection_source_stays_inside_the_mutex(self):
+        rel = "src/terminal/search/Thread.zig"
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch("GX-0030", rel, "fork(gx): GX-0030", "active"), patches)
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        stripped, hunks = marked_hunks(source, "GX-0030")
+        self.assertEqual(len(hunks), 5)
+        self.assertNotIn("gx_user_scroll", stripped)
+        lines = source.splitlines()
+        bounds = zig_fn_lines(lines, "fn select(")
+        self.assertIsNotNone(bounds)
+        body = "\n".join(lines[bounds[0]:bounds[1]])
+        lock = body.index("self.opts.mutex.lockUncancelable(")
+        before = body.index("const gx_before =")
+        mutation = body.index("try s.select(")
+        after = body.index("const gx_after =")
+        notify = body.index("cb(.{ .gx_user_scroll")
+        self.assertTrue(lock < before < mutation < after < notify)
+        self.assertIn("defer self.opts.mutex.unlock(", body)
+        self.assertIn("if (gx_before.offset != gx_after.offset)", body)
+        self.assertNotIn(".push(", body)
+        self.assertEqual(body.count("screens.active.pages.scrollbar()"), 2)
+        self.assertIn("gx_user_scroll_enabled: bool = false", source)
+        core = (ROOT / "src/Surface.zig").read_text(encoding="utf-8")
+        self.assertIn('.gx_user_scroll_enabled = @hasDecl(apprt.Surface, "gxUserScrolled"),', core)
+        self.assertIn("self.rt_surface.gxUserScrolled(scroll.before, scroll.after);", core)
+
+
+class Gx0031ShapeTests(unittest.TestCase):
+    def test_cursor_gate_only_changes_the_timer_notify(self):
+        source = (ROOT / "src/renderer/Thread.zig").read_text(encoding="utf-8")
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, "fn cursorTimerCallback(")
+        body = "\n".join(lines[start:end])
+        self.assertIn('fork(gx): GX-0031', body)
+        self.assertIn('@import("../gx/cursor_blink.zig").notify(t, global.io());', body)
+        self.assertIn('t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;', body)
+        self.assertIn('t.cursor_h.run(', body)
+        self.assertIn('const CURSOR_BLINK_INTERVAL = 600;', source)
+        self.assertNotIn('t.state', body)
+        self.assertNotIn('t.wakeup.notify()', body)
+        focus = source[source.index('.focus =>'):source.index('.reset_cursor_blink =>')]
+        self.assertIn('self.cursor_h.cancel(', focus)
+        animation = source[source.index('fn animationTimerCallback('):source.index('fn cursorTimerCallback(')]
+        self.assertNotIn('cursor_blink.zig', animation)
+
+    def test_blink_cache_uses_the_successful_frame_snapshot(self):
+        source = (ROOT / "src/renderer/generic.zig").read_text(encoding="utf-8")
+        self.assertIn('gx_cursor_blink_affects: bool = true', source)
+        self.assertIn('errdefer @import("../gx/cursor_blink.zig").invalidate(self, global.io());', source)
+        cache = source.index('self.gx_cursor_blink_affects = !gx_rebuilt')
+        self.assertLess(source.index('self.terminal_state.endUpdate();'), cache)
+        self.assertLess(source.index('self.rebuildCells('), cache)
+        self.assertIn('.preedit = critical.preedit != null,', source[cache:cache + 280])
+        self.assertIn('.focused = self.focused,', source[cache:cache + 280])
+        outside = source[source.index('self.terminal_state.endUpdate();'):source.index('pub fn drawFrame(')]
+        self.assertNotIn('state.preedit', outside)
+        self.assertNotIn('state.mouse', outside)
+        callback = (ROOT / 'src/renderer/Thread.zig').read_text(encoding='utf-8')
+        self.assertLess(callback.index('if (!t.renderer.display_realized)'), callback.index('if (!t.flags.visible) return .disarm;'))
+
+
+class Gx0032ShapeTests(unittest.TestCase):
+    def test_background_is_prepared_under_draw_mutex_before_realization(self):
+        source = (ROOT / 'src/renderer/generic.zig').read_text(encoding='utf-8')
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, 'pub fn displayRealized(')
+        body = '\n'.join(lines[start:end])
+        self.assertIn('fork(gx): GX-0032', body)
+        self.assertLess(body.index('draw_mutex.lockUncancelable'), body.index('prepareBackground('))
+        self.assertLess(body.index('prepareBackground('), body.index('self.display_realized = true;'))
+        self.assertNotIn('uploadBackgroundImage(', body)
+        helper = (ROOT / 'src/gx/renderer_recovery.zig').read_text(encoding='utf-8')
+        self.assertIn('renderer.config.bg_image != null and renderer.bg_image == null', helper)
+        self.assertIn('try prepare(renderer);', helper)
+
+
+class Gx0033ShapeTests(unittest.TestCase):
+    def test_vsync_documentation_describes_a_request_not_a_driver_guarantee(self):
+        source = (ROOT / 'src/config/Config.zig').read_text(encoding='utf-8')
+        doc = source[source.index('/// Synchronize rendering with the screen refresh rate.'):source.index('@"window-vsync": bool = true,')]
+        for text in ('fork(gx): GX-0033', 'WGL', 'interval 1', 'when false', 'Driver settings', 'original request', 'gl.finish()', 'only affect new terminals'):
+            self.assertIn(text, doc)
+        self.assertNotIn('only supported currently on macOS', doc)
+
+
+class GtkInputShapeTests(unittest.TestCase):
+    def test_zoom_hooks_stay_thin_and_before_scroll_conversion(self):
+        rel = "src/apprt/gtk/class/surface.zig"
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch("GX-0035", rel, "fork(gx): GX-0035", "active"), patches)
+        self.assertEqual(source.count("gx_font_zoom.sync("), 1)
+        self.assertEqual(source.count("gx_font_zoom.scroll("), 1)
+        self.assertEqual(source.count("gx_font_zoom.dispose("), 1)
+        self.assertLess(source.index("gx_font_zoom.dispose("), source.index("gtk.Widget.disposeTemplate("))
+        self.assertLess(source.index("gx_font_zoom.scroll("), source.index("const multiplier: f64 = if (priv.precision_scroll)"))
+        zoom = (ROOT / "src/apprt/gtk/gx/font_zoom.zig").read_text(encoding="utf-8")
+        self.assertIn(".set_font_size = points", zoom)
+        self.assertNotIn(".setFontSize(", zoom)
+        self.assertNotIn("gui_settings", zoom)
+        self.assertNotIn(".getZoom(", zoom)
+
+    def test_environment_only_replaces_the_two_flag_writers(self):
+        source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch("GX-0036", APPLICATION_ZIG, "fork(gx): GX-0036", "active"), patches)
+        lines = source.splitlines()
+        start, end = zig_fn_lines(lines, "fn setGtkEnv(")
+        body = "\n".join(lines[start:end])
+        self.assertEqual(body.count('@import("../gx/environment.zig").append('), 2)
+        self.assertIn("assert(gtk.isInitialized() == 0);", body)
+        self.assertIn("global.syncEnviron();", body)
+        self.assertNotIn('setenv("GDK_', body)
+        adapter = (ROOT / "src/apprt/gtk/gx/environment.zig").read_text(encoding="utf-8")
+        self.assertIn("gtk_version.runtimeAtLeast(4, 16, 0)", adapter)
+        self.assertNotIn('setenv("GSK_RENDERER"', adapter)
+        surface = (ROOT / "src/apprt/gtk/class/surface.zig").read_text(encoding="utf-8")
+        for variable in ("GDK_DEBUG", "GDK_DISABLE", "GSK_RENDERER"):
+            self.assertIn(f'"{variable}"', surface)
+
+
+class Gx0037ShapeTests(unittest.TestCase):
+    GENERATORS = (
+        ("src/build/webgen/main_config.zig", "try genConfig(stdout);"),
+        ("src/build/webgen/main_actions.zig",
+         "try helpgen_actions.generate(stdout, .markdown, true, std.heap.page_allocator);"),
+        ("src/build/webgen/main_commands.zig", "try genActions(stdout);"),
+    )
+
+    def test_buffered_stdout_is_flushed_after_generation(self):
+        for rel, generate in self.GENERATORS:
+            with self.subTest(rel):
+                lines = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+                bounds = zig_fn_lines(lines, "pub fn main(")
+                self.assertIsNotNone(bounds)
+                body = [line.strip() for line in lines[bounds[0]:bounds[1]]]
+                self.assertEqual(body.count(generate), 1)
+                self.assertEqual(body.count("try stdout.flush();"), 1)
+                self.assertLess(body.index(generate), body.index("try stdout.flush();"))
+
+    def test_flush_hunks_are_registered_pure_additions(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for rel, generate in self.GENERATORS:
+            with self.subTest(rel):
+                source = (ROOT / rel).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0037")
+                self.assertEqual(len(hunks), 1)
+                begin, end = hunks[0]
+                lines = source.splitlines()
+                self.assertEqual(lines[begin - 1].strip(), generate)
+                self.assertEqual(squash("\n".join(lines[begin + 1:end])), squash("try stdout.flush();"))
+                self.assertIn(Patch("GX-0037", rel, "fork(gx): GX-0037", "active"), patches)
+                self.assertEqual(marked_hunks(source.replace("\n", "\r\n"), "GX-0037")[0]
+                                 .replace("\r\n", "\n"), stripped)
+                upstream, reason = merged_upstream_text(ROOT, rel)
+                if upstream is None:
+                    self.skipTest(reason)
+                self.assertEqual(stripped, upstream)
+
+
+class Gx0038ShapeTests(unittest.TestCase):
+    def test_mapping_style_and_cache_are_thin_hooks(self):
+        source = (ROOT / "src/font/CodepointResolver.zig").read_text(encoding="utf-8")
+        self.assertIn("self.getIndexCodepointOverride(alloc, cp, style)", source)
+        self.assertIn('const DescriptorCache = @import("../gx/font_codepoint_map.zig").State;', source)
+        self.assertIn("self.descriptor_cache.resolve(alloc, &self.collection, discover, map, cp, style)", source)
+        self.assertEqual(source.count("self.descriptor_cache.getOrdinaryIndex(&self.collection,"), 2)
+        resolver_body = source.split("pub fn getIndex(", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("self.collection.getIndex(", resolver_body)
+        mapping = (ROOT / "src/gx/font_codepoint_map.zig").read_text(encoding="utf-8")
+        self.assertIn("private_indices.contains(index.int())", mapping)
+        self.assertIn("private_indices.putAssumeCapacityNoClobber(idx.int(), {})", mapping)
+        self.assertLess(mapping.index("state.private_indices.ensureUnusedCapacity(alloc, 1)"), mapping.index("const idx = try collection.add(alloc, face,"))
+        self.assertNotIn("return ctx.hash(a) == ctx.hash(b);", source)
+        self.assertNotIn(".style = .regular,", source.split("fn getIndexCodepointOverride(", 1)[1].split("\n}", 1)[0])
+        for line in ("if (self.getIndexCodepointOverride(alloc, cp, style))", "fn getIndexCodepointOverride(", "const DescriptorCache ="):
+            lines = source.splitlines()
+            pos = next(i for i, text in enumerate(lines) if line in text)
+            self.assertIn("fork(gx): GX-0038", lines[pos - 1])
+
+    def test_fontconfig_and_grid_additions_have_closed_hunks(self):
+        expected = {"src/font/discovery.zig": 1, "src/font/SharedGridSet.zig": 4}
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for path, count in expected.items():
+            with self.subTest(path=path):
+                self.assertIn(Patch("GX-0038", path, "fork(gx): GX-0038", "active"), patches)
+                source = (ROOT / path).read_text(encoding="utf-8")
+                stripped, hunks = marked_hunks(source, "GX-0038")
+                self.assertEqual(len(hunks), count)
+                self.assertNotIn("font_policy", stripped)
+                self.assertNotIn("discoverMappedFamily", stripped)
+        grid = (ROOT / "src/font/SharedGridSet.zig").read_text(encoding="utf-8")
+        self.assertIn(".descriptor_cache = .{ .policy = key.font_policy }", grid)
+        self.assertIn('Policy.fromConfig(config)', grid)
+        self.assertIn("autoHash(hasher, @as(u8, @bitCast(self.font_policy)));", grid)
 
 
 REGISTRY_TEMPLATE = """# fork 补丁登记
@@ -970,6 +1407,29 @@ class FixtureTests(unittest.TestCase):
                     f"{TABLE_BEGIN}\n| ID | 文件 | 标记 | 状态 |\n|---|---|---|---|\n{body}\n{TABLE_END}\n")
                 with self.assertRaises(ValueError):
                     parse_registry(text)
+
+
+class Gx0034ShapeTests(unittest.TestCase):
+    def test_startup_retains_layers_and_samples_after_adw_init(self):
+        source = (ROOT / APPLICATION_ZIG).read_text(encoding="utf-8")
+        self.assertIn(Patch("GX-0034", APPLICATION_ZIG, "fork(gx): GX-0034", "active"),
+                      parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8")))
+        self.assertEqual(source.count("var gx_defaults: gx_gtk.defaults.Startup = .{};"), 1)
+        self.assertEqual(source.count("defer gx_defaults.deinit();"), 1)
+        self.assertEqual(source.count("gx_defaults.load(alloc)"), 1)
+        self.assertEqual(source.count("gx_defaults.initialized(alloc, &config);"), 1)
+        self.assertLess(source.index("gx_defaults.load(alloc)"), source.index("adw.init();"))
+        self.assertLess(source.index("adw.init();"), source.index("gx_defaults.initialized(alloc, &config);"))
+        reload = source.split("// Hard reload, load a new config completely.", 1)[1]
+        self.assertLess(reload.index("gx_gtk.defaults.sampleSystemCursorBlink();"),
+                        reload.index("CoreConfig.load(alloc)"))
+        replacement = ("        // fork(gx): GX-0034 load before GTK without reading GtkSettings\n"
+                       "        var config = gx_defaults.load(alloc)")
+        self.assertEqual(source.count(replacement), 1)
+        restored = source.replace(replacement, "        var config = CoreConfig.load(alloc)")
+        stripped, hunks = marked_hunks(restored, "GX-0034")
+        self.assertEqual(len(hunks), 3)
+        self.assertNotIn("sampleSystemCursorBlink()", stripped)
 
 
 if __name__ == "__main__":

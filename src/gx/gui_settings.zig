@@ -95,6 +95,20 @@ pub const Overlay = struct {
         return null;
     }
 
+    /// Returns all values for `key` in file order, including duplicates and
+    /// empty values. Bare keys have an empty value, as with `get`. Free the
+    /// returned slice with `alloc`; its values borrow overlay lines and become invalid
+    /// when those lines are replaced or removed, or this overlay is deinitialized.
+    pub fn getAll(self: *const Overlay, alloc: Allocator, key: []const u8) Allocator.Error![]const []const u8 {
+        var values: std.ArrayList([]const u8) = .empty;
+        errdefer values.deinit(alloc);
+        for (self.lines.items) |line| {
+            const entry = parseLine(line) orelse continue;
+            if (std.mem.eql(u8, entry.key, key)) try values.append(alloc, entry.value);
+        }
+        return values.toOwnedSlice(alloc);
+    }
+
     /// Sets `key` to `value`, replacing every existing line for `key`. The
     /// new line takes the place of the first existing one, or is appended.
     pub fn set(self: *Overlay, key: []const u8, value: []const u8) (Allocator.Error || Error)!void {
@@ -410,4 +424,85 @@ test "load refuses unreadable paths instead of starting over" {
     defer alloc.free(path);
 
     try testing.expect(std.meta.isError(Overlay.load(alloc, io, path)));
+}
+
+test "getAll preserves file order, duplicates, quotes and empty resets" {
+    const testing = std.testing;
+    const source = "# profiles\n" ++
+        "gx-launch-profile = First=cmd\n" ++
+        "unknown-key = keep me\n" ++
+        "gx-launch-profile =\n" ++
+        "  gx-launch-profile = \"Second=pwsh -NoLogo\"\n" ++
+        "gx-launch-profile\n" ++
+        "gx-launch-profile = \" padded \"\n" ++
+        "gx-launch-profile-extra = ignored\n" ++
+        "gx-launch-profile = First=cmd\n";
+    var overlay = try Overlay.parse(testing.allocator, source);
+    defer overlay.deinit();
+
+    const values = try overlay.getAll(testing.allocator, "gx-launch-profile");
+    defer testing.allocator.free(values);
+    const expected = [_][]const u8{ "First=cmd", "", "Second=pwsh -NoLogo", "", " padded ", "First=cmd" };
+    try testing.expectEqual(expected.len, values.len);
+    for (expected, values) |want, actual| try testing.expectEqualStrings(want, actual);
+    try testing.expectEqualStrings(expected[expected.len - 1], overlay.get("gx-launch-profile").?);
+    try expectContent(&overlay, source);
+}
+
+test "getAll follows BOM and CRLF parsing and borrows overlay values" {
+    const testing = std.testing;
+    var overlay = try Overlay.parse(
+        testing.allocator,
+        "\xef\xbb\xbffont-family = First\r\nfont-family = \"Second\"\r\nfont-family = \"\"\r\n",
+    );
+    defer overlay.deinit();
+
+    const values = try overlay.getAll(testing.allocator, "font-family");
+    defer testing.allocator.free(values);
+    try testing.expectEqual(@as(usize, 3), values.len);
+    for (overlay.lines.items, values) |line, value| {
+        const entry = parseLine(line).?;
+        try testing.expect(entry.value.ptr == value.ptr);
+        try testing.expectEqualStrings(entry.value, value);
+    }
+    try testing.expectEqualStrings("", overlay.get("font-family").?);
+    try overlay.setAll("font-family", values);
+    try expectContent(&overlay, "font-family = First\nfont-family = Second\nfont-family =\n");
+}
+
+test "getAll missing or differently cased keys require no allocation" {
+    const testing = std.testing;
+    var overlay = try Overlay.parse(testing.allocator, "# keybind = ignored\nkeybind-extra = ignored\nKeybind = ignored\n");
+    defer overlay.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    const values = try overlay.getAll(alloc, "keybind");
+    defer alloc.free(values);
+    try testing.expectEqual(@as(usize, 0), values.len);
+    try testing.expect(!failing.has_induced_failure);
+
+    var empty = try Overlay.init(testing.allocator);
+    defer empty.deinit();
+    const missing = try empty.getAll(alloc, "gx-launch-profile");
+    defer alloc.free(missing);
+    try testing.expectEqual(@as(usize, 0), missing.len);
+    try testing.expect(!failing.has_induced_failure);
+}
+
+fn getAllAllocationScenario(alloc: Allocator) !void {
+    const source = "keybind = ctrl+a=copy_to_clipboard\n" ** 20;
+    var overlay = try Overlay.parse(std.testing.allocator, source);
+    defer overlay.deinit();
+    const values = overlay.getAll(alloc, "keybind") catch |err| {
+        try expectContent(&overlay, source);
+        return err;
+    };
+    defer alloc.free(values);
+    try std.testing.expectEqual(@as(usize, 20), values.len);
+    for (values) |value| try std.testing.expectEqualStrings("ctrl+a=copy_to_clipboard", value);
+    try expectContent(&overlay, source);
+}
+
+test "getAll allocation failures leave the overlay unchanged and release partial results" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, getAllAllocationScenario, .{});
 }

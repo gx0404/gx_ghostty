@@ -6,6 +6,8 @@
 //! a key press performs (`actionForKey`, `isBound`).
 const std = @import("std");
 const input = @import("../../../input.zig");
+const ui_color = @import("../../../gx/ui_color.zig");
+const ui_tokens = @import("../../../gx/ui_tokens.zig");
 const shortcut_conflicts = @import("../shortcut_conflicts.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
@@ -52,26 +54,16 @@ pub const Hints = struct {
     blocked: ?*const shortcut_conflicts.Conflicts = null,
 
     /// The trigger shown for `action`: the one `find` returns, or when
-    /// that one is blocked another binding of the action. Null when none
-    /// works.
+    /// that one is blocked or has no key name (such as the `paste` media
+    /// key, which would show as its tag name) another binding of the
+    /// action. Null when none works.
     pub fn lookup(self: Hints, action: Binding.Action) ?Trigger {
-        return self.pick(action, false);
-    }
-
-    /// The formatted trigger of `action`, or null: like `lookup`, but
-    /// also skipping keys without a display name (such as the `paste`
-    /// media key).
-    pub fn text(self: Hints, action: Binding.Action, buf: []u8) ?[]const u8 {
-        return format(self.pick(action, true) orelse return null, buf);
-    }
-
-    fn pick(self: Hints, action: Binding.Action, named: bool) ?Trigger {
         if (find(self.set, action)) |trigger| {
-            if (self.usable(trigger, named)) return trigger;
+            if (self.usable(trigger)) return trigger;
         }
         var it = self.set.bindings.iterator();
         while (it.next()) |entry| switch (entry.value_ptr.*) {
-            .leaf => |leaf| if (leaf.action.equal(action) and self.usable(entry.key_ptr.*, named)) {
+            .leaf => |leaf| if (leaf.action.equal(action) and self.usable(entry.key_ptr.*)) {
                 return entry.key_ptr.*;
             },
             .leader, .leaf_chained => {},
@@ -79,8 +71,13 @@ pub const Hints = struct {
         return null;
     }
 
-    fn usable(self: Hints, trigger: Trigger, named: bool) bool {
-        if (named and !displayable(trigger)) return false;
+    /// The formatted trigger of `action` (`lookup`), or null.
+    pub fn text(self: Hints, action: Binding.Action, buf: []u8) ?[]const u8 {
+        return format(self.lookup(action) orelse return null, buf);
+    }
+
+    fn usable(self: Hints, trigger: Trigger) bool {
+        if (!displayable(trigger)) return false;
         const blocked = self.blocked orelse return true;
         return blocked.reason(trigger) == null;
     }
@@ -296,16 +293,18 @@ const arrow = "\u{2192}";
 pub const ChipColors = struct {
     fill: d2d.Color,
     border: d2d.Color,
+    /// The key names, 4.5:1 on the chip fill.
     text: d2d.Color,
     /// The arrow between the steps of a sequence.
     arrow: d2d.Color,
 
     pub fn fromTokens(tokens: style.Tokens) ChipColors {
+        const fill = style.mix(tokens.surface_raised, tokens.foreground, 0.07);
         return .{
-            .fill = style.mix(tokens.surface_raised, tokens.foreground, 0.07),
+            .fill = fill,
             .border = tokens.border,
-            .text = tokens.text_secondary,
-            .arrow = tokens.text_disabled,
+            .text = ui_color.ensureContrast(tokens.text_secondary, fill, ui_tokens.floor.text),
+            .arrow = tokens.text_tertiary,
         };
     }
 };
@@ -467,6 +466,36 @@ test "Hints.text skips keys without a display name" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("Ctrl+Shift+V", hints.text(.paste_from_clipboard, &buf).?);
     try testing.expectEqual(@as(?[]const u8, null), hints.text(.{ .copy_to_clipboard = .mixed }, &buf));
+}
+
+test "Hints.lookup skips keys without a display name" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: input.Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "ctrl+insert=copy_to_clipboard");
+    try set.parseAndPut(alloc, "copy=copy_to_clipboard");
+    try set.parseAndPut(alloc, "paste=paste_from_clipboard");
+
+    const hints: Hints = .{ .set = &set };
+    var buf: [64]u8 = undefined;
+    const copy = hints.lookup(.{ .copy_to_clipboard = .mixed }).?;
+    try testing.expectEqualStrings("Ctrl+Insert", format(copy, &buf));
+    try testing.expectEqual(@as(?Trigger, null), hints.lookup(.paste_from_clipboard));
+}
+
+test "chip text contrasts with the chip" {
+    const testing = std.testing;
+    for ([_][3]u24{
+        .{ 0x2e3440, 0xd8dee9, 0x81a1c1 },
+        .{ 0x1e1e2e, 0xcdd6f4, 0x89b4fa },
+        .{ 0xfdf6e3, 0x657b83, 0x268bd2 },
+    }) |th| {
+        const t = style.Tokens.fromColors(d2d.Color.hex(th[0]), d2d.Color.hex(th[1]), d2d.Color.hex(th[2]));
+        const chips = ChipColors.fromTokens(t);
+        try testing.expect(style.contrast(chips.text, chips.fill) >= ui_tokens.floor.text);
+        try testing.expect(style.contrast(chips.arrow, t.surface_raised) >= ui_tokens.floor.text_tertiary);
+    }
 }
 
 test "Hints leave out blocked triggers" {

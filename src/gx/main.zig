@@ -31,14 +31,18 @@
 //!   (`win32_input`), the bundled ConPTY (`conpty`), OSC 7 working
 //!   directories (`osc7`) and shell quoting of dropped or pasted file
 //!   paths (`path_quote`).
+//! - The DMABUF export of the OpenGL renderer once it cannot work
+//!   (`dmabuf_export`).
 pub const action = @import("action.zig");
 pub const app_mode = @import("app_mode.zig");
+pub const bell_border = @import("bell_border.zig");
 pub const branding = @import("branding.zig");
 pub const chrome = @import("chrome.zig");
 pub const config_layers = @import("config_layers.zig");
 pub const config_types = @import("config_types.zig");
 pub const confirm = @import("confirm.zig");
 pub const conpty = @import("conpty.zig");
+pub const dmabuf_export = @import("dmabuf_export.zig");
 pub const fuzzy = @import("fuzzy.zig");
 pub const gtk_css = @import("gtk_css.zig");
 pub const gui_settings = @import("gui_settings.zig");
@@ -59,21 +63,27 @@ pub const state_file = @import("state_file.zig");
 pub const theme = @import("theme.zig");
 pub const theme_swatch = @import("theme_swatch.zig");
 pub const ui_color = @import("ui_color.zig");
+pub const ui_ref = @import("ui_ref.zig");
 pub const ui_tokens = @import("ui_tokens.zig");
 pub const unread = @import("unread.zig");
 pub const url_policy = @import("url_policy.zig");
+pub const viewport_activity = @import("viewport_activity.zig");
 pub const win32_input = @import("win32_input.zig");
 pub const window_state = @import("window_state.zig");
 
 test {
     _ = action;
     _ = app_mode;
+    _ = bell_border;
     _ = branding;
     _ = chrome;
     _ = config_layers;
     _ = config_types;
     _ = confirm;
     _ = conpty;
+    _ = dmabuf_export;
+    _ = @import("font_codepoint_map.zig");
+    _ = @import("font_map_fontconfig.zig");
     _ = fuzzy;
     _ = gtk_css;
     _ = gui_settings;
@@ -94,9 +104,15 @@ test {
     _ = theme;
     _ = theme_swatch;
     _ = ui_color;
+    _ = ui_ref;
     _ = ui_tokens;
     _ = unread;
     _ = url_policy;
+    _ = viewport_activity;
     _ = win32_input;
     _ = window_state;
+    _ = @import("cursor_blink.zig");
+    _ = @import("renderer_recovery.zig");
+    _ = @import("font_zoom.zig");
+    _ = @import("environment.zig");
 }

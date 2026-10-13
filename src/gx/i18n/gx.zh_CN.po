@@ -865,3 +865,299 @@ msgstr "打开此文件可能会运行程序。"
 
 msgid "Links of this type can run programs."
 msgstr "此类链接可能运行程序。"
+
+#. Windows apprt: feedback at the bottom of a window (App.zig)
+msgid "Configuration Errors"
+msgstr "配置错误"
+
+msgid "…and {count} more."
+msgstr "……另有 {count} 条。"
+
+msgid "Reloaded the configuration"
+msgstr "已重新加载配置"
+
+msgid "Cleared clipboard"
+msgstr "已清空剪贴板"
+
+msgid "Command Failed"
+msgstr "命令执行失败"
+
+msgid "Press any key to close the terminal."
+msgstr "按任意键关闭此终端。"
+
+msgid "Read-only"
+msgstr "只读"
+
+msgid ""
+"This terminal is in read-only mode. You can still view, select, and scroll "
+"through the content, but no input events will be sent to the running "
+"application."
+msgstr ""
+"本终端当前处于只读模式。你仍可浏览、选择、并滚动其中内容，但任何用户输入都不"
+"会传给运行中的程序。"
+
+msgid "Read-only mode is off"
+msgstr "已退出只读模式"
+
+msgid "Key table {name}"
+msgstr "按键表 {name}"
+
+msgid ""
+"Ghostty GX requires OpenGL 4.3 or newer, but no usable OpenGL driver was "
+"found.\n"
+"\n"
+"Update the graphics driver, or put a Mesa opengl32.dll in the \"mesa\" "
+"folder next to ghostty.exe."
+msgstr ""
+"Ghostty GX 需要 OpenGL 4.3 或更高版本，但未找到可用的 OpenGL 驱动。\n"
+"\n"
+"请更新显卡驱动，或在 ghostty.exe 所在目录的“mesa”文件夹中放入 Mesa 的 "
+"opengl32.dll。"
+
+msgid "Clear Search"
+msgstr "清除搜索"
+
+msgid "Graphics"
+msgstr "图形"
+
+msgid "Software rendering"
+msgstr "软件渲染"
+
+msgid "Loading font families…"
+msgstr "正在加载字体…"
+
+msgid "On this system the whole window becomes translucent."
+msgstr "在此系统上整个窗口会一起变得半透明。"
+
+msgid "The material shows in the title bar only: the terminals are drawn by software rendering."
+msgstr "材质只显示在标题栏：终端由软件渲染绘制。"
+
+msgid "The material shows in the title bar only: the graphics driver draws the terminals without transparency."
+msgstr "材质只显示在标题栏：显卡驱动绘制的终端不带透明度。"
+
+msgid "Reset All Settings"
+msgstr "重置全部设置"
+
+msgid "Press Reset All Settings again to confirm."
+msgstr "再按一次“重置全部设置”以确认。"
+
+msgid "Removes every setting made here, so the configuration file and the defaults apply again."
+msgstr "删除在这里做的全部设置，重新使用配置文件和默认值。"
+
+msgid "Every setting made here was removed."
+msgstr "已删除在这里做的全部设置。"
+
+msgid "Search settings…"
+msgstr "搜索设置…"
+
+msgid "Search Settings"
+msgstr "搜索设置"
+
+msgid "No matching settings"
+msgstr "没有匹配的设置"
+
+msgid "Reset Interface Settings"
+msgstr "重置界面设置"
+
+msgid "Press Reset Interface Settings again to confirm."
+msgstr "再按一次“重置界面设置”以确认。"
+
+msgid "An unexpected error occurred."
+msgstr "发生了未知错误。"
+
+#. Windows apprt: dialogs (src/apprt/win32/ui/Dialogs.zig)
+msgid "Closing this terminal will end the processes running in it."
+msgstr "关闭此终端会结束其中正在运行的进程。"
+
+msgid "Closing this tab will end the processes running in it."
+msgstr "关闭此标签页会结束其中正在运行的进程。"
+
+msgid "Closing these tabs will end the processes running in them."
+msgstr "关闭这些标签页会结束其中正在运行的进程。"
+
+msgid "Closing this window will end the processes running in its tabs."
+msgstr "关闭此窗口会结束各标签页中正在运行的进程。"
+
+msgid "Quitting will end the processes running in all windows."
+msgstr "退出会结束所有窗口中正在运行的进程。"
+
+msgid "The text is empty."
+msgstr "文本为空。"
+
+msgid "Lines: {lines} · Characters: {chars}"
+msgstr "行数：{lines} · 字符数：{chars}"
+
+msgid "Report an Issue"
+msgstr "反馈问题"
+
+msgid "Graphics: {renderer}, OpenGL {version}"
+msgstr "图形：{renderer}，OpenGL {version}"
+
+msgid "Graphics: {renderer}, OpenGL {version} (software rendering)"
+msgstr "图形：{renderer}，OpenGL {version}（软件渲染）"
+
+#. GTK settings dialog (src/apprt/gtk/gx/settings_dialog.zig)
+msgid "Revert"
+msgstr "还原"
+
+msgid "Retry"
+msgstr "重试"
+
+msgid "Choose a Monospace Font…"
+msgstr "选择等宽字体…"
+
+msgid "Use the Default Font"
+msgstr "使用默认字体"
+
+msgid "Open Folder"
+msgstr "打开文件夹"
+
+msgid "Custom: {value}"
+msgstr "自定义：{value}"
+
+msgid "Settings cannot be changed here because {variable} turns off the Ghostty GX settings. Edit the configuration file instead."
+msgstr "{variable} 关闭了 Ghostty GX 设置，此处无法更改设置。请改为编辑配置文件。"
+
+msgid "Set bell-audio-path in the configuration file to choose the sound."
+msgstr "在配置文件中设置 bell-audio-path 以选择声音。"
+
+#. GTK tabs: progress reports (src/apprt/gtk/gx/progress.zig)
+msgid "Progress: {percent}%"
+msgstr "进度：{percent}%"
+
+msgid "Error: {percent}%"
+msgstr "出错：{percent}%"
+
+msgid "Error"
+msgstr "出错"
+
+msgid "In progress"
+msgstr "进行中"
+
+msgid "Remote session"
+msgstr "远程会话"
+
+msgid "Superuser session"
+msgstr "超级用户会话"
+
+msgid "Container session"
+msgstr "容器会话"
+
+#. Search bar: the message when it cannot open without Direct2D
+msgid "Find"
+msgstr "查找"
+
+msgid "Find is not available: Direct2D could not be started."
+msgstr "查找不可用：无法启动 Direct2D。"
+
+#. Window menu (src/apprt/win32/ui/Menu.zig)
+msgid "Restore"
+msgstr "还原"
+
+msgid "Move"
+msgstr "移动"
+
+msgid "Size"
+msgstr "大小"
+
+#. Windows apprt: tooltips of the caption buttons
+msgid "Minimize"
+msgstr "最小化"
+
+msgid "Maximize"
+msgstr "最大化"
+
+msgid "Restore Down"
+msgstr "向下还原"
+
+#. Windows apprt: keyboard shortcut sheet (src/apprt/win32/ui/Keybinds.zig)
+msgid "Record Keys"
+msgstr "录制按键"
+
+msgid "Press the keys to look up; Esc stops recording"
+msgstr "按下要查找的按键；按 Esc 停止录制"
+
+msgid "Global hotkeys of other programs: Windows gives these keys to the program that registered them, so Ghostty GX does not receive them."
+msgstr "其他程序的全局快捷键：Windows 会把这些按键交给注册它们的程序，Ghostty GX 收不到。"
+
+msgid "Kept by the input method: Ghostty GX does not receive these keys while the input method is on."
+msgstr "被输入法占用：输入法开启时，Ghostty GX 收不到这些按键。"
+
+msgid "{keys}: global hotkey of another program"
+msgstr "{keys}：其他程序的全局快捷键"
+
+msgid "{keys}: kept by the input method"
+msgstr "{keys}：被输入法占用"
+
+#. Windows apprt: command palette pages, footer key hints and messages
+msgid "New Tab…"
+msgstr "新建标签页…"
+
+msgid "Change Theme…"
+msgstr "更换主题…"
+
+msgid "Search launch profiles…"
+msgstr "搜索启动配置…"
+
+msgid "Search tabs…"
+msgstr "搜索标签页…"
+
+msgid "Clear Recently Used"
+msgstr "清除最近使用"
+
+msgid "Forget the entries the command palette remembers."
+msgstr "清除命令面板记住的最近使用项。"
+
+msgid "Cleared the recently used entries."
+msgstr "已清除最近使用记录。"
+
+msgid "Run"
+msgstr "运行"
+
+msgid "Switch"
+msgstr "切换"
+
+msgid "Back"
+msgstr "返回"
+
+msgid "Remove"
+msgstr "移除"
+
+msgid "Apply Without Closing"
+msgstr "应用但不关闭"
+
+msgid "No results for “{query}”"
+msgstr "没有与“{query}”匹配的结果"
+
+msgid "Try the English name or the pinyin initials."
+msgstr "可尝试英文名称或拼音首字母。"
+
+msgid "Key Table: {name}"
+msgstr "按键表：{name}"
+
+msgid "{name} (Default)"
+msgstr "{name}（默认）"
+
+msgid "Pin Tab"
+msgstr "固定标签页"
+
+msgid "Edit Launch Profiles…"
+msgstr "编辑启动配置…"
+
+msgid "Zoom Out"
+msgstr "缩小"
+
+msgid "Zoom In"
+msgstr "放大"
+
+msgid "Reset Zoom"
+msgstr "重置缩放"
+
+msgid "Full Screen"
+msgstr "全屏"
+
+msgid "Chinese glyphs are missing. Install fonts-noto-cjk to display the Chinese interface."
+msgstr "缺少汉字字形。请安装 fonts-noto-cjk 以显示中文界面。Install fonts-noto-cjk for Chinese glyphs."
+
+msgid "Graphics: {backend}"
+msgstr "图形：{backend}"

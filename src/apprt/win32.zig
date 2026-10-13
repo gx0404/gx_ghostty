@@ -12,15 +12,21 @@ pub const resourcesDir = internal_os.resourcesDir;
 // Every file below win32/ that declares tests is imported here, so its tests
 // run even when no other code analyzes it (scripts/test_gx_test_roots.py).
 test {
+    _ = @import("../renderer/opengl/wgl.zig");
     _ = @import("win32/App.zig");
+    _ = @import("win32/BellAudio.zig");
+    _ = @import("win32/ComApartment.zig");
+    _ = @import("win32/bell_wav.zig");
     _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/Surface.zig");
     _ = @import("win32/Window.zig");
     _ = @import("win32/chrome/Backdrop.zig");
     _ = @import("win32/chrome/TabBar.zig");
+    _ = @import("win32/chrome/alpha.zig");
     _ = @import("win32/chrome/caption_layout.zig");
     _ = @import("win32/clipboard.zig");
     _ = @import("win32/shortcut_conflicts.zig");
+    _ = @import("win32/split_layout.zig");
     _ = @import("win32/splits.zig");
     _ = @import("win32/tab_status.zig");
     _ = @import("win32/tabs.zig");
@@ -45,4 +51,16 @@ test {
     _ = @import("win32/ui/settings/hit_test.zig");
     _ = @import("win32/ui/settings/swatch.zig");
     _ = @import("win32/ui/settings/system.zig");
+    _ = @import("win32/open_url.zig");
+    _ = @import("win32/ui/settings/model.zig");
+    _ = @import("win32/ui/Settings.zig");
+    _ = @import("win32/ui/settings/draw.zig");
+    _ = @import("win32/QuickTerminal.zig");
+    _ = @import("win32/ui/LinkPreview.zig");
+    _ = @import("win32/ui/ResizeOverlay.zig");
+    _ = @import("win32/ui/SearchBar.zig");
+    _ = @import("win32/chrome/TitleBar.zig");
+    _ = @import("win32/ui/Tooltip.zig");
+    _ = @import("win32/chrome/tab_layout.zig");
+    _ = @import("win32/ui/palette_model.zig");
 }

@@ -32,8 +32,10 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   cancel-mode ENV_DIR               SendMessage WM_CANCELMODE to the focused terminal
 
 Isolation: LOCALAPPDATA and XDG_CONFIG_HOME point at ENV_DIR, so the configuration is
-ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log; NO_COLOR, TERM,
-COLORTERM, TERM_PROGRAM*, GHOSTTY_* and GHOSTTY_GX_* of the calling shell are removed (pass
+ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log. APPDATA,
+XDG_STATE_HOME and XDG_CACHE_HOME use ENV_DIR/appdata, ENV_DIR/state and ENV_DIR/cache;
+--env cannot override these isolated paths. NO_COLOR, TERM, COLORTERM, TERM_PROGRAM*,
+GHOSTTY_* and GHOSTTY_GX_* of the calling shell are removed (pass
 GX switches such as GHOSTTY_GX_OPENGL=software with --env). Only the instance this tool
 started is ever closed: before terminating it checks that the process still has the image
 path and creation time it was started with.
@@ -240,17 +242,19 @@ def env_assignments(values: Iterable[str]) -> dict[str, str]:
 
 
 def isolated_environment(base: Mapping[str, str], env_dir: Path, extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for an isolated Ghostty: the profile in env_dir, the caller's terminal settings removed."""
+    """Keep config, state, cache and roaming data private; extra cannot override those paths."""
+    paths = {"LOCALAPPDATA": env_dir, "APPDATA": env_dir / "appdata", "XDG_CONFIG_HOME": env_dir,
+             "XDG_STATE_HOME": env_dir / "state", "XDG_CACHE_HOME": env_dir / "cache"}
+    for name in extra or {}:
+        if name.upper() in paths:
+            raise UsageError(f"不能通过 --env 覆盖隔离路径变量: {name}")
     env = {}
     for name, value in base.items():
         upper = name.upper()
-        if upper in STRIPPED_ENV or any(upper.startswith(prefix) for prefix in STRIPPED_ENV_PREFIXES):
+        if upper in paths or upper in STRIPPED_ENV or any(upper.startswith(prefix) for prefix in STRIPPED_ENV_PREFIXES):
             continue
         env[name] = value
-    for name in [name for name in env if name.upper() in ("LOCALAPPDATA", "XDG_CONFIG_HOME")]:
-        del env[name]
-    env["LOCALAPPDATA"] = str(env_dir)
-    env["XDG_CONFIG_HOME"] = str(env_dir)
+    env.update({name: str(path) for name, path in paths.items()})
     env.update(extra or {})
     return env
 
@@ -935,6 +939,10 @@ class Instance:
     def alive(self) -> bool:
         return win32().process_alive(self.pid) and self.owned()
 
+    def ensure_owned(self) -> None:
+        if not self.alive():
+            raise InputBlocked(f"Ghostty 实例 {self.pid} 已结束或进程身份已变化；未发送输入或执行界面操作")
+
     def remember_children(self) -> None:
         w = win32()
         known = {entry[0] for entry in self.children}
@@ -971,6 +979,7 @@ class Instance:
     # -- windows ------------------------------------------------------------
 
     def windows(self) -> list[WindowInfo]:
+        self.ensure_owned()
         return win32().top_windows(self.pid)
 
     def window(self, kind: str = "main", shown: bool = True) -> WindowInfo | None:
@@ -1042,6 +1051,7 @@ class Instance:
     # -- guarded input --------------------------------------------------------
 
     def ensure_foreground(self) -> None:
+        self.ensure_owned()
         w = win32()
         hwnd = w.foreground()
         pid = w.window_pid(hwnd) if hwnd else 0
@@ -1051,6 +1061,7 @@ class Instance:
                                "no input was sent")
 
     def ensure_point(self, x: int, y: int) -> None:
+        self.ensure_owned()
         w = win32()
         hwnd = w.window_at(x, y)
         if not hwnd or (w.window_pid(hwnd) != self.pid and w.root_owner_pid(hwnd) != self.pid):
@@ -1059,6 +1070,7 @@ class Instance:
                                f"pid {pid}), not ghostty pid {self.pid}; no input was sent")
 
     def activate(self, kind: str = "main") -> None:
+        self.ensure_owned()
         if not win32().activate(self.require_window(kind).hwnd):
             raise GuiError("cannot bring the ghostty window to the foreground; click it once, then retry")
 
@@ -1192,6 +1204,7 @@ class Instance:
     # -- capture --------------------------------------------------------------
 
     def capture_window(self, info: WindowInfo, method: str = "screen") -> Image:
+        self.ensure_owned()
         w = win32()
         if method == "print":
             return w.capture_print(info.hwnd)
@@ -1598,20 +1611,22 @@ class ScenarioRun:
     def do_capture(self, p):
         what, method = p.get("what", "window"), p.get("method", "screen")
         step = self.capture_steps + 1
+        path = self.capture_name(p["name"], step)
         saved = []
         if what in ("window", "all"):
             image = self.gui.capture_window(self.gui.require_window("main"), method)
-            saved.append(image.save_png(self.capture_name(p["name"], step)))
+            saved.append(image.save_png(path))
         if what == "quick":
             image = self.gui.capture_window(self.gui.require_window("quick"), method)
-            saved.append(image.save_png(self.capture_name(p["name"], step)))
+            saved.append(image.save_png(path))
         if what in ("popups", "all"):
             popups = self.gui.popups()
             if not popups and what == "popups":
                 raise GuiError("no visible popup to capture")
             for index, info in enumerate(popups, 1):
                 image = self.gui.capture_window(info, method)
-                saved.append(image.save_png(self.capture_name(f"{p['name']}-{info.cls}-{index}", step)))
+                cls = re.sub(r"[^A-Za-z0-9._-]", lambda match: f"_{ord(match[0]):x}_", info.cls) or "unknown"
+                saved.append(image.save_png(self.capture_name(f"{p['name']}-{cls}-{index}", step)))
         self.capture_steps = step
         for path in saved:
             self.captures.append(path.name)
@@ -1713,6 +1728,7 @@ class ScenarioRun:
         try:
             self.instance = launch(self.exe, env_dir, config=scenario.full_config(), env=scenario.env, args=scenario.args)
             report["pid"] = self.instance.pid
+            report["creation_filetime_100ns"] = str(self.instance.creation)
             self.startup = self.gui.wait_window(20)
             report["startup_ms"] = self.startup
             self.gui.activate()

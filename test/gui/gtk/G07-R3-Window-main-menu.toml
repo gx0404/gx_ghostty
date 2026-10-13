@@ -1,0 +1,19 @@
+id = "G07"
+title = "R3-Window: the English main menu follows the Windows order and offers view controls"
+lang = "en"
+env = { GHOSTTY_GX_PERF = "1" }
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+shift+m
+sleep 1
+"""
+expect = [
+  "G07.png: the English main window shows no missing glyphs",
+  "G07-after.png: twelve main entries follow the Windows order; zoom out, reset, zoom in, find and fullscreen form one control row; GX settings and shortcuts show accelerators",
+]

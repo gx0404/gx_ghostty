@@ -8,10 +8,19 @@
 //! UTF-8 locale of the language when it is installed, else kept if it is
 //! already a real locale, else set to the locale of another supported
 //! language. Without any such locale only the `gx.i18n` strings follow the
-//! language. Child processes get the original `LANG` and `LANGUAGE` back
-//! (see `restoreChildEnv`).
+//! language.
+//!
+//! Pango picks the fonts for Han characters, which Chinese, Japanese and
+//! Korean write differently, by the first language of `PANGO_LANGUAGE` or
+//! `LANGUAGE` that uses them. Switching `LANGUAGE` would lose the system's
+//! preference, so `PANGO_LANGUAGE` (unless set) lists the UI language
+//! followed by the language Ghostty was started with. Child processes get
+//! the original `LANG`, `LANGUAGE` and `PANGO_LANGUAGE` back (see
+//! `restoreChildEnv`). `hanGlyphAvailable` tells whether any font can show
+//! the Chinese UI at all.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const build_config = @import("../../../build_config.zig");
@@ -30,22 +39,23 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn textdomain(domainname: ?[*:0]const u8) ?[*:0]const u8;
 extern "c" fn bind_textdomain_codeset(domainname: [*:0]const u8, codeset: ?[*:0]const u8) ?[*:0]const u8;
 
-/// The `LANGUAGE` value Ghostty was started with, captured once by
-/// `startup` on the main thread before anything else reads it, so that
-/// child processes keep the system language.
-const OriginalLanguage = struct {
+/// The value an environment variable had when Ghostty started, captured
+/// once by `startup` on the main thread before anything else reads it, so
+/// that child processes keep the system language.
+const OriginalEnv = struct {
+    name: [:0]const u8,
     state: enum { unknown, unset, set } = .unknown,
     buf: [256]u8 = undefined,
     len: usize = 0,
 
-    fn capture(self: *OriginalLanguage) void {
-        const env = global.environ().getPosix("LANGUAGE") orelse {
+    fn capture(self: *OriginalEnv) void {
+        const env = global.environ().getPosix(self.name) orelse {
             self.state = .unset;
             return;
         };
         if (env.len > self.buf.len) {
-            // Too long to keep: child processes then go without LANGUAGE.
-            log.warn("LANGUAGE is {d} bytes, child processes will not inherit it", .{env.len});
+            // Too long to keep: child processes then go without it.
+            log.warn("{s} is {d} bytes, child processes will not inherit it", .{ self.name, env.len });
             self.state = .unset;
             return;
         }
@@ -54,7 +64,7 @@ const OriginalLanguage = struct {
         self.state = .set;
     }
 
-    fn get(self: *const OriginalLanguage) ?[]const u8 {
+    fn get(self: *const OriginalEnv) ?[]const u8 {
         return switch (self.state) {
             .unknown, .unset => null,
             .set => self.buf[0..self.len],
@@ -62,7 +72,12 @@ const OriginalLanguage = struct {
     }
 };
 
-var original_language: OriginalLanguage = .{};
+var original_language: OriginalEnv = .{ .name = "LANGUAGE" };
+var original_pango_language: OriginalEnv = .{ .name = "PANGO_LANGUAGE" };
+
+/// Whether `startup` set `PANGO_LANGUAGE`, which child processes then go
+/// without.
+var pango_language_set = false;
 
 /// Applies the configured language before GTK is initialized. This
 /// replaces upstream's `LANG = language`, which breaks with GX values such
@@ -79,6 +94,20 @@ pub fn startup(alloc: Allocator, config: *configpkg.Config) void {
     const palette_before = paletteFingerprint();
 
     original_language.capture();
+    original_pango_language.capture();
+    var pango_buf: [320]u8 = undefined;
+    const pango = pangoLanguages(
+        &pango_buf,
+        lang,
+        original_language.get(),
+        global.environ().getPosix("LANG"),
+    );
+    if (original_pango_language.state == .unset) {
+        if (pango) |value| {
+            _ = setenv("PANGO_LANGUAGE", value, 1);
+            pango_language_set = true;
+        }
+    }
     if (localeInstalled(lang.posixLocale())) {
         _ = setenv("LANG", lang.posixLocale(), 1);
     } else {
@@ -133,19 +162,70 @@ pub fn switchTo(lang: Language) bool {
 }
 
 /// Gives a child process environment the `LANGUAGE` value Ghostty was
-/// started with (upstream restores `LANG` the same way).
+/// started with (upstream restores `LANG` the same way), and removes the
+/// `PANGO_LANGUAGE` that `startup` set.
 pub fn restoreChildEnv(env: *std.process.Environ.Map) Allocator.Error!void {
     if (original_language.state == .unknown) return;
-    try applyOriginal(env, original_language.get());
+    try applyOriginal(env, "LANGUAGE", original_language.get());
+    if (pango_language_set) try applyOriginal(env, "PANGO_LANGUAGE", null);
 }
 
-fn applyOriginal(env: *std.process.Environ.Map, original: ?[]const u8) Allocator.Error!void {
+fn applyOriginal(env: *std.process.Environ.Map, name: []const u8, original: ?[]const u8) Allocator.Error!void {
     if (original) |value| {
-        try env.put("LANGUAGE", value);
+        try env.put(name, value);
     } else {
-        _ = env.orderedRemove("LANGUAGE");
+        _ = env.orderedRemove(name);
     }
 }
+
+/// The `PANGO_LANGUAGE` list for the UI language `lang` when Ghostty
+/// started with `LANGUAGE` (`language_env`) and `LANG` (`lang_env`): the
+/// UI language, then the first of the two that names a language. Null
+/// when there is nothing to add to `LANGUAGE = gettextLanguages(lang)`.
+pub fn pangoLanguages(
+    buf: []u8,
+    lang: Language,
+    language_env: ?[]const u8,
+    lang_env: ?[]const u8,
+) ?[:0]const u8 {
+    const preferred: []const u8 = preferred: {
+        if (language_env) |value| {
+            if (value.len > 0) break :preferred value;
+        }
+        const locale = lang_env orelse return null;
+        if (locale.len == 0 or isCLocale(locale)) return null;
+        const end = std.mem.indexOfAny(u8, locale, ".@") orelse locale.len;
+        break :preferred locale[0..end];
+    };
+    const ui = gettextLanguages(lang);
+    if (std.mem.eql(u8, preferred, ui)) return null;
+    return std.fmt.bufPrintZ(buf, "{s}:{s}", .{ ui, preferred }) catch null;
+}
+
+/// A common Han character (中) that every Chinese font has.
+const han_sample: u32 = 0x4E2D;
+
+/// Whether the fonts Pango picks for the text of `widget` in Chinese have
+/// a glyph for Han characters, so the Chinese UI does not show boxes.
+pub fn hanGlyphAvailable(widget: *gtk.Widget) bool {
+    const context: *anyopaque = @ptrCast(widget.getPangoContext());
+    const description = pango_context_get_font_description(context) orelse return true;
+    const fontset = pango_context_load_fontset(
+        context,
+        description,
+        pango_language_from_string("zh-cn"),
+    ) orelse return true;
+    defer gobject.Object.unref(@ptrCast(@alignCast(fontset)));
+    const font = pango_fontset_get_font(fontset, han_sample) orelse return false;
+    defer gobject.Object.unref(@ptrCast(@alignCast(font)));
+    return pango_font_has_char(font, han_sample) != 0;
+}
+
+extern fn pango_context_get_font_description(context: *anyopaque) ?*anyopaque;
+extern fn pango_context_load_fontset(context: *anyopaque, desc: *anyopaque, language: ?*anyopaque) ?*anyopaque;
+extern fn pango_language_from_string(language: [*:0]const u8) ?*anyopaque;
+extern fn pango_fontset_get_font(fontset: *anyopaque, wc: c_uint) ?*anyopaque;
+extern fn pango_font_has_char(font: *anyopaque, wc: u32) c_int;
 
 /// The window and tab title used before the terminal sets one.
 pub fn fallbackTitle() [:0]const u8 {
@@ -230,11 +310,34 @@ test "applyOriginal restores or strips LANGUAGE" {
     defer env.deinit();
 
     try env.put("LANGUAGE", "zh_CN");
-    try applyOriginal(&env, "de:en");
+    try applyOriginal(&env, "LANGUAGE", "de:en");
     try testing.expectEqualStrings("de:en", env.get("LANGUAGE").?);
 
-    try applyOriginal(&env, null);
+    try applyOriginal(&env, "LANGUAGE", null);
     try testing.expectEqual(@as(?[]const u8, null), env.get("LANGUAGE"));
-    try applyOriginal(&env, null);
+    try applyOriginal(&env, "LANGUAGE", null);
     try testing.expectEqual(@as(?[]const u8, null), env.get("LANGUAGE"));
+
+    try env.put("PANGO_LANGUAGE", "zh_CN:en");
+    try applyOriginal(&env, "PANGO_LANGUAGE", null);
+    try testing.expectEqual(@as(?[]const u8, null), env.get("PANGO_LANGUAGE"));
+}
+
+test "pangoLanguages puts the UI language before the language Ghostty started with" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+
+    try testing.expectEqualStrings("en:zh_CN", pangoLanguages(&buf, .en, null, "zh_CN.UTF-8").?);
+    try testing.expectEqualStrings("zh_CN:ja_JP", pangoLanguages(&buf, .zh_CN, null, "ja_JP.UTF-8@euro").?);
+    try testing.expectEqualStrings("en:zh_TW:en", pangoLanguages(&buf, .en, "zh_TW:en", "de_DE.UTF-8").?);
+    try testing.expectEqualStrings("en:de_DE", pangoLanguages(&buf, .en, "", "de_DE").?);
+
+    // Nothing to add to LANGUAGE.
+    try testing.expectEqual(@as(?[:0]const u8, null), pangoLanguages(&buf, .zh_CN, null, null));
+    try testing.expectEqual(@as(?[:0]const u8, null), pangoLanguages(&buf, .zh_CN, null, "C.UTF-8"));
+    try testing.expectEqual(@as(?[:0]const u8, null), pangoLanguages(&buf, .en, null, "POSIX"));
+    try testing.expectEqual(@as(?[:0]const u8, null), pangoLanguages(&buf, .zh_CN, "zh_CN", "en_US.UTF-8"));
+
+    var small: [4]u8 = undefined;
+    try testing.expectEqual(@as(?[:0]const u8, null), pangoLanguages(&small, .zh_CN, null, "en_US.UTF-8"));
 }

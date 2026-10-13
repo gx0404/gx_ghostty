@@ -2096,7 +2096,14 @@ keybind: Keybinds = .{},
 ///
 /// Changing this value at runtime will only affect new terminals.
 ///
-/// This setting is only supported currently on macOS.
+// fork(gx): GX-0033 begin: document the existing Windows WGL swap-control request.
+/// This setting is supported on macOS and Windows. On Windows, a WGL
+/// context with swap-control support requests interval 1 when true and 0
+/// when false. Driver settings may override or reject this request.
+/// Rebuilding a Windows GPU context preserves its original request.
+/// Disabling this setting does not remove the OpenGL `gl.finish()` at frame
+/// completion and does not guarantee a particular redraw frequency.
+// fork(gx): GX-0033 end
 @"window-vsync": bool = true,
 
 /// If true, new windows will inherit the working directory of the
@@ -4112,17 +4119,19 @@ term: []const u8 = "xterm-ghostty",
 /// Available since Ghostty GX 0.0.1.
 @"gx-open-config-ui": gx_config_types.OpenConfigUi = .settings,
 
-/// Whether turning the mouse wheel with Ctrl held, or pinching on a
+/// Whether turning the mouse wheel with Ctrl alone held, or pinching on a
 /// touchpad, changes the font size of the terminal under the pointer, one
-/// step per notch of the wheel, like the `increase_font_size` and
-/// `decrease_font_size` actions.
+/// point per notch of the wheel. Pinching scales from the font size at the
+/// start of the gesture. Neither operation changes the configured font size.
 ///
 /// When this is `false`, the wheel scrolls with Ctrl held as it does
 /// without it, and programs that use the mouse receive the Ctrl modifier.
+/// Other modifier combinations keep their normal scrolling behavior.
+/// Changing this setting at runtime also ends any active zoom gesture.
 ///
 /// The default is `true`.
 ///
-/// Windows only.
+/// Windows and GTK only.
 /// Available since Ghostty GX 0.0.3.
 @"gx-ctrl-scroll-zoom": bool = true,
 // fork(gx): GX-0010 end

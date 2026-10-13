@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0026）之后的号。在册的 20 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0038）之后的号。在册的 32 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0038，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -39,6 +39,7 @@
 | GX-0003 | `src/terminal/mouse.zig` | `fork(gx): GX-0003` | active |
 | GX-0004 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0004` | active |
 | GX-0004 | `src/renderer/opengl/Frame.zig` | `fork(gx): GX-0004` | active |
+| GX-0004 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0004` | active |
 | GX-0005 | `src/Surface.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Exec.zig` | `fork(gx): GX-0005` | active |
 | GX-0005 | `src/termio/Options.zig` | `fork(gx): GX-0005` | active |
@@ -80,6 +81,26 @@
 | GX-0023 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0023` | active |
 | GX-0024 | `src/config/Config.zig` | `fork(gx): GX-0024` | active |
 | GX-0026 | `src/build/GhosttyExe.zig` | `fork(gx): GX-0026` | active |
+| GX-0027 | `src/apprt/gtk/class/close_confirmation_dialog.zig` | `fork(gx): GX-0027` | active |
+| GX-0028 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0028` | active |
+| GX-0029 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0029` | active |
+| GX-0030 | `src/Surface.zig` | `fork(gx): GX-0030` | active |
+| GX-0030 | `src/terminal/search/Thread.zig` | `fork(gx): GX-0030` | active |
+| GX-0030 | `src/termio/Termio.zig` | `fork(gx): GX-0030` | active |
+| GX-0031 | `src/renderer/Thread.zig` | `fork(gx): GX-0031` | active |
+| GX-0031 | `src/renderer/cursor.zig` | `fork(gx): GX-0031` | active |
+| GX-0031 | `src/renderer/generic.zig` | `fork(gx): GX-0031` | active |
+| GX-0032 | `src/renderer/generic.zig` | `fork(gx): GX-0032` | active |
+| GX-0033 | `src/config/Config.zig` | `fork(gx): GX-0033` | active |
+| GX-0034 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0034` | active |
+| GX-0035 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0035` | active |
+| GX-0036 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0036` | active |
+| GX-0037 | `src/build/webgen/main_config.zig` | `fork(gx): GX-0037` | active |
+| GX-0037 | `src/build/webgen/main_actions.zig` | `fork(gx): GX-0037` | active |
+| GX-0037 | `src/build/webgen/main_commands.zig` | `fork(gx): GX-0037` | active |
+| GX-0038 | `src/font/CodepointResolver.zig` | `fork(gx): GX-0038` | active |
+| GX-0038 | `src/font/SharedGridSet.zig` | `fork(gx): GX-0038` | active |
+| GX-0038 | `src/font/discovery.zig` | `fork(gx): GX-0038` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -265,10 +286,10 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0004 OpenGL 渲染器在 Windows 上用 WGL
 
-- 文件：`src/renderer/OpenGL.zig`（导入、`Device` 与 `egl_context` 两处类型、新增 `wgl_context` 字段，`init`、`deinit`、`threadEnter`、`threadExit`、`present` 开头各一个 Windows 分支，`ExportedFrame` 在 Windows 上为 `void`）、`src/renderer/opengl/Frame.zig`（`ExportedFrame` 为 `void` 时不再推送 `.redraw`）。WGL 实现在新路径 `src/renderer/opengl/wgl.zig`。
-- 标记：`fork(gx): GX-0004`；纯新增块用 begin/end，三处改动的单行上一行写单行标记。
+- 文件：`src/renderer/OpenGL.zig`（导入、`Device` 与 `egl_context` 两处类型、`swap_chain_count` 在 Windows 上为 1、新增 `wgl_context` 字段，`init`、`deinit`、`threadEnter`、`threadExit`、`present` 开头各一个 Windows 分支，`ExportedFrame` 在 Windows 上为 `void`）、`src/renderer/opengl/Frame.zig`（`ExportedFrame` 为 `void` 时不再推送 `.redraw`）、`src/renderer/opengl/Target.zig`（导入 `builtin`；`init` 在 Windows 上建完渲染用的纹理与 framebuffer 就返回，不建导出纹理）。WGL 实现在新路径 `src/renderer/opengl/wgl.zig`。
+- 标记：`fork(gx): GX-0004`；纯新增块用 begin/end，单行改动（`Device`、`egl_context`、`swap_chain_count`、`ExportedFrame` 与 `Frame.complete` 里的 `.redraw`）在上一行写单行标记。
 - 状态：active，未回馈上游。
-- 改动量：2 个文件，`git diff --numstat` 合计 +51/−4（含注释）。
+- 改动量：3 个文件，`git diff --numstat` 合计 +69/−5（含注释）。
 
 ### 原因
 
@@ -276,10 +297,11 @@ python -m unittest scripts.test_fork_patches -v
 
 ### 行为
 
-- Windows 上 `OpenGL.Device` 即 `wgl.Device`：进程启动时用一个隐藏的探测窗口载入 `wglCreateContextAttribsARB`、`wglChoosePixelFormatARB`、`wglSwapIntervalEXT`，并确认能建 OpenGL 4.3 core context；系统驱动不满足时改用 exe 同目录 `mesa\opengl32.dll`（Mesa llvmpipe），环境变量 `GHOSTTY_GX_OPENGL=software` 直接用 Mesa。两者都不可用时弹出说明对话框，`App` 初始化以 `DeviceFailed` 失败。
-- apprt 为每个子窗口（`CS_OWNDC`）调用一次 `Device.setPixelFormat`，优先选 sRGB-capable 的双缓冲 RGBA8 格式。
-- `OpenGL.init`（主线程）只记录 surface 的 HDC，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、设 swap interval 1，并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
-- `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer（尺寸不一致时按左上角对齐，其余区域清为透明黑），再 `SwapBuffers`；没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
+- Windows 上 `OpenGL.Device` 即 `wgl.Device`：`Device.init` 起一个探测线程就返回，主线程同时做别的启动工作；探测用一个隐藏窗口载入 `wglCreateContextAttribsARB`、`wglChoosePixelFormatARB`、`wglSwapIntervalEXT`，并确认能建 OpenGL 4.3 core context；系统驱动不满足时改用 exe 同目录 `mesa\opengl32.dll`，环境变量 `GHOSTTY_GX_OPENGL=software` 直接用 Mesa。载入 Mesa 前若用户没设，临时设 `GALLIUM_DRIVER=llvmpipe`（否则有 `dxil.dll` 与 D3D12 适配器时 Mesa 先用 D3D12 驱动，虚拟机里是 WARP），CPU 多于 4 个时设 `LP_NUM_THREADS=4`（llvmpipe 每个 context 按 CPU 数起光栅线程，每个终端一个 context），探测完删掉。`Device.wait` 等探测结果，两者都不可用时返回 `error.OpenGLUnavailable`，由 apprt 告诉用户；`alphaFrames`、`setPixelFormat`、`backend` 自己也会等，`setPixelFormat` 同样返回 `error.OpenGLUnavailable`，渲染层不再显示错误对话框。探测耗时记为 `gx.perf` 的 `wgl.probe`，主线程等它的时间记为 `wgl.probe_wait`。
+- apprt 为每个子窗口（`CS_OWNDC`）调用一次 `Device.setPixelFormat`，优先选 sRGB-capable 的双缓冲 RGBA8 格式，同等条件下取没有深度与模板缓冲的格式（渲染器画在自己的 target 里，窗口缓冲只接收拷贝）；探测时记日志 `window pixel format=… srgb=… alpha=… depth=… stencil=…`。
+- `OpenGL.init`（主线程）只记录 surface 的 HDC 与 `window-vsync`，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、按 `window-vsync` 设 swap interval 1 或 0，非 Debug 构建关掉 NOTIFICATION 级的 GL 调试消息（`wgl.quietDebugOutput`，Release 本来也不记 debug 日志），并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
+- Windows 上 `swap_chain_count` 为 1：`present` 同步呈现、`Frame.complete` 随后 `gl.finish`，帧不会在 GPU 上重叠；`Target.init` 也不建导出纹理。每个终端的渲染目标从 3 帧 × 2 张降到 1 张，字形 atlas 也只传一份。GTK 仍是 3 帧。
+- `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer，再 `SwapBuffers`；窗口尺寸取 apprt 发布的 `Surface.clientSize`（渲染线程不调用 HWND API）。尺寸一致时只有这一次 blit、不清屏；窗口大于 target 时（拖动改尺寸的间隙、常显滚动条占掉的一列）帧贴左上角，最后一列、最后一行与右下角像素拉伸补满其余部分（`wgl.edgeFills`）。apprt 经 `Surface.unfocusedDim` 要求给未聚焦分屏变暗时，blit 之后用一个小着色程序把预乘色按 `rgb = dim.rgb·dst.a + dst.rgb·(1−dim.a)` 混合到整个窗口、alpha 不变（着色程序首次需要时建立，随 context 销毁、GPU 重置后重建）。没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
 - 交换成功后调用 apprt 的 `signalFrameDrawn`（win32 apprt 在拖动改尺寸时最多等 16 ms 新帧）。驱动支持 `WGL_ARB_create_context_robustness` 时上下文按「重置即丢失」创建；GPU 重置（驱动超时恢复、驱动更新）后 `wgl.Context.present` 换上新上下文、调 apprt 的 `gpuContextReset` 让渲染器重建 GPU 资源，本帧以 `error.ContextLost` 放弃。这些都在新路径 `wgl.zig` 与 win32 apprt 里，补丁行不变。
 - 非 Windows 目标的行为与产物不变。
 
@@ -289,7 +311,7 @@ python -m unittest scripts.test_fork_patches -v
 
 ### 同步冲突处理
 
-先取上游版本，再把各 Windows 分支放回对应函数开头（`init`、`deinit`、`threadEnter`、`threadExit`、`present`），恢复 `Device`、`egl_context`、`ExportedFrame` 三处类型选择与 `wgl_context` 字段、`Frame.complete` 里 `.redraw` 的守卫。上游改动这些函数的签名、`Device` 接口（`init`/`deinit`）或帧呈现协议时，同步调整 `src/renderer/opengl/wgl.zig`。
+先取上游版本，再把各 Windows 分支放回对应函数开头（`init`、`deinit`、`threadEnter`、`threadExit`、`present`），恢复 `Device`、`egl_context`、`ExportedFrame` 三处类型选择、`swap_chain_count` 的 Windows 取值与 `wgl_context` 字段、`Frame.complete` 里 `.redraw` 的守卫，以及 `Target.init` 里建完渲染 framebuffer 之后的 Windows 提前返回。上游改动这些函数的签名、`Device` 接口（`init`/`deinit`）、`Target` 的字段、swap chain 的帧数假设或帧呈现协议时，同步调整 `src/renderer/opengl/wgl.zig`。
 
 ### 移除条件
 
@@ -303,11 +325,11 @@ python scripts/zigw.py build -Dtarget=x86_64-linux-gnu -Dapp-runtime=none
 python -m unittest scripts.test_fork_patches -v
 ```
 
-运行 `zig-out/bin/ghostty.exe`：日志有 `loaded OpenGL 4.x vendor=… renderer=… software=false`，窗口正常渲染、缩放后重绘，Ctrl+Shift+T 新建的标签页同样渲染。把 Mesa 的 `opengl32.dll` 与 `libgallium_wgl.dll` 放进 `zig-out/bin/mesa/` 并以 `GHOSTTY_GX_OPENGL=software` 启动，日志应为 `software=true`、renderer 为 llvmpipe。GTK 的 EGL 路径需在 Linux 上验证。
+运行 `zig-out/bin/ghostty.exe`：日志有 `loaded OpenGL 4.x vendor=… renderer=… software=false`，窗口正常渲染、缩放后重绘（边缘没有黑边），Ctrl+Shift+T 新建的标签页同样渲染。把 Mesa 的 `opengl32.dll`、`libgallium_wgl.dll` 与 `dxil.dll` 放进 `zig-out/bin/mesa/` 并以 `GHOSTTY_GX_OPENGL=software` 启动，日志应为 `software=true`、renderer 为 llvmpipe（不是 D3D12）。GTK 的 EGL 路径需在 Linux 上验证。
 
 ### 测试锁定
 
-只有登记表与闭集检查；`wgl.zig` 带一个版本串解析的单元测试。
+只有登记表与闭集检查；`wgl.zig` 的单元测试覆盖版本串解析、`Device.wait` 等待探测线程与失败、`frameBlit` 加 `edgeFills` 不重不漏地铺满窗口、变暗颜色换算、无深度与模板格式的挑选和 llvmpipe 线程上限。
 
 ## GX-0005 Windows 下的 termio 与核心修正
 
@@ -1089,3 +1111,242 @@ PowerShell 里 `[System.Diagnostics.FileVersionInfo]::GetVersionInfo('<prefix>\b
 
 - `scripts/test_fork_patches.py` 锁定标记与登记的闭集。
 - `scripts/test_gx_icon.py` 锁定已提交的 ico 与生成器逐像素一致、尺寸齐全（16～256）、只有 256 像素是 PNG。
+
+## GX-0027 GTK 的关闭确认列出仍在运行的进程
+
+- 文件：`src/apprt/gtk/class/close_confirmation_dialog.zig`，`CloseConfirmationDialog.present` 设好标题与正文之后的一个纯新增块，调用新路径 `src/apprt/gtk/gx/confirm.zig::listProcesses`。
+- 标记：`fork(gx): GX-0027`，以 `// fork(gx): GX-0027 begin: <说明>` 开头、`// fork(gx): GX-0027 end` 结尾，包住一行调用。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，新增 3 行（含 2 行标记），不改、不删上游行。
+
+### 原因
+
+上游 GTK 的关闭确认（退出、关窗口、关标签页、关分屏）只有固定的标题与正文，例如「此标签页中的所有终端会话都将被终止」，不说哪些程序会被终止；Windows 的确认框列出正在运行的进程（`src/apprt/win32/ui/Dialogs.zig`）。GTK 对话框只知道关闭对象（`Target`）与调用方传入的父控件，正文在 `present` 里设置，所以只能在这里接入；按关闭对象收集终端与列进程都在 fork 路径。
+
+### 行为
+
+- `present` 设好标题与正文后，`listProcesses(dialog, target, parent)` 按关闭对象收集终端：退出（`.app`）取核心 App 的全部终端；关窗口（`.window`，父控件是 `Window`）取每个标签页分屏树里的终端；关标签页（`.tab`，父控件是 `Tab`）取它的分屏树；关分屏（`.surface`，父控件是 `SplitTree`）取分屏树的活动终端，即 `split-tree.close-split` 与关闭快捷键关闭的那个。父控件不是预期的类型时不列。
+- 只看需要确认的终端（`CoreSurface.needsConfirmQuit`，含 GX-0012 的空闲进程判断），对它们调 `gx.confirm.appendBusyProcesses`：前台进程及其子孙中不空闲的那些，名字按界面显示的形式（去掉路径与 `.exe`）、按出现顺序去重，与 Windows 相同。整个过程在一个 `gx.confirm.Scope` 里，只读一次进程表；列进程在主线程同步进行，显示对话框之前结束。
+- 有进程时用 `setExtraChild` 在正文下方放一段：标题「正在运行的进程：」（`gx.i18n`，与 Windows 共用译文）加 libadwaita 的 `boxed-list` 列表，每个进程一行，过长时末尾省略；超过 6 个时列前 5 个，最后一行写「……另有 N 个」（N 至少为 2）。没有进程或读不到（Linux 以外的系统、`/proc` 打不开）时，对话框与上游完全相同。
+- 标题、正文、按钮、响应与关闭流程都不变。
+
+### 上游状态
+
+未回馈上游。空闲进程的判断与界面译文来自 Ghostty GX 的共享核心；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+块是纯新增：放在 `present` 里设置正文之后、`self.as(Dialog).present(parent)` 之前。上游改动 `Target`、`present` 的签名，或调用方传入的父控件（`window.zig::windowCloseRequest`、`window.zig::tabViewClosePage`、`split_tree.zig::surfaceCloseRequest`、`application.zig::quit`）时，同步 `src/apprt/gtk/gx/confirm.zig::Processes.collect` 的取终端规则；上游自己给确认框加了 extra child 时，把进程列表并进去，不要覆盖。
+
+### 移除条件
+
+上游的关闭确认列出将被终止的进程，或 Ghostty GX 不再需要该功能时移除：删除块与标记、`src/apprt/gtk/gx/confirm.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl test --gtk --filter apprt.gtk.gx
+just wsl smoke --out <目录> --config <配置> --xdotool <脚本>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟（`shell-integration = none`、`command = /bin/bash --noprofile --norc`）：在终端里运行 `sleep 300` 后按 Ctrl+Shift+W，关闭标签页的确认框在正文下方列出 `sleep`；同时运行 8 个不同名的程序后按 Ctrl+Shift+Q，退出确认列出前 5 个与「……另有 3 个」；空闲的终端照常不确认。读图后才算通过。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0027_problems` 锁定 `close_confirmation_dialog.zig` 只有一个 GX-0027 纯新增块：块里调用 `listProcesses`，位于设置正文之后、显示对话框之前；删掉它就与 `HEAD` 和 `main` 的 merge-base 上的上游版本相同（没有 `main` 时跳过）。`src/apprt/gtk/gx/confirm.zig` 的单测锁定行数规则（不会出现「另有 1 个」，`just wsl test --gtk --filter apprt.gtk.gx`）。
+
+## GX-0028 GTK 的配置错误对话框按诊断去重
+
+- 文件：`src/apprt/gtk/class/application.zig`，五个纯新增块与一行改动：导入 `src/apprt/gtk/gx/config_errors.zig`；`Private` 的 `gx_config_errors` 字段；`showConfigErrorsDialog` 开头记下这次的诊断是否没报告过，已打开的对话框只在有新诊断时 `present`（改动的一行），没打开时报告过的诊断不再弹出；`handleReloadConfig`（配置错误对话框的「重新加载配置」按钮）在重新加载之前清空记录。
+- 标记：`fork(gx): GX-0028`；纯新增块用 begin/end 包住，改动的一行上一行写单行标记。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +18/−1（含标记）。
+
+### 原因
+
+上游 `Application.showConfigErrorsDialog` 在 App 的每次配置变化（`setConfig`）时运行：配置有诊断就弹出配置错误对话框，已打开时再 `present` 一次，把它提到前面并夺走键盘焦点；用户点「忽略」关掉之后，下一次配置变化又弹出来。Ghostty GX 改配置的次数远多于用户编辑配置：设置对话框里主题预览的每一步（`App.updateConfig`）、每次保存（写 `gui-settings.ghostty` 后经 `reload_config` 重新读取）、切换界面语言、系统明暗切换，都会触发 `config_change`。用户的配置文件里只要有一处错误，用方向键浏览主题时对话框就每一步都弹出、焦点离开主题列表，每保存一项设置又弹一次（A10）。判断与记录放在 fork 路径，钩子只在对话框的显示入口与对话框自己的重新加载按钮。
+
+### 行为
+
+- `src/apprt/gtk/gx/config_errors.zig::Reports` 记住已报告过的诊断的摘要（`gx.config_layers.diagnosticsDigest`：没有诊断为 0，内容与顺序相同则值相同），最多 8 组，满了替换最早的一组；主题预览在几组诊断之间来回（用户文件的错误，加上某个出错的主题文件）时，回到报告过的那组不再弹出。
+- `showConfigErrorsDialog`：没报告过的诊断照上游显示（新建对话框，或把已打开的对话框提到前面）并记为已报告；报告过的诊断只更新已打开对话框的内容（上游原有的 `config` 属性更新），不再 `present`、不抢焦点，对话框已被关掉时不再弹出。配置没有诊断时照上游关掉对话框，并清空记录，所以之后再出现同样的错误会再次弹出。
+- 重新加载配置（`reload_config` 绑定、主菜单「重新加载配置」、systemd 的 SIGUSR2，以及 GX 设置对话框保存后的重新读取）只在诊断变了时弹出：改了配置文件、错误变多或变少都会报告新的那组；什么都没改时不重复报告已经看过的错误。只有配置错误对话框自己的「重新加载配置」按钮先清空记录：按下后错误仍在，就照上游再弹出一次，不会让人误以为已经修好。
+- 对话框本身、文字与按钮不变；Windows 不受影响。
+
+### 上游状态
+
+未回馈上游。按内容去重对上游同样有益（上游的 soft 重载也会重弹），但摘要函数在 Ghostty GX 的共享核心里；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+五个纯新增块分别放在：GX-0016 导入块之后；`Private.config_errors_dialog` 之后；`showConfigErrorsDialog` 取得 `priv` 之后，以及「No diagnostics, do nothing.」的提前返回之后；`handleReloadConfig` 里 `priv.config_errors_dialog.set(null);` 之后、`Action.reloadConfig` 之前。改动的一行是已打开对话框分支里的 `diag.present(null)`。上游重写 `showConfigErrorsDialog`（例如改成按诊断内容比较）或对话框的重新加载流程时，保持两点：只有没报告过的诊断才新建或 `present` 对话框；对话框自己的重新加载先 `forget`。上游自己去重之后按「移除条件」处理。
+
+### 移除条件
+
+上游的配置错误对话框不再为相同的诊断重复弹出或抢焦点时移除：删除五个块、恢复改动的一行，连同标记与 `src/apprt/gtk/gx/config_errors.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just wsl sync <worktree> --dirty
+just wsl build --gtk
+just wsl test --gtk --filter apprt.gtk.gx
+just wsl smoke --out <目录> --config <有错误的配置> --xdotool <脚本>
+python -m unittest scripts.test_fork_patches -v
+```
+
+GTK 冒烟：配置里写一个未知键（如 `fontsize = 12`），启动后弹出配置错误对话框；按 Esc 忽略后打开设置对话框（Ctrl+,），到外观页在主题列表里按方向键浏览几步：配置错误对话框不再弹出，焦点留在主题列表；补丁前每一步都弹回来。读图后才算通过。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0028_problems` 锁定钩子的形状：`showConfigErrorsDialog` 先 `gx_config_errors.update` 再处理已打开的对话框，上游的 `diag.present(null)` 只剩带 `gx_new_errors` 条件、上方有标记的一处，报告过的诊断在新建对话框之前返回；整个文件只有 `handleReloadConfig` 在 `Action.reloadConfig` 之前 `forget`。`src/apprt/gtk/gx/config_errors.zig` 的单测锁定去重、清空与容量规则（`just wsl test --gtk --filter apprt.gtk.gx`）。
+
+## GX-0029 DMABUF 导出不可用后不再逐帧重试
+
+- 文件：`src/renderer/OpenGL.zig`，`OpenGL` 的 `gx_dmabuf` 字段（纯新增块）与 `present` 里导出的三处改动：条件加上 `self.gx_dmabuf.enabled(...)`，导出结果经 `self.gx_dmabuf.track(...)` 传回，每帧一条的 `log.warn` 换成一行说明。逻辑在新路径 `src/gx/dmabuf_export.zig`（只依赖 std，`gl` 以编译期参数传入，用于在警告里写出 GL 渲染器）。
+- 标记：`fork(gx): GX-0029`；字段用 begin/end 包住，三处改动的上一行写单行标记（删去的警告处留一行标记）。
+- 状态：active，未回馈上游。
+- 改动量：1 个文件，`git diff --numstat` 合计 +8/−3（含标记）。
+
+### 原因
+
+GTK 能显示 DMABUF 时（`presentation_health == .healthy`），上游 `OpenGL.present` 每帧都先把渲染目标整帧 blit 到导出纹理、建 EGLImage 再导出；失败就记一条 warning，回读到 CPU 内存，下一帧再试。EGL 显示没有 `EGL_MESA_image_dma_buf_export` 时每次都失败：Mesa 的软件渲染（llvmpipe）在 surfaceless 显示上就是这样（Xvfb、没有 GPU 的虚拟机与远程桌面，gx-ci 的 `gtk-smoke` 也是），每帧白做一次整帧 blit 与 EGLImage，日志被同一条警告刷屏（`just wsl smoke --perf` 的 300 万行负载期间 600 多条）。导出逻辑与它的状态都在上游 `present` 里，只能在这里接入（A37）。
+
+### 行为
+
+- 每个渲染器的第一帧检查 EGL 显示的扩展串：没有 `EGL_MESA_image_dma_buf_export` 时直接关掉导出，之后每帧直接回读，不再 blit、不建 EGLImage、不记警告。
+- 扩展存在时照常导出；连续失败 3 次（`max_failures`）关掉导出，成功一次就重新计数。前两次失败只记 debug 日志。关掉之后这个渲染器（终端）一直回读，直到它被销毁；新终端的渲染器重新检查。
+- 整个进程只有第一个关掉导出的渲染器记一条 warning：`failed to export DMABUF (<原因>), presenting frames from CPU memory from now on renderer=<GL_RENDERER>`，原因是缺少的扩展，或连续失败的次数与最后一次的错误；其余渲染器只记 debug。
+- `presentation_health` 不是 `healthy`（GTK 导入 DMABUF 失败后的上游回退）时与上游相同，不检查也不计数。Windows 走 GX-0004 的 WGL 分支，不受影响。
+
+### 上游状态
+
+未回馈上游。这是上游的通用问题（软件 GL 下每帧白做导出并刷屏），适合回馈；如需回馈，由人类按上游流程处理；agent 不创建 issue 或 PR。
+
+### 同步冲突处理
+
+字段块放在 `alloc` 字段之后（与 GX-0004 的字段与 Windows 分支隔开，两个补丁互不相邻）。上游改动 `present` 的导出分支时，取上游版本后保持三点：只在 `presentation_health == .healthy` 且 `self.gx_dmabuf.enabled(self.device.display)` 时尝试导出；导出结果经 `self.gx_dmabuf.track(...)`；导出失败不再每帧记警告。上游改了 `Target.exportDmabuf` 需要的 EGL 扩展时，同步 `src/gx/dmabuf_export.zig::extension`；上游自己限制了重试或警告时，按「移除条件」处理。
+
+### 移除条件
+
+上游在 DMABUF 导出不可用时不再逐帧重试与警告之后移除：删除字段块与三处改动、`src/gx/dmabuf_export.zig`，把登记行改为 `removed`。
+
+### 验证
+
+```bash
+just test --filter gx.dmabuf_export                     # Windows 本机（win32 apprt），纯逻辑单测
+just wsl sync <worktree> --dirty
+just wsl build --gtk -Doptimize=ReleaseFast
+just wsl smoke --out <目录> --perf                      # <名字>-perf.txt 的 dmabuf_warnings 为 1
+python -m unittest scripts.test_fork_patches -v
+```
+
+`smoke --perf` 的日志只有一条 `failed to export DMABUF (the EGL display does not support EGL_MESA_image_dma_buf_export) … renderer=llvmpipe …`；补丁前同一负载有 600 多条。有 GPU 与 `EGL_MESA_image_dma_buf_export` 的 Linux 桌面上应照常走 DMABUF（日志没有这条警告），需在真机确认。
+
+### 测试锁定
+
+登记表与闭集检查之外，`scripts/test_fork_patches.py::gx0029_problems` 锁定形状：字段、导出条件与导出调用各一处、上方都有标记，条件里有 `self.gx_dmabuf.enabled(`，导出经 `self.gx_dmabuf.track(`，都在 `present` 里、GX-0004 的 Windows 分支之后；上游每帧一条的警告文字不再出现。`src/gx/dmabuf_export.zig` 的单测锁定扩展检查、连续失败计数、警告里的 GL 渲染器名与只警告一次（`just test --filter gx.dmabuf_export`，Linux 上 `just wsl test --filter gx.dmabuf_export`）。
+
+## GX-0030 用户视口移动的私有来源钩子
+
+- 文件：`src/Surface.zig`、`src/termio/Termio.zig`、app-only `src/terminal/search/Thread.zig`；状态 active，未回馈上游。
+- 查找接线：`navigate_search` 的真实 Thread.select 在同 mutex 下夹住 TerminalSearch.select；只比较当前 active viewport 的实际移动，发默认关闭、由 win32 opt-in 的内部 `gx_user_scroll` callback 事件。Core.searchCallback 直接复用纯数据来源 hook，不加锁、不进 UI 或消息队列。selected/initial/feed/refresh 不发来源；纯库 search/terminal.zig 与库 ABI 不变。
+- 原因：输出裁剪与用户上滚可产生相同三元组，滚动条报告本身不能表达来源。
+- 钩子：仅在实际用户变更处、同一 renderer mutex 下取紧邻的前后快照；`@hasDecl(apprt.Surface, "gxUserScrolled")` 可选调用。Termio 经既有 `surface_mailbox.surface.rt_surface` 取得稳定运行时指针。选区自动滚动在可能临时解锁的 queueIo 之前取 after。
+- fork 真源：`src/gx/viewport_activity.zig::Pending` 只记录有来源的实际移动；win32 `Surface` 持锁记 pending 与投递 wakeup，GUI `App.tick` 取清当前快照后锁外同步并调用 `Scrollbar.userScrolled`。普通报告仅同步当前锁内状态，不揭幕；hidden/never 关闭写入门并清 pending，销毁先关门再 join，可见 reparent 保留状态。
+- 不变：C ABI、`terminal.Scrollbar`、40 字节 `termio.Message`、renderer 协议不变；GTK/none 编译期无钩子。
+- 移除条件：上游有等价的用户视口来源通知时移除私有钩子，登记改为 removed。
+- 验证：`just test --filter D11:`、`just test --filter apprt.win32 --filter gx.`、Windows `just build`/`just test`；独立 WSL clone 的 GTK build、GTK/GX 与 POSIX/GX/core/termio 单测；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff 守门。锁屏时真实 GUI 记 PENDING，解锁后在隔离配置下复验持续输出/满裁剪不揭幕、实际视口移动及右缘揭幕。
+- 最小锁定：`scripts/test_fork_patches.py::Gx0030ShapeTests` 检查核心/Termio 原有 5/2 对 mutation 钩子及搜索接线；Thread 来源限于 opts.mutex 内 select 的当前 active viewport，opt-in 默认 false，不入消息队列。钩子禁止 UI/临时解锁；不锁定其他补丁的源码。
+
+## GX-0031 无视觉变化的光标相位不额外唤醒渲染
+
+- 文件：`src/renderer/Thread.zig`、`src/renderer/cursor.zig`、`src/renderer/generic.zig`；状态 active，未回馈上游。新增块用 begin/end，timer notify 与锁外 mouse 快照替换处用单行标记。
+- 原因：每 600 ms 的相位翻转无条件通知，即使关闭闪烁、隐藏光标、滚回历史、预编辑或密码锁时两相位的样式相同，也更新快照并重画。
+- fork 真源：`src/gx/cursor_blink.zig::blinkAffects`；`cursor.blinkAffects` 只转换输入。缓存初值 true，仅在 `updateFrame` 的同一终端快照、锁内克隆的 preedit 和成功 cells 更新后收紧；分配失败保守恢复 true。锁外正则链接也使用已捕获的 mouse，不再读取 `State.mouse`。
+- timer 仅在 visible、focused、display_realized 和缓存为 true 时附加 notify；draw mutex 保护缓存和 realized 的读取。保留相位翻转、600 ms 重装、focus cancel/reset；mailbox、真实输出/配置/预编辑/可见性通知、首帧和资源释放、Kitty/custom shader 的独立计时器不变。不新增空闲停闪。
+- 移除条件：上游有同等快照一致性和 timer notify 门时删除钩子与共享模块，登记改为 removed。
+- 验证：`just zig test src/gx/cursor_blink.zig`；`just test --filter cursor: --filter gx.cursor_blink` 与真实 Thread callback/async 回归；POSIX/GTK 对应 tests/build；正常闪烁控制、hide/show/output/focus/preedit 真窗口截图。`Gx0031ShapeTests` 锁定 timer-only 和一致快照。无交互桌面时 GUI 与十次新旧交替收益记 PENDING。
+
+## GX-0032 GPU 上下文恢复后重新准备背景图
+
+- 文件：`src/renderer/generic.zig::displayRealized`；状态 active，未回馈上游。CPU 准备钩子和回归测试为纯新增 begin/end 块。
+- 原因：win32 的 `gpuContextReset` 清空 CPU/GPU 背景图，之后的 realized 链只重建 shaders/targets；同路径配置不会重新读取图片。
+- fork 真源：`src/gx/renderer_recovery.zig::prepareBackground` 仅在 `config.bg_image != null && bg_image == null` 时调用原 CPU 准备函数；draw mutex 内成功返回后才提交 realized。GPU 上传仍由渲染线程的 `uploadBackgroundImage` 完成，GUI 线程不碰 GL/WGL。普通 reparent/可见性变化不重新读盘。
+- 错误边界：文件打不开或读失败沿用原警告并无图片降级；坏图解码与解码 OOM 返回错误，realized 不半提交。CPU 解码在 GUI 线程持 draw mutex，大图片可能阻塞，未擅自扩展异步架构。
+- 移除条件：上游 realized 链有同等背景恢复时删除钩子和共享模块，登记改为 removed。
+- 验证：纯 helper 单测与真实 Renderer.displayRealized CPU 回归（pending、重复 reparent 不读盘、缺图/坏图/OOM 后重试）；Windows actual context-reset 在 NVIDIA/Mesa 上逐图确认背景＋Kitty、连续 reset/resize/tab/input。锁屏时真实 GUI 记 PENDING；CPU 单测不代证驱动 TDR。
+
+## GX-0033 Windows window-vsync 的既有行为文档
+
+- 文件：`src/config/Config.zig::window-vsync` 字段 doc comment；状态 active，未回馈上游。替换「仅 macOS」段，新增 begin/end 标记。
+- 原因：GX-0004 已把请求接到 Windows WGL，字段文档却仍写只支持 macOS。
+- 行为不变：支持 swap-control 的 context 请求 0/1；驱动可能覆盖或拒绝。reload 仅影响新终端，context reset 保留原请求；关闭 vsync 不移除 `gl.finish()`，不保证任意刷新率。
+- 移除条件：上游字段文档覆盖同等 Windows 实现时移除，登记改为 removed。
+- 验证：`just build -Demit-webdata` 的生成文档及隔离 `+show-config --default --docs`；`Gx0033ShapeTests` 锁定请求/重载/恢复/finish 边界。驱动是否接受需渲染线程实测，日志参数不能代证。
+
+## GX-0034 GTK 系统光标闪烁偏好的默认层接入
+
+- 文件：`src/apprt/gtk/class/application.zig`；状态 active，未回馈上游。
+- 原因：首次配置加载早于 `adw.init`，此时不能读取 `GtkSettings`。系统关闭闪烁必须进入最低默认层，不能用高于 CLI 的覆盖参数实现。
+- 钩子：`Application.new` 在首次加载前持有 `gx/defaults.zig::Startup`，通过它读取配置并保留原 `Layers`；`adw.init` 后读取 `gtk-cursor-blink`，默认行为变化时从原快照重建，不再读取用户、include 或 GUI 文件；硬重载前调用同一采样接口。生命周期、初始化后应用与硬重载采样是三个 begin/end 新增块；原 `CoreConfig.load` 的一行替换有单行标记。
+- fork 真源：`src/apprt/gtk/gx/defaults.zig`、`src/gx/config_layers.zig::effectiveDefaults`。用户/include、GUI、CLI 的显式 true/false/空值仍按原层序覆盖；`GHOSTTY_GX_DEFAULTS=0` 不注入。失败保留既有配置并记录警告，未触及字体发现或渲染器。
+- 移除条件：上游在 GTK 初始化后以低优先级默认层应用系统闪烁设置、且保留原始加载快照时移除；恢复原加载行并删除三个新增块，登记改为 removed。
+- 验证：`just test --filter gx.config_layers --filter gx.theme`；独立 WSL clone 的 `just wsl test --filter gx.`、`just wsl test --gtk --filter apprt.gtk.gx` 与 `just wsl build --gtk`；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots test_gtk_gx_contract`。两端隔离配置实际 load 与 GUI 优先级、主题迁移、系统属性证据保存在本机 `.local/evidence/R4/R4-Defaults/`；未读图的真实桌面验收记 PENDING。
+- 最小锁定：`scripts/test_fork_patches.py::Gx0034ShapeTests` 检查快照生命周期、首次 load 早于 adw、采样重建晚于 adw、硬重载先采样。GTK 模块单测验证重建保持用户输入、用户覆盖与 GUI 删除覆盖的回落。
+
+## GX-0035 GTK 滚轮与捏合字号缩放
+
+- 文件：`src/apprt/gtk/class/surface.zig`；active，未回馈上游。导入与 `propConfig`、`ecMouseScrollVertical`、`dispose` 各留一处薄委托；滚轮控制器参数由匿名改为命名。
+- 原因：GTK 原本无 Ctrl 滚轮／捏合字号缩放，现有 `gx-ctrl-scroll-zoom` 只在 Windows 消费。
+- 真源：共享 `src/gx/font_zoom.zig::WheelAccumulator`／`PinchState`；GTK `src/apprt/gtk/gx/font_zoom.zig::sync`／`scroll`／`dispose`。仅 Ctrl 单独按下时拦截滚轮，保留原始 wheel-unit 分数，surface-unit 以 GTK 页面步长（逻辑高度的 2/3 次方）换算；方向反转、停止、Ctrl 释放、失焦、重载与禁用清累计。捏合基于开始字号与累计 scale，半点目标去重；结束／取消／禁用清状态，关闭不 claim。只走核心 `set_font_size`，不碰分屏 zoom，不写字号配置。
+- 设置：现有 Adw 1.5 模板增加开关、提示与恢复按钮，复用共享设置模型和译文；恢复只删覆盖键。GX-0010 字段文档更新为 Windows 与 GTK；资源下限不变。
+- 移除条件：上游提供同等滚轮／捏合语义后删除钩子，将登记改为 removed。
+- 验证：`just test --filter gx.`、POSIX/GX 与 GTK/GX 单测、GTK 构建、隔离场景的上下滚／修饰键组合／禁用／分屏／重载与中文截图；native pinch 与 smooth 设备灵敏度仍须真实硬件。`test_gtk_gx_contract`、`test_gx_test_roots` 与 `test_fork_patches` 锁定接线和闭集。
+
+## GX-0036 GTK 渲染环境保留用户标记
+
+- 文件：`src/apprt/gtk/class/application.zig::setGtkEnv`；active，未回馈上游。仅将两段固定缓冲区 setenv 改为两行 `gx/environment.zig::append`，仍在 `adw.init` 前执行，最后同步全局环境。
+- 原因：上游覆盖 `GDK_DEBUG`／`GDK_DISABLE`，丢失用户和未知标记。
+- 真源：共享 `src/gx/environment.zig::appendFlags` 分配可增长的 NUL 终止值，原文保留、按 token 查缺、幂等追加；GTK `src/apprt/gtk/gx/environment.zig::append` 使用运行期 GTK `<4.16` 门追加 `vulkan-disable`，保留必需的 `GDK_DISABLE=vulkan`。不修改 `GSK_RENDERER`，不据 Mesa／Xvfb／DMABUF 失败判软件 GL。
+- 子进程：沿用 `Surface.defaultTermioEnv` 剔除 `GDK_DEBUG`、`GDK_DISABLE`、`GSK_RENDERER` 的清理表。
+- 移除条件：上游保留并幂等追加必要环境标记后移除委托，将登记改为 removed。
+- 验证：共享及 GTK 模块的长值／未知 token／幂等／OOM／4.14 与新版本行为单测，GTK 4.14 构建和真实启动的进程环境／子进程清理；`scripts/test_fork_patches.py::GtkInputShapeTests` 锁定两处薄调用、初始化顺序与版本门。
+
+## GX-0037 网站文档生成器刷新尾部输出
+
+- 文件：`src/build/webgen/main_config.zig`、`src/build/webgen/main_actions.zig`、`src/build/webgen/main_commands.zig`，各自的 `main`。
+- 标记：`fork(gx): GX-0037`，三个纯新增 begin/end 块。
+- 状态：active，未回馈上游。
+- 改动量：三个入口各增加一行 `try stdout.flush();` 与两行标记，不改生成协议、缓冲大小或原有生成逻辑。
+
+### 原因与行为
+
+三个入口用 2048 字节缓冲的 `std.Io.File.stdout().writer`，生成完成后直接返回。未满缓冲的尾部不会自动写出，构建捕获到的是截断的文档，仍然报告成功。配置末字段 `gx-ctrl-scroll-zoom` 的正文、绑定动作末尾的 `crash` 与 `gx`、CLI 末命令 `toggle-quick-terminal` 的 flags 与示例均可丢失；CLI `+show-config --default --docs` 已刷新输出，正文完整。
+
+补丁只在三个生成调用成功之后刷新各自的 stdout；刷新失败向上传递错误，避免把未完成的输出当作成功。helpgen、文档排版与 CLI 行为保持不变。
+
+### 移除条件
+
+上游三个入口已在成功返回之前刷新或结束 stdout writer，并且标准产物的末项全文完整时，删除三个块与标记，把登记行改为 `removed`，移除对应形状守卫。
+
+### 验证
+
+- `just build -Demit-webdata` 后读取 `zig-out/share/ghostty/webdata/{config,actions,commands}.mdx`：逐项对照真源末项 doc comment，确认配置末字段全文、`gx` 绑定动作全文与最后 CLI 示例闭合；不能只用构建退出码代证。
+- `python scripts/run_unittests.py test_fork_patches test_gx_test_roots`；`Gx0037ShapeTests` 锁定刷新在生成调用之后、标记闭集与三个块的纯新增性（删块后与合入的上游版本相同）。
+
+## GX-0038 映射字体按同族真实样式解析
+
+- 文件：`src/font/CodepointResolver.zig`（样式参数、算法说明、缓存别名与转发，以及两个普通查找转发）；`src/font/discovery.zig::Fontconfig.discoverMappedFamily`（纯新增 adapter 转发）；`src/font/SharedGridSet.zig`（四个纯新增块：resolver 策略、Key 字段、初始化与 hash）。状态 active，未回馈上游。
+- 原因：上游的 `font-codepoint-map` 把所有请求缓存到常规体；Fontconfig 的排序首项并不保证是真粗体或同族字面。synthetic 与禁用样式未进入 grid key 还会串用旧策略。
+- 真源：`src/gx/font_codepoint_map.zig::Policy/State/Batch`。descriptor 逐字段内容判等，请求按有效样式缓存；实际常规体锁定字体族，先找覆盖码位的真样式，再在独立拥有的 face 上合成缺失 traits，最后退同族常规体。粗斜体的 synthetic 开关独立于粗体与斜体；缺 glyph 继续同族候选，OOM 不记成不存在。
+- adapter：新路径 `src/gx/font_map_fontconfig.zig` 检查原始 pattern 的 family/weight/slant/file/index 后才 render-prepare；fork-owned `src/font/directwrite/discovery.zig` 重用真实字面选择，并保留命名实例和实际轴坐标；`src/gx/font_map_freetype.zig` 重新打开物理源，不调用会共享 FT_Face 的 syntheticBold/syntheticItalic。无发现后端保持普通回退；未支持专用 adapter 的后端保持常规映射。
+- 隔离：映射插入前先预留私有 index 集合容量，成功添加后无分配登记 index。`State.getOrdinaryIndex` 通过现有公开只读 iterator 跳过这些 index；resolver 的精确查找与最终 any-presentation 查找仅作薄转发。映射仍通过直接 index 呈现；普通配置及后来发现的 fallback entry 不登记私有、仍按原先顺序遍历。不仅仅改变 fallback 标志，不修改 Collection 或 glyph cache。
+- 实证：真实 Windows 的微软雅黑 regular＋Consolas bold、只映射 U+4E2D，同 resolver 粗体「国→中→国」及 SharedGrid「国→中→家」保持未映射来源；Linux 用现有字体临时文件的等价缺 glyph 顺序。file/fromDeferred 在非 1 ic_width、96/144 DPI 下验证原生/合成 FT_Face、mutex、实际字号与 regular 前后 metrics，以及逐次分配失败。外国粗体测试仅暴露 Inconsolata 的 regular raw pattern（现有文件另含可变命名实例），强制 JetBrains Bold 排首；目标字体合成、不借外国真粗体。
+- 不变：普通 `Collection.completeStyles`、C ABI、GPU 算法、默认映射、alpha-blending 与 FreeType 默认值；`SharedGrid` 的 codepoint/glyph 键无需扩展。
+- 同步：上游取原文后仅保留 resolver 的样式、缓存与普通查找转发、Fontconfig 转发、grid Policy 及其 hash；普通发现不可改成映射专用过滤。编号按共同树合入顺序固定为 GX-0038，已有 GX-0031～GX-0037 保持不变。
+- 移除条件：上游映射原生支持同族样式、独立合成、内容缓存判等及策略隔离后，移除这些薄钩子和 GX 模块，将三条登记行改为 removed。
+- 验证：`just test --filter gx.font_codepoint_map --filter directwrite --filter getIndex --filter Key`；独占 WSL clone 的同过滤 POSIX/GTK 测试及 GTK build；`just test -Dfont-backend=freetype --filter gx.font_codepoint_map` 验证无发现退路；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff。真实 CJK 终端四样式需 Windows 96 DPI/100% 与 GTK scale=1 原尺寸图，锁屏或仅 Xvfb 时记 PENDING，不以设置预览代证。

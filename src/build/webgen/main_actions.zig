@@ -6,4 +6,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &buffer);
     const stdout = &stdout_writer.interface;
     try helpgen_actions.generate(stdout, .markdown, true, std.heap.page_allocator);
+    // fork(gx): GX-0037 begin: Flush buffered website data before exiting.
+    try stdout.flush();
+    // fork(gx): GX-0037 end
 }

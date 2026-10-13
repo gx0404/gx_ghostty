@@ -1,0 +1,17 @@
+id = "G11"
+title = "R3-Window: shortcuts show a status page for unmatched searches"
+lang = "zh_CN"
+config = """
+command = /bin/bash --noprofile --norc
+language = zh-CN
+"""
+xdotool = """
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+shift+slash
+sleep 1
+type --delay 20 "no-such-shortcut-r3"
+sleep 0.5
+"""
+expect = ["G11-after.png: the Chinese shortcuts dialog shows a centered No results status page"]

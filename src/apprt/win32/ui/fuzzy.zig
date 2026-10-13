@@ -8,4 +8,3 @@ pub const max_text = fuzzy.max_text;
 pub const Query = fuzzy.Query;
 pub const score = fuzzy.score;
 pub const matches = fuzzy.matches;
-pub const Frecency = fuzzy.Frecency;

@@ -1,9 +1,13 @@
 //! A short confirmation centered at the bottom of a window ("Copied",
 //! "Configuration reloaded"): a rounded capsule with an optional icon
-//! that stays for 3 seconds. It fades in (`Popup.Options.motion`), lets
+//! that stays for 3 seconds by default (or until hidden for key hints).
+//! It fades in (`Popup.Options.motion`), lets
 //! the pointer through, never takes the focus, waits while a modal dialog
-//! has its window disabled, and showing it again replaces the text and
-//! starts the time over.
+//! has its window disabled, and defers while a live Quick owner is hidden
+//! or moving. Closing owners discard feedback. Showing it again replaces
+//! the text and starts its deadline; queued old timer messages cannot
+//! expire the replacement. Surface key hints are cancelled on occlusion
+//! or destruction, without clearing another terminal's key state.
 //!
 //! Usage: embed a `Toast` in an address-stable owner (the window); call
 //! `show` from the message loop or `post` from a core callback (it shows
@@ -24,10 +28,19 @@ const style = @import("style.zig");
 
 const log = std.log.scoped(.win32_toast);
 
+pub const Owner = struct {
+    surface_id: u64,
+    kind: enum { sequence, table },
+};
+
 pub const Content = struct {
     text: []const u8,
     /// An icon glyph (`d2d.icons`) before the text, in the accent color.
     icon: ?u21 = null,
+    /// Null keeps the hint until its caller hides it.
+    duration_ms: ?u32 = Toast.duration_ms,
+    /// Persistent key hints follow this terminal, never another one's end.
+    owner: ?Owner = null,
 };
 
 pub const Placement = Notice.Placement;
@@ -52,6 +65,9 @@ placement: ?Placement = null,
 text: [256]u8 = undefined,
 text_len: usize = 0,
 icon: ?u21 = null,
+timeout_ms: ?u32 = duration_ms,
+timeout_deadline: ?u64 = null,
+owner: ?Owner = null,
 pending: bool = false,
 
 /// Show `content` now (from the message loop).
@@ -69,6 +85,7 @@ pub fn post(self: *Toast, app: *App, placement: Placement, content: Content) voi
     self.placement = placement;
     self.store(content);
     self.pending = true;
+    if (!self.applyDisposition(placement.disposition(app))) return;
     if (!self.ensurePopup()) return;
     const hwnd = self.popup.hwnd orelse return;
     if (w32.PostMessageW(hwnd, WM_SHOW_POSTED, 0, 0) == 0) log.warn("cannot post a toast", .{});
@@ -76,11 +93,43 @@ pub fn post(self: *Toast, app: *App, placement: Placement, content: Content) voi
 
 pub fn hide(self: *Toast) void {
     self.pending = false;
+    self.owner = null;
+    self.deferUntilShown();
+    self.pending = false;
+}
+
+pub fn hideOwned(self: *Toast, owner: Owner) void {
+    if (self.owner) |current| if (std.meta.eql(current, owner)) self.hide();
+}
+
+pub fn hideForSurface(self: *Toast, id: u64) void {
+    if (self.owner) |current| if (current.surface_id == id) self.hide();
+}
+
+/// Keep feedback for the next settled show, without a timer or reveal
+/// that could bring its popup back during the owner's animation.
+pub fn deferUntilShown(self: *Toast) void {
+    self.pending = self.pending or self.popup.visible;
+    self.timeout_deadline = null;
     if (self.popup.hwnd) |hwnd| {
         _ = w32.KillTimer(hwnd, HIDE_TIMER_ID);
         _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
     }
     self.popup.hide();
+}
+
+pub fn onOwnerShown(self: *Toast, placement: Placement) void {
+    self.placement = placement;
+    self.showStored();
+}
+
+fn applyDisposition(self: *Toast, disposition: Notice.Disposition) bool {
+    switch (disposition) {
+        .ready => return true,
+        .deferred => self.deferUntilShown(),
+        .discard => self.hide(),
+    }
+    return false;
 }
 
 pub fn isVisible(self: *const Toast) bool {
@@ -90,6 +139,7 @@ pub fn isVisible(self: *const Toast) bool {
 /// Follow the window (moved, resized, another DPI).
 pub fn reposition(self: *Toast, placement: Placement) void {
     self.placement = placement;
+    if (self.app) |app| if (!self.applyDisposition(placement.disposition(app))) return;
     if (!self.popup.visible) return;
     const rect = self.bounds() orelse return;
     self.popup.setBounds(rect);
@@ -106,6 +156,10 @@ fn store(self: *Toast, content: Content) void {
     @memcpy(self.text[0..len], content.text[0..len]);
     self.text_len = len;
     self.icon = content.icon;
+    self.timeout_ms = content.duration_ms;
+    self.owner = content.owner;
+    self.timeout_deadline = null;
+    if (self.popup.hwnd) |hwnd| _ = w32.KillTimer(hwnd, HIDE_TIMER_ID);
 }
 
 fn tokens(self: *const Toast) style.Tokens {
@@ -146,20 +200,24 @@ fn ensurePopup(self: *Toast) bool {
 
 fn showStored(self: *Toast) void {
     if (!self.pending) return;
-    if (!self.ensurePopup()) return;
     const placement = self.placement orelse return;
+    const app = self.app orelse return;
+    if (!self.applyDisposition(placement.disposition(app))) return;
+    if (!self.ensurePopup()) return;
     const hwnd = self.popup.hwnd orelse return;
     if (w32.IsWindowEnabled(placement.owner) == 0) {
         _ = w32.SetTimer(hwnd, WAIT_TIMER_ID, wait_ms, null);
         return;
     }
     _ = w32.KillTimer(hwnd, WAIT_TIMER_ID);
-    self.pending = false;
     self.popup.applyTheme(self.tokens());
     self.popup.setAccessibleName(self.text[0..self.text_len]);
     const rect = self.bounds() orelse return;
+    self.pending = false;
     self.popup.show(rect);
-    _ = w32.SetTimer(hwnd, HIDE_TIMER_ID, duration_ms, null);
+    _ = w32.KillTimer(hwnd, HIDE_TIMER_ID);
+    self.timeout_deadline = if (self.timeout_ms) |ms| GetTickCount64() +| ms else null;
+    if (self.timeout_ms) |ms| _ = w32.SetTimer(hwnd, HIDE_TIMER_ID, ms, null);
 }
 
 fn textStyle(color: d2d.Color) d2d.TextStyle {
@@ -208,10 +266,17 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     canvas.drawText(self.text[0..self.text_len], .{ .x = x, .y = 0, .w = @max(0, size.width - x - layout.pad), .h = size.height }, textStyle(t.text));
 }
 
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+fn timeoutDue(self: *const Toast, now: u64) bool {
+    const deadline = self.timeout_deadline orelse return false;
+    return self.popup.visible and !self.pending and now >= deadline;
+}
+
 fn onTimer(ctx: *anyopaque, popup: *Popup, id: usize) void {
     const self: *Toast = @ptrCast(@alignCast(ctx));
     switch (id) {
-        HIDE_TIMER_ID => self.hide(),
+        HIDE_TIMER_ID => if (self.timeoutDue(GetTickCount64())) self.hide(),
         WAIT_TIMER_ID => self.showStored(),
         else => if (popup.hwnd) |hwnd| {
             _ = w32.KillTimer(hwnd, id);
@@ -244,6 +309,64 @@ test "toast text is stored up to a character boundary" {
     try testing.expect(toast.text_len <= toast.text.len);
     try testing.expect(std.unicode.utf8ValidateSlice(toast.text[0..toast.text_len]));
     try testing.expectEqual(@as(?u21, null), toast.icon);
+}
+
+test "toast duration defaults, replaces and keeps persistent hints" {
+    const testing = std.testing;
+    var toast: Toast = .{};
+    toast.store(.{ .text = "Copied" });
+    try testing.expectEqual(@as(?u32, 3000), toast.timeout_ms);
+    toast.store(.{ .text = "Reloaded", .duration_ms = 2000 });
+    try testing.expectEqual(@as(?u32, 2000), toast.timeout_ms);
+    toast.store(.{ .text = "Leader", .duration_ms = null });
+    toast.pending = true;
+    onTimer(&toast, &toast.popup, HIDE_TIMER_ID);
+    try testing.expectEqual(@as(?u32, null), toast.timeout_ms);
+    try testing.expect(toast.pending);
+    toast.store(.{ .text = "Copied again" });
+    try testing.expectEqual(@as(?u32, 3000), toast.timeout_ms);
+}
+
+test "toast terminal owners and replacement never cancel unrelated feedback" {
+    const testing = std.testing;
+    const a: Owner = .{ .surface_id = 1, .kind = .sequence };
+    var toast: Toast = .{ .pending = true, .owner = a };
+    toast.hideOwned(.{ .surface_id = 2, .kind = .sequence });
+    toast.hideOwned(.{ .surface_id = 1, .kind = .table });
+    try testing.expect(toast.pending);
+    toast.hideForSurface(2);
+    try testing.expect(toast.pending);
+    toast.hideForSurface(1);
+    try testing.expect(!toast.pending);
+    toast.store(.{ .text = "Copied" });
+    toast.pending = true;
+    toast.hideOwned(a);
+    try testing.expect(toast.pending);
+}
+
+test "toast deferred feedback, deadlines and late messages respect cancellation" {
+    const testing = std.testing;
+    var toast: Toast = .{};
+    toast.popup.visible = true;
+    toast.timeout_deadline = 2000;
+    try testing.expect(!toast.timeoutDue(1999));
+    try testing.expect(toast.timeoutDue(2000));
+    try testing.expect(!toast.applyDisposition(.deferred));
+    try testing.expect(toast.pending and !toast.popup.visible);
+    try testing.expect(toast.timeout_deadline == null);
+    toast.store(.{ .text = "Persistent", .duration_ms = null });
+    try testing.expect(!toast.timeoutDue(10_000));
+    toast.store(.{ .text = "New timed", .duration_ms = 2000 });
+    toast.pending = false;
+    toast.popup.visible = true;
+    toast.timeout_deadline = 5000;
+    try testing.expect(!toast.timeoutDue(2000));
+    try testing.expect(toast.timeoutDue(5000));
+    try testing.expect(!toast.applyDisposition(.discard));
+    _ = onMessage(&toast, &toast.popup, WM_SHOW_POSTED, 0, 0);
+    onTimer(&toast, &toast.popup, WAIT_TIMER_ID);
+    onTimer(&toast, &toast.popup, HIDE_TIMER_ID);
+    try testing.expect(!toast.pending and !toast.popup.visible);
 }
 
 test {

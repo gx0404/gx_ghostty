@@ -1,6 +1,9 @@
 //! The Ghostty GX settings overlay. Opened by `gx:settings`, the main
 //! menu's Settings… item and `open_config` when `gx-open-config-ui =
-//! settings` (the default); all of them call `show`.
+//! settings` (the default); all of them call `show`, and
+//! `gx:settings_page:<page>` and the command palette's "Settings: <section>"
+//! entries call `showSection`. Without Direct2D the configuration file opens
+//! instead.
 //!
 //! A modal panel centered over the terminal window: an activating
 //! `ui/Popup` drawn with Direct2D, above a dimmed backdrop
@@ -11,23 +14,51 @@
 //!
 //!   - Tab / Shift+Tab (or Ctrl+PgDn / Ctrl+PgUp) switch sections, Up/Down
 //!     move between rows and through lists, Left/Right change a choice,
-//!     a switch or the font size, Enter and Space activate, Esc closes.
+//!     a switch, the font size or the button of a group, Enter and Space
+//!     activate, Delete resets the focused setting, PgUp/PgDn scroll, Esc
+//!     clears a filter box and then closes. The focus ring shows once the
+//!     keyboard moved the focus.
 //!   - Lists (themes, font families) have an IME-capable filter box that
 //!     takes the typing while the list is focused (fuzzy matching,
-//!     `settings/fuzzy.zig`).
+//!     `gx.fuzzy`); typing elsewhere on a page with a list goes to its
+//!     filter box. Font families also match by their name in the user's
+//!     language. The font size can be typed into its field.
+//!   - Buttons, cards and chips act when the left button goes up over the
+//!     part it went down on; list items are picked on the press, and the
+//!     size buttons repeat while held. The wheel keeps the fraction of
+//!     small steps and scrolls the lines `SPI_GETWHEELSCROLLLINES` asks for;
+//!     a list at its end passes the wheel on to the page.
 //!   - Clicks in the first moments after opening are ignored, so the click
 //!     that opened the overlay cannot also press something in it.
 //!
 //! Every change is recorded in a `gx.settings_map.Changes` and written to
 //! the settings overlay `gui-settings.ghostty` (never to the user's
-//! configuration file) after a short pause, then the configuration is
-//! reloaded from disk like `reload_config`. Moving through the theme list
-//! previews themes: the configuration is loaded with an in-memory
-//! `--theme` override (and no reload notification) and applied without
-//! writing anything; Enter, Apply or a double click keeps the theme, and
-//! closing the overlay otherwise reverts the preview. Errors show in the
-//! status line. The text follows the UI language, so the overlay redraws
-//! in the new language as soon as a `language` change is applied.
+//! configuration file) after a short pause; a failed save keeps the
+//! changes, shows the reason and tries again with a growing delay
+//! (`settings/model.zig`). The configuration is then rebuilt from a
+//! `gx.config_layers.Layers` snapshot read when the overlay opens (no file
+//! is read again; the snapshot follows the changes made here) and the rows
+//! show the values it ends up with. "Reset to Default" (the ↺ button next to
+//! a setting that the settings file sets, or Delete) removes the key from
+//! the file, so the configuration file or the default applies again (D13);
+//! a value that comes from the configuration file or the command line says
+//! so under the setting (`Layers.provenance`).
+//!
+//! Moving through the theme list previews themes once the cursor rests a
+//! moment (a debounce: longer while typing in the filter): the
+//! configuration is built from the snapshot with an in-memory `--theme`
+//! override (and no reload notification) and applied without writing
+//! anything; Enter, Apply or a double click keeps the theme, and closing the
+//! overlay otherwise reverts the preview. Errors show in the status line.
+//! The text follows the UI language, so the overlay redraws in the new
+//! language as soon as a `language` change is applied.
+//!
+//! The theme list and its swatches and the font families stay between
+//! openings. The font families are listed on a thread of their own
+//! (`system.FontLoader`, `WM_FONTS_READY` when done) on the first visit to
+//! Font and again after `WM_FONTCHANGE`; the last list shows meanwhile.
+//! F6 focuses the sidebar search; labels, section names and configuration
+//! keys match across all six sections, and Enter reveals a result.
 //!
 //! There is one overlay per process, shown over one window at a time.
 //! `Window` calls `onWindowDestroyed` when a window goes away.
@@ -47,20 +78,23 @@ const App = @import("../App.zig");
 const Window = @import("../Window.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
+const TooltipOf = @import("Tooltip.zig").Tooltip;
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
 const wstr = @import("wstr.zig");
 const Scrim = @import("settings/Scrim.zig");
 const draw = @import("settings/draw.zig");
-const fuzzy = @import("settings/fuzzy.zig");
 const hit_test = @import("settings/hit_test.zig");
-const swatch = @import("settings/swatch.zig");
+const model = @import("settings/model.zig");
 const system = @import("settings/system.zig");
 
 const Config = configpkg.Config;
+const Layers = gx.config_layers.Layers;
 const i18n = gx.i18n;
 const settings_map = gx.settings_map;
 const msg = settings_map.msg;
+const fuzzy = gx.fuzzy;
+const theme_swatch = gx.theme_swatch;
 const WindowMaterial = gx.config_types.WindowMaterial;
 
 const log = std.log.scoped(.win32_settings);
@@ -70,21 +104,33 @@ const sidebar_width: f32 = 200;
 const header_height: f32 = 64;
 const footer_height: f32 = 44;
 const content_pad: f32 = 24;
+const top_pad: f32 = 8;
+const bottom_pad: f32 = 16;
 const row_gap: f32 = 6;
 const card_height: f32 = 44;
 const card_height_detail: f32 = 58;
+const choice_height: f32 = 48;
+/// The line the chips of a choice take below its title when they do not fit
+/// next to it.
+const chip_line: f32 = draw.chip_height + 8;
 const item_height: f32 = 30;
+const list_pad: f32 = 4;
 const field_height: f32 = style.metrics.input_height;
-const min_list_height: f32 = 150;
+const field_gap: f32 = 8;
+const min_list_items = 4;
+/// How much of the rows below a list stays in view when the list is
+/// sized, so the page shows that it goes on.
+const list_peek: f32 = 112;
+const sample_height: f32 = 64;
 const min_width: f32 = 640;
 const max_width: f32 = 920;
 const min_height: f32 = 460;
 const max_height: f32 = 680;
+/// The page scrolls this much per wheel line.
+const body_line: f32 = 32;
 
 /// How long changes are collected before they are saved.
 const save_delay_ms = 300;
-/// The least time between two theme previews while moving through the list.
-const preview_interval_ms = 120;
 /// Clicks this soon after opening are ignored.
 const click_guard_ms = 400;
 /// How often a running herdr is checked, and when it is given up.
@@ -94,7 +140,11 @@ const herdr_timeout_ms = 30_000;
 const scrim_alpha: u8 = 90;
 
 const max_rows = 64;
-const max_hits = 160;
+const max_hits = 192;
+
+/// Posted to the overlay by `system.FontLoader` when the font families are
+/// listed.
+pub const WM_FONTS_READY: u32 = w32.WM_APP + 2;
 
 /// The overlay, created by the first `show`.
 var instance: ?*Settings = null;
@@ -105,6 +155,7 @@ window: *Window,
 
 popup: Popup = .{},
 scrim: Scrim = .{},
+tooltip: Tooltip = .{},
 
 /// Owns the data loaded when the overlay opens (paths, shells, theme
 /// directories); reset when it closes.
@@ -118,22 +169,44 @@ opened_ms: u64 = 0,
 section: Section = .language,
 /// The focused row of the section (an index into `buildRows`).
 focus: usize = 0,
+/// The focused button of a focused group row.
+focus_button: usize = 0,
+/// The keyboard moved the focus last: the focus ring shows.
+focus_visible: bool = false,
 /// Scroll the focused row into view at the next paint.
 reveal_focus: bool = false,
 body_scroll: f32 = 0,
+/// The height of the page at the last paint.
+body_view: f32 = 0,
 hover: ?Target = null,
+/// What the left button went down on, until it goes up.
+pressed: ?Target = null,
+/// The pointer (DIPs) while it is over the overlay.
+pointer: ?d2d.Point = null,
+wheel_lines: model.Wheel = .{},
 
-/// The values shown, starting from the configuration when the overlay
-/// opens and following every change made here.
+/// The values shown: the configuration the app runs with, read again
+/// after every change is applied, and the changes made here meanwhile.
 values: Values = undefined,
 font_family: []const u8 = "",
 notifications: Config.AppNotifications = .{},
+/// The configuration layers, read when the overlay opens and following
+/// the changes made here; null when the layering is off
+/// (`GHOSTTY_GX_DEFAULTS=0`) or they could not be read.
+layers: ?Layers = null,
+/// `inputsDigest` of the configuration the app ran with when the overlay
+/// last opened or applied one (`followReload`).
+applied_inputs: u64 = 0,
+applying: bool = false,
 /// Whether the configuration is loaded with the Ghostty GX layers; theme
-/// previews need them (`GHOSTTY_GX_DEFAULTS=0` turns them off).
+/// previews need them.
 layered: bool = true,
 build: u32 = 0,
 
+/// The theme names and their swatches, kept between openings while the
+/// theme directories list the same names.
 themes: ?settings_map.ThemeList = null,
+swatches: theme_swatch.Cache = .{},
 theme_dirs: []const []const u8 = &.{},
 theme_list: List = .{},
 theme_query: std.ArrayList(u8) = .empty,
@@ -142,12 +215,22 @@ saved_theme: ?u32 = null,
 /// The theme to preview and the one currently applied as a preview.
 preview_theme: ?u32 = null,
 applied_preview: ?u32 = null,
-last_preview_ms: u64 = 0,
-swatches: swatch.Cache = .{},
+/// A paint left swatches unread.
+swatches_pending: bool = false,
 
+/// The installed font families, kept between openings.
 fonts: ?system.FontFamilies = null,
+/// Lists the font families in the background.
+font_loader: ?*system.FontLoader = null,
+/// The cached font list is current, until WM_FONTCHANGE.
+fonts_checked: bool = false,
+/// What the font list shows: `fonts` and the configured family.
+font_picker: system.Picker = .{ .names = &.{}, .local_names = &.{} },
+/// Owns what `font_picker` adds.
+font_arena: ArenaAllocator,
 font_list: List = .{},
 font_query: std.ArrayList(u8) = .empty,
+search_query: std.ArrayList(u8) = .empty,
 
 shells: []const Shell = &.{},
 shell_selected: usize = 0,
@@ -157,11 +240,14 @@ herdr_run: ?system.HerdrRun = null,
 config_path: []const u8 = "",
 overlay_path: []const u8 = "",
 
-/// The list whose filter box receives the typing, if any.
 text_field: ?Field = null,
 
 changes: settings_map.Changes,
+/// Failed saves in a row (`model.saveRetryDelayMs`).
+save_attempts: u32 = 0,
 timers: std.EnumSet(Timer) = .initEmpty(),
+reset_all: model.Confirm = .{},
+measurements: draw.Measurements = .{},
 
 status_kind: StatusKind = .none,
 status_buf: [512]u8 = undefined,
@@ -176,12 +262,23 @@ hit_clip: ?d2d.Rect = null,
 /// Where the last paint put the list of the section, for the wheel.
 list_area: ?d2d.Rect = null,
 
+const Tooltip = TooltipOf(Tip);
+
+/// What a tooltip describes: the buttons that only show an icon.
+const Tip = union(enum) {
+    none,
+    close,
+    reset: u16,
+};
+
 // -----------------------------------------------------------------------
 // Opening and closing
 // -----------------------------------------------------------------------
 
-/// Show the settings for `window`. Returns false if nothing was shown.
+/// Show the settings for `window`; without Direct2D or GX configuration
+/// layering, open the configuration file instead.
 pub fn show(window: *Window) bool {
+    if (!gx.config_layers.enabled(window.app.core_app.alloc) or window.app.uiFactory() == null) return openConfigInstead(window.app);
     if (instance) |self| {
         if (self.window == window) {
             if (self.open) {
@@ -204,18 +301,20 @@ pub fn show(window: *Window) bool {
         .window = window,
         .arena = .init(alloc),
         .scratch = .init(alloc),
+        .font_arena = .init(alloc),
         .changes = .init(alloc),
     };
     instance = self;
     return self.openOverlay();
 }
 
-/// Like `show`, then switch to `section` (the command palette's
-/// "Settings: <section>" entries).
+/// Like `show`, then switch to `section`: the command palette's
+/// "Settings: <section>" entries and `gx:settings_page:<page>`.
 pub fn showSection(window: *Window, section: Section) bool {
     if (!show(window)) return false;
-    const self = instance orelse return false;
-    if (self.section != section) self.enterSection(section);
+    const self = instance orelse return true;
+    if (!self.open) return true;
+    if (self.section != section or self.searching() or self.text_field == .search) self.enterSection(section);
     return true;
 }
 
@@ -227,12 +326,35 @@ pub fn onWindowDestroyed(window: *Window) void {
     self.destroy();
 }
 
+pub fn onConfigChange(app: *App) void {
+    const self = instance orelse return;
+    if (self.app != app or !self.open or self.applying) return;
+    self.stopTimer(.preview);
+    self.preview_theme = null;
+    self.applied_preview = null;
+    self.followReload();
+    self.applied_inputs = inputsDigest(&app.config);
+    self.swatches.deinit(self.alloc);
+    self.loadThemes(&app.config);
+    self.loadShells();
+    self.configApplied(false);
+    self.popup.setAccessibleName(i18n.tr(msg.settings));
+}
+
+fn openConfigInstead(app: *App) bool {
+    log.info("opening the configuration file instead of the unavailable settings overlay", .{});
+    return app.openConfigFile(.os_open) catch |err| {
+        log.warn("cannot open the configuration file err={}", .{err});
+        return false;
+    };
+}
+
 fn destroy(self: *Settings) void {
     self.finish(.owner);
-    self.stopTimer(.save);
-    self.stopTimer(.herdr);
+    inline for (comptime std.enums.values(Timer)) |timer| self.stopTimer(timer);
     if (self.herdr_run) |*run| run.deinit();
     self.herdr_run = null;
+    self.tooltip.destroy();
     if (self.popup.hwnd) |hwnd| {
         // Windows destroys owned windows with their owner.
         if (!Scrim.isOwnWindow(hwnd, &self.popup)) self.popup.hwnd = null;
@@ -240,11 +362,20 @@ fn destroy(self: *Settings) void {
     self.popup.destroy();
     self.scrim.destroy();
     self.releaseData();
+    if (self.font_loader) |loader| loader.detach();
+    self.font_loader = null;
+    if (self.fonts) |*fonts| fonts.deinit();
+    self.fonts = null;
+    if (self.themes) |*themes| themes.deinit();
+    self.themes = null;
+    self.swatches.deinit(self.alloc);
     self.theme_query.deinit(self.alloc);
     self.font_query.deinit(self.alloc);
+    self.search_query.deinit(self.alloc);
     self.theme_list.deinit(self.alloc);
     self.font_list.deinit(self.alloc);
     self.changes.deinit();
+    self.font_arena.deinit();
     self.arena.deinit();
     self.scratch.deinit();
     if (instance == self) instance = null;
@@ -254,8 +385,11 @@ fn destroy(self: *Settings) void {
 fn openOverlay(self: *Settings) bool {
     const owner = self.window.hwnd orelse return false;
     if (self.window.closing) return false;
-    const factory = self.app.uiFactory() orelse return false;
+    const factory = self.app.uiFactory() orelse return openConfigInstead(self.app);
     const t = self.tokens();
+    // Until the first frame is painted (`Popup.show` paints at once).
+    const span: gx.perf.Span = .begin(global.io());
+    defer _ = span.end(global.io(), "settings_open");
 
     if (self.popup.hwnd == null) {
         self.popup.create(self.app.hinstance, owner, factory, .{
@@ -267,6 +401,8 @@ fn openOverlay(self: *Settings) bool {
             .text_input = true,
             .border_color = t.border,
             .dark = t.dark,
+            .release_target_on_hide = true,
+            .accessible_name = i18n.tr(msg.settings),
         }, .{
             .ctx = self,
             .paint = paint,
@@ -275,15 +411,23 @@ fn openOverlay(self: *Settings) bool {
             .text_changed = onTextChanged,
             .dismissed = onDismissed,
             .dpi_changed = onDpiChanged,
+            .timer = onPopupTimer,
+            .repeat = onRepeat,
+            .message = onMessage,
         }) catch |err| {
             log.err("cannot create the settings popup err={}", .{err});
-            return false;
+            return openConfigInstead(self.app);
         };
     } else {
-        self.popup.setBorderColor(t.border);
+        self.popup.applyTheme(t);
+        self.popup.setAccessibleName(i18n.tr(msg.settings));
     }
     if (self.scrim.hwnd == null) {
-        self.scrim.create(self.app.hinstance, owner, scrim_alpha, self, onScrimClick) catch |err| {
+        self.scrim.create(self.app.hinstance, owner, scrim_alpha, .{
+            .ctx = self,
+            .click = onScrimClick,
+            .font_change = onFontChange,
+        }) catch |err| {
             log.warn("cannot create the settings backdrop err={}", .{err});
         };
     }
@@ -291,9 +435,15 @@ fn openOverlay(self: *Settings) bool {
     self.loadData();
     self.clearStatus();
     self.hover = null;
+    self.pressed = null;
+    self.focus_visible = false;
+    self.reset_all.cancel();
+    self.wheel_lines.reset();
     self.enterSection(self.section);
 
-    self.scrim.show(Scrim.visibleBounds(owner));
+    self.popup.setOwnerScale(self.window.scale);
+    const maximized = w32.IsZoomed(owner) != 0 or self.window.title_bar.is_fullscreen;
+    self.scrim.show(Scrim.visibleBounds(owner), !maximized);
     self.popup.show(self.popupRect(owner));
     self.opened_ms = system.nowMs();
     self.open = true;
@@ -316,15 +466,16 @@ fn finish(self: *Settings, how: Close) void {
     if (!self.open) return;
     self.open = false;
     self.stopTimer(.preview);
+    self.stopTimer(.prefetch);
+    self.endSizeEdit(true);
     const previewed = self.applied_preview != null;
     self.preview_theme = null;
     self.applied_preview = null;
-    if (!self.changes.isEmpty()) {
-        // Saving reloads the saved configuration, which ends the preview.
-        self.saveNow();
-    } else if (previewed) {
-        _ = self.reloadFromDisk();
-    }
+    // Saving applies the saved configuration, which ends the preview.
+    const applied = !self.changes.isEmpty() and self.saveNow();
+    if (previewed and !applied) _ = self.applyConfig(null);
+    if (self.popup.hwnd) |hwnd| self.tooltip.setTarget(hwnd, .none);
+    self.tooltip.hide();
     self.scrim.hide();
     self.popup.hide();
     self.text_field = null;
@@ -334,10 +485,8 @@ fn finish(self: *Settings, how: Close) void {
 }
 
 fn popupRect(self: *Settings, owner: w32.HWND) w32.RECT {
-    _ = self;
     const bounds = Scrim.visibleBounds(owner);
-    const dpi = w32.GetDpiForWindow(owner);
-    const scale: f32 = @as(f32, @floatFromInt(if (dpi == 0) 96 else dpi)) / 96.0;
+    const scale = self.window.scale;
     const bounds_w = bounds.right - bounds.left;
     const bounds_h = bounds.bottom - bounds.top;
     const w_dip = std.math.clamp(style.dip(bounds_w, scale) - 80, min_width, max_width);
@@ -375,22 +524,48 @@ fn invalidate(self: *Settings) void {
 const Values = struct {
     language: i18n.Language,
     material: WindowMaterial,
+    /// Null for a value no choice offers.
+    opacity: ?settings_map.Opacity,
+    padding: ?settings_map.Padding,
+    cursor_style: settings_map.CursorStyle,
+    cursor_blink: bool,
     font_size: f32,
     right_click: Config.RightClickAction,
     scrollbar: bool,
     close_confirmation: Config.ConfirmCloseSurface,
+    focus_follows_mouse: bool,
+    ctrl_scroll_zoom: bool,
     bell: Config.BellFeatures,
 
-    fn fromConfig(config: *const Config) Values {
+    fn fromConfig(config: *const Config, layers: ?*const Layers) Values {
+        const padding_keys = settings_map.Padding.keys;
         return .{
             .language = i18n.resolve(config.language),
             .material = config.@"gx-window-material",
+            .opacity = settings_map.Opacity.fromConfig(config.@"background-opacity", configured(layers, "background-opacity")),
+            .padding = settings_map.Padding.fromConfig(
+                config.@"window-padding-x",
+                config.@"window-padding-y",
+                configured(layers, padding_keys[0]) or configured(layers, padding_keys[1]),
+            ),
+            .cursor_style = config.@"cursor-style",
+            .cursor_blink = config.@"cursor-style-blink" orelse true,
             .font_size = settings_map.FontSize.normalize(config.@"font-size"),
             .right_click = config.@"right-click-action",
             .scrollbar = config.scrollbar == .system,
             .close_confirmation = config.@"confirm-close-surface",
+            .focus_follows_mouse = config.@"focus-follows-mouse",
+            .ctrl_scroll_zoom = config.@"gx-ctrl-scroll-zoom",
             .bell = config.@"bell-features",
         };
+    }
+
+    /// Whether a layer above the defaults sets `key`; without the layers,
+    /// the configuration sets everything it has.
+    fn configured(layers: ?*const Layers, key: []const u8) bool {
+        const l = layers orelse return true;
+        const layer = l.provenance(key) orelse return false;
+        return layer != .defaults;
     }
 };
 
@@ -409,17 +584,31 @@ const Shell = struct {
     const Kind = enum { system_default, profile, custom_profile, custom_command };
 };
 
+fn layersPtr(self: *Settings) ?*Layers {
+    return if (self.layers) |*layers| layers else null;
+}
+
 fn loadData(self: *Settings) void {
     self.releaseData();
     const config = &self.app.config;
     const arena = self.arena.allocator();
 
-    self.values = .fromConfig(config);
-    self.notifications = config.@"app-notifications";
     self.layered = gx.config_layers.enabled(self.alloc);
+    if (self.layered) {
+        self.layers = App.loadLayers(self.alloc) catch |err| layers: {
+            log.warn("cannot read the configuration layers, previews read the files err={}", .{err});
+            break :layers null;
+        };
+        // Changes a failed save keeps (it is tried again).
+        if (self.layersPtr()) |layers| self.changes.applyToLayers(layers) catch |err| {
+            log.warn("cannot keep the unsaved settings err={}", .{err});
+        };
+    }
+    self.applied_inputs = inputsDigest(config);
+    self.values = .fromConfig(config, self.layersPtr());
+    self.notifications = config.@"app-notifications";
     self.build = system.windowsBuild();
-    const families = config.@"font-family".list.items;
-    self.font_family = if (families.len > 0) arena.dupe(u8, families[0]) catch "" else "";
+    self.font_family = self.configuredFamily(arena);
 
     self.config_path = file_load.preferredDefaultFilePath(arena) catch |err| path: {
         log.warn("cannot locate the configuration file err={}", .{err});
@@ -432,25 +621,33 @@ fn loadData(self: *Settings) void {
 
     self.loadThemes(config);
     self.loadShells();
+    self.updateFontPicker();
 }
 
+/// The first configured font family, in `alloc`.
+fn configuredFamily(self: *Settings, alloc: Allocator) []const u8 {
+    const families = self.app.config.@"font-family".list.items;
+    if (families.len == 0) return "";
+    return alloc.dupe(u8, families[0]) catch "";
+}
+
+/// Frees what was loaded for one opening; the theme and font lists stay.
 fn releaseData(self: *Settings) void {
-    if (self.themes) |*list| list.deinit();
-    self.themes = null;
-    if (self.fonts) |*list| list.deinit();
-    self.fonts = null;
-    self.swatches.deinit(self.alloc);
+    if (self.layers) |*layers| layers.deinit();
+    self.layers = null;
     self.theme_list.clear();
     self.font_list.clear();
     self.theme_query.clearRetainingCapacity();
     self.font_query.clearRetainingCapacity();
-    self.saved_theme = null;
+    self.search_query.clearRetainingCapacity();
     self.shells = &.{};
     self.theme_dirs = &.{};
     self.herdr_exe = null;
     self.font_family = "";
     self.config_path = "";
     self.overlay_path = "";
+    self.font_picker = .{ .names = &.{}, .local_names = &.{} };
+    _ = self.font_arena.reset(.retain_capacity);
     _ = self.arena.reset(.retain_capacity);
     _ = self.scratch.reset(.retain_capacity);
 }
@@ -463,17 +660,38 @@ fn loadThemes(self: *Settings, config: *const Config) void {
         dirs.append(arena, location.dir) catch break;
     }
     self.theme_dirs = dirs.items;
-    self.themes = settings_map.listThemes(self.alloc, global.io(), dirs.items) catch |err| list: {
+
+    var listed = settings_map.listThemes(self.alloc, global.io(), dirs.items) catch |err| list: {
         log.warn("cannot list the themes err={}", .{err});
         break :list null;
     };
-    if (settings_map.themeName(config.theme)) |name| {
-        if (self.themes) |*list| {
-            if (list.indexOf(name)) |index| self.saved_theme = @intCast(index);
+    if (listed) |*new| {
+        const same = if (self.themes) |*old| sameNames(old.names, new.names) else false;
+        if (same) {
+            new.deinit();
+        } else {
+            if (self.themes) |*old| old.deinit();
+            self.themes = new.*;
+            // Swatches are kept by index.
+            self.swatches.deinit(self.alloc);
         }
     }
+    self.saved_theme = self.configuredTheme(config);
     self.refilter(.themes);
     if (self.saved_theme) |saved| self.theme_list.select(saved);
+}
+
+fn sameNames(a: []const [:0]const u8, b: []const [:0]const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+fn configuredTheme(self: *Settings, config: *const Config) ?u32 {
+    const name = settings_map.themeName(config.theme) orelse return null;
+    const list = if (self.themes) |*themes| themes else return null;
+    const index = list.indexOf(name) orelse return null;
+    return @intCast(index);
 }
 
 fn loadShells(self: *Settings) void {
@@ -484,7 +702,7 @@ fn loadShells(self: *Settings) void {
     shells.append(arena, .{ .command = null, .name = msg.system_default, .kind = .system_default }) catch return;
     var selected: ?usize = if (overlay_command == null) 0 else null;
 
-    if (self.app.launchProfiles()) |list_| {
+    if (self.app.cachedLaunchProfiles()) |list_| {
         var list = list_;
         defer list.deinit();
         for (list.profiles) |profile| {
@@ -529,26 +747,86 @@ fn overlayValue(self: *Settings, alloc: Allocator, key: []const u8) ?[]const u8 
     return alloc.dupe(u8, value) catch null;
 }
 
+// -----------------------------------------------------------------------
+// Font families
+// -----------------------------------------------------------------------
+
 fn ensureFonts(self: *Settings) void {
-    if (self.fonts != null) return;
-    const extra: []const []const u8 = if (self.font_family.len > 0) &.{self.font_family} else &.{};
-    self.fonts = system.terminalFontFamilies(self.alloc, extra) catch |err| fonts: {
-        log.warn("cannot list the font families err={}", .{err});
-        break :fonts null;
+    if (self.fonts_checked or self.font_loader != null) return;
+    const hwnd = self.popup.hwnd orelse return;
+    self.font_loader = system.FontLoader.start(self.alloc, hwnd, WM_FONTS_READY, true) catch |err| {
+        log.warn("cannot list the font families in the background err={}", .{err});
+        return;
     };
-    self.refilter(.fonts);
-    if (self.fonts) |fonts| {
-        for (fonts.names, 0..) |name, i| {
-            if (std.mem.eql(u8, name, self.font_family)) self.font_list.select(@intCast(i));
-        }
+    self.fonts_checked = true;
+}
+
+/// `WM_FONTS_READY`: take the new list, keeping the cursor on its family.
+fn onFontsReady(self: *Settings) void {
+    const loader = self.font_loader orelse return;
+    var failed = false;
+    switch (loader.take()) {
+        .running => return,
+        .ready => |families| {
+            var keep_buf: [256]u8 = undefined;
+            const keep = self.cursorFamily(&keep_buf);
+            if (self.fonts) |*old| old.deinit();
+            self.fonts = families;
+            self.rebuildFontPicker(keep);
+        },
+        .failed, .taken => failed = true,
     }
+    loader.detach();
+    self.font_loader = null;
+    if (!failed and !self.fonts_checked and self.open and self.section == .font) self.ensureFonts();
+    if (failed) self.fonts_checked = false;
+    self.invalidate();
+}
+
+/// `WM_FONTCHANGE`: fonts were installed or removed.
+fn onFontChange(ctx: *anyopaque) void {
+    const self: *Settings = @ptrCast(@alignCast(ctx));
+    self.fonts_checked = false;
+    self.measurements.clear();
+    if (self.open and self.section == .font) self.ensureFonts();
+}
+
+/// Builds what the font list shows from `fonts` and the configured family,
+/// keeping the cursor on the family it was on.
+fn updateFontPicker(self: *Settings) void {
+    var keep_buf: [256]u8 = undefined;
+    self.rebuildFontPicker(self.cursorFamily(&keep_buf));
+}
+
+/// The family under the cursor of the font list, copied into `buf`.
+fn cursorFamily(self: *Settings, buf: []u8) ?[]const u8 {
+    const index = self.font_list.current() orelse return null;
+    if (index >= self.font_picker.names.len) return null;
+    const name = self.font_picker.names[index];
+    if (name.len > buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    return buf[0..name.len];
+}
+
+/// The font list from `fonts` and the configured family, with the cursor
+/// on `keep` when it is listed, else on the configured family.
+fn rebuildFontPicker(self: *Settings, keep: ?[]const u8) void {
+    _ = self.font_arena.reset(.retain_capacity);
+    const installed = if (self.fonts) |*fonts| fonts else null;
+    self.font_picker = system.Picker.init(self.font_arena.allocator(), installed, self.font_family) catch
+        .{ .names = &.{}, .local_names = &.{} };
+    self.refilter(.fonts);
+    if (keep) |name| {
+        if (self.font_picker.indexOf(name)) |index| return self.font_list.select(index);
+    }
+    if (self.font_picker.indexOf(self.font_family)) |index| self.font_list.select(index);
 }
 
 // -----------------------------------------------------------------------
 // Lists and their filter boxes
 // -----------------------------------------------------------------------
 
-const Field = enum { themes, fonts };
+const Field = enum { themes, fonts, font_size, search };
 
 /// A filtered list with a cursor.
 const List = struct {
@@ -601,33 +879,71 @@ const List = struct {
         self.reveal = true;
         return true;
     }
+
+    /// Scrolls by `lines`; false if it was already at that end.
+    fn scroll(self: *List, lines: i32) bool {
+        const max_top = self.matches.items.len -| self.visible;
+        const top: isize = @as(isize, @intCast(self.top)) + lines;
+        const clamped: usize = @intCast(std.math.clamp(top, 0, @as(isize, @intCast(max_top))));
+        if (clamped == self.top) return false;
+        self.top = clamped;
+        self.reveal = false;
+        return true;
+    }
 };
 
 fn listOf(self: *Settings, field: Field) *List {
     return switch (field) {
         .themes => &self.theme_list,
-        .fonts => &self.font_list,
+        .fonts, .font_size => &self.font_list,
+        .search => unreachable,
     };
 }
 
 fn queryOf(self: *Settings, field: Field) *std.ArrayList(u8) {
     return switch (field) {
         .themes => &self.theme_query,
-        .fonts => &self.font_query,
+        .fonts, .font_size => &self.font_query,
+        .search => &self.search_query,
     };
 }
 
 fn namesOf(self: *Settings, field: Field) []const [:0]const u8 {
     return switch (field) {
         .themes => if (self.themes) |list| list.names else &.{},
-        .fonts => if (self.fonts) |list| list.names else &.{},
+        .fonts, .font_size => self.font_picker.names,
+        .search => unreachable,
     };
 }
 
-/// Matches the names of `field` against its filter text.
+/// The list field of a row, if it has one.
+fn listField(action: Action) ?Field {
+    return switch (action) {
+        .themes => .themes,
+        .font_family => .fonts,
+        else => null,
+    };
+}
+
+/// Matches the names of `field` against its filter text; font families
+/// also by their name in the user's language.
 fn refilter(self: *Settings, field: Field) void {
+    if (field == .search) {
+        var buf: [max_rows]Row = undefined;
+        const rows = self.buildRows(&buf);
+        self.focus = firstFocusable(rows) orelse 0;
+        self.body_scroll = 0;
+        self.reveal_focus = true;
+        return;
+    }
     const list = self.listOf(field);
-    fuzzy.filter(self.alloc, self.namesOf(field), self.queryOf(field).items, &list.matches) catch |err| {
+    const query = self.queryOf(field).items;
+    const result = switch (field) {
+        .themes => fuzzy.filter(self.alloc, self.namesOf(field), query, &list.matches),
+        .fonts, .font_size => filterNames(self.alloc, self.font_picker.names, self.font_picker.local_names, query, &list.matches),
+        .search => unreachable,
+    };
+    result catch |err| {
         log.warn("cannot filter the list err={}", .{err});
         list.matches.clearRetainingCapacity();
     };
@@ -636,15 +952,68 @@ fn refilter(self: *Settings, field: Field) void {
     list.reveal = true;
 }
 
-/// Gives the filter box of the focused list, if any, the text input.
+/// `gx.fuzzy.filter` over two names per entry (`alt` may be null), each
+/// entry ranked by the better of them.
+fn filterNames(
+    alloc: Allocator,
+    names: []const [:0]const u8,
+    alt: []const ?[:0]const u8,
+    pattern: []const u8,
+    out: *std.ArrayList(u32),
+) Allocator.Error!void {
+    out.clearRetainingCapacity();
+    const query: fuzzy.Query = .init(pattern);
+    if (query.isEmpty()) {
+        try out.ensureTotalCapacity(alloc, names.len);
+        for (0..names.len) |i| out.appendAssumeCapacity(@intCast(i));
+        return;
+    }
+
+    const Ranked = struct {
+        index: u32,
+        score: i32,
+        len: u32,
+
+        fn better(_: void, a: @This(), b: @This()) bool {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.len != b.len) return a.len < b.len;
+            return a.index < b.index;
+        }
+    };
+    var ranked: std.ArrayList(Ranked) = .empty;
+    defer ranked.deinit(alloc);
+    var buf: fuzzy.Buffer = undefined;
+    for (names, 0..) |name, i| {
+        var best: ?Ranked = null;
+        var candidates = [2]?[]const u8{ name, null };
+        if (i < alt.len) {
+            if (alt[i]) |local| candidates[1] = local;
+        }
+        for (candidates) |candidate| {
+            const text = candidate orelse continue;
+            const p = buf.prepare(text);
+            const s = fuzzy.scorePrepared(&query, &p) orelse continue;
+            const entry: Ranked = .{ .index = @intCast(i), .score = s, .len = @intCast(p.cps.len) };
+            if (best == null or Ranked.better({}, entry, best.?)) best = entry;
+        }
+        if (best) |entry| try ranked.append(alloc, entry);
+    }
+    std.mem.sort(Ranked, ranked.items, {}, Ranked.better);
+    try out.ensureTotalCapacity(alloc, ranked.items.len);
+    for (ranked.items) |r| out.appendAssumeCapacity(r.index);
+}
+
+/// Gives the filter box of the focused list, if any, the text input; a
+/// size being typed is applied when the focus moves on.
 fn syncTextField(self: *Settings) void {
+    if (self.searching()) return;
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
-    const want: ?Field = if (self.focus < rows.len) switch (rows[self.focus].action) {
-        .themes => .themes,
-        .font_family => .fonts,
-        else => null,
-    } else null;
+    const want: ?Field = if (self.focus < rows.len) listField(rows[self.focus].action) else null;
+    if (self.text_field == .font_size) {
+        if (self.focus < rows.len and rows[self.focus].action == .font_size) return;
+        self.endSizeEdit(true);
+    }
     if (want == self.text_field) return;
     self.text_field = want;
     if (want) |field| {
@@ -654,13 +1023,19 @@ fn syncTextField(self: *Settings) void {
     }
 }
 
+fn focusSearch(self: *Settings, select: bool) void {
+    self.endSizeEdit(true);
+    if (self.text_field != .search) self.popup.input.setText(self.alloc, self.search_query.items) catch {};
+    self.text_field = .search;
+    if (select) self.popup.input.anchor = 0;
+    self.stopTimer(.preview);
+    self.invalidate();
+}
+
 fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
     const self: *Settings = @ptrCast(@alignCast(ctx));
-    const field = self.text_field orelse {
-        // Typing outside a filter box goes nowhere.
-        popup.input.clear();
-        return;
-    };
+    const field = self.text_field orelse return self.typedElsewhere(popup);
+    if (field == .font_size) return self.invalidate();
     const text = popup.input.text(self.alloc) catch return;
     defer self.alloc.free(text);
     const query = self.queryOf(field);
@@ -668,7 +1043,54 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
     query.clearRetainingCapacity();
     query.appendSlice(self.alloc, text) catch return;
     self.refilter(field);
-    if (field == .themes) self.schedulePreview();
+    if (field == .themes) self.schedulePreview(.type);
+    self.invalidate();
+}
+
+fn typedElsewhere(self: *Settings, popup: *Popup) void {
+    const typed = popup.input.text(self.alloc) catch return popup.input.clear();
+    defer self.alloc.free(typed);
+    if (fuzzy.isBlank(typed)) return popup.input.clear();
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildRows(&buf);
+    if (typed.len > 0 and self.focus < rows.len and rows[self.focus].action == .font_size and model.startsFontSize(typed[0])) {
+        return self.beginSizeEdit(typed, false);
+    }
+    const list_index: ?usize = for (rows, 0..) |row, i| {
+        if (listField(row.action) != null) break i;
+    } else null;
+    const field: Field = if (list_index) |index| listField(rows[index].action).? else .search;
+    const query = self.queryOf(field);
+    query.appendSlice(self.alloc, typed) catch {};
+    if (list_index) |index| self.focus = index;
+    self.focus_visible = true;
+    self.reveal_focus = true;
+    self.text_field = field;
+    popup.input.setText(self.alloc, query.items) catch {};
+    self.refilter(field);
+    if (field == .themes) self.schedulePreview(.type);
+    self.invalidate();
+}
+
+/// Starts typing the font size, with `text` in the field (all of it
+/// selected when `select`).
+fn beginSizeEdit(self: *Settings, text: []const u8, select: bool) void {
+    self.text_field = .font_size;
+    self.popup.input.setText(self.alloc, text) catch {};
+    if (select) self.popup.input.anchor = 0;
+    self.invalidate();
+}
+
+/// Stops typing the font size, applying a valid size when `apply`.
+fn endSizeEdit(self: *Settings, apply: bool) void {
+    if (self.text_field != .font_size) return;
+    const text = self.popup.input.text(self.alloc) catch null;
+    defer if (text) |t| self.alloc.free(t);
+    self.text_field = null;
+    self.popup.input.clear();
+    if (apply) {
+        if (text) |t| if (model.parseFontSize(t)) |size| self.setFontSize(settings_map.FontSize.normalize(size));
+    }
     self.invalidate();
 }
 
@@ -676,37 +1098,24 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
 // Sections and rows
 // -----------------------------------------------------------------------
 
-/// The sections of the overlay, in sidebar order.
-pub const Section = enum {
-    language,
-    appearance,
-    font,
-    interaction,
-    shell,
-    about,
+/// The sections of the overlay, in sidebar order: the pages of
+/// `gx:settings_page:<page>`.
+pub const Section = settings_map.Page;
 
-    fn title(self: Section) [:0]const u8 {
-        return switch (self) {
-            .language => i18n.tr(msg.language),
-            .appearance => i18n.tr(msg.appearance),
-            .font => i18n.tr(msg.font),
-            .interaction => i18n.tr(msg.interaction),
-            .shell => i18n.tr(msg.shell),
-            .about => i18n.tr(msg.about),
-        };
-    }
+fn sectionTitle(section: Section) [:0]const u8 {
+    return i18n.trRuntime(settings_map.pageLabel(section));
+}
 
-    fn icon(self: Section) u21 {
-        return switch (self) {
-            .language => draw.icons.globe,
-            .appearance => draw.icons.color,
-            .font => draw.icons.font,
-            .interaction => draw.icons.touch,
-            .shell => draw.icons.command_prompt,
-            .about => draw.icons.info,
-        };
-    }
-};
+fn sectionIcon(section: Section) u21 {
+    return switch (section) {
+        .language => draw.icons.globe,
+        .appearance => draw.icons.color,
+        .font => draw.icons.font,
+        .interaction => draw.icons.touch,
+        .shell => draw.icons.command_prompt,
+        .about => draw.icons.info,
+    };
+}
 
 const RowKind = enum {
     /// A group title with an optional description and buttons.
@@ -717,201 +1126,80 @@ const RowKind = enum {
     toggle,
     /// A segmented choice (chips).
     choice,
-    /// The font size with -/+ and reset.
+    /// The font size with -/+ and a field to type it into.
     stepper,
     /// A filter box with a list below it.
     list,
     /// A title with a value (paths, the version).
     info,
     button,
+    /// A line of text in the font being picked.
+    sample,
+    /// A setting the search found, with the section it is in.
+    result,
+};
 
-    fn focusable(self: RowKind) bool {
-        return switch (self) {
-            .group, .note, .info => false,
-            else => true,
-        };
-    }
+/// A row of a section, as a search result points at it.
+const Goto = struct {
+    section: Section,
+    row: u16,
 };
 
 const Action = union(enum) {
     none,
+    goto: Goto,
     language: i18n.Language,
     material,
+    opacity,
+    padding,
+    cursor_style,
+    cursor_blink,
     themes,
     font_size,
     font_family,
-    right_click,
+    right_click: u8,
     scrollbar,
     close_confirmation,
+    focus_follows_mouse,
+    ctrl_scroll_zoom,
     bell: u8,
     shell: u16,
     open_config_file,
     open_config_dir,
+    reset_all,
 };
 
-const GroupButton = enum { apply_theme, apply_font, reset_font };
+const GroupButton = enum { reset, apply_theme, apply_font };
 
 const Row = struct {
     kind: RowKind,
     action: Action = .none,
     title: []const u8 = "",
     detail: []const u8 = "",
+    /// The detail warns (the command line overrides the setting).
+    detail_warning: bool = false,
     on: bool = false,
     choices: []const []const u8 = &.{},
-    choice: usize = 0,
+    /// Null when the value is none of the choices.
+    choice: ?usize = 0,
     /// Bit `i` set: choice `i` is not available.
     disabled: u8 = 0,
     value: []const u8 = "",
     buttons: []const GroupButton = &.{},
     icon: ?u21 = null,
-};
+    /// The configuration keys the row sets, which Delete resets.
+    keys: []const []const u8 = &.{},
+    /// Draw a reset button: the settings file sets `keys`.
+    resettable: bool = false,
 
-/// The rows of the current section. Dynamic strings live in `scratch`
-/// until the next paint.
-fn buildRows(self: *Settings, buf: *[max_rows]Row) []Row {
-    var rows: RowList = .{ .buf = buf };
-    const scratch = self.scratch.allocator();
-    switch (self.section) {
-        .language => {
-            rows.add(.{ .kind = .group, .title = i18n.tr(msg.interface_language) });
-            for (std.enums.values(i18n.Language)) |lang| {
-                rows.add(.{
-                    .kind = .radio,
-                    .action = .{ .language = lang },
-                    .title = lang.nativeName(),
-                    .detail = lang.configValue(),
-                    .on = self.values.language == lang,
-                });
-            }
-        },
-        .appearance => {
-            const materials = std.enums.values(WindowMaterial);
-            var labels_buf: [materials.len][]const u8 = undefined;
-            var disabled: u8 = 0;
-            for (materials, 0..) |material, i| {
-                labels_buf[i] = materialLabel(material);
-                if (!system.materialSupported(material, self.build)) disabled |= @as(u8, 1) << @intCast(i);
-            }
-            const labels = scratch.dupe([]const u8, &labels_buf) catch &.{};
-            rows.add(.{
-                .kind = .choice,
-                .action = .material,
-                .title = i18n.tr(msg.window_material),
-                .choices = labels,
-                .choice = std.mem.indexOfScalar(WindowMaterial, materials, self.values.material) orelse 0,
-                .disabled = disabled,
-            });
-            rows.add(.{ .kind = .note, .detail = self.materialNote(scratch) });
-            rows.add(.{
-                .kind = .group,
-                .title = i18n.tr(msg.theme),
-                .detail = if (self.layered) i18n.tr(msg.theme_hint) else "",
-                .buttons = &.{.apply_theme},
-            });
-            rows.add(.{ .kind = .list, .action = .themes });
-        },
-        .font => {
-            var size_buf: [32]u8 = undefined;
-            const size = settings_map.FontSize.format(&size_buf, self.values.font_size) catch "";
-            rows.add(.{
-                .kind = .stepper,
-                .action = .font_size,
-                .title = i18n.tr(msg.font_size),
-                .value = scratch.dupe(u8, size) catch "",
-            });
-            rows.add(.{
-                .kind = .group,
-                .title = i18n.tr(msg.font_family),
-                .detail = i18n.tr(msg.font_family_hint),
-                .buttons = &.{ .apply_font, .reset_font },
-            });
-            rows.add(.{ .kind = .list, .action = .font_family });
-        },
-        .interaction => {
-            const menu = self.values.right_click == .@"context-menu";
-            rows.add(.{
-                .kind = .toggle,
-                .action = .right_click,
-                .title = i18n.tr("Right-Click Menu"),
-                .detail = if (menu) "" else rightClickLabel(self.values.right_click),
-                .on = menu,
-            });
-            rows.add(.{
-                .kind = .toggle,
-                .action = .scrollbar,
-                .title = i18n.tr(msg.show_scrollbar),
-                .on = self.values.scrollbar,
-            });
-            const choices = &settings_map.close_confirmation_choices;
-            var labels_buf: [choices.len][]const u8 = undefined;
-            for (choices, &labels_buf) |choice, *label| label.* = i18n.trRuntime(choice.label);
-            const labels = scratch.dupe([]const u8, &labels_buf) catch &.{};
-            rows.add(.{
-                .kind = .choice,
-                .action = .close_confirmation,
-                .title = i18n.tr(msg.close_confirmation),
-                .choices = labels,
-                .choice = settings_map.choiceIndex(Config.ConfirmCloseSurface, choices, self.values.close_confirmation) orelse 0,
-            });
-            rows.add(.{ .kind = .group, .title = i18n.tr(msg.bell) });
-            inline for (settings_map.bell_features, 0..) |feature, i| {
-                rows.add(.{
-                    .kind = .toggle,
-                    .action = .{ .bell = i },
-                    .title = i18n.tr(feature.label),
-                    .on = @field(self.values.bell, feature.field),
-                });
-            }
-        },
-        .shell => {
-            rows.add(.{ .kind = .group, .title = i18n.tr(msg.default_shell), .detail = i18n.tr(msg.default_shell_hint) });
-            const current = if (self.shell_selected < self.shells.len)
-                self.shellName(scratch, self.shells[self.shell_selected])
-            else
-                "";
-            var note: std.Io.Writer.Allocating = .init(scratch);
-            i18n.format(&note.writer, i18n.tr("Current default: {name}"), .{ .name = current }) catch {};
-            if (self.app.defaultTerminalCommand()) |command| {
-                const line = command.string(scratch) catch "";
-                if (line.len > 0) note.writer.print(" \u{2014} {s}", .{line}) catch {};
-            }
-            rows.add(.{ .kind = .note, .detail = note.written() });
-            for (self.shells, 0..) |shell, i| {
-                rows.add(.{
-                    .kind = .radio,
-                    .action = .{ .shell = @intCast(i) },
-                    .title = self.shellName(scratch, shell),
-                    .detail = shell.command orelse "",
-                    .on = i == self.shell_selected,
-                });
-            }
-        },
-        .about => {
-            rows.add(.{
-                .kind = .info,
-                .title = i18n.tr(msg.app_name),
-                .detail = i18n.fill(scratch, i18n.tr(msg.version), .{ .version = build_config.version_string }) catch "",
-            });
-            rows.add(.{ .kind = .note, .detail = i18n.tr(msg.notice) });
-            rows.add(.{ .kind = .info, .title = i18n.tr(msg.config_file), .detail = self.config_path });
-            rows.add(.{ .kind = .info, .title = i18n.tr(msg.settings_file), .detail = self.overlay_path });
-            rows.add(.{ .kind = .note, .detail = i18n.tr(msg.settings_file_hint) });
-            rows.add(.{
-                .kind = .button,
-                .action = .open_config_file,
-                .title = i18n.tr(msg.open_config_file),
-                .icon = draw.icons.open_file,
-            });
-            rows.add(.{
-                .kind = .button,
-                .action = .open_config_dir,
-                .title = i18n.tr("Open Configuration Directory"),
-                .icon = draw.icons.folder,
-            });
-        },
+    fn focusable(self: Row) bool {
+        return switch (self.kind) {
+            .group => self.buttons.len > 0,
+            .note, .info, .sample => false,
+            else => true,
+        };
     }
-    return rows.items();
-}
+};
 
 const RowList = struct {
     buf: *[max_rows]Row,
@@ -928,6 +1216,378 @@ const RowList = struct {
     }
 };
 
+/// What a setting row says under its title: where the value comes from
+/// when that is not the settings file or a default, else `hint`.
+const Detail = struct {
+    text: []const u8 = "",
+    warning: bool = false,
+};
+
+fn detailFor(self: *Settings, keys: []const []const u8, hint: []const u8) Detail {
+    const layers = self.layersPtr() orelse return .{ .text = hint };
+    var source: ?gx.config_layers.Layer = null;
+    for (keys) |key| {
+        const layer = layers.provenance(key) orelse continue;
+        if (source == null or @intFromEnum(layer) > @intFromEnum(source.?)) source = layer;
+    }
+    return switch (source orelse return .{ .text = hint }) {
+        .cli => .{ .text = i18n.trRuntime(settings_map.provenanceLabel(.cli)), .warning = true },
+        .user => .{ .text = i18n.trRuntime(settings_map.provenanceLabel(.user)) },
+        .defaults, .overlay => .{ .text = hint },
+    };
+}
+
+/// Whether the settings file sets one of `keys` (with the changes made
+/// here), so "Reset to Default" does something.
+fn overlaySets(self: *Settings, keys: []const []const u8) bool {
+    const layers = self.layersPtr() orelse return false;
+    for (keys) |key| if (layers.sets(.overlay, key)) return true;
+    return false;
+}
+
+/// A setting row with its keys, detail and reset button.
+fn setting(self: *Settings, row: Row, hint: []const u8) Row {
+    var out = row;
+    const detail = self.detailFor(row.keys, hint);
+    out.detail = detail.text;
+    out.detail_warning = detail.warning;
+    out.resettable = self.overlaySets(row.keys);
+    return out;
+}
+
+/// A group title over the radio rows of one setting.
+fn settingGroup(self: *Settings, scratch: Allocator, title: []const u8, keys: []const []const u8, hint: []const u8, buttons: []const GroupButton) Row {
+    const resettable = self.overlaySets(keys);
+    const detail = self.detailFor(keys, hint);
+    var all: []const GroupButton = buttons;
+    if (resettable) {
+        if (scratch.alloc(GroupButton, buttons.len + 1)) |list| {
+            list[0] = .reset;
+            @memcpy(list[1..], buttons);
+            all = list;
+        } else |_| {}
+    }
+    return .{
+        .kind = .group,
+        .title = title,
+        .detail = detail.text,
+        .detail_warning = detail.warning,
+        .buttons = all,
+        .keys = keys,
+        .resettable = resettable,
+    };
+}
+
+const keys_language: []const []const u8 = &.{"language"};
+const keys_material: []const []const u8 = &.{"gx-window-material"};
+const keys_opacity: []const []const u8 = &.{"background-opacity"};
+const keys_padding: []const []const u8 = &.{ settings_map.Padding.keys[0], settings_map.Padding.keys[1] };
+const keys_cursor_style: []const []const u8 = &.{"cursor-style"};
+const keys_cursor_blink: []const []const u8 = &.{settings_map.cursor_blink.key};
+const keys_theme: []const []const u8 = &.{"theme"};
+const keys_font_size: []const []const u8 = &.{"font-size"};
+const keys_font_family: []const []const u8 = &.{"font-family"};
+const keys_right_click: []const []const u8 = &.{"right-click-action"};
+const keys_scrollbar: []const []const u8 = &.{"scrollbar"};
+const keys_close: []const []const u8 = &.{"confirm-close-surface"};
+const keys_focus_follows_mouse: []const []const u8 = &.{settings_map.focus_follows_mouse.key};
+const keys_ctrl_scroll_zoom: []const []const u8 = &.{settings_map.ctrl_scroll_zoom.key};
+const keys_bell: []const []const u8 = &.{"bell-features"};
+const keys_command: []const []const u8 = &.{"command"};
+
+/// The rows of the body: the settings the search finds while it has text,
+/// else the rows of the current section. Dynamic strings live in `scratch`
+/// until the next paint.
+fn buildRows(self: *Settings, buf: *[max_rows]Row) []Row {
+    if (self.searching()) return self.buildSearchRows(buf);
+    return self.buildSectionRows(self.section, buf);
+}
+
+/// Whether the search has text, so the body shows what it finds.
+fn searching(self: *const Settings) bool {
+    return !fuzzy.isBlank(self.search_query.items);
+}
+
+/// The settings of every section whose title, or the title of the group
+/// it is in, matches the search: a group row per section, a result row
+/// per setting pointing at its row (`Goto`).
+fn buildSearchRows(self: *Settings, buf: *[max_rows]Row) []Row {
+    var rows: RowList = .{ .buf = buf };
+    const query: fuzzy.Query = .init(self.search_query.items);
+    var section_buf: [max_rows]Row = undefined;
+    for (std.enums.values(Section)) |section| {
+        const section_rows = self.buildSectionRows(section, &section_buf);
+        appendSearchRows(&rows, section, sectionTitle(section), section_rows, &query, self.scratch.allocator());
+    }
+    if (rows.len == 0) rows.add(.{ .kind = .note, .detail = i18n.tr("No matching settings") });
+    return rows.items();
+}
+
+fn appendSearchRows(out: *RowList, section: Section, section_title: []const u8, rows: []const Row, query: *const fuzzy.Query, alloc: Allocator) void {
+    var group: []const u8 = "";
+    var found = false;
+    for (rows, 0..) |row, i| {
+        switch (row.kind) {
+            .group => {
+                group = row.title;
+                continue;
+            },
+            .radio, .toggle, .choice, .stepper, .list, .button => {},
+            .note, .info, .sample, .result => continue,
+        }
+        const title = if (row.kind == .list or row.title.len == 0) group else row.title;
+        if (title.len == 0) continue;
+        var text: std.Io.Writer.Allocating = .init(alloc);
+        defer text.deinit();
+        text.writer.print("{s} {s} {s}", .{ section_title, group, title }) catch continue;
+        for (row.keys) |key| text.writer.print(" {s}", .{key}) catch {};
+        if (fuzzy.score(query, text.written()) == null) continue;
+        if (!found) {
+            found = true;
+            out.add(.{ .kind = .group, .title = section_title });
+        }
+        const where = if (group.len > 0 and !std.mem.eql(u8, group, title))
+            std.fmt.allocPrint(alloc, "{s} \u{203A} {s}", .{ section_title, group }) catch section_title
+        else
+            section_title;
+        out.add(.{
+            .kind = .result,
+            .action = .{ .goto = .{ .section = section, .row = @intCast(i) } },
+            .title = title,
+            .detail = where,
+        });
+    }
+}
+
+/// The rows of `section`.
+fn buildSectionRows(self: *Settings, section: Section, buf: *[max_rows]Row) []Row {
+    var rows: RowList = .{ .buf = buf };
+    const scratch = self.scratch.allocator();
+    switch (section) {
+        .language => {
+            rows.add(self.settingGroup(scratch, i18n.tr(msg.interface_language), keys_language, "", &.{}));
+            for (std.enums.values(i18n.Language)) |lang| {
+                rows.add(.{
+                    .kind = .radio,
+                    .action = .{ .language = lang },
+                    .title = lang.nativeName(),
+                    .detail = lang.configValue(),
+                    .on = self.values.language == lang,
+                    .keys = keys_language,
+                });
+            }
+        },
+        .appearance => {
+            rows.add(self.settingGroup(scratch, i18n.tr(msg.theme), keys_theme, if (self.layered) i18n.tr(msg.theme_hint) else "", &.{.apply_theme}));
+            rows.add(.{ .kind = .list, .action = .themes, .keys = keys_theme });
+
+            rows.add(.{ .kind = .group, .title = i18n.tr("Window") });
+            const materials = std.enums.values(WindowMaterial);
+            var material_labels: [materials.len][]const u8 = undefined;
+            var disabled: u8 = 0;
+            for (materials, 0..) |material, i| {
+                material_labels[i] = materialLabel(material);
+                if (!system.materialSupported(material, self.build)) disabled |= @as(u8, 1) << @intCast(i);
+            }
+            rows.add(self.setting(.{
+                .kind = .choice,
+                .action = .material,
+                .title = i18n.tr(msg.window_material),
+                .choices = scratch.dupe([]const u8, &material_labels) catch &.{},
+                .choice = std.mem.indexOfScalar(WindowMaterial, materials, self.values.material),
+                .disabled = disabled,
+                .keys = keys_material,
+            }, ""));
+            rows.add(.{ .kind = .note, .detail = self.materialNote(scratch) });
+
+            const opacities = std.enums.values(settings_map.Opacity);
+            var opacity_labels: [opacities.len][]const u8 = undefined;
+            for (opacities, &opacity_labels) |choice, *label| label.* = i18n.trRuntime(choice.label());
+            const opacity_hint = if (self.app.alpha_frames)
+                i18n.tr(msg.opacity_hint)
+            else
+                i18n.tr("On this system the whole window becomes translucent.");
+            rows.add(self.setting(.{
+                .kind = .choice,
+                .action = .opacity,
+                .title = i18n.tr(msg.opacity),
+                .choices = scratch.dupe([]const u8, &opacity_labels) catch &.{},
+                .choice = if (self.values.opacity) |o| std.mem.indexOfScalar(settings_map.Opacity, opacities, o) else null,
+                .keys = keys_opacity,
+            }, opacity_hint));
+
+            const paddings = std.enums.values(settings_map.Padding);
+            var padding_labels: [paddings.len][]const u8 = undefined;
+            for (paddings, &padding_labels) |preset, *label| label.* = i18n.trRuntime(preset.label());
+            rows.add(self.setting(.{
+                .kind = .choice,
+                .action = .padding,
+                .title = i18n.tr(msg.padding),
+                .choices = scratch.dupe([]const u8, &padding_labels) catch &.{},
+                .choice = if (self.values.padding) |p| std.mem.indexOfScalar(settings_map.Padding, paddings, p) else null,
+                .keys = keys_padding,
+            }, i18n.tr(msg.padding_hint)));
+
+            rows.add(.{ .kind = .group, .title = i18n.tr(msg.cursor) });
+            const cursor_choices = &settings_map.cursor_style_choices;
+            var cursor_labels: [cursor_choices.len][]const u8 = undefined;
+            for (cursor_choices, &cursor_labels) |choice, *label| label.* = i18n.trRuntime(choice.label);
+            rows.add(self.setting(.{
+                .kind = .choice,
+                .action = .cursor_style,
+                .title = i18n.tr(msg.cursor_style),
+                .choices = scratch.dupe([]const u8, &cursor_labels) catch &.{},
+                .choice = settings_map.choiceIndex(settings_map.CursorStyle, cursor_choices, self.values.cursor_style),
+                .keys = keys_cursor_style,
+            }, ""));
+            rows.add(self.setting(.{
+                .kind = .toggle,
+                .action = .cursor_blink,
+                .title = i18n.tr(msg.cursor_blink),
+                .on = self.values.cursor_blink,
+                .keys = keys_cursor_blink,
+            }, ""));
+        },
+        .font => {
+            var size_buf: [32]u8 = undefined;
+            const size = settings_map.FontSize.format(&size_buf, self.values.font_size) catch "";
+            rows.add(self.setting(.{
+                .kind = .stepper,
+                .action = .font_size,
+                .title = i18n.tr(msg.font_size),
+                .value = scratch.dupe(u8, size) catch "",
+                .keys = keys_font_size,
+            }, ""));
+            rows.add(.{ .kind = .sample });
+            rows.add(self.settingGroup(scratch, i18n.tr(msg.font_family), keys_font_family, i18n.tr(msg.font_family_hint), &.{.apply_font}));
+            rows.add(.{ .kind = .list, .action = .font_family, .keys = keys_font_family });
+        },
+        .interaction => {
+            rows.add(self.settingGroup(scratch, i18n.tr(msg.right_click), keys_right_click, "", &.{}));
+            for (settings_map.right_click_choices, 0..) |choice, i| {
+                rows.add(.{
+                    .kind = .radio,
+                    .action = .{ .right_click = @intCast(i) },
+                    .title = i18n.trRuntime(choice.label),
+                    .on = self.values.right_click == choice.value,
+                    .keys = keys_right_click,
+                });
+            }
+            rows.add(self.setting(.{
+                .kind = .toggle,
+                .action = .scrollbar,
+                .title = i18n.tr(msg.show_scrollbar),
+                .on = self.values.scrollbar,
+                .keys = keys_scrollbar,
+            }, ""));
+            const choices = &settings_map.close_confirmation_choices;
+            var labels_buf: [choices.len][]const u8 = undefined;
+            for (choices, &labels_buf) |choice, *label| label.* = i18n.trRuntime(choice.label);
+            rows.add(self.setting(.{
+                .kind = .choice,
+                .action = .close_confirmation,
+                .title = i18n.tr(msg.close_confirmation),
+                .choices = scratch.dupe([]const u8, &labels_buf) catch &.{},
+                .choice = settings_map.choiceIndex(Config.ConfirmCloseSurface, choices, self.values.close_confirmation),
+                .keys = keys_close,
+            }, ""));
+            rows.add(self.setting(.{
+                .kind = .toggle,
+                .action = .focus_follows_mouse,
+                .title = i18n.tr(settings_map.focus_follows_mouse.label),
+                .on = self.values.focus_follows_mouse,
+                .keys = keys_focus_follows_mouse,
+            }, i18n.tr(settings_map.focus_follows_mouse.hint)));
+            rows.add(self.setting(.{
+                .kind = .toggle,
+                .action = .ctrl_scroll_zoom,
+                .title = i18n.tr(settings_map.ctrl_scroll_zoom.label),
+                .on = self.values.ctrl_scroll_zoom,
+                .keys = keys_ctrl_scroll_zoom,
+            }, i18n.tr(settings_map.ctrl_scroll_zoom.hint)));
+            rows.add(self.settingGroup(scratch, i18n.tr(msg.bell), keys_bell, "", &.{}));
+            const runtime = settings_map.Runtime.native orelse .win32;
+            inline for (settings_map.bell_features, 0..) |feature, i| {
+                if (feature.supports(runtime)) rows.add(.{
+                    .kind = .toggle,
+                    .action = .{ .bell = i },
+                    .title = i18n.tr(feature.label),
+                    .on = @field(self.values.bell, feature.field),
+                    .keys = keys_bell,
+                });
+            }
+        },
+        .shell => {
+            rows.add(self.settingGroup(scratch, i18n.tr(msg.default_shell), keys_command, i18n.tr(msg.default_shell_hint), &.{}));
+            const current = if (self.shell_selected < self.shells.len)
+                self.shellName(scratch, self.shells[self.shell_selected])
+            else
+                "";
+            var note: std.Io.Writer.Allocating = .init(scratch);
+            i18n.format(&note.writer, i18n.tr("Current default: {name}"), .{ .name = current }) catch {};
+            if (self.app.defaultTerminalCommand()) |command| {
+                const line = command.string(scratch) catch "";
+                if (line.len > 0) note.writer.print(" \u{2014} {s}", .{model.displayCommand(line)}) catch {};
+            }
+            rows.add(.{ .kind = .note, .detail = note.written() });
+            for (self.shells, 0..) |shell, i| {
+                rows.add(.{
+                    .kind = .radio,
+                    .action = .{ .shell = @intCast(i) },
+                    .title = self.shellName(scratch, shell),
+                    .detail = model.displayCommand(shell.command orelse ""),
+                    .on = i == self.shell_selected,
+                    .keys = keys_command,
+                });
+            }
+        },
+        .about => {
+            rows.add(.{
+                .kind = .info,
+                .title = i18n.tr(msg.app_name),
+                .detail = i18n.fill(scratch, i18n.tr(msg.version), .{ .version = build_config.version_string }) catch "",
+            });
+            rows.add(.{ .kind = .note, .detail = i18n.tr(msg.notice) });
+            rows.add(.{ .kind = .info, .title = i18n.tr("Graphics"), .detail = self.graphicsDetail(scratch) });
+            rows.add(.{ .kind = .info, .title = i18n.tr(msg.config_file), .detail = windowsPath(scratch, self.config_path) });
+            rows.add(.{ .kind = .info, .title = i18n.tr(msg.settings_file), .detail = windowsPath(scratch, self.overlay_path) });
+            rows.add(.{ .kind = .note, .detail = i18n.tr(msg.settings_file_hint) });
+            rows.add(.{
+                .kind = .button,
+                .action = .open_config_file,
+                .title = i18n.tr(msg.open_config_file),
+                .icon = draw.icons.open_file,
+            });
+            rows.add(.{
+                .kind = .button,
+                .action = .open_config_dir,
+                .title = i18n.tr("Open Configuration Directory"),
+                .icon = draw.icons.folder,
+            });
+            rows.add(.{
+                .kind = .button,
+                .action = .reset_all,
+                .title = i18n.tr("Reset Interface Settings"),
+                .icon = draw.icons.reset,
+            });
+            rows.add(.{
+                .kind = .note,
+                .detail = if (self.reset_all.armed(system.nowMs()))
+                    i18n.tr("Press Reset Interface Settings again to confirm.")
+                else
+                    i18n.tr("Removes every setting made here, so the configuration file and the defaults apply again."),
+                .detail_warning = self.reset_all.armed(system.nowMs()),
+            });
+        },
+    }
+    return rows.items();
+}
+
+fn windowsPath(alloc: Allocator, path: []const u8) []const u8 {
+    const buf = alloc.alloc(u8, path.len) catch return path;
+    return model.windowsPath(buf, path);
+}
+
 fn materialLabel(material: WindowMaterial) [:0]const u8 {
     return switch (material) {
         .solid => i18n.tr("Solid"),
@@ -937,22 +1597,33 @@ fn materialLabel(material: WindowMaterial) [:0]const u8 {
     };
 }
 
+/// Which materials work here, and why one does not show behind the
+/// terminals.
 fn materialNote(self: *Settings, alloc: Allocator) []const u8 {
     if (self.build < system.build_windows_11) return i18n.tr("Window material requires Windows 11.");
     const all = for (std.enums.values(WindowMaterial)) |material| {
         if (!system.materialSupported(material, self.build)) break false;
     } else true;
-    const template = if (all)
-        i18n.tr("All window materials are supported on this system (build {build}).")
-    else
-        i18n.tr("Dimmed materials are not supported on this system (build {build}).");
-    return i18n.fill(alloc, template, .{ .build = self.build }) catch "";
+    if (!all) return i18n.fill(alloc, i18n.tr("Dimmed materials are not supported on this system (build {build})."), .{ .build = self.build }) catch "";
+    if (!self.app.alpha_frames and self.values.material != .solid) {
+        return switch (self.app.core_app.device.alphaFrames()) {
+            .software => i18n.tr("The material shows in the title bar only: the terminals are drawn by software rendering."),
+            .supported, .no_alpha_channel => i18n.tr("The material shows in the title bar only: the graphics driver draws the terminals without transparency."),
+        };
+    }
+    return i18n.fill(alloc, i18n.tr("All window materials are supported on this system (build {build})."), .{ .build = self.build }) catch "";
 }
 
-fn rightClickLabel(action: Config.RightClickAction) []const u8 {
-    const choices = &settings_map.right_click_choices;
-    const index = settings_map.choiceIndex(Config.RightClickAction, choices, action) orelse return "";
-    return i18n.trRuntime(choices[index].label);
+/// The OpenGL implementation that draws the terminals (`wgl.Device`).
+fn graphicsDetail(self: *Settings, alloc: Allocator) []const u8 {
+    const device = &self.app.core_app.device;
+    device.wait() catch return "OpenGL";
+    const backend = device.backend();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    const name = if (backend.renderer.len > 0) backend.renderer else backend.vendor;
+    out.writer.print("{s} \u{00B7} OpenGL {d}.{d}", .{ name, backend.version.major, backend.version.minor }) catch {};
+    if (backend.software) out.writer.print(" \u{00B7} {s}", .{i18n.tr("Software rendering")}) catch {};
+    return out.written();
 }
 
 fn shellName(self: *Settings, alloc: Allocator, shell: Shell) []const u8 {
@@ -960,7 +1631,7 @@ fn shellName(self: *Settings, alloc: Allocator, shell: Shell) []const u8 {
     return switch (shell.kind) {
         .system_default => i18n.tr(msg.system_default),
         .custom_profile => shell.name,
-        .custom_command => i18n.fill(alloc, i18n.tr(msg.custom_command), .{ .command = shell.name }) catch shell.name,
+        .custom_command => i18n.fill(alloc, i18n.tr(msg.custom_command), .{ .command = model.displayCommand(shell.name) }) catch shell.name,
         .profile => i18n.fill(alloc, i18n.trRuntime(shell.name), .{ .name = shell.name_arg orelse "" }) catch shell.name,
     };
 }
@@ -968,27 +1639,48 @@ fn shellName(self: *Settings, alloc: Allocator, shell: Shell) []const u8 {
 fn defaultFocus(self: *Settings, rows: []const Row) usize {
     for (rows, 0..) |row, i| {
         switch (self.section) {
-            .language, .shell => if (row.kind == .radio and row.on) return i,
-            .appearance => if (row.kind == .list) return i,
+            .language, .shell, .interaction => if (row.kind == .radio and row.on) return i,
+            .appearance, .font => if (row.kind == .list) return i,
             .about => if (row.kind == .button) return i,
-            else => {},
         }
     }
     return firstFocusable(rows) orelse 0;
 }
 
 fn firstFocusable(rows: []const Row) ?usize {
-    for (rows, 0..) |row, i| if (row.kind.focusable()) return i;
+    for (rows, 0..) |row, i| if (row.focusable()) return i;
     return null;
 }
 
+fn gotoSetting(self: *Settings, target: Goto) void {
+    self.enterSection(target.section);
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildRows(&buf);
+    if (target.row >= rows.len or !rows[target.row].focusable()) return;
+    self.focus = target.row;
+    self.focus_button = 0;
+    self.focus_visible = true;
+    self.reveal_focus = true;
+    self.syncTextField();
+    self.invalidate();
+}
+
 fn enterSection(self: *Settings, section: Section) void {
+    self.endSizeEdit(true);
+    self.search_query.clearRetainingCapacity();
+    self.text_field = null;
+    self.popup.input.clear();
     self.section = section;
     self.body_scroll = 0;
+    self.hover = null;
+    self.pressed = null;
+    self.reset_all.cancel();
+    self.tooltip.hide();
     if (section == .font) self.ensureFonts();
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
     self.focus = self.defaultFocus(rows);
+    self.focus_button = 0;
     self.reveal_focus = true;
     self.theme_list.reveal = true;
     self.font_list.reveal = true;
@@ -1009,9 +1701,10 @@ fn moveFocus(self: *Settings, rows: []const Row, delta: isize) void {
     while (true) {
         i += delta;
         if (i < 0 or i >= rows.len) return;
-        if (rows[@intCast(i)].kind.focusable()) break;
+        if (rows[@intCast(i)].focusable()) break;
     }
     self.focus = @intCast(i);
+    self.focus_button = if (delta < 0) rows[self.focus].buttons.len -| 1 else 0;
     self.reveal_focus = true;
     if (i == 0 or firstFocusableBefore(rows, @intCast(i)) == null) self.body_scroll = 0;
     self.syncTextField();
@@ -1019,7 +1712,7 @@ fn moveFocus(self: *Settings, rows: []const Row, delta: isize) void {
 }
 
 fn firstFocusableBefore(rows: []const Row, end: usize) ?usize {
-    for (rows[0..end], 0..) |row, i| if (row.kind.focusable()) return i;
+    for (rows[0..end], 0..) |row, i| if (row.focusable()) return i;
     return null;
 }
 
@@ -1031,17 +1724,28 @@ fn firstFocusableBefore(rows: []const Row, end: usize) ?usize {
 fn activate(self: *Settings, row: Row) void {
     switch (row.action) {
         .none, .font_size => {},
+        .goto => |target| self.gotoSetting(target),
         .language => |lang| self.setLanguage(lang),
-        .material => self.stepChoice(row, 1),
+        .material, .opacity, .padding, .cursor_style, .close_confirmation => self.stepChoice(row, 1),
         .themes => self.applyTheme(),
         .font_family => self.applyFontFamily(),
-        .right_click => self.setRightClickMenu(!row.on),
+        .right_click => |i| self.setRightClick(i),
         .scrollbar => self.setScrollbar(!row.on),
-        .close_confirmation => self.stepChoice(row, 1),
+        .cursor_blink, .focus_follows_mouse, .ctrl_scroll_zoom => self.setSwitch(row.action, !row.on),
         .bell => |i| self.setBell(i, !row.on),
         .shell => |i| self.chooseShell(i),
         .open_config_file => self.openConfigFile(),
         .open_config_dir => self.openConfigDir(),
+        .reset_all => self.resetAll(),
+    }
+    self.invalidate();
+}
+
+fn activateGroupButton(self: *Settings, row: Row, button: GroupButton) void {
+    switch (button) {
+        .reset => self.resetRow(row),
+        .apply_theme => self.applyTheme(),
+        .apply_font => self.applyFontFamily(),
     }
     self.invalidate();
 }
@@ -1051,7 +1755,7 @@ fn activate(self: *Settings, row: Row) void {
 fn stepChoice(self: *Settings, row: Row, delta: isize) void {
     const count = row.choices.len;
     if (count == 0) return;
-    var index: isize = @intCast(row.choice);
+    var index: isize = if (row.choice) |c| @intCast(c) else if (delta > 0) -1 else @intCast(count);
     for (0..count) |_| {
         index = @mod(index + delta, @as(isize, @intCast(count)));
         const i: usize = @intCast(index);
@@ -1066,16 +1770,32 @@ fn stepChoice(self: *Settings, row: Row, delta: isize) void {
 fn setChoice(self: *Settings, row: Row, index: usize) void {
     if (index >= row.choices.len) return;
     if (row.disabled & (@as(u8, 1) << @intCast(index)) != 0) return;
+    if (row.choice == index) return;
     switch (row.action) {
         .material => {
             const material = std.enums.values(WindowMaterial)[index];
-            if (material == self.values.material) return;
             self.values.material = material;
             self.queueSet("gx-window-material", @tagName(material));
         },
+        .opacity => {
+            const choice = std.enums.values(settings_map.Opacity)[index];
+            self.values.opacity = choice;
+            if (choice.value()) |value| self.queueSet("background-opacity", value) else self.queueReset(keys_opacity);
+        },
+        .padding => {
+            const preset = std.enums.values(settings_map.Padding)[index];
+            self.values.padding = preset;
+            if (preset.values()) |values| {
+                for (settings_map.Padding.keys, values) |key, value| self.queueSet(key, value);
+            } else self.queueReset(keys_padding);
+        },
+        .cursor_style => {
+            const value = settings_map.cursor_style_choices[index].value;
+            self.values.cursor_style = value;
+            self.queueSet("cursor-style", @tagName(value));
+        },
         .close_confirmation => {
             const value = settings_map.close_confirmation_choices[index].value;
-            if (value == self.values.close_confirmation) return;
             self.values.close_confirmation = value;
             self.queueSet("confirm-close-surface", @tagName(value));
         },
@@ -1090,9 +1810,9 @@ fn setLanguage(self: *Settings, lang: i18n.Language) void {
     self.queueSet("language", lang.configValue());
 }
 
-fn setRightClickMenu(self: *Settings, on: bool) void {
-    // Without the menu, a right click copies the selection or pastes.
-    const action: Config.RightClickAction = if (on) .@"context-menu" else .@"copy-or-paste";
+fn setRightClick(self: *Settings, index: u8) void {
+    if (index >= settings_map.right_click_choices.len) return;
+    const action = settings_map.right_click_choices[index].value;
     if (action == self.values.right_click) return;
     self.values.right_click = action;
     self.queueSet("right-click-action", @tagName(action));
@@ -1104,6 +1824,24 @@ fn setScrollbar(self: *Settings, on: bool) void {
     self.queueSet("scrollbar", @tagName(settings_map.scrollbar(on)));
 }
 
+fn setSwitch(self: *Settings, action: Action, on: bool) void {
+    const item: settings_map.Switch = switch (action) {
+        .cursor_blink => settings_map.cursor_blink,
+        .focus_follows_mouse => settings_map.focus_follows_mouse,
+        .ctrl_scroll_zoom => settings_map.ctrl_scroll_zoom,
+        else => return,
+    };
+    const value: *bool = switch (action) {
+        .cursor_blink => &self.values.cursor_blink,
+        .focus_follows_mouse => &self.values.focus_follows_mouse,
+        .ctrl_scroll_zoom => &self.values.ctrl_scroll_zoom,
+        else => unreachable,
+    };
+    if (value.* == on) return;
+    value.* = on;
+    self.queueSet(item.key, settings_map.Switch.value(on));
+}
+
 fn setBell(self: *Settings, index: u8, on: bool) void {
     inline for (settings_map.bell_features, 0..) |feature, i| {
         if (i == index) @field(self.values.bell, feature.field) = on;
@@ -1113,38 +1851,68 @@ fn setBell(self: *Settings, index: u8, on: bool) void {
     self.queueSet("bell-features", value);
 }
 
-const Step = enum { minus, plus, reset };
+const Step = enum(u32) { minus, plus };
 
 fn stepFontSize(self: *Settings, step: Step) void {
     const FontSize = settings_map.FontSize;
-    const size: f32 = switch (step) {
+    self.setFontSize(switch (step) {
         .minus => FontSize.normalize(self.values.font_size - FontSize.step),
         .plus => FontSize.normalize(self.values.font_size + FontSize.step),
-        .reset => FontSize.default,
-    };
+    });
+}
+
+fn setFontSize(self: *Settings, size: f32) void {
     if (size == self.values.font_size) return;
     self.values.font_size = size;
     var buf: [32]u8 = undefined;
-    const value = FontSize.format(&buf, size) catch return;
+    const value = settings_map.FontSize.format(&buf, size) catch return;
     self.queueSet("font-size", value);
     self.invalidate();
 }
 
 fn applyFontFamily(self: *Settings) void {
-    const names = self.namesOf(.fonts);
+    const names = self.font_picker.names;
     const typed = std.mem.trim(u8, self.font_query.items, &std.ascii.whitespace);
     // The highlighted family, or what was typed when nothing matches.
     const family: []const u8 = if (self.font_list.current()) |index| names[index] else typed;
-    if (family.len == 0) return self.resetFontFamily();
+    if (family.len == 0) return self.resetRow(.{ .kind = .group, .keys = keys_font_family });
+    if (std.mem.eql(u8, family, self.font_family)) return;
+    // The settings file replaces the whole list: keep the fallbacks.
+    const families = settings_map.fontFamilies(self.alloc, family, self.app.config.@"font-family".list.items) catch return;
+    defer self.alloc.free(families);
     self.font_family = self.arena.allocator().dupe(u8, family) catch return;
-    self.queueSet("font-family", family);
+    self.queueSetAll("font-family", families);
     self.invalidate();
 }
 
-fn resetFontFamily(self: *Settings) void {
-    self.font_family = "";
-    self.queueSetAll("font-family", &.{});
-    self.invalidate();
+/// "Reset to Default": removes the keys of `row` from the settings file
+/// at once, so the row shows the value that applies then.
+fn resetRow(self: *Settings, row: Row) void {
+    if (row.keys.len == 0 or !self.overlaySets(row.keys)) return;
+    self.queueReset(row.keys);
+    if (std.mem.eql(u8, row.keys[0], "theme")) {
+        self.stopTimer(.preview);
+        self.preview_theme = null;
+        self.applied_preview = null;
+    }
+    _ = self.saveNow();
+}
+
+fn resetAll(self: *Settings) void {
+    if (!self.reset_all.press(system.nowMs())) return self.invalidate();
+    if (self.overlay_path.len == 0) return;
+    for ([_][]const []const u8{
+        keys_language,     keys_material, keys_opacity,             keys_padding,          keys_cursor_style,
+        keys_cursor_blink, keys_theme,    keys_font_size,           keys_font_family,      keys_right_click,
+        keys_scrollbar,    keys_close,    keys_focus_follows_mouse, keys_ctrl_scroll_zoom, keys_bell,
+        keys_command,
+    }) |keys| self.queueReset(keys);
+    self.stopTimer(.preview);
+    self.preview_theme = null;
+    self.applied_preview = null;
+    if (self.changes.isEmpty() or self.saveNow()) {
+        self.setStatus(.success, "Every setting made here was removed.", .{});
+    }
 }
 
 fn chooseShell(self: *Settings, index: u16) void {
@@ -1154,7 +1922,7 @@ fn chooseShell(self: *Settings, index: u16) void {
     if (shell.command) |command| {
         self.queueSet("command", command);
     } else {
-        self.queueSetAll("command", &.{});
+        self.queueReset(keys_command);
     }
     if (shell.gx_zsh) |exe| self.runHerdr(exe);
     self.invalidate();
@@ -1163,8 +1931,7 @@ fn chooseShell(self: *Settings, index: u16) void {
 fn openConfigFile(self: *Settings) void {
     // The editor path of `gx-open-config-ui = editor`.
     const opened = self.app.openConfigFile(.os_open) catch |err| {
-        self.setStatus(.err, msg.open_failed, .{ .reason = @errorName(err) });
-        return;
+        return self.setStatusReason(.err, msg.open_failed, err);
     };
     if (!opened) self.setStatus(.err, msg.open_failed, .{ .reason = "ShellExecute" });
 }
@@ -1196,29 +1963,28 @@ fn themeName(self: *Settings, index: u32) ?[:0]const u8 {
     return if (index < names.len) names[index] else null;
 }
 
-/// Previews the theme under the cursor, at most every
-/// `preview_interval_ms` while the cursor moves.
-fn schedulePreview(self: *Settings) void {
+/// Previews the theme under the cursor once it rests for the time
+/// `trigger` asks for (`model.previewDelayMs`): every move starts the wait
+/// again, so moving through the list previews where it stops.
+fn schedulePreview(self: *Settings, trigger: model.PreviewTrigger) void {
     if (!self.layered) return;
     const index = self.theme_list.current() orelse return;
     if (self.preview_theme == null and self.applied_preview == null and index == self.saved_theme) return;
     self.preview_theme = index;
-    if (self.timers.contains(.preview)) return;
-    const elapsed = system.nowMs() -| self.last_preview_ms;
-    const delay: u32 = if (elapsed >= preview_interval_ms) 10 else @intCast(preview_interval_ms - elapsed);
-    self.startTimer(.preview, delay);
+    self.stopTimer(.preview);
+    self.startTimer(.preview, model.previewDelayMs(trigger));
 }
 
 fn previewNow(self: *Settings) void {
-    self.last_preview_ms = system.nowMs();
     const index = self.preview_theme orelse return;
     if (self.applied_preview == index) return;
     const name = self.themeName(index) orelse return;
-    // Pending changes go to disk first so the preview keeps them.
-    self.commitChanges() catch {};
-    if (self.reloadWith(name)) {
+    const span: gx.perf.Span = .begin(global.io());
+    defer _ = span.end(global.io(), "settings_preview");
+    const saved = self.commitChanges();
+    if (self.applyConfig(name)) {
         self.applied_preview = index;
-        self.setStatus(.info, "Previewing {name}", .{ .name = name });
+        if (saved) self.setStatus(.info, "Previewing {name}", .{ .name = name });
     }
 }
 
@@ -1230,7 +1996,7 @@ fn applyTheme(self: *Settings) void {
     self.applied_preview = null;
     self.saved_theme = index;
     self.queueSet("theme", name);
-    self.saveNow();
+    _ = self.saveNow();
     self.invalidate();
 }
 
@@ -1242,6 +2008,19 @@ fn queueSet(self: *Settings, key: []const u8, value: []const u8) void {
     self.queueSetAll(key, &.{value});
 }
 
+/// "Reset to Default" of `keys` (`Changes.reset`): removes them from the
+/// settings file with the next save.
+fn queueReset(self: *Settings, keys: []const []const u8) void {
+    for (keys) |key| {
+        self.changes.reset(key) catch |err| {
+            log.warn("cannot record the reset of {s} err={}", .{ key, err });
+            continue;
+        };
+        self.followChange(key, &.{});
+    }
+    self.scheduleSave();
+}
+
 /// Records a change (an empty `values` removes `key` from the overlay)
 /// and saves it with the other changes of the next moment.
 fn queueSetAll(self: *Settings, key: []const u8, values: []const []const u8) void {
@@ -1249,100 +2028,160 @@ fn queueSetAll(self: *Settings, key: []const u8, values: []const []const u8) voi
         log.warn("cannot record the change of {s} err={}", .{ key, err });
         return;
     };
+    self.followChange(key, values);
+    self.scheduleSave();
+}
+
+/// The layers follow a change at once, so the rows show where values come
+/// from and previews keep it.
+fn followChange(self: *Settings, key: []const u8, values: []const []const u8) void {
+    const layers = self.layersPtr() orelse return;
+    layers.setOverlay(key, values) catch |err| {
+        log.warn("cannot follow the change of {s} err={}", .{ key, err });
+    };
+}
+
+fn scheduleSave(self: *Settings) void {
+    self.save_attempts = 0;
     self.stopTimer(.save);
     self.startTimer(.save, save_delay_ms);
 }
 
-/// Writes the recorded changes to the overlay file.
-fn commitChanges(self: *Settings) !void {
-    if (self.changes.isEmpty()) return;
-    const path = gx.config_layers.overlayPath(self.alloc) catch |err| {
-        log.warn("cannot locate {s} err={}", .{ gx.gui_settings.file_name, err });
-        self.changes.clear();
-        self.setStatus(.err, msg.save_failed, .{ .reason = @errorName(err) });
-        return err;
-    };
+/// Writes the recorded changes to the overlay file. On failure the
+/// changes stay, the reason shows and the save is tried again later.
+fn commitChanges(self: *Settings) bool {
+    if (self.changes.isEmpty()) return true;
+    const path = gx.config_layers.overlayPath(self.alloc) catch |err| return self.saveFailed(err);
     defer self.alloc.free(path);
-    self.changes.commit(self.alloc, global.io(), path) catch |err| {
-        log.warn("cannot save {s} err={}", .{ path, err });
-        self.changes.clear();
-        self.setStatus(.err, msg.save_failed, .{ .reason = @errorName(err) });
-        return err;
-    };
+    self.changes.commit(self.alloc, global.io(), path) catch |err| return self.saveFailed(err);
+    self.save_attempts = 0;
     log.info("saved the settings to {s}", .{path});
-}
-
-/// Saves the recorded changes and applies them.
-fn saveNow(self: *Settings) void {
-    self.stopTimer(.save);
-    if (self.changes.isEmpty()) return;
-    self.commitChanges() catch return;
-    const ok = if (self.applied_preview != null or self.preview_theme != null) ok: {
-        const index = self.preview_theme orelse self.applied_preview.?;
-        break :ok self.reloadWith(self.themeName(index));
-    } else self.reloadFromDisk();
-    if (ok) self.setStatus(.success, "Settings saved.", .{});
-}
-
-/// Reloads the configuration from disk and applies it, like
-/// `reload_config`.
-fn reloadFromDisk(self: *Settings) bool {
-    var config = Config.load(self.alloc) catch |err| {
-        log.warn("cannot reload the configuration err={}", .{err});
-        self.setStatus(.err, msg.reload_failed, .{ .reason = @errorName(err) });
-        return false;
-    };
-    defer config.deinit();
-    self.app.applyConfig(&config) catch |err| {
-        log.warn("cannot apply the configuration err={}", .{err});
-        self.setStatus(.err, msg.reload_failed, .{ .reason = @errorName(err) });
-        return false;
-    };
-    self.applied_preview = null;
-    self.configApplied();
     return true;
 }
 
-/// Loads the configuration with in-memory overrides, `theme` (if any) and
-/// no reload notification, and applies it without saving anything.
-fn reloadWith(self: *Settings, theme: ?[]const u8) bool {
+fn saveFailed(self: *Settings, err: anyerror) bool {
+    log.warn("cannot save the settings err={}", .{err});
+    self.save_attempts += 1;
+    self.setStatusReason(.err, msg.save_failed, err);
+    self.stopTimer(.save);
+    if (model.saveRetryDelayMs(self.save_attempts)) |delay| {
+        self.startTimer(.save, delay);
+    } else {
+        log.warn("gave up saving the settings after {d} attempts", .{self.save_attempts});
+    }
+    return false;
+}
+
+/// Saves the recorded changes and applies them. Returns whether the
+/// configuration with them applies now.
+fn saveNow(self: *Settings) bool {
+    self.stopTimer(.save);
+    if (self.changes.isEmpty()) return true;
+    if (!self.commitChanges()) return false;
+    const preview = self.preview_theme orelse self.applied_preview;
+    const ok = self.applyConfig(if (preview) |index| self.themeName(index) else null);
+    if (ok) self.setStatus(.success, "Settings saved.", .{});
+    return ok;
+}
+
+/// Builds the configuration (from the layers, else from the files) with
+/// `theme` as a preview override, applies it and shows its values. A
+/// preview has no reload notification and saves nothing.
+fn applyConfig(self: *Settings, theme: ?[]const u8) bool {
+    const preview = theme != null;
     var quiet_buf: [128]u8 = undefined;
-    const quiet = settings_map.quietReloadArg(&quiet_buf, self.notifications) catch |err| {
-        self.setStatus(.err, msg.preview_failed, .{ .reason = @errorName(err) });
-        return false;
-    };
-    var args: [2][:0]const u8 = .{ quiet, undefined };
-    var len: usize = 1;
+    var args: [2][:0]const u8 = undefined;
+    var len: usize = 0;
     var theme_arg: ?[:0]u8 = null;
     defer if (theme_arg) |arg| self.alloc.free(arg);
     if (theme) |name| {
-        theme_arg = settings_map.themeArg(self.alloc, name) catch |err| {
-            self.setStatus(.err, msg.preview_failed, .{ .reason = @errorName(err) });
-            return false;
-        };
+        args[0] = settings_map.quietReloadArg(&quiet_buf, self.notifications) catch |err| return self.applyFailed(preview, err);
+        theme_arg = settings_map.themeArg(self.alloc, name) catch |err| return self.applyFailed(preview, err);
         args[1] = theme_arg.?;
         len = 2;
     }
-    var config = gx.config_layers.loadWithOverrides(self.alloc, args[0..len]) catch |err| {
-        log.warn("cannot load the configuration err={}", .{err});
-        self.setStatus(.err, msg.preview_failed, .{ .reason = @errorName(err) });
-        return false;
-    };
+    self.followReload();
+    var config = self.buildConfig(args[0..len]) catch |err| return self.applyFailed(preview, err);
     defer config.deinit();
-    self.app.applyConfig(&config) catch |err| {
-        log.warn("cannot apply the configuration err={}", .{err});
-        self.setStatus(.err, msg.preview_failed, .{ .reason = @errorName(err) });
-        return false;
-    };
-    self.configApplied();
+    self.applying = true;
+    defer self.applying = false;
+    self.app.applyConfig(&config) catch |err| return self.applyFailed(preview, err);
+    self.applied_inputs = inputsDigest(&self.app.config);
+    if (!preview) self.applied_preview = null;
+    self.configApplied(preview);
     return true;
 }
 
-/// The application now runs with a new configuration: follow its colors
-/// and language.
-fn configApplied(self: *Settings) void {
-    const t = self.tokens();
-    self.popup.setBorderColor(t.border);
+/// Reads the layers again when something else applied a configuration
+/// (`reload_config`) since the overlay did, so a save or a preview does not
+/// undo it. The changes not saved yet are kept.
+fn followReload(self: *Settings) void {
+    const layers = self.layersPtr() orelse return;
+    if (inputsDigest(&self.app.config) == self.applied_inputs) return;
+    log.info("the configuration was replaced, reading its layers again", .{});
+    var fresh = App.loadLayers(self.alloc) catch |err| {
+        log.warn("cannot read the configuration layers again err={}", .{err});
+        return;
+    };
+    self.changes.applyToLayers(&fresh) catch |err| {
+        log.warn("cannot keep the unsaved settings err={}", .{err});
+    };
+    layers.deinit();
+    self.layers = fresh;
+}
+
+/// A digest of the recorded inputs of `config`: the same for a
+/// configuration built from the same inputs.
+fn inputsDigest(config: *const Config) u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    for (config._replay_steps.items) |step| {
+        hasher.update(@tagName(step));
+        switch (step) {
+            .arg => |arg| hasher.update(arg),
+            .conditional_arg => |conditional| hasher.update(conditional.arg),
+            else => {},
+        }
+        hasher.update(&.{0});
+    }
+    return hasher.final();
+}
+
+/// The configuration with `overrides`: built from the layers, else read
+/// from the files.
+fn buildConfig(self: *Settings, overrides: []const [:0]const u8) !Config {
+    const blink = App.sampleSystemCursorBlink();
+    if (self.layersPtr()) |layers| {
+        _ = layers.setSystemCursorBlink(blink);
+        return try layers.build(self.alloc, overrides);
+    }
+    if (overrides.len > 0) return try gx.config_layers.loadWithOverrides(self.alloc, overrides);
+    return try Config.load(self.alloc);
+}
+
+fn applyFailed(self: *Settings, preview: bool, err: anyerror) bool {
+    log.warn("cannot apply the configuration err={}", .{err});
+    if (preview) {
+        self.setStatusReason(.err, msg.preview_failed, err);
+    } else {
+        self.setStatusReason(.err, msg.reload_failed, err);
+    }
+    return false;
+}
+
+fn configApplied(self: *Settings, preview: bool) void {
+    const config = &self.app.config;
+    self.popup.applyTheme(self.tokens());
+    self.popup.setAccessibleName(i18n.tr(msg.settings));
+    self.values = .fromConfig(config, self.layersPtr());
+    self.font_family = self.configuredFamily(self.arena.allocator());
+    self.updateFontPicker();
+    if (!preview) {
+        self.notifications = config.@"app-notifications";
+        self.saved_theme = self.configuredTheme(config);
+        if (self.saved_theme) |saved| {
+            if (self.theme_list.current() == null) self.theme_list.select(saved);
+        }
+    }
     self.invalidate();
 }
 
@@ -1360,24 +2199,26 @@ fn runHerdr(self: *Settings, gx_zsh: []const u8) void {
         (if (self.herdr_exe) |exe| self.alloc.dupe(u8, exe) catch return else return);
     defer self.alloc.free(herdr);
     self.herdr_run = system.HerdrRun.start(self.alloc, herdr, gx_zsh) catch |err| {
-        self.setStatus(.err, msg.herdr_failed, .{ .reason = @errorName(err) });
+        self.setStatusReason(.err, msg.herdr_failed, err);
         return;
     };
     log.info("running {s} --gx-set-default-shell {s}", .{ herdr, gx_zsh });
     self.startTimer(.herdr, herdr_poll_ms);
 }
 
-fn pollHerdr(self: *Settings) void {
+/// Checks a running herdr; true when it finished (and the status line
+/// changed).
+fn pollHerdr(self: *Settings) bool {
     var run = self.herdr_run orelse {
         self.stopTimer(.herdr);
-        return;
+        return false;
     };
     // Report after the shell choice is saved, so its status does not hide
     // the result.
-    if (self.timers.contains(.save)) return;
+    if (self.timers.contains(.save)) return false;
     switch (run.poll()) {
         .running => {
-            if (system.nowMs() -| run.started_ms < herdr_timeout_ms) return;
+            if (system.nowMs() -| run.started_ms < herdr_timeout_ms) return false;
             log.warn("herdr --gx-set-default-shell did not finish", .{});
             self.setStatus(.err, msg.herdr_failed, .{ .reason = "timeout" });
         },
@@ -1394,6 +2235,7 @@ fn pollHerdr(self: *Settings) void {
     run.deinit();
     self.herdr_run = null;
     self.stopTimer(.herdr);
+    return true;
 }
 
 // -----------------------------------------------------------------------
@@ -1404,6 +2246,8 @@ const Timer = enum(usize) {
     save = 1,
     preview = 2,
     herdr = 3,
+    /// Reads the swatches a paint left out and of the next page.
+    prefetch = 4,
 };
 
 fn startTimer(self: *Settings, timer: Timer, ms: u32) void {
@@ -1426,15 +2270,78 @@ fn timerProc(hwnd: ?w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void 
     switch (timer) {
         .save => {
             self.stopTimer(.save);
-            self.saveNow();
+            _ = self.saveNow();
         },
         .preview => {
             self.stopTimer(.preview);
             self.previewNow();
         },
-        .herdr => self.pollHerdr(),
+        .herdr => if (self.pollHerdr()) self.invalidate(),
+        .prefetch => {
+            self.stopTimer(.prefetch);
+            if (self.prefetchSwatches()) self.invalidate();
+        },
     }
-    self.invalidate();
+}
+
+/// Reads the swatches of the themes on display and of the pages above and
+/// below; true when it read any.
+fn prefetchSwatches(self: *Settings) bool {
+    if (!self.open or self.section != .appearance) return false;
+    const names = self.namesOf(.themes);
+    const matches = self.theme_list.matches.items;
+    const visible = @max(self.theme_list.visible, 1);
+    const start = self.theme_list.top -| visible;
+    const end = @min(matches.len, self.theme_list.top + 2 * visible);
+    var read = false;
+    for (matches[start..end]) |index| {
+        if (index >= names.len or self.swatches.map.contains(index)) continue;
+        _ = self.swatches.get(self.alloc, global.io(), self.theme_dirs, index, names[index]);
+        read = true;
+    }
+    self.swatches_pending = false;
+    return read;
+}
+
+/// Timers the popup gets as WM_TIMER: the tooltip delay.
+fn onPopupTimer(ctx: *anyopaque, popup: *Popup, id: usize) void {
+    const self: *Settings = @ptrCast(@alignCast(ctx));
+    const hwnd = popup.hwnd orelse return;
+    if (!self.tooltip.delayElapsed(hwnd, id)) return;
+    const text: []const u8 = switch (self.tooltip.target) {
+        .none => return,
+        .close => i18n.tr("Close"),
+        .reset => i18n.tr(msg.reset_to_default),
+    };
+    const hover = self.hover orelse return;
+    const rect = self.hitRect(hover) orelse return;
+    var window_rect: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &window_rect) == 0) return;
+    const s = popup.scale();
+    const anchor: w32.RECT = .{
+        .left = window_rect.left + style.px(rect.x, s),
+        .top = window_rect.top + style.px(rect.y, s),
+        .right = window_rect.left + style.px(rect.x + rect.w, s),
+        .bottom = window_rect.top + style.px(rect.y + rect.h, s),
+    };
+    self.tooltip.show(self.app, hwnd, self.window.scale, text, anchor);
+}
+
+fn onRepeat(ctx: *anyopaque, popup: *Popup, tag: u32) void {
+    const self: *Settings = @ptrCast(@alignCast(ctx));
+    _ = popup;
+    const step = std.enums.fromInt(Step, tag) orelse return;
+    self.stepFontSize(step);
+}
+
+fn onMessage(ctx: *anyopaque, popup: *Popup, message: u32, wparam: usize, lparam: isize) bool {
+    const self: *Settings = @ptrCast(@alignCast(ctx));
+    _ = popup;
+    _ = wparam;
+    _ = lparam;
+    if (message != WM_FONTS_READY) return false;
+    self.onFontsReady();
+    return true;
 }
 
 // -----------------------------------------------------------------------
@@ -1451,6 +2358,22 @@ fn setStatus(self: *Settings, kind: StatusKind, comptime msgid: [:0]const u8, ar
     self.invalidate();
 }
 
+/// `setStatus` with the translated reason of `err` as `{reason}`.
+fn setStatusReason(self: *Settings, kind: StatusKind, comptime msgid: [:0]const u8, err: anyerror) void {
+    self.setStatus(kind, msgid, .{ .reason = i18n.trRuntime(errorMessage(err)) });
+}
+
+fn errorMessage(err: anyerror) [:0]const u8 {
+    const reason = settings_map.errorReason(err);
+    return if (std.mem.eql(u8, reason, @errorName(err))) "An unexpected error occurred." else reason;
+}
+
+test "settings errors keep known reasons and localize unknown errors" {
+    try std.testing.expectEqualStrings("Permission denied.", errorMessage(error.PermissionDenied));
+    try std.testing.expectEqualStrings("The file is in use by another program.", errorMessage(error.SharingViolation));
+    try std.testing.expectEqualStrings("An unexpected error occurred.", errorMessage(error.Unexpected));
+}
+
 fn clearStatus(self: *Settings) void {
     self.status_kind = .none;
     self.status_len = 0;
@@ -1462,13 +2385,18 @@ fn clearStatus(self: *Settings) void {
 
 const Target = union(enum) {
     section: Section,
+    search,
     close,
     row: u16,
     chip: struct { row: u16, index: u8 },
     step: struct { row: u16, step: Step },
+    /// The font size field.
+    value: u16,
     item: struct { row: u16, index: u32 },
     field: u16,
-    group_button: GroupButton,
+    group_button: struct { row: u16, button: GroupButton },
+    /// The reset button of a setting row.
+    reset: u16,
 };
 
 const Hit = struct {
@@ -1492,9 +2420,46 @@ fn hitAt(self: *const Settings, pos: d2d.Point) ?Target {
     return null;
 }
 
+fn hitRect(self: *const Settings, target: Target) ?d2d.Rect {
+    var i = self.hit_count;
+    while (i > 0) {
+        i -= 1;
+        if (std.meta.eql(self.hits[i].target, target)) return self.hits[i].rect;
+    }
+    return null;
+}
+
 fn isHover(self: *const Settings, target: Target) bool {
     const hover = self.hover orelse return false;
     return std.meta.eql(hover, target);
+}
+
+/// The state `target` draws in: pressed while the button that went down
+/// on it is still down over it.
+fn stateOf(self: *const Settings, target: Target, enabled: bool) draw.State {
+    if (!enabled) return .{ .disabled = true };
+    const hover = self.isHover(target);
+    const pressed = if (self.pressed) |p| std.meta.eql(p, target) else false;
+    return .{ .hover = hover, .pressed = hover and pressed };
+}
+
+fn setHover(self: *Settings, target: ?Target) void {
+    const same = if (target) |t| self.isHover(t) else self.hover == null;
+    if (same) return;
+    self.hover = target;
+    self.updateTooltip();
+    self.invalidate();
+}
+
+fn updateTooltip(self: *Settings) void {
+    const hwnd = self.popup.hwnd orelse return;
+    const tip: Tip = if (self.hover) |hover| switch (hover) {
+        .close => .close,
+        .reset => |row| .{ .reset = row },
+        .group_button => |button| if (button.button == .reset) .{ .reset = button.row } else .none,
+        else => .none,
+    } else .none;
+    self.tooltip.setTarget(hwnd, tip);
 }
 
 fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
@@ -1504,11 +2469,69 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
         return true;
     }
     if (key.alt) return false;
+    self.tooltip.hide();
+    if (key.vk == w32.VK_F6 or (key.ctrl and key.vk == 'F')) {
+        self.focusSearch(true);
+        return true;
+    }
+    if (self.text_field == .search) {
+        switch (key.vk) {
+            w32.VK_LEFT, w32.VK_RIGHT, w32.VK_HOME, w32.VK_END, w32.VK_BACK, w32.VK_DELETE, w32.VK_SPACE => return false,
+            w32.VK_RETURN => {
+                var buf: [max_rows]Row = undefined;
+                const rows = self.buildRows(&buf);
+                if (self.searching() and self.focus < rows.len) self.activate(rows[self.focus]);
+                return true;
+            },
+            w32.VK_UP, w32.VK_DOWN => if (!self.searching()) {
+                self.text_field = null;
+                self.popup.input.clear();
+                self.syncTextField();
+                self.focus_visible = true;
+                self.invalidate();
+                return true;
+            },
+            else => {},
+        }
+    }
+
+    if (self.text_field == .font_size) {
+        switch (key.vk) {
+            w32.VK_RETURN => {
+                self.endSizeEdit(true);
+                self.focus_visible = true;
+                return true;
+            },
+            w32.VK_ESCAPE => {
+                self.endSizeEdit(false);
+                return true;
+            },
+            w32.VK_UP, w32.VK_DOWN, w32.VK_TAB, w32.VK_PRIOR, w32.VK_NEXT => self.endSizeEdit(true),
+            else => return false,
+        }
+    }
+    if (key.vk == w32.VK_ESCAPE) {
+        // A filter box with text: clear it first.
+        if (self.text_field) |field| {
+            if (self.queryOf(field).items.len > 0) {
+                self.clearQuery(field);
+                return true;
+            }
+        }
+        if (self.reset_all.armed(system.nowMs())) {
+            self.reset_all.cancel();
+            self.invalidate();
+            return true;
+        }
+        return false;
+    }
     if (key.vk == w32.VK_TAB) {
+        self.focus_visible = true;
         self.cycleSection(if (key.shift) -1 else 1);
         return true;
     }
     if (key.ctrl and (key.vk == w32.VK_NEXT or key.vk == w32.VK_PRIOR)) {
+        self.focus_visible = true;
         self.cycleSection(if (key.vk == w32.VK_NEXT) 1 else -1);
         return true;
     }
@@ -1516,20 +2539,18 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
     if (rows.len == 0) return false;
-    if (self.focus >= rows.len or !rows[self.focus].kind.focusable()) self.focus = self.defaultFocus(rows);
+    if (self.focus >= rows.len or !rows[self.focus].focusable()) self.focus = self.defaultFocus(rows);
     const row = rows[self.focus];
-    const list: ?*List = switch (row.action) {
-        .themes => &self.theme_list,
-        .font_family => &self.font_list,
-        else => null,
-    };
+    const field = listField(row.action);
+    const list: ?*List = if (field) |f| self.listOf(f) else null;
 
     switch (key.vk) {
         w32.VK_UP, w32.VK_DOWN => {
+            self.focus_visible = true;
             const delta: isize = if (key.vk == w32.VK_UP) -1 else 1;
             if (list) |l| {
                 if (l.move(delta)) {
-                    if (row.action == .themes) self.schedulePreview();
+                    if (field == .themes) self.schedulePreview(.navigate);
                     self.invalidate();
                     return true;
                 }
@@ -1538,18 +2559,29 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
             return true;
         },
         w32.VK_PRIOR, w32.VK_NEXT => {
-            const l = list orelse return true;
-            const page: isize = @intCast(@max(l.visible, 2) - 1);
-            if (l.move(if (key.vk == w32.VK_PRIOR) -page else page) and row.action == .themes) self.schedulePreview();
-            self.invalidate();
+            self.focus_visible = true;
+            const up = key.vk == w32.VK_PRIOR;
+            if (list) |l| {
+                const page: isize = @intCast(@max(l.visible, 2) - 1);
+                if (l.move(if (up) -page else page) and field == .themes) self.schedulePreview(.navigate);
+                self.invalidate();
+                return true;
+            }
+            const page = @max(body_line, self.body_view - body_line);
+            self.scrollBody(if (up) -page else page);
             return true;
         },
         w32.VK_HOME, w32.VK_END => {
-            const l = list orelse return false;
-            if (!key.ctrl) return false;
-            const far: isize = @intCast(l.matches.items.len);
-            if (l.move(if (key.vk == w32.VK_HOME) -far else far) and row.action == .themes) self.schedulePreview();
-            self.invalidate();
+            const home = key.vk == w32.VK_HOME;
+            if (list) |l| {
+                if (!key.ctrl) return false;
+                const far: isize = @intCast(l.matches.items.len);
+                if (l.move(if (home) -far else far) and field == .themes) self.schedulePreview(.navigate);
+                self.invalidate();
+                return true;
+            }
+            self.focus_visible = true;
+            self.scrollBody(if (home) -std.math.floatMax(f32) else std.math.floatMax(f32) / 2);
             return true;
         },
         w32.VK_LEFT, w32.VK_RIGHT => {
@@ -1558,18 +2590,28 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
                 .choice => self.stepChoice(row, if (right) 1 else -1),
                 .toggle => if (row.on != right) self.activate(row),
                 .stepper => self.stepFontSize(if (right) .plus else .minus),
+                .group => {
+                    if (right and self.focus_button + 1 < row.buttons.len) self.focus_button += 1;
+                    if (!right and self.focus_button > 0) self.focus_button -= 1;
+                },
                 else => return false,
             }
+            self.focus_visible = true;
             self.invalidate();
             return true;
         },
-        w32.VK_RETURN => {
-            self.activate(row);
-            return true;
-        },
-        w32.VK_SPACE => {
-            if (row.kind == .list) return false;
-            self.activate(row);
+        w32.VK_RETURN, w32.VK_SPACE => {
+            if (key.vk == w32.VK_SPACE and row.kind == .list) return false;
+            self.focus_visible = true;
+            switch (row.kind) {
+                .group => {
+                    if (row.buttons.len == 0) return false;
+                    self.activateGroupButton(row, row.buttons[@min(self.focus_button, row.buttons.len - 1)]);
+                },
+                // Enter types the font size.
+                .stepper => if (key.vk == w32.VK_RETURN) self.beginSizeEdit(row.value, true),
+                else => self.activate(row),
+            }
             return true;
         },
         w32.VK_OEM_PLUS, w32.VK_ADD, w32.VK_OEM_MINUS, w32.VK_SUBTRACT => {
@@ -1578,51 +2620,116 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
             self.stepFontSize(if (plus) .plus else .minus);
             return true;
         },
-        w32.VK_BACK, w32.VK_DELETE => {
+        w32.VK_F2 => {
             if (row.kind != .stepper) return false;
-            self.stepFontSize(.reset);
+            self.beginSizeEdit(row.value, true);
+            return true;
+        },
+        w32.VK_BACK, w32.VK_DELETE => {
+            if (row.kind == .list or (key.vk == w32.VK_BACK and row.kind != .stepper)) return false;
+            self.resetRow(row);
             return true;
         },
         else => return false,
     }
 }
 
+fn clearQuery(self: *Settings, field: Field) void {
+    self.queryOf(field).clearRetainingCapacity();
+    self.popup.input.clear();
+    self.refilter(field);
+    switch (field) {
+        .themes => if (self.preview_theme orelse self.saved_theme) |index| self.theme_list.select(index),
+        .fonts, .font_size => if (self.font_picker.indexOf(self.font_family)) |index| self.font_list.select(index),
+        .search => {
+            var buf: [max_rows]Row = undefined;
+            self.focus = self.defaultFocus(self.buildRows(&buf));
+        },
+    }
+    self.invalidate();
+}
+
 fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
     const self: *Settings = @ptrCast(@alignCast(ctx));
-    _ = popup;
     switch (event.kind) {
         .move => {
-            const target = self.hitAt(event.pos);
-            const changed = if (target) |t| !self.isHover(t) else self.hover != null;
-            if (changed) {
-                self.hover = target;
-                self.invalidate();
-            }
+            self.pointer = event.pos;
+            self.setHover(self.hitAt(event.pos));
+            // A held size button repeats only while the pointer is on it.
+            if (self.pressed) |pressed| if (pressed == .step and !self.isHover(pressed)) popup.stopRepeat();
         },
-        .leave => if (self.hover != null) {
-            self.hover = null;
-            self.invalidate();
+        .leave => {
+            self.pointer = null;
+            self.setHover(null);
+            popup.stopRepeat();
         },
         .down, .double_click => {
             if (event.button != .left) return;
             if (system.nowMs() -| self.opened_ms < click_guard_ms) return;
-            const target = self.hitAt(event.pos) orelse return;
-            if (event.kind == .double_click) {
-                if (target == .item) {
-                    self.click(target);
-                    var buf: [max_rows]Row = undefined;
-                    const rows = self.buildRows(&buf);
-                    if (target.item.row < rows.len) self.activate(rows[target.item.row]);
-                    return;
-                }
-            }
-            self.click(target);
+            self.focus_visible = false;
+            self.tooltip.hide();
+            const target = self.hitAt(event.pos) orelse {
+                self.endSizeEdit(true);
+                return self.invalidate();
+            };
+            self.press(popup, target, event.kind == .double_click);
         },
-        .up => {},
+        .up => {
+            if (event.button != .left) return;
+            popup.stopRepeat();
+            const pressed = self.pressed orelse return;
+            self.pressed = null;
+            if (popup.hwnd) |hwnd| if (w32.GetCapture() == hwnd) {
+                _ = w32.ReleaseCapture();
+            };
+            if (self.hitAt(event.pos)) |target| {
+                if (std.meta.eql(target, pressed)) self.click(pressed);
+            }
+            self.invalidate();
+        },
         .wheel => self.wheel(event.pos, event.wheel),
     }
 }
 
+/// The left button went down on `target`: list items, filter boxes and
+/// the size buttons act now, everything else when it goes up over it.
+fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildRows(&buf);
+    switch (target) {
+        .search => self.focusSearch(false),
+        .item => |item| {
+            if (item.row >= rows.len) return;
+            self.focusRow(item.row);
+            const field = listField(rows[item.row].action) orelse return;
+            const list = self.listOf(field);
+            if (item.index >= list.matches.items.len) return;
+            list.cursor = item.index;
+            if (double) return self.activate(rows[item.row]);
+            if (field == .themes) self.schedulePreview(.click);
+        },
+        .field => |i| self.focusRow(i),
+        .value => |i| {
+            if (self.text_field == .font_size or i >= rows.len) return;
+            self.focusRow(i);
+            self.beginSizeEdit(rows[i].value, true);
+        },
+        .step => |step| {
+            if (step.row >= rows.len) return;
+            self.focusRow(step.row);
+            self.stepFontSize(step.step);
+            self.pressed = target;
+            popup.startRepeat(@intFromEnum(step.step));
+        },
+        else => {
+            self.pressed = target;
+            if (popup.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
+        },
+    }
+    self.invalidate();
+}
+
+/// The left button went up over `target`, where it went down.
 fn click(self: *Settings, target: Target) void {
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
@@ -1630,19 +2737,18 @@ fn click(self: *Settings, target: Target) void {
         .section => |section| return self.enterSection(section),
         .close => return self.popup.dismiss(.owner),
         .group_button => |button| {
-            switch (button) {
-                .apply_theme => self.applyTheme(),
-                .apply_font => self.applyFontFamily(),
-                .reset_font => self.resetFontFamily(),
-            }
-            self.invalidate();
-            return;
+            if (button.row >= rows.len) return;
+            self.focusRow(button.row);
+            const row = rows[button.row];
+            if (std.mem.indexOfScalar(GroupButton, row.buttons, button.button)) |index| self.focus_button = index;
+            self.activateGroupButton(row, button.button);
         },
+        .reset => |i| if (i < rows.len) self.resetRow(rows[i]),
         .row => |i| {
             if (i >= rows.len) return;
             self.focusRow(i);
             switch (rows[i].kind) {
-                .radio, .toggle, .button => self.activate(rows[i]),
+                .radio, .toggle, .button, .result => self.activate(rows[i]),
                 else => {},
             }
         },
@@ -1651,49 +2757,46 @@ fn click(self: *Settings, target: Target) void {
             self.focusRow(chip.row);
             self.setChoice(rows[chip.row], chip.index);
         },
-        .step => |step| {
-            if (step.row >= rows.len) return;
-            self.focusRow(step.row);
-            self.stepFontSize(step.step);
-        },
-        .item => |item| {
-            if (item.row >= rows.len) return;
-            self.focusRow(item.row);
-            const list: *List = switch (rows[item.row].action) {
-                .themes => &self.theme_list,
-                .font_family => &self.font_list,
-                else => return,
-            };
-            if (item.index >= list.matches.items.len) return;
-            list.cursor = item.index;
-            if (rows[item.row].action == .themes) self.schedulePreview();
-        },
-        .field => |i| self.focusRow(i),
+        .step, .value, .item, .field, .search => {},
     }
     self.invalidate();
 }
 
 fn focusRow(self: *Settings, index: usize) void {
+    if (self.focus != index) self.focus_button = 0;
     self.focus = index;
     self.syncTextField();
 }
 
+/// The list of the section, if it has one.
+fn sectionList(self: *Settings) ?*List {
+    return switch (self.section) {
+        .appearance => &self.theme_list,
+        .font => &self.font_list,
+        else => null,
+    };
+}
+
 fn wheel(self: *Settings, pos: d2d.Point, notches: f32) void {
+    self.tooltip.hide();
+    const wheel_setting = system.wheelScrollLines();
     if (self.list_area) |area| {
         if (area.contains(pos)) {
-            const field: Field = if (self.section == .font) .fonts else .themes;
-            const list = self.listOf(field);
-            const len = list.matches.items.len;
-            const max_top = len -| list.visible;
-            const delta: isize = @intFromFloat(@round(-notches * 3));
-            const top: isize = @as(isize, @intCast(list.top)) + delta;
-            list.top = @intCast(std.math.clamp(top, 0, @as(isize, @intCast(max_top))));
-            list.reveal = false;
-            self.invalidate();
-            return;
+            if (self.sectionList()) |list| {
+                const page: f32 = @floatFromInt(@max(list.visible, 2) - 1);
+                const lines = self.wheel_lines.lines(notches, model.wheelLines(wheel_setting, page));
+                if (lines == 0) return;
+                if (list.scroll(lines)) return self.invalidate();
+                // At the end of the list the page scrolls on.
+            }
         }
     }
-    self.body_scroll = @max(0, self.body_scroll - notches * 96);
+    const page_lines = @max(1, self.body_view / body_line - 1);
+    self.scrollBody(-notches * model.wheelLines(wheel_setting, page_lines) * body_line);
+}
+
+fn scrollBody(self: *Settings, delta: f32) void {
+    self.body_scroll = @max(0, self.body_scroll + delta);
     self.reveal_focus = false;
     self.invalidate();
 }
@@ -1731,6 +2834,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     self.hit_count = 0;
     self.hit_clip = null;
     self.list_area = null;
+    self.popup.input.field = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     const t = self.tokens();
     const size = popup.sizeDip();
     const w = size.width;
@@ -1751,6 +2855,18 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
         .w = @max(0, w - sidebar_width),
         .h = footer_height,
     });
+
+    // What is under the pointer may have moved (scrolling, a new section).
+    if (self.pointer) |pos| {
+        const target = self.hitAt(pos);
+        const same = if (target) |hit| self.isHover(hit) else self.hover == null;
+        if (!same) {
+            self.hover = target;
+            self.updateTooltip();
+            self.invalidate();
+        }
+    }
+    if (self.swatches_pending and !self.timers.contains(.prefetch)) self.startTimer(.prefetch, 15);
 }
 
 fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) void {
@@ -1764,21 +2880,37 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
         .color = t.text,
     });
 
-    var y: f32 = 64;
+    const search: d2d.Rect = .{ .x = 10, .y = 58, .w = sidebar_width - 20, .h = field_height };
+    if (self.text_field == .search) {
+        self.popup.drawTextInputEx(canvas, search, t, .{ .placeholder = i18n.tr("Search settings…"), .focused = true });
+    } else {
+        canvas.fillRoundedRect(search, 4, t.surface_raised);
+        canvas.strokeRoundedRect(search, 4, t.border, 1);
+        canvas.drawText(i18n.tr("Search settings…"), search.inset(style.metrics.padding_x, 0), .{
+            .size = style.font_size.body,
+            .color = t.text_placeholder,
+        });
+    }
+    self.addHit(search, .search);
+
+    var y: f32 = 104;
     for (std.enums.values(Section)) |section| {
         const item: d2d.Rect = .{ .x = 10, .y = y, .w = sidebar_width - 20, .h = 36 };
-        const selected = section == self.section;
+        const selected = section == self.section and !self.searching();
+        const state = self.stateOf(.{ .section = section }, true);
         if (selected) {
             canvas.fillRoundedRect(item, 4, t.selected);
             canvas.fillRoundedRect(.{ .x = item.x, .y = item.y + 10, .w = 3, .h = 16 }, 1.5, t.accent);
-        } else if (self.isHover(.{ .section = section })) {
+        } else if (state.pressed) {
+            canvas.fillRoundedRect(item, 4, t.pressed);
+        } else if (state.hover) {
             canvas.fillRoundedRect(item, 4, t.hover);
         }
-        canvas.drawIcon(section.icon(), .{ .x = item.x + 12, .y = item.y, .w = 18, .h = item.h }, 15, if (selected) t.accent else t.text_secondary);
-        canvas.drawText(section.title(), .{ .x = item.x + 40, .y = item.y, .w = item.w - 48, .h = item.h }, .{
+        canvas.drawIcon(sectionIcon(section), .{ .x = item.x + 12, .y = item.y, .w = 18, .h = item.h }, 15, if (selected) t.accent else t.text_secondary);
+        canvas.drawText(sectionTitle(section), .{ .x = item.x + 40, .y = item.y, .w = item.w - 48, .h = item.h }, .{
             .size = style.font_size.body,
             .weight = if (selected) .semibold else .normal,
-            .color = t.text,
+            .color = if (selected) t.selected_text else t.text,
         });
         self.addHit(item, .{ .section = section });
         y += 40;
@@ -1786,14 +2918,14 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
 }
 
 fn paintHeader(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, w: f32) void {
-    canvas.drawText(self.section.title(), .{
+    canvas.drawText(if (self.searching()) i18n.tr("Search Settings") else sectionTitle(self.section), .{
         .x = sidebar_width + content_pad,
         .y = 16,
         .w = @max(0, w - sidebar_width - content_pad - 64),
         .h = 34,
     }, .{ .size = style.font_size.subtitle, .weight = .semibold, .color = t.text });
-    const close: d2d.Rect = .{ .x = w - 16 - 34, .y = 16, .w = 34, .h = 34 };
-    draw.button(canvas, close, "", draw.icons.close, .subtle, true, self.isHover(.close), t);
+    const close: d2d.Rect = .{ .x = w - 16 - style.close_button.size, .y = 17, .w = style.close_button.size, .h = style.close_button.size };
+    draw.iconButton(canvas, close, d2d.icons.cancel, self.stateOf(.close, true), t);
     self.addHit(close, .close);
 }
 
@@ -1801,7 +2933,7 @@ fn paintFooter(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, rect: d2d.
     canvas.fillRect(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = 1 }, t.border);
     var text_style: d2d.TextStyle = .{ .size = style.font_size.caption, .color = t.text_secondary };
     const text: []const u8 = switch (self.status_kind) {
-        .none => i18n.tr(msg.changes_saved),
+        .none => if (self.font_loader != null and self.section == .font) i18n.tr("Loading font families…") else i18n.tr(msg.changes_saved),
         else => self.status_buf[0..self.status_len],
     };
     switch (self.status_kind) {
@@ -1810,94 +2942,87 @@ fn paintFooter(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, rect: d2d.
         .err => text_style.color = draw.errorColor(t),
     }
 
-    // A message that does not fit next to the key hints takes the whole
-    // line, wrapped.
+    const esc = if (self.text_field) |field|
+        if (field != .font_size and self.queryOf(field).items.len > 0) i18n.tr("Clear Search") else i18n.tr("Close")
+    else
+        i18n.tr("Close");
+    const hints = [_]struct { []const u8, []const u8 }{
+        .{ if (self.searching()) "Enter" else "Tab", if (self.searching()) i18n.tr("Open") else i18n.tr("Switch Section") },
+        .{ "Esc", esc },
+    };
+    var hints_w: f32 = 0;
+    var widths: [hints.len]f32 = undefined;
+    for (hints, &widths, 0..) |hint, *width, i| {
+        width.* = draw.keyHintWidth(canvas, &self.measurements, hint[0], hint[1]);
+        hints_w += width.* + if (i > 0) @as(f32, 16) else 0;
+    }
+
     const full_w = @max(0, rect.w - 2 * content_pad);
-    const hints_w = self.paintKeyHints(canvas, t, rect, false) + 16;
-    const fits = canvas.measureText(text, text_style, 10_000).width <= full_w - hints_w;
+    const fits = self.measurements.measure(canvas, text, text_style, 10_000).width <= full_w - hints_w - 16;
     if (!fits) text_style.wrap = true;
     canvas.drawText(text, .{
         .x = rect.x + content_pad,
         .y = rect.y + 1,
-        .w = if (fits) full_w - hints_w else full_w,
+        .w = if (fits) full_w - hints_w - 16 else full_w,
         .h = rect.h - 1,
     }, text_style);
-    if (fits) _ = self.paintKeyHints(canvas, t, rect, true);
+    if (!fits) return;
+    var x = rect.x + rect.w - content_pad - hints_w;
+    for (hints, widths) |hint, width| {
+        _ = draw.keyHint(canvas, &self.measurements, x, rect.y, rect.h, hint[0], hint[1], t);
+        x += width + 16;
+    }
 }
 
-/// The key hints at the right of the footer; returns their width and
-/// draws them when `visible`.
-fn paintKeyHints(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, rect: d2d.Rect, visible: bool) f32 {
-    _ = self;
-    const hints = [_]struct { []const u8, []const u8 }{
-        .{ "Tab", i18n.tr("Switch Section") },
-        .{ "Esc", i18n.tr("Close") },
-    };
-    var widths: [hints.len]f32 = undefined;
-    var total: f32 = 0;
-    const small: d2d.TextStyle = .{ .size = style.font_size.caption, .ellipsis = false };
-    for (hints, 0..) |hint, i| {
-        widths[i] = @ceil(canvas.measureText(hint[0], small, 200).width) + 12 + 6 +
-            @ceil(canvas.measureText(hint[1], small, 400).width);
-        total += widths[i];
-    }
-    total += 16 * @as(f32, @floatFromInt(hints.len - 1));
-    if (visible) {
-        var x = rect.x + rect.w - content_pad - total;
-        for (hints, widths) |hint, width| {
-            _ = draw.keyHint(canvas, x, rect.y, rect.h, hint[0], hint[1], t);
-            x += width + 16;
-        }
-    }
-    return total;
-}
-
-/// Row geometry of a paint pass.
-const Layout = struct {
-    heights: [max_rows]f32 = undefined,
-    content_height: f32 = 0,
+/// The height of a row, and whether the chips of a choice go on a line of
+/// their own.
+const Geometry = struct {
+    height: f32,
+    wrap: bool = false,
 };
 
 fn paintBody(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, body: d2d.Rect) void {
     var buf: [max_rows]Row = undefined;
     const rows = self.buildRows(&buf);
     if (rows.len == 0) return;
-    if (self.focus >= rows.len or !rows[self.focus].kind.focusable()) self.focus = self.defaultFocus(rows);
+    if (self.focus >= rows.len or !rows[self.focus].focusable()) self.focus = self.defaultFocus(rows);
+    self.body_view = body.h;
 
     const x = body.x + content_pad;
     const width = @max(0, body.w - 2 * content_pad);
-    const top_pad: f32 = 8;
-    const bottom_pad: f32 = 16;
 
-    // Heights: lists take what the other rows leave.
-    var layout: Layout = .{};
-    var fixed: f32 = 0;
-    var list_count: f32 = 0;
+    // Heights: a list takes what the rows above it and a part of those
+    // below it leave, in whole items.
+    var geometry: [max_rows]Geometry = undefined;
+    var before: f32 = 0;
+    var after: f32 = 0;
+    var list_index: ?usize = null;
     for (rows, 0..) |row, i| {
-        const height = if (row.kind == .list) 0 else self.rowHeight(canvas, row, width);
-        layout.heights[i] = height;
-        fixed += height;
-        if (row.kind == .list) list_count += 1;
-    }
-    fixed += row_gap * @as(f32, @floatFromInt(rows.len - 1));
-    if (list_count > 0) {
-        const share = @max(min_list_height, (body.h - top_pad - bottom_pad - fixed) / list_count);
-        for (rows, 0..) |row, i| {
-            if (row.kind == .list) layout.heights[i] = share;
+        geometry[i] = self.rowGeometry(canvas, row, width);
+        if (row.kind == .list) {
+            list_index = i;
+            continue;
         }
-        fixed += share * list_count;
+        if (list_index == null) before += geometry[i].height + row_gap else after += geometry[i].height + row_gap;
     }
-    layout.content_height = top_pad + fixed + bottom_pad;
+    if (list_index) |li| {
+        const peek = @min(after, list_peek);
+        const available = body.h - top_pad - before - bottom_pad - peek - field_height - field_gap;
+        const min_box = @as(f32, @floatFromInt(min_list_items)) * item_height + 2 * list_pad;
+        const fit = model.fitList(@max(min_box, available), item_height, list_pad);
+        geometry[li].height = field_height + field_gap + fit.box;
+    }
+    var content: f32 = top_pad + bottom_pad;
+    for (geometry[0..rows.len], 0..) |g, i| content += g.height + if (i > 0) row_gap else 0;
 
     // Scrolling.
-    const max_scroll = @max(0, layout.content_height - body.h);
+    const max_scroll = @max(0, content - body.h);
     if (self.reveal_focus) {
         self.reveal_focus = false;
         var row_top: f32 = top_pad;
-        for (rows[0..self.focus], 0..) |_, i| row_top += layout.heights[i] + row_gap;
-        const row_bottom = row_top + layout.heights[self.focus];
-        if (row_top < self.body_scroll) self.body_scroll = row_top - top_pad;
-        if (row_bottom > self.body_scroll + body.h) self.body_scroll = row_bottom - body.h + bottom_pad;
+        for (geometry[0..self.focus]) |g| row_top += g.height + row_gap;
+        const row_bottom = row_top + geometry[self.focus].height;
+        self.body_scroll = model.reveal(self.body_scroll, row_top, row_bottom, body.h, top_pad, max_scroll);
     }
     self.body_scroll = std.math.clamp(self.body_scroll, 0, max_scroll);
 
@@ -1907,43 +3032,53 @@ fn paintBody(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, body: d2d.Re
     defer self.hit_clip = null;
     var y = body.y + top_pad - self.body_scroll;
     for (rows, 0..) |row, i| {
-        const height = layout.heights[i];
-        const rect: d2d.Rect = .{ .x = x, .y = y, .w = width, .h = height };
+        const g = geometry[i];
+        const rect: d2d.Rect = .{ .x = x, .y = y, .w = width, .h = g.height };
         if (rect.y + rect.h >= body.y and rect.y <= body.y + body.h) {
-            self.paintRow(canvas, t, row, @intCast(i), rect, body);
+            self.paintRow(canvas, t, row, @intCast(i), rect, body, g);
         }
-        y += height + row_gap;
+        y += g.height + row_gap;
     }
 
     if (max_scroll > 0) {
         const track_h = body.h - 8;
-        const thumb_h = @max(24, track_h * body.h / layout.content_height);
+        const thumb_h = @max(24, track_h * body.h / content);
         const thumb_y = body.y + 4 + (track_h - thumb_h) * (self.body_scroll / max_scroll);
-        canvas.fillRoundedRect(.{ .x = body.x + body.w - 6, .y = thumb_y, .w = 3, .h = thumb_h }, 1.5, t.text_disabled);
+        canvas.fillRoundedRect(.{ .x = body.x + body.w - 6, .y = thumb_y, .w = 3, .h = thumb_h }, 1.5, t.text_tertiary);
     }
 }
 
-fn rowHeight(self: *Settings, canvas: *d2d.Canvas, row: Row, width: f32) f32 {
-    _ = self;
+fn rowGeometry(self: *Settings, canvas: *d2d.Canvas, row: Row, width: f32) Geometry {
     return switch (row.kind) {
         .group => {
             var h: f32 = 34;
             if (row.detail.len > 0) h += 2 + measureWrapped(canvas, row.detail, width);
-            return h;
+            return .{ .height = h };
         },
-        .note => measureWrapped(canvas, row.detail, width) + 4,
-        .radio, .toggle => if (row.detail.len > 0) card_height_detail else card_height,
-        .choice, .stepper => card_height + 4,
-        .info => 22 + 8 + measureWrapped(canvas, row.detail, width - 32) + 14,
-        .button => draw.button_height + 8,
-        .list => min_list_height,
+        .note => .{ .height = measureWrapped(canvas, row.detail, width) + 4 },
+        .radio, .toggle, .result => .{ .height = if (row.detail.len > 0) card_height_detail else card_height },
+        .stepper => .{ .height = if (row.detail.len > 0) card_height_detail else choice_height },
+        .choice => {
+            const base: f32 = if (row.detail.len > 0) card_height_detail else choice_height;
+            const body_style: d2d.TextStyle = .{ .size = style.font_size.body, .ellipsis = false };
+            const caption_style: d2d.TextStyle = .{ .size = style.font_size.caption, .ellipsis = false };
+            var title_w = self.measurements.measure(canvas, row.title, body_style, 10_000).width;
+            if (row.detail.len > 0) title_w = @max(title_w, self.measurements.measure(canvas, row.detail, caption_style, 10_000).width);
+            const reset_w: f32 = if (row.resettable) draw.icon_button_size + 8 else 0;
+            const wrap = model.chipsWrap(title_w, draw.chipsWidth(canvas, &self.measurements, row.choices) + reset_w, 16, width - 32);
+            return .{ .height = if (wrap) base + chip_line else base, .wrap = wrap };
+        },
+        .info => .{ .height = card_height_detail },
+        .button => .{ .height = draw.button_height + 8 },
+        .sample => .{ .height = sample_height },
+        .list => .{ .height = 0 },
     };
 }
 
-fn captionStyle(t: style.Tokens) d2d.TextStyle {
+fn captionStyle(t: style.Tokens, warning: bool) d2d.TextStyle {
     return .{
         .size = style.font_size.caption,
-        .color = t.text_secondary,
+        .color = if (warning) draw.cautionColor(t) else t.text_secondary,
         .align_y = .top,
         .wrap = true,
         .ellipsis = false,
@@ -1956,118 +3091,161 @@ fn measureWrapped(canvas: *d2d.Canvas, text: []const u8, width: f32) f32 {
     return @ceil(canvas.measureText(text, s, @max(width, 1)).height);
 }
 
-fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, index: u16, rect: d2d.Rect, body: d2d.Rect) void {
-    const focused = index == self.focus and row.kind.focusable();
+fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, index: u16, rect: d2d.Rect, body: d2d.Rect, geometry: Geometry) void {
+    const ring = index == self.focus and row.focusable() and self.focus_visible;
     const title_style: d2d.TextStyle = .{ .size = style.font_size.body, .color = t.text };
-    const hover_row = self.isHover(.{ .row = index });
+    const row_state = self.stateOf(.{ .row = index }, true);
     switch (row.kind) {
         .group => {
-            var buttons_w: f32 = 0;
             var bx = rect.x + rect.w;
-            for (row.buttons) |button| {
-                const label = groupButtonLabel(button);
-                const bw = draw.buttonWidth(canvas, label, null);
-                bx -= bw;
-                const brect: d2d.Rect = .{ .x = bx, .y = rect.y + 2, .w = bw, .h = draw.button_height };
+            var i = row.buttons.len;
+            while (i > 0) {
+                i -= 1;
+                const button = row.buttons[i];
+                const target: Target = .{ .group_button = .{ .row = index, .button = button } };
                 const enabled = self.groupButtonEnabled(button);
-                draw.button(canvas, brect, label, null, if (button == .reset_font) .normal else .primary, enabled, self.isHover(.{ .group_button = button }), t);
-                if (enabled) self.addHit(brect, .{ .group_button = button });
+                var state = self.stateOf(target, enabled);
+                state.focused = ring and @min(self.focus_button, row.buttons.len - 1) == i;
+                if (button == .reset) {
+                    bx -= draw.icon_button_size;
+                    const brect: d2d.Rect = .{ .x = bx, .y = rect.y + 3, .w = draw.icon_button_size, .h = draw.icon_button_size };
+                    draw.iconButton(canvas, brect, draw.icons.reset, state, t);
+                    self.addHit(brect, target);
+                } else {
+                    const label = i18n.tr(msg.apply);
+                    const bw = draw.buttonWidth(canvas, &self.measurements, label, null);
+                    bx -= bw;
+                    const brect: d2d.Rect = .{ .x = bx, .y = rect.y + 2, .w = bw, .h = draw.button_height };
+                    draw.button(canvas, brect, label, null, .primary, state, t);
+                    if (enabled) self.addHit(brect, target);
+                }
                 bx -= 8;
-                buttons_w += bw + 8;
             }
             var group_style = title_style;
             group_style.weight = .semibold;
-            canvas.drawText(row.title, .{ .x = rect.x, .y = rect.y + 4, .w = @max(0, rect.w - buttons_w), .h = 26 }, group_style);
+            canvas.drawText(row.title, .{ .x = rect.x, .y = rect.y + 4, .w = @max(0, bx - rect.x), .h = 26 }, group_style);
             if (row.detail.len > 0) {
-                canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 34, .w = rect.w, .h = rect.h - 34 }, captionStyle(t));
+                canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 34, .w = rect.w, .h = rect.h - 34 }, captionStyle(t, row.detail_warning));
             }
+            return;
         },
-        .note => canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 2, .w = rect.w, .h = rect.h }, captionStyle(t)),
+        .note => return canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 2, .w = rect.w, .h = rect.h }, captionStyle(t, row.detail_warning)),
+        .result => {
+            draw.card(canvas, rect, t, row_state);
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = rect.w - 60, .h = rect.h });
+            canvas.drawIcon(0xE76C, .{ .x = rect.x + rect.w - 32, .y = rect.y, .w = 20, .h = rect.h }, 12, t.text_secondary);
+            self.addHit(rect, .{ .row = index });
+        },
         .radio => {
-            draw.card(canvas, rect, t, hover_row);
-            draw.radio(canvas, .{ .x = rect.x + 12, .y = rect.y, .w = 24, .h = rect.h }, row.on, hover_row, t);
+            draw.card(canvas, rect, t, row_state);
+            draw.radio(canvas, .{ .x = rect.x + 12, .y = rect.y, .w = 24, .h = rect.h }, row.on, row_state, t);
             self.paintTitle(canvas, t, row, .{ .x = rect.x + 48, .y = rect.y, .w = rect.w - 64, .h = rect.h });
             self.addHit(rect, .{ .row = index });
         },
         .toggle => {
-            draw.card(canvas, rect, t, hover_row);
+            draw.card(canvas, rect, t, row_state);
+            self.addHit(rect, .{ .row = index });
             const sw: d2d.Rect = .{
                 .x = rect.x + rect.w - 16 - draw.switch_width,
                 .y = rect.y + (rect.h - draw.switch_height) / 2,
                 .w = draw.switch_width,
                 .h = draw.switch_height,
             };
-            draw.switchControl(canvas, sw, row.on, hover_row, t);
-            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = rect.w - 48 - draw.switch_width, .h = rect.h });
-            self.addHit(rect, .{ .row = index });
+            draw.switchControl(canvas, sw, row.on, row_state, t);
+            var right = sw.x - 8;
+            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (rect.h - draw.icon_button_size) / 2) - 8;
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, right - rect.x - 16), .h = rect.h });
         },
         .choice => {
-            draw.card(canvas, rect, t, false);
+            draw.card(canvas, rect, t, .{});
             self.addHit(rect, .{ .row = index });
-            var widths: [8]f32 = undefined;
-            var total: f32 = 0;
+            const head_h = if (geometry.wrap) rect.h - chip_line else rect.h;
+            const chips_w = draw.chipsWidth(canvas, &self.measurements, row.choices);
+            const chips_left = rect.x + rect.w - 12 - chips_w;
+            var cx = if (geometry.wrap) rect.x + 16 else chips_left;
+            const cy = if (geometry.wrap) rect.y + head_h - 2 else rect.y + (rect.h - draw.chip_height) / 2;
             for (row.choices, 0..) |label, i| {
-                if (i >= widths.len) break;
-                widths[i] = draw.chipWidth(canvas, label);
-                total += widths[i] + (if (i > 0) @as(f32, 6) else 0);
-            }
-            var cx = rect.x + rect.w - 12 - total;
-            for (row.choices, 0..) |label, i| {
-                if (i >= widths.len) break;
-                const chip_rect: d2d.Rect = .{ .x = cx, .y = rect.y + (rect.h - draw.chip_height) / 2, .w = widths[i], .h = draw.chip_height };
+                if (i >= 8) break;
+                const chip_w = draw.chipWidth(canvas, &self.measurements, label);
+                const chip_rect: d2d.Rect = .{ .x = cx, .y = cy, .w = chip_w, .h = draw.chip_height };
                 const enabled = row.disabled & (@as(u8, 1) << @intCast(i)) == 0;
                 const target: Target = .{ .chip = .{ .row = index, .index = @intCast(i) } };
-                draw.chip(canvas, chip_rect, label, i == row.choice, enabled, self.isHover(target), t);
+                draw.chip(canvas, chip_rect, label, row.choice == i, self.stateOf(target, enabled), t);
                 if (enabled) self.addHit(chip_rect, target);
-                cx += widths[i] + 6;
+                cx += chip_w + draw.chip_gap;
             }
-            canvas.drawText(row.title, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, rect.w - total - 40), .h = rect.h }, title_style);
+            var right = if (geometry.wrap) rect.x + rect.w - 12 else chips_left - 8;
+            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (head_h - draw.icon_button_size) / 2) - 8;
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, right - rect.x - 16), .h = head_h });
         },
         .stepper => {
-            draw.card(canvas, rect, t, false);
+            draw.card(canvas, rect, t, .{});
             self.addHit(rect, .{ .row = index });
-            const reset_label = i18n.tr(msg.reset_to_default);
-            const reset_w = draw.buttonWidth(canvas, reset_label, draw.icons.reset);
+            const FontSize = settings_map.FontSize;
             const by = rect.y + (rect.h - draw.button_height) / 2;
-            const reset: d2d.Rect = .{ .x = rect.x + rect.w - 12 - reset_w, .y = by, .w = reset_w, .h = draw.button_height };
-            const plus: d2d.Rect = .{ .x = reset.x - 16 - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
+            const plus: d2d.Rect = .{ .x = rect.x + rect.w - 12 - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
             const value: d2d.Rect = .{ .x = plus.x - 4 - 64, .y = by, .w = 64, .h = draw.button_height };
             const minus: d2d.Rect = .{ .x = value.x - 4 - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
-            const FontSize = settings_map.FontSize;
-            const steps = [_]struct { d2d.Rect, Step, []const u8, ?u21, bool }{
-                .{ minus, .minus, "", draw.icons.remove, self.values.font_size > FontSize.min },
-                .{ plus, .plus, "", draw.icons.add, self.values.font_size < FontSize.max },
-                .{ reset, .reset, reset_label, draw.icons.reset, self.values.font_size != FontSize.default },
+            const steps = [_]struct { d2d.Rect, Step, u21, bool }{
+                .{ minus, .minus, draw.icons.remove, self.values.font_size > FontSize.min },
+                .{ plus, .plus, draw.icons.add, self.values.font_size < FontSize.max },
             };
             for (steps) |step| {
                 const target: Target = .{ .step = .{ .row = index, .step = step[1] } };
-                draw.button(canvas, step[0], step[2], step[3], .normal, step[4], self.isHover(target), t);
-                if (step[4]) self.addHit(step[0], target);
+                draw.button(canvas, step[0], "", step[2], .normal, self.stateOf(target, step[3]), t);
+                if (step[3]) self.addHit(step[0], target);
             }
-            canvas.fillRoundedRect(value, 4, t.surface_raised);
-            canvas.strokeRoundedRect(value, 4, t.border, 1);
-            canvas.drawText(row.value, value, .{ .size = style.font_size.body, .weight = .semibold, .color = t.text, .align_x = .center });
-            canvas.drawText(row.title, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, minus.x - rect.x - 24), .h = rect.h }, title_style);
+            if (self.text_field == .font_size) {
+                self.popup.drawTextInputEx(canvas, value, t, .{ .focused = true });
+            } else {
+                const value_state = self.stateOf(.{ .value = index }, true);
+                canvas.fillRoundedRect(value, 4, if (value_state.hover) style.hoverOf(t.surface_raised, t) else t.surface_raised);
+                canvas.strokeRoundedRect(value, 4, t.border, 1);
+                canvas.drawText(row.value, value, .{ .size = style.font_size.body, .weight = .semibold, .color = t.text, .align_x = .center });
+            }
+            self.addHit(value, .{ .value = index });
+            var right = minus.x - 8;
+            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (rect.h - draw.icon_button_size) / 2) - 8;
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, right - rect.x - 16), .h = rect.h });
         },
-        .list => self.paintList(canvas, t, row, index, rect, body),
+        .list => return self.paintList(canvas, t, row, index, rect, body),
         .info => {
-            draw.card(canvas, rect, t, false);
+            draw.card(canvas, rect, t, .{});
             canvas.drawText(row.title, .{ .x = rect.x + 16, .y = rect.y + 8, .w = rect.w - 32, .h = 22 }, title_style);
-            canvas.drawText(row.detail, .{ .x = rect.x + 16, .y = rect.y + 30, .w = rect.w - 32, .h = rect.h - 34 }, captionStyle(t));
-        },
-        .button => {
-            const bw = draw.buttonWidth(canvas, row.title, row.icon);
-            const brect: d2d.Rect = .{ .x = rect.x, .y = rect.y + 4, .w = bw, .h = draw.button_height };
-            draw.button(canvas, brect, row.title, row.icon, .normal, true, hover_row, t);
-            self.addHit(brect, .{ .row = index });
-            if (focused) draw.focusRing(canvas, brect, t);
+            canvas.drawTextMiddle(row.detail, .{ .x = rect.x + 16, .y = rect.y + 30, .w = rect.w - 32, .h = 20 }, .{
+                .size = style.font_size.caption,
+                .color = t.text_secondary,
+            });
             return;
         },
+        .button => {
+            const bw = draw.buttonWidth(canvas, &self.measurements, row.title, row.icon);
+            const brect: d2d.Rect = .{ .x = rect.x, .y = rect.y + 4, .w = bw, .h = draw.button_height };
+            var state = row_state;
+            state.focused = ring;
+            draw.button(canvas, brect, row.title, row.icon, .normal, state, t);
+            self.addHit(brect, .{ .row = index });
+            return;
+        },
+        .sample => {
+            const size_dip = std.math.clamp(self.values.font_size * 4.0 / 3.0, 8, sample_height - 12);
+            return draw.fontSample(canvas, rect, self.sampleFamily(), size_dip, t);
+        },
     }
-    if (focused and row.kind != .list) draw.focusRing(canvas, rect, t);
+    if (ring) draw.focusRing(canvas, rect, draw.radius, t);
 }
 
-/// The title of a radio or toggle row with its optional detail line.
+/// A reset button whose right edge is at `right`, top at `y`; returns its
+/// left edge.
+fn paintReset(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, index: u16, right: f32, y: f32) f32 {
+    const rect: d2d.Rect = .{ .x = right - draw.icon_button_size, .y = y, .w = draw.icon_button_size, .h = draw.icon_button_size };
+    const target: Target = .{ .reset = index };
+    draw.iconButton(canvas, rect, draw.icons.reset, self.stateOf(target, true), t);
+    self.addHit(rect, target);
+    return rect.x;
+}
+
+/// The title of a card row with its optional detail line.
 fn paintTitle(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, rect: d2d.Rect) void {
     _ = self;
     const title_style: d2d.TextStyle = .{ .size = style.font_size.body, .color = t.text };
@@ -2075,37 +3253,45 @@ fn paintTitle(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, r
         canvas.drawText(row.title, rect, title_style);
         return;
     }
-    canvas.drawText(row.title, .{ .x = rect.x, .y = rect.y + 9, .w = rect.w, .h = 22 }, title_style);
-    canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 31, .w = rect.w, .h = 18 }, .{
+    const top = rect.y + (rect.h - 44) / 2;
+    canvas.drawText(row.title, .{ .x = rect.x, .y = top + 2, .w = rect.w, .h = 22 }, title_style);
+    canvas.drawText(row.detail, .{ .x = rect.x, .y = top + 24, .w = rect.w, .h = 18 }, .{
         .size = style.font_size.caption,
-        .color = t.text_secondary,
+        .color = if (row.detail_warning) draw.cautionColor(t) else t.text_secondary,
     });
-}
-
-fn groupButtonLabel(button: GroupButton) []const u8 {
-    return switch (button) {
-        .apply_theme, .apply_font => i18n.tr(msg.apply),
-        .reset_font => i18n.tr(msg.reset_to_default),
-    };
 }
 
 fn groupButtonEnabled(self: *Settings, button: GroupButton) bool {
     return switch (button) {
+        .reset => true,
         .apply_theme => if (self.theme_list.current()) |index| index != self.saved_theme else false,
-        .apply_font => self.font_list.current() != null or
+        .apply_font => if (self.font_list.current()) |index|
+            !std.mem.eql(u8, self.font_picker.names[index], self.font_family)
+        else
             std.mem.trim(u8, self.font_query.items, &std.ascii.whitespace).len > 0,
-        .reset_font => self.font_family.len > 0,
     };
 }
 
+/// The family the font sample shows: the one under the cursor while the
+/// list has the focus, else the configured one.
+fn sampleFamily(self: *Settings) []const u8 {
+    if (self.text_field == .fonts) {
+        if (self.font_list.current()) |index| {
+            if (index < self.font_picker.names.len) return self.font_picker.names[index];
+        }
+    }
+    return self.font_family;
+}
+
 fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, index: u16, rect: d2d.Rect, body: d2d.Rect) void {
-    const field: Field = if (row.action == .themes) .themes else .fonts;
+    const field: Field = listField(row.action) orelse return;
     const list = self.listOf(field);
     const names = self.namesOf(field);
     const focused = index == self.focus;
     const placeholder = switch (field) {
         .themes => i18n.tr(msg.search_themes),
-        .fonts => i18n.tr("Search font families…"),
+        .fonts, .font_size => i18n.tr("Search font families…"),
+        .search => unreachable,
     };
 
     // The filter box.
@@ -2118,21 +3304,19 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
         const query = self.queryOf(field).items;
         canvas.drawText(if (query.len > 0) query else placeholder, field_rect.inset(style.metrics.padding_x, 0), .{
             .size = style.font_size.body,
-            .color = if (query.len > 0) t.text else t.text_disabled,
+            .color = if (query.len > 0) t.text else t.text_placeholder,
         });
     }
     self.addHit(field_rect, .{ .field = index });
 
-    // The list.
-    const box: d2d.Rect = .{ .x = rect.x, .y = rect.y + field_height + 8, .w = rect.w, .h = @max(0, rect.h - field_height - 8) };
+    // The list, sized to whole items by `paintBody`.
+    const box: d2d.Rect = .{ .x = rect.x, .y = rect.y + field_height + field_gap, .w = rect.w, .h = @max(0, rect.h - field_height - field_gap) };
     canvas.fillRoundedRect(box, draw.radius, t.surface);
     canvas.strokeRoundedRect(box, draw.radius, if (focused) style.mix(t.border, t.accent, 0.5) else t.border, 1);
-    const visible_box = hit_test.intersect(box, body);
-    self.list_area = visible_box;
+    self.list_area = hit_test.intersect(box, body);
 
     const matches = list.matches.items;
-    const inner_h = @max(0, box.h - 8);
-    const visible: usize = @max(1, @as(usize, @intFromFloat(@floor(inner_h / item_height))));
+    const visible: usize = @max(1, @as(usize, @intFromFloat(@floor((box.h - 2 * list_pad) / item_height + 0.001))));
     list.visible = visible;
     if (list.reveal) {
         list.reveal = false;
@@ -2144,7 +3328,11 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     if (matches.len == 0) {
         const empty = switch (field) {
             .themes => i18n.tr(msg.no_themes),
-            .fonts => i18n.tr("No matching fonts"),
+            .fonts, .font_size => if (self.fonts == null and self.font_loader != null)
+                i18n.tr("Loading font families…")
+            else
+                i18n.tr("No matching fonts"),
+            .search => unreachable,
         };
         canvas.drawText(empty, box, .{ .size = style.font_size.body, .color = t.text_secondary, .align_x = .center });
         return;
@@ -2155,16 +3343,17 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     defer canvas.popClip();
     const saved: ?u32 = switch (field) {
         .themes => self.saved_theme,
-        .fonts => self.fontIndex(self.font_family),
+        .fonts, .font_size => self.font_picker.indexOf(self.font_family),
+        .search => unreachable,
     };
     var i = list.top;
     while (i < matches.len and i < list.top + visible) : (i += 1) {
         const name_index = matches[i];
         if (name_index >= names.len) continue;
         const item_rect: d2d.Rect = .{
-            .x = box.x + 4,
-            .y = box.y + 4 + @as(f32, @floatFromInt(i - list.top)) * item_height,
-            .w = box.w - 8 - scrollbar_w,
+            .x = box.x + list_pad,
+            .y = box.y + list_pad + @as(f32, @floatFromInt(i - list.top)) * item_height,
+            .w = box.w - 2 * list_pad - scrollbar_w,
             .h = item_height,
         };
         const target: Target = .{ .item = .{ .row = index, .index = @intCast(i) } };
@@ -2174,27 +3363,57 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
         } else if (self.isHover(target)) {
             canvas.fillRoundedRect(item_rect, 4, t.hover);
         }
-        var name_w = item_rect.w - 24 - 24;
+        const text_color = if (i == list.cursor and focused) t.selected_text else t.text;
+        var right = item_rect.x + item_rect.w - 8;
         if (field == .themes) {
             const swatch_rect: d2d.Rect = .{
-                .x = item_rect.x + item_rect.w - 8 - draw.swatch_width,
+                .x = right - draw.swatch_width,
                 .y = item_rect.y + 5,
                 .w = draw.swatch_width,
                 .h = item_rect.h - 10,
             };
-            const colors = self.swatches.get(self.alloc, global.io(), self.theme_dirs, name_index, names[name_index]);
-            draw.themeSwatch(canvas, swatch_rect, colors, t);
-            name_w -= draw.swatch_width + 8;
+            if (self.swatches.map.get(name_index)) |colors| {
+                draw.themeSwatch(canvas, swatch_rect, colors, t);
+            } else {
+                draw.swatchPlaceholder(canvas, swatch_rect, t);
+                self.swatches_pending = true;
+            }
+            right = swatch_rect.x - 8;
         }
         if (saved == name_index) {
-            canvas.drawIcon(draw.icons.check, .{ .x = item_rect.x + item_rect.w - 28 - (if (field == .themes) draw.swatch_width + 8 else 0), .y = item_rect.y, .w = 20, .h = item_rect.h }, 12, t.accent);
+            canvas.drawIcon(draw.icons.check, .{ .x = right - 20, .y = item_rect.y, .w = 20, .h = item_rect.h }, 12, t.accent);
+            right -= 28;
         }
-        canvas.drawText(names[name_index], .{ .x = item_rect.x + 12, .y = item_rect.y, .w = @max(0, name_w), .h = item_rect.h }, .{
+        const name_style: d2d.TextStyle = .{
             .size = style.font_size.body,
-            .color = t.text,
+            .color = text_color,
             .weight = if (saved == name_index) .semibold else .normal,
-        });
+        };
+        const name_rect: d2d.Rect = .{ .x = item_rect.x + 12, .y = item_rect.y, .w = @max(0, right - item_rect.x - 12), .h = item_rect.h };
+        const local: ?[:0]const u8 = if (field != .themes and name_index < self.font_picker.local_names.len) self.font_picker.local_names[name_index] else null;
+        if (local) |local_name| {
+            const name_w = @min(name_rect.w * 0.6, @ceil(canvas.measureText(names[name_index], name_style, 10_000).width));
+            canvas.drawText(names[name_index], .{ .x = name_rect.x, .y = name_rect.y, .w = name_w, .h = name_rect.h }, name_style);
+            canvas.drawText(local_name, .{ .x = name_rect.x + name_w + 12, .y = name_rect.y, .w = @max(0, name_rect.w - name_w - 12), .h = name_rect.h }, .{
+                .size = style.font_size.caption,
+                .color = if (i == list.cursor and focused) t.selected_text else t.text_secondary,
+                .align_x = .trailing,
+            });
+        } else {
+            canvas.drawText(names[name_index], name_rect, name_style);
+        }
         self.addHit(item_rect, target);
+    }
+    if (field == .themes and !self.swatches_pending) {
+        // Read the pages around the view after this paint.
+        const start = list.top -| visible;
+        const end = @min(matches.len, list.top + 2 * visible);
+        for (matches[start..end]) |name_index| {
+            if (!self.swatches.map.contains(name_index)) {
+                self.swatches_pending = true;
+                break;
+            }
+        }
     }
 
     if (scrollbar_w > 0) {
@@ -2203,13 +3422,179 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
         const thumb_h = @max(20, track_h * @as(f32, @floatFromInt(visible)) / len_f);
         const max_top: f32 = @floatFromInt(matches.len - visible);
         const thumb_y = box.y + 4 + (track_h - thumb_h) * (@as(f32, @floatFromInt(list.top)) / @max(max_top, 1));
-        canvas.fillRoundedRect(.{ .x = box.x + box.w - 7, .y = thumb_y, .w = 3, .h = thumb_h }, 1.5, t.text_disabled);
+        canvas.fillRoundedRect(.{ .x = box.x + box.w - 7, .y = thumb_y, .w = 3, .h = thumb_h }, 1.5, t.text_tertiary);
     }
 }
 
-fn fontIndex(self: *Settings, family: []const u8) ?u32 {
-    for (self.namesOf(.fonts), 0..) |name, i| {
-        if (std.mem.eql(u8, name, family)) return @intCast(i);
+test "font families match by their English or local name" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const names = [_][:0]const u8{ "Cascadia Mono", "Microsoft YaHei Mono", "Sarasa Mono SC" };
+    const local = [_]?[:0]const u8{ null, "微软雅黑 Mono", "更纱黑体 SC" };
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(alloc);
+
+    try filterNames(alloc, &names, &local, "", &out);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, out.items);
+    try filterNames(alloc, &names, &local, "yahei", &out);
+    try testing.expectEqualSlices(u32, &.{1}, out.items);
+    // The local name, and its pinyin initials.
+    try filterNames(alloc, &names, &local, "雅黑", &out);
+    try testing.expectEqualSlices(u32, &.{1}, out.items);
+    try filterNames(alloc, &names, &local, "gs", &out);
+    try testing.expectEqualSlices(u32, &.{2}, out.items);
+    // Missing local names are fine.
+    try filterNames(alloc, &names, &.{}, "cascadia", &out);
+    try testing.expectEqualSlices(u32, &.{0}, out.items);
+    try filterNames(alloc, &names, &local, "zzz", &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "the inputs digest follows the recorded inputs" {
+    const testing = std.testing;
+    var a = try Config.default(testing.allocator);
+    defer a.deinit();
+    var b = try Config.default(testing.allocator);
+    defer b.deinit();
+    try testing.expectEqual(inputsDigest(&a), inputsDigest(&b));
+    try gx.config_layers.applyArg(&b, testing.allocator, "--font-size=15");
+    try testing.expect(inputsDigest(&a) != inputsDigest(&b));
+}
+
+test "settings search matches labels, sections, keys and pinyin" {
+    const testing = std.testing;
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const source = [_]Row{
+        .{ .kind = .group, .title = "字体" },
+        .{ .kind = .stepper, .action = .font_size, .title = "字号", .keys = keys_font_size },
+        .{ .kind = .list, .action = .font_family, .keys = keys_font_family },
+        .{ .kind = .note, .detail = "font-size" },
+    };
+    for ([_][]const u8{ "font-size", "字号", "zihao", "zh", "字体 字号", "ＦＯＮＴ－ＳＩＺＥ" }) |pattern| {
+        var buf: [max_rows]Row = undefined;
+        var out: RowList = .{ .buf = &buf };
+        const query: fuzzy.Query = .init(pattern);
+        appendSearchRows(&out, .font, "Font", &source, &query, alloc);
+        if (std.mem.eql(u8, pattern, "zihao")) {
+            try testing.expectEqual(@as(usize, 0), out.len);
+            continue;
+        }
+        try testing.expect(out.len >= 2);
+        try testing.expectEqual(RowKind.group, out.items()[0].kind);
+        try testing.expectEqual(RowKind.result, out.items()[1].kind);
+        try testing.expectEqual(Section.font, out.items()[1].action.goto.section);
+        try testing.expectEqual(@as(u16, 1), out.items()[1].action.goto.row);
     }
-    return null;
+    var buf: [max_rows]Row = undefined;
+    var out: RowList = .{ .buf = &buf };
+    const query: fuzzy.Query = .init("font-family");
+    appendSearchRows(&out, .font, "Font", &source, &query, alloc);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(u16, 2), out.items()[1].action.goto.row);
+    try testing.expectEqualStrings("字体", out.items()[1].title);
+}
+
+test "a search result clears the query and reveals its setting without changing it" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+        .text_field = .search,
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.search_query.deinit(testing.allocator);
+    try self.search_query.appendSlice(testing.allocator, "font-size");
+    const original = self.values.font_size;
+    self.gotoSetting(.{ .section = .font, .row = 0 });
+    try testing.expectEqual(Section.font, self.section);
+    try testing.expectEqual(@as(usize, 0), self.focus);
+    try testing.expect(self.focus_visible and self.reveal_focus);
+    try testing.expectEqual(@as(usize, 0), self.search_query.items.len);
+    try testing.expect(self.text_field == null);
+    try testing.expectEqual(original, self.values.font_size);
+    try testing.expect(self.changes.isEmpty());
+}
+
+test "theme previews read back other settings without committing the preview" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    config.@"font-size" = 17;
+    config.@"app-notifications".@"config-reload" = false;
+    var app: App = undefined;
+    app.config = config;
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = &app,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+        .saved_theme = 7,
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.font_list.deinit(testing.allocator);
+    const notifications = self.notifications;
+    self.values.font_size = 13;
+    self.configApplied(true);
+    try testing.expectEqual(@as(f32, 17), self.values.font_size);
+    try testing.expectEqual(@as(?u32, 7), self.saved_theme);
+    try testing.expect(std.meta.eql(notifications, self.notifications));
+    try testing.expect(self.changes.isEmpty());
+}
+
+test "activation spaces outside a field do not change focus or start a preview" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+        .focus = 2,
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.input.deinit(testing.allocator);
+    defer self.search_query.deinit(testing.allocator);
+    defer self.theme_query.deinit(testing.allocator);
+    for ([_][]const u8{ " ", "\t", "\u{3000}" }) |text| {
+        try self.popup.input.setText(testing.allocator, text);
+        self.typedElsewhere(&self.popup);
+        try testing.expectEqual(@as(usize, 2), self.focus);
+        try testing.expect(self.text_field == null);
+        try testing.expect(self.preview_theme == null);
+        try testing.expectEqual(@as(usize, 0), self.popup.input.buf.items.len);
+        try testing.expectEqual(@as(usize, 0), self.search_query.items.len);
+        try testing.expectEqual(@as(usize, 0), self.theme_query.items.len);
+    }
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

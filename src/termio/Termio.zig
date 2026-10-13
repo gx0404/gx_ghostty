@@ -655,7 +655,13 @@ pub fn scrollViewport(
 ) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
+    // fork(gx): GX-0030 begin: bracket the IO-thread user mutation, not its enqueue
+    const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.terminal.screens.active.pages.scrollbar() else terminalpkg.Scrollbar.zero;
+    // fork(gx): GX-0030 end
     self.terminal.scrollViewport(scroll);
+    // fork(gx): GX-0030 begin
+    if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.surface_mailbox.surface.rt_surface.gxUserScrolled(gx_before, self.terminal.screens.active.pages.scrollbar());
+    // fork(gx): GX-0030 end
 }
 
 /// Jump the viewport to the prompt.
@@ -663,7 +669,13 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+        // fork(gx): GX-0030 begin: the mailbox owns the stable core/runtime pointers
+        const gx_before = if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.terminal.screens.active.pages.scrollbar() else terminalpkg.Scrollbar.zero;
+        // fork(gx): GX-0030 end
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        // fork(gx): GX-0030 begin
+        if (comptime @hasDecl(apprt.Surface, "gxUserScrolled")) self.surface_mailbox.surface.rt_surface.gxUserScrolled(gx_before, self.terminal.screens.active.pages.scrollbar());
+        // fork(gx): GX-0030 end
     }
 
     try self.renderer_wakeup.notify();

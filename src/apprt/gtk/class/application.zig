@@ -53,6 +53,9 @@ const Overrides = @import("Overrides.zig");
 // fork(gx): GX-0016 begin: Ghostty GX look (src/apprt/gtk/gx/style.zig)
 const gx_style = @import("../gx/style.zig");
 // fork(gx): GX-0016 end
+// fork(gx): GX-0028 begin: configuration errors are reported once (src/apprt/gtk/gx/config_errors.zig)
+const gx_config_errors = @import("../gx/config_errors.zig");
+// fork(gx): GX-0028 end
 
 const log = std.log.scoped(.gtk_ghostty_application);
 // fork(gx): GX-0011 begin: the Ghostty GX layer of the GTK apprt
@@ -226,6 +229,10 @@ pub const Application = extern struct {
         /// outside of our own lifecycle and that's okay.
         config_errors_dialog: WeakRef(ConfigErrorsDialog) = .empty,
 
+        // fork(gx): GX-0028 begin: the configuration errors already reported
+        gx_config_errors: gx_config_errors.Reports = .{},
+        // fork(gx): GX-0028 end
+
         /// glib source for our signal handler.
         signal_source: ?c_uint = null,
 
@@ -288,8 +295,13 @@ pub const Application = extern struct {
         gtk_version.logVersion();
         adw_version.logVersion();
 
+        // fork(gx): GX-0034 begin: retain the startup configuration layers until GTK initializes
+        var gx_defaults: gx_gtk.defaults.Startup = .{};
+        defer gx_defaults.deinit();
+        // fork(gx): GX-0034 end
         // Load our configuration.
-        var config = CoreConfig.load(alloc) catch |err| err: {
+        // fork(gx): GX-0034 load before GTK without reading GtkSettings
+        var config = gx_defaults.load(alloc) catch |err| err: {
             // If we fail to load the configuration, then we should log
             // the error in the diagnostics so it can be shown to the user.
             // We can still load a default which only fails for OOM, allowing
@@ -337,6 +349,9 @@ pub const Application = extern struct {
             },
         };
         adw.init();
+        // fork(gx): GX-0034 begin: sample GtkSettings and rebuild from the retained layers
+        gx_defaults.initialized(alloc, &config);
+        // fork(gx): GX-0034 end
 
         const single_instance = switch (config.@"gtk-single-instance") {
             .true => true,
@@ -1721,6 +1736,9 @@ pub const Application = extern struct {
         // after response handling and we don't want to reuse it.
         const priv = self.private();
         priv.config_errors_dialog.set(null);
+        // fork(gx): GX-0028 begin: errors that remain after this reload are shown again
+        priv.gx_config_errors.forget();
+        // fork(gx): GX-0028 end
 
         // Reload our config as if the app reloaded.
         Action.reloadConfig(
@@ -1739,6 +1757,9 @@ pub const Application = extern struct {
     /// has diagnostics.
     fn showConfigErrorsDialog(self: *Self) void {
         const priv = self.private();
+        // fork(gx): GX-0028 begin: show each set of diagnostics once, not for every configuration change
+        const gx_new_errors = priv.gx_config_errors.update(priv.config.get());
+        // fork(gx): GX-0028 end
 
         // If we already have a dialog, just update the config.
         if (priv.config_errors_dialog.get()) |diag| {
@@ -1755,7 +1776,8 @@ pub const Application = extern struct {
             if (!priv.config.hasDiagnostics()) {
                 diag.close();
             } else {
-                diag.present(null);
+                // fork(gx): GX-0028 raise (and focus) the open dialog only for new diagnostics
+                if (gx_new_errors) diag.present(null);
             }
 
             return;
@@ -1763,6 +1785,9 @@ pub const Application = extern struct {
 
         // No diagnostics, do nothing.
         if (!priv.config.hasDiagnostics()) return;
+        // fork(gx): GX-0028 begin: diagnostics reported before stay dismissed
+        if (!gx_new_errors) return;
+        // fork(gx): GX-0028 end
 
         // No dialog yet, initialize a new one. There's no need to unref
         // here because the widget that it becomes a part of takes ownership.
@@ -2884,6 +2909,9 @@ const Action = struct {
 
             // Hard reload, load a new config completely.
             const alloc = self.allocator();
+            // fork(gx): GX-0034 begin: refresh the default-layer cursor preference on hard reload
+            _ = gx_gtk.defaults.sampleSystemCursorBlink();
+            // fork(gx): GX-0034 end
             var config = try CoreConfig.load(alloc);
             defer config.deinit();
             break :config try .new(alloc, &config);
@@ -3338,39 +3366,10 @@ fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
         vulkan: bool = true,
     } = .{};
 
-    {
-        var buf: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buf);
-        var first: bool = true;
-        inline for (@typeInfo(@TypeOf(gdk_debug)).@"struct".fields) |field| {
-            if (@field(gdk_debug, field.name)) {
-                if (!first) try writer.writeAll(",");
-                try writer.writeAll(field.name);
-                first = false;
-            }
-        }
-        try writer.writeByte(0);
-        const value = writer.buffered();
-        log.warn("setting GDK_DEBUG={s}", .{value[0 .. value.len - 1]});
-        _ = setenv("GDK_DEBUG", @ptrCast(value[0 .. value.len - 1 :0]), 1);
-    }
-
-    {
-        var buf: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buf);
-        var first: bool = true;
-        inline for (@typeInfo(@TypeOf(gdk_disable)).@"struct".fields) |field| {
-            if (@field(gdk_disable, field.name)) {
-                if (!first) try writer.writeAll(",");
-                try writer.writeAll(field.name);
-                first = false;
-            }
-        }
-        try writer.writeByte(0);
-        const value = writer.buffered();
-        log.warn("setting GDK_DISABLE={s}", .{value[0 .. value.len - 1]});
-        _ = setenv("GDK_DISABLE", @ptrCast(value[0 .. value.len - 1 :0]), 1);
-    }
+    // fork(gx): GX-0036 append required flags without replacing user tokens.
+    try @import("../gx/environment.zig").append("GDK_DEBUG", gdk_debug);
+    // fork(gx): GX-0036 retain the Vulkan disable on old and new GTK.
+    try @import("../gx/environment.zig").append("GDK_DISABLE", gdk_disable);
 
     // Sync environ after altering system env
     global.syncEnviron();

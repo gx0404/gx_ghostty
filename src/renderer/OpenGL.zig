@@ -36,7 +36,8 @@ pub const custom_shader_y_is_down = false;
 
 /// Triple-buffering gives the GPU room to pipeline renders without
 /// having to wait on the apprt consuming previous frames.
-pub const swap_chain_count = 3;
+// fork(gx): GX-0004 Windows presents (and finishes) every frame before the next, so one is enough
+pub const swap_chain_count = if (builtin.os.tag == .windows) 1 else 3;
 
 const log = std.log.scoped(.opengl);
 
@@ -45,6 +46,9 @@ pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
 
 alloc: std.mem.Allocator,
+// fork(gx): GX-0029 begin: stop exporting DMABUFs once that cannot work (src/gx/dmabuf_export.zig)
+gx_dmabuf: @import("../gx/dmabuf_export.zig").Export(gl) = .{},
+// fork(gx): GX-0029 end
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -70,7 +74,7 @@ pub fn init(
         .blending = opts.config.blending,
         .device = device,
         .egl_context = {},
-        .wgl_context = try .init(opts.rt_surface),
+        .wgl_context = try .init(opts.rt_surface, opts.config.vsync),
     };
     // fork(gx): GX-0004 end
     const display = device.display;
@@ -231,6 +235,7 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
         try self.wgl_context.threadEnter(self.device);
         errdefer self.wgl_context.threadExit(self.device);
         try prepareContext(&wgl.getProcAddress);
+        wgl.quietDebugOutput();
         self.wgl_context.logImplementation(self.device);
         return;
     }
@@ -326,11 +331,13 @@ pub fn present(
     // fork(gx): GX-0004 end
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
-    if (presentation_health == .healthy) {
-        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
+    // fork(gx): GX-0029 and only while exporting can work
+    if (presentation_health == .healthy and self.gx_dmabuf.enabled(self.device.display)) {
+        // fork(gx): GX-0029 count the failures; enough of them in a row switch exporting off
+        if (self.gx_dmabuf.track(target.exportDmabuf(self.device.display, self.egl_context))) |dmabuf| {
             return .{ .dmabuf = dmabuf };
         } else |_| {
-            log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+            // fork(gx): GX-0029 `track` warns once, when exporting switches off, not for every frame
         }
     }
 
