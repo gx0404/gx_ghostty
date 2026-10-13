@@ -30,6 +30,8 @@ const gx_confirm = @import("../../gx/confirm.zig");
 const gx_proc = @import("../../gx/proc.zig");
 const path_quote = @import("../../gx/path_quote.zig");
 const bell_border = @import("../../gx/bell_border.zig");
+const ui_ref = @import("../../gx/ui_ref.zig");
+const LaunchOrigin = @import("../../gx/profiles.zig").LaunchOrigin;
 const ui_color = @import("../../gx/ui_color.zig");
 const ui_tokens = @import("../../gx/ui_tokens.zig");
 const style = @import("ui/style.zig");
@@ -66,6 +68,9 @@ scale: f32 = 1.0,
 
 /// The parent App.
 app: *App,
+ui_reference: ui_ref.Reference = .{},
+ui_attachment: ui_ref.Attachment = .{},
+launch_origin: LaunchOrigin = .unknown,
 
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
@@ -287,6 +292,7 @@ pub fn init(
 pub const InitOptions = struct {
     context: apprt.surface.NewSurfaceContext,
     command: ?*const configpkg.Command = null,
+    profile_id: ?[]const u8 = null,
     title: ?[:0]const u8 = null,
     font_size: ?f32 = null,
     /// Where the terminal's window goes, in client pixels of the parent
@@ -437,6 +443,9 @@ pub fn initWithOptions(
         config.title = try config.arenaAlloc().dupeZ(u8, title);
     }
 
+    const origin = LaunchOrigin.select(options.profile_id, app.default_profile_id, options.command != null, app.core_app.first and config.@"initial-command" != null);
+    self.launch_origin = try origin.clone(alloc);
+    errdefer self.launch_origin.deinit(alloc);
     self.configureBellBorder(&config);
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
@@ -448,6 +457,9 @@ pub fn initWithOptions(
         app,
         self,
     );
+    errdefer self.core_surface.deinit();
+    self.ui_reference = try app.ui_ids.surface(self.core_surface.id);
+    self.ui_attachment = try app.ui_ids.attach(self.ui_reference, parent.ui_reference);
 
     // Mark the surface as ready. Before this point, Win32 messages
     // (triggered by ShowWindow etc.) must be ignored.
@@ -457,6 +469,8 @@ pub fn initWithOptions(
 }
 
 pub fn deinit(self: *Surface) void {
+    self.ui_reference = .{};
+    self.ui_attachment = .{};
     self.stopBellBorder();
     self.setScrollbarOwnerVisible(false);
     self.core_surface_ready = false;
@@ -478,6 +492,7 @@ pub fn deinit(self: *Surface) void {
         _ = w32.CloseHandle(timer);
         self.resize_deadline = null;
     }
+    self.launch_origin.deinit(self.app.core_app.alloc);
     if (self.launch_command) |*command| {
         command.deinit(self.app.core_app.alloc);
         self.launch_command = null;
@@ -2810,8 +2825,16 @@ pub fn clientSize(self: *const Surface) ?apprt.SurfaceSize {
     return .{ .width = @truncate(packed_size), .height = @truncate(packed_size >> 32) };
 }
 
+pub fn prepareReparent(self: *Surface, window: *Window) !ui_ref.Attachment {
+    if (window.app != self.app or window.closing) return error.InvalidOwner;
+    return self.app.ui_ids.attach(self.ui_reference, window.ui_reference);
+}
+
 /// Rebuild owned popups after SetParent, without ending an active search.
-pub fn onReparented(self: *Surface, window: *Window) void {
+pub fn onReparented(self: *Surface, window: *Window, attachment: ui_ref.Attachment) void {
+    std.debug.assert(attachment.isValid() and attachment.object.matches(self.ui_reference));
+    std.debug.assert(attachment.owner.matches(window.ui_reference));
+    self.ui_attachment = attachment;
     if (self.parent_window == window) return;
     self.bell_border_snapshot.store(0, .release);
     if (self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);
@@ -2843,6 +2866,26 @@ pub fn onReparented(self: *Surface, window: *Window) void {
         saved_input.deinit(alloc);
     }
     self.refitGrid();
+}
+
+test "runtime reference reparent reservations preserve the old view until commit" {
+    const testing = std.testing;
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try ui_ref.Issuer.init(123) };
+    var source: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    var destination: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    var surface: Surface = .{ .app = &app, .parent_window = &source, .ui_reference = try app.ui_ids.surface(42) };
+    surface.ui_attachment = try app.ui_ids.attach(surface.ui_reference, source.ui_reference);
+    const original = surface.ui_attachment;
+    const moved = try surface.prepareReparent(&destination);
+    try testing.expect(original.matches(surface.ui_attachment));
+    try testing.expect(surface.parent_window == &source);
+    try testing.expect(!original.matches(moved));
+    try testing.expect(original.object.matches(moved.object));
+    try testing.expect(moved.owner.matches(destination.ui_reference));
+    app.ui_ids.serial = std.math.maxInt(u64);
+    try testing.expectError(error.Exhausted, surface.prepareReparent(&destination));
+    try testing.expect(original.matches(surface.ui_attachment));
+    try testing.expect(surface.parent_window == &source);
 }
 
 test "bell border color follows conditional themes and high contrast" {
@@ -3429,18 +3472,22 @@ test "reparenting a terminal cancels its old window hint, not destination feedba
     core_app.alloc = std.testing.allocator;
     var app: App = .{ .core_app = &core_app, .config = config, .hinstance = undefined, .default_command_arena = .init(std.testing.allocator) };
     defer app.default_command_arena.deinit();
-    var source: Window = .{ .app = &app };
-    var destination: Window = .{ .app = &app, .scale = 2 };
-    var surface: Surface = .{ .app = &app, .parent_window = &source, .core_surface_initialized = true, .key_sequence_len = 4 };
+    app.ui_ids = try ui_ref.Issuer.init(123);
+    var source: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    var destination: Window = .{ .app = &app, .scale = 2, .ui_reference = try app.ui_ids.create(.window) };
+    var surface: Surface = .{ .app = &app, .parent_window = &source, .core_surface_initialized = true, .key_sequence_len = 4, .ui_reference = try app.ui_ids.surface(1) };
     surface.core_surface.id = 1;
     surface.bell_border_state.configure(true);
     surface.bell_border_state.ring(false);
     surface.publishBellBorder();
     source.toast = .{ .pending = true, .owner = .{ .surface_id = 1, .kind = .table } };
     destination.toast = .{ .pending = true };
-    surface.onReparented(&source);
+    surface.onReparented(&source, try surface.prepareReparent(&source));
+    const original = surface.ui_attachment;
     try std.testing.expect(source.toast.pending);
-    surface.onReparented(&destination);
+    surface.onReparented(&destination, try surface.prepareReparent(&destination));
+    try std.testing.expect(!original.matches(surface.ui_attachment));
+    try std.testing.expect(original.object.matches(surface.ui_attachment.object));
     try std.testing.expect(!source.toast.pending);
     try std.testing.expect(destination.toast.pending);
     try std.testing.expect(surface.parent_window == &destination);

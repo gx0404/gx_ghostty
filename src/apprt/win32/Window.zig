@@ -103,6 +103,10 @@ pub const MAX_TABS: usize = 64;
 
 /// The parent App.
 app: *App,
+ui_reference: gx.ui_ref.Reference = .{},
+ui_attachment: gx.ui_ref.Attachment = .{},
+tab_references: [MAX_TABS]gx.ui_ref.Reference = @splat(.{}),
+tab_attachments: [MAX_TABS]gx.ui_ref.Attachment = @splat(.{}),
 
 /// The top-level window handle.
 hwnd: ?w32.HWND = null,
@@ -403,6 +407,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         .app = app,
         .is_quick_terminal = options.is_quick_terminal,
     };
+    self.ui_reference = try app.ui_ids.create(.window);
+    self.ui_attachment = try app.ui_ids.attach(self.ui_reference, self.ui_reference);
 
     const window_style = TitleBar.windowStyle(&app.config, options.is_quick_terminal);
 
@@ -976,6 +982,8 @@ pub fn resizeForSurface(
 /// When the app quits it deinitializes every window in `app.windows`; the
 /// last of them remembers its place for the next run.
 pub fn deinit(self: *Window) void {
+    self.ui_reference = .{};
+    self.ui_attachment = .{};
     self.visibility.deinit(self.hwnd);
     Settings.onWindowDestroyed(self);
     const windows = self.app.windows.items;
@@ -1273,6 +1281,8 @@ fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surfa
 
 /// Everything the window keeps per tab, for moving tabs between slots.
 const TabSlot = struct {
+    reference: gx.ui_ref.Reference,
+    attachment: gx.ui_ref.Attachment,
     tree: SplitTree(Surface),
     active_surface: *Surface,
     title: [256]u16,
@@ -1283,8 +1293,18 @@ const TabSlot = struct {
     activated: u64,
 };
 
+pub fn resolveTab(self: *const Window, reference: gx.ui_ref.Reference) ?usize {
+    if (self.closing or !self.ui_reference.isValid() or reference.epoch != self.ui_reference.epoch or reference.kind != .tab) return null;
+    for (self.tab_references[0..self.tab_count], 0..) |live, index| {
+        if (reference.matches(live)) return index;
+    }
+    return null;
+}
+
 fn getSlot(self: *const Window, i: usize) TabSlot {
     return .{
+        .reference = self.tab_references[i],
+        .attachment = self.tab_attachments[i],
         .tree = self.tab_trees[i],
         .active_surface = self.tab_active_surface[i],
         .title = self.tab_titles[i],
@@ -1297,6 +1317,8 @@ fn getSlot(self: *const Window, i: usize) TabSlot {
 }
 
 fn setSlot(self: *Window, i: usize, slot: TabSlot) void {
+    self.tab_references[i] = slot.reference;
+    self.tab_attachments[i] = slot.attachment;
     self.tab_trees[i] = slot.tree;
     self.tab_active_surface[i] = slot.active_surface;
     self.tab_titles[i] = slot.title;
@@ -1325,6 +1347,8 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     if (self.closing) return error.WindowClosing;
     if (self.is_quick_terminal and self.tab_count != 0) return error.QuickTerminalTabUnsupported;
     if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
+    const reference = try self.app.ui_ids.create(.tab);
+    const attachment = try self.app.ui_ids.attach(reference, self.ui_reference);
     self.tab_bar.cancelRename();
 
     const alloc = self.app.core_app.alloc;
@@ -1352,6 +1376,8 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.cancelDividerDrag();
     var i: usize = self.tab_count;
     while (i > pos) : (i -= 1) self.copySlot(i, i - 1);
+    self.tab_references[pos] = reference;
+    self.tab_attachments[pos] = attachment;
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
     self.tab_unread[pos] = false;
@@ -1400,6 +1426,7 @@ pub fn duplicateTab(self: *Window, index: usize) void {
     const duplicate = self.addTabWithOptions(.{
         .context = .tab,
         .command = if (surface.launch_command) |*command| command else null,
+        .profile_id = if (surface.launch_command != null) surface.launch_origin.profileId() else null,
     }) catch |err| {
         log.err("failed to duplicate the tab err={}", .{err});
         return;
@@ -2606,13 +2633,19 @@ pub fn moveSplitToTab(self: *Window, surface: *Surface) !bool {
     if (!tree.isSplit()) return false;
     const handle = tree.locate(surface) orelse return false;
     const next = self.focusAfterMove(tab, handle);
+    const reference = try self.app.ui_ids.create(.tab);
+    const attachment = try self.app.ui_ids.attach(reference, self.ui_reference);
+    const surface_attachment = try surface.prepareReparent(self);
     const detached = try splits.detachPane(Tree, self.app.core_app.alloc, tree, handle);
+    surface.onReparented(self, surface_attachment);
     self.finishSplitMove(tab, next, detached.remaining);
     const pos = switch (self.app.config.@"window-new-tab-position") {
         .current => tab + 1,
         .end => self.tab_count,
     };
     self.insertMovedSlot(pos, .{
+        .reference = reference,
+        .attachment = attachment,
         .tree = detached.moved,
         .active_surface = surface,
         .title = [_]u16{0} ** 256,
@@ -2638,17 +2671,22 @@ pub fn moveSplitToNewWindow(self: *Window, surface: *Surface) !bool {
     if (!tree.isSplit()) return false;
     const handle = tree.locate(surface) orelse return false;
     const next = self.focusAfterMove(tab, handle);
+    const reference = try self.app.ui_ids.create(.tab);
     var detached = try splits.detachPane(Tree, self.app.core_app.alloc, tree, handle);
     errdefer detached.remaining.deinit();
     errdefer detached.moved.deinit();
     const destination = try self.createMoveWindow();
     errdefer self.discardMoveWindow(destination);
+    const attachment = try self.app.ui_ids.attach(reference, destination.ui_reference);
+    const surface_attachment = try surface.prepareReparent(destination);
     const child = surface.hwnd orelse return error.Win32Error;
     const parent = destination.hwnd orelse return error.Win32Error;
     self.cancelDividerDrag();
     if (w32.SetParent(child, parent) == null) return error.Win32Error;
     self.finishSplitMove(tab, next, detached.remaining);
     destination.insertMovedSlot(0, .{
+        .reference = reference,
+        .attachment = attachment,
         .tree = detached.moved,
         .active_surface = surface,
         .title = [_]u16{0} ** 256,
@@ -2658,7 +2696,7 @@ pub fn moveSplitToNewWindow(self: *Window, surface: *Surface) !bool {
         .bell = false,
         .activated = 0,
     });
-    surface.onReparented(destination);
+    surface.onReparented(destination, surface_attachment);
     destination.applyScale(0);
     destination.updateTabDim(0);
     destination.refreshTabTitle(0);
@@ -2754,10 +2792,19 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     const destination_hwnd = destination.hwnd orelse return error.Win32Error;
     var moved_tree = self.tab_trees[tab_idx];
+    const attachment = try self.app.ui_ids.attach(self.tab_references[tab_idx], destination.ui_reference);
+    const MoveView = struct { surface: *Surface, attachment: gx.ui_ref.Attachment };
+    var views: std.ArrayList(MoveView) = .empty;
+    defer views.deinit(alloc);
+    var it = moved_tree.iterator();
+    while (it.next()) |entry| try views.append(alloc, .{
+        .surface = entry.view,
+        .attachment = try entry.view.prepareReparent(destination),
+    });
 
     // Reparent every child HWND first so a failure can be rolled back before
     // either window's tab arrays are mutated.
-    var it = moved_tree.iterator();
+    it = moved_tree.iterator();
     while (it.next()) |entry| {
         const child = entry.view.hwnd orelse continue;
         if (w32.SetParent(child, destination_hwnd) == null) {
@@ -2776,6 +2823,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     self.cancelDividerDrag();
     // The slot carries the title override along.
     var moved = self.getSlot(tab_idx);
+    moved.attachment = attachment;
     moved.unread = false;
     moved.bell = false;
     const moved_active = moved.active_surface;
@@ -2792,8 +2840,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     destination.active_tab = 0;
     destination.noteTabActivated(0);
 
-    it = destination.tab_trees[0].iterator();
-    while (it.next()) |entry| entry.view.onReparented(destination);
+    for (views.items) |view| view.surface.onReparented(destination, view.attachment);
     destination.applyScale(0);
     destination.updateTabDim(0);
     destination.tab_bar.onTabShown(0);
@@ -3772,6 +3819,56 @@ pub fn windowWndProc(
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+test "runtime references follow tab slots across reorder and window ownership" {
+    const testing = std.testing;
+    var issuer = try gx.ui_ref.Issuer.init(123);
+    var source: Window = .{ .app = undefined, .ui_reference = try issuer.create(.window), .tab_count = 2 };
+    var destination: Window = .{ .app = undefined, .ui_reference = try issuer.create(.window) };
+    var first: Surface = .{ .app = undefined };
+    var second: Surface = .{ .app = undefined };
+    source.tab_references[0] = try issuer.create(.tab);
+    source.tab_references[1] = try issuer.create(.tab);
+    source.tab_trees[0] = .empty;
+    source.tab_trees[1] = .empty;
+    source.tab_active_surface[0] = &first;
+    source.tab_active_surface[1] = &second;
+    source.tab_titles[0] = [_]u16{0} ** 256;
+    source.tab_titles[1] = [_]u16{0} ** 256;
+    source.tab_title_lens[0] = 0;
+    source.tab_title_lens[1] = 0;
+    const first_ref = source.tab_references[0];
+    const second_ref = source.tab_references[1];
+    const saved = source.getSlot(0);
+    source.copySlot(0, 1);
+    source.setSlot(1, saved);
+    try testing.expectEqual(@as(?usize, 1), source.resolveTab(first_ref));
+    try testing.expectEqual(@as(?usize, 0), source.resolveTab(second_ref));
+    destination.setSlot(0, source.getSlot(1));
+    destination.tab_count = 1;
+    source.tab_count = 1;
+    try testing.expect(source.resolveTab(first_ref) == null);
+    try testing.expectEqual(@as(?usize, 0), destination.resolveTab(first_ref));
+    try testing.expect(destination.tab_active_surface[0] == &first);
+    destination.closing = true;
+    try testing.expect(destination.resolveTab(first_ref) == null);
+    destination.closing = false;
+    destination.tab_references[0] = try issuer.create(.tab);
+    try testing.expect(destination.resolveTab(first_ref) == null);
+    try testing.expect(destination.resolveTab(destination.ui_reference) == null);
+}
+
+test "runtime reference exhaustion precedes native window and tab creation" {
+    const testing = std.testing;
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(123) };
+    app.ui_ids.serial = std.math.maxInt(u64);
+    var window: Window = undefined;
+    try testing.expectError(error.Exhausted, window.init(&app, .{}));
+    try testing.expect(window.hwnd == null);
+    try testing.expect(!window.ui_reference.isValid());
+    try testing.expectError(error.Exhausted, window.addTabWithOptions(.{ .context = .tab }));
+    try testing.expectEqual(@as(usize, 0), window.tab_count);
 }
 
 test "quick terminal rejects an additional tab before creating a surface" {

@@ -57,6 +57,39 @@ pub const Profile = struct {
     kind: Kind,
 };
 
+pub const LaunchOrigin = union(enum) {
+    unknown,
+    ad_hoc,
+    profile: []const u8,
+
+    pub fn select(profile_id: ?[]const u8, default_profile_id: ?[]const u8, command_override: bool, initial_command: bool) LaunchOrigin {
+        if (initial_command) return .ad_hoc;
+        if (profile_id) |id| return .{ .profile = id };
+        if (command_override) return .ad_hoc;
+        if (default_profile_id) |id| return .{ .profile = id };
+        return .unknown;
+    }
+
+    pub fn profileId(self: LaunchOrigin) ?[]const u8 {
+        return switch (self) {
+            .profile => |id| id,
+            else => null,
+        };
+    }
+
+    pub fn clone(self: LaunchOrigin, alloc: Allocator) Allocator.Error!LaunchOrigin {
+        return switch (self) {
+            .profile => |id| .{ .profile = try alloc.dupe(u8, id) },
+            else => self,
+        };
+    }
+
+    pub fn deinit(self: *LaunchOrigin, alloc: Allocator) void {
+        if (self.* == .profile) alloc.free(self.profile);
+        self.* = .unknown;
+    }
+};
+
 /// The detection rules to apply.
 pub const Platform = enum {
     windows,
@@ -756,6 +789,30 @@ fn expectArgv(expected: []const []const u8, command: Command) !void {
     const actual = command.argv;
     try testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |e, a| try testing.expectEqualStrings(e, a);
+}
+
+test "launch origin keeps only an owned stable profile id" {
+    const testing = std.testing;
+    var id = [_]u8{ 'c', 'm', 'd' };
+    var origin = try (LaunchOrigin{ .profile = &id }).clone(testing.allocator);
+    defer origin.deinit(testing.allocator);
+    id[0] = 'x';
+    try testing.expectEqualStrings("cmd", origin.profileId().?);
+    try testing.expectEqual(@as(?[]const u8, null), @as(LaunchOrigin, .ad_hoc).profileId());
+    try testing.expectEqual(@as(?[]const u8, null), @as(LaunchOrigin, .unknown).profileId());
+    try testing.expectError(error.OutOfMemory, origin.clone(std.testing.failing_allocator));
+    origin.deinit(testing.allocator);
+    try testing.expect(origin == .unknown);
+}
+
+test "launch origin does not mislabel an initial or ad hoc command as a profile" {
+    const testing = std.testing;
+    try testing.expect(LaunchOrigin.select("pwsh", "cmd", true, true) == .ad_hoc);
+    try testing.expect(LaunchOrigin.select(null, "cmd", true, false) == .ad_hoc);
+    try testing.expect(LaunchOrigin.select(null, null, false, false) == .unknown);
+    try testing.expectEqualStrings("pwsh", LaunchOrigin.select("pwsh", "cmd", true, false).profileId().?);
+    try testing.expectEqualStrings("cmd", LaunchOrigin.select(null, "cmd", false, false).profileId().?);
+    try testing.expectEqualStrings("custom:中文", LaunchOrigin.select("custom:中文", null, true, false).profileId().?);
 }
 
 test "detect Windows profiles" {

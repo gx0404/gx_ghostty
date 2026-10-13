@@ -103,6 +103,7 @@ msg_class_atom: u16 = 0,
 
 /// List of active Window containers (tabbed windows).
 windows: std.ArrayList(*Window) = .empty,
+ui_ids: gx.ui_ref.Issuer = .{ .epoch = 0 },
 
 /// Background brush created from the configured background color.
 /// Used by WM_ERASEBKGND to fill exposed areas during resize,
@@ -175,6 +176,7 @@ ui_factory: ?*d2d.Factory = null,
 /// `updateDefaultCommand`). Null when `command` is configured or no shell
 /// was found; the configured command (upstream: `cmd.exe`) applies then.
 default_command: ?configpkg.Command = null,
+default_profile_id: ?[]const u8 = null,
 
 /// Owns `default_command`.
 default_command_arena: std.heap.ArenaAllocator,
@@ -305,6 +307,10 @@ pub fn init(
     };
     errdefer config.deinit();
     repairWorkingDirectory(&config);
+    const rng: std.Random.IoSource = .{ .io = global.io() };
+    var epoch: gx.ui_ref.HostEpoch = 0;
+    while (epoch == 0) epoch = rng.interface().int(gx.ui_ref.HostEpoch);
+    const ui_ids = try gx.ui_ref.Issuer.init(epoch);
 
     // The UI language follows `language` (zh-CN by default).
     i18n.setCurrent(i18n.resolve(config.language));
@@ -321,6 +327,7 @@ pub fn init(
         .hinstance = hinstance,
         .bg_brush = bg_brush,
         .alpha_frames = alpha_frames,
+        .ui_ids = ui_ids,
         .com_apartment = .init(),
         .default_command_arena = .init(alloc),
     };
@@ -565,6 +572,34 @@ const EditOwner = union(enum) {
     search: *Surface,
 };
 
+pub fn resolveWindow(self: *App, reference: gx.ui_ref.Reference) ?*Window {
+    if (!reference.isValid() or reference.kind != .window or reference.epoch != self.ui_ids.epoch) return null;
+    for (self.windows.items) |window| {
+        if (!window.closing and reference.matches(window.ui_reference)) return window;
+    }
+    if (self.quick_terminal) |quick| {
+        if (!quick.window.closing and reference.matches(quick.window.ui_reference)) return quick.window;
+    }
+    return null;
+}
+
+pub fn resolveSurface(self: *App, reference: gx.ui_ref.Reference) ?*Surface {
+    if (!reference.isValid() or reference.kind != .surface or reference.epoch != self.ui_ids.epoch) return null;
+    for (self.core_app.surfaces.items) |surface| {
+        if (!surface.core_surface_initialized or !surface.core_surface_ready) continue;
+        if (surface.parent_window.closing or !surface.parent_window.ui_reference.isValid()) continue;
+        if (reference.matches(surface.ui_reference)) return surface;
+    }
+    return null;
+}
+
+pub fn resolveSurfaceView(self: *App, attachment: gx.ui_ref.Attachment) ?*Surface {
+    const surface = self.resolveSurface(attachment.object) orelse return null;
+    if (!attachment.matches(surface.ui_attachment)) return null;
+    if (!attachment.owner.matches(surface.parent_window.ui_reference)) return null;
+    return surface;
+}
+
 /// Find which tab rename, palette or search Edit control `hwnd` is.
 fn findEditOwner(self: *App, hwnd: w32.HWND) ?EditOwner {
     for (self.windows.items) |win| {
@@ -710,6 +745,7 @@ fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
 }
 
 pub fn terminate(self: *App) void {
+    self.ui_ids.epoch = 0;
     self.com_apartment.beginClose() catch |err| log.err("COM apartment 关闭准备失败: {}", .{err});
     if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, PROGRESS_TIMER_ID);
     self.progress_timer = false;
@@ -2043,6 +2079,7 @@ pub fn openProfile(self: *App, window: *Window, id: []const u8, where: ProfileTa
         .context = context,
         .font_size = font_size,
         .command = &command,
+        .profile_id = profile.id,
     }) catch |err| {
         log.err("failed to open launch profile id={s} err={}", .{ profile.id, err });
         if (where == .window) destination.close();
@@ -2068,6 +2105,7 @@ pub fn defaultTerminalCommand(self: *const App) ?configpkg.Command {
 fn updateDefaultCommand(self: *App) void {
     self.default_command_stale = false;
     self.default_command = null;
+    self.default_profile_id = null;
     _ = self.default_command_arena.reset(.free_all);
     if (gx.profiles.commandConfigured(self.config._replay_steps.items)) return;
 
@@ -2096,6 +2134,7 @@ fn updateDefaultCommand(self: *App) void {
         log.warn("cannot keep the default shell command err={}", .{err});
         return;
     };
+    self.default_profile_id = alloc.dupe(u8, profile.id) catch null;
     log.info("default shell profile={s}", .{profile.id});
 }
 
@@ -3777,6 +3816,58 @@ fn msgWndProc(
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "runtime references resolve only live windows in this app epoch" {
+    const testing = std.testing;
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(123) };
+    defer app.windows.deinit(testing.allocator);
+    var window: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    const reference = window.ui_reference;
+    try testing.expect(app.resolveWindow(reference) == null);
+    try app.windows.append(testing.allocator, &window);
+    try testing.expect(app.resolveWindow(reference) == &window);
+    try testing.expect(app.resolveWindow(.{}) == null);
+    var stale = reference;
+    stale.generation += 1;
+    try testing.expect(app.resolveWindow(stale) == null);
+    stale = reference;
+    stale.kind = .tab;
+    try testing.expect(app.resolveWindow(stale) == null);
+    window.closing = true;
+    try testing.expect(app.resolveWindow(reference) == null);
+    window.closing = false;
+    app.ui_ids.epoch += 1;
+    try testing.expect(app.resolveWindow(reference) == null);
+}
+
+test "runtime references reject unready disposed and reused core surfaces" {
+    const testing = std.testing;
+    var core_app: CoreApp = undefined;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(testing.allocator);
+    var app: App = .{ .core_app = &core_app, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(123) };
+    var window: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    var surface: Surface = .{ .app = &app, .parent_window = &window, .ui_reference = try app.ui_ids.surface(42) };
+    surface.core_surface.id = 42;
+    const reference = surface.ui_reference;
+    try core_app.surfaces.append(testing.allocator, &surface);
+    try testing.expect(app.resolveSurface(reference) == null);
+    surface.core_surface_initialized = true;
+    surface.core_surface_ready = true;
+    try testing.expect(app.resolveSurface(reference) == &surface);
+    try testing.expect(app.resolveSurface(window.ui_reference) == null);
+    window.closing = true;
+    try testing.expect(app.resolveSurface(reference) == null);
+    window.closing = false;
+    surface.ui_reference = try app.ui_ids.surface(42);
+    try testing.expect(app.resolveSurface(reference) == null);
+    try testing.expect(app.resolveSurface(surface.ui_reference) == &surface);
+    surface.core_surface_ready = false;
+    try testing.expect(app.resolveSurface(surface.ui_reference) == null);
+    surface.core_surface_ready = true;
+    app.ui_ids.epoch += 1;
+    try testing.expect(app.resolveSurface(surface.ui_reference) == null);
 }
 
 test "export terminal IO requires a surface target" {
