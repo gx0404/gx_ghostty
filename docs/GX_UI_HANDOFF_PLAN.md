@@ -118,6 +118,7 @@ tar --force-local -xzf .local/worktree-archives/UI-closeout-20261013/R23-int.tar
 - 同目录 `getall-final.json`、`com-gui-results.json`、`ui-ref-final.json`、`framework-check.json`：历史范围明确；不搬旧测试数字当当前新测。
 - W22 COM 链、W01 标题回归曾有限 PASS；共 11 张图已读（包括 W16）。**W16 旧 expect 与右侧菜单锚点契约冲突，视觉验收仍 PENDING**。
 - 原 framework：884 总 = 869 PASS + 14 SKIP + 1 KB freshness FAIL；旧 TempRepo WinError32 保留，本轮之前未复现不等于已修复。
+- 收口后 `just framework-check`：885 tests、14 SKIP、0 FAIL；`just graph-check` 仍 FAIL（源指纹 1063→1117），最终前必须 `just graph` 后复验。
 - `.local/evidence/R4/GTKPipeline/quiet-reviewed/`：三棵标准 RF build、receipt/hash/version、原 quiet、commands、summary。原 unsafe 40 loads 永久 REVOKED；bootstrap 不计产品门。
 - 最近三次补充 quiet：37→26%、29→15%、33→11%，外部同 birth 进程持续 CPU；无 owned build/test、空 slots 并不等于 full-machine quiet。**仍 0/40 新 loads、0 新截图、DATA_VALID=false、Gate/Pool INSUFFICIENT**。
 - `.local/evidence/R23/OSC52Transport/`：bundled ConPTY raw transport 与真实 core/UI 是不同证据。
