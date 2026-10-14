@@ -10,7 +10,9 @@ QEMU human monitor inside the container.
   verify             check the pinned installation media
   status             read-only state of the owned containers (no environment values)
   up                 start one VM attached and hold a heavy gx_slots slot for its whole runtime;
-                     refuses while another owned VM runs; never pulls (--pull never)
+                     refuses while another owned VM runs; never pulls (--pull never). compose.yaml
+                     must equal the generated file; an existing container must match its owner
+                     label, image, compose file, mounts and UUID, else --replace-container <ID>
   stop               ACPI shutdown through docker compose stop; storage and disk are kept
   identity           live SMBIOS UUID (HMP info uuid) compared with machine.json
   screenshot         HMP screendump of the VM screen to a new PNG
@@ -197,14 +199,18 @@ def docker_executable(explicit: str | None = None) -> str:
 class Docker:
     """docker CLI wrapper; error text never includes container environment values."""
 
-    def __init__(self, executable: str, runner=subprocess.run):
+    def __init__(self, executable: str, runner=None, root: Path | None = None):
         self.executable = executable
+        # Resolved per call so a patched subprocess.run is honoured (no import-time capture).
         self.runner = runner
+        # When set, every live-container operation also checks the compose/mount binding.
+        self.root = root
 
     def run(self, *args: str, input: str | bytes | None = None, timeout: float = 120, text: bool = True,
             check: bool = True) -> subprocess.CompletedProcess:
-        result = self.runner([self.executable, *args], input=input, capture_output=True, text=text,
-                             timeout=timeout)
+        runner = self.runner or subprocess.run
+        result = runner([self.executable, *args], input=input, capture_output=True, text=text,
+                        timeout=timeout)
         if check and result.returncode != 0:
             detail = result.stderr if text else result.stderr.decode("utf-8", "replace")
             raise VmError(f"docker {args[0]} failed ({result.returncode}): {str(detail).strip()[:400]}")
@@ -215,27 +221,87 @@ def container_name(version: str) -> str:
     return f"gx-ghostty-{version}"
 
 
+def same_host_path(a: str, b: str | Path) -> bool:
+    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def expected_binding(root: Path, version: str) -> dict:
+    base = Path(root).resolve() / version
+    return {"project": container_name(version), "config_file": base / "compose.yaml", "working_dir": base,
+            "mounts": {"/storage": base / "storage", "/shared": base / "exchange", "/oem": base / "oem",
+                       "/custom.iso": Path(root).resolve() / "media" / MEDIA[version]["file"]},
+            "machine": machine_identity(root, version)}
+
+
+def binding_errors(data: dict, root: Path, version: str) -> list[str]:
+    """Why an existing container is not the one the pinned compose under root would run.
+
+    Compares owner label, pinned image, compose project/config file/working directory, every bind
+    mount's absolute host path and the SMBIOS UUID/HOST variables. Other environment values
+    (credentials) are never read into the result."""
+    expected = expected_binding(root, version)
+    config = data.get("Config") or {}
+    labels = config.get("Labels") or {}
+    errors = []
+    if labels.get("gx.owner") != OWNER:
+        errors.append("owner label differs")
+    if config.get("Image") != IMAGE:
+        errors.append("image is not the pinned digest")
+    if labels.get("com.docker.compose.project") != expected["project"]:
+        errors.append("compose project differs")
+    if not same_host_path(labels.get("com.docker.compose.project.config_files", ""), expected["config_file"]):
+        errors.append("created from another compose file: " + labels.get("com.docker.compose.project.config_files", "<none>"))
+    if not same_host_path(labels.get("com.docker.compose.project.working_dir", ""), expected["working_dir"]):
+        errors.append("compose working directory differs")
+    mounts = {item.get("Destination"): item for item in data.get("Mounts") or []}
+    for destination, source in expected["mounts"].items():
+        mount = mounts.get(destination)
+        if mount is None or mount.get("Type") != "bind" or not same_host_path(mount.get("Source", ""), source):
+            errors.append(f"{destination} is not bound to {source}")
+    if set(mounts) - set(expected["mounts"]):
+        errors.append("unexpected extra mounts")
+    env = {}
+    for item in config.get("Env") or []:
+        name, _, value = str(item).partition("=")
+        if name in ("UUID", "HOST"):
+            env[name] = value
+    if env.get("UUID") != expected["machine"]["uuid"]:
+        errors.append("SMBIOS UUID differs from machine.json")
+    if env.get("HOST") != expected["machine"]["host"]:
+        errors.append("guest HOST differs from machine.json")
+    return errors
+
+
+def inspect_container(docker: Docker, version: str) -> dict | None:
+    result = docker.run("inspect", "--type", "container", container_name(version), check=False)
+    return json.loads(result.stdout)[0] if result.returncode == 0 else None
+
+
 def container_state(docker: Docker, version: str) -> dict:
     name = container_name(version)
-    result = docker.run("inspect", "--type", "container", name, check=False)
-    if result.returncode != 0:
+    data = inspect_container(docker, version)
+    if data is None:
         return {"name": name, "exists": False, "running": False}
-    data = json.loads(result.stdout)[0]
     config = data.get("Config") or {}
     labels = config.get("Labels") or {}
     state = data.get("State") or {}
-    return {"name": name, "exists": True, "id": data.get("Id", "")[:12],
-            "owned": labels.get("gx.owner") == OWNER and config.get("Image") == IMAGE,
-            "running": bool(state.get("Running")), "status": state.get("Status"),
-            "exit_code": state.get("ExitCode"), "oom_killed": state.get("OOMKilled"),
-            "started_at": state.get("StartedAt"), "finished_at": state.get("FinishedAt"),
-            "uuid_configured": any(str(item).startswith("UUID=") for item in config.get("Env") or [])}
+    result = {"name": name, "exists": True, "id": data.get("Id", "")[:12], "full_id": data.get("Id", ""),
+              "owned": labels.get("gx.owner") == OWNER and config.get("Image") == IMAGE,
+              "running": bool(state.get("Running")), "status": state.get("Status"),
+              "exit_code": state.get("ExitCode"), "oom_killed": state.get("OOMKilled"),
+              "started_at": state.get("StartedAt"), "finished_at": state.get("FinishedAt"),
+              "uuid_configured": any(str(item).startswith("UUID=") for item in config.get("Env") or [])}
+    if docker.root is not None:
+        result["binding_errors"] = binding_errors(data, docker.root, version)
+    return result
 
 
 def require_running(docker: Docker, version: str) -> dict:
     state = container_state(docker, version)
     if not state["exists"] or not state.get("owned"):
         raise VmError(f"{state['name']} is not the owned, digest-pinned validation container")
+    if state.get("binding_errors"):
+        raise VmError(f"{state['name']} is not bound to this VM root: " + "; ".join(state["binding_errors"]))
     if not state["running"]:
         raise VmError(f"{state['name']} is not running")
     return state
@@ -412,28 +478,53 @@ def screenshot(docker: Docker, version: str, destination: Path) -> dict:
             "visual_review": "PENDING"}
 
 
-def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: float) -> int:
+def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: float,
+       replace_container: str | None = None) -> int:
+    """Run the VM attached while holding one heavy gx_slots slot.
+
+    The compose file must equal the generated pinned configuration byte for byte. An existing
+    container is reused only if its binding matches (no recreation); a mismatched container is
+    refused unless its exact ID is passed as replace_container and it is stopped and owned."""
     sys.path.insert(0, str(SCRIPTS))
     import gx_slots
 
+    root = Path(root).resolve()
     compose = root / version / "compose.yaml"
-    text = compose.read_text(encoding="utf-8")
     machine = machine_identity(root, version)
-    if IMAGE not in text or f"UUID: '{machine['uuid']}'" not in text:
-        raise VmError("compose.yaml is not the pinned, UUID-bound configuration; run prepare first")
+    if compose.read_text(encoding="utf-8") != compose_text(version, machine):
+        raise VmError("compose.yaml is not the generated pinned, UUID-bound configuration; run prepare first")
     docker.run("image", "inspect", IMAGE)  # must already be cached; never pulled
     with gx_slots.acquire(SLOTS, "heavy", slot_timeout):
         for other in MEDIA:
             if container_state(docker, other)["running"]:
                 raise VmError(f"{container_name(other)} is already running; only one owned VM may run")
+        data = inspect_container(docker, version)
+        mode, record = "create", None
+        if data is not None:
+            errors = binding_errors(data, root, version)
+            if not errors:
+                mode = "reuse"
+            else:
+                full_id = data.get("Id", "")
+                config = data.get("Config") or {}
+                owned = (config.get("Labels") or {}).get("gx.owner") == OWNER and config.get("Image") == IMAGE
+                if (not replace_container or len(replace_container) < 12 or not full_id.startswith(replace_container)
+                        or not owned or (data.get("State") or {}).get("Running")):
+                    raise VmError(f"{container_name(version)} ({full_id[:12]}) does not match this VM root: "
+                                  + "; ".join(errors) + ". Inspect it; pass --replace-container <its ID> only "
+                                  "for a stopped owned container that may be replaced (bind-mounted disks are kept).")
+                mode = "replace"
+                record = {"replaced_container": full_id, "binding_errors": errors, "utc": utc_now()}
+        extra = {"reuse": ["--no-recreate"], "replace": ["--force-recreate"], "create": []}[mode]
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab") as stream:
             child = subprocess.Popen(
                 [docker.executable, "compose", "-p", container_name(version), "-f", str(compose),
-                 "up", "--pull", "never", "--no-build", "--no-color"],
+                 "up", "--pull", "never", "--no-build", "--no-color", *extra],
                 cwd=compose.parent, stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT)
-            print(json.dumps({"event": "compose-up", "pid": child.pid, "slot": "heavy",
-                              "log": str(log_path), "utc": utc_now()}), flush=True)
+            print(json.dumps({"event": "compose-up", "mode": mode, "pid": child.pid, "slot": "heavy",
+                              "log": str(log_path), "utc": utc_now(), **({"replace": record} if record else {})}),
+                  flush=True)
             while True:
                 try:
                     return child.wait()
@@ -443,11 +534,14 @@ def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: f
 
 
 def stop(root: Path, version: str, docker: Docker) -> dict:
-    state = container_state(docker, version)
-    if not state["exists"] or not state.get("owned"):
-        raise VmError(f"{state['name']} is not the owned validation container")
-    if state["running"]:
-        compose = root / version / "compose.yaml"
+    data = inspect_container(docker, version)
+    if data is None:
+        raise VmError(f"{container_name(version)} does not exist")
+    errors = binding_errors(data, root, version)
+    if errors:
+        raise VmError(f"{container_name(version)} is not bound to this VM root: " + "; ".join(errors))
+    if (data.get("State") or {}).get("Running"):
+        compose = Path(root).resolve() / version / "compose.yaml"
         docker.run("compose", "-p", container_name(version), "-f", str(compose), "stop", "-t", "180",
                    timeout=300)
     return container_state(docker, version)
@@ -571,42 +665,10 @@ def rehearsal_layout(app: Path, output: Path, share: Path | None, cache: Path | 
     return {"output": str(output), "app_sha256": files["ghostty.exe"], "file_count": len(files)}
 
 
-def prepare(root: Path) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    protect_directory(root)
-    (root / "media").mkdir(exist_ok=True)
-    write(root / "manifest.json", json.dumps({"owner": OWNER, "image": IMAGE, "media": MEDIA}, indent=2) + "\n")
-    for version, (web, rdp) in PORTS.items():
-        base = root / version
-        for sub in ("storage", "exchange", "oem"):
-            (base / sub).mkdir(parents=True, exist_ok=True)
-        secret = base / "credentials.json"
-        if not secret.exists():
-            write(secret, json.dumps({"admin_user": "gxadmin", "admin_password": "Gx9" + secrets.token_hex(16), "user": "gxtest", "user_password": "Gx9" + secrets.token_hex(16)}, indent=2))
-        machine_file = base / "machine.json"
-        if not machine_file.exists():
-            write(machine_file, json.dumps({"uuid": str(uuid.uuid4()), "host": f"GX-{version.upper()}"}, indent=2) + "\n")
-        machine = machine_identity(root, version)
-        account = json.loads(secret.read_text(encoding="utf-8"))
-        write(base / "guest.env", "USERNAME=gxadmin\nPASSWORD=" + account["admin_password"] + "\n")
-        write(base / "oem" / "guest-user.json", json.dumps({"username": "gxtest", "password": account["user_password"]}))
-        write(base / "oem" / "install.bat", "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\OEM\\setup-guest.ps1\r\n")
-        write(base / "oem" / "setup-guest.ps1", r'''$ErrorActionPreference = 'Stop'
-$account = Get-Content -LiteralPath C:\OEM\guest-user.json -Raw | ConvertFrom-Json
-$secure = ConvertTo-SecureString $account.password -AsPlainText -Force
-if (-not (Get-LocalUser -Name $account.username -ErrorAction SilentlyContinue)) {
-    New-LocalUser -Name $account.username -Password $secure -Description 'GX isolated standard-user tests' | Out-Null
-    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account.username
-    Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $account.username
-}
-$policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-New-Item -Path $policy -Force | Out-Null
-New-ItemProperty -Path $policy -Name fDisableClip -Value 1 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -Path $policy -Name fDisableCdm -Value 1 -PropertyType DWord -Force | Out-Null
-Remove-Item -LiteralPath C:\OEM\guest-user.json
-'GX guest setup initialized.' | Set-Content C:\OEM\gx-setup-result.txt
-''')
-        write(base / "compose.yaml", f'''services:
+def compose_text(version: str, machine: dict) -> str:
+    """The only accepted compose.yaml for version; up compares the file to this exactly."""
+    web, rdp = PORTS[version]
+    return f'''services:
   windows:
     image: {IMAGE}
     container_name: {container_name(version)}
@@ -642,7 +704,45 @@ Remove-Item -LiteralPath C:\OEM\guest-user.json
       - '../media/{MEDIA[version]['file']}:/custom.iso:ro'
     restart: 'no'
     stop_grace_period: 2m
+'''
+
+
+def prepare(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    protect_directory(root)
+    (root / "media").mkdir(exist_ok=True)
+    write(root / "manifest.json", json.dumps({"owner": OWNER, "image": IMAGE, "media": MEDIA}, indent=2) + "\n")
+    for version, (web, rdp) in PORTS.items():
+        base = root / version
+        for sub in ("storage", "exchange", "oem"):
+            (base / sub).mkdir(parents=True, exist_ok=True)
+        secret = base / "credentials.json"
+        if not secret.exists():
+            write(secret, json.dumps({"admin_user": "gxadmin", "admin_password": "Gx9" + secrets.token_hex(16), "user": "gxtest", "user_password": "Gx9" + secrets.token_hex(16)}, indent=2))
+        machine_file = base / "machine.json"
+        if not machine_file.exists():
+            write(machine_file, json.dumps({"uuid": str(uuid.uuid4()), "host": f"GX-{version.upper()}"}, indent=2) + "\n")
+        machine = machine_identity(root, version)
+        account = json.loads(secret.read_text(encoding="utf-8"))
+        write(base / "guest.env", "USERNAME=gxadmin\nPASSWORD=" + account["admin_password"] + "\n")
+        write(base / "oem" / "guest-user.json", json.dumps({"username": "gxtest", "password": account["user_password"]}))
+        write(base / "oem" / "install.bat", "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\OEM\\setup-guest.ps1\r\n")
+        write(base / "oem" / "setup-guest.ps1", r'''$ErrorActionPreference = 'Stop'
+$account = Get-Content -LiteralPath C:\OEM\guest-user.json -Raw | ConvertFrom-Json
+$secure = ConvertTo-SecureString $account.password -AsPlainText -Force
+if (-not (Get-LocalUser -Name $account.username -ErrorAction SilentlyContinue)) {
+    New-LocalUser -Name $account.username -Password $secure -Description 'GX isolated standard-user tests' | Out-Null
+    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account.username
+    Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $account.username
+}
+$policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+New-Item -Path $policy -Force | Out-Null
+New-ItemProperty -Path $policy -Name fDisableClip -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $policy -Name fDisableCdm -Value 1 -PropertyType DWord -Force | Out-Null
+Remove-Item -LiteralPath C:\OEM\guest-user.json
+'GX guest setup initialized.' | Set-Content C:\OEM\gx-setup-result.txt
 ''')
+        write(base / "compose.yaml", compose_text(version, machine))
 
 
 def main() -> int:
@@ -666,6 +766,8 @@ def main() -> int:
     parser.add_argument("--button", choices=("left", "middle", "right"), default="left")
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--slot-timeout", type=float, default=0)
+    parser.add_argument("--replace-container", help="up: exact ID (12+ hex) of a stopped, owned but mismatched "
+                        "container that may be recreated from the pinned compose; disks are bind mounts and kept")
     parser.add_argument("--app", type=Path, help="rehearsal-layout: old ghostty.exe")
     parser.add_argument("--share", type=Path, help="rehearsal-layout: prefix share/ directory")
     parser.add_argument("--cache-dir", type=Path)
@@ -693,13 +795,13 @@ def main() -> int:
                 raise VmError("rehearsal-layout requires --app and --out")
             print(json.dumps(rehearsal_layout(args.app, args.out.resolve(), args.share, args.cache_dir), indent=2))
             return 0
-        docker = Docker(docker_executable(args.docker))
+        docker = Docker(docker_executable(args.docker), root=root)
         if args.command == "status":
             print(json.dumps({version: container_state(docker, version) for version in MEDIA}, indent=2))
         elif args.command == "up":
             if args.out is None:
                 raise VmError("up requires --out for the compose log")
-            return up(root, args.version, docker, args.out.resolve(), args.slot_timeout)
+            return up(root, args.version, docker, args.out.resolve(), args.slot_timeout, args.replace_container)
         elif args.command == "stop":
             print(json.dumps(stop(root, args.version, docker), indent=2))
         elif args.command == "identity":
