@@ -78,7 +78,7 @@
 | W04 | 嵌套分屏的分隔条跟随指针；关掉一个窗格后焦点给相邻窗格 | — |
 | W05 | 打开命令面板不预览第一行主题；Esc 恢复原主题 | — |
 | W06 | Ctrl+单击 4100 字符的 URL 能打开，窗口不卡死 | 副作用：默认浏览器打开 `http://127.0.0.1:9/` |
-| W07 | 启动即失败的命令弹出失败对话框，按 OK 之前不消失 | — |
+| W07 | 启动即失败的命令在窗口底部显示非模态的「Command Failed」提示（D12）：提示不抢焦点，主窗仍执行分屏绑定；在失败终端按一个键只关闭它，提示随之消失 | — |
 | W08 | 连续五次粘贴都进查找框，Ctrl+Shift+V 粘贴进 shell | — |
 | W09 | 焦点上报：每次切标签往返恰好一对 `^[[O` / `^[[I` | `wsl:Ubuntu-24.04` |
 | W10 | 水平滚轮：向右报按钮 67，向左报 66 | `wsl:Ubuntu-24.04` |
@@ -91,11 +91,12 @@
 | W17 | 模拟 DPI 96 → 144 → 192，chrome 与终端一起缩放 | — |
 | W18 | 3 个与 12 个标签时标签栏怎样收窄、溢出 | — |
 | W19 | zh-CN 界面：窗口与主菜单 | — |
+| W20 | 拖动分屏分隔条、已关闭的 HWND 与后台标签推迟的 DPI 变化 | — |
 
 W01–W15 逐条对应 R0 的验收点，W16 起采集界面现状截图。R0 验收时踩过、已写进工具与场景的坑：
 
 - 宿主程序（如 agent 的桌面端）偶尔抢走前台：守门拒绝发送，这一步失败，场景不会误操作别的窗口；加 `--retries 1` 重跑。
-- 模态对话框会禁用主窗：激活主窗时改为激活它的 `GW_ENABLEDPOPUP`，否则对话框拿不到键盘焦点（W07）。
+- 模态对话框会禁用主窗：`activate` 改为激活主窗的 `GW_ENABLEDPOPUP`，否则对话框拿不到键盘焦点。W07 的失败提示是非模态 Notice，不经这条路径：先用绑定动作确认主窗仍收键，再在失败终端按空格（不触发输入法组字）关闭它，并等提示消失。
 - 弹层出现有延迟：按键后先等 `wait_popup`（`new = true` 只认这次输入之后出现的弹层），再截图。
 - 连续粘贴之间等约 0.4 s，让剪贴板读取完成（W08）。
 
@@ -104,7 +105,7 @@ W01–W15 逐条对应 R0 的验收点，W16 起采集界面现状截图。R0 �
 GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来自下面两处，都要实际读图：
 
 - 本机 WSL：`just wsl build --gtk` 后 `just wsl smoke --out <Windows 目录>`（Xvfb，参数与 `gtk-smoke` 相同；`--lang`、`--xdotool`、`--config`、`--env`、`--settle` 按需），截图与日志复制回 Windows，读图后才记 PASS。它是 Ubuntu 24.04 上的证据，不代证 `gtk-smoke`。
-- 场景：`just wsl scenario --out <Windows 目录> [G01 …]` 逐个跑 `test/gui/gtk/G*.toml`（格式见 `test/gui/README.md`），每个场景一份配置、一段 xdotool 脚本、一次 smoke，日志命中 `forbid`（默认 `Theme parser error`、`css parsing failed`）即失败；`<id>/notes.txt` 列出读图要点，`SUMMARY.txt` 每个场景一行。G01 英文启动、G02 中文主菜单、G03 设置对话框、G04 快捷键速查表的搜索、G05 双标签加分屏、G06 浅色主题加命令面板。Xvfb 里没有窗口管理器，脚本先在终端里单击一次取得键盘焦点；也没有合成器，弹出菜单周围透明的阴影区画成黑色，不是渲染错误。
+- 场景：`just wsl scenario --out <Windows 目录> [G01 …]` 逐个跑 `test/gui/gtk/G*.toml`（格式见 `test/gui/README.md`），每个场景一份配置、一段 xdotool 脚本、一次 smoke，日志命中 `forbid`（默认 `Theme parser error`、`css parsing failed`）即失败；`<id>/notes.txt` 列出读图要点，`SUMMARY.txt` 每个场景一行。G01 英文启动、G02 中文主菜单、G03 设置对话框、G04 快捷键速查表的搜索、G05 双标签加分屏、G06 浅色主题加命令面板；G07–G13 是主菜单、启动配置菜单、标签右键菜单、快捷键速查表与设置分页，G14 Ctrl 滚轮缩放字号，G15 把现有分屏移到新标签，G16 从启动配置菜单打开启动配置管理器。Xvfb 里没有窗口管理器，脚本先在终端里单击一次取得键盘焦点；也没有合成器，弹出菜单周围透明的阴影区画成黑色，不是渲染错误。
 - CI：手动触发 `gx-ci` 并打开 `gtk_smoke`，下载 artifact `gx-gtk-smoke-evidence` 读图；`gx-release` 的 `linux-gtk-noble` 另有 Ubuntu 24.04 测试包的截图（`evidence-linux-gtk-noble`）。
 - 读图之前一律记 PENDING：提交没 push、CI 没跑、artifact 还没下载或下载了没读，都不能记 PASS。
 

@@ -252,10 +252,9 @@ class MainTest(unittest.TestCase):
         self.assertEqual(self.output.read_bytes().count(b"\r"), 0)
         code, out, _ = run(["--root", str(self.root), "--source", str(source)])
         self.assertEqual((code, "无变化" in out), (0, True))
-        # Without sources only the digests are checked.
+        # Missing original sources can never produce a false reproducibility PASS.
         code, out, _ = run(["--root", str(self.root), "--check"])
-        self.assertEqual(code, 0)
-        self.assertIn("未重新生成", out)
+        self.assertEqual(code, 2)
         code, out, _ = run(["--root", str(self.root), "--check", "--source", str(source)])
         self.assertEqual((code, "是最新的" in out), (0, True))
 
@@ -278,8 +277,8 @@ class MainTest(unittest.TestCase):
         code, _, err = run(["--root", str(self.root), "--check", "--source", str(source)])
         self.assertEqual(code, 1)
 
-    def test_check_compares_with_the_cache(self) -> None:
-        write_source_dir(self.root / gx_pinyin.CACHE_DIR, self.files)
+    def test_check_regenerates_from_committed_inputs_without_cache(self) -> None:
+        write_source_dir(self.root / gx_pinyin.INPUT_DIR, self.files)
         self.assertEqual(run(["--root", str(self.root)])[0], 0)
         code, out, _ = run(["--root", str(self.root), "--check"])
         self.assertEqual((code, "是最新的" in out), (0, True))
@@ -316,6 +315,37 @@ class RealTableTest(unittest.TestCase):
         text = (gx_pinyin.REPO_ROOT / gx_pinyin.OUTPUT).read_text(encoding="utf-8")
         self.assertEqual(gx_pinyin.verify(text), [])
         self.assertIn(f"pinyin-data\n//! {gx_pinyin.SOURCE_VERSION}", text)
+
+    def test_fresh_checkout_inputs_reproduce_both_tables(self) -> None:
+        texts = gx_pinyin.read_sources(gx_pinyin.REPO_ROOT / gx_pinyin.INPUT_DIR)
+        self.assertEqual(gx_pinyin.generate(texts), (gx_pinyin.REPO_ROOT / gx_pinyin.OUTPUT).read_text(encoding="utf-8"))
+        self.assertEqual(gx_pinyin.generate_syllables(texts), (gx_pinyin.REPO_ROOT / gx_pinyin.SYLLABLE_OUTPUT).read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("urllib.request.urlopen", side_effect=AssertionError("must stay offline")):
+            root = Path(tmp)
+            write_source_dir(root / gx_pinyin.INPUT_DIR, texts)
+            self.assertFalse((root / gx_pinyin.CACHE_DIR).exists())
+            self.assertEqual(run(["--root", str(root)])[0], 0)
+            self.assertEqual(run(["--root", str(root), "--check"])[0], 0)
+            for output in (gx_pinyin.OUTPUT, gx_pinyin.SYLLABLE_OUTPUT):
+                self.assertEqual((root / output).read_bytes(), (gx_pinyin.REPO_ROOT / output).read_bytes())
+
+
+class SyllableTest(unittest.TestCase):
+    def test_vowel_umlaut_is_not_plain_u(self) -> None:
+        self.assertEqual(gx_pinyin.syllable_of("Lǜ"), "lv")
+        self.assertEqual(gx_pinyin.syllable_of("lù"), "lu")
+        self.assertEqual(gx_pinyin.syllable_of("ńg"), "ng")
+        with self.assertRaises(gx_pinyin.SourceError):
+            gx_pinyin.syllable_of("zhong!")
+
+    def test_syllables_use_modern_dictionaries_not_primary_archaic_alternatives(self) -> None:
+        files = sources()
+        result = gx_pinyin.generate_syllables(files, pins_of(files))
+        self.assertIn('"chong"', result)
+        self.assertIn('"zhong"', result)
+        self.assertIn('"yue"', result)
+        self.assertNotIn('"tong"', result)
+        self.assertEqual(gx_pinyin.verify(result, pins_of(files)), [])
 
 
 if __name__ == "__main__":

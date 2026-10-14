@@ -191,8 +191,8 @@ pub const Source = struct {
                 const item = gio.MenuItem.new(label, null);
                 defer item.unref();
                 item.setActionAndTargetValue(
-                    "app.new-tab",
-                    glib.ext.Variant.newFrom(.{ @as(u64, 0), profile.args }),
+                    "app.gx-new-tab-profile",
+                    glib.Variant.newString(profile.id),
                 );
                 setVerbatim(item);
                 setAccel(item, nth(self.options.tab_profile_accels, i));
@@ -202,8 +202,8 @@ pub const Source = struct {
                 const item = gio.MenuItem.new(label, null);
                 defer item.unref();
                 item.setActionAndTargetValue(
-                    "app.new-window-command",
-                    glib.ext.Variant.newFrom(profile.args),
+                    "app.gx-new-window-profile",
+                    glib.Variant.newString(profile.id),
                 );
                 setVerbatim(item);
                 setAccel(item, nth(self.options.window_profile_accels, i));

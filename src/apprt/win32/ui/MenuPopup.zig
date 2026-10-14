@@ -66,6 +66,9 @@ const global = @import("../../../global.zig");
 const perf = @import("../../../gx/perf.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
+const App = @import("../App.zig");
+const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 const controls = @import("controls.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
@@ -170,6 +173,7 @@ pub const Builder = struct {
 
 /// What a menu is drawn with.
 pub const Host = struct {
+    app: ?*App = null,
     hinstance: w32.HINSTANCE,
     factory: *d2d.Factory,
     tokens: style.Tokens,
@@ -225,6 +229,7 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
     var state: State = .{
         .host = host,
         .owner = owner,
+        .uia_attachment = if (host.app) |app| uia_bridge.ownerAttachment(app, owner) orelse .{} else .{},
         .alloc = arena.allocator(),
         .anchor = options.anchor,
         .alignment = options.alignment,
@@ -241,9 +246,9 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
     };
     defer state.destroyPopups();
 
-    if (!state.open(root, null, options.keyboard)) return null;
     current = &state;
     defer current = null;
+    if (!state.open(root, null, options.keyboard)) return null;
 
     // The capture keeps WM_SETCURSOR away, so set the menu cursor once.
     if (w32.LoadCursorW(null, w32.IDC_ARROW)) |arrow| _ = w32.SetCursor(arrow);
@@ -297,6 +302,7 @@ const RasterCache = struct {
     }
 
     fn capture(self: *RasterCache, popup: *Popup) bool {
+        if (popup.composition_requested) return false;
         if (!popup.layered or popup.canvas == null) return false;
         if (popup.canvas.?.drawing) return false;
         self.clear();
@@ -316,6 +322,7 @@ const RasterCache = struct {
     }
 
     fn restore(self: *RasterCache, popup: *Popup) bool {
+        if (popup.composition_requested) return false;
         const saved_key = self.key orelse return false;
         const factory = if (popup.canvas) |canvas| canvas.factory else return false;
         if (!popup.layered or !std.meta.eql(saved_key, RasterKey.from(factory))) {
@@ -867,6 +874,38 @@ const Level = struct {
     scroll_px: i32 = 0,
     arrow_px: i32 = 0,
 
+    fn uiaLive(context: *anyopaque) bool {
+        const self: *Level = @ptrCast(@alignCast(context));
+        const app = self.state.host.app orelse return false;
+        return current == self.state and self.index < self.state.depth and self.popup.visible and
+            self.state.result == .open and uia_bridge.attachmentAlive(app, self.state.uia_attachment);
+    }
+    fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+        const self: *Level = @ptrCast(@alignCast(context));
+        try bridge.publishMenu(api, queue, self.state.uia_attachment, self, .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+    }
+    fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
+        const self: *Level = @ptrCast(@alignCast(context));
+        if (!uiaLive(context) or token == 0) return false;
+        const index = std.math.cast(usize, token - 1) orelse return false;
+        if (index >= self.items().len or !self.items()[index].selectable()) return false;
+        switch (action.kind) {
+            .focus => self.select(index),
+            .invoke => self.state.activate(self.index, index),
+            .expand => {
+                if (self.items()[index].kind != .submenu) return false;
+                self.state.openSubmenu(self.index, index, true);
+            },
+            .collapse => {
+                if (self.items()[index].kind != .submenu) return false;
+                self.state.closeFrom(self.index + 1);
+                self.popup.invalidate();
+            },
+            else => return false,
+        }
+        return true;
+    }
+
     fn items(self: *const Level) []const Item {
         return self.list.items.items;
     }
@@ -1229,6 +1268,7 @@ const Level = struct {
 const State = struct {
     host: Host,
     owner: w32.HWND,
+    uia_attachment: @import("../../../gx/ui_ref.zig").Attachment = .{},
     alloc: Allocator,
     anchor: w32.RECT,
     alignment: Align,
@@ -1300,6 +1340,7 @@ const State = struct {
             }, .{
                 .ctx = level,
                 .paint = Level.paint,
+                .uia_source = if (self.host.app) |app| .{ .app = app, .build = Level.uiaBuild, .is_live = Level.uiaLive, .action = Level.uiaAction } else null,
                 .dismissed = Level.dismissed,
                 .dpi_changed = Level.dpiChanged,
             }) catch |err| {

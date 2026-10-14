@@ -9,13 +9,18 @@
 //! work, and leaving a link hides the bubble after a short delay, so
 //! moving between links does not flicker.
 //!
-//! The owning `Surface` embeds this struct as `link_preview` and calls
-//! `show`/`hide` and `deinit`. `show` creates the popup again for another
-//! window (the tab moved) or the other dark or light frame
-//! (`Palette.ensurePopup`).
+//! A `Surface` embeds this struct as `link_preview` and calls `show`; the
+//! runtime UI of a remote pane (`RemoteRuntimeUi.zig`) embeds one and
+//! calls `showRemote` with the pane, which has no `Surface`. Both call
+//! `hide` and `deinit`. A show places the bubble on the terminal's own
+//! child window (`Host`), colors it from that terminal's app and creates
+//! the popup again for another window (the tab moved) or the other dark
+//! or light frame (`Palette.ensurePopup`).
 const LinkPreview = @This();
 
 const std = @import("std");
+const App = @import("../App.zig");
+const RemotePane = @import("../RemotePane.zig");
 const Surface = @import("../Surface.zig");
 const Palette = @import("Palette.zig");
 const Popup = @import("Popup.zig");
@@ -44,6 +49,10 @@ const HIDE_TIMER_ID: usize = 0x4C48; // 'LH'
 const ellipsis = "\u{2026}";
 
 popup: Popup = .{},
+
+/// The app of the terminal the bubble showed for last: its configuration
+/// colors the bubble.
+app: ?*App = null,
 
 /// The URL on display, elided to fit the bubble.
 text_buf: [max_text_len]u8 = undefined,
@@ -89,8 +98,9 @@ fn hideSoon(self: *LinkPreview) void {
     if (w32.SetTimer(hwnd, HIDE_TIMER_ID, hide_delay_ms, null) == 0) self.hide();
 }
 
-fn tokens(self: *LinkPreview) style.Tokens {
-    return style.Tokens.fromConfig(&self.surface().app.config);
+fn tokens(self: *LinkPreview) ?style.Tokens {
+    const app = self.app orelse return null;
+    return style.Tokens.fromConfig(&app.config);
 }
 
 fn textStyle(t: style.Tokens) d2d.TextStyle {
@@ -129,18 +139,89 @@ const Measurer = struct {
     }
 };
 
-/// Show `url` at the bottom of the surface (after a short delay, hide the
-/// bubble when it is empty).
+/// Where a bubble shows: the terminal's own child window and its size in
+/// pixels, the top-level window that owns the popup and its content scale
+/// (`Window.scale`, like the terminal text), and the pointer in client
+/// pixels of the terminal window (null when unknown).
+const Host = struct {
+    app: *App,
+    hwnd: w32.HWND,
+    owner: w32.HWND,
+    scale: f32,
+    width: u32,
+    height: u32,
+    pointer: ?Point,
+};
+
+/// Show `url` at the bottom of the owning `Surface` (after a short delay,
+/// hide the bubble when it is empty).
 pub fn show(self: *LinkPreview, url: []const u8) void {
     if (url.len == 0) {
         self.hideSoon();
         return;
     }
     const s = self.surface();
-    const hwnd = s.hwnd orelse return;
-    const owner = s.parent_window.hwnd orelse return;
-    const t = self.tokens();
-    if (!Palette.ensurePopup(&self.popup, s.app, owner, .{
+    const pointer: ?Point = pointer: {
+        const pos = s.getCursorPos() catch break :pointer null;
+        break :pointer .{ .x = @intFromFloat(pos.x), .y = @intFromFloat(pos.y) };
+    };
+    self.showOn(.{
+        .app = s.app,
+        .hwnd = s.hwnd orelse return,
+        .owner = s.parent_window.hwnd orelse return,
+        .scale = s.parent_window.scale,
+        .width = s.width,
+        .height = s.height,
+        .pointer = pointer,
+    }, url);
+}
+
+/// `show` for a remote pane, whose runtime UI owns this preview: the
+/// bubble sits on the pane's child window at its size and moves away from
+/// the pointer where the pane maps it for its input (client pixels of
+/// that window, `clientPointer`).
+pub fn showRemote(self: *LinkPreview, pane: *RemotePane, url: []const u8) void {
+    if (url.len == 0) {
+        self.hideSoon();
+        return;
+    }
+    const hwnd = pane.hwnd orelse return;
+    self.showOn(.{
+        .app = pane.app,
+        .hwnd = hwnd,
+        .owner = pane.parent_window.hwnd orelse return,
+        .scale = pane.parent_window.scale,
+        .width = pane.width,
+        .height = pane.height,
+        .pointer = clientPointer(hwnd, pane.width, pane.height),
+    }, url);
+}
+
+/// Whether a bubble is on display: placed by a show and not hidden since.
+pub fn isShown(self: *const LinkPreview) bool {
+    return self.shown != null and self.popup.visible;
+}
+
+/// The pointer in client pixels of `hwnd` while it is over that window's
+/// `width` x `height` area (`pointerIn`), else null.
+fn clientPointer(hwnd: w32.HWND, width: u32, height: u32) ?Point {
+    var pt: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&pt) == 0 or w32.ScreenToClient(hwnd, &pt) == 0) return null;
+    return pointerIn(.{ .x = pt.x, .y = pt.y }, width, height);
+}
+
+/// `p` when it lies in a `width` x `height` area at the origin, else null:
+/// a pointer outside the terminal covers no link.
+pub fn pointerIn(p: Point, width: u32, height: u32) ?Point {
+    if (p.x < 0 or p.y < 0) return null;
+    if (@as(i64, p.x) >= width or @as(i64, p.y) >= height) return null;
+    return p;
+}
+
+fn showOn(self: *LinkPreview, host: Host, url: []const u8) void {
+    self.app = host.app;
+    const t = self.tokens() orelse return;
+    if (!Palette.ensurePopup(&self.popup, host.app, host.owner, .{
         .activate = false,
         .click_through = true,
         .dismiss_on_escape = false,
@@ -164,20 +245,20 @@ pub fn show(self: *LinkPreview, url: []const u8) void {
     }
 
     // The content scale of the window, like the terminal text.
-    self.popup.setOwnerScale(s.parent_window.scale);
+    self.popup.setOwnerScale(host.scale);
     const scale = self.popup.ownerScale();
     const url_hash = std.hash.Wyhash.hash(0, url);
     const same_url = if (self.shown) |shown|
         shown.url_hash == url_hash and shown.url_len == url.len and
-            shown.surface_width == s.width and shown.surface_height == s.height and
+            shown.surface_width == host.width and shown.surface_height == host.height and
             shown.scale == scale
     else
         false;
 
     // Lay the text out again only for another URL or surface size.
     const width: i32 = if (same_url) self.shown.?.width else width: {
-        const factory = s.app.uiFactory() orelse return;
-        const surface_w = style.dip(@intCast(s.width), scale);
+        const factory = host.app.uiFactory() orelse return;
+        const surface_w = style.dip(@intCast(host.width), scale);
         const max_w = @max(0, @min(surface_w * max_width_share, surface_w - 2 * margin));
         const max_pixels: i32 = @intFromFloat(@floor(max_w * scale));
         const measurer: Measurer = .{ .factory = factory, .text_style = textStyle(t) };
@@ -186,17 +267,13 @@ pub fn show(self: *LinkPreview, url: []const u8) void {
         break :width bubbleWidth(measurer.width(text), max_pixels, scale);
     };
 
-    const pointer: ?Point = pointer: {
-        const pos = s.getCursorPos() catch break :pointer null;
-        break :pointer .{ .x = @intFromFloat(pos.x), .y = @intFromFloat(pos.y) };
-    };
     const place = placement(
-        @intCast(s.width),
-        @intCast(s.height),
+        @intCast(host.width),
+        @intCast(host.height),
         width,
         style.px(bubble_height, scale),
         style.px(margin, scale),
-        pointer,
+        host.pointer,
     );
     if (same_url and self.popup.visible and self.shown.?.side == place.side) return;
 
@@ -204,14 +281,14 @@ pub fn show(self: *LinkPreview, url: []const u8) void {
         .url_hash = url_hash,
         .url_len = url.len,
         .side = place.side,
-        .surface_width = s.width,
-        .surface_height = s.height,
+        .surface_width = host.width,
+        .surface_height = host.height,
         .scale = scale,
         .width = width,
         .tokens = t,
     };
     var pt: w32.POINT = .{ .x = place.x, .y = place.y };
-    _ = w32.ClientToScreen(hwnd, &pt);
+    _ = w32.ClientToScreen(host.hwnd, &pt);
     const rect: w32.RECT = .{
         .left = pt.x,
         .top = pt.y,
@@ -378,7 +455,7 @@ fn endOfFirst(text: []const u8, k: usize) usize {
 
 fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
     const self: *LinkPreview = @ptrCast(@alignCast(ctx));
-    const t = self.tokens();
+    const t = self.tokens() orelse return;
     const size = popup.sizeDip();
     const full: d2d.Rect = .{ .x = 0, .y = 0, .w = size.width, .h = size.height };
     canvas.fillRect(full, t.surface_raised);

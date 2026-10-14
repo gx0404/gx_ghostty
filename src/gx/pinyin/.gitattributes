@@ -1,0 +1,2 @@
+# Preserve the exact upstream bytes pinned by SOURCE_FILES.
+inputs/**/*.txt -text

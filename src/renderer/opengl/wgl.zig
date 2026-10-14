@@ -564,6 +564,61 @@ pub const Context = struct {
             return error.ContextLost;
         }
 
+        // fork(gx): GX-0043 begin: source-owned remote views export the actual
+        // target FBO instead of relying on a hidden window's back buffer.
+        // Only this renderer thread touches GL; the apprt guard owns the bounded
+        // mapped write slot and its independent lifetime lock until finish.
+        if (comptime @hasDecl(apprt.Surface, "gxRemoteRenderingEnabled")) {
+            if (self.surface.gxRemoteRenderingEnabled()) {
+                if (self.surface.gxBeginRemoteFrame(@intCast(target.width), @intCast(target.height))) |value| {
+                    var remote = value;
+                    var success = false;
+                    defer remote.finish(success);
+                    const ctx = &gl.glad.context;
+                    // GL_FRAMEBUFFER_BINDING aliases DRAW, not READ. Preserve
+                    // the actual read binding when these two targets differ.
+                    var read_framebuffer: gl.c.GLint = 0;
+                    ctx.GetIntegerv.?(gl.c.GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+                    ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, target.framebuffer.id);
+                    defer ctx.BindFramebuffer.?(gl.c.GL_READ_FRAMEBUFFER, @intCast(read_framebuffer));
+                    var pack_buffer: gl.c.GLint = 0;
+                    var alignment: gl.c.GLint = 0;
+                    var row_length: gl.c.GLint = 0;
+                    var skip_rows: gl.c.GLint = 0;
+                    var skip_pixels: gl.c.GLint = 0;
+                    var read_buffer: gl.c.GLint = 0;
+                    ctx.GetIntegerv.?(gl.c.GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+                    ctx.GetIntegerv.?(gl.c.GL_PACK_ALIGNMENT, &alignment);
+                    ctx.GetIntegerv.?(gl.c.GL_PACK_ROW_LENGTH, &row_length);
+                    ctx.GetIntegerv.?(gl.c.GL_PACK_SKIP_ROWS, &skip_rows);
+                    ctx.GetIntegerv.?(gl.c.GL_PACK_SKIP_PIXELS, &skip_pixels);
+                    ctx.GetIntegerv.?(gl.c.GL_READ_BUFFER, &read_buffer);
+                    defer {
+                        ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, @intCast(pack_buffer));
+                        ctx.PixelStorei.?(gl.c.GL_PACK_ALIGNMENT, alignment);
+                        ctx.PixelStorei.?(gl.c.GL_PACK_ROW_LENGTH, row_length);
+                        ctx.PixelStorei.?(gl.c.GL_PACK_SKIP_ROWS, skip_rows);
+                        ctx.PixelStorei.?(gl.c.GL_PACK_SKIP_PIXELS, skip_pixels);
+                        ctx.ReadBuffer.?(@intCast(read_buffer));
+                    }
+                    ctx.BindBuffer.?(gl.c.GL_PIXEL_PACK_BUFFER, 0);
+                    ctx.PixelStorei.?(gl.c.GL_PACK_ALIGNMENT, 4);
+                    ctx.PixelStorei.?(gl.c.GL_PACK_ROW_LENGTH, @intCast(remote.frame.stride / 4));
+                    ctx.PixelStorei.?(gl.c.GL_PACK_SKIP_ROWS, 0);
+                    ctx.PixelStorei.?(gl.c.GL_PACK_SKIP_PIXELS, 0);
+                    ctx.ReadBuffer.?(gl.c.GL_COLOR_ATTACHMENT0);
+                    ctx.ReadPixels.?(0, 0, @intCast(target.width), @intCast(target.height), gl.c.GL_BGRA, gl.c.GL_UNSIGNED_BYTE, remote.frame.pixels().ptr);
+                    try gl.errors.getError();
+                    success = true;
+                }
+                if (self.surface.gxRemoteViewDetached()) {
+                    if (comptime @hasDecl(apprt.Surface, "signalFrameDrawn")) self.surface.signalFrameDrawn(@intCast(target.width), @intCast(target.height));
+                    return;
+                }
+            }
+        }
+        // fork(gx): GX-0043 end
+
         // The target holds sRGB-encoded values; copy them verbatim.
         try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
         defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {

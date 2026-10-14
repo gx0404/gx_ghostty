@@ -51,9 +51,11 @@
 | `just graph-query <问题…>` | `graphify.py query`：在本机图谱上查询，多个词合并为一句；路径与解释查询没有配方，直接用 `python scripts/graphify.py path …` 或 `python scripts/graphify.py explain …` | 本机已有 `graph.json`（先 `just graph`） | stdout | 透传 graphify；缺 `graph.json` 时 1 |
 | `just i18n` | `gx_i18n.py`：由上游 `po/zh_CN.po` 与 fork 的 `src/gx/i18n/gx.zh_CN.po`（同一 msgid 以 fork 为准）重新生成 GX 界面的 zh-CN 翻译表；跳过 fuzzy、废弃与空译文，带 msgctxt 的条目以 `<msgctxt>\x04<msgid>` 为键，fork 条目的 `{name}` 占位符必须与原文一致 | Python | 写 `src/gx/i18n/zh_CN.zig`（按键的 UTF-8 字节序排序、LF、无时间戳，入库，审 diff）；内容不变时不写 | 0；源文件缺失、语法错误、键重复或占位符不一致 2 |
 | `just i18n-check` | `gx_i18n.py --check`：内存重新生成后与已提交的翻译表比较（CRLF 检出视同 LF） | Python | 只读 | 0 新鲜；缺失或过期 1；源文件问题 2 |
-| `just pinyin` | `gx_pinyin.py --download`：联网取拼音源数据，重新生成 GX 的拼音首字母表 | Python；网络 | 写 `src/gx/pinyin/initials.zig`（生成物，入库，审 diff） | 见 `scripts/gx_pinyin.py` 的模块文档 |
-| `just pinyin-check` | `gx_pinyin.py --check`：离线校验拼音首字母表与生成器一致，不联网 | Python | 只读 | 0 新鲜；非 0 过期或出错，细节见脚本文档 |
-| `just generated-check` | 聚合门：kb-check → i18n-check → pinyin-check → graph-check | 同上各项 | 只读 | 首个失败子项的退出码 |
+| `just pinyin` | `gx_pinyin.py`：从仓内钉版输入 `src/gx/pinyin/inputs/0.15.0/` 离线重新生成拼音首字母表与全音节表（只有显式 `--download` 才联网） | Python | 写 `src/gx/pinyin/initials.zig`、`syllables.zig`（生成物，入库，审 diff） | 见 `scripts/gx_pinyin.py` 的模块文档 |
+| `just pinyin-check` | `gx_pinyin.py --check`：离线完整再生成两张拼音表并逐字节校验，不联网 | Python | 只读 | 0 新鲜；非 0 过期或出错，细节见脚本文档 |
+| `just fluent` | `gx_fluent_icons.py`：从 `src/gx/fluent/inputs/` 的钉版 SVG 离线生成 Fluent 图标路径 | Python | 写 `src/gx/fluent/paths.zig`（生成物，入库，审 diff） | 0 成功；2 输入缺失或不合法 |
+| `just fluent-check` | `gx_fluent_icons.py --check`：离线校验 Fluent 图标路径，不写文件 | Python | 只读 | 0 新鲜；1 缺失或过期；2 出错 |
+| `just generated-check` | 聚合门：kb-check → i18n-check → pinyin-check → fluent-check → graph-check | 同上各项 | 只读 | 首个失败子项的退出码 |
 
 ### 产品构建与测试
 

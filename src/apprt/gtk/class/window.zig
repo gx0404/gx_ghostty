@@ -384,6 +384,12 @@ pub const Window = extern struct {
         // fork(gx): GX-0011 begin: Ghostty GX menus, launch profiles and tooltips in the UI language
         gx_gtk.window.sync(self);
         // fork(gx): GX-0011 end
+        // fork(gx): GX-0039 issue window identity and follow hide/reopen.
+        @import("../gx/runtime.zig").windowInitialized(self);
+        // fork(gx): GX-0039 track actual normal geometry through window lifetime.
+        @import("../gx/window_state.zig").install(self);
+        // fork(gx): GX-0039 show pending restore diagnostics on the first normal window.
+        @import("../gx/session.zig").observeWindow(self);
     }
 
     /// Setup our action map.
@@ -429,6 +435,8 @@ pub const Window = extern struct {
     pub fn newTab(self: *Self, parent_: ?*CoreSurface, overrides: Overrides) void {
         _ = self.newTabPage(parent_, .tab, .{
             .command = overrides.command,
+            // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+            .launch_origin = overrides.launch_origin,
             .shell_integration = overrides.shell_integration,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
@@ -441,6 +449,8 @@ pub const Window = extern struct {
             .window,
             .{
                 .command = overrides.command,
+                // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+                .launch_origin = overrides.launch_origin,
                 .shell_integration = overrides.shell_integration,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
@@ -455,13 +465,14 @@ pub const Window = extern struct {
         overrides: Overrides,
     ) *adw.TabPage {
         const priv: *Private = self.private();
-        const tab_view = priv.tab_view;
 
         // Create our new tab object
         const tab = Tab.new(
             priv.config,
             .{
                 .command = overrides.command,
+                // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+                .launch_origin = overrides.launch_origin,
                 .shell_integration = overrides.shell_integration,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
@@ -475,6 +486,17 @@ pub const Window = extern struct {
             }
             tab.setParentWithContext(p, context);
         }
+
+        // fork(gx): GX-0039 insert both new and adopted tabs through one path.
+        return self.adoptTab(tab);
+    }
+
+    // fork(gx): GX-0039 begin: insert an empty or pre-populated unparented tab.
+    pub fn adoptTab(self: *Self, tab: *Tab) *adw.TabPage {
+        assert(tab.as(gtk.Widget).getParent() == null);
+        const priv = self.private();
+        const tab_view = priv.tab_view;
+        // fork(gx): GX-0039 end
 
         // Get the position that we should insert the new tab at.
         const config = if (priv.config) |v| v.get() else {
@@ -511,24 +533,7 @@ pub const Window = extern struct {
             .{ .sync_create = true },
         );
 
-        // Bind signals
-        const split_tree = tab.getSplitTree();
-        _ = SplitTree.signals.changed.connect(
-            split_tree,
-            *Self,
-            tabSplitTreeChanged,
-            self,
-            .{},
-        );
-
-        // Run an initial notification for the surface tree so we can setup
-        // initial state.
-        tabSplitTreeChanged(
-            split_tree,
-            null,
-            split_tree.getTree(),
-            self,
-        );
+        // fork(gx): GX-0039 tree listeners follow page attachment, including transfers.
 
         return page;
     }
@@ -821,6 +826,8 @@ pub const Window = extern struct {
         var it = tree.iterator();
         while (it.next()) |entry| {
             const surface = entry.view;
+            // fork(gx): GX-0039 view attachment follows actual window ownership.
+            @import("../gx/runtime.zig").surfaceAttached(self, surface);
             // Before adding any new signal handlers, disconnect any that we may
             // have added before. Otherwise we may get multiple handlers for the
             // same signal.
@@ -892,6 +899,18 @@ pub const Window = extern struct {
     /// Disconnect all the surface handlers for the given tree. This should
     /// be called whenever a tree is no longer present in the window, e.g.
     /// when a tab is detached or the tree changes.
+    // fork(gx): GX-0039 begin: same-window transfers share signal userdata.
+    /// Reconnect leaves only after both source and target models have committed.
+    pub fn gxRebindSurfaceHandlers(self: *Self) void {
+        const tabs = self.getTabView();
+        var index: c_int = 0;
+        while (index < tabs.getNPages()) : (index += 1) {
+            const tab = gobject.ext.cast(Tab, tabs.getNthPage(index).getChild()) orelse continue;
+            if (tab.getSurfaceTree()) |tree| self.connectSurfaceHandlers(tree);
+        }
+    }
+    // fork(gx): GX-0039 end
+
     fn disconnectSurfaceHandlers(
         self: *Self,
         tree: *const Surface.Tree,
@@ -899,6 +918,8 @@ pub const Window = extern struct {
         var it = tree.iterator();
         while (it.next()) |entry| {
             const surface = entry.view;
+            // fork(gx): GX-0039 view attachment follows actual window ownership.
+            @import("../gx/runtime.zig").surfaceDetached(self, surface);
             _ = gobject.signalHandlersDisconnectMatched(
                 surface.as(gobject.Object),
                 .{ .data = true },
@@ -1468,6 +1489,12 @@ pub const Window = extern struct {
     // Virtual methods
 
     fn dispose(self: *Self) callconv(.c) void {
+        // fork(gx): GX-0039 direct accepted destruction also removes session state.
+        @import("../gx/session.zig").closing(self);
+        // fork(gx): GX-0039 save accepted closes and stop geometry callbacks.
+        @import("../gx/window_state.zig").dispose(self);
+        // fork(gx): GX-0039 revoke identities before callbacks can reenter disposal.
+        @import("../gx/runtime.zig").dispose(self.as(gobject.Object));
         const priv = self.private();
 
         if (priv.handle_active_state_source) |v| {
@@ -1667,6 +1694,9 @@ pub const Window = extern struct {
             return @intFromBool(true);
         }
 
+        // fork(gx): GX-0039 cancellation never reaches this snapshot.
+        @import("../gx/session.zig").closing(self);
+        @import("../gx/window_state.zig").closing(self);
         self.as(gtk.Window).destroy();
         return @intFromBool(false);
     }
@@ -1675,6 +1705,9 @@ pub const Window = extern struct {
         _: *CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
+        // fork(gx): GX-0039 cancellation never reaches this snapshot.
+        @import("../gx/session.zig").closing(self);
+        @import("../gx/window_state.zig").closing(self);
         self.as(gtk.Window).destroy();
     }
 
@@ -1782,6 +1815,13 @@ pub const Window = extern struct {
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
 
+        // fork(gx): GX-0039 begin: a transferred tab must use its current owner.
+        @import("../gx/runtime.zig").tabAttached(self, tab);
+        @import("../gx/session.zig").changed(Application.default());
+        const split_tree = tab.getSplitTree();
+        _ = SplitTree.signals.changed.connect(split_tree, *Self, tabSplitTreeChanged, self, .{});
+        // fork(gx): GX-0039 end
+
         // Attach listeners for the tab.
         _ = Tab.signals.@"close-request".connect(
             tab,
@@ -1833,6 +1873,21 @@ pub const Window = extern struct {
             null,
             self,
         );
+
+        // fork(gx): GX-0039 revoke old view leases before publishing the new owner.
+        @import("../gx/runtime.zig").tabDetached(self, tab);
+        @import("../gx/session.zig").removed(Application.default());
+        // fork(gx): GX-0039 begin: disconnect the tree itself, not only its leaves.
+        _ = gobject.signalHandlersDisconnectMatched(
+            tab.getSplitTree().as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+        // fork(gx): GX-0039 end
 
         // Remove the tree handlers
         if (tab.getSurfaceTree()) |tree| {
@@ -2030,6 +2085,10 @@ pub const Window = extern struct {
                 @intCast(size.height),
             );
         }
+        // fork(gx): GX-0039 late renderer sizing must retain restored axes.
+        @import("../gx/window_state.zig").restore(self);
+        // fork(gx): GX-0039 per-window session geometry wins over the last-window fallback.
+        @import("../gx/session.zig").applyGeometry(self);
     }
 
     fn tabSplitTreeChanged(
@@ -2044,6 +2103,14 @@ pub const Window = extern struct {
 
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
+        }
+        // fork(gx): GX-0039 observe the completed tree later, after a transfer commits.
+        if ((if (old_tree) |tree| tree.nodes.len else @as(usize, 0)) >
+            (if (new_tree) |tree| tree.nodes.len else @as(usize, 0)))
+        {
+            @import("../gx/session.zig").removed(Application.default());
+        } else {
+            @import("../gx/session.zig").changed(Application.default());
         }
         // fork(gx): GX-0016 begin: re-evaluate herdr app mode
         self.private().gx_app_mode.update(self, true);

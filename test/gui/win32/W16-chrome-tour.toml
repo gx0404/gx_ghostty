@@ -5,7 +5,7 @@ command = cmd.exe /d /k prompt $G$S
 language = en
 """
 expect = [
-  "main-menu: opened from the keyboard, the main menu sits below the chrome at the window's left edge with its first item highlighted, its items and the shortcut column",
+  "main-menu: opened from the keyboard, the main menu sits below the main-menu button on the right side of the chrome, aligned to the button's right edge, with its first item highlighted, its items and the shortcut column",
   "keybinds: the keyboard shortcuts cheat sheet lists categories and key caps",
   "settings: the settings overlay shows its six sections (Language, Appearance, Font, Interaction, Shell, About)",
 ]

@@ -6,6 +6,7 @@ the input guard. Nothing here starts Ghostty or sends input; the Win32 backend i
 from __future__ import annotations
 
 import struct
+import os
 import sys
 import tempfile
 import unittest
@@ -90,6 +91,32 @@ class GeometryTests(unittest.TestCase):
 
 
 class IsolationTests(unittest.TestCase):
+    def test_launch_resolves_relative_isolation_before_changing_child_cwd(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            exe = directory / "ghostty.exe"
+            exe.write_bytes(b"fixture")
+            environment = directory / "env"
+            environment.mkdir()
+            relative_exe = Path("ghostty.exe")
+            relative_environment = Path("env")
+            native = mock.Mock()
+            native.now_filetime.return_value = 1
+            native.process_creation.return_value = 2
+            with mock.patch.object(gui, "win32", return_value=native), mock.patch.object(gui.subprocess, "Popen") as popen:
+                popen.return_value.pid = 123
+                previous = Path.cwd()
+                try:
+                    os.chdir(directory)
+                    gui.launch(relative_exe, relative_environment)
+                finally:
+                    os.chdir(previous)
+            args, options = popen.call_args
+            self.assertEqual(args[0][0], str(exe.resolve()))
+            self.assertEqual(options["cwd"], str(environment.resolve()))
+            self.assertEqual(options["env"]["LOCALAPPDATA"], str(environment.resolve()))
+            self.assertEqual(options["env"]["XDG_CONFIG_HOME"], str(environment.resolve()))
+
     def test_isolated_environment(self):
         base = {"PATH": "C:/bin", "NO_COLOR": "1", "TERM": "dumb", "ColorTerm": "truecolor", "TERM_PROGRAM": "x",
                 "GHOSTTY_RESOURCES_DIR": "r", "ghostty_gx_opengl": "software", "LocalAppData": "C:/real",

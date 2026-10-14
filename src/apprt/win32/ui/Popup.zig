@@ -56,9 +56,13 @@ const clipboard = @import("../clipboard.zig");
 const w32 = @import("../win32.zig");
 const anim = @import("anim.zig");
 const d2d = @import("d2d.zig");
+const dcomp = @import("dcomp.zig");
 const style = @import("style.zig");
 const text_edit = @import("text_edit.zig");
 const wstr = @import("wstr.zig");
+const App = @import("../App.zig");
+const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 
 const log = std.log.scoped(.win32_popup);
 
@@ -107,6 +111,7 @@ pub const Cursor = enum { arrow, ibeam, hand };
 pub const Callbacks = struct {
     /// Passed to every callback.
     ctx: *anyopaque,
+    uia_source: ?UiaSource = null,
     /// Paint the content in DIPs. The canvas is cleared to transparent
     /// black; fill the background yourself.
     paint: *const fn (ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void,
@@ -135,6 +140,17 @@ pub const Callbacks = struct {
     /// show itself from the message loop); return true when handled.
     message: ?*const fn (ctx: *anyopaque, popup: *Popup, msg: u32, wparam: usize, lparam: isize) bool = null,
 };
+
+pub const UiaSource = struct {
+    app: *App,
+    /// GUI-only data copy. Must not pump messages or destroy the widget.
+    build: *const fn (*anyopaque, *Popup, *uia_bridge.PopupBridge, *uia.Api, *uia.Queue) anyerror!void,
+    is_live: *const fn (*anyopaque) bool,
+    action: *const fn (*anyopaque, u64, *const uia.Action) bool,
+};
+
+// Every popup is created on the one GUI thread. Zero is the revoked cookie.
+var next_uia_cookie: u64 = 1;
 
 /// How a popup with `Options.motion` comes in.
 pub const Motion = struct {
@@ -197,9 +213,20 @@ pub const REPEAT_TIMER_ID: usize = 0x5250; // 'RP'
 hwnd: ?w32.HWND = null,
 owner: ?w32.HWND = null,
 canvas: ?d2d.Canvas = null,
+composition: ?dcomp.Backend = null,
+composition_requested: bool = false,
+composition_attempted: bool = false,
+composition_failed: bool = false,
+composition_frame: ?dcomp.FrameKey = null,
+composition_generation: u64 = 0,
+composition_failure: dcomp.Failure = .none,
 alloc: Allocator = undefined,
 options: Options = .{},
 callbacks: ?Callbacks = null,
+uia_view: uia_bridge.PopupBridge = .{},
+uia_cookie: u64 = 0,
+uia_refreshing: bool = false,
+uia_layout_pending: bool = true,
 visible: bool = false,
 dpi: u32 = 96,
 /// The owner's content scale relative to its window DPI (`setOwnerScale`),
@@ -277,6 +304,10 @@ pub fn create(
     callbacks: Callbacks,
 ) !void {
     if (self.hwnd != null) return;
+    self.uiaDetach();
+    if (next_uia_cookie == std.math.maxInt(u64)) return error.Exhausted;
+    const uia_cookie = next_uia_cookie;
+    next_uia_cookie += 1;
     try registerClasses(hinstance);
     // A popup Windows destroyed with its owner may come back: free what
     // the old window left.
@@ -305,9 +336,11 @@ pub fn create(
         .hwnd = hwnd,
         .owner = owner,
         .canvas = d2d.Canvas.init(factory),
+        .composition_requested = dcomp.enabled(),
         .alloc = factory.alloc,
         .options = options,
         .callbacks = callbacks,
+        .uia_cookie = uia_cookie,
         .dpi = dpiOf(owner),
         .layered = layered,
         .input = .{ .alloc = factory.alloc },
@@ -326,6 +359,7 @@ pub fn create(
 /// Free the canvas and text input of a popup whose window Windows already
 /// destroyed (they outlive it).
 fn freeResources(self: *Popup) void {
+    self.releaseComposition();
     if (self.canvas) |*canvas| canvas.deinit();
     self.canvas = null;
     self.dib.deinit();
@@ -334,6 +368,8 @@ fn freeResources(self: *Popup) void {
 
 /// Destroy the window and its resources.
 pub fn destroy(self: *Popup) void {
+    self.uiaDetach();
+    self.releaseComposition();
     if (self.hwnd) |hwnd| {
         self.unlockOwner();
         anim.stop(&self.animator);
@@ -376,6 +412,8 @@ pub fn setAccessibleName(self: *Popup, name: []const u8) void {
 
 /// Release the render target (it is recreated by the next paint).
 pub fn discardTarget(self: *Popup) void {
+    if (self.composition) |*backend| backend.reset();
+    self.composition_frame = null;
     if (self.canvas) |*canvas| canvas.discardTarget();
     self.dib.deinit();
 }
@@ -449,6 +487,7 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
     if (self.options.activate and self.options.keep_owner_active) self.lockOwner();
     const motion = if (self.layered) self.options.motion else null;
     const animate = motion != null and anim.enabled();
+    self.composition_frame = null;
     // Cloaked until it painted and DWM had a frame for it.
     setCloaked(hwnd, true);
     self.revealing = true;
@@ -504,6 +543,7 @@ fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
     const resized = !known or
         current.right - current.left != rect.right - rect.left or
         current.bottom - current.top != rect.bottom - rect.top;
+    self.uiaDirty();
     var flags: u32 = w32.SWP_NOZORDER | w32.SWP_NOACTIVATE;
     if (!resized) flags |= w32.SWP_NOSIZE;
     _ = w32.SetWindowPos(hwnd, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags);
@@ -515,6 +555,7 @@ fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
 
 /// Hide without reporting a dismissal.
 pub fn hide(self: *Popup) void {
+    self.uiaDetach();
     const was_visible = self.visible;
     self.visible = false;
     const hwnd = self.hwnd orelse return;
@@ -542,7 +583,59 @@ pub fn dismiss(self: *Popup, reason: DismissReason) void {
 
 /// Repaint the popup.
 pub fn invalidate(self: *Popup) void {
+    self.uiaDirty();
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
+}
+
+fn uiaDirty(self: *Popup) void {
+    self.uia_view.dirty();
+    self.uia_layout_pending = true;
+}
+
+fn uiaDetach(self: *Popup) void {
+    if (self.callbacks) |cb| if (cb.uia_source) |source| {
+        source.app.uia_popups.unregister(&self.uia_view);
+    };
+    self.uia_view.hide();
+    self.uia_layout_pending = true;
+}
+
+fn uiaRefresh(self: *Popup) void {
+    if (self.uia_refreshing or !self.visible) return;
+    if (!self.uia_view.needs_publish and self.uia_view.publisher.current != null) return;
+    const cb = self.callbacks orelse return;
+    const source = cb.uia_source orelse return;
+    if (source.app.drop_closing) return self.uiaDetach();
+    const api = source.app.uia_api orelse return;
+    const queue = source.app.uia_queue orelse return;
+    if (!source.is_live(cb.ctx)) return self.uia_view.hide();
+    source.app.uia_popups.register(&self.uia_view) catch return self.uia_view.hide();
+    self.uia_refreshing = true;
+    defer self.uia_refreshing = false;
+    source.build(cb.ctx, self, &self.uia_view, api, queue) catch self.uia_view.hide();
+}
+
+fn livePopup(hwnd: w32.HWND, cookie: u64) ?*Popup {
+    const address = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    if (address == 0) return null;
+    const current: *Popup = @ptrFromInt(@as(usize, @bitCast(address)));
+    if (current.uia_cookie != cookie or current.hwnd != hwnd) return null;
+    return current;
+}
+pub fn uiaAlive(hwnd: w32.HWND, cookie: u64) bool {
+    return livePopup(hwnd, cookie) != null;
+}
+
+fn uiaGetObject(self: *Popup, hwnd: w32.HWND, wparam: usize, lparam: isize) isize {
+    const cb = self.callbacks orelse return 0;
+    const source = cb.uia_source orelse return 0;
+    const cookie = self.uia_cookie;
+    if (!source.app.ensureUia()) return 0;
+    const current = livePopup(hwnd, cookie) orelse return 0;
+    if (current.uia_layout_pending) current.paint(hwnd);
+    const ready = livePopup(hwnd, cookie) orelse return 0;
+    ready.uiaRefresh();
+    return ready.uia_view.publisher.returnProvider(wparam, lparam);
 }
 
 /// What the modal loop of a dialog or menu does with a WM_QUIT (exit code
@@ -571,8 +664,17 @@ fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
 fn reveal(self: *Popup, hwnd: w32.HWND) void {
     _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
     if (!self.revealing) return;
-    self.revealing = false;
+    const cookie = self.uia_cookie;
     _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
+    const current = livePopup(hwnd, cookie) orelse return;
+    // The opt-in path (including its legacy fallback) must have a successful
+    // current-size/current-DPI frame. Do not reveal a failed or stale surface.
+    if (current.composition_requested and !current.compositionReady(hwnd)) {
+        log.warn("popup has no successful frame after composition fallback", .{});
+        current.hide();
+        return;
+    }
+    current.revealing = false;
     setCloaked(hwnd, false);
     if (!self.fade_pending) return;
     self.fade_pending = false;
@@ -1279,6 +1381,8 @@ fn handleClose(self: *Popup, hwnd: w32.HWND) void {
 
 /// Windows destroyed the window (with its owner): forget it.
 fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
+    self.uiaDetach();
+    self.releaseComposition();
     self.unlockOwner();
     anim.stop(&self.animator);
     if (self.system_caret) _ = DestroyCaret();
@@ -1294,6 +1398,11 @@ fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
 }
 
 fn paint(self: *Popup, hwnd: w32.HWND) void {
+    const cookie = self.uia_cookie;
+    defer if (livePopup(hwnd, cookie)) |current| {
+        current.uia_layout_pending = false;
+        current.uiaRefresh();
+    };
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc = w32.BeginPaint(hwnd, &ps);
     defer _ = w32.EndPaint(hwnd, &ps);
@@ -1304,6 +1413,7 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     self.paint_scale = self.scale();
     // Only a text input drawn by this paint takes clicks and the I-beam.
     self.input.field = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    if (self.paintComposition(hwnd, canvas, cb)) return;
     if (self.layered) {
         // A layered window shows GDI content reliably: draw into a DIB.
         const dc = hdc orelse return;
@@ -1314,7 +1424,7 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
         canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
         cb.paint(cb.ctx, self, canvas);
         switch (canvas.finish()) {
-            .ok => _ = w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY),
+            .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd),
             .recreate => self.invalidate(),
             .failed => {},
         }
@@ -1323,7 +1433,107 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     if (!canvas.beginHwnd(hwnd, self.canvasDpi())) return;
     canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
     cb.paint(cb.ctx, self, canvas);
-    if (canvas.finish() == .recreate) self.invalidate();
+    switch (canvas.finish()) {
+        .ok => self.markLegacyFrame(hwnd),
+        .recreate => self.invalidate(),
+        .failed => {},
+    }
+}
+
+fn releaseComposition(self: *Popup) void {
+    if (self.composition) |*backend| backend.deinit();
+    self.composition = null;
+    self.composition_frame = null;
+}
+
+fn compositionReady(self: *Popup, hwnd: w32.HWND) bool {
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return false;
+    const width: u32 = @intCast(client.right);
+    const height: u32 = @intCast(client.bottom);
+    if (!self.composition_failed) if (self.composition) |*backend| return backend.ready(width, height, self.canvasDpi());
+    const frame = self.composition_frame orelse return false;
+    return frame.width == width and frame.height == height and frame.dpi == self.canvasDpi();
+}
+
+fn markLegacyFrame(self: *Popup, hwnd: w32.HWND) void {
+    if (!self.composition_requested) return;
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return;
+    // Present the legacy pixels before detaching the old composition root.
+    // A failed legacy draw therefore keeps the last native frame, rather than
+    // committing an empty root while no replacement pixels exist yet.
+    if (self.composition_failed) self.releaseComposition();
+    self.composition_frame = .{ .width = @intCast(client.right), .height = @intCast(client.bottom), .dpi = self.canvasDpi(), .generation = 0 };
+}
+
+/// Failure disables composition for this popup lifetime. The caller immediately
+/// paints the same content through its original HWND/DC path; no blank reveal
+/// and no repeated device creation loop on a failing driver.
+fn paintComposition(self: *Popup, hwnd: w32.HWND, canvas: *d2d.Canvas, cb: Callbacks) bool {
+    if (!self.composition_requested) return false;
+    self.composition_frame = null;
+    if (self.composition_failed) return false;
+    if (!self.composition_attempted) {
+        self.composition_attempted = true;
+        if (canvas.factory.popupDevice()) |device| {
+            self.composition = dcomp.Backend.init(device, hwnd) catch |err| result: {
+                log.warn("popup composition target unavailable; using legacy err={}", .{err});
+                break :result null;
+            };
+            if (self.composition) |*backend| {
+                backend.key.generation = self.composition_generation;
+                backend.failure = self.composition_failure;
+            }
+        }
+    }
+    const backend = if (self.composition) |*value| value else return false;
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return false;
+    const frame = backend.begin(@intCast(client.right), @intCast(client.bottom), self.canvasDpi()) catch |err| {
+        log.warn("popup composition BeginDraw failed; using legacy err={}", .{err});
+        self.failComposition();
+        return false;
+    };
+    self.composition_generation = frame.key.generation;
+    if (!canvas.beginBorrowed(frame.context, .{ .width = frame.key.width, .height = frame.key.height }, frame.key.dpi, frame.offset)) {
+        dcomp.releaseContext(frame.context);
+        self.failComposition();
+        return false;
+    }
+    canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
+    cb.paint(cb.ctx, self, canvas);
+    canvas.finishBorrowed();
+    dcomp.releaseContext(frame.context);
+    backend.finish(frame.key) catch |err| {
+        log.warn("popup composition EndDraw/Commit failed; using legacy err={}", .{err});
+        self.failComposition();
+        return false;
+    };
+    self.composition_frame = frame.key;
+    return true;
+}
+
+fn failComposition(self: *Popup) void {
+    self.composition_failed = true;
+    if (self.composition) |*backend| backend.reset();
+}
+
+/// Popup-only native test hook. wparam=0 queries bits: opted-in=1, native=2,
+/// current frame=4, WARP=8, legacy fallback=16. wparam=1 resets the popup
+/// resource domain and injects Failure(lparam) at its next native draw phase.
+/// It never touches a terminal context, and does nothing without explicit opt-in.
+pub const WM_GHOSTTY_POPUP_DCOMP: u32 = w32.WM_USER + 0x4E;
+
+fn compositionStatus(self: *Popup, hwnd: w32.HWND) isize {
+    var result: isize = if (self.composition_requested) 1 else 0;
+    if (!self.composition_failed and self.composition != null) {
+        const backend = &self.composition.?;
+        result |= 2;
+        if (backend.device.warp) result |= 8;
+    } else if (self.composition_requested and self.composition_attempted) result |= 16;
+    if (self.compositionReady(hwnd)) result |= 4;
+    return result;
 }
 
 /// An IME string or attribute array read by `imeData`.
@@ -1438,6 +1648,15 @@ fn wndProc(
     const self: *Popup = @ptrFromInt(@as(usize, @bitCast(userdata)));
 
     switch (msg) {
+        0x000A => { // WM_ENABLE: modal dialogs changed the actual input gate.
+            self.invalidate();
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_GETOBJECT => {
+            if (w32.objectId(lparam) == w32.OBJID_CLIENT) return 0;
+            if (w32.objectId(lparam) == uia.root_object_id) return self.uiaGetObject(hwnd, wparam, lparam);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         WM_NCHITTEST => {
             if (self.options.click_through) return HTTRANSPARENT;
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -1463,6 +1682,21 @@ fn wndProc(
         w32.WM_PAINT => {
             self.paint(hwnd);
             return 0;
+        },
+        WM_GHOSTTY_POPUP_DCOMP => {
+            if (wparam == 0) return self.compositionStatus(hwnd);
+            if (wparam != 1 or !self.composition_requested) return 0;
+            const raw = std.math.cast(u32, lparam) orelse return 0;
+            const failure = std.enums.fromInt(dcomp.Failure, raw) orelse return 0;
+            const cookie = self.uia_cookie;
+            self.releaseComposition();
+            self.composition_attempted = false;
+            self.composition_failed = false;
+            self.composition_failure = failure;
+            self.invalidate();
+            _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | w32.RDW_UPDATENOW);
+            const current = livePopup(hwnd, cookie) orelse return 0;
+            return current.compositionStatus(hwnd);
         },
         w32.WM_SIZE => {
             self.invalidate();

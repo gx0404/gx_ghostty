@@ -37,13 +37,15 @@ def prefetch_namespace() -> dict:
 
 
 def find_bash() -> str | None:
-    """A real bash for `bash -n`; the WSL launcher under %SystemRoot% does not count."""
+    """A real bash; neither Windows' system launcher nor Store alias counts."""
     system_root = os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or (os.name == "nt" and os.path.normcase(os.path.abspath(entry)).startswith(system_root)):
             continue
         found = shutil.which("bash", path=entry)
         if found:
+            if os.name == "nt" and Path(found).parent.name.lower() == "windowsapps":
+                continue
             return found
     return None
 
@@ -329,7 +331,7 @@ class ScriptTests(unittest.TestCase):
             with self.subTest(script=name):
                 # stdin, not -c: an MSYS bash would re-parse a Windows command line argument.
                 result = subprocess.run(
-                    [bash, "-n"], input=invocation.script, capture_output=True, text=True, encoding="utf-8", check=False
+                    [bash, "-n"], input=invocation.script.encode("utf-8"), capture_output=True, check=False
                 )
                 self.assertEqual(0, result.returncode, result.stderr)
 
@@ -691,8 +693,8 @@ mkdir() {
 }
 ''' + gx_wsl.SMOKE_BODY
             args = [out.as_posix(), "", "", "", "", "20", "perf", "1280x800x24", "3", "0", "", gx_wsl.PERF_WORKLOAD]
-            result = subprocess.run([find_bash(), "-s", "--", *args], input=script, capture_output=True,
-                                    text=True, encoding="utf-8", check=False)
+            result = subprocess.run([find_bash(), "-s", "--", *args], input=script.encode("utf-8"),
+                                    capture_output=True, check=False)
             self.assertEqual(2, result.returncode, result.stderr)
             self.assertEqual("raced\n", (out / "perf-raced.log").read_text())
 

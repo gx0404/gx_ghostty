@@ -41,6 +41,19 @@ pub const Attachment = struct {
     pub fn matches(self: Attachment, live: Attachment) bool {
         return self.isValid() and live.isValid() and std.meta.eql(self, live);
     }
+
+    /// GUI-thread visibility transition. Hidden views are immediately inert;
+    /// reopening reserves a fresh revision, while repeated shows are idempotent.
+    /// Failure leaves the attachment revoked, never usable with its old owner.
+    pub fn setVisible(self: *Attachment, issuer: *Issuer, object: Reference, owner: Reference, visible: bool) Error!void {
+        if (!visible) {
+            self.* = .{};
+            return;
+        }
+        if (self.isValid() and self.object.matches(object) and self.owner.matches(owner) and object.epoch == issuer.epoch) return;
+        self.* = .{};
+        self.* = try issuer.attach(object, owner);
+    }
 };
 
 /// GUI-thread issuer. Use a fresh nonzero host epoch for every app lifetime;
@@ -214,4 +227,25 @@ test "identity exhaustion fails closed without wrapping or reusing a generation"
     try std.testing.expectError(error.Exhausted, issuer.surface(42));
     try std.testing.expectError(error.Exhausted, issuer.attach(last, last));
     try std.testing.expectEqual(std.math.maxInt(u64), issuer.serial);
+}
+
+test "view visibility revokes hidden providers and never revives their revision" {
+    var issuer = try Issuer.init(1);
+    const owner = try issuer.create(.window);
+    const terminal = try issuer.surface(42);
+    var view = try issuer.attach(terminal, owner);
+    const original = view;
+    const serial = issuer.serial;
+    try view.setVisible(&issuer, terminal, owner, true);
+    try std.testing.expect(original.matches(view));
+    try std.testing.expectEqual(serial, issuer.serial);
+    try view.setVisible(&issuer, terminal, owner, false);
+    try std.testing.expect(!view.isValid());
+    try view.setVisible(&issuer, terminal, owner, true);
+    try std.testing.expect(!original.matches(view));
+    try std.testing.expect(original.object.matches(view.object));
+    try view.setVisible(&issuer, terminal, owner, false);
+    issuer.serial = std.math.maxInt(u64);
+    try std.testing.expectError(error.Exhausted, view.setVisible(&issuer, terminal, owner, true));
+    try std.testing.expect(!view.isValid());
 }

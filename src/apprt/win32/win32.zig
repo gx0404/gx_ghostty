@@ -728,6 +728,7 @@ pub extern "user32" fn SetLayeredWindowAttributes(
 pub const RDW_INVALIDATE: u32 = 0x0001;
 pub const RDW_ERASE: u32 = 0x0004;
 pub const RDW_ALLCHILDREN: u32 = 0x0080;
+pub const RDW_UPDATENOW: u32 = 0x0100;
 pub const RDW_FRAME: u32 = 0x0400;
 pub extern "user32" fn RedrawWindow(
     hWnd: ?HWND,

@@ -139,6 +139,17 @@ last_binding_trigger: u64 = 0,
 gx_win32_key: ?gx_win32_input.Pending = null,
 // fork(gx): GX-0006 end
 
+// fork(gx): GX-0044 begin: optional resolved-binding routing for remote views
+gx_binding_route: ?struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque, *Surface, input.KeyEvent, input.Binding.Set.GenericLeaf, ?GxOnceTable) anyerror!?InputEffect,
+    config_changed: *const fn (*anyopaque) void,
+} = null,
+gx_binding_bypass: bool = false,
+gx_table_generation: u64 = 0,
+gx_sequence_once: ?GxOnceTable = null,
+// fork(gx): GX-0044 end
+
 /// The terminal IO handler.
 io: termio.Termio,
 io_thread: termio.Thread,
@@ -295,6 +306,8 @@ pub const Keyboard = struct {
     table_stack: std.ArrayListUnmanaged(struct {
         set: *const input.Binding.Set,
         once: bool,
+        // fork(gx): GX-0044 distinguish reactivations during remote continuations
+        gx_generation: u64 = 0,
     }) = .empty,
 
     /// The last handled binding. This is used to prevent encoding release
@@ -1845,6 +1858,9 @@ pub fn updateConfig(
     };
     self.config.deinit();
     self.config = derived;
+    // fork(gx): GX-0044 begin: invalidate suspended chains before new input
+    if (self.gx_binding_route) |route| route.config_changed(route.context);
+    // fork(gx): GX-0044 end
 
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
@@ -3029,6 +3045,10 @@ fn maybeHandleBinding(
     event: input.KeyEvent,
     insp_ev: ?*inspectorpkg.KeyEvent,
 ) !?InputEffect {
+    // fork(gx): GX-0044 begin: a completed performable miss encodes once
+    if (self.gx_binding_bypass) return null;
+    var gx_once: ?GxOnceTable = null;
+    // fork(gx): GX-0044 end
     switch (event.action) {
         // Release events never trigger a binding but we need to check if
         // we consumed the press event so we don't encode the release.
@@ -3053,6 +3073,8 @@ fn maybeHandleBinding(
     const entry: input.Binding.Set.Entry = entry: {
         // Handle key sequences first.
         if (self.keyboard.sequence_set) |set| {
+            // fork(gx): GX-0044 carry a prefix's one-shot activation to its leaf
+            gx_once = self.gxSequenceOnce();
             // Get our entry from the set for the given event.
             if (set.getEvent(event)) |v| break :entry v;
 
@@ -3090,7 +3112,10 @@ fn maybeHandleBinding(
                     // Note: we may want to change the semantics here to
                     // remove this table no matter where it is in the stack,
                     // maybe.
-                    if (table.once and i == 0) _ = try self.performBindingAction(
+                    // fork(gx): GX-0044 begin: remote actions defer the one-shot pop
+                    if (table.once and i == 0 and self.gx_binding_route != null) gx_once = .{ .set = table.set, .generation = table.gx_generation };
+                    // fork(gx): GX-0044 end
+                    if (table.once and i == 0 and self.gx_binding_route == null) _ = try self.performBindingAction(
                         .deactivate_key_table,
                     );
 
@@ -3119,6 +3144,8 @@ fn maybeHandleBinding(
 
             // Setup the next set we'll look at only after all fallible work.
             self.keyboard.sequence_set = set;
+            // fork(gx): GX-0044 prefixes have not performed their action yet
+            self.gxRememberSequenceOnce(gx_once);
 
             // Start or continue our key sequence
             _ = self.rt_app.performAction(
@@ -3137,6 +3164,13 @@ fn maybeHandleBinding(
 
         inline .leaf, .leaf_chained => |leaf| leaf.generic(),
     };
+
+    // fork(gx): GX-0044 begin: route only after source key tables and sequences resolve
+    if (self.gx_binding_route) |route| {
+        if (try route.callback(route.context, self, event, leaf, gx_once)) |effect| return effect;
+        if (gx_once) |once| try self.gxPopOnceTable(once);
+    }
+    // fork(gx): GX-0044 end
 
     // consumed determines if the input is consumed or if we continue
     // encoding the key (if we have a key to encode).
@@ -3258,6 +3292,85 @@ fn maybeHandleBinding(
     return null;
 }
 
+// fork(gx): GX-0044 begin: finish suspended binding effects exactly once
+pub const GxOnceTable = struct { set: *const input.Binding.Set, generation: u64 };
+
+pub fn gxRememberSequenceOnce(self: *Surface, once: ?GxOnceTable) void {
+    if (self.gx_binding_route != null) self.gx_sequence_once = once;
+}
+
+pub fn gxSequenceOnce(self: *const Surface) ?GxOnceTable {
+    return if (self.gx_binding_route != null) self.gx_sequence_once else null;
+}
+
+pub fn gxCompleteBinding(self: *Surface, event: input.KeyEvent, flags: input.Binding.Flags, performed: bool, ignored: bool, once: ?GxOnceTable) !bool {
+    if (performed) if (once) |table| try self.gxPopOnceTable(table);
+    self.keyboard.last_trigger = null;
+    self.keyboard.sequence_set = null;
+    if (ignored and performed) {
+        self.endKeySequence(.drop, .retain);
+        return false;
+    }
+    if (flags.performable and !performed) {
+        self.endKeySequence(.flush, .retain);
+        return true;
+    }
+    if (flags.consumed or flags.all or flags.global) {
+        self.endKeySequence(.drop, .retain);
+        self.keyboard.last_trigger = event.bindingHash();
+        return false;
+    }
+    self.endKeySequence(.flush, .retain);
+    return true;
+}
+
+fn gxPopOnceTable(self: *Surface, table: GxOnceTable) !void {
+    for (self.keyboard.table_stack.items, 0..) |active, i| {
+        if (active.set != table.set or active.gx_generation != table.generation) continue;
+        if (i + 1 == self.keyboard.table_stack.items.len) {
+            _ = try self.performBindingAction(.deactivate_key_table);
+        } else {
+            // A chained action activated another table while awaiting a UI
+            // receipt. Remove only the matched activation, preserving that one.
+            _ = self.keyboard.table_stack.orderedRemove(i);
+        }
+        return;
+    }
+}
+
+pub fn gxBeginBinding(self: *Surface) void {
+    self.keyboard.last_trigger = null;
+    self.keyboard.sequence_set = null;
+    self.gx_sequence_once = null;
+}
+
+pub fn gxCancelPendingSequence(self: *Surface) void {
+    self.endKeySequence(.drop, .retain);
+}
+
+pub fn gxCancelBinding(self: *Surface, event: input.KeyEvent) void {
+    self.gxCancelPendingSequence();
+    self.keyboard.last_trigger = event.bindingHash();
+}
+
+test "gx.remote_binding once completion preserves newer table activations" {
+    var original: input.Binding.Set = .{};
+    var newer: input.Binding.Set = .{};
+    var surface: Surface = undefined;
+    surface.alloc = std.testing.allocator;
+    surface.keyboard = .{};
+    defer surface.keyboard.table_stack.deinit(surface.alloc);
+    try surface.keyboard.table_stack.append(surface.alloc, .{ .set = &original, .once = true, .gx_generation = 3 });
+    try surface.keyboard.table_stack.append(surface.alloc, .{ .set = &newer, .once = true, .gx_generation = 4 });
+    try surface.gxPopOnceTable(.{ .set = &original, .generation = 3 });
+    try std.testing.expectEqual(@as(usize, 1), surface.keyboard.table_stack.items.len);
+    try std.testing.expect(surface.keyboard.table_stack.items[0].set == &newer);
+    // A stale completion must not pop a later activation of the same table.
+    try surface.gxPopOnceTable(.{ .set = &newer, .generation = 2 });
+    try std.testing.expectEqual(@as(usize, 1), surface.keyboard.table_stack.items.len);
+}
+// fork(gx): GX-0044 end
+
 fn deactivateAllKeyTables(self: *Surface) !bool {
     switch (self.keyboard.table_stack.items.len) {
         // No key table active. This does nothing.
@@ -3322,6 +3435,8 @@ fn endKeySequence(
     action: KeySequenceQueued,
     mem: KeySequenceMemory,
 ) void {
+    // fork(gx): GX-0044 ending/cancelling a prefix never consumes its table
+    self.gx_sequence_once = null;
     // Notify apprt key sequence ended
     _ = self.rt_app.performAction(
         .{ .surface = self },
@@ -5218,7 +5333,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 );
 
                 // Clear the selection if configured to do so.
-                if (self.config.selection_clear_on_copy) {
+                // fork(gx): GX-0044 remote writes clear only after an actual receipt
+                if (self.config.selection_clear_on_copy and self.gx_binding_route == null) {
                     if (self.setSelection(null)) {
                         self.queueRender() catch |err| {
                             log.warn("failed to queue render after clear selection err={}", .{err});
@@ -5752,9 +5868,13 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
 
             // Add the table to the stack.
+            // fork(gx): GX-0044 monotonic activation identity for deferred pop
+            self.gx_table_generation = std.math.add(u64, self.gx_table_generation, 1) catch return false;
             try self.keyboard.table_stack.append(self.alloc, .{
                 .set = set,
                 .once = tag == .activate_key_table_once,
+                // fork(gx): GX-0044 keep the identity with its stack entry
+                .gx_generation = self.gx_table_generation,
             });
 
             // Notify the UI.
@@ -6284,6 +6404,23 @@ pub fn denyClipboardRequest(self: *Surface, req: apprt.ClipboardRequest) void {
         },
     }
 }
+
+// fork(gx): GX-0044 begin: acknowledge a target-owned clipboard write receipt
+pub fn gxCompleteClipboardWrite(self: *Surface, req: *apprt.ClipboardRequest.KittyWrite, performed: bool) !void {
+    defer req.destroy();
+    try self.kittyClipboardStatus(.write, req.id, req.terminator, if (performed) .DONE else .EPERM);
+}
+
+pub fn gxCompleteClipboardCopy(self: *Surface, copied: terminal.Selection) !void {
+    if (!self.config.selection_clear_on_copy) return;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    const current = self.io.terminal.screens.active.selection orelse return;
+    if (!std.meta.eql(current, copied)) return;
+    try self.setSelection(null);
+    try self.queueRender();
+}
+// fork(gx): GX-0044 end
 
 /// This starts a clipboard request, with some basic validation. For example,
 /// an OSC 52 request is not actually requested if OSC 52 is disabled.

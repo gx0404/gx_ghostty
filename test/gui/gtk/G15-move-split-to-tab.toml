@@ -1,0 +1,24 @@
+id = "G15"
+title = "Move an existing split into a new tab and keep its terminal contents"
+lang = "en"
+config = """
+command = /bin/bash --noprofile --norc
+language = en
+keybind = ctrl+alt+m=gx:move_split_to_tab
+"""
+xdotool = """
+mousemove 400 300
+click 1
+key ctrl+shift+o
+sleep 1
+type --clearmodifiers "printf R5-MOVE"
+key Return
+sleep 0.5
+key ctrl+alt+m
+sleep 1.5
+"""
+expect = [
+  "G15.png: the initial terminal has one tab and a Bash prompt",
+  "G15-after.png: two tabs exist; the selected moved tab has one pane and retains R5-MOVE in its terminal contents",
+  "This visual regression does not by itself prove PID/birth/PTY identity; the dedicated transfer fixture must verify those separately",
+]

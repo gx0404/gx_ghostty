@@ -78,6 +78,8 @@ const App = @import("../App.zig");
 const Window = @import("../Window.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
+const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 const TooltipOf = @import("Tooltip.zig").Tooltip;
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
@@ -154,6 +156,7 @@ app: *App,
 window: *Window,
 
 popup: Popup = .{},
+uia_attachment: gx.ui_ref.Attachment = .{},
 scrim: Scrim = .{},
 tooltip: Tooltip = .{},
 
@@ -385,6 +388,7 @@ fn destroy(self: *Settings) void {
 fn openOverlay(self: *Settings) bool {
     const owner = self.window.hwnd orelse return false;
     if (self.window.closing) return false;
+    self.uia_attachment = self.window.ui_attachment;
     const factory = self.app.uiFactory() orelse return openConfigInstead(self.app);
     const t = self.tokens();
     // Until the first frame is painted (`Popup.show` paints at once).
@@ -406,6 +410,7 @@ fn openOverlay(self: *Settings) bool {
         }, .{
             .ctx = self,
             .paint = paint,
+            .uia_source = .{ .app = self.app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
             .key = onKey,
             .mouse = onMouse,
             .text_changed = onTextChanged,
@@ -447,6 +452,7 @@ fn openOverlay(self: *Settings) bool {
     self.popup.show(self.popupRect(owner));
     self.opened_ms = system.nowMs();
     self.open = true;
+    self.popup.invalidate();
     return true;
 }
 
@@ -514,6 +520,132 @@ fn tokens(self: *const Settings) style.Tokens {
 
 fn invalidate(self: *Settings) void {
     self.popup.invalidate();
+}
+
+fn uiaLive(context: *anyopaque) bool {
+    const self: *Settings = @ptrCast(@alignCast(context));
+    return self.open and self.popup.visible and uia_bridge.attachmentAlive(self.app, self.uia_attachment);
+}
+fn uiaControlState(self: *Settings, target: Target, rows: []const Row) uia_bridge.ControlState {
+    var state: uia_bridge.ControlState = .{};
+    switch (target) {
+        .search => {
+            state.focusable = true;
+            state.focused = self.popup.focused and self.text_field == .search;
+        },
+        .row => |index| {
+            state.enabled = index < rows.len;
+            state.focusable = state.enabled and rows[index].focusable();
+            state.focused = self.popup.focused and self.text_field == null and self.focus == index;
+        },
+        .chip => |chip| {
+            state.enabled = chip.row < rows.len and chip.index < rows[chip.row].choices.len and chip.index < 8 and
+                rows[chip.row].disabled & (@as(u8, 1) << @intCast(chip.index)) == 0;
+            state.container_focusable = chip.row < rows.len and rows[chip.row].focusable();
+            state.container_focused = state.container_focusable and self.popup.focused and self.text_field == null and self.focus == chip.row;
+        },
+        .step => |step| {
+            state.enabled = if (step.step == .minus) self.values.font_size > settings_map.FontSize.min else self.values.font_size < settings_map.FontSize.max;
+        },
+        .value => |index| {
+            state.enabled = index < rows.len;
+            state.focusable = true;
+            state.focused = self.popup.focused and self.text_field == .font_size;
+        },
+        .field => |index| {
+            state.enabled = index < rows.len;
+            state.focusable = true;
+            state.focused = self.popup.focused and state.enabled and self.text_field == listField(rows[index].action) and self.focus == index;
+        },
+        .group_button => |item| {
+            state.enabled = item.row < rows.len and self.groupButtonEnabled(item.button);
+            state.focusable = true;
+            if (item.row < rows.len) {
+                if (std.mem.indexOfScalar(GroupButton, rows[item.row].buttons, item.button)) |index|
+                    state.focused = self.popup.focused and self.text_field == null and self.focus == item.row and self.focus_button == index;
+            }
+        },
+        .section, .close, .item, .reset => {},
+    }
+    return state;
+}
+fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+    const self: *Settings = @ptrCast(@alignCast(context));
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildRows(&buf);
+    var states: [max_hits]uia_bridge.ControlState = undefined;
+    for (self.hits[0..self.hit_count], 0..) |hit, index| states[index] = self.uiaControlState(hit.target, rows);
+    try bridge.publishSettings(api, queue, self.uia_attachment, self, rows, states[0..self.hit_count], .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+}
+fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
+    const self: *Settings = @ptrCast(@alignCast(context));
+    if (!uiaLive(context)) return false;
+    if (token == 0 and action.kind == .close) {
+        self.popup.dismiss(.owner);
+        return true;
+    }
+    if (token < uia_bridge.settings_hit_base or token == uia_bridge.settings_container) return false;
+    const hit_index = std.math.cast(usize, token - uia_bridge.settings_hit_base) orelse return false;
+    if (hit_index >= self.hit_count) return false;
+    const target = self.hits[hit_index].target;
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildRows(&buf);
+    const control_state = self.uiaControlState(target, rows);
+    if (!control_state.enabled and !(action.kind == .focus and control_state.container_focusable)) return false;
+    const hwnd = self.popup.hwnd orelse return false;
+    const cookie = self.popup.uia_cookie;
+    if (action.kind == .set_value) {
+        if (std.mem.indexOfAny(u8, action.value, "\r\n") != null) return false;
+        switch (target) {
+            .search => self.focusSearch(false),
+            .field => |index| self.focusRow(index),
+            .value => {
+                if (model.parseFontSize(action.value) == null) return false;
+                self.beginSizeEdit(action.value, false);
+                self.endSizeEdit(true);
+                return true;
+            },
+            else => return false,
+        }
+        if (!Popup.uiaAlive(hwnd, cookie)) return false;
+        self.popup.input.setText(self.alloc, action.value) catch return false;
+        onTextChanged(self, &self.popup);
+        return true;
+    }
+    if (action.kind == .focus) {
+        switch (target) {
+            .search => self.focusSearch(false),
+            .row, .field => |index| self.focusRow(index),
+            .chip => |chip| self.focusRow(chip.row),
+            .value => |index| {
+                const alloc = self.alloc;
+                const value = alloc.dupe(u8, rows[index].value) catch return false;
+                defer alloc.free(value);
+                self.focusRow(index);
+                if (!Popup.uiaAlive(hwnd, cookie)) return false;
+                self.beginSizeEdit(value, true);
+            },
+            .group_button => |item| {
+                const button_index = std.mem.indexOfScalar(GroupButton, rows[item.row].buttons, item.button);
+                self.focusRow(item.row);
+                if (!Popup.uiaAlive(hwnd, cookie)) return false;
+                if (button_index) |index| self.focus_button = index;
+            },
+            else => return false,
+        }
+        if (!Popup.uiaAlive(hwnd, cookie)) return false;
+        self.focus_visible = true;
+        self.invalidate();
+        _ = w32.SetFocus(hwnd);
+        return true;
+    }
+    if (action.kind != .invoke and action.kind != .toggle and action.kind != .select) return false;
+    switch (target) {
+        .step => |step| self.stepFontSize(step.step),
+        .item => self.press(&self.popup, target, action.kind == .invoke),
+        else => self.click(target),
+    }
+    return true;
 }
 
 // -----------------------------------------------------------------------
@@ -2906,7 +3038,18 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
         } else if (state.hover) {
             canvas.fillRoundedRect(item, 4, t.hover);
         }
-        canvas.drawIcon(sectionIcon(section), .{ .x = item.x + 12, .y = item.y, .w = 18, .h = item.h }, 15, if (selected) t.accent else t.text_secondary);
+        const icon_rect: d2d.Rect = .{ .x = item.x + 12, .y = item.y + (item.h - 18) / 2, .w = 18, .h = 18 };
+        const fluent_id: @import("fluent_icons.zig").Id = switch (section) {
+            .language => .language,
+            .appearance => .appearance,
+            .font => .font,
+            .interaction => .interaction,
+            .shell => .shell,
+            .about => .about,
+        };
+        if (!selected or !self.app.fluent_icons.draw(canvas, fluent_id, icon_rect, t.accent)) {
+            canvas.drawIcon(sectionIcon(section), .{ .x = item.x + 12, .y = item.y, .w = 18, .h = item.h }, 15, if (selected) t.accent else t.text_secondary);
+        }
         canvas.drawText(sectionTitle(section), .{ .x = item.x + 40, .y = item.y, .w = item.w - 48, .h = item.h }, .{
             .size = style.font_size.body,
             .weight = if (selected) .semibold else .normal,
@@ -3426,6 +3569,24 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     }
 }
 
+test "UIA segmented choice exposes row focus even when first option is disabled" {
+    var settings: Settings = undefined;
+    settings.popup = .{};
+    settings.popup.focused = true;
+    settings.text_field = null;
+    settings.focus = 0;
+    const rows = &.{Row{ .kind = .choice, .choices = &.{ "A", "B" }, .disabled = 1 }};
+    const disabled = settings.uiaControlState(.{ .chip = .{ .row = 0, .index = 0 } }, rows);
+    try std.testing.expect(!disabled.enabled);
+    try std.testing.expect(disabled.container_focusable and disabled.container_focused);
+    try std.testing.expect(!disabled.focusable and !disabled.focused);
+    settings.text_field = .search;
+    try std.testing.expect(!settings.uiaControlState(.{ .chip = .{ .row = 0, .index = 1 } }, rows).container_focused);
+    settings.text_field = null;
+    settings.popup.focused = false;
+    try std.testing.expect(!settings.uiaControlState(.{ .chip = .{ .row = 0, .index = 1 } }, rows).container_focused);
+}
+
 test "font families match by their English or local name" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -3477,10 +3638,6 @@ test "settings search matches labels, sections, keys and pinyin" {
         var out: RowList = .{ .buf = &buf };
         const query: fuzzy.Query = .init(pattern);
         appendSearchRows(&out, .font, "Font", &source, &query, alloc);
-        if (std.mem.eql(u8, pattern, "zihao")) {
-            try testing.expectEqual(@as(usize, 0), out.len);
-            continue;
-        }
         try testing.expect(out.len >= 2);
         try testing.expectEqual(RowKind.group, out.items()[0].kind);
         try testing.expectEqual(RowKind.result, out.items()[1].kind);

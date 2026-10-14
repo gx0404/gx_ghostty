@@ -1,0 +1,22 @@
+id = "G16"
+title = "The launch-profile menu opens the real profile manager"
+lang = "zh_CN"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = zh-CN
+gx-launch-profile = Demo=direct:/bin/bash --noprofile --norc
+keybind = ctrl+alt+n=gx:new_tab_menu
+"""
+xdotool = """
+mousemove 400 300
+click 1
+key ctrl+alt+n
+sleep 0.5
+mousemove 90 500
+click 1
+sleep 1.5
+"""
+expect = [
+  "G16.png: the private Chinese test window starts normally",
+  "G16-after.png: the real launch-profile manager is open with a profile selector, name and command fields, editing controls, and source/rename guidance",
+]

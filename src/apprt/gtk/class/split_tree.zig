@@ -220,6 +220,8 @@ pub const SplitTree = extern struct {
         // Create our new surface.
         const surface: *Surface = .new(.{
             .command = overrides.command,
+            // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+            .launch_origin = overrides.launch_origin,
             .shell_integration = overrides.shell_integration,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
@@ -607,8 +609,43 @@ pub const SplitTree = extern struct {
             self.connectSurfaceHandlers();
         }
 
+        // fork(gx): GX-0039 never restore focus into a migrated surface.
+        if (!@import("../gx/tree_lifecycle.zig").contains(priv.tree, self.getLastFocusedSurface())) priv.last_focused.set(null);
+
         self.as(gobject.Object).notifyByPspec(properties.tree.impl.param_spec);
     }
+
+    // fork(gx): GX-0039 begin: prepared trees make transfer commit non-allocating.
+    /// Takes a tree prepared by gx.tree_lifecycle.prepare. The caller must
+    /// detach moved widgets from their old owner before publishing the target.
+    pub fn adoptOwnedTree(self: *Self, tree: ?*Surface.Tree, focused: ?*Surface) void {
+        const priv = self.private();
+        assert(tree != priv.tree or tree == null);
+        signals.changed.impl.emit(self, null, .{ priv.tree, tree }, null);
+        self.disconnectSurfaceHandlers();
+        if (priv.tree) |old| ext.boxedFree(Surface.Tree, old);
+        priv.tree = tree;
+        // A modal close request recorded against the old tree must not target a new leaf.
+        priv.pending_close = null;
+        priv.last_focused.set(if (@import("../gx/tree_lifecycle.zig").contains(tree, focused)) focused else null);
+        if (tree) |value| {
+            var it = value.iterator();
+            while (it.next()) |entry| entry.view.bindIsSplit(self);
+        }
+        self.connectSurfaceHandlers();
+        self.as(gobject.Object).notifyByPspec(properties.tree.impl.param_spec);
+    }
+
+    /// Complete a prepared transfer's widget reparenting before source teardown.
+    pub fn rebuildNow(self: *Self) void {
+        const priv = self.private();
+        if (priv.rebuild_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.rebuild_source = null;
+        }
+        _ = onRebuild(self);
+    }
+    // fork(gx): GX-0039 end
 
     fn getTreeValue(self: *Self, value: *gobject.Value) void {
         gobject.ext.Value.set(
@@ -641,6 +678,8 @@ pub const SplitTree = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        // fork(gx): GX-0039 migrated leaves can outlive the source widget.
+        self.disconnectSurfaceHandlers();
         priv.last_focused.deinit();
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {

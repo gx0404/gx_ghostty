@@ -103,8 +103,9 @@ zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitigno
 | `just graph` / `just graph-check` / `just graph-query <q>` | 图谱重建 / 新鲜度 / 查询 |
 | `just kb` / `just kb-check` / `just kb-query <q>` | 知识库构建 / 校验 / 检索 |
 | `just i18n` / `just i18n-check` | 由 `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` 重建 / 校验 GX 翻译表 |
-| `just pinyin` / `just pinyin-check` | 联网重建 / 离线校验拼音首字母表 `src/gx/pinyin/initials.zig` |
-| `just generated-check` | kb-check、i18n-check、pinyin-check 与 graph-check（同步后、发版前；framework-check 也含 pinyin-check） |
+| `just pinyin` / `just pinyin-check` | 从仓内钉版输入重建 / 离线校验拼音表 `src/gx/pinyin/{initials,syllables}.zig` |
+| `just fluent` / `just fluent-check` | 离线重建 / 校验 Fluent 图标路径 `src/gx/fluent/paths.zig` |
+| `just generated-check` | kb-check、i18n-check、pinyin-check、fluent-check 与 graph-check（同步后、发版前；framework-check 也含 pinyin-check） |
 | `just install-hooks` / `just commit-check <a>` | 启用 `.githooks` / 校验提交信息 |
 
 Windows 上 `just build` 产出 `zig-out/bin/ghostty.exe`，`just test` 构建同一组合（`-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`）的 `ghostty-test`，不含 POSIX 分支，Linux 侧用 `just wsl test` 或 gx-ci 的 `linux-main`；libghostty-internal（`-Dapp-runtime=none`）在 Windows 上仍链接失败。改过 Zig 源码后测试二进制要用 LLVM 重编约 2–4 min，属正常耗时（`docs/TESTING.md`）。Windows 未开开发者模式时，`src/lib/tinyio` 的符号链接用例报 `PermissionDenied`（`just test-vt` 4 处、`just test` 2 处）：这是环境前置，不是回归，记 FAIL 并写明原因，不跳过、不改用例。全表与副作用见 `docs/MAKE_COMMANDS.md`。
@@ -121,7 +122,7 @@ Windows 上 `just build` 产出 `zig-out/bin/ghostty.exe`，`just test` 构建�
 - **配置即文档**：`src/config/Config.zig` 字段的 doc comment 生成用户文档，用 Pandoc Markdown 写（`config.md`）。
 - **i18n**：上游 GTK 字符串用 gettext 的 `_`/`N_`/`C_` 标记，pot 经 `update-translations` 同步；fork 字符串（GTK 的 GX 层、win32 全部界面）一律是英文 msgid 经 `gx.i18n.tr`/`trRuntime` 翻译，不得用 `_`，新译文写进 `src/gx/i18n/gx.zh_CN.po` 后 `just i18n`；macOS 未本地化（`apprt-gtk.md`、`gx-core.md`）。
 - **配置分层**：GX 默认值 < 用户配置（含 include）< `gui-settings.ghostty` < 命令行；设置界面只写 `gui-settings.ghostty`，不写用户的 `config.ghostty`；fork 配置键一律 `gx-*`（`gx-core.md`、`config.md`）。
-- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json`、`src/gx/i18n/zh_CN.zig`、`src/gx/pinyin/initials.zig` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
+- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json`、`src/gx/i18n/zh_CN.zig`、`src/gx/pinyin/{initials,syllables}.zig`、`src/gx/fluent/paths.zig` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
 - **工具链本地性**：Zig、graphify 与 Inno Setup 只经 `just setup`（后者加 `--innosetup`）装进 `.local/`，禁止 winget/choco/scoop/msiexec 等系统级安装（`development.md`）。
 
 ## 提交规范

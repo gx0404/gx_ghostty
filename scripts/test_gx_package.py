@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import dataclasses
 import hashlib
 import io
@@ -276,7 +278,7 @@ class PinTests(unittest.TestCase):
         # The pinyin table is compiled into ghostty.exe: both license texts next to it ship.
         targets = {item.target: item for item in pkg.PAYLOAD}
         shipped = {targets[target].member for component in pkg.EMBEDDED for target in component.licenses}
-        self.assertEqual(shipped, {pkg.PINYIN_LICENSE, pkg.UNICODE_LICENSE})
+        self.assertEqual(shipped, {pkg.PINYIN_LICENSE, pkg.UNICODE_LICENSE, pkg.FLUENT_LICENSE})
         for component in pkg.EMBEDDED:
             for target in component.licenses:
                 self.assertEqual(targets[target].source, pkg.REPO)
@@ -640,8 +642,10 @@ class InstallerScriptTests(unittest.TestCase):
     def test_languages_tasks_files_and_shortcuts(self):
         self.assertIn('Name: "chinesesimplified"; MessagesFile: "compiler:Languages\\ChineseSimplified.isl"', self.lines)
         self.assertIn('Name: "english"; MessagesFile: "compiler:Default.isl"', self.lines)
-        self.assertIn("chinesesimplified.OpenHere=在此处打开 Ghostty GX", self.lines)
-        self.assertIn("english.OpenHere=Open Ghostty GX here", self.lines)
+        self.assertIn('#define GxOpenHereZh "在此处打开 Ghostty GX"', self.lines)
+        self.assertIn('#define GxOpenHereEn "Open Ghostty GX here"', self.lines)
+        self.assertIn("chinesesimplified.OpenHere={#GxOpenHereZh}", self.lines)
+        self.assertIn("english.OpenHere={#GxOpenHereEn}", self.lines)
         self.assertIn('Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; '
                       'GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked', self.lines)
         self.assertTrue(any(line.startswith('Name: "contextmenu";') for line in self.lines))
@@ -658,14 +662,130 @@ class InstallerScriptTests(unittest.TestCase):
         registry = [line for line in self.lines if line.startswith("Root: ")]
         self.assertTrue(all(line.startswith("Root: HKA;") for line in registry))
         self.assertIn('Root: HKA; Subkey: "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\ghostty.exe"; '
-                      'ValueType: string; ValueData: "{app}\\ghostty.exe"; Flags: uninsdeletekey', registry)
+                      'ValueType: string; ValueData: "{app}\\ghostty.exe"', registry)
         for key in ("Directory\\Background\\shell\\GhosttyGX", "Directory\\shell\\GhosttyGX"):
             with self.subTest(key=key):
                 self.assertIn(f'Root: HKA; Subkey: "Software\\Classes\\{key}"; ValueType: string; '
-                              'ValueData: "{cm:OpenHere}"; Flags: uninsdeletekey; Tasks: contextmenu', registry)
+                              'ValueData: "{cm:OpenHere}"; Tasks: contextmenu', registry)
                 self.assertIn(f'Root: HKA; Subkey: "Software\\Classes\\{key}\\command"; ValueType: string; '
                               'ValueData: """{app}\\ghostty.exe"" --working-directory=""%V"""; Tasks: contextmenu',
                               registry)
+
+    def test_shell_identity_matches_native_owner_and_both_shortcuts(self):
+        identity = (ROOT / "src/apprt/win32/shell/Identity.zig").read_text(encoding="utf-8")
+        aumid = re.search(r'pub const installed_aumid = "([^"]+)";', identity).group(1)
+        activator = re.search(r'pub const installed_activator = "([^"]+)";', identity).group(1)
+        self.assertIn(f'#define GxAumid "{aumid}"', self.lines)
+        self.assertIn(f'#define GxToastClsid "{activator}"', self.lines)
+        shortcuts = [line for line in self.lines if line.startswith(('Name: "{autoprograms}', 'Name: "{autodesktop}'))]
+        self.assertEqual(len(shortcuts), 2)
+        for line in shortcuts:
+            self.assertIn('AppUserModelID: "{#GxAumid}"', line)
+            self.assertIn('AppUserModelToastActivatorCLSID: "{{{#GxToastClsid}}"', line)
+        registrations = [line for line in self.lines if line.startswith("Root: ") and
+                         ("AppUserModelId" in line or "LocalServer32" in line)]
+        self.assertEqual(len(registrations), 5)
+        self.assertTrue(all("uninsdelete" not in line for line in registrations))
+        self.assertTrue(any('ValueName: "GxExecutable"; ValueData: "{app}\\ghostty.exe"' in line
+                            for line in registrations))
+        self.assertTrue(any('ValueName: "CustomActivator"; ValueData: "{{{#GxToastClsid}}"' in line
+                            for line in registrations))
+        server_argument = re.search(r'pub const server_argument = "([^"]+)";', identity).group(1)
+        self.assertTrue(any('LocalServer32' in line and f'"" {server_argument}"' in line
+                            for line in registrations))
+
+    def test_shell_uninstall_checks_ownership_and_preserves_foreign_values(self):
+        code = self.text.split("[Code]", 1)[1]
+        self.assertIn("function PrepareToInstall(var NeedsRestart: Boolean): String;", code)
+        self.assertIn("not GxOwnsShellRegistration then", code)
+        self.assertIn("(CurUninstallStep = usUninstall) and GxOwnsShellRegistration then", code)
+        ownership = code.split("function GxOwnsShellRegistration: Boolean;", 1)[1].split("end;", 1)[0]
+        for required in ("'GxExecutable'", "'CustomActivator'", "'\\LocalServer32'", "GxExpectedServer"):
+            self.assertIn(required, ownership)
+        self.assertIn("if GxRegisteredValueMatches(Key, Name, Expected) then", code)
+        self.assertNotIn("RegDeleteKeyIncludingSubkeys", code)
+        self.assertEqual(code.count("RegDeleteValue("), 1)
+        self.assertIn("RegDeleteKeyIfEmpty(HKA, GxAumidKey)", code)
+
+    def test_non_shell_registry_never_uses_unconditional_uninstall_delete(self):
+        # A later application's value or child key must survive uninstall.
+        # Inno's declarative uninsdeletekey removes the whole key regardless of
+        # our Pascal ownership checks, so it cannot be present on these groups.
+        registry = [line for line in self.lines if line.startswith("Root: ")]
+        for key in (r"App Paths\ghostty.exe", r"Directory\Background\shell\GhosttyGX", r"Directory\shell\GhosttyGX"):
+            entries = [line for line in registry if key in line]
+            self.assertTrue(entries, key)
+            for line in entries:
+                with self.subTest(key=key, entry=line):
+                    self.assertNotIn("uninsdelete", line)
+
+    def test_upgrade_does_not_append_legacy_unconditional_registry_deletions(self):
+        self.assertEqual(self.setting("UninstallLogMode"), "overwrite")
+        self.assertIn("from an older manifest may remain", self.text)
+        self.assertNotIn("[UninstallDelete]", self.text)
+
+    def pascal_routine(self, name: str) -> str:
+        match = re.search(r"(?ms)^(?:function|procedure) " + re.escape(name) +
+                          r"\b.*?(?=^(?:function|procedure) |\Z)", self.text.split("[Code]", 1)[1])
+        self.assertIsNotNone(match, name)
+        return match.group(0)
+
+    def test_registry_preflight_refuses_foreign_groups_before_declarative_writes(self):
+        preflight = self.pascal_routine("PrepareToInstall")
+        self.assertIn("RegKeyExists(HKA, GxAppPathKey) and not GxOwnsAppPath", preflight)
+        selected = preflight.split("if WizardIsTaskSelected('contextmenu') then", 1)[1]
+        for key in ("GxBackgroundKey", "GxDirectoryKey"):
+            self.assertIn(f"RegKeyExists(HKA, {key}) and not GxOwnsContextMenu({key})", selected)
+        self.assertIn("CustomMessage('IntegrationInUse')", preflight)
+        self.assertNotIn("RegWrite", preflight)
+        # A disabled context-menu task must not write a foreign menu even if
+        # App Paths itself is available; do not turn this into an unconditional
+        # registry write while retaining the conditional preflight above.
+        for line in self.lines:
+            if line.startswith("Root:") and "\\shell\\GhosttyGX" in line:
+                self.assertIn("Tasks: contextmenu", line)
+
+    def test_ownership_requires_closed_value_and_child_sets_and_exact_executable(self):
+        values = self.pascal_routine("GxHasExactValues")
+        subkeys = self.pascal_routine("GxHasExactSubkeys")
+        self.assertIn("if not RegGetValueNames(HKA, Key, Names) then Exit;", values)
+        self.assertIn("if GetArrayLength(Names) <> ExpectedCount then Exit;", values)
+        self.assertIn("Result := HasDefault and HasOther;", values)
+        self.assertIn("if not RegGetSubkeyNames(HKA, Key, Names) then Exit;", subkeys)
+        self.assertIn("Result := GetArrayLength(Names) = 0;", subkeys)
+        self.assertLess(subkeys.index("if GetArrayLength(Names) <> 1 then Exit;"), subkeys.index("Names[0]"))
+        app_path = self.pascal_routine("GxOwnsAppPath")
+        for condition in ("GxHasExactValues(GxAppPathKey, 'Path')", "GxHasExactSubkeys(GxAppPathKey, '')",
+                          "GxRegisteredValueMatches(GxAppPathKey, '', ExpandConstant('{app}\\ghostty.exe'))",
+                          "GxRegisteredValueMatches(GxAppPathKey, 'Path', ExpandConstant('{app}'))"):
+            self.assertIn(condition, app_path)
+        menu = self.pascal_routine("GxOwnsContextMenu")
+        for condition in ("GxHasExactValues(Key, 'Icon')", "GxHasExactSubkeys(Key, 'command')",
+                          "GxHasExactValues(Key + '\\command', '')", "GxHasExactSubkeys(Key + '\\command', '')",
+                          "GxRegisteredValueMatches(Key, 'Icon', GxExpectedIcon)",
+                          "GxRegisteredValueMatches(Key + '\\command', '', GxExpectedOpenHere)"):
+            self.assertIn(condition, menu)
+        # Both known captions are acceptable for same-path cross-language
+        # upgrades; an arbitrary replacement caption is not owned.
+        for caption in ("GxOpenHereEn", "GxOpenHereZh"):
+            self.assertIn("GxRegisteredValueMatches(Key, '', '{#" + caption + "}')", menu)
+
+    def test_uninstall_keeps_foreign_content_and_rechecks_each_owned_value(self):
+        app_path = self.pascal_routine("GxDeleteOwnedAppPath")
+        menu = self.pascal_routine("GxDeleteOwnedContextMenu")
+        self.assertLess(app_path.index("if not GxOwnsAppPath then Exit;"), app_path.index("GxDeleteOwnedValue("))
+        self.assertLess(menu.index("if not GxOwnsContextMenu(Key) then Exit;"), menu.index("GxDeleteOwnedValue("))
+        self.assertIn("RegDeleteKeyIfEmpty(HKA, GxAppPathKey)", app_path)
+        self.assertIn("RegDeleteKeyIfEmpty(HKA, Key + '\\command')", menu)
+        self.assertIn("RegDeleteKeyIfEmpty(HKA, Key)", menu)
+        uninstall = self.pascal_routine("CurUninstallStepChanged")
+        for call in ("GxDeleteOwnedAppPath;", "GxDeleteOwnedContextMenu(GxBackgroundKey);",
+                     "GxDeleteOwnedContextMenu(GxDirectoryKey);"):
+            self.assertIn(call, uninstall)
+        # There is exactly one actual value-deletion site, inside the shared
+        # value-equality guard, and no recursive deletion site anywhere.
+        self.assertEqual(self.text.count("RegDeleteValue("), 1)
+        self.assertNotIn("RegDeleteKeyIncludingSubkeys", self.text)
 
 
 class WindowsStageTests(Case):

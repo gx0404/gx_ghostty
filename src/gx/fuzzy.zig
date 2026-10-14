@@ -15,7 +15,9 @@
 //! match their ASCII forms. A term with at least two ASCII letters also
 //! matches Chinese characters by the initials of their pinyin readings
 //! (`xjbq` matches 新建标签, see `pinyin.zig`), each scoring a little
-//! less than a literal match.
+//! less than a literal match. Full modern pinyin syllables, zh/ch/sh initials,
+//! apostrophe boundaries and a final syllable prefix also match; each Hanzi
+//! consumes one coherent reading (`zhongwen` or `zhw` finds 中文).
 //!
 //! `prepare` decodes and classifies a text once for any number of
 //! queries; `scorePrepared` scores it, and `positions` also marks the
@@ -94,7 +96,7 @@ pub const Query = struct {
         for (self.terms[0..self.term_count]) |*term| {
             var letters: usize = 0;
             for (self.cps[term.start..][0..term.len]) |cp| {
-                if (cp >= 'a' and cp <= 'z') letters += 1;
+                if ((cp >= 'a' and cp <= 'z') or cp == 'ü' or cp == 'Ü') letters += 1;
             }
             term.pinyin = letters >= min_pinyin_letters;
         }
@@ -240,12 +242,12 @@ pub fn positions(query: *const Query, p: *const Prepared, out: *Positions) ?i32 
         };
         total += m.score;
         var j = m.end;
-        var row = t.len - 1;
-        while (true) {
+        var row = t.len;
+        while (row > 0) {
             out.set(j);
-            if (row == 0) break;
-            j = trace[row][j];
-            row -= 1;
+            const previous = trace[row - 1][j];
+            j = previous.text;
+            row = previous.query;
         }
     }
     return total + nameBonus(query.slice(), p);
@@ -253,7 +255,8 @@ pub fn positions(query: *const Query, p: *const Prepared, out: *Positions) ?i32 
 
 /// For each query character after the first and each text position it
 /// matched at, the position the previous character matched at.
-const Trace = [max_query][max_text]u8;
+const TraceStep = struct { text: u8, query: u8 };
+const Trace = [max_query][max_text]TraceStep;
 
 const Match = struct { score: i32, end: usize };
 
@@ -275,6 +278,11 @@ fn penalty(how: Accept) i32 {
 /// character of the consecutive run that ends there (a run keeps the
 /// bonus of its start, so "Tab" in "New Tab" outranks t-a-b spread out).
 fn matchTerm(t: []const u21, use_pinyin: bool, p: *const Prepared, trace: ?*Trace) ?Match {
+    if (use_pinyin and p.initials.len != 0) return matchSyllables(t, p, trace);
+    return matchSingle(t, use_pinyin, p, trace);
+}
+
+fn matchSingle(t: []const u21, use_pinyin: bool, p: *const Prepared, trace: ?*Trace) ?Match {
     const n = p.cps.len;
     const m = t.len;
     if (m == 0 or n < m) return null;
@@ -297,6 +305,7 @@ fn matchTerm(t: []const u21, use_pinyin: bool, p: *const Prepared, trace: ?*Trac
         } else {
             cur[j] = score_match + @as(i32, p.bonus[j]) * bonus_first_char_multiplier - penalty(how);
             cur_chunk[j] = p.bonus[j];
+            if (trace) |tr| tr[0][j] = .{ .text = 0, .query = 0 };
         }
     }
 
@@ -344,7 +353,7 @@ fn matchTerm(t: []const u21, use_pinyin: bool, p: *const Prepared, trace: ?*Trac
             if (best <= no_match / 2) continue;
             cur[j] = best - penalty(how);
             cur_chunk[j] = best_chunk;
-            if (trace) |tr| tr[i][j] = @intCast(best_from);
+            if (trace) |tr| tr[i][j] = .{ .text = @intCast(best_from), .query = @intCast(i) };
         }
     }
 
@@ -358,6 +367,91 @@ fn matchTerm(t: []const u21, use_pinyin: bool, p: *const Prepared, trace: ?*Trac
     }
     if (result <= no_match / 2) return null;
     return .{ .score = result, .end = end };
+}
+
+const SyllableCell = struct { score: i32 = no_match, chunk: i8 = 0, from: u8 = 0 };
+
+/// Roll over text columns, retaining query-prefix states. A transition consumes
+/// one text character and one coherent reading, never a polyphone combination.
+/// Scores and highlights use this same DP; only visible rows request a trace.
+fn matchSyllables(t: []const u21, p: *const Prepared, trace: ?*Trace) ?Match {
+    if (t.len == 0 or p.cps.len == 0) return null;
+    var previous: [max_query + 1]SyllableCell = @splat(.{});
+    var gaps: [max_query + 1]SyllableCell = @splat(.{});
+    var result: ?Match = null;
+    for (p.cps, 0..) |cp, j| {
+        var current: [max_query + 1]SyllableCell = @splat(.{});
+        for (0..t.len) |i| {
+            var source: SyllableCell = .{};
+            if (i == 0) {
+                source = .{ .score = @as(i32, p.bonus[j]) * bonus_first_char_multiplier, .chunk = p.bonus[j] };
+            } else {
+                if (previous[i].score > no_match / 2) {
+                    source = previous[i];
+                    source.score += @max(source.chunk, bonus_consecutive, p.bonus[j]);
+                    source.chunk = @max(source.chunk, p.bonus[j]);
+                }
+                if (gaps[i].score > no_match / 2 and gaps[i].score + p.bonus[j] > source.score) {
+                    source = gaps[i];
+                    source.score += p.bonus[j];
+                    source.chunk = p.bonus[j];
+                }
+            }
+            if (source.score <= no_match / 2) continue;
+            if (cp == t[i]) offerSyllable(&current, trace, source, i, j, 1, 1, false);
+            if (pinyinLetter(t[i]) < 'a' or pinyinLetter(t[i]) > 'z' or p.initialsAt(j) == 0) continue;
+            var readings = pinyin.readings(cp);
+            while (readings.next()) |reading| {
+                var matched: usize = 0;
+                while (matched < reading.len and i + matched < t.len and pinyinLetter(t[i + matched]) == reading[matched]) : (matched += 1) {}
+                if (matched == 0) continue;
+                // The old one-letter initials are always valid. zh/ch/sh can
+                // also be used as an initial, as in zhw for 中文.
+                offerReading(&current, trace, source, t, i, j, 1);
+                if (matched >= 2 and reading.len >= 2 and reading[1] == 'h' and
+                    (reading[0] == 'z' or reading[0] == 'c' or reading[0] == 's'))
+                    offerReading(&current, trace, source, t, i, j, 2);
+                if (matched == reading.len) offerReading(&current, trace, source, t, i, j, matched);
+                // Only the final syllable may be a partial prefix. No middle
+                // substring or truncated interior syllable can consume a Hanzi.
+                if (i + matched == t.len) offerReading(&current, trace, source, t, i, j, matched);
+            }
+        }
+        if (current[t.len].score > no_match / 2 and (result == null or current[t.len].score > result.?.score))
+            result = .{ .score = current[t.len].score, .end = j };
+        for (0..t.len + 1) |i| {
+            const opened = previous[i].score + score_gap_start;
+            gaps[i].score += score_gap_extension;
+            if (previous[i].score > no_match / 2 and opened >= gaps[i].score) {
+                gaps[i] = previous[i];
+                gaps[i].score = opened;
+            }
+        }
+        previous = current;
+    }
+    return result;
+}
+
+fn offerReading(current: *[max_query + 1]SyllableCell, trace: ?*Trace, source: SyllableCell, t: []const u21, i: usize, j: usize, letters: usize) void {
+    var consumed = letters;
+    if (i + consumed < t.len and t[i + consumed] == '\'') {
+        if (i + consumed + 1 == t.len or t[i + consumed + 1] == '\'') return;
+        consumed += 1;
+    }
+    offerSyllable(current, trace, source, i, j, consumed, letters, true);
+}
+
+fn pinyinLetter(cp: u21) u21 {
+    return if (cp == 'ü' or cp == 'Ü') 'v' else cp;
+}
+
+fn offerSyllable(current: *[max_query + 1]SyllableCell, trace: ?*Trace, source: SyllableCell, i: usize, j: usize, consumed: usize, letters: usize, phonetic: bool) void {
+    const contribution = @as(i32, @intCast(letters)) * (score_match - @as(i32, if (phonetic) penalty_pinyin else 0)) +
+        @as(i32, @intCast(letters - 1)) * bonus_consecutive;
+    const value = source.score + contribution;
+    if (value <= current[i + consumed].score) return;
+    current[i + consumed] = .{ .score = value, .chunk = source.chunk, .from = @intCast(j) };
+    if (trace) |tr| tr[i + consumed - 1][j] = .{ .text = source.from, .query = @intCast(i) };
 }
 
 fn isSubsequence(t: []const u21, use_pinyin: bool, p: *const Prepared) bool {
@@ -769,6 +863,86 @@ test "pinyin initials match Chinese characters" {
     // Initials and characters mix, within a term and across terms.
     try testing.expect(testScore("xj标签", "新建标签页") != null);
     try testing.expect(testScore("xj 标签", "新建标签页") != null);
+}
+
+test "full pinyin modern polyphones digraph initials and final prefixes" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "zhongwen", "中文" },
+        .{ "zhw", "中文" },
+        .{ "zhongwe", "中文" },
+        .{ "zhong'wen", "中文" },
+        .{ "chongqing", "重庆" },
+        .{ "chong'qing", "重庆" },
+        .{ "yinyue", "音乐" },
+        .{ "yinle", "音乐" },
+        .{ "lvse", "绿色" },
+        .{ "lüse", "绿色" },
+        .{ "ＺＨＯＮＧＷＥＮ", "中文" },
+        .{ "wen zhong", "中文" },
+    };
+    for (cases) |case| {
+        const query = Query.init(case[0]);
+        var buffer: Buffer = undefined;
+        const prepared = buffer.prepare(case[1]);
+        var marked: Positions = undefined;
+        const value = scorePrepared(&query, &prepared);
+        try std.testing.expect(value != null);
+        try std.testing.expectEqual(value, positions(&query, &prepared, &marked));
+        try std.testing.expectEqual(@as(usize, 2), marked.count());
+    }
+    for ([_][]const u8{ "hon", "zhonwen", "tongqing", "zhong''wen", "'zhongwen", "zhongwen'" }) |text| {
+        const query = Query.init(text);
+        try std.testing.expect(score(&query, "中文重庆") == null);
+    }
+    const mixed = Query.init("zhch");
+    try std.testing.expect(score(&mixed, "重") == null);
+    // 绿 legitimately also has lu (绿林); 女 has no plain-u modern reading.
+    const plain_u = Query.init("nuxing");
+    try std.testing.expect(score(&plain_u, "女性") == null);
+    const umlaut = Query.init("nvxing");
+    try std.testing.expect(score(&umlaut, "女性") != null);
+    const literal_umlaut = Query.init("lü");
+    try std.testing.expect(score(&literal_umlaut, "lü") != null);
+    try std.testing.expect(score(&literal_umlaut, "lv") == null);
+    const query = Query.init("zhongwen");
+    try std.testing.expect(score(&query, "zhongwen").? > score(&query, "中文").?);
+}
+
+test "full pinyin trace follows variable length syllables and UTF16 emoji offsets" {
+    const text = "😀重庆 中文音乐";
+    var buffer: Buffer = undefined;
+    const prepared = buffer.prepare(text);
+    for ([_][]const u8{ "chongqing", "zhongwen", "yinyue", "yinle", "zhw", "zw", "zhong'wen" }) |term| {
+        const query = Query.init(term);
+        var marked: Positions = undefined;
+        const result = positions(&query, &prepared, &marked);
+        try std.testing.expectEqual(scorePrepared(&query, &prepared), result);
+        try std.testing.expect(result != null);
+        try std.testing.expectEqual(@as(usize, 2), marked.count());
+    }
+    const query = Query.init("chongqing");
+    var marked: Positions = undefined;
+    _ = positions(&query, &prepared, &marked);
+    var runs = Runs.init(text, &marked);
+    const run = runs.next().?;
+    try std.testing.expectEqual(@as(usize, 2), run.utf16_start);
+    try std.testing.expectEqual(@as(usize, 4), run.utf16_end);
+    try std.testing.expectEqualStrings("重庆", text[run.byte_start..run.byte_end]);
+}
+
+test "full pinyin bounded query text and term limits without allocation" {
+    const query = Query.init("a" ** max_query);
+    var buffer: Buffer = undefined;
+    const prepared = buffer.prepare("阿" ** (max_text + 1));
+    try std.testing.expectEqual(@as(usize, max_text), prepared.cps.len);
+    var marked: Positions = undefined;
+    const result = positions(&query, &prepared, &marked);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(scorePrepared(&query, &prepared), result);
+    try std.testing.expectEqual(@as(usize, max_query), marked.count());
+    const terms = Query.init("zhong zhong zhong zhong zhong zhong zhong zhong absent");
+    try std.testing.expectEqual(@as(u8, max_terms), terms.term_count);
+    try std.testing.expect(score(&terms, "中") != null);
 }
 
 test "positions marks the best alignment of every term" {

@@ -758,6 +758,8 @@ pub const Surface = extern struct {
             .shell_integration = overrides.shell_integration,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
         };
+        // fork(gx): GX-0039 clone launch provenance before borrowed overrides expire.
+        @import("../gx/origin.zig").created(self, overrides, priv.overrides.command != null);
         return self;
     }
 
@@ -1881,6 +1883,8 @@ pub const Surface = extern struct {
     }
 
     fn dispose(self: *Self) callconv(.c) void {
+        // fork(gx): GX-0039 revoke identities before callbacks can reenter disposal.
+        @import("../gx/runtime.zig").dispose(self.as(gobject.Object));
         const priv = self.private();
 
         // fork(gx): GX-0035 begin
@@ -3508,6 +3512,10 @@ pub const Surface = extern struct {
             config.@"font-size",
         });
 
+        // fork(gx): GX-0039 resolve the first-command precedence before core init.
+        @import("../gx/session.zig").applySeed(self, &config);
+        try @import("../gx/origin.zig").initializing(self, &config);
+
         // Initialize the surface
         surface.init(
             alloc,
@@ -3521,8 +3529,14 @@ pub const Surface = extern struct {
         };
         errdefer surface.deinit();
 
+        // fork(gx): GX-0039 reserve identity while core-init rollback is still active.
+        @import("../gx/runtime.zig").prepareSurface(self, surface.id) catch return error.SurfaceError;
+
         // Store it!
         priv.core_surface = surface;
+        // fork(gx): GX-0039 publish the live view only after the core is available.
+        @import("../gx/runtime.zig").surfaceInitialized(self);
+        @import("../gx/session.zig").surfaceReady(self);
 
         // Give the render surface a pointer to the core surface so it
         // can pull presents from the renderer in its snapshot handler.

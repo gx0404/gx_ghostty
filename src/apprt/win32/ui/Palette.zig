@@ -35,7 +35,7 @@
 //! and the entry picked most after typing the same text comes first.
 //! Shift+Delete forgets the selected entry, "Clear Recently Used" all.
 //!
-//! The owning `Surface` embeds this struct as `palette` and calls
+//! The owning `Window` embeds this struct as `palette` and calls
 //! `setActive` (from `toggle_command_palette`), `reposition` (on resize),
 //! `onDpiChanged`, `onLanguageChanged` and `deinit`. The app's message
 //! loop gives `handleKey` the first look at key presses in the popup
@@ -56,11 +56,13 @@ const i18n = gx.i18n;
 const fuzzy = gx.fuzzy;
 const ui_color = gx.ui_color;
 const App = @import("../App.zig");
-const Surface = @import("../Surface.zig");
+const Pane = @import("../Pane.zig");
 const Window = @import("../Window.zig");
 const w32 = @import("../win32.zig");
 const Keybinds = @import("Keybinds.zig");
 const Popup = @import("Popup.zig");
+const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 const Settings = @import("Settings.zig");
 const controls = @import("controls.zig");
 const d2d = @import("d2d.zig");
@@ -203,8 +205,8 @@ pub const Page = enum {
 /// What an entry does when it runs.
 const Target = union(enum) {
     command: Action,
-    /// The tab whose active surface this is.
-    tab: *Surface,
+    /// Stable local tab identity, not a pointer to its formerly active pane.
+    tab: gx.ui_ref.Reference,
     /// A launch profile id.
     profile: [:0]const u8,
     settings: Settings.Section,
@@ -283,6 +285,7 @@ const ItemCache = struct {
 };
 
 popup: Popup = .{},
+uia_attachment: gx.ui_ref.Attachment = .{},
 
 /// The keyboard shortcut sheet of the window (see `Keybinds.show`).
 keybinds: Keybinds.Sheet = .{},
@@ -341,12 +344,15 @@ preview_gate: model.PreviewGate = .{},
 /// without the "reloaded" notification.
 notifications: Config.AppNotifications = .{},
 
-pub fn surface(self: *Palette) *Surface {
+pub fn ownerWindow(self: *Palette) *Window {
     return @alignCast(@fieldParentPtr("palette", self));
+}
+pub fn paneView(self: *Palette) Pane {
+    return self.ownerWindow().activePane().?;
 }
 
 fn alloc(self: *Palette) Allocator {
-    return self.surface().app.core_app.alloc;
+    return self.ownerWindow().app.core_app.alloc;
 }
 
 /// Destroy the popups and free the entries. A theme preview still showing
@@ -354,10 +360,11 @@ fn alloc(self: *Palette) Allocator {
 /// loop (`restoreSavedTheme`): the window is taking its tab apart now.
 pub fn deinit(self: *Palette) void {
     self.keybinds.deinit();
-    if (self.preview_len != null) restoreSavedTheme(self.surface().app);
+    if (self.preview_len != null) restoreSavedTheme(self.ownerWindow().app);
     self.endPreview(false);
     releasePopup(&self.popup);
     self.rows.deinit(self.alloc());
+    self.rows = .empty;
     self.swatches.deinit(self.alloc());
     self.item_cache.deinit();
     if (self.arena) |*arena| arena.deinit();
@@ -365,6 +372,24 @@ pub fn deinit(self: *Palette) void {
     self.items = .empty;
     self.theme_dirs = &.{};
     self.active = false;
+}
+
+test "palette storage can be released rebuilt and released across reparenting" {
+    const fixture_alloc = std.testing.allocator;
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = fixture_alloc;
+    var app: App = undefined;
+    app.core_app = &core;
+    var fixture_window: Window = undefined;
+    fixture_window.app = &app;
+    fixture_window.palette = .{};
+    try fixture_window.palette.rows.ensureTotalCapacity(fixture_alloc, 4);
+    fixture_window.palette.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture_window.palette.rows.capacity);
+    fixture_window.palette.deinit();
+    try fixture_window.palette.rows.ensureTotalCapacity(fixture_alloc, 8);
+    fixture_window.palette.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture_window.palette.rows.capacity);
 }
 
 /// Whether `hwnd` is the palette popup, whose filter input has the
@@ -396,17 +421,20 @@ pub fn toggle(self: *Palette, page: Page) void {
 
 /// Show the palette on `page` (switching to it when the palette is shown).
 pub fn open(self: *Palette, page: Page) void {
+    if (self.ownerWindow().activePane() == null) return;
     if (self.active) {
         self.setPage(page);
         return;
     }
     const span: gx.perf.Span = .begin(global.io());
-    const s = self.surface();
-    if (s.search_bar.active) s.search_bar.setActive(false, &[_:0]u8{});
-    const window = s.parent_window;
+    const pane = self.paneView();
+    pane.dismissSearch();
+    self.uia_attachment = pane.attachment();
+    const window = pane.ownerWindow();
+    const app = pane.app();
     const owner = window.hwnd orelse return;
     const t = self.tokens();
-    if (!ensurePopup(&self.popup, s.app, owner, .{
+    if (!ensurePopup(&self.popup, app, owner, .{
         .activate = true,
         .text_input = true,
         .dismiss_on_escape = true,
@@ -420,6 +448,7 @@ pub fn open(self: *Palette, page: Page) void {
     }, .{
         .ctx = self,
         .paint = paint,
+        .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
         .key = onKey,
         .mouse = onMouse,
         .text_changed = onTextChanged,
@@ -433,7 +462,7 @@ pub fn open(self: *Palette, page: Page) void {
 
     self.active = true;
     self.page = page;
-    self.notifications = s.app.config.@"app-notifications";
+    self.notifications = app.config.@"app-notifications";
     self.popup.input.clear();
     self.mouse = null;
     self.buildItems();
@@ -458,13 +487,13 @@ fn close(self: *Palette, restore_focus: bool) void {
 }
 
 fn focusSurface(self: *Palette) void {
-    if (self.surface().hwnd) |hwnd| _ = w32.SetFocus(hwnd);
+    if (self.ownerWindow().activePane()) |pane| pane.focus();
 }
 
 /// Move and size the palette for its window (after a resize).
 pub fn reposition(self: *Palette) void {
     if (!self.active or !popupAlive(&self.popup)) return;
-    self.popup.setOwnerScale(self.surface().parent_window.scale);
+    self.popup.setOwnerScale(self.ownerWindow().scale);
     const rect = self.bounds() orelse return;
     self.popup.setBounds(rect);
 }
@@ -486,13 +515,13 @@ pub fn onLanguageChanged(self: *Palette) void {
 }
 
 fn tokens(self: *Palette) style.Tokens {
-    return style.Tokens.fromConfig(&self.surface().app.config);
+    return style.Tokens.fromConfig(&self.ownerWindow().app.config);
 }
 
 /// The palette's place in screen pixels: centered below the window's
 /// chrome, as tall as the rows need up to a limit, at the window's scale.
 fn bounds(self: *Palette) ?w32.RECT {
-    const window = self.surface().parent_window;
+    const window = self.ownerWindow();
     const hwnd = window.hwnd orelse return null;
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0) return null;
@@ -544,7 +573,7 @@ fn buildItems(self: *Palette) void {
 }
 
 fn itemStamp(self: *Palette) u64 {
-    const app = self.surface().app;
+    const app = self.ownerWindow().app;
     var hasher: std.hash.Wyhash = .init(configStamp(&app.config, self.hints()));
     std.hash.autoHash(&hasher, app.profiles_cache.detections);
     std.hash.autoHash(&hasher, app.profiles_cache.shells != null);
@@ -636,18 +665,22 @@ fn loadRanks(self: *Palette, start: usize) void {
     }
 }
 
-fn keybindSet(self: *Palette) *const input.Binding.Set {
-    return &self.surface().app.config.keybind.set;
+pub fn keybindSet(self: *Palette) *const input.Binding.Set {
+    if (self.ownerWindow().activePane()) |pane| switch (pane.backend) {
+        .remote => |remote| return &remote.ui.keybind_set.set,
+        .local => {},
+    };
+    return &self.ownerWindow().app.config.keybind.set;
 }
 
 /// The shortcuts shown next to the items: none that another program or
 /// the input method takes, and none without a key name.
 fn hints(self: *Palette) trigger.Hints {
-    return .{ .set = self.keybindSet(), .blocked = &self.surface().app.shortcut_conflicts };
+    return .{ .set = self.keybindSet(), .blocked = &self.ownerWindow().app.shortcut_conflicts };
 }
 
 fn addTabs(self: *Palette, a: Allocator) !void {
-    const window = self.surface().parent_window;
+    const window = self.ownerWindow();
     for (0..window.tab_count) |i| {
         const title16 = window.tab_titles[i][0..window.tab_title_lens[i]];
         const name = std.unicode.utf16LeToUtf8Alloc(a, title16) catch |err| switch (err) {
@@ -670,14 +703,14 @@ fn addTabs(self: *Palette, a: Allocator) !void {
             .current = current,
             .unread = status.unread,
             .recency = if (current) std.math.maxInt(u64) else window.tabRecency(i),
-            .target = .{ .tab = window.tab_active_surface[i] },
+            .target = .{ .tab = window.tab_references[i] },
         });
     }
 }
 
 /// The entries that open the launch profile and theme pages.
 fn addPages(self: *Palette, a: Allocator) !void {
-    const app = self.surface().app;
+    const app = self.ownerWindow().app;
     const new_tab = i18n.tr("New Tab…");
     try self.items.append(a, .{
         .group = .commands,
@@ -704,7 +737,7 @@ fn addPages(self: *Palette, a: Allocator) !void {
 }
 
 fn addCommands(self: *Palette, a: Allocator) !void {
-    const app = self.surface().app;
+    const app = self.ownerWindow().app;
     for (app.config.@"command-palette-entry".value.items) |command| {
         if (!supported(command.action)) continue;
         // Copied: a configuration reload frees the originals.
@@ -815,7 +848,7 @@ fn addSettings(self: *Palette, a: Allocator) !void {
 }
 
 fn addProfiles(self: *Palette, a: Allocator) !void {
-    var list = try self.surface().app.cachedLaunchProfiles();
+    var list = try self.ownerWindow().app.cachedLaunchProfiles();
     defer list.deinit();
     for (list.profiles) |profile| {
         const id = try a.dupeZ(u8, profile.id);
@@ -861,7 +894,7 @@ fn commandText(a: Allocator, command: gx.profiles.Command) ![]const u8 {
 
 /// The themes: `all` of them, or only the `recent`ly used ones.
 fn addThemes(self: *Palette, a: Allocator, which: enum { recent, all }) !void {
-    const app = self.surface().app;
+    const app = self.ownerWindow().app;
     if (self.theme_dirs.len == 0) {
         var dirs: std.ArrayList([]const u8) = .empty;
         var it: themepkg.LocationIterator = .{ .arena_alloc = a };
@@ -1163,7 +1196,7 @@ fn listView(self: *const Palette) d2d.Rect {
 /// (`bounds`), which it gets after a new filter.
 fn viewHeight(self: *Palette) f32 {
     const rect = self.bounds() orelse return self.listView().h;
-    const height = style.dip(rect.bottom - rect.top, self.surface().parent_window.scale);
+    const height = style.dip(rect.bottom - rect.top, self.ownerWindow().scale);
     return @max(0, height - layout.list_top - layout.footer_height);
 }
 
@@ -1295,46 +1328,71 @@ fn run(self: *Palette, index: usize, how: model.EnterAction) void {
             return;
         },
         .clear_history => {
-            const window = self.surface().parent_window;
+            const pane = self.paneView();
+            const app = pane.app();
+            const owner = pane.ownerWindow().ui_reference;
             self.close(true);
             history.clear();
-            commitHistory(self.alloc());
-            window.showToast(.{ .text = i18n.tr("Cleared the recently used entries."), .icon = d2d.icons.completed });
+            commitHistory(app.core_app.alloc);
+            if (app.resolveWindow(owner)) |window| window.showToast(.{ .text = i18n.tr("Cleared the recently used entries."), .icon = d2d.icons.completed });
             return;
         },
         else => {},
     }
 
     self.remember(item);
-    const s = self.surface();
-    const window = s.parent_window;
-    const app = s.app;
+    const pane = self.paneView();
+    const reference = pane.reference();
+    const owner = pane.ownerWindow().ui_reference;
+    const app = pane.app();
+    var arena = std.heap.ArenaAllocator.init(app.core_app.alloc);
+    defer arena.deinit();
+    const target = cloneTarget(item.target, arena.allocator()) catch return;
     // Saving a theme reloads the configuration anyway.
     if (item.target == .theme) self.endPreview(false);
     self.close(true);
 
-    switch (item.target) {
+    switch (target) {
         .command => |action| {
-            if (!s.core_surface_ready) return;
-            _ = s.core_surface.performBindingAction(action) catch |err| {
+            const live = Pane.resolve(app, reference) orelse return;
+            _ = live.performBindingAction(action) catch |err| {
                 log.err("palette action failed action={t} err={}", .{ action, err });
             };
         },
-        .tab => |tab| if (window.findTabIndex(tab)) |i| {
-            window.selectTabIndex(i);
-            window.invalidateTabBar();
+        .tab => |tab| {
+            const window = app.resolveWindow(owner) orelse return;
+            if (window.resolveTab(tab)) |i| {
+                window.selectTabIndex(i);
+                window.invalidateTabBar();
+            }
         },
-        .profile => |id| _ = app.openProfile(window, id, if (how == .new_window) .window else .tab),
-        .settings => |section| _ = Settings.showSection(window, section),
-        .language => |language| _ = saveSetting(window, "language", language.configValue()),
-        .theme => |theme| _ = saveSetting(window, "theme", theme.name),
+        .profile => |id| if (app.resolveWindow(owner)) |window| {
+            _ = app.openProfile(window, id, if (how == .new_window) .window else .tab);
+        },
+        .settings => |section| if (app.resolveWindow(owner)) |window| {
+            _ = Settings.showSection(window, section);
+        },
+        .language => |language| if (app.resolveWindow(owner)) |window| {
+            _ = saveSetting(window, "language", language.configValue());
+        },
+        .theme => |theme| if (app.resolveWindow(owner)) |window| {
+            _ = saveSetting(window, "theme", theme.name);
+        },
         .page, .clear_history => {},
     }
+}
+fn cloneTarget(target: Target, allocator: Allocator) !Target {
+    return switch (target) {
+        .command => |action| .{ .command = try action.clone(allocator) },
+        .profile => |id| .{ .profile = try allocator.dupeZ(u8, id) },
+        .theme => |theme| .{ .theme = .{ .name = try allocator.dupe(u8, theme.name), .index = theme.index } },
+        else => target,
+    };
 }
 
 /// Save theme `index` as the theme and keep the palette open on it.
 fn applyKeepOpen(self: *Palette, index: usize, name: []const u8) void {
-    const window = self.surface().parent_window;
+    const window = self.ownerWindow();
     self.endPreview(false);
     if (!saveSetting(window, "theme", name)) return;
     for (self.items.items, 0..) |*item, i| {
@@ -1418,15 +1476,26 @@ fn showSaveError(window: *Window, err: anyerror) void {
 // Theme preview
 // -----------------------------------------------------------------------
 
-/// The theme of the selected entry on the theme page, if it is one other
-/// than the saved theme.
+/// The selected theme, including a root-page search result. PreviewGate keeps
+/// merely opening an empty palette from previewing a recently used theme.
 fn selectedTheme(self: *Palette) ?[]const u8 {
-    if (self.page != .themes) return null;
     const item = self.selectedItem() orelse return null;
     return switch (item.target) {
         .theme => |theme| if (item.current) null else theme.name,
         else => null,
     };
+}
+
+test "root theme search previews the selection but empty opening does not" {
+    var items = [_]Item{.{ .group = .themes, .icon = 0, .title = "Nord", .title_en = "Nord", .name = "Nord", .name_en = "Nord", .target = .{ .theme = .{ .name = "Nord", .index = 0 } } }};
+    var rows = [_]Row{.{ .kind = .{ .item = 0 }, .y = 0, .h = 20 }};
+    var palette: Palette = .{ .page = .root, .selected = 0, .items = .{ .items = &items, .capacity = 1 }, .rows = .{ .items = &rows, .capacity = 1 } };
+    palette.preview_gate.filtered(true);
+    try std.testing.expect(palette.wantedTheme() == null);
+    palette.preview_gate.filtered(false);
+    try std.testing.expectEqualStrings("Nord", palette.wantedTheme().?);
+    items[0].current = true;
+    try std.testing.expect(palette.wantedTheme() == null);
 }
 
 fn previewTheme(self: *const Palette) ?[]const u8 {
@@ -1471,7 +1540,7 @@ fn previewTimer(hwnd: w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) voi
 /// the running app without saving anything, like the settings UI's theme
 /// preview.
 fn applyTheme(self: *Palette, theme: ?[]const u8) void {
-    const app = self.surface().app;
+    const app = self.ownerWindow().app;
     const alloc_ = app.core_app.alloc;
     var quiet_buf: [128]u8 = undefined;
     const quiet = gx.settings_map.quietReloadArg(&quiet_buf, self.notifications) catch return;
@@ -1619,7 +1688,7 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
         },
         w32.VK_F4 => if (key.alt and !key.ctrl) {
             // Alt+F4 closes the window, not just the palette.
-            const window = self.surface().parent_window;
+            const window = self.ownerWindow();
             self.close(true);
             if (window.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
             return true;
@@ -1656,9 +1725,15 @@ fn keyPress(self: *Palette, key: Popup.Key, routed: bool) bool {
             // The message loop closes the palette and gives the key to the
             // surface; keys it does not route are performed here.
             if (routed) return false;
-            const s = self.surface();
+            const pane = self.paneView();
+            const app = pane.app();
+            const reference = pane.reference();
+            var arena = std.heap.ArenaAllocator.init(app.core_app.alloc);
+            defer arena.deinit();
+            const owned = action.clone(arena.allocator()) catch return true;
             self.close(true);
-            if (s.core_surface_ready) _ = s.core_surface.performBindingAction(action) catch |err| {
+            const live = Pane.resolve(app, reference) orelse return true;
+            _ = live.performBindingAction(owned) catch |err| {
                 log.err("palette chord failed action={t} err={}", .{ action, err });
             };
             return true;
@@ -1694,6 +1769,48 @@ fn textChanged(self: *Palette) void {
     self.reposition();
     self.updateHover();
     self.popup.invalidate();
+}
+
+fn uiaLive(context: *anyopaque) bool {
+    const self: *Palette = @ptrCast(@alignCast(context));
+    return self.active and self.popup.visible and uia_bridge.attachmentAlive(self.ownerWindow().app, self.uia_attachment);
+}
+fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+    const self: *Palette = @ptrCast(@alignCast(context));
+    try bridge.publishPalette(api, queue, self.uia_attachment, self, self.listView(), .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+}
+fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
+    const self: *Palette = @ptrCast(@alignCast(context));
+    if (!uiaLive(context)) return false;
+    if (token == uia_bridge.palette_root and action.kind == .close) {
+        self.close(true);
+        return true;
+    }
+    if (token == uia_bridge.palette_filter) {
+        if (action.kind == .focus) {
+            const hwnd = self.popup.hwnd orelse return false;
+            _ = w32.SetFocus(hwnd);
+            return true;
+        }
+        if (action.kind != .set_value) return false;
+        if (std.mem.indexOfAny(u8, action.value, "\r\n") != null) return false;
+        self.popup.input.setText(self.ownerWindow().app.core_app.alloc, action.value) catch return false;
+        self.textChanged();
+        return true;
+    }
+    if (token == uia_bridge.palette_back and action.kind == .invoke) {
+        self.setPage(.root);
+        return true;
+    }
+    if (token < uia_bridge.palette_row_base) return false;
+    const row = std.math.cast(usize, token - uia_bridge.palette_row_base) orelse return false;
+    if (row >= self.rows.items.len or self.rows.items[row].kind != .item) return false;
+    switch (action.kind) {
+        .select => self.select(row),
+        .invoke => self.run(self.rows.items[row].kind.item, .run),
+        else => return false,
+    }
+    return true;
 }
 
 /// How a click runs an entry: with Ctrl in a new window, with Shift

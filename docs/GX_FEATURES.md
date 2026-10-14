@@ -21,15 +21,15 @@ Ghostty GX 是 GX Shell 新的终端组件（0.0.1 起），接替 WezTerm GX（
 | 壁纸 | 有：壁纸浮层（列出、预览、添加、删除）与 16 张内置壁纸 | 未移植。上游的 `background-image`（与 `-opacity`、`-position`、`-fit`、`-repeat`）可以设背景图，Windows 上没有专门验证过 | 未移植；同样可用上游的 `background-image` | 上游的 `background-image` | GX Shell 0.4.0 随 WezTerm GX 移除了壁纸 |
 | 标签栏外观 | 有：fancy 圆角标签栏、集成标题栏按钮、关闭按钮悬停 `#c42b1c`、未读计数、☰ 按钮 | 有：标签并入标题栏，Direct2D 绘制：8 DIP 圆角、活动标签与终端背景相连、`程序 ~ 标题`、未读圆点、管理员盾牌与 WSL 图标；拖动排序、双击改名、中键关闭；自绘最小化、最大化、关闭（悬停 `#c42b1c`），贴靠布局与窗口菜单；新窗口约占显示器工作区 80%，首帧前不显示 | 有（GX-0016）：libadwaita 标签栏加 GX 样式：8 px 圆角、取自主题的标题栏与标签配色、1 px 分屏线、细滚动条 | 上游原样 | — |
 | 主菜单 | 有：☰ 主菜单（命令面板、快捷键、设置、重载配置、隐藏窗口、退出），`ShowMainMenu` | 有：☰ 主菜单是按主题自绘的弹出菜单：新建标签页与窗口、启动配置子菜单、分屏、命令面板、设置、键盘快捷键、语言、重新加载配置、打开配置文件、关于、退出；`gx:main_menu`（默认 Ctrl+Shift+M） | 有（GX-0011）：上游 ☰ 菜单加 GX 分区（设置…、键盘快捷键、语言）；「关于 Ghostty GX」打开 GX 自己的关于对话框（写明非官方分支），代替上游的关于；`gx:main_menu` 从 ☰ 按钮弹出 | 上游菜单栏 | Windows 的标签页右键与终端右键菜单也是同一套自绘菜单；两边的「关于」与设置的关于页都写明 Ghostty GX 是非官方分支 |
-| 命令面板 | 有：汉化的命令面板，中文模糊搜索，frecency 排序，鼠标悬停与点击 | 有：Direct2D 弹层，分组列出最近使用、标签页、启动配置、命令、设置、主题；同时匹配译文与英文原文；本次运行内的 frecency；选中主题即预览；键盘与鼠标 | 上游 GTK 命令面板，上游条目随界面语言翻译；GX 默认值的三条 `gx:` 条目也列出，可按标题或 `gx:` 动作搜索、回车执行（GX-0014），标题与描述在加载配置时按 `language` 翻译（中文为设置、键盘快捷键、主菜单），切换语言后随配置重载更新；用户自己写的条目按原文显示 | 上游 | Windows 的使用记录只保存在进程内，重启后清空 |
-| 快捷键速查表 | 有：快捷键速查浮层 | 有：`gx:keybinds`（默认 Ctrl+Shift+/）：按类别列出全部绑定，前导键序列显示为 `A → B`，可按标题、动作与按键搜索；被其他程序或输入法占用的按键带警告标记并说明原因（见下文「快捷键冲突」） | 有（GX-0011）：`Adw.Dialog`，按类别分组，可搜索 | 无 | — |
+| 命令面板 | 有：汉化的命令面板，中文模糊搜索，frecency 排序，鼠标悬停与点击 | 有：Direct2D 弹层，分组列出最近使用、标签页、启动配置、命令、设置、主题；同时匹配译文与英文原文，汉字可按拼音首字母或全拼匹配；frecency 排序，使用记录跨运行保存在状态目录（只存条目键的哈希）；选中主题即预览；键盘与鼠标 | 上游 GTK 命令面板，上游条目随界面语言翻译；GX 默认值的三条 `gx:` 条目也列出，可按标题或 `gx:` 动作搜索、回车执行（GX-0014），标题与描述在加载配置时按 `language` 翻译（中文为设置、键盘快捷键、主菜单），切换语言后随配置重载更新；用户自己写的条目按原文显示 | 上游 | 使用记录不写进任何配置文件 |
+| 快捷键速查表 | 有：快捷键速查浮层 | 有：`gx:keybinds`（默认 Ctrl+Shift+/）：按类别列出全部绑定，前导键序列显示为 `A → B`，可按标题、动作与按键搜索；被其他程序或输入法占用的按键带警告标记并说明原因（见下文「快捷键冲突」） | 有（GX-0011）：`Adw.Dialog`，按类别分组，可搜索；另有快捷键编辑器（键表、按键序列、标志与动作链），只写 `gui-settings.ghostty`，命令行与其他配置文件的条目只读 | 无 | Windows 的速查表只查看与执行，不编辑绑定 |
 | 快捷键冲突 | 无 | 有：启动后与每次重载配置时检测被其他程序注册为全局快捷键的组合键，以及当前输入法保留的按键；日志逐条警告，速查表标出，菜单与命令面板不再提示收不到的按键，默认的复制、粘贴、查找、分屏键受影响时每次运行提示一次替代方式；Shift+Insert 粘贴剪贴板、Ctrl+Insert 复制 | 无（上游行为；Shift+Insert 仍是上游的粘贴选择内容） | 无 | 见下文「快捷键冲突」 |
-| 启动配置与默认 Shell | 有：探测 PowerShell 7、Windows PowerShell 5.1、cmd、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版与 GX Zsh；设置的 Shell 分区写默认 Shell；回退顺序 GX Zsh、PowerShell 7、PowerShell 5.1 | 有：`src/gx/profiles.zig` 探测 GX Zsh、herdr、PowerShell 7、Windows PowerShell、命令提示符、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版，加 `gx-launch-profile`；「+」旁的「▾」与右键「+」列出，另有 `gx:new_tab_profile`、`gx:new_window_profile`；未配置 `command` 时默认 GX Zsh，依次退到 PowerShell 7、Windows PowerShell、命令提示符；设置的 Shell 分区写 `command` | 有：新建标签页下拉列出 GX Zsh、herdr、登录 Shell、zsh、bash、fish 与 `gx-launch-profile`，另有「用启动配置新建窗口」；默认仍是上游的登录 shell，设置的 Shell 分区可写 `command` | 上游 | 两边选 GX Zsh 时都在后台运行 `herdr --gx-set-default-shell`，退出码 3 表示用户自管 herdr 配置，只提示 |
+| 启动配置与默认 Shell | 有：探测 PowerShell 7、Windows PowerShell 5.1、cmd、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版与 GX Zsh；设置的 Shell 分区写默认 Shell；回退顺序 GX Zsh、PowerShell 7、PowerShell 5.1 | 有：`src/gx/profiles.zig` 探测 GX Zsh、herdr、PowerShell 7、Windows PowerShell、命令提示符、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版，加 `gx-launch-profile`；「+」旁的「▾」与右键「+」列出，另有 `gx:new_tab_profile`、`gx:new_window_profile`；未配置 `command` 时默认 GX Zsh，依次退到 PowerShell 7、Windows PowerShell、命令提示符；设置的 Shell 分区写 `command` | 有：新建标签页下拉列出 GX Zsh、herdr、登录 Shell、zsh、bash、fish 与 `gx-launch-profile`，另有「用启动配置新建窗口」；默认仍是上游的登录 shell，设置的 Shell 分区可写 `command`；启动配置管理器可新建、编辑、改名、删除自定义启动配置并设默认（只写 `gui-settings.ghostty`） | 上游 | 两边选 GX Zsh 时都在后台运行 `herdr --gx-set-default-shell`，退出码 3 表示用户自管 herdr 配置，只提示 |
 | herdr 应用模式 | 有（配置脚本 `events/status.lua`）：唯一标签运行 herdr 时隐藏标签栏 | 有：`gx-herdr-app-mode`（默认开）：窗口唯一的标签页运行 herdr 时隐藏标签，保留标题栏与按钮；每 1.5 s 及标签页、分屏变化时重新判断 | 有（GX-0016）：隐藏标签栏；`gtk-titlebar-style = tabs` 时改为显示标题栏，窗口仍可拖动与关闭 | 无 | — |
 | 关闭与退出确认 | 有：空闲 Shell 名单，全部窗格空闲时关闭与退出不确认 | 有：核心 `needsConfirmQuit` 加 GX-0012 的空闲进程判断（`gx-idle-processes` 或内置列表），检查 shell 及其全部子孙；关闭标签页、窗口与退出都先问，主题化对话框列出仍在运行的进程 | 有：同一判断，检查 pty 前台进程组组长及其子孙（`/proc`）；对话框是上游 GTK 的 | 上游行为（读不到进程时保持上游结论） | — |
 | 输入法（IME） | 有：内置预编辑显示光标位置；改尺寸、切换焦点后候选框位置修正 | 有：内联预编辑；候选窗贴着光标并按 DPI 定位，改尺寸或 DPI 变化后重新定位；GX-0021 修正预编辑时渲染线程越界崩溃；win32-input-mode 下输入法上屏的文字按 VK=0 记录发送 | 上游 GTK IME；GX-0021 同样生效 | 上游；GX-0021 同样编入 | 微软拼音会吞掉 Ctrl+Shift+F（它不是 TSF 保留键，冲突检测发现不了），查找可从命令面板或右键菜单打开 |
-| 通知、响铃与进度 | 有：响铃聚焦抑制、请求注意与节流；Windows 任务栏闪烁与 OSC 9;4 进度 | 有：OSC 9 与 OSC 777 的桌面通知显示为托盘气泡，点击回到对应终端；`bell-features` 的 `system` 发系统提示音、`attention` 在窗口不在前台时闪烁任务栏，后台标签显示未读圆点；`progress-style` 开启时 OSC 9;4 进度显示在任务栏按钮；支持 `notify-on-command-finish` | 上游 GTK 行为 | 上游 | — |
-| 剪贴板图片粘贴 | 有：Ctrl+V 粘贴剪贴板图片，以 OSC 1337 内联或写临时文件（`clipboard_image_paste`） | 未移植：只粘贴文本；拖放文件与粘贴文件列表时插入按当前 shell 引用的路径（`gx.path_quote`：cmd、PowerShell、MSYS2/Git Bash/GX Zsh、WSL） | 未移植（上游行为） | 上游 | GX Shell 0.4.0 把它列为随 WezTerm GX 移除的功能 |
+| 通知、响铃与进度 | 有：响铃聚焦抑制、请求注意与节流；Windows 任务栏闪烁与 OSC 9;4 进度 | 有：OSC 9 与 OSC 777 的桌面通知在安装版里是 Windows 系统通知，便携版或系统通知不可用时是托盘气泡，点击都回到对应终端；`bell-features` 的 `system` 发系统提示音、`attention` 在窗口不在前台时闪烁任务栏，后台标签显示未读圆点；`progress-style` 开启时 OSC 9;4 进度显示在任务栏按钮；支持 `notify-on-command-finish` | 上游 GTK 行为 | 上游 | — |
+| 剪贴板图片粘贴 | 有：Ctrl+V 粘贴剪贴板图片，以 OSC 1337 内联或写临时文件（`clipboard_image_paste`） | 未移植：只粘贴文本；OLE 拖入文本、链接与文件，以及粘贴文件列表时，路径按当前 shell 引用（`gx.path_quote`：cmd、PowerShell、MSYS2/Git Bash/GX Zsh、WSL） | 未移植（上游行为） | 上游 | GX Shell 0.4.0 把它列为随 WezTerm GX 移除的功能 |
 | 字体包 | 有：JetBrainsMono Nerd Font 6 个字重与 Noto Sans CJK Regular/Bold，随配置快照与安装包分发 | 有：同一组 8 个字体文件（其中 Oh My Zsh GX 也带的 4 个与它逐字节相同，GX Shell 只在字节一致时合并组件字体）；安装包按与程序相同的范围（当前用户或所有用户）安装，已有同名字体时跳过，卸载不删；便携 zip 只附带不安装。默认 `font-family = JetBrainsMono Nerd Font`，CJK 经 `font-codepoint-map` 交给 `Noto Sans CJK SC`；字体发现用 DirectWrite（GX-0009） | 部分：deb stage 带 `fonts/`，由 GX Shell 安装；Debian 13 tarball 不带字体；默认配置相同，字体缺失时退到内嵌的 JetBrains Mono 与系统回退 | 上游 | — |
 | 安装包 | 有：0.3.0 起的原生安装包（Windows EXE 与 Ubuntu deb），后来改由 GX Shell 统一打包 | 有：Inno Setup 7.1 安装包与便携 zip（`just package-windows`；`gx-release` 的 `windows-app`），带随包 ConPTY、Mesa 软件渲染后备、字体与许可证；可选「在此处打开 Ghostty GX」右键菜单；exe 与安装包用 Ghostty GX 自己的图标（GX-0026），欢迎页、「应用和功能」与便携包 `README.txt` 写明非官方分支声明 | 无独立安装包：发布实验性的 Debian 13 tarball；Ubuntu 24.04 的 deb 由 GX Shell 用 stage 构建 | `gx-release` 可选构建只做 ad-hoc 签名的 app zip | 全部资产都没有代码签名 |
 | GX Shell 集成 | GX Shell 0.4.0 之前的终端组件 | 有：GX Shell 0.4.0 起的终端组件（0.4.0 随包 0.0.1，0.4.1 随包 0.0.2，来源锁钉各自的定版提交）；`scripts/gx_package.py windows` 产出 stage；在 `<exe>\..\bin`、`%LOCALAPPDATA%\Programs\GXShell\bin`、`%LOCALAPPDATA%\Programs\OhMyZshGX\bin` 与 PATH 中找 GX Zsh 与 herdr | 有：`scripts/gx_package.py deb` 产出 Ubuntu 24.04 的 stage，装到 `/usr/lib/ghostty-gx`，命令 `ghostty-gx`；在 `/usr/lib/ohmyzsh-gx/bin` 与 PATH 中找 GX Zsh 与 herdr | 无 | 消费方契约写在 `scripts/gx_package.py` 模块文档 |
@@ -69,11 +69,44 @@ GX Shell 的 Windows 用户最常碰到的就是这类冲突：按键被抢走�
 | Windows 11 的界面规范 | 关闭按钮悬停色 `#c42b1c`、Snap Layouts（`HTMAXBUTTON`）、DWM 圆角与阴影、Mica/Acrylic 系统材质、圆角弹出菜单 | `src/apprt/win32/chrome/`、`src/apprt/win32/ui/` | 代码与 CHANGELOG |
 | [Noctty](https://github.com/amanthanvi/noctty)（原名 winghostty） | 同样是基于 Ghostty 核心的原生 Win32 终端；公开 README 里有 shell 选择器（PowerShell、cmd、Git Bash、WSL）、命令面板、Ctrl+, 打开设置、带「在此处打开」资源管理器右键菜单的安装包加便携 ZIP、发布 SHA256SUMS | 启动配置（`src/gx/profiles.zig`）、命令面板、设置浮层、`dist/windows/gx/ghostty-gx.iss`、`gx-release` | 仓库与提交历史没有记录参考了 Noctty 的哪些部分；本行只按 Noctty 的公开 README（2026-10-09 读取）对照同类做法 |
 
-与 Noctty 公开 README 的差异：Noctty 有会话恢复、自动更新检查、自签名证书签名与 ARM64 包，没有软件渲染器（OpenGL 回落到软件时不启动）；Ghostty GX 没有会话恢复与自动更新，资产未签名、只有 x64，但在系统驱动建不出 OpenGL 4.3 时用随包的 Mesa llvmpipe 运行。
+与 Noctty 公开 README 的差异：Noctty 有自动更新检查、自签名证书签名与 ARM64 包，没有软件渲染器（OpenGL 回落到软件时不启动）；Ghostty GX 的候选实现支持下述会话恢复，尚无自动更新，资产未签名、只有 x64，但在系统驱动建不出 OpenGL 4.3 时用随包的 Mesa llvmpipe 运行。
+
+## 会话、实例与远程窗格（0.0.3 候选）
+
+本节按 `gx_ghostty` 工作区源码描述 0.0.3 的候选行为，代码已接线不等于完整平台验收已经完成；实际通过项、失败项与补验入口见 [当前执行计划](GX_UI_EXECUTION_PLAN.md) 和 [证据索引](GX_UI_EVIDENCE_INDEX.md)。
+
+### 会话恢复
+
+- 默认关闭。Windows 与 GTK 都用 `gx-session-restore = true` 开启，改动后需完全重启。开启后，普通启动恢复上次的普通窗口、标签、分屏结构与比例、放大的分屏、字号、手动设置的窗口与标签标题和工作目录；快速终端与远程窗格不进入会话。
+- 会话文件是有版本、有大小上限的结构（最多 16 个窗口、每窗 64 个标签），放在状态目录，不是配置。它只记启动配置的稳定 ID（如 `pwsh`、`wsl:<发行版>`、`custom:<名称>`），恢复时按当前配置解析：`custom:` 自定义启动配置每次恢复前确认，已不存在的跳过并提示；临时命令（`-e`、`initial-command`）与来源不明的终端不恢复。
+- 不保存命令、参数、环境变量、终端输入、动态标题或滚屏内容。工作目录只接受本机绝对路径；WSL 启动配置记录发行版内的目录，恢复时以 `--cd` 交给同一启动配置。
+- 命令行指定了 `-e`、`command`、`initial-command` 或 `working-directory` 时本次不恢复，也不覆盖已保存的会话；命令行的字号与标题优先于会话。从「退出」结束时保留退出时的布局，逐个关掉最后一个普通窗口后下次不再恢复这些窗口。
+
+### Windows 单实例与 `-e`
+
+- `gx-single-instance` 默认开：普通启动在同一用户、登录会话、权限、配置目录、程序构建、安装位置与 `class` 都相同的已运行实例里新开窗口（可带启动配置），自己随即退出。实例之间用本机认证的命名管道，主实例在界面实际完成后才回复成功。
+- `-e`、无法转交的命令行参数或 `--gx-single-instance=false` 启动独立进程；以管理员身份运行与普通权限运行属于不同的隔离域，互不复用。转交结果不明时报错退出，不另开一份终端。
+- `+toggle-quick-terminal`（可加 `--class`）在 Windows 上经同一通道切换已运行实例的快速终端，目标未运行时返回错误；GTK 仍走 GApplication 的 D-Bus。
+
+### Windows 远程窗格
+
+- 把标签拖出窗口、放到同一隔离域内另一个 Ghostty GX 进程的窗口上，标签里的终端以远程窗格显示在目标窗口。原进程在后台宿主里继续持有终端、PTY、渲染与子进程，目标只承载画面（BGRA 帧）并转发键盘、鼠标、输入法、焦点与粘贴；关闭原普通窗口不会重启或结束命令。
+- 可以在远程窗格旁新建目标进程的本地终端，形成混合分屏；作用于全部窗格的动作只影响目标窗口里可见的窗格。只含远程窗格的标签可以拖回原进程（拖到别的进程会提示「请移回原进程」），混合标签不能跨进程移动，快速终端不接收远程窗格，会话只保留混合标签里的本地部分。
+- 目标退出或断开后，原进程收回仍存活的终端；原进程故障时远程窗格显示「不可用」并提供关闭，不重放任何命令或输入。远程粘贴单次最多 16 MiB，分块传输，不自动追加回车；搜索、确认与剪贴板由目标窗口显示，结果回到原终端后才算完成。
+
+### 拖放、受保护粘贴与提权窗口
+
+- 终端用 OLE 接收拖入的文本、文件与链接，路径按当前 shell 引用；拖入内容和粘贴一样按终端的粘贴确认规则处理，确认后也不自动发送回车。
+- 以管理员身份运行的窗口收不到普通权限程序的拖放（UIPI）。为此有一个普通权限的接收窗口「拖入提权终端」，只服务一个经过核验（进程号与创建时间、同一程序映像）的提权进程：内容在提权窗口里预览，点「允许粘贴」才粘贴；接收窗口显示已粘贴、已取消、被拒绝、目标已关闭、已过期或结果未知。它不读剪贴板、不改 UIPI 过滤、不提权。接收窗口目前只能用内部启动参数打开，尚无菜单入口。
+
+### 系统通知、跳转列表、无障碍与 DComp
+
+- 安装版用安装程序登记的 Shell 身份（AUMID 与通知激活器）发 Windows 系统通知并维护任务栏跳转列表：点击通知回到原终端，程序未运行时由通知冷启动；跳转列表按稳定 ID 列出启动配置，已删除的配置不会启动默认 shell。便携版不做任何注册；系统通知后端不可用时退回托盘气泡，被勿扰或用户关闭的通知不改用气泡。
+- 窗口、标签、终端窗格与自绘弹层向 UI Automation 公开名称、角色和调用、选择、切换、展开等操作；外部读屏工具只拿到界面线程生成的快照。
+- 弹层的 DirectComposition 呈现是实验：环境变量 `GHOSTTY_GX_POPUP_DCOMP=1` 才启用（其他值与未设置都走原路径），只影响弹层，不改终端的 WGL 渲染；初始化、设备重置或提交失败时退回原绘制方式。
 
 ## 没有实现的
 
 - WezTerm GX 的壁纸浮层与内置壁纸、剪贴板图片粘贴、CLI 帮助汉化，以及配置脚本里的插件与键位集合，Ghostty GX 都没有移植；GX Shell 0.4.0 不迁移 WezTerm 的配置。
-- 会话恢复（窗口、标签与工作目录在重启后恢复）两边都没有。
 - Linux GTK 上：默认 shell 仍是登录 shell（不默认进 GX Zsh），没有系统窗口材质。
 - macOS app 没有任何 GX 界面与配置分层。

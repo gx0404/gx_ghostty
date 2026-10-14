@@ -4119,6 +4119,24 @@ term: []const u8 = "xterm-ghostty",
 /// Available since Ghostty GX 0.0.1.
 @"gx-open-config-ui": gx_config_types.OpenConfigUi = .settings,
 
+/// Whether an ordinary Windows launch opens a new window in the existing
+/// Ghostty GX instance with the same user, login session, elevation, config
+/// directory, executable build, installation and `class`. The default is true.
+/// Use `--gx-single-instance=false` to start an independent instance. `-e` and
+/// command-line overrides that cannot be forwarded also start independently.
+/// Changes require a full restart. Windows only.
+/// Available since Ghostty GX 0.0.3.
+@"gx-single-instance": bool = true,
+
+/// Whether to restore the saved arrangement of ordinary windows and terminals
+/// on the next ordinary launch. The default is false. Restoration resolves
+/// trusted profiles from the current configuration and asks before launching
+/// custom profiles; temporary commands are not replayed. Explicit startup
+/// command-line choices take precedence. Changes require a full restart.
+/// Windows and GTK only.
+/// Available since Ghostty GX 0.0.3.
+@"gx-session-restore": bool = false,
+
 /// Whether turning the mouse wheel with Ctrl alone held, or pinching on a
 /// touchpad, changes the font size of the terminal under the pointer, one
 /// point per notch of the wheel. Pinching scales from the font size at the
@@ -4532,7 +4550,11 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
     // Initialize our CLI iterator.
     var iter = try cli.args.argsIterator(alloc_gpa, global.args());
     defer iter.deinit();
-    try self.loadIter(alloc_gpa, &iter);
+    // fork(gx): GX-0042 consume internal shell flags only from actual Windows CLI.
+    if (comptime builtin.os.tag == .windows) {
+        var shell_iter: @import("../gx/shell_startup.zig").Filter(@TypeOf(iter)) = .{ .iterator = &iter };
+        try self.loadIter(alloc_gpa, &shell_iter);
+    } else try self.loadIter(alloc_gpa, &iter);
 
     // If we are not loading the default files, then we need to
     // replay the steps up to this point so that we can rebuild

@@ -230,3 +230,30 @@ just wsl --clone "~/src/gx_ghostty-R5-00-overlay" build --gtk
 8. 清理是否代表原R6完成？哪些生成物、平台、GUI、性能与权限门仍需补验？
 
 本轮不声称已做无上下文独立reader测试；未调用子代理。接手者答不出来时先补文档缺口，不重做37份审计、不扩大到其他私有会话。
+
+## 8. 2026-10-13 接续实施检查点（进行中）
+
+本节是后续实施的中间记录，不替代前文验收契约。用户已授权分波并行实施、Docker Windows 测试机部署和钉版拼音／Fluent 素材下载；当时没有 commit/push 授权（2026-10-14 起本地阶段 commit 已获授权，见第 9 节）。主分支 HEAD 仍以实查为准，本轮源码尚在工作区。整体 **not_complete**。
+
+- 新实现覆盖两端稳定引用、GTK 来源／空树收养／分屏迁移／geometry／session／profile 管理、Windows authenticated IPC 与 CLI、共享安全 session、全拼、Fluent 路径及其选中图标接线；Windows session、OLE、UIA 与标签拖出／合并仍在接线和复审。
+- GTK 快照 `479c38195` 定向 81/81；`f9a526817` 定向 26/26；`207362f94` 定向 104/104，均零 skip。这些只证明相应快照的选择范围。
+- `207362f94` 标准 GTK app 已构建；G05/G08 共四张截图已读，只确认现有分屏／标签和启动菜单回归。真实迁移 PID/PTY、session restart、manager CRUD、硬件／Wayland／IME 验收仍 PENDING。
+- Windows 第 6 批保留原 506 PASS、1 FAIL（旧测试要求 `zihao` 不匹配“字号”）。修复后第 12 批 557/557、零 skip，包含 OLE 外层撤销、UIA、session 和全拼。第 11 批 SRW API 编译失败也保留日志；新快照不自动继承旧测试结论。
+- 标准 Windows app 第 1、2 批构建成功；第 2 批接入 shell identity、通知和 JumpList，SHA256 为 `3005be94b8e650189ea0a32bd53ecbea039bceb67c9ff650c1ee15a96f08d29a`。W01 在第 1 批 app 的绝对隔离路径下通过，三张图已读；相对 out 导致相对环境目录被二次解析的首次失败保留。其余 GUI 和系统功能不由 W01 代证。
+- GTK 快照 `e1c50a811` 第 6 批定向 91/91、零 skip，包含编辑模型、session 和 GTK GX 生命周期；新 std app build 与 session restart 场景继续验证。
+- Shell 模块、安装器注册及按所有权卸载、实际 CLI 参数过滤已实现；轻量 native 29/29，相关 package/release 99 tests、6 环境 skip。未实际编译安装器或执行 VM 安卸载、通知冷暖激活及 JumpList，保持 PENDING。
+- R5-01X 已有双缓冲 CAS 所有权与源权威输入租约，轻量 12/12；真实映射、认证句柄、源产帧、目标呈现和全部 UI 回调仍在实施，不记跨 host 已完成。
+- 相关框架定向 139 项通过；打包定向 48 项、6 skip。完整 framework/CI/main/VT/POSIX/GTK 总门尚未运行。
+- 独立复审发现并修复 GTK 同窗迁移监听断连、隐藏 pane 旧引用及窗口手动标题遗漏；OLE 真实原生测试证明先 DestroyWindow 再 RevokeDragDrop 会泄漏注册引用，当前采用保留 HWND、外层 GUI 循环撤销后销毁和注册中 reservation，该生产回归已随 Windows 第 12 批通过。UIA 追加每批请求预算、通知语义去重和队列满重试，外部 MTA 与真实 OLE source 仍需补验。
+- 新 `scripts/gx_slots.py` 用内核锁协调 Windows 发起的 Windows/WSL/Docker 作业，三重型槽与单桌面槽，不按年龄删除锁。旧 `.local/bin/slot.sh`／`desk.sh` 不再作为本轮调度入口。
+- Win11 Docker VM 已通过实际 KVM、官方 ISO SHA256 校验并启动到登录界面；已正常停止，磁盘保留。首次登录后的普通账户／策略验收、Win10、安装／通知／提权场景仍 PENDING。不能用安装完成代 GUI 或 GPU 验收。
+- 当前证据：`.local/evidence/R5/execution-20261013/tasks.json`、`leaf-matrix.json`、各批日志和 `gtk-gui-05/review.json`；VM 在 `.local/evidence/R5/VM/`。142 叶最终绑定、C1 新 40 loads、P 门、其余 R5/R6 都未关闭。
+
+## 9. 2026-10-14 R6 收口检查点
+
+本节只更新组织方式与入口，不替代前文验收契约，也不关闭任何门。整体 **not_complete**。
+
+- 任务组织、模型分工、重型槽、构建频次与提交授权以 [GX_UI_EXECUTION_PLAN.md](GX_UI_EXECUTION_PLAN.md) 为准：只派当前会话的原生子智能体（同时最多 10 个），本地阶段 commit 已授权，仍不 push、不建 PR/Issue/tag/release、不新增下载。原定 02:48 截止已超期，如实保留。
+- 最近的完整候选证据是 final-r2（`candidate-20261014-0250`），结果、限制与补验入口见 [GX_UI_EVIDENCE_INDEX.md](GX_UI_EVIDENCE_INDEX.md) 2.1 与第 6 节。它之后的源码修改尚未编译，任何新结论都要绑定新的构建身份。
+- 第 2.3 节的 R5-00 与第 5 节各流的源码大部分已接线：普通窗口本地/远程混合树、远程输入与绑定续延（GX-0043、GX-0044）、两端会话恢复（默认关）、Windows 单实例与 `-e` 独立、protected paste 与跨权限拖放 broker、Shell 身份下的 Toast/JumpList、UIA、全拼、Fluent 图标与默认关闭的 Popup DComp，以及 GTK 的生命周期、geometry、分屏迁移、快捷键编辑器与启动配置管理器。接线不等于验收：第 5 节每一行的完成门照旧适用。
+- 用户可见行为写在 [GX_FEATURES.md](GX_FEATURES.md)「会话、实例与远程窗格」与根 `CHANGELOG.md` 的 `0.0.3(TBD)`；上游补丁 GX-0039～GX-0044 登记在 [FORK_PATCHES.md](FORK_PATCHES.md)。

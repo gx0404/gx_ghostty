@@ -449,5 +449,39 @@ class SettingsDialogTests(unittest.TestCase):
         self.assertLess(body.group(1).index(guard), body.group(1).index('self.queueSet("theme"'))
 
 
+class TransferRuntimeTests(unittest.TestCase):
+    """Contracts for real callback wiring, separate from pure tree models."""
+
+    def test_transfer_rebinds_final_window_listeners_after_both_tree_commits(self):
+        source = (GX / "split_transfer.zig").read_text(encoding="utf-8")
+        committed = source.index("source_tree.adoptOwnedTree(remaining, next_focus)")
+        rebind = source.index("source_window.gxRebindSurfaceHandlers()")
+        self.assertLess(committed, rebind)
+        self.assertIn("if (target_window != source_window) target_window.gxRebindSurfaceHandlers()", source)
+        window = (GTK / "class/window.zig").read_text(encoding="utf-8")
+        body = window.split("pub fn gxRebindSurfaceHandlers(", 1)[1].split("    fn disconnectSurfaceHandlers(", 1)[0]
+        self.assertIn("tabs.getNPages()", body)
+        self.assertIn("tab.getSurfaceTree()", body)
+        self.assertIn("self.connectSurfaceHandlers(tree)", body)
+        handlers = window.split("    fn connectSurfaceHandlers(", 1)[1].split("pub fn gxRebindSurfaceHandlers(", 1)[0]
+        for actual_signal in ('@"present-request"', '@"toggle-fullscreen"', '@"toggle-maximize"', "Surface.signals.menu"):
+            self.assertIn(actual_signal, handlers)
+
+    def test_surface_view_leases_follow_surface_mapping_not_only_window_mapping(self):
+        source = (GX / "runtime.zig").read_text(encoding="utf-8")
+        self.assertIn('.detail = "mapped"', source)
+        self.assertIn("surfaceMapped", source)
+        attached = source.split("pub fn surfaceAttached(", 1)[1].split("pub fn surfaceDetached(", 1)[0]
+        self.assertIn("surface.getMapped()", attached)
+        resolved = source.split("pub fn resolveSurfaceView(", 1)[1].split("pub fn resolveView(", 1)[0]
+        self.assertIn("if (!surface.getMapped()) return null", resolved)
+
+    def test_session_roundtrips_manual_window_title_with_cli_precedence(self):
+        source = (GX / "session.zig").read_text(encoding="utf-8")
+        self.assertIn("try manualTitle(alloc, window.as(gobject.Object))", source)
+        self.assertIn("if (!value.cli.title) if (saved_window.title_override)", source)
+        self.assertIn("window.setTitleOverride(title)", source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ const i18n = @import("../../../gx/i18n.zig");
 const ui_color = @import("../../../gx/ui_color.zig");
 const text_edit = @import("text_edit.zig");
 const wstr = @import("wstr.zig");
+const dcomp = @import("dcomp.zig");
 
 const log = std.log.scoped(.win32_d2d);
 
@@ -127,15 +128,30 @@ pub fn ceilValue(v: f32, scale: f32) f32 {
 
 const RectF = extern struct { left: f32, top: f32, right: f32, bottom: f32 };
 const RoundedRect = extern struct { rect: RectF, radius_x: f32, radius_y: f32 };
-const Matrix3x2 = extern struct {
+pub const Matrix3x2 = extern struct {
     m11: f32 = 1,
     m12: f32 = 0,
     m21: f32 = 0,
     m22: f32 = 1,
     dx: f32 = 0,
     dy: f32 = 0,
+
+    /// Row-vector composition: apply local coordinates before the target's
+    /// existing transform, including its translation and nonuniform scale.
+    pub fn then(a: Matrix3x2, b: Matrix3x2) Matrix3x2 {
+        return .{
+            .m11 = a.m11 * b.m11 + a.m12 * b.m21,
+            .m12 = a.m11 * b.m12 + a.m12 * b.m22,
+            .m21 = a.m21 * b.m11 + a.m22 * b.m21,
+            .m22 = a.m21 * b.m12 + a.m22 * b.m22,
+            .dx = a.dx * b.m11 + a.dy * b.m21 + b.dx,
+            .dy = a.dx * b.m12 + a.dy * b.m22 + b.dy,
+        };
+    }
 };
 const PixelFormat = extern struct { format: u32, alpha_mode: u32 };
+const BitmapProperties = extern struct { pixel_format: PixelFormat, dpi_x: f32, dpi_y: f32 };
+const ID2D1Bitmap = extern struct { vtable: *const extern struct { unknown: IUnknownVtbl } };
 const RenderTargetProperties = extern struct {
     type: u32 = D2D1_RENDER_TARGET_TYPE_DEFAULT,
     pixel_format: PixelFormat,
@@ -276,7 +292,7 @@ const ID2D1RenderTarget = extern struct {
     const VTable = extern struct {
         unknown: IUnknownVtbl,
         GetFactory: Unused,
-        CreateBitmap: Unused,
+        CreateBitmap: *const fn (*ID2D1RenderTarget, SizeU, ?*const anyopaque, u32, *const BitmapProperties, *?*ID2D1Bitmap) callconv(.winapi) HRESULT,
         CreateBitmapFromWicBitmap: Unused,
         CreateSharedBitmap: Unused,
         CreateBitmapBrush: Unused,
@@ -298,12 +314,12 @@ const ID2D1RenderTarget = extern struct {
         FillGeometry: *const fn (*ID2D1RenderTarget, *ID2D1PathGeometry, *ID2D1SolidColorBrush, ?*anyopaque) callconv(.winapi) void,
         FillMesh: Unused,
         FillOpacityMask: Unused,
-        DrawBitmap: Unused,
+        DrawBitmap: *const fn (*ID2D1RenderTarget, *ID2D1Bitmap, ?*const RectF, f32, u32, ?*const RectF) callconv(.winapi) void,
         DrawText: Unused,
         DrawTextLayout: *const fn (*ID2D1RenderTarget, Point, *IDWriteTextLayout, *ID2D1SolidColorBrush, u32) callconv(.winapi) void,
         DrawGlyphRun: Unused,
         SetTransform: *const fn (*ID2D1RenderTarget, *const Matrix3x2) callconv(.winapi) void,
-        GetTransform: Unused,
+        GetTransform: *const fn (*ID2D1RenderTarget, *Matrix3x2) callconv(.winapi) void,
         SetAntialiasMode: *const fn (*ID2D1RenderTarget, u32) callconv(.winapi) void,
         GetAntialiasMode: Unused,
         SetTextAntialiasMode: *const fn (*ID2D1RenderTarget, u32) callconv(.winapi) void,
@@ -393,7 +409,7 @@ const ID2D1GeometrySink = extern struct {
     vtable: *const VTable,
     const VTable = extern struct {
         unknown: IUnknownVtbl,
-        SetFillMode: Unused,
+        SetFillMode: *const fn (*ID2D1GeometrySink, u32) callconv(.winapi) void,
         SetSegmentFlags: Unused,
         BeginFigure: *const fn (*ID2D1GeometrySink, Point, u32) callconv(.winapi) void,
         AddLines: Unused,
@@ -912,8 +928,37 @@ pub const Factory = struct {
     mono_family: [:0]const u16,
     formats: std.ArrayList(CachedFormat) = .empty,
     text_cache: TextCache = .{ .capacity = text_cache_capacity },
+    popup_device: ?dcomp.Device = null,
+    popup_device_attempted: bool = false,
+
+    /// One optional D3D/D2D composition device shared by every popup. Failure
+    /// stays legacy for this factory lifetime instead of retrying every paint.
+    pub fn popupDevice(self: *Factory) ?*dcomp.Device {
+        if (!self.popup_device_attempted) {
+            self.popup_device_attempted = true;
+            if (self.d2d_1_1 and dcomp.enabled()) self.popup_device = dcomp.Device.init(self.d2d) catch |err| result: {
+                log.warn("popup composition device unavailable; using legacy err={}", .{err});
+                break :result null;
+            };
+        }
+        return if (self.popup_device) |*device| device else null;
+    }
 
     pub const Error = error{ Direct2DUnavailable, DirectWriteUnavailable, OutOfMemory };
+
+    /// Empty factory-owned geometry. Call beginFigure/endFigure for each
+    /// contour, then finish once; only successful geometry may be cached.
+    pub fn createPath(self: *Factory) ?Path {
+        var geometry: ?*ID2D1PathGeometry = null;
+        if (!succeeded(self.d2d.vtable.CreatePathGeometry(self.d2d, &geometry))) return null;
+        const g = geometry orelse return null;
+        var sink: ?*ID2D1GeometrySink = null;
+        if (!succeeded(g.vtable.Open(g, &sink)) or sink == null) {
+            release(g);
+            return null;
+        }
+        return .{ .geometry = g, .sink = sink };
+    }
 
     /// Entries per `TextCache` generation.
     pub const text_cache_capacity = 256;
@@ -990,6 +1035,7 @@ pub const Factory = struct {
     }
 
     pub fn destroy(self: *Factory) void {
+        if (self.popup_device) |*device| device.deinit();
         self.flushFormats();
         self.formats.deinit(self.alloc);
         self.text_cache.deinit(self.alloc);
@@ -1462,6 +1508,30 @@ pub fn middleEllipsis(
 pub const Path = struct {
     geometry: *ID2D1PathGeometry,
     sink: ?*ID2D1GeometrySink,
+    finished: bool = false,
+
+    pub fn setFillMode(self: *Path, mode: enum { nonzero, evenodd }) void {
+        const sink = self.sink orelse return;
+        sink.vtable.SetFillMode(sink, if (mode == .nonzero) 1 else 0);
+    }
+
+    pub fn beginFigure(self: *Path, start: Point) void {
+        const sink = self.sink orelse return;
+        sink.vtable.BeginFigure(sink, start, D2D1_FIGURE_BEGIN_FILLED);
+    }
+
+    pub fn endFigure(self: *Path, closed: bool) void {
+        const sink = self.sink orelse return;
+        sink.vtable.EndFigure(sink, if (closed) D2D1_FIGURE_END_CLOSED else D2D1_FIGURE_END_OPEN);
+    }
+
+    pub fn finish(self: *Path) bool {
+        const sink = self.sink orelse return self.finished;
+        self.finished = succeeded(sink.vtable.Close(sink));
+        release(sink);
+        self.sink = null;
+        return self.finished;
+    }
 
     pub fn lineTo(self: *Path, p: Point) void {
         const sink = self.sink orelse return;
@@ -1487,11 +1557,8 @@ pub const Path = struct {
 
     /// Finish the figure (closing it back to its start when `closed`).
     pub fn end(self: *Path, closed: bool) void {
-        const sink = self.sink orelse return;
-        sink.vtable.EndFigure(sink, if (closed) D2D1_FIGURE_END_CLOSED else D2D1_FIGURE_END_OPEN);
-        _ = sink.vtable.Close(sink);
-        release(sink);
-        self.sink = null;
+        self.endFigure(closed);
+        _ = self.finish();
     }
 
     pub fn deinit(self: *Path) void {
@@ -1518,6 +1585,43 @@ fn endResultOf(hr: HRESULT) EndResult {
     if (hr == D2DERR_RECREATE_TARGET) return .recreate;
     if (!succeeded(hr)) return .failed;
     return .ok;
+}
+
+fn borrowedTransform(offset: w32.POINT, dpi: f32) Matrix3x2 {
+    return .{ .dx = @as(f32, @floatFromInt(offset.x)) * 96 / dpi, .dy = @as(f32, @floatFromInt(offset.y)) * 96 / dpi };
+}
+
+test "DComp atlas offset is converted from physical pixels to canvas DIPs" {
+    const transform = borrowedTransform(.{ .x = 30, .y = -15 }, 144);
+    try std.testing.expectEqual(@as(f32, 20), transform.dx);
+    try std.testing.expectEqual(@as(f32, -10), transform.dy);
+}
+
+test "DComp borrowed canvas leaves the native draw transaction to its owner" {
+    const factory = try Factory.create(std.testing.allocator);
+    defer factory.destroy();
+    var canvas = Canvas.init(factory);
+    defer canvas.deinit();
+    const software = canvas.createDcTarget(D2D1_RENDER_TARGET_TYPE_SOFTWARE, true, 96) orelse return error.SoftwareD2DUnavailable;
+    defer release(software);
+    var output: DibTarget = .{};
+    defer output.deinit();
+    const dc = output.ensure(null, 32, 32) orelse return error.CreateDibFailed;
+    try std.testing.expect(succeeded(software.vtable.BindDC(software, dc, &.{ .left = 0, .top = 0, .right = 32, .bottom = 32 })));
+    const rt: *ID2D1RenderTarget = @ptrCast(software);
+    rt.vtable.BeginDraw(rt);
+    try std.testing.expect(canvas.beginBorrowed(rt, .{ .width = 32, .height = 32 }, 144, .{ .x = 3, .y = 6 }));
+    canvas.clear(Color.black.withAlpha(0));
+    canvas.fillRect(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, .white);
+    var transform: Matrix3x2 = undefined;
+    rt.vtable.GetTransform(rt, &transform);
+    try std.testing.expectEqual(@as(f32, 2), transform.dx);
+    try std.testing.expectEqual(@as(f32, 4), transform.dy);
+    // Accidentally using the owned finish API must not call native EndDraw.
+    try std.testing.expectEqual(EndResult.failed, canvas.finish());
+    canvas.finishBorrowed();
+    try std.testing.expect(!canvas.hasTarget() and !canvas.drawing and canvas.brush == null);
+    try std.testing.expect(succeeded(rt.vtable.EndDraw(rt, null, null)));
 }
 
 /// Draws on one render target in DIPs. Create it with the app's
@@ -1551,6 +1655,7 @@ pub const Canvas = struct {
         none,
         hwnd: *ID2D1HwndRenderTarget,
         dc: *ID2D1DCRenderTarget,
+        borrowed: *ID2D1RenderTarget,
     };
 
     pub fn init(factory: *Factory) Canvas {
@@ -1568,6 +1673,7 @@ pub const Canvas = struct {
             .none => null,
             .hwnd => |rt| @ptrCast(rt),
             .dc => |rt| @ptrCast(rt),
+            .borrowed => |rt| rt,
         };
     }
 
@@ -1585,8 +1691,40 @@ pub const Canvas = struct {
             .none => {},
             .hwnd => |rt| release(rt),
             .dc => |rt| release(rt),
+            .borrowed => {},
         }
         self.target = .none;
+    }
+
+    /// DirectComposition owns this BeginDraw/EndDraw pair. Never AddRef,
+    /// BeginDraw or EndDraw the borrowed device context; brushes live only for
+    /// this draw, so neither a returned atlas context nor a device generation
+    /// leaks into a later frame or the legacy raster cache.
+    pub fn beginBorrowed(self: *Canvas, context: *anyopaque, pixels: SizeU, dpi: u32, offset: w32.POINT) bool {
+        if (self.drawing or self.dib_output != null or dpi == 0) return false;
+        self.discardTarget();
+        const rt: *ID2D1RenderTarget = @ptrCast(@alignCast(context));
+        self.target = .{ .borrowed = rt };
+        self.pixel_size = pixels;
+        self.dpi = @floatFromInt(dpi);
+        rt.vtable.SetDpi(rt, self.dpi, self.dpi);
+        var brush: ?*ID2D1SolidColorBrush = null;
+        if (!succeeded(rt.vtable.CreateSolidColorBrush(rt, &Color.black, null, &brush)) or brush == null) {
+            self.discardTarget();
+            return false;
+        }
+        self.brush = brush;
+        rt.vtable.SetTransform(rt, &borrowedTransform(offset, self.dpi));
+        rt.vtable.SetAntialiasMode(rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        rt.vtable.SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        self.drawing = true;
+        return true;
+    }
+
+    pub fn finishBorrowed(self: *Canvas) void {
+        std.debug.assert(self.target == .borrowed);
+        self.drawing = false;
+        self.discardTarget();
     }
 
     /// Whether the canvas holds a render target.
@@ -1611,7 +1749,7 @@ pub const Canvas = struct {
         };
         const dpi_f: f32 = @floatFromInt(if (dpi == 0) 96 else dpi);
 
-        if (self.target == .dc) self.discardTarget();
+        if (self.target == .dc or self.target == .borrowed) self.discardTarget();
         if (self.target == .hwnd) {
             const rt = self.target.hwnd;
             if (client_size.width != self.pixel_size.width or client_size.height != self.pixel_size.height) {
@@ -1734,7 +1872,7 @@ pub const Canvas = struct {
 
     fn beginDcMode(self: *Canvas, hdc: w32.HDC, rect: w32.RECT, dpi: u32, alpha: bool) bool {
         const dpi_f: f32 = @floatFromInt(if (dpi == 0) 96 else dpi);
-        if (self.target == .hwnd or (self.target == .dc and self.dc_alpha != alpha)) self.discardTarget();
+        if (self.target == .hwnd or self.target == .borrowed or (self.target == .dc and self.dc_alpha != alpha)) self.discardTarget();
         if (self.target == .none) {
             // The pixels go back to GDI, so render in software: a hardware
             // target would only add a device and a read-back.
@@ -1808,6 +1946,8 @@ pub const Canvas = struct {
     }
 
     fn finishTarget(self: *Canvas) EndResult {
+        // The surface owner must finish the DComp transaction instead.
+        if (self.target == .borrowed) return .failed;
         if (!self.drawing) return .ok;
         self.drawing = false;
         const rt = self.renderTarget() orelse return .failed;
@@ -1880,6 +2020,28 @@ pub const Canvas = struct {
         rt.vtable.FillRectangle(rt, &rect.d2d(), brush);
     }
 
+    /// Copy a top-down BGRA frame while the caller holds its read lease. D2D
+    /// owns the uploaded bytes before this returns, so no mapping is retained.
+    /// The bitmap belongs to this target and is released before a target reset.
+    pub fn drawBgra(self: *Canvas, pixels: []const u8, width: u32, height: u32, stride: u32, rect: Rect) bool {
+        const layout = @import("../../../gx/remote_view.zig").Layout.checked(width, height, stride) catch return false;
+        const required = std.math.mul(usize, stride, height) catch return false;
+        _ = layout;
+        if (!self.drawing or pixels.len != required) return false;
+        const rt = self.renderTarget() orelse return false;
+        const properties: BitmapProperties = .{
+            .pixel_format = .{ .format = 87, .alpha_mode = 3 }, // BGRA8, opaque terminal frame.
+            .dpi_x = 96,
+            .dpi_y = 96,
+        };
+        var bitmap: ?*ID2D1Bitmap = null;
+        if (!succeeded(rt.vtable.CreateBitmap(rt, .{ .width = width, .height = height }, pixels.ptr, stride, &properties, &bitmap))) return false;
+        const owned = bitmap orelse return false;
+        defer _ = owned.vtable.unknown.Release(@ptrCast(owned));
+        rt.vtable.DrawBitmap(rt, owned, &rect.d2d(), 1, 0, null);
+        return true;
+    }
+
     pub fn fillRoundedRect(self: *Canvas, rect: Rect, radius: f32, color: Color) void {
         const rt = self.renderTarget() orelse return;
         const brush = self.brushFor(color) orelse return;
@@ -1931,16 +2093,22 @@ pub const Canvas = struct {
     /// Start a path at `start`; finish it with `Path.end`, draw it with
     /// `fillPath`/`strokePath` and release it with `Path.deinit`.
     pub fn beginPath(self: *Canvas, start: Point, filled: bool) ?Path {
-        var geometry: ?*ID2D1PathGeometry = null;
-        if (!succeeded(self.factory.d2d.vtable.CreatePathGeometry(self.factory.d2d, &geometry))) return null;
-        const g = geometry orelse return null;
-        var sink: ?*ID2D1GeometrySink = null;
-        if (!succeeded(g.vtable.Open(g, &sink)) or sink == null) {
-            release(g);
-            return null;
-        }
-        sink.?.vtable.BeginFigure(sink.?, start, if (filled) D2D1_FIGURE_BEGIN_FILLED else 1);
-        return .{ .geometry = g, .sink = sink };
+        const path = self.factory.createPath() orelse return null;
+        path.sink.?.vtable.BeginFigure(path.sink.?, start, if (filled) D2D1_FIGURE_BEGIN_FILLED else 1);
+        return path;
+    }
+
+    pub fn fillPathTransformed(self: *Canvas, path: *const Path, color: Color, transform: Matrix3x2) bool {
+        if (!path.finished) return false;
+        const rt = self.renderTarget() orelse return false;
+        const brush = self.brushFor(color) orelse return false;
+        var previous: Matrix3x2 = undefined;
+        rt.vtable.GetTransform(rt, &previous);
+        const combined = transform.then(previous);
+        rt.vtable.SetTransform(rt, &combined);
+        defer rt.vtable.SetTransform(rt, &previous);
+        rt.vtable.FillGeometry(rt, path.geometry, brush, null);
+        return true;
     }
 
     pub fn fillPath(self: *Canvas, path: *const Path, color: Color) void {
@@ -2268,6 +2436,69 @@ test "opticalSize follows the Fluent type ramp" {
     try testing.expectEqual(OpticalSize.text, opticalSize(18));
     try testing.expectEqual(OpticalSize.display, opticalSize(20));
     try testing.expectEqual(OpticalSize.display, opticalSize(28));
+}
+
+test "Fluent native evenodd contours preserve holes and restore target transform" {
+    const testing = std.testing;
+    const factory = try Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = Canvas.init(factory);
+    defer canvas.deinit();
+    const software = canvas.createDcTarget(D2D1_RENDER_TARGET_TYPE_SOFTWARE, true, 96) orelse return error.SoftwareD2DUnavailable;
+    canvas.target = .{ .dc = software };
+    canvas.dc_alpha = true;
+    var output: DibTarget = .{};
+    defer output.deinit();
+    _ = output.ensure(null, 48, 48) orelse return error.CreateDibFailed;
+    var path = factory.createPath() orelse return error.CreatePathFailed;
+    defer path.deinit();
+    path.setFillMode(.evenodd);
+    for ([_][2]f32{ .{ 0, 12 }, .{ 3, 9 } }) |sides| {
+        path.beginFigure(.{ .x = sides[0], .y = sides[0] });
+        path.lineTo(.{ .x = sides[1], .y = sides[0] });
+        path.lineTo(.{ .x = sides[1], .y = sides[1] });
+        path.lineTo(.{ .x = sides[0], .y = sides[1] });
+        path.endFigure(true);
+    }
+    try testing.expect(path.finish());
+    try testing.expect(canvas.beginDib(&output, .{ .width = 48, .height = 48 }, 96));
+    canvas.clear(Color.black.withAlpha(0));
+    const rt = canvas.renderTarget().?;
+    const original: Matrix3x2 = .{ .dx = 2, .dy = 3 };
+    rt.vtable.SetTransform(rt, &original);
+    try testing.expect(canvas.fillPathTransformed(&path, .white, .{ .m11 = 2, .m22 = 2, .dx = 4, .dy = 4 }));
+    var restored: Matrix3x2 = undefined;
+    rt.vtable.GetTransform(rt, &restored);
+    try testing.expectEqualDeep(original, restored);
+    try testing.expectEqual(EndResult.ok, canvas.finish());
+    const pixels: [*]const u32 = @ptrCast(@alignCast(output.bits.?));
+    try testing.expectEqual(@as(u32, 0xffffffff), pixels[9 * 48 + 9]);
+    try testing.expectEqual(@as(u32, 0), pixels[19 * 48 + 18]);
+    try testing.expectEqual(@as(u32, 0), pixels[40 * 48 + 40]);
+}
+
+test "remote BGRA upload owns pixels and preserves padded rows" {
+    const testing = std.testing;
+    const factory = try Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = Canvas.init(factory);
+    defer canvas.deinit();
+    const software = canvas.createDcTarget(D2D1_RENDER_TARGET_TYPE_SOFTWARE, true, 96) orelse return error.SoftwareD2DUnavailable;
+    canvas.target = .{ .dc = software };
+    canvas.dc_alpha = true;
+    var output: DibTarget = .{};
+    defer output.deinit();
+    _ = output.ensure(null, 2, 2) orelse return error.CreateDibFailed;
+    try testing.expect(canvas.beginDib(&output, .{ .width = 2, .height = 2 }, 96));
+    canvas.clear(.black);
+    var source = [_]u32{ 0xffff0000, 0xff00ff00, 0xdeadbeef, 0xff0000ff, 0xffffffff, 0xdeadbeef };
+    const rect: Rect = .{ .x = 0, .y = 0, .w = 2, .h = 2 };
+    try testing.expect(!canvas.drawBgra(std.mem.asBytes(&source)[0..8], 2, 2, 12, rect));
+    try testing.expect(canvas.drawBgra(std.mem.asBytes(&source), 2, 2, 12, rect));
+    @memset(&source, 0); // The producer can reuse the slot before EndDraw.
+    try testing.expectEqual(EndResult.ok, canvas.finish());
+    const pixels: [*]const u32 = @ptrCast(@alignCast(output.bits.?));
+    try testing.expectEqualSlices(u32, &.{ 0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff }, pixels[0..4]);
 }
 
 test "cjkFontFor picks the font of the language, then of the region" {

@@ -55,7 +55,7 @@
 
 - `justfile` 在 Windows 经 `cmd.exe` 执行（`set windows-shell`），解释器在 Windows 取 `python`、其余取 `python3`；配方体只写单条命令（Python 脚本调用，`install-hooks` 是 `git config`），串联的门用配方依赖表达，不写 POSIX 守卫或多行 shell。`.githooks/commit-msg` 必须以可执行模式入库（`git add --chmod=+x`），由提交规范测试锁定。上游 `Makefile` 不改，也不作 fork 入口。
 - `just framework-check`：rules-check → version-check → framework-test → kb-check → i18n-check → pinyin-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
-- `just generated-check`：kb-check → i18n-check → pinyin-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑 kb、graph 两项。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
+- `just generated-check`：kb-check → i18n-check → pinyin-check → fluent-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑 kb、graph 两项。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
 - `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含完整单测 `just test`），需要钉版 Zig，热缓存约 100 s，改过 Zig 源码另加约 2 min 编译；不得自行排除冷编译或用本机结果代证 CI（`docs/TESTING.md`）。
 - `just doctor`：`setup_env.py --check` 只读诊断，缺必需项（zig、python、git、venv、graphify，Windows 另需 MSVC）退出 1，其余（hooksPath、符号链接权限、Inno Setup、各 CLI）只报可选；只给修复命令，不隐式安装。配方参数不加引号拼进命令行，含 shell 元字符的自由文本直接调用脚本。
 

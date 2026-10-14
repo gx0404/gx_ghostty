@@ -1,12 +1,18 @@
 id = "W07"
-title = "A command that fails right away shows the failure dialog, which stays until OK"
+title = "A command that fails right away shows a non-modal notice; any key closes only that terminal"
+# App.showChildExited (D12): an abnormal exit posts a persistent Notice at the
+# bottom of the window. It never takes focus or disables the window; the core
+# closes the exited terminal on any key that encodes input.
+# initial-command fails only the first terminal; later splits run `command`.
 config = """
-command = cmd.exe /c exit 3
+initial-command = cmd.exe /c exit 3
+command = cmd.exe /d /k prompt GX_W07$G$S
 language = en
 """
 expect = [
-  "dialog: a themed dialog says the command failed with exit code 3, over the Ghostty window",
-  "after-ok: the dialog is gone and the window answers and draws (the exited terminal stays)",
+  "notice: a non-modal Command Failed notice at the bottom of the terminal area says the shell exited with code 3 and any key closes the terminal; the window chrome is active and not dimmed behind a modal dialog",
+  "split-with-notice: while the notice stayed up the window itself took Ctrl+Shift+O: the failed terminal is on the left, a new GX_W07> prompt on the right, the notice is still shown",
+  "after-close: one key in the failed terminal closed only it; the GX_W07> terminal fills the window, the window answers, and no Command Failed notice remains",
 ]
 
 [[step]]
@@ -14,6 +20,7 @@ action = "wait_popup"
 cls = "GhosttyGxPopup"
 timeout = 10
 
+# A persistent notice: no timeout hides it.
 [[step]]
 action = "sleep"
 seconds = 1.5
@@ -24,23 +31,59 @@ cls = "GhosttyGxPopup"
 timeout = 1
 
 [[step]]
+action = "assert_responsive"
+
+[[step]]
 action = "capture"
-name = "dialog"
+name = "notice"
 what = "all"
 
-# The modal dialog disables the main window; activating the window activates the dialog,
-# as a click on the window would.
-[[step]]
-action = "activate"
-
+# Non-modal: the main window keeps keyboard focus while the notice shows. A
+# modal dialog would disable it and own the key. A binding is handled before
+# the exited terminal's close-on-key path, so this must not close anything.
 [[step]]
 action = "key"
-keys = "enter"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
 
 [[step]]
 action = "wait_popup"
 cls = "GhosttyGxPopup"
+timeout = 2
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "split-with-notice"
+what = "all"
+
+# Terminals are ordered top to bottom, then left to right: 0 is the failed one.
+# Space avoids starting an IME composition; it still encodes input.
+[[step]]
+action = "click"
+in = "terminal:0"
+y = "30%"
+
+[[step]]
+action = "key"
+keys = "space"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+# The notice belongs to the closed terminal; it must not outlive it.
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
 present = false
+timeout = 3
 
 [[step]]
 action = "assert_responsive"
@@ -51,4 +94,4 @@ seconds = 0.5
 
 [[step]]
 action = "capture"
-name = "after-ok"
+name = "after-close"

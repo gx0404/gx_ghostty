@@ -51,6 +51,8 @@ const std = @import("std");
 const App = @import("../App.zig");
 const Window = @import("../Window.zig");
 const Surface = @import("../Surface.zig");
+const Pane = @import("../Pane.zig");
+const PaneSnapshot = @import("../PaneSnapshot.zig");
 const Menu = @import("../ui/Menu.zig");
 const Popup = @import("../ui/Popup.zig");
 const anim = @import("../ui/anim.zig");
@@ -160,8 +162,10 @@ active_path_key: [4]f32 = .{ 0, 0, 0, 0 },
 const Drag = struct {
     /// The tab (the active one: a press selects it).
     tab: usize,
+    reference: @import("../../../gx/ui_ref.zig").Reference,
     /// Where the press was, and how far right of the tab's left edge.
     press_x: i32,
+    press_y: i32,
     grab: i32,
     /// The pointer moved far enough to drag.
     active: bool = false,
@@ -182,7 +186,7 @@ const RenameTarget = union(enum) {
 
 /// What runs in a terminal, for its tab's label and icon.
 const ProcessName = struct {
-    surface: ?*const Surface = null,
+    pane: PaneSnapshot.Reference = .{},
     len: u8 = 0,
     buf: [48]u8 = undefined,
     /// The terminal runs a WSL distribution.
@@ -203,7 +207,7 @@ const ProcessName = struct {
     }
 
     fn eql(a: *const ProcessName, b: *const ProcessName) bool {
-        return a.surface == b.surface and a.wsl == b.wsl and a.idle == b.idle and a.kind == b.kind and
+        return PaneSnapshot.sameIdentity(a.pane, b.pane) and a.wsl == b.wsl and a.idle == b.idle and a.kind == b.kind and
             std.mem.eql(u8, a.name(), b.name()) and std.mem.eql(u8, a.shell(), b.shell());
     }
 };
@@ -211,42 +215,8 @@ const ProcessName = struct {
 const max_tracked = 256;
 
 const Tracked = struct {
-    const RendererState = @import("../../../renderer/State.zig");
-
-    id: u64,
-    tracker: gx.unread.Tracker = .{},
-    grid: ?[2]usize = null,
-
-    fn capture(self: *Tracked, state: *RendererState) void {
-        self.tracker = .{ .baseline = gx.unread.baseline(state.terminal) };
-        self.grid = .{ state.terminal.cols, state.terminal.rows };
-    }
-
-    fn hide(self: *Tracked, state: *RendererState, io: std.Io) void {
-        state.lockDemand(io);
-        defer state.unlockDemand(io);
-        self.capture(state);
-    }
-
-    fn show(self: *Tracked) void {
-        self.tracker.show();
-        self.grid = null;
-    }
-
-    fn check(self: *Tracked, state: *RendererState, io: std.Io) bool {
-        if (!state.mutex.tryLock()) {
-            self.tracker.busy +|= 1;
-            return self.tracker.busy >= gx.unread.busy_checks;
-        }
-        defer state.mutex.unlock(io);
-        const grid: [2]usize = .{ state.terminal.cols, state.terminal.rows };
-        if (self.grid == null or !std.meta.eql(self.grid.?, grid) or self.tracker.baseline == null) {
-            self.capture(state);
-            return false;
-        }
-        self.tracker.busy = 0;
-        return gx.unread.changed(state.terminal, self.tracker.baseline);
-    }
+    reference: PaneSnapshot.Reference,
+    unread: Pane.UnreadTracker = .{},
 };
 
 /// What the status marks of a tab show.
@@ -330,7 +300,6 @@ const status_gap: f32 = 4;
 const title_font_size: f32 = 12;
 const unread_dot_size: f32 = 6;
 const close_glyph_size: f32 = 10;
-const drag_threshold: f32 = 10;
 const fade_width: f32 = 16;
 const progress_radius: f32 = 6;
 const progress_stroke: f32 = 2;
@@ -1143,7 +1112,20 @@ fn utf16ToUtf8(buf: []u8, units: []const u16) []const u8 {
 pub fn onMouseMove(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     if (self.drag) |*d| {
         const win = self.window();
-        if (!d.active and @abs(x - d.press_x) > tab_layout.px(drag_threshold, lay.scale)) {
+        const gesture = @import("../tab_transfer.zig").gesture(x - d.press_x, y - d.press_y, lay.scale);
+        if (gesture == .detach and !win.is_quick_terminal and d.tab < win.tab_count) {
+            const reference = d.reference;
+            const app = win.app;
+            const owner = win.ui_reference;
+            var point: w32.POINT = .{ .x = x, .y = y };
+            if (win.hwnd) |hwnd| _ = w32.ClientToScreen(hwnd, &point);
+            // Release capture only after clearing drag state; WM_CAPTURECHANGED
+            // must not cancel the already queued detach request.
+            self.cancelDrag();
+            if (app.resolveWindow(owner)) |live| _ = live.queueTabDetach(reference, point);
+            return true;
+        }
+        if (!d.active and gesture == .reorder) {
             d.active = true;
             win.title_bar.setTabTooltipTarget(.none);
             if (win.hwnd) |hwnd| escape_hook.acquire(hwnd);
@@ -1169,6 +1151,18 @@ pub fn onMouseMove(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     if (part == .none) self.unfreeze();
     self.setHover(part);
     return false;
+}
+
+/// Current geometry only: reject buttons, close glyphs and hidden tab strips.
+pub fn transferSlotAt(self: *TabBar, point: w32.POINT) ?usize {
+    if (!self.visible) return null;
+    const g = self.geometry(self.window().title_bar.layout());
+    const index = switch (self.partAt(&g, point.x, point.y)) {
+        .tab => |index| index,
+        else => return null,
+    };
+    const tab_rect = g.tabRect(index);
+    return index + @as(usize, if (point.x >= tab_rect.left + @divTrunc(tab_rect.right - tab_rect.left, 2)) 1 else 0);
 }
 
 fn trackLeave(self: *TabBar) void {
@@ -1217,10 +1211,10 @@ pub fn onMouseLeave(self: *TabBar) void {
 /// potential drag of) a tab, or press a button.
 pub fn onLeftButtonDown(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) void {
     const g = self.geometry(lay);
-    self.press(lay, self.partAt(&g, x, y), x);
+    self.press(lay, self.partAt(&g, x, y), x, y);
 }
 
-fn press(self: *TabBar, lay: TitleBar.Layout, part: Part, x: i32) void {
+fn press(self: *TabBar, lay: TitleBar.Layout, part: Part, x: i32, y: i32) void {
     const win = self.window();
     switch (part) {
         .none => return,
@@ -1234,7 +1228,7 @@ fn press(self: *TabBar, lay: TitleBar.Layout, part: Part, x: i32) void {
             }
             const g = self.geometry(lay);
             if (i >= g.count) return;
-            self.drag = .{ .tab = i, .press_x = x, .grab = x - g.tabRect(i).left, .x = x, .target = i };
+            self.drag = .{ .tab = i, .reference = win.tab_references[i], .press_x = x, .press_y = y, .grab = x - g.tabRect(i).left, .x = x, .target = i };
         },
         .scroll_back, .scroll_forward => {
             self.pressed = part;
@@ -1417,12 +1411,12 @@ pub fn onDoubleClick(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
             log.err("failed to create new tab: {}", .{err});
         },
         .none => return false,
-        .tab_close, .profiles, .tab_list, .scroll_back, .scroll_forward => self.press(lay, part, x),
+        .tab_close, .profiles, .tab_list, .scroll_back, .scroll_forward => self.press(lay, part, x, y),
     }
     return true;
 }
 
-/// A middle-button press, paired by terminal id rather than a movable slot.
+/// A middle-button press, paired by pane generation rather than a movable slot.
 pub fn onMiddleButtonDown(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     const g = self.geometry(lay);
     const target = self.middleTarget(self.partAt(&g, x, y));
@@ -1437,10 +1431,11 @@ fn middleTarget(self: *const TabBar, part: Part) ?u64 {
         else => return null,
     };
     const win = self.windowConst();
-    if (i >= win.tab_count) return null;
-    const surface = win.tab_active_surface[i];
-    if (!surface.core_surface_initialized) return null;
-    return surface.core_surface.id;
+    const pane = win.paneAtTab(i) orelse return null;
+    if (!pane.initialized()) return null;
+    const reference = pane.reference();
+    // Issuer generations never repeat within this window's host lifetime.
+    return if (reference.isValid()) reference.generation else null;
 }
 
 /// A release consumes its press, including one outside a tab. Missing or
@@ -1500,19 +1495,14 @@ pub fn onRightButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool
     var pt = w32.POINT{ .x = x, .y = y };
     _ = w32.ClientToScreen(hwnd, &pt);
 
-    // Tabs and splits can close or move while the menu runs its modal
-    // loop: the pick applies to the tab found again by any of its
-    // terminals.
-    var ids: [64]u64 = undefined;
-    var count: usize = 0;
-    var it = win.tab_trees[clicked_tab].iterator();
-    while (it.next()) |entry| {
-        if (count == ids.len) break;
-        ids[count] = entry.view.core_surface.id;
-        count += 1;
-    }
+    // A modal callback can close or move either object. Retain identities,
+    // never a borrowed tab, window, or terminal pointer across it.
+    const app = win.app;
+    const owner = win.ui_reference;
+    const tab = win.tab_references[clicked_tab];
     const command = Menu.showTabContextMenu(win, pt, clicked_tab) orelse return true;
-    Menu.performTabCommand(win, ids[0..count], command);
+    const live = app.resolveWindow(owner) orelse return true;
+    Menu.performTabCommand(live, tab, command);
     return true;
 }
 
@@ -1654,18 +1644,16 @@ fn checkUnread(self: *TabBar) bool {
     var changed = false;
     for (0..win.tab_count) |i| {
         if (i == win.active_tab or win.tab_unread[i]) continue;
-        var it = win.tab_trees[i].iterator();
-        while (it.next()) |entry| {
-            const surface = entry.view;
-            if (!surface.core_surface_ready) continue;
-            const state = &surface.core_surface.renderer_state;
-            const tracker = self.findTracker(surface.core_surface.id) orelse {
-                if (!state.mutex.tryLock()) continue;
-                defer state.mutex.unlock(io);
-                self.trackerOf(surface.core_surface.id).capture(state);
+        var it = win.paneIterator(i);
+        while (it.next()) |pane| {
+            if (!pane.ready() or !pane.reference().isValid()) continue;
+            const reference = pane.reference();
+            const tracker = self.findTracker(reference) orelse {
+                var baseline: Pane.UnreadTracker = .{};
+                if (pane.captureUnread(&baseline, io)) self.trackerOf(reference).unread = baseline;
                 continue;
             };
-            if (tracker.check(state, io)) {
+            if (pane.checkUnread(&tracker.unread, io)) {
                 win.tab_unread[i] = true;
                 changed = true;
                 break;
@@ -1677,7 +1665,7 @@ fn checkUnread(self: *TabBar) bool {
 
 /// The bell rang in the terminal `surface` (`Window.onBell`): mark its tab
 /// with the bell (`Window.ringTab`) unless it is the active tab.
-pub fn markUnread(self: *TabBar, surface: *Surface) void {
+pub fn markUnread(self: *TabBar, surface: anytype) void {
     self.window().ringTab(surface);
 }
 
@@ -1687,11 +1675,10 @@ pub fn markUnread(self: *TabBar, surface: *Surface) void {
 pub fn onTabHidden(self: *TabBar, tab: usize) void {
     const win = self.window();
     if (tab >= win.tab_count) return;
-    var it = win.tab_trees[tab].iterator();
-    while (it.next()) |entry| {
-        const surface = entry.view;
-        if (!surface.core_surface_ready) continue;
-        self.trackerOf(surface.core_surface.id).hide(&surface.core_surface.renderer_state, global.io());
+    var it = win.paneIterator(tab);
+    while (it.next()) |pane| {
+        if (!pane.ready() or !pane.reference().isValid()) continue;
+        pane.hideUnread(&self.trackerOf(pane.reference()).unread, global.io());
     }
 }
 
@@ -1700,33 +1687,32 @@ pub fn onTabHidden(self: *TabBar, tab: usize) void {
 pub fn onTabShown(self: *TabBar, tab: usize) void {
     const win = self.window();
     if (tab >= win.tab_count) return;
-    var it = win.tab_trees[tab].iterator();
-    while (it.next()) |entry| {
-        const surface = entry.view;
-        if (!surface.core_surface_initialized) continue;
-        if (self.findTracker(surface.core_surface.id)) |tracker| tracker.show();
+    var it = win.paneIterator(tab);
+    while (it.next()) |pane| {
+        if (!pane.initialized()) continue;
+        if (self.findTracker(pane.reference())) |tracker| tracker.unread.show();
     }
     self.reveal_pending = true;
 }
 
-fn findTracker(self: *TabBar, id: u64) ?*Tracked {
+fn findTracker(self: *TabBar, reference: PaneSnapshot.Reference) ?*Tracked {
     for (self.tracked[0..self.tracked_len]) |*entry| {
-        if (entry.id == id) return entry;
+        if (entry.reference.matches(reference)) return entry;
     }
     return null;
 }
 
-/// The tracker of the terminal with core surface id `id`, added when it
+/// The tracker of the pane with value identity `reference`, added when it
 /// has none.
-fn trackerOf(self: *TabBar, id: u64) *Tracked {
-    if (self.findTracker(id)) |tracker| return tracker;
+fn trackerOf(self: *TabBar, reference: PaneSnapshot.Reference) *Tracked {
+    if (self.findTracker(reference)) |tracker| return tracker;
     if (self.tracked_len == max_tracked) self.pruneTrackers();
     if (self.tracked_len == max_tracked) {
         // Full of live terminals: reuse the oldest entry.
         std.mem.copyForwards(Tracked, self.tracked[0 .. max_tracked - 1], self.tracked[1..max_tracked]);
         self.tracked_len -= 1;
     }
-    self.tracked[self.tracked_len] = .{ .id = id };
+    self.tracked[self.tracked_len] = .{ .reference = reference };
     self.tracked_len += 1;
     return &self.tracked[self.tracked_len - 1];
 }
@@ -1736,29 +1722,23 @@ fn pruneTrackers(self: *TabBar) void {
     const win = self.window();
     var kept: usize = 0;
     for (self.tracked[0..self.tracked_len]) |entry| {
-        if (!liveTerminal(win, entry.id)) continue;
+        if (!liveTerminal(win, entry.reference)) continue;
         self.tracked[kept] = entry;
         kept += 1;
     }
     self.tracked_len = kept;
 }
 
-fn liveTerminal(win: *Window, id: u64) bool {
-    for (0..win.tab_count) |i| {
-        var it = win.tab_trees[i].iterator();
-        while (it.next()) |entry| {
-            if (entry.view.core_surface_initialized and entry.view.core_surface.id == id) return true;
-        }
-    }
-    return false;
+fn liveTerminal(win: *Window, reference: PaneSnapshot.Reference) bool {
+    const pane = win.lookupPane(reference) orelse return false;
+    return pane.initialized();
 }
 
 fn processFor(self: *const TabBar, i: usize) ?*const ProcessName {
     const win = self.windowConst();
-    if (i >= win.tab_count) return null;
-    const surface = win.tab_active_surface[i];
+    const pane = win.paneAtTab(i) orelse return null;
     for (&self.processes) |*entry| {
-        if (entry.surface == surface and entry.len > 0) return entry;
+        if (entry.pane.matches(pane.reference()) and entry.len > 0) return entry;
     }
     return null;
 }
@@ -1812,11 +1792,9 @@ fn refreshPrograms(self: *TabBar, table: *gx.proc.Table) bool {
     var pids: [max_tabs]gx.proc.Pid = undefined;
     var pid_count: usize = 0;
     for (0..count) |i| {
-        const surface = win.tab_active_surface[i];
-        next[i].surface = surface;
-        if (!surface.core_surface_ready) continue;
-        const pid64 = surface.core_surface.getProcessInfo(.foreground_pid) orelse continue;
-        const pid = std.math.cast(gx.proc.Pid, pid64) orelse continue;
+        const pane = win.paneAtTab(i) orelse continue;
+        next[i].pane = pane.reference();
+        const pid = pane.foregroundPid() orelse continue;
         roots[i] = pid;
         pids[pid_count] = pid;
         pid_count += 1;
@@ -2045,7 +2023,14 @@ fn renamePlaceholder(self: *TabBar, buf: []u8) []const u8 {
     const win = self.window();
     return switch (self.rename_target) {
         .none => "",
-        .tab => |i| if (i < win.tab_count) win.tab_active_surface[i].getTitle() orelse utf16ToUtf8(buf, tabs.default_title) else "",
+        .tab => |i| title: {
+            const pane = win.paneAtTab(i) orelse break :title "";
+            const snapshot = pane.snapshot();
+            if (snapshot.title.len == 0) break :title utf16ToUtf8(buf, tabs.default_title);
+            const value = tab_layout.utf8Prefix(snapshot.title.slice(), buf.len);
+            @memcpy(buf[0..value.len], value);
+            break :title buf[0..value.len];
+        },
         .window => if (win.active_tab < win.tab_count)
             utf16ToUtf8(buf, win.tab_titles[win.active_tab][0..win.tab_title_lens[win.active_tab]])
         else
@@ -2294,41 +2279,6 @@ test "tooltip and title buffers keep complete utf8 codepoints" {
         try testing.expect(std.unicode.utf8ValidateSlice(utf16ToUtf8(buf[0..limit], units)));
     }
     try testing.expectEqualStrings("\u{6C49}", utf16ToUtf8(buf[0..6], units));
-}
-
-test "hidden tracking ignores reflow but sees subsequent output" {
-    const testing = std.testing;
-    const Terminal = @import("../../../terminal/main.zig").Terminal;
-    var terminal: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
-    defer terminal.deinit(testing.allocator);
-    var mutex: std.Io.Mutex = .init;
-    var state: Tracked.RendererState = .{ .mutex = &mutex, .terminal = &terminal };
-    var tracked: Tracked = .{ .id = 1 };
-    try terminal.printString("$ ");
-    tracked.hide(&state, testing.io);
-    try testing.expect(!tracked.check(&state, testing.io));
-    try terminal.resize(testing.allocator, .{ .cols = 40, .rows = 7 });
-    try testing.expect(!tracked.check(&state, testing.io));
-    try terminal.printString("new output\n");
-    try testing.expect(tracked.check(&state, testing.io));
-    tracked.show();
-    try testing.expect(!tracked.check(&state, testing.io));
-}
-
-test "hidden tracking never waits for a busy terminal" {
-    const testing = std.testing;
-    const Terminal = @import("../../../terminal/main.zig").Terminal;
-    var terminal: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
-    defer terminal.deinit(testing.allocator);
-    var mutex: std.Io.Mutex = .init;
-    var state: Tracked.RendererState = .{ .mutex = &mutex, .terminal = &terminal };
-    var tracked: Tracked = .{ .id = 1 };
-    tracked.hide(&state, testing.io);
-    try testing.expect(mutex.tryLock());
-    for (1..gx.unread.busy_checks) |_| try testing.expect(!tracked.check(&state, testing.io));
-    try testing.expect(tracked.check(&state, testing.io));
-    mutex.unlock(testing.io);
-    try testing.expect(!tracked.check(&state, testing.io));
 }
 
 test "caption colors are consumed without tinting a bare material" {

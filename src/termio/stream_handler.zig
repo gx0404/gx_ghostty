@@ -1499,6 +1499,16 @@ pub const StreamHandler = struct {
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+        // fork(gx): GX-0041 begin: optional guest-domain session capture.
+        // The read thread holds renderer_state.mutex here. The runtime hook
+        // may only copy bounded metadata under its independent guest-cwd lock.
+        // Deferred capture also invalidates stale guest state on parse errors;
+        // raw url remains borrowed until this handler returns.
+        var gx_host_is_local = url.len == 0;
+        defer if (comptime @hasDecl(apprt.Surface, "gxCaptureGuestPwd")) {
+            self.surface_mailbox.surface.rt_surface.gxCaptureGuestPwd(url, gx_host_is_local);
+        };
+        // fork(gx): GX-0041 end
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable
@@ -1558,6 +1568,8 @@ pub const StreamHandler = struct {
                 return;
             },
         };
+        // fork(gx): GX-0041 preserve the existing local-host decision verbatim.
+        gx_host_is_local = host_valid;
         if (!host_valid) {
             log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
             return;

@@ -33,6 +33,8 @@ const i18n = @import("../../../gx/i18n.zig");
 const ui_color = @import("../../../gx/ui_color.zig");
 const ui_tokens = @import("../../../gx/ui_tokens.zig");
 const Surface = @import("../Surface.zig");
+const Pane = @import("../Pane.zig");
+const RemotePane = @import("../RemotePane.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
 const tooltips = @import("Tooltip.zig");
@@ -69,6 +71,7 @@ const Tip = enum { none, previous, next, close };
 const ButtonTooltip = tooltips.Tooltip(Tip);
 
 popup: Popup = .{},
+remote: ?*RemotePane = null,
 
 /// The tooltips of the buttons (timer `Tooltip.timer_id` on the bar).
 tooltip: ButtonTooltip = .{},
@@ -87,6 +90,23 @@ pressed: ?Button = null,
 
 fn surface(self: *SearchBar) *Surface {
     return @alignCast(@fieldParentPtr("search_bar", self));
+}
+
+pub fn bindRemote(self: *SearchBar, remote: *RemotePane) void {
+    self.remote = remote;
+}
+fn paneView(self: *SearchBar) Pane {
+    return if (self.remote) |remote| Pane.fromRemote(remote) else Pane.fromLocal(self.surface());
+}
+fn perform(self: *SearchBar, action: input.Binding.Action) !bool {
+    const pane = self.paneView();
+    return switch (pane.backend) {
+        .local => |local| try local.core_surface.performBindingAction(action),
+        .remote => |remote| blk: {
+            try remote.ui.sendAction(remote, action, null);
+            break :blk false;
+        },
+    };
 }
 
 /// Destroy the popup and its tooltip.
@@ -118,7 +138,7 @@ pub fn setSelected(self: *SearchBar, selected: ?usize) void {
 }
 
 fn tokens(self: *SearchBar) style.Tokens {
-    return style.Tokens.fromConfig(&self.surface().app.config);
+    return style.Tokens.fromConfig(&self.paneView().app().config);
 }
 
 /// Show (pre-filled with `needle` when it is not empty) or close the find
@@ -126,14 +146,14 @@ fn tokens(self: *SearchBar) style.Tokens {
 /// searched again. Closing it ends the search in the core, which clears
 /// the highlighted matches and then hides the bar (`onSearchEnded`).
 pub fn setActive(self: *SearchBar, active: bool, needle: [:0]const u8) void {
-    const s = self.surface();
+    const pane = self.paneView();
     if (!active) {
         self.endSearch();
         return;
     }
 
     // Close the command palette if open (mutual exclusion).
-    if (s.palette.active) s.palette.setActive(false);
+    if (pane.ownerWindow().palette.active) pane.ownerWindow().palette.setActive(false);
     if (!self.ensure()) return;
     const was_active = self.active;
     self.active = true;
@@ -163,8 +183,8 @@ pub fn setActive(self: *SearchBar, active: bool, needle: [:0]const u8) void {
 /// or light frame, the border). Without Direct2D the user, who asked for
 /// the bar, hears why it does not open (`reportUnavailable`).
 fn ensure(self: *SearchBar) bool {
-    const s = self.surface();
-    const owner = s.parent_window.hwnd orelse return false;
+    const pane = self.paneView();
+    const owner = pane.ownerWindow().hwnd orelse return false;
     const t = self.tokens();
     if (self.popup.hwnd != null and self.popup.owner == owner) {
         const border: ?d2d.Color = t.border;
@@ -173,7 +193,7 @@ fn ensure(self: *SearchBar) bool {
         }
         return true;
     }
-    const factory = s.app.uiFactory() orelse {
+    const factory = pane.app().uiFactory() orelse {
         self.reportUnavailable();
         return false;
     };
@@ -190,7 +210,7 @@ fn ensure(self: *SearchBar) bool {
         self.popup.destroy();
     }
 
-    self.popup.create(s.app.hinstance, owner, factory, .{
+    self.popup.create(pane.app().hinstance, owner, factory, .{
         .activate = true,
         .dismiss_on_escape = false,
         .dismiss_on_outside_click = false,
@@ -225,7 +245,7 @@ fn ensure(self: *SearchBar) bool {
 /// a modal loop.
 fn reportUnavailable(self: *SearchBar) void {
     log.warn("the find bar cannot open without Direct2D", .{});
-    const owner = self.surface().parent_window.hwnd orelse return;
+    const owner = self.paneView().ownerWindow().hwnd orelse return;
     _ = w32.SetTimer(owner, UNAVAILABLE_TIMER_ID, 0, @ptrCast(&unavailableTimer));
 }
 
@@ -257,15 +277,18 @@ fn barWidth(surface_width: f32) f32 {
 /// bar takes the content scale of the window first, like the terminal
 /// text (`Popup.setOwnerScale`).
 fn screenRect(self: *SearchBar) ?w32.RECT {
-    const s = self.surface();
-    const hwnd = s.hwnd orelse return null;
-    self.popup.setOwnerScale(s.parent_window.scale);
+    const pane = self.paneView();
+    const hwnd = pane.nativeHandle() orelse return null;
+    self.popup.setOwnerScale(pane.ownerWindow().scale);
     const scale = self.popup.ownerScale();
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0) return null;
     // Keep clear of an always-visible scrollbar, which sits inside the
     // surface's right edge (`width` leaves it out).
-    const right: i32 = @intCast(s.width);
+    const right: i32 = switch (pane.backend) {
+        .local => |local| @intCast(local.width),
+        .remote => |remote| @intCast(remote.width),
+    };
     const w = style.px(barWidth(style.dip(right, scale)), scale);
     const h = style.px(bar_height, scale);
     const m = style.px(margin, scale);
@@ -327,33 +350,33 @@ fn resetPointer(self: *SearchBar) void {
 
 /// Run the search for the current text.
 fn search(self: *SearchBar) void {
-    const s = self.surface();
-    if (!s.core_surface_ready) return;
+    const pane = self.paneView();
+    if (!pane.ready()) return;
     const alloc = self.popup.alloc;
     const text = self.popup.input.text(alloc) catch return;
     defer alloc.free(text);
     const needle = alloc.dupeZ(u8, text) catch return;
     defer alloc.free(needle);
-    _ = s.core_surface.performBindingAction(.{ .search = needle }) catch |err| {
+    _ = self.perform(.{ .search = needle }) catch |err| {
         log.err("search error: {}", .{err});
     };
 }
 
 fn navigate(self: *SearchBar, direction: input.Binding.Action.NavigateSearch) void {
-    const s = self.surface();
-    if (!s.core_surface_ready) return;
-    _ = s.core_surface.performBindingAction(.{ .navigate_search = direction }) catch |err| {
+    const pane = self.paneView();
+    if (!pane.ready()) return;
+    _ = self.perform(.{ .navigate_search = direction }) catch |err| {
         log.err("navigate_search error: {}", .{err});
     };
 }
 
 fn endSearch(self: *SearchBar) void {
-    const s = self.surface();
-    if (!s.core_surface_ready) {
+    const pane = self.paneView();
+    if (!pane.ready()) {
         self.onSearchEnded();
         return;
     }
-    _ = s.core_surface.performBindingAction(.end_search) catch |err| {
+    _ = self.perform(.end_search) catch |err| {
         log.err("end_search error: {}", .{err});
     };
 }
@@ -361,7 +384,7 @@ fn endSearch(self: *SearchBar) void {
 /// The search ended (the `end_search` apprt action): hide the bar and
 /// give the focus back to the terminal, unless it went elsewhere.
 pub fn onSearchEnded(self: *SearchBar) void {
-    const s = self.surface();
+    const pane = self.paneView();
     const had_focus = self.popup.hwnd != null and w32.GetFocus() == self.popup.hwnd;
     self.active = false;
     self.total = null;
@@ -369,7 +392,7 @@ pub fn onSearchEnded(self: *SearchBar) void {
     self.resetPointer();
     self.popup.hide();
     if (had_focus or w32.GetFocus() == null) {
-        if (s.hwnd) |hwnd| _ = w32.SetFocus(hwnd);
+        if (pane.nativeHandle()) |hwnd| _ = w32.SetFocus(hwnd);
     }
 }
 
@@ -534,7 +557,7 @@ fn showTooltip(self: *SearchBar) void {
     _ = w32.ClientToScreen(hwnd, &top_left);
     _ = w32.ClientToScreen(hwnd, &bottom_right);
     var buf: [128]u8 = undefined;
-    self.tooltip.show(self.surface().app, hwnd, s, tooltipText(&buf, which), .{
+    self.tooltip.show(self.paneView().app(), hwnd, s, tooltipText(&buf, which), .{
         .left = top_left.x,
         .top = top_left.y,
         .right = bottom_right.x,

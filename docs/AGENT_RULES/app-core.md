@@ -38,6 +38,7 @@
 - app 线程处理 surface 消息前用 `hasSurface` 确认目标仍在；`deleteSurface` 主动清空 `focused_surface`，因为分配器会复用地址，单靠 `hasSurface` 会误判（源码注释记录过这个缺陷）。`focusedSurface` 只在主线程、`tick` 之前有效。
 - `DerivedConfig` 把所需配置复制进自己的 arena，surface 不持有 `Config` 指针。`Surface.updateConfig` 重新派生，向 renderer 发 `renderer.Message.initChangeConfig` 的结果、向 termio 发堆上的 `Termio.DerivedConfig`，并结束按键序列、停用全部 key table（它们持有旧配置里的指针）。`apprt.surface.Message.change_config` 的指针收到后即失效，必须当场派生。
 - 写往 pty 的数据统一经 `Surface.queueIo`：只读模式（`readonly`）在这里丢弃并释放 `write_*` 消息。
+- 按键绑定的可选远程续延（GX-0044）：`Surface.gx_binding_route` 默认 `null`，只有 win32 的 `RemoteSource` 在源终端被远程窗格承载时安装。键表与序列在源端解析后才交给它；一次性键表按激活代次只弹出原来那次，`updateConfig` 通知它作废挂起的续延，复制后清选区与 kitty 剪贴板写回执都等目标实际完成。未安装时全部回到上游路径；形状由 `scripts/test_fork_patches.py::Gx0044ShapeTests` 锁定。
 - 关闭确认统一经 `Surface.needsConfirmQuit`（各 apprt 都调用它）：只读模式恒确认、子进程已退出不确认，其余按 `confirm-close-surface`。fork 补丁 GX-0012 在 `true` 且光标不在提示符时，经 `src/gx/confirm.zig` 列出终端里的进程（Linux 为前台进程组组长及其子孙，Windows 为 shell 及其子孙），全部空闲就不确认；列进程在主线程进行，不持有 `renderer_state.mutex`。
 - `activateInspector`/`deactivateInspector` 在 `renderer_state.mutex` 下挂上或摘下 `renderer_state.inspector`，再通知 renderer 与 termio；inspector 包本身见 `cli-inspector.md`。
 - `App.drainMailbox` 收到 `.quit` 立刻执行并返回，剩余消息留到下一次 tick。
@@ -78,6 +79,7 @@
 
 ## 验证
 
+- 改按键绑定或 GX-0044：`python scripts/run_unittests.py test_fork_patches`，再跑 `just test --filter gx.remote_binding --filter apprt.win32.RemoteSource`。
 - 定向测试：`just test --filter ghostty.h`（Zig 枚举与 `include/ghostty.h` 对账，含 `apprt.Action.Key`、`ipc.Action.Key`、`ipc.Target.Key`）、`just test --filter Envelope`（崩溃信封）、`just test --filter queueIo`、`just test --filter copyUtf8Z`、`just test --filter keyToMouseShape`。Windows 上 `just test` 编译 win32 运行时的 `ghostty-test`（`testing.md`），POSIX 分支用 `just wsl test --filter <名>` 或 gx-ci 的 `linux-main`（`-Dapp-runtime=none`）。
 - 编译覆盖：Windows 本机 `just build` 与 `just test` 覆盖 Windows 分支与 win32 apprt；POSIX 分支由 `linux-main` 与 WSL 覆盖，GTK 由 `just wsl build --gtk` 与手动触发的 `gtk-smoke` 构建；Darwin 分支只在 Mac 上编译。Windows 的 `-Dapp-runtime=none`（libghostty-internal）目前链接失败（`build-system.md`「平台」）。
 - 改 apprt 动作、Surface 生命周期或主循环交互：两个 apprt 都要有 GUI 证据，win32 按 `apprt-win32.md` 在本机截图，GTK 用 `just wsl smoke` 或 `gtk-smoke` 截图（`apprt-gtk.md`）；macOS 侧只能在 Mac 上验证（gx-ci 的 `macos` job 只跑 `zig build test-lib-vt`），记 PENDING。

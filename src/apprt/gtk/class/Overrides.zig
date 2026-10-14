@@ -16,6 +16,11 @@ shell_integration: ?configpkg.Config.ShellIntegration,
 working_directory: ?[:0]const u8,
 title: ?[:0]const u8,
 
+// fork(gx): GX-0039 begin: internal typed metadata, never parsed from external argv.
+/// Borrowed until Surface.new clones it synchronously. Do not retain across tasks.
+launch_origin: ?@import("../../../gx/profiles.zig").LaunchOrigin = null,
+// fork(gx): GX-0039 end
+
 pub const none: Overrides = .{
     .command = null,
     .shell_integration = null,

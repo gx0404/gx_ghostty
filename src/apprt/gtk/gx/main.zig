@@ -32,4 +32,12 @@ test {
     _ = @import("progress.zig");
     _ = @import("font_zoom.zig");
     _ = @import("environment.zig");
+    _ = @import("origin.zig");
+    _ = @import("runtime.zig");
+    _ = @import("tree_lifecycle.zig");
+    _ = @import("split_transfer.zig");
+    _ = @import("window_state.zig");
+    _ = @import("session.zig");
+    _ = @import("launch_profiles_dialog.zig");
+    _ = @import("shortcut_editor.zig");
 }

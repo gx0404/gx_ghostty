@@ -1161,3 +1161,305 @@ msgstr "缺少汉字字形。请安装 fonts-noto-cjk 以显示中文界面。In
 
 msgid "Graphics: {backend}"
 msgstr "图形：{backend}"
+
+msgid "Restore custom launch profile?"
+msgstr "恢复自定义启动配置？"
+
+msgid "This profile runs its current configured command. Restore it for this session?"
+msgstr "此启动配置会执行当前配置的命令。要在本次会话中恢复吗？"
+
+msgid "Skip"
+msgstr "跳过"
+
+msgid "Some terminals were not restored because their launch profile was unavailable or not approved."
+msgstr "部分终端的启动配置不可用或未获确认，因此未恢复。"
+
+msgid "Temporary and unknown launch commands are not restored."
+msgstr "临时命令和来源未知的启动命令不会恢复。"
+
+msgid "The previous session could not be restored."
+msgstr "无法恢复上次会话。"
+
+msgid "The session could not be saved."
+msgstr "无法保存会话。"
+
+msgid "The session is already in use by another instance."
+msgstr "会话文件正在被另一个实例使用。"
+
+msgid "The saved session format is not supported."
+msgstr "不支持已保存的会话格式。"
+
+msgid "The saved session is damaged and was left unchanged."
+msgstr "已保存的会话已损坏，原文件保持不变。"
+
+msgid "Drop to paste"
+msgstr "拖放以粘贴"
+
+msgid "Cannot drop here"
+msgstr "无法拖放到此处"
+
+msgid "The dropped content could not be pasted safely."
+msgstr "无法安全粘贴拖放的内容。"
+
+msgid "Profile Name"
+msgstr "启动配置名称"
+
+msgid "Profile Command"
+msgstr "启动命令"
+
+msgid "New Profile"
+msgstr "新建启动配置"
+
+msgid "Use as Default"
+msgstr "设为默认"
+
+msgid "Reset Default Shell"
+msgstr "恢复默认 Shell"
+
+msgid "This profile is read-only because it comes from another configuration source."
+msgstr "此启动配置来自其他配置来源，只能读取。"
+
+msgid "Renaming changes the profile ID. Existing keybindings and saved sessions keep the old ID."
+msgstr "重命名会改变启动配置 ID。已有快捷键绑定和已保存会话仍保留旧 ID。"
+
+msgid "Changing or deleting a profile does not rewrite the default command."
+msgstr "修改或删除启动配置不会改写默认命令。"
+
+msgid "The profile changed outside this dialog. Reload it before saving."
+msgstr "启动配置已被外部修改。请重新加载后再保存。"
+
+msgid "A profile with this name already exists."
+msgstr "已存在同名启动配置。"
+
+msgid "Profile names and commands must not contain newlines or NUL characters."
+msgstr "启动配置名称和命令不能包含换行或 NUL 字符。"
+
+msgid "Launch profiles saved."
+msgstr "启动配置已保存。"
+
+msgid "Unable to save launch profiles. Your draft is still available."
+msgstr "无法保存启动配置。草稿仍然保留。"
+
+msgid "Reload Profiles"
+msgstr "重新加载启动配置"
+
+msgid "Edit Keyboard Shortcuts"
+msgstr "编辑快捷键"
+
+msgid "Shortcut Source"
+msgstr "快捷键来源"
+
+msgid "Advanced Binding"
+msgstr "高级绑定"
+
+msgid "Enter one keybind value per line. Tables, flags, sequences, and chain actions use the configuration syntax."
+msgstr "每行输入一个 keybind 值。键表、标志、按键序列和动作链使用配置文件语法。"
+
+msgid "New Binding"
+msgstr "新建绑定"
+
+msgid "Record Shortcut"
+msgstr "录制快捷键"
+
+msgid "Press the shortcut now. Escape cancels recording."
+msgstr "请按下快捷键。按 Escape 取消录制。"
+
+msgid "Shortcut Conflict"
+msgstr "快捷键冲突"
+
+msgid "This shortcut replaces an existing binding or overlaps a leader sequence. Save it anyway?"
+msgstr "此快捷键将替换已有绑定，或与前导键序列重叠。仍要保存吗？"
+
+msgid "Save Anyway"
+msgstr "仍然保存"
+
+msgid "Reset Selected Override"
+msgstr "恢复所选覆盖项"
+
+msgid "The shortcut changed outside this dialog. Reload it before saving."
+msgstr "快捷键已被外部修改。请重新加载后再保存。"
+
+msgid "This shortcut is controlled by the command line and cannot be edited here."
+msgstr "此快捷键由命令行控制，无法在此处编辑。"
+
+msgid "Invalid keybinding syntax. The draft was not saved."
+msgstr "快捷键语法无效，草稿未保存。"
+
+msgid "Keyboard shortcuts saved."
+msgstr "快捷键已保存。"
+
+msgid "Unable to save keyboard shortcuts. Your draft is still available."
+msgstr "无法保存快捷键。草稿仍然保留。"
+
+msgid "Reload Shortcuts"
+msgstr "重新加载快捷键"
+
+msgid "Defaults"
+msgstr "默认值"
+
+msgid "User Configuration"
+msgstr "用户配置"
+
+msgid "Command Line"
+msgstr "命令行"
+
+msgid "Saved Override"
+msgstr "已保存的覆盖项"
+
+msgid "Reset removes only this editor's override and restores the lower configuration."
+msgstr "恢复操作只删除此编辑器的覆盖项，并恢复下层配置。"
+
+msgid "A saved working directory is unavailable. The previous session was left unchanged."
+msgstr "保存的工作目录不可用，原会话文件保持不变。"
+
+msgid "Save"
+msgstr "保存"
+
+msgid "Delete"
+msgstr "删除"
+
+msgid "Some working directories were unavailable and could not be restored."
+msgstr "部分工作目录不可用，未能恢复。"
+
+msgid "The notification target is no longer available."
+msgstr "这条通知对应的终端已不可用。"
+
+msgid "Remote terminal"
+msgstr "远程终端"
+
+msgid "The remote terminal is unavailable."
+msgstr "远程终端不可用。"
+
+msgid "Remote terminal rendering is unavailable."
+msgstr "远程终端画面不可用。"
+
+msgid "Waiting for remote terminal..."
+msgstr "正在等待远程终端……"
+
+msgid "Remote input is temporarily busy."
+msgstr "远程输入暂时繁忙。"
+
+msgid "Paste into elevated terminal?"
+msgstr "粘贴到管理员终端？"
+
+msgid "A lower-privilege window wants to paste this content into an elevated terminal. Review it before allowing the paste."
+msgstr "一个普通权限窗口希望将以下内容粘贴到管理员终端。请检查内容后再允许粘贴。"
+
+msgid "Source process: {pid}"
+msgstr "来源进程：{pid}"
+
+msgid "Dropped files: {count}"
+msgstr "拖入文件：{count}"
+
+msgid "Allow Paste"
+msgstr "允许粘贴"
+
+msgid "Drop into elevated terminal"
+msgstr "拖放到管理员终端"
+
+msgid "Drop text or files here. The elevated terminal will ask for confirmation."
+msgstr "将文本或文件拖放到此处，管理员终端将请求确认。"
+
+msgid "Waiting for confirmation and paste in the elevated terminal..."
+msgstr "正在等待管理员终端确认并完成粘贴……"
+
+msgid "Pasted into the elevated terminal. No Enter key was sent."
+msgstr "已粘贴到管理员终端，未发送回车。"
+
+msgid "The paste was cancelled."
+msgstr "已取消粘贴。"
+
+msgid "The dropped content was rejected."
+msgstr "拖入的内容已被拒绝。"
+
+msgid "The selected elevated terminal is no longer available."
+msgstr "所选管理员终端已不可用。"
+
+msgid "The drop request expired. Drop again only if you still want to paste."
+msgstr "拖放请求已过期。如仍需粘贴，请重新拖放。"
+
+msgid "The drop could not be completed."
+msgstr "无法完成拖放。"
+
+msgid "The paste result is unknown. Check the elevated terminal before dropping again."
+msgstr "粘贴结果未知。请先检查管理员终端，再决定是否重新拖放。"
+
+msgid "Elevated terminal process: {pid}"
+msgstr "管理员终端进程：{pid}"
+
+msgid "A tab containing local and remote panes cannot move to another process."
+msgstr "包含本地与远程窗格的标签页不能移到其他进程。"
+
+msgid "Return this remote tab to its original process."
+msgstr "请将此远程标签页移回原进程。"
+
+msgid "The tab could not be transferred. Its terminals are unchanged."
+msgstr "无法迁移此标签页，其终端保持原状。"
+
+msgid "Cannot move tab"
+msgstr "无法移动标签页"
+
+msgid "The remote terminal was closed."
+msgstr "远程终端已关闭。"
+
+#. Windows: the RemotePane terminal inspector (RemotePaneUi.zig).
+
+msgid "Refresh"
+msgstr "刷新"
+
+msgid "Pause IO"
+msgstr "暂停 IO"
+
+msgid "Resume IO"
+msgstr "恢复 IO"
+
+msgid "Snapshot truncated"
+msgstr "快照已截断"
+
+msgid "Clear the recording and export a smaller capture."
+msgstr "清空记录并导出更小的捕获。"
+
+#. Windows UIA names (uia_bridge.zig): popup menus, the command palette
+#. list, and the settings steppers and buttons.
+
+msgid "Menu"
+msgstr "菜单"
+
+msgid "Results"
+msgstr "结果"
+
+msgid "Increase"
+msgstr "增加"
+
+msgid "Decrease"
+msgstr "减少"
+
+msgid "Apply Theme"
+msgstr "应用主题"
+
+msgid "Apply Font"
+msgstr "应用字体"
+
+#. Upstream words "Clear" and "Reset" for the GTK context menu (clear the
+#. screen, reset the terminal). GX needs them for the inspector's
+#. clear-the-recording button and the settings UIA reset names.
+
+msgid "Clear"
+msgstr "清空"
+
+msgid "Reset"
+msgstr "重置"
+
+#. Windows: the elevated-terminal drop receiver (ui/Menu.zig).
+
+msgid "Drop into Elevated Terminal…"
+msgstr "拖入管理员终端…"
+
+msgid "Drop Receiver"
+msgstr "拖放接收器"
+
+msgid "A normal-privilege drop receiver needs an elevated window with User Account Control enabled."
+msgstr "以普通权限运行的拖放接收器需要启用了用户账户控制的管理员窗口。"
+
+msgid "The drop receiver could not be started."
+msgstr "无法启动拖放接收器。"

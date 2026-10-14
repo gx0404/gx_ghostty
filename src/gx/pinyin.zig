@@ -1,6 +1,8 @@
 //! Pinyin initials of Chinese characters, so that the fuzzy matcher
 //! (`fuzzy.zig`) finds Chinese text by the first letters of its readings
-//! (`xjbq` finds 新建标签). A character's initials are the first letters
+//! (`xjbq` finds 新建标签). `readings` also exposes complete modern syllables
+//! for variable-length matching; its immutable table uses v for ü.
+//! A character's initials are the first letters
 //! of its modern readings, all of them for characters with several
 //! (乐 has `l` and `y`).
 //!
@@ -11,6 +13,26 @@
 //! on `std`.
 const std = @import("std");
 const table = @import("pinyin/initials.zig");
+const syllables = @import("pinyin/syllables.zig");
+
+pub const Readings = struct {
+    ids: []const u16,
+    index: usize = 0,
+
+    pub fn next(self: *Readings) ?[]const u8 {
+        if (self.index == self.ids.len) return null;
+        defer self.index += 1;
+        return syllables.syllables[self.ids[self.index]];
+    }
+};
+
+/// Full modern syllables without tones. The umlaut vowel is v, never u.
+/// The iterator borrows immutable generated data and does not allocate.
+pub fn readings(cp: u21) Readings {
+    if (cp < syllables.first or cp > 0x9FFF) return .{ .ids = &.{} };
+    const offset = cp - syllables.first;
+    return .{ .ids = syllables.reading_ids[syllables.offsets[offset]..syllables.offsets[offset + 1]] };
+}
 
 /// A set of letters: bit `c - 'a'` for letter `c`.
 pub const Initials = u32;
@@ -113,4 +135,20 @@ test "has" {
     try std.testing.expect(!has(set, 'L'));
     try std.testing.expect(!has(set, '新'));
     try std.testing.expect(!has(0, 'a'));
+}
+
+test "full modern readings preserve umlaut and omit archaic alternatives" {
+    var heavy = readings('重');
+    try std.testing.expectEqualStrings("chong", heavy.next().?);
+    try std.testing.expectEqualStrings("zhong", heavy.next().?);
+    try std.testing.expect(heavy.next() == null);
+    var music = readings('乐');
+    try std.testing.expectEqualStrings("le", music.next().?);
+    try std.testing.expectEqualStrings("yue", music.next().?);
+    var green = readings('绿');
+    var umlaut = false;
+    while (green.next()) |reading| if (std.mem.eql(u8, reading, "lv")) {
+        umlaut = true;
+    };
+    try std.testing.expect(umlaut);
 }

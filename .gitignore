@@ -35,6 +35,8 @@ vgcore.*
 
 # --- GX fork：AI 协作开发框架（fork 维护段；上游没有）---
 /.local/
+/zig-out-*/
+/zig-out-*/
 /Python/
 /graphify-out/*
 !/graphify-out/GRAPH_REPORT.md

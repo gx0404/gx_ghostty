@@ -33,9 +33,12 @@ const profiles = gx.profiles;
 const w32 = @import("../win32.zig");
 const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
+const Pane = @import("../Pane.zig");
+const ui_ref = @import("../../../gx/ui_ref.zig");
 const Window = @import("../Window.zig");
 const Dialogs = @import("Dialogs.zig");
 const MenuPopup = @import("MenuPopup.zig");
+const drop_companion_launch = @import("../drop_companion_launch.zig");
 const Settings = @import("Settings.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
@@ -95,6 +98,7 @@ fn menuHost(app: *App) ?MenuPopup.Host {
         .factory = factory,
         .tokens = style.Tokens.fromConfig(&app.config),
         .quit_requested = &app.quit_requested,
+        .app = app,
     };
 }
 
@@ -153,28 +157,30 @@ const SurfaceItem = enum(usize) {
 /// action to perform on the surface. Opening the working directory needs
 /// no terminal, so the menu does it itself.
 pub fn showSurfaceContextMenu(surface: *Surface, screen_pt: w32.POINT) ?input.Binding.Action {
-    return surfaceMenu(surface, .{ .anchor = MenuPopup.Options.at(screen_pt) });
+    return showPaneContextMenu(Pane.fromLocal(surface), screen_pt);
 }
-
-fn surfaceMenu(surface: *Surface, placement: MenuPopup.Options) ?input.Binding.Action {
-    const owner = surface.hwnd orelse return null;
-    if (!surface.core_surface_ready) return null;
-    const app = surface.app;
-    const window = surface.parent_window;
+pub fn showPaneContextMenu(pane: Pane, screen_pt: w32.POINT) ?input.Binding.Action {
+    return paneMenu(pane, .{ .anchor = MenuPopup.Options.at(screen_pt) });
+}
+fn paneMenu(pane: Pane, placement: MenuPopup.Options) ?input.Binding.Action {
+    const owner = pane.nativeHandle() orelse return null;
+    if (!pane.ready()) return null;
+    const app = pane.app();
+    const window = pane.ownerWindow();
+    const window_ref = window.ui_reference;
     const alloc = app.core_app.alloc;
 
     var menu: MenuPopup.Builder = .init(alloc);
     defer menu.deinit();
     // In the menu's arena the directory outlives the terminal.
-    const pwd = workingDirectory(surface, menu.arena.allocator());
-    const tab = window.findTabIndex(surface);
-    const split = if (tab) |i| window.tab_trees[i].isSplit() else false;
+    const pwd = workingDirectory(pane, menu.arena.allocator());
+    const tab = pane.tabInfo();
     buildSurfaceMenu(&menu, &app.config, hintsOf(app), .{
-        .selection = surface.core_surface.hasSelection(),
+        .selection = pane.hasSelection(),
         .clipboard_text = w32.IsClipboardFormatAvailable(w32.CF_UNICODETEXT) != 0,
-        .split = split,
-        .zoomed = if (tab) |i| window.tab_trees[i].zoomed != null else false,
-        .other_tabs = window.tab_count > 1,
+        .split = tab.split,
+        .zoomed = tab.zoomed,
+        .other_tabs = tab.other_tabs,
         .pwd = pwd != null,
     }) catch |err| {
         log.err("failed to build the terminal menu err={}", .{err});
@@ -201,7 +207,7 @@ fn surfaceMenu(surface: *Surface, placement: MenuPopup.Options) ?input.Binding.A
         .clear_screen => .clear_screen,
         .reset => .reset,
         .open_pwd => {
-            if (pwd) |path| openFolder(alloc, owner, path);
+            if (pwd) |path| if (app.resolveWindow(window_ref)) |live| if (live.hwnd) |hwnd| openFolder(alloc, hwnd, path);
             return null;
         },
         .settings => .{ .gx = .settings },
@@ -345,8 +351,8 @@ fn settingsShortcut(config: *const configpkg.Config, hints: trigger.Hints, buf: 
 
 /// The terminal's working directory as reported by its shell (OSC 7),
 /// when it is an absolute local path; allocated with `alloc`.
-fn workingDirectory(surface: *Surface, alloc: Allocator) ?[]const u8 {
-    const path = (surface.core_surface.pwd(alloc) catch return null) orelse return null;
+fn workingDirectory(pane: Pane, alloc: Allocator) ?[]const u8 {
+    const path = (pane.workingDirectory(alloc) catch return null) orelse return null;
     if (!std.fs.path.isAbsolute(path)) return null;
     return path;
 }
@@ -406,25 +412,27 @@ fn addSplitMenu(
 /// below the terminal cursor, with the first item highlighted. Performs
 /// the picked action on the surface.
 pub fn showSurfaceContextMenuAtCursor(surface: *Surface) void {
-    const hwnd = surface.hwnd orelse return;
-    if (!surface.core_surface_ready) return;
-    const app = surface.app;
-    const id = surface.core_surface.id;
+    showPaneContextMenuAtCursor(Pane.fromLocal(surface));
+}
+pub fn showPaneContextMenuAtCursor(pane: Pane) void {
+    const hwnd = pane.nativeHandle() orelse return;
+    const anchor = pane.cursorAnchor() orelse return;
+    const app = pane.app();
+    const reference = pane.reference();
     const cell = cursorCell(
-        surface.core_surface.imePoint(),
-        surface.scale,
-        surface.core_surface.size.cell.width,
-        surface.core_surface.size.cell.height,
-        surface.width,
-        surface.height,
+        .{ .x = anchor.x, .y = anchor.y, .width = anchor.width, .height = anchor.height },
+        anchor.scale,
+        anchor.cell_width,
+        anchor.cell_height,
+        anchor.pane_width,
+        anchor.pane_height,
     );
-    const binding = surfaceMenu(surface, .{
+    const binding = paneMenu(pane, .{
         .anchor = screenRect(hwnd, cell),
         .keyboard = true,
     }) orelse return;
-    const live = findSurface(app, id) orelse return;
-    if (!live.core_surface_ready) return;
-    _ = live.core_surface.performBindingAction(binding) catch |err| {
+    const live = Pane.resolve(app, reference) orelse return;
+    _ = live.performBindingAction(binding) catch |err| {
         log.err("context menu action failed err={}", .{err});
     };
 }
@@ -549,12 +557,9 @@ fn buildTabMenu(
     });
 }
 
-/// Perform a pick of the tab context menu for the tab holding the terminals
-/// with core surface ids `tab` (null: the empty part of the tab bar). The
-/// menu ran a modal loop, so the tab is found again by any of those ids
-/// (its focused split can close meanwhile); nothing happens when all of
-/// them closed.
-pub fn performTabCommand(window: *Window, tab: ?[]const u64, command: TabCommand) void {
+/// The caller resolves the window after its modal menu; the tab is resolved
+/// again from its complete stable identity, including epoch and generation.
+pub fn performTabCommand(window: *Window, tab: ?gx.ui_ref.Reference, command: TabCommand) void {
     if (command == .new_tab) {
         _ = window.addTab() catch |err| {
             log.err("failed to create new tab: {}", .{err});
@@ -562,17 +567,18 @@ pub fn performTabCommand(window: *Window, tab: ?[]const u64, command: TabCommand
         };
         return;
     }
-    const index = for (tab orelse return) |id| {
-        if (window.findTabBySurfaceId(id)) |i| break i;
-    } else return;
+    const index = window.resolveTab(tab orelse return) orelse return;
     switch (command) {
         .rename => window.tab_bar.startRename(index),
         .close => window.closeTabByIndex(index),
         .close_others => window.closeOtherTabs(index),
         .close_right => window.closeTabsRightOf(index),
-        .move_to_new_window => _ = window.moveTabToNewWindow(window.tab_active_surface[index]) catch |err| failed: {
-            log.err("failed to move the tab to a new window err={}", .{err});
-            break :failed false;
+        .move_to_new_window => {
+            const pane = window.paneAtTab(index) orelse return;
+            _ = pane.moveTabToNewWindow() catch |err| failed: {
+                log.err("failed to move the tab to a new window err={}", .{err});
+                break :failed false;
+            };
         },
         .duplicate => window.duplicateTab(index),
         .new_tab => unreachable,
@@ -595,10 +601,11 @@ pub fn showTabList(window: *Window, anchor: w32.RECT) void {
     defer menu.deinit();
     // Tabs can close or move while the menu runs: the pick selects the tab
     // found again by the terminal that was focused in it.
-    var ids: [Window.MAX_TABS]u64 = undefined;
+    var identities: [Window.MAX_TABS]ui_ref.Reference = undefined;
+    const window_ref = window.ui_reference;
     const count = window.tab_count;
     for (0..count) |i| {
-        ids[i] = window.tab_active_surface[i].core_surface.id;
+        identities[i] = window.tab_references[i];
         var title_buf: [768]u8 = undefined;
         const label = window.tab_bar.labelText(i, &title_buf) orelse continue;
         var shortcut_buf: [64]u8 = undefined;
@@ -617,8 +624,9 @@ pub fn showTabList(window: *Window, anchor: w32.RECT) void {
         .anchor = anchor,
         .owner_scale = window.scale,
     }) orelse return;
-    if (!windowOpen(app, window) or id == 0 or id > count) return;
-    if (window.findTabBySurfaceId(ids[id - 1])) |index| window.selectTabIndex(index);
+    const live = app.resolveWindow(window_ref) orelse return;
+    if (id == 0 or id > count) return;
+    if (live.resolveTab(identities[id - 1])) |index| live.selectTabIndex(index);
 }
 
 const MainItem = enum(usize) {
@@ -635,6 +643,7 @@ const MainItem = enum(usize) {
     open_config_file,
     about,
     quit,
+    drop_receiver,
 };
 
 /// Ids of the Language submenu items: this plus the `i18n.Language` value.
@@ -686,6 +695,7 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     const hwnd = window.hwnd orelse return;
     if (window.closing) return;
     const app = window.app;
+    const attachment = window.ui_attachment;
     const prepare = if (gx.perf.enabled()) gx.perf.Span.begin(global.io()) else null;
     const detections = app.profiles_cache.detections;
 
@@ -703,7 +713,7 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     var options = placement;
     options.owner_scale = window.scale;
     const id = runMenu(app, hwnd, &menu.root, options) orelse return;
-    if (!windowOpen(app, window)) return;
+    if (!windowOpen(app, window, attachment)) return;
 
     if (launch.pick(id)) |pick| {
         _ = app.openProfile(window, pick.id, pick.where);
@@ -730,6 +740,21 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
         },
         .about => Dialogs.showAbout(hwnd, build_config.version_string),
         .quit => window.performBindingAction(.quit),
+        // `windowOpen` re-resolved this window after the modal menu returned;
+        // the launch never pumps messages, so it stays valid for the notice.
+        .drop_receiver => switch (drop_companion_launch.launch(app)) {
+            .launched => {},
+            .not_elevated => window.showNotice(.{
+                .severity = .@"error",
+                .title = i18n.tr("Drop Receiver"),
+                .body = i18n.tr("A normal-privilege drop receiver needs an elevated window with User Account Control enabled."),
+            }, null),
+            .no_linked_token, .not_medium, .launch_failed => window.showNotice(.{
+                .severity = .@"error",
+                .title = i18n.tr("Drop Receiver"),
+                .body = i18n.tr("The drop receiver could not be started."),
+            }, null),
+        },
     }
 }
 
@@ -814,6 +839,17 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
         else
             hints.text(.{ .open_config = .os_open }, &buf),
     });
+    // Only an elevated window with a running broker can pair with a
+    // normal-privilege drop receiver; medium windows never show this item.
+    if (app.drop_bridge.available()) {
+        try menu.separator(root);
+        try menu.add(root, .{
+            .id = @intFromEnum(MainItem.drop_receiver),
+            .label = i18n.tr("Drop into Elevated Terminal…"),
+            .icon = d2d.icons.shield,
+            .access = 'D',
+        });
+    }
     try menu.separator(root);
     try menu.add(root, .{
         .id = @intFromEnum(MainItem.about),
@@ -851,15 +887,9 @@ fn saveLanguage(alloc: Allocator, lang: i18n.Language) !void {
     try overlay.save(global.io(), path);
 }
 
-/// Whether `window` is still one of the app's open windows.
-fn windowOpen(app: *App, window: *Window) bool {
-    for (app.windows.items) |open| {
-        if (open == window) return !window.closing;
-    }
-    if (app.quick_terminal) |qt| {
-        if (qt.window == window) return !window.closing;
-    }
-    return false;
+/// Reject object-address reuse and hide/reopen while the modal menu ran.
+fn windowOpen(app: *App, window: *Window, attachment: ui_ref.Attachment) bool {
+    return app.resolveWindowView(attachment) == window;
 }
 
 /// Items of the launch profile menu besides the profiles.
@@ -899,6 +929,7 @@ fn openProfileMenu(window: *Window, placement: MenuPopup.Options) void {
     const hwnd = window.hwnd orelse return;
     if (window.closing) return;
     const app = window.app;
+    const attachment = window.ui_attachment;
 
     var launch: ProfileItems = .init(app);
     defer launch.deinit();
@@ -912,7 +943,7 @@ fn openProfileMenu(window: *Window, placement: MenuPopup.Options) void {
     var options = placement;
     options.owner_scale = window.scale;
     const id = runMenu(app, hwnd, &menu.root, options) orelse return;
-    if (!windowOpen(app, window)) return;
+    if (!windowOpen(app, window, attachment)) return;
     if (launch.pick(id)) |pick| {
         _ = app.openProfile(window, pick.id, pick.where);
         return;
@@ -1082,9 +1113,8 @@ fn defaultTag(alloc: Allocator, shortcut: ?[]const u8) Allocator.Error![]const u
 /// A menu a key binding asked for, opened from the message loop: a binding
 /// runs inside a core callback, where a menu must not run its modal loop.
 const Queued = union(enum) {
-    new_tab: *Window,
-    /// The core surface id of the terminal.
-    context: u64,
+    new_tab: ui_ref.Reference,
+    context: ui_ref.Reference,
 };
 
 var queued: ?Queued = null;
@@ -1098,7 +1128,7 @@ var queued_timer: usize = 0;
 /// not be queued.
 pub fn queueNewTabMenu(window: *Window) bool {
     if (window.closing or window.hwnd == null) return false;
-    return queue(window.app, .{ .new_tab = window });
+    return queue(window.app, .{ .new_tab = window.ui_reference });
 }
 
 /// Open the context menu of `surface` at its cursor
@@ -1106,8 +1136,11 @@ pub fn queueNewTabMenu(window: *Window) bool {
 /// handled, for `gx:context_menu`. Safe in a core callback. Returns false
 /// when it could not be queued.
 pub fn queueContextMenu(surface: *Surface) bool {
-    if (!surface.core_surface_ready or surface.hwnd == null) return false;
-    return queue(surface.app, .{ .context = surface.core_surface.id });
+    return queuePaneContextMenu(Pane.fromLocal(surface));
+}
+pub fn queuePaneContextMenu(pane: Pane) bool {
+    if (!pane.ready() or pane.nativeHandle() == null) return false;
+    return queue(pane.app(), .{ .context = pane.reference() });
 }
 
 fn queue(app: *App, request: Queued) bool {
@@ -1131,14 +1164,15 @@ fn openQueued(hwnd: ?w32.HWND, msg: u32, id: usize, time: u32) callconv(.winapi)
     queued = null;
     const app = queued_app orelse return;
     switch (request) {
-        .new_tab => |window| {
-            if (!windowOpen(app, window) or !enabledWindow(window.hwnd)) return;
+        .new_tab => |reference| {
+            const window = app.resolveWindow(reference) orelse return;
+            if (!enabledWindow(window.hwnd)) return;
             showNewTabMenu(window);
         },
-        .context => |surface_id| {
-            const surface = findSurface(app, surface_id) orelse return;
-            if (!enabledWindow(surface.parent_window.hwnd)) return;
-            showSurfaceContextMenuAtCursor(surface);
+        .context => |reference| {
+            const pane = Pane.resolve(app, reference) orelse return;
+            if (!enabledWindow(pane.ownerWindow().hwnd)) return;
+            showPaneContextMenuAtCursor(pane);
         },
     }
 }
@@ -1147,25 +1181,6 @@ fn openQueued(hwnd: ?w32.HWND, msg: u32, id: usize, time: u32) callconv(.winapi)
 fn enabledWindow(hwnd: ?w32.HWND) bool {
     const h = hwnd orelse return false;
     return w32.IsWindowEnabled(h) != 0;
-}
-
-/// The terminal with core surface id `id` in one of the app's windows.
-fn findSurface(app: *App, id: u64) ?*Surface {
-    for (app.windows.items) |window| {
-        if (findSurfaceIn(window, id)) |surface| return surface;
-    }
-    if (app.quick_terminal) |qt| return findSurfaceIn(qt.window, id);
-    return null;
-}
-
-fn findSurfaceIn(window: *Window, id: u64) ?*Surface {
-    if (window.closing) return null;
-    const tab = window.findTabBySurfaceId(id) orelse return null;
-    var it = window.tab_trees[tab].iterator();
-    while (it.next()) |entry| {
-        if (entry.view.core_surface.id == id) return entry.view;
-    }
-    return null;
 }
 
 // -----------------------------------------------------------------------
@@ -1183,13 +1198,14 @@ pub fn showWindowMenu(window: *Window, screen_pt: w32.POINT) void {
     const hwnd = window.hwnd orelse return;
     if (window.closing) return;
     const app = window.app;
+    const attachment = window.ui_attachment;
     const zoomed = w32.IsZoomed(hwnd) != 0;
     const fullscreen = window.title_bar.is_fullscreen;
     const state: WindowState = .{ .zoomed = zoomed, .fullscreen = fullscreen };
     // Alt+Space opens it while both keys are down.
     const keyboard = w32.GetKeyState(@as(i32, w32.VK_SPACE)) < 0 and w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0;
 
-    if (MenuPopup.preferNative() or menuHost(app) == null) return nativeWindowMenu(hwnd, screen_pt, state);
+    if (MenuPopup.preferNative() or menuHost(app) == null) return nativeWindowMenu(app, attachment, hwnd, screen_pt, state);
 
     var menu: MenuPopup.Builder = .init(app.core_app.alloc);
     defer menu.deinit();
@@ -1202,7 +1218,7 @@ pub fn showWindowMenu(window: *Window, screen_pt: w32.POINT) void {
         .keyboard = keyboard,
         .owner_scale = window.scale,
     }) orelse return;
-    if (!windowOpen(app, window)) return;
+    if (!windowOpen(app, window, attachment)) return;
     _ = w32.PostMessageW(hwnd, WM_SYSCOMMAND, id, 0);
 }
 
@@ -1245,7 +1261,7 @@ fn buildWindowMenu(menu: *MenuPopup.Builder, state: WindowState) Allocator.Error
 }
 
 /// The system menu of `hwnd` (native), set up for its state.
-fn nativeWindowMenu(hwnd: w32.HWND, screen_pt: w32.POINT, state: WindowState) void {
+fn nativeWindowMenu(app: *App, attachment: ui_ref.Attachment, hwnd: w32.HWND, screen_pt: w32.POINT, state: WindowState) void {
     const menu = GetSystemMenu(hwnd, 0) orelse return;
     setMenuItemEnabled(menu, SC_RESTORE, state.zoomed or state.fullscreen);
     setMenuItemEnabled(menu, SC_MOVE, state.movable());
@@ -1263,6 +1279,8 @@ fn nativeWindowMenu(hwnd: w32.HWND, screen_pt: w32.POINT, state: WindowState) vo
         hwnd,
         null,
     );
+    const live = app.resolveWindowView(attachment) orelse return;
+    if (live.hwnd != hwnd) return;
     if (cmd > 0) _ = w32.PostMessageW(hwnd, WM_SYSCOMMAND, @intCast(cmd), 0);
 }
 

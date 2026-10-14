@@ -113,6 +113,9 @@ fn build(state: *State, config: *const configpkg.Config, parent: *gtk.Widget) Al
 
     const header = adw.HeaderBar.new();
     header.setTitleWidget(adw.WindowTitle.new(tr("Keyboard Shortcuts"), "").as(gtk.Widget));
+    const edit_button = gtk.Button.newWithLabel(tr("Edit Keyboard Shortcuts"));
+    edit_button.as(gtk.Actionable).setActionName("app.gx-shortcut-editor");
+    header.packEnd(edit_button.as(gtk.Widget));
 
     const toolbar = adw.ToolbarView.new();
     toolbar.addTopBar(header.as(gtk.Widget));

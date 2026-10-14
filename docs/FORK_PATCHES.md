@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0038）之后的号。在册的 32 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0038，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0044）之后的号。在册的 38 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0044，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -101,6 +101,17 @@
 | GX-0038 | `src/font/CodepointResolver.zig` | `fork(gx): GX-0038` | active |
 | GX-0038 | `src/font/SharedGridSet.zig` | `fork(gx): GX-0038` | active |
 | GX-0038 | `src/font/discovery.zig` | `fork(gx): GX-0038` | active |
+| GX-0039 | `src/apprt/gtk/class/Overrides.zig` | `fork(gx): GX-0039` | active |
+| GX-0039 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0039` | active |
+| GX-0039 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0039` | active |
+| GX-0039 | `src/apprt/gtk/class/tab.zig` | `fork(gx): GX-0039` | active |
+| GX-0039 | `src/apprt/gtk/class/surface.zig` | `fork(gx): GX-0039` | active |
+| GX-0039 | `src/apprt/gtk/class/split_tree.zig` | `fork(gx): GX-0039` | active |
+| GX-0040 | `src/cli/toggle_quick_terminal.zig` | `fork(gx): GX-0040` | active |
+| GX-0041 | `src/termio/stream_handler.zig` | `fork(gx): GX-0041` | active |
+| GX-0042 | `src/config/Config.zig` | `fork(gx): GX-0042` | active |
+| GX-0043 | `src/renderer/opengl/wgl.zig` | `fork(gx): GX-0043` | active |
+| GX-0044 | `src/Surface.zig` | `fork(gx): GX-0044` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1353,3 +1364,60 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：上游取原文后仅保留 resolver 的样式、缓存与普通查找转发、Fontconfig 转发、grid Policy 及其 hash；普通发现不可改成映射专用过滤。编号按共同树合入顺序固定为 GX-0038，已有 GX-0031～GX-0037 保持不变。
 - 移除条件：上游映射原生支持同族样式、独立合成、内容缓存判等及策略隔离后，移除这些薄钩子和 GX 模块，将三条登记行改为 removed。
 - 验证：`just test --filter gx.font_codepoint_map --filter directwrite --filter getIndex --filter Key`；独占 WSL clone 的同过滤 POSIX/GTK 测试及 GTK build；`just test -Dfont-backend=freetype --filter gx.font_codepoint_map` 验证无发现退路；`python scripts/run_unittests.py test_fork_patches test_gx_test_roots`、rules/fmt/diff。真实 CJK 终端四样式需 Windows 96 DPI/100% 与 GTK scale=1 原尺寸图，锁屏或仅 Xvfb 时记 PENDING，不以设置预览代证。
+
+
+## GX-0039 GTK 稳定视图引用、启动来源与树收养
+
+- 状态 active，未回馈上游。文件见登记表；新增入口使用 begin/end 块，必要调用替换紧邻单行标记。
+- 原因：异步消费者需要区分对象与视图寿命；显式 profile 的内部命令包装丢失稳定来源；Tab 迁移后旧 Window 的 SplitTree.changed 监听未解绑；原 Tab 构造必然启动一个 shell。
+- 真源：`src/apprt/gtk/gx/runtime.zig` 管理 qdata 身份和活对象查找；`origin.zig` 持有启动来源副本；`tree_lifecycle.zig` 预分配待收养的树。上游类仅提供创建、映射、附着、分离和销毁钩子。
+- 对象引用保持 host epoch，视图隐藏、移动和销毁撤销旧 attachment；旧 owner 的迟到 detach 不撤销新 owner。临时命令不猜测为 profile，owned 来源不借用临时列表内存。
+- 空 Tab/Window 和树收养不得创建 placeholder shell；树复制和可恢复分配失败在提交前处理，旧 listener 随 owner 解绑。
+- 移除条件：上游提供等价的稳定生命周期、typed 启动来源和无初始终端的收养接口后移除钩子，登记改为 removed。
+- 验证：GTK runtime/origin/tree_lifecycle/app/launch 定向单测、GTK app 构建、真实移窗后关闭旧窗继续 split/title；Windows/POSIX 共享引用测试；fork/roots/GTK contract 守门。未实际读图的项目保持 PENDING。
+
+
+## GX-0040 Quick Terminal CLI 参数解析与 Windows IPC
+
+- 文件：`src/cli/toggle_quick_terminal.zig`；active，未回馈上游。解析、arena 释放、错误输出刷新与参数测试使用标记块，支持平台文档紧邻标记。
+- 原因：原入口未消费 `--class` 和帮助参数，Windows `performIpc` 也未实现。CLI 现在先用原 parser 解析，再把 class 交给原 IPC 接口；GTK 保留 GApplication/D-Bus，Windows 真源在 `src/apprt/win32/ipc/`。
+- 原生接口仅认证本机同用户、登录、会话、提权和配置隔离域；GUI 实际执行后才 ACK。超时或未知结果返回失败，不另启 shell 重复执行。
+- 移除条件：上游入口等价解析并转发 class/help 后删除本钩子，登记改为 removed。
+- 验证：CLI 参数定向测试、真实 named-pipe 身份/选主/重复请求/native ACK、标准 app 的 `+toggle-quick-terminal --help` 与 class/错误码，以及 webdata 最后一项全文和闭合尾部；真实 quick 展示另需已读截图。
+
+
+## GX-0041 保留明确 WSL 会话的 guest cwd
+
+- 文件：`src/termio/stream_handler.zig::reportPwd`；active，未回馈上游。begin/end 块只调存在的 `gxCaptureGuestPwd`，既有本机 host 判断的结果以紧邻标记传入。
+- 原因：Windows 的 nativePath 正确拒绝 POSIX 路径，但会使明确 WSL profile 的 session 无法记录 guest cwd。独立 snapshot 记录该域的数据，不改变宿主 pwd 及原有安全门。
+- 真源：`src/gx/session_cwd.zig` 严格验证明确 wsl: 来源、本机 host、scheme、一次解码、UTF-8、长度和绝对 POSIX 路径；Win Surface 使用独立 SRW 锁保护固定缓冲，不操作 HWND。GUI 先复制并释放 guest 锁，再访问 renderer 状态；IO join 后才释放 Surface。
+- 错误和清空报告撤销旧目录，保存不可用标志并在恢复时反馈；非本机／未知 guest hostname 不探测、不猜测。恢复仅传给当前可信 WSL profile 的 argv `--cd`，不交宿主文件系统。
+- 移除条件：上游提供独立的、带来源域的工作目录状态后移除此可选钩子。
+- 验证：session_cwd 纯解析、Win Surface 读写快照与 WSL 实际 OSC7→保存→重启→cwd 全链；Windows/GTK/POSIX 编译与定向测试。纯解析通过不代真实 WSL 往返。
+
+## GX-0042 Windows Shell 内部启动参数过滤
+
+- 文件：`src/config/Config.zig::loadCliArgs`；active，未回馈上游。原来的 `loadIter` 调用换成编译期分支并带紧邻单行标记：Windows 包装实际 CLI 迭代器，其余平台仍传原迭代器。
+- 原因：通知 COM 激活和 JumpList 参数属于进程启动路由，不能成为配置键或进入 replay。真源 `src/gx/shell_startup.zig::Filter` 仅包装实际 CLI，保留诊断位置与 `-e` 后子命令参数；配置文件不使用该包装。
+- 路由由 `src/apprt/win32/shell/Identity.zig::parseStartup` 严格验证，App 解析当前稳定 profile；未知 profile 不回退默认 shell。
+- 移除条件：上游提供独立启动路由参数入口后移除此钩子。
+- 验证：shell_startup、Identity 定向测试与标准 app 构建；真实 JumpList、通知冷暖激活及无效参数另在隔离 Windows 环境验证。
+
+## GX-0043 远程终端宿主导出 BGRA 帧
+
+- 文件：`src/renderer/opengl/wgl.zig::present`；active，未回馈上游。begin/end 块调用 Surface 的可选远程帧入口；未启用时继续原本的本地呈现路径。
+- 原因：既存终端跨宿主迁移保留源 PTY、核心 Surface 和渲染线程，目标需要有界像素流。原本隐藏窗口停止呈现，不能作为远程帧源。
+- 真源：`src/apprt/win32/RemoteHost.zig` 管理隐藏宿主和每个 Surface 的映射输出；源渲染线程在目标 FBO 已绑定时读取 BGRA，恢复 PACK/PBO/read-buffer 状态，翻转为 top-down 后提交双缓冲写槽。GUI 不调用 GL。
+- 独立 remote 锁保护映射借用，GUI 更换通道先释放锁再调用核心；尺寸变化采用新映射代次，不修改正在读取的旧槽。帧通知只置 event 和原子序号。
+- 移除条件：上游提供 Windows 原生帧导出以及跨宿主 Surface 生命周期后移除此钩子。
+- 验证：帧布局、借用与翻行定向测试；标准 Windows app、原本 WGL 呈现回归、两个既存宿主实际迁移和旧窗关闭后持续输出；硬件／软件路径及输入显示延迟另实测。仅生成 BGRA 不能代证跨 host 完成。
+
+## GX-0044 远程绑定续延与剪贴板回执
+
+- 文件：`src/Surface.zig`；active，未回馈上游。新增字段组、`GxOnceTable` 与续延函数、`updateConfig` 的失效通知、`maybeHandleBinding` 入口旁路与路由调用、剪贴板回执函数用 begin/end 块；改动的上游行（一次性表的立即弹出条件、leader 前弹出、`activate_key_table*` 的激活代次、复制后清除选区的条件、`table_stack` 元素的 `gx_generation`）用紧邻的 GX-0044 标记行，其中一次性表弹出条件紧跟在同一处 begin/end 块之后。
+- 可选 `gx_binding_route` 默认 `null`。未安装时上述条件全部回到上游路径：立即弹出一次性表、复制后立即清除选区、不调用远程回调。安装方只有 Windows `src/apprt/win32/RemoteSource.zig`（源端终端被远程视图承载时安装、撤销时置回 `null`）；实现真源还有 `src/gx/remote_binding.zig`。
+- 源解析 keytable、序列、动作链与标志；目标 UI 动作经认证 IPC，在实际结果返回后恢复续延。每叶一个挂起续延，输入队列有界；代次变化与断连不重放已执行动作。
+- 延迟完成只弹出原匹配的那次一次性表激活（按激活代次 `gx_generation` 区分），不弹出等待期间新激活的表；performable 未执行时 `gxCompleteBinding` 返回 true，调用方在 `gx_binding_bypass` 下把原按键编码一次。远程复制只在目标回执实际完成后经 `gxCompleteClipboardCopy` 清除仍相同的选区；kitty 剪贴板写入经 `gxCompleteClipboardWrite` 按回执报 DONE 或 EPERM。
+- 同步时核查可选 hook、配置变更、绑定完成副作用和剪贴板回执薄接线；Windows UI 与 IPC 实现保持在 fork 模块。
+- 移除条件：上游提供等价的异步绑定续延与远程视图接口后移除本钩子。
+- 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0044ShapeTests` 锁定默认 `null`、远程调用只在门控内、改动行紧邻标记）；remote_protocol/remote_binding/RemoteSource 定向测试、Windows/GTK 标准构建、真实远程链式绑定、once、performable 和断连取消。最终实树验证前保持 PENDING。

@@ -451,7 +451,7 @@ fn surfacePopover(surface: *Surface) ?*gtk.PopoverMenu {
     return gobject.ext.cast(gtk.PopoverMenu, object);
 }
 
-fn toast(window: *Window, title: [:0]const u8) void {
+pub fn toast(window: *Window, title: [:0]const u8) void {
     const object = gtk_widget_get_template_child(
         window.as(gtk.Widget),
         Window.getGObjectType(),

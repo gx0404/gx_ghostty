@@ -23,6 +23,8 @@ const App = @import("../App.zig");
 const w32 = @import("../win32.zig");
 const Notice = @import("Notice.zig");
 const Popup = @import("Popup.zig");
+const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
 
@@ -69,6 +71,8 @@ timeout_ms: ?u32 = duration_ms,
 timeout_deadline: ?u64 = null,
 owner: ?Owner = null,
 pending: bool = false,
+uia_message_version: u64 = 0,
+uia_staged_version: ?u64 = null,
 
 /// Show `content` now (from the message loop).
 pub fn show(self: *Toast, app: *App, placement: Placement, content: Content) void {
@@ -109,6 +113,7 @@ pub fn hideForSurface(self: *Toast, id: u64) void {
 /// Keep feedback for the next settled show, without a timer or reveal
 /// that could bring its popup back during the owner's animation.
 pub fn deferUntilShown(self: *Toast) void {
+    if (self.popup.uia_view.announcement.pending) self.uia_staged_version = null;
     self.pending = self.pending or self.popup.visible;
     self.timeout_deadline = null;
     if (self.popup.hwnd) |hwnd| {
@@ -151,6 +156,10 @@ pub fn deinit(self: *Toast) void {
 }
 
 fn store(self: *Toast, content: Content) void {
+    self.uia_message_version +%= 1;
+    self.uia_staged_version = null;
+    self.popup.uia_view.announcement.cancel();
+    self.popup.uia_view.dirty();
     var len = @min(content.text.len, self.text.len);
     while (len < content.text.len and len > 0 and content.text[len] & 0xC0 == 0x80) len -= 1;
     @memcpy(self.text[0..len], content.text[0..len]);
@@ -189,12 +198,37 @@ fn ensurePopup(self: *Toast) bool {
     }, .{
         .ctx = self,
         .paint = paint,
+        .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
         .timer = onTimer,
         .message = onMessage,
     }) catch |err| {
         log.warn("cannot create a toast err={}", .{err});
         return false;
     };
+    return true;
+}
+
+fn uiaLive(context: *anyopaque) bool {
+    const self: *Toast = @ptrCast(@alignCast(context));
+    const app = self.app orelse return false;
+    const placement = self.placement orelse return false;
+    return self.popup.visible and uia_bridge.ownerAttachment(app, placement.owner) != null;
+}
+fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+    const self: *Toast = @ptrCast(@alignCast(context));
+    const app = self.app orelse return;
+    const placement = self.placement orelse return;
+    const attachment = uia_bridge.ownerAttachment(app, placement.owner) orelse return bridge.hide();
+    _ = try bridge.publishToast(api, queue, attachment, self, .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+    if (bridge.publisher.current != null and self.uia_staged_version != self.uia_message_version) {
+        self.uia_staged_version = self.uia_message_version;
+        bridge.announce(self.text[0..self.text_len]);
+    }
+}
+fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
+    const self: *Toast = @ptrCast(@alignCast(context));
+    if (!uiaLive(context) or token != 0 or action.kind != .close) return false;
+    self.hide();
     return true;
 }
 
@@ -325,6 +359,23 @@ test "toast duration defaults, replaces and keeps persistent hints" {
     try testing.expect(toast.pending);
     toast.store(.{ .text = "Copied again" });
     try testing.expectEqual(@as(?u32, 3000), toast.timeout_ms);
+}
+
+test "toast replacement cancels queued speech while deferred pending speech is restaged" {
+    var toast: Toast = .{};
+    toast.store(.{ .text = "Copied" });
+    const first = toast.uia_message_version;
+    toast.uia_staged_version = first;
+    toast.popup.uia_view.announcement.stage("Copied");
+    toast.popup.uia_view.dirty();
+    try std.testing.expect(toast.popup.uia_view.announcement.pending);
+    try std.testing.expectEqual(first, toast.uia_staged_version.?);
+    toast.deferUntilShown();
+    try std.testing.expect(toast.uia_staged_version == null);
+    try std.testing.expect(!toast.popup.uia_view.announcement.pending);
+    toast.store(.{ .text = "Reloaded" });
+    try std.testing.expect(toast.uia_message_version != first);
+    try std.testing.expect(toast.uia_staged_version == null);
 }
 
 test "toast terminal owners and replacement never cancel unrelated feedback" {

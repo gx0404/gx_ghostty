@@ -1251,6 +1251,10 @@ def prepare_env_dir(env_dir: Path, fresh: bool) -> None:
 
 def launch(exe: Path, env_dir: Path, *, config: str | None = None, env: Mapping[str, str] | None = None,
            args: Sequence[str] = ()) -> Instance:
+    # Child cwd is the private profile. Resolve both paths before that change so
+    # relative --out cannot turn the isolation variables into nested paths.
+    exe = exe.resolve()
+    env_dir = env_dir.resolve()
     if not exe.is_file():
         raise UsageError(f"{exe} does not exist; build it first with: just build")
     w = win32()

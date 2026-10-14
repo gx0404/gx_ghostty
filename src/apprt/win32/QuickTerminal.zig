@@ -535,7 +535,7 @@ fn setTerminalPopupsShown(self: *QuickTerminal, shown: bool) void {
     var it = tree.iterator();
     while (it.next()) |entry| {
         const pane_shown = if (tree.zoomed) |zoomed| entry.handle == zoomed else true;
-        const surface = entry.view;
+        const surface = entry.view.local() orelse continue;
         if (shown and pane_shown) surface.repositionPopups() else surface.link_preview.hide();
         surface.search_bar.setOwnerVisible(shown and pane_shown);
         if (surface.scrollbar) |sb| sb.setOwnerVisible(shown and pane_shown);

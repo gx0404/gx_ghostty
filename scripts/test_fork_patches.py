@@ -543,6 +543,100 @@ def gx0029_problems(source: str) -> list[str]:
     return problems
 
 
+CORE_SURFACE_ZIG = "src/Surface.zig"
+GX0044 = "GX-0044"
+GX0044_MARKER_RE = re.compile(r"fork\(gx\):[ \t]*GX-0044(?![0-9])")
+# Every identifier that the GX-0044 hook adds to the core Surface.
+GX0044_NAMES = ("gx_binding_route", "gx_binding_bypass", "gx_table_generation", "gx_generation",
+                "gx_once", "GxOnceTable", "gxPopOnceTable", "gxCompleteBinding", "gxBeginBinding",
+                "gxCancelBinding", "gxCompleteClipboard")
+GX0044_ROUTE_FIELD = "gx_binding_route: ?struct {"
+GX0044_ROUTE_GATE = "if (self.gx_binding_route) |route|"
+# Upstream behavior kept when no route is installed: the immediate one-shot table pop
+# and clearing the selection right after a copy.
+GX0044_LOCAL_PATHS = 2
+
+
+def gx0044_problems(source: str) -> list[str]:
+    """Shape lock for GX-0044 in src/Surface.zig: the remote binding route is optional
+    (null by default), its callbacks run only behind that gate, the upstream paths stay
+    when it is absent, and every code line using GX-0044 state is inside a GX-0044 hunk
+    or directly below a GX-0044 marker line."""
+    lines = source.replace("\r\n", "\n").split("\n")
+    problems: list[str] = []
+    inside = False
+    for index, line in enumerate(lines):
+        opened, closed = HUNK_BEGIN_RE.match(line), HUNK_END_RE.match(line)
+        if opened and opened.group(1) == GX0044:
+            inside = True
+            continue
+        if closed and closed.group(1) == GX0044:
+            inside = False
+            continue
+        if inside or line.lstrip().startswith("//"):
+            continue
+        if any(name in line for name in GX0044_NAMES) and not (
+                index and GX0044_MARKER_RE.search(lines[index - 1])):
+            problems.append(f"line {index + 1}: GX-0044 state outside a hunk needs a "
+                            f"fork(gx): {GX0044} line above")
+    fields = [i for i, line in enumerate(lines) if line.strip() == GX0044_ROUTE_FIELD]
+    if len(fields) != 1:
+        problems.append(f"expected one {GX0044_ROUTE_FIELD!r} field, found {len(fields)}")
+    else:
+        close = next((i for i in range(fields[0] + 1, min(fields[0] + 8, len(lines)))
+                      if lines[i].startswith("}")), None)
+        if close is None or lines[close].strip() != "} = null,":
+            problems.append("gx_binding_route must default to null")
+    for call in ("route.callback(", "route.config_changed("):
+        hits = [i for i, line in enumerate(lines) if call in line]
+        if len(hits) != 1:
+            problems.append(f"expected one {call!r}, found {len(hits)}")
+        elif not any(GX0044_ROUTE_GATE in lines[i] for i in range(max(0, hits[0] - 1), hits[0] + 1)):
+            problems.append(f"{call!r} must run only inside `{GX0044_ROUTE_GATE}`")
+    local = sum("self.gx_binding_route == null" in line for line in lines)
+    if local != GX0044_LOCAL_PATHS:
+        problems.append(f"expected {GX0044_LOCAL_PATHS} upstream paths gated on a missing route, "
+                        f"found {local}")
+    return problems
+
+
+def _expand_ids(spec: str) -> set[str]:
+    ids: set[str] = set()
+    for first, last in re.findall(r"GX-(\d{4})(?:～GX-(\d{4}))?", spec):
+        ids.update(f"GX-{n:04d}" for n in range(int(first), int(last or first) + 1))
+    return ids
+
+
+def registry_rule_problems(text: str, patches: list[Patch]) -> list[str]:
+    """The 规则 section states the skipped IDs, the highest ID and the registered IDs;
+    these sentences must agree with the registry table."""
+    rules = text.split("## 规则", 1)[1].split("\n## ", 1)[0] if "## 规则" in text else ""
+    ids = {patch.id for patch in patches}
+    if not ids:
+        return ["the registry table is empty"]
+    highest = max(ids)
+    problems: list[str] = []
+    stated = re.search(r"当前最大编号（(GX-\d{4})）", rules)
+    if stated is None or stated.group(1) != highest:
+        problems.append(f"the rules must name {highest} as the current highest ID")
+    listed = re.search(r"在册的 (\d+) 个 ID 是 ([^，]+)，", rules)
+    if listed is None:
+        problems.append("the rules must list the registered IDs")
+    else:
+        if int(listed.group(1)) != len(ids):
+            problems.append(f"the rules count {listed.group(1)} IDs, the table has {len(ids)}")
+        if _expand_ids(listed.group(2)) != ids:
+            problems.append("the registered ID ranges in the rules differ from the table")
+    skipped_match = re.search(r"。(GX-[^：。]+?) 没有对应补丁", rules)
+    skipped = _expand_ids(skipped_match.group(1)) if skipped_match else set()
+    if skipped & ids:
+        problems.append(f"skipped IDs are registered: {', '.join(sorted(skipped & ids))}")
+    every = {f"GX-{n:04d}" for n in range(1, int(highest[3:]) + 1)}
+    if skipped | ids != every:
+        problems.append("every ID up to the highest must be registered or listed as skipped")
+    return problems
+
+
 def css_call_args(css: str, paren: int) -> list[str]:
     """Top-level, comma-separated arguments of the call whose '(' is at ``paren``."""
     args: list[str] = []
@@ -1268,6 +1362,56 @@ class Gx0038ShapeTests(unittest.TestCase):
         self.assertIn(".descriptor_cache = .{ .policy = key.font_policy }", grid)
         self.assertIn('Policy.fromConfig(config)', grid)
         self.assertIn("autoHash(hasher, @as(u8, @bitCast(self.font_policy)));", grid)
+
+
+class Gx0044ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / CORE_SURFACE_ZIG).read_text(encoding="utf-8")
+
+    def test_registered_route_stays_optional_and_marked(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0044, CORE_SURFACE_ZIG, f"fork(gx): {GX0044}", "active"), patches)
+        self.assertEqual(gx0044_problems(self.source), [])
+        self.assertEqual(gx0044_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_broken_shapes_are_rejected(self):
+        cases = {
+            "default to null": ("\n} = null,\ngx_binding_bypass", "\n} = undefined,\ngx_binding_bypass"),
+            "inside `if (self.gx_binding_route) |route|`": (
+                "if (self.gx_binding_route) |route| {", "if (true) { const route = self.gx_binding_route.?;"),
+            "needs a fork(gx): GX-0044 line above": (
+                "// fork(gx): GX-0044 remote writes clear only after an actual receipt\n", ""),
+            "upstream paths gated on a missing route": (
+                "self.config.selection_clear_on_copy and self.gx_binding_route == null",
+                "self.config.selection_clear_on_copy"),
+        }
+        for expected, (old, new) in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(self.source.count(old), 1, old)
+                problems = gx0044_problems(self.source.replace(old, new))
+                self.assertTrue(any(expected in problem for problem in problems), problems)
+
+
+class RegistryRuleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (ROOT / REGISTRY).read_text(encoding="utf-8")
+        cls.patches = parse_registry(cls.text)
+
+    def test_rules_match_the_registry(self):
+        self.assertEqual(registry_rule_problems(self.text, self.patches), [])
+
+    def test_stale_rules_are_rejected(self):
+        highest = max(patch.id for patch in self.patches)
+        count = len({patch.id for patch in self.patches})
+        stale = self.text.replace(f"当前最大编号（{highest}）", "当前最大编号（GX-0001）", 1)
+        self.assertTrue(any("highest ID" in p for p in registry_rule_problems(stale, self.patches)))
+        stale = self.text.replace(f"在册的 {count} 个 ID", f"在册的 {count - 1} 个 ID", 1)
+        self.assertTrue(any("the table has" in p for p in registry_rule_problems(stale, self.patches)))
+        extra = [*self.patches, Patch("GX-0013", "src/a.zig", "fork(gx): GX-0013", "active")]
+        problems = registry_rule_problems(self.text, extra)
+        self.assertTrue(any("skipped IDs are registered" in p for p in problems), problems)
 
 
 REGISTRY_TEMPLATE = """# fork 补丁登记

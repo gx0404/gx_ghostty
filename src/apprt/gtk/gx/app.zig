@@ -51,9 +51,13 @@ pub fn startup(app: *Application) void {
             glib.Variant.newString(gx.i18n.current().configValue()),
         ),
         .init("gx-keybinds", actionKeybinds, null),
+        .init("gx-shortcut-editor", actionShortcutEditor, null),
         .init("gx-about", actionAbout, null),
         .init("gx-settings-page", actionSettingsPage, s_variant_type),
         .init("gx-open-config-file", actionOpenConfigFile, null),
+        .init("gx-launch-profiles", actionLaunchProfiles, null),
+        .init("gx-new-tab-profile", actionNewTabProfile, s_variant_type),
+        .init("gx-new-window-profile", actionNewWindowProfile, s_variant_type),
     };
     ext.actions.add(Application, app, &actions);
 }
@@ -78,14 +82,16 @@ pub fn performGxAction(app: *Application, target: apprt.Target, action: anytype)
         .settings_page => |page| openSettingsPage(app, page),
         .main_menu => if (targetWindow(app, target)) |window| gx_window.popupMainMenu(window) else false,
         .keybinds => if (targetWindow(app, target)) |window| showShortcuts(app, window) else false,
-        .new_tab_profile => |name| launchProfile(app, target, name, .tab),
-        .new_window_profile => |name| launchProfile(app, target, name, .window),
+        .new_tab_profile => |name| launchProfile(app, target, name, .tab, .query),
+        .new_window_profile => |name| launchProfile(app, target, name, .window, .query),
         .new_tab_menu => if (targetWindow(app, target)) |window| gx_window.popupNewTabMenu(window) else false,
         .context_menu => switch (target) {
             .app => false,
             .surface => |core| gx_window.popupContextMenu(core.rt_surface.surface),
         },
         .tab_switcher => if (targetWindow(app, target)) |window| gx_window.openTabSwitcher(window) else false,
+        .move_split_to_tab => @import("split_transfer.zig").perform(app, target, .tab),
+        .move_split_to_window => @import("split_transfer.zig").perform(app, target, .window),
         .unknown => false,
     };
 }
@@ -101,18 +107,20 @@ pub const Request = union(enum) {
     new_tab_menu,
     context_menu,
     tab_switcher,
+    move_split_to_tab,
+    move_split_to_window,
     unknown,
 };
 
 /// Maps a `gx.action.Action` to a request by tag name, so this compiles
-/// with any tagged union; tags this app runtime does not handle, such as
-/// `move_split_to_tab`, are unknown. Enum payloads (the settings page) map
+/// with any tagged union; tags this app runtime does not handle remain
+/// unknown. Enum payloads (the settings page) map
 /// to their tag names.
 pub fn request(action: anytype) Request {
     switch (action) {
         inline else => |payload, tag| {
             const name = @tagName(tag);
-            const simple = [_][]const u8{ "settings", "main_menu", "keybinds", "new_tab_menu", "context_menu", "tab_switcher" };
+            const simple = [_][]const u8{ "settings", "main_menu", "keybinds", "new_tab_menu", "context_menu", "tab_switcher", "move_split_to_tab", "move_split_to_window" };
             inline for (simple) |simple_name| {
                 if (comptime std.mem.eql(u8, name, simple_name)) return @unionInit(Request, simple_name, {});
             }
@@ -153,7 +161,7 @@ fn actionLanguage(
 /// Loads the configuration again, as `reload_config` does, without the
 /// "Reloaded the configuration" toast: the windows tell about the new
 /// language themselves (`window.sync`).
-fn reloadQuietly(app: *Application) void {
+pub fn reloadQuietly(app: *Application) void {
     const alloc = app.allocator();
     const notifications = notifications: {
         const config = app.getConfig();
@@ -184,6 +192,11 @@ fn reloadConfig(app: *Application) void {
     };
 }
 
+fn actionShortcutEditor(_: *gio.SimpleAction, _: ?*glib.Variant, app: *Application) callconv(.c) void {
+    const window = activeWindow(app) orelse return;
+    @import("shortcut_editor.zig").present(app, window.as(gtk.Widget));
+}
+
 fn actionKeybinds(
     _: *gio.SimpleAction,
     _: ?*glib.Variant,
@@ -209,6 +222,11 @@ fn actionSettingsPage(
 ) callconv(.c) void {
     const value = parameter orelse return;
     _ = openSettingsPage(app, std.mem.span(value.getString(null)));
+}
+
+fn actionLaunchProfiles(_: *gio.SimpleAction, _: ?*glib.Variant, app: *Application) callconv(.c) void {
+    const window = activeWindow(app) orelse return;
+    @import("launch_profiles_dialog.zig").present(app, window.as(gtk.Widget));
 }
 
 fn actionOpenConfigFile(
@@ -310,28 +328,52 @@ fn launchProfile(
     target: apprt.Target,
     name: []const u8,
     where: enum { tab, window },
+    match: enum { query, id },
 ) bool {
     const config = app.getConfig();
     defer config.unref();
     var profiles = launch.list(app, config.get()) catch return false;
     defer profiles.deinit();
-    const profile = profiles.find(name) orelse {
+    const profile = (switch (match) {
+        .query => profiles.find(name),
+        .id => profiles.findId(name),
+    }) orelse {
         log.warn("unknown launch profile {s}", .{name});
         return false;
     };
 
-    const group = app.as(gio.ActionGroup);
+    var arena: std.heap.ArenaAllocator = .init(app.allocator());
+    defer arena.deinit();
+    const arguments = glib.ext.Variant.newFrom(profile.args);
+    _ = arguments.refSink();
+    defer arguments.unref();
+    var it: glib.VariantIter = undefined;
+    _ = it.init(arguments);
+    var overrides = @import("../class/Overrides.zig").parse(arena.allocator(), &it) catch return false;
+    overrides.launch_origin = .{ .profile = profile.id };
+    const parent = switch (target) {
+        .surface => |core| core,
+        .app => app.core().focusedSurface(),
+    };
     switch (where) {
-        .tab => {
-            const surface_id: u64 = switch (target) {
-                .app => 0,
-                .surface => |core| core.id,
-            };
-            group.activateAction("new-tab", glib.ext.Variant.newFrom(.{ surface_id, profile.args }));
+        .tab => if (parent) |core| {
+            return Application.gxNewTab(.{ .surface = core }, overrides);
+        } else {
+            app.gxNewWindow(null, overrides) catch return false;
         },
-        .window => group.activateAction("new-window-command", glib.ext.Variant.newFrom(profile.args)),
+        .window => app.gxNewWindow(parent, overrides) catch return false,
     }
     return true;
+}
+
+fn actionNewTabProfile(_: *gio.SimpleAction, parameter: ?*glib.Variant, app: *Application) callconv(.c) void {
+    const value = parameter orelse return;
+    _ = launchProfile(app, .app, std.mem.span(value.getString(null)), .tab, .id);
+}
+
+fn actionNewWindowProfile(_: *gio.SimpleAction, parameter: ?*glib.Variant, app: *Application) callconv(.c) void {
+    const value = parameter orelse return;
+    _ = launchProfile(app, .app, std.mem.span(value.getString(null)), .window, .id);
 }
 
 fn targetWindow(app: *Application, target: apprt.Target) ?*Window {
@@ -372,8 +414,8 @@ test "request maps the gx.action.Action tags by name" {
     try testing.expectEqualStrings("gx-zsh", request(Action{ .new_tab_profile = "gx-zsh" }).new_tab_profile);
     try testing.expectEqualStrings("bash", request(Action{ .new_window_profile = "bash" }).new_window_profile);
     try testing.expectEqualStrings("shell", request(Action{ .settings_page = .shell }).settings_page);
-    try testing.expect(request(@as(Action, .move_split_to_tab)) == .unknown);
-    try testing.expect(request(@as(Action, .move_split_to_window)) == .unknown);
+    try testing.expect(request(@as(Action, .move_split_to_tab)) == .move_split_to_tab);
+    try testing.expect(request(@as(Action, .move_split_to_window)) == .move_split_to_window);
 
     const Later = union(enum) { settings, something_new: u32 };
     try testing.expect(request(@as(Later, .settings)) == .settings);

@@ -53,7 +53,7 @@ framework-test:
 framework-check: rules-check version-check framework-test kb-check i18n-check pinyin-check
 
 # 生成物新鲜度门：kb-check、i18n-check、pinyin-check、graph-check（上游同步后与发版前）
-generated-check: kb-check i18n-check pinyin-check graph-check
+generated-check: kb-check i18n-check pinyin-check fluent-check graph-check
 
 # 本地 CI 门：framework-check、fmt-check、test-vt
 ci-check: framework-check fmt-check test-vt
@@ -90,13 +90,21 @@ i18n:
 i18n-check:
     {{python}} scripts/gx_i18n.py --check
 
-# 联网取拼音源数据，重新生成拼音首字母表 src/gx/pinyin/initials.zig
+# 从仓内钉版输入离线重建首字母与全拼表
 pinyin:
-    {{python}} scripts/gx_pinyin.py --download
+    {{python}} scripts/gx_pinyin.py
 
 # 离线只读校验拼音首字母表 src/gx/pinyin/initials.zig
 pinyin-check:
     {{python}} scripts/gx_pinyin.py --check
+
+# 从钉版 MIT SVG 离线重建 Fluent 路径
+fluent:
+    {{python}} scripts/gx_fluent_icons.py
+
+# 校验 Fluent 输入摘要和路径生成物
+fluent-check:
+    {{python}} scripts/gx_fluent_icons.py --check
 
 # 启用仓库内 git 钩子（commit-msg 校验提交标题）
 install-hooks:

@@ -51,6 +51,8 @@ const ui_color = gx.ui_color;
 const contrast_floor = gx.ui_tokens.floor;
 const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
+const Pane = @import("../Pane.zig");
+const ui_ref = @import("../../../gx/ui_ref.zig");
 const Window = @import("../Window.zig");
 const clipboard = @import("../clipboard.zig");
 const shortcut_conflicts = @import("../shortcut_conflicts.zig");
@@ -71,8 +73,19 @@ const Reason = shortcut_conflicts.Reason;
 /// Show the keyboard shortcuts for `window`. Returns false if nothing was
 /// shown.
 pub fn show(window: *Window) bool {
-    const surface = window.getActiveSurface() orelse return false;
-    return surface.palette.keybinds.open();
+    const pane = window.activePane() orelse return false;
+    switch (pane.backend) {
+        .remote => |remote| if (!remote.ui.keybind_ready) {
+            remote.ui.requestKeybinds(remote) catch return false;
+            return false;
+        },
+        .local => {},
+    }
+    return window.palette.keybinds.open();
+}
+/// Local callers share the window-owned sheet with remote panes.
+pub fn showLocal(surface: *Surface) bool {
+    return show(surface.parent_window);
 }
 
 /// Layout in DIPs.
@@ -339,12 +352,12 @@ pub const Sheet = struct {
         return @alignCast(@fieldParentPtr("keybinds", self));
     }
 
-    fn surface(self: *Sheet) *Surface {
-        return self.palette().surface();
+    fn paneView(self: *Sheet) Pane {
+        return self.palette().paneView();
     }
 
     fn app(self: *Sheet) *App {
-        return self.surface().app;
+        return self.palette().ownerWindow().app;
     }
 
     fn gpa(self: *Sheet) Allocator {
@@ -375,11 +388,11 @@ pub const Sheet = struct {
     /// list is open.
     fn open(self: *Sheet) bool {
         if (self.list.hwnd != null or screenReaderRunning()) return self.openList(true);
-        const s = self.surface();
-        const window = s.parent_window;
+        const pane = self.paneView();
+        const window = pane.ownerWindow();
         const owner = window.hwnd orelse return false;
         const t = self.colors();
-        if (!Palette.ensurePopup(&self.popup, s.app, owner, popupOptions(t), .{
+        if (!Palette.ensurePopup(&self.popup, pane.app(), owner, popupOptions(t), .{
             .ctx = self,
             .paint = paint,
             .key = onKey,
@@ -409,7 +422,7 @@ pub const Sheet = struct {
         self.endInteraction();
         self.popup.hide();
         if (was_open and restore_focus) {
-            if (self.surface().hwnd) |hwnd| _ = w32.SetFocus(hwnd);
+            self.paneView().focus();
         }
     }
 
@@ -445,7 +458,7 @@ pub const Sheet = struct {
     /// The sheet's place in screen pixels: centered on the window below its
     /// chrome, at the window's content scale.
     fn bounds(self: *Sheet) ?w32.RECT {
-        const window = self.surface().parent_window;
+        const window = self.paneView().ownerWindow();
         const hwnd = window.hwnd orelse return null;
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(hwnd, &client) == 0) return null;
@@ -478,7 +491,7 @@ pub const Sheet = struct {
         collect(
             a,
             &self.entries,
-            &config.keybind.set,
+            self.palette().keybindSet(),
             config.@"command-palette-entry".value.items,
             &self.app().shortcut_conflicts,
         ) catch |err| {
@@ -672,7 +685,7 @@ pub const Sheet = struct {
         var name_buf: [4]u8 = undefined;
         if (keyName(physicalKey(key.vk), layoutChar(key.vk), &name_buf) == null) return;
         const press: Recording.Press = .{ .vk = key.vk, .mods = modsOf(key) };
-        self.recording.add(&self.app().config.keybind.set, press);
+        self.recording.add(self.palette().keybindSet(), press);
         var buf: [256]u8 = undefined;
         const text = self.recording.query(&buf);
         self.popup.input.setText(self.gpa(), text) catch |err| {
@@ -691,15 +704,15 @@ pub const Sheet = struct {
     /// or refresh the text of the open one; `activate` brings it to the
     /// front. Returns false when it cannot be shown.
     fn openList(self: *Sheet, activate: bool) bool {
-        const s = self.surface();
-        const window = s.parent_window;
+        const pane = self.paneView();
+        const window = pane.ownerWindow();
         const owner = window.hwnd orelse return false;
         if (self.popup.visible) self.close(false);
         self.build();
         const a = if (self.arena) |*arena| arena.allocator() else return false;
         const text = listText(a, self.entries.items, "\r\n") catch return false;
         const units = wstr.allocZ(a, text) catch return false;
-        return self.list.show(s.app.hinstance, owner, window.scale, units, activate);
+        return self.list.show(pane.app().hinstance, owner, window.scale, units, activate);
     }
 
     // -------------------------------------------------------------------
@@ -713,19 +726,29 @@ pub const Sheet = struct {
             .entry => |i| i,
             .notice, .header => return,
         };
-        const s = self.surface();
+        const pane = self.paneView();
+        const app_ = pane.app();
+        const reference = pane.reference();
         const actions = self.entries.items[index].actions;
+        const skip = isKeybinds(actions);
+        var arena = std.heap.ArenaAllocator.init(app_.core_app.alloc);
+        defer arena.deinit();
+        const copies = cloneActions(arena.allocator(), actions) catch {
+            self.close(true);
+            return;
+        };
         self.close(true);
-        if (isKeybinds(actions)) return;
-        perform(s, actions);
+        if (!skip) perform(app_, reference, copies);
     }
 
     /// A key bound to an action outside the search: close the sheet and
     /// perform it. Returns false when the key should edit the search
     /// instead.
     fn performChord(self: *Sheet, key: Popup.Key) bool {
-        const s = self.surface();
-        const value = bindingForKey(&s.app.config.keybind.set, key.vk, modsOf(key)) orelse {
+        const pane = self.paneView();
+        const app_ = pane.app();
+        const reference = pane.reference();
+        const value = bindingForKey(self.palette().keybindSet(), key.vk, modsOf(key)) orelse {
             // Ctrl+Alt without a binding is AltGr typing a character.
             return !(key.ctrl and key.alt);
         };
@@ -739,8 +762,15 @@ pub const Sheet = struct {
             .copy_to_clipboard, .paste_from_clipboard, .select_all => return false,
             else => {},
         };
+        const skip = isKeybinds(actions);
+        var arena = std.heap.ArenaAllocator.init(app_.core_app.alloc);
+        defer arena.deinit();
+        const copies = cloneActions(arena.allocator(), actions) catch {
+            self.close(true);
+            return true;
+        };
         self.close(true);
-        if (!isKeybinds(actions)) perform(s, actions);
+        if (!skip) perform(app_, reference, copies);
         return true;
     }
 
@@ -764,7 +794,7 @@ pub const Sheet = struct {
             .swallow => return true,
             .close => self.close(true),
             .close_window => {
-                const window = self.surface().parent_window;
+                const window = self.paneView().ownerWindow();
                 self.close(true);
                 if (window.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
             },
@@ -885,7 +915,7 @@ pub const Sheet = struct {
         const self: *Sheet = @ptrCast(@alignCast(ctx));
         self.endInteraction();
         if (reason == .escape or reason == .owner) {
-            if (self.surface().hwnd) |hwnd| _ = w32.SetFocus(hwnd);
+            self.paneView().focus();
         }
     }
 
@@ -1569,17 +1599,16 @@ fn isKeybinds(actions: []const Action) bool {
     };
 }
 
-/// Perform `actions` on the terminal of `s`, in order. They are copied
-/// first: an action can reload the configuration they come from.
-fn perform(s: *Surface, actions: []const Action) void {
-    if (!s.core_surface_ready) return;
-    var arena: std.heap.ArenaAllocator = .init(s.app.core_app.alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const copies = a.alloc(Action, actions.len) catch return;
-    for (actions, copies) |action, *copy| copy.* = action.clone(a) catch return;
-    for (copies) |action| {
-        _ = s.core_surface.performBindingAction(action) catch |err| {
+/// Copy into a caller-owned arena before closing/reloading the sheet.
+fn cloneActions(allocator: Allocator, actions: []const Action) ![]const Action {
+    const copies = try allocator.alloc(Action, actions.len);
+    for (actions, copies) |action, *copy| copy.* = try action.clone(allocator);
+    return copies;
+}
+fn perform(app: *App, reference: ui_ref.Reference, actions: []const Action) void {
+    for (actions) |action| {
+        const pane = Pane.resolve(app, reference) orelse return;
+        _ = pane.performBindingAction(action) catch |err| {
             log.err("shortcut sheet action failed action={t} err={}", .{ action, err });
             return;
         };
@@ -1883,7 +1912,7 @@ const List = struct {
     /// Close the window and give the keyboard back to the terminal.
     fn close(self: *List) void {
         const hwnd = self.hwnd orelse return;
-        const terminal = self.sheet().surface().hwnd;
+        const terminal = self.sheet().paneView().nativeHandle();
         _ = w32.DestroyWindow(hwnd);
         if (terminal) |h| _ = w32.SetFocus(h);
     }

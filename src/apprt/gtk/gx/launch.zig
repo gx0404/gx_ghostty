@@ -46,6 +46,13 @@ pub const List = struct {
         self.* = undefined;
     }
 
+    /// Exact identity lookup for stored or menu-carried profile references.
+    /// A renamed or missing id must never fall back to a display name.
+    pub fn findId(self: *const List, id: []const u8) ?*const Item {
+        for (self.items) |*item| if (std.mem.eql(u8, item.id, id)) return item;
+        return null;
+    }
+
     /// The profile whose id or name is `query`; names match ignoring ASCII
     /// case.
     pub fn find(self: *const List, query: []const u8) ?*const Item {
@@ -245,4 +252,14 @@ test "detect lists custom profiles after the detected ones and marks the default
     try testing.expectEqualStrings("--command=direct:tail -f /tmp/x.log", last.args[0]);
     try testing.expectEqual(@as(?usize, result.items.len - 1), result.default);
     for (result.items) |item| try testing.expect(item.args.len > 0);
+}
+
+test "List.findId does not retarget a stale profile id to a display name" {
+    var profiles: List = .{ .arena = .init(std.testing.allocator) };
+    defer profiles.deinit();
+    profiles.items = &.{.{ .id = "custom:New", .name = "custom:Old", .args = &.{} }};
+    try std.testing.expect(profiles.findId("custom:Old") == null);
+    try std.testing.expect(profiles.findId("CUSTOM:NEW") == null);
+    try std.testing.expectEqualStrings("custom:New", profiles.findId("custom:New").?.id);
+    try std.testing.expect(profiles.find("custom:Old") != null);
 }

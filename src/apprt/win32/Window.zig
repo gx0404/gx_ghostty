@@ -75,6 +75,13 @@ const gx = @import("../../gx/main.zig");
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
+const Leaf = @import("Leaf.zig");
+const RemotePane = @import("RemotePane.zig");
+const protocol = @import("../../gx/remote_protocol.zig");
+const refs = @import("../../gx/ui_ref.zig");
+const Pane = @import("Pane.zig");
+const Palette = @import("ui/Palette.zig");
+const PaneSnapshot = @import("PaneSnapshot.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const split_layout = @import("split_layout.zig");
 const splits = @import("splits.zig");
@@ -100,12 +107,20 @@ const log = std.log.scoped(.win32);
 
 /// Maximum number of tabs per window.
 pub const MAX_TABS: usize = 64;
+const WM_APP_TAB_DETACH: u32 = w32.WM_APP + 0x68;
+const DetachRequest = struct { tab: gx.ui_ref.Reference, point: w32.POINT };
 
 /// The parent App.
 app: *App,
 ui_reference: gx.ui_ref.Reference = .{},
 ui_attachment: gx.ui_ref.Attachment = .{},
+pending_native_destroy: bool = false,
 tab_references: [MAX_TABS]gx.ui_ref.Reference = @splat(.{}),
+pending_tab_detach: ?DetachRequest = null,
+tab_transfer_active: bool = false,
+tab_transfer_close: bool = false,
+uia_bridge: @import("ui/uia_bridge.zig").WindowBridge = .{},
+uia_dirty: bool = true,
 tab_attachments: [MAX_TABS]gx.ui_ref.Attachment = @splat(.{}),
 
 /// The top-level window handle.
@@ -113,10 +128,11 @@ hwnd: ?w32.HWND = null,
 
 /// Tab split trees owned by this window (fixed-capacity inline array).
 tab_count: usize = 0,
-tab_trees: [MAX_TABS]SplitTree(Surface) = undefined,
+tab_trees: [MAX_TABS]SplitTree(Leaf) = undefined,
 
 /// The currently focused surface within each tab.
-tab_active_surface: [MAX_TABS]*Surface = undefined,
+tab_active_surface: [MAX_TABS]*Leaf = undefined,
+palette: Palette = .{},
 
 /// Index of the currently active (visible) tab.
 active_tab: usize = 0,
@@ -164,20 +180,22 @@ tab_bar: TabBar = .{},
 
 /// Whether this window is a quick terminal (borderless popup, no tabs).
 is_quick_terminal: bool = false,
+/// Source-owned background container, registered separately by RemoteCoordinator.
+is_remote_host: bool = false,
 
 /// Split divider drag state: the tab, the split node and how far from the
 /// divider line the pointer grabbed it. Replacing the tab's split tree ends
 /// the drag (`replaceTree`).
 dragging_split: bool = false,
 drag_split_tab: usize = 0,
-drag_split_handle: SplitTree(Surface).Node.Handle = .root,
-drag_split_layout: SplitTree(Surface).Split.Layout = .horizontal,
+drag_split_handle: SplitTree(Leaf).Node.Handle = .root,
+drag_split_layout: SplitTree(Leaf).Split.Layout = .horizontal,
 drag_grab_offset: i32 = 0,
 
 /// The split of the active tab whose divider is under the pointer, drawn
 /// highlighted (`updateDividerHover`), and whether WM_MOUSELEAVE is
 /// requested for it.
-divider_hover: ?SplitTree(Surface).Node.Handle = null,
+divider_hover: ?SplitTree(Leaf).Node.Handle = null,
 divider_tracking: bool = false,
 
 /// True after the last tab has been closed and WM_CLOSE has been posted.
@@ -276,7 +294,7 @@ layout_key: ?LayoutKey = null,
 layout_passes: usize = 0,
 
 /// The terminal (core surface id) and grid of a size overlay.
-const OverlayGrid = struct { id: u64, columns: u16, rows: u16 };
+const OverlayGrid = PaneSnapshot.Grid;
 
 /// What a layout of the panes depends on, besides split ratios changed in
 /// place (whose callers lay out themselves): the terminal area, the scale,
@@ -286,7 +304,7 @@ const LayoutKey = struct {
     scale: f32,
     tab: usize,
     nodes: usize,
-    zoomed: ?SplitTree(Surface).Node.Handle,
+    zoomed: ?SplitTree(Leaf).Node.Handle,
 };
 
 /// Reasons nobody sees the window's terminals: the renderers stop drawing
@@ -389,6 +407,7 @@ pub fn onConfigChange(self: *Window) void {
 /// The UI language changed: rebuild menus and repaint the chrome and the
 /// popups of every surface.
 pub fn onLanguageChanged(self: *Window) void {
+    self.palette.onLanguageChanged();
     Menu.onLanguageChanged();
     self.title_bar.onLanguageChanged();
     self.tab_bar.onLanguageChanged();
@@ -603,13 +622,21 @@ fn saveWindowState(self: *Window) void {
 /// keep its place for the window state, while it is neither minimized nor
 /// fullscreen: whether it is maximized, and its rectangle when it is not.
 fn trackPlacement(self: *Window) void {
+    self.uia_dirty = true;
+    self.uia_bridge.dirty();
     const hwnd = self.hwnd orelse return;
     if (self.is_quick_terminal or self.title_bar.is_fullscreen or self.closing) return;
     if (w32.IsIconic(hwnd) != 0) return;
-    self.maximized = w32.IsZoomed(hwnd) != 0;
+    const maximized = w32.IsZoomed(hwnd) != 0;
+    if (self.maximized != maximized) self.app.scheduleSessionSave();
+    self.maximized = maximized;
     if (self.maximized) return;
     var rect: w32.RECT = undefined;
-    if (w32.GetWindowRect(hwnd, &rect) != 0) self.normal_rect = rect;
+    if (w32.GetWindowRect(hwnd, &rect) != 0) {
+        const changed = if (self.normal_rect) |old| !std.meta.eql(old, rect) else true;
+        self.normal_rect = rect;
+        if (changed) self.app.scheduleSessionSave();
+    }
 }
 
 /// The rectangle (screen pixels) of a new window: 80% of the work area of
@@ -752,7 +779,15 @@ const DWMWA_CLOAK: u32 = 13;
 /// window goes fullscreen while it is still cloaked (after it is shown, so
 /// leaving fullscreen restores it as shown), and its terminals show at
 /// their final size.
-fn showWhenReady(self: *Window, surface: *Surface) void {
+fn showWhenReady(self: *Window, view: anytype) void {
+    const leaf = leafIdentity(view) orelse return;
+    const surface = leaf.local() orelse {
+        const native = self.hwnd orelse return;
+        self.shown = true;
+        _ = w32.ShowWindow(native, if (self.app.config.maximize or self.start_maximized) SW_SHOWMAXIMIZED else w32.SW_SHOW);
+        self.uncloak(true);
+        return;
+    };
     const hwnd = self.hwnd orelse return;
     self.first_frame_surface = surface;
     self.first_frame_since_ms = GetTickCount64();
@@ -807,7 +842,7 @@ fn uncloak(self: *Window, drawn: bool) void {
     // The layouts before were the window opening: they are the first one
     // `resize-overlay = after-first` leaves out.
     if (self.app.config.@"resize-overlay" != .always) {
-        if (self.getActiveSurface()) |surface| self.resize_overlay.remember(surface);
+        if (self.activePane()) |pane_| self.resize_overlay.rememberPane(pane_);
     }
     self.overlay_grid = self.activeGrid();
     if (self.app.config.@"resize-overlay" == .always and !self.is_quick_terminal) self.showActiveResizeOverlay();
@@ -816,10 +851,8 @@ fn uncloak(self: *Window, drawn: bool) void {
 
 /// The terminal and grid of the active tab's focused terminal.
 fn activeGrid(self: *Window) ?OverlayGrid {
-    const surface = self.getActiveSurface() orelse return null;
-    if (!surface.core_surface_ready) return null;
-    const grid = surface.core_surface.size.grid();
-    return .{ .id = surface.core_surface.id, .columns = grid.columns, .rows = grid.rows };
+    const pane_ = self.activePane() orelse return null;
+    return pane_.grid();
 }
 
 /// A resize: show the size overlay (`ResizeOverlay.show`, which follows
@@ -835,11 +868,34 @@ fn showResizeOverlay(self: *Window) void {
 }
 
 fn showActiveResizeOverlay(self: *Window) void {
-    const surface = self.getActiveSurface() orelse return;
+    const surface = self.activeLeaf() orelse return;
     const tree = &self.tab_trees[self.active_tab];
     const handle = tree.locate(surface) orelse return;
     const area = split_layout.paneRect(Tree, tree, self.splitArea(), self.splitMetrics().gap, handle) orelse return;
-    self.resize_overlay.showIn(surface, .{ .left = area.left, .top = area.top, .right = area.right, .bottom = area.bottom });
+    self.resize_overlay.showPaneIn(surface.pane(), .{ .left = area.left, .top = area.top, .right = area.right, .bottom = area.bottom });
+}
+
+/// Hide the size overlay once the pane it shows is no longer on screen
+/// (`paneOnScreen`): another tab is selected, the pane closed or moved to
+/// another tab or window, or a zoom hides it. A resize of the pane that is
+/// still shown keeps it (`showResizeOverlay`).
+fn dropStaleResizeOverlay(self: *Window) void {
+    const owner = self.resize_overlay.owner() orelse return;
+    if (!self.paneOnScreen(owner.tab, owner.pane)) self.resize_overlay.hide();
+}
+
+/// Whether pane `pane` is on screen as part of tab `tab`: that tab is the
+/// active one, still holds the pane and shows it (no zoom on another pane).
+fn paneOnScreen(self: *const Window, tab: refs.Reference, pane: refs.Reference) bool {
+    if (self.closing or self.active_tab >= self.tab_count) return false;
+    if (!self.tab_references[self.active_tab].matches(tab)) return false;
+    const tree = &self.tab_trees[self.active_tab];
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        if (!entry.view.reference().matches(pane)) continue;
+        return if (tree.zoomed) |zoomed| entry.handle == zoomed else true;
+    }
+    return false;
 }
 
 const SW_SHOWMAXIMIZED: i32 = 3;
@@ -869,6 +925,8 @@ pub fn onFrameChanged(self: *Window) void {
 /// terminals of the active tab about their new content scale; the other
 /// tabs follow when they are selected (`applyScale`).
 fn handleDpiChange(self: *Window, dpi: u32, suggested: *const w32.RECT) void {
+    self.palette.popup.setOwnerScale(@as(f32, @floatFromInt(dpi)) / 96);
+    self.palette.onDpiChanged();
     if (dpi == 0) return;
     const quick = self.quickTerminal();
     if (quick) |qt| if (qt.ignoresDpiChange()) return;
@@ -914,7 +972,7 @@ fn applyScale(self: *Window, tab: usize) void {
     const dpi: u32 = @intFromFloat(@round(self.scale * 96));
     var it = self.tab_trees[tab].iterator();
     while (it.next()) |entry| {
-        if (entry.view.scale != self.scale) entry.view.handleDpiChange(dpi);
+        if (entry.view.scale() != self.scale) entry.view.handleDpiChange(dpi);
     }
 }
 
@@ -942,14 +1000,15 @@ fn simulatedDpiRect(self: *Window, dpi: u32) ?w32.RECT {
 /// maximized, fullscreen and quick terminal windows.
 pub fn resizeForSurface(
     self: *Window,
-    surface: *Surface,
+    surface: anytype,
     size: apprt.action.ResizeWindow,
 ) bool {
     const hwnd = self.hwnd orelse return false;
     const surface_hwnd = surface.hwnd orelse return false;
     if (self.title_bar.is_fullscreen or self.is_quick_terminal) return false;
     if (w32.IsZoomed(hwnd) != 0) return false;
-    const tab = self.findTabIndex(surface) orelse return false;
+    const leaf = self.leafForPane(surface.ui_reference) orelse return false;
+    const tab = self.findTabIndex(leaf) orelse return false;
     if (self.tab_trees[tab].isSplit()) return false;
 
     var surface_rect: w32.RECT = undefined;
@@ -982,6 +1041,8 @@ pub fn resizeForSurface(
 /// When the app quits it deinitializes every window in `app.windows`; the
 /// last of them remembers its place for the next run.
 pub fn deinit(self: *Window) void {
+    self.app.shell.revoke(self.ui_reference);
+    self.uia_bridge.deinit();
     self.ui_reference = .{};
     self.ui_attachment = .{};
     self.visibility.deinit(self.hwnd);
@@ -1004,7 +1065,12 @@ pub fn deinit(self: *Window) void {
     // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
     if (self.hwnd) |hwnd| {
         _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
-        _ = w32.DestroyWindow(hwnd);
+        if (self.hasForeignTerminalWindows()) {
+            // Irrecoverable SetParent rollback: the app is shutting down and
+            // another model still owns these renderers. Keep this inert native
+            // parent until process teardown rather than destroy a live GL HWND.
+            log.err("retaining native transfer parent after failed rollback", .{});
+        } else if (!self.app.deferDropParentDestroy(hwnd)) _ = w32.DestroyWindow(hwnd);
         self.hwnd = null;
     }
 }
@@ -1030,13 +1096,67 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
 /// Returns the currently active Surface, or null if there are no tabs.
 pub fn getActiveSurface(self: *Window) ?*Surface {
     if (self.tab_count == 0) return null;
-    return self.tab_active_surface[self.active_tab];
+    return self.tab_active_surface[self.active_tab].local();
+}
+
+/// Borrowed GUI adapters, valid only until a model mutation or modal call.
+/// Core runtime callbacks retain getActiveSurface; UI consumers migrate here.
+pub fn activePane(self: *const Window) ?Pane {
+    return self.paneAtTab(self.active_tab);
+}
+pub fn paneAtTab(self: *const Window, index: usize) ?Pane {
+    if (self.closing or index >= self.tab_count) return null;
+    return self.tab_active_surface[index].pane();
+}
+pub const PaneIterator = struct {
+    inner: ?SplitTree(Leaf).Iterator = null,
+    pub fn next(self: *PaneIterator) ?Pane {
+        const iterator = if (self.inner) |*value| value else return null;
+        const entry = iterator.next() orelse return null;
+        return entry.view.pane();
+    }
+};
+pub fn paneIterator(self: *const Window, tab: usize) PaneIterator {
+    if (self.closing or tab >= self.tab_count) return .{};
+    return .{ .inner = self.tab_trees[tab].iterator() };
+}
+pub fn lookupPane(self: *const Window, reference: gx.ui_ref.Reference) ?Pane {
+    if (!reference.isValid() or reference.kind != .surface or reference.epoch != self.ui_reference.epoch) return null;
+    for (0..self.tab_count) |tab| {
+        var iterator = self.paneIterator(tab);
+        while (iterator.next()) |candidate| if (reference.matches(candidate.reference())) return candidate;
+    }
+    return null;
+}
+
+test "local pane facade rejects stale references without changing tree ownership" {
+    const alloc = std.testing.allocator;
+    var issuer = try gx.ui_ref.Issuer.init(7);
+    var window: Window = .{ .app = undefined, .ui_reference = try issuer.create(.window), .tab_count = 1 };
+    // A fixture-owned strong ref keeps tree release from invoking native cleanup.
+    var surface: Surface = .{ .app = undefined, .parent_window = &window, .ui_reference = try issuer.surface(42), .ref_count = 1 };
+    const leaf = try Leaf.fromLocal(alloc, &surface);
+    window.tab_trees[0] = try SplitTree(Leaf).init(alloc, leaf);
+    defer window.tab_trees[0].deinit();
+    window.tab_active_surface[0] = surface.leaf.?;
+    try std.testing.expect(window.activePane().?.reference().matches(surface.ui_reference));
+    try std.testing.expect(window.lookupPane(surface.ui_reference) != null);
+    var iterator = window.paneIterator(0);
+    try std.testing.expect(iterator.next().?.reference().matches(surface.ui_reference));
+    try std.testing.expect(iterator.next() == null);
+    try std.testing.expectEqual(@as(u32, 2), surface.ref_count);
+    var stale = surface.ui_reference;
+    stale.generation += 1;
+    try std.testing.expect(window.lookupPane(stale) == null);
+    window.closing = true;
+    try std.testing.expect(window.activePane() == null);
+    try std.testing.expect(window.lookupPane(surface.ui_reference) == null);
 }
 
 /// Give keyboard focus to the active surface of the active tab.
 pub fn focusActiveSurface(self: *Window) void {
-    if (self.getActiveSurface()) |s| {
-        if (s.hwnd) |h| _ = w32.SetFocus(h);
+    if (self.activeLeaf()) |s| {
+        if (s.nativeHandle()) |h| _ = w32.SetFocus(h);
     }
 }
 
@@ -1053,19 +1173,15 @@ fn hasFocus(self: *const Window) bool {
 /// Perform a binding action on behalf of the window's chrome (menus,
 /// buttons): on the active surface, or app-scoped when there is none.
 pub fn performBindingAction(self: *Window, action: @import("../../input.zig").Binding.Action) void {
-    if (self.getActiveSurface()) |surface| {
-        if (surface.core_surface_ready) {
-            _ = surface.core_surface.performBindingAction(action) catch |err| {
-                log.err("binding action failed action={t} err={}", .{ action, err });
-            };
-            return;
-        }
-    }
-    if (action.scoped(.app)) |app_action| {
-        self.app.core_app.performAction(self.app, app_action) catch |err| {
+    if (self.activePane()) |pane| {
+        _ = pane.performBindingAction(action) catch |err| {
             log.err("binding action failed action={t} err={}", .{ action, err });
         };
+        return;
     }
+    if (action.scoped(.app)) |app_action| self.app.core_app.performAction(self.app, app_action) catch |err| {
+        log.err("binding action failed action={t} err={}", .{ action, err });
+    };
 }
 
 /// Open the main menu (`Menu.showMainMenu`) once the current message has
@@ -1199,7 +1315,8 @@ const WINDOWPOS = extern struct {
 };
 
 /// The index of the tab whose split tree holds `surface`.
-pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
+pub fn findTabIndex(self: *Window, view: anytype) ?usize {
+    const surface = leafIdentity(view) orelse return null;
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
@@ -1214,7 +1331,8 @@ pub fn findTabIndex(self: *Window, surface: *Surface) ?usize {
 /// active tab, and show its title on the tab. A zoomed tab moves its zoom
 /// to it or unzooms (`split-preserve-zoom`), so a focused pane is never
 /// hidden. Returns false when no tab of this window holds `surface`.
-pub fn setActiveSurface(self: *Window, surface: *Surface) bool {
+pub fn setActiveSurface(self: *Window, view: anytype) bool {
+    const surface = leafIdentity(view) orelse return false;
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
     const was_zoomed = tree.zoomed != null;
@@ -1222,7 +1340,7 @@ pub fn setActiveSurface(self: *Window, surface: *Surface) bool {
         const handle = tree.locate(surface) orelse return false;
         if (handle != zoomed) {
             tree.zoom(splits.zoomAfterFocus(
-                SplitTree(Surface).Node.Handle,
+                SplitTree(Leaf).Node.Handle,
                 zoomed,
                 handle,
                 self.app.config.@"split-preserve-zoom".navigation,
@@ -1266,12 +1384,14 @@ fn updateDims(self: *Window) void {
 /// Tab `tab` zoomed one of its splits or stopped: its panes dim
 /// differently and the tab bar shows the zoom (`tabStatus`).
 fn onTabZoomChanged(self: *Window, tab: usize) void {
+    if (self.hwnd != null and !self.is_quick_terminal) self.app.scheduleSessionSave();
     self.updateTabDim(tab);
     self.invalidateTabBar();
 }
 
 /// Find the Node.Handle for a surface in a given tab's tree.
-fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surface).Node.Handle {
+fn findHandle(self: *Window, tab_idx: usize, view: anytype) ?SplitTree(Leaf).Node.Handle {
+    const surface = leafIdentity(view) orelse return null;
     var it = self.tab_trees[tab_idx].iterator();
     while (it.next()) |entry| {
         if (entry.view == surface) return entry.handle;
@@ -1283,8 +1403,8 @@ fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surfa
 const TabSlot = struct {
     reference: gx.ui_ref.Reference,
     attachment: gx.ui_ref.Attachment,
-    tree: SplitTree(Surface),
-    active_surface: *Surface,
+    tree: SplitTree(Leaf),
+    active_surface: *Leaf,
     title: [256]u16,
     title_len: u16,
     title_override: ?tabs.Title,
@@ -1360,7 +1480,13 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     };
     // After surface.init succeeds, create the SplitTree which takes ownership
     // via ref(). If this fails, we manually clean up.
-    var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
+    const leaf = Leaf.fromLocal(alloc, surface) catch |err| {
+        surface.deinit();
+        alloc.destroy(surface);
+        return err;
+    };
+    var tree = SplitTree(Leaf).init(alloc, leaf) catch |err| {
+        leaf.discardUnretained(alloc);
         surface.deinit();
         alloc.destroy(surface);
         return err;
@@ -1379,7 +1505,7 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     self.tab_references[pos] = reference;
     self.tab_attachments[pos] = attachment;
     self.tab_trees[pos] = tree;
-    self.tab_active_surface[pos] = surface;
+    self.tab_active_surface[pos] = leaf;
     self.tab_unread[pos] = false;
     self.tab_bell[pos] = false;
     self.tab_activated[pos] = 0;
@@ -1410,6 +1536,7 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     }
     self.updateTabBarVisibility();
     self.updateAppMode();
+    if (!self.is_quick_terminal) self.app.scheduleSessionSave();
     return surface;
 }
 
@@ -1420,13 +1547,13 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
 /// with the default `window-new-tab-position = current`, open next to it.
 pub fn duplicateTab(self: *Window, index: usize) void {
     if (index >= self.tab_count) return;
-    const surface = self.tab_active_surface[index];
+    const surface = self.tab_active_surface[index].local();
     const title_override = self.tab_title_overrides[index];
     self.selectTabIndex(index);
     const duplicate = self.addTabWithOptions(.{
         .context = .tab,
-        .command = if (surface.launch_command) |*command| command else null,
-        .profile_id = if (surface.launch_command != null) surface.launch_origin.profileId() else null,
+        .command = if (surface) |local| if (local.launch_command) |*command| command else null else null,
+        .profile_id = if (surface) |local| if (local.launch_command != null) local.launch_origin.profileId() else null else null,
     }) catch |err| {
         log.err("failed to duplicate the tab err={}", .{err});
         return;
@@ -1437,7 +1564,8 @@ pub fn duplicateTab(self: *Window, index: usize) void {
 
 /// Close a tab by surface pointer. Removes from the tab list,
 /// deinits the tree, and adjusts the active tab index.
-pub fn closeTab(self: *Window, surface: *Surface) void {
+pub fn closeTab(self: *Window, view: anytype) void {
+    const surface = leafIdentity(view) orelse return;
     log.debug("closeTab called for surface={x} tab_count={}", .{ @intFromPtr(surface), self.tab_count });
     const idx = self.findTabIndex(surface) orelse return;
     self.removeTab(idx);
@@ -1486,8 +1614,12 @@ const TabSelection = union(enum) {
 /// The tabs leave the tab model together and the window lays out once
 /// before their terminals stop (`freeTrees`).
 fn closeTabs(self: *Window, selection: TabSelection) void {
-    const hwnd = self.hwnd orelse return;
-    var ids: [MAX_TABS]u64 = undefined;
+    _ = self.closeTabsRequested(selection);
+}
+
+fn closeTabsRequested(self: *Window, selection: TabSelection) bool {
+    const hwnd = self.hwnd orelse return false;
+    var ids: [MAX_TABS]refs.Reference = undefined;
     var count: usize = 0;
     var check: CloseCheck = .init(self.app.core_app.alloc);
     defer check.deinit();
@@ -1496,46 +1628,47 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     defer scope.end();
     for (0..self.tab_count) |i| {
         if (!selection.contains(i)) continue;
-        ids[count] = self.tab_active_surface[i].core_surface.id;
+        ids[count] = self.tab_references[i];
         count += 1;
         check.tab(self, i) catch |err| {
             log.err("cannot prepare the tab close confirmation err={}", .{err});
-            return;
+            return false;
         };
     }
     scope.end();
     check.done();
-    if (count == 0) return;
+    if (count == 0) return false;
     // The tab that stays when the active one closes with others.
     const keep: usize = switch (selection) {
         .one => self.tab_count,
         .all_but, .right_of => |i| i,
     };
-    const keep_id: ?u64 = if (keep < self.tab_count) self.tab_active_surface[keep].core_surface.id else null;
+    const keep_id: ?refs.Reference = if (keep < self.tab_count) self.tab_references[keep] else null;
 
     if (check.needed) {
         const choice = if (count == 1)
             Dialogs.confirmCloseTabWithTitle(hwnd, check.groups.items[0])
         else
             Dialogs.confirmCloseTabsByTab(hwnd, check.groups.items);
-        if (choice != .accept or !isAlive(hwnd, self)) return;
+        if (choice != .accept or !isAlive(hwnd, self)) return false;
     }
 
-    if (self.tab_count == 0) return;
-    if (self.closeQuickSelection(ids[0..count])) return;
+    if (self.tab_count == 0) return false;
+    if (self.requestRemoteSelectionClose(ids[0..count])) return true;
+    if (self.closeQuickSelection(ids[0..count])) return true;
     const focused = self.hasFocus();
-    const active_id = self.tab_active_surface[self.active_tab].core_surface.id;
-    const active_closed = std.mem.indexOfScalar(u64, ids[0..count], active_id) != null;
+    const active_id = self.tab_references[self.active_tab];
+    const active_closed = referenceIndex(ids[0..count], active_id) != null;
     if (active_closed) {
-        const preferred = if (keep_id) |id| self.findTabBySurfaceId(id) else null;
+        const preferred = if (keep_id) |id| self.resolveTab(id) else null;
         if (preferred) |index| {
             self.active_tab = index;
         } else {
             const start = tabs.closeNeighbor(self.active_tab, self.tab_count) orelse self.active_tab;
             for (0..self.tab_count) |offset| {
                 const index = (start + offset) % self.tab_count;
-                const id = self.tab_active_surface[index].core_surface.id;
-                if (std.mem.indexOfScalar(u64, ids[0..count], id) == null) {
+                const id = self.tab_references[index];
+                if (referenceIndex(ids[0..count], id) == null) {
                     self.active_tab = index;
                     break;
                 }
@@ -1548,22 +1681,22 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     var trees: [MAX_TABS]Tree = undefined;
     var detached: usize = 0;
     for (ids[0..count]) |id| {
-        const index = self.findTabBySurfaceId(id) orelse continue;
+        const index = self.resolveTab(id) orelse continue;
         trees[detached] = self.detachTab(index);
         detached += 1;
     }
-    if (detached == 0) return;
+    if (detached == 0) return false;
     if (self.tab_count == 0) {
         self.hide();
-        freeTrees(trees[0..detached]);
+        freeTrees(self.app, trees[0..detached]);
         _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
-        return;
+        return true;
     }
     for (trees[0..detached]) |*tree| {
         var it = tree.iterator();
         while (it.next()) |entry| {
             entry.view.setVisible(false);
-            if (entry.view.hwnd) |child| _ = w32.ShowWindow(child, w32.SW_HIDE);
+            if (entry.view.nativeHandle()) |child| _ = w32.ShowWindow(child, w32.SW_HIDE);
         }
     }
     const visibility_changed = self.tab_bar.updateVisibility();
@@ -1586,13 +1719,13 @@ fn closeTabs(self: *Window, selection: TabSelection) void {
     self.repositionOverlays();
     self.invalidateTabBar();
     self.updateAppMode();
-    freeTrees(trees[0..detached]);
+    freeTrees(self.app, trees[0..detached]);
+    return true;
 }
 
-fn closeQuickSelection(self: *Window, ids: []const u64) bool {
+fn closeQuickSelection(self: *Window, ids: []const refs.Reference) bool {
     if (!self.is_quick_terminal or self.tab_count != 1) return false;
-    const surface = self.tab_active_surface[0];
-    if (!surface.core_surface_initialized or std.mem.indexOfScalar(u64, ids, surface.core_surface.id) == null) return false;
+    if (referenceIndex(ids, self.tab_references[0]) == null) return false;
     self.removeTab(0);
     return true;
 }
@@ -1603,7 +1736,7 @@ pub fn findTabBySurfaceId(self: *Window, id: u64) ?usize {
     for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
-            if (entry.view.core_surface_initialized and entry.view.core_surface.id == id) return i;
+            if (entry.view.local()) |surface| if (surface.core_surface_initialized and surface.core_surface.id == id) return i;
         }
     }
     return null;
@@ -1620,6 +1753,10 @@ fn isAlive(hwnd: w32.HWND, window: *const Window) bool {
 /// The active tab hands over to its neighbor (`tabs.closeNeighbor`)
 /// before it goes; closing another tab leaves the active one as it is.
 fn removeTab(self: *Window, idx: usize) void {
+    if (self.hwnd != null) {
+        self.app.session.markRemoved();
+        self.app.scheduleSessionSave();
+    }
     if (idx >= self.tab_count or self.closing) return;
     if (self.is_quick_terminal and self.tab_count == 1) {
         if (self.app.quick_terminal) |qt| {
@@ -1645,7 +1782,7 @@ fn removeTab(self: *Window, idx: usize) void {
         // The window closes: off the screen before its terminals stop.
         self.hide();
         self.stopAppModeSoon();
-        freeTrees(&tree);
+        freeTrees(self.app, &tree);
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
@@ -1654,7 +1791,7 @@ fn removeTab(self: *Window, idx: usize) void {
     // nothing else repaints it without the removed tab.
     self.invalidateTabBar();
     self.updateAppMode();
-    freeTrees(&tree);
+    freeTrees(self.app, &tree);
 }
 
 /// Take the tab at `idx` out of the tab model, keeping the active tab, and
@@ -1673,7 +1810,7 @@ fn detachTab(self: *Window, idx: usize) Tree {
 /// first, so the terminals go in parallel rather than one after the other,
 /// then each terminal is freed and its window destroyed
 /// (`destroyFreedWindow`).
-fn freeTrees(trees: []Tree) void {
+fn freeTrees(app: *App, trees: []Tree) void {
     for (trees) |*tree| stopTerminalThreads(tree);
     for (trees) |*tree| {
         var windows: [PaneLayout.capacity]w32.HWND = undefined;
@@ -1681,11 +1818,11 @@ fn freeTrees(trees: []Tree) void {
         var it = tree.iterator();
         while (it.next()) |entry| {
             if (count == windows.len) break;
-            windows[count] = entry.view.hwnd orelse continue;
+            windows[count] = entry.view.nativeHandle() orelse continue;
             count += 1;
         }
         tree.deinit(); // Unrefs all surfaces: Surface.unref frees them.
-        for (windows[0..count]) |hwnd| destroyFreedWindow(hwnd);
+        for (windows[0..count]) |hwnd| destroyFreedWindow(app, hwnd);
     }
 }
 
@@ -1695,7 +1832,7 @@ fn freeTrees(trees: []Tree) void {
 fn stopTerminalThreads(tree: *const Tree) void {
     var it = tree.iterator();
     while (it.next()) |entry| {
-        const surface = entry.view;
+        const surface = entry.view.local() orelse continue;
         if (!surface.core_surface_ready or surface.ref_count != 1) continue;
         surface.core_surface.renderer_thread.stop.notify() catch {};
         surface.core_surface.io_thread.stop.notify() catch {};
@@ -1757,7 +1894,7 @@ pub fn closeGroup(self: *Window, index: usize, alloc: Allocator) Allocator.Error
     var it = self.tab_trees[index].iterator();
     while (it.next()) |entry| {
         const surface = entry.view;
-        if (!surface.core_surface_ready or !surface.core_surface.needsConfirmQuit()) continue;
+        if (!surface.needsConfirmQuit()) continue;
         needed = true;
         surface.appendBusyProcesses(alloc, &processes);
     }
@@ -1811,7 +1948,8 @@ fn onCloseTabRequest(self: *Window, wparam: usize, lparam: isize) void {
 /// before it in the tree's order, or after it when it was the first,
 /// takes over (`splits.focusAfterClose`, as in the GTK and macOS apps),
 /// and gets the keyboard focus if the tab is shown and the window has it.
-pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
+pub fn closeSplitSurface(self: *Window, view: anytype) void {
+    const surface = leafIdentity(view) orelse return;
     const alloc = self.app.core_app.alloc;
     const tab = self.findTabIndex(surface) orelse {
         log.debug("closeSplitSurface: surface not found in any tab", .{});
@@ -1832,8 +1970,8 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     log.debug("closeSplitSurface: removing handle={} from tab={}", .{ handle.idx(), tab });
 
     const was_active = self.tab_active_surface[tab] == surface;
-    const next: *Surface = if (!was_active) self.tab_active_surface[tab] else next: {
-        const next_handle = splits.focusAfterClose(SplitTree(Surface), alloc, tree, handle) orelse {
+    const next: *Leaf = if (!was_active) self.tab_active_surface[tab] else next: {
+        const next_handle = splits.focusAfterClose(SplitTree(Leaf), alloc, tree, handle) orelse {
             self.removeTab(tab);
             return;
         };
@@ -1849,17 +1987,17 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
 
     // Before the closing terminal hides: its focus goes to this window,
     // which passes it to the active surface.
-    const closed_hwnd = surface.hwnd;
+    const closed_hwnd = surface.nativeHandle();
     self.tab_active_surface[tab] = next;
     self.replaceTree(tab, new_tree);
-    destroyFreedWindow(closed_hwnd);
+    destroyFreedWindow(self.app, closed_hwnd);
     self.refreshTabTitle(tab);
     self.updateTabDim(tab);
     if (was_zoomed != (self.tab_trees[tab].zoomed != null)) self.invalidateTabBar();
     if (tab == self.active_tab) {
         self.layoutSplits();
         if (focused) {
-            if (next.hwnd) |h| _ = w32.SetFocus(h);
+            if (next.nativeHandle()) |h| _ = w32.SetFocus(h);
         }
     }
     self.updateAppMode();
@@ -1870,9 +2008,10 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
 /// GWLP_USERDATA), its renderer and GL context are gone, and otherwise the
 /// hidden window and its private DC would stay until the top-level window
 /// closes. A terminal still alive (another tree holds it) keeps its window.
-fn destroyFreedWindow(hwnd: ?w32.HWND) void {
+fn destroyFreedWindow(app: *App, hwnd: ?w32.HWND) void {
     const h = hwnd orelse return;
     if (w32.IsWindow(h) == 0 or w32.GetWindowLongPtrW(h, w32.GWLP_USERDATA) != 0) return;
+    if (app.deferDropWindowDestroy(h)) return;
     _ = w32.DestroyWindow(h);
 }
 
@@ -1906,6 +2045,7 @@ fn setOcclusion(self: *Window, comptime reason: []const u8, occluded: bool) void
     if (@field(self.occlusion, reason) == occluded) return;
     @field(self.occlusion, reason) = occluded;
     const seen = self.terminalsSeen();
+    self.setViewVisible(seen);
     self.setActiveTabVisible(seen);
     if (self.hwnd) |hwnd| {
         if (seen and !self.is_quick_terminal) {
@@ -1918,12 +2058,27 @@ fn setOcclusion(self: *Window, comptime reason: []const u8, occluded: bool) void
     }
 }
 
+/// Revoke root/tab view providers while occluded without losing object IDs.
+/// Showing the window again publishes new revisions for the same live objects.
+fn setViewVisible(self: *Window, visible: bool) void {
+    self.uia_dirty = true;
+    if (!visible) self.uia_bridge.hide();
+    self.ui_attachment.setVisible(&self.app.ui_ids, self.ui_reference, self.ui_reference, visible) catch |err| {
+        log.warn("cannot publish window view err={}", .{err});
+    };
+    for (self.tab_references[0..self.tab_count], self.tab_attachments[0..self.tab_count]) |reference, *attachment| {
+        attachment.setVisible(&self.app.ui_ids, reference, self.ui_reference, visible) catch |err| {
+            log.warn("cannot publish tab view err={}", .{err});
+        };
+    }
+}
+
 /// Hide the panes of tab `tab`, which is no longer shown.
 fn hideTabPanes(self: *Window, tab: usize) void {
     var it = self.tab_trees[tab].iterator();
     while (it.next()) |entry| {
         entry.view.setVisible(false);
-        if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+        if (entry.view.nativeHandle()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
     }
     self.tab_bar.onTabHidden(tab);
 }
@@ -1941,6 +2096,7 @@ pub fn refreshRenderers(self: *Window) void {
 /// popups of the other tabs are hidden; they move when their tab is
 /// selected (`selectTabIndex`).
 fn repositionPopups(self: *Window) void {
+    if (self.palette.active) self.palette.reposition();
     if (self.quickTerminal()) |qt| if (qt.animating or !qt.visible) return;
     if (self.tab_count > 0) self.repositionTabPopups(self.active_tab);
     self.shortcut_notice.reposition();
@@ -1957,6 +2113,7 @@ fn repositionTabPopups(self: *Window, tab: usize) void {
 /// panes of the previous tab, so the focus never passes through a hidden
 /// pane. Selecting the active tab again only gives its terminal the focus.
 pub fn selectTabIndex(self: *Window, idx: usize) void {
+    if (self.hwnd != null and !self.is_quick_terminal) self.app.scheduleSessionSave();
     if (idx >= self.tab_count) return;
     self.tab_bar.cancelRename();
     // Clear any in-progress tab drag
@@ -2007,7 +2164,7 @@ pub fn tabStatus(self: *const Window, i: usize) tab_status.TabStatus {
     const now = GetTickCount64();
     var progress: tab_status.Progress = .none;
     var it = self.tab_trees[i].iterator();
-    while (it.next()) |entry| progress = tab_status.merge(progress, entry.view.progress, now);
+    while (it.next()) |entry| progress = tab_status.merge(progress, entry.view.progress(), now);
     return .{
         .unread = self.tab_unread[i],
         .bell = self.tab_bell[i],
@@ -2041,7 +2198,8 @@ pub fn setSurfaceProgress(self: *Window, surface: *Surface, report: apprt.Action
 /// The terminal `surface` rang the bell: mark its tab (`tabStatus`) until
 /// the tab is selected, unless it is the active tab, and repaint the tab
 /// bar. GUI thread.
-pub fn ringTab(self: *Window, surface: *Surface) void {
+pub fn ringTab(self: *Window, view: anytype) void {
+    const surface = leafIdentity(view) orelse return;
     const tab = self.findTabIndex(surface) orelse return;
     if (tab == self.active_tab or self.tab_bell[tab]) return;
     self.tab_bell[tab] = true;
@@ -2052,8 +2210,10 @@ pub fn ringTab(self: *Window, surface: *Surface) void {
 /// tab shows only its zoomed pane. The panes move in one DeferWindowPos
 /// batch, so they resize together instead of one after the other; during a
 /// live resize the window then waits once for all of them to present a
-/// frame at the new size.
+/// frame at the new size. A size overlay whose pane left the screen goes
+/// first (`dropStaleResizeOverlay`).
 pub fn layoutSplits(self: *Window) void {
+    self.dropStaleResizeOverlay();
     if (self.tab_count == 0) return;
     self.layout_passes +|= 1;
     const tree = &self.tab_trees[self.active_tab];
@@ -2065,7 +2225,7 @@ pub fn layoutSplits(self: *Window) void {
         while (it.next()) |entry| {
             if (panes.holds(entry.view)) continue;
             entry.view.setVisible(false);
-            if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+            if (entry.view.nativeHandle()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
         }
     }
 
@@ -2084,7 +2244,7 @@ pub fn layoutSplits(self: *Window) void {
 }
 
 /// The split tree of a tab.
-const Tree = SplitTree(Surface);
+const Tree = SplitTree(Leaf);
 
 fn layoutKey(self: *const Window) LayoutKey {
     const tree = &self.tab_trees[self.active_tab];
@@ -2101,6 +2261,9 @@ fn layoutKey(self: *const Window) LayoutKey {
 /// holds (a WM_SIZE on the way here did it); repaint the split gaps either
 /// way, for a new background or divider color.
 fn relayout(self: *Window) void {
+    self.uia_dirty = true;
+    self.uia_bridge.dirty();
+    self.dropStaleResizeOverlay();
     if (self.tab_count == 0) return;
     if (self.layout_key) |key| if (std.meta.eql(key, self.layoutKey())) return self.repaintSplitGaps();
     self.layoutSplits();
@@ -2127,9 +2290,9 @@ fn dividerReach(self: *const Window) i32 {
 
 /// The visible panes of one layout pass and where they go.
 const PaneLayout = struct {
-    const capacity = 64;
+    const capacity = protocol.max_leaves;
 
-    surfaces: [capacity]*Surface = undefined,
+    surfaces: [capacity]*Leaf = undefined,
     rects: [capacity]w32.RECT = undefined,
     len: usize = 0,
     /// What the panes tell their renderers (`Surface.setVisible`): false
@@ -2137,16 +2300,16 @@ const PaneLayout = struct {
     visible: bool = true,
 
     /// `split_layout.walk` visitor.
-    pub fn pane(self: *PaneLayout, _: Tree.Node.Handle, surface: *Surface, rect: split_layout.Rect) void {
+    pub fn pane(self: *PaneLayout, _: Tree.Node.Handle, surface: *Leaf, rect: split_layout.Rect) void {
         self.add(surface, @bitCast(rect));
     }
 
     /// Whether the pass shows `surface`, for a zoomed tab (one pane).
-    fn holds(self: *const PaneLayout, surface: *Surface) bool {
-        return std.mem.indexOfScalar(*Surface, self.surfaces[0..self.len], surface) != null;
+    fn holds(self: *const PaneLayout, surface: *Leaf) bool {
+        return std.mem.indexOfScalar(*Leaf, self.surfaces[0..self.len], surface) != null;
     }
 
-    fn add(self: *PaneLayout, surface: *Surface, rect: w32.RECT) void {
+    fn add(self: *PaneLayout, surface: *Leaf, rect: w32.RECT) void {
         if (self.len == capacity) {
             surface.setVisible(self.visible);
             place(surface, rect);
@@ -2172,7 +2335,7 @@ const PaneLayout = struct {
         batch: {
             var hdwp = w32.BeginDeferWindowPos(@intCast(self.len)) orelse break :batch;
             for (surfaces, rects) |surface, rect| {
-                const hwnd = surface.hwnd orelse continue;
+                const hwnd = surface.nativeHandle() orelse continue;
                 // A failed DeferWindowPos abandons the whole batch.
                 hdwp = w32.DeferWindowPos(hdwp, hwnd, null, rect.left, rect.top, width(rect), height(rect), flags) orelse
                     break :batch;
@@ -2182,8 +2345,8 @@ const PaneLayout = struct {
         for (surfaces, rects) |surface, rect| place(surface, rect);
     }
 
-    fn place(surface: *Surface, rect: w32.RECT) void {
-        const hwnd = surface.hwnd orelse return;
+    fn place(surface: *Leaf, rect: w32.RECT) void {
+        const hwnd = surface.nativeHandle() orelse return;
         _ = w32.SetWindowPos(hwnd, null, rect.left, rect.top, width(rect), height(rect), flags);
     }
 
@@ -2199,7 +2362,13 @@ const PaneLayout = struct {
     /// presented a frame at its new size, so DWM does not stretch stale
     /// frames. The renderers draw in parallel.
     fn awaitResizeFrames(self: *const PaneLayout) void {
-        _ = Surface.awaitResizeFrames(self.surfaces[0..self.len]);
+        var locals: [capacity]*Surface = undefined;
+        var count: usize = 0;
+        for (self.surfaces[0..self.len]) |leaf| if (leaf.local()) |surface| {
+            locals[count] = surface;
+            count += 1;
+        };
+        _ = Surface.awaitResizeFrames(locals[0..count]);
     }
 };
 
@@ -2372,7 +2541,7 @@ fn startDividerDrag(self: *Window, hit: Divider, grab: i32) void {
 fn setPanesLiveResize(self: *Window, tab: usize, live: bool) void {
     if (tab >= self.tab_count) return;
     var it = self.tab_trees[tab].iterator();
-    while (it.next()) |entry| entry.view.in_live_resize = live;
+    while (it.next()) |entry| entry.view.setLiveResize(live);
 }
 
 /// Move the dragged divider to follow the pointer at (x, y): the ratio of
@@ -2422,7 +2591,8 @@ fn cancelDividerDrag(self: *Window) void {
 /// Replace the split tree of tab `tab` and free the old one. A divider
 /// drag in that tab ends and its divider is no longer hovered: their nodes
 /// belong to the old tree.
-fn replaceTree(self: *Window, tab: usize, tree: SplitTree(Surface)) void {
+fn replaceTree(self: *Window, tab: usize, tree: SplitTree(Leaf)) void {
+    if (!self.is_quick_terminal) self.app.scheduleSessionSave();
     if (self.drag_split_tab == tab) self.cancelDividerDrag();
     if (tab == self.active_tab) self.divider_hover = null;
     var old = self.tab_trees[tab];
@@ -2433,7 +2603,7 @@ fn replaceTree(self: *Window, tab: usize, tree: SplitTree(Surface)) void {
 /// Create a new split in the active tab. The new terminal starts in the
 /// half of the focused pane it takes (`split_layout.insertRect`), so its pty
 /// starts at its final size rather than the size of the whole tab.
-pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !void {
+pub fn newSplit(self: *Window, direction: SplitTree(Leaf).Split.Direction) !void {
     if (self.tab_count == 0) return;
     const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
@@ -2457,18 +2627,25 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
         const new_hwnd = new_surface.hwnd;
         new_surface.deinit();
         alloc.destroy(new_surface);
-        destroyFreedWindow(new_hwnd);
+        destroyFreedWindow(self.app, new_hwnd);
         return err;
     };
     const new_hwnd = new_surface.hwnd;
-    var insert_tree = SplitTree(Surface).init(alloc, new_surface) catch |err| {
+    const new_leaf = Leaf.fromLocal(alloc, new_surface) catch |err| {
         new_surface.deinit();
         alloc.destroy(new_surface);
-        destroyFreedWindow(new_hwnd);
+        destroyFreedWindow(self.app, new_hwnd);
+        return err;
+    };
+    var insert_tree = SplitTree(Leaf).init(alloc, new_leaf) catch |err| {
+        new_leaf.discardUnretained(alloc);
+        new_surface.deinit();
+        alloc.destroy(new_surface);
+        destroyFreedWindow(self.app, new_hwnd);
         return err;
     };
     // On an error the terminal is freed with `insert_tree`, then its window.
-    errdefer destroyFreedWindow(new_hwnd);
+    errdefer destroyFreedWindow(self.app, new_hwnd);
     defer insert_tree.deinit();
 
     // Split the current tree at the active surface.
@@ -2481,7 +2658,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
     );
 
     // Focus the new surface.
-    self.tab_active_surface[tab] = new_surface;
+    self.tab_active_surface[tab] = new_leaf;
     self.replaceTree(tab, new_tree);
     self.refreshTabTitle(tab);
     self.updateTabDim(tab);
@@ -2498,13 +2675,14 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
 /// terminal. A zoomed tab moves its zoom to the newly focused split with
 /// `split-preserve-zoom = navigation` and unzooms otherwise, so the focus
 /// never lands on a hidden split.
-pub fn gotoSplit(self: *Window, surface: *Surface, goto_target: apprt.action.GotoSplit) bool {
+pub fn gotoSplit(self: *Window, view: anytype, goto_target: apprt.action.GotoSplit) bool {
+    const surface = leafIdentity(view) orelse return false;
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
     if (!tree.isSplit()) return false;
     const from = tree.locate(self.tab_active_surface[tab]) orelse return false;
 
-    const target: SplitTree(Surface).Goto = switch (goto_target) {
+    const target: SplitTree(Leaf).Goto = switch (goto_target) {
         .previous => .previous_wrapped,
         .next => .next_wrapped,
         .up => .{ .spatial = .up },
@@ -2515,13 +2693,13 @@ pub fn gotoSplit(self: *Window, surface: *Surface, goto_target: apprt.action.Got
     const dest = (tree.goto(self.app.core_app.alloc, from, target) catch return false) orelse return false;
     if (dest == from) return false;
     const next = switch (tree.nodes[dest.idx()]) {
-        .leaf => |view| view,
+        .leaf => |candidate| candidate,
         .split => return false,
     };
 
     const zoomed = tree.zoomed != null;
     if (zoomed) tree.zoom(splits.zoomAfterFocus(
-        SplitTree(Surface).Node.Handle,
+        SplitTree(Leaf).Node.Handle,
         tree.zoomed,
         dest,
         self.app.config.@"split-preserve-zoom".navigation,
@@ -2532,7 +2710,7 @@ pub fn gotoSplit(self: *Window, surface: *Surface, goto_target: apprt.action.Got
     if (zoomed and tree.zoomed == null) self.invalidateTabBar();
     if (tab == self.active_tab) {
         if (zoomed) self.layoutSplits();
-        if (next.hwnd) |h| _ = w32.SetFocus(h);
+        if (next.nativeHandle()) |h| _ = w32.SetFocus(h);
     }
     return true;
 }
@@ -2541,13 +2719,14 @@ pub fn gotoSplit(self: *Window, surface: *Surface, goto_target: apprt.action.Got
 /// in the given direction by the given pixel amount (`resize_split`).
 /// Returns false, letting the key reach the terminal, when the tab has no
 /// splits.
-pub fn resizeSplit(self: *Window, surface: *Surface, rs: apprt.action.ResizeSplit) bool {
+pub fn resizeSplit(self: *Window, view: anytype, rs: apprt.action.ResizeSplit) bool {
+    const surface = leafIdentity(view) orelse return false;
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
     if (!tree.isSplit() or rs.amount == 0) return false;
     const handle = tree.locate(self.tab_active_surface[tab]) orelse return false;
 
-    const layout: SplitTree(Surface).Split.Layout = switch (rs.direction) {
+    const layout: SplitTree(Leaf).Split.Layout = switch (rs.direction) {
         .left, .right => .horizontal,
         .up, .down => .vertical,
     };
@@ -2573,7 +2752,8 @@ pub fn resizeSplit(self: *Window, surface: *Surface, rs: apprt.action.ResizeSpli
 
 /// Equalize all splits in the tab of `surface` (`equalize_splits`).
 /// Returns false when the tab has no splits.
-pub fn equalizeSplits(self: *Window, surface: *Surface) bool {
+pub fn equalizeSplits(self: *Window, view: anytype) bool {
+    const surface = leafIdentity(view) orelse return false;
     const tab = self.findTabIndex(surface) orelse return false;
     if (!self.tab_trees[tab].isSplit()) return false;
     const new_tree = self.tab_trees[tab].equalize(self.app.core_app.alloc) catch return false;
@@ -2584,7 +2764,8 @@ pub fn equalizeSplits(self: *Window, surface: *Surface) bool {
 
 /// Toggle the zoom of the focused split in the tab of `surface`
 /// (`toggle_split_zoom`). Returns false when the tab has no splits.
-pub fn toggleSplitZoom(self: *Window, surface: *Surface) bool {
+pub fn toggleSplitZoom(self: *Window, view: anytype) bool {
+    const surface = leafIdentity(view) orelse return false;
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
     if (!tree.isSplit()) return false;
@@ -2619,14 +2800,16 @@ pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
 /// Move the tab of `surface` by a relative offset, wrapping cyclically
 /// (`move_tab`). Returns false when it stays where it is (a single tab),
 /// so that the key reaches the terminal.
-pub fn moveTab(self: *Window, surface: *Surface, amount: isize) bool {
+pub fn moveTab(self: *Window, view: anytype, amount: isize) bool {
+    const surface = leafIdentity(view) orelse return false;
     const from = self.findTabIndex(surface) orelse return false;
     const to = tabs.moveIndex(from, self.tab_count, amount) orelse return false;
     self.moveTabTo(from, to);
     return true;
 }
 
-pub fn moveSplitToTab(self: *Window, surface: *Surface) !bool {
+pub fn moveSplitToTab(self: *Window, view: anytype) !bool {
+    const surface = leafIdentity(view) orelse return false;
     if (self.closing or self.is_quick_terminal or self.tab_count >= MAX_TABS) return false;
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
@@ -2664,7 +2847,8 @@ pub fn moveSplitToTab(self: *Window, surface: *Surface) !bool {
     return true;
 }
 
-pub fn moveSplitToNewWindow(self: *Window, surface: *Surface) !bool {
+pub fn moveSplitToNewWindow(self: *Window, view: anytype) !bool {
+    const surface = leafIdentity(view) orelse return false;
     if (self.closing or self.is_quick_terminal) return false;
     const tab = self.findTabIndex(surface) orelse return false;
     const tree = &self.tab_trees[tab];
@@ -2679,7 +2863,7 @@ pub fn moveSplitToNewWindow(self: *Window, surface: *Surface) !bool {
     errdefer self.discardMoveWindow(destination);
     const attachment = try self.app.ui_ids.attach(reference, destination.ui_reference);
     const surface_attachment = try surface.prepareReparent(destination);
-    const child = surface.hwnd orelse return error.Win32Error;
+    const child = surface.nativeHandle() orelse return error.Win32Error;
     const parent = destination.hwnd orelse return error.Win32Error;
     self.cancelDividerDrag();
     if (w32.SetParent(child, parent) == null) return error.Win32Error;
@@ -2714,7 +2898,7 @@ pub fn moveSplitToNewWindow(self: *Window, surface: *Surface) !bool {
     return true;
 }
 
-fn focusAfterMove(self: *Window, tab: usize, handle: Tree.Node.Handle) *Surface {
+fn focusAfterMove(self: *Window, tab: usize, handle: Tree.Node.Handle) *Leaf {
     const tree = &self.tab_trees[tab];
     const surface = tree.nodes[handle.idx()].leaf;
     if (self.tab_active_surface[tab] != surface) return self.tab_active_surface[tab];
@@ -2722,7 +2906,7 @@ fn focusAfterMove(self: *Window, tab: usize, handle: Tree.Node.Handle) *Surface 
     return tree.nodes[next.idx()].leaf;
 }
 
-fn finishSplitMove(self: *Window, tab: usize, next: *Surface, tree: Tree) void {
+fn finishSplitMove(self: *Window, tab: usize, next: *Leaf, tree: Tree) void {
     self.tab_bar.cancelRename();
     self.tab_bar.cancelDrag();
     self.cancelDividerDrag();
@@ -2739,6 +2923,76 @@ fn insertMovedSlot(self: *Window, pos: usize, slot: TabSlot) void {
     self.setSlot(pos, slot);
     if (self.tab_count > 0 and self.active_tab >= pos) self.active_tab += 1;
     self.tab_count += 1;
+}
+
+/// Consume a prepared restore tree only after identity reservation succeeds.
+/// Staged windows stay hidden until the complete session has been constructed.
+pub fn adoptSessionTab(self: *Window, tree: *Tree, focused: *Leaf, title: ?tabs.Title) !usize {
+    if (self.closing or self.is_quick_terminal or self.tab_count >= MAX_TABS) return error.InvalidOwner;
+    if (tree.locate(focused) == null) return error.InvalidSurface;
+    const reference = try self.app.ui_ids.create(.tab);
+    const attachment = try self.app.ui_ids.attach(reference, self.ui_reference);
+    const index = self.tab_count;
+    self.insertMovedSlot(index, .{
+        .reference = reference,
+        .attachment = attachment,
+        .tree = tree.*,
+        .active_surface = focused,
+        .title = @splat(0),
+        .title_len = 0,
+        .title_override = title,
+        .unread = false,
+        .bell = false,
+        .activated = 0,
+    });
+    tree.* = .empty;
+    self.refreshTabTitle(index);
+    self.updateTabDim(index);
+    return index;
+}
+
+pub fn revealSession(self: *Window, active: usize, geometry: ?gx.session.Geometry) !void {
+    if (self.closing or self.tab_count == 0) return error.InvalidOwner;
+    const hwnd = self.hwnd orelse return error.InvalidOwner;
+    if (geometry) |saved| if (self.app.config.@"window-save-state" != .never) {
+        var current: w32.RECT = undefined;
+        if (w32.GetWindowRect(hwnd, &current) == 0) return error.Win32Error;
+        const hint: w32.RECT = .{ .left = saved.x orelse current.left, .top = saved.y orelse current.top, .right = (saved.x orelse current.left) +| @as(i32, @intCast(saved.width)), .bottom = (saved.y orelse current.top) +| @as(i32, @intCast(saved.height)) };
+        const monitor = MonitorFromRect(&hint, MONITOR_DEFAULTTONEAREST) orelse return error.Win32Error;
+        var info: w32.MONITORINFO = .{ .cbSize = @sizeOf(w32.MONITORINFO), .rcMonitor = undefined, .rcWork = undefined, .dwFlags = 0 };
+        if (w32.GetMonitorInfoW(monitor, &info) == 0) return error.Win32Error;
+        const ws = gx.window_state;
+        const scaled = ws.rescale(.{ .x = hint.left, .y = hint.top, .width = @intCast(saved.width), .height = @intCast(saved.height) }, saved.dpi, monitorDpi(monitor));
+        const cfg = &self.app.config;
+        const placed = ws.fit(.{
+            .x = if (cfg.@"window-position-x" == null) scaled.x else current.left,
+            .y = if (cfg.@"window-position-y" == null) scaled.y else current.top,
+            .width = if (cfg.@"window-width" == 0) scaled.width else current.right - current.left,
+            .height = if (cfg.@"window-height" == 0) scaled.height else current.bottom - current.top,
+        }, .{ .x = info.rcWork.left, .y = info.rcWork.top, .width = info.rcWork.right - info.rcWork.left, .height = info.rcWork.bottom - info.rcWork.top });
+        _ = w32.SetWindowPos(hwnd, null, placed.x, placed.y, placed.width, placed.height, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+        self.start_maximized = saved.maximized and ws.use(cfg).maximized;
+        for (cfg._replay_steps.items) |step| switch (step) {
+            .@"-e" => break,
+            .arg => |arg| {
+                const name = std.mem.trimStart(u8, arg, "-");
+                if (std.mem.startsWith(u8, name, "maximize=") or std.mem.startsWith(u8, name, "fullscreen=")) self.start_maximized = false;
+            },
+            else => {},
+        };
+    };
+    self.active_tab = @min(active, self.tab_count - 1);
+    for (0..self.tab_count) |index| if (index != self.active_tab) {
+        self.hideTabPanes(index);
+    };
+    self.noteTabActivated(self.active_tab);
+    self.applyScale(self.active_tab);
+    self.tab_bar.onTabShown(self.active_tab);
+    self.updateTabBarVisibility();
+    self.updateWindowTitle();
+    self.relayout();
+    self.showWhenReady(self.tab_active_surface[self.active_tab]);
+    self.focusActiveSurface();
 }
 
 fn createMoveWindow(self: *Window) !*Window {
@@ -2764,110 +3018,199 @@ fn discardMoveWindow(self: *Window, destination: *Window) void {
 
 /// Move the tab containing `surface`, including all of its splits, into a new
 /// native window without restarting any child processes.
-pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
-    if (self.is_quick_terminal or self.tab_count <= 1) return false;
-    const tab_idx = self.findTabIndex(surface) orelse return false;
-
-    const alloc = self.app.core_app.alloc;
-    const destination = try alloc.create(Window);
-    destination.init(self.app, .{}) catch |err| {
-        alloc.destroy(destination);
-        return err;
-    };
-    errdefer {
-        destination.deinit();
-        alloc.destroy(destination);
+pub fn queueTabDetach(self: *Window, tab: gx.ui_ref.Reference, point: w32.POINT) bool {
+    if (self.closing or self.is_quick_terminal or self.tab_transfer_active or self.pending_tab_detach != null) return false;
+    _ = self.resolveTab(tab) orelse return false;
+    const hwnd = self.hwnd orelse return false;
+    self.pending_tab_detach = .{ .tab = tab, .point = point };
+    if (w32.PostMessageW(hwnd, WM_APP_TAB_DETACH, 0, 0) == 0) {
+        self.pending_tab_detach = null;
+        return false;
     }
+    return true;
+}
 
-    try self.app.windows.append(alloc, destination);
-    var tracked = true;
-    errdefer if (tracked) {
-        for (self.app.windows.items, 0..) |window, i| {
-            if (window == destination) {
-                _ = self.app.windows.orderedRemove(i);
-                break;
-            }
-        }
+pub fn moveTabToNewWindow(self: *Window, view: anytype) !bool {
+    const surface = leafIdentity(view) orelse return false;
+    if (self.closing or self.is_quick_terminal or self.tab_count <= 1) return false;
+    const index = self.findTabIndex(surface) orelse return false;
+    _ = try self.detachTabForDrag(self.tab_references[index]);
+    return true;
+}
+
+/// Creates a genuinely empty container, then transfers the existing complete tab.
+pub fn detachTabForDrag(self: *Window, reference: gx.ui_ref.Reference) !gx.ui_ref.Reference {
+    if (self.closing or self.is_quick_terminal or self.tab_transfer_active) return error.InvalidOwner;
+    _ = self.resolveTab(reference) orelse return error.InvalidTab;
+    const app = self.app;
+    const source_reference = self.ui_reference;
+    const destination = try self.createMoveWindow();
+    const destination_reference = destination.ui_reference;
+    var discard = true;
+    errdefer if (discard) {
+        if (app.resolveWindow(destination_reference)) |live| live.requestClose();
     };
+    const source = app.resolveWindow(source_reference) orelse return error.InvalidOwner;
+    if (!(source.moveTabToWindow(reference, destination_reference, 0) catch |err| {
+        // Never destroy a parent that still holds a running HWND after a
+        // failed OS rollback. Keep both owners for diagnosis/recovery.
+        if (err == error.RollbackFailed) discard = false;
+        return err;
+    })) return error.InvalidOwner;
+    return destination_reference;
+}
 
-    const destination_hwnd = destination.hwnd orelse return error.Win32Error;
-    var moved_tree = self.tab_trees[tab_idx];
-    const attachment = try self.app.ui_ids.attach(self.tab_references[tab_idx], destination.ui_reference);
-    const MoveView = struct { surface: *Surface, attachment: gx.ui_ref.Attachment };
-    var views: std.ArrayList(MoveView) = .empty;
-    defer views.deinit(alloc);
-    var it = moved_tree.iterator();
-    while (it.next()) |entry| try views.append(alloc, .{
-        .surface = entry.view,
+/// Move a complete owned slot, preserving its tree, zoom, active pane and
+/// manual title. All allocations/identity reservations precede native changes.
+pub fn moveTabToWindow(self: *Window, reference: gx.ui_ref.Reference, destination_reference: gx.ui_ref.Reference, position: usize) !bool {
+    const app = self.app;
+    const destination = app.resolveWindow(destination_reference) orelse return false;
+    if (self == destination or self.closing or self.is_quick_terminal or destination.is_quick_terminal or
+        self.tab_transfer_active or destination.tab_transfer_active or destination.tab_count >= MAX_TABS) return false;
+    const index = self.resolveTab(reference) orelse return false;
+    const source_reference = self.ui_reference;
+    const source_hwnd = self.hwnd orelse return false;
+    const destination_hwnd = destination.hwnd orelse return false;
+    const source_count = self.tab_count;
+    const destination_count = destination.tab_count;
+    const source_nodes = self.tab_trees[index].nodes.ptr;
+    const slot_attachment = try app.ui_ids.attach(reference, destination_reference);
+    const View = struct { reference: gx.ui_ref.Reference, child: w32.HWND, attachment: gx.ui_ref.Attachment };
+    var views: std.ArrayList(View) = .empty;
+    defer views.deinit(app.core_app.alloc);
+    // A nested model removal cannot free a terminal while SetParent is active.
+    var retained = try self.tab_trees[index].clone(app.core_app.alloc);
+    defer retained.deinit();
+    var it = retained.iterator();
+    while (it.next()) |entry| try views.append(app.core_app.alloc, .{
+        .reference = entry.view.reference(),
+        .child = entry.view.nativeHandle() orelse return error.InvalidSurface,
         .attachment = try entry.view.prepareReparent(destination),
     });
-
-    // Reparent every child HWND first so a failure can be rolled back before
-    // either window's tab arrays are mutated.
-    it = moved_tree.iterator();
-    while (it.next()) |entry| {
-        const child = entry.view.hwnd orelse continue;
-        if (w32.SetParent(child, destination_hwnd) == null) {
-            if (self.hwnd) |source_hwnd| {
-                var rollback = moved_tree.iterator();
-                while (rollback.next()) |rollback_entry| {
-                    if (rollback_entry.view.hwnd) |h| _ = w32.SetParent(h, source_hwnd);
-                }
-            }
-            return error.Win32Error;
-        }
-    }
-
+    self.tab_transfer_active = true;
+    destination.tab_transfer_active = true;
+    defer endTabTransfer(app, source_reference);
+    defer endTabTransfer(app, destination_reference);
     self.tab_bar.cancelRename();
     self.tab_bar.cancelDrag();
     self.cancelDividerDrag();
-    // The slot carries the title override along.
-    var moved = self.getSlot(tab_idx);
-    moved.attachment = attachment;
-    moved.unread = false;
-    moved.bell = false;
-    const moved_active = moved.active_surface;
-    const next_active = tabs.activeAfterClose(self.active_tab, tab_idx, self.tab_count).?;
-    const was_active = tab_idx == self.active_tab;
-
-    var i = tab_idx;
-    while (i + 1 < self.tab_count) : (i += 1) self.copySlot(i, i + 1);
-    self.tab_count -= 1;
-    self.active_tab = next_active;
-
-    destination.setSlot(0, moved);
-    destination.tab_count = 1;
-    destination.active_tab = 0;
-    destination.noteTabActivated(0);
-
-    for (views.items) |view| view.surface.onReparented(destination, view.attachment);
-    destination.applyScale(0);
-    destination.updateTabDim(0);
-    destination.tab_bar.onTabShown(0);
-
-    if (was_active) {
-        self.tab_unread[self.active_tab] = false;
-        self.tab_bell[self.active_tab] = false;
-        self.noteTabActivated(self.active_tab);
-        self.applyScale(self.active_tab);
-        self.tab_bar.onTabShown(self.active_tab);
-        self.updateWindowTitle();
+    destination.tab_bar.cancelRename();
+    destination.tab_bar.cancelDrag();
+    destination.cancelDividerDrag();
+    self.uia_bridge.hide();
+    destination.uia_bridge.hide();
+    const Backend = struct {
+        app: *App,
+        source: gx.ui_ref.Reference,
+        destination: gx.ui_ref.Reference,
+        tab: gx.ui_ref.Reference,
+        source_hwnd: w32.HWND,
+        destination_hwnd: w32.HWND,
+        source_count: usize,
+        destination_count: usize,
+        source_nodes: [*]const Tree.Node,
+        views: []const View,
+        pub fn validate(b: *@This()) !void {
+            const from = b.app.resolveWindow(b.source) orelse return error.StaleSource;
+            const to = b.app.resolveWindow(b.destination) orelse return error.StaleDestination;
+            const slot = from.resolveTab(b.tab) orelse return error.StaleSource;
+            if (from.tab_transfer_close or to.tab_transfer_close or from.tab_count != b.source_count or
+                to.tab_count != b.destination_count or from.tab_trees[slot].nodes.ptr != b.source_nodes)
+                return error.StaleSource;
+        }
+        pub fn move(b: *@This(), i: usize) !void {
+            try b.validate();
+            const owner = b.app.resolveWindow(b.source) orelse return error.StaleSource;
+            const surface = owner.leafForPane(b.views[i].reference) orelse return error.StaleSource;
+            if (surface.nativeHandle() != b.views[i].child or w32.GetParent(b.views[i].child) != b.source_hwnd) return error.StaleSource;
+            if (w32.SetParent(b.views[i].child, b.destination_hwnd) == null) return error.SetParentFailed;
+        }
+        pub fn restore(b: *@This(), i: usize) !void {
+            if (w32.IsWindow(b.source_hwnd) == 0 or w32.IsWindow(b.views[i].child) == 0) return error.RollbackFailed;
+            if (w32.GetParent(b.views[i].child) == b.source_hwnd) return;
+            for (0..3) |_| {
+                if (w32.SetParent(b.views[i].child, b.source_hwnd) != null or w32.GetParent(b.views[i].child) == b.source_hwnd) return;
+            }
+            return error.RollbackFailed;
+        }
+    };
+    var backend: Backend = .{ .app = app, .source = source_reference, .destination = destination_reference, .tab = reference, .source_hwnd = source_hwnd, .destination_hwnd = destination_hwnd, .source_count = source_count, .destination_count = destination_count, .source_nodes = source_nodes, .views = views.items };
+    try @import("tab_transfer.zig").reparent(Backend, &backend, views.items.len);
+    // No message-pumping call between this final validation and slot publication.
+    const from = app.resolveWindow(source_reference) orelse return error.StaleSource;
+    const to = app.resolveWindow(destination_reference) orelse return error.StaleDestination;
+    const current = from.resolveTab(reference) orelse return error.StaleSource;
+    var moved = from.getSlot(current);
+    moved.attachment = slot_attachment;
+    const next = if (from.tab_count > 1) tabs.activeAfterClose(from.active_tab, current, from.tab_count).? else 0;
+    var i = current;
+    while (i + 1 < from.tab_count) : (i += 1) from.copySlot(i, i + 1);
+    from.tab_count -= 1;
+    from.active_tab = next;
+    const inserted = @min(position, to.tab_count);
+    to.insertMovedSlot(inserted, moved);
+    to.active_tab = inserted;
+    // From here both native and model ownership agree. Reparent callbacks only
+    // retire OLE resources; native COM work stays in the outer app loop.
+    for (views.items) |view| {
+        const live = to.leafForPane(view.reference) orelse continue;
+        live.onReparented(to, view.attachment);
     }
-    self.updateTabBarVisibility();
-    self.relayout();
-    self.repositionPopups();
-    self.invalidateTabBar();
-    self.updateAppMode();
-
-    destination.updateTabBarVisibility();
-    destination.updateWindowTitle();
-    destination.relayout();
-    destination.showWhenReady(moved_active);
-    if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
-    destination.updateAppMode();
-
-    tracked = false;
+    if (app.resolveWindow(source_reference)) |live| {
+        if (live.tab_count == 0) {
+            live.tab_transfer_close = true;
+        } else {
+            live.noteTabActivated(live.active_tab);
+            live.applyScale(live.active_tab);
+            live.tab_bar.onTabShown(live.active_tab);
+            live.updateTabBarVisibility();
+            live.updateWindowTitle();
+            live.relayout();
+            live.repositionPopups();
+            live.invalidateTabBar();
+            live.updateAppMode();
+        }
+    }
+    if (app.resolveWindow(destination_reference)) |live| {
+        if (live.is_remote_host) {
+            live.relayout();
+            var iterator = live.tab_trees[live.active_tab].iterator();
+            while (iterator.next()) |entry| {
+                entry.view.setVisible(false);
+                if (entry.view.nativeHandle()) |child| _ = w32.ShowWindow(child, w32.SW_HIDE);
+            }
+            app.scheduleSessionSave();
+            return true;
+        }
+        for (0..live.tab_count) |tab| if (tab != live.active_tab) {
+            live.hideTabPanes(tab);
+        };
+        live.noteTabActivated(live.active_tab);
+        live.applyScale(live.active_tab);
+        live.updateTabDim(live.active_tab);
+        live.tab_bar.onTabShown(live.active_tab);
+        live.updateTabBarVisibility();
+        live.updateWindowTitle();
+        live.relayout();
+        live.showWhenReady(moved.active_surface);
+        live.focusActiveSurface();
+        live.updateAppMode();
+    }
+    app.scheduleSessionSave();
     return true;
+}
+
+fn endTabTransfer(app: *App, reference: gx.ui_ref.Reference) void {
+    // A nested last-tab close may already mark the window closing. Locate its
+    // still-owned record without reviving it for normal UI operations.
+    const window = for (app.windows.items) |candidate| {
+        if (reference.matches(candidate.ui_reference)) break candidate;
+    } else app.remote.resolveHostWindow(reference) orelse return;
+    window.tab_transfer_active = false;
+    if (window.tab_transfer_close or window.closing) {
+        window.tab_transfer_close = false;
+        window.requestClose();
+    }
 }
 
 /// Update the top-level window title to match the active tab's title (or
@@ -2919,7 +3262,8 @@ fn refreshTabTitle(self: *Window, tab: usize) void {
 /// while `surface` is the focused terminal of the tab and the tab has no
 /// title override. A program may have started or exited in it, which herdr
 /// app mode looks at (`onAppModeTitle`).
-pub fn onSurfaceTitleChanged(self: *Window, surface: *Surface) void {
+pub fn onSurfaceTitleChanged(self: *Window, view: anytype) void {
+    const surface = leafIdentity(view) orelse return;
     const tab = self.findTabIndex(surface) orelse return;
     self.onAppModeTitle();
     if (self.tab_active_surface[tab] != surface) return;
@@ -2930,6 +3274,7 @@ pub fn onSurfaceTitleChanged(self: *Window, surface: *Surface) void {
 /// tab); an empty title clears it, so the tab shows its terminal's title
 /// again.
 pub fn setTabTitleOverride(self: *Window, tab: usize, title: tabs.Title) void {
+    if (self.hwnd != null and !self.is_quick_terminal) self.app.scheduleSessionSave();
     if (tab >= self.tab_count) return;
     self.tab_title_overrides[tab] = if (title.len == 0) null else title;
     self.refreshTabTitle(tab);
@@ -3019,7 +3364,7 @@ fn appModeAnswers(self: *Window, answers: *[app_mode_max_terminals]?bool) usize 
     while (it.next()) |entry| {
         if (count == answers.len) break;
         const surface = entry.view;
-        pids[count] = if (surface.core_surface_ready) surface.core_surface.getProcessInfo(.foreground_pid) else null;
+        pids[count] = if (surface.pane().foregroundPid()) |pid| @as(u64, pid) else null;
         if (pids[count]) |pid| if (std.math.cast(gx.proc.Pid, pid)) |root| {
             roots[root_count] = root;
             root_count += 1;
@@ -3076,12 +3421,15 @@ fn stopAppModeSoon(self: *Window) void {
 
 /// Invalidate the tab bar region so it gets repainted.
 pub fn invalidateTabBar(self: *Window) void {
+    self.uia_dirty = true;
+    self.uia_bridge.dirty();
     self.tab_bar.invalidate();
 }
 
 /// Set (or clear, when empty) the explicit window title override (UTF-16,
 /// cut to `tabs.max_title_len` code units at a codepoint boundary).
 pub fn setWindowTitleOverride(self: *Window, title: []const u16) void {
+    if (self.hwnd != null and !self.is_quick_terminal) self.app.scheduleSessionSave();
     const units = wstr.truncate(title, tabs.max_title_len);
     if (units.len == 0) {
         self.window_title_override_len = null;
@@ -3195,6 +3543,22 @@ pub fn requestClose(self: *Window) void {
 /// because Win32 destroys child HWNDs during DestroyWindow and the
 /// OpenGL driver crashes if contexts are still active on destroyed windows.
 pub fn close(self: *Window) void {
+    if (self.tab_transfer_active) {
+        self.tab_transfer_close = true;
+        return;
+    }
+    if (self.is_remote_host) {
+        _ = self.app.remote.closeHost(self.ui_reference);
+        return;
+    }
+    if (!self.app.quit_requested and self.requestRemoteSelectionClose(self.tab_references[0..self.tab_count])) return;
+    if (self.app.remote.deferLocalWindowClose(self.ui_reference)) return;
+    if (self.hasForeignTerminalWindows()) {
+        log.err("cannot close a transfer parent while another window owns its terminals", .{});
+        return;
+    }
+    if (self.pending_native_destroy) return;
+    if (self.app.running) self.app.session.onWindowClose(self.app, self);
     // The last window remembers its place for the next one.
     const windows = self.app.windows.items;
     if (windows.len == 1 and windows[0] == self) self.saveWindowState();
@@ -3205,13 +3569,31 @@ pub fn close(self: *Window) void {
 
     // Now safe to destroy the parent HWND (children already cleaned up).
     if (self.hwnd) |hwnd| {
+        if (self.app.deferDropParentDestroy(hwnd)) {
+            self.pending_native_destroy = true;
+            return;
+        }
         _ = w32.DestroyWindow(hwnd);
     }
+}
+
+/// A failed native rollback must never let an empty staging container destroy
+/// another model owner's live terminal HWNDs. Query only current GUI records.
+fn hasForeignTerminalWindows(self: *const Window) bool {
+    const hwnd = self.hwnd orelse return false;
+    for (self.app.core_app.surfaces.items) |surface| {
+        if (surface.parent_window == self) continue;
+        const child = surface.hwnd orelse continue;
+        if (w32.GetParent(child) == hwnd) return true;
+    }
+    return false;
 }
 
 /// Hide the window for good, before its terminals stop: input no longer
 /// reaches it (`closing`) and its renderers are not told about the hide.
 fn hide(self: *Window) void {
+    self.uia_bridge.hide();
+    self.resize_overlay.hide();
     const hwnd = self.hwnd orelse return;
     self.closing = true;
     self.visibility.deinit(hwnd);
@@ -3222,6 +3604,7 @@ fn hide(self: *Window) void {
 
 /// Deinit and free all tab trees (which unrefs and frees surfaces).
 fn cleanupAllSurfaces(self: *Window) void {
+    self.palette.deinit();
     self.cancelDividerDrag();
     // Empty the tab model before any terminal goes away: freeing one can
     // dispatch messages that walk the tabs, which then find none instead
@@ -3233,13 +3616,14 @@ fn cleanupAllSurfaces(self: *Window) void {
         tree.* = slot.*;
         slot.* = .empty;
     }
-    freeTrees(trees[0..count]);
+    freeTrees(self.app, trees[0..count]);
 }
 
 /// Handle WM_DESTROY: remove this window from the App's list,
 /// free resources, and start the quit timer if no windows remain.
 /// Surfaces are already cleaned up by close() before DestroyWindow.
 fn onDestroy(self: *Window) void {
+    self.uia_bridge.deinit();
     const app = self.app;
     self.visibility.deinit(self.hwnd);
     Settings.onWindowDestroyed(self);
@@ -3277,6 +3661,14 @@ fn onDestroy(self: *Window) void {
     self.toast.deinit();
     self.hwnd = null;
 
+    // Background hosts belong to RemoteCoordinator, never the ordinary list.
+    // Unexpected native destruction invalidates the record; its owner still
+    // joins terminal threads and releases the Host allocation at a safe point.
+    if (self.is_remote_host) {
+        self.closing = true;
+        return;
+    }
+
     // Free the Window allocation.
     app.core_app.alloc.destroy(self);
 
@@ -3311,7 +3703,8 @@ fn inChrome(self: *const Window, y: i32) bool {
 
 /// The tab of `surface` rang the bell: badge it unless it is the active
 /// tab.
-pub fn onBell(self: *Window, surface: *Surface) void {
+pub fn onBell(self: *Window, view: anytype) void {
+    const surface = leafIdentity(view) orelse return;
     self.tab_bar.markUnread(surface);
 }
 
@@ -3323,8 +3716,11 @@ fn onChromeRightClick(self: *Window, pt: w32.POINT) void {
     const hwnd = self.hwnd orelse return;
     var screen = pt;
     _ = w32.ClientToScreen(hwnd, &screen);
+    const app = self.app;
+    const owner = self.ui_reference;
     const command = Menu.showTabContextMenu(self, screen, null) orelse return;
-    Menu.performTabCommand(self, null, command);
+    const live = app.resolveWindow(owner) orelse return;
+    Menu.performTabCommand(live, null, command);
 }
 
 /// A system broadcast reached this window (only top-level windows hear
@@ -3356,7 +3752,7 @@ fn onSystemSettingChange(self: *Window, change: w32.SystemChange) void {
         var it = self.tab_trees[tab].iterator();
         while (it.next()) |entry| {
             entry.view.refreshScrollbarMode();
-            if (entry.view.hwnd) |child| _ = w32.SendMessageW(child, message, wp, lp);
+            if (entry.view.nativeHandle()) |child| _ = w32.SendMessageW(child, message, wp, lp);
         }
     }
 }
@@ -3374,6 +3770,8 @@ pub fn windowWndProc(
         @ptrFromInt(@as(usize, @bitCast(userdata)))
     else
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    if (window.app.drop_closing) return 0;
 
     if (window.app.isTaskbarButtonCreated(msg)) {
         window.app.onTaskbarButtonCreated(window);
@@ -3425,6 +3823,7 @@ pub fn windowWndProc(
             // later destruction can re-enter our WindowProc via
             // SetFocus and deadlock on a COM marshaling reply.
             if (w32.objectId(lparam) == w32.OBJID_CLIENT) return 0;
+            if (w32.objectId(lparam) == -25) return window.app.uiaForWindow(window, wparam, lparam);
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_TIMER => {
@@ -3449,13 +3848,7 @@ pub fn windowWndProc(
             if (window.main_menu_anchor) |anchor| {
                 Menu.showMainMenu(window, anchor);
             } else {
-                const layout = window.title_bar.layout();
-                var top_left: w32.POINT = .{ .x = layout.menu.left, .y = layout.menu.top };
-                var bottom_right: w32.POINT = .{ .x = layout.menu.right, .y = layout.bar.bottom };
-                _ = w32.ClientToScreen(hwnd, &top_left);
-                _ = w32.ClientToScreen(hwnd, &bottom_right);
-                const anchor: w32.RECT = .{ .left = top_left.x, .top = top_left.y, .right = bottom_right.x, .bottom = bottom_right.y };
-                Menu.showMain(window, if (layout.menu.right > layout.menu.left) anchor else null, .right);
+                Menu.showMainMenu(window, null);
             }
             return 0;
         },
@@ -3475,6 +3868,38 @@ pub fn windowWndProc(
             return 0;
         },
 
+        @import("remote_test.zig").begin_message => {
+            if (!@import("remote_test.zig").enabled() or window.tab_count == 0 or wparam > std.math.maxInt(u32)) return 0;
+            const target: @import("ipc/Security.zig").policy.Process = .{ .pid = @intCast(wparam), .birth = @as(usize, @bitCast(lparam)) };
+            if (window.app.remote.returnRemoteTab(window.app, window.tab_references[window.active_tab], target) catch return 0) return 1;
+            window.app.remote.begin(window.app, window.ui_reference, window.tab_references[window.active_tab], target) catch return 0;
+            return 1;
+        },
+        @import("remote_test.zig").query_message => {
+            const fixture = @import("remote_test.zig");
+            if (!fixture.enabled()) return 0;
+            if (wparam >= 12 and wparam <= 16) {
+                if (wparam == 12) return @intCast(window.tab_count);
+                const leaf = window.activeLeaf() orelse return 0;
+                if (wparam == 16) return if (leaf.remote()) |remote| if (remote.hwnd) |native| @bitCast(@intFromPtr(native)) else 0 else 0;
+                var count: usize = 0;
+                var iterator = window.tab_trees[window.active_tab].iterator();
+                while (iterator.next()) |entry| {
+                    if (wparam == 13 or (wparam == 14 and entry.view.local() != null) or (wparam == 15 and entry.view.remote() != null)) count += 1;
+                }
+                return @intCast(count);
+            }
+            if (window.activeLeaf()) |leaf| if (leaf.remote()) |remote| return if (wparam == 3) 0 else remote.query(wparam);
+            const surface = window.getActiveSurface();
+            return switch (wparam) {
+                0 => fixture.magic,
+                1 => if (window.shown and !window.closing) @intCast(fixture.Flags.visible) else 0,
+                2 => if (surface) |value| @bitCast(@as(usize, @intCast(value.ui_reference.id))) else 0,
+                3 => if (surface) |value| if (value.core_surface_ready) @intCast(value.core_surface.getProcessInfo(.foreground_pid) orelse 0) else 0 else 0,
+                7 => if (surface) |value| if (value.hwnd) |child| @bitCast(@intFromPtr(child)) else 0 else 0,
+                else => 0,
+            };
+        },
         WM_GHOSTTY_SIMULATE_SYSTEM_THEME => return @intFromBool(window.app.simulateSystemTheme(wparam)),
         WM_GHOSTTY_WINDOW_STATE => {
             return switch (wparam) {
@@ -3485,11 +3910,11 @@ pub fn windowWndProc(
                     (@as(isize, @intFromBool(window.title_bar.is_fullscreen)) << 16),
                 1 => @intCast(window.tab_count),
                 2 => @intFromFloat(window.scale * 96),
-                3 => if (window.getActiveSurface()) |surface| @intFromFloat(surface.scale * 96) else 0,
+                3 => if (window.activeLeaf()) |leaf| @intFromFloat(leaf.scale() * 96) else 0,
                 4 => if (window.getActiveSurface()) |surface| @intFromBool(surface.last_reported_visible orelse false) else 0,
                 5 => @intFromBool(window.app_mode_soon),
-                6 => if (window.getActiveSurface()) |surface| @intFromBool(window.moveSplitToTab(surface) catch false) else 0,
-                7 => if (window.getActiveSurface()) |surface| @intFromBool(window.moveSplitToNewWindow(surface) catch false) else 0,
+                6 => if (window.activeLeaf()) |leaf| @intFromBool(window.moveSplitToTab(leaf) catch false) else 0,
+                7 => if (window.activeLeaf()) |leaf| @intFromBool(window.moveSplitToNewWindow(leaf) catch false) else 0,
                 8 => @intCast(@min(window.layout_passes, std.math.maxInt(isize))),
                 9 => blk: {
                     window.toggleMaximize();
@@ -3647,11 +4072,25 @@ pub fn windowWndProc(
             window.setPanesLiveResize(window.active_tab, true);
             return 0;
         },
+        WM_APP_TAB_DETACH => {
+            const request = window.pending_tab_detach orelse return 0;
+            window.pending_tab_detach = null;
+            const app = window.app;
+            const reference = window.ui_reference;
+            @import("TabTransfer.zig").run(app, reference, request.tab, request.point) catch |err| {
+                log.warn("tab drag transfer failed err={}", .{err});
+            };
+            return 0;
+        },
         w32.WM_EXITSIZEMOVE => {
             window.setPanesLiveResize(window.active_tab, false);
             return 0;
         },
         w32.WM_CLOSE => {
+            if (window.tab_transfer_active) {
+                window.tab_transfer_close = true;
+                return 0;
+            }
             // Title-bar X / Alt+F4 / close_window land here. Confirm once
             // for the whole window if any tab has a running process. While
             // a dialog's modal loop runs, the close waits for the dialog.
@@ -3685,9 +4124,7 @@ pub fn windowWndProc(
             // Forward keyboard focus to the active child surface.
             // Without this, keyboard input stays on the parent and
             // is never delivered to the terminal.
-            if (window.getActiveSurface()) |s| {
-                if (s.hwnd) |h| _ = w32.SetFocus(h);
-            }
+            window.focusActiveSurface();
             return 0;
         },
         w32.WM_ERASEBKGND => {
@@ -3780,6 +4217,13 @@ pub fn windowWndProc(
             window.cancelDividerDrag();
             return 0;
         },
+
+        0x001F => { // WM_CANCELMODE
+            @import("TabTransfer.zig").cancelNativeMove();
+            window.tab_bar.cancelDrag();
+            window.cancelDividerDrag();
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_SETCURSOR => {
             var pt: w32.POINT = undefined;
             if (w32.GetCursorPos_(&pt) != 0) {
@@ -3828,12 +4272,16 @@ test "runtime references follow tab slots across reorder and window ownership" {
     var destination: Window = .{ .app = undefined, .ui_reference = try issuer.create(.window) };
     var first: Surface = .{ .app = undefined };
     var second: Surface = .{ .app = undefined };
+    var first_leaf: Leaf = .{ .backend = .{ .local = &first } };
+    var second_leaf: Leaf = .{ .backend = .{ .local = &second } };
+    first.leaf = &first_leaf;
+    second.leaf = &second_leaf;
     source.tab_references[0] = try issuer.create(.tab);
     source.tab_references[1] = try issuer.create(.tab);
     source.tab_trees[0] = .empty;
     source.tab_trees[1] = .empty;
-    source.tab_active_surface[0] = &first;
-    source.tab_active_surface[1] = &second;
+    source.tab_active_surface[0] = first.leaf.?;
+    source.tab_active_surface[1] = second.leaf.?;
     source.tab_titles[0] = [_]u16{0} ** 256;
     source.tab_titles[1] = [_]u16{0} ** 256;
     source.tab_title_lens[0] = 0;
@@ -3850,7 +4298,7 @@ test "runtime references follow tab slots across reorder and window ownership" {
     source.tab_count = 1;
     try testing.expect(source.resolveTab(first_ref) == null);
     try testing.expectEqual(@as(?usize, 0), destination.resolveTab(first_ref));
-    try testing.expect(destination.tab_active_surface[0] == &first);
+    try testing.expect(destination.tab_active_surface[0] == first.leaf.?);
     destination.closing = true;
     try testing.expect(destination.resolveTab(first_ref) == null);
     destination.closing = false;
@@ -3892,12 +4340,15 @@ test "quick last tab remains in the model until deferred window close" {
     window.tab_trees[0] = .empty;
     var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_initialized = true };
     surface.core_surface.id = 1;
-    window.tab_active_surface[0] = &surface;
+    var leaf: Leaf = .{ .backend = .{ .local = &surface } };
+    surface.leaf = &leaf;
+    window.tab_references[0] = .{ .epoch = 1, .kind = .tab, .id = 1, .generation = 1 };
+    window.tab_active_surface[0] = &leaf;
     var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &window, .phase = .shown, .visible = true };
     app.quick_terminal = &quick;
-    try testing.expect(!window.closeQuickSelection(&.{2}));
+    try testing.expect(!window.closeQuickSelection(&.{.{ .epoch = 1, .kind = .tab, .id = 2, .generation = 1 }}));
     try testing.expect(!window.closing);
-    try testing.expect(window.closeQuickSelection(&.{1}));
+    try testing.expect(window.closeQuickSelection(&.{window.tab_references[0]}));
     try testing.expectEqual(@as(usize, 1), window.tab_count);
     try testing.expect(window.closing);
     try testing.expect(quick.close_when_hidden);
@@ -4162,4 +4613,381 @@ test "window and caption private message contracts do not collide" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+fn leafIdentity(view: anytype) ?*Leaf {
+    if (@TypeOf(view) == *Leaf) return view;
+    if (@TypeOf(view) == *Surface) return view.leaf;
+    @compileError("expected a Leaf or local Surface identity");
+}
+fn referenceIndex(values: []const refs.Reference, needle: refs.Reference) ?usize {
+    for (values, 0..) |value, index| if (value.matches(needle)) return index;
+    return null;
+}
+pub fn activeLeaf(self: *const Window) ?*Leaf {
+    if (self.closing or self.tab_count == 0) return null;
+    return self.tab_active_surface[self.active_tab];
+}
+pub fn leafForPane(self: *const Window, reference: refs.Reference) ?*Leaf {
+    if (self.closing or !reference.isValid()) return null;
+    for (self.tab_trees[0..self.tab_count]) |*tree| {
+        var iterator = tree.iterator();
+        while (iterator.next()) |entry| if (entry.view.reference().matches(reference)) return entry.view;
+    }
+    return null;
+}
+pub fn removeLeaf(self: *Window, leaf: *Leaf) void {
+    // A confirmed close or revoked lease removes an identity without opening
+    // another dialog. User requests must run their confirmation before this.
+    const index = self.findTabIndex(leaf) orelse return;
+    if (self.tab_trees[index].isSplit()) self.closeSplitSurface(leaf) else self.removeTab(index);
+}
+pub fn onLeafStateChanged(self: *Window, leaf: *Leaf) void {
+    const tab = self.findTabIndex(leaf) orelse return;
+    const state = leaf.pane().snapshot();
+    if (tab != self.active_tab) {
+        self.tab_unread[tab] = self.tab_unread[tab] or state.unread;
+        self.tab_bell[tab] = self.tab_bell[tab] or state.bell;
+    }
+    self.refreshTabTitle(tab);
+    self.invalidateTabBar();
+    self.uia_bridge.dirty();
+}
+pub fn closeRemoteTransfer(self: *Window, tab: refs.Reference) void {
+    while (self.resolveTab(tab)) |index| {
+        var iterator = self.tab_trees[index].iterator();
+        const remote_leaf = while (iterator.next()) |entry| {
+            if (entry.view.remote() != null) break entry.view;
+        } else return;
+        remote_leaf.remote().?.disconnect();
+        self.removeLeaf(remote_leaf);
+    }
+}
+
+/// Source terminal shutdown is asynchronous. Keep remote identities visible
+/// until leaf_closed confirms completion; ordinary local siblings close now.
+fn requestRemoteSelectionClose(self: *Window, selected: []const refs.Reference) bool {
+    var found = false;
+    var references: std.ArrayList(refs.Reference) = .empty;
+    defer references.deinit(self.app.core_app.alloc);
+    for (selected) |tab| {
+        const index = self.resolveTab(tab) orelse continue;
+        var iterator = self.tab_trees[index].iterator();
+        while (iterator.next()) |entry| {
+            found = found or entry.view.remote() != null;
+            references.append(self.app.core_app.alloc, entry.view.reference()) catch return true;
+        }
+    }
+    if (!found) return false;
+    const app = self.app;
+    const owner = self.ui_reference;
+    for (references.items) |reference| {
+        const window = app.resolveWindow(owner) orelse return true;
+        const leaf = window.leafForPane(reference) orelse continue;
+        if (leaf.remote()) |remote| {
+            if (remote.closed or remote.unavailable) window.removeLeaf(leaf) else _ = remote.ui.requestCloseFromOwner(remote, true);
+        } else window.removeLeaf(leaf);
+    }
+    return true;
+}
+
+/// Install a source description using target-owned panes. Existing tree slots
+/// and native parents remain untouched until every identity/allocation succeeds.
+pub fn adoptRemoteTab(self: *Window, at: usize, description: *const protocol.Tree, panes: []const *RemotePane) !refs.Reference {
+    if (self.closing or self.is_quick_terminal or self.is_remote_host or self.tab_count >= MAX_TABS) return error.InvalidOwner;
+    if (panes.len == 0 or panes.len > protocol.max_leaves or description.nodes.len == 0 or description.nodes.len > protocol.max_nodes) return error.InvalidTree;
+    for (panes, 0..) |pane, index| {
+        if (pane.parent_window != self or pane.app != self.app or self.app.resolveRemote(pane.ui_reference) != null) return error.InvalidOwner;
+        for (panes[0..index]) |prior| if (prior == pane or prior.source_reference.matches(pane.source_reference)) return error.InvalidTree;
+    }
+    const reference = try self.app.ui_ids.create(.tab);
+    const attachment = try self.app.ui_ids.attach(reference, self.ui_reference);
+    var identities = [_]?*Leaf{null} ** protocol.max_nodes;
+    var visited = [_]bool{false} ** protocol.max_nodes;
+    var tree = try self.buildRemoteTree(description, description.root, panes, &identities, &visited, 0);
+    errdefer tree.deinit();
+    for (visited[0..description.nodes.len]) |seen| if (!seen) return error.InvalidTree;
+    if (description.active >= description.nodes.len) return error.InvalidTree;
+    const focused = identities[description.active] orelse return error.InvalidTree;
+    if (description.zoom) |zoom| {
+        if (zoom >= description.nodes.len) return error.InvalidTree;
+        tree.zoomed = tree.locate(identities[zoom] orelse return error.InvalidTree) orelse return error.InvalidTree;
+    }
+    var attachments: [protocol.max_leaves]refs.Attachment = undefined;
+    for (panes, 0..) |pane, index| attachments[index] = try pane.prepareReparent(self);
+    const position = @min(at, self.tab_count);
+    self.tab_bar.cancelRename();
+    self.tab_bar.cancelDrag();
+    self.insertMovedSlot(position, .{ .reference = reference, .attachment = attachment, .tree = tree, .active_surface = focused, .title = @splat(0), .title_len = 0, .title_override = if (description.tab_override.len != 0) .fromUtf8(description.tab_override.slice()) else null, .unread = false, .bell = false, .activated = 0 });
+    for (panes, 0..) |pane, index| pane.onReparented(self, attachments[index]);
+    self.refreshTabTitle(position);
+    self.selectTabIndex(position);
+    self.updateTabBarVisibility();
+    self.layoutSplits();
+    self.updateWindowTitle();
+    self.updateAppMode();
+    if (!self.shown) self.showWhenReady(focused);
+    self.focusActiveSurface();
+    self.app.scheduleSessionSave();
+    return reference;
+}
+fn buildRemoteTree(self: *Window, description: *const protocol.Tree, index: u16, panes: []const *RemotePane, identities: *[protocol.max_nodes]?*Leaf, visited: *[protocol.max_nodes]bool, depth: usize) anyerror!Tree {
+    if (depth > 32 or index >= description.nodes.len or visited[index]) return error.InvalidTree;
+    visited[index] = true;
+    const alloc = self.app.core_app.alloc;
+    switch (description.nodes.items[index]) {
+        .leaf => |source| {
+            const pane = for (panes) |candidate| {
+                if (candidate.source_reference.matches(source)) break candidate;
+            } else return error.InvalidTree;
+            for (identities) |existing| if (existing) |leaf| if (leaf.remote() == pane) return error.InvalidTree;
+            const leaf = try Leaf.fromRemote(alloc, pane);
+            errdefer leaf.discardUnretained(alloc);
+            const tree = try Tree.init(alloc, leaf);
+            identities[index] = leaf;
+            return tree;
+        },
+        .split => |branch| {
+            const ratio: f16 = @floatCast(branch.ratio);
+            if (!std.math.isFinite(ratio) or ratio <= 0 or ratio >= 1) return error.InvalidTree;
+            var first = try self.buildRemoteTree(description, branch.first, panes, identities, visited, depth + 1);
+            defer first.deinit();
+            var second = try self.buildRemoteTree(description, branch.second, panes, identities, visited, depth + 1);
+            defer second.deinit();
+            return try first.split(alloc, .root, if (branch.axis == .horizontal) .right else .down, ratio, &second);
+        },
+    }
+}
+pub fn describeTab(self: *Window, tab_reference: refs.Reference) !protocol.Tree {
+    const index = self.resolveTab(tab_reference) orelse return error.InvalidTab;
+    const tree = &self.tab_trees[index];
+    if (tree.nodes.len == 0 or tree.nodes.len > protocol.max_nodes) return error.InvalidTree;
+    var nodes: protocol.Bounded(protocol.Node, protocol.max_nodes) = .{ .len = @intCast(tree.nodes.len) };
+    for (tree.nodes, nodes.items[0..tree.nodes.len]) |node, *destination| destination.* = switch (node) {
+        .leaf => |leaf| .{ .leaf = leaf.reference() },
+        .split => |branch| .{ .split = .{ .axis = if (branch.layout == .horizontal) .horizontal else .vertical, .ratio = @floatCast(branch.ratio), .first = @intFromEnum(branch.left), .second = @intFromEnum(branch.right) } },
+    };
+    return .{ .nodes = nodes, .root = 0, .active = @intFromEnum(tree.locate(self.tab_active_surface[index]) orelse return error.InvalidTree), .zoom = if (tree.zoomed) |zoom| @intFromEnum(zoom) else null, .tab_override = if (self.tab_title_overrides[index]) |title| try protocolTitle(title.slice()) else .{}, .window_override = if (self.window_title_override_len) |len| try protocolTitle(self.window_title_override[0..len]) else .{} };
+}
+/// UI actions run against the visible target identity. The source evaluates
+/// key bindings, while window/tree operations always belong to this owner.
+pub fn performUiAction(self: *Window, origin: refs.Reference, action: @import("../../input.zig").Binding.Action, flags: @import("../../input.zig").Binding.Flags) !bool {
+    _ = flags;
+    const leaf = self.leafForPane(origin) orelse return false;
+    const tab = self.findTabIndex(leaf) orelse return false;
+    switch (action) {
+        .new_split => |direction| {
+            self.selectTabIndex(tab);
+            _ = self.setActiveSurface(leaf);
+            const area = self.surfaceRect();
+            try self.newSplit(switch (direction) {
+                .left => .left,
+                .right => .right,
+                .up => .up,
+                .down => .down,
+                .auto => if (area.right - area.left > area.bottom - area.top) .right else .down,
+            });
+            return true;
+        },
+        .goto_split => |target| return self.gotoSplit(leaf, switch (target) {
+            .previous => .previous,
+            .next => .next,
+            .up => .up,
+            .down => .down,
+            .left => .left,
+            .right => .right,
+        }),
+        .resize_split => |value| return self.resizeSplit(leaf, .{ .direction = switch (value[0]) {
+            .left => .left,
+            .right => .right,
+            .up => .up,
+            .down => .down,
+        }, .amount = value[1] }),
+        .equalize_splits => return self.equalizeSplits(leaf),
+        .toggle_split_zoom => return self.toggleSplitZoom(leaf),
+        .new_tab => {
+            _ = try self.addTab();
+            return true;
+        },
+        .previous_tab => return self.selectTab(.previous),
+        .next_tab => return self.selectTab(.next),
+        .last_tab => return self.selectTab(.last),
+        .goto_tab => |index| return self.selectTab(@enumFromInt(index)),
+        .move_tab => |amount| return self.moveTab(leaf, amount),
+        .move_tab_to_new_window => return try self.moveTabToNewWindow(leaf),
+        .goto_window => |direction| {
+            const windows = self.app.windows.items;
+            var index = std.mem.indexOfScalar(*Window, windows, self) orelse return false;
+            for (1..windows.len) |_| {
+                index = tabs.cycleIndex(index, windows.len, direction == .next);
+                const window = windows[index];
+                if (window.closing or window.is_remote_host) continue;
+                const hwnd = window.hwnd orelse continue;
+                if (w32.IsWindowVisible_(hwnd) == 0) continue;
+                if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+                if (w32.SetForegroundWindow(hwnd) == 0) return false;
+                window.focusActiveSurface();
+                return true;
+            }
+            return false;
+        },
+        .set_tab_title => |title| {
+            self.setTabTitleOverride(tab, .fromUtf8(title));
+            return true;
+        },
+        .set_window_title => |title| {
+            const owned = try self.app.core_app.alloc.dupeZ(u8, title);
+            defer self.app.core_app.alloc.free(owned);
+            self.setWindowTitle(owned);
+            return true;
+        },
+        .prompt_surface_title, .prompt_tab_title => {
+            self.selectTabIndex(tab);
+            _ = self.setActiveSurface(leaf);
+            self.tab_bar.startRename(tab);
+            return self.tab_bar.rename_target != .none;
+        },
+        .prompt_window_title => {
+            self.tab_bar.startWindowRename();
+            return self.tab_bar.rename_target != .none;
+        },
+        .close_tab, .close_window => {
+            const app = self.app;
+            var closing: std.ArrayList(refs.Reference) = .empty;
+            defer closing.deinit(app.core_app.alloc);
+            if (!try self.requestUiClose(origin, action, &closing)) return false;
+            for (closing.items) |reference| {
+                if (reference.kind == .window) {
+                    if (app.resolveWindow(reference) != null) return false;
+                } else if (app.resolveTab(reference) != null) return false;
+            }
+            return closing.items.len > 0;
+        },
+        .toggle_command_palette => {
+            self.palette.setActive(!self.palette.active);
+            return true;
+        },
+        .toggle_tab_overview => {
+            self.palette.toggle(.tabs);
+            return true;
+        },
+        .toggle_fullscreen => {
+            self.toggleFullscreen();
+            return true;
+        },
+        .toggle_maximize => {
+            self.toggleMaximize();
+            return true;
+        },
+        .toggle_window_decorations => {
+            self.toggleWindowDecorations();
+            return true;
+        },
+        .toggle_window_float_on_top => {
+            const hwnd = self.hwnd orelse return false;
+            const topmost = w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & w32.WS_EX_TOPMOST != 0;
+            return w32.SetWindowPos(hwnd, if (topmost) w32.HWND_NOTOPMOST else w32.HWND_TOPMOST, 0, 0, 0, 0, w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE) != 0;
+        },
+        .reset_window_size => {
+            self.resetWindowSize();
+            return true;
+        },
+        .gx => |value| {
+            self.selectTabIndex(tab);
+            _ = self.setActiveSurface(leaf);
+            return self.app.performGx(self, value);
+        },
+        else => {
+            if (action.scoped(.app) != null) return try self.app.performRemoteAppAction(action);
+            return false;
+        },
+    }
+}
+fn protocolTitle(value: []const u16) !protocol.Title {
+    var bytes: [1024]u8 = undefined;
+    const count = try std.unicode.utf16LeToUtf8(&bytes, value);
+    return try protocol.Title.init(bytes[0..count]);
+}
+
+test "remote tabs are rejected by quick terminal before inspecting backend state" {
+    var window: Window = .{ .app = undefined, .is_quick_terminal = true };
+    try std.testing.expectError(error.InvalidOwner, window.adoptRemoteTab(0, undefined, &.{}));
+}
+
+/// Append only currently displayed panes; callers capture this list before
+/// invoking callbacks and deduplicate complete stable references.
+pub fn visiblePaneReferences(self: *const Window, out: *std.ArrayList(refs.Reference)) !void {
+    if (self.closing or self.is_remote_host or self.tab_count == 0) return;
+    const hwnd = self.hwnd orelse return;
+    if (w32.IsIconic(hwnd) != 0 or w32.IsWindowVisible_(hwnd) == 0) return;
+    var iterator = self.tab_trees[self.active_tab].iterator();
+    while (iterator.next()) |entry| {
+        const leaf = entry.view;
+        if (!leaf.attachment().isValid()) continue;
+        const child = leaf.nativeHandle() orelse continue;
+        if (w32.IsWindowVisible_(child) == 0) continue;
+        try out.append(self.app.core_app.alloc, leaf.reference());
+    }
+}
+
+/// Captures identities before confirmation, then starts a close. Accepted does
+/// not mean completed: the coordinator waits for these identities to disappear.
+pub fn requestUiClose(self: *Window, origin: refs.Reference, action: @import("../../input.zig").Binding.Action, closed: *std.ArrayList(refs.Reference)) !bool {
+    const app = self.app;
+    const owner = self.ui_reference;
+    const origin_leaf = self.leafForPane(origin) orelse return false;
+    const tab = self.findTabIndex(origin_leaf) orelse return false;
+    const base = closed.items.len;
+    errdefer closed.items.len = base;
+    switch (action) {
+        .close_surface => {
+            try closed.append(app.core_app.alloc, origin);
+            if (origin_leaf.needsConfirmQuit()) {
+                var arena = std.heap.ArenaAllocator.init(app.core_app.alloc);
+                defer arena.deinit();
+                var names: std.ArrayList([]const u8) = .empty;
+                origin_leaf.appendBusyProcesses(arena.allocator(), &names);
+                if (Dialogs.confirmCloseSurface(self.hwnd, names.items) != .accept) {
+                    closed.items.len = base;
+                    return false;
+                }
+            }
+            const live = app.resolveLeaf(origin) orelse return true;
+            if (live.remote()) |remote| {
+                if (!remote.closed and !remote.unavailable) {
+                    if (!remote.ui.requestCloseFromOwner(remote, true)) {
+                        closed.items.len = base;
+                        return false;
+                    }
+                    return true;
+                }
+            }
+            live.ownerWindow().removeLeaf(live);
+            return true;
+        },
+        .close_window => {
+            try closed.append(app.core_app.alloc, owner);
+            if (!self.confirmCloseIfNeeded()) {
+                closed.items.len = base;
+                return false;
+            }
+            const live = app.resolveWindow(owner) orelse return true;
+            live.close();
+            return true;
+        },
+        .close_tab => |mode| {
+            const selection: TabSelection = switch (mode) {
+                .this => .{ .one = tab },
+                .other => .{ .all_but = tab },
+                .right => .{ .right_of = tab },
+            };
+            for (0..self.tab_count) |index| if (selection.contains(index)) try closed.append(app.core_app.alloc, self.tab_references[index]);
+            if (!self.closeTabsRequested(selection)) {
+                closed.items.len = base;
+                return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
 }

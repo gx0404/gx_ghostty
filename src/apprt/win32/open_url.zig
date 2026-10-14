@@ -16,6 +16,43 @@ const log = std.log.scoped(.win32);
 /// allocator any thread can use.
 const alloc = std.heap.page_allocator;
 
+/// Thread-safe completion owned jointly by the shell worker and GUI caller.
+/// The GUI may release its reference while the shell is still opening the URL.
+pub const Tracked = struct {
+    references: std.atomic.Value(u8) = .init(2),
+    completion: std.atomic.Value(u8) = .init(0),
+
+    pub fn result(self: *const Tracked) ?bool {
+        return switch (self.completion.load(.acquire)) {
+            0 => null,
+            1 => true,
+            else => false,
+        };
+    }
+
+    pub fn release(self: *Tracked) void {
+        if (self.references.fetchSub(1, .acq_rel) == 1) alloc.destroy(self);
+    }
+};
+
+/// Admission is separate from completion: only ShellExecute's actual result
+/// completes this request. No application or HWND pointer crosses threads.
+pub fn openTracked(url: []const u8) !*Tracked {
+    const url_w = try wstr.allocZ(alloc, url);
+    errdefer alloc.free(url_w);
+    const request = try alloc.create(Tracked);
+    errdefer alloc.destroy(request);
+    request.* = .{};
+    const thread = try std.Thread.spawn(.{}, openTrackedThread, .{ request, url_w, url.len });
+    thread.detach();
+    return request;
+}
+
+fn openTrackedThread(request: *Tracked, url_w: [:0]u16, len: usize) void {
+    defer request.release();
+    request.completion.store(if (openShell(url_w, len)) 1 else 2, .release);
+}
+
 /// Open `url` without waiting for the shell. Failures are logged with the
 /// length of the URL only, since a URL can carry private data.
 pub fn open(url: []const u8) void {
@@ -32,6 +69,10 @@ pub fn open(url: []const u8) void {
 }
 
 fn openThread(url_w: [:0]u16, len: usize) void {
+    _ = openShell(url_w, len);
+}
+
+fn openShell(url_w: [:0]u16, len: usize) bool {
     defer alloc.free(url_w);
 
     // The shell may hand the URL to extensions that need COM.
@@ -48,6 +89,7 @@ fn openThread(url_w: [:0]u16, len: usize) void {
     );
     // Values up to 32 are errors (SE_ERR_*).
     if (result <= 32) log.warn("cannot open a URL code={} len={}", .{ result, len });
+    return result > 32;
 }
 
 /// Open the file `path` (UTF-8) with the program its type is associated
@@ -179,4 +221,18 @@ test "a file type without an association gets the open with dialog" {
 test "SHELLEXECUTEINFOW has the size of the Windows SDK structure" {
     const expected: usize = if (@sizeOf(usize) == 8) 112 else 60;
     try std.testing.expectEqual(expected, @sizeOf(SHELLEXECUTEINFOW));
+}
+
+test "tracked shell admission is pending until the worker publishes its actual outcome" {
+    const request = try alloc.create(Tracked);
+    request.* = .{};
+    try std.testing.expect(request.result() == null);
+    // Dropping the GUI owner cannot free the worker's completion storage.
+    request.release();
+    try std.testing.expectEqual(@as(u8, 1), request.references.load(.acquire));
+    request.completion.store(2, .release);
+    try std.testing.expectEqual(@as(?bool, false), request.result());
+    request.completion.store(1, .release);
+    try std.testing.expectEqual(@as(?bool, true), request.result());
+    request.release();
 }

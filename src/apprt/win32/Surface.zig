@@ -32,6 +32,7 @@ const path_quote = @import("../../gx/path_quote.zig");
 const bell_border = @import("../../gx/bell_border.zig");
 const ui_ref = @import("../../gx/ui_ref.zig");
 const LaunchOrigin = @import("../../gx/profiles.zig").LaunchOrigin;
+const OleDrop = @import("ole_drop.zig");
 const ui_color = @import("../../gx/ui_color.zig");
 const ui_tokens = @import("../../gx/ui_tokens.zig");
 const style = @import("ui/style.zig");
@@ -45,7 +46,6 @@ const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 const Dialogs = @import("ui/Dialogs.zig");
 const LinkPreview = @import("ui/LinkPreview.zig");
 const Menu = @import("ui/Menu.zig");
-const Palette = @import("ui/Palette.zig");
 const SearchBar = @import("ui/SearchBar.zig");
 const wstr = @import("ui/wstr.zig");
 
@@ -71,6 +71,22 @@ app: *App,
 ui_reference: ui_ref.Reference = .{},
 ui_attachment: ui_ref.Attachment = .{},
 launch_origin: LaunchOrigin = .unknown,
+session_title: ?[:0]u8 = null,
+/// The window that still owns this terminal's abnormal-exit notice.
+child_exit_notice_window: ui_ref.Reference = .{},
+guest_cwd_lock: std.os.windows.SRWLOCK = .{},
+guest_cwd_buffer: [4096]u8 = undefined,
+guest_cwd_len: u16 = 0,
+guest_cwd_unavailable: bool = false,
+guest_cwd_dirty: std.atomic.Value(bool) = .init(false),
+drop_target: ?*OleDrop.Target = null,
+drop_target_pending: bool = false,
+/// Independent render-export lifetime lock. Never acquire renderer/core locks
+/// while holding it; the render-side guard covers readback and slot publication.
+remote_mutex: std.os.windows.SRWLOCK = .{},
+remote_output: ?*@import("RemoteHost.zig").Output = null,
+remote_rendering: std.atomic.Value(bool) = .init(false),
+remote_detached: std.atomic.Value(bool) = .init(false),
 
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
@@ -132,19 +148,15 @@ tracking_leave: bool = false,
 /// text is extracted from WM_IME_COMPOSITION instead.
 ime_composing: bool = false,
 ime_text: []u16 = &.{},
-dead_key_preedit: bool = false,
+key_decoder: @import("key_translate.zig").State = .{},
 
 /// Cleared before the next press, including VK_PACKET and VK_PROCESSKEY.
 key_event_produced_text: bool = false,
 
 /// ToUnicode output of the latest key message, the text of its
 /// win32-input-mode record (`gx_win32_input.KeyMessage.text`).
-key_utf16: [4]u16 = undefined,
-
 /// Scan codes of keys whose press went to the IME (VK_PROCESSKEY), so
 /// handleKeyEvent does not report their release as a key of its own.
-ime_keys: std.StaticBitSet(256) = .initEmpty(),
-
 /// Whether the log already noted that this terminal sends win32-input-mode
 /// records (`noteWin32InputMode`).
 win32_input_logged: bool = false,
@@ -234,9 +246,6 @@ link_preview: LinkPreview = .{},
 /// delivery fails so the next call retries.
 last_reported_visible: ?bool = null,
 
-/// Command palette popup (see ui/Palette.zig).
-palette: Palette = .{},
-
 /// Clipboard accesses waiting for another application to close the
 /// clipboard (see `retryClipboardRead` and `writeClipboard`).
 pending_clipboard_read: ?PendingClipboardRead = null,
@@ -255,6 +264,10 @@ launch_command: ?configpkg.Command = null,
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
 ref_count: u32 = 0,
+
+/// Weak tree identity, owned by the split trees.
+leaf: ?*@import("Leaf.zig") = null,
+remote_source_state: ?*@import("RemoteSource.zig").State = null,
 
 /// SplitTree view protocol: increment reference count.
 pub fn ref(self: *Surface, alloc: Allocator) Allocator.Error!*Surface {
@@ -295,6 +308,8 @@ pub const InitOptions = struct {
     profile_id: ?[]const u8 = null,
     title: ?[:0]const u8 = null,
     font_size: ?f32 = null,
+    session_restore: bool = false,
+    working_directory: ?[:0]const u8 = null,
     /// Where the terminal's window goes, in client pixels of the parent
     /// window (e.g. a new split's part of the terminal area); null for the
     /// whole terminal area (`Window.surfaceRect`). The pty starts with the
@@ -417,6 +432,10 @@ pub fn initWithOptions(
     // Create a config copy for this surface.
     var config = try apprt.surface.newConfig(app.core_app, &app.config, options.context);
     defer config.deinit();
+    if (options.session_restore) config.@"initial-command" = null;
+    if (options.working_directory) |directory| {
+        config.@"working-directory" = .{ .path = try config.arenaAlloc().dupeZ(u8, directory) };
+    }
     const inherited_font_size: ?f32 = if (options.font_size) |points|
         points
     else if (app.core_app.focusedSurface()) |previous|
@@ -442,6 +461,11 @@ pub fn initWithOptions(
     if (options.title) |title| {
         config.title = try config.arenaAlloc().dupeZ(u8, title);
     }
+    if (config.title) |title| self.session_title = try alloc.dupeZ(u8, title);
+    errdefer if (self.session_title) |title| {
+        alloc.free(title);
+        self.session_title = null;
+    };
 
     const origin = LaunchOrigin.select(options.profile_id, app.default_profile_id, options.command != null, app.core_app.first and config.@"initial-command" != null);
     self.launch_origin = try origin.clone(alloc);
@@ -465,12 +489,23 @@ pub fn initWithOptions(
     // (triggered by ShowWindow etc.) must be ignored.
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
+    if (options.session_restore and options.font_size != null) self.core_surface.font_size_adjusted = true;
     self.updateScrollbarGate();
 }
 
 pub fn deinit(self: *Surface) void {
+    self.app.hideChildExitedNotice(self);
+    @import("RemoteSource.zig").release(self);
+    self.remote_rendering.store(false, .release);
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.remote_mutex);
+    self.remote_output = null;
+    std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.remote_mutex);
+    self.app.shell.revoke(self.ui_reference);
     self.ui_reference = .{};
     self.ui_attachment = .{};
+    self.core_surface_ready = false;
+    if (self.hwnd) |hwnd| _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+    self.revokeDropTarget();
     self.stopBellBorder();
     self.setScrollbarOwnerVisible(false);
     self.core_surface_ready = false;
@@ -493,6 +528,8 @@ pub fn deinit(self: *Surface) void {
         self.resize_deadline = null;
     }
     self.launch_origin.deinit(self.app.core_app.alloc);
+    if (self.session_title) |title| self.app.core_app.alloc.free(title);
+    self.session_title = null;
     if (self.launch_command) |*command| {
         command.deinit(self.app.core_app.alloc);
         self.launch_command = null;
@@ -522,7 +559,6 @@ fn deinitGui(self: *Surface) void {
     }
     self.search_bar.deinit();
     self.link_preview.deinit();
-    self.palette.deinit();
     self.clearImeText();
     if (self.erase_brush) |brush| {
         _ = w32.DeleteObject(brush);
@@ -530,7 +566,7 @@ fn deinitGui(self: *Surface) void {
     }
     if (self.hwnd) |hwnd| {
         _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
-        _ = w32.DestroyWindow(hwnd);
+        if (!self.app.deferDropWindowDestroy(hwnd)) _ = w32.DestroyWindow(hwnd);
     }
     self.hwnd = null;
 }
@@ -609,6 +645,10 @@ pub fn getTitle(self: *const Surface) ?[:0]const u8 {
 pub fn setVisible(self: *Surface, visible: bool) void {
     self.bell_border_requested_visible = visible;
     const state = self.visibilityState(visible);
+    self.ui_attachment.setVisible(&self.app.ui_ids, self.ui_reference, self.parent_window.ui_reference, state.popups and self.core_surface_ready) catch |err| {
+        log.warn("cannot publish surface view err={}", .{err});
+    };
+    self.queueDropTarget();
     if (self.parent_window.closing) self.bell_border_state.stop();
     if (self.parent_window.is_quick_terminal and !state.popups) self.bell_border_state.clear();
     self.publishBellBorder();
@@ -630,10 +670,73 @@ pub fn setVisible(self: *Surface, visible: bool) void {
 }
 
 fn visibilityState(self: *const Surface, requested: bool) struct { render: bool, popups: bool } {
+    if (self.remote_rendering.load(.acquire)) return .{ .render = true, .popups = requested and !self.remote_detached.load(.acquire) };
     if (!self.parent_window.is_quick_terminal) return .{ .render = requested, .popups = requested };
     const qt = self.app.quick_terminal orelse return .{ .render = false, .popups = false };
     if (qt.window != self.parent_window) return .{ .render = false, .popups = false };
     return .{ .render = requested and qt.visible, .popups = requested and qt.visible and !qt.animating };
+}
+
+/// GUI thread only. The host owns output lifetime. Detaching waits for an
+/// in-flight readback guard before the caller may close or replace its mapping.
+pub fn setRemoteOutput(self: *Surface, output: ?*@import("RemoteHost.zig").Output) void {
+    self.setRemoteOutputMode(output, true);
+}
+
+/// Prepare transfer pixels while the source view remains visible and usable.
+/// The coordinator revokes source input at commit and detaches only after the
+/// target confirms enablement; a failed prepare preserves this original view.
+pub fn setRemotePreview(self: *Surface, output: ?*@import("RemoteHost.zig").Output) void {
+    self.setRemoteOutputMode(output, false);
+}
+
+fn setRemoteOutputMode(self: *Surface, output: ?*@import("RemoteHost.zig").Output, detached: bool) void {
+    const was_visible = self.bell_border_requested_visible;
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.remote_mutex);
+    self.remote_output = output;
+    self.remote_rendering.store(output != null, .release);
+    self.remote_detached.store(output != null and detached, .release);
+    std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.remote_mutex);
+    // Keep the renderer active explicitly; local view providers/popups remain
+    // hidden. Never hold remote_mutex while posting to renderer or GUI helpers.
+    self.last_reported_visible = null;
+    self.setVisible(if (output != null and detached) false else was_visible);
+    if (output != null and self.core_surface_ready) self.core_surface.renderer_thread.draw_now.notify() catch {};
+}
+
+pub fn gxRemoteRenderingEnabled(self: *const Surface) bool {
+    return self.remote_rendering.load(.acquire);
+}
+
+pub fn gxRemoteViewDetached(self: *const Surface) bool {
+    return self.remote_detached.load(.acquire);
+}
+
+pub const RemoteFrame = struct {
+    surface: *Surface,
+    frame: @import("RemoteHost.zig").Frame,
+    ended: bool = false,
+    pub fn finish(self: *RemoteFrame, success: bool) void {
+        if (self.ended) return;
+        self.ended = true;
+        self.frame.finish(success);
+        std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);
+    }
+};
+
+/// Render thread only, while its WGL context is current. The returned guard
+/// MUST finish before leaving present, including every GL error path.
+pub fn gxBeginRemoteFrame(self: *Surface, width: u32, height: u32) ?RemoteFrame {
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.remote_mutex);
+    const output = self.remote_output orelse {
+        std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.remote_mutex);
+        return null;
+    };
+    const frame = output.begin(width, height) orelse {
+        std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.remote_mutex);
+        return null;
+    };
+    return .{ .surface = self, .frame = frame };
 }
 
 /// Posted by `close` when the terminal to close still runs a program;
@@ -653,6 +756,10 @@ pub const WM_APP_CHILD_EXITED: u32 = w32.WM_APP + 32;
 /// both the question and the close run from the message loop: WM_CLOSE
 /// reaches `Window.closeSplitSurface` through surfaceWndProc.
 pub fn close(self: *Surface, process_active: bool) void {
+    if (self.remote_source_state != null) {
+        @import("RemoteSource.zig").requestClose(self, process_active) catch {};
+        return;
+    }
     log.debug("Surface.close called process_active={}", .{process_active});
     if (self.hwnd) |hwnd| {
         _ = w32.PostMessageW(hwnd, if (process_active) WM_APP_CONFIRM_CLOSE else w32.WM_CLOSE, 0, 0);
@@ -747,6 +854,7 @@ pub fn clipboardRequest(
     clipboard_type: apprt.Clipboard,
     state: apprt.ClipboardRequest,
 ) !apprt.ClipboardReadResult {
+    if (self.remote_source_state != null) return @import("RemoteSource.zig").clipboardRequest(self, clipboard_type, state);
     // Only the standard clipboard is supported on Win32.
     if (clipboard_type != .standard) return .unsupported;
 
@@ -949,6 +1057,26 @@ fn completeClipboardRequestWithConfirmation(
     contents: []const terminal.clipboard.Content,
     available: []const []const u8,
 ) apprt.ClipboardReadResult {
+    return self.completeClipboardRequestWithReceipt(state, contents, available, null);
+}
+
+fn completeClipboardRequestWithReceipt(
+    self: *Surface,
+    state: apprt.ClipboardRequest,
+    contents: []const terminal.clipboard.Content,
+    available: []const []const u8,
+    receipt: ?@import("DropBridge.zig").Receipt,
+) apprt.ClipboardReadResult {
+    if (receipt != null and (self.core_surface.readonly or self.core_surface.child_exited)) {
+        self.core_surface.denyClipboardRequest(state);
+        finishPasteReceipt(receipt, .paste_failed);
+        return .started;
+    }
+    if (state == .paste and !self.app.remote.allowsLocalInput(self.ui_reference)) {
+        self.core_surface.denyClipboardRequest(state);
+        finishPasteReceipt(receipt, .target_gone);
+        return .started;
+    }
     if (state == .paste) self.clearBellBorder();
     // Complete with confirmed=false so the core runs its safety checks. If it
     // flags the paste as unsafe (paste-protection) or the OSC 52 read as
@@ -967,6 +1095,7 @@ fn completeClipboardRequestWithConfirmation(
             },
             else => {
                 log.err("completeClipboardRequest error: {}", .{err});
+                finishPasteReceipt(receipt, .paste_failed);
                 return .started;
             },
         };
@@ -976,10 +1105,53 @@ fn completeClipboardRequestWithConfirmation(
             .kitty_write => |kitty| clipboardText(kitty.contents),
             else => clipboardText(contents),
         };
-        self.queueClipboardConfirm(kind, state, text, "");
+        self.queueClipboardConfirm(kind, state, text, "", receipt);
+        return .started;
     };
 
+    finishPasteReceipt(receipt, .pasted);
     return .started;
+}
+
+fn finishPasteReceipt(receipt: ?@import("DropBridge.zig").Receipt, outcome: @import("DropBridge.zig").Outcome) void {
+    if (receipt) |value| value.complete(value.context, outcome);
+}
+
+test "protected paste receipts remain per request and complete once on refusal or destruction" {
+    const Outcome = @import("DropBridge.zig").Outcome;
+    const Tracker = struct {
+        calls: usize = 0,
+        outcome: ?Outcome = null,
+        fn finish(context: *anyopaque, result: Outcome) void {
+            const tracker: *@This() = @ptrCast(@alignCast(context));
+            tracker.calls += 1;
+            tracker.outcome = result;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const hwnd = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("GX paste receipt test"), 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(hwnd);
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    var surface: Surface = .{ .app = &app, .hwnd = hwnd };
+    defer surface.dropClipboardConfirms();
+    var first: Tracker = .{};
+    surface.queueClipboardConfirm(.unsafe_paste, .{ .paste = .standard }, "first\nsecond", "", .{ .context = &first, .complete = Tracker.finish });
+    try std.testing.expectEqual(@as(usize, 0), first.calls);
+    surface.dropClipboardConfirms();
+    surface.dropClipboardConfirms();
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(Outcome.target_gone, first.outcome.?);
+    for (0..max_clipboard_confirms) |_| surface.queueClipboardConfirm(.unsafe_paste, .{ .paste = .standard }, "ordinary\npaste", "", null);
+    var refused: Tracker = .{};
+    surface.queueClipboardConfirm(.unsafe_paste, .{ .paste = .standard }, "broker\npaste", "", .{ .context = &refused, .complete = Tracker.finish });
+    try std.testing.expectEqual(@as(usize, 1), refused.calls);
+    try std.testing.expectEqual(Outcome.paste_failed, refused.outcome.?);
+    surface.dropClipboardConfirms();
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 1), refused.calls);
 }
 
 /// The first text representation of clipboard contents (core or apprt
@@ -1010,6 +1182,7 @@ pub fn setClipboard(
     contents: []const apprt.ClipboardContent,
     confirm: bool,
 ) !void {
+    if (self.remote_source_state != null) return @import("RemoteSource.zig").setClipboard(self, clipboard_type, contents, confirm);
     // Only the standard clipboard is supported on Win32.
     if (clipboard_type != .standard) return;
 
@@ -1022,7 +1195,7 @@ pub fn setClipboard(
     // `clipboard-write = ask`), ask from the message loop: the core calls
     // here from its callbacks.
     if (confirm) {
-        self.queueClipboardConfirm(.write, null, text orelse html.?, html orelse "");
+        self.queueClipboardConfirm(.write, null, text orelse html.?, html orelse "", null);
         return;
     }
     self.writeClipboardText(text, html);
@@ -1120,6 +1293,10 @@ const ClipboardConfirm = struct {
     text: []u8,
     /// A write's HTML representation, owned; empty for none.
     html: []u8,
+    receipt: ?@import("DropBridge.zig").Receipt = null,
+    /// Broker authorization belongs to the exact visible attachment that was
+    /// previewed, even when this Surface survives a move or hide/reopen.
+    broker_view: ui_ref.Attachment = .{},
 
     const Kind = enum { unsafe_paste, read, write };
 
@@ -1142,7 +1319,10 @@ fn queueClipboardConfirm(
     request: ?apprt.ClipboardRequest,
     text: []const u8,
     html: []const u8,
+    receipt: ?@import("DropBridge.zig").Receipt,
 ) void {
+    var queued = false;
+    defer if (!queued) finishPasteReceipt(receipt, .paste_failed);
     const alloc = self.app.core_app.alloc;
     const hwnd = self.hwnd orelse return self.refuseClipboard(request);
     const owned_text = alloc.dupe(u8, text) catch return self.refuseClipboard(request);
@@ -1170,13 +1350,20 @@ fn queueClipboardConfirm(
         .request = request,
         .text = owned_text,
         .html = owned_html,
+        .receipt = receipt,
+        .broker_view = if (receipt != null) self.ui_attachment else .{},
     }) catch {
         alloc.free(owned_text);
         alloc.free(owned_html);
         return self.refuseClipboard(request);
     };
     // While a dialog is up its answer posts the next one.
-    if (!self.confirming_clipboard) _ = w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0);
+    if (!self.confirming_clipboard and w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0) == 0) {
+        var pending = self.clipboard_confirms.pop().?;
+        pending.freeText(alloc);
+        return self.refuseClipboard(request);
+    }
+    queued = true;
 }
 
 /// Deny a clipboard access without asking (a write needs nothing).
@@ -1197,7 +1384,7 @@ pub fn confirmClipboard(self: *Surface) void {
     var pending = self.clipboard_confirms.orderedRemove(0);
     const app = self.app;
     const alloc = app.core_app.alloc;
-    const id = self.core_surface.id;
+    const reference = self.ui_reference;
     const owner = self.parent_window.hwnd;
 
     self.confirming_clipboard = true;
@@ -1205,17 +1392,20 @@ pub fn confirmClipboard(self: *Surface) void {
         request == .osc_52_read or request == .osc_52_write
     else
         pending.kind == .write;
-    const answer: Dialogs.ClipboardAnswer = switch (pending.kind) {
+    const answer: Dialogs.ClipboardAnswer = if (!self.brokerClipboardTargetLive(pending))
+        .{ .choice = .cancel }
+    else switch (pending.kind) {
         .unsafe_paste => .{ .choice = Dialogs.confirmUnsafePaste(owner, pending.text) },
         .read => Dialogs.askClipboardAccess(owner, .read, pending.text, can_remember),
         .write => Dialogs.askClipboardAccess(owner, .write, pending.text, can_remember),
     };
     defer pending.freeText(alloc);
 
-    const surface: *Surface = if (app.core_app.findSurfaceByID(id)) |cs| cs.rt_surface else {
+    const surface = app.resolveSurface(reference) orelse {
         // Kitty requests own arenas that the apprt releases even when their
         // terminal closed while the dialog was open.
         if (pending.request) |state| destroyClipboardRequest(state);
+        finishPasteReceipt(pending.receipt, .target_gone);
         return;
     };
     surface.confirming_clipboard = false;
@@ -1229,24 +1419,160 @@ pub fn confirmClipboard(self: *Surface) void {
         }
     }
     if (surface.clipboard_confirms.items.len > 0) {
-        if (surface.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0);
+        const posted = if (surface.hwnd) |hwnd|
+            w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0) != 0
+        else
+            false;
+        if (!posted) surface.refuseQueuedClipboardConfirms();
     }
 }
 
 /// Complete (`accept`) or deny the clipboard access `pending`.
 fn answerClipboard(self: *Surface, pending: ClipboardConfirm, accept: bool) void {
+    var outcome: @import("DropBridge.zig").Outcome = .cancelled;
+    defer finishPasteReceipt(pending.receipt, outcome);
     const state = pending.request orelse {
         if (accept) self.writeClipboardText(pending.text, if (pending.html.len > 0) pending.html else null);
         return;
     };
-    if (!self.core_surface_ready) return destroyClipboardRequest(state);
-    if (!accept) return self.core_surface.denyClipboardRequest(state);
+    if (!self.core_surface_ready) {
+        outcome = .target_gone;
+        return destroyClipboardRequest(state);
+    }
+    if (!self.brokerClipboardTargetLive(pending)) {
+        outcome = .target_gone;
+        return self.core_surface.denyClipboardRequest(state);
+    }
+    if (!accept or (state == .paste and !self.app.remote.allowsLocalInput(self.ui_reference))) return self.core_surface.denyClipboardRequest(state);
+    if (pending.receipt != null and (self.core_surface.readonly or self.core_surface.child_exited)) {
+        outcome = .paste_failed;
+        return self.core_surface.denyClipboardRequest(state);
+    }
     self.core_surface.completeClipboardRequest(state, .{
         .contents = &.{.{ .mime = "text/plain", .data = pending.text }},
         .confirmed = true,
     }) catch |err| {
         log.err("completeClipboardRequest (confirmed) error: {}", .{err});
+        outcome = .paste_failed;
+        return;
     };
+    outcome = .pasted;
+}
+
+fn brokerClipboardTargetLive(self: *Surface, pending: ClipboardConfirm) bool {
+    return pending.receipt == null or (!self.app.quit_requested and !self.app.drop_closing and
+        self.app.resolveSurfaceView(pending.broker_view) == self);
+}
+
+/// A failed wake cannot leave owned requests awaiting a dialog indefinitely.
+fn refuseQueuedClipboardConfirms(self: *Surface) void {
+    var pending = self.clipboard_confirms;
+    self.clipboard_confirms = .empty;
+    const alloc = self.app.core_app.alloc;
+    defer pending.deinit(alloc);
+    for (pending.items) |*request| {
+        self.refuseClipboard(request.request);
+        finishPasteReceipt(request.receipt, .paste_failed);
+        request.freeText(alloc);
+    }
+}
+
+test "protected paste failed window wake returns its receipt without retaining a request" {
+    const Outcome = @import("DropBridge.zig").Outcome;
+    const Tracker = struct {
+        calls: usize = 0,
+        outcome: ?Outcome = null,
+        fn finish(context: *anyopaque, result: Outcome) void {
+            const tracker: *@This() = @ptrCast(@alignCast(context));
+            tracker.calls += 1;
+            tracker.outcome = result;
+        }
+    };
+    const hwnd = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("GX failed paste wake"), 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    try std.testing.expect(w32.DestroyWindow(hwnd) != 0);
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    var surface: Surface = .{ .app = &app, .hwnd = hwnd };
+    defer surface.dropClipboardConfirms();
+    var tracker: Tracker = .{};
+    surface.queueClipboardConfirm(.unsafe_paste, .{ .paste = .standard }, "first\nsecond", "", .{ .context = &tracker, .complete = Tracker.finish });
+    try std.testing.expectEqual(@as(usize, 1), tracker.calls);
+    try std.testing.expectEqual(Outcome.paste_failed, tracker.outcome.?);
+    try std.testing.expectEqual(@as(usize, 0), surface.clipboard_confirms.items.len);
+    // Cover failure of the next-dialog wake after a modal request completed.
+    surface.confirming_clipboard = true;
+    tracker = .{};
+    surface.queueClipboardConfirm(.unsafe_paste, .{ .paste = .standard }, "first\nsecond", "", .{ .context = &tracker, .complete = Tracker.finish });
+    try std.testing.expectEqual(@as(usize, 0), tracker.calls);
+    surface.refuseQueuedClipboardConfirms();
+    surface.refuseQueuedClipboardConfirms();
+    try std.testing.expectEqual(@as(usize, 1), tracker.calls);
+    try std.testing.expectEqual(Outcome.paste_failed, tracker.outcome.?);
+}
+
+test "broker paste confirmation rejects moved hidden reopened and closing targets" {
+    const Outcome = @import("DropBridge.zig").Outcome;
+    const Tracker = struct {
+        calls: usize = 0,
+        outcome: ?Outcome = null,
+        fn finish(context: *anyopaque, result: Outcome) void {
+            const tracker: *@This() = @ptrCast(@alignCast(context));
+            tracker.calls += 1;
+            tracker.outcome = result;
+        }
+    };
+    var issuer = try ui_ref.Issuer.init(27);
+    var window: Window = undefined;
+    window.ui_reference = try issuer.create(.window);
+    window.closing = false;
+    var core_app: @import("../../App.zig") = undefined;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.ui_ids = issuer;
+    app.quit_requested = false;
+    app.drop_closing = false;
+    app.remote = .{};
+    var surface: Surface = .{ .app = &app, .parent_window = &window };
+    surface.core_surface_initialized = true;
+    surface.core_surface_ready = true;
+    // A missed lifetime guard has a safe, distinguishable paste_failed outcome
+    // instead of accessing terminal/PTY state in this regression fixture.
+    surface.core_surface.readonly = true;
+    surface.ui_reference = try issuer.surface(9);
+    const original = try issuer.attach(surface.ui_reference, window.ui_reference);
+    var surfaces = [_]*Surface{&surface};
+    core_app.surfaces = .{ .items = &surfaces, .capacity = surfaces.len };
+    var tracker: Tracker = .{};
+    const pending: ClipboardConfirm = .{
+        .kind = .unsafe_paste,
+        .request = .{ .paste = .standard },
+        .text = &.{},
+        .html = &.{},
+        .receipt = .{ .context = &tracker, .complete = Tracker.finish },
+        .broker_view = original,
+    };
+    surface.ui_attachment = original;
+    surface.answerClipboard(pending, false);
+    try std.testing.expectEqual(Outcome.cancelled, tracker.outcome.?);
+    for (0..5) |scenario| {
+        tracker = .{};
+        surface.ui_attachment = original;
+        app.quit_requested = false;
+        app.drop_closing = false;
+        switch (scenario) {
+            0 => surface.ui_attachment = .{},
+            1 => surface.ui_attachment = try issuer.attach(surface.ui_reference, window.ui_reference),
+            2 => surface.ui_attachment = try issuer.attach(surface.ui_reference, try issuer.create(.window)),
+            3 => app.quit_requested = true,
+            4 => app.drop_closing = true,
+            else => unreachable,
+        }
+        surface.answerClipboard(pending, true);
+        try std.testing.expectEqual(@as(usize, 1), tracker.calls);
+        try std.testing.expectEqual(Outcome.target_gone, tracker.outcome.?);
+    }
 }
 
 /// Drop the clipboard accesses still waiting for an answer (the terminal is
@@ -1255,6 +1581,7 @@ fn dropClipboardConfirms(self: *Surface) void {
     const alloc = self.app.core_app.alloc;
     for (self.clipboard_confirms.items) |*pending| {
         if (pending.request) |state| destroyClipboardRequest(state);
+        finishPasteReceipt(pending.receipt, .target_gone);
         pending.freeText(alloc);
     }
     self.clipboard_confirms.deinit(alloc);
@@ -1276,6 +1603,53 @@ pub fn setTitle(self: *Surface, title: [:0]const u8) void {
     self.title[len] = 0;
     self.title_len = len;
     self.parent_window.onSurfaceTitleChanged(self);
+}
+
+/// Static per-surface title only. OSC titles are intentionally never session data;
+/// the Windows rename UI stores manual overrides on the tab/window instead.
+pub fn sessionTitle(self: *const Surface) ?[]const u8 {
+    return self.session_title;
+}
+
+/// Termio reader thread, with the renderer mutex already held. This touches
+/// only a separate bounded data snapshot, never HWND, UI state or the mailbox.
+/// launch_origin is immutable from before core init until after the IO join.
+pub fn gxCaptureGuestPwd(self: *Surface, raw_uri: []const u8, host_is_local: bool) void {
+    var buffer: [4096]u8 = undefined;
+    const parsed = @import("../../gx/session_cwd.zig").parse(self.launch_origin.profileId(), raw_uri, host_is_local, &buffer);
+    var path: []const u8 = "";
+    var unavailable = false;
+    if (parsed) |value| {
+        if (value) |cwd| path = cwd.path;
+    } else |_| unavailable = true;
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.guest_cwd_lock);
+    const changed = self.guest_cwd_unavailable != unavailable or
+        !std.mem.eql(u8, self.guest_cwd_buffer[0..self.guest_cwd_len], path);
+    @memcpy(self.guest_cwd_buffer[0..path.len], path);
+    self.guest_cwd_len = @intCast(path.len);
+    self.guest_cwd_unavailable = unavailable;
+    std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.guest_cwd_lock);
+    if (changed) {
+        self.guest_cwd_dirty.store(true, .release);
+        self.app.wakeup();
+    }
+}
+
+pub const GuestCwdSnapshot = struct { path: ?[]const u8, unavailable: bool };
+
+/// Caller owns path. Release this lock before touching renderer/core state;
+/// the reader thread takes renderer -> guest in that order.
+pub fn snapshotGuestCwd(self: *Surface, alloc: Allocator) Allocator.Error!GuestCwdSnapshot {
+    var buffer: [4096]u8 = undefined;
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.guest_cwd_lock);
+    const len = self.guest_cwd_len;
+    const unavailable = self.guest_cwd_unavailable or len == 0;
+    @memcpy(buffer[0..len], self.guest_cwd_buffer[0..len]);
+    std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.guest_cwd_lock);
+    return .{
+        .path = if (len == 0) null else try alloc.dupe(u8, buffer[0..len]),
+        .unavailable = unavailable,
+    };
 }
 
 /// Toggle fullscreen mode. Delegates to the parent Window.
@@ -1313,7 +1687,7 @@ fn pointerOver(self: *const Surface) bool {
 
 /// The system cursor (`IDC_*`) closest to the CSS cursor `shape`; Windows
 /// has no cell, alias, copy, grab or zoom cursors.
-fn cursorIdFor(shape: terminal.MouseShape) usize {
+pub fn cursorIdFor(shape: terminal.MouseShape) usize {
     return switch (shape) {
         .default, .context_menu, .alias, .copy, .zoom_in, .zoom_out => w32.IDC_ARROW,
         .help => w32.IDC_HELP,
@@ -1380,7 +1754,6 @@ pub fn repositionPopups(self: *Surface) void {
 
 /// The UI language changed: refresh the translated text of the popups.
 pub fn onLanguageChanged(self: *Surface) void {
-    self.palette.onLanguageChanged();
     self.search_bar.onLanguageChanged();
 }
 
@@ -1558,7 +1931,6 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     self.width = grid_width;
     self.height = height;
     if (self.search_bar.active) self.search_bar.reposition();
-    if (self.palette.active) self.palette.reposition();
     if (!changed or !self.core_surface_ready) return;
 
     self.wanted_size.store(packSize(grid_width, height), .release);
@@ -1661,9 +2033,7 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
     }
 
     self.search_bar.popup.setOwnerScale(self.scale);
-    self.palette.popup.setOwnerScale(self.scale);
     self.search_bar.onDpiChanged();
-    self.palette.onDpiChanged();
     self.link_preview.hide();
 
     // Notify the scrollbar of the new DPI.
@@ -1681,178 +2051,25 @@ pub fn handleDpiChange(self: *Surface, dpi: u32) void {
 /// presses, repeats and releases, modifier keys included. See
 /// src/gx/win32_input.zig for the contract.
 pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
-    const vk: u16 = @intCast(wparam & 0xFFFF);
     if (action == .press or action == .repeat) self.clearBellBorder();
     if (action == .press) self.key_event_produced_text = false;
-    // Bits 16-23 of lparam. Bit 24 is the extended-key flag, not part of
-    // the scancode; including it broke ToUnicode for AltGr layouts
-    // (German, Polish) and arrow/numpad keys.
-    const scancode: u8 = @truncate(@as(usize, @bitCast(lparam)) >> 16);
-
-    // When the IME is active, physical key presses arrive as VK_PROCESSKEY.
-    // The IME will produce the composed text via WM_IME_COMPOSITION — skip
-    // the key event so we don't feed garbage to the terminal. The release
-    // of such a key can still arrive with its real virtual-key code;
-    // remember the key so that release is not reported on its own.
-    if (vk == w32.VK_PROCESSKEY) {
-        self.ime_keys.setValue(scancode, action == .press);
-        return;
-    }
-    if (action == .press) self.ime_keys.unset(scancode);
-
-    // VK_PACKET is sent by SendInput with KEYEVENTF_UNICODE (used by
-    // accessibility tools, on-screen keyboards, and Unicode injection).
-    // The actual character follows as WM_CHAR — don't set the
-    // key_event_produced_text flag so WM_CHAR is allowed through.
-    if (vk == w32.VK_PACKET) return;
-
-    // Determine left/right for modifier keys using the extended key flag
-    // (bit 24 of lparam) and specific left/right VK codes.
-    const extended = (lparam & (1 << 24)) != 0;
-
-    const key = mapVirtualKey(vk, extended);
-
-    // Build modifier state
-    const mods = getModifiers();
-
-    // Check if the key is a repeat (bit 30 of lparam is set for KEYDOWN
-    // if the key was already down).
-    const actual_action = if (action == .press and (lparam & (1 << 30)) != 0)
-        input.Action.repeat
-    else
-        action;
-
-    // Try to get the unshifted codepoint for this key
-    const unshifted_codepoint: u21 = if (key.codepoint()) |cp| cp else 0;
-
-    // Use ToUnicode to translate the key press into UTF-16 text,
-    // then convert to UTF-8 for the key event. Only for press/repeat.
-    var utf8_buf: [16]u8 = undefined;
-    var utf8_text: []const u8 = "";
-    var consumed_mods: input.Mods = .{};
-    // The modifier set actually encoded into the key event. AltGr handling
-    // below may clear ctrl+alt on this copy without disturbing `mods`.
-    var event_mods = mods;
-
-    // The modifier and lock state for this message, read for every key
-    // (modifiers and releases included) as the console host would.
-    var keyboard_state: [256]u8 = undefined;
-    const have_keyboard_state = w32.GetKeyboardState(&keyboard_state) != 0;
-    if (!have_keyboard_state) @memset(&keyboard_state, 0);
-    var message: gx_win32_input.KeyMessage = .{
-        .vk = vk,
-        .lparam = lparam,
-        .down = action == .press,
-        .state = .fromKeyboardState(&keyboard_state),
-    };
-
-    if (have_keyboard_state and !isModifierVk(vk)) {
-        // ToUnicode's raw UTF-16 output, control characters included, is
-        // the record's character. The buffer lives in the surface so the
-        // message never points into a finished call.
-        const utf16_buf = &self.key_utf16;
-        if (actual_action == .press or actual_action == .repeat) {
-            // App.run skips TranslateMessage for surface keyboard messages,
-            // so this ToUnicode call owns the per-queue dead-key state.
-            // result>0 means composed text (including composition with a
-            // previously pending dead key); result<0 means VK is itself a
-            // dead key and ToUnicode just stored it for the next call.
-            const result = w32.ToUnicode(
-                @intCast(vk),
-                scancode,
-                &keyboard_state,
-                utf16_buf,
-                utf16_buf.len,
-                0,
-            );
-            if (result < 0) {
-                message.dead = true;
-                self.dead_key_preedit = true;
-                const text = wstr.utf8Buf(&utf8_buf, utf16_buf[0..@min(@as(usize, @intCast(@abs(result))), utf16_buf.len)]);
-                self.core_surface.preeditCallback(if (text.len == 0) null else text) catch {};
-            } else if (result > 0 or vk == w32.VK_ESCAPE or vk == w32.VK_BACK) {
-                if (self.dead_key_preedit) self.core_surface.preeditCallback(null) catch {};
-                self.dead_key_preedit = false;
-            }
-            if (result > 0) {
-                const utf16_slice = utf16_buf[0..@min(@as(usize, @intCast(result)), utf16_buf.len)];
-                message.text = utf16_slice;
-                // Skip Ctrl-induced control chars (0x01-0x1A): the core
-                // handles modifier combos via key + mods, and emitting
-                // the control char here would double-encode.
-                if (utf16_slice[0] >= 0x20) {
-                    const len = std.unicode.utf16LeToUtf8(&utf8_buf, utf16_slice) catch 0;
-                    if (len > 0) {
-                        utf8_text = utf8_buf[0..len];
-                        if (mods.shift) consumed_mods.shift = true;
-                        self.key_event_produced_text = true;
-                        // AltGr layouts: Windows reports AltGr as
-                        // Left-Ctrl+Right-Alt. When that combination itself
-                        // produced printable text (e.g. German AltGr+Q '@',
-                        // AltGr+8 '['), strip ctrl+alt from the ENCODED mods.
-                        // The core key encoder reads raw event.mods and would
-                        // otherwise turn the literal into a C0/CSIu control
-                        // sequence. Gate on the right-Alt physically being down
-                        // so genuine Ctrl+Alt chords are left untouched.
-                        if (mods.ctrl and mods.alt and
-                            (keyboard_state[w32.VK_RMENU] & 0x80) != 0)
-                        {
-                            event_mods.ctrl = false;
-                            event_mods.alt = false;
-                            consumed_mods.ctrl = true;
-                            consumed_mods.alt = true;
-                        }
-                    }
-                }
-            }
-        } else {
-            // A release record carries the key's character too. Translate
-            // without changing the keyboard state, so a pending dead key
-            // survives for the next press.
-            const result = w32.ToUnicode(
-                @intCast(vk),
-                scancode,
-                &keyboard_state,
-                utf16_buf,
-                utf16_buf.len,
-                tounicode_keep_state,
-            );
-            if (result < 0) message.dead = true;
-            if (result > 0) message.text = utf16_buf[0..@intCast(result)];
-        }
-    }
-
-    const event = input.KeyEvent{
-        .action = actual_action,
-        .key = key,
-        .mods = event_mods,
-        .consumed_mods = consumed_mods,
-        .composing = message.dead,
-        .utf8 = utf8_text,
-        .unshifted_codepoint = unshifted_codepoint,
-    };
-
-    // The press of this key went to the IME, so its release is not
-    // reported on its own either.
-    if (action == .release and self.ime_keys.isSet(scancode)) {
-        self.ime_keys.unset(scancode);
-        _ = self.core_surface.keyCallback(event) catch |err| {
+    const decoded = self.key_decoder.decode(wparam, lparam, action) orelse return;
+    self.key_event_produced_text = decoded.produced_text;
+    if (decoded.preedit_changed) self.core_surface.preeditCallback(decoded.preedit) catch {};
+    if (decoded.ime_release) {
+        _ = self.core_surface.keyCallback(decoded.event) catch |err| {
             log.err("key callback error: {}", .{err});
         };
         return;
     }
-
-    const effect = self.core_surface.gxWin32KeyCallback(event, message) catch |err| {
+    const effect = self.core_surface.gxWin32KeyCallback(decoded.event, decoded.message) catch |err| {
         log.err("key callback error: {}", .{err});
         return;
     };
     if (effect != .closed) self.noteWin32InputMode();
 }
-
-/// ToUnicode wFlags bit 2: translate without changing the keyboard state
-/// (Windows 10 version 1607 and later).
-const tounicode_keep_state: u32 = 0x4;
 
 /// Log once per terminal when its key input starts going out as
 /// win32-input-mode records, i.e. ConPTY (or a program) turned the mode on.
@@ -1877,6 +2094,7 @@ fn noteWin32InputMode(self: *Surface) void {
 /// key=.unidentified, mirroring how GTK handles IME commits.
 /// textCallback is for clipboard paste; keyCallback is for keyboard/IME text.
 pub fn handleCharEvent(self: *Surface, wparam: usize) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
     const char_code: u16 = @intCast(wparam & 0xFFFF);
 
@@ -1932,6 +2150,7 @@ pub fn handleMouseButton(
     action: input.MouseButtonState,
     lparam: isize,
 ) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
     if (action == .press) self.clearBellBorder();
 
@@ -2133,6 +2352,7 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
 
 /// Handle WM_MOUSEMOVE.
 pub fn handleMouseMove(self: *Surface, lparam: isize) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
     self.trackPointerLeave();
     self.pointerMoved(lparamPos(lparam));
@@ -2206,7 +2426,7 @@ fn followPointerFocus(self: *Surface) void {
     if (focus == hwnd or window.tab_count == 0) return;
     var it = window.tab_trees[window.active_tab].iterator();
     while (it.next()) |entry| {
-        if (entry.view != self and entry.view.hwnd == focus) {
+        if (entry.view != self.leaf and entry.view.nativeHandle() == focus) {
             _ = w32.SetFocus(hwnd);
             return;
         }
@@ -2217,9 +2437,9 @@ fn followPointerFocus(self: *Surface) void {
 /// surface. Convert each path to UTF-8, quote it for the shell running in
 /// the terminal, and type the paths at the cursor.
 pub fn handleDropFiles(self: *Surface, wparam: usize) void {
-    if (!self.core_surface_ready) return;
     const hdrop: w32.HDROP = @ptrFromInt(wparam);
     defer w32.DragFinish(hdrop);
+    if (!self.core_surface_ready) return;
 
     const alloc = self.app.core_app.alloc;
     const text = (hdropPathsToUtf8(alloc, hdrop, self.pathQuoting()) catch |err| {
@@ -2228,27 +2448,39 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
     }) orelse return;
     defer alloc.free(text);
 
-    self.clearBellBorder();
-    // Send through keyCallback as text (PTY-bound, encoding-correct).
-    // Like a paste, and as in Windows Terminal, the paths stay raw text
-    // even while win32-input-mode is on, so this is not gxWin32KeyCallback.
-    _ = self.core_surface.keyCallback(.{
-        .action = .press,
-        .key = .unidentified,
-        .mods = .{},
-        .consumed_mods = .{},
-        .composing = false,
-        .utf8 = text,
-        .unshifted_codepoint = 0,
-    }) catch |err| {
-        log.err("drop-files keyCallback: {}", .{err});
-    };
+    self.pasteDroppedText(text);
+}
+
+/// GUI-owned drop delivery. The bytes are already owned by the drop request;
+/// this never opens the system clipboard and never appends an Enter key.
+/// Core paste validation and bracketed paste remain identical to normal paste.
+pub fn pasteDroppedText(self: *Surface, text: []const u8) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
+    if (!self.core_surface_ready) return;
+    _ = self.completeClipboardRequestWithConfirmation(.{ .paste = .standard }, &.{.{
+        .mime = "text/plain;charset=utf-8",
+        .data = text,
+    }}, &.{"text/plain;charset=utf-8"});
+}
+
+/// A broker-approved paste still goes through normal protected-paste checks.
+/// On success this method owns receipt until exactly one final completion;
+/// the receipt belongs to this operation, never to a global paste slot.
+pub fn pasteBrokerText(self: *Surface, text: []const u8, receipt: @import("DropBridge.zig").Receipt) !void {
+    if (self.app.quit_requested or self.app.drop_closing or
+        !self.core_surface_ready or self.hwnd == null or !self.ui_attachment.isValid() or
+        !self.app.remote.allowsLocalInput(self.ui_reference)) return error.TargetGone;
+    if (self.core_surface.readonly or self.core_surface.child_exited) return error.PasteUnavailable;
+    _ = self.completeClipboardRequestWithReceipt(.{ .paste = .standard }, &.{.{
+        .mime = "text/plain;charset=utf-8",
+        .data = text,
+    }}, &.{"text/plain;charset=utf-8"}, receipt);
 }
 
 /// How dropped and pasted file paths are quoted: for the innermost shell
 /// running in the terminal (`gx.path_quote.styleFor`), in double quotes
 /// when it is unknown.
-fn pathQuoting(self: *Surface) path_quote.Style {
+pub fn pathQuoting(self: *Surface) path_quote.Style {
     if (!self.core_surface_ready) return .windows;
     const root = self.core_surface.getProcessInfo(.foreground_pid) orelse return .windows;
     const pid = std.math.cast(gx_proc.Pid, root) orelse return .windows;
@@ -2329,6 +2561,7 @@ fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP, quoting: path_quote.Styl
 /// Handle WM_MOUSEWHEEL (vertical) and WM_MOUSEHWHEEL (horizontal).
 /// `axis` selects which scroll axis to deliver the delta on.
 pub fn handleMouseWheel(self: *Surface, wparam: usize, lparam: isize, axis: enum { vertical, horizontal }) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
     // The high word of wparam contains the wheel delta (signed).
     const raw_delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
@@ -2444,12 +2677,13 @@ test "wheelNotches adds up small steps" {
 }
 
 pub fn handleImeStartComposition(self: *Surface) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
     self.clearBellBorder();
     self.ime_composing = true;
     self.high_surrogate = 0;
     self.key_event_produced_text = false;
-    self.dead_key_preedit = false;
+    self.key_decoder.dead_key_preedit = false;
     self.clearImeText();
     self.core_surface.preeditCallback(null) catch {};
     self.positionImeWindow();
@@ -2462,6 +2696,7 @@ pub fn handleImeEndComposition(self: *Surface) void {
 }
 
 pub fn handleImeComposition(self: *Surface, lparam: isize) bool {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return true;
     if (!self.core_surface_ready) return false;
     const flags: u32 = @truncate(@as(usize, @bitCast(lparam)));
     if (flags & (w32.GCS_RESULTSTR | w32.GCS_COMPSTR) != 0) self.clearBellBorder();
@@ -2834,6 +3069,7 @@ pub fn prepareReparent(self: *Surface, window: *Window) !ui_ref.Attachment {
 pub fn onReparented(self: *Surface, window: *Window, attachment: ui_ref.Attachment) void {
     std.debug.assert(attachment.isValid() and attachment.object.matches(self.ui_reference));
     std.debug.assert(attachment.owner.matches(window.ui_reference));
+    self.revokeDropTarget();
     self.ui_attachment = attachment;
     if (self.parent_window == window) return;
     self.bell_border_snapshot.store(0, .release);
@@ -2844,7 +3080,6 @@ pub fn onReparented(self: *Surface, window: *Window, attachment: ui_ref.Attachme
     self.search_bar.popup.input = .{};
     self.search_bar.deinit();
     self.link_preview.deinit();
-    self.palette.deinit();
     self.parent_window = window;
     self.handleDpiChange(@intFromFloat(@round(window.scale * 96)));
 
@@ -2866,6 +3101,53 @@ pub fn onReparented(self: *Surface, window: *Window, attachment: ui_ref.Attachme
         saved_input.deinit(alloc);
     }
     self.refitGrid();
+    self.queueDropTarget();
+}
+
+fn revokeDropTarget(self: *Surface) void {
+    if (self.drop_target) |target| {
+        self.drop_target = null;
+        self.app.retireDropTarget(target);
+    }
+}
+
+/// Layout must not enter foreign COM. Defer registration until the native
+/// message loop, after the surface is in the complete window/tab model.
+fn queueDropTarget(self: *Surface) void {
+    if (!self.ui_attachment.isValid() or !self.core_surface_ready) return;
+    if (self.drop_target) |target| {
+        if (!target.attachment.matches(self.ui_attachment)) _ = target.updateAttachment(self.ui_attachment);
+        return;
+    }
+    if (self.drop_target_pending) return;
+    if (self.hwnd == null) return;
+    self.drop_target_pending = true;
+    self.app.queueDropTargets();
+}
+
+pub fn installDropTarget(self: *Surface) void {
+    self.drop_target_pending = false;
+    if (!self.core_surface_ready or !self.ui_attachment.isValid() or self.drop_target != null) return;
+    const app = self.app;
+    const attachment = self.ui_attachment;
+    const hwnd = self.hwnd orelse return;
+    app.beginDropRegistration(hwnd);
+    defer app.endDropRegistration();
+    const target = OleDrop.Target.create(app.core_app.alloc, &app.com_apartment, hwnd, attachment, app.dropCallbacks()) catch |err| {
+        log.warn("OLE drop target unavailable err={}", .{err});
+        return;
+    };
+    // OleInitialize/CoCreateInstance/RegisterDragDrop can pump messages. Never
+    // touch the original self after them without resolving the saved view.
+    const live = app.resolveSurfaceView(attachment) orelse {
+        _ = target.destroy();
+        return;
+    };
+    if (live.drop_target != null) {
+        _ = target.destroy();
+        return;
+    }
+    live.drop_target = target;
 }
 
 test "runtime reference reparent reservations preserve the old view until commit" {
@@ -2956,8 +3238,10 @@ test "bell border surface publication follows visibility config DPI and shutdown
 }
 
 test "bell border VK_PACKET VK_PROCESSKEY and text clear only the addressed split" {
-    var window: Window = .{ .app = undefined };
-    var surface: Surface = .{ .app = undefined, .parent_window = &window, .core_surface_ready = true };
+    var app: App = undefined;
+    app.remote = .{};
+    var window: Window = .{ .app = &app };
+    var surface: Surface = .{ .app = &app, .parent_window = &window, .core_surface_ready = true };
     var other: Surface = .{ .app = undefined, .parent_window = &window };
     surface.core_surface.focused = false;
     surface.core_surface.renderer_thread.wakeup = try global.xev.Async.init();
@@ -3159,6 +3443,7 @@ pub fn refreshRenderer(self: *Surface) void {
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
 pub fn handleFocus(self: *Surface, focused: bool) void {
+    if (self.core_surface_ready and !self.app.remote.allowsLocalInput(self.ui_reference)) return;
     if (!self.core_surface_ready) return;
     self.bell_border_state.setFocused(focused);
     self.publishBellBorder();
@@ -3168,8 +3453,8 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
         self.high_surrogate = 0;
         self.key_event_produced_text = false;
         self.clearImeText();
-        if (self.dead_key_preedit) self.core_surface.preeditCallback(null) catch {};
-        self.dead_key_preedit = false;
+        if (self.key_decoder.dead_key_preedit) self.core_surface.preeditCallback(null) catch {};
+        self.key_decoder.dead_key_preedit = false;
         // Composition messages follow keyboard focus, so a split losing
         // focus mid-composition never gets its own WM_IME_ENDCOMPOSITION.
         // Cancel the composition and clear its inline preedit now.
@@ -3198,222 +3483,8 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
     };
 }
 
-/// Get the current keyboard modifier state from Win32.
-fn getModifiers() input.Mods {
-    var mods: input.Mods = .{};
-
-    // GetKeyState returns a value where the high bit indicates the key
-    // is currently down.
-    if (w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0) {
-        mods.shift = true;
-        // Determine which shift key is pressed
-        if (w32.GetKeyState(@as(i32, w32.VK_RSHIFT)) < 0) {
-            mods.sides.shift = .right;
-        }
-    }
-    if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) {
-        mods.ctrl = true;
-        if (w32.GetKeyState(@as(i32, w32.VK_RCONTROL)) < 0) {
-            mods.sides.ctrl = .right;
-        }
-    }
-    if (w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0) {
-        mods.alt = true;
-        if (w32.GetKeyState(@as(i32, w32.VK_RMENU)) < 0) {
-            mods.sides.alt = .right;
-        }
-    }
-
-    // Check super (Windows key)
-    if (w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
-        w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0)
-    {
-        mods.super = true;
-        if (w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0) {
-            mods.sides.super = .right;
-        }
-    }
-
-    // Lock keys (low bit indicates toggle state)
-    if (w32.GetKeyState(@as(i32, w32.VK_CAPITAL)) & 1 != 0) {
-        mods.caps_lock = true;
-    }
-    if (w32.GetKeyState(@as(i32, w32.VK_NUMLOCK)) & 1 != 0) {
-        mods.num_lock = true;
-    }
-
-    return mods;
-}
-
-/// True for VKs that on their own never produce a character (Shift, Ctrl,
-/// Alt, Win, lock keys). Calling ToUnicode for these is wasted at best and
-/// can perturb the kernel's per-thread keyboard state at worst (in
-/// particular, ToUnicode buffers any pending dead key into kernel state
-/// even when the result is unused).
-fn isModifierVk(vk: u16) bool {
-    return switch (vk) {
-        w32.VK_SHIFT,
-        w32.VK_LSHIFT,
-        w32.VK_RSHIFT,
-        w32.VK_CONTROL,
-        w32.VK_LCONTROL,
-        w32.VK_RCONTROL,
-        w32.VK_MENU,
-        w32.VK_LMENU,
-        w32.VK_RMENU,
-        w32.VK_LWIN,
-        w32.VK_RWIN,
-        w32.VK_CAPITAL,
-        w32.VK_NUMLOCK,
-        w32.VK_SCROLL,
-        => true,
-        else => false,
-    };
-}
-
-/// Map a Win32 virtual key code to a Ghostty input.Key.
-fn mapVirtualKey(vk: u16, extended: bool) input.Key {
-    return switch (vk) {
-        // Letter keys (A-Z: 0x41-0x5A)
-        0x41 => .key_a,
-        0x42 => .key_b,
-        0x43 => .key_c,
-        0x44 => .key_d,
-        0x45 => .key_e,
-        0x46 => .key_f,
-        0x47 => .key_g,
-        0x48 => .key_h,
-        0x49 => .key_i,
-        0x4A => .key_j,
-        0x4B => .key_k,
-        0x4C => .key_l,
-        0x4D => .key_m,
-        0x4E => .key_n,
-        0x4F => .key_o,
-        0x50 => .key_p,
-        0x51 => .key_q,
-        0x52 => .key_r,
-        0x53 => .key_s,
-        0x54 => .key_t,
-        0x55 => .key_u,
-        0x56 => .key_v,
-        0x57 => .key_w,
-        0x58 => .key_x,
-        0x59 => .key_y,
-        0x5A => .key_z,
-
-        // Number keys (0-9: 0x30-0x39)
-        0x30 => .digit_0,
-        0x31 => .digit_1,
-        0x32 => .digit_2,
-        0x33 => .digit_3,
-        0x34 => .digit_4,
-        0x35 => .digit_5,
-        0x36 => .digit_6,
-        0x37 => .digit_7,
-        0x38 => .digit_8,
-        0x39 => .digit_9,
-
-        // Function keys
-        w32.VK_F1 => .f1,
-        w32.VK_F2 => .f2,
-        w32.VK_F3 => .f3,
-        w32.VK_F4 => .f4,
-        w32.VK_F5 => .f5,
-        w32.VK_F6 => .f6,
-        w32.VK_F7 => .f7,
-        w32.VK_F8 => .f8,
-        w32.VK_F9 => .f9,
-        w32.VK_F10 => .f10,
-        w32.VK_F11 => .f11,
-        w32.VK_F12 => .f12,
-        w32.VK_F13 => .f13,
-        w32.VK_F14 => .f14,
-        w32.VK_F15 => .f15,
-        w32.VK_F16 => .f16,
-        w32.VK_F17 => .f17,
-        w32.VK_F18 => .f18,
-        w32.VK_F19 => .f19,
-        w32.VK_F20 => .f20,
-        w32.VK_F21 => .f21,
-        w32.VK_F22 => .f22,
-        w32.VK_F23 => .f23,
-        w32.VK_F24 => .f24,
-
-        // Navigation / editing keys
-        w32.VK_RETURN => if (extended) .numpad_enter else .enter,
-        w32.VK_BACK => .backspace,
-        w32.VK_TAB => .tab,
-        w32.VK_ESCAPE => .escape,
-        w32.VK_SPACE => .space,
-        w32.VK_PRIOR => .page_up,
-        w32.VK_NEXT => .page_down,
-        w32.VK_END => .end,
-        w32.VK_HOME => .home,
-        w32.VK_LEFT => .arrow_left,
-        w32.VK_UP => .arrow_up,
-        w32.VK_RIGHT => .arrow_right,
-        w32.VK_DOWN => .arrow_down,
-        w32.VK_INSERT => .insert,
-        w32.VK_DELETE => .delete,
-
-        // Modifier keys
-        w32.VK_LSHIFT => .shift_left,
-        w32.VK_RSHIFT => .shift_right,
-        w32.VK_LCONTROL => .control_left,
-        w32.VK_RCONTROL => .control_right,
-        w32.VK_LMENU => .alt_left,
-        w32.VK_RMENU => .alt_right,
-        w32.VK_LWIN => .meta_left,
-        w32.VK_RWIN => .meta_right,
-        w32.VK_SHIFT => if (extended) .shift_right else .shift_left,
-        w32.VK_CONTROL => if (extended) .control_right else .control_left,
-        w32.VK_MENU => if (extended) .alt_right else .alt_left,
-
-        // Lock keys
-        w32.VK_CAPITAL => .caps_lock,
-        w32.VK_NUMLOCK => .num_lock,
-        w32.VK_SCROLL => .scroll_lock,
-
-        // OEM keys (US keyboard layout)
-        w32.VK_OEM_1 => .semicolon,
-        w32.VK_OEM_PLUS => .equal,
-        w32.VK_OEM_COMMA => .comma,
-        w32.VK_OEM_MINUS => .minus,
-        w32.VK_OEM_PERIOD => .period,
-        w32.VK_OEM_2 => .slash,
-        w32.VK_OEM_3 => .backquote,
-        w32.VK_OEM_4 => .bracket_left,
-        w32.VK_OEM_5 => .backslash,
-        w32.VK_OEM_6 => .bracket_right,
-        w32.VK_OEM_7 => .quote,
-        w32.VK_OEM_102 => .intl_backslash,
-
-        // Numpad keys
-        w32.VK_NUMPAD0 => .numpad_0,
-        w32.VK_NUMPAD1 => .numpad_1,
-        w32.VK_NUMPAD2 => .numpad_2,
-        w32.VK_NUMPAD3 => .numpad_3,
-        w32.VK_NUMPAD4 => .numpad_4,
-        w32.VK_NUMPAD5 => .numpad_5,
-        w32.VK_NUMPAD6 => .numpad_6,
-        w32.VK_NUMPAD7 => .numpad_7,
-        w32.VK_NUMPAD8 => .numpad_8,
-        w32.VK_NUMPAD9 => .numpad_9,
-        w32.VK_MULTIPLY => .numpad_multiply,
-        w32.VK_ADD => .numpad_add,
-        w32.VK_SEPARATOR => .numpad_separator,
-        w32.VK_SUBTRACT => .numpad_subtract,
-        w32.VK_DECIMAL => .numpad_decimal,
-        w32.VK_DIVIDE => .numpad_divide,
-
-        // Misc
-        w32.VK_APPS => .context_menu,
-        w32.VK_PAUSE => .pause,
-
-        else => .unidentified,
-    };
-}
+const getModifiers = @import("key_translate.zig").getModifiers;
+const mapVirtualKey = @import("key_translate.zig").mapVirtualKey;
 
 /// Return a pointer to the core terminal surface.
 pub fn core(self: *Surface) *CoreSurface {

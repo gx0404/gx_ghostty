@@ -18,6 +18,9 @@ const global = @import("../../global.zig");
 
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
+const Leaf = @import("Leaf.zig");
+const RemotePane = @import("RemotePane.zig");
+const RemoteSource = @import("RemoteSource.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const tabs = @import("tabs.zig");
@@ -25,6 +28,17 @@ const tab_status = @import("tab_status.zig");
 const open_url = @import("open_url.zig");
 const BellAudio = @import("BellAudio.zig");
 const ComApartment = @import("ComApartment.zig");
+const Session = @import("Session.zig");
+const ShellIntegration = @import("ShellIntegration.zig");
+const RemoteCoordinator = @import("RemoteCoordinator.zig");
+const DropBridge = @import("DropBridge.zig");
+const DropCompanion = @import("DropCompanion.zig");
+const Uia = @import("ui/uia.zig");
+const IpcInstance = @import("ipc/Instance.zig");
+const IpcClient = @import("ipc/Client.zig");
+const IpcEnvironment = @import("ipc/environment.zig");
+const IpcProtocol = @import("../../gx/ipc/protocol.zig");
+const OleDrop = @import("ole_drop.zig");
 const w32 = @import("win32.zig");
 const Backdrop = @import("chrome/Backdrop.zig");
 const Dialogs = @import("ui/Dialogs.zig");
@@ -39,6 +53,7 @@ const wstr = @import("ui/wstr.zig");
 const key_conflicts = @import("shortcut_conflicts.zig");
 const gx = @import("../../gx/main.zig");
 const i18n = gx.i18n;
+const PendingDrop = struct { attachment: gx.ui_ref.Attachment, payload: OleDrop.data.Payload };
 
 const input = @import("../../input.zig");
 
@@ -55,6 +70,11 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
 /// Posted to the message-only window by `requestQuit`.
 const WM_APP_QUIT: u32 = w32.WM_APP + 0x62;
+const WM_APP_IPC: u32 = w32.WM_APP + 0x63;
+const WM_APP_DROP: u32 = w32.WM_APP + 0x64;
+const WM_APP_DROP_REGISTER: u32 = w32.WM_APP + 0x65;
+const WM_APP_DROP_REAP: u32 = w32.WM_APP + 0x66;
+const SESSION_TIMER_ID: usize = 0x5353;
 
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
@@ -92,6 +112,8 @@ config: Config,
 /// A message-only window used to receive WM_APP_WAKEUP.
 /// This is not a visible window; it just participates in the message loop.
 msg_hwnd: ?w32.HWND = null,
+ipc_server: ?*IpcInstance.Server = null,
+ipc_forwarded: bool = false,
 
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
@@ -164,13 +186,34 @@ taskbar: ?*w32.ITaskbarList3 = null,
 /// notification balloon; a balloon click focuses it. 0 = app-targeted.
 /// A single id suffices: there is one NOTIF_DESKTOP_UID tray balloon and
 /// each new notification overwrites it.
-notif_desktop_surface_id: u64 = 0,
+notif_desktop_reference: gx.ui_ref.Reference = .{},
 /// Owns this GUI thread's COM/OLE references; consumers share the owner.
 com_apartment: ComApartment = .{},
 
 /// Direct2D/DirectWrite state of the custom-drawn UI (popups, chrome),
 /// created on first use by `uiFactory`.
 ui_factory: ?*d2d.Factory = null,
+session: Session = .{},
+shell: ShellIntegration = .{},
+remote: RemoteCoordinator = .{},
+drop_bridge: DropBridge = .{},
+drop_companion: ?*DropCompanion = null,
+session_save_ready: bool = false,
+uia_api: ?*Uia.Api = null,
+uia_queue: ?*Uia.Queue = null,
+uia_initializing: bool = false,
+uia_popups: @import("ui/uia_bridge.zig").Registry = .{},
+fluent_icons: @import("ui/fluent_icons.zig").Cache = .{},
+drop_feedback: @import("ui/DropFeedback.zig") = .{},
+pending_drops: std.ArrayList(PendingDrop) = .empty,
+drop_closing: bool = false,
+retired_drop_targets: ?*OleDrop.Target = null,
+drop_reaping: bool = false,
+reaping_drop_target: ?*OleDrop.Target = null,
+constructing_drop_hwnd: ?w32.HWND = null,
+constructing_drop_destroy: bool = false,
+constructing_drop_parent: ?w32.HWND = null,
+drop_registration_pending: bool = false,
 
 /// The command of new terminals while `command` is not configured (see
 /// `updateDefaultCommand`). Null when `command` is configured or no shell
@@ -320,6 +363,9 @@ pub fn init(
     // background, making the flash invisible.
     const bg = config.background;
     const bg_brush = w32.CreateSolidBrush(w32.RGB(bg.r, bg.g, bg.b));
+    errdefer if (bg_brush) |brush| {
+        _ = w32.DeleteObject(@ptrCast(brush));
+    };
 
     self.* = .{
         .core_app = core_app,
@@ -333,7 +379,11 @@ pub fn init(
     };
     errdefer self.com_apartment.deinit() catch {};
     errdefer self.default_command_arena.deinit();
-    self.updateDefaultCommand();
+    errdefer if (self.ipc_server) |server| server.destroy();
+    try self.shell.readStartup(alloc);
+    errdefer self.shell.deinit(alloc);
+    if (try self.routeInitialLaunch()) return;
+    if (self.shell.startup != .drop_companion and self.shell.startup != .toast_server) self.updateDefaultCommand();
 
     // Register the window container class (GDI painting, no CS_OWNDC).
     // CS_DBLCLKS is required to receive WM_LBUTTONDBLCLK for divider equalize.
@@ -425,17 +475,31 @@ pub fn init(
         null,
     );
     if (self.msg_hwnd == null) return error.Win32Error;
+    errdefer {
+        _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, 0);
+        _ = w32.DestroyWindow(self.msg_hwnd.?);
+        self.msg_hwnd = null;
+    }
 
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
+    self.shell.initialize(self) catch |err| log.warn("shell integration unavailable: {}", .{err});
+    errdefer self.remote.shutdown(self);
+    if (self.shell.startup != .drop_companion and self.shell.startup != .toast_server) self.remote.initialize(self) catch |err| log.warn("remote transfer unavailable: {}", .{err});
+    errdefer self.drop_bridge.destroy() catch {};
+    if (self.shell.startup != .drop_companion and self.shell.startup != .toast_server) self.drop_bridge.initialize(self) catch |err| log.warn("drop broker unavailable: {}", .{err});
+
     self.taskbar_button_created = RegisterWindowMessageW(std.unicode.utf8ToUtf16LeStringLiteral("TaskbarButtonCreated"));
 
     // Register the `global:` keybinds as system hotkeys.
-    self.registerGlobalHotkey();
+    if (self.shell.startup != .toast_server and self.shell.startup != .drop_companion) self.registerGlobalHotkey();
+    errdefer self.unregisterGlobalHotkeys();
+    if (self.ipc_server) |server| try server.start(self.msg_hwnd.?, WM_APP_IPC);
 }
 
 pub fn run(self: *App) !void {
+    if (self.ipc_forwarded) return;
     self.running = true;
     defer self.running = false;
 
@@ -443,30 +507,84 @@ pub fn run(self: *App) !void {
     // dark app mode of Windows (`theme = light:…,dark:…`).
     self.syncColorScheme();
 
-    // Create the initial Window container with one tab.
-    const alloc = self.core_app.alloc;
-    const window = window: {
-        const window = try alloc.create(Window);
-        errdefer alloc.destroy(window);
-        var initialized = false;
-        errdefer if (initialized) window.deinit();
-        try window.init(self, .{});
-        initialized = true;
-        if (try self.settleDevice()) {
-            window.deinit();
-            initialized = false;
+    // Device setup needs an empty HWND before restoring any terminal leaves.
+    if (self.shell.startup == .drop_companion) {
+        self.session.protect_file = true;
+        self.drop_companion = try DropCompanion.create(self, self.shell.startup.drop_companion);
+        self.stopQuitTimer();
+    } else if (self.shell.startup == .toast_server) {
+        self.session.protect_file = true;
+        if (self.shell.worker == null) return;
+        _ = w32.SetTimer(self.msg_hwnd.?, ShellIntegration.server_timer, 15000, null);
+    } else if (self.config.@"initial-window" or self.shell.startup == .profile) {
+        const alloc = self.core_app.alloc;
+        const window = window: {
+            const window = try alloc.create(Window);
+            errdefer alloc.destroy(window);
+            var initialized = false;
+            errdefer if (initialized) window.deinit();
             try window.init(self, .{});
             initialized = true;
+            if (try self.settleDevice()) {
+                window.deinit();
+                initialized = false;
+                try window.init(self, .{});
+                initialized = true;
+            }
+            try self.windows.append(alloc, window);
+            break :window window;
+        };
+        const bootstrap = window.ui_reference;
+        if (self.shell.startup == .profile) {
+            self.session.protect_file = true;
+            var profiles = try self.cachedLaunchProfiles();
+            defer profiles.deinit();
+            const profile_id = self.shell.startup.profile;
+            if (profiles.find(profile_id) == null or !self.openProfile(window, profile_id, .tab)) {
+                self.discardSessionWindow(bootstrap);
+                return error.ShellProfileUnavailable;
+            }
+        } else if (self.session.tryRestore(self)) {
+            self.discardSessionWindow(bootstrap);
+        } else {
+            if (self.quit_requested) return;
+            const fallback = self.resolveWindow(bootstrap) orelse try self.newWindow(.{});
+            _ = try fallback.addTab();
         }
-        try self.windows.append(alloc, window);
-        break :window window;
-    };
-    _ = try window.addTab();
-    self.scheduleShortcutProbe();
+        self.scheduleShortcutProbe();
+        self.scheduleSessionSave();
+    } else {
+        self.session.protect_file = true;
+        self.stopQuitTimer();
+    }
 
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
     loop: while (true) {
+        // Only this outer loop is a safe COM-revocation boundary. A posted
+        // reaper message can also arrive inside a native/modal transaction.
+        self.reapDropTargets();
+        self.installDropTargets();
+        self.refreshUia();
+        self.shell.drain(self);
+        const remote_kept_alive = self.remote.keepsAlive();
+        self.remote.drain(self);
+        self.drop_bridge.updateTarget(self);
+        self.drop_bridge.drain(self);
+        if (self.drop_companion) |companion| {
+            companion.drain();
+            if (!companion.keepsAlive()) {
+                if (companion.destroy()) |_| {
+                    self.drop_companion = null;
+                    self.startQuitTimer();
+                } else |err| log.err("drop companion shutdown pending: {}", .{err});
+            }
+        }
+        if (remote_kept_alive and !self.remote.keepsAlive() and self.windows.items.len == 0 and self.quick_terminal == null) self.startQuitTimer();
+        if (self.session_save_ready) {
+            self.session_save_ready = false;
+            self.session.flush(self);
+        }
         const result = w32.GetMessageW(&msg, null, 0, 0);
         if (result == 0) {
             // WM_QUIT received. Check if it's still wanted — stopQuitTimer()
@@ -513,7 +631,7 @@ pub fn run(self: *App) !void {
                 if (msg.wParam == w32.VK_PACKET) break :blk false;
                 const h = msg.hwnd orelse break :blk false;
                 const atom: u16 = @truncate(w32.GetClassLongW(h, w32.GCW_ATOM));
-                break :blk atom != 0 and atom == self.terminal_class_atom;
+                break :blk (atom != 0 and atom == self.terminal_class_atom) or RemotePane.isWindow(h);
             },
             else => false,
         };
@@ -568,10 +686,13 @@ const MB_ICONERROR: u32 = 0x00000010;
 /// The chrome or popup element that owns a focused Edit control.
 const EditOwner = union(enum) {
     rename: *Window,
-    palette: *Surface,
+    palette: *Window,
     search: *Surface,
+    remote_search: *RemotePane,
 };
 
+/// GUI-thread-only lookup. The returned pointer is borrowed until the next
+/// message pump; retain the reference and resolve again after modal/COM calls.
 pub fn resolveWindow(self: *App, reference: gx.ui_ref.Reference) ?*Window {
     if (!reference.isValid() or reference.kind != .window or reference.epoch != self.ui_ids.epoch) return null;
     for (self.windows.items) |window| {
@@ -580,9 +701,40 @@ pub fn resolveWindow(self: *App, reference: gx.ui_ref.Reference) ?*Window {
     if (self.quick_terminal) |quick| {
         if (!quick.window.closing and reference.matches(quick.window.ui_reference)) return quick.window;
     }
+    if (self.remote.resolveHostWindow(reference)) |window| {
+        if (!window.closing) return window;
+    }
     return null;
 }
 
+pub fn resolveWindowView(self: *App, attachment: gx.ui_ref.Attachment) ?*Window {
+    const window = self.resolveWindow(attachment.object) orelse return null;
+    if (!attachment.matches(window.ui_attachment)) return null;
+    return window;
+}
+
+/// A GUI-thread borrowed tab location; indices are not persistent identities.
+pub const TabLocation = struct { window: *Window, index: usize };
+
+pub fn resolveTab(self: *App, reference: gx.ui_ref.Reference) ?TabLocation {
+    if (!reference.isValid() or reference.kind != .tab or reference.epoch != self.ui_ids.epoch) return null;
+    for (self.windows.items) |window| {
+        if (window.resolveTab(reference)) |index| return .{ .window = window, .index = index };
+    }
+    if (self.quick_terminal) |quick| {
+        if (quick.window.resolveTab(reference)) |index| return .{ .window = quick.window, .index = index };
+    }
+    return null;
+}
+
+pub fn resolveTabView(self: *App, attachment: gx.ui_ref.Attachment) ?TabLocation {
+    const window = self.resolveWindow(attachment.owner) orelse return null;
+    const index = window.resolveTab(attachment.object) orelse return null;
+    if (!attachment.matches(window.tab_attachments[index])) return null;
+    return .{ .window = window, .index = index };
+}
+
+/// GUI-thread-only core identity lookup, including temporarily hidden views.
 pub fn resolveSurface(self: *App, reference: gx.ui_ref.Reference) ?*Surface {
     if (!reference.isValid() or reference.kind != .surface or reference.epoch != self.ui_ids.epoch) return null;
     for (self.core_app.surfaces.items) |surface| {
@@ -611,12 +763,14 @@ fn findEditOwner(self: *App, hwnd: w32.HWND) ?EditOwner {
 
 fn findEditOwnerIn(win: *Window, hwnd: w32.HWND) ?EditOwner {
     if (win.tab_bar.isRenameEdit(hwnd)) return .{ .rename = win };
+    if (win.palette.active and win.palette.ownsEdit(hwnd)) return .{ .palette = win };
     for (0..win.tab_count) |i| {
         var it = win.tab_trees[i].iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
-            if (surface.palette.active and surface.palette.ownsEdit(hwnd)) return .{ .palette = surface };
-            if (surface.search_bar.active and surface.search_bar.ownsEdit(hwnd)) return .{ .search = surface };
+            switch (entry.view.backend) {
+                .local => |surface| if (surface.search_bar.active and surface.search_bar.ownsEdit(hwnd)) return .{ .search = surface },
+                .remote => |remote| if (remote.ui.search_bar.active and remote.ui.search_bar.ownsEdit(hwnd)) return .{ .remote_search = remote },
+            }
         }
     }
     return null;
@@ -642,7 +796,8 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
             return true;
         },
         .search => |surface| if (surface.search_bar.handleKey(vk)) return true,
-        .palette => |surface| if (surface.palette.handleKey(vk)) return true,
+        .remote_search => |remote| if (remote.ui.search_bar.handleKey(vk)) return true,
+        .palette => |win| if (win.palette.handleKey(vk)) return true,
     }
 
     const mods: input.Mods = .{
@@ -650,7 +805,19 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
         .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
         .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
     };
-    const bound = mods.ctrl and trigger.isBound(&self.config.keybind.set, vk, mods);
+    // The key goes to the pane below, so a remote one decides with the
+    // source's keybind snapshot, like its find bar and the palette.
+    const bindings = switch (owner) {
+        .remote_search => |remote| &remote.ui.keybind_set.set,
+        .palette => |win| win.palette.keybindSet(),
+        .rename => |win| rename: {
+            const leaf = win.activeLeaf() orelse break :rename &self.config.keybind.set;
+            const remote = leaf.remote() orelse break :rename &self.config.keybind.set;
+            break :rename &remote.ui.keybind_set.set;
+        },
+        .search => &self.config.keybind.set,
+    };
+    const bound = mods.ctrl and trigger.isBound(bindings, vk, mods);
     switch (editKeyRoute(vk, mods, bound)) {
         .edit => return false,
         .swallow => return true,
@@ -659,27 +826,33 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
 
     // A keybinding: e.g. `Ctrl+Shift+P` while renaming toggles the palette
     // instead of being eaten by the edit control.
-    const target: ?*Surface = switch (owner) {
+    const target: ?@import("Pane.zig") = switch (owner) {
         // Commit (not cancel) — matches standard Win32 inline rename
         // convention (Explorer, Edge): any action that takes focus away
         // saves the typed title.
         .rename => |win| target: {
             win.tab_bar.finishRename();
-            break :target win.getActiveSurface();
+            break :target win.activePane();
         },
-        .palette => |surface| target: {
-            surface.palette.setActive(false);
-            break :target surface;
+        .palette => |win| target: {
+            win.palette.setActive(false);
+            break :target win.activePane();
         },
         // The search goes on: the bar stays open, the terminal gets the
         // focus and the key.
         .search => |surface| target: {
             if (surface.hwnd) |h| _ = w32.SetFocus(h);
-            break :target surface;
+            break :target @import("Pane.zig").fromLocal(surface);
+        },
+        .remote_search => |remote| target: {
+            const reference = remote.ui_reference;
+            if (remote.hwnd) |h| _ = w32.SetFocus(h);
+            break :target @import("Pane.zig").resolve(self, reference);
         },
     };
-    const surface = target orelse return false;
-    surface.handleKeyEvent(msg.wParam, msg.lParam, .press);
+    const pane = target orelse return false;
+    const child = pane.nativeHandle() orelse return false;
+    _ = w32.SendMessageW(child, msg.message, msg.wParam, msg.lParam);
     return true;
 }
 
@@ -745,7 +918,32 @@ fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
 }
 
 pub fn terminate(self: *App) void {
+    self.drop_bridge.beginClose();
+    if (self.drop_companion) |companion| {
+        // Busy means COM or an outer drain still borrows App-owned state.
+        // Continuing teardown would turn that lifecycle violation into a UAF.
+        companion.destroy() catch @panic("drop companion still borrowed during App termination");
+        self.drop_companion = null;
+    }
+    // Stop remote control and detach all render exports while object identities,
+    // GUI windows, COM and the message destination still belong to this app.
+    self.remote.shutdown(self);
+    // run has returned, so nested GUI IPC handlers have all finished. Stop
+    // workers before destroying their HWND or any terminal targets.
+    if (self.ipc_server) |server| {
+        self.ipc_server = null;
+        server.destroy();
+    }
+    self.shell.deinit(self.core_app.alloc);
     self.ui_ids.epoch = 0;
+    if (self.uia_queue) |queue| queue.close();
+    self.uia_popups.deinit();
+    self.drop_closing = true;
+    var pending_drops = self.pending_drops;
+    self.pending_drops = .empty;
+    self.drop_feedback.deinit();
+    for (pending_drops.items) |*request| request.payload.deinit();
+    pending_drops.deinit(self.core_app.alloc);
     self.com_apartment.beginClose() catch |err| log.err("COM apartment 关闭准备失败: {}", .{err});
     if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, PROGRESS_TIMER_ID);
     self.progress_timer = false;
@@ -788,10 +986,28 @@ pub fn terminate(self: *App) void {
         alloc.destroy(window);
     }
     self.windows.deinit(alloc);
+    self.windows = .empty;
+    // All model owners are inert. Revoke registered children while their HWNDs
+    // and window classes still exist, before releasing shared GUI resources.
+    self.reapDropTargets();
+
+    // Concrete surface/dialog teardown has returned every owned paste receipt.
+    self.drop_bridge.destroy() catch @panic("drop broker receipts still live during App termination");
 
     // Last: the threads of the terminals wake the message loop through it
     // until they are gone.
     if (self.msg_hwnd) |hwnd| {
+        // The worker threads have joined. Windows discards queued messages on
+        // destruction, so explicitly free the two owned pointer payload types.
+        var pending: w32.MSG = undefined;
+        while (w32.PeekMessageW(&pending, hwnd, WM_APP_EXPORT_TERMINAL_IO, WM_APP_EXPORT_TERMINAL_IO, w32.PM_REMOVE) != 0) {
+            const request: *TerminalIoExport = @ptrFromInt(@as(usize, @bitCast(pending.lParam)));
+            request.destroy(alloc);
+        }
+        while (w32.PeekMessageW(&pending, hwnd, WM_APP_OPEN_LINK, WM_APP_OPEN_LINK, w32.PM_REMOVE) != 0) {
+            const request: *LinkRequest = @ptrFromInt(@as(usize, @bitCast(pending.lParam)));
+            request.destroy(alloc);
+        }
         // Clear GWLP_USERDATA before destroying so msgWndProc sees
         // userdata=0 and falls through to DefWindowProc for any
         // messages during destruction (e.g. WM_DESTROY).
@@ -806,6 +1022,11 @@ pub fn terminate(self: *App) void {
     }
 
     // After the windows: their popups draw with the factory.
+    self.fluent_icons.deinit();
+    if (self.uia_queue) |queue| queue.release();
+    self.uia_queue = null;
+    if (self.uia_api) |api| api.release();
+    self.uia_api = null;
     if (self.ui_factory) |factory| {
         factory.destroy();
         self.ui_factory = null;
@@ -831,7 +1052,103 @@ pub fn terminate(self: *App) void {
     self.proc_shared.deinit();
     self.profiles_cache.deinit();
     self.default_command_arena.deinit();
+    self.session.deinit();
     self.config.deinit();
+}
+
+pub fn scheduleSessionSave(self: *App) void {
+    if (!self.running or self.drop_closing or !self.config.@"gx-session-restore" or self.ipc_forwarded) return;
+    self.session.markDirty();
+    if (self.msg_hwnd) |hwnd| _ = w32.SetTimer(hwnd, SESSION_TIMER_ID, 300, null);
+}
+
+pub fn ensureUia(self: *App) bool {
+    if (self.uia_api != null and self.uia_queue != null) return true;
+    if (self.drop_closing or self.uia_initializing) return false;
+    const hwnd = self.msg_hwnd orelse return false;
+    self.uia_initializing = true;
+    defer self.uia_initializing = false;
+    self.com_apartment.ensureCom() catch return false;
+    // Providers can outlive GUI owners and be released from an external MTA.
+    const alloc = std.heap.page_allocator;
+    const api = Uia.Api.load(alloc) catch return false;
+    const queue = Uia.Queue.create(alloc, hwnd) catch {
+        api.release();
+        return false;
+    };
+    self.uia_api = api;
+    self.uia_queue = queue;
+    return true;
+}
+
+pub fn uiaForWindow(self: *App, window: *Window, wparam: usize, lparam: isize) isize {
+    if (w32.objectId(lparam) != Uia.root_object_id) return 0;
+    const reference = window.ui_reference;
+    if (!self.ensureUia()) return 0;
+    const live = self.resolveWindow(reference) orelse return 0;
+    live.uia_bridge.publish(live, self.uia_api.?, self.uia_queue.?) catch |err| {
+        log.warn("UIA snapshot unavailable err={}", .{err});
+        return 0;
+    };
+    live.uia_dirty = false;
+    return live.uia_bridge.publisher.returnProvider(wparam, lparam);
+}
+
+fn refreshUia(self: *App) void {
+    const api = self.uia_api orelse return;
+    const queue = self.uia_queue orelse return;
+    for (self.windows.items) |window| {
+        if (!window.uia_dirty) continue;
+        window.uia_dirty = false;
+        window.uia_bridge.publish(window, api, queue) catch |err| log.warn("UIA refresh failed err={}", .{err});
+    }
+    if (self.quick_terminal) |quick| {
+        const window = quick.window;
+        if (window.uia_dirty) {
+            window.uia_dirty = false;
+            window.uia_bridge.publish(window, api, queue) catch {};
+        }
+    }
+}
+
+fn onUia(self: *App) void {
+    const queue = self.uia_queue orelse return;
+    // A bounded queue can still be replenished indefinitely by external MTA
+    // clients. Yield back to native messages after a bounded GUI batch.
+    var budget: usize = 64;
+    while (budget > 0) : (budget -= 1) {
+        const value = queue.pop() orelse break;
+        var action = value;
+        defer action.deinit();
+        if (self.uia_popups.dispatch(self, &action)) continue;
+        if (self.dispatchRemoteUia(&action)) continue;
+        // dispatch may close a window or enter a modal loop. Stop iterating as
+        // soon as the snapshot owner matches; no list pointer survives it.
+        var handled = false;
+        for (self.windows.items) |window| {
+            if (!window.uia_bridge.publisher.accepts(action)) continue;
+            _ = window.uia_bridge.dispatch(self, &action);
+            handled = true;
+            break;
+        }
+        if (!handled) if (self.quick_terminal) |quick| {
+            if (quick.window.uia_bridge.publisher.accepts(action)) _ = quick.window.uia_bridge.dispatch(self, &action);
+        };
+    }
+    self.uia_popups.retryAnnouncements();
+}
+
+/// Remove only this staged window, without treating rollback as a user close
+/// or starting the quit timer while a normal startup fallback is still pending.
+pub fn discardSessionWindow(self: *App, reference: gx.ui_ref.Reference) void {
+    const window = self.resolveWindow(reference) orelse return;
+    for (self.windows.items, 0..) |candidate, index| {
+        if (candidate != window) continue;
+        _ = self.windows.orderedRemove(index);
+        window.deinit();
+        self.core_app.alloc.destroy(window);
+        return;
+    }
 }
 
 /// The Direct2D/DirectWrite factory of the custom-drawn UI, created on
@@ -840,6 +1157,7 @@ pub fn terminate(self: *App) void {
 pub fn uiFactory(self: *App) ?*d2d.Factory {
     if (self.ui_factory) |factory| return factory;
     self.ui_factory = d2d.Factory.create(self.core_app.alloc) catch return null;
+    self.fluent_icons = .init(self.ui_factory.?);
     return self.ui_factory;
 }
 
@@ -960,14 +1278,334 @@ fn broadcastSystemTheme(window: *Window) void {
     _ = w32.SendMessageW(hwnd, w32.WM_SYSCOLORCHANGE, 0, 0);
 }
 
-/// IPC from external processes. Not yet implemented for Win32.
-pub fn performIpc(
-    _: Allocator,
-    _: apprt.ipc.Target,
-    comptime action: apprt.ipc.Action.Key,
-    _: apprt.ipc.Action.Value(action),
-) !bool {
+pub fn instanceIsolation(alloc: Allocator, class: ?[]const u8) !@import("ipc/Security.zig").policy.Isolation {
+    const path = try gx.config_layers.overlayPath(alloc);
+    defer alloc.free(path);
+    const directory = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    return IpcEnvironment.isolation(alloc, directory, class, @import("../../build_config.zig").version_string);
+}
+
+/// Runs before hotkeys and surfaces exist. Never independently launch after an
+/// ambiguous IPC result: the primary may already have created the window.
+fn routeInitialLaunch(self: *App) !bool {
+    if (self.shell.startup == .toast_server or self.shell.startup == .drop_companion) return false;
+    if (!self.config.@"gx-single-instance" or self.config.@"initial-command" != null) return false;
+    var iter = try cli.args.argsIterator(self.core_app.alloc, global.args());
+    defer iter.deinit();
+    while (iter.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--gx-shell-action=") or std.mem.startsWith(u8, arg, "--gx-shell-profile=")) continue;
+        if (!IpcEnvironment.canForwardArgument(arg)) return false;
+    }
+    const isolation = try instanceIsolation(self.core_app.alloc, self.config.class);
+    switch (try IpcInstance.elect(self.core_app.alloc, isolation, self.ui_ids.epoch)) {
+        .primary => |server| self.ipc_server = server,
+        .secondary => |endpoint| {
+            const profile_id = if (self.shell.startup == .profile) self.shell.startup.profile else "";
+            const outcome = try IpcClient.request(endpoint, self.ui_ids.epoch, 1, .{ .new_window = profile_id });
+            if (outcome != .completed) return error.IPCExecutionFailed;
+            self.ipc_forwarded = true;
+            return true;
+        },
+    }
     return false;
+}
+
+/// CLI actions connect to the same authenticated namespace as ordinary starts.
+pub fn performIpc(
+    alloc: Allocator,
+    target: apprt.ipc.Target,
+    comptime action: apprt.ipc.Action.Key,
+    value: apprt.ipc.Action.Value(action),
+) anyerror!bool {
+    const request: IpcProtocol.Request = switch (action) {
+        .toggle_quick_terminal => .toggle_quick_terminal,
+        .new_window => if (value.arguments == null) .{ .new_window = "" } else return error.UnsupportedIPCOverrides,
+        .new_tab => if (value.arguments == null and value.surface_id == 0) .{ .new_tab = "" } else return error.UnsupportedIPCOverrides,
+    };
+    var config = try Config.load(alloc);
+    defer config.deinit();
+    const class = switch (target) {
+        .class => |name| name,
+        .detect => config.class,
+    };
+    const isolation = try instanceIsolation(alloc, class);
+    const security = @import("ipc/Security.zig");
+    const native = @import("ipc/native.zig");
+    const local = try security.inspect(native.GetCurrentProcessId());
+    defer local.deinit();
+    const endpoint = try IpcInstance.Endpoint.init(isolation, local.identity);
+    const outcome = try IpcClient.request(endpoint, try IpcInstance.freshEpoch(), 1, request);
+    return switch (outcome) {
+        .completed => true,
+        .unavailable => error.IPCUnavailable,
+        .rejected => error.IPCRejected,
+        .target_gone => error.IPCTargetGone,
+        .execution_failed => error.IPCExecutionFailed,
+        .cancelled => error.IPCCancelled,
+    };
+}
+
+fn onIpc(self: *App) void {
+    const server = self.ipc_server orelse return;
+    while (server.take()) |work| {
+        const outcome = if (self.quit_requested) IpcProtocol.Outcome.cancelled else self.executeIpc(work.request) catch |err| result: {
+            log.err("IPC action failed err={}", .{err});
+            break :result IpcProtocol.Outcome.execution_failed;
+        };
+        server.finish(work.key, outcome) catch |err| log.err("IPC completion failed err={}", .{err});
+    }
+}
+
+pub fn dropCallbacks(self: *App) OleDrop.Callbacks {
+    return .{ .context = self, .is_live = dropIsLive, .post = postDrop, .feedback = dropFeedback };
+}
+
+/// No allocation or foreign COM here: moves and surface teardown may still be
+/// using borrowed tree pointers. Native revocation runs at a GUI safe point.
+pub fn retireDropTarget(self: *App, target: *OleDrop.Target) void {
+    target.invalidate();
+    target.retired_next = self.retired_drop_targets;
+    self.retired_drop_targets = target;
+    if (self.msg_hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_DROP_REAP, 0, 0);
+}
+
+/// Keep a registered terminal HWND alive until native revoke releases OLE's
+/// registration reference. Surface/core resources may already be gone.
+pub fn deferDropWindowDestroy(self: *App, hwnd: w32.HWND) bool {
+    if (self.constructing_drop_hwnd == hwnd) {
+        self.constructing_drop_destroy = true;
+        return true;
+    }
+    if (self.reaping_drop_target) |target| {
+        if (target.hwnd == hwnd) {
+            target.retired_destroy_hwnd = true;
+            return true;
+        }
+    }
+    var cursor = self.retired_drop_targets;
+    while (cursor) |target| : (cursor = target.retired_next) {
+        if (target.hwnd == hwnd) {
+            target.retired_destroy_hwnd = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Destroy the parent only after the final registered child in reaper order.
+pub fn deferDropParentDestroy(self: *App, hwnd: w32.HWND) bool {
+    var last: ?*OleDrop.Target = null;
+    if (self.reaping_drop_target) |target| {
+        if (w32.GetParent(target.hwnd) == hwnd) last = target;
+    }
+    var cursor = self.retired_drop_targets;
+    while (cursor) |target| : (cursor = target.retired_next) {
+        if (w32.GetParent(target.hwnd) == hwnd) last = target;
+    }
+    const target = last orelse {
+        if (self.constructing_drop_hwnd) |child| {
+            if (w32.GetParent(child) == hwnd) {
+                self.constructing_drop_parent = hwnd;
+                return true;
+            }
+        }
+        return false;
+    };
+    target.retired_destroy_parent = hwnd;
+    return true;
+}
+
+pub fn beginDropRegistration(self: *App, hwnd: w32.HWND) void {
+    std.debug.assert(self.constructing_drop_hwnd == null);
+    self.constructing_drop_hwnd = hwnd;
+    self.constructing_drop_destroy = false;
+    self.constructing_drop_parent = null;
+}
+
+pub fn endDropRegistration(self: *App) void {
+    const terminal = if (self.constructing_drop_destroy) self.constructing_drop_hwnd else null;
+    const parent = self.constructing_drop_parent;
+    self.constructing_drop_hwnd = null;
+    self.constructing_drop_destroy = false;
+    self.constructing_drop_parent = null;
+    if (terminal) |hwnd| _ = w32.DestroyWindow(hwnd);
+    if (parent) |hwnd| _ = w32.DestroyWindow(hwnd);
+}
+
+pub fn queueDropTargets(self: *App) void {
+    if (self.drop_closing or self.drop_registration_pending) return;
+    self.drop_registration_pending = true;
+    if (self.msg_hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_DROP_REGISTER, 0, 0);
+}
+
+fn installDropTargets(self: *App) void {
+    if (self.drop_closing or !self.drop_registration_pending) return;
+    self.drop_registration_pending = false;
+    var references: [64]gx.ui_ref.Reference = undefined;
+    var count: usize = 0;
+    for (self.core_app.surfaces.items) |surface| {
+        if (!surface.drop_target_pending) continue;
+        if (count == references.len) {
+            self.queueDropTargets();
+            break;
+        }
+        surface.drop_target_pending = false;
+        references[count] = surface.ui_reference;
+        count += 1;
+    }
+    // Every remote pane of the model, shown or not: a pane skipped here would
+    // keep its pending flag, and `RemotePane.queueDropTarget` never queues a
+    // pending pane again. `installDropTarget` itself skips hidden views.
+    const quick_window: ?*Window = if (self.quick_terminal) |quick| quick.window else null;
+    remotes: for (0..self.windows.items.len + 1) |slot| {
+        const window = if (slot < self.windows.items.len) self.windows.items[slot] else quick_window orelse break;
+        for (0..window.tab_count) |tab| {
+            var panes = window.paneIterator(tab);
+            while (panes.next()) |pane| {
+                const remote = switch (pane.backend) {
+                    .remote => |value| value,
+                    .local => continue,
+                };
+                if (!remote.drop_target_pending) continue;
+                if (count == references.len) {
+                    self.queueDropTargets();
+                    break :remotes;
+                }
+                remote.drop_target_pending = false;
+                references[count] = remote.ui_reference;
+                count += 1;
+            }
+        }
+    }
+    // Foreign COM may mutate the app list. Iterate owned identity values and
+    // re-resolve each one, never a borrowed slice of the live surface list.
+    for (references[0..count]) |reference| {
+        if (self.resolveSurface(reference)) |surface| surface.installDropTarget() else if (self.resolveRemote(reference)) |remote| remote.installDropTarget();
+    }
+}
+
+fn reapDropTargets(self: *App) void {
+    if (self.drop_reaping or self.retired_drop_targets == null) return;
+    self.drop_reaping = true;
+    defer self.drop_reaping = false;
+    self.drop_feedback.hide();
+    while (self.retired_drop_targets) |target| {
+        self.retired_drop_targets = target.retired_next;
+        target.retired_next = null;
+        // Keep the record alive through foreign COM and any nested close that
+        // adds a deferred native destruction to the record being reaped.
+        const interface = &target.interface;
+        _ = interface.vtable.AddRef(interface);
+        self.reaping_drop_target = target;
+        const result = target.destroy();
+        if (result < 0) log.warn("OLE drop revocation failed hr={x}", .{@as(u32, @bitCast(result))});
+        const terminal = if (target.retired_destroy_hwnd) target.hwnd else null;
+        const parent = target.retired_destroy_parent;
+        self.reaping_drop_target = null;
+        if (terminal) |hwnd| _ = w32.DestroyWindow(hwnd);
+        if (parent) |hwnd| _ = w32.DestroyWindow(hwnd);
+        _ = interface.vtable.Release(interface);
+    }
+}
+
+fn dropIsLive(context: *anyopaque, attachment: gx.ui_ref.Attachment) bool {
+    const self: *App = @ptrCast(@alignCast(context));
+    return !self.drop_closing and !self.quit_requested and self.resolvePaneView(attachment) != null;
+}
+
+fn postDrop(context: *anyopaque, attachment: gx.ui_ref.Attachment, payload: OleDrop.data.Payload) bool {
+    const self: *App = @ptrCast(@alignCast(context));
+    if (self.pending_drops.items.len >= 8 or !dropIsLive(context, attachment)) return false;
+    const hwnd = self.msg_hwnd orelse return false;
+    self.pending_drops.append(self.core_app.alloc, .{ .attachment = attachment, .payload = payload }) catch return false;
+    if (w32.PostMessageW(hwnd, WM_APP_DROP, 0, 0) == 0) {
+        _ = self.pending_drops.pop();
+        return false;
+    }
+    return true;
+}
+
+fn dropFeedback(context: *anyopaque, attachment: gx.ui_ref.Attachment, phase: OleDrop.Phase, point: w32.POINT, accepted: bool) void {
+    const self: *App = @ptrCast(@alignCast(context));
+    switch (phase) {
+        .enter, .over => {
+            const pane = self.resolvePaneView(attachment) orelse return;
+            const owner = pane.ownerWindow().hwnd orelse return;
+            self.drop_feedback.show(self, attachment, owner, pane.ownerWindow().scale, point, accepted);
+        },
+        .leave, .queued, .rejected => self.drop_feedback.hide(),
+    }
+}
+
+fn onDrop(self: *App) void {
+    if (self.drop_closing) return;
+    while (self.pending_drops.items.len != 0) {
+        var request = self.pending_drops.orderedRemove(0);
+        defer request.payload.deinit();
+        const pane = self.resolvePaneView(request.attachment) orelse continue;
+        const quoting = switch (pane.backend) {
+            .local => |surface| surface.pathQuoting(),
+            .remote => |remote| remote.ui.path_quoting,
+        };
+        const text = request.payload.toPaste(self.core_app.alloc, quoting) catch |err| {
+            log.warn("drop paste rejected err={}", .{err});
+            pane.ownerWindow().showNotice(.{ .severity = .warning, .title = i18n.tr("Cannot drop here"), .body = i18n.tr("The dropped content could not be pasted safely.") }, null);
+            continue;
+        };
+        defer self.core_app.alloc.free(text);
+        if (pane.nativeHandle()) |hwnd| _ = w32.SetFocus(hwnd);
+        const live = self.resolvePaneView(request.attachment) orelse continue;
+        switch (live.backend) {
+            .local => |surface| surface.pasteDroppedText(text),
+            .remote => |remote| remote.ui.paste(remote, text, null) catch |err| log.warn("remote drop could not be accepted err={}", .{err}),
+        }
+    }
+}
+
+fn executeIpc(self: *App, request: IpcProtocol.Request) !IpcProtocol.Outcome {
+    switch (request) {
+        .toggle_quick_terminal => try self.toggleQuickTerminal(),
+        .activate => {
+            const window = self.targetWindow(.app) orelse return .target_gone;
+            const hwnd = window.hwnd orelse return .target_gone;
+            _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+            _ = w32.SetForegroundWindow(hwnd);
+        },
+        .new_window, .new_tab => |profile| {
+            if (profile.len > 0) {
+                var list = try self.cachedLaunchProfiles();
+                defer list.deinit();
+                if (list.find(profile) == null) return .target_gone;
+            }
+            const create_window = request == .new_window;
+            const window = if (create_window)
+                try self.newWindow(.{})
+            else
+                self.targetWindow(.app) orelse return .target_gone;
+            if (window.is_quick_terminal) return .rejected;
+            if (profile.len > 0) {
+                if (!self.openProfile(window, profile, .tab)) {
+                    if (create_window) window.requestClose();
+                    return .execution_failed;
+                }
+            } else {
+                _ = window.addTabWithOptions(.{ .context = if (create_window) .window else .tab }) catch |err| {
+                    if (create_window) window.requestClose();
+                    return err;
+                };
+            }
+        },
+    }
+    return .completed;
+}
+
+fn toggleQuickTerminal(self: *App) !void {
+    const qt = self.quick_terminal orelse value: {
+        const created = try QuickTerminal.init(self);
+        self.quick_terminal = created;
+        break :value created;
+    };
+    qt.toggle();
 }
 
 pub fn performAction(
@@ -976,6 +1614,7 @@ pub fn performAction(
     comptime action: apprt.Action.Key,
     value: apprt.Action.Value(action),
 ) !bool {
+    if (try RemoteSource.routeAction(self, target, action, value)) |handled| return handled;
     switch (action) {
         .quit => {
             self.requestQuit();
@@ -1302,7 +1941,7 @@ pub fn performAction(
                 core_surface.config.abnormal_command_exit_runtime_ms,
             )) {
                 .normal => false,
-                .abnormal => showChildExited(core_surface.rt_surface.parent_window, value.exit_code),
+                .abnormal => showChildExited(core_surface.rt_surface, value.exit_code),
             },
         },
 
@@ -1389,10 +2028,14 @@ pub fn performAction(
             return true;
         },
 
-        // Acknowledge actions that don't need Win32-specific handling.
-        // The core handles the logic; we just confirm receipt.
         .pwd,
         .cell_size,
+        => {
+            if (target == .surface and !target.surface.rt_surface.parent_window.is_quick_terminal) self.scheduleSessionSave();
+            return true;
+        },
+        // Acknowledge actions that don't need Win32-specific handling.
+        // The core handles the logic; we just confirm receipt.
         // Platform-specific actions that don't apply on Windows:
         .secure_input, // macOS EnableSecureEventInput
         .undo, // macOS NSUndoManager
@@ -1409,8 +2052,8 @@ pub fn performAction(
             switch (value) {
                 .healthy => {},
                 .unhealthy => {
-                    self.notif_desktop_surface_id = 0;
-                    self.showDesktopNotificationText(
+                    self.notif_desktop_reference = .{};
+                    _ = self.showDesktopNotificationText(
                         i18n.tr("Renderer Unhealthy"),
                         i18n.tr("The GPU renderer is in an unhealthy state; terminal output may stop updating."),
                     );
@@ -1535,8 +2178,8 @@ pub fn performAction(
                                 .duration = duration,
                             }) catch {};
                         }
-                        self.notif_desktop_surface_id = core_surface.id;
-                        self.showDesktopNotificationText(title, body.buffered());
+                        self.notif_desktop_reference = core_surface.rt_surface.ui_reference;
+                        _ = self.showDesktopNotificationText(title, body.buffered());
                     }
                 },
             }
@@ -1563,7 +2206,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const dir: SplitTree(Surface).Split.Direction = switch (value) {
+                    const dir: SplitTree(Leaf).Split.Direction = switch (value) {
                         .left => .left,
                         .right => .right,
                         .up => .up,
@@ -1622,7 +2265,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    const palette = &core_surface.rt_surface.palette;
+                    const palette = &core_surface.rt_surface.parent_window.palette;
                     palette.setActive(!palette.active);
                 },
             }
@@ -1630,16 +2273,7 @@ pub fn performAction(
         },
 
         .toggle_quick_terminal => {
-            if (self.quick_terminal) |qt| {
-                qt.toggle();
-            } else {
-                const qt = QuickTerminal.init(self) catch |err| {
-                    log.err("failed to create quick terminal: {}", .{err});
-                    return true;
-                };
-                self.quick_terminal = qt;
-                qt.toggle();
-            }
+            try self.toggleQuickTerminal();
             return true;
         },
 
@@ -1687,22 +2321,22 @@ pub fn performGx(self: *App, window: *Window, action: gx.action.Action) bool {
             .about => .about,
         }),
         .move_split_to_tab => moved: {
-            const surface = window.getActiveSurface() orelse break :moved false;
+            const surface = window.activeLeaf() orelse break :moved false;
             break :moved window.moveSplitToTab(surface) catch |err| {
                 log.warn("cannot move split to tab err={}", .{err});
                 break :moved false;
             };
         },
         .move_split_to_window => moved: {
-            const surface = window.getActiveSurface() orelse break :moved false;
+            const surface = window.activeLeaf() orelse break :moved false;
             break :moved window.moveSplitToNewWindow(surface) catch |err| {
                 log.warn("cannot move split to window err={}", .{err});
                 break :moved false;
             };
         },
         .tab_switcher => tabs: {
-            const surface = window.getActiveSurface() orelse break :tabs false;
-            surface.palette.toggle(.tabs);
+            if (window.activeLeaf() == null) break :tabs false;
+            window.palette.toggle(.tabs);
             break :tabs true;
         },
     };
@@ -1722,21 +2356,21 @@ const DeferredGx = enum(usize) {
 fn deferGx(self: *App, kind: DeferredGx, window: *Window) bool {
     const hwnd = self.msg_hwnd orelse return false;
     if (window.closing) return false;
-    const surface = window.getActiveSurface() orelse return false;
-    if (!surface.core_surface_initialized) return false;
-    return w32.PostMessageW(hwnd, WM_APP_DEFERRED_GX, @intFromEnum(kind), @bitCast(surface.core_surface.id)) != 0;
+    if (window.activePane() == null) return false;
+    return w32.PostMessageW(hwnd, WM_APP_DEFERRED_GX, @intFromEnum(kind), @bitCast(window.ui_reference.id)) != 0;
 }
 
 /// Handle `WM_APP_DEFERRED_GX` (`deferGx`), if the terminal is still there.
 fn onDeferredGx(self: *App, wparam: usize, lparam: isize) void {
     const kind = std.enums.fromInt(DeferredGx, wparam) orelse return;
-    const core_surface = self.core_app.findSurfaceByID(@bitCast(lparam)) orelse return;
-    const surface = core_surface.rt_surface;
-    const window = surface.parent_window;
-    if (window.closing) return;
+    const id: u64 = @bitCast(lparam);
+    const window = for (self.windows.items) |candidate| {
+        if (candidate.ui_reference.id == id and !candidate.closing) break candidate;
+    } else if (self.quick_terminal) |quick| quick.window else return;
+    if (window.closing or window.ui_reference.id != id) return;
     switch (kind) {
         .new_tab_menu => Menu.showNewTabMenu(window),
-        .context_menu => Menu.showSurfaceContextMenuAtCursor(surface),
+        .context_menu => Menu.showPaneContextMenuAtCursor(window.activePane() orelse return),
     }
 }
 
@@ -1832,11 +2466,51 @@ fn toggleVisibility(self: *App) void {
     window.focusActiveSurface();
 }
 
-/// `present_terminal`: bring `surface` to the user. Its window comes back
-/// from hidden or minimized (the quick terminal slides in) to the front,
-/// with the surface's tab selected and the surface focused.
+/// `present_terminal`: bring `surface` to the user (`presentReference`).
 fn presentSurface(self: *App, surface: *Surface) void {
-    const window = surface.parent_window;
+    _ = self.presentReference(surface.ui_reference);
+}
+
+/// Bring the pane or window `reference` names to the user, for
+/// `present_terminal` and a click on a desktop notification (tray balloon or
+/// toast). Its window comes back from hidden or minimized (the quick terminal
+/// slides in) to the front without leaving a maximized state, with the
+/// pane's tab selected and the pane focused. Showing and activating dispatch
+/// messages, so every step resolves the reference again. Returns false when
+/// nothing it names is left.
+pub fn presentReference(self: *App, reference: gx.ui_ref.Reference) bool {
+    if (self.resolveLeaf(reference)) |leaf| {
+        self.presentWindow(leaf.ownerWindow());
+        const shown = self.resolveLeaf(reference) orelse return true;
+        const window = shown.ownerWindow();
+        if (window.findTabIndex(shown)) |index| {
+            if (index != window.active_tab) window.selectTabIndex(index);
+        }
+        const live = self.resolveLeaf(reference) orelse return true;
+        _ = live.ownerWindow().setActiveSurface(live);
+        live.pane().focus();
+        return true;
+    }
+    if (self.resolveSurface(reference)) |surface| {
+        // An exported terminal in a hidden remote host: `RemoteSource`
+        // forwards the request to the view that shows it.
+        if (surface.remote_source_state == null) return false;
+        _ = self.performAction(.{ .surface = &surface.core_surface }, .present_terminal, {}) catch return false;
+        return true;
+    }
+    const window = self.resolveWindow(reference) orelse return false;
+    if (window.is_remote_host) return false;
+    self.presentWindow(window);
+    if (self.resolveWindow(reference)) |live| live.focusActiveSurface();
+    return true;
+}
+
+/// Show `window` and bring it to the front: back from hidden with its active
+/// tab visible again, or from minimized (SW_RESTORE would also un-maximize,
+/// so only then); the quick terminal slides in.
+fn presentWindow(self: *App, window: *Window) void {
+    if (window.closing or window.is_remote_host) return;
+    const reference = window.ui_reference;
     const hwnd = window.hwnd orelse return;
     if (window.is_quick_terminal) {
         const qt = self.quick_terminal orelse return;
@@ -1845,16 +2519,12 @@ fn presentSurface(self: *App, surface: *Surface) void {
     } else {
         if (w32.IsWindowVisible_(hwnd) == 0) {
             _ = w32.ShowWindow(hwnd, SW_SHOWNA);
-            window.setActiveTabVisible(true);
+            const live = self.resolveWindow(reference) orelse return;
+            live.setActiveTabVisible(true);
         }
-        // SW_RESTORE would also un-maximize, so only when minimized.
         if (w32.IsIconic(hwnd) != 0) _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
     }
     _ = w32.SetForegroundWindow(hwnd);
-    if (window.findTabIndex(surface)) |idx| {
-        if (idx != window.active_tab) window.selectTabIndex(idx);
-    }
-    if (surface.hwnd) |h| _ = w32.SetFocus(h);
 }
 
 /// Whether the pointer is over the window `hwnd` itself (not a window in
@@ -1872,8 +2542,8 @@ const WM_APP_OPEN_LINK: u32 = w32.WM_APP + 34;
 /// A link the link policy holds back, waiting for the message loop to ask
 /// about it or to tell why it stays closed (`onLinkRequest`).
 const LinkRequest = struct {
-    /// The core surface whose terminal showed the link; 0 for none.
-    surface_id: u64,
+    /// Stable lifetime identity, or null for an explicit application target.
+    surface_ref: ?gx.ui_ref.Reference,
     decision: gx.url_policy.Decision,
     url: []u8,
 
@@ -1899,9 +2569,9 @@ fn openLink(self: *App, target: apprt.Target, url: []const u8) void {
     const alloc = self.core_app.alloc;
     const request = alloc.create(LinkRequest) catch return;
     request.* = .{
-        .surface_id = switch (target) {
-            .app => 0,
-            .surface => |core_surface| core_surface.id,
+        .surface_ref = switch (target) {
+            .app => null,
+            .surface => |core_surface| core_surface.rt_surface.ui_reference,
         },
         .decision = decision,
         .url = alloc.dupe(u8, url) catch {
@@ -1920,7 +2590,10 @@ fn openLink(self: *App, target: apprt.Target, url: []const u8) void {
 fn onLinkRequest(self: *App, request: *LinkRequest) void {
     const alloc = self.core_app.alloc;
     defer request.destroy(alloc);
-    const window = self.windowOfSurface(request.surface_id) orelse self.targetWindow(.app);
+    const window = if (request.surface_ref) |reference|
+        (self.resolveSurface(reference) orelse return).parent_window
+    else
+        self.targetWindow(.app);
 
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
@@ -1934,6 +2607,9 @@ fn onLinkRequest(self: *App, request: *LinkRequest) void {
             const owner = if (window) |w| w.hwnd else null;
             // A modal loop: nothing here uses the window after it.
             if (Dialogs.confirm(owner, body.written(), i18n.tr(gx.url_policy.msg.confirm_title)) != .accept) return;
+            if (request.surface_ref) |reference| {
+                if (self.resolveSurface(reference) == null) return;
+            }
             var name_buf: [host_name_size]u8 = undefined;
             const path = gx.url_policy.filePath(alloc, request.url, .{ .host_name = hostName(&name_buf) }) catch null;
             defer if (path) |p| alloc.free(p);
@@ -2218,6 +2894,7 @@ fn updateConfig(self: *App, config: *const Config) void {
     var old = self.config;
     defer old.deinit();
     self.config = new_config;
+    if (old.changed(&self.config, .@"gx-launch-profile") or old.changed(&self.config, .language)) self.shell.jump_list_dirty = true;
     repairWorkingDirectory(&self.config);
     if (old.changed(&self.config, .@"bell-audio-path") or
         old.changed(&self.config, .@"bell-audio-volume") or
@@ -2414,7 +3091,7 @@ const WM_APP_EXPORT_TERMINAL_IO: u32 = w32.WM_APP + 36;
 /// A terminal-I/O log waiting for the message loop to save it.
 const TerminalIoExport = struct {
     /// The core surface that asked: the Save As dialog belongs to its window.
-    surface_id: u64,
+    surface_ref: gx.ui_ref.Reference,
     contents: []u8,
 
     fn destroy(self: *TerminalIoExport, alloc: Allocator) void {
@@ -2436,7 +3113,7 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
     const alloc = self.core_app.alloc;
     const request = alloc.create(TerminalIoExport) catch return false;
     request.* = .{
-        .surface_id = core_surface.id,
+        .surface_ref = core_surface.rt_surface.ui_reference,
         .contents = alloc.dupe(u8, contents) catch {
             alloc.destroy(request);
             return false;
@@ -2455,10 +3132,7 @@ fn saveTerminalIo(self: *App, request: *TerminalIoExport) void {
     const alloc = self.core_app.alloc;
     defer request.destroy(alloc);
 
-    const owner = if (self.core_app.findSurfaceByID(request.surface_id)) |cs|
-        cs.rt_surface.parent_window.hwnd
-    else
-        null;
+    const owner = (self.resolveSurface(request.surface_ref) orelse return).parent_window.hwnd;
     const path = Dialogs.saveFilePath(alloc, owner, .{
         .title = i18n.tr("Export Terminal IO Events"),
         .default_name = "ghostty-terminal-io.txt",
@@ -2472,6 +3146,10 @@ fn saveTerminalIo(self: *App, request: *TerminalIoExport) void {
         return;
     } orelse return;
     defer alloc.free(path);
+
+    // Save dialogs pump messages. A closed/replaced origin cannot authorize a
+    // delayed write on behalf of a new terminal that happens to reuse its ID.
+    if (self.resolveSurface(request.surface_ref) == null) return;
 
     var file = std.Io.Dir.createFileAbsolute(global.io(), path, .{ .truncate = true }) catch |err| {
         log.warn("unable to create terminal IO export file: {}", .{err});
@@ -2771,7 +3449,9 @@ fn showsNotice(window: *const Window, closed: NoticeClosedFn) bool {
 /// dialog. It stays until it is closed; any key closes the terminal. From a
 /// core callback. Returns whether it is shown, which keeps the core from
 /// printing its own message.
-fn showChildExited(window: *Window, exit_code: u32) bool {
+fn showChildExited(surface: *Surface, exit_code: u32) bool {
+    surface.app.hideChildExitedNotice(surface);
+    const window = surface.parent_window;
     if (window.hwnd == null) return false;
     var buf: [512]u8 = undefined;
     var body: std.Io.Writer = .fixed(&buf);
@@ -2783,8 +3463,25 @@ fn showChildExited(window: *Window, exit_code: u32) bool {
         .title = i18n.tr("Command Failed"),
         .body = body.buffered(),
         .duration_ms = null,
-    }, null);
+    }, .{ .ctx = surface, .closed = childExitedNoticeClosed });
+    surface.child_exit_notice_window = window.ui_reference;
     return true;
+}
+
+// The marker identifies ownership without dereferencing a terminal that a
+// window-level notice could outlive.
+fn childExitedNoticeClosed(_: *anyopaque, _: *Notice, _: Notice.CloseReason) void {}
+
+/// Removing the failed terminal must not leave its instruction over another
+/// terminal, or dismiss a newer unrelated notice in the same window.
+pub fn hideChildExitedNotice(self: *App, surface: *Surface) void {
+    const reference = surface.child_exit_notice_window;
+    surface.child_exit_notice_window = .{};
+    const window = self.resolveWindow(reference) orelse return;
+    if (!showsNotice(window, childExitedNoticeClosed)) return;
+    const callbacks = window.notice.callbacks orelse return;
+    if (callbacks.ctx != @as(*anyopaque, surface)) return;
+    window.hideNotice();
 }
 
 /// The sequence belongs to its terminal. Other terminals ending a sequence
@@ -2953,7 +3650,7 @@ fn flashTaskbarButton(window: *Window) void {
 }
 
 /// Play `bell-audio-path` without waiting for file I/O or playback.
-fn playBellAudio(self: *App) void {
+pub fn playBellAudio(self: *App) void {
     if (self.config.@"bell-audio-path" == null) return;
     const player = self.bell_audio orelse blk: {
         const player = BellAudio.create() catch |err| {
@@ -3059,7 +3756,7 @@ fn windowProgress(window: *const Window, now_ms: u64) tab_status.Progress {
 
 /// Show the progress of `window` (`windowProgress`) on its taskbar button
 /// and keep `PROGRESS_TIMER_ID` running while there is some.
-fn updateTaskbarProgress(self: *App, window: *Window) void {
+pub fn updateTaskbarProgress(self: *App, window: *Window) void {
     if (self.com_apartment.isClosing()) return;
     const hwnd = window.hwnd orelse return;
     const progress = windowProgress(window, GetTickCount64());
@@ -3187,6 +3884,8 @@ fn quitTimerStart(running: bool, enabled: bool, delay_ms: ?u32) QuitTimerStart {
 pub fn startQuitTimer(self: *App) void {
     // Cancel any existing timer first.
     self.stopQuitTimer();
+    if (self.remote.keepsAlive()) return;
+    if (self.drop_companion) |companion| if (companion.keepsAlive()) return;
 
     const delay = self.config.@"quit-after-last-window-closed-delay";
     switch (quitTimerStart(
@@ -3278,6 +3977,7 @@ fn appendQuitGroups(window: *Window, alloc: Allocator, groups: *std.ArrayList(Di
 }
 
 fn quitNow(self: *App) void {
+    self.session.onQuit(self);
     self.quit_requested = true;
     w32.PostQuitMessage(0);
 }
@@ -3290,20 +3990,26 @@ fn showDesktopNotification(
     target: apprt.Target,
     value: apprt.Action.Value(.desktop_notification),
 ) void {
-    // Remember the originating surface so a balloon click can focus it.
-    self.notif_desktop_surface_id = switch (target) {
-        .app => 0,
-        .surface => |core_surface| core_surface.id,
+    const reference: gx.ui_ref.Reference = switch (target) {
+        .surface => |surface| surface.rt_surface.ui_reference,
+        .app => if (self.targetWindow(.app)) |window| window.ui_reference else return,
     };
-    self.showDesktopNotificationText(value.title, value.body);
+    if (self.shell.notify(self, reference, value.title, value.body)) return;
+    _ = self.showLegacyDesktopNotification(reference, value.title, value.body);
+}
+
+pub fn showLegacyDesktopNotification(self: *App, reference: gx.ui_ref.Reference, title: []const u8, body: []const u8) bool {
+    // Remember the originating surface so a balloon click can focus it.
+    self.notif_desktop_reference = reference;
+    return self.showDesktopNotificationText(title, body);
 }
 
 /// Show a desktop toast with the given title/body via the tray icon. The
-/// balloon click is delivered as WM_APP_TRAY (NIF_MESSAGE) and focuses the
-/// surface stored in notif_desktop_surface_id, mirroring macOS/GTK where
+/// balloon click is delivered as WM_APP_TRAY (NIF_MESSAGE) and presents the
+/// pane or window in notif_desktop_reference, mirroring macOS/GTK where
 /// clicking a notification presents the originating surface.
-fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) void {
-    const hwnd = self.msg_hwnd orelse return;
+fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) bool {
+    const hwnd = self.msg_hwnd orelse return false;
 
     var nid: w32.NOTIFYICONDATAW_V3 = std.mem.zeroes(w32.NOTIFYICONDATAW_V3);
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW_V3);
@@ -3330,13 +4036,14 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     const shown = w32.Shell_NotifyIconW(w32.NIM_ADD, data) != 0 or
         w32.Shell_NotifyIconW(w32.NIM_MODIFY, data) != 0;
     if (shown) {
-        log.info("desktop notification shown surface_id={x}", .{self.notif_desktop_surface_id});
+        log.info("desktop notification shown surface_id={x}", .{self.notif_desktop_reference.id});
     } else {
         log.warn("desktop notification could not be shown", .{});
     }
 
     // Schedule icon removal via a timer.
     _ = w32.SetTimer(hwnd, NOTIF_DESKTOP_TIMER_ID, 6000, null);
+    return shown;
 }
 
 /// The app icon at the size of large icons, for desktop notifications.
@@ -3385,7 +4092,10 @@ fn tick(self: *App) void {
     self.core_app.tick(self) catch |err| {
         log.err("core app tick error: {}", .{err});
     };
-    for (self.core_app.surfaces.items) |surface| surface.drainScrollbarActivity();
+    for (self.core_app.surfaces.items) |surface| {
+        surface.drainScrollbarActivity();
+        if (surface.guest_cwd_dirty.swap(false, .acq_rel)) self.scheduleSessionSave();
+    }
 }
 
 /// Window procedure for terminal surface child HWNDs (GhosttyTerminal class).
@@ -3397,6 +4107,10 @@ fn surfaceWndProc(
     lparam: isize,
 ) callconv(.winapi) isize {
     const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    if (userdata == 0 and msg == w32.WM_DROPFILES) {
+        if (wparam != 0) w32.DragFinish(@ptrFromInt(wparam));
+        return 0;
+    }
     const surface: *Surface = if (userdata != 0)
         @ptrFromInt(@as(usize, @bitCast(userdata)))
     else
@@ -3405,6 +4119,11 @@ fn surfaceWndProc(
     // Guard: verify this is the surface window itself.
     if (surface.hwnd == null or surface.hwnd.? != hwnd)
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    if (surface.app.drop_closing) {
+        if (msg == w32.WM_DROPFILES and wparam != 0) w32.DragFinish(@ptrFromInt(wparam));
+        return 0;
+    }
 
     switch (msg) {
         w32.WM_ENTERSIZEMOVE => {
@@ -3455,7 +4174,7 @@ fn surfaceWndProc(
         },
 
         Surface.WM_APP_CHILD_EXITED => {
-            _ = showChildExited(surface.parent_window, @truncate(wparam));
+            _ = showChildExited(surface, @truncate(wparam));
             return 0;
         },
 
@@ -3722,6 +4441,17 @@ fn msgWndProc(
     if (userdata == 0) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
     const app: *App = @ptrFromInt(@as(usize, @bitCast(userdata)));
 
+    if (app.drop_closing) {
+        if (msg == WM_APP_EXPORT_TERMINAL_IO) {
+            const request: *TerminalIoExport = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            request.destroy(app.core_app.alloc);
+        } else if (msg == WM_APP_OPEN_LINK) {
+            const request: *LinkRequest = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            request.destroy(app.core_app.alloc);
+        }
+        return 0;
+    }
+
     if (msg == WM_APP_WAKEUP) {
         // Cleared before the tick: what is pushed during it wakes again.
         _ = app.wakeup_pending.swap(false, .acq_rel);
@@ -3731,6 +4461,45 @@ fn msgWndProc(
 
     if (msg == WM_APP_QUIT) {
         app.confirmQuit();
+        return 0;
+    }
+
+    if (msg == WM_APP_IPC) {
+        app.onIpc();
+        return 0;
+    }
+
+    if (msg == WM_APP_DROP) {
+        app.onDrop();
+        return 0;
+    }
+
+    if (msg == WM_APP_DROP_REAP) {
+        // Wake the outer loop; never revoke COM while nested dispatch still
+        // holds borrowed model pointers.
+        return 0;
+    }
+
+    if (msg == WM_APP_DROP_REGISTER) return 0;
+    if (msg == ShellIntegration.wake_message) return 0;
+    if (msg == DropBridge.wake_message) return 0;
+    if (msg == DropCompanion.wake_message) return 0;
+    if (msg == RemoteCoordinator.wake_message or (msg == w32.WM_TIMER and wparam == RemoteCoordinator.timer_id)) return 0;
+    if (msg == w32.WM_TIMER and wparam == ShellIntegration.server_timer) {
+        _ = w32.KillTimer(hwnd, ShellIntegration.server_timer);
+        app.quit_requested = true;
+        w32.PostQuitMessage(0);
+        return 0;
+    }
+
+    if (msg == Uia.wake_message) {
+        app.onUia();
+        return 0;
+    }
+
+    if (msg == w32.WM_TIMER and wparam == SESSION_TIMER_ID) {
+        _ = w32.KillTimer(hwnd, SESSION_TIMER_ID);
+        app.session_save_ready = true;
         return 0;
     }
 
@@ -3759,20 +4528,7 @@ fn msgWndProc(
         // NIN_BALLOONUSERCLICK on the desktop notification.
         const event: u32 = @intCast(lparam & 0xFFFF);
         if (wparam == NOTIF_DESKTOP_UID and event == w32.NIN_BALLOONUSERCLICK) {
-            log.info("desktop notification clicked surface_id={x}", .{app.notif_desktop_surface_id});
-            // Focus the surface that produced the notification (click-to-
-            // focus, matching macOS/GTK).
-            if (app.notif_desktop_surface_id != 0) {
-                if (app.core_app.findSurfaceByID(app.notif_desktop_surface_id)) |surface| {
-                    _ = app.performAction(
-                        .{ .surface = surface },
-                        .present_terminal,
-                        {},
-                    ) catch |err| {
-                        log.warn("present_terminal from notification failed err={}", .{err});
-                    };
-                }
-            }
+            _ = app.presentReference(app.notif_desktop_reference);
             return 0;
         }
         return 0;
@@ -3780,6 +4536,12 @@ fn msgWndProc(
 
     if (msg == w32.WM_TIMER and wparam == QUIT_TIMER_ID) {
         _ = w32.KillTimer(hwnd, QUIT_TIMER_ID);
+        // KillTimer cannot remove an already queued WM_TIMER. New local or
+        // remote windows may have cancelled this shutdown in the meantime.
+        if (app.quit_timer_state != .active or app.remote.keepsAlive() or (if (app.drop_companion) |companion| companion.keepsAlive() else false)) {
+            app.stopQuitTimer();
+            return 0;
+        }
         app.quit_timer_state = .expired;
         app.quit_requested = true;
         w32.PostQuitMessage(0);
@@ -3873,6 +4635,83 @@ test "runtime references reject unready disposed and reused core surfaces" {
 test "export terminal IO requires a surface target" {
     var app: App = undefined;
     try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
+}
+
+test "runtime tab locations follow objects while old owner views stay inert" {
+    const testing = std.testing;
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(123) };
+    defer app.windows.deinit(testing.allocator);
+    var source: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window), .tab_count = 1 };
+    var destination: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    try app.windows.append(testing.allocator, &source);
+    try app.windows.append(testing.allocator, &destination);
+    source.ui_attachment = try app.ui_ids.attach(source.ui_reference, source.ui_reference);
+    const root = source.ui_attachment;
+    try testing.expect(app.resolveWindowView(root) == &source);
+    source.tab_references[0] = try app.ui_ids.create(.tab);
+    source.tab_attachments[0] = try app.ui_ids.attach(source.tab_references[0], source.ui_reference);
+    const tab = source.tab_references[0];
+    const old_view = source.tab_attachments[0];
+    try testing.expect(app.resolveTab(tab).?.window == &source);
+    try testing.expect(app.resolveTabView(old_view).?.window == &source);
+    destination.tab_count = 1;
+    destination.tab_references[0] = tab;
+    destination.tab_attachments[0] = try app.ui_ids.attach(tab, destination.ui_reference);
+    source.tab_count = 0;
+    try testing.expect(app.resolveTab(tab).?.window == &destination);
+    try testing.expect(app.resolveTabView(old_view) == null);
+    const moved = destination.tab_attachments[0];
+    try testing.expectEqual(@as(usize, 0), app.resolveTabView(moved).?.index);
+    try destination.tab_attachments[0].setVisible(&app.ui_ids, tab, destination.ui_reference, false);
+    try testing.expect(app.resolveTab(tab) != null);
+    try testing.expect(app.resolveTabView(moved) == null);
+    try destination.tab_attachments[0].setVisible(&app.ui_ids, tab, destination.ui_reference, true);
+    try testing.expect(app.resolveTabView(moved) == null);
+    destination.closing = true;
+    try testing.expect(app.resolveTab(tab) == null);
+    source.ui_attachment = .{};
+    try testing.expect(app.resolveWindow(source.ui_reference) == &source);
+    try testing.expect(app.resolveWindowView(root) == null);
+    app.ui_ids.epoch = 0;
+    try testing.expect(app.resolveWindow(source.ui_reference) == null);
+}
+
+test "OLE outer-loop retirement revokes before destroying registered child and parent" {
+    const testing = std.testing;
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined };
+    var apartment = ComApartment.init();
+    defer apartment.deinit() catch {};
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const parent = w32.CreateWindowExW(0, class, class, 0, 0, 0, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+    defer if (w32.IsWindow(parent) != 0) {
+        _ = w32.DestroyWindow(parent);
+    };
+    const child = w32.CreateWindowExW(0, class, class, w32.WS_CHILD, 0, 0, 32, 32, parent, null, null, null) orelse return error.TestWindowFailed;
+    var issuer = try gx.ui_ref.Issuer.init(42);
+    const owner = try issuer.create(.window);
+    const attachment = try issuer.attach(try issuer.surface(1), owner);
+    const Callbacks = struct {
+        fn live(_: *anyopaque, _: gx.ui_ref.Attachment) bool {
+            return true;
+        }
+        fn post(_: *anyopaque, _: gx.ui_ref.Attachment, _: OleDrop.data.Payload) bool {
+            return false;
+        }
+        fn feedback(_: *anyopaque, _: gx.ui_ref.Attachment, _: OleDrop.Phase, _: w32.POINT, _: bool) void {}
+    };
+    const target = try OleDrop.Target.create(testing.allocator, &apartment, child, attachment, .{
+        .context = &app,
+        .is_live = Callbacks.live,
+        .post = Callbacks.post,
+        .feedback = Callbacks.feedback,
+    });
+    app.retireDropTarget(target);
+    try testing.expect(app.deferDropWindowDestroy(child));
+    try testing.expect(app.deferDropParentDestroy(parent));
+    try testing.expect(w32.IsWindow(child) != 0 and w32.IsWindow(parent) != 0);
+    app.reapDropTargets();
+    try testing.expect(app.retired_drop_targets == null);
+    try testing.expect(w32.IsWindow(child) == 0 and w32.IsWindow(parent) == 0);
 }
 
 test "SimulatedSystemTheme packs the scheme and high contrast" {
@@ -4126,5 +4965,85 @@ test "D11: native wakeup dispatch drains the GUI snapshot and rearms" {
         try testing.expect(!surface.scrollbar_activity.pending);
         try testing.expectEqual(@as(usize, if (delta < 0) 75 else 76), surface.scrollbar_state.offset);
         try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_WAKEUP, WM_APP_WAKEUP, w32.PM_REMOVE) == 0);
+    }
+}
+
+/// Visible model only: hidden source hosts are never target-side UI contexts.
+pub fn resolveLeaf(self: *App, reference: gx.ui_ref.Reference) ?*Leaf {
+    for (self.windows.items) |window| if (window.leafForPane(reference)) |leaf| return leaf;
+    if (self.quick_terminal) |quick| return quick.window.leafForPane(reference);
+    return null;
+}
+pub fn resolveRemote(self: *App, reference: gx.ui_ref.Reference) ?*RemotePane {
+    return (self.resolveLeaf(reference) orelse return null).remote();
+}
+pub fn resolvePaneView(self: *App, attachment: gx.ui_ref.Attachment) ?@import("Pane.zig") {
+    const leaf = self.resolveLeaf(attachment.object) orelse return null;
+    if (!attachment.matches(leaf.attachment())) return null;
+    return leaf.pane();
+}
+pub const VisiblePaneIterator = struct {
+    app: *App,
+    window: usize = 0,
+    iterator: Window.PaneIterator = .{},
+    pub fn next(self: *VisiblePaneIterator) ?@import("Pane.zig") {
+        while (true) {
+            while (self.iterator.next()) |pane| {
+                const hwnd = pane.nativeHandle() orelse continue;
+                if (pane.attachment().isValid() and w32.IsWindowVisible_(hwnd) != 0) return pane;
+            }
+            if (self.window > self.app.windows.items.len) return null;
+            const owner = if (self.window < self.app.windows.items.len) self.app.windows.items[self.window] else if (self.app.quick_terminal) |quick| quick.window else return null;
+            self.window += 1;
+            if (owner.closing or owner.is_remote_host or owner.tab_count == 0) continue;
+            const hwnd = owner.hwnd orelse continue;
+            if (w32.IsIconic(hwnd) != 0 or w32.IsWindowVisible_(hwnd) == 0) continue;
+            self.iterator = owner.paneIterator(owner.active_tab);
+        }
+    }
+};
+
+pub fn visiblePanes(self: *App) VisiblePaneIterator {
+    return .{ .app = self };
+}
+
+fn dispatchRemoteUia(self: *App, action: *const Uia.Action) bool {
+    var iterator = self.visiblePanes();
+    while (iterator.next()) |pane| switch (pane.backend) {
+        .local => {},
+        .remote => |remote| if (remote.ui.accessibility.dispatch(self, remote, action)) return true,
+    };
+    return false;
+}
+
+/// Target-owned app actions preserve actual execution results. Close-all and
+/// Quit require the coordinator's asynchronous close receipts, never queue ACK.
+pub fn performRemoteAppAction(self: *App, action: input.Binding.Action) !bool {
+    switch (action) {
+        .ignore => return true,
+        .new_window => {
+            const window = try self.newWindow(.{});
+            _ = window.addTabWithOptions(.{ .context = .window }) catch |err| {
+                self.discardSessionWindow(window.ui_reference);
+                return err;
+            };
+            return true;
+        },
+        .open_config => |mode| return self.openConfigFile(switch (mode) {
+            .os_open => .os_open,
+            .new_window => .new_window,
+        }),
+        .reload_config => return self.performAction(.app, .reload_config, .{}),
+        .toggle_quick_terminal => {
+            try self.toggleQuickTerminal();
+            return true;
+        },
+        .toggle_visibility => {
+            self.toggleVisibility();
+            return self.windows.items.len != 0;
+        },
+        .check_for_updates, .show_gtk_inspector, .undo, .redo => return false,
+        .quit, .close_all_windows => return false,
+        else => return false,
     }
 }

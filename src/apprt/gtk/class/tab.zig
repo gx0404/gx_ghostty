@@ -188,7 +188,8 @@ pub const Tab = extern struct {
         }
     }
 
-    pub fn new(config: ?*Config, overrides: Overrides) *Self {
+    // fork(gx): GX-0039 begin: empty containers never start a placeholder shell.
+    pub fn newEmpty(config: ?*Config) *Self {
         const tab = gobject.ext.newInstance(Tab, .{});
 
         const priv: *Private = tab.private();
@@ -204,9 +205,20 @@ pub const Tab = extern struct {
 
         tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
+        return tab;
+    }
+    // fork(gx): GX-0039 end
+
+    pub fn new(config: ?*Config, overrides: Overrides) *Self {
+        // fork(gx): GX-0039 use the same empty-container setup for ordinary tabs.
+        const tab = newEmpty(config);
+        const priv = tab.private();
+
         // Create our initial surface in the split tree.
         priv.split_tree.newSplit(.right, null, .{
             .command = overrides.command,
+            // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+            .launch_origin = overrides.launch_origin,
             .shell_integration = overrides.shell_integration,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
@@ -321,6 +333,8 @@ pub const Tab = extern struct {
     // Virtual methods
 
     fn dispose(self: *Self) callconv(.c) void {
+        // fork(gx): GX-0039 revoke identities before callbacks can reenter disposal.
+        @import("../gx/runtime.zig").dispose(self.as(gobject.Object));
         const priv = self.private();
         if (priv.config) |v| {
             v.unref();

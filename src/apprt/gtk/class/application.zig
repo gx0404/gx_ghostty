@@ -481,6 +481,10 @@ pub const Application = extern struct {
     /// finalizer. But applications are never fully unreferenced so this
     /// ensures that our memory is cleaned up properly.
     pub fn deinit(self: *Self) void {
+        // fork(gx): GX-0039 release the session lease and cancel owned callbacks.
+        @import("../gx/session.zig").shutdown(self);
+        // fork(gx): GX-0039 stale callbacks cannot resolve across application shutdown.
+        @import("../gx/runtime.zig").shutdown(self);
         const alloc = self.allocator();
         const priv: *Private = self.private();
         priv.config.unref();
@@ -689,6 +693,10 @@ pub const Application = extern struct {
     }
 
     fn quitNow(self: *Self) void {
+        // fork(gx): GX-0039 snapshot confirmed Quit before per-window removal.
+        @import("../gx/session.zig").quit(self);
+        // fork(gx): GX-0039 confirmed quit snapshots before destruction order changes.
+        @import("../gx/window_state.zig").quit(self);
         // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
@@ -1601,9 +1609,12 @@ pub const Application = extern struct {
 
         // Queue a new window
         const priv = self.private();
-        _ = priv.core_app.mailbox.push(global.io(), .{
-            .new_window = .{},
-        }, .{ .forever = {} });
+        // fork(gx): GX-0039 restore only the first ordinary activation.
+        if (!@import("../gx/session.zig").activate(self)) {
+            _ = priv.core_app.mailbox.push(global.io(), .{
+                .new_window = .{},
+            }, .{ .forever = {} });
+        }
 
         // Call the parent activate method.
         gio.Application.virtual_methods.activate.call(
@@ -1910,6 +1921,29 @@ pub const Application = extern struct {
         };
     }
 
+    // fork(gx): GX-0039 begin: typed in-process launch metadata bypasses argv.
+    pub fn gxNewTab(target: apprt.Target, overrides: Overrides) bool {
+        return Action.newTab(target, overrides);
+    }
+
+    pub fn gxNewWindow(self: *Self, parent: ?*CoreSurface, overrides: Overrides) !void {
+        return Action.newWindow(self, parent, overrides);
+    }
+
+    /// Creates a configured window without launching any terminal process.
+    pub fn gxNewEmptyWindow(self: *Self) *Window {
+        self.private().requested_window = true;
+        const window = Window.new(self, .none);
+        _ = self.as(gobject.Object).bindProperty(
+            "config",
+            window.as(gobject.Object),
+            "config",
+            .{ .sync_create = true },
+        );
+        return window;
+    }
+    // fork(gx): GX-0039 end
+
     /// Handle `app.new-window` and `app.new-window-command` GTK actions
     pub fn actionNewWindow(
         _: *gio.SimpleAction,
@@ -2031,6 +2065,8 @@ pub const Application = extern struct {
                 },
                 .{
                     .command = overrides.command,
+                    // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+                    .launch_origin = overrides.launch_origin,
                     .shell_integration = overrides.shell_integration,
                     .working_directory = overrides.working_directory,
                     .title = overrides.title,
@@ -2044,6 +2080,8 @@ pub const Application = extern struct {
                 null,
                 .{
                     .command = overrides.command,
+                    // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+                    .launch_origin = overrides.launch_origin,
                     .shell_integration = overrides.shell_integration,
                     .working_directory = overrides.working_directory,
                     .title = overrides.title,
@@ -2667,6 +2705,8 @@ const Action = struct {
                 };
                 window.newTab(core, .{
                     .command = overrides.command,
+                    // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+                    .launch_origin = overrides.launch_origin,
                     .shell_integration = overrides.shell_integration,
                     .working_directory = overrides.working_directory,
                     .title = overrides.title,
@@ -2693,6 +2733,8 @@ const Action = struct {
             parent,
             .{
                 .command = overrides.command,
+                // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+                .launch_origin = overrides.launch_origin,
                 .shell_integration = overrides.shell_integration,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
@@ -2720,6 +2762,8 @@ const Action = struct {
         // Create a new tab with window context (first tab in new window)
         win.newTabForWindow(parent, .{
             .command = overrides.command,
+            // fork(gx): GX-0039 forward owned-at-surface launch metadata.
+            .launch_origin = overrides.launch_origin,
             .shell_integration = overrides.shell_integration,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
@@ -2736,6 +2780,9 @@ const Action = struct {
                 );
             }
         }
+
+        // fork(gx): GX-0039 restore after initial cell-size estimates, before show.
+        @import("../gx/window_state.zig").restore(win);
 
         // Show the window
         gtk.Window.present(win.as(gtk.Window));

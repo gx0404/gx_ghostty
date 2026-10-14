@@ -46,6 +46,8 @@ const clipboard = @import("../clipboard.zig");
 const open_url = @import("../open_url.zig");
 const w32 = @import("../win32.zig");
 const Popup = @import("Popup.zig");
+const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 const controls = @import("controls.zig");
 const d2d = @import("d2d.zig");
 const style = @import("style.zig");
@@ -219,6 +221,33 @@ pub fn confirmUnsafePaste(owner: ?w32.HWND, text: []const u8) Choice {
         .buttons = &buttons,
         .default_button = 1,
     }).choice;
+}
+
+/// Cross-integrity drops always require an explicit preview. This does not
+/// replace the terminal's protected-paste check and never remembers approval.
+pub fn confirmBrokerDrop(owner: ?w32.HWND, text: []const u8, source_pid: u32, file_count: usize) Choice {
+    var buffer: [1024]u8 = undefined;
+    var body: std.Io.Writer = .fixed(&buffer);
+    body.writeAll(i18n.tr("A lower-privilege window wants to paste this content into an elevated terminal. Review it before allowing the paste.")) catch {};
+    body.writeAll("\n\n") catch {};
+    i18n.format(&body, i18n.tr("Source process: {pid}"), .{ .pid = source_pid }) catch {};
+    if (file_count != 0) {
+        body.writeAll("\n") catch {};
+        i18n.format(&body, i18n.tr("Dropped files: {count}"), .{ .count = file_count }) catch {};
+    }
+    const buttons = [_]Button{
+        .{ .label = i18n.tr("Allow Paste"), .choice = .accept },
+        .{ .label = i18n.tr("Cancel"), .choice = .cancel },
+    };
+    const answer = run(owner, .{
+        .title = i18n.tr("Paste into elevated terminal?"),
+        .icon = .shield,
+        .body = body.buffered(),
+        .preview = .{ .text = text, .kind = .paste },
+        .buttons = &buttons,
+        .default_button = 1,
+    });
+    return if (answer.explicit) answer.choice else .cancel;
 }
 
 /// Tell the user that the shell process exited with a non-zero code.
@@ -542,6 +571,38 @@ const Layout = struct {
 
 const zero_rect: d2d.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
+fn uiaLive(context: *anyopaque) bool {
+    const self: *Dialog = @ptrCast(@alignCast(context));
+    return self.popup.visible and self.result == null and uia_bridge.attachmentAlive(self.app, self.uia_attachment);
+}
+fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+    const self: *Dialog = @ptrCast(@alignCast(context));
+    try bridge.publishDialog(api, queue, self.uia_attachment, self, .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+}
+fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
+    const self: *Dialog = @ptrCast(@alignCast(context));
+    if (!uiaLive(context)) return false;
+    if (token == 0 and action.kind == .close) {
+        self.answer(.cancel, false);
+        return true;
+    }
+    if (token < uia_bridge.dialog_action_base) return false;
+    const index = std.math.cast(usize, token - uia_bridge.dialog_action_base) orelse return false;
+    if (index >= self.focusCount()) return false;
+    switch (action.kind) {
+        .focus => {
+            self.focus = index;
+            self.keyboard = true;
+            self.popup.invalidate();
+            const hwnd = self.popup.hwnd orelse return false;
+            _ = w32.SetFocus(hwnd);
+        },
+        .invoke, .toggle => self.activate(index),
+        else => return false,
+    }
+    return true;
+}
+
 /// A focusable element: the links, the check box, then the buttons.
 const Target = union(enum) {
     link: usize,
@@ -552,6 +613,7 @@ const Target = union(enum) {
 const Dialog = struct {
     app: *App,
     owner: w32.HWND,
+    uia_attachment: @import("../../../gx/ui_ref.zig").Attachment = .{},
     spec: Spec,
     tokens: style.Tokens,
     popup: Popup = .{},
@@ -1489,6 +1551,7 @@ fn run(owner_: ?w32.HWND, spec: Spec) Answer {
     var dialog: Dialog = .{
         .app = app,
         .owner = owner,
+        .uia_attachment = uia_bridge.ownerAttachment(app, owner) orelse .{},
         .spec = spec,
         .tokens = style.Tokens.fromConfig(&app.config),
         .keyboard = keyboardCues(),
@@ -1508,6 +1571,7 @@ fn run(owner_: ?w32.HWND, spec: Spec) Answer {
     }, .{
         .ctx = &dialog,
         .paint = onPaint,
+        .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
         .key = onKey,
         .mouse = onMouse,
         .dismissed = onDismissed,
