@@ -268,6 +268,25 @@ test "remote frame rejects stale metadata and source close cancels in-flight pub
     try std.testing.expectError(error.Closed, producer.beginWrite());
 }
 
+test "remote frame acquisition releases its earlier lease when a later slot is corrupt" {
+    var bytes: [384]u8 align(8) = undefined;
+    var producer = try Mapped.initialize(&bytes, try Layout.checked(4, 2, 16), 7);
+    var consumer = try Mapped.attach(&bytes, 7);
+    var first = try producer.beginWrite();
+    // Keep slot 0 writing while claiming slot 1: a ready slot is reusable.
+    var second = try producer.beginWrite();
+    try first.publishCopy(&(@as([32]u8, @splat(1))));
+    try second.publishCopy(&(@as([32]u8, @splat(2))));
+    // acquire takes slot 0 before discovering slot 1's stale generation.
+    std.mem.writeInt(u64, bytes[control_offsets[1] + 16 ..][0..8], 6, .little);
+    try std.testing.expectError(error.InvalidFrame, consumer.acquire());
+    // Both the failed candidate and previously acquired best must be returned.
+    try std.testing.expectEqual(State.free, try state(@atomicLoad(u64, atomicAt(&bytes, control_offsets[0]), .acquire)));
+    try std.testing.expectEqual(State.free, try state(@atomicLoad(u64, atomicAt(&bytes, control_offsets[1]), .acquire)));
+    var recovered = try producer.beginWrite();
+    try std.testing.expect(recovered.cancel());
+}
+
 test "remote frame peer-exit reclamation invalidates the exact old reader token" {
     var bytes: [384]u8 align(8) = undefined;
     var producer = try Mapped.initialize(&bytes, try Layout.checked(4, 2, 16), 7);

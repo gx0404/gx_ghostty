@@ -25,7 +25,38 @@ pub const timer_id: usize = 0x524d; // RM, coordinator retry/query tick.
 const max_transfers = transport.max_connections;
 pub const transfer_budget: u64 = 512 * 1024 * 1024;
 pub const process_budget: u64 = 1024 * 1024 * 1024;
-const Export = struct { value: channels.Export, surface: refs.Reference, id: u64, request: ?u64 = null, accepted: bool = false, settled: bool = false, receipt_sent: bool = false, receipt_request: ?u64 = null, receipt_acked: bool = false, receipt_time: u64 = 0 };
+const Export = struct {
+    value: channels.Export,
+    surface: refs.Reference,
+    id: u64,
+    request: ?u64 = null,
+    accepted: bool = false,
+    settled: bool = false,
+    receipt_sent: bool = false,
+    receipt_request: ?u64 = null,
+    receipt_acked: bool = false,
+    receipt_time: u64 = 0,
+    // The target can still paint/read its old mapping until it accepts this
+    // replacement. Retiring it earlier turns an ordinary resize into EOF.
+    retired_output: ?*Output = null,
+    replacement_deadline: u64 = 0,
+
+    fn releaseRetired(self: *Export) void {
+        const output = self.retired_output orelse return;
+        self.retired_output = null;
+        output.deinit();
+    }
+    fn replacementExpired(self: *const Export, now: u64) bool {
+        return self.retired_output != null and !self.accepted and now >= self.replacement_deadline;
+    }
+    fn acknowledge(self: *Export, peer: *const channels.BoundPeer, outcome: protocol.Outcome, target_handle: u64) !void {
+        try self.value.acknowledge(peer, self.value.offer.generation, target_handle);
+        self.settled = true;
+        self.accepted = outcome == .completed;
+        if (self.accepted) self.releaseRetired();
+    }
+};
+const replacement_timeout_ms = 10_000;
 const Source = struct {
     connection: ?*transport.Connection,
     source_window: refs.Reference,
@@ -88,6 +119,7 @@ const Fanout = struct {
     remaining: usize = 0,
     performed: bool = false,
     dispatching: bool = true,
+    abandoned: bool = false,
     cancelled: bool = false,
     closing: std.ArrayList(refs.Reference) = .empty,
 };
@@ -272,7 +304,7 @@ pub fn performUiRequest(self: *Self, app: *App, origin: *RemotePane, action: @im
         return;
     }
     for (references.items, 0..) |reference, index| {
-        if (aggregate.cancelled) break;
+        if (aggregate.abandoned) break;
         const duplicate = for (references.items[0..index]) |previous| {
             if (previous.matches(reference)) break true;
         } else false;
@@ -291,18 +323,19 @@ pub fn performUiRequest(self: *Self, app: *App, origin: *RemotePane, action: @im
         if (pane.backend == .remote) {
             aggregate.remaining += 1;
             const completed = pane.backend.remote.ui.performRequest(pane.backend.remote, action, aggregate.id, request) catch false;
-            if (completed) |performed| self.completeFanout(aggregate.id, performed);
+            if (completed) |performed| self.completeFanout(aggregate.id, performed, false);
         } else {
             const performed = pane.performBindingAction(action) catch false;
-            if (!aggregate.cancelled) aggregate.performed = performed or aggregate.performed;
+            if (!aggregate.abandoned) aggregate.performed = performed or aggregate.performed;
         }
     }
 }
-pub fn completeFanout(self: *Self, id: u64, performed: bool) void {
+pub fn completeFanout(self: *Self, id: u64, performed: bool, cancelled: bool) void {
     for (self.fanouts) |entry| if (entry) |aggregate| if (aggregate.id == id) {
-        if (aggregate.cancelled) return;
+        if (aggregate.abandoned) return;
         if (aggregate.remaining != 0) aggregate.remaining -= 1;
         aggregate.performed = aggregate.performed or performed;
+        aggregate.cancelled = aggregate.cancelled or cancelled;
         if (!aggregate.dispatching and aggregate.remaining == 0) self.paste_fanout.release(id);
         return;
     };
@@ -314,7 +347,7 @@ pub fn completeFanout(self: *Self, id: u64, performed: bool) void {
 pub fn cancelPasteFanouts(self: *Self, origin: refs.Reference) void {
     const owner = self.paste_fanout.owner orelse return;
     for (self.fanouts) |entry| if (entry) |aggregate| if (aggregate.id == owner and aggregate.origin.matches(origin)) {
-        aggregate.cancelled = true;
+        aggregate.abandoned = true;
         aggregate.performed = false;
         aggregate.remaining = 0;
         self.paste_fanout.release(owner);
@@ -352,7 +385,7 @@ fn progressFanouts(self: *Self, app: *App) void {
         if (app.resolveRemote(aggregate.origin)) |pane| pane.ui.last_action_performed = aggregate.performed;
         const request = aggregate.request;
         if (@import("remote_test.zig").enabled()) log.info("remote action aggregate completed aggregate={} source={x} transaction={} generation={} performed={}", .{ aggregate.id, request.surface.id, request.transaction, request.config_generation, aggregate.performed });
-        self.postToSource(request.surface, .{ .ui_action_result = .{ .surface = request.surface, .lease = request.lease, .transaction = request.transaction, .config_generation = request.config_generation, .performed = aggregate.performed, .closed = @import("Pane.zig").resolve(app, aggregate.origin) == null } }) catch |err| {
+        self.postToSource(request.surface, .{ .ui_action_result = .{ .surface = request.surface, .lease = request.lease, .transaction = request.transaction, .config_generation = request.config_generation, .performed = aggregate.performed, .cancelled = aggregate.cancelled, .closed = @import("Pane.zig").resolve(app, aggregate.origin) == null } }) catch |err| {
             if (err == error.QueueFull) continue;
         };
         aggregate.closing.deinit(app.core_app.alloc);
@@ -774,6 +807,10 @@ fn syncTimer(self: *Self, app: *App) void {
 }
 
 fn progressSource(self: *Self, app: *App, source: *Source) !void {
+    // The old mapping remains owned only during a bounded replacement. A peer
+    // that stops consuming offers triggers normal reclaim, never a silent wait.
+    const replacement_now = native.GetTickCount64();
+    for (source.exports.items) |*item| if (item.replacementExpired(replacement_now)) return error.MappingReplacementTimedOut;
     if (source.connection) |connection| while (source.reply_len != 0) {
         const body = source.replies[source.reply_head].?;
         _ = try connection.sendBody(source.ticket orelse return error.NotReady, body.*);
@@ -1089,9 +1126,7 @@ fn acknowledge(self: *Self, app: *App, connection: *transport.Connection, packet
             return;
         }
         if (result.offer_id != item.id or result.target_handle != item.value.offer.target_handle) return;
-        item.value.acknowledge(&connection.peer.?, item.value.offer.generation, result.target_handle) catch return;
-        item.settled = true;
-        item.accepted = result.outcome == .completed;
+        item.acknowledge(&connection.peer.?, result.outcome, result.target_handle) catch return;
         if (!item.accepted) self.reclaim(app, source) catch {};
         return;
     };
@@ -1127,11 +1162,13 @@ fn resizeMapping(self: *Self, app: *App, source: *Source, reference: refs.Refere
         return err;
     };
     consumed = true;
-    old.deinit();
+    var retired_owned = true;
+    defer if (retired_owned) old.deinit();
     const exported = try channel.exportToPeer();
     source.mapping_generation = generation;
     source.export_serial += 1;
-    source.exports.appendAssumeCapacity(.{ .value = exported, .surface = reference, .id = source.export_serial });
+    source.exports.appendAssumeCapacity(.{ .value = exported, .surface = reference, .id = source.export_serial, .retired_output = old, .replacement_deadline = native.GetTickCount64() +| replacement_timeout_ms });
+    retired_owned = false;
     try surface.core_surface.refreshCallback();
 }
 fn applyInput(app: *App, source: *Source, input: *const protocol.Input) !void {
@@ -1235,6 +1272,7 @@ fn retireHost(self: *Self, app: *App, source: *Source) void {
     if (source.connection) |connection| {
         for (source.description.nodes.slice()) |node| if (node == .leaf) connection.unwatchFrame(node.leaf);
     }
+    for (source.exports.items) |*item| item.releaseRetired();
     if (source.host) |host| {
         host.deinit();
         source.host = null;
@@ -1262,6 +1300,17 @@ fn reapExports(self: *Self, source: *Source) void {
                 index += 1;
                 continue;
             }
+            // A newer offer can be acknowledged before an older replacement
+            // receipt arrives. Keep the original mapping's accounting while
+            // any replacement still owns its retired native Output.
+            const retained = for (source.exports.items) |later| {
+                if (!later.surface.matches(item.surface)) continue;
+                if (later.retired_output) |output| if (output.channel.mapped.generation == item.value.offer.generation) break true;
+            } else false;
+            if (retained) {
+                index += 1;
+                continue;
+            }
             const closed = for (source.description.nodes.slice(), 0..) |node, leaf_index| {
                 if (node == .leaf and node.leaf.matches(item.surface)) break source.closed_leaves[leaf_index];
             } else false;
@@ -1282,6 +1331,7 @@ fn reapExports(self: *Self, source: *Source) void {
             index += 1;
             continue;
         };
+        item.releaseRetired();
         _ = source.exports.orderedRemove(index);
     }
 }
@@ -1392,6 +1442,76 @@ test "remote coordinator production control entrypoints compile" {
     inline for (.{ &initialize, &begin, &drain, &shutdown, &resolveHostWindow, &keepsAlive, &allowsLocalInput, &closeHost, &deferLocalWindowClose }) |function| try std.testing.expect(@intFromPtr(function) != 0);
 }
 
+test "remote replacement keeps old native mapping readable until exact offer acknowledgement" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const security = @import("ipc/Security.zig");
+    const domain: policy.Isolation = .{ .config_root = @splat(1), .build = @splat(2), .class = @splat(3), .install = @splat(4) };
+    var target_peer: channels.BoundPeer = .{ .facts = try security.inspect(native.GetCurrentProcessId()), .epoch = 2, .isolation = domain };
+    defer target_peer.deinit();
+    var source_peer: channels.BoundPeer = .{ .facts = try security.inspect(native.GetCurrentProcessId()), .epoch = 1, .isolation = domain };
+    defer source_peer.deinit();
+    const layout = try channels.Layout.checked(4, 2, 16);
+    const old_channel = try channels.Channel.createSource(alloc, layout, 7, 1, &target_peer);
+    const old_output = Output.create(alloc, old_channel) catch |err| {
+        try old_channel.deinit();
+        return err;
+    };
+    var old_owned = true;
+    defer if (old_owned) old_output.deinit();
+    var old_export = try old_channel.exportToPeer();
+    defer old_export.abandonLocalTrackingOnShutdown();
+    const old_target = try channels.Channel.accept(alloc, old_export.offer, 2, &source_peer);
+    var target_owned = true;
+    defer if (target_owned) old_target.deinit() catch @panic("old target lease leak");
+    try old_export.acknowledge(&target_peer, 7, old_export.offer.target_handle);
+    var writing = try old_channel.beginWrite();
+    try writing.publish(&(@as([32]u8, @splat(0x37))));
+
+    const replacement = try channels.Channel.createSource(alloc, layout, 8, 1, &target_peer);
+    defer replacement.deinit() catch @panic("replacement lease leak");
+    var pending: Export = .{ .value = try replacement.exportToPeer(), .surface = .{ .epoch = 1, .kind = .surface, .id = 3, .generation = 4 }, .id = 2, .retired_output = old_output, .replacement_deadline = 10_000 };
+    old_owned = false;
+    defer pending.releaseRetired();
+    defer pending.value.abandonLocalTrackingOnShutdown();
+    // Model the delayed offer: render ownership already moved to generation 8,
+    // but the target is still allowed to consume the generation-7 frame.
+    var reading = (try old_target.acquire()).?;
+    try std.testing.expectEqual(@as(u8, 0x37), reading.lease.pixels[0]);
+    reading.release();
+    try std.testing.expect((try old_target.acquire()) == null);
+    try std.testing.expect(!pending.replacementExpired(9_999));
+    try std.testing.expect(pending.replacementExpired(10_000));
+    try std.testing.expectError(error.InvalidAcknowledgement, pending.acknowledge(&target_peer, .completed, pending.value.offer.target_handle + 1));
+    try std.testing.expect(pending.retired_output != null);
+
+    const next_target = try channels.Channel.accept(alloc, pending.value.offer, 2, &source_peer);
+    defer next_target.deinit() catch @panic("next target lease leak");
+    // RemotePane replaces and releases its old view before acknowledging.
+    try old_target.deinit();
+    target_owned = false;
+    try pending.acknowledge(&target_peer, .completed, pending.value.offer.target_handle);
+    try std.testing.expect(pending.retired_output == null);
+    try std.testing.expect(pending.accepted);
+    try std.testing.expect(!pending.replacementExpired(20_000));
+    pending.releaseRetired(); // Idempotent teardown after acknowledgement.
+}
+
+test "remote fanout preserves explicit cancellation separately from ordinary failure" {
+    var coordinator: Self = .{};
+    const reference: refs.Reference = .{ .epoch = 1, .kind = .surface, .id = 10, .generation = 1 };
+    const request: protocol.ActionRequest = .{ .surface = reference, .lease = .{ .holder_epoch = 2, .transaction = 3, .generation = 4 }, .transaction = 5, .config_generation = 1, .action = try protocol.ActionText.init("paste_from_clipboard"), .all = true };
+    var result: Fanout = .{ .id = 1, .origin = reference, .request = request, .remaining = 3, .dispatching = false };
+    coordinator.fanouts[0] = &result;
+    coordinator.completeFanout(1, false, false);
+    try std.testing.expect(!result.performed and !result.cancelled);
+    coordinator.completeFanout(1, false, true);
+    try std.testing.expect(!result.performed and result.cancelled);
+    coordinator.completeFanout(1, true, false);
+    try std.testing.expect(result.performed and result.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+}
+
 test "remote concurrent paste fanouts reject the second source and release exact operation" {
     const first: refs.Reference = .{ .epoch = 1, .kind = .surface, .id = 10, .generation = 1 };
     const second: refs.Reference = .{ .epoch = 1, .kind = .surface, .id = 11, .generation = 1 };
@@ -1412,9 +1532,9 @@ test "remote concurrent paste fanouts reject the second source and release exact
     // B is refused before it can send an ordinary paste back to A. Its source
     // chain can end, allowing A's already-admitted paste at B to complete.
     try std.testing.expect(!coordinator.paste_fanout.acquire(b.id));
-    coordinator.completeFanout(a.id, false);
+    coordinator.completeFanout(a.id, false, false);
     try std.testing.expectEqual(@as(?u64, a.id), coordinator.paste_fanout.owner);
-    coordinator.completeFanout(a.id, true);
+    coordinator.completeFanout(a.id, true, false);
     try std.testing.expect(coordinator.paste_fanout.owner == null);
     try std.testing.expect(a.performed);
 
@@ -1423,10 +1543,10 @@ test "remote concurrent paste fanouts reject the second source and release exact
     try std.testing.expectEqual(@as(?u64, b.id), coordinator.paste_fanout.owner);
     coordinator.cancelPasteFanouts(second);
     try std.testing.expect(coordinator.paste_fanout.owner == null);
-    try std.testing.expect(b.cancelled);
+    try std.testing.expect(b.abandoned);
     try std.testing.expect(!b.performed);
     try std.testing.expect(coordinator.paste_fanout.acquire(3));
-    coordinator.completeFanout(b.id, true);
+    coordinator.completeFanout(b.id, true, false);
     coordinator.paste_fanout.release(a.id);
     try std.testing.expectEqual(@as(?u64, 3), coordinator.paste_fanout.owner);
     try std.testing.expect(!b.performed);

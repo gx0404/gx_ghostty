@@ -85,7 +85,10 @@ pub const Input = struct {
 };
 pub const Outcome = enum(u16) { completed, rejected, unavailable, cancelled, unknown };
 pub const ActionRequest = struct { surface: refs.Reference, lease: Lease, transaction: u64, config_generation: u64, action: ActionText, all: bool = false, global: bool = false };
-pub const ActionResult = struct { surface: refs.Reference, lease: Lease, transaction: u64, config_generation: u64, performed: bool, closed: bool = false };
+/// cancelled means the user handled an interaction without authorizing its
+/// effect. It consumes the initiating key but is never counted as performed.
+/// Aggregated chains may have both flags when another effect did complete.
+pub const ActionResult = struct { surface: refs.Reference, lease: Lease, transaction: u64, config_generation: u64, performed: bool, closed: bool = false, cancelled: bool = false };
 pub const RuntimeEvent = union(enum(u16)) {
     readonly: bool,
     /// Complete formatted sequence; null ends its hint.
@@ -763,4 +766,34 @@ test "gx.remote inspector commands and snapshots reject foreign epochs and stale
     packet.body.inspector_request.surface.epoch = 1;
     packet.body.inspector_request.lease.transaction += 1;
     try std.testing.expectError(error.InvalidIdentity, validate(&packet));
+}
+
+test "gx.remote action result distinguishes cancelled input from failed and performed effects" {
+    const alloc = std.testing.allocator;
+    const packet = try alloc.create(Packet);
+    defer alloc.destroy(packet);
+    const decoded = try alloc.create(Packet);
+    defer alloc.destroy(decoded);
+    const buffer = try alloc.alloc(u8, max_frame_size);
+    defer alloc.free(buffer);
+    const base: ActionResult = .{ .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 5 }, .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 3 }, .transaction = 9, .config_generation = 11, .performed = false };
+    try std.testing.expect(!base.cancelled);
+    inline for (.{ .apply_action_result, .ui_action_result }) |tag| {
+        for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, false }, .{ true, true } }) |flags| {
+            var result = base;
+            result.performed = flags[0];
+            result.cancelled = flags[1];
+            const source_sent = tag == .apply_action_result;
+            packet.* = .{ .sender_epoch = if (source_sent) 1 else 2, .recipient_epoch = if (source_sent) 2 else 1, .request_id = 31, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 3 }, .body = @unionInit(Body, @tagName(tag), result) };
+            const encoded = try encode(buffer, packet);
+            try decodeInto(encoded, decoded);
+            const received = @field(decoded.body, @tagName(tag));
+            try std.testing.expectEqual(flags[0], received.performed);
+            try std.testing.expectEqual(flags[1], received.cancelled);
+            try std.testing.expectEqual(@as(u64, 9), received.transaction);
+            // Cancellation is a canonical boolean, not an unchecked outcome tag.
+            buffer[encoded.len - 1] = 2;
+            try std.testing.expectError(error.InvalidFrame, decodeInto(buffer[0..encoded.len], decoded));
+        }
+    }
 }

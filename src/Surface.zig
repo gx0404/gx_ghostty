@@ -3303,10 +3303,17 @@ pub fn gxSequenceOnce(self: *const Surface) ?GxOnceTable {
     return if (self.gx_binding_route != null) self.gx_sequence_once else null;
 }
 
-pub fn gxCompleteBinding(self: *Surface, event: input.KeyEvent, flags: input.Binding.Flags, performed: bool, ignored: bool, once: ?GxOnceTable) !bool {
+pub fn gxCompleteBinding(self: *Surface, event: input.KeyEvent, flags: input.Binding.Flags, performed: bool, ignored: bool, cancelled: bool, once: ?GxOnceTable) !bool {
     if (performed) if (once) |table| try self.gxPopOnceTable(table);
     self.keyboard.last_trigger = null;
     self.keyboard.sequence_set = null;
+    if (cancelled) {
+        // Cancelling a permission dialog handled this key. Unlike an
+        // unavailable action, it must never replay the key or its prefix.
+        self.endKeySequence(.drop, .retain);
+        self.keyboard.last_trigger = event.bindingHash();
+        return false;
+    }
     if (ignored and performed) {
         self.endKeySequence(.drop, .retain);
         return false;

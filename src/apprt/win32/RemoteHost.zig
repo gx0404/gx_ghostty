@@ -167,9 +167,10 @@ pub const Host = struct {
         };
     }
 
-    /// Resize uses a new generation/mapping. Caller stops its notification wait
-    /// on the returned old Output before deinit; target mappings remain pinned
-    /// by their own handles/read leases. Never mutate old slot dimensions.
+    /// Resize uses a new generation/mapping. The returned old Output stays
+    /// readable until the caller retires it after replacement acknowledgement
+    /// or disconnect, and stops its notification wait before deinit. Never
+    /// mutate old slot dimensions.
     pub fn replaceOutput(self: *Host, surface: *Surface, channel: *Channel) !*Output {
         return self.replaceOutputWithWake(surface, channel, null);
     }
@@ -182,7 +183,6 @@ pub const Host = struct {
             const previous = binding.output;
             surface.setRemoteOutput(replacement);
             binding.output = replacement;
-            previous.channel.close();
             return previous;
         }
         return error.UnknownSurface;

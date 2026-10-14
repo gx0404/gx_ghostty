@@ -151,11 +151,11 @@ pub fn disconnect(self: *Self, app: *App) void {
     self.inspector_popup.hide();
     self.inspector_active = false;
     for (&self.inspector_pending) |*slot| if (slot.*) |pending| {
-        if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, false);
+        if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, false, false);
         slot.* = null;
     };
     for (&self.pending) |*slot| if (slot.*) |pending| {
-        if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, false);
+        if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, false, false);
         slot.* = null;
     };
     self.consents = @splat(null);
@@ -517,8 +517,8 @@ fn pasteWithParent(self: *Self, pane: *RemotePane, text: []const u8, origin: ?pr
     pane.clearBellBorder();
     self.last_action_performed = null;
 }
-fn reply(app: *App, source: refs.Reference, request: protocol.ActionRequest, performed: bool) !void {
-    try app.remote.postToSource(source, .{ .ui_action_result = .{ .surface = source, .lease = request.lease, .transaction = request.transaction, .config_generation = request.config_generation, .performed = performed } });
+fn reply(app: *App, source: refs.Reference, request: protocol.ActionRequest, performed: bool, cancelled: bool) !void {
+    try app.remote.postToSource(source, .{ .ui_action_result = .{ .surface = source, .lease = request.lease, .transaction = request.transaction, .config_generation = request.config_generation, .performed = performed, .cancelled = cancelled } });
 }
 fn clipboardRequest(app: *App, pane: *RemotePane, request: *const protocol.ClipboardRequest) !void {
     const reference = pane.ui_reference;
@@ -641,7 +641,7 @@ pub fn handlePacket(app: *App, pane: *RemotePane, packet: *const protocol.Packet
                 };
             } else return error.UnknownTransaction;
             var performed = pending.generation == result.config_generation and result.config_generation == self.config_generation and pending.command == result.command and pending.attachment.matches(pane.ui_attachment) and result.performed;
-            defer if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, performed);
+            defer if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, performed, false);
             errdefer performed = false;
             const reference = pane.ui_reference;
             if (performed) switch (result.command) {
@@ -721,12 +721,12 @@ pub fn handlePacket(app: *App, pane: *RemotePane, packet: *const protocol.Packet
             self.config_generation = request.config_generation;
             self.last_action_performed = null;
             const action = Action.parse(request.action.slice()) catch {
-                try reply(app, pane.source_reference, request, false);
+                try reply(app, pane.source_reference, request, false, false);
                 return true;
             };
             const source = pane.source_reference;
             app.remote.performUiRequest(app, pane, action, request) catch {
-                try reply(app, source, request, false);
+                try reply(app, source, request, false, false);
             };
         },
         .apply_action_result => |result| {
@@ -734,10 +734,11 @@ pub fn handlePacket(app: *App, pane: *RemotePane, packet: *const protocol.Packet
             for (&self.pending) |*slot| if (slot.*) |pending| if (pending.transaction == result.transaction) {
                 slot.* = null;
                 const performed = pending.generation == result.config_generation and (result.performed or pending.ui_performed);
+                const cancelled = pending.generation == result.config_generation and result.cancelled;
                 if (@import("remote_test.zig").enabled()) log.info("remote action result surface={x} transaction={} generation={} aggregate={any} performed={}", .{ result.surface.id, result.transaction, result.config_generation, pending.aggregate, performed });
                 self.last_action_performed = performed;
-                if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, performed);
-                if (pending.origin) |origin| try reply(app, pane.source_reference, origin, performed);
+                if (pending.aggregate) |aggregate| app.remote.completeFanout(aggregate, performed, cancelled);
+                if (pending.origin) |origin| try reply(app, pane.source_reference, origin, performed, cancelled);
                 return true;
             };
             var pending_ids: [32]u64 = @splat(0);

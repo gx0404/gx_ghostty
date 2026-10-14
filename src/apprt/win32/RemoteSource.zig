@@ -30,6 +30,7 @@ const Chain = struct {
     once: ?CoreSurface.GxOnceTable,
     performed: bool = false,
     ignored: bool = false,
+    cancelled: bool = false,
     waiting: bool = false,
 };
 
@@ -79,13 +80,13 @@ pub const State = struct {
         }
         self.chain = null;
     }
-    fn cancelClipboard(self: *State) void {
+    fn cancelClipboard(self: *State, cancelled: bool) void {
         const pending = self.clipboard orelse return;
         self.clipboard = null;
         if (pending.reply) |reply| self.surface.app.core_app.alloc.destroy(reply);
         if (pending.command) |command| self.surface.app.core_app.alloc.destroy(command);
         if (pending.request) |request| self.surface.core_surface.denyClipboardRequest(request);
-        if (pending.origin) |origin| clipboardActionResult(self, origin, false) catch {};
+        if (pending.origin) |origin| actionResult(self, origin, false, cancelled) catch {};
     }
     fn cancelUi(self: *State) void {
         const pending = self.pending_ui orelse return;
@@ -112,7 +113,7 @@ pub const State = struct {
         }
         self.paste.deinit(alloc);
         self.confirmation = null;
-        self.cancelClipboard();
+        self.cancelClipboard(false);
     }
 };
 
@@ -151,7 +152,7 @@ fn configChanged(context: *anyopaque) void {
     state.cancelChain();
     state.cancelUi();
     state.cancelCallbacks();
-    state.cancelClipboard();
+    state.cancelClipboard(false);
     state.confirmation = null;
     state.paste.deinit(state.surface.app.core_app.alloc);
     state.config_generation +|= 1;
@@ -398,12 +399,16 @@ fn completePaste(state: *State, confirmed: bool) !void {
 }
 
 fn pasteResult(state: *State, transaction: u64, performed: bool) !void {
+    return pasteCompletion(state, transaction, performed, false);
+}
+
+fn pasteCompletion(state: *State, transaction: u64, performed: bool, cancelled: bool) !void {
     if (transaction == 0) return;
-    state.surface.app.remote.postToTarget(state.surface.ui_reference, .{ .apply_action_result = .{ .surface = state.surface.ui_reference, .lease = state.lease, .transaction = transaction, .config_generation = state.config_generation, .performed = performed } }) catch |err| {
+    state.surface.app.remote.postToTarget(state.surface.ui_reference, .{ .apply_action_result = .{ .surface = state.surface.ui_reference, .lease = state.lease, .transaction = transaction, .config_generation = state.config_generation, .performed = performed, .cancelled = cancelled } }) catch |err| {
         trace("paste result dispatch failed surface={x} transfer={} lease={} config={} performed={} err={}", .{ state.surface.ui_reference.id, transaction, state.lease.generation, state.config_generation, performed, err });
         return err;
     };
-    trace("paste result dispatched surface={x} transfer={} lease={} config={} performed={}", .{ state.surface.ui_reference.id, transaction, state.lease.generation, state.config_generation, performed });
+    trace("paste result dispatched surface={x} transfer={} lease={} config={} performed={} cancelled={}", .{ state.surface.ui_reference.id, transaction, state.lease.generation, state.config_generation, performed, cancelled });
 }
 
 fn routeBinding(context: *anyopaque, core: *CoreSurface, event: input.KeyEvent, leaf: input.Binding.Set.GenericLeaf, once: ?CoreSurface.GxOnceTable) !?CoreSurface.InputEffect {
@@ -487,7 +492,7 @@ fn advance(state: *State) !void {
     }
     var finished = state.chain.?;
     state.chain = null;
-    trace("binding complete surface={x} source_transaction={} lease={} config={} performed={} queued={}", .{ state.surface.ui_reference.id, finished.identity.transaction, state.lease.generation, finished.identity.config_generation, finished.performed, state.len });
+    trace("binding complete surface={x} source_transaction={} lease={} config={} performed={} cancelled={} queued={}", .{ state.surface.ui_reference.id, finished.identity.transaction, state.lease.generation, finished.identity.config_generation, finished.performed, finished.cancelled, state.len });
     defer state.surface.app.core_app.alloc.free(finished.actions);
     finished.event.utf8 = switch (finished.original.event) {
         .key => |*key| key.text.slice(),
@@ -495,7 +500,7 @@ fn advance(state: *State) !void {
         else => "",
     };
     const core = &state.surface.core_surface;
-    if (try core.gxCompleteBinding(finished.event, finished.flags, finished.performed, finished.ignored, finished.once)) {
+    if (try core.gxCompleteBinding(finished.event, finished.flags, finished.performed, finished.ignored, finished.cancelled, finished.once)) {
         core.gx_binding_bypass = true;
         defer core.gx_binding_bypass = false;
         try dispatchInput(state, &finished.original);
@@ -509,11 +514,11 @@ pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Pack
     if (!coordinator.acceptsSourceAction(reference, state.lease)) return error.InvalidLease;
     switch (packet.body) {
         .ui_action_result => |result| {
-            trace("binding receipt surface={x} source_transaction={} expected={} lease={} config={} performed={} closed={} matches={}", .{ reference.id, result.transaction, if (state.chain) |chain| chain.identity.transaction else 0, result.lease.generation, result.config_generation, result.performed, result.closed, if (state.chain) |chain| chain.waiting and chain.identity.accepts(result) else false });
+            trace("binding receipt surface={x} source_transaction={} expected={} lease={} config={} performed={} cancelled={} closed={} matches={}", .{ reference.id, result.transaction, if (state.chain) |chain| chain.identity.transaction else 0, result.lease.generation, result.config_generation, result.performed, result.cancelled, result.closed, if (state.chain) |chain| chain.waiting and chain.identity.accepts(result) else false });
             if (state.pending_ui) |pending| if (pending.identity.accepts(result)) {
                 state.pending_ui = null;
                 if (result.performed) state.view.search_active = true;
-                try clipboardActionResult(state, pending.origin, result.performed);
+                try actionResult(state, pending.origin, result.performed, result.cancelled);
                 try drainQueue(state);
                 return true;
             };
@@ -523,6 +528,7 @@ pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Pack
             if (!chain.waiting or !chain.identity.accepts(result)) return true;
             chain.waiting = false;
             chain.performed = chain.performed or result.performed;
+            chain.cancelled = chain.cancelled or result.cancelled;
             if (result.performed) {
                 const action = try binding.decode(&chain.actions[chain.next - 1]);
                 if (action == .ignore) chain.ignored = true;
@@ -541,7 +547,7 @@ pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Pack
             defer app.core_app.alloc.destroy(pending);
             const performed = result.performed and result.config_generation == state.config_generation;
             if (pending.kind == .start_search and performed) state.view.search_active = true;
-            if (pending.origin) |origin| try clipboardActionResult(state, origin, performed);
+            if (pending.origin) |origin| try actionResult(state, origin, performed, result.cancelled and result.config_generation == state.config_generation);
             try drainQueue(state);
         },
         .inspector_request => |request| try handleInspector(state, request),
@@ -592,6 +598,7 @@ pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Pack
         .confirm_result => |result| {
             const confirmation = state.confirmation orelse return true;
             if (!std.meta.eql(result.lease, state.lease) or result.transaction != confirmation.transaction) return error.InvalidResult;
+            trace("confirmation receipt surface={x} transaction={} reason={s} confirmed={} lease={} config={}", .{ reference.id, result.transaction, @tagName(confirmation.reason), result.confirmed, state.lease.generation, state.config_generation });
             state.confirmation = null;
             switch (confirmation.reason) {
                 .close => if (result.confirmed) {
@@ -601,22 +608,23 @@ pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Pack
                 .paste => {
                     if (state.clipboard) |pending| {
                         if (pending.reply) |reply| {
-                            if (result.confirmed) try finishClipboard(state, reply, true) else state.cancelClipboard();
+                            if (result.confirmed) try finishClipboard(state, reply, true) else state.cancelClipboard(true);
                         }
                     } else if (result.confirmed) try completePaste(state, true) else {
-                        try pasteResult(state, state.paste.transfer, false);
+                        const transaction = state.paste.transfer;
                         state.paste.deinit(app.core_app.alloc);
+                        try pasteCompletion(state, transaction, false, true);
                     }
                 },
                 .clipboard_read, .clipboard_write => {
                     const pending = state.clipboard orelse return true;
                     if (!result.confirmed or pending.generation != state.config_generation) {
-                        state.cancelClipboard();
+                        state.cancelClipboard(!result.confirmed and pending.generation == state.config_generation);
                     } else if (pending.command) |command| {
                         command.prompt = false;
                         command.confirmed = true;
                         state.surface.app.remote.postToTarget(reference, .{ .clipboard_request = command.* }) catch |err| {
-                            state.cancelClipboard();
+                            state.cancelClipboard(false);
                             return err;
                         };
                         state.clipboard.?.command = null;
@@ -739,7 +747,11 @@ fn beginClipboard(state: *State, message: *const protocol.ClipboardRequest, requ
 }
 
 fn clipboardActionResult(state: *State, origin: protocol.ActionRequest, performed: bool) !void {
-    try state.surface.app.remote.postToTarget(state.surface.ui_reference, .{ .apply_action_result = .{ .surface = origin.surface, .lease = origin.lease, .transaction = origin.transaction, .config_generation = origin.config_generation, .performed = performed } });
+    return actionResult(state, origin, performed, false);
+}
+
+fn actionResult(state: *State, origin: protocol.ActionRequest, performed: bool, cancelled: bool) !void {
+    try state.surface.app.remote.postToTarget(state.surface.ui_reference, .{ .apply_action_result = .{ .surface = origin.surface, .lease = origin.lease, .transaction = origin.transaction, .config_generation = origin.config_generation, .performed = performed, .cancelled = cancelled } });
 }
 
 fn clipboardContents(message: *protocol.ClipboardRequest, contents: []const apprt.ClipboardContent) !void {
@@ -766,7 +778,7 @@ fn clipboardContents(message: *protocol.ClipboardRequest, contents: []const appr
 fn finishClipboard(state: *State, result: *const protocol.ClipboardResult, confirmed: bool) !void {
     const pending = state.clipboard orelse return;
     if (!result.performed) {
-        state.cancelClipboard();
+        state.cancelClipboard(false);
         return;
     }
     const request = pending.request orelse {
@@ -1263,7 +1275,7 @@ test "apprt.win32 remote once prefix survives failed performable completion and 
     core.gxBeginBinding();
     try std.testing.expect(core.gxSequenceOnce() == null);
     // A false result requests the original key exactly once; it does not pop.
-    try std.testing.expect(try core.gxCompleteBinding(key, .{ .performable = true }, false, false, carried));
+    try std.testing.expect(try core.gxCompleteBinding(key, .{ .performable = true }, false, false, false, carried));
     try std.testing.expectEqual(@as(usize, 1), core.keyboard.table_stack.items.len);
     try std.testing.expectEqual(@as(usize, 0), core.keyboard.sequence_queued.items.len);
     try std.testing.expect(core.keyboard.last_trigger == null);
@@ -1280,13 +1292,66 @@ test "apprt.win32 remote once prefix survives failed performable completion and 
     try std.testing.expect(core.gxSequenceOnce() == null);
     try std.testing.expectEqual(@as(usize, 1), core.keyboard.table_stack.items.len);
     // A subsequent actual success removes exactly that activation.
-    try std.testing.expect(!try core.gxCompleteBinding(key, .{}, true, false, once));
+    try std.testing.expect(!try core.gxCompleteBinding(key, .{}, true, false, false, once));
     try std.testing.expectEqual(@as(usize, 0), core.keyboard.table_stack.items.len);
     try std.testing.expectEqual(@as(?u64, key.bindingHash()), core.keyboard.last_trigger);
     // With no remote route the added sequence bookkeeping is inert.
     core.gx_binding_route = null;
     core.gxRememberSequenceOnce(once);
     try std.testing.expect(core.gxSequenceOnce() == null);
+}
+
+test "apprt.win32 remote cancellation consumes performable paste without claiming success or popping once" {
+    const alloc = std.testing.allocator;
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.remote = .{ .closing = true };
+    app.msg_hwnd = null;
+    app.wakeup_pending = .init(false);
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.ui_reference = .{ .epoch = 1, .kind = .surface, .id = 1, .generation = 1 };
+    const lease: protocol.Lease = .{ .holder_epoch = 2, .transaction = 2, .generation = 3 };
+    var state: State = .{ .surface = &surface, .lease = lease, .view = .{ .surface = surface.ui_reference, .lease = lease } };
+    surface.remote_source_state = &state;
+    const core = &surface.core_surface;
+    core.alloc = alloc;
+    core.rt_app = &app;
+    core.rt_surface = &surface;
+    core.keyboard = .{};
+    core.config.keybind = .{};
+    core.readonly = true;
+    core.gx_binding_route = .{ .context = &state, .callback = routeBinding, .config_changed = configChanged };
+    core.gx_sequence_once = null;
+    defer core.keyboard.table_stack.deinit(alloc);
+    defer core.keyboard.sequence_queued.deinit(alloc);
+    defer state.discard();
+    var table: input.Binding.Set = .{};
+    try core.keyboard.table_stack.append(alloc, .{ .set = &table, .once = true, .gx_generation = 10 });
+    const once: CoreSurface.GxOnceTable = .{ .set = &table, .generation = 10 };
+    const key: input.KeyEvent = .{ .unshifted_codepoint = 'v', .mods = .{ .ctrl = true, .shift = true } };
+    // A genuine miss still asks the caller to replay its original native key.
+    try std.testing.expect(try core.gxCompleteBinding(key, .{ .performable = true }, false, false, false, once));
+    try std.testing.expect(core.keyboard.last_trigger == null);
+    for ([_]input.Binding.Flags{
+        .{ .performable = true },
+        .{ .consumed = false, .performable = true },
+        .{ .all = true, .performable = true },
+        .{ .global = true, .performable = true },
+    }) |flags| {
+        try core.keyboard.sequence_queued.append(alloc, .{ .alloc = .{ .alloc = alloc, .data = try alloc.dupe(u8, "owned-prefix") } });
+        core.keyboard.sequence_set = &table;
+        core.gxRememberSequenceOnce(once);
+        // User cancellation keeps performed=false. It must suppress replay
+        // nevertheless, drop prefix bytes, and suppress the matching release.
+        try std.testing.expect(!try core.gxCompleteBinding(key, flags, false, false, true, once));
+        try std.testing.expectEqual(@as(usize, 1), core.keyboard.table_stack.items.len);
+        try std.testing.expectEqual(@as(usize, 0), core.keyboard.sequence_queued.items.len);
+        try std.testing.expect(core.gxSequenceOnce() == null);
+        try std.testing.expectEqual(@as(?u64, key.bindingHash()), core.keyboard.last_trigger);
+    }
 }
 
 test "apprt.win32 remote paste only bypasses queued typing for its exact suspended parent" {

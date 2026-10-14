@@ -597,7 +597,12 @@ pub fn run(self: *App) !void {
             break;
         }
         if (result < 0) return error.Win32Error;
-        if (self.quit_requested) break;
+        if (self.quit_requested) {
+            // GetMessageW already removed this payload from the queue, so
+            // terminate's remaining-queue drain cannot reclaim it.
+            if (self.msg_hwnd) |hwnd| discardOwnedRequest(self.core_app.alloc, hwnd, &msg);
+            break;
+        }
 
         // Intercept keystrokes destined for popup edit controls so
         // Enter/Escape/Arrow keys can be handled by our code.
@@ -999,15 +1004,7 @@ pub fn terminate(self: *App) void {
     if (self.msg_hwnd) |hwnd| {
         // The worker threads have joined. Windows discards queued messages on
         // destruction, so explicitly free the two owned pointer payload types.
-        var pending: w32.MSG = undefined;
-        while (w32.PeekMessageW(&pending, hwnd, WM_APP_EXPORT_TERMINAL_IO, WM_APP_EXPORT_TERMINAL_IO, w32.PM_REMOVE) != 0) {
-            const request: *TerminalIoExport = @ptrFromInt(@as(usize, @bitCast(pending.lParam)));
-            request.destroy(alloc);
-        }
-        while (w32.PeekMessageW(&pending, hwnd, WM_APP_OPEN_LINK, WM_APP_OPEN_LINK, w32.PM_REMOVE) != 0) {
-            const request: *LinkRequest = @ptrFromInt(@as(usize, @bitCast(pending.lParam)));
-            request.destroy(alloc);
-        }
+        discardQueuedRequests(alloc, hwnd);
         // Clear GWLP_USERDATA before destroying so msgWndProc sees
         // userdata=0 and falls through to DefWindowProc for any
         // messages during destruction (e.g. WM_DESTROY).
@@ -1054,6 +1051,34 @@ pub fn terminate(self: *App) void {
     self.default_command_arena.deinit();
     self.session.deinit();
     self.config.deinit();
+}
+
+/// Only used after the app loop stops. PeekMessageW returns WM_QUIT even when
+/// the HWND and message filters do not match; its lParam is not an owned
+/// request. Consume it here and keep draining the actual queued payloads.
+fn discardQueuedRequests(alloc: Allocator, hwnd: w32.HWND) void {
+    var pending: w32.MSG = undefined;
+    while (w32.PeekMessageW(&pending, hwnd, WM_APP_EXPORT_TERMINAL_IO, WM_APP_EXPORT_TERMINAL_IO, w32.PM_REMOVE) != 0) {
+        discardOwnedRequest(alloc, hwnd, &pending);
+    }
+    while (w32.PeekMessageW(&pending, hwnd, WM_APP_OPEN_LINK, WM_APP_OPEN_LINK, w32.PM_REMOVE) != 0) {
+        discardOwnedRequest(alloc, hwnd, &pending);
+    }
+}
+
+fn discardOwnedRequest(alloc: Allocator, hwnd: w32.HWND, pending: *const w32.MSG) void {
+    if (pending.hwnd != hwnd) return;
+    switch (pending.message) {
+        WM_APP_EXPORT_TERMINAL_IO => {
+            const request: *TerminalIoExport = @ptrFromInt(@as(usize, @bitCast(pending.lParam)));
+            request.destroy(alloc);
+        },
+        WM_APP_OPEN_LINK => {
+            const request: *LinkRequest = @ptrFromInt(@as(usize, @bitCast(pending.lParam)));
+            request.destroy(alloc);
+        },
+        else => {},
+    }
 }
 
 pub fn scheduleSessionSave(self: *App) void {
@@ -4635,6 +4660,71 @@ test "runtime references reject unready disposed and reused core surfaces" {
 test "export terminal IO requires a surface target" {
     var app: App = undefined;
     try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
+}
+
+test "shutdown request drain handles quit and already dequeued owned payloads" {
+    const Worker = struct {
+        fn run(result: *?anyerror) void {
+            check() catch |err| {
+                result.* = err;
+            };
+        }
+
+        fn check() !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+            const hwnd = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(hwnd);
+            defer discardQueuedRequests(alloc, hwnd);
+
+            // A queued quit bypasses the filter even without any payloads.
+            w32.PostQuitMessage(0);
+            var pending: w32.MSG = undefined;
+            try testing.expect(w32.PeekMessageW(&pending, hwnd, WM_APP_EXPORT_TERMINAL_IO, WM_APP_EXPORT_TERMINAL_IO, 0) != 0);
+            try testing.expectEqual(w32.WM_QUIT, pending.message);
+            discardQueuedRequests(alloc, hwnd);
+
+            for ([_]?u32{ null, WM_APP_EXPORT_TERMINAL_IO, WM_APP_OPEN_LINK }) |dequeued| {
+                {
+                    const request = try alloc.create(TerminalIoExport);
+                    errdefer alloc.destroy(request);
+                    request.* = .{ .surface_ref = .{}, .contents = try alloc.dupe(u8, "pending terminal output") };
+                    errdefer alloc.free(request.contents);
+                    try testing.expect(w32.PostMessageW(hwnd, WM_APP_EXPORT_TERMINAL_IO, 0, @bitCast(@intFromPtr(request))) != 0);
+                }
+                {
+                    const request = try alloc.create(LinkRequest);
+                    errdefer alloc.destroy(request);
+                    request.* = .{ .surface_ref = null, .decision = .allow, .url = try alloc.dupe(u8, "https://example.com") };
+                    errdefer alloc.free(request.url);
+                    try testing.expect(w32.PostMessageW(hwnd, WM_APP_OPEN_LINK, 0, @bitCast(@intFromPtr(request))) != 0);
+                }
+                // Model run's quit branch with either owned message already
+                // removed. The queue drain must free only the other one.
+                if (dequeued) |message| {
+                    try testing.expect(w32.GetMessageW(&pending, hwnd, message, message) > 0);
+                    discardOwnedRequest(alloc, hwnd, &pending);
+                }
+                try testing.expect(w32.PostMessageW(hwnd, WM_APP_WAKEUP, 0, 1) != 0);
+                w32.PostQuitMessage(0);
+                discardQueuedRequests(alloc, hwnd);
+                try testing.expect(w32.PeekMessageW(&pending, hwnd, WM_APP_OPEN_LINK, WM_APP_EXPORT_TERMINAL_IO, w32.PM_REMOVE) == 0);
+                // Ordinary messages remain queued and have no owned payload.
+                try testing.expect(w32.PeekMessageW(&pending, hwnd, WM_APP_WAKEUP, WM_APP_WAKEUP, w32.PM_REMOVE) != 0);
+                try testing.expectEqual(WM_APP_WAKEUP, pending.message);
+                discardOwnedRequest(alloc, hwnd, &pending);
+                // Quit has lower priority than the ordinary queued message.
+                discardQueuedRequests(alloc, hwnd);
+                try testing.expect(w32.PeekMessageW(&pending, hwnd, WM_APP_OPEN_LINK, WM_APP_EXPORT_TERMINAL_IO, w32.PM_REMOVE) == 0);
+            }
+        }
+    };
+    // Quit belongs to a thread's queue, so never disturb the test runner's.
+    var result: ?anyerror = null;
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{&result});
+    worker.join();
+    if (result) |err| return err;
 }
 
 test "runtime tab locations follow objects while old owner views stay inert" {
