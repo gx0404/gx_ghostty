@@ -10,7 +10,7 @@ elevation, or unverified installer/application execution is supported.
 param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
-    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign')]
+    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -22,6 +22,10 @@ param(
     [string]$AppRoot,
     [switch]$Rehearsal,
     [ValidateRange(0,120)][int]$HoldSeconds = 0,
+    [ValidateRange(15,120)][int]$CloseWaitSeconds = 15,
+    [ValidateSet('text','multiline','files')][string]$DropCase = 'text',
+    [string]$OleSourceSha256,
+    [ValidateRange(1000,30000)][int]$DropTimeoutMs = 30000,
     [ValidateRange(0,2147483647)][int]$PeerPid = 0,
     [string]$ExportDir,
     [switch]$SoftwareGL
@@ -112,6 +116,96 @@ public static class GxVmToken {
             if (!OpenProcessToken(process, 0x0008, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
             try { return Describe(token, true); } finally { CloseHandle(token); }
         } finally { CloseHandle(process); }
+    }
+}
+'@
+
+# Read-only window facts for the GL close evidence. GetWindowText does not send
+# messages across processes; WM_NULL is sent with SMTO_ABORTIFHUNG and a bound.
+$script:WindowSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class GxVmWindows {
+    delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr lparam);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int count);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hwnd, StringBuilder text, int count);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint msg, IntPtr w, IntPtr l, uint flags, uint ms, out IntPtr result);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    public static string Hex(IntPtr hwnd) { return "0x" + hwnd.ToInt64().ToString("x"); }
+
+    public static Hashtable Describe(IntPtr hwnd) {
+        Hashtable facts = new Hashtable();
+        facts["hwnd"] = Hex(hwnd);
+        bool alive = hwnd != IntPtr.Zero && IsWindow(hwnd);
+        facts["exists"] = alive;
+        if (!alive) return facts;
+        uint pid;
+        facts["thread"] = (long)GetWindowThreadProcessId(hwnd, out pid);
+        facts["pid"] = (long)pid;
+        StringBuilder text = new StringBuilder(512);
+        GetClassNameW(hwnd, text, text.Capacity);
+        facts["class"] = text.ToString();
+        text.Length = 0;
+        GetWindowTextW(hwnd, text, text.Capacity);
+        facts["title"] = text.ToString();
+        facts["visible"] = IsWindowVisible(hwnd);
+        facts["enabled"] = IsWindowEnabled(hwnd);
+        facts["iconic"] = IsIconic(hwnd);
+        facts["owner"] = Hex(GetWindow(hwnd, 4));
+        facts["style"] = "0x" + GetWindowLongPtr(hwnd, -16).ToInt64().ToString("x");
+        facts["ex_style"] = "0x" + GetWindowLongPtr(hwnd, -20).ToInt64().ToString("x");
+        RECT rect;
+        if (GetWindowRect(hwnd, out rect)) facts["rect"] = new int[] { rect.Left, rect.Top, rect.Right, rect.Bottom };
+        int cloaked;
+        facts["cloaked"] = DwmGetWindowAttribute(hwnd, 14, out cloaked, 4) == 0 ? (object)cloaked : null;
+        return facts;
+    }
+
+    public static ArrayList TopLevel(int pid) {
+        ArrayList list = new ArrayList();
+        EnumWindows(delegate (IntPtr hwnd, IntPtr unused) {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            if (owner == (uint)pid) list.Add(Describe(hwnd));
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    // WM_NULL with SMTO_ABORTIFHUNG: whether the window's thread still pumps messages.
+    public static Hashtable Responds(IntPtr hwnd, uint ms) {
+        Hashtable facts = new Hashtable();
+        facts["hwnd"] = Hex(hwnd);
+        facts["timeout_ms"] = (long)ms;
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) { facts["responds"] = null; facts["note"] = "no window"; return facts; }
+        IntPtr unused;
+        bool ok = SendMessageTimeoutW(hwnd, 0, IntPtr.Zero, IntPtr.Zero, 2, ms, out unused) != IntPtr.Zero;
+        facts["responds"] = ok;
+        facts["error"] = ok ? 0 : Marshal.GetLastWin32Error();
+        return facts;
+    }
+
+    public static Hashtable PostClose(IntPtr hwnd) {
+        Hashtable facts = new Hashtable();
+        facts["hwnd"] = Hex(hwnd);
+        bool ok = PostMessageW(hwnd, 0x0010, IntPtr.Zero, IntPtr.Zero);
+        facts["posted"] = ok;
+        facts["error"] = ok ? 0 : Marshal.GetLastWin32Error();
+        return facts;
     }
 }
 '@
@@ -248,6 +342,94 @@ function Initialize-GuestAccounts($Identity) {
 function Get-TokenFacts([int]$ProcessId) {
     if (-not ('GxVmToken' -as [type])) { Add-Type -TypeDefinition $script:TokenSource -Language CSharp }
     return [GxVmToken]::Process($ProcessId)
+}
+
+function Get-WindowSnapshot([int]$ProcessId, [IntPtr]$Main, [string]$Label) {
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $top = @([GxVmWindows]::TopLevel($ProcessId))
+    $ghostty = @($top | Where-Object { $_['class'] -ceq 'GhosttyWindow' })
+    $responds = @($ghostty | ForEach-Object { [GxVmWindows]::Responds([IntPtr][Convert]::ToInt64($_['hwnd'].Substring(2), 16), 2000) })
+    return [ordered]@{ label=$Label; utc=[DateTime]::UtcNow.ToString('o'); main=[GxVmWindows]::Describe($Main);
+        main_is_ghostty_window=(@($ghostty | Where-Object { $_['hwnd'] -eq [GxVmWindows]::Hex($Main) }).Count -eq 1);
+        ghostty_windows=$ghostty; ghostty_wm_null=$responds; top_level=$top }
+}
+
+function Get-ProcessScene([Diagnostics.Process]$Process) {
+    $Process.Refresh()
+    $threads = @($Process.Threads | Group-Object { if ($_.ThreadState -eq 'Wait') { 'Wait/' + $_.WaitReason } else { [string]$_.ThreadState } } |
+        ForEach-Object { [ordered]@{ state=$_.Name; count=$_.Count } })
+    $children = @(Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $Process.Id) |
+        ForEach-Object { [ordered]@{ pid=[int]$_.ProcessId; name=$_.Name; created=$_.CreationDate.ToUniversalTime().ToString('o') } })
+    return [ordered]@{ utc=[DateTime]::UtcNow.ToString('o'); exited=$Process.HasExited; threads=$threads; children=$children }
+}
+
+function Start-DropSource {
+    # Medium console only: re-verify the receiver/host pair, then start the staged,
+    # hash-pinned OLE source (test/windows/gx_ole_source.zig) in --source-window mode.
+    # The host drives the real drag through the VM's VNC pointer; nothing here
+    # injects input, reads the clipboard or presses Enter.
+    if ($OleSourceSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'drop-source requires -OleSourceSha256.' }
+    if (-not $ExportDir) { throw 'drop-source runs through gx-run.cmd so the staged tool and export folder are known.' }
+    $peer = Find-BrokerPeer
+    $receiverPid = [int]$peer.receiver.pid
+    $receiverProcess = Get-Process -Id $receiverPid
+    $receiverBirth = $receiverProcess.StartTime.ToFileTimeUtc()
+    $receiverHwnd = $receiverProcess.MainWindowHandle
+    if ($receiverHwnd -eq [IntPtr]::Zero) { throw 'The drop receiver has no visible window.' }
+    $toolShare = Join-Path (Split-Path -Parent $ExportDir) 'tools\gx_ole_source_window.exe'
+    $toolDir = Join-Path $script:RunRoot ($script:Step + '-ole')
+    [IO.Directory]::CreateDirectory($toolDir) | Out-Null
+    $tool = Join-Path $toolDir 'gx_ole_source_window.exe'
+    Copy-Item -LiteralPath $toolShare -Destination $tool
+    Assert-Hash $tool $OleSourceSha256
+    $work = Join-Path $toolDir 'work'
+    [IO.Directory]::CreateDirectory($work) | Out-Null
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $arguments = @('--run', '--source-window', ('--hwnd=0x{0:x}' -f $receiverHwnd.ToInt64()), "--pid=$receiverPid", "--birth=$receiverBirth",
+        ('--exe="' + $peer.receiver.exe + '"'), ('--sha256=' + $AppSha256.ToLowerInvariant()), ('--work-dir="' + $work + '"'),
+        "--case=$DropCase", "--timeout-ms=$DropTimeoutMs")
+    $start = [Diagnostics.ProcessStartInfo]::new($tool, ($arguments -join ' '))
+    $start.UseShellExecute = $false
+    $start.WorkingDirectory = $toolDir
+    $source = [Diagnostics.Process]::Start($start)
+    $null = $source.Handle
+    $result = [ordered]@{ peer=$peer; receiver_birth_filetime=$receiverBirth; tool_sha256=$OleSourceSha256.ToLowerInvariant();
+        source_pid=$source.Id; case=$DropCase; timeout_ms=$DropTimeoutMs; ready=$null; exit_code=$null; evidence=$null }
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        $readyFile = $null
+        while (-not $readyFile -and [DateTime]::UtcNow -lt $deadline -and -not $source.HasExited) {
+            $readyFile = Get-ChildItem -LiteralPath $work -Recurse -Filter 'ready.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $readyFile) { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $readyFile) { throw "OLE source did not become ready (exited=$($source.HasExited))." }
+        $ready = Get-Content -LiteralPath $readyFile.FullName -Raw | ConvertFrom-Json
+        $result.ready = $ready
+        $sourceWindow = [GxVmWindows]::Describe([IntPtr][int64]$ready.source_hwnd)
+        $receiverWindow = [GxVmWindows]::Describe($receiverHwnd)
+        $result.source_window = $sourceWindow
+        $result.receiver_window = $receiverWindow
+        $s = $sourceWindow['rect']; $r = $receiverWindow['rect']
+        # Drag from the source's client middle to the receiver's lower-right area, clear of the source window.
+        $result.drag = [ordered]@{ x=[int](($s[0] + $s[2]) / 2); y=[int](($s[1] + $s[3]) / 2) + 12;
+            to_x=[int]($r[0] + ($r[2] - $r[0]) * 0.65); to_y=[int]($r[1] + ($r[3] - $r[1]) * 0.65) }
+        Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-drop-ready.json')) $result
+        $closed = $source.WaitForExit($DropTimeoutMs + 15000)
+        if (-not $closed) { $source.Kill(); $null = $source.WaitForExit(5000); throw 'OLE source did not finish within its deadline.' }
+        $result.exit_code = $source.ExitCode
+        $evidence = Get-ChildItem -LiteralPath $work -Recurse -File | Where-Object { $_.Name -in 'evidence.json','result.json','trace.jsonl' }
+        foreach ($item in $evidence) { $script:ExportExtra.Add($item.FullName) }
+        $finished = $evidence | Where-Object { $_.Name -ne 'trace.jsonl' } | Select-Object -First 1
+        if ($finished) { $result.evidence = Get-Content -LiteralPath $finished.FullName -Raw | ConvertFrom-Json }
+        $result.meaning = @{ 0='COPY accepted (OLE admission only; inspect the elevated preview)'; 3='cancelled'; 4='drop rejected/NONE'; 2='invalid invocation/identity/error' }[[int]$source.ExitCode]
+        if ($source.ExitCode -ne 0) { throw ('OLE source exited ' + $source.ExitCode + ': ' + $result.meaning) }
+    } finally {
+        if (-not $source.HasExited) { $source.Kill(); $null = $source.WaitForExit(5000) }
+        $source.Dispose()
+        Write-Json (Join-Path $toolDir 'drop-source.json') $result
+        $script:ExportExtra.Add((Join-Path $toolDir 'drop-source.json'))
+    }
+    return $result
 }
 
 function Compare-SplitTokens($Medium, $High) {
@@ -473,6 +655,9 @@ function Probe-GL {
     $start.EnvironmentVariables['XDG_STATE_HOME'] = Join-Path $private 'state'
     $start.EnvironmentVariables['XDG_CACHE_HOME'] = Join-Path $private 'cache'
     if ($SoftwareGL) { $start.EnvironmentVariables['GHOSTTY_GX_OPENGL'] = 'software' }
+    # Compile the window helper before the launch so the close evidence adds no
+    # delay between the observed window and CloseMainWindow (hold 0 timing).
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
     $process = [Diagnostics.Process]::Start($start)
     $null = $process.Handle
     $pidOwned = $process.Id
@@ -482,6 +667,13 @@ function Probe-GL {
     $renderer = $null
     $closed = $false
     $held = 0
+    $outcome = $null
+    # Close evidence is always exported, also when the close fails and the
+    # finally block replaces the result with the shutdown failure.
+    $closePath = Join-Path $script:RunRoot ($script:Step + '-gl-close.json')
+    $script:ExportExtra.Add($closePath)
+    $close = [ordered]@{ pid=$pidOwned; birth=$birth; birth_filetime=$process.StartTime.ToFileTimeUtc(); hold_seconds=$HoldSeconds;
+        close_wait_seconds=$CloseWaitSeconds; probe_error=$null; probe_outcome=$null }
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(45)
         while ([DateTime]::UtcNow -lt $deadline) {
@@ -493,9 +685,11 @@ function Probe-GL {
             Start-Sleep -Milliseconds 100
         }
         if (-not $renderer) { throw 'No supported actual WGL/Mesa renderer was reported.' }
+        $close.renderer_seen_utc = [DateTime]::UtcNow.ToString('o')
         $windowDeadline = [DateTime]::UtcNow.AddSeconds(10)
         do { $process.Refresh(); if ($process.MainWindowHandle -ne [IntPtr]::Zero) { break }; Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $windowDeadline)
         if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Renderer started without an observable application window.' }
+        $close.window_seen_utc = [DateTime]::UtcNow.ToString('o')
         $title = $process.MainWindowTitle
         if ($HoldSeconds -gt 0) {
             if ($ExportDir) {
@@ -510,19 +704,74 @@ function Probe-GL {
             $held = $HoldSeconds
         }
         $software = if ($renderer[-1] -match 'software=(true|false)') { $Matches[1] -eq 'true' } else { $null }
-        return @{ status=$(if ($app.class -eq 'INSTALLED') { 'PASS_NATIVE_GL_ONLY' } else { 'REHEARSAL_NATIVE_GL_ONLY_NOT_FINAL' });
+        $outcome = @{ status=$(if ($app.class -eq 'INSTALLED') { 'PASS_NATIVE_GL_ONLY' } else { 'REHEARSAL_NATIVE_GL_ONLY_NOT_FINAL' });
                   app_class=$app.class; pid=$pidOwned; birth=$birth; app_sha256=$AppSha256; exe=$exe; window_title=$title;
                   renderer=$renderer; software_renderer=$software; held_seconds=$held; log=$log;
                   visual_review='PENDING'; software_requested=[bool]$SoftwareGL }
+    } catch {
+        $close.probe_error = $_.Exception.Message
+        throw
     } finally {
+        $close.probe_outcome = $outcome
         if (-not $process.HasExited) {
-            $null = $process.CloseMainWindow()
-            $closed = $process.WaitForExit(15000)
-            if (-not $closed) { $process.Kill(); $null = $process.WaitForExit(5000) }
+            # CloseMainWindow targets the handle cached by the window wait above
+            # (no Refresh here), exactly as before; record which window that is.
+            $main = $process.MainWindowHandle
+            $close.before = Get-WindowSnapshot $pidOwned $main 'before-close'
+            $close.close_main_window_utc = [DateTime]::UtcNow.ToString('o')
+            $close.close_main_window = $process.CloseMainWindow()
+            if ($ExportDir -and $script:ExportRoot) {
+                Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-gl-closing.json')) @{ pid=$pidOwned;
+                    utc=$close.close_main_window_utc; close_main_window=$close.close_main_window; wait_seconds=$CloseWaitSeconds }
+            }
+            $closed = $process.WaitForExit(1000)
+            $close.children_after_1s = @()
+            if (-not $closed) {
+                $close.after_1s = Get-WindowSnapshot $pidOwned $main 'after-1s'
+                $close.children_after_1s = @((Get-ProcessScene $process).children)
+                $closed = $process.WaitForExit($CloseWaitSeconds * 1000 - 1000)
+            }
+            if (-not $closed) {
+                $close.before_kill = Get-WindowSnapshot $pidOwned $main 'before-kill'
+                $close.scene = Get-ProcessScene $process
+                # Diagnostic only, never a pass: when CloseMainWindow did not reach a
+                # GhosttyWindow, post WM_CLOSE to the top-level GhosttyWindow itself.
+                if (-not $close.close_main_window -or -not $close.before.main_is_ghostty_window) {
+                    $close.followup = @($close.before_kill.ghostty_windows | ForEach-Object {
+                        [GxVmWindows]::PostClose([IntPtr][Convert]::ToInt64($_['hwnd'].Substring(2), 16)) })
+                    $close.followup_exited = $process.WaitForExit(15000)
+                    if (-not $close.followup_exited) { $close.after_followup = Get-WindowSnapshot $pidOwned $main 'after-followup' }
+                }
+                if (-not $process.HasExited) { $process.Kill(); $null = $process.WaitForExit(5000) }
+                $close.killed = $true
+            }
         } else { $closed = $true }
+        $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
+        $close.exit_code = $exitCode
+        $close.exit_code_hex = if ($null -ne $exitCode) { '0x{0:X8}' -f $exitCode } else { $null }
+        $close.exit_utc = if ($process.HasExited) { $process.ExitTime.ToUniversalTime().ToString('o') } else { $null }
+        # Direct children started by this app that outlived it (ParentProcessId
+        # stays recorded after the parent exits; creation time rules out reuse).
+        $close.orphans_after_exit = if ($process.HasExited) {
+            $bornUtc = $process.StartTime.ToUniversalTime()
+            @(Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $pidOwned) |
+                Where-Object { $_.CreationDate.ToUniversalTime() -ge $bornUtc } |
+                ForEach-Object { [ordered]@{ pid=[int]$_.ProcessId; name=$_.Name; created=$_.CreationDate.ToUniversalTime().ToString('o') } })
+        } else { $null }
+        $close.closed_normally = $closed -and $exitCode -eq 0
+        if ($closed -and $exitCode -ne 0) {
+            # A crash during shutdown: keep the Windows Error Reporting facts.
+            $since = $process.StartTime.AddSeconds(-1)
+            $close.application_errors = @(Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=@(1000,1001); StartTime=$since } -MaxEvents 20 -ErrorAction SilentlyContinue |
+                Where-Object { $_.Message -match 'ghostty\.exe' } |
+                ForEach-Object { [ordered]@{ id=$_.Id; provider=$_.ProviderName; utc=$_.TimeCreated.ToUniversalTime().ToString('o'); message=$_.Message } })
+        }
         $process.Dispose()
+        Write-Json $closePath $close
         if (-not $closed) { throw 'Owned GL probe required termination; normal shutdown did not pass.' }
+        if ($exitCode -ne 0) { throw ('Owned GL probe exited with ' + $close.exit_code_hex + ' after the close request; normal shutdown did not pass.') }
     }
+    return $outcome
 }
 
 function Enable-SplitTokens {
@@ -539,6 +788,73 @@ function Enable-SplitTokens {
     $after = Get-ItemProperty -LiteralPath $path
     return @{ before=$old; after=@{ enable_lua=$after.EnableLUA; consent_admin=$after.ConsentPromptBehaviorAdmin; secure_desktop=$after.PromptOnSecureDesktop };
               restart_required=($old.enable_lua -ne 1) }
+}
+
+function Start-IsolatedApp([string]$Exe, [string]$Private, [string[]]$ConfigLines) {
+    $config = Join-Path $Private 'ghostty\config.ghostty'
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($config)) | Out-Null
+    [IO.File]::WriteAllText($config, (($ConfigLines -join $script:LF) + $script:LF), [Text.UTF8Encoding]::new($false))
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Exe
+    $start.Arguments = '--gx-single-instance=false'
+    $start.WorkingDirectory = $Private
+    $start.UseShellExecute = $false
+    foreach ($key in @($start.EnvironmentVariables.Keys)) {
+        if ($key -match '^(?i:GHOSTTY_|XDG_)' -or $key -in @('NO_COLOR','TERM','LOCALAPPDATA','APPDATA')) { $start.EnvironmentVariables.Remove($key) }
+    }
+    $start.EnvironmentVariables['LOCALAPPDATA'] = $Private
+    $start.EnvironmentVariables['APPDATA'] = Join-Path $Private 'appdata'
+    $start.EnvironmentVariables['XDG_CONFIG_HOME'] = $Private
+    $start.EnvironmentVariables['XDG_STATE_HOME'] = Join-Path $Private 'state'
+    $start.EnvironmentVariables['XDG_CACHE_HOME'] = Join-Path $Private 'cache'
+    return [Diagnostics.Process]::Start($start)
+}
+
+function Start-BrokerHost {
+    # Elevated, isolated candidate terminal that stays running for the manual
+    # menu/drop steps. Only -Rehearsal payloads are accepted before the final package.
+    if (-not (Test-Elevated)) { throw 'broker-host must run in the elevated (high) console of the split-token user.' }
+    $app = Resolve-GlApp
+    $private = Join-Path $script:RunRoot ($script:Step + '-broker-profile')
+    $process = Start-IsolatedApp $app.exe $private @('language = en', 'confirm-close-surface = false', 'gx-session-restore = false',
+        'clipboard-paste-protection = true', 'command = cmd.exe /d /k prompt GX_BROKER_HIGH$G$S')
+    $null = $process.Handle
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    do { $process.Refresh(); if ($process.HasExited) { throw "Broker host exited $($process.ExitCode) during startup." }
+         if ($process.MainWindowHandle -ne [IntPtr]::Zero) { break }; Start-Sleep -Milliseconds 200 } while ([DateTime]::UtcNow -lt $deadline)
+    if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Broker host showed no window within 45 seconds.' }
+    $host_record = [ordered]@{ pid=$process.Id; birth_filetime=$process.StartTime.ToFileTimeUtc(); birth=$process.StartTime.ToUniversalTime().ToString('o');
+        exe=$app.exe; app_class=$app.class; app_sha256=$AppSha256; hwnd=('0x{0:x}' -f $process.MainWindowHandle.ToInt64());
+        token=(Get-TokenFacts $process.Id); log=(Join-Path $private 'ghostty\logs\ghostty.log') }
+    $record = Join-Path $script:RunRoot 'broker-host.json'
+    Write-Json $record $host_record
+    $script:ExportExtra.Add($record)
+    $process.Dispose()
+    return $host_record
+}
+
+function Find-BrokerPeer {
+    if (Test-Elevated) { throw 'broker-peer must run in the normal (medium) console.' }
+    $hostPath = Join-Path $script:RunRoot 'broker-host.json'
+    $hostRecord = Get-Content -LiteralPath $hostPath -Raw | ConvertFrom-Json
+    $hostProcess = Get-Process -Id $hostRecord.pid -ErrorAction Stop
+    if ($hostProcess.StartTime.ToFileTimeUtc() -ne [int64]$hostRecord.birth_filetime) { throw 'Broker host PID was reused.' }
+    $hostFacts = Get-TokenFacts $hostRecord.pid
+    $self = Get-TokenFacts $PID
+    $candidates = @(Get-CimInstance Win32_Process -Filter "Name = 'ghostty.exe'" | Where-Object {
+        $_.CommandLine -match '--gx-shell-action=drop-companion' -and $_.CommandLine -match ('--gx-drop-target-pid=' + $hostRecord.pid + '(\s|$)') })
+    if ($candidates.Count -ne 1) { throw "Expected exactly one drop receiver for host $($hostRecord.pid), found $($candidates.Count)." }
+    $peer = $candidates[0]
+    if ($peer.ExecutablePath -ine $hostRecord.exe) { throw 'Drop receiver image path differs from the elevated host.' }
+    Assert-Hash $peer.ExecutablePath $AppSha256
+    if ($peer.CommandLine -notmatch ('--gx-drop-target-birth=' + $hostRecord.birth_filetime + '(\s|$)')) { throw 'Drop receiver birth argument differs from the host process.' }
+    $peerFacts = Get-TokenFacts ([int]$peer.ProcessId)
+    $pair = Compare-SplitTokens $peerFacts $hostFacts
+    if (-not $pair.paired) { throw ('Receiver/host split-token pairing failed: ' + ($pair.failures -join '; ')) }
+    if ($peerFacts.sid -ne $self.sid -or $peerFacts.logon_id -ne $self.logon_id) { throw 'Receiver is not in this medium console logon.' }
+    $windows = @(Get-Process -Id $peer.ProcessId | ForEach-Object { @{ title=$_.MainWindowTitle; hwnd=('0x{0:x}' -f $_.MainWindowHandle.ToInt64()) } })
+    return [ordered]@{ host=$hostRecord; host_token_now=$hostFacts; receiver=@{ pid=[int]$peer.ProcessId; command_line=$peer.CommandLine;
+        exe=$peer.ExecutablePath; created=$peer.CreationDate.ToUniversalTime().ToString('o'); token=$peerFacts; window=$windows }; pairing=$pair }
 }
 
 function Run-Inspect {
@@ -602,6 +918,9 @@ try {
         'accounts' { $report.result = Initialize-GuestAccounts $identity }
         'enable-uac' { $report.result = Enable-SplitTokens }
         'gl' { $report.result = Probe-GL }
+        'broker-host' { $report.result = Start-BrokerHost }
+        'broker-peer' { $report.result = Find-BrokerPeer }
+        'drop-source' { $report.result = Start-DropSource }
         { $_ -in 'install','upgrade' } {
             if ($script:State.foreign_active) { throw 'Use expect-install-refused for a recorded foreign-before fixture.' }
             if ($Phase -eq 'upgrade' -and -not $script:State.installed) { throw 'Install the old package in this run before upgrading.' }
