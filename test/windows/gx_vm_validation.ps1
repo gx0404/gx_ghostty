@@ -57,6 +57,20 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 public static class GxVmToken {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CommandLineToArgvW(string command, out int count);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+
+    public static string[] Arguments(string command) {
+        if (String.IsNullOrEmpty(command)) return new string[0];
+        int count;
+        IntPtr memory = CommandLineToArgvW(command, out count);
+        if (memory == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            string[] result = new string[count];
+            for (int i = 0; i < count; i++) result[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(memory, i * IntPtr.Size));
+            return result;
+        } finally { LocalFree(memory); }
+    }
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
@@ -841,13 +855,17 @@ function Find-BrokerPeer {
     if ($hostProcess.StartTime.ToFileTimeUtc() -ne [int64]$hostRecord.birth_filetime) { throw 'Broker host PID was reused.' }
     $hostFacts = Get-TokenFacts $hostRecord.pid
     $self = Get-TokenFacts $PID
+    $expectedPid = '--gx-drop-target-pid=' + $hostRecord.pid
+    $expectedBirth = '--gx-drop-target-birth=' + $hostRecord.birth_filetime
     $candidates = @(Get-CimInstance Win32_Process -Filter "Name = 'ghostty.exe'" | Where-Object {
-        $_.CommandLine -match '--gx-shell-action=drop-companion' -and $_.CommandLine -match ('--gx-drop-target-pid=' + $hostRecord.pid + '(\s|$)') })
+        $arguments = [GxVmToken]::Arguments($_.CommandLine)
+        $arguments -ccontains '--gx-shell-action=drop-companion' -and $arguments -ccontains $expectedPid })
     if ($candidates.Count -ne 1) { throw "Expected exactly one drop receiver for host $($hostRecord.pid), found $($candidates.Count)." }
     $peer = $candidates[0]
     if ($peer.ExecutablePath -ine $hostRecord.exe) { throw 'Drop receiver image path differs from the elevated host.' }
     Assert-Hash $peer.ExecutablePath $AppSha256
-    if ($peer.CommandLine -notmatch ('--gx-drop-target-birth=' + $hostRecord.birth_filetime + '(\s|$)')) { throw 'Drop receiver birth argument differs from the host process.' }
+    $peerArguments = [GxVmToken]::Arguments($peer.CommandLine)
+    if ($peerArguments -cnotcontains $expectedBirth) { throw 'Drop receiver birth argument differs from the host process.' }
     $peerFacts = Get-TokenFacts ([int]$peer.ProcessId)
     $pair = Compare-SplitTokens $peerFacts $hostFacts
     if (-not $pair.paired) { throw ('Receiver/host split-token pairing failed: ' + ($pair.failures -join '; ')) }
