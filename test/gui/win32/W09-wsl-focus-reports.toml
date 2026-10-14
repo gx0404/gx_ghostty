@@ -8,7 +8,8 @@ keybind = f7=goto_tab:1
 keybind = f8=goto_tab:2
 """
 expect = [
-  "focus-events: tab 1 shows cat -v output with exactly two ^[[O^[[I pairs (two round trips), no extra events",
+  "enabled: right after printf turns focus reporting on, before any tab switch, cat -v shows exactly one ^[[I (the DECSET 1004 report of the current focus) and nothing else",
+  "focus-events: tab 1 shows cat -v output with that ^[[I followed by exactly two ^[[O^[[I pairs (two round trips), no extra events",
 ]
 
 [[step]]
@@ -22,6 +23,12 @@ text = "printf '\\e[?1004h'; cat -v\n"
 [[step]]
 action = "sleep"
 seconds = 1.0
+
+# Enabling 1004 reports the current focus once (upstream
+# src/termio/stream_handler.zig, .focus_event); show it before the round trips.
+[[step]]
+action = "capture"
+name = "enabled"
 
 [[step]]
 action = "key"

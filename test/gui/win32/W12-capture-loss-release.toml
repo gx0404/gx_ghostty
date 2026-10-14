@@ -6,6 +6,7 @@ command = wsl.exe -d Ubuntu-24.04 -e bash --noprofile --norc
 language = en
 """
 expect = [
+  "released-on-cancel: after WM_CANCELMODE took the capture and while the button is still held, cat -v already shows the ^[[<0;…M press and exactly one ^[[<0;…m release",
   "one-release: cat -v shows one ^[[<0;…M press and exactly one ^[[<0;…m release (sent when WM_CANCELMODE took the capture); the physical button up adds no second release",
 ]
 
@@ -36,7 +37,12 @@ action = "cancel_mode"
 
 [[step]]
 action = "sleep"
-seconds = 0.4
+seconds = 0.8
+
+# The button is still down: a release on screen now came from the capture loss.
+[[step]]
+action = "capture"
+name = "released-on-cancel"
 
 [[step]]
 action = "mouse_up"

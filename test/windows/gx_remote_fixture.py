@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime
 from ctypes import wintypes
 from dataclasses import asdict
 import hashlib
@@ -48,6 +49,8 @@ LEASE = 8
 VISIBLE = 16
 UNAVAILABLE = 32
 REQUIRED_REMOTE = REMOTE | READY | ALL_FRAMES | LEASE | VISIBLE
+# RemoteSurfaceView.State: waiting, live, unavailable, closed.
+PANE_LIVE, PANE_UNAVAILABLE, PANE_CLOSED = 1, 2, 3
 UIA_PANE = 50033
 WM_IME_CONTROL = 0x0283
 IMC_GETCONVERSIONMODE = 0x0001
@@ -57,6 +60,8 @@ IMC_SETOPENSTATUS = 0x0006
 IME_CMODE_NATIVE = 0x0001
 # Handles that are not HGLOBAL bytes: bitmap, metafile, palette, enhanced metafile, display variants.
 GDI_HANDLE_FORMATS = {2, 3, 9, 14, 0x82, 0x83, 0x8E}
+STANDARD_FORMATS = {1: "CF_TEXT", 2: "CF_BITMAP", 3: "CF_METAFILEPICT", 7: "CF_OEMTEXT", 8: "CF_DIB", 9: "CF_PALETTE",
+                    13: "CF_UNICODETEXT", 14: "CF_ENHMETAFILE", 15: "CF_HDROP", 16: "CF_LOCALE", 17: "CF_DIBV5"}
 SESSION_PROFILE = "custom:GXFixture"
 UNSAFE_PASTE_TITLE = "Warning: Potentially Unsafe Paste"
 OPTIONAL_CASES = ("uia", "performable", "once", "copy", "paste", "ole", "ime", "dragback", "bell", "mixed", "session")
@@ -94,6 +99,7 @@ class Fixture:
         self.expected_hash = args.sha256.lower()
         self.out = args.out.resolve()
         self.capture_method = args.capture
+        self.split_stress = args.split_stress
         self.end = args.end
         self.skip = set(args.skip or ())
         self.owned = []
@@ -108,7 +114,8 @@ class Fixture:
         self.clipboard_saved = None
         self.allow_clipboard_loss = bool(args.allow_clipboard_loss)
         self.ole_source = args.ole_source.resolve(strict=True) if args.ole_source else None
-        self.session_target = "session" not in self.skip
+        self.only = list(dict.fromkeys(args.only or ()))
+        self.session_target = not self.only and "session" not in self.skip
         self.token = secrets.token_hex(12)
         self.check_build()
         self.out.mkdir(parents=True, exist_ok=False)
@@ -155,7 +162,7 @@ class Fixture:
             "rehearsal": bool(args.rehearsal),
             "evidence_class": "REHEARSAL_NOT_ACCEPTANCE" if args.rehearsal else "CANDIDATE",
             "environment": str(self.environment), "marker_token": self.token, "end": self.end,
-            "skipped_cases": sorted(self.skip), "config_validation": self.config_check,
+            "skipped_cases": sorted(self.skip), "only": self.only, "config_validation": self.config_check,
             "keyboard_mouse_input": True, "clipboard_access": False, "wire_protocol_injected": False,
             "visual_review": "PENDING", "processes": [], "cases": [], "captures": [], "cleanup": [],
             "hook_contract": {"begin": BEGIN, "query": QUERY, "magic": MAGIC,
@@ -498,9 +505,14 @@ class Fixture:
 
     # -- evidence ----------------------------------------------------------------------
 
-    def capture(self, instance, hwnd, cls, name, expect):
+    def capture(self, instance, hwnd, cls, name, expect, force=False):
         attempts = []
-        methods = ("screen", "print") if self.capture_method == "auto" else (self.capture_method,)
+        if self.capture_method == "none" and not force:
+            # Stress repetitions keep native checks only; failures still force a capture.
+            self.report.setdefault("not_captured", []).append({"name": name, "expect": expect})
+            self.save()
+            return
+        methods = ("screen", "print") if self.capture_method in ("auto", "none") else (self.capture_method,)
         for method in methods:
             try:
                 info = self.fresh(instance, hwnd, cls)
@@ -753,13 +765,120 @@ class Fixture:
         # The cmd process exists before its script appends the launch marker.
         wait(lambda: len(self.launches("target")) >= 2, "the new local split ran its launch script")
         self.once("target", 2)
+        # The split resizes the remote view; after it settles the original
+        # remote pane must still be live, not the unavailable placeholder.
+        time.sleep(1.0)
+        pane_flags = self.require_live_remote(target, remote, "after the chained new_split")
         self.record("chained-new-split-continuation", target_children=self.command_children(target),
-                    chain=lines, layout=self.layout(target, remote.hwnd))
+                    chain=lines, pane_flags=pane_flags, layout=self.layout(target, remote.hwnd))
         self.capture(target, remote.hwnd, REMOTE_CLASS, "target-mixed",
                      "原远程终端与新建的目标本地终端并排；源端 chain 命令行已执行，源命令不重放")
 
+    def case_split_stress(self, target, remote, before, rounds):
+        """Repeat layout changes in one target instance: a remote-originated
+        new_split (with its chained source text), closing that new local split,
+        and shrinking then restoring the target window. Every change re-maps
+        the remote view; after each one the original pane must be live, bound to
+        the original source core and still receiving frames."""
+        api = gui.win32()
+        left, top, right, bottom = self.fresh(target, remote.hwnd, REMOTE_CLASS).rect
+        width, height = right - left, bottom - top
+        chain = list(self.file_lines("chain.txt") or [])
+        children = self.command_children(target)
+        launches = self.launches("target")
+        steps = []
+        alive = []
+
+        def settled(label, previous):
+            # Read the remote pane itself (the window query follows the
+            # focused leaf). Frame sequences restart with each mapping
+            # generation and an idle shell need not draw, so progress is not
+            # required here; liveness is: still live, same source core, and a
+            # fresh echo marker typed into the pane must reach the source shell.
+            state = wait(lambda: (lambda value: value if value["state"] == PANE_LIVE else None)(self.live_pane(target, remote, label)),
+                         f"remote pane live {label}", 10)
+            self.require_live_remote(target, remote, label)
+            if state["surface_id"] != before["surface_id"]:
+                raise AssertionError(f"remote pane lost its source core {label}: {state!r}")
+            # End-to-end after every layout change: a unique marker typed into
+            # the remote pane must run in the original source shell once.
+            self.focus_remote(target, remote.hwnd)
+            alive.append(f"{self.marker('alive')}_{len(alive) + 1}")
+            target.type_text(f"echo {alive[-1]}>>alive.txt")
+            target.press("enter")
+            self.expect_lines("alive.txt", alive, f"input through the remote pane reached the source shell {label}")
+            after = self.live_pane(target, remote, label)
+            steps.append({"step": label, "before": previous, "settled": state, "after_echo": after,
+                          "layout": self.layout(target, remote.hwnd)})
+            return after
+
+        def shells(expected):
+            # A cmd that is starting or exiting can vanish between enumeration
+            # and its identity query; that is not a result, so poll again.
+            try:
+                current = self.command_children(target)
+            except AssertionError:
+                return False
+            return len(current) == expected if isinstance(expected, int) else current == expected
+
+        state = self.live_pane(target, remote, "before the stress")
+        try:
+            for index in range(1, rounds + 1):
+                # Remote-originated split; the chained source text runs exactly once more.
+                self.focus_remote(target, remote.hwnd)
+                known = {item.hwnd for item in self.local_terminals(target, remote.hwnd)}
+                target.press("ctrl+alt+r")
+                wait(lambda: shells(len(children) + 1), f"round {index}: new_split adds one target shell")
+                chain.append(self.marker("chain"))
+                self.expect_lines("chain.txt", chain, f"round {index}: the chained source text ran once")
+                wait(lambda: len(self.launches("target")) == len(launches) + index,
+                     f"round {index}: the new local split ran its launch script")
+                added = wait(lambda: [item for item in self.local_terminals(target, remote.hwnd) if item.hwnd not in known],
+                             f"round {index}: the new local split is visible")
+                if len(added) != 1:
+                    raise AssertionError(f"round {index}: expected one new local split, found {len(added)}")
+                split = added[0]
+                state = settled(f"after split {index}", state)
+                # Close only the new local split. Focus is checked before every
+                # keystroke so "exit" can never reach the source shell.
+                if api.focus_window(remote.hwnd) != split.hwnd:
+                    l, t, r, b = split.rect
+                    target.mouse((l + r) // 2, (t + b) // 2)
+                    wait(lambda: api.focus_window(remote.hwnd) == split.hwnd, f"round {index}: focus on the new split", 3)
+                target.ensure_foreground()
+                if api.focus_window(remote.hwnd) != split.hwnd:
+                    raise AssertionError(f"round {index}: keyboard focus is not on the new local split")
+                target.type_text("exit")
+                if api.focus_window(remote.hwnd) != split.hwnd:
+                    raise AssertionError(f"round {index}: focus left the new local split before Enter")
+                target.press("enter")
+                wait(lambda: shells(children), f"round {index}: exit ends only the new split's shell")
+                wait(lambda: split.hwnd not in {item.hwnd for item in self.local_terminals(target, remote.hwnd)},
+                     f"round {index}: the new split closes")
+                state = settled(f"after close {index}", state)
+                # Shrink, then restore, the target window (SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE).
+                for w, h, what in ((width - 320, height - 200, "shrink"), (width, height, "restore")):
+                    target.ensure_owned()
+                    if not api.SetWindowPos(remote.hwnd, None, 0, 0, w, h, 0x0002 | 0x0004 | 0x0010):
+                        raise AssertionError(f"round {index}: SetWindowPos {what} failed")
+                    state = settled(f"after {what} {index}", state)
+        except AssertionError:
+            self.report.setdefault("stress_steps", steps)
+            self.capture(target, remote.hwnd, REMOTE_CLASS, "target-stress-failure",
+                         "失败时的目标窗口：远程窗格是否已显示 unavailable，或停在哪一步", force=True)
+            raise
+        self.same_process(self.source_child)
+        if self.command_children(target) != children:
+            raise AssertionError("split stress left extra or replaced target shells")
+        self.once("source")
+        generations = sorted({item["after_echo"]["mapping_generation"] for item in steps})
+        self.record("split-resize-stress", rounds=rounds, layout_changes=len(steps), chain_lines=len(chain), alive_lines=len(alive),
+                    mapping_generations=generations, steps=steps, target_launches=len(self.launches("target")))
+        self.capture(target, remote.hwnd, REMOTE_CLASS, "target-stress-final",
+                     f"{rounds} 轮 split/关闭/缩放后：左侧远程窗格仍显示源终端（{len(chain)} 行 CHAIN），右侧为链式新建的本地窗格")
+
     def tracked_files(self):
-        return {name: self.file_lines(name) for name in ("chain.txt", "once.txt", "perf.txt", "twice.txt", "remote-input.txt", "back.txt", "paste.txt", "safe-paste.txt", "ole.txt", "ime.txt", "keep.txt")}
+        return {name: self.file_lines(name) for name in ("alive.txt", "chain.txt", "once.txt", "perf.txt", "twice.txt", "remote-input.txt", "back.txt", "paste.txt", "safe-paste.txt", "ole.txt", "ime.txt", "keep.txt")}
 
     def case_mixed(self, source, target, remote):
         layout_before = self.layout(target, remote.hwnd)
@@ -784,7 +903,33 @@ class Fixture:
         self.once("target", 2)
         self.record("mixed-tab-transfer-rejected", begin_result=result, layout=layout_after)
 
+    def require_live_remote(self, target, remote, when):
+        """Exactly one visible remote pane, still connected (not unavailable)."""
+        panes = self.remote_panes(target, remote.hwnd)
+        if len(panes) != 1:
+            raise AssertionError(f"expected one visible remote pane {when}, found {len(panes)}")
+        flags = self.query(target, panes[0].hwnd, REMOTE_PANE_CLASS, 1)
+        if flags & UNAVAILABLE:
+            raise AssertionError(f"the remote pane was already unavailable {when} (flags={flags})")
+        return flags
+
+    def live_pane(self, target, remote, label):
+        """Fixture query on the single visible remote pane (RemotePane.query)."""
+        panes = self.remote_panes(target, remote.hwnd)
+        if len(panes) != 1:
+            raise AssertionError(f"expected one visible remote pane {label}, found {len(panes)}")
+        hwnd = panes[0].hwnd
+        if self.query(target, hwnd, REMOTE_PANE_CLASS, 0) != MAGIC:
+            raise AssertionError("remote pane test hook absent or incompatible")
+        fields = {1: "flags", 2: "surface_id", 4: "frame_sequence", 5: "mapping_generation", 6: "transaction", 9: "state"}
+        state = {"pane": hwnd, **{name: self.query(target, hwnd, REMOTE_PANE_CLASS, selector) for selector, name in fields.items()}}
+        if state["flags"] & UNAVAILABLE or state["state"] in (PANE_UNAVAILABLE, PANE_CLOSED):
+            raise AssertionError(f"remote pane became unavailable {label}: {state!r}")
+        return state
+
     def case_source_loss(self, source, target, remote):
+        # An earlier disconnect would make the unavailable state below trivial.
+        self.require_live_remote(target, remote, "before the source was terminated")
         panes = self.remote_panes(target, remote.hwnd)
         if len(panes) != 1:
             raise AssertionError("expected one remote pane before the source loss")
@@ -806,8 +951,11 @@ class Fixture:
         flags = wait(unavailable, "target marks the remote pane unavailable after source loss", 20)
         if flags & LEASE:
             raise AssertionError("an unavailable remote pane kept its input lease")
-        if self.command_children(target) != target_children or len(self.local_terminals(target, remote.hwnd)) != len(local_before):
-            raise AssertionError("source loss changed target-local terminals")
+        children_after = self.command_children(target)
+        local_after = self.local_terminals(target, remote.hwnd)
+        if children_after != target_children or len(local_after) != len(local_before):
+            raise AssertionError(f"source loss changed target-local terminals: cmd {target_children!r} -> {children_after!r}, "
+                                 f"visible local {[w.hwnd for w in local_before]!r} -> {[w.hwnd for w in local_after]!r}")
         self.same_launches("target", launches_before)
         self.record("source-loss-unavailable", flags=flags, layout=self.layout(target, remote.hwnd))
         self.capture(target, remote.hwnd, REMOTE_CLASS, "target-source-unavailable",
@@ -828,7 +976,9 @@ class Fixture:
         self.capture(target, remote.hwnd, REMOTE_CLASS, "target-unavailable-closed",
                      "不可用远程叶关闭后只剩目标本地终端，窗口仍可用")
 
-    def case_target_loss(self, source, target, before):
+    def case_target_loss(self, source, target, before, remote):
+        # Recovery must follow the target abort, not an earlier disconnect.
+        self.require_live_remote(target, remote, "before the target was terminated")
         target_process = self.processes["target"]["process"]
         self.expected_exit.add("target")
         target.ensure_owned()
@@ -842,7 +992,15 @@ class Fixture:
         self.check_continuity(source, restored, before)
         self.record("original-core-recovered-without-command-replay", before=before, restored=restored,
                     source_child=self.source_child, source_launches=self.launches("source"), target_launches=self.launches("target"))
-        self.capture(source, restored_window.hwnd, gui.WINDOW_CLASS, "source-recovered", "恢复后同一源终端仍显示 " + self.marker("source"))
+        # Same presentation gate as the drag-back capture: the original
+        # terminal HWND must be a visible child, then one second to draw.
+        terminal = next((child for child in gui.win32().child_windows(restored_window.hwnd, gui.TERMINAL_CLASS)
+                         if child.hwnd == before["terminal_hwnd"]), None)
+        if terminal is None or not terminal.visible:
+            raise AssertionError(f"the recovered terminal HWND is not a visible child of the source window: {terminal!r}")
+        time.sleep(1.0)
+        self.capture(source, restored_window.hwnd, gui.WINDOW_CLASS, "source-recovered",
+                     "目标退出 1 秒后源窗口显示同一源终端：" + self.marker("source") + " 与已执行输入仍在（空白即渲染未恢复）")
 
     # -- batch 2: clipboard, OLE, IME, session, bell border ---------------------------------
 
@@ -897,19 +1055,28 @@ class Fixture:
         finally:
             api.CloseClipboard()
 
+    @staticmethod
+    def format_name(fmt):
+        if fmt in STANDARD_FORMATS:
+            return STANDARD_FORMATS[fmt]
+        buffer = ctypes.create_unicode_buffer(256)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        return buffer.value if user32.GetClipboardFormatNameW(fmt, buffer, 256) else f"format-{fmt}"
+
     def claim_clipboard(self):
         """Snapshot the user's clipboard once, byte for byte, before any case writes it."""
         if self.clipboard_saved is not None:
             return True
         items, blocker = self.clipboard_snapshot()
         if items is None:
-            self.report["clipboard"] = {"blocked_by_format": blocker}
+            self.report["clipboard"] = {"blocked_by_format": self.format_name(blocker)}
             if not self.allow_clipboard_loss:
                 self.save()
                 return False
             items = []
+        # Held in memory only; the report never records clipboard bytes, text or sizes.
         self.clipboard_saved = items
-        self.report["clipboard"] = {"formats_before": [[fmt, len(data)] for fmt, data in items]}
+        self.report["clipboard"] = {"format_count": len(items), "formats": [self.format_name(fmt) for fmt, _ in items]}
         self.report["clipboard_access"] = True
         self.save()
         return True
@@ -941,8 +1108,9 @@ class Fixture:
                 api.CloseClipboard()
             items, _ = self.clipboard_snapshot()
             same = items is not None and {fmt: data for fmt, data in items if fmt in restored} == {fmt: data for fmt, data in self.clipboard_saved if fmt in restored}
-            self.report["clipboard"]["restored_formats"] = restored
+            self.report["clipboard"]["restored_count"] = len(restored)
             self.report["clipboard"]["restored_identical"] = same and len(restored) == len(self.clipboard_saved)
+            self.clipboard_saved = None
         except gui.GuiError as exc:
             self.report["clipboard"]["restore_error"] = str(exc)
 
@@ -1010,26 +1178,74 @@ class Fixture:
         finally:
             self.cancel_dialogs(target, before)
 
+    @staticmethod
+    def local_time():
+        return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    def case_safe_paste(self, target, remote):
+        before = {item.hwnd for item in target.popups()}
+        try:
+            if not self.claim_clipboard():
+                self.record("safe-paste-no-enter", "BLOCKED", reason="the clipboard holds a GDI-handle format this fixture cannot restore; pass --allow-clipboard-loss")
+                return
+            self.safe_paste_steps(target, remote)
+        finally:
+            self.cancel_dialogs(target, before)
+
+    def safe_paste_steps(self, target, remote):
+        """One safe line: no dialog, no Enter, and the paste binding's continuation
+        must finish so that the next Enter reaches the source shell."""
+        api = gui.win32()
+        pane = self.focus_remote(target, remote.hwnd)
+        timeline = []
+
+        def mark(event):
+            entry = {"event": event, "local_time": self.local_time()}
+            try:
+                entry["pane_flags"] = self.query(target, pane.hwnd, REMOTE_PANE_CLASS, 1)
+                entry["pane_last_action"] = self.query(target, pane.hwnd, REMOTE_PANE_CLASS, 10)
+                entry["pane_transaction"] = self.query(target, pane.hwnd, REMOTE_PANE_CLASS, 6)
+            except (AssertionError, gui.GuiError) as exc:
+                entry["query_error"] = str(exc)
+            timeline.append(entry)
+            self.report["safe_paste_timeline"] = timeline
+            self.save()
+
+        safe = self.marker("safe_paste")
+        api.set_clipboard_text(f"echo {safe}>>safe-paste.txt")
+        before = {item.hwnd for item in target.popups()}
+        mark("before-ctrl-shift-v")
+        target.press("ctrl+shift+v")
+        mark("after-ctrl-shift-v")
+        time.sleep(1.0)
+        mark("settled-1s")
+        if self.new_popups(target, before):
+            raise AssertionError("a one-line paste asked for confirmation")
+        if self.file_lines("safe-paste.txt") is not None:
+            raise AssertionError("a one-line paste ran without Enter")
+        target.ensure_foreground()
+        mark("before-enter")
+        target.press("enter")
+        mark("after-enter")
+        try:
+            self.expect_lines("safe-paste.txt", [safe], "after a safe remote paste the next Enter reaches the shell")
+        except AssertionError:
+            mark("enter-not-delivered")
+            self.capture(target, remote.hwnd, REMOTE_CLASS, "target-safe-paste-failure",
+                         "失败现场：粘贴的单行停在远程提示符，Enter 未到达源端 shell")
+            raise
+        mark("result-file-matched")
+        self.record("safe-paste-no-enter", marker=safe, timeline=timeline)
+        self.capture(target, remote.hwnd, REMOTE_CLASS, "target-safe-paste",
+                     "远程窗格中 echo GX_REMOTE_SAFE_PASTE…>>safe-paste.txt 只执行一次，执行后回到空提示符")
+
     def paste_steps(self, target, remote):
         if not self.claim_clipboard():
             self.record("protected-paste-no-enter", "BLOCKED", reason="the clipboard holds a GDI-handle format this fixture cannot restore; pass --allow-clipboard-loss")
             return
         api = gui.win32()
+        self.safe_paste_steps(target, remote)
         self.focus_remote(target, remote.hwnd)
-        # A safe one-line paste first: no dialog, no Enter, and the binding
-        # continuation must finish so the next key reaches the shell.
-        safe = self.marker("safe_paste")
-        api.set_clipboard_text(f"echo {safe}>>safe-paste.txt")
-        before = {item.hwnd for item in target.popups()}
-        target.press("ctrl+shift+v")
-        time.sleep(1.0)
-        if self.new_popups(target, before):
-            raise AssertionError("a one-line paste asked for confirmation")
-        if self.file_lines("safe-paste.txt") is not None:
-            raise AssertionError("a one-line paste ran without Enter")
-        target.press("enter")
-        self.expect_lines("safe-paste.txt", [safe], "after a safe remote paste the next Enter reaches the shell")
-        self.record("safe-paste-no-enter", marker=safe)
         first, second = self.marker("paste_1"), self.marker("paste_2")
         # LF only: Ghostty turns each newline into one Enter, so CRLF would add an empty command.
         api.set_clipboard_text(f"echo {first}>>paste.txt\necho {second}>>paste.txt")
@@ -1276,8 +1492,11 @@ class Fixture:
                     saved_leaf=document["windows"][0]["tabs"][0]["nodes"][0]["leaf"], generation=document.get("generation"))
         self.capture(target, remote.hwnd, REMOTE_CLASS, "target-profile-tab",
                      "第三个标签：自定义 profile GXFixture 的终端与其普通分屏，均显示 GX_REMOTE_TARGET 标记")
-        target.press("alt+2")
-        wait(lambda: len(self.remote_panes(target, remote.hwnd)) == 1, "back on the mixed tab")
+        # GX defaults unbind alt+digit; the profile tab opened right after the
+        # mixed tab (window-new-tab-position = current), so previous_tab returns.
+        target.press("ctrl+pageup")
+        wait(lambda: len(self.remote_panes(target, remote.hwnd)) == 1 and len(self.local_terminals(target, remote.hwnd)) == 1,
+             "back on the mixed tab: one remote and one local leaf visible")
 
     def edge_colors(self, image, rect, scale):
         left, top, right, bottom = rect
@@ -1381,6 +1600,18 @@ class Fixture:
                     child=self.source_child, layout=self.layout(target, remote.hwnd))
         self.capture(target, remote.hwnd, REMOTE_CLASS, "target-remote",
                      "目标远程视图应显示源标记 " + self.marker("source") + "；不是目标本地标记")
+        if self.only:
+            # Narrow diagnosis: transfer and its continuity checks above stay mandatory.
+            probes = {"uia": ("remote-uia-external-mta", self.case_uia),
+                      "input": ("remote-input-to-original-shell", self.case_input),
+                      "performable": ("performable-fallback-without-selection", self.case_performable),
+                      "once": ("activate-key-table-once", self.case_once),
+                      "copy": ("mouse-selection-copy", self.case_copy),
+                      "paste": ("safe-paste-no-enter", self.case_safe_paste)}
+            for name in self.only:
+                label, function = probes[name]
+                self.case(label, function, target, remote)
+            return self.finish()
         self.case("remote-input-to-original-shell", self.case_input, target, remote, critical=True)
         self.case("remote-uia-external-mta", self.case_uia, target, remote, optional="uia")
         self.case("performable-fallback-without-selection", self.case_performable, target, remote, optional="performable")
@@ -1401,6 +1632,9 @@ class Fixture:
         else:
             self.record("dragback-returns-original-tab", "SKIPPED", reason="--skip dragback")
         self.case("chained-new-split-continuation", self.case_chain, target, remote, critical=True)
+        if self.split_stress:
+            self.case("split-resize-stress", self.case_split_stress, target, remote, before, self.split_stress,
+                      critical=True)
         self.case("remote-bell-border", self.case_bell, target, remote, optional="bell")
         self.case("mixed-tab-transfer-rejected", self.case_mixed, source, target, remote, optional="mixed")
         self.case("session-prunes-remote-leaf", self.case_session, target, remote, optional="session", critical=True)
@@ -1408,7 +1642,10 @@ class Fixture:
             self.case("source-loss-unavailable", self.case_source_loss, source, target, remote, critical=True)
         else:
             self.case("original-core-recovered-without-command-replay", self.case_target_loss, source, target, before,
-                      critical=True)
+                      remote, critical=True)
+        return self.finish()
+
+    def finish(self):
         self.check_build()
         failed = [item["name"] for item in self.report["cases"] if item["status"] == "FAIL"]
         blocked = [item["name"] for item in self.report["cases"] if item["status"] == "BLOCKED"]
@@ -1478,6 +1715,26 @@ class Fixture:
                         self.report["cleanup"].append({"role": role, "pid": process.pid, "status": "FAIL", "reason": str(exc)})
                     self.report["status"] = "FAIL"
                     result = 1
+            # A fixture-initiated close must end the app cleanly. An access
+            # violation (0xC0000005) or any other code is a product failure.
+            shutdown = []
+            for role, tracked in self.processes.items():
+                if role in self.expected_exit:
+                    continue
+                process = tracked["process"]
+                try:
+                    code = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    code = None
+                shutdown.append({"role": role, "pid": process.pid, "exit_code": code,
+                                 "exit_code_hex32": None if code is None else f"0x{code & 0xffffffff:08x}"})
+            if shutdown:
+                clean = all(item["exit_code"] == 0 for item in shutdown)
+                self.report["cases"].append({"name": "clean-shutdown-on-close", "status": "PASS" if clean else "FAIL",
+                                             "processes": shutdown})
+                if not clean:
+                    self.report["status"] = "FAIL"
+                    result = 1
             try:
                 self.diagnostics("after-cleanup")
             except Exception as exc:
@@ -1492,15 +1749,22 @@ def main(argv=None):
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--out", required=True, type=Path, help="new unused evidence directory")
     parser.add_argument("--build", required=True, help="build label recorded with the hash")
-    parser.add_argument("--capture", choices=("auto", "screen", "print"), default="auto")
+    parser.add_argument("--capture", choices=("auto", "screen", "print", "none"), default="auto",
+                        help="none: native checks only (failures still capture); for stress repetitions")
+    parser.add_argument("--split-stress", type=int, default=0, metavar="N",
+                        help="after the chained split, N rounds of remote new_split, closing it and a window resize")
     parser.add_argument("--end", choices=("source-loss", "target-loss"), default="source-loss",
                         help="which peer to terminate last (only one can be lost per run)")
     parser.add_argument("--skip", action="append", choices=OPTIONAL_CASES, help="skip an optional case (repeatable)")
     parser.add_argument("--rehearsal", action="store_true", help="label the evidence as a rehearsal, never acceptance")
     parser.add_argument("--ole-source", type=Path, help="built test/windows/gx_ole_source.zig executable for the real OLE drag")
+    parser.add_argument("--only", action="append", choices=("uia", "input", "performable", "once", "copy", "paste"),
+                        help="after the mandatory transfer run only these probes, in order, then close both apps (repeatable)")
     parser.add_argument("--allow-clipboard-loss", action="store_true",
                         help="run clipboard cases even when non-text clipboard data cannot be restored")
     args = parser.parse_args(argv)
+    if args.split_stress < 0:
+        parser.error("--split-stress must be >= 0")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
         parser.error("--sha256 must be a complete frozen-build digest")
     if os.name != "nt":
