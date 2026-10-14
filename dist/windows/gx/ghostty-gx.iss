@@ -107,8 +107,8 @@ Source: "{#GxApp}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs crea
 #include GxFonts
 
 [Icons]
-Name: "{autoprograms}\Ghostty GX"; Filename: "{app}\ghostty.exe"; WorkingDir: "{%USERPROFILE}"; AppUserModelID: "{#GxAumid}"; AppUserModelToastActivatorCLSID: "{{{#GxToastClsid}}"
-Name: "{autodesktop}\Ghostty GX"; Filename: "{app}\ghostty.exe"; WorkingDir: "{%USERPROFILE}"; AppUserModelID: "{#GxAumid}"; AppUserModelToastActivatorCLSID: "{{{#GxToastClsid}}"; Tasks: desktopicon
+Name: "{autoprograms}\Ghostty GX"; Filename: "{app}\ghostty.exe"; WorkingDir: "{%USERPROFILE}"; AppUserModelID: "{#GxAumid}"; AppUserModelToastActivatorCLSID: "{#GxToastClsid}"
+Name: "{autodesktop}\Ghostty GX"; Filename: "{app}\ghostty.exe"; WorkingDir: "{%USERPROFILE}"; AppUserModelID: "{#GxAumid}"; AppUserModelToastActivatorCLSID: "{#GxToastClsid}"; Tasks: desktopicon
 
 [Registry]
 ; No automatic uninstall deletion: the guarded code below removes only values

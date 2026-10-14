@@ -681,7 +681,7 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertEqual(len(shortcuts), 2)
         for line in shortcuts:
             self.assertIn('AppUserModelID: "{#GxAumid}"', line)
-            self.assertIn('AppUserModelToastActivatorCLSID: "{{{#GxToastClsid}}"', line)
+            self.assertIn('AppUserModelToastActivatorCLSID: "{#GxToastClsid}"', line)
         registrations = [line for line in self.lines if line.startswith("Root: ") and
                          ("AppUserModelId" in line or "LocalServer32" in line)]
         self.assertEqual(len(registrations), 5)
