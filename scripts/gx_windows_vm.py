@@ -19,7 +19,14 @@ QEMU human monitor inside the container.
   keys / type        HMP sendkey with QEMU qcodes, or US-keyboard ASCII text (--channel vnc
                      sends keysyms through the container's QEMU VNC server instead)
   type-secret        type a credentials.json field; the value never reaches argv or output
-  click              absolute pointer click through the container's QEMU VNC server
+  pointer            read-only HMP info mice: which QEMU mouse receives VNC pointer input now;
+                     exits 1 unless it is an absolute device (usb-tablet)
+  click              pointer click at VM screen pixels through the container's QEMU VNC server
+  drag               press at --x/--y, move in --steps to --to-x/--to-y, dwell --hold-ms, release
+                     (VNC pointer; a real OLE drag in the guest, never the host desktop). click and
+                     drag first require an absolute current mouse (a relative one turns the
+                     coordinates into motion from wherever the guest cursor is), report the mode
+                     before and after, and refuse points outside the VNC screen unsent
   stage-validation   stage the guest fixture after checking the live VM identity
   rehearsal-layout   ghostty.exe plus pinned ConPTY/Mesa from the offline package cache, marked
                      REHEARSAL_NOT_FINAL, for GL rehearsal before the frozen installer exists
@@ -383,6 +390,10 @@ width, height = struct.unpack(">HH", recv(4))
 recv(16)
 recv(struct.unpack(">I", recv(4))[0])
 for event in events:
+    if event[0] == "p" and not (0 <= event[1] < width and 0 <= event[2] < height):
+        raise SystemExit("pointer %d,%d is outside the %dx%d VNC screen; no event was sent"
+                         % (event[1], event[2], width, height))
+for event in events:
     kind = event[0]
     if kind == "k":
         s.sendall(struct.pack(">BBxxI", 4, event[2], event[1]))
@@ -421,12 +432,110 @@ def vnc_send(docker: Docker, version: str, events: list) -> dict:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-def vnc_click(docker: Docker, version: str, x: int, y: int, button: str = "left", count: int = 1) -> dict:
-    mask = {"left": 1, "middle": 2, "right": 4}[button]
+VNC_COORD_MAX = 0xFFFF
+DRAG_STEPS = (2, 60)
+DRAG_HOLD_MS = (0, 5000)
+BUTTON_MASKS = {"left": 1, "middle": 2, "right": 4}
+# One HMP "info mice" line, e.g. "* Mouse #2: QEMU HID Tablet (absolute)". "*" marks the device that
+# receives pointer input: the one QEMU's VNC server asks whether coordinates are absolute.
+MOUSE_LINE = re.compile(r"([* ]) Mouse #(\d+): (.*?)( \(absolute\))?$")
+
+
+def parse_mice(text: str) -> list[dict]:
+    mice = []
+    for line in clean_monitor(text).splitlines():
+        found = MOUSE_LINE.search(line.rstrip())
+        if found:
+            mice.append({"index": int(found.group(2)), "name": found.group(3),
+                         "absolute": found.group(4) is not None, "current": found.group(1) == "*"})
+    return mice
+
+
+def pointer_mode(docker: Docker, version: str) -> dict:
+    """Which QEMU mouse receives VNC pointer events right now (read-only HMP info mice).
+
+    QEMU's VNC server passes RFB coordinates on as positions only when this device is absolute; for
+    a relative one it sends motion deltas, so a correct packet still lands at the guest cursor.
+    Nothing here switches devices."""
+    mice = parse_mice(hmp(docker, version, ["info mice"]))
+    current = [mouse for mouse in mice if mouse["current"]]
+    active = current[0] if len(current) == 1 else None
+    return {"absolute": bool(active and active["absolute"]), "current": active, "devices": mice,
+            "source": "HMP info mice", "checked_utc": utc_now()}
+
+
+def require_absolute_pointer(docker: Docker, version: str) -> dict:
+    mode = pointer_mode(docker, version)
+    if not mode["absolute"]:
+        current = mode["current"]
+        name = current["name"] if current else ("no single current mouse" if mode["devices"] else "no mouse reported")
+        raise VmError(f"VNC pointer input is not absolute (current QEMU mouse: {name}); the coordinates would "
+                      "become relative motion from the guest cursor, so nothing was sent. Use keyboard input; "
+                      "switching the mouse device needs an authorized VM runtime change.")
+    return mode
+
+
+def vnc_pointer(docker: Docker, version: str, events: list) -> dict:
+    """Send pointer events only while the current QEMU mouse is absolute and report the mode before
+    and after: a correct RFB packet is not enough when the device that receives it is relative."""
+    before = require_absolute_pointer(docker, version)
+    screen = vnc_send(docker, version, events)
+    after = pointer_mode(docker, version)
+    if not after["absolute"]:
+        raise VmError("the current QEMU mouse stopped being absolute while the pointer events were sent; "
+                      "treat that input as unverified")
+    return {"screen": screen, "pointer": {"before": before, "after": after}}
+
+
+def vnc_click_events(x: int, y: int, button: str = "left", count: int = 1) -> list:
+    if button not in BUTTON_MASKS:
+        raise VmError("click button must be left, middle or right")
+    if not 1 <= count <= 3:
+        raise VmError("click --count must be 1-3")
+    for value in (x, y):
+        if not 0 <= value <= VNC_COORD_MAX:
+            raise VmError("click coordinates must be VM screen pixels")
+    mask = BUTTON_MASKS[button]
     events: list = [["p", x, y, 0], ["s", 0.15]]
     for _ in range(count):
         events += [["p", x, y, mask], ["s", 0.08], ["p", x, y, 0], ["s", 0.08]]
-    return vnc_send(docker, version, events)
+    return events
+
+
+def vnc_click(docker: Docker, version: str, x: int, y: int, button: str = "left", count: int = 1) -> dict:
+    return vnc_pointer(docker, version, vnc_click_events(x, y, button, count))
+
+
+def vnc_drag_events(x: int, y: int, to_x: int, to_y: int, button: str = "left", steps: int = 12,
+                    hold_ms: int = 300) -> list:
+    """Press, move in `steps` interpolated moves with the button held, dwell, release at the target.
+
+    The first move after the press crosses the Windows drag threshold, so the guest's
+    DragDetect/DoDragDrop sees a real drag; the dwell lets DragEnter/DragOver settle."""
+    if button not in ("left", "middle", "right"):
+        raise VmError("drag button must be left, middle or right")
+    for value in (x, y, to_x, to_y):
+        if not 0 <= value <= VNC_COORD_MAX:
+            raise VmError("drag coordinates must be VM screen pixels")
+    if (x, y) == (to_x, to_y):
+        raise VmError("drag needs distinct start and end points")
+    if not DRAG_STEPS[0] <= steps <= DRAG_STEPS[1]:
+        raise VmError(f"drag --steps must be {DRAG_STEPS[0]}-{DRAG_STEPS[1]}")
+    if not DRAG_HOLD_MS[0] <= hold_ms <= DRAG_HOLD_MS[1]:
+        raise VmError(f"drag --hold-ms must be {DRAG_HOLD_MS[0]}-{DRAG_HOLD_MS[1]}")
+    mask = {"left": 1, "middle": 2, "right": 4}[button]
+    events: list = [["p", x, y, 0], ["s", 0.15], ["p", x, y, mask], ["s", 0.15]]
+    for step in range(1, steps + 1):
+        px = x + round((to_x - x) * step / steps)
+        py = y + round((to_y - y) * step / steps)
+        events += [["p", px, py, mask], ["s", 0.04]]
+    events += [["s", hold_ms / 1000], ["p", to_x, to_y, 0], ["s", 0.15]]
+    return events
+
+
+def vnc_drag(docker: Docker, version: str, x: int, y: int, to_x: int, to_y: int, button: str = "left",
+             steps: int = 12, hold_ms: int = 300) -> dict:
+    return vnc_pointer(docker, version, vnc_drag_events(x, y, to_x, to_y, button, steps, hold_ms))
 
 
 def type_secret_vnc(root: Path, version: str, docker: Docker, field: str, enter: bool) -> int:
@@ -748,7 +857,7 @@ Remove-Item -LiteralPath C:\OEM\guest-user.json
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("prepare", "verify", "status", "up", "stop", "identity", "screenshot",
-                                            "keys", "type", "type-secret", "click", "stage-validation",
+                                            "keys", "type", "type-secret", "pointer", "click", "drag", "stage-validation",
                                             "rehearsal-layout"))
     parser.add_argument("items", nargs="*", help="keys: QEMU qcodes such as meta_l-r or ctrl-alt-delete; type: text")
     parser.add_argument("--root", type=Path, default=ROOT / ".local" / "windows-vm")
@@ -765,6 +874,10 @@ def main() -> int:
     parser.add_argument("--y", type=int)
     parser.add_argument("--button", choices=("left", "middle", "right"), default="left")
     parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--to-x", type=int, help="drag: end point (VM screen pixels)")
+    parser.add_argument("--to-y", type=int)
+    parser.add_argument("--steps", type=int, default=12, help="drag: interpolated moves while held (2-60)")
+    parser.add_argument("--hold-ms", type=int, default=300, help="drag: dwell at the end point before release")
     parser.add_argument("--slot-timeout", type=float, default=0)
     parser.add_argument("--replace-container", help="up: exact ID (12+ hex) of a stopped, owned but mismatched "
                         "container that may be recreated from the pinned compose; disks are bind mounts and kept")
@@ -833,11 +946,24 @@ def main() -> int:
             count = typer(root, args.version, docker, args.field, args.enter)
             print(json.dumps({"typed_characters": count, "enter": args.enter, "channel": args.channel,
                               "value_printed": False}))
+        elif args.command == "pointer":
+            mode = pointer_mode(docker, args.version)
+            print(json.dumps(mode, indent=2))
+            if not mode["absolute"]:
+                return 1
         elif args.command == "click":
             if args.x is None or args.y is None or not 1 <= args.count <= 3:
                 raise VmError("click requires --x and --y (VM screen pixels) and --count 1-3")
+            events = vnc_click_events(args.x, args.y, args.button, args.count)
             print(json.dumps({"clicked": [args.x, args.y], "button": args.button, "count": args.count,
-                              "screen": vnc_click(docker, args.version, args.x, args.y, args.button, args.count)}))
+                              **vnc_pointer(docker, args.version, events)}))
+        elif args.command == "drag":
+            if None in (args.x, args.y, args.to_x, args.to_y):
+                raise VmError("drag requires --x --y --to-x --to-y (VM screen pixels)")
+            events = vnc_drag_events(args.x, args.y, args.to_x, args.to_y, args.button, args.steps, args.hold_ms)
+            print(json.dumps({"dragged": [[args.x, args.y], [args.to_x, args.to_y]], "button": args.button,
+                              "steps": args.steps, "hold_ms": args.hold_ms,
+                              **vnc_pointer(docker, args.version, events)}))
         else:
             live = live_uuid(docker, args.version)
             if args.guest_uuid and str(uuid.UUID(args.guest_uuid)) != live:

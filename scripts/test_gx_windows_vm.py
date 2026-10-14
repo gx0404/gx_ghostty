@@ -2,10 +2,12 @@
 IsolatedTestCase makes any unmocked subprocess call, docker CLI lookup or gx_slots acquisition fail
 the test, and fakes use a docker path that does not exist."""
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -14,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gx_windows_vm as vm
 
 MISSING_DOCKER = str(Path(tempfile.gettempdir()) / "gx-no-such-docker" / "docker.exe")
+# HMP transcripts as QEMU's monitor socket returns them: banner, echoed prompt, CRLF.
+BANNER = "QEMU 9.2.0 monitor - type 'help' for more information\r\n(qemu) info mice\r\n"
+ABSOLUTE_MICE = BANNER + "  Mouse #0: QEMU PS/2 Mouse\r\n* Mouse #2: QEMU HID Tablet (absolute)\r\n(qemu) "
+RELATIVE_MICE = BANNER + "* Mouse #0: QEMU PS/2 Mouse\r\n  Mouse #2: QEMU HID Tablet (absolute)\r\n(qemu) "
 
 
 def refuse(*args, **kwargs):
@@ -43,10 +49,12 @@ class IsolatedTestCase(unittest.TestCase):
 class FakeDocker(vm.Docker):
     """Answers inspect/exec from memory; never runs a real CLI."""
 
-    def __init__(self, inspect=None, root=None):
+    def __init__(self, inspect=None, root=None, mice=None):
         super().__init__(MISSING_DOCKER, runner=self.fake, root=root)
         self.calls = []
         self.inspect = inspect
+        # HMP "info mice" answers, consumed in order; none means no mouse is reported.
+        self.mice = list(mice or [])
 
     def fake(self, argv, input=None, capture_output=True, text=True, timeout=None):
         assert argv[0] == MISSING_DOCKER
@@ -55,6 +63,8 @@ class FakeDocker(vm.Docker):
             if self.inspect is None:
                 return subprocess.CompletedProcess(argv, 1, "", "No such container")
             return subprocess.CompletedProcess(argv, 0, json.dumps([self.inspect]), "")
+        if argv[1] == "exec" and input == "info mice\n":
+            return subprocess.CompletedProcess(argv, 0, self.mice.pop(0) if self.mice else "", "")
         if argv[1:3] == ["image", "inspect"] or argv[1] in ("exec", "compose"):
             return subprocess.CompletedProcess(argv, 0, "" if text else b"", "" if text else b"")
         raise AssertionError(f"unexpected docker command {argv[1:]}")
@@ -256,6 +266,154 @@ class WindowsVmTests(IsolatedTestCase):
         docker = FakeDocker(payload(self.root, running=True), root=self.root)
         vm.stop(self.root, "win11", docker)
         self.assertTrue(any(call[0][:1] == ["compose"] and "stop" in call[0] for call in docker.calls))
+
+    def test_drag_holds_the_button_until_release_at_the_target(self):
+        events = vm.vnc_drag_events(100, 200, 400, 260, steps=3, hold_ms=300)
+        pointer = [event for event in events if event[0] == "p"]
+        self.assertEqual(pointer[0], ["p", 100, 200, 0])
+        self.assertEqual(pointer[1], ["p", 100, 200, 1])
+        held = pointer[2:-1]
+        self.assertEqual(len(held), 3)
+        self.assertTrue(all(event[3] == 1 for event in held))
+        self.assertNotEqual(held[0][1:3], [100, 200])
+        self.assertEqual(held[-1], ["p", 400, 260, 1])
+        self.assertEqual(pointer[-1], ["p", 400, 260, 0])
+        self.assertIn(["s", 0.3], events)
+        right = [event for event in vm.vnc_drag_events(5, 5, 50, 5, "right", 2, 0) if event[0] == "p"]
+        self.assertEqual([event[3] for event in right], [0, 4, 4, 4, 0])
+
+    def test_drag_rejects_invalid_arguments_before_any_input(self):
+        for args in ((10, 10, 10, 10), (10, 10, 20, 20, "left", 1), (10, 10, 20, 20, "left", 61),
+                     (10, 10, 20, 20, "left", 12, -1), (10, 10, 20, 20, "left", 12, 5001),
+                     (-1, 10, 20, 20), (10, 10, 65536, 20), (10, 10, 20, 20, "x1")):
+            with self.subTest(args=args), self.assertRaises(vm.VmError):
+                vm.vnc_drag_events(*args)
+
+    def test_drag_keeps_the_owned_running_container_guard(self):
+        vm.prepare(self.root)
+        for inspect in (payload(self.root, running=False), payload(self.root, owner="someone-else"), None):
+            docker = FakeDocker(inspect, root=self.root)
+            with self.subTest(inspect=bool(inspect)), self.assertRaises(vm.VmError):
+                vm.vnc_drag(docker, "win11", 10, 10, 200, 20)
+            self.assertFalse([call for call in docker.calls if call[0][0] == "exec"])
+        with mock.patch.object(vm, "vnc_send", return_value={"width": 1280, "height": 800}) as send:
+            docker = FakeDocker(payload(self.root), root=self.root, mice=[ABSOLUTE_MICE, ABSOLUTE_MICE])
+            self.assertEqual(vm.vnc_drag(docker, "win11", 10, 10, 200, 20, steps=4)["screen"]["width"], 1280)
+            self.assertEqual(send.call_args.args[2], vm.vnc_drag_events(10, 10, 200, 20, steps=4))
+
+    def test_drag_cli_validates_before_touching_docker(self):
+        argv = ["gx_windows_vm.py", "drag", "--root", str(self.root), "--x", "10", "--y", "10", "--to-x", "50"]
+        with mock.patch.object(vm, "docker_executable", return_value=MISSING_DOCKER), \
+                mock.patch.object(sys, "argv", argv), mock.patch("sys.stderr") as stderr, \
+                self.assertRaises(SystemExit) as raised:
+            vm.main()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("--to-y", "".join(call.args[0] for call in stderr.write.call_args_list))
+        argv += ["--to-y", "10", "--steps", "1"]
+        with mock.patch.object(vm, "docker_executable", return_value=MISSING_DOCKER), \
+                mock.patch.object(sys, "argv", argv), mock.patch("sys.stderr"), \
+                self.assertRaises(SystemExit) as raised:
+            vm.main()
+        self.assertEqual(raised.exception.code, 1)
+
+    def test_info_mice_names_the_device_that_receives_vnc_pointer_input(self):
+        mice = vm.parse_mice(ABSOLUTE_MICE)
+        self.assertEqual(mice, [
+            {"index": 0, "name": "QEMU PS/2 Mouse", "absolute": False, "current": False},
+            {"index": 2, "name": "QEMU HID Tablet", "absolute": True, "current": True}])
+        self.assertEqual([mouse["current"] for mouse in vm.parse_mice(RELATIVE_MICE)], [True, False])
+        self.assertEqual(vm.parse_mice(BANNER + "No mouse devices connected\r\n(qemu) "), [])
+        vm.prepare(self.root)
+        mode = vm.pointer_mode(FakeDocker(payload(self.root), root=self.root, mice=[ABSOLUTE_MICE]), "win11")
+        self.assertTrue(mode["absolute"])
+        self.assertEqual(mode["current"]["name"], "QEMU HID Tablet")
+        mode = vm.pointer_mode(FakeDocker(payload(self.root), root=self.root, mice=[RELATIVE_MICE]), "win11")
+        self.assertFalse(mode["absolute"])
+        self.assertEqual(mode["current"]["name"], "QEMU PS/2 Mouse")
+
+    def test_relative_or_unknown_mouse_refuses_click_and_drag_before_any_vnc_input(self):
+        vm.prepare(self.root)
+        for mice in ([RELATIVE_MICE], [BANNER + "No mouse devices connected\r\n"], [],
+                     [ABSOLUTE_MICE.replace("  Mouse #0", "* Mouse #0")]):
+            for action in (lambda docker: vm.vnc_click(docker, "win11", 842, 776, "right"),
+                           lambda docker: vm.vnc_drag(docker, "win11", 10, 10, 200, 20)):
+                docker = FakeDocker(payload(self.root), root=self.root, mice=mice)
+                with self.subTest(mice=mice), self.assertRaisesRegex(vm.VmError, "not absolute.*nothing was sent"):
+                    action(docker)
+                self.assertFalse([call for call in docker.calls if "python3" in call[0]])
+
+    def test_absolute_click_keeps_its_events_and_reports_the_mode_before_and_after(self):
+        vm.prepare(self.root)
+        docker = FakeDocker(payload(self.root), root=self.root, mice=[ABSOLUTE_MICE, ABSOLUTE_MICE])
+        with mock.patch.object(vm, "vnc_send", return_value={"width": 1280, "height": 800}) as send:
+            result = vm.vnc_click(docker, "win11", 842, 776, "right")
+        self.assertEqual(send.call_args.args[2], [["p", 842, 776, 0], ["s", 0.15], ["p", 842, 776, 4], ["s", 0.08],
+                                                  ["p", 842, 776, 0], ["s", 0.08]])
+        self.assertEqual(result["screen"], {"width": 1280, "height": 800})
+        for moment in ("before", "after"):
+            self.assertTrue(result["pointer"][moment]["absolute"])
+            self.assertEqual(result["pointer"][moment]["current"]["name"], "QEMU HID Tablet")
+        hmp_inputs = [call[1] for call in docker.calls if call[0][:1] == ["exec"]]
+        self.assertEqual(hmp_inputs, ["info mice\n", "info mice\n"])
+
+    def test_mouse_that_turns_relative_during_the_send_is_reported_as_unverified(self):
+        vm.prepare(self.root)
+        docker = FakeDocker(payload(self.root), root=self.root, mice=[ABSOLUTE_MICE, RELATIVE_MICE])
+        with mock.patch.object(vm, "vnc_send", return_value={"width": 1280, "height": 800}) as send, \
+                self.assertRaisesRegex(vm.VmError, "unverified"):
+            vm.vnc_click(docker, "win11", 10, 10)
+        send.assert_called_once()
+
+    def test_click_rejects_invalid_arguments_before_any_input(self):
+        for args in ((-1, 10), (10, 65536), (10, 10, "x1"), (10, 10, "left", 0), (10, 10, "left", 4)):
+            with self.subTest(args=args), self.assertRaises(vm.VmError):
+                vm.vnc_click_events(*args)
+        double = [event for event in vm.vnc_click_events(3, 4, "middle", 2) if event[0] == "p"]
+        self.assertEqual([event[3] for event in double], [0, 2, 0, 2, 0])
+
+    def run_vnc_client(self, events, width=1280, height=800):
+        """Run the in-container VNC client source against an in-memory RFB 3.8 server."""
+        server = io.BytesIO(b"RFB 003.008\n" + bytes([1, 1]) + struct.pack(">I", 0) + struct.pack(">HH", width, height)
+                            + bytes(16) + struct.pack(">I", 2) + b"vm")
+        sent = []
+        connection = mock.MagicMock()
+        connection.recv.side_effect = lambda size: server.read(size)
+        connection.sendall.side_effect = sent.append
+        fake_socket = mock.MagicMock()
+        fake_socket.create_connection.return_value = connection
+        with mock.patch.dict(sys.modules, {"socket": fake_socket}), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(events))), \
+                mock.patch("time.sleep"), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            try:
+                exec(compile(vm.VNC_CLIENT, "vnc_client", "exec"), {})
+            except SystemExit as exc:
+                return sent, None, str(exc)
+        return sent, json.loads(stdout.getvalue()), None
+
+    def test_vnc_client_sends_rfb_pointer_events_only_inside_the_screen(self):
+        handshake = [b"RFB 003.008\n", b"\x01", b"\x01"]
+        sent, screen, error = self.run_vnc_client([["p", 842, 776, 4], ["p", 1279, 799, 0]])
+        self.assertIsNone(error)
+        self.assertEqual(screen, {"width": 1280, "height": 800})
+        self.assertEqual(sent, handshake + [bytes.fromhex("0504034a0308"), bytes.fromhex("050004ff031f")])
+        for outside in (["p", 1280, 10, 0], ["p", 10, 800, 1]):
+            sent, screen, error = self.run_vnc_client([["p", 10, 10, 0], outside])
+            self.assertIn("outside the 1280x800 VNC screen", error)
+            self.assertEqual(sent, handshake)
+        sent, screen, error = self.run_vnc_client([["k", 0x41, 1], ["k", 0x41, 0]], width=1, height=1)
+        self.assertIsNone(error)
+        self.assertEqual(sent[3:], [struct.pack(">BBxxI", 4, 1, 0x41), struct.pack(">BBxxI", 4, 0, 0x41)])
+
+    def test_pointer_cli_reports_the_mode_and_fails_when_relative(self):
+        for mice, code in ((ABSOLUTE_MICE, 0), (RELATIVE_MICE, 1)):
+            vm.prepare(self.root)
+            docker = FakeDocker(payload(self.root), root=self.root, mice=[mice])
+            argv = ["gx_windows_vm.py", "pointer", "--root", str(self.root)]
+            with mock.patch.object(vm, "docker_executable", return_value=MISSING_DOCKER), \
+                    mock.patch.object(vm, "Docker", return_value=docker), mock.patch.object(sys, "argv", argv), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(vm.main(), code)
+            self.assertEqual(json.loads(stdout.getvalue())["absolute"], code == 0)
 
 
 if __name__ == "__main__":
