@@ -471,6 +471,10 @@ pub fn queuePaste(self: *Self, pane: *RemotePane, transaction: u64, text: []cons
     const owned = try pane.app.core_app.alloc.dupe(u8, text);
     errdefer pane.app.core_app.alloc.free(owned);
     if (!target.inputs.pushPaste(.{ .surface = pane.source_reference, .lease = lease, .sequence = sequence, .event = .{ .paste = .{ .transfer = transaction, .parent = parent, .index = 0, .last = false, .text = .{} } } }, owned)) return error.QueueFull;
+    if (@import("remote_test.zig").enabled()) {
+        const last = (target.inputs.head + target.inputs.len - 1) % target.inputs.ordered.len;
+        log.info("remote paste queued requested={} stored={} producer_sequence={}", .{ transaction, target.inputs.ordered[last].?.input.event.paste.transfer, sequence });
+    }
     target.input_sequence = sequence;
     if (pane.app.msg_hwnd) |hwnd| _ = w32.PostMessageW(hwnd, wake_message, 0, 0);
 }
@@ -891,6 +895,7 @@ fn progressTarget(self: *Self, target: *Target) !void {
     if (target.source_revoked and target.ever_enabled and target.input_request == null) if (target.inputs.peek()) |input| {
         var ordered = input;
         ordered.sequence = try std.math.add(u64, target.wire_sequence, 1);
+        if (@import("remote_test.zig").enabled() and ordered.event == .paste) log.info("remote paste sending queued_transfer={} wire_transfer={} chunk={} wire_sequence={}", .{ input.event.paste.transfer, ordered.event.paste.transfer, ordered.event.paste.index, ordered.sequence });
         const request = try connection.sendBody(target.ticket, .{ .input = ordered });
         target.wire_sequence = ordered.sequence;
         target.input_request = .{ .request = request, .sequence = input.sequence, .surface = input.surface };

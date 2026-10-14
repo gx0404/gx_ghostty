@@ -627,6 +627,53 @@ test "remote input sequence survives reconnect and key tags require real enum me
     try std.testing.expectError(error.InvalidInput, physicalKey(Sparse, 5));
 }
 
+test "gx.remote paste codec preserves transfer nine parent ten independent of sequence and boolean flags" {
+    const alloc = std.testing.allocator;
+    const packet = try alloc.create(Packet);
+    defer alloc.destroy(packet);
+    const decoded = try alloc.create(Packet);
+    defer alloc.destroy(decoded);
+    const bytes = try alloc.alloc(u8, max_frame_size);
+    defer alloc.free(bytes);
+    packet.* = .{ .sender_epoch = 2, .recipient_epoch = 1, .request_id = 127, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 3 }, .body = .{ .input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 5 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 3 },
+        .sequence = 41,
+        .event = .{ .paste = .{ .transfer = 9, .index = 0, .last = true, .text = try Text.init("owned paste"), .parent = .{ .transaction = 10, .config_generation = 23 } } },
+    } } };
+    const encoded = try encode(bytes, packet);
+    // Inspect the wire scalar separately from decodeInto's nested aggregate
+    // writes, so a regression identifies which side corrupts the correlation.
+    var reader: Reader = .{ .bytes = encoded, .offset = 8 };
+    _ = try reader.get(u128); // sender_epoch
+    _ = try reader.get(u128); // recipient_epoch
+    _ = try reader.get(u64); // request_id
+    _ = try reader.get(Ticket);
+    try std.testing.expectEqual(std.meta.Tag(Body).input, try reader.get(std.meta.Tag(Body)));
+    _ = try reader.get(refs.Reference);
+    _ = try reader.get(Lease);
+    try std.testing.expectEqual(@as(u64, 41), try reader.get(u64));
+    try std.testing.expectEqual(std.meta.Tag(@FieldType(Input, "event")).paste, try reader.get(std.meta.Tag(@FieldType(Input, "event"))));
+    try std.testing.expectEqual(@as(u64, 9), try reader.get(u64));
+    try decodeInto(encoded, decoded);
+    try std.testing.expectEqual(@as(u64, 9), decoded.body.input.event.paste.transfer);
+    try std.testing.expectEqual(@as(u32, 0), decoded.body.input.event.paste.index);
+    try std.testing.expect(decoded.body.input.event.paste.last);
+    try std.testing.expectEqual(@as(u64, 10), decoded.body.input.event.paste.parent.?.transaction);
+    try std.testing.expectEqual(@as(u64, 23), decoded.body.input.event.paste.parent.?.config_generation);
+    try std.testing.expectEqualStrings("owned paste", decoded.body.input.event.paste.text.slice());
+    const returned = try decode(encoded);
+    try std.testing.expectEqual(@as(u64, 9), returned.body.input.event.paste.transfer);
+    try std.testing.expectEqual(@as(u64, 10), returned.body.input.event.paste.parent.?.transaction);
+    // Reuse the same destination with absent parent and a false last flag.
+    packet.body.input.event.paste.parent = null;
+    packet.body.input.event.paste.last = false;
+    try decodeInto(try encode(bytes, packet), decoded);
+    try std.testing.expectEqual(@as(u64, 9), decoded.body.input.event.paste.transfer);
+    try std.testing.expect(!decoded.body.input.event.paste.last);
+    try std.testing.expect(decoded.body.input.event.paste.parent == null);
+}
+
 test "mapping receipt is source owned and binds nonzero offer and handle" {
     var packet: Packet = .{ .sender_epoch = 1, .recipient_epoch = 2, .request_id = 3, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 4, .generation = 5 }, .body = .{ .mapping_receipt = .{ .offer_id = 6, .target_handle = 7 } } };
     var buffer: [max_frame_size]u8 = undefined;

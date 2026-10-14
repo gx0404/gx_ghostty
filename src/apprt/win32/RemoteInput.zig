@@ -50,21 +50,54 @@ pub const Buffer = struct {
         return true;
     }
     pub fn peek(self: *const Buffer) ?protocol.Input {
-        var result: ?protocol.Input = if (self.len != 0) self.ordered[self.head].?.input else null;
-        if (self.len != 0) if (self.ordered[self.head].?.paste) |paste| {
-            var end = @min(paste.bytes.len, paste.offset + protocol.Text.capacity);
-            while (end < paste.bytes.len and end > paste.offset and paste.bytes[end] & 0xc0 == 0x80) end -= 1;
-            result.?.event.paste.index = paste.index;
-            result.?.event.paste.last = end == paste.bytes.len;
-            result.?.event.paste.text = protocol.Text.init(paste.bytes[paste.offset..end]) catch unreachable;
+        const Kind = enum { ordered, resize, focus };
+        var kind: ?Kind = null;
+        var selected: usize = 0;
+        var sequence: u64 = 0;
+        if (self.len != 0) {
+            kind = .ordered;
+            sequence = self.ordered[self.head].?.input.sequence;
+        }
+        for (self.resizes, 0..) |item, index| if (item) |value| {
+            if (kind == null or value.base.sequence < sequence) {
+                kind = .resize;
+                selected = index;
+                sequence = value.base.sequence;
+            }
         };
-        for (self.resizes) |item| if (item) |value| {
-            if (result == null or value.base.sequence < result.?.sequence) result = .{ .surface = value.base.surface, .lease = value.base.lease, .sequence = value.base.sequence, .event = .{ .resize = value.value } };
+        for (self.focuses, 0..) |item, index| if (item) |value| {
+            if (kind == null or value.base.sequence < sequence) {
+                kind = .focus;
+                selected = index;
+                sequence = value.base.sequence;
+            }
         };
-        for (self.focuses) |item| if (item) |value| {
-            if (result == null or value.base.sequence < result.?.sequence) result = .{ .surface = value.base.surface, .lease = value.base.lease, .sequence = value.base.sequence, .event = .{ .focus = value.value } };
-        };
-        return result;
+        // Choose the input before constructing its tagged payload. Repeatedly
+        // assigning different union variants in the selection loops corrupts
+        // the paste transfer field in the pinned ReleaseFast compiler.
+        switch (kind orelse return null) {
+            .ordered => {
+                const entry = &self.ordered[self.head].?;
+                const paste = entry.paste orelse return entry.input;
+                var end = @min(paste.bytes.len, paste.offset + protocol.Text.capacity);
+                while (end < paste.bytes.len and end > paste.offset and paste.bytes[end] & 0xc0 == 0x80) end -= 1;
+                return .{ .surface = entry.input.surface, .lease = entry.input.lease, .sequence = entry.input.sequence, .event = .{ .paste = .{
+                    .transfer = entry.input.event.paste.transfer,
+                    .parent = entry.input.event.paste.parent,
+                    .index = paste.index,
+                    .last = end == paste.bytes.len,
+                    .text = protocol.Text.init(paste.bytes[paste.offset..end]) catch unreachable,
+                } } };
+            },
+            .resize => {
+                const value = self.resizes[selected].?;
+                return .{ .surface = value.base.surface, .lease = value.base.lease, .sequence = value.base.sequence, .event = .{ .resize = value.value } };
+            },
+            .focus => {
+                const value = self.focuses[selected].?;
+                return .{ .surface = value.base.surface, .lease = value.base.lease, .sequence = value.base.sequence, .event = .{ .focus = value.value } };
+            },
+        }
     }
     /// Call only after the transport accepted the owned packet. QueueFull does
     /// not remove anything. Producer sequences are unique within a window.
@@ -296,14 +329,16 @@ test "remote paste spool keeps later input behind every UTF8 chunk and releases 
     const bytes = try alloc.alloc(u8, protocol.Text.capacity + 7);
     @memset(bytes, 'a');
     @memcpy(bytes[protocol.Text.capacity - 1 ..][0..3], "\xe4\xb8\xad");
-    try std.testing.expect(queue.pushPaste(.{ .surface = surface, .lease = lease, .sequence = 1, .event = .{ .paste = .{ .transfer = 1, .parent = parent, .index = 0, .last = false, .text = .{} } } }, bytes));
+    try std.testing.expect(queue.pushPaste(.{ .surface = surface, .lease = lease, .sequence = 1, .event = .{ .paste = .{ .transfer = 9, .parent = parent, .index = 0, .last = false, .text = .{} } } }, bytes));
     try std.testing.expect(queue.push(0, .{ .surface = surface, .lease = lease, .sequence = 2, .event = .{ .text = try protocol.Text.init("later") } }));
     const first = queue.peek().?;
+    try std.testing.expectEqual(@as(u64, 9), first.event.paste.transfer);
     try std.testing.expectEqual(parent, first.event.paste.parent.?);
     try std.testing.expectEqual(@as(usize, protocol.Text.capacity - 1), first.event.paste.text.len);
     try std.testing.expect(!first.event.paste.last);
     try std.testing.expect(queue.pop(1) == null);
     const second = queue.peek().?;
+    try std.testing.expectEqual(@as(u64, 9), second.event.paste.transfer);
     try std.testing.expectEqual(parent, second.event.paste.parent.?);
     try std.testing.expectEqual(@as(u64, 1), second.sequence);
     try std.testing.expectEqual(@as(u32, 1), second.event.paste.index);
@@ -312,6 +347,44 @@ test "remote paste spool keeps later input behind every UTF8 chunk and releases 
     alloc.free(queue.pop(1).?);
     try std.testing.expectEqual(@as(u64, 2), queue.peek().?.sequence);
     try std.testing.expectEqual(@as(usize, 0), queue.paste_bytes);
+}
+
+test "remote paste noninitial transfer survives spool wire sequence and protocol round trip" {
+    const alloc = std.testing.allocator;
+    var queue: Buffer = .{};
+    defer queue.clear(alloc);
+    const surface: refs.Reference = .{ .epoch = 101, .kind = .surface, .id = 67, .generation = 3 };
+    const lease: protocol.Lease = .{ .holder_epoch = 202, .transaction = 1, .generation = 2 };
+    const parent: protocol.PasteParent = .{ .transaction = 10, .config_generation = 13 };
+    const bytes = try alloc.alloc(u8, protocol.Text.capacity + 7);
+    @memset(bytes, 'x');
+    const input: protocol.Input = .{ .surface = surface, .lease = lease, .sequence = 347, .event = .{ .paste = .{ .transfer = 9, .parent = parent, .index = 0, .last = false, .text = .{} } } };
+    if (input.event.paste.transfer != 9) return error.PasteIdentityChangedAtConstruction;
+    try std.testing.expect(queue.pushPaste(input, bytes));
+    if (queue.ordered[queue.head].?.input.event.paste.transfer != 9) return error.PasteIdentityChangedOnAdmission;
+    const packet = try alloc.create(protocol.Packet);
+    defer alloc.destroy(packet);
+    const received = try alloc.create(protocol.Packet);
+    defer alloc.destroy(received);
+    const wire = try alloc.alloc(u8, protocol.max_frame_size);
+    defer alloc.free(wire);
+    for (0..2) |index| {
+        const queued = queue.peek().?;
+        if (queued.event.paste.transfer != 9) return error.PasteIdentityChangedOnPeek;
+        // The coordinator gives every chunk a fresh wire sequence, and the
+        // transport separately allocates its request ID. Neither is transfer T.
+        var outbound = queued;
+        outbound.sequence = 700 + index;
+        packet.* = .{ .sender_epoch = 202, .recipient_epoch = 101, .request_id = 642 + index, .ticket = .{ .source_epoch = 101, .target_epoch = 202, .transaction = 1, .generation = 2 }, .body = .{ .input = outbound } };
+        const encoded = try protocol.encode(wire, packet);
+        try protocol.decodeInto(encoded, received);
+        if (received.body.input.event.paste.transfer != 9) return error.PasteIdentityChangedOnCodec;
+        try std.testing.expectEqual(parent, received.body.input.event.paste.parent.?);
+        try std.testing.expectEqual(@as(u32, @intCast(index)), received.body.input.event.paste.index);
+        try std.testing.expectEqual(index == 1, received.body.input.event.paste.last);
+        if (queue.pop(queued.sequence)) |owned| alloc.free(owned);
+    }
+    try std.testing.expect(queue.peek() == null);
 }
 
 test "remote cancellation discards only the closed surface and releases unsent paste" {
