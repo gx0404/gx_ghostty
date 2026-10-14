@@ -616,9 +616,37 @@ class Driver:
             ("restore-two-tabs-no-visit-then-quit", [], True, True, True),
             ("restore-two-tabs-visit-second-then-quit", ["ctrl+alt+2"], True, True, True),
         )
-        variants = targeted if self.args.targeted else basic
+        # A saved [custom, bash] session with the custom tab selected, then restores that each start from it.
+        prep = ("prep-save-custom-selected", ["ctrl+alt+j", "ctrl+alt+b", "ctrl+alt+2"], False, True, False)
+        restore = (
+            prep,
+            ("restore-quit", [], "snapshot", True, True),
+            ("restore-visit-bash-quit", ["ctrl+alt+2"], "snapshot", True, True),
+            ("restore-visit-bash-back-quit", ["ctrl+alt+2", "ctrl+alt+1"], "snapshot", True, True),
+            ("restore-new-tab-quit", ["ctrl+alt+j"], "snapshot", True, True),
+            ("restore-visit-back-new-tab-quit", ["ctrl+alt+2", "ctrl+alt+1", "ctrl+alt+j"], "snapshot", True, True),
+            # Same keys without restore: temp tab, custom tab, bash tab, then switch and open another tab.
+            ("control-no-restore-same-keys", ["ctrl+alt+j", "ctrl+alt+b", "ctrl+alt+2", "ctrl+alt+3", "ctrl+alt+2", "ctrl+alt+j"], False, True, False),
+        )
+        # Set B: is it the approval dialog or switching back to an earlier restored tab?
+        restore_b = (
+            ("prep-save-bash-bash-first-selected", ["ctrl+alt+b", "ctrl+alt+b", "ctrl+alt+2"], False, False, False),
+            ("restore-trusted-first-selected-quit", [], "snapshot", False, False),
+            ("prep-save-bash-bash-last-selected", ["ctrl+alt+b", "ctrl+alt+b"], False, False, False),
+            ("restore-trusted-last-selected-quit", [], "snapshot", False, False),
+            ("prep-save-custom-bash-last-selected", ["ctrl+alt+j", "ctrl+alt+b"], False, True, False),
+            ("restore-approved-custom-unselected-visit-quit", ["ctrl+alt+1"], "snapshot", True, True),
+        )
+        if self.args.restore_probe == "b":
+            variants = restore_b
+        else:
+            variants = restore if self.args.restore_probe else targeted if self.args.targeted else basic
+        snapshot = self.work / "state-snapshot"
         for variant, keys, keep_state, custom, approve in variants:
-            if not keep_state:
+            if keep_state == "snapshot":
+                shutil.rmtree(self.state_home, ignore_errors=True)
+                shutil.copytree(snapshot, self.state_home)
+            elif not keep_state:
                 shutil.rmtree(self.state_home, ignore_errors=True)
             if custom:
                 overlay.write_text(f"gx-launch-profile = {PROFILE_NAME}={PROFILE_COMMAND}\nkeybind = {BINDING}\n", encoding="utf-8")
@@ -643,7 +671,12 @@ class Driver:
             self.key("ctrl+alt+q", 0.5)
             code = self.wait_exit()
             results[variant] = {"exit": code, "roles_before_quit": roles, "panic": self.panic_lines(),
+                                "surface_started": self.log_count("started subcommand"),
                                 "surface_closed": self.log_count("surface closed")}
+            if variant.startswith("prep-"):
+                shutil.rmtree(snapshot, ignore_errors=True)
+                shutil.copytree(self.state_home, snapshot)
+                self.copy_state(variant)
             self.defect(f"quit probe {variant}: quit exits cleanly", code == 0, results[variant])
             self.kill_leftovers()
         self.report["quit_probe"] = results
@@ -736,8 +769,9 @@ class Driver:
         self.click(*LAYOUT["ed_new_binding"], 0.8)
         self.click(*LAYOUT["ed_text"], 0.5)
         self.type(BINDING)
+        self.shot("binding-typed", f"New Binding: the text editor holds {BINDING} before Save")
         self.click(*LAYOUT["ed_save"], 1.5)
-        self.shot("binding-saved", f"the editor shows {BINDING} and the status Keyboard shortcuts saved.")
+        self.shot("binding-saved", "after Save the editor reloads (first row selected again) and shows the status Keyboard shortcuts saved.")
         self.check("session1: the shortcut editor saved the binding to gui-settings.ghostty",
                    BINDING in self.overlay_text(), self.overlay_text())
         self.check("session1: the editors changed nothing but the profile and the binding (default command untouched)",
@@ -767,7 +801,7 @@ class Driver:
         self.check("move to tab: still one window", len(self.terminal_windows()) == 1, self.terminal_windows())
         self.check_same_terminal("temp", terminal, "move to tab")
         self.type_marker("t2-after-tab", terminal, "after move to tab")
-        self.shot("split-moved-to-tab", "three tabs; the selected third tab has one TEMP$ pane holding both printf marker commands")
+        self.shot("split-moved-to-tab", "three tabs; the selected new tab (inserted right after the source tab) has one TEMP$ pane holding both printf marker commands")
 
         # Move it again, now out of a split into a new window.
         known = {s["pid"] for s in self.shells()}
@@ -786,7 +820,7 @@ class Driver:
         placed = {w["id"]: w for w in self.terminal_windows()}
         self.check("move to window: the new window can be placed beside the old one",
                    (placed[w2["id"]]["x"], placed[w2["id"]]["y"]) == W2_POSITION, placed)
-        self.shot("split-moved-to-window", "two windows: the old one at the origin (three tabs) and the new one at 440,170 with only the TEMP$ pane")
+        self.shot("split-moved-to-window", "two windows: the old one at the origin (three tabs, the left-over DEFAULT$ pane selected) and the new one at 440,170 with only the TEMP$ pane")
 
         # Close the old window, with the keyboard focus explicitly on it.
         w1 = next(w for w in windows if w["id"] in old)
@@ -832,7 +866,7 @@ class Driver:
         self.new_shell("default", known)
         self.key("ctrl+alt+2", 1.0)
         self.report["identities"]["restorable"] = {"profile": profile, "bash": bash}
-        self.shot("restorable-layout", "one window, three tabs (TEMP$, PROFILE$, Bash split with DEFAULT$); the PROFILE$ tab is selected")
+        self.shot("restorable-layout", "one window, three tabs (TEMP$, PROFILE$, Bash split with DEFAULT$); the middle PROFILE$ tab is selected")
 
         # Resize, then quit: a quit keeps the session (closing the last window clears it).
         self.xdo("windowmove", w2["id"], "100", "60")
@@ -895,7 +929,7 @@ class Driver:
                    {"restored": restored, "before_quit": pre, "saved": saved["windows"][0].get("geometry")})
         self.check("restore: the temporary initial command and the unknown split were not replayed",
                    not self.by_role("temp") and not self.by_role("default"), [s["cmdline"] for s in self.shells()])
-        self.shot("restored", f"one {pre['width']}x{pre['height']} window with two tabs; the selected first tab shows PROFILE$; the second (Bash) tab is not started yet")
+        self.shot("restored", f"one {pre['width']}x{pre['height']} window with two tabs; the selected first tab shows PROFILE$; the second (Bash) tab is not started yet; a toast says some terminals were not restored")
         # The non-selected restored tab starts its terminal when it is first shown.
         self.focus(restored[0]["id"], (restored[0]["x"] + 400, restored[0]["y"] + 360))
         self.key("ctrl+alt+2", 1.0)
@@ -927,7 +961,7 @@ class Driver:
         known = {s["pid"] for s in self.shells()}
         self.key("ctrl+alt+j", 1.0)
         self.new_shell("profile", known)
-        self.shot("binding-after-restart", "a third tab with PROFILE$: the binding saved in session 1 still works after the restart")
+        self.shot("binding-after-restart", "a new PROFILE$ tab next to the current one: the binding saved in session 1 still works after the restart")
         self.copy_state("after-restore")
         self.key("ctrl+alt+q", 0.5)
         code = self.wait_exit()
@@ -966,10 +1000,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repro", action="store_true", help="minimal close-window check after move-to-tab, with a control")
     parser.add_argument("--quit-probe", action="store_true", help="does a plain quit exit cleanly (one terminal, two tabs, a split)")
     parser.add_argument("--targeted", action="store_true", help="with --quit-probe: the unselected-tab adoption variants")
+    parser.add_argument("--restore-probe", nargs="?", const="a", choices=("a", "b"), help="with --quit-probe: restore variants (set a or b)")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--driver", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    extra = (["--explore"] if args.explore else []) + (["--repro"] if args.repro else []) + (["--quit-probe"] if args.quit_probe else []) + (["--targeted"] if args.targeted else [])
+    extra = (["--explore"] if args.explore else []) + (["--repro"] if args.repro else []) + (["--quit-probe"] if args.quit_probe else []) + (["--targeted"] if args.targeted else []) + ([f"--restore-probe={args.restore_probe}"] if args.restore_probe else [])
     if args.driver:
         return driver_main(args)
     if args.inside:

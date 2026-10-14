@@ -373,10 +373,15 @@ fn buildRestore(value: *State, profiles: *const launch.List) !void {
                 defer value.alloc.free(title_z);
                 tab.setTitleOverride(title_z);
             };
-            const page = window.adoptTab(tab);
             tab.getSplitTree().adoptOwnedTree(owned, focused);
             owned = null;
             tab.getSplitTree().rebuildNow();
+            // Publish only the complete tab: unattached, its rebuild cannot grab
+            // focus. Grabs inside the not-yet-shown window let each later page
+            // switch queue a GTK move-focus ref that nothing cleared before
+            // present, and GTK 4.14-4.18 overwrites such a pending ref instead
+            // of releasing it, leaking a restored tab (see split_transfer.zig).
+            const page = window.adoptTab(tab);
             if (tab_index == saved_window.active) active_page = page;
         }
         if (window.getTabView().getNPages() == 0) {
