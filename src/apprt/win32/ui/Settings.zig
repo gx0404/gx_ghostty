@@ -60,7 +60,8 @@
 //! F6 focuses the sidebar search; labels, section names and configuration
 //! keys match across all six sections, and Enter reveals a result.
 //!
-//! There is one overlay per process, shown over one window at a time.
+//! Each owner retains at most one hidden overlay, with only one shown at a
+//! time. Configuration changes invalidate cached data and the next host.
 //! `Window` calls `onWindowDestroyed` when a window goes away.
 const Settings = @This();
 
@@ -148,20 +149,22 @@ const max_hits = 192;
 /// listed.
 pub const WM_FONTS_READY: u32 = w32.WM_APP + 2;
 
-/// The overlay, created by the first `show`.
+/// The currently selected overlay; hidden owners live in `instances`.
 var instance: ?*Settings = null;
+var instances: ?*Settings = null;
 
 alloc: Allocator,
 app: *App,
 window: *Window,
+next: ?*Settings = null,
+data_ready: bool = false,
 
 popup: Popup = .{},
 uia_attachment: gx.ui_ref.Attachment = .{},
 scrim: Scrim = .{},
 tooltip: Tooltip = .{},
 
-/// Owns the data loaded when the overlay opens (paths, shells, theme
-/// directories); reset when it closes.
+/// Cached paths, layers, shells and theme directories, reset on invalidation.
 arena: ArenaAllocator,
 /// Owns the strings of the rows built since the last paint.
 scratch: ArenaAllocator,
@@ -283,21 +286,31 @@ const Tip = union(enum) {
 pub fn show(window: *Window) bool {
     const timing = Popup.OpenTiming.begin(.settings);
     if (!gx.config_layers.enabled(window.app.core_app.alloc) or window.app.uiFactory() == null) return openConfigInstead(window.app);
-    if (instance) |self| {
-        if (self.window == window) {
-            if (self.open) {
-                if (self.popup.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
-                return true;
-            }
-            return self.openOverlay(timing);
-        }
-        self.destroy();
+    const self = acquire(window) orelse return false;
+    if (instance) |old| if (old != self and old.open) old.finish(.deactivated);
+    instance = self;
+    if (self.open) {
+        if (self.popup.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
+        return true;
     }
+    return self.openOverlay(timing, false);
+}
+
+fn find(window: *Window) ?*Settings {
+    var it = instances;
+    while (it) |self| : (it = self.next) {
+        if (self.window == window) return self;
+    }
+    return null;
+}
+
+fn acquire(window: *Window) ?*Settings {
+    if (find(window)) |self| return self;
 
     const alloc = window.app.core_app.alloc;
     const self = alloc.create(Settings) catch |err| {
         log.err("cannot create the settings overlay err={}", .{err});
-        return false;
+        return null;
     };
     self.* = .{
         .alloc = alloc,
@@ -307,9 +320,46 @@ pub fn show(window: *Window) bool {
         .scratch = .init(alloc),
         .font_arena = .init(alloc),
         .changes = .init(alloc),
+        .next = instances,
     };
-    instance = self;
-    return self.openOverlay(timing);
+    instances = self;
+    return self;
+}
+
+test "P4 reuse keeps independent settings owners for 100 acquire close cycles" {
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core;
+    var a: Window = undefined;
+    var b: Window = undefined;
+    a.app = &app;
+    b.app = &app;
+    a.hwnd = null;
+    b.hwnd = null;
+    defer onWindowDestroyed(&a);
+    defer onWindowDestroyed(&b);
+    const first = acquire(&a).?;
+    const second = acquire(&b).?;
+    try std.testing.expect(find(&a) != null);
+    try std.testing.expect(first != second);
+    first.data_ready = true;
+    second.data_ready = true;
+    first.config_path = try first.arena.allocator().dupe(u8, "fixture-config");
+    const storage = first.config_path.ptr;
+    for (0..100) |_| {
+        try std.testing.expectEqual(first, acquire(&a).?);
+        first.open = true;
+        first.finish(.deactivated);
+        try std.testing.expectEqual(second, acquire(&b).?);
+        second.open = true;
+        second.finish(.deactivated);
+        try std.testing.expectEqual(storage, first.config_path.ptr);
+        try std.testing.expect(first.data_ready and second.data_ready);
+    }
+    invalidateOwner(&a);
+    try std.testing.expect(!first.data_ready and first.popup.reuse_invalid);
+    try std.testing.expect(second.data_ready and !second.popup.reuse_invalid);
 }
 
 /// Like `show`, then switch to `section`: the command palette's
@@ -325,21 +375,46 @@ pub fn showSection(window: *Window, section: Section) bool {
 /// `window` is going away: save pending changes, end a theme preview and
 /// destroy the overlay if it belongs to that window.
 pub fn onWindowDestroyed(window: *Window) void {
-    const self = instance orelse return;
-    if (self.window != window) return;
-    self.destroy();
+    if (window.hwnd) |owner| @import("MenuPopup.zig").invalidateOwner(owner);
+    if (find(window)) |self| self.destroy();
+}
+
+pub fn isOpen(window: *Window) bool {
+    const self = find(window) orelse return false;
+    return self.open;
+}
+
+pub fn invalidateOwner(window: *Window) void {
+    const self = find(window) orelse return;
+    self.data_ready = false;
+    self.popup.reuse_invalid = true;
+}
+
+pub fn prepare(window: *Window) void {
+    if (!gx.config_layers.enabled(window.app.core_app.alloc)) return;
+    const self = acquire(window) orelse return;
+    if (!self.open) _ = self.openOverlay(null, true);
 }
 
 pub fn onConfigChange(app: *App) void {
-    const self = instance orelse return;
-    if (self.app != app or !self.open or self.applying) return;
+    var it = instances;
+    while (it) |self| : (it = self.next) {
+        if (self.app != app) continue;
+        self.data_ready = false;
+        self.popup.reuse_invalid = true;
+        if (!self.open or self.applying) continue;
+        self.followConfigChange();
+    }
+}
+
+fn followConfigChange(self: *Settings) void {
     self.stopTimer(.preview);
     self.preview_theme = null;
     self.applied_preview = null;
     self.followReload();
-    self.applied_inputs = inputsDigest(&app.config);
+    self.applied_inputs = inputsDigest(&self.app.config);
     self.swatches.deinit(self.alloc);
-    self.loadThemes(&app.config);
+    self.loadThemes(&self.app.config);
     self.loadShells();
     self.configApplied(false);
     self.popup.setAccessibleName(i18n.tr(msg.settings));
@@ -383,21 +458,41 @@ fn destroy(self: *Settings) void {
     self.arena.deinit();
     self.scratch.deinit();
     if (instance == self) instance = null;
+    var link = &instances;
+    while (link.*) |entry| : (link = &entry.next) {
+        if (entry != self) continue;
+        link.* = self.next;
+        break;
+    }
     self.alloc.destroy(self);
 }
 
-fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
+fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming, preparing: bool) bool {
     var timing = opened;
     const owner = self.window.hwnd orelse return false;
     if (self.window.closing) return false;
     self.uia_attachment = self.window.ui_attachment;
-    const factory = self.app.uiFactory() orelse return openConfigInstead(self.app);
+    const factory = self.app.uiFactory() orelse return if (preparing) false else openConfigInstead(self.app);
     const t = self.tokens();
     // Until the first frame is painted (`Popup.show` paints at once).
-    const span: gx.perf.Span = .begin(global.io());
-    defer _ = span.end(global.io(), "settings_open");
+    const span = if (!preparing) gx.perf.Span.begin(global.io()) else null;
+    defer if (span) |value| {
+        _ = value.end(global.io(), "settings_open");
+    };
     if (timing) |*value| value.lap(.prepare);
 
+    if (self.popup.reuse_invalid) {
+        // Detach asynchronous HWND recipients before replacing a hidden host.
+        if (self.font_loader) |loader| {
+            loader.detach();
+            self.fonts_checked = false;
+        }
+        self.font_loader = null;
+        inline for (comptime std.enums.values(Timer)) |timer| self.stopTimer(timer);
+        self.tooltip.destroy();
+        self.popup.destroy();
+        self.scrim.destroy();
+    }
     if (self.popup.hwnd == null) {
         self.popup.create(self.app.hinstance, owner, factory, .{
             .activate = true,
@@ -408,7 +503,6 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
             .text_input = true,
             .border_color = t.border,
             .dark = t.dark,
-            .release_target_on_hide = true,
             .accessible_name = i18n.tr(msg.settings),
         }, .{
             .ctx = self,
@@ -424,11 +518,8 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
             .message = onMessage,
         }) catch |err| {
             log.err("cannot create the settings popup err={}", .{err});
-            return openConfigInstead(self.app);
+            return if (preparing) false else openConfigInstead(self.app);
         };
-    } else {
-        self.popup.applyTheme(t);
-        self.popup.setAccessibleName(i18n.tr(msg.settings));
     }
     if (self.scrim.hwnd == null) {
         self.scrim.create(self.app.hinstance, owner, scrim_alpha, .{
@@ -440,9 +531,21 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
         };
     }
 
+    // A replaced HWND also replaced its timers. Hidden failed saves and the
+    // user's existing shell helper keep their bounded retry/poll lifecycle.
+    if (!self.changes.isEmpty() and !self.timers.contains(.save)) {
+        if (model.saveRetryDelayMs(self.save_attempts)) |delay| self.startTimer(.save, delay);
+    }
+    if (self.herdr_run != null and !self.timers.contains(.herdr)) self.startTimer(.herdr, herdr_poll_ms);
+
     if (timing) |*value| value.lap(.create);
-    self.loadData();
+    if (!self.data_ready) self.loadData();
+    self.theme_query.clearRetainingCapacity();
+    self.font_query.clearRetainingCapacity();
+    self.refilter(.themes);
+    self.refilter(.fonts);
     self.clearStatus();
+    self.pointer = null;
     self.hover = null;
     self.pressed = null;
     self.focus_visible = false;
@@ -452,15 +555,18 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
     self.enterSection(self.section);
 
     self.popup.setOwnerScale(self.window.scale);
+    const rect = self.popupRect(owner);
+    if (preparing) {
+        self.popup.prepareHidden(rect);
+        return true;
+    }
     const maximized = w32.IsZoomed(owner) != 0 or self.window.title_bar.is_fullscreen;
     self.scrim.show(Scrim.visibleBounds(owner), !maximized);
-    const rect = self.popupRect(owner);
     if (timing) |*value| value.lap(.layout);
     self.popup.open_timing = timing;
+    self.open = true;
     self.popup.show(rect);
     self.opened_ms = system.nowMs();
-    self.open = true;
-    self.popup.invalidate();
     return true;
 }
 
@@ -494,7 +600,6 @@ fn finish(self: *Settings, how: Close) void {
     self.popup.hide();
     self.text_field = null;
     self.popup.input.clear();
-    self.releaseData();
     if (how == .user) self.window.focusActiveSurface();
 }
 
@@ -762,6 +867,7 @@ fn loadData(self: *Settings) void {
     self.loadThemes(config);
     self.loadShells();
     self.updateFontPicker();
+    self.data_ready = true;
 }
 
 /// The first configured font family, in `alloc`.
@@ -773,6 +879,7 @@ fn configuredFamily(self: *Settings, alloc: Allocator) []const u8 {
 
 /// Frees what was loaded for one opening; the theme and font lists stay.
 fn releaseData(self: *Settings) void {
+    self.data_ready = false;
     if (self.layers) |*layers| layers.deinit();
     self.layers = null;
     self.theme_list.clear();
@@ -2411,7 +2518,7 @@ fn stopTimer(self: *Settings, timer: Timer) void {
 }
 
 fn timerProc(hwnd: ?w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void {
-    const self = instance orelse {
+    const self = byPopup(hwnd) orelse {
         _ = w32.KillTimer(hwnd, id);
         return;
     };
@@ -2431,6 +2538,15 @@ fn timerProc(hwnd: ?w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void 
             if (self.prefetchSwatches()) self.invalidate();
         },
     }
+}
+
+fn byPopup(hwnd: ?w32.HWND) ?*Settings {
+    if (hwnd == null) return null;
+    var it = instances;
+    while (it) |self| : (it = self.next) {
+        if (self.popup.hwnd == hwnd) return self;
+    }
+    return null;
 }
 
 /// Reads the swatches of the themes on display and of the pages above and
@@ -3015,7 +3131,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
             self.invalidate();
         }
     }
-    if (self.swatches_pending and !self.timers.contains(.prefetch)) self.startTimer(.prefetch, 15);
+    if (self.open and self.swatches_pending and !self.timers.contains(.prefetch)) self.startTimer(.prefetch, 15);
 }
 
 fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) void {
