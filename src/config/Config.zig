@@ -2594,8 +2594,10 @@ keybind: Keybinds = .{},
 
 /// The time in milliseconds between clicks to consider a click a repeat
 /// (double, triple, etc.) or an entirely new single click. A value of zero will
-/// use a platform-specific default. The default on macOS is determined by the
-/// OS settings. On every other platform it is 500ms.
+// fork(gx): GX-0048 Windows also takes the default from the OS setting
+/// use a platform-specific default. The default on macOS and Windows is
+/// determined by the OS settings (on Windows, the double-click speed of the
+/// mouse settings). On every other platform it is 500ms.
 @"click-repeat-interval": u32 = 0,
 
 /// Additional configuration files to read. This configuration can be repeated

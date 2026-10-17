@@ -66,6 +66,9 @@ test {
     _ = path;
     _ = uri;
     _ = shell;
+    // fork(gx): GX-0048 begin: run the click-interval test
+    _ = mouse;
+    // fork(gx): GX-0048 end
 
     if (comptime builtin.os.tag == .linux) {
         _ = kernel_info;
