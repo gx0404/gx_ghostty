@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime as _datetime
+import functools
 import json
 import os
 import re
@@ -898,6 +899,19 @@ def same_path(a: str | Path, b: str | Path) -> bool:
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
+def input_guard(function):
+    @functools.wraps(function)
+    def checked(self, *args, **kwargs):
+        try:
+            result = function(self, *args, **kwargs)
+        except InputBlocked as exc:
+            self.record_input('guard', check=function.__name__, status='fail', reason=str(exc))
+            raise
+        self.record_input('guard', check=function.__name__, status='pass')
+        return result
+    return checked
+
+
 @dataclass
 class Instance:
     pid: int
@@ -907,6 +921,26 @@ class Instance:
     launched: int  # FILETIME right before CreateProcess
     simulated_dpi: int | None = None
     children: list[list[Any]] = field(default_factory=list)  # [pid, creation, image name]
+    input_events: list[dict] = field(default_factory=list)
+
+    def record_input(self, event: str, **data) -> None:
+        row = {'schema': 'gx-input-guard-v1', 'event': event, 'time_ns': time.time_ns(),
+               'harness_pid': os.getpid(), 'instance_pid': self.pid,
+               'batch_id': os.environ.get('GX_PERF_BATCH_ID'), **data}
+        self.input_events.append(row)
+        if path := os.environ.get('GX_PERF_GUARD_LOG'):
+            with Path(path).open('a', encoding='utf-8', newline='\n') as stream:
+                stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+    def release_input(self, events, control: str, aborted: bool) -> None:
+        # Release only what this operation pressed. Never move the pointer,
+        # reactivate a window, or send another down when the guard has failed.
+        try:
+            win32().send(events)
+        except Exception as exc:
+            self.record_input('release', control=control, abort_release=aborted, status='fail', reason=str(exc))
+            raise
+        self.record_input('release', control=control, abort_release=aborted, status='pass')
 
     # -- persistence for the session commands --------------------------------
 
@@ -1050,6 +1084,7 @@ class Instance:
 
     # -- guarded input --------------------------------------------------------
 
+    @input_guard
     def ensure_foreground(self) -> None:
         self.ensure_owned()
         w = win32()
@@ -1060,6 +1095,7 @@ class Instance:
             raise InputBlocked(f"the foreground window {hwnd:#x} ({name}, pid {pid}) is not ghostty pid {self.pid}; "
                                "no input was sent")
 
+    @input_guard
     def ensure_point(self, x: int, y: int) -> None:
         self.ensure_owned()
         w = win32()
@@ -1119,9 +1155,7 @@ class Instance:
                 time.sleep(max(0, start + (index + 1) / hz - time.monotonic()))
         finally:
             if sent:
-                # Do not send even a release into an unrelated foreground app.
-                self.ensure_foreground()
-                w.send([w.key_input(vk, True)])
+                self.release_input([w.key_input(vk, True)], key, sys.exc_info()[0] is not None)
 
     def uia_rows(self, hwnd: int) -> list[dict]:
         """Read geometry under an owned HWND; no UIA invocation or desktop search."""
@@ -1198,17 +1232,19 @@ class Instance:
     def drag(self, start: tuple[int, int], end: tuple[int, int], *, steps: int = 12, button: str = "left",
              release: bool = True, step_delay: float = 0.015) -> None:
         self.mouse(*start, button=button, action="down")
-        for index in range(1, steps + 1):
-            x = round(start[0] + (end[0] - start[0]) * index / steps)
-            y = round(start[1] + (end[1] - start[1]) * index / steps)
-            self.ensure_foreground()
-            self.ensure_point(x, y)
-            win32().send([win32().mouse_input(0x0001 | 0x8000 | 0x4000, x, y)])
-            time.sleep(step_delay)
-        if release:
-            self.ensure_foreground()
-            self.ensure_point(*end)
-            win32().send([win32().mouse_input(MOUSE_BUTTONS[button][1], data=MOUSE_BUTTONS[button][2])])
+        try:
+            for index in range(1, steps + 1):
+                x = round(start[0] + (end[0] - start[0]) * index / steps)
+                y = round(start[1] + (end[1] - start[1]) * index / steps)
+                self.ensure_foreground()
+                self.ensure_point(x, y)
+                win32().send([win32().mouse_input(0x0001 | 0x8000 | 0x4000, x, y)])
+                time.sleep(step_delay)
+        finally:
+            aborted = sys.exc_info()[0] is not None
+            if release or aborted:
+                self.release_input([win32().mouse_input(MOUSE_BUTTONS[button][1], data=MOUSE_BUTTONS[button][2])],
+                                   button, aborted)
 
     # -- test hooks and probes ------------------------------------------------
 

@@ -6,6 +6,7 @@ the input guard. Nothing here starts Ghostty or sends input; the Win32 backend i
 from __future__ import annotations
 
 import struct
+import json
 import os
 import sys
 import tempfile
@@ -451,7 +452,8 @@ class InputGuardTests(unittest.TestCase):
         with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
             with self.assertRaises(gui.InputBlocked):
                 self.instance().drag((10, 10), (20, 20))
-        self.assertEqual(1, len(fake.sent))
+        self.assertEqual(2, len(fake.sent))
+        self.assertEqual([('mouse', 0x4, 0, 0, 0)], fake.sent[-1])
 
     def test_held_key_stops_when_foreground_changes(self):
         fake = FakeWin32(self.PID, self.PID)
@@ -460,7 +462,36 @@ class InputGuardTests(unittest.TestCase):
         with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep', side_effect=sleep):
             with self.assertRaises(gui.InputBlocked):
                 self.instance().hold_key('down')
-        self.assertEqual(1, len(fake.sent))
+        self.assertEqual(2, len(fake.sent))
+        self.assertEqual([('key', 0x28, True)], fake.sent[-1])
+
+    def test_abort_release_and_guard_failure_are_audited(self):
+        fake = FakeWin32(self.PID, self.PID)
+        instance = self.instance()
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'guards.jsonl'
+            def sleep(_):
+                fake.foreground_pid = 999
+            with mock.patch.dict(os.environ, {'GX_PERF_BATCH_ID': 'batch', 'GX_PERF_GUARD_LOG': str(log)}), \
+                    mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep', side_effect=sleep):
+                with self.assertRaises(gui.InputBlocked):
+                    instance.hold_key('down')
+            rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(['pass', 'fail', 'pass'], [row['status'] for row in rows])
+            self.assertTrue(rows[-1]['abort_release'])
+            self.assertEqual('batch', rows[-1]['batch_id'])
+
+    def test_no_release_without_down_and_abort_release_overrides_release_false(self):
+        fake = FakeWin32(999, self.PID)
+        with mock.patch.object(gui, 'win32', return_value=fake):
+            with self.assertRaises(gui.InputBlocked):
+                self.instance().hold_key('down')
+        self.assertEqual([], fake.sent)
+        fake.foreground_pid = self.PID
+        with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep', side_effect=RuntimeError('stop')):
+            with self.assertRaises(RuntimeError):
+                self.instance().drag((10, 10), (20, 20), release=False)
+        self.assertEqual([('mouse', 0x4, 0, 0, 0)], fake.sent[-1])
 
     def instance(self) -> gui.Instance:
         return gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
