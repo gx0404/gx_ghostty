@@ -1,3 +1,5 @@
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,20 @@ class SlotTests(unittest.TestCase):
             common = Path(temp) / 'main' / '.git'
             with mock.patch.object(gx_slots.subprocess, 'run', return_value=mock.Mock(stdout=str(common))):
                 self.assertEqual(common.parent / '.local/kernel-slots', gx_slots.shared_root())
+
+    def test_unresolvable_default_root_is_a_usage_error_without_traceback(self):
+        argv = ['gx_slots.py', '--kind', 'heavy', '--', sys.executable, '-c', 'pass']
+        for failure in (subprocess.CalledProcessError(128, ['git']), subprocess.TimeoutExpired(['git'], 10),
+                        FileNotFoundError('git')):
+            stderr = io.StringIO()
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(gx_slots, 'shared_root', side_effect=failure), \
+                    mock.patch.object(gx_slots, 'acquire', side_effect=AssertionError('no lock without a root')), \
+                    contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as exit_:
+                gx_slots.main()
+            self.assertEqual(2, exit_.exception.code)
+            self.assertIn('cannot resolve the shared slot root', stderr.getvalue())
+            self.assertNotIn('Traceback', stderr.getvalue())
 
     def test_unlock_failure_still_closes_every_owned_handle(self):
         with tempfile.TemporaryDirectory() as temp:

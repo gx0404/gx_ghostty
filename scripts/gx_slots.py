@@ -181,8 +181,11 @@ def main() -> int:
         parser.error("a command and a nonnegative timeout are required")
     try:
         args.root = args.root or shared_root()
-        if not args.root.is_dir():
-            parser.error(f'{args.root}: slot directory does not exist')
+    except (OSError, subprocess.SubprocessError) as exc:
+        parser.exit(2, f'gx-slots: cannot resolve the shared slot root from git; pass --root: {exc}\n')
+    if not args.root.is_dir():
+        parser.error(f'{args.root}: slot directory does not exist')
+    try:
         with acquire(args.root, args.kind, args.timeout):
             child = subprocess.Popen(command)
             try:
