@@ -391,6 +391,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual([.2],capture.samples.values['scrollbar.paint_time'])
         self.assertNotIn('scrollbar.paint',capture.samples.values)
         self.assertEqual(0,capture.report['missing_metrics']['scrollbar.paint']['n'])
+        history=gx_perf.historical_names(gx_perf.parse_text(text))
+        self.assertEqual([.2],history.values['scrollbar.paint_time'])
+        self.assertNotIn('scrollbar.paint',history.units)
         with self.assertRaises(gx_perf.PerfError):
             gx_perf.arm_samples('info(gx_perf): x 1us\ninfo(gx_perf): metric x 1\n',True)
 
@@ -448,6 +451,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(0,result['metrics']['old']['menu.open.ready']['n'])
         self.assertEqual(2,result['metrics']['new']['menu.open.ready']['n'])
         self.assertFalse(result['comparison']['menu.open.ready']['comparable'])
+        self.assertEqual(0,result['comparison']['menu.open.ready']['old']['n'])
 
     def test_unexpected_driver_exception_retains_failed_evidence(self):
         args,gui=self.args(),self.fake_gui()

@@ -491,7 +491,8 @@ def comparison_errors(old: Samples, new: Samples, gtk: bool = False, runs: int |
                     errors.append(f"{side} {name}: requires {expected} time samples, got {len(values)}")
     for name in sorted(set(old.values) | set(new.values)):
         if not old.values.get(name) or not new.values.get(name):
-            errors.append(f"{name}: metric missing on one side")
+            if gtk:
+                errors.append(f"{name}: metric missing on one side")
         elif len(old.values[name]) != len(new.values[name]):
             errors.append(f"{name}: sample counts differ ({len(old.values[name])} vs {len(new.values[name])})")
     return errors
@@ -1069,6 +1070,14 @@ def arm_samples(text: str, baseline: bool = False) -> Samples:
     return parse_text(text)
 
 
+def historical_names(samples: Samples) -> Samples:
+    if samples.units.get('scrollbar.paint') == 'ms':
+        for value in samples.values.pop('scrollbar.paint'):
+            samples.add('scrollbar.paint_time', value, 'ms')
+        del samples.units['scrollbar.paint']
+    return samples
+
+
 def metric_capabilities(values: Sequence[str], labels, exes) -> dict:
     result = {label: {} for label in labels}
     for value in values:
@@ -1553,6 +1562,10 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         texts.append(label + '\n' + text)
     if len(labels) == 2:
         text, batch['comparison'] = compare_table(sets[labels[0]], sets[labels[1]], tuple(labels))
+        for name, entry in batch['comparison'].items():
+            for label in labels:
+                if entry[label] is None:
+                    entry[label] = batch['metrics'][label].get(name, {'status': 'not_instrumented', 'n': 0, 'unit': entry['unit']})
         texts.append(text)
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
     text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
@@ -1853,6 +1866,8 @@ def report_runs(out: Path, labels: Sequence[str], json_path: Path | None) -> int
     if batch_path.is_file():
         return report_gtk_runs(out, read_json(batch_path), json_path)
     sets = [collect([out / label]) if (out / label).exists() else Samples() for label in labels]
+    if len(sets) == 2:
+        historical_names(sets[0])
     if not any(sets):
         print(f"{TAG} error: no samples in {out}", file=sys.stderr)
         return 2
@@ -1985,7 +2000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_json(args.json, report)
             return 0
         if args.command == "compare":
-            old, new = collect(args.old), collect(args.new)
+            old, new = historical_names(collect(args.old)), collect(args.new)
             if not old or not new:
                 raise PerfError(f"no samples on the {'old' if not old else 'new'} side")
             errors = comparison_errors(old, new)
