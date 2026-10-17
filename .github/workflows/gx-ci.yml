@@ -306,10 +306,11 @@ jobs:
         run: |
           zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      # The win32 apprt, the GX core and DirectWrite only compile into a Windows test binary.
-      - name: win32 apprt, GX core and DirectWrite tests, sharded across processes
+      # The win32 apprt, the GX core and DirectWrite only compile into a Windows test binary;
+      # tinyio's symlink cases need the administrator token that hosted runners have.
+      - name: win32 apprt, GX core, DirectWrite and tinyio tests, sharded across processes
         run: |
-          python scripts/zig_test.py --suite main -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu --filter apprt.win32 --filter gx. --filter font.directwrite --zig-arg=--summary --zig-arg=all --json "$env:RUNNER_TEMP/gx-zig-test/windows-app.json"
+          python scripts/zig_test.py --suite main -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu --filter apprt.win32 --filter gx. --filter font.directwrite --filter lib.tinyio --zig-arg=--summary --zig-arg=all --json "$env:RUNNER_TEMP/gx-zig-test/windows-app.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload the test report
         if: always()

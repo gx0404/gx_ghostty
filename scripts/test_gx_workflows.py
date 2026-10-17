@@ -44,7 +44,8 @@ ZIG_TEST_COMMANDS = {
 # Jobs that also run the main suite filtered to the fork code only their platform compiles.
 FILTERED_TEST_COMMANDS = {
     "windows-app": 'python scripts/zig_test.py --suite main -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu '
-                   '--filter apprt.win32 --filter gx. --filter font.directwrite --zig-arg=--summary --zig-arg=all '
+                   '--filter apprt.win32 --filter gx. --filter font.directwrite --filter lib.tinyio '
+                   '--zig-arg=--summary --zig-arg=all '
                    '--json "$env:RUNNER_TEMP/gx-zig-test/windows-app.json"',
     "gtk-smoke": 'python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx '
                  '--zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-gtk-smoke/zig-test.json"',

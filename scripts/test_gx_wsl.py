@@ -37,7 +37,7 @@ def wait_for_task_exit(task: Path, timeout: float = 5.0) -> None:
     while task.exists():
         if time.monotonic() >= deadline:
             raise AssertionError(f"joined worker still present in {task}")
-        time.sleep(0.001)
+        time.sleep(0.01)
 
 
 class TaskExitTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class TaskExitTests(unittest.TestCase):
                 mock.patch(__name__ + ".time.sleep") as sleep:
             wait_for_task_exit(task)
         self.assertEqual(3, task.exists.call_count)
-        self.assertEqual([mock.call(0.001), mock.call(0.001)], sleep.call_args_list)
+        self.assertEqual([mock.call(0.01), mock.call(0.01)], sleep.call_args_list)
 
     def test_missing_task_does_not_wait(self):
         task = mock.Mock(spec=Path)
@@ -608,8 +608,9 @@ class PerfProgramTests(unittest.TestCase):
             return self.program["parse_tasks"](pid + "\t" + path.read_text())[pid]
         before_proc, before_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
         population = {path.name for path in (root / "task").iterdir()}
-        cpu = []
+        cpu, native = [], []
         def worker():
+            native.append(threading.get_native_id())
             begin = time.thread_time()
             total = 0
             for index in range(8_000_000):
@@ -621,8 +622,7 @@ class PerfProgramTests(unittest.TestCase):
         # CPython releases the join lock before the native thread finishes
         # exiting. Sample only after Linux has removed that task and folded
         # its CPU time into the process counters; keep the population check.
-        self.assertIsNotNone(thread.native_id)
-        wait_for_task_exit(root / "task" / str(thread.native_id))
+        wait_for_task_exit(root / "task" / str(native[0]))
         self.assertEqual(population, {path.name for path in (root / "task").iterdir()})
         after_proc, after_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
         process_delta = sum(after_proc[key] - before_proc[key] for key in ("utime", "stime"))
