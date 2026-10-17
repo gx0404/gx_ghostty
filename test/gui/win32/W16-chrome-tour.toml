@@ -318,6 +318,13 @@ what = "all"
 action = "key"
 keys = "escape"
 
+# Move the pointer off the menu button so its "Main menu" tooltip does not linger and
+# count as an open popup in later waits.
+[[step]]
+action = "move"
+x = 600
+y = 400
+
 [[step]]
 action = "wait_popup"
 cls = "GhosttyGxPopup"
@@ -725,6 +732,12 @@ what = "all"
 [[step]]
 action = "key"
 keys = "escape"
+
+# Off the tab too: its tooltip would otherwise show while the settings overlay opens.
+[[step]]
+action = "move"
+x = 600
+y = 400
 
 [[step]]
 action = "wait_popup"
