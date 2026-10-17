@@ -6562,13 +6562,11 @@ test "gx.clipboard empty OSC 52 completion bypasses ask but nonempty does not" {
     surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
     defer surface.io.mailbox.deinit(testing.allocator);
 
-    try surface.completeClipboardRequest(.{ .osc_52_read = .standard }, .{});
+    try surface.completeClipboardReadOSC52("", .standard, false);
     const message = surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.MissingClipboardReply;
     defer message.deinit();
     try testing.expectEqualStrings("\x1b]52;c;\x1b\\", message.write_alloc.data);
-    try testing.expectError(error.UnauthorizedPaste, surface.completeClipboardRequest(.{ .osc_52_read = .standard }, .{
-        .contents = &.{.{ .mime = "text/plain", .data = "private" }},
-    }));
+    try testing.expectError(error.UnauthorizedPaste, surface.completeClipboardReadOSC52("private", .standard, false));
     try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
 }
 
