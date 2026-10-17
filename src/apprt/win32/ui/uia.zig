@@ -137,15 +137,23 @@ pub const Queue = struct {
     fn postWith(self: *Queue, snapshot: *Snapshot, node_id: u64, kind: ActionKind, value: []const u8, state: i32, post_message: anytype) HR {
         if (value.len > max_string_bytes) return E_INVALIDARG;
         const copy = self.alloc.dupe(u8, value) catch return E_OUTOFMEMORY;
+        var reason: []const u8 = "queued";
         self.lock();
-        defer self.unlock();
+        defer {
+            const pending = self.length;
+            self.unlock();
+            // Logging never holds the queue lock and never includes Value text.
+            fixtureTrace(snapshot, node_id, kind, reason, pending);
+        }
         if (self.closed or !snapshot.isActive() or self.length == self.items.len) {
+            reason = if (self.closed) "queue_closed" else if (!snapshot.isActive()) "snapshot_inactive" else "queue_full";
             self.alloc.free(copy);
             return UNAVAILABLE;
         }
         // PostMessage never calls the destination synchronously; holding this
         // short lock prevents delivery before the owned payload is installed.
         if (post_message(self.hwnd, wake_message, 0, 0) == 0) {
+            reason = "PostMessageW_failed";
             self.alloc.free(copy);
             return UNAVAILABLE;
         }
@@ -686,7 +694,10 @@ fn fragmentRoot(face: *Face, out: *?*Face) callconv(.winapi) HR {
     return returnFace(&face.node.snapshot.nodes[0], .root, out);
 }
 fn enqueue(face: *Face, kind: ActionKind, value: []const u8, state: i32) HR {
-    if (!live(face)) return UNAVAILABLE;
+    if (!live(face)) {
+        fixtureTrace(face.node.snapshot, face.node.spec.id, kind, "enqueue_inactive", 0);
+        return UNAVAILABLE;
+    }
     if (!face.node.spec.enabled) return DISABLED;
     return face.node.snapshot.queue.post(face.node.snapshot, face.node.spec.id, kind, value, state);
 }
@@ -825,7 +836,10 @@ const SelectionTable = extern struct {
     IsSelectionRequired: BoolFn = fieldFn("selection_required"),
 };
 fn setValue(face: *Face, text: [*:0]const u16) callconv(.winapi) HR {
-    if (!live(face)) return UNAVAILABLE;
+    if (!live(face)) {
+        fixtureTrace(face.node.snapshot, face.node.spec.id, .set_value, "setValue_inactive", 0);
+        return UNAVAILABLE;
+    }
     if (face.node.spec.read_only) return INVALID_OPERATION;
     var length: usize = 0;
     while (length <= max_string_bytes and text[length] != 0) : (length += 1) {}
@@ -851,6 +865,11 @@ const ValueTable = extern struct {
     Value: *const fn (*Face, *?[*:0]u16) callconv(.winapi) HR = getValue,
     IsReadOnly: BoolFn = fieldFn("read_only"),
 };
+
+fn fixtureTrace(snapshot: *const Snapshot, node: u64, kind: ActionKind, reason: []const u8, pending: usize) void {
+    if (!@import("../remote_test.zig").enabled()) return;
+    std.log.scoped(.win32_uia).info("fixture_uia snapshot={d} hwnd={d} node={d} kind={s} reason={s} pending={d}", .{ snapshot.id, @intFromPtr(snapshot.hwnd), node, @tagName(kind), reason, pending });
+}
 const ToggleTable = extern struct { unknown: UnknownTable = .{}, Toggle: ActionFn = actionFn(.toggle), ToggleState: BoolFn = fieldFn("toggle_state") };
 const ExpandTable = extern struct { unknown: UnknownTable = .{}, Expand: ActionFn = actionFn(.expand), Collapse: ActionFn = actionFn(.collapse), ExpandCollapseState: BoolFn = fieldFn("expand_state") };
 fn setVisual(face: *Face, state: i32) callconv(.winapi) HR {

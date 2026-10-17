@@ -339,7 +339,14 @@ pub const PopupBridge = struct {
             if (!delivered) std.log.scoped(.win32_uia).warn("notification API rejected an announcement", .{});
             return delivered;
         }
-        self.dirty();
+        return self.dispatchPrepared(callbacks, token, action);
+    }
+    fn dispatchPrepared(self: *PopupBridge, callbacks: PopupCallbacks, token: u64, action: *const uia.Action) bool {
+        // UIAutomation may focus a Value target before calling SetValue on the
+        // same retained provider. Focus alone does not change the token/model
+        // mapping. Actual edits, selection and layout mutations still revoke it.
+        if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_dispatch snapshot={d} node={d} kind={s} invalidates={}", .{ action.snapshot_id, action.node_id, @tagName(action.kind), action.kind != .focus });
+        if (action.kind != .focus) self.dirty();
         // The callback may dismiss its menu and free this bridge. No reads of
         // self/context after the operation; the App registry is removed first.
         return callbacks.action(callbacks.context, token, action);
@@ -596,6 +603,62 @@ pub const PopupBridge = struct {
         try self.publish(api, queue, attachment, hwnd, builder.nodes[0..builder.length], builder.tokens[0..builder.length], callbacks);
     }
 };
+
+test "popup focus dispatch preserves the retained Value provider and pending action" {
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: refs.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+    try bridge.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &.{
+        .{ .id = 1, .name = "Palette", .role = .window, .patterns = .{ .window = true } },
+        .{ .id = 2, .parent = 0, .name = "Search", .role = .edit, .patterns = .{ .value = true }, .focusable = true, .read_only = false },
+    });
+    const snapshot = bridge.publisher.current.?;
+    const Lifetime = extern struct {
+        query: *const anyopaque,
+        add: *const fn (*uia.Face) callconv(.winapi) u32,
+        release: *const fn (*uia.Face) callconv(.winapi) u32,
+        options: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const face = &snapshot.nodes[1].faces[0];
+    const table: *const Lifetime = @ptrCast(@alignCast(face.vtable));
+    _ = table.add(face);
+    defer _ = table.release(face);
+    var value: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .set_value, .value = &.{}, .alloc = testing.allocator };
+    var focus = value;
+    focus.kind = .focus;
+    const Context = struct {
+        calls: usize = 0,
+        fn live(_: *anyopaque) bool {
+            return true;
+        }
+        fn action(context: *anyopaque, _: u64, _: *const uia.Action) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            return true;
+        }
+    };
+    var context: Context = .{};
+    const callbacks: PopupCallbacks = .{ .context = &context, .is_live = Context.live, .action = Context.action };
+    try testing.expect(bridge.dispatchPrepared(callbacks, palette_filter, &focus));
+    try testing.expectEqual(@as(usize, 1), context.calls);
+    var options: u32 = 0;
+    try testing.expectEqual(@as(i32, 0), table.options(face, &options));
+    try testing.expect(bridge.publisher.accepts(value));
+    // A real edit still revokes index-based providers before model mutation.
+    try testing.expect(bridge.dispatchPrepared(callbacks, palette_filter, &value));
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), table.options(face, &options));
+    try testing.expect(!bridge.publisher.accepts(value));
+}
 
 pub const palette_root: u64 = 0;
 pub const palette_filter: u64 = 1;
