@@ -161,6 +161,8 @@ function __ghostty_precmd() {
     if [[ "$GHOSTTY_SHELL_FEATURES" == *"cursor"* ]]; then
       builtin local cursor=5  # blinking bar
       [[ "$GHOSTTY_SHELL_FEATURES" == *"cursor:steady"* ]] && cursor=6  # steady bar
+      # fork(gx): GX-0047 restore the configured cursor at each prompt.
+      [[ "$GHOSTTY_SHELL_FEATURES" == *"cursor:config"* ]] && cursor=0
 
       [[ "$PS1" != *"\[\e[${cursor} q\]"* ]] && PS1=$PS1"\[\e[${cursor} q\]"
       [[ "$PS0" != *'\[\e[0 q\]'* ]] && PS0=$PS0'\[\e[0 q\]' # reset

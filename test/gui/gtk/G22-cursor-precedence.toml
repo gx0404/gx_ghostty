@@ -10,6 +10,10 @@ env = HISTFILE=/dev/null
 script = '''
 import shlex
 import os
+import signal
+import select
+import termios
+import time
 private_home = config_home / "shell-home"
 private_home.mkdir()
 (private_home / ".zshrc").write_text("PROMPT='R6-ZSH%# '\nprintf '%s\\n' \"$GHOSTTY_SHELL_FEATURES|$_ghostty_state\" > \"$HOME/integration.txt\"\n")
@@ -34,8 +38,49 @@ try:
  os.read(0,1)
 finally:
  termios.tcsetattr(0,termios.TCSANOW,old)
- os.write(1,b'\\x1b[0 q')
 """)
+def prompt_cursor(label, identity):
+    # Freeze only the owned shell's input reader. Query through its PTY slave
+    # without executing a command, so preexec cannot mask the prompt's state.
+    def state():
+        fields = Path(f"/proc/{identity['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+        assert int(fields[19]) == identity["birth"], "shell PID was reused"
+        return fields[0]
+    state()
+    handle = os.pidfd_open(identity["pid"])
+    terminal = None
+    stopped = False
+    try:
+        state()
+        terminal = os.open(identity["fd0"], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        assert not termios.tcgetattr(terminal)[3] & termios.ICANON, "shell is not reading a prompt"
+        signal.pidfd_send_signal(handle, signal.SIGSTOP)
+        stopped = True
+        for _ in range(100):
+            if state() == "T": break
+            sleep(0.01)
+        assert state() == "T", "owned shell did not stop"
+        os.write(terminal, b"\x1bP$q q\x1b\\")
+        response = b""
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if select.select([terminal], [], [], 0.1)[0]:
+                response += os.read(terminal, 1024)
+                if response.endswith(b"\x1b\\"): break
+        prefix, suffix = b"\x1bP1$r", b" q\x1b\\"
+        assert response.startswith(prefix) and response.endswith(suffix), response
+        value = int(response[len(prefix):-len(suffix)])
+        save("-" + label + "-prompt-query.json", json.dumps({"identity":identity,"response_hex":response.hex(),"value":value},indent=2))
+        return value
+    finally:
+        if stopped:
+            try:
+                signal.pidfd_send_signal(handle, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        if terminal is not None:
+            os.close(terminal)
+        os.close(handle)
 results = []
 config_file = config_home / "ghostty/config.ghostty"
 for shell in ("bash", "zsh"):
@@ -54,6 +99,12 @@ for shell in ("bash", "zsh"):
                 xdo("mousemove", 400, 300, "click", 1)
                 sleep(0.2)
                 capture(label + "-prompt")
+                shells = [row for row in processes(label + "-shell") if Path(row["exe"]).name == shell]
+                assert len(shells) == 1, shells
+                identity = shells[0]
+                configured = {"block":1,"underline":3,"bar":5}[style] + (0 if blink else 1)
+                initial_cursor = prompt_cursor(label + "-initial", identity)
+                assert initial_cursor == configured, (label, configured, initial_cursor)
                 if blink:
                     xdo("type", "x")
                     xdo("key", "BackSpace")
@@ -73,14 +124,38 @@ for shell in ("bash", "zsh"):
                 capture(label + "-tui")
                 xdo("key", "Return")
                 sleep(0.4)
-                results.append({"case":label,"configured_style":style,"configured_blink":blink,"feature":feature,"shell":shell,**result})
+                returned_cursor = prompt_cursor(label + "-returned", identity)
+                assert returned_cursor == (configured if feature == "cursor" else 2), (label, configured, returned_cursor)
+                capture(label + "-returned")
+                results.append({"case":label,"configured_style":style,"configured_blink":blink,"feature":feature,"shell":shell,
+                                "prompt_before":initial_cursor,"prompt_returned":returned_cursor,**result})
 save("-cursor-matrix.json", json.dumps(results,indent=2))
+# Zsh's vi command indicator remains a block, while insert uses configuration.
+config_file.write_text("language = en\ncommand = direct:/usr/bin/zsh -d\nconfirm-close-surface = false\nenv = HISTFILE=/dev/null\ncursor-style = underline\ncursor-style-blink = false\nshell-integration-features = cursor\n")
+restart()
+xdo("mousemove", 400, 300, "click", 1)
+xdo("type", "KEYTIMEOUT=1; bindkey -v")
+xdo("key", "Return")
+sleep(0.5)
+identity = next(row for row in processes("zsh-vi-shell") if Path(row["exe"]).name == "zsh")
+assert prompt_cursor("zsh-vi-insert", identity) == 4
+capture("zsh-vi-insert")
+xdo("key", "Escape")
+sleep(0.3)
+assert prompt_cursor("zsh-vi-command", identity) == 2
+capture("zsh-vi-command")
+xdo("key", "i")
+sleep(0.3)
+assert prompt_cursor("zsh-vi-insert-again", identity) == 4
+capture("zsh-vi-insert-again")
 '''
 expect = [
   "G22.png: an isolated initial Bash terminal",
-  "*-prompt.png: read the visible prompt cursor for each shell, integration feature, shape and blink setting",
+  "*-prompt.png: the initial prompt shows the configured cursor in all cases; the direct PTY query must match",
   "*-prompt-active.png and *-prompt-idle.png: blinking cases include a key-woken frame and a later frame",
   "*-tui.png: a steady block requested by the test program; query JSON must contain the exact DECRQSS response for DECSCUSR 2",
-  "G22-after.png: the shell prompt returns after the final TUI exits",
+  "*-returned.png: cursor restores configuration after the TUI; no-cursor deliberately preserves the TUI's steady block",
+  "G22-zsh-vi-*.png: insert is configured steady underline; vi command mode remains steady block",
+  "G22-after.png: Zsh vi insert mode is restored",
   "This GTK matrix does not substitute for the same configuration on Windows",
 ]

@@ -195,7 +195,8 @@ pub fn setupFeatures(
     const capacity: usize = capacity: {
         comptime var n: usize = fields.len - 1; // commas
         inline for (fields) |field| n += field.name.len;
-        n += ":steady".len; // cursor value
+        // fork(gx): GX-0047 retain the blink hint and add the configured-cursor marker.
+        n += ":steady,cursor:config".len; // cursor values
         break :capacity n;
     };
 
@@ -227,6 +228,8 @@ pub fn setupFeatures(
 
             if (std.mem.eql(u8, name, "cursor")) {
                 try writer.writeAll(if (cursor_blink) ":blink" else ":steady");
+                // fork(gx): GX-0047 ask GX integration to restore effective cursor defaults.
+                try writer.writeAll(",cursor:config");
             }
         }
     }
@@ -249,7 +252,12 @@ test "setup features" {
         defer env.deinit();
 
         try setupFeatures(&env, .{ .cursor = true, .sudo = true, .title = true, .@"ssh-env" = true, .@"ssh-terminfo" = true, .path = true }, true);
-        try testing.expectEqualStrings("cursor:blink,path,ssh-env,ssh-terminfo,sudo,title", env.get("GHOSTTY_SHELL_FEATURES").?);
+        // fork(gx): GX-0047 the configured-cursor marker accompanies the legacy blink hint.
+        try testing.expectEqualStrings("cursor:blink,cursor:config,path,ssh-env,ssh-terminfo,sudo,title", env.get("GHOSTTY_SHELL_FEATURES").?);
+        // fork(gx): GX-0047 begin: exercise the longest complete feature value.
+        try setupFeatures(&env, .{ .cursor = true, .sudo = true, .title = true, .@"ssh-env" = true, .@"ssh-terminfo" = true, .path = true }, false);
+        try testing.expectEqualStrings("cursor:steady,cursor:config,path,ssh-env,ssh-terminfo,sudo,title", env.get("GHOSTTY_SHELL_FEATURES").?);
+        // fork(gx): GX-0047 end
     }
 
     // Test: all features disabled
@@ -275,7 +283,8 @@ test "setup features" {
         var env = EnvMap.init(alloc);
         defer env.deinit();
         try setupFeatures(&env, .{ .cursor = true, .sudo = false, .title = false, .@"ssh-env" = false, .@"ssh-terminfo" = false, .path = false }, true);
-        try testing.expectEqualStrings("cursor:blink", env.get("GHOSTTY_SHELL_FEATURES").?);
+        // fork(gx): GX-0047 cursor enabled always advertises configuration reset.
+        try testing.expectEqualStrings("cursor:blink,cursor:config", env.get("GHOSTTY_SHELL_FEATURES").?);
     }
 
     // Test: steady cursor
@@ -283,7 +292,8 @@ test "setup features" {
         var env = EnvMap.init(alloc);
         defer env.deinit();
         try setupFeatures(&env, .{ .cursor = true, .sudo = false, .title = false, .@"ssh-env" = false, .@"ssh-terminfo" = false, .path = false }, false);
-        try testing.expectEqualStrings("cursor:steady", env.get("GHOSTTY_SHELL_FEATURES").?);
+        // fork(gx): GX-0047 retain steady for vi command-mode indication.
+        try testing.expectEqualStrings("cursor:steady,cursor:config", env.get("GHOSTTY_SHELL_FEATURES").?);
     }
 }
 

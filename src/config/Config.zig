@@ -873,14 +873,18 @@ palette: Palette = .{},
 /// make it difficult to find the cursor.
 @"cursor-opacity": f64 = 1.0,
 
+// fork(gx): GX-0047 document configured prompt cursors without disabling program requests.
 /// The style of the cursor. This sets the default style. A running program can
 /// still request an explicit cursor style using escape sequences (such as `CSI
 /// q`). Shell configurations will often request specific cursor styles.
 ///
-/// Note that shell integration will automatically set the cursor to a bar at
-/// a prompt, regardless of this configuration. You can disable that behavior
-/// by specifying `shell-integration-features = no-cursor` or disabling shell
-/// integration entirely.
+/// Ghostty GX shell integration restores this style and `cursor-style-blink`
+/// at each prompt when its `cursor` feature is enabled. Set `cursor-style = bar`
+/// for a bar prompt cursor. Zsh vi command and visual modes retain a block
+/// indicator; insert/main mode restores the configured style. Programs may
+/// still request their own cursor while running. Set
+/// `shell-integration-features = no-cursor` to disable the integration's cursor
+/// handling, including the reset after a program exits.
 ///
 /// Valid values are:
 ///
@@ -2963,6 +2967,7 @@ keybind: Keybinds = .{},
 /// The default value is `detect`.
 @"shell-integration": ShellIntegration = .detect,
 
+// fork(gx): GX-0047 document the GX prompt reset policy for the cursor feature.
 /// Shell integration features to enable. These require our shell integration
 /// to be loaded, either automatically via shell-integration or manually.
 ///
@@ -2975,7 +2980,11 @@ keybind: Keybinds = .{},
 ///
 /// Available features:
 ///
-///   * `cursor` - Set the cursor to a bar at the prompt.
+///   * `cursor` - Restore the effective `cursor-style` and `cursor-style-blink`
+///     at the prompt in Ghostty GX. Programs can still change their cursor
+///     while running. Zsh vi command/visual modes retain a block indicator;
+///     insert/main mode restores configuration. Set `cursor-style = bar` for
+///     a bar prompt cursor. `no-cursor` disables all integration cursor handling.
 ///
 ///   * `sudo` - Set sudo wrapper to preserve terminfo.
 ///
