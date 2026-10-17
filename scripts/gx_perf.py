@@ -49,7 +49,8 @@ Samples come from these lines:
   - the Debug-build log line `window shown after <n>ms first_frame=<bool>` (log.window_shown);
   - the `startup_ms` block of a scripts/gx_win_gui.py run.json (startup.<mark>).
 Times are reported in milliseconds; metrics without a unit are counts. p90 is the nearest-rank
-90th percentile. Exit codes: 0 success, 1 a failed measurement run, 2 usage errors or no samples.
+90th percentile. Exit codes: 0 success, 1 a failed measurement run, 2 usage errors or no samples,
+4 a complete win32-* batch whose new-arm absolute gate failed (truthful FAIL evidence).
 """
 
 from __future__ import annotations
@@ -1675,6 +1676,10 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         if report['status'] != 'completed':
             break  # Never retry or continue input after a failed guard.
     batch['valid'] = not batch['errors'] and len(batch['runs']) == args.runs * len(labels)
+    batch['gate_failed'] = any(item['absolute_gate']['status'] == 'FAIL' for item in batch['runs'])
+    # 1 = incomplete driver evidence (any observed gate FAIL stays in absolute_gates);
+    # 4 = complete batch whose new-arm absolute gate failed: keep it as FAIL evidence.
+    batch['exit'] = 1 if not batch['valid'] else (4 if batch['gate_failed'] else 0)
     texts = []
     for label in labels:
         text, batch['metrics'][label] = summary_table(sets[label])
@@ -1692,6 +1697,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
     text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
     text += '\nAbsolute gates: ' + json.dumps(batch['absolute_gates'], ensure_ascii=False) + '\n'
+    text += ('Driver result: ' + ('complete' if batch['valid'] else 'incomplete (driver error)') +
+             ('; absolute gate FAIL observed' if batch['gate_failed'] else '') + f"; exit {batch['exit']}\n")
     if resources:
         batch['resource_populations'] = resources
         text += ('\nP8: one window, 1/11 tabs, one terminal per tab; dedicated-byte increment denominator=10.\n'
@@ -1704,8 +1711,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     write_json(out / 'RESULT.json', batch)
     write_json(args.json, batch)
     print(text)
-    gate_failed = any(item['absolute_gate']['status'] == 'FAIL' for item in batch['runs'])
-    return 0 if batch['valid'] and not gate_failed else 1
+    return batch['exit']
 
 
 def run_remote(args) -> int:

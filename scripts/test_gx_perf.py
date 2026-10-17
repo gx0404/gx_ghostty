@@ -545,6 +545,31 @@ class ExperimentTests(unittest.TestCase):
         self.assertFalse(result['comparison']['menu.open.ready']['comparable'])
         self.assertEqual(0,result['comparison']['menu.open.ready']['old']['n'])
 
+    def test_complete_gate_fail_exits_4_but_incomplete_evidence_stays_1(self):
+        gui, calls = self.fake_gui(), []
+        def measure(_, instance, capture, args):
+            calls.append(capture.report['run'])
+            if len(calls) == 3:
+                raise gx_perf.PerfError('popup vanished')
+            for ui in ('palette', 'menu', 'settings'):
+                capture.add(ui + '.open.ready', 7 if ui == 'menu' else 2, 'ms')
+                capture.add(ui + '.profiles.path_scan', 0)
+        args = self.args()
+        with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(4, gx_perf.run_experiment(args, gui))
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual((True, True, 4), (result['valid'], result['gate_failed'], result['exit']))
+        self.assertEqual('FAIL', result['runs'][0]['absolute_gate']['status'])
+        self.assertIn('complete; absolute gate FAIL observed; exit 4', (args.out / 'SUMMARY.txt').read_text())
+        args = self.args('win32-ui', '--runs', '2')
+        args.out = self.root / 'incomplete'
+        with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1, gx_perf.run_experiment(args, gui))
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual((False, True, 1), (result['valid'], result['gate_failed'], result['exit']))
+
     def test_unexpected_driver_exception_retains_failed_evidence(self):
         args,gui=self.args(),self.fake_gui()
         with mock.patch.object(gx_perf,'measure_ui',side_effect=StopIteration('window vanished')),mock.patch.object(gx_perf.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
