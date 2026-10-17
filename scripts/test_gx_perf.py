@@ -6,6 +6,7 @@ that only read files. The measurement commands (win32, gtk) need a desktop or WS
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import io
 import json
 import sys
@@ -13,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -223,6 +225,218 @@ class QuietTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'command_output', side_effect=gx_perf.PerfError('daemon')):
             with self.assertRaises(gx_perf.PerfError):
                 gx_perf.QuietProbe().vm(self.args.slot_root)
+
+
+class CounterTests(unittest.TestCase):
+    def test_nt_snapshot_decoder_rejects_truncation_and_foreign_threads(self):
+        process, thread = gx_perf.NativeProcess(), gx_perf.NativeThread()
+        process.pid, process.birth, process.threads = 42, 123, 1
+        thread.pid, thread.tid, thread.birth, thread.switches = 42, 43, 124, 10
+        raw = bytes(process) + bytes(thread)
+        self.assertEqual({'birth': 123, 'threads': [{'tid': 43, 'birth': 124, 'switches': 10}]}, gx_perf.decode_threads(raw, 42))
+        for damaged in (raw[:-1], bytes(process), raw[:20]):
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.decode_threads(damaged, 42)
+        thread.pid = 99
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.decode_threads(bytes(process) + bytes(thread), 42)
+
+    def test_cpu_uses_process_times_and_switches_match_thread_birth(self):
+        before = dict(pid=1, birth=2, user_100ns=10, kernel_100ns=20, begin_ns=0, end_ns=1,
+                      threads=[dict(tid=3, birth=4, switches=0xfffffffe)])
+        after = dict(before, user_100ns=10010, kernel_100ns=20020, begin_ns=60000000001,
+                     threads=[dict(tid=3, birth=4, switches=2)])
+        result = gx_perf.idle_delta(before, after)
+        self.assertEqual((3, 'ms'), result['process.cpu'])
+        self.assertEqual((4, ''), result['threads.context_switches'])
+        self.assertEqual((60000, 'ms'), result['idle.wall'])
+        after['threads'][0]['birth'] = 5
+        with self.assertRaisesRegex(gx_perf.PerfError, 'population'):
+            gx_perf.idle_delta(before, after)
+
+    def test_paint_frames_do_not_mix_threads_or_count_trailing_layouts(self):
+        text = ('00:00:00.100 [1] info(gx_perf): metric d2d.layout_create 2\n'
+                '00:00:00.100 [2] info(gx_perf): metric d2d.layout_create 99\n'
+                '00:00:00.101 [1] info(gx_perf): keybinds.paint 500us\n'
+                '00:00:00.102 [1] info(gx_perf): keybinds.paint 1000us\n'
+                '00:00:00.103 [1] info(gx_perf): metric d2d.layout_create 8\n')
+        self.assertEqual([{'thread': '1', 'layouts': 2, 'paint_ms': .5},
+                          {'thread': '1', 'layouts': 0, 'paint_ms': 1}], gx_perf.keybind_frames(text))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows ABI only')
+    def test_native_structure_sizes(self):
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(256, ctypes.sizeof(gx_perf.NativeProcess))
+            self.assertEqual(80, ctypes.sizeof(gx_perf.NativeThread))
+            self.assertEqual(80, ctypes.sizeof(gx_perf.ProcessMemory))
+        else:
+            self.assertEqual(44, ctypes.sizeof(gx_perf.ProcessMemory))
+
+
+class ExperimentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.exe = self.root / 'ghostty.exe'
+        self.exe.write_bytes(b'fake executable')
+
+    def args(self, command='win32-ui', *extra):
+        return gx_perf.build_parser().parse_args([command, '--exe', str(self.exe), '--out', str(self.root / 'out'),
+                                                 '--runs', '1', *(['--case', 'p4'] if command == 'win32-ui' else []), *extra])
+
+    def fake_gui(self):
+        import gx_win_gui as real
+        gui = mock.Mock(GuiError=real.GuiError, InputBlocked=real.InputBlocked, HARNESS_CONFIG='', env_assignments=real.env_assignments)
+        def launch(exe, env_dir, **kwargs):
+            env_dir.mkdir(parents=True, exist_ok=True)
+            log = env_dir / 'app.log'
+            log.write_text('info(gx_perf): metric proc.snapshot 1\n', encoding='utf-8')
+            return mock.Mock(pid=1, creation=2, log=log, wait_window=mock.Mock(return_value={'shown_ms': 1}),
+                             close=mock.Mock(return_value='closed'))
+        gui.launch.side_effect = launch
+        return gui
+
+    def test_alternating_batch_preserves_env_raw_and_does_not_double_count(self):
+        args = self.args('win32-ui', '--exe', str(self.exe), '--runs', '2', '--label-env', 'new:TEST=1')
+        gui = self.fake_gui()
+        def measure(_, instance, capture, args):
+            capture.add('palette.open.total', 2, 'ms')
+        with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.run_experiment(args, gui))
+        batch = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual(['old', 'new', 'new', 'old'], [r['label'] for r in batch['runs']])
+        self.assertEqual([None, '1', '1', None], [c.kwargs['env'].get('TEST') for c in gui.launch.call_args_list])
+        self.assertEqual([2, 2], gx_perf.collect([args.out / 'old']).values['palette.open.total'])
+        self.assertTrue((args.out / 'new/run-02/ghostty.log').is_file())
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.run_experiment(args, gui)
+
+    def test_guard_failure_stops_batch_and_retains_failed_run(self):
+        import gx_win_gui as real
+        args, gui = self.args('win32-ui', '--runs', '3'), self.fake_gui()
+        with mock.patch.object(gx_perf, 'measure_ui', side_effect=real.InputBlocked('foreground changed')), mock.patch.object(gx_perf.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1, gx_perf.run_experiment(args, gui))
+        self.assertEqual(1, gui.launch.call_count)
+        run = json.loads((args.out / 'build/run-01/run.json').read_text())
+        self.assertEqual('failed', run['status'])
+        self.assertIn('foreground changed', run['errors'])
+        self.assertTrue((args.out / 'build/run-01/ghostty.log').exists())
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.collect([args.out])
+
+    def test_p4_excludes_warmup_and_reduces_three_hot_opens(self):
+        instance = mock.Mock()
+        target = self.root
+        instance.log = target / 'app.log'
+        instance.log.write_text('', encoding='utf-8')
+        capture = gx_perf.CaptureRun(instance, target, {})
+        counts = {}
+        def opened(_, name):
+            n = counts.get(name, 0)
+            counts[name] = n + 1
+            with instance.log.open('a', encoding='utf-8') as log:
+                log.write(f'info(gx_perf): {name}.open.total {[900000, 1000, 3000, 2000][n]}us\n')
+                log.write('info(gx_perf): metric profiles.path_scan 1\n')
+            return mock.Mock()
+        with mock.patch.object(gx_perf, 'open_ui', side_effect=opened), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.measure_ui(mock.Mock(), instance, capture, self.args())
+        for name in ('palette', 'menu', 'settings'):
+            self.assertEqual([2], capture.samples.values[name + '.open.total'])
+            self.assertEqual([3], capture.samples.values[name + '.profiles.path_scan'])
+        self.assertEqual({'palette': 4, 'menu': 4, 'settings': 4}, counts)
+
+    def test_resource_measurement_reports_commit_per_added_thread(self):
+        args = self.args('win32-mem')
+        counters = mock.Mock()
+        counters.sample.side_effect = [dict(private_bytes=100, thread_count=4), dict(private_bytes=500, thread_count=14)]
+        instance, gui = mock.Mock(), mock.Mock()
+        capture = gx_perf.CaptureRun(instance, self.root, {})
+        with mock.patch.object(gx_perf, 'wait_until', return_value=True), mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.measure_resources(gui, instance, capture, args, counters)
+        self.assertEqual([40], capture.samples.values['process.commit.per_added_thread'])
+        self.assertEqual(10, instance.press.call_count)
+
+    def test_gpu_keeps_last_gauge_and_dedicated_bytes_per_terminal(self):
+        counters, instance = mock.Mock(), mock.Mock()
+        counters.sample.side_effect = [dict(private_bytes=100, thread_count=4), dict(private_bytes=500, thread_count=14)]
+        counters.gpu.side_effect = [dict(dedicated_bytes=1024), dict(dedicated_bytes=11264)]
+        instance.log_text.return_value = 'info(gx_perf): metric renderer.targets_live 2\ninfo(gx_perf): metric renderer.targets_live 22\n'
+        capture = gx_perf.CaptureRun(instance, self.root, {})
+        with mock.patch.object(gx_perf, 'wait_until', return_value=True), mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.measure_resources(mock.Mock(), instance, capture, self.args('win32-gpu'), counters)
+        self.assertEqual([1024], capture.samples.values['gpu.dedicated.per_added_terminal'])
+        self.assertEqual([22], capture.samples.values['renderer.targets_live.11'])
+
+    def test_idle_interval_excludes_setup_events_and_records_cpu(self):
+        instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        gui.win32.return_value.window_pid.return_value = instance.pid
+        instance.log = self.root / 'idle.log'
+        instance.log.write_text('info(gx_perf): metric proc.snapshot 99\n', encoding='utf-8')
+        before = dict(pid=1, birth=2, user_100ns=0, kernel_100ns=0, begin_ns=0, end_ns=1,
+                      threads=[dict(tid=3, birth=4, switches=10)])
+        after = dict(before, user_100ns=20000, begin_ns=60000000001,
+                     threads=[dict(tid=3, birth=4, switches=20)])
+        counters.sample.side_effect = [before, after]
+        capture = gx_perf.CaptureRun(instance, self.root, {})
+        def sleep(seconds):
+            if seconds == 60:
+                with instance.log.open('a') as stream:
+                    stream.write('info(gx_perf): metric proc.snapshot 2\ninfo(gx_perf): metric renderer.present 4\n')
+        with mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep):
+            gx_perf.idle_interval(gui, instance, capture, self.args('win32-idle'), counters)
+        self.assertEqual([2], capture.samples.values['proc.snapshot'])
+        self.assertEqual([2], capture.samples.values['process.cpu'])
+        self.assertEqual([10], capture.samples.values['threads.context_switches'])
+
+    def test_p3_drags_real_caption_and_p6_holds_key_at_30hz(self):
+        gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()
+        old = SimpleNamespace(hwnd=10, rect=(0, 0, 800, 600))
+        new = SimpleNamespace(hwnd=10, rect=(100, 50, 900, 650))
+        gui.win32.return_value.foreground.return_value = 10
+        instance.scale.return_value = 1
+        instance.caption_point.return_value = (500, 20)
+        with mock.patch.object(gx_perf, 'populate') as populate, mock.patch.object(gx_perf, 'main_windows', side_effect=[[old], [new]]), mock.patch.object(gx_perf.time, 'sleep'):
+            args = self.args()
+            args.case = 'p3'
+            gx_perf.measure_ui(gui, instance, capture, args)
+        populate.assert_called_once_with(gui, instance, 15, 3)
+        instance.drag.assert_called_once_with((500, 20), (620, 60), steps=60, step_delay=2/60)
+        instance.uia_rows.return_value = [{'type': 'ControlType.ListItem'}]
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'):
+            args.case = 'p6'
+            gx_perf.measure_ui(gui, instance, capture, args)
+        instance.hold_key.assert_called_once_with('down', seconds=2, hz=30)
+        instance.press.assert_called_with('ctrl+pagedown')
+
+    def test_p5_sweeps_overlapping_pages_until_viewport_stops(self):
+        import gx_win_gui as gui
+        instance, capture, backend = mock.Mock(), mock.Mock(), mock.Mock()
+        backend.client_rect.return_value = (0, 0, 400, 220)
+        instance.scale.return_value = 1
+        image = gui.Image(400, 220, bytes(400 * 220 * 4))
+        instance.capture_window.return_value = image
+        capture.window.return_value = 'info(gx_perf): keybinds.paint 400us\n'
+        capture.report = {}
+        args = self.args()
+        args.case = 'p5'
+        with mock.patch.object(gui, 'win32', return_value=backend), mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.measure_ui(gui, instance, capture, args)
+        self.assertEqual(1, instance.wheel.call_count)
+        self.assertGreater(instance.mouse.call_count, 10)
+        self.assertEqual(1, len(capture.report['frames']))
+
+    def test_remote_accepts_unknown_remote_names_and_ignores_other_metrics(self):
+        log = self.root / 'remote.log'
+        log.write_text('info(gx_perf): metric remote.frame_bytes 100\ninfo(gx_perf): remote.future 200us\n'
+                       'info(gx_perf): other 1us\ninfo(gx_perf): metric other 4\n', encoding='utf-8')
+        out = self.root / 'remote'
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.main(['remote', str(log), '--out', str(out)]))
+        report = json.loads((out / 'RESULT.json').read_text())['metrics']
+        self.assertEqual({'remote.frame_bytes', 'remote.future'}, set(report))
+        self.assertEqual(100, report['remote.frame_bytes']['sum'])
+        self.assertEqual(.2, report['remote.future']['median'])
 
 
 class StatisticsTests(unittest.TestCase):

@@ -21,10 +21,25 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         New/empty DIR only; no automatic warm-up; AB/BA order. DIR/<label>/run-NN/ holds raw evidence,
         gtk-runs.json preserves every planned run, RESULT.json records validity (not a performance verdict).
         Missing/failed/changed-identity runs cannot be filtered into success.
+  quiet --out DIR [--slot-root DIR] [--idle-seconds 600] [--wait --interval 900 --max-attempts 3]
+        Read-only Windows/WSL/VM/input/blacklist checks; probe all slots and immediately release.
+        Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON. CPU is observation only.
+  win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
+  win32-idle --exe PATH --out DIR [--tabs 1 --windows 1 --state visible --seconds 60]
+  win32-gpu --exe PATH --out DIR              (PDH dedicated GPU bytes, 1/11 terminals)
+  win32-mem --exe PATH --out DIR              (PrivateUsage and threads, 1/11 terminals)
+        All four accept --label, --config, --env, --label-env LABEL:NAME=VALUE, --runs, --json
+        and --diagnostic. New output only, per-round isolated profiles, AB/BA order, no retry.
+        Input uses gx_win_gui guards. Caller owns the desktop/quiet slot and quiet-window policy.
+        run.json and ghostty.log preserve originals; samples.txt contains reduced measurements.
+        RESULT.json and SUMMARY.txt describe driver evidence, never a performance verdict.
+  remote PATH... [--out DIR] [--json FILE]
+        Summarize remote.* fixture logs only; no remote scene or desktop actions.
 
 Samples come from these lines:
   - `info(gx_perf): <metric> <value>us` written when GHOSTTY_GX_PERF=1 (src/gx/perf.zig);
-    historical ns/ms/s time lines are also accepted, not counts;
+    historical ns/ms/s time lines are also accepted;
+  - `info(gx_perf): metric <name> <value>` (unitless count/gauge; sum is also reported);
   - `metric <name> <value> [s|ms|us]` from `gx_wsl.py smoke --perf` and from this tool's runs;
   - the Debug-build log line `window shown after <n>ms first_frame=<bool>` (log.window_shown);
   - the `startup_ms` block of a scripts/gx_win_gui.py run.json (startup.<mark>).
@@ -321,6 +336,21 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
 def collect(paths: Iterable[Path]) -> Samples:
     samples = Samples()
     files = sample_files(paths)
+    experiment_dirs = {}
+    for path in files:
+        manifest = path.parent / 'run.json'
+        if manifest.is_file() and manifest.parent not in experiment_dirs:
+            data = read_json(manifest)
+            if data.get('schema') == 'gx-win32-perf-run-v1':
+                if data.get('status') != 'completed' or data.get('errors'):
+                    raise PerfError(f'{manifest}: rejected Windows measurement')
+                experiment_dirs[manifest.parent] = data
+    for directory in experiment_dirs:
+        # Per-run derived metrics already reduce warmups and select measurement
+        # intervals. Never count the same events again from the full raw log.
+        samples.extend(parse_text((directory / 'samples.txt').read_text(encoding='utf-8')))
+        samples.unverified.add(str(directory / 'run.json'))
+    files = [path for path in files if path.parent not in experiment_dirs]
     for parent in {path.parent for path in files}:
         for legacy in parent.glob("*-meta.txt"):
             text = legacy.read_text(encoding="utf-8", errors="replace")
@@ -685,6 +715,578 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
     return 2
 
 
+# Fixed-width Windows ABI fields keep the raw snapshot decoder testable off Windows.
+class NativeThread(ctypes.Structure):
+    _fields_ = [("kernel", ctypes.c_int64), ("user", ctypes.c_int64), ("birth", ctypes.c_int64),
+                ("wait", ctypes.c_uint32), ("start", ctypes.c_void_p), ("pid", ctypes.c_void_p),
+                ("tid", ctypes.c_void_p), ("priority", ctypes.c_int32), ("base_priority", ctypes.c_int32),
+                ("switches", ctypes.c_uint32), ("state", ctypes.c_uint32), ("reason", ctypes.c_uint32)]
+
+
+class NativeString(ctypes.Structure):
+    _fields_ = [("length", ctypes.c_uint16), ("maximum", ctypes.c_uint16), ("buffer", ctypes.c_void_p)]
+
+
+class NativeProcess(ctypes.Structure):
+    _fields_ = [("next", ctypes.c_uint32), ("threads", ctypes.c_uint32), ("private_ws", ctypes.c_int64),
+                ("faults", ctypes.c_uint32), ("high_threads", ctypes.c_uint32), ("cycles", ctypes.c_uint64),
+                ("birth", ctypes.c_int64), ("user", ctypes.c_int64), ("kernel", ctypes.c_int64),
+                ("image", NativeString), ("priority", ctypes.c_int32), ("pid", ctypes.c_void_p),
+                ("parent", ctypes.c_void_p), ("handles", ctypes.c_uint32), ("session", ctypes.c_uint32),
+                ("key", ctypes.c_size_t), ("peak_virtual", ctypes.c_size_t), ("virtual", ctypes.c_size_t),
+                ("page_faults", ctypes.c_uint32)] + [(name, ctypes.c_size_t) for name in
+                ("peak_ws", "ws", "peak_paged", "paged", "peak_nonpaged", "nonpaged", "pagefile", "peak_pagefile", "private")] + [
+                (name, ctypes.c_int64) for name in ("read_ops", "write_ops", "other_ops", "read_bytes", "write_bytes", "other_bytes")]
+
+
+class ProcessMemory(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_uint32), ("faults", ctypes.c_uint32)] + [(name, ctypes.c_size_t) for name in
+                ("peak_ws", "ws", "peak_paged", "paged", "peak_nonpaged", "nonpaged", "pagefile", "peak_pagefile", "private")]
+
+
+def decode_threads(raw: bytes, pid: int) -> dict:
+    offset = 0
+    header, stride = ctypes.sizeof(NativeProcess), ctypes.sizeof(NativeThread)
+    while offset + header <= len(raw):
+        item = NativeProcess.from_buffer_copy(raw, offset)
+        end = offset + item.next if item.next else len(raw)
+        if end > len(raw) or end < offset + header or offset + header + item.threads * stride > end:
+            raise PerfError("truncated SystemProcessInformation")
+        if item.pid == pid:
+            rows = []
+            for i in range(item.threads):
+                thread = NativeThread.from_buffer_copy(raw, offset + header + i * stride)
+                if thread.pid != pid or not thread.tid:
+                    raise PerfError("invalid SYSTEM_THREAD_INFORMATION identity")
+                rows.append({"tid": thread.tid, "birth": thread.birth, "switches": thread.switches})
+            return {"birth": item.birth, "threads": rows}
+        if not item.next:
+            break
+        offset = end
+    raise PerfError(f"pid {pid} missing from SystemProcessInformation")
+
+
+class NativeCounters:
+    """GetProcessTimes / PrivateUsage and NT endpoint thread context-switch counters."""
+    def __init__(self, gui):
+        self.w = gui.win32()
+        self.nt = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+        self.nt.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+        self.nt.restype = ctypes.c_int32
+        self.memory = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+        self.memory.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_uint32]
+        self.memory.restype = ctypes.c_int32
+
+    def threads(self, pid: int) -> dict:
+        length = 1024 * 1024
+        for _ in range(8):
+            buffer = ctypes.create_string_buffer(length)
+            needed = ctypes.c_uint32()
+            status = self.nt(5, buffer, length, ctypes.byref(needed))  # SystemProcessInformation
+            if status == 0:
+                return decode_threads(buffer.raw[:needed.value], pid)
+            if status & 0xFFFFFFFF != 0xC0000004:
+                raise PerfError(f"NtQuerySystemInformation failed: {status & 0xFFFFFFFF:#x}")
+            length = max(length * 2, needed.value + 65536)
+        raise PerfError("SystemProcessInformation kept growing")
+
+    def sample(self, instance) -> dict:
+        instance.ensure_owned()
+        began = time.perf_counter_ns()
+        handle = self.w._open(instance.pid, 0x0400 | 0x0010)
+        if not handle:
+            raise PerfError("cannot open owned process for counters")
+        try:
+            created, exited, kernel, user = (self.w.FILETIME() for _ in range(4))
+            if not self.w.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            value = lambda ft: (ft.high << 32) | ft.low
+            if value(created) != instance.creation:
+                raise PerfError("process birth changed during counter read")
+            memory = ProcessMemory()
+            memory.cb = ctypes.sizeof(memory)
+            if not self.memory(handle, ctypes.byref(memory), memory.cb):
+                raise ctypes.WinError(ctypes.get_last_error())
+            threads = self.threads(instance.pid)
+            if threads['birth'] != instance.creation:
+                raise PerfError("NT process birth differs from held process")
+            instance.ensure_owned()
+            return {"begin_ns": began, "end_ns": time.perf_counter_ns(), "pid": instance.pid,
+                    "birth": value(created), "kernel_100ns": value(kernel), "user_100ns": value(user),
+                    "private_bytes": memory.private, "thread_count": len(threads['threads']), "threads": threads['threads']}
+        finally:
+            self.w.CloseHandle(handle)
+
+    def gpu(self, instance) -> dict:
+        instance.ensure_owned()
+        result = gpu_memory(instance.pid)
+        instance.ensure_owned()
+        return result
+
+
+def gpu_memory(pid: int) -> dict:
+    pdh = ctypes.WinDLL("pdh")
+    handle = ctypes.c_void_p
+    dword = ctypes.c_uint32
+    class Raw(ctypes.Structure):
+        _fields_ = [("status", dword), ("time", dword * 2), ("first", ctypes.c_int64),
+                    ("second", ctypes.c_int64), ("multi", dword)]
+    class Item(ctypes.Structure):
+        _fields_ = [("name", ctypes.c_wchar_p), ("raw", Raw)]
+    def bind(name, *args):
+        fn = getattr(pdh, name)
+        fn.argtypes, fn.restype = list(args), dword
+        return fn
+    open_query = bind('PdhOpenQueryW', ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(handle))
+    add = bind('PdhAddEnglishCounterW', handle, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(handle))
+    collect_data = bind('PdhCollectQueryData', handle)
+    array = bind('PdhGetRawCounterArrayW', handle, ctypes.POINTER(dword), ctypes.POINTER(dword), ctypes.c_void_p)
+    close = bind('PdhCloseQuery', handle)
+    def check(status):
+        if status:
+            raise PerfError(f"PDH GPU counter failed: {status:#x}")
+    query, counter = handle(), handle()
+    check(open_query(None, 0, ctypes.byref(query)))
+    path = rf"\GPU Process Memory(pid_{pid}_*)\Dedicated Usage"
+    try:
+        check(add(query, path, 0, ctypes.byref(counter)))
+        check(collect_data(query))
+        size, count = dword(), dword()
+        status = array(counter, ctypes.byref(size), ctypes.byref(count), None)
+        if status != 0x800007D2 or not size.value:  # PDH_MORE_DATA
+            raise PerfError(f"GPU instances unavailable: {status:#x}")
+        buffer = ctypes.create_string_buffer(size.value)
+        check(array(counter, ctypes.byref(size), ctypes.byref(count), buffer))
+        rows = []
+        for item in ctypes.cast(buffer, ctypes.POINTER(Item * count.value)).contents:
+            if item.raw.status not in (0, 1) or item.raw.first < 0 or not item.name.startswith(f'pid_{pid}_'):
+                raise PerfError("invalid or foreign GPU counter instance")
+            rows.append({"name": item.name, "bytes": item.raw.first})
+        if not rows:
+            raise PerfError("no GPU Process Memory instances for owned process")
+        return {"path": path, "instances": rows, "dedicated_bytes": sum(row['bytes'] for row in rows)}
+    finally:
+        close(query)
+
+
+def idle_delta(before: dict, after: dict) -> dict:
+    if (before['pid'], before['birth']) != (after['pid'], after['birth']):
+        raise PerfError("idle process identity changed")
+    cpu_parts = [after[k] - before[k] for k in ('kernel_100ns', 'user_100ns')]
+    cpu = sum(cpu_parts) / 10000
+    if any(value < 0 for value in cpu_parts) or after['begin_ns'] < before['end_ns']:
+        raise PerfError("negative process CPU delta")
+    old = {(row['tid'], row['birth']): row['switches'] for row in before['threads']}
+    new = {(row['tid'], row['birth']): row['switches'] for row in after['threads']}
+    # Endpoint counters cannot account for threads that exited during the interval.
+    # Refuse churn instead of inventing a complete process switch total.
+    if old.keys() != new.keys():
+        raise PerfError("thread population changed; context-switch interval incomplete")
+    return {"process.cpu": (cpu, "ms"), "threads.context_switches": (sum((new[k] - old[k]) & 0xFFFFFFFF for k in old), ""),
+            "idle.wall": ((after['begin_ns'] - before['end_ns']) / 1e6, "ms")}
+
+
+UI_KEYS = {"palette": "ctrl+shift+p", "menu": "ctrl+shift+m", "settings": "ctrl+comma", "keybinds": "ctrl+shift+slash"}
+
+
+def keybind_frames(text: str) -> list[dict]:
+    """Each paint timing ends a frame; count layouts since the previous paint on that thread."""
+    pending, frames = {}, []
+    for line in text.splitlines():
+        match = re.match(r"^\d{2}:\d{2}:\d{2}\.\d{3} \[(\d+)\] ", line)
+        thread = match.group(1) if match else "unstamped"
+        samples = parse_text(line)
+        pending[thread] = pending.get(thread, 0) + sum(samples.values.get('d2d.layout_create', []))
+        if 'keybinds.paint' in samples.values:
+            frames.append({"thread": thread, "layouts": pending[thread], "paint_ms": samples.values['keybinds.paint'][0]})
+            pending[thread] = 0
+    return frames
+
+
+def wait_until(predicate, description: str, timeout: float = 10):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = predicate()
+        if result:
+            return result
+        if time.monotonic() >= deadline:
+            raise PerfError(f"timeout waiting for {description}")
+        time.sleep(0.02)
+
+
+def open_ui(instance, name: str):
+    instance.press(UI_KEYS[name])
+    return wait_until(lambda: next((p for p in instance.popups() if p.cls == 'GhosttyGxPopup'), None), name)
+
+
+def close_ui(instance):
+    instance.press('escape')
+    wait_until(lambda: not any(p.cls == 'GhosttyGxPopup' for p in instance.popups()), 'popup close')
+    time.sleep(0.25)
+
+
+def main_windows(gui, instance):
+    return [w for w in instance.windows() if w.cls == gui.WINDOW_CLASS and not w.toolwindow]
+
+
+def populate(gui, instance, tabs: int, windows: int):
+    """All terminals belong to one owned PID; creation uses default keybindings."""
+    for window_index in range(windows):
+        if window_index:
+            previous = {w.hwnd for w in main_windows(gui, instance)}
+            instance.press('ctrl+shift+n')
+            current = wait_until(lambda: next((w for w in main_windows(gui, instance)
+                                              if w.hwnd not in previous and w.visible and not w.cloaked), None), 'new window')
+        else:
+            current = instance.require_window()
+        if not gui.win32().activate(current.hwnd):
+            raise gui.InputBlocked('cannot activate the owned window')
+        for _ in range(tabs - 1):
+            before = {w.hwnd for w in gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)}
+            instance.press(NEW_TAB_KEYS)
+            wait_until(lambda: any(w.hwnd not in before and w.visible for w in
+                                   gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)), 'new tab')
+        actual = len(gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS))
+        if actual != tabs:
+            raise PerfError(f"expected {tabs} terminal children, found {actual}")
+    if len(main_windows(gui, instance)) != windows:
+        raise PerfError('window count differs from requested topology')
+    time.sleep(1)
+
+
+class CaptureRun:
+    def __init__(self, instance, target: Path, report: dict):
+        self.instance, self.target, self.report = instance, target, report
+        self.samples = Samples()
+        report['windows'] = []
+        report['observations'] = {}
+
+    def mark(self) -> bytes:
+        return self.instance.log.read_bytes() if self.instance.log.exists() else b''
+
+    def window(self, name: str, before: bytes) -> str:
+        after = self.mark()
+        if not after.startswith(before):
+            raise PerfError('log truncated or replaced during measurement')
+        text = after[len(before):].decode('utf-8', errors='strict')
+        self.report['windows'].append({'name': name, 'start_byte': len(before), 'end_byte': len(after)})
+        return text
+
+    def add(self, name: str, value: float, unit: str = ''):
+        self.samples.add(name, value, unit or None)
+
+    def count(self, text: str, name: str):
+        parsed = parse_text(text)
+        if name in parsed.units and parsed.units[name]:
+            raise PerfError(f'{name}: expected an unscaled count')
+        values = parsed.values.get(name, [])
+        self.add(name, sum(values))
+        self.report['observations'][name] = {'events': len(values), 'absent_is_zero_observed_events': not values,
+                                            'instrumentation_support': 'caller must verify source/build identity'}
+
+    def screenshot(self, name: str, info=None):
+        info = info or self.instance.require_window()
+        self.instance.capture_window(info).save_png(self.target / (name + '.png'))
+
+
+def measure_ui(gui, instance, capture: CaptureRun, args):
+    case = args.case
+    if case == 'p3':
+        populate(gui, instance, 15, 3)
+        current = next(w for w in main_windows(gui, instance) if w.hwnd == gui.win32().foreground())
+        scale = instance.scale(current)
+        x, y = instance.caption_point(current)
+        before = capture.mark()
+        instance.drag((round(x), round(y)), (round(x + 120 * scale), round(y + 40 * scale)), steps=60, step_delay=2 / 60)
+        time.sleep(0.3)
+        capture.count(capture.window('drag', before), 'scrollbar.paint')
+        moved = next(w for w in main_windows(gui, instance) if w.hwnd == current.hwnd)
+        if moved.rect[:2] == current.rect[:2]:
+            raise PerfError('title-bar drag did not move the window')
+        capture.screenshot('drag', moved)
+    elif case == 'p4':
+        for name in ('palette', 'menu', 'settings'):
+            open_ui(instance, name)
+            time.sleep(0.6)
+            close_ui(instance)
+            hot, scans = [], []
+            for index in range(3):
+                before = capture.mark()
+                popup = open_ui(instance, name)
+                time.sleep(0.4)
+                text = capture.window(f'{name}-hot-{index + 1}', before)
+                parsed = parse_text(text)
+                values = parsed.values.get(f'{name}.open.total', [])
+                if len(values) != 1 and not args.diagnostic:
+                    raise PerfError(f'{name}: expected one hot .open.total, got {len(values)}')
+                hot.extend(values)
+                scans.extend(parsed.values.get('profiles.path_scan', []))
+                capture.screenshot(f'{name}-hot-{index + 1}', popup)
+                close_ui(instance)
+            if hot:
+                capture.add(f'{name}.open.total', statistics.median(hot), 'ms')
+            capture.report['observations'][name] = {'hot_ms': hot, 'profiles.path_scan': scans}
+            capture.add(f'{name}.profiles.path_scan', sum(scans))
+    elif case == 'p5':
+        popup = open_ui(instance, 'keybinds')
+        time.sleep(0.6)
+        instance.press('ctrl+home')
+        time.sleep(0.2)
+        # Keybinds has no UIA row provider. Sweep every 8 DIP (rows >=32 DIP)
+        # and overlap wheel pages, so each visible entry receives hover without
+        # invoking a private hook. Crop out the blinking search caret and scrollbar.
+        scale = instance.scale(instance.require_window())
+        left, top, right, bottom = gui.win32().client_rect(popup.hwnd)
+        x = round((left + right) / 2)
+        first_y, last_y = round(top + 112 * scale), round(bottom - 8 * scale)
+        viewport = (round(left + 24 * scale), first_y, round(right - 24 * scale), last_y)
+        frames, pages = [], []
+        def fingerprint():
+            image = instance.capture_window(popup)
+            return hashlib.sha256(gui.crop(image, viewport).bgra).hexdigest()
+        for page in range(100):
+            before = capture.mark()
+            points = list(range(first_y, last_y, max(1, round(8 * scale))))
+            for y in points:
+                instance.mouse(x, y, action='move')
+                time.sleep(0.05)
+            time.sleep(0.1)
+            frames.extend(keybind_frames(capture.window(f'hover-page-{page + 1}', before)))
+            pages.append({'page': page + 1, 'points': len(points)})
+            old_image = fingerprint()
+            instance.wheel(x, points[-1], delta=-120, count=1)
+            time.sleep(0.3)
+            if fingerprint() == old_image:
+                break
+        else:
+            raise PerfError('shortcut sheet did not reach its last page')
+        capture.report['frames'] = frames
+        capture.report['hover_pages'] = pages
+        capture.report['hover_strategy'] = '8 DIP vertical sweep, overlapping 3-row wheel pages; unchanged viewport ends traversal'
+        for frame in frames:
+            capture.add('keybinds.paint', frame['paint_ms'], 'ms')
+            capture.add('d2d.layout_create.per_frame', frame['layouts'])
+        if not frames and not args.diagnostic:
+            raise PerfError('no keybinds.paint frames')
+        capture.screenshot('keybinds', popup)
+        close_ui(instance)
+    else:
+        popup = open_ui(instance, 'settings')
+        time.sleep(0.6)
+        instance.press('ctrl+pagedown')  # Language -> Appearance; default focus is the theme list.
+        time.sleep(0.5)
+        rows = instance.uia_rows(popup.hwnd)
+        if not any(row['type'] == 'ControlType.ListItem' for row in rows):
+            raise PerfError('theme page has no theme list items')
+        before = capture.mark()
+        instance.hold_key('down', seconds=2, hz=30)
+        time.sleep(1)  # Include the debounced preview after release, before closing/reverting it.
+        capture.count(capture.window('theme-hold', before), 'theme.reload')
+        capture.screenshot('theme', popup)
+        close_ui(instance)
+
+
+def measure_idle(gui, instance, capture: CaptureRun, args, counters):
+    populate(gui, instance, args.tabs, args.windows)
+    windows = main_windows(gui, instance)
+    if args.state == 'minimized':
+        for window in windows:
+            instance.ensure_owned()
+            gui.win32().ShowWindow(window.hwnd, 6)  # SW_MINIMIZE, owned windows only.
+    elif args.state == 'unfocused':
+        # Focus a second owned, isolated Ghostty process. Never activate an unrelated app.
+        helper_dir = capture.target / 'focus-env'
+        gui.prepare_env_dir(helper_dir, fresh=False)
+        helper = gui.launch(Path(instance.exe), helper_dir, config=DEFAULT_WIN32_CONFIG + gui.HARNESS_CONFIG)
+        capture.report['focus_helper'] = {'pid': helper.pid, 'creation': helper.creation, 'separate_process': True}
+        try:
+            helper.wait_window(30)
+            helper.activate()
+            return idle_interval(gui, instance, capture, args, counters)
+        finally:
+            helper.close()
+    return idle_interval(gui, instance, capture, args, counters)
+
+
+def idle_interval(gui, instance, capture, args, counters):
+    time.sleep(2)
+    before_log = capture.mark()
+    before = counters.sample(instance)
+    time.sleep(args.seconds)
+    after = counters.sample(instance)
+    capture.report.update(before=before, after=after,
+        context_switch_source='NtQuerySystemInformation(SystemProcessInformation), matched TID+CreateTime endpoints; endpoint churn rejected',
+        context_switch_scope='endpoint-surviving threads only; threads born and exited between endpoints are not observable')
+    if args.state == 'visible' and gui.win32().window_pid(gui.win32().foreground()) != instance.pid:
+        raise PerfError('visible measured process lost focus')
+    if args.state == 'unfocused' and gui.win32().window_pid(gui.win32().foreground()) == instance.pid:
+        raise PerfError('measured process regained focus')
+    if args.state == 'minimized' and not all(gui.win32().IsIconic(w.hwnd) for w in main_windows(gui, instance)):
+        raise PerfError('a measured window was restored')
+    text = capture.window('idle', before_log)
+    for name in ('proc.snapshot', 'renderer.present'):
+        capture.count(text, name)
+    for name, (value, unit) in idle_delta(before, after).items():
+        capture.add(name, value, unit)
+
+
+def measure_resources(gui, instance, capture: CaptureRun, args, counters):
+    samples = []
+    for count in (1, 11):
+        if count == 11:
+            current = instance.require_window()
+            for expected in range(2, 12):
+                instance.press(NEW_TAB_KEYS)
+                wait_until(lambda: len(gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)) == expected, 'terminal count')
+        time.sleep(2)
+        raw = counters.sample(instance)
+        if args.command == 'win32-gpu':
+            raw['gpu'] = counters.gpu(instance)
+            capture.add(f'gpu.dedicated.{count}', raw['gpu']['dedicated_bytes'])
+            metrics = parse_text(instance.log_text())
+            gauges = {name: values[-1] for name, values in metrics.values.items() if name.startswith('renderer.targets_')}
+            raw['target_gauges'] = gauges
+            for name, value in gauges.items():
+                capture.add(f'{name}.{count}', value)
+        capture.add(f'process.commit.{count}', raw['private_bytes'])
+        capture.add(f'process.threads.{count}', raw['thread_count'])
+        samples.append(raw)
+        capture.screenshot(f'terminals-{count}')
+    capture.report['resources'] = samples
+    added_threads = samples[1]['thread_count'] - samples[0]['thread_count']
+    added_commit = samples[1]['private_bytes'] - samples[0]['private_bytes']
+    capture.add('process.commit.delta', added_commit)
+    capture.add('process.threads.delta', added_threads)
+    if added_threads <= 0:
+        raise PerfError('no positive thread-count increment at 11 terminals')
+    capture.add('process.commit.per_added_thread', added_commit / added_threads)
+    if args.command == 'win32-gpu':
+        capture.add('gpu.dedicated.per_added_terminal', (samples[1]['gpu']['dedicated_bytes'] - samples[0]['gpu']['dedicated_bytes']) / 10)
+
+
+def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
+    if gui is None:
+        import gx_win_gui as gui
+    exes = [Path(path).resolve() for path in args.exe]
+    if not 1 <= len(exes) <= 2 or any(not exe.is_file() for exe in exes):
+        raise PerfError('give one or two existing --exe files')
+    labels = labels_for(len(exes), args.label)
+    try:
+        envs = label_environments(labels, ['GHOSTTY_GX_PERF=1', *args.env], args.label_env, gui.env_assignments)
+    except gui.GuiError as exc:
+        raise PerfError(str(exc)) from None
+    if any(env.get('GHOSTTY_GX_PERF') != '1' for env in envs.values()):
+        raise PerfError('measurement requires GHOSTTY_GX_PERF=1')
+    config = args.config.read_text(encoding='utf-8') if args.config else DEFAULT_WIN32_CONFIG
+    config = config.rstrip() + '\n' + gui.HARNESS_CONFIG
+    out = new_output(args.out)
+    batch = {'schema': 'gx-win32-perf-v1', 'command': args.command, 'case': getattr(args, 'case', None),
+             'order': 'AB/BA', 'planned_runs': args.runs, 'labels': labels, 'diagnostic': args.diagnostic,
+             'performance_verdict': 'not evaluated', 'runs': [], 'errors': [], 'metrics': {},
+             'measurement_units': {'process.commit.*': 'bytes', 'gpu.dedicated.*': 'bytes',
+                                   'process.commit.per_added_thread': 'bytes/thread', 'gpu.dedicated.per_added_terminal': 'bytes/terminal',
+                                   'process.threads.*': 'threads', 'time': 'ms', 'other_unitless': 'count/gauge'}}
+    sets = {label: Samples() for label in labels}
+    for run, label in alternate(labels, args.runs):
+        target = out / label / f'run-{run:02d}'
+        target.mkdir(parents=True)
+        exe = exes[labels.index(label)]
+        report = {'schema': 'gx-win32-perf-run-v1', 'label': label, 'run': run, 'command': args.command,
+                  'case': getattr(args, 'case', None), 'env': envs[label], 'config': config, 'diagnostic': args.diagnostic,
+                  'exe': str(exe), 'exe_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
+                  'state': getattr(args, 'state', None), 'tabs': getattr(args, 'tabs', None), 'windows_count': getattr(args, 'windows', None),
+                  'seconds': getattr(args, 'seconds', None), 'status': 'running', 'errors': []}
+        write_json(target / 'run.json', report)
+        batch['runs'].append({'label': label, 'run': run, 'path': str(target.relative_to(out)), 'status': 'running'})
+        write_json(out / 'RESULT.json', batch)
+        instance = capture = None
+        try:
+            gui.prepare_env_dir(target / 'env', fresh=False)
+            instance = gui.launch(exe, target / 'env', config=config, env=envs[label])
+            report.update(pid=instance.pid, creation=instance.creation, startup_ms=instance.wait_window(30))
+            instance.activate()
+            time.sleep(1)
+            capture = CaptureRun(instance, target, report)
+            if args.command == 'win32-ui':
+                measure_ui(gui, instance, capture, args)
+            elif args.command == 'win32-idle':
+                measure_idle(gui, instance, capture, args, counters_factory(gui))
+            else:
+                measure_resources(gui, instance, capture, args, counters_factory(gui))
+            instance.ensure_owned()
+            if hashlib.sha256(exe.read_bytes()).hexdigest() != report['exe_sha256']:
+                raise PerfError('executable changed during run')
+            report['status'] = 'completed'
+        except (OSError, ValueError, PerfError, gui.GuiError, subprocess.SubprocessError) as exc:
+            report['status'] = 'failed'
+            report['errors'].append(str(exc))
+        finally:
+            if instance:
+                try:
+                    report['cleanup'] = instance.close()
+                except (OSError, gui.GuiError) as exc:
+                    report['status'] = 'failed'
+                    report['errors'].append('cleanup: ' + str(exc))
+                if instance.log.exists():
+                    (target / 'ghostty.log').write_bytes(instance.log.read_bytes())
+            if capture:
+                report['metrics'] = summary_table(capture.samples)[1]
+                # A dedicated derived file is the only round-level summary input.
+                lines = [f"metric {name} {value} {capture.samples.units[name]}".rstrip()
+                         for name, values in capture.samples.values.items() for value in values]
+                (target / 'samples.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+                if report['status'] == 'completed':
+                    sets[label].extend(capture.samples)
+            write_json(target / 'run.json', report)
+            batch['runs'][-1]['status'] = report['status']
+            batch['errors'].extend(f'{label}/{run}: {error}' for error in report['errors'])
+            write_json(out / 'RESULT.json', batch)
+        print(f"{TAG} {label}/{run}: {report['status']}", flush=True)
+        if report['status'] != 'completed':
+            break  # Never retry or continue input after a failed guard.
+    batch['valid'] = not batch['errors'] and len(batch['runs']) == args.runs * len(labels)
+    texts = []
+    for label in labels:
+        text, batch['metrics'][label] = summary_table(sets[label])
+        texts.append(label + '\n' + text)
+    if len(labels) == 2:
+        text, batch['comparison'] = compare_table(sets[labels[0]], sets[labels[1]], tuple(labels))
+        texts.append(text)
+    text = 'Driver evidence only; no performance verdict. Absent events do not prove instrumentation support.\n' + '\n'.join(texts)
+    if batch['errors']:
+        text += '\nFAILED: ' + '; '.join(batch['errors']) + '\n'
+    (out / 'SUMMARY.txt').write_text(text, encoding='utf-8', newline='\n')
+    write_json(out / 'RESULT.json', batch)
+    write_json(args.json, batch)
+    print(text)
+    return 0 if batch['valid'] else 1
+
+
+def run_remote(args) -> int:
+    files = [p for p in sample_files(args.paths) if p.suffix in SAMPLE_SUFFIXES]
+    samples = Samples()
+    for path in files:
+        text = path.read_text(encoding='utf-8', errors='strict')
+        parse_text('\n'.join(line for line in text.splitlines() if re.search(r'(?:metric\s+|\(gx_perf\):\s+)remote\.', line)), samples)
+    remote = Samples()
+    for name, values in samples.values.items():
+        if name.startswith('remote.'):
+            for value in values:
+                remote.add(name, value, samples.units[name] or None)
+    if not remote:
+        raise PerfError('no remote.* metrics in fixture logs')
+    text, report = summary_table(remote)
+    result = {'schema': 'gx-remote-perf-v1', 'metrics': report, 'performance_verdict': 'not evaluated',
+              'source_files': [str(p) for p in files], 'units': 'ms for timings; unitless gauges/counts'}
+    print(text)
+    if args.out:
+        out = new_output(args.out)
+        (out / 'SUMMARY.txt').write_text(text, encoding='utf-8', newline='\n')
+        write_json(out / 'RESULT.json', result)
+    write_json(args.json, result)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Measurement runs
 # ---------------------------------------------------------------------------
@@ -737,7 +1339,7 @@ def run_win32(args: argparse.Namespace) -> int:
     import gx_win_gui as gui
 
     try:
-        env = gui.env_assignments(args.env)
+        gui.env_assignments(args.env)
     except gui.UsageError as exc:
         raise PerfError(str(exc)) from None
     exes = [Path(path).resolve() for path in args.exe]
@@ -998,6 +1600,28 @@ def build_parser() -> argparse.ArgumentParser:
     quiet.add_argument("--wait", action="store_true")
     quiet.add_argument("--interval", type=float, default=900)
     quiet.add_argument("--max-attempts", type=int, default=3)
+    remote = commands.add_parser('remote', allow_abbrev=False, help='summarize remote.* fixture logs only')
+    remote.add_argument('paths', nargs='+', type=Path)
+    remote.add_argument('--out', type=Path)
+    remote.add_argument('--json', type=Path)
+    for name in ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem'):
+        experiment = commands.add_parser(name, allow_abbrev=False, help='isolated AB/BA Windows measurement')
+        experiment.add_argument('--exe', action='append', required=True)
+        experiment.add_argument('--label', action='append', default=[])
+        experiment.add_argument('--env', action='append', default=[])
+        experiment.add_argument('--label-env', action='append', default=[], metavar='LABEL:NAME=VALUE')
+        experiment.add_argument('--out', type=Path, required=True)
+        experiment.add_argument('--json', type=Path)
+        experiment.add_argument('--config', type=Path)
+        experiment.add_argument('--runs', type=int, default=10, help='runs per label; odd rounds AB, even rounds BA')
+        experiment.add_argument('--diagnostic', action='store_true', help='development smoke; allow absent timing instrumentation')
+        if name == 'win32-ui':
+            experiment.add_argument('--case', choices=('p3', 'p4', 'p5', 'p6'), required=True)
+        if name == 'win32-idle':
+            experiment.add_argument('--tabs', type=int, default=1)
+            experiment.add_argument('--windows', type=int, default=1)
+            experiment.add_argument('--state', choices=('visible', 'unfocused', 'minimized'), default='visible')
+            experiment.add_argument('--seconds', type=float, default=60)
     return parser
 
 
@@ -1016,6 +1640,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "quiet":
             return run_quiet(args)
+        if args.command == 'remote':
+            return run_remote(args)
         if args.command == "summarize":
             samples = collect(args.paths)
             if not samples:
@@ -1042,10 +1668,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.runs < 1:
             raise PerfError("--runs must be at least 1")
+        if args.command.startswith('win32-'):
+            if args.command == 'win32-idle' and (not 1 <= args.tabs <= 64 or not 1 <= args.windows <= 16 or
+                                                not math.isfinite(args.seconds) or args.seconds <= 0):
+                raise PerfError('invalid --tabs, --windows or --seconds')
+            return run_experiment(args)
         if args.command == "win32":
             return run_win32(args)
         return run_gtk(args)
-    except PerfError as exc:
+    except (PerfError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"{TAG} error: {exc}", file=sys.stderr)
         write_json(args.json, {"_validation": {"status": "rejected", "identity": "unverified", "errors": [str(exc)]}})
         return 2
