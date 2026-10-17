@@ -1,5 +1,9 @@
 id = "W02"
 title = "Editing chords in the search bar stay in the search box and never reach the shell"
+# R0: the first two screenshots. Phase 6 (r6) extends the case for the R2-Find leaves: the
+# counter, Enter/F3/Shift+F3 from the bar and the terminal, a button tooltip, focus without a
+# caret, No results, the 240 DIP clamp in a narrow pane, the hovered-URL preview and the resize
+# overlay.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
@@ -7,6 +11,16 @@ language = en
 expect = [
   "search-box: the typed text and the editing chords stayed in the search box (word-wise editing removes the words abc and x; until the text editor gets word boundaries Ctrl+Backspace and Ctrl+Delete remove one character, leaving `needle ab`)",
   "shell-clean: after Esc the prompt line `> ` is empty: no needle, abc, ^Q or stray characters",
+  "counter: the reopened bar reads needle and its counter shows {current}/6 (three matches on the command line, three in the output); the bar is 380 DIPs wide (570 px at 144 DPI) at the top-right of the terminal",
+  "enter-next: Enter in the bar moved the current match; the total stayed 6",
+  "tooltip: resting on the next button shows the tooltip Next Match (Enter) below the bar",
+  "terminal-focus: after a click in the terminal the bar is still shown, without a caret in its field",
+  "f3: F3 pressed while the terminal has the focus moved the current match forward; shift-f3: Shift+F3 moved it back",
+  "no-results: the field reads zzqx with the caution border, the counter says No results in the caution color",
+  "narrow-clamp: in the narrow right pane the bar keeps its 240 DIP minimum (360 px at 144 DPI) and still shows the counter",
+  "link-left: with Ctrl held on the long URL, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
+  "link-right: with the pointer on the bubble's place (the bottom row), the bubble moved to the bottom-right corner",
+  "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
 ]
 
 # Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch.
@@ -72,3 +86,313 @@ seconds = 0.3
 [[step]]
 action = "capture"
 name = "shell-clean"
+
+# --- r6 extension (R2-Find.01-05) -----------------------------------------------------------
+# Six matches: three on the command line, three in its output.
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "type"
+text = "echo needle one& echo needle two& echo needle three\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+# Reopening keeps the previous text selected; Ctrl+A and typing replace it.
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "needle"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "counter"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "enter-next"
+what = "all"
+
+# The next button sits 60 DIPs left of the terminal's right edge and 30 DIPs down: the bar has
+# an 8 DIP margin and is 44 high; its buttons are 28 wide, 8 from its end, 2 apart.
+[[step]]
+action = "move"
+in = "terminal:0"
+x = -60
+y = 30
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "tooltip"
+what = "all"
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "75%"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "terminal-focus"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f3"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "f3"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "shift+f3"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "shift-f3"
+what = "all"
+
+# Back into the bar: nothing matches.
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "zzqx"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "no-results"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# A narrow pane: the second right split halves the right half again and takes the focus.
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "needle"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "narrow-clamp"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# Back to one pane: exit the two new panes.
+[[step]]
+action = "type"
+text = "exit\n"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "click"
+in = "terminal:1"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "type"
+text = "exit\n"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+# A long URL on the last rows: blank lines push it down, set /p prints it without a newline.
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "type"
+text = "for /L %i in (1,1,60) do @echo.\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "type"
+text = "<nul set /p =https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+# The core reports a hovered link only while Ctrl is down. Held presses keep the bubble up, and
+# it stays 250 ms after the last release (the leave delay): long enough for the capture.
+[[step]]
+action = "move"
+in = "terminal:0"
+x = 60
+y = -50
+
+[[step]]
+action = "key"
+keys = "ctrl"
+repeat = 10
+delay = 0.1
+
+[[step]]
+action = "capture"
+name = "link-left"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+# At the start of the bottom row the pointer is over the bubble's place: it moves to the right.
+[[step]]
+action = "move"
+in = "terminal:0"
+x = 8
+y = -12
+
+[[step]]
+action = "key"
+keys = "ctrl"
+repeat = 10
+delay = 0.1
+
+[[step]]
+action = "capture"
+name = "link-right"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "resize"
+width = 1500
+height = 1000
+
+[[step]]
+action = "sleep"
+seconds = 0.25
+
+[[step]]
+action = "capture"
+name = "resize-overlay"
+what = "all"
