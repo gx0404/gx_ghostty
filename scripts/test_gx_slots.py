@@ -25,6 +25,19 @@ class SlotTests(unittest.TestCase):
                 pass
             self.assertEqual(before, {p.name: p.read_bytes() for p in root.iterdir()})
 
+    def test_holders_read_owner_records_without_locking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertEqual([], gx_slots.holders(root))
+            with gx_slots.acquire(root, 'heavy'):
+                held = gx_slots.holders(root)
+                self.assertEqual([('heavy-1.lock', gx_slots.os.getpid(), 'heavy')],
+                                 [(row['lock'], row['pid'], row['kind']) for row in held])
+                self.assertEqual(0, self.attempt(root, 'heavy').returncode)
+            self.assertEqual([], gx_slots.holders(root))
+            (root / 'desktop-1.lock').write_bytes(b'\0{"pid": 7, "kind": "desk')
+            self.assertEqual([], gx_slots.holders(root))
+
     def test_default_root_uses_git_common_dir(self):
         with tempfile.TemporaryDirectory() as temp:
             common = Path(temp) / 'main' / '.git'

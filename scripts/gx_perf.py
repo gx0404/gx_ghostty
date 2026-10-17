@@ -725,10 +725,13 @@ class QuietProbe:
             raise PerfError("Windows process inventory is missing")
         return data
 
-    def wsl(self, distro: str) -> dict:
+    def registered(self, distro: str) -> None:
         registered = command_output(['wsl.exe', '--list', '--quiet'])
         if distro.casefold() not in {line.strip().casefold() for line in registered.splitlines()}:
             raise PerfError(f'WSL distribution is not registered: {distro}')
+
+    def wsl(self, distro: str) -> dict:
+        self.registered(distro)
         running = command_output(["wsl.exe", "--list", "--running", "--quiet"])
         rows = []
         active = [line.strip() for line in running.splitlines() if line.strip()]
@@ -928,6 +931,38 @@ def guard_evidence(path: Path, batch_id: str, *, command_failed: bool = False) -
     return {**result, 'state': 'pass', 'reason': f'{len(guards)} audited input guards passed'}
 
 
+FILETIME_UNIX_EPOCH = 116444736000000000  # 100 ns intervals from 1601-01-01 to 1970-01-01
+
+
+def batch_preflight(args, probe) -> dict:
+    """Fail before waiting for locks when the batch could never start: an
+    unregistered distribution, a session that GetLastInputInfo cannot observe,
+    or a quiet-batch nested under its own slot holder (gx_slots.py, Invoke-Heavy
+    or Invoke-Desktop), which would only time out after --timeout."""
+    import gx_slots
+    probe.registered(args.distro)
+    session = probe.session()
+    if not session.get('interactive_console'):
+        raise PerfError(f'not in the active console session: {session}')
+    holders = gx_slots.holders(args.slot_root)
+    nested = []
+    if holders:
+        cim = probe.windows().get('cim') or []
+        chain, _ = ancestor_exclusions(cim, os.getpid())
+        born = {row['pid']: row.get('created') for row in cim}
+        for holder in holders:
+            created, started = born.get(holder['pid']), holder.get('started_ns')
+            # A verified self/ancestor that took the lock after it was created
+            # (1 s clock slack); a stale record of a recycled PID predates it.
+            if chain.get(holder['pid']) in ('self', 'ancestor') and isinstance(created, int) and isinstance(started, int) \
+                    and started >= (created - FILETIME_UNIX_EPOCH) * 100 - 1_000_000_000:
+                nested.append(holder)
+    if nested:
+        raise PerfError(f'quiet-batch is nested under its own slot holder {nested}; '
+                        'run it directly, never inside gx_slots.py, Invoke-Heavy or Invoke-Desktop')
+    return {'distro_registered': args.distro, 'session': session, 'slot_holders': holders}
+
+
 BATCH_GUIDANCE = {
     'VALID': 'Quiet criteria met at the start and end checks and the command completed; '
              'the measurement RESULT/SUMMARY carries the performance verdict.',
@@ -1006,8 +1041,10 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     write_json(out / 'RESULT.json', result)
     try:
         args.slot_root = validate_slot_root(args.slot_root or shared_slots_root())
-        # Wait first, then check inside the lease. A previous quiet snapshot is
-        # never an authorization to run after waiting for resources.
+        result['preflight'] = batch_preflight(args, probe)
+        write_json(out / 'RESULT.json', result)
+        # Wait first, then check inside the lease. Neither the preflight nor a
+        # previous quiet snapshot authorizes running after waiting for resources.
         with gx_slots.acquire(args.slot_root, 'quiet', args.timeout) as lease:
             before = quiet_snapshot(args, probe, lease=lease)
             write_json(out / 'before.json', before)

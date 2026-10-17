@@ -46,6 +46,29 @@ class Lease:
         return True
 
 
+def holders(root: Path) -> list[dict]:
+    """Owner records of the four shared locks, read without taking any lock.
+
+    An owner writes its record after byte 0 under its own byte-0 lock and
+    truncates it on release, so a record names a current owner (or one that
+    crashed). Reading past byte 0 never touches the locked byte."""
+    found = []
+    for name in QUIET_NAMES:
+        try:
+            with (root / name).open('rb') as stream:
+                stream.seek(1)
+                raw = stream.read()
+        except FileNotFoundError:
+            continue
+        try:
+            meta = json.loads(raw.decode('ascii')) if raw.strip() else None
+        except (UnicodeDecodeError, ValueError):
+            meta = None  # an owner may be mid-write; not evidence of anything
+        if isinstance(meta, dict) and isinstance(meta.get('pid'), int):
+            found.append({'lock': name, 'pid': meta['pid'], 'kind': meta.get('kind'), 'started_ns': meta.get('started_ns')})
+    return found
+
+
 def lock(stream) -> bool:
     stream.seek(0)
     try:

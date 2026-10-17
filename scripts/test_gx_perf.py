@@ -422,6 +422,32 @@ class QuietBatchTests(unittest.TestCase):
             return SimpleNamespace(returncode=code)
         return runner
 
+    def test_preflight_rejects_impossible_batches_before_waiting_for_locks(self):
+        import gx_slots
+        args = self.batch_args('--timeout', '14400')
+        self.probe.registered.side_effect = gx_perf.PerfError('WSL distribution is not registered: typo')
+        with mock.patch.object(gx_slots, 'acquire', side_effect=AssertionError('waited for locks')):
+            exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((2, 'NOT_STARTED', 'NOT_RUN'), (exit_code, result['status'], result['measurement']))
+        self.assertIn('not registered', ' '.join(result['errors']))
+        self.assertFalse((args.out / 'before.json').exists())
+        self.probe.registered.side_effect = None
+        args.out = self.args.out.parent / 'nested'
+        born = gx_perf.FILETIME_UNIX_EPOCH + (gx_perf.time.time_ns() - 10_000_000_000) // 100
+        self.probe.windows.return_value = {'inventory_pid': None, 'processes': [{'pid': 1, 'name': 'x', 'title': ''}],
+                                           'cim': [{'pid': gx_perf.os.getpid(), 'ppid': 0, 'name': 'python.exe', 'created': born}]}
+        with gx_slots.acquire(args.slot_root, 'heavy'), mock.patch.object(gx_slots, 'acquire', side_effect=AssertionError('waited')):
+            exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((2, 'NOT_STARTED'), (exit_code, result['status']))
+        self.assertIn('never inside gx_slots.py, Invoke-Heavy or Invoke-Desktop', ' '.join(result['errors']))
+        # A record left by another (or recycled) PID is not nesting: the batch proceeds.
+        args.out = self.args.out.parent / 'foreign-record'
+        (args.slot_root / 'heavy-2.lock').write_bytes(b'\0' + json.dumps({'pid': 999999, 'kind': 'heavy', 'started_ns': 1}).encode())
+        self.probe.windows.return_value = windows_data({'pid': 10, 'name': 'ghostty', 'title': 'test'})
+        exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((0, 'VALID'), (exit_code, result['status']))
+        self.assertEqual([999999], [row['pid'] for row in result['preflight']['slot_holders']])
+
     def test_gate_fail_under_valid_checks_is_fail_not_invalid(self):
         cases = [  # (flags, command exit, guard, exit, status, quiet, measurement)
             ((), 4, None, 4, 'FAIL', 'VALID', 'GATE_FAIL'),
