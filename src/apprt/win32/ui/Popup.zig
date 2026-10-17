@@ -298,6 +298,9 @@ uia_cookie: u64 = 0,
 uia_refreshing: bool = false,
 uia_layout_pending: bool = true,
 visible: bool = false,
+/// An invalidated host may finish its active transaction, but cannot be reused
+/// by a later opening (configuration/DPI/device generation changed).
+reuse_invalid: bool = false,
 open_timing: ?OpenTiming = null,
 dpi: u32 = 96,
 /// The owner's content scale relative to its window DPI (`setOwnerScale`),
@@ -314,6 +317,8 @@ input: TextInput = .{},
 paint_scale: f32 = 0,
 /// Cloaked until the reveal timer, after the first paint.
 revealing: bool = false,
+reveal_started_ms: u64 = 0,
+successful_frame: ?OpenTiming.Frame = null,
 /// Created as a layered window for `Options.motion`; painted through `dib`.
 layered: bool = false,
 dib: d2d.DibTarget = .{},
@@ -364,6 +369,50 @@ const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
 /// How long a new popup stays cloaked after its first paint: about a
 /// frame, so DWM composed it before it appears.
 const reveal_ms: u32 = 16;
+const reveal_timeout_ms: u64 = 300;
+
+const RevealStep = enum { reveal, wait, cancel };
+
+fn revealStep(ready: bool, elapsed_ms: u64) RevealStep {
+    if (ready) return .reveal;
+    return if (elapsed_ms < reveal_timeout_ms) .wait else .cancel;
+}
+
+/// Coalesced event work, consumed only at an outer message-loop idle boundary.
+/// A blocked owner keeps its request; a consumed request never polls itself.
+pub const Preparation = struct {
+    pending: bool = true,
+
+    pub fn request(self: *Preparation) void {
+        self.pending = true;
+    }
+
+    pub fn take(self: *Preparation, eligible: bool, queue_empty: bool) bool {
+        if (!self.pending or !eligible or !queue_empty) return false;
+        self.pending = false;
+        return true;
+    }
+};
+
+test "P4 reuse preparation consumes one event at idle and never polls" {
+    var preparation: Preparation = .{};
+    try std.testing.expect(!preparation.take(false, true));
+    try std.testing.expect(!preparation.take(true, false));
+    try std.testing.expect(preparation.take(true, true));
+    for (0..100) |_| try std.testing.expect(!preparation.take(true, true));
+    preparation.request();
+    preparation.request();
+    try std.testing.expect(preparation.take(true, true));
+    try std.testing.expect(!preparation.take(true, true));
+}
+
+test "P4 reuse reveal requires a current frame and bounds failure by 300ms" {
+    try std.testing.expectEqual(RevealStep.wait, revealStep(false, 16));
+    try std.testing.expectEqual(RevealStep.wait, revealStep(false, 299));
+    try std.testing.expectEqual(RevealStep.cancel, revealStep(false, 300));
+    try std.testing.expectEqual(RevealStep.reveal, revealStep(true, 16));
+    try std.testing.expectEqual(RevealStep.reveal, revealStep(true, 300));
+}
 
 /// Create the (hidden) popup window owned by `owner`.
 pub fn create(
@@ -385,8 +434,9 @@ pub fn create(
     self.freeResources();
 
     const layered = options.motion != null and anim.enabled();
-    var ex_style: u32 = w32.WS_EX_TOOLWINDOW;
-    if (!options.activate) ex_style |= w32.WS_EX_NOACTIVATE;
+    // Hidden/prepared hosts must never activate. show restores activation for
+    // interactive widgets, hide removes it again; TOOLWINDOW excludes Alt-Tab.
+    var ex_style: u32 = w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE;
     if (layered) ex_style |= w32.WS_EX_LAYERED;
     const hwnd = w32.CreateWindowExW(
         ex_style,
@@ -483,6 +533,8 @@ pub fn setAccessibleName(self: *Popup, name: []const u8) void {
 
 /// Release the render target (it is recreated by the next paint).
 pub fn discardTarget(self: *Popup) void {
+    self.reuse_invalid = true;
+    self.successful_frame = null;
     if (self.composition) |*backend| backend.reset();
     self.composition_frame = null;
     if (self.canvas) |*canvas| canvas.discardTarget();
@@ -556,6 +608,9 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
         return;
     }
 
+    self.uiaDetach();
+    self.successful_frame = null;
+    self.setActivationStyle(self.options.activate);
     if (self.open_timing) |*timing| timing.showing = true;
     if (self.options.activate and self.options.keep_owner_active) self.lockOwner();
     const motion = if (self.layered) self.options.motion else null;
@@ -564,6 +619,7 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
     // Cloaked until it painted and DWM had a frame for it.
     setCloaked(hwnd, true);
     self.revealing = true;
+    self.reveal_started_ms = GetTickCount64();
     if (self.layered) _ = w32.SetLayeredWindowAttributes(hwnd, 0, if (animate) 0 else 255, w32.LWA_ALPHA);
 
     var start = rect;
@@ -620,6 +676,38 @@ pub fn setBounds(self: *Popup, rect: w32.RECT) void {
     self.place(hwnd, rect);
 }
 
+/// Prelayout/rasterize an owned hidden host without showing, activating,
+/// capturing input, publishing UIA or starting an opening measurement. Every
+/// real show still clears the frame proof and paints synchronously.
+pub fn prepareHidden(self: *Popup, rect: w32.RECT) void {
+    if (self.visible) return;
+    const hwnd = self.hwnd orelse return;
+    self.setBounds(rect);
+    self.dpi = dpiOf(hwnd);
+    self.repaint();
+    _ = w32.SendMessageW(hwnd, w32.WM_PAINT, 0, 0);
+}
+
+fn setActivationStyle(self: *Popup, activate: bool) void {
+    const hwnd = self.hwnd orelse return;
+    const old = w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE);
+    const next = activationStyle(old, activate);
+    if (old != next) _ = w32.SetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE, next);
+}
+
+fn activationStyle(old: isize, activate: bool) isize {
+    const flag: isize = w32.WS_EX_NOACTIVATE;
+    return if (activate) old & ~flag else old | flag;
+}
+
+test "P4 reuse hidden hosts cannot activate and remain tool windows" {
+    const tool: isize = w32.WS_EX_TOOLWINDOW | w32.WS_EX_LAYERED;
+    const hidden = activationStyle(tool, false);
+    try std.testing.expect(hidden & w32.WS_EX_NOACTIVATE != 0);
+    try std.testing.expect(hidden & tool == tool);
+    try std.testing.expectEqual(tool, activationStyle(hidden, true));
+}
+
 fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
     var current: w32.RECT = undefined;
     const known = w32.GetWindowRect(hwnd, &current) != 0;
@@ -647,6 +735,7 @@ pub fn hide(self: *Popup) void {
     self.uiaDetach();
     const was_visible = self.visible;
     self.visible = false;
+    self.successful_frame = null;
     const hwnd = self.hwnd orelse return;
     self.stopRepeat();
     self.input.dragging = false;
@@ -660,6 +749,7 @@ pub fn hide(self: *Popup) void {
     self.endMotion(hwnd);
     // After hiding: the owner has the activation back by now.
     self.unlockOwner();
+    self.setActivationStyle(false);
     if (self.options.release_target_on_hide) self.discardTarget();
 }
 
@@ -763,12 +853,20 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
     const cookie = self.uia_cookie;
     _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
     const current = livePopup(hwnd, cookie) orelse return;
-    // The opt-in path (including its legacy fallback) must have a successful
-    // current-size/current-DPI frame. Do not reveal a failed or stale surface.
-    if (current.composition_requested and !current.compositionReady(hwnd)) {
-        log.warn("popup has no successful frame after composition fallback", .{});
-        current.hide();
-        return;
+    // Neither a reused host nor the opt-in composition fallback may reveal a
+    // failed/stale frame. Bound recovery rather than leaving a cloaked zombie.
+    const ready = if (current.composition_requested) current.compositionReady(hwnd) else if (current.successful_frame) |frame| if (current.openFrame(hwnd)) |size| std.meta.eql(frame, size) else false else false;
+    switch (revealStep(ready, GetTickCount64() -| current.reveal_started_ms)) {
+        .wait => {
+            if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, reveal_ms, null) == 0) current.dismiss(.owner);
+            return;
+        },
+        .cancel => {
+            log.warn("popup first frame unavailable after 300ms; cancelling reveal", .{});
+            current.dismiss(.owner);
+            return;
+        },
+        .reveal => {},
     }
     current.revealing = false;
     setCloaked(hwnd, false);
@@ -1574,19 +1672,25 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
         cb.paint(cb.ctx, self, canvas);
         switch (canvas.finish()) {
             .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd, frame),
-            .recreate => self.repaint(),
-            .failed => {},
+            .recreate => {
+                self.reuse_invalid = true;
+                self.repaint();
+            },
+            .failed => self.reuse_invalid = true,
         }
         return;
     }
     if (!canvas.beginHwnd(hwnd, self.canvasDpi())) return;
-    const frame = if (self.open_timing != null) self.openFrame(hwnd) else null;
+    const frame = self.openFrame(hwnd);
     canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
     cb.paint(cb.ctx, self, canvas);
     switch (canvas.finish()) {
         .ok => self.markLegacyFrame(hwnd, frame),
-        .recreate => self.repaint(),
-        .failed => {},
+        .recreate => {
+            self.reuse_invalid = true;
+            self.repaint();
+        },
+        .failed => self.reuse_invalid = true,
     }
 }
 
@@ -1607,6 +1711,7 @@ fn compositionReady(self: *Popup, hwnd: w32.HWND) bool {
 }
 
 fn markLegacyFrame(self: *Popup, hwnd: w32.HWND, frame: ?OpenTiming.Frame) void {
+    self.successful_frame = frame;
     if (self.open_timing) |*timing| {
         timing.painted = true;
         timing.frame = frame;
@@ -1673,6 +1778,7 @@ fn paintComposition(self: *Popup, hwnd: w32.HWND, canvas: *d2d.Canvas, cb: Callb
 }
 
 fn failComposition(self: *Popup) void {
+    self.reuse_invalid = true;
     self.composition_failed = true;
     if (self.composition) |*backend| backend.reset();
 }
@@ -1861,6 +1967,7 @@ fn wndProc(
             return 0;
         },
         w32.WM_DPICHANGED => {
+            self.reuse_invalid = true;
             self.dpi = @intCast((wparam >> 16) & 0xFFFF);
             const suggested: *const w32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             _ = w32.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
@@ -2168,6 +2275,20 @@ test "caret blinking preserves the live UIA snapshot and queued Value action" {
     try testing.expect(!popup.uia_view.publisher.accepts(last));
     try testing.expectEqual(unavailable, abi.ProviderOptions(before_destroy, &options));
     try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+    var previous_id = last.snapshot_id;
+    for (0..100) |_| {
+        try popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+        const snapshot = popup.uia_view.publisher.current.?;
+        try testing.expect(snapshot.id != previous_id);
+        previous_id = snapshot.id;
+        const provider = &snapshot.nodes[1].faces[0];
+        _ = abi.AddRef(provider);
+        try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+        popup.hide();
+        try testing.expectEqual(unavailable, abi.ProviderOptions(provider, &options));
+        _ = abi.Release(provider);
+        try testing.expect(popup.uia_view.publisher.current == null);
+    }
 }
 
 test "P4 opening placement avoids redundant size and position changes" {
