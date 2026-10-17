@@ -108,7 +108,7 @@ fn trace(comptime event: []const u8, comptime fields: []const u8, args: anytype,
     trace_last = now;
 }
 
-const Case = enum { text, multiline, files, shell_metachar_files, uri, unterminated, bad_hdrop, bad_uri, text_limit, too_many_files };
+const Case = enum { text, unicode, multiline, single_file, files, shell_metachar_files, quoted_path, uri, unterminated, bad_hdrop, bad_uri, text_limit, too_many_files };
 const Options = struct {
     run: bool = false,
     source_window: bool = false,
@@ -125,7 +125,7 @@ const Options = struct {
 };
 const usage =
     \\gx_ole_source --run --hwnd=0xHEX --pid=N --birth=FILETIME --exe=ABS --sha256=HEX
-    \\  --work-dir=OWNED_PARENT --case=text|multiline|files|shell_metachar_files|uri|unterminated|bad_hdrop|bad_uri|text_limit|too_many_files
+    \\  --work-dir=OWNED_PARENT --case=text|unicode|multiline|single_file|files|shell_metachar_files|quoted_path|uri|unterminated|bad_hdrop|bad_uri|text_limit|too_many_files
     \\  [--timeout-ms=5000] [--x=SCREEN_X --y=SCREEN_Y]
     \\Press and hold left on the verified target first; release after ready.json appears.
     \\--source-window instead starts from this fixture's real visible source window.
@@ -677,14 +677,19 @@ fn run(init: std.process.Init) !u8 {
     var format: u16 = 13;
     const bytes: []const u8 = switch (opts.case) {
         .text => try widePayload(alloc, marker, true),
+        .unicode => try widePayload(alloc, try std.fmt.allocPrint(alloc, "{s} 中文 café 🧪", .{marker}), true),
         .multiline => try widePayload(alloc, try std.fmt.allocPrint(alloc, "# {s}\r\n# second-line", .{marker}), true),
         .unterminated => try widePayload(alloc, marker, false),
         .text_limit => try widePayload(alloc, try alloc.dupe(u8, &(@as([1024 * 1024 + 1]u8, @splat('x')))), true),
-        .files, .shell_metachar_files, .too_many_files, .uri, .bad_uri => blk: {
-            try dir.writeFile(init.io, .{ .sub_path = "GX OLE 中文 sample.txt", .data = "Owned OLE test input.\n" });
-            const path = try std.fs.path.join(alloc, &.{ root, "GX OLE 中文 sample.txt" });
-            if (opts.case == .files or opts.case == .shell_metachar_files or opts.case == .too_many_files) {
+        .single_file, .files, .shell_metachar_files, .quoted_path, .too_many_files, .uri, .bad_uri => blk: {
+            try dir.writeFile(init.io, .{ .sub_path = "GX OLE 中文 🧪 sample.txt", .data = "Owned OLE test input.\n" });
+            const path = try std.fs.path.join(alloc, &.{ root, "GX OLE 中文 🧪 sample.txt" });
+            if (opts.case == .single_file or opts.case == .files or opts.case == .shell_metachar_files or opts.case == .quoted_path or opts.case == .too_many_files) {
                 format = 15;
+                if (opts.case == .single_file) break :blk try filePayload(alloc, &.{path});
+                // Quotes are illegal in real Win32 filenames. This is explicitly
+                // a synthetic hostile HDROP value; no such file is opened.
+                if (opts.case == .quoted_path) break :blk try filePayload(alloc, &.{try std.fs.path.join(alloc, &.{ root, "bad\"&echo GX_MUST_NOT_EXECUTE.txt" })});
                 if (opts.case == .too_many_files) {
                     const paths = try alloc.alloc([]const u8, 257);
                     @memset(paths, path);

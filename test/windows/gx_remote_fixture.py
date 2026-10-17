@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import gx_slots  # noqa: E402
 import gx_win_gui as gui  # noqa: E402
+from gx_fixture_evidence import native_snapshot, write_review, drag_thresholds, fixture_slots
 
 BEGIN = 0x44F
 QUERY = 0x450
@@ -65,6 +66,12 @@ STANDARD_FORMATS = {1: "CF_TEXT", 2: "CF_BITMAP", 3: "CF_METAFILEPICT", 7: "CF_O
 SESSION_PROFILE = "custom:GXFixture"
 UNSAFE_PASTE_TITLE = "Warning: Potentially Unsafe Paste"
 OPTIONAL_CASES = ("uia", "performable", "once", "copy", "paste", "ole", "ime", "dragback", "bell", "mixed", "session")
+CASE_IDS = {"transfer": "MIG-02", "remote-input-to-original-shell": "MIG-03",
+            "remote-uia-external-mta": "UIA-01", "performable-fallback-without-selection": "MIG-06a",
+            "activate-key-table-once": "MIG-06b", "chained-new-split-continuation": "MIG-06c",
+            "persistent-key-table": "MIG-06d", "dragback-returns-original-tab": "MIG-02b",
+            "drag-threshold": "MIG-01",
+            "mixed-tab-transfer-rejected": "MIG-04b", "perf-input": "PERF-REMOTE-01"}
 
 
 class Blocked(RuntimeError):
@@ -101,7 +108,10 @@ class Fixture:
         self.capture_method = args.capture
         self.split_stress = args.split_stress
         self.end = args.end
-        self.skip = set(args.skip or ())
+        self.skip = set(args.skip or ()) | {"copy", "paste"}
+        self.perf_count = args.perf_count
+        self.perf_interval_ms = args.perf_interval_ms
+        self.perf_input = "perf-input" in (args.only or ())
         self.owned = []
         self.processes = {}
         self.expected_exit = set()
@@ -132,6 +142,9 @@ class Fixture:
             "keybind = performable:ctrl+c=copy_to_clipboard",
             "keybind = ctrl+alt+k=activate_key_table_once:gxonce",
             f"keybind = gxonce/e=text:echo {self.marker('once')}>>once.txt\\r",
+            "keybind = ctrl+alt+t=activate_key_table:gxrepeat",
+            f"keybind = gxrepeat/e=text:echo {self.marker('table')}>>table.txt\\r",
+            "keybind = gxrepeat/escape=deactivate_key_table",
             "bell-features = border,no-attention,no-title",
             "gx-launch-profile = GXFixture=cmd.exe /d /k gx-remote-fixture.cmd",
             f"keybind = ctrl+alt+p=gx:new_tab_profile:{SESSION_PROFILE}",
@@ -223,6 +236,8 @@ class Fixture:
         if optional is not None and optional in self.skip:
             self.record(name, "SKIPPED", reason=f"--skip {optional}")
             return None
+        first_capture = len(self.report["captures"])
+        first_record = len(self.report["cases"])
         try:
             return function(*args)
         except (gui.InputBlocked, Blocked, CaseAbort):
@@ -232,6 +247,17 @@ class Fixture:
             if critical:
                 raise CaseAbort(name) from exc
             return None
+        finally:
+            if name in CASE_IDS:
+                rows = self.report["cases"][first_record:]
+                status = "FAIL" if any(row["status"] == "FAIL" for row in rows) else "PENDING"
+                if rows and all(row["status"] == "PASS" for row in rows):
+                    status = "PASS"
+                self.report.setdefault("case_reviews", []).append(write_review(
+                    self.out, CASE_IDS[name], "R5-03" if name == "remote-uia-external-mta" else "R5-01X",
+                    "host", status, [row["file"] for row in self.report["captures"][first_capture:]],
+                    observations=rows, identity_scope="native snapshots in report; scrollback counter pending A2r"))
+                self.save()
 
     def marker(self, role):
         return f"GX_REMOTE_{role.upper()}_{self.token}"
@@ -284,6 +310,8 @@ class Fixture:
             "GHOSTTY_GX_REMOTE_TEST": "1", "GX_REMOTE_FIXTURE_ROLE": role,
             "GX_REMOTE_FIXTURE_ROOT": str(self.environment),
         })
+        if self.perf_input:
+            environment["GHOSTTY_GX_PERF"] = "1"
         stdout_path = self.out / f"{role}.stdout.txt"
         stderr_path = self.out / f"{role}.stderr.txt"
         launched = gui.win32().now_filetime()
@@ -624,6 +652,99 @@ class Fixture:
         self.expect_lines("remote-input.txt", [input_marker], "remote keyboard reaches the original source shell")
         self.same_process(self.source_child)
         self.record("remote-input-to-original-shell", marker=input_marker, child=self.source_child)
+
+    def case_perf_input(self, target, remote):
+        """Paced real input; metric interpretation and quiet acceptance belong to root."""
+        pane = self.focus_remote(target, remote.hwnd)
+        before = native_snapshot(target)
+        samples = []
+        interval = self.perf_interval_ms / 1000
+        deadline = time.perf_counter()
+        for index in range(self.perf_count):
+            delay = deadline - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            target.ensure_foreground()
+            self.fresh(target, pane.hwnd, REMOTE_PANE_CLASS)
+            if gui.win32().focus_window(remote.hwnd) != pane.hwnd:
+                raise gui.InputBlocked("remote input focus changed during paced sample")
+            sent = time.perf_counter_ns()
+            target.type_text(chr(ord("a") + index % 26), delay=0)
+            samples.append({"index": index, "sent_perf_counter_ns": sent})
+            deadline += interval
+        time.sleep(0.5)
+        self.same_process(self.source_child)
+        self.capture(target, remote.hwnd, REMOTE_CLASS, "perf-input", "固定节奏字符停留在原 shell 行内；没有自动回车")
+        self.record("perf-input", count=self.perf_count, interval_ms=self.perf_interval_ms,
+                    metric="remote.input_to_present", clock="system QPC (product metric); Python schedule is diagnostic",
+                    samples=samples, before=before, after=native_snapshot(target), enter_injected=False,
+                    measurement_status="PENDING_ROOT_AGGREGATION", perf_enabled_roles=["source", "target"])
+
+    def case_table(self, target, remote):
+        if not self.use_us_layout(target, remote.hwnd):
+            raise Blocked("persistent table needs US layout on the owned input thread")
+        self.focus_remote(target, remote.hwnd)
+        target.press("ctrl+alt+t")
+        for count in (1, 2):
+            target.press("e")
+            self.expect_lines("table.txt", [self.marker("table")] * count, "persistent table remains active")
+        target.press("escape")
+        target.type_text("echo " + self.marker("table_exit") + ">table-exit.txt")
+        target.press("enter")
+        self.expect_lines("table-exit.txt", [self.marker("table_exit")], "table deactivation reaches shell")
+        self.capture(target, remote.hwnd, REMOTE_CLASS, "table", "持久表连续执行两次并退出；原 PTY 继续接收输入")
+        self.record("persistent-key-table", child=self.source_child, executions=2)
+
+    def case_drag_threshold(self, source, window):
+        source.activate()
+        source.press("ctrl+shift+t")
+        wait(lambda: self.query(source, window.hwnd, gui.WINDOW_CLASS, 12) == 2, "second tab")
+        command = [sys.executable, str(ROOT / "scripts/gx_win_uia.py"), "--worker", "--hwnd", str(window.hwnd),
+                   "--pid", str(source.pid), "--birth", str(source.creation), "--exe", str(self.exe),
+                   "--sha256", self.expected_hash, "--max-nodes", "512"]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        (self.out / "drag-tab-geometry.json").write_text(result.stdout, encoding="utf-8")
+        assert result.returncode == 0, "cannot discover live tab geometry"
+        nodes = [node for node in json.loads(result.stdout)["nodes"] if node["control_type"] == 50019 and node.get("bounds")]
+        assert len(nodes) == 2, "expected two UIA tab items"
+        left, top, width, height = nodes[0]["bounds"]
+        assert width > 60 and height > 10
+        point = round(left + width / 3), round(top + height / 2)
+        source.mouse(*point)
+        before = native_snapshot(source)
+        dpi = gui.win32().GetDpiForWindow(window.hwnd)
+        threshold = drag_thresholds(dpi)
+        below = threshold["vertical"]["at_or_below_px"]
+        above = threshold["vertical"]["above_px"]
+        source.drag(point, (point[0], point[1] + below), steps=1)
+        time.sleep(0.2)
+        assert len(self.visible_windows(source)) == 1, "at/below 15 DIP detached"
+        self.capture(source, window.hwnd, gui.WINDOW_CLASS, "drag-at-or-below", "15 DIP 以下或恰等于阈值时仍是一窗两标签")
+        released = False
+        try:
+            source.drag(point, (point[0], point[1] + above), steps=1, release=False)
+            wait(lambda: len(self.visible_windows(source)) == 2, ">15 DIP detach", 5)
+            source.press("escape")
+            source.activate()
+            release_point = source.point(100, 100)
+            source.mouse(*release_point, action="up")
+            released = True
+            after = native_snapshot(source)
+            before_leaves = {(w["surface_id"], w["terminal_hwnd"]) for w in before["windows"]}
+            after_leaves = {(w["surface_id"], w["terminal_hwnd"]) for w in after["windows"]}
+            assert before_leaves <= after_leaves, "detached active Surface/HWND was replaced"
+            assert before["children"] == after["children"], "detach replaced a PTY process"
+            for index, moved in enumerate(self.visible_windows(source)):
+                self.capture(source, moved.hwnd, gui.WINDOW_CLASS, f"drag-after-{index}", "拖出后保留原终端；子进程身份以 JSON 核对")
+            self.record("drag-threshold", threshold=threshold, before=before, after=after,
+                        horizontal_status="PENDING_DRAG_ACTIVE_QUERY", exact_15_dip_native=threshold["vertical"]["exact_representable"],
+                        scope="vertical native detach; exact 15 DIP only when integral pixels; horizontal pure test is separate")
+        finally:
+            if not released:
+                # Releasing is itself guarded; do not send to another app after
+                # foreground/identity loss, including in failure cleanup.
+                source.ensure_foreground()
+                source.mouse(*source.point(100, 100), action="up")
 
     def case_uia(self, target, remote):
         panes = self.remote_panes(target, remote.hwnd)
@@ -1568,6 +1689,9 @@ class Fixture:
 
     def execute(self):
         source = self.start("source")
+        if self.only == ["drag-threshold"]:
+            self.case("drag-threshold", self.case_drag_threshold, source, source.require_window(), critical=True)
+            return self.finish()
         target = self.start("target")
         if source.pid == target.pid or source.env_dir != target.env_dir:
             raise AssertionError("fixture does not have two processes in the same isolated domain")
@@ -1606,6 +1730,8 @@ class Fixture:
                       "input": ("remote-input-to-original-shell", self.case_input),
                       "performable": ("performable-fallback-without-selection", self.case_performable),
                       "once": ("activate-key-table-once", self.case_once),
+                      "table": ("persistent-key-table", self.case_table),
+                      "perf-input": ("perf-input", self.case_perf_input),
                       "copy": ("mouse-selection-copy", self.case_copy),
                       "paste": ("safe-paste-no-enter", self.case_safe_paste)}
             for name in self.only:
@@ -1616,6 +1742,7 @@ class Fixture:
         self.case("remote-uia-external-mta", self.case_uia, target, remote, optional="uia")
         self.case("performable-fallback-without-selection", self.case_performable, target, remote, optional="performable")
         self.case("activate-key-table-once", self.case_once, target, remote, optional="once")
+        self.case("persistent-key-table", self.case_table, target, remote)
         self.case("mouse-selection-copy", self.case_copy, target, remote, optional="copy")
         self.case("protected-paste-no-enter", self.case_paste, target, remote, optional="paste")
         self.case("same-privilege-ole-drop", self.case_ole, target, remote, optional="ole")
@@ -1745,6 +1872,7 @@ class Fixture:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--desktop-held", action="store_true", help="caller already holds Invoke-Desktop")
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--out", required=True, type=Path, help="new unused evidence directory")
@@ -1758,11 +1886,19 @@ def main(argv=None):
     parser.add_argument("--skip", action="append", choices=OPTIONAL_CASES, help="skip an optional case (repeatable)")
     parser.add_argument("--rehearsal", action="store_true", help="label the evidence as a rehearsal, never acceptance")
     parser.add_argument("--ole-source", type=Path, help="built test/windows/gx_ole_source.zig executable for the real OLE drag")
-    parser.add_argument("--only", action="append", choices=("uia", "input", "performable", "once", "copy", "paste"),
+    parser.add_argument("--only", action="append", choices=("uia", "input", "performable", "once", "table", "perf-input", "drag-threshold"),
                         help="after the mandatory transfer run only these probes, in order, then close both apps (repeatable)")
+    parser.add_argument("--perf-count", type=int, default=50)
+    parser.add_argument("--perf-interval-ms", type=int, default=200)
     parser.add_argument("--allow-clipboard-loss", action="store_true",
                         help="run clipboard cases even when non-text clipboard data cannot be restored")
     args = parser.parse_args(argv)
+    if args.only and "drag-threshold" in args.only and args.only != ["drag-threshold"]:
+        parser.error("drag-threshold uses an independent local fixture; run it separately")
+    if args.allow_clipboard_loss:
+        parser.error("r6 forbids reading or replacing an unknown user clipboard")
+    if not 1 <= args.perf_count <= 10000 or not 10 <= args.perf_interval_ms <= 10000:
+        parser.error("perf-count must be 1..10000; perf-interval-ms must be 10..10000")
     if args.split_stress < 0:
         parser.error("--split-stress must be >= 0")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
@@ -1770,12 +1906,11 @@ def main(argv=None):
     if os.name != "nt":
         parser.error("requires Windows")
     try:
-        with gx_slots.acquire(ROOT / ".local/kernel-slots", "heavy"):
-            with gx_slots.acquire(ROOT / ".local/kernel-slots", "desktop"):
-                fixture = Fixture(args)
-                result = fixture.run()
-                print(json.dumps({"status": fixture.report["status"], "report": str(fixture.out / "report.json")}, ensure_ascii=False))
-                return result
+        with fixture_slots(ROOT, args.desktop_held):
+            fixture = Fixture(args)
+            result = fixture.run()
+            print(json.dumps({"status": fixture.report["status"], "report": str(fixture.out / "report.json")}, ensure_ascii=False))
+            return result
     except (OSError, Blocked, TimeoutError) as exc:
         print(json.dumps({"status": "BLOCKED", "reason": str(exc)}, ensure_ascii=False))
         return 2
