@@ -2003,15 +2003,17 @@ function ConvertFrom-GxOscReply([string]$Text) {
 
 function Get-GxOscExpected([string]$Case, [string]$Expect) {
     $allow = @('allow','allow-remember','auto-allow')
-    if ($Expect -eq 'observe' -or $Case -eq 'read-cleared') { return 'observe' }
+    # GX-0046: a clipboard without text answers an empty reply without a dialog.
+    if ($Case -eq 'read-cleared') { return 'empty' }
+    if ($Expect -eq 'observe') { return 'observe' }
     if ($Case -eq 'race') { return 'race' }
     if ($Case -like 'write*') {
         if ($Expect -eq 'auto' -or $allow -contains $Expect) { if ($Case -eq 'write') { return 'written' } else { return 'emptied' } }
         return 'unchanged'
     }
     if ($Expect -eq 'auto') { throw 'Expect auto applies to write cases only (no dialog under clipboard-write = allow).' }
-    # A remembered deny turns clipboard-read into deny, which the core answers with nothing at all.
-    if ($Expect -eq 'auto-deny') { return 'none' }
+    # A remembered deny answers an empty reply, like the dialog's Deny.
+    if ($Expect -eq 'auto-deny') { return 'empty' }
     if ($Case -eq 'read-empty') { return 'empty' }
     if ($allow -contains $Expect) { return 'match' }
     return 'empty'

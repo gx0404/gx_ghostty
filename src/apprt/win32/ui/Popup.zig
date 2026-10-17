@@ -63,8 +63,78 @@ const wstr = @import("wstr.zig");
 const App = @import("../App.zig");
 const uia = @import("uia.zig");
 const uia_bridge = @import("uia_bridge.zig");
+const perf = @import("../../../gx/perf.zig");
+const global = @import("../../../global.zig");
 
 const log = std.log.scoped(.win32_popup);
+
+/// One GUI-thread opening, through successful painting and uncloaking (or
+/// completion of its fade). Text layout performed while painting belongs to
+/// raster, not to the earlier geometry/layout phase. Cancelled opens emit no
+/// successful sample. The five phases partition total, including reveal waits.
+pub const OpenTiming = struct {
+    pub const Kind = enum { palette, menu, settings };
+    pub const Phase = enum { prepare, create, layout, raster, show };
+    const Frame = struct { width: u32, height: u32, dpi: u32 };
+    kind: Kind,
+    start: perf.Instant,
+    last: perf.Instant,
+    phases: [5]u64 = @splat(0),
+    painted: bool = false,
+    frame: ?Frame = null,
+    ready: ?perf.Instant = null,
+    /// Paints during ShowWindow/RedrawWindow must wait for the rest of the
+    /// synchronous show path before capturing ready (just before the RV timer).
+    showing: bool = false,
+
+    pub fn begin(kind: Kind) ?OpenTiming {
+        if (!perf.enabled()) return null;
+        const at = perf.now(global.io());
+        return .{ .kind = kind, .start = at, .last = at };
+    }
+
+    pub fn lap(self: *OpenTiming, phase: Phase) void {
+        const at = perf.now(global.io());
+        self.add(phase, perf.elapsedUs(self.last, at));
+        self.last = at;
+    }
+
+    fn add(self: *OpenTiming, phase: Phase, us: u64) void {
+        self.phases[@intFromEnum(phase)] += us;
+    }
+
+    pub fn addSince(self: *OpenTiming, phase: Phase, start: perf.Instant) void {
+        self.add(phase, perf.sinceUs(global.io(), start));
+    }
+
+    fn readyAt(self: *OpenTiming, at: perf.Instant, current: Frame) void {
+        if (self.showing or self.ready != null) return;
+        const frame = self.frame orelse return;
+        if (current.width == 0 or current.height == 0 or !std.meta.eql(frame, current)) return;
+        self.ready = at;
+    }
+
+    fn finishAt(self: *OpenTiming, at: perf.Instant) u64 {
+        const total = perf.elapsedUs(self.start, at);
+        var work: u64 = 0;
+        for (self.phases[0..4]) |us| work += us;
+        self.phases[@intFromEnum(Phase.show)] = total -| work;
+        return total;
+    }
+
+    fn reportAt(self: *OpenTiming, comptime Recorder: type, at: perf.Instant) void {
+        const total = self.finishAt(at);
+        switch (self.kind) {
+            inline else => |kind| {
+                inline for (std.meta.fields(Phase), 0..) |phase, i| {
+                    Recorder.record(@tagName(kind) ++ ".open." ++ phase.name, self.phases[i]);
+                }
+                Recorder.record(@tagName(kind) ++ ".open.ready", perf.elapsedUs(self.start, self.ready.?));
+                Recorder.record(@tagName(kind) ++ ".open.total", total);
+            },
+        }
+    }
+};
 
 /// DWM corner preference of the popup (DWM_WINDOW_CORNER_PREFERENCE).
 pub const Corners = enum(u32) {
@@ -228,6 +298,7 @@ uia_cookie: u64 = 0,
 uia_refreshing: bool = false,
 uia_layout_pending: bool = true,
 visible: bool = false,
+open_timing: ?OpenTiming = null,
 dpi: u32 = 96,
 /// The owner's content scale relative to its window DPI (`setOwnerScale`),
 /// applied on top of `dpi`.
@@ -399,7 +470,7 @@ pub fn applyTheme(self: *Popup, tokens: style.Tokens) void {
     const dark: u32 = @intFromBool(tokens.dark);
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_USE_IMMERSIVE_DARK_MODE, @ptrCast(&dark), @sizeOf(u32));
     self.setBorderColor(tokens.border);
-    self.invalidate();
+    self.repaint();
 }
 
 /// Name the popup for screen readers and automation (its window text),
@@ -477,6 +548,7 @@ pub fn sizeDip(self: *const Popup) d2d.Size {
 pub fn show(self: *Popup, rect: w32.RECT) void {
     const hwnd = self.hwnd orelse return;
     if (self.visible and w32.IsWindowVisible_(hwnd) != 0) {
+        self.open_timing = null;
         if (self.animator.running) self.fade_target = rect else self.place(hwnd, rect);
         if (self.options.activate) _ = w32.SetFocus(hwnd);
         if (self.options.capture_mouse) _ = w32.SetCapture(hwnd);
@@ -484,6 +556,7 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
         return;
     }
 
+    if (self.open_timing) |*timing| timing.showing = true;
     if (self.options.activate and self.options.keep_owner_active) self.lockOwner();
     const motion = if (self.layered) self.options.motion else null;
     const animate = motion != null and anim.enabled();
@@ -517,6 +590,10 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
     if (self.options.capture_mouse) _ = w32.SetCapture(hwnd);
     self.visible = true;
     _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
+    if (self.open_timing) |*timing| {
+        timing.showing = false;
+        self.markOpenReady(hwnd, perf.now(global.io()));
+    }
     if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, reveal_ms, null) == 0) self.reveal(hwnd);
 }
 
@@ -555,6 +632,7 @@ fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
 
 /// Hide without reporting a dismissal.
 pub fn hide(self: *Popup) void {
+    self.open_timing = null;
     self.uiaDetach();
     const was_visible = self.visible;
     self.visible = false;
@@ -581,9 +659,16 @@ pub fn dismiss(self: *Popup, reason: DismissReason) void {
     if (self.callbacks) |cb| if (cb.dismissed) |f| f(cb.ctx, self, reason);
 }
 
-/// Repaint the popup.
+/// Repaint after a model/layout edit. Revoke index-based UIA actions until the
+/// changed model is published; visual-only changes must use `repaint` instead.
 pub fn invalidate(self: *Popup) void {
     self.uiaDirty();
+    self.repaint();
+}
+
+/// Schedule drawing without changing the accessible model or its lifetime.
+/// A caret blink or hover color must not revoke an external COM provider.
+pub fn repaint(self: *Popup) void {
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
@@ -676,7 +761,10 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
     }
     current.revealing = false;
     setCloaked(hwnd, false);
-    if (!self.fade_pending) return;
+    if (!self.fade_pending) {
+        self.finishOpenTiming();
+        return;
+    }
     self.fade_pending = false;
     self.fade = anim.Tween.begin(anim.now(), anim.motion.duration.fast, anim.motion.enter);
     if (!anim.start(&self.animator)) self.finishMotion(hwnd);
@@ -713,10 +801,36 @@ fn finishMotion(self: *Popup, hwnd: w32.HWND) void {
     if (self.layered) _ = w32.SetLayeredWindowAttributes(hwnd, 0, 255, w32.LWA_ALPHA);
     const target = self.fade_target;
     if (target.right > target.left) self.place(hwnd, target);
+    self.finishOpenTiming();
+}
+
+fn finishOpenTiming(self: *Popup) void {
+    if (self.open_timing == null) return;
+    self.finishOpenTimingAt(perf, perf.now(global.io()));
+}
+
+fn finishOpenTimingAt(self: *Popup, comptime Recorder: type, at: perf.Instant) void {
+    var timing = self.open_timing orelse return;
+    // Take before logging: an opening can report only once, even on reentry.
+    self.open_timing = null;
+    if (timing.painted and timing.ready != null) timing.reportAt(Recorder, at);
+}
+
+fn openFrame(self: *const Popup, hwnd: w32.HWND) ?OpenTiming.Frame {
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return null;
+    return .{ .width = @intCast(client.right), .height = @intCast(client.bottom), .dpi = self.canvasDpi() };
+}
+
+fn markOpenReady(self: *Popup, hwnd: w32.HWND, at: perf.Instant) void {
+    const timing = if (self.open_timing) |*value| value else return;
+    if (timing.showing or timing.ready != null or timing.frame == null) return;
+    timing.readyAt(at, self.openFrame(hwnd) orelse return);
 }
 
 /// Stop a reveal or fade in progress (hiding).
 fn endMotion(self: *Popup, hwnd: w32.HWND) void {
+    self.open_timing = null;
     if (self.revealing) {
         _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
         setCloaked(hwnd, false);
@@ -1218,21 +1332,30 @@ fn restartBlink(self: *Popup) void {
 fn onBlink(self: *Popup, hwnd: w32.HWND) void {
     var timeout: u32 = 5000;
     if (SystemParametersInfoW(SPI_GETCARETTIMEOUT, 0, @ptrCast(&timeout), 0) == 0) timeout = 5000;
+    if (!self.blinkCaret(GetTickCount64() -| self.blink_started, timeout)) {
+        _ = w32.KillTimer(hwnd, CARET_TIMER_ID);
+    }
+}
+
+/// Update the visual caret state; false asks the caller to stop its timer.
+/// Elapsed time and the system timeout are inputs so this transition can be
+/// tested without a native window, a desktop, a timer or wall-clock waits.
+fn blinkCaret(self: *Popup, elapsed_ms: u64, timeout_ms: u32) bool {
     self.input.caret_on = !self.input.caret_on;
     // No input on screen: nothing blinks.
     const drawn = self.input.field.w > 0;
     if (!self.focused or !drawn) {
         self.input.caret_on = true;
-        _ = w32.KillTimer(hwnd, CARET_TIMER_ID);
-        return;
+        return false;
     }
     // Stop blinking after a while without input, like Windows text boxes,
     // so an idle field costs nothing.
-    if (GetTickCount64() -| self.blink_started >= timeout) {
+    const running = elapsed_ms < timeout_ms;
+    if (!running) {
         self.input.caret_on = true;
-        _ = w32.KillTimer(hwnd, CARET_TIMER_ID);
     }
-    self.invalidate();
+    self.repaint();
+    return running;
 }
 
 fn onFocus(self: *Popup, hwnd: w32.HWND, focused: bool) void {
@@ -1288,7 +1411,7 @@ fn handleKey(self: *Popup, hwnd: w32.HWND, key: Key) bool {
         self.textChanged();
     } else {
         self.restartBlink();
-        self.invalidate();
+        self.repaint();
     }
     return true;
 }
@@ -1327,7 +1450,7 @@ fn pressInput(self: *Popup, hwnd: w32.HWND, pos: d2d.Point, double: bool) bool {
     self.input.dragging = clicks == 1;
     if (self.input.dragging and !self.options.capture_mouse) _ = w32.SetCapture(hwnd);
     self.restartBlink();
-    self.invalidate();
+    self.repaint();
     return true;
 }
 
@@ -1337,7 +1460,7 @@ fn dragInput(self: *Popup, pos: d2d.Point) void {
     if (at == self.input.caret) return;
     text_edit.pointerDrag(&self.input, at);
     self.restartBlink();
-    self.invalidate();
+    self.repaint();
 }
 
 fn releaseInput(self: *Popup, hwnd: w32.HWND) void {
@@ -1381,6 +1504,7 @@ fn handleClose(self: *Popup, hwnd: w32.HWND) void {
 
 /// Windows destroyed the window (with its owner): forget it.
 fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
+    self.open_timing = null;
     self.uiaDetach();
     self.releaseComposition();
     self.unlockOwner();
@@ -1399,6 +1523,18 @@ fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
 
 fn paint(self: *Popup, hwnd: w32.HWND) void {
     const cookie = self.uia_cookie;
+    const raster = if (self.open_timing != null) perf.Span.begin(global.io()) else null;
+    defer if (raster) |span| {
+        if (livePopup(hwnd, cookie)) |current| {
+            if (current.open_timing) |*timing| {
+                const at = perf.now(global.io());
+                timing.add(.raster, perf.elapsedUs(span.start, at));
+                // If synchronous show could not paint, take the first later
+                // successful current-size/DPI frame after EndPaint/UIA refresh.
+                current.markOpenReady(hwnd, at);
+            }
+        }
+    };
     defer if (livePopup(hwnd, cookie)) |current| {
         current.uia_layout_pending = false;
         current.uiaRefresh();
@@ -1420,22 +1556,25 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(hwnd, &client) == 0) return;
         const mem = self.dib.ensure(dc, client.right, client.bottom) orelse return;
-        if (!canvas.beginDc(mem, .{ .left = 0, .top = 0, .right = client.right, .bottom = client.bottom }, self.canvasDpi())) return;
+        const dpi = self.canvasDpi();
+        if (!canvas.beginDc(mem, .{ .left = 0, .top = 0, .right = client.right, .bottom = client.bottom }, dpi)) return;
+        const frame: OpenTiming.Frame = .{ .width = @intCast(client.right), .height = @intCast(client.bottom), .dpi = dpi };
         canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
         cb.paint(cb.ctx, self, canvas);
         switch (canvas.finish()) {
-            .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd),
-            .recreate => self.invalidate(),
+            .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd, frame),
+            .recreate => self.repaint(),
             .failed => {},
         }
         return;
     }
     if (!canvas.beginHwnd(hwnd, self.canvasDpi())) return;
+    const frame = if (self.open_timing != null) self.openFrame(hwnd) else null;
     canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
     cb.paint(cb.ctx, self, canvas);
     switch (canvas.finish()) {
-        .ok => self.markLegacyFrame(hwnd),
-        .recreate => self.invalidate(),
+        .ok => self.markLegacyFrame(hwnd, frame),
+        .recreate => self.repaint(),
         .failed => {},
     }
 }
@@ -1456,7 +1595,11 @@ fn compositionReady(self: *Popup, hwnd: w32.HWND) bool {
     return frame.width == width and frame.height == height and frame.dpi == self.canvasDpi();
 }
 
-fn markLegacyFrame(self: *Popup, hwnd: w32.HWND) void {
+fn markLegacyFrame(self: *Popup, hwnd: w32.HWND, frame: ?OpenTiming.Frame) void {
+    if (self.open_timing) |*timing| {
+        timing.painted = true;
+        timing.frame = frame;
+    }
     if (!self.composition_requested) return;
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return;
@@ -1511,6 +1654,10 @@ fn paintComposition(self: *Popup, hwnd: w32.HWND, canvas: *d2d.Canvas, cb: Callb
         return false;
     };
     self.composition_frame = frame.key;
+    if (self.open_timing) |*timing| {
+        timing.painted = true;
+        timing.frame = .{ .width = frame.key.width, .height = frame.key.height, .dpi = frame.key.dpi };
+    }
     return true;
 }
 
@@ -1693,7 +1840,7 @@ fn wndProc(
             self.composition_attempted = false;
             self.composition_failed = false;
             self.composition_failure = failure;
-            self.invalidate();
+            self.repaint();
             _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | w32.RDW_UPDATENOW);
             const current = livePopup(hwnd, cookie) orelse return 0;
             return current.compositionStatus(hwnd);
@@ -1908,6 +2055,221 @@ extern "user32" fn SystemParametersInfoW(
     pvParam: ?*anyopaque,
     fWinIni: u32,
 ) callconv(.winapi) i32;
+
+test "caret blinking preserves the live UIA snapshot and queued Value action" {
+    const testing = std.testing;
+    // Snapshot ownership and COM lifetime checks only: no DLL load, HWND,
+    // message dispatch, desktop interaction or externally configured timeout.
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Palette", .role = .window, .patterns = .{ .window = true } },
+        .{ .id = 2, .parent = 0, .name = "Search", .role = .edit, .patterns = .{ .value = true }, .read_only = false },
+    };
+    var popup: Popup = .{ .visible = true, .focused = true, .uia_layout_pending = false };
+    defer popup.destroy();
+    popup.input.field.w = 100;
+    popup.input.caret_on = true;
+    try popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    popup.uia_view.needs_publish = false;
+    const snapshot_id = popup.uia_view.publisher.current.?.id;
+    // IRawElementProviderSimple's first four SDK slots. Retain the actual COM
+    // face so hiding/reopening cannot make the old pointer appear live again.
+    const LifetimeTable = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const retained = &popup.uia_view.publisher.current.?.nodes[1].faces[0];
+    const abi: *const LifetimeTable = @ptrCast(@alignCast(retained.vtable));
+    _ = abi.AddRef(retained);
+    defer _ = abi.Release(retained);
+    const unavailable: i32 = @bitCast(@as(u32, 0x80040201));
+    var options: u32 = 0;
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(retained, &options));
+    const action: uia.Action = .{
+        .attachment = attachment,
+        .snapshot_id = snapshot_id,
+        .node_id = 2,
+        .kind = .set_value,
+        .value = &.{},
+        .alloc = testing.allocator,
+    };
+    try testing.expect(popup.uia_view.publisher.accepts(action));
+    for (0..4) |i| {
+        try testing.expect(popup.blinkCaret(i * 500, 5000));
+        try testing.expectEqual(i % 2 != 0, popup.input.caret_on);
+        try testing.expect(popup.uia_view.publisher.accepts(action));
+        try testing.expect(!popup.uia_layout_pending);
+        try testing.expect(!popup.uia_view.needs_publish);
+        try testing.expectEqual(snapshot_id, popup.uia_view.publisher.current.?.id);
+        try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(retained, &options));
+    }
+    try testing.expect(!popup.blinkCaret(5000, 5000));
+    try testing.expect(popup.input.caret_on);
+    try testing.expect(popup.uia_view.publisher.accepts(action));
+    popup.repaint();
+    try testing.expect(popup.uia_view.publisher.accepts(action));
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(retained, &options));
+
+    // Model edits must still revoke index-based actions immediately.
+    popup.invalidate();
+    try testing.expect(!popup.uia_view.publisher.accepts(action));
+    try testing.expect(popup.uia_layout_pending);
+    try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+    try popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    const reopened_id = popup.uia_view.publisher.current.?.id;
+    try testing.expect(reopened_id != snapshot_id);
+    var reopened = action;
+    reopened.snapshot_id = reopened_id;
+    const before_hide = &popup.uia_view.publisher.current.?.nodes[1].faces[0];
+    _ = abi.AddRef(before_hide);
+    defer _ = abi.Release(before_hide);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(before_hide, &options));
+    try testing.expect(popup.uia_view.publisher.accepts(reopened));
+    try testing.expect(!popup.uia_view.publisher.accepts(action));
+    popup.hide();
+    try testing.expect(!popup.uia_view.publisher.accepts(reopened));
+    try testing.expectEqual(unavailable, abi.ProviderOptions(before_hide, &options));
+    try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+    try popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    var last = action;
+    last.snapshot_id = popup.uia_view.publisher.current.?.id;
+    const before_destroy = &popup.uia_view.publisher.current.?.nodes[1].faces[0];
+    _ = abi.AddRef(before_destroy);
+    defer _ = abi.Release(before_destroy);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(before_destroy, &options));
+    try testing.expectEqual(unavailable, abi.ProviderOptions(before_hide, &options));
+    try testing.expect(last.snapshot_id != reopened_id);
+    try testing.expect(!popup.uia_view.publisher.accepts(reopened));
+    try testing.expect(popup.uia_view.publisher.accepts(last));
+    try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+    popup.destroy();
+    try testing.expect(!popup.uia_view.publisher.accepts(last));
+    try testing.expectEqual(unavailable, abi.ProviderOptions(before_destroy, &options));
+    try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+}
+
+test "opening ready waits for synchronous show and a current-size DPI frame" {
+    const expected: OpenTiming.Frame = .{ .width = 640, .height = 480, .dpi = 144 };
+    var timing: OpenTiming = .{
+        .kind = .palette,
+        .start = .{ .nanoseconds = 0 },
+        .last = .{ .nanoseconds = 0 },
+        .showing = true,
+        .painted = true,
+        .frame = expected,
+    };
+    timing.readyAt(.{ .nanoseconds = 1000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.showing = false;
+    timing.readyAt(.{ .nanoseconds = 2000 }, expected);
+    try std.testing.expectEqual(@as(i96, 2000), timing.ready.?.nanoseconds);
+    timing.readyAt(.{ .nanoseconds = 9000 }, expected);
+    try std.testing.expectEqual(@as(i96, 2000), timing.ready.?.nanoseconds);
+
+    // The synchronous frame failed. Later successful drawing, not the failed
+    // show return or an old-size/old-DPI bitmap, establishes the ready endpoint.
+    timing.ready = null;
+    timing.frame = null;
+    timing.readyAt(.{ .nanoseconds = 10_000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.frame = .{ .width = 640, .height = 480, .dpi = 96 };
+    timing.readyAt(.{ .nanoseconds = 11_000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.frame = .{ .width = 800, .height = 480, .dpi = 144 };
+    timing.readyAt(.{ .nanoseconds = 12_000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.frame = expected;
+    timing.readyAt(.{ .nanoseconds = 13_000 }, expected);
+    try std.testing.expectEqual(@as(i96, 13_000), timing.ready.?.nanoseconds);
+}
+
+test "opening emits seven metrics once on reveal and none when cancelled" {
+    const Capture = struct {
+        var length: usize = 0;
+        var names: [32][]const u8 = undefined;
+        var values: [32]u64 = undefined;
+        pub fn record(name: []const u8, us: u64) void {
+            names[length] = name;
+            values[length] = us;
+            length += 1;
+        }
+    };
+    for (std.meta.tags(OpenTiming.Kind)) |kind| {
+        const opening: OpenTiming = .{
+            .kind = kind,
+            .start = .{ .nanoseconds = 1000 },
+            .last = .{ .nanoseconds = 1000 },
+            .painted = true,
+            .ready = .{ .nanoseconds = 151_000 },
+        };
+        Capture.length = 0;
+        var popup: Popup = .{ .open_timing = opening };
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 901_000 });
+        try std.testing.expect(popup.open_timing == null);
+        try std.testing.expectEqual(@as(usize, 7), Capture.length);
+        inline for (.{ "prepare", "create", "layout", "raster", "show", "ready", "total" }, 0..) |phase, i| {
+            var buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "{s}.open.{s}", .{ @tagName(kind), phase });
+            try std.testing.expectEqualStrings(name, Capture.names[i]);
+        }
+        try std.testing.expectEqual(@as(u64, 150), Capture.values[5]);
+        try std.testing.expectEqual(@as(u64, 400), Capture.values[6]);
+
+        Capture.length = 0;
+        popup.open_timing = opening;
+        popup.hide(); // Escape/dismiss cancels even an already-ready opening.
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.open_timing = opening;
+        popup.destroy();
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.open_timing = opening;
+        popup.open_timing.?.painted = false;
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.open_timing = opening;
+        popup.open_timing.?.ready = null;
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        try std.testing.expectEqual(@as(usize, 0), Capture.length);
+        try std.testing.expect(popup.open_timing == null);
+    }
+}
+
+test "opening phases partition the action through reveal including repeated raster" {
+    var timing: OpenTiming = .{
+        .kind = .menu,
+        .start = .{ .nanoseconds = 1000 },
+        .last = .{ .nanoseconds = 1000 },
+    };
+    timing.add(.prepare, 10);
+    timing.add(.create, 20);
+    timing.add(.layout, 30);
+    timing.add(.raster, 40);
+    timing.add(.raster, 50);
+    const total = timing.finishAt(.{ .nanoseconds = 1_001_000 });
+    try std.testing.expectEqual(@as(u64, 1000), total);
+    try std.testing.expectEqual(@as(u64, 850), timing.phases[@intFromEnum(OpenTiming.Phase.show)]);
+    var sum: u64 = 0;
+    for (timing.phases) |us| sum += us;
+    try std.testing.expectEqual(total, sum);
+    var popup: Popup = .{ .open_timing = timing };
+    popup.hide(); // Even a never-created/cancelled host drops the pending sample.
+    try std.testing.expect(popup.open_timing == null);
+    const before = perf.enabled();
+    defer perf.setEnabled(before);
+    perf.setEnabled(false);
+    try std.testing.expect(OpenTiming.begin(.settings) == null);
+}
 
 test "modalQuitCode drops a withdrawn quit" {
     const testing = std.testing;

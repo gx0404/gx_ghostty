@@ -421,6 +421,7 @@ pub fn toggle(self: *Palette, page: Page) void {
 
 /// Show the palette on `page` (switching to it when the palette is shown).
 pub fn open(self: *Palette, page: Page) void {
+    var timing = Popup.OpenTiming.begin(.palette);
     if (self.ownerWindow().activePane() == null) return;
     if (self.active) {
         self.setPage(page);
@@ -434,6 +435,7 @@ pub fn open(self: *Palette, page: Page) void {
     const app = pane.app();
     const owner = window.hwnd orelse return;
     const t = self.tokens();
+    if (timing) |*value| value.lap(.prepare);
     if (!ensurePopup(&self.popup, app, owner, .{
         .activate = true,
         .text_input = true,
@@ -459,6 +461,7 @@ pub fn open(self: *Palette, page: Page) void {
     self.popup.applyTheme(t);
     self.popup.setOwnerScale(window.scale);
     self.popup.setAccessibleName(i18n.tr("Command Palette"));
+    if (timing) |*value| value.lap(.create);
 
     self.active = true;
     self.page = page;
@@ -466,8 +469,11 @@ pub fn open(self: *Palette, page: Page) void {
     self.popup.input.clear();
     self.mouse = null;
     self.buildItems();
+    if (timing) |*value| value.lap(.prepare);
     self.refilter(.navigation);
     const rect = self.bounds() orelse return;
+    if (timing) |*value| value.lap(.layout);
+    self.popup.open_timing = timing;
     self.popup.show(rect);
     _ = span.end(global.io(), "palette_open");
 }
@@ -1459,6 +1465,7 @@ fn saveSetting(window: *Window, key: []const u8, value: []const u8) bool {
         showSaveError(window, err);
         return false;
     };
+    if (gx.perf.enabled() and std.mem.eql(u8, key, "theme")) gx.perf.count("theme.reload", 1);
     window.performBindingAction(.reload_config);
     return true;
 }
@@ -1560,6 +1567,7 @@ fn applyTheme(self: *Palette, theme: ?[]const u8) void {
         return;
     };
     defer config.deinit();
+    gx.perf.count("theme.reload", 1);
     app.applyConfig(&config) catch |err| {
         log.warn("cannot apply a theme preview err={}", .{err});
         return;
@@ -1602,6 +1610,7 @@ fn restoreTimer(hwnd: w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) voi
     if (userdata == 0) return;
     const app: *App = @ptrFromInt(@as(usize, @bitCast(userdata)));
     if (app.quit_requested) return;
+    gx.perf.count("theme.reload", 1);
     app.core_app.performAction(app, .reload_config) catch |err| {
         log.warn("cannot restore the saved theme err={}", .{err});
     };
@@ -1853,7 +1862,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
                 self.back_hover = back;
                 changed = true;
             }
-            if (changed) popup.invalidate();
+            if (changed) popup.repaint();
         },
         .leave => {
             self.mouse = null;
@@ -1861,7 +1870,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             self.hover = null;
             self.back_hover = false;
             self.scrollbar.hover = false;
-            popup.invalidate();
+            popup.repaint();
         },
         .down => if (event.button == .left) {
             if (self.scrollbar.press(view, self.content_height, view.h, self.scroll, event.pos)) |offset| {
@@ -1873,12 +1882,12 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             }
             if (self.back_rect) |r| if (r.contains(event.pos)) {
                 self.pressed = .back;
-                popup.invalidate();
+                popup.repaint();
                 return;
             };
             if (self.rowAt(event.pos)) |row| {
                 self.pressed = .{ .row = row };
-                popup.invalidate();
+                popup.repaint();
             }
         },
         .up => if (event.button == .left) {
@@ -1887,7 +1896,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
                 if (popup.hwnd) |hwnd| if (w32.GetCapture() == hwnd) {
                     _ = w32.ReleaseCapture();
                 };
-                popup.invalidate();
+                popup.repaint();
                 return;
             }
             const pressed = self.pressed orelse return;

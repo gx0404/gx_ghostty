@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0044）之后的号。在册的 38 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0044，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0046）之后的号。在册的 40 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0046，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -112,6 +112,8 @@
 | GX-0042 | `src/config/Config.zig` | `fork(gx): GX-0042` | active |
 | GX-0043 | `src/renderer/opengl/wgl.zig` | `fork(gx): GX-0043` | active |
 | GX-0044 | `src/Surface.zig` | `fork(gx): GX-0044` | active |
+| GX-0045 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0045` | active |
+| GX-0046 | `src/Surface.zig` | `fork(gx): GX-0046` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1409,6 +1411,7 @@ python -m unittest scripts.test_fork_patches -v
 - 原因：既存终端跨宿主迁移保留源 PTY、核心 Surface 和渲染线程，目标需要有界像素流。原本隐藏窗口停止呈现，不能作为远程帧源。
 - 真源：`src/apprt/win32/RemoteHost.zig` 管理隐藏宿主和每个 Surface 的映射输出；源渲染线程在目标 FBO 已绑定时读取 BGRA，恢复 PACK/PBO/read-buffer 状态，翻转为 top-down 后提交双缓冲写槽。GUI 不调用 GL。
 - 独立 remote 锁保护映射借用，GUI 更换通道先释放锁再调用核心；尺寸变化采用新映射代次，不修改正在读取的旧槽。帧通知只置 event 和原子序号。
+- 性能（`GHOSTTY_GX_PERF=1`）：`RemoteHost.Frame.pixels` 在 `ReadPixels` 入口取 QPC，块内 GL 错误检查成功后的 `remote.frame.readbackComplete()` 只存结束戳，`remote.readback` 因此包含同步读回等待本帧 GPU 完成的时间。映射准备、翻行、发布与通知计入 `remote.map`，成功发布的 `stride*height` 计入 `remote.frame_bytes`。`Surface.RemoteFrame.finish` 先结束发布、释放 remote 锁，再输出已缓存的样本，锁内不写日志；GUI 输入戳经单写者原子快照发布，不取读回锁。关闭开关时不读时钟、不写快照、不增加渲染或输入操作。
 - 移除条件：上游提供 Windows 原生帧导出以及跨宿主 Surface 生命周期后移除此钩子。
 - 验证：帧布局、借用与翻行定向测试；标准 Windows app、原本 WGL 呈现回归、两个既存宿主实际迁移和旧窗关闭后持续输出；硬件／软件路径及输入显示延迟另实测。仅生成 BGRA 不能代证跨 host 完成。
 
@@ -1422,3 +1425,21 @@ python -m unittest scripts.test_fork_patches -v
 - 同步时核查可选 hook、配置变更、绑定完成副作用和剪贴板回执薄接线；Windows UI 与 IPC 实现保持在 fork 模块。
 - 移除条件：上游提供等价的异步绑定续延与远程视图接口后移除本钩子。
 - 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0044ShapeTests` 锁定默认 `null`、远程调用只在门控内、改动行紧邻标记）；remote_protocol/remote_binding/RemoteSource 定向测试、Windows/GTK 标准构建、真实远程链式绑定、once、performable 和断连取消。最终实树验证前保持 PENDING。
+
+## GX-0045 Windows 渲染目标存活指标
+
+- 文件：`src/renderer/opengl/Target.zig`；active，未回馈上游。`init` 与 `deinit` 各一个纯新增 begin/end 块，块内只有一行 Windows 编译期门控调用；实现在 fork 路径 `src/renderer/opengl/wgl.zig::targetLifetime`。块里的 `builtin` 来自 GX-0004 在同一文件新增的导入，移除或改动 GX-0004 时同步检查本补丁。
+- 原因：性能验收要按真实资源所有权统计 Windows 渲染目标，不能按终端数乘常量估算，也不能只记创建而漏掉缩放、隐藏和销毁时的释放。
+- 行为：`Target.init` 在渲染 framebuffer 完整性检查通过后、GX-0004 的 Windows 提前返回之前调用 `wgl.targetLifetime(true)`；`Target.deinit` 在四次 destroy 之后调用 `wgl.targetLifetime(false)`。`targetLifetime` 先检查 `GHOSTTY_GX_PERF`，关闭时不取锁、不改计数、不写日志；开启时在进程锁内更新计数，并输出三个 gauge（`info(gx_perf): metric <名> <n>`）：`renderer.targets_live` 为 Target 持有的纹理与 FBO 总数，`renderer.target_objects_live` 为 Target 对象数，`renderer.target_textures_live` 为 Target 自有纹理数。Windows 上每个 Target 只有一张 sRGB 纹理和一个 FBO（导出纹理与 FBO 为 0），默认单个可见终端稳态分别为 2、1、1；调整尺寸先建后删的重叠如实计入。字形 atlas、自定义着色器纹理与窗口默认缓冲不在统计内。
+- 同步：保持“完整创建后计入、删除后计出”的位置，不得把计入移到可能失败的初始化之前；Windows Target 改为持有其他 GL 对象时同步 `targetLifetime` 的口径。删掉两块（及其后新增的空行）即回到只有 GX-0004 的文件。
+- 移除条件：上游提供等价的渲染目标资源计数，或 Windows 渲染路径不再使用 `Target` 时，移除两块与 `wgl.targetLifetime`。
+- 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0045ShapeTests` 锁定两块的位置、内容、Windows 门控，以及去掉 GX-0004 与 GX-0045 后等于上游原文）；`just test --filter renderer.opengl.wgl` 的 target gauges 用例覆盖 resize 重叠与回零；真实窗口日志中创建、resize、隐藏与关闭时的 gauge 在最终构建上核对，核对前保持 PENDING。
+
+## GX-0046 OSC 52 空读完成
+
+- 文件：`src/Surface.zig`；active，未回馈上游。三个纯新增 begin/end 块：`startClipboardRequest` 在既有配置拒绝检查之后，把 OSC 52 读转交私有 `gxStartClipboardReadOSC52`；该函数处理 apprt 返回的 `unavailable`；`completeClipboardReadOSC52` 在 deny 断言之后、ask 授权之前让空内容走已确认的完成路径。
+- 原因：apprt 返回 `unavailable`（剪贴板里没有文本）时请求没有启动、也不会有回调，上游发起处丢弃了返回值，等待回复的程序会一直挂起。空内容没有可泄露的数据，与上游 Kitty 剪贴板路径对 `unavailable` 直接回复的原则一致；区别是 Kitty 路径对空字符串内容仍按 ask 询问，OSC 52 这里不再询问。
+- 行为：`unavailable` 立即回复空 OSC 52 并返回 `started`；已启动的请求仍由原回调完成，不会二次回复；`unsupported` 与配置级 `clipboard-read = deny` 保持上游的不回复。回复沿用 `queueIo`，保留只读过滤与消息所有权，结束符仍固定为 ST（上游现状，BEL 请求的结束符镜像不在本补丁范围）。OSC 52 回复没有请求 ID，本地重试中或远程请求在途时的“忙”也立即得到空回复，两个读请求并发时回复顺序可能与请求不对应。Windows 分屏“记住拒绝”的回复一致性在 fork 文件 `src/apprt/win32/Surface.zig`，不属于本补丁。
+- 同步：保持配置 deny 检查在钩子之前、空内容豁免在 deny 断言之后；不得把 `unsupported` 当成有效数据，也不得对 `started` 再回复。
+- 移除条件：上游原生对 `unavailable` 回复空 OSC 52、并对空内容免于 ask 授权后，删除三个块（含测试）并把登记改为 removed；不要误删 Windows fork 文件里的记忆拒绝修复。
+- 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0046ShapeTests` 锁定三块的位置与内容、剥离后等于上游原文）；`just test --filter gx.clipboard`，WSL 上 none 与 `--gtk` 各跑同一 filter；真实剪贴板链路由 VM 的 osc52 相位验证，验证前保持 PENDING。

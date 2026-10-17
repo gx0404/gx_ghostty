@@ -38,6 +38,7 @@ const ui_ref = @import("../../../gx/ui_ref.zig");
 const Window = @import("../Window.zig");
 const Dialogs = @import("Dialogs.zig");
 const MenuPopup = @import("MenuPopup.zig");
+const Popup = @import("Popup.zig");
 const drop_companion_launch = @import("../drop_companion_launch.zig");
 const Settings = @import("Settings.zig");
 const d2d = @import("d2d.zig");
@@ -659,7 +660,8 @@ pub const Align = MenuPopup.Align;
 /// rules as `showMainMenu`.
 pub fn showMain(window: *Window, anchor: ?w32.RECT, alignment: Align) void {
     const rect = anchor orelse return showMainMenu(window, null);
-    openMainMenu(window, .{ .anchor = rect, .alignment = alignment });
+    const timing = Popup.OpenTiming.begin(.menu);
+    openMainMenu(window, .{ .anchor = rect, .alignment = alignment, .open_timing = timing });
 }
 
 /// The application menu (`gx:main_menu`): new tabs and windows, a launch
@@ -672,8 +674,9 @@ pub fn showMain(window: *Window, anchor: ?w32.RECT, alignment: Align) void {
 /// button click), never from a core callback; key bindings go through
 /// `Window.queueMainMenu`.
 pub fn showMainMenu(window: *Window, anchor: ?w32.POINT) void {
-    if (anchor) |pt| return openMainMenu(window, .{ .anchor = MenuPopup.Options.at(pt) });
-    openMainMenu(window, .{ .anchor = menuButtonAnchor(window), .alignment = .right, .keyboard = true });
+    const timing = Popup.OpenTiming.begin(.menu);
+    if (anchor) |pt| return openMainMenu(window, .{ .anchor = MenuPopup.Options.at(pt), .open_timing = timing });
+    openMainMenu(window, .{ .anchor = menuButtonAnchor(window), .alignment = .right, .keyboard = true, .open_timing = timing });
 }
 
 /// The main menu button and its column down to the bottom of the chrome
@@ -711,6 +714,7 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     if (prepare) |span| _ = span.end(global.io(), "menu.prepare");
 
     var options = placement;
+    if (options.open_timing) |*timing| timing.lap(.prepare);
     options.owner_scale = window.scale;
     const id = runMenu(app, hwnd, &menu.root, options) orelse return;
     if (!windowOpen(app, window, attachment)) return;

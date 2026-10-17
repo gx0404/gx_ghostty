@@ -1209,6 +1209,7 @@ pub const Factory = struct {
     fn createLayout16(self: *Factory, text: []const u16, style: TextStyle, max_w: f32, max_h: f32) ?*IDWriteTextLayout {
         const cached = self.formatOf(style) orelse return null;
         var out: ?*IDWriteTextLayout = null;
+        @import("../../../gx/perf.zig").count("d2d.layout_create", 1);
         if (!succeeded(self.dwrite.vtable.CreateTextLayout(
             self.dwrite,
             text.ptr,

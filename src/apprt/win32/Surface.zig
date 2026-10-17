@@ -255,6 +255,9 @@ pending_clipboard_write: ?PendingClipboardWrite = null,
 /// whether the dialog of one is up (see `confirmClipboard`).
 clipboard_confirms: std.ArrayList(ClipboardConfirm) = .empty,
 confirming_clipboard: bool = false,
+/// A dialog denial is distinct from config-level deny: reads still receive
+/// their protocol's denial reply. Scoped to this split until config reload.
+clipboard_read_denied: bool = false,
 
 /// The command this terminal was started with instead of the configured
 /// one (`InitOptions.command`, e.g. a launch profile), so that its tab can
@@ -721,6 +724,7 @@ pub const RemoteFrame = struct {
         self.ended = true;
         self.frame.finish(success);
         std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);
+        self.frame.logPerfSamples();
     }
 };
 
@@ -854,6 +858,15 @@ pub fn clipboardRequest(
     clipboard_type: apprt.Clipboard,
     state: apprt.ClipboardRequest,
 ) !apprt.ClipboardReadResult {
+    if (self.clipboard_read_denied and self.core_surface.config.clipboard_read == .ask) {
+        switch (state) {
+            .osc_52_read, .kitty_read => {
+                self.core_surface.denyClipboardRequest(state);
+                return .started;
+            },
+            else => {},
+        }
+    }
     if (self.remote_source_state != null) return @import("RemoteSource.zig").clipboardRequest(self, clipboard_type, state);
     // Only the standard clipboard is supported on Win32.
     if (clipboard_type != .standard) return .unsupported;
@@ -1410,14 +1423,7 @@ pub fn confirmClipboard(self: *Surface) void {
     };
     surface.confirming_clipboard = false;
     surface.answerClipboard(pending, answer.choice == .accept);
-    if (answer.remember and can_remember and surface.core_surface_ready) {
-        const policy: configpkg.Config.ClipboardAccess = if (answer.choice == .accept) .allow else .deny;
-        switch (pending.kind) {
-            .read => surface.core_surface.config.clipboard_read = policy,
-            .write => surface.core_surface.config.clipboard_write = policy,
-            .unsafe_paste => {},
-        }
-    }
+    if (can_remember) surface.rememberClipboardAnswer(pending.kind, answer);
     if (surface.clipboard_confirms.items.len > 0) {
         const posted = if (surface.hwnd) |hwnd|
             w32.PostMessageW(hwnd, WM_APP_CONFIRM_CLIPBOARD, 0, 0) != 0
@@ -1425,6 +1431,106 @@ pub fn confirmClipboard(self: *Surface) void {
             false;
         if (!posted) surface.refuseQueuedClipboardConfirms();
     }
+}
+
+fn rememberClipboardAnswer(surface: *Surface, kind: ClipboardConfirm.Kind, answer: Dialogs.ClipboardAnswer) void {
+    if (answer.remember and surface.core_surface_ready) {
+        const policy: configpkg.Config.ClipboardAccess = if (answer.choice == .accept) .allow else .deny;
+        switch (kind) {
+            .read => {
+                surface.clipboard_read_denied = policy == .deny;
+                // Keep the core's config-level silent deny path out of this
+                // flow; clipboardRequest answers remembered denials instead.
+                surface.core_surface.config.clipboard_read = if (policy == .deny) .ask else .allow;
+            },
+            .write => surface.core_surface.config.clipboard_write = policy,
+            .unsafe_paste => {},
+        }
+    }
+}
+
+test "gx.clipboard remembered OSC 52 denial replies like dialog denial" {
+    const testing = std.testing;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = undefined, .core_surface_ready = true };
+    const core_surface = &surface.core_surface;
+    core_surface.alloc = testing.allocator;
+    core_surface.readonly = false;
+    core_surface.config.clipboard_read = .ask;
+    core_surface.rt_surface = surface;
+    core_surface.io.mailbox = try @import("../../termio.zig").Mailbox.initSPSC(testing.allocator);
+    defer core_surface.io.mailbox.deinit(testing.allocator);
+
+    core_surface.denyClipboardRequest(.{ .osc_52_read = .standard });
+    const denied = core_surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.MissingClipboardReply;
+    defer denied.deinit();
+    surface.rememberClipboardAnswer(.read, .{ .choice = .cancel, .remember = true });
+    // Remembering a dialog decision must not enter the config-level silent deny path.
+    try testing.expectEqual(configpkg.Config.ClipboardAccess.ask, core_surface.config.clipboard_read);
+    try core_surface.handleMessage(.{ .clipboard_read = .standard });
+    const remembered = core_surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.MissingClipboardReply;
+    defer remembered.deinit();
+    try testing.expectEqualStrings(denied.write_alloc.data, remembered.write_alloc.data);
+    try testing.expect(core_surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+    try testing.expectEqual(@as(usize, 0), surface.clipboard_confirms.items.len);
+
+    // Remembered read denial continues to cover Kitty reads and consume their
+    // owned request, while using Kitty's EPERM response (and BEL terminator).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const kitty = try arena.allocator().create(apprt.ClipboardRequest.KittyRead);
+    kitty.* = .{
+        .arena = arena,
+        .location = .standard,
+        .mimes = &.{"text/plain"},
+        .list = false,
+        .id = "v1",
+        .pw = "",
+        .name = "test",
+        .granted = false,
+        .terminator = .bel,
+    };
+    try core_surface.handleMessage(.{ .kitty_clipboard_read = kitty });
+    const kitty_denied = core_surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.MissingClipboardReply;
+    defer kitty_denied.deinit();
+    try testing.expect(std.mem.indexOf(u8, kitty_denied.write_alloc.data, "EPERM") != null);
+    try testing.expect(std.mem.endsWith(u8, kitty_denied.write_alloc.data, "\x07"));
+
+    // Config-level deny retains the upstream no-reply behavior.
+    core_surface.config.clipboard_read = .deny;
+    try core_surface.handleMessage(.{ .clipboard_read = .standard });
+    try testing.expect(core_surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "gx.clipboard remembered choices stay per split and ignore dismissal or closed surface" {
+    const testing = std.testing;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = undefined, .core_surface_ready = true };
+    surface.core_surface.config.clipboard_read = .ask;
+    surface.core_surface.config.clipboard_write = .ask;
+    const other = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(other);
+    other.* = .{ .app = undefined };
+
+    // Dialogs only sets remember for an explicit button choice; dismissing
+    // with Escape or closing the dialog returns remember=false.
+    surface.rememberClipboardAnswer(.read, .{ .choice = .cancel });
+    try testing.expect(!surface.clipboard_read_denied);
+    try testing.expectEqual(configpkg.Config.ClipboardAccess.ask, surface.core_surface.config.clipboard_read);
+    surface.rememberClipboardAnswer(.read, .{ .choice = .cancel, .remember = true });
+    try testing.expect(surface.clipboard_read_denied);
+    try testing.expect(!other.clipboard_read_denied);
+    surface.rememberClipboardAnswer(.read, .{ .choice = .accept, .remember = true });
+    try testing.expect(!surface.clipboard_read_denied);
+    try testing.expectEqual(configpkg.Config.ClipboardAccess.allow, surface.core_surface.config.clipboard_read);
+    surface.rememberClipboardAnswer(.write, .{ .choice = .cancel, .remember = true });
+    try testing.expectEqual(configpkg.Config.ClipboardAccess.deny, surface.core_surface.config.clipboard_write);
+
+    surface.core_surface_ready = false;
+    surface.rememberClipboardAnswer(.read, .{ .choice = .cancel, .remember = true });
+    try testing.expect(!surface.clipboard_read_denied);
+    try testing.expectEqual(configpkg.Config.ClipboardAccess.allow, surface.core_surface.config.clipboard_read);
 }
 
 /// Complete (`accept`) or deny the clipboard access `pending`.
@@ -1766,6 +1872,7 @@ pub fn toggleWindowDecorations(self: *Surface) void {
 /// Follow a config change reported for this surface. Its conditional
 /// configuration (e.g. a light/dark theme) can differ from the app's.
 pub fn onConfigChange(self: *Surface, config: *const configpkg.Config) void {
+    self.clipboard_read_denied = false;
     self.configureBellBorder(config);
     self.setEraseColor(config.background);
     self.erase_opacity = config.@"background-opacity";

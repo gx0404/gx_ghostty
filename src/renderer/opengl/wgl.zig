@@ -49,6 +49,51 @@ const Target = @import("Target.zig");
 
 const log = std.log.scoped(.opengl);
 
+// Serializes the process-wide gauges and their log order across render threads.
+// Windows Targets own exactly one texture and one FBO; atlas and custom shader
+// textures and the window's default framebuffer are not Targets.
+var target_lock: std.Io.Mutex = .init;
+var target_counts: TargetCounts = .{};
+
+const TargetCounts = struct {
+    objects: u64 = 0,
+
+    fn change(self: *TargetCounts, created: bool) void {
+        if (created) self.objects += 1 else {
+            std.debug.assert(self.objects > 0);
+            self.objects -= 1;
+        }
+    }
+
+    fn report(self: TargetCounts) void {
+        perf.count("renderer.targets_live", self.objects * 2);
+        perf.count("renderer.target_objects_live", self.objects);
+        perf.count("renderer.target_textures_live", self.objects);
+    }
+};
+
+/// Called only after a complete Windows Target exists, and after its GL
+/// resources are deleted. The perf switch is fixed at process startup.
+pub fn targetLifetime(created: bool) void {
+    if (!perf.enabled()) return;
+    const io = global.io();
+    target_lock.lockUncancelable(io);
+    defer target_lock.unlock(io);
+    target_counts.change(created);
+    target_counts.report();
+}
+
+test "target gauges include replacement overlap and return to zero" {
+    var counts: TargetCounts = .{};
+    counts.change(true);
+    counts.change(true); // Resize creates the replacement before deletion.
+    try std.testing.expectEqual(@as(u64, 2), counts.objects);
+    counts.change(false);
+    try std.testing.expectEqual(@as(u64, 1), counts.objects);
+    counts.change(false);
+    try std.testing.expectEqual(@as(u64, 0), counts.objects);
+}
+
 const BOOL = windows.BOOL;
 const HDC = windows.HDC;
 const HGLRC = windows.HGLRC;
@@ -559,6 +604,7 @@ pub const Context = struct {
     /// reset nothing is presented: the context is recreated (`recover`)
     /// and the frame fails with `error.ContextLost`.
     pub fn present(self: *Context, device: *const Device, target: Target) !void {
+        perf.count("renderer.present", 1);
         if (self.lost()) {
             self.recover(device);
             return error.ContextLost;
@@ -609,6 +655,7 @@ pub const Context = struct {
                     ctx.ReadBuffer.?(gl.c.GL_COLOR_ATTACHMENT0);
                     ctx.ReadPixels.?(0, 0, @intCast(target.width), @intCast(target.height), gl.c.GL_BGRA, gl.c.GL_UNSIGNED_BYTE, remote.frame.pixels().ptr);
                     try gl.errors.getError();
+                    remote.frame.readbackComplete();
                     success = true;
                 }
                 if (self.surface.gxRemoteViewDetached()) {

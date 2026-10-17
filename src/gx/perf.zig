@@ -5,6 +5,7 @@
 //! collects them. Metric names use lower-case letters, digits, `_` and `.`;
 //! the summary of a series (`Stats.report`) adds `_p50`, `_p90` and `_max`
 //! to its name.
+//! Counts and gauges use `metric <name> <n>` without a time unit.
 //!
 //! Times come from the awake clock (`std.Io.Clock.awake`): monotonic, and
 //! without the time the system was suspended. `processAgeUs` measures from
@@ -91,6 +92,17 @@ pub fn sinceUs(io: std.Io, from: Instant) u64 {
 pub fn record(metric: []const u8, us: u64) void {
     if (!enabled()) return;
     log.info("{s} {d}us", .{ metric, us });
+}
+
+/// Logs an event count or current gauge value without a time unit.
+/// Disabled measurements do not format, allocate, read a clock or log.
+pub fn count(metric: []const u8, n: u64) void {
+    countWith(log, enabled(), metric, n);
+}
+
+fn countWith(comptime logger: type, on: bool, metric: []const u8, n: u64) void {
+    if (!on) return;
+    logger.info("metric {s} {d}", .{ metric, n });
 }
 
 /// A measurement from `begin` to `end`.
@@ -225,6 +237,34 @@ const windows = if (builtin.os.tag == .windows) struct {
 } else struct {};
 
 const testing = std.testing;
+
+test "count emits one unitless event or gauge only when enabled" {
+    const Capture = struct {
+        var calls: usize = 0;
+        var bytes: [128]u8 = undefined;
+        var line: []const u8 = "";
+
+        pub fn info(comptime fmt: []const u8, args: anytype) void {
+            calls += 1;
+            line = std.fmt.bufPrint(&bytes, fmt, args) catch unreachable;
+        }
+    };
+    Capture.calls = 0;
+    countWith(Capture, false, "scrollbar.paint", 1);
+    try testing.expectEqual(@as(usize, 0), Capture.calls);
+    countWith(Capture, true, "scrollbar.paint", 1);
+    try testing.expectEqual(@as(usize, 1), Capture.calls);
+    try testing.expectEqualStrings("metric scrollbar.paint 1", Capture.line);
+    countWith(Capture, true, "renderer.targets_live", 0);
+    try testing.expectEqual(@as(usize, 2), Capture.calls);
+    try testing.expectEqualStrings("metric renderer.targets_live 0", Capture.line);
+    countWith(Capture, true, "test.max", std.math.maxInt(u64));
+    try testing.expectEqualStrings("metric test.max 18446744073709551615", Capture.line);
+    const before = enabled();
+    defer setEnabled(before);
+    setEnabled(false);
+    count("test.disabled", 1);
+}
 
 test "GHOSTTY_GX_PERF values that turn measurements on" {
     for ([_][]const u8{ "1", "true", "ON", " yes " }) |value| try testing.expect(isOn(value));
