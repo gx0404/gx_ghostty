@@ -93,6 +93,10 @@ pub fn init(opts: Options) !Self {
         }
     }
 
+    // fork(gx): GX-0045 begin: count fully initialized Windows target resources
+    if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(true);
+    // fork(gx): GX-0045 end
+
     // fork(gx): GX-0004 begin: Windows blits the target into the window and exports nothing
     if (comptime builtin.os.tag == .windows) return .{
         .framebuffer = fbo,
@@ -158,6 +162,9 @@ pub fn deinit(self: *Self) void {
     self.texture.destroy();
     self.export_framebuffer.destroy();
     self.export_texture.destroy();
+    // fork(gx): GX-0045 begin: account for released Windows target resources
+    if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(false);
+    // fork(gx): GX-0045 end
 }
 
 pub fn exportDmabuf(
