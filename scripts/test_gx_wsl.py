@@ -571,8 +571,9 @@ class PerfProgramTests(unittest.TestCase):
             return self.program["parse_tasks"](pid + "\t" + path.read_text())[pid]
         before_proc, before_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
         population = {path.name for path in (root / "task").iterdir()}
-        cpu = []
+        cpu, native = [], []
         def worker():
+            native.append(threading.get_native_id())
             begin = time.thread_time()
             total = 0
             for index in range(8_000_000):
@@ -581,6 +582,13 @@ class PerfProgramTests(unittest.TestCase):
         thread = threading.Thread(target=worker)
         thread.start()
         thread.join()
+        # join() returns once the Python thread is done; on a busy machine its kernel task can
+        # linger a moment, so wait (bounded) for it to exit before reading the "after" counters.
+        task = root / "task" / str(native[0])
+        deadline = time.monotonic() + 5
+        while task.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(task.exists(), "worker thread still listed 5 s after join")
         after_proc, after_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
         self.assertEqual(population, {path.name for path in (root / "task").iterdir()})
         process_delta = sum(after_proc[key] - before_proc[key] for key in ("utime", "stime"))
