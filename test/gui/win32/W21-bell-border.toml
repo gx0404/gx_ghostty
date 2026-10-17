@@ -1,0 +1,114 @@
+id = "W21"
+title = "BellBorder zero-padding per-surface four edges, reset, DPI and focus clear"
+# Imported in phase 6 from the external BellBorder fixture W21-after-unlock.toml.
+config = """
+command = powershell.exe -NoLogo -NoProfile
+language = en
+window-save-state = never
+window-padding-x = 0
+window-padding-y = 0
+scrollbar = never
+background-opacity = 0
+bell-features = border,no-system,no-audio,no-attention,no-title
+keybind = f6=new_split:right
+keybind = f8=goto_tab:1
+keybind = f9=goto_tab:2
+"""
+expect = [
+  "A-only: left unfocused surface has four complete thin caution-colour edges even over transparent zero-padding background; right focused surface has none; no focus-stealing overlay",
+  "A-after-reset: left surface's border survives simulated GPU context reset, no black frame or changed grid geometry",
+  "A-dpi192: complete left border at updated pixel width, text/grid resizing follows existing DPI semantics",
+  "focus-cleared: click refocus clears left border without affecting sibling",
+  "hidden-tab-return: returning to tab 1 focuses its active surface and clears its retained hidden-tab bell; no resurrected overlay",
+]
+
+[[step]]
+action = "type"
+text = "Start-Sleep -Seconds 6; [Console]::Write([char]7); Write-Output 'BB23-PUBLIC-BEL-A'\n"
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 7
+
+[[step]]
+action = "capture"
+name = "A-only"
+method = "screen"
+
+[[step]]
+action = "gpu_reset"
+terminal = 0
+
+[[step]]
+action = "sleep"
+seconds = 1
+
+[[step]]
+action = "capture"
+name = "A-after-reset"
+method = "screen"
+
+[[step]]
+action = "dpi"
+value = 192
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "A-dpi192"
+method = "screen"
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "focus-cleared"
+method = "screen"
+
+[[step]]
+action = "type"
+text = "Start-Sleep -Seconds 6; [Console]::Write([char]7); Write-Output 'BB23-PUBLIC-HIDDEN-BEL-A'\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 7
+
+[[step]]
+action = "key"
+keys = "f8"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "capture"
+name = "hidden-tab-return"
+method = "screen"

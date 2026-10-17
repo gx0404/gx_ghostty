@@ -1,0 +1,43 @@
+id = "W23"
+title = "R2-Font: a user family overrides the prewarmed default"
+# Imported in phase 6 from the external R2-Font fixture W21-R2-Font-override.toml.
+# The prompt is PowerShell 7 (pwsh.exe); without it the scenario is SKIPPED.
+requires = ['file:%ProgramFiles%\PowerShell\7\pwsh.exe']
+config = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+font-family = Consolas
+font-codepoint-map =
+window-width = 100
+window-height = 24
+"""
+expect = [
+  "override: Consolas regular, bold, italic and bold italic load independently of default warmup; CJK, Greek and emoji still fall back; expected missing characters do not hang the window",
+]
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "ime_off"
+
+[[step]]
+action = "type"
+text = '''[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Clear-Host; $e=[char]27; [Console]::Write("${e}[0mRegular:     ABCD 0123456789 -> ffi`r`n${e}[1mBold:        ABCD 0123456789 -> ffi`r`n${e}[0;3mItalic:      ABCD 0123456789 -> ffi`r`n${e}[1;3mBold italic: ABCD 0123456789 -> ffi`r`n${e}[0mCJK / Greek: 中文 日本語 한국어 Ω`r`nEmoji / PUA: $([char]::ConvertFromUtf32(0x1F600)) $([char]0xE0B0) $([char]0xF120)`r`nMissing (expected boxes): U+0378=$([char]0x378) U+FFFE=$([char]0xFFFE)`r`n"); $Host.UI.RawUI.WindowTitle='R2-Font override ready'
+'''
+
+[[step]]
+action = "wait_title"
+pattern = "R2-Font override ready"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "override"
