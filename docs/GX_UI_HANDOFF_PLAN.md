@@ -1,6 +1,6 @@
 # GX UI 剩余任务接手计划（主分支收口版）
 
-> 生成日期：2026-10-13。用户已明确暂停功能开发，要求把正式成果合回 `gx_ghostty`、归档后清理关联 worktree，并交接剩余任务。**原产品计划仍是 `not_complete`。本次合入是暂停检查点，不是 GUI、性能、发布或 R0–R6 全部验收通过。**
+> 历史交接生成于 2026-10-13；用户已于 2026-10-14 恢复实施。当前组织、提交授权与验证批次以 [执行计划](GX_UI_EXECUTION_PLAN.md) 和本文件第 9 节为准；第 1—8 节保留历史检查点。**原产品计划仍是 `not_complete`，阶段提交不等于全部验收。**
 >
 > 本文件是新 agent 的入口；同仓 `docs/GX_UI_REMAINING_PLAN.md` 保留原始完整验收契约，必须一并读取。本文覆盖其过时的模型/goal 工具、主分支 SHA、worktree 存在性、合入状态和 R5-00 进度；其 D1–D17、142 叶需求、C/V/P 数值门及 R5 十一流范围不缩减。不要只读摘要后执行，不需要访问旧私有会话才能理解任务。
 
@@ -16,7 +16,7 @@ E:/gx_projects/gx_ghostty/docs/GX_UI_HANDOFF_PLAN.md
 完整完成剩余 R5-00、R5 十一流、C/V/P 与 R6；已闭合源码不重做。未验证、未达标、环境阻塞和历史失败均保留，不将暂停合入或定向测试冒称 complete。除非另获许可，不安装/注册/下载、不操作未知进程或未知用户剪贴板。
 ```
 
-当前这份文档本身不恢复开发。仅审阅时明确发送“只读审阅，不执行”。新会话是否执行以用户的新消息为准。
+上方启动提示保留历史上下文；当前对话已获用户恢复实施授权。新会话是否执行仍以用户的新消息为准。
 
 ## 1. 当前源码与收口选择
 
@@ -179,8 +179,8 @@ WSL 发行版 `Ubuntu-24.04`，用户 `gx`；本轮未删独立克隆：
 | R5-11c/d | GTK geometry真实尺寸/close/restart、各轴CLI/never/Quick/Wayland；移动已有Surface到空Tab/Window | new_tab_menu路由已存在勿重做；不能placeholder shell；旧focus/listener必须解绑，PIDbirth/PTY/scrollback不变 |
 | V1–V7 | OSC52真实确认回包；BEL/audio；Alpha DWM；BellBorder四角；搜索/滚动真实来源；Win IME/Quick/DPI/首帧/reset；GTK modern/Wayland/硬件 | 原 §7.2，unit/native/日志不代真实逐图；未知剪贴板不读/备份；app reset不代TDR，Xvfb不代硬件/WM/IME |
 | R6-1/1R/2 | 用户真源/CHANGELOG 0.0.3(TBD)/规则/registry；删除已无消费者的三个Win shim；不抬规则预算 | 不改main、不bump；当前public/ownership文档和旧描述待收口；root及域16KiB/KB2.5MiB约束保留 |
-| R6-3/4/4A/4W | 最终真源freeze后生成、framework/CI、完整Win main+VT与POSIX+GTK；按实际影响跑CABI/freestanding；三webdata末项全文及suffix | KB可在本检查点更新但不代表最终fresh永续；graph及全量门仍实查；tinyio权限FAIL不能skip洗绿 |
-| R6-5/6/7/8 | 最终真实GUI全包和性能矩阵、独立复审、后续本地no-ff、最终gx实树再构建/测试/图、正常清理和真实交付 | 本轮归档清理只完成暂停收口，不关闭未来最终验收与清理；必需门全过才能complete |
+| R6-3/4/4A/4W | 原完整验收合同：生成、framework/CI、Win main+VT与POSIX+GTK、CABI/freestanding、webdata；当前执行按第9节和执行计划，不再重复已跑main | KB可在本检查点更新但不代表最终fresh永续；graph及全量门仍实查；tinyio权限FAIL不能skip洗绿 |
+| R6-5/6/7/8 | 原完整验收合同：真实GUI/性能、独立复审与交付；当前构建/复验/延期项以执行计划为准，不按历史安排重复构建 | 本轮归档清理只完成暂停收口，不关闭未来最终验收与清理；必需门全过才能complete |
 
 ### 性能门速查（不替代原 §6.2）
 
@@ -212,7 +212,7 @@ just build
 just wsl --clone "~/src/gx_ghostty-R5-00-overlay" build --gtk
 ```
 
-最终阶段还须 `just test`、`just test-vt`、WSL完整POSIX/GTK、`just framework-check`、`just ci-check`、适用的VT/CABI/wasm、`just build -Demit-webdata`、`just generated-check`、`git diff --check`。**定向 481 或历史 79/21 不能代全量。** 新语料写完才 `just kb`；i18n/pinyin/Fluent/graph 只能生成器更新，禁止手改产物。GUI按原W01–W20/G01–G14及外部/新增case完整逐图；W08等先有安全fixture；重要转场重新observe，guard失败立刻停止而非重试洗绿。
+本段原完整验收安排已由 2026-10-14 批准的 [执行计划](GX_UI_EXECUTION_PLAN.md) 取代：Windows/GTK 完整 main 已各运行一次，不再重复；后续只合并受影响定向与 GUI 场景。VT、独立 POSIX/C ABI/wasm、硬件和性能等按批准延期表保留 PENDING，P4 保留 FAIL。i18n/pinyin/Fluent/KB/graph 只能经生成器维护；聚合检查与组成项不重复。历史失败原件保留，当前逐图结论见证据索引。
 
 交付逐项写 PASS / FAIL / PENDING / BLOCKED / N/A（带理由）；CLOSED只表示源码发现关闭。保存 source/tree/dirty、标准exe/receipt/hash、命令exit、seed/filter/skip、raw/截图及清理身份。没有完整必需门时整体永远是 `not_complete`。
 
@@ -251,9 +251,12 @@ just wsl --clone "~/src/gx_ghostty-R5-00-overlay" build --gtk
 
 ## 9. 2026-10-14 R6 收口检查点
 
-本节只更新组织方式与入口，不替代前文验收契约，也不关闭任何门。整体 **not_complete**。
+本节覆盖前文历史进度，不替代原验收契约。整体 **not_complete**。
 
 - 任务组织、模型分工、重型槽、构建频次与提交授权以 [GX_UI_EXECUTION_PLAN.md](GX_UI_EXECUTION_PLAN.md) 为准：只派当前会话的原生子智能体（同时最多 10 个），本地阶段 commit 已授权，仍不 push、不建 PR/Issue/tag/release、不新增下载。原定 02:48 截止已超期，如实保留。
-- 最近的完整候选证据是 final-r2（`candidate-20261014-0250`），结果、限制与补验入口见 [GX_UI_EVIDENCE_INDEX.md](GX_UI_EVIDENCE_INDEX.md) 2.1 与第 6 节。它之后的源码修改尚未编译，任何新结论都要绑定新的构建身份。
+- 阶段实现已提交为 `8a2b4bb59`，GTK 恢复泄漏、VM 测试隔离和远程粘贴事务修复分别在 `de3149e1f`、`03c8e138f`、`c9dd5eb7c`；远程取消与回收、打包 GUID、VM 夹具与接收器关联令牌在 `ff41652c2`、`84671b9b6`、`b0de75a1b`、`f55771d84`、`432f91eb4`、`3aeb28f15`。2026-10-17 核对时 HEAD 为 `3aeb28f15`，产品源码无未提交改动，`src/**` 与 r4 构建前快照逐文件一致，无需重编；Win11 原容器已复用重启，旧客机 PID 不视为在运行；交接时仍须重新实查 HEAD 与 dirty。
+- 当前最终候选 app 为 `zig-out-delivery-r4/bin/ghostty.exe`（SHA256 `eece67e02e54823a8336849359776c86fe1195c1fef4d721c146f40013c37e90`，setup `de2a8101…c9ea`）；r3 `95d7a015…8eba` 与更早 `cc2edbc9…663f76` 的证据各自绑定其身份。GTK 已验快照 `38e3e644f`。历史完整 main 各跑一次，新修复集中构建与定向复验。
+- GTK 生命周期 38/38、20 图通过，原终端迁移后 PID/PTY 保持、恢复前确认及两次正常退出已验证。Windows session/IPC、W20、W01/W15/W16，以及增强观测后的 W09/W12 通过；Popup 原生 21 项与 13 图限定通过。具体边界见证据索引。
+- 远程取消、映射替换与退出清理已在 r3 真实场景复验通过（52 图已读，目标丢失 15/15 干净退出，330 次布局变化无断连）。真实 Win11 接收器 1346 修复后又出现 err=5，四组权限实验证明需 `0x18B`；r4 安装版接收器启动与双向关联认证已通过，实际拖放的预览、回执与不追加回车待验。r3 安装后卸载无残留，r4 安装与 JumpList 通过；通知早期三次未显示原因未明，原生探针、诊断版与 r3 原版对照均能显示，不宣称诊断日志修复了它。通知冷热激活与 r4 最终卸载仍须完成。VM 历史单测误操作与异常关机证据保留，磁盘未丢失。
 - 第 2.3 节的 R5-00 与第 5 节各流的源码大部分已接线：普通窗口本地/远程混合树、远程输入与绑定续延（GX-0043、GX-0044）、两端会话恢复（默认关）、Windows 单实例与 `-e` 独立、protected paste 与跨权限拖放 broker、Shell 身份下的 Toast/JumpList、UIA、全拼、Fluent 图标与默认关闭的 Popup DComp，以及 GTK 的生命周期、geometry、分屏迁移、快捷键编辑器与启动配置管理器。接线不等于验收：第 5 节每一行的完成门照旧适用。
 - 用户可见行为写在 [GX_FEATURES.md](GX_FEATURES.md)「会话、实例与远程窗格」与根 `CHANGELOG.md` 的 `0.0.3(TBD)`；上游补丁 GX-0039～GX-0044 登记在 [FORK_PATCHES.md](FORK_PATCHES.md)。

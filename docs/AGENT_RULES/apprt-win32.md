@@ -76,7 +76,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 - 按像素合成：`Backdrop.perPixel` 的顶层窗口开了 DWM blur-behind，按客户区像素 alpha 合成，GDI 画出的像素 alpha 为 0 即全透明；在顶层窗口与终端子窗口上作画一律经预乘 32bpp DIB（`Backdrop.fillBackground`、`fillOpaque`），不直接用 `FillRect` 或画笔；能否按像素合成启动时定一次（`App.alpha_frames`）。
 - 颜色与动效以 `src/gx` 为真源：`style.Tokens` 逐字段镜像 `gx.ui_tokens.Tokens` 并带 `gx.chrome` 的颜色（编译期校验），`anim` 只留时钟与 `Tween`，时长与曲线取 `gx.motion`；改色值、对比度或动效先改 `src/gx`，不在 win32 另写常量。时钟线程随首个动画启动并 detach 常驻；tick 回调可先 `stop` 自己再释放所有者。
 - 新增自定义消息或计时器先查上表，同一 HWND 不重号，`WM_TIMER` 分派保持完整，并把新 ID 写进上表。
-- 配置：`App.config` 只在 GUI 线程的 `config_change` 中替换；token 在绘制时由当前配置派生（`style.fromConfig`），不跨线程缓存 `*const Config`。
+- 配置：`App.config` 只在 GUI 线程的 `config_change` 中替换；token 在绘制时由当前配置派生（`style.Tokens.fromConfig`），不跨线程缓存 `*const Config`。
 - 外部线程（UIA MTA、WinRT、IPC 与 broker 工作线程）只拿 owned 快照或投递消息，不借用 Surface、RemotePane 或帧映射；GUI 实际执行后才回复成功。OLE 注册 HWND 在外层循环撤销注册后才销毁；拖入与远程粘贴走 protected paste，不自动加 Enter。
 - 远程：源持有终端、PTY、渲染与绑定，目标只持有画面与 UI；断连不重放已执行的输入或动作；混合标签不跨进程，Quick Terminal 与 Session 不收远程叶。单实例转交（`App.routeInitialLaunch`）先于热键与 Surface，结果不明即报错退出。
 - Popup DComp 仅 `GHOSTTY_GX_POPUP_DCOMP=1` 启用、只影响弹层，失败退回 legacy 绘制。

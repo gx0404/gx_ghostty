@@ -4,12 +4,12 @@
 
 ## 1. 真源与证据边界
 
-- 完成合同：`docs/GX_UI_REMAINING_PLAN.md` 第 6—9 节；进度补充：`docs/GX_UI_HANDOFF_PLAN.md` 第 8 节。本轮用户确定的并行实施、默认恢复关闭、`-e` 独立、Docker 测试机、DComp 默认关闭，以及 2026-10-14 起的本地阶段 commit 授权（仍不 push、不建 PR/Issue/tag/release、不新增下载），优先于旧计划的历史授权措辞；任务组织见 `docs/GX_UI_EXECUTION_PLAN.md`。
-- 本轮执行账本：`.local/evidence/R5/execution-20261013/tasks.json`。核对时所有必需任务仍为 PENDING；其中的批次 PASS 只证明明确选中的范围。
+- 完成合同：`docs/GX_UI_REMAINING_PLAN.md` 第 6—9 节；进度补充：`docs/GX_UI_HANDOFF_PLAN.md` 第 9 节。本轮用户确定的并行实施、默认恢复关闭、`-e` 独立、Docker 测试机、DComp 默认关闭，以及 2026-10-14 起的本地阶段 commit 授权（仍不 push、不建 PR/Issue/tag/release、不新增下载），优先于旧计划的历史授权措辞；任务组织见 `docs/GX_UI_EXECUTION_PLAN.md`。
+- 本轮执行账本：`.local/evidence/R5/execution-20261013/tasks.json`。总状态仍为 not_complete；批次 PASS 只证明明确选中的范围，P4 保留历史 FAIL。
 - 原叶需求账本：同目录 `leaf-matrix.json`，共 **21 组、142 叶**，其中 Windows R2 为 117 叶、GTK R3 为 25 叶；`results={}`、`case_to_leaves={}`，最终逐叶状态仍全部 PENDING。该文件保留原候选 `d6f9e1c…` 身份，同时另记本轮基线，不能把两个树当成一个最终树。
-- 本轮主仓 HEAD 实查为 `ecdac24009f87a0694bd33fb2bc0ec4f65a546ad`，新增实现仍在工作区。本文引用当前源码入口，不声称该 HEAD 已包含工作区改动。
-- 最新有证据的 Windows 候选是 final-r2 的 `candidate-20261014-0250`（见 2.1）；更早的 **windows-app-06**（SHA256 `7557404780b692387db62a3662826a4fd7f9f04b10844f0804831042faffe0f5`）只证明远程单叶迁移与 Palette 回收修复。两者都不覆盖 10:00 之后的源码。
-- 当前图谱不含新远程模块；查询已成功，提示技能文本与本地 graphify 包版本不同。这里只用图谱作旧入口导航，新增事实以源码为准；最终冻结仍须重建。
+- 本轮已提交 `8a2b4bb59`、`de3149e1f`、`03c8e138f`、`c9dd5eb7c`、`ff41652c2`、`b0de75a1b`、`84671b9b6`、`f55771d84`、`432f91eb4`、`3aeb28f15`；2026-10-17 核对时产品源码无未提交改动。构建身份始终用当时 HEAD 加文件摘要，不回写历史 receipt。
+- 当前最终候选为 `zig-out-delivery-r4/bin/ghostty.exe`（SHA256 `eece67e02e54823a8336849359776c86fe1195c1fef4d721c146f40013c37e90`），只在 r3 `95d7a015…8eba`（50 项定向通过）基础上改接收器启动令牌权限。此前 `zig-out-delivery` 的 `cc2edbc9…663f76` 证据仍绑定其自身。`candidate-20261014-0250` 与 windows-app-06 为历史证据。
+- r3/r4 图谱已用钉版生成器重建并包含远程模块；35 处头文件解析警告仍为覆盖限制。后续诊断源码有变，最终需按指纹检查决定重建；技能版本警告不触发工具升级。
 
 本文用 U 表示纯逻辑或定向测试，N 表示实际原生调用，G 表示真实交互及已读截图，P 表示原性能合同。U/N 不代 G，构建成功不代运行，单个 G 不代 142 叶，运行器退出 0 不代读图。下面各表中的 PENDING 指**完整任务验收**；已有子证据单独注明。
 
@@ -17,7 +17,36 @@
 
 ## 2. 本轮已经能证明的范围
 
-### 2.1 最终候选 final-r2（`candidate-20261014-0250`）
+### 2.0 后续修复与已验范围（2026-10-17 核对）
+
+本节 `F` 指 `E/final-r2/`。以下结果均为限定范围，未关闭原完整验收门。
+
+| 证据入口 | 实际结果 | 限制与后续 |
+|---|---|---|
+| `F/delivery-r3-identity.json`、`F/delivery-r3-targeted.json` | 合并 app/test-bin 构建通过；受影响 50/50，seed `0x52553301`、jobs 2；补丁/测试根 89 项通过 | `95d7a015…eba`；覆盖退出队列、映射 ACK 寿命、取消、令牌配对和输入队列。真实场景及安装包仍待验 |
+| `F/paste-input-target-verified-manifest.json` 与 Debug/ReleaseFast 日志 | 精确生产源码小入口各 7/7；修复 ReleaseFast 的 paste T=9 被覆盖为 1 | 已提交 `c9dd5eb7c`；不代所有远程交互 |
+| `F/delivery-remote-subset/review-root.json` | 9 native checks、4 图通过；外部 MTA、once、performable、选择复制、安全粘贴 | app `cc2edbc9` |
+| `F/delivery-r3-remote/review.json`、`review-root-spotcheck.json`、`F/windows-visual-review/review-r3-spotcheck.json` | r3 取消后输入 PASS；回收后退出 15/15；330 次分屏与布局变化无非预期断连 | 52 图已读完：附加 25 图见 `review-remaining.json`（10 PASS、15 张历史夹具失败图无异常、0 视觉失败）；r1—r4 的新夹具错误有独立说明，不改写旧产品失败 |
+| `F/delivery-r3-package-identity.json` | 离线 setup 与 zip 生成并核包内 exe SHA；setup `17a4dca5…`、zip `c9e0aa2c…` | 首次 ISCC GUID 转义失败已修复；104 打包/发布契约测试（6 skip）；VM 安装与卸载见下方 r3 行 |
+| `F/delivery-r3-framework.log`、`delivery-r3-kb-recheck.log`、`delivery-r3-generated.log` | 929 框架测试（17 skip）仅 KB 过期失败；重建后仅复跑失败类 6/6；生成物检查 PASS | 保留首次失败，不重跑无关全套；图谱 35 处头文件解析警告记录为工具覆盖限制 |
+| `F/delivery-remote-full/review.json` | source-loss-r4 19 PASS/1 FAIL；target-loss-r4 7 PASS/1 FAIL；27 图已读 | 取消粘贴注入控制键、回收后退出崩溃；另 r3 偶发映射替换断连。三项修复已在 r3 复验通过，原 FAIL 保留 |
+| `F/gtk-lifecycle-fix2-full/`、`F/gtk-lifecycle-fix2-restoreprobe-a/`、`F/gtk-lifecycle-fix2-restoreprobe-b/`、`F/gtk-lifecycle-fix2-gscenarios/` | 快照 `38e3e644f`：生命周期 38/38、20 图由 Opus 逐张审阅；恢复探针 7/7、6/6；受影响 G15/G16 通过 | 原 PID/birth/PTY 保持、关闭旧窗仍可输入、双 quit=0；只证 Xvfb 软件路径，combined build receipt 为 non-install |
+| `F/uia-uac-targeted.json` | 103/103 PASS，seed `0xf66f6cc7` | 包含 UIA 寿命、叶关闭与 UAC 身份模型；不代真实 VM 接收器启动 |
+| `F/resume-w-repairs/*/review-root.json` | W06/W07/W14/W16 修复验证，19 图已读 | `d433edce` 候选，后续无关改动按影响复用 |
+| `F/delivery-session-ipc/review-root.json` | 4 native 组、7 图通过 | 单实例复用、`-e` 独立、恢复默认关闭、自定义 profile 每次确认、Quit 保留和关闭清空 |
+| `F/delivery-w20/W20/review-root.json` | 23 步、6 图通过 | 关闭与切标签后无旧尺寸提示，观测 0.530/0.509 秒早于 0.750 秒超时；真实 resize 提示保留 |
+| `F/delivery-windows-gaps/review.json`、`F/delivery-windows-w09-w12/review.json` | W01/W15/W16 通过；W09/W12 增强夹具后通过，4 张新图已读 | W09 区分初始焦点与两次切换；W12 在物理松开前已观察到释放；没有放宽次数要求 |
+| `F/delivery-popup-uia/review-opus.json` | 21 native 检查、13 张 screen 图已审阅；6 次外部 MTA；DComp 关闭/开启/reset/五故障回退 | 3 张像素与 legacy 相同，不能单凭图分辨后端；后端状态与其余图另列，字体约 1 px 差异原因未定，不代性能门 |
+| `F/vm-resume/BROKER-CGL-CONCLUSION.md` | 真实 split-token 菜单可见，接收器启动 FAIL：1346，后续配对 BLOCKED；旧 GL 关闭漏查退出码，已撤销其正常退出 PASS | 新探针确认正确 HWND/CloseMainWindow=true，崩溃偏移与宿主同为 `0x145992`；r3 launcher 真实复验仍 err=5；退出清理已三次退出0；r4 接收器启动与配对已通过（见下行），不能把旧超时猜作死锁 |
+| `F/delivery-r4-identity.json`、`F/delivery-r4-package-identity.json` | r4 app `eece67e0…7e90` 构建 exit 0，相对 r3 只改接收器启动令牌 `0x0B`→`0x18B`（Leaf 仅换行符）；离线 setup `de2a8101…c9ea`、zip `9d440ea5…fc25f`，包内 exe 哈希一致 | r3 的 50 项定向与远程/GUI 证据只覆盖未改逻辑，不计为 r4 新套件；Toast 诊断 app `435c87aa…236e`（`F/toast-diag-identity.json`）不作最终包，四个诊断源码文件已精确撤回，补丁留存 `F/toastdiag-final.patch` |
+| `F/vm-resume/guest-out/inst-r3--gxadmin--20261014-072851-661-install.json`、`…-085738-054-uninstall.json`、`r4-owned-files-residue-post-uninstall-r3.json` | r3 安装 exit 0、注册齐全；卸载 exit 0，AppPath/Background/Directory/ShellAumid/ShellClsid 均不存在，`Apps\inst-r3` 目录不存在 | PASS_NATIVE_SCOPED；r4 最终卸载残留仍 PENDING |
+| `F/vm-resume/guest-out/inst-r4--gxadmin--20261014-090045-197-install.json`、`…-091411-809-broker-peer.json` | r4 安装 exit 0、用户范围、未提权，app 哈希核对通过；提权 host 10180 经菜单启动 receiver 8260，双向关联认证与配对 PASS（high 567492 / medium 567552，同 SID、会话 1） | 首次 peer 因夹具引号匹配 FAIL，原件保留，改 CommandLineToArgvW 后重跑通过；PID 为 10-14 历史值，不代今日运行；实际 DoDragDrop 预览、回执与不追加回车 PENDING |
+| `F/vm-resume/handoff-r3.txt`（JumpList 与 Toast 段）及截图 win11-91…139 | JumpList 键盘打开，选择 PowerShell 启动配置在同一进程 2912 新开窗口，PASS；原生同 AUMID 探针（104）、诊断版（120—122）与 r3 原版重启对照（136）均显示横幅 | 早期三次 OSC 未显示（92—98）保留 FAIL，原因不明，不宣称诊断日志修复；诊断版热激活未核到产品侧日志，冷热激活 PENDING |
+| `F/vm-resume/INCIDENT-test-docker.md` | 单测误操作导致 VM 异常关机，真实存储未丢失；修复测试 11/11 | 容器精确归属校验与测试 subprocess 隔离已提交 `03c8e138f`，原事件仍保留 |
+| `F/identity-20261017.json`、`tasks.json` 的 `resume_20261017` | `src/**` 1223/1223 与 r4 构建前快照一致；r4 app/setup/zip 与 r3 test-bin 哈希全部匹配；framework-check 936 项（17 skip）通过；Win11 原容器复用重启，live UUID 匹配，heavy session 9120 | 只证身份连续、无需重编，不新增测试结论；10-14 的客机 PID 不代今日运行 |
+| `F/evidence-resume/reconciliation-20261014.json`、`F/evidence-resume/leaf-map-draft.json` | 142 叶映射草稿、来源摘要与缺口分类 | 正式签收全部仍 PENDING，映射不制造重复场景 |
+
+### 2.1 历史完整候选 final-r2（`candidate-20261014-0250`）
 
 `F` 指 `E/final-r2/`。该候选由 2026-10-14 约 02:46 的工作区一次构建（`F/final-build.log`；此前 `F/m1-build.log` 的 ReleaseFast 测试构建 9 处编译错误作为失败原件保留）。此后 root 继续修改 App、Surface、Window、Palette、SearchBar、Remote* 与 runtime helper（`F/app-review/` 留有 10:31 的快照与 diff），新快照 `80fd77531` 在唯一主树构建到 `zig-out-resume`（含 install、test-bin 与 `-Demit-webdata`；不覆盖 02:50 产物，非完整 main）：首编 session 48133（源快照 `F/evidence-resume/source-snapshot-20261014T025803Z-ecdac2400-resume-prebuild.json`）**FAIL**，4 处接线错误由 root 修复；修复编译 session 44734（源快照 `...T030359Z-ecdac2400-resume-repair-prebuild.json`）**尚未编译通过**，同目录另有 `T030732Z` repair2 快照，其构建结果待 root 确认；**新源码未经验证前，下表结论不继承到当前工作区**；`F/windows-fixtures-resume/` 下基于旧 02:50 产物的预演只用于调通夹具；Windows、GTK 完整 main 各已运行一次，按计划不重复，新编译后只重跑受影响的定向测试与场景。
 
@@ -67,7 +96,9 @@
 
 必须保留的失败原件还包括 `windows-06` 旧全拼断言、`windows-11` SRW 编译失败、`windows-app-03` 缺 RDW 常量、相对隔离目录的 `windows-gui-01`、session fixture01—03 及 GUI/WSL runner 原失败。修复后的有限子集只关闭对应原因，不删除原证据。
 
-## 3. R5 源码入口与剩余硬门
+## 3. R5 源码入口与原完整验收门
+
+下表保留完整合同导航；已取得的限定证据以第 2.0 节为准，不能把本表历史待验描述当成当前交付必须全量重跑的清单。
 
 | 合同 | 当前可核源码入口 | 本轮证据与完整状态 | 仍需实现或补验 |
 |---|---|---|---|
@@ -75,18 +106,18 @@
 | R5-01 | W `TabTransfer.zig::run`、`tab_transfer.zig::gesture/reparent`、`Window.zig::moveTabToNewWindow/moveTabToWindow`、`Surface.zig::onReparented` | 源码及定向子集；真实完整迁移 PENDING | 15 DIP 严格边界、横向 10 DIP、混合 DPI、完整树/zoom/override/活动 pane、满 tab、SetParent 重入/回滚；迁移后关源窗，核 PID/birth/PTY/Surface/scrollback 不变 |
 | R5-01X | `src/gx/remote_view.zig`、`remote_protocol.zig`、`remote_binding.zig`；W `Leaf.zig`、`Pane.zig`、`RemotePane.zig`、`RemotePaneUi.zig`、`RemoteSource.zig`、`RemoteCoordinator.zig`、`RemoteInput.zig`、`RemoteHost.zig`、`ipc/remote_frame.zig`、`RemoteChannel.zig`、`RemoteService.zig`、`ui/uia_remote.zig`；`wgl.zig::Context.present` GX-0043；`src/Surface.zig` GX-0044 | final-r2 两进程普通窗口迁移、远程输入、混合分屏、目标崩溃恢复 native 7 项与 4 图 `PASS_SCOPED`；完整 PENDING | 普通窗口的 Leaf 混合树、目标交互与源端绑定续延已接线，`RemoteInput` 转发物理键、文本、IME、鼠标与 protected paste 分块；10:00 后的 runtime helper 修改未编译。仍缺：拖回原进程、混合标签拒绝跨进程、IME/OLE/MTA UIA/protected paste/搜索/确认在远程窗格上的真实场景，链式绑定 once/performable/断连取消，输入 ACK 丢失后查询，源进程故障显示与会话剪枝，DWM 上屏（非 PrintWindow）与输入到显示延迟 |
 | R5-02 | `src/gx/session.zig`、`session_cwd.zig`；W `Session.zig::tryRestore/onQuit/onWindowClose`；G `session.zig::activate/quit/closing` | app04 两次 custom 恢复限定 PASS；GTK U 与接线；完整 PENDING | 两端多窗嵌套非 0.5 树、zoom/字号/手动标题/合法 cwd、失效 profile、CLI/initial-command、取消关闭、写失败、双 writer、Quick 排除及文件隐私。GTK 真 resize→close→restart 尚需独立场景 |
-| R5-03 | W `ui/uia.zig::Publisher`、`uia_bridge.zig`、Popup/Palette/Menu/Settings/Dialogs/Toast 接线；`scripts/gx_win_uia.py` | root 外部 MTA 有限 PASS；popup 前台失败；完整 PENDING | 新非客户区去重修复的外部 MTA 复验；真实 popup Invoke/Selection/Value/Toggle/Expand、旧 provider inert、焦点/IME/modal 压力、Notification 真接收、读屏、Win10 缺 API。不能以 Show/notify HRESULT 代事件 |
-| R5-04 | W `ole_drop.zig`、`drop_data.zig`、`ui/DropFeedback.zig`、Surface protected paste 与 App owned queue/延后撤销 | medium/注册/撤销原生合同；完整 PENDING | 外部受控 DoDragDrop 与 Explorer 真源、Unicode/文件/URI/多行保护、不自动 Enter、reparent/销毁。跨完整性 broker 已有生产实现：`src/gx/ipc/drop_broker.zig` 合同、W `ipc/DropBroker.zig` 专用管道、`DropBridge.zig`（高端预览确认后经 protected paste 回执）与 `DropCompanion.zig`（显式启动的 medium 接收窗口，核验目标 PID/birth 与映像）；普通 IPC 的 `policy.authenticate` 仍拒绝不同 elevation。尚无任何 broker 运行证据：VM 专用 `test/windows/gx_drop_broker_fixture.py` 的四权限方向矩阵、高端显式预览/取消/拒绝/过期/目标关闭回执均 PENDING；接收窗口目前只能由内部启动参数打开 |
-| R5-05 | W `ShellIntegration.zig::initialize/notify/drain`、`shell/Identity.zig`、`WinRTToast.zig`、`ToastActivation.zig`；安装器/包装接线 | native/编码与 app02+构建子集；完整 PENDING | VM 实际安装/升级/卸载、冷/暖激活、多目标 token、DND/禁用、关闭/Quick、多目录 identity；应用内 `ui/Toast.zig` 不代系统通知 |
+| R5-03 | W `ui/uia.zig::Publisher`、`uia_bridge.zig`、Popup/Palette/Menu/Settings/Dialogs/Toast 接线；`scripts/gx_win_uia.py` | root/remote/popup 外部 MTA 与 popup 13 图限定 PASS；历史前台失败保留，完整 PENDING | 新非客户区去重修复的外部 MTA 复验；真实 popup Invoke/Selection/Value/Toggle/Expand、旧 provider inert、焦点/IME/modal 压力、Notification 真接收、读屏、Win10 缺 API。不能以 Show/notify HRESULT 代事件 |
+| R5-04 | W `ole_drop.zig`、`drop_data.zig`、`ui/DropFeedback.zig`、Surface protected paste 与 App owned queue/延后撤销 | medium/注册/撤销原生合同；完整 PENDING | 外部受控 DoDragDrop 与 Explorer 真源、Unicode/文件/URI/多行保护、不自动 Enter、reparent/销毁。跨完整性 broker 已有生产实现：`src/gx/ipc/drop_broker.zig` 合同、W `ipc/DropBroker.zig` 专用管道、`DropBridge.zig`（高端预览确认后经 protected paste 回执）与 `DropCompanion.zig`（显式启动的 medium 接收窗口，核验目标 PID/birth 与映像）；普通 IPC 的 `policy.authenticate` 仍拒绝不同 elevation。VM 已实测菜单入口；1346 与 err=5 修复后，r4 安装版接收器启动与双向配对 PASS_NATIVE_SCOPED；VM 专用 `test/windows/gx_drop_broker_fixture.py` 的四权限方向矩阵、高端显式预览/取消/拒绝/过期/目标关闭回执均 PENDING |
+| R5-05 | W `ShellIntegration.zig::initialize/notify/drain`、`shell/Identity.zig`、`WinRTToast.zig`、`ToastActivation.zig`；安装器/包装接线 | native/编码与 app02+构建子集；VM r3 安装与无残留卸载、r4 安装 PASS_NATIVE_SCOPED，横幅显示对照通过，早期三次 OSC 未显示保留 FAIL；完整 PENDING | r4 最终卸载、冷/暖激活（升级为批准延期）、多目标 token、DND/禁用、关闭/Quick、多目录 identity；应用内 `ui/Toast.zig` 不代系统通知 |
 | R5-06 | W `ipc/Instance.zig::elect`、Client/Server/Security；`src/gx/ipc/`、App 路由、toggle CLI | 普通 launcher/-e 有限 PASS；完整 PENDING | 多 launcher 竞争、ready 前崩溃、退出、冒名 endpoint、不同 root/build/class/install/elevation、重复 toggle、GUI 失败不得 success ACK；GTK D-Bus 真 quick 行为仍独立验 |
 | R5-07 | `src/gx/fuzzy.zig`、`pinyin.zig`、`pinyin/inputs/0.15.0/`；`scripts/gx_pinyin.py` | 钉版输入与离线生成、定向算法子集；完整 PENDING | fresh checkout 离线全量再生成/许可随包，三 API 同路径、polyphone/ü-v/高亮边界，Windows 动态 tab/字体与 GTK GX 筛选实际读图；P4 不放宽 |
-| R5-08 | W `shell/JumpList.zig`、`ShellIntegration.zig`；`src/gx/windows_argv.zig` 与 startup/profile 路由 | 实现与 native/编码子集；完整 PENDING | 真系统 JumpList 写入/点击、冷启动、removed profile、语言、路径引用、两目录不串台、Abort 保旧、portable 不自动注册；测试环境变量不能隔离系统列表 |
+| R5-08 | W `shell/JumpList.zig`、`ShellIntegration.zig`；`src/gx/windows_argv.zig` 与 startup/profile 路由 | 实现与 native/编码子集；VM 键盘打开 JumpList 并在同一进程新开启动配置窗口 PASS；完整 PENDING | 真系统 JumpList 写入/点击、冷启动、removed profile、语言、路径引用、两目录不串台、Abort 保旧、portable 不自动注册；测试环境变量不能隔离系统列表 |
 | R5-09 | `src/gx/fluent/{inputs,model.zig,paths.zig}`；`scripts/gx_fluent_icons.py`；W `ui/fluent_icons.zig`、D2D 与 Settings selected 图标 | 六个 MIT 官方输入、离线生成/几何子集；完整 PENDING | Windows/Linux 字节再生、许可包、真实多 DPI/暗亮/高对比/禁用/选择图、device/factory 资源域；系统 glyph 默认保留 |
-| R5-10 | W `ui/dcomp.zig::Device/Backend`、`d2d.zig::Canvas.beginBorrowed/finishBorrowed`、`Popup.zig::paintComposition` | 隐藏 HWND native 合同 PASS；生产 GUI PENDING | `GHOSTTY_GX_POPUP_DCOMP=1` 明确 opt-in，默认 off；真 popup 的 reset/target/surface/begin/end/commit、先 legacy 补画、size/DPI/generation 首帧、IME/modal/销毁、Win10/WARP/NVIDIA/Mesa 区分、Fluent 共域及 P4 十对 |
+| R5-10 | W `ui/dcomp.zig::Device/Backend`、`d2d.zig::Canvas.beginBorrowed/finishBorrowed`、`Popup.zig::paintComposition` | 隐藏 HWND native 合同与生产 popup 图限定 PASS；完整 PENDING | `GHOSTTY_GX_POPUP_DCOMP=1` 明确 opt-in，默认 off；真 popup 的 reset/target/surface/begin/end/commit、先 legacy 补画、size/DPI/generation 首帧、IME/modal/销毁、Win10/WARP/NVIDIA/Mesa 区分、Fluent 共域及 P4 十对 |
 | R5-11a | `src/gx/keybind_edit.zig::enumerate/parseValues/apply`；G `shortcut_editor.zig::present`、`app.zig` | GTK 模型与真实 UI 入口已存在；完整 PENDING | 真实录制及执行结果、table/chain/flags、prefix 冲突、下层 unbind、CLI readonly、失败草稿、外部编辑、取消/恢复，中英文暗亮截图 |
 | R5-11b | `src/gx/launch_profile_edit.zig::apply/commit`；G `launch_profiles_dialog.zig::present`、`app.zig` | GTK 管理器实现；G16 原失败及修后 runner 原件均保留；完整 PENDING | CRUD/default/rename 引用影响、只读来源、删覆盖后下层重现、跨窗/重开同步、旧 shell 不重启、保存失败和外部编辑；打开窗口本身不代这些动作 |
-| R5-11c | G `window_state.zig::install/restore/closing/quit`、session 生命周期、`window.zig::popupNewTabMenu` | 定向 U/接线；完整 PENDING | 真实 resize→close→restart、各轴 CLI、max/tiled/fullscreen 不污染、never/Quick/取消关闭；Wayland 不承诺 XY，需真 WM 环境 |
-| R5-11d | G `split_transfer.zig::perform`，K window/split_tree 的空树收养与 listeners | G15 输出保留有限 PASS；完整 PENDING | PID/birth、Surface/PTY/scrollback 恒等，嵌套/zoom/连续移窗、旧窗关闭后 split/title/search 可用、OOM/回滚与迟到 focus |
+| R5-11c | G `window_state.zig::install/restore/closing/quit`、session 生命周期、`window.zig::popupNewTabMenu` | 真实 resize→close→restart 几何限定 PASS；完整 PENDING | 真实 resize→close→restart、各轴 CLI、max/tiled/fullscreen 不污染、never/Quick/取消关闭；Wayland 不承诺 XY，需真 WM 环境 |
+| R5-11d | G `split_transfer.zig::perform`，K window/split_tree 的空树收养与 listeners | 生命周期 38/38、20 图，PID/PTY 与关旧窗继续输入限定 PASS；完整 PENDING | PID/birth、Surface/PTY/scrollback 恒等，嵌套/zoom/连续移窗、旧窗关闭后 split/title/search 可用、OOM/回滚与迟到 focus |
 
 **Windows 11a/11b 范围说明。** 原合同 R5-11 标题和四子任务明确为 GTK。当前 W `ui/Keybinds.zig` 是速查/查询录制并执行已有动作，未消费 `keybind_edit`；W `ui/Menu.zig::showProfileMenu` 提供启动、分屏和默认 shell 设置，未接 `launch_profile_edit` 管理 UI。因此不能声称 Windows 已有完整快捷键编辑器/profile CRUD；也不能把本次核查自行扩张为原合同没有的 Windows 新必过项。共享编辑模型测试不证明任一平台完整 UI。
 
@@ -171,13 +202,13 @@
 
 - 模块定向：`just test --filter apprt.win32 --filter gx.session`，或实际受影响的新模块过滤器；GTK 用 `just wsl test --gtk --filter <实际名称>`。完整运行期筛选和 seed 以相应批次 JSON 的 `build/filters/reproduce` 为准；零命中不计通过，`--no-build` 需身份一致。
 - 原场景：Windows `just win-gui run --out <新的绝对隔离目录> W01 ... W20`；GTK `just wsl scenario --out <目录> G01 ... G16`，另保留外部 BellBorder 与所有 R5 场景。不要为了填 142 行机械创建 142 个场景。
-- final-r2 之后的最小 GUI 补验（新编译后、身份一致时）：W07 按改写后的非模态 Notice 场景重跑并读 `notice`、`split-with-notice`、`after-close` 三张图；W14 复验预览修复；W16 复验首项高亮并逐图签收（三项源码 root 已修，待本批编译）；BellBorder 与粘贴守门的修复按影响面补外部 BellBorder 与 W08；W06 需 `--allow-side-effects`，会打开默认浏览器访问 `http://127.0.0.1:9/`，未获许可时保持 SKIPPED；其余 W 场景读图前记 PENDING。G01—G16 的旧图已限定 PASS，新 GTK 快照只按影响面重跑。
-- 远程窗格：`test/windows/gx_remote_fixture.py`（需显式开启远程测试钩子的冻结 exe）已覆盖两进程迁移、输入、混合分屏与目标进程丢失；拖回、混合标签拒绝、源进程故障与远程窗格上的 IME/UIA/OLE/protected paste 尚无夹具步骤，补齐前不签 R5-01X。
+- 本轮 W06/W07/W14/W16、W20、W01/W15 和增强后的 W09/W12 已有读图结论，见第 2.0 节；后续只按实际改动影响补验。GTK 生命周期、G15/G16 已在修复后的快照通过。
+- 远程窗格：`test/windows/gx_remote_fixture.py` 已包含拖回、混合拒绝、源/目标丢失、IME/UIA/OLE/protected paste 与 session 剪枝。当前只需新构建复验取消、映射替换和干净退出三项修复，再按受影响链路确认输入回退、once 与回收；不重复已经有同路径证据的全部组合。
 - 跨权限拖放：`test/windows/gx_drop_broker_fixture.py` 只在 VM 中按模块文档的 setup/target/drop 顺序、从同一用户同一会话预开的 medium/high 控制台运行；它不提权、不用 Explorer、不改 UIPI、不读剪贴板、不发 Enter。
 - Session/IPC：`test/windows/gx_session_ipc_fixture.py --help` 后选择真实新证据批次；同私有 state 多轮恢复仍须每轮核 PID/birth/exe。已有 custom 子场景与其他 session 门分别签收。
 - UIA/DComp：`test/windows/gx_popup_uia_fixture.py --exe <标准exe> --sha256 <构建后实际哈希> --out <新绝对目录> --build <批次>`；`--readonly-root` 只签 root/window/pane MTA 层；`--capture print` 只能诊断，不签 GL/DComp 上屏。脚本内部统一 heavy→desktop；前台/点位失败停止并保留 FAIL，逐张读 `visual-review.md` 指向的图。
-- 系统功能：`scripts/gx_windows_vm.py` 管理的 Win11 VM 已实际 KVM 启动、官方 ISO 验证并到登录界面；证据在 `.local/evidence/R5/VM/`。普通/管理员身份及策略、Win10、安装/升级/卸载、通知/JumpList、OLE 四权限方向仍 PENDING。完整 VM 启动不证明其 GL 能力，先核实际 app 后端。
+- 系统功能：Win11 VM 已运行并有同一用户真实 medium/high 拆分令牌，Mesa 渲染图有效；旧 GL 正常关闭判断因未检查退出码而失效，与远程相同的 `WM_QUIT` 清理崩溃修复后 r3 三次关闭均退出 0。`test/windows/gx_vm_validation.ps1` 已加强退出码与窗口诊断。r3 安装与卸载、r4 安装、JumpList 与接收器配对已有证据（第 2.0 节）；Toast 冷热激活、broker 实际拖放与回执、r4 最终卸载与残留是余下的本次功能门，Win11 卸载不延期；Win10、升级路径、不同账户负向是批准延期项。
 - OLE 专用入口：`test/windows/gx_ole_fixture.py` 与其受控外部 source；以当时 `--help`、已冻结 app/source 哈希和自有窗口守门执行。首个 text 失败在上表，后续正常权限真实成功也不能替代跨权限 broker 与四方向验收。
-- 最终冻结只集中一轮：Windows main `just test`；Windows VT/framework/fmt 由一次 `just ci-check` 提供，避免另重复同样完整套件；独立 POSIX main、GTK main 各一次。单独标准 app build、`generated-check`、webdata 全文尾项与真实 CLI/help/error；VT/C ABI/wasm 按真实影响补充。
-- R6 文档收口（2026-10-14）：本索引、执行计划、交接计划、`GX_FEATURES.md`、`TESTING.md`、CHANGELOG `0.0.3(TBD)`、`FORK_PATCHES.md`（38 个 ID，GX-0044 形状锁 `Gx0044ShapeTests`）与 apprt-win32/gx-core/app-core 规则已按源码更新；三个 Windows 过渡 shim 已删除。源码和文档冻结后由 owner 统一生成 i18n/pinyin/Fluent/KB/graph 并审 diff；这些文档改动会让 KB 过期，不能沿用此前 freshness。文档任务只跑了 `test_fork_patches`、`version.py --check` 与 resolver `--check`，未生成、未跑 Zig 测试或构建。
+- 完整 Windows/GTK main 已各运行一次，原件保留；不因提交/文档重跑。新 Windows 修复只统一构建 app＋test-bin 并跑非零命中的受影响并集。VT、独立 POSIX/C ABI/wasm、硬件与性能门按批准计划延期，不能再把 `ci-check` 与组成项重复运行。
+- root 当前 `just framework-check` 936 项（17 skip）exit 0；KB 曾重新生成且 fresh，本轮文档修改后再次过期，由 root 最终统一生成。R6 冻结后生成 KB/图谱并审 diff；i18n 当前为 671 条，真源不变不重复生成。集中 framework/fmt/generated/diff 检查；打包离线消费最终 app，不加 `--build`。本索引与用户文档不能代替实际运行记录。
 - 最终逐叶需要完整身份、命令退出码、raw 单位/n、读图判定与缺证原因。本地阶段 commit 已获授权（精确暂存、不 push）；commit 只保存可审的工作，不代表任何门通过。全部必需功能和门满足前，`tasks.json` 与最终交付继续 **not_complete**。
