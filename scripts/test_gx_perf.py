@@ -183,6 +183,7 @@ class QuietTests(unittest.TestCase):
         self.probe.vm.return_value = {'win11': {'exists': True, 'owned': True, 'running': False}}
         self.probe.slots.return_value = True
         self.probe.idle.return_value = 600
+        self.probe.session.return_value = {'interactive_console': True, 'process_session': 1, 'active_console_session': 1}
         self.probe.cpu.return_value = {'cpu': 100, 'top': []}
 
     def test_cpu_is_not_a_gate_and_threshold_is_inclusive(self):
@@ -222,7 +223,8 @@ class QuietTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'command_output', side_effect=['Ubuntu-24.04\n', '']) as command:
             self.assertFalse(gx_perf.QuietProbe().wsl('Ubuntu-24.04')['running'])
             self.assertEqual(2, command.call_count)
-        with mock.patch.object(gx_perf, 'command_output', side_effect=gx_perf.PerfError('daemon')):
+        import gx_windows_vm
+        with mock.patch.object(gx_windows_vm, 'docker_executable', return_value='docker'), mock.patch.object(gx_perf, 'command_output', side_effect=gx_perf.PerfError('daemon')):
             with self.assertRaises(gx_perf.PerfError):
                 gx_perf.QuietProbe().vm(self.args.slot_root)
 
@@ -243,6 +245,81 @@ class QuietTests(unittest.TestCase):
         self.assertFalse(raw['running'])
         self.assertEqual('Other', raw['processes'][0]['distro'])
         self.assertEqual('zig', raw['processes'][0]['name'])
+
+    def test_null_titles_redaction_plan_compliance_and_session_errors(self):
+        self.probe.windows.return_value = [{'pid': 5, 'name': 'app', 'title': None},
+                                          {'pid': 6, 'name': 'browser', 'title': 'private ToDesk title'}]
+        self.args.idle_seconds = 5
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertFalse(result['plan_compliant'])
+        self.assertNotIn('private', json.dumps(result))
+        self.assertEqual(['todesk'], result['checks']['blacklist']['raw'][0]['matches'])
+        self.probe.session.return_value = {'interactive_console': False}
+        self.assertEqual(2, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
+    def test_probe_unexpected_exception_is_recorded(self):
+        self.probe.windows.side_effect = AttributeError('unexpected')
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual(2, result['exit'])
+        self.assertEqual('error', result['checks']['windows']['status'])
+
+
+class QuietBatchTests(unittest.TestCase):
+    setUp = QuietTests.setUp
+    def batch_args(self, *extra):
+        import gx_slots
+        with gx_slots.acquire(self.args.slot_root, 'quiet'):
+            pass
+        return gx_perf.build_parser().parse_args(['quiet-batch', '--out', str(self.args.out),
+            '--slot-root', str(self.args.slot_root), *extra, '--', 'dummy-command'])
+
+    def test_checks_are_inside_lease_and_injected_end_uses_guards(self):
+        import gx_slots
+        args = self.batch_args('--injected-input')
+        def run(command, **kwargs):
+            with self.assertRaises(TimeoutError):
+                with gx_slots.acquire(args.slot_root, 'quiet'):
+                    pass
+            row = {'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'],
+                   'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
+            Path(kwargs['env']['GX_PERF_GUARD_LOG']).write_text(json.dumps(row)+'\n', encoding='utf-8')
+            return SimpleNamespace(returncode=0)
+        with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.run_quiet_batch(args, self.probe, run))
+        self.probe.idle.assert_called_once()
+        for name in ('before', 'after'):
+            data = json.loads((args.out / (name+'.json')).read_text())
+            self.assertEqual('all four locks held by this batch', data['checks']['slots']['reason'])
+
+    def test_before_busy_never_runs_command_and_after_busy_invalidates(self):
+        args = self.batch_args()
+        self.probe.idle.return_value = 5
+        runner = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
+        runner.assert_not_called()
+        args.out = args.out.parent / 'second'
+        self.probe.idle.side_effect = [600, 5]
+        with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
+        result = json.loads((args.out/'RESULT.json').read_text())
+        self.assertEqual('INVALID', result['status'])
+        self.assertFalse(result['batch_valid'])
+
+    def test_missing_or_failed_guards_and_command_exception_are_invalid(self):
+        args = self.batch_args('--injected-input')
+        for index, failure in enumerate(('missing', 'failed', 'exception')):
+            args.out = self.args.out.parent / f'bad-{index}'
+            def runner(command, **kwargs):
+                if failure == 'exception':
+                    raise RuntimeError('child setup')
+                if failure == 'failed':
+                    row = {'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'], 'event': 'guard', 'status': 'fail'}
+                    Path(kwargs['env']['GX_PERF_GUARD_LOG']).write_text(json.dumps(row)+'\n')
+                return SimpleNamespace(returncode=0)
+            with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
+                self.assertNotEqual(0, gx_perf.run_quiet_batch(args, self.probe, runner))
+            self.assertEqual('INVALID', json.loads((args.out/'RESULT.json').read_text())['status'])
 
 
 class CounterTests(unittest.TestCase):

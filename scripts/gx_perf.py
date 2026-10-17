@@ -24,13 +24,17 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
   quiet --out DIR [--slot-root DIR] [--idle-seconds 600] [--wait --interval 900 --max-attempts 3]
         Read-only Windows/WSL/VM/input/blacklist checks; probe all slots and immediately release.
         Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON. CPU is observation only.
+  quiet-batch --out DIR [--timeout S] [--injected-input] -- COMMAND [ARGS...]
+        Acquire all shared slots, check immediately inside the lease, run the command, check again
+        before release. End-check failure invalidates the entire batch. Injected input requires
+        batch-bound gx_win_gui guard JSONL; last-input idle is checked at start only in this mode.
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
   win32-idle --exe PATH --out DIR [--tabs 1 --windows 1 --state visible --seconds 60]
   win32-gpu --exe PATH --out DIR              (PDH dedicated GPU bytes, 1/11 terminals)
   win32-mem --exe PATH --out DIR              (PrivateUsage and threads, 1/11 terminals)
         All four accept --label, --config, --env, --label-env LABEL:NAME=VALUE, --runs, --json
         and --diagnostic. New output only, per-round isolated profiles, AB/BA order, no retry.
-        Input uses gx_win_gui guards. Caller owns the desktop/quiet slot and quiet-window policy.
+        Input uses gx_win_gui guards. Use quiet-batch for performance; desktop-only runs are diagnostic.
         run.json and ghostty.log preserve originals; samples.txt contains reduced measurements.
         RESULT.json and SUMMARY.txt describe driver evidence, never a performance verdict.
   remote PATH... [--out DIR] [--json FILE]
@@ -60,6 +64,7 @@ import statistics
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -549,7 +554,8 @@ def label_environments(labels: Sequence[str], common: Sequence[str], overrides: 
 BUILD_PROCESSES = ("zig", "build", "test", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
                    "ninja", "msbuild", "cl", "link", "gcc", "g++", "make", "cmake", "rustc", "cargo")
 BLACKLIST = ("Devin", "devin", "ToDesk", "Kimi Code", "哔哩哔哩")
-BUILD_RUNNER_RE = r'(?:run_unittests\.py|zig_test\.py|zigw\.py\s+build|(?:^|\s)-m\s+(?:unittest|pytest)(?:\s|$)|(?:^|[/\\\s])test_[^\s]+\.py)'
+BUILD_RUNNER_RE = (r'(?:run_unittests\.py|zig_test\.py|zigw\.py\s+build|(?:^|\s)-m\s+(?:unittest|pytest)(?:\s|$)|'
+                   r'(?:^|[/\\\s])test_[^\s]+\.py|gx_(?:win_gui|perf|wsl|windows_vm)\.py|test[/\\]windows[/\\][^\s]+\.py)')
 
 
 def command_output(argv: Sequence[str]) -> str:
@@ -580,6 +586,29 @@ def validate_slot_root(root: Path) -> Path:
 
 
 def user_idle_seconds() -> float:
+    session = input_session()
+    if not session['interactive_console']:
+        raise PerfError(f'GetLastInputInfo is not in the active console session: {session}')
+    tick, now = last_input_ticks()
+    return ((now - tick) & 0xFFFFFFFF) / 1000
+
+
+def input_session() -> dict:
+    if sys.platform != 'win32':
+        raise PerfError('input session check requires Windows')
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.ProcessIdToSessionId.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    kernel.ProcessIdToSessionId.restype = ctypes.c_int
+    kernel.WTSGetActiveConsoleSessionId.restype = ctypes.c_uint32
+    current = ctypes.c_uint32()
+    if not kernel.ProcessIdToSessionId(os.getpid(), ctypes.byref(current)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    active = kernel.WTSGetActiveConsoleSessionId()
+    return {'process_session': current.value, 'active_console_session': active,
+            'interactive_console': active != 0xFFFFFFFF and active == current.value}
+
+
+def last_input_ticks() -> tuple[int, int]:
     if sys.platform != "win32":
         raise PerfError("GetLastInputInfo requires Windows")
     class LASTINPUTINFO(ctypes.Structure):
@@ -592,7 +621,7 @@ def user_idle_seconds() -> float:
     kernel.GetTickCount.restype = ctypes.c_uint32
     if not user.GetLastInputInfo(ctypes.byref(info)):
         raise ctypes.WinError(ctypes.get_last_error())
-    return ((kernel.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
+    return info.dwTime, kernel.GetTickCount()
 
 
 def process_name(name: str) -> str:
@@ -601,10 +630,15 @@ def process_name(name: str) -> str:
 
 class QuietProbe:
     def windows(self) -> list[dict]:
-        data = powershell_json("$runners=@{}; Get-CimInstance Win32_Process | ForEach-Object {"
-                               f"$runners[[int]$_.ProcessId]=[bool]($_.CommandLine -match '{BUILD_RUNNER_RE}')}}; "
-                               "@(Get-Process | Select-Object @{n='pid';e={$_.Id}},"
+        data = powershell_json("$items=@(Get-CimInstance Win32_Process); $exclude=@{}; $current=$PID; "
+                               "while($current -gt 0 -and !$exclude.ContainsKey([int]$current)){"
+                               "$exclude[[int]$current]=$true; $p=$items | Where-Object ProcessId -eq $current; "
+                               "$current=$p.ParentProcessId}; $runners=@{}; $unknown=@{}; $items | ForEach-Object {"
+                               f"$runners[[int]$_.ProcessId]=[bool]($_.CommandLine -match '{BUILD_RUNNER_RE}'); "
+                               "$unknown[[int]$_.ProcessId]=!$_.CommandLine}; "
+                               "@(Get-Process | Where-Object {!$exclude.ContainsKey($_.Id)} | Select-Object @{n='pid';e={$_.Id}},"
                                "@{n='name';e={$_.ProcessName}},@{n='title';e={$_.MainWindowTitle}},"
+                               "@{n='command_line_unavailable';e={$unknown[$_.Id]}},"
                                "@{n='build_runner';e={$runners[$_.Id]}}) | ConvertTo-Json -Compress")
         if not isinstance(data, list) or not data:
             raise PerfError("Windows process inventory is missing")
@@ -633,7 +667,8 @@ class QuietProbe:
     def vm(self, slots: Path) -> dict:
         # status historically treats a failed docker inspect as an absent VM.
         # Verify daemon access first so an unavailable daemon cannot look quiet.
-        docker = os.environ.get("GX_GHOSTTY_DOCKER", "docker")
+        import gx_windows_vm
+        docker = gx_windows_vm.docker_executable(None)
         command_output([docker, "info", "--format", "{{json .ServerVersion}}"])
         data = json.loads(command_output([sys.executable, str(SCRIPTS / "gx_windows_vm.py"), "status",
                                          "--root", str(slots.parent / "windows-vm")]))
@@ -655,6 +690,9 @@ class QuietProbe:
     def idle(self) -> float:
         return user_idle_seconds()
 
+    def session(self) -> dict:
+        return input_session()
+
     def cpu(self) -> dict:
         return powershell_json("@{cpu=@(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | "
                                "Where-Object Name -eq '_Total' | Select-Object PercentProcessorTime); "
@@ -664,7 +702,7 @@ class QuietProbe:
                                "IDProcess,Name,PercentProcessorTime)} | ConvertTo-Json -Depth 5 -Compress")
 
 
-def quiet_snapshot(args, probe=None) -> dict:
+def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
     probe = probe or QuietProbe()
     checks = {}
     def check(name, operation, assess):
@@ -672,38 +710,56 @@ def quiet_snapshot(args, probe=None) -> dict:
             raw = operation()
             passed, reason = assess(raw)
             checks[name] = {"status": "pass" if passed else "fail", "reason": reason, "raw": raw}
-        except (OSError, ValueError, PerfError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             checks[name] = {"status": "error", "reason": str(exc)}
-    builds = {process_name(name) for name in (args.build_process or BUILD_PROCESSES)}
-    blacklist = [name.casefold() for name in (args.blacklist or BLACKLIST)]
+    builds = {process_name(name) for name in (*BUILD_PROCESSES, *(args.build_process or []))}
+    blacklist = sorted({name.casefold() for name in (*BLACKLIST, *(args.blacklist or []))})
     def build_check(rows):
         found = [row for row in rows if process_name(row['name']) in builds or row.get('build_runner')]
-        return not found, "no build/test processes" if not found else f"build/test processes: {found}"
+        return not found, "no build/test processes" if not found else f"build/test PIDs: {[row['pid'] for row in found]}"
     check("windows", probe.windows, build_check)
     windows = checks["windows"]
     if windows['status'] == 'error':
         checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
     else:
-        found = [row for row in windows['raw'] if any(name in row['name'].casefold() or
-                 name in row.get('title', '').casefold() for name in blacklist)]
-        checks['blacklist'] = {"status": "fail" if found else "pass", "raw": found,
-                               "reason": "blacklisted process present" if found else "no blacklisted processes"}
+        def blacklist_matches():
+            found = []
+            for row in windows['raw']:
+                matches = [name for name in blacklist if name in (row.get('name') or '').casefold() or
+                           name in (row.get('title') or '').casefold()]
+                if matches:
+                    found.append({'pid': row['pid'], 'name': row.get('name'), 'matches': matches})
+            return found
+        check('blacklist', blacklist_matches, lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
+        windows['command_lines_unavailable'] = sum(bool(row.get('command_line_unavailable')) for row in windows['raw'])
+        windows['raw'] = [{key: row[key] for key in ('pid', 'name', 'build_runner', 'command_line_unavailable') if key in row}
+                          for row in windows['raw']]
     check("wsl", lambda: probe.wsl(args.distro), lambda data: build_check(data['processes']))
     check("vm", lambda: probe.vm(args.slot_root), lambda data: (
         not any(row['running'] for row in data.values()),
         "all validation VM containers stopped" if not any(row['running'] for row in data.values()) else "VM container running"))
-    check("slots", lambda: probe.slots(args.slot_root), lambda free: (free, "all four locks acquired and released" if free else "slot occupied"))
-    check("input", probe.idle, lambda seconds: (seconds >= args.idle_seconds, f"idle {seconds:.3f}s; required {args.idle_seconds:g}s"))
+    if lease is None:
+        check("slots", lambda: probe.slots(args.slot_root), lambda free: (free, "all four existing locks probed and released" if free else "slot occupied"))
+    else:
+        check('slots', lease.verify, lambda held: (held, 'all four locks held by this batch' if held else 'batch lock ownership lost'))
+    check('session', probe.session, lambda data: (data['interactive_console'], 'active console session required'))
+    if checks['session']['status'] == 'fail':
+        checks['session']['status'] = 'error'
+    if guarded_input is None:
+        check("input", probe.idle, lambda seconds: (seconds >= args.idle_seconds, f"idle {seconds:.3f}s; required {args.idle_seconds:g}s"))
+    else:
+        check('input', guarded_input, lambda data: (data['valid'], 'injected input: audited guards, not GetLastInputInfo'))
     try:
         observation = {"status": "recorded", "raw": probe.cpu()}
-    except (OSError, ValueError, PerfError, subprocess.SubprocessError) as exc:
+    except Exception as exc:
         observation = {"status": "unavailable", "reason": str(exc)}
     code = 2 if any(row['status'] == 'error' for row in checks.values()) else (
         3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
     return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
             "build_processes": sorted(builds), "blacklist": blacklist,
-            "scope": "point-in-time probe; locks released, not a reservation"}
+            'plan_compliant': args.idle_seconds >= 600,
+            "scope": "batch-owned locks" if lease else "point-in-time probe; locks released, not a reservation"}
 
 
 def new_output(path: Path) -> Path:
@@ -729,6 +785,73 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
             return result['exit']
         sleep(args.interval)
     return 2
+
+
+def guard_evidence(path: Path, batch_id: str) -> dict:
+    rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+    if not rows or any(row.get('schema') != 'gx-input-guard-v1' or row.get('batch_id') != batch_id for row in rows):
+        raise PerfError('missing, foreign or malformed input guard evidence')
+    guards = [row for row in rows if row.get('event') == 'guard']
+    failures = [row for row in rows if row.get('status') != 'pass']
+    return {'valid': bool(guards) and not failures, 'guards': len(guards), 'failures': failures,
+            'events': len(rows), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def run_quiet_batch(args, probe=None, execute=None) -> int:
+    import gx_slots
+    command = args.batch_command[1:] if args.batch_command[:1] == ['--'] else args.batch_command
+    if not command or not math.isfinite(args.timeout) or args.timeout < 0 or not math.isfinite(args.idle_seconds) or args.idle_seconds < 0:
+        raise PerfError('quiet-batch requires a command and finite nonnegative timeout/idle threshold')
+    out = new_output(args.out)
+    result = {'schema': 'gx-quiet-batch-v1', 'batch_id': uuid.uuid4().hex, 'command': command,
+              'status': 'NOT_STARTED', 'batch_valid': False, 'injected_input': args.injected_input,
+              'command_exit': None, 'exit': 2, 'errors': []}
+    write_json(out / 'RESULT.json', result)
+    try:
+        args.slot_root = validate_slot_root(args.slot_root or shared_slots_root())
+        # Wait first, then check inside the lease. A previous quiet snapshot is
+        # never an authorization to run after waiting for resources.
+        with gx_slots.acquire(args.slot_root, 'quiet', args.timeout) as lease:
+            before = quiet_snapshot(args, probe, lease=lease)
+            write_json(out / 'before.json', before)
+            if before['exit']:
+                result['exit'] = before['exit']
+                result['errors'].append('start check did not pass; command was not run')
+            else:
+                environment = dict(os.environ, GX_PERF_BATCH_ID=result['batch_id'],
+                                   GX_PERF_GUARD_LOG=str(out / 'guards.jsonl'))
+                result['status'] = 'RUNNING'
+                write_json(out / 'RESULT.json', result)
+                try:
+                    with (out / 'command.log').open('w', encoding='utf-8', newline='\n') as log:
+                        runner = execute or subprocess.run
+                        child = runner(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
+                        result['command_exit'] = child.returncode
+                except (Exception, KeyboardInterrupt) as exc:
+                    result['errors'].append(f'command: {type(exc).__name__}: {exc}')
+                finally:
+                    guarded = (lambda: guard_evidence(out / 'guards.jsonl', result['batch_id'])) if args.injected_input else None
+                    after = quiet_snapshot(args, probe, lease=lease, guarded_input=guarded)
+                    write_json(out / 'after.json', after)
+                    result['batch_valid'] = result['command_exit'] == 0 and after['exit'] == 0 and not result['errors']
+                    result['status'] = 'VALID' if result['batch_valid'] else 'INVALID'
+                    if after['exit']:
+                        result['errors'].append('end check did not pass; entire batch is INVALID, originals retained')
+                    result['exit'] = 0 if result['batch_valid'] else (after['exit'] or 1)
+    except TimeoutError as exc:
+        result['exit'] = 3
+        result['errors'].append(str(exc))
+    except Exception as exc:
+        result['exit'] = 2
+        result['errors'].append(f'{type(exc).__name__}: {exc}')
+        if result['status'] == 'RUNNING':
+            result['status'] = 'INVALID'
+    write_json(out / 'RESULT.json', result)
+    write_json(args.json, result)
+    (out / 'SUMMARY.txt').write_text(f"{result['status']} exit={result['exit']} command_exit={result['command_exit']}\n" +
+                                    '\n'.join(result['errors']) + '\n', encoding='utf-8', newline='\n')
+    print(json.dumps(result, ensure_ascii=False))
+    return result['exit']
 
 
 # Fixed-width Windows ABI fields keep the raw snapshot decoder testable off Windows.
@@ -1616,11 +1739,22 @@ def build_parser() -> argparse.ArgumentParser:
     quiet.add_argument("--slot-root", type=Path)
     quiet.add_argument("--distro", default="Ubuntu-24.04")
     quiet.add_argument("--idle-seconds", type=float, default=600)
-    quiet.add_argument("--build-process", action="append", help="replace default build process names (repeatable)")
-    quiet.add_argument("--blacklist", action="append", help="replace default name/title substrings (repeatable)")
+    quiet.add_argument("--build-process", action="append", help="add build process names (repeatable)")
+    quiet.add_argument("--blacklist", action="append", help="add name/title substrings (repeatable)")
     quiet.add_argument("--wait", action="store_true")
     quiet.add_argument("--interval", type=float, default=900)
     quiet.add_argument("--max-attempts", type=int, default=3)
+    batch = commands.add_parser('quiet-batch', allow_abbrev=False, help='hold all slots, check before/after a bounded command')
+    batch.add_argument('--out', type=Path, required=True)
+    batch.add_argument('--json', type=Path)
+    batch.add_argument('--slot-root', type=Path)
+    batch.add_argument('--distro', default='Ubuntu-24.04')
+    batch.add_argument('--idle-seconds', type=float, default=600)
+    batch.add_argument('--build-process', action='append')
+    batch.add_argument('--blacklist', action='append')
+    batch.add_argument('--timeout', type=float, default=0)
+    batch.add_argument('--injected-input', action='store_true', help='end input check uses batch-bound gx_win_gui guard log')
+    batch.add_argument('batch_command', nargs=argparse.REMAINDER)
     remote = commands.add_parser('remote', allow_abbrev=False, help='summarize remote.* fixture logs only')
     remote.add_argument('paths', nargs='+', type=Path)
     remote.add_argument('--out', type=Path)
@@ -1661,6 +1795,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "quiet":
             return run_quiet(args)
+        if args.command == 'quiet-batch':
+            return run_quiet_batch(args)
         if args.command == 'remote':
             return run_remote(args)
         if args.command == "summarize":
