@@ -551,7 +551,12 @@ def label_environments(labels: Sequence[str], common: Sequence[str], overrides: 
 # Quiet checks observe state; they never stop a process, VM or WSL distribution.
 BUILD_PROCESSES = ("zig", "build", "test", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
                    "ninja", "msbuild", "cl", "link", "gcc", "g++", "make", "cmake", "rustc", "cargo")
+# Plan §4 lists these exact strings (both "Devin" and "devin"), so matching is a
+# case-sensitive substring of a process image name or main window title.
 BLACKLIST = ("Devin", "devin", "ToDesk", "Kimi Code", "哔哩哔哩")
+# Other programs worth noting in the evidence (root ruling: kimi-cu is not "Kimi
+# Code"). Observation only: they never make a snapshot busy.
+OBSERVED_PROGRAMS = ("kimi-cu",)
 BUILD_RUNNER_RE = (r'(?:run_unittests\.py|zig_test\.py|zigw\.py\s+build|(?:^|\s)-m\s+(?:unittest|pytest)(?:\s|$)|'
                    r'(?:^|[/\\\s])test_[^\s]+\.py|gx_(?:win_gui|perf|wsl|windows_vm)\.py|test[/\\]windows[/\\][^\s]+\.py)')
 
@@ -767,6 +772,18 @@ class QuietProbe:
                                "IDProcess,Name,PercentProcessorTime)} | ConvertTo-Json -Depth 5 -Compress")
 
 
+def program_matches(rows: Sequence[Mapping], names: Sequence[str], *, case_sensitive: bool) -> list[dict]:
+    """Rows whose image name or window title contains one of `names`; only pid/name/matches are returned."""
+    fold = (lambda text: text) if case_sensitive else str.casefold
+    found = []
+    for row in rows:
+        texts = [fold(text or '') for text in (*(row.get('names') or [row.get('name')]), row.get('title'))]
+        matches = [name for name in names if any(fold(name) in text for text in texts)]
+        if matches:
+            found.append({'pid': row['pid'], 'name': row.get('name'), 'matches': matches})
+    return found
+
+
 def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
     probe = probe or QuietProbe()
     checks = {}
@@ -778,26 +795,22 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
         except Exception as exc:
             checks[name] = {"status": "error", "reason": str(exc)}
     builds = {process_name(name) for name in (*BUILD_PROCESSES, *(args.build_process or []))}
-    blacklist = sorted({name.casefold() for name in (*BLACKLIST, *(args.blacklist or []))})
+    blacklist = sorted({*BLACKLIST, *(args.blacklist or [])})
+    observed = sorted({name.casefold() for name in (*OBSERVED_PROGRAMS, *(getattr(args, 'observe', None) or []))})
     def build_check(rows):
         found = [row for row in rows if any(process_name(name) in builds for name in row.get('names') or [row['name']])
                  or row.get('build_runner')]
         return not found, "no build/test processes" if not found else f"build/test PIDs: {[row['pid'] for row in found]}"
     check("windows", lambda: windows_inventory(probe.windows(), os.getpid()), lambda data: build_check(data['processes']))
     windows = checks["windows"]
+    other_programs = {'status': 'unavailable', 'names': observed, 'scope': 'observation only; never a quiet gate'}
     if windows['status'] == 'error':
         checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
     else:
         rows = windows['raw']['processes']
-        def blacklist_matches():
-            found = []
-            for row in rows:
-                texts = [text.casefold() for text in (*(row.get('names') or [row.get('name') or '']), row.get('title') or '')]
-                matches = [name for name in blacklist if any(name in text for text in texts)]
-                if matches:
-                    found.append({'pid': row['pid'], 'name': row.get('name'), 'matches': matches})
-            return found
-        check('blacklist', blacklist_matches, lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
+        check('blacklist', lambda: program_matches(rows, blacklist, case_sensitive=True),
+              lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
+        other_programs.update(status='recorded', matches=program_matches(rows, observed, case_sensitive=False))
         windows['command_lines_unavailable'] = sum(bool(row.get('command_line_unavailable')) for row in rows)
         windows['raw'] = {'processes': [{key: row[key] for key in ('pid', 'name', 'build_runner', 'command_line_unavailable',
                                                                    'runner_exclusion') if key in row} for row in rows],
@@ -826,7 +839,8 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
         3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
     return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
-            "build_processes": sorted(builds), "blacklist": blacklist,
+            "other_programs": other_programs, "build_processes": sorted(builds), "blacklist": blacklist,
+            "blacklist_matching": "case-sensitive substring of a process image name or main window title",
             'plan_compliant': args.idle_seconds >= 600,
             "scope": "batch-owned locks" if lease else "point-in-time probe; locks released, not a reservation"}
 
@@ -2016,7 +2030,8 @@ def build_parser() -> argparse.ArgumentParser:
     quiet.add_argument("--distro", default="Ubuntu-24.04")
     quiet.add_argument("--idle-seconds", type=float, default=600)
     quiet.add_argument("--build-process", action="append", help="add build process names (repeatable)")
-    quiet.add_argument("--blacklist", action="append", help="add name/title substrings (repeatable)")
+    quiet.add_argument("--blacklist", action="append", help="add case-sensitive name/title substrings (repeatable)")
+    quiet.add_argument("--observe", action="append", help="add name/title substrings recorded as other programs, never a gate")
     quiet.add_argument("--wait", action="store_true")
     quiet.add_argument("--interval", type=float, default=900)
     quiet.add_argument("--max-attempts", type=int, default=3)
@@ -2028,6 +2043,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument('--idle-seconds', type=float, default=600)
     batch.add_argument('--build-process', action='append')
     batch.add_argument('--blacklist', action='append')
+    batch.add_argument('--observe', action='append')
     batch.add_argument('--timeout', type=float, default=0)
     batch.add_argument('--injected-input', action='store_true', help='end input check uses batch-bound gx_win_gui guard log')
     batch.add_argument('batch_command', nargs=argparse.REMAINDER)

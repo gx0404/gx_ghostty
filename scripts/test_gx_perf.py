@@ -261,9 +261,28 @@ class QuietTests(unittest.TestCase):
         result = gx_perf.quiet_snapshot(self.args, self.probe)
         self.assertFalse(result['plan_compliant'])
         self.assertNotIn('private', json.dumps(result))
-        self.assertEqual(['todesk'], result['checks']['blacklist']['raw'][0]['matches'])
+        self.assertEqual(['ToDesk'], result['checks']['blacklist']['raw'][0]['matches'])
         self.probe.session.return_value = {'interactive_console': False}
         self.assertEqual(2, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
+    def test_blacklist_is_the_exact_plan_list_and_kimi_cu_is_only_observed(self):
+        self.assertEqual(('Devin', 'devin', 'ToDesk', 'Kimi Code', '哔哩哔哩'), gx_perf.BLACKLIST)
+        rows = [{'pid': 1, 'name': 'kimi-cu.exe', 'title': 'kimi-cu'}, {'pid': 2, 'name': 'todesk-lookalike', 'title': 'KIMI CODE'},
+                {'pid': 3, 'name': 'devin', 'title': ''}, {'pid': 4, 'name': 'Kimi Code.exe', 'title': ''},
+                {'pid': 5, 'name': 'player', 'title': '哔哩哔哩 (゜-゜)つロ'}]
+        self.probe.windows.return_value = windows_data(*rows)
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual({3: ['devin'], 4: ['Kimi Code'], 5: ['哔哩哔哩']},
+                         {row['pid']: row['matches'] for row in result['checks']['blacklist']['raw']})
+        self.assertEqual('recorded', result['other_programs']['status'])
+        self.assertEqual([1], [row['pid'] for row in result['other_programs']['matches']])
+        self.assertNotIn('つロ', gx_perf.json.dumps(result, ensure_ascii=False))
+        self.probe.windows.return_value = windows_data(rows[0], rows[1])
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual(0, result['exit'])
+        self.assertEqual([1], [row['pid'] for row in result['other_programs']['matches']])
+        self.args.blacklist = ['kimi-cu']
+        self.assertEqual(3, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
 
     def test_ancestor_exemption_covers_runner_command_lines_only(self):
         me = gx_perf.os.getpid()
