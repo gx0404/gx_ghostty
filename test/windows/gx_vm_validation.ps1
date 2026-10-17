@@ -26,6 +26,7 @@ param(
     [ValidateSet('text','multiline','files')][string]$DropCase = 'text',
     [string]$OleSourceSha256,
     [ValidateRange(1000,30000)][int]$DropTimeoutMs = 30000,
+    [switch]$AutoDrag,
     [ValidateRange(0,2147483647)][int]$PeerPid = 0,
     [string]$ExportDir,
     [switch]$SoftwareGL
@@ -134,8 +135,8 @@ public static class GxVmToken {
 }
 '@
 
-# Read-only window facts for the GL close evidence. GetWindowText does not send
-# messages across processes; WM_NULL is sent with SMTO_ABORTIFHUNG and a bound.
+# Window facts and explicitly requested fixture input. GetWindowText does not
+# send messages across processes; WM_NULL uses SMTO_ABORTIFHUNG and a bound.
 $script:WindowSource = @'
 using System;
 using System.Collections;
@@ -158,6 +159,152 @@ public static class GxVmWindows {
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; public POINT(int x, int y) { X = x; Y = y; } }
+    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint data, flags, time; public UIntPtr extra; }
+    [StructLayout(LayoutKind.Explicit)] struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mouse; }
+    [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public INPUTUNION value; }
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder image, ref uint size);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+
+    sealed class ProcessLease : IDisposable {
+        public IntPtr Handle;
+        public ProcessLease(uint pid, long birth, string exe) {
+            Handle = OpenProcess(0x101000, false, pid); // SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+            if (Handle == IntPtr.Zero) throw new Exception("OpenProcess failed: " + Marshal.GetLastWin32Error());
+            try {
+                long created, exited, kernel, user;
+                uint length = 32768;
+                StringBuilder image = new StringBuilder((int)length);
+                if (!GetProcessTimes(Handle, out created, out exited, out kernel, out user) || created != birth ||
+                    !QueryFullProcessImageName(Handle, 0, image, ref length) ||
+                    !String.Equals(image.ToString(), exe, StringComparison.OrdinalIgnoreCase)) throw new Exception("Process identity mismatch");
+                Alive();
+            } catch { Dispose(); throw; }
+        }
+        public void Alive() { if (WaitForSingleObject(Handle, 0) != 258) throw new Exception("Owned process exited"); }
+        public void Dispose() { if (Handle != IntPtr.Zero) { CloseHandle(Handle); Handle = IntPtr.Zero; } }
+    }
+
+    static void RequireWindow(IntPtr hwnd, uint pid, string cls) {
+        uint actual;
+        StringBuilder name = new StringBuilder(128);
+        GetClassNameW(hwnd, name, name.Capacity);
+        if (GetWindowThreadProcessId(hwnd, out actual) == 0 || actual != pid || name.ToString() != cls ||
+            !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd) || IsIconic(hwnd)) throw new Exception("Window ownership or visibility mismatch");
+    }
+    static RECT ClientRect(IntPtr hwnd) {
+        RECT rect; POINT origin = new POINT(0, 0);
+        if (!GetClientRect(hwnd, out rect) || !ClientToScreen(hwnd, ref origin)) throw new Exception("Client rectangle unavailable");
+        rect.Left += origin.X; rect.Right += origin.X; rect.Top += origin.Y; rect.Bottom += origin.Y;
+        return rect;
+    }
+    static void MoveCursor(POINT point) {
+        POINT actual;
+        if (!SetCursorPos(point.X, point.Y) || !GetCursorPos(out actual) || actual.X != point.X || actual.Y != point.Y)
+            throw new Exception("Cursor position was not observed at the requested point");
+    }
+    static void MouseButton(uint flags) {
+        INPUT[] input = new INPUT[1]; input[0].value.mouse.flags = flags;
+        if (SendInput(1, input, Marshal.SizeOf(typeof(INPUT))) != 1) throw new Exception("SendInput failed: " + Marshal.GetLastWin32Error());
+    }
+    public static void ReleaseAfterSourceExit(IntPtr sourceProcess) {
+        if (WaitForSingleObject(sourceProcess, 0) != 0) throw new Exception("Cannot release without proven source exit");
+        MouseButton(4);
+    }
+
+    // The caller has verified hashes, source lineage and the real split-token pair.
+    // Retained process handles bind all mouse input to those exact process lives.
+    public static Hashtable DragOwned(uint sourcePid, long sourceBirth, string sourceExe, IntPtr sourceWindow,
+        uint receiverPid, long receiverBirth, string appExe, IntPtr receiverWindow, uint hostPid, long hostBirth) {
+        Hashtable result = new Hashtable(); result["status"] = "FAIL";
+        result["clipboard_access"] = false; result["enter_injected"] = false;
+        bool down = false;
+        POINT start = new POINT(), end = new POINT(); bool haveEnd = false;
+        IntPtr previousDpi = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            using (ProcessLease source = new ProcessLease(sourcePid, sourceBirth, sourceExe))
+            using (ProcessLease receiver = new ProcessLease(receiverPid, receiverBirth, appExe))
+            using (ProcessLease host = new ProcessLease(hostPid, hostBirth, appExe)) {
+                Action guard = delegate {
+                    source.Alive(); receiver.Alive(); host.Alive();
+                    RequireWindow(sourceWindow, sourcePid, "GxOwnedOleDragSource");
+                    RequireWindow(receiverWindow, receiverPid, "GhosttyDropCompanion");
+                };
+                try {
+                    guard();
+                    if (previousDpi == IntPtr.Zero) throw new Exception("DPI context unavailable");
+                    RECT sourceOuter;
+                    if (!GetWindowRect(sourceWindow, out sourceOuter)) throw new Exception("Source rectangle unavailable");
+                    // Move only this source, leaving the receiver's client exposed.
+                    int x = GetSystemMetrics(76) + 20;
+                    int y = GetSystemMetrics(77) + GetSystemMetrics(79) - (sourceOuter.Bottom - sourceOuter.Top) - 80;
+                    if (!SetWindowPos(sourceWindow, IntPtr.Zero, x, y, 0, 0, 0x41)) throw new Exception("Source placement failed");
+                    SetForegroundWindow(sourceWindow);
+                    System.Threading.Thread.Sleep(100);
+                    guard();
+                    if (GetForegroundWindow() != sourceWindow) throw new Exception("Source foreground not established");
+                    RECT s = ClientRect(sourceWindow), r = ClientRect(receiverWindow);
+                    start = new POINT((s.Left + s.Right) / 2, (s.Top + s.Bottom) / 2);
+                    if (WindowFromPoint(start) != sourceWindow) throw new Exception("Source point is occluded");
+                    foreach (int ey in new int[] { r.Top + 30, r.Bottom - 30 }) {
+                        foreach (int ex in new int[] { r.Right - 30, r.Left + 30 }) {
+                            POINT candidate = new POINT(ex, ey);
+                            if (ex > r.Left && ex < r.Right && ey > r.Top && ey < r.Bottom && WindowFromPoint(candidate) == receiverWindow) {
+                                end = candidate; haveEnd = true; break;
+                            }
+                        }
+                        if (haveEnd) break;
+                    }
+                    if (!haveEnd) throw new Exception("No exposed receiver point");
+                    result["source_point"] = new int[] { start.X, start.Y };
+                    result["receiver_point"] = new int[] { end.X, end.Y };
+                    result["source_window"] = Describe(sourceWindow); result["receiver_window"] = Describe(receiverWindow);
+                    guard(); MoveCursor(start); MouseButton(2); down = true;
+                    for (int step = 1; step <= 20; step++) {
+                        guard(); MoveCursor(new POINT(start.X + (end.X - start.X) * step / 20, start.Y + (end.Y - start.Y) * step / 20));
+                        System.Threading.Thread.Sleep(30);
+                    }
+                    guard();
+                    if (WindowFromPoint(end) != receiverWindow) throw new Exception("Receiver point became occluded");
+                    MouseButton(4); down = false;
+                    result["status"] = "REAL_DRAG_SENT";
+                } finally {
+                    if (down) {
+                        // Never emit mouse-up unless this invocation emitted mouse-down.
+                        // The pinned source's WM_CLOSE sets cancelled before returning.
+                        // Acknowledging it before mouse-up prevents an accidental drop.
+                        try {
+                            if (WaitForSingleObject(source.Handle, 0) != 0) {
+                                RequireWindow(sourceWindow, sourcePid, "GxOwnedOleDragSource");
+                                IntPtr unused;
+                                if (SendMessageTimeoutW(sourceWindow, 0x0010, IntPtr.Zero, IntPtr.Zero, 2, 1000, out unused) == IntPtr.Zero)
+                                    throw new Exception("Source cancellation was not acknowledged");
+                            }
+                            MouseButton(4); down = false;
+                            result["cleanup"] = "released owned mouse-down after source cancellation or exit";
+                        } catch (Exception error) { result["cleanup"] = "BLOCKED: " + error.Message; }
+                    }
+                }
+            }
+        } catch (Exception error) { result["error"] = error.Message; }
+        finally { if (previousDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(previousDpi); }
+        result["mouse_down_unreleased"] = down;
+        return result;
+    }
 
     public static string Hex(IntPtr hwnd) { return "0x" + hwnd.ToInt64().ToString("x"); }
 
@@ -380,8 +527,8 @@ function Get-ProcessScene([Diagnostics.Process]$Process) {
 function Start-DropSource {
     # Medium console only: re-verify the receiver/host pair, then start the staged,
     # hash-pinned OLE source (test/windows/gx_ole_source.zig) in --source-window mode.
-    # The host drives the real drag through the VM's VNC pointer; nothing here
-    # injects input, reads the clipboard or presses Enter.
+    # Default: the host drives the real drag. -AutoDrag explicitly requests
+    # same-guest native mouse input after process/window validation; never Enter.
     if ($OleSourceSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'drop-source requires -OleSourceSha256.' }
     if (-not $ExportDir) { throw 'drop-source runs through gx-run.cmd so the staged tool and export folder are known.' }
     $peer = Find-BrokerPeer
@@ -408,7 +555,8 @@ function Start-DropSource {
     $source = [Diagnostics.Process]::Start($start)
     $null = $source.Handle
     $result = [ordered]@{ peer=$peer; receiver_birth_filetime=$receiverBirth; tool_sha256=$OleSourceSha256.ToLowerInvariant();
-        source_pid=$source.Id; case=$DropCase; timeout_ms=$DropTimeoutMs; ready=$null; exit_code=$null; evidence=$null }
+        source_pid=$source.Id; source_birth_filetime=$source.StartTime.ToFileTimeUtc(); case=$DropCase;
+        timeout_ms=$DropTimeoutMs; ready=$null; auto_drag_requested=[bool]$AutoDrag; auto_drag=$null; exit_code=$null; evidence=$null }
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(20)
         $readyFile = $null
@@ -418,6 +566,9 @@ function Start-DropSource {
         }
         if (-not $readyFile) { throw "OLE source did not become ready (exited=$($source.HasExited))." }
         $ready = Get-Content -LiteralPath $readyFile.FullName -Raw | ConvertFrom-Json
+        if ($AutoDrag -and ($ready.source_pid -ne $source.Id -or $ready.target_pid -ne $receiverPid -or
+            [long]$ready.target_birth -ne $receiverBirth -or [long]$ready.target_hwnd -ne $receiverHwnd.ToInt64() -or
+            $ready.app_sha256 -ine $AppSha256 -or $ready.case -cne $DropCase)) { throw 'OLE source ready identity mismatch.' }
         $result.ready = $ready
         $sourceWindow = [GxVmWindows]::Describe([IntPtr][int64]$ready.source_hwnd)
         $receiverWindow = [GxVmWindows]::Describe($receiverHwnd)
@@ -428,6 +579,17 @@ function Start-DropSource {
         $result.drag = [ordered]@{ x=[int](($s[0] + $s[2]) / 2); y=[int](($s[1] + $s[3]) / 2) + 12;
             to_x=[int]($r[0] + ($r[2] - $r[0]) * 0.65); to_y=[int]($r[1] + ($r[3] - $r[1]) * 0.65) }
         Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-drop-ready.json')) $result
+        if ($AutoDrag) {
+            # All participants are freshly verified by Find-BrokerPeer above.
+            # The source is the exact child we launched, with a pinned image.
+            Assert-Hash $tool $OleSourceSha256
+            Assert-Hash $peer.receiver.exe $AppSha256
+            $result.auto_drag = [GxVmWindows]::DragOwned([uint32]$source.Id, $source.StartTime.ToFileTimeUtc(), $tool,
+                [IntPtr][long]$ready.source_hwnd, [uint32]$receiverPid, $receiverBirth, $peer.receiver.exe,
+                $receiverHwnd, [uint32]$peer.host.pid, [long]$peer.host.birth_filetime)
+            if ($result.auto_drag['status'] -cne 'REAL_DRAG_SENT') { throw ('Automatic owned drag failed: ' + $result.auto_drag['error']) }
+            Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-auto-drag.json')) $result.auto_drag
+        }
         $closed = $source.WaitForExit($DropTimeoutMs + 15000)
         if (-not $closed) { $source.Kill(); $null = $source.WaitForExit(5000); throw 'OLE source did not finish within its deadline.' }
         $result.exit_code = $source.ExitCode
@@ -439,7 +601,19 @@ function Start-DropSource {
         if ($source.ExitCode -ne 0) { throw ('OLE source exited ' + $source.ExitCode + ': ' + $result.meaning) }
     } finally {
         if (-not $source.HasExited) { $source.Kill(); $null = $source.WaitForExit(5000) }
+        if ($result.auto_drag -and $result.auto_drag['mouse_down_unreleased']) {
+            try {
+                [GxVmWindows]::ReleaseAfterSourceExit($source.Handle)
+                $result.auto_drag['mouse_down_unreleased'] = $false
+                $result.auto_drag['cleanup'] = 'released owned mouse-down after verified source process exit'
+            } catch { $result.auto_drag['cleanup'] = 'BLOCKED: ' + $_.Exception.Message }
+        }
         $source.Dispose()
+        if ($result.auto_drag) {
+            # Cleanup must finish before any potentially blocking share export.
+            Write-Json (Join-Path $toolDir 'auto-drag.json') $result.auto_drag
+            $script:ExportExtra.Add((Join-Path $toolDir 'auto-drag.json'))
+        }
         Write-Json (Join-Path $toolDir 'drop-source.json') $result
         $script:ExportExtra.Add((Join-Path $toolDir 'drop-source.json'))
     }
