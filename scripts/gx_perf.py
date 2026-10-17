@@ -626,19 +626,86 @@ def process_name(name: str) -> str:
     return name.replace("\\", "/").rsplit("/", 1)[-1].casefold().removesuffix(".exe")
 
 
+def ancestor_exclusions(cim: Sequence[Mapping], start_pid: int, inventory_pid=None) -> tuple[dict[int, str], str]:
+    """PIDs exempt from runner command-line matching only: this process, its
+    verified ancestors and the inventory helper it started.
+
+    A parent counts only while its CreationDate is not later than its child's,
+    so a recycled ParentProcessId (common once userinit.exe has exited) is never
+    exempted. Returns {pid: reason} and why the walk stopped."""
+    by_pid = {row['pid']: row for row in cim}
+    excluded: dict[int, str] = {}
+    helper = by_pid.get(inventory_pid) if isinstance(inventory_pid, int) else None
+    if helper is not None and helper.get('ppid') == start_pid:
+        excluded[inventory_pid] = 'inventory'
+    current, reason, end = by_pid.get(start_pid), 'self', 'self_missing'
+    while current is not None:
+        excluded[current['pid']] = reason
+        reason = 'ancestor'
+        parent_pid = current.get('ppid')
+        if not isinstance(parent_pid, int) or parent_pid <= 0 or parent_pid == current['pid']:
+            end = 'root'
+            break
+        parent = by_pid.get(parent_pid)
+        if parent is None:
+            end = 'parent_exited'
+            break
+        if parent_pid in excluded:
+            end = 'cycle'
+            break
+        born, parent_born = current.get('created'), parent.get('created')
+        if not isinstance(born, int) or not isinstance(parent_born, int) or parent_born > born:
+            end = 'parent_pid_reused_or_unverifiable'
+            break
+        current = parent
+    return excluded, end
+
+
+def windows_inventory(data: Mapping, self_pid: int) -> dict:
+    """Join Win32_Process (parent, creation, command line) with Get-Process (window title).
+
+    Command lines and titles stay in memory for matching; quiet_snapshot persists
+    only pid/name/flags. The self/ancestor exemption applies to runner
+    command-line matching alone: build-process names and the blacklist still
+    cover every process, ancestors included."""
+    cim = data.get('cim') if isinstance(data, Mapping) else None
+    processes = data.get('processes') if isinstance(data, Mapping) else None
+    if not isinstance(cim, list) or not cim or not isinstance(processes, list) or not processes:
+        raise PerfError("Windows process inventory is missing")
+    excluded, chain_end = ancestor_exclusions(cim, self_pid, data.get('inventory_pid'))
+    rows: dict[int, dict] = {}
+    for item in cim:
+        line = item.get('command_line')
+        rows[item['pid']] = {'pid': item['pid'], 'name': item.get('name') or '', 'names': [item.get('name') or ''],
+                             'title': '', 'command_line_unavailable': not line,
+                             # Windows command lines are case-insensitive, like the former PowerShell -match.
+                             'runner_match': bool(line) and re.search(BUILD_RUNNER_RE, line, re.IGNORECASE) is not None}
+    for item in processes:
+        row = rows.setdefault(item['pid'], {'pid': item['pid'], 'name': item.get('name') or '', 'names': [], 'title': '',
+                                            'command_line_unavailable': True, 'runner_match': False})
+        row['names'].append(item.get('name') or '')
+        row['title'] = item.get('title') or ''
+    exclusions = []
+    for pid in sorted(rows):
+        row = rows[pid]
+        reason = excluded.get(pid)
+        row['build_runner'] = row['runner_match'] and reason is None
+        if reason:
+            row['runner_exclusion'] = reason
+            exclusions.append({'pid': pid, 'name': row['name'], 'reason': reason, 'runner_match_suppressed': row['runner_match']})
+    return {'processes': [rows[pid] for pid in sorted(rows)], 'runner_exclusions': exclusions,
+            'ancestor_chain_end': chain_end}
+
+
 class QuietProbe:
-    def windows(self) -> list[dict]:
-        data = powershell_json("$items=@(Get-CimInstance Win32_Process); $exclude=@{}; $current=$PID; "
-                               "while($current -gt 0 -and !$exclude.ContainsKey([int]$current)){"
-                               "$exclude[[int]$current]=$true; $p=$items | Where-Object ProcessId -eq $current; "
-                               "$current=$p.ParentProcessId}; $runners=@{}; $unknown=@{}; $items | ForEach-Object {"
-                               f"$runners[[int]$_.ProcessId]=[bool]($_.CommandLine -match '{BUILD_RUNNER_RE}'); "
-                               "$unknown[[int]$_.ProcessId]=!$_.CommandLine}; "
-                               "@(Get-Process | Where-Object {!$exclude.ContainsKey($_.Id)} | Select-Object @{n='pid';e={$_.Id}},"
-                               "@{n='name';e={$_.ProcessName}},@{n='title';e={$_.MainWindowTitle}},"
-                               "@{n='command_line_unavailable';e={$unknown[$_.Id]}},"
-                               "@{n='build_runner';e={$runners[$_.Id]}}) | ConvertTo-Json -Compress")
-        if not isinstance(data, list) or not data:
+    def windows(self) -> dict:
+        data = powershell_json(
+            "$cim=@(Get-CimInstance Win32_Process | ForEach-Object {@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;"
+            "name=$_.Name;created=$(if($_.CreationDate){$_.CreationDate.ToFileTimeUtc()}else{$null});"
+            "command_line=$_.CommandLine}}); "
+            "$processes=@(Get-Process | ForEach-Object {@{pid=$_.Id;name=$_.ProcessName;title=$_.MainWindowTitle}}); "
+            "@{inventory_pid=$PID;cim=$cim;processes=$processes} | ConvertTo-Json -Depth 4 -Compress")
+        if not isinstance(data, dict):
             raise PerfError("Windows process inventory is missing")
         return data
 
@@ -713,25 +780,29 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
     builds = {process_name(name) for name in (*BUILD_PROCESSES, *(args.build_process or []))}
     blacklist = sorted({name.casefold() for name in (*BLACKLIST, *(args.blacklist or []))})
     def build_check(rows):
-        found = [row for row in rows if process_name(row['name']) in builds or row.get('build_runner')]
+        found = [row for row in rows if any(process_name(name) in builds for name in row.get('names') or [row['name']])
+                 or row.get('build_runner')]
         return not found, "no build/test processes" if not found else f"build/test PIDs: {[row['pid'] for row in found]}"
-    check("windows", probe.windows, build_check)
+    check("windows", lambda: windows_inventory(probe.windows(), os.getpid()), lambda data: build_check(data['processes']))
     windows = checks["windows"]
     if windows['status'] == 'error':
         checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
     else:
+        rows = windows['raw']['processes']
         def blacklist_matches():
             found = []
-            for row in windows['raw']:
-                matches = [name for name in blacklist if name in (row.get('name') or '').casefold() or
-                           name in (row.get('title') or '').casefold()]
+            for row in rows:
+                texts = [text.casefold() for text in (*(row.get('names') or [row.get('name') or '']), row.get('title') or '')]
+                matches = [name for name in blacklist if any(name in text for text in texts)]
                 if matches:
                     found.append({'pid': row['pid'], 'name': row.get('name'), 'matches': matches})
             return found
         check('blacklist', blacklist_matches, lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
-        windows['command_lines_unavailable'] = sum(bool(row.get('command_line_unavailable')) for row in windows['raw'])
-        windows['raw'] = [{key: row[key] for key in ('pid', 'name', 'build_runner', 'command_line_unavailable') if key in row}
-                          for row in windows['raw']]
+        windows['command_lines_unavailable'] = sum(bool(row.get('command_line_unavailable')) for row in rows)
+        windows['raw'] = {'processes': [{key: row[key] for key in ('pid', 'name', 'build_runner', 'command_line_unavailable',
+                                                                   'runner_exclusion') if key in row} for row in rows],
+                          'runner_exclusions': windows['raw']['runner_exclusions'],
+                          'ancestor_chain_end': windows['raw']['ancestor_chain_end']}
     check("wsl", lambda: probe.wsl(args.distro), lambda data: build_check(data['processes']))
     check("vm", lambda: probe.vm(args.slot_root), lambda data: (
         not any(row['running'] for row in data.values()),

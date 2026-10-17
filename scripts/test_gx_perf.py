@@ -26,6 +26,14 @@ import gx_wsl  # noqa: E402
 from test_gx_wsl import stat_line  # noqa: E402
 
 
+def windows_data(*rows) -> dict:
+    """A fake QuietProbe.windows() result: Win32_Process plus Get-Process rows."""
+    cim = [{'pid': row['pid'], 'ppid': row.get('ppid', 0), 'name': row['name'], 'created': row.get('created', 1),
+            'command_line': row.get('command_line')} for row in rows]
+    processes = [{'pid': row['pid'], 'name': row['name'], 'title': row.get('title')} for row in rows]
+    return {'inventory_pid': None, 'cim': cim, 'processes': processes}
+
+
 def gtk_fixture(root: Path) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     before = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0), stat_line(11, "renderer", 0, 0, 0, 0)))
@@ -178,7 +186,7 @@ class QuietTests(unittest.TestCase):
         self.args = gx_perf.build_parser().parse_args(['quiet', '--out', self.temp.name + '/out',
                                                      '--slot-root', self.temp.name + '/locks'])
         self.probe = mock.Mock()
-        self.probe.windows.return_value = [{'pid': 10, 'name': 'ghostty', 'title': 'test'}]
+        self.probe.windows.return_value = windows_data({'pid': 10, 'name': 'ghostty', 'title': 'test'})
         self.probe.wsl.return_value = {'running': False, 'processes': []}
         self.probe.vm.return_value = {'win11': {'exists': True, 'owned': True, 'running': False}}
         self.probe.slots.return_value = True
@@ -194,8 +202,8 @@ class QuietTests(unittest.TestCase):
         self.assertEqual(0, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
 
     def test_each_gate_and_probe_error_fail_closed(self):
-        for method, value in [('windows', [{'pid': 1, 'name': 'ZiG.ExE'}]),
-                              ('windows', [{'pid': 1, 'name': 'app', 'title': 'Kimi Code'}]),
+        for method, value in [('windows', windows_data({'pid': 1, 'name': 'ZiG.ExE'})),
+                              ('windows', windows_data({'pid': 1, 'name': 'app', 'title': 'Kimi Code'})),
                               ('wsl', {'processes': [{'pid': 2, 'name': 'cc1plus'}]}),
                               ('vm', {'win11': {'running': True}}), ('slots', False), ('idle', 599.9)]:
             operation = getattr(self.probe, method)
@@ -247,8 +255,8 @@ class QuietTests(unittest.TestCase):
         self.assertEqual('zig', raw['processes'][0]['name'])
 
     def test_null_titles_redaction_plan_compliance_and_session_errors(self):
-        self.probe.windows.return_value = [{'pid': 5, 'name': 'app', 'title': None},
-                                          {'pid': 6, 'name': 'browser', 'title': 'private ToDesk title'}]
+        self.probe.windows.return_value = windows_data({'pid': 5, 'name': 'app', 'title': None},
+                                                       {'pid': 6, 'name': 'browser', 'title': 'private ToDesk title'})
         self.args.idle_seconds = 5
         result = gx_perf.quiet_snapshot(self.args, self.probe)
         self.assertFalse(result['plan_compliant'])
@@ -256,6 +264,45 @@ class QuietTests(unittest.TestCase):
         self.assertEqual(['todesk'], result['checks']['blacklist']['raw'][0]['matches'])
         self.probe.session.return_value = {'interactive_console': False}
         self.assertEqual(2, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
+    def test_ancestor_exemption_covers_runner_command_lines_only(self):
+        me = gx_perf.os.getpid()
+        self.probe.windows.return_value = {'inventory_pid': 900, 'cim': [
+            {'pid': 900, 'ppid': me, 'name': 'powershell.exe', 'created': 40, 'command_line': 'powershell -NoProfile'},
+            {'pid': me, 'ppid': 50, 'name': 'python.exe', 'created': 30, 'command_line': 'python scripts/gx_perf.py quiet --out x'},
+            {'pid': 50, 'ppid': 60, 'name': 'Kimi Code.exe', 'created': 20, 'command_line': 'python scripts/run_unittests.py test_x'},
+            {'pid': 60, 'ppid': 0, 'name': 'ninja.exe', 'created': 10, 'command_line': 'ninja -C out'}],
+            'processes': [{'pid': 50, 'name': 'Kimi Code', 'title': 'Kimi Code'}]}
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        windows = result['checks']['windows']
+        self.assertEqual({900: 'inventory', me: 'self', 50: 'ancestor', 60: 'ancestor'},
+                         {row['pid']: row['reason'] for row in windows['raw']['runner_exclusions']})
+        self.assertTrue(next(row for row in windows['raw']['runner_exclusions'] if row['pid'] == 50)['runner_match_suppressed'])
+        # The exemption hides only the runner command lines: an ancestor's build name and blacklist name still count.
+        self.assertEqual('fail', windows['status'])
+        self.assertIn('[60]', windows['reason'])
+        self.assertEqual('fail', result['checks']['blacklist']['status'])
+        self.assertEqual([50], [row['pid'] for row in result['checks']['blacklist']['raw']])
+        self.assertEqual('root', windows['raw']['ancestor_chain_end'])
+        self.assertNotIn('run_unittests', gx_perf.json.dumps(result))
+
+    def test_recycled_parent_pid_is_not_exempt(self):
+        me = gx_perf.os.getpid()
+        self.probe.windows.return_value = {'inventory_pid': None, 'cim': [
+            {'pid': me, 'ppid': 50, 'name': 'python.exe', 'created': 30, 'command_line': 'python scripts/gx_perf.py quiet'},
+            {'pid': 50, 'ppid': 0, 'name': 'python.exe', 'created': 31, 'command_line': 'python scripts/zig_test.py --suite main'}],
+            'processes': [{'pid': me, 'name': 'python', 'title': ''}]}
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        windows = result['checks']['windows']
+        self.assertEqual('parent_pid_reused_or_unverifiable', windows['raw']['ancestor_chain_end'])
+        self.assertEqual([me], [row['pid'] for row in windows['raw']['runner_exclusions']])
+        self.assertEqual('fail', windows['status'])
+        self.assertIn('[50]', windows['reason'])
+        excluded, end = gx_perf.ancestor_exclusions([{'pid': 7, 'ppid': 8, 'created': 5}], 7)
+        self.assertEqual(({7: 'self'}, 'parent_exited'), (excluded, end))
+        self.assertEqual(({}, 'self_missing'), gx_perf.ancestor_exclusions([{'pid': 7, 'ppid': 0}], 9))
+        unverifiable = [{'pid': 7, 'ppid': 8, 'created': 5}, {'pid': 8, 'ppid': 0, 'created': None}]
+        self.assertEqual('parent_pid_reused_or_unverifiable', gx_perf.ancestor_exclusions(unverifiable, 7)[1])
 
     def test_probe_unexpected_exception_is_recorded(self):
         self.probe.windows.side_effect = AttributeError('unexpected')
