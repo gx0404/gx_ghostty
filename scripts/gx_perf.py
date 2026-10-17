@@ -1106,6 +1106,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     print(json.dumps(result, ensure_ascii=False))
     return result['exit']
 
+
 # Fixed-width Windows ABI fields keep the raw snapshot decoder testable off Windows.
 class NativeThread(ctypes.Structure):
     _fields_ = [("kernel", ctypes.c_int64), ("user", ctypes.c_int64), ("birth", ctypes.c_int64),
