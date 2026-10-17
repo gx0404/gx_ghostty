@@ -161,6 +161,62 @@ class ParseTests(unittest.TestCase):
         self.assertEqual([1.0], samples.values["a"])
 
 
+class QuietTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.args = gx_perf.build_parser().parse_args(['quiet', '--out', self.temp.name + '/out',
+                                                     '--slot-root', self.temp.name + '/locks'])
+        self.probe = mock.Mock()
+        self.probe.windows.return_value = [{'pid': 10, 'name': 'ghostty', 'title': 'test'}]
+        self.probe.wsl.return_value = {'running': False, 'processes': []}
+        self.probe.vm.return_value = {'win11': {'exists': True, 'owned': True, 'running': False}}
+        self.probe.slots.return_value = True
+        self.probe.idle.return_value = 600
+        self.probe.cpu.return_value = {'cpu': 100, 'top': []}
+
+    def test_cpu_is_not_a_gate_and_threshold_is_inclusive(self):
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual(0, result['exit'])
+        self.assertTrue(result['quiet'])
+        self.probe.cpu.side_effect = OSError('PDH missing')
+        self.assertEqual(0, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
+    def test_each_gate_and_probe_error_fail_closed(self):
+        for method, value in [('windows', [{'pid': 1, 'name': 'ZiG.ExE'}]),
+                              ('windows', [{'pid': 1, 'name': 'app', 'title': 'Kimi Code'}]),
+                              ('wsl', {'processes': [{'pid': 2, 'name': 'cc1plus'}]}),
+                              ('vm', {'win11': {'running': True}}), ('slots', False), ('idle', 599.9)]:
+            operation = getattr(self.probe, method)
+            original = operation.return_value
+            operation.return_value = value
+            with self.subTest(method=method):
+                self.assertEqual(3, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+            operation.return_value = original
+        self.probe.wsl.side_effect = OSError('unavailable')
+        self.assertEqual(2, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
+    def test_polling_writes_every_attempt_without_overwriting(self):
+        self.args.wait = True
+        self.probe.idle.side_effect = [20, 600]
+        sleeper = mock.Mock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.run_quiet(self.args, self.probe, sleeper))
+        sleeper.assert_called_once_with(900)
+        paths = sorted(self.args.out.glob('attempt-*.json'))
+        self.assertEqual([3, 0], [json.loads(p.read_text())['exit'] for p in paths])
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.run_quiet(self.args, self.probe, sleeper)
+
+    def test_wsl_stopped_is_not_started_and_vm_daemon_failure_is_error(self):
+        with mock.patch.object(gx_perf, 'command_output', return_value='Other\r\n') as command:
+            self.assertFalse(gx_perf.QuietProbe().wsl('Ubuntu-24.04')['running'])
+            command.assert_called_once_with(['wsl.exe', '--list', '--running', '--quiet'])
+        with mock.patch.object(gx_perf, 'command_output', side_effect=gx_perf.PerfError('daemon')):
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.QuietProbe().vm(self.args.slot_root)
+
+
 class StatisticsTests(unittest.TestCase):
     def test_median_and_nearest_rank_p90(self):
         values = [float(v) for v in range(10, 0, -1)]

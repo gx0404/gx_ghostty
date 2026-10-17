@@ -35,12 +35,14 @@ Times are reported in milliseconds; metrics without a unit are counts. p90 is th
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
 import os
 import re
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -513,6 +515,172 @@ def label_environments(labels: Sequence[str], common: Sequence[str], overrides: 
     return result
 
 
+# Quiet checks observe state; they never stop a process, VM or WSL distribution.
+BUILD_PROCESSES = ("zig", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
+                   "ninja", "msbuild", "cl", "link", "gcc", "g++", "make", "cmake", "rustc", "cargo")
+BLACKLIST = ("Devin", "devin", "ToDesk", "Kimi Code", "哔哩哔哩")
+
+
+def command_output(argv: Sequence[str]) -> str:
+    result = subprocess.run(list(argv), capture_output=True, timeout=45)
+    if result.returncode:
+        raise PerfError(f"{argv[0]} exited {result.returncode}: {result.stderr.decode('utf-8', errors='replace')}")
+    raw = result.stdout
+    return raw.decode("utf-16" if b"\0" in raw else "utf-8-sig", errors="strict")
+
+
+def powershell_json(script: str):
+    prefix = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; "
+    return json.loads(command_output(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", prefix + script]))
+
+
+def shared_slots_root() -> Path:
+    # Worktrees must contend with the main checkout, not with worktree-local locks.
+    common = command_output(["git", "-C", str(REPO_ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+    return Path(common).parent / ".local" / "kernel-slots"
+
+
+def user_idle_seconds() -> float:
+    if sys.platform != "win32":
+        raise PerfError("GetLastInputInfo requires Windows")
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint32), ("dwTime", ctypes.c_uint32)]
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    user.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+    user.GetLastInputInfo.restype = ctypes.c_int
+    kernel.GetTickCount.restype = ctypes.c_uint32
+    if not user.GetLastInputInfo(ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return ((kernel.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
+
+
+def process_name(name: str) -> str:
+    return name.replace("\\", "/").rsplit("/", 1)[-1].casefold().removesuffix(".exe")
+
+
+class QuietProbe:
+    def windows(self) -> list[dict]:
+        data = powershell_json("@(Get-Process | Select-Object @{n='pid';e={$_.Id}},"
+                               "@{n='name';e={$_.ProcessName}},@{n='title';e={$_.MainWindowTitle}}) | ConvertTo-Json -Compress")
+        if not isinstance(data, list) or not data:
+            raise PerfError("Windows process inventory is missing")
+        return data
+
+    def wsl(self, distro: str) -> dict:
+        running = command_output(["wsl.exe", "--list", "--running", "--quiet"])
+        if distro.casefold() not in {line.strip().casefold() for line in running.splitlines()}:
+            return {"distro": distro, "running": False, "processes": []}
+        output = command_output(["wsl.exe", "--distribution", distro, "--exec", "ps", "-eo", "pid=,comm="])
+        rows = []
+        for line in output.splitlines():
+            pid, name = line.strip().split(None, 1)
+            rows.append({"pid": int(pid), "name": name})
+        if not rows:
+            raise PerfError("WSL process inventory is empty")
+        return {"distro": distro, "running": True, "processes": rows}
+
+    def vm(self, slots: Path) -> dict:
+        # status historically treats a failed docker inspect as an absent VM.
+        # Verify daemon access first so an unavailable daemon cannot look quiet.
+        docker = os.environ.get("GX_GHOSTTY_DOCKER", "docker")
+        command_output([docker, "info", "--format", "{{json .ServerVersion}}"])
+        data = json.loads(command_output([sys.executable, str(SCRIPTS / "gx_windows_vm.py"), "status",
+                                         "--root", str(slots.parent / "windows-vm")]))
+        if not isinstance(data, dict) or not data or any(not isinstance(row, dict) or
+                type(row.get("running")) is not bool or type(row.get("exists")) is not bool for row in data.values()):
+            raise PerfError("VM status is incomplete")
+        return data
+
+    def slots(self, root: Path) -> bool:
+        import gx_slots
+        try:
+            with gx_slots.acquire(root, "quiet", timeout=0):
+                pass
+            return True
+        except TimeoutError:
+            return False
+
+    def idle(self) -> float:
+        return user_idle_seconds()
+
+    def cpu(self) -> dict:
+        return powershell_json("@{cpu=@(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | "
+                               "Where-Object Name -eq '_Total' | Select-Object PercentProcessorTime); "
+                               "top=@(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | "
+                               "Where-Object {$_.IDProcess -ne 0 -and $_.Name -ne '_Total'} | "
+                               "Sort-Object PercentProcessorTime -Descending | Select-Object -First 10 "
+                               "IDProcess,Name,PercentProcessorTime)} | ConvertTo-Json -Depth 5 -Compress")
+
+
+def quiet_snapshot(args, probe=None) -> dict:
+    probe = probe or QuietProbe()
+    checks = {}
+    def check(name, operation, assess):
+        try:
+            raw = operation()
+            passed, reason = assess(raw)
+            checks[name] = {"status": "pass" if passed else "fail", "reason": reason, "raw": raw}
+        except (OSError, ValueError, PerfError, subprocess.SubprocessError) as exc:
+            checks[name] = {"status": "error", "reason": str(exc)}
+    builds = {process_name(name) for name in (args.build_process or BUILD_PROCESSES)}
+    blacklist = [name.casefold() for name in (args.blacklist or BLACKLIST)]
+    def build_check(rows):
+        found = [row for row in rows if process_name(row['name']) in builds]
+        return not found, "no build/test processes" if not found else f"build/test processes: {found}"
+    check("windows", probe.windows, build_check)
+    windows = checks["windows"]
+    if windows['status'] == 'error':
+        checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
+    else:
+        found = [row for row in windows['raw'] if any(name in row['name'].casefold() or
+                 name in row.get('title', '').casefold() for name in blacklist)]
+        checks['blacklist'] = {"status": "fail" if found else "pass", "raw": found,
+                               "reason": "blacklisted process present" if found else "no blacklisted processes"}
+    check("wsl", lambda: probe.wsl(args.distro), lambda data: build_check(data['processes']))
+    check("vm", lambda: probe.vm(args.slot_root), lambda data: (
+        not any(row['running'] for row in data.values()),
+        "all validation VM containers stopped" if not any(row['running'] for row in data.values()) else "VM container running"))
+    check("slots", lambda: probe.slots(args.slot_root), lambda free: (free, "all four locks acquired and released" if free else "slot occupied"))
+    check("input", probe.idle, lambda seconds: (seconds >= args.idle_seconds, f"idle {seconds:.3f}s; required {args.idle_seconds:g}s"))
+    try:
+        observation = {"status": "recorded", "raw": probe.cpu()}
+    except (OSError, ValueError, PerfError, subprocess.SubprocessError) as exc:
+        observation = {"status": "unavailable", "reason": str(exc)}
+    code = 2 if any(row['status'] == 'error' for row in checks.values()) else (
+        3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
+    return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
+            "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
+            "build_processes": sorted(builds), "blacklist": blacklist,
+            "scope": "point-in-time probe; locks released, not a reservation"}
+
+
+def new_output(path: Path) -> Path:
+    path = path.resolve()
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise PerfError(f"{path}: output must be new or empty; evidence is never overwritten")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def run_quiet(args, probe=None, sleep=time.sleep) -> int:
+    if not math.isfinite(args.idle_seconds) or args.idle_seconds < 0 or not math.isfinite(args.interval) or args.interval <= 0 or args.max_attempts < 1:
+        raise PerfError("invalid idle threshold, polling interval or attempts")
+    args.slot_root = args.slot_root or shared_slots_root()
+    out = new_output(args.out)
+    for attempt in range(1, (args.max_attempts if args.wait else 1) + 1):
+        result = quiet_snapshot(args, probe)
+        result['attempt'] = attempt
+        write_json(out / f"attempt-{attempt:03d}.json", result)
+        write_json(args.json, result)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        if result['exit'] != 3 or not args.wait or attempt == args.max_attempts:
+            return result['exit']
+        sleep(args.interval)
+    return 2
+
+
 # ---------------------------------------------------------------------------
 # Measurement runs
 # ---------------------------------------------------------------------------
@@ -815,6 +983,17 @@ def build_parser() -> argparse.ArgumentParser:
                      help="passed to every `smoke --perf` as --env (repeatable)")
     gtk.add_argument("--json", type=Path)
     gtk.add_argument("--label-env", action="append", default=[], metavar="LABEL:NAME=VALUE")
+    quiet = commands.add_parser("quiet", allow_abbrev=False, help="read-only quiet-window checks (0 quiet, 3 busy, 2 error)")
+    quiet.add_argument("--out", type=Path, required=True)
+    quiet.add_argument("--json", type=Path)
+    quiet.add_argument("--slot-root", type=Path)
+    quiet.add_argument("--distro", default="Ubuntu-24.04")
+    quiet.add_argument("--idle-seconds", type=float, default=600)
+    quiet.add_argument("--build-process", action="append", help="replace default build process names (repeatable)")
+    quiet.add_argument("--blacklist", action="append", help="replace default name/title substrings (repeatable)")
+    quiet.add_argument("--wait", action="store_true")
+    quiet.add_argument("--interval", type=float, default=900)
+    quiet.add_argument("--max-attempts", type=int, default=3)
     return parser
 
 
@@ -831,6 +1010,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 2
     try:
+        if args.command == "quiet":
+            return run_quiet(args)
         if args.command == "summarize":
             samples = collect(args.paths)
             if not samples:
