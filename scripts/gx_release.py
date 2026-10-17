@@ -10,6 +10,12 @@ Actions:
       release notes start with it) and checks that neither the gx-vX.Y.Z tag
       (git ls-remote --tags origin) nor a release for it (gh release view) exists.
       Prints sha/version/tag/version_string/zig and appends them to $GITHUB_OUTPUT.
+  linux-doc --dest DIR [--root SRC]
+      Used by the linux-gtk job: write the license files of ghostty-gx-$VS-x86_64-linux-debian13.tar.gz
+      into DIR (its usr/share/doc/ghostty-gx/) from the source tree SRC (default: this checkout): the
+      machine-readable copyright of the deb stage (gx_package.py) without its font paragraphs, and the
+      verbatim Ghostty-MIT.txt, pinyin-data-MIT.txt and Unicode-License-V3.txt (their names in licenses/ of
+      the Windows zip; the pinyin texts must match the gx_windows_package pins). Never overwrites a file.
   verify --sha SHA --artifacts DIR [--macos] [--version-string VS]
       Check the artifact directory against the exact expected asset set, the archive layouts,
       the VERSION embedded in the source tarballs and the Windows installer header, then write
@@ -72,6 +78,15 @@ LINUX_LIBVT_TARGETS = ("x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-mu
 WASM_LIBVT_TARGET = "wasm32-freestanding"
 WINDOWS_LIBVT_TARGET = "x86_64-windows-msvc"
 LINUX_APP_TARGET = "x86_64-linux-debian13"
+# License files of the Linux GTK asset: the binary embeds the pinyin tables of src/gx/pinyin/.
+LINUX_APP_DOC = "usr/share/doc/ghostty-gx"
+# (source path, file name in LINUX_APP_DOC); the names are those in licenses/ of the Windows zip.
+LINUX_APP_LICENSES = (
+    ("LICENSE", "Ghostty-MIT.txt"),
+    ("src/gx/pinyin/pinyin-data-LICENSE.txt", "pinyin-data-MIT.txt"),
+    ("src/gx/pinyin/Unicode-LICENSE.txt", "Unicode-License-V3.txt"),
+)
+LINUX_APP_DOC_FILES = ("copyright", *(name for _, name in LINUX_APP_LICENSES))
 WINDOWS_APP_TARGET = "x86_64-windows"
 WINDOWS_FONTS = (
     "JetBrainsMonoNerdFont-Bold.ttf", "JetBrainsMonoNerdFont-BoldItalic.ttf", "JetBrainsMonoNerdFont-Italic.ttf",
@@ -438,7 +453,8 @@ def expected_assets(version_string: str, macos: bool = False) -> dict[str, Asset
     assets.append(Asset(
         f"ghostty-gx-{vs}-{LINUX_APP_TARGET}.tar.gz", "app", LINUX_APP_TARGET,
         f"ghostty-gx-{vs}-{LINUX_APP_TARGET}",
-        required=("usr/bin/ghostty",), required_prefixes=("usr/share/ghostty/",),
+        required=("usr/bin/ghostty", *(f"{LINUX_APP_DOC}/{name}" for name in LINUX_APP_DOC_FILES)),
+        required_prefixes=("usr/share/ghostty/",),
     ))
     assets.append(Asset(
         f"ghostty-gx-{vs}-{WINDOWS_APP_TARGET}.zip", "app", WINDOWS_APP_TARGET,
@@ -466,6 +482,85 @@ def expected_assets(version_string: str, macos: bool = False) -> dict[str, Asset
             required=("Contents/Info.plist", "Contents/MacOS/ghostty"),
         ))
     return {asset.name: asset for asset in assets}
+
+
+def linux_app_doc(root: Path = ROOT) -> dict[str, bytes]:
+    """The files of LINUX_APP_DOC in the Linux GTK asset, from the source tree at root.
+
+    copyright is the machine-readable (DEP-5) file of the deb stage (gx_package.copyright_file) without
+    its font paragraphs, since this asset ships no fonts; the others are LINUX_APP_LICENSES verbatim with
+    LF line endings, and every text that gx_windows_package.PAYLOAD pins must match its pin.
+    """
+    # Imported here because both modules import this one.
+    import gx_package as package
+    import gx_pinyin
+    import gx_windows_package as windows
+
+    pins = {item.member: item.sha256 for item in windows.PAYLOAD if item.source == windows.REPO}
+    licenses: dict[str, bytes] = {}
+    for source, name in LINUX_APP_LICENSES:
+        path = Path(root) / source
+        if path.is_symlink() or not path.is_file():
+            raise ReleaseError(f"license text {source} is missing or not a regular file in {root}")
+        data = path.read_bytes().replace(b"\r\n", b"\n")
+        pin = pins.get(source)
+        if pin is None and source != "LICENSE":
+            raise ReleaseError(f"{source} has no SHA-256 pin in gx_windows_package.PAYLOAD")
+        if pin is not None and hashlib.sha256(data).hexdigest() != pin:
+            raise ReleaseError(f"{source} has SHA-256 {hashlib.sha256(data).hexdigest()}, pinned {pin}")
+        licenses[name] = data
+    ghostty_text, pinyin_text, unicode_text = (licenses[name].decode("utf-8") for _, name in LINUX_APP_LICENSES)
+    try:
+        ghostty, pinyin, unicode = (
+            package.copyright_holder(text, source)
+            for text, (source, _) in zip((ghostty_text, pinyin_text, unicode_text), LINUX_APP_LICENSES)
+        )
+    except package.PackageError as error:
+        raise ReleaseError(str(error)) from error
+    lines = [
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+        "Upstream-Name: Ghostty GX",
+        f"Upstream-Contact: https://github.com/{REPOSITORY}/issues",
+        f"Source: https://github.com/{REPOSITORY}",
+        "",
+        "Files: *",
+        f"Copyright: {ghostty}",
+        " gx0404 and Ghostty GX contributors",
+        "License: MIT",
+        "",
+        "Files: src/gx/pinyin/*",
+        f"Copyright: {pinyin}",
+        f" {unicode}",
+        "License: MIT and Unicode-3.0",
+        "Comment: The pinyin tables (initials and syllables) compiled into usr/bin/ghostty, generated from",
+        f" pinyin-data {gx_pinyin.SOURCE_VERSION} (https://github.com/mozillazg/pinyin-data, MIT), whose readings",
+        " come from the Unicode Unihan database (Unicode License V3). Verbatim texts: pinyin-data-MIT.txt and",
+        " Unicode-License-V3.txt in this directory; Ghostty's own license: Ghostty-MIT.txt.",
+        "",
+        "License: MIT",
+        *package.dep5_text(ghostty_text),
+        "",
+        "License: Unicode-3.0",
+        *package.dep5_text(unicode_text),
+        "",
+    ]
+    return {"copyright": "\n".join(lines).encode("utf-8"), **licenses}
+
+
+def write_linux_app_doc(root: Path, dest: Path) -> list[str]:
+    """Write linux_app_doc(root) into dest, creating it; refuses before writing if any file exists."""
+    doc = linux_app_doc(root)
+    dest = Path(dest)
+    if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+        raise ReleaseError(f"{dest} is a symlink or not a directory")
+    existing = [name for name in doc if (dest / name).exists() or (dest / name).is_symlink()]
+    if existing:
+        raise ReleaseError(f"{', '.join(existing)} already exist in {dest}; refusing to overwrite them")
+    dest.mkdir(parents=True, exist_ok=True)
+    for name, data in doc.items():
+        with (dest / name).open("xb") as stream:
+            stream.write(data)
+    return list(doc)
 
 
 def regular_file(path: Path) -> None:
@@ -728,7 +823,8 @@ def asset_description(name: str, asset: Asset | None) -> str:
     if asset.kind == "libvt":
         return f"libghostty-vt 预编译库（`{asset.target}`）"
     if asset.target == LINUX_APP_TARGET:
-        return "Ghostty GX 的 Linux GTK 构建（实验性，debian:13 构建，解压后运行 `usr/bin/ghostty`）"
+        return ("Ghostty GX 的 Linux GTK 构建（实验性，debian:13 构建，解压后运行 `usr/bin/ghostty`；"
+                "许可证在 `usr/share/doc/ghostty-gx/`）")
     if asset.kind == "installer":
         return ("Ghostty GX Windows 安装包（x64；默认按用户安装到 `%LOCALAPPDATA%\\Programs\\Ghostty GX`，"
                 "可改为所有用户；可选桌面图标与资源管理器右键菜单，按同一范围安装随附字体，卸载保留用户配置）")
@@ -861,6 +957,11 @@ def main(argv: list[str] | None = None) -> int:
     prepare_parser = actions.add_parser("prepare", help="resolve versions and run the release gates")
     prepare_parser.add_argument("--publish", action="store_true", help="also require a dated heading and an unused tag")
     prepare_parser.add_argument("--root", type=Path, default=ROOT, help="repository root (default: this checkout)")
+    doc_parser = actions.add_parser("linux-doc", help="write usr/share/doc/ghostty-gx/ of the Linux GTK asset")
+    doc_parser.add_argument("--dest", type=Path, required=True,
+                            help="usr/share/doc/ghostty-gx/ of the install tree (created; files are never overwritten)")
+    doc_parser.add_argument("--root", type=Path, default=ROOT,
+                            help="source tree holding the license texts (default: this checkout)")
     for name in ("verify", "publish"):
         sub = actions.add_parser(name, help=f"{name} the release assets")
         sub.add_argument("--sha", required=True, help="full commit SHA from prepare")
@@ -873,6 +974,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "prepare":
             prepare(root, args.publish)
+        elif args.action == "linux-doc":
+            written = write_linux_app_doc(root, args.dest)
+            print(f"PASS: wrote {', '.join(written)} to {args.dest}")
         elif args.action == "verify":
             files = verify_artifacts(root, args.artifacts, args.sha, args.macos, args.version_string)
             print(f"PASS: verified {len(files)} release files in {args.artifacts}")

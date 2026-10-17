@@ -176,8 +176,8 @@ pub fn confirmClipboardAccess(owner: ?w32.HWND, access: ClipboardAccess, text: [
 
 /// `confirmClipboardAccess` that, with `can_remember` (OSC 52 requests,
 /// as the GTK app does), offers "Remember choice for this split". On
-/// `remember` the caller sets the terminal's `clipboard-read` or
-/// `clipboard-write` to allow or deny after the choice.
+/// `remember` the caller retains this terminal's access decision until
+/// its configuration is reloaded.
 pub fn askClipboardAccess(owner: ?w32.HWND, access: ClipboardAccess, text: []const u8, can_remember: bool) ClipboardAnswer {
     const buttons = [_]Button{
         .{ .label = i18n.tr("Allow"), .choice = .accept },

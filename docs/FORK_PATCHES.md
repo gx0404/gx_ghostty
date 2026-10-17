@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0045）之后的号。在册的 39 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0045，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0046）之后的号。在册的 40 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0046，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -113,6 +113,7 @@
 | GX-0043 | `src/renderer/opengl/wgl.zig` | `fork(gx): GX-0043` | active |
 | GX-0044 | `src/Surface.zig` | `fork(gx): GX-0044` | active |
 | GX-0045 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0045` | active |
+| GX-0046 | `src/Surface.zig` | `fork(gx): GX-0046` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1433,3 +1434,12 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：保持“完整创建后计入、删除后计出”的位置，不得把计入移到可能失败的初始化之前；Windows Target 改为持有其他 GL 对象时同步 `targetLifetime` 的口径。删掉两块（及其后新增的空行）即回到只有 GX-0004 的文件。
 - 移除条件：上游提供等价的渲染目标资源计数，或 Windows 渲染路径不再使用 `Target` 时，移除两块与 `wgl.targetLifetime`。
 - 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0045ShapeTests` 锁定两块的位置、内容、Windows 门控，以及去掉 GX-0004 与 GX-0045 后等于上游原文）；`just test --filter renderer.opengl.wgl` 的 target gauges 用例覆盖 resize 重叠与回零；真实窗口日志中创建、resize、隐藏与关闭时的 gauge 在最终构建上核对，核对前保持 PENDING。
+
+## GX-0046 OSC 52 空读完成
+
+- 文件：`src/Surface.zig`；active，未回馈上游。三个纯新增 begin/end 块：`startClipboardRequest` 在既有配置拒绝检查之后，把 OSC 52 读转交私有 `gxStartClipboardReadOSC52`；该函数处理 apprt 返回的 `unavailable`；`completeClipboardReadOSC52` 在 deny 断言之后、ask 授权之前让空内容走已确认的完成路径。
+- 原因：apprt 返回 `unavailable`（剪贴板里没有文本）时请求没有启动、也不会有回调，上游发起处丢弃了返回值，等待回复的程序会一直挂起。空内容没有可泄露的数据，与上游 Kitty 剪贴板路径对 `unavailable` 直接回复的原则一致；区别是 Kitty 路径对空字符串内容仍按 ask 询问，OSC 52 这里不再询问。
+- 行为：`unavailable` 立即回复空 OSC 52 并返回 `started`；已启动的请求仍由原回调完成，不会二次回复；`unsupported` 与配置级 `clipboard-read = deny` 保持上游的不回复。回复沿用 `queueIo`，保留只读过滤与消息所有权，结束符仍固定为 ST（上游现状，BEL 请求的结束符镜像不在本补丁范围）。OSC 52 回复没有请求 ID，本地重试中或远程请求在途时的“忙”也立即得到空回复，两个读请求并发时回复顺序可能与请求不对应。Windows 分屏“记住拒绝”的回复一致性在 fork 文件 `src/apprt/win32/Surface.zig`，不属于本补丁。
+- 同步：保持配置 deny 检查在钩子之前、空内容豁免在 deny 断言之后；不得把 `unsupported` 当成有效数据，也不得对 `started` 再回复。
+- 移除条件：上游原生对 `unavailable` 回复空 OSC 52、并对空内容免于 ask 授权后，删除三个块（含测试）并把登记改为 removed；不要误删 Windows fork 文件里的记忆拒绝修复。
+- 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0046ShapeTests` 锁定三块的位置与内容、剥离后等于上游原文）；`just test --filter gx.clipboard`，WSL 上 none 与 `--gtk` 各跑同一 filter；真实剪贴板链路由 VM 的 osc52 相位验证，验证前保持 PENDING。

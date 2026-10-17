@@ -67,7 +67,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 | `source` | ubuntu-24.04 | `zig build distcheck -Demit-lib-vt=true -Dversion-string=$VS`，产出 libghostty-vt 源码包并检查不超过 5 MiB |
 | `libvt` | ubuntu-24.04 / windows-2025 | 矩阵构建 libghostty-vt：Linux 三个目标与 wasm32 在 ubuntu 上交叉编译，`x86_64-windows-msvc` 在 windows-2025 上原生构建 |
 | `libvt-macos` | macos-15 | 仅 `macos=true`：构建 libghostty-vt XCFramework |
-| `linux-gtk` | ubuntu-24.04 中的 `debian:13` 容器 | `zig build dist` 产出完整源码包，再从该源码包构建 GTK app 并检查 `+version` |
+| `linux-gtk` | ubuntu-24.04 中的 `debian:13` 容器 | `zig build dist` 产出完整源码包，再从该源码包构建 GTK app 并检查 `+version`，再用源码包内的 `scripts/gx_release.py linux-doc` 写入许可文件 |
 | `linux-gtk-noble` | ubuntu-24.04 中的 `ubuntu:24.04` 容器 | 按 GX Shell 的消费方命令从检出构建 GTK app 并生成、校验 deb stage，再装成一次性测试包，检查 `+version` 并截图；只上传证据 artifact `evidence-linux-gtk-noble`，不产出发布资产 |
 | `windows-app` | windows-2025 | 安装 sha256 钉版的 Inno Setup 7.1.0（当前用户、便携模式），以 `-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast` 构建，再由 `scripts/gx_windows_package.py` 打出便携 zip 与安装包，并检查输出目录恰好是这两个文件 |
 | `macos` | macos-26 | 仅 `macos=true`：构建 `Ghostty.app`。macos-15（Xcode 26.3）编不过 `images/Ghostty.icon` 的资源目录（2026-10-07 run 37587740223），上游也在 macOS 26 上构建 app |
@@ -103,7 +103,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 | `libghostty-vt-1.3.2-gx.0.0.1-x86_64-linux-musl.tar.gz` | `libvt` | 同上 |
 | `libghostty-vt-1.3.2-gx.0.0.1-wasm32-freestanding.tar.gz` | `libvt` | `bin/ghostty-vt.wasm`（ReleaseSmall，默认启用 simd128） |
 | `libghostty-vt-1.3.2-gx.0.0.1-x86_64-windows-msvc.zip` | `libvt` | `ghostty-vt.dll` 及导入库、`lib/ghostty-vt-static.lib`、`include/ghostty/` |
-| `ghostty-gx-1.3.2-gx.0.0.1-x86_64-linux-debian13.tar.gz` | `linux-gtk` | 实验性 GTK app，顶层目录下是 `usr/`（`--prefix /usr` 安装），可执行文件为 `usr/bin/ghostty` |
+| `ghostty-gx-1.3.2-gx.0.0.1-x86_64-linux-debian13.tar.gz` | `linux-gtk` | 实验性 GTK app，顶层目录下是 `usr/`（`--prefix /usr` 安装），可执行文件为 `usr/bin/ghostty`；`usr/share/doc/ghostty-gx/` 有 DEP-5 `copyright` 与许可原文 `Ghostty-MIT.txt`、`pinyin-data-MIT.txt`、`Unicode-License-V3.txt`（`scripts/gx_release.py linux-doc` 从源码包写出，拼音两份按钉值校验） |
 | `ghostty-gx-1.3.2-gx.0.0.1-x86_64-windows.zip` | `windows-app` | Windows 便携版，顶层目录 `ghostty-gx-$VS-x86_64-windows/`：`ghostty.exe`、`conpty.dll`、`OpenConsole.exe`、`mesa/`（3 个 DLL）、`share/`（含 `share/terminfo/ghostty.terminfo` 与 fork 主题）、`fonts/`（8 个字体文件）、`licenses/`（含 `Ghostty-MIT.txt`、`THIRD-PARTY.txt`）、中英文 `README.txt`；不写注册表，不安装字体 |
 | `ghostty-gx-1.3.2-gx.0.0.1-x86_64-windows-setup.exe` | `windows-app` | Windows 安装包（Inno Setup 7.1，AppId `{49341A18-5070-425E-83B9-79E184242ACF}`，x64，Windows 10 1809 起）：默认按当前用户装到 `%LOCALAPPDATA%\Programs\Ghostty GX`，可在对话框里改为所有用户；开始菜单快捷方式，可选桌面图标（默认不勾）；登记 `App Paths\ghostty.exe`；可选资源管理器右键「在此处打开 Ghostty GX」（目录与目录背景，默认勾选）；字体装进 `{autofonts}`，范围与程序相同（当前用户或所有用户），已有同名字体时跳过，卸载时不删；卸载只删安装写入的内容，保留用户配置；`verify` 要求至少 16 MiB 且是 PE 文件 |
 | `libghostty-vt-1.3.2-gx.0.0.1-xcframework.zip` | `libvt-macos` | 仅 `macos=true`：`ghostty-vt.xcframework`，macOS universal，SDK 存在时另含 iOS 与 iOS 模拟器切片（`src/build/GhosttyLibVt.zig::initStaticAppleUniversal`） |

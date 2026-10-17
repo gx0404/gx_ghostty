@@ -632,6 +632,58 @@ def gx0043_readback_problems(wgl: str, surface: str) -> list[str]:
     return problems
 
 
+GX0046 = "GX-0046"
+GX0046_HOOK = ("if (effective_req == .osc_52_read) return gxStartClipboardReadOSC52(self, loc, "
+               "effective_req.osc_52_read);")
+GX0046_EMPTY = ("if (data.len == 0 and !confirmed) return self.completeClipboardReadOSC52("
+                "data, clipboard_type, true);")
+
+
+def gx0046_problems(source: str) -> list[str]:
+    """Shape lock for GX-0046 in src/Surface.zig: the OSC 52 read hook after the deny check
+    of startClipboardRequest, the helper hunk, and the empty-read bypass after the deny
+    assertion of completeClipboardReadOSC52."""
+    try:
+        _, hunks = marked_hunks(source, GX0046)
+    except ValueError as err:
+        return [str(err)]
+    if len(hunks) != 3:
+        return [f"expected 3 {GX0046} hunks, found {len(hunks)}"]
+    lines = source.splitlines()
+    bodies = [[line.strip() for line in lines[b + 1:e] if line.strip()] for b, e in hunks]
+    problems: list[str] = []
+    if bodies[0] != [GX0046_HOOK]:
+        problems.append("the first GX-0046 hunk must hold only the OSC 52 read hook")
+    if bodies[2] != [GX0046_EMPTY]:
+        problems.append("the last GX-0046 hunk must hold only the empty-read bypass")
+    helper = "\n".join(bodies[1])
+    if "fn gxStartClipboardReadOSC52(" not in helper or "if (result == .unavailable) {" not in helper \
+            or 'try self.completeClipboardReadOSC52("", clipboard, true);' not in helper \
+            or "return .started;" not in helper:
+        problems.append("the helper must answer only an unavailable read, once, as started")
+    def exact_fn(name: str) -> tuple[int, int] | None:
+        # The upstream signatures break after "(", unlike same-named test doubles.
+        starts = [i for i, line in enumerate(lines) if line.strip() == f"fn {name}("]
+        if len(starts) != 1:
+            return None
+        end = next((i for i in range(starts[0] + 1, len(lines)) if lines[i] == "}"), None)
+        return None if end is None else (starts[0], end + 1)
+
+    start = exact_fn("startClipboardRequest")
+    complete = exact_fn("completeClipboardReadOSC52")
+    if start is None or complete is None:
+        return problems + ["startClipboardRequest or completeClipboardReadOSC52 is missing"]
+    deny = [i for i in range(*start) if lines[i].strip() == ".osc_52_read => if (self.config.clipboard_read == .deny) {"]
+    if not (start[0] <= hunks[0][0] < start[1]) or not deny or hunks[0][0] < deny[0]:
+        problems.append("the hook must sit in startClipboardRequest after its deny check")
+    elif lines[hunks[0][1] + 1].strip() != "return try self.rt_surface.clipboardRequest(loc, effective_req);":
+        problems.append("the hook must sit right above the upstream clipboardRequest return")
+    asserted = [i for i in range(*complete) if lines[i].strip() == "assert(self.config.clipboard_read != .deny);"]
+    if not (complete[0] <= hunks[2][0] < complete[1]) or not asserted or hunks[2][0] < asserted[0]:
+        problems.append("the empty-read bypass must follow the deny assertion")
+    return problems
+
+
 TARGET_ZIG = "src/renderer/opengl/Target.zig"
 WGL_ZIG = "src/renderer/opengl/wgl.zig"
 GX0045 = "GX-0045"
@@ -1495,6 +1547,30 @@ class Gx0043ReadbackTests(unittest.TestCase):
         locked = self.surface.replace(unlock + log, log + unlock, 1)
         problems = gx0043_readback_problems(self.wgl, locked)
         self.assertTrue(any("only then log" in p for p in problems), problems)
+
+
+class Gx0046ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / CORE_SURFACE_ZIG).read_text(encoding="utf-8")
+
+    def test_osc52_read_completion_stays_registered_and_in_place(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0046, CORE_SURFACE_ZIG, f"fork(gx): {GX0046}", "active"), patches)
+        self.assertEqual(gx0046_problems(self.source), [])
+        self.assertEqual(gx0046_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_broken_shapes_are_rejected(self):
+        cases = {
+            "only the OSC 52 read hook": (GX0046_HOOK, GX0046_HOOK + "\n    _ = 0;"),
+            "only the empty-read bypass": (GX0046_EMPTY, "if (data.len == 0) return;"),
+            "answer only an unavailable read": ("if (result == .unavailable) {", "if (result != .started) {"),
+        }
+        for expected, (old, new) in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(self.source.count(old), 1, old)
+                problems = gx0046_problems(self.source.replace(old, new))
+                self.assertTrue(any(expected in problem for problem in problems), problems)
 
 
 class Gx0045ShapeTests(unittest.TestCase):
