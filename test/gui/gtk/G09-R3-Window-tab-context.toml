@@ -12,9 +12,9 @@ keybind = ctrl+alt+r=prompt_tab_title
 # apart by its title. Intermediate
 # screenshots use xdotool exec into the evidence directory next to
 # XDG_STATE_HOME, which the runner copies out with the rest; the whole script
-# must finish within the runner's 30 s xdotool timeout. After Escape closes a
-# menu the next right-click needs the pointer to leave and re-enter the tab
-# bar, or GTK drops it.
+# must finish within the runner's 30 s xdotool timeout. The pinned tab's menu
+# is dismissed with a click on the terminal: under Xvfb without a window
+# manager the first right-click after Escape dismisses it is dropped.
 xdotool = '''
 mousemove 400 300
 click 1
@@ -96,10 +96,9 @@ mousemove 32 68
 click 3
 sleep 0.6
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s05-pinned-menu.png"
-key Escape
+mousemove 400 450
+click 1
 sleep 0.8
-mousemove 400 400
-sleep 0.2
 mousemove 237 68
 sleep 0.2
 click 3
