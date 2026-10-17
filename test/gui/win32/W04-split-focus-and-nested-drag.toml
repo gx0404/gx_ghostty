@@ -1,14 +1,37 @@
 id = "W04"
 title = "Nested split divider follows the pointer; closing a pane focuses its sibling"
+# R0: nested, dragged and focus-after-exit. Phase 6 (r6) extends the case for R2-Window.03,
+# .04 and .07: no size overlay at the first show, the new split takes the half of the pane,
+# the configured divider color and its hover highlight, live resize while dragging, the
+# minimum pane size, the dim of unfocused panes, zoom, and the size overlay only for a resize
+# that changes the grid.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+split-divider-color = #ff3030
+unfocused-split-opacity = 0.5
+keybind = f9=toggle_split_zoom
 """
 expect = [
-  "nested: three panes A | (B / C), the bottom-right pane C is focused",
+  "first-show: right after the window appeared it shows the prompt and no columns × rows overlay (resize-overlay = after-first)",
+  "half-split: the new pane took exactly the right half of the window; the left pane is dimmed (unfocused), a red 1 DIP divider line sits in the gap",
+  "divider-hover: with the pointer on the divider, its line is wider (3 DIP) and in the accent color instead of red",
+  "live-drag: while the button is still held, both panes already follow the pointer at about 30% of the width",
+  "min-clamp: dragged to the left edge, the left pane keeps its minimum width instead of disappearing",
+  "nested: three panes A | (B / C), the bottom-right pane C is focused; A and B are dimmed",
   "dragged: the divider between B and C sits under the pointer at three quarters of the right column (not further down)",
+  "zoomed: F9 (toggle_split_zoom) shows only the focused pane C over the whole terminal area, no divider",
+  "unzoomed: F9 again brings back the three panes with the same layout",
   "focus-after-exit: after `exit` in C, `echo focus-here` ran in B (top right), not in A",
+  "resize-overlay: right after the window was resized, the focused pane shows its columns × rows overlay",
+  "same-grid: a resize by two pixels that keeps the grid shows no overlay (the window's last grid)",
 ]
+
+# Captured as soon as the window shows: the first grid gets no overlay.
+[[step]]
+action = "capture"
+name = "first-show"
+what = "all"
 
 [[step]]
 action = "key"
@@ -17,6 +40,95 @@ keys = "ctrl+shift+o"
 [[step]]
 action = "wait_terminals"
 count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "half-split"
+what = "all"
+
+# A single right split puts its divider in the middle of the client area.
+[[step]]
+action = "move"
+in = "client"
+x = "50%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "divider-hover"
+
+[[step]]
+action = "mouse_down"
+in = "client"
+x = "50%"
+y = "60%"
+
+[[step]]
+action = "move"
+in = "client"
+x = "40%"
+y = "60%"
+
+[[step]]
+action = "move"
+in = "client"
+x = "30%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "live-drag"
+
+[[step]]
+action = "move"
+in = "client"
+x = "10%"
+y = "60%"
+
+[[step]]
+action = "move"
+in = "client"
+x = "1%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "min-clamp"
+
+[[step]]
+action = "mouse_up"
+in = "client"
+x = "1%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "drag_divider"
+between = [0, 1]
+fraction = 0.5
+
+[[step]]
+action = "sleep"
+seconds = 0.5
 
 [[step]]
 action = "key"
@@ -49,6 +161,38 @@ action = "capture"
 name = "dragged"
 
 [[step]]
+action = "key"
+keys = "f9"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "zoomed"
+
+[[step]]
+action = "key"
+keys = "f9"
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "unzoomed"
+
+[[step]]
 action = "type"
 text = "exit\n"
 
@@ -71,3 +215,35 @@ seconds = 0.5
 [[step]]
 action = "capture"
 name = "focus-after-exit"
+
+[[step]]
+action = "resize"
+width = 1400
+height = 900
+
+[[step]]
+action = "sleep"
+seconds = 0.2
+
+[[step]]
+action = "capture"
+name = "resize-overlay"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 2.0
+
+[[step]]
+action = "resize"
+width = 1402
+height = 901
+
+[[step]]
+action = "sleep"
+seconds = 0.2
+
+[[step]]
+action = "capture"
+name = "same-grid"
+what = "all"
