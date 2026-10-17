@@ -163,7 +163,7 @@ pub fn frameReady(self: *Self) void {
             self.disconnect();
             return;
         }
-        view.perf_frame.received(reading.lease.perf_input, RemotePerf.now());
+        view.receivePerf(reading.lease.perf_input, self.visible);
         @memcpy(view.last_frame, reading.lease.pixels);
         view.has_frame = true;
         view.last_sequence = reading.lease.sequence;
@@ -208,6 +208,7 @@ pub fn setVisible(self: *Self, visible: bool) void {
         self.emit(.{ .visible = false });
     }
     self.visible = visible and !self.destroying;
+    self.hidePerfIfHidden();
     self.ui.search_bar.bindRemote(self);
     self.ui.search_bar.setOwnerVisible(self.visible);
     self.ui_attachment.setVisible(&self.app.ui_ids, self.ui_reference, self.parent_window.ui_reference, self.visible) catch {
@@ -427,6 +428,13 @@ pub fn emit(self: *Self, event: Input.Event) void {
     self.emitTimed(event, if (protocol.Input.measurable(event)) RemotePerf.now() else 0);
 }
 
+/// GUI-only, pure state transition shared by hide and its regression tests.
+fn hidePerfIfHidden(self: *Self) void {
+    if (self.visible) return;
+    self.perf_last_input = @max(self.perf_last_input, self.gate.sequence);
+    if (self.view) |*view| view.perf_frame = .{};
+}
+
 fn emitTimed(self: *Self, event: Input.Event, qpc: u64) void {
     if (self.destroying or self.unavailable or self.closed or self.close_pending or !self.visible or self.input_suspended) return;
     var value = self.gate.next(self.source_reference, event) catch return;
@@ -560,7 +568,11 @@ fn paint(self: *Self) void {
     if (self.input_busy) self.canvas.drawText(i18n.tr("Remote input is temporarily busy."), .{ .x = 8, .y = @max(0, rect.h - 32), .w = @max(0, rect.w - 16), .h = 32 }, .{ .color = colors.foreground });
     const completed = self.canvas.finish();
     if (completed == .recreate) self.invalidate();
-    if (completed == .ok and result == .drawn and !self.closed and self.visible) {
+    self.recordPaint(completed == .ok, result);
+}
+
+fn recordPaint(self: *Self, completed: bool, result: View.DrawResult) void {
+    if (completed and result == .drawn and !self.closed and self.visible) {
         if (self.view) |*view| view.perf_frame.presented(&self.perf_last_input);
     }
 }
@@ -715,6 +727,146 @@ test "remote bell border edges cover exactly the shared border pixels" {
                     // Strips may overlap only when the pane is thinner than both edges.
                     try std.testing.expectEqual(expected, hits > 0);
                     if (size[0] > 2 and size[1] > 2) try std.testing.expect(hits <= 1);
+                }
+            }
+        }
+    }
+}
+
+fn perfTestPane() Self {
+    return .{
+        .app = undefined,
+        .parent_window = undefined,
+        .canvas = undefined,
+        .ui_reference = .{},
+        .transfer_reference = .{},
+        .source_reference = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 9 },
+        .gate = .{ .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 9 } },
+        .callbacks = undefined,
+    };
+}
+
+fn perfTestView() View {
+    return .{ .allocator = std.testing.allocator, .reference = .{}, .attachment = .{}, .channel = undefined, .last_frame = undefined };
+}
+
+test "remote hidden pane discards pending timing and retires input through its gate sequence" {
+    const perf = @import("../../gx/perf.zig");
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    perf.setEnabled(true);
+    const pane = try std.testing.allocator.create(Self);
+    defer std.testing.allocator.destroy(pane);
+    pane.* = perfTestPane();
+    pane.view = perfTestView();
+    pane.gate.sequence = 8;
+    pane.perf_last_input = 3;
+    pane.view.?.perf_frame.received(.{ .sequence = 7, .qpc = 100 }, 150);
+    pane.hidePerfIfHidden();
+    try std.testing.expectEqual(RemotePerf.Presentation{}, pane.view.?.perf_frame);
+    try std.testing.expectEqual(@as(u64, 8), pane.perf_last_input);
+    pane.view.?.receivePerf(.{ .sequence = 7, .qpc = 100 }, false);
+    try std.testing.expectEqual(RemotePerf.Presentation{}, pane.view.?.perf_frame);
+    // draw must return before clocks, channel access or painting when hidden.
+    try std.testing.expectEqual(View.DrawResult.waiting, pane.view.?.draw(undefined, undefined));
+    pane.visible = true;
+    // Fixed clocks keep the hide/show attribution regression purely logical.
+    pane.view.?.perf_frame.received(.{ .sequence = 7, .qpc = 100 }, 200);
+    pane.hidePerfIfHidden();
+    const samples = pane.view.?.perf_frame.complete(&pane.perf_last_input, 210, 1_000_000);
+    try std.testing.expectEqual(@as(?u64, 10), samples.present);
+    try std.testing.expectEqual(@as(?u64, null), samples.input_to_present);
+    pane.visible = false;
+    pane.perf_last_input = 10;
+    pane.hidePerfIfHidden();
+    try std.testing.expectEqual(@as(u64, 10), pane.perf_last_input);
+    pane.view = null;
+    pane.gate.sequence = 11;
+    pane.hidePerfIfHidden();
+    try std.testing.expectEqual(@as(u64, 11), pane.perf_last_input);
+}
+
+test "remote emitTimed gates inactive input and stamps only measurable event kinds" {
+    const perf = @import("../../gx/perf.zig");
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    const Sink = struct {
+        calls: u64 = 0,
+        stamp: RemotePerf.InputStamp = .{},
+        accept: bool = true,
+        fn input(ctx: *anyopaque, _: refs.Reference, value: protocol.Input) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.stamp = value.perf;
+            return self.accept;
+        }
+    };
+    var sink: Sink = .{};
+    const pane = try std.testing.allocator.create(Self);
+    defer std.testing.allocator.destroy(pane);
+    pane.* = perfTestPane();
+    pane.callbacks = .{ .ctx = &sink, .input = Sink.input, .close_requested = undefined };
+    pane.visible = true;
+    pane.input_suspended = false;
+    const event: Input.Event = .{ .text = try protocol.Text.init("x") };
+    perf.setEnabled(true);
+    pane.emitTimed(event, 100);
+    try std.testing.expectEqual(@as(u64, 0), sink.calls); // no input lease
+    try pane.gate.enable(.{ .holder_epoch = 2, .transaction = 7, .generation = 9 });
+    inline for (.{ "destroying", "unavailable", "closed", "close_pending", "input_suspended" }) |field| {
+        @field(pane, field) = true;
+        pane.emitTimed(event, 100);
+        @field(pane, field) = false;
+    }
+    pane.visible = false;
+    pane.emitTimed(event, 100);
+    try std.testing.expectEqual(@as(u64, 0), sink.calls);
+    try std.testing.expectEqual(@as(u64, 0), pane.gate.sequence);
+    pane.visible = true;
+    pane.emitTimed(event, 100);
+    try std.testing.expectEqual(RemotePerf.InputStamp{ .sequence = 1, .qpc = 100 }, sink.stamp);
+    pane.emitTimed(.{ .key = .{ .action = .press, .physical = 0, .unicode = 0, .modifiers = 0 } }, 200);
+    try std.testing.expectEqual(RemotePerf.InputStamp{}, sink.stamp);
+    sink.accept = false;
+    pane.emitTimed(event, 300);
+    try std.testing.expect(pane.input_busy);
+    try std.testing.expectEqual(@as(u64, 3), pane.gate.sequence);
+    sink.accept = true;
+    perf.setEnabled(false);
+    pane.emit(event);
+    try std.testing.expectEqual(RemotePerf.InputStamp{}, sink.stamp);
+    try std.testing.expect(!pane.input_busy);
+    try std.testing.expectEqual(@as(u64, 4), sink.calls);
+}
+
+test "remote paint timing requires perf visible open drawn and successful EndDraw" {
+    const perf = @import("../../gx/perf.zig");
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    const pane = try std.testing.allocator.create(Self);
+    defer std.testing.allocator.destroy(pane);
+    pane.* = perfTestPane();
+    pane.view = perfTestView();
+    for ([_]bool{ false, true }) |enabled| {
+        perf.setEnabled(enabled);
+        for ([_]bool{ false, true }) |visible| {
+            pane.visible = visible;
+            for ([_]bool{ false, true }) |closed| {
+                pane.closed = closed;
+                for ([_]bool{ false, true }) |completed| {
+                    for (std.enums.values(View.DrawResult)) |result| {
+                        pane.perf_last_input = 0;
+                        pane.view.?.perf_frame.received(.{ .sequence = 7, .qpc = 1 }, 1);
+                        pane.recordPaint(completed, result);
+                        const expected = enabled and visible and !closed and completed and result == .drawn;
+                        try std.testing.expectEqual(@as(u64, if (expected) 7 else 0), pane.perf_last_input);
+                        try std.testing.expectEqual(@as(u64, if (expected) 0 else 1), pane.view.?.perf_frame.received_qpc);
+                        if (expected) {
+                            pane.recordPaint(completed, result);
+                            try std.testing.expectEqual(RemotePerf.Presentation{}, pane.view.?.perf_frame);
+                        }
+                    }
                 }
             }
         }
