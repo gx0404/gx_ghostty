@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52','toast-matrix','jumplist-matrix')]
+                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -1268,7 +1268,7 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix')
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator')
 $script:Restore = $null
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
@@ -1574,6 +1574,11 @@ function Get-PhaseState([string]$When) {
             $state.jump_lists = Get-JumpListFiles
             $state.user_config = @(Get-UserConfigFiles | ForEach-Object { [ordered]@{ path=$_; exists=(Test-Path -LiteralPath $_);
                 sha256=$(if (Test-Path -LiteralPath $_) { Get-Sha256 $_ } else { $null }) } })
+        }
+        'narrator' {
+            $state.records = @(Get-OwnedRecordSummary 'narrator')
+            $state.narrator_processes = @(Get-NarratorProcesses)
+            $state.screen_reader = Get-ScreenReaderFlag
         }
     }
     return $state
@@ -2762,6 +2767,116 @@ function Invoke-JumpListMatrix {
     }
 }
 
+# ---- narrator: Narrator for screenshots of what a screen reader gets -------
+
+$script:NarratorKeys = [ordered]@{ 'narrator-settings'='Software\Microsoft\Narrator';
+    'narrator-accessibility'='Software\Microsoft\Windows NT\CurrentVersion\Accessibility' }
+
+$script:ScreenReaderSource = @'
+using System;
+using System.Runtime.InteropServices;
+public static class GxVmScreenReader {
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")] static extern bool GetParam(uint action, uint param, out int value, uint flags);
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")] static extern bool SetParam(uint action, uint param, IntPtr value, uint flags);
+    // SPI_GETSCREENREADER / SPI_SETSCREENREADER; the app picks native dialogs while it is set.
+    public static bool Get() { int value; if (!GetParam(0x0046, 0, out value, 0)) throw new Exception("SPI_GETSCREENREADER failed: " + Marshal.GetLastWin32Error()); return value != 0; }
+    public static void Set(bool on) { if (!SetParam(0x0047, on ? 1u : 0u, IntPtr.Zero, 0x2)) throw new Exception("SPI_SETSCREENREADER failed: " + Marshal.GetLastWin32Error()); }
+}
+'@
+
+function Get-ScreenReaderFlag {
+    if (-not ('GxVmScreenReader' -as [type])) { Add-Type -TypeDefinition $script:ScreenReaderSource -Language CSharp }
+    return [GxVmScreenReader]::Get()
+}
+
+function Get-NarratorProcesses {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'Narrator.exe'" | ForEach-Object {
+        [ordered]@{ pid=[int]$_.ProcessId; parent=[int]$_.ParentProcessId; session=[int]$_.SessionId; path=$_.ExecutablePath;
+            created=$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }) } })
+}
+
+function Invoke-Narrator {
+    # start: back up the Narrator and Accessibility keys, start Narrator.exe and
+    # own exactly the Narrator processes created by that start; developer mode
+    # (Narrator+Shift+F12) and turning Narrator off (Ctrl+Win+Enter) are the
+    # coordinator's keyboard input. stop: wait for that exit (close, then end
+    # only the owned processes as a recorded failure), restore keys and flag.
+    $step = Assert-Action @('start','status','stop') 'status'
+    $record = Read-Record 'narrator'
+    switch ($step) {
+        'start' {
+            if ($record -and $record.status -ceq 'RUNNING') { throw 'This run already started Narrator; stop it first.' }
+            $foreign = @(Get-NarratorProcesses)
+            if ($foreign.Count -gt 0) { throw ('Narrator already runs (pid ' + (@($foreign | ForEach-Object { $_.pid }) -join ',') + '); turn it off first.') }
+            $backups = [ordered]@{}
+            foreach ($entry in $script:NarratorKeys.GetEnumerator()) { $backups[$entry.Key] = (Backup-HkcuKey $entry.Key $entry.Value).backed_up_utc }
+            $flagBefore = Get-ScreenReaderFlag
+            $exe = Join-Path $env:SystemRoot 'System32\Narrator.exe'
+            $since = [DateTime]::UtcNow.AddSeconds(-1)
+            $launcher = Start-Process -FilePath $exe -PassThru
+            $owned = @()
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            do {
+                Start-Sleep -Milliseconds 500
+                $owned = @(Get-NarratorProcesses | Where-Object { $_.created -and [DateTime]::Parse($_.created).ToUniversalTime() -ge $since })
+            } while ($clock.Elapsed.TotalSeconds -lt 20 -and ($owned.Count -eq 0 -or -not (Get-ScreenReaderFlag)))
+            $owned = @($owned | ForEach-Object {
+                $process = Get-Process -Id $_.pid -ErrorAction SilentlyContinue
+                if ($process) { $_.birth_filetime = $process.StartTime.ToFileTimeUtc(); $_.exe = $process.Path; $process.Dispose() }
+                $_ })
+            $record = [ordered]@{ status='RUNNING'; started_utc=$since.AddSeconds(1).ToString('o'); launcher_pid=$launcher.Id; owned=$owned;
+                screen_reader_before=$flagBefore; screen_reader_after_start=(Get-ScreenReaderFlag); backups=$backups }
+            $launcher.Dispose()
+            Save-Record 'narrator' $record | Out-Null
+            Write-ExportMarker 'narrator-running' @{ owned=@($owned | ForEach-Object { $_.pid }); utc=[DateTime]::UtcNow.ToString('o') }
+            return [ordered]@{ record=$record; fixture_verdict=$(if ($owned.Count -gt 0) { 'RUNNING' } else { 'FAIL' });
+                fixture_reason=$(if ($owned.Count -gt 0) { $null } else { 'no Narrator process appeared within 20 seconds' });
+                next='developer mode: Narrator+Shift+F12; turn Narrator off with Ctrl+Win+Enter, then -Action stop' }
+        }
+        'status' {
+            return [ordered]@{ record=$record; narrator_processes=@(Get-NarratorProcesses); screen_reader=(Get-ScreenReaderFlag);
+                foreground=$(if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }; [GxVmWindows]::Foreground()) }
+        }
+        'stop' {
+            if ($null -eq $record) { throw 'This run did not start Narrator.' }
+            $outcomes = @(foreach ($owned in @($record.owned)) {
+                $item = [ordered]@{ pid=$owned.pid; exited_by_itself=$false; close_main_window=$null; killed=$false; exit_code=$null; unverified_alive=$false }
+                $process = if ($owned.PSObject.Properties['birth_filetime']) { Get-OwnedProcess ([pscustomobject]@{ pid=$owned.pid; birth_filetime=$owned.birth_filetime; exe=$owned.exe }) } else { $null }
+                if ($null -eq $process -and -not $owned.PSObject.Properties['birth_filetime'] -and (Get-Process -Id ([int]$owned.pid) -ErrorAction SilentlyContinue)) {
+                    # Its creation time was not readable at start, so this PID is not provably ours: never touch it.
+                    $item.unverified_alive = $true
+                } elseif ($null -eq $process) { $item.exited_by_itself = $true }
+                else {
+                    try {
+                        $item.exited_by_itself = $process.WaitForExit($CloseWaitSeconds * 1000)
+                        if (-not $item.exited_by_itself) {
+                            $item.close_main_window = $process.CloseMainWindow()
+                            if (-not $process.WaitForExit(5000)) { $process.Kill(); $null = $process.WaitForExit(5000); $item.killed = $true }
+                        }
+                        if ($process.HasExited) { $item.exit_code = $process.ExitCode }
+                    } finally { $process.Dispose() }
+                }
+                $item })
+            $flag = [ordered]@{ before=$record.screen_reader_before; at_stop=(Get-ScreenReaderFlag); reset=$false }
+            if (-not $record.screen_reader_before -and $flag.at_stop -and @(Get-NarratorProcesses).Count -eq 0) {
+                # Narrator's own flag outlived it (for example after a forced end): put back the recorded value.
+                [GxVmScreenReader]::Set($false)
+                $flag.reset = $true
+            }
+            $flag.after = Get-ScreenReaderFlag
+            $restores = @(foreach ($name in $script:NarratorKeys.Keys) { Restore-HkcuKey $name })
+            $script:Restore = [ordered]@{ registry=$restores; screen_reader=$flag }
+            $record.status = 'STOPPED'
+            Set-RecordField $record 'stop' ([ordered]@{ outcomes=$outcomes; restore=$script:Restore; utc=[DateTime]::UtcNow.ToString('o') })
+            Save-Record 'narrator' $record | Out-Null
+            $forced = @($outcomes | Where-Object { $_.killed -or $_.unverified_alive })
+            $restored = @($restores | Where-Object { -not $_.restored }).Count -eq 0 -and $flag.after -eq [bool]$record.screen_reader_before
+            return [ordered]@{ outcomes=$outcomes; restore=$script:Restore; fixture_verdict=$(if ($forced.Count -eq 0 -and $restored) { 'PASS' } else { 'FAIL' });
+                fixture_reason=$(if ($forced.Count -gt 0) { 'Narrator did not exit on its own or on close (ended, or left running when not provably owned)' } elseif (-not $restored) { 'settings were not restored' } else { $null }) }
+        }
+    }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
@@ -2872,6 +2987,7 @@ try {
         'osc52' { $report.result = Invoke-Osc52 }
         'toast-matrix' { $report.result = Invoke-ToastMatrix }
         'jumplist-matrix' { $report.result = Invoke-JumpListMatrix }
+        'narrator' { $report.result = Invoke-Narrator }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
