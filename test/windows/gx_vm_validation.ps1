@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator')]
+                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -65,7 +65,9 @@ param(
     # jumplist-matrix config: back up and replace a configuration this fixture did not write.
     [switch]$AdoptUserConfig,
     # jumplist-matrix observe: profile key (p1-p6) whose launch is expected, or none.
-    [ValidatePattern('^(p[1-6]|none)?$')][string]$ExpectProfile = ''
+    [ValidatePattern('^(p[1-6]|none)?$')][string]$ExpectProfile = '',
+    # cross-account peer: also try to open each visible Ghostty pipe as a client (then close it).
+    [switch]$ProbePipes
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1268,7 +1270,7 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator')
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account')
 $script:Restore = $null
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
@@ -1579,6 +1581,11 @@ function Get-PhaseState([string]$When) {
             $state.records = @(Get-OwnedRecordSummary 'narrator')
             $state.narrator_processes = @(Get-NarratorProcesses)
             $state.screen_reader = Get-ScreenReaderFlag
+        }
+        'cross-account' {
+            $state.records = @(Get-OwnedRecordSummary 'cross-')
+            $state.public_root = [ordered]@{ path=(Get-CrossRoot); exists=(Test-Path -LiteralPath (Get-CrossRoot)) }
+            $state.pipes = @(Get-GhosttyPipes)
         }
     }
     return $state
@@ -2877,6 +2884,262 @@ function Invoke-Narrator {
     }
 }
 
+# ---- cross-account: gxadmin and gxtest must stay separate -----------------
+# Both accounts run the same copied payload with the same configuration
+# directory, so the user is the only difference in the instance identity.
+
+function Get-CrossRoot { return Join-Path $env:PUBLIC ('GXVMValidation\' + $RunId) }
+
+$script:PipeSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+public static class GxVmPipe {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    // Opens the pipe as a client and closes it at once; records only the outcome.
+    public static Hashtable Probe(string path) {
+        Hashtable result = new Hashtable();
+        IntPtr handle = CreateFileW(path, 0xC0000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        int error = Marshal.GetLastWin32Error();
+        bool opened = handle != new IntPtr(-1);
+        if (opened) CloseHandle(handle);
+        result["pipe"] = path; result["opened"] = opened; result["error"] = opened ? 0 : error;
+        return result;
+    }
+}
+'@
+
+function Get-GhosttyPipes {
+    try { return @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -match '(?i)ghostty' } | Sort-Object) } catch { return @('error: ' + $_.Exception.Message) }
+}
+
+function Get-CrossSessionSummary([string]$StateDir) {
+    $path = Join-Path $StateDir 'ghostty\gx-session.json'
+    $summary = [ordered]@{ path=$path; exists=$false }
+    try {
+        if (-not (Test-Path -LiteralPath $path)) { return $summary }
+        $text = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))
+        $summary.exists = $true
+        $summary.size = $text.Length
+        $summary.sha256 = Get-Sha256 $path
+        $summary.mentions_gxadmin = ([regex]::Matches($text, 'GX_XA_gxadmin')).Count
+        $summary.mentions_gxtest = ([regex]::Matches($text, 'GX_XA_gxtest')).Count
+        $json = $text | ConvertFrom-Json
+        $summary.top_level = @($json.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($json.PSObject.Properties['windows']) { $summary.windows = @($json.windows).Count }
+        $script:ExportExtra.Add($path)
+    } catch { $summary.error = $_.Exception.Message }
+    return $summary
+}
+
+function Start-CrossApp([string]$Exe, [string]$Private, [string]$ConfigHome, [string[]]$Arguments = @()) {
+    # Isolated like the other phases, but XDG_CONFIG_HOME is the shared configuration.
+    $started = Start-OwnedApp -Exe $Exe -Private $Private -ConfigBytes $null -Environment (Get-AppEnvironment) -Arguments $Arguments -Overrides @{ XDG_CONFIG_HOME=$ConfigHome }
+    return $started.process
+}
+
+function Get-ForeignWindowCount([int]$ProcessId) {
+    # EnumWindows works across users on one desktop; no access to the process is needed.
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    return @([GxVmWindows]::TopLevel($ProcessId) | Where-Object { $_['class'] -ceq 'GhosttyWindow' }).Count
+}
+
+function Invoke-CrossPeer($Root) {
+    if ($env:USERNAME -ine 'gxtest' -or (Test-Elevated)) { throw 'The peer step runs as the standard user gxtest (runas), not elevated.' }
+    $owner = Read-JsonFile (Join-Path $Root 'owner.json')
+    $hostInfo = Read-JsonFile (Join-Path $Root 'host.json')
+    if ($owner.owner -cne $script:Owner -or $owner.token -cne $hostInfo.token) { throw 'The shared directory does not belong to this run.' }
+    $exe = Join-Path $Root 'app\ghostty.exe'
+    Assert-Hash $exe $AppSha256
+    $configHome = Join-Path $Root 'config'
+    $result = [ordered]@{ host=$hostInfo; self=(Get-TokenFacts $PID); host_windows_before=(Get-ForeignWindowCount ([int]$hostInfo.pid)); pipes=@(Get-GhosttyPipes) }
+    if ($ProbePipes) {
+        if (-not ('GxVmPipe' -as [type])) { Add-Type -TypeDefinition $script:PipeSource -Language CSharp }
+        $result.pipe_probes = @($result.pipes | Where-Object { $_ -notmatch '^error' } | ForEach-Object { [GxVmPipe]::Probe($_) })
+    }
+    # 1. Single instance: an ordinary, forwardable launch must start its own instance.
+    $stateDir = Join-Path $script:RunRoot ($script:Step + '-xa-peer')
+    $process = Start-CrossApp $exe $stateDir $configHome
+    $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
+    $record.record_name = 'cross-peer'
+    Save-Record 'cross-peer' $record | Out-Null
+    $launch = [ordered]@{ outcome=$null; exit_code=$null; own_window=$null }
+    try {
+        try { $launch.own_window = Wait-AppWindow $process 20; $launch.outcome = 'independent' }
+        catch {
+            $process.Refresh()
+            $launch.outcome = if ($process.HasExited) { 'exited' } else { 'no-window' }
+            if ($process.HasExited) { $launch.exit_code = $process.ExitCode }
+            $launch.error = $_.Exception.Message
+        }
+        $result.host_windows_after_launch = Get-ForeignWindowCount ([int]$hostInfo.pid)
+        if ($launch.outcome -ceq 'exited' -and $launch.exit_code -eq 0 -and $result.host_windows_after_launch -gt $result.host_windows_before) { $launch.outcome = 'forwarded-to-other-account' }
+        $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
+        if ($launch.outcome -ceq 'independent' -and $hold -gt 0) {
+            Write-ExportMarker 'cross-peer-holding' @{ pid=$process.Id; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
+            Start-Sleep -Seconds $hold
+        }
+    } finally { $process.Dispose() }
+    $record.status = 'RUNNING'
+    $close = Close-OwnedApp $record
+    $record.close = $close
+    $record.status = 'CLOSED'
+    Save-Record 'cross-peer' $record | Out-Null
+    $result.launch = $launch
+    $result.close = $close
+    $result.session = Get-CrossSessionSummary (Join-Path $stateDir 'state')
+    # 2. Session files: the other account's state directory must stay unreadable.
+    $result.host_state_access = try { $null = Get-ChildItem -LiteralPath $hostInfo.state_dir -ErrorAction Stop; 'readable' } catch { 'refused: ' + $_.Exception.GetType().Name }
+    # 3. Broker: a gxtest receiver must not pair with gxadmin's elevated host.
+    if ($hostInfo.PSObject.Properties['broker'] -and $hostInfo.broker) {
+        $companionDir = Join-Path $script:RunRoot ($script:Step + '-xa-companion')
+        $arguments = @('--gx-shell-action=drop-companion', ('--gx-drop-target-pid=' + $hostInfo.broker.pid), ('--gx-drop-target-birth=' + $hostInfo.broker.birth_filetime))
+        $companion = Start-CrossApp $exe $companionDir $configHome $arguments
+        $companionRecord = New-AppRecord $companion $exe 'CROSS_COPY' $companionDir $null $null $arguments
+        $broker = [ordered]@{ target=$hostInfo.broker; pid=$companion.Id; exited=$false; exit_code=$null; windows=@() }
+        try {
+            $broker.exited = $companion.WaitForExit(20000)
+            if ($broker.exited) { $broker.exit_code = $companion.ExitCode }
+            else { $broker.windows = @([GxVmWindows]::TopLevel($companion.Id) | Where-Object { $_['visible'] } | ForEach-Object { [ordered]@{ class=$_['class']; title=$_['title'] } }) }
+        } finally { $companion.Dispose() }
+        if (-not $broker.exited) { $broker.close = Close-OwnedApp $companionRecord }
+        $broker.refused = $broker.exited -and $broker.exit_code -ne 0
+        $logPath = Join-Path $companionDir 'ghostty\logs\ghostty.log'
+        if (Test-Path -LiteralPath $logPath) { $script:ExportExtra.Add($logPath); $broker.log_tail = @(Get-Content -LiteralPath $logPath | Select-Object -Last 20) }
+        $result.broker = $broker
+    }
+    $result.host_windows_after = Get-ForeignWindowCount ([int]$hostInfo.pid)
+    $failures = @()
+    if ($launch.outcome -cne 'independent') { $failures += 'launch outcome ' + $launch.outcome }
+    if ($result.host_windows_after -ne $result.host_windows_before) { $failures += 'the other account''s window count changed' }
+    if ($result.session.exists -and $result.session.mentions_gxadmin -gt 0) { $failures += 'session file mentions gxadmin' }
+    if ($result.host_state_access -ceq 'readable') { $failures += 'the other account''s state directory is readable' }
+    if ($result.Contains('broker') -and -not $result.broker.refused) { $failures += 'the drop companion did not refuse the other account''s host' }
+    if ($ProbePipes -and @($result.pipe_probes | Where-Object { $_['opened'] }).Count -gt 0) { $failures += 'a Ghostty pipe of the other account was opened' }
+    $result.fixture_verdict = if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }
+    $result.fixture_reason = if ($failures.Count -eq 0) { $null } else { $failures -join '; ' }
+    return $result
+}
+
+function Invoke-CrossAccount {
+    # gxadmin (medium): prepare, host, [publish-broker after the existing elevated
+    # broker-host phase], collect, stop, cleanup. gxtest: peer, started by the
+    # generated as-gxtest.cmd through runas; its password is typed by the
+    # coordinator (type-secret) and never reaches this fixture.
+    $step = Assert-Action @('prepare','host','publish-broker','peer','collect','stop','cleanup') 'collect'
+    $root = Get-CrossRoot
+    if ($step -ceq 'peer') { return Invoke-CrossPeer $root }
+    if ($env:USERNAME -ine 'gxadmin' -or (Test-Elevated)) { throw "cross-account $step runs in gxadmin's normal (medium) console." }
+    switch ($step) {
+        'prepare' {
+            if (-not $ExportDir) { throw 'prepare runs through gx-run.cmd so the share path is known.' }
+            Assert-NoReparse $root
+            if (Test-Path -LiteralPath $root) { throw "The shared directory already exists: $root (cleanup first)." }
+            [IO.Directory]::CreateDirectory($root) | Out-Null
+            $copy = Copy-PortableApp (Join-Path $root 'app')
+            $adminSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            Write-Json (Join-Path $root 'owner.json') ([ordered]@{ owner=$script:Owner; run_id=$RunId; token=$script:State.token; admin_sid=$adminSid; created_utc=[DateTime]::UtcNow.ToString('o') })
+            $config = Join-Path $root 'config\ghostty\config.ghostty'
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($config)) | Out-Null
+            $lines = @('language = en', 'confirm-close-surface = false', 'gx-session-restore = true', 'command = cmd.exe /d /k title GX_XA_%USERNAME%') + $script:FixtureKeybinds
+            [IO.File]::WriteAllBytes($config, (Get-Utf8Bytes (($lines -join $script:LF) + $script:LF)))
+            $runner = Join-Path (Split-Path -Parent $ExportDir) 'gx-run.cmd'
+            $peerArgs = '-Phase cross-account -Action peer -RunId ' + $RunId + ' -AppSha256 ' + $AppSha256 + ' -RunHoldSeconds ' + [Math]::Max(30, $RunHoldSeconds) + $(if ($ProbePipes) { ' -ProbePipes' } else { '' })
+            $launcher = (@('@echo off', 'rem Starts the cross-account peer step as gxtest; runas asks for its password.',
+                ('runas /profile /user:%COMPUTERNAME%\gxtest "cmd /c ' + $runner + ' ' + $peerArgs + ' & pause"')) -join "`r`n") + "`r`n"
+            [IO.File]::WriteAllText((Join-Path $root 'as-gxtest.cmd'), $launcher, [Text.Encoding]::ASCII)
+            # Administrators, SYSTEM and gxadmin full control; Users read and execute only.
+            $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+            & $icacls $root /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' ('*' + $adminSid + ':(OI)(CI)F') '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls exited $LASTEXITCODE for $root" }
+            $record = [ordered]@{ root=$root; copy=$copy; config=$config; config_sha256=(Get-Sha256 $config); launcher=(Join-Path $root 'as-gxtest.cmd');
+                peer_arguments=$peerArgs; acl=(Get-Acl -LiteralPath $root).Sddl; prepared_utc=[DateTime]::UtcNow.ToString('o') }
+            Save-Record 'cross-prepare' $record | Out-Null
+            return [ordered]@{ record=$record; next='host, then run cmd /c ' + $record.launcher + ' and type the gxtest password' }
+        }
+        'host' {
+            $prepared = Read-Record 'cross-prepare'
+            if (-not $prepared) { throw 'Run prepare first.' }
+            $exe = Join-Path $root 'app\ghostty.exe'
+            Assert-Hash $exe $AppSha256
+            $stateDir = Join-Path $script:RunRoot ($script:Step + '-xa-host')
+            $process = Start-CrossApp $exe $stateDir (Join-Path $root 'config')
+            $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
+            $record.record_name = 'cross-host'
+            try { $record.main_window = Wait-AppWindow $process 45; $record.status = 'RUNNING' }
+            catch { $record.status = 'START_FAILED'; $record.error = $_.Exception.Message; Save-Record 'cross-host' $record | Out-Null; throw }
+            finally { $process.Dispose() }
+            Start-Sleep -Seconds 2
+            $record.ghostty_windows = Get-ForeignWindowCount $record.pid
+            $record.token_facts = Get-TokenFacts $record.pid
+            $record.pipes = @(Get-GhosttyPipes)
+            Save-Record 'cross-host' $record | Out-Null
+            $owner = Read-JsonFile (Join-Path $root 'owner.json')
+            Write-Json (Join-Path $root 'host.json') ([ordered]@{ token=$owner.token; pid=$record.pid; birth_filetime=$record.birth_filetime; exe=$exe;
+                sid=$record.token_facts.sid; logon_id=$record.token_facts.logon_id; session_id=$record.token_facts.session_id;
+                hwnd=$record.main_window['hwnd']; ghostty_windows=$record.ghostty_windows; state_dir=(Join-Path $stateDir 'state'); broker=$null;
+                published_utc=[DateTime]::UtcNow.ToString('o') })
+            return [ordered]@{ record=$record; fixture_verdict='RUNNING' }
+        }
+        'publish-broker' {
+            $broker = Read-JsonFile (Join-Path $script:RunRoot 'broker-host.json')
+            $hostPath = Join-Path $root 'host.json'
+            $hostInfo = Read-JsonFile $hostPath
+            $alive = Get-Process -Id ([int]$broker.pid) -ErrorAction SilentlyContinue
+            if (-not $alive) { throw 'The elevated broker host of this run is not running.' }
+            $alive.Dispose()
+            $hostInfo.broker = [ordered]@{ pid=$broker.pid; birth_filetime=$broker.birth_filetime; exe=$broker.exe }
+            Write-Json $hostPath $hostInfo
+            return [ordered]@{ host=$hostInfo }
+        }
+        'collect' {
+            $record = Read-Record 'cross-host'
+            if (-not $record) { throw 'Run host first.' }
+            $status = Get-AppStatus $record
+            $now = Get-ForeignWindowCount $record.pid
+            $peers = @()
+            if ($script:ExportRoot) {
+                $peers = @(Get-ChildItem -LiteralPath $script:ExportRoot -Filter ($RunId + '--gxtest--*-cross-account.json') | Sort-Object LastWriteTimeUtc |
+                    ForEach-Object { $report = Read-JsonFile $_.FullName; [ordered]@{ file=$_.Name; status=$report.status;
+                        verdict=$(if ($report.result -and $report.result.PSObject.Properties['fixture_verdict']) { $report.result.fixture_verdict } else { $null });
+                        reason=$(if ($report.result -and $report.result.PSObject.Properties['fixture_reason']) { $report.result.fixture_reason } elseif ($report.result -and $report.result.PSObject.Properties['reason']) { $report.result.reason } else { $null }) } })
+            }
+            $latest = if ($peers.Count -gt 0) { $peers[-1] } else { $null }
+            $failures = @()
+            if (-not $status.alive) { $failures += 'the gxadmin host is no longer running' }
+            if ($now -ne $record.ghostty_windows) { $failures += "the gxadmin host has $now windows instead of $($record.ghostty_windows)" }
+            if (-not $latest) { $failures += 'no gxtest peer report on the share' } elseif ($latest.status -cne 'PASS_NATIVE_SCOPED') { $failures += 'gxtest peer: ' + $latest.reason }
+            return [ordered]@{ host=$status; host_windows_now=$now; host_windows_at_start=$record.ghostty_windows; peers=$peers;
+                fixture_verdict=$(if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }); fixture_reason=$(if ($failures.Count -eq 0) { $null } else { $failures -join '; ' }) }
+        }
+        'stop' {
+            $record = Read-Record 'cross-host'
+            if (-not $record) { throw 'Run host first.' }
+            $close = Close-OwnedApp $record
+            Set-RecordField $record 'close' $close
+            $record.status = if ($close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' }
+            Save-Record 'cross-host' $record | Out-Null
+            $session = Get-CrossSessionSummary (Join-Path $record.profile 'state')
+            $ok = $close.closed_normally -and -not ($session.exists -and $session.mentions_gxtest -gt 0)
+            return [ordered]@{ close=$close; session=$session; fixture_verdict=$(if ($ok) { 'PASS' } else { 'FAIL' });
+                fixture_reason=$(if ($ok) { $null } elseif (-not $close.closed_normally) { 'normal close did not pass' } else { 'the gxadmin session file mentions gxtest' }) }
+        }
+        'cleanup' {
+            $record = Read-Record 'cross-host'
+            if ($record -and (Get-OwnedProcess $record)) { throw 'Stop the gxadmin host first.' }
+            if (-not (Test-Path -LiteralPath $root)) { return [ordered]@{ removed=$false; note='nothing to remove' } }
+            $owner = Read-JsonFile (Join-Path $root 'owner.json')
+            if ($owner.owner -cne $script:Owner -or $owner.token -cne $script:State.token) { throw 'The shared directory is not owned by this run; nothing was removed.' }
+            $running = @(Get-GuestApps | Where-Object { $_.path -and $_.path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) })
+            if ($running.Count -gt 0) { throw ('Apps still run from the shared copy: ' + (@($running | ForEach-Object { $_.pid }) -join ',')) }
+            Remove-Item -LiteralPath $root -Recurse -Force
+            $script:Restore = [ordered]@{ shared_root=$root; removed=(-not (Test-Path -LiteralPath $root)) }
+            return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($script:Restore.removed) { 'PASS' } else { 'FAIL' }) }
+        }
+    }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
@@ -2988,6 +3251,7 @@ try {
         'toast-matrix' { $report.result = Invoke-ToastMatrix }
         'jumplist-matrix' { $report.result = Invoke-JumpListMatrix }
         'narrator' { $report.result = Invoke-Narrator }
+        'cross-account' { $report.result = Invoke-CrossAccount }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
