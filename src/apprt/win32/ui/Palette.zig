@@ -1862,7 +1862,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
                 self.back_hover = back;
                 changed = true;
             }
-            if (changed) popup.invalidate();
+            if (changed) popup.repaint();
         },
         .leave => {
             self.mouse = null;
@@ -1870,7 +1870,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             self.hover = null;
             self.back_hover = false;
             self.scrollbar.hover = false;
-            popup.invalidate();
+            popup.repaint();
         },
         .down => if (event.button == .left) {
             if (self.scrollbar.press(view, self.content_height, view.h, self.scroll, event.pos)) |offset| {
@@ -1882,12 +1882,12 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             }
             if (self.back_rect) |r| if (r.contains(event.pos)) {
                 self.pressed = .back;
-                popup.invalidate();
+                popup.repaint();
                 return;
             };
             if (self.rowAt(event.pos)) |row| {
                 self.pressed = .{ .row = row };
-                popup.invalidate();
+                popup.repaint();
             }
         },
         .up => if (event.button == .left) {
@@ -1896,7 +1896,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
                 if (popup.hwnd) |hwnd| if (w32.GetCapture() == hwnd) {
                     _ = w32.ReleaseCapture();
                 };
-                popup.invalidate();
+                popup.repaint();
                 return;
             }
             const pressed = self.pressed orelse return;
