@@ -285,6 +285,24 @@ class ExperimentTests(unittest.TestCase):
         return gx_perf.build_parser().parse_args([command, '--exe', str(self.exe), '--out', str(self.root / 'out'),
                                                  '--runs', '1', *(['--case', 'p4'] if command == 'win32-ui' else []), *extra])
 
+    def test_legacy_win32_guard_failure_is_not_retried(self):
+        import gx_win_gui as gui
+        out = self.root / 'legacy'
+        calls = []
+        def measure(*args):
+            calls.append(args)
+            log = gui.log_path(args[2])
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text('raw failure evidence\n', encoding='utf-8')
+            if len(calls) == 1:
+                return ['metric startup.shown 1 ms']
+            raise gui.InputBlocked('foreground changed')
+        with mock.patch.object(gx_perf, 'measure_win32', side_effect=measure), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = gx_perf.main(['win32', '--exe', str(self.exe), '--out', str(out), '--runs', '1'])
+        self.assertEqual(1, code)
+        self.assertEqual(2, len(calls))
+        self.assertEqual('raw failure evidence\n', (out / 'build/run-01.log').read_text())
+
     def fake_gui(self):
         import gx_win_gui as real
         gui = mock.Mock(GuiError=real.GuiError, InputBlocked=real.InputBlocked, HARNESS_CONFIG='', env_assignments=real.env_assignments)

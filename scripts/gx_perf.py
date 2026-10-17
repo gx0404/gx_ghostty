@@ -1356,9 +1356,18 @@ def run_win32(args: argparse.Namespace) -> int:
     config = Path(args.config).read_text(encoding="utf-8") if args.config else DEFAULT_WIN32_CONFIG
     config += "" if config.endswith("\n") else "\n"
     config += gui.HARNESS_CONFIG
-    out = Path(args.out)
+    out = new_output(Path(args.out))
     by_label = dict(zip(labels, exes))
-    failures = 0
+    def failed(label, name, exc):
+        target = out / label / name
+        log = gui.log_path(out / label / 'env')
+        if log.is_file():
+            target.with_suffix('.log').write_bytes(log.read_bytes())
+        result = {'status': 'failed', 'label': label, 'run': name, 'env': environments[label], 'error': str(exc)}
+        write_json(target.with_suffix('.json'), result)
+        write_json(args.json, result)
+        (out / 'SUMMARY.txt').write_text(f'FAILED {label}/{name}: {exc}\n', encoding='utf-8', newline='\n')
+        return 1
     for label in labels:
         env_dir = out / label / "env"
         gui.prepare_env_dir(env_dir, fresh=True)
@@ -1367,19 +1376,15 @@ def run_win32(args: argparse.Namespace) -> int:
             measure_win32(gui, by_label[label], env_dir, config, 0, environments[label])
         except gui.GuiError as exc:
             print(f"{TAG} {label}: warm-up failed: {exc}", file=sys.stderr)
+            return failed(label, 'warmup-failed', exc)
     for run, label in alternate(labels, args.runs):
         target = out / label / f"run-{run:02d}.txt"
         env_dir = out / label / "env"
-        for attempt in (1, 2):
-            try:
-                lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label])
-                break
-            except gui.GuiError as exc:
-                print(f"{TAG} {label} run {run} attempt {attempt} failed: {exc}", file=sys.stderr)
-                lines = None
-        if lines is None:
-            failures += 1
-            continue
+        try:
+            lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label])
+        except gui.GuiError as exc:
+            print(f"{TAG} {label} run {run} failed: {exc}", file=sys.stderr)
+            return failed(label, f'run-{run:02d}', exc)
         lines.insert(0, "# environment " + json.dumps(environments[label], sort_keys=True))
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         write_json(target.with_suffix(".json"), {"label": label, "run": run, "env": environments[label]})
@@ -1388,7 +1393,7 @@ def run_win32(args: argparse.Namespace) -> int:
             target.with_suffix(".log").write_text(log.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
         print(f"{TAG} {label} run {run}: " + ", ".join(line.split(None, 1)[1] for line in lines if line.startswith("metric ")
                                                       and not line.startswith("metric resize")), flush=True)
-    return report_runs(out, labels, args.json) or (1 if failures else 0)
+    return report_runs(out, labels, args.json)
 
 
 def run_gtk(args: argparse.Namespace) -> int:
