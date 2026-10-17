@@ -1,7 +1,11 @@
 """Offline SVG normalization and pin-validation tests."""
 from pathlib import Path
+import contextlib
 import hashlib
+import io
 import math
+import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -76,6 +80,63 @@ class FluentIconsTests(unittest.TestCase):
         self.assertEqual(fluent.number(-0.00000001), '0')
         self.assertEqual(fluent.number(1.23456789), '1.234568')
         self.assertEqual(fluent.normalize('M1e1 -.5'), fluent.normalize('M10 -0.5'))
+
+
+class CommandTests(unittest.TestCase):
+    """The command says "Generated" only when it writes paths.zig (O3 finding F-4)."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        shutil.copytree(fluent.ROOT / fluent.BASE / 'inputs', self.root / fluent.BASE / 'inputs')
+        self.paths = self.root / fluent.BASE / 'paths.zig'
+
+    def run_main(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fluent.main(['--root', str(self.root), *argv])
+        return code, out.getvalue()
+
+    def age(self):
+        os.utime(self.paths, ns=(10**18, 10**18))
+        return self.paths.stat().st_mtime_ns
+
+    def test_reports_generated_only_when_it_writes(self):
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn('Generated Fluent paths', out)
+        self.assertEqual(self.paths.read_bytes(), fluent.generate(self.root))
+        stamp = self.age()
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertNotIn('Generated', out)
+        self.assertIn('up to date', out)
+        self.assertEqual(self.paths.stat().st_mtime_ns, stamp)
+        self.paths.write_bytes(fluent.generate(self.root).replace(b'\n', b'\r\n'))
+        stamp = self.age()
+        code, out = self.run_main()
+        self.assertIn('up to date', out)
+        self.assertEqual(self.paths.stat().st_mtime_ns, stamp)
+        self.paths.write_bytes(b'stale')
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn('Generated Fluent paths', out)
+        self.assertEqual(self.paths.read_bytes(), fluent.generate(self.root))
+
+    def test_check_never_writes(self):
+        self.run_main()
+        stamp = self.age()
+        code, out = self.run_main('--check')
+        self.assertEqual(code, 0)
+        self.assertIn('PASS', out)
+        self.assertNotIn('Generated', out)
+        self.assertEqual(self.paths.stat().st_mtime_ns, stamp)
+        self.paths.write_bytes(b'stale')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            self.run_main('--check')
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(self.paths.read_bytes(), b'stale')
 
 
 if __name__ == '__main__':
