@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52')]
+                 'run-config','osc52','toast-matrix')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -52,7 +52,11 @@ param(
     [ValidateLength(0,2048)][string]$AppEnv = '',
     [ValidateRange(0,900)][int]$RunHoldSeconds = 0,
     # osc52: clipboard-write policy of the probe terminal (clipboard-read stays at its default, ask).
-    [ValidateSet('allow','ask')][string]$ClipboardWritePolicy = 'allow'
+    [ValidateSet('allow','ask')][string]$ClipboardWritePolicy = 'allow',
+    # toast-matrix early: seconds after the probe shell starts at which each OSC 9 is sent.
+    [ValidatePattern('^\d{1,3}(,\d{1,3}){0,9}$')][string]$EarlyOffsets = '8,25,45',
+    # toast-matrix early: back up, then delete HKCU Notifications\Settings\<AUMID> before the launch.
+    [switch]$ResetToastSettings
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1255,8 +1259,14 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52')
+$script:R6Phases = @('run-config','osc52','toast-matrix')
 $script:Restore = $null
+$script:InstalledAumid = 'gx0404.GhosttyGX'
+$script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
+# Fixture keybinds shared by the r6 GUI phases (explicit, so no default chord is assumed).
+$script:FixtureKeybinds = @('keybind = ctrl+alt+shift+o=new_split:right', 'keybind = ctrl+alt+shift+t=new_tab',
+    'keybind = ctrl+alt+shift+n=new_window', 'keybind = ctrl+alt+shift+w=close_surface',
+    'keybind = ctrl+alt+shift+r=reload_config', 'keybind = global:ctrl+alt+shift+q=toggle_quick_terminal')
 
 function Assert-Action([string[]]$Allowed, [string]$Default) {
     $value = if ($Action) { $Action } else { $Default }
@@ -1292,6 +1302,187 @@ function Set-RecordField($Record, [string]$Name, $Value) {
 function Get-Sha256([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 function Get-Utf8Bytes([string]$Text) { return [Text.UTF8Encoding]::new($false).GetBytes($Text) }
+
+function Json-Normal($Value) { return (($Value | ConvertTo-Json -Depth 20) | ConvertFrom-Json | ConvertTo-Json -Depth 20 -Compress) }
+
+function Open-HkcuBase { return [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64) }
+
+function Get-MapEntries($Map) {
+    # Entries of an ordered dictionary or of the PSCustomObject it became in JSON.
+    if ($null -eq $Map) { return @() }
+    if ($Map -is [System.Collections.IDictionary]) { return @($Map.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name=[string]$_.Key; Value=$_.Value } }) }
+    return @($Map.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name=$_.Name; Value=$_.Value } })
+}
+
+function Read-AnyKeyTree([Microsoft.Win32.RegistryKey]$Base, [string]$Key, [int]$Depth = 0) {
+    # Every value kind, bounded; used to back up a key before a phase changes it.
+    $handle = $Base.OpenSubKey($Key, $false)
+    if ($null -eq $handle) { return [ordered]@{ exists=$false } }
+    try {
+        $names = @($handle.GetValueNames() | Sort-Object)
+        $subkeys = @($handle.GetSubKeyNames() | Sort-Object)
+        if ($names.Count -gt 256 -or $subkeys.Count -gt 64 -or $Depth -gt 4) { throw "Registry backup exceeds fixture bounds: $Key" }
+        $values = [ordered]@{}
+        foreach ($name in $names) {
+            $kind = [string]$handle.GetValueKind($name)
+            $raw = $handle.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $data = switch ($kind) {
+                'Binary' { [Convert]::ToBase64String([byte[]]$raw) }
+                'MultiString' { ,@($raw) }
+                'DWord' { [long][int]$raw }
+                'QWord' { [long]$raw }
+                'String' { [string]$raw }
+                'ExpandString' { [string]$raw }
+                default { throw "Unsupported registry value kind $kind under $Key; nothing was changed." }
+            }
+            $values['value:' + $name] = [ordered]@{ kind=$kind; data=$data }
+        }
+        $children = [ordered]@{}
+        foreach ($name in $subkeys) { $children[$name] = Read-AnyKeyTree $Base ($Key + '\' + $name) ($Depth + 1) }
+        return [ordered]@{ exists=$true; values=$values; children=$children }
+    } finally { $handle.Dispose() }
+}
+
+function Restore-AnyKeyTree([Microsoft.Win32.RegistryKey]$Base, [string]$Key, $Tree) {
+    if (-not $Tree.exists) { $Base.DeleteSubKeyTree($Key, $false); return }
+    $handle = $Base.CreateSubKey($Key)
+    $children = @(Get-MapEntries $Tree.children)
+    try {
+        $wanted = @{}
+        foreach ($entry in @(Get-MapEntries $Tree.values)) { $wanted[$entry.Name.Substring(6)] = $entry.Value }
+        foreach ($name in @($handle.GetValueNames())) { if (-not $wanted.ContainsKey($name)) { $handle.DeleteValue($name, $false) } }
+        foreach ($name in @($wanted.Keys)) {
+            $value = $wanted[$name]
+            $kind = [Microsoft.Win32.RegistryValueKind]$value.kind
+            $data = switch ([string]$value.kind) {
+                'Binary' { [byte[]][Convert]::FromBase64String([string]$value.data) }
+                'MultiString' { [string[]]@($value.data) }
+                'DWord' { [int][long]$value.data }
+                'QWord' { [long]$value.data }
+                default { [string]$value.data }
+            }
+            $handle.SetValue($name, $data, $kind)
+        }
+        $keep = @($children | ForEach-Object { $_.Name })
+        foreach ($name in @($handle.GetSubKeyNames())) { if ($keep -notcontains $name) { $handle.DeleteSubKeyTree($name, $false) } }
+    } finally { $handle.Dispose() }
+    foreach ($child in $children) { Restore-AnyKeyTree $Base ($Key + '\' + $child.Name) $child.Value }
+}
+
+function Backup-HkcuKey([string]$RecordName, [string]$Key) {
+    # The first backup of a run is kept until it has been restored.
+    $existing = Read-Record $RecordName
+    if ($existing -and -not $existing.restored) {
+        if ($existing.key -cne $Key) { throw "Record $RecordName backs up another key." }
+        return $existing
+    }
+    $base = Open-HkcuBase
+    try { $tree = Read-AnyKeyTree $base $Key } finally { $base.Dispose() }
+    Save-Record $RecordName ([ordered]@{ hive='HKCU'; key=$Key; before=$tree; backed_up_utc=[DateTime]::UtcNow.ToString('o'); restored=$false }) | Out-Null
+    return Read-Record $RecordName
+}
+
+function Restore-HkcuKey([string]$RecordName) {
+    $record = Read-Record $RecordName
+    if ($null -eq $record) { return [ordered]@{ record=$RecordName; restored=$true; note='no backup was taken' } }
+    if ($record.restored) { return [ordered]@{ record=$RecordName; key=$record.key; restored=$true; note='already restored' } }
+    $base = Open-HkcuBase
+    try {
+        Restore-AnyKeyTree $base $record.key $record.before
+        $after = Read-AnyKeyTree $base $record.key
+    } finally { $base.Dispose() }
+    $equal = (Json-Normal $after) -ceq (Json-Normal $record.before)
+    Set-RecordField $record 'restored' $equal
+    Set-RecordField $record 'restored_utc' ([DateTime]::UtcNow.ToString('o'))
+    Set-RecordField $record 'after_restore' $after
+    Save-Record $RecordName $record | Out-Null
+    return [ordered]@{ record=$RecordName; key=$record.key; restored=$equal; before_existed=[bool]$record.before.exists }
+}
+
+function Read-HkcuTree([string]$Key) {
+    $base = Open-HkcuBase
+    try { return Read-AnyKeyTree $base $Key } finally { $base.Dispose() }
+}
+
+function Initialize-Toast {
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
+    $null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]
+}
+
+function Get-ToastFacts([string]$Aumid) {
+    # Notification history XML (same read as the r18 evidence) and the notifier setting.
+    $facts = [ordered]@{ aumid=$Aumid; setting=$null; setting_value=$null; history_count=$null; history=@(); error=$null }
+    try {
+        Initialize-Toast
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($Aumid)
+        $facts.setting = [string]$notifier.Setting
+        $facts.setting_value = [int]$notifier.Setting
+        $items = @([Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory($Aumid))
+        $facts.history_count = $items.Count
+        $facts.history = @($items | Select-Object -First 50 | ForEach-Object {
+            $xml = $_.Content.GetXml(); if ($xml.Length -gt 4096) { $xml.Substring(0, 4096) } else { $xml } })
+    } catch { $facts.error = $_.Exception.Message }
+    return $facts
+}
+
+# Diagnostic only: the shell's quiet-hours (Focus assist / Do not disturb)
+# profile from WNF. The authoritative evidence is the notification center
+# screenshot; a nonzero status means the state could not be read here.
+$script:WnfSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+public static class GxVmWnf {
+    [DllImport("ntdll.dll")] static extern int NtQueryWnfStateData(ref ulong stateName, IntPtr typeId, IntPtr explicitScope, out uint changeStamp, [Out] byte[] buffer, ref uint bufferSize);
+    public static Hashtable Query(ulong name) {
+        Hashtable facts = new Hashtable();
+        byte[] buffer = new byte[64]; uint size = (uint)buffer.Length; uint stamp;
+        int status = NtQueryWnfStateData(ref name, IntPtr.Zero, IntPtr.Zero, out stamp, buffer, ref size);
+        facts["state_name"] = "0x" + name.ToString("x16");
+        facts["status"] = "0x" + status.ToString("x8");
+        facts["change_stamp"] = (long)stamp;
+        facts["size"] = (long)size;
+        if (status == 0 && size >= 4) facts["value"] = (long)BitConverter.ToInt32(buffer, 0);
+        return facts;
+    }
+}
+'@
+
+function Get-QuietHoursDiagnostic {
+    try {
+        if (-not ('GxVmWnf' -as [type])) { Add-Type -TypeDefinition $script:WnfSource -Language CSharp }
+        # WNF_SHEL_QUIETHOURS_ACTIVE_PROFILE_CHANGED: 0 off, 1 priority only, 2 alarms only.
+        return [GxVmWnf]::Query([uint64]'0x0D83063EA3BF1C75')
+    } catch { return @{ error=$_.Exception.Message } }
+}
+
+function Get-PortableAumid([string]$Exe) {
+    # Mirrors src/apprt/win32/shell/Identity.zig::init for an unregistered copy:
+    # SHA-256 of the ASCII-lowercased, forward-slash path; first 16 bytes in hex.
+    # The app hashes its final (handle-resolved) path; this uses the full path.
+    $normalized = [regex]::Replace([IO.Path]::GetFullPath($Exe).Replace('\', '/'), '[A-Z]', { param($m) $m.Value.ToLowerInvariant() })
+    $hash = [Security.Cryptography.SHA256]::Create().ComputeHash((Get-Utf8Bytes $normalized))
+    return $script:InstalledAumid + '.Portable.' + ([BitConverter]::ToString($hash, 0, 16)).Replace('-', '').ToLowerInvariant()
+}
+
+function Copy-PortableApp([string]$Destination) {
+    # A copy of this run's installed AppDir without the installer-owned uninstaller.
+    if (-not $script:State.installed) { throw 'Install the fixture package in this run first.' }
+    Assert-Hash (Join-Path $script:AppDir 'ghostty.exe') $AppSha256
+    Assert-NoReparse $Destination
+    if (Test-Path -LiteralPath $Destination) { throw "Portable copy already exists: $Destination" }
+    $prefix = [IO.Path]::GetFullPath($script:AppDir).TrimEnd('\') + '\'
+    $files = @(Get-ChildItem -LiteralPath $script:AppDir -Recurse -File -Force | Where-Object { $_.Name -notlike 'unins*' })
+    foreach ($file in $files) {
+        $target = Join-Path $Destination $file.FullName.Substring($prefix.Length)
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $target
+    }
+    $exe = Join-Path $Destination 'ghostty.exe'
+    Assert-Hash $exe $AppSha256
+    return @{ exe=$exe; files=$files.Count; aumid=(Get-PortableAumid $exe) }
+}
 
 function Write-ExportMarker([string]$Suffix, $Value) {
     # A small file the host can poll on the share while the guest holds a step.
@@ -1350,6 +1541,12 @@ function Get-PhaseState([string]$When) {
             if (-not ('GxVmClipboard' -as [type])) { Add-Type -TypeDefinition $script:ClipboardSource -Language CSharp }
             $state.clipboard_sequence = [GxVmClipboard]::Sequence()
             $state.records = @(Get-OwnedRecordSummary 'osc52-')
+        }
+        'toast-matrix' {
+            $state.records = @(Get-OwnedRecordSummary 'toast-')
+            $state.installed_toast = Get-ToastFacts $script:InstalledAumid
+            $state.notification_settings = Read-HkcuTree $script:NotificationSettingsKey
+            $state.quiet_hours = Get-QuietHoursDiagnostic
         }
     }
     return $state
@@ -1964,6 +2161,216 @@ function Invoke-Osc52 {
     return $result
 }
 
+# Runs inside the terminal under test: gxtoast titles its tab, waits, sends one
+# OSC 9 (or OSC 777) notification; gxtoast-early replays the early r3 sequence.
+$script:ToastProbeTemplate = @'
+# GX toast probe generated by gx_vm_validation.ps1 (phase toast-matrix). ASCII only.
+$GxToastResults = '__RESULTS__'
+$GxToastToken = '__TOKEN__'
+function Send-GxToast([string]$Tag, [string]$Kind, [string]$Body, [hashtable]$Extra) {
+    $esc = [string][char]27; $bel = [string][char]7
+    $sequence = if ($Kind -eq 'osc777') { $esc + ']777;notify;GX toast ' + $Tag + ';' + $Body + $bel } else { $esc + ']9;' + $Body + $bel }
+    [Console]::Out.Write($sequence)
+    [Console]::Out.Flush()
+    $n = @(Get-ChildItem -LiteralPath $GxToastResults -Filter 'toast-*.json' -ErrorAction SilentlyContinue).Count + 1
+    $record = [ordered]@{ schema=1; n=$n; token=$GxToastToken; tag=$Tag; kind=$Kind; body=$Body; shell_pid=$PID; sent_utc=[DateTime]::UtcNow.ToString('o') }
+    if ($Extra) { foreach ($key in $Extra.Keys) { $record[$key] = $Extra[$key] } }
+    [IO.File]::WriteAllText((Join-Path $GxToastResults ('toast-{0:D3}-{1}.json' -f $n, $Tag)), ($record | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+    return $record
+}
+function gxtoast {
+    param([Parameter(Mandatory = $true, Position = 0)][ValidatePattern('^[A-Za-z0-9-]{1,16}$')][string]$Tag,
+          [Parameter(Position = 1)][ValidateRange(0,600)][int]$Delay = 10,
+          [Parameter(Position = 2)][ValidateSet('osc9','osc777')][string]$Kind = 'osc9')
+    $esc = [string][char]27; $bel = [string][char]7
+    [Console]::Out.Write($esc + ']2;GX-TOAST-' + $Tag + $bel)
+    Write-Host ("GX-TOAST {0}: tab titled GX-TOAST-{0}; {1} in {2} s" -f $Tag, $Kind, $Delay)
+    Start-Sleep -Seconds $Delay
+    $record = Send-GxToast $Tag $Kind ('GX toast ' + $Tag + ' ' + $GxToastToken) @{ delay_seconds=$Delay; title=('GX-TOAST-' + $Tag) }
+    Write-Host ("GX-TOAST {0}: SENT #{1} at {2}" -f $Tag, $record.n, $record.sent_utc)
+}
+function gxtoast-early {
+    param([Parameter(Position = 0)][int[]]$Offsets = @(8, 25, 45))
+    $esc = [string][char]27; $bel = [string][char]7
+    [Console]::Out.Write($esc + ']2;GX-TOAST-EARLY' + $bel)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $i = 0
+    foreach ($offset in $Offsets) {
+        $i++
+        while ($clock.Elapsed.TotalSeconds -lt $offset) { Start-Sleep -Milliseconds 100 }
+        $record = Send-GxToast ('early' + $i) 'osc9' ('GX early ' + $i + ' ' + $GxToastToken) @{ offset_seconds=$offset; elapsed_ms=[int]$clock.Elapsed.TotalMilliseconds }
+        Write-Host ("==== GX-TOAST-EARLY {0}/{1} SENT at {2} (offset {3} s) ====" -f $i, $Offsets.Count, $record.sent_utc, $offset)
+    }
+    Write-Host 'GX-TOAST-EARLY sequence complete.'
+}
+Write-Host ('GX toast probe ready (token ' + $GxToastToken + '). Usage: gxtoast <tag> [delay] [osc9|osc777]; gxtoast-early [offsets]')
+'@
+
+function New-ToastProbe([string]$Results, [string]$Token) {
+    if ($Results -match "[\s']") { throw 'The probe results path must not contain whitespace or quotes.' }
+    $text = $script:ToastProbeTemplate.Replace('__RESULTS__', $Results).Replace('__TOKEN__', $Token)
+    if ($text -match '__[A-Z0-9_]+__' -or $text -match '[^\x00-\x7f]') { throw 'Generated probe is incomplete or not ASCII.' }
+    return $text
+}
+
+function Get-ToastProbeResults {
+    return @(Get-ChildItem -LiteralPath $script:RunRoot -Directory -Filter 'toast-*-results' -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem -LiteralPath $_.FullName -Filter 'toast-*.json' | Sort-Object Name | ForEach-Object {
+            $script:ExportExtra.Add($_.FullName)
+            Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } })
+}
+
+function Start-ToastApp([string]$Exe, [string]$Class, [string]$EarlyCommand) {
+    $name = 'toast-' + $Label
+    $previous = Read-Record $name
+    if ($previous) { throw "toast-matrix label $Label already exists in this run; use a new -Label." }
+    $token = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $results = Join-Path $script:RunRoot ('toast-' + $Label + '-results')
+    [IO.Directory]::CreateDirectory($results) | Out-Null
+    $probePath = Join-Path $script:RunRoot ('toast-' + $Label + '-probe.ps1')
+    [IO.File]::WriteAllText($probePath, (New-ToastProbe $results $token), [Text.Encoding]::ASCII)
+    $command = 'command = powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -Command . ' + $probePath
+    if ($EarlyCommand) { $command += '; ' + $EarlyCommand }
+    $lines = @('language = en', 'confirm-close-surface = false', 'gx-session-restore = false', $command) + $script:FixtureKeybinds
+    $environment = Get-AppEnvironment
+    $arguments = @('--gx-single-instance=false')
+    $private = Join-Path $script:RunRoot ($script:Step + '-toast-' + $Label)
+    $started = Start-OwnedApp -Exe $Exe -Private $private -ConfigBytes (Get-Utf8Bytes (($lines -join $script:LF) + $script:LF)) -Environment $environment -Arguments $arguments
+    $process = $started.process
+    $record = New-AppRecord $process $Exe $Class $private $started.config $environment $arguments
+    $record.token = $token
+    $record.probe = $probePath
+    $record.results = $results
+    $record.aumid = if ($Class -ceq 'PORTABLE_COPY') { Get-PortableAumid $Exe } else { $script:InstalledAumid }
+    Save-Record $name $record | Out-Null
+    $script:ExportExtra.Add($started.config)
+    try {
+        $record.main_window = Wait-AppWindow $process 45
+        $record.status = 'RUNNING'
+    } catch {
+        $record.status = 'START_FAILED'
+        $record.error = $_.Exception.Message
+        if (-not $process.HasExited) { $record.close = Close-OwnedApp $record }
+        throw
+    } finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+    return $record
+}
+
+function Get-ToastRecords {
+    $dir = Join-Path $script:RunRoot 'records'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter 'toast-*.json' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } |
+        Where-Object { $_.PSObject.Properties['pid'] })
+}
+
+function Invoke-ToastMatrix {
+    # start: isolated installed app with the gxtoast probe; portable: the same
+    # payload copied outside the installation (portable identity); early: the
+    # probe shell replays the early three-OSC sequence; native-probe: a direct
+    # WinRT toast for the installed AUMID; disable-app/enable-app: the
+    # per-app notification switch (HKCU, backed up and restored);
+    # status: windows, foreground, history XML; stop: close and restore.
+    $step = Assert-Action @('start','portable','early','native-probe','disable-app','enable-app','status','stop') 'status'
+    switch ($step) {
+        'start' {
+            $app = Resolve-GlApp
+            if ($app.class -cne 'INSTALLED') { throw 'toast-matrix needs the installed, registered application (registration_verified).' }
+            $record = Start-ToastApp $app.exe $app.class $null
+            Write-ExportMarker 'toast-running' @{ label=$Label; pid=$record.pid; hwnd=$record.main_window['hwnd'] }
+            return [ordered]@{ record=$record; installed=(Get-ToastFacts $script:InstalledAumid); fixture_verdict='RUNNING' }
+        }
+        'portable' {
+            $copy = Copy-PortableApp (Join-Path $script:RunRoot ('portable-' + $Label))
+            $before = Registry-Snapshot
+            $record = Start-ToastApp $copy.exe 'PORTABLE_COPY' $null
+            Start-Sleep -Seconds 8
+            $after = Registry-Snapshot
+            $unchanged = (Json-Canonical $before) -ceq (Json-Canonical $after)
+            return [ordered]@{ record=$record; copy=$copy; registry_unchanged=$unchanged; registry_before=$before; registry_after=$after;
+                installed=(Get-ToastFacts $script:InstalledAumid); portable=(Get-ToastFacts $copy.aumid);
+                fixture_verdict=$(if ($unchanged) { 'RUNNING' } else { 'FAIL' }); fixture_reason=$(if ($unchanged) { $null } else { 'starting the portable copy changed the shell registration' }) }
+        }
+        'early' {
+            $app = Resolve-GlApp
+            if ($app.class -cne 'INSTALLED') { throw 'The early sequence needs the installed, registered application.' }
+            $settingsBefore = Read-HkcuTree $script:NotificationSettingsKey
+            $reset = $null
+            if ($ResetToastSettings) {
+                $backup = Backup-HkcuKey 'toast-notification-settings' $script:NotificationSettingsKey
+                $base = Open-HkcuBase
+                try { $base.DeleteSubKeyTree($script:NotificationSettingsKey, $false) } finally { $base.Dispose() }
+                $reset = [ordered]@{ backed_up_utc=$backup.backed_up_utc; deleted=(-not (Read-HkcuTree $script:NotificationSettingsKey).exists) }
+            }
+            $exeItem = Get-Item -LiteralPath $app.exe
+            $record = Start-ToastApp $app.exe $app.class ('gxtoast-early ' + $EarlyOffsets)
+            Write-ExportMarker 'toast-early-running' @{ label=$Label; pid=$record.pid; offsets=$EarlyOffsets; utc=[DateTime]::UtcNow.ToString('o') }
+            return [ordered]@{ record=$record; offsets=$EarlyOffsets; notification_settings_before=$settingsBefore; reset=$reset;
+                seconds_since_exe_created=[int]([DateTime]::UtcNow - $exeItem.CreationTimeUtc).TotalSeconds;
+                installed=(Get-ToastFacts $script:InstalledAumid); fixture_verdict='RUNNING' }
+        }
+        'native-probe' {
+            Initialize-Toast
+            $token = [guid]::NewGuid().ToString('N').Substring(0, 12)
+            $facts = [ordered]@{ aumid=$script:InstalledAumid; token=$token; phases=@() }
+            $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($script:InstalledAumid)
+            $facts.setting = [string]$notifier.Setting
+            $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+            $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>GX native control</text><text>' + $token + '</text></binding></visual></toast>')
+            $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+            $facts.shown_utc = [DateTime]::UtcNow.ToString('o')
+            $facts.note = 'Show returned; presentation needs the screenshot.'
+            Save-Record ('toast-native-' + $token) $facts | Out-Null
+            return $facts
+        }
+        'disable-app' {
+            $backup = Backup-HkcuKey 'toast-notification-settings' $script:NotificationSettingsKey
+            $base = Open-HkcuBase
+            try {
+                $key = $base.CreateSubKey($script:NotificationSettingsKey)
+                try { $key.SetValue('Enabled', 0, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
+            } finally { $base.Dispose() }
+            return [ordered]@{ backed_up_utc=$backup.backed_up_utc; before=$backup.before; after=(Read-HkcuTree $script:NotificationSettingsKey);
+                installed=(Get-ToastFacts $script:InstalledAumid) }
+        }
+        'enable-app' {
+            $script:Restore = Restore-HkcuKey 'toast-notification-settings'
+            return [ordered]@{ restore=$script:Restore; installed=(Get-ToastFacts $script:InstalledAumid);
+                fixture_verdict=$(if ($script:Restore.restored) { 'PASS' } else { 'FAIL' }) }
+        }
+        'status' {
+            $records = @(Get-ToastRecords)
+            $aumids = @(@($script:InstalledAumid) + @($records | ForEach-Object { $_.aumid }) | Select-Object -Unique)
+            return [ordered]@{ apps=@($records | ForEach-Object { Get-AppStatus $_ }); toast=@($aumids | ForEach-Object { Get-ToastFacts $_ });
+                probe_results=@(Get-ToastProbeResults); notification_settings=(Read-HkcuTree $script:NotificationSettingsKey);
+                quiet_hours=(Get-QuietHoursDiagnostic); visual_review='PENDING' }
+        }
+        'stop' {
+            $closes = @(Get-ToastRecords | Where-Object { $_.status -ceq 'RUNNING' } | ForEach-Object {
+                $record = $_
+                $close = Close-OwnedApp $record
+                Set-RecordField $record 'close' $close
+                $record.status = if ($close.closed_normally -or $close.already_exited) { 'CLOSED' } else { 'CLOSE_FAILED' }
+                Save-Record ('toast-' + $record.label) $record | Out-Null
+                if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+                $close })
+            $settings = Restore-HkcuKey 'toast-notification-settings'
+            $removed = @(Get-ToastRecords | Where-Object { $_.app_class -ceq 'PORTABLE_COPY' -and $_.status -ceq 'CLOSED' } | ForEach-Object {
+                $dir = Split-Path -Parent $_.exe
+                $root = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
+                if ([IO.Path]::GetFullPath($dir).StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $dir) -like 'portable-*' -and (Test-Path -LiteralPath $dir)) {
+                    Remove-Item -LiteralPath $dir -Recurse -Force
+                    $dir
+                } })
+            $script:Restore = [ordered]@{ notification_settings=$settings; removed_portable_copies=$removed }
+            $bad = @($closes | Where-Object { -not $_.closed_normally -and -not $_.already_exited })
+            $verdict = if ($bad.Count -gt 0 -or -not $settings.restored) { 'FAIL' } else { 'PASS' }
+            return [ordered]@{ closes=$closes; restore=$script:Restore; toast=(Get-ToastFacts $script:InstalledAumid);
+                probe_results=@(Get-ToastProbeResults); fixture_verdict=$verdict;
+                fixture_reason=$(if ($bad.Count -gt 0) { 'an owned app did not close normally' } elseif (-not $settings.restored) { 'notification settings were not restored' } else { $null }) }
+        }
+    }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
@@ -2064,6 +2471,7 @@ try {
         'cleanup-foreign' { $report.result = Cleanup-Foreign }
         'run-config' { $report.result = Invoke-RunConfig }
         'osc52' { $report.result = Invoke-Osc52 }
+        'toast-matrix' { $report.result = Invoke-ToastMatrix }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
