@@ -83,12 +83,13 @@ pub const Input = struct {
         paste: Paste,
     },
     /// Fixed in v3 even when measurement is off, so process-local switches
-    /// cannot change the codec. Never used for input admission or replay.
+    /// cannot change the codec. Only its format/measurement eligibility is
+    /// validated; it is not an authorization, ordering or replay identity.
     perf: view.InputStamp = .{},
 
     pub fn measurable(event: @FieldType(Input, "event")) bool {
         return switch (event) {
-            .key => |key| key.action != .release,
+            .key => |key| key.action != .release and key.text.len != 0,
             .text => |value| value.len != 0,
             else => false,
         };
@@ -666,6 +667,40 @@ test "gx.remote input performance stamp survives wire renumbering and rejects ma
     packet.body.input.perf = .{ .sequence = 18, .qpc = 999 };
     packet.body.input.event = .{ .focus = true };
     try std.testing.expectError(error.InvalidInput, encode(buffer, packet));
+}
+
+test "gx.remote measurement eligibility matches wire validation for text-bearing input only" {
+    const alloc = std.testing.allocator;
+    const packet = try alloc.create(Packet);
+    defer alloc.destroy(packet);
+    packet.* = .{ .sender_epoch = 2, .recipient_epoch = 1, .request_id = 1, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 9 }, .body = .{ .input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 1,
+        .event = .{ .text = .{} },
+    } } };
+    const Event = @FieldType(Input, "event");
+    const cases = [_]struct { event: Event, measurable: bool }{
+        .{ .event = .{ .text = try Text.init("x") }, .measurable = true },
+        .{ .event = .{ .text = .{} }, .measurable = false },
+        .{ .event = .{ .key = .{ .action = .press, .physical = 1, .unicode = 'x', .modifiers = 0, .text = try Text.init("x") } }, .measurable = true },
+        .{ .event = .{ .key = .{ .action = .repeat, .physical = 1, .unicode = 'x', .modifiers = 0, .text = try Text.init("x") } }, .measurable = true },
+        .{ .event = .{ .key = .{ .action = .release, .physical = 1, .unicode = 'x', .modifiers = 0, .text = try Text.init("x") } }, .measurable = false },
+        // Modifier-only keys, arrows and target-only shortcuts have no text.
+        .{ .event = .{ .key = .{ .action = .press, .physical = 1, .unicode = 0, .modifiers = 1 } }, .measurable = false },
+        .{ .event = .{ .key = .{ .action = .repeat, .physical = 1, .unicode = 0, .modifiers = 0 } }, .measurable = false },
+        .{ .event = .{ .composition = .{ .phase = .update, .text = try Text.init("x") } }, .measurable = false },
+        .{ .event = .{ .focus = true }, .measurable = false },
+        .{ .event = .{ .visible = false }, .measurable = false },
+    };
+    for (cases) |case| {
+        packet.body.input.event = case.event;
+        packet.body.input.perf = .{};
+        try validate(packet);
+        packet.body.input.perf = .{ .sequence = 1, .qpc = 100 };
+        try std.testing.expectEqual(case.measurable, Input.measurable(case.event));
+        if (case.measurable) try validate(packet) else try std.testing.expectError(error.InvalidInput, validate(packet));
+    }
 }
 
 test "remote input sequence survives reconnect and key tags require real enum membership" {
