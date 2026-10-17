@@ -7,6 +7,14 @@ const refs = @import("../../gx/ui_ref.zig");
 pub const Rect = struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, h: f32 = 0 };
 pub const Event = @FieldType(protocol.Input, "event");
 
+/// Producer and wire counters are independent of the pane-local performance
+/// identity. Both coordinator stages must preserve every other payload field.
+pub fn renumber(input: protocol.Input, previous: u64) !protocol.Input {
+    var ordered = input;
+    ordered.sequence = try std.math.add(u64, previous, 1);
+    return ordered;
+}
+
 /// Each pane has one latest geometry/focus slot. Text remains a FIFO. Picking
 /// the smallest producer sequence prevents a newer coalesced resize from
 /// overtaking earlier text and tripping the source's monotonic input guard.
@@ -262,14 +270,21 @@ test "remote input buffer preserves performance identity across producer and wir
     const measured: protocol.Input = .{
         .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
         .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
-        .sequence = 91,
+        .sequence = 7,
         .event = .{ .text = try protocol.Text.init("x") },
         .perf = stamp,
     };
-    try std.testing.expect(buffer.push(0, measured));
-    var wire = buffer.peek().?;
-    wire.sequence = 200;
+    const producer = try renumber(measured, 90);
+    try std.testing.expect(buffer.push(0, producer));
+    const wire = try renumber(buffer.peek().?, 199);
+    try std.testing.expectEqual(@as(u64, 7), measured.sequence);
+    try std.testing.expectEqual(@as(u64, 91), producer.sequence);
+    try std.testing.expectEqual(@as(u64, 200), wire.sequence);
     try std.testing.expectEqual(stamp, wire.perf);
+    try std.testing.expect(wire.surface.matches(measured.surface));
+    try std.testing.expect(std.meta.eql(wire.lease, measured.lease));
+    try std.testing.expect(std.meta.eql(wire.event, measured.event));
+    try std.testing.expectError(error.Overflow, renumber(measured, std.math.maxInt(u64)));
     try std.testing.expectEqual(@as(u64, 91), buffer.peek().?.sequence);
     _ = buffer.pop(91);
     try std.testing.expect(buffer.peek() == null);

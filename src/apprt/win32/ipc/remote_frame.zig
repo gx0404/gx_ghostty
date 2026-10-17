@@ -236,8 +236,12 @@ test "remote frame attach validates size stride generation and header version" {
     std.mem.writeInt(u32, bytes[24..28], 12, .little);
     try std.testing.expectError(error.InvalidStride, Mapped.attach(&bytes, 7));
     _ = try Mapped.initialize(&bytes, layout, 7);
-    bytes[8] = 1;
-    try std.testing.expectError(error.UnsupportedVersion, Mapped.attach(&bytes, 7));
+    for ([_]u32{ 1, 3 }) |unsupported| {
+        std.mem.writeInt(u32, bytes[8..12], unsupported, .little);
+        try std.testing.expectError(error.UnsupportedVersion, Mapped.attach(&bytes, 7));
+    }
+    std.mem.writeInt(u32, bytes[8..12], version, .little);
+    _ = try Mapped.attach(&bytes, 7);
 }
 
 test "remote frame never overwrites borrowed slots and stale release cannot free a replacement" {

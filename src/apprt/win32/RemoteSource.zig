@@ -388,6 +388,10 @@ fn dispatchInput(state: *State, event: *const protocol.Input) !void {
     }
     // An asynchronous binding has only been queued, not applied. Its original
     // input is marked by advance after the continuation actually completes.
+    markCompletedPerfInput(state, event);
+}
+
+fn markCompletedPerfInput(state: *State, event: *const protocol.Input) void {
     if (state.chain == null) markPerfInput(state.surface, event);
 }
 
@@ -564,7 +568,7 @@ fn advance(state: *State) !void {
         defer core.gx_binding_bypass = false;
         try dispatchInput(state, &finished.original);
     }
-    markPerfInput(state.surface, &finished.original);
+    markCompletedPerfInput(state, &finished.original);
 }
 
 pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Packet) !bool {
@@ -1213,6 +1217,37 @@ test "apprt.win32 remote source owns bounded input queue instead of packet slabs
     try std.testing.expect(@sizeOf(State) < 20 * 1024);
     try std.testing.expectEqual(@as(usize, 4), utf8Prefix("hello"[0..4]));
     try std.testing.expectEqual(@as(usize, 0), utf8Prefix("\xe4\xb8"));
+}
+
+test "remote continuation must finish before marking its input performance stamp" {
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    perf.setEnabled(true);
+    const alloc = std.testing.allocator;
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.* = undefined;
+    var output: @import("RemoteHost.zig").Output = undefined;
+    output.perf_input = .{};
+    surface.remote_output = &output;
+    const event: protocol.Input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 100,
+        .event = .{ .text = try protocol.Text.init("x") },
+        .perf = .{ .sequence = 7, .qpc = 12345 },
+    };
+    var state: State = undefined;
+    state.surface = surface;
+    state.chain = .{ .actions = &.{}, .identity = undefined, .flags = .{}, .original = event, .event = .{}, .once = null, .waiting = true };
+    markCompletedPerfInput(&state, &event);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input.load());
+    state.chain.?.waiting = false; // runnable is not yet completed
+    markCompletedPerfInput(&state, &event);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input.load());
+    state.chain = null;
+    markCompletedPerfInput(&state, &event);
+    try std.testing.expectEqual(event.perf, output.perf_input.load());
 }
 
 test "apprt.win32 remote source native codepoints encode UTF16 scalar boundaries" {

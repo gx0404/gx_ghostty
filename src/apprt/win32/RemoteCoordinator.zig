@@ -486,8 +486,7 @@ fn onInput(ctx: *anyopaque, window: refs.Reference, input: protocol.Input) bool 
     const index = for (target.window.tree.nodes.slice(), 0..) |node, index| {
         if (node == .leaf and node.leaf.matches(input.surface)) break index;
     } else return false;
-    var ordered = input;
-    ordered.sequence = std.math.add(u64, target.input_sequence, 1) catch return false;
+    const ordered = RemoteInput.renumber(input, target.input_sequence) catch return false;
     const accepted = target.inputs.push(index, ordered);
     if (accepted) target.input_sequence = ordered.sequence;
     if (accepted) if (self.app) |app| if (app.msg_hwnd) |hwnd| {
@@ -930,8 +929,7 @@ fn progressTarget(self: *Self, target: *Target) !void {
         target.last_query = now;
     }
     if (target.source_revoked and target.ever_enabled and target.input_request == null) if (target.inputs.peek()) |input| {
-        var ordered = input;
-        ordered.sequence = try std.math.add(u64, target.wire_sequence, 1);
+        const ordered = try RemoteInput.renumber(input, target.wire_sequence);
         if (@import("remote_test.zig").enabled() and ordered.event == .paste) log.info("remote paste sending queued_transfer={} wire_transfer={} chunk={} wire_sequence={}", .{ input.event.paste.transfer, ordered.event.paste.transfer, ordered.event.paste.index, ordered.sequence });
         const request = try connection.sendBody(target.ticket, .{ .input = ordered });
         target.wire_sequence = ordered.sequence;
