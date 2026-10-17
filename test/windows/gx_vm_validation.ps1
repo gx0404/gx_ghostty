@@ -1292,8 +1292,12 @@ function Read-Record([string]$Name) {
     $path = Get-RecordPath $Name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     if (-not $script:ExportExtra.Contains($path)) { $script:ExportExtra.Add($path) }
-    return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    return Read-JsonFile $path
 }
+
+# Write-Json emits BOM-less UTF-8, which Windows PowerShell 5.1's Get-Content
+# would decode as ANSI; every r6 JSON read (and state.json) goes through here.
+function Read-JsonFile([string]$Path) { return [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json }
 
 function Set-RecordField($Record, [string]$Name, $Value) {
     $Record | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
@@ -1526,7 +1530,7 @@ function Get-OwnedRecordSummary([string]$Prefix) {
     $dir = Join-Path $script:RunRoot 'records'
     if (-not (Test-Path -LiteralPath $dir)) { return @() }
     return @(Get-ChildItem -LiteralPath $dir -Filter ($Prefix + '*.json') | ForEach-Object {
-        $record = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+        $record = Read-JsonFile $_.FullName
         $alive = $false
         if ($record.PSObject.Properties['pid'] -and $record.pid) { $owned = Get-OwnedProcess $record; if ($owned) { $alive = $true; $owned.Dispose() } }
         [ordered]@{ name=$_.BaseName; status=$(if ($record.PSObject.Properties['status']) { $record.status } else { $null }); alive=$alive } })
@@ -2069,7 +2073,7 @@ function Get-Osc52Results([string]$Results) {
     if (-not (Test-Path -LiteralPath $Results)) { return @() }
     return @(Get-ChildItem -LiteralPath $Results -Filter 'osc52-*.json' | Sort-Object Name | ForEach-Object {
         $script:ExportExtra.Add($_.FullName)
-        Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+        Read-JsonFile $_.FullName })
 }
 
 function Invoke-Osc52 {
@@ -2217,7 +2221,7 @@ function Get-ToastProbeResults {
     return @(Get-ChildItem -LiteralPath $script:RunRoot -Directory -Filter 'toast-*-results' -ErrorAction SilentlyContinue | ForEach-Object {
         Get-ChildItem -LiteralPath $_.FullName -Filter 'toast-*.json' | Sort-Object Name | ForEach-Object {
             $script:ExportExtra.Add($_.FullName)
-            Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } })
+            Read-JsonFile $_.FullName } })
 }
 
 function Start-ToastApp([string]$Exe, [string]$Class, [string]$EarlyCommand) {
@@ -2259,7 +2263,7 @@ function Start-ToastApp([string]$Exe, [string]$Class, [string]$EarlyCommand) {
 function Get-ToastRecords {
     $dir = Join-Path $script:RunRoot 'records'
     if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -Filter 'toast-*.json' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } |
+    return @(Get-ChildItem -LiteralPath $dir -Filter 'toast-*.json' | ForEach-Object { Read-JsonFile $_.FullName } |
         Where-Object { $_.PSObject.Properties['pid'] })
 }
 
@@ -2392,7 +2396,8 @@ if ($ExportDir) {
 }
 $statePath = Join-Path $script:RunRoot 'state.json'
 if (Test-Path -LiteralPath $statePath) {
-    $script:State = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    # UTF-8: state values (such as app_dir) may hold non-ASCII text.
+    $script:State = Read-JsonFile $statePath
     if ($script:State.owner -ne $script:Owner -or $script:State.uuid -ne $identity.guest_uuid -or
         $script:State.sid -ne $sid -or $script:State.scope -ne $Scope -or $script:State.app_dir -ne $script:AppDir) {
         throw 'Existing run belongs to a different VM/user/scope/application.'
