@@ -118,6 +118,7 @@ pending_native_destroy: bool = false,
 tab_references: [MAX_TABS]gx.ui_ref.Reference = @splat(.{}),
 pending_tab_detach: ?DetachRequest = null,
 tab_transfer_active: bool = false,
+fixture: @import("tab_transfer.zig").Fixture = .{},
 tab_transfer_close: bool = false,
 uia_bridge: @import("ui/uia_bridge.zig").WindowBridge = .{},
 uia_dirty: bool = true,
@@ -3123,6 +3124,18 @@ pub fn moveTabToWindow(self: *Window, reference: gx.ui_ref.Reference, destinatio
             const owner = b.app.resolveWindow(b.source) orelse return error.StaleSource;
             const surface = owner.leafForPane(b.views[i].reference) orelse return error.StaleSource;
             if (surface.nativeHandle() != b.views[i].child or w32.GetParent(b.views[i].child) != b.source_hwnd) return error.StaleSource;
+            const enabled = @import("remote_test.zig").enabled();
+            // Exercise a real failing Win32 SetParent, after earlier children
+            // have moved. No terminal is replaced or stopped by this seam.
+            if (owner.fixture.failParent(enabled, i)) {
+                if (w32.SetParent(b.views[i].child, @ptrFromInt(std.math.maxInt(usize))) != null) return error.FixtureUnexpectedParent;
+                return error.SetParentFailed;
+            }
+            // WH_CALLWNDPROC runs synchronously inside the actual SetParent
+            // call, so this tests native reentrancy, not a later queued action.
+            var probe: FixtureParentProbe = .{ .app = b.app, .source = b.source, .destination = b.destination, .tab = b.tab, .child = b.views[i].child };
+            const hook = if (enabled and owner.fixture.reenter_parent == i + 1) try probe.install() else null;
+            defer if (hook) |value| probe.uninstall(value);
             if (w32.SetParent(b.views[i].child, b.destination_hwnd) == null) return error.SetParentFailed;
         }
         pub fn restore(b: *@This(), i: usize) !void {
@@ -3198,6 +3211,218 @@ pub fn moveTabToWindow(self: *Window, reference: gx.ui_ref.Reference, destinatio
     }
     app.scheduleSessionSave();
     return true;
+}
+
+const FixtureParentProbe = struct {
+    app: *App,
+    source: gx.ui_ref.Reference,
+    destination: gx.ui_ref.Reference,
+    tab: gx.ui_ref.Reference,
+    child: w32.HWND,
+    var active: ?*FixtureParentProbe = null; // GUI thread, only while SetParent is on the stack.
+    const Call = extern struct { result: isize, wparam: usize, message: u32, hwnd: w32.HWND };
+    extern "user32" fn SetWindowsHookExW(i32, *const anyopaque, ?w32.HINSTANCE, u32) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn UnhookWindowsHookEx(*anyopaque) callconv(.winapi) i32;
+    extern "user32" fn CallNextHookEx(?*anyopaque, i32, usize, isize) callconv(.winapi) isize;
+    fn install(self: *FixtureParentProbe) !*anyopaque {
+        if (active != null) return error.FixtureProbeBusy;
+        const hook = SetWindowsHookExW(4, @ptrCast(&callback), null, w32.GetCurrentThreadId()) orelse return error.FixtureHookFailed;
+        active = self;
+        return hook;
+    }
+    fn uninstall(_: *FixtureParentProbe, hook: *anyopaque) void {
+        active = null;
+        _ = UnhookWindowsHookEx(hook);
+    }
+    fn callback(code: i32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+        if (code >= 0 and lparam != 0) if (active) |probe| {
+            const call: *const Call = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (call.hwnd == probe.child) {
+                active = null; // At most one reentry, including nested hooks.
+                if (probe.app.resolveWindow(probe.source)) |owner| {
+                    owner.fixture.count(true, "reentries");
+                    const moved = owner.moveTabToWindow(probe.tab, probe.destination, 0) catch false;
+                    if (!moved) owner.fixture.count(true, "rejected_reentries");
+                }
+            }
+        };
+        return CallNextHookEx(null, code, wparam, lparam);
+    }
+};
+
+fn fixtureBits(value: u64) isize {
+    return @bitCast(@as(usize, @truncate(value)));
+}
+fn fixtureHash(bytes: []const u8) isize {
+    return fixtureBits(std.hash.Wyhash.hash(0, bytes));
+}
+
+/// Explicit test-only control. Scalar arguments never name an unowned object;
+/// destination HWNDs are resolved against this App's live window list.
+fn fixtureMessage(self: *Window, enabled: bool, message: u32, field: usize, argument: isize) isize {
+    if (!enabled) return 0;
+    const contract = @import("tab_transfer.zig");
+    if (message == contract.fixture_control) {
+        if (self.closing) return 0;
+        switch (field) {
+            0 => self.fixture = .{},
+            1 => self.fixture.fail_parent = std.math.cast(usize, argument) orelse return 0,
+            2 => self.fixture.reenter_parent = std.math.cast(usize, argument) orelse return 0,
+            3 => {
+                const app = self.app;
+                const target = for (app.windows.items) |candidate| {
+                    if (candidate.hwnd) |hwnd| if (@intFromPtr(hwnd) == @as(usize, @bitCast(argument))) break candidate.ui_reference;
+                } else return 0;
+                if (self.tab_count == 0) return 0;
+                return @intFromBool(self.moveTabToWindow(self.tab_references[self.active_tab], target, 0) catch return -1);
+            },
+            4 => {
+                if (self.tab_count == 0) return 0;
+                const app = self.app;
+                const target = self.detachTabForDrag(self.tab_references[self.active_tab]) catch return -1;
+                const window = app.resolveWindow(target) orelse return -1;
+                return if (window.hwnd) |hwnd| @bitCast(@intFromPtr(hwnd)) else -1;
+            },
+            5 => {
+                const index = std.math.cast(usize, argument) orelse return 0;
+                if (index >= self.tab_count) return 0;
+                self.selectTabIndex(index);
+            },
+            6 => {
+                if (self.tab_count == 0) return 0;
+                const tree = &self.tab_trees[self.active_tab];
+                if (argument < 0) tree.zoom(null) else {
+                    const index: usize = @intCast(argument);
+                    if (index >= tree.nodes.len or tree.nodes[index] != .leaf) return 0;
+                    tree.zoom(@enumFromInt(index));
+                }
+                self.relayout();
+            },
+            7 => {
+                if (self.tab_count == 0 or argument < 0) return 0;
+                const index: usize = @intCast(argument);
+                const tree = &self.tab_trees[self.active_tab];
+                if (index >= tree.nodes.len or tree.nodes[index] != .leaf) return 0;
+                self.tab_active_surface[self.active_tab] = tree.nodes[index].leaf;
+                self.focusActiveSurface();
+            },
+            8 => self.removeLeaf(self.activeLeaf() orelse return 0),
+            9 => return @intFromBool(self.uia_bridge.publisher.notify("The session could not be saved.")),
+            10 => {
+                _ = Dialogs.confirmCloseWindow(self.hwnd, &.{"cmd"});
+            },
+            20 => self.app.fixture.fail_windows = @min(std.math.cast(usize, argument) orelse return 0, 16),
+            21 => self.app.drop_bridge.fixture_reject = argument != 0,
+            22 => {
+                const surface = self.app.resolveSurfaceView(self.app.drop_bridge.selected) orelse return 0;
+                const leaf = surface.leaf orelse return 0;
+                surface.parent_window.removeLeaf(leaf);
+            },
+            23 => _ = self.addTab() catch return -1,
+            else => return 0,
+        }
+        return 1;
+    }
+    if (message != contract.fixture_query) return 0;
+    switch (field) {
+        0 => return contract.fixture_magic,
+        1 => return if (self.tab_bar.drag) |drag| @intFromBool(drag.active) else 0,
+        2 => return fixtureBits(self.ui_reference.id),
+        3 => return @intCast(self.active_tab),
+        4 => return @intCast(self.tab_count),
+        23 => return @intFromFloat(self.scale * 96),
+        40 => return @intCast(self.fixture.reentries),
+        41 => return @intCast(self.fixture.rejected_reentries),
+        100 => return @intCast(self.app.fixture.hotkey_attempts),
+        101 => return @intCast(self.app.fixture.hotkey_successes),
+        102 => return @intCast(self.app.fixture.toggle_executions),
+        103 => return @intCast(self.app.fixture.ipc_executions),
+        104 => return @intCast(self.app.fixture.fail_windows),
+        105 => return @intCast(self.app.global_hotkeys.items.len),
+        106 => return @intCast(self.app.fixture.ime_events),
+        200 => return @intCast(@import("ole_drop.zig").fixture_counts.drops),
+        201 => return @intCast(@import("ole_drop.zig").fixture_counts.queued),
+        else => {},
+    }
+    const indices: usize = @bitCast(argument);
+    const tab = indices & 0xffff;
+    const index = (indices >> 16) & 0xffff;
+    if (tab >= self.tab_count) return -1;
+    const tree = &self.tab_trees[tab];
+    switch (field) {
+        5 => return @intCast(tree.nodes.len),
+        6 => return if (tree.zoomed) |zoom| @intCast(zoom.idx() + 1) else 0,
+        7 => return if (self.tab_active_surface[tab].remote()) |remote| fixtureBits(remote.source_reference.id) else fixtureBits(self.tab_active_surface[tab].reference().id),
+        8 => return fixtureBits(self.tab_references[tab].id),
+        9 => return if (self.tab_title_overrides[tab]) |title| fixtureHash(std.mem.sliceAsBytes(title.slice())) else 0,
+        30, 31, 32, 33 => {
+            const rect = self.tab_bar.tabRect(tab);
+            var point: w32.POINT = .{ .x = rect.left, .y = rect.top };
+            if (self.hwnd) |hwnd| _ = w32.ClientToScreen(hwnd, &point);
+            return switch (field) {
+                30 => point.x,
+                31 => point.y,
+                32 => rect.right - rect.left,
+                else => rect.bottom - rect.top,
+            };
+        },
+        else => {},
+    }
+    if (index >= tree.nodes.len) return -1;
+    switch (tree.nodes[index]) {
+        .split => |split| return switch (field) {
+            10 => 2,
+            15 => @intCast(@as(u32, @bitCast(@as(f32, split.ratio)))),
+            16 => @intFromBool(split.layout == .vertical),
+            17 => @intCast(split.left.idx()),
+            18 => @intCast(split.right.idx()),
+            else => 0,
+        },
+        .leaf => |leaf| {
+            switch (field) {
+                10 => return 1,
+                11 => return if (leaf.remote()) |remote| fixtureBits(remote.source_reference.id) else fixtureBits(leaf.reference().id),
+                12 => return if (leaf.nativeHandle()) |hwnd| @bitCast(@intFromPtr(hwnd)) else 0,
+                13 => return if (leaf.nativeHandle()) |hwnd| if (w32.GetParent(hwnd)) |parent| @bitCast(@intFromPtr(parent)) else 0 else 0,
+                else => {},
+            }
+            if (leaf.remote()) |remote| switch (field) {
+                // Search UI is GUI-owned here. Frame/history/ACK instrumentation
+                // remains with A2r; never infer those counters from UI state.
+                24 => return @intFromBool(remote.ui.search_bar.active),
+                25 => return if (remote.ui.search_bar.total) |total| @intCast(total) else -1,
+                else => {},
+            };
+            const surface = leaf.local() orelse return -2; // Remote metadata is owned by A2r.
+            if (!surface.core_surface_ready) return -1;
+            switch (field) {
+                14 => return @intCast(surface.core_surface.getProcessInfo(.foreground_pid) orelse 0),
+                19 => return if (surface.sessionTitle()) |title| fixtureHash(title) else 0,
+                24 => return @intFromBool(surface.search_bar.active),
+                25 => return if (surface.search_bar.total) |total| @intCast(total) else -1,
+                20, 21, 22 => {
+                    const state = &surface.core_surface.renderer_state;
+                    state.lockDemand(global.io());
+                    defer state.unlockDemand(global.io());
+                    const scroll = state.terminal.screens.active.pages.scrollbar();
+                    return @intCast(switch (field) {
+                        20 => scroll.total,
+                        21 => scroll.len,
+                        else => scroll.offset,
+                    });
+                },
+                else => return 0,
+            }
+        },
+    }
+}
+
+test "window fixture messages are inert without the explicit test gate" {
+    const contract = @import("tab_transfer.zig");
+    for ([_]u32{ contract.fixture_control, contract.fixture_query }) |message| {
+        // Undefined owner proves the disabled path does not even inspect UI state.
+        try std.testing.expectEqual(@as(isize, 0), fixtureMessage(undefined, false, message, 3, 1));
+    }
 }
 
 fn endTabTransfer(app: *App, reference: gx.ui_ref.Reference) void {
@@ -3867,6 +4092,8 @@ pub fn windowWndProc(
             window.title_bar.onOwnerActiveLock(wparam != 0);
             return 0;
         },
+
+        @import("tab_transfer.zig").fixture_control, @import("tab_transfer.zig").fixture_query => return window.fixtureMessage(@import("remote_test.zig").enabled(), msg, wparam, lparam),
 
         @import("remote_test.zig").begin_message => {
             if (!@import("remote_test.zig").enabled() or window.tab_count == 0 or wparam > std.math.maxInt(u32)) return 0;

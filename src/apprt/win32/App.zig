@@ -113,6 +113,9 @@ config: Config,
 /// This is not a visible window; it just participates in the message loop.
 msg_hwnd: ?w32.HWND = null,
 ipc_server: ?*IpcInstance.Server = null,
+// Test-only counters/faults. Every access that changes behavior checks the
+// existing remote fixture gate; this never alters ordinary launch semantics.
+fixture: @import("tab_transfer.zig").Fixture = .{},
 ipc_forwarded: bool = false,
 
 /// The HINSTANCE for this module.
@@ -1310,6 +1313,16 @@ pub fn instanceIsolation(alloc: Allocator, class: ?[]const u8) !@import("ipc/Sec
     return IpcEnvironment.isolation(alloc, directory, class, @import("../../build_config.zig").version_string);
 }
 
+fn fixtureFlag(comptime name: []const u8) bool {
+    if (!@import("remote_test.zig").enabled()) return false;
+    var value: [4]u16 = undefined;
+    return FixtureEnvironment.get(std.unicode.utf8ToUtf16LeStringLiteral(name), &value, value.len) == 1 and value[0] == '1';
+}
+const FixtureEnvironment = struct {
+    extern "kernel32" fn GetEnvironmentVariableW([*:0]const u16, [*]u16, u32) callconv(.winapi) u32;
+    const get = GetEnvironmentVariableW;
+};
+
 /// Runs before hotkeys and surfaces exist. Never independently launch after an
 /// ambiguous IPC result: the primary may already have created the window.
 fn routeInitialLaunch(self: *App) !bool {
@@ -1323,7 +1336,24 @@ fn routeInitialLaunch(self: *App) !bool {
     }
     const isolation = try instanceIsolation(self.core_app.alloc, self.config.class);
     switch (try IpcInstance.elect(self.core_app.alloc, isolation, self.ui_ids.epoch)) {
-        .primary => |server| self.ipc_server = server,
+        .primary => |server| {
+            self.ipc_server = server;
+            if (@import("remote_test.zig").enabled()) {
+                const native = @import("ipc/native.zig");
+                const identity = try @import("ipc/Security.zig").inspect(native.GetCurrentProcessId());
+                defer identity.deinit();
+                var bytes: [@import("ipc/wire.zig").hello_size]u8 = undefined;
+                @import("ipc/wire.zig").hello(&bytes, self.ui_ids.epoch, identity.identity, isolation);
+                log.info("fixture_hello {s}", .{std.fmt.bytesToHex(bytes, .lower)});
+                // Deterministic pre-ready crash seam: no GUI, PTY or hotkey
+                // exists yet. Only the controller may terminate its own host.
+                if (fixtureFlag("GHOSTTY_GX_REMOTE_TEST_HOLD_READY")) {
+                    log.info("fixture_hold_ready", .{});
+                    _ = native.WaitForSingleObject(server.stop, 30_000);
+                    return error.FixtureReadyTimeout;
+                }
+            }
+        },
         .secondary => |endpoint| {
             const profile_id = if (self.shell.startup == .profile) self.shell.startup.profile else "";
             const outcome = try IpcClient.request(endpoint, self.ui_ids.epoch, 1, .{ .new_window = profile_id });
@@ -1359,7 +1389,15 @@ pub fn performIpc(
     const local = try security.inspect(native.GetCurrentProcessId());
     defer local.deinit();
     const endpoint = try IpcInstance.Endpoint.init(isolation, local.identity);
-    const outcome = try IpcClient.request(endpoint, try IpcInstance.freshEpoch(), 1, request);
+    var attempt: IpcClient.Attempt = .{ .endpoint = endpoint, .sender_epoch = try IpcInstance.freshEpoch(), .request_id = 1 };
+    const outcome = try attempt.send(request);
+    // Replay the exact authenticated request key through the production pipe,
+    // not a second GUI call. Off-gate execution performs exactly one send.
+    if (fixtureFlag("GHOSTTY_GX_REMOTE_TEST_REPLAY")) {
+        const duplicate = try attempt.send(request);
+        if (duplicate != outcome) return error.FixtureReplayMismatch;
+        log.info("fixture_ipc_replay outcome={s}", .{@tagName(outcome)});
+    }
     return switch (outcome) {
         .completed => true,
         .unavailable => error.IPCUnavailable,
@@ -1373,6 +1411,7 @@ pub fn performIpc(
 fn onIpc(self: *App) void {
     const server = self.ipc_server orelse return;
     while (server.take()) |work| {
+        self.fixture.count(@import("remote_test.zig").enabled(), "ipc_executions");
         const outcome = if (self.quit_requested) IpcProtocol.Outcome.cancelled else self.executeIpc(work.request) catch |err| result: {
             log.err("IPC action failed err={}", .{err});
             break :result IpcProtocol.Outcome.execution_failed;
@@ -1625,6 +1664,7 @@ fn executeIpc(self: *App, request: IpcProtocol.Request) !IpcProtocol.Outcome {
 }
 
 fn toggleQuickTerminal(self: *App) !void {
+    self.fixture.count(@import("remote_test.zig").enabled(), "toggle_executions");
     const qt = self.quick_terminal orelse value: {
         const created = try QuickTerminal.init(self);
         self.quick_terminal = created;
@@ -2676,6 +2716,9 @@ extern "user32" fn WindowFromPoint(point: w32.POINT) callconv(.winapi) ?w32.HWND
 /// Create and track a top-level window without tabs. It is shown with its
 /// first tab (`Window.addTab*`).
 pub fn newWindow(self: *App, options: Window.InitOptions) !*Window {
+    // One-shot injected CreateWindow failure occurs before allocation/shell
+    // creation, so the real GUI completion path must return execution_failed.
+    if (self.fixture.takeWindowFailure(@import("remote_test.zig").enabled())) return error.FixtureCreateWindowFailed;
     const alloc = self.core_app.alloc;
     const window = try alloc.create(Window);
     errdefer alloc.destroy(window);
@@ -3254,12 +3297,14 @@ fn registerGlobalHotkey(self: *App) void {
         };
 
         const id = next_id;
+        self.fixture.count(@import("remote_test.zig").enabled(), "hotkey_attempts");
         if (w32.RegisterHotKey(hwnd, id, chord.mods | w32.MOD_NOREPEAT, chord.vk) == 0) {
             const err = GetLastError();
             log.warn("failed to register global hotkey action={s} err={}", .{ @tagName(leaf.action), err });
             if (err == ERROR_HOTKEY_ALREADY_REGISTERED) self.noteShortcutConflict(chord, .hotkey);
             continue;
         }
+        self.fixture.count(@import("remote_test.zig").enabled(), "hotkey_successes");
         self.global_hotkeys.append(alloc, .{ .id = id, .chord = chord, .trigger = entry.key_ptr.* }) catch {
             _ = w32.UnregisterHotKey(hwnd, id);
             continue;
@@ -4334,12 +4379,14 @@ fn surfaceWndProc(
         },
 
         w32.WM_IME_STARTCOMPOSITION => {
+            surface.app.fixture.count(@import("remote_test.zig").enabled(), "ime_events");
             surface.handleImeStartComposition();
             // Consume: we draw the composition inline; no default window.
             return 0;
         },
 
         w32.WM_IME_COMPOSITION => {
+            surface.app.fixture.count(@import("remote_test.zig").enabled(), "ime_events");
             // Handles both intermediate preedit (GCS_COMPSTR, mirrored
             // inline) and the final result string (GCS_RESULTSTR, committed
             // to the terminal). Always consume so DefWindowProc doesn't

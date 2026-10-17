@@ -33,6 +33,7 @@ worker: ?*Worker = null,
 closing: bool = false,
 draining: bool = false,
 status: Status = .ready,
+fixture_birth: u64 = 0,
 const Status = enum { ready, queued, waiting, pasted, cancelled, rejected, target_gone, expired, failed, unknown };
 
 const Worker = struct {
@@ -111,7 +112,7 @@ pub fn create(app: *App, target_process: Process) !*Self {
     // as a core Surface or resolve it through App's terminal registry.
     const serial = try app.ui_ids.create(.tab);
     const attachment = try app.ui_ids.attach(try app.ui_ids.surface(serial.id), owner);
-    self.* = .{ .app = app, .endpoint = endpoint, .target_process = peer, .reference = owner, .attachment = attachment, .canvas = d2d.Canvas.init(factory) };
+    self.* = .{ .app = app, .endpoint = endpoint, .target_process = peer, .reference = owner, .attachment = attachment, .canvas = d2d.Canvas.init(factory), .fixture_birth = if (@import("remote_test.zig").enabled()) local.identity.process.birth else 0 };
     errdefer self.canvas.deinit();
     const definition: w32.WNDCLASSEXW = .{ .cbSize = @sizeOf(w32.WNDCLASSEXW), .style = w32.CS_HREDRAW | w32.CS_VREDRAW, .lpfnWndProc = &wndProc, .cbClsExtra = 0, .cbWndExtra = 0, .hInstance = app.hinstance, .hIcon = w32.LoadIconW(app.hinstance, w32.IDI_GHOSTTY), .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW), .hbrBackground = null, .lpszMenuName = null, .lpszClassName = class_name, .hIconSm = null };
     if (w32.RegisterClassExW(&definition) == 0 and GetLastError() != 1410) return error.ClassRegistrationFailed;
@@ -174,6 +175,7 @@ pub fn drain(self: *Self) void {
     }
     if (self.worker) |worker| if (worker.done.load(.acquire)) {
         if (worker.outcome) |outcome| {
+            if (@import("remote_test.zig").enabled()) log.info("fixture_receipt pid={d} request={d} outcome={s} birth={d}", .{ native.GetCurrentProcessId(), worker.attempt.request, @tagName(outcome), self.fixture_birth });
             self.status = switch (outcome) {
                 .pasted => .pasted,
                 .cancelled => .cancelled,

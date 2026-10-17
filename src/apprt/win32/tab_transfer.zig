@@ -1,6 +1,48 @@
 //! Toolkit-free drag thresholds and a rollback transaction for native parents.
 const std = @import("std");
 
+// Native fixture messages are private to GhosttyWindow. Off-gate calls must
+// not consume an armed fault or mutate counters. See test/windows/README.md.
+pub const fixture_control: u32 = 0x451;
+pub const fixture_query: u32 = 0x452;
+pub const fixture_magic: isize = 0x47584133;
+pub const Fixture = struct {
+    fail_parent: usize = 0,
+    reenter_parent: usize = 0,
+    reentries: usize = 0,
+    rejected_reentries: usize = 0,
+    fail_windows: usize = 0,
+    hotkey_attempts: usize = 0,
+    hotkey_successes: usize = 0,
+    ipc_executions: usize = 0,
+    toggle_executions: usize = 0,
+    ime_events: usize = 0,
+    pub fn takeWindowFailure(self: *Fixture, enabled: bool) bool {
+        if (!enabled or self.fail_windows == 0) return false;
+        self.fail_windows -= 1;
+        return true;
+    }
+    pub fn count(self: *Fixture, enabled: bool, comptime field: []const u8) void {
+        if (enabled) @field(self, field) +|= 1;
+    }
+    pub fn failParent(self: *const Fixture, enabled: bool, index: usize) bool {
+        return enabled and self.fail_parent != 0 and self.fail_parent - 1 == index;
+    }
+};
+
+test "fixture gate off never consumes faults or changes counters" {
+    var state: Fixture = .{ .fail_windows = 2, .fail_parent = 1, .reenter_parent = 1 };
+    const before = state;
+    try std.testing.expect(!state.takeWindowFailure(false));
+    try std.testing.expect(!state.failParent(false, 0));
+    inline for (.{ "hotkey_attempts", "hotkey_successes", "ipc_executions", "toggle_executions", "ime_events", "reentries", "rejected_reentries" }) |field| state.count(false, field);
+    try std.testing.expectEqualDeep(before, state);
+    try std.testing.expect(state.takeWindowFailure(true));
+    try std.testing.expectEqual(@as(usize, 1), state.fail_windows);
+    try std.testing.expect(state.failParent(true, 0));
+    try std.testing.expect(!state.failParent(true, 1));
+}
+
 pub const Gesture = enum { pending, reorder, detach };
 pub fn gesture(dx: i32, dy: i32, scale: f32) Gesture {
     if (!std.math.isFinite(scale) or scale <= 0) return .pending;
