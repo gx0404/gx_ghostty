@@ -19,6 +19,12 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def source_manifest():
+    root = Path(__file__).resolve().parents[2]
+    paths = sorted((root / "test/windows").glob("gx_*.py")) + [root / "scripts/gx_win_uia.py"]
+    return {str(path.relative_to(root)).replace("\\", "/"): sha256(path) for path in paths}
+
+
 def process_identity(api, pid):
     birth, image = api.process_creation(pid), api.process_image(pid)
     if not birth or not image or not api.process_alive(pid):
@@ -56,6 +62,24 @@ def native_snapshot(instance, *, hooks=True):
             pid = api.send_message(window.hwnd, 0x450, 3, 0, timeout_ms=2000)
             if pid:
                 entry["pty"] = process_identity(api, pid)
+            if api.send_message(window.hwnd, 0x452, 0, 0, timeout_ms=2000) == 0x47584133:
+                entry["window_id"] = api.send_message(window.hwnd, 0x452, 2, 0, timeout_ms=2000)
+                tab = api.send_message(window.hwnd, 0x452, 3, 0, timeout_ms=2000)
+                count = api.send_message(window.hwnd, 0x452, 5, tab, timeout_ms=2000)
+                if count is not None and 1 <= count <= 511:
+                    for index in range(count):
+                        position = tab | (index << 16)
+                        if api.send_message(window.hwnd, 0x452, 10, position, timeout_ms=2000) != 1:
+                            continue
+                        core = api.send_message(window.hwnd, 0x452, 11, position, timeout_ms=2000)
+                        if core != entry["surface_id"]:
+                            continue
+                        total = api.send_message(window.hwnd, 0x452, 20, position, timeout_ms=2000)
+                        viewport = api.send_message(window.hwnd, 0x452, 21, position, timeout_ms=2000)
+                        if total is not None and viewport is not None and 0 <= viewport <= total < (1 << 63):
+                            entry.update(scrollback_count=total - viewport, scrollback_total=total,
+                                         viewport_rows=viewport, scrollback_status="OBSERVED_NATIVE")
+                        break
         windows.append(entry)
     instance.ensure_owned()
     return {"process": process, "windows": windows,

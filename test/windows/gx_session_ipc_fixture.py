@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import asdict
 import ctypes
 import hashlib
 import json
@@ -22,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import gx_slots  # noqa: E402
 import gx_win_gui as gui  # noqa: E402
-from gx_fixture_evidence import native_snapshot, sha256, write_review, fixture_slots
+from gx_fixture_evidence import native_snapshot, sha256, write_review, fixture_slots, source_manifest
 
 CONFIG = "language = en\nconfirm-close-surface = false\n"
 CREATE_SUSPENDED = 0x00000004  # Win32 creation flag; not exported by every Python build.
@@ -143,6 +144,7 @@ class Fixture:
             "app_mtime_ns": self.exe.stat().st_mtime_ns, "build_label": build,
             "tree_boundary": "Build label is caller supplied; the current source tree is not a build receipt.",
             "cases": [], "processes": [], "captures": [], "visual_review": "PENDING",
+            "fixture_sources": source_manifest(),
         }
 
     def environment(self, name, config):
@@ -151,7 +153,7 @@ class Fixture:
         gui.write_config(path, config)
         return path
 
-    def start(self, path, args=(), *, resume=True, exe=None, expected_hash=None):
+    def start(self, path, args=(), *, resume=True, exe=None, expected_hash=None, env=None):
         assert path.is_absolute()
         image = exe.resolve(strict=True) if exe else self.exe
         image_hash = sha256(image)
@@ -159,7 +161,7 @@ class Fixture:
         # Query identity before the launcher can exit. Retain our exact process
         # handle for exit codes and crash tests; never infer exit success by PID.
         launched = gui.win32().now_filetime()
-        environment = gui.isolated_environment(os.environ, path, {"GHOSTTY_GX_REMOTE_TEST": "1"})
+        environment = gui.isolated_environment(os.environ, path, {"GHOSTTY_GX_REMOTE_TEST": "1", **(env or {})})
         process = subprocess.Popen([str(image), *args], cwd=path, env=environment,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    creationflags=CREATE_SUSPENDED)
@@ -201,10 +203,21 @@ class Fixture:
             raise gui.InputBlocked("owned window foreground denied; stopping batch")
         time.sleep(0.2)
         instance.ensure_owned()
+        window = gui.win32().info(window.hwnd)
+        if gui.win32().window_pid(window.hwnd) != instance.pid:
+            raise gui.InputBlocked("capture HWND owner changed")
+        occluders = set()
+        left, top, right, bottom = window.rect
+        for fx, fy in ((0.5, 0.1), (0.5, 0.5), (0.5, 0.9)):
+            hit = gui.win32().window_at(round(left + (right - left) * fx), round(top + (bottom - top) * fy))
+            root = gui.win32().GetAncestor(hit, 2) if hit else 0
+            if root and root != window.hwnd:
+                occluders.add(root)
         method = "screen"
         instance.capture_window(window, method).save_png(self.out / f"{name}.png")
         self.report["captures"].append({"file": f"{name}.png", "method": method,
                                         "foreground": foreground, "review": "PENDING_REVIEW",
+                                        "window": asdict(window), "occluder_hwnds": sorted(occluders),
                                         "identity": native_snapshot(instance)})
 
     def close(self, instance):
