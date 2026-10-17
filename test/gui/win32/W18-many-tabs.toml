@@ -1,32 +1,283 @@
 id = "W18"
 title = "Twelve tabs: how the tab bar shrinks and overflows"
+env = { GHOSTTY_GX_PERF = "1" }
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+bell-features = no-system,no-audio,no-attention,title,no-border
+keybind = f6=new_split:right
+keybind = f7=goto_tab:1
+keybind = f8=goto_tab:2
 """
+# R2-Tabs.01-.06/.09/.10 and R2-App.06 (tab part), R2-接口.05 (all-tabs menu). The window is
+# resized to 1500x1000 (about 984-1000 DIP wide at 144 DPI): four tabs are about 177 DIP
+# wide from x = 8 DIP; with twelve the strip overflows: scroll back button at x 8..40 DIP,
+# scroll forward and the all-tabs button about 650..726 DIP (x = 704 hits the list button
+# for either client width). Tab statuses: t1 rings the bell (silently, title feature only)
+# in the background, t2 prints in the background, t3 has a zoomed split and t4 reports
+# OSC 9;4 error progress from its prompt.
 expect = [
-  "three-tabs: three equal tabs with titles",
-  "twelve-tabs: twelve tabs; note how narrow they get, whether the active one keeps its close button and whether any is clipped",
+  "status-glyphs: four tabs t1..t4: t1 marks the bell, t2 shows the new-output dot and its running program (PING) in the secondary color before the title, t3 the zoom glyph, the active t4 a red error progress ring; each status distinct",
+  "tab-tooltip: resting on t1 shows a tooltip with its full label and the F7 shortcut",
+  "tab-hover-close: the hovered inactive tab t2 shows its close button; other inactive tabs do not",
+  "middle-mismatch: middle pressed on t1 and released on t2: no tab closed",
+  "middle-closed-frozen: a middle click closed t2; the remaining tabs keep their widths while the pointer stays on the tab bar",
+  "widths-reflowed: the pointer left the tab bar and the three tabs grew to share the strip",
+  "progress-expired: more than 15 s after t4's last prompt its progress ring is gone",
+  "max-top-edge-click: in the maximized window a click at the very top screen edge selected t1",
+  "max-close-top-edge: a click at the top edge of t3's close column closed t3",
+  "twelve-tabs: twelve tabs overflow: scroll buttons at both ends, the all-tabs button, fades at the clipped ends; the active tab keeps its minimum width and close button",
+  "scrolled-back: the scroll back button moved the strip by 50 DIP",
+  "wheel-scrolled: the wheel over the tab bar scrolled the strip",
+  "all-tabs-menu: the all-tabs button opened a menu listing every tab with the active one marked",
+  "active-into-view: F7 selected the first tab and the strip scrolled it into view",
+  "tab-pressed: an inactive tab held down shows the pressed fill, lighter than hover",
 ]
+
+[[step]]
+action = "resize"
+width = 1500
+height = 1000
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "type"
+text = "title t1\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^t1$"
+
+[[step]]
+action = "type"
+text = 'powershell -NoProfile -Command "Start-Sleep 6; [Console]::Write([char]7)"'
+
+[[step]]
+action = "key"
+keys = "enter"
 
 [[step]]
 action = "key"
 keys = "ctrl+shift+t"
-repeat = 2
-delay = 0.6
 
 [[step]]
 action = "sleep"
 seconds = 1.0
 
 [[step]]
-action = "capture"
-name = "three-tabs"
+action = "type"
+text = "title t2\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^t2$"
+
+[[step]]
+action = "type"
+text = "ping -n 14 127.0.0.1\n"
 
 [[step]]
 action = "key"
 keys = "ctrl+shift+t"
-repeat = 9
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "type"
+text = "title t3\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^t3$"
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+enter"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "type"
+text = "title t4\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^t4$"
+
+[[step]]
+action = "type"
+text = 'prompt $E]9;4;2;40$E\$G$S'
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 4.0
+
+[[step]]
+action = "capture"
+name = "status-glyphs"
+
+[[step]]
+action = "move"
+x = 90
+y = 24
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "tab-tooltip"
+what = "all"
+
+[[step]]
+action = "move"
+x = 274
+y = 24
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "tab-hover-close"
+
+[[step]]
+action = "mouse_down"
+x = 90
+y = 24
+button = "middle"
+
+[[step]]
+action = "mouse_up"
+x = 274
+y = 24
+button = "middle"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "middle-mismatch"
+
+[[step]]
+action = "click"
+x = 274
+y = 24
+button = "middle"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "middle-closed-frozen"
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "widths-reflowed"
+
+[[step]]
+action = "sleep"
+seconds = 12.0
+
+[[step]]
+action = "capture"
+name = "progress-expired"
+
+[[step]]
+action = "click"
+x = -69
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "click"
+x = 90
+y = 1
+
+[[step]]
+action = "wait_title"
+pattern = "^t1$"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "max-top-edge-click"
+
+[[step]]
+action = "click"
+x = 474
+y = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "max-close-top-edge"
+
+[[step]]
+action = "click"
+x = -69
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+repeat = 10
 delay = 0.5
 
 [[step]]
@@ -36,3 +287,92 @@ seconds = 1.5
 [[step]]
 action = "capture"
 name = "twelve-tabs"
+
+[[step]]
+action = "click"
+x = 24
+y = 24
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "scrolled-back"
+
+[[step]]
+action = "wheel"
+x = 300
+y = 24
+delta = -240
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "wheel-scrolled"
+
+[[step]]
+action = "click"
+x = 704
+y = 24
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "all-tabs-menu"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_title"
+pattern = "^t1$"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "active-into-view"
+
+[[step]]
+action = "mouse_down"
+x = 300
+y = 24
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "tab-pressed"
+
+[[step]]
+action = "mouse_up"
+x = 300
+y = 24
