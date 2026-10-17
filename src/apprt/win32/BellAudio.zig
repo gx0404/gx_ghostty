@@ -739,6 +739,28 @@ test "bell audio WinMM structures match Windows SDK ABI offsets" {
     try t.expectEqual(@as(usize, if (@sizeOf(usize) == 8) 24 else 16), @offsetOf(WaveHeader, "flags"));
 }
 
+fn awaitNativeCount(player: *Player, counter: *std.atomic.Value(usize), value: usize) !void {
+    std.debug.assert(@import("builtin").is_test);
+    for (0..300) |_| {
+        if (counter.load(.acquire) >= value) return;
+        if (player.faulted.load(.acquire)) {
+            // The worker publishes its issue before faulted. Only a missing
+            // device/driver on the first open is an unavailable test host;
+            // every other failure, including later device loss, is a failure.
+            const issue = player.issue.load(.acquire);
+            const kind = issue >> 32;
+            const code: u32 = @truncate(issue);
+            if (kind == @as(u64, @intFromEnum(Operation.open)) + 1 and
+                (code == 2 or code == 6) and // MMSYSERR_BADDEVICEID / MMSYSERR_NODRIVER
+                player.started.load(.acquire) == 0)
+                return error.SkipZigTest;
+            return error.NativeAudioFailed;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    return error.WorkerTimeout;
+}
+
 test "bell audio native WinMM silent buffer completion reset and release" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
@@ -754,13 +776,13 @@ test "bell audio native WinMM silent buffer completion reset and release" {
         player.flushRetained() catch @panic("native silent test did not release ownership");
     }
     try player.request(path, 1);
-    try Observer.awaitCount(&player.completed, 1);
+    try awaitNativeCount(player, &player.completed, 1);
     const native = &player.state.backend;
     try t.expectEqualSlices(u8, &.{ 0, 0 }, player.state.cache.?.wave.samples());
     try t.expect(native.header.data == player.state.cache.?.wave.samples().ptr);
     try t.expect(native.handle == null and !native.prepared);
     try player.request(path, 1);
-    try Observer.awaitCount(&player.started, 2);
+    try awaitNativeCount(player, &player.started, 2);
     player.destroy();
     destroyed = true;
     try t.expect(w32.WaitForSingleObject(player.finished_event, 0) == w32.WAIT_OBJECT_0);
@@ -863,6 +885,72 @@ const Script = struct {
         try Observer.awaitCount(&self.calls[@intFromEnum(operation)], count);
     }
 };
+
+test "bell audio native wait skips only initial no-device open failures and worker releases resources" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try testFile(tmp.dir, "bell.wav", 0);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "bell.wav", t.allocator);
+    defer t.allocator.free(path);
+    const Case = struct { operation: Operation = .open, code: u32, expected: anyerror };
+    for ([_]Case{
+        .{ .code = 2, .expected = error.SkipZigTest }, // MMSYSERR_BADDEVICEID
+        .{ .code = 6, .expected = error.SkipZigTest }, // MMSYSERR_NODRIVER
+        .{ .code = 4, .expected = error.NativeAudioFailed }, // MMSYSERR_ALLOCATED
+        .{ .code = 7, .expected = error.NativeAudioFailed }, // MMSYSERR_NOMEM
+        .{ .code = 32, .expected = error.NativeAudioFailed }, // WAVERR_BADFORMAT
+        .{ .operation = .prepare, .code = 2, .expected = error.NativeAudioFailed },
+        .{ .operation = .write, .code = 6, .expected = error.NativeAudioFailed },
+    }) |case| {
+        var script: Script = .{};
+        script.errors[@intFromEnum(case.operation)].store(case.code, .release);
+        const player = try Player.create(t.allocator, .{ .api = script.api() });
+        player.retain();
+        defer {
+            player.destroy();
+            player.flushRetained() catch @panic("no-device test did not release ownership");
+        }
+        try player.request(path, 1);
+        // A failed open must finish without needing a destroy request or a
+        // playback-completion event. Inspect native fields only after exit.
+        try t.expect(w32.WaitForSingleObject(player.thread.getHandle(), 5000) == w32.WAIT_OBJECT_0);
+        try t.expect(player.faulted.load(.acquire));
+        try t.expect(!player.cache_present.load(.acquire));
+        try t.expect(!script.loan.load(.acquire));
+        try t.expect(player.state.backend.handle == null);
+        try t.expect(player.state.backend.event == null);
+        try t.expect(!player.state.backend.prepared);
+        try t.expectEqual(@as(usize, 0), player.started.load(.acquire));
+        try t.expectEqual(@as(usize, 0), player.completed.load(.acquire));
+        try t.expectError(error.PlayerFaulted, player.request(path, 1));
+        try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+        try t.expectError(case.expected, awaitNativeCount(player, &player.completed, 1));
+    }
+}
+
+test "bell audio native wait does not skip device loss after successful playback" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try testFile(tmp.dir, "bell.wav", 0);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "bell.wav", t.allocator);
+    defer t.allocator.free(path);
+    var script: Script = .{};
+    const player = try Player.create(t.allocator, .{ .api = script.api() });
+    player.retain();
+    defer {
+        player.destroy();
+        player.flushRetained() catch @panic("device-loss test did not release ownership");
+    }
+    try player.request(path, 1);
+    try awaitNativeCount(player, &player.completed, 1);
+    script.errors[@intFromEnum(Operation.open)].store(2, .release);
+    try player.request(path, 1);
+    try t.expect(w32.WaitForSingleObject(player.thread.getHandle(), 5000) == w32.WAIT_OBJECT_0);
+    try t.expectEqual(@as(usize, 1), player.started.load(.acquire));
+    try t.expectError(error.NativeAudioFailed, awaitNativeCount(player, &player.started, 2));
+}
 
 test "bell audio permanent close after unprepare must not block Worker destroy" {
     const t = std.testing;

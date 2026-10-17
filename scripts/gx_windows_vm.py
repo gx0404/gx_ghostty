@@ -12,7 +12,12 @@ QEMU human monitor inside the container.
   up                 start one VM attached and hold a heavy gx_slots slot for its whole runtime;
                      refuses while another owned VM runs; never pulls (--pull never). compose.yaml
                      must equal the generated file; an existing container must match its owner
-                     label, image, compose file, mounts and UUID, else --replace-container <ID>
+                     label, image, compose file, mounts and UUID, else --replace-container <ID>.
+                     A replaced container from another compose project (for example one created
+                     before machine.json existed) is removed by its exact ID first ("rebind"):
+                     compose cannot recreate a fixed container_name it does not own. Its disk is a
+                     bind mount under --root and is kept; containers with other mounts are refused.
+                     --dry-run prints that plan and changes nothing
   stop               ACPI shutdown through docker compose stop; storage and disk are kept
   identity           live SMBIOS UUID (HMP info uuid) compared with machine.json
   screenshot         HMP screendump of the VM screen to a new PNG
@@ -277,6 +282,56 @@ def binding_errors(data: dict, root: Path, version: str) -> list[str]:
     if env.get("HOST") != expected["machine"]["host"]:
         errors.append("guest HOST differs from machine.json")
     return errors
+
+
+def disk_facts(root: Path, version: str) -> dict:
+    """The VM disk a (re)created container will boot; read-only."""
+    disk = Path(root).resolve() / version / "storage" / "data.qcow2"
+    if not disk.is_file():
+        return {"path": str(disk), "exists": False}
+    stat = disk.stat()
+    return {"path": str(disk), "exists": True, "size": stat.st_size,
+            "modified_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()}
+
+
+def plan_up(root: Path, version: str, docker: Docker, replace_container: str | None = None) -> dict:
+    """How up would start version without changing anything: reuse, create, replace or rebind.
+
+    replace: the stopped owned container belongs to this compose project, so compose
+    --force-recreate replaces it. rebind: it belongs to another project (or none), so compose
+    would collide with the fixed container_name; up removes exactly that container first."""
+    root = Path(root).resolve()
+    plan = {"version": version, "container": container_name(version), "machine": machine_identity(root, version),
+            "disk": disk_facts(root, version), "mode": "create", "remove_container": None, "binding_errors": []}
+    data = inspect_container(docker, version)
+    if data is None:
+        return plan
+    full_id = data.get("Id", "")
+    config = data.get("Config") or {}
+    labels = config.get("Labels") or {}
+    plan["existing"] = {"id": full_id, "running": bool((data.get("State") or {}).get("Running")),
+                        "compose_project": labels.get("com.docker.compose.project")}
+    errors = binding_errors(data, root, version)
+    if not errors:
+        plan["mode"] = "reuse"
+        return plan
+    plan["binding_errors"] = errors
+    owned = labels.get("gx.owner") == OWNER and config.get("Image") == IMAGE
+    if (not replace_container or len(replace_container) < 12 or not full_id.startswith(replace_container)
+            or not owned or plan["existing"]["running"]):
+        raise VmError(f"{container_name(version)} ({full_id[:12]}) does not match this VM root: "
+                      + "; ".join(errors) + ". Inspect it; pass --replace-container <its ID> only "
+                      "for a stopped owned container that may be replaced (bind-mounted disks are kept).")
+    other = sorted({str(item.get("Type")) for item in data.get("Mounts") or [] if item.get("Type") != "bind"})
+    if other:
+        raise VmError(f"{container_name(version)} has non-bind mounts ({', '.join(other)}); replacing it could "
+                      "detach their data, so nothing was changed")
+    if labels.get("com.docker.compose.project") == container_name(version):
+        plan["mode"] = "replace"
+    else:
+        plan["mode"] = "rebind"
+        plan["remove_container"] = full_id
+    return plan
 
 
 def inspect_container(docker: Docker, version: str) -> dict | None:
@@ -588,12 +643,13 @@ def screenshot(docker: Docker, version: str, destination: Path) -> dict:
 
 
 def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: float,
-       replace_container: str | None = None) -> int:
+       replace_container: str | None = None, dry_run: bool = False) -> int:
     """Run the VM attached while holding one heavy gx_slots slot.
 
     The compose file must equal the generated pinned configuration byte for byte. An existing
     container is reused only if its binding matches (no recreation); a mismatched container is
-    refused unless its exact ID is passed as replace_container and it is stopped and owned."""
+    refused unless its exact ID is passed as replace_container and it is stopped and owned
+    (plan_up). dry_run reports the plan without a slot, removal or compose call."""
     sys.path.insert(0, str(SCRIPTS))
     import gx_slots
 
@@ -602,29 +658,27 @@ def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: f
     machine = machine_identity(root, version)
     if compose.read_text(encoding="utf-8") != compose_text(version, machine):
         raise VmError("compose.yaml is not the generated pinned, UUID-bound configuration; run prepare first")
+    if dry_run:
+        running = [container_name(other) for other in MEDIA if container_state(docker, other)["running"]]
+        plan = plan_up(root, version, docker, replace_container)
+        print(json.dumps({"event": "compose-up-plan", "dry_run": True, "running_owned_vms": running, **plan}, indent=2),
+              flush=True)
+        return 0
     docker.run("image", "inspect", IMAGE)  # must already be cached; never pulled
     with gx_slots.acquire(SLOTS, "heavy", slot_timeout):
         for other in MEDIA:
             if container_state(docker, other)["running"]:
                 raise VmError(f"{container_name(other)} is already running; only one owned VM may run")
-        data = inspect_container(docker, version)
-        mode, record = "create", None
-        if data is not None:
-            errors = binding_errors(data, root, version)
-            if not errors:
-                mode = "reuse"
-            else:
-                full_id = data.get("Id", "")
-                config = data.get("Config") or {}
-                owned = (config.get("Labels") or {}).get("gx.owner") == OWNER and config.get("Image") == IMAGE
-                if (not replace_container or len(replace_container) < 12 or not full_id.startswith(replace_container)
-                        or not owned or (data.get("State") or {}).get("Running")):
-                    raise VmError(f"{container_name(version)} ({full_id[:12]}) does not match this VM root: "
-                                  + "; ".join(errors) + ". Inspect it; pass --replace-container <its ID> only "
-                                  "for a stopped owned container that may be replaced (bind-mounted disks are kept).")
-                mode = "replace"
-                record = {"replaced_container": full_id, "binding_errors": errors, "utc": utc_now()}
-        extra = {"reuse": ["--no-recreate"], "replace": ["--force-recreate"], "create": []}[mode]
+        plan = plan_up(root, version, docker, replace_container)
+        mode, record = plan["mode"], None
+        if mode in ("replace", "rebind"):
+            record = {"replaced_container": plan["existing"]["id"], "binding_errors": plan["binding_errors"],
+                      "disk": plan["disk"], "utc": utc_now()}
+        if plan["remove_container"]:
+            # Exact full ID of the stopped, owned container: no -f, no -v; bind-mounted disks stay.
+            docker.run("rm", plan["remove_container"])
+            record["removed_before_create"] = True
+        extra = {"reuse": ["--no-recreate"], "replace": ["--force-recreate"], "rebind": [], "create": []}[mode]
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("ab") as stream:
             child = subprocess.Popen(
@@ -736,6 +790,8 @@ GL 只签真实 native renderer/window 与正常关闭；VM 无 GPU 时随包 Me
 安装前冲突：干净用户状态下，分别以 Group=AppPath/Background/Directory/ShellIdentity 新 RunId 执行 seed-foreign-before，再 expect-install-refused（须退出码 7 且日志含对应具体原因），最后 check-preserved、cleanup-foreign。
 
 干净卸载必须同时删除 App Paths、两组右键菜单、AUMID 与 Toast CLSID 键。首次账户检查不证明后续登录/实际权限操作；静态测试不代旧版升级、真实 registry、Toast/JumpList、DND/冷暖激活或 GUI 验收。安装器/卸载器等待有界，超时保留 owned PID 信息，不强杀未知进程。
+
+r6 相位 run-config、osc52、toast-matrix、jumplist-matrix、narrator、cross-account、dpi 用 -Action 分步执行（start/status/collect/stop 等，每个相位只接受自己的步骤），记录写在 Runs\\<RunId>\\records，每份报告带 before、after 与 restore。只关闭本夹具启动或明确收编的进程；剪贴板只在 osc52 里由终端内探针写入测试内容；改动的设置（通知、真实配置、讲述人、DPI、JumpList ACL）都先备份再恢复；跨账户密码只经宿主 type-secret 输入。
 """)
     return destination
 
@@ -881,6 +937,7 @@ def main() -> int:
     parser.add_argument("--slot-timeout", type=float, default=0)
     parser.add_argument("--replace-container", help="up: exact ID (12+ hex) of a stopped, owned but mismatched "
                         "container that may be recreated from the pinned compose; disks are bind mounts and kept")
+    parser.add_argument("--dry-run", action="store_true", help="up: print the reuse/create/replace/rebind plan only")
     parser.add_argument("--app", type=Path, help="rehearsal-layout: old ghostty.exe")
     parser.add_argument("--share", type=Path, help="rehearsal-layout: prefix share/ directory")
     parser.add_argument("--cache-dir", type=Path)
@@ -912,6 +969,9 @@ def main() -> int:
         if args.command == "status":
             print(json.dumps({version: container_state(docker, version) for version in MEDIA}, indent=2))
         elif args.command == "up":
+            if args.dry_run:
+                return up(root, args.version, docker, Path(os.devnull), args.slot_timeout, args.replace_container,
+                          dry_run=True)
             if args.out is None:
                 raise VmError("up requires --out for the compose log")
             return up(root, args.version, docker, args.out.resolve(), args.slot_timeout, args.replace_container)

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,42 @@ if str(SCRIPTS) not in sys.path:
 import gx_wsl  # noqa: E402
 
 CLONE = "~/src/gx_ghostty"
+
+
+def wait_for_task_exit(task: Path, timeout: float = 5.0) -> None:
+    """Wait for kernel task teardown, which can finish after Thread.join()."""
+    deadline = time.monotonic() + timeout
+    while task.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"joined worker still present in {task}")
+        time.sleep(0.01)
+
+
+class TaskExitTests(unittest.TestCase):
+    def test_joined_worker_can_remain_visible_until_kernel_teardown(self):
+        task = mock.Mock(spec=Path)
+        task.exists.side_effect = [True, True, False]
+        with mock.patch(__name__ + ".time.monotonic", side_effect=[0, 0.1, 0.2]), \
+                mock.patch(__name__ + ".time.sleep") as sleep:
+            wait_for_task_exit(task)
+        self.assertEqual(3, task.exists.call_count)
+        self.assertEqual([mock.call(0.01), mock.call(0.01)], sleep.call_args_list)
+
+    def test_missing_task_does_not_wait(self):
+        task = mock.Mock(spec=Path)
+        task.exists.return_value = False
+        with mock.patch(__name__ + ".time.sleep") as sleep:
+            wait_for_task_exit(task)
+        sleep.assert_not_called()
+
+    def test_worker_that_never_exits_fails_at_deadline(self):
+        task = mock.Mock(spec=Path)
+        task.exists.return_value = True
+        with mock.patch(__name__ + ".time.monotonic", side_effect=[0, 5]), \
+                mock.patch(__name__ + ".time.sleep") as sleep:
+            with self.assertRaisesRegex(AssertionError, "joined worker still present"):
+                wait_for_task_exit(task)
+        sleep.assert_not_called()
 
 
 def prefetch_namespace() -> dict:
@@ -582,15 +619,12 @@ class PerfProgramTests(unittest.TestCase):
         thread = threading.Thread(target=worker)
         thread.start()
         thread.join()
-        # join() returns once the Python thread is done; on a busy machine its kernel task can
-        # linger a moment, so wait (bounded) for it to exit before reading the "after" counters.
-        task = root / "task" / str(native[0])
-        deadline = time.monotonic() + 5
-        while task.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertFalse(task.exists(), "worker thread still listed 5 s after join")
-        after_proc, after_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
+        # CPython releases the join lock before the native thread finishes
+        # exiting. Sample only after Linux has removed that task and folded
+        # its CPU time into the process counters; keep the population check.
+        wait_for_task_exit(root / "task" / str(native[0]))
         self.assertEqual(population, {path.name for path in (root / "task").iterdir()})
+        after_proc, after_main = stat(root / "stat"), stat(root / "task" / pid / "stat")
         process_delta = sum(after_proc[key] - before_proc[key] for key in ("utime", "stime"))
         main_delta = sum(after_main[key] - before_main[key] for key in ("utime", "stime"))
         self.assertGreaterEqual(process_delta - main_delta, int(cpu[0] * os.sysconf("SC_CLK_TCK")) - 4)

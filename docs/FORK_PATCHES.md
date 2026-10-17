@@ -1418,6 +1418,7 @@ python -m unittest scripts.test_fork_patches -v
 - 可选 `gx_binding_route` 默认 `null`。未安装时上述条件全部回到上游路径：立即弹出一次性表、复制后立即清除选区、不调用远程回调。安装方只有 Windows `src/apprt/win32/RemoteSource.zig`（源端终端被远程视图承载时安装、撤销时置回 `null`）；实现真源还有 `src/gx/remote_binding.zig`。
 - 源解析 keytable、序列、动作链与标志；目标 UI 动作经认证 IPC，在实际结果返回后恢复续延。每叶一个挂起续延，输入队列有界；代次变化与断连不重放已执行动作。
 - 延迟完成只弹出原匹配的那次一次性表激活（按激活代次 `gx_generation` 区分），不弹出等待期间新激活的表；performable 未执行时 `gxCompleteBinding` 返回 true，调用方在 `gx_binding_bypass` 下把原按键编码一次。远程复制只在目标回执实际完成后经 `gxCompleteClipboardCopy` 清除仍相同的选区；kitty 剪贴板写入经 `gxCompleteClipboardWrite` 按回执报 DONE 或 EPERM。
+- `gxPopOnceTable` 对需要通知 UI 的栈顶弹出做编译期 apprt 检查：`none` 返回 `UnsupportedAppRuntime` 并保留活动键表，不引用完整动作分派；移除被新激活表覆盖的旧表与忽略过期回执仍可在 `none` 核心测试中验证。真实 apprt 继续使用上游 `deactivate_key_table`，不修改 `App.zig` 或为 `none` 伪造 UI 接口。
 - 同步时核查可选 hook、配置变更、绑定完成副作用和剪贴板回执薄接线；Windows UI 与 IPC 实现保持在 fork 模块。
 - 移除条件：上游提供等价的异步绑定续延与远程视图接口后移除本钩子。
 - 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0044ShapeTests` 锁定默认 `null`、远程调用只在门控内、改动行紧邻标记）；remote_protocol/remote_binding/RemoteSource 定向测试、Windows/GTK 标准构建、真实远程链式绑定、once、performable 和断连取消。最终实树验证前保持 PENDING。

@@ -3335,6 +3335,10 @@ fn gxPopOnceTable(self: *Surface, table: GxOnceTable) !void {
     for (self.keyboard.table_stack.items, 0..) |active, i| {
         if (active.set != table.set or active.gx_generation != table.generation) continue;
         if (i + 1 == self.keyboard.table_stack.items.len) {
+            // The active table needs an apprt notification. Keep the full
+            // binding dispatcher out of none-runtime core tests; removing a
+            // covered activation below remains independent of the apprt.
+            if (comptime apprt.runtime == apprt.none) return error.UnsupportedAppRuntime;
             _ = try self.performBindingAction(.deactivate_key_table);
         } else {
             // A chained action activated another table while awaiting a UI
@@ -3375,6 +3379,12 @@ test "gx.remote_binding once completion preserves newer table activations" {
     // A stale completion must not pop a later activation of the same table.
     try surface.gxPopOnceTable(.{ .set = &newer, .generation = 2 });
     try std.testing.expectEqual(@as(usize, 1), surface.keyboard.table_stack.items.len);
+    if (comptime apprt.runtime == apprt.none) {
+        // No UI notification can be delivered, so retain the active table.
+        try std.testing.expectError(error.UnsupportedAppRuntime, surface.gxPopOnceTable(.{ .set = &newer, .generation = 4 }));
+        try std.testing.expectEqual(@as(usize, 1), surface.keyboard.table_stack.items.len);
+        try std.testing.expect(surface.keyboard.table_stack.items[0].set == &newer);
+    }
 }
 // fork(gx): GX-0044 end
 
