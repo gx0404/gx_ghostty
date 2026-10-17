@@ -203,6 +203,8 @@ class QuietTests(unittest.TestCase):
         result = gx_perf.quiet_snapshot(self.args, self.probe)
         self.assertEqual(0, result['exit'])
         self.assertTrue(result['quiet'])
+        self.assertTrue(result['plan_compliant'])
+        self.assertTrue(result['thresholds_plan_compliant'])
         self.probe.cpu.side_effect = OSError('PDH missing')
         self.assertEqual(0, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
 
@@ -265,6 +267,7 @@ class QuietTests(unittest.TestCase):
         self.args.idle_seconds = 5
         result = gx_perf.quiet_snapshot(self.args, self.probe)
         self.assertFalse(result['plan_compliant'])
+        self.assertFalse(result['thresholds_plan_compliant'])
         self.assertNotIn('private', json.dumps(result))
         self.assertEqual(['ToDesk'], result['checks']['blacklist']['raw'][0]['matches'])
         self.probe.session.return_value = {'interactive_console': False}
@@ -361,6 +364,11 @@ class QuietBatchTests(unittest.TestCase):
         for name in ('before', 'after'):
             data = json.loads((args.out / (name+'.json')).read_text())
             self.assertEqual('all four locks held by this batch', data['checks']['slots']['reason'])
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual(('gx-quiet-batch-v2', 'VALID', 'VALID', 'COMPLETE', True, True),
+                         (result['schema'], result['status'], result['quiet_status'], result['measurement'],
+                          result['quiet_valid'], result['plan_compliant']))
+        self.assertTrue((args.out / 'SUMMARY.txt').read_text().startswith('VALID exit=0 quiet=VALID measurement=COMPLETE'))
 
     def test_before_busy_never_runs_command_and_after_busy_invalidates(self):
         args = self.batch_args()
@@ -369,13 +377,16 @@ class QuietBatchTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
         runner.assert_not_called()
+        result = json.loads((args.out/'RESULT.json').read_text())
+        self.assertEqual(('NOT_STARTED', 'NOT_MET', 'NOT_RUN'), (result['status'], result['quiet_status'], result['measurement']))
         args.out = args.out.parent / 'second'
         self.probe.input_ticks.side_effect = [ticks(600), ticks(5)]
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
         result = json.loads((args.out/'RESULT.json').read_text())
-        self.assertEqual('INVALID', result['status'])
-        self.assertFalse(result['batch_valid'])
+        self.assertEqual(('INVALID', 'INVALID', 'COMPLETE'), (result['status'], result['quiet_status'], result['measurement']))
+        self.assertFalse(result['quiet_valid'])
+        self.assertFalse(result['plan_compliant'])
 
     def test_uninjected_end_check_rejects_any_input_after_the_start(self):
         start = 0xFFFFFF00  # the tick clock wraps during this batch
@@ -395,21 +406,83 @@ class QuietBatchTests(unittest.TestCase):
                 self.assertEqual(1200, after['raw']['batch_seconds'])
                 self.assertEqual(start, after['raw']['batch_start_tick'])
 
-    def test_missing_or_failed_guards_and_command_exception_are_invalid(self):
-        args = self.batch_args('--injected-input')
-        for index, failure in enumerate(('missing', 'failed', 'exception')):
-            args.out = self.args.out.parent / f'bad-{index}'
-            def runner(command, **kwargs):
-                if failure == 'exception':
-                    raise RuntimeError('child setup')
-                if failure == 'failed':
-                    row = {'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'], 'event': 'guard', 'status': 'fail'}
-                    Path(kwargs['env']['GX_PERF_GUARD_LOG']).write_text(json.dumps(row)+'\n')
-                return SimpleNamespace(returncode=0)
-            with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
-                self.assertNotEqual(0, gx_perf.run_quiet_batch(args, self.probe, runner))
-            self.assertEqual('INVALID', json.loads((args.out/'RESULT.json').read_text())['status'])
+    def run_batch(self, args, runner):
+        with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
+            code = gx_perf.run_quiet_batch(args, self.probe, runner)
+        return code, json.loads((args.out / 'RESULT.json').read_text())
 
+    @staticmethod
+    def command(code=0, guard=None):
+        def runner(command, **kwargs):
+            if code == 'raise':
+                raise RuntimeError('child setup')
+            if guard:
+                row = {'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'], 'event': 'guard', 'status': guard}
+                Path(kwargs['env']['GX_PERF_GUARD_LOG']).write_text(json.dumps(row) + '\n', encoding='utf-8')
+            return SimpleNamespace(returncode=code)
+        return runner
+
+    def test_gate_fail_under_valid_checks_is_fail_not_invalid(self):
+        cases = [  # (flags, command exit, guard, exit, status, quiet, measurement)
+            ((), 4, None, 4, 'FAIL', 'VALID', 'GATE_FAIL'),
+            (('--injected-input',), 4, 'pass', 4, 'FAIL', 'VALID', 'GATE_FAIL'),
+            ((), 1, None, 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
+            (('--injected-input',), 1, 'pass', 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
+            # The driver failed before its first input: the input criterion is not applicable, not failed.
+            (('--injected-input',), 1, None, 2, 'ERROR', 'UNVERIFIED', 'DRIVER_ERROR'),
+            (('--injected-input',), 'raise', None, 2, 'ERROR', 'UNVERIFIED', 'DRIVER_ERROR'),
+        ]
+        for index, (flags, code, guard, expected, status, quiet, measurement) in enumerate(cases):
+            args = self.batch_args(*flags)
+            args.out = self.args.out.parent / f'case-{index}'
+            with self.subTest(flags=flags, code=code, guard=guard):
+                exit_code, result = self.run_batch(args, self.command(code, guard))
+                self.assertEqual((expected, status, quiet, measurement),
+                                 (exit_code, result['status'], result['quiet_status'], result['measurement']))
+                self.assertEqual(quiet == 'VALID', result['quiet_valid'])
+                self.assertEqual(None if code == 'raise' else code, result['command_exit'])
+        after = json.loads((self.args.out.parent / 'case-4' / 'after.json').read_text())
+        self.assertEqual('not_applicable', after['checks']['input']['status'])
+        self.assertEqual(['input'], after['unverified_checks'])
+        self.assertFalse(after['quiet'])
+        summary = (self.args.out.parent / 'case-0' / 'SUMMARY.txt').read_text()
+        self.assertIn('never rerun to replace it', summary)
+
+    def test_guard_evidence_failures_are_invalid_or_tool_errors(self):
+        for index, (code, guard, expected, status) in enumerate(((0, None, 2, 'ERROR'), (0, 'fail', 3, 'INVALID'),
+                                                                  (1, 'fail', 3, 'INVALID'))):
+            args = self.batch_args('--injected-input')
+            args.out = self.args.out.parent / f'guard-{index}'
+            with self.subTest(code=code, guard=guard):
+                exit_code, result = self.run_batch(args, self.command(code, guard))
+                self.assertEqual((expected, status), (exit_code, result['status']))
+        foreign = self.args.out.parent / 'foreign.jsonl'
+        foreign.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'other', 'event': 'guard', 'status': 'pass'}) + '\n')
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.guard_evidence(foreign, 'mine', command_failed=True)
+        release = self.args.out.parent / 'release.jsonl'
+        release.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'b', 'event': 'release', 'status': 'fail', 'reason': 'UIPI'}) + '\n')
+        with self.assertRaisesRegex(gx_perf.PerfError, 'UIPI'):
+            gx_perf.guard_evidence(release, 'b')
+
+    def test_noncompliant_thresholds_mode_mismatch_and_end_check_errors(self):
+        args = self.batch_args('--idle-seconds', '5')
+        self.probe.input_ticks.return_value = ticks(30)
+        exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((5, 'NONCOMPLIANT', 'VALID', False, False),
+                         (exit_code, result['status'], result['quiet_status'], result['plan_compliant'], result['thresholds_plan_compliant']))
+        self.assertIn('plan_compliant=false', (args.out / 'SUMMARY.txt').read_text())
+        self.probe.input_ticks.return_value = ticks(600)
+        args = self.batch_args()
+        args.out = self.args.out.parent / 'mismatch'
+        exit_code, result = self.run_batch(args, self.command(0, guard='pass'))
+        self.assertEqual((2, 'ERROR'), (exit_code, result['status']))
+        self.assertIn('--injected-input was not given', ' '.join(result['errors']))
+        args = self.batch_args()
+        args.out = self.args.out.parent / 'end-error'
+        self.probe.wsl.side_effect = [{'running': False, 'processes': []}, OSError('wsl.exe vanished')]
+        exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((2, 'ERROR', 'ERROR', 'COMPLETE'), (exit_code, result['status'], result['quiet_status'], result['measurement']))
 
 class CounterTests(unittest.TestCase):
     def test_nt_snapshot_decoder_rejects_truncation_and_foreign_threads(self):
