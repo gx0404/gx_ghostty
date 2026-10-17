@@ -34,6 +34,7 @@ from ctypes import wintypes as wt
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -45,6 +46,21 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import gx_slots
 import gx_win_gui as gui
 from gx_ole_fixture import OwnedDrag, wait, timeout_snapshot
+from gx_fixture_evidence import write_review, fixture_slots
+
+
+def require_broker_preview(case, stage, title):
+    if stage != "broker-preview":
+        raise ValueError("the protected-paste dialog can only be cancelled by this fixture")
+    if case == "multiline" and title != "Paste into elevated terminal?":
+        raise ValueError("multiline allow requires the exact English broker-preview title")
+
+
+def receipt_rows(text, pid):
+    return [{"pid": int(source), "request": int(request), "outcome": outcome}
+            for source, request, outcome in re.findall(
+                r"fixture_receipt pid=(\d+) request=(\d+) outcome=(pasted|cancelled|rejected|target_gone|expired|paste_failed)\b", text)
+            if int(source) == pid]
 
 
 def digest(path):
@@ -218,7 +234,7 @@ def start_target(args, config):
     path = args.root / f"target-{args.integrity}.json"
     if path.exists():
         raise ValueError("target manifest already exists; use a fresh fixture root")
-    instance = gui.launch(Path(config["exe"]), args.root / "profile")
+    instance = gui.launch(Path(config["exe"]), args.root / "profile", env={"GHOSTTY_GX_REMOTE_TEST": "1"})
     value = record(instance, config)
     save(path, value)  # Preserve ownership even if startup fails.
     instance.wait_window(15)
@@ -252,7 +268,7 @@ def drop(args, config):
             # linked-token creation, Explorer launch, registry or UIPI change.
             cli = ["--gx-shell-action=drop-companion", f"--gx-drop-target-pid={target.pid}",
                    f"--gx-drop-target-birth={target.creation}"]
-            helper = gui.launch(Path(config["exe"]), args.root / "profile", args=cli)
+            helper = gui.launch(Path(config["exe"]), args.root / "profile", args=cli, env={"GHOSTTY_GX_REMOTE_TEST": "1"})
             helper_data = record(helper, config)
             require_level("medium", helper.pid)
             report["companion"] = helper_data
@@ -357,10 +373,12 @@ def inspect_or_respond(args, config):
                 raise gui.InputBlocked("confirmation identity/foreground changed; no input sent")
         guard_popup()
         if args.decision == "allow":
-            if report["case"] == "multiline":
-                raise ValueError("multiline approval is manual-only; this fixture can cancel its protection dialog")
+            require_broker_preview(report["case"], args.stage, popup.title)
             if args.x is None or args.y is None or gui.win32().window_at(args.x, args.y) != popup.hwnd:
                 raise ValueError("allow requires reviewed button coordinates inside the exact popup")
+            if args.delay_ms:
+                time.sleep(args.delay_ms / 1000)
+                guard_popup()
             target.mouse(args.x, args.y)
         else:
             target.press("escape")
@@ -372,6 +390,31 @@ def inspect_or_respond(args, config):
         companion.capture_window(companion.require_window(), "screen").save_png(work / f"companion-{stamp}.png")
     save(work / f"observation-{stamp}.json", evidence)
     print(json.dumps(evidence, indent=2))
+
+
+def receipt(args, config):
+    work = case_path(args.root, args.name)
+    report = json.loads((work / "report.json").read_text(encoding="utf-8"))
+    companion = owner(report["companion"], config, companion=True)
+    same_session(require_level("medium"), report["companion"]["token"])
+    rows = []
+    for path in (companion.log, companion.log.with_name(companion.log.name + ".1")):
+        if path.exists():
+            rows.extend(receipt_rows(path.read_text(encoding="utf-8", errors="replace"), companion.pid))
+    case_id = {"rejected": "BRK-01", "expired": "BRK-02", "target_gone": "BRK-03", "cancelled": "BRK-04", "pasted": "BRK-05", "paste_failed": "BRK-06"}[args.expect]
+    companion.activate()
+    image = f"{case_id}-receipt.png"
+    companion.capture_window(companion.require_window(), "screen").save_png(work / image)
+    # Missing logging is not proof that the GUI receipt happened. It is an
+    # explicit integration dependency, and keeps the native case pending.
+    status = "PENDING" if not rows else ("PASS" if rows[-1]["outcome"] == args.expect else "FAIL")
+    result = {"case_id": case_id, "boundary": "R5-04 broker final receipt", "environment": "VM medium/high split token",
+              "status": status, "expected": args.expect, "rows": rows, "companion": report["companion"],
+              "reason": "requires test-gated DropCompanion fixture_receipt diagnostic" if not rows else None}
+    save(work / f"{case_id}-native.json", result)
+    write_review(work, case_id, result["boundary"], result["environment"], status, [image], observation=result)
+    print(json.dumps(result, indent=2))
+    return 2 if status == "PENDING" else int(status == "FAIL")
 
 
 def close(args, config):
@@ -392,9 +435,10 @@ def close(args, config):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("setup", "target", "drop", "inspect", "respond", "close"):
+    for name in ("setup", "target", "drop", "inspect", "respond", "receipt", "close"):
         command = sub.add_parser(name)
         command.add_argument("--root", type=Path, required=True)
+        command.add_argument("--desktop-held", action="store_true", help="caller already holds Invoke-Desktop")
         if name == "setup":
             for item in ("exe", "source"):
                 command.add_argument(f"--{item}", type=Path, required=True)
@@ -402,7 +446,7 @@ def main():
             command.add_argument("--source-sha256", required=True)
         if name == "target":
             command.add_argument("--integrity", choices=("medium", "high"), required=True)
-        if name in ("drop", "inspect", "respond", "close"):
+        if name in ("drop", "inspect", "respond", "receipt", "close"):
             command.add_argument("--name", required=name != "close")
         if name == "drop":
             command.add_argument("--direction", choices=("medium-medium", "medium-high", "high-medium", "high-high"), required=True)
@@ -412,24 +456,31 @@ def main():
             command.add_argument("--decision", choices=("allow", "cancel"), required=True)
             command.add_argument("--x", type=int)
             command.add_argument("--y", type=int)
+            command.add_argument("--stage", choices=("broker-preview", "protected-paste"), default="broker-preview")
+            command.add_argument("--delay-ms", type=int, default=0, help="31000 for the expired preview case; <=32000")
+        if name == "receipt":
+            command.add_argument("--expect", choices=("pasted", "cancelled", "rejected", "target_gone", "expired", "paste_failed"), required=True)
         if name == "close":
             command.add_argument("--target", choices=("medium", "high"))
     args = parser.parse_args()
+    if getattr(args, "delay_ms", 0) not in range(32001):
+        parser.error("delay-ms must be 0..32000")
     args.root = args.root.resolve()
     if args.command == "setup":
         setup(args)
         return 0
     config = settings(args.root)
-    with gx_slots.acquire(ROOT / ".local/kernel-slots", "heavy", 45):
-        with gx_slots.acquire(ROOT / ".local/kernel-slots", "desktop", 45):
-            if args.command == "target":
-                start_target(args, config)
-            elif args.command == "drop":
-                return drop(args, config)
-            elif args.command in ("inspect", "respond"):
-                inspect_or_respond(args, config)
-            else:
-                close(args, config)
+    with fixture_slots(ROOT, args.desktop_held):
+        if args.command == "receipt":
+            return receipt(args, config)
+        if args.command == "target":
+            start_target(args, config)
+        elif args.command == "drop":
+            return drop(args, config)
+        elif args.command in ("inspect", "respond"):
+            inspect_or_respond(args, config)
+        else:
+            close(args, config)
     return 0
 
 
