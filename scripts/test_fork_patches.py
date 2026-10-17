@@ -600,6 +600,38 @@ def gx0044_problems(source: str) -> list[str]:
     return problems
 
 
+GX0043 = "GX-0043"
+WIN32_SURFACE_ZIG = "src/apprt/win32/Surface.zig"
+
+
+def gx0043_readback_problems(wgl: str, surface: str) -> list[str]:
+    """The GX-0043 readback timing: one end stamp after the successful error check of the
+    remote ReadPixels and before success, and the remote frame logs only after unlocking."""
+    lines = wgl.splitlines()
+    try:
+        _, hunks = marked_hunks(wgl, GX0043)
+    except ValueError as err:
+        return [str(err)]
+    inside = [i for begin, end in hunks for i in range(begin, end)]
+    stamps = [i for i in inside if lines[i].strip() == "remote.frame.readbackComplete();"]
+    if len(wgl.split("readbackComplete(")) != 2 or len(stamps) != 1:
+        return ["expected exactly one remote.frame.readbackComplete() inside the GX-0043 hunk"]
+    stamp = stamps[0]
+    problems: list[str] = []
+    if not (lines[stamp - 1].strip() == "try gl.errors.getError();"
+            and "remote.frame.pixels().ptr" in lines[stamp - 2]
+            and lines[stamp + 1].strip() == "success = true;"):
+        problems.append("readbackComplete must follow the remote ReadPixels error check and precede success")
+    finish = surface[surface.index("pub const RemoteFrame = struct"):]
+    finish = finish[finish.index("pub fn finish("):finish.index("\n    }\n")]
+    order = ["self.frame.finish(success);", "RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);",
+             "self.frame.logPerfSamples();"]
+    places = [finish.find(step) for step in order]
+    if -1 in places or places != sorted(places):
+        problems.append("RemoteFrame.finish must finish, unlock and only then log the perf samples")
+    return problems
+
+
 TARGET_ZIG = "src/renderer/opengl/Target.zig"
 WGL_ZIG = "src/renderer/opengl/wgl.zig"
 GX0045 = "GX-0045"
@@ -1436,6 +1468,33 @@ class Gx0044ShapeTests(unittest.TestCase):
                 self.assertEqual(self.source.count(old), 1, old)
                 problems = gx0044_problems(self.source.replace(old, new))
                 self.assertTrue(any(expected in problem for problem in problems), problems)
+
+
+class Gx0043ReadbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.wgl = (ROOT / WGL_ZIG).read_text(encoding="utf-8")
+        cls.surface = (ROOT / WIN32_SURFACE_ZIG).read_text(encoding="utf-8")
+
+    def test_readback_stamp_and_unlocked_logging(self):
+        self.assertEqual(gx0043_readback_problems(self.wgl, self.surface), [])
+
+    def test_broken_shapes_are_rejected(self):
+        stamp = "                    remote.frame.readbackComplete();\n"
+        self.assertEqual(self.wgl.count(stamp), 1)
+        dropped = gx0043_readback_problems(self.wgl.replace(stamp, ""), self.surface)
+        self.assertTrue(any("exactly one" in p for p in dropped), dropped)
+        early = self.wgl.replace(stamp, "").replace(
+            "                    try gl.errors.getError();\n                    success = true;\n",
+            stamp + "                    try gl.errors.getError();\n                    success = true;\n", 1)
+        problems = gx0043_readback_problems(early, self.surface)
+        self.assertTrue(any("must follow" in p for p in problems), problems)
+        unlock = "        std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);\n"
+        log = "        self.frame.logPerfSamples();\n"
+        self.assertEqual(self.surface.count(unlock + log), 1)
+        locked = self.surface.replace(unlock + log, log + unlock, 1)
+        problems = gx0043_readback_problems(self.wgl, locked)
+        self.assertTrue(any("only then log" in p for p in problems), problems)
 
 
 class Gx0045ShapeTests(unittest.TestCase):

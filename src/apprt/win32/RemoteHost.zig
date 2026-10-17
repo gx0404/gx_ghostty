@@ -323,8 +323,9 @@ pub const Frame = struct {
         return self.writing.lease.pixels;
     }
 
-    /// Root wires this into wgl.zig's GX-0043 block after ReadPixels and its
-    /// successful GL error check. Only capture time here, while the lock is held.
+    /// Called from wgl.zig's GX-0043 block after ReadPixels and its successful
+    /// GL error check. Only capture time here, while the lock is held; the
+    /// sample includes the synchronous wait for the GPU to finish the frame.
     pub fn readbackComplete(self: *Frame) void {
         if (self.readback_qpc != 0 and self.readback_end_qpc == 0) self.readback_end_qpc = RemotePerf.now();
     }

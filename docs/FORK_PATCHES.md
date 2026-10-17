@@ -1410,6 +1410,7 @@ python -m unittest scripts.test_fork_patches -v
 - 原因：既存终端跨宿主迁移保留源 PTY、核心 Surface 和渲染线程，目标需要有界像素流。原本隐藏窗口停止呈现，不能作为远程帧源。
 - 真源：`src/apprt/win32/RemoteHost.zig` 管理隐藏宿主和每个 Surface 的映射输出；源渲染线程在目标 FBO 已绑定时读取 BGRA，恢复 PACK/PBO/read-buffer 状态，翻转为 top-down 后提交双缓冲写槽。GUI 不调用 GL。
 - 独立 remote 锁保护映射借用，GUI 更换通道先释放锁再调用核心；尺寸变化采用新映射代次，不修改正在读取的旧槽。帧通知只置 event 和原子序号。
+- 性能（`GHOSTTY_GX_PERF=1`）：`RemoteHost.Frame.pixels` 在 `ReadPixels` 入口取 QPC，块内 GL 错误检查成功后的 `remote.frame.readbackComplete()` 只存结束戳，`remote.readback` 因此包含同步读回等待本帧 GPU 完成的时间。映射准备、翻行、发布与通知计入 `remote.map`，成功发布的 `stride*height` 计入 `remote.frame_bytes`。`Surface.RemoteFrame.finish` 先结束发布、释放 remote 锁，再输出已缓存的样本，锁内不写日志；GUI 输入戳经单写者原子快照发布，不取读回锁。关闭开关时不读时钟、不写快照、不增加渲染或输入操作。
 - 移除条件：上游提供 Windows 原生帧导出以及跨宿主 Surface 生命周期后移除此钩子。
 - 验证：帧布局、借用与翻行定向测试；标准 Windows app、原本 WGL 呈现回归、两个既存宿主实际迁移和旧窗关闭后持续输出；硬件／软件路径及输入显示延迟另实测。仅生成 BGRA 不能代证跨 host 完成。
 

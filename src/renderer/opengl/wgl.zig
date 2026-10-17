@@ -655,6 +655,7 @@ pub const Context = struct {
                     ctx.ReadBuffer.?(gl.c.GL_COLOR_ATTACHMENT0);
                     ctx.ReadPixels.?(0, 0, @intCast(target.width), @intCast(target.height), gl.c.GL_BGRA, gl.c.GL_UNSIGNED_BYTE, remote.frame.pixels().ptr);
                     try gl.errors.getError();
+                    remote.frame.readbackComplete();
                     success = true;
                 }
                 if (self.surface.gxRemoteViewDetached()) {
