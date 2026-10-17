@@ -10,6 +10,27 @@ import gx_slots
 
 
 class SlotTests(unittest.TestCase):
+    def test_probe_requires_existing_files_and_preserves_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'missing'
+            with self.assertRaises(FileNotFoundError):
+                with gx_slots.acquire(root, 'quiet', probe=True):
+                    pass
+            self.assertFalse(root.exists())
+            with gx_slots.acquire(root, 'quiet') as lease:
+                self.assertTrue(lease.verify())
+            self.assertFalse(lease.verify())
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            with gx_slots.acquire(root, 'quiet', probe=True):
+                pass
+            self.assertEqual(before, {p.name: p.read_bytes() for p in root.iterdir()})
+
+    def test_default_root_uses_git_common_dir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            common = Path(temp) / 'main' / '.git'
+            with mock.patch.object(gx_slots.subprocess, 'run', return_value=mock.Mock(stdout=str(common))):
+                self.assertEqual(common.parent / '.local/kernel-slots', gx_slots.shared_root())
+
     def test_unlock_failure_still_closes_every_owned_handle(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

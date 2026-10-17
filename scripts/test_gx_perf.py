@@ -166,7 +166,7 @@ class ParseTests(unittest.TestCase):
 class QuietTests(unittest.TestCase):
     def test_wsl_build_runner_detection_does_not_persist_command_lines(self):
         with mock.patch.object(gx_perf, 'command_output', side_effect=[
-                'Ubuntu-24.04\n', '10 python3 python3 scripts/run_unittests.py test_x\n11 ps ps -eo pid=,comm=,args=\n']):
+                'Ubuntu-24.04\n', 'Ubuntu-24.04\n', '10 python3 python3 scripts/run_unittests.py test_x\n11 ps ps -eo pid=,comm=,args=\n']):
             data = gx_perf.QuietProbe().wsl('Ubuntu-24.04')
         self.assertTrue(data['processes'][0]['build_runner'])
         self.assertFalse(data['processes'][1]['build_runner'])
@@ -219,12 +219,30 @@ class QuietTests(unittest.TestCase):
             gx_perf.run_quiet(self.args, self.probe, sleeper)
 
     def test_wsl_stopped_is_not_started_and_vm_daemon_failure_is_error(self):
-        with mock.patch.object(gx_perf, 'command_output', return_value='Other\r\n') as command:
+        with mock.patch.object(gx_perf, 'command_output', side_effect=['Ubuntu-24.04\n', '']) as command:
             self.assertFalse(gx_perf.QuietProbe().wsl('Ubuntu-24.04')['running'])
-            command.assert_called_once_with(['wsl.exe', '--list', '--running', '--quiet'])
+            self.assertEqual(2, command.call_count)
         with mock.patch.object(gx_perf, 'command_output', side_effect=gx_perf.PerfError('daemon')):
             with self.assertRaises(gx_perf.PerfError):
                 gx_perf.QuietProbe().vm(self.args.slot_root)
+
+    def test_unknown_distro_and_wrong_or_missing_slots_are_errors(self):
+        with mock.patch.object(gx_perf, 'command_output', return_value='Other\n'):
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.QuietProbe().wsl('typo')
+        with mock.patch.object(gx_perf, 'shared_slots_root', return_value=self.args.slot_root):
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.QuietProbe().slots(self.args.slot_root)
+            self.assertFalse(self.args.slot_root.exists())
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.QuietProbe().slots(Path(self.temp.name))
+
+    def test_other_running_distro_is_checked(self):
+        with mock.patch.object(gx_perf, 'command_output', side_effect=['Ubuntu-24.04\nOther\n', 'Other\n', '1 zig zig build\n']):
+            raw = gx_perf.QuietProbe().wsl('Ubuntu-24.04')
+        self.assertFalse(raw['running'])
+        self.assertEqual('Other', raw['processes'][0]['distro'])
+        self.assertEqual('zig', raw['processes'][0]['name'])
 
 
 class CounterTests(unittest.TestCase):

@@ -14,8 +14,36 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from dataclasses import dataclass
 
 ROOT = Path(__file__).resolve().parents[1]
+QUIET_NAMES = tuple(f'heavy-{number}.lock' for number in (1, 2, 3)) + ('desktop-1.lock',)
+
+
+def shared_root() -> Path:
+    result = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                            capture_output=True, text=True, encoding='utf-8', timeout=10, check=True)
+    return Path(result.stdout.strip()).parent / '.local' / 'kernel-slots'
+
+
+@dataclass
+class Lease:
+    root: Path
+    kind: str
+    streams: list
+    pid: int
+
+    def verify(self) -> bool:
+        if self.pid != os.getpid() or self.kind != 'quiet' or len(self.streams) != 4:
+            return False
+        for stream in self.streams:
+            if stream.closed:
+                return False
+            stream.seek(1)
+            meta = json.loads(stream.read().decode('ascii'))
+            if meta.get('pid') != self.pid or meta.get('kind') != 'quiet':
+                return False
+        return True
 
 
 def lock(stream) -> bool:
@@ -47,10 +75,14 @@ def unlock(stream) -> None:
 
 
 @contextmanager
-def acquire(root: Path, kind: str, timeout: float = 0):
+def acquire(root: Path, kind: str, timeout: float = 0, *, probe: bool = False):
     if kind not in ("heavy", "desktop", "quiet") or not math.isfinite(timeout) or timeout < 0:
         raise ValueError("invalid slot kind or timeout")
-    root.mkdir(parents=True, exist_ok=True)
+    if probe:
+        if not root.is_dir() or any(not (root / name).is_file() for name in QUIET_NAMES):
+            raise FileNotFoundError(f'{root}: existing shared slot directory and all four locks are required')
+    else:
+        root.mkdir(parents=True, exist_ok=True)
     names = [f"heavy-{n}.lock" for n in (1, 2, 3)] if kind in ("heavy", "quiet") else []
     if kind in ("desktop", "quiet"):
         names.append("desktop-1.lock")
@@ -63,9 +95,10 @@ def acquire(root: Path, kind: str, timeout: float = 0):
             stream = held.pop()
             try:
                 try:
-                    stream.seek(1)
-                    stream.truncate()
-                    stream.flush()
+                    if not probe:
+                        stream.seek(1)
+                        stream.truncate()
+                        stream.flush()
                 finally:
                     try:
                         unlock(stream)
@@ -81,7 +114,7 @@ def acquire(root: Path, kind: str, timeout: float = 0):
             for name in names:
                 path = root / name
                 # No append mode: update metadata under the owned byte lock.
-                candidate = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
+                candidate = os.fdopen(os.open(path, os.O_RDWR | (0 if probe else os.O_CREAT), 0o600), "r+b")
                 try:
                     acquired = lock(candidate)
                 except BaseException:
@@ -93,11 +126,12 @@ def acquire(root: Path, kind: str, timeout: float = 0):
                         break
                     continue
                 held.append(candidate)
-                candidate.seek(0)
-                candidate.write(b"\0" + json.dumps({"pid": os.getpid(), "host": os.name, "kind": kind,
+                if not probe:
+                    candidate.seek(0)
+                    candidate.write(b"\0" + json.dumps({"pid": os.getpid(), "host": os.name, "kind": kind,
                                                "started_ns": time.time_ns()}).encode("ascii"))
-                candidate.truncate()
-                candidate.flush()
+                    candidate.truncate()
+                    candidate.flush()
                 if kind != "quiet":
                     break
             if held and (kind != "quiet" or len(held) == len(names)):
@@ -107,7 +141,7 @@ def acquire(root: Path, kind: str, timeout: float = 0):
             if timeout == 0 or time.monotonic() >= deadline:
                 raise TimeoutError(f"No free {kind} slot; existing owners were not changed")
             time.sleep(min(0.2, max(0, deadline - time.monotonic())))
-        yield
+        yield Lease(root.resolve(), kind, held, os.getpid())
     finally:
         release()
 
@@ -115,7 +149,7 @@ def acquire(root: Path, kind: str, timeout: float = 0):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kind", choices=("heavy", "desktop", "quiet"), required=True)
-    parser.add_argument("--root", type=Path, default=ROOT / ".local" / "kernel-slots")
+    parser.add_argument("--root", type=Path)
     parser.add_argument("--timeout", type=float, default=0)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -123,6 +157,9 @@ def main() -> int:
     if not command or not math.isfinite(args.timeout) or args.timeout < 0:
         parser.error("a command and a nonnegative timeout are required")
     try:
+        args.root = args.root or shared_root()
+        if not args.root.is_dir():
+            parser.error(f'{args.root}: slot directory does not exist')
         with acquire(args.root, args.kind, args.timeout):
             child = subprocess.Popen(command)
             try:

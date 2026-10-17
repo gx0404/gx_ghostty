@@ -566,9 +566,17 @@ def powershell_json(script: str):
 
 
 def shared_slots_root() -> Path:
-    # Worktrees must contend with the main checkout, not with worktree-local locks.
-    common = command_output(["git", "-C", str(REPO_ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
-    return Path(common).parent / ".local" / "kernel-slots"
+    import gx_slots
+    return gx_slots.shared_root()
+
+
+def validate_slot_root(root: Path) -> Path:
+    import gx_slots
+    if root.resolve() != shared_slots_root().resolve():
+        raise PerfError(f'{root}: slot root must be the main checkout shared root {shared_slots_root()}')
+    if not root.is_dir() or any(not (root / name).is_file() for name in gx_slots.QUIET_NAMES):
+        raise PerfError(f'{root}: slot root or lock files do not exist')
+    return root.resolve()
 
 
 def user_idle_seconds() -> float:
@@ -603,17 +611,24 @@ class QuietProbe:
         return data
 
     def wsl(self, distro: str) -> dict:
+        registered = command_output(['wsl.exe', '--list', '--quiet'])
+        if distro.casefold() not in {line.strip().casefold() for line in registered.splitlines()}:
+            raise PerfError(f'WSL distribution is not registered: {distro}')
         running = command_output(["wsl.exe", "--list", "--running", "--quiet"])
-        if distro.casefold() not in {line.strip().casefold() for line in running.splitlines()}:
-            return {"distro": distro, "running": False, "processes": []}
-        output = command_output(["wsl.exe", "--distribution", distro, "--exec", "ps", "-eo", "pid=,comm=,args="])
         rows = []
-        for line in output.splitlines():
-            pid, name, argv = line.strip().split(None, 2)
-            rows.append({"pid": int(pid), "name": name, "build_runner": bool(re.search(BUILD_RUNNER_RE, argv))})
-        if not rows:
-            raise PerfError("WSL process inventory is empty")
-        return {"distro": distro, "running": True, "processes": rows}
+        active = [line.strip() for line in running.splitlines() if line.strip()]
+        for name in active:
+            # Docker's managed distro is covered by the Docker VM inventory.
+            if name.casefold().startswith('docker-desktop'):
+                continue
+            output = command_output(["wsl.exe", "--distribution", name, "--exec", "ps", "-eo", "pid=,comm=,args="])
+            if not output.strip():
+                raise PerfError(f'WSL process inventory is empty: {name}')
+            for line in output.splitlines():
+                pid, process, argv = line.strip().split(None, 2)
+                rows.append({"distro": name, "pid": int(pid), "name": process, "build_runner": bool(re.search(BUILD_RUNNER_RE, argv))})
+        return {"distro": distro, "running": distro.casefold() in {name.casefold() for name in active},
+                "running_distributions": active, "processes": rows}
 
     def vm(self, slots: Path) -> dict:
         # status historically treats a failed docker inspect as an absent VM.
@@ -629,8 +644,9 @@ class QuietProbe:
 
     def slots(self, root: Path) -> bool:
         import gx_slots
+        validate_slot_root(root)
         try:
-            with gx_slots.acquire(root, "quiet", timeout=0):
+            with gx_slots.acquire(root, "quiet", timeout=0, probe=True):
                 pass
             return True
         except TimeoutError:
