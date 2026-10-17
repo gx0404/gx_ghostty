@@ -3,14 +3,20 @@ Guest-only validation. Stage with scripts/gx_windows_vm.py stage-validation and 
 staged gx-run.cmd ("cmd /c \\host.lan\Data\validation\gx-run.cmd -Phase ..."), which copies this file
 into the caller's profile and runs it with a per-process execution-policy bypass.
 The manifest's UUID MUST be the live QEMU UUID read by the host (HMP info uuid).
-No host execution, password parameters, clipboard, account impersonation, automatic download,
+No host execution, password parameters, account impersonation, automatic download,
 elevation, or unverified installer/application execution is supported.
+The clipboard is touched only by the osc52 phase, and only with test content that the
+phase itself writes first; nothing reads or backs up clipboard content it did not write.
+Phases that change guest settings (toast-matrix, jumplist-matrix, narrator, dpi) record the
+before state, change only fixture-owned or explicitly named values, and restore them.
+Each r6 phase report carries "before" and "after" guest snapshots and its restore result.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
-    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign')]
+    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
+                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -34,7 +40,36 @@ param(
     [ValidatePattern('^(0x[0-9a-fA-F]{1,16})?$')][string]$TargetWindow = '',
     [ValidateRange(0,2147483647)][int]$PeerPid = 0,
     [string]$ExportDir,
-    [switch]$SoftwareGL
+    [switch]$SoftwareGL,
+    # r6 phases: a sub-step of the phase (each phase validates its own set).
+    [ValidatePattern('^([a-z][a-z0-9-]{0,31})?$')][string]$Action = '',
+    # Names one owned application record of a phase (several may run at once).
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{0,23}$')][string]$Label = 'main',
+    # run-config: UTF-8 configuration file (verbatim) and its frozen SHA256.
+    [string]$ConfigFile,
+    [string]$ConfigSha256,
+    # Extra application environment as NAME=VALUE pairs separated by ';' (GHOSTTY_* names only).
+    [ValidateLength(0,2048)][string]$AppEnv = '',
+    [ValidateRange(0,900)][int]$RunHoldSeconds = 0,
+    # osc52: clipboard-write policy of the probe terminal (clipboard-read stays at its default, ask).
+    [ValidateSet('allow','ask')][string]$ClipboardWritePolicy = 'allow',
+    # toast-matrix early: seconds after the probe shell starts at which each OSC 9 is sent.
+    [ValidatePattern('^\d{1,3}(,\d{1,3}){0,9}$')][string]$EarlyOffsets = '8,25,45',
+    # toast-matrix early: back up, then delete HKCU Notifications\Settings\<AUMID> before the launch.
+    [switch]$ResetToastSettings,
+    # Installation directory below the run's AppDir: 'space' and 'cjk' put spaces, CJK and an
+    # apostrophe into the installed exe path (fixed names; CJK cannot be typed over HMP).
+    [ValidateSet('none','space','cjk')][string]$PathPreset = 'none',
+    # jumplist-matrix config: profile set written to the real user configuration.
+    [ValidateSet('base','deleted','lang-zh','lang-en')][string]$JumpListSet = 'base',
+    # jumplist-matrix config: back up and replace a configuration this fixture did not write.
+    [switch]$AdoptUserConfig,
+    # jumplist-matrix observe: profile key (p1-p6) whose launch is expected, or none.
+    [ValidatePattern('^(p[1-6]|none)?$')][string]$ExpectProfile = '',
+    # cross-account peer: also try to open each visible Ghostty pipe as a client (then close it).
+    [switch]$ProbePipes,
+    # dpi set: the custom scaling (LogPixels) for this user; effective after signing in again.
+    [ValidateSet('96','120','144','168','192')][string]$Dpi = '96'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -402,6 +437,21 @@ public static class GxVmWindows {
         facts["error"] = ok ? 0 : Marshal.GetLastWin32Error();
         return facts;
     }
+
+    // Read-only: every descendant window of one class (bounded).
+    public static ArrayList ChildrenOfClass(IntPtr parent, string cls) {
+        ArrayList list = new ArrayList();
+        if (parent == IntPtr.Zero || !IsWindow(parent)) return list;
+        EnumChildWindows(parent, delegate (IntPtr hwnd, IntPtr unused) {
+            StringBuilder name = new StringBuilder(128);
+            GetClassNameW(hwnd, name, name.Capacity);
+            if (name.ToString() == cls) list.Add(Describe(hwnd));
+            return list.Count < 256;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    public static Hashtable Foreground() { return Describe(GetForegroundWindow()); }
 }
 '@
 
@@ -1216,12 +1266,2013 @@ function Run-Inspect {
     }
 }
 
+# ---------------------------------------------------------------------------
+# r6 phases. An application is "owned" only while this fixture started (or a
+# phase explicitly adopted) it and its PID, creation time and image path still
+# match the saved record; nothing else is closed or terminated. Multi-step
+# phases keep their records under <RunRoot>\records and are driven by -Action.
+
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')
+$script:Restore = $null
+$script:InstalledAumid = 'gx0404.GhosttyGX'
+$script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
+# Fixture keybinds shared by the r6 GUI phases (explicit, so no default chord is assumed).
+$script:FixtureKeybinds = @('keybind = ctrl+alt+shift+o=new_split:right', 'keybind = ctrl+alt+shift+t=new_tab',
+    'keybind = ctrl+alt+shift+n=new_window', 'keybind = ctrl+alt+shift+w=close_surface',
+    'keybind = ctrl+alt+shift+r=reload_config', 'keybind = global:ctrl+alt+shift+q=toggle_quick_terminal')
+
+function Get-PathPresetName([string]$Preset) {
+    switch ($Preset) {
+        'space' { return "GX JL dir 'q'" }
+        'cjk' { return 'GX ' + (-join @([char]0x5B89, [char]0x88C5)) + " dir 'q'" }
+        default { return '' }
+    }
+}
+
+function Assert-Action([string[]]$Allowed, [string]$Default) {
+    $value = if ($Action) { $Action } else { $Default }
+    if ($Allowed -cnotcontains $value) { throw ("Phase $Phase accepts -Action " + ($Allowed -join '|') + "; got '$value'.") }
+    return $value
+}
+
+function Get-RecordPath([string]$Name) {
+    if ($Name -notmatch '^[A-Za-z0-9_.-]{1,96}$') { throw "Invalid record name: $Name" }
+    $dir = Join-Path $script:RunRoot 'records'
+    [IO.Directory]::CreateDirectory($dir) | Out-Null
+    return Join-Path $dir ($Name + '.json')
+}
+
+function Save-Record([string]$Name, $Value) {
+    $path = Get-RecordPath $Name
+    Write-Json $path $Value
+    if (-not $script:ExportExtra.Contains($path)) { $script:ExportExtra.Add($path) }
+    return $path
+}
+
+function Read-Record([string]$Name) {
+    $path = Get-RecordPath $Name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    if (-not $script:ExportExtra.Contains($path)) { $script:ExportExtra.Add($path) }
+    return Read-JsonFile $path
+}
+
+# Write-Json emits BOM-less UTF-8, which Windows PowerShell 5.1's Get-Content
+# would decode as ANSI; every r6 JSON read (and state.json) goes through here.
+function Read-JsonFile([string]$Path) { return [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json }
+
+function Set-RecordField($Record, [string]$Name, $Value) {
+    $Record | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
+function Get-Sha256([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+
+function Get-Utf8Bytes([string]$Text) { return [Text.UTF8Encoding]::new($false).GetBytes($Text) }
+
+function Json-Normal($Value) { return (($Value | ConvertTo-Json -Depth 20) | ConvertFrom-Json | ConvertTo-Json -Depth 20 -Compress) }
+
+function Open-HkcuBase { return [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64) }
+
+function Get-MapEntries($Map) {
+    # Entries of an ordered dictionary or of the PSCustomObject it became in JSON.
+    if ($null -eq $Map) { return @() }
+    if ($Map -is [System.Collections.IDictionary]) { return @($Map.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name=[string]$_.Key; Value=$_.Value } }) }
+    return @($Map.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name=$_.Name; Value=$_.Value } })
+}
+
+function Read-AnyKeyTree([Microsoft.Win32.RegistryKey]$Base, [string]$Key, [int]$Depth = 0) {
+    # Every value kind, bounded; used to back up a key before a phase changes it.
+    $handle = $Base.OpenSubKey($Key, $false)
+    if ($null -eq $handle) { return [ordered]@{ exists=$false } }
+    try {
+        $names = @($handle.GetValueNames() | Sort-Object)
+        $subkeys = @($handle.GetSubKeyNames() | Sort-Object)
+        if ($names.Count -gt 256 -or $subkeys.Count -gt 64 -or $Depth -gt 4) { throw "Registry backup exceeds fixture bounds: $Key" }
+        $values = [ordered]@{}
+        foreach ($name in $names) {
+            $kind = [string]$handle.GetValueKind($name)
+            $raw = $handle.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $data = switch ($kind) {
+                'Binary' { [Convert]::ToBase64String([byte[]]$raw) }
+                'MultiString' { ,@($raw) }
+                'DWord' { [long][int]$raw }
+                'QWord' { [long]$raw }
+                'String' { [string]$raw }
+                'ExpandString' { [string]$raw }
+                default { throw "Unsupported registry value kind $kind under $Key; nothing was changed." }
+            }
+            $values['value:' + $name] = [ordered]@{ kind=$kind; data=$data }
+        }
+        $children = [ordered]@{}
+        foreach ($name in $subkeys) { $children[$name] = Read-AnyKeyTree $Base ($Key + '\' + $name) ($Depth + 1) }
+        return [ordered]@{ exists=$true; values=$values; children=$children }
+    } finally { $handle.Dispose() }
+}
+
+function Restore-AnyKeyTree([Microsoft.Win32.RegistryKey]$Base, [string]$Key, $Tree) {
+    if (-not $Tree.exists) { $Base.DeleteSubKeyTree($Key, $false); return }
+    $handle = $Base.CreateSubKey($Key)
+    $children = @(Get-MapEntries $Tree.children)
+    try {
+        $wanted = @{}
+        foreach ($entry in @(Get-MapEntries $Tree.values)) { $wanted[$entry.Name.Substring(6)] = $entry.Value }
+        foreach ($name in @($handle.GetValueNames())) { if (-not $wanted.ContainsKey($name)) { $handle.DeleteValue($name, $false) } }
+        foreach ($name in @($wanted.Keys)) {
+            $value = $wanted[$name]
+            $kind = [Microsoft.Win32.RegistryValueKind]$value.kind
+            $data = switch ([string]$value.kind) {
+                'Binary' { [byte[]][Convert]::FromBase64String([string]$value.data) }
+                'MultiString' { [string[]]@($value.data) }
+                'DWord' { [int][long]$value.data }
+                'QWord' { [long]$value.data }
+                default { [string]$value.data }
+            }
+            $handle.SetValue($name, $data, $kind)
+        }
+        $keep = @($children | ForEach-Object { $_.Name })
+        foreach ($name in @($handle.GetSubKeyNames())) { if ($keep -notcontains $name) { $handle.DeleteSubKeyTree($name, $false) } }
+    } finally { $handle.Dispose() }
+    foreach ($child in $children) { Restore-AnyKeyTree $Base ($Key + '\' + $child.Name) $child.Value }
+}
+
+function Backup-HkcuKey([string]$RecordName, [string]$Key) {
+    # The first backup of a run is kept until it has been restored.
+    $existing = Read-Record $RecordName
+    if ($existing -and -not $existing.restored) {
+        if ($existing.key -cne $Key) { throw "Record $RecordName backs up another key." }
+        return $existing
+    }
+    $base = Open-HkcuBase
+    try { $tree = Read-AnyKeyTree $base $Key } finally { $base.Dispose() }
+    Save-Record $RecordName ([ordered]@{ hive='HKCU'; key=$Key; before=$tree; backed_up_utc=[DateTime]::UtcNow.ToString('o'); restored=$false }) | Out-Null
+    return Read-Record $RecordName
+}
+
+function Restore-HkcuKey([string]$RecordName) {
+    $record = Read-Record $RecordName
+    if ($null -eq $record) { return [ordered]@{ record=$RecordName; restored=$true; note='no backup was taken' } }
+    if ($record.restored) { return [ordered]@{ record=$RecordName; key=$record.key; restored=$true; note='already restored' } }
+    $base = Open-HkcuBase
+    try {
+        Restore-AnyKeyTree $base $record.key $record.before
+        $after = Read-AnyKeyTree $base $record.key
+    } finally { $base.Dispose() }
+    $equal = (Json-Normal $after) -ceq (Json-Normal $record.before)
+    Set-RecordField $record 'restored' $equal
+    Set-RecordField $record 'restored_utc' ([DateTime]::UtcNow.ToString('o'))
+    Set-RecordField $record 'after_restore' $after
+    Save-Record $RecordName $record | Out-Null
+    return [ordered]@{ record=$RecordName; key=$record.key; restored=$equal; before_existed=[bool]$record.before.exists }
+}
+
+function Read-HkcuTree([string]$Key) {
+    $base = Open-HkcuBase
+    try { return Read-AnyKeyTree $base $Key } finally { $base.Dispose() }
+}
+
+function Initialize-Toast {
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
+    $null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]
+}
+
+function Get-ToastFacts([string]$Aumid) {
+    # Notification history XML (same read as the r18 evidence) and the notifier setting.
+    $facts = [ordered]@{ aumid=$Aumid; setting=$null; setting_value=$null; history_count=$null; history=@(); error=$null }
+    try {
+        Initialize-Toast
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($Aumid)
+        $facts.setting = [string]$notifier.Setting
+        $facts.setting_value = [int]$notifier.Setting
+        $items = @([Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory($Aumid))
+        $facts.history_count = $items.Count
+        $facts.history = @($items | Select-Object -First 50 | ForEach-Object {
+            $xml = $_.Content.GetXml(); if ($xml.Length -gt 4096) { $xml.Substring(0, 4096) } else { $xml } })
+    } catch { $facts.error = $_.Exception.Message }
+    return $facts
+}
+
+# Diagnostic only: the shell's quiet-hours (Focus assist / Do not disturb)
+# profile from WNF. The authoritative evidence is the notification center
+# screenshot; a nonzero status means the state could not be read here.
+$script:WnfSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+public static class GxVmWnf {
+    [DllImport("ntdll.dll")] static extern int NtQueryWnfStateData(ref ulong stateName, IntPtr typeId, IntPtr explicitScope, out uint changeStamp, [Out] byte[] buffer, ref uint bufferSize);
+    public static Hashtable Query(ulong name) {
+        Hashtable facts = new Hashtable();
+        byte[] buffer = new byte[64]; uint size = (uint)buffer.Length; uint stamp;
+        int status = NtQueryWnfStateData(ref name, IntPtr.Zero, IntPtr.Zero, out stamp, buffer, ref size);
+        facts["state_name"] = "0x" + name.ToString("x16");
+        facts["status"] = "0x" + status.ToString("x8");
+        facts["change_stamp"] = (long)stamp;
+        facts["size"] = (long)size;
+        if (status == 0 && size >= 4) facts["value"] = (long)BitConverter.ToInt32(buffer, 0);
+        return facts;
+    }
+}
+'@
+
+function Get-QuietHoursDiagnostic {
+    try {
+        if (-not ('GxVmWnf' -as [type])) { Add-Type -TypeDefinition $script:WnfSource -Language CSharp }
+        # WNF_SHEL_QUIETHOURS_ACTIVE_PROFILE_CHANGED: 0 off, 1 priority only, 2 alarms only.
+        return [GxVmWnf]::Query([uint64]'0x0D83063EA3BF1C75')
+    } catch { return @{ error=$_.Exception.Message } }
+}
+
+function Get-PortableAumid([string]$Exe) {
+    # Mirrors src/apprt/win32/shell/Identity.zig::init for an unregistered copy:
+    # SHA-256 of the ASCII-lowercased, forward-slash path; first 16 bytes in hex.
+    # The app hashes its final (handle-resolved) path; this uses the full path.
+    $normalized = [regex]::Replace([IO.Path]::GetFullPath($Exe).Replace('\', '/'), '[A-Z]', { param($m) $m.Value.ToLowerInvariant() })
+    $hash = [Security.Cryptography.SHA256]::Create().ComputeHash((Get-Utf8Bytes $normalized))
+    return $script:InstalledAumid + '.Portable.' + ([BitConverter]::ToString($hash, 0, 16)).Replace('-', '').ToLowerInvariant()
+}
+
+function Copy-PortableApp([string]$Destination) {
+    # A copy of this run's installed AppDir without the installer-owned uninstaller.
+    if (-not $script:State.installed) { throw 'Install the fixture package in this run first.' }
+    Assert-Hash (Join-Path $script:AppDir 'ghostty.exe') $AppSha256
+    Assert-NoReparse $Destination
+    if (Test-Path -LiteralPath $Destination) { throw "Portable copy already exists: $Destination" }
+    $prefix = [IO.Path]::GetFullPath($script:AppDir).TrimEnd('\') + '\'
+    $files = @(Get-ChildItem -LiteralPath $script:AppDir -Recurse -File -Force | Where-Object { $_.Name -notlike 'unins*' })
+    foreach ($file in $files) {
+        $target = Join-Path $Destination $file.FullName.Substring($prefix.Length)
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $target
+    }
+    $exe = Join-Path $Destination 'ghostty.exe'
+    Assert-Hash $exe $AppSha256
+    return @{ exe=$exe; files=$files.Count; aumid=(Get-PortableAumid $exe) }
+}
+
+function Write-ExportMarker([string]$Suffix, $Value) {
+    # A small file the host can poll on the share while the guest holds a step.
+    if ($script:ExportRoot) { Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-' + $Suffix + '.json')) $Value }
+}
+
+function Get-AppEnvironment {
+    $map = [ordered]@{}
+    if ($SoftwareGL) { $map['GHOSTTY_GX_OPENGL'] = 'software' }
+    foreach ($pair in @($AppEnv.Split(';') | Where-Object { $_ })) {
+        $index = $pair.IndexOf('=')
+        if ($index -lt 1) { throw "AppEnv entry needs NAME=VALUE: $pair" }
+        $name = $pair.Substring(0, $index)
+        $value = $pair.Substring($index + 1)
+        if ($name -cnotmatch '^GHOSTTY_[A-Z0-9_]{1,48}$') { throw "AppEnv accepts GHOSTTY_* names only: $name" }
+        if ($value.Length -gt 512 -or $value -match '[\x00-\x1f]') { throw "AppEnv value for $name is not a short single line." }
+        $map[$name] = $value
+    }
+    return $map
+}
+
+function Get-GuestApps {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'ghostty.exe'" | ForEach-Object {
+        [ordered]@{ pid=[int]$_.ProcessId; parent=[int]$_.ParentProcessId; session=[int]$_.SessionId; path=$_.ExecutablePath;
+            created=$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }); command_line=$_.CommandLine } })
+}
+
+function Get-OwnedProcess($Record) {
+    # The record's exact process life, or $null once it exited or its PID was reused.
+    if ($null -eq $Record -or -not $Record.pid) { return $null }
+    $process = Get-Process -Id ([int]$Record.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $null }
+    try {
+        if ($process.StartTime.ToFileTimeUtc() -ne [long]$Record.birth_filetime -or $process.Path -ine [string]$Record.exe) { $process.Dispose(); return $null }
+        $null = $process.Handle
+        return $process
+    } catch { $process.Dispose(); return $null }
+}
+
+function Get-OwnedRecordSummary([string]$Prefix) {
+    $dir = Join-Path $script:RunRoot 'records'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter ($Prefix + '*.json') | ForEach-Object {
+        $record = Read-JsonFile $_.FullName
+        $alive = $false
+        if ($record.PSObject.Properties['pid'] -and $record.pid) { $owned = Get-OwnedProcess $record; if ($owned) { $alive = $true; $owned.Dispose() } }
+        [ordered]@{ name=$_.BaseName; status=$(if ($record.PSObject.Properties['status']) { $record.status } else { $null }); alive=$alive } })
+}
+
+function Get-PhaseState([string]$When) {
+    $state = [ordered]@{ label=$When; utc=[DateTime]::UtcNow.ToString('o'); user=$env:USERNAME; ghostty=(Get-GuestApps) }
+    switch ($Phase) {
+        'run-config' { $state.records = @(Get-OwnedRecordSummary 'run-config-') }
+        'osc52' {
+            # Only the clipboard sequence number: never the content of a clipboard this fixture did not write.
+            if (-not ('GxVmClipboard' -as [type])) { Add-Type -TypeDefinition $script:ClipboardSource -Language CSharp }
+            $state.clipboard_sequence = [GxVmClipboard]::Sequence()
+            $state.records = @(Get-OwnedRecordSummary 'osc52-')
+        }
+        'toast-matrix' {
+            $state.records = @(Get-OwnedRecordSummary 'toast-')
+            $state.installed_toast = Get-ToastFacts $script:InstalledAumid
+            $state.notification_settings = Read-HkcuTree $script:NotificationSettingsKey
+            $state.quiet_hours = Get-QuietHoursDiagnostic
+        }
+        'jumplist-matrix' {
+            $state.records = @(Get-OwnedRecordSummary 'jumplist-')
+            $state.jump_lists = Get-JumpListFiles
+            $state.user_config = @(Get-UserConfigFiles | ForEach-Object { [ordered]@{ path=$_; exists=(Test-Path -LiteralPath $_);
+                sha256=$(if (Test-Path -LiteralPath $_) { Get-Sha256 $_ } else { $null }) } })
+        }
+        'narrator' {
+            $state.records = @(Get-OwnedRecordSummary 'narrator')
+            $state.narrator_processes = @(Get-NarratorProcesses)
+            $state.screen_reader = Get-ScreenReaderFlag
+        }
+        'cross-account' {
+            $state.records = @(Get-OwnedRecordSummary 'cross-')
+            $state.public_root = [ordered]@{ path=(Get-CrossRoot); exists=(Test-Path -LiteralPath (Get-CrossRoot)) }
+            $state.pipes = @(Get-GhosttyPipes)
+        }
+        'dpi' {
+            $state.desktop = Get-DpiSettings
+            $state.effective = Get-EffectiveDpi
+        }
+    }
+    return $state
+}
+
+function Start-OwnedApp {
+    # Isolated by default (private LOCALAPPDATA/APPDATA/XDG_* under -Private, like
+    # Start-IsolatedApp); -RealProfile keeps the caller's real user environment.
+    param([string]$Exe, [string]$Private, [byte[]]$ConfigBytes, $Environment, [string[]]$Arguments = @(), [switch]$RealProfile, $Overrides = $null)
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Exe
+    $start.Arguments = ($Arguments -join ' ')
+    $start.UseShellExecute = $false
+    foreach ($key in @($start.EnvironmentVariables.Keys)) { if ($key -match '^(?i:GHOSTTY_)') { $start.EnvironmentVariables.Remove($key) } }
+    $config = $null
+    if ($RealProfile) {
+        $start.WorkingDirectory = $env:USERPROFILE
+    } else {
+        Assert-NoReparse $Private
+        if (Test-Path -LiteralPath $Private) { throw "Application profile already exists: $Private" }
+        [IO.Directory]::CreateDirectory($Private) | Out-Null
+        if ($null -ne $ConfigBytes) {
+            $config = Join-Path $Private 'ghostty\config.ghostty'
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($config)) | Out-Null
+            [IO.File]::WriteAllBytes($config, $ConfigBytes)
+        }
+        $start.WorkingDirectory = $Private
+        foreach ($key in @($start.EnvironmentVariables.Keys)) {
+            if ($key -match '^(?i:XDG_)' -or $key -in @('NO_COLOR','TERM','LOCALAPPDATA','APPDATA')) { $start.EnvironmentVariables.Remove($key) }
+        }
+        $start.EnvironmentVariables['LOCALAPPDATA'] = $Private
+        $start.EnvironmentVariables['APPDATA'] = Join-Path $Private 'appdata'
+        $start.EnvironmentVariables['XDG_CONFIG_HOME'] = $Private
+        $start.EnvironmentVariables['XDG_STATE_HOME'] = Join-Path $Private 'state'
+        $start.EnvironmentVariables['XDG_CACHE_HOME'] = Join-Path $Private 'cache'
+    }
+    if ($Overrides) { foreach ($key in @($Overrides.Keys)) { $start.EnvironmentVariables[$key] = [string]$Overrides[$key] } }
+    if ($Environment) { foreach ($key in @($Environment.Keys)) { $start.EnvironmentVariables[$key] = [string]$Environment[$key] } }
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $process = [Diagnostics.Process]::Start($start)
+    $null = $process.Handle
+    return @{ process=$process; config=$config }
+}
+
+function New-AppRecord($Process, [string]$Exe, [string]$Class, [string]$Private, [string]$Config, $Environment, [string[]]$Arguments) {
+    $logRoot = if ($Private) { $Private } else { $env:LOCALAPPDATA }
+    return [ordered]@{ phase=$Phase; label=$Label; status='STARTING'; step=$script:Step; pid=$Process.Id;
+        birth_filetime=$Process.StartTime.ToFileTimeUtc(); birth=$Process.StartTime.ToUniversalTime().ToString('o');
+        exe=$Exe; exe_sha256=(Get-Sha256 $Exe); app_class=$Class; profile=$Private; config=$Config;
+        config_sha256=$(if ($Config) { Get-Sha256 $Config } else { $null }); log=(Join-Path $logRoot 'ghostty\logs\ghostty.log');
+        environment=$Environment; arguments=@($Arguments); main_window=$null }
+}
+
+function Wait-AppWindow($Process, [int]$Seconds = 45) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) { throw "Owned app exited $($Process.ExitCode) before it showed a window." }
+        $windows = @([GxVmWindows]::TopLevel($Process.Id) | Where-Object { $_['class'] -ceq 'GhosttyWindow' -and $_['visible'] })
+        if ($windows.Count -gt 0) { return $windows[0] }
+        Start-Sleep -Milliseconds 100
+    } while ($clock.Elapsed.TotalSeconds -lt $Seconds)
+    throw "Owned app showed no GhosttyWindow within $Seconds seconds."
+}
+
+function Get-TerminalPanes([int]$ProcessId) {
+    $panes = New-Object System.Collections.Generic.List[object]
+    foreach ($window in @([GxVmWindows]::TopLevel($ProcessId) | Where-Object { $_['class'] -ceq 'GhosttyWindow' })) {
+        $hwnd = [IntPtr][Convert]::ToInt64($window['hwnd'].Substring(2), 16)
+        foreach ($pane in @([GxVmWindows]::ChildrenOfClass($hwnd, 'GhosttyTerminal'))) { $pane['window'] = $window['hwnd']; $panes.Add($pane) }
+    }
+    return $panes.ToArray()
+}
+
+function Get-AppStatus($Record) {
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $process = Get-OwnedProcess $Record
+    $status = [ordered]@{ label=$Record.label; pid=[int]$Record.pid; birth_filetime=[long]$Record.birth_filetime; alive=($null -ne $process);
+        foreground=[GxVmWindows]::Foreground() }
+    if ($process) {
+        try {
+            $process.Refresh()
+            $status.windows = Get-WindowSnapshot $process.Id $process.MainWindowHandle 'status'
+            $status.terminal_panes = @(Get-TerminalPanes $process.Id)
+            $status.foreground_is_owned = ([long]$status.foreground['pid'] -eq $process.Id)
+        } finally { $process.Dispose() }
+    }
+    return $status
+}
+
+function Close-OwnedApp($Record) {
+    # CloseMainWindow first (the normal close request); WM_CLOSE to this exact
+    # process's remaining GhosttyWindows is recorded as a follow-up; a kill is
+    # always a failed close.
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $close = [ordered]@{ label=$Record.label; pid=[int]$Record.pid; birth_filetime=[long]$Record.birth_filetime; wait_seconds=$CloseWaitSeconds;
+        already_exited=$false; close_main_window=$null; followup=@(); killed=$false; exit_code=$null; exit_code_hex=$null;
+        closed_by_close_main_window=$false; closed_normally=$false }
+    $process = Get-OwnedProcess $Record
+    if ($null -eq $process) {
+        $close.already_exited = $true
+        $close.note = 'The recorded process had already exited (or its PID was reused); its exit code is not observable now.'
+        return $close
+    }
+    try {
+        $process.Refresh()
+        $main = $process.MainWindowHandle
+        $close.before = Get-WindowSnapshot $process.Id $main 'before-close'
+        $close.close_main_window_utc = [DateTime]::UtcNow.ToString('o')
+        $close.close_main_window = $process.CloseMainWindow()
+        $exited = $process.WaitForExit(2000)
+        $close.closed_by_close_main_window = $exited
+        if (-not $exited) {
+            $close.after_2s = Get-WindowSnapshot $process.Id $main 'after-2s'
+            $close.followup = @($close.after_2s.ghostty_windows | ForEach-Object {
+                [GxVmWindows]::PostClose([IntPtr][Convert]::ToInt64($_['hwnd'].Substring(2), 16)) })
+            $exited = $process.WaitForExit([Math]::Max(1000, $CloseWaitSeconds * 1000 - 2000))
+        }
+        if (-not $exited) {
+            $close.before_kill = Get-WindowSnapshot $process.Id $main 'before-kill'
+            $close.scene = Get-ProcessScene $process
+            $process.Kill()
+            $null = $process.WaitForExit(5000)
+            $close.killed = $true
+        }
+        if ($process.HasExited) {
+            $close.exit_code = $process.ExitCode
+            $close.exit_code_hex = '0x{0:X8}' -f $process.ExitCode
+            $close.exit_utc = $process.ExitTime.ToUniversalTime().ToString('o')
+            $born = $process.StartTime.ToUniversalTime()
+            $close.orphans_after_exit = @(Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $process.Id) |
+                Where-Object { $_.CreationDate.ToUniversalTime() -ge $born } |
+                ForEach-Object { [ordered]@{ pid=[int]$_.ProcessId; name=$_.Name; created=$_.CreationDate.ToUniversalTime().ToString('o') } })
+        }
+        $close.closed_normally = (-not $close.killed) -and $process.HasExited -and $process.ExitCode -eq 0
+    } finally { $process.Dispose() }
+    return $close
+}
+
+function Get-RunConfigSource {
+    if ($ConfigFile) {
+        Assert-Hash $ConfigFile $ConfigSha256
+        $bytes = [IO.File]::ReadAllBytes($ConfigFile)
+        if ($bytes.Length -gt 262144) { throw 'The configuration file exceeds 256 KiB.' }
+        # Strict decoding: an invalid UTF-8 file is refused; the bytes are used verbatim.
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        return [ordered]@{ bytes=$bytes; source=$ConfigFile; sha256=$ConfigSha256.ToLowerInvariant(); default=$false; lines=@($text -split "`r?`n").Count }
+    }
+    if ($ConfigSha256) { throw '-ConfigSha256 needs -ConfigFile.' }
+    $text = (@('language = en', 'confirm-close-surface = false', 'gx-session-restore = false') -join $script:LF) + $script:LF
+    return [ordered]@{ bytes=(Get-Utf8Bytes $text); source=$null; sha256=$null; default=$true; lines=3 }
+}
+
+function Get-RendererLines([string]$Log) {
+    if (-not (Test-Path -LiteralPath $Log)) { return @() }
+    return @(Get-Content -LiteralPath $Log | Select-String 'loaded OpenGL' | Select-Object -First 4 | ForEach-Object Line)
+}
+
+function Invoke-RunConfig {
+    # once: start, wait for the window, hold, CloseMainWindow, require exit 0.
+    # start/stop/status split the same life across invocations by -Label.
+    $step = Assert-Action @('once','start','stop','status') 'once'
+    $name = 'run-config-' + $Label
+    if ($step -ceq 'status' -or $step -ceq 'stop') {
+        $record = Read-Record $name
+        if ($null -eq $record) { throw "No run-config record for -Label $Label in this run." }
+        if ($step -ceq 'status') { return Get-AppStatus $record }
+        $close = Close-OwnedApp $record
+        Set-RecordField $record 'close' $close
+        Set-RecordField $record 'renderer' (Get-RendererLines $record.log)
+        $record.status = if ($close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' }
+        Save-Record $name $record | Out-Null
+        if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+        return [ordered]@{ record=$record; fixture_verdict=$(if ($close.closed_normally) { 'PASS' } else { 'FAIL' });
+            fixture_reason=$(if ($close.closed_normally) { $null } else { 'normal close did not pass (see close)' }) }
+    }
+    $previous = Read-Record $name
+    $alive = Get-OwnedProcess $previous
+    if ($alive) { $alive.Dispose(); throw "Label $Label still runs (pid $($previous.pid)); stop it or use another -Label." }
+    $app = Resolve-GlApp
+    $source = Get-RunConfigSource
+    $environment = Get-AppEnvironment
+    $arguments = @('--gx-single-instance=false')
+    $private = Join-Path $script:RunRoot ($script:Step + '-run-config-' + $Label)
+    $started = Start-OwnedApp -Exe $app.exe -Private $private -ConfigBytes $source.bytes -Environment $environment -Arguments $arguments
+    $process = $started.process
+    $record = New-AppRecord $process $app.exe $app.class $private $started.config $environment $arguments
+    $record.config_source = $source.source
+    $record.config_default = $source.default
+    $record.config_source_sha256 = $source.sha256
+    Save-Record $name $record | Out-Null
+    $script:ExportExtra.Add($started.config)
+    try {
+        $record.main_window = Wait-AppWindow $process 45
+        $record.window_seen_utc = [DateTime]::UtcNow.ToString('o')
+        $record.status = 'RUNNING'
+        Save-Record $name $record | Out-Null
+        if ($step -ceq 'start') {
+            Write-ExportMarker 'run-config-running' @{ label=$Label; pid=$record.pid; hwnd=$record.main_window['hwnd']; utc=$record.window_seen_utc }
+            return [ordered]@{ record=$record; fixture_verdict='RUNNING' }
+        }
+        $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
+        if ($hold -gt 0) {
+            Write-ExportMarker 'run-config-holding' @{ label=$Label; pid=$record.pid; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
+            $holdEnd = [DateTime]::UtcNow.AddSeconds($hold)
+            while ([DateTime]::UtcNow -lt $holdEnd) {
+                if ($process.HasExited) { throw "Owned app exited $($process.ExitCode) during the hold." }
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        $record.held_seconds = $hold
+    } catch {
+        $record.status = 'START_FAILED'
+        $record.error = $_.Exception.Message
+        if ($step -ceq 'start' -and -not $process.HasExited) { $record.close = Close-OwnedApp $record }
+        Save-Record $name $record | Out-Null
+        throw
+    } finally {
+        if ($step -ceq 'once') {
+            if (-not $record.Contains('close')) { $record.close = Close-OwnedApp $record }
+            $record.renderer = Get-RendererLines $record.log
+            if ($record.status -ceq 'RUNNING') { $record.status = if ($record.close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' } }
+            Save-Record $name $record | Out-Null
+            if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+        }
+        $process.Dispose()
+    }
+    $passed = $record.close.closed_normally
+    return [ordered]@{ record=$record; fixture_verdict=$(if ($passed) { 'PASS' } else { 'FAIL' });
+        fixture_reason=$(if ($passed) { $null } else { 'normal close did not pass (see record.close)' }); visual_review='PENDING' }
+}
+
+# Controller-side clipboard access: the sequence number (no content) and the
+# final clean-up of content this fixture itself put on the clipboard.
+$script:ClipboardSource = @'
+using System;
+using System.Runtime.InteropServices;
+public static class GxVmClipboard {
+    [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll", SetLastError = true)] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool EmptyClipboard();
+    [DllImport("user32.dll", SetLastError = true)] static extern bool CloseClipboard();
+    public static long Sequence() { return (long)GetClipboardSequenceNumber(); }
+    public static long EmptyIfSequence(long expected) {
+        if ((long)GetClipboardSequenceNumber() != expected) return -1;
+        for (int i = 0; i < 50; i++) {
+            if (OpenClipboard(IntPtr.Zero)) {
+                try {
+                    if ((long)GetClipboardSequenceNumber() != expected) return -1;
+                    if (!EmptyClipboard()) throw new Exception("EmptyClipboard failed: " + Marshal.GetLastWin32Error());
+                } finally { CloseClipboard(); }
+                return (long)GetClipboardSequenceNumber();
+            }
+            System.Threading.Thread.Sleep(20);
+        }
+        throw new Exception("OpenClipboard failed: " + Marshal.GetLastWin32Error());
+    }
+}
+'@
+
+# The OSC 52 probe runs inside the terminal under test (powershell.exe 5.1).
+# It seeds the clipboard with fixture-known text itself, sends one request,
+# and reads the terminal's reply from console input in raw VT-input mode.
+# Placeholders __NAME__ are replaced at generation; the file must stay ASCII.
+$script:Osc52ProbeTemplate = @'
+# GX OSC 52 probe generated by gx_vm_validation.ps1 (phase osc52). ASCII only.
+$GxOscResults = '__RESULTS__'
+$GxOscToken = '__TOKEN__'
+$GxOscSeed = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__SEED_B64__'))
+$GxOscBefore = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__BEFORE_B64__'))
+$GxOscWrite = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__WRITE_B64__'))
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class GxOsc52 {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleMode(IntPtr h, uint m);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FlushConsoleInputBuffer(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool WriteConsoleW(IntPtr h, string s, uint n, out uint written, IntPtr reserved);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNumberOfConsoleInputEvents(IntPtr h, out uint count);
+    [StructLayout(LayoutKind.Explicit, Size = 20)] public struct InputRecord {
+        [FieldOffset(0)] public ushort EventType; [FieldOffset(4)] public int KeyDown; [FieldOffset(8)] public ushort Repeat;
+        [FieldOffset(10)] public ushort VirtualKey; [FieldOffset(12)] public ushort ScanCode; [FieldOffset(14)] public ushort Char;
+        [FieldOffset(16)] public uint Control;
+    }
+    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "ReadConsoleInputW")] static extern bool ReadConsoleInput(IntPtr h, [Out] InputRecord[] buffer, uint length, out uint read);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool CloseClipboard();
+    [DllImport("user32.dll", SetLastError = true)] static extern bool EmptyClipboard();
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetClipboardData(uint format, IntPtr data);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr GetClipboardData(uint format);
+    [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowExW(uint ex, string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
+    [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hwnd);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GlobalLock(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GlobalUnlock(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GlobalFree(IntPtr h);
+
+    public static IntPtr Input() { return GetStdHandle(-10); }
+    public static long Sequence() { return (long)GetClipboardSequenceNumber(); }
+    public static void Flush() { FlushConsoleInputBuffer(Input()); }
+    public static void Send(string text) {
+        uint written;
+        if (!WriteConsoleW(GetStdHandle(-11), text, (uint)text.Length, out written, IntPtr.Zero) || written != (uint)text.Length)
+            throw new Exception("WriteConsoleW failed: " + Marshal.GetLastWin32Error());
+    }
+    public static bool Complete(string text) {
+        int start = text.IndexOf("\u001b]52;");
+        if (start < 0) return false;
+        return text.IndexOf('\u0007', start) >= 0 || text.IndexOf("\u001b\\", start + 1) >= 0;
+    }
+    // Characters of key-down records until a complete OSC 52 reply or the deadline.
+    public static string Read(int timeoutMs) {
+        IntPtr input = Input();
+        StringBuilder text = new StringBuilder();
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        InputRecord[] records = new InputRecord[128];
+        while (DateTime.UtcNow < deadline && text.Length < 65536) {
+            int left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+            if (WaitForSingleObject(input, (uint)Math.Max(1, Math.Min(left, 100))) != 0) continue;
+            uint count;
+            if (!GetNumberOfConsoleInputEvents(input, out count) || count == 0) { System.Threading.Thread.Sleep(10); continue; }
+            uint read;
+            if (!ReadConsoleInput(input, records, (uint)records.Length, out read)) throw new Exception("ReadConsoleInputW failed: " + Marshal.GetLastWin32Error());
+            for (int i = 0; i < read; i++) {
+                if (records[i].EventType != 1 || records[i].KeyDown == 0 || records[i].Char == 0) continue;
+                for (int r = 0; r < Math.Max((int)records[i].Repeat, 1); r++) text.Append((char)records[i].Char);
+            }
+            if (Complete(text.ToString())) break;
+        }
+        return text.ToString();
+    }
+    static void Open(IntPtr owner) {
+        for (int i = 0; i < 50; i++) { if (OpenClipboard(owner)) return; System.Threading.Thread.Sleep(20); }
+        throw new Exception("OpenClipboard failed: " + Marshal.GetLastWin32Error());
+    }
+    // mode "text" leaves CF_UNICODETEXT (possibly empty); "cleared" leaves no format at all.
+    public static long Seed(string mode, string text) {
+        IntPtr owner = CreateWindowExW(0, "STATIC", "GxOsc52ClipboardOwner", 0, 0, 0, 0, 0, new IntPtr(-3), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (owner == IntPtr.Zero) throw new Exception("CreateWindowExW failed: " + Marshal.GetLastWin32Error());
+        try {
+            Open(owner);
+            try {
+                if (!EmptyClipboard()) throw new Exception("EmptyClipboard failed: " + Marshal.GetLastWin32Error());
+                if (mode == "text") {
+                    byte[] bytes = Encoding.Unicode.GetBytes(text + "\0");
+                    IntPtr block = GlobalAlloc(0x0002, new UIntPtr((uint)bytes.Length));
+                    if (block == IntPtr.Zero) throw new Exception("GlobalAlloc failed");
+                    IntPtr data = GlobalLock(block);
+                    Marshal.Copy(bytes, 0, data, bytes.Length);
+                    GlobalUnlock(block);
+                    if (SetClipboardData(13, block) == IntPtr.Zero) { GlobalFree(block); throw new Exception("SetClipboardData failed: " + Marshal.GetLastWin32Error()); }
+                }
+            } finally { CloseClipboard(); }
+        } finally { DestroyWindow(owner); }
+        return Sequence();
+    }
+    // Null when no CF_UNICODETEXT is present.
+    public static string ReadText() {
+        Open(IntPtr.Zero);
+        try {
+            if (!IsClipboardFormatAvailable(13)) return null;
+            IntPtr handle = GetClipboardData(13);
+            if (handle == IntPtr.Zero) return null;
+            IntPtr data = GlobalLock(handle);
+            if (data == IntPtr.Zero) return null;
+            try { return Marshal.PtrToStringUni(data); } finally { GlobalUnlock(handle); }
+        } finally { CloseClipboard(); }
+    }
+}
+"@
+
+function ConvertTo-GxOscVisible([string]$Text) {
+    if ($null -eq $Text) { return $null }
+    $out = New-Object Text.StringBuilder
+    foreach ($c in $Text.ToCharArray()) { if ([int]$c -lt 32 -or [int]$c -eq 127) { [void]$out.AppendFormat('\x{0:x2}', [int]$c) } else { [void]$out.Append($c) } }
+    return $out.ToString()
+}
+
+function ConvertFrom-GxOscReply([string]$Text) {
+    $esc = [string][char]27
+    $parsed = [ordered]@{ found=$false; terminator=$null; kind=$null; payload=$null; decoded_b64=$null; decoded_length=$null; outcome='none' }
+    if (-not $Text) { return $parsed }
+    $start = $Text.IndexOf($esc + ']52;')
+    if ($start -lt 0) { $parsed.outcome = 'garbled'; return $parsed }
+    $body = $Text.Substring($start + 5)
+    $bel = $body.IndexOf([string][char]7)
+    $st = $body.IndexOf($esc + '\')
+    if ($bel -lt 0 -and $st -lt 0) { $parsed.outcome = 'garbled'; return $parsed }
+    if ($bel -ge 0 -and ($st -lt 0 -or $bel -lt $st)) { $end = $bel; $parsed.terminator = 'bel' } else { $end = $st; $parsed.terminator = 'st' }
+    $content = $body.Substring(0, $end)
+    $semi = $content.IndexOf(';')
+    if ($semi -lt 0) { $parsed.outcome = 'garbled'; return $parsed }
+    $parsed.found = $true
+    $parsed.kind = $content.Substring(0, $semi)
+    $parsed.payload = $content.Substring($semi + 1)
+    if ($parsed.payload.Length -eq 0) { $parsed.outcome = 'empty'; return $parsed }
+    try { $bytes = [Convert]::FromBase64String($parsed.payload) } catch { $parsed.outcome = 'garbled'; return $parsed }
+    $parsed.decoded_b64 = [Convert]::ToBase64String($bytes)
+    $parsed.decoded_length = $bytes.Length
+    $parsed.outcome = if ([Text.Encoding]::UTF8.GetString($bytes) -ceq $GxOscSeed) { 'match' } else { 'mismatch' }
+    return $parsed
+}
+
+function Get-GxOscExpected([string]$Case, [string]$Expect) {
+    $allow = @('allow','allow-remember','auto-allow')
+    if ($Expect -eq 'observe' -or $Case -eq 'read-cleared') { return 'observe' }
+    if ($Case -eq 'race') { return 'race' }
+    if ($Case -like 'write*') {
+        if ($Expect -eq 'auto' -or $allow -contains $Expect) { if ($Case -eq 'write') { return 'written' } else { return 'emptied' } }
+        return 'unchanged'
+    }
+    if ($Expect -eq 'auto') { throw 'Expect auto applies to write cases only (no dialog under clipboard-write = allow).' }
+    # A remembered deny turns clipboard-read into deny, which the core answers with nothing at all.
+    if ($Expect -eq 'auto-deny') { return 'none' }
+    if ($Case -eq 'read-empty') { return 'empty' }
+    if ($allow -contains $Expect) { return 'match' }
+    return 'empty'
+}
+
+function gxosc {
+    param([Parameter(Mandatory = $true, Position = 0)][ValidateSet('read','read-empty','read-cleared','write','write-empty','race')][string]$Case,
+          [Parameter(Position = 1)][ValidateSet('bel','st')][string]$Term = 'bel',
+          [Parameter(Position = 2)][ValidateSet('allow','deny','cancel','allow-remember','deny-remember','auto-allow','auto-deny','auto','observe')][string]$Expect = 'observe',
+          [Parameter(Position = 3)][ValidateRange(1,600)][int]$Timeout = 90)
+    $esc = [string][char]27
+    $terminator = if ($Term -eq 'st') { $esc + '\' } else { [string][char]7 }
+    $n = @(Get-ChildItem -LiteralPath $GxOscResults -Filter 'osc52-*.json' -ErrorAction SilentlyContinue).Count + 1
+    $result = [ordered]@{ schema=1; n=$n; token=$GxOscToken; case=$Case; terminator=$Term; expect=$Expect; timeout_seconds=$Timeout;
+        shell_pid=$PID; expected_outcome=(Get-GxOscExpected $Case $Expect); outcome=$null; verdict=$null; errors=@() }
+    $conIn = [GxOsc52]::Input()
+    $mode = [uint32]0
+    [void][GxOsc52]::GetConsoleMode($conIn, [ref]$mode)
+    $result.input_mode_before = '0x{0:X}' -f $mode
+    try {
+        switch ($Case) {
+            'read-empty' { $result.seq_seed = [GxOsc52]::Seed('text', '') }
+            'read-cleared' { $result.seq_seed = [GxOsc52]::Seed('cleared', '') }
+            { $_ -like 'write*' } { $result.seq_seed = [GxOsc52]::Seed('text', $GxOscBefore) }
+            default { $result.seq_seed = [GxOsc52]::Seed('text', $GxOscSeed) }
+        }
+        $request = if ($Case -eq 'write') { $esc + ']52;c;' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($GxOscWrite)) + $terminator }
+                   elseif ($Case -eq 'write-empty') { $esc + ']52;c;' + $terminator } else { $esc + ']52;c;?' + $terminator }
+        $result.request_visible = ConvertTo-GxOscVisible $request
+        Write-Host ("GX-OSC52 #{0} case={1} term={2} expect={3}: request sent, answer any dialog now" -f $n, $Case, $Term, $Expect)
+        if ($Case -like 'write*') {
+            [GxOsc52]::Send($request)
+            $result.sent_utc = [DateTime]::UtcNow.ToString('o')
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            while ($clock.Elapsed.TotalSeconds -lt $Timeout -and [GxOsc52]::Sequence() -eq $result.seq_seed) { Start-Sleep -Milliseconds 100 }
+            $result.elapsed_ms = [int]$clock.Elapsed.TotalMilliseconds
+            $result.seq_after = [GxOsc52]::Sequence()
+            $after = [GxOsc52]::ReadText()
+            $result.clipboard_after = [ordered]@{ has_text=($null -ne $after); length=$(if ($null -ne $after) { $after.Length } else { $null }) }
+            $result.outcome = if ($null -eq $after -or $after.Length -eq 0) { 'emptied' } elseif ($after -ceq $GxOscWrite) { 'written' } elseif ($after -ceq $GxOscBefore) { 'unchanged' } else { 'other' }
+        } else {
+            # Raw VT input: no line editing or echo, so the reply arrives as typed characters.
+            [void][GxOsc52]::SetConsoleMode($conIn, 0x200)
+            [GxOsc52]::Flush()
+            [GxOsc52]::Send($request)
+            $result.sent_utc = [DateTime]::UtcNow.ToString('o')
+            if ($Case -eq 'race') {
+                Start-Sleep -Seconds $Timeout
+                $result.outcome = 'race-exit'
+                $result.verdict = 'RACE_SENT'
+                $result.exit_utc = [DateTime]::UtcNow.ToString('o')
+                [IO.File]::WriteAllText((Join-Path $GxOscResults ('osc52-{0:D3}-{1}.json' -f $n, $Case)), ($result | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
+                Write-Host ("GX-OSC52 #{0} race: shell exits now while the request is pending" -f $n)
+                [Environment]::Exit(0)
+            }
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $reply = [GxOsc52]::Read($Timeout * 1000)
+            $result.elapsed_ms = [int]$clock.Elapsed.TotalMilliseconds
+            $result.reply_utc = [DateTime]::UtcNow.ToString('o')
+            $result.reply_length = $reply.Length
+            $result.reply_visible = ConvertTo-GxOscVisible $(if ($reply.Length -gt 4096) { $reply.Substring(0, 4096) } else { $reply })
+            $result.reply = ConvertFrom-GxOscReply $reply
+            $result.outcome = $result.reply.outcome
+            $result.seq_after = [GxOsc52]::Sequence()
+        }
+    } catch {
+        $result.errors += $_.Exception.Message
+        if (-not $result.outcome) { $result.outcome = 'error' }
+    } finally {
+        [void][GxOsc52]::SetConsoleMode($conIn, $mode)
+    }
+    $result.verdict = if ($result.expected_outcome -eq 'observe') { 'OBSERVED' } elseif ($result.outcome -ceq $result.expected_outcome) { 'PASS' } else { 'FAIL' }
+    $path = Join-Path $GxOscResults ('osc52-{0:D3}-{1}.json' -f $n, $Case)
+    [IO.File]::WriteAllText($path, ($result | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
+    Write-Host ("GX-OSC52 #{0} case={1} term={2} expect={3} outcome={4} expected={5} verdict={6}" -f $n, $Case, $Term, $Expect, $result.outcome, $result.expected_outcome, $result.verdict)
+}
+Write-Host ('GX-OSC52 probe ready (token ' + $GxOscToken + '). Usage: gxosc <read|read-empty|read-cleared|write|write-empty|race> <bel|st> <expect> [seconds]')
+'@
+
+function New-Osc52Probe([string]$Results, [string]$Token) {
+    # Fixture-known test strings only; the seed carries non-ASCII text so the
+    # UTF-8 and base64 path is exercised. Built from code points: the fixture
+    # file itself stays ASCII for Windows PowerShell 5.1.
+    $cjk = -join @([char]0x526A, [char]0x8D34, [char]0x677F, [char]0x6D4B, [char]0x8BD5)
+    $strings = [ordered]@{
+        seed = 'GX-OSC52-SEED ' + $Token + ' ' + $cjk + ' ' + [char]0x2713 + ' end'
+        before = 'GX-OSC52-BEFORE ' + $Token
+        write = 'GX-OSC52-WRITE ' + $Token + ' ' + $cjk + ' line2'
+    }
+    if ($Results -match "[\s']") { throw 'The probe results path must not contain whitespace or quotes.' }
+    $text = $script:Osc52ProbeTemplate.Replace('__RESULTS__', $Results).Replace('__TOKEN__', $Token)
+    foreach ($key in @('seed','before','write')) {
+        $text = $text.Replace('__' + $key.ToUpperInvariant() + '_B64__', [Convert]::ToBase64String((Get-Utf8Bytes $strings[$key])))
+    }
+    if ($text -match '__[A-Z0-9_]+__' -or $text -match '[^\x00-\x7f]') { throw 'Generated probe is incomplete or not ASCII.' }
+    return @{ text=$text; strings=$strings }
+}
+
+function Get-Osc52Results([string]$Results) {
+    if (-not (Test-Path -LiteralPath $Results)) { return @() }
+    return @(Get-ChildItem -LiteralPath $Results -Filter 'osc52-*.json' | Sort-Object Name | ForEach-Object {
+        $script:ExportExtra.Add($_.FullName)
+        Read-JsonFile $_.FullName })
+}
+
+function Invoke-Osc52 {
+    # start: isolated app whose terminal dot-sources the probe (gxosc ...);
+    # status/collect: app state and probe results; stop: CloseMainWindow, then
+    # empty the clipboard only if it still holds this fixture's last content.
+    $step = Assert-Action @('start','status','collect','stop') 'start'
+    $name = 'osc52-' + $Label
+    $results = Join-Path $script:RunRoot ('osc52-' + $Label + '-results')
+    if ($step -ceq 'start') {
+        $previous = Read-Record $name
+        if ($previous) { throw "osc52 label $Label already exists in this run; use a new -Label." }
+        $app = Resolve-GlApp
+        $token = [guid]::NewGuid().ToString('N').Substring(0, 12)
+        [IO.Directory]::CreateDirectory($results) | Out-Null
+        $probe = New-Osc52Probe $results $token
+        $probePath = Join-Path $script:RunRoot ('osc52-' + $Label + '-probe.ps1')
+        [IO.File]::WriteAllText($probePath, $probe.text, [Text.Encoding]::ASCII)
+        $lines = @('language = en', 'confirm-close-surface = false', 'gx-session-restore = false',
+            ('command = powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -Command . ' + $probePath),
+            'keybind = ctrl+alt+shift+o=new_split:right', 'keybind = ctrl+alt+shift+w=close_surface')
+        if ($ClipboardWritePolicy -ceq 'ask') { $lines += 'clipboard-write = ask' }
+        $environment = Get-AppEnvironment
+        $arguments = @('--gx-single-instance=false')
+        $private = Join-Path $script:RunRoot ($script:Step + '-osc52-' + $Label)
+        $started = Start-OwnedApp -Exe $app.exe -Private $private -ConfigBytes (Get-Utf8Bytes ((($lines -join $script:LF)) + $script:LF)) -Environment $environment -Arguments $arguments
+        $process = $started.process
+        $record = New-AppRecord $process $app.exe $app.class $private $started.config $environment $arguments
+        $record.token = $token
+        $record.probe = $probePath
+        $record.probe_sha256 = Get-Sha256 $probePath
+        $record.results = $results
+        $record.clipboard_read = 'default (not set; ask)'
+        $record.clipboard_write = $ClipboardWritePolicy
+        $record.test_strings_sha256 = [ordered]@{}
+        foreach ($key in @($probe.strings.Keys)) { $record.test_strings_sha256[$key] = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash((Get-Utf8Bytes $probe.strings[$key])))).Replace('-', '').ToLowerInvariant() }
+        Save-Record $name $record | Out-Null
+        $script:ExportExtra.Add($started.config)
+        $script:ExportExtra.Add($probePath)
+        try {
+            $record.main_window = Wait-AppWindow $process 45
+            $record.status = 'RUNNING'
+        } catch {
+            $record.status = 'START_FAILED'
+            $record.error = $_.Exception.Message
+            if (-not $process.HasExited) { $record.close = Close-OwnedApp $record }
+            throw
+        } finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+        Write-ExportMarker 'osc52-running' @{ label=$Label; pid=$record.pid; hwnd=$record.main_window['hwnd']; token=$token }
+        return [ordered]@{ record=$record; fixture_verdict='RUNNING'; next='type gxosc <case> <bel|st> <expect> in the terminal' }
+    }
+    $record = Read-Record $name
+    if ($null -eq $record) { throw "No osc52 record for -Label $Label in this run." }
+    $items = @(Get-Osc52Results $results)
+    $summary = @($items | ForEach-Object { [ordered]@{ n=$_.n; case=$_.case; terminator=$_.terminator; expect=$_.expect;
+        outcome=$_.outcome; expected=$_.expected_outcome; verdict=$_.verdict; elapsed_ms=$(if ($_.PSObject.Properties['elapsed_ms']) { $_.elapsed_ms } else { $null }) } })
+    $failed = @($items | Where-Object { $_.verdict -ceq 'FAIL' })
+    $status = Get-AppStatus $record
+    $result = [ordered]@{ record_status=$record.status; app=$status; results=$summary; counts=[ordered]@{
+        total=$items.Count; pass=@($items | Where-Object { $_.verdict -ceq 'PASS' }).Count; fail=$failed.Count;
+        observed=@($items | Where-Object { $_.verdict -ceq 'OBSERVED' }).Count; race=@($items | Where-Object { $_.verdict -ceq 'RACE_SENT' }).Count } }
+    if ($step -ceq 'status') { return $result }
+    if ($step -ceq 'stop') {
+        $close = Close-OwnedApp $record
+        Set-RecordField $record 'close' $close
+        $record.status = if ($close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' }
+        Save-Record $name $record | Out-Null
+        if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+        $result.close = $close
+        # Clean up only content this fixture wrote: the last sequence number a probe observed.
+        $sequences = @($items | ForEach-Object { foreach ($field in @('seq_seed','seq_after')) { if ($_.PSObject.Properties[$field] -and $null -ne $_.$field) { [long]$_.$field } } })
+        if ($sequences.Count -eq 0) {
+            $script:Restore = @{ clipboard='nothing to clean: no probe wrote the clipboard' }
+        } else {
+            if (-not ('GxVmClipboard' -as [type])) { Add-Type -TypeDefinition $script:ClipboardSource -Language CSharp }
+            $last = ($sequences | Measure-Object -Maximum).Maximum
+            $now = [GxVmClipboard]::Sequence()
+            $emptied = [GxVmClipboard]::EmptyIfSequence([long]$last)
+            $script:Restore = [ordered]@{ clipboard=$(if ($emptied -ge 0) { 'emptied (held only this fixture''s last content)' } else { 'left untouched: sequence moved past the fixture''s last write' });
+                last_fixture_sequence=$last; sequence_before_cleanup=$now; sequence_after_cleanup=[GxVmClipboard]::Sequence() }
+        }
+        $result.fixture_verdict = if ($failed.Count -gt 0 -or -not $close.closed_normally) { 'FAIL' } else { 'PASS' }
+        $result.fixture_reason = if ($failed.Count -gt 0) { 'probe cases failed: ' + (@($failed | ForEach-Object { '#' + $_.n + ' ' + $_.case }) -join ', ') } elseif (-not $close.closed_normally) { 'normal close did not pass' } else { $null }
+        return $result
+    }
+    # collect: a still-running app is required unless the record was stopped.
+    $result.fixture_verdict = if ($failed.Count -gt 0 -or -not $status.alive) { 'FAIL' } else { 'PASS' }
+    $result.fixture_reason = if ($failed.Count -gt 0) { 'probe cases failed: ' + (@($failed | ForEach-Object { '#' + $_.n + ' ' + $_.case }) -join ', ') } elseif (-not $status.alive) { 'the owned app is no longer running' } else { $null }
+    return $result
+}
+
+# Runs inside the terminal under test: gxtoast titles its tab, waits, sends one
+# OSC 9 (or OSC 777) notification; gxtoast-early replays the early r3 sequence.
+$script:ToastProbeTemplate = @'
+# GX toast probe generated by gx_vm_validation.ps1 (phase toast-matrix). ASCII only.
+$GxToastResults = '__RESULTS__'
+$GxToastToken = '__TOKEN__'
+function Send-GxToast([string]$Tag, [string]$Kind, [string]$Body, [hashtable]$Extra) {
+    $esc = [string][char]27; $bel = [string][char]7
+    $sequence = if ($Kind -eq 'osc777') { $esc + ']777;notify;GX toast ' + $Tag + ';' + $Body + $bel } else { $esc + ']9;' + $Body + $bel }
+    [Console]::Out.Write($sequence)
+    [Console]::Out.Flush()
+    $n = @(Get-ChildItem -LiteralPath $GxToastResults -Filter 'toast-*.json' -ErrorAction SilentlyContinue).Count + 1
+    $record = [ordered]@{ schema=1; n=$n; token=$GxToastToken; tag=$Tag; kind=$Kind; body=$Body; shell_pid=$PID; sent_utc=[DateTime]::UtcNow.ToString('o') }
+    if ($Extra) { foreach ($key in $Extra.Keys) { $record[$key] = $Extra[$key] } }
+    [IO.File]::WriteAllText((Join-Path $GxToastResults ('toast-{0:D3}-{1}.json' -f $n, $Tag)), ($record | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+    return $record
+}
+function gxtoast {
+    param([Parameter(Mandatory = $true, Position = 0)][ValidatePattern('^[A-Za-z0-9-]{1,16}$')][string]$Tag,
+          [Parameter(Position = 1)][ValidateRange(0,600)][int]$Delay = 10,
+          [Parameter(Position = 2)][ValidateSet('osc9','osc777')][string]$Kind = 'osc9')
+    $esc = [string][char]27; $bel = [string][char]7
+    [Console]::Out.Write($esc + ']2;GX-TOAST-' + $Tag + $bel)
+    Write-Host ("GX-TOAST {0}: tab titled GX-TOAST-{0}; {1} in {2} s" -f $Tag, $Kind, $Delay)
+    Start-Sleep -Seconds $Delay
+    $record = Send-GxToast $Tag $Kind ('GX toast ' + $Tag + ' ' + $GxToastToken) @{ delay_seconds=$Delay; title=('GX-TOAST-' + $Tag) }
+    Write-Host ("GX-TOAST {0}: SENT #{1} at {2}" -f $Tag, $record.n, $record.sent_utc)
+}
+function gxtoast-early {
+    param([Parameter(Position = 0)][int[]]$Offsets = @(8, 25, 45))
+    $esc = [string][char]27; $bel = [string][char]7
+    [Console]::Out.Write($esc + ']2;GX-TOAST-EARLY' + $bel)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $i = 0
+    foreach ($offset in $Offsets) {
+        $i++
+        while ($clock.Elapsed.TotalSeconds -lt $offset) { Start-Sleep -Milliseconds 100 }
+        $record = Send-GxToast ('early' + $i) 'osc9' ('GX early ' + $i + ' ' + $GxToastToken) @{ offset_seconds=$offset; elapsed_ms=[int]$clock.Elapsed.TotalMilliseconds }
+        Write-Host ("==== GX-TOAST-EARLY {0}/{1} SENT at {2} (offset {3} s) ====" -f $i, $Offsets.Count, $record.sent_utc, $offset)
+    }
+    Write-Host 'GX-TOAST-EARLY sequence complete.'
+}
+Write-Host ('GX toast probe ready (token ' + $GxToastToken + '). Usage: gxtoast <tag> [delay] [osc9|osc777]; gxtoast-early [offsets]')
+'@
+
+function New-ToastProbe([string]$Results, [string]$Token) {
+    if ($Results -match "[\s']") { throw 'The probe results path must not contain whitespace or quotes.' }
+    $text = $script:ToastProbeTemplate.Replace('__RESULTS__', $Results).Replace('__TOKEN__', $Token)
+    if ($text -match '__[A-Z0-9_]+__' -or $text -match '[^\x00-\x7f]') { throw 'Generated probe is incomplete or not ASCII.' }
+    return $text
+}
+
+function Get-ToastProbeResults {
+    return @(Get-ChildItem -LiteralPath $script:RunRoot -Directory -Filter 'toast-*-results' -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem -LiteralPath $_.FullName -Filter 'toast-*.json' | Sort-Object Name | ForEach-Object {
+            $script:ExportExtra.Add($_.FullName)
+            Read-JsonFile $_.FullName } })
+}
+
+function Start-ToastApp([string]$Exe, [string]$Class, [string]$EarlyCommand) {
+    $name = 'toast-' + $Label
+    $previous = Read-Record $name
+    if ($previous) { throw "toast-matrix label $Label already exists in this run; use a new -Label." }
+    $token = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $results = Join-Path $script:RunRoot ('toast-' + $Label + '-results')
+    [IO.Directory]::CreateDirectory($results) | Out-Null
+    $probePath = Join-Path $script:RunRoot ('toast-' + $Label + '-probe.ps1')
+    [IO.File]::WriteAllText($probePath, (New-ToastProbe $results $token), [Text.Encoding]::ASCII)
+    $command = 'command = powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -Command . ' + $probePath
+    if ($EarlyCommand) { $command += '; ' + $EarlyCommand }
+    $lines = @('language = en', 'confirm-close-surface = false', 'gx-session-restore = false', $command) + $script:FixtureKeybinds
+    $environment = Get-AppEnvironment
+    $arguments = @('--gx-single-instance=false')
+    $private = Join-Path $script:RunRoot ($script:Step + '-toast-' + $Label)
+    $started = Start-OwnedApp -Exe $Exe -Private $private -ConfigBytes (Get-Utf8Bytes (($lines -join $script:LF) + $script:LF)) -Environment $environment -Arguments $arguments
+    $process = $started.process
+    $record = New-AppRecord $process $Exe $Class $private $started.config $environment $arguments
+    $record.token = $token
+    $record.probe = $probePath
+    $record.results = $results
+    $record.aumid = if ($Class -ceq 'PORTABLE_COPY') { Get-PortableAumid $Exe } else { $script:InstalledAumid }
+    Save-Record $name $record | Out-Null
+    $script:ExportExtra.Add($started.config)
+    try {
+        $record.main_window = Wait-AppWindow $process 45
+        $record.status = 'RUNNING'
+    } catch {
+        $record.status = 'START_FAILED'
+        $record.error = $_.Exception.Message
+        if (-not $process.HasExited) { $record.close = Close-OwnedApp $record }
+        throw
+    } finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+    return $record
+}
+
+function Get-ToastRecords {
+    $dir = Join-Path $script:RunRoot 'records'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter 'toast-*.json' | ForEach-Object { Read-JsonFile $_.FullName } |
+        Where-Object { $_.PSObject.Properties['pid'] })
+}
+
+function Invoke-ToastMatrix {
+    # start: isolated installed app with the gxtoast probe; portable: the same
+    # payload copied outside the installation (portable identity); early: the
+    # probe shell replays the early three-OSC sequence; native-probe: a direct
+    # WinRT toast for the installed AUMID; disable-app/enable-app: the
+    # per-app notification switch (HKCU, backed up and restored);
+    # status: windows, foreground, history XML; stop: close and restore.
+    $step = Assert-Action @('start','portable','early','native-probe','disable-app','enable-app','status','stop') 'status'
+    switch ($step) {
+        'start' {
+            $app = Resolve-GlApp
+            if ($app.class -cne 'INSTALLED') { throw 'toast-matrix needs the installed, registered application (registration_verified).' }
+            $record = Start-ToastApp $app.exe $app.class $null
+            Write-ExportMarker 'toast-running' @{ label=$Label; pid=$record.pid; hwnd=$record.main_window['hwnd'] }
+            return [ordered]@{ record=$record; installed=(Get-ToastFacts $script:InstalledAumid); fixture_verdict='RUNNING' }
+        }
+        'portable' {
+            $copy = Copy-PortableApp (Join-Path $script:RunRoot ('portable-' + $Label))
+            $before = Registry-Snapshot
+            $record = Start-ToastApp $copy.exe 'PORTABLE_COPY' $null
+            Start-Sleep -Seconds 8
+            $after = Registry-Snapshot
+            $unchanged = (Json-Canonical $before) -ceq (Json-Canonical $after)
+            return [ordered]@{ record=$record; copy=$copy; registry_unchanged=$unchanged; registry_before=$before; registry_after=$after;
+                installed=(Get-ToastFacts $script:InstalledAumid); portable=(Get-ToastFacts $copy.aumid);
+                fixture_verdict=$(if ($unchanged) { 'RUNNING' } else { 'FAIL' }); fixture_reason=$(if ($unchanged) { $null } else { 'starting the portable copy changed the shell registration' }) }
+        }
+        'early' {
+            $app = Resolve-GlApp
+            if ($app.class -cne 'INSTALLED') { throw 'The early sequence needs the installed, registered application.' }
+            $settingsBefore = Read-HkcuTree $script:NotificationSettingsKey
+            $reset = $null
+            if ($ResetToastSettings) {
+                $backup = Backup-HkcuKey 'toast-notification-settings' $script:NotificationSettingsKey
+                $base = Open-HkcuBase
+                try { $base.DeleteSubKeyTree($script:NotificationSettingsKey, $false) } finally { $base.Dispose() }
+                $reset = [ordered]@{ backed_up_utc=$backup.backed_up_utc; deleted=(-not (Read-HkcuTree $script:NotificationSettingsKey).exists) }
+            }
+            $exeItem = Get-Item -LiteralPath $app.exe
+            $record = Start-ToastApp $app.exe $app.class ('gxtoast-early ' + $EarlyOffsets)
+            Write-ExportMarker 'toast-early-running' @{ label=$Label; pid=$record.pid; offsets=$EarlyOffsets; utc=[DateTime]::UtcNow.ToString('o') }
+            return [ordered]@{ record=$record; offsets=$EarlyOffsets; notification_settings_before=$settingsBefore; reset=$reset;
+                seconds_since_exe_created=[int]([DateTime]::UtcNow - $exeItem.CreationTimeUtc).TotalSeconds;
+                installed=(Get-ToastFacts $script:InstalledAumid); fixture_verdict='RUNNING' }
+        }
+        'native-probe' {
+            Initialize-Toast
+            $token = [guid]::NewGuid().ToString('N').Substring(0, 12)
+            $facts = [ordered]@{ aumid=$script:InstalledAumid; token=$token; phases=@() }
+            $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($script:InstalledAumid)
+            $facts.setting = [string]$notifier.Setting
+            $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+            $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>GX native control</text><text>' + $token + '</text></binding></visual></toast>')
+            $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+            $facts.shown_utc = [DateTime]::UtcNow.ToString('o')
+            $facts.note = 'Show returned; presentation needs the screenshot.'
+            Save-Record ('toast-native-' + $token) $facts | Out-Null
+            return $facts
+        }
+        'disable-app' {
+            $backup = Backup-HkcuKey 'toast-notification-settings' $script:NotificationSettingsKey
+            $base = Open-HkcuBase
+            try {
+                $key = $base.CreateSubKey($script:NotificationSettingsKey)
+                try { $key.SetValue('Enabled', 0, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
+            } finally { $base.Dispose() }
+            return [ordered]@{ backed_up_utc=$backup.backed_up_utc; before=$backup.before; after=(Read-HkcuTree $script:NotificationSettingsKey);
+                installed=(Get-ToastFacts $script:InstalledAumid) }
+        }
+        'enable-app' {
+            $script:Restore = Restore-HkcuKey 'toast-notification-settings'
+            return [ordered]@{ restore=$script:Restore; installed=(Get-ToastFacts $script:InstalledAumid);
+                fixture_verdict=$(if ($script:Restore.restored) { 'PASS' } else { 'FAIL' }) }
+        }
+        'status' {
+            $records = @(Get-ToastRecords)
+            $aumids = @(@($script:InstalledAumid) + @($records | ForEach-Object { $_.aumid }) | Select-Object -Unique)
+            return [ordered]@{ apps=@($records | ForEach-Object { Get-AppStatus $_ }); toast=@($aumids | ForEach-Object { Get-ToastFacts $_ });
+                probe_results=@(Get-ToastProbeResults); notification_settings=(Read-HkcuTree $script:NotificationSettingsKey);
+                quiet_hours=(Get-QuietHoursDiagnostic); visual_review='PENDING' }
+        }
+        'stop' {
+            $closes = @(Get-ToastRecords | Where-Object { $_.status -ceq 'RUNNING' } | ForEach-Object {
+                $record = $_
+                $close = Close-OwnedApp $record
+                Set-RecordField $record 'close' $close
+                $record.status = if ($close.closed_normally -or $close.already_exited) { 'CLOSED' } else { 'CLOSE_FAILED' }
+                Save-Record ('toast-' + $record.label) $record | Out-Null
+                if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+                $close })
+            $settings = Restore-HkcuKey 'toast-notification-settings'
+            $removed = @(Get-ToastRecords | Where-Object { $_.app_class -ceq 'PORTABLE_COPY' -and $_.status -ceq 'CLOSED' } | ForEach-Object {
+                $dir = Split-Path -Parent $_.exe
+                $root = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
+                if ([IO.Path]::GetFullPath($dir).StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $dir) -like 'portable-*' -and (Test-Path -LiteralPath $dir)) {
+                    Remove-Item -LiteralPath $dir -Recurse -Force
+                    $dir
+                } })
+            $script:Restore = [ordered]@{ notification_settings=$settings; removed_portable_copies=$removed }
+            $bad = @($closes | Where-Object { -not $_.closed_normally -and -not $_.already_exited })
+            $verdict = if ($bad.Count -gt 0 -or -not $settings.restored) { 'FAIL' } else { 'PASS' }
+            return [ordered]@{ closes=$closes; restore=$script:Restore; toast=(Get-ToastFacts $script:InstalledAumid);
+                probe_results=@(Get-ToastProbeResults); fixture_verdict=$verdict;
+                fixture_reason=$(if ($bad.Count -gt 0) { 'an owned app did not close normally' } elseif (-not $settings.restored) { 'notification settings were not restored' } else { $null }) }
+        }
+    }
+}
+
+# ---- jumplist-matrix: the real user configuration and shell jump lists -----
+
+function Get-UserConfigFiles {
+    $dir = Join-Path $env:LOCALAPPDATA 'ghostty'
+    return @(@('config.ghostty', 'config', 'gui-settings.ghostty') | ForEach-Object { Join-Path $dir $_ })
+}
+
+function Get-FixtureConfigMarker { return '# gx-vm-validation owner ' + $RunId + ' ' + $script:State.token }
+
+function Test-FixtureOwnedFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return ([string](Get-Content -LiteralPath $Path -TotalCount 1 -Encoding UTF8)) -ceq (Get-FixtureConfigMarker)
+}
+
+function Adopt-UserConfig {
+    # JumpList launches use the shell's environment, so these cases need the real
+    # configuration. Foreign files are backed up (hash-checked) and moved aside.
+    if ($env:XDG_CONFIG_HOME) { throw 'XDG_CONFIG_HOME is set for this user; the jump list cases expect the default configuration directory.' }
+    $record = Read-Record 'jumplist-user-config'
+    if ($record -and -not $record.restored) { return $record }
+    $backupDir = Join-Path $script:RunRoot ('user-config-backup-' + $script:Step)
+    $files = @()
+    foreach ($path in Get-UserConfigFiles) {
+        $entry = [ordered]@{ path=$path; existed=(Test-Path -LiteralPath $path -PathType Leaf); sha256=$null; backup=$null }
+        if ($entry.existed) {
+            if (-not $AdoptUserConfig) { throw "A configuration this fixture did not write exists ($path); pass -AdoptUserConfig to back it up and replace it." }
+            [IO.Directory]::CreateDirectory($backupDir) | Out-Null
+            $entry.sha256 = Get-Sha256 $path
+            $entry.backup = Join-Path $backupDir ([IO.Path]::GetFileName($path))
+            Copy-Item -LiteralPath $path -Destination $entry.backup
+            Assert-Hash $entry.backup $entry.sha256
+            Remove-Item -LiteralPath $path
+        }
+        $files += $entry
+    }
+    Save-Record 'jumplist-user-config' ([ordered]@{ files=$files; adopted_utc=[DateTime]::UtcNow.ToString('o'); restored=$false }) | Out-Null
+    return Read-Record 'jumplist-user-config'
+}
+
+function Restore-UserConfig {
+    $record = Read-Record 'jumplist-user-config'
+    if ($null -eq $record) { return [ordered]@{ restored=$true; note='no configuration was adopted' } }
+    if ($record.restored) { return [ordered]@{ restored=$true; note='already restored' } }
+    $items = @(foreach ($entry in @($record.files)) {
+        $item = [ordered]@{ path=$entry.path; action=$null; ok=$false }
+        $present = Test-Path -LiteralPath $entry.path -PathType Leaf
+        if ($present -and -not (Test-FixtureOwnedFile $entry.path)) {
+            $item.action = 'left untouched: the file now present was not written by this fixture'
+            $item.sha256_now = Get-Sha256 $entry.path
+        } elseif ($entry.existed) {
+            Copy-Item -LiteralPath $entry.backup -Destination $entry.path -Force
+            $item.ok = (Get-Sha256 $entry.path) -ceq $entry.sha256
+            $item.action = 'restored from backup'
+        } elseif ($present) {
+            Remove-Item -LiteralPath $entry.path
+            $item.ok = -not (Test-Path -LiteralPath $entry.path)
+            $item.action = 'removed the fixture file'
+        } else { $item.ok = $true; $item.action = 'absent, as before' }
+        $item })
+    $ok = @($items | Where-Object { -not $_.ok }).Count -eq 0
+    Set-RecordField $record 'restored' $ok
+    Set-RecordField $record 'restore' $items
+    Save-Record 'jumplist-user-config' $record | Out-Null
+    return [ordered]@{ restored=$ok; files=$items }
+}
+
+function Get-JumpListMarkDir { return Join-Path $script:RunRoot ('jl mark ' + (-join @([char]0x4E2D, [char]0x6587)) + " 'q'") }
+
+function Get-JumpListProfiles([string]$MarkDir) {
+    $mark = Join-Path $MarkDir 'gx-jl-mark.cmd'
+    return @(
+        [ordered]@{ key='p1'; name='GX JL Plain'; command='cmd.exe /d /k title GX_JL_P1' },
+        [ordered]@{ key='p2'; name='GX JL Space Name'; command='cmd.exe /d /k title GX_JL_P2' },
+        [ordered]@{ key='p3'; name=('GX JL ' + (-join @([char]0x4E2D, [char]0x6587))); command='cmd.exe /d /k title GX_JL_P3' },
+        [ordered]@{ key='p4'; name='GX JL "Quote"'; command='cmd.exe /d /k title GX_JL_P4' },
+        [ordered]@{ key='p5'; name='GX JL Trail\'; command='cmd.exe /d /k title GX_JL_P5' },
+        [ordered]@{ key='p6'; name='GX JL Path'; command=('cmd.exe /d /k call "' + $mark + '" "' + $MarkDir + '\"') })
+}
+
+function New-JumpListConfig([string]$Set, [string]$MarkDir) {
+    $profiles = @(Get-JumpListProfiles $MarkDir)
+    if ($Set -ceq 'deleted') { $profiles = @($profiles | Where-Object { $_.key -cne 'p2' }) }
+    $language = if ($Set -ceq 'lang-zh') { 'zh-CN' } else { 'en' }
+    $lines = @((Get-FixtureConfigMarker), ('language = ' + $language), 'confirm-close-surface = false', 'gx-session-restore = false') +
+        $script:FixtureKeybinds + @($profiles | ForEach-Object { 'gx-launch-profile = ' + $_.name + '=' + $_.command })
+    return @{ text=(($lines -join $script:LF) + $script:LF); profiles=$profiles; language=$language }
+}
+
+function Read-JumpListTasks([byte[]]$Bytes, [string[]]$Titles) {
+    # Shell link StringData is UTF-16 with a 16-bit length prefix: read each
+    # argument string exactly, then decode it with CommandLineToArgvW.
+    if (-not ('GxVmToken' -as [type])) { Add-Type -TypeDefinition $script:TokenSource -Language CSharp }
+    $marker = '"--gx-shell-action=profile"'
+    $tasks = New-Object System.Collections.Generic.List[object]
+    $present = New-Object System.Collections.Generic.List[string]
+    foreach ($offset in @(0, 1)) {
+        $count = $Bytes.Length - $offset
+        if ($count -lt 2) { continue }
+        $text = [Text.Encoding]::Unicode.GetString($Bytes, $offset, $count - ($count % 2))
+        foreach ($title in $Titles) { if ($text.Contains($title) -and -not $present.Contains($title)) { $present.Add($title) } }
+        $index = $text.IndexOf($marker)
+        while ($index -ge 0 -and $tasks.Count -lt 128) {
+            $length = if ($index -gt 0) { [int]$text[$index - 1] } else { 0 }
+            if ($length -ge $marker.Length -and $index + $length -le $text.Length) { $arguments = $text.Substring($index, $length); $method = 'length-prefixed' }
+            else {
+                $end = $index
+                while ($end -lt $text.Length -and [int]$text[$end] -ge 32) { $end++ }
+                $arguments = $text.Substring($index, $end - $index); $method = 'printable-run'
+            }
+            $argv = @([GxVmToken]::Arguments('x ' + $arguments) | Select-Object -Skip 1)
+            $profile = if ($argv.Count -ge 2 -and $argv[1].StartsWith('--gx-shell-profile=')) { $argv[1].Substring(19) } else { $null }
+            $tasks.Add([ordered]@{ alignment=$offset; method=$method; arguments=$arguments; argv=$argv; profile=$profile;
+                shape_ok=($argv.Count -eq 2 -and $argv[0] -ceq '--gx-shell-action=profile' -and $null -ne $profile) })
+            $index = $text.IndexOf($marker, $index + $marker.Length)
+        }
+    }
+    return @{ tasks=$tasks.ToArray(); titles_present=$present.ToArray() }
+}
+
+function Get-JumpListTitles {
+    $titles = @(Get-JumpListProfiles (Get-JumpListMarkDir) | ForEach-Object { $_.name })
+    return $titles + @('Command Prompt', 'Windows PowerShell', (-join @([char]0x547D, [char]0x4EE4, [char]0x63D0, [char]0x793A, [char]0x7B26)))
+}
+
+function Get-JumpListFiles {
+    $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Recent\CustomDestinations'
+    $facts = [ordered]@{ dir=$dir; exists=(Test-Path -LiteralPath $dir); dir_sddl=$null; files=@() }
+    if (-not $facts.exists) { return $facts }
+    $facts.dir_sddl = (Get-Acl -LiteralPath $dir).Sddl
+    $titles = Get-JumpListTitles
+    $facts.files = @(Get-ChildItem -LiteralPath $dir -File -Force | Sort-Object Name | ForEach-Object {
+        $item = [ordered]@{ name=$_.Name; size=$_.Length; modified_utc=$_.LastWriteTimeUtc.ToString('o'); sha256=$null; gx=$false }
+        if ($_.Length -le 4194304) {
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            $item.sha256 = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+            $parsed = Read-JumpListTasks $bytes $titles
+            if ($parsed.tasks.Count -gt 0) { $item.gx = $true; $item.tasks = $parsed.tasks; $item.titles_present = $parsed.titles_present }
+        }
+        $item })
+    return $facts
+}
+
+function Get-JumpListLogLines {
+    $lines = @()
+    foreach ($name in @('ghostty.log.1', 'ghostty.log')) {
+        $path = Join-Path $env:LOCALAPPDATA ('ghostty\logs\' + $name)
+        if (Test-Path -LiteralPath $path) { $lines += @(Get-Content -LiteralPath $path | Select-String -SimpleMatch 'JumpList' | ForEach-Object Line) }
+    }
+    return @($lines | Select-Object -Last 40)
+}
+
+function Test-JumpListState($JumpLists) {
+    $gx = @($JumpLists.files | Where-Object { $_.gx })
+    $acl = Read-Record 'jumplist-acl'
+    if ($acl -and -not $acl.restored) {
+        # Commit denied: the list committed before the denial must be byte-identical.
+        $changed = @($acl.gx_files | Where-Object { $name = $_.name; $sha = $_.sha256; -not @($gx | Where-Object { $_.name -ceq $name -and $_.sha256 -ceq $sha }) })
+        return [ordered]@{ mode='commit-denied'; unchanged=($changed.Count -eq 0); changed=@($changed | ForEach-Object { $_.name });
+            verdict=$(if ($changed.Count -eq 0) { 'PASS' } else { 'FAIL' }) }
+    }
+    $config = Read-Record 'jumplist-user-config'
+    if (-not $config -or $config.restored -or -not $config.PSObject.Properties['profiles']) { return [ordered]@{ mode='no-fixture-config'; verdict='OBSERVED' } }
+    $expected = @($config.profiles | ForEach-Object { 'custom:' + $_.name })
+    $all = @(Get-JumpListProfiles (Get-JumpListMarkDir) | ForEach-Object { 'custom:' + $_.name })
+    $listed = @($gx | ForEach-Object { $_.tasks } | ForEach-Object { $_.profile } | Where-Object { $_ } | Select-Object -Unique)
+    $missing = @($expected | Where-Object { $listed -cnotcontains $_ })
+    $unexpected = @($listed | Where-Object { $all -ccontains $_ -and $expected -cnotcontains $_ })
+    $shape = @($gx | ForEach-Object { $_.tasks } | Where-Object { -not $_.shape_ok }).Count -eq 0
+    return [ordered]@{ mode='config'; set=$config.set; language=$config.language; expected=$expected; listed=$listed; missing=$missing;
+        unexpected=$unexpected; shape_ok=$shape; verdict=$(if ($missing.Count -eq 0 -and $unexpected.Count -eq 0 -and $shape -and $gx.Count -gt 0) { 'PASS' } else { 'FAIL' }) }
+}
+
+function Set-JumpListCommitDenied {
+    $existing = Read-Record 'jumplist-acl'
+    if ($existing -and -not $existing.restored) { throw 'Commits are already denied in this run; run allow-commit first.' }
+    $lists = Get-JumpListFiles
+    $gx = @($lists.files | Where-Object { $_.gx })
+    if (-not $lists.exists -or $gx.Count -eq 0) { throw 'No Ghostty GX jump list is committed yet; publish one before denying commits.' }
+    $targets = @($lists.dir) + @($gx | ForEach-Object { Join-Path $lists.dir $_.name })
+    $entries = @($targets | ForEach-Object { [ordered]@{ path=$_; sddl=(Get-Acl -LiteralPath $_).Sddl } })
+    Save-Record 'jumplist-acl' ([ordered]@{ entries=$entries; gx_files=@($gx | ForEach-Object { [ordered]@{ name=$_.name; sha256=$_.sha256 } });
+        denied_utc=[DateTime]::UtcNow.ToString('o'); restored=$false }) | Out-Null
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    foreach ($entry in $entries) {
+        $rights = if ($entry.path -ceq $lists.dir) { [Security.AccessControl.FileSystemRights]'CreateFiles, AppendData, DeleteSubdirectoriesAndFiles' }
+                  else { [Security.AccessControl.FileSystemRights]'WriteData, AppendData, Delete' }
+        $acl = Get-Acl -LiteralPath $entry.path
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user, $rights, [Security.AccessControl.AccessControlType]::Deny))
+        Set-Acl -LiteralPath $entry.path -AclObject $acl
+    }
+    return @($entries | ForEach-Object { [ordered]@{ path=$_.path; sddl_before=$_.sddl; sddl_now=(Get-Acl -LiteralPath $_.path).Sddl } })
+}
+
+function Restore-JumpListAcl {
+    $record = Read-Record 'jumplist-acl'
+    if ($null -eq $record) { return [ordered]@{ restored=$true; note='commits were never denied' } }
+    if ($record.restored) { return [ordered]@{ restored=$true; note='already restored' } }
+    $items = @(foreach ($entry in @($record.entries)) {
+        $item = [ordered]@{ path=$entry.path; ok=$false; note=$null }
+        if (-not (Test-Path -LiteralPath $entry.path)) { $item.note = 'path no longer exists' }
+        else {
+            $acl = Get-Acl -LiteralPath $entry.path
+            $acl.SetSecurityDescriptorSddlForm($entry.sddl)
+            Set-Acl -LiteralPath $entry.path -AclObject $acl
+            $item.ok = (Get-Acl -LiteralPath $entry.path).Sddl -ceq $entry.sddl
+        }
+        $item })
+    $ok = @($items | Where-Object { -not $_.ok }).Count -eq 0
+    Set-RecordField $record 'restored' $ok
+    Set-RecordField $record 'restore' $items
+    Save-Record 'jumplist-acl' $record | Out-Null
+    return [ordered]@{ restored=$ok; entries=$items }
+}
+
+function Get-JumpListAppRecords {
+    $dir = Join-Path $script:RunRoot 'records'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter 'jumplist-*.json' | ForEach-Object { Read-JsonFile $_.FullName } |
+        Where-Object { $_.PSObject.Properties['pid'] -and $_.PSObject.Properties['record_name'] })
+}
+
+function Close-JumpListApp($Record) {
+    $close = Close-OwnedApp $Record
+    Set-RecordField $Record 'close' $close
+    $Record.status = if ($close.closed_normally -or $close.already_exited) { 'CLOSED' } else { 'CLOSE_FAILED' }
+    Save-Record $Record.record_name $Record | Out-Null
+    return $close
+}
+
+function Invoke-JumpListMatrix {
+    # config: write a profile set to the real configuration (adopting it once);
+    # snapshot: committed lists read from CustomDestinations; start: the
+    # installed app in the real environment; observe: what a shell (JumpList)
+    # launch produced; deny-commit/allow-commit: make CommitList fail by ACL,
+    # then restore the exact descriptors; portable: a copied payload must not
+    # publish or register; stop: close owned/adopted apps; restore: config+ACL.
+    $step = Assert-Action @('config','snapshot','start','observe','deny-commit','allow-commit','portable','stop','restore') 'snapshot'
+    $installedExe = Join-Path $script:AppDir 'ghostty.exe'
+    switch ($step) {
+        'config' {
+            $record = Adopt-UserConfig
+            $markDir = Get-JumpListMarkDir
+            Assert-NoReparse $markDir
+            [IO.Directory]::CreateDirectory($markDir) | Out-Null
+            $markScript = (@('@echo off', 'title GX_JL_P6', 'set "GXARG=%~1"',
+                '>>"%~dp0gx-jl-marker.txt" echo GX_JL_PATH_OK tail=[%GXARG:~-1%] at %DATE% %TIME%') -join "`r`n") + "`r`n"
+            [IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-mark.cmd'), $markScript, [Text.Encoding]::ASCII)
+            $config = New-JumpListConfig $JumpListSet $markDir
+            $path = (Get-UserConfigFiles)[0]
+            if ((Test-Path -LiteralPath $path) -and -not (Test-FixtureOwnedFile $path)) { throw "Refusing to overwrite ${path}: it is not this fixture's file." }
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path)) | Out-Null
+            [IO.File]::WriteAllBytes($path, (Get-Utf8Bytes $config.text))
+            Set-RecordField $record 'set' $JumpListSet
+            Set-RecordField $record 'language' $config.language
+            Set-RecordField $record 'profiles' @($config.profiles | ForEach-Object { [ordered]@{ key=$_.key; name=$_.name; command=$_.command } })
+            Set-RecordField $record 'config_sha256' (Get-Sha256 $path)
+            Set-RecordField $record 'written_utc' ([DateTime]::UtcNow.ToString('o'))
+            Save-Record 'jumplist-user-config' $record | Out-Null
+            $script:ExportExtra.Add($path)
+            return [ordered]@{ set=$JumpListSet; language=$config.language; config=$path; config_sha256=$record.config_sha256;
+                profiles=@($config.profiles | ForEach-Object { [ordered]@{ key=$_.key; id=('custom:' + $_.name) } }); mark_dir=$markDir;
+                next='reload a running app (ctrl+alt+shift+r) or start it, then snapshot' }
+        }
+        'snapshot' {
+            $lists = Get-JumpListFiles
+            $check = Test-JumpListState $lists
+            return [ordered]@{ jump_lists=$lists; check=$check; log=@(Get-JumpListLogLines); fixture_verdict=$check.verdict; visual_review='PENDING' }
+        }
+        'start' {
+            $config = Read-Record 'jumplist-user-config'
+            if (-not $config -or $config.restored) { throw 'Write the fixture configuration first (-Action config).' }
+            Assert-Hash $installedExe $AppSha256
+            $name = 'jumplist-' + $Label
+            $previous = Read-Record $name
+            if ($previous -and (Get-OwnedProcess $previous)) { throw "Label $Label still runs." }
+            $started = Start-OwnedApp -Exe $installedExe -Private $null -RealProfile -Arguments @()
+            $process = $started.process
+            $record = New-AppRecord $process $installedExe 'INSTALLED' $null $null $null @()
+            $record.record_name = $name
+            try { $record.main_window = Wait-AppWindow $process 45; $record.status = 'RUNNING' }
+            catch { $record.status = 'START_FAILED'; $record.error = $_.Exception.Message; throw }
+            finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+            return [ordered]@{ record=$record; fixture_verdict='RUNNING' }
+        }
+        'observe' {
+            if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+            $apps = @(Get-GuestApps | Where-Object { $_.path -and $_.path -ieq $installedExe })
+            $seen = @(foreach ($app in $apps) {
+                $name = 'jumplist-pid-' + $app.pid
+                $known = @(Get-JumpListAppRecords | Where-Object { [int]$_.pid -eq $app.pid })
+                if ($known.Count -eq 0) {
+                    # Adopt the shell-launched process so stop can close exactly this life.
+                    $process = Get-Process -Id $app.pid -ErrorAction SilentlyContinue
+                    if ($process) {
+                        Save-Record $name ([ordered]@{ phase=$Phase; label=('pid-' + $app.pid); record_name=$name; status='RUNNING'; adopted=$true;
+                            pid=$app.pid; birth_filetime=$process.StartTime.ToFileTimeUtc(); exe=$installedExe; parent=$app.parent;
+                            command_line=$app.command_line; adopted_utc=[DateTime]::UtcNow.ToString('o') }) | Out-Null
+                        $process.Dispose()
+                    }
+                }
+                [ordered]@{ pid=$app.pid; parent=$app.parent; created=$app.created; command_line=$app.command_line;
+                    windows=@([GxVmWindows]::TopLevel($app.pid) | Where-Object { $_['class'] -ceq 'GhosttyWindow' } | ForEach-Object { [ordered]@{ hwnd=$_['hwnd']; title=$_['title']; visible=$_['visible'] } }) }
+            })
+            $markerFile = Join-Path (Get-JumpListMarkDir) 'gx-jl-marker.txt'
+            $markers = if (Test-Path -LiteralPath $markerFile) { @([IO.File]::ReadAllLines($markerFile, [Text.Encoding]::Default)) } else { @() }
+            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; markers=$markers; jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
+            if (-not $ExpectProfile -or $ExpectProfile -ceq 'none') { $result.fixture_verdict = 'OBSERVED'; return $result }
+            $want = 'GX_JL_' + $ExpectProfile.ToUpperInvariant()
+            $titled = @($seen | ForEach-Object { $_.windows } | Where-Object { $_.title -and $_.title.Contains($want) })
+            $markerOk = ($ExpectProfile -cne 'p6') -or (@($markers | Where-Object { $_ -match '^GX_JL_PATH_OK tail=\[\\\]' }).Count -gt 0)
+            $result.window_with_title = $titled
+            $result.marker_ok = $markerOk
+            $result.fixture_verdict = if ($titled.Count -gt 0 -and $markerOk) { 'PASS' } else { 'FAIL' }
+            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 marker missing or trailing backslash lost' } else { $null }
+            return $result
+        }
+        'deny-commit' { return [ordered]@{ denied=@(Set-JumpListCommitDenied); next='change the profile set (config), reload the app, then snapshot' } }
+        'allow-commit' {
+            $script:Restore = [ordered]@{ acl=(Restore-JumpListAcl) }
+            return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($script:Restore.acl.restored) { 'PASS' } else { 'FAIL' }) }
+        }
+        'portable' {
+            $config = Read-Record 'jumplist-user-config'
+            if (-not $config -or $config.restored) { throw 'Write the fixture configuration first (-Action config).' }
+            $copy = Copy-PortableApp (Join-Path $script:RunRoot ('portable-jl-' + $Label))
+            $listsBefore = Get-JumpListFiles
+            $registryBefore = Registry-Snapshot
+            $started = Start-OwnedApp -Exe $copy.exe -Private $null -RealProfile -Arguments @()
+            $process = $started.process
+            $name = 'jumplist-portable-' + $Label
+            $record = New-AppRecord $process $copy.exe 'PORTABLE_COPY' $null $null $null @()
+            $record.record_name = $name
+            $record.aumid = $copy.aumid
+            try { $record.main_window = Wait-AppWindow $process 45; $record.status = 'RUNNING' }
+            finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+            Start-Sleep -Seconds 8
+            $listsAfter = Get-JumpListFiles
+            $registryAfter = Registry-Snapshot
+            $close = Close-JumpListApp (Read-Record $name)
+            $before = @($listsBefore.files | Where-Object { $_.gx } | ForEach-Object { $_.name + '=' + $_.sha256 }) -join ';'
+            $after = @($listsAfter.files | Where-Object { $_.gx } | ForEach-Object { $_.name + '=' + $_.sha256 }) -join ';'
+            $registryUnchanged = (Json-Canonical $registryBefore) -ceq (Json-Canonical $registryAfter)
+            if ($close.closed_normally) { Remove-Item -LiteralPath (Split-Path -Parent $copy.exe) -Recurse -Force }
+            $ok = ($before -ceq $after) -and $registryUnchanged -and $close.closed_normally
+            return [ordered]@{ copy=$copy; jump_lists_unchanged=($before -ceq $after); registry_unchanged=$registryUnchanged; close=$close;
+                jump_lists_before=$listsBefore; jump_lists_after=$listsAfter; fixture_verdict=$(if ($ok) { 'PASS' } else { 'FAIL' });
+                fixture_reason=$(if ($ok) { $null } else { 'the portable copy changed a jump list or the registration, or did not close normally' }) }
+        }
+        'stop' {
+            $closes = @(Get-JumpListAppRecords | Where-Object { $_.status -ceq 'RUNNING' } | ForEach-Object { Close-JumpListApp $_ })
+            $bad = @($closes | Where-Object { -not $_.closed_normally -and -not $_.already_exited })
+            return [ordered]@{ closes=$closes; fixture_verdict=$(if ($bad.Count -eq 0) { 'PASS' } else { 'FAIL' }) }
+        }
+        'restore' {
+            $alive = @(Get-JumpListAppRecords | Where-Object { $_.status -ceq 'RUNNING' -and (Get-OwnedProcess $_) })
+            if ($alive.Count -gt 0) { throw 'Stop the owned jump list apps before restoring the configuration.' }
+            $script:Restore = [ordered]@{ config=(Restore-UserConfig); acl=(Restore-JumpListAcl) }
+            $ok = $script:Restore.config.restored -and $script:Restore.acl.restored
+            return [ordered]@{ restore=$script:Restore; jump_lists=(Get-JumpListFiles); fixture_verdict=$(if ($ok) { 'PASS' } else { 'FAIL' });
+                note='Unpin the taskbar button by hand if it was pinned for the cold start.' }
+        }
+    }
+}
+
+# ---- narrator: Narrator for screenshots of what a screen reader gets -------
+
+$script:NarratorKeys = [ordered]@{ 'narrator-settings'='Software\Microsoft\Narrator';
+    'narrator-accessibility'='Software\Microsoft\Windows NT\CurrentVersion\Accessibility' }
+
+$script:ScreenReaderSource = @'
+using System;
+using System.Runtime.InteropServices;
+public static class GxVmScreenReader {
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")] static extern bool GetParam(uint action, uint param, out int value, uint flags);
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SystemParametersInfoW")] static extern bool SetParam(uint action, uint param, IntPtr value, uint flags);
+    // SPI_GETSCREENREADER / SPI_SETSCREENREADER; the app picks native dialogs while it is set.
+    public static bool Get() { int value; if (!GetParam(0x0046, 0, out value, 0)) throw new Exception("SPI_GETSCREENREADER failed: " + Marshal.GetLastWin32Error()); return value != 0; }
+    public static void Set(bool on) { if (!SetParam(0x0047, on ? 1u : 0u, IntPtr.Zero, 0x2)) throw new Exception("SPI_SETSCREENREADER failed: " + Marshal.GetLastWin32Error()); }
+}
+'@
+
+function Get-ScreenReaderFlag {
+    if (-not ('GxVmScreenReader' -as [type])) { Add-Type -TypeDefinition $script:ScreenReaderSource -Language CSharp }
+    return [GxVmScreenReader]::Get()
+}
+
+function Get-NarratorProcesses {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'Narrator.exe'" | ForEach-Object {
+        [ordered]@{ pid=[int]$_.ProcessId; parent=[int]$_.ParentProcessId; session=[int]$_.SessionId; path=$_.ExecutablePath;
+            created=$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }) } })
+}
+
+function Invoke-Narrator {
+    # start: back up the Narrator and Accessibility keys, start Narrator.exe and
+    # own exactly the Narrator processes created by that start; developer mode
+    # (Narrator+Shift+F12) and turning Narrator off (Ctrl+Win+Enter) are the
+    # coordinator's keyboard input. stop: wait for that exit (close, then end
+    # only the owned processes as a recorded failure), restore keys and flag.
+    $step = Assert-Action @('start','status','stop') 'status'
+    $record = Read-Record 'narrator'
+    switch ($step) {
+        'start' {
+            if ($record -and $record.status -ceq 'RUNNING') { throw 'This run already started Narrator; stop it first.' }
+            $foreign = @(Get-NarratorProcesses)
+            if ($foreign.Count -gt 0) { throw ('Narrator already runs (pid ' + (@($foreign | ForEach-Object { $_.pid }) -join ',') + '); turn it off first.') }
+            $backups = [ordered]@{}
+            foreach ($entry in $script:NarratorKeys.GetEnumerator()) { $backups[$entry.Key] = (Backup-HkcuKey $entry.Key $entry.Value).backed_up_utc }
+            $flagBefore = Get-ScreenReaderFlag
+            $exe = Join-Path $env:SystemRoot 'System32\Narrator.exe'
+            $since = [DateTime]::UtcNow.AddSeconds(-1)
+            $launcher = Start-Process -FilePath $exe -PassThru
+            $owned = @()
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            do {
+                Start-Sleep -Milliseconds 500
+                $owned = @(Get-NarratorProcesses | Where-Object { $_.created -and [DateTime]::Parse($_.created).ToUniversalTime() -ge $since })
+            } while ($clock.Elapsed.TotalSeconds -lt 20 -and ($owned.Count -eq 0 -or -not (Get-ScreenReaderFlag)))
+            $owned = @($owned | ForEach-Object {
+                $process = Get-Process -Id $_.pid -ErrorAction SilentlyContinue
+                if ($process) { $_.birth_filetime = $process.StartTime.ToFileTimeUtc(); $_.exe = $process.Path; $process.Dispose() }
+                $_ })
+            $record = [ordered]@{ status='RUNNING'; started_utc=$since.AddSeconds(1).ToString('o'); launcher_pid=$launcher.Id; owned=$owned;
+                screen_reader_before=$flagBefore; screen_reader_after_start=(Get-ScreenReaderFlag); backups=$backups }
+            $launcher.Dispose()
+            Save-Record 'narrator' $record | Out-Null
+            Write-ExportMarker 'narrator-running' @{ owned=@($owned | ForEach-Object { $_.pid }); utc=[DateTime]::UtcNow.ToString('o') }
+            return [ordered]@{ record=$record; fixture_verdict=$(if ($owned.Count -gt 0) { 'RUNNING' } else { 'FAIL' });
+                fixture_reason=$(if ($owned.Count -gt 0) { $null } else { 'no Narrator process appeared within 20 seconds' });
+                next='developer mode: Narrator+Shift+F12; turn Narrator off with Ctrl+Win+Enter, then -Action stop' }
+        }
+        'status' {
+            return [ordered]@{ record=$record; narrator_processes=@(Get-NarratorProcesses); screen_reader=(Get-ScreenReaderFlag);
+                foreground=$(if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }; [GxVmWindows]::Foreground()) }
+        }
+        'stop' {
+            if ($null -eq $record) { throw 'This run did not start Narrator.' }
+            $outcomes = @(foreach ($owned in @($record.owned)) {
+                $item = [ordered]@{ pid=$owned.pid; exited_by_itself=$false; close_main_window=$null; killed=$false; exit_code=$null; unverified_alive=$false }
+                $process = if ($owned.PSObject.Properties['birth_filetime']) { Get-OwnedProcess ([pscustomobject]@{ pid=$owned.pid; birth_filetime=$owned.birth_filetime; exe=$owned.exe }) } else { $null }
+                if ($null -eq $process -and -not $owned.PSObject.Properties['birth_filetime'] -and (Get-Process -Id ([int]$owned.pid) -ErrorAction SilentlyContinue)) {
+                    # Its creation time was not readable at start, so this PID is not provably ours: never touch it.
+                    $item.unverified_alive = $true
+                } elseif ($null -eq $process) { $item.exited_by_itself = $true }
+                else {
+                    try {
+                        $item.exited_by_itself = $process.WaitForExit($CloseWaitSeconds * 1000)
+                        if (-not $item.exited_by_itself) {
+                            $item.close_main_window = $process.CloseMainWindow()
+                            if (-not $process.WaitForExit(5000)) { $process.Kill(); $null = $process.WaitForExit(5000); $item.killed = $true }
+                        }
+                        if ($process.HasExited) { $item.exit_code = $process.ExitCode }
+                    } finally { $process.Dispose() }
+                }
+                $item })
+            $flag = [ordered]@{ before=$record.screen_reader_before; at_stop=(Get-ScreenReaderFlag); reset=$false }
+            if (-not $record.screen_reader_before -and $flag.at_stop -and @(Get-NarratorProcesses).Count -eq 0) {
+                # Narrator's own flag outlived it (for example after a forced end): put back the recorded value.
+                [GxVmScreenReader]::Set($false)
+                $flag.reset = $true
+            }
+            $flag.after = Get-ScreenReaderFlag
+            $restores = @(foreach ($name in $script:NarratorKeys.Keys) { Restore-HkcuKey $name })
+            $script:Restore = [ordered]@{ registry=$restores; screen_reader=$flag }
+            $record.status = 'STOPPED'
+            Set-RecordField $record 'stop' ([ordered]@{ outcomes=$outcomes; restore=$script:Restore; utc=[DateTime]::UtcNow.ToString('o') })
+            Save-Record 'narrator' $record | Out-Null
+            $forced = @($outcomes | Where-Object { $_.killed -or $_.unverified_alive })
+            $restored = @($restores | Where-Object { -not $_.restored }).Count -eq 0 -and $flag.after -eq [bool]$record.screen_reader_before
+            return [ordered]@{ outcomes=$outcomes; restore=$script:Restore; fixture_verdict=$(if ($forced.Count -eq 0 -and $restored) { 'PASS' } else { 'FAIL' });
+                fixture_reason=$(if ($forced.Count -gt 0) { 'Narrator did not exit on its own or on close (ended, or left running when not provably owned)' } elseif (-not $restored) { 'settings were not restored' } else { $null }) }
+        }
+    }
+}
+
+# ---- cross-account: gxadmin and gxtest must stay separate -----------------
+# Both accounts run the same copied payload with the same configuration
+# directory, so the user is the only difference in the instance identity.
+
+function Get-CrossRoot { return Join-Path $env:PUBLIC ('GXVMValidation\' + $RunId) }
+
+$script:PipeSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+public static class GxVmPipe {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    // Opens the pipe as a client and closes it at once; records only the outcome.
+    public static Hashtable Probe(string path) {
+        Hashtable result = new Hashtable();
+        IntPtr handle = CreateFileW(path, 0xC0000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        int error = Marshal.GetLastWin32Error();
+        bool opened = handle != new IntPtr(-1);
+        if (opened) CloseHandle(handle);
+        result["pipe"] = path; result["opened"] = opened; result["error"] = opened ? 0 : error;
+        return result;
+    }
+}
+'@
+
+function Get-GhosttyPipes {
+    try { return @([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -match '(?i)ghostty' } | Sort-Object) } catch { return @('error: ' + $_.Exception.Message) }
+}
+
+function Get-CrossSessionSummary([string]$StateDir) {
+    $path = Join-Path $StateDir 'ghostty\gx-session.json'
+    $summary = [ordered]@{ path=$path; exists=$false }
+    try {
+        if (-not (Test-Path -LiteralPath $path)) { return $summary }
+        $text = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))
+        $summary.exists = $true
+        $summary.size = $text.Length
+        $summary.sha256 = Get-Sha256 $path
+        $summary.mentions_gxadmin = ([regex]::Matches($text, 'GX_XA_gxadmin')).Count
+        $summary.mentions_gxtest = ([regex]::Matches($text, 'GX_XA_gxtest')).Count
+        $json = $text | ConvertFrom-Json
+        $summary.top_level = @($json.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($json.PSObject.Properties['windows']) { $summary.windows = @($json.windows).Count }
+        $script:ExportExtra.Add($path)
+    } catch { $summary.error = $_.Exception.Message }
+    return $summary
+}
+
+function Start-CrossApp([string]$Exe, [string]$Private, [string]$ConfigHome, [string[]]$Arguments = @()) {
+    # Isolated like the other phases, but XDG_CONFIG_HOME is the shared configuration.
+    $started = Start-OwnedApp -Exe $Exe -Private $Private -ConfigBytes $null -Environment (Get-AppEnvironment) -Arguments $Arguments -Overrides @{ XDG_CONFIG_HOME=$ConfigHome }
+    return $started.process
+}
+
+function Get-ForeignWindowCount([int]$ProcessId) {
+    # EnumWindows works across users on one desktop; no access to the process is needed.
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    return @([GxVmWindows]::TopLevel($ProcessId) | Where-Object { $_['class'] -ceq 'GhosttyWindow' }).Count
+}
+
+function Invoke-CrossPeer($Root) {
+    if ($env:USERNAME -ine 'gxtest' -or (Test-Elevated)) { throw 'The peer step runs as the standard user gxtest (runas), not elevated.' }
+    $owner = Read-JsonFile (Join-Path $Root 'owner.json')
+    $hostInfo = Read-JsonFile (Join-Path $Root 'host.json')
+    if ($owner.owner -cne $script:Owner -or $owner.token -cne $hostInfo.token) { throw 'The shared directory does not belong to this run.' }
+    $exe = Join-Path $Root 'app\ghostty.exe'
+    Assert-Hash $exe $AppSha256
+    $configHome = Join-Path $Root 'config'
+    $result = [ordered]@{ host=$hostInfo; self=(Get-TokenFacts $PID); host_windows_before=(Get-ForeignWindowCount ([int]$hostInfo.pid)); pipes=@(Get-GhosttyPipes) }
+    if ($ProbePipes) {
+        if (-not ('GxVmPipe' -as [type])) { Add-Type -TypeDefinition $script:PipeSource -Language CSharp }
+        $result.pipe_probes = @($result.pipes | Where-Object { $_ -notmatch '^error' } | ForEach-Object { [GxVmPipe]::Probe($_) })
+    }
+    # 1. Single instance: an ordinary, forwardable launch must start its own instance.
+    $stateDir = Join-Path $script:RunRoot ($script:Step + '-xa-peer')
+    $process = Start-CrossApp $exe $stateDir $configHome
+    $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
+    $record.record_name = 'cross-peer'
+    Save-Record 'cross-peer' $record | Out-Null
+    $launch = [ordered]@{ outcome=$null; exit_code=$null; own_window=$null }
+    try {
+        try { $launch.own_window = Wait-AppWindow $process 20; $launch.outcome = 'independent' }
+        catch {
+            $process.Refresh()
+            $launch.outcome = if ($process.HasExited) { 'exited' } else { 'no-window' }
+            if ($process.HasExited) { $launch.exit_code = $process.ExitCode }
+            $launch.error = $_.Exception.Message
+        }
+        $result.host_windows_after_launch = Get-ForeignWindowCount ([int]$hostInfo.pid)
+        if ($launch.outcome -ceq 'exited' -and $launch.exit_code -eq 0 -and $result.host_windows_after_launch -gt $result.host_windows_before) { $launch.outcome = 'forwarded-to-other-account' }
+        $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
+        if ($launch.outcome -ceq 'independent' -and $hold -gt 0) {
+            Write-ExportMarker 'cross-peer-holding' @{ pid=$process.Id; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
+            Start-Sleep -Seconds $hold
+        }
+    } finally { $process.Dispose() }
+    $record.status = 'RUNNING'
+    $close = Close-OwnedApp $record
+    $record.close = $close
+    $record.status = 'CLOSED'
+    Save-Record 'cross-peer' $record | Out-Null
+    $result.launch = $launch
+    $result.close = $close
+    $result.session = Get-CrossSessionSummary (Join-Path $stateDir 'state')
+    # 2. Session files: the other account's state directory must stay unreadable.
+    $result.host_state_access = try { $null = Get-ChildItem -LiteralPath $hostInfo.state_dir -ErrorAction Stop; 'readable' } catch { 'refused: ' + $_.Exception.GetType().Name }
+    # 3. Broker: a gxtest receiver must not pair with gxadmin's elevated host.
+    if ($hostInfo.PSObject.Properties['broker'] -and $hostInfo.broker) {
+        $companionDir = Join-Path $script:RunRoot ($script:Step + '-xa-companion')
+        $arguments = @('--gx-shell-action=drop-companion', ('--gx-drop-target-pid=' + $hostInfo.broker.pid), ('--gx-drop-target-birth=' + $hostInfo.broker.birth_filetime))
+        $companion = Start-CrossApp $exe $companionDir $configHome $arguments
+        $companionRecord = New-AppRecord $companion $exe 'CROSS_COPY' $companionDir $null $null $arguments
+        $broker = [ordered]@{ target=$hostInfo.broker; pid=$companion.Id; exited=$false; exit_code=$null; windows=@() }
+        try {
+            $broker.exited = $companion.WaitForExit(20000)
+            if ($broker.exited) { $broker.exit_code = $companion.ExitCode }
+            else { $broker.windows = @([GxVmWindows]::TopLevel($companion.Id) | Where-Object { $_['visible'] } | ForEach-Object { [ordered]@{ class=$_['class']; title=$_['title'] } }) }
+        } finally { $companion.Dispose() }
+        if (-not $broker.exited) { $broker.close = Close-OwnedApp $companionRecord }
+        $broker.refused = $broker.exited -and $broker.exit_code -ne 0
+        $logPath = Join-Path $companionDir 'ghostty\logs\ghostty.log'
+        if (Test-Path -LiteralPath $logPath) { $script:ExportExtra.Add($logPath); $broker.log_tail = @(Get-Content -LiteralPath $logPath | Select-Object -Last 20) }
+        $result.broker = $broker
+    }
+    $result.host_windows_after = Get-ForeignWindowCount ([int]$hostInfo.pid)
+    $failures = @()
+    if ($launch.outcome -cne 'independent') { $failures += 'launch outcome ' + $launch.outcome }
+    if ($result.host_windows_after -ne $result.host_windows_before) { $failures += 'the other account''s window count changed' }
+    if ($result.session.exists -and $result.session.mentions_gxadmin -gt 0) { $failures += 'session file mentions gxadmin' }
+    if ($result.host_state_access -ceq 'readable') { $failures += 'the other account''s state directory is readable' }
+    if ($result.Contains('broker') -and -not $result.broker.refused) { $failures += 'the drop companion did not refuse the other account''s host' }
+    if ($ProbePipes -and @($result.pipe_probes | Where-Object { $_['opened'] }).Count -gt 0) { $failures += 'a Ghostty pipe of the other account was opened' }
+    $result.fixture_verdict = if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }
+    $result.fixture_reason = if ($failures.Count -eq 0) { $null } else { $failures -join '; ' }
+    return $result
+}
+
+function Invoke-CrossAccount {
+    # gxadmin (medium): prepare, host, [publish-broker after the existing elevated
+    # broker-host phase], collect, stop, cleanup. gxtest: peer, started by the
+    # generated as-gxtest.cmd through runas; its password is typed by the
+    # coordinator (type-secret) and never reaches this fixture.
+    $step = Assert-Action @('prepare','host','publish-broker','peer','collect','stop','cleanup') 'collect'
+    $root = Get-CrossRoot
+    if ($step -ceq 'peer') { return Invoke-CrossPeer $root }
+    if ($env:USERNAME -ine 'gxadmin' -or (Test-Elevated)) { throw "cross-account $step runs in gxadmin's normal (medium) console." }
+    switch ($step) {
+        'prepare' {
+            if (-not $ExportDir) { throw 'prepare runs through gx-run.cmd so the share path is known.' }
+            Assert-NoReparse $root
+            if (Test-Path -LiteralPath $root) { throw "The shared directory already exists: $root (cleanup first)." }
+            [IO.Directory]::CreateDirectory($root) | Out-Null
+            $copy = Copy-PortableApp (Join-Path $root 'app')
+            $adminSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            Write-Json (Join-Path $root 'owner.json') ([ordered]@{ owner=$script:Owner; run_id=$RunId; token=$script:State.token; admin_sid=$adminSid; created_utc=[DateTime]::UtcNow.ToString('o') })
+            $config = Join-Path $root 'config\ghostty\config.ghostty'
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($config)) | Out-Null
+            $lines = @('language = en', 'confirm-close-surface = false', 'gx-session-restore = true', 'command = cmd.exe /d /k title GX_XA_%USERNAME%') + $script:FixtureKeybinds
+            [IO.File]::WriteAllBytes($config, (Get-Utf8Bytes (($lines -join $script:LF) + $script:LF)))
+            $runner = Join-Path (Split-Path -Parent $ExportDir) 'gx-run.cmd'
+            $peerArgs = '-Phase cross-account -Action peer -RunId ' + $RunId + ' -AppSha256 ' + $AppSha256 + ' -RunHoldSeconds ' + [Math]::Max(30, $RunHoldSeconds) + $(if ($ProbePipes) { ' -ProbePipes' } else { '' })
+            $launcher = (@('@echo off', 'rem Starts the cross-account peer step as gxtest; runas asks for its password.',
+                ('runas /profile /user:%COMPUTERNAME%\gxtest "cmd /c ' + $runner + ' ' + $peerArgs + ' & pause"')) -join "`r`n") + "`r`n"
+            [IO.File]::WriteAllText((Join-Path $root 'as-gxtest.cmd'), $launcher, [Text.Encoding]::ASCII)
+            # Administrators, SYSTEM and gxadmin full control; Users read and execute only.
+            $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+            & $icacls $root /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' ('*' + $adminSid + ':(OI)(CI)F') '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls exited $LASTEXITCODE for $root" }
+            $record = [ordered]@{ root=$root; copy=$copy; config=$config; config_sha256=(Get-Sha256 $config); launcher=(Join-Path $root 'as-gxtest.cmd');
+                peer_arguments=$peerArgs; acl=(Get-Acl -LiteralPath $root).Sddl; prepared_utc=[DateTime]::UtcNow.ToString('o') }
+            Save-Record 'cross-prepare' $record | Out-Null
+            return [ordered]@{ record=$record; next='host, then run cmd /c ' + $record.launcher + ' and type the gxtest password' }
+        }
+        'host' {
+            $prepared = Read-Record 'cross-prepare'
+            if (-not $prepared) { throw 'Run prepare first.' }
+            $exe = Join-Path $root 'app\ghostty.exe'
+            Assert-Hash $exe $AppSha256
+            $stateDir = Join-Path $script:RunRoot ($script:Step + '-xa-host')
+            $process = Start-CrossApp $exe $stateDir (Join-Path $root 'config')
+            $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
+            $record.record_name = 'cross-host'
+            try { $record.main_window = Wait-AppWindow $process 45; $record.status = 'RUNNING' }
+            catch { $record.status = 'START_FAILED'; $record.error = $_.Exception.Message; Save-Record 'cross-host' $record | Out-Null; throw }
+            finally { $process.Dispose() }
+            Start-Sleep -Seconds 2
+            $record.ghostty_windows = Get-ForeignWindowCount $record.pid
+            $record.token_facts = Get-TokenFacts $record.pid
+            $record.pipes = @(Get-GhosttyPipes)
+            Save-Record 'cross-host' $record | Out-Null
+            $owner = Read-JsonFile (Join-Path $root 'owner.json')
+            Write-Json (Join-Path $root 'host.json') ([ordered]@{ token=$owner.token; pid=$record.pid; birth_filetime=$record.birth_filetime; exe=$exe;
+                sid=$record.token_facts.sid; logon_id=$record.token_facts.logon_id; session_id=$record.token_facts.session_id;
+                hwnd=$record.main_window['hwnd']; ghostty_windows=$record.ghostty_windows; state_dir=(Join-Path $stateDir 'state'); broker=$null;
+                published_utc=[DateTime]::UtcNow.ToString('o') })
+            return [ordered]@{ record=$record; fixture_verdict='RUNNING' }
+        }
+        'publish-broker' {
+            $broker = Read-JsonFile (Join-Path $script:RunRoot 'broker-host.json')
+            $hostPath = Join-Path $root 'host.json'
+            $hostInfo = Read-JsonFile $hostPath
+            $alive = Get-Process -Id ([int]$broker.pid) -ErrorAction SilentlyContinue
+            if (-not $alive) { throw 'The elevated broker host of this run is not running.' }
+            $alive.Dispose()
+            $hostInfo.broker = [ordered]@{ pid=$broker.pid; birth_filetime=$broker.birth_filetime; exe=$broker.exe }
+            Write-Json $hostPath $hostInfo
+            return [ordered]@{ host=$hostInfo }
+        }
+        'collect' {
+            $record = Read-Record 'cross-host'
+            if (-not $record) { throw 'Run host first.' }
+            $status = Get-AppStatus $record
+            $now = Get-ForeignWindowCount $record.pid
+            $peers = @()
+            if ($script:ExportRoot) {
+                $peers = @(Get-ChildItem -LiteralPath $script:ExportRoot -Filter ($RunId + '--gxtest--*-cross-account.json') | Sort-Object LastWriteTimeUtc |
+                    ForEach-Object { $report = Read-JsonFile $_.FullName; [ordered]@{ file=$_.Name; status=$report.status;
+                        verdict=$(if ($report.result -and $report.result.PSObject.Properties['fixture_verdict']) { $report.result.fixture_verdict } else { $null });
+                        reason=$(if ($report.result -and $report.result.PSObject.Properties['fixture_reason']) { $report.result.fixture_reason } elseif ($report.result -and $report.result.PSObject.Properties['reason']) { $report.result.reason } else { $null }) } })
+            }
+            $latest = if ($peers.Count -gt 0) { $peers[-1] } else { $null }
+            $failures = @()
+            if (-not $status.alive) { $failures += 'the gxadmin host is no longer running' }
+            if ($now -ne $record.ghostty_windows) { $failures += "the gxadmin host has $now windows instead of $($record.ghostty_windows)" }
+            if (-not $latest) { $failures += 'no gxtest peer report on the share' } elseif ($latest.status -cne 'PASS_NATIVE_SCOPED') { $failures += 'gxtest peer: ' + $latest.reason }
+            return [ordered]@{ host=$status; host_windows_now=$now; host_windows_at_start=$record.ghostty_windows; peers=$peers;
+                fixture_verdict=$(if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }); fixture_reason=$(if ($failures.Count -eq 0) { $null } else { $failures -join '; ' }) }
+        }
+        'stop' {
+            $record = Read-Record 'cross-host'
+            if (-not $record) { throw 'Run host first.' }
+            $close = Close-OwnedApp $record
+            Set-RecordField $record 'close' $close
+            $record.status = if ($close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' }
+            Save-Record 'cross-host' $record | Out-Null
+            $session = Get-CrossSessionSummary (Join-Path $record.profile 'state')
+            $ok = $close.closed_normally -and -not ($session.exists -and $session.mentions_gxtest -gt 0)
+            return [ordered]@{ close=$close; session=$session; fixture_verdict=$(if ($ok) { 'PASS' } else { 'FAIL' });
+                fixture_reason=$(if ($ok) { $null } elseif (-not $close.closed_normally) { 'normal close did not pass' } else { 'the gxadmin session file mentions gxtest' }) }
+        }
+        'cleanup' {
+            $record = Read-Record 'cross-host'
+            if ($record -and (Get-OwnedProcess $record)) { throw 'Stop the gxadmin host first.' }
+            if (-not (Test-Path -LiteralPath $root)) { return [ordered]@{ removed=$false; note='nothing to remove' } }
+            $owner = Read-JsonFile (Join-Path $root 'owner.json')
+            if ($owner.owner -cne $script:Owner -or $owner.token -cne $script:State.token) { throw 'The shared directory is not owned by this run; nothing was removed.' }
+            $running = @(Get-GuestApps | Where-Object { $_.path -and $_.path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) })
+            if ($running.Count -gt 0) { throw ('Apps still run from the shared copy: ' + (@($running | ForEach-Object { $_.pid }) -join ',')) }
+            Remove-Item -LiteralPath $root -Recurse -Force
+            $script:Restore = [ordered]@{ shared_root=$root; removed=(-not (Test-Path -LiteralPath $root)) }
+            return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($script:Restore.removed) { 'PASS' } else { 'FAIL' }) }
+        }
+    }
+}
+
+# ---- dpi: this user's custom scaling (applies at the next sign-in) --------
+
+$script:DesktopKey = 'Control Panel\Desktop'
+$script:PerMonitorKey = 'Control Panel\Desktop\PerMonitorSettings'
+
+$script:DpiSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+public static class GxVmDpi {
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern uint GetDpiForSystem();
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT point, uint flags);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint x, out uint y);
+    // Read-only, under a per-monitor-v2 thread context so nothing is virtualized to 96.
+    public static Hashtable Effective() {
+        Hashtable facts = new Hashtable();
+        IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            facts["system"] = (long)GetDpiForSystem();
+            uint x, y;
+            int hr = GetDpiForMonitor(MonitorFromPoint(new POINT(), 1), 0, out x, out y);
+            facts["primary_monitor_hr"] = (long)hr;
+            if (hr == 0) facts["primary_monitor"] = (long)x;
+            facts["thread_context_set"] = previous != IntPtr.Zero;
+        } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
+        return facts;
+    }
+}
+'@
+
+function Get-EffectiveDpi {
+    if (-not ('GxVmDpi' -as [type])) { Add-Type -TypeDefinition $script:DpiSource -Language CSharp }
+    return [GxVmDpi]::Effective()
+}
+
+function Get-DpiValue([string]$Name) {
+    $base = Open-HkcuBase
+    try {
+        $key = $base.OpenSubKey($script:DesktopKey, $false)
+        try {
+            if ($null -eq $key -or $null -eq $key.GetValue($Name)) { return [ordered]@{ exists=$false } }
+            return [ordered]@{ exists=$true; kind=[string]$key.GetValueKind($Name); data=$key.GetValue($Name) }
+        } finally { if ($key) { $key.Dispose() } }
+    } finally { $base.Dispose() }
+}
+
+function Get-DpiSettings {
+    return [ordered]@{ LogPixels=(Get-DpiValue 'LogPixels'); Win8DpiScaling=(Get-DpiValue 'Win8DpiScaling'); per_monitor=(Read-HkcuTree $script:PerMonitorKey) }
+}
+
+function Set-DpiValue([string]$Name, $Value) {
+    # $Value is a Get-DpiValue record (exists/kind/data); exists=$false deletes the value.
+    $base = Open-HkcuBase
+    try {
+        $key = $base.OpenSubKey($script:DesktopKey, $true)
+        try {
+            if (-not $Value.exists) { $key.DeleteValue($Name, $false) }
+            else {
+                $kind = [Microsoft.Win32.RegistryValueKind][string]$Value.kind
+                $data = if ($kind -eq [Microsoft.Win32.RegistryValueKind]::DWord) { [int]$Value.data } else { [string]$Value.data }
+                $key.SetValue($Name, $data, $kind)
+            }
+        } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+}
+
+function Invoke-Dpi {
+    # set: back up LogPixels, Win8DpiScaling and PerMonitorSettings once, then
+    # apply custom scaling -Dpi; status: values and the effective DPI of this
+    # sign-in; restore: put back exactly what was backed up (96 when nothing
+    # was set). Signing out and in again is the coordinator's step.
+    $step = Assert-Action @('set','status','restore') 'status'
+    $record = Read-Record 'dpi'
+    switch ($step) {
+        'set' {
+            if (-not $record -or $record.restored) {
+                $record = [ordered]@{ before=(Get-DpiSettings); before_effective=(Get-EffectiveDpi); backed_up_utc=[DateTime]::UtcNow.ToString('o'); restored=$false; applied=@() }
+                Save-Record 'dpi' $record | Out-Null
+                $record = Read-Record 'dpi'
+            }
+            $base = Open-HkcuBase
+            try { $base.DeleteSubKeyTree($script:PerMonitorKey, $false) } finally { $base.Dispose() }
+            $value = [int]$Dpi
+            Set-DpiValue 'LogPixels' ([ordered]@{ exists=$true; kind='DWord'; data=$value })
+            Set-DpiValue 'Win8DpiScaling' ([ordered]@{ exists=$true; kind='DWord'; data=$(if ($value -eq 96) { 0 } else { 1 }) })
+            Set-RecordField $record 'applied' @(@($record.applied) + [ordered]@{ dpi=$value; utc=[DateTime]::UtcNow.ToString('o') })
+            Set-RecordField $record 'target' $value
+            Save-Record 'dpi' $record | Out-Null
+            return [ordered]@{ target=$value; now=(Get-DpiSettings); effective=(Get-EffectiveDpi); next='sign out and sign in again, then -Action status' }
+        }
+        'status' {
+            $effective = Get-EffectiveDpi
+            $expected = if ($null -eq $record) { $null } elseif ($record.restored) { [long]$record.before_effective.system } else { [long]$record.target }
+            $verdict = if ($null -eq $expected) { 'OBSERVED' } elseif ([long]$effective['system'] -eq $expected) { 'PASS' } else { 'PENDING_SIGN_IN' }
+            return [ordered]@{ settings=(Get-DpiSettings); effective=$effective; expected_system_dpi=$expected; record=$record; fixture_verdict=$verdict }
+        }
+        'restore' {
+            if (-not $record) { return [ordered]@{ restored=$true; note='this run never changed the scaling' } }
+            if (-not $record.restored) {
+                Set-DpiValue 'LogPixels' $record.before.LogPixels
+                Set-DpiValue 'Win8DpiScaling' $record.before.Win8DpiScaling
+                $base = Open-HkcuBase
+                try { Restore-AnyKeyTree $base $script:PerMonitorKey $record.before.per_monitor } finally { $base.Dispose() }
+                $now = Get-DpiSettings
+                $equal = (Json-Normal $now) -ceq (Json-Normal $record.before)
+                Set-RecordField $record 'restored' $equal
+                Set-RecordField $record 'restored_utc' ([DateTime]::UtcNow.ToString('o'))
+                Set-RecordField $record 'after_restore' $now
+                Save-Record 'dpi' $record | Out-Null
+            }
+            $script:Restore = [ordered]@{ dpi_settings_restored=[bool]$record.restored; before=$record.before; before_effective=$record.before_effective }
+            return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($record.restored) { 'PASS' } else { 'FAIL' });
+                next='sign out and sign in again, then -Action status (expects the system DPI recorded before the first set)' }
+        }
+    }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $script:RunRoot = Join-Path $env:LOCALAPPDATA ('GXVMValidation\Runs\' + $RunId)
-$script:AppDir = if ($Scope -eq 'Machine') { Join-Path $env:ProgramFiles ('GXVMValidation\' + $RunId) } else { Join-Path $env:LOCALAPPDATA ('GXVMValidation\Apps\' + $RunId) }
+$script:AppBase = if ($Scope -eq 'Machine') { Join-Path $env:ProgramFiles ('GXVMValidation\' + $RunId) } else { Join-Path $env:LOCALAPPDATA ('GXVMValidation\Apps\' + $RunId) }
+$script:AppDir = $script:AppBase
+if (Get-PathPresetName $PathPreset) { $script:AppDir = Join-Path $script:AppBase (Get-PathPresetName $PathPreset) }
 Assert-NoReparse $script:RunRoot
 Assert-NoReparse $script:AppDir
 $script:ExportRoot = $null
@@ -1237,7 +3288,13 @@ if ($ExportDir) {
 }
 $statePath = Join-Path $script:RunRoot 'state.json'
 if (Test-Path -LiteralPath $statePath) {
-    $script:State = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    # UTF-8: state values (such as app_dir) may hold non-ASCII text.
+    $script:State = Read-JsonFile $statePath
+    # A run installed below a path preset keeps that AppDir without repeating -PathPreset.
+    if ($PathPreset -ceq 'none' -and ([string]$script:State.app_dir).StartsWith($script:AppBase + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        $script:AppDir = [string]$script:State.app_dir
+        Assert-NoReparse $script:AppDir
+    }
     if ($script:State.owner -ne $script:Owner -or $script:State.uuid -ne $identity.guest_uuid -or
         $script:State.sid -ne $sid -or $script:State.scope -ne $Scope -or $script:State.app_dir -ne $script:AppDir) {
         throw 'Existing run belongs to a different VM/user/scope/application.'
@@ -1255,6 +3312,7 @@ $report = [ordered]@{ phase=$Phase; status='PENDING'; run_id=$RunId; vm_uuid=$id
     scope=$Scope; app_dir=$script:AppDir; rehearsal=[bool]$Rehearsal; visual_review='PENDING';
     export_error=$script:ExportError; result=$null }
 try {
+    if ($Phase -in $script:R6Phases) { $report.before = Get-PhaseState 'before' }
     switch ($Phase) {
         'inspect' { $report.result = Run-Inspect }
         'tokens' { $report.result = Run-Tokens }
@@ -1313,12 +3371,26 @@ try {
         }
         'check-preserved' { $report.result = Check-Preserved }
         'cleanup-foreign' { $report.result = Cleanup-Foreign }
+        'run-config' { $report.result = Invoke-RunConfig }
+        'osc52' { $report.result = Invoke-Osc52 }
+        'toast-matrix' { $report.result = Invoke-ToastMatrix }
+        'jumplist-matrix' { $report.result = Invoke-JumpListMatrix }
+        'narrator' { $report.result = Invoke-Narrator }
+        'cross-account' { $report.result = Invoke-CrossAccount }
+        'dpi' { $report.result = Invoke-Dpi }
     }
-    $report.status = if ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
+    # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
+    $verdict = $null
+    if ($report.result -is [System.Collections.IDictionary] -and $report.result.Contains('fixture_verdict')) { $verdict = $report.result['fixture_verdict'] }
+    $report.status = if ($verdict -ceq 'FAIL') { 'FAIL' } elseif ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
 } catch {
     $report.status = 'FAIL'
     $report.result = @{ reason=$_.Exception.Message; position=$_.InvocationInfo.PositionMessage }
 } finally {
+    if ($Phase -in $script:R6Phases) {
+        try { $report.after = Get-PhaseState 'after' } catch { $report.after = @{ error=$_.Exception.Message } }
+        $report.restore = $script:Restore
+    }
     Write-Json $statePath $script:State
     $reportPath = Join-Path $script:RunRoot ($script:Step + '.json')
     Write-Json $reportPath $report
