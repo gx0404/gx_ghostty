@@ -1371,19 +1371,37 @@ def measure_resources(gui, instance, capture: CaptureRun, args, counters):
                 wait_until(lambda: len(gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)) == expected, 'terminal count')
         time.sleep(2)
         raw = counters.sample(instance)
+        windows = main_windows(gui, instance)
+        if len(windows) != 1:
+            raise PerfError('resource measurement requires exactly one main window')
+        terminals = gui.win32().child_windows(windows[0].hwnd, gui.TERMINAL_CLASS)
+        if len(terminals) != count:
+            raise PerfError(f'resource measurement expected {count} tabs with one terminal each, got {len(terminals)}')
+        visible = sum(info.visible and not info.cloaked for info in terminals)
+        if not visible or gui.win32().IsIconic(windows[0].hwnd):
+            raise PerfError('resource measurement requires a visible terminal')
+        raw['terminal_population'] = {'layout': 'one window; tabs, one terminal per tab', 'total': count, 'visible': visible}
         if args.command == 'win32-gpu':
             raw['gpu'] = counters.gpu(instance)
             capture.add(f'gpu.dedicated.{count}', raw['gpu']['dedicated_bytes'])
-            metrics = parse_text(instance.log_text())
-            gauges = {name: values[-1] for name, values in metrics.values.items() if name.startswith('renderer.targets_')}
+            metrics = capture.parse(instance.log_text())
+            gauges = {name: values[-1] for name, values in metrics.values.items() if name.startswith(('renderer.targets_', 'renderer.target_'))}
+            if any(metrics.units[name] for name in gauges):
+                raise PerfError('renderer target gauge unexpectedly has time units')
             raw['target_gauges'] = gauges
             for name, value in gauges.items():
                 capture.add(f'{name}.{count}', value)
+            if 'renderer.targets_live' in gauges:
+                capture.add(f'renderer.targets_live.per_visible_terminal.{count}', gauges['renderer.targets_live'] / visible)
+                raw['targets_per_visible_terminal'] = gauges['renderer.targets_live'] / visible
+            else:
+                capture.missing(f'renderer.targets_live.{count}')
         capture.add(f'process.commit.{count}', raw['private_bytes'])
         capture.add(f'process.threads.{count}', raw['thread_count'])
         samples.append(raw)
         capture.screenshot(f'terminals-{count}')
     capture.report['resources'] = samples
+    capture.report['resource_scope'] = 'PDH increment=(11-tab bytes - 1-tab bytes)/10; target gauge denominator=actually visible terminals, not all tabs'
     added_threads = samples[1]['thread_count'] - samples[0]['thread_count']
     added_commit = samples[1]['private_bytes'] - samples[0]['private_bytes']
     capture.add('process.commit.delta', added_commit)
@@ -1391,6 +1409,7 @@ def measure_resources(gui, instance, capture: CaptureRun, args, counters):
     if added_threads <= 0:
         raise PerfError('no positive thread-count increment at 11 terminals')
     capture.add('process.commit.per_added_thread', added_commit / added_threads)
+    capture.report['commit_scope'] = 'whole-process PrivateUsage delta per added thread; includes terminal heaps/atlases, not isolated stack commitment'
     if args.command == 'win32-gpu':
         capture.add('gpu.dedicated.per_added_terminal', (samples[1]['gpu']['dedicated_bytes'] - samples[0]['gpu']['dedicated_bytes']) / 10)
 
@@ -1452,6 +1471,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                                    'process.threads.*': 'threads', 'time': 'ms', 'other_unitless': 'count/gauge'}}
     sets = {label: Samples() for label in labels}
     missing = {label: {} for label in labels}
+    resources = []
     for run, label in alternate(labels, args.runs):
         target = out / label / f'run-{run:02d}'
         target.mkdir(parents=True)
@@ -1513,6 +1533,9 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 if report['status'] == 'completed':
                     sets[label].extend(capture.samples)
             write_json(target / 'run.json', report)
+            if report.get('resources'):
+                resources.append({'label': label, 'run': run, 'populations': [row['terminal_population'] for row in report['resources']],
+                                  'target_ratios': [row.get('targets_per_visible_terminal') for row in report['resources']]})
             batch['runs'][-1]['status'] = report['status']
             batch['runs'][-1]['absolute_gate'] = report.get('absolute_gate', {'status': 'not_evaluated'})
             batch['errors'].extend(f'{label}/{run}: {error}' for error in report['errors'])
@@ -1534,6 +1557,12 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
     text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
     text += '\nAbsolute gates: ' + json.dumps(batch['absolute_gates'], ensure_ascii=False) + '\n'
+    if resources:
+        batch['resource_populations'] = resources
+        text += ('\nP8: one window, 1/11 tabs, one terminal per tab; dedicated-byte increment denominator=10.\n'
+                 'renderer.targets_live ratios use the actually visible terminal count at each endpoint; hidden tabs are excluded.\n'
+                 'Commit/thread is whole-process PrivateUsage delta and includes heaps, not isolated stack commit.\n' +
+                 json.dumps(resources, ensure_ascii=False) + '\n')
     if batch['errors']:
         text += '\nFAILED: ' + '; '.join(batch['errors']) + '\n'
     (out / 'SUMMARY.txt').write_text(text, encoding='utf-8', newline='\n')

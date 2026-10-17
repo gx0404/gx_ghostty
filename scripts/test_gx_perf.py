@@ -564,22 +564,35 @@ class ExperimentTests(unittest.TestCase):
         counters = mock.Mock()
         counters.sample.side_effect = [dict(private_bytes=100, thread_count=4), dict(private_bytes=500, thread_count=14)]
         instance, gui = mock.Mock(), mock.Mock()
+        window=SimpleNamespace(hwnd=1)
+        gui.win32.return_value.child_windows.side_effect = [[SimpleNamespace(visible=True,cloaked=False)],
+            [SimpleNamespace(visible=i==10,cloaked=False) for i in range(11)]]
+        gui.win32.return_value.IsIconic.return_value=False
         capture = gx_perf.CaptureRun(instance, self.root, {})
-        with mock.patch.object(gx_perf, 'wait_until', return_value=True), mock.patch.object(gx_perf.time, 'sleep'):
+        with mock.patch.object(gx_perf, 'main_windows',return_value=[window]), mock.patch.object(gx_perf, 'wait_until', return_value=True), mock.patch.object(gx_perf.time, 'sleep'):
             gx_perf.measure_resources(gui, instance, capture, args, counters)
         self.assertEqual([40], capture.samples.values['process.commit.per_added_thread'])
         self.assertEqual(10, instance.press.call_count)
 
     def test_gpu_keeps_last_gauge_and_dedicated_bytes_per_terminal(self):
         counters, instance = mock.Mock(), mock.Mock()
+        gui=mock.Mock()
+        gui.win32.return_value.IsIconic.return_value=False
+        gui.win32.return_value.child_windows.side_effect = [[SimpleNamespace(visible=True,cloaked=False)],
+            [SimpleNamespace(visible=i==10,cloaked=False) for i in range(11)]]
         counters.sample.side_effect = [dict(private_bytes=100, thread_count=4), dict(private_bytes=500, thread_count=14)]
         counters.gpu.side_effect = [dict(dedicated_bytes=1024), dict(dedicated_bytes=11264)]
-        instance.log_text.return_value = 'info(gx_perf): metric renderer.targets_live 2\ninfo(gx_perf): metric renderer.targets_live 22\n'
+        instance.log_text.return_value = ('info(gx_perf): metric renderer.targets_live 2\ninfo(gx_perf): metric renderer.targets_live 22\n'
+                                        'info(gx_perf): metric renderer.target_objects_live 1\ninfo(gx_perf): metric renderer.target_textures_live 1\n')
         capture = gx_perf.CaptureRun(instance, self.root, {})
-        with mock.patch.object(gx_perf, 'wait_until', return_value=True), mock.patch.object(gx_perf.time, 'sleep'):
-            gx_perf.measure_resources(mock.Mock(), instance, capture, self.args('win32-gpu'), counters)
+        with mock.patch.object(gx_perf, 'main_windows',return_value=[SimpleNamespace(hwnd=1)]), mock.patch.object(gx_perf, 'wait_until', return_value=True), mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.measure_resources(gui, instance, capture, self.args('win32-gpu'), counters)
         self.assertEqual([1024], capture.samples.values['gpu.dedicated.per_added_terminal'])
         self.assertEqual([22], capture.samples.values['renderer.targets_live.11'])
+        self.assertEqual([22],capture.samples.values['renderer.targets_live.per_visible_terminal.11'])
+        self.assertEqual([1],capture.samples.values['renderer.target_textures_live.11'])
+        self.assertEqual(1,capture.report['resources'][1]['terminal_population']['visible'])
+        self.assertEqual(11,capture.report['resources'][1]['terminal_population']['total'])
 
     def test_idle_interval_excludes_setup_events_and_records_cpu(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
