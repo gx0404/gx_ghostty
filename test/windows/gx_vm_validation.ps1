@@ -10,7 +10,7 @@ elevation, or unverified installer/application execution is supported.
 param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
-    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign')]
+    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -27,6 +27,11 @@ param(
     [string]$OleSourceSha256,
     [ValidateRange(1000,30000)][int]$DropTimeoutMs = 30000,
     [switch]$AutoDrag,
+    [ValidateSet('broker','medium-medium','high-medium','high-high')][string]$DropDirection = 'broker',
+    [ValidateSet('medium','high')][string]$TargetIntegrity = 'medium',
+    [ValidateRange(0,2147483647)][int]$TargetPid = 0,
+    [ValidateRange(0,9223372036854775807)][long]$TargetBirth = 0,
+    [ValidatePattern('^(0x[0-9a-fA-F]{1,16})?$')][string]$TargetWindow = '',
     [ValidateRange(0,2147483647)][int]$PeerPid = 0,
     [string]$ExportDir,
     [switch]$SoftwareGL
@@ -145,6 +150,8 @@ using System.Text;
 public static class GxVmWindows {
     delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr lparam);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr hwnd, EnumProc proc, IntPtr lparam);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int count);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hwnd, StringBuilder text, int count);
@@ -206,6 +213,18 @@ public static class GxVmWindows {
         if (GetWindowThreadProcessId(hwnd, out actual) == 0 || actual != pid || name.ToString() != cls ||
             !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd) || IsIconic(hwnd)) throw new Exception("Window ownership or visibility mismatch");
     }
+    public static ArrayList Terminals(IntPtr parent, uint pid) {
+        RequireWindow(parent, pid, "GhosttyWindow");
+        ArrayList list = new ArrayList();
+        EnumChildWindows(parent, delegate (IntPtr hwnd, IntPtr unused) {
+            Hashtable item = Describe(hwnd);
+            if (!(bool)item["exists"]) return true;
+            if ((long)item["pid"] == pid && (string)item["class"] == "GhosttyTerminal" &&
+                (bool)item["visible"] && (bool)item["enabled"] && GetAncestor(hwnd, 2) == parent) list.Add(item);
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
     static RECT ClientRect(IntPtr hwnd) {
         RECT rect; POINT origin = new POINT(0, 0);
         if (!GetClientRect(hwnd, out rect) || !ClientToScreen(hwnd, ref origin)) throw new Exception("Client rectangle unavailable");
@@ -230,6 +249,17 @@ public static class GxVmWindows {
     // Retained process handles bind all mouse input to those exact process lives.
     public static Hashtable DragOwned(uint sourcePid, long sourceBirth, string sourceExe, IntPtr sourceWindow,
         uint receiverPid, long receiverBirth, string appExe, IntPtr receiverWindow, uint hostPid, long hostBirth) {
+        return DragCore(sourcePid, sourceBirth, sourceExe, sourceWindow, receiverPid, receiverBirth, appExe,
+            receiverWindow, hostPid, hostBirth, "GhosttyDropCompanion", IntPtr.Zero);
+    }
+    public static Hashtable DragDirect(uint sourcePid, long sourceBirth, string sourceExe, IntPtr sourceWindow,
+        uint targetPid, long targetBirth, string appExe, IntPtr terminalWindow, IntPtr mainWindow) {
+        return DragCore(sourcePid, sourceBirth, sourceExe, sourceWindow, targetPid, targetBirth, appExe,
+            terminalWindow, targetPid, targetBirth, "GhosttyTerminal", mainWindow);
+    }
+    static Hashtable DragCore(uint sourcePid, long sourceBirth, string sourceExe, IntPtr sourceWindow,
+        uint receiverPid, long receiverBirth, string appExe, IntPtr receiverWindow, uint hostPid, long hostBirth,
+        string receiverClass, IntPtr mainWindow) {
         Hashtable result = new Hashtable(); result["status"] = "FAIL";
         result["clipboard_access"] = false; result["enter_injected"] = false;
         bool down = false;
@@ -242,7 +272,11 @@ public static class GxVmWindows {
                 Action guard = delegate {
                     source.Alive(); receiver.Alive(); host.Alive();
                     RequireWindow(sourceWindow, sourcePid, "GxOwnedOleDragSource");
-                    RequireWindow(receiverWindow, receiverPid, "GhosttyDropCompanion");
+                    RequireWindow(receiverWindow, receiverPid, receiverClass);
+                    if (mainWindow != IntPtr.Zero) {
+                        RequireWindow(mainWindow, receiverPid, "GhosttyWindow");
+                        if (GetAncestor(receiverWindow, 2) != mainWindow) throw new Exception("Terminal was reparented");
+                    }
                 };
                 try {
                     guard();
@@ -524,18 +558,69 @@ function Get-ProcessScene([Diagnostics.Process]$Process) {
     return [ordered]@{ utc=[DateTime]::UtcNow.ToString('o'); exited=$Process.HasExited; threads=$threads; children=$children }
 }
 
+function Assert-DirectTokenPair($Source, $Target, [string]$Direction) {
+    if ($Direction -notin @('medium-medium','high-medium','high-high')) { throw 'Unsupported direct direction.' }
+    $levels = $Direction.Split('-')
+    foreach ($entry in @(@{ facts=$Source; level=$levels[0] }, @{ facts=$Target; level=$levels[1] })) {
+        $facts = $entry.facts
+        $high = $entry.level -eq 'high'
+        $kind = if ($high) { 'Full' } else { 'Limited' }
+        if ($facts.integrity -cne $entry.level -or [bool]$facts.elevated -ne $high -or $facts.elevation_type -cne $kind) {
+            throw 'Direct source/target token does not match the explicit direction.'
+        }
+    }
+    if ($Source.sid -ne $Target.sid -or $Source.session_id -ne $Target.session_id) { throw 'Direct participants differ in user or session.' }
+    if ($levels[0] -eq $levels[1]) {
+        if ($Source.logon_id -eq 0 -or $Source.logon_id -ne $Target.logon_id) { throw 'Same-integrity direct participants must share one logon.' }
+    } else {
+        $pair = Compare-SplitTokens $Target $Source
+        if (-not $pair.paired) { throw ('Direct participants are not linked split tokens: ' + ($pair.failures -join '; ')) }
+    }
+}
+
+function Get-DirectTarget {
+    if ($TargetPid -le 0 -or $TargetBirth -le 0 -or -not $TargetWindow) {
+        throw 'Direct drop requires -TargetPid, -TargetBirth and -TargetWindow (the recorded main HWND).'
+    }
+    $app = Resolve-GlApp
+    if ($app.class -cne 'INSTALLED') { throw 'Direct permission cases require the installed, hash-verified application.' }
+    $process = Get-Process -Id $TargetPid -ErrorAction Stop
+    try {
+        if ($process.StartTime.ToFileTimeUtc() -ne $TargetBirth -or $process.Path -ine $app.exe) { throw 'Direct target PID/birth/image mismatch.' }
+        $self = Get-TokenFacts $PID
+        $targetToken = Get-TokenFacts $TargetPid
+        Assert-DirectTokenPair $self $targetToken $DropDirection
+        if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+        $main = [IntPtr][Convert]::ToInt64($TargetWindow.Substring(2), 16)
+        $terminals = @([GxVmWindows]::Terminals($main, [uint32]$TargetPid))
+        if ($terminals.Count -ne 1) { throw 'Direct target must have exactly one visible, enabled terminal child; no implicit pane selection.' }
+        return [ordered]@{ pid=$TargetPid; birth_filetime=$TargetBirth; exe=$app.exe; app_sha256=$AppSha256;
+            main_window=([GxVmWindows]::Describe($main)); terminal_window=$terminals[0]; token=$targetToken; source_console_token=$self }
+    } finally { $process.Dispose() }
+}
+
 function Start-DropSource {
-    # Medium console only: re-verify the receiver/host pair, then start the staged,
-    # hash-pinned OLE source (test/windows/gx_ole_source.zig) in --source-window mode.
+    # Broker is the original medium-only route. Direct cases explicitly name
+    # their integrity direction and installed target; neither route elevates.
+    # Start the pinned OLE source in --source-window mode, not a private drop API.
     # Default: the host drives the real drag. -AutoDrag explicitly requests
     # same-guest native mouse input after process/window validation; never Enter.
     if ($OleSourceSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'drop-source requires -OleSourceSha256.' }
     if (-not $ExportDir) { throw 'drop-source runs through gx-run.cmd so the staged tool and export folder are known.' }
-    $peer = Find-BrokerPeer
-    $receiverPid = [int]$peer.receiver.pid
+    $peer = $null; $direct = $null
+    if ($DropDirection -eq 'broker') {
+        $peer = Find-BrokerPeer
+        $receiverPid = [int]$peer.receiver.pid
+        $receiverExe = $peer.receiver.exe
+    } else {
+        $direct = Get-DirectTarget
+        $receiverPid = [int]$direct.pid
+        $receiverExe = $direct.exe
+    }
     $receiverProcess = Get-Process -Id $receiverPid
     $receiverBirth = $receiverProcess.StartTime.ToFileTimeUtc()
-    $receiverHwnd = $receiverProcess.MainWindowHandle
+    $receiverHwnd = if ($direct) { [IntPtr][Convert]::ToInt64($direct.terminal_window.hwnd.Substring(2), 16) } else { $receiverProcess.MainWindowHandle }
+    if ($direct -and $receiverBirth -ne $TargetBirth) { throw 'Direct target changed before source launch.' }
     if ($receiverHwnd -eq [IntPtr]::Zero) { throw 'The drop receiver has no visible window.' }
     $toolShare = Join-Path (Split-Path -Parent $ExportDir) 'tools\gx_ole_source_window.exe'
     $toolDir = Join-Path $script:RunRoot ($script:Step + '-ole')
@@ -547,17 +632,23 @@ function Start-DropSource {
     [IO.Directory]::CreateDirectory($work) | Out-Null
     if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
     $arguments = @('--run', '--source-window', ('--hwnd=0x{0:x}' -f $receiverHwnd.ToInt64()), "--pid=$receiverPid", "--birth=$receiverBirth",
-        ('--exe="' + $peer.receiver.exe + '"'), ('--sha256=' + $AppSha256.ToLowerInvariant()), ('--work-dir="' + $work + '"'),
+        ('--exe="' + $receiverExe + '"'), ('--sha256=' + $AppSha256.ToLowerInvariant()), ('--work-dir="' + $work + '"'),
         "--case=$DropCase", "--timeout-ms=$DropTimeoutMs")
     $start = [Diagnostics.ProcessStartInfo]::new($tool, ($arguments -join ' '))
     $start.UseShellExecute = $false
     $start.WorkingDirectory = $toolDir
     $source = [Diagnostics.Process]::Start($start)
     $null = $source.Handle
-    $result = [ordered]@{ peer=$peer; receiver_birth_filetime=$receiverBirth; tool_sha256=$OleSourceSha256.ToLowerInvariant();
+    $result = [ordered]@{ peer=$peer; direct_target=$direct; direction=$DropDirection; source_token=$null;
+        receiver_birth_filetime=$receiverBirth; tool_sha256=$OleSourceSha256.ToLowerInvariant();
         source_pid=$source.Id; source_birth_filetime=$source.StartTime.ToFileTimeUtc(); case=$DropCase;
         timeout_ms=$DropTimeoutMs; ready=$null; auto_drag_requested=[bool]$AutoDrag; auto_drag=$null; exit_code=$null; evidence=$null }
     try {
+        if ($direct) {
+            $result.source_token = Get-TokenFacts $source.Id
+            Assert-DirectTokenPair $result.source_token $direct.token $DropDirection
+            if ($result.source_token.logon_id -ne $direct.source_console_token.logon_id) { throw 'Source did not inherit the selected console logon.' }
+        }
         $deadline = [DateTime]::UtcNow.AddSeconds(20)
         $readyFile = $null
         while (-not $readyFile -and [DateTime]::UtcNow -lt $deadline -and -not $source.HasExited) {
@@ -566,7 +657,7 @@ function Start-DropSource {
         }
         if (-not $readyFile) { throw "OLE source did not become ready (exited=$($source.HasExited))." }
         $ready = Get-Content -LiteralPath $readyFile.FullName -Raw | ConvertFrom-Json
-        if ($AutoDrag -and ($ready.source_pid -ne $source.Id -or $ready.target_pid -ne $receiverPid -or
+        if (($AutoDrag -or $direct) -and ($ready.source_pid -ne $source.Id -or $ready.target_pid -ne $receiverPid -or
             [long]$ready.target_birth -ne $receiverBirth -or [long]$ready.target_hwnd -ne $receiverHwnd.ToInt64() -or
             $ready.app_sha256 -ine $AppSha256 -or $ready.case -cne $DropCase)) { throw 'OLE source ready identity mismatch.' }
         $result.ready = $ready
@@ -580,13 +671,19 @@ function Start-DropSource {
             to_x=[int]($r[0] + ($r[2] - $r[0]) * 0.65); to_y=[int]($r[1] + ($r[3] - $r[1]) * 0.65) }
         Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-drop-ready.json')) $result
         if ($AutoDrag) {
-            # All participants are freshly verified by Find-BrokerPeer above.
+            # All participants are freshly verified by their selected route.
             # The source is the exact child we launched, with a pinned image.
             Assert-Hash $tool $OleSourceSha256
-            Assert-Hash $peer.receiver.exe $AppSha256
-            $result.auto_drag = [GxVmWindows]::DragOwned([uint32]$source.Id, $source.StartTime.ToFileTimeUtc(), $tool,
-                [IntPtr][long]$ready.source_hwnd, [uint32]$receiverPid, $receiverBirth, $peer.receiver.exe,
-                $receiverHwnd, [uint32]$peer.host.pid, [long]$peer.host.birth_filetime)
+            Assert-Hash $receiverExe $AppSha256
+            if ($direct) {
+                $main = [IntPtr][Convert]::ToInt64($direct.main_window.hwnd.Substring(2), 16)
+                $result.auto_drag = [GxVmWindows]::DragDirect([uint32]$source.Id, $source.StartTime.ToFileTimeUtc(), $tool,
+                    [IntPtr][long]$ready.source_hwnd, [uint32]$receiverPid, $receiverBirth, $receiverExe, $receiverHwnd, $main)
+            } else {
+                $result.auto_drag = [GxVmWindows]::DragOwned([uint32]$source.Id, $source.StartTime.ToFileTimeUtc(), $tool,
+                    [IntPtr][long]$ready.source_hwnd, [uint32]$receiverPid, $receiverBirth, $receiverExe,
+                    $receiverHwnd, [uint32]$peer.host.pid, [long]$peer.host.birth_filetime)
+            }
             if ($result.auto_drag['status'] -cne 'REAL_DRAG_SENT') { throw ('Automatic owned drag failed: ' + $result.auto_drag['error']) }
             Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-auto-drag.json')) $result.auto_drag
         }
@@ -599,6 +696,11 @@ function Start-DropSource {
         if ($finished) { $result.evidence = Get-Content -LiteralPath $finished.FullName -Raw | ConvertFrom-Json }
         $result.meaning = @{ 0='COPY accepted (OLE admission only; inspect the elevated preview)'; 3='cancelled'; 4='drop rejected/NONE'; 2='invalid invocation/identity/error' }[[int]$source.ExitCode]
         if ($source.ExitCode -ne 0) { throw ('OLE source exited ' + $source.ExitCode + ': ' + $result.meaning) }
+        if ($direct) {
+            $result.meaning = 'COPY accepted (OLE admission only; inspect the target terminal and any protection dialog)'
+            if (-not $result.evidence -or $result.evidence.effect -ne 1 -or $result.evidence.get_data -lt 1 -or
+                $result.evidence.get_data -ne $result.evidence.medium_releases) { throw 'Direct OLE data acquisition/release evidence did not pass.' }
+        }
     } finally {
         if (-not $source.HasExited) { $source.Kill(); $null = $source.WaitForExit(5000) }
         if ($result.auto_drag -and $result.auto_drag['mouse_down_unreleased']) {
@@ -998,6 +1100,55 @@ function Start-IsolatedApp([string]$Exe, [string]$Private, [string[]]$ConfigLine
     return [Diagnostics.Process]::Start($start)
 }
 
+function Start-DirectTarget {
+    # Launch under the caller's existing token. Repeated calls get distinct
+    # profiles and ownership records, never overwrite an earlier target record.
+    $self = Get-TokenFacts $PID
+    Assert-DirectTokenPair $self $self ($TargetIntegrity + '-' + $TargetIntegrity)
+    $app = Resolve-GlApp
+    if ($app.class -cne 'INSTALLED') { throw 'Direct targets require the installed, hash-verified application.' }
+    $private = Join-Path $script:RunRoot ($script:Step + '-direct-profile')
+    Assert-NoReparse $private
+    if (Test-Path -LiteralPath $private) { throw 'Direct target profile already exists.' }
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $prompt = 'command = cmd.exe /d /k prompt GX_DIRECT_' + $TargetIntegrity.ToUpperInvariant() + '$G$S'
+    $process = Start-IsolatedApp $app.exe $private @('language = en', 'confirm-close-surface = false', 'gx-session-restore = false',
+        'clipboard-paste-protection = true', $prompt)
+    $null = $process.Handle
+    $record = Join-Path $script:RunRoot ($script:Step + '-direct-target.json')
+    $facts = [ordered]@{ status='STARTING'; pid=$process.Id; birth_filetime=$process.StartTime.ToFileTimeUtc();
+        exe=$app.exe; app_sha256=$AppSha256; integrity=$TargetIntegrity; profile=$private;
+        log=(Join-Path $private 'ghostty\logs\ghostty.log'); token=$null; main_window=$null; terminal_window=$null }
+    Write-Json $record $facts
+    $script:ExportExtra.Add($record)
+    try {
+        $facts.token = Get-TokenFacts $process.Id
+        Assert-DirectTokenPair $self $facts.token ($TargetIntegrity + '-' + $TargetIntegrity)
+        $deadline = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $process.Refresh()
+            if ($process.HasExited) { throw "Direct target exited $($process.ExitCode) during startup." }
+            if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
+                $terminals = @([GxVmWindows]::Terminals($process.MainWindowHandle, [uint32]$process.Id))
+                if ($terminals.Count -gt 1) { throw 'Unexpected multiple terminal children in the isolated target.' }
+                if ($terminals.Count -eq 1) {
+                    $facts.main_window = [GxVmWindows]::Describe($process.MainWindowHandle)
+                    $facts.terminal_window = $terminals[0]
+                    $facts.status = 'TARGET_READY'
+                    return $facts
+                }
+            }
+            Start-Sleep -Milliseconds 100
+        } while ($deadline.Elapsed.TotalSeconds -lt 45)
+        throw 'Direct target showed no terminal child within 45 seconds.'
+    } finally {
+        # A startup failure still preserves the exact process/profile to inspect;
+        # targets are only closed by the subsequent explicitly owned GUI steps.
+        Write-Json $record $facts
+        $process.Dispose()
+    }
+}
+
 function Start-BrokerHost {
     # Elevated, isolated candidate terminal that stays running for the manual
     # menu/drop steps. Only -Rehearsal payloads are accepted before the final package.
@@ -1112,6 +1263,7 @@ try {
         'gl' { $report.result = Probe-GL }
         'broker-host' { $report.result = Start-BrokerHost }
         'broker-peer' { $report.result = Find-BrokerPeer }
+        'direct-target' { $report.result = Start-DirectTarget }
         'drop-source' { $report.result = Start-DropSource }
         { $_ -in 'install','upgrade' } {
             if ($script:State.foreign_active) { throw 'Use expect-install-refused for a recorded foreign-before fixture.' }
