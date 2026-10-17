@@ -10,6 +10,23 @@ import gx_slots
 
 
 class SlotTests(unittest.TestCase):
+    def test_unlock_failure_still_closes_every_owned_handle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            original = gx_slots.unlock
+            calls = []
+            def unlock(stream):
+                original(stream)
+                calls.append(stream)
+                if len(calls) == 1:
+                    raise OSError('simulated cleanup error')
+            with mock.patch.object(gx_slots, 'unlock', side_effect=unlock), self.assertRaises(OSError):
+                with gx_slots.acquire(root, 'quiet'):
+                    pass
+            self.assertEqual(4, len(calls))
+            self.assertTrue(all(stream.closed for stream in calls))
+            self.assertEqual(0, self.attempt(root, 'quiet').returncode)
+
     def test_quiet_excludes_all_slots_and_releases_after_error(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

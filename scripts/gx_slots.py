@@ -58,17 +58,23 @@ def acquire(root: Path, kind: str, timeout: float = 0):
     held = []
 
     def release():
+        error = None
         while held:
             stream = held.pop()
             try:
-                stream.seek(1)
-                stream.truncate()
-                stream.flush()
-            finally:
                 try:
-                    unlock(stream)
+                    stream.seek(1)
+                    stream.truncate()
+                    stream.flush()
                 finally:
-                    stream.close()
+                    try:
+                        unlock(stream)
+                    finally:
+                        stream.close()
+            except BaseException as exc:
+                error = error or exc
+        if error is not None:
+            raise error
 
     try:
         while True:
@@ -76,7 +82,12 @@ def acquire(root: Path, kind: str, timeout: float = 0):
                 path = root / name
                 # No append mode: update metadata under the owned byte lock.
                 candidate = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
-                if not lock(candidate):
+                try:
+                    acquired = lock(candidate)
+                except BaseException:
+                    candidate.close()
+                    raise
+                if not acquired:
                     candidate.close()
                     if kind == "quiet":
                         break
