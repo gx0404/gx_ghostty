@@ -33,7 +33,8 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         the --env variables, wait up to --wait seconds (default 20) for its window (an
         `xdotool search` every 50 ms; it stops early if Ghostty exits), screenshot it with
         scrot --settle seconds later (default 3),
-        optionally run an xdotool script (the Ghostty PID is its $1) and screenshot again, then
+        optionally run an xdotool script (the Ghostty PID is its $1), or a trusted Python
+        scenario headed by # gx-scenario-python-v1, and screenshot again, then
         copy PNGs, log, version and metadata to the Windows directory DIR. --perf sets
         GHOSTTY_GX_PERF=1, runs `seq 1 3000000` in the terminal (`-e sh workload.sh`) after the
         first screenshot and writes PREFIX-perf.txt: the time to the window and of the workload,
@@ -46,10 +47,13 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         Existing evidence prefixes are refused, never overwritten.
   scenario --out DIR [SCENARIO...]
         Run the GTK scenarios test/gui/gtk/G*.toml (ids such as G01 or file paths; default
-        all): each writes its config and xdotool script to DIR/<id>/, runs one smoke named
+        all): each writes its config and xdotool or Python `script` to DIR/<id>/, runs one smoke named
         <id> there and fails when the log has a line matching its `forbid` patterns (default
         `Theme parser error` and `css parsing failed`). DIR/<id>/notes.txt lists what the
         screenshots must show; DIR/SUMMARY.txt has one line per scenario.
+        `script` and `xdotool` are mutually exclusive. Python helpers capture named steps,
+        snapshot descendant PID/birth/PTY identities, and restart in the same private state.
+        Python scripts are trusted repository code, not sandboxed, and cannot be perf samples.
   run [--lang zh_CN|en] [--config FILE] [--x11] [-- GHOSTTY ARGS...]
         Start zig-out/bin/ghostty on the WSLg desktop (Wayland, or XWayland with --x11) in the
         background and print its PID.
@@ -141,7 +145,7 @@ ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 GTK_SCENARIO_DIR = REPO_ROOT / "test" / "gui" / "gtk"
 GTK_SCENARIO_ID = re.compile(r"^G\d{2}$")
 GTK_SCENARIO_KEYS = frozenset(("id", "title", "lang", "config", "xdotool", "wait", "settle", "env", "args", "expect",
-                               "forbid"))
+                               "forbid", "script"))
 # GTK and the GX layer log these when a stylesheet does not parse.
 SCENARIO_FORBID = ("Theme parser error", "css parsing failed")
 # --lang value -> (LANG and LC_ALL, LANGUAGE)
@@ -1001,6 +1005,111 @@ def smoke_main(argv):
         if (evidence / (name + suffix)).stat().st_size == 0:
             raise ValueError("empty screenshot")
 
+    def scenario_capture(label):
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", label):
+            raise ValueError("invalid screenshot label")
+        suffix = "-" + label + ".png"
+        if Path(str(prefix) + suffix).exists():
+            raise ValueError("screenshot label already used")
+        capture(suffix)
+
+    def scenario_xdo(*args):
+        return checked(["xdotool", *map(str, args)], "scenario input").stdout.strip()
+
+    def scenario_save(suffix, text):
+        if not re.fullmatch(r"-[a-zA-Z0-9][a-zA-Z0-9_.-]*", suffix):
+            raise ValueError("invalid evidence suffix")
+        with (evidence / (name + suffix)).open("x", encoding="utf-8", newline="\n") as output:
+            output.write(text)
+
+    def scenario_processes(label):
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", label):
+            raise ValueError("invalid process snapshot label")
+        guard("process snapshot", True)
+        rows = {}
+        for root in Path("/proc").iterdir():
+            if not root.name.isdigit():
+                continue
+            try:
+                fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+                rows[int(root.name)] = {"pid": int(root.name), "ppid": int(fields[1]),
+                                       "birth": int(fields[19]), "tty": int(fields[4])}
+            except (OSError, ValueError, IndexError):
+                continue
+        owned = {child.pid}
+        while True:
+            added = {pid for pid, row in rows.items() if row["ppid"] in owned} - owned
+            if not added:
+                break
+            owned.update(added)
+        result = []
+        for pid in sorted(owned - {child.pid}):
+            row = rows[pid]
+            root = Path("/proc") / str(pid)
+            row["fd0"] = os.readlink(root / "fd/0")
+            row["exe"] = os.readlink(root / "exe")
+            fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[19]) != row["birth"]:
+                raise ValueError("descendant identity changed")
+            result.append(row)
+        guard("process snapshot finished", True)
+        scenario_save("-processes-" + label + ".json", json.dumps(result, indent=2) + "\n")
+        return result
+
+    def scenario_dispatch(script):
+        if not script.startswith("# gx-scenario-python-v1\n"):
+            checked(["xdotool", xdo, str(child.pid)], "xdotool script")
+            return
+        if perf:
+            raise ValueError("Python scenarios cannot run as performance samples")
+        scope = {"capture": scenario_capture, "xdo": scenario_xdo, "restart": scenario_restart,
+                 "processes": scenario_processes, "save": scenario_save, "sleep": time.sleep,
+                 "config_home": Path(os.environ["XDG_CONFIG_HOME"]),
+                 "state_home": Path(os.environ["XDG_STATE_HOME"]), "evidence": evidence,
+                 "window": lambda: meta["window"], "pid": lambda: child.pid,
+                 "Path": Path, "json": json}
+        exec(compile(script, xdo, "exec"), scope)
+
+    def scenario_failure(exc):
+        import traceback
+        meta["errors"].append(type(exc).__name__ + ": " + str(exc))
+        save("-failure.txt", traceback.format_exc())
+
+    def scenario_restart(args=None, close_key="ctrl+shift+q"):
+        nonlocal child, pidfd
+        if perf:
+            raise ValueError("scenario restart is not a performance operation")
+        guard("before graceful restart", True)
+        if close_key:
+            subprocess.run(["xdotool", "key", "--clearmodifiers", close_key], check=True, timeout=10)
+        status = child.wait(timeout=15)
+        if status != 0:
+            raise ValueError("graceful scenario close failed: " + str(status))
+        os.close(pidfd)
+        pidfd = None
+        meta.setdefault("sessions", []).append({"identity": meta["identity"], "command": meta["command"], "exit": status})
+        command = [exe, "--gtk-single-instance=false", *(extra if args is None else args)]
+        meta["command"] = command
+        with open(str(prefix) + ".log", "a") as log:
+            child = subprocess.Popen(command, executable=held, pass_fds=(exe_fd,), stdout=log, stderr=log)
+        pidfd = os.pidfd_open(child.pid)
+        meta["identity"] = process_identity(child.pid, True)
+        if any(meta["identity"][key] != value for key, value in meta["executable"].items() if key != "path"):
+            raise ValueError("restart executable mismatch")
+        deadline = time.monotonic() + float(wait_seconds)
+        while time.monotonic() < deadline:
+            found = checked(["xdotool", "search", "--onlyvisible", "--pid", str(child.pid)], "restart window", False)
+            if found.returncode == 0 and found.stdout.strip():
+                window = found.stdout.splitlines()[0]
+                owner = checked(["xdotool", "getwindowpid", window], "restart window owner")
+                if owner.stdout.strip() != str(child.pid):
+                    raise ValueError("restart window PID mismatch")
+                meta["window"] = window
+                time.sleep(float(settle))
+                return window
+            time.sleep(0.05)
+        raise ValueError("no visible window after restart")
+
     def snapshot(stage):
         guard(stage + " before", True)
         root = Path("/proc") / str(child.pid)
@@ -1113,7 +1222,8 @@ def smoke_main(argv):
             measurement(before, after, "\n".join(f"{key} {value}" for key, value in times.items()))
             meta["cpu_accounting"] = cpu_accounting(before, after, process_before, process_after, str(child.pid), meta["clk_tck"])
         if xdo:
-            checked(["xdotool", xdo, str(child.pid)], "xdotool script")
+            script = Path(xdo).read_text(encoding="utf-8")
+            scenario_dispatch(script)
             time.sleep(1)
             capture("-after.png")
         guard("finished", True)
@@ -1123,8 +1233,8 @@ def smoke_main(argv):
                 raise ValueError("normal build receipt changed during smoke")
             validate_receipt(receipt, meta["source_end"], meta["executable"], meta["version"], meta["version_exit"])
         meta["exit"] = 0
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        meta["errors"].append(str(exc))
+    except Exception as exc:
+        scenario_failure(exc)
     except KeyboardInterrupt:
         meta["errors"].append("interrupted")
     finally:
@@ -1320,9 +1430,18 @@ def build_function() -> str:
 
 
 def smoke_function() -> str:
+    import base64
+    import zlib
     program = PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + SMOKE_PROGRAM
-    program = "\n".join(re.sub(r"^(?:    )+", lambda m: "  " * (len(m[0]) // 4), line) for line in program.splitlines())
-    return "write_smoke_program() {\ncat <<'GX_WSL_SESSION'\n" + program.strip() + "\nGX_WSL_SESSION\n}\n"
+    # wsl.exe shares Windows' 32767-character command-line limit. Transport
+    # the exact readable source compressed; do not trim code or diagnostics.
+    payload = base64.b64encode(zlib.compress(program.encode("utf-8"))).decode("ascii")
+    bootstrap = (f"import base64, linecache, zlib\n"
+                 f"_source = zlib.decompress(base64.b64decode({payload!r})).decode('utf-8')\n"
+                 "_filename = 'gx-wsl-session'\n"
+                 "linecache.cache[_filename] = (len(_source), None, _source.splitlines(True), _filename)\n"
+                 "exec(compile(_source, _filename, 'exec'))")
+    return "write_smoke_program() {\ncat <<'GX_WSL_SESSION'\n" + bootstrap + "\nGX_WSL_SESSION\n}\n"
 
 
 def compose(*parts: str) -> str:
@@ -1765,6 +1884,11 @@ class GtkScenario:
     args: tuple[str, ...] = ()
     expect: tuple[str, ...] = ()
     forbid: tuple[str, ...] = SCENARIO_FORBID
+    # Trusted repository Python, run inside the private Xvfb smoke supervisor.
+    # Helpers: capture(label), xdo(*args), restart(args=None, close_key=...),
+    # processes(label), save(suffix, text), sleep(seconds), config_home/state_home,
+    # evidence, window()/pid(). Restart retains this scenario's private state.
+    script: str = ""
 
 
 def load_toml(path: Path) -> dict:
@@ -1799,6 +1923,16 @@ def load_gtk_scenario(path: Path) -> GtkScenario:
         raise GxWslError(f"{path}: env must map variable names to strings")
     assignments = tuple(f"{name}={value}" for name, value in env.items())
     env_assignments(assignments)
+    script = data.get("script", "")
+    if not isinstance(script, str):
+        raise GxWslError(f"{path}: script must be a string")
+    if script and data.get("xdotool"):
+        raise GxWslError(f"{path}: script and xdotool are mutually exclusive")
+    if script:
+        try:
+            compile(script, str(path), "exec")
+        except SyntaxError as exc:
+            raise GxWslError(f"{path}: invalid Python script: {exc}") from None
     forbid = tuple(data.get("forbid", SCENARIO_FORBID))
     for pattern in forbid:
         try:
@@ -1807,7 +1941,7 @@ def load_gtk_scenario(path: Path) -> GtkScenario:
             raise GxWslError(f"{path}: bad forbid pattern {pattern!r}: {exc}") from None
     return GtkScenario(path, data["id"], data["title"], data["config"], lang, data.get("xdotool", ""),
                        float(data.get("wait", SMOKE_WAIT_SECONDS)), float(data.get("settle", SMOKE_SETTLE_SECONDS)),
-                       assignments, tuple(data.get("args", ())), tuple(data.get("expect", ())), forbid)
+                       assignments, tuple(data.get("args", ())), tuple(data.get("expect", ())), forbid, script)
 
 
 def gtk_scenario_paths(selectors: Sequence[str], directory: Path = GTK_SCENARIO_DIR) -> list[Path]:
@@ -1847,6 +1981,9 @@ def run_gtk_scenarios(args: argparse.Namespace) -> int:
         if scenario.xdotool.strip():
             script = target / "script.xdo"
             script.write_text(scenario.xdotool.lstrip("\n"), encoding="utf-8", newline="\n")
+        if scenario.script.strip():
+            script = target / "script.py"
+            script.write_text("# gx-scenario-python-v1\n" + scenario.script.lstrip("\n"), encoding="utf-8", newline="\n")
         invocation = smoke_invocation(
             clone,
             out=str(target),
