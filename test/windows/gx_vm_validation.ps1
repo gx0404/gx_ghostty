@@ -3,14 +3,20 @@ Guest-only validation. Stage with scripts/gx_windows_vm.py stage-validation and 
 staged gx-run.cmd ("cmd /c \\host.lan\Data\validation\gx-run.cmd -Phase ..."), which copies this file
 into the caller's profile and runs it with a per-process execution-policy bypass.
 The manifest's UUID MUST be the live QEMU UUID read by the host (HMP info uuid).
-No host execution, password parameters, clipboard, account impersonation, automatic download,
+No host execution, password parameters, account impersonation, automatic download,
 elevation, or unverified installer/application execution is supported.
+The clipboard is touched only by the osc52 phase, and only with test content that the
+phase itself writes first; nothing reads or backs up clipboard content it did not write.
+Phases that change guest settings (toast-matrix, jumplist-matrix, narrator, dpi) record the
+before state, change only fixture-owned or explicitly named values, and restore them.
+Each r6 phase report carries "before" and "after" guest snapshots and its restore result.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
-    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign')]
+    [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
+                 'run-config')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -34,7 +40,17 @@ param(
     [ValidatePattern('^(0x[0-9a-fA-F]{1,16})?$')][string]$TargetWindow = '',
     [ValidateRange(0,2147483647)][int]$PeerPid = 0,
     [string]$ExportDir,
-    [switch]$SoftwareGL
+    [switch]$SoftwareGL,
+    # r6 phases: a sub-step of the phase (each phase validates its own set).
+    [ValidatePattern('^([a-z][a-z0-9-]{0,31})?$')][string]$Action = '',
+    # Names one owned application record of a phase (several may run at once).
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{0,23}$')][string]$Label = 'main',
+    # run-config: UTF-8 configuration file (verbatim) and its frozen SHA256.
+    [string]$ConfigFile,
+    [string]$ConfigSha256,
+    # Extra application environment as NAME=VALUE pairs separated by ';' (GHOSTTY_* names only).
+    [ValidateLength(0,2048)][string]$AppEnv = '',
+    [ValidateRange(0,900)][int]$RunHoldSeconds = 0
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -402,6 +418,21 @@ public static class GxVmWindows {
         facts["error"] = ok ? 0 : Marshal.GetLastWin32Error();
         return facts;
     }
+
+    // Read-only: every descendant window of one class (bounded).
+    public static ArrayList ChildrenOfClass(IntPtr parent, string cls) {
+        ArrayList list = new ArrayList();
+        if (parent == IntPtr.Zero || !IsWindow(parent)) return list;
+        EnumChildWindows(parent, delegate (IntPtr hwnd, IntPtr unused) {
+            StringBuilder name = new StringBuilder(128);
+            GetClassNameW(hwnd, name, name.Capacity);
+            if (name.ToString() == cls) list.Add(Describe(hwnd));
+            return list.Count < 256;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    public static Hashtable Foreground() { return Describe(GetForegroundWindow()); }
 }
 '@
 
@@ -1216,6 +1247,333 @@ function Run-Inspect {
     }
 }
 
+# ---------------------------------------------------------------------------
+# r6 phases. An application is "owned" only while this fixture started (or a
+# phase explicitly adopted) it and its PID, creation time and image path still
+# match the saved record; nothing else is closed or terminated. Multi-step
+# phases keep their records under <RunRoot>\records and are driven by -Action.
+
+$script:R6Phases = @('run-config')
+$script:Restore = $null
+
+function Assert-Action([string[]]$Allowed, [string]$Default) {
+    $value = if ($Action) { $Action } else { $Default }
+    if ($Allowed -cnotcontains $value) { throw ("Phase $Phase accepts -Action " + ($Allowed -join '|') + "; got '$value'.") }
+    return $value
+}
+
+function Get-RecordPath([string]$Name) {
+    if ($Name -notmatch '^[A-Za-z0-9_.-]{1,96}$') { throw "Invalid record name: $Name" }
+    $dir = Join-Path $script:RunRoot 'records'
+    [IO.Directory]::CreateDirectory($dir) | Out-Null
+    return Join-Path $dir ($Name + '.json')
+}
+
+function Save-Record([string]$Name, $Value) {
+    $path = Get-RecordPath $Name
+    Write-Json $path $Value
+    if (-not $script:ExportExtra.Contains($path)) { $script:ExportExtra.Add($path) }
+    return $path
+}
+
+function Read-Record([string]$Name) {
+    $path = Get-RecordPath $Name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    if (-not $script:ExportExtra.Contains($path)) { $script:ExportExtra.Add($path) }
+    return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+}
+
+function Set-RecordField($Record, [string]$Name, $Value) {
+    $Record | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+}
+
+function Get-Sha256([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+
+function Get-Utf8Bytes([string]$Text) { return [Text.UTF8Encoding]::new($false).GetBytes($Text) }
+
+function Write-ExportMarker([string]$Suffix, $Value) {
+    # A small file the host can poll on the share while the guest holds a step.
+    if ($script:ExportRoot) { Write-Json (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-' + $Suffix + '.json')) $Value }
+}
+
+function Get-AppEnvironment {
+    $map = [ordered]@{}
+    if ($SoftwareGL) { $map['GHOSTTY_GX_OPENGL'] = 'software' }
+    foreach ($pair in @($AppEnv.Split(';') | Where-Object { $_ })) {
+        $index = $pair.IndexOf('=')
+        if ($index -lt 1) { throw "AppEnv entry needs NAME=VALUE: $pair" }
+        $name = $pair.Substring(0, $index)
+        $value = $pair.Substring($index + 1)
+        if ($name -cnotmatch '^GHOSTTY_[A-Z0-9_]{1,48}$') { throw "AppEnv accepts GHOSTTY_* names only: $name" }
+        if ($value.Length -gt 512 -or $value -match '[\x00-\x1f]') { throw "AppEnv value for $name is not a short single line." }
+        $map[$name] = $value
+    }
+    return $map
+}
+
+function Get-GuestApps {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'ghostty.exe'" | ForEach-Object {
+        [ordered]@{ pid=[int]$_.ProcessId; parent=[int]$_.ParentProcessId; session=[int]$_.SessionId; path=$_.ExecutablePath;
+            created=$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }); command_line=$_.CommandLine } })
+}
+
+function Get-OwnedProcess($Record) {
+    # The record's exact process life, or $null once it exited or its PID was reused.
+    if ($null -eq $Record -or -not $Record.pid) { return $null }
+    $process = Get-Process -Id ([int]$Record.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $null }
+    try {
+        if ($process.StartTime.ToFileTimeUtc() -ne [long]$Record.birth_filetime -or $process.Path -ine [string]$Record.exe) { $process.Dispose(); return $null }
+        $null = $process.Handle
+        return $process
+    } catch { $process.Dispose(); return $null }
+}
+
+function Get-OwnedRecordSummary([string]$Prefix) {
+    $dir = Join-Path $script:RunRoot 'records'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter ($Prefix + '*.json') | ForEach-Object {
+        $record = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+        $alive = $false
+        if ($record.PSObject.Properties['pid'] -and $record.pid) { $owned = Get-OwnedProcess $record; if ($owned) { $alive = $true; $owned.Dispose() } }
+        [ordered]@{ name=$_.BaseName; status=$(if ($record.PSObject.Properties['status']) { $record.status } else { $null }); alive=$alive } })
+}
+
+function Get-PhaseState([string]$When) {
+    $state = [ordered]@{ label=$When; utc=[DateTime]::UtcNow.ToString('o'); user=$env:USERNAME; ghostty=(Get-GuestApps) }
+    switch ($Phase) {
+        'run-config' { $state.records = @(Get-OwnedRecordSummary 'run-config-') }
+    }
+    return $state
+}
+
+function Start-OwnedApp {
+    # Isolated by default (private LOCALAPPDATA/APPDATA/XDG_* under -Private, like
+    # Start-IsolatedApp); -RealProfile keeps the caller's real user environment.
+    param([string]$Exe, [string]$Private, [byte[]]$ConfigBytes, $Environment, [string[]]$Arguments = @(), [switch]$RealProfile, $Overrides = $null)
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Exe
+    $start.Arguments = ($Arguments -join ' ')
+    $start.UseShellExecute = $false
+    foreach ($key in @($start.EnvironmentVariables.Keys)) { if ($key -match '^(?i:GHOSTTY_)') { $start.EnvironmentVariables.Remove($key) } }
+    $config = $null
+    if ($RealProfile) {
+        $start.WorkingDirectory = $env:USERPROFILE
+    } else {
+        Assert-NoReparse $Private
+        if (Test-Path -LiteralPath $Private) { throw "Application profile already exists: $Private" }
+        [IO.Directory]::CreateDirectory($Private) | Out-Null
+        if ($null -ne $ConfigBytes) {
+            $config = Join-Path $Private 'ghostty\config.ghostty'
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($config)) | Out-Null
+            [IO.File]::WriteAllBytes($config, $ConfigBytes)
+        }
+        $start.WorkingDirectory = $Private
+        foreach ($key in @($start.EnvironmentVariables.Keys)) {
+            if ($key -match '^(?i:XDG_)' -or $key -in @('NO_COLOR','TERM','LOCALAPPDATA','APPDATA')) { $start.EnvironmentVariables.Remove($key) }
+        }
+        $start.EnvironmentVariables['LOCALAPPDATA'] = $Private
+        $start.EnvironmentVariables['APPDATA'] = Join-Path $Private 'appdata'
+        $start.EnvironmentVariables['XDG_CONFIG_HOME'] = $Private
+        $start.EnvironmentVariables['XDG_STATE_HOME'] = Join-Path $Private 'state'
+        $start.EnvironmentVariables['XDG_CACHE_HOME'] = Join-Path $Private 'cache'
+    }
+    if ($Overrides) { foreach ($key in @($Overrides.Keys)) { $start.EnvironmentVariables[$key] = [string]$Overrides[$key] } }
+    if ($Environment) { foreach ($key in @($Environment.Keys)) { $start.EnvironmentVariables[$key] = [string]$Environment[$key] } }
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $process = [Diagnostics.Process]::Start($start)
+    $null = $process.Handle
+    return @{ process=$process; config=$config }
+}
+
+function New-AppRecord($Process, [string]$Exe, [string]$Class, [string]$Private, [string]$Config, $Environment, [string[]]$Arguments) {
+    $logRoot = if ($Private) { $Private } else { $env:LOCALAPPDATA }
+    return [ordered]@{ phase=$Phase; label=$Label; status='STARTING'; step=$script:Step; pid=$Process.Id;
+        birth_filetime=$Process.StartTime.ToFileTimeUtc(); birth=$Process.StartTime.ToUniversalTime().ToString('o');
+        exe=$Exe; exe_sha256=(Get-Sha256 $Exe); app_class=$Class; profile=$Private; config=$Config;
+        config_sha256=$(if ($Config) { Get-Sha256 $Config } else { $null }); log=(Join-Path $logRoot 'ghostty\logs\ghostty.log');
+        environment=$Environment; arguments=@($Arguments); main_window=$null }
+}
+
+function Wait-AppWindow($Process, [int]$Seconds = 45) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) { throw "Owned app exited $($Process.ExitCode) before it showed a window." }
+        $windows = @([GxVmWindows]::TopLevel($Process.Id) | Where-Object { $_['class'] -ceq 'GhosttyWindow' -and $_['visible'] })
+        if ($windows.Count -gt 0) { return $windows[0] }
+        Start-Sleep -Milliseconds 100
+    } while ($clock.Elapsed.TotalSeconds -lt $Seconds)
+    throw "Owned app showed no GhosttyWindow within $Seconds seconds."
+}
+
+function Get-TerminalPanes([int]$ProcessId) {
+    $panes = New-Object System.Collections.Generic.List[object]
+    foreach ($window in @([GxVmWindows]::TopLevel($ProcessId) | Where-Object { $_['class'] -ceq 'GhosttyWindow' })) {
+        $hwnd = [IntPtr][Convert]::ToInt64($window['hwnd'].Substring(2), 16)
+        foreach ($pane in @([GxVmWindows]::ChildrenOfClass($hwnd, 'GhosttyTerminal'))) { $pane['window'] = $window['hwnd']; $panes.Add($pane) }
+    }
+    return $panes.ToArray()
+}
+
+function Get-AppStatus($Record) {
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $process = Get-OwnedProcess $Record
+    $status = [ordered]@{ label=$Record.label; pid=[int]$Record.pid; birth_filetime=[long]$Record.birth_filetime; alive=($null -ne $process);
+        foreground=[GxVmWindows]::Foreground() }
+    if ($process) {
+        try {
+            $process.Refresh()
+            $status.windows = Get-WindowSnapshot $process.Id $process.MainWindowHandle 'status'
+            $status.terminal_panes = @(Get-TerminalPanes $process.Id)
+            $status.foreground_is_owned = ([long]$status.foreground['pid'] -eq $process.Id)
+        } finally { $process.Dispose() }
+    }
+    return $status
+}
+
+function Close-OwnedApp($Record) {
+    # CloseMainWindow first (the normal close request); WM_CLOSE to this exact
+    # process's remaining GhosttyWindows is recorded as a follow-up; a kill is
+    # always a failed close.
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    $close = [ordered]@{ label=$Record.label; pid=[int]$Record.pid; birth_filetime=[long]$Record.birth_filetime; wait_seconds=$CloseWaitSeconds;
+        already_exited=$false; close_main_window=$null; followup=@(); killed=$false; exit_code=$null; exit_code_hex=$null;
+        closed_by_close_main_window=$false; closed_normally=$false }
+    $process = Get-OwnedProcess $Record
+    if ($null -eq $process) {
+        $close.already_exited = $true
+        $close.note = 'The recorded process had already exited (or its PID was reused); its exit code is not observable now.'
+        return $close
+    }
+    try {
+        $process.Refresh()
+        $main = $process.MainWindowHandle
+        $close.before = Get-WindowSnapshot $process.Id $main 'before-close'
+        $close.close_main_window_utc = [DateTime]::UtcNow.ToString('o')
+        $close.close_main_window = $process.CloseMainWindow()
+        $exited = $process.WaitForExit(2000)
+        $close.closed_by_close_main_window = $exited
+        if (-not $exited) {
+            $close.after_2s = Get-WindowSnapshot $process.Id $main 'after-2s'
+            $close.followup = @($close.after_2s.ghostty_windows | ForEach-Object {
+                [GxVmWindows]::PostClose([IntPtr][Convert]::ToInt64($_['hwnd'].Substring(2), 16)) })
+            $exited = $process.WaitForExit([Math]::Max(1000, $CloseWaitSeconds * 1000 - 2000))
+        }
+        if (-not $exited) {
+            $close.before_kill = Get-WindowSnapshot $process.Id $main 'before-kill'
+            $close.scene = Get-ProcessScene $process
+            $process.Kill()
+            $null = $process.WaitForExit(5000)
+            $close.killed = $true
+        }
+        if ($process.HasExited) {
+            $close.exit_code = $process.ExitCode
+            $close.exit_code_hex = '0x{0:X8}' -f $process.ExitCode
+            $close.exit_utc = $process.ExitTime.ToUniversalTime().ToString('o')
+            $born = $process.StartTime.ToUniversalTime()
+            $close.orphans_after_exit = @(Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $process.Id) |
+                Where-Object { $_.CreationDate.ToUniversalTime() -ge $born } |
+                ForEach-Object { [ordered]@{ pid=[int]$_.ProcessId; name=$_.Name; created=$_.CreationDate.ToUniversalTime().ToString('o') } })
+        }
+        $close.closed_normally = (-not $close.killed) -and $process.HasExited -and $process.ExitCode -eq 0
+    } finally { $process.Dispose() }
+    return $close
+}
+
+function Get-RunConfigSource {
+    if ($ConfigFile) {
+        Assert-Hash $ConfigFile $ConfigSha256
+        $bytes = [IO.File]::ReadAllBytes($ConfigFile)
+        if ($bytes.Length -gt 262144) { throw 'The configuration file exceeds 256 KiB.' }
+        # Strict decoding: an invalid UTF-8 file is refused; the bytes are used verbatim.
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        return [ordered]@{ bytes=$bytes; source=$ConfigFile; sha256=$ConfigSha256.ToLowerInvariant(); default=$false; lines=@($text -split "`r?`n").Count }
+    }
+    if ($ConfigSha256) { throw '-ConfigSha256 needs -ConfigFile.' }
+    $text = (@('language = en', 'confirm-close-surface = false', 'gx-session-restore = false') -join $script:LF) + $script:LF
+    return [ordered]@{ bytes=(Get-Utf8Bytes $text); source=$null; sha256=$null; default=$true; lines=3 }
+}
+
+function Get-RendererLines([string]$Log) {
+    if (-not (Test-Path -LiteralPath $Log)) { return @() }
+    return @(Get-Content -LiteralPath $Log | Select-String 'loaded OpenGL' | Select-Object -First 4 | ForEach-Object Line)
+}
+
+function Invoke-RunConfig {
+    # once: start, wait for the window, hold, CloseMainWindow, require exit 0.
+    # start/stop/status split the same life across invocations by -Label.
+    $step = Assert-Action @('once','start','stop','status') 'once'
+    $name = 'run-config-' + $Label
+    if ($step -ceq 'status' -or $step -ceq 'stop') {
+        $record = Read-Record $name
+        if ($null -eq $record) { throw "No run-config record for -Label $Label in this run." }
+        if ($step -ceq 'status') { return Get-AppStatus $record }
+        $close = Close-OwnedApp $record
+        Set-RecordField $record 'close' $close
+        Set-RecordField $record 'renderer' (Get-RendererLines $record.log)
+        $record.status = if ($close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' }
+        Save-Record $name $record | Out-Null
+        if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+        return [ordered]@{ record=$record; fixture_verdict=$(if ($close.closed_normally) { 'PASS' } else { 'FAIL' });
+            fixture_reason=$(if ($close.closed_normally) { $null } else { 'normal close did not pass (see close)' }) }
+    }
+    $previous = Read-Record $name
+    $alive = Get-OwnedProcess $previous
+    if ($alive) { $alive.Dispose(); throw "Label $Label still runs (pid $($previous.pid)); stop it or use another -Label." }
+    $app = Resolve-GlApp
+    $source = Get-RunConfigSource
+    $environment = Get-AppEnvironment
+    $arguments = @('--gx-single-instance=false')
+    $private = Join-Path $script:RunRoot ($script:Step + '-run-config-' + $Label)
+    $started = Start-OwnedApp -Exe $app.exe -Private $private -ConfigBytes $source.bytes -Environment $environment -Arguments $arguments
+    $process = $started.process
+    $record = New-AppRecord $process $app.exe $app.class $private $started.config $environment $arguments
+    $record.config_source = $source.source
+    $record.config_default = $source.default
+    $record.config_source_sha256 = $source.sha256
+    Save-Record $name $record | Out-Null
+    $script:ExportExtra.Add($started.config)
+    try {
+        $record.main_window = Wait-AppWindow $process 45
+        $record.window_seen_utc = [DateTime]::UtcNow.ToString('o')
+        $record.status = 'RUNNING'
+        Save-Record $name $record | Out-Null
+        if ($step -ceq 'start') {
+            Write-ExportMarker 'run-config-running' @{ label=$Label; pid=$record.pid; hwnd=$record.main_window['hwnd']; utc=$record.window_seen_utc }
+            return [ordered]@{ record=$record; fixture_verdict='RUNNING' }
+        }
+        $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
+        if ($hold -gt 0) {
+            Write-ExportMarker 'run-config-holding' @{ label=$Label; pid=$record.pid; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
+            $holdEnd = [DateTime]::UtcNow.AddSeconds($hold)
+            while ([DateTime]::UtcNow -lt $holdEnd) {
+                if ($process.HasExited) { throw "Owned app exited $($process.ExitCode) during the hold." }
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        $record.held_seconds = $hold
+    } catch {
+        $record.status = 'START_FAILED'
+        $record.error = $_.Exception.Message
+        if ($step -ceq 'start' -and -not $process.HasExited) { $record.close = Close-OwnedApp $record }
+        Save-Record $name $record | Out-Null
+        throw
+    } finally {
+        if ($step -ceq 'once') {
+            if (-not $record.Contains('close')) { $record.close = Close-OwnedApp $record }
+            $record.renderer = Get-RendererLines $record.log
+            if ($record.status -ceq 'RUNNING') { $record.status = if ($record.close.closed_normally) { 'CLOSED' } else { 'CLOSE_FAILED' } }
+            Save-Record $name $record | Out-Null
+            if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+        }
+        $process.Dispose()
+    }
+    $passed = $record.close.closed_normally
+    return [ordered]@{ record=$record; fixture_verdict=$(if ($passed) { 'PASS' } else { 'FAIL' });
+        fixture_reason=$(if ($passed) { $null } else { 'normal close did not pass (see record.close)' }); visual_review='PENDING' }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
@@ -1255,6 +1613,7 @@ $report = [ordered]@{ phase=$Phase; status='PENDING'; run_id=$RunId; vm_uuid=$id
     scope=$Scope; app_dir=$script:AppDir; rehearsal=[bool]$Rehearsal; visual_review='PENDING';
     export_error=$script:ExportError; result=$null }
 try {
+    if ($Phase -in $script:R6Phases) { $report.before = Get-PhaseState 'before' }
     switch ($Phase) {
         'inspect' { $report.result = Run-Inspect }
         'tokens' { $report.result = Run-Tokens }
@@ -1313,12 +1672,20 @@ try {
         }
         'check-preserved' { $report.result = Check-Preserved }
         'cleanup-foreign' { $report.result = Cleanup-Foreign }
+        'run-config' { $report.result = Invoke-RunConfig }
     }
-    $report.status = if ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
+    # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
+    $verdict = $null
+    if ($report.result -is [System.Collections.IDictionary] -and $report.result.Contains('fixture_verdict')) { $verdict = $report.result['fixture_verdict'] }
+    $report.status = if ($verdict -ceq 'FAIL') { 'FAIL' } elseif ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
 } catch {
     $report.status = 'FAIL'
     $report.result = @{ reason=$_.Exception.Message; position=$_.InvocationInfo.PositionMessage }
 } finally {
+    if ($Phase -in $script:R6Phases) {
+        try { $report.after = Get-PhaseState 'after' } catch { $report.after = @{ error=$_.Exception.Message } }
+        $report.restore = $script:Restore
+    }
     Write-Json $statePath $script:State
     $reportPath = Join-Path $script:RunRoot ($script:Step + '.json')
     Write-Json $reportPath $report
