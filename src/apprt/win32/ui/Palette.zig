@@ -285,6 +285,7 @@ const ItemCache = struct {
 };
 
 popup: Popup = .{},
+preparation: Popup.Preparation = .{},
 uia_attachment: gx.ui_ref.Attachment = .{},
 
 /// The keyboard shortcut sheet of the window (see `Keybinds.show`).
@@ -431,11 +432,31 @@ pub fn open(self: *Palette, page: Page) void {
     const pane = self.paneView();
     pane.dismissSearch();
     self.uia_attachment = pane.attachment();
-    const window = pane.ownerWindow();
     const app = pane.app();
-    const owner = window.hwnd orelse return;
-    const t = self.tokens();
     if (timing) |*value| value.lap(.prepare);
+    if (!self.prepareHost()) return;
+    if (timing) |*value| value.lap(.create);
+
+    self.active = true;
+    self.page = page;
+    self.notifications = app.config.@"app-notifications";
+    self.popup.input.clear();
+    self.mouse = null;
+    self.buildItems();
+    if (timing) |*value| value.lap(.prepare);
+    self.refilter(.navigation);
+    const rect = self.bounds() orelse return;
+    if (timing) |*value| value.lap(.layout);
+    self.popup.open_timing = timing;
+    self.popup.show(rect);
+    _ = span.end(global.io(), "palette_open");
+}
+
+fn prepareHost(self: *Palette) bool {
+    const window = self.ownerWindow();
+    const app = window.app;
+    const owner = window.hwnd orelse return false;
+    const t = self.tokens();
     if (!ensurePopup(&self.popup, app, owner, .{
         .activate = true,
         .text_input = true,
@@ -457,25 +478,28 @@ pub fn open(self: *Palette, page: Page) void {
         .composition_changed = onCompositionChanged,
         .dismissed = onDismissed,
         .dpi_changed = onPopupDpiChanged,
-    })) return;
-    self.popup.applyTheme(t);
+    })) return false;
     self.popup.setOwnerScale(window.scale);
-    self.popup.setAccessibleName(i18n.tr("Command Palette"));
-    if (timing) |*value| value.lap(.create);
+    return true;
+}
 
-    self.active = true;
-    self.page = page;
-    self.notifications = app.config.@"app-notifications";
+/// Event-driven idle preparation of the hidden root. Dynamic tab rows are
+/// still rebuilt at open, while the host/target and bounded text cache survive.
+pub fn prepare(self: *Palette) void {
+    if (self.active or self.ownerWindow().activePane() == null) return;
+    if (!self.prepareHost()) return;
+    self.page = .root;
     self.popup.input.clear();
     self.mouse = null;
     self.buildItems();
-    if (timing) |*value| value.lap(.prepare);
     self.refilter(.navigation);
-    const rect = self.bounds() orelse return;
-    if (timing) |*value| value.lap(.layout);
-    self.popup.open_timing = timing;
-    self.popup.show(rect);
-    _ = span.end(global.io(), "palette_open");
+    self.popup.prepareHidden(self.bounds() orelse return);
+}
+
+pub fn invalidateHost(self: *Palette) void {
+    self.preparation.request();
+    self.popup.reuse_invalid = true;
+    self.item_cache.stamp = null;
 }
 
 /// Hide the palette, ending a theme preview; `restore_focus` gives the
@@ -506,12 +530,14 @@ pub fn reposition(self: *Palette) void {
 
 /// The DPI of the surface changed: resize the palette.
 pub fn onDpiChanged(self: *Palette) void {
+    @import("Menu.zig").invalidateWindow(self.ownerWindow());
     self.reposition();
     self.keybinds.reposition();
 }
 
 /// The UI language changed: retranslate the entries.
 pub fn onLanguageChanged(self: *Palette) void {
+    @import("Menu.zig").invalidateWindow(self.ownerWindow());
     self.keybinds.onLanguageChanged();
     if (!self.active) return;
     self.buildItems();
@@ -2420,7 +2446,7 @@ pub fn ensurePopup(
     callbacks: Popup.Callbacks,
 ) bool {
     if (popup.hwnd != null) {
-        if (popupAlive(popup) and popup.owner == owner and popup.options.dark == options.dark) return true;
+        if (!popup.reuse_invalid and popupAlive(popup) and popup.owner == owner and popup.options.dark == options.dark) return true;
         releasePopup(popup);
     }
     const factory = app.uiFactory() orelse return false;

@@ -392,6 +392,7 @@ pub const InitOptions = struct {
 /// reloads: theme colors, border, material, decorations and tab bar.
 pub fn onConfigChange(self: *Window) void {
     const hwnd = self.hwnd orelse return;
+    Menu.invalidateWindow(self);
     const config = &self.app.config;
     Backdrop.onConfigChange(hwnd, config, self.app.alpha_frames);
     if (!self.is_quick_terminal) {

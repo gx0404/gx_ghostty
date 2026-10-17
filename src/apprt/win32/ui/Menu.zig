@@ -694,6 +694,62 @@ fn menuButtonAnchor(window: *Window) w32.RECT {
     return screenRect(hwnd, .{ .left = client.right, .top = top, .right = client.right, .bottom = top });
 }
 
+/// Invalidate generations, not live callback storage. Active overlays finish
+/// their transaction; the next idle preparation/open rebuilds their hosts.
+pub fn invalidateWindow(window: *Window) void {
+    window.palette.invalidateHost();
+    Settings.invalidateOwner(window);
+    if (window.hwnd) |hwnd| MenuPopup.invalidateOwner(hwnd);
+}
+
+/// Environment/profile-cache notifications use the same coalesced work as
+/// configuration and language changes. No timer drives this preparation.
+pub fn invalidateApp(app: *App) void {
+    for (app.windows.items) |window| invalidateWindow(window);
+    if (app.quick_terminal) |qt| invalidateWindow(qt.window);
+}
+
+/// Only the outer GUI loop calls this, after dispatch and before GetMessage.
+/// Pending work is initialized by owner creation and enabled by its first
+/// frame, or requested by config/language/DPI/profile-cache notifications.
+pub fn prepareIdle(app: *App) void {
+    if (app.quit_requested) return;
+    // PeekMessage may dispatch sent messages (including owner destruction).
+    // Do not borrow any Window until after that reentrancy boundary.
+    var message: w32.MSG = undefined;
+    if (w32.PeekMessageW(&message, null, 0, 0, 0) != 0) return;
+    for (app.windows.items) |window| prepareWindow(window);
+    if (app.quick_terminal) |qt| prepareWindow(qt.window);
+}
+
+fn prepareWindow(window: *Window) void {
+    const eligible = window.shown and window.first_frame_surface == null and
+        !window.closing and !window.palette.active and !Settings.isOpen(window);
+    if (!window.palette.preparation.take(eligible, true)) return;
+    window.palette.prepare();
+    prepareMain(window);
+    Settings.prepare(window);
+}
+
+fn prepareMain(window: *Window) void {
+    if (MenuPopup.preferNative()) return;
+    const owner = window.hwnd orelse return;
+    const app = window.app;
+    const host = menuHost(app) orelse return;
+    var launch: ProfileItems = .init(app);
+    defer launch.deinit();
+    var menu: MenuPopup.Builder = .init(app.core_app.alloc);
+    defer menu.deinit();
+    buildMainMenu(&menu, app, &launch) catch return;
+    MenuPopup.prepare(host, owner, &menu.root, .{
+        .anchor = menuButtonAnchor(window),
+        .alignment = .right,
+        .keyboard = true,
+        .owner_scale = window.scale,
+        .reuse_root = true,
+    });
+}
+
 fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     const hwnd = window.hwnd orelse return;
     if (window.closing) return;
@@ -716,6 +772,7 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     var options = placement;
     if (options.open_timing) |*timing| timing.lap(.prepare);
     options.owner_scale = window.scale;
+    options.reuse_root = true;
     const id = runMenu(app, hwnd, &menu.root, options) orelse return;
     if (!windowOpen(app, window, attachment)) return;
 

@@ -585,6 +585,7 @@ pub fn run(self: *App) !void {
             self.session_save_ready = false;
             self.session.flush(self);
         }
+        Menu.prepareIdle(self);
         const result = w32.GetMessageW(&msg, null, 0, 0);
         if (result == 0) {
             // WM_QUIT received. Check if it's still wanted — stopQuitTimer()
@@ -1213,6 +1214,7 @@ pub fn onSystemSettingChange(self: *App, window: *Window, change: w32.SystemChan
     if (change.isArea("Environment")) {
         self.profiles_cache.invalidate();
         self.updateDefaultCommand();
+        Menu.invalidateApp(self);
     }
 }
 
