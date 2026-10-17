@@ -16,8 +16,8 @@ keybind = f8=goto_tab:1
 keybind = ctrl+shift+f9=gx:move_split_to_tab
 """
 # Later phases (R2-Surface.06/.07, R2-Window.05/.08/.10/.12): a split with an open search
-# bar moves into a new tab (the bar follows its terminal to the new parent); the palette
-# follows a window drag; fullscreen and maximize; the minimum track size; an odd resize;
+# bar moves into a new tab (the bar follows its terminal to the new parent); the open search
+# bar follows a window drag; fullscreen and maximize; the minimum track size; an odd resize;
 # closing a three-pane tab whose panes run ping asks once, Cancel keeps all three, and after
 # the pings end the tab closes its panes together.
 expect = [
@@ -28,7 +28,7 @@ expect = [
   "background-dpi: selecting the first tab after a DPI change gives its split panes the new scale",
   "search-before-move: the focused split shows its search bar with the query focus",
   "search-after-reparent: the split moved into a new tab; its search bar shows again over it in the new place",
-  "palette-follows-move: the window was dragged by its title bar; the open command palette moved with it and stays centered near the top of the window",
+  "search-follows-move: the window was dragged by its title bar; the open search bar moved with it and stays at the top right of the pane (the runner logs its rectangle before and after)",
   "fullscreen: Ctrl+Enter made the window fullscreen: no caption buttons, the terminal fills the screen",
   "maximized: the maximized window fills the work area with the tabs at the top edge",
   "min-track: resizing to 200x100 px stops at the minimum track size: caption buttons, the main menu button, a tab and a drag strip still fit",
@@ -192,27 +192,12 @@ action = "capture"
 name = "search-after-reparent"
 what = "all"
 
-[[step]]
-action = "key"
-keys = "escape"
-
-[[step]]
-action = "sleep"
-seconds = 0.4
-
-# R2-Window.08: the palette follows a window drag (empty title bar at x = -200 DIP).
-[[step]]
-action = "key"
-keys = "ctrl+shift+p"
-
+# R2-Window.08: the open search bar follows a window drag (empty title bar at x = -200 DIP).
+# The command palette cannot be used here: it is dismissed by a click outside it, the title
+# bar included. The two wait_popup steps log the bar's screen rectangle before and after.
 [[step]]
 action = "wait_popup"
 cls = "GhosttyGxPopup"
-new = true
-
-[[step]]
-action = "sleep"
-seconds = 0.4
 
 [[step]]
 action = "drag"
@@ -225,8 +210,13 @@ action = "sleep"
 seconds = 0.6
 
 [[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 2
+
+[[step]]
 action = "capture"
-name = "palette-follows-move"
+name = "search-follows-move"
 what = "all"
 
 [[step]]
