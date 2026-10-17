@@ -1,41 +1,125 @@
 id = "G09"
-title = "R3-Window: a non-selected tab has its own context actions"
+title = "R3-Window: tab context actions act on the right-clicked tab: close right, close, duplicate, pin, move to a new window and close others"
 lang = "zh_CN"
 config = """
 command = /bin/bash --noprofile --norc
 language = zh-CN
 keybind = ctrl+alt+r=prompt_tab_title
 """
-xdotool = """
+# Each action right-clicks a tab that is not the selected one where possible,
+# captures its menu, clicks the item and captures the result. BBB's shell is in
+# /tmp, so its duplicate is told apart by its /tmp title. Intermediate
+# screenshots use xdotool exec into the evidence directory next to
+# XDG_STATE_HOME, which the runner copies out with the rest; the whole script
+# must finish within the runner's 30 s xdotool timeout.
+xdotool = '''
 mousemove 400 300
 click 1
 sleep 0.3
 key ctrl+alt+r
-sleep 0.3
+sleep 0.25
 key ctrl+a
-type --delay 10 "FIRST"
+type --delay 8 "AAA"
 key Return
 sleep 0.3
 key ctrl+shift+t
-sleep 0.6
+sleep 0.5
+type --delay 8 "cd /tmp"
+key Return
+sleep 0.2
 key ctrl+alt+r
-sleep 0.3
+sleep 0.25
 key ctrl+a
-type --delay 10 "SECOND"
+type --delay 8 "BBB"
 key Return
 sleep 0.3
 key ctrl+shift+t
-sleep 0.6
+sleep 0.5
 key ctrl+alt+r
-sleep 0.3
+sleep 0.25
 key ctrl+a
-type --delay 10 "THIRD"
+type --delay 8 "CCC"
 key Return
 sleep 0.3
-mousemove 110 80
+key ctrl+shift+t
+sleep 0.5
+key ctrl+alt+r
+sleep 0.25
+key ctrl+a
+type --delay 8 "DDD"
+key Return
+sleep 0.3
+key ctrl+shift+t
+sleep 0.5
+key ctrl+alt+r
+sleep 0.25
+key ctrl+a
+type --delay 8 "EEE"
+key Return
+sleep 0.3
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s01-five-tabs.png"
+mousemove 554 68
 click 3
-sleep 1
-"""
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s02-close-right-of-ddd-menu.png"
+mousemove 634 298
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s02-close-right-of-ddd.png"
+mousemove 304 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s03-pin-bbb-menu.png"
+mousemove 384 189
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s03-pin-bbb.png"
+mousemove 419 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s04-move-ccc-to-window-menu.png"
+mousemove 499 157
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s04-move-ccc-to-window.png"
+search --onlyvisible --pid $1
+windowmove %2 480 300
+sleep 0.3
+mousemove 200 400
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s04b-two-windows.png"
+mousemove 32 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s05-duplicate-pinned-bbb-menu.png"
+mousemove 112 125
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s05-duplicate-pinned-bbb.png"
+mousemove 176 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s06-close-aaa-menu.png"
+mousemove 256 234
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s06-close-aaa.png"
+mousemove 237 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s07-close-others-of-ddd-menu.png"
+mousemove 317 266
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s07-close-others-of-ddd.png"
+'''
 expect = [
-  "G09-after.png: THREE tabs FIRST, SECOND, THIRD remain, THIRD is selected and FIRST's context menu offers rename, duplicate, move, pin, close, close others, close right",
+  "G09.png: the Chinese main window with one tab",
+  "G09-s01-five-tabs.png: five tabs AAA BBB CCC DDD EEE, EEE selected",
+  "G09-s02-close-right-of-ddd-menu.png / G09-s02-close-right-of-ddd.png: the menu of the non-selected DDD (更改标签页标题…, 复制标签页, 将标签页移至新窗口, 固定标签页, 关闭标签页, 关闭其他标签页, 关闭右侧标签页); 关闭右侧标签页 closed only EEE",
+  "G09-s03-pin-bbb.png: 固定标签页 on the non-selected BBB pinned BBB as a small tab at the start",
+  "G09-s04-move-ccc-to-window.png / G09-s04b-two-windows.png: 将标签页移至新窗口 on CCC moved CCC into a second window (moved aside with xdotool); the first window keeps BBB, AAA and DDD",
+  "G09-s05-duplicate-pinned-bbb-menu.png / G09-s05-duplicate-pinned-bbb.png: the pinned BBB's menu shows 固定标签页 checked; 复制标签页 added a tab titled /tmp (BBB's working directory)",
+  "G09-s06-close-aaa.png: 关闭标签页 on AAA closed AAA and nothing else",
+  "G09-s07-close-others-of-ddd.png: 关闭其他标签页 on DDD closes the /tmp copy; the pinned BBB is expected to stay, because window.zig::setupTabMenu counts only unpinned tabs when it enables the item",
 ]
