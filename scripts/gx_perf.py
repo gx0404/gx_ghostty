@@ -452,22 +452,20 @@ def summary_table(samples: Samples) -> tuple[str, dict]:
 
 def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", "new")) -> tuple[str, dict]:
     a, b = labels
-    for name in old.units.keys() & new.units.keys():
-        if old.units[name] != new.units[name]:
-            raise PerfError(f"metric {name}: time/count unit conflict")
     rows = [f"{'metric':<34} {'unit':<4} {a + ' n':>6} {a + ' med':>10} {a + ' p90':>10} "
             f"{b + ' n':>6} {b + ' med':>10} {b + ' p90':>10} {'Δ med':>10} {'Δ%':>7} {a + ' sum':>10} {b + ' sum':>10}"]
     report = {}
     for name in sorted(set(old.values) | set(new.values)):
-        unit = old.units.get(name) or new.units.get(name, "")
-        left = stats(old.values[name], unit) if old.values.get(name) else None
-        right = stats(new.values[name], unit) if new.values.get(name) else None
-        entry: dict = {"unit": unit, a: left, b: right}
+        unit = old.units.get(name, new.units.get(name, ""))
+        left = {**stats(old.values[name], old.units[name]), 'unit': old.units[name]} if old.values.get(name) else None
+        right = {**stats(new.values[name], new.units[name]), 'unit': new.units[name]} if new.values.get(name) else None
+        comparable = bool(left and right and left['unit'] == right['unit'])
+        entry: dict = {"unit": unit if comparable else None, a: left, b: right, 'comparable': comparable}
         cells = []
         for side in (left, right):
-            cells += [f"{side['n']:>6}", f"{fmt(side['median'], unit):>10}", f"{fmt(side['p90'], unit):>10}"] if side \
+            cells += [f"{side['n']:>6}", f"{fmt(side['median'], side['unit']):>10}", f"{fmt(side['p90'], side['unit']):>10}"] if side \
                 else [f"{'-':>6}", f"{'-':>10}", f"{'-':>10}"]
-        if left and right:
+        if comparable:
             delta = right["median"] - left["median"]
             percent = (delta / left["median"] * 100) if left["median"] else float("nan")
             entry["delta_median"], entry["delta_percent"] = delta, percent if math.isfinite(percent) else None
@@ -476,8 +474,9 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
         else:
             cells += [f"{'-':>10}", f"{'-':>7}"]
         report[name] = entry
-        cells += [f"{fmt(side['sum'], unit) if side and not unit else '-':>10}" for side in (left, right)]
-        rows.append(f"{name:<34} {unit:<4} " + " ".join(cells))
+        cells += [f"{fmt(side['sum'], '') if side and not side['unit'] else '-':>10}" for side in (left, right)]
+        display_unit = unit if not left or not right or comparable else f"{left['unit'] or 'count'}/{right['unit'] or 'count'}"
+        rows.append(f"{name:<34} {display_unit:<4} " + " ".join(cells))
     return "\n".join(rows) + "\n", report
 
 
@@ -495,8 +494,6 @@ def comparison_errors(old: Samples, new: Samples, gtk: bool = False, runs: int |
             errors.append(f"{name}: metric missing on one side")
         elif len(old.values[name]) != len(new.values[name]):
             errors.append(f"{name}: sample counts differ ({len(old.values[name])} vs {len(new.values[name])})")
-        elif old.units[name] != new.units[name]:
-            errors.append(f"{name}: time/count unit conflict")
     return errors
 
 
@@ -1060,8 +1057,32 @@ def wait_until(predicate, description: str, timeout: float = 10):
 
 
 def open_ui(instance, name: str):
+    previous = {popup.hwnd for popup in instance.popups() if popup.cls == 'GhosttyGxPopup'}
     instance.press(UI_KEYS[name])
-    return wait_until(lambda: next((p for p in instance.popups() if p.cls == 'GhosttyGxPopup'), None), name)
+    return wait_until(lambda: next((p for p in instance.popups() if p.cls == 'GhosttyGxPopup' and p.hwnd not in previous), None), name)
+
+
+def arm_samples(text: str, baseline: bool = False) -> Samples:
+    if baseline:
+        text = re.sub(r'(\(gx_perf\):\s+)scrollbar\.paint(?=\s+\d+(?:\.\d+)?\s*(?:ns|us|ms|s)\b)',
+                      r'\1scrollbar.paint_time', text)
+    return parse_text(text)
+
+
+def metric_capabilities(values: Sequence[str], labels, exes) -> dict:
+    result = {label: {} for label in labels}
+    for value in values:
+        label, separator, path = value.partition(':')
+        if not separator or label not in result:
+            raise PerfError('--capabilities requires LABEL:JSON_FILE')
+        data = read_json(Path(path))
+        if data.get('exe_sha256') != hashlib.sha256(exes[labels.index(label)].read_bytes()).hexdigest():
+            raise PerfError(f'{path}: capability declaration does not match measured executable')
+        metrics = data.get('metrics')
+        if not isinstance(metrics, dict) or any(not isinstance(name, str) or unit not in ('', 'ms') for name, unit in metrics.items()):
+            raise PerfError(f'{path}: metrics must map names to normalized units (ms or empty string)')
+        result[label] = metrics
+    return result
 
 
 def close_ui(instance):
@@ -1105,6 +1126,43 @@ class CaptureRun:
         self.samples = Samples()
         report['windows'] = []
         report['observations'] = {}
+        report['missing_metrics'] = {}
+
+    def parse(self, text):
+        return arm_samples(text, self.report.get('baseline', False))
+
+    def supported(self, name, unit='') -> bool:
+        observed = self.parse(self.mark().decode('utf-8', errors='strict'))
+        declared = self.report.get('capabilities', {})
+        actual = observed.units.get(name, declared.get(name))
+        if actual is not None:
+            if actual != unit:
+                raise PerfError(f'{name}: time/count unit conflict within this arm')
+            self.report['missing_metrics'].pop(name, None)
+            return True
+        self.missing(name, unit)
+        return False
+
+    def missing(self, name, unit=''):
+        self.report['missing_metrics'][name] = {'status': 'not_instrumented', 'n': 0, 'unit': unit}
+        if not self.report.get('baseline') and not self.report.get('diagnostic', True):
+            raise PerfError(f'{name}: instrumentation unproved; provide a hash-bound --capabilities declaration for zero-event counters')
+
+    def drain(self, names: Sequence[str], minimum: float = 0.3, quiet: float = 0.3, timeout: float = 3):
+        began = last_change = time.monotonic()
+        previous = None
+        while True:
+            observed = self.parse(self.mark().decode('utf-8', errors='strict'))
+            signature = tuple((name, tuple(observed.values.get(name, []))) for name in names)
+            now = time.monotonic()
+            if signature != previous:
+                previous, last_change = signature, now
+            if now - began >= minimum and now - last_change >= quiet:
+                self.report.setdefault('drains', []).append({'metrics': list(names), 'seconds': now - began, 'quiet_seconds': quiet})
+                return
+            if now - began >= timeout:
+                raise PerfError(f'metric log did not settle: {names}')
+            time.sleep(0.05)
 
     def mark(self) -> bytes:
         return self.instance.log.read_bytes() if self.instance.log.exists() else b''
@@ -1121,13 +1179,18 @@ class CaptureRun:
         self.samples.add(name, value, unit or None)
 
     def count(self, text: str, name: str):
-        parsed = parse_text(text)
+        parsed = self.parse(text)
         if name in parsed.units and parsed.units[name]:
             raise PerfError(f'{name}: expected an unscaled count')
         values = parsed.values.get(name, [])
-        self.add(name, sum(values))
-        self.report['observations'][name] = {'events': len(values), 'absent_is_zero_observed_events': not values,
-                                            'instrumentation_support': 'caller must verify source/build identity'}
+        supported = bool(values) or self.supported(name)
+        if supported:
+            self.add(name, sum(values))
+        if name == 'scrollbar.paint' and 'scrollbar.paint_time' in parsed.values:
+            for value in parsed.values['scrollbar.paint_time']:
+                self.add('scrollbar.paint_time', value, 'ms')
+        self.report['observations'][name] = {'events': len(values), 'status': 'observed' if supported else 'not_instrumented',
+                                            'zero_requires_support': True}
 
     def screenshot(self, name: str, info=None):
         info = info or self.instance.require_window()
@@ -1143,7 +1206,7 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
         x, y = instance.caption_point(current)
         before = capture.mark()
         instance.drag((round(x), round(y)), (round(x + 120 * scale), round(y + 40 * scale)), steps=60, step_delay=2 / 60)
-        time.sleep(0.3)
+        capture.drain(['scrollbar.paint'], minimum=0.6, quiet=0.5)
         capture.count(capture.window('drag', before), 'scrollbar.paint')
         moved = next(w for w in main_windows(gui, instance) if w.hwnd == current.hwnd)
         if moved.rect[:2] == current.rect[:2]:
@@ -1154,24 +1217,35 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
             open_ui(instance, name)
             time.sleep(0.6)
             close_ui(instance)
-            hot, scans = [], []
+            hot, totals, scans = [], [], []
             for index in range(3):
                 before = capture.mark()
                 popup = open_ui(instance, name)
-                time.sleep(0.4)
+                capture.drain([f'{name}.open.ready', f'{name}.open.total', 'profiles.path_scan'], minimum=0.5)
                 text = capture.window(f'{name}-hot-{index + 1}', before)
-                parsed = parse_text(text)
-                values = parsed.values.get(f'{name}.open.total', [])
-                if len(values) != 1 and not args.diagnostic:
-                    raise PerfError(f'{name}: expected one hot .open.total, got {len(values)}')
+                parsed = capture.parse(text)
+                values = parsed.values.get(f'{name}.open.ready', [])
+                if not values:
+                    capture.missing(f'{name}.open.ready', 'ms')
+                elif len(values) != 1 or parsed.units[f'{name}.open.ready'] != 'ms':
+                    raise PerfError(f'{name}: expected one hot .open.ready timing, got {len(values)}')
                 hot.extend(values)
+                totals.extend(parsed.values.get(f'{name}.open.total', []))
                 scans.extend(parsed.values.get('profiles.path_scan', []))
                 capture.screenshot(f'{name}-hot-{index + 1}', popup)
                 close_ui(instance)
             if hot:
-                capture.add(f'{name}.open.total', statistics.median(hot), 'ms')
-            capture.report['observations'][name] = {'hot_ms': hot, 'profiles.path_scan': scans}
-            capture.add(f'{name}.profiles.path_scan', sum(scans))
+                capture.add(f'{name}.open.ready', statistics.median(hot), 'ms')
+            if totals:
+                capture.add(f'{name}.open.total', statistics.median(totals), 'ms')
+            else:
+                capture.report['missing_metrics'][f'{name}.open.total'] = {'status': 'not_instrumented', 'n': 0, 'unit': 'ms'}
+            capture.report['observations'][name] = {'hot_ready_ms': hot, 'hot_total_ms': totals, 'profiles.path_scan': scans,
+                                                   'gate_metric': f'{name}.open.ready'}
+            if capture.supported('profiles.path_scan'):
+                capture.add(f'{name}.profiles.path_scan', sum(scans))
+            else:
+                capture.report['missing_metrics'][f'{name}.profiles.path_scan'] = {'status': 'not_instrumented', 'n': 0, 'unit': ''}
     elif case == 'p5':
         popup = open_ui(instance, 'keybinds')
         time.sleep(0.6)
@@ -1192,6 +1266,8 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
         for page in range(100):
             before = capture.mark()
             points = list(range(first_y, last_y, max(1, round(8 * scale))))
+            if not points:
+                raise PerfError('shortcut list viewport is empty')
             for y in points:
                 instance.mouse(x, y, action='move')
                 time.sleep(0.05)
@@ -1208,11 +1284,15 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
         capture.report['frames'] = frames
         capture.report['hover_pages'] = pages
         capture.report['hover_strategy'] = '8 DIP vertical sweep, overlapping 3-row wheel pages; unchanged viewport ends traversal'
+        layout_supported = capture.supported('d2d.layout_create')
         for frame in frames:
             capture.add('keybinds.paint', frame['paint_ms'], 'ms')
-            capture.add('d2d.layout_create.per_frame', frame['layouts'])
-        if not frames and not args.diagnostic:
-            raise PerfError('no keybinds.paint frames')
+            if layout_supported:
+                capture.add('d2d.layout_create.per_frame', frame['layouts'])
+        if not layout_supported:
+            capture.report['missing_metrics']['d2d.layout_create.per_frame'] = {'status': 'not_instrumented', 'n': 0, 'unit': ''}
+        if not frames:
+            capture.missing('keybinds.paint', 'ms')
         capture.screenshot('keybinds', popup)
         close_ui(instance)
     else:
@@ -1225,7 +1305,7 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
             raise PerfError('theme page has no theme list items')
         before = capture.mark()
         instance.hold_key('down', seconds=2, hz=30)
-        time.sleep(1)  # Include the debounced preview after release, before closing/reverting it.
+        capture.drain(['theme.reload'], minimum=1, quiet=0.5)
         capture.count(capture.window('theme-hold', before), 'theme.reload')
         capture.screenshot('theme', popup)
         close_ui(instance)
@@ -1315,6 +1395,32 @@ def measure_resources(gui, instance, capture: CaptureRun, args, counters):
         capture.add('gpu.dedicated.per_added_terminal', (samples[1]['gpu']['dedicated_bytes'] - samples[0]['gpu']['dedicated_bytes']) / 10)
 
 
+def absolute_gate(args, capture: CaptureRun) -> dict:
+    if capture.report.get('baseline') or args.diagnostic:
+        return {'status': 'not_evaluated', 'reason': 'baseline' if capture.report.get('baseline') else 'diagnostic'}
+    values = capture.samples.values
+    requirements = []
+    if args.command == 'win32-idle':
+        if args.seconds != 60:
+            return {'status': 'not_evaluated', 'reason': 'P2 requires a 60-second window'}
+        requirements = [('proc.snapshot', lambda xs: sum(xs) == 0 if args.state == 'minimized' else sum(xs) <= 30)]
+    elif args.command == 'win32-ui':
+        if args.case == 'p3':
+            requirements = [('scrollbar.paint', lambda xs: sum(xs) == 0)]
+        elif args.case == 'p4':
+            for ui in ('palette', 'menu', 'settings'):
+                requirements.extend([(ui+'.open.ready', lambda xs: max(xs) <= 6.25),
+                                     (ui+'.profiles.path_scan', lambda xs: sum(xs) == 0)])
+        elif args.case == 'p5':
+            requirements = [('keybinds.paint', lambda xs: p90(xs) < 2), ('d2d.layout_create.per_frame', lambda xs: max(xs) <= 10)]
+        else:
+            requirements = [('theme.reload', lambda xs: sum(xs) == 1)]
+    checks = {name: ('PASS' if predicate(values[name]) else 'FAIL') if values.get(name) else 'NOT_INSTRUMENTED'
+              for name, predicate in requirements}
+    return {'status': ('PASS' if all(value == 'PASS' for value in checks.values()) else 'FAIL') if checks else 'not_evaluated',
+            'checks': checks, 'scope': 'new-arm absolute numerical gate only; quiet/visual/cross-topology checks remain separate'}
+
+
 def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     if gui is None:
         import gx_win_gui as gui
@@ -1322,6 +1428,13 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     if not 1 <= len(exes) <= 2 or any(not exe.is_file() for exe in exes):
         raise PerfError('give one or two existing --exe files')
     labels = labels_for(len(exes), args.label)
+    unsupported = set(getattr(args, 'uninstrumented', []))
+    if not unsupported <= set(labels):
+        raise PerfError('--uninstrumented must name a declared label')
+    baseline = labels[0] if len(labels) == 2 else None
+    if unsupported - ({baseline} if baseline else set()) and not args.diagnostic:
+        raise PerfError('--uninstrumented can mark only the historical first arm outside diagnostic mode')
+    capabilities = metric_capabilities(getattr(args, 'capabilities', []), labels, exes)
     try:
         envs = label_environments(labels, ['GHOSTTY_GX_PERF=1', *args.env], args.label_env, gui.env_assignments)
     except gui.GuiError as exc:
@@ -1333,16 +1446,18 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     out = new_output(args.out)
     batch = {'schema': 'gx-win32-perf-v1', 'command': args.command, 'case': getattr(args, 'case', None),
              'order': 'AB/BA', 'planned_runs': args.runs, 'labels': labels, 'diagnostic': args.diagnostic,
-             'performance_verdict': 'not evaluated', 'runs': [], 'errors': [], 'metrics': {},
+             'performance_verdict': 'not evaluated', 'runs': [], 'errors': [], 'metrics': {}, 'baseline_label': baseline,
              'measurement_units': {'process.commit.*': 'bytes', 'gpu.dedicated.*': 'bytes',
                                    'process.commit.per_added_thread': 'bytes/thread', 'gpu.dedicated.per_added_terminal': 'bytes/terminal',
                                    'process.threads.*': 'threads', 'time': 'ms', 'other_unitless': 'count/gauge'}}
     sets = {label: Samples() for label in labels}
+    missing = {label: {} for label in labels}
     for run, label in alternate(labels, args.runs):
         target = out / label / f'run-{run:02d}'
         target.mkdir(parents=True)
         exe = exes[labels.index(label)]
         report = {'schema': 'gx-win32-perf-run-v1', 'label': label, 'run': run, 'command': args.command,
+                  'baseline': label == baseline or label in unsupported, 'capabilities': capabilities[label],
                   'case': getattr(args, 'case', None), 'env': envs[label], 'config': config, 'diagnostic': args.diagnostic,
                   'exe': str(exe), 'exe_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
                   'state': getattr(args, 'state', None), 'tabs': getattr(args, 'tabs', None), 'windows_count': getattr(args, 'windows', None),
@@ -1365,23 +1480,32 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
             else:
                 measure_resources(gui, instance, capture, args, counters_factory(gui))
             instance.ensure_owned()
+            capture.parse(capture.mark().decode('utf-8', errors='strict'))  # Refuse intra-arm conflicts even outside selected windows.
             if hashlib.sha256(exe.read_bytes()).hexdigest() != report['exe_sha256']:
                 raise PerfError('executable changed during run')
+            report['absolute_gate'] = absolute_gate(args, capture)
             report['status'] = 'completed'
-        except (OSError, ValueError, PerfError, gui.GuiError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             report['status'] = 'failed'
             report['errors'].append(str(exc))
         finally:
             if instance:
                 try:
                     report['cleanup'] = instance.close()
-                except (OSError, gui.GuiError) as exc:
+                except Exception as exc:
                     report['status'] = 'failed'
                     report['errors'].append('cleanup: ' + str(exc))
-                if instance.log.exists():
-                    (target / 'ghostty.log').write_bytes(instance.log.read_bytes())
+                try:
+                    if instance.log.exists():
+                        (target / 'ghostty.log').write_bytes(instance.log.read_bytes())
+                except Exception as exc:
+                    report['status'] = 'failed'
+                    report['errors'].append('copy raw log: ' + str(exc))
+                report['input_events'] = instance.input_events if isinstance(instance.input_events, list) else []
             if capture:
                 report['metrics'] = summary_table(capture.samples)[1]
+                report['metrics'].update({key: value for key, value in report['missing_metrics'].items() if key not in report['metrics']})
+                missing[label].update(report['missing_metrics'])
                 # A dedicated derived file is the only round-level summary input.
                 lines = [f"metric {name} {value} {capture.samples.units[name]}".rstrip()
                          for name, values in capture.samples.values.items() for value in values]
@@ -1390,6 +1514,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                     sets[label].extend(capture.samples)
             write_json(target / 'run.json', report)
             batch['runs'][-1]['status'] = report['status']
+            batch['runs'][-1]['absolute_gate'] = report.get('absolute_gate', {'status': 'not_evaluated'})
             batch['errors'].extend(f'{label}/{run}: {error}' for error in report['errors'])
             write_json(out / 'RESULT.json', batch)
         print(f"{TAG} {label}/{run}: {report['status']}", flush=True)
@@ -1399,18 +1524,24 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     texts = []
     for label in labels:
         text, batch['metrics'][label] = summary_table(sets[label])
+        absent = {name: info for name, info in missing[label].items() if name not in batch['metrics'][label]}
+        batch['metrics'][label].update(absent)
+        text += ''.join(f'{name} unit={info["unit"] or "count"} n=0 not_instrumented\n' for name, info in absent.items())
         texts.append(label + '\n' + text)
     if len(labels) == 2:
         text, batch['comparison'] = compare_table(sets[labels[0]], sets[labels[1]], tuple(labels))
         texts.append(text)
-    text = 'Driver evidence only; no performance verdict. Absent events do not prove instrumentation support.\n' + '\n'.join(texts)
+    batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
+    text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
+    text += '\nAbsolute gates: ' + json.dumps(batch['absolute_gates'], ensure_ascii=False) + '\n'
     if batch['errors']:
         text += '\nFAILED: ' + '; '.join(batch['errors']) + '\n'
     (out / 'SUMMARY.txt').write_text(text, encoding='utf-8', newline='\n')
     write_json(out / 'RESULT.json', batch)
     write_json(args.json, batch)
     print(text)
-    return 0 if batch['valid'] else 1
+    gate_failed = any(item['absolute_gate']['status'] == 'FAIL' for item in batch['runs'])
+    return 0 if batch['valid'] and not gate_failed else 1
 
 
 def run_remote(args) -> int:
@@ -1782,6 +1913,8 @@ def build_parser() -> argparse.ArgumentParser:
         experiment.add_argument('--config', type=Path)
         experiment.add_argument('--runs', type=int, default=10, help='runs per label; odd rounds AB, even rounds BA')
         experiment.add_argument('--diagnostic', action='store_true', help='development smoke; allow absent timing instrumentation')
+        experiment.add_argument('--uninstrumented', action='append', default=[], metavar='LABEL', help='explicit historical arm; missing metrics are n=0, never fabricated zero')
+        experiment.add_argument('--capabilities', action='append', default=[], metavar='LABEL:JSON', help='hash-bound instrumentation declaration, needed to certify zero-event counters')
         if name == 'win32-ui':
             experiment.add_argument('--case', choices=('p3', 'p4', 'p5', 'p6'), required=True)
         if name == 'win32-idle':

@@ -381,6 +381,103 @@ class ExperimentTests(unittest.TestCase):
         return gx_perf.build_parser().parse_args([command, '--exe', str(self.exe), '--out', str(self.root / 'out'),
                                                  '--runs', '1', *(['--case', 'p4'] if command == 'win32-ui' else []), *extra])
 
+    def test_baseline_count_is_missing_and_legacy_timing_is_renamed(self):
+        instance = mock.Mock()
+        instance.log = self.root/'old.log'
+        text = 'info(gx_perf): scrollbar.paint 200us\n'
+        instance.log.write_text(text)
+        capture = gx_perf.CaptureRun(instance,self.root,{'baseline': True,'diagnostic':False})
+        capture.count(text,'scrollbar.paint')
+        self.assertEqual([.2],capture.samples.values['scrollbar.paint_time'])
+        self.assertNotIn('scrollbar.paint',capture.samples.values)
+        self.assertEqual(0,capture.report['missing_metrics']['scrollbar.paint']['n'])
+        with self.assertRaises(gx_perf.PerfError):
+            gx_perf.arm_samples('info(gx_perf): x 1us\ninfo(gx_perf): metric x 1\n',True)
+
+    def test_zero_count_requires_hash_bound_support_in_new_arm(self):
+        instance = mock.Mock()
+        instance.log = self.root/'new.log'
+        instance.log.write_text('')
+        capture = gx_perf.CaptureRun(instance,self.root,{'baseline':False,'diagnostic':False})
+        with self.assertRaisesRegex(gx_perf.PerfError,'unproved'):
+            capture.count('', 'scrollbar.paint')
+        manifest = self.root/'capabilities.json'
+        manifest.write_text(json.dumps({'exe_sha256':gx_perf.hashlib.sha256(self.exe.read_bytes()).hexdigest(),
+                                        'metrics':{'scrollbar.paint':''}}))
+        capabilities=gx_perf.metric_capabilities(['new:'+str(manifest)],['new'],[self.exe])
+        capture.report['capabilities']=capabilities['new']
+        capture.count('', 'scrollbar.paint')
+        self.assertEqual([0],capture.samples.values['scrollbar.paint'])
+        self.exe.write_bytes(b'changed')
+        with self.assertRaisesRegex(gx_perf.PerfError,'executable'):
+            gx_perf.metric_capabilities(['new:'+str(manifest)],['new'],[self.exe])
+
+    def test_p4_old_without_metrics_completes_but_new_uses_ready_not_total(self):
+        instance = mock.Mock()
+        instance.log=self.root/'blank.log'
+        instance.log.write_text('')
+        capture=gx_perf.CaptureRun(instance,self.root,{'baseline':True,'diagnostic':False})
+        with mock.patch.object(gx_perf,'open_ui'),mock.patch.object(gx_perf,'close_ui'),mock.patch.object(capture,'drain'),mock.patch.object(gx_perf.time,'sleep'):
+            gx_perf.measure_ui(mock.Mock(),instance,capture,self.args())
+        self.assertFalse(capture.samples)
+        self.assertEqual('not_instrumented',capture.report['missing_metrics']['menu.open.ready']['status'])
+        capture.report['baseline']=False
+        for ui in ('palette','menu','settings'):
+            capture.add(ui+'.open.ready',6,'ms')
+            capture.add(ui+'.open.total',200,'ms')
+            capture.add(ui+'.profiles.path_scan',0)
+        self.assertEqual('PASS',gx_perf.absolute_gate(self.args(),capture)['status'])
+        capture.samples.values['menu.open.ready']=[7]
+        self.assertEqual('FAIL',gx_perf.absolute_gate(self.args(),capture)['status'])
+
+    def test_old_and_new_keep_abba_missing_n_zero(self):
+        args=self.args('win32-ui','--exe',str(self.exe),'--runs','2')
+        gui=self.fake_gui()
+        def measure(_,instance,capture,args):
+            if capture.report['baseline']:
+                for ui in ('palette','menu','settings'):
+                    capture.missing(ui+'.open.ready','ms')
+            else:
+                for ui in ('palette','menu','settings'):
+                    capture.add(ui+'.open.ready',2,'ms')
+                    capture.add(ui+'.profiles.path_scan',0)
+        with mock.patch.object(gx_perf,'measure_ui',side_effect=measure),mock.patch.object(gx_perf.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0,gx_perf.run_experiment(args,gui))
+        result=json.loads((args.out/'RESULT.json').read_text())
+        self.assertEqual(['old','new','new','old'],[row['label'] for row in result['runs']])
+        self.assertEqual(0,result['metrics']['old']['menu.open.ready']['n'])
+        self.assertEqual(2,result['metrics']['new']['menu.open.ready']['n'])
+        self.assertFalse(result['comparison']['menu.open.ready']['comparable'])
+
+    def test_unexpected_driver_exception_retains_failed_evidence(self):
+        args,gui=self.args(),self.fake_gui()
+        with mock.patch.object(gx_perf,'measure_ui',side_effect=StopIteration('window vanished')),mock.patch.object(gx_perf.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1,gx_perf.run_experiment(args,gui))
+        self.assertEqual('failed',json.loads((args.out/'build/run-01/run.json').read_text())['status'])
+        self.assertTrue((args.out/'SUMMARY.txt').is_file())
+
+    def test_open_ui_ignores_preexisting_popup(self):
+        instance=mock.Mock()
+        old=SimpleNamespace(hwnd=1,cls='GhosttyGxPopup')
+        new=SimpleNamespace(hwnd=2,cls='GhosttyGxPopup')
+        instance.popups.side_effect=[[old],[old],[old,new]]
+        with mock.patch.object(gx_perf.time,'sleep'):
+            self.assertIs(new,gx_perf.open_ui(instance,'menu'))
+
+    def test_drain_waits_for_late_count_then_quiet_interval(self):
+        instance=mock.Mock()
+        instance.log=self.root/'drain.log'
+        instance.log.write_text('')
+        capture=gx_perf.CaptureRun(instance,self.root,{})
+        now=[0.0]
+        def sleep(seconds):
+            now[0]+=seconds
+            if now[0] >= .4 and instance.log.stat().st_size == 0:
+                instance.log.write_text('info(gx_perf): metric scrollbar.paint 1\n')
+        with mock.patch.object(gx_perf.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(gx_perf.time,'sleep',side_effect=sleep):
+            capture.drain(['scrollbar.paint'],minimum=.6,quiet=.5)
+        self.assertGreaterEqual(now[0],.9)
+
     def test_legacy_win32_guard_failure_is_not_retried(self):
         import gx_win_gui as gui
         out = self.root / 'legacy'
@@ -412,7 +509,7 @@ class ExperimentTests(unittest.TestCase):
         return gui
 
     def test_alternating_batch_preserves_env_raw_and_does_not_double_count(self):
-        args = self.args('win32-ui', '--exe', str(self.exe), '--runs', '2', '--label-env', 'new:TEST=1')
+        args = self.args('win32-ui', '--exe', str(self.exe), '--runs', '2', '--label-env', 'new:TEST=1', '--diagnostic')
         gui = self.fake_gui()
         def measure(_, instance, capture, args):
             capture.add('palette.open.total', 2, 'ms')
@@ -450,12 +547,14 @@ class ExperimentTests(unittest.TestCase):
             n = counts.get(name, 0)
             counts[name] = n + 1
             with instance.log.open('a', encoding='utf-8') as log:
+                log.write(f'info(gx_perf): {name}.open.ready {[900000, 1000, 3000, 2000][n]}us\n')
                 log.write(f'info(gx_perf): {name}.open.total {[900000, 1000, 3000, 2000][n]}us\n')
                 log.write('info(gx_perf): metric profiles.path_scan 1\n')
             return mock.Mock()
-        with mock.patch.object(gx_perf, 'open_ui', side_effect=opened), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'):
+        with mock.patch.object(gx_perf, 'open_ui', side_effect=opened), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'), mock.patch.object(capture, 'drain'):
             gx_perf.measure_ui(mock.Mock(), instance, capture, self.args())
         for name in ('palette', 'menu', 'settings'):
+            self.assertEqual([2], capture.samples.values[name + '.open.ready'])
             self.assertEqual([2], capture.samples.values[name + '.open.total'])
             self.assertEqual([3], capture.samples.values[name + '.profiles.path_scan'])
         self.assertEqual({'palette': 4, 'menu': 4, 'settings': 4}, counts)
@@ -684,8 +783,9 @@ class CommandTests(unittest.TestCase):
             gx_perf.parse_text("info(gx_perf): a 10us\nmetric a 10\n")
         old = gx_perf.parse_text("metric a 1 ms\n")
         new = gx_perf.parse_text("metric a 1\n")
-        with self.assertRaises(gx_perf.PerfError):
-            gx_perf.compare_table(old, new)
+        _, report = gx_perf.compare_table(old, new)
+        self.assertFalse(report['a']['comparable'])
+        self.assertNotIn('delta_median', report['a'])
 
     def test_compare_rejects_missing_renderer_and_unequal_n(self):
         old, new = self.root / "old.txt", self.root / "new.txt"
