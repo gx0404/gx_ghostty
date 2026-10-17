@@ -577,8 +577,9 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
     self.fade_pending = animate;
 
     // On top of the owner's other popups, also when it does not activate.
-    var flags: u32 = 0;
-    if (!self.options.activate) flags |= w32.SWP_NOACTIVATE;
+    var current: w32.RECT = undefined;
+    const known = w32.GetWindowRect(hwnd, &current) != 0;
+    const flags = showPlacementFlags(if (known) current else null, start, self.options.activate);
     _ = w32.SetWindowPos(hwnd, null, start.left, start.top, start.right - start.left, start.bottom - start.top, flags);
     self.dpi = dpiOf(hwnd);
     if (self.options.activate) {
@@ -595,6 +596,16 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
         self.markOpenReady(hwnd, perf.now(global.io()));
     }
     if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, reveal_ms, null) == 0) self.reveal(hwnd);
+}
+
+fn showPlacementFlags(current: ?w32.RECT, target: w32.RECT, activate: bool) u32 {
+    var flags: u32 = if (activate) 0 else w32.SWP_NOACTIVATE;
+    if (current) |rect| {
+        if (rect.left == target.left and rect.top == target.top) flags |= w32.SWP_NOMOVE;
+        if (rect.right - rect.left == target.right - target.left and
+            rect.bottom - rect.top == target.bottom - target.top) flags |= w32.SWP_NOSIZE;
+    }
+    return flags;
 }
 
 /// Move/resize without changing visibility (screen pixels); nothing
@@ -2157,6 +2168,18 @@ test "caret blinking preserves the live UIA snapshot and queued Value action" {
     try testing.expect(!popup.uia_view.publisher.accepts(last));
     try testing.expectEqual(unavailable, abi.ProviderOptions(before_destroy, &options));
     try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+}
+
+test "P4 opening placement avoids redundant size and position changes" {
+    const rect: w32.RECT = .{ .left = 100, .top = 200, .right = 740, .bottom = 680 };
+    try std.testing.expect(w32.SWP_NOMOVE | w32.SWP_NOSIZE == showPlacementFlags(rect, rect, true));
+    try std.testing.expectEqual(w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE, showPlacementFlags(rect, rect, false));
+    try std.testing.expectEqual(w32.SWP_NOSIZE, showPlacementFlags(rect, .{ .left = 101, .top = 202, .right = 741, .bottom = 682 }, true));
+    try std.testing.expectEqual(w32.SWP_NOMOVE, showPlacementFlags(rect, .{ .left = 100, .top = 200, .right = 800, .bottom = 700 }, true));
+    try std.testing.expectEqual(@as(u32, 0), showPlacementFlags(null, rect, true));
+    try std.testing.expectEqual(w32.SWP_NOACTIVATE, showPlacementFlags(null, rect, false));
+    // Geometry hints must not suppress z-order placement, activation or show.
+    try std.testing.expect(showPlacementFlags(rect, rect, true) & w32.SWP_NOZORDER == 0);
 }
 
 test "opening ready waits for synchronous show and a current-size DPI frame" {
