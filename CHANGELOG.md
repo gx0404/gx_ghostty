@@ -41,7 +41,7 @@
 - Windows 标签栏每次刷新只拍一次系统进程快照（原来每个标签拍一次），标签多时 CPU 占用更低。
 - 配置诊断：`language` 填了不支持的值、`gui-settings.ghostty` 读不出来时会报告配置错误，`ghostty +validate-config` 因此返回 1。
 - GTK 切换界面语言与重新加载配置时在内存里重建配置，不再重新读盘。
-- Windows 便携包、安装包与 Linux deb 附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本。
+- Windows 便携包、安装包、Linux deb 与 debian13 GTK 压缩包附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本（压缩包在 `usr/share/doc/ghostty-gx/`，另附 Ghostty 的 MIT 许可）。
 
 ### Fixed
 
