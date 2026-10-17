@@ -67,25 +67,31 @@ class FakeDocker(vm.Docker):
             return subprocess.CompletedProcess(argv, 0, self.mice.pop(0) if self.mice else "", "")
         if argv[1:3] == ["image", "inspect"] or argv[1] in ("exec", "compose"):
             return subprocess.CompletedProcess(argv, 0, "" if text else b"", "" if text else b"")
+        if argv[1] == "rm":
+            return subprocess.CompletedProcess(argv, 0, "", "")
         raise AssertionError(f"unexpected docker command {argv[1:]}")
 
 
 def payload(root, version="win11", *, running=True, owner=vm.OWNER, image=vm.IMAGE, config_file=None,
-            storage=None, uuid=None):
+            storage=None, uuid=None, project=None, without_uuid=False, extra_mounts=()):
     expected = vm.expected_binding(root, version)
     mounts = [{"Type": "bind", "Source": str(source), "Destination": destination}
               for destination, source in expected["mounts"].items()]
     if storage is not None:
         mounts = [dict(item, Source=str(storage)) if item["Destination"] == "/storage" else item for item in mounts]
+    env = ["PASSWORD=never-shown", "HOST=" + expected["machine"]["host"]]
+    if not without_uuid:
+        env.insert(1, "UUID=" + (uuid or expected["machine"]["uuid"]))
     return {"Id": "71c3496b2aaa165eb663ee394a3455ef951621418ef22d617f9209c238b3f710",
             "Config": {"Image": image,
-                       "Labels": {"gx.owner": owner, "com.docker.compose.project": vm.container_name(version),
+                       "Labels": {"gx.owner": owner, "com.docker.compose.project": project or vm.container_name(version),
                                   "com.docker.compose.project.config_files": str(config_file or expected["config_file"]),
                                   "com.docker.compose.project.working_dir": str(expected["working_dir"])},
-                       "Env": ["PASSWORD=never-shown", "UUID=" + (uuid or expected["machine"]["uuid"]),
-                               "HOST=" + expected["machine"]["host"]]},
-            "Mounts": mounts,
+                       "Env": env},
+            "Mounts": mounts + list(extra_mounts),
             "State": {"Running": running, "Status": "running" if running else "exited", "ExitCode": 0}}
+
+FULL_ID = "71c3496b2aaa165eb663ee394a3455ef951621418ef22d617f9209c238b3f710"
 
 
 class WindowsVmTests(IsolatedTestCase):
@@ -256,6 +262,100 @@ class WindowsVmTests(IsolatedTestCase):
             popen.assert_not_called()
         _, argv = self.run_up(foreign, "71c3496b2aaa")
         self.assertIn("--force-recreate", argv)
+
+    def up_win10(self, inspect, replace=None, dry_run=False):
+        """up for win10 against a fake container; returns (result, docker, popen mock)."""
+        self.slots.acquire.side_effect = None
+        docker = FakeDocker(inspect, root=self.root)
+        with mock.patch.object(subprocess, "Popen") as popen, mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            popen.return_value.wait.return_value = 0
+            popen.return_value.pid = 4321
+            result = vm.up(self.root, "win10", docker, self.root / "log", 0, replace, dry_run=dry_run)
+        return result, docker, popen, stdout.getvalue()
+
+    def test_pre_machine_container_reports_project_and_missing_uuid(self):
+        # The live Win10 container was created by "docker compose up" in its directory (project
+        # "win10") before machine.json existed, so it carries no UUID.
+        vm.prepare(self.root)
+        errors = vm.binding_errors(payload(self.root, "win10", project="win10", without_uuid=True), self.root, "win10")
+        self.assertEqual(errors, ["compose project differs", "SMBIOS UUID differs from machine.json"])
+        self.assertNotIn("never-shown", json.dumps(errors))
+
+    def test_up_rebinds_a_foreign_project_container_by_removing_exactly_it_first(self):
+        vm.prepare(self.root)
+        foreign = payload(self.root, "win10", running=False, project="win10", without_uuid=True)
+        result, docker, popen, out = self.up_win10(foreign, FULL_ID[:12])
+        self.assertEqual(result, 0)
+        removals = [call[0] for call in docker.calls if call[0][0] == "rm"]
+        self.assertEqual(removals, [["rm", FULL_ID]])
+        argv = popen.call_args.args[0]
+        self.assertIn("never", argv)
+        self.assertNotIn("--force-recreate", argv)
+        self.assertNotIn("--no-recreate", argv)
+        self.assertEqual(argv[argv.index("-p") + 1], "gx-ghostty-win10")
+        event = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(event["mode"], "rebind")
+        self.assertTrue(event["replace"]["removed_before_create"])
+        self.assertEqual(event["replace"]["replaced_container"], FULL_ID)
+
+    def test_same_project_uuid_change_is_a_plain_replace_without_removal(self):
+        vm.prepare(self.root)
+        stale = payload(self.root, "win10", running=False, uuid="64a9cf19-6e00-44df-8579-58620db1ab2e")
+        _, docker, popen, _ = self.up_win10(stale, FULL_ID[:12])
+        self.assertFalse([call for call in docker.calls if call[0][0] == "rm"])
+        self.assertIn("--force-recreate", popen.call_args.args[0])
+
+    def test_rebind_needs_the_exact_id_of_a_stopped_owned_container(self):
+        vm.prepare(self.root)
+        for inspect, replace, message in (
+                (payload(self.root, "win10", running=False, project="win10", without_uuid=True), None, "does not match"),
+                (payload(self.root, "win10", running=False, project="win10", without_uuid=True), FULL_ID[:8], "does not match"),
+                (payload(self.root, "win10", running=False, project="win10", without_uuid=True), "deadbeefdead", "does not match"),
+                (payload(self.root, "win10", running=False, project="win10", owner="other"), FULL_ID[:12], "does not match"),
+                (payload(self.root, "win10", running=True, project="win10", without_uuid=True), FULL_ID[:12], "already running")):
+            with self.subTest(replace=replace, message=message), self.assertRaisesRegex(vm.VmError, message):
+                self.up_win10(inspect, replace)
+
+    def test_replace_refuses_containers_with_non_bind_mounts(self):
+        vm.prepare(self.root)
+        volume = {"Type": "volume", "Name": "x", "Source": "/var/lib/docker/volumes/x", "Destination": "/data"}
+        inspect = payload(self.root, "win10", running=False, project="win10", without_uuid=True, extra_mounts=[volume])
+        self.slots.acquire.side_effect = None
+        docker = FakeDocker(inspect, root=self.root)
+        with self.assertRaisesRegex(vm.VmError, "non-bind mounts"):
+            vm.up(self.root, "win10", docker, self.root / "log", 0, FULL_ID[:12])
+        self.assertFalse([call for call in docker.calls if call[0][0] in ("rm", "compose")])
+
+    def test_dry_run_reports_the_rebind_plan_without_slot_removal_or_compose(self):
+        vm.prepare(self.root)
+        foreign = payload(self.root, "win10", running=False, project="win10", without_uuid=True)
+        docker = FakeDocker(foreign, root=self.root)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(vm.up(self.root, "win10", docker, self.root / "log", 0, FULL_ID[:12], dry_run=True), 0)
+        plan = json.loads(stdout.getvalue())
+        self.assertEqual((plan["mode"], plan["remove_container"], plan["dry_run"]), ("rebind", FULL_ID, True))
+        self.assertEqual(plan["machine"], vm.machine_identity(self.root, "win10"))
+        self.assertFalse(plan["disk"]["exists"])
+        self.assertEqual(plan["running_owned_vms"], [])
+        self.slots.acquire.assert_not_called()
+        self.assertFalse([call for call in docker.calls if call[0][0] in ("rm", "compose", "image")])
+        self.assertFalse((self.root / "log").exists())
+
+    def test_dry_run_cli_needs_no_log_and_touches_nothing(self):
+        vm.prepare(self.root)
+        (self.root / "win10" / "storage" / "data.qcow2").write_bytes(b"qcow")
+        docker = FakeDocker(payload(self.root, "win10", running=False, project="win10", without_uuid=True), root=self.root)
+        argv = ["gx_windows_vm.py", "up", "--root", str(self.root), "--version", "win10",
+                "--replace-container", FULL_ID[:12], "--dry-run"]
+        with mock.patch.object(vm, "docker_executable", return_value=MISSING_DOCKER), \
+                mock.patch.object(vm, "Docker", return_value=docker), mock.patch.object(sys, "argv", argv), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(vm.main(), 0)
+        plan = json.loads(stdout.getvalue())
+        self.assertEqual(plan["mode"], "rebind")
+        self.assertEqual(plan["disk"]["size"], 4)
+        self.slots.acquire.assert_not_called()
+        self.assertFalse([call for call in docker.calls if call[0][0] in ("rm", "compose")])
 
     def test_stop_refuses_unbound_container(self):
         vm.prepare(self.root)
