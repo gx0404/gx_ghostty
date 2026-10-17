@@ -197,6 +197,8 @@ pub const Options = struct {
     /// The owner's content scale (`Window.scale` for the menus of a
     /// window), when the menu follows it (`Popup.setOwnerScale`).
     owner_scale: ?f32 = null,
+    /// Only the main menu root supplies a P4 opening measurement.
+    open_timing: ?Popup.OpenTiming = null,
 
     /// The anchor of a menu that opens at a point.
     pub fn at(pt: w32.POINT) w32.RECT {
@@ -234,6 +236,7 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
         .anchor = options.anchor,
         .alignment = options.alignment,
         .owner_scale = options.owner_scale,
+        .open_timing = options.open_timing,
         .foreground = w32.GetForegroundWindow(),
         .start_pt = cursor,
         .last_pt = cursor,
@@ -1273,6 +1276,7 @@ const State = struct {
     anchor: w32.RECT,
     alignment: Align,
     owner_scale: ?f32,
+    open_timing: ?Popup.OpenTiming = null,
     /// The popup of each level, created when the level first opens and
     /// reused by every submenu shown there until the menu closes.
     popups: [max_depth]Popup = @splat(.{}),
@@ -1319,6 +1323,8 @@ const State = struct {
             _ = value.end(global.io(), "menu.open");
         };
         const index = self.depth;
+        var timing = if (index == 0) self.open_timing else null;
+        if (timing) |*value| value.lap(.prepare);
         const level = &self.levels[index];
         const popup = &self.popups[index];
         level.* = .{ .state = self, .index = index, .popup = popup, .list = list, .parent_item = parent_item };
@@ -1354,6 +1360,7 @@ const State = struct {
             if (self.owner_scale) |owner_scale| popup.setOwnerScale(owner_scale);
         }
         self.depth += 1;
+        if (timing) |*value| value.lap(.create);
 
         level.scale = popup.ownerScale();
         level.layout();
@@ -1361,11 +1368,17 @@ const State = struct {
         level.hot_keyboard = level.hot != null;
         level.place();
         popup.options.motion = .{ .offset_y = if (index == 0) self.slideFor(level.bounds) else 0 };
+        if (timing) |*value| value.lap(.layout);
+        popup.open_timing = timing;
         popup.show(level.bounds);
         if (popup.scale() != level.scale) {
+            const layout_span = if (popup.open_timing != null) perf.Span.begin(global.io()) else null;
             level.scale = popup.scale();
             level.layout();
             level.place();
+            if (layout_span) |value| {
+                if (popup.open_timing) |*opened| opened.phases[@intFromEnum(Popup.OpenTiming.Phase.layout)] += perf.sinceUs(global.io(), value.start);
+            }
             popup.setBounds(level.bounds);
         }
         if (level.hot) |item| level.ensureVisible(item);

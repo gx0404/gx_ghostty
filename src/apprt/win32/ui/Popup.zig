@@ -63,8 +63,60 @@ const wstr = @import("wstr.zig");
 const App = @import("../App.zig");
 const uia = @import("uia.zig");
 const uia_bridge = @import("uia_bridge.zig");
+const perf = @import("../../../gx/perf.zig");
+const global = @import("../../../global.zig");
 
 const log = std.log.scoped(.win32_popup);
+
+/// One GUI-thread opening, through successful painting and uncloaking (or
+/// completion of its fade). Text layout performed while painting belongs to
+/// raster, not to the earlier geometry/layout phase. Cancelled opens emit no
+/// successful sample. The five phases partition total, including reveal waits.
+pub const OpenTiming = struct {
+    pub const Kind = enum { palette, menu, settings };
+    pub const Phase = enum { prepare, create, layout, raster, show };
+    kind: Kind,
+    start: perf.Instant,
+    last: perf.Instant,
+    phases: [5]u64 = @splat(0),
+    painted: bool = false,
+
+    pub fn begin(kind: Kind) ?OpenTiming {
+        if (!perf.enabled()) return null;
+        const at = perf.now(global.io());
+        return .{ .kind = kind, .start = at, .last = at };
+    }
+
+    pub fn lap(self: *OpenTiming, phase: Phase) void {
+        const at = perf.now(global.io());
+        self.add(phase, perf.elapsedUs(self.last, at));
+        self.last = at;
+    }
+
+    fn add(self: *OpenTiming, phase: Phase, us: u64) void {
+        self.phases[@intFromEnum(phase)] += us;
+    }
+
+    fn finishAt(self: *OpenTiming, at: perf.Instant) u64 {
+        const total = perf.elapsedUs(self.start, at);
+        var work: u64 = 0;
+        for (self.phases[0..4]) |us| work += us;
+        self.phases[@intFromEnum(Phase.show)] = total -| work;
+        return total;
+    }
+
+    fn report(self: *OpenTiming) void {
+        const total = self.finishAt(perf.now(global.io()));
+        switch (self.kind) {
+            inline else => |kind| {
+                inline for (std.meta.fields(Phase), 0..) |phase, i| {
+                    perf.record(@tagName(kind) ++ ".open." ++ phase.name, self.phases[i]);
+                }
+                perf.record(@tagName(kind) ++ ".open.total", total);
+            },
+        }
+    }
+};
 
 /// DWM corner preference of the popup (DWM_WINDOW_CORNER_PREFERENCE).
 pub const Corners = enum(u32) {
@@ -228,6 +280,7 @@ uia_cookie: u64 = 0,
 uia_refreshing: bool = false,
 uia_layout_pending: bool = true,
 visible: bool = false,
+open_timing: ?OpenTiming = null,
 dpi: u32 = 96,
 /// The owner's content scale relative to its window DPI (`setOwnerScale`),
 /// applied on top of `dpi`.
@@ -477,6 +530,7 @@ pub fn sizeDip(self: *const Popup) d2d.Size {
 pub fn show(self: *Popup, rect: w32.RECT) void {
     const hwnd = self.hwnd orelse return;
     if (self.visible and w32.IsWindowVisible_(hwnd) != 0) {
+        self.open_timing = null;
         if (self.animator.running) self.fade_target = rect else self.place(hwnd, rect);
         if (self.options.activate) _ = w32.SetFocus(hwnd);
         if (self.options.capture_mouse) _ = w32.SetCapture(hwnd);
@@ -555,6 +609,7 @@ fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
 
 /// Hide without reporting a dismissal.
 pub fn hide(self: *Popup) void {
+    self.open_timing = null;
     self.uiaDetach();
     const was_visible = self.visible;
     self.visible = false;
@@ -676,7 +731,10 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
     }
     current.revealing = false;
     setCloaked(hwnd, false);
-    if (!self.fade_pending) return;
+    if (!self.fade_pending) {
+        self.finishOpenTiming();
+        return;
+    }
     self.fade_pending = false;
     self.fade = anim.Tween.begin(anim.now(), anim.motion.duration.fast, anim.motion.enter);
     if (!anim.start(&self.animator)) self.finishMotion(hwnd);
@@ -713,10 +771,19 @@ fn finishMotion(self: *Popup, hwnd: w32.HWND) void {
     if (self.layered) _ = w32.SetLayeredWindowAttributes(hwnd, 0, 255, w32.LWA_ALPHA);
     const target = self.fade_target;
     if (target.right > target.left) self.place(hwnd, target);
+    self.finishOpenTiming();
+}
+
+fn finishOpenTiming(self: *Popup) void {
+    if (self.open_timing) |*timing| {
+        if (timing.painted) timing.report();
+        self.open_timing = null;
+    }
 }
 
 /// Stop a reveal or fade in progress (hiding).
 fn endMotion(self: *Popup, hwnd: w32.HWND) void {
+    self.open_timing = null;
     if (self.revealing) {
         _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
         setCloaked(hwnd, false);
@@ -1381,6 +1448,7 @@ fn handleClose(self: *Popup, hwnd: w32.HWND) void {
 
 /// Windows destroyed the window (with its owner): forget it.
 fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
+    self.open_timing = null;
     self.uiaDetach();
     self.releaseComposition();
     self.unlockOwner();
@@ -1399,6 +1467,12 @@ fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
 
 fn paint(self: *Popup, hwnd: w32.HWND) void {
     const cookie = self.uia_cookie;
+    const raster = if (self.open_timing != null) perf.Span.begin(global.io()) else null;
+    defer if (raster) |span| {
+        if (livePopup(hwnd, cookie)) |current| {
+            if (current.open_timing) |*timing| timing.add(.raster, perf.sinceUs(global.io(), span.start));
+        }
+    };
     defer if (livePopup(hwnd, cookie)) |current| {
         current.uia_layout_pending = false;
         current.uiaRefresh();
@@ -1457,6 +1531,7 @@ fn compositionReady(self: *Popup, hwnd: w32.HWND) bool {
 }
 
 fn markLegacyFrame(self: *Popup, hwnd: w32.HWND) void {
+    if (self.open_timing) |*timing| timing.painted = true;
     if (!self.composition_requested) return;
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return;
@@ -1511,6 +1586,7 @@ fn paintComposition(self: *Popup, hwnd: w32.HWND, canvas: *d2d.Canvas, cb: Callb
         return false;
     };
     self.composition_frame = frame.key;
+    if (self.open_timing) |*timing| timing.painted = true;
     return true;
 }
 
@@ -1908,6 +1984,32 @@ extern "user32" fn SystemParametersInfoW(
     pvParam: ?*anyopaque,
     fWinIni: u32,
 ) callconv(.winapi) i32;
+
+test "opening phases partition the action through reveal including repeated raster" {
+    var timing: OpenTiming = .{
+        .kind = .menu,
+        .start = .{ .nanoseconds = 1000 },
+        .last = .{ .nanoseconds = 1000 },
+    };
+    timing.add(.prepare, 10);
+    timing.add(.create, 20);
+    timing.add(.layout, 30);
+    timing.add(.raster, 40);
+    timing.add(.raster, 50);
+    const total = timing.finishAt(.{ .nanoseconds = 1_001_000 });
+    try std.testing.expectEqual(@as(u64, 1000), total);
+    try std.testing.expectEqual(@as(u64, 850), timing.phases[@intFromEnum(OpenTiming.Phase.show)]);
+    var sum: u64 = 0;
+    for (timing.phases) |us| sum += us;
+    try std.testing.expectEqual(total, sum);
+    var popup: Popup = .{ .open_timing = timing };
+    popup.hide(); // Even a never-created/cancelled host drops the pending sample.
+    try std.testing.expect(popup.open_timing == null);
+    const before = perf.enabled();
+    defer perf.setEnabled(before);
+    perf.setEnabled(false);
+    try std.testing.expect(OpenTiming.begin(.settings) == null);
+}
 
 test "modalQuitCode drops a withdrawn quit" {
     const testing = std.testing;
