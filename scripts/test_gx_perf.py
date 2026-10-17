@@ -349,6 +349,9 @@ class CounterTests(unittest.TestCase):
         delta = gx_perf.idle_delta(before, after)
         self.assertEqual((3, 'ms'), delta['process.cpu'])
         self.assertNotIn('threads.context_switches', delta)
+        after['thread_error']='query unavailable'
+        self.assertEqual('unavailable',gx_perf.context_switch_diagnostic(before,after)['status'])
+        self.assertEqual((3,'ms'),gx_perf.idle_delta(before,after)['process.cpu'])
 
     def test_paint_frames_do_not_mix_threads_or_count_trailing_layouts(self):
         text = ('00:00:00.100 [1] info(gx_perf): metric d2d.layout_create 2\n'
@@ -632,11 +635,12 @@ class ExperimentTests(unittest.TestCase):
             if seconds == 60:
                 with instance.log.open('a') as stream:
                     stream.write('info(gx_perf): metric proc.snapshot 2\n')
-        capture = gx_perf.CaptureRun(instance, self.root, {})
+        capture = gx_perf.CaptureRun(instance, self.root, {'diagnostic':False,'capabilities':{'proc.snapshot':''}})
         with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',return_value=(10,20)):
             gx_perf.idle_interval(gui,instance,capture,self.args('win32-idle'),counters)
         self.assertEqual([2],capture.samples.values['proc.snapshot'])
         self.assertEqual('partial',capture.report['context_switch_diagnostic']['status'])
+        self.assertEqual('not_instrumented',capture.report['missing_metrics']['renderer.present']['status'])
         with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',side_effect=[(10,20),(11,21)]):
             with self.assertRaisesRegex(gx_perf.PerfError,'input'):
                 gx_perf.idle_interval(gui,instance,capture,self.args('win32-idle'),counters)

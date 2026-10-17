@@ -944,13 +944,19 @@ class NativeCounters:
             memory.cb = ctypes.sizeof(memory)
             if not self.memory(handle, ctypes.byref(memory), memory.cb):
                 raise ctypes.WinError(ctypes.get_last_error())
-            threads = self.threads(instance.pid)
+            thread_error = None
+            try:
+                threads = self.threads(instance.pid)
+            except Exception as exc:
+                threads = {'birth': instance.creation, 'threads': []}
+                thread_error = f'{type(exc).__name__}: {exc}'
             if threads['birth'] != instance.creation:
                 raise PerfError("NT process birth differs from held process")
             instance.ensure_owned()
             return {"begin_ns": began, "end_ns": time.perf_counter_ns(), "pid": instance.pid,
                     "birth": value(created), "kernel_100ns": value(kernel), "user_100ns": value(user),
-                    "private_bytes": memory.private, "thread_count": len(threads['threads']), "threads": threads['threads']}
+                    "private_bytes": memory.private, "thread_count": None if thread_error else len(threads['threads']),
+                    "threads": threads['threads'], 'thread_error': thread_error}
         finally:
             self.w.CloseHandle(handle)
 
@@ -1021,6 +1027,9 @@ def idle_delta(before: dict, after: dict) -> dict:
 
 
 def context_switch_diagnostic(before, after) -> dict:
+    if before.get('thread_error') or after.get('thread_error'):
+        return {'status': 'unavailable', 'errors': [before.get('thread_error'), after.get('thread_error')],
+                'scope': 'thread counters are diagnostic only, not a P2 gate'}
     old = {(row['tid'], row['birth']): row['switches'] for row in before['threads']}
     new = {(row['tid'], row['birth']): row['switches'] for row in after['threads']}
     return {'status': 'endpoint_complete' if old.keys() == new.keys() else 'partial',
@@ -1152,9 +1161,9 @@ class CaptureRun:
         self.missing(name, unit)
         return False
 
-    def missing(self, name, unit=''):
+    def missing(self, name, unit='', *, required=True):
         self.report['missing_metrics'][name] = {'status': 'not_instrumented', 'n': 0, 'unit': unit}
-        if not self.report.get('baseline') and not self.report.get('diagnostic', True):
+        if required and not self.report.get('baseline') and not self.report.get('diagnostic', True):
             raise PerfError(f'{name}: instrumentation unproved; provide a hash-bound --capabilities declaration for zero-event counters')
 
     def drain(self, names: Sequence[str], minimum: float = 0.3, quiet: float = 0.3, timeout: float = 3):
@@ -1187,12 +1196,18 @@ class CaptureRun:
     def add(self, name: str, value: float, unit: str = ''):
         self.samples.add(name, value, unit or None)
 
-    def count(self, text: str, name: str):
+    def count(self, text: str, name: str, *, required=True):
         parsed = self.parse(text)
         if name in parsed.units and parsed.units[name]:
             raise PerfError(f'{name}: expected an unscaled count')
         values = parsed.values.get(name, [])
-        supported = bool(values) or self.supported(name)
+        if not values and not required:
+            full = self.parse(self.mark().decode('utf-8', errors='strict'))
+            supported = full.units.get(name, self.report.get('capabilities', {}).get(name)) == ''
+            if not supported:
+                self.missing(name, required=False)
+        else:
+            supported = bool(values) or self.supported(name)
         if supported:
             self.add(name, sum(values))
         if name == 'scrollbar.paint' and 'scrollbar.paint_time' in parsed.values:
@@ -1364,8 +1379,8 @@ def idle_interval(gui, instance, capture, args, counters):
     if args.state == 'minimized' and not all(gui.win32().IsIconic(w.hwnd) for w in main_windows(gui, instance)):
         raise PerfError('a measured window was restored')
     text = capture.window('idle', before_log)
-    for name in ('proc.snapshot', 'renderer.present'):
-        capture.count(text, name)
+    capture.count(text, 'proc.snapshot')
+    capture.count(text, 'renderer.present', required=False)
     for name, (value, unit) in idle_delta(before, after).items():
         capture.add(name, value, unit)
 
@@ -1406,18 +1421,21 @@ def measure_resources(gui, instance, capture: CaptureRun, args, counters):
             else:
                 capture.missing(f'renderer.targets_live.{count}')
         capture.add(f'process.commit.{count}', raw['private_bytes'])
-        capture.add(f'process.threads.{count}', raw['thread_count'])
+        if raw['thread_count'] is not None:
+            capture.add(f'process.threads.{count}', raw['thread_count'])
         samples.append(raw)
         capture.screenshot(f'terminals-{count}')
     capture.report['resources'] = samples
     capture.report['resource_scope'] = 'PDH increment=(11-tab bytes - 1-tab bytes)/10; target gauge denominator=actually visible terminals, not all tabs'
-    added_threads = samples[1]['thread_count'] - samples[0]['thread_count']
+    added_threads = (samples[1]['thread_count'] - samples[0]['thread_count']) if all(row['thread_count'] is not None for row in samples) else None
     added_commit = samples[1]['private_bytes'] - samples[0]['private_bytes']
     capture.add('process.commit.delta', added_commit)
-    capture.add('process.threads.delta', added_threads)
-    if added_threads <= 0:
+    if added_threads is not None:
+        capture.add('process.threads.delta', added_threads)
+    if (added_threads is None or added_threads <= 0) and args.command == 'win32-mem':
         raise PerfError('no positive thread-count increment at 11 terminals')
-    capture.add('process.commit.per_added_thread', added_commit / added_threads)
+    if added_threads is not None and added_threads > 0:
+        capture.add('process.commit.per_added_thread', added_commit / added_threads)
     capture.report['commit_scope'] = 'whole-process PrivateUsage delta per added thread; includes terminal heaps/atlases, not isolated stack commitment'
     if args.command == 'win32-gpu':
         capture.add('gpu.dedicated.per_added_terminal', (samples[1]['gpu']['dedicated_bytes'] - samples[0]['gpu']['dedicated_bytes']) / 10)
