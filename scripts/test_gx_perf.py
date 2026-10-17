@@ -26,6 +26,11 @@ import gx_wsl  # noqa: E402
 from test_gx_wsl import stat_line  # noqa: E402
 
 
+def ticks(idle_seconds: float, now: int = 50_000_000) -> dict:
+    """A fake QuietProbe.input_ticks() result with the given idle time."""
+    return {'last_input_tick': (now - round(idle_seconds * 1000)) & 0xFFFFFFFF, 'tick_count': now & 0xFFFFFFFF}
+
+
 def windows_data(*rows) -> dict:
     """A fake QuietProbe.windows() result: Win32_Process plus Get-Process rows."""
     cim = [{'pid': row['pid'], 'ppid': row.get('ppid', 0), 'name': row['name'], 'created': row.get('created', 1),
@@ -190,7 +195,7 @@ class QuietTests(unittest.TestCase):
         self.probe.wsl.return_value = {'running': False, 'processes': []}
         self.probe.vm.return_value = {'win11': {'exists': True, 'owned': True, 'running': False}}
         self.probe.slots.return_value = True
-        self.probe.idle.return_value = 600
+        self.probe.input_ticks.return_value = ticks(600)
         self.probe.session.return_value = {'interactive_console': True, 'process_session': 1, 'active_console_session': 1}
         self.probe.cpu.return_value = {'cpu': 100, 'top': []}
 
@@ -205,7 +210,7 @@ class QuietTests(unittest.TestCase):
         for method, value in [('windows', windows_data({'pid': 1, 'name': 'ZiG.ExE'})),
                               ('windows', windows_data({'pid': 1, 'name': 'app', 'title': 'Kimi Code'})),
                               ('wsl', {'processes': [{'pid': 2, 'name': 'cc1plus'}]}),
-                              ('vm', {'win11': {'running': True}}), ('slots', False), ('idle', 599.9)]:
+                              ('vm', {'win11': {'running': True}}), ('slots', False), ('input_ticks', ticks(599.9))]:
             operation = getattr(self.probe, method)
             original = operation.return_value
             operation.return_value = value
@@ -217,7 +222,7 @@ class QuietTests(unittest.TestCase):
 
     def test_polling_writes_every_attempt_without_overwriting(self):
         self.args.wait = True
-        self.probe.idle.side_effect = [20, 600]
+        self.probe.input_ticks.side_effect = [ticks(20), ticks(600)]
         sleeper = mock.Mock()
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, gx_perf.run_quiet(self.args, self.probe, sleeper))
@@ -352,25 +357,43 @@ class QuietBatchTests(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, gx_perf.run_quiet_batch(args, self.probe, run))
-        self.probe.idle.assert_called_once()
+        self.probe.input_ticks.assert_called_once()
         for name in ('before', 'after'):
             data = json.loads((args.out / (name+'.json')).read_text())
             self.assertEqual('all four locks held by this batch', data['checks']['slots']['reason'])
 
     def test_before_busy_never_runs_command_and_after_busy_invalidates(self):
         args = self.batch_args()
-        self.probe.idle.return_value = 5
+        self.probe.input_ticks.return_value = ticks(5)
         runner = mock.Mock(return_value=SimpleNamespace(returncode=0))
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
         runner.assert_not_called()
         args.out = args.out.parent / 'second'
-        self.probe.idle.side_effect = [600, 5]
+        self.probe.input_ticks.side_effect = [ticks(600), ticks(5)]
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
         result = json.loads((args.out/'RESULT.json').read_text())
         self.assertEqual('INVALID', result['status'])
         self.assertFalse(result['batch_valid'])
+
+    def test_uninjected_end_check_rejects_any_input_after_the_start(self):
+        start = 0xFFFFFF00  # the tick clock wraps during this batch
+        for label, last_input, valid in (('input-during-batch', (start + 500_000) & 0xFFFFFFFF, False),
+                                         ('no-input', (start - 700_000) & 0xFFFFFFFF, True)):
+            args = self.batch_args()
+            args.out = self.args.out.parent / label
+            # The command takes 1200 s; with input 500 s in, the end idle (700 s) still exceeds 600 s.
+            self.probe.input_ticks.side_effect = [ticks(700, start),
+                                                  {'last_input_tick': last_input, 'tick_count': (start + 1_200_000) & 0xFFFFFFFF}]
+            runner = mock.Mock(return_value=SimpleNamespace(returncode=0))
+            with self.subTest(label), mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0 if valid else 3, gx_perf.run_quiet_batch(args, self.probe, runner))
+                after = json.loads((args.out / 'after.json').read_text())['checks']['input']
+                self.assertEqual('pass' if valid else 'fail', after['status'])
+                self.assertEqual(1200, after['raw']['batch_seconds'])
+                self.assertEqual(start, after['raw']['batch_start_tick'])
 
     def test_missing_or_failed_guards_and_command_exception_are_invalid(self):
         args = self.batch_args('--injected-input')

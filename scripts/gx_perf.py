@@ -28,6 +28,7 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         Acquire all shared slots, check immediately inside the lease, run the command, check again
         before release. End-check failure invalidates the entire batch. Injected input requires
         batch-bound gx_win_gui guard JSONL; last-input idle is checked at start only in this mode.
+        Without injected input the end check requires no input since the start check.
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
   win32-idle --exe PATH --out DIR [--tabs 1 --windows 1 --state visible --seconds 60]
   win32-gpu --exe PATH --out DIR              (PDH dedicated GPU bytes, 1/11 terminals)
@@ -588,12 +589,19 @@ def validate_slot_root(root: Path) -> Path:
     return root.resolve()
 
 
-def user_idle_seconds() -> float:
-    session = input_session()
-    if not session['interactive_console']:
-        raise PerfError(f'GetLastInputInfo is not in the active console session: {session}')
-    tick, now = last_input_ticks()
-    return ((now - tick) & 0xFFFFFFFF) / 1000
+PLAN_IDLE_SECONDS = 600  # plan §4: no user input for at least 10 minutes
+TICK_MASK = 0xFFFFFFFF  # GetTickCount and LASTINPUTINFO.dwTime wrap every 49.7 days
+
+
+def input_observation(ticks: Mapping, since: Mapping | None = None) -> dict:
+    """Idle time from one GetLastInputInfo/GetTickCount pair; with `since`, also
+    the time elapsed on the same tick clock since an earlier (start-check) pair."""
+    last, now = int(ticks['last_input_tick']), int(ticks['tick_count'])
+    data = {'last_input_tick': last, 'tick_count': now, 'idle_seconds': ((now - last) & TICK_MASK) / 1000}
+    if since is not None:
+        data['batch_start_tick'] = int(since['tick_count'])
+        data['batch_seconds'] = ((now - data['batch_start_tick']) & TICK_MASK) / 1000
+    return data
 
 
 def input_session() -> dict:
@@ -757,8 +765,9 @@ class QuietProbe:
         except TimeoutError:
             return False
 
-    def idle(self) -> float:
-        return user_idle_seconds()
+    def input_ticks(self) -> dict:
+        tick, now = last_input_ticks()
+        return {'last_input_tick': tick, 'tick_count': now}
 
     def session(self) -> dict:
         return input_session()
@@ -784,7 +793,7 @@ def program_matches(rows: Sequence[Mapping], names: Sequence[str], *, case_sensi
     return found
 
 
-def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
+def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_since=None) -> dict:
     probe = probe or QuietProbe()
     checks = {}
     def check(name, operation, assess):
@@ -827,10 +836,19 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
     check('session', probe.session, lambda data: (data['interactive_console'], 'active console session required'))
     if checks['session']['status'] == 'fail':
         checks['session']['status'] = 'error'
-    if guarded_input is None:
-        check("input", probe.idle, lambda seconds: (seconds >= args.idle_seconds, f"idle {seconds:.3f}s; required {args.idle_seconds:g}s"))
-    else:
+    threshold = args.idle_seconds
+    if guarded_input is not None:
         check('input', guarded_input, lambda data: (data['valid'], 'injected input: audited guards, not GetLastInputInfo'))
+    elif input_since is None:
+        check('input', lambda: input_observation(probe.input_ticks()),
+              lambda data: (data['idle_seconds'] >= threshold, f"idle {data['idle_seconds']:.3f}s; required {threshold:g}s"))
+    else:
+        # End of a batch without injected input: the plan requires no user input
+        # during the batch, i.e. the last input predates the start check.
+        check('input', lambda: input_observation(probe.input_ticks(), input_since),
+              lambda data: (data['idle_seconds'] >= max(threshold, data['batch_seconds']),
+                            f"idle {data['idle_seconds']:.3f}s; batch {data['batch_seconds']:.3f}s; no input allowed "
+                            f"after the start check (required >= {threshold:g}s and >= the batch duration)"))
     try:
         observation = {"status": "recorded", "raw": probe.cpu()}
     except Exception as exc:
@@ -841,7 +859,7 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None) -> dict:
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
             "other_programs": other_programs, "build_processes": sorted(builds), "blacklist": blacklist,
             "blacklist_matching": "case-sensitive substring of a process image name or main window title",
-            'plan_compliant': args.idle_seconds >= 600,
+            'plan_compliant': args.idle_seconds >= PLAN_IDLE_SECONDS,
             "scope": "batch-owned locks" if lease else "point-in-time probe; locks released, not a reservation"}
 
 
@@ -914,7 +932,8 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                     result['errors'].append(f'command: {type(exc).__name__}: {exc}')
                 finally:
                     guarded = (lambda: guard_evidence(out / 'guards.jsonl', result['batch_id'])) if args.injected_input else None
-                    after = quiet_snapshot(args, probe, lease=lease, guarded_input=guarded)
+                    since = None if args.injected_input else before['checks']['input']['raw']
+                    after = quiet_snapshot(args, probe, lease=lease, guarded_input=guarded, input_since=since)
                     write_json(out / 'after.json', after)
                     result['batch_valid'] = result['command_exit'] == 0 and after['exit'] == 0 and not result['errors']
                     result['status'] = 'VALID' if result['batch_valid'] else 'INVALID'
