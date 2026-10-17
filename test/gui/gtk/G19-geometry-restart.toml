@@ -1,0 +1,70 @@
+id = "G19"
+title = "Private GTK geometry survives restart and respects per-axis CLI and never"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+window-save-state = always
+"""
+script = '''
+def geometry():
+    return dict(line.split("=", 1) for line in xdo("getwindowgeometry", "--shell", window()).splitlines())
+xdo("mousemove", 400, 300, "click", 1)
+default = geometry()
+xdo("windowsize", window(), 1000, 680)
+sleep(1)
+before = geometry()
+capture("resized")
+restart()
+restored = geometry()
+assert restored["WIDTH"] == before["WIDTH"] and restored["HEIGHT"] == before["HEIGHT"], (before, restored)
+capture("restored")
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--window-width=70"])
+width = geometry()
+assert width["WIDTH"] == default["WIDTH"] and width["HEIGHT"] == before["HEIGHT"], width
+capture("cli-width")
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--window-height=20"])
+height = geometry()
+assert height["WIDTH"] == width["WIDTH"] and height["HEIGHT"] == default["HEIGHT"], height
+capture("cli-height")
+xdo("windowsize", window(), 1040, 710)
+sleep(1)
+xdo("mousemove", 400, 300, "click", 1)
+restart([])
+remembered = geometry()
+assert (remembered["WIDTH"], remembered["HEIGHT"]) == ("1040", "710"), remembered
+capture("nondefault-saved")
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--window-save-state=never"])
+never = geometry()
+assert (never["WIDTH"], never["HEIGHT"]) == (default["WIDTH"], default["HEIGHT"]), never
+assert (never["WIDTH"], never["HEIGHT"]) != (remembered["WIDTH"], remembered["HEIGHT"])
+state = state_home / "ghostty/gx-window-state"
+saved = state.read_bytes()
+capture("never")
+xdo("windowsize", window(), 1120, 730)
+sleep(0.5)
+never_resized = geometry()
+assert (never_resized["WIDTH"], never_resized["HEIGHT"]) != (remembered["WIDTH"], remembered["HEIGHT"])
+capture("never-resized")
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--window-save-state=never"])
+assert geometry()["WIDTH"] == never["WIDTH"] and geometry()["HEIGHT"] == never["HEIGHT"]
+assert state.read_bytes() == saved, "never must not overwrite remembered geometry"
+capture("never-restarted")
+save("-geometry.json", json.dumps({"default":default,"before":before,"restored":restored,"width":width,"height":height,"remembered":remembered,"never":never,"never_resized":never_resized},indent=2))
+'''
+expect = [
+  "G19.png: the first ordinary window",
+  "G19-resized.png and G19-restored.png: the same normal size before and after graceful restart",
+  "G19-cli-width.png and G19-cli-height.png: only the requested axis overrides remembered geometry",
+  "G19-nondefault-saved.png: 1040x710 was actually restored before testing never",
+  "G19-never.png and G19-never-restarted.png: never ignores the previous resize",
+  "G19-never-resized.png: the never session is resized to a third, distinct size; stored geometry must remain unchanged",
+  "G19-after.png: the final restarted terminal is responsive",
+  "Xvfb without a window manager does not prove maximize/tiled/fullscreen or Wayland geometry",
+]
