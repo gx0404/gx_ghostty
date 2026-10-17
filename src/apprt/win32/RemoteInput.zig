@@ -256,6 +256,25 @@ test "remote input gate drops precommit and disconnected input and never reuses 
     try std.testing.expectError(error.InvalidLease, gate.enable(lease));
 }
 
+test "remote input buffer preserves performance identity across producer and wire sequence changes" {
+    var buffer: Buffer = .{};
+    const stamp: @import("../../gx/remote_view.zig").InputStamp = .{ .sequence = 7, .qpc = 12345 };
+    const measured: protocol.Input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 91,
+        .event = .{ .text = try protocol.Text.init("x") },
+        .perf = stamp,
+    };
+    try std.testing.expect(buffer.push(0, measured));
+    var wire = buffer.peek().?;
+    wire.sequence = 200;
+    try std.testing.expectEqual(stamp, wire.perf);
+    try std.testing.expectEqual(@as(u64, 91), buffer.peek().?.sequence);
+    _ = buffer.pop(91);
+    try std.testing.expect(buffer.peek() == null);
+}
+
 test "remote text assembles surrogate pairs and clears unfinished input on focus loss" {
     var decoder: Utf16 = .{};
     try std.testing.expect((try decoder.feed(0xd83d)) == null);

@@ -14,6 +14,7 @@ const refs = @import("../../gx/ui_ref.zig");
 const win_input = @import("../../gx/win32_input.zig");
 const terminal = @import("../../terminal/main.zig");
 const w32 = @import("win32.zig");
+const perf = @import("../../gx/perf.zig");
 
 fn trace(comptime format: []const u8, args: anytype) void {
     if (!@import("remote_test.zig").enabled()) return;
@@ -124,6 +125,7 @@ pub fn install(surface: *Surface, lease: protocol.Lease) !void {
     }
     const state = try surface.app.core_app.alloc.create(State);
     state.* = .{ .surface = surface, .lease = lease, .view = .{ .surface = surface.ui_reference, .lease = lease } };
+    resetPerfInput(surface);
     surface.remote_source_state = state;
     surface.core_surface.gx_binding_route = .{ .context = state, .callback = routeBinding, .config_changed = configChanged };
     state.view.title = clipped(protocol.Title, surface.getTitle() orelse "");
@@ -140,6 +142,7 @@ pub fn install(surface: *Surface, lease: protocol.Lease) !void {
 
 pub fn release(surface: *Surface) void {
     const state = surface.remote_source_state orelse return;
+    resetPerfInput(surface);
     surface.remote_source_state = null;
     surface.core_surface.gx_binding_route = null;
     state.discard();
@@ -383,6 +386,62 @@ fn dispatchInput(state: *State, event: *const protocol.Input) !void {
             }
         },
     }
+    // An asynchronous binding has only been queued, not applied. Its original
+    // input is marked by advance after the continuation actually completes.
+    if (state.chain == null) markPerfInput(state.surface, event);
+}
+
+fn resetPerfInput(surface: *Surface) void {
+    if (!perf.enabled()) return;
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&surface.remote_mutex);
+    defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&surface.remote_mutex);
+    if (surface.remote_output) |output| output.perf_input = .{};
+}
+
+/// Only after a successful core callback; never hold remote_mutex while calling
+/// core/renderer APIs. The render thread snapshots this at begin of frame export.
+fn markPerfInput(surface: *Surface, event: *const protocol.Input) void {
+    if (!perf.enabled() or event.perf.sequence == 0) return;
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&surface.remote_mutex);
+    defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&surface.remote_mutex);
+    if (surface.remote_output) |output| {
+        if (event.perf.sequence > output.perf_input.sequence) output.perf_input = event.perf;
+    }
+}
+
+test "remote applied performance stamp is monotonic independent of transport sequence and resets with lease" {
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    var event: protocol.Input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 100,
+        .event = .{ .text = try protocol.Text.init("x") },
+        .perf = .{ .sequence = 7, .qpc = 12345 },
+    };
+    // Off must not even dereference the surface or touch its export lock.
+    perf.setEnabled(false);
+    markPerfInput(undefined, &event);
+    resetPerfInput(undefined);
+    const alloc = std.testing.allocator;
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    var output: @import("RemoteHost.zig").Output = undefined;
+    output.perf_input = .{};
+    surface.* = undefined;
+    surface.remote_mutex = .{};
+    surface.remote_output = &output;
+    perf.setEnabled(true);
+    markPerfInput(surface, &event);
+    try std.testing.expectEqual(event.perf, output.perf_input);
+    event.sequence = 200;
+    event.perf = .{ .sequence = 6, .qpc = 12000 };
+    markPerfInput(surface, &event);
+    try std.testing.expectEqual(@as(u64, 7), output.perf_input.sequence);
+    resetPerfInput(surface);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input);
+    surface.remote_output = null;
+    markPerfInput(surface, &event);
 }
 
 fn completePaste(state: *State, confirmed: bool) !void {
@@ -505,6 +564,7 @@ fn advance(state: *State) !void {
         defer core.gx_binding_bypass = false;
         try dispatchInput(state, &finished.original);
     }
+    markPerfInput(state.surface, &finished.original);
 }
 
 pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Packet) !bool {

@@ -15,6 +15,7 @@ const i18n = @import("../../gx/i18n.zig");
 const refs = @import("../../gx/ui_ref.zig");
 const protocol = @import("../../gx/remote_protocol.zig");
 const Input = @import("RemoteInput.zig");
+const RemotePerf = @import("RemotePerf.zig");
 const View = @import("RemoteSurfaceView.zig");
 const Channel = @import("ipc/RemoteChannel.zig").Channel;
 const Snapshot = @import("PaneSnapshot.zig");
@@ -64,6 +65,8 @@ owned_cwd: []const u8 = "",
 current_cursor: ?w32.HCURSOR = null,
 mouse_visible: bool = true,
 bell_border_state: bell_border.State = .{},
+/// Survives mapping replacement; a fresh pane/lease starts at zero.
+perf_last_input: u64 = 0,
 
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "user32" fn GetClassNameW(w32.HWND, [*]u16, i32) callconv(.winapi) i32;
@@ -160,6 +163,7 @@ pub fn frameReady(self: *Self) void {
             self.disconnect();
             return;
         }
+        view.perf_frame.received(reading.lease.perf_input, RemotePerf.now());
         @memcpy(view.last_frame, reading.lease.pixels);
         view.has_frame = true;
         view.last_sequence = reading.lease.sequence;
@@ -420,8 +424,13 @@ pub fn invalidate(self: *Self) void {
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 pub fn emit(self: *Self, event: Input.Event) void {
+    self.emitTimed(event, if (protocol.Input.measurable(event)) RemotePerf.now() else 0);
+}
+
+fn emitTimed(self: *Self, event: Input.Event, qpc: u64) void {
     if (self.destroying or self.unavailable or self.closed or self.close_pending or !self.visible or self.input_suspended) return;
-    const value = self.gate.next(self.source_reference, event) catch return;
+    var value = self.gate.next(self.source_reference, event) catch return;
+    if (qpc != 0 and protocol.Input.measurable(event)) value.perf = .{ .sequence = value.sequence, .qpc = qpc };
     const accepted = self.callbacks.input(self.callbacks.ctx, self.transfer_reference, value);
     if (self.input_busy == accepted) {
         self.input_busy = !accepted;
@@ -506,6 +515,7 @@ fn positionIme(self: *Self) void {
 }
 fn key(self: *Self, wparam: usize, lparam: isize, pressed: bool) void {
     if (self.input_suspended or !self.visible or self.unavailable) return;
+    const qpc = if (pressed) RemotePerf.now() else 0;
     if (pressed) self.clearBellBorder();
     const decoded = self.keys.decode(wparam, lparam, if (pressed) .press else .release) orelse return;
     if (decoded.preedit_changed) self.emit(.{ .composition = .{ .phase = .update, .text = protocol.Text.init(decoded.preedit orelse "") catch .{} } });
@@ -515,7 +525,7 @@ fn key(self: *Self, wparam: usize, lparam: isize, pressed: bool) void {
         var iterator = std.unicode.Utf16LeIterator.init(decoded.message.text);
         unicode = iterator.nextCodepoint() catch 0 orelse 0;
     }
-    self.emit(.{ .key = .{
+    self.emitTimed(.{ .key = .{
         .action = switch (decoded.event.action) {
             .press => .press,
             .repeat => .repeat,
@@ -529,7 +539,7 @@ fn key(self: *Self, wparam: usize, lparam: isize, pressed: bool) void {
         .unshifted_codepoint = decoded.event.unshifted_codepoint,
         .text = protocol.Text.init(decoded.event.utf8) catch .{},
         .native = .{ .virtual_key = decoded.message.vk, .scan_code = @as(u8, @truncate(@as(usize, @bitCast(lparam)) >> 16)), .extended = lparam & (1 << 24) != 0, .control_state = decoded.message.state.int(), .codepoint = unicode, .text = protocol.Bounded(u16, 4).init(decoded.message.text) catch .{}, .repeat_count = @max(1, @as(u16, @truncate(@as(usize, @bitCast(lparam))))), .dead = decoded.message.dead },
-    } });
+    } }, qpc);
 }
 fn paint(self: *Self) void {
     const hwnd = self.hwnd orelse return;
@@ -548,7 +558,11 @@ fn paint(self: *Self) void {
         if (self.unavailable or self.closed) self.canvas.drawText(i18n.tr("Close"), .{ .x = @max(0, rect.w / 2 - 60), .y = @max(0, rect.h / 2 + 24), .w = 120, .h = 32 }, .{ .color = colors.accent, .align_x = .center });
     }
     if (self.input_busy) self.canvas.drawText(i18n.tr("Remote input is temporarily busy."), .{ .x = 8, .y = @max(0, rect.h - 32), .w = @max(0, rect.w - 16), .h = 32 }, .{ .color = colors.foreground });
-    if (self.canvas.finish() == .recreate) self.invalidate();
+    const completed = self.canvas.finish();
+    if (completed == .recreate) self.invalidate();
+    if (completed == .ok and result == .drawn and !self.closed and self.visible) {
+        if (self.view) |*view| view.perf_frame.presented(&self.perf_last_input);
+    }
 }
 pub fn wndProc(hwnd: w32.HWND, message: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
     const address = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);

@@ -10,6 +10,8 @@ const w32 = @import("win32.zig");
 const Channel = @import("ipc/RemoteChannel.zig").Channel;
 const Write = @import("ipc/RemoteChannel.zig").Write;
 const refs = @import("../../gx/ui_ref.zig");
+const perf = @import("../../gx/perf.zig");
+const RemotePerf = @import("RemotePerf.zig");
 const Tree = @import("../../datastruct/split_tree.zig").SplitTree(@import("Leaf.zig"));
 
 pub const Host = struct {
@@ -181,6 +183,8 @@ pub const Host = struct {
             if (surface.parent_window != self.window or channel.mapped.generation <= binding.output.channel.mapped.generation) return error.InvalidGeneration;
             const replacement = try Output.createWithWake(self.allocator, channel, transport_wake);
             const previous = binding.output;
+            // GUI is the only writer; renderer only reads under remote_mutex.
+            if (perf.enabled()) replacement.perf_input = previous.perf_input;
             surface.setRemoteOutput(replacement);
             binding.output = replacement;
             return previous;
@@ -222,6 +226,8 @@ pub const Output = struct {
     latest_sequence: std.atomic.Value(u64) = .init(0),
     requested_size: std.atomic.Value(u64) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
+    /// GUI writes and render snapshots under Surface.remote_mutex.
+    perf_input: RemotePerf.InputStamp = .{},
 
     pub fn create(allocator: std.mem.Allocator, channel: *Channel) !*Output {
         return createWithWake(allocator, channel, null);
@@ -265,6 +271,7 @@ pub const Output = struct {
             if (self.requested_size.swap(size, .acq_rel) != size) self.signal();
             return null;
         }
+        const map_start = RemotePerf.now();
         const writing = self.channel.beginWrite() catch |err| {
             if (err != error.WouldBlock) {
                 self.failed.store(true, .release);
@@ -275,7 +282,15 @@ pub const Output = struct {
         // glReadPixels does not write stride padding; zero it before publication
         // so a newly created mapping can never expose stale allocator bytes.
         @memset(writing.lease.pixels, 0);
-        return .{ .output = self, .writing = writing, .width = width, .height = height, .stride = layout.stride };
+        return .{
+            .output = self,
+            .writing = writing,
+            .width = width,
+            .height = height,
+            .stride = layout.stride,
+            .perf_input = if (perf.enabled()) self.perf_input else .{},
+            .map_prepare_ticks = if (map_start != 0) RemotePerf.now() -| map_start else 0,
+        };
     }
 
     /// Only after Surface detached this output and every render guard returned.
@@ -296,9 +311,21 @@ pub const Frame = struct {
     height: u32,
     stride: u32,
     finished: bool = false,
+    perf_input: RemotePerf.InputStamp = .{},
+    map_prepare_ticks: u64 = 0,
+    readback_qpc: u64 = 0,
 
     pub fn pixels(self: *Frame) []u8 {
+        if (self.readback_qpc == 0) self.readback_qpc = RemotePerf.now();
         return self.writing.lease.pixels;
+    }
+
+    /// GX-0043 calls this after ReadPixels and its successful GL error check.
+    /// Keeping the hook here needs just one call at the upstream readback site.
+    pub fn readbackComplete(self: *Frame) void {
+        const end = RemotePerf.now();
+        RemotePerf.record("remote.readback", self.readback_qpc, end);
+        self.readback_qpc = 0;
     }
     /// Input is GL's bottom-up BGRA; the shared protocol is top-down BGRA.
     pub fn finish(self: *Frame, success: bool) void {
@@ -310,7 +337,9 @@ pub const Frame = struct {
             self.output.signal();
             return;
         }
+        const map_start = RemotePerf.now();
         flipRows(self.writing.lease.pixels, self.stride, self.height, self.output.row_scratch);
+        self.writing.lease.perf_input = self.perf_input;
         self.writing.lease.publishWritten() catch {
             self.output.failed.store(true, .release);
             self.output.signal();
@@ -318,6 +347,11 @@ pub const Frame = struct {
         };
         self.output.latest_sequence.store(self.writing.lease.expected >> 3, .release);
         self.output.signal();
+        if (map_start != 0) {
+            const ticks = self.map_prepare_ticks +| (RemotePerf.now() -| map_start);
+            RemotePerf.recordTicks("remote.map", ticks);
+        }
+        perf.count("remote.frame_bytes", self.writing.lease.pixels.len);
     }
 };
 
@@ -345,6 +379,6 @@ test "remote host flips BGRA rows including stride padding without changing chan
 }
 
 test "remote host production tree frame and lifetime entrypoints compile" {
-    const functions = .{ &Host.create, &Host.adoptTree, &Host.addOutput, &Host.replaceOutput, &Host.deinit, &Output.create, &Output.begin, &Output.notificationHandle, &Output.deinit, &Frame.pixels, &Frame.finish };
+    const functions = .{ &Host.create, &Host.adoptTree, &Host.addOutput, &Host.replaceOutput, &Host.deinit, &Output.create, &Output.begin, &Output.notificationHandle, &Output.deinit, &Frame.pixels, &Frame.readbackComplete, &Frame.finish };
     inline for (functions) |function| try std.testing.expect(@intFromPtr(function) != 0);
 }
