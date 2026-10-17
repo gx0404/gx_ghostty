@@ -1,0 +1,116 @@
+id = "G21"
+title = "Diagnostic GTK menu and settings mapping metrics"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+gtk-opengl-debug = true
+keybind = ctrl+alt+m=gx:main_menu
+keybind = ctrl+alt+s=gx:settings
+keybind = ctrl+alt+t=gx:settings_page:appearance
+"""
+env = { GHOSTTY_GX_PERF = "1" }
+script = '''
+xdo("windowsize", window(), 1100, 740)
+xdo("mousemove", 400, 300, "click", 1)
+for index in range(4):
+    xdo("key", "ctrl+alt+m")
+    sleep(0.3)
+    if index == 0:
+        capture("menu")
+    xdo("key", "Escape")
+    sleep(0.3)
+for index in range(4):
+    xdo("key", "ctrl+alt+s")
+    sleep(0.5)
+    if index == 0:
+        capture("settings")
+    xdo("key", "Escape")
+    sleep(0.5)
+text = (evidence / "G21.log").read_text()
+assert text.count("info(gx_perf): menu.open.total ") == 4
+assert text.count("info(gx_perf): settings.open.total ") == 4
+xdo("key", "ctrl+alt+t")
+sleep(0.5)
+capture("appearance")
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.5)
+capture("themes")
+xdo("key", "Tab")
+before = (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.reload ")
+xdo("key", "--repeat", 60, "--delay", 33, "Down")
+sleep(0.5)
+after = (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.reload ")
+save("-theme-reloads.json", json.dumps({"before":before,"after":after,"delta":after-before}))
+capture("theme-preview")
+assert after - before == 1, (before, after)
+xdo("mousemove", 755, 96, "click", 1)
+sleep(0.5)
+reverted = (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.reload ")
+capture("theme-reverted")
+assert reverted == after + 1, (after, reverted)
+def theme_count():
+    return (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.reload ")
+def search_theme(query):
+    xdo("mousemove", 400, 96, "click", 1)
+    xdo("key", "ctrl+a")
+    xdo("type", "--delay", 1, query)
+    sleep(0.8)
+search_theme("Blue Dolphin")
+assert theme_count() == reverted + 1
+applied = theme_count()
+xdo("mousemove", 845, 96, "click", 1)
+sleep(0.6)
+assert theme_count() == applied, "saving an already applied preview must not double count"
+assert "theme = Blue Dolphin" in (config_home / "ghostty/gui-settings.ghostty").read_text()
+capture("theme-saved")
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.5)
+assert theme_count() == applied
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+t")
+sleep(0.5)
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.5)
+search_theme("Adventure")
+assert theme_count() == applied + 1
+capture("unsaved-theme-preview")
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.6)
+assert theme_count() == applied + 2, "closing an unsaved preview must count restoring the saved theme"
+capture("close-restores-theme")
+save("-theme-actions.json", json.dumps({"preview":after,"revert":reverted,"applied":applied,"closed":theme_count()}))
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--gtk-titlebar=false"])
+xdo("windowsize", window(), 1100, 740)
+sleep(0.5)
+xdo("mousemove", 400, 300, "click", 1)
+menu_before = (evidence / "G21.log").read_text().count("info(gx_perf): menu.open.total ")
+for index in range(3):
+    xdo("key", "ctrl+alt+m")
+    sleep(0.4)
+    assert (evidence / "G21.log").read_text().count("info(gx_perf): menu.open.total ") == menu_before + index + 1
+    if index == 0:
+        capture("fallback-menu")
+    xdo("key", "Escape")
+    sleep(0.3)
+xdo("mousemove", 300, 300, "click", 3)
+sleep(0.4)
+capture("context-after-fallback")
+assert (evidence / "G21.log").read_text().count("info(gx_perf): menu.open.total ") == menu_before + 3
+'''
+expect = [
+  "G21.png: the isolated terminal before repeated openings",
+  "G21-after.png: the ordinary context menu after fallback timing remains visible",
+  "G21-menu.png: mapped GX main menu",
+  "G21-settings.png: mapped GX settings dialog",
+  "G21-appearance.png and G21-themes.png: the appearance section and theme browser",
+  "G21-theme-preview.png: one preview applies after repeated Down events; the counter delta is exactly one",
+  "G21-theme-reverted.png: the saved theme returns after Revert; the count increases once",
+  "G21-theme-saved.png: saving an already visible preview adds no duplicate count",
+  "G21-unsaved-theme-preview.png and G21-close-restores-theme.png: close restores the saved theme and counts once",
+  "G21-fallback-menu.png and G21-context-after-fallback.png: the titlebar-hidden fallback has one sample per open; ordinary context menu adds none",
+  "All timings are diagnostic Debug samples, not a P4 performance-gate result",
+]
