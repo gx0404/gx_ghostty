@@ -360,7 +360,7 @@ def inspect_or_respond(args, config):
     level = report["target"]["token"]["integrity"]
     same_session(require_level(level), report["target"]["token"])
     stamp = str(time.time_ns())
-    popups = [popup for popup in target.popups() if popup.cls in ("GhosttyGxPopup", "#32770")]
+    popups = [popup for popup in target.popups() if popup.cls in ("GhosttyGxPopup", "GhosttyGxPopupShadow", "#32770")]
     evidence = {"status": "VISUAL_PENDING", "popups": [], "enter_injected": False}
     for popup in popups:
         filename = f"popup-{stamp}-{popup.hwnd:x}.png"

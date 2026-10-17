@@ -10,12 +10,18 @@ import gx_drop_broker_fixture as broker
 
 class BrokerPreviewTests(unittest.TestCase):
     def test_multiline_respond_reaches_reviewed_preview_button(self):
+        self.respond_preview('GhosttyGxPopup')
+
+    def test_multiline_respond_accepts_shadow_popup_class(self):
+        self.respond_preview('GhosttyGxPopupShadow')
+
+    def respond_preview(self, popup_class):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             work = root / 'cases' / 'multiline'
             work.mkdir(parents=True)
             broker.save(work / 'report.json', {'target': {'token': {'integrity': 'high'}}, 'case': 'multiline'})
-            popup = SimpleNamespace(hwnd=3, cls='GhosttyGxPopup', title='Paste into elevated terminal?', rect=(0, 0, 400, 200))
+            popup = SimpleNamespace(hwnd=3, cls=popup_class, title='Paste into elevated terminal?', rect=(0, 0, 400, 200))
             target = mock.Mock(pid=42)
             target.popups.return_value = [popup]
             target.require_window.return_value = popup
