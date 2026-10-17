@@ -1,15 +1,35 @@
 id = "W05"
 title = "Opening the command palette does not preview its first theme row; Esc restores the theme"
+# R0: empty-query, down and restored. Phase 6 (r6) extends the case for R2-Palette.01-08:
+# initials and transposed matches with highlights, zero results, the theme page (no preview on
+# opening, preview on moving, Shift+Enter keeps it open, Backspace back to the root), the New
+# Tab page, other tabs and the MRU tab switcher, forgetting and clearing the recently used
+# entries, and the entry cache following the UI language with English titles on a second line.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 theme = Nord
 keybind = ctrl+shift+r=reload_config
+keybind = f6=toggle_tab_overview
 """
 expect = [
   "empty-query: the palette is open with an empty query, its first row is Theme: Dracula (recently used, not the current theme) and the terminal behind it is still Nord (#2e3440)",
   "down: Down moved the selection off Dracula",
   "restored: after Esc the palette is closed and the terminal is Nord",
+  "initials: the filter ct lists Change Theme… with its C and T highlighted (word initials)",
+  "swapped: the misspelled filter Chnage Theme still finds Change Theme… (two neighbouring letters swapped)",
+  "zero-results: the filter qqzzxxvv shows the No results state with the hint to try the English name or the pinyin initials",
+  "theme-page: Enter on Change Theme… opens the theme page with the theme swatches, its selection on the current theme Nord, the terminal still Nord (no preview on opening)",
+  "theme-preview: Down moved the selection to the next theme and the terminal previews it",
+  "shift-enter: Shift+Enter applied the previewed theme and kept the palette open on the theme page",
+  "back-root: Backspace in the empty filter went back to the root page",
+  "new-tab-page: Enter on New Tab… opens the launch profiles page listing the detected shells with their command lines",
+  "root-tabs: with three tabs the empty root lists Switch to Tab entries for the two other tabs, not for the current one",
+  "tab-switcher: F6 (toggle_tab_overview) opens the tab switcher with the tabs most recently used first and the previous tab selected",
+  "history-forgot: Shift+Delete removed the selected recently used entry from the root list",
+  "history-cleared: after Clear Recently Used the root has no Recently Used group",
+  "zh-root: after language = zh-CN and a reload, the palette lists its entries in Chinese",
+  "english-alias: the English filter theme finds 更换主题… and shows the English title Change Theme… on its second line",
 ]
 
 [[step]]
@@ -146,3 +166,404 @@ label = "Nord after Esc"
 [[step]]
 action = "capture"
 name = "restored"
+
+# --- r6 extension (R2-Palette.01-08) --------------------------------------------------------
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "ct"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "initials"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "Chnage Theme"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "swapped"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "qqzzxxvv"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "zero-results"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "Change Theme"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "theme-page"
+what = "all"
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 2
+label = "Nord while the theme page opens"
+
+[[step]]
+action = "key"
+keys = "down"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "theme-preview"
+what = "all"
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+label = "background while the next theme previews"
+
+[[step]]
+action = "key"
+keys = "shift+enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "shift-enter"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "backspace"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "back-root"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# Back to Nord for the rest: forget the saved theme and reload.
+[[step]]
+action = "file"
+path = "ghostty/gui-settings.ghostty"
+text = ""
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "New Tab…"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "new-tab-page"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+# Three tabs: the root lists the two others; the switcher puts the most recent first.
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "root-tabs"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "tab-switcher"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# The first row of the empty root is the most recently used entry: forget it.
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "key"
+keys = "shift+delete"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "history-forgot"
+what = "all"
+
+[[step]]
+action = "type"
+text = "Clear Recently Used"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "history-cleared"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# The entry cache follows the UI language.
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "command = cmd.exe /d /k prompt $G$S\nlanguage = zh-CN\ntheme = Nord\nkeybind = ctrl+shift+r=reload_config\nkeybind = f6=toggle_tab_overview\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "zh-root"
+what = "all"
+
+[[step]]
+action = "type"
+text = "theme"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "english-alias"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
