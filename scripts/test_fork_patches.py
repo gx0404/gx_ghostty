@@ -600,6 +600,51 @@ def gx0044_problems(source: str) -> list[str]:
     return problems
 
 
+TARGET_ZIG = "src/renderer/opengl/Target.zig"
+WGL_ZIG = "src/renderer/opengl/wgl.zig"
+GX0045 = "GX-0045"
+GX0045_CALLS = (
+    'if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(true);',
+    'if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(false);',
+)
+
+
+def gx0045_problems(source: str) -> list[str]:
+    """Shape lock for GX-0045 in src/renderer/opengl/Target.zig: two one-line hunks, the
+    create count after the render framebuffer is complete and before the GX-0004 Windows
+    return, the release count after the four destroys in deinit."""
+    try:
+        _, hunks = marked_hunks(source, GX0045)
+    except ValueError as err:
+        return [str(err)]
+    lines = source.splitlines()
+    if len(hunks) != 2:
+        return [f"expected 2 {GX0045} hunks, found {len(hunks)}"]
+    problems: list[str] = []
+    for (begin, end), call in zip(hunks, GX0045_CALLS):
+        body = [line.strip() for line in lines[begin + 1:end]]
+        if body != [call]:
+            problems.append(f"line {begin + 1}: the {GX0045} hunk must hold only `{call}`")
+    init = zig_fn_lines(lines, "pub fn init(")
+    deinit = zig_fn_lines(lines, "pub fn deinit(")
+    if init is None or deinit is None:
+        return problems + ["Target.init or Target.deinit is missing"]
+    create, release = hunks[0][0], hunks[1][0]
+    complete = [i for i in range(*init) if lines[i].strip() == ".complete => {},"]
+    windows_return = [i for i in range(*init) if "GX-0004 begin: Windows blits" in lines[i]]
+    if not (init[0] <= create < init[1]):
+        problems.append("the create count must sit inside Target.init")
+    elif not complete or not windows_return or not (complete[0] < create < windows_return[0]):
+        problems.append("the create count must follow the complete render framebuffer and "
+                        "precede the GX-0004 Windows return")
+    destroys = [i for i in range(*deinit) if lines[i].strip().endswith(".destroy();")]
+    if not (deinit[0] <= release < deinit[1]):
+        problems.append("the release count must sit inside Target.deinit")
+    elif len(destroys) != 4 or release < max(destroys):
+        problems.append("the release count must follow the four destroys of Target.deinit")
+    return problems
+
+
 def _expand_ids(spec: str) -> set[str]:
     ids: set[str] = set()
     for first, last in re.findall(r"GX-(\d{4})(?:～GX-(\d{4}))?", spec):
@@ -1391,6 +1436,69 @@ class Gx0044ShapeTests(unittest.TestCase):
                 self.assertEqual(self.source.count(old), 1, old)
                 problems = gx0044_problems(self.source.replace(old, new))
                 self.assertTrue(any(expected in problem for problem in problems), problems)
+
+
+class Gx0045ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / TARGET_ZIG).read_text(encoding="utf-8")
+
+    def test_target_counts_stay_registered_and_in_place(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0045, TARGET_ZIG, f"fork(gx): {GX0045}", "active"), patches)
+        self.assertEqual(gx0045_problems(self.source), [])
+        self.assertEqual(gx0045_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_dropping_the_hunks_gives_back_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, TARGET_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        stripped, _ = marked_hunks(self.source, GX0045)
+        stripped, _ = marked_hunks(stripped, "GX-0004")
+        self.assertEqual(squash(stripped), squash(upstream))
+
+    def test_gauge_switch_comes_before_the_lock(self):
+        lines = (ROOT / WGL_ZIG).read_text(encoding="utf-8").splitlines()
+        start, end = zig_fn_lines(lines, "pub fn targetLifetime(")
+        body = [line.strip() for line in lines[start + 1:end] if line.strip()]
+        self.assertEqual(body[0], "if (!perf.enabled()) return;")
+        lock = next(i for i, line in enumerate(body) if "target_lock.lockUncancelable(" in line)
+        report = next(i for i, line in enumerate(body) if "target_counts.report()" in line)
+        self.assertLess(0, lock)
+        self.assertLess(lock, report)
+
+    def test_broken_shapes_are_rejected(self):
+        create, release = GX0045_CALLS
+        cases = {
+            "must hold only": (create, create + "\n    _ = 0;"),
+            "expected 2": (
+                "    // fork(gx): GX-0045 begin: account for released Windows target resources\n"
+                f"    {release}\n    // fork(gx): GX-0045 end\n",
+                ""),
+        }
+        for expected, (old, new) in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(self.source.count(old), 1, old)
+                problems = gx0045_problems(self.source.replace(old, new))
+                self.assertTrue(any(expected in problem for problem in problems), problems)
+        swapped = self.source.replace(create, "@@CREATE@@").replace(release, create).replace("@@CREATE@@", release)
+        self.assertTrue(gx0045_problems(swapped))
+        hunk = ("    // fork(gx): GX-0045 begin: count fully initialized Windows target resources\n"
+                f"    {create}\n    // fork(gx): GX-0045 end\n")
+        fbo = "    const fbo = try gl.Framebuffer.create();\n"
+        self.assertEqual(self.source.count(hunk), 1)
+        early = self.source.replace(hunk, "", 1).replace(fbo, hunk + fbo, 1)
+        problems = gx0045_problems(early)
+        self.assertTrue(any("precede the GX-0004 Windows return" in p for p in problems), problems)
+        moved = self.source.replace(
+            "    self.framebuffer.destroy();\n",
+            "    // fork(gx): GX-0045 begin: account for released Windows target resources\n"
+            f"    {release}\n    // fork(gx): GX-0045 end\n    self.framebuffer.destroy();\n", 1)
+        moved = moved.replace(
+            "    self.export_texture.destroy();\n    // fork(gx): GX-0045 begin: account for released Windows target resources\n"
+            f"    {release}\n    // fork(gx): GX-0045 end\n",
+            "    self.export_texture.destroy();\n", 1)
+        self.assertTrue(any("four destroys" in p for p in gx0045_problems(moved)), gx0045_problems(moved))
 
 
 class RegistryRuleTests(unittest.TestCase):
