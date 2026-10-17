@@ -1563,8 +1563,15 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
         instance.press('ctrl+pagedown')  # Language -> Appearance; default focus is the theme list.
         time.sleep(0.5)
         rows = instance.uia_rows(popup.hwnd)
-        if not any(row['type'] == 'ControlType.ListItem' for row in rows):
-            raise PerfError('theme page has no theme list items')
+        items = sum(row.get('type') == 'ControlType.ListItem' for row in rows)
+        capture.report['observations']['theme_list_uia'] = {'list_items': items}
+        if not items:
+            if not capture.report.get('baseline'):
+                raise PerfError('theme page has no theme list items')
+            # Historical builds predate the settings UIA provider (ui/uia.zig): like a
+            # missing metric (M5) this is not_instrumented and never stops AB/BA.
+            capture.report.setdefault('missing_preconditions', {})['theme_list_uia'] = {
+                'status': 'not_instrumented', 'n': 0, 'scope': 'historical arm only; theme list items not readable through UIA'}
         before = capture.mark()
         instance.hold_key('down', seconds=2, hz=30)
         capture.drain(['theme.reload'], minimum=1, quiet=0.5)
@@ -1736,6 +1743,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                                    'process.threads.*': 'threads', 'time': 'ms', 'other_unitless': 'count/gauge'}}
     sets = {label: Samples() for label in labels}
     missing = {label: {} for label in labels}
+    preconditions = {label: {} for label in labels}
     resources = []
     for run, label in alternate(labels, args.runs):
         target = out / label / f'run-{run:02d}'
@@ -1791,6 +1799,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 report['metrics'] = summary_table(capture.samples)[1]
                 report['metrics'].update({key: value for key, value in report['missing_metrics'].items() if key not in report['metrics']})
                 missing[label].update(report['missing_metrics'])
+                for name, info in report.get('missing_preconditions', {}).items():
+                    preconditions[label].setdefault(name, {**info, 'runs': []})['runs'].append(run)
                 # A dedicated derived file is the only round-level summary input.
                 lines = [f"metric {name} {value} {capture.samples.units[name]}".rstrip()
                          for name, values in capture.samples.values.items() for value in values]
@@ -1828,8 +1838,12 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                     entry[label] = batch['metrics'][label].get(name, {'status': 'not_instrumented', 'n': 0, 'unit': entry['unit']})
         texts.append(text)
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
+    batch['missing_preconditions'] = {label: items for label, items in preconditions.items() if items}
     text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
     text += '\nAbsolute gates: ' + json.dumps(batch['absolute_gates'], ensure_ascii=False) + '\n'
+    if batch['missing_preconditions']:
+        text += ('Missing preconditions (historical arm only; recorded, not a gate): ' +
+                 json.dumps(batch['missing_preconditions'], ensure_ascii=False) + '\n')
     text += ('Driver result: ' + ('complete' if batch['valid'] else 'incomplete (driver error)') +
              ('; absolute gate FAIL observed' if batch['gate_failed'] else '') + f"; exit {batch['exit']}\n")
     if resources:

@@ -860,6 +860,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_p3_drags_real_caption_and_p6_holds_key_at_30hz(self):
         gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()
+        capture.report = {'observations': {}}
         old = SimpleNamespace(hwnd=10, rect=(0, 0, 800, 600))
         new = SimpleNamespace(hwnd=10, rect=(100, 50, 900, 650))
         gui.win32.return_value.foreground.return_value = 10
@@ -877,6 +878,42 @@ class ExperimentTests(unittest.TestCase):
             gx_perf.measure_ui(gui, instance, capture, args)
         instance.hold_key.assert_called_once_with('down', seconds=2, hz=30)
         instance.press.assert_called_with('ctrl+pagedown')
+
+    def test_p6_theme_list_uia_is_required_only_in_the_new_arm(self):
+        args = self.args('win32-ui', '--exe', str(self.exe), '--runs', '2', '--case', 'p6', '--label-env', 'new:GX_TEST_ARM=new')
+        gui = self.fake_gui()
+        launch = gui.launch.side_effect
+        def launch_arm(exe, env_dir, **kwargs):
+            instance = launch(exe, env_dir, **kwargs)
+            new = kwargs['env'].get('GX_TEST_ARM') == 'new'
+            # The historical image has no settings UIA provider: no theme list items, no theme.reload counter.
+            instance.uia_rows.return_value = [{'type': 'ControlType.ListItem'}] if new else [{'type': 'ControlType.Window'}]
+            def hold(*_, **__):
+                if new:
+                    with instance.log.open('a', encoding='utf-8') as log:
+                        log.write('info(gx_perf): metric theme.reload 1\n')
+            instance.hold_key.side_effect = hold
+            return instance
+        gui.launch.side_effect = launch_arm
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
+                mock.patch.object(gx_perf.CaptureRun, 'drain'), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.run_experiment(args, gui))
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual(['completed'] * 4, [row['status'] for row in result['runs']])
+        self.assertEqual({'theme_list_uia': {'status': 'not_instrumented', 'n': 0, 'runs': [1, 2],
+                                             'scope': 'historical arm only; theme list items not readable through UIA'}},
+                         result['missing_preconditions']['old'])
+        self.assertNotIn('new', result['missing_preconditions'])
+        self.assertEqual(['not_evaluated', 'not_evaluated'], [gate['status'] for gate in result['absolute_gates']['old']])
+        self.assertEqual(['PASS', 'PASS'], [gate['status'] for gate in result['absolute_gates']['new']])
+        self.assertIn('Missing preconditions (historical arm only', (args.out / 'SUMMARY.txt').read_text())
+        instance = mock.Mock()
+        instance.uia_rows.return_value = []
+        capture = gx_perf.CaptureRun(instance, self.root, {'baseline': False, 'diagnostic': False})
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
+                self.assertRaisesRegex(gx_perf.PerfError, 'no theme list items'):
+            gx_perf.measure_ui(mock.Mock(), instance, capture, args)
+        instance.hold_key.assert_not_called()
 
     def test_p5_sweeps_overlapping_pages_until_viewport_stops(self):
         import gx_win_gui as gui
