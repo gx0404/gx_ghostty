@@ -4,15 +4,32 @@ title = "A command that fails right away shows a non-modal notice; any key close
 # bottom of the window. It never takes focus or disables the window; the core
 # closes the exited terminal on any key that encodes input.
 # initial-command fails only the first terminal; later splits run `command`.
+# Phase 6 (r6) extends the case for R2-App.04 after the R0 screenshots: the configuration error
+# notice, the 2 s reload confirmation, the read-only notice and toast, the leader toast, the copy
+# toast and the app-notifications switches. The copy writes the fixture's own text (GX_W07) to
+# the clipboard; nothing reads or restores what was there before.
 config = """
 initial-command = cmd.exe /c exit 3
 command = cmd.exe /d /k prompt GX_W07$G$S
 language = en
+keybind = ctrl+shift+r=reload_config
+keybind = f11=toggle_readonly
+keybind = ctrl+b>n=new_split:right
 """
 expect = [
   "notice: a non-modal Command Failed notice at the bottom of the terminal area says the shell exited with code 3 and any key closes the terminal; the window chrome is active and not dimmed behind a modal dialog",
   "split-with-notice: while the notice stayed up the window itself took Ctrl+Shift+O: the failed terminal is on the left, a new GX_W07> prompt on the right, the notice is still shown",
   "after-close: one key in the failed terminal closed only it; the GX_W07> terminal fills the window, the window answers, and no Command Failed notice remains",
+  "diagnostics: after a reload with two bad lines a notice at the bottom lists the configuration errors (gx-r6-bogus-key, font-size = banana) with the buttons Open Configuration File and Reload Configuration",
+  "reload-ok: after the errors were removed and Ctrl+Shift+R reloaded, the error notice is gone and a toast says Reloaded the configuration",
+  "reload-ok-gone: about 3 s later the reload toast is gone again (it lasts 2 s)",
+  "readonly: F11 (toggle_readonly) shows the Read-only notice explaining that input is not sent",
+  "readonly-off: F11 again closes that notice and a toast says Read-only mode is off",
+  "leader: after Ctrl+B (the leader of ctrl+b>n) a keyboard toast shows the keys typed so far (Ctrl+B)",
+  "leader-ended: Escape ended the sequence: the leader toast is gone and no split was made",
+  "copied: double-click selected GX_W07 and Ctrl+Shift+C copied it: a toast says Copied to clipboard",
+  "reload-gated: with app-notifications = no-clipboard-copy,no-config-reload a reload shows no toast",
+  "copy-gated: copying again shows no toast",
 ]
 
 [[step]]
@@ -95,3 +112,193 @@ seconds = 0.5
 [[step]]
 action = "capture"
 name = "after-close"
+
+# --- r6 extension (R2-App.04) ---------------------------------------------------------------
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "initial-command = cmd.exe /c exit 3\ncommand = cmd.exe /d /k prompt GX_W07$G$S\nlanguage = en\nkeybind = ctrl+shift+r=reload_config\nkeybind = f11=toggle_readonly\nkeybind = ctrl+b>n=new_split:right\ngx-r6-bogus-key = 1\nfont-size = banana\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "diagnostics"
+what = "all"
+
+[[step]]
+action = "assert_log"
+pattern = "configuration errors reported count=[1-9]"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "initial-command = cmd.exe /c exit 3\ncommand = cmd.exe /d /k prompt GX_W07$G$S\nlanguage = en\nkeybind = ctrl+shift+r=reload_config\nkeybind = f11=toggle_readonly\nkeybind = ctrl+b>n=new_split:right\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "reload-ok"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "capture"
+name = "reload-ok-gone"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f11"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "readonly"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f11"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "readonly-off"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "key"
+keys = "ctrl+b"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "leader"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "capture"
+name = "leader-ended"
+what = "all"
+
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = 20
+y = 10
+count = 2
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+c"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "copied"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "initial-command = cmd.exe /c exit 3\ncommand = cmd.exe /d /k prompt GX_W07$G$S\nlanguage = en\nkeybind = ctrl+shift+r=reload_config\nkeybind = f11=toggle_readonly\nkeybind = ctrl+b>n=new_split:right\napp-notifications = no-clipboard-copy,no-config-reload\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "reload-gated"
+what = "all"
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = 20
+y = 10
+count = 2
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+c"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "copy-gated"
+what = "all"
