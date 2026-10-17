@@ -4512,6 +4512,9 @@ fn msgWndProc(
     if (msg == RemoteCoordinator.wake_message or (msg == w32.WM_TIMER and wparam == RemoteCoordinator.timer_id)) return 0;
     if (msg == w32.WM_TIMER and wparam == ShellIntegration.server_timer) {
         _ = w32.KillTimer(hwnd, ShellIntegration.server_timer);
+        // KillTimer cannot retract a WM_TIMER already queued before activation.
+        // In particular, its dispatch inside a result dialog must not quit it.
+        if (!app.shell.serverTimeoutShouldQuit()) return 0;
         app.quit_requested = true;
         w32.PostQuitMessage(0);
         return 0;
@@ -4881,6 +4884,24 @@ test "quitTimerStart ignores the call before the message loop runs" {
     try testing.expectEqual(@as(QuitTimerStart, .{ .timer = 500 }), quitTimerStart(true, true, 500));
     try testing.expectEqual(none, quitTimerStart(true, false, null));
     try testing.expectEqual(none, quitTimerStart(true, false, 500));
+}
+
+test "toast server watchdog ignores queued timeout after activation" {
+    var shell: ShellIntegration = .{ .startup = .toast_server };
+    try std.testing.expect(shell.serverTimeoutShouldQuit());
+    shell.activationReceived(null);
+    try std.testing.expect(!shell.serverTimeoutShouldQuit());
+    // A second callback cannot rearm the watchdog while its result is visible.
+    shell.activationReceived(null);
+    try std.testing.expect(!shell.serverTimeoutShouldQuit());
+}
+
+test "toast server watchdog does not affect ordinary warm instances" {
+    var shell: ShellIntegration = .{};
+    try std.testing.expect(!shell.serverTimeoutShouldQuit());
+    shell.activationReceived(null);
+    try std.testing.expect(!shell.server_activation_received);
+    try std.testing.expect(!shell.serverTimeoutShouldQuit());
 }
 
 test "ending key hints preserves another terminal, table and action feedback" {

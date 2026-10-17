@@ -26,6 +26,7 @@ jump_list_dirty: bool = true,
 publishing: bool = false,
 closing: bool = false,
 startup: Identity.Startup = .none,
+server_activation_received: bool = false,
 pending: [32]?Pending = @splat(null),
 pending_retire: [512]?Activation.Token = @splat(null),
 const Pending = struct { token: Activation.Token, target: Ref, title: []u8, body: []u8, receipt: ?protocol.ActionResult = null, completed: ?bool = null };
@@ -116,6 +117,20 @@ fn live(app: *App, target: Ref) bool {
     };
 }
 
+/// The startup watchdog bounds a server that never receives an activation,
+/// not the time a user may spend reading its activation result.
+pub fn serverTimeoutShouldQuit(self: *const Self) bool {
+    return self.startup == .toast_server and !self.server_activation_received;
+}
+
+/// Set the state before KillTimer: a timer message may already be queued, and
+/// presenting a target or a native dialog may enter a nested message loop.
+pub fn activationReceived(self: *Self, hwnd: ?w32.HWND) void {
+    if (self.startup != .toast_server) return;
+    self.server_activation_received = true;
+    if (hwnd) |window| _ = w32.KillTimer(window, server_timer);
+}
+
 /// Called from the outer loop, where native shell calls may reenter safely.
 pub fn drain(self: *Self, app: *App) void {
     if (self.closing) return;
@@ -149,15 +164,24 @@ pub fn drain(self: *Self, app: *App) void {
     };
     if (self.sink) |sink| for (0..64) |_| {
         const token = sink.take() orelse break;
+        self.activationReceived(app.msg_hwnd);
         const target = if (self.registry) |*registry| registry.resolve(token) else null;
         // The same presentation as the tray balloon and `present_terminal`.
         if (target) |reference| if (app.presentReference(reference)) continue;
         var text: [256]u16 = undefined;
         var caption: [64]u16 = undefined;
-        _ = w32.MessageBoxW(null, wstr.bufZ(&text, i18n.tr("The notification target is no longer available.")), wstr.bufZ(&caption, "Ghostty GX"), 0x40);
+        // A cold server has no application window to own or expose this dialog.
+        // Request foreground focus and keep this one result visible even when
+        // Windows denies foreground activation; do not make app windows topmost.
+        const flags = w32.MB_ICONINFORMATION | @as(u32, if (self.startup == .toast_server)
+            0x00010000 | 0x00040000 // MB_SETFOREGROUND | MB_TOPMOST
+        else
+            0);
+        _ = w32.MessageBoxW(null, wstr.bufZ(&text, i18n.tr("The notification target is no longer available.")), wstr.bufZ(&caption, "Ghostty GX"), flags);
         if (self.startup == .toast_server) {
             app.quit_requested = true;
             w32.PostQuitMessage(0);
+            return;
         }
     };
     if (self.jump_list_dirty and !self.publishing and self.startup != .toast_server and self.startup != .drop_companion) self.publish(app);
