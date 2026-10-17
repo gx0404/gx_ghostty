@@ -57,6 +57,7 @@ key ctrl+a
 type --delay 8 "EEE"
 key Return
 sleep 0.3
+sleep 0.4
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s01-five-tabs.png"
 mousemove 554 68
 click 3
@@ -91,35 +92,42 @@ exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s04b-two-window
 mousemove 32 68
 click 3
 sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s05-duplicate-pinned-bbb-menu.png"
-mousemove 112 125
-click 1
-sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s05-duplicate-pinned-bbb.png"
-mousemove 176 68
-click 3
-sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s06-close-aaa-menu.png"
-mousemove 256 234
-click 1
-sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s06-close-aaa.png"
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s05-pinned-menu.png"
+key Escape
+sleep 0.3
 mousemove 237 68
 click 3
 sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s07-close-others-of-ddd-menu.png"
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s06-duplicate-aaa-menu.png"
+mousemove 317 125
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s06-duplicate-aaa.png"
+mousemove 176 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s07-close-aaa-menu.png"
+mousemove 256 234
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s07-close-aaa.png"
+mousemove 237 68
+click 3
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s08-close-others-of-ddd-menu.png"
 mousemove 317 266
 click 1
 sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s07-close-others-of-ddd.png"
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G09-s08-close-others-of-ddd.png"
 '''
 expect = [
   "G09.png: the Chinese main window with one tab",
-  "G09-s01-five-tabs.png: five tabs AAA BBB CCC DDD EEE, EEE selected",
+  "G09-s01-five-tabs.png: five tabs AAA BBB CCC DDD EEE, EEE selected; AAA's shell stays in the clone, BBB cd'd to /tmp and the later tabs inherited /tmp",
   "G09-s02-close-right-of-ddd-menu.png / G09-s02-close-right-of-ddd.png: the menu of the non-selected DDD (更改标签页标题…, 复制标签页, 将标签页移至新窗口, 固定标签页, 关闭标签页, 关闭其他标签页, 关闭右侧标签页); 关闭右侧标签页 closed only EEE",
-  "G09-s03-pin-bbb.png: 固定标签页 on the non-selected BBB pinned BBB as a small tab at the start",
-  "G09-s04-move-ccc-to-window.png / G09-s04b-two-windows.png: 将标签页移至新窗口 on CCC moved CCC into a second window (moved aside with xdotool); the first window keeps BBB, AAA and DDD",
-  "G09-s05-duplicate-pinned-bbb-menu.png / G09-s05-duplicate-pinned-bbb.png: the pinned BBB's menu shows 固定标签页 checked; 复制标签页 added a tab titled /tmp (BBB's working directory)",
-  "G09-s06-close-aaa.png: 关闭标签页 on AAA closed AAA and nothing else",
-  "G09-s07-close-others-of-ddd.png: 关闭其他标签页 on DDD closes the /tmp copy; the pinned BBB is expected to stay, because window.zig::setupTabMenu counts only unpinned tabs when it enables the item",
+  "G09-s03-pin-bbb-menu.png / G09-s03-pin-bbb.png: 固定标签页 on the non-selected BBB pinned BBB as a small tab at the start",
+  "G09-s04-move-ccc-to-window-menu.png / G09-s04-move-ccc-to-window.png / G09-s04b-two-windows.png: 将标签页移至新窗口 on CCC moved CCC into a second window (moved aside with xdotool); the first window keeps BBB, AAA and DDD",
+  "G09-s05-pinned-menu.png: the pinned BBB's menu shows 固定标签页 checked",
+  "G09-s06-duplicate-aaa-menu.png / G09-s06-duplicate-aaa.png: 复制标签页 on AAA added a tab titled with AAA's directory (~/src/gx_ghostty-r6-o6), not /tmp of the selected DDD",
+  "G09-s07-close-aaa-menu.png / G09-s07-close-aaa.png: 关闭标签页 on AAA closed AAA and nothing else",
+  "G09-s08-close-others-of-ddd-menu.png / G09-s08-close-others-of-ddd.png: 关闭其他标签页 on DDD closes the copy; the pinned BBB is expected to stay, because window.zig::setupTabMenu counts only unpinned tabs when it enables the item",
 ]
