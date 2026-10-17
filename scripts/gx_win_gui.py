@@ -1101,6 +1101,64 @@ class Instance:
             if index + 1 < repeat:
                 time.sleep(delay)
 
+    def hold_key(self, key: str, seconds: float = 2, hz: float = 30) -> None:
+        """A held key with explicit repeat downs; check ownership before every event."""
+        if seconds <= 0 or hz <= 0 or seconds * hz > 10000:
+            raise UsageError("invalid hold duration or repeat frequency")
+        mods, vk = parse_chord(key)
+        if mods:
+            raise UsageError("hold_key accepts one unmodified key")
+        w = win32()
+        start = time.monotonic()
+        sent = False
+        try:
+            for index in range(max(1, round(seconds * hz))):
+                self.ensure_foreground()
+                w.send([w.key_input(vk, False)])
+                sent = True
+                time.sleep(max(0, start + (index + 1) / hz - time.monotonic()))
+        finally:
+            if sent:
+                # Do not send even a release into an unrelated foreground app.
+                self.ensure_foreground()
+                w.send([w.key_input(vk, True)])
+
+    def uia_rows(self, hwnd: int) -> list[dict]:
+        """Read geometry under an owned HWND; no UIA invocation or desktop search."""
+        self.ensure_owned()
+        if win32().window_pid(hwnd) != self.pid:
+            raise InputBlocked("UIA root no longer belongs to this instance")
+        script = ("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; "
+                  "Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes; "
+                  f"$root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]{int(hwnd)}); "
+                  "$nodes=$root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition); "
+                  "@($nodes | ForEach-Object {$c=$_.Current; $r=$c.BoundingRectangle; "
+                  "if (!$c.IsOffscreen -and $r.Width -gt 0 -and $r.Height -gt 0) { "
+                  "@{name=$c.Name;id=$c.AutomationId;type=$c.ControlType.ProgrammaticName; "
+                  "rect=@($r.X,$r.Y,$r.Width,$r.Height)}}}) | ConvertTo-Json -Depth 4 -Compress")
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
+                                capture_output=True, timeout=20)
+        self.ensure_owned()
+        if win32().window_pid(hwnd) != self.pid or result.returncode:
+            raise GuiError(f"UIA geometry probe failed: {result.stderr.decode('utf-8', errors='replace')}")
+        data = json.loads(result.stdout.decode('utf-8-sig'))
+        return data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+
+    def caption_point(self, window: WindowInfo) -> tuple[int, int]:
+        """Find a real HTCAPTION point; do not guess where tabs end."""
+        self.ensure_owned()
+        w = win32()
+        scale = self.scale(window)
+        left, top, right, _ = window.rect
+        for dy in (16, 24, 32, 10, 6):
+            y = round(top + dy * scale)
+            for x in range(round(right - 16 * scale), round(left + 16 * scale), -max(1, round(8 * scale))):
+                packed = (x & 0xffff) | ((y & 0xffff) << 16)
+                if w.send_message(window.hwnd, 0x0084, 0, packed) == 2:  # WM_NCHITTEST / HTCAPTION
+                    self.ensure_point(x, y)
+                    return x, y
+        raise GuiError('no visible draggable HTCAPTION point in the owned window')
+
     def _modifier_events(self, mods: Sequence[str], up: bool) -> list[Any]:
         w = win32()
         vks = [parse_chord(f"{mod}+a")[0][0] for mod in mods]
@@ -1144,10 +1202,12 @@ class Instance:
             x = round(start[0] + (end[0] - start[0]) * index / steps)
             y = round(start[1] + (end[1] - start[1]) * index / steps)
             self.ensure_foreground()
+            self.ensure_point(x, y)
             win32().send([win32().mouse_input(0x0001 | 0x8000 | 0x4000, x, y)])
             time.sleep(step_delay)
         if release:
             self.ensure_foreground()
+            self.ensure_point(*end)
             win32().send([win32().mouse_input(MOUSE_BUTTONS[button][1], data=MOUSE_BUTTONS[button][2])])
 
     # -- test hooks and probes ------------------------------------------------

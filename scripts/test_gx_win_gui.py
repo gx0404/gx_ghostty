@@ -433,6 +433,35 @@ class FakeWin32:
 class InputGuardTests(unittest.TestCase):
     PID = 4242
 
+    def test_held_key_uses_repeat_downs_and_one_release(self):
+        fake = FakeWin32(self.PID, self.PID)
+        with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
+            self.instance().hold_key('down', seconds=2, hz=30)
+        self.assertEqual(61, len(fake.sent))
+        self.assertTrue(all(events == [('key', 0x28, False)] for events in fake.sent[:-1]))
+        self.assertEqual([('key', 0x28, True)], fake.sent[-1])
+
+    def test_drag_checks_pointer_at_every_step(self):
+        fake = FakeWin32(self.PID, self.PID)
+        original = fake.send
+        def send(events):
+            original(events)
+            fake.point_pid = 999
+        fake.send = send
+        with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
+            with self.assertRaises(gui.InputBlocked):
+                self.instance().drag((10, 10), (20, 20))
+        self.assertEqual(1, len(fake.sent))
+
+    def test_held_key_stops_when_foreground_changes(self):
+        fake = FakeWin32(self.PID, self.PID)
+        def sleep(_):
+            fake.foreground_pid = 999
+        with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep', side_effect=sleep):
+            with self.assertRaises(gui.InputBlocked):
+                self.instance().hold_key('down')
+        self.assertEqual(1, len(fake.sent))
+
     def instance(self) -> gui.Instance:
         return gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
 
