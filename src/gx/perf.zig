@@ -93,6 +93,12 @@ pub fn record(metric: []const u8, us: u64) void {
     log.info("{s} {d}us", .{ metric, us });
 }
 
+/// Logs a unitless count or gauge when measurements are on.
+pub fn count(metric: []const u8, n: u64) void {
+    if (!enabled()) return;
+    log.info("metric {s} {d}", .{ metric, n });
+}
+
 /// A measurement from `begin` to `end`.
 pub const Span = struct {
     start: Instant,
