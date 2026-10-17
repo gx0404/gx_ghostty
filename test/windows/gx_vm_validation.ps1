@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52','toast-matrix')]
+                 'run-config','osc52','toast-matrix','jumplist-matrix')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -56,7 +56,16 @@ param(
     # toast-matrix early: seconds after the probe shell starts at which each OSC 9 is sent.
     [ValidatePattern('^\d{1,3}(,\d{1,3}){0,9}$')][string]$EarlyOffsets = '8,25,45',
     # toast-matrix early: back up, then delete HKCU Notifications\Settings\<AUMID> before the launch.
-    [switch]$ResetToastSettings
+    [switch]$ResetToastSettings,
+    # Installation directory below the run's AppDir: 'space' and 'cjk' put spaces, CJK and an
+    # apostrophe into the installed exe path (fixed names; CJK cannot be typed over HMP).
+    [ValidateSet('none','space','cjk')][string]$PathPreset = 'none',
+    # jumplist-matrix config: profile set written to the real user configuration.
+    [ValidateSet('base','deleted','lang-zh','lang-en')][string]$JumpListSet = 'base',
+    # jumplist-matrix config: back up and replace a configuration this fixture did not write.
+    [switch]$AdoptUserConfig,
+    # jumplist-matrix observe: profile key (p1-p6) whose launch is expected, or none.
+    [ValidatePattern('^(p[1-6]|none)?$')][string]$ExpectProfile = ''
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1259,7 +1268,7 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52','toast-matrix')
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix')
 $script:Restore = $null
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
@@ -1267,6 +1276,14 @@ $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Not
 $script:FixtureKeybinds = @('keybind = ctrl+alt+shift+o=new_split:right', 'keybind = ctrl+alt+shift+t=new_tab',
     'keybind = ctrl+alt+shift+n=new_window', 'keybind = ctrl+alt+shift+w=close_surface',
     'keybind = ctrl+alt+shift+r=reload_config', 'keybind = global:ctrl+alt+shift+q=toggle_quick_terminal')
+
+function Get-PathPresetName([string]$Preset) {
+    switch ($Preset) {
+        'space' { return "GX JL dir 'q'" }
+        'cjk' { return 'GX ' + (-join @([char]0x5B89, [char]0x88C5)) + " dir 'q'" }
+        default { return '' }
+    }
+}
 
 function Assert-Action([string[]]$Allowed, [string]$Default) {
     $value = if ($Action) { $Action } else { $Default }
@@ -1551,6 +1568,12 @@ function Get-PhaseState([string]$When) {
             $state.installed_toast = Get-ToastFacts $script:InstalledAumid
             $state.notification_settings = Read-HkcuTree $script:NotificationSettingsKey
             $state.quiet_hours = Get-QuietHoursDiagnostic
+        }
+        'jumplist-matrix' {
+            $state.records = @(Get-OwnedRecordSummary 'jumplist-')
+            $state.jump_lists = Get-JumpListFiles
+            $state.user_config = @(Get-UserConfigFiles | ForEach-Object { [ordered]@{ path=$_; exists=(Test-Path -LiteralPath $_);
+                sha256=$(if (Test-Path -LiteralPath $_) { Get-Sha256 $_ } else { $null }) } })
         }
     }
     return $state
@@ -2375,12 +2398,378 @@ function Invoke-ToastMatrix {
     }
 }
 
+# ---- jumplist-matrix: the real user configuration and shell jump lists -----
+
+function Get-UserConfigFiles {
+    $dir = Join-Path $env:LOCALAPPDATA 'ghostty'
+    return @(@('config.ghostty', 'config', 'gui-settings.ghostty') | ForEach-Object { Join-Path $dir $_ })
+}
+
+function Get-FixtureConfigMarker { return '# gx-vm-validation owner ' + $RunId + ' ' + $script:State.token }
+
+function Test-FixtureOwnedFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return ([string](Get-Content -LiteralPath $Path -TotalCount 1 -Encoding UTF8)) -ceq (Get-FixtureConfigMarker)
+}
+
+function Adopt-UserConfig {
+    # JumpList launches use the shell's environment, so these cases need the real
+    # configuration. Foreign files are backed up (hash-checked) and moved aside.
+    if ($env:XDG_CONFIG_HOME) { throw 'XDG_CONFIG_HOME is set for this user; the jump list cases expect the default configuration directory.' }
+    $record = Read-Record 'jumplist-user-config'
+    if ($record -and -not $record.restored) { return $record }
+    $backupDir = Join-Path $script:RunRoot ('user-config-backup-' + $script:Step)
+    $files = @()
+    foreach ($path in Get-UserConfigFiles) {
+        $entry = [ordered]@{ path=$path; existed=(Test-Path -LiteralPath $path -PathType Leaf); sha256=$null; backup=$null }
+        if ($entry.existed) {
+            if (-not $AdoptUserConfig) { throw "A configuration this fixture did not write exists ($path); pass -AdoptUserConfig to back it up and replace it." }
+            [IO.Directory]::CreateDirectory($backupDir) | Out-Null
+            $entry.sha256 = Get-Sha256 $path
+            $entry.backup = Join-Path $backupDir ([IO.Path]::GetFileName($path))
+            Copy-Item -LiteralPath $path -Destination $entry.backup
+            Assert-Hash $entry.backup $entry.sha256
+            Remove-Item -LiteralPath $path
+        }
+        $files += $entry
+    }
+    Save-Record 'jumplist-user-config' ([ordered]@{ files=$files; adopted_utc=[DateTime]::UtcNow.ToString('o'); restored=$false }) | Out-Null
+    return Read-Record 'jumplist-user-config'
+}
+
+function Restore-UserConfig {
+    $record = Read-Record 'jumplist-user-config'
+    if ($null -eq $record) { return [ordered]@{ restored=$true; note='no configuration was adopted' } }
+    if ($record.restored) { return [ordered]@{ restored=$true; note='already restored' } }
+    $items = @(foreach ($entry in @($record.files)) {
+        $item = [ordered]@{ path=$entry.path; action=$null; ok=$false }
+        $present = Test-Path -LiteralPath $entry.path -PathType Leaf
+        if ($present -and -not (Test-FixtureOwnedFile $entry.path)) {
+            $item.action = 'left untouched: the file now present was not written by this fixture'
+            $item.sha256_now = Get-Sha256 $entry.path
+        } elseif ($entry.existed) {
+            Copy-Item -LiteralPath $entry.backup -Destination $entry.path -Force
+            $item.ok = (Get-Sha256 $entry.path) -ceq $entry.sha256
+            $item.action = 'restored from backup'
+        } elseif ($present) {
+            Remove-Item -LiteralPath $entry.path
+            $item.ok = -not (Test-Path -LiteralPath $entry.path)
+            $item.action = 'removed the fixture file'
+        } else { $item.ok = $true; $item.action = 'absent, as before' }
+        $item })
+    $ok = @($items | Where-Object { -not $_.ok }).Count -eq 0
+    Set-RecordField $record 'restored' $ok
+    Set-RecordField $record 'restore' $items
+    Save-Record 'jumplist-user-config' $record | Out-Null
+    return [ordered]@{ restored=$ok; files=$items }
+}
+
+function Get-JumpListMarkDir { return Join-Path $script:RunRoot ('jl mark ' + (-join @([char]0x4E2D, [char]0x6587)) + " 'q'") }
+
+function Get-JumpListProfiles([string]$MarkDir) {
+    $mark = Join-Path $MarkDir 'gx-jl-mark.cmd'
+    return @(
+        [ordered]@{ key='p1'; name='GX JL Plain'; command='cmd.exe /d /k title GX_JL_P1' },
+        [ordered]@{ key='p2'; name='GX JL Space Name'; command='cmd.exe /d /k title GX_JL_P2' },
+        [ordered]@{ key='p3'; name=('GX JL ' + (-join @([char]0x4E2D, [char]0x6587))); command='cmd.exe /d /k title GX_JL_P3' },
+        [ordered]@{ key='p4'; name='GX JL "Quote"'; command='cmd.exe /d /k title GX_JL_P4' },
+        [ordered]@{ key='p5'; name='GX JL Trail\'; command='cmd.exe /d /k title GX_JL_P5' },
+        [ordered]@{ key='p6'; name='GX JL Path'; command=('cmd.exe /d /k call "' + $mark + '" "' + $MarkDir + '\"') })
+}
+
+function New-JumpListConfig([string]$Set, [string]$MarkDir) {
+    $profiles = @(Get-JumpListProfiles $MarkDir)
+    if ($Set -ceq 'deleted') { $profiles = @($profiles | Where-Object { $_.key -cne 'p2' }) }
+    $language = if ($Set -ceq 'lang-zh') { 'zh-CN' } else { 'en' }
+    $lines = @((Get-FixtureConfigMarker), ('language = ' + $language), 'confirm-close-surface = false', 'gx-session-restore = false') +
+        $script:FixtureKeybinds + @($profiles | ForEach-Object { 'gx-launch-profile = ' + $_.name + '=' + $_.command })
+    return @{ text=(($lines -join $script:LF) + $script:LF); profiles=$profiles; language=$language }
+}
+
+function Read-JumpListTasks([byte[]]$Bytes, [string[]]$Titles) {
+    # Shell link StringData is UTF-16 with a 16-bit length prefix: read each
+    # argument string exactly, then decode it with CommandLineToArgvW.
+    if (-not ('GxVmToken' -as [type])) { Add-Type -TypeDefinition $script:TokenSource -Language CSharp }
+    $marker = '"--gx-shell-action=profile"'
+    $tasks = New-Object System.Collections.Generic.List[object]
+    $present = New-Object System.Collections.Generic.List[string]
+    foreach ($offset in @(0, 1)) {
+        $count = $Bytes.Length - $offset
+        if ($count -lt 2) { continue }
+        $text = [Text.Encoding]::Unicode.GetString($Bytes, $offset, $count - ($count % 2))
+        foreach ($title in $Titles) { if ($text.Contains($title) -and -not $present.Contains($title)) { $present.Add($title) } }
+        $index = $text.IndexOf($marker)
+        while ($index -ge 0 -and $tasks.Count -lt 128) {
+            $length = if ($index -gt 0) { [int]$text[$index - 1] } else { 0 }
+            if ($length -ge $marker.Length -and $index + $length -le $text.Length) { $arguments = $text.Substring($index, $length); $method = 'length-prefixed' }
+            else {
+                $end = $index
+                while ($end -lt $text.Length -and [int]$text[$end] -ge 32) { $end++ }
+                $arguments = $text.Substring($index, $end - $index); $method = 'printable-run'
+            }
+            $argv = @([GxVmToken]::Arguments('x ' + $arguments) | Select-Object -Skip 1)
+            $profile = if ($argv.Count -ge 2 -and $argv[1].StartsWith('--gx-shell-profile=')) { $argv[1].Substring(19) } else { $null }
+            $tasks.Add([ordered]@{ alignment=$offset; method=$method; arguments=$arguments; argv=$argv; profile=$profile;
+                shape_ok=($argv.Count -eq 2 -and $argv[0] -ceq '--gx-shell-action=profile' -and $null -ne $profile) })
+            $index = $text.IndexOf($marker, $index + $marker.Length)
+        }
+    }
+    return @{ tasks=$tasks.ToArray(); titles_present=$present.ToArray() }
+}
+
+function Get-JumpListTitles {
+    $titles = @(Get-JumpListProfiles (Get-JumpListMarkDir) | ForEach-Object { $_.name })
+    return $titles + @('Command Prompt', 'Windows PowerShell', (-join @([char]0x547D, [char]0x4EE4, [char]0x63D0, [char]0x793A, [char]0x7B26)))
+}
+
+function Get-JumpListFiles {
+    $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Recent\CustomDestinations'
+    $facts = [ordered]@{ dir=$dir; exists=(Test-Path -LiteralPath $dir); dir_sddl=$null; files=@() }
+    if (-not $facts.exists) { return $facts }
+    $facts.dir_sddl = (Get-Acl -LiteralPath $dir).Sddl
+    $titles = Get-JumpListTitles
+    $facts.files = @(Get-ChildItem -LiteralPath $dir -File -Force | Sort-Object Name | ForEach-Object {
+        $item = [ordered]@{ name=$_.Name; size=$_.Length; modified_utc=$_.LastWriteTimeUtc.ToString('o'); sha256=$null; gx=$false }
+        if ($_.Length -le 4194304) {
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            $item.sha256 = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+            $parsed = Read-JumpListTasks $bytes $titles
+            if ($parsed.tasks.Count -gt 0) { $item.gx = $true; $item.tasks = $parsed.tasks; $item.titles_present = $parsed.titles_present }
+        }
+        $item })
+    return $facts
+}
+
+function Get-JumpListLogLines {
+    $lines = @()
+    foreach ($name in @('ghostty.log.1', 'ghostty.log')) {
+        $path = Join-Path $env:LOCALAPPDATA ('ghostty\logs\' + $name)
+        if (Test-Path -LiteralPath $path) { $lines += @(Get-Content -LiteralPath $path | Select-String -SimpleMatch 'JumpList' | ForEach-Object Line) }
+    }
+    return @($lines | Select-Object -Last 40)
+}
+
+function Test-JumpListState($JumpLists) {
+    $gx = @($JumpLists.files | Where-Object { $_.gx })
+    $acl = Read-Record 'jumplist-acl'
+    if ($acl -and -not $acl.restored) {
+        # Commit denied: the list committed before the denial must be byte-identical.
+        $changed = @($acl.gx_files | Where-Object { $name = $_.name; $sha = $_.sha256; -not @($gx | Where-Object { $_.name -ceq $name -and $_.sha256 -ceq $sha }) })
+        return [ordered]@{ mode='commit-denied'; unchanged=($changed.Count -eq 0); changed=@($changed | ForEach-Object { $_.name });
+            verdict=$(if ($changed.Count -eq 0) { 'PASS' } else { 'FAIL' }) }
+    }
+    $config = Read-Record 'jumplist-user-config'
+    if (-not $config -or $config.restored -or -not $config.PSObject.Properties['profiles']) { return [ordered]@{ mode='no-fixture-config'; verdict='OBSERVED' } }
+    $expected = @($config.profiles | ForEach-Object { 'custom:' + $_.name })
+    $all = @(Get-JumpListProfiles (Get-JumpListMarkDir) | ForEach-Object { 'custom:' + $_.name })
+    $listed = @($gx | ForEach-Object { $_.tasks } | ForEach-Object { $_.profile } | Where-Object { $_ } | Select-Object -Unique)
+    $missing = @($expected | Where-Object { $listed -cnotcontains $_ })
+    $unexpected = @($listed | Where-Object { $all -ccontains $_ -and $expected -cnotcontains $_ })
+    $shape = @($gx | ForEach-Object { $_.tasks } | Where-Object { -not $_.shape_ok }).Count -eq 0
+    return [ordered]@{ mode='config'; set=$config.set; language=$config.language; expected=$expected; listed=$listed; missing=$missing;
+        unexpected=$unexpected; shape_ok=$shape; verdict=$(if ($missing.Count -eq 0 -and $unexpected.Count -eq 0 -and $shape -and $gx.Count -gt 0) { 'PASS' } else { 'FAIL' }) }
+}
+
+function Set-JumpListCommitDenied {
+    $existing = Read-Record 'jumplist-acl'
+    if ($existing -and -not $existing.restored) { throw 'Commits are already denied in this run; run allow-commit first.' }
+    $lists = Get-JumpListFiles
+    $gx = @($lists.files | Where-Object { $_.gx })
+    if (-not $lists.exists -or $gx.Count -eq 0) { throw 'No Ghostty GX jump list is committed yet; publish one before denying commits.' }
+    $targets = @($lists.dir) + @($gx | ForEach-Object { Join-Path $lists.dir $_.name })
+    $entries = @($targets | ForEach-Object { [ordered]@{ path=$_; sddl=(Get-Acl -LiteralPath $_).Sddl } })
+    Save-Record 'jumplist-acl' ([ordered]@{ entries=$entries; gx_files=@($gx | ForEach-Object { [ordered]@{ name=$_.name; sha256=$_.sha256 } });
+        denied_utc=[DateTime]::UtcNow.ToString('o'); restored=$false }) | Out-Null
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    foreach ($entry in $entries) {
+        $rights = if ($entry.path -ceq $lists.dir) { [Security.AccessControl.FileSystemRights]'CreateFiles, AppendData, DeleteSubdirectoriesAndFiles' }
+                  else { [Security.AccessControl.FileSystemRights]'WriteData, AppendData, Delete' }
+        $acl = Get-Acl -LiteralPath $entry.path
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user, $rights, [Security.AccessControl.AccessControlType]::Deny))
+        Set-Acl -LiteralPath $entry.path -AclObject $acl
+    }
+    return @($entries | ForEach-Object { [ordered]@{ path=$_.path; sddl_before=$_.sddl; sddl_now=(Get-Acl -LiteralPath $_.path).Sddl } })
+}
+
+function Restore-JumpListAcl {
+    $record = Read-Record 'jumplist-acl'
+    if ($null -eq $record) { return [ordered]@{ restored=$true; note='commits were never denied' } }
+    if ($record.restored) { return [ordered]@{ restored=$true; note='already restored' } }
+    $items = @(foreach ($entry in @($record.entries)) {
+        $item = [ordered]@{ path=$entry.path; ok=$false; note=$null }
+        if (-not (Test-Path -LiteralPath $entry.path)) { $item.note = 'path no longer exists' }
+        else {
+            $acl = Get-Acl -LiteralPath $entry.path
+            $acl.SetSecurityDescriptorSddlForm($entry.sddl)
+            Set-Acl -LiteralPath $entry.path -AclObject $acl
+            $item.ok = (Get-Acl -LiteralPath $entry.path).Sddl -ceq $entry.sddl
+        }
+        $item })
+    $ok = @($items | Where-Object { -not $_.ok }).Count -eq 0
+    Set-RecordField $record 'restored' $ok
+    Set-RecordField $record 'restore' $items
+    Save-Record 'jumplist-acl' $record | Out-Null
+    return [ordered]@{ restored=$ok; entries=$items }
+}
+
+function Get-JumpListAppRecords {
+    $dir = Join-Path $script:RunRoot 'records'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter 'jumplist-*.json' | ForEach-Object { Read-JsonFile $_.FullName } |
+        Where-Object { $_.PSObject.Properties['pid'] -and $_.PSObject.Properties['record_name'] })
+}
+
+function Close-JumpListApp($Record) {
+    $close = Close-OwnedApp $Record
+    Set-RecordField $Record 'close' $close
+    $Record.status = if ($close.closed_normally -or $close.already_exited) { 'CLOSED' } else { 'CLOSE_FAILED' }
+    Save-Record $Record.record_name $Record | Out-Null
+    return $close
+}
+
+function Invoke-JumpListMatrix {
+    # config: write a profile set to the real configuration (adopting it once);
+    # snapshot: committed lists read from CustomDestinations; start: the
+    # installed app in the real environment; observe: what a shell (JumpList)
+    # launch produced; deny-commit/allow-commit: make CommitList fail by ACL,
+    # then restore the exact descriptors; portable: a copied payload must not
+    # publish or register; stop: close owned/adopted apps; restore: config+ACL.
+    $step = Assert-Action @('config','snapshot','start','observe','deny-commit','allow-commit','portable','stop','restore') 'snapshot'
+    $installedExe = Join-Path $script:AppDir 'ghostty.exe'
+    switch ($step) {
+        'config' {
+            $record = Adopt-UserConfig
+            $markDir = Get-JumpListMarkDir
+            Assert-NoReparse $markDir
+            [IO.Directory]::CreateDirectory($markDir) | Out-Null
+            $markScript = (@('@echo off', 'title GX_JL_P6', 'set "GXARG=%~1"',
+                '>>"%~dp0gx-jl-marker.txt" echo GX_JL_PATH_OK tail=[%GXARG:~-1%] at %DATE% %TIME%') -join "`r`n") + "`r`n"
+            [IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-mark.cmd'), $markScript, [Text.Encoding]::ASCII)
+            $config = New-JumpListConfig $JumpListSet $markDir
+            $path = (Get-UserConfigFiles)[0]
+            if ((Test-Path -LiteralPath $path) -and -not (Test-FixtureOwnedFile $path)) { throw "Refusing to overwrite ${path}: it is not this fixture's file." }
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path)) | Out-Null
+            [IO.File]::WriteAllBytes($path, (Get-Utf8Bytes $config.text))
+            Set-RecordField $record 'set' $JumpListSet
+            Set-RecordField $record 'language' $config.language
+            Set-RecordField $record 'profiles' @($config.profiles | ForEach-Object { [ordered]@{ key=$_.key; name=$_.name; command=$_.command } })
+            Set-RecordField $record 'config_sha256' (Get-Sha256 $path)
+            Set-RecordField $record 'written_utc' ([DateTime]::UtcNow.ToString('o'))
+            Save-Record 'jumplist-user-config' $record | Out-Null
+            $script:ExportExtra.Add($path)
+            return [ordered]@{ set=$JumpListSet; language=$config.language; config=$path; config_sha256=$record.config_sha256;
+                profiles=@($config.profiles | ForEach-Object { [ordered]@{ key=$_.key; id=('custom:' + $_.name) } }); mark_dir=$markDir;
+                next='reload a running app (ctrl+alt+shift+r) or start it, then snapshot' }
+        }
+        'snapshot' {
+            $lists = Get-JumpListFiles
+            $check = Test-JumpListState $lists
+            return [ordered]@{ jump_lists=$lists; check=$check; log=@(Get-JumpListLogLines); fixture_verdict=$check.verdict; visual_review='PENDING' }
+        }
+        'start' {
+            $config = Read-Record 'jumplist-user-config'
+            if (-not $config -or $config.restored) { throw 'Write the fixture configuration first (-Action config).' }
+            Assert-Hash $installedExe $AppSha256
+            $name = 'jumplist-' + $Label
+            $previous = Read-Record $name
+            if ($previous -and (Get-OwnedProcess $previous)) { throw "Label $Label still runs." }
+            $started = Start-OwnedApp -Exe $installedExe -Private $null -RealProfile -Arguments @()
+            $process = $started.process
+            $record = New-AppRecord $process $installedExe 'INSTALLED' $null $null $null @()
+            $record.record_name = $name
+            try { $record.main_window = Wait-AppWindow $process 45; $record.status = 'RUNNING' }
+            catch { $record.status = 'START_FAILED'; $record.error = $_.Exception.Message; throw }
+            finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+            return [ordered]@{ record=$record; fixture_verdict='RUNNING' }
+        }
+        'observe' {
+            if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+            $apps = @(Get-GuestApps | Where-Object { $_.path -and $_.path -ieq $installedExe })
+            $seen = @(foreach ($app in $apps) {
+                $name = 'jumplist-pid-' + $app.pid
+                $known = @(Get-JumpListAppRecords | Where-Object { [int]$_.pid -eq $app.pid })
+                if ($known.Count -eq 0) {
+                    # Adopt the shell-launched process so stop can close exactly this life.
+                    $process = Get-Process -Id $app.pid -ErrorAction SilentlyContinue
+                    if ($process) {
+                        Save-Record $name ([ordered]@{ phase=$Phase; label=('pid-' + $app.pid); record_name=$name; status='RUNNING'; adopted=$true;
+                            pid=$app.pid; birth_filetime=$process.StartTime.ToFileTimeUtc(); exe=$installedExe; parent=$app.parent;
+                            command_line=$app.command_line; adopted_utc=[DateTime]::UtcNow.ToString('o') }) | Out-Null
+                        $process.Dispose()
+                    }
+                }
+                [ordered]@{ pid=$app.pid; parent=$app.parent; created=$app.created; command_line=$app.command_line;
+                    windows=@([GxVmWindows]::TopLevel($app.pid) | Where-Object { $_['class'] -ceq 'GhosttyWindow' } | ForEach-Object { [ordered]@{ hwnd=$_['hwnd']; title=$_['title']; visible=$_['visible'] } }) }
+            })
+            $markerFile = Join-Path (Get-JumpListMarkDir) 'gx-jl-marker.txt'
+            $markers = if (Test-Path -LiteralPath $markerFile) { @([IO.File]::ReadAllLines($markerFile, [Text.Encoding]::Default)) } else { @() }
+            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; markers=$markers; jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
+            if (-not $ExpectProfile -or $ExpectProfile -ceq 'none') { $result.fixture_verdict = 'OBSERVED'; return $result }
+            $want = 'GX_JL_' + $ExpectProfile.ToUpperInvariant()
+            $titled = @($seen | ForEach-Object { $_.windows } | Where-Object { $_.title -and $_.title.Contains($want) })
+            $markerOk = ($ExpectProfile -cne 'p6') -or (@($markers | Where-Object { $_ -match '^GX_JL_PATH_OK tail=\[\\\]' }).Count -gt 0)
+            $result.window_with_title = $titled
+            $result.marker_ok = $markerOk
+            $result.fixture_verdict = if ($titled.Count -gt 0 -and $markerOk) { 'PASS' } else { 'FAIL' }
+            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 marker missing or trailing backslash lost' } else { $null }
+            return $result
+        }
+        'deny-commit' { return [ordered]@{ denied=@(Set-JumpListCommitDenied); next='change the profile set (config), reload the app, then snapshot' } }
+        'allow-commit' {
+            $script:Restore = [ordered]@{ acl=(Restore-JumpListAcl) }
+            return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($script:Restore.acl.restored) { 'PASS' } else { 'FAIL' }) }
+        }
+        'portable' {
+            $config = Read-Record 'jumplist-user-config'
+            if (-not $config -or $config.restored) { throw 'Write the fixture configuration first (-Action config).' }
+            $copy = Copy-PortableApp (Join-Path $script:RunRoot ('portable-jl-' + $Label))
+            $listsBefore = Get-JumpListFiles
+            $registryBefore = Registry-Snapshot
+            $started = Start-OwnedApp -Exe $copy.exe -Private $null -RealProfile -Arguments @()
+            $process = $started.process
+            $name = 'jumplist-portable-' + $Label
+            $record = New-AppRecord $process $copy.exe 'PORTABLE_COPY' $null $null $null @()
+            $record.record_name = $name
+            $record.aumid = $copy.aumid
+            try { $record.main_window = Wait-AppWindow $process 45; $record.status = 'RUNNING' }
+            finally { Save-Record $name $record | Out-Null; $process.Dispose() }
+            Start-Sleep -Seconds 8
+            $listsAfter = Get-JumpListFiles
+            $registryAfter = Registry-Snapshot
+            $close = Close-JumpListApp (Read-Record $name)
+            $before = @($listsBefore.files | Where-Object { $_.gx } | ForEach-Object { $_.name + '=' + $_.sha256 }) -join ';'
+            $after = @($listsAfter.files | Where-Object { $_.gx } | ForEach-Object { $_.name + '=' + $_.sha256 }) -join ';'
+            $registryUnchanged = (Json-Canonical $registryBefore) -ceq (Json-Canonical $registryAfter)
+            if ($close.closed_normally) { Remove-Item -LiteralPath (Split-Path -Parent $copy.exe) -Recurse -Force }
+            $ok = ($before -ceq $after) -and $registryUnchanged -and $close.closed_normally
+            return [ordered]@{ copy=$copy; jump_lists_unchanged=($before -ceq $after); registry_unchanged=$registryUnchanged; close=$close;
+                jump_lists_before=$listsBefore; jump_lists_after=$listsAfter; fixture_verdict=$(if ($ok) { 'PASS' } else { 'FAIL' });
+                fixture_reason=$(if ($ok) { $null } else { 'the portable copy changed a jump list or the registration, or did not close normally' }) }
+        }
+        'stop' {
+            $closes = @(Get-JumpListAppRecords | Where-Object { $_.status -ceq 'RUNNING' } | ForEach-Object { Close-JumpListApp $_ })
+            $bad = @($closes | Where-Object { -not $_.closed_normally -and -not $_.already_exited })
+            return [ordered]@{ closes=$closes; fixture_verdict=$(if ($bad.Count -eq 0) { 'PASS' } else { 'FAIL' }) }
+        }
+        'restore' {
+            $alive = @(Get-JumpListAppRecords | Where-Object { $_.status -ceq 'RUNNING' -and (Get-OwnedProcess $_) })
+            if ($alive.Count -gt 0) { throw 'Stop the owned jump list apps before restoring the configuration.' }
+            $script:Restore = [ordered]@{ config=(Restore-UserConfig); acl=(Restore-JumpListAcl) }
+            $ok = $script:Restore.config.restored -and $script:Restore.acl.restored
+            return [ordered]@{ restore=$script:Restore; jump_lists=(Get-JumpListFiles); fixture_verdict=$(if ($ok) { 'PASS' } else { 'FAIL' });
+                note='Unpin the taskbar button by hand if it was pinned for the cold start.' }
+        }
+    }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $script:RunRoot = Join-Path $env:LOCALAPPDATA ('GXVMValidation\Runs\' + $RunId)
-$script:AppDir = if ($Scope -eq 'Machine') { Join-Path $env:ProgramFiles ('GXVMValidation\' + $RunId) } else { Join-Path $env:LOCALAPPDATA ('GXVMValidation\Apps\' + $RunId) }
+$script:AppBase = if ($Scope -eq 'Machine') { Join-Path $env:ProgramFiles ('GXVMValidation\' + $RunId) } else { Join-Path $env:LOCALAPPDATA ('GXVMValidation\Apps\' + $RunId) }
+$script:AppDir = $script:AppBase
+if (Get-PathPresetName $PathPreset) { $script:AppDir = Join-Path $script:AppBase (Get-PathPresetName $PathPreset) }
 Assert-NoReparse $script:RunRoot
 Assert-NoReparse $script:AppDir
 $script:ExportRoot = $null
@@ -2398,6 +2787,11 @@ $statePath = Join-Path $script:RunRoot 'state.json'
 if (Test-Path -LiteralPath $statePath) {
     # UTF-8: state values (such as app_dir) may hold non-ASCII text.
     $script:State = Read-JsonFile $statePath
+    # A run installed below a path preset keeps that AppDir without repeating -PathPreset.
+    if ($PathPreset -ceq 'none' -and ([string]$script:State.app_dir).StartsWith($script:AppBase + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        $script:AppDir = [string]$script:State.app_dir
+        Assert-NoReparse $script:AppDir
+    }
     if ($script:State.owner -ne $script:Owner -or $script:State.uuid -ne $identity.guest_uuid -or
         $script:State.sid -ne $sid -or $script:State.scope -ne $Scope -or $script:State.app_dir -ne $script:AppDir) {
         throw 'Existing run belongs to a different VM/user/scope/application.'
@@ -2477,6 +2871,7 @@ try {
         'run-config' { $report.result = Invoke-RunConfig }
         'osc52' { $report.result = Invoke-Osc52 }
         'toast-matrix' { $report.result = Invoke-ToastMatrix }
+        'jumplist-matrix' { $report.result = Invoke-JumpListMatrix }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
