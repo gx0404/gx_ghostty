@@ -1578,6 +1578,7 @@ class ScenarioRun:
         self.saved_clipboard: str | None = None
         self.clipboard_changed = False
         self.startup: dict[str, float] = {}
+        self.held_buttons: list[str] = []  # pressed by mouse_down, not yet released by mouse_up
 
     # -- addressing -----------------------------------------------------------
 
@@ -1673,13 +1674,32 @@ class ScenarioRun:
 
     def do_mouse_down(self, p):
         x, y = self.point(p)
-        self.gui.mouse(x, y, button=p.get("button", "left"), action="down", mods=p.get("mods", []))
+        button = p.get("button", "left")
+        self.gui.mouse(x, y, button=button, action="down", mods=p.get("mods", []))
+        self.held_buttons.append(button)
         return f"({x}, {y})"
 
     def do_mouse_up(self, p):
         x, y = self.point(p)
-        self.gui.mouse(x, y, button=p.get("button", "left"), action="up", mods=p.get("mods", []))
+        button = p.get("button", "left")
+        self.gui.mouse(x, y, button=button, action="up", mods=p.get("mods", []))
+        if button in self.held_buttons:
+            self.held_buttons.remove(button)
         return f"({x}, {y})"
+
+    def release_held_buttons(self, aborted: bool) -> list[str]:
+        """Button-ups for presses a mouse_down step left held (e.g. W12 stopped before its
+        mouse_up). Like Instance.drag: no pointer move, no activation, no further down."""
+        released = []
+        while self.held_buttons:
+            button = self.held_buttons.pop()
+            _, up, data = MOUSE_BUTTONS[button]
+            try:
+                self.gui.release_input([win32().mouse_input(up, data=data)], button, aborted)
+                released.append(button)
+            except Exception as exc:  # noqa: BLE001 - keep closing the instance and recording evidence
+                released.append(f"{button}: release failed: {exc}")
+        return released
 
     def do_move(self, p):
         x, y = self.point(p)
@@ -1831,6 +1851,7 @@ class ScenarioRun:
                                   "expect": scenario.expect, "status": "ok"}
         env_dir = self.out_dir / "env"
         prepare_env_dir(env_dir, fresh=True)
+        completed = False
         try:
             self.instance = launch(self.exe, env_dir, config=scenario.full_config(), env=scenario.env, args=scenario.args)
             report["pid"] = self.instance.pid
@@ -1851,12 +1872,15 @@ class ScenarioRun:
                 self.results.append({"index": index, "step": step.describe(), "ok": True,
                                      "seconds": round(time.monotonic() - began, 3), "detail": detail})
                 print(f"{TAG} {scenario.id} {index}/{len(scenario.steps)} {step.action}: {detail}", flush=True)
+            completed = True
         except GuiError as exc:
             report["status"] = "failed"
             report["reason"] = str(exc)
             print(f"{TAG} {scenario.id} FAILED: {exc}", file=sys.stderr, flush=True)
             self.capture_failure()
         finally:
+            if self.instance is not None and self.held_buttons:
+                report["released_buttons"] = self.release_held_buttons(aborted=not completed)
             if self.instance is not None and not self.keep_open:
                 try:
                     report["closed"] = self.instance.close()

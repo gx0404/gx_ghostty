@@ -5,6 +5,8 @@ the input guard. Nothing here starts Ghostty or sends input; the Win32 backend i
 
 from __future__ import annotations
 
+import contextlib
+import io
 import struct
 import json
 import os
@@ -585,6 +587,46 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual([("unicode", 0x4E2D, False), ("unicode", 0x4E2D, True)], han)
         self.assertEqual([("key", 0x11, False), ("mouse", 0xC001, 5, 6, 0), ("mouse", 0x80, 0, 0, 2),
                           ("mouse", 0x100, 0, 0, 2), ("key", 0x11, True)], click)
+
+
+class ScenarioReleaseTests(unittest.TestCase):
+    BODY = 'id = "W90"\ntitle = "t"\nconfig = "language = en"\n'
+
+    def run_scenario(self, steps: str, capture_error: bool):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-release.toml"
+            path.write_text(self.BODY + steps, encoding="utf-8")
+            run = gui.ScenarioRun(gui.load_scenario(path), Path("ghostty.exe"), Path(tmp) / "out")
+            instance = mock.Mock()
+            instance.log = Path(tmp) / "absent.log"
+            instance.popups.return_value = []
+            instance.point.return_value = (5, 6)
+            if capture_error:
+                instance.capture_window.side_effect = gui.GuiError("capture failed")
+            else:
+                instance.capture_window.return_value.save_png.side_effect = lambda target: target
+            fake = FakeWin32(4242, 4242)
+            with mock.patch.object(gui, "launch", return_value=instance), mock.patch.object(gui, "win32", return_value=fake), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                report = run.run()
+            return report, instance
+
+    def test_scenario_stopped_after_mouse_down_releases_the_button_only(self):
+        down = '[[step]]\naction = "mouse_down"\nbutton = "x2"\nx = 5\ny = 6\n'
+        report, instance = self.run_scenario(down + '[[step]]\naction = "capture"\nname = "held"\n', capture_error=True)
+        self.assertEqual("failed", report["status"])
+        self.assertEqual(["x2"], report["released_buttons"])
+        instance.release_input.assert_called_once_with([("mouse", 0x100, 0, 0, 2)], "x2", True)
+        instance.close.assert_called_once()
+        up = '[[step]]\naction = "mouse_up"\nbutton = "x2"\nx = 5\ny = 6\n'
+        report, instance = self.run_scenario(down + up + '[[step]]\naction = "capture"\nname = "done"\n', capture_error=False)
+        self.assertEqual("ok", report["status"])
+        self.assertNotIn("released_buttons", report)
+        instance.release_input.assert_not_called()
+        # A completed scenario that never released its press is cleaned up too, without the abort label.
+        report, instance = self.run_scenario(down + '[[step]]\naction = "capture"\nname = "left-held"\n', capture_error=False)
+        self.assertEqual(["x2"], report["released_buttons"])
+        instance.release_input.assert_called_once_with([("mouse", 0x100, 0, 0, 2)], "x2", False)
 
 
 @unittest.skipUnless(sys.platform == "win32", "the ctypes structures are Windows only")
