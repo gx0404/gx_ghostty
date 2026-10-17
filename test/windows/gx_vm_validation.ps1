@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account')]
+                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -67,7 +67,9 @@ param(
     # jumplist-matrix observe: profile key (p1-p6) whose launch is expected, or none.
     [ValidatePattern('^(p[1-6]|none)?$')][string]$ExpectProfile = '',
     # cross-account peer: also try to open each visible Ghostty pipe as a client (then close it).
-    [switch]$ProbePipes
+    [switch]$ProbePipes,
+    # dpi set: the custom scaling (LogPixels) for this user; effective after signing in again.
+    [ValidateSet('96','120','144','168','192')][string]$Dpi = '96'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1270,7 +1272,7 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account')
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')
 $script:Restore = $null
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
@@ -1586,6 +1588,10 @@ function Get-PhaseState([string]$When) {
             $state.records = @(Get-OwnedRecordSummary 'cross-')
             $state.public_root = [ordered]@{ path=(Get-CrossRoot); exists=(Test-Path -LiteralPath (Get-CrossRoot)) }
             $state.pipes = @(Get-GhosttyPipes)
+        }
+        'dpi' {
+            $state.desktop = Get-DpiSettings
+            $state.effective = Get-EffectiveDpi
         }
     }
     return $state
@@ -3140,6 +3146,125 @@ function Invoke-CrossAccount {
     }
 }
 
+# ---- dpi: this user's custom scaling (applies at the next sign-in) --------
+
+$script:DesktopKey = 'Control Panel\Desktop'
+$script:PerMonitorKey = 'Control Panel\Desktop\PerMonitorSettings'
+
+$script:DpiSource = @'
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+public static class GxVmDpi {
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern uint GetDpiForSystem();
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT point, uint flags);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint x, out uint y);
+    // Read-only, under a per-monitor-v2 thread context so nothing is virtualized to 96.
+    public static Hashtable Effective() {
+        Hashtable facts = new Hashtable();
+        IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            facts["system"] = (long)GetDpiForSystem();
+            uint x, y;
+            int hr = GetDpiForMonitor(MonitorFromPoint(new POINT(), 1), 0, out x, out y);
+            facts["primary_monitor_hr"] = (long)hr;
+            if (hr == 0) facts["primary_monitor"] = (long)x;
+            facts["thread_context_set"] = previous != IntPtr.Zero;
+        } finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
+        return facts;
+    }
+}
+'@
+
+function Get-EffectiveDpi {
+    if (-not ('GxVmDpi' -as [type])) { Add-Type -TypeDefinition $script:DpiSource -Language CSharp }
+    return [GxVmDpi]::Effective()
+}
+
+function Get-DpiValue([string]$Name) {
+    $base = Open-HkcuBase
+    try {
+        $key = $base.OpenSubKey($script:DesktopKey, $false)
+        try {
+            if ($null -eq $key -or $null -eq $key.GetValue($Name)) { return [ordered]@{ exists=$false } }
+            return [ordered]@{ exists=$true; kind=[string]$key.GetValueKind($Name); data=$key.GetValue($Name) }
+        } finally { if ($key) { $key.Dispose() } }
+    } finally { $base.Dispose() }
+}
+
+function Get-DpiSettings {
+    return [ordered]@{ LogPixels=(Get-DpiValue 'LogPixels'); Win8DpiScaling=(Get-DpiValue 'Win8DpiScaling'); per_monitor=(Read-HkcuTree $script:PerMonitorKey) }
+}
+
+function Set-DpiValue([string]$Name, $Value) {
+    # $Value is a Get-DpiValue record (exists/kind/data); exists=$false deletes the value.
+    $base = Open-HkcuBase
+    try {
+        $key = $base.OpenSubKey($script:DesktopKey, $true)
+        try {
+            if (-not $Value.exists) { $key.DeleteValue($Name, $false) }
+            else {
+                $kind = [Microsoft.Win32.RegistryValueKind][string]$Value.kind
+                $data = if ($kind -eq [Microsoft.Win32.RegistryValueKind]::DWord) { [int]$Value.data } else { [string]$Value.data }
+                $key.SetValue($Name, $data, $kind)
+            }
+        } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+}
+
+function Invoke-Dpi {
+    # set: back up LogPixels, Win8DpiScaling and PerMonitorSettings once, then
+    # apply custom scaling -Dpi; status: values and the effective DPI of this
+    # sign-in; restore: put back exactly what was backed up (96 when nothing
+    # was set). Signing out and in again is the coordinator's step.
+    $step = Assert-Action @('set','status','restore') 'status'
+    $record = Read-Record 'dpi'
+    switch ($step) {
+        'set' {
+            if (-not $record -or $record.restored) {
+                $record = [ordered]@{ before=(Get-DpiSettings); before_effective=(Get-EffectiveDpi); backed_up_utc=[DateTime]::UtcNow.ToString('o'); restored=$false; applied=@() }
+                Save-Record 'dpi' $record | Out-Null
+                $record = Read-Record 'dpi'
+            }
+            $base = Open-HkcuBase
+            try { $base.DeleteSubKeyTree($script:PerMonitorKey, $false) } finally { $base.Dispose() }
+            $value = [int]$Dpi
+            Set-DpiValue 'LogPixels' ([ordered]@{ exists=$true; kind='DWord'; data=$value })
+            Set-DpiValue 'Win8DpiScaling' ([ordered]@{ exists=$true; kind='DWord'; data=$(if ($value -eq 96) { 0 } else { 1 }) })
+            Set-RecordField $record 'applied' @(@($record.applied) + [ordered]@{ dpi=$value; utc=[DateTime]::UtcNow.ToString('o') })
+            Set-RecordField $record 'target' $value
+            Save-Record 'dpi' $record | Out-Null
+            return [ordered]@{ target=$value; now=(Get-DpiSettings); effective=(Get-EffectiveDpi); next='sign out and sign in again, then -Action status' }
+        }
+        'status' {
+            $effective = Get-EffectiveDpi
+            $expected = if ($null -eq $record) { $null } elseif ($record.restored) { [long]$record.before_effective.system } else { [long]$record.target }
+            $verdict = if ($null -eq $expected) { 'OBSERVED' } elseif ([long]$effective['system'] -eq $expected) { 'PASS' } else { 'PENDING_SIGN_IN' }
+            return [ordered]@{ settings=(Get-DpiSettings); effective=$effective; expected_system_dpi=$expected; record=$record; fixture_verdict=$verdict }
+        }
+        'restore' {
+            if (-not $record) { return [ordered]@{ restored=$true; note='this run never changed the scaling' } }
+            if (-not $record.restored) {
+                Set-DpiValue 'LogPixels' $record.before.LogPixels
+                Set-DpiValue 'Win8DpiScaling' $record.before.Win8DpiScaling
+                $base = Open-HkcuBase
+                try { Restore-AnyKeyTree $base $script:PerMonitorKey $record.before.per_monitor } finally { $base.Dispose() }
+                $now = Get-DpiSettings
+                $equal = (Json-Normal $now) -ceq (Json-Normal $record.before)
+                Set-RecordField $record 'restored' $equal
+                Set-RecordField $record 'restored_utc' ([DateTime]::UtcNow.ToString('o'))
+                Set-RecordField $record 'after_restore' $now
+                Save-Record 'dpi' $record | Out-Null
+            }
+            $script:Restore = [ordered]@{ dpi_settings_restored=[bool]$record.restored; before=$record.before; before_effective=$record.before_effective }
+            return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($record.restored) { 'PASS' } else { 'FAIL' });
+                next='sign out and sign in again, then -Action status (expects the system DPI recorded before the first set)' }
+        }
+    }
+}
+
 # This must remain before all account/registry mutations and directory creation.
 $identity = Assert-GxVm $Manifest
 if ($Scope -eq 'Machine' -and -not (Test-Elevated)) { throw 'Machine-scope fixtures require elevation inside the verified VM.' }
@@ -3252,6 +3377,7 @@ try {
         'jumplist-matrix' { $report.result = Invoke-JumpListMatrix }
         'narrator' { $report.result = Invoke-Narrator }
         'cross-account' { $report.result = Invoke-CrossAccount }
+        'dpi' { $report.result = Invoke-Dpi }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
