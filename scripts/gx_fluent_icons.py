@@ -289,20 +289,24 @@ def generate(root: Path) -> bytes:
     return "\n".join(lines).encode()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--check", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         data = generate(args.root)
         path = args.root / BASE / "paths.zig"
         previous = path.read_bytes().replace(b"\r\n", b"\n") if path.exists() else None
         if args.check and previous != data:
             parser.exit(1, "Fluent paths are missing or stale; run scripts/gx_fluent_icons.py\n")
-        if not args.check and previous != data:
+        if args.check:
+            print("PASS: Fluent inputs and generated paths")
+        elif previous != data:
             path.write_bytes(data)
-        print("PASS: Fluent inputs and generated paths" if args.check else "Generated Fluent paths")
+            print(f"Generated Fluent paths: {BASE}/paths.zig")
+        else:
+            print(f"Fluent paths are up to date; {BASE}/paths.zig not written")
     except (OSError, ValueError) as exc:
         parser.exit(2, f"ERROR: {exc}\n")
     return 0

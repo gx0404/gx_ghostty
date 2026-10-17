@@ -258,6 +258,7 @@ jobs:
       - name: Build the GTK app from the source tarball
         env:
           GX_VERSION_STRING: ${{ needs.prepare.outputs.version_string }}
+          PYTHONDONTWRITEBYTECODE: '1'
         run: |
           export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-global"
           export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/gx-zig-local"
@@ -273,6 +274,7 @@ jobs:
             "-Dversion-string=$GX_VERSION_STRING"
           "$stage/$name/usr/bin/ghostty" +version | tee "$RUNNER_TEMP/gx-version.txt"
           grep -Fx "  - version: $GX_VERSION_STRING" "$RUNNER_TEMP/gx-version.txt"
+          python3 scripts/gx_release.py linux-doc --dest "$stage/$name/usr/share/doc/ghostty-gx"
           tar -C "$stage" -czf "$RUNNER_TEMP/gx-out/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
