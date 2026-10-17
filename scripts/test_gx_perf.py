@@ -698,6 +698,37 @@ class ExperimentTests(unittest.TestCase):
             capture.drain(['scrollbar.paint'],minimum=.6,quiet=.5)
         self.assertGreaterEqual(now[0],.9)
 
+    def test_unsettled_metric_window_is_counted_not_a_driver_error(self):
+        instance = mock.Mock()
+        instance.log = self.root / 'busy.log'
+        instance.log.write_text('')
+        capture = gx_perf.CaptureRun(instance, self.root, {'baseline': False, 'diagnostic': False})
+        now = [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+            with instance.log.open('a') as stream:
+                stream.write('info(gx_perf): metric scrollbar.paint 1\n')
+        with mock.patch.object(gx_perf.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep):
+            self.assertFalse(capture.drain(['scrollbar.paint'], minimum=.6, quiet=.5))
+        self.assertTrue(capture.report['measurement_unsettled'])
+        self.assertEqual('timeout', capture.report['drains'][-1]['status'])
+        capture.count(instance.log.read_text(), 'scrollbar.paint')
+        args = self.args()
+        args.case = 'p3'
+        self.assertEqual('FAIL', gx_perf.absolute_gate(args, capture)['status'])
+        gui = self.fake_gui()
+        def measure(_, instance, capture, args):
+            capture.report['measurement_unsettled'] = True
+            capture.report['drains'] = [{'metrics': ['scrollbar.paint'], 'status': 'timeout'}]
+            capture.add('scrollbar.paint', 3)
+        with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(4, gx_perf.run_experiment(args, gui))
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual([{'label': 'build', 'run': 1, 'metrics': [['scrollbar.paint']]}], result['unsettled_runs'])
+        self.assertIn('Unsettled metric windows', (args.out / 'SUMMARY.txt').read_text())
+
     def test_legacy_win32_guard_failure_is_not_retried(self):
         import gx_win_gui as gui
         out = self.root / 'legacy'

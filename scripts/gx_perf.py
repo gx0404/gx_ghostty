@@ -1414,10 +1414,16 @@ class CaptureRun:
             if signature != previous:
                 previous, last_change = signature, now
             if now - began >= minimum and now - last_change >= quiet:
-                self.report.setdefault('drains', []).append({'metrics': list(names), 'seconds': now - began, 'quiet_seconds': quiet})
-                return
+                self.report.setdefault('drains', []).append({'metrics': list(names), 'seconds': now - began,
+                                                             'quiet_seconds': quiet, 'status': 'settled'})
+                return True
             if now - began >= timeout:
-                raise PerfError(f'metric log did not settle: {names}')
+                # Still changing at the limit: count what the window holds and let the
+                # numerical gate judge it, so a real regression is a FAIL, not a driver error.
+                self.report.setdefault('drains', []).append({'metrics': list(names), 'seconds': now - began,
+                                                             'quiet_seconds': quiet, 'status': 'timeout'})
+                self.report['measurement_unsettled'] = True
+                return False
             time.sleep(0.05)
 
     def mark(self) -> bytes:
@@ -1744,6 +1750,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     sets = {label: Samples() for label in labels}
     missing = {label: {} for label in labels}
     preconditions = {label: {} for label in labels}
+    unsettled = []
     resources = []
     for run, label in alternate(labels, args.runs):
         target = out / label / f'run-{run:02d}'
@@ -1801,6 +1808,9 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 missing[label].update(report['missing_metrics'])
                 for name, info in report.get('missing_preconditions', {}).items():
                     preconditions[label].setdefault(name, {**info, 'runs': []})['runs'].append(run)
+                if report.get('measurement_unsettled'):
+                    unsettled.append({'label': label, 'run': run,
+                                      'metrics': [d['metrics'] for d in report.get('drains', []) if d.get('status') == 'timeout']})
                 # A dedicated derived file is the only round-level summary input.
                 lines = [f"metric {name} {value} {capture.samples.units[name]}".rstrip()
                          for name, values in capture.samples.values.items() for value in values]
@@ -1839,11 +1849,15 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         texts.append(text)
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
     batch['missing_preconditions'] = {label: items for label, items in preconditions.items() if items}
+    batch['unsettled_runs'] = unsettled
     text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
     text += '\nAbsolute gates: ' + json.dumps(batch['absolute_gates'], ensure_ascii=False) + '\n'
     if batch['missing_preconditions']:
         text += ('Missing preconditions (historical arm only; recorded, not a gate): ' +
                  json.dumps(batch['missing_preconditions'], ensure_ascii=False) + '\n')
+    if unsettled:
+        text += ('Unsettled metric windows (still changing at the 3 s limit; counted as observed): ' +
+                 json.dumps(unsettled, ensure_ascii=False) + '\n')
     text += ('Driver result: ' + ('complete' if batch['valid'] else 'incomplete (driver error)') +
              ('; absolute gate FAIL observed' if batch['gate_failed'] else '') + f"; exit {batch['exit']}\n")
     if resources:
