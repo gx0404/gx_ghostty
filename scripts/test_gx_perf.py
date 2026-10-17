@@ -93,6 +93,30 @@ WIN32_LOG = """23:59:59.900 [1] info: ghostty version=1.3.2
 
 
 class ParseTests(unittest.TestCase):
+    def test_prefixed_counts_gauges_and_time_conflicts(self):
+        samples = gx_perf.parse_text("12:00:00.123 [42] info(gx_perf): metric remote.frame_bytes 1048576\r\n"
+                                     "info(gx_perf): metric remote.frame_bytes 8\ninfo(gx_perf): remote.map 123us\n")
+        text, report = gx_perf.summary_table(samples)
+        self.assertEqual(1048584, report['remote.frame_bytes']['sum'])
+        self.assertEqual('', report['remote.frame_bytes']['unit'])
+        self.assertNotIn('sum', report['remote.map'])
+        self.assertIn('sum', text)
+        _, comparison = gx_perf.compare_table(samples, samples)
+        self.assertEqual(1048584, comparison['remote.frame_bytes']['old']['sum'])
+        for lines in ("info(gx_perf): metric a 1\ninfo(gx_perf): a 2us\n",
+                      "info(gx_perf): a 2us\ninfo(gx_perf): metric a 1\n"):
+            with self.assertRaisesRegex(gx_perf.PerfError, 'conflict'):
+                gx_perf.parse_text(lines)
+
+    def test_label_environment_overrides_are_local(self):
+        result = gx_perf.label_environments(['old', 'new'], ['GSK_RENDERER=ngl'],
+                                           ['new:GSK_RENDERER=cairo', 'new:EMPTY='], gx_wsl.env_assignments)
+        self.assertEqual({'GSK_RENDERER': 'ngl'}, result['old'])
+        self.assertEqual({'GSK_RENDERER': 'cairo', 'EMPTY': ''}, result['new'])
+        for value in ('absent:X=1', 'old', 'old:1INVALID=x'):
+            with self.assertRaises((gx_perf.PerfError, gx_wsl.GxWslError)):
+                gx_perf.label_environments(['old'], [], [value], gx_wsl.env_assignments)
+
     def test_lines_of_every_source(self):
         samples = gx_perf.parse_text(LOG + PERF_TXT.replace("\n", "\r\n"))
         self.assertEqual([183.456, 200.0], samples.values["first_frame"])

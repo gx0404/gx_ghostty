@@ -54,6 +54,7 @@ TAG = "[gx-perf]"
 GX_PERF_RE = re.compile(
     r"\(gx_perf\):\s+(?P<name>[A-Za-z0-9_.:-]+)[\s=]+(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>ns|us|ms|s)\b")
 METRIC_RE = re.compile(r"^metric\s+(?P<name>[A-Za-z0-9_.:-]+)\s+(?P<value>-?\d+(?:\.\d+)?)(?:\s+(?P<unit>s|ms|us))?\s*$")
+GX_COUNT_RE = re.compile(r"\(gx_perf\):\s+metric\s+(?P<name>[A-Za-z0-9_.:-]+)\s+(?P<value>-?\d+(?:\.\d+)?)\s*$")
 WINDOW_SHOWN_RE = re.compile(r"window shown after (?P<value>\d+)ms first_frame=(?P<drawn>true|false)")
 SAMPLE_SUFFIXES = (".log", ".txt")
 ENV_MARKER = ".gx-win-gui-env"  # scripts/gx_win_gui.py::ENV_MARKER
@@ -144,6 +145,10 @@ def parse_text(text: str, samples: Samples | None = None) -> Samples:
         match = GX_PERF_RE.search(line)
         if match:
             samples.add(match.group("name"), float(match.group("value")), match.group("unit"))
+            continue
+        match = GX_COUNT_RE.search(line)
+        if match:
+            samples.add(match.group("name"), float(match.group("value")), None)
             continue
         match = METRIC_RE.match(line.strip())
         if match:
@@ -380,9 +385,12 @@ def p90(values: Sequence[float]) -> float:
     return ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
 
 
-def stats(values: Sequence[float]) -> dict[str, float]:
-    return {"n": len(values), "median": statistics.median(values), "p90": p90(values), "min": min(values),
-            "max": max(values)}
+def stats(values: Sequence[float], unit: str = "ms") -> dict[str, float]:
+    result = {"n": len(values), "median": statistics.median(values), "p90": p90(values), "min": min(values),
+              "max": max(values)}
+    if not unit:
+        result["sum"] = sum(values)
+    return result
 
 
 def fmt(value: float, unit: str) -> str:
@@ -390,17 +398,18 @@ def fmt(value: float, unit: str) -> str:
 
 
 def summary_table(samples: Samples) -> tuple[str, dict]:
-    rows = [f"{'metric':<34} {'unit':<4} {'n':>4} {'median':>10} {'p90':>10} {'min':>10} {'max':>10}"]
+    rows = [f"{'metric':<34} {'unit':<4} {'n':>4} {'median':>10} {'p90':>10} {'min':>10} {'max':>10} {'sum':>10}"]
     report = {}
     for name in sorted(samples.values):
         values = samples.values[name]
         if not values:
             continue
         unit = samples.units[name]
-        summary = stats(values)
+        summary = stats(values, unit)
         report[name] = {"unit": unit, **summary}
         rows.append(f"{name:<34} {unit:<4} {summary['n']:>4} {fmt(summary['median'], unit):>10} "
-                    f"{fmt(summary['p90'], unit):>10} {fmt(summary['min'], unit):>10} {fmt(summary['max'], unit):>10}")
+                    f"{fmt(summary['p90'], unit):>10} {fmt(summary['min'], unit):>10} {fmt(summary['max'], unit):>10} "
+                    f"{fmt(summary['sum'], unit) if not unit else '-':>10}")
     return "\n".join(rows) + "\n", report
 
 
@@ -410,12 +419,12 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
         if old.units[name] != new.units[name]:
             raise PerfError(f"metric {name}: time/count unit conflict")
     rows = [f"{'metric':<34} {'unit':<4} {a + ' n':>6} {a + ' med':>10} {a + ' p90':>10} "
-            f"{b + ' n':>6} {b + ' med':>10} {b + ' p90':>10} {'Δ med':>10} {'Δ%':>7}"]
+            f"{b + ' n':>6} {b + ' med':>10} {b + ' p90':>10} {'Δ med':>10} {'Δ%':>7} {a + ' sum':>10} {b + ' sum':>10}"]
     report = {}
     for name in sorted(set(old.values) | set(new.values)):
         unit = old.units.get(name) or new.units.get(name, "")
-        left = stats(old.values[name]) if old.values.get(name) else None
-        right = stats(new.values[name]) if new.values.get(name) else None
+        left = stats(old.values[name], unit) if old.values.get(name) else None
+        right = stats(new.values[name], unit) if new.values.get(name) else None
         entry: dict = {"unit": unit, a: left, b: right}
         cells = []
         for side in (left, right):
@@ -430,6 +439,7 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
         else:
             cells += [f"{'-':>10}", f"{'-':>7}"]
         report[name] = entry
+        cells += [f"{fmt(side['sum'], unit) if side and not unit else '-':>10}" for side in (left, right)]
         rows.append(f"{name:<34} {unit:<4} " + " ".join(cells))
     return "\n".join(rows) + "\n", report
 
@@ -486,6 +496,21 @@ def labels_for(count: int, given: Sequence[str]) -> list[str]:
     if len(set(labels)) != len(labels) or not all(label not in (".", "..") and re.fullmatch(r"[A-Za-z0-9._-]+", label) for label in labels):
         raise PerfError("labels must be distinct and use letters, digits, '.', '_' or '-'")
     return labels
+
+
+def label_environments(labels: Sequence[str], common: Sequence[str], overrides: Sequence[str], parse) -> dict:
+    """Resolve label-local overrides without mutating the caller's environment."""
+    parse(common)
+    base = dict(item.split("=", 1) for item in common)
+    result = {label: dict(base) for label in labels}
+    for item in overrides:
+        label, separator, assignment = item.partition(":")
+        if not separator or label not in result:
+            raise PerfError(f"--label-env requires a known LABEL:NAME=VALUE: {item}")
+        parse([assignment])
+        name, value = assignment.split("=", 1)
+        result[label][name] = value
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +575,10 @@ def run_win32(args: argparse.Namespace) -> int:
         if not exe.is_file():
             raise PerfError(f"{exe} does not exist")
     labels = labels_for(len(exes), args.label)
+    try:
+        environments = label_environments(labels, args.env, args.label_env, gui.env_assignments)
+    except gui.UsageError as exc:
+        raise PerfError(str(exc)) from None
     config = Path(args.config).read_text(encoding="utf-8") if args.config else DEFAULT_WIN32_CONFIG
     config += "" if config.endswith("\n") else "\n"
     config += gui.HARNESS_CONFIG
@@ -561,7 +590,7 @@ def run_win32(args: argparse.Namespace) -> int:
         gui.prepare_env_dir(env_dir, fresh=True)
         print(f"{TAG} {label}: warm-up run (discarded)", flush=True)
         try:
-            measure_win32(gui, by_label[label], env_dir, config, 0, env)
+            measure_win32(gui, by_label[label], env_dir, config, 0, environments[label])
         except gui.GuiError as exc:
             print(f"{TAG} {label}: warm-up failed: {exc}", file=sys.stderr)
     for run, label in alternate(labels, args.runs):
@@ -569,7 +598,7 @@ def run_win32(args: argparse.Namespace) -> int:
         env_dir = out / label / "env"
         for attempt in (1, 2):
             try:
-                lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, env)
+                lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label])
                 break
             except gui.GuiError as exc:
                 print(f"{TAG} {label} run {run} attempt {attempt} failed: {exc}", file=sys.stderr)
@@ -577,7 +606,9 @@ def run_win32(args: argparse.Namespace) -> int:
         if lines is None:
             failures += 1
             continue
+        lines.insert(0, "# environment " + json.dumps(environments[label], sort_keys=True))
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_json(target.with_suffix(".json"), {"label": label, "run": run, "env": environments[label]})
         log = gui.log_path(env_dir)
         if log.is_file():
             target.with_suffix(".log").write_text(log.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
@@ -598,12 +629,16 @@ def run_gtk(args: argparse.Namespace) -> int:
     if not 1 <= len(clones) <= 2:
         raise PerfError("give one or two --clone")
     labels = labels_for(len(clones), args.label)
+    try:
+        environments = label_environments(labels, args.env, args.label_env, gx_wsl.env_assignments)
+    except gx_wsl.GxWslError as exc:
+        raise PerfError(str(exc)) from None
     out = Path(args.out)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise PerfError(f"{out}: GTK output must be new or empty; old evidence is never deleted")
     out.mkdir(parents=True, exist_ok=True)
     batch = {"schema": "gx-gtk-runs-v1", "planned_runs": args.runs, "labels": labels, "valid": False,
-             "warmup": "none (GTK has no automatic warm-up)", "order": "AB/BA",
+             "warmup": "none (GTK has no automatic warm-up)", "order": "AB/BA", "env": environments,
              "runs": [{"run": run, "label": label, "path": f"{label}/run-{run:02d}", "exit": None, "status": "pending"}
                       for run, label in alternate(labels, args.runs)]}
     write_json(out / "gtk-runs.json", batch)
@@ -613,8 +648,9 @@ def run_gtk(args: argparse.Namespace) -> int:
         clone = clones[labels.index(label)]
         target = out / item["path"]
         argv = ["--clone", clone, "smoke", "--perf", "--out", str(target), "--name", "perf"]
-        for assignment in args.env:
-            argv += ["--env", assignment]
+        item["env"] = environments[label]
+        for name, value in environments[label].items():
+            argv += ["--env", f"{name}={value}"]
         if args.distro:
             argv[:0] = ["--distro", args.distro]
         print(f"{TAG} {label} run {run}: gx_wsl.py {' '.join(argv)}", flush=True)
@@ -768,6 +804,7 @@ def build_parser() -> argparse.ArgumentParser:
     win32.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
                        help="environment variable for every run, e.g. GHOSTTY_GX_PERF=1 (repeatable)")
     win32.add_argument("--json", type=Path)
+    win32.add_argument("--label-env", action="append", default=[], metavar="LABEL:NAME=VALUE")
     gtk = commands.add_parser("gtk", allow_abbrev=False, help="measure GTK builds in WSL clones")
     gtk.add_argument("--clone", action="append", required=True, metavar="PATH")
     gtk.add_argument("--label", action="append", default=[])
@@ -777,6 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
     gtk.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
                      help="passed to every `smoke --perf` as --env (repeatable)")
     gtk.add_argument("--json", type=Path)
+    gtk.add_argument("--label-env", action="append", default=[], metavar="LABEL:NAME=VALUE")
     return parser
 
 
