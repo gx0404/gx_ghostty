@@ -848,7 +848,9 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
         check("slots", lambda: probe.slots(args.slot_root), lambda free: (free, "all four existing locks probed and released" if free else "slot occupied"))
     else:
         check('slots', lease.verify, lambda held: (held, 'all four locks held by this batch' if held else 'batch lock ownership lost'))
-    check('session', probe.session, lambda data: (data['interactive_console'], 'active console session required'))
+    check('session', probe.session, lambda data: (
+        data['interactive_console'], 'running in the active console session' if data['interactive_console'] else
+        'not in the active console session: GetLastInputInfo cannot observe the console user'))
     if checks['session']['status'] == 'fail':
         checks['session']['status'] = 'error'
     threshold = args.idle_seconds
@@ -1646,6 +1648,12 @@ def idle_interval(gui, instance, capture, args, counters):
     text = capture.window('idle', before_log)
     capture.count(text, 'proc.snapshot')
     capture.count(text, 'renderer.present', required=False)
+    switches = capture.report['context_switch_diagnostic']['status']
+    if switches != 'endpoint_complete':
+        # Absent because the endpoint sets differ or NT counters failed, not because
+        # the build lacks instrumentation; summaries keep that distinction.
+        capture.report['missing_metrics']['threads.context_switches'] = {'status': switches, 'n': 0, 'unit': '',
+                                                                         'scope': 'C7 diagnostic only'}
     for name, (value, unit) in idle_delta(before, after).items():
         capture.add(name, value, unit)
 
@@ -1852,14 +1860,15 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         text, batch['metrics'][label] = summary_table(sets[label])
         absent = {name: info for name, info in missing[label].items() if name not in batch['metrics'][label]}
         batch['metrics'][label].update(absent)
-        text += ''.join(f'{name} unit={info["unit"] or "count"} n=0 not_instrumented\n' for name, info in absent.items())
+        text += ''.join(f'{name} unit={info["unit"] or "count"} n=0 {info["status"]}\n' for name, info in absent.items())
         texts.append(label + '\n' + text)
     if len(labels) == 2:
         text, batch['comparison'] = compare_table(sets[labels[0]], sets[labels[1]], tuple(labels))
         for name, entry in batch['comparison'].items():
             for label in labels:
                 if entry[label] is None:
-                    entry[label] = batch['metrics'][label].get(name, {'status': 'not_instrumented', 'n': 0, 'unit': entry['unit']})
+                    # The arm's own recorded reason (not_instrumented, partial, unavailable), else no samples.
+                    entry[label] = batch['metrics'][label].get(name, {'status': 'no_samples', 'n': 0, 'unit': entry['unit']})
         texts.append(text)
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
     batch['missing_preconditions'] = {label: items for label, items in preconditions.items() if items}

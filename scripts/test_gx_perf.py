@@ -284,8 +284,11 @@ class QuietTests(unittest.TestCase):
         self.assertFalse(result['thresholds_plan_compliant'])
         self.assertNotIn('private', json.dumps(result))
         self.assertEqual(['ToDesk'], result['checks']['blacklist']['raw'][0]['matches'])
+        self.assertEqual('running in the active console session', result['checks']['session']['reason'])
         self.probe.session.return_value = {'interactive_console': False}
-        self.assertEqual(2, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((2, 'error'), (result['exit'], result['checks']['session']['status']))
+        self.assertIn('not in the active console session', result['checks']['session']['reason'])
 
     def test_blacklist_is_the_exact_plan_list_and_kimi_cu_is_only_observed(self):
         self.assertEqual(('Devin', 'devin', 'ToDesk', 'Kimi Code', '哔哩哔哩'), gx_perf.BLACKLIST)
@@ -683,6 +686,24 @@ class ExperimentTests(unittest.TestCase):
         result = json.loads((args.out / 'RESULT.json').read_text())
         self.assertEqual((False, True, 1), (result['valid'], result['gate_failed'], result['exit']))
 
+    def test_comparison_keeps_each_arms_own_reason_for_absent_metrics(self):
+        args = self.args('win32-idle', '--exe', str(self.exe))
+        gui = self.fake_gui()
+        def measure(_, instance, capture, args, counters):
+            capture.add('proc.snapshot', 2)
+            if capture.report['baseline']:
+                capture.add('threads.context_switches', 40)
+                capture.add('process.cpu', 3, 'ms')
+            else:
+                capture.report['missing_metrics']['threads.context_switches'] = {'status': 'partial', 'n': 0, 'unit': ''}
+        with mock.patch.object(gx_perf, 'measure_idle', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, gx_perf.run_experiment(args, gui, counters_factory=mock.Mock()))
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual('partial', result['comparison']['threads.context_switches']['new']['status'])
+        self.assertEqual('no_samples', result['comparison']['process.cpu']['new']['status'])
+        self.assertIn('threads.context_switches unit=count n=0 partial', (args.out / 'SUMMARY.txt').read_text())
+
     def test_unexpected_driver_exception_retains_failed_evidence(self):
         args,gui=self.args(),self.fake_gui()
         with mock.patch.object(gx_perf,'measure_ui',side_effect=StopIteration('window vanished')),mock.patch.object(gx_perf.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
@@ -898,6 +919,7 @@ class ExperimentTests(unittest.TestCase):
             gx_perf.idle_interval(gui,instance,capture,self.args('win32-idle'),counters)
         self.assertEqual([2],capture.samples.values['proc.snapshot'])
         self.assertEqual('partial',capture.report['context_switch_diagnostic']['status'])
+        self.assertEqual('partial', capture.report['missing_metrics']['threads.context_switches']['status'])
         self.assertEqual('not_instrumented',capture.report['missing_metrics']['renderer.present']['status'])
         with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',side_effect=[(10,20),(11,21)]):
             with self.assertRaisesRegex(gx_perf.PerfError,'input'):
