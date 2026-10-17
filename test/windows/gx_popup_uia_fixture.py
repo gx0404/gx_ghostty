@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import gx_slots  # noqa: E402
 import gx_win_gui as gui  # noqa: E402
-from gx_fixture_evidence import native_snapshot, write_review, fixture_slots
+from gx_fixture_evidence import native_snapshot, write_review, fixture_slots, source_manifest
 
 WM_POPUP_DCOMP = 0x400 + 0x4E
 POPUP_CLASSES = {"GhosttyGxPopup", "GhosttyGxPopupShadow"}
@@ -38,6 +38,10 @@ POPUPS = (
     ("settings", "ctrl+comma", ("selection", "selection_item")),
 )
 PHASES = {0: "reset", 1: "target", 2: "surface", 3: "begin", 4: "end", 5: "commit"}
+
+
+def choose_popup(windows):
+    return next((window for window in windows if window.cls in POPUP_CLASSES), None)
 
 
 class Blocked(RuntimeError):
@@ -83,6 +87,7 @@ class Fixture:
             "capture_method": self.method, "visual_review": "PENDING", "cases": [],
             "scope": "root/window/pane external MTA only" if self.readonly_root else "popup UIA and DComp",
             "processes": [], "captures": [], "cleanup": [],
+            "fixture_sources": source_manifest(),
             "limits": ["No screen reader product certification or notification receipt test.",
                        "No physical device removal, Win10 compatibility, or performance claim.",
                        "Fault injection tests the native popup failure path, not terminal GPU reset.",
@@ -232,7 +237,7 @@ class Fixture:
 
     def stale_palette(self, instance, mode):
         instance.press("ctrl+shift+p")
-        popup = wait(lambda: next((w for w in instance.popups() if w.cls == "GhosttyGxPopup"), None))
+        popup = wait(lambda: choose_popup(instance.popups()))
         name = mode + "-stale-palette"
         plan, ready, proceed = (self.out / (name + suffix) for suffix in (".plan.json", ".ready.json", ".continue"))
         plan.write_text(json.dumps([{"name": "Search", "pattern": "value", "operation": "set",
@@ -249,7 +254,7 @@ class Fixture:
                 instance.press("escape")
                 wait(lambda: not any(w.hwnd == popup.hwnd for w in instance.popups()))
                 instance.press("ctrl+shift+p")
-                replacement = wait(lambda: next((w for w in instance.popups() if w.cls == "GhosttyGxPopup"), None))
+                replacement = wait(lambda: choose_popup(instance.popups()))
                 instance.ensure_foreground()
                 proceed.write_text("transition completed\n", encoding="utf-8")
                 assert process.wait(timeout=15) == 0, "old provider did not become unavailable"
@@ -326,12 +331,12 @@ class Fixture:
                     actual = self.uia(instance, popup.hwnd, name + "-value-after", ("value",))
                     assert any(n.get("value") == "font" for n in actual["nodes"]), "Value.SetValue did not reach GUI model"
                 elif label == "settings":
-                    node = next(n for n in probe["nodes"] if n["patterns"].get("selection_item"))
+                    node = next(n for n in probe["nodes"] if n["name"] == "Interaction" and n["patterns"].get("selection_item"))
                     self.pattern_call(instance, popup, node, "selection_item", "select")
                     toggles = self.uia(instance, popup.hwnd, name + "-toggle-tree", ())
                     node = next((n for n in toggles["nodes"] if n["enabled"] and n["patterns"].get("toggle")), None)
                     if node is None:
-                        self.record(name + "/toggle", "PENDING", case_id="UIA-01-toggle", reason="selected settings page exposes no toggle; use a page with a live checkbox")
+                        raise AssertionError("Interaction page has no enabled Toggle provider")
                     else:
                         label_before = node["name"]
                         self.pattern_call(instance, popup, node, "toggle", "toggle")
@@ -343,6 +348,7 @@ class Fixture:
                     node = next(n for n in probe["nodes"] if n["patterns"].get("expand_collapse"))
                     self.pattern_call(instance, popup, node, "expand_collapse", "expand")
                     instance.press("escape")  # Close just the submenu before the root below.
+                self.capture(instance, popup.hwnd, name + "-action-after", f"{label} 实际 COM 操作后的可见状态")
             if mode == "on" and label == "settings":
                 self.fault_phases(instance, popup.hwnd)
             instance.press("escape")

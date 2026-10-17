@@ -14,6 +14,43 @@ import gx_win_uia as probe
 
 
 class UiaProbeTests(unittest.TestCase):
+    def test_notifications_use_sdk_class_that_exposes_iuiautomation5(self):
+        self.assertEqual('e22ad333-b25f-460c-83d0-0581107395c9', probe.automation_clsid(1000))
+        self.assertEqual('ff48dba4-60ef-4201-aa87-54103eef594e', probe.automation_clsid(0))
+
+    def test_failure_freezes_stage_hresult_and_accumulated_actions(self):
+        diagnostic = {'stage': 'action.invoke', 'node_id': 'gx-2', 'pattern_id': 10002,
+                      'call': 'SetValue', 'hresult': '0x80040201', 'action_results': [{'call': 'Expand', 'hresult': '0x00000000'}]}
+        failure = probe.ProbeFailure('COM failure 0x80040201', diagnostic)
+        diagnostic['stage'] = 'cleanup'
+        diagnostic['action_results'].clear()
+        with mock.patch.object(probe, 'run_worker', side_effect=failure):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(1, probe.main(self.args('--worker')))
+        result = json.loads(output.getvalue())
+        self.assertEqual('action.invoke', result['stage'])
+        self.assertEqual('SetValue', result['call'])
+        self.assertEqual('gx-2', result['node_id'])
+        self.assertEqual(10002, result['pattern_id'])
+        self.assertEqual('0x80040201', result['hresult'])
+        self.assertEqual(1, len(result['action_results']))
+
+    def test_parent_keeps_failed_worker_diagnostic_without_retry(self):
+        payload = {'status': 'FAIL', 'error': 'COM failure 0x80040201', 'stage': 'action.pattern',
+                   'node_id': 'gx-2', 'pattern_id': 10002, 'call': 'IUIAutomationElement.GetCurrentPattern',
+                   'hresult': '0x80040201', 'action_results': []}
+        result = subprocess.CompletedProcess(['worker'], 1, json.dumps(payload), '')
+        with mock.patch.object(probe.subprocess, 'run', return_value=result) as run:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(1, probe.main(self.args()))
+            self.assertEqual(1, run.call_count)
+        observed = json.loads(output.getvalue())
+        self.assertEqual(payload['stage'], observed['stage'])
+        self.assertEqual(payload['hresult'], observed['hresult'])
+        self.assertEqual(1, observed['worker_exit_code'])
+
     def args(self, *extra):
         return ['--hwnd', '0x123', '--pid', '42', '--birth', '12345', '--exe', 'ghostty.exe', *extra]
 

@@ -8,6 +8,7 @@ process creation FILETIME (integer); --exe must match the process image exactly.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -23,6 +24,19 @@ _CALLBACK_ANCHORS = []
 PATTERNS = {"invoke": (10000, {"invoke": 3}), "selection_item": (10010, {"select": 3, "add": 4, "remove": 5}),
             "value": (10002, {"set": 3}), "toggle": (10015, {"toggle": 3}),
             "expand_collapse": (10005, {"expand": 3, "collapse": 4})}
+
+
+class ProbeFailure(RuntimeError):
+    def __init__(self, message, diagnostic):
+        super().__init__(message)
+        # Freeze before COM cleanup can change stage or release retained refs.
+        self.diagnostic = copy.deepcopy(diagnostic)
+
+
+def automation_clsid(listen_ms):
+    # SDK UIAutomationClient.idl: the Win7-compatible class exposes only
+    # IUIAutomation; Notification lives on IUIAutomation5/CUIAutomation8.
+    return "e22ad333-b25f-460c-83d0-0581107395c9" if listen_ms else "ff48dba4-60ef-4201-aa87-54103eef594e"
 
 
 def physical_coordinates(user):
@@ -117,6 +131,11 @@ def run_worker(args) -> dict:
     kernel = C.WinDLL("kernel32", use_last_error=True)
     user = C.WinDLL("user32", use_last_error=True)
     physical_coordinates(user)
+    diagnostic = {"stage": "initialization", "node_id": None, "pattern_id": None,
+                  "call": None, "hresult": None, "action_results": []}
+
+    def stage(name, call, **facts):
+        diagnostic.update(stage=name, call=call, hresult=None, **facts)
 
     class GUID(C.Structure):
         _fields_ = [("bytes", C.c_ubyte * 16)]
@@ -135,8 +154,9 @@ def run_worker(args) -> dict:
         return C.WINFUNCTYPE(result, pointer, *types)(table[index])
 
     def check(hr):
+        diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
         if hr < 0:
-            raise RuntimeError(f"COM failure 0x{hr & 0xffffffff:08x}")
+            raise ProbeFailure(f"COM failure 0x{hr & 0xffffffff:08x}", diagnostic)
 
     def release(obj):
         if obj:
@@ -198,10 +218,14 @@ def run_worker(args) -> dict:
 
     def property_value(element, property_id):
         value = Variant()
+        stage("enumerate.properties", "IUIAutomationElement.GetCurrentPropertyValue", property_id=property_id)
         check(method(element, 10, HRESULT, C.c_int, C.POINTER(Variant))(element, property_id, C.byref(value)))
         try:
             if value.tag == 8 and value.data.pointer:
-                return C.wstring_at(value.data.pointer, min(aut.SysStringLen(value.data.pointer), 4096))
+                text = C.wstring_at(value.data.pointer, min(aut.SysStringLen(value.data.pointer), 4096))
+                if property_id == 30011:
+                    diagnostic["node_id"] = text
+                return text
             if value.tag == 3:
                 return C.c_int(value.data.integer & 0xffffffff).value
             if value.tag == 11:
@@ -226,6 +250,7 @@ def run_worker(args) -> dict:
             aut.VariantClear(C.byref(value))
 
     verify_identity()
+    stage("connect", "CoInitializeEx")
     check(ole.CoInitializeEx(None, 0))  # COINIT_MULTITHREADED; no window on this thread.
     automation, root, walker, automation5 = pointer(), pointer(), pointer(), pointer()
     pending = []
@@ -234,13 +259,16 @@ def run_worker(args) -> dict:
     handler = None
     plan = read_plan(args.action_plan)
     retained = [[] for _ in plan]
-    action_results = []
+    retained_ids = [[] for _ in plan]
+    action_results = diagnostic["action_results"]
     owner_thread = kernel.GetCurrentThreadId()
     lifecycle = {"query_thread": owner_thread, "registration_thread": None, "removal_thread": None}
     try:
-        clsid = guid("ff48dba4-60ef-4201-aa87-54103eef594e")
+        clsid = guid(automation_clsid(args.listen_ms))
         iid = guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")
+        stage("connect", "CoCreateInstance")
         check(ole.CoCreateInstance(C.byref(clsid), None, 1, C.byref(iid), C.byref(automation)))
+        stage("connect", "IUIAutomation.ElementFromHandle")
         check(method(automation, 6, HRESULT, W.HWND, C.POINTER(pointer))(automation, args.hwnd, C.byref(root)))
         if not root:
             raise RuntimeError("UIA returned no element for the selected HWND")
@@ -252,9 +280,12 @@ def run_worker(args) -> dict:
         if not walker:
             raise RuntimeError("UIA raw view walker unavailable")
         notifications_supported = False
+        notification_interface_hr = None
         if args.listen_ms:
             iid5 = guid("25f700c8-d816-4057-a9dc-3cbdee77e256")
+            stage("notification.query_interface", "IUnknown.QueryInterface(IUIAutomation5)")
             hr = method(automation, 0, HRESULT, C.POINTER(GUID), C.POINTER(pointer))(automation, C.byref(iid5), C.byref(automation5))
+            notification_interface_hr = f"0x{hr & 0xffffffff:08x}"
             notifications_supported = hr >= 0 and bool(automation5)
             if notifications_supported:
                 handler_iid = uuid.UUID("c7cb2637-e6c2-4d0c-85de-4948c02175c7").bytes_le
@@ -297,6 +328,7 @@ def run_worker(args) -> dict:
 
                 handler = Handler(table)
                 _CALLBACK_ANCHORS.append((handler, table, query, add_ref, release_ref, notification))
+                stage("notification.register", "IUIAutomation5.AddNotificationEventHandler")
                 check(method(automation5, 68, HRESULT, pointer, C.c_int, pointer, pointer)(automation5, root, 7, None, C.byref(handler)))
                 registered = True
                 lifecycle["registration_thread"] = kernel.GetCurrentThreadId()
@@ -310,6 +342,7 @@ def run_worker(args) -> dict:
         while pending and len(nodes) < args.max_nodes:
             element, depth = pending.pop()
             try:
+                diagnostic.update(node_id=None, node_index=len(nodes), depth=depth, pattern_id=None)
                 if property_value(element, 30002) != args.pid:
                     continue
                 nodes.append({"depth": depth, "name": property_value(element, 30005),
@@ -332,10 +365,12 @@ def run_worker(args) -> dict:
                             and descriptor["patterns"].get(action["pattern"]) is True):
                         method(element, 1, W.ULONG)(element)
                         retained[index].append(element)
+                        retained_ids[index].append(descriptor["automation_id"])
                 if depth >= args.max_depth:
                     truncated = True
                     continue
                 child = pointer()
+                stage("enumerate.navigation", "IUIAutomationTreeWalker.GetFirstChildElement")
                 check(method(walker, 4, HRESULT, pointer, C.POINTER(pointer))(walker, element, C.byref(child)))
                 siblings = []
                 try:
@@ -347,6 +382,7 @@ def run_worker(args) -> dict:
                             break
                         siblings.append((child, depth + 1))
                         following = pointer()
+                        stage("enumerate.navigation", "IUIAutomationTreeWalker.GetNextSiblingElement")
                         check(method(walker, 6, HRESULT, pointer, C.POINTER(pointer))(walker, child, C.byref(following)))
                         child = following
                     pending.extend(reversed(siblings))
@@ -365,27 +401,35 @@ def run_worker(args) -> dict:
                 raise RuntimeError(f"action target is missing or ambiguous ({len(elements)}): {action}")
 
         def execute_actions(after_signal):
-            for action, elements in zip(plan, retained):
+            for action, elements, node_ids in zip(plan, retained, retained_ids):
                 if bool(action.get("after_signal")) != after_signal:
                     continue
                 verify_identity(require_hwnd=not after_signal)
                 pattern_id, operations = PATTERNS[action["pattern"]]
                 pattern = pointer()
+                stage("action.pattern", "IUIAutomationElement.GetCurrentPattern", node_id=node_ids[0],
+                      pattern_id=pattern_id, action_index=len(action_results), property_id=None)
                 hr = method(elements[0], 16, HRESULT, C.c_int, C.POINTER(pointer))(elements[0], pattern_id, C.byref(pattern))
+                diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
                 try:
                     if hr >= 0 and pattern:
                         operation = operations[action["operation"]]
+                        call_name = {"invoke": "Invoke", "select": "Select", "add": "AddToSelection", "remove": "RemoveFromSelection",
+                                     "set": "SetValue", "toggle": "Toggle", "expand": "Expand", "collapse": "Collapse"}[action["operation"]]
+                        stage("action.invoke", call_name)
                         if action["pattern"] == "value":
                             hr = method(pattern, operation, HRESULT, W.LPCWSTR)(pattern, action["value"])
                         else:
                             hr = method(pattern, operation, HRESULT)(pattern)
                     elif hr >= 0:
                         raise RuntimeError("pattern disappeared without an unavailable HRESULT")
-                    result = {"action": action, "hresult": f"0x{hr & 0xffffffff:08x}", "thread": kernel.GetCurrentThreadId()}
+                    result = {"action": action, "hresult": f"0x{hr & 0xffffffff:08x}", "thread": kernel.GetCurrentThreadId(),
+                              "stage": diagnostic["stage"], "call": diagnostic["call"], "node_id": diagnostic["node_id"], "pattern_id": pattern_id}
+                    diagnostic["hresult"] = result["hresult"]
                     action_results.append(result)
                     if action.get("expect_unavailable"):
                         if hr & 0xffffffff != 0x80040201:
-                            raise RuntimeError(f"stale provider did not return UIA_E_ELEMENTNOTAVAILABLE: {result}")
+                            raise ProbeFailure(f"stale provider did not return UIA_E_ELEMENTNOTAVAILABLE: {result}", diagnostic)
                     else:
                         check(hr)
                 finally:
@@ -395,15 +439,36 @@ def run_worker(args) -> dict:
         if args.ready_file:
             with args.ready_file.open("x", encoding="utf-8") as stream:
                 json.dump({"pid": args.pid, "birth": args.birth, "hwnd": args.hwnd,
-                           "registered": registered, "retained_actions": len(plan), "thread": owner_thread}, stream)
+                           "registered": registered, "retained_actions": len(plan), "thread": owner_thread,
+                           "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr}, stream)
         deadline = time.monotonic() + args.listen_ms / 1000
         queries = 0
+        unavailable_queries = 0
         next_query = time.monotonic()
         while time.monotonic() < deadline:
             if args.continue_file and args.continue_file.exists():
                 break
             if args.query_interval_ms and time.monotonic() >= next_query:
-                property_value(root, 30005)
+                # A semantic focus/tab update legitimately replaces the root
+                # epoch. Stress reacquires through the SAME owned HWND; stale
+                # action tests above intentionally keep their original refs.
+                current = pointer()
+                hr = method(automation, 6, HRESULT, W.HWND, C.POINTER(pointer))(automation, args.hwnd, C.byref(current))
+                try:
+                    if hr & 0xffffffff == 0x80040201:
+                        unavailable_queries += 1
+                    else:
+                        check(hr)
+                        try:
+                            if property_value(current, 30002) != args.pid:
+                                raise RuntimeError("stress root owner changed")
+                            property_value(current, 30005)
+                        except RuntimeError as error:
+                            if "0x80040201" not in str(error):
+                                raise
+                            unavailable_queries += 1
+                finally:
+                    release(current)
                 queries += 1
                 next_query += args.query_interval_ms / 1000
             time.sleep(min(0.05, max(0, deadline - time.monotonic())))
@@ -420,8 +485,15 @@ def run_worker(args) -> dict:
                 "apartment": "MTA", "created_hwnd": False, "nodes": nodes,
                 "coordinate_space": "physical-pixels-per-monitor-v2",
                 "truncated": truncated, "notification_supported": notifications_supported, "events": events,
-                "actions": action_results, "queries_during_wait": queries, "threads": lifecycle}
+                "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr,
+                "actions": action_results, "queries_during_wait": queries, "unavailable_queries": unavailable_queries,
+                "threads": lifecycle}
+    except Exception as error:
+        if isinstance(error, ProbeFailure):
+            raise
+        raise ProbeFailure(str(error), diagnostic) from error
     finally:
+        original_failure = sys.exc_info()[1]
         cleanup_error = None
         if registered:
             # HRESULT failure must not masquerade as successful event cleanup.
@@ -439,7 +511,10 @@ def run_worker(args) -> dict:
             release(element)
         ole.CoUninitialize()
         if cleanup_error:
-            raise RuntimeError(cleanup_error)
+            if isinstance(original_failure, ProbeFailure):
+                original_failure.diagnostic["cleanup_error"] = cleanup_error
+            else:
+                raise ProbeFailure(cleanup_error, diagnostic)
 
 
 def main(argv=None) -> int:
@@ -455,13 +530,19 @@ def main(argv=None) -> int:
                 process = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=args.timeout)
             except subprocess.TimeoutExpired:
                 raise RuntimeError("UIA probe exceeded the hard timeout; owned worker terminated") from None
+            try:
+                result = json.loads(process.stdout)
+            except json.JSONDecodeError:
+                raise RuntimeError(process.stdout.strip() or process.stderr.strip() or "UIA worker failed") from None
             if process.returncode != 0:
-                raise RuntimeError(process.stdout.strip() or process.stderr.strip() or "UIA worker failed")
-            result = json.loads(process.stdout)
+                result.update(status="FAIL", worker_exit_code=process.returncode)
         print(json.dumps(result, ensure_ascii=True))
         return 0 if result.get("status") == "PASS" else 1
     except (OSError, ValueError, RuntimeError) as exc:
-        print(json.dumps({"status": "FAIL", "error": str(exc)}, ensure_ascii=True))
+        result = {"status": "FAIL", "error": str(exc)}
+        if isinstance(exc, ProbeFailure):
+            result.update(exc.diagnostic)
+        print(json.dumps(result, ensure_ascii=True))
         return 1
 
 
