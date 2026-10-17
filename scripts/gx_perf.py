@@ -516,9 +516,10 @@ def label_environments(labels: Sequence[str], common: Sequence[str], overrides: 
 
 
 # Quiet checks observe state; they never stop a process, VM or WSL distribution.
-BUILD_PROCESSES = ("zig", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
+BUILD_PROCESSES = ("zig", "build", "test", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
                    "ninja", "msbuild", "cl", "link", "gcc", "g++", "make", "cmake", "rustc", "cargo")
 BLACKLIST = ("Devin", "devin", "ToDesk", "Kimi Code", "哔哩哔哩")
+BUILD_RUNNER_RE = r'(?:run_unittests\.py|zig_test\.py|zigw\.py\s+build|(?:^|\s)-m\s+(?:unittest|pytest)(?:\s|$)|(?:^|[/\\\s])test_[^\s]+\.py)'
 
 
 def command_output(argv: Sequence[str]) -> str:
@@ -562,8 +563,11 @@ def process_name(name: str) -> str:
 
 class QuietProbe:
     def windows(self) -> list[dict]:
-        data = powershell_json("@(Get-Process | Select-Object @{n='pid';e={$_.Id}},"
-                               "@{n='name';e={$_.ProcessName}},@{n='title';e={$_.MainWindowTitle}}) | ConvertTo-Json -Compress")
+        data = powershell_json("$runners=@{}; Get-CimInstance Win32_Process | ForEach-Object {"
+                               f"$runners[[int]$_.ProcessId]=[bool]($_.CommandLine -match '{BUILD_RUNNER_RE}')}}; "
+                               "@(Get-Process | Select-Object @{n='pid';e={$_.Id}},"
+                               "@{n='name';e={$_.ProcessName}},@{n='title';e={$_.MainWindowTitle}},"
+                               "@{n='build_runner';e={$runners[$_.Id]}}) | ConvertTo-Json -Compress")
         if not isinstance(data, list) or not data:
             raise PerfError("Windows process inventory is missing")
         return data
@@ -572,11 +576,11 @@ class QuietProbe:
         running = command_output(["wsl.exe", "--list", "--running", "--quiet"])
         if distro.casefold() not in {line.strip().casefold() for line in running.splitlines()}:
             return {"distro": distro, "running": False, "processes": []}
-        output = command_output(["wsl.exe", "--distribution", distro, "--exec", "ps", "-eo", "pid=,comm="])
+        output = command_output(["wsl.exe", "--distribution", distro, "--exec", "ps", "-eo", "pid=,comm=,args="])
         rows = []
         for line in output.splitlines():
-            pid, name = line.strip().split(None, 1)
-            rows.append({"pid": int(pid), "name": name})
+            pid, name, argv = line.strip().split(None, 2)
+            rows.append({"pid": int(pid), "name": name, "build_runner": bool(re.search(BUILD_RUNNER_RE, argv))})
         if not rows:
             raise PerfError("WSL process inventory is empty")
         return {"distro": distro, "running": True, "processes": rows}
@@ -627,7 +631,7 @@ def quiet_snapshot(args, probe=None) -> dict:
     builds = {process_name(name) for name in (args.build_process or BUILD_PROCESSES)}
     blacklist = [name.casefold() for name in (args.blacklist or BLACKLIST)]
     def build_check(rows):
-        found = [row for row in rows if process_name(row['name']) in builds]
+        found = [row for row in rows if process_name(row['name']) in builds or row.get('build_runner')]
         return not found, "no build/test processes" if not found else f"build/test processes: {found}"
     check("windows", probe.windows, build_check)
     windows = checks["windows"]

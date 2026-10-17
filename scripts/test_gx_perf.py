@@ -162,6 +162,14 @@ class ParseTests(unittest.TestCase):
 
 
 class QuietTests(unittest.TestCase):
+    def test_wsl_build_runner_detection_does_not_persist_command_lines(self):
+        with mock.patch.object(gx_perf, 'command_output', side_effect=[
+                'Ubuntu-24.04\n', '10 python3 python3 scripts/run_unittests.py test_x\n11 ps ps -eo pid=,comm=,args=\n']):
+            data = gx_perf.QuietProbe().wsl('Ubuntu-24.04')
+        self.assertTrue(data['processes'][0]['build_runner'])
+        self.assertFalse(data['processes'][1]['build_runner'])
+        self.assertNotIn('argv', data['processes'][0])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
