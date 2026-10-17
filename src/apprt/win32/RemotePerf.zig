@@ -1,8 +1,35 @@
 //! Optional remote-frame telemetry. QPC is shared by processes on this host;
-//! timestamps never drive admission, retries, rendering or input ordering.
+//! stamps are format-checked, never authorization or input-ordering identities.
+//! Sampling never drives retries or rendering.
 const std = @import("std");
 const perf = @import("../../gx/perf.zig");
 pub const InputStamp = @import("../../gx/remote_view.zig").InputStamp;
+
+/// GUI is the sole writer; render readers never wait for it. Sequentially
+/// consistent atomics give the revision and both payload words one total order.
+/// An interrupted snapshot omits telemetry for that frame instead of spinning.
+pub const InputSnapshot = struct {
+    revision: std.atomic.Value(u64) = .init(0),
+    sequence: std.atomic.Value(u64) = .init(0),
+    qpc: std.atomic.Value(u64) = .init(0),
+
+    pub fn store(self: *InputSnapshot, stamp: InputStamp) void {
+        _ = self.revision.fetchAdd(1, .seq_cst);
+        self.sequence.store(stamp.sequence, .seq_cst);
+        self.qpc.store(stamp.qpc, .seq_cst);
+        _ = self.revision.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn load(self: *const InputSnapshot) InputStamp {
+        const before = self.revision.load(.seq_cst);
+        if (before & 1 != 0) return .{};
+        const stamp: InputStamp = .{
+            .sequence = self.sequence.load(.seq_cst),
+            .qpc = self.qpc.load(.seq_cst),
+        };
+        return if (self.revision.load(.seq_cst) == before) stamp else .{};
+    }
+};
 
 extern "kernel32" fn QueryPerformanceCounter(*i64) callconv(.winapi) i32;
 extern "kernel32" fn QueryPerformanceFrequency(*i64) callconv(.winapi) i32;
@@ -83,6 +110,39 @@ test "remote QPC conversion rejects missing reversed clocks and saturates overfl
     try std.testing.expectEqual(@as(?u64, null), elapsedUs(11, 10, 10));
     try std.testing.expectEqual(@as(?u64, null), elapsedUs(1, 10, 0));
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), elapsedUs(1, std.math.maxInt(u64), 1));
+}
+
+test "remote input snapshot is coherent and never waits for an interrupted GUI writer" {
+    var snapshot: InputSnapshot = .{};
+    try std.testing.expectEqual(InputStamp{}, snapshot.load());
+    snapshot.store(.{ .sequence = 7, .qpc = 70 });
+    try std.testing.expectEqual(InputStamp{ .sequence = 7, .qpc = 70 }, snapshot.load());
+    snapshot.revision.store(3, .seq_cst);
+    snapshot.sequence.store(8, .seq_cst);
+    try std.testing.expectEqual(InputStamp{}, snapshot.load());
+    snapshot.qpc.store(80, .seq_cst);
+    snapshot.revision.store(4, .seq_cst);
+    try std.testing.expectEqual(InputStamp{ .sequence = 8, .qpc = 80 }, snapshot.load());
+    snapshot.store(.{});
+    try std.testing.expectEqual(InputStamp{}, snapshot.load());
+}
+
+test "remote input snapshot concurrent reader never observes a torn pair" {
+    const Writer = struct {
+        fn run(snapshot: *InputSnapshot, done: *std.atomic.Value(bool)) void {
+            for (1..10_001) |i| snapshot.store(.{ .sequence = i, .qpc = i * 10 });
+            done.store(true, .release);
+        }
+    };
+    var snapshot: InputSnapshot = .{};
+    var done: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ &snapshot, &done });
+    defer thread.join();
+    while (!done.load(.acquire)) {
+        const stamp = snapshot.load();
+        try std.testing.expectEqual(stamp.sequence * 10, stamp.qpc);
+    }
+    try std.testing.expectEqual(InputStamp{ .sequence = 10_000, .qpc = 100_000 }, snapshot.load());
 }
 
 test "remote presentation samples latest input once across coalescing repaint and resize" {

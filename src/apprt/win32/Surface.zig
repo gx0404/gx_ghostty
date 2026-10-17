@@ -721,6 +721,7 @@ pub const RemoteFrame = struct {
         self.ended = true;
         self.frame.finish(success);
         std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);
+        self.frame.logPerfSamples();
     }
 };
 

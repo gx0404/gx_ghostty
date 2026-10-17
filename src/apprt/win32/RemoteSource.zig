@@ -393,19 +393,15 @@ fn dispatchInput(state: *State, event: *const protocol.Input) !void {
 
 fn resetPerfInput(surface: *Surface) void {
     if (!perf.enabled()) return;
-    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&surface.remote_mutex);
-    defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&surface.remote_mutex);
-    if (surface.remote_output) |output| output.perf_input = .{};
+    if (surface.remote_output) |output| output.perf_input.store(.{});
 }
 
-/// Only after a successful core callback; never hold remote_mutex while calling
-/// core/renderer APIs. The render thread snapshots this at begin of frame export.
+/// GUI owns Output lifetime and is the sole stamp writer. Do not wait on the
+/// readback lock: the render thread takes a coherent atomic snapshot at begin.
 fn markPerfInput(surface: *Surface, event: *const protocol.Input) void {
     if (!perf.enabled() or event.perf.sequence == 0) return;
-    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&surface.remote_mutex);
-    defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&surface.remote_mutex);
     if (surface.remote_output) |output| {
-        if (event.perf.sequence > output.perf_input.sequence) output.perf_input = event.perf;
+        if (event.perf.sequence > output.perf_input.load().sequence) output.perf_input.store(event.perf);
     }
 }
 
@@ -432,14 +428,18 @@ test "remote applied performance stamp is monotonic independent of transport seq
     surface.remote_mutex = .{};
     surface.remote_output = &output;
     perf.setEnabled(true);
+    // Even while a renderer owns the readback lock, GUI stamp updates must
+    // finish without taking it. This thread holds it to model that condition.
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&surface.remote_mutex);
+    defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&surface.remote_mutex);
     markPerfInput(surface, &event);
-    try std.testing.expectEqual(event.perf, output.perf_input);
+    try std.testing.expectEqual(event.perf, output.perf_input.load());
     event.sequence = 200;
     event.perf = .{ .sequence = 6, .qpc = 12000 };
     markPerfInput(surface, &event);
-    try std.testing.expectEqual(@as(u64, 7), output.perf_input.sequence);
+    try std.testing.expectEqual(@as(u64, 7), output.perf_input.load().sequence);
     resetPerfInput(surface);
-    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input.load());
     surface.remote_output = null;
     markPerfInput(surface, &event);
 }
