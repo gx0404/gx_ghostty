@@ -1015,14 +1015,20 @@ def idle_delta(before: dict, after: dict) -> dict:
     cpu = sum(cpu_parts) / 10000
     if any(value < 0 for value in cpu_parts) or after['begin_ns'] < before['end_ns']:
         raise PerfError("negative process CPU delta")
+    result = {"process.cpu": (cpu, "ms"), "idle.wall": ((after['begin_ns'] - before['end_ns']) / 1e6, "ms")}
+    switches = context_switch_diagnostic(before, after)
+    if switches['status'] == 'endpoint_complete':
+        result['threads.context_switches'] = (switches['matched_switches'], '')
+    return result
+
+
+def context_switch_diagnostic(before, after) -> dict:
     old = {(row['tid'], row['birth']): row['switches'] for row in before['threads']}
     new = {(row['tid'], row['birth']): row['switches'] for row in after['threads']}
-    # Endpoint counters cannot account for threads that exited during the interval.
-    # Refuse churn instead of inventing a complete process switch total.
-    if old.keys() != new.keys():
-        raise PerfError("thread population changed; context-switch interval incomplete")
-    return {"process.cpu": (cpu, "ms"), "threads.context_switches": (sum((new[k] - old[k]) & 0xFFFFFFFF for k in old), ""),
-            "idle.wall": ((after['begin_ns'] - before['end_ns']) / 1e6, "ms")}
+    return {'status': 'endpoint_complete' if old.keys() == new.keys() else 'partial',
+            'matched_switches': sum((new[k] - old[k]) & 0xFFFFFFFF for k in old.keys() & new.keys()),
+            'added_threads': sorted(new.keys() - old.keys()), 'removed_threads': sorted(old.keys() - new.keys()),
+            'scope': 'diagnostic surviving endpoint threads; transient threads unobservable; not a P2 gate'}
 
 
 UI_KEYS = {"palette": "ctrl+shift+p", "menu": "ctrl+shift+m", "settings": "ctrl+comma", "keybinds": "ctrl+shift+slash"}
@@ -1250,12 +1256,18 @@ def measure_idle(gui, instance, capture: CaptureRun, args, counters):
 def idle_interval(gui, instance, capture, args, counters):
     time.sleep(2)
     before_log = capture.mark()
+    input_before = last_input_ticks()[0]
     before = counters.sample(instance)
     time.sleep(args.seconds)
     after = counters.sample(instance)
+    input_after = last_input_ticks()[0]
     capture.report.update(before=before, after=after,
-        context_switch_source='NtQuerySystemInformation(SystemProcessInformation), matched TID+CreateTime endpoints; endpoint churn rejected',
+        input_window={'before_tick': input_before, 'after_tick': input_after},
+        context_switch_diagnostic=context_switch_diagnostic(before, after),
+        context_switch_source='NtQuerySystemInformation(SystemProcessInformation), matched TID+CreateTime endpoints; diagnostic only',
         context_switch_scope='endpoint-surviving threads only; threads born and exited between endpoints are not observable')
+    if input_before != input_after:
+        raise PerfError('external input occurred during the idle measurement window')
     if args.state == 'visible' and gui.win32().window_pid(gui.win32().foreground()) != instance.pid:
         raise PerfError('visible measured process lost focus')
     if args.state == 'unfocused' and gui.win32().window_pid(gui.win32().foreground()) == instance.pid:

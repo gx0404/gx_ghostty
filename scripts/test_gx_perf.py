@@ -346,8 +346,9 @@ class CounterTests(unittest.TestCase):
         self.assertEqual((4, ''), result['threads.context_switches'])
         self.assertEqual((60000, 'ms'), result['idle.wall'])
         after['threads'][0]['birth'] = 5
-        with self.assertRaisesRegex(gx_perf.PerfError, 'population'):
-            gx_perf.idle_delta(before, after)
+        delta = gx_perf.idle_delta(before, after)
+        self.assertEqual((3, 'ms'), delta['process.cpu'])
+        self.assertNotIn('threads.context_switches', delta)
 
     def test_paint_frames_do_not_mix_threads_or_count_trailing_layouts(self):
         text = ('00:00:00.100 [1] info(gx_perf): metric d2d.layout_create 2\n'
@@ -496,11 +497,33 @@ class ExperimentTests(unittest.TestCase):
             if seconds == 60:
                 with instance.log.open('a') as stream:
                     stream.write('info(gx_perf): metric proc.snapshot 2\ninfo(gx_perf): metric renderer.present 4\n')
-        with mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep):
+        with mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 10)):
             gx_perf.idle_interval(gui, instance, capture, self.args('win32-idle'), counters)
         self.assertEqual([2], capture.samples.values['proc.snapshot'])
         self.assertEqual([2], capture.samples.values['process.cpu'])
         self.assertEqual([10], capture.samples.values['threads.context_switches'])
+
+    def test_idle_thread_churn_preserves_p2_but_foreign_input_rejects(self):
+        instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        instance.log = self.root/'idle.log'
+        instance.log.write_text('')
+        gui.win32.return_value.window_pid.return_value = instance.pid
+        before = dict(pid=1,birth=2,user_100ns=0,kernel_100ns=0,begin_ns=0,end_ns=1,
+                      threads=[dict(tid=3,birth=4,switches=10)])
+        after = dict(before,begin_ns=60000000001,threads=[])
+        counters.sample.side_effect = [before, after, before, after]
+        def sleep(seconds):
+            if seconds == 60:
+                with instance.log.open('a') as stream:
+                    stream.write('info(gx_perf): metric proc.snapshot 2\n')
+        capture = gx_perf.CaptureRun(instance, self.root, {})
+        with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',return_value=(10,20)):
+            gx_perf.idle_interval(gui,instance,capture,self.args('win32-idle'),counters)
+        self.assertEqual([2],capture.samples.values['proc.snapshot'])
+        self.assertEqual('partial',capture.report['context_switch_diagnostic']['status'])
+        with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',side_effect=[(10,20),(11,21)]):
+            with self.assertRaisesRegex(gx_perf.PerfError,'input'):
+                gx_perf.idle_interval(gui,instance,capture,self.args('win32-idle'),counters)
 
     def test_p3_drags_real_caption_and_p6_holds_key_at_30hz(self):
         gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()
