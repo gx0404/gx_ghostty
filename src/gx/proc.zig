@@ -231,10 +231,12 @@ pub const Table = struct {
 
     /// Reads every process of the running system: Toolhelp32 on Windows,
     /// `/proc` (kept open until `deinit`) on Linux.
+    /// `proc.snapshot` counts each system snapshot attempt, including failure.
     pub fn capture(alloc: Allocator, io: std.Io) SnapshotError!Table {
         switch (builtin.os.tag) {
             .windows => return try windows.capture(alloc),
             .linux => {
+                @import("perf.zig").count("proc.snapshot", 1);
                 var dir = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch |err| {
                     log.warn("cannot open /proc err={}", .{err});
                     return error.SnapshotFailed;
@@ -251,6 +253,8 @@ pub const Table = struct {
     /// Reads a Linux procfs layout from `proc_dir`: an iterable directory
     /// with `<pid>/stat` and `<pid>/cmdline` entries, which must stay open
     /// while the table is in use.
+    /// Injected procfs directories do not count as system snapshot attempts;
+    /// production callers must use `capture` to participate in `proc.snapshot`.
     pub fn readProc(alloc: Allocator, io: std.Io, proc_dir: std.Io.Dir) Allocator.Error!Table {
         var arena: std.heap.ArenaAllocator = .init(alloc);
         errdefer arena.deinit();
@@ -647,6 +651,7 @@ const windows = if (builtin.os.tag == .windows) struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        @import("perf.zig").count("proc.snapshot", 1);
         const handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (handle == win.INVALID_HANDLE_VALUE) return error.SnapshotFailed;
         defer _ = CloseHandle(handle);

@@ -281,6 +281,7 @@ const Tip = union(enum) {
 /// Show the settings for `window`; without Direct2D or GX configuration
 /// layering, open the configuration file instead.
 pub fn show(window: *Window) bool {
+    const timing = Popup.OpenTiming.begin(.settings);
     if (!gx.config_layers.enabled(window.app.core_app.alloc) or window.app.uiFactory() == null) return openConfigInstead(window.app);
     if (instance) |self| {
         if (self.window == window) {
@@ -288,7 +289,7 @@ pub fn show(window: *Window) bool {
                 if (self.popup.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
                 return true;
             }
-            return self.openOverlay();
+            return self.openOverlay(timing);
         }
         self.destroy();
     }
@@ -308,7 +309,7 @@ pub fn show(window: *Window) bool {
         .changes = .init(alloc),
     };
     instance = self;
-    return self.openOverlay();
+    return self.openOverlay(timing);
 }
 
 /// Like `show`, then switch to `section`: the command palette's
@@ -385,7 +386,8 @@ fn destroy(self: *Settings) void {
     self.alloc.destroy(self);
 }
 
-fn openOverlay(self: *Settings) bool {
+fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
+    var timing = opened;
     const owner = self.window.hwnd orelse return false;
     if (self.window.closing) return false;
     self.uia_attachment = self.window.ui_attachment;
@@ -394,6 +396,7 @@ fn openOverlay(self: *Settings) bool {
     // Until the first frame is painted (`Popup.show` paints at once).
     const span: gx.perf.Span = .begin(global.io());
     defer _ = span.end(global.io(), "settings_open");
+    if (timing) |*value| value.lap(.prepare);
 
     if (self.popup.hwnd == null) {
         self.popup.create(self.app.hinstance, owner, factory, .{
@@ -437,6 +440,7 @@ fn openOverlay(self: *Settings) bool {
         };
     }
 
+    if (timing) |*value| value.lap(.create);
     self.loadData();
     self.clearStatus();
     self.hover = null;
@@ -444,12 +448,16 @@ fn openOverlay(self: *Settings) bool {
     self.focus_visible = false;
     self.reset_all.cancel();
     self.wheel_lines.reset();
+    if (timing) |*value| value.lap(.prepare);
     self.enterSection(self.section);
 
     self.popup.setOwnerScale(self.window.scale);
     const maximized = w32.IsZoomed(owner) != 0 or self.window.title_bar.is_fullscreen;
     self.scrim.show(Scrim.visibleBounds(owner), !maximized);
-    self.popup.show(self.popupRect(owner));
+    const rect = self.popupRect(owner);
+    if (timing) |*value| value.lap(.layout);
+    self.popup.open_timing = timing;
+    self.popup.show(rect);
     self.opened_ms = system.nowMs();
     self.open = true;
     self.popup.invalidate();
@@ -479,7 +487,7 @@ fn finish(self: *Settings, how: Close) void {
     self.applied_preview = null;
     // Saving applies the saved configuration, which ends the preview.
     const applied = !self.changes.isEmpty() and self.saveNow();
-    if (previewed and !applied) _ = self.applyConfig(null);
+    if (previewed and !applied) _ = self.applyConfig(null, true);
     if (self.popup.hwnd) |hwnd| self.tooltip.setTarget(hwnd, .none);
     self.tooltip.hide();
     self.scrim.hide();
@@ -2114,7 +2122,7 @@ fn previewNow(self: *Settings) void {
     const span: gx.perf.Span = .begin(global.io());
     defer _ = span.end(global.io(), "settings_preview");
     const saved = self.commitChanges();
-    if (self.applyConfig(name)) {
+    if (self.applyConfig(name, true)) {
         self.applied_preview = index;
         if (saved) self.setStatus(.info, "Previewing {name}", .{ .name = name });
     }
@@ -2209,9 +2217,15 @@ fn saveFailed(self: *Settings, err: anyerror) bool {
 fn saveNow(self: *Settings) bool {
     self.stopTimer(.save);
     if (self.changes.isEmpty()) return true;
+    var theme_action = false;
+    if (gx.perf.enabled()) {
+        for (self.changes.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.key, "theme")) theme_action = true;
+        }
+    }
     if (!self.commitChanges()) return false;
     const preview = self.preview_theme orelse self.applied_preview;
-    const ok = self.applyConfig(if (preview) |index| self.themeName(index) else null);
+    const ok = self.applyConfig(if (preview) |index| self.themeName(index) else null, theme_action);
     if (ok) self.setStatus(.success, "Settings saved.", .{});
     return ok;
 }
@@ -2219,7 +2233,7 @@ fn saveNow(self: *Settings) bool {
 /// Builds the configuration (from the layers, else from the files) with
 /// `theme` as a preview override, applies it and shows its values. A
 /// preview has no reload notification and saves nothing.
-fn applyConfig(self: *Settings, theme: ?[]const u8) bool {
+fn applyConfig(self: *Settings, theme: ?[]const u8, theme_action: bool) bool {
     const preview = theme != null;
     var quiet_buf: [128]u8 = undefined;
     var args: [2][:0]const u8 = undefined;
@@ -2237,6 +2251,9 @@ fn applyConfig(self: *Settings, theme: ?[]const u8) bool {
     defer config.deinit();
     self.applying = true;
     defer self.applying = false;
+    if (gx.perf.enabled()) {
+        if (theme_action or preview or self.app.config.changed(&config, .theme)) gx.perf.count("theme.reload", 1);
+    }
     self.app.applyConfig(&config) catch |err| return self.applyFailed(preview, err);
     self.applied_inputs = inputsDigest(&self.app.config);
     if (!preview) self.applied_preview = null;

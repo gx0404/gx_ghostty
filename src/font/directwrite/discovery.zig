@@ -25,6 +25,7 @@ const match = @import("match.zig");
 const font = @import("../main.zig");
 const discovery = @import("../discovery.zig");
 const global = @import("../../global.zig");
+const perf = @import("../../gx/perf.zig");
 const config_layers = @import("../../gx/config_layers.zig");
 const DeferredFace = font.DeferredFace;
 const Descriptor = discovery.Descriptor;
@@ -33,6 +34,26 @@ const Library = font.Library;
 const Variation = font.face.Variation;
 
 const log = std.log.scoped(.discovery);
+
+var first_fallback: std.atomic.Value(bool) = .init(false);
+
+fn firstFallbackSpan(claimed: *std.atomic.Value(bool)) ?perf.Span {
+    if (!perf.enabled()) return null;
+    if (claimed.cmpxchgStrong(false, true, .monotonic, .monotonic) != null) return null;
+    return .begin(global.io());
+}
+
+test "first fallback timing claims once and stays untouched when disabled" {
+    const before = perf.enabled();
+    defer perf.setEnabled(before);
+    var claimed: std.atomic.Value(bool) = .init(false);
+    perf.setEnabled(false);
+    try std.testing.expect(firstFallbackSpan(&claimed) == null);
+    try std.testing.expect(!claimed.load(.monotonic));
+    perf.setEnabled(true);
+    try std.testing.expect(firstFallbackSpan(&claimed) != null);
+    try std.testing.expect(firstFallbackSpan(&claimed) == null);
+}
 
 pub const DirectWrite = struct {
     lib: Library,
@@ -132,6 +153,10 @@ pub const DirectWrite = struct {
         collection: *font.Collection,
         desc: Descriptor,
     ) !DiscoverIterator {
+        const span = firstFallbackSpan(&first_fallback);
+        defer if (span) |value| {
+            _ = value.end(global.io(), "font.first_fallback");
+        };
         _ = collection;
         return try self.discover(alloc, desc);
     }

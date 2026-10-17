@@ -744,6 +744,7 @@ pub const Scrollbar = struct {
         if (self.painted == null or !std.meta.eql(self.painted.?, key)) {
             const span: gx.perf.Span = .begin(global.io());
             const pixels = self.canvas.pixels(at.w, at.h) orelse return false;
+            gx.perf.count("scrollbar.paint", 1);
             render(key, pixels);
             const size: w32.SIZE = .{ .cx = at.w, .cy = at.h };
             const src: w32.POINT = .{ .x = 0, .y = 0 };
@@ -752,7 +753,7 @@ pub const Scrollbar = struct {
             self.placed = pos;
             self.alpha = alpha;
             self.paints +%= 1;
-            _ = span.end(global.io(), "scrollbar.paint");
+            _ = span.end(global.io(), "scrollbar.paint_time");
             return true;
         }
 
