@@ -736,7 +736,9 @@ class QuietProbe:
         rows = []
         active = [line.strip() for line in running.splitlines() if line.strip()]
         for name in active:
-            # Docker's managed distro is covered by the Docker VM inventory.
+            # docker-desktop* is Docker's own utility VM, not a build distribution. Plan §4
+            # gates only the validation VM containers (vm check); the number of running
+            # containers is recorded separately as an observation (docker_containers).
             if name.casefold().startswith('docker-desktop'):
                 continue
             output = command_output(["wsl.exe", "--distribution", name, "--exec", "ps", "-eo", "pid=,comm=,args="])
@@ -760,6 +762,12 @@ class QuietProbe:
                 type(row.get("running")) is not bool or type(row.get("exists")) is not bool for row in data.values()):
             raise PerfError("VM status is incomplete")
         return data
+
+    def containers(self) -> int:
+        """Running Docker containers of any image; only the count is kept."""
+        import gx_windows_vm
+        docker = gx_windows_vm.docker_executable(None)
+        return sum(bool(line.strip()) for line in command_output([docker, 'ps', '-q']).splitlines())
 
     def slots(self, root: Path) -> bool:
         import gx_slots
@@ -861,6 +869,11 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
         observation = {"status": "recorded", "raw": probe.cpu()}
     except Exception as exc:
         observation = {"status": "unavailable", "reason": str(exc)}
+    container_scope = 'observation only; plan §4 gates the validation VM containers (vm check)'
+    try:
+        containers = {'status': 'recorded', 'running': int(probe.containers()), 'scope': container_scope}
+    except Exception as exc:
+        containers = {'status': 'unavailable', 'reason': str(exc), 'scope': container_scope}
     code = 2 if any(row['status'] == 'error' for row in checks.values()) else (
         3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
     unverified = sorted(name for name, row in checks.items() if row['status'] == 'not_applicable')
@@ -870,7 +883,8 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
             # Every plan §4 criterion observed with the plan's thresholds (point in time; batches see RESULT.json).
             'plan_compliant': code == 0 and not unverified and thresholds,
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
-            "other_programs": other_programs, "build_processes": sorted(builds), "blacklist": blacklist,
+            "other_programs": other_programs, "docker_containers": containers,
+            "build_processes": sorted(builds), "blacklist": blacklist,
             "blacklist_matching": "case-sensitive substring of a process image name or main window title",
             "scope": "batch-owned locks" if lease else "point-in-time probe; locks released, not a reservation"}
 

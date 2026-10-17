@@ -198,6 +198,7 @@ class QuietTests(unittest.TestCase):
         self.probe.input_ticks.return_value = ticks(600)
         self.probe.session.return_value = {'interactive_console': True, 'process_session': 1, 'active_console_session': 1}
         self.probe.cpu.return_value = {'cpu': 100, 'top': []}
+        self.probe.containers.return_value = 0
 
     def test_cpu_is_not_a_gate_and_threshold_is_inclusive(self):
         result = gx_perf.quiet_snapshot(self.args, self.probe)
@@ -207,6 +208,19 @@ class QuietTests(unittest.TestCase):
         self.assertTrue(result['thresholds_plan_compliant'])
         self.probe.cpu.side_effect = OSError('PDH missing')
         self.assertEqual(0, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
+    def test_running_container_count_is_only_an_observation(self):
+        self.probe.containers.return_value = 3
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((0, 'recorded', 3), (result['exit'], result['docker_containers']['status'], result['docker_containers']['running']))
+        self.probe.containers.side_effect = gx_perf.PerfError('docker ps exited 1')
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((0, 'unavailable'), (result['exit'], result['docker_containers']['status']))
+        import gx_windows_vm
+        with mock.patch.object(gx_windows_vm, 'docker_executable', return_value='docker'), \
+                mock.patch.object(gx_perf, 'command_output', return_value='abc\ndef\n\n') as command:
+            self.assertEqual(2, gx_perf.QuietProbe().containers())
+        command.assert_called_once_with(['docker', 'ps', '-q'])
 
     def test_each_gate_and_probe_error_fail_closed(self):
         for method, value in [('windows', windows_data({'pid': 1, 'name': 'ZiG.ExE'})),
