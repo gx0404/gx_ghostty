@@ -1,13 +1,31 @@
 id = "W12"
 title = "WSL: losing the mouse capture mid-press reports one release, the later button up none"
 requires = ["wsl:Ubuntu-24.04"]
+# R0: released-on-cancel and one-release. Phase 6 (r6) extends the case for R2-Surface.05 and
+# R2-Scrollbar.01-04: the overlay scrollbar stays hidden for output and shows when the user
+# scrolls or rests on the right edge, fades after a second, widens under the pointer, passes
+# the wheel to the terminal, jumps on a track click, pages while a press is held, and is never
+# created with scrollbar = never. The always-visible mode follows a system setting the fixture
+# does not change.
 config = """
 command = wsl.exe -d Ubuntu-24.04 -e bash --noprofile --norc
 language = en
+keybind = ctrl+shift+r=reload_config
 """
+# GX performance lines (info(gx_perf)) count the scrollbar paints in ghostty.log; they change
+# nothing else.
+env = { GHOSTTY_GX_PERF = "1" }
 expect = [
   "released-on-cancel: after WM_CANCELMODE took the capture and while the button is still held, cat -v already shows the ^[[<0;…M press and exactly one ^[[<0;…m release",
   "one-release: cat -v shows one ^[[<0;…M press and exactly one ^[[<0;…m release (sent when WM_CANCELMODE took the capture); the physical button up adds no second release",
+  "at-bottom: after 400 lines of output the view is at the bottom and no scrollbar shows (output never reveals it)",
+  "wheel-reveal: three wheel notches up scrolled the view and revealed the thin overlay thumb at the right edge, near the bottom of the track",
+  "faded: two seconds without use the scrollbar has faded out again",
+  "edge-reveal: with the pointer resting on the right edge the scrollbar shows again with the wider, brighter thumb (hover)",
+  "wheel-on-bar: the wheel over the scrollbar scrolled the terminal further up",
+  "track-jump: a click high on the track jumped the view up there (the numbers near the top of the output show)",
+  "hold-paging: while a press low on the track was held, the view paged down toward the pointer",
+  "never: after scrollbar = never and a reload, scrolling up shows no scrollbar at all",
 ]
 
 [[step]]
@@ -57,3 +75,182 @@ seconds = 0.6
 [[step]]
 action = "capture"
 name = "one-release"
+
+# --- r6 extension (R2-Surface.05, R2-Scrollbar.01-04) ---------------------------------------
+[[step]]
+action = "key"
+keys = "ctrl+c"
+
+[[step]]
+action = "type"
+text = "printf '\\e[?1000l\\e[?1006l'; clear; seq 1 400\n"
+
+[[step]]
+action = "sleep"
+seconds = 2.0
+
+[[step]]
+action = "capture"
+name = "at-bottom"
+what = "all"
+
+[[step]]
+action = "wheel"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+delta = 120
+count = 3
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyScrollbar"
+timeout = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "capture"
+name = "wheel-reveal"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 2.5
+
+[[step]]
+action = "capture"
+name = "faded"
+what = "all"
+
+# The overlay scrollbar floats over the right 12 DIPs of the terminal.
+[[step]]
+action = "move"
+in = "terminal:0"
+x = -4
+y = "50%"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyScrollbar"
+timeout = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "edge-reveal"
+what = "all"
+
+[[step]]
+action = "wheel"
+in = "terminal:0"
+x = -4
+y = "50%"
+delta = 120
+count = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "wheel-on-bar"
+what = "all"
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = -4
+y = "8%"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "track-jump"
+what = "all"
+
+[[step]]
+action = "mouse_down"
+in = "terminal:0"
+x = -4
+y = "92%"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "hold-paging"
+what = "all"
+
+[[step]]
+action = "mouse_up"
+in = "terminal:0"
+x = -4
+y = "92%"
+
+[[step]]
+action = "sleep"
+seconds = 2.5
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "command = wsl.exe -d Ubuntu-24.04 -e bash --noprofile --norc\nlanguage = en\nkeybind = ctrl+shift+r=reload_config\nscrollbar = never\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "wheel"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+delta = 120
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "never"
+what = "all"
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = -4
+y = "50%"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyScrollbar"
+present = false
+timeout = 2
