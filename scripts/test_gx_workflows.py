@@ -786,6 +786,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertEqual(field(RELEASE.job(name), "runs-on", 4), runner)
 
     def test_linux_gtk_builds_from_the_dist_tarball_in_debian_13(self):
+        import gx_release
+
         job = RELEASE.job("linux-gtk")
         self.assertEqual(mapping(job, "container", 4), {"image": "debian:13"})
         packages = apt_packages(RELEASE.scripts("linux-gtk")[0])
@@ -796,9 +798,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
             'zig build dist "-Dversion-string=$GX_VERSION_STRING"',
             'tar -xzf "$RUNNER_TEMP/gx-out/ghostty-$GX_VERSION_STRING.tar.gz"',
             "test ! -e .git", "--prefix /usr -Doptimize=ReleaseFast -Dcpu=baseline",
-            "+version", 'grep -Fx "  - version: $GX_VERSION_STRING"')]
+            "+version", 'grep -Fx "  - version: $GX_VERSION_STRING"',
+            # The license texts of the source the binary was built from (O3 finding F-1), written by the
+            # extracted tarball's own scripts/gx_release.py into the tree that is archived next.
+            f'python3 scripts/gx_release.py linux-doc --dest "$stage/$name/{gx_release.LINUX_APP_DOC}"',
+            'tar -C "$stage" -czf "$RUNNER_TEMP/gx-out/$name.tar.gz" "$name"')]
         self.assertEqual(order, sorted(order))
         self.assertIn('name="ghostty-gx-$GX_VERSION_STRING-x86_64-linux-debian13"', text)
+        self.assertEqual(text.count("linux-doc"), 1)
+        build = next(step for step in steps(job) if field(step, "name", 8) == "Build the GTK app from the source tarball")
+        self.assertEqual(mapping(build, "env", 8).get("PYTHONDONTWRITEBYTECODE"), "'1'")
+        # blueprint-compiler, a build dependency, is a Python 3 program: the container has python3.
+        self.assertIn("blueprint-compiler", packages)
 
     def test_linux_gtk_noble_runs_the_documented_deb_contract_in_ubuntu_24_04(self):
         import gx_package
