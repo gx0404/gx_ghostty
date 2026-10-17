@@ -132,6 +132,7 @@ pub const Probe = union(enum) {
         switch (self) {
             .io => |io| {
                 if (!std.fs.path.isAbsolute(path) or !validNativePath(path)) return false;
+                @import("perf.zig").count("profiles.path_scan", 1);
                 std.Io.Dir.accessAbsolute(io, path, .{
                     .execute = builtin.os.tag != .windows,
                 }) catch return false;

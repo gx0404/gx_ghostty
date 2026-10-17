@@ -240,6 +240,7 @@ pub const Table = struct {
                     return error.SnapshotFailed;
                 };
                 errdefer dir.close(io);
+                @import("perf.zig").count("proc.snapshot", 1);
                 var table = try readProc(alloc, io, dir);
                 table.names.procfs.owned = true;
                 return table;
@@ -647,6 +648,7 @@ const windows = if (builtin.os.tag == .windows) struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        @import("perf.zig").count("proc.snapshot", 1);
         const handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (handle == win.INVALID_HANDLE_VALUE) return error.SnapshotFailed;
         defer _ = CloseHandle(handle);
