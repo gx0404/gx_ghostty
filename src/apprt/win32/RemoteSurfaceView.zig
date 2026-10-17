@@ -6,6 +6,7 @@ const std = @import("std");
 const refs = @import("../../gx/ui_ref.zig");
 const Channel = @import("ipc/RemoteChannel.zig").Channel;
 const d2d = @import("ui/d2d.zig");
+const RemotePerf = @import("RemotePerf.zig");
 
 pub const State = enum { waiting, live, unavailable, closed };
 pub const DrawResult = enum { waiting, drawn, unavailable, backend_unavailable };
@@ -18,6 +19,7 @@ state: State = .waiting,
 last_frame: []u8,
 has_frame: bool = false,
 last_sequence: u64 = 0,
+perf_frame: RemotePerf.Presentation = .{},
 
 /// local_id must be issued from the host's remote-view namespace, not copied
 /// from a foreign core Surface ID. The registry must distinguish local core
@@ -34,7 +36,14 @@ pub fn init(allocator: std.mem.Allocator, issuer: *refs.Issuer, local_id: u64, o
 /// A hidden or replaced local attachment cannot resurrect its old providers.
 pub fn setVisible(self: *Self, issuer: *refs.Issuer, owner: refs.Reference, visible: bool) !void {
     if (self.state == .closed) return error.Closed;
+    if (!visible) self.perf_frame = .{};
     try self.attachment.setVisible(issuer, self.reference, owner, visible);
+}
+
+/// Both frameReady and draw use this gate. Hidden frames may still update the
+/// pixel cache, but cannot start a sample that includes time away from the tab.
+pub fn receivePerf(self: *Self, stamp: RemotePerf.InputStamp, visible: bool) void {
+    if (visible) self.perf_frame.received(stamp, RemotePerf.now());
 }
 
 pub fn matches(self: *const Self, attachment: refs.Attachment) bool {
@@ -59,6 +68,7 @@ pub fn draw(self: *Self, canvas: *d2d.Canvas, bounds: d2d.Rect) DrawResult {
             self.disconnect();
             return .unavailable;
         }
+        self.receivePerf(reading.lease.perf_input, self.attachment.isValid());
         @memcpy(self.last_frame, reading.lease.pixels);
         self.has_frame = true;
         self.last_sequence = reading.lease.sequence;
@@ -76,6 +86,7 @@ pub fn disconnect(self: *Self) void {
     self.state = .unavailable;
     self.attachment = .{};
     self.has_frame = false;
+    self.perf_frame = .{};
     self.channel.close();
 }
 

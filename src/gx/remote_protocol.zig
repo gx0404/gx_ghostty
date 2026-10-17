@@ -6,7 +6,7 @@ const std = @import("std");
 const refs = @import("ui_ref.zig");
 const view = @import("remote_view.zig");
 const policy = @import("ipc/policy.zig");
-pub const version: u16 = 2;
+pub const version: u16 = 3;
 pub const max_frame_size = 64 * 1024;
 pub const max_nodes = 256;
 pub const max_leaves = 128;
@@ -82,6 +82,18 @@ pub const Input = struct {
         /// Source must apply protected-paste policy and never append Enter.
         paste: Paste,
     },
+    /// Fixed in v3 even when measurement is off, so process-local switches
+    /// cannot change the codec. Only its format/measurement eligibility is
+    /// validated; it is not an authorization, ordering or replay identity.
+    perf: view.InputStamp = .{},
+
+    pub fn measurable(event: @FieldType(Input, "event")) bool {
+        return switch (event) {
+            .key => |key| key.action != .release and key.text.len != 0,
+            .text => |value| value.len != 0,
+            else => false,
+        };
+    }
 };
 pub const Outcome = enum(u16) { completed, rejected, unavailable, cancelled, unknown };
 pub const ActionRequest = struct { surface: refs.Reference, lease: Lease, transaction: u64, config_generation: u64, action: ActionText, all: bool = false, global: bool = false };
@@ -292,6 +304,7 @@ pub fn validate(packet: *const Packet) Error!void {
         .input => |*input| {
             try reference(input.surface, ticket.source_epoch);
             if (packet.sender_epoch != ticket.target_epoch or input.sequence == 0 or input.lease.holder_epoch != ticket.target_epoch or input.lease.generation != ticket.generation or input.lease.transaction != ticket.transaction) return error.InvalidInput;
+            if (!input.perf.valid() or (input.perf.sequence != 0 and !Input.measurable(input.event))) return error.InvalidInput;
             switch (input.event) {
                 .key => |key| {
                     // The authenticated build digest freezes the physical key enum.
@@ -611,6 +624,83 @@ test "remote input requires exact target lease and checked bounded text" {
     try validate(&packet);
     packet.body.input.event.paste.index = max_paste_bytes / (Text.capacity - 3) + 2;
     try std.testing.expectError(error.InvalidInput, validate(&packet));
+}
+
+test "gx.remote input performance stamp survives wire renumbering and rejects malformed v3 frames" {
+    const alloc = std.testing.allocator;
+    const packet = try alloc.create(Packet);
+    defer alloc.destroy(packet);
+    const decoded = try alloc.create(Packet);
+    defer alloc.destroy(decoded);
+    const buffer = try alloc.alloc(u8, max_frame_size);
+    defer alloc.free(buffer);
+    packet.* = .{ .sender_epoch = 2, .recipient_epoch = 1, .request_id = 1, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 9 }, .body = .{ .input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 400,
+        .event = .{ .text = try Text.init("hello") },
+        .perf = .{ .sequence = 17, .qpc = 123456789 },
+    } } };
+    const encoded = try encode(buffer, packet);
+    try decodeInto(encoded, decoded);
+    try std.testing.expectEqual(@as(u64, 400), decoded.body.input.sequence);
+    try std.testing.expectEqual(packet.body.input.perf, decoded.body.input.perf);
+    try std.testing.expectError(error.InvalidFrame, decodeInto(encoded[0 .. encoded.len - 1], decoded));
+    // A v2 peer cannot silently interpret the appended fields as old input.
+    std.mem.writeInt(u16, buffer[4..6], 2, .little);
+    try std.testing.expectError(error.InvalidVersion, decodeInto(encoded, decoded));
+    std.mem.writeInt(u16, buffer[4..6], version, .little);
+    std.mem.writeInt(u64, buffer[encoded.len - 8 ..][0..8], 0, .little);
+    try std.testing.expectError(error.InvalidInput, decodeInto(encoded, decoded));
+    for ([_]view.InputStamp{ .{ .sequence = 1 }, .{ .qpc = 1 }, .{ .sequence = 1, .qpc = std.math.maxInt(u64) } }) |stamp| {
+        packet.body.input.perf = stamp;
+        try std.testing.expectError(error.InvalidInput, encode(buffer, packet));
+    }
+    packet.body.input.perf = .{};
+    // Disabled sampling keeps exactly the same v3 byte length and resets a
+    // reused decoder's old stamp. Full bounded text still fits in one frame.
+    try std.testing.expectEqual(encoded.len, (try encode(buffer, packet)).len);
+    try decodeInto(try encode(buffer, packet), decoded);
+    try std.testing.expectEqual(view.InputStamp{}, decoded.body.input.perf);
+    packet.body.input.event.text = try Text.init(&(@as([Text.capacity]u8, @splat('x'))));
+    try std.testing.expect((try encode(buffer, packet)).len <= max_frame_size);
+    packet.body.input.perf = .{ .sequence = 18, .qpc = 999 };
+    packet.body.input.event = .{ .focus = true };
+    try std.testing.expectError(error.InvalidInput, encode(buffer, packet));
+}
+
+test "gx.remote measurement eligibility matches wire validation for text-bearing input only" {
+    const alloc = std.testing.allocator;
+    const packet = try alloc.create(Packet);
+    defer alloc.destroy(packet);
+    packet.* = .{ .sender_epoch = 2, .recipient_epoch = 1, .request_id = 1, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 7, .generation = 9 }, .body = .{ .input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 1,
+        .event = .{ .text = .{} },
+    } } };
+    const Event = @FieldType(Input, "event");
+    const cases = [_]struct { event: Event, measurable: bool }{
+        .{ .event = .{ .text = try Text.init("x") }, .measurable = true },
+        .{ .event = .{ .text = .{} }, .measurable = false },
+        .{ .event = .{ .key = .{ .action = .press, .physical = 1, .unicode = 'x', .modifiers = 0, .text = try Text.init("x") } }, .measurable = true },
+        .{ .event = .{ .key = .{ .action = .repeat, .physical = 1, .unicode = 'x', .modifiers = 0, .text = try Text.init("x") } }, .measurable = true },
+        .{ .event = .{ .key = .{ .action = .release, .physical = 1, .unicode = 'x', .modifiers = 0, .text = try Text.init("x") } }, .measurable = false },
+        // Modifier-only keys, arrows and target-only shortcuts have no text.
+        .{ .event = .{ .key = .{ .action = .press, .physical = 1, .unicode = 0, .modifiers = 1 } }, .measurable = false },
+        .{ .event = .{ .key = .{ .action = .repeat, .physical = 1, .unicode = 0, .modifiers = 0 } }, .measurable = false },
+        .{ .event = .{ .composition = .{ .phase = .update, .text = try Text.init("x") } }, .measurable = false },
+        .{ .event = .{ .focus = true }, .measurable = false },
+        .{ .event = .{ .visible = false }, .measurable = false },
+    };
+    for (cases) |case| {
+        packet.body.input.event = case.event;
+        packet.body.input.perf = .{};
+        try validate(packet);
+        packet.body.input.perf = .{ .sequence = 1, .qpc = 100 };
+        try std.testing.expectEqual(case.measurable, Input.measurable(case.event));
+        if (case.measurable) try validate(packet) else try std.testing.expectError(error.InvalidInput, validate(packet));
+    }
 }
 
 test "remote input sequence survives reconnect and key tags require real enum membership" {

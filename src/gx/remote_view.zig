@@ -6,6 +6,17 @@ pub const max_dimension: u32 = 16384;
 pub const max_frame_bytes: u32 = 128 * 1024 * 1024;
 pub const slot_count = 2;
 
+/// Target-local input identity, independent of transport renumbering. QPC is
+/// comparable across processes on the same Windows host. Both zero means off.
+pub const InputStamp = struct {
+    sequence: u64 = 0,
+    qpc: u64 = 0,
+
+    pub fn valid(self: InputStamp) bool {
+        return (self.sequence == 0) == (self.qpc == 0) and self.qpc <= std.math.maxInt(i64);
+    }
+};
+
 /// BGRA8 pixels, top row first. One immutable layout per mapping generation;
 /// resize creates another mapping instead of mutating a reader's dimensions.
 pub const Layout = struct {
