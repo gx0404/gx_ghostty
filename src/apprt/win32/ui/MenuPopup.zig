@@ -1324,6 +1324,7 @@ const State = struct {
         };
         const index = self.depth;
         var timing = if (index == 0) self.open_timing else null;
+        if (index == 0) self.open_timing = null;
         if (timing) |*value| value.lap(.prepare);
         const level = &self.levels[index];
         const popup = &self.popups[index];
@@ -1377,7 +1378,7 @@ const State = struct {
             level.layout();
             level.place();
             if (layout_span) |value| {
-                if (popup.open_timing) |*opened| opened.phases[@intFromEnum(Popup.OpenTiming.Phase.layout)] += perf.sinceUs(global.io(), value.start);
+                if (popup.open_timing) |*opened| opened.addSince(.layout, value.start);
             }
             popup.setBounds(level.bounds);
         }

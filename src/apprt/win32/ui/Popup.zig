@@ -75,11 +75,17 @@ const log = std.log.scoped(.win32_popup);
 pub const OpenTiming = struct {
     pub const Kind = enum { palette, menu, settings };
     pub const Phase = enum { prepare, create, layout, raster, show };
+    const Frame = struct { width: u32, height: u32, dpi: u32 };
     kind: Kind,
     start: perf.Instant,
     last: perf.Instant,
     phases: [5]u64 = @splat(0),
     painted: bool = false,
+    frame: ?Frame = null,
+    ready: ?perf.Instant = null,
+    /// Paints during ShowWindow/RedrawWindow must wait for the rest of the
+    /// synchronous show path before capturing ready (just before the RV timer).
+    showing: bool = false,
 
     pub fn begin(kind: Kind) ?OpenTiming {
         if (!perf.enabled()) return null;
@@ -97,6 +103,17 @@ pub const OpenTiming = struct {
         self.phases[@intFromEnum(phase)] += us;
     }
 
+    pub fn addSince(self: *OpenTiming, phase: Phase, start: perf.Instant) void {
+        self.add(phase, perf.sinceUs(global.io(), start));
+    }
+
+    fn readyAt(self: *OpenTiming, at: perf.Instant, current: Frame) void {
+        if (self.showing or self.ready != null) return;
+        const frame = self.frame orelse return;
+        if (current.width == 0 or current.height == 0 or !std.meta.eql(frame, current)) return;
+        self.ready = at;
+    }
+
     fn finishAt(self: *OpenTiming, at: perf.Instant) u64 {
         const total = perf.elapsedUs(self.start, at);
         var work: u64 = 0;
@@ -105,14 +122,15 @@ pub const OpenTiming = struct {
         return total;
     }
 
-    fn report(self: *OpenTiming) void {
-        const total = self.finishAt(perf.now(global.io()));
+    fn reportAt(self: *OpenTiming, comptime Recorder: type, at: perf.Instant) void {
+        const total = self.finishAt(at);
         switch (self.kind) {
             inline else => |kind| {
                 inline for (std.meta.fields(Phase), 0..) |phase, i| {
-                    perf.record(@tagName(kind) ++ ".open." ++ phase.name, self.phases[i]);
+                    Recorder.record(@tagName(kind) ++ ".open." ++ phase.name, self.phases[i]);
                 }
-                perf.record(@tagName(kind) ++ ".open.total", total);
+                Recorder.record(@tagName(kind) ++ ".open.ready", perf.elapsedUs(self.start, self.ready.?));
+                Recorder.record(@tagName(kind) ++ ".open.total", total);
             },
         }
     }
@@ -538,6 +556,7 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
         return;
     }
 
+    if (self.open_timing) |*timing| timing.showing = true;
     if (self.options.activate and self.options.keep_owner_active) self.lockOwner();
     const motion = if (self.layered) self.options.motion else null;
     const animate = motion != null and anim.enabled();
@@ -571,6 +590,10 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
     if (self.options.capture_mouse) _ = w32.SetCapture(hwnd);
     self.visible = true;
     _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
+    if (self.open_timing) |*timing| {
+        timing.showing = false;
+        self.markOpenReady(hwnd, perf.now(global.io()));
+    }
     if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, reveal_ms, null) == 0) self.reveal(hwnd);
 }
 
@@ -782,10 +805,27 @@ fn finishMotion(self: *Popup, hwnd: w32.HWND) void {
 }
 
 fn finishOpenTiming(self: *Popup) void {
-    if (self.open_timing) |*timing| {
-        if (timing.painted) timing.report();
-        self.open_timing = null;
-    }
+    if (self.open_timing == null) return;
+    self.finishOpenTimingAt(perf, perf.now(global.io()));
+}
+
+fn finishOpenTimingAt(self: *Popup, comptime Recorder: type, at: perf.Instant) void {
+    var timing = self.open_timing orelse return;
+    // Take before logging: an opening can report only once, even on reentry.
+    self.open_timing = null;
+    if (timing.painted and timing.ready != null) timing.reportAt(Recorder, at);
+}
+
+fn openFrame(self: *const Popup, hwnd: w32.HWND) ?OpenTiming.Frame {
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return null;
+    return .{ .width = @intCast(client.right), .height = @intCast(client.bottom), .dpi = self.canvasDpi() };
+}
+
+fn markOpenReady(self: *Popup, hwnd: w32.HWND, at: perf.Instant) void {
+    const timing = if (self.open_timing) |*value| value else return;
+    if (timing.showing or timing.ready != null or timing.frame == null) return;
+    timing.readyAt(at, self.openFrame(hwnd) orelse return);
 }
 
 /// Stop a reveal or fade in progress (hiding).
@@ -1486,7 +1526,13 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     const raster = if (self.open_timing != null) perf.Span.begin(global.io()) else null;
     defer if (raster) |span| {
         if (livePopup(hwnd, cookie)) |current| {
-            if (current.open_timing) |*timing| timing.add(.raster, perf.sinceUs(global.io(), span.start));
+            if (current.open_timing) |*timing| {
+                const at = perf.now(global.io());
+                timing.add(.raster, perf.elapsedUs(span.start, at));
+                // If synchronous show could not paint, take the first later
+                // successful current-size/DPI frame after EndPaint/UIA refresh.
+                current.markOpenReady(hwnd, at);
+            }
         }
     };
     defer if (livePopup(hwnd, cookie)) |current| {
@@ -1510,21 +1556,24 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(hwnd, &client) == 0) return;
         const mem = self.dib.ensure(dc, client.right, client.bottom) orelse return;
-        if (!canvas.beginDc(mem, .{ .left = 0, .top = 0, .right = client.right, .bottom = client.bottom }, self.canvasDpi())) return;
+        const dpi = self.canvasDpi();
+        if (!canvas.beginDc(mem, .{ .left = 0, .top = 0, .right = client.right, .bottom = client.bottom }, dpi)) return;
+        const frame: OpenTiming.Frame = .{ .width = @intCast(client.right), .height = @intCast(client.bottom), .dpi = dpi };
         canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
         cb.paint(cb.ctx, self, canvas);
         switch (canvas.finish()) {
-            .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd),
+            .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd, frame),
             .recreate => self.repaint(),
             .failed => {},
         }
         return;
     }
     if (!canvas.beginHwnd(hwnd, self.canvasDpi())) return;
+    const frame = if (self.open_timing != null) self.openFrame(hwnd) else null;
     canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
     cb.paint(cb.ctx, self, canvas);
     switch (canvas.finish()) {
-        .ok => self.markLegacyFrame(hwnd),
+        .ok => self.markLegacyFrame(hwnd, frame),
         .recreate => self.repaint(),
         .failed => {},
     }
@@ -1546,8 +1595,11 @@ fn compositionReady(self: *Popup, hwnd: w32.HWND) bool {
     return frame.width == width and frame.height == height and frame.dpi == self.canvasDpi();
 }
 
-fn markLegacyFrame(self: *Popup, hwnd: w32.HWND) void {
-    if (self.open_timing) |*timing| timing.painted = true;
+fn markLegacyFrame(self: *Popup, hwnd: w32.HWND, frame: ?OpenTiming.Frame) void {
+    if (self.open_timing) |*timing| {
+        timing.painted = true;
+        timing.frame = frame;
+    }
     if (!self.composition_requested) return;
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return;
@@ -1602,7 +1654,10 @@ fn paintComposition(self: *Popup, hwnd: w32.HWND, canvas: *d2d.Canvas, cb: Callb
         return false;
     };
     self.composition_frame = frame.key;
-    if (self.open_timing) |*timing| timing.painted = true;
+    if (self.open_timing) |*timing| {
+        timing.painted = true;
+        timing.frame = .{ .width = frame.key.width, .height = frame.key.height, .dpi = frame.key.dpi };
+    }
     return true;
 }
 
@@ -2102,6 +2157,92 @@ test "caret blinking preserves the live UIA snapshot and queued Value action" {
     try testing.expect(!popup.uia_view.publisher.accepts(last));
     try testing.expectEqual(unavailable, abi.ProviderOptions(before_destroy, &options));
     try testing.expectEqual(unavailable, abi.ProviderOptions(retained, &options));
+}
+
+test "opening ready waits for synchronous show and a current-size DPI frame" {
+    const expected: OpenTiming.Frame = .{ .width = 640, .height = 480, .dpi = 144 };
+    var timing: OpenTiming = .{
+        .kind = .palette,
+        .start = .{ .nanoseconds = 0 },
+        .last = .{ .nanoseconds = 0 },
+        .showing = true,
+        .painted = true,
+        .frame = expected,
+    };
+    timing.readyAt(.{ .nanoseconds = 1000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.showing = false;
+    timing.readyAt(.{ .nanoseconds = 2000 }, expected);
+    try std.testing.expectEqual(@as(i96, 2000), timing.ready.?.nanoseconds);
+    timing.readyAt(.{ .nanoseconds = 9000 }, expected);
+    try std.testing.expectEqual(@as(i96, 2000), timing.ready.?.nanoseconds);
+
+    // The synchronous frame failed. Later successful drawing, not the failed
+    // show return or an old-size/old-DPI bitmap, establishes the ready endpoint.
+    timing.ready = null;
+    timing.frame = null;
+    timing.readyAt(.{ .nanoseconds = 10_000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.frame = .{ .width = 640, .height = 480, .dpi = 96 };
+    timing.readyAt(.{ .nanoseconds = 11_000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.frame = .{ .width = 800, .height = 480, .dpi = 144 };
+    timing.readyAt(.{ .nanoseconds = 12_000 }, expected);
+    try std.testing.expect(timing.ready == null);
+    timing.frame = expected;
+    timing.readyAt(.{ .nanoseconds = 13_000 }, expected);
+    try std.testing.expectEqual(@as(i96, 13_000), timing.ready.?.nanoseconds);
+}
+
+test "opening emits seven metrics once on reveal and none when cancelled" {
+    const Capture = struct {
+        var length: usize = 0;
+        var names: [32][]const u8 = undefined;
+        var values: [32]u64 = undefined;
+        pub fn record(name: []const u8, us: u64) void {
+            names[length] = name;
+            values[length] = us;
+            length += 1;
+        }
+    };
+    for (std.meta.tags(OpenTiming.Kind)) |kind| {
+        const opening: OpenTiming = .{
+            .kind = kind,
+            .start = .{ .nanoseconds = 1000 },
+            .last = .{ .nanoseconds = 1000 },
+            .painted = true,
+            .ready = .{ .nanoseconds = 151_000 },
+        };
+        Capture.length = 0;
+        var popup: Popup = .{ .open_timing = opening };
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 901_000 });
+        try std.testing.expect(popup.open_timing == null);
+        try std.testing.expectEqual(@as(usize, 7), Capture.length);
+        inline for (.{ "prepare", "create", "layout", "raster", "show", "ready", "total" }, 0..) |phase, i| {
+            var buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "{s}.open.{s}", .{ @tagName(kind), phase });
+            try std.testing.expectEqualStrings(name, Capture.names[i]);
+        }
+        try std.testing.expectEqual(@as(u64, 150), Capture.values[5]);
+        try std.testing.expectEqual(@as(u64, 400), Capture.values[6]);
+
+        Capture.length = 0;
+        popup.open_timing = opening;
+        popup.hide(); // Escape/dismiss cancels even an already-ready opening.
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.open_timing = opening;
+        popup.destroy();
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.open_timing = opening;
+        popup.open_timing.?.painted = false;
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        popup.open_timing = opening;
+        popup.open_timing.?.ready = null;
+        popup.finishOpenTimingAt(Capture, .{ .nanoseconds = 401_000 });
+        try std.testing.expectEqual(@as(usize, 0), Capture.length);
+        try std.testing.expect(popup.open_timing == null);
+    }
 }
 
 test "opening phases partition the action through reveal including repeated raster" {
