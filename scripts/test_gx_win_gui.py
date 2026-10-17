@@ -493,6 +493,26 @@ class InputGuardTests(unittest.TestCase):
                 self.instance().drag((10, 10), (20, 20), release=False)
         self.assertEqual([('mouse', 0x4, 0, 0, 0)], fake.sent[-1])
 
+    def test_completion_inside_a_caller_except_block_is_not_an_abort(self):
+        fake = FakeWin32(self.PID, self.PID)
+        instance = self.instance()
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'guards.jsonl'
+            with mock.patch.dict(os.environ, {'GX_PERF_BATCH_ID': 'batch', 'GX_PERF_GUARD_LOG': str(log)}), \
+                    mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
+                try:
+                    raise RuntimeError('the caller is handling an unrelated error')
+                except RuntimeError:
+                    instance.drag((10, 10), (20, 20), steps=2, release=False)
+                    instance.hold_key('down', seconds=1, hz=2)
+            rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+        releases = [row for row in rows if row['event'] == 'release']
+        # drag(release=False) completed, so its button stays down; the key hold ends with one normal release.
+        self.assertEqual(['down'], [row['control'] for row in releases])
+        self.assertFalse(releases[0]['abort_release'])
+        self.assertNotIn(('mouse', 0x4, 0, 0, 0), [event for batch in fake.sent for event in batch])
+        self.assertEqual([('key', 0x28, True)], fake.sent[-1])
+
     def instance(self) -> gui.Instance:
         return gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
 

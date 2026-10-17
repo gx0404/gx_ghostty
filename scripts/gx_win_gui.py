@@ -1146,16 +1146,20 @@ class Instance:
             raise UsageError("hold_key accepts one unmodified key")
         w = win32()
         start = time.monotonic()
-        sent = False
+        # A completion flag, not sys.exc_info(): inside a caller's except block
+        # exc_info() still reports the caller's exception and would label a
+        # normal finish as an abort.
+        sent = completed = False
         try:
             for index in range(max(1, round(seconds * hz))):
                 self.ensure_foreground()
                 w.send([w.key_input(vk, False)])
                 sent = True
                 time.sleep(max(0, start + (index + 1) / hz - time.monotonic()))
+            completed = True
         finally:
             if sent:
-                self.release_input([w.key_input(vk, True)], key, sys.exc_info()[0] is not None)
+                self.release_input([w.key_input(vk, True)], key, not completed)
 
     def uia_rows(self, hwnd: int) -> list[dict]:
         """Read geometry under an owned HWND; no UIA invocation or desktop search."""
@@ -1232,6 +1236,7 @@ class Instance:
     def drag(self, start: tuple[int, int], end: tuple[int, int], *, steps: int = 12, button: str = "left",
              release: bool = True, step_delay: float = 0.015) -> None:
         self.mouse(*start, button=button, action="down")
+        completed = False
         try:
             for index in range(1, steps + 1):
                 x = round(start[0] + (end[0] - start[0]) * index / steps)
@@ -1240,11 +1245,12 @@ class Instance:
                 self.ensure_point(x, y)
                 win32().send([win32().mouse_input(0x0001 | 0x8000 | 0x4000, x, y)])
                 time.sleep(step_delay)
+            completed = True
         finally:
-            aborted = sys.exc_info()[0] is not None
-            if release or aborted:
+            # release=False keeps the button down only after a completed drag.
+            if release or not completed:
                 self.release_input([win32().mouse_input(MOUSE_BUTTONS[button][1], data=MOUSE_BUTTONS[button][2])],
-                                   button, aborted)
+                                   button, not completed)
 
     # -- test hooks and probes ------------------------------------------------
 
