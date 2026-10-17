@@ -16,6 +16,7 @@ const refs = @import("../../gx/ui_ref.zig");
 const protocol = @import("../../gx/remote_protocol.zig");
 const Input = @import("RemoteInput.zig");
 const RemotePerf = @import("RemotePerf.zig");
+const RemoteControls = @import("RemoteControls.zig");
 const View = @import("RemoteSurfaceView.zig");
 const Channel = @import("ipc/RemoteChannel.zig").Channel;
 const Snapshot = @import("PaneSnapshot.zig");
@@ -67,6 +68,7 @@ mouse_visible: bool = true,
 bell_border_state: bell_border.State = .{},
 /// Survives mapping replacement; a fresh pane/lease starts at zero.
 perf_last_input: u64 = 0,
+test_controls: RemoteControls.State = .{},
 
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "user32" fn GetClassNameW(w32.HWND, [*]u16, i32) callconv(.winapi) i32;
@@ -580,6 +582,9 @@ pub fn wndProc(hwnd: w32.HWND, message: u32, wparam: usize, lparam: isize) callc
     const address = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
     const self: *Self = if (address != 0) @ptrFromInt(@as(usize, @bitCast(address))) else return w32.DefWindowProcW(hwnd, message, wparam, lparam);
     const fixture = @import("remote_test.zig");
+    if (message == RemoteControls.query_message or message == RemoteControls.control_message) {
+        if (self.testMessage(fixture.enabled(), message, wparam, lparam)) |result| return result;
+    }
     if (message == fixture.query_message and fixture.enabled()) return self.query(wparam);
     switch (message) {
         w32.WM_SETCURSOR => {
@@ -711,6 +716,19 @@ pub fn query(self: *const Self, field: usize) isize {
         10 => self.ui.queryResult(),
         else => 0,
     };
+}
+
+/// Called only on the pane's GUI thread. A disabled gate does not inspect self.
+fn testMessage(self: *Self, enabled: bool, message: u32, wparam: usize, lparam: isize) ?isize {
+    if (!enabled) return null;
+    const live = !self.destroying and !self.closed and !self.unavailable and !self.input_suspended and self.gate.lease != null;
+    return self.test_controls.dispatch(true, live, message, wparam, lparam);
+}
+
+test "remote pane fixture messages fall through without touching pane when gate is off" {
+    const pane: *Self = undefined;
+    try std.testing.expectEqual(@as(?isize, null), pane.testMessage(false, RemoteControls.query_message, 0, 0));
+    try std.testing.expectEqual(@as(?isize, null), pane.testMessage(false, RemoteControls.control_message, 1, RemoteControls.magic));
 }
 
 test "remote bell border edges cover exactly the shared border pixels" {
