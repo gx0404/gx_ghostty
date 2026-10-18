@@ -92,10 +92,13 @@ pub fn run(app: *App, source_reference: refs.Reference, tab: refs.Reference, poi
     }
     var cursor: w32.POINT = undefined;
     if (w32.GetCursorPos_(&cursor) == 0) return;
+    // Test-gated drop evidence; off-gate the counters never change.
+    const fixture_gate = @import("remote_test.zig").enabled();
+    app.fixture.count(fixture_gate, "transfer_drops");
     const destination = targetAt(app, location.window.ui_reference, cursor) orelse return;
     const fresh = app.resolveTab(tab) orelse return;
     switch (destination) {
-        .local => |local| _ = try fresh.window.moveTabToWindow(tab, local.window, local.position),
+        .local => |local| if (try fresh.window.moveTabToWindow(tab, local.window, local.position)) app.fixture.count(fixture_gate, "transfer_merges"),
         .remote => |process| {
             const returned = app.remote.returnRemoteTab(app, tab, process) catch |err| {
                 showRemoteError(fresh.window, err);
@@ -134,7 +137,12 @@ fn targetAt(app: *App, moving: refs.Reference, point: w32.POINT) ?Target {
         // through an unrelated app to a Ghostty window behind it.
         for (app.windows.items) |window| {
             if (window.hwnd != hwnd) continue;
-            if (window.closing or !window.ui_attachment.isValid() or window.is_quick_terminal or window.tab_count >= @import("Window.zig").MAX_TABS) return null;
+            const full = window.tab_count >= @import("Window.zig").MAX_TABS;
+            if (window.closing or !window.ui_attachment.isValid() or window.is_quick_terminal or full) {
+                // Gated evidence that a real drop hit a live full target.
+                if (full and !window.closing and !window.is_quick_terminal) app.fixture.count(@import("remote_test.zig").enabled(), "transfer_full_refusals");
+                return null;
+            }
             var client = point;
             if (w32.ScreenToClient(hwnd, &client) == 0) return null;
             return .{ .local = .{ .window = window.ui_reference, .position = window.tab_bar.transferSlotAt(client) orelse return null } };

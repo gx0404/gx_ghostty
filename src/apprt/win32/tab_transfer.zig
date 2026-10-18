@@ -17,6 +17,11 @@ pub const Fixture = struct {
     ipc_executions: usize = 0,
     toggle_executions: usize = 0,
     ime_events: usize = 0,
+    // App-level evidence of real native tab drops: the move loop ended and a
+    // target was looked up, a live full window refused it, or a merge landed.
+    transfer_drops: usize = 0,
+    transfer_full_refusals: usize = 0,
+    transfer_merges: usize = 0,
     pub fn takeWindowFailure(self: *Fixture, enabled: bool) bool {
         if (!enabled or self.fail_windows == 0) return false;
         self.fail_windows -= 1;
@@ -35,8 +40,10 @@ test "fixture gate off never consumes faults or changes counters" {
     const before = state;
     try std.testing.expect(!state.takeWindowFailure(false));
     try std.testing.expect(!state.failParent(false, 0));
-    inline for (.{ "hotkey_attempts", "hotkey_successes", "ipc_executions", "toggle_executions", "ime_events", "reentries", "rejected_reentries" }) |field| state.count(false, field);
+    inline for (.{ "hotkey_attempts", "hotkey_successes", "ipc_executions", "toggle_executions", "ime_events", "reentries", "rejected_reentries", "transfer_drops", "transfer_full_refusals", "transfer_merges" }) |field| state.count(false, field);
     try std.testing.expectEqualDeep(before, state);
+    state.count(true, "transfer_full_refusals");
+    try std.testing.expectEqual(@as(usize, 1), state.transfer_full_refusals);
     try std.testing.expect(state.takeWindowFailure(true));
     try std.testing.expectEqual(@as(usize, 1), state.fail_windows);
     try std.testing.expect(state.failParent(true, 0));
