@@ -499,7 +499,12 @@ class CiWorkflowTests(unittest.TestCase):
                 keys = [match[1] for line in step if (match := re.match(r"^        ([\w-]+):", line))]
                 self.assertEqual(keys, ["name", "run"], f"{name} test step must not override if, env or shell")
                 expected = command + ("\n          " + PWSH_CHECK if name == "windows-app" else "")
-                self.assertEqual([script.strip() for script in run_scripts(step)], [expected])
+                if name == "gtk-smoke":
+                    # The dedicated display test below locks the full wrapper and environment.
+                    self.assertEqual(run_scripts(step)[0].splitlines()[-1].strip(),
+                                     "xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' " + command)
+                else:
+                    self.assertEqual([script.strip() for script in run_scripts(step)], [expected])
                 self.assertEqual(sum("scripts/zig_test.py" in script for script in CI.scripts(name)), 1)
                 for forbidden in ("--no-build", "--dedupe", "-Dtest-filter", "--serial-filter"):
                     self.assertNotIn(forbidden, command)
@@ -647,6 +652,29 @@ class CiWorkflowTests(unittest.TestCase):
         uploads = [mapping(step, "with", 8)["name"] for step in steps(CI.job("windows-app"))
                    if (field(step, "uses", 8) or "").startswith("actions/upload-artifact@")]
         self.assertEqual(uploads, ["gx-zig-test-windows-app", "evidence-windows-smoke"])
+
+    def test_gtk_tests_own_a_display_for_the_entire_runner(self):
+        job = CI.job("gtk-smoke")
+        step = next(step for step in steps(job)
+                    if field(step, "name", 8) == "GTK GX layer tests, sharded across processes")
+        # A previous screenshot step's X server and exports cannot serve this step.
+        # Keep the complete runner (including all shards) inside a fresh Xvfb session.
+        scripts = run_scripts(step)
+        self.assertEqual(len(scripts), 1)
+        commands = [line.strip() for line in scripts[0].splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(commands, [
+            "export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1",
+            "xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' "
+            + FILTERED_TEST_COMMANDS["gtk-smoke"],
+        ])
+        # No conditional skip or failure masking; the runner's JSON is uploaded on failure too.
+        self.assertIsNone(field(step, "if", 8))
+        self.assertIsNone(field(step, "continue-on-error", 8))
+        upload = next(step for step in steps(job)
+                      if (field(step, "uses", 8) or "").startswith("actions/upload-artifact@"))
+        self.assertEqual(field(upload, "if", 8), "always()")
+        self.assertEqual(mapping(upload, "with", 8)["path"], "${{ runner.temp }}/gx-gtk-smoke/")
 
     def test_gtk_smoke_is_manual_and_mirrors_the_debian_dockerfile(self):
         job = CI.job("gtk-smoke")
