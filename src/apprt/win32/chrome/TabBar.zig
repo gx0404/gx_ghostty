@@ -349,18 +349,33 @@ pub fn deinit(self: *TabBar) void {
 /// even a single tab. Returns true when it changed, so the window must
 /// lay itself out again.
 pub fn updateVisibility(self: *TabBar) bool {
-    const win = self.window();
     _ = self.isElevated();
-    const caption_row = win.title_bar.hasCaptionRow() or win.title_bar.frame() == .borderless;
-    const should_show = if (win.is_quick_terminal or win.tab_bar_suppressed) false else switch (win.app.config.@"window-show-tab-bar") {
-        .always => true,
-        .auto => caption_row or win.tab_count > 1,
-        .never => false,
-    };
+    const should_show = self.shouldShow();
     if (should_show == self.visible) return false;
     self.visible = should_show;
     self.reveal_pending = true;
     return true;
+}
+
+fn shouldShow(self: *const TabBar) bool {
+    const win = self.windowConst();
+    // Initial restoration precedes applyDecoration and HWND creation.
+    const caption_row = if (win.hwnd == null)
+        TitleBar.Decoration.fromConfig(win.app.config.@"window-decoration") != .native
+    else
+        win.title_bar.hasCaptionRow() or win.title_bar.frame() == .borderless;
+    return if (win.is_quick_terminal or win.tab_bar_suppressed) false else switch (win.app.config.@"window-show-tab-bar") {
+        .always => true,
+        .auto => caption_row or win.tab_count > 1,
+        .never => false,
+    };
+}
+
+/// Whether the row displays the administrator badge. Resolve elevation even
+/// before the first visibility update, while restoring initial geometry.
+pub fn showsAdminBadge(self: *const TabBar) bool {
+    return !self.windowConst().title_bar.direct2d_failed and self.shouldShow() and
+        (self.elevated orelse processElevated());
 }
 
 /// Repaint the chrome row.
@@ -387,7 +402,7 @@ fn geometryInput(self: *const TabBar, lay: TitleBar.Layout) tab_layout.Input {
         .scale = lay.scale,
         .count = @min(win.tab_count, max_tabs),
         .active = win.active_tab,
-        .badge = self.elevated orelse false,
+        .badge = self.showsAdminBadge(),
         .frozen = self.frozen,
         .scroll = self.scroll,
     };
@@ -1165,7 +1180,10 @@ pub fn transferSlotAt(self: *TabBar, point: w32.POINT) ?usize {
     return index + @as(usize, if (point.x >= tab_rect.left + @divTrunc(tab_rect.right - tab_rect.left, 2)) 1 else 0);
 }
 
-fn trackLeave(self: *TabBar) void {
+/// Ask for WM_MOUSELEAVE on the client area of the window, which the tab
+/// bar shares with the client buttons of the title bar (`TitleBar.onSize`
+/// asks for one when a resize put a button under the pointer).
+pub fn trackLeave(self: *TabBar) void {
     if (self.tracking_mouse) return;
     const hwnd = self.window().hwnd orelse return;
     var tme = w32.TRACKMOUSEEVENT{
@@ -1205,6 +1223,12 @@ pub fn onMouseLeave(self: *TabBar) void {
         self.setHover(.none);
         self.unfreeze();
     }
+}
+
+/// Whether a left press or a drag on the tab bar holds the mouse capture:
+/// the title bar buttons do not react to the pointer meanwhile.
+pub fn holdsPress(self: *const TabBar) bool {
+    return self.drag != null or self.pressed != .none;
 }
 
 /// A left-button press on the tab bar: select (and start tracking a
@@ -1258,9 +1282,7 @@ pub fn onLeftButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool 
     if (pressed == .none) return false;
     self.pressed = .none;
     self.stopScrollRepeat();
-    if (win.hwnd) |h| {
-        if (w32.GetCapture() == h) _ = w32.ReleaseCapture();
-    }
+    self.releaseCapture();
     self.invalidate();
     const g = self.geometry(lay);
     if (!self.partAt(&g, x, y).eql(pressed)) return true;
@@ -1350,6 +1372,8 @@ fn slideTick(animator: *anim.Animator, now: u64) bool {
 }
 
 fn releaseCapture(self: *TabBar) void {
+    // ReleaseCapture synchronously reenters TitleBar to restore hover.
+    std.debug.assert(!self.holdsPress());
     const hwnd = self.window().hwnd orelse return;
     if (w32.GetCapture() == hwnd) _ = w32.ReleaseCapture();
 }
@@ -1420,9 +1444,31 @@ pub fn onDoubleClick(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
 pub fn onMiddleButtonDown(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     const g = self.geometry(lay);
     const target = self.middleTarget(self.partAt(&g, x, y));
-    self.middle_press.down(target);
-    if (target != null) self.trackLeave();
+    self.beginMiddlePress(target);
     return target != null;
+}
+
+fn beginMiddlePress(self: *TabBar, target: ?u64) void {
+    self.middle_press.down(target);
+    if (target != null) {
+        self.clearMiddleTooltip();
+        self.trackLeave();
+    }
+}
+
+fn releaseMiddlePress(self: *TabBar, target: ?u64) bool {
+    const matched = self.middle_press.release(target);
+    // Movement during a long press may have rearmed the tooltip.
+    if (matched) self.clearMiddleTooltip();
+    return matched;
+}
+
+fn clearMiddleTooltip(self: *TabBar) void {
+    // The slot may name another tab after close: force the next move
+    // to establish a fresh hover target even when its index is equal.
+    self.window().title_bar.tooltip.hide();
+    self.hover = .none;
+    self.invalidate();
 }
 
 fn middleTarget(self: *const TabBar, part: Part) ?u64 {
@@ -1443,7 +1489,7 @@ fn middleTarget(self: *const TabBar, part: Part) ?u64 {
 pub fn onMiddleButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     const g = self.geometry(lay);
     const part = self.partAt(&g, x, y);
-    const matched = self.middle_press.release(self.middleTarget(part));
+    const matched = self.releaseMiddlePress(self.middleTarget(part));
     const i = switch (part) {
         .tab, .tab_close => |i| i,
         .none => return false,
@@ -2265,6 +2311,32 @@ test "tooltips append the shortcut" {
     try testing.expectEqualStrings("New tab", withShortcut(&buf, "New tab", null));
 }
 
+test "middle press cancels the old tab tooltip before closing its target" {
+    var win: Window = undefined;
+    win.hwnd = null;
+    win.title_bar = .{};
+    win.tab_bar = .{};
+    win.title_bar.tooltip.target = .{ .tab = 0 };
+    win.tab_bar.hover = .{ .tab = 0 };
+    win.tab_bar.beginMiddlePress(42);
+    try std.testing.expectEqual(TitleBar.TooltipTarget.none, win.title_bar.tooltip.target);
+    try std.testing.expectEqual(Part.none, win.tab_bar.hover);
+    // A move during the press can arm the same slot again. Closing it
+    // must clear the tooltip without needing any subsequent movement.
+    win.title_bar.tooltip.target = .{ .tab = 0 };
+    win.tab_bar.hover = .{ .tab = 0 };
+    try std.testing.expect(win.tab_bar.releaseMiddlePress(42));
+    try std.testing.expectEqual(TitleBar.TooltipTarget.none, win.title_bar.tooltip.target);
+    try std.testing.expectEqual(Part.none, win.tab_bar.hover);
+
+    // Non-tab presses do not disturb another chrome control's tooltip.
+    win.title_bar.tooltip.target = .new_tab;
+    win.tab_bar.beginMiddlePress(null);
+    try std.testing.expectEqual(TitleBar.TooltipTarget.new_tab, win.title_bar.tooltip.target);
+    try std.testing.expect(!win.tab_bar.releaseMiddlePress(42));
+    try std.testing.expectEqual(TitleBar.TooltipTarget.new_tab, win.title_bar.tooltip.target);
+}
+
 test "tooltip and title buffers keep complete utf8 codepoints" {
     const testing = std.testing;
     var keys: Shortcut = .{};
@@ -2567,4 +2639,39 @@ test "ChromeAlpha native fade replaces strip alpha without accumulating underlay
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "administrator badge sizing follows elevation and tab visibility before first layout" {
+    var app: @import("../App.zig") = undefined;
+    app.config.@"window-show-tab-bar" = .auto;
+    app.config.@"window-decoration" = .auto;
+    var win: Window = undefined;
+    win.app = &app;
+    win.hwnd = null;
+    win.is_quick_terminal = false;
+    win.tab_bar_suppressed = false;
+    win.tab_count = 1;
+    win.title_bar = .{};
+    win.tab_bar = .{ .elevated = false };
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.tab_bar.elevated = true;
+    try std.testing.expect(win.tab_bar.showsAdminBadge());
+    app.config.@"window-decoration" = .server;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.tab_count = 2;
+    try std.testing.expect(win.tab_bar.showsAdminBadge());
+    win.tab_count = 1;
+    app.config.@"window-decoration" = .auto;
+    app.config.@"window-show-tab-bar" = .never;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    app.config.@"window-show-tab-bar" = .always;
+    try std.testing.expect(win.tab_bar.showsAdminBadge());
+    win.tab_bar_suppressed = true;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.tab_bar_suppressed = false;
+    win.title_bar.direct2d_failed = true;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.title_bar.direct2d_failed = false;
+    win.is_quick_terminal = true;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
 }

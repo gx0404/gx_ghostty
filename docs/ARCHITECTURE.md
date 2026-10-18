@@ -155,7 +155,7 @@ Surface（src/Surface.zig）
 | `Surface.zig` | 终端子窗口：键鼠、IME、拖放（路径经 `gx.path_quote` 按 shell 引用）、剪贴板（被占用时计时器重试）、弹层宿主（命令面板、查找栏、链接预览）、`signalFrameDrawn`/`gpuContextReset` |
 | `QuickTerminal.zig`、`Scrollbar.zig` | 从屏幕边缘滑出的快速终端；主题化细滚动条 |
 | `file_log.zig`、`win32.zig` | 日志文件；手写 Win32 类型与 extern 声明 |
-| `chrome/TitleBar.zig` | 非客户区与集成标题栏：`WM_NCCALCSIZE` 把客户区延伸到标题栏，`WM_NCHITTEST` 报 `HTCAPTION`、`HTTOP` 与 `HTMINBUTTON`/`HTMAXBUTTON`（Windows 11 贴靠布局）/`HTCLOSE`；`window-decoration` 各模式、全屏；整行用 Direct2D 画进带逐像素 alpha 的 32bpp DIB 再贴到窗口 |
+| `chrome/TitleBar.zig` | 非客户区与集成标题栏：`WM_NCCALCSIZE` 把客户区延伸到标题栏，`WM_NCHITTEST` 报 `HTCAPTION`、`HTTOP` 与 `HTMAXBUTTON`（Windows 11 贴靠布局）；自绘最小化/关闭按钮报 `HTCLIENT`，由推按钮状态机处理，默认集成标题栏支持快速第二次按下与释放捕获后按指针恢复悬停（取消模式不恢复）；`window-decoration` 各模式、全屏；整行用 Direct2D 画进带逐像素 alpha 的 32bpp DIB 再贴到窗口 |
 | `chrome/TabBar.zig` | 标题栏行里的标签页：绘制、命中测试、拖动排序、右键菜单、双击改名、未读圆点、`程序 ~ 标题` 标签 |
 | `chrome/Backdrop.zig` | DWM 深浅色与边框色、`gx-window-material`（`mica`/`acrylic`/`tabbed`，Windows 11 22H2 起，标题栏一行延伸 DWM 边框，此时标题栏按钮交给 DWM 绘制）、按像素合成（`perPixel`：材质与 `background-opacity` 从终端背景透出；GDI 不写 alpha，窗口自己画的部分经 `fillBackground`、`fillOpaque` 贴预乘 DIB）、退路（更早的系统、Mesa、无 alpha 格式：`background-opacity` 整窗 `WS_EX_LAYERED`）、`background-blur`（只用于纯色材质） |
 | `ui/d2d.zig`、`ui/style.zig`、`ui/anim.zig` | 手写的 Direct2D 1.1/DirectWrite COM 绑定与 `Canvas`（`Factory` 由 `App.uiFactory` 持有，只在 GUI 线程使用）；设计令牌（颜色逐字段取自 `gx.ui_tokens` 与 `gx.chrome`）；帧时钟与 `Tween`（时长与曲线取自 `gx.motion`） |
@@ -165,6 +165,8 @@ Surface（src/Surface.zig）
 | `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层：模态、背后变暗，六个分区，改动写入 `gui-settings.ghostty` 后重载 |
 | `ui/Dialogs.zig` | 主题化模态对话框：关闭与退出确认（列出仍在运行的进程）、剪贴板授权与不安全粘贴（带预览）、子进程退出、关于（带非官方分支声明）；任务模态，嵌套上限 4 层，对话框期间推迟 `WM_CLOSE`；另存为用系统对话框 |
 | `ui/SearchBar.zig`、`ui/LinkPreview.zig`、`ui/ResizeOverlay.zig`、`ui/ShortcutNotice.zig`、`ui/wstr.zig` | 查找栏（`当前/总数` 计数）、链接预览气泡、改尺寸时的列×行提示、默认复制/粘贴/查找/分屏键被占用时窗口底部的提示条（每次运行一次）；UTF-8 → UTF-16 |
+
+窗口最小宽度以 `chrome/caption_layout.zig::minTrackSize` 为真源：非提权为 510 DIP，进程实际提权且标签栏显示管理员标记时为 538 DIP；控件尺寸按目标 DPI 逐项取整。`Window.zig` 的尺寸约束、普通窗口恢复与会话恢复共用此规则；会话先放宽宽高，再移入目标显示器工作区。较窄的已保存窗口和较小的 `window-width` 会被放宽，可能限制贴靠布局（例如 1920 宽、125% 缩放时，非提权最小宽度 639 px 可放入三栏，提权时 674 px 不可）。
 
 - 启动：`App.init` 用 `Config.load` 加载配置（GX 分层）、修复资源管理器传来的盘符根目录工作目录、按 `language` 设定界面语言、注册窗口类与消息专用窗口；`App.run` 建第一个窗口与标签后进入消息循环。终端子窗口的按键消息跳过 `TranslateMessage`（由 `handleKeyEvent` 自己调 `ToUnicode`，避免死键状态被改两次），只有 `VK_PROCESSKEY`（交给输入法）与 `VK_PACKET`（`SendInput` 注入的 Unicode）照常翻译。
 - 界面文字全部经 `gx.i18n`（Windows 构建没有 gettext），语言切换时窗口、菜单、命令面板与设置浮层当场重建文字。
