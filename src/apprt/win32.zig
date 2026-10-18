@@ -20,6 +20,7 @@ test {
     _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/Surface.zig");
     _ = @import("win32/Session.zig");
+    _ = @import("win32/ShellIntegration.zig");
     _ = @import("win32/shell/Identity.zig");
     _ = @import("win32/shell/ToastActivation.zig");
     _ = @import("win32/shell/WinRTToast.zig");

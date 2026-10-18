@@ -245,3 +245,16 @@ test "D18 ShellLink arguments preserve profile IDs through Ghostty argv parsing"
         try t.expect(iter.next() == null);
     }
 }
+
+test "D19 already committed fingerprint skips the native Shell transaction" {
+    const t = std.testing;
+    var identity = try Identity.init(t.allocator, .portable, "C:/My App/ghostty.exe", false);
+    defer identity.deinit();
+    identity.registration_verified = true;
+    var snapshot = try Snapshot.init(t.allocator, &identity, &.{.{ .id = "custom:Test", .title = "Test" }});
+    defer snapshot.deinit();
+    var publisher: Publisher = .{ .applied = snapshot.fingerprint };
+    // The duplicate path returns before creating COM objects or writing Shell.
+    try t.expect(!try publisher.publish(&identity, &snapshot));
+    try t.expectEqual(snapshot.fingerprint, publisher.applied.?);
+}
