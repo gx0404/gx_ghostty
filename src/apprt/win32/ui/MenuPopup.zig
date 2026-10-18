@@ -346,11 +346,19 @@ const RootHosts = struct {
 
 var root_hosts: RootHosts = .{};
 
-/// Called before an owner is destroyed and on configuration/DPI changes.
-/// Modal sessions may still be on the stack: retire, cancel and defer freeing
-/// their borrowed root until runSession returns.
+/// A configuration, language, DPI or system UI change retired `owner`'s
+/// hidden root host (`Menu.invalidateWindow`). A session on the stack keeps
+/// its borrowed root, finishes normally and frees it when it unwinds; the
+/// next opening builds a new one.
 pub fn invalidateOwner(owner: w32.HWND) void {
     root_hosts.invalidate(owner);
+}
+
+/// `owner` is about to be destroyed (`Settings.onWindowDestroyed`): retire
+/// its root host and cancel a menu open on it; the borrowed root is freed
+/// once that modal session unwinds.
+pub fn onOwnerDestroyed(owner: w32.HWND) void {
+    invalidateOwner(owner);
     if (current) |state| if (state.owner == owner) state.dismiss();
 }
 
@@ -374,6 +382,26 @@ test "P4 reuse retains one stable menu root for 100 sessions and retires a borro
     try std.testing.expectError(error.Busy, hosts.acquire(std.testing.allocator, owner));
     hosts.release(borrowed);
     try std.testing.expect(hosts.first == null);
+}
+
+test "P4 retiring an owner's menu root lets its open session finish" {
+    // A configuration, language, DPI or system UI change during a menu: the
+    // menu stays open and ends normally; only a later opening rebuilds.
+    const owner: w32.HWND = @ptrFromInt(0x40);
+    var state: State = undefined;
+    state.owner = owner;
+    state.result = .open;
+    state.depth = 0;
+    const running = current;
+    current = &state;
+    defer current = running;
+    invalidateOwner(owner);
+    try std.testing.expect(state.result == .open);
+    // Only the owner's destruction ends it.
+    onOwnerDestroyed(@ptrFromInt(0x80));
+    try std.testing.expect(state.result == .open);
+    onOwnerDestroyed(owner);
+    try std.testing.expect(state.result == .cancelled);
 }
 
 /// Nested submenus beyond this depth do not open.

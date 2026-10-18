@@ -360,6 +360,8 @@ test "P4 reuse keeps independent settings owners for 100 acquire close cycles" {
     invalidateOwner(&a);
     try std.testing.expect(!first.data_ready and first.popup.reuse_invalid);
     try std.testing.expect(second.data_ready and !second.popup.reuse_invalid);
+    invalidateData(&b);
+    try std.testing.expect(!second.data_ready and !second.popup.reuse_invalid);
 }
 
 /// Like `show`, then switch to `section`: the command palette's
@@ -375,7 +377,7 @@ pub fn showSection(window: *Window, section: Section) bool {
 /// `window` is going away: save pending changes, end a theme preview and
 /// destroy the overlay if it belongs to that window.
 pub fn onWindowDestroyed(window: *Window) void {
-    if (window.hwnd) |owner| @import("MenuPopup.zig").invalidateOwner(owner);
+    if (window.hwnd) |owner| @import("MenuPopup.zig").onOwnerDestroyed(owner);
     if (find(window)) |self| self.destroy();
 }
 
@@ -388,6 +390,14 @@ pub fn invalidateOwner(window: *Window) void {
     const self = find(window) orelse return;
     self.data_ready = false;
     self.popup.reuse_invalid = true;
+}
+
+/// The launch profiles were detected again with another result
+/// (`Menu.onShellsDetected`): read the data again at the next opening. The
+/// host stays, and an open overlay keeps what it shows.
+pub fn invalidateData(window: *Window) void {
+    const self = find(window) orelse return;
+    self.data_ready = false;
 }
 
 pub fn prepare(window: *Window) void {

@@ -695,39 +695,221 @@ fn menuButtonAnchor(window: *Window) w32.RECT {
 }
 
 /// Invalidate generations, not live callback storage. Active overlays finish
-/// their transaction; the next idle preparation/open rebuilds their hosts.
+/// their transaction (an open menu, palette or settings stays open, only
+/// marked stale); the next idle preparation/open rebuilds their hosts. Only
+/// the owner's destruction ends an open menu (`Settings.onWindowDestroyed`).
 pub fn invalidateWindow(window: *Window) void {
     window.palette.invalidateHost();
     Settings.invalidateOwner(window);
     if (window.hwnd) |hwnd| MenuPopup.invalidateOwner(hwnd);
 }
 
-test "P4 system theme invalidates a non-primary owner's hidden hosts" {
-    // No HWND, desktop, configuration load or native theme API is involved.
-    // A non-primary receiver must still invalidate its own hidden UI, even
-    // though only the primary owner applies the process-wide system change.
+/// What hidden popup hosts draw with from the system (`style.system`):
+/// whether high contrast applies and, if it does, its system colors.
+const SystemUi = struct {
+    high_contrast: bool,
+    colors: ?style.SystemColors,
+
+    fn current() SystemUi {
+        const high_contrast = style.system.highContrast();
+        return .{ .high_contrast = high_contrast, .colors = if (high_contrast) style.system.colors else null };
+    }
+};
+
+/// The system UI state the hidden hosts were last retired for; null until
+/// the first broadcast of the process. GUI thread.
+var drawn_system: ?SystemUi = null;
+
+/// A system broadcast reached a window (`App.onSystemSettingChange`), after
+/// `style.system` was read again: retire every owner's hidden hosts only
+/// when what they draw with changed (`invalidateApp`). Every window hears
+/// each broadcast, and a new window hears its own WM_THEMECHANGED
+/// (`Backdrop.apply`); the first one that sees a change retires them all,
+/// the others see none. The app light or dark mode reaches the hosts as a
+/// configuration change when the configuration follows it.
+pub fn onSystemChange(app: *App) void {
+    const now = SystemUi.current();
+    if (drawn_system) |drawn| if (std.meta.eql(drawn, now)) return;
+    drawn_system = now;
+    invalidateApp(app);
+}
+
+/// A digest of the launch profiles detected in `cache`; null when none are
+/// cached (not detected yet, or invalidated).
+pub fn shellsDigest(cache: *const gx.profiles.Cache) ?u64 {
+    const shells = cache.shells orelse return null;
+    var hasher: std.hash.Wyhash = .init(0);
+    for (shells.profiles) |profile| {
+        hashBytes(&hasher, profile.id);
+        hashBytes(&hasher, profile.name);
+        hashBytes(&hasher, profile.name_arg orelse "");
+        std.hash.autoHash(&hasher, profile.kind);
+        std.hash.autoHash(&hasher, std.meta.activeTag(profile.command));
+        switch (profile.command) {
+            .argv => |argv| {
+                std.hash.autoHash(&hasher, argv.len);
+                for (argv) |arg| hashBytes(&hasher, arg);
+            },
+            .command_line => |line| hashBytes(&hasher, line),
+        }
+    }
+    return hasher.final();
+}
+
+fn hashBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    std.hash.autoHash(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+/// The launch profiles were detected again (an "Environment" broadcast,
+/// `App.onSystemSettingChange`); `before` is their `shellsDigest` from
+/// before. When they changed, or are not known, what lists them is read
+/// again at the next opening (the shells of the settings; the palette
+/// entries follow `profiles_cache` themselves) and every window prepares
+/// its hidden UI again. The hosts stay: nothing they draw with changed.
+pub fn onShellsDetected(app: *App, before: ?u64) void {
+    if (before) |old| if (shellsDigest(&app.profiles_cache)) |new| if (old == new) return;
+    for (app.windows.items) |window| shellsChanged(window);
+    if (app.quick_terminal) |qt| shellsChanged(qt.window);
+}
+
+fn shellsChanged(window: *Window) void {
+    Settings.invalidateData(window);
+    window.palette.preparation.request();
+}
+
+/// Test windows without an HWND for the invalidation tests.
+const InvalidationFixture = struct {
+    app: App,
+    primary: Window,
+    window: Window,
+    windows: [2]*Window,
+
+    fn init(self: *InvalidationFixture) void {
+        self.app = undefined;
+        self.app.quick_terminal = null;
+        self.primary = undefined;
+        self.primary.hwnd = null;
+        self.primary.palette = .{};
+        self.window = undefined;
+        self.window.hwnd = null;
+        self.window.palette = .{};
+        self.windows = .{ &self.primary, &self.window };
+        self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len };
+    }
+
+    fn settle(self: *InvalidationFixture) void {
+        for (self.windows) |owner| {
+            owner.palette.preparation.pending = false;
+            owner.palette.popup.reuse_invalid = false;
+            owner.palette.item_cache.stamp = 123;
+        }
+    }
+
+    fn retired(self: *InvalidationFixture) !bool {
+        const first = self.windows[0].palette.popup.reuse_invalid;
+        for (self.windows) |owner| {
+            try std.testing.expectEqual(first, owner.palette.popup.reuse_invalid);
+            try std.testing.expectEqual(first, owner.palette.preparation.pending);
+            try std.testing.expectEqual(first, owner.palette.item_cache.stamp == null);
+        }
+        return first;
+    }
+};
+
+test "P4 a change of what popups draw with retires every owner's hidden hosts once" {
+    // No HWND, desktop or native theme API: high contrast is forced, as
+    // `App.simulateSystemTheme` does before it broadcasts.
+    const forced = style.system.forced_high_contrast;
+    defer style.system.forced_high_contrast = forced;
+    const drawn = drawn_system;
+    defer drawn_system = drawn;
+    var fixture: InvalidationFixture = undefined;
+    fixture.init();
+    style.system.forced_high_contrast = false;
+    fixture.app.onSystemSettingChange(&fixture.window, .sys_colors);
+    fixture.settle();
+    style.system.forced_high_contrast = true;
+    // A non-primary window hears it first and retires every owner's hosts,
+    // although only the primary window applies process-wide changes.
+    fixture.app.onSystemSettingChange(&fixture.window, .sys_colors);
+    try std.testing.expect(try fixture.retired());
+    fixture.settle();
+    // The other windows hear the same broadcasts: nothing is retired twice.
+    fixture.app.onSystemSettingChange(&fixture.primary, .sys_colors);
+    fixture.app.onSystemSettingChange(&fixture.primary, .theme);
+    try std.testing.expect(!try fixture.retired());
+    style.system.forced_high_contrast = false;
+    fixture.app.onSystemSettingChange(&fixture.primary, .theme);
+    try std.testing.expect(try fixture.retired());
+}
+
+test "P4 broadcasts that change nothing popups draw with keep every hidden host" {
+    // Every window hears each broadcast, and a new window hears its own
+    // WM_THEMECHANGED (Backdrop.apply sets its window theme in init). None of
+    // them may retire the hosts unless what the popups draw with changed.
     var app: App = undefined;
     app.quick_terminal = null;
     var primary: Window = undefined;
     primary.hwnd = null;
     primary.palette = .{};
-    primary.palette.preparation.pending = false;
     var window: Window = undefined;
     window.hwnd = null;
     window.palette = .{};
-    window.palette.preparation.pending = false;
-    window.palette.item_cache.stamp = 123;
     var windows = [_]*Window{ &primary, &window };
     app.windows = .{ .items = &windows, .capacity = windows.len };
+    // Whatever the first broadcast of this process does, the next ones see
+    // the same system state.
     app.onSystemSettingChange(&window, .theme);
-    try std.testing.expect(primary.palette.preparation.pending);
-    try std.testing.expect(window.palette.preparation.pending);
-    try std.testing.expect(window.palette.popup.reuse_invalid);
-    try std.testing.expect(window.palette.item_cache.stamp == null);
+    for (windows) |owner| {
+        owner.palette.preparation.pending = false;
+        owner.palette.popup.reuse_invalid = false;
+        owner.palette.item_cache.stamp = 123;
+    }
+    app.onSystemSettingChange(&window, .theme);
+    app.onSystemSettingChange(&primary, .theme);
+    app.onSystemSettingChange(&window, .sys_colors);
+    app.onSystemSettingChange(&primary, .{ .colorization = .{ .color = 0xC40078D4, .opaque_blend = true } });
+    for (windows) |owner| {
+        try std.testing.expect(!owner.palette.preparation.pending);
+        try std.testing.expect(!owner.palette.popup.reuse_invalid);
+        try std.testing.expect(owner.palette.item_cache.stamp == 123);
+    }
 }
 
-/// System broadcasts invalidate all owners after shared state is applied; an
-/// earlier non-primary receiver cannot leave a stale profile/theme cache warm.
+test "P4 re-detected launch profiles refresh what lists them only when they changed" {
+    var fixture: InvalidationFixture = undefined;
+    fixture.init();
+    fixture.settle();
+    fixture.app.profiles_cache = .{};
+    try std.testing.expect(shellsDigest(&fixture.app.profiles_cache) == null);
+    const first = [_]gx.profiles.Profile{.{ .id = "pwsh", .name = "PowerShell", .command = .{ .command_line = "pwsh.exe" }, .kind = .pwsh }};
+    fixture.app.profiles_cache.shells = .{ .arena = .init(std.testing.allocator), .profiles = &first };
+    defer fixture.app.profiles_cache.invalidate();
+    const before = shellsDigest(&fixture.app.profiles_cache);
+    try std.testing.expect(before != null);
+    // Detected again with the same result: nothing to do.
+    onShellsDetected(&fixture.app, before);
+    try std.testing.expect(!try fixture.retired());
+    // Another result, or none known before: the data and the preparation
+    // follow, the hosts stay.
+    const second = [_]gx.profiles.Profile{.{ .id = "pwsh", .name = "PowerShell", .command = .{ .command_line = "pwsh.exe -NoLogo" }, .kind = .pwsh }};
+    fixture.app.profiles_cache.shells.?.profiles = &second;
+    try std.testing.expect(shellsDigest(&fixture.app.profiles_cache).? != before.?);
+    for ([_]?u64{ before, null }) |known| {
+        fixture.settle();
+        onShellsDetected(&fixture.app, known);
+        for (fixture.windows) |owner| {
+            try std.testing.expect(owner.palette.preparation.pending);
+            try std.testing.expect(!owner.palette.popup.reuse_invalid);
+            try std.testing.expect(owner.palette.item_cache.stamp == 123);
+        }
+    }
+}
+
+/// Retire the hidden hosts of every owner (`invalidateWindow`): a system UI
+/// change (`onSystemChange`) applies to all of them, whichever window heard
+/// the broadcast first.
 pub fn invalidateApp(app: *App) void {
     for (app.windows.items) |window| invalidateWindow(window);
     if (app.quick_terminal) |qt| invalidateWindow(qt.window);
