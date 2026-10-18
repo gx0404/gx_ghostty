@@ -1678,12 +1678,13 @@ function Set-ToastSwitchInSettings([string]$Aumid) {
             $toggles.Add([ordered]@{ attempt=$attempt; state=$state; setting=$setting })
             if ($state -ceq 'On' -and $setting -ceq 'Enabled') { break }
         }
-        $facts.toggles = @($toggles)
+        # PS 5.1 rejects $dict.key = @($genericList) ('Argument types do not match').
+        $facts['toggles'] = $toggles.ToArray()
         if (-not $facts.settings_window_preexisting -and $null -ne $window) {
             try { $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close(); $facts.closed_window = $true }
             catch { $facts.error = 'closing Settings: ' + $_.Exception.Message }
         }
-    } catch { $facts.error = $_.Exception.Message }
+    } catch { $facts.error = $_.Exception.Message + ' (line ' + $_.InvocationInfo.ScriptLineNumber + ')' }
     return $facts
 }
 
