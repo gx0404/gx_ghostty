@@ -102,8 +102,9 @@ borderless, never activated, not in the taskbar or Alt-Tab, and destroyed when t
 fails. backdrop = false (with backdrop_reason, for a test that must see the desktop through the
 window) turns it off, and notes.txt and run.json say so. Before every screen capture or pixel read
 it is put back under the instance and checked: every pixel of the captured window must lie on a
-covered area (a window partly on no monitor fails before anything is captured), no window of
-another process may show inside the window or its band on the covered areas, and every band pixel
+covered area (a window partly on no monitor fails before anything is captured), the window must be
+above the backdrop before and after the capture, no window of another process may show inside the
+window or its band on the covered areas, and every band pixel
 outside the instance's windows must be the backdrop color or its shadow; otherwise the step fails
 and the screenshot is not saved. run.json lists every check (covered areas, band pieces, pixels
 counted, foreign windows by class, pid and image, no titles).
@@ -732,6 +733,17 @@ def backdrop_audit(stack: Sequence[StackEntry], backdrop: int, pid: int,
         if entry.shows() and not entry.belongs_to(pid) and any(rect_intersection(entry.rect, area) for area in areas):
             foreign.append(entry)
     return foreign, False
+
+
+def above_backdrop(stack: Sequence[StackEntry], backdrop: int, hwnd: int) -> bool:
+    """Whether the window hwnd shows above the backdrop in `stack` (a window under it shows only the
+    backdrop color in a screen capture)."""
+    for entry in stack:
+        if entry.hwnd == backdrop:
+            return False
+        if entry.hwnd == hwnd:
+            return entry.shows()
+    return False
 
 
 def backdrop_message(message: int) -> int | None:
@@ -1579,21 +1591,22 @@ class Backdrop:
             image = instance.capture_window(info, "screen", region=probe, see_through=(self.window.hwnd,))
             after = w.window_stack()
             foreign: dict[int, StackEntry] = {}
-            found = True
+            found = above = True
             for stack in (before, after):
                 entries, present = backdrop_audit(stack, self.window.hwnd, instance.pid, regions)
                 found = found and present
+                above = above and above_backdrop(stack, self.window.hwnd, info.hwnd)
                 foreign.update((entry.hwnd, entry) for entry in entries)
             keep_out = [rect_inflate(entry.rect, BACKDROP_EDGE_PX) for stack in (before, after) for entry in stack
                         if entry.shows() and entry.belongs_to(instance.pid)]
             band_stats = backdrop_band(image, keep_out, color, inside=band_regions)
-            passed = found and not foreign and not band_stats["foreign_pixels"]
+            passed = found and above and not foreign and not band_stats["foreign_pixels"]
             # Only a backdrop that may not have reached the screen yet is worth another look.
-            if passed or foreign or not found or time.monotonic() >= deadline:
+            if passed or foreign or not found or not above or time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
         check.update({"band": list(probe), "band_regions": [list(piece) for piece in band_regions], **band_stats,
-                      "backdrop_in_stack": found, "attempts": attempts,
+                      "backdrop_in_stack": found, "window_above_backdrop": above, "attempts": attempts,
                       "foreign_windows": [{"hwnd": f"{entry.hwnd:#x}", "class": entry.cls, "pid": entry.pid,
                                            "image": image_name(entry.pid)} for entry in foreign.values()],
                       "status": "pass" if passed else "fail"})
@@ -1605,6 +1618,9 @@ class Backdrop:
                     f"{item['class']} pid {item['pid']} {item['image']}" for item in check["foreign_windows"]) + ")")
             if not found:
                 problems.append("the backdrop is not in the window stack")
+            if not above:
+                problems.append(f"the captured window {info.hwnd:#x} is not above the backdrop before and after the "
+                                "capture (the image would show the backdrop instead of it)")
             if band_stats["foreign_pixels"]:
                 x, y, seen = band_stats["first_foreign"]
                 problems.append(f"{band_stats['foreign_pixels']} of {band_stats['checked_pixels']} band pixels are not "

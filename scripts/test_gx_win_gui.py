@@ -1583,6 +1583,27 @@ class BackdropTests(unittest.TestCase):
         self.assertEqual(([foreign], True), gui.backdrop_audit(stack, 0xB0, self.PID, [area, (400, 400, 500, 500)]))
         self.assertEqual(([], True), gui.backdrop_audit(stack, 0xB0, self.PID, [(0, 0, 40, 40), (400, 400, 500, 500)]))
 
+    def test_above_backdrop(self):
+        popup = gui.StackEntry(0x20, gui.POPUP_CLASS, (0, 0, 10, 10), self.PID, self.PID)
+        hidden = gui.StackEntry(0x30, gui.POPUP_CLASS, (0, 0, 10, 10), self.PID, self.PID, iconic=True)
+        stack = [popup, hidden, self.backdrop_entry, self.main]
+        self.assertEqual([True, False, False, False],
+                         [gui.above_backdrop(stack, 0xB0, hwnd) for hwnd in (0x20, 0x30, 0x10, 0x99)])
+        self.assertTrue(gui.above_backdrop([self.main], 0xB0, 0x10), "with no backdrop in the stack it is not under it")
+
+    def test_a_window_that_falls_under_the_backdrop_fails_the_capture(self):
+        self.fake.stack = [self.backdrop_entry, self.main]
+        with self.assertRaisesRegex(gui.GuiError, r"window 0x10 is not above the backdrop.*not saved"):
+            gui.Backdrop("#000000").capture(self.instance, self.WINDOW, "screen", "01-under.png")
+        # Above it before the capture, under it right after: still a failure, and never retried.
+        backdrop = gui.Backdrop("#000000")
+        over, under = [self.main, self.backdrop_entry], [self.backdrop_entry, self.main]
+        self.fake.window_stack = mock.Mock(side_effect=[over, over, under])
+        with self.assertRaisesRegex(gui.GuiError, r"not above the backdrop"):
+            backdrop.capture(self.instance, self.WINDOW, "screen", "02-under.png")
+        self.assertEqual((False, 1, "fail"), (backdrop.checks[0]["window_above_backdrop"], backdrop.checks[0]["attempts"],
+                                              backdrop.checks[0]["status"]))
+
     def test_cover_reaches_every_monitor_the_windows_or_the_band_reach(self):
         primary, portrait = HOST_MONITORS[0], HOST_MONITORS[1]
         cases = {
@@ -1632,9 +1653,9 @@ class BackdropTests(unittest.TestCase):
         self.instance.capture_window.assert_called_once_with(self.WINDOW, "screen", region=self.PROBE, see_through=(0xB0,))
         self.assertEqual((40, 30, 100, 100), (image.width, image.height, image.left, image.top))
         check = backdrop.checks[0]
-        self.assertEqual(("pass", 88 * 78 - 44 * 34, 0, 1, []),
+        self.assertEqual(("pass", 88 * 78 - 44 * 34, 0, 1, [], True),
                          (check["status"], check["checked_pixels"], check["foreign_pixels"], check["attempts"],
-                          check["foreign_windows"]))
+                          check["foreign_windows"], check["window_above_backdrop"]))
         result = backdrop.finish()
         self.assertEqual(1, window.closed)
         self.assertEqual(["created", "destroyed"], [event["event"] for event in result["events"]])
