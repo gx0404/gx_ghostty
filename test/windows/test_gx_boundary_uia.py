@@ -17,9 +17,11 @@ class PopupBoundaryTests(unittest.TestCase):
         pinyin = PinyinEmulator(open_=0, mode=0x0400)
         report, error = run_compose(pinyin, press=RuntimeError("composition input failed"))
         self.assertIsInstance(error, RuntimeError)  # the original failure is not masked
-        self.assertIn(("mode", 0x0401), pinyin.sets)  # native bit added, other mode bits kept
+        # Native bit added with the other bits kept, then undone newest first, each confirmed.
+        self.assertEqual([("open", 1), ("mode", 0x0401), ("mode", 0x0400), ("open", 0)], pinyin.sets)
         self.assertEqual({"open": 0, "mode": 0}, pinyin.state)  # closing reset the mode
-        self.assertEqual(("closed-mode-reset-by-ime", 0x0400), (report["ime_restore"], report["mode_while_open_readback"]))
+        self.assertEqual("closed-mode-not-comparable", report["ime_restore"])
+        self.assertEqual([["mode", True], ["open", True]], report["ime_undo"])
         self.assertTrue(report["input_language"]["restored"])
 
     def test_activation_transient_is_not_taken_as_the_saved_state(self):
@@ -31,15 +33,22 @@ class PopupBoundaryTests(unittest.TestCase):
         self.assertEqual({"open": 0, "mode": 1}, report["ime_first_read"])
         self.assertEqual({"open": 1, "mode": 1}, report["ime_before"])
         self.assertEqual(({"open": 1, "mode": 1}, "exact"), (report["ime_after"], report["ime_restore"]))
-        self.assertEqual({"open": 1, "mode": 1}, pinyin.state)
+        self.assertEqual(([], {"open": 1, "mode": 1}), (pinyin.sets, pinyin.state))  # nothing to change or undo
 
-    def test_closed_ime_mode_reset_is_recorded_with_the_open_readback(self):
+    def test_only_what_composition_changed_is_undone(self):
+        # round3-batch-20261018-110320: from (0, 1) the redundant writes
+        # open=1, mode=1 before closing left Microsoft Pinyin open at (1, 1025).
         pinyin = PinyinEmulator(open_=0, mode=1)
         report, error = run_compose(pinyin)
         self.assertIsNone(error)
-        self.assertEqual([("open", 1), ("mode", 1), ("open", 1), ("mode", 1), ("open", 0)], pinyin.sets)
-        self.assertEqual(({"open": 0, "mode": 0}, 1), (report["ime_after"], report["mode_while_open_readback"]))
-        self.assertEqual("closed-mode-reset-by-ime", report["ime_restore"])
+        self.assertEqual([("open", 1), ("open", 0)], pinyin.sets)
+        self.assertEqual(({"open": 0, "mode": 0}, "closed-mode-not-comparable"), (report["ime_after"], report["ime_restore"]))
+
+    def test_a_close_that_is_never_confirmed_fails(self):
+        pinyin = PinyinEmulator(open_=0, mode=1, ignore_close=True)
+        report, error = run_compose(pinyin)
+        self.assertIsInstance(error, AssertionError)
+        self.assertEqual(([["open", False]], "mismatch"), (report["ime_undo"], report["ime_restore"]))
 
     def test_an_open_status_that_does_not_come_back_fails(self):
         pinyin = PinyinEmulator(open_=1, mode=1, close_on_escape=True)
@@ -55,10 +64,10 @@ class PinyinEmulator:
     reads after a layout switch may show an activation state, a conversion mode
     set while closed is ignored, and closing resets the mode to 0."""
 
-    def __init__(self, *, open_, mode, transient=None, transient_reads=0, close_on_escape=False):
+    def __init__(self, *, open_, mode, transient=None, transient_reads=0, close_on_escape=False, ignore_close=False):
         self.state = {"open": open_, "mode": mode}
         self.transient, self.transient_reads = transient, transient_reads
-        self.close_on_escape, self.stuck = close_on_escape, False
+        self.close_on_escape, self.stuck, self.ignore_close = close_on_escape, False, ignore_close
         self.sets = []
 
     def press(self, key):
@@ -70,7 +79,7 @@ class PinyinEmulator:
         if command in (0x0006, 0x0002):
             self.sets.append(("open" if command == 0x0006 else "mode", value))
             self.transient_reads = 0
-            if command == 0x0006 and not self.stuck:
+            if command == 0x0006 and not self.stuck and not (self.ignore_close and value == 0):
                 self.state["open"] = value
                 if value == 0:
                     self.state["mode"] = 0

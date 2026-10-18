@@ -139,7 +139,7 @@ Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --ex
 | IPC-06 | 已就绪 host 一次 GUI 创建故障；真实 secondary 请求收到非成功退出，host 无新窗口/PTY |
 | IPC-07 | CLI 通过真实认证管道重复发送同一 request key；先按 launcher PID/birth 断言日志恰有一条 `fixture_ipc_replay ... outcome=completed`（证明确实重发），再要求 host GUI toggle 与 execute 计数只增1，Quick 仍可见 |
 | UIA-02 | 外部 MTA 保留 provider，分别 hide/reopen、换子菜单、销毁窗口；旧对象实际调用必须 0x80040201，不能操作替补对象 |
-| UIA-03 | MTA 连续查询同时切兄弟 pane 焦点、真实中文 IME 组字、关 tab、开 menu、模态确认；无安装 IME 才属于环境 PENDING。切到已加载的中文布局后等 IME 状态 0.3 s 不变再保存（首读与时间线入报告；组字只 OR 上 NATIVE 位）；finally 先打开 IME、设回转换模式并读回，最后恢复开关并等读回稳定，再恢复输入语言（app 已退出时经夹具自有窗口）。精确一致记 `exact`；保存态为关闭、开启时读回模式正确而关闭后被微软拼音清零记 `closed-mode-reset-by-ime`（保留原始读数）；开关或输入语言未恢复记 FAIL |
+| UIA-03 | MTA 连续查询同时切兄弟 pane 焦点、真实中文 IME 组字、关 tab、开 menu、模态确认；无安装 IME 才属于环境 PENDING。切到已加载的中文布局后等 IME 状态 0.3 s 不变再保存（首读与时间线入报告）；组字只改必需项（开启、OR 上 NATIVE 位），每次写入等状态稳定确认后记入撤销表，finally 按相反顺序逐项撤销并确认，再恢复输入语言（app 已退出时经夹具自有窗口）。精确一致记 `exact`；保存态与结果都是关闭记 `closed-mode-not-comparable`（微软拼音关闭时清零转换模式，原始读数保留）；撤销未确认、开关或输入语言未恢复记 FAIL |
 | UIA-04 | 注册外部 Notification handler 完成握手后，GUI native publisher 发固定测试通知；必须实际收到正文，query/register/remove 同线程 |
 | OLE-07 | 用 `/n,/separate` 打开自建目录，Shell 确认是新增 HWND 且精确目录，UIA 找唯一自建文件后真实 Explorer drag；原生 Drop/queued 计数各增1；无论成败都在 finally 关掉所有新增且仍显示该私有目录的窗口（未归属成功时再观察 5 s 防迟到窗口），只关这些窗口，不终止 Explorer 进程 |
 | OLE-08 / OLE-09 | `--ole-source <exe>`：真实 DoDragDrop 已进入循环/目标 hover 时 reparent 或销毁目标；取消后 effect NONE、没有落到替补 pane，资源 release 配对 |
