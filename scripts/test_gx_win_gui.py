@@ -45,6 +45,14 @@ class ChordTests(unittest.TestCase):
         self.assertEqual(([0x11], ord("9")), gui.parse_chord("control+9"))
         self.assertEqual(([0x11], ord("A")), gui.parse_chord("ctrl+ctrl+a"))
 
+    def test_layout_dependent_oem_keys(self):
+        self.assertEqual(([], 0xE2), gui.parse_chord("oem102"))
+        self.assertEqual(([0x10], 0xDC), gui.parse_chord("shift+oem5"))
+        self.assertEqual([0xBA, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF],
+                         [gui.parse_chord(f"oem{index}")[1] for index in range(1, 9)])
+        with self.assertRaises(gui.UsageError):
+            gui.parse_chord("oem9")
+
     def test_rejections(self):
         for chord in ("", "ctrl+", "+a", "hyper+a", "ctrl+f25", "ctrl+nosuchkey"):
             with self.subTest(chord=chord), self.assertRaises(gui.UsageError):

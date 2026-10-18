@@ -23,7 +23,9 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   capture ENV_DIR OUT.png [--popups] [--quick] [--method screen|print]
   pixel ENV_DIR X Y [--in ANCHOR]   print the color at a point
   type ENV_DIR TEXT                 KEYEVENTF_UNICODE, "\\n" is Enter
-  key ENV_DIR CHORD [--repeat N]    real virtual keys with scan codes, e.g. ctrl+shift+t
+  key ENV_DIR CHORD [--repeat N]    real virtual keys with scan codes, e.g. ctrl+shift+t; oem1..oem8 and
+                                    oem102 name the layout-dependent keys (VK_OEM_*, e.g. German ^ is
+                                    oem5, the ISO <> key oem102)
   click ENV_DIR X Y [--in ANCHOR] [--button left|right|middle|x1|x2] [--count N] [--mods ctrl,...]
   wheel ENV_DIR X Y [--in ANCHOR] [--delta N] [--horizontal] [--count N] [--mods ctrl,shift,alt,...]
   drag ENV_DIR X1 Y1 X2 Y2 [--in ANCHOR] [--steps N] [--button B]
@@ -236,6 +238,9 @@ NAMED_KEYS = {
     "period": 0xBE, "slash": 0xBF, "semicolon": 0xBA, "apostrophe": 0xDE, "quote": 0xDE,
     "bracketleft": 0xDB, "backslash": 0xDC, "bracketright": 0xDD, "apps": 0x5D, "capslock": 0x14,
     "printscreen": 0x2C, "pause": 0x13, "numlock": 0x90, "scrolllock": 0x91,
+    # VK_OEM_*: what they type depends on the layout (dead keys, the ISO key left of Z).
+    "oem1": 0xBA, "oem2": 0xBF, "oem3": 0xC0, "oem4": 0xDB, "oem5": 0xDC, "oem6": 0xDD, "oem7": 0xDE,
+    "oem8": 0xDF, "oem102": 0xE2,
 }
 # Keys that need KEYEVENTF_EXTENDEDKEY when MapVirtualKeyW cannot say (older systems).
 EXTENDED_VKS = frozenset((0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x2D, 0x2E, 0x5B, 0x5C, 0x5D,
