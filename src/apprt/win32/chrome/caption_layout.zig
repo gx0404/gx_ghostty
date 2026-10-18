@@ -292,8 +292,8 @@ pub fn hit(lay: Layout, x: i32, y: i32, tabs: bool) Hit {
 }
 
 /// What a point of the chrome row is for `WM_NCHITTEST`. `TitleBar`
-/// answers `.minimize` with `HTCLIENT` (minimize takes client input,
-/// `TitleBar.ncHitCode`) and the others with their hit-test codes.
+/// answers `.minimize` and `.close` with `HTCLIENT` (they take client
+/// input, `TitleBar.ncHitCode`) and the others with their hit-test codes.
 pub const NcHit = enum { client, caption, top, top_left, top_right, minimize, maximize, close };
 
 /// What `WM_NCHITTEST` reports for client point (`x`, `y`) of `lay` that

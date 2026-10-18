@@ -8,12 +8,13 @@
 //! buttons. `WM_NCHITTEST` reports the empty parts of the row as
 //! `HTCAPTION` (drag, double-click maximize, right-click system menu), the
 //! top edge as `HTTOP`, maximize as `HTMAXBUTTON` (Windows 11 shows the
-//! Snap Layouts flyout over it), close as `HTCLOSE`, and minimize, the tabs
-//! and menu as `HTCLIENT`; the geometry is the
+//! Snap Layouts flyout over it), and minimize, close, the tabs and menu as
+//! `HTCLIENT` (Windows adds a second, system-language tooltip to
+//! `HTMINBUTTON` and `HTCLOSE`); the geometry is the
 //! pure `chrome/caption_layout.zig`. A maximized window takes hits on the
 //! tabs and the main menu button up to the screen edge (`Layout.hit_top`).
-//! Maximize and close are handled through the non-client mouse messages
-//! so DefWindowProc never draws its classic buttons over the row. All
+//! Maximize is handled through the non-client mouse messages so
+//! DefWindowProc never draws its classic button over the row. All
 //! title bar buttons work like push buttons (`ButtonInput`): a left press
 //! captures the mouse until the release, the button looks pressed while
 //! the pointer is over it and performs only when released there. They
@@ -171,9 +172,9 @@ pub const Decoration = enum {
 
 fn buttonFromHitCode(code: usize) Button {
     return switch (code) {
-        // Minimize answers `WM_NCHITTEST` with `HTCLIENT` (`ncHitCode`);
-        // should the default handling ever report `HTMINBUTTON`, it is
-        // still the button.
+        // Minimize and close answer `WM_NCHITTEST` with `HTCLIENT`
+        // (`ncHitCode`); should the default handling ever report their
+        // codes, they are still the buttons.
         HTMINBUTTON => .minimize,
         HTMAXBUTTON => .maximize,
         HTCLOSE => .close,
@@ -466,8 +467,8 @@ pub fn handleMessage(
             return null;
         },
         w32.WM_RBUTTONUP => {
-            // Minimize is client input, but still ignores right clicks as
-            // it did as a caption button (no tab menu).
+            // Minimize and close are client input, but still ignore right
+            // clicks as they did as caption buttons (no tab menu).
             const pt = lparamPoint(lparam);
             const hit = self.hitTest(self.layout(), pt.x, pt.y);
             return if (self.routeButtons(.{ .msg = msg, .hit = hit }).consumed) 0 else null;
@@ -510,10 +511,11 @@ fn onNcHitTest(self: *TitleBar, hwnd: w32.HWND, lparam: isize) ?isize {
     var pt = lparamPoint(lparam);
     _ = w32.ScreenToClient(hwnd, &pt);
     const hit = caption_layout.ncHit(lay, pt.x, pt.y, self.tabsAt(lay, pt.x, pt.y));
-    // HTMINBUTTON lets Windows create a second, system-language tooltip
-    // even when its hover message is consumed. Own this button as client
-    // input before consulting DefWindowProc; leave HTMAXBUTTON for Snap.
-    if (hit == .minimize) return ncHitCode(hit);
+    // HTMINBUTTON and HTCLOSE let Windows create a second, system-language
+    // tooltip however their messages are handled. Own these buttons as
+    // client input before consulting DefWindowProc; leave HTMAXBUTTON for
+    // Snap Layouts.
+    if (hit == .minimize or hit == .close) return ncHitCode(hit);
 
     // The default handles the left, right and bottom borders.
     const default = w32.DefWindowProcW(hwnd, WM_NCHITTEST, 0, lparam);
@@ -523,13 +525,12 @@ fn onNcHitTest(self: *TitleBar, hwnd: w32.HWND, lparam: isize) ?isize {
 
 fn ncHitCode(hit: caption_layout.NcHit) isize {
     return switch (hit) {
-        .client, .minimize => w32.HTCLIENT,
+        .client, .minimize, .close => w32.HTCLIENT,
         .caption => HTCAPTION,
         .top => HTTOP,
         .top_left => HTTOPLEFT,
         .top_right => HTTOPRIGHT,
         .maximize => HTMAXBUTTON,
-        .close => HTCLOSE,
     };
 }
 
@@ -577,9 +578,9 @@ fn performButton(self: *TitleBar, button: Button) void {
 /// The pointer state of the title bar buttons as a pure state machine:
 /// `route` takes a mouse message with what the pointer hits and says what
 /// to do about it (`Effects`), which `routeButtons` carries out. Maximize
-/// and close get the non-client messages of their hit-test codes
-/// (`handleMessage`); minimize and the main menu button get the client
-/// messages the window routes to `onMouseMove`, `onLeftButtonDown`,
+/// gets the non-client messages of its hit-test code (`handleMessage`);
+/// minimize, close and the main menu button get the client messages the
+/// window routes to `onMouseMove`, `onLeftButtonDown`,
 /// `onLeftButtonUp` and `onMouseLeave`, which hand the rest of the row on
 /// to the tab bar; `onSize` reports what the pointer hits after the layout
 /// moved under it as `WM_SIZE`. A left press on a button captures the
@@ -681,7 +682,7 @@ const ButtonInput = struct {
                     if (clientButton(self.pressed)) self.pressed = .none;
                 }
             },
-            w32.WM_RBUTTONUP => fx.consumed = hitsButton(m.hit, .minimize),
+            w32.WM_RBUTTONUP => fx.consumed = hitsButton(m.hit, .minimize) or hitsButton(m.hit, .close),
             WM_NCRBUTTONDOWN, WM_NCRBUTTONDBLCLK, WM_NCRBUTTONUP => fx.consumed = buttonFromHitCode(m.wparam) != .none,
             w32.WM_SIZE => {
                 // The layout moved under a pointer that stayed (a resize,
@@ -715,13 +716,13 @@ const ButtonInput = struct {
     }
 
     /// The leave tracking that drops the hover of `button`: the client
-    /// area for minimize and the main menu button, the frame for maximize
-    /// and close.
+    /// area for minimize, close and the main menu button, the frame for
+    /// maximize.
     fn trackOf(button: Button) Track {
         return switch (button) {
             .none => .none,
-            .minimize, .menu => .client,
-            .maximize, .close => .nonclient,
+            .minimize, .close, .menu => .client,
+            .maximize => .nonclient,
         };
     }
 
@@ -750,7 +751,7 @@ const ButtonInput = struct {
 };
 
 fn clientButton(button: Button) bool {
-    return button == .menu or button == .minimize;
+    return button == .menu or button == .minimize or button == .close;
 }
 
 fn buttonOf(hit: Hit) Button {
@@ -1977,10 +1978,10 @@ test "Direct2D failure keeps native controls visible without affecting other win
     try std.testing.expectEqual(Frame.fullscreen, failed.title_bar.frame());
 }
 
-test "minimize answers the hit test as client input, maximize and close as caption buttons" {
+test "minimize and close answer the hit test as client input, maximize as its caption button" {
     try std.testing.expectEqual(w32.HTCLIENT, ncHitCode(.minimize));
+    try std.testing.expectEqual(w32.HTCLIENT, ncHitCode(.close));
     try std.testing.expectEqual(HTMAXBUTTON, ncHitCode(.maximize));
-    try std.testing.expectEqual(HTCLOSE, ncHitCode(.close));
     try std.testing.expectEqual(HTCAPTION, ncHitCode(.caption));
     try std.testing.expectEqual(HTTOP, ncHitCode(.top));
 }
@@ -2007,7 +2008,7 @@ const TestPointer = struct {
     }
 };
 
-test "maximize and close hover, press and perform through non-client messages" {
+test "maximize hovers, presses and performs through non-client messages" {
     const testing = std.testing;
     var p: TestPointer = .{};
     var fx = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
@@ -2020,9 +2021,9 @@ test "maximize and close hover, press and perform through non-client messages" {
     try testing.expect(fx.consumed);
     try testing.expectEqual(Button.maximize, p.input.pressed);
     try testing.expectEqual(ButtonInput.TooltipChange.hide, fx.tooltip);
-    // Over close and back: still the press of maximize, which alone
-    // reacts to the pointer.
-    _ = p.nc(WM_NCMOUSEMOVE, HTCLOSE);
+    // Over the empty caption and back: still the press of maximize, which
+    // alone reacts to the pointer.
+    _ = p.nc(WM_NCMOUSEMOVE, HTCAPTION);
     try testing.expectEqual(Button.none, p.input.hover);
     try testing.expectEqual(Button.maximize, p.input.pressed);
     _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
@@ -2031,10 +2032,9 @@ test "maximize and close hover, press and perform through non-client messages" {
     try testing.expectEqual(Button.maximize, fx.perform);
     try testing.expectEqual(Button.none, p.input.pressed);
 
-    // Released over another button: nothing.
-    _ = p.nc(WM_NCLBUTTONDOWN, HTCLOSE);
-    _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
-    try testing.expectEqual(Button.none, p.nc(WM_NCLBUTTONUP, HTMAXBUTTON).perform);
+    // Released elsewhere: nothing.
+    _ = p.nc(WM_NCLBUTTONDOWN, HTMAXBUTTON);
+    try testing.expectEqual(Button.none, p.nc(WM_NCLBUTTONUP, HTCAPTION).perform);
     try testing.expectEqual(Button.none, p.input.pressed);
 
     // The empty caption is left to the default handling.
@@ -2046,9 +2046,9 @@ test "maximize and close hover, press and perform through non-client messages" {
     try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
 }
 
-test "minimize and the main menu button perform when released over them" {
+test "minimize, close and the main menu button perform when released over them" {
     const testing = std.testing;
-    for ([_]Hit{ TestPointer.minimize, TestPointer.menu }) |hit| {
+    for ([_]Hit{ TestPointer.minimize, TestPointer.close, TestPointer.menu }) |hit| {
         const button = buttonOf(hit);
         var p: TestPointer = .{};
         var fx = p.send(w32.WM_MOUSEMOVE, hit);
@@ -2097,6 +2097,7 @@ test "right clicks on the caption buttons are swallowed, not on the menu button 
     const testing = std.testing;
     var p: TestPointer = .{};
     try testing.expect(p.send(w32.WM_RBUTTONUP, TestPointer.minimize).consumed);
+    try testing.expect(p.send(w32.WM_RBUTTONUP, TestPointer.close).consumed);
     try testing.expect(!p.send(w32.WM_RBUTTONUP, TestPointer.menu).consumed);
     try testing.expect(!p.send(w32.WM_RBUTTONUP, .tabs).consumed);
     try testing.expect(!p.send(w32.WM_RBUTTONUP, .caption).consumed);
@@ -2114,20 +2115,22 @@ test "right clicks on the caption buttons are swallowed, not on the menu button 
 test "leaving the client area or the frame drops the hover of its buttons" {
     const testing = std.testing;
     var p: TestPointer = .{};
-    _ = p.send(w32.WM_MOUSEMOVE, TestPointer.minimize);
-    // Leaving the frame keeps the hover of a client button.
-    _ = p.nc(WM_NCMOUSELEAVE, 0);
-    try testing.expectEqual(Button.minimize, p.input.hover);
-    var fx = p.send(w32.WM_MOUSELEAVE, .none);
-    try testing.expect(fx.tab_bar);
-    try testing.expectEqual(Button.none, p.input.hover);
-    try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+    for ([_]Hit{ TestPointer.minimize, TestPointer.close, TestPointer.menu }) |hit| {
+        _ = p.send(w32.WM_MOUSEMOVE, hit);
+        // Leaving the frame keeps the hover of a client button.
+        _ = p.nc(WM_NCMOUSELEAVE, 0);
+        try testing.expectEqual(buttonOf(hit), p.input.hover);
+        const fx = p.send(w32.WM_MOUSELEAVE, .none);
+        try testing.expect(fx.tab_bar);
+        try testing.expectEqual(Button.none, p.input.hover);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+    }
 
-    _ = p.nc(WM_NCMOUSEMOVE, HTCLOSE);
+    _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
     // Leaving the client area keeps the hover of a caption button.
     _ = p.send(w32.WM_MOUSELEAVE, .none);
-    try testing.expectEqual(Button.close, p.input.hover);
-    fx = p.nc(WM_NCMOUSELEAVE, 0);
+    try testing.expectEqual(Button.maximize, p.input.hover);
+    const fx = p.nc(WM_NCMOUSELEAVE, 0);
     try testing.expect(fx.consumed);
     try testing.expectEqual(Button.none, p.input.hover);
 }
@@ -2165,12 +2168,12 @@ test "losing the mouse capture or cancelling a mode drops the press and the hove
         try testing.expect(!fx.consumed and fx.tab_bar);
         try testing.expectEqual(Button.none, fx.perform);
 
-        // A caption button pressed through the frame likewise.
-        _ = p.nc(WM_NCMOUSEMOVE, HTCLOSE);
-        _ = p.nc(WM_NCLBUTTONDOWN, HTCLOSE);
+        // Maximize pressed through the frame likewise.
+        _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
+        _ = p.nc(WM_NCLBUTTONDOWN, HTMAXBUTTON);
         _ = p.send(msg, .none);
         try testing.expectEqual(ButtonInput{}, p.input);
-        try testing.expectEqual(Button.none, p.nc(WM_NCLBUTTONUP, HTCLOSE).perform);
+        try testing.expectEqual(Button.none, p.nc(WM_NCLBUTTONUP, HTMAXBUTTON).perform);
     }
     // The window taking the capture itself changes nothing.
     var p: TestPointer = .{};
@@ -2188,7 +2191,7 @@ test "a pressed button follows the pointer off and back and performs on release 
         .{ .button = .minimize, .nc = null, .beside = TestPointer.maximize },
         .{ .button = .menu, .nc = null, .beside = .tabs },
         .{ .button = .maximize, .nc = HTMAXBUTTON, .beside = TestPointer.minimize },
-        .{ .button = .close, .nc = HTCLOSE, .beside = TestPointer.maximize },
+        .{ .button = .close, .nc = null, .beside = TestPointer.maximize },
     };
     for (cases) |case| {
         const hit: Hit = .{ .button = case.button };
@@ -2258,10 +2261,10 @@ test "without the mouse capture, leaving the area of a pressed button ends the p
     try testing.expectEqual(Button.minimize, p.input.pressed);
     _ = p.send(w32.WM_MOUSELEAVE, .none);
     try testing.expectEqual(ButtonInput{}, p.input);
-    _ = p.nc(WM_NCLBUTTONDOWN, HTCLOSE);
+    _ = p.nc(WM_NCLBUTTONDOWN, HTMAXBUTTON);
     p.input.captured = false;
     _ = p.send(w32.WM_MOUSELEAVE, .none);
-    try testing.expectEqual(Button.close, p.input.pressed);
+    try testing.expectEqual(Button.maximize, p.input.pressed);
     _ = p.nc(WM_NCMOUSELEAVE, 0);
     try testing.expectEqual(ButtonInput{}, p.input);
 }
@@ -2269,14 +2272,14 @@ test "without the mouse capture, leaving the area of a pressed button ends the p
 test "a resize hovers the button now under the pointer and points the tooltip at it" {
     const testing = std.testing;
     var p: TestPointer = .{};
-    // Minimize and the main menu button track the client area, maximize
-    // and close the frame; the tooltip starts over (`onSize` hid it).
+    // Minimize, close and the main menu button track the client area,
+    // maximize the frame; the tooltip starts over (`onSize` hid it).
     const cases = [_]struct { hit: Hit, track: ButtonInput.Track }{
         .{ .hit = TestPointer.minimize, .track = .client },
         .{ .hit = TestPointer.minimize, .track = .client },
         .{ .hit = TestPointer.menu, .track = .client },
         .{ .hit = TestPointer.maximize, .track = .nonclient },
-        .{ .hit = TestPointer.close, .track = .nonclient },
+        .{ .hit = TestPointer.close, .track = .client },
     };
     for (cases) |case| {
         const fx = p.send(w32.WM_SIZE, case.hit);
