@@ -1,8 +1,9 @@
 //! Ghostty GX additions to `class/window.zig::Window`: menus and header
 //! bar tooltips in the current UI language (rebuilt when it changes, with a
 //! toast because some libadwaita labels only change in new windows), launch
-//! profiles in the new tab dropdown, the terminal context menu, and opening
-//! the main menu for the `gx:main_menu` action.
+//! profiles in the new tab dropdown, the terminal context menu, opening
+//! the main menu for the `gx:main_menu` action, and keeping new and
+//! adopted tabs out of the pinned tabs (`adoptPosition`).
 const std = @import("std");
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -43,6 +44,10 @@ const restore_key = "gx-context-menu";
 /// The object data key on a terminal popover that has the handler putting
 /// the context menu back.
 const restore_handler_key = "gx-context-menu-handler";
+
+/// The object data key on the box of a terminal's context menu holding
+/// the main menu popover next to it (`mainPopover`).
+const main_popover_key = "gx-main-menu-popover";
 
 /// Brings the menus and tooltips of `window` up to date with the UI
 /// language, the launch profiles and the configuration. Called when the
@@ -103,17 +108,19 @@ pub fn syncSurfaceMenu(surface: *Surface) void {
 
 /// Opens the main menu of `window`: from its header bar or tab bar button
 /// when one is shown, else from the active terminal. Returns false if
-/// there is neither.
+/// there is neither. Both keep their menu between openings.
 pub fn popupMainMenu(window: *Window) bool {
-    const started = open_perf.begin();
-    var header: Header = .{};
+    var timing = open_perf.begin(.menu);
+    var header: Header = .{ .translate = false };
     if (toolbar(window)) |widget| walk(widget, &header);
     for (header.menu_buttons.slice()) |button| {
         const widget = button.as(gtk.Widget);
         if (widget.isVisible() != 0 and widget.getMapped() != 0) {
-            if (button.getPopover()) |popover| open_perf.watch(popover.as(gtk.Widget), "menu.open.total", started);
+            // The button keeps its popover and menu: nothing to create.
+            open_perf.lap(&timing, .prepare);
+            if (button.getPopover()) |popover| open_perf.watch(popover.as(gtk.Widget), timing);
             button.popup();
-            if (button.getPopover()) |popover| open_perf.presented(popover.as(gtk.Widget), started);
+            if (button.getPopover()) |popover| open_perf.presented(popover.as(gtk.Widget), timing);
             return true;
         }
     }
@@ -121,16 +128,65 @@ pub fn popupMainMenu(window: *Window) bool {
     const button = if (header.menu_buttons.len > 0) header.menu_buttons.items[0] else return false;
     const model = button.getMenuModel() orelse return false;
     const surface = window.getActiveSurface() orelse return false;
-    const popover = surfacePopover(surface) orelse return false;
-    open_perf.watch(popover.as(gtk.Widget), "menu.open.total", started);
-    showFromPopover(popover, model);
-    addViewControls(popover);
-    open_perf.presented(popover.as(gtk.Widget), started);
+    const context = surfacePopover(surface) orelse return false;
+    open_perf.lap(&timing, .prepare);
+    const popover = mainPopover(context, model) orelse return false;
+    open_perf.lap(&timing, .create);
+    pointAtTopRight(popover.as(gtk.Popover));
+    open_perf.lap(&timing, .layout);
+    open_perf.watch(popover.as(gtk.Widget), timing);
+    popover.as(gtk.Popover).popup();
+    open_perf.presented(popover.as(gtk.Widget), timing);
     return true;
 }
 
+/// The main menu popover of a terminal whose window shows no main menu
+/// button, next to its context menu `context` (the main menu used to take
+/// the context menu's place, building both menus at every opening). It is
+/// built at the first opening and kept, and its menu is built again only
+/// when `model` changed. The box of the context menu holds it and removes
+/// it with the terminal.
+fn mainPopover(context: *gtk.PopoverMenu, model: *gio.MenuModel) ?*gtk.PopoverMenu {
+    const parent = context.as(gtk.Widget).getParent() orelse return null;
+    const box = gobject.ext.cast(gtk.Box, parent) orelse return null;
+    const object = box.as(gobject.Object);
+    if (object.getData(main_popover_key)) |data| {
+        const popover: *gtk.PopoverMenu = @ptrCast(@alignCast(data));
+        if (popover.getMenuModel() != model) {
+            removeViewControls(popover);
+            popover.setMenuModel(model);
+            addViewControls(popover);
+        }
+        return popover;
+    }
+    // Like the context menu it stands for.
+    const popover = gtk.PopoverMenu.newFromModelFull(model, .{ .nested = true });
+    popover.as(gtk.Widget).setHalign(.start);
+    popover.as(gtk.Popover).setHasArrow(0);
+    box.append(popover.as(gtk.Widget));
+    object.setData(main_popover_key, popover);
+    popover.as(gobject.Object).weakRef(&forgetMainPopover, object);
+    _ = gtk.Popover.signals.closed.connect(popover.as(gtk.Popover), ?*anyopaque, mainPopoverClosed, null, .{});
+    addViewControls(popover);
+    return popover;
+}
+
+fn forgetMainPopover(data: ?*anyopaque, _: *gobject.Object) callconv(.c) void {
+    const box: *gobject.Object = @ptrCast(@alignCast(data orelse return));
+    box.setData(main_popover_key, null);
+}
+
+/// Gives the focus back to the terminal when the main menu closes, like
+/// its context menu does (GTK would move it to the tab bar).
+fn mainPopoverClosed(popover: *gtk.Popover, _: ?*anyopaque) callconv(.c) void {
+    const widget = popover.as(gtk.Widget).getAncestor(Surface.getGObjectType()) orelse return;
+    if (widget.getRoot() == null) return;
+    const surface = gobject.ext.cast(Surface, widget) orelse return;
+    surface.grabFocus();
+}
+
 pub fn popupNewTabMenu(window: *Window) bool {
-    var header: Header = .{};
+    var header: Header = .{ .translate = false };
     if (toolbar(window)) |widget| walk(widget, &header);
     for (header.split_buttons.slice()) |button| {
         const widget = button.as(gtk.Widget);
@@ -302,7 +358,7 @@ fn actionTabCloseOthers(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window
 /// counts only unpinned tabs. `closeOtherPages` would close them, because
 /// the window confirms every close request. Going from the last tab keeps
 /// the positions still to visit valid while tabs close.
-fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
+pub fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
     var i = view.getNPages();
     while (i > 0) {
         i -= 1;
@@ -312,7 +368,29 @@ fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
 }
 
 fn actionTabCloseRight(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
-    window.getTabView().closePagesAfter(contextPage(window) orelse return);
+    closeTabsRight(window.getTabView(), contextPage(window) orelse return);
+}
+
+/// "Close Tabs to the Right": asks to close the unpinned tabs after
+/// `page`. Pinned tabs stay, like with "Close Other Tabs" (D-21), and like
+/// the menu item that counts only the unpinned tabs to the right; pinned
+/// tabs come first, so from a pinned tab the later pinned ones stay.
+/// `closePagesAfter` would close them, because the window confirms every
+/// close request.
+pub fn closeTabsRight(view: *adw.TabView, page: *adw.TabPage) void {
+    const first = view.getPagePosition(page) + 1;
+    var i = view.getNPages();
+    while (i > first) {
+        i -= 1;
+        const other = view.getNthPage(i);
+        if (other.getPinned() == 0) view.closePage(other);
+    }
+}
+
+/// libadwaita inserts new (unpinned) pages only after the pinned group.
+/// `Window.adoptTab` uses this for new, duplicated and moved-in tabs.
+pub fn adoptPosition(view: *adw.TabView, position: c_int) c_int {
+    return @max(position, view.getNPinnedPages());
 }
 
 fn actionTabDuplicate(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
@@ -414,28 +492,32 @@ fn Widgets(comptime T: type) type {
 }
 
 /// The new tab and main menu buttons of the header bar and the tab bar.
-/// Visiting a button also translates its tooltip.
 const Header = struct {
+    /// Whether visiting a button translates its tooltip, which `sync` does
+    /// when the language changes; opening a menu only looks it up.
+    translate: bool = true,
     menu_buttons: Widgets(gtk.MenuButton) = .{},
     split_buttons: Widgets(adw.SplitButton) = .{},
 
     /// Returns whether to visit the children of `widget`.
     fn visit(self: *Header, widget: *gtk.Widget) bool {
         if (gobject.ext.cast(adw.SplitButton, widget)) |button| {
-            widget.setTooltipText(tr("New Tab"));
-            button.setDropdownTooltip(tr("Launch Profiles and Splits"));
+            if (self.translate) {
+                widget.setTooltipText(tr("New Tab"));
+                button.setDropdownTooltip(tr("Launch Profiles and Splits"));
+            }
             self.split_buttons.add(button);
             return false;
         }
         if (gobject.ext.cast(gtk.MenuButton, widget)) |button| {
             if (iconIs(button.getIconName(), "open-menu-symbolic")) {
-                widget.setTooltipText(tr("Main Menu"));
+                if (self.translate) widget.setTooltipText(tr("Main Menu"));
                 self.menu_buttons.add(button);
             }
             return false;
         }
         if (gobject.ext.cast(gtk.ToggleButton, widget)) |button| {
-            if (iconIs(button.as(gtk.Button).getIconName(), "view-grid-symbolic")) {
+            if (self.translate and iconIs(button.as(gtk.Button).getIconName(), "view-grid-symbolic")) {
                 widget.setTooltipText(tr("View Open Tabs"));
             }
             return false;
@@ -502,7 +584,12 @@ fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel) void {
         object.setDataFull(restore_key, context.as(gobject.Object).ref(), &unrefObject);
     }
     popover.setMenuModel(model);
+    pointAtTopRight(popover.as(gtk.Popover));
+    popover.as(gtk.Popover).popup();
+}
 
+/// Points `popover` at the top right corner of the terminal it belongs to.
+fn pointAtTopRight(popover: *gtk.Popover) void {
     const anchor = popover.as(gtk.Widget).getParent() orelse popover.as(gtk.Widget);
     const rect: gdk.Rectangle = .{
         .f_x = @max(anchor.getWidth() - 1, 0),
@@ -510,8 +597,7 @@ fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel) void {
         .f_width = 1,
         .f_height = 1,
     };
-    popover.as(gtk.Popover).setPointingTo(&rect);
-    popover.as(gtk.Popover).popup();
+    popover.setPointingTo(&rect);
 }
 
 fn restoreContextMenu(popover: *gtk.Popover, _: ?*anyopaque) callconv(.c) void {
@@ -595,6 +681,75 @@ test "close other tabs keeps the pinned tabs and the context tab" {
     for ([_]*adw.TabPage{ pages[2], pages[4] }) |page| try testing.expect(view.getPagePosition(page) >= 0);
 }
 
+test "close tabs to the right keeps the pinned tabs" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const view = adw.TabView.new();
+    _ = view.as(gobject.Object).refSink();
+    defer view.as(gobject.Object).unref();
+    _ = adw.TabView.signals.close_page.connect(view, ?*anyopaque, testConfirmClose, null, .{});
+
+    var pages: [6]*adw.TabPage = undefined;
+    for (&pages) |*page| {
+        page.* = view.append(gtk.Label.new(null).as(gtk.Widget));
+        _ = page.*.as(gobject.Object).ref();
+    }
+    defer for (pages) |page| page.as(gobject.Object).unref();
+    // Three pinned tabs first: 0, 1 and 2, then the unpinned 3, 4 and 5.
+    for (pages[0..3]) |page| view.setPagePinned(page, 1);
+
+    // From the first pinned tab: the later pinned tabs stay, only the
+    // unpinned ones close.
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    closeTabsRight(view, pages[0]);
+    try testing.expectEqual(@as(c_int, 3), view.getNPages());
+    for (pages[0..3], 0..) |page, i| try testing.expectEqual(@as(c_int, @intCast(i)), view.getPagePosition(page));
+
+    // From an unpinned tab: only the tabs after it close.
+    const kept = view.append(gtk.Label.new(null).as(gtk.Widget));
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    closeTabsRight(view, kept);
+    try testing.expectEqual(@as(c_int, 4), view.getNPages());
+    try testing.expectEqual(@as(c_int, 3), view.getPagePosition(kept));
+}
+
+test "a tab adopted while a pinned tab other than the last one is selected goes after the pinned tabs" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const view = adw.TabView.new();
+    _ = view.as(gobject.Object).refSink();
+    defer view.as(gobject.Object).unref();
+
+    // Two pinned tabs, then two unpinned ones.
+    var pages: [4]*adw.TabPage = undefined;
+    for (&pages) |*page| page.* = view.append(gtk.Label.new(null).as(gtk.Widget));
+    view.setPagePinned(pages[0], 1);
+    view.setPagePinned(pages[1], 1);
+
+    // `window-new-tab-position = current` with the first pinned tab
+    // selected asks for the position after it (D-24): the tab goes after
+    // the pinned tabs instead, unpinned, and the pinned tabs stay.
+    view.setSelectedPage(pages[0]);
+    const after_first = view.insert(gtk.Label.new(null).as(gtk.Widget), adoptPosition(view, view.getPagePosition(view.getSelectedPage().?) + 1));
+    try testing.expectEqual(@as(c_int, 5), view.getNPages());
+    try testing.expectEqual(@as(c_int, 2), view.getPagePosition(after_first));
+    try testing.expect(after_first.getPinned() == 0);
+    try testing.expectEqual(@as(c_int, 2), view.getNPinnedPages());
+    for (pages[0..2], 0..) |page, i| try testing.expectEqual(@as(c_int, @intCast(i)), view.getPagePosition(page));
+
+    // After the last pinned tab, after an unpinned tab and at the end the
+    // position stays.
+    const after_last = view.insert(gtk.Label.new(null).as(gtk.Widget), adoptPosition(view, view.getPagePosition(pages[1]) + 1));
+    try testing.expectEqual(@as(c_int, 2), view.getPagePosition(after_last));
+    const after_unpinned = view.insert(gtk.Label.new(null).as(gtk.Widget), adoptPosition(view, view.getPagePosition(pages[2]) + 1));
+    try testing.expectEqual(view.getPagePosition(pages[2]) + 1, view.getPagePosition(after_unpinned));
+    const at_end = view.insert(gtk.Label.new(null).as(gtk.Widget), adoptPosition(view, view.getNPages()));
+    try testing.expectEqual(view.getNPages() - 1, view.getPagePosition(at_end));
+    try testing.expectEqual(@as(c_int, 8), view.getNPages());
+    try testing.expectEqual(@as(c_int, 2), view.getNPinnedPages());
+}
+
 fn testConfirmClose(view: *adw.TabView, page: *adw.TabPage, _: ?*anyopaque) callconv(.c) c_int {
     view.closePageFinish(page, 1);
     return 1;
@@ -607,4 +762,118 @@ test "menuTrigger never advertises a key sequence as a single menu accelerator" 
     var keybinds: configpkg.Config.Keybinds = .{};
     try keybinds.parseCLI(arena.allocator(), "ctrl+x>ctrl+k=gx:keybinds");
     try testing.expectEqual(@as(?input.Binding.Trigger, null), menuTrigger(&keybinds.set, .{ .gx = .keybinds }));
+}
+
+/// Wraps inside the page's group. With pinned pages, amount counts positions
+/// within that group, so even some previously legal multi-step moves change.
+/// Without pinned pages the group is the whole view, including large amounts.
+pub fn movedTabPosition(view: *adw.TabView, page: *adw.TabPage, pos: c_int, amount: isize) c_int {
+    const pinned = view.getNPinnedPages();
+    const start: c_int = if (page.getPinned() != 0) 0 else pinned;
+    const count = if (page.getPinned() != 0) pinned else view.getNPages() - pinned;
+    // Reduce the amount before adding, including minInt/maxInt amounts.
+    const relative: i64 = @as(i64, pos - start) + @mod(amount, @as(isize, count));
+    return start + @as(c_int, @intCast(@mod(relative, count)));
+}
+
+test "move tabs wraps within pinned and unpinned groups" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const Case = struct { pinned: c_int, total: c_int, pos: c_int, amount: isize, expected: c_int };
+    const cases = [_]Case{
+        .{ .pinned = 2, .total = 4, .pos = 1, .amount = 1, .expected = 0 },
+        .{ .pinned = 2, .total = 4, .pos = 2, .amount = -1, .expected = 3 },
+        .{ .pinned = 2, .total = 4, .pos = 3, .amount = 1, .expected = 2 },
+        .{ .pinned = 2, .total = 4, .pos = 0, .amount = -1, .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 0, .amount = 1, .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 3, .amount = -1, .expected = 2 },
+        .{ .pinned = 1, .total = 2, .pos = 0, .amount = 1, .expected = 0 },
+        .{ .pinned = 1, .total = 2, .pos = 1, .amount = -1, .expected = 1 },
+        .{ .pinned = 2, .total = 2, .pos = 1, .amount = 1, .expected = 0 },
+        .{ .pinned = 2, .total = 4, .pos = 1, .amount = 100, .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 2, .amount = -101, .expected = 3 },
+        .{ .pinned = 2, .total = 4, .pos = 0, .amount = std.math.maxInt(isize), .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 3, .amount = std.math.minInt(isize), .expected = 3 },
+        .{ .pinned = 2, .total = 6, .pos = 5, .amount = 3, .expected = 4 },
+        .{ .pinned = 2, .total = 5, .pos = 0, .amount = -4, .expected = 0 },
+        .{ .pinned = 0, .total = 4, .pos = 1, .amount = 100, .expected = 1 },
+        .{ .pinned = 0, .total = 4, .pos = 0, .amount = std.math.maxInt(isize), .expected = 3 },
+        .{ .pinned = 0, .total = 4, .pos = 3, .amount = std.math.minInt(isize), .expected = 3 },
+    };
+    for (cases) |case| {
+        const view = adw.TabView.new();
+        _ = view.as(gobject.Object).refSink();
+        defer view.as(gobject.Object).unref();
+        var i: c_int = 0;
+        while (i < case.total) : (i += 1) {
+            const page = view.append(gtk.Label.new(null).as(gtk.Widget));
+            if (i < case.pinned) view.setPagePinned(page, 1);
+        }
+        const page = view.getNthPage(case.pos);
+        const destination = movedTabPosition(view, page, case.pos, case.amount);
+        const moved = view.reorderPage(page, destination) != 0;
+        try testing.expectEqual(case.expected != case.pos, moved);
+        try testing.expectEqual(case.expected, view.getPagePosition(page));
+        try testing.expectEqual(case.expected, destination);
+        try testing.expectEqual(case.pinned, view.getNPinnedPages());
+        try testing.expectEqual(case.total, view.getNPages());
+    }
+}
+
+test "move tabs without pinned pages preserves legal upstream results and wraps all other amounts" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    var total: c_int = 1;
+    while (total <= 8) : (total += 1) {
+        const view = adw.TabView.new();
+        _ = view.as(gobject.Object).refSink();
+        defer view.as(gobject.Object).unref();
+        var i: c_int = 0;
+        while (i < total) : (i += 1) _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+        var pos: c_int = 0;
+        while (pos < total) : (pos += 1) {
+            var amount: isize = -100;
+            while (amount <= 100) : (amount += 1) {
+                const page = view.getNthPage(pos);
+                const initial: c_int = @intCast(pos + amount);
+                const max = total - 1;
+                const expected = if (initial < 0) max + initial + 1 else if (initial > max) initial - max - 1 else initial;
+                const destination = movedTabPosition(view, page, pos, amount);
+                // Preserve upstream only where its single wrap was legal.
+                // Every other amount must produce a valid cyclic destination.
+                const wrapped: c_int = @intCast(@mod(@as(isize, pos) + amount, @as(isize, total)));
+                try testing.expectEqual(if (expected >= 0 and expected < total) expected else wrapped, destination);
+                try testing.expect(destination >= 0 and destination < total);
+                try testing.expectEqual(destination != pos, view.reorderPage(page, destination) != 0);
+                try testing.expectEqual(destination, view.getPagePosition(page));
+                try testing.expectEqual(@as(c_int, 0), view.getNPinnedPages());
+            }
+        }
+    }
+}
+
+test "move tabs handles three pinned and four ordinary pages with large amounts" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const view = adw.TabView.new();
+    _ = view.as(gobject.Object).refSink();
+    defer view.as(gobject.Object).unref();
+    for (0..7) |i| {
+        const page = view.append(gtk.Label.new(null).as(gtk.Widget));
+        if (i < 3) view.setPagePinned(page, 1);
+    }
+    const amounts = [_]isize{ -8, -7, -4, -1, 0, 1, 4, 7, 8, std.math.minInt(isize), std.math.maxInt(isize) };
+    for (0..7) |i| for (amounts) |amount| {
+        const pos: c_int = @intCast(i);
+        const page = view.getNthPage(pos);
+        const start: c_int = if (pos < 3) 0 else 3;
+        const count: c_int = if (pos < 3) 3 else 4;
+        const expected = start + @as(c_int, @intCast(@mod(@as(i128, pos - start) + @as(i128, amount), @as(i128, count))));
+        const destination = movedTabPosition(view, page, pos, amount);
+        try testing.expectEqual(expected, destination);
+        try testing.expectEqual(expected != pos, view.reorderPage(page, destination) != 0);
+        try testing.expectEqual(expected, view.getPagePosition(page));
+        try testing.expectEqual(@as(c_int, 3), view.getNPinnedPages());
+        try testing.expectEqual(@as(c_int, 7), view.getNPages());
+    };
 }

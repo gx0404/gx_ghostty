@@ -12,15 +12,28 @@
 //! each theme: the configuration is built in memory from a snapshot of
 //! the configuration layers (`gx.config_layers.Layers`) with a `--theme`
 //! override. Applying a theme saves it; reverting, going back or closing
-//! the dialog without applying ends the preview. A configuration that
-//! follows the system's light or dark mode with two themes shows a row
-//! for each.
+//! the dialog without applying ends the preview. Reverting, going back or
+//! selecting the saved theme again also drops a theme whose saving failed;
+//! when the theme was saved and only applying it failed, reverting applies
+//! the saved configuration again instead. A configuration that follows the
+//! system's light or dark mode with two themes shows a row for each.
 //!
 //! The text is translated with the Ghostty GX tables (`src/gx/i18n.zig`,
 //! not gettext) into the language of the configuration, and follows it
 //! when it changes while the dialog is open. Without the Ghostty GX
 //! layers (`GHOSTTY_GX_DEFAULTS=0`) the overlay is not loaded, so the
 //! settings are shown but cannot be changed.
+//!
+//! Closing the dialog only takes it out of its window, which keeps it
+//! (`dialog_cache`) and presents it again at its next opening there, on
+//! the page a new dialog would start on and with the values of the
+//! configuration (P4). A configuration reload, a change of the UI
+//! language or of the theme, or the window going away puts it out of
+//! date, and the next opening builds a new one. One dialog shows at a
+//! time: opening it elsewhere first closes the one shown. If saving keeps
+//! it open, the request brings that dialog and its pending edits forward.
+//! On reopening, theme discovery is refreshed when its subpage is shown;
+//! shell discovery runs once in idle after the Shell page is shown.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -43,6 +56,8 @@ const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("../class/application.zig").Application;
+const open_perf = @import("open_perf.zig");
+const dialog_cache = @import("dialog_cache.zig");
 
 const settings_map = gx.settings_map;
 const msg = settings_map.msg;
@@ -131,8 +146,12 @@ const text = struct {
     pub const bell_audio_hint = "Set bell-audio-path in the configuration file to choose the sound.";
 };
 
-/// The open dialog, if any. Opening the settings again presents it.
+/// The dialog shown, if any. Opening the settings again in its window
+/// brings it to the front; opening them in another window closes it.
 var open_dialog: WeakRef(GxSettingsDialog) = .empty;
+
+/// The dialog each window keeps after it closed.
+const kept_dialogs = dialog_cache.Cache(GxSettingsDialog, "gx-settings-dialog");
 
 /// The page the dialog showed when it was last closed; the next opening
 /// starts there.
@@ -162,6 +181,29 @@ fn themeValue(
         .dark => .{ .light = light orelse name, .dark = name },
     };
     return try pair.value(alloc);
+}
+
+/// What a dialog shows of the configuration it was built with that only
+/// building it again updates: the UI language of its static text and the
+/// theme. A kept dialog opens again only while both are unchanged.
+const Built = struct {
+    lang: gx.i18n.Language,
+    theme: u64,
+
+    fn of(config: *const CoreConfig) Built {
+        return .{ .lang = gx.i18n.resolve(config.language), .theme = themeStamp(config.theme) };
+    }
+};
+
+/// A hash of a `theme` value: its light and its dark theme.
+fn themeStamp(theme: ?CoreConfig.Theme) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    if (theme) |value| {
+        hasher.update(value.light);
+        hasher.update(&.{0});
+        hasher.update(value.dark);
+    }
+    return hasher.final();
 }
 
 /// `command` without the `direct:` or `shell:` prefix that tells how it
@@ -304,9 +346,14 @@ pub const GxSettingsDialog = extern struct {
     const State = struct {
         alloc: Allocator,
 
-        /// Owns the shell choices and other strings that live as long as
-        /// the dialog.
+        /// Owns theme directories and other strings stable for the lifetime
+        /// of the dialog.
         arena: ArenaAllocator,
+
+        /// Replaced synchronized values do not accumulate in the lifetime arena.
+        font_arena: ArenaAllocator,
+        command_arena: ArenaAllocator,
+        shell_arena: ArenaAllocator,
 
         /// The language of the dialog text.
         lang: gx.i18n.Language = .default,
@@ -361,6 +408,7 @@ pub const GxSettingsDialog = extern struct {
         /// The listed themes, the directories they are read from and the
         /// swatches read so far.
         themes: ?settings_map.ThemeList = null,
+        themes_stale: bool = false,
         theme_dirs: []const []const u8 = &.{},
         swatches: theme_swatch.Cache = .{},
 
@@ -390,9 +438,10 @@ pub const GxSettingsDialog = extern struct {
         previewing: bool = false,
         preview_source: ?c_uint = null,
 
-        /// The shell choices, filled in when the shell page is first
-        /// shown; a choice's index is its position in the shell row.
+        /// The shell choices, refreshed once per opening after the shell
+        /// page is mapped; an index is its position in the shell row.
         shells_loaded: bool = false,
+        shell_source: ?c_uint = null,
         shells: []const Shell = &.{},
         shell: usize = 0,
 
@@ -401,6 +450,28 @@ pub const GxSettingsDialog = extern struct {
 
         /// The herdr executable, if herdr was detected.
         herdr: ?[:0]const u8 = null,
+
+        /// The window that keeps the dialog (`kept_dialogs`); none for a
+        /// dialog in a window of its own, which every opening builds anew.
+        owner: WeakRef(gtk.Window) = .empty,
+
+        /// Whether the dialog is presented: from opening until it closes.
+        shown: bool = false,
+
+        /// Set while `apply` updates the configuration, which tells the
+        /// dialog's own changes from a reload.
+        applying: bool = false,
+
+        /// Set by a configuration change the dialog did not make (a reload,
+        /// another settings UI): the next opening builds a new dialog.
+        stale: bool = false,
+
+        /// The UI language and theme the dialog was built with.
+        built: Built = .{ .lang = .default, .theme = 0 },
+
+        // Tests keep real widget, save and close paths; only the application
+        // boundary and overlay location are supplied by an isolated fixture.
+        test_backend: if (@import("builtin").is_test) ?*TestBackend else void = if (@import("builtin").is_test) null else {},
     };
 
     const Shell = struct {
@@ -433,36 +504,145 @@ pub const GxSettingsDialog = extern struct {
     }
 
     /// Like `show`, and shows `page` (`gx:settings_page:<page>`); without
-    /// a page, a new dialog starts on the page the last one was closed on.
+    /// a page, the dialog starts on the page the last one was closed on.
     pub fn showPage(app: *Application, page: ?settings_map.Page) void {
-        const open_perf = @import("open_perf.zig");
-        const started = open_perf.begin();
+        var timing = open_perf.begin(.settings);
         if (!adw_version.supportsDialogs()) {
             log.warn("the settings dialog needs libadwaita 1.5 or newer", .{});
             return;
         }
 
-        const parent: ?*gtk.Widget = if (app.as(gtk.Application).getActiveWindow()) |window|
-            window.as(gtk.Widget)
+        const window = app.as(gtk.Application).getActiveWindow();
+        const parent: ?*gtk.Widget = if (window) |value| value.as(gtk.Widget) else null;
+        const host: ?*gtk.Window = if (window) |value|
+            if (dialog_cache.hostsDialogs(value)) value else null
         else
             null;
 
-        if (open_dialog.get()) |dialog| {
-            defer dialog.unref();
-            if (page) |name| dialog.showSettingsPage(name);
-            open_perf.watch(dialog.as(gtk.Widget), "settings.open.total", started);
-            dialog.as(adw.Dialog).present(parent);
-            open_perf.presented(dialog.as(gtk.Widget), started);
+        if (existingFor(host)) |shown| {
+            defer shown.unref();
+            open_perf.lap(&timing, .prepare);
+            const state = &shown.private().state;
+            // A failed save belongs to the visible controls. Do not pop a
+            // subpage or reset them while the user still needs to retry.
+            if (state.changes.isEmpty() and !state.apply_pending) {
+                if (page) |name| shown.showSettingsPage(name);
+            }
+            const owner = state.owner.get();
+            defer if (owner) |value| value.unref();
+            if (owner) |value| value.present();
+            open_perf.lap(&timing, .layout);
+            open_perf.watch(shown.as(gtk.Widget), timing);
+            shown.as(adw.Dialog).present(if (owner) |value| value.as(gtk.Widget) else null);
+            open_perf.presented(shown.as(gtk.Widget), timing);
             return;
         }
 
-        const dialog = gobject.ext.newInstance(Self, .{});
-        dialog.load(app);
-        if (page orelse last_page) |name| dialog.showSettingsPage(name);
+        const config_obj = app.getConfig();
+        defer config_obj.unref();
+        const config = config_obj.get();
+        const reused: ?*Self = find: {
+            const value = host orelse break :find null;
+            const candidate = kept_dialogs.get(value) orelse break :find null;
+            const st = &candidate.private().state;
+            if (upToDate(st.built, st.stale, config)) break :find candidate;
+            kept_dialogs.drop(value);
+            break :find null;
+        };
+        open_perf.lap(&timing, .prepare);
+
+        const dialog: *Self = if (reused) |candidate| candidate else build: {
+            const created = gobject.ext.newInstance(Self, .{});
+            open_perf.lap(&timing, .create);
+            created.load(app);
+            if (page orelse last_page) |name| created.showSettingsPage(name);
+            if (host) |value| {
+                kept_dialogs.keep(value, created);
+                created.private().state.owner.set(value);
+            }
+            break :build created;
+        };
+        if (reused != null) dialog.reopen(config, page);
+        dialog.private().state.shown = true;
         open_dialog.set(dialog);
-        open_perf.watch(dialog.as(gtk.Widget), "settings.open.total", started);
+        open_perf.lap(&timing, .layout);
+        open_perf.watch(dialog.as(gtk.Widget), timing);
         dialog.as(adw.Dialog).present(parent);
-        open_perf.presented(dialog.as(gtk.Widget), started);
+        open_perf.presented(dialog.as(gtk.Widget), timing);
+    }
+
+    /// Returns a retained dialog when an opening should use the one shown.
+    fn existingFor(host: ?*gtk.Window) ?*Self {
+        if (open_dialog.get()) |shown| {
+            if (shown.private().state.shown and !shown.isShownIn(host)) shown.closeElsewhere();
+            if (shown.private().state.shown) return shown;
+            shown.unref();
+        }
+        // Also guard the borrowed cache candidate: being stale does not
+        // make a visible dialog (or its pending edits) safe to replace.
+        if (host) |window| if (kept_dialogs.get(window)) |candidate| {
+            if (candidate.private().state.shown) {
+                open_dialog.set(candidate);
+                return candidate.ref();
+            }
+        };
+        return null;
+    }
+
+    /// Whether the dialog shows in `host`, the window that keeps it (null:
+    /// in a window of its own).
+    fn isShownIn(self: *Self, host: ?*gtk.Window) bool {
+        const owner = self.private().state.owner.get();
+        defer if (owner) |value| value.unref();
+        return owner == host;
+    }
+
+    /// Closes the dialog shown in another window, which saves its changes
+    /// first (a failed save keeps it open). A dialog whose window went away
+    /// is no longer shown.
+    fn closeElsewhere(self: *Self) void {
+        if (self.as(gtk.Widget).getRoot() == null) {
+            self.private().state.shown = false;
+            open_dialog.set(null);
+            return;
+        }
+        _ = self.as(adw.Dialog).close();
+    }
+
+    /// Whether a dialog built with `built` still shows what a new one would
+    /// show for `config`: no reload came since (`stale`), and neither the
+    /// UI language nor the theme changed.
+    fn upToDate(built: Built, stale: bool, config: *const CoreConfig) bool {
+        const now: Built = .of(config);
+        return !stale and built.lang == now.lang and built.theme == now.theme;
+    }
+
+    /// Shows a kept dialog again the way a new one opens: on `page` (else
+    /// the page the last dialog was closed on), without the theme list or a
+    /// toast, with the values of `config` (text typed and not applied goes),
+    /// scrolled to the top and with the first control focused. A failed
+    /// save keeps the dialog open, so a closed one has no changes to drop.
+    fn reopen(self: *Self, config: *const CoreConfig, page: ?settings_map.Page) void {
+        const priv = self.private();
+        std.debug.assert(!priv.state.shown);
+        std.debug.assert(priv.state.changes.isEmpty() and !priv.state.apply_pending);
+        priv.state.themes_stale = true;
+        priv.state.shells_loaded = false;
+        self.dismissToast();
+        if (page orelse last_page) |name|
+            self.showSettingsPage(name)
+        else
+            _ = self.as(adw.PreferencesDialog).popSubpage();
+        self.syncValues(config, .{ .font_family = true });
+        for ([_]*adw.PreferencesPage{
+            priv.language_page,
+            priv.appearance_page,
+            priv.font_page,
+            priv.interaction_page,
+            priv.shell_page,
+            priv.about_page,
+        }) |preferences| preferences.scrollToTop();
+        self.as(adw.Dialog).setFocus(null);
     }
 
     /// Handles opening the configuration in the system editor (the
@@ -503,24 +683,31 @@ pub const GxSettingsDialog = extern struct {
     fn load(self: *Self, app: *Application) void {
         const priv = self.private();
         const st = &priv.state;
+        var steps: open_perf.Steps = .begin();
         const config_obj = app.getConfig();
         defer config_obj.unref();
         const config = config_obj.get();
 
         st.lang = gx.i18n.resolve(config.language);
+        st.built = .of(config);
         st.notifications = config.@"app-notifications";
         st.layered = gx.config_layers.enabled(st.alloc);
         if (st.layered) self.reloadLayers();
+        steps.step("settings.load.layers");
         st.loading = true;
         defer st.loading = false;
 
         self.setUpThemes();
+        steps.step("settings.load.themes");
         self.setUpFontChooser();
+        steps.step("settings.load.fonts");
         self.addRowSwatches();
         self.syncValues(config, .{ .font_family = true });
+        steps.step("settings.load.values");
         self.loadAbout();
         if (!st.layered) self.disableEditing();
         self.applyTexts();
+        steps.step("settings.load.texts");
 
         st.config_handler = gobject.Object.signals.notify.connect(
             app,
@@ -534,6 +721,7 @@ pub const GxSettingsDialog = extern struct {
     /// Reads the configuration layers again, so builds see the files as
     /// they are now.
     fn reloadLayers(self: *Self) void {
+        if (self.testBackend() != null) return;
         const st = &self.private().state;
         if (st.layers) |*layers| layers.deinit();
         _ = @import("defaults.zig").sampleSystemCursorBlink();
@@ -587,10 +775,11 @@ pub const GxSettingsDialog = extern struct {
 
     /// What saving the recorded `changes` refreshes. A failed Apply keeps
     /// its `theme` change recorded and the theme previewed until a later
-    /// save writes it (Retry, or any other change): when that `theme` is
-    /// the previewed value it is no longer a preview (R3-Settings.04);
-    /// while another theme stays previewed, the saved theme is read from
-    /// the saved layers instead of the applied configuration.
+    /// save writes it (Retry, or any other change), or reverting drops it
+    /// (`revertChanges`): when that `theme` is the previewed value it is no
+    /// longer a preview (R3-Settings.04); while another theme stays
+    /// previewed, the saved theme is read from the saved layers instead of
+    /// the applied configuration (`appliedSync`).
     const SaveEffects = struct {
         sync: Sync,
         end_preview: bool = false,
@@ -619,6 +808,64 @@ pub const GxSettingsDialog = extern struct {
             }
         }
         return effects;
+    }
+
+    /// How applying the saved settings refreshes the theme rows. While a
+    /// theme stays previewed the applied configuration has the preview, so
+    /// a saved theme is read from the saved layers (`saved_theme`) rather
+    /// than shown from it: after a save whose applying failed, Retry while
+    /// another theme is previewed would otherwise show that theme as
+    /// saved. Without a preview the applied configuration has the saved
+    /// theme.
+    fn appliedSync(sync: Sync, previewing: bool) Sync {
+        var applied = sync;
+        if (previewing) {
+            applied.saved_theme = sync.theme or sync.saved_theme;
+            applied.theme = false;
+        } else {
+            applied.theme = true;
+            applied.saved_theme = false;
+        }
+        return applied;
+    }
+
+    /// Drops the `theme` change a failed Apply left recorded, for Revert
+    /// and going back from the theme list (D-15): the dialog shows the
+    /// saved theme again, so no later save (Retry, another change or
+    /// closing) may write the reverted one. The other recorded changes
+    /// stay for their retry. Returns whether a change was dropped.
+    fn dropThemeChange(changes: *settings_map.Changes) bool {
+        for (changes.entries.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.key, "theme")) continue;
+            _ = changes.entries.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    /// What reverting the theme list does with what failed saves left
+    /// (D-15). Revert, going back and selecting the saved theme again all
+    /// revert.
+    const Revert = struct {
+        /// The unsaved `theme` change was dropped, so no later save
+        /// writes it.
+        dropped: bool,
+        /// Nothing is left to save: the retry toast goes and the dialog
+        /// can close again, even while the settings folder stays read-only.
+        settled: bool,
+        /// A save wrote the theme already and only applying it failed:
+        /// the saved configuration is applied again and shown as saved,
+        /// rather than as an undone change.
+        reapply: bool,
+    };
+
+    fn revertChanges(changes: *settings_map.Changes, apply_pending: bool) Revert {
+        const dropped = dropThemeChange(changes);
+        return .{
+            .dropped = dropped,
+            .settled = dropped and changes.isEmpty() and !apply_pending,
+            .reapply = apply_pending,
+        };
     }
 
     /// Shows the values of `config`, without recording them as changes.
@@ -675,7 +922,9 @@ pub const GxSettingsDialog = extern struct {
         priv.font_size_reset_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets("font-size")));
 
         if (sync.font_family) {
-            const arena = st.arena.allocator();
+            st.font_families = &.{};
+            _ = st.font_arena.reset(.retain_capacity);
+            const arena = st.font_arena.allocator();
             const families = config.@"font-family".list.items;
             var copies: std.ArrayList([]const u8) = .empty;
             for (families) |family| copies.append(arena, arena.dupe(u8, family) catch break) catch break;
@@ -688,11 +937,18 @@ pub const GxSettingsDialog = extern struct {
             priv.font_choose_button.setFontDesc(@ptrCast(description));
         }
         priv.font_clear_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets("font-family")));
-        if (st.shells_loaded and st.shell < st.shells.len and st.shells[st.shell].command == null) {
-            st.default_command = if (config.command) |command| command.string(st.arena.allocator()) catch "" else "";
+        if (st.shell < st.shells.len and st.shells[st.shell].command == null) {
+            self.syncDefaultCommand(config);
         }
 
         self.updateNotes(config);
+    }
+
+    fn syncDefaultCommand(self: *Self, config: *const CoreConfig) void {
+        const st = &self.private().state;
+        st.default_command = "";
+        _ = st.command_arena.reset(.retain_capacity);
+        if (config.command) |command| st.default_command = command.string(st.command_arena.allocator()) catch "";
     }
 
     fn setSwitch(row: *adw.SwitchRow, on: bool) void {
@@ -734,8 +990,10 @@ pub const GxSettingsDialog = extern struct {
     /// stays previewed (the applied configuration has the preview).
     fn refreshSavedTheme(self: *Self) void {
         const st = &self.private().state;
-        const layers = &(st.layers orelse return);
-        var saved = layers.build(st.alloc, &.{}) catch |err| {
+        var saved = (if (st.layers) |*layers|
+            layers.build(st.alloc, &.{})
+        else
+            gx.config_layers.loadWithOverrides(st.alloc, &.{})) catch |err| {
             log.warn("cannot read the saved theme err={}", .{err});
             return;
         };
@@ -831,6 +1089,23 @@ pub const GxSettingsDialog = extern struct {
         _ = gtk.EventControllerKey.signals.key_pressed.connect(keys, *Self, themeSearchKeyPressed, self, .{});
         priv.theme_search.as(gtk.Widget).addController(keys.as(gtk.EventController));
         priv.theme_search.setKeyCaptureWidget(priv.theme_list.as(gtk.Widget));
+    }
+
+    /// Refresh only when the list is requested after reopening. Drop model
+    /// indices before replacing names so callbacks cannot index the old list.
+    fn refreshDiscoveredThemes(self: *Self) void {
+        const st = &self.private().state;
+        if (!st.themes_stale) return;
+        const list = settings_map.listThemes(st.alloc, global.io(), st.theme_dirs) catch return;
+        st.selecting = true;
+        defer st.selecting = false;
+        st.visible.clearRetainingCapacity();
+        if (st.theme_model) |model| model.splice(0, model.as(gio.ListModel).getNItems(), @ptrCast(&[_:null]?[*:0]const u8{}));
+        if (st.themes) |*old| old.deinit();
+        st.themes = list;
+        st.swatches.deinit(st.alloc);
+        st.swatches = .{};
+        st.themes_stale = false;
     }
 
     /// The combo rows whose models carry translated labels, built again
@@ -952,9 +1227,35 @@ pub const GxSettingsDialog = extern struct {
         self.updateShellSubtitle();
     }
 
-    /// Detects the shells and fills in the shell row, once: detecting
-    /// searches `PATH`, so it waits until the shell page is shown.
+    /// PATH discovery is deferred until after presentation, once per opening.
     fn loadShells(self: *Self) void {
+        const st = &self.private().state;
+        if (st.shells_loaded or st.shell_source != null or st.disposed or self.as(gtk.Widget).getMapped() == 0) return;
+        st.shell_source = glib.idleAddFull(glib.PRIORITY_DEFAULT_IDLE, shellIdle, self.ref(), unrefData);
+    }
+
+    fn shellMapped(_: *gtk.Widget, self: *Self) callconv(.c) void {
+        const name = self.as(adw.PreferencesDialog).getVisiblePageName() orelse return;
+        if (std.mem.eql(u8, std.mem.span(name), "shell")) self.loadShells();
+    }
+
+    fn shellIdle(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const st = &self.private().state;
+        st.shell_source = null;
+        if (!st.disposed and st.shown and self.as(gtk.Widget).getMapped() != 0) self.scanShells();
+        return 0;
+    }
+
+    fn cancelShellScan(self: *Self) void {
+        const st = &self.private().state;
+        if (st.shell_source) |source| {
+            st.shell_source = null;
+            _ = glib.Source.remove(source);
+        }
+    }
+
+    fn scanShells(self: *Self) void {
         const priv = self.private();
         const st = &priv.state;
         if (st.shells_loaded or st.disposed) return;
@@ -963,15 +1264,18 @@ pub const GxSettingsDialog = extern struct {
         st.loading = true;
         defer st.loading = loading;
 
-        const app = Application.default();
-        const config_obj = app.getConfig();
-        defer config_obj.unref();
-        const config = config_obj.get();
-        const arena = st.arena.allocator();
+        const fixture = self.testBackend();
+        const config_obj = if (fixture == null) Application.default().getConfig() else null;
+        defer if (config_obj) |object| object.unref();
+        const config = if (fixture) |backend| backend.config else config_obj.?.get();
+        // GTK owns copies of its model strings. Clear our borrowed choices
+        // before resetting their storage; change handlers are loading-guarded.
+        st.shells = &.{};
+        st.herdr = null;
+        _ = st.shell_arena.reset(.retain_capacity);
+        const arena = st.shell_arena.allocator();
 
-        if (config.command) |command| {
-            st.default_command = command.string(arena) catch "";
-        }
+        self.syncDefaultCommand(config);
         const overlay_command = self.overlayValue(arena, "command");
 
         var shells: std.ArrayList(Shell) = .empty;
@@ -983,12 +1287,14 @@ pub const GxSettingsDialog = extern struct {
         for (launch.keys(), launch.values()) |name, command| {
             custom.append(arena, .{ .name = name, .command = command }) catch break;
         }
-        var env = global.environMap() catch |err| env: {
+        var env = std.process.Environ.Map.init(st.alloc);
+        defer env.deinit();
+        const supplied = if (fixture) |backend| backend.shell_env else null;
+        if (supplied == null) env = global.environMap() catch |err| env: {
             log.warn("cannot read the environment to detect shells err={}", .{err});
             break :env std.process.Environ.Map.init(st.alloc);
         };
-        defer env.deinit();
-        if (gx.profiles.detectSystem(st.alloc, global.io(), &env, custom.items)) |list_| {
+        if (gx.profiles.detectSystem(st.alloc, global.io(), supplied orelse &env, custom.items)) |list_| {
             var list = list_;
             defer list.deinit();
             for (list.profiles) |profile| {
@@ -1419,6 +1725,17 @@ pub const GxSettingsDialog = extern struct {
     /// Saves the recorded changes to the overlay and applies the
     /// configuration. On failure the changes are kept for another try.
     /// Returns whether the changes are saved.
+    fn testBackend(self: *Self) ?*TestBackend {
+        if (comptime @import("builtin").is_test) return self.private().state.test_backend;
+        return null;
+    }
+
+    fn savePath(self: *Self) ![]const u8 {
+        const alloc = self.private().state.alloc;
+        if (self.testBackend()) |backend| return alloc.dupe(u8, backend.path);
+        return gx.config_layers.overlayPath(alloc);
+    }
+
     fn saveNow(self: *Self) bool {
         const st = &self.private().state;
         if (st.save_source) |source| {
@@ -1428,14 +1745,16 @@ pub const GxSettingsDialog = extern struct {
         if (st.changes.isEmpty() and !st.apply_pending) return true;
 
         if (!st.changes.isEmpty()) {
+            const preview = self.previewArg();
+            defer if (preview) |value| st.alloc.free(value);
             const effects = saveEffects(
                 st.changes.entries.items,
                 st.previewing,
-                self.previewArg(),
+                preview,
                 if (st.apply_pending) st.pending_sync else null,
             );
 
-            const path = gx.config_layers.overlayPath(st.alloc) catch |err| {
+            const path = self.savePath() catch |err| {
                 log.warn("cannot locate {s} err={}", .{ gx.gui_settings.file_name, err });
                 self.toastError(msg.save_failed, err, true);
                 return false;
@@ -1451,14 +1770,38 @@ pub const GxSettingsDialog = extern struct {
             st.pending_sync = effects.sync;
             self.reloadLayers();
         }
+        return self.applyPending();
+    }
 
-        var config = self.apply(self.previewArg()) orelse return false;
+    /// Applies what the last save wrote (`apply_pending`) and shows it: the
+    /// saved theme, the configured font family. With nothing else left to
+    /// save the dialog can close again and says the settings are saved.
+    /// Returns whether applying succeeded.
+    fn applyPending(self: *Self) bool {
+        const st = &self.private().state;
+        const preview = self.previewArg();
+        defer if (preview) |value| st.alloc.free(value);
+        var config = self.apply(preview) orelse return false;
         defer config.deinit();
-        self.syncValues(&config, st.pending_sync);
+        self.syncValues(&config, appliedSync(st.pending_sync, st.previewing));
         st.apply_pending = false;
-        self.as(adw.Dialog).setCanClose(1);
-        if (!st.disposed) self.showToast(self.tr(text.saved), false);
+        if (st.changes.isEmpty()) {
+            self.as(adw.Dialog).setCanClose(1);
+            if (!st.disposed) self.showToast(self.tr(text.saved), false);
+        }
         return true;
+    }
+
+    /// Nothing is left to save: the retry toast goes and the dialog can
+    /// close again, even while the settings folder stays read-only.
+    fn settleSaves(self: *Self) void {
+        const st = &self.private().state;
+        if (st.save_source) |source| {
+            st.save_source = null;
+            _ = glib.Source.remove(source);
+        }
+        self.dismissToast();
+        self.as(adw.Dialog).setCanClose(1);
     }
 
     /// Builds the configuration with in-memory overrides, the previewed
@@ -1468,6 +1811,18 @@ pub const GxSettingsDialog = extern struct {
     fn apply(self: *Self, theme: ?[]const u8) ?CoreConfig {
         const st = &self.private().state;
         const failed: [:0]const u8 = if (theme != null) msg.preview_failed else msg.reload_failed;
+        if (self.testBackend()) |backend| {
+            if (backend.fail_apply) {
+                self.toastError(failed, error.OutOfMemory, st.apply_pending);
+                return null;
+            }
+            var config = backend.config.clone(st.alloc) catch return null;
+            config.loadFile(config._arena.?.allocator(), backend.path) catch {
+                config.deinit();
+                return null;
+            };
+            return config;
+        }
 
         var quiet_buf: [128]u8 = undefined;
         const quiet = settings_map.quietReloadArg(&quiet_buf, st.notifications) catch |err| {
@@ -1503,7 +1858,12 @@ pub const GxSettingsDialog = extern struct {
             defer previous.unref();
             break :changed themeReloadChanged(previous.get(), &config);
         } else false;
-        app.core().updateConfig(app.rt(), &config) catch |err| {
+        const updated = updated: {
+            st.applying = true;
+            defer st.applying = false;
+            break :updated app.core().updateConfig(app.rt(), &config);
+        };
+        updated catch |err| {
             log.warn("cannot apply the configuration err={}", .{err});
             self.toastError(failed, err, st.apply_pending);
             config.deinit();
@@ -1524,7 +1884,7 @@ pub const GxSettingsDialog = extern struct {
     /// Reads the value of `key` in the overlay file.
     fn overlayValue(self: *Self, alloc: Allocator, key: []const u8) ?[]const u8 {
         const st = &self.private().state;
-        const path = gx.config_layers.overlayPath(st.alloc) catch return null;
+        const path = self.savePath() catch return null;
         defer st.alloc.free(path);
         var overlay = gx.gui_settings.Overlay.load(st.alloc, global.io(), path) catch |err| {
             log.warn("cannot read {s} err={}", .{ path, err });
@@ -1540,10 +1900,15 @@ pub const GxSettingsDialog = extern struct {
         self.unref();
     }
 
-    /// Follows the zoom switch and UI language without overwriting pending edits.
+    /// Follows the zoom switch and UI language without overwriting pending
+    /// edits. A change the dialog did not make puts it out of date, so the
+    /// next opening builds a new one; a closed dialog leaves the rest to its
+    /// next opening.
     fn appConfigChanged(app: *Application, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
         const st = &self.private().state;
         if (st.disposed) return;
+        if (!st.applying) st.stale = true;
+        if (!st.shown) return;
         const config = app.getConfig();
         defer config.unref();
         if (st.changes.isEmpty() and !st.apply_pending) {
@@ -1717,16 +2082,13 @@ pub const GxSettingsDialog = extern struct {
         return 0;
     }
 
-    /// Applies the selected theme without saving it, or the saved
-    /// configuration when the saved theme is selected.
+    /// Applies the selected theme without saving it. Selecting the saved
+    /// theme again reverts (`revertTheme`): the saved configuration applies
+    /// and a theme whose saving failed is dropped.
     fn previewSelected(self: *Self) void {
         const st = &self.private().state;
         const index = self.selectedTheme() orelse return;
-        if (self.isSavedTheme(index)) {
-            if (st.previewing) self.endPreview();
-            self.updateThemeButtons();
-            return;
-        }
+        if (self.isSavedTheme(index)) return self.revertTheme();
         const value = themeValue(st.alloc, st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return;
         defer st.alloc.free(value);
         if (self.apply(value)) |config_| {
@@ -1737,12 +2099,12 @@ pub const GxSettingsDialog = extern struct {
         self.updateThemeButtons();
     }
 
-    /// The `theme` value the applied configuration previews, if any.
-    fn previewArg(self: *Self) ?[]const u8 {
+    /// The previewed `theme` value, owned by the caller (state allocator).
+    fn previewArg(self: *Self) ?[:0]const u8 {
         const st = &self.private().state;
         if (!st.previewing) return null;
         const index = self.selectedTheme() orelse return null;
-        const value = themeValue(st.arena.allocator(), st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return null;
+        const value = themeValue(st.alloc, st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return null;
         return value;
     }
 
@@ -1755,11 +2117,26 @@ pub const GxSettingsDialog = extern struct {
         self.applySaved();
     }
 
-    /// Ends the preview and selects the saved theme again.
+    /// Ends the preview and selects the saved theme again (D-15). The theme
+    /// a failed Apply left to save is dropped, and with nothing else to
+    /// save its retry toast goes and the dialog can close again. When a
+    /// save wrote the theme and only applying it failed, the saved
+    /// configuration is applied again instead, so the dialog shows what the
+    /// file has rather than an undone change.
     fn revertTheme(self: *Self) void {
         const priv = self.private();
         const st = &priv.state;
-        self.endPreview();
+        const revert = revertChanges(&st.changes, st.apply_pending);
+        // Dismiss the old save failure before restoring the configuration:
+        // a new apply failure must remain visible.
+        if (revert.settled) self.settleSaves();
+        if (revert.reapply) {
+            self.cancelPreview();
+            st.previewing = false;
+            _ = self.applyPending();
+        } else {
+            self.endPreview();
+        }
         if (st.theme_selection) |selection| {
             const saved = self.savedThemeIndex(st.target);
             const pos = if (saved) |index| std.mem.indexOfScalar(u32, st.visible.items, index) else null;
@@ -1933,9 +2310,11 @@ pub const GxSettingsDialog = extern struct {
         defer keep.unref();
         const st = &self.private().state;
         if (st.disposed) return;
+        st.shown = false;
+        self.cancelShellScan();
 
-        // The next opening builds a new dialog, even while this one is
-        // kept alive by a timer or a running herdr.
+        // The window keeps the dialog (`kept_dialogs`) for its next
+        // opening; a timer or a running herdr may keep it alive meanwhile.
         if (open_dialog.get()) |dialog| {
             defer dialog.unref();
             if (dialog == self) open_dialog.set(null);
@@ -1976,6 +2355,7 @@ pub const GxSettingsDialog = extern struct {
     fn themeSubpageShown(_: *adw.NavigationPage, self: *Self) callconv(.c) void {
         const priv = self.private();
         if (priv.state.disposed) return;
+        self.refreshDiscoveredThemes();
         self.refilter(.open);
         _ = priv.theme_search.as(gtk.Widget).grabFocus();
     }
@@ -2305,18 +2685,24 @@ pub const GxSettingsDialog = extern struct {
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         // Before the template, whose signal handlers read the state.
-        const alloc = Application.default().allocator();
+        const alloc = if (@import("builtin").is_test) std.testing.allocator else Application.default().allocator();
         self.private().state = .{
             .alloc = alloc,
             .arena = .init(alloc),
+            .font_arena = .init(alloc),
+            .command_arena = .init(alloc),
+            .shell_arena = .init(alloc),
             .changes = .init(alloc),
         };
         gtk.Widget.initTemplate(self.as(gtk.Widget));
+        _ = gtk.Widget.signals.map.connect(self.as(gtk.Widget), *Self, shellMapped, self, .{ .after = true });
     }
 
     fn dispose(self: *Self) callconv(.c) void {
         const st = &self.private().state;
         st.disposed = true;
+        self.cancelShellScan();
+        st.owner.deinit();
         self.cancelPreview();
         if (st.save_source) |source| {
             st.save_source = null;
@@ -2355,6 +2741,9 @@ pub const GxSettingsDialog = extern struct {
         st.visible.deinit(st.alloc);
         st.bound.deinit(st.alloc);
         st.arena.deinit();
+        st.font_arena.deinit();
+        st.command_arena.deinit();
+        st.shell_arena.deinit();
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -2746,6 +3135,134 @@ test "failed settings saves preserve font edits and resets for retry" {
     try testing.expectEqualStrings("font-family = New Mono\nfont-family = CJK Fallback\n", saved.written());
 }
 
+test "reverting after a failed theme save keeps the reverted theme out of later saves" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "blocked", .data = "not a directory" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const blocked = try std.fs.path.join(alloc, &.{ root, "blocked", gx.gui_settings.file_name });
+    defer alloc.free(blocked);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = gx.gui_settings.file_name, .data = "theme = Saved\n" });
+
+    // Apply fails while a font size waits for the same save (D-15).
+    var changes = settings_map.Changes.init(alloc);
+    defer changes.deinit();
+    try changes.set("font-size", "14");
+    try changes.set("theme", "Chalkboard");
+    try testing.expectError(error.NotDir, changes.commit(alloc, io, blocked));
+
+    // Revert, then the next save: Retry, another change or closing.
+    const dropped = GxSettingsDialog.dropThemeChange(&changes);
+    try changes.commit(alloc, io, path);
+    var overlay = try gx.gui_settings.Overlay.load(alloc, io, path);
+    defer overlay.deinit();
+    try testing.expectEqualStrings("Saved", overlay.get("theme") orelse "");
+    try testing.expectEqualStrings("14", overlay.get("font-size") orelse "");
+    try testing.expect(dropped);
+
+    // Only the theme is dropped; without a recorded theme nothing is.
+    try changes.set("cursor-style", "bar");
+    try testing.expect(!GxSettingsDialog.dropThemeChange(&changes));
+    try testing.expectEqual(@as(usize, 1), changes.entries.items.len);
+}
+
+test "reverting settles a failed theme save, or applies a theme that was saved but not applied" {
+    const alloc = testing.allocator;
+    const Dialog = GxSettingsDialog;
+
+    // Only the theme failed to save: Revert, going back or selecting the
+    // saved theme again drop it, nothing is left to save or retry, and the
+    // dialog can close while the folder stays read-only.
+    var only = settings_map.Changes.init(alloc);
+    defer only.deinit();
+    try only.set("theme", "Chalkboard");
+    const settled = Dialog.revertChanges(&only, false);
+    try testing.expect(settled.dropped and settled.settled and !settled.reapply);
+    try testing.expect(only.isEmpty());
+
+    // Another change still waits for its retry: it stays, and so does the
+    // retry toast.
+    var mixed = settings_map.Changes.init(alloc);
+    defer mixed.deinit();
+    try mixed.set("font-size", "14");
+    try mixed.set("theme", "Chalkboard");
+    const waiting = Dialog.revertChanges(&mixed, false);
+    try testing.expect(waiting.dropped and !waiting.settled and !waiting.reapply);
+    try testing.expectEqual(@as(usize, 1), mixed.entries.items.len);
+    try testing.expectEqualStrings("font-size", mixed.entries.items[0].key);
+
+    // The save wrote the theme and only applying it failed: nothing is
+    // dropped, the saved configuration is applied again and shown as saved
+    // rather than as undone; a theme that failed to save after that is
+    // dropped as well.
+    var written = settings_map.Changes.init(alloc);
+    defer written.deinit();
+    const reapplied = Dialog.revertChanges(&written, true);
+    try testing.expect(!reapplied.dropped and !reapplied.settled and reapplied.reapply);
+    try written.set("theme", "Dracula");
+    const both = Dialog.revertChanges(&written, true);
+    try testing.expect(both.dropped and !both.settled and both.reapply);
+    try testing.expect(written.isEmpty());
+
+    // Reverting a plain preview has nothing to settle.
+    const plain = Dialog.revertChanges(&written, false);
+    try testing.expect(!plain.dropped and !plain.settled and !plain.reapply);
+}
+
+test "applying saved settings while another theme stays previewed reads the saved theme from the layers" {
+    const Dialog = GxSettingsDialog;
+
+    // A save wrote the theme, applying it failed, another theme is previewed
+    // and Retry applies: the applied configuration has the preview, so the
+    // saved theme comes from the layers.
+    const retried = Dialog.appliedSync(.{ .theme = true }, true);
+    try testing.expect(!retried.theme and retried.saved_theme);
+    const kept = Dialog.appliedSync(.{ .theme = false, .saved_theme = true, .font_family = true }, true);
+    try testing.expect(!kept.theme and kept.saved_theme and kept.font_family);
+
+    // Other settings saved during a preview leave the theme rows.
+    const font = Dialog.appliedSync(.{ .theme = false, .font_family = true }, true);
+    try testing.expect(!font.theme and !font.saved_theme and font.font_family);
+
+    // Without a preview the applied configuration has the saved theme.
+    const plain = Dialog.appliedSync(.{ .theme = false, .saved_theme = true }, false);
+    try testing.expect(plain.theme and !plain.saved_theme);
+}
+
+test "a kept dialog opens again only while its language and theme stay and no reload came" {
+    const alloc = testing.allocator;
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    config.language = "en";
+    config.theme = .{ .light = "Light", .dark = "Dark" };
+    const built: Built = .of(&config);
+    try testing.expect(GxSettingsDialog.upToDate(built, false, &config));
+    // A reload, or another settings UI, came while it was closed.
+    try testing.expect(!GxSettingsDialog.upToDate(built, true, &config));
+
+    var other = try config.clone(alloc);
+    defer other.deinit();
+    other.theme = .{ .light = "Dark", .dark = "Light" };
+    try testing.expect(!GxSettingsDialog.upToDate(built, false, &other));
+    other.theme = null;
+    try testing.expect(!GxSettingsDialog.upToDate(built, false, &other));
+    other.theme = config.theme;
+    try testing.expect(GxSettingsDialog.upToDate(built, false, &other));
+    other.language = "zh-CN";
+    try testing.expect(!GxSettingsDialog.upToDate(built, false, &other));
+
+    // Other settings it shows are synced at the next opening instead.
+    other.language = config.language;
+    other.@"font-size" = 18;
+    try testing.expect(GxSettingsDialog.upToDate(built, false, &other));
+    try testing.expect(themeStamp(.{ .light = "ab", .dark = "c" }) != themeStamp(.{ .light = "a", .dark = "bc" }));
+}
+
 test "the dialog strings are translated" {
     var missing: usize = 0;
     inline for (@typeInfo(text).@"struct".decls) |decl| {
@@ -2756,4 +3273,295 @@ test "the dialog strings are translated" {
         }
     }
     try testing.expectEqual(@as(usize, 0), missing);
+}
+
+// Use the real settings template and callbacks, without starting terminals or
+// reading the user's configuration. Tests supply the configuration and models.
+fn testDialog() !*GxSettingsDialog {
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    adw.init();
+    gobject.ext.ensureType(Application);
+    const dialog = gobject.ext.newInstance(GxSettingsDialog, .{});
+    _ = dialog.as(gobject.Object).refSink();
+    dialog.setUpFontChooser();
+    _ = dialog.as(gtk.Widget).addTickCallback(struct {
+        fn tick(widget: *gtk.Widget, _: *gdk.FrameClock, _: ?*anyopaque) callconv(.c) c_int {
+            const object = widget.as(gobject.Object);
+            object.setData("gx-settings-test-frames", @ptrFromInt(@intFromPtr(object.getData("gx-settings-test-frames")) + 1));
+            return 1;
+        }
+    }.tick, null, null);
+    return dialog;
+}
+
+test "settings reopen 100 times keeps synchronized allocations bounded" {
+    const dialog = try testDialog();
+    defer dialog.unref();
+    const st = &dialog.private().state;
+    var config = try CoreConfig.default(testing.allocator);
+    defer config.deinit();
+    var families: ArenaAllocator = .init(testing.allocator);
+    defer families.deinit();
+    try config.@"font-family".parseCLI(families.allocator(), "Monospace");
+    config.command = .{ .shell = "bash --noprofile --norc" };
+    config.theme = .{ .light = "Saved", .dark = "Saved" };
+    st.shells_loaded = true;
+    st.shells = &.{.{ .command = null, .label = .system_default }};
+    st.themes = .{ .arena = .init(testing.allocator), .names = &.{"Preview"} };
+    const model = gtk.StringList.new(null);
+    model.append("Preview");
+    st.theme_model = model;
+    st.theme_selection = gtk.SingleSelection.new(model.as(gio.ListModel));
+    try st.visible.append(st.alloc, 0);
+    const window = adw.Window.new();
+    defer window.as(gtk.Window).destroy();
+    window.as(gtk.Window).setDefaultSize(1100, 740);
+    window.as(gtk.Window).present();
+    var baseline: usize = 0;
+    for (0..102) |i| {
+        dialog.reopen(&config, .appearance);
+        st.shown = true;
+        dialog.as(gobject.Object).setData("gx-settings-test-frames", null);
+        dialog.as(adw.Dialog).present(window.as(gtk.Widget));
+        try testing.expect(testWaitDialog(dialog, true));
+        st.previewing = true;
+        const preview = dialog.previewArg() orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("Preview", preview);
+        st.alloc.free(preview);
+        st.previewing = false;
+        try testing.expect(dialog.as(adw.Dialog).close() != 0);
+        try testing.expect(testWaitDialog(dialog, false));
+        try testing.expect(!st.shown);
+        if (i == 1) baseline = st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity() + st.shell_arena.queryCapacity();
+        if (i > 1) try testing.expectEqual(baseline, st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity() + st.shell_arena.queryCapacity());
+        try testing.expectEqualStrings("Monospace", st.font_families[0]);
+        try testing.expectEqualStrings("bash --noprofile --norc", st.default_command);
+    }
+}
+
+fn testWaitDialog(dialog: *GxSettingsDialog, mapped: bool) bool {
+    const tick = glib.timeoutAdd(5, struct {
+        fn wake(_: ?*anyopaque) callconv(.c) c_int {
+            return 1;
+        }
+    }.wake, null);
+    defer _ = glib.Source.remove(tick);
+    const deadline = glib.getMonotonicTime() + 2_000_000;
+    while (glib.getMonotonicTime() < deadline) {
+        const widget = dialog.as(gtk.Widget);
+        if (if (mapped) widget.getMapped() != 0 and @intFromPtr(dialog.as(gobject.Object).getData("gx-settings-test-frames")) >= 3 else widget.getParent() == null) return true;
+        _ = glib.MainContext.iteration(null, 1);
+    }
+    return false;
+}
+
+const TestBackend = struct {
+    path: []const u8,
+    config: *const CoreConfig,
+    fail_apply: bool = false,
+    shell_env: ?*const std.process.Environ.Map = null,
+};
+
+fn testPresentSettings(dialog: *GxSettingsDialog, window: *gtk.Window) !void {
+    window.setDefaultSize(1100, 740);
+    window.present();
+    dialog.private().state.owner.set(window);
+    dialog.private().state.shown = true;
+    dialog.as(gobject.Object).setData("gx-settings-test-frames", null);
+    open_dialog.set(dialog);
+    dialog.as(adw.Dialog).present(window.as(gtk.Widget));
+    try testing.expect(testWaitDialog(dialog, true));
+}
+
+test "cross window settings closes and saves before allowing another dialog" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config };
+    const first = try testDialog();
+    defer first.unref();
+    first.private().state.test_backend = &backend;
+    first.reopen(&config, .appearance);
+    first.private().state.loading = false;
+    const a = adw.Window.new();
+    defer a.as(gtk.Window).destroy();
+    const b = adw.Window.new();
+    defer b.as(gtk.Window).destroy();
+    try testPresentSettings(first, a.as(gtk.Window));
+    first.private().cursor_blink_row.setActive(0);
+    try testing.expect(!first.private().state.changes.isEmpty());
+    const existing = GxSettingsDialog.existingFor(b.as(gtk.Window));
+    defer if (existing) |value| value.unref();
+    try testing.expect(existing == null);
+    try testing.expect(!first.private().state.shown);
+    try testing.expect(first.private().state.changes.isEmpty());
+    var overlay = try gx.gui_settings.Overlay.load(alloc, testing.io, path);
+    defer overlay.deinit();
+    try testing.expectEqualStrings("false", overlay.get("cursor-style-blink").?);
+    try testing.expect(testWaitDialog(first, false));
+    const second = try testDialog();
+    defer second.unref();
+    try testPresentSettings(second, b.as(gtk.Window));
+    try testing.expect(second.private().state.shown and !first.private().state.shown);
+    _ = second.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(second, false));
+}
+
+test "cross window settings preserves the failed edit and retry instead of reopening" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "blocked", .data = "not a directory" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "blocked", gx.gui_settings.file_name });
+    defer alloc.free(path);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config };
+    const first = try testDialog();
+    defer first.unref();
+    const st = &first.private().state;
+    st.test_backend = &backend;
+    first.reopen(&config, .appearance);
+    st.loading = false;
+    const a = adw.Window.new();
+    defer a.as(gtk.Window).destroy();
+    const b = adw.Window.new();
+    defer b.as(gtk.Window).destroy();
+    try testPresentSettings(first, a.as(gtk.Window));
+    first.private().cursor_blink_row.setActive(0);
+    try testing.expect(!first.saveNow());
+    defer {
+        st.changes.deinit();
+        st.changes = .init(alloc);
+        first.as(adw.Dialog).forceClose();
+    }
+    const existing = GxSettingsDialog.existingFor(b.as(gtk.Window));
+    defer if (existing) |value| value.unref();
+    try testing.expectEqual(first, existing orelse return error.TestUnexpectedResult);
+    try testing.expect(st.shown);
+    try testing.expect(st.toast != null);
+    const toast = st.toast;
+    const again = GxSettingsDialog.existingFor(a.as(gtk.Window));
+    defer if (again) |value| value.unref();
+    try testing.expectEqual(first, again.?);
+    try testing.expectEqual(toast, st.toast);
+    try testing.expectEqual(@as(c_int, 0), first.private().cursor_blink_row.getActive());
+    try testing.expectEqualStrings("false", st.changes.entries.items[0].values[0]);
+    try testing.expectEqual(@as(c_int, 0), first.as(adw.Dialog).getCanClose());
+    kept_dialogs.keep(a.as(gtk.Window), first);
+    st.stale = true;
+    open_dialog.set(null);
+    const recovered = GxSettingsDialog.existingFor(a.as(gtk.Window)).?;
+    defer recovered.unref();
+    try testing.expectEqual(first, recovered);
+    try testing.expectEqual(toast, st.toast);
+}
+
+test "revert keeps a new failure toast when restoring the saved configuration fails" {
+    const dialog = try testDialog();
+    defer dialog.unref();
+    var config = try CoreConfig.default(testing.allocator);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = "", .config = &config, .fail_apply = true };
+    const st = &dialog.private().state;
+    st.test_backend = &backend;
+    try st.changes.set("theme", "Preview");
+    st.previewing = true;
+    dialog.showToast("old retry", true);
+    dialog.revertTheme();
+    try testing.expect(st.changes.isEmpty());
+    try testing.expect(st.toast != null);
+    try testing.expect(!std.mem.eql(u8, std.mem.span(st.toast.?.getTitle().?), "old retry"));
+}
+
+test "reopen discovers theme files added while closed" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const dialog = try testDialog();
+    defer dialog.unref();
+    const st = &dialog.private().state;
+    st.theme_dirs = &.{root};
+    st.themes = try settings_map.listThemes(alloc, testing.io, st.theme_dirs);
+    const model = gtk.StringList.new(null);
+    st.theme_model = model;
+    st.theme_selection = gtk.SingleSelection.new(model.as(gio.ListModel));
+    dialog.private().theme_list.setModel(st.theme_selection.?.as(gtk.SelectionModel));
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    dialog.reopen(&config, .appearance);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "AddedTheme", .data = "background = 123456\n" });
+    dialog.reopen(&config, .appearance);
+    GxSettingsDialog.themeSubpageShown(dialog.private().theme_subpage, dialog);
+    try testing.expect(st.themes.?.indexOf("AddedTheme") != null);
+}
+
+fn testWaitShells(dialog: *GxSettingsDialog) bool {
+    const tick = glib.timeoutAdd(5, struct {
+        fn wake(_: ?*anyopaque) callconv(.c) c_int {
+            return 1;
+        }
+    }.wake, null);
+    defer _ = glib.Source.remove(tick);
+    const deadline = glib.getMonotonicTime() + 2_000_000;
+    while (!dialog.private().state.shells_loaded and glib.getMonotonicTime() < deadline) {
+        _ = glib.MainContext.iteration(null, 1);
+    }
+    return dialog.private().state.shells_loaded;
+}
+
+fn testHasShell(dialog: *GxSettingsDialog, path: []const u8) bool {
+    for (dialog.private().state.shells) |shell| if (shell.command) |command| {
+        if (std.mem.indexOf(u8, command, path) != null) return true;
+    };
+    return false;
+}
+
+test "reopen discovers a shell installed while closed" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    const shell_path = try std.fs.path.join(alloc, &.{ root, "bash" });
+    defer alloc.free(shell_path);
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("PATH", root);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config, .shell_env = &env };
+    const dialog = try testDialog();
+    defer dialog.unref();
+    dialog.private().state.test_backend = &backend;
+    const window = adw.Window.new();
+    defer window.as(gtk.Window).destroy();
+    dialog.reopen(&config, .appearance);
+    try testPresentSettings(dialog, window.as(gtk.Window));
+    dialog.loadShells();
+    try testing.expect(testWaitShells(dialog));
+    try testing.expect(!testHasShell(dialog, shell_path));
+    _ = dialog.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(dialog, false));
+    const executable = try tmp.dir.createFile(testing.io, "bash", .{ .permissions = .fromMode(0o755) });
+    executable.close(testing.io);
+    dialog.reopen(&config, .appearance);
+    try testPresentSettings(dialog, window.as(gtk.Window));
+    dialog.loadShells();
+    try testing.expect(testWaitShells(dialog));
+    try testing.expect(testHasShell(dialog, shell_path));
+    _ = dialog.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(dialog, false));
 }

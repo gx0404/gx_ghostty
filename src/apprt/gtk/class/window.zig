@@ -516,7 +516,8 @@ pub const Window = extern struct {
         };
 
         // Add the page and select it
-        const page = tab_view.insert(tab.as(gtk.Widget), position);
+        // fork(gx): GX-0054 Keep new and adopted tabs after pinned tabs.
+        const page = tab_view.insert(tab.as(gtk.Widget), gx_gtk.window.adoptPosition(tab_view, position));
         tab_view.setSelectedPage(page);
 
         // Create some property bindings
@@ -620,16 +621,8 @@ pub const Window = extern struct {
         const pos = tab_view.getPagePosition(page);
 
         // Move it
-        const desired_pos: c_int = desired: {
-            const initial: c_int = @intCast(pos + amount);
-            const max = total - 1;
-            break :desired if (initial < 0)
-                max + initial + 1
-            else if (initial > max)
-                initial - max - 1
-            else
-                initial;
-        };
+        // fork(gx): GX-0054 Keep moves inside the page's pinned or unpinned group.
+        const desired_pos = gx_gtk.window.movedTabPosition(tab_view, page, pos, amount);
         assert(desired_pos >= 0);
         assert(desired_pos < total);
 
