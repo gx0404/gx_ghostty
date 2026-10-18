@@ -882,6 +882,9 @@ $p6 = @(Get-JumpListProfiles $markDir | Where-Object { $_.key -ceq 'p6' })[0]
 Add-Type -TypeDefinition $script:TokenSource -Language CSharp
 # CommandLineToArgvW is the CRT-compatible parse Ghostty's profile command follows.
 $argv = @([GxVmToken]::Arguments($p6.command))
+# The A/B set keeps the original input, which the same rules read as <dir>".
+$legacy = @(Get-JumpListProfiles $markDir -LegacyP6 | Where-Object { $_.key -ceq 'p6' })[0]
+$legacyArgv = @([GxVmToken]::Arguments($legacy.command))
 # Run the marker the way the profile would, without -NoExit, and read what it recorded.
 $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
 $start.Arguments = $p6.command.Substring($p6.command.IndexOf(' ') + 1).Replace('-NoExit ', '')
@@ -891,15 +894,17 @@ $process = [Diagnostics.Process]::Start($start)
 if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'marker did not finish' }
 $marker = @(Get-ChildItem -LiteralPath $markDir -Filter 'gx-jl-argv-*.json')[0]
 $record = [IO.File]::ReadAllText($marker.FullName, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-ConvertTo-GxJson ([ordered]@{ dir=$markDir; argv=$argv; script_args=@($record.script_args); last=@($record.argv)[-1];
-    command_line=$record.command_line; exit=$process.ExitCode }) -Compress
+ConvertTo-GxJson ([ordered]@{ dir=$markDir; argv=$argv; legacy_argv=$legacyArgv; script_args=@($record.script_args); last=@($record.argv)[-1];
+    command_line=$record.command_line; crt=@([GxVmToken]::Arguments($record.command_line)); exit=$process.ExitCode }) -Compress
 """
         out = self.run_body(body, ("ConvertTo-GxJson", "Get-JumpListMarkDir", "Get-JumpListProfiles", "Get-JumpListArgvScript"),
                             ("LF", "JsonSource", "TokenSource"))
         expected = out["dir"] + "\\"
         self.assertIn("\u4e2d\u6587", out["dir"])
         self.assertEqual(out["argv"][-1], expected)
-        self.assertEqual((out["script_args"], out["last"], out["exit"]), ([expected], expected, 0))
+        self.assertEqual(out["legacy_argv"][-1], out["dir"] + '"')
+        # Whole values: script args, .NET argv and the CRT-decoded raw command line.
+        self.assertEqual((out["script_args"], out["last"], out["crt"][-1], out["exit"]), ([expected], expected, expected, 0))
         self.assertTrue(out["command_line"].endswith('"' + out["dir"] + '\\\\"'), out["command_line"])
 
     def test_respond_when_shown_answers_each_new_confirmation_once(self):

@@ -61,7 +61,8 @@ param(
     # apostrophe into the installed exe path (fixed names; CJK cannot be typed over HMP).
     [ValidateSet('none','space','cjk')][string]$PathPreset = 'none',
     # jumplist-matrix config: profile set written to the real user configuration.
-    [ValidateSet('base','deleted','lang-zh','lang-en')][string]$JumpListSet = 'base',
+    # p6-legacy: base with the original p6 input "<dir>\" (A/B for D-18; CRT reads it as <dir>").
+    [ValidateSet('base','deleted','lang-zh','lang-en','p6-legacy')][string]$JumpListSet = 'base',
     # jumplist-matrix config: back up and replace a configuration this fixture did not write.
     [switch]$AdoptUserConfig,
     # jumplist-matrix observe: profile key (p1-p6) whose launch is expected, or none.
@@ -2784,19 +2785,21 @@ function Restore-UserConfig {
 
 function Get-JumpListMarkDir { return Join-Path $script:RunRoot ('jl mark ' + (-join @([char]0x4E2D, [char]0x6587)) + " 'q'") }
 
-function Get-JumpListProfiles([string]$MarkDir) {
+function Get-JumpListProfiles([string]$MarkDir, [switch]$LegacyP6) {
     # p6: an argument that ends in a backslash. In Windows (CRT) command-line syntax a backslash
     # before the closing quote is written doubled ("<dir>\\"); the earlier "<dir>\" made \" an
     # escaped quote, so the configuration itself asked for <dir>" (A7, F3\A7\report.md section 3).
     # The child is a .NET process that records the command line it received and its parsed argv.
+    # -LegacyP6 keeps the original input for the A/B run (JumpList versus the in-app menu).
     $argvScript = Join-Path $MarkDir 'gx-jl-argv.ps1'
+    $p6Tail = if ($LegacyP6) { '\"' } else { '\\"' }
     return @(
         [ordered]@{ key='p1'; name='GX JL Plain'; command='cmd.exe /d /k title GX_JL_P1' },
         [ordered]@{ key='p2'; name='GX JL Space Name'; command='cmd.exe /d /k title GX_JL_P2' },
         [ordered]@{ key='p3'; name=('GX JL ' + (-join @([char]0x4E2D, [char]0x6587))); command='cmd.exe /d /k title GX_JL_P3' },
         [ordered]@{ key='p4'; name='GX JL "Quote"'; command='cmd.exe /d /k title GX_JL_P4' },
         [ordered]@{ key='p5'; name='GX JL Trail\'; command='cmd.exe /d /k title GX_JL_P5' },
-        [ordered]@{ key='p6'; name='GX JL Path'; command=('powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -File "' + $argvScript + '" "' + $MarkDir + '\\"') })
+        [ordered]@{ key='p6'; name='GX JL Path'; command=('powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -File "' + $argvScript + '" "' + $MarkDir + $p6Tail) })
 }
 
 function Get-JumpListArgvScript {
@@ -2809,7 +2812,7 @@ function Get-JumpListArgvScript {
 }
 
 function New-JumpListConfig([string]$Set, [string]$MarkDir) {
-    $profiles = @(Get-JumpListProfiles $MarkDir)
+    $profiles = @(Get-JumpListProfiles $MarkDir -LegacyP6:($Set -ceq 'p6-legacy'))
     if ($Set -ceq 'deleted') { $profiles = @($profiles | Where-Object { $_.key -cne 'p2' }) }
     $language = if ($Set -ceq 'lang-zh') { 'zh-CN' } else { 'en' }
     $lines = @((Get-FixtureConfigMarker), ('language = ' + $language), 'confirm-close-surface = false', 'gx-session-restore = false') +
@@ -3047,20 +3050,38 @@ function Invoke-JumpListMatrix {
             $markDir = Get-JumpListMarkDir
             $markers = @(Get-ChildItem -LiteralPath $markDir -Filter 'gx-jl-argv-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc |
                 ForEach-Object { $script:ExportExtra.Add($_.FullName); Read-JsonFile $_.FullName })
-            $expectedArgument = $markDir + '\'
-            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; argv_markers=$markers; expected_last_argument=$expectedArgument;
+            # p6 expectation: the configured argument read with the CRT rules (CommandLineToArgvW),
+            # which must also be the fixture's intent: <dir>\ (base) or <dir>" (p6-legacy A/B).
+            if (-not ('GxVmToken' -as [type])) { Add-Type -TypeDefinition $script:TokenSource -Language CSharp }
+            $configRecord = Read-Record 'jumplist-user-config'
+            $set = if ($configRecord -and $configRecord.PSObject.Properties['set']) { [string]$configRecord.set } else { 'base' }
+            $expectedArgument = if ($set -ceq 'p6-legacy') { $markDir + '"' } else { $markDir + '\' }
+            $configuredP6 = @(if ($configRecord -and $configRecord.PSObject.Properties['profiles']) { @($configRecord.profiles) | Where-Object { $_.key -ceq 'p6' } })
+            $configuredArgv = if ($configuredP6.Count -eq 1) { @([GxVmToken]::Arguments([string]$configuredP6[0].command)) } else { @() }
+            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; argv_markers=$markers; jumplist_set=$set; expected_last_argument=$expectedArgument;
+                configured_p6_crt_last=$(if ($configuredArgv.Count -gt 0) { $configuredArgv[-1] } else { $null });
                 jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
             if (-not $ExpectProfile -or $ExpectProfile -ceq 'none') { $result.fixture_verdict = 'OBSERVED'; return $result }
             $want = 'GX_JL_' + $ExpectProfile.ToUpperInvariant()
             $titled = @($seen | ForEach-Object { $_.windows } | Where-Object { $_.title -and $_.title.Contains($want) })
-            # p6: the newest marker's only script argument and last argv entry are exactly <dir>\.
+            # p6: compare whole values, never just the last character. The newest marker's only
+            # script argument, the last entry of the .NET argv and the last entry of its raw command
+            # line decoded with CommandLineToArgvW must all equal the expected argument exactly.
             $latest = if ($markers.Count -gt 0) { $markers[-1] } else { $null }
+            $crtArgv = if ($null -ne $latest) { @([GxVmToken]::Arguments([string]$latest.command_line)) } else { @() }
+            if ($null -ne $latest) {
+                $result.p6_received = [ordered]@{ pid=$latest.pid; command_line=[string]$latest.command_line; crt_argv=$crtArgv;
+                    dotnet_argv=@($latest.argv); script_args=@($latest.script_args); expected=$expectedArgument;
+                    expected_length=$expectedArgument.Length }
+            }
             $markerOk = ($ExpectProfile -cne 'p6') -or ($null -ne $latest -and @($latest.script_args).Count -eq 1 -and
-                [string]@($latest.script_args)[0] -ceq $expectedArgument -and [string]@($latest.argv)[-1] -ceq $expectedArgument)
+                [string]@($latest.script_args)[0] -ceq $expectedArgument -and [string]@($latest.argv)[-1] -ceq $expectedArgument -and
+                $crtArgv.Count -gt 0 -and [string]$crtArgv[-1] -ceq $expectedArgument -and
+                [string]$result.configured_p6_crt_last -ceq $expectedArgument)
             $result.window_with_title = $titled
             $result.marker_ok = $markerOk
             $result.fixture_verdict = if ($titled.Count -gt 0 -and $markerOk) { 'PASS' } else { 'FAIL' }
-            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 argv marker missing, or its argument is not exactly the directory with one trailing backslash' } else { $null }
+            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 argv marker missing, or the received argument (script args, .NET argv, CRT-decoded command line) is not exactly ' + $expectedArgument } else { $null }
             return $result
         }
         'deny-commit' { return [ordered]@{ denied=@(Set-JumpListCommitDenied); next='change the profile set (config), reload the app, then snapshot' } }
