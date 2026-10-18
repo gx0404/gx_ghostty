@@ -17,6 +17,11 @@
 //!     dma-buf, so we blit the rendered sRGB texture into this plain RGBA8
 //!     texture (the blit copies the already-sRGB-encoded pixel values
 //!     verbatim) and export that instead.
+// fork(gx): GX-0051 begin: native blending already emits encoded RGB.
+//! GX native blending uses plain RGBA8 for `texture` so framebuffer sRGB
+//! conversion does not encode that output again. Linear modes retain the
+//! sRGB attachment described above; exported bytes stay sRGB in both cases.
+// fork(gx): GX-0051 end
 const Self = @This();
 
 const std = @import("std");
@@ -36,6 +41,9 @@ pub const Options = struct {
     width: usize,
     /// Desired height
     height: usize,
+    // fork(gx): GX-0051 begin: match the attachment to the shader output space.
+    srgb: bool = true,
+    // fork(gx): GX-0051 end
 };
 
 /// The framebuffer we render to.
@@ -67,7 +75,8 @@ pub fn init(opts: Options) !Self {
         try bound_tex.parameter(.wrap_t, .clamp_to_edge);
         try bound_tex.image2D(
             0,
-            .srgba,
+            // fork(gx): GX-0051 native output must remain in encoded RGB.
+            if (opts.srgb) .srgba else .rgba,
             @intCast(opts.width),
             @intCast(opts.height),
             .rgba,

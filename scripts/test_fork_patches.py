@@ -1549,6 +1549,198 @@ class Gx0043ReadbackTests(unittest.TestCase):
         self.assertTrue(any("only then log" in p for p in problems), problems)
 
 
+GX0050 = "GX-0050"
+GX0050_DISCARD = "    // fork(gx): GX-0050 replaces the now-invalid unused self discard."
+GX0050_BODIES = (
+    ("surfaceSize", """if (comptime builtin.os.tag == .windows) {
+        if (!self.wgl_context.drawable()) return error.ContextLost;
+    }"""),
+    ("setViewport", """if (comptime builtin.os.tag == .windows) {
+        if (!self.wgl_context.drawable()) return;
+    }"""),
+    ("drawFrameEnd", """if (comptime builtin.os.tag == .windows) {
+        self.wgl_context.finishRecovery(self.device) catch |err| {
+            log.err("cannot recreate the OpenGL context err={}", .{err});
+        };
+        return;
+    }"""),
+)
+
+
+def gx0050_problems(source: str) -> list[str]:
+    """Three Windows-only hooks; GL/resource work stays in fork code.
+
+    Each hook necessarily replaces the upstream unused-self discard (Zig
+    rejects it once self is used). Restore those explicitly marked lines
+    before stripping pure-addition blocks.
+    """
+    problems = []
+    if source.count(GX0050_DISCARD) != 3:
+        problems.append("expected three explicitly marked unused-self replacements")
+    restored = source.replace(GX0050_DISCARD, "    _ = self;")
+    try:
+        _, hunks = marked_hunks(restored, GX0050)
+    except ValueError as err:
+        return problems + [str(err)]
+    if len(hunks) != 3:
+        return problems + [f"expected 3 {GX0050} hunks, found {len(hunks)}"]
+    lines = source.splitlines()
+    for (begin, end), (name, expected) in zip(hunks, GX0050_BODIES):
+        bounds = zig_fn_lines(lines, f"pub fn {name}(")
+        if bounds is None or not (bounds[0] < begin < end < bounds[1]):
+            problems.append(f"the {name} hook must stay in that function")
+        if squash("\n".join(lines[begin + 1:end])) != squash(expected):
+            problems.append(f"the {name} hook must remain the exact Windows forwarding/guard")
+        if end + 1 >= len(lines) or lines[end + 1] != GX0050_DISCARD:
+            problems.append(f"the {name} unused-self replacement must follow its hook")
+    return problems
+
+
+GX0051 = "GX-0051"
+GX0051_TARGET = "src/renderer/opengl/Target.zig"
+GX0051_TARGET_LINE = ("            // fork(gx): GX-0051 native output must remain in encoded RGB.\n"
+                      "            if (opts.srgb) .srgba else .rgba,")
+GX0051_INTERMEDIATE = ("        // fork(gx): GX-0051 keep intermediate writes and samples in the same space.\n"
+                       "        .internal_format = if (self.blending.isLinear()) .srgba else .rgba,")
+GX0051_DISCARDS = (
+    "    // fork(gx): GX-0051 self now supplies the target color space.",
+    "    // fork(gx): GX-0051 self also controls custom shader ping-pong targets.",
+)
+
+
+def gx0051_restore_target(source: str) -> str:
+    """Target.zig with the GX-0051 storage choice put back to upstream's sRGBA."""
+    source = source.replace("\r\n", "\n")
+    source = source.replace(GX0051_TARGET_LINE, "            .srgba,")
+    return marked_hunks(source, GX0051)[0]
+
+
+def gx0051_restore_opengl(source: str) -> str:
+    """OpenGL.zig with the GX-0051 hooks and unused-self replacements undone."""
+    source = source.replace("\r\n", "\n")
+    source = source.replace(GX0051_INTERMEDIATE, "        .internal_format = .srgba,")
+    for marker in GX0051_DISCARDS:
+        source = source.replace(marker, "    _ = self;")
+    return marked_hunks(source, GX0051)[0]
+
+
+def gx0051_problems(opengl: str, target: str) -> list[str]:
+    """Native blending stores encoded RGB in RGBA8; linear modes keep sRGBA."""
+    opengl, target = opengl.replace("\r\n", "\n"), target.replace("\r\n", "\n")
+    problems = []
+    for marker in (*GX0051_DISCARDS, GX0051_INTERMEDIATE):
+        if opengl.count(marker) != 1:
+            problems.append("missing or changed OpenGL color-space hook: " + marker)
+    if target.count(GX0051_TARGET_LINE) != 1:
+        problems.append("Target must select storage from opts.srgb")
+    if target.count("srgb: bool = true,") != 1:
+        problems.append("Target.srgb must default true for existing direct callers")
+    if opengl.count(".srgb = self.blending.isLinear(),") != 1:
+        problems.append("final target must follow blending.isLinear")
+    for name in ("targetFormats", "intermediateFormats", "sampledFormats"):
+        if f'try @import("opengl/gx_color_test.zig").{name}();' not in opengl:
+            problems.append("missing deterministic GL allocation test: " + name)
+    try:
+        gx0051_restore_target(target)
+        gx0051_restore_opengl(opengl)
+    except ValueError as error:
+        problems.append(str(error))
+    return problems
+
+
+class Gx0051ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.opengl = (ROOT / OPENGL_ZIG).read_text(encoding="utf-8")
+        cls.target = (ROOT / GX0051_TARGET).read_text(encoding="utf-8")
+
+    def test_registration(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for path in (OPENGL_ZIG, GX0051_TARGET):
+            self.assertIn(Patch(GX0051, path, f"fork(gx): {GX0051}", "active"), patches)
+
+    def test_real_source_and_crlf(self):
+        self.assertEqual(gx0051_problems(self.opengl, self.target), [])
+        self.assertEqual(gx0051_problems(self.opengl.replace("\n", "\r\n"), self.target.replace("\n", "\r\n")), [])
+
+    def test_target_restores_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, GX0051_TARGET)
+        if upstream is None:
+            self.skipTest(reason)
+        restored = gx0051_restore_target(self.target)
+        for patch in ("GX-0045", "GX-0004"):
+            restored, _ = marked_hunks(restored, patch)
+        self.assertEqual(squash(restored), squash(upstream))
+
+    def test_opengl_functions_restore_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, OPENGL_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        restored = gx0051_restore_opengl(self.opengl).splitlines()
+        original = upstream.splitlines()
+        for prefix in ("pub fn initTarget(", "pub inline fn textureOptions("):
+            with self.subTest(prefix=prefix):
+                first, last = zig_fn_lines(restored, prefix)
+                before, after = zig_fn_lines(original, prefix)
+                self.assertEqual(squash("\n".join(restored[first:last])), squash("\n".join(original[before:after])))
+
+    def test_fixed_srgb_missing_intermediate_and_wrong_default_are_rejected(self):
+        self.assertTrue(gx0051_problems(self.opengl, self.target.replace("if (opts.srgb) .srgba else .rgba", ".srgba")))
+        self.assertTrue(gx0051_problems(self.opengl.replace("if (self.blending.isLinear()) .srgba else .rgba", ".srgba"), self.target))
+        self.assertTrue(gx0051_problems(self.opengl, self.target.replace("srgb: bool = true", "srgb: bool = false")))
+        self.assertTrue(gx0051_problems(self.opengl.replace(".srgb = self.blending.isLinear(),", ".srgb = true,"), self.target))
+
+
+class Gx0050ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / OPENGL_ZIG).read_text(encoding="utf-8")
+
+    def test_registration(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0050, OPENGL_ZIG, f"fork(gx): {GX0050}", "active"), patches)
+
+    def test_real_source_and_crlf(self):
+        self.assertEqual(gx0050_problems(self.source), [])
+        self.assertEqual(gx0050_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_affected_functions_restore_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, OPENGL_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        restored = self.source.replace(GX0050_DISCARD, "    _ = self;")
+        restored, _ = marked_hunks(restored, GX0050)
+        for name, _ in GX0050_BODIES:
+            with self.subTest(name=name):
+                current_lines = restored.splitlines()
+                original_lines = upstream.splitlines()
+                current = zig_fn_lines(current_lines, f"pub fn {name}(")
+                original = zig_fn_lines(original_lines, f"pub fn {name}(")
+                self.assertIsNotNone(current)
+                self.assertIsNotNone(original)
+                self.assertEqual(squash("\n".join(current_lines[slice(*current)])),
+                                 squash("\n".join(original_lines[slice(*original)])))
+
+    def test_wrong_platform_or_early_hook_is_rejected(self):
+        for name, body in GX0050_BODIES:
+            with self.subTest(name=name):
+                self.assertIn(body, self.source)
+                self.assertTrue(gx0050_problems(self.source.replace(body, body.replace(".windows", ".linux"))))
+        moved = self.source.replace("pub fn drawFrameEnd(", "pub fn gxWrongFrameEnd(")
+        self.assertTrue(gx0050_problems(moved))
+
+    def test_inline_cleanup_and_silent_failure_are_rejected(self):
+        call = "self.wgl_context.finishRecovery(self.device)"
+        self.assertTrue(gx0050_problems(self.source.replace(call, "self.releaseGpuResources()")))
+        logged = 'log.err("cannot recreate the OpenGL context err={}", .{err});'
+        self.assertTrue(gx0050_problems(self.source.replace(logged, "_ = err;")))
+
+    def test_missing_guard_discard_marker_or_delimiter_is_rejected(self):
+        self.assertTrue(gx0050_problems(self.source.replace("if (!self.wgl_context.drawable()) return;", "", 1)))
+        self.assertTrue(gx0050_problems(self.source.replace(GX0050_DISCARD, "", 1)))
+        self.assertTrue(gx0050_problems(self.source.replace("// fork(gx): GX-0050 end", "", 1)))
+
+
 class Gx0049ShapeTests(unittest.TestCase):
     def test_validate_config_flushes_stdout_without_truncating(self):
         patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
@@ -1624,7 +1816,8 @@ class Gx0045ShapeTests(unittest.TestCase):
         upstream, reason = merged_upstream_text(ROOT, TARGET_ZIG)
         if upstream is None:
             self.skipTest(reason)
-        stripped, _ = marked_hunks(self.source, GX0045)
+        # GX-0051 also edits Target.zig; put its storage choice back first.
+        stripped, _ = marked_hunks(gx0051_restore_target(self.source), GX0045)
         stripped, _ = marked_hunks(stripped, "GX-0004")
         self.assertEqual(squash(stripped), squash(upstream))
 
