@@ -243,13 +243,20 @@ class ImageTests(unittest.TestCase):
 
 class ScenarioFileTests(unittest.TestCase):
     def test_a2_find_shortcut_leaves_f9_for_tab_navigation(self):
-        for number in ('W02', 'W03', 'W08', 'W13', 'W20'):
+        for number in ('W02', 'W03', 'W08', 'W13', 'W20', 'W24'):
             path = next((ROOT / 'test/gui/win32').glob(number + '-*.toml'))
             text = path.read_text(encoding='utf-8')
             with self.subTest(path=path.name):
                 self.assertIn('keybind = f12=start_search', text)
                 self.assertNotIn('f9=start_search', text)
-                self.assertNotIn('keys = "f9"', text)
+                self.assertNotIn('keys = "ctrl+shift+f"', text)
+                self.assertNotIn('action = "ime_off"', text)
+                if number == 'W20':
+                    self.assertEqual(text.count('keybind = f9=goto_tab:2'), 1)
+                    self.assertEqual(text.count('keys = "f9"'), 1)
+                    self.assertIn('keybind = f10=gx:move_split_to_tab', text)
+                else:
+                    self.assertNotIn('keys = "f9"', text)
 
     def test_the_windows_scenarios_cover_the_r0_checks(self):
         paths = gui.scenario_paths([])

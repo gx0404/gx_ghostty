@@ -13,8 +13,14 @@
 //! find bars (without its caret then), F3/Shift+F3 navigate from the
 //! terminal too (performable bindings in `src/gx/defaults-windows.ghostty`),
 //! and it hides with its surface (a background tab). Closing the bar any
-//! way, Alt+F4 included, ends the search. Without Direct2D the bar cannot
-//! open, and a message box says so.
+//! way ends the search; a bound Alt+F4 (`close_window` by default) runs in
+//! the terminal instead, like the other bound function keys. Without
+//! Direct2D the bar cannot open, and a message box says so.
+//! The bar stays horizontally inside its window: from a pane too narrow for it, it
+//! moves left over the neighboring pane, and a window narrower than the bar
+//! bounds its width (`barSpan`). Very short panes can overflow vertically;
+//! neighboring bars can overlap, and a clamped bar may cover part of an
+//! always-visible scrollbar. Window-wide avoidance is not implemented.
 //!
 //! The owning `Surface` embeds this struct as `search_bar` and forwards the
 //! `start_search`/`end_search`/`search_total`/`search_selected` apprt
@@ -23,8 +29,9 @@
 //! (`setOwnerVisible`), DPI changes, a move to another window
 //! (`onReparented`) and `deinit`. The app's message loop gives keys typed
 //! into the bar to `handleKey` first (see `App.run`, `ownsEdit`), then lets
-//! keybindings with Ctrl reach the terminal, which takes the focus while
-//! the bar stays open.
+//! keybindings with Ctrl and bound function keys (F1 to F24, also with
+//! Shift, Alt or Win) reach the terminal, which takes the focus while the bar
+//! stays open.
 const SearchBar = @This();
 
 const std = @import("std");
@@ -273,13 +280,32 @@ fn barWidth(surface_width: f32) f32 {
     return std.math.clamp(surface_width - 2 * margin, min_width, max_width);
 }
 
-/// The bar's screen rectangle: the top-right corner of the surface. The
-/// bar takes the content scale of the window first, like the terminal
-/// text (`Popup.setOwnerScale`).
+/// The bar's left edge and width on screen, in pixels.
+const Span = struct { left: i32, width: i32 };
+
+/// The bar's span for a surface whose client area starts at `surface_left`
+/// on screen and is `surface_width` pixels wide (an always-visible
+/// scrollbar left out), in a window whose client area spans `window_left`
+/// to `window_right` on screen, at `scale`: `barWidth` wide at the
+/// surface's top-right corner, moved left as far as it takes to stay inside
+/// the window's margins, over a neighboring pane if need be, and no wider
+/// than the window less its margins.
+fn barSpan(surface_left: i32, surface_width: i32, window_left: i32, window_right: i32, scale: f32) Span {
+    const m = style.px(margin, scale);
+    const room = @max(window_right - window_left - 2 * m, 0);
+    const w = @min(style.px(barWidth(style.dip(surface_width, scale)), scale), room);
+    const corner = surface_left + @max(m, surface_width - w - m);
+    return .{ .left = @max(@min(corner, window_right - m - w), window_left + m), .width = w };
+}
+
+/// The bar's screen rectangle: the top-right corner of the surface, inside
+/// the window horizontally (`barSpan`). The bar takes the content scale of the window
+/// first, like the terminal text (`Popup.setOwnerScale`).
 fn screenRect(self: *SearchBar) ?w32.RECT {
     const pane = self.paneView();
     const hwnd = pane.nativeHandle() orelse return null;
-    self.popup.setOwnerScale(pane.ownerWindow().scale);
+    const window = pane.ownerWindow();
+    self.popup.setOwnerScale(window.scale);
     const scale = self.popup.ownerScale();
     var client: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client) == 0) return null;
@@ -289,12 +315,20 @@ fn screenRect(self: *SearchBar) ?w32.RECT {
         .local => |local| @intCast(local.width),
         .remote => |remote| @intCast(remote.width),
     };
-    const w = style.px(barWidth(style.dip(right, scale)), scale);
+    var origin: w32.POINT = .{ .x = client.left, .y = client.top };
+    _ = w32.ClientToScreen(hwnd, &origin);
+    // The window's client area on screen bounds the bar.
+    const owner = window.hwnd orelse return null;
+    var bounds: w32.RECT = undefined;
+    if (w32.GetClientRect(owner, &bounds) == 0) return null;
+    var window_left: w32.POINT = .{ .x = bounds.left, .y = bounds.top };
+    var window_right: w32.POINT = .{ .x = bounds.right, .y = bounds.top };
+    _ = w32.ClientToScreen(owner, &window_left);
+    _ = w32.ClientToScreen(owner, &window_right);
+    const span = barSpan(origin.x, right - client.left, window_left.x, window_right.x, scale);
     const h = style.px(bar_height, scale);
-    const m = style.px(margin, scale);
-    var pt: w32.POINT = .{ .x = @max(client.left + m, right - w - m), .y = client.top + m };
-    _ = w32.ClientToScreen(hwnd, &pt);
-    return .{ .left = pt.x, .top = pt.y, .right = pt.x + w, .bottom = pt.y + h };
+    const top = origin.y + style.px(margin, scale);
+    return .{ .left = span.left, .top = top, .right = span.left + span.width, .bottom = top + h };
 }
 
 /// Move and resize the bar after the surface or its window moved or
@@ -446,8 +480,8 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
     self.search();
 }
 
-/// The bar closed itself (WM_CLOSE: Alt+F4 in the bar, a close from
-/// outside): the search ends with it, or the matches would stay
+/// The bar closed itself (WM_CLOSE: an unbound Alt+F4 in the bar, a close
+/// from outside): the search ends with it, or the matches would stay
 /// highlighted without a bar, e.g. after canceling the window close that
 /// Alt+F4 goes on to ask about.
 fn onDismissed(ctx: *anyopaque, popup: *Popup, reason: Popup.DismissReason) void {
@@ -700,6 +734,36 @@ test "the find bar fits the surface between 240 and 380 DIPs" {
     try testing.expectEqual(@as(f32, 240), barWidth(256));
     // Narrower surfaces still get the smallest usable bar.
     try testing.expectEqual(@as(f32, 240), barWidth(120));
+}
+
+test "D14: the find bar keeps its width and stays inside its window" {
+    const testing = std.testing;
+    // A wide pane at the window's right edge: its top-right corner.
+    try testing.expectEqual(Span{ .left = 1212, .width = 380 }, barSpan(1000, 600, 0, 1600, 1));
+    // A pane too narrow for the bar at the right edge: the bar keeps its
+    // 240 DIPs and moves left over the neighboring pane, inside the margin.
+    try testing.expectEqual(Span{ .left = 1600 - 8 - 240, .width = 240 }, barSpan(1400, 200, 0, 1600, 1));
+    // At the left edge it stays at the pane's margin, over the neighbor.
+    try testing.expectEqual(Span{ .left = 8, .width = 240 }, barSpan(0, 200, 0, 1600, 1));
+    // A window that cannot hold 240 DIPs and the margins bounds the width.
+    try testing.expectEqual(Span{ .left = 8, .width = 220 - 2 * 8 }, barSpan(0, 220, 0, 220, 1));
+    // The same at 200%, with the window left of the primary screen.
+    try testing.expectEqual(Span{ .left = -300 + 1400 - 16 - 480, .width = 480 }, barSpan(-300 + 1000, 400, -300, -300 + 1400, 2));
+
+    // Whatever the pane, the bar has its width and never leaves the window.
+    const scale: f32 = 1.5;
+    const m = style.px(margin, scale);
+    const window_right: i32 = 1200;
+    var pane_width: i32 = 40;
+    while (pane_width <= 900) : (pane_width += 37) {
+        for ([_]i32{ 0, 300, 700, 1100 }) |pane_left| {
+            const width = @min(pane_width, window_right - pane_left);
+            const span = barSpan(pane_left, width, 0, window_right, scale);
+            try testing.expectEqual(style.px(barWidth(style.dip(width, scale)), scale), span.width);
+            try testing.expect(span.left >= m);
+            try testing.expect(span.left + span.width <= window_right - m);
+        }
+    }
 }
 
 test "the counter takes the width it needs and the field the rest" {

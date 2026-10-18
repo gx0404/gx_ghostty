@@ -1,0 +1,164 @@
+id = "W24"
+title = "Cancel Alt+F4 from the find bar preserves the search unless the binding is removed"
+args = ["--confirm-close-surface=true"]
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+window-save-state = never
+keybind = f12=start_search
+"""
+expect = [
+  "before-close: the focused find field reads needle and has matches while ping is running",
+  "close-confirm: Alt+F4 from the find field asks to close the window and lists PING",
+  "cancel-keeps-search: after Escape cancels closing, the window and find bar remain; the field still reads needle and the match counter remains",
+  "unbound-confirm: after removing the Alt+F4 binding and reopening the find field, Alt+F4 still asks to close the window",
+  "unbound-cancel-ends-search: after cancelling the unbound close path the window remains, but the search bar has ended",
+]
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "50%"
+y = "75%"
+
+[[step]]
+action = "type"
+text = "echo needle& ping -t 127.0.0.1\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "needle"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "before-close"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "alt+f4"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "capture"
+name = "close-confirm"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 2
+
+# The runner asserts presence; the image asserts the preserved needle and counter.
+[[step]]
+action = "capture"
+name = "cancel-keeps-search"
+what = "all"
+
+# Reload only the isolated profile. The command-line confirmation setting survives.
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+window-save-state = never
+keybind = f12=start_search
+keybind = alt+f4=unbind
+"""
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+comma"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+
+[[step]]
+action = "key"
+keys = "alt+f4"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "capture"
+name = "unbound-confirm"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 2
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "unbound-cancel-ends-search"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+c"
+
+[[step]]
+action = "sleep"
+seconds = 0.5

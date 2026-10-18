@@ -56,7 +56,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 ### 输入、IME、DPI 与文字
 
 - 按键：`App.run` 对终端子窗口的按键跳过 `TranslateMessage`（`Surface.handleKeyEvent` 自己调 `ToUnicode`，共用死键状态），`VK_PROCESSKEY` 与 `VK_PACKET` 除外。按键、`WM_CHAR` 与上屏文字都经核心 `Surface.gxWin32KeyCallback`（GX-0006，契约见 `src/gx/win32_input.zig` 文件头），DECSET 9001 开时按 KEY_EVENT_RECORD 发出；粘贴与拖放不走记录，拖放路径按 shell 引用（`gx.path_quote`）。
-- 弹层编辑框：`App.routeEditKey` 与纯函数 `App.editKeyRoute` 分流：编辑键、输入法与修饰键留给编辑框；`trigger.isBound` 命中绑定的 Ctrl 组合交给终端绑定（查找栏只交出焦点、不结束搜索）；其余 Ctrl 组合吞掉，未绑定的 Ctrl+Alt 按 AltGr 输入。查找栏从外部关闭一律经核心 `end_search`；Alt+Space 由 `Window.handleSystemMenuKey` 打开窗口菜单。
+- 弹层编辑框：`App.routeEditKey` 先处理弹层自身按键；编辑与输入法留给编辑框，已绑定 Ctrl 组合转给终端；查找栏另放行不带 Ctrl 的已绑定 F1–F24（含 Shift、Alt、Win），只交出焦点、不结束搜索。其余 Ctrl 组合吞掉，未绑定 Ctrl+Alt 按 AltGr 输入。外部关闭查找栏经核心 `end_search`；Alt+Space 打开窗口菜单。
 - 快捷键冲突：`App.probeShortcuts` 在首窗显示约 1 s 后与每次重载后（计时器 4）试注册带修饰键的绑定并查 TSF 保留键，结果 `App.shortcut_conflicts` 供速查表标记、`trigger.Hints` 跳过；用户可见行为见 `docs/GX_FEATURES.md`「快捷键冲突」。
 - IME：组字串作为 preedit 交给核心内联显示，候选窗由 `Surface.positionImeWindow` 按 DPI 放到光标处；终端失焦时取消组字。
 - 剪贴板：`OpenClipboard` 都经 `clipboard.open`（有界重试，应对剪贴板管理器与远程桌面的短暂占用），终端读写另由 `CR`、`CW` 计时器再试约 0.6 s。自绘输入框粘贴只取第一行，截到 `text_edit.max_len`（4096 个 UTF-16 码元）。
@@ -69,7 +69,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 - 线程：其他线程进入 apprt 的入口（`wakeup`、`signalFrameDrawn`、`gpuContextReset`、`anim` 时钟线程）只投递消息、置位事件或改渲染器自身的状态，不碰 HWND、Direct2D 与 apprt 的 UI 状态；GL 调用只在渲染线程（`renderer.md`）。
 - 关闭：`Surface.close` 只投递 `WM_CLOSE` 或 `WM_APP_CONFIRM_CLOSE`，销毁一律在消息循环里进行，不在核心回调中关窗或释放 Surface。关闭分屏、标签、窗口与退出都先问核心 `needsConfirmQuit`（含 GX-0012 的空闲进程判断）。
 - 模态循环（菜单、对话框、`MessageBoxW`、另存为）照常派发消息，其间任何对象都可能被释放：返回后重新解析 Window 与 Surface，不沿用裸指针；对话框打开期间窗口推迟自己的 `WM_CLOSE`，最外层对话框返回后再投递。窗口与终端销毁时清零 `GWLP_USERDATA`，据此丢弃迟到的消息。自绘对话框与菜单取到 WM_QUIT 时仅当 `App.quit_requested` 才结束并重投（`Popup.modalQuitCode`）。
-- 弹层关闭：`WM_CLOSE`（Alt+F4、系统关闭、外部发来）把已显示的弹层隐藏而不销毁，以 `.owner` 报 `dismissed`；会取焦点且开着 `close_owner_on_close` 的弹层再关所属窗口；未显示的弹层忽略它（`taskkill` 已发给每个窗口）。`Dialogs` 关掉 `close_owner_on_close`，外部关闭按取消结束模态循环。
+- 弹层关闭：`WM_CLOSE`（未被绑定接管的 Alt+F4、系统关闭等）把已显示的弹层隐藏而不销毁，以 `.owner` 报 `dismissed`；会取焦点且开着 `close_owner_on_close` 的弹层再关所属窗口；未显示的弹层忽略它（`taskkill` 已发给每个窗口）。`Dialogs` 关掉 `close_owner_on_close`，外部关闭按取消结束模态循环。
 - 持锁回调：核心持 `renderer_state.mutex` 时会回调 apprt（如 `open_url`、`setClipboard`、`export_terminal_io`），它们不得泵消息或跑模态循环（重入核心再取锁即自锁）：URL 交给 `open_url.zig` 的工作线程，另存为对话框经 `WM_APP_EXPORT_TERMINAL_IO` 回到消息循环。
 - 菜单只从窗口消息里打开：绑定动作经 `Window.queueMainMenu` 投递 `WM_APP_MAIN_MENU`，同一时刻只开一个菜单。
 - Direct2D 可能不可用（`App.uiFactory` 返回 null）：自绘 UI 要有退路，对话框退回 `MessageBoxW`。

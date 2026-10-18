@@ -13,7 +13,7 @@ language = en
 keybind = f12=start_search
 """
 expect = [
-  "search-box: the typed text and the editing chords stayed in the search box (word-wise editing removes the words abc and x; until the text editor gets word boundaries Ctrl+Backspace and Ctrl+Delete remove one character, leaving `needle ab`)",
+  "search-box: the typed text and the editing chords stayed in the search box (Ctrl+Backspace and Ctrl+Delete remove the words abc and x, leaving `needle`)",
   "shell-clean: after Esc the prompt line `> ` is empty: no needle, abc, ^Q or stray characters",
   "counter: the reopened bar reads needle and its counter shows {current}/6 (three matches on the command line, three in the output); the bar is 380 DIPs wide (570 px at 144 DPI) at the top-right of the terminal",
   "enter-next: Enter in the bar moved the current match; the total stayed 6",
@@ -21,7 +21,8 @@ expect = [
   "terminal-focus: after a click in the terminal the bar is still shown, without a caret in its field",
   "f3: F3 pressed while the terminal has the focus moved the current match forward; shift-f3: Shift+F3 moved it back",
   "no-results: the field reads zzqx with the caution border, the counter says No results in the caution color",
-  "narrow-clamp: in the narrow right pane of the 1,400 px window the bar keeps its 240 DIP minimum (360 px at 144 DPI, wider than the pane) and still shows the counter",
+  "narrow-clamp: in the narrow right pane of the 1,400 px window the bar keeps its 240 DIP minimum (360 px at 144 DPI, wider than the pane) and still shows the counter; the whole bar and close button stay inside the window",
+  "narrow-closed: clicking the close button inside the window ended the search (old geometry leaves the bar open)",
   "link-left: with Ctrl held on a row of the long URL output, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
   "link-right: with the pointer on the URL prompt in the last row, under the bubble's place, the bubble for https://example.com/gx-r6-right/prompt shows at the bottom-right corner",
   "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
@@ -246,95 +247,6 @@ action = "wait_popup"
 cls = "GhosttyGxPopup"
 present = false
 
-# A narrow pane: in a 1,400 px wide window the second right split halves the right half again
-# (about 230 DIPs) and takes the focus, so the bar keeps its 240 DIP minimum.
-[[step]]
-action = "resize"
-width = 1400
-height = 1000
-
-[[step]]
-action = "sleep"
-seconds = 0.8
-
-[[step]]
-action = "key"
-keys = "ctrl+shift+o"
-
-[[step]]
-action = "wait_terminals"
-count = 2
-
-[[step]]
-action = "key"
-keys = "ctrl+shift+o"
-
-[[step]]
-action = "wait_terminals"
-count = 3
-
-[[step]]
-action = "sleep"
-seconds = 1.0
-
-[[step]]
-action = "key"
-keys = "f12"
-
-[[step]]
-action = "wait_popup"
-cls = "GhosttyGxPopup"
-new = true
-
-[[step]]
-action = "type"
-text = "needle"
-
-[[step]]
-action = "sleep"
-seconds = 0.8
-
-[[step]]
-action = "capture"
-name = "narrow-clamp"
-what = "all"
-
-[[step]]
-action = "key"
-keys = "escape"
-
-[[step]]
-action = "wait_popup"
-cls = "GhosttyGxPopup"
-present = false
-
-# Back to one pane: exit the two new panes.
-[[step]]
-action = "type"
-text = "exit\n"
-
-[[step]]
-action = "wait_terminals"
-count = 2
-
-[[step]]
-action = "click"
-in = "terminal:1"
-x = "50%"
-y = "50%"
-
-[[step]]
-action = "type"
-text = "exit\n"
-
-[[step]]
-action = "wait_terminals"
-count = 1
-
-[[step]]
-action = "sleep"
-seconds = 0.5
-
 # The link preview. Output soft-wraps, so every row of a long URL printed by a program is part of
 # the link; a command line echoed by ConPTY does not (its rows are separate lines), so the URLs come
 # from output and from the prompt text. Blank lines push the prompt to the bottom first.
@@ -426,3 +338,113 @@ seconds = 0.25
 action = "capture"
 name = "resize-overlay"
 what = "all"
+
+# Keep narrow-pane geometry after the link checks so their original width is preserved.
+# A narrow right-edge pane: drag the nested divider so the bar cannot fit,
+# regardless of the desktop DPI. The bar must move left inside the window.
+[[step]]
+action = "resize"
+width = 1400
+height = 1000
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "drag_divider"
+between = [1, 2]
+fraction = 0.85
+
+[[step]]
+action = "click"
+in = "terminal:2"
+x = "50%"
+y = "75%"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "needle"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "narrow-clamp"
+what = "all"
+
+[[step]]
+# Click in window coordinates derived from the rightmost pane, not in the popup.
+# Before D-14 the button is outside the window and this cannot close the bar.
+action = "click"
+in = "terminal:2"
+x = -30
+y = 30
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "capture"
+name = "narrow-closed"
+what = "all"
+
+# Back to one pane: exit the two new panes.
+[[step]]
+action = "type"
+text = "exit\n"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "click"
+in = "terminal:1"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "type"
+text = "exit\n"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.5
