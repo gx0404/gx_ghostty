@@ -142,6 +142,7 @@ def stale(fixture, instance, first, other):
 
 IMC_GETCONVERSIONMODE, IMC_SETCONVERSIONMODE, IMC_GETOPENSTATUS, IMC_SETOPENSTATUS = 0x0001, 0x0002, 0x0005, 0x0006
 IME_CMODE_NATIVE = 0x0001
+IME_QUIET_S, IME_SETTLE_S, IME_POLL_S = 0.3, 2.0, 0.05
 
 
 def ime_control(ime, command, value=0):
@@ -149,6 +150,38 @@ def ime_control(ime, command, value=0):
     if result is None:
         raise AssertionError("the owned IME window did not answer WM_IME_CONTROL")
     return result
+
+
+def ime_state(ime):
+    return {"open": ime_control(ime, IMC_GETOPENSTATUS), "mode": ime_control(ime, IMC_GETCONVERSIONMODE)}
+
+
+def settled_ime_state(ime):
+    """Read until the state is unchanged for IME_QUIET_S (right after a layout
+    switch Microsoft Pinyin can still show its activation state); returns
+    (state, [[seconds, state], ...] timeline, settled)."""
+    start = time.monotonic()
+    state = ime_state(ime)
+    timeline, since = [[0.0, state]], start
+    while time.monotonic() - since < IME_QUIET_S:
+        if time.monotonic() - start >= IME_SETTLE_S:
+            return state, timeline, False
+        time.sleep(IME_POLL_S)
+        current = ime_state(ime)
+        if current != state:
+            state, since = current, time.monotonic()
+            timeline.append([round(since - start, 3), current])
+    return state, timeline, True
+
+
+def ime_restore_verdict(saved, restored, mode_while_open):
+    if restored == saved:
+        return "exact"
+    if saved["open"] == 0 and restored["open"] == 0 and mode_while_open == saved["mode"]:
+        # Closed means direct input; Pinyin zeroes the mode when it closes. The
+        # readback while open proves the saved mode was set before closing.
+        return "closed-mode-reset-by-ime"
+    return "mismatch"
 
 
 def compose_ime(fixture, instance, native):
@@ -179,8 +212,11 @@ def compose_ime(fixture, instance, native):
         ime = imm.ImmGetDefaultIMEWnd(hwnd)
         if not ime or api.window_pid(ime) != instance.pid:
             raise EnvironmentUnavailable("owned thread's IME control window is unavailable")
-        state = {"open": ime_control(ime, IMC_GETOPENSTATUS), "mode": ime_control(ime, IMC_GETCONVERSIONMODE)}
-        report["ime_before"] = state
+        report["ime_first_read"] = ime_state(ime)
+        settled, report["ime_before_timeline"], quiet = settled_ime_state(ime)
+        if not quiet:
+            raise AssertionError(f"IME state did not settle within {IME_SETTLE_S}s: {report['ime_before_timeline']}")
+        state = report["ime_before"] = settled
         ime_control(ime, IMC_SETOPENSTATUS, 1)
         ime_control(ime, IMC_SETCONVERSIONMODE, state["mode"] | IME_CMODE_NATIVE)  # keep the other mode bits
         before = native.query(106)
@@ -194,19 +230,24 @@ def compose_ime(fixture, instance, native):
         restored = None
         try:
             if state is not None and ime and api.IsWindow(ime) and api.window_pid(ime) == instance.pid:
-                # Open status first: closing Microsoft Pinyin after a composition
-                # resets the conversion mode (round3-batch-20261018-101019:
-                # mode-then-open read back (0,1) as (0,0)), so mode goes last.
-                ime_control(ime, IMC_SETOPENSTATUS, state["open"])
+                # Microsoft Pinyin ignores a conversion mode set while closed and
+                # resets it when closing (round3 batches 101019 and 102024 both
+                # read (0,0) back), so the mode is set while open, read back, and
+                # the open status goes last.
+                ime_control(ime, IMC_SETOPENSTATUS, 1)
                 ime_control(ime, IMC_SETCONVERSIONMODE, state["mode"])
-                restored = {"open": ime_control(ime, IMC_GETOPENSTATUS), "mode": ime_control(ime, IMC_GETCONVERSIONMODE)}
+                report["mode_while_open_readback"] = ime_control(ime, IMC_GETCONVERSIONMODE)
+                ime_control(ime, IMC_SETOPENSTATUS, state["open"])
+                report["ime_after_immediate"] = ime_state(ime)
+                restored, report["ime_after_timeline"], _ = settled_ime_state(ime)
                 report["ime_after"] = restored
+                report["ime_restore"] = ime_restore_verdict(state, restored, report["mode_while_open_readback"])
         finally:
             try:
                 report["input_language"] = language.restore()
             finally:
                 fixture.check("IME-restore", **report)
-        if state is not None and restored != state:
+        if state is not None and report.get("ime_restore") not in ("exact", "closed-mode-reset-by-ime"):
             raise AssertionError(f"IME open/conversion state was not restored: {state} -> {restored}")
 
 

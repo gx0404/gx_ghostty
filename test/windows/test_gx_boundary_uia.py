@@ -14,46 +14,118 @@ class PopupBoundaryTests(unittest.TestCase):
         self.assertIs(palette, popup_fixture.choose_popup([palette]))
 
     def test_ime_composition_failure_still_restores_open_mode_and_language(self):
-        import gx_boundary_uia as boundary
-        ime_state = {'open': 0, 'mode': 0x0400}
-        sets = []
+        pinyin = PinyinEmulator(open_=0, mode=0x0400)
+        report, error = run_compose(pinyin, press=RuntimeError("composition input failed"))
+        self.assertIsInstance(error, RuntimeError)  # the original failure is not masked
+        self.assertIn(("mode", 0x0401), pinyin.sets)  # native bit added, other mode bits kept
+        self.assertEqual({"open": 0, "mode": 0}, pinyin.state)  # closing reset the mode
+        self.assertEqual(("closed-mode-reset-by-ime", 0x0400), (report["ime_restore"], report["mode_while_open_readback"]))
+        self.assertTrue(report["input_language"]["restored"])
 
-        def send_message(hwnd, message, command, value=0, timeout_ms=0):
-            if command in (0x0006, 0x0002):
-                sets.append((command, value))
-                ime_state['open' if command == 0x0006 else 'mode'] = value
-                if command == 0x0006 and value == 0:
-                    ime_state['mode'] = 0  # Pinyin: closing resets the conversion mode.
-                return 0
-            return ime_state['open' if command == 0x0005 else 'mode']
+    def test_activation_transient_is_not_taken_as_the_saved_state(self):
+        # round3-batch-20261018-101019/102024: the first read after the layout
+        # switch was (open 0, mode 1); restoring that read back gave (0, 0).
+        pinyin = PinyinEmulator(open_=1, mode=1, transient={"open": 0, "mode": 1}, transient_reads=4)
+        report, error = run_compose(pinyin)
+        self.assertIsNone(error)
+        self.assertEqual({"open": 0, "mode": 1}, report["ime_first_read"])
+        self.assertEqual({"open": 1, "mode": 1}, report["ime_before"])
+        self.assertEqual(({"open": 1, "mode": 1}, "exact"), (report["ime_after"], report["ime_restore"]))
+        self.assertEqual({"open": 1, "mode": 1}, pinyin.state)
 
-        api = mock.Mock()
-        api.focus_window.return_value = 55
-        api.window_pid.return_value = 42
-        api.class_name.return_value = boundary.gui.TERMINAL_CLASS
-        api.keyboard_layout.return_value = 0x08040804
-        api.IsWindow.return_value = True
-        api.send_message.side_effect = send_message
+    def test_closed_ime_mode_reset_is_recorded_with_the_open_readback(self):
+        pinyin = PinyinEmulator(open_=0, mode=1)
+        report, error = run_compose(pinyin)
+        self.assertIsNone(error)
+        self.assertEqual([("open", 1), ("mode", 1), ("open", 1), ("mode", 1), ("open", 0)], pinyin.sets)
+        self.assertEqual(({"open": 0, "mode": 0}, 1), (report["ime_after"], report["mode_while_open_readback"]))
+        self.assertEqual("closed-mode-reset-by-ime", report["ime_restore"])
 
-        def layouts(count, array):
-            if array is not None:
-                array[0] = 0x08040804
-            return 1
-        native_dll = mock.Mock()
-        native_dll.GetKeyboardLayoutList.side_effect = layouts
-        native_dll.ImmGetDefaultIMEWnd.return_value = 77
-        instance = mock.Mock(pid=42)
-        instance.press.side_effect = RuntimeError('composition input failed')
-        fixture = SimpleNamespace(report={}, check=mock.Mock())
-        with mock.patch.object(boundary.gui, 'win32', return_value=api), \
-                mock.patch('gx_boundary_controller.gui.win32', return_value=api), \
-                mock.patch.object(boundary.C, 'WinDLL', return_value=native_dll), \
-                self.assertRaisesRegex(RuntimeError, 'composition input failed'):
-            boundary.compose_ime(fixture, instance, mock.Mock(hwnd=9))
-        self.assertIn((0x0002, 0x0401), sets)  # native bit added, other mode bits kept
-        self.assertEqual({'open': 0, 'mode': 0x0400}, ime_state)
-        self.assertTrue(fixture.report['input_language'][0]['restored'])
+    def test_an_open_status_that_does_not_come_back_fails(self):
+        pinyin = PinyinEmulator(open_=1, mode=1, close_on_escape=True)
+        report, error = run_compose(pinyin)
+        self.assertIsInstance(error, AssertionError)
+        self.assertIn("not restored", str(error))
+        self.assertEqual("mismatch", report["ime_restore"])
+        self.assertTrue(report["input_language"]["restored"])
 
+
+class PinyinEmulator:
+    """Microsoft Pinyin through WM_IME_CONTROL as observed on the host: the first
+    reads after a layout switch may show an activation state, a conversion mode
+    set while closed is ignored, and closing resets the mode to 0."""
+
+    def __init__(self, *, open_, mode, transient=None, transient_reads=0, close_on_escape=False):
+        self.state = {"open": open_, "mode": mode}
+        self.transient, self.transient_reads = transient, transient_reads
+        self.close_on_escape, self.stuck = close_on_escape, False
+        self.sets = []
+
+    def press(self, key):
+        if key == "escape" and self.close_on_escape:
+            self.state.update(open=0, mode=0)
+            self.stuck = True  # an IME that refuses to reopen
+
+    def send_message(self, hwnd, message, command, value=0, timeout_ms=0):
+        if command in (0x0006, 0x0002):
+            self.sets.append(("open" if command == 0x0006 else "mode", value))
+            self.transient_reads = 0
+            if command == 0x0006 and not self.stuck:
+                self.state["open"] = value
+                if value == 0:
+                    self.state["mode"] = 0
+            elif command == 0x0002 and self.state["open"]:
+                self.state["mode"] = value
+            return 0
+        source = self.state
+        if self.transient_reads:
+            self.transient_reads -= 1
+            source = self.transient
+        return source["open" if command == 0x0005 else "mode"]
+
+
+def run_compose(pinyin, press=None):
+    """compose_ime against the emulator with a fake clock; returns (report, error)."""
+    import gx_boundary_uia as boundary
+    api = mock.Mock()
+    api.focus_window.return_value = 55
+    api.window_pid.return_value = 42
+    api.class_name.return_value = boundary.gui.TERMINAL_CLASS
+    api.keyboard_layout.return_value = 0x08040804
+    api.IsWindow.return_value = True
+    api.send_message.side_effect = pinyin.send_message
+
+    def layouts(count, array):
+        if array:
+            array[0] = 0x08040804
+        return 1
+    native_dll = mock.Mock()
+    native_dll.GetKeyboardLayoutList.side_effect = layouts
+    native_dll.ImmGetDefaultIMEWnd.return_value = 77
+    instance = mock.Mock(pid=42)
+
+    def pressed(key):
+        if press is not None:
+            raise press
+        pinyin.press(key)
+    instance.press.side_effect = pressed
+    events = iter(range(1000))
+    native = mock.Mock(hwnd=9)
+    native.query.side_effect = lambda selector, *rest: next(events)
+    fixture = SimpleNamespace(report={}, check=mock.Mock())
+    ticks = iter(range(100000))
+    error = None
+    with mock.patch.object(boundary.gui, "win32", return_value=api), \
+            mock.patch("gx_boundary_controller.gui.win32", return_value=api), \
+            mock.patch.object(boundary.C, "WinDLL", return_value=native_dll), \
+            mock.patch.object(boundary.time, "monotonic", side_effect=lambda: next(ticks) * 0.05), \
+            mock.patch.object(boundary.time, "sleep"):
+        try:
+            boundary.compose_ime(fixture, instance, native)
+        except Exception as caught:  # noqa: BLE001 - returned to the test
+            error = caught
+    report = fixture.check.call_args.kwargs if fixture.check.call_args else {}
+    return report, error
 
 if __name__ == "__main__":
     unittest.main()
