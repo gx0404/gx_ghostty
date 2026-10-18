@@ -801,3 +801,92 @@ test "menuTrigger never advertises a key sequence as a single menu accelerator" 
     try keybinds.parseCLI(arena.allocator(), "ctrl+x>ctrl+k=gx:keybinds");
     try testing.expectEqual(@as(?input.Binding.Trigger, null), menuTrigger(&keybinds.set, .{ .gx = .keybinds }));
 }
+
+/// Wraps moves inside the page's pinned or unpinned group. Without pinned
+/// pages, preserve upstream's single-wrap formula, including large amounts.
+pub fn movedTabPosition(view: *adw.TabView, page: *adw.TabPage, amount: isize) c_int {
+    const pos = view.getPagePosition(page);
+    const pinned = view.getNPinnedPages();
+    if (pinned == 0) {
+        const initial: c_int = @intCast(pos + amount);
+        const max = view.getNPages() - 1;
+        return if (initial < 0) max + initial + 1 else if (initial > max) initial - max - 1 else initial;
+    }
+
+    const start: c_int = if (page.getPinned() != 0) 0 else pinned;
+    const count = if (page.getPinned() != 0) pinned else view.getNPages() - pinned;
+    // Reduce the amount before adding, including minInt/maxInt amounts.
+    const relative: i64 = @as(i64, pos - start) + @mod(amount, @as(isize, count));
+    return start + @as(c_int, @intCast(@mod(relative, count)));
+}
+
+test "move tabs wraps within pinned and unpinned groups" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const Case = struct { pinned: c_int, total: c_int, pos: c_int, amount: isize, expected: c_int };
+    const cases = [_]Case{
+        .{ .pinned = 2, .total = 4, .pos = 1, .amount = 1, .expected = 0 },
+        .{ .pinned = 2, .total = 4, .pos = 2, .amount = -1, .expected = 3 },
+        .{ .pinned = 2, .total = 4, .pos = 3, .amount = 1, .expected = 2 },
+        .{ .pinned = 2, .total = 4, .pos = 0, .amount = -1, .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 0, .amount = 1, .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 3, .amount = -1, .expected = 2 },
+        .{ .pinned = 1, .total = 2, .pos = 0, .amount = 1, .expected = 0 },
+        .{ .pinned = 1, .total = 2, .pos = 1, .amount = -1, .expected = 1 },
+        .{ .pinned = 2, .total = 2, .pos = 1, .amount = 1, .expected = 0 },
+        .{ .pinned = 2, .total = 4, .pos = 1, .amount = 100, .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 2, .amount = -101, .expected = 3 },
+        .{ .pinned = 2, .total = 4, .pos = 0, .amount = std.math.maxInt(isize), .expected = 1 },
+        .{ .pinned = 2, .total = 4, .pos = 3, .amount = std.math.minInt(isize), .expected = 3 },
+    };
+    for (cases) |case| {
+        const view = adw.TabView.new();
+        _ = view.as(gobject.Object).refSink();
+        defer view.as(gobject.Object).unref();
+        var i: c_int = 0;
+        while (i < case.total) : (i += 1) {
+            const page = view.append(gtk.Label.new(null).as(gtk.Widget));
+            if (i < case.pinned) view.setPagePinned(page, 1);
+        }
+        const page = view.getNthPage(case.pos);
+        const destination = movedTabPosition(view, page, case.amount);
+        const moved = view.reorderPage(page, destination) != 0;
+        try testing.expectEqual(case.expected != case.pos, moved);
+        try testing.expectEqual(case.expected, view.getPagePosition(page));
+        try testing.expectEqual(case.expected, destination);
+        try testing.expectEqual(case.pinned, view.getNPinnedPages());
+        try testing.expectEqual(case.total, view.getNPages());
+    }
+}
+
+test "move tabs without pinned pages matches upstream single wrap formula" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    var total: c_int = 1;
+    while (total <= 8) : (total += 1) {
+        const view = adw.TabView.new();
+        _ = view.as(gobject.Object).refSink();
+        defer view.as(gobject.Object).unref();
+        var i: c_int = 0;
+        while (i < total) : (i += 1) _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+        var pos: c_int = 0;
+        while (pos < total) : (pos += 1) {
+            var amount: isize = -100;
+            while (amount <= 100) : (amount += 1) {
+                const page = view.getNthPage(pos);
+                const initial: c_int = @intCast(pos + amount);
+                const max = total - 1;
+                const expected = if (initial < 0) max + initial + 1 else if (initial > max) initial - max - 1 else initial;
+                const destination = movedTabPosition(view, page, amount);
+                try testing.expectEqual(expected, destination);
+                // Upstream only wraps once: large amounts can stay outside
+                // the view. Preserve that result, but do not reorder to it.
+                if (destination >= 0 and destination < total) {
+                    try testing.expectEqual(destination != pos, view.reorderPage(page, destination) != 0);
+                    try testing.expectEqual(destination, view.getPagePosition(page));
+                    try testing.expectEqual(@as(c_int, 0), view.getNPinnedPages());
+                }
+            }
+        }
+    }
+}
