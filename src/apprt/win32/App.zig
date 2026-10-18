@@ -2717,8 +2717,9 @@ extern "user32" fn WindowFromPoint(point: w32.POINT) callconv(.winapi) ?w32.HWND
 /// Create and track a top-level window without tabs. It is shown with its
 /// first tab (`Window.addTab*`).
 pub fn newWindow(self: *App, options: Window.InitOptions) !*Window {
-    // One-shot injected CreateWindow failure occurs before allocation/shell
-    // creation, so the real GUI completion path must return execution_failed.
+    // One-shot injected error at this entry, before allocation, shell creation
+    // and CreateWindowExW (which is not called); the real GUI completion path
+    // must then return execution_failed.
     if (self.fixture.takeWindowFailure(@import("remote_test.zig").enabled())) return error.FixtureCreateWindowFailed;
     const alloc = self.core_app.alloc;
     const window = try alloc.create(Window);

@@ -3220,7 +3220,7 @@ const FixtureParentProbe = struct {
     tab: gx.ui_ref.Reference,
     child: w32.HWND,
     var active: ?*FixtureParentProbe = null; // GUI thread, only while SetParent is on the stack.
-    const Call = extern struct { result: isize, wparam: usize, message: u32, hwnd: w32.HWND };
+    const Call = extern struct { lparam: isize, wparam: usize, message: u32, hwnd: w32.HWND }; // CWPSTRUCT
     extern "user32" fn SetWindowsHookExW(i32, *const anyopaque, ?w32.HINSTANCE, u32) callconv(.winapi) ?*anyopaque;
     extern "user32" fn UnhookWindowsHookEx(*anyopaque) callconv(.winapi) i32;
     extern "user32" fn CallNextHookEx(?*anyopaque, i32, usize, isize) callconv(.winapi) isize;

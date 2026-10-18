@@ -231,6 +231,10 @@ pub const PopupCallbacks = struct {
     context: *anyopaque,
     /// GUI only; registration is removed before the context is freed.
     is_live: *const fn (*anyopaque) bool,
+    /// GUI only. The bridge pre-revokes the snapshot for every action except
+    /// focus. A callback whose action (focus included) changes the model or
+    /// layout must call `Popup.invalidate()` itself; a purely visual change
+    /// uses `Popup.repaint()` and keeps the retained providers usable.
     action: *const fn (*anyopaque, u64, *const uia.Action) bool,
 };
 
