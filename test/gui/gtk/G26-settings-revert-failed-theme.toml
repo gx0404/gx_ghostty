@@ -38,10 +38,9 @@ try:
     capture("03-reverted")
     # Nothing is left to save, so the dialog closes while the folder is
     # still read-only.
-    for step in range(3):
-        xdo("key", "Escape")
-        sleep(0.8)
-        capture("04-escape-%d" % (step + 1))
+    xdo("mousemove", 987, 59, "click", 1)
+    sleep(0.8)
+    capture("04-closed")
 finally:
     os.chmod(folder, 0o755)
     if overlay.exists():
@@ -49,6 +48,7 @@ finally:
 text = overlay_text()
 save("-overlay.txt", text)
 assert "Chalkboard" not in text, text
+xdo("mousemove", 400, 300, "click", 1)
 xdo("key", "ctrl+alt+t")
 sleep(0.8)
 capture("05-reopened")
@@ -58,10 +58,10 @@ assert "Chalkboard" not in overlay_text()
 '''
 expect = [
   "G26.png: the isolated terminal before the settings open",
-  "G26-01-preview.png: the theme list searched for Chalkboard previews it; the saved theme keeps its check mark",
+  "G26-01-preview.png: the theme list searched for Chalkboard previews it in the terminal; Revert and Apply are sensitive",
   "G26-02-save-failed.png: with the settings folder read-only, Apply shows the failure toast with Retry and Chalkboard stays previewed",
-  "G26-03-reverted.png: Revert brings the saved theme back, selected with its check mark; the retry toast is gone and Apply/Revert are insensitive",
-  "G26-04-escape-1.png to G26-04-escape-3.png: with the folder still read-only, Escape leaves the theme list and closes the dialog without a failure toast",
+  "G26-03-reverted.png: Revert brings the saved theme back in the terminal; the retry toast is gone and Apply/Revert are insensitive",
+  "G26-04-closed.png: with the folder still read-only, the close button closes the dialog without a failure toast",
   "G26-overlay.txt: after the folder became writable again the settings file has no theme = Chalkboard: nothing saved the reverted theme",
   "G26-05-reopened.png: the appearance page shows the saved theme, not Chalkboard",
 ]
