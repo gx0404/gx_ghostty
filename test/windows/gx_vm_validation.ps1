@@ -24,6 +24,9 @@ param(
     [ValidateSet('Value','Subkey','Both')][string]$ForeignKind = 'Both',
     [string]$Installer,
     [string]$InstallerSha256,
+    # install: the package is an older release (upgrade source) that predates part of the current
+    # integration baseline; missing groups are recorded as OBSERVED instead of failing the phase.
+    [switch]$OldPackage,
     [string]$AppSha256,
     [string]$AppRoot,
     [switch]$Rehearsal,
@@ -1043,6 +1046,22 @@ function Assert-OwnedBaseline($Snapshot, [string]$Name) {
             }
         }
     }
+}
+
+function New-InstallResult($Installed, $Snapshot, [string]$AppSha, [bool]$AllowOld) {
+    # The registry snapshot is part of the evidence even when the baseline does not hold, so the
+    # comparison is recorded per group instead of throwing on the first difference.
+    $problems = New-Object System.Collections.Generic.List[object]
+    foreach ($name in $script:Keys.Keys) {
+        try { Assert-OwnedBaseline $Snapshot $name } catch { $problems.Add([ordered]@{ group=$name; problem=$_.Exception.Message }) }
+    }
+    $result = [ordered]@{ installer=$Installed; registry=$Snapshot; app_sha256=$AppSha; baseline_problems=$problems.ToArray() }
+    if ($problems.Count -gt 0) {
+        $groups = (@($problems | ForEach-Object { $_.group }) -join ', ')
+        if ($AllowOld) { $result.fixture_verdict = 'OBSERVED'; $result.fixture_reason = 'older package without the current baseline for: ' + $groups }
+        else { $result.fixture_verdict = 'FAIL'; $result.fixture_reason = 'integration baseline differs: ' + $groups }
+    }
+    return $result
 }
 
 function Foreign-Groups([bool]$BeforeInstall) {
@@ -3941,9 +3960,8 @@ try {
             $script:State.installed = $true
             $script:State.installer_history = @(@($script:State.installer_history) + $InstallerSha256.ToLowerInvariant())
             $snapshot = Registry-Snapshot
-            foreach ($name in $script:Keys.Keys) { Assert-OwnedBaseline $snapshot $name }
-            $report.result = @{ installer=$installed; registry=$snapshot;
-                                app_sha256=(Get-FileHash -LiteralPath (Join-Path $script:AppDir 'ghostty.exe') -Algorithm SHA256).Hash }
+            $appSha = (Get-FileHash -LiteralPath (Join-Path $script:AppDir 'ghostty.exe') -Algorithm SHA256).Hash
+            $report.result = New-InstallResult $installed $snapshot $appSha ($Phase -eq 'install' -and $OldPackage)
         }
         'seed-foreign-before' { $report.result = Seed-Foreign $true }
         'expect-install-refused' {

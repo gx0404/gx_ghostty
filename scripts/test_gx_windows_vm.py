@@ -858,6 +858,25 @@ ConvertTo-GxJson ([ordered]@{ ok=$ok; stuck=$stuck; switched=$switched; disabled
                                            "switch gx0404.GhosttyGX", "restore toast-notification-settings"])
         self.assertEqual(out["log"][-2:], ["set Enabled=0", "restore toast-notification-settings"])
 
+    def test_install_result_keeps_the_registry_and_names_each_baseline_difference(self):
+        body = r"""
+$script:Keys = [ordered]@{ AppPath='a'; ShellAumid='b'; ShellClsid='c' }
+# An older package (gx-v0.0.2) has no shell identity yet.
+function Assert-OwnedBaseline($Snapshot, $Name) { if (-not $Snapshot[$Name].exists) { throw "Integration group $Name is missing after installation." } }
+$old = @{ AppPath=@{ exists=$true }; ShellAumid=@{ exists=$false }; ShellClsid=@{ exists=$false } }
+$new = @{ AppPath=@{ exists=$true }; ShellAumid=@{ exists=$true }; ShellClsid=@{ exists=$true } }
+ConvertTo-GxJson ([ordered]@{ observed=(New-InstallResult @{ exit_code=0 } $old 'AB' $true); failed=(New-InstallResult @{ exit_code=0 } $old 'AB' $false);
+    passed=(New-InstallResult @{ exit_code=0 } $new 'CD' $false) }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "New-InstallResult"), ("LF", "JsonSource"))
+        self.assertEqual(out["observed"]["fixture_verdict"], "OBSERVED")
+        self.assertEqual([p["group"] for p in out["observed"]["baseline_problems"]], ["ShellAumid", "ShellClsid"])
+        self.assertIn("ShellAumid", out["observed"]["registry"])
+        self.assertEqual(out["failed"]["fixture_verdict"], "FAIL")
+        self.assertIn("ShellAumid, ShellClsid", out["failed"]["fixture_reason"])
+        self.assertNotIn("fixture_verdict", out["passed"])
+        self.assertEqual((out["passed"]["baseline_problems"], out["passed"]["app_sha256"]), ([], "CD"))
+
     def test_acl_comparison_ignores_only_the_auto_inherited_flags(self):
         base = "O:S-1-5-21-1-2-3-1001G:S-1-5-21-1-2-3-513D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;S-1-5-21-1-2-3-1001)"
         body = r"""
