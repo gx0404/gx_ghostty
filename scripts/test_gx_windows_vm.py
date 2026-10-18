@@ -857,6 +857,38 @@ ConvertTo-GxJson ([ordered]@{ dir=$markDir; argv=$argv; script_args=@($record.sc
         self.assertEqual((out["script_args"], out["last"], out["exit"]), ([expected], expected, 0))
         self.assertTrue(out["command_line"].endswith('"' + out["dir"] + '\\\\"'), out["command_line"])
 
+    def test_respond_when_shown_answers_each_new_confirmation_once(self):
+        body = r"""
+$script:RunRoot = $Work
+$PyRoot = 'brk'; $PyCase = 'BRK-04'; $PyWaitSeconds = 5
+$PyResponses = 'allow,broker-preview,0,-120,-30;cancel,protected-paste,0'
+[IO.Directory]::CreateDirectory((Join-Path $Work 'brk\cases\BRK-04')) | Out-Null
+[IO.File]::WriteAllText((Join-Path $Work 'brk\cases\BRK-04\report.json'), '{"target":{"pid":4242}}')
+$script:Windows = @(@{ hwnd='0x10a'; class='GhosttyGxPopup'; visible=$true; title='Paste into elevated terminal?' },
+                    @{ hwnd='0x20b'; class='#32770'; visible=$true; title='Warning' })
+function Get-PyPopups([int]$TargetPid, $Answered) { @($script:Windows | Where-Object { $Answered -notcontains [Convert]::ToInt64($_['hwnd'].Substring(2), 16) }) }
+$script:Calls = New-Object System.Collections.ArrayList
+function Invoke-PyFixtureProcess($Context, [string]$Arguments, [string]$Tag) {
+    [void]$script:Calls.Add($Arguments)
+    if ($Tag -ceq 'inspect') {
+        return [ordered]@{ verdict='PASS'; output=[pscustomobject]@{ popups=@([pscustomobject]@{ hwnd=0x10a; rect=@(100, 200, 500, 400) },
+            [pscustomobject]@{ hwnd=0x20b; rect=@(10, 20, 30, 40) }) } }
+    }
+    return [ordered]@{ verdict='PASS'; exit_code=0 }
+}
+$result = Invoke-PyRespondWhenShown $null
+ConvertTo-GxJson ([ordered]@{ verdict=$result.fixture_verdict; reason=$result.fixture_reason; calls=@($script:Calls); click=$result.steps[0].click }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Read-JsonFile", "Invoke-PyRespondWhenShown"), ("LF", "JsonSource"))
+        self.assertEqual(out["verdict"], "PASS", out)
+        self.assertEqual(out["click"], [380, 370])
+        calls = out["calls"]
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(calls[0].startswith("inspect ") and "--name BRK-04" in calls[0])
+        self.assertIn("--popup-hwnd 0x10a --decision allow --stage broker-preview --desktop-held --x 380 --y 370", calls[1])
+        self.assertIn("--popup-hwnd 0x20b --decision cancel --stage protected-paste", calls[3])
+        self.assertNotIn("--x", calls[3])
+
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""
 $result = [ordered]@{}

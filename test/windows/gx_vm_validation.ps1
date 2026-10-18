@@ -75,6 +75,12 @@ param(
     [ValidateSet('gx_drop_broker_fixture')][string]$PyFixture = 'gx_drop_broker_fixture',
     [ValidateLength(0,2048)][string]$PyArgs = '',
     [ValidateRange(10,1800)][int]$PyTimeoutSeconds = 300,
+    # py-fixture -Action respond-when-shown: the fixture root below the run, the case, and
+    # "decision,stage,delay_ms[,dx,dy]" entries separated by ';' (see Invoke-PyRespondWhenShown).
+    [ValidatePattern('^([A-Za-z0-9_-]{1,40})?$')][string]$PyRoot = '',
+    [ValidatePattern('^([A-Za-z0-9_-]{1,40})?$')][string]$PyCase = '',
+    [ValidatePattern('^((allow|cancel),(broker-preview|protected-paste),\d{1,5}(,-?\d{1,4},-?\d{1,4})?(;|$)){0,4}$')][string]$PyResponses = '',
+    [ValidateRange(5,300)][int]$PyWaitSeconds = 120,
     # Waits before the phase samples anything. Started minimized and non-activating
     # (cmd /c start "" /min cmd /c ...\gx-q.cmd <name>), a status step then records the
     # foreground the operator left instead of the console that ran it.
@@ -3509,7 +3515,8 @@ function Expand-PyArgs([string]$Text, [hashtable]$Values) {
     return $Text
 }
 
-function Invoke-PyFixture($Identity) {
+function Initialize-PyFixture($Identity) {
+    # Hash-checked interpreter and fixture tree, the ._pth that names the tree, and placeholder values.
     if (-not $ExportDir) { throw 'py-fixture runs through gx-run.cmd so the staged share is known.' }
     $share = Split-Path -Parent $ExportDir
     $spec = Get-PyFixtureSpec $Identity
@@ -3527,12 +3534,20 @@ function Invoke-PyFixture($Identity) {
     $values = @{ run=$script:RunRoot; app=$app; app_sha256=$null; ole=$tree.ole_source;
         ole_sha256=$(if ($tree.ole_source) { ([string]$spec.ole_source.sha256).ToLowerInvariant() } else { $null }) }
     if ($PyArgs -match '\{app(_sha256)?\}') { Assert-Hash $app $AppSha256; $values.app_sha256 = $AppSha256.ToLowerInvariant() }
-    $arguments = Expand-PyArgs $PyArgs $values
-    $commandLine = '-B -X utf8 "' + $fixture + '" ' + $arguments
-    $stdout = Join-Path $script:RunRoot ($script:Step + '-py.stdout.txt')
-    $stderr = Join-Path $script:RunRoot ($script:Step + '-py.stderr.txt')
+    return [ordered]@{ spec=$spec; python=$python; tree=$tree; fixture=$fixture; values=$values; runs=0;
+        started=[DateTime]::UtcNow; summary=[ordered]@{ fixture=$PyFixture; python=[ordered]@{ version=$spec.python.version;
+            sha256=$spec.python.sha256; dir=$python.dir; extracted=$python.extracted }; tree=$tree } }
+}
+
+function Invoke-PyFixtureProcess($Context, [string]$Arguments, [string]$Tag) {
+    # One fixture interpreter run with the caller's token; output files are exported as py-<tag>-N.
+    $Context.runs++
+    $name = $Tag + '-' + $Context.runs
+    $commandLine = '-B -X utf8 "' + $Context.fixture + '" ' + $Arguments
+    $stdout = Join-Path $script:RunRoot ($script:Step + '-py-' + $name + '.stdout.txt')
+    $stderr = Join-Path $script:RunRoot ($script:Step + '-py-' + $name + '.stderr.txt')
     $started = [DateTime]::UtcNow
-    $process = Start-Process -FilePath (Join-Path $python.dir 'python.exe') -ArgumentList $commandLine -WorkingDirectory $script:RunRoot `
+    $process = Start-Process -FilePath (Join-Path $Context.python.dir 'python.exe') -ArgumentList $commandLine -WorkingDirectory $script:RunRoot `
         -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $null = $process.Handle
     $timedOut = $false
@@ -3545,30 +3560,109 @@ function Invoke-PyFixture($Identity) {
         }
         $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
     } finally { $process.Dispose() }
-    $result = [ordered]@{ fixture=$PyFixture; python=[ordered]@{ version=$spec.python.version; sha256=$spec.python.sha256; dir=$python.dir; extracted=$python.extracted };
-        tree=$tree; command_line=$commandLine; exit_code=$exitCode; timed_out=$timedOut;
-        elapsed_seconds=[Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 1) }
     $out = if (Test-Path -LiteralPath $stdout) { @(Read-TextLines $stdout) } else { @() }
     $err = if (Test-Path -LiteralPath $stderr) { @(Read-TextLines $stderr) } else { @() }
-    Add-ExportFile $stdout 'py.stdout.txt'
-    Add-ExportFile $stderr 'py.stderr.txt'
-    $result.stdout_tail = @($out | Select-Object -Last 80)
-    $result.stderr_tail = @($err | Select-Object -Last 80)
+    Add-ExportFile $stdout ('py-' + $name + '.stdout.txt')
+    Add-ExportFile $stderr ('py-' + $name + '.stderr.txt')
+    $run = [ordered]@{ tag=$name; command_line=$commandLine; exit_code=$exitCode; timed_out=$timedOut; started_utc=$started.ToString('o');
+        elapsed_seconds=[Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 1);
+        stdout_tail=@($out | Select-Object -Last 80); stderr_tail=@($err | Select-Object -Last 80) }
     # The fixture prints one JSON document last; keep it parsed when it is there.
     $first = -1
     for ($i = 0; $i -lt $out.Count; $i++) { if ($out[$i] -ceq '{') { $first = $i } }
-    if ($first -ge 0) { try { $result.fixture_output = (($out[$first..($out.Count - 1)]) -join "`n") | ConvertFrom-Json } catch { $result.fixture_output_error = $_.Exception.Message } }
+    if ($first -ge 0) { try { $run.output = (($out[$first..($out.Count - 1)]) -join "`n") | ConvertFrom-Json } catch { $run.output_error = $_.Exception.Message } }
+    $run.verdict = if ($timedOut) { 'FAIL' } elseif ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 2) { 'PENDING' } else { 'FAIL' }
+    return $run
+}
+
+function Export-PyFixtureFiles($Context) {
     # Files the fixture wrote during this step (case reports, captures, reviews), flattened by path.
     $prefix = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
     $written = @(Get-ChildItem -LiteralPath $script:RunRoot -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -ge $started.AddSeconds(-2) -and $_.Length -le 8MB -and $_.FullName -ne $stdout -and $_.FullName -ne $stderr -and
+        Where-Object { $_.LastWriteTimeUtc -ge $Context.started.AddSeconds(-2) -and $_.Length -le 8MB -and $_.Name -notlike ($script:Step + '-py-*') -and
             -not $_.FullName.StartsWith($prefix + 'records\', [StringComparison]::OrdinalIgnoreCase) } | Sort-Object FullName | Select-Object -First 200)
-    $result.written = @($written | ForEach-Object {
+    return @($written | ForEach-Object {
         $relative = $_.FullName.Substring($prefix.Length)
         Add-ExportFile $_.FullName ('py-' + $relative)
         [ordered]@{ path=$relative; size=$_.Length; sha256=(Get-Sha256 $_.FullName) } })
-    $result.fixture_verdict = if ($timedOut) { 'FAIL' } elseif ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 2) { 'PENDING' } else { 'FAIL' }
-    $result.fixture_reason = if ($timedOut) { "the fixture did not finish within $PyTimeoutSeconds s" } elseif ($exitCode -eq 0) { $null } elseif ($exitCode -eq 2) { 'the fixture reported PENDING (exit 2)' } else { "the fixture exited $exitCode" }
+}
+
+function Get-PyPopups([int]$TargetPid, $Answered) {
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    return @([GxVmWindows]::TopLevel($TargetPid) | Where-Object { $_['visible'] -and ($_['class'] -ceq 'GhosttyGxPopup' -or $_['class'] -ceq '#32770') -and
+        $Answered -notcontains [Convert]::ToInt64($_['hwnd'].Substring(2), 16) })
+}
+
+function Invoke-PyRespondWhenShown($Context) {
+    # Broker confirmations have a 30 s lifetime, too short for a person to read an inspect capture
+    # and type a response. Each -PyResponses entry "decision,stage,delay_ms[,dx,dy]" waits for a new
+    # GhosttyGxPopup/#32770 of the case's target process, runs the fixture's inspect (captures),
+    # then its respond on that HWND. delay_ms counts from when the popup was first seen; allow
+    # clicks at the popup's left/top plus dx/dy (negative: from right/bottom), offsets read from an
+    # earlier reviewed capture of the same dialog. The fixture's own respond guards still apply.
+    if ($PyCase -notmatch '^[A-Za-z0-9_-]{1,40}$' -or $PyRoot -notmatch '^[A-Za-z0-9_-]{1,40}$') { throw 'respond-when-shown needs -PyRoot and -PyCase.' }
+    $root = Join-Path $script:RunRoot $PyRoot
+    $reportPath = Join-Path $root ('cases\' + $PyCase + '\report.json')
+    $answered = New-Object System.Collections.Generic.List[long]
+    $steps = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $PyResponses.Split(';')) {
+        $parts = $entry.Split(',')
+        $step = [ordered]@{ decision=$parts[0]; stage=$parts[1]; delay_ms=[int]$parts[2]; offset=$(if ($parts.Count -ge 5) { @([int]$parts[3], [int]$parts[4]) } else { $null }) }
+        $steps.Add($step)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $seen = $null
+        while ($clock.Elapsed.TotalSeconds -lt $PyWaitSeconds) {
+            if (Test-Path -LiteralPath $reportPath) {
+                # The drop step may still be writing its report; read it again on the next pass.
+                $targetPid = try { [int](Read-JsonFile $reportPath).target.pid } catch { 0 }
+                $seen = @(if ($targetPid -gt 0) { Get-PyPopups $targetPid $answered | Select-Object -First 1 })
+                if ($seen.Count -gt 0) { $seen = $seen[0]; break } else { $seen = $null }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($null -eq $seen) { $step.outcome = "no new confirmation within $PyWaitSeconds s"; break }
+        $detected = [Diagnostics.Stopwatch]::StartNew()
+        $step.seen = $seen
+        $step.seen_after_seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 2)
+        $inspect = Invoke-PyFixtureProcess $Context ('inspect --root "' + $root + '" --name ' + $PyCase + ' --desktop-held') 'inspect'
+        $step.inspect = $inspect
+        $hwnd = [Convert]::ToInt64($seen['hwnd'].Substring(2), 16)
+        $listed = @(if ($inspect.Contains('output')) { @($inspect.output.popups) | Where-Object { [long]$_.hwnd -eq $hwnd } })
+        if ($listed.Count -ne 1) { $step.outcome = 'inspect did not list the confirmation that was seen'; break }
+        $rect = @($listed[0].rect)
+        $arguments = 'respond --root "' + $root + '" --name ' + $PyCase + (' --popup-hwnd 0x{0:x}' -f $hwnd) + ' --decision ' + $step.decision + ' --stage ' + $step.stage + ' --desktop-held'
+        if ($step.decision -ceq 'allow') {
+            if ($null -eq $step.offset) { $step.outcome = 'allow needs reviewed dx,dy offsets'; break }
+            $x = if ($step.offset[0] -lt 0) { [int]$rect[2] + $step.offset[0] } else { [int]$rect[0] + $step.offset[0] }
+            $y = if ($step.offset[1] -lt 0) { [int]$rect[3] + $step.offset[1] } else { [int]$rect[1] + $step.offset[1] }
+            $arguments += ' --x ' + $x + ' --y ' + $y
+            $step.click = @($x, $y)
+        }
+        $remaining = [Math]::Max(0, $step.delay_ms - [int]$detected.ElapsedMilliseconds)
+        if ($remaining -gt 0) { $arguments += ' --delay-ms ' + $remaining }
+        $step.delay_passed_ms = $remaining
+        $respond = Invoke-PyFixtureProcess $Context $arguments 'respond'
+        $step.respond = $respond
+        $step.outcome = 'responded (exit ' + $respond.exit_code + ')'
+        $answered.Add($hwnd)
+        if ($respond.verdict -cne 'PASS') { break }
+    }
+    $failed = @($steps | Where-Object { -not $_.Contains('respond') -or $_.respond.verdict -cne 'PASS' })
+    return [ordered]@{ root=$root; case=$PyCase; steps=$steps.ToArray(); fixture_verdict=$(if ($failed.Count -eq 0) { 'PASS' } else { 'FAIL' });
+        fixture_reason=$(if ($failed.Count -eq 0) { $null } else { 'response steps that did not pass: ' + (@($failed | ForEach-Object { $_.decision + '@' + $_.stage + ': ' + $_.outcome }) -join '; ') }) }
+}
+
+function Invoke-PyFixture($Identity) {
+    $step = Assert-Action @('run','respond-when-shown') 'run'
+    $context = Initialize-PyFixture $Identity
+    if ($step -ceq 'respond-when-shown') { $result = Invoke-PyRespondWhenShown $context }
+    else {
+        $run = Invoke-PyFixtureProcess $context (Expand-PyArgs $PyArgs $context.values) 'run'
+        $result = [ordered]@{ run=$run; fixture_verdict=$run.verdict;
+            fixture_reason=$(if ($run.verdict -ceq 'PASS') { $null } elseif ($run.timed_out) { "the fixture did not finish within $PyTimeoutSeconds s" } else { 'the fixture exited ' + $run.exit_code }) }
+    }
+    foreach ($key in @($context.summary.Keys)) { $result[$key] = $context.summary[$key] }
+    $result.written = @(Export-PyFixtureFiles $context)
     return $result
 }
 
