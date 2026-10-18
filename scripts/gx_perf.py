@@ -34,6 +34,9 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON.
   quiet-batch --out DIR [--timeout S] [--injected-input | --input-observe-only] [--strict-blacklist]
         -- COMMAND [ARGS...]
+        A reviewed external C1 task package additionally requires --frozen-collector MANIFEST
+        --frozen-collector-sha256 SHA256. Exact cwd/argv/files and fresh outputs are checked again
+        inside the quiet lease; the child receives verified code bytes, not reopened script paths.
         --input-observe-only allowlists direct gx_perf.py gtk / just perf gtk and gx_wsl.py /
         just wsl smoke or scenario only; wrappers, run and unknown commands are rejected before locking.
         Allowed just recipes become direct Python argv using scripts/ in the measurement cwd;
@@ -77,6 +80,7 @@ Times are reported in milliseconds; metrics without a unit are counts. p90 is th
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import hashlib
 import json
@@ -487,8 +491,9 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
         unit = old.units.get(name, new.units.get(name, ""))
         left = {**stats(old.values[name], old.units[name]), 'unit': old.units[name]} if old.values.get(name) else None
         right = {**stats(new.values[name], new.units[name]), 'unit': new.units[name]} if new.values.get(name) else None
-        comparable = bool(left and right and left['unit'] == right['unit'])
-        entry: dict = {"unit": unit if comparable else None, a: left, b: right, 'comparable': comparable}
+        comparison = metric_comparability(old, new, name)
+        comparable = comparison['comparable']
+        entry: dict = {"unit": unit if comparable else None, a: left, b: right, **comparison}
         cells = []
         for side in (left, right):
             cells += [f"{side['n']:>6}", f"{fmt(side['median'], side['unit']):>10}", f"{fmt(side['p90'], side['unit']):>10}"] if side \
@@ -503,32 +508,74 @@ def compare_table(old: Samples, new: Samples, labels: tuple[str, str] = ("old", 
             cells += [f"{'-':>10}", f"{'-':>7}"]
         report[name] = entry
         cells += [f"{fmt(side['sum'], '') if side and not side['unit'] else '-':>10}" for side in (left, right)]
-        display_unit = unit if not left or not right or comparable else f"{left['unit'] or 'count'}/{right['unit'] or 'count'}"
+        display_unit = unit if not left or not right or left['unit'] == right['unit'] else f"{left['unit'] or 'count'}/{right['unit'] or 'count'}"
         rows.append(f"{name:<34} {display_unit:<4} " + " ".join(cells))
     return "\n".join(rows) + "\n", report
 
 
+def metric_comparability(old: Samples, new: Samples, name: str) -> dict:
+    """Describe coverage without inventing samples or evaluating a benefit."""
+    left, right = old.values.get(name, []), new.values.get(name, [])
+    reasons = []
+    if not left or not right:
+        reasons.append('metric missing on one side')
+    if left and right and old.units.get(name) != new.units.get(name):
+        reasons.append('time/count unit conflict')
+    if left and right and len(left) != len(right):
+        reasons.append(f'sample counts differ ({len(left)} vs {len(right)})')
+    return {'comparable': not reasons, 'reasons': reasons}
+
+
+def gtk_sample_errors(samples: Samples, runs: int) -> list[str]:
+    """Only the five core metrics are required in every planned run.
+
+    Other CPU groups describe the comm values actually captured at the endpoints.
+    A missing group is unknown, not a zero; a present group still needs valid time
+    samples. The cross-arm equal-n rule is enforced by comparison_errors.
+    """
+    errors = []
+    for name in sorted(set(GTK_REQUIRED) | {n for n in samples.values if n.startswith('cpu.')}):
+        values = samples.values.get(name, [])
+        if name in GTK_REQUIRED and (not values or len(values) != runs):
+            errors.append(f'{name}: requires {runs} time samples, got {len(values)}')
+        if values and (samples.units.get(name) != 'ms' or any(not math.isfinite(v) or v < 0 for v in values)):
+            errors.append(f'{name}: invalid time unit or non-finite/negative sample')
+    return errors
+
+
+def metric_coverage(samples: Samples, planned: int | None = None, names: Iterable[str] = ()) -> dict:
+    return {name: {'n': len(samples.values.get(name, [])), 'unit': samples.units.get(name),
+                   'role': 'required' if name in GTK_REQUIRED else 'captured_cpu_group' if name.startswith('cpu.') else 'optional',
+                   'planned_runs': planned, 'availability': 'observed' if samples.values.get(name) else 'unknown'}
+            for name in sorted(set(samples.values) | set(names))}
+
+
 def comparison_errors(old: Samples, new: Samples, gtk: bool = False, runs: int | None = None) -> list[str]:
     errors = []
-    if gtk or any(name.startswith("cpu.") for name in set(old.values) | set(new.values)):
+    verified_gtk = gtk or bool(old.gtk_runs or new.gtk_runs)
+    if verified_gtk or any(name.startswith("cpu.") for name in set(old.values) | set(new.values)):
         for side, samples in (("old", old), ("new", new)):
-            for name in GTK_REQUIRED:
-                values = samples.values.get(name, [])
-                expected = runs if runs is not None else len(samples.values.get("cpu.main", []))
-                if not values or len(values) != expected or samples.units.get(name) != "ms" or any(value < 0 for value in values):
-                    errors.append(f"{side} {name}: requires {expected} time samples, got {len(values)}")
+            expected = runs if runs is not None else len(samples.values.get("cpu.main", []))
+            errors.extend(f'{side} {error}' for error in gtk_sample_errors(samples, expected))
     for name in sorted(set(old.values) | set(new.values)):
-        if not old.values.get(name) or not new.values.get(name):
-            if gtk:
+        left, right = old.values.get(name, []), new.values.get(name, [])
+        if left and right and old.units.get(name) != new.units.get(name):
+            errors.append(f'{name}: time/count unit conflict')
+        if verified_gtk and name not in GTK_REQUIRED and not (name.startswith('cpu.') and left and right):
+            continue
+        if not left or not right:
+            if verified_gtk:
                 errors.append(f"{name}: metric missing on one side")
-        elif len(old.values[name]) != len(new.values[name]):
-            errors.append(f"{name}: sample counts differ ({len(old.values[name])} vs {len(new.values[name])})")
+        elif len(left) != len(right):
+            errors.append(f"{name}: sample counts differ ({len(left)} vs {len(right)})")
     return errors
 
 
 def validation(samples: Sequence[Samples]) -> dict:
     return {"status": "valid", "identity": "unverified" if any(s.unverified for s in samples) else "verified",
             "verified_gtk_runs": [len(s.gtk_runs) for s in samples],
+            "metric_coverage": [metric_coverage(s) for s in samples],
+            "optional_metrics_complete": "not asserted; unknown/missing sides remain absent, never synthesized as zero",
             "cpu_contract": "process/endpoint quantized ticks; residual bounds diagnostic-only and unproved" if any(s.gtk_runs for s in samples) else "unverified",
             "unverified_files": sorted(set().union(*(s.unverified for s in samples)))}
 
@@ -1087,7 +1134,8 @@ def batch_preflight(args, probe) -> dict:
 BATCH_GUIDANCE = {
     'VALID': 'Quiet criteria met at the start and end checks and the command completed; '
              'the measurement RESULT/SUMMARY carries the performance verdict.',
-    'FAIL': 'Quiet criteria met at the start and end checks; the command reported an absolute gate FAIL (exit 4). '
+    'FAIL': 'Quiet criteria met at the start and end checks; the command reported a gate FAIL (exit 4). '
+            'For the pinned C1 entry this means shared CPU sample counts differ: INSUFFICIENT, not a performance regression. '
             'Keep it as FAIL evidence; never rerun to replace it.',
     'INVALID': 'A quiet criterion was not met at the end check: the whole batch is INVALID. '
                'Originals are retained; rerun on another day in a new directory.',
@@ -1105,6 +1153,144 @@ BATCH_GUIDANCE = {
 
 
 WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem', 'win32-c7', 'win32-c6')
+
+
+FROZEN_C1_CONTRACT = {
+    'runs_per_arm': 10, 'order': 'AB/BA', 'workload': 'seq 1 3000000', 'tail_seconds': 1, 'poll_ms': 50,
+    'env': ['GHOSTTY_GX_PERF=1', 'GHOSTTY_GX_PIPELINE_STATS=1', 'GSK_RENDERER=cairo'],
+}
+FROZEN_C1_FILES = ('adapter', 'gx_perf.py', 'gx_wsl.py', 'test_gx_perf.py', 'test_gx_wsl.py')
+
+# Only this fixed bootstrap is executed, with the verified bytes on stdin. The
+# child does not reopen the adapter/modules after the lease-time hash check.
+FROZEN_COLLECTOR_BOOTSTRAP = '''import base64, json, sys
+from importlib.machinery import BuiltinImporter, FrozenImporter, PathFinder
+from pathlib import Path
+
+if not (sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode):
+    raise RuntimeError('frozen collector requires -I -S -B')
+# Snapshot only the interpreter's isolated, no-site search path. Never consult
+# task sys.path additions. Bound application modules are installed from payload
+# bytes by the reviewed adapter; all other imports must belong to the stdlib.
+stdlib_paths = tuple(sys.path)
+stdlib_roots = tuple(Path(value).resolve() for value in stdlib_paths)
+stdlib_names = frozenset(sys.stdlib_module_names)
+
+def trusted_path(value):
+    path = Path(value).resolve()
+    return (not {'site-packages', 'dist-packages'}.intersection(path.parts) and
+            any(path.is_relative_to(root) for root in stdlib_roots))
+
+class StdlibOnly:
+    @staticmethod
+    def find_spec(fullname, path=None, target=None):
+        if fullname.partition('.')[0] not in stdlib_names:
+            raise ImportError('unbound frozen collector import: ' + fullname)
+        search = stdlib_paths if path is None else tuple(path)
+        if not all(trusted_path(value) for value in search):
+            raise ImportError('untrusted frozen collector package path: ' + fullname)
+        spec = PathFinder.find_spec(fullname, search, target)
+        if spec is None:
+            # Keep optional platform probes (e.g. subprocess importing msvcrt
+            # on POSIX) compatible with normal import failure semantics.
+            raise ModuleNotFoundError('stdlib module unavailable: ' + fullname, name=fullname)
+        if not spec.origin or not trusted_path(spec.origin):
+            raise ImportError('untrusted frozen collector module origin: ' + fullname)
+        return spec
+
+sys.meta_path[:] = [BuiltinImporter, FrozenImporter, StdlibOnly]
+payload = json.load(sys.stdin)
+payload['files'] = {name: base64.b64decode(raw, validate=True) for name, raw in payload['files'].items()}
+entry = payload['manifest']['files']['adapter']['path']
+namespace = {'__name__': '__frozen_collector__', '__file__': entry}
+exec(compile(payload['files']['adapter'], entry, 'exec'), namespace)
+raise SystemExit(namespace['main'](payload))
+'''
+
+
+def frozen_collector_binding(args, command: Sequence[str]) -> dict:
+    """Validate an explicitly reviewed C1 task manifest; return captured bytes.
+
+    No host paths or Git objects are built in. The CLI manifest SHA is a separate
+    trust anchor selected after review, not a hash supplied by the manifest itself.
+    Call again inside the quiet lease immediately before dispatch. A content hash
+    binds identity; it is not a substitute for review of the external adapter.
+    """
+    if args.json is not None:
+        raise PerfError('frozen collector: outer --json is forbidden')
+    def exact_path(value):
+        if not isinstance(value, str) or not value:
+            raise PerfError('frozen collector: missing path')
+        path = Path(value)
+        if not path.is_absolute() or path.is_symlink() or path.resolve() != path.absolute():
+            raise PerfError(f'frozen collector: relative or redirected path: {value}')
+        return path
+
+    def checked_bytes(path, expected):
+        if not isinstance(expected, str) or not re.fullmatch('[0-9a-f]{64}', expected):
+            raise PerfError('frozen collector: missing complete SHA256')
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise PerfError(f'frozen collector: SHA256 mismatch: {path}')
+        return raw
+
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise PerfError(f'frozen collector: duplicate manifest key: {key}')
+            result[key] = value
+        return result
+
+    manifest_path = exact_path(str(args.frozen_collector))
+    raw = checked_bytes(manifest_path, args.frozen_collector_sha256)
+    data = json.loads(raw, object_pairs_hook=unique_keys)
+    keys = {'schema', 'cwd', 'argv', 'files', 'contract', 'builds', 'distro'}
+    if not isinstance(data, dict) or set(data) != keys or data['schema'] != 'gx-c1-frozen-collector-v3':
+        raise PerfError('frozen collector: unknown manifest schema/fields')
+    if not isinstance(data['distro'], str) or not data['distro'] or args.distro != data['distro']:
+        raise PerfError('frozen collector: outer distro differs from reviewed manifest')
+    cwd = exact_path(data['cwd'])
+    if not cwd.is_dir() or Path.cwd().resolve() != cwd:
+        raise PerfError('frozen collector: measurement cwd mismatch')
+    if data['contract'] != FROZEN_C1_CONTRACT or not isinstance(data['builds'], dict) or set(data['builds']) != {'base', 'gate', 'combined'}:
+        raise PerfError('frozen collector: C1 contract or frozen builds missing')
+    files = data['files']
+    if not isinstance(files, dict) or set(files) != set(FROZEN_C1_FILES):
+        raise PerfError('frozen collector: incomplete file manifest')
+    buffers = {}
+    for name in FROZEN_C1_FILES:
+        item = files[name]
+        if not isinstance(item, dict) or set(item) != {'path', 'sha256'}:
+            raise PerfError('frozen collector: malformed file identity')
+        path = exact_path(item['path'])
+        if name != 'adapter' and path != cwd / 'scripts' / name:
+            raise PerfError('frozen collector: wrapper/module location mismatch')
+        buffers[name] = checked_bytes(path, item['sha256'])
+    argv = data['argv']
+    if not isinstance(argv, list) or not all(isinstance(v, str) for v in argv) or list(command) != argv or len(argv) != 9:
+        raise PerfError('frozen collector: argv differs from reviewed manifest')
+    if argv[:3] != [sys.executable, files['adapter']['path'], 'gtk'] or sorted(argv[3::2]) != ['--json', '--out', '--pair']:
+        raise PerfError('frozen collector: only the pinned direct Python C1 invocation is allowed')
+    options = dict(zip(argv[3::2], argv[4::2]))
+    if options['--pair'] not in ('base-vs-gate', 'gate-vs-combined'):
+        raise PerfError('frozen collector: unknown pair')
+    out, report = exact_path(options['--out']), exact_path(options['--json'])
+    batch_out = exact_path(str(args.out))
+    if out != batch_out / 'measure' or report != batch_out / 'measurement-result.json':
+        raise PerfError('frozen collector: outputs differ from owned quiet batch')
+    for path in (out, report, batch_out / 'collector-identity.json', batch_out / 'collector-outcome.json'):
+        exact_path(str(path))
+        if path.exists():
+            raise PerfError(f'frozen collector: output must be fresh: {path}')
+    payload = json.dumps({'manifest': data, 'manifest_sha256': args.frozen_collector_sha256,
+                          'files': {name: base64.b64encode(content).decode('ascii') for name, content in buffers.items()}},
+                         allow_nan=False).encode('utf-8')
+    return {'payload': payload, 'argv': [sys.executable, '-I', '-S', '-B', '-c', FROZEN_COLLECTOR_BOOTSTRAP],
+            'evidence': {'manifest_path': str(manifest_path), 'manifest_sha256': args.frozen_collector_sha256,
+                         'files': files, 'cwd': str(cwd), 'distro': data['distro'], 'requested_argv': argv,
+                         'payload_sha256': hashlib.sha256(payload).hexdigest(),
+                         'bootstrap_sha256': hashlib.sha256(FROZEN_COLLECTOR_BOOTSTRAP.encode()).hexdigest()}}
 
 
 def gate_exit_contract(command: Sequence[str]) -> bool:
@@ -1297,12 +1483,19 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     if not command or not math.isfinite(args.timeout) or args.timeout < 0 or not math.isfinite(args.idle_seconds) or args.idle_seconds < 0:
         raise PerfError('quiet-batch requires a command and finite nonnegative timeout/idle threshold')
     observe_input = bool(getattr(args, 'input_observe_only', False))
+    frozen = bool(getattr(args, 'frozen_collector', None))
+    if frozen != bool(getattr(args, 'frozen_collector_sha256', None)):
+        raise PerfError('--frozen-collector and its explicit SHA256 are both required')
+    if frozen and not observe_input:
+        raise PerfError('--frozen-collector requires --input-observe-only')
     if observe_input and args.injected_input:
         raise PerfError('--input-observe-only and --injected-input are mutually exclusive')
     requested_command = list(command)
-    if observe_input:
+    if frozen:
+        frozen_collector_binding(args, command)  # fail fast only; never reuse this authorization after waiting
+    elif observe_input:
         command = normalize_observe_command(command)
-    if observe_input and desktop_command(command):
+    if observe_input and not frozen and desktop_command(command):
         raise PerfError('--input-observe-only requires a direct gx_perf gtk or gx_wsl smoke/scenario command '
                         '(including just perf/just wsl); this command drives the Windows desktop or is not '
                         'allowlisted: run it without --input-observe-only')
@@ -1316,7 +1509,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
               'status': 'NOT_STARTED', 'exit': 2,
               'quiet_status': 'NOT_CHECKED', 'quiet_valid': False, 'measurement': 'NOT_RUN', 'command_exit': None,
               'plan_compliant': False, 'thresholds_plan_compliant': thresholds_plan_compliant(args),
-              'gate_exit_contract': gate_exit_contract(command),
+              'gate_exit_contract': frozen or gate_exit_contract(command),
               'failure_cause': None, 'started_ns': None, 'ended_ns': None, 'errors': []}
     before = after = None
     write_json(out / 'RESULT.json', result)
@@ -1339,9 +1532,15 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                 write_json(out / 'RESULT.json', result)
                 raised = False
                 try:
+                    binding = frozen_collector_binding(args, command) if frozen else None
+                    if binding:
+                        result['frozen_collector'] = binding['evidence']
+                        write_json(out / 'RESULT.json', result)
                     with (out / 'command.log').open('w', encoding='utf-8', newline='\n') as log:
                         runner = execute or subprocess.run
-                        child = runner(command, env=environment, stdout=log, stderr=subprocess.STDOUT, shell=False)
+                        child = (runner(binding['argv'], input=binding['payload'], cwd=Path.cwd(),
+                                        env=environment, stdout=log, stderr=subprocess.STDOUT, shell=False)
+                                 if binding else runner(command, env=environment, stdout=log, stderr=subprocess.STDOUT, shell=False))
                         result['command_exit'] = child.returncode
                 except (Exception, KeyboardInterrupt) as exc:
                     raised = True
@@ -3123,20 +3322,22 @@ def report_gtk_runs(out: Path, batch: dict, json_path: Path | None) -> int:
             errors.append(f"{item['label']} run {item['run']}: {exc}")
     ordered = [sets[label] for label in batch["labels"]]
     for label, samples in sets.items():
-        for name in GTK_REQUIRED:
-            if len(samples.values.get(name, [])) != batch["planned_runs"]:
-                errors.append(f"{label} {name}: {len(samples.values.get(name, []))}/{batch['planned_runs']} planned samples")
+        errors.extend(f'{label} {error}' for error in gtk_sample_errors(samples, batch['planned_runs']))
     if len(ordered) == 2:
         errors.extend(comparison_errors(*ordered, gtk=True, runs=batch["planned_runs"]))
     batch["valid"] = not errors
     batch["errors"] = errors
     batch["valid_runs"] = {label: len(samples.gtk_runs) for label, samples in sets.items()}
     write_json(out / "gtk-runs.json", batch)
+    names = set(GTK_REQUIRED).union(*(s.values for s in ordered))
     result = {"validation": {"status": "rejected" if errors else "valid",
                              "identity": "verified" if all(len(s.gtk_runs) == batch["planned_runs"] for s in ordered) else "incomplete",
                              "renderer_path": "unknown", "performance_verdict": "not evaluated",
                              "cpu_contract": "quantized process/endpoint ticks; residual bounds diagnostic-only and unproved",
-                             "planned_runs": batch["planned_runs"], "valid_runs": batch["valid_runs"], "errors": errors}}
+                             "planned_runs": batch["planned_runs"], "valid_runs": batch["valid_runs"], "errors": errors,
+                             "metric_coverage": {label: metric_coverage(s, batch['planned_runs'], names) for label, s in sets.items()},
+                             "metric_comparability": {name: metric_comparability(*ordered, name) for name in sorted(names)} if len(ordered) == 2 else {},
+                             "optional_metrics_complete": "not asserted; unknown/missing sides remain absent, never synthesized as zero"}}
     if errors:
         text = "GTK comparison rejected; no performance verdict.\n" + "\n".join(errors) + "\n"
     else:
@@ -3241,6 +3442,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help='make the blacklist a gate again (the criteria before the r6 13:20 user ruling)')
     batch.add_argument('--observe', action='append', help='add name/title substrings recorded as other programs, never a gate')
     batch.add_argument('--timeout', type=float, default=0)
+    batch.add_argument('--frozen-collector', type=Path, help='explicit reviewed external C1 manifest (no implicit wrapper exemption)')
+    batch.add_argument('--frozen-collector-sha256', help='full manifest SHA256 selected by the reviewer; rechecked inside the lease')
     input_mode = batch.add_mutually_exclusive_group()
     input_mode.add_argument('--injected-input', action='store_true',
                             help='the command may send input through gx_win_gui (all win32-* drivers): judge input by the '
@@ -3300,6 +3503,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 2
+    # Reject this output before entering the generic error-reporting handler:
+    # even a rejection report must not overwrite a frozen batch's evidence.
+    if (args.command == 'quiet-batch' and args.json is not None and
+            (args.frozen_collector is not None or args.frozen_collector_sha256 is not None)):
+        print(f"{TAG} error: frozen collector forbids outer --json", file=sys.stderr)
+        return 2
     try:
         if args.command == "quiet":
             return run_quiet(args)

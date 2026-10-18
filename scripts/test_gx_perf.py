@@ -41,10 +41,13 @@ def windows_data(*rows) -> dict:
     return {'inventory_pid': None, 'cim': cim, 'processes': processes}
 
 
-def gtk_fixture(root: Path) -> dict:
+def gtk_fixture(root: Path, thread_comm: str | None = None) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     before = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0), stat_line(11, "renderer", 0, 0, 0, 0)))
     after = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0), stat_line(11, "renderer", 0, 0, 100, 0)))
+    if thread_comm is not None:
+        before += "\n" + stat_line(12, thread_comm, 0, 0, 0, 0)
+        after += "\n" + stat_line(12, thread_comm, 0, 0, 0, 0)
     times = "pid 10\nwindow_seconds 1\nworkload_seconds 1\nworkload_finished 1\nrun_exit 0\n"
     program = {"__name__": "test_gtk_fixture"}
     exec(gx_wsl.PERF_PROGRAM, program)
@@ -2088,6 +2091,405 @@ class CommandTests(unittest.TestCase):
             (root / "perf-meta.json").write_text(json.dumps(meta), encoding="utf-8")
             with self.subTest(field=key), self.assertRaises(gx_perf.PerfError):
                 gx_perf.collect([root])
+
+
+class FrozenCollectorTests(unittest.TestCase):
+    """Portable fixtures: no Git objects, frozen checkout, WSL or host paths."""
+    setUp = QuietTests.setUp
+    batch_args = QuietBatchTests.batch_args
+    run_batch = QuietBatchTests.run_batch
+
+    def fixture(self):
+        import copy
+        root = self.args.out.parent.resolve()
+        cwd = root / 'frozen'
+        (cwd / 'scripts').mkdir(parents=True)
+        entry = root / 'task-adapter.py'
+        entry.write_text('def main(payload):\n    print("BOUND_ORIGINAL")\n    return 0\n', encoding='utf-8')
+        files = {'adapter': {'path': str(entry), 'sha256': gx_perf.hashlib.sha256(entry.read_bytes()).hexdigest()}}
+        for name in gx_perf.FROZEN_C1_FILES[1:]:
+            path = cwd / 'scripts' / name
+            path.write_text('# synthetic frozen file\n', encoding='utf-8')
+            files[name] = {'path': str(path), 'sha256': gx_perf.hashlib.sha256(path.read_bytes()).hexdigest()}
+        command = [sys.executable, str(entry), 'gtk', '--pair', 'base-vs-gate', '--out', str(self.args.out / 'measure'),
+                   '--json', str(self.args.out / 'measurement-result.json')]
+        manifest = {'schema': 'gx-c1-frozen-collector-v3', 'distro': 'Ubuntu-24.04', 'cwd': str(cwd), 'argv': command, 'files': files,
+                    'contract': copy.deepcopy(gx_perf.FROZEN_C1_CONTRACT), 'builds': {label: {} for label in ('base', 'gate', 'combined')}}
+        path = root / 'manifest.json'
+        gx_perf.write_json(path, manifest)
+        digest = gx_perf.hashlib.sha256(path.read_bytes()).hexdigest()
+        args = self.batch_args('--input-observe-only', '--frozen-collector', str(path), '--frozen-collector-sha256', digest,
+                               command=command)
+        return args, manifest, entry, cwd
+
+    def test_explicit_manifest_binds_cwd_argv_hash_units_and_outputs(self):
+        import copy
+        args, manifest, entry, cwd = self.fixture()
+        command = manifest['argv']
+        with mock.patch.object(Path, 'cwd', return_value=cwd):
+            binding = gx_perf.frozen_collector_binding(args, command)
+        self.assertEqual(command, binding['evidence']['requested_argv'])
+        self.assertIn(b'"adapter"', binding['payload'])
+        self.assertTrue(gx_perf.desktop_command(command), 'unflagged external entry is not a basename exemption')
+        self.assertFalse(gx_perf.gate_exit_contract(command))
+        with self.assertRaisesRegex(gx_perf.PerfError, 'cwd'):
+            gx_perf.frozen_collector_binding(args, command)
+        for change in ('hash', 'duplicate', 'unknown', 'argv', 'count', 'module_location', 'missing_module', 'distro_missing', 'distro_empty', 'fresh'):
+            data = copy.deepcopy(manifest)
+            request = command[:]
+            if change == 'unknown':
+                data['unknown'] = True
+            elif change == 'argv':
+                request[-1] = 'different'
+            elif change == 'count':
+                data['contract']['runs_per_arm'] = 1
+            elif change == 'module_location':
+                data['files']['gx_wsl.py']['path'] = str(entry)
+            elif change == 'missing_module':
+                del data['files']['test_gx_perf.py']
+            elif change == 'distro_missing':
+                del data['distro']
+            elif change == 'distro_empty':
+                data['distro'] = ''
+            elif change == 'fresh':
+                (args.out / 'measure').mkdir(parents=True)
+            text = json.dumps(data)
+            if change == 'duplicate':
+                text = text[:-1] + ', "cwd": ' + json.dumps(str(cwd)) + '}'
+            args.frozen_collector.write_text(text, encoding='utf-8')
+            args.frozen_collector_sha256 = '0' * 64 if change == 'hash' else gx_perf.hashlib.sha256(args.frozen_collector.read_bytes()).hexdigest()
+            with self.subTest(change=change), mock.patch.object(Path, 'cwd', return_value=cwd), self.assertRaises(gx_perf.PerfError):
+                gx_perf.frozen_collector_binding(args, request)
+
+    def test_pin_mode_does_not_admit_wrappers_options_or_naked_adapter(self):
+        args, data, _, cwd = self.fixture()
+        for command in ([sys.executable, '-m', 'wrapper', *data['argv'][2:]],
+                        ['bash', *data['argv']], ['python', *data['argv'][1:]],
+                        [*data['argv'], '--runs', '1']):
+            data['argv'] = command
+            gx_perf.write_json(args.frozen_collector, data)
+            args.frozen_collector_sha256 = gx_perf.hashlib.sha256(args.frozen_collector.read_bytes()).hexdigest()
+            with self.subTest(command=command), mock.patch.object(Path, 'cwd', return_value=cwd), self.assertRaises(gx_perf.PerfError):
+                gx_perf.frozen_collector_binding(args, command)
+        args.input_observe_only = False
+        with self.assertRaisesRegex(gx_perf.PerfError, 'requires --input-observe-only'):
+            gx_perf.run_quiet_batch(args, self.probe, mock.Mock())
+
+    def test_outer_json_is_rejected_before_any_output_or_dispatch(self):
+        args, data, _, cwd = self.fixture()
+        historical = args.out.parent / 'historical-result.json'
+        historical.write_bytes(b'original evidence\n')
+        for target in (historical, args.out / 'collector-identity.json',
+                       args.out / 'measurement-result.json', args.out / 'collector-outcome.json',
+                       args.out / 'RESULT.json'):
+            args.json = target
+            runner = mock.Mock()
+            with self.subTest(target=target), mock.patch.object(Path, 'cwd', return_value=cwd):
+                with self.assertRaisesRegex(gx_perf.PerfError, 'outer --json'):
+                    gx_perf.run_quiet_batch(args, self.probe, runner)
+            runner.assert_not_called()
+            self.assertFalse(args.out.exists())
+            self.assertEqual(b'original evidence\n', historical.read_bytes())
+
+    def test_outer_distro_must_match_manifest_before_probe_or_dispatch(self):
+        args, data, _, cwd = self.fixture()
+        args.distro = 'Different-Distribution'
+        runner, probe = mock.Mock(), mock.Mock()
+        with mock.patch.object(Path, 'cwd', return_value=cwd):
+            with self.assertRaisesRegex(gx_perf.PerfError, 'distro'):
+                gx_perf.run_quiet_batch(args, probe, runner)
+        self.assertFalse(args.out.exists())
+        runner.assert_not_called()
+        self.assertEqual([], probe.mock_calls)
+
+    def test_frozen_main_and_cli_preserve_every_outer_json_target(self):
+        import subprocess
+        args, data, _, cwd = self.fixture()
+        targets = (args.out.parent / 'historical-result.json', args.out / 'collector-identity.json',
+                   args.out / 'measurement-result.json', args.out / 'collector-outcome.json', args.out / 'RESULT.json')
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            argv = ['quiet-batch', '--out', str(args.out), '--input-observe-only', '--distro', 'Ubuntu-24.04',
+                    '--frozen-collector', str(args.frozen_collector),
+                    '--frozen-collector-sha256', args.frozen_collector_sha256, '--json', str(target), '--', *data['argv']]
+            for route in ('main', 'cli'):
+                with self.subTest(target=target.name, route=route):
+                    original = b'original evidence\r\n\x00\xff'
+                    target.write_bytes(original)
+                    if route == 'main':
+                        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(Path, 'cwd', return_value=cwd):
+                            code = gx_perf.main(argv)
+                    else:
+                        child = subprocess.run([sys.executable, str(SCRIPTS / 'gx_perf.py'), *argv], cwd=cwd,
+                                               capture_output=True, timeout=20)
+                        code = child.returncode
+                        self.assertIn(b'outer --json', child.stderr)
+                    self.assertEqual(2, code)
+                    self.assertEqual(original, target.read_bytes())
+
+    def test_partial_frozen_options_do_not_create_outer_json_but_normal_errors_do(self):
+        args, data, _, cwd = self.fixture()
+        target = args.out.parent / 'must-not-be-created.json'
+        options = (['--frozen-collector', str(args.frozen_collector)],
+                   ['--frozen-collector-sha256', args.frozen_collector_sha256])
+        for option in options:
+            argv = ['quiet-batch', '--out', str(args.out), '--input-observe-only', *option,
+                    '--json', str(target), '--', *data['argv']]
+            with self.subTest(option=option[0]), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(2, gx_perf.main(argv))
+                self.assertFalse(target.exists())
+                self.assertFalse(args.out.exists())
+        # The restriction is scoped to frozen mode, not normal error reports.
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, gx_perf.main(['compare', '--old', str(cwd / 'missing-old'),
+                                            '--new', str(cwd / 'missing-new'), '--json', str(target)]))
+        self.assertEqual('rejected', json.loads(target.read_text(encoding='utf-8'))['_validation']['status'])
+
+    def test_isolated_child_cannot_import_shadow_modules_from_task_paths(self):
+        import subprocess
+        args, data, entry, cwd = self.fixture()
+        for directory in (entry.parent, cwd / 'scripts', cwd):
+            (directory / 'statistics.py').write_text('raise RuntimeError("UNBOUND_SHADOW")\n', encoding='utf-8')
+            (directory / 'task_only.py').write_text('raise RuntimeError("UNBOUND_EXTRA")\n', encoding='utf-8')
+        entry.write_text(
+            'import sys\n'
+            'def main(payload):\n'
+            '    from pathlib import Path\n'
+            '    for path in (Path(__file__).parent, Path.cwd() / "scripts", Path.cwd()):\n'
+            '        sys.path.insert(0, str(path))\n'
+            '    import statistics\n'
+            '    import subprocess\n'
+            '    assert statistics.mean([2, 4]) == 3\n'
+            '    try:\n'
+            '        import task_only\n'
+            '    except ImportError:\n'
+            '        pass\n'
+            '    else:\n'
+            '        raise AssertionError("unbound module admitted")\n'
+            '    print("TRUSTED_STDLIB_ONLY")\n'
+            '    return 0\n', encoding='utf-8')
+        data['files']['adapter']['sha256'] = gx_perf.hashlib.sha256(entry.read_bytes()).hexdigest()
+        gx_perf.write_json(args.frozen_collector, data)
+        args.frozen_collector_sha256 = gx_perf.hashlib.sha256(args.frozen_collector.read_bytes()).hexdigest()
+        with mock.patch.object(Path, 'cwd', return_value=cwd):
+            binding = gx_perf.frozen_collector_binding(args, data['argv'])
+        result = subprocess.run(binding['argv'], input=binding['payload'], cwd=cwd, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr.decode())
+        self.assertIn(b'TRUSTED_STDLIB_ONLY', result.stdout)
+
+    def test_changed_entry_during_slot_wait_is_rejected_before_execution(self):
+        import gx_slots
+        args, data, entry, cwd = self.fixture()
+        acquire = gx_slots.acquire
+        @contextlib.contextmanager
+        def wait_then_acquire(*values, **options):
+            entry.write_text('raise RuntimeError("changed while waiting")\n', encoding='utf-8')
+            with acquire(*values, **options) as lease:
+                yield lease
+        runner = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(Path, 'cwd', return_value=cwd), mock.patch.object(gx_slots, 'acquire', side_effect=wait_then_acquire):
+            code, result = self.run_batch(args, runner)
+        self.assertEqual(0, runner.call_count, 'changed entry must never reach dispatch')
+        self.assertEqual((2, 'ERROR', 'DRIVER_ERROR'), (code, result['status'], result['measurement']))
+        self.assertTrue(any('SHA256 mismatch' in error for error in result['errors']))
+
+    def test_changed_manifest_or_module_during_wait_is_rejected(self):
+        import gx_slots
+        args, data, _, cwd = self.fixture()
+        original = args.frozen_collector.read_bytes()
+        acquire = gx_slots.acquire
+        for index, path in enumerate((args.frozen_collector, Path(data['files']['gx_wsl.py']['path']))):
+            if index:
+                args.frozen_collector.write_bytes(original)
+                args.out = args.out.parent / 'other-batch'
+                data['argv'][-3] = str(args.out / 'measure')
+                data['argv'][-1] = str(args.out / 'measurement-result.json')
+                gx_perf.write_json(args.frozen_collector, data)
+                args.frozen_collector_sha256 = gx_perf.hashlib.sha256(args.frozen_collector.read_bytes()).hexdigest()
+                args.batch_command = ['--', *data['argv']]
+            @contextlib.contextmanager
+            def wait_then_acquire(*values, **options):
+                path.write_bytes(path.read_bytes() + b'\n')
+                with acquire(*values, **options) as lease:
+                    yield lease
+            runner = mock.Mock()
+            with self.subTest(path=path), mock.patch.object(Path, 'cwd', return_value=cwd), \
+                    mock.patch.object(gx_slots, 'acquire', side_effect=wait_then_acquire):
+                code, result = self.run_batch(args, runner)
+                runner.assert_not_called()
+                self.assertEqual(2, code)
+                self.assertTrue(any('SHA256 mismatch' in error for error in result['errors']))
+
+    def test_dispatch_executes_captured_bytes_even_if_file_changes_after_binding(self):
+        import subprocess
+        args, data, entry, cwd = self.fixture()
+        def runner(command, **kwargs):
+            entry.write_text('raise RuntimeError("unverified replacement executed")\n', encoding='utf-8')
+            Path(data['files']['gx_wsl.py']['path']).write_text('changed after binding\n', encoding='utf-8')
+            self.assertEqual(['-I', '-S', '-B', '-c'], command[1:5])
+            return subprocess.run(command, **kwargs)
+        with mock.patch.object(Path, 'cwd', return_value=cwd):
+            code, result = self.run_batch(args, runner)
+        self.assertEqual(0, code)
+        self.assertIn('BOUND_ORIGINAL', (args.out / 'command.log').read_text(encoding='utf-8'))
+        self.assertEqual(data['files'], result['frozen_collector']['files'])
+
+    def test_output_created_during_wait_is_rejected_without_overwrite(self):
+        import gx_slots
+        args, _, _, cwd = self.fixture()
+        acquire = gx_slots.acquire
+        marker = args.out / 'measurement-result.json'
+        @contextlib.contextmanager
+        def wait_then_acquire(*values, **options):
+            marker.write_text('existing original', encoding='utf-8')
+            with acquire(*values, **options) as lease:
+                yield lease
+        runner = mock.Mock()
+        with mock.patch.object(Path, 'cwd', return_value=cwd), mock.patch.object(gx_slots, 'acquire', side_effect=wait_then_acquire):
+            code, result = self.run_batch(args, runner)
+        runner.assert_not_called()
+        self.assertEqual(2, code)
+        self.assertIn('fresh', ' '.join(result['errors']))
+        self.assertEqual('existing original', marker.read_text(encoding='utf-8'))
+
+
+class GtkMetricCoverageTests(unittest.TestCase):
+    def core(self):
+        samples = gx_perf.Samples()
+        for name in gx_perf.GTK_REQUIRED:
+            for _ in range(10):
+                samples.add(name, 1, "ms")
+        samples.gtk_runs = [{} for _ in range(10)]
+        return samples
+
+    def test_optional_group_absence_is_unknown_not_a_zero_sample(self):
+        old, new = self.core(), self.core()
+        for _ in range(5):
+            old.add("cpu.pool", 0, "ms")
+        self.assertEqual([], gx_perf.comparison_errors(old, new, gtk=True, runs=10))
+        _, table = gx_perf.compare_table(old, new)
+        self.assertEqual(5, table['cpu.pool']['old']['n'])
+        self.assertIsNone(table['cpu.pool']['new'])
+        self.assertFalse(table['cpu.pool']['comparable'])
+        self.assertNotIn('delta_median', table['cpu.pool'])
+        self.assertNotIn('cpu.pool', new.values)
+
+    def test_shared_partial_cpu_groups_still_require_equal_counts(self):
+        old, new = self.core(), self.core()
+        for samples, n in ((old, 5), (new, 6)):
+            for _ in range(n):
+                samples.add('cpu.pool', 0, 'ms')
+        errors = gx_perf.comparison_errors(old, new, gtk=True, runs=10)
+        self.assertEqual(['cpu.pool: sample counts differ (5 vs 6)'], errors)
+        _, table = gx_perf.compare_table(old, new)
+        self.assertFalse(table['cpu.pool']['comparable'])
+        self.assertNotIn('delta_median', table['cpu.pool'])
+        new.values['cpu.pool'].pop()
+        self.assertEqual([], gx_perf.comparison_errors(old, new, gtk=True, runs=10))
+
+    def test_optional_non_cpu_counts_remain_descriptive_and_units_still_gate(self):
+        old, new = self.core(), self.core()
+        old.add('pipeline.uploads', 4, None)
+        new.add('pipeline.uploads', 7, None)
+        new.add('pipeline.uploads', 8, None)
+        self.assertEqual([], gx_perf.comparison_errors(old, new, gtk=True, runs=10))
+        _, table = gx_perf.compare_table(old, new)
+        self.assertFalse(table['pipeline.uploads']['comparable'])
+        self.assertNotIn('delta_median', table['pipeline.uploads'])
+        new.units['pipeline.uploads'] = 'ms'
+        self.assertIn('pipeline.uploads: time/count unit conflict',
+                      gx_perf.comparison_errors(old, new, gtk=True, runs=10))
+
+    def test_every_required_metric_needs_ten_finite_nonnegative_times(self):
+        for name in gx_perf.GTK_REQUIRED:
+            for failure in ('missing', 'nine', 'count', 'negative', 'nan'):
+                old, new = self.core(), self.core()
+                if failure == 'missing':
+                    old.values.pop(name)
+                elif failure == 'nine':
+                    old.values[name].pop()
+                elif failure == 'count':
+                    old.units[name] = ''
+                else:
+                    old.values[name][0] = -1 if failure == 'negative' else float('nan')
+                with self.subTest(name=name, failure=failure):
+                    self.assertTrue(gx_perf.comparison_errors(old, new, gtk=True, runs=10))
+
+    def test_optional_cpu_unit_and_negative_are_rejected_even_without_peer(self):
+        for unit, value in (('', 0), ('ms', -1), ('ms', float('inf'))):
+            old, new = self.core(), self.core()
+            old.values['cpu.pool'], old.units['cpu.pool'] = [value], unit
+            with self.subTest(unit=unit, value=value):
+                self.assertTrue(gx_perf.comparison_errors(old, new, gtk=True, runs=10))
+
+    def test_raw_cpu_groups_must_not_be_dropped_or_filled_in(self):
+        for change in ('drop', 'zero', 'unit', 'negative', 'rename'):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                meta = gtk_fixture(root, 'pool')
+                path = root / 'perf-perf.txt'
+                text = path.read_text(encoding='utf-8')
+                if change == 'drop':
+                    text = text.replace('metric cpu.pool 0.000 s\n', '')
+                elif change == 'zero':
+                    text += 'metric cpu.pool-ghostty 0.000 s\n'
+                elif change == 'unit':
+                    text = text.replace('metric cpu.pool 0.000 s', 'metric cpu.pool 0')
+                elif change == 'negative':
+                    text = text.replace('metric cpu.pool 0.000 s', 'metric cpu.pool -0.001 s')
+                else:
+                    text = text.replace('metric cpu.pool ', 'metric cpu.pool-ghostty ')
+                path.write_text(text, encoding='utf-8')
+                meta['artifact_sha256'][path.name] = gx_perf.hashlib.sha256(path.read_bytes()).hexdigest()
+                gx_perf.write_json(root / 'perf-meta.json', meta)
+                with self.subTest(change=change), self.assertRaises(gx_perf.PerfError):
+                    gx_perf.gtk_evidence(root / 'perf-meta.json')
+
+    def batch(self, root, limits):
+        batch = {'schema': 'gx-gtk-runs-v1', 'planned_runs': 10, 'labels': ['old', 'new'],
+                 'valid': False, 'order': 'AB/BA', 'runs': []}
+        for run, label in gx_perf.alternate(batch['labels'], 10):
+            relative = f'{label}/run-{run:02d}'
+            gtk_fixture(root / relative, 'pool' if run <= limits[label] else 'pool-ghostty')
+            batch['runs'].append({'label': label, 'run': run, 'path': relative, 'exit': 0, 'status': 'completed'})
+        return batch
+
+    def test_rejected_batch_reports_all_actual_n_without_comparison_or_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = self.batch(root, {'old': 5, 'new': 6})
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(1, gx_perf.report_gtk_runs(root, batch, None))
+            result = gx_perf.read_json(root / 'RESULT.json')
+            self.assertEqual('rejected', result['validation']['status'])
+            self.assertEqual({'old': 10, 'new': 10}, result['validation']['valid_runs'])
+            self.assertEqual(20, len(batch['runs']))
+            self.assertNotIn('metrics', result)
+            coverage = result['validation']['metric_coverage']
+            for label, n in (('old', 5), ('new', 6)):
+                self.assertEqual(n, coverage[label]['cpu.pool']['n'])
+                self.assertEqual(10 - n, coverage[label]['cpu.pool-ghostty']['n'])
+                for name in gx_perf.GTK_REQUIRED:
+                    self.assertEqual(10, coverage[label][name]['n'])
+            self.assertFalse(result['validation']['metric_comparability']['cpu.pool']['comparable'])
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.collect([root / 'old', root / 'new'])
+
+    def test_partial_groups_do_not_allow_any_proper_subset_of_valid_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = self.batch(root, {'old': 5, 'new': 5})
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, gx_perf.report_gtk_runs(root, batch, None))
+            for label in batch['labels']:
+                for omitted in range(1, 11):
+                    paths = [root / label / f'run-{i:02d}' for i in range(1, 11) if i != omitted]
+                    with self.subTest(label=label, omitted=omitted), self.assertRaisesRegex(gx_perf.PerfError, 'partial GTK subsets'):
+                        gx_perf.collect(paths)
+            self.assertEqual(20, len(gx_perf.collect([root]).gtk_runs))
+            truncated = dict(batch, runs=batch['runs'][:-1])
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.canonical_plan(root, truncated)
 
 
 class P7C7Tests(unittest.TestCase):
