@@ -32,6 +32,7 @@ PREFIX = 'font.first_cjk_fallback.'
 METRIC = PREFIX + 'raster_ready'
 EVENTS = ('started', 'codepoint', 'request', 'grid', 'font_index', 'glyph',
           'bound', 'raster_ready', 'completed')
+STARTUP_FILE = 'startup-observation.json'
 
 
 def reject(message, cause='c6_evidence_unproved'):
@@ -178,22 +179,45 @@ def validate_arm(report: dict, manifest: dict) -> None:
         reject('C6 collected source differs from fixed manifest arm')
 
 
-def raw_guard_metrics(run: dict, final: str) -> dict:
-    """Derive guard values from raw log and native endpoints, not summaries."""
-    from gx_perf import parse_text
-    lines = [line for line in final.splitlines() if 'startup.shown' in line]
-    if len(lines) != 1 or final.count('startup.shown') != 1:
-        reject('C6 final startup.shown missing or duplicated')
-    if not re.fullmatch(
-            r'(?:metric startup\.shown [0-9]+(?:\.[0-9]+)? (?:us|ms|s)|'
-            r'.*?\(gx_perf\):\s+startup\.shown [0-9]+(?:\.[0-9]+)?\s*(?:ns|us|ms|s))',
-            lines[0].strip()):
-        reject('C6 final startup.shown malformed')
-    startup = parse_text(lines[0])
-    shown = startup.values.get('startup.shown', [])
-    if (len(shown) != 1 or startup.units.get('startup.shown') != 'ms' or
-            not math.isfinite(shown[0]) or shown[0] < 0):
-        reject('C6 final startup.shown malformed')
+def startup_guard(run: dict, path: Path, *, collect: bool = False) -> float:
+    """Read the GUI observer's independent raw endpoint, never an app metric.
+
+    Pin its bytes at collection and re-read them at cleanup/finalize. The hash
+    binds checkpoints, not authenticity: OS calls are the producer, with mocks
+    used only in offline tests. P1's wall-clock FILETIME definition stays distinct
+    from the native counter/trigger QPC endpoints below.
+    """
+    import gx_win_gui as gui
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate startup observation key: ' + key)
+            result[key] = value
+        return result
+    try:
+        raw = (path / STARTUP_FILE).read_bytes()
+        observation = json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object)
+        shown = gui.startup_shown_ms(observation, pid=run['pid'], creation=run['creation'])
+        recorded = run['startup_ms']['shown_ms']
+        if type(recorded) not in (int, float) or recorded != shown:
+            raise ValueError('startup_ms.shown_ms differs from raw observation')
+        reference = dict(path=STARTUP_FILE, schema=gui.STARTUP_OBSERVATION_SCHEMA,
+                         sha256=hashlib.sha256(raw).hexdigest())
+        if collect:
+            if 'startup_observation' in run['c6']:
+                raise ValueError('startup observation already collected')
+            run['c6']['startup_observation'] = reference
+        elif run['c6']['startup_observation'] != reference:
+            raise ValueError('startup observation changed since collection')
+        return shown
+    except (OSError, ValueError, KeyError, TypeError, gui.GuiError) as exc:
+        reject('C6 startup observation: ' + str(exc))
+
+
+def raw_guard_metrics(run: dict, path: Path) -> dict:
+    """Derive guards from raw GUI observation and native counter endpoints."""
+    shown = startup_guard(run, path)
     if any(type(run[key]) is not int or run[key] <= 0 for key in ('pid', 'creation')):
         reject('C6 launched process identity invalid')
     evidence = run['c6']
@@ -211,7 +235,7 @@ def raw_guard_metrics(run: dict, final: str) -> dict:
              after['begin_ns'], after['end_ns']]
     if any(type(t) is not int or t <= 0 for t in times) or times != sorted(times):
         reject('C6 native counter/trigger/output QPC order invalid')
-    return {'startup.shown': shown[0], 'process.commit.before': before['private_bytes'],
+    return {'startup.shown': shown, 'process.commit.before': before['private_bytes'],
             'process.commit.after': after['private_bytes'],
             'process.commit.delta': after['private_bytes'] - before['private_bytes']}
 
@@ -225,12 +249,14 @@ def validate_run_raw(run: dict, path: Path) -> dict:
     before_text, after_text, final_text = [raw.decode('utf-8', errors='strict') for raw in (before, after, final)]
     if re.search(r'(?m)^.*\berror\(', final_text):
         reject('C6 final raw log contains an error')
+    if 'startup.shown' in final_text:
+        reject('C6 startup.shown belongs to GUI observation, not the app log')
     identity = validate_target(before_text, after_text)
     if identity != validate_target(before_text, final_text) or identity != run['c6']['identity']:
         reject('C6 full raw identity differs from collected identity')
     if target_events(after_text) != target_events(final_text):
         reject('C6 final raw event chain changed')
-    return {METRIC: identity['duration_ms'], **raw_guard_metrics(run, final_text)}
+    return {METRIC: identity['duration_ms'], **raw_guard_metrics(run, path)}
 
 
 def finalize_batch(batch: dict, out: Path) -> None:
@@ -350,6 +376,7 @@ def measure(gui, instance, capture, args, counters, shell):
         source=report['font_build'], shell_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         python_sha256=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
         commit_source='native GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS_EX.PrivateUsage')
+    startup_guard(report, capture.target, collect=True)
     perf.wait_until(lambda: shell.ready(gui, instance, 1), 'C6 owned ASCII shell ready')
     evidence['shell_identities'] = shell.identities.copy()
     ready = [row for row in shell.rows() if row['event'] == 'ready']
@@ -401,13 +428,13 @@ def measure(gui, instance, capture, args, counters, shell):
     if not after.startswith(before):
         reject('C6 log truncated or replaced')
     evidence['generic_fallback_diagnostic'] = perf.parse_text(after.decode('utf-8')).values.get('font.first_fallback', [])
-    for endpoint in ('before', 'after'):
-        capture.add('process.commit.' + endpoint, evidence['commit_' + endpoint]['private_bytes'])
-    shown = perf.parse_text(after.decode('utf-8')).values.get('startup.shown', [])
-    if len(shown) != 1 or perf.parse_text(after.decode('utf-8')).units.get('startup.shown') != 'ms':
-        reject('startup.shown missing, duplicated or not a duration')
-    capture.add('startup.shown', shown[0], 'ms')
-    capture.add('process.commit.delta', evidence['commit_after']['private_bytes'] - evidence['commit_before']['private_bytes'])
+    if b'startup.shown' in after:
+        reject('C6 startup.shown belongs to GUI observation, not the app log')
+    for name, value in raw_guard_metrics(report, capture.target).items():
+        if name == 'startup.shown':
+            capture.add(name, value, 'ms')
+        else:
+            capture.add(name, value)
     evidence['identity'] = validate_target(before.decode('utf-8'), after.decode('utf-8'))
     capture.add(METRIC, evidence['identity']['duration_ms'], 'ms')
     evidence['coverage'] = 'captured'

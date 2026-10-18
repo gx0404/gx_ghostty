@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gx_perf
+from test_gx_win_gui import observe_startup
 
 
 class C6ContractTests(unittest.TestCase):
@@ -121,6 +122,43 @@ class C6ContractTests(unittest.TestCase):
 
 
 class C6FormalTests(unittest.TestCase):
+    def test_real_wait_window_startup_reaches_c6_without_native_metric(self):
+        import gx_perf_font as font
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            instance, marks = observe_startup(root, evidence=True)
+            self.assertEqual(marks['shown_ms'], 10)
+            instance.log.parent.mkdir(parents=True)
+            instance.log.write_bytes(b'ASCII only\n')
+            capture = gx_perf.CaptureRun(instance, root, dict(font_build={}, pid=instance.pid,
+                creation=instance.creation, startup_ms=marks))
+            shell = mock.Mock()
+            shell.identities = {12: 34}
+            shell.ready.return_value = True
+            shell.rows.return_value = [dict(event='ready', payload_hex=font.READY.hex(), written_bytes=len(font.READY))]
+            def trigger(_action):
+                with instance.log.open('ab') as stream:
+                    stream.write(self.good().encode())
+                return dict(id='owned', qpc_ns=3)
+            shell.command.side_effect = trigger
+            shell.receipt.return_value = dict(write_begin_qpc_ns=4, qpc_ns=5)
+            counters = mock.Mock()
+            counters.sample.side_effect = [
+                dict(pid=instance.pid, birth=instance.creation, begin_ns=1, end_ns=2, private_bytes=1000),
+                dict(pid=instance.pid, birth=instance.creation, begin_ns=6, end_ns=7, private_bytes=2000)]
+            ticks = itertools.count()
+            with mock.patch.object(gx_perf, 'wait_until', side_effect=lambda fn, _: fn()), \
+                 mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 0)), \
+                 mock.patch.object(gx_perf, 'c7_input_check'), \
+                 mock.patch.object(font.time, 'monotonic', side_effect=lambda: next(ticks) / 10), \
+                 mock.patch.object(font.time, 'sleep'), mock.patch.object(capture, 'screenshot'):
+                font.measure(None, instance, capture, object(), counters, shell)
+            self.assertEqual(capture.samples.values['startup.shown'], [marks['shown_ms']])
+            self.assertNotIn(b'startup.shown', instance.log.read_bytes())
+            (root / 'ghostty.log').write_bytes(instance.log.read_bytes() + b'cleanup\n')
+            self.assertEqual(font.validate_run_raw(capture.report, root)['startup.shown'], marks['shown_ms'])
+            self.assertEqual(instance.log.read_bytes(), b'ASCII only\n' + self.good().encode())
+
     @staticmethod
     def good():
         return ('info(gx_perf): metric font.first_cjk_fallback.started 1\n'
@@ -230,16 +268,19 @@ class C6FormalTests(unittest.TestCase):
                 shell.ready.return_value = True
                 shell.rows.return_value = [dict(event='ready', payload_hex=font.READY.hex(), written_bytes=len(font.READY))]
                 shell.command.return_value = dict(id='owned', qpc_ns=100)
-                shell.receipt.return_value = dict(pid=12, id='owned', payload_hex=font.PAYLOAD.hex(), written_bytes=len(font.PAYLOAD))
+                shell.receipt.return_value = dict(pid=12, id='owned', payload_hex=font.PAYLOAD.hex(),
+                    written_bytes=len(font.PAYLOAD), write_begin_qpc_ns=101, qpc_ns=102)
                 capture = mock.Mock()
-                capture.report = dict(font_build={})
                 capture.target = Path(tmp)
-                before = b'metric startup.shown 10 ms\n'
+                instance, marks = observe_startup(capture.target, evidence=True)
+                capture.report = dict(font_build={}, pid=instance.pid, creation=instance.creation, startup_ms=marks)
+                before = b'ASCII only\n'
                 after = before + (self.good() if completed else 'metric font.first_fallback 2 ms\n').encode()
                 capture.mark.side_effect = lambda: after if shell.command.called else before
                 counters = mock.Mock()
-                counters.sample.side_effect = [dict(private_bytes=1000), dict(private_bytes=2000)]
-                instance = object()
+                counters.sample.side_effect = [
+                    dict(pid=instance.pid, birth=instance.creation, begin_ns=1, end_ns=2, private_bytes=1000),
+                    dict(pid=instance.pid, birth=instance.creation, begin_ns=103, end_ns=104, private_bytes=2000)]
                 ticks = itertools.count()
                 with mock.patch.object(gx_perf, 'wait_until', side_effect=lambda fn, _: fn()), \
                      mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 0)), \
@@ -280,17 +321,19 @@ class C6FormalTests(unittest.TestCase):
         for number, label in gx_perf.alternate(['warmup', 'no-warmup'], 10):
             path = root / label / str(number)
             path.mkdir(parents=True)
-            before = b'metric startup.shown 10 ms\r\n'
+            instance, marks = observe_startup(path, evidence=True)
+            before = b'ASCII only\r\n'
             after = before + self.good().encode() + b'tail\r\n'
             (path / 'before-cjk.log').write_bytes(before)
             (path / 'after-cjk.log').write_bytes(after)
             (path / 'ghostty.log').write_bytes(after + b'cleanup\r\n')
             metrics = {name: dict(n=1, median=value, unit=unit) for name, value, unit in
-                       [(font.METRIC, 2.5, 'ms'), ('startup.shown', 10, 'ms'),
+                       [(font.METRIC, 2.5, 'ms'), ('startup.shown', marks['shown_ms'], 'ms'),
                         ('process.commit.before', 1000, ''), ('process.commit.after', 2000, ''),
                         ('process.commit.delta', 1000, '')]}
             report = dict(status='completed', label=label, run=number, metrics=metrics,
-                          pid=42, creation=123, errors=[], exe=str(root / (label + '.exe')),
+                          pid=instance.pid, creation=instance.creation, startup_ms=marks,
+                          errors=[], exe=str(root / (label + '.exe')),
                           exe_sha256=batch['font_manifest']['arms'][label]['exe_sha256'],
                           font_build=batch['font_manifest']['arms'][label].copy(),
                           c6=dict(scope=font.SCOPE, coverage='captured',
@@ -299,6 +342,7 @@ class C6FormalTests(unittest.TestCase):
                               commit_before=dict(pid=42, birth=123, begin_ns=1, end_ns=2, private_bytes=1000),
                               trigger=dict(qpc_ns=3), actual_output=dict(write_begin_qpc_ns=4, qpc_ns=5),
                               commit_after=dict(pid=42, birth=123, begin_ns=6, end_ns=7, private_bytes=2000)))
+            font.startup_guard(report, path, collect=True)
             (path / 'run.json').write_text(json.dumps(report), encoding='utf-8')
             batch['runs'].append(dict(run=number, label=label, status='completed', path=str(path.relative_to(root))))
         return batch
@@ -320,17 +364,14 @@ class C6FormalTests(unittest.TestCase):
             self.assertEqual(batch['exit'], 1)
 
 
-    def test_raw_native_startup_and_negative_private_delta(self):
+    def test_raw_gui_startup_and_negative_private_delta(self):
         import gx_perf_font as font
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             batch = self.batch_fixture(root)
             for row in batch['runs']:
                 path = root / row['path']
-                for name in ('before-cjk.log', 'after-cjk.log', 'ghostty.log'):
-                    raw = path / name
-                    raw.write_bytes(raw.read_bytes().replace(b'metric startup.shown 10 ms',
-                        b'12:00:00.000 [42] info(gx_perf): startup.shown 10000us'))
+                self.assertNotIn(b'startup.shown', (path / 'ghostty.log').read_bytes())
                 run = json.loads((path / 'run.json').read_text())
                 run['c6']['commit_after']['private_bytes'] = 900
                 run['metrics']['process.commit.after']['median'] = 900
@@ -339,6 +380,100 @@ class C6FormalTests(unittest.TestCase):
             font.finalize_batch(batch, root)
             self.assertTrue(batch['valid'], batch['errors'])
             self.assertEqual(batch['c6']['distributions']['warmup']['process.commit.delta']['median'], -100)
+
+    def test_startup_raw_fields_reject_even_with_rehashed_reference(self):
+        import gx_perf_font as font
+        changes = [
+            (('shown_ms',), 10), (('confirmation', 'error'), 'query failed'),
+            (('schema',), 'unknown'), (('producer',), 'native'), (('pid',), 43), (('pid',), True),
+            (('window_kind',), 'quick'), (('start_filetime_100ns',), 124),
+            (('start_filetime_100ns',), True), (('end_filetime_100ns',), 122),
+            (('end_filetime_100ns',), 1.5), (('end_filetime_100ns',), 2**64),
+            (('clock', 'unit'), 'ns'), (('clock', 'start_source'), 'CreateProcess.before'),
+            (('clock', 'end_source'), 'QueryPerformanceCounter'),
+            (('clock', 'end_phase'), 'after_window_enumeration'),
+            (('window', 'hwnd'), 0), (('window', 'hwnd'), True), (('window', 'hwnd'), 102),
+            (('window', 'cls'), 'OtherWindow'), (('window', 'visible'), False),
+            (('window', 'visible'), 1), (('window', 'cloaked'), True), (('window', 'cloaked'), 0),
+            (('window', 'toolwindow'), True), (('confirmation', 'hwnd'), 102),
+            (('confirmation', 'pid'), 43), (('confirmation', 'birth'), 124),
+            (('confirmation', 'visible'), False), (('confirmation', 'cloaked'), 1),
+            (('confirmation', 'cloaked'), False), (('confirmation', 'cloak_hresult'), -1),
+            (('confirmation', 'cloak_hresult'), False), (('confirmation', 'toolwindow'), True),
+        ]
+        for key in ('schema', 'producer', 'pid', 'clock', 'window_kind', 'start_filetime_100ns',
+                    'end_filetime_100ns', 'window', 'confirmation'):
+            changes.append(((key,), None))
+        for key in ('hwnd', 'pid', 'birth', 'visible', 'cloaked', 'cloak_hresult', 'toolwindow', 'cls'):
+            changes.append((('confirmation', key), None))
+        for keys, value in changes:
+            with self.subTest(keys=keys, value=value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                instance, marks = observe_startup(root, evidence=True)
+                run = dict(pid=instance.pid, creation=instance.creation, startup_ms=marks, c6={})
+                font.startup_guard(run, root, collect=True)
+                path = root / font.STARTUP_FILE
+                raw = json.loads(path.read_text(encoding='utf-8'))
+                target = raw
+                for key in keys[:-1]:
+                    target = target[key]
+                if value is None:
+                    del target[keys[-1]]
+                else:
+                    target[keys[-1]] = value
+                path.write_text(json.dumps(raw), encoding='utf-8')
+                run['c6']['startup_observation']['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                with self.assertRaisesRegex(gx_perf.PerfError, 'startup observation'):
+                    font.startup_guard(run, root)
+
+    def test_raw_startup_cannot_be_replaced_by_summary_or_log(self):
+        import gx_perf_font as font
+        for case in ('missing_raw', 'different_hash', 'duplicate_key', 'fake_report', 'bool_report',
+                     'missing_report', 'missing_reference', 'wrong_path', 'wrong_reference_schema',
+                     'native_row', 'synthetic_row', 'duplicate_native', 'malformed_native', 'wrong_report_pid',
+                     'wrong_report_birth'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                batch = self.batch_fixture(root)
+                path = root / batch['runs'][-1]['path']
+                run_path = path / 'run.json'
+                run = json.loads(run_path.read_text(encoding='utf-8'))
+                raw_path = path / font.STARTUP_FILE
+                if case == 'missing_raw':
+                    raw_path.unlink()
+                    # The old invented log must not substitute for raw observation.
+                    final = path / 'ghostty.log'
+                    final.write_bytes(final.read_bytes() + b'metric startup.shown 10 ms\n')
+                elif case == 'different_hash':
+                    raw_path.write_bytes(raw_path.read_bytes() + b'\n')
+                elif case == 'duplicate_key':
+                    raw_path.write_bytes(raw_path.read_bytes().replace(b'"pid": 42', b'"pid": 42, "pid": 42', 1))
+                    run['c6']['startup_observation']['sha256'] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+                elif case in ('fake_report', 'bool_report'):
+                    run['startup_ms']['shown_ms'] = True if case == 'bool_report' else 11
+                elif case == 'missing_report':
+                    del run['startup_ms']
+                elif case == 'missing_reference':
+                    del run['c6']['startup_observation']
+                elif case == 'wrong_path':
+                    run['c6']['startup_observation']['path'] = '../startup-observation.json'
+                elif case == 'wrong_reference_schema':
+                    run['c6']['startup_observation']['schema'] = 'qpc'
+                elif case in ('wrong_report_pid', 'wrong_report_birth'):
+                    run['pid' if case == 'wrong_report_pid' else 'creation'] += 1
+                else:
+                    line = {'native_row': b'12:00:00.000 [42] info(gx_perf): startup.shown 10000us\n',
+                            'synthetic_row': b'metric startup.shown 10 ms\n',
+                            'duplicate_native': b'metric startup.shown 10 ms\n' * 2,
+                            'malformed_native': b'metric startup.shown broken\n'}[case]
+                    for name in ('before-cjk.log', 'after-cjk.log', 'ghostty.log'):
+                        log = path / name
+                        log.write_bytes(line + log.read_bytes())
+                run_path.write_text(json.dumps(run), encoding='utf-8')
+                font.finalize_batch(batch, root)
+                self.assertFalse(batch['valid'], case)
+                self.assertEqual(len(batch['runs']), 20)
+                self.assertNotIn('distributions', batch['c6'])
 
     def test_finalization_rejects_raw_or_identity_corruption(self):
         import gx_perf_font as font
@@ -393,14 +528,13 @@ class C6FormalTests(unittest.TestCase):
                     name = 'startup.shown' if case == 'fake_startup' else 'process.commit.' + case[5:]
                     run['metrics'][name]['median'] += 1
                 elif case in ('missing_startup', 'duplicate_startup', 'malformed_startup'):
-                    for raw in (path / 'before-cjk.log', after, final):
-                        data = raw.read_bytes()
-                        data = data.replace(b'metric startup.shown 10 ms\r\n', b'') if case == 'missing_startup' else data
-                        if case == 'duplicate_startup':
-                            data = data.replace(b'metric startup.shown 10 ms\r\n', b'metric startup.shown 10 ms\r\n' * 2)
-                        if case == 'malformed_startup':
-                            data = data.replace(b'metric startup.shown 10 ms', b'metric startup.shown broken')
-                        raw.write_bytes(data)
+                    raw = path / font.STARTUP_FILE
+                    if case == 'missing_startup':
+                        raw.unlink()
+                    elif case == 'duplicate_startup':
+                        raw.write_bytes(raw.read_bytes() * 2)
+                    else:
+                        raw.write_text('{broken', encoding='utf-8')
                 elif case == 'exe_replaced':
                     Path(run['exe']).write_bytes(b'changed between rounds')
                 elif case == 'source_replaced':
@@ -409,8 +543,7 @@ class C6FormalTests(unittest.TestCase):
                     run['c6']['source']['source_commit'] = 'c' * 40
                 elif case == 'startup_trailing_garbage':
                     for raw in (path / 'before-cjk.log', after, final):
-                        raw.write_bytes(raw.read_bytes().replace(b'metric startup.shown 10 ms',
-                            b'info(gx_perf): startup.shown 10000us junk'))
+                        raw.write_bytes(b'info(gx_perf): startup.shown 10000us junk\r\n' + raw.read_bytes())
                 elif case == 'endpoint_error':
                     run['c6']['commit_after']['error'] = 'failed'
                 elif case == 'false_count':
