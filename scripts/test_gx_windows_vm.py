@@ -638,7 +638,13 @@ class WindowsVmTests(IsolatedTestCase):
 
 BROKER_CLOSURE = ("test/windows/gx_drop_broker_fixture.py", "test/windows/gx_ole_fixture.py",
                   "test/windows/gx_fixture_evidence.py", "scripts/gx_win_gui.py", "scripts/gx_slots.py",
-                  "scripts/gx_win_uia.py")
+                  "scripts/gx_win_uia.py",
+                  # The broker's Native controller also imports its lazy action
+                  # backends and language/session helpers after A3 integration.
+                  "test/windows/gx_boundary_controller.py", "test/windows/gx_boundary_ipc.py",
+                  "test/windows/gx_boundary_ole.py", "test/windows/gx_boundary_remote.py",
+                  "test/windows/gx_boundary_uia.py", "test/windows/gx_input_language.py",
+                  "test/windows/gx_session_ipc_fixture.py")
 
 
 class FixtureDependencyTests(unittest.TestCase):
