@@ -17,6 +17,10 @@
 //! Lifecycle: `show` from hidden keeps the window cloaked until it painted
 //! once (synchronously) and a frame passed (timer `RV`), so DWM never
 //! shows it empty; `show` and `setBounds` leave an unchanged window alone.
+//! Without a successful frame of its size and DPI 300 ms after `show`, a
+//! popup cancels its opening, or with `RevealTimeout.reveal` (modal
+//! questions) comes up anyway and keeps painting (timer `RV`) until a
+//! frame succeeds.
 //! WM_CLOSE (Alt+F4, the system close) hides a shown popup instead of
 //! destroying it, reports `.owner` and, for an activating popup with
 //! `Options.close_owner_on_close`, closes the window it belongs to; a
@@ -233,6 +237,19 @@ pub const Motion = struct {
     offset_y: f32 = 0,
 };
 
+/// What a popup does when `show` painted no successful frame of its current
+/// size and DPI within `reveal_timeout_ms` (a lost or failing device).
+pub const RevealTimeout = enum {
+    /// Cancel the opening and log it: the popup hides and reports a
+    /// dismissal (`.owner`). Menus, the command palette, the settings and
+    /// the other popups, which are opened again at will.
+    cancel,
+    /// Reveal it anyway and log it, then keep painting until a frame
+    /// succeeds: modal questions (`Dialogs`), which must stay answerable
+    /// from the keyboard and UI Automation and never answer by themselves.
+    reveal,
+};
+
 pub const Options = struct {
     /// Take activation and keyboard focus when shown. Non-activating
     /// popups (previews, tooltips) never take focus.
@@ -276,6 +293,9 @@ pub const Options = struct {
     /// outside caller takes the focus from the window. Any show makes an
     /// activating host activatable again (`mayActivate`).
     reuse_host: bool = false,
+    /// What the first-frame reveal does without a successful frame 300 ms
+    /// after `show` (`RevealTimeout`).
+    reveal_timeout: RevealTimeout = .cancel,
 };
 
 /// Sent (not posted) to the root owner window of a popup with
@@ -333,6 +353,9 @@ paint_scale: f32 = 0,
 revealing: bool = false,
 reveal_started_ms: u64 = 0,
 successful_frame: ?OpenTiming.Frame = null,
+/// Revealed without a successful frame (`RevealTimeout.reveal`): the reveal
+/// timer paints again every `repaint_retry_ms` until a frame succeeds.
+repaint_retry: bool = false,
 /// Created as a layered window for `Options.motion`; painted through `dib`.
 layered: bool = false,
 dib: d2d.DibTarget = .{},
@@ -396,12 +419,18 @@ const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
 /// frame, so DWM composed it before it appears.
 const reveal_ms: u32 = 16;
 const reveal_timeout_ms: u64 = 300;
+/// How often a modal popup revealed without a frame paints again.
+const repaint_retry_ms: u32 = 100;
 
-const RevealStep = enum { reveal, wait, cancel };
+const RevealStep = enum { reveal, wait, cancel, reveal_unpainted };
 
-fn revealStep(ready: bool, elapsed_ms: u64) RevealStep {
+fn revealStep(ready: bool, elapsed_ms: u64, timeout: RevealTimeout) RevealStep {
     if (ready) return .reveal;
-    return if (elapsed_ms < reveal_timeout_ms) .wait else .cancel;
+    if (elapsed_ms < reveal_timeout_ms) return .wait;
+    return switch (timeout) {
+        .cancel => .cancel,
+        .reveal => .reveal_unpainted,
+    };
 }
 
 /// Coalesced event work, consumed only at an outer message-loop idle boundary.
@@ -433,11 +462,15 @@ test "P4 reuse preparation consumes one event at idle and never polls" {
 }
 
 test "P4 reuse reveal requires a current frame and bounds failure by 300ms" {
-    try std.testing.expectEqual(RevealStep.wait, revealStep(false, 16));
-    try std.testing.expectEqual(RevealStep.wait, revealStep(false, 299));
-    try std.testing.expectEqual(RevealStep.cancel, revealStep(false, 300));
-    try std.testing.expectEqual(RevealStep.reveal, revealStep(true, 16));
-    try std.testing.expectEqual(RevealStep.reveal, revealStep(true, 300));
+    for ([_]RevealTimeout{ .cancel, .reveal }) |timeout| {
+        try std.testing.expectEqual(RevealStep.wait, revealStep(false, 16, timeout));
+        try std.testing.expectEqual(RevealStep.wait, revealStep(false, 299, timeout));
+        try std.testing.expectEqual(RevealStep.reveal, revealStep(true, 16, timeout));
+        try std.testing.expectEqual(RevealStep.reveal, revealStep(true, 300, timeout));
+    }
+    // Without a frame by 300 ms: non-modal popups cancel, modal ones come up.
+    try std.testing.expectEqual(RevealStep.cancel, revealStep(false, 300, .cancel));
+    try std.testing.expectEqual(RevealStep.reveal_unpainted, revealStep(false, 300, .reveal));
 }
 
 /// Create the (hidden) popup window owned by `owner`.
@@ -869,6 +902,55 @@ test "P4 an input popup shown outside Popup.show stays click-activatable" {
     preview.hide();
 }
 
+test "P4 a modal popup with no first frame is revealed after 300ms, others cancel" {
+    // A popup without callbacks paints no frame, as a lost device does: its
+    // show stays cloaked, waiting for one. After 300 ms a modal question must
+    // come up anyway (keyboard and UI Automation work, nothing answers for
+    // the user); any other popup cancels its opening.
+    const testing = std.testing;
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    var context: u8 = 0;
+    const rect: w32.RECT = .{ .left = -32000, .top = -32000, .right = -31936, .bottom = -31968 };
+    for ([_]RevealTimeout{ .reveal, .cancel }) |timeout| {
+        var popup: Popup = .{};
+        defer popup.destroy();
+        try popup.create(hinstance, owner, factory, .{ .reveal_timeout = timeout }, .{ .ctx = &context, .paint = ActivationFixture.paint });
+        const hwnd = popup.hwnd.?;
+        popup.callbacks = null;
+        popup.show(rect);
+        try testing.expect(popup.visible and popup.revealing);
+        try testing.expect(popup.successful_frame == null);
+        // The reveal timer, 300 ms later.
+        popup.reveal_started_ms -|= reveal_timeout_ms;
+        popup.reveal(hwnd);
+        try testing.expect(!popup.revealing);
+        switch (timeout) {
+            .reveal => {
+                try testing.expect(popup.visible and w32.IsWindowVisible_(hwnd) != 0);
+                try testing.expect(popup.repaint_retry);
+                // The next reveal timer paints again; once a frame succeeds
+                // it stops.
+                popup.reveal(hwnd);
+                try testing.expect(popup.repaint_retry and popup.visible);
+                popup.callbacks = .{ .ctx = &context, .paint = ActivationFixture.paint };
+                popup.reveal(hwnd);
+                try testing.expect(!popup.repaint_retry and popup.visible);
+                try testing.expect(popup.successful_frame != null);
+            },
+            .cancel => {
+                try testing.expect(!popup.visible and w32.IsWindowVisible_(hwnd) == 0);
+                try testing.expect(!popup.repaint_retry);
+            },
+        }
+        popup.hide();
+        try testing.expect(!popup.repaint_retry);
+    }
+}
+
 fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
     var current: w32.RECT = undefined;
     const known = w32.GetWindowRect(hwnd, &current) != 0;
@@ -1007,30 +1089,51 @@ fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
 }
 
 /// A frame passed since the first paint: paint again (DWM can drop the
-/// first frame of a new window), uncloak and start the fade-in.
+/// first frame of a new window), uncloak and start the fade-in. Without a
+/// successful frame it waits up to `reveal_timeout_ms`, then cancels or (with
+/// `RevealTimeout.reveal`) reveals the popup unpainted and paints again.
 fn reveal(self: *Popup, hwnd: w32.HWND) void {
     _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
-    if (!self.revealing) return;
+    if (!self.revealing) {
+        if (self.repaint_retry) self.retryPaint(hwnd);
+        return;
+    }
     const cookie = self.uia_cookie;
     _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
     const current = livePopup(hwnd, cookie) orelse return;
     // Neither a reused host nor the opt-in composition fallback may reveal a
     // failed/stale frame. Bound recovery rather than leaving a cloaked zombie.
-    const ready = if (current.composition_requested) current.compositionReady(hwnd) else if (current.successful_frame) |frame| if (current.openFrame(hwnd)) |size| std.meta.eql(frame, size) else false else false;
-    switch (revealStep(ready, GetTickCount64() -| current.reveal_started_ms)) {
-        .wait => {
-            if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, reveal_ms, null) == 0) current.dismiss(.owner);
-            return;
-        },
+    const timeout = current.options.reveal_timeout;
+    var step = revealStep(current.frameReady(hwnd), GetTickCount64() -| current.reveal_started_ms, timeout);
+    if (step == .wait and w32.SetTimer(hwnd, REVEAL_TIMER_ID, reveal_ms, null) == 0) {
+        // No timer to wait with: decide as at the timeout.
+        step = revealStep(false, reveal_timeout_ms, timeout);
+    }
+    switch (step) {
+        .wait => return,
         .cancel => {
             log.warn("popup first frame unavailable after 300ms; cancelling reveal", .{});
             current.dismiss(.owner);
             return;
         },
+        .reveal_unpainted => {
+            // A modal question must not answer itself: up for the keyboard
+            // and UI Automation, painted as soon as the device lets it.
+            log.warn("popup first frame unavailable after 300ms; revealing it unpainted and painting again", .{});
+            current.repaint_retry = true;
+        },
         .reveal => {},
     }
     current.revealing = false;
     setCloaked(hwnd, false);
+    if (current.repaint_retry) {
+        // Opaque in place at once; an unpainted opening reports no sample.
+        current.fade_pending = false;
+        current.open_timing = null;
+        if (current.layered) _ = w32.SetLayeredWindowAttributes(hwnd, 0, 255, w32.LWA_ALPHA);
+        if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, repaint_retry_ms, null) == 0) current.repaint_retry = false;
+        return;
+    }
     if (!self.fade_pending) {
         self.finishOpenTiming();
         return;
@@ -1038,6 +1141,30 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
     self.fade_pending = false;
     self.fade = anim.Tween.begin(anim.now(), anim.motion.duration.fast, anim.motion.enter);
     if (!anim.start(&self.animator)) self.finishMotion(hwnd);
+}
+
+/// Whether the last successful paint is of the current size and DPI (the
+/// opt-in composition path checks its own frame).
+fn frameReady(self: *Popup, hwnd: w32.HWND) bool {
+    if (self.composition_requested) return self.compositionReady(hwnd);
+    const frame = self.successful_frame orelse return false;
+    const size = self.openFrame(hwnd) orelse return false;
+    return std.meta.eql(frame, size);
+}
+
+/// A modal popup revealed without a frame (`RevealTimeout.reveal`): paint
+/// again every `repaint_retry_ms` until a frame of its size and DPI succeeds.
+fn retryPaint(self: *Popup, hwnd: w32.HWND) void {
+    const cookie = self.uia_cookie;
+    _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
+    const current = livePopup(hwnd, cookie) orelse return;
+    if (!current.repaint_retry) return;
+    if (current.frameReady(hwnd)) {
+        current.repaint_retry = false;
+        log.info("popup painted after an unpainted reveal", .{});
+        return;
+    }
+    if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, repaint_retry_ms, null) == 0) current.repaint_retry = false;
 }
 
 fn animTick(animator: *anim.Animator, now: u64) bool {
@@ -1101,8 +1228,9 @@ fn markOpenReady(self: *Popup, hwnd: w32.HWND, at: perf.Instant) void {
 /// Stop a reveal or fade in progress (hiding).
 fn endMotion(self: *Popup, hwnd: w32.HWND) void {
     self.open_timing = null;
+    if (self.revealing or self.repaint_retry) _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
+    self.repaint_retry = false;
     if (self.revealing) {
-        _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
         setCloaked(hwnd, false);
         self.revealing = false;
     }
@@ -1787,6 +1915,7 @@ fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
     self.visible = false;
     self.focused = false;
     self.revealing = false;
+    self.repaint_retry = false;
     self.repeat_tag = null;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
 }

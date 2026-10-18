@@ -1592,6 +1592,36 @@ fn windowOf(hwnd: w32.HWND) ?*Window {
 var open_dialogs: [max_depth]*Dialog = undefined;
 var open_count: usize = 0;
 
+/// The popup of a dialog: activating, closed only by an answer (Escape and
+/// Alt+F4 answer Cancel themselves), and revealed even when its first frame
+/// cannot be painted, so the question stays answerable and never answers
+/// itself (`Popup.RevealTimeout.reveal`).
+fn popupOptions(spec: Spec, tokens: style.Tokens) Popup.Options {
+    return .{
+        .activate = true,
+        .dismiss_on_escape = false,
+        .dismiss_on_outside_click = false,
+        .close_owner_on_close = false,
+        .corners = .round,
+        .shadow = true,
+        .border_color = tokens.border,
+        .dark = tokens.dark,
+        .accessible_name = spec.window_title orelse spec.title,
+        .reveal_timeout = .reveal,
+    };
+}
+
+test "P4 a dialog stays up and answerable when its first frame fails" {
+    const tokens = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
+    const options = popupOptions(.{ .title = "Close Terminal?", .body = "", .buttons = &.{.{ .label = "Close", .choice = .accept }} }, tokens);
+    try std.testing.expectEqual(Popup.RevealTimeout.reveal, options.reveal_timeout);
+    try std.testing.expect(options.activate and !options.dismiss_on_outside_click and !options.dismiss_on_escape);
+    try std.testing.expect(!options.reuse_host);
+    try std.testing.expectEqualStrings("Close Terminal?", options.accessible_name);
+    // Everything else (menus, the palette, settings) cancels instead.
+    try std.testing.expectEqual(Popup.RevealTimeout.cancel, (Popup.Options{}).reveal_timeout);
+}
+
 fn run(owner_: ?w32.HWND, spec: Spec) Answer {
     if (depth >= max_depth) {
         log.warn("too many nested dialogs, declining title={s}", .{spec.title});
@@ -1613,17 +1643,7 @@ fn run(owner_: ?w32.HWND, spec: Spec) Answer {
     };
     dialog.focus = dialog.buttonIndex(dialog.defaultButton());
 
-    dialog.popup.create(app.hinstance, owner, factory, .{
-        .activate = true,
-        .dismiss_on_escape = false,
-        .dismiss_on_outside_click = false,
-        .close_owner_on_close = false,
-        .corners = .round,
-        .shadow = true,
-        .border_color = dialog.tokens.border,
-        .dark = dialog.tokens.dark,
-        .accessible_name = spec.window_title orelse spec.title,
-    }, .{
+    dialog.popup.create(app.hinstance, owner, factory, popupOptions(spec, dialog.tokens), .{
         .ctx = &dialog,
         .paint = onPaint,
         .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
