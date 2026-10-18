@@ -128,7 +128,7 @@ Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --ex
 | MIG-01 | 按原生已绘制 tabRect 实际拖动；先在按键抬起时逐像素校准 SendInput 落点，再在同一次按下中跨越边界：阈值内一侧在 `GetCursorPos` 确认落点后等 ≥250 ms、隔 300 ms 读两次（横向 drag.active=0；纵向窗口数不变、无 move loop），越过一侧再等到 drag.active=1 / 新窗口 |
 | MIG-02 / MIG-02b / MIG-03 | 多进程完整嵌套树、0.3125/0.6875、zoom、手动标题、活动 core；每叶先输出 200 行，再核原源进程隐藏宿主的 HWND/PTY PID+birth/history；拖回与实际 shell marker |
 | MIG-02-local | 同进程跨窗合并与拆出完整树，经 CONTROL 3/4 直接调用产品 `moveTabToWindow` / `detachTabForDrag`（没有鼠标手势；手势见 MIG-04），核每个真实子 HWND 的父子关系和原 PTY |
-| MIG-04 | Session 恢复 64 tab 目标与单 tab 源，两窗按主屏工作区并排且整窗可见；真实手势：在源 tab 上按下，纵向越过 15 DIP 触发产品 detach，等到源线程进入原生 SC_MOVE 循环（`GUI_INMOVESIZE`），沿途只经自有窗口移到目标 tab 栏后松开。断言释放点最上层是目标、源窗随指针位移、门控计数 drops/full_refusals/merges 恰为 +1/+1/0，目标仍 64、源树/core/PTY 保持；同一 controller 再删目标一个 tab 做正对照，同一手势必须 +1/0/+1 合入并保持完整树。未开“拖动时显示窗口内容”记环境 PENDING |
+| MIG-04 | Session 恢复 64 tab 目标与单 tab 源，两窗按主屏工作区并排、纵向居中且整窗可见（顶部附近拖动标题栏会出现 Windows 11 Snap 布局栏，先于目标拥有落点）；真实手势：在源 tab 上按下，纵向越过 15 DIP 触发产品 detach，等到源线程进入原生 SC_MOVE 循环（`GUI_INMOVESIZE`），沿途只经自有窗口移到目标 tab 栏后松开。断言手势前释放点最上层是目标、松开前记录 z 序命中、源窗随指针位移、门控计数 drops/full_refusals/merges 恰为 +1/+1/0 且产品记录 `fixture_transfer_target` 恰为目标窗的 `full`，目标仍 64、源树/core/PTY 保持；同一 controller 再删目标一个 tab 做正对照，同一手势必须 +1/0/+1、产品记录为目标窗 `local`，合入并保持完整树。未开“拖动时显示窗口内容”记环境 PENDING |
 | MIG-05 | 每个叶位置的真实 SetParent 失败（已移动的 HWND 回滚）；WH_CALLWNDPROC 在实际 SetParent 内同步尝试嵌套迁移，检查事务拒绝而非停止 shell |
 | MIG-07 | `--remote-controls <F3>/A2r-fix/remote-controls.json`：先轮询 capability 等于 magic，再取基线；先测无丢失时单字符的 input_applied 增量作对照，武装一次 ACK 丢弃后输入 x，要求 ack_dropped 恰 +1、input_query_count 增加、input_applied 增量与对照相同；原 cmd 的 `set /p` 输出文件恰为 `x` |
 | MIG-08 | 迁移后关闭原普通源窗口（同样要 `--remote-controls`），capability 仍就绪；Ctrl+Shift+F 前切到美式键盘（结束恢复原输入语言），继续远程 split、search 与 wheel；远程 scrollback 三项（实时状态量，不当单调值）在底部满足 offset+viewport=total，wheel 后 offset 变小，并与源进程隐藏宿主本地 PageList 查询一致 |
@@ -167,7 +167,7 @@ ID 只在同一 HWND 内唯一；新增前先查本表。GhosttyWindow 上 A3 �
 | 同上 | 30 / 31 / 32 / 33 | 已绘制 tab 的屏幕像素 x/y/width/height |
 | 同上 | 40 / 41 | SetParent 内真实同步重入数 / 事务拒绝数 |
 | 同上 | 100 / 101 / 102 / 103 / 104 / 105 / 106 | hotkey attempts/successes、GUI toggle、GUI IPC execute、剩余 window failure、当前持久热键数、实际 IME composition 消息数 |
-| 同上 | 107 / 108 / 109 | App 级真实标签拖放：原生 move loop 结束后进入目标查找的次数 / 命中活着的满 64 窗口而拒绝的次数 / 本地合入成功次数 |
+| 同上 | 107 / 108 / 109 | App 级真实标签拖放：原生 move loop 结束后进入目标查找的次数 / 命中活着的满 64 窗口而拒绝的次数 / 本地合入成功次数；每次查找另记日志 `fixture_transfer_target outcome=full\|unavailable\|no_slot\|local\|foreign\|peer\|none hwnd=0x… pid=N class=<ASCII 类名>` |
 | 同上 | 200 / 201 | 真实 OLE Drop 回调数 / owned payload 成功排入数 |
 
 同进程其他测试消息（不归 A3，均须同一门）：
@@ -235,6 +235,11 @@ medium: receipt --root <private> --name BRK-03 --expect target_gone
 若 `<case>-native.json`、回执截图、review 或 target-gone 文件已存在即拒绝，换新 `--name`。
 
 ### 宿主副作用说明
+
+- controller 的 stage 配置把分屏焦点绑定为 Ctrl+Alt+Shift+J/K（不用 Ctrl+Alt+L/H），启动前用与
+  产品 `shortcut_conflicts.zig` 相同的 RegisterHotKey/UnregisterHotKey 探测所有要注入的组合键；
+  被其他程序注册为全局热键的组合键会被 Windows 投递给那个程序，故探测到即环境 PENDING，
+  绝不注入。
 
 - UIA-03 与 MIG-08 / MIG-08-local 会切换自有 GUI 线程的输入语言（默认“所有应用同一
   输入法”时对其他应用可见），结束时恢复；恢复结果写入 report 的 `input_language`，
