@@ -5,6 +5,7 @@ config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 window-save-state = never
+keybind = f12=start_search
 """
 expect = [
   "before-close: the focused find field reads needle and has matches while ping is running",
@@ -13,9 +14,6 @@ expect = [
   "unbound-confirm: after removing the Alt+F4 binding and reopening the find field, Alt+F4 still asks to close the window",
   "unbound-cancel-ends-search: after cancelling the unbound close path the window remains, but the search bar has ended",
 ]
-
-[[step]]
-action = "ime_off"
 
 [[step]]
 action = "move"
@@ -33,7 +31,7 @@ seconds = 1.0
 
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"
@@ -101,6 +99,7 @@ text = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 window-save-state = never
+keybind = f12=start_search
 keybind = alt+f4=unbind
 """
 
@@ -114,7 +113,7 @@ seconds = 1.0
 
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"

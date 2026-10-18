@@ -4,9 +4,13 @@ title = "Editing chords in the search bar stay in the search box and never reach
 # counter, Enter/F3/Shift+F3 from the bar and the terminal, a button tooltip, focus without a
 # caret, No results, the 240 DIP clamp in a narrow pane, the hovered-URL preview and the resize
 # overlay.
+# Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch, so this scenario opens
+# the search bar with F12 (start_search, bound below), a key no input method takes: it needs no
+# keyboard layout switch and runs the same with any input method.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+keybind = f12=start_search
 """
 expect = [
   "search-box: the typed text and the editing chords stayed in the search box (Ctrl+Backspace and Ctrl+Delete remove the words abc and x, leaving `needle`)",
@@ -32,13 +36,9 @@ in = "terminal:0"
 x = "50%"
 y = "50%"
 
-# Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch.
-[[step]]
-action = "ime_off"
-
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"
@@ -117,7 +117,7 @@ seconds = 0.5
 # Reopening keeps the previous text selected; Ctrl+A and typing replace it.
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"
@@ -215,7 +215,7 @@ what = "all"
 # Back into the bar: nothing matches.
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "sleep"
@@ -384,7 +384,7 @@ seconds = 1.0
 
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"
