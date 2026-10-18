@@ -37,6 +37,7 @@
   - `search_*` 的 arena 由渲染器接管，替换时 deinit 旧值；匹配可能指向已失效的 PageList 节点，用前要校验。
 - **后端对等**：generic 层只依赖两个后端共有的类型（`Target`、`Buffer`、`Texture`、`Sampler`、`RenderPass`、`Pipeline`、`shaders`）与工厂函数，可选钩子用 `@hasDecl` 探测（`threadEnter`/`threadExit`、`loopEnter`/`loopExit`、`displayRealized`、`setViewport`）。uniform 与顶点结构成对维护：`src/renderer/opengl/shaders.zig` 对 `src/renderer/shaders/glsl/*.glsl`（std140），`src/renderer/metal/shaders.zig` 对 `src/renderer/shaders/shaders.metal`，`src/renderer/shadertoy.zig::Uniforms` 对 `shadertoy_prefix.glsl`（已有测试锁定部分偏移）。`custom_shader_y_is_down`（OpenGL 为 false、Metal 为 true）决定 GTK 是否翻转纹理。
 - **Health 跨后端共享**：某后端到达不了的状态也保留；增值要同步 `include/ghostty.h`（见 `libghostty-embedding.md`）与 macOS app。
+- **目标编码空间**：OpenGL 的 Target 与自定义着色器中间纹理按 `alpha-blending` 选格式：`linear`/`linear-corrected` 用 sRGBA（着色器输出线性值，写入经 `GL_FRAMEBUFFER_SRGB` 编码），`native` 用 RGBA8 存着色器已编码的 RGB，不再二次编码（GX-0051）；图片与彩色 atlas 的源格式不随模式变。
 - **失败可降级**：自定义着色器加载或编译失败只记日志，退化为无后处理。只有 `presentation_health` 为 `healthy` 才尝试导出 DMABUF，失败即退回 CPU 回读；导出纹理必须是非 sRGB 的 RGBA8（Mesa 不能导出 sRGB），blit 时临时关闭 `GL_FRAMEBUFFER_SRGB`。OpenGL 的 `Frame.complete` 忽略 `sync`，帧经 `LatestFrame` 交给 apprt，只留最新一帧。
 - **帧节奏**：常规渲染由 `wakeup` 驱动；`synchronized_output` 下 `updateFrame` 直接返回；不可见时动画全部暂停；动画唤醒间隔下限是 `draw_interval_ms`；`terminal_state` 按帧数定期整体重建以回收内存。
 - **cell 缓冲**：`src/renderer/cell.zig::Contents.fg_rows` 不得用 `appendAssumeCapacity`（组合字符与多字形替换会超出初始容量）；`fg_rows[0]` 专用于光标，保证光标是 GPU 缓冲的首项。`generic.zig` 的 `rebuildRow` 在输入法预编辑区之后追赶字形游标时以 `shaper_cells_unwrapped.len` 为界（补丁 GX-0021，铺满背景色的空格子没有字形）。

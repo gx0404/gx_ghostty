@@ -622,7 +622,8 @@ fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) 
 
     for (argv, 0..) |arg, arg_i| {
         if (arg_i != 0) try writer.writeByte(' ');
-        if (mem.indexOfAny(u8, arg, " \t\n\"") == null) {
+        // fork(gx): GX-0053 empty arguments need quotes to survive argv decoding.
+        if (arg.len != 0 and mem.indexOfAny(u8, arg, " \t\n\"") == null) {
             try writer.writeAll(arg);
             continue;
         }
@@ -649,6 +650,65 @@ fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) 
 
     return buf.toOwnedSliceSentinel(0);
 }
+
+// fork(gx): GX-0053 begin: verify process argv with the native Windows decoder
+test "Command: D23 native Windows argv preserves empty arguments" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const cases = [_][]const []const u8{
+        &.{ "ghostty.exe", "" },
+        &.{ "ghostty.exe", "", "middle", "", "" },
+        &.{ "C:\\Program Files\\ghostty.exe", "", "with space", "" },
+    };
+    for (cases) |args| {
+        const command = try windowsCreateCommandLine(testing.allocator, args);
+        defer testing.allocator.free(command);
+        try expectWindowsCommandLine(args, command);
+    }
+}
+
+test "Command: D23 Windows quoting agrees with GX for slashes quotes and Unicode" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const args = [_][]const u8{
+        "C:\\Program Files\\Ghostty\\ghostty.exe",
+        "C:\\plain\\",
+        "C:\\with space\\",
+        "C:\\中文\\\\",
+        "C:\\中文 space\\\\",
+        "embedded\"quote",
+        "one\\\"two\\\\\"three",
+        "\\\\server\\share\\\\",
+        " ",
+        "\t",
+        "\n",
+    };
+    const command = try windowsCreateCommandLine(testing.allocator, &args);
+    defer testing.allocator.free(command);
+    const gx_command = try @import("gx/windows_argv.zig").encodeUtf8(testing.allocator, &args);
+    defer testing.allocator.free(gx_command);
+    // The wire strings may differ: GX always quotes, Command quotes only
+    // when needed. The arguments received by Windows must be identical.
+    try expectWindowsCommandLine(&args, command);
+    try expectWindowsCommandLine(&args, gx_command);
+}
+
+fn expectWindowsCommandLine(args: []const []const u8, command: []const u8) !void {
+    const Native = struct {
+        extern "shell32" fn CommandLineToArgvW([*:0]const u16, *c_int) callconv(.winapi) ?[*][*:0]u16;
+        extern "kernel32" fn LocalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
+    };
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(testing.allocator, command);
+    defer testing.allocator.free(wide);
+    var count: c_int = 0;
+    const parsed = Native.CommandLineToArgvW(wide, &count) orelse return error.DecodeFailed;
+    defer _ = Native.LocalFree(@ptrCast(parsed));
+    try testing.expectEqual(@as(c_int, @intCast(args.len)), count);
+    for (args, 0..) |arg, i| {
+        const decoded = try std.unicode.utf16LeToUtf8Alloc(testing.allocator, mem.span(parsed[i]));
+        defer testing.allocator.free(decoded);
+        try testing.expectEqualStrings(arg, decoded);
+    }
+}
+// fork(gx): GX-0053 end
 
 test "createNullDelimitedEnvMap" {
     const allocator = testing.allocator;

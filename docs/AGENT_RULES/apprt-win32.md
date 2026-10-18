@@ -37,7 +37,7 @@
 
 - GUI 线程跑 `App.run` 的 `GetMessageW` 循环，HWND、GDI、Direct2D 与 COM UI 对象只在它上面创建和使用。`App.wakeup` 可从任意线程调用，只向 `msg_hwnd` 投递 `WM_APP_WAKEUP`，收到后执行 `core_app.tick`。
 - `wgl.Device` 一次选定 OpenGL 实现：系统驱动能建 4.3 core context 就用它，否则用 exe 旁 `mesa\opengl32.dll` 的 llvmpipe（`GHOSTTY_GX_OPENGL=software` 直接用 Mesa）。pixel format 在主线程设定，context 在渲染线程的 `threadEnter` 创建（NVIDIA 下 `wglMakeCurrent` 会瞬时失败，按次数重试）。
-- `present` blit 后 `SwapBuffers`，再经 `@hasDecl` 回调 `Surface.signalFrameDrawn` 置位 `frame_event`。只有远程源的隐藏宿主经 GX-0043 在渲染线程读回 BGRA 写进 `RemoteHost` 映射，GUI 不调 GL。GPU 重置时 `present` 重建 context 并持 `draw_mutex` 调 `Surface.gpuContextReset`（只标记未 realize 并投递 `WM_APP_GPU_RESET`），GUI 线程经 `GR` 计时器等资源释放后重新 realize。
+- `present` blit 后 `SwapBuffers`，再经 `@hasDecl` 回调 `Surface.signalFrameDrawn` 置位 `frame_event`。只有远程源的隐藏宿主经 GX-0043 在渲染线程读回 BGRA 写进 `RemoteHost` 映射，GUI 不调 GL。GPU 重置时 `present` 留旧 context、持 `draw_mutex` 调 `Surface.gpuContextReset`（标未 realize、投 `WM_APP_GPU_RESET`）；帧归还后 GX-0050 在旧 context 释放资源再换新的，GUI 经 `GR` 计时器再 realize。
 - `frame_event` 手动复位：live resize 时发布目标尺寸，`Window.PaneLayout` 调 `Surface.awaitResizeFrames` 以一个 16 ms deadline 等各 pane 的匹配尺寸帧；新窗口首帧前保持 cloak，`WM_APP+31` 按 core id 揭幕，`FIRST_FRAME_TIMER_ID` 以 `Window.first_frame_timeout_ms`（300 ms）兜底。
 
 ### 消息与计时器 ID 登记表

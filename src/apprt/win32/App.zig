@@ -2979,7 +2979,7 @@ fn updateConfig(self: *App, config: *const Config) void {
     var old = self.config;
     defer old.deinit();
     self.config = new_config;
-    if (old.changed(&self.config, .@"gx-launch-profile") or old.changed(&self.config, .language)) self.shell.jump_list_dirty = true;
+    self.shell.onConfigChange(old.changed(&self.config, .@"gx-launch-profile") or old.changed(&self.config, .language));
     repairWorkingDirectory(&self.config);
     if (old.changed(&self.config, .@"bell-audio-path") or
         old.changed(&self.config, .@"bell-audio-volume") or

@@ -34,6 +34,18 @@ pub const custom_shader_target: shadertoy.Target = .glsl;
 // The fragCoord for OpenGL shaders is +Y = up.
 pub const custom_shader_y_is_down = false;
 
+// fork(gx): GX-0051 begin: verify the color contract through injected GL calls.
+test "D-16 final targets follow the blending mode on rebuild" {
+    try @import("opengl/gx_color_test.zig").targetFormats();
+}
+test "D-16 custom shader intermediates follow the blending mode" {
+    try @import("opengl/gx_color_test.zig").intermediateFormats();
+}
+test "D-16 image and atlas sampling formats remain mode independent" {
+    try @import("opengl/gx_color_test.zig").sampledFormats();
+}
+// fork(gx): GX-0051 end
+
 /// Triple-buffering gives the GPU room to pipeline renders without
 /// having to wait on the apprt consuming previous frames.
 // fork(gx): GX-0004 Windows presents (and finishes) every frame before the next, so one is enough
@@ -262,7 +274,12 @@ pub fn threadExit(self: *OpenGL) void {
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-    _ = self;
+    // fork(gx): GX-0050 begin: failed recovery has no current GL context.
+    if (comptime builtin.os.tag == .windows) {
+        if (!self.wgl_context.drawable()) return error.ContextLost;
+    }
+    // fork(gx): GX-0050 end
+    // fork(gx): GX-0050 replaces the now-invalid unused self discard.
     var viewport: [4]gl.c.GLint = undefined;
     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
     return .{
@@ -276,7 +293,12 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
 /// This used to be automatically called by the GtkGLArea upon resizing,
 /// but now we need to do this manually.
 pub fn setViewport(self: *const OpenGL, width: u32, height: u32) void {
-    _ = self;
+    // fork(gx): GX-0050 begin: mailbox resizes must not use unloaded GLAD.
+    if (comptime builtin.os.tag == .windows) {
+        if (!self.wgl_context.drawable()) return;
+    }
+    // fork(gx): GX-0050 end
+    // fork(gx): GX-0050 replaces the now-invalid unused self discard.
     gl.viewport(0, 0, @intCast(width), @intCast(height)) catch |err| {
         log.warn("failed to set OpenGL viewport err={}", .{err});
     };
@@ -293,7 +315,15 @@ pub fn drawFrameStart(self: *OpenGL) void {
 ///
 /// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
-    _ = self;
+    // fork(gx): GX-0050 begin: the completed frame has returned its permit.
+    if (comptime builtin.os.tag == .windows) {
+        self.wgl_context.finishRecovery(self.device) catch |err| {
+            log.err("cannot recreate the OpenGL context err={}", .{err});
+        };
+        return;
+    }
+    // fork(gx): GX-0050 end
+    // fork(gx): GX-0050 replaces the now-invalid unused self discard.
 }
 
 pub fn initShaders(
@@ -310,10 +340,13 @@ pub fn initShaders(
 
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
-    _ = self;
+    // fork(gx): GX-0051 self now supplies the target color space.
     return Target.init(.{
         .width = width,
         .height = height,
+        // fork(gx): GX-0051 begin: only linear shader output needs encoding.
+        .srgb = self.blending.isLinear(),
+        // fork(gx): GX-0051 end
     });
 }
 
@@ -394,10 +427,11 @@ pub const bgImageBufferOptions = bufferOptions;
 
 /// Returns the options to use when constructing textures.
 pub inline fn textureOptions(self: OpenGL) Texture.Options {
-    _ = self;
+    // fork(gx): GX-0051 self also controls custom shader ping-pong targets.
     return .{
         .format = .rgba,
-        .internal_format = .srgba,
+        // fork(gx): GX-0051 keep intermediate writes and samples in the same space.
+        .internal_format = if (self.blending.isLinear()) .srgba else .rgba,
         .target = .@"2d",
         .min_filter = .linear,
         .mag_filter = .linear,

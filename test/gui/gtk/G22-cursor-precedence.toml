@@ -1,5 +1,5 @@
 id = "G22"
-title = "Bash and Zsh cursor integration versus configured defaults and DECSCUSR"
+title = "Bash and Zsh prompt cursor versus configuration, gx-prompt-cursor and DECSCUSR"
 lang = "en"
 config = """
 command = direct:/bin/bash --noprofile --norc
@@ -10,50 +10,153 @@ env = HISTFILE=/dev/null
 script = '''
 import shlex
 import os
+import signal
+import select
+import termios
+import time
 private_home = config_home / "shell-home"
 private_home.mkdir()
+integration_file = private_home / "integration.txt"
 (private_home / ".zshrc").write_text("PROMPT='R6-ZSH%# '\nprintf '%s\\n' \"$GHOSTTY_SHELL_FEATURES|$_ghostty_state\" > \"$HOME/integration.txt\"\n")
 # Set inherited environment before launching Ghostty. Config env=ZDOTDIR is
 # applied after automatic injection and would deliberately override its path.
 os.environ.update(HOME=str(private_home), ZDOTDIR=str(private_home), HISTFILE="/dev/null")
+# Zsh starts with vi bindings when EDITOR or VISUAL mentions vi; every case
+# below selects its key bindings explicitly instead.
+for name in ("EDITOR", "VISUAL"):
+    os.environ.pop(name, None)
 probe = private_home / "cursor_probe.py"
 probe.write_text("""import os,sys,termios,tty,select,time,json
 from pathlib import Path
-old=termios.tcgetattr(0)
-try:
- tty.setraw(0)
- os.write(1,b'\\x1b[2 q\\x1bP$q q\\x1b\\\\')
+def query(request):
+ os.write(1,request+b'\\x1bP$q q\\x1b\\\\')
  result=b''
  end=time.monotonic()+3
  while time.monotonic()<end:
   if select.select([0],[],[],0.1)[0]:
    result+=os.read(0,1024)
    if result.endswith(b'\\x1b\\\\'): break
- Path(sys.argv[1]).write_text(json.dumps({'request':'DECSCUSR 2','response_hex':result.hex()}))
+ return result.hex()
+old=termios.tcgetattr(0)
+try:
+ tty.setraw(0)
+ start=query(b'')
+ response=query(b'\\x1b[2 q')
+ Path(sys.argv[1]).write_text(json.dumps({'request':'DECSCUSR 2','start_hex':start,'response_hex':response}))
  os.write(1,b'\\r\\nR6 TUI STEADY BLOCK; PRESS ENTER\\r\\n')
  os.read(0,1)
 finally:
  termios.tcsetattr(0,termios.TCSANOW,old)
- os.write(1,b'\\x1b[0 q')
 """)
-results = []
+def decrqss(response):
+    prefix, suffix = b"\x1bP1$r", b" q\x1b\\"
+    assert response.startswith(prefix) and response.endswith(suffix), response
+    return int(response[len(prefix):-len(suffix)])
+def prompt_cursor(label, identity):
+    # Freeze only the owned shell's input reader. Query through its PTY slave
+    # without executing a command, so preexec cannot mask the prompt's state.
+    def state():
+        fields = Path(f"/proc/{identity['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+        assert int(fields[19]) == identity["birth"], "shell PID was reused"
+        return fields[0]
+    state()
+    handle = os.pidfd_open(identity["pid"])
+    terminal = None
+    stopped = False
+    try:
+        state()
+        terminal = os.open(identity["fd0"], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        assert not termios.tcgetattr(terminal)[3] & termios.ICANON, "shell is not reading a prompt"
+        signal.pidfd_send_signal(handle, signal.SIGSTOP)
+        stopped = True
+        for _ in range(100):
+            if state() == "T": break
+            sleep(0.01)
+        assert state() == "T", "owned shell did not stop"
+        os.write(terminal, b"\x1bP$q q\x1b\\")
+        response = b""
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if select.select([terminal], [], [], 0.1)[0]:
+                response += os.read(terminal, 1024)
+                if response.endswith(b"\x1b\\"): break
+        value = decrqss(response)
+        save("-" + label + "-prompt-query.json", json.dumps({"identity":identity,"response_hex":response.hex(),"value":value},indent=2))
+        return value
+    finally:
+        if stopped:
+            try:
+                signal.pidfd_send_signal(handle, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        if terminal is not None:
+            os.close(terminal)
+        os.close(handle)
 config_file = config_home / "ghostty/config.ghostty"
+def configure(shell, settings):
+    command = "direct:/bin/bash --noprofile --norc" if shell == "bash" else "direct:/usr/bin/zsh -d"
+    config_file.write_text(f"language = en\ncommand = {command}\nconfirm-close-surface = false\nenv = HISTFILE=/dev/null\n{settings}")
+def start(label, shell):
+    integration_file.unlink(missing_ok=True)
+    xdo("mousemove", 400, 300, "click", 1)
+    restart()
+    if shell == "zsh":
+        for _ in range(50):
+            if integration_file.exists(): break
+            sleep(0.1)
+        integration = integration_file.read_text()
+        assert "|0" in integration, integration
+        save("-" + label + "-integration.txt", integration)
+    xdo("mousemove", 400, 300, "click", 1)
+    sleep(0.2)
+    capture(label + "-prompt")
+    shells = [row for row in processes(label + "-shell") if Path(row["exe"]).name == shell]
+    assert len(shells) == 1, shells
+    return shells[0]
+def check_features(label, identity, cursor_features):
+    # The environment Ghostty gave the shell: upstream setupFeatures, plus the
+    # GX feature right after the cursor feature for gx-prompt-cursor = config.
+    environ = Path(f"/proc/{identity['pid']}/environ").read_bytes().split(b"\0")
+    values = [item.split(b"=", 1)[1].decode() for item in environ if item.startswith(b"GHOSTTY_SHELL_FEATURES=")]
+    features = values[0].split(",") if values else []
+    save("-" + label + "-features.json", json.dumps(features))
+    assert [feature for feature in features if feature.startswith("cursor")] == cursor_features, (label, features)
+def run_program(label):
+    output = evidence / (label + "-query.json")
+    xdo("type", "--clearmodifiers", "--delay", 1, "python3 " + shlex.quote(str(probe)) + " " + shlex.quote(str(output)))
+    xdo("key", "Return")
+    for _ in range(60):
+        if output.exists(): break
+        sleep(0.1)
+    assert output.exists(), label
+    result = json.loads(output.read_text())
+    assert decrqss(bytes.fromhex(result["response_hex"])) == 2, result
+    capture(label + "-tui")
+    xdo("key", "Return")
+    sleep(0.4)
+    return result, decrqss(bytes.fromhex(result["start_hex"]))
+def command(text):
+    xdo("type", "--clearmodifiers", "--delay", 1, text)
+    xdo("key", "Return")
+    sleep(0.5)
+def expect_prompt(label, identity, expected):
+    value = prompt_cursor(label, identity)
+    assert value == expected, (label, expected, value)
+    capture(label)
+    return value
+results = []
 for shell in ("bash", "zsh"):
     for feature in ("cursor", "no-cursor"):
         for style in ("block", "bar", "underline"):
             for blink in (False, True):
                 label = f"{shell}-{feature}-{style}-{'blink' if blink else 'steady'}"
-                command = "direct:/bin/bash --noprofile --norc" if shell == "bash" else "direct:/usr/bin/zsh -d"
-                config_file.write_text(f"language = en\ncommand = {command}\nconfirm-close-surface = false\nenv = HISTFILE=/dev/null\ncursor-style = {style}\ncursor-style-blink = {str(blink).lower()}\nshell-integration-features = {feature}\n")
-                xdo("mousemove", 400, 300, "click", 1)
-                restart()
-                if shell == "zsh":
-                    integration = (private_home / "integration.txt").read_text()
-                    assert "|0" in integration, integration
-                    save("-" + label + "-integration.txt", integration)
-                xdo("mousemove", 400, 300, "click", 1)
-                sleep(0.2)
-                capture(label + "-prompt")
+                configure(shell, f"cursor-style = {style}\ncursor-style-blink = {str(blink).lower()}\nshell-integration-features = {feature}\n")
+                identity = start(label, shell)
+                hint = "cursor:blink" if blink else "cursor:steady"
+                check_features(label, identity, [hint, "cursor:config"] if feature == "cursor" else [])
+                configured = {"block":1,"underline":3,"bar":5}[style] + (0 if blink else 1)
+                initial_cursor = prompt_cursor(label + "-initial", identity)
+                assert initial_cursor == configured, (label, configured, initial_cursor)
                 if blink:
                     xdo("type", "x")
                     xdo("key", "BackSpace")
@@ -61,26 +164,68 @@ for shell in ("bash", "zsh"):
                     capture(label + "-prompt-active")
                     sleep(0.65)
                     capture(label + "-prompt-idle")
-                output = evidence / (label + "-query.json")
-                xdo("type", "--clearmodifiers", "--delay", 1, "python3 " + shlex.quote(str(probe)) + " " + shlex.quote(str(output)))
-                xdo("key", "Return")
-                for _ in range(60):
-                    if output.exists(): break
-                    sleep(0.1)
-                assert output.exists(), label
-                result = json.loads(output.read_text())
-                assert bytes.fromhex(result["response_hex"]) == b"\x1bP1$r2 q\x1b\\", result
-                capture(label + "-tui")
-                xdo("key", "Return")
-                sleep(0.4)
-                results.append({"case":label,"configured_style":style,"configured_blink":blink,"feature":feature,"shell":shell,**result})
+                result, program_start = run_program(label)
+                # A program that requests no style of its own starts with the configured one.
+                assert program_start == configured, (label, configured, program_start)
+                returned_cursor = prompt_cursor(label + "-returned", identity)
+                assert returned_cursor == (configured if feature == "cursor" else 2), (label, configured, returned_cursor)
+                capture(label + "-returned")
+                results.append({"case":label,"configured_style":style,"configured_blink":blink,"feature":feature,"shell":shell,
+                                "prompt_before":initial_cursor,"program_start":program_start,"prompt_returned":returned_cursor,**result})
 save("-cursor-matrix.json", json.dumps(results,indent=2))
+modes = []
+def zsh_bindings(label, settings, cursor_features, emacs, insert, command_mode):
+    configure("zsh", settings)
+    identity = start(label, "zsh")
+    check_features(label, identity, cursor_features)
+    record = {"case":label,"settings":settings,"emacs":expect_prompt(label + "-emacs", identity, emacs)}
+    command("KEYTIMEOUT=1; bindkey -v")
+    record["vi_insert"] = expect_prompt(label + "-vi-insert", identity, insert)
+    xdo("key", "Escape")
+    sleep(0.3)
+    record["vi_command"] = expect_prompt(label + "-vi-command", identity, command_mode)
+    xdo("key", "i")
+    sleep(0.3)
+    record["vi_insert_again"] = expect_prompt(label + "-vi-insert-again", identity, insert)
+    command("bindkey -e")
+    record["emacs_again"] = expect_prompt(label + "-emacs-again", identity, emacs)
+    modes.append(record)
+# Zsh vi bindings keep upstream's bar while inserting and block in command
+# mode; emacs bindings show the configured cursor at the prompt.
+zsh_bindings("zsh-underline-steady", "cursor-style = underline\ncursor-style-blink = false\nshell-integration-features = cursor\n",
+             ["cursor:steady", "cursor:config"], 4, 6, 2)
+# The GX default blinking block keeps the vi modes distinguishable.
+zsh_bindings("zsh-gx-default", "shell-integration-features = cursor\n", ["cursor:blink", "cursor:config"], 1, 5, 1)
+# gx-prompt-cursor = bar is upstream: a bar at every prompt, vi modes as above.
+zsh_bindings("zsh-prompt-bar", "gx-prompt-cursor = bar\nshell-integration-features = cursor\n", ["cursor:blink"], 5, 5, 1)
+# With gx-prompt-cursor = bar, programs still start with the configured
+# cursor-style (the GX default blinking block) and the prompt returns to a bar.
+for shell in ("bash", "zsh"):
+    label = shell + "-prompt-bar-program"
+    configure(shell, "gx-prompt-cursor = bar\nshell-integration-features = cursor\n")
+    identity = start(label, shell)
+    check_features(label, identity, ["cursor:blink"])
+    record = {"case":label,"prompt_before":expect_prompt(label + "-initial", identity, 5)}
+    # The blinking bar may be in its off phase; a key press shows it.
+    xdo("type", "x")
+    xdo("key", "BackSpace")
+    sleep(0.03)
+    capture(label + "-prompt-active")
+    result, record["program_start"] = run_program(label)
+    assert record["program_start"] == 1, record
+    record["prompt_returned"] = expect_prompt(label + "-returned", identity, 5)
+    modes.append(record | result)
+save("-modes.json", json.dumps(modes,indent=2))
 '''
 expect = [
   "G22.png: an isolated initial Bash terminal",
-  "*-prompt.png: read the visible prompt cursor for each shell, integration feature, shape and blink setting",
+  "*-prompt.png: each case's first prompt; in the bash/zsh x cursor/no-cursor x block/bar/underline x blink/steady matrix the configured cursor shows and the direct PTY query must match",
   "*-prompt-active.png and *-prompt-idle.png: blinking cases include a key-woken frame and a later frame",
-  "*-tui.png: a steady block requested by the test program; query JSON must contain the exact DECRQSS response for DECSCUSR 2",
-  "G22-after.png: the shell prompt returns after the final TUI exits",
+  "*-tui.png: a steady block requested by the test program; its query JSON holds the configured style at program start and the exact DECRQSS response for DECSCUSR 2",
+  "*-returned.png: cursor restores configuration after the TUI; no-cursor deliberately preserves the TUI's steady block",
+  "G22-zsh-underline-steady-*.png: emacs bindings show the configured steady underline; vi insert is a steady bar and vi command mode a steady block",
+  "G22-zsh-gx-default-*.png: with the GX default blinking block, emacs bindings show a block, vi insert a bar and vi command mode a block",
+  "G22-zsh-prompt-bar-*.png and G22-*-prompt-bar-program-*.png: gx-prompt-cursor = bar shows upstream's blinking bar at the prompt (visible in *-prompt-active.png and in frames caught in the on phase); the TUI starts with the configured blinking block",
+  "G22-after.png: the last Zsh prompt with gx-prompt-cursor = bar",
   "This GTK matrix does not substitute for the same configuration on Windows",
 ]

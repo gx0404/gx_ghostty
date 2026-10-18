@@ -740,8 +740,37 @@ test "bell audio WinMM structures match Windows SDK ABI offsets" {
 }
 
 fn awaitNativeCount(player: *Player, counter: *std.atomic.Value(usize), value: usize) !void {
+    return awaitNativeCountWithWait(player, counter, value, NativeWait{}) catch |err| {
+        if (err == error.WorkerTimeout) {
+            const audio = AudioService.query(std.unicode.utf8ToUtf16LeStringLiteral("Audiosrv"));
+            const endpoints = AudioService.query(std.unicode.utf8ToUtf16LeStringLiteral("AudioEndpointBuilder"));
+            std.debug.print("bell audio timeout: budget_ms={d} target={d} observed={d} thread_wait={d} stopping={} faulted={} issue=0x{x} started={d} completed={d} cache={} refs={d} Audiosrv={any} AudioEndpointBuilder={any}\n", .{
+                native_test_wait_ms,                                   value,                          counter.load(.acquire),
+                w32.WaitForSingleObject(player.thread.getHandle(), 0), player.stopping.load(.acquire), player.faulted.load(.acquire),
+                player.issue.load(.acquire),                           player.started.load(.acquire),  player.completed.load(.acquire),
+                player.cache_present.load(.acquire),                   player.refs.load(.acquire),     audio,
+                endpoints,
+            });
+        }
+        return err;
+    };
+}
+
+const native_test_wait_ms = 15_000;
+
+const NativeWait = struct {
+    fn now(_: @This()) i64 {
+        return std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds();
+    }
+    fn pause(_: @This()) !void {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+};
+
+fn awaitNativeCountWithWait(player: *Player, counter: *std.atomic.Value(usize), value: usize, wait: anytype) !void {
     std.debug.assert(@import("builtin").is_test);
-    for (0..300) |_| {
+    const start = wait.now();
+    while (true) {
         if (counter.load(.acquire) >= value) return;
         if (player.faulted.load(.acquire)) {
             // The worker publishes its issue before faulted. Only a missing
@@ -756,9 +785,83 @@ fn awaitNativeCount(player: *Player, counter: *std.atomic.Value(usize), value: u
                 return error.SkipZigTest;
             return error.NativeAudioFailed;
         }
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        if (wait.now() - start >= native_test_wait_ms) return error.WorkerTimeout;
+        try wait.pause();
     }
-    return error.WorkerTimeout;
+}
+
+// Read-only diagnostics, used only on a failed native test. A missing service
+// or access error is reported as such; neither is a reason to skip the test.
+const AudioService = struct {
+    const Status = extern struct {
+        service_type: u32,
+        state: u32,
+        accepted: u32,
+        exit_code: u32,
+        specific_exit: u32,
+        checkpoint: u32,
+        wait_hint: u32,
+        pid: u32,
+        flags: u32,
+    };
+    const Result = struct { state: u32 = 0, pid: u32 = 0, query_error: u32 = 0 };
+    fn query(name: [*:0]const u16) Result {
+        const manager = OpenSCManagerW(null, null, 1) orelse return failed();
+        defer _ = CloseServiceHandle(manager);
+        const service = OpenServiceW(manager, name, 4) orelse return failed();
+        defer _ = CloseServiceHandle(service);
+        var status: Status = undefined;
+        var needed: u32 = 0;
+        if (QueryServiceStatusEx(service, 0, @ptrCast(&status), @sizeOf(Status), &needed) == 0) return failed();
+        return .{ .state = status.state, .pid = status.pid };
+    }
+    fn failed() Result {
+        return .{ .query_error = @intFromEnum(std.os.windows.GetLastError()) };
+    }
+    extern "advapi32" fn OpenSCManagerW(?[*:0]const u16, ?[*:0]const u16, u32) callconv(.winapi) ?*anyopaque;
+    extern "advapi32" fn OpenServiceW(*anyopaque, [*:0]const u16, u32) callconv(.winapi) ?*anyopaque;
+    extern "advapi32" fn QueryServiceStatusEx(*anyopaque, u32, [*]u8, u32, *u32) callconv(.winapi) i32;
+    extern "advapi32" fn CloseServiceHandle(*anyopaque) callconv(.winapi) i32;
+};
+
+test "bell audio native wait tolerates delayed completion beyond three seconds" {
+    const t = std.testing;
+    const player = try Player.create(t.allocator, .{});
+    defer player.destroy();
+    // Advance a deterministic clock without a device or scheduler dependency.
+    const Delayed = struct {
+        counter: *std.atomic.Value(usize),
+        polls: usize = 0,
+        fn now(self: *@This()) i64 {
+            return @intCast(self.polls * 10);
+        }
+        fn pause(self: *@This()) !void {
+            self.polls += 1;
+            if (self.polls == 350) self.counter.store(1, .release);
+        }
+    };
+    var wait: Delayed = .{ .counter = &player.completed };
+    try awaitNativeCountWithWait(player, &player.completed, 1, &wait);
+    try t.expectEqual(@as(usize, 350), wait.polls);
+}
+
+test "bell audio native wait still fails when completion never arrives" {
+    const t = std.testing;
+    const player = try Player.create(t.allocator, .{});
+    defer player.destroy();
+    const Never = struct {
+        milliseconds: i64 = 0,
+        fn now(self: *@This()) i64 {
+            return self.milliseconds;
+        }
+        fn pause(self: *@This()) !void {
+            self.milliseconds += 10;
+        }
+    };
+    var wait: Never = .{};
+    try t.expectError(error.WorkerTimeout, awaitNativeCountWithWait(player, &player.completed, 1, &wait));
+    try t.expectEqual(@as(i64, 15_000), wait.milliseconds);
+    try t.expectEqual(@as(usize, 0), player.completed.load(.acquire));
 }
 
 test "bell audio native WinMM silent buffer completion reset and release" {
@@ -802,6 +905,7 @@ const Script = struct {
     loan: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(true),
     early: bool = false,
+    reset_completes: bool = true,
     blocked: std.atomic.Value(u32) = .init(0),
     entered: std.atomic.Value(u32) = .init(0),
     gate: ?w32.HANDLE = null,
@@ -862,7 +966,7 @@ const Script = struct {
     fn reset(ctx: ?*anyopaque, _: *anyopaque) u32 {
         const self = selfFrom(ctx);
         const code = self.enter(.reset);
-        if (code == 0) self.complete();
+        if (code == 0 and self.reset_completes) self.complete();
         return code;
     }
 
@@ -1128,6 +1232,52 @@ test "bell audio early and absent completion retain loan until unprepare succeed
     try player.request("not-a-file.wav", 0);
     try awaitFlag(&player.cache_present, false);
     try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+}
+
+test "bell audio absent callback and buffer return retain quarantine until the driver releases" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try testFile(tmp.dir, "bell.wav", 20000);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "bell.wav", t.allocator);
+    defer t.allocator.free(path);
+    // Reset returns success, but neither signals completion nor returns the
+    // loan. There will be no callback even when the test later returns it.
+    var script: Script = .{ .reset_completes = false };
+    script.done.store(false, .release);
+    const player = try Player.create(t.allocator, .{ .api = script.api() });
+    player.retain();
+    var destroyed = false;
+    defer {
+        releaseScript(&script);
+        if (!destroyed) player.destroy();
+        player.flushRetained() catch @panic("absent callback did not release ownership");
+    }
+    try player.request(path, 0.5);
+    try Observer.awaitCount(&player.started, 1);
+    try destroyWithinBudget(player);
+    destroyed = true;
+    try script.awaitCalls(.unprepare, 1);
+    try t.expectEqual(w32.WAIT_TIMEOUT, w32.WaitForSingleObject(player.finished_event, 0));
+    try t.expectEqual(w32.WAIT_TIMEOUT, w32.WaitForSingleObject(player.state.backend.event.?, 0));
+    try t.expectEqual(@as(usize, 0), player.completed.load(.acquire));
+    try t.expect(script.loan.load(.acquire));
+    try t.expect(player.cache_present.load(.acquire));
+    const header: *WaveHeader = @ptrFromInt(script.header_address.load(.acquire));
+    try t.expectEqual(&player.state.backend.header, header);
+    try t.expectEqual(@as(i16, 10000), std.mem.readInt(i16, header.data[0..2], .little));
+    for (0..100) |_| try t.expectError(error.PlayerStopped, player.request(path, 1));
+    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.write)].load(.acquire));
+    // Successful unprepare is the ownership fence; no callback is required.
+    script.done.store(true, .release);
+    player.signal();
+    try t.expectEqual(w32.WAIT_OBJECT_0, w32.WaitForSingleObject(player.finished_event, 5000));
+    try t.expect(!script.loan.load(.acquire));
+    try t.expect(!player.cache_present.load(.acquire));
+    try t.expect(player.state.backend.handle == null);
+    try t.expect(player.state.backend.event == null);
+    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.close)].load(.acquire));
 }
 
 test "bell audio new serial while prepare blocks does not submit the obsolete gain" {

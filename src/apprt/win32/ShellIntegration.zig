@@ -23,6 +23,8 @@ sink: ?*Activation.Sink = null,
 worker: ?*Toast = null,
 publisher: JumpList.Publisher = .{},
 jump_list_dirty: bool = true,
+// A failed attempt waits for a config trigger; it must not rearm drain itself.
+jump_list_retry_pending: bool = false,
 publishing: bool = false,
 closing: bool = false,
 startup: Identity.Startup = .none,
@@ -184,28 +186,119 @@ pub fn drain(self: *Self, app: *App) void {
             return;
         }
     };
-    if (self.jump_list_dirty and !self.publishing and self.startup != .toast_server and self.startup != .drop_companion) self.publish(app);
+    self.drainJumpList(app, publish) catch |err| {
+        log.warn("JumpList update failed: {}", .{err});
+    };
 }
 
-fn publish(self: *Self, app: *App) void {
+/// A config notification is an external trigger, separate from draining work.
+pub fn onConfigChange(self: *Self, profiles_or_language_changed: bool) void {
+    if (profiles_or_language_changed or self.jump_list_retry_pending) self.jump_list_dirty = true;
+}
+
+fn drainJumpList(self: *Self, context: anytype, comptime publishFn: anytype) !void {
+    if (self.closing or !self.jump_list_dirty or self.publishing or self.startup == .toast_server or self.startup == .drop_companion) return;
     self.jump_list_dirty = false;
-    const identity = if (self.identity) |*value| value else return;
-    if (!identity.registration_verified) return;
     self.publishing = true;
     defer self.publishing = false;
-    var profiles = app.cachedLaunchProfiles() catch return;
+    errdefer self.jump_list_retry_pending = true;
+    try publishFn(self, context);
+    self.jump_list_retry_pending = false;
+}
+
+fn publish(self: *Self, app: *App) !void {
+    const identity = if (self.identity) |*value| value else return;
+    if (!identity.registration_verified) return;
+    var profiles = try app.cachedLaunchProfiles();
     defer profiles.deinit();
     var items: [JumpList.max_profiles]JumpList.Profile = undefined;
     const count = @min(items.len, profiles.profiles.len);
     for (profiles.profiles[0..count], items[0..count]) |profile, *item| item.* = .{ .id = profile.id, .title = i18n.trRuntime(profile.name) };
-    var snapshot = JumpList.Snapshot.init(app.core_app.alloc, identity, items[0..count]) catch return;
+    var snapshot = try JumpList.Snapshot.init(app.core_app.alloc, identity, items[0..count]);
     defer snapshot.deinit();
-    app.com_apartment.ensureCom() catch return;
+    try app.com_apartment.ensureCom();
     if (self.closing or app.quit_requested) return;
-    _ = self.publisher.publish(identity, &snapshot) catch |err| {
-        log.warn("JumpList update failed: {}", .{err});
-        return;
+    _ = try self.publisher.publish(identity, &snapshot);
+}
+
+test "D19 failed JumpList publication retries once on an unchanged config notification" {
+    const t = std.testing;
+    const Shell = struct {
+        attempts: usize = 0,
+        fail: bool = true,
+        fn publish(_: *Self, shell: *@This()) !void {
+            shell.attempts += 1;
+            if (shell.fail) return error.ShellTransactionFailed;
+        }
     };
+    var integration: Self = .{};
+    var shell: Shell = .{};
+    try t.expectError(error.ShellTransactionFailed, integration.drainJumpList(&shell, Shell.publish));
+    try t.expect(!integration.jump_list_dirty and !integration.publishing);
+    try t.expect(integration.jump_list_retry_pending);
+    for (0..100) |_| try integration.drainJumpList(&shell, Shell.publish);
+    try t.expectEqual(@as(usize, 1), shell.attempts);
+    integration.onConfigChange(false);
+    shell.fail = false;
+    try integration.drainJumpList(&shell, Shell.publish);
+    try t.expectEqual(@as(usize, 2), shell.attempts);
+    try t.expect(!integration.jump_list_retry_pending);
+    for (0..100) |_| try integration.drainJumpList(&shell, Shell.publish);
+    integration.onConfigChange(false);
+    try integration.drainJumpList(&shell, Shell.publish);
+    try t.expectEqual(@as(usize, 2), shell.attempts);
+}
+
+test "D19 repeated failures are bounded by external config triggers" {
+    const t = std.testing;
+    const Shell = struct {
+        attempts: usize = 0,
+        fn publish(_: *Self, shell: *@This()) !void {
+            shell.attempts += 1;
+            return error.ShellTransactionFailed;
+        }
+    };
+    var integration: Self = .{};
+    var shell: Shell = .{};
+    for (1..4) |expected| {
+        integration.onConfigChange(false);
+        try t.expectError(error.ShellTransactionFailed, integration.drainJumpList(&shell, Shell.publish));
+        for (0..100) |_| try integration.drainJumpList(&shell, Shell.publish);
+        try t.expectEqual(expected, shell.attempts);
+        try t.expect(integration.jump_list_retry_pending);
+        try t.expect(!integration.jump_list_dirty and !integration.publishing);
+    }
+}
+
+test "D19 reentrant config changes are deferred and special startup modes never publish" {
+    const t = std.testing;
+    const Shell = struct {
+        attempts: usize = 0,
+        fn publish(integration: *Self, shell: *@This()) anyerror!void {
+            shell.attempts += 1;
+            if (shell.attempts != 1) return;
+            integration.onConfigChange(true);
+            try integration.drainJumpList(shell, @This().publish);
+            try std.testing.expectEqual(@as(usize, 1), shell.attempts);
+        }
+    };
+    var integration: Self = .{};
+    var shell: Shell = .{};
+    try integration.drainJumpList(&shell, Shell.publish);
+    try t.expect(integration.jump_list_dirty);
+    try t.expect(!integration.publishing);
+    try integration.drainJumpList(&shell, Shell.publish);
+    try t.expectEqual(@as(usize, 2), shell.attempts);
+    try t.expect(!integration.jump_list_dirty);
+    integration.onConfigChange(true);
+    integration.startup = .toast_server;
+    try integration.drainJumpList(&shell, Shell.publish);
+    integration.startup = .{ .drop_companion = .{ .pid = 1, .birth = 1 } };
+    try integration.drainJumpList(&shell, Shell.publish);
+    integration.startup = .none;
+    integration.closing = true;
+    try integration.drainJumpList(&shell, Shell.publish);
+    try t.expectEqual(@as(usize, 2), shell.attempts);
 }
 
 pub fn revoke(self: *Self, target: Ref) void {

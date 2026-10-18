@@ -51,9 +51,13 @@ pub const Publisher = struct {
     /// COM is owned by the caller's existing apartment; this does not initialize
     /// or uninitialize the GUI STA. A failed update does not advance the digest.
     pub fn publish(self: *Publisher, identity: *const Identity, snapshot: *const Snapshot) !bool {
+        return self.publishWith(identity, snapshot, Native);
+    }
+
+    fn publishWith(self: *Publisher, identity: *const Identity, snapshot: *const Snapshot, comptime Backend: type) !bool {
         if (!identity.registration_verified) return error.UnregisteredIdentity;
         if (self.applied) |previous| if (std.mem.eql(u8, &previous, &snapshot.fingerprint)) return false;
-        var native = try Native.init(identity, snapshot);
+        var native = try Backend.init(identity, snapshot);
         defer native.deinit();
         try transaction(&native, snapshot.tasks);
         self.applied = snapshot.fingerprint;
@@ -201,4 +205,110 @@ test "owned task snapshot carries stable IDs only and rejects host publication w
     try testing.expectError(error.UnregisteredIdentity, publisher.publish(&identity, &snapshot));
     try testing.expectEqual(@as(usize, 20), @sizeOf(PropertyKey));
     try testing.expectEqual(@as(usize, if (@sizeOf(usize) == 8) 24 else 16), @sizeOf(PropertyVariant));
+}
+
+test "D18 ShellLink arguments preserve profile IDs through Ghostty argv parsing" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const t = std.testing;
+    const Com = struct {
+        extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) HRESULT;
+        extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+    };
+    const initialized = Com.CoInitializeEx(null, 2);
+    // A test runner thread may already own an MTA. ShellLink works in either.
+    if (initialized != @as(i32, @bitCast(@as(u32, 0x80010106)))) try check(initialized);
+    defer if (initialized >= 0) Com.CoUninitialize();
+    var identity = try Identity.init(t.allocator, .portable, "C:/My App/ghostty.exe", false);
+    defer identity.deinit();
+    const profiles = [_]Profile{
+        .{ .id = "custom:Space Name", .title = "Space Name" },
+        .{ .id = "custom:中文", .title = "中文" },
+        .{ .id = "custom:Trail\\", .title = "Trail\\" },
+        .{ .id = "custom:嵌入\"引号\\\\", .title = "Quote" },
+    };
+    var snapshot = try Snapshot.init(t.allocator, &identity, &profiles);
+    defer snapshot.deinit();
+    for (snapshot.tasks) |task| {
+        // An in-memory ShellLink only: no Save, registration or JumpList write.
+        const link = try create(&clsid_link, &iid_link);
+        defer Identity.release(link);
+        try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 11)(link, task.arguments));
+        var buffer: [4096]u16 = @splat(0);
+        try check(Identity.method(*const fn (*Interface, [*]u16, c_int) callconv(.winapi) HRESULT, link, 10)(link, &buffer, buffer.len));
+        const stored = std.mem.sliceTo(&buffer, 0);
+        try t.expectEqualSlices(u16, task.arguments, stored);
+        const command = try std.mem.concat(t.allocator, u16, &.{ std.unicode.utf8ToUtf16LeStringLiteral("ghostty.exe "), stored });
+        defer t.allocator.free(command);
+        var iter = try std.process.Args.Iterator.Windows.init(t.allocator, command);
+        defer iter.deinit();
+        try t.expectEqualStrings("ghostty.exe", iter.next().?);
+        try t.expectEqualStrings(Identity.profile_argument, iter.next().?);
+        const expected = try std.fmt.allocPrint(t.allocator, "{s}{s}", .{ Identity.profile_switch, task.profile_id });
+        defer t.allocator.free(expected);
+        try t.expectEqualStrings(expected, iter.next().?);
+        try t.expect(iter.next() == null);
+    }
+}
+
+test "D19 already committed fingerprint skips the native Shell transaction" {
+    const t = std.testing;
+    const Backend = struct {
+        fn init(_: *const Identity, _: *const Snapshot) error{UnexpectedNativeCall}!@This() {
+            return error.UnexpectedNativeCall;
+        }
+        fn deinit(_: *@This()) void {}
+        fn begin(_: *@This()) !void {}
+        fn add(_: *@This(), _: Task) !void {}
+        fn commit(_: *@This()) !void {}
+        fn abort(_: *@This()) void {}
+    };
+    var identity = try Identity.init(t.allocator, .portable, "C:/My App/ghostty.exe", false);
+    defer identity.deinit();
+    identity.registration_verified = true;
+    var snapshot = try Snapshot.init(t.allocator, &identity, &.{.{ .id = "custom:Test", .title = "Test" }});
+    defer snapshot.deinit();
+    var publisher: Publisher = .{ .applied = snapshot.fingerprint };
+    // A regression must fail the test, never publish to the real user's Shell.
+    try t.expect(!try publisher.publishWith(&identity, &snapshot, Backend));
+    try t.expectEqual(snapshot.fingerprint, publisher.applied.?);
+}
+
+test "D19 failed commit preserves the fingerprint and identical snapshot can retry" {
+    const t = std.testing;
+    const Factory = struct {
+        fn backend(comptime fail: bool) type {
+            return struct {
+                committed: bool = false,
+                aborted: bool = false,
+                fn init(_: *const Identity, _: *const Snapshot) !@This() {
+                    return .{};
+                }
+                fn deinit(self: *@This()) void {
+                    std.debug.assert(if (fail) self.aborted and !self.committed else self.committed and !self.aborted);
+                }
+                fn begin(_: *@This()) !void {}
+                fn add(_: *@This(), _: Task) !void {}
+                fn commit(self: *@This()) !void {
+                    if (fail) return error.ShellTransactionFailed;
+                    self.committed = true;
+                }
+                fn abort(self: *@This()) void {
+                    self.aborted = true;
+                }
+            };
+        }
+    };
+    var identity = try Identity.init(t.allocator, .portable, "C:/My App/ghostty.exe", false);
+    defer identity.deinit();
+    identity.registration_verified = true;
+    var snapshot = try Snapshot.init(t.allocator, &identity, &.{.{ .id = "custom:Test", .title = "Test" }});
+    defer snapshot.deinit();
+    var previous = snapshot.fingerprint;
+    previous[0] ^= 1;
+    var publisher: Publisher = .{ .applied = previous };
+    try t.expectError(error.ShellTransactionFailed, publisher.publishWith(&identity, &snapshot, Factory.backend(true)));
+    try t.expectEqual(previous, publisher.applied.?);
+    try t.expect(try publisher.publishWith(&identity, &snapshot, Factory.backend(false)));
+    try t.expectEqual(snapshot.fingerprint, publisher.applied.?);
+    try t.expect(!try publisher.publishWith(&identity, &snapshot, Factory.backend(true)));
 }

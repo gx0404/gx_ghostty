@@ -14,6 +14,8 @@ keybind = f6=new_split:right
 keybind = f8=goto_tab:1
 keybind = f9=goto_tab:2
 """
+# The window is first resized to 1500x900 px so the simulated 192 DPI (x4/3 from 144)
+# still fits on the screen for the DWM screen capture of A-dpi192.
 expect = [
   "A-only: left unfocused surface has four complete thin caution-colour edges even over transparent zero-padding background; right focused surface has none; no focus-stealing overlay",
   "A-after-reset: left surface's border survives simulated GPU context reset, no black frame or changed grid geometry",
@@ -21,6 +23,15 @@ expect = [
   "focus-cleared: click refocus clears left border without affecting sibling",
   "hidden-tab-return: returning to tab 1 focuses its active surface and clears its retained hidden-tab bell; no resurrected overlay",
 ]
+
+[[step]]
+action = "resize"
+width = 1500
+height = 900
+
+[[step]]
+action = "sleep"
+seconds = 0.6
 
 [[step]]
 action = "type"

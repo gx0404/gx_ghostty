@@ -614,6 +614,8 @@ pub const Config = struct {
     shell_integration: configpkg.Config.ShellIntegration = .detect,
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
     cursor_blink: ?bool = null,
+    // fork(gx): GX-0047 the prompt cursor that the GX shell integrations show
+    gx_prompt_cursor: @FieldType(configpkg.Config, "gx-prompt-cursor") = .config,
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
@@ -813,6 +815,8 @@ const Subprocess = struct {
                 cfg.shell_integration_features,
                 cfg.cursor_blink orelse true,
             );
+            // fork(gx): GX-0047 ask the GX integrations for the configured prompt cursor
+            try @import("../gx/prompt_cursor.zig").advertise(&env, cfg.gx_prompt_cursor);
 
             const force: ?shell_integration.Shell = switch (cfg.shell_integration) {
                 .none => {

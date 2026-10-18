@@ -20,6 +20,9 @@ pub fn clickInterval() ?u32 {
             break :macos ms;
         },
 
+        // fork(gx): GX-0048 begin: Windows reads the double-click time of the mouse settings
+        .windows => @import("../gx/os_mouse.zig").doubleClickTime(),
+        // fork(gx): GX-0048 end
         else => null,
     };
 }

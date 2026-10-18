@@ -3,17 +3,43 @@ title = "goto_tab counts from 1, last_tab reaches the end, move_tab moves one ta
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+window-width = 90
+window-height = 28
 keybind = ctrl+shift+u=set_tab_title:Build
 keybind = f7=goto_tab:1
 keybind = f8=goto_tab:2
+keybind = f9=gx:move_split_to_tab
+keybind = f12=gx:move_split_to_window
 """
+# R2-Window.13 and R2-Tabs.08 extend the R0 check: a split moves into a new tab and into a
+# new window; dragging a tab follows the pointer only past 10 DIPs, Escape puts it back and
+# a drop reorders the model; the rename field over a tab keeps its text when it loses the
+# focus and cancels on Escape. The main window is resized to 1920x1200 so the tabs are
+# 240 DIPs wide from x = 8 DIP; new windows are smaller (window-width/height).
 expect = [
   "three-tabs: tabs one, two, Build; Build is active",
   "goto-1: F7 (goto_tab:1) selected tab one",
   "goto-2: F8 (goto_tab:2) selected tab two",
   "moved: after Alt+9 (last_tab) and Ctrl+Shift+PageUp (move_tab:-1) the order is one, Build, two with Build active",
   "goto-2-after-move: F8 now selects Build, the tab that moved to position 2",
+  "split-to-tab: gx:move_split_to_tab moved the new right split of Build into a new tab of its own; the window shows one pane and four tabs",
+  "drag-below-threshold: the mouse is down on tab one and moved 5 DIPs; the tab has not moved",
+  "dragging: tab one follows the pointer to the right and Build has slid left under it",
+  "drag-escaped: after Escape during the drag tab one is back at the first position",
+  "dragged: after a real drag and drop the order starts Build, one",
+  "renamed: double-clicking tab one opened the rename field; the typed Renamed was kept when the field lost the focus to the terminal and the tab and window are titled Renamed",
+  "rename-escaped: a second rename typed Discarded and pressed Escape; the tab is still Renamed",
+  "split-to-window: gx:move_split_to_window moved a new split out of the main window, which shows one pane again (the new window opens elsewhere)",
 ]
+
+[[step]]
+action = "resize"
+width = 1920
+height = 1200
+
+[[step]]
+action = "sleep"
+seconds = 0.5
 
 [[step]]
 action = "type"
@@ -122,3 +148,216 @@ pattern = "^Build$"
 [[step]]
 action = "capture"
 name = "goto-2-after-move"
+
+# R2-Window.13: a split of Build moves into a new tab.
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "f9"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "split-to-tab"
+
+# R2-Tabs.08: tab one is at x 8..248 DIP; press it and move less than 10 DIPs.
+[[step]]
+action = "mouse_down"
+x = 128
+y = 24
+
+[[step]]
+action = "move"
+x = 133
+y = 24
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "capture"
+name = "drag-below-threshold"
+
+[[step]]
+action = "move"
+x = 200
+y = 24
+
+[[step]]
+action = "move"
+x = 280
+y = 24
+
+[[step]]
+action = "move"
+x = 360
+y = 24
+
+[[step]]
+action = "move"
+x = 400
+y = 24
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "dragging"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "drag-escaped"
+
+[[step]]
+action = "mouse_up"
+x = 400
+y = 24
+
+[[step]]
+action = "drag"
+from = [128, 24]
+to = [420, 24]
+steps = 16
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "dragged"
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_title"
+pattern = "^Build$"
+
+# The rename field over tab one, now the second tab (x 248..488 DIP).
+[[step]]
+action = "click"
+x = 368
+y = 24
+count = 2
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "Renamed"
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "wait_title"
+pattern = "^Renamed$"
+
+[[step]]
+action = "capture"
+name = "renamed"
+
+[[step]]
+action = "click"
+x = 368
+y = 24
+count = 2
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "Discarded"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "assert_title"
+pattern = "^Renamed$"
+
+[[step]]
+action = "capture"
+name = "rename-escaped"
+
+# R2-Window.13: a split moves into a new window; the new window takes the focus, so this
+# runs last and is captured with PrintWindow.
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "split-to-window"
+method = "print"
