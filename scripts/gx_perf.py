@@ -26,9 +26,9 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON. CPU is observation only.
   quiet-batch --out DIR [--timeout S] [--injected-input] -- COMMAND [ARGS...]
         Acquire all shared slots, check immediately inside the lease, run the command, check again
-        before release. End-check failure invalidates the entire batch. Injected input requires
-        batch-bound gx_win_gui guard JSONL; last-input idle is checked at start only in this mode.
-        Without injected input the end check requires no input since the start check.
+        before release. End-check failure invalidates the entire batch. With --injected-input a batch
+        that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
+        (with or without the flag) must have had no input at all since the start check.
         Exit 0 VALID, 4 FAIL (quiet valid, command gate FAIL), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4).
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
@@ -814,15 +814,16 @@ def program_matches(rows: Sequence[Mapping], names: Sequence[str]) -> list[dict]
     return found
 
 
-def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_since=None) -> dict:
+def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
+    """One check of every plan §4 criterion. `end` = {evidence, since, injected_mode}
+    turns the input item into the end-of-batch criterion (see end_input)."""
     probe = probe or QuietProbe()
     checks = {}
     def check(name, operation, assess):
         try:
             raw = operation()
             passed, reason = assess(raw)
-            status = 'not_applicable' if passed is None else ('pass' if passed else 'fail')
-            checks[name] = {"status": status, "reason": reason, "raw": raw}
+            checks[name] = {"status": "pass" if passed else "fail", "reason": reason, "raw": raw}
         except Exception as exc:
             checks[name] = {"status": "error", "reason": str(exc)}
     builds = {process_name(name) for name in (*BUILD_PROCESSES, *(args.build_process or []))}
@@ -861,19 +862,11 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
     if checks['session']['status'] == 'fail':
         checks['session']['status'] = 'error'
     threshold = args.idle_seconds
-    if guarded_input is not None:
-        check('input', guarded_input, lambda data: ({'pass': True, 'fail': False, 'not_applicable': None}[data['state']],
-                                                    'injected input: audited guards, not GetLastInputInfo; ' + data['reason']))
-    elif input_since is None:
+    if end is None:
         check('input', lambda: input_observation(probe.input_ticks()),
               lambda data: (data['idle_seconds'] >= threshold, f"idle {data['idle_seconds']:.3f}s; required {threshold:g}s"))
     else:
-        # End of a batch without injected input: the plan requires no user input
-        # during the batch, i.e. the last input predates the start check.
-        check('input', lambda: input_observation(probe.input_ticks(), input_since),
-              lambda data: (data['idle_seconds'] >= max(threshold, data['batch_seconds']),
-                            f"idle {data['idle_seconds']:.3f}s; batch {data['batch_seconds']:.3f}s; no input allowed "
-                            f"after the start check (required >= {threshold:g}s and >= the batch duration)"))
+        check('input', lambda: end_input(end, probe, threshold), lambda data: (data['state'] == 'pass', data['reason']))
     try:
         observation = {"status": "recorded", "raw": probe.cpu()}
     except Exception as exc:
@@ -885,12 +878,11 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
         containers = {'status': 'unavailable', 'reason': str(exc), 'scope': container_scope}
     code = 2 if any(row['status'] == 'error' for row in checks.values()) else (
         3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
-    unverified = sorted(name for name, row in checks.items() if row['status'] == 'not_applicable')
     thresholds = args.idle_seconds >= PLAN_IDLE_SECONDS
-    return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0 and not unverified, "exit": code,
-            'unverified_checks': unverified, 'thresholds_plan_compliant': thresholds,
+    return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
+            'thresholds_plan_compliant': thresholds,
             # Every plan §4 criterion observed with the plan's thresholds (point in time; batches see RESULT.json).
-            'plan_compliant': code == 0 and not unverified and thresholds,
+            'plan_compliant': code == 0 and thresholds,
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
             "other_programs": other_programs, "docker_containers": containers,
             "build_processes": sorted(builds), "blacklist": blacklist,
@@ -923,35 +915,61 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
     return 2
 
 
-def guard_evidence(path: Path, batch_id: str, *, command_failed: bool = False) -> dict:
-    """Audit the batch-bound gx_win_gui guard log of an injected-input batch.
+# gx_win_gui runs these guards immediately before every SendInput (scripts/gx_win_gui.py::input_guard).
+SEND_GUARDS = ('ensure_foreground', 'ensure_point')
 
-    state: pass (audited guards, none failed); fail (a guard failed, i.e. the
-    input criterion of plan §4 was not met); not_applicable (the command failed
-    before any guarded input). Missing, foreign or malformed evidence of a
-    command that did not fail is a tool error (PerfError)."""
-    if not path.is_file():
-        if command_failed:
-            return {'state': 'not_applicable', 'guards': 0, 'events': 0, 'reason': 'command failed before any guarded input'}
-        raise PerfError('injected-input batch left no guard evidence')
-    data = path.read_bytes()
-    rows = [json.loads(line) for line in data.decode('utf-8').splitlines()]
+
+def guard_evidence(path: Path, batch_id: str) -> dict:
+    """Facts from the batch-bound gx_win_gui audit log (gx-input-guard-v1); no file means no rows.
+
+    injected: input was actually sent (a passed SendInput guard or a sent key/button
+    release). failures: failed guards (nothing was sent at that point);
+    release_failures: releases that could not be sent. Foreign, malformed or
+    other-batch rows raise PerfError because the log cannot be trusted."""
+    data = path.read_bytes() if path.is_file() else b''
+    rows = [json.loads(line) for line in data.decode('utf-8').splitlines() if line.strip()]
     if any(not isinstance(row, dict) or row.get('schema') != 'gx-input-guard-v1' or row.get('batch_id') != batch_id for row in rows):
-        raise PerfError('missing, foreign or malformed input guard evidence')
+        raise PerfError('foreign or malformed input guard evidence')
     guards = [row for row in rows if row.get('event') == 'guard']
-    guard_failures = [row for row in guards if row.get('status') != 'pass']
-    other_failures = [row for row in rows if row.get('event') != 'guard' and row.get('status') != 'pass']
-    result = {'guards': len(guards), 'events': len(rows), 'failures': guard_failures + other_failures,
-              'sha256': hashlib.sha256(data).hexdigest()}
-    if guard_failures:
-        return {**result, 'state': 'fail', 'reason': 'an input guard failed: the foreground window or pointer target changed'}
-    if other_failures:
-        raise PerfError(f"input release failed: {other_failures[0].get('reason')}")
-    if not guards:
-        if command_failed:
-            return {**result, 'state': 'not_applicable', 'reason': 'command failed before any guarded input'}
-        raise PerfError('injected-input batch recorded no input guard')
-    return {**result, 'state': 'pass', 'reason': f'{len(guards)} audited input guards passed'}
+    sent = [row for row in guards if row.get('status') == 'pass' and row.get('check') in SEND_GUARDS]
+    releases = [row for row in rows if row.get('event') == 'release']
+    return {'events': len(rows), 'guards': len(guards), 'passed_guards': len(sent),
+            'injected': bool(sent) or any(row.get('status') == 'pass' for row in releases),
+            'failures': [row for row in guards if row.get('status') != 'pass'],
+            'release_failures': [row for row in releases if row.get('status') != 'pass'],
+            'sha256': hashlib.sha256(data).hexdigest() if data else None}
+
+
+def end_input(end: Mapping, probe, threshold: float) -> dict:
+    """The input criterion of plan §4 at the end check of a batch.
+
+    A batch that injected input is judged by its audited guards, because its own
+    SendInput refreshes GetLastInputInfo. A batch that injected nothing - run without
+    --injected-input, or with it but no input was ever sent (one-tab one-window
+    win32-idle) - must have had no input at all since the start check:
+    idle >= max(threshold, batch duration) on the same tick clock. Failed guards
+    always fail the criterion; failed releases are tool errors."""
+    evidence = end['evidence']
+    if isinstance(evidence, BaseException):
+        raise evidence
+    if evidence['release_failures']:
+        raise PerfError(f"input release failed: {evidence['release_failures'][0].get('reason')}")
+    summary = {key: evidence[key] for key in ('events', 'guards', 'passed_guards', 'injected', 'sha256')}
+    if evidence['failures']:
+        first = evidence['failures'][0]
+        return {**summary, 'mode': 'guards', 'state': 'fail', 'failures': evidence['failures'],
+                'reason': f"input guard {first.get('check')} failed: {first.get('reason')}"}
+    if end['injected_mode'] and evidence['injected']:
+        return {**summary, 'mode': 'guards', 'state': 'pass',
+                'reason': f"injected input: {evidence['passed_guards']} audited input guards passed, not GetLastInputInfo"}
+    data = {**summary, **input_observation(probe.input_ticks(), end['since']), 'mode': 'last_input'}
+    if end['injected_mode']:
+        data['fallback'] = 'last_input'  # nothing was injected, so GetLastInputInfo shows only other input
+    data['state'] = 'pass' if data['idle_seconds'] >= max(threshold, data['batch_seconds']) else 'fail'
+    data['reason'] = (f"idle {data['idle_seconds']:.3f}s; batch {data['batch_seconds']:.3f}s; no input allowed after the start "
+                      f"check (required >= {threshold:g}s and >= the batch duration)" +
+                      ('; --injected-input batch sent no input: last-input fallback' if end['injected_mode'] else ''))
+    return data
 
 
 FILETIME_UNIX_EPOCH = 116444736000000000  # 100 ns intervals from 1601-01-01 to 1970-01-01
@@ -1011,8 +1029,7 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
     """Quiet validity comes only from the checks; the measurement only from the command.
     INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL."""
     statuses = [row['status'] for row in after['checks'].values()]
-    quiet = ('INVALID' if 'fail' in statuses else 'ERROR' if 'error' in statuses
-             else 'UNVERIFIED' if 'not_applicable' in statuses else 'VALID')
+    quiet = 'INVALID' if 'fail' in statuses else 'ERROR' if 'error' in statuses else 'VALID'
     result['quiet_status'], result['quiet_valid'] = quiet, quiet == 'VALID'
     thresholds = before['thresholds_plan_compliant'] and after['thresholds_plan_compliant']
     result['plan_compliant'] = result['quiet_valid'] and thresholds
@@ -1027,7 +1044,7 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
     elif quiet == 'ERROR':
         result['errors'].append('end check raised a tool error; quiet validity is unproved')
         result['status'], result['exit'] = 'ERROR', 2
-    elif quiet == 'UNVERIFIED' or result['measurement'] == 'DRIVER_ERROR':
+    elif result['measurement'] == 'DRIVER_ERROR':
         result['status'], result['exit'] = 'ERROR', 2
     elif not thresholds:
         result['status'], result['exit'] = 'NONCOMPLIANT', 5
@@ -1091,12 +1108,15 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                 finally:
                     result['ended_ns'] = time.time_ns()
                     result['measurement'] = measurement_state(raised, result['command_exit'])
-                    failed = result['measurement'] == 'DRIVER_ERROR'
-                    guarded = (lambda: guard_evidence(guard_log, result['batch_id'], command_failed=failed)) if args.injected_input else None
-                    since = None if args.injected_input else before['checks']['input']['raw']
-                    after = quiet_snapshot(args, probe, lease=lease, guarded_input=guarded, input_since=since)
+                    try:
+                        evidence = guard_evidence(guard_log, result['batch_id'])
+                    except Exception as exc:  # the end check's input item reports it as an error
+                        evidence = exc
+                    end = {'evidence': evidence, 'since': before['checks']['input']['raw'], 'injected_mode': args.injected_input}
+                    after = quiet_snapshot(args, probe, lease=lease, end=end)
                     write_json(out / 'after.json', after)
-                    mismatch = not args.injected_input and guard_log.is_file() and guard_log.stat().st_size > 0
+                    # Input was sent although the batch claimed none: the last-input check is meaningless.
+                    mismatch = not args.injected_input and isinstance(evidence, dict) and evidence['injected']
                     classify_batch(result, before, after, mode_mismatch=mismatch)
     except TimeoutError as exc:
         result.update(exit=3, quiet_status='NOT_MET')

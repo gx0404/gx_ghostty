@@ -439,15 +439,41 @@ class QuietBatchTests(unittest.TestCase):
         return code, json.loads((args.out / 'RESULT.json').read_text())
 
     @staticmethod
-    def command(code=0, guard=None):
+    def command(code=0, guard=None, **extra):
         def runner(command, **kwargs):
             if code == 'raise':
                 raise RuntimeError('child setup')
             if guard:
-                row = {'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'], 'event': 'guard', 'status': guard}
+                # Like gx_win_gui.input_guard: the guard that precedes a SendInput.
+                row = {'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'], 'event': 'guard',
+                       'check': 'ensure_foreground', 'status': guard, **extra}
                 Path(kwargs['env']['GX_PERF_GUARD_LOG']).write_text(json.dumps(row) + '\n', encoding='utf-8')
             return SimpleNamespace(returncode=code)
         return runner
+
+    def test_injected_batch_that_sent_no_input_falls_back_to_last_input(self):
+        start = 50_000_000
+        for label, last_input, expected, status in (('no-input', start - 700_000, 0, 'VALID'),
+                                                    ('input-during-batch', start + 30_000, 3, 'INVALID')):
+            args = self.batch_args('--injected-input')
+            args.out = self.args.out.parent / label
+            # Start: idle 700 s. End after 90 s: either still no input (idle 790 s) or input 30 s in (idle 60 s).
+            self.probe.input_ticks.side_effect = [ticks(700, start), {'last_input_tick': last_input, 'tick_count': start + 90_000}]
+            with self.subTest(label):
+                exit_code, result = self.run_batch(args, self.command(0))  # zero guard rows: nothing was injected
+                self.assertEqual((expected, status), (exit_code, result['status']))
+                raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
+                self.assertEqual(('last_input', 'last_input', 0, False, 90), (raw['mode'], raw['fallback'], raw['guards'],
+                                                                             raw['injected'], raw['batch_seconds']))
+        # A guard that failed before any input was sent also counts as no injection, but it fails the criterion.
+        args = self.batch_args('--injected-input')
+        args.out = self.args.out.parent / 'failed-first-guard'
+        self.probe.input_ticks.side_effect = None
+        self.probe.input_ticks.return_value = ticks(700)
+        exit_code, result = self.run_batch(args, self.command(0, guard='fail'))
+        self.assertEqual((3, 'INVALID'), (exit_code, result['status']))
+        raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
+        self.assertEqual(('guards', False), (raw['mode'], raw['injected']))
 
     def test_preflight_rejects_impossible_batches_before_waiting_for_locks(self):
         import gx_slots
@@ -481,9 +507,9 @@ class QuietBatchTests(unittest.TestCase):
             (('--injected-input',), 4, 'pass', 4, 'FAIL', 'VALID', 'GATE_FAIL'),
             ((), 1, None, 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
             (('--injected-input',), 1, 'pass', 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
-            # The driver failed before its first input: the input criterion is not applicable, not failed.
-            (('--injected-input',), 1, None, 2, 'ERROR', 'UNVERIFIED', 'DRIVER_ERROR'),
-            (('--injected-input',), 'raise', None, 2, 'ERROR', 'UNVERIFIED', 'DRIVER_ERROR'),
+            # The driver failed before its first input: nothing was injected, so the last-input check decides.
+            (('--injected-input',), 1, None, 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
+            (('--injected-input',), 'raise', None, 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
         ]
         for index, (flags, code, guard, expected, status, quiet, measurement) in enumerate(cases):
             args = self.batch_args(*flags)
@@ -495,15 +521,13 @@ class QuietBatchTests(unittest.TestCase):
                 self.assertEqual(quiet == 'VALID', result['quiet_valid'])
                 self.assertEqual(None if code == 'raise' else code, result['command_exit'])
         after = json.loads((self.args.out.parent / 'case-4' / 'after.json').read_text())
-        self.assertEqual('not_applicable', after['checks']['input']['status'])
-        self.assertEqual(['input'], after['unverified_checks'])
-        self.assertFalse(after['quiet'])
+        self.assertEqual(('pass', 'last_input'), (after['checks']['input']['status'], after['checks']['input']['raw']['fallback']))
+        self.assertNotIn('unverified_checks', after)
         summary = (self.args.out.parent / 'case-0' / 'SUMMARY.txt').read_text()
         self.assertIn('never rerun to replace it', summary)
 
     def test_guard_evidence_failures_are_invalid_or_tool_errors(self):
-        for index, (code, guard, expected, status) in enumerate(((0, None, 2, 'ERROR'), (0, 'fail', 3, 'INVALID'),
-                                                                  (1, 'fail', 3, 'INVALID'))):
+        for index, (code, guard, expected, status) in enumerate(((0, 'fail', 3, 'INVALID'), (1, 'fail', 3, 'INVALID'))):
             args = self.batch_args('--injected-input')
             args.out = self.args.out.parent / f'guard-{index}'
             with self.subTest(code=code, guard=guard):
@@ -512,11 +536,15 @@ class QuietBatchTests(unittest.TestCase):
         foreign = self.args.out.parent / 'foreign.jsonl'
         foreign.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'other', 'event': 'guard', 'status': 'pass'}) + '\n')
         with self.assertRaises(gx_perf.PerfError):
-            gx_perf.guard_evidence(foreign, 'mine', command_failed=True)
+            gx_perf.guard_evidence(foreign, 'mine')
         release = self.args.out.parent / 'release.jsonl'
         release.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'b', 'event': 'release', 'status': 'fail', 'reason': 'UIPI'}) + '\n')
+        evidence = gx_perf.guard_evidence(release, 'b')
+        self.assertEqual((1, False), (len(evidence['release_failures']), evidence['injected']))
         with self.assertRaisesRegex(gx_perf.PerfError, 'UIPI'):
-            gx_perf.guard_evidence(release, 'b')
+            gx_perf.end_input({'evidence': evidence, 'since': ticks(700), 'injected_mode': True}, self.probe, 600)
+        self.assertEqual({'events': 0, 'guards': 0, 'passed_guards': 0, 'injected': False, 'failures': [], 'release_failures': [],
+                          'sha256': None}, gx_perf.guard_evidence(self.args.out.parent / 'absent.jsonl', 'b'))
 
     def test_noncompliant_thresholds_mode_mismatch_and_end_check_errors(self):
         args = self.batch_args('--idle-seconds', '5')
