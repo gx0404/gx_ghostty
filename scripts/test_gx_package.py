@@ -275,7 +275,7 @@ class PinTests(unittest.TestCase):
                     self.assertEqual(sha(data), item.sha256)
 
     def test_embedded_data_ships_its_licenses(self):
-        # The pinyin table is compiled into ghostty.exe: both license texts next to it ship.
+        # The pinyin tables and the Fluent icon paths are compiled into ghostty.exe: their license texts ship.
         targets = {item.target: item for item in pkg.PAYLOAD}
         shipped = {targets[target].member for component in pkg.EMBEDDED for target in component.licenses}
         self.assertEqual(shipped, {pkg.PINYIN_LICENSE, pkg.UNICODE_LICENSE, pkg.FLUENT_LICENSE})
@@ -285,6 +285,8 @@ class PinTests(unittest.TestCase):
                 self.assertIn(f"({target})", component.license)
         self.assertIn(f"pinyin-data {pinyin.SOURCE_VERSION}", pkg.EMBEDDED[0].component)
         self.assertIn(pinyin.OUTPUT, pkg.EMBEDDED[0].component)
+        self.assertIn(pinyin.SYLLABLE_OUTPUT, pkg.EMBEDDED[0].component)
+        self.assertIn("src/gx/fluent/paths.zig", pkg.EMBEDDED[1].component)
         # A license text missing from the payload is refused.
         with self.assertRaisesRegex(pkg.PackageError, "not in the payload"):
             pkg.third_party(pkg.DOWNLOADS, [item for item in pkg.PAYLOAD if item.member != pkg.UNICODE_LICENSE])
@@ -405,9 +407,12 @@ class PortableTreeTests(Case):
             self.assertIn(download.url, third_party)
             self.assertIn(download.sha256, third_party)
         for needle in (f"pinyin-data {pinyin.SOURCE_VERSION}", "compiled into ghostty.exe", pinyin.SOURCE_URL,
+                       pinyin.OUTPUT, pinyin.SYLLABLE_OUTPUT,
                        "MIT (licenses/pinyin-data-MIT.txt)", "Unicode License V3 (licenses/Unicode-License-V3.txt)",
                        f"licenses/pinyin-data-MIT.txt  sha256 {sha((ROOT / pkg.PINYIN_LICENSE).read_bytes())}",
-                       f"licenses/Unicode-License-V3.txt  sha256 {sha((ROOT / pkg.UNICODE_LICENSE).read_bytes())}"):
+                       f"licenses/Unicode-License-V3.txt  sha256 {sha((ROOT / pkg.UNICODE_LICENSE).read_bytes())}",
+                       "Microsoft Fluent UI System Icons", "MIT (licenses/Fluent-System-Icons-MIT.txt)",
+                       f"licenses/Fluent-System-Icons-MIT.txt  sha256 {sha((ROOT / pkg.FLUENT_LICENSE).read_bytes())}"):
             self.assertIn(needle, third_party)
 
     def test_fork_themes_are_added_with_lf_unless_the_prefix_has_them(self):
@@ -599,6 +604,7 @@ class BinaryFormatTests(unittest.TestCase):
         stanza = text.split("Files: src/gx/pinyin/*\n", 1)[1].split("\n\n", 1)[0]
         self.assertTrue(stanza.startswith("Copyright: 2016 mozillazg\n "))
         self.assertIn("Unicode, Inc.\nLicense: MIT and Unicode-3.0\nComment: ", stanza)
+        self.assertIn("Comment: The pinyin tables (initials and syllables) compiled into bin/ghostty", stanza)
         self.assertIn(pinyin.SOURCE_VERSION, stanza)
         unicode_text = (ROOT / pkg.UNICODE_LICENSE).read_text(encoding="utf-8")
         self.assertIn("\n".join(["License: Unicode-3.0", *stage_mod.dep5_text(unicode_text)]), text)
