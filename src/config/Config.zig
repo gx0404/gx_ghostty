@@ -873,18 +873,26 @@ palette: Palette = .{},
 /// make it difficult to find the cursor.
 @"cursor-opacity": f64 = 1.0,
 
-// fork(gx): GX-0047 document configured prompt cursors without disabling program requests.
 /// The style of the cursor. This sets the default style. A running program can
 /// still request an explicit cursor style using escape sequences (such as `CSI
 /// q`). Shell configurations will often request specific cursor styles.
 ///
-/// Ghostty GX shell integration restores this style and `cursor-style-blink`
-/// at each prompt when its `cursor` feature is enabled. Set `cursor-style = bar`
-/// for a bar prompt cursor. Zsh vi command and visual modes retain a block
-/// indicator; insert/main mode restores the configured style. Programs may
-/// still request their own cursor while running. Set
-/// `shell-integration-features = no-cursor` to disable the integration's cursor
-/// handling, including the reset after a program exits.
+// fork(gx): GX-0047 begin: the prompt shows this style. Upstream text:
+// /// Note that shell integration will automatically set the cursor to a bar at
+// /// a prompt, regardless of this configuration. You can disable that behavior
+// /// by specifying `shell-integration-features = no-cursor` or disabling shell
+// /// integration entirely.
+/// Programs that do not request a cursor style of their own use this style
+/// (with `cursor-style-blink`): the shell integration resets the cursor to it
+/// before each command. Ghostty GX also shows it at the prompt by default, so
+/// a style that a program left behind is reset when the next prompt appears.
+/// With zsh or fish vi key bindings the prompt still tells the modes apart,
+/// by default with a bar while inserting and a block in command mode. To get
+/// upstream Ghostty's bar at the prompt while programs keep this style, set
+/// `gx-prompt-cursor = bar`. To stop the shell integration from changing the
+/// cursor, specify `shell-integration-features = no-cursor` or disable shell
+/// integration entirely.
+// fork(gx): GX-0047 end
 ///
 /// Valid values are:
 ///
@@ -2967,7 +2975,6 @@ keybind: Keybinds = .{},
 /// The default value is `detect`.
 @"shell-integration": ShellIntegration = .detect,
 
-// fork(gx): GX-0047 document the GX prompt reset policy for the cursor feature.
 /// Shell integration features to enable. These require our shell integration
 /// to be loaded, either automatically via shell-integration or manually.
 ///
@@ -2980,11 +2987,12 @@ keybind: Keybinds = .{},
 ///
 /// Available features:
 ///
-///   * `cursor` - Restore the effective `cursor-style` and `cursor-style-blink`
-///     at the prompt in Ghostty GX. Programs can still change their cursor
-///     while running. Zsh vi command/visual modes retain a block indicator;
-///     insert/main mode restores configuration. Set `cursor-style = bar` for
-///     a bar prompt cursor. `no-cursor` disables all integration cursor handling.
+// fork(gx): GX-0047 begin: the prompt cursor follows gx-prompt-cursor. Upstream text:
+// ///   * `cursor` - Set the cursor to a bar at the prompt.
+///   * `cursor` - Set the cursor at the prompt: in Ghostty GX the configured
+///     `cursor-style` by default, or a bar like upstream Ghostty with
+///     `gx-prompt-cursor = bar`.
+// fork(gx): GX-0047 end
 ///
 ///   * `sudo` - Set sudo wrapper to preserve terminfo.
 ///
