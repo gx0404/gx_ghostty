@@ -1104,7 +1104,7 @@ BATCH_GUIDANCE = {
 }
 
 
-WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem', 'win32-c7')
+WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem', 'win32-c7', 'win32-c6')
 
 
 def gate_exit_contract(command: Sequence[str]) -> bool:
@@ -2371,6 +2371,10 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     if not 1 <= len(exes) <= 2 or any(not exe.is_file() for exe in exes):
         raise PerfError('give one or two existing --exe files')
     labels = labels_for(len(exes), args.label)
+    font_manifest = None
+    if args.command == 'win32-c6':
+        import gx_perf_font as font
+        font_manifest = font.validate_manifest(args, exes, labels)
     unsupported = set(getattr(args, 'uninstrumented', []))
     if not unsupported <= set(labels):
         raise PerfError('--uninstrumented must name a declared label')
@@ -2404,6 +2408,9 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         exe = exes[labels.index(label)]
         run_config = config
         shells = None
+        if args.command == 'win32-c6':
+            shells = font.OwnedFontShell(target / 'stimulus')
+            run_config += shells.config()
         if args.command == 'win32-c7':
             shells = stimulus.OwnedShells(target / 'stimulus')
             run_config += shells.config()
@@ -2420,12 +2427,18 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                   'exe': str(exe), 'exe_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
                   'state': getattr(args, 'state', None), 'tabs': getattr(args, 'tabs', None), 'windows_count': getattr(args, 'windows', None),
                   'seconds': getattr(args, 'seconds', None), 'status': 'running', 'errors': []}
+        if font_manifest:
+            report['baseline'] = False  # Both arms must satisfy the same instrumentation contract.
+            report['font_build'] = json.loads(json.dumps(font_manifest['arms'][label]))
+            batch['font_manifest'] = json.loads(json.dumps(font_manifest))
         write_json(target / 'run.json', report)
         batch['runs'].append({'label': label, 'run': run, 'path': str(target.relative_to(out)), 'status': 'running'})
         write_json(out / 'RESULT.json', batch)
         instance = capture = None
         try:
             gui.prepare_env_dir(target / 'env', fresh=False)
+            if font_manifest:
+                font.validate_arm(report, font_manifest)
             instance = gui.launch(exe, target / 'env', config=run_config, env=envs[label])
             report.update(pid=instance.pid, creation=instance.creation)
             write_json(target / 'run.json', report)
@@ -2439,12 +2452,16 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 measure_idle(gui, instance, capture, args, counters_factory(gui))
             elif args.command == 'win32-c7':
                 measure_c7(gui, instance, capture, args, counters_factory(gui), shells)
+            elif args.command == 'win32-c6':
+                font.measure(gui, instance, capture, args, counters_factory(gui), shells)
             else:
                 measure_resources(gui, instance, capture, args, counters_factory(gui))
             instance.ensure_owned()
             capture.parse(capture.mark().decode('utf-8', errors='strict'))  # Refuse intra-arm conflicts even outside selected windows.
             if hashlib.sha256(exe.read_bytes()).hexdigest() != report['exe_sha256']:
                 raise PerfError('executable changed during run')
+            if font_manifest:
+                font.validate_arm(report, font_manifest)
             report['absolute_gate'] = absolute_gate(args, capture)
             report['status'] = 'completed'
         except Exception as exc:
@@ -2467,11 +2484,23 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 try:
                     if instance.log.exists():
                         (target / 'ghostty.log').write_bytes(instance.log.read_bytes())
+                        if args.command == 'win32-c6' and report['status'] == 'completed':
+                            font.validate_run_raw(report, target)
                 except Exception as exc:
                     report['status'] = 'failed'
                     report['environment_pending'] = False
                     report['errors'].append('copy raw log: ' + str(exc))
+                    if args.command == 'win32-c6':
+                        report['failure_cause'] = getattr(exc, 'cause', None) or 'c6_final_log_error'
                 report['input_events'] = instance.input_events if isinstance(instance.input_events, list) else []
+            if font_manifest:
+                try:
+                    font.validate_arm(report, font_manifest)
+                except Exception as exc:
+                    report['status'] = 'failed'
+                    report['environment_pending'] = False
+                    report['errors'].append('C6 end identity: ' + str(exc))
+                    report['failure_cause'] = getattr(exc, 'cause', None) or 'c6_arm_changed'
             # Cleanup failure must override an environmental exception caught above.
             # Keep both reasons, but never authorize the matrix to continue input.
             if report.get('backdrop_teardown_errors'):
@@ -2513,6 +2542,10 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
             break  # Never retry or continue input after a failed guard.
     batch['valid'] = not batch['errors'] and len(batch['runs']) == args.runs * len(labels)
     batch['environment_pending'] = any(item.get('environment_pending') for item in batch['runs'])
+    if args.command == 'win32-c6':
+        batch['visual_review'] = 'PENDING: root must read every ASCII/CJK screenshot'
+        batch['performance_verdict'] = 'INSUFFICIENT: retain warmup until quiet, source, CJK and visual evidence pass'
+        batch['planned_order'] = [{'run': run, 'label': label} for run, label in alternate(labels, args.runs)]
     if args.command == 'win32-c7':
         batch['measurement_coverage'] = ('captured' if batch['valid'] and
             all(item.get('c7_coverage') == 'captured' for item in batch['runs']) else 'PENDING')
@@ -2541,6 +2574,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     batch['absolute_gates'] = {label: [item['absolute_gate'] for item in batch['runs'] if item['label'] == label] for label in labels}
     batch['missing_preconditions'] = {label: items for label, items in preconditions.items() if items}
     batch['unsettled_runs'] = unsettled
+    if args.command == 'win32-c6':
+        font.finalize_batch(batch, out)
     text = 'Numerical absolute gates apply only to the new arm; baseline missing metrics are not_instrumented (n=0).\n' + '\n'.join(texts)
     text += '\nAbsolute gates: ' + json.dumps(batch['absolute_gates'], ensure_ascii=False) + '\n'
     if batch['missing_preconditions']:
@@ -3098,6 +3133,10 @@ def build_parser() -> argparse.ArgumentParser:
             experiment.add_argument('--output-bytes', type=int, default=4096,
                                     help='bytes written by EACH owned terminal at the midpoint')
             experiment.set_defaults(windows=1, state='visible')
+        if name == 'win32-c6':
+            experiment.add_argument('--font-manifest', type=Path, required=True,
+                                    help='root-attested same-source ReleaseFast build manifest')
+            experiment.set_defaults(tabs=1, windows=1, state='visible')
     return parser
 
 

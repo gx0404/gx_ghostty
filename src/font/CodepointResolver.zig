@@ -176,6 +176,13 @@ pub fn getIndex(
         if (self.discover) |disco| discover: {
             const load_opts = self.collection.load_options orelse
                 break :discover;
+            // fork(gx): GX-0056 ordinary fallback span, excluded from lib-vt.
+            const perf_span = if (comptime @import("terminal_options").artifact == .ghostty)
+                @import("../gx/font_fallback_perf.zig").discoveryBegin(self, cp)
+            else
+                null;
+            defer if (comptime @import("terminal_options").artifact == .ghostty)
+                @import("../gx/font_fallback_perf.zig").discoveryEnd(perf_span);
             var disco_it = disco.discoverFallback(alloc, &self.collection, .{
                 .codepoint = cp,
                 .size = load_opts.size.points,
@@ -208,7 +215,8 @@ pub fn getIndex(
                     cp,
                     deferred_face.name(&buf) catch "<error>",
                 });
-                return self.collection.addDeferred(alloc, deferred_face, .{
+                // fork(gx): GX-0056 bind only a successfully added fallback index.
+                const index = self.collection.addDeferred(alloc, deferred_face, .{
                     .style = style,
                     .fallback = true,
                     .size_adjustment = font.default_fallback_adjustment,
@@ -216,6 +224,10 @@ pub fn getIndex(
                     deferred_face.deinit();
                     break :discover;
                 };
+                // fork(gx): GX-0056 keep the claim tied to this resolver result.
+                if (comptime @import("terminal_options").artifact == .ghostty)
+                    @import("../gx/font_fallback_perf.zig").discoveryIndex(perf_span, index);
+                return index;
             }
 
             log.debug("no fallback face found for cp={X}", .{cp});
