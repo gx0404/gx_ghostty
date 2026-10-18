@@ -1,0 +1,142 @@
+id = "G28"
+title = "D-21/D-22: closing the tabs to the right or the other tabs keeps the pinned tabs, from the tab menu, key bindings and the command palette"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+r=prompt_tab_title
+keybind = ctrl+alt+o=close_tab:other
+keybind = ctrl+alt+g=close_tab:right
+"""
+# The window is 1100x740 at the top left: the tab bar is at y 67, and the
+# two pinned tabs P1 and P2 sit at x 33 and 72. Tab menu items lie 80 px
+# right of the right click and 119 (Pin Tab) or 228 (Close Tabs to the
+# Right) px below it. New tabs are only made while P2 or an unpinned tab
+# is selected: with P1 selected a new tab would go before P2, which
+# libadwaita refuses (a finding of this round, not covered here).
+script = '''
+results = {}
+def closed():
+    return (evidence / "G28.log").read_text().count("info(surface): surface closed")
+def record(label, before, count):
+    for _ in range(30):
+        if closed() - before >= count:
+            break
+        sleep(0.1)
+    sleep(0.5)
+    results[label] = closed() - before
+def focus_terminal():
+    xdo("mousemove", 600, 400, "click", 1)
+    sleep(0.3)
+def name_tab(name):
+    xdo("key", "ctrl+alt+r")
+    sleep(0.4)
+    xdo("key", "ctrl+a")
+    xdo("type", "--delay", 8, name)
+    xdo("key", "Return")
+    sleep(0.4)
+def new_tab(name):
+    xdo("key", "ctrl+shift+t")
+    sleep(0.7)
+    name_tab(name)
+def select_tab(x):
+    xdo("mousemove", x, 67, "click", 1)
+    sleep(0.4)
+    focus_terminal()
+def tab_menu(x):
+    xdo("mousemove", x, 67, "click", 3)
+    sleep(0.7)
+def menu_item(x, dy):
+    xdo("mousemove", x + 80, 67 + dy, "click", 1)
+    sleep(0.8)
+    focus_terminal()
+def palette(command):
+    xdo("key", "ctrl+shift+p")
+    sleep(0.8)
+    xdo("type", "--delay", 8, command)
+    sleep(0.8)
+xdo("windowsize", window(), 1100, 740)
+focus_terminal()
+name_tab("P1")
+for name in ["P2", "N1", "N2"]:
+    new_tab(name)
+tab_menu(143)
+menu_item(143, 119)
+tab_menu(225)
+menu_item(225, 119)
+capture("01-pinned")
+
+# The tab menu: Close Tabs to the Right on the first pinned tab (D-21).
+tab_menu(33)
+capture("02-close-right-menu")
+before = closed()
+menu_item(33, 228)
+record("menu close right from P1", before, 2)
+capture("02-closed-right")
+
+# Key bindings (D-22): close_tab:other on an unpinned tab, then
+# close_tab:right on the first pinned tab.
+select_tab(72)
+for name in ["N3", "N4", "N5"]:
+    new_tab(name)
+select_tab(585)
+capture("03-before-key-close-other")
+before = closed()
+xdo("key", "ctrl+alt+o")
+record("key close other from N4", before, 2)
+capture("03-key-closed-other")
+for name in ["N6", "N7"]:
+    new_tab(name)
+select_tab(33)
+before = closed()
+xdo("key", "ctrl+alt+g")
+record("key close right from P1", before, 3)
+capture("04-key-closed-right")
+
+# The command palette (D-22): Close Tabs to the Right on the first pinned
+# tab, then Close Other Tabs on the second.
+select_tab(72)
+for name in ["N8", "N9"]:
+    new_tab(name)
+select_tab(33)
+palette("Close Tabs to the Right")
+capture("05-palette-close-right")
+before = closed()
+xdo("key", "Return")
+record("palette close right from P1", before, 2)
+capture("05-palette-closed-right")
+select_tab(72)
+new_tab("N10")
+select_tab(72)
+palette("Close Other Tabs")
+capture("06-palette-close-other")
+before = closed()
+xdo("key", "Return")
+record("palette close other from P2", before, 1)
+capture("06-palette-closed-other")
+save("-closed.json", json.dumps(results, indent=1) + "\n")
+expected = {
+    "menu close right from P1": 2,
+    "key close other from N4": 2,
+    "key close right from P1": 3,
+    "palette close right from P1": 2,
+    "palette close other from P2": 1,
+}
+assert results == expected, results
+'''
+expect = [
+  "G28.png: the isolated terminal with one tab",
+  "G28-01-pinned.png: P1 and P2 pinned as small tabs at the start, then N1 and N2",
+  "G28-02-close-right-menu.png: the tab menu of the pinned P1 with Pin Tab checked and Close Tabs to the Right",
+  "G28-02-closed-right.png: Close Tabs to the Right on P1 closed N1 and N2; the pinned P2 stays",
+  "G28-03-before-key-close-other.png: P1 and P2 pinned, then N3, N4 and N5 with N4 selected",
+  "G28-03-key-closed-other.png: close_tab:other (ctrl+alt+o) on N4 closed N3 and N5; the pinned P1 and P2 stay",
+  "G28-04-key-closed-right.png: close_tab:right (ctrl+alt+g) on P1 closed N4, N6 and N7; the pinned P2 stays",
+  "G28-05-palette-close-right.png: the command palette filtered to Close Tabs to the Right, P1 selected behind it",
+  "G28-05-palette-closed-right.png: the palette entry closed N8 and N9; the pinned P2 stays",
+  "G28-06-palette-close-other.png: the command palette filtered to Close Other Tabs, P2 selected behind it",
+  "G28-06-palette-closed-other.png: the palette entry on P2 closed N10; the pinned P1 stays",
+  "G28-closed.json: the surfaces each step closed: 2, 2, 3, 2 and 1",
+]
