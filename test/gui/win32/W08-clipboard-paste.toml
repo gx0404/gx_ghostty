@@ -10,9 +10,13 @@ title = "Five clipboard pastes in a row land in the search box, and Ctrl+Shift+V
 # The OSC 52 read request needs the bundled ConPTY: the inbox conhost passes OSC 52 writes on but
 # not queries. Run W08 against the packaged layout (conpty.dll and OpenConsole.exe from the pinned
 # NuGet package next to ghostty.exe, docs/FORK_PATCHES.md GX-0007); the first step checks it.
+# Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch, so this scenario opens
+# the search bar with F9 (start_search, bound below), a key no input method takes: it needs no
+# keyboard layout switch and runs the same with any input method.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+keybind = f9=start_search
 """
 expect = [
   "search-pasted: the search box reads a1a1a1a1a1 (every one of the five pastes landed)",
@@ -31,9 +35,6 @@ action = "wait_log"
 pattern = "ConPTY: bundled"
 timeout = 10
 
-[[step]]
-action = "ime_off"
-
 # The fixture's own clipboard text, written by clip.exe (set /p prints it without a newline).
 [[step]]
 action = "type"
@@ -45,7 +46,7 @@ seconds = 1.0
 
 [[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f9"
 
 [[step]]
 action = "wait_popup"
