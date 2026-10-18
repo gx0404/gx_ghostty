@@ -374,7 +374,11 @@ pub const PopupBridge = struct {
         }
         // Queued by Publisher.moveFocus and raised here, from the message
         // loop: no widget callback, nothing revoked.
-        if (action.kind == .focus_changed) return self.publisher.raiseFocusChanged(action.node_id);
+        if (action.kind == .focus_changed) {
+            const raised = self.publisher.raiseFocusChanged(action.node_id);
+            if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_focus snapshot={d} node={d} raised={}", .{ action.snapshot_id, action.node_id, raised });
+            return raised;
+        }
         return self.dispatchPrepared(callbacks, token, action);
     }
     fn dispatchPrepared(self: *PopupBridge, callbacks: PopupCallbacks, token: u64, action: *const uia.Action) bool {

@@ -196,6 +196,10 @@ UIA test-only 日志 `fixture_uia` 给 snapshot/HWND/node/kind/reason/pending，
 在释放锁之后输出；`fixture_uia_dispatch ... invalidates=` 只表示桥层是否预撤销 snapshot
 （focus 为 false），回调自身改模型/布局时仍会 `Popup.invalidate()`，不能据此推断最终
 provider 状态，以随后的 `fixture_uia ... reason=` 为准。无 Value 正文。
+弹层焦点原位移动（`Publisher.moveFocus`）入队时记 `fixture_uia ... kind=focus_changed
+reason=queued`，消息循环发事件时记 `fixture_uia_focus snapshot=N node=N raised=true|false`；
+`raised` 只是 UiaRaiseAutomationEvent 的返回值，不代表客户端收到，焦点已移走时为 false，
+快照已换则不派发也不记。
 Python FAIL JSON 保留 `stage/node_id/pattern_id/call/hresult/action_results`，不重试。
 
 ### A2r 远程控制接口（MIG-07 / MIG-08）
