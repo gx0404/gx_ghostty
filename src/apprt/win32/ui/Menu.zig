@@ -702,8 +702,32 @@ pub fn invalidateWindow(window: *Window) void {
     if (window.hwnd) |hwnd| MenuPopup.invalidateOwner(hwnd);
 }
 
-/// Environment/profile-cache notifications use the same coalesced work as
-/// configuration and language changes. No timer drives this preparation.
+test "P4 system theme invalidates a non-primary owner's hidden hosts" {
+    // No HWND, desktop, configuration load or native theme API is involved.
+    // A non-primary receiver must still invalidate its own hidden UI, even
+    // though only the primary owner applies the process-wide system change.
+    var app: App = undefined;
+    app.quick_terminal = null;
+    var primary: Window = undefined;
+    primary.hwnd = null;
+    primary.palette = .{};
+    primary.palette.preparation.pending = false;
+    var window: Window = undefined;
+    window.hwnd = null;
+    window.palette = .{};
+    window.palette.preparation.pending = false;
+    window.palette.item_cache.stamp = 123;
+    var windows = [_]*Window{ &primary, &window };
+    app.windows = .{ .items = &windows, .capacity = windows.len };
+    app.onSystemSettingChange(&window, .theme);
+    try std.testing.expect(primary.palette.preparation.pending);
+    try std.testing.expect(window.palette.preparation.pending);
+    try std.testing.expect(window.palette.popup.reuse_invalid);
+    try std.testing.expect(window.palette.item_cache.stamp == null);
+}
+
+/// System broadcasts invalidate all owners after shared state is applied; an
+/// earlier non-primary receiver cannot leave a stale profile/theme cache warm.
 pub fn invalidateApp(app: *App) void {
     for (app.windows.items) |window| invalidateWindow(window);
     if (app.quick_terminal) |qt| invalidateWindow(qt.window);

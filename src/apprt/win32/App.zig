@@ -1209,12 +1209,14 @@ pub fn wakeup(self: *App) void {
 /// terminals (`syncColorScheme`), and changed environment variables
 /// ("Environment") detect the shells of the launch profiles again.
 pub fn onSystemSettingChange(self: *App, window: *Window, change: w32.SystemChange) void {
+    // Retire every owner's hidden UI after updating shared theme/profile state.
+    // Non-primary broadcasts also invalidate; pending idle work is coalesced.
+    defer Menu.invalidateApp(self);
     if (window != self.primaryWindow()) return;
     if (change.isArea("ImmersiveColorSet")) self.syncColorScheme();
     if (change.isArea("Environment")) {
         self.profiles_cache.invalidate();
         self.updateDefaultCommand();
-        Menu.invalidateApp(self);
     }
 }
 
