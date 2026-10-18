@@ -21,7 +21,9 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   windows ENV_DIR                   list its top-level windows and terminals
   activate ENV_DIR                  bring its main window to the foreground
   capture ENV_DIR OUT.png [--popups] [--quick] [--method screen|print]
-  pixel ENV_DIR X Y [--in ANCHOR]   print the color at a point
+          [--backdrop #RRGGBB | --no-backdrop REASON]           (see Privacy backdrop)
+  pixel ENV_DIR X Y [--in ANCHOR] [--method screen|print] [--backdrop #RRGGBB | --no-backdrop REASON]
+                                    print the color at a point
   type ENV_DIR TEXT                 KEYEVENTF_UNICODE, "\\n" is Enter
   key ENV_DIR CHORD [--repeat N]    real virtual keys with scan codes, e.g. ctrl+shift+t; oem1..oem8 and
                                     oem102 name the layout-dependent keys (VK_OEM_*, e.g. German ^ is
@@ -107,7 +109,10 @@ above the backdrop before and after the capture, no window of another process ma
 window or its band on the covered areas, and every band pixel outside the instance's windows must be
 the backdrop color or its shadow; otherwise the step fails and the screenshot is not saved. A
 backdrop that cannot be destroyed fails the scenario. run.json lists every check (covered areas,
-band pieces, pixels counted, foreign windows by class, pid and image, no titles).
+band pieces, pixels counted, foreign windows by class, pid and image, no titles). The session
+commands capture and pixel do the same with --method screen: a backdrop of their own (--backdrop,
+default #000000) for that one command, destroyed before it returns (exit 1 when that fails);
+--no-backdrop REASON captures without one and prints a warning.
 
 Keyboard layouts: layout, the layout step and ime_off only switch to a layout GetKeyboardLayoutList
 reports for this user: they post WM_INPUTLANGCHANGEREQUEST to the window's focused thread and wait up
@@ -1647,8 +1652,8 @@ class Backdrop:
         return [f"{event['why']}: {event['result']}" for event in self.events
                 if event.get("event") == "destroyed" and event.get("result") != "destroyed"]
 
-    def finish(self) -> dict[str, Any]:
-        self.drop("scenario end")
+    def finish(self, why: str = "scenario end") -> dict[str, Any]:
+        self.drop(why)
         return {"initial": self.initial, "color": self.color, "reason": self.reason, "placements": self.placements,
                 "restacks": self.restacks, "events": self.events, "checks": self.checks}
 
@@ -3281,6 +3286,15 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--quick", action="store_true", help="capture the quick terminal")
     capture.add_argument("--method", choices=("screen", "print"), default="screen")
 
+    def backdrop_options(sub: argparse.ArgumentParser) -> None:
+        group = sub.add_mutually_exclusive_group()
+        group.add_argument("--backdrop", default=BACKDROP_DEFAULT, metavar="#RRGGBB",
+                           help=f"privacy backdrop color of a screen capture (default {BACKDROP_DEFAULT})")
+        group.add_argument("--no-backdrop", metavar="REASON",
+                           help="screen capture without the privacy backdrop, for the given reason (warns)")
+
+    backdrop_options(capture)
+
     def pointer(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("x", type=coordinate)
         sub.add_argument("y", type=coordinate)
@@ -3289,6 +3303,7 @@ def build_parser() -> argparse.ArgumentParser:
     pixel = session("pixel", "print the color at a point")
     pointer(pixel)
     pixel.add_argument("--method", choices=("screen", "print"), default="screen")
+    backdrop_options(pixel)
     typing = session("type", "type text")
     typing.add_argument("text")
     key = session("key", "press a key chord")
@@ -3341,6 +3356,46 @@ def print_windows(instance: Instance) -> None:
                 print("  " + terminal.describe())
 
 
+def session_capture(instance: Instance, args: argparse.Namespace) -> int:
+    """capture and pixel: a screen capture goes through a privacy backdrop of its own, destroyed before
+    the command returns, unless --no-backdrop gives the reason (then a warning)."""
+    if args.no_backdrop is not None:
+        if not args.no_backdrop.strip():
+            raise UsageError("--no-backdrop needs the reason why the image may show the desktop")
+        backdrop = Backdrop(None, args.no_backdrop)
+        if args.method == "screen":
+            print(f"{TAG} warning: screen capture without the privacy backdrop ({args.no_backdrop}); the desktop "
+                  "and windows behind or over the window may be in the image", file=sys.stderr, flush=True)
+    else:
+        backdrop = Backdrop(color_hex(parse_color(args.backdrop)))
+    teardown: list[str] = []
+    try:
+        if args.command == "capture":
+            if args.popups:
+                targets = [(info, args.out.with_name(f"{args.out.stem}-{info.cls}-{index}{args.out.suffix}"))
+                           for index, info in enumerate(instance.popups(), 1)]
+            else:
+                targets = [(instance.require_window("quick" if args.quick else "main"), args.out)]
+            for info, path in targets:
+                print(backdrop.capture(instance, info, args.method, path.name).save_png(path))
+        else:
+            x, y = instance.point(args.x, args.y, args.anchor)
+            image = backdrop.capture(instance, instance.require_window(), args.method, "pixel")
+            print(f"({x}, {y}) {color_hex(image.pixel(x, y))}")
+    finally:
+        backdrop.finish("command end")
+        teardown = backdrop.teardown_failures()
+        if teardown:
+            print(f"{TAG} error: the privacy backdrop was not destroyed ({'; '.join(teardown)})", file=sys.stderr,
+                  flush=True)
+        elif backdrop.checks:
+            passed = sum(check["status"] == "pass" for check in backdrop.checks)
+            print(f"{TAG} privacy backdrop {backdrop.color}: {passed} of {len(backdrop.checks)} checks passed; "
+                  "destroyed", file=sys.stderr, flush=True)
+    instance.save()
+    return 1 if teardown else 0
+
+
 def session_command(args: argparse.Namespace) -> int:
     env_dir: Path = args.env_dir
     if args.command == "start":
@@ -3372,18 +3427,8 @@ def session_command(args: argparse.Namespace) -> int:
         print_windows(instance)
     elif args.command == "activate":
         instance.activate()
-    elif args.command == "capture":
-        if args.popups:
-            for index, info in enumerate(instance.popups(), 1):
-                path = args.out.with_name(f"{args.out.stem}-{info.cls}-{index}{args.out.suffix}")
-                print(instance.capture_window(info, args.method).save_png(path))
-        else:
-            info = instance.require_window("quick" if args.quick else "main")
-            print(instance.capture_window(info, args.method).save_png(args.out))
-    elif args.command == "pixel":
-        x, y = instance.point(args.x, args.y, args.anchor)
-        image = instance.capture_window(instance.require_window(), args.method)
-        print(f"({x}, {y}) {color_hex(image.pixel(x, y))}")
+    elif args.command in ("capture", "pixel"):
+        return session_capture(instance, args)
     elif args.command == "type":
         instance.type_text(args.text.replace("\\n", "\n"))
     elif args.command == "key":

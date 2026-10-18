@@ -1932,6 +1932,90 @@ class BackdropScenarioTests(unittest.TestCase):
         self.assertIn("a backdrop step changed it", notes)
 
 
+class SessionCaptureTests(unittest.TestCase):
+    """The session commands capture and pixel put their screen captures behind a backdrop too."""
+
+    WINDOW = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (100, 100, 140, 130), True, False, False)
+    POPUP = gui.WindowInfo(0x20, gui.POPUP_CLASS, "", (300, 300, 340, 330), True, False, False)
+
+    def setUp(self):
+        FakeBackdropWindow.made = []
+        FakeBackdropWindow.close_error = None
+        self.fake = FakeWin32(4242, 4242)
+        self.fake.stack = [gui.StackEntry(0x20, gui.POPUP_CLASS, self.POPUP.rect, 4242, 4242),
+                           gui.StackEntry(0x10, gui.WINDOW_CLASS, self.WINDOW.rect, 4242, 4242),
+                           gui.StackEntry(0xB0, "backdrop", (0, 0, 1000, 800), 1, 1)]
+        self.instance = mock.Mock(spec=gui.Instance)
+        self.instance.pid = 4242
+        self.instance.alive.return_value = True
+        self.instance.require_window.return_value = self.WINDOW
+        self.instance.popups.return_value = [self.POPUP]
+        self.instance.point.return_value = (120, 110)
+        self.instance.capture_window.side_effect = (
+            lambda info, method, region=None, see_through=(): screen(region or info.rect, [info.rect]))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.out = Path(tmp.name)
+        for patch in (mock.patch.object(gui, "win32", return_value=self.fake),
+                      mock.patch.object(gui, "BackdropWindow", FakeBackdropWindow),
+                      mock.patch.object(gui.Instance, "load", return_value=self.instance),
+                      mock.patch.object(gui.time, "sleep")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def command(self, *argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = gui.main([argv[0], str(self.out / "env"), *argv[1:]])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_screen_capture_and_a_pixel_read_go_through_a_backdrop_of_their_own(self):
+        code, out, err = self.command("capture", str(self.out / "shot.png"))
+        self.assertEqual(0, code, err)
+        self.assertTrue((self.out / "shot.png").is_file())
+        self.assertEqual(1, len(FakeBackdropWindow.made))
+        self.assertEqual(((0, 0, 0), 1), (FakeBackdropWindow.made[0].color, FakeBackdropWindow.made[0].closed))
+        self.assertIn("privacy backdrop #000000: 1 of 1 checks passed; destroyed", err)
+        self.instance.capture_window.assert_called_once_with(self.WINDOW, "screen", region=(76, 76, 164, 154),
+                                                             see_through=(0xB0,))
+        code, out, err = self.command("pixel", "1", "2", "--backdrop", "FF00FF")
+        self.assertEqual((0, "(120, 110) #ffffff\n"), (code, out))
+        self.assertEqual(((255, 0, 255), 1), (FakeBackdropWindow.made[1].color, FakeBackdropWindow.made[1].closed))
+
+    def test_the_popups_share_one_backdrop_and_a_failed_check_saves_nothing(self):
+        code, out, err = self.command("capture", str(self.out / "p.png"), "--popups")
+        self.assertEqual((0, 1), (code, len(FakeBackdropWindow.made)), err)
+        self.assertTrue((self.out / f"p-{gui.POPUP_CLASS}-1.png").is_file())
+        self.fake.stack.insert(0, gui.StackEntry(0x99, "Chrome_WidgetWin_1", (0, 0, 900, 900), 777, 777))
+        code, out, err = self.command("capture", str(self.out / "leak.png"))
+        self.assertEqual(1, code)
+        self.assertRegex(err, r"privacy backdrop check failed for leak.png: 1 window\(s\) of other processes")
+        self.assertFalse((self.out / "leak.png").exists())
+        self.assertEqual(1, FakeBackdropWindow.made[1].closed, "destroyed although the check failed")
+
+    def test_print_and_no_backdrop_need_no_window_and_no_backdrop_warns(self):
+        code, _, err = self.command("capture", str(self.out / "print.png"), "--method", "print")
+        self.assertEqual((0, [], ""), (code, FakeBackdropWindow.made, err))
+        code, _, err = self.command("capture", str(self.out / "bare.png"), "--no-backdrop", "checks the wallpaper")
+        self.assertEqual((0, []), (code, FakeBackdropWindow.made))
+        self.assertIn("warning: screen capture without the privacy backdrop (checks the wallpaper)", err)
+        self.assertEqual([mock.call(self.WINDOW, "print"), mock.call(self.WINDOW, "screen")],
+                         self.instance.capture_window.call_args_list)
+
+    def test_bad_options_and_a_backdrop_that_is_not_destroyed(self):
+        for argv in (("capture", "x.png", "--backdrop", "pink"), ("pixel", "1", "2", "--no-backdrop", " "),
+                     ("capture", "x.png", "--backdrop", "#000000", "--no-backdrop", "x")):
+            with self.subTest(argv=argv):
+                self.assertEqual(2, self.command(*argv)[0])
+        self.assertEqual([], FakeBackdropWindow.made)
+        FakeBackdropWindow.close_error = gui.GuiError("the privacy backdrop 0xb0 still exists")
+        code, out, err = self.command("capture", str(self.out / "kept.png"))
+        self.assertEqual(1, code)
+        self.assertTrue((self.out / "kept.png").is_file(), "the capture itself passed")
+        self.assertIn("error: the privacy backdrop was not destroyed (command end: failed: the privacy backdrop "
+                      "0xb0 still exists)", err)
+
+
 @unittest.skipUnless(sys.platform == "win32", "the ctypes structures are Windows only")
 class Win32StructureTests(unittest.TestCase):
     def test_input_structure_size_matches_the_platform(self):
