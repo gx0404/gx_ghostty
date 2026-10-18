@@ -359,7 +359,11 @@ pub fn updateVisibility(self: *TabBar) bool {
 
 fn shouldShow(self: *const TabBar) bool {
     const win = self.windowConst();
-    const caption_row = win.title_bar.hasCaptionRow() or win.title_bar.frame() == .borderless;
+    // Initial restoration precedes applyDecoration and HWND creation.
+    const caption_row = if (win.hwnd == null)
+        TitleBar.Decoration.fromConfig(win.app.config.@"window-decoration") != .native
+    else
+        win.title_bar.hasCaptionRow() or win.title_bar.frame() == .borderless;
     return if (win.is_quick_terminal or win.tab_bar_suppressed) false else switch (win.app.config.@"window-show-tab-bar") {
         .always => true,
         .auto => caption_row or win.tab_count > 1,
@@ -2640,8 +2644,10 @@ test {
 test "administrator badge sizing follows elevation and tab visibility before first layout" {
     var app: @import("../App.zig") = undefined;
     app.config.@"window-show-tab-bar" = .auto;
+    app.config.@"window-decoration" = .auto;
     var win: Window = undefined;
     win.app = &app;
+    win.hwnd = null;
     win.is_quick_terminal = false;
     win.tab_bar_suppressed = false;
     win.tab_count = 1;
@@ -2650,6 +2656,12 @@ test "administrator badge sizing follows elevation and tab visibility before fir
     try std.testing.expect(!win.tab_bar.showsAdminBadge());
     win.tab_bar.elevated = true;
     try std.testing.expect(win.tab_bar.showsAdminBadge());
+    app.config.@"window-decoration" = .server;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.tab_count = 2;
+    try std.testing.expect(win.tab_bar.showsAdminBadge());
+    win.tab_count = 1;
+    app.config.@"window-decoration" = .auto;
     app.config.@"window-show-tab-bar" = .never;
     try std.testing.expect(!win.tab_bar.showsAdminBadge());
     app.config.@"window-show-tab-bar" = .always;
