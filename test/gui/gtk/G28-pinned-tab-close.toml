@@ -22,6 +22,7 @@ keybind = ctrl+alt+left=move_tab:-1
 # pane to a new tab while the first pinned tab P1 is selected (D-24).
 script = '''
 results = {}
+orders = {}
 def log():
     return (evidence / "G28.log").read_text()
 def closed():
@@ -51,6 +52,20 @@ def select_tab(x):
     xdo("mousemove", x, 67, "click", 1)
     sleep(0.4)
     focus_terminal()
+def assert_order(label, expected, selected):
+    assert len(expected) in (3, 4)
+    positions = [33, 72] + ([588] if len(expected) == 3 else [340, 838])
+    observed = []
+    for x in positions:
+        select_tab(x)
+        observed.append(xdo("getwindowname", window()))
+    orders[label] = {"expected": expected, "observed": observed}
+    save("-order-" + label + ".json", json.dumps(orders[label], indent=2))
+    if observed != expected:
+        capture(label + "-order-failed")
+    assert observed == expected, (label, expected, observed)
+    select_tab(positions[expected.index(selected)])
+
 def tab_menu(x):
     xdo("mousemove", x, 67, "click", 3)
     sleep(0.7)
@@ -142,6 +157,7 @@ xdo("key", "ctrl+shift+t")
 sleep(0.8)
 name_tab("N11")
 capture("07-new-tab-from-first-pinned")
+assert_order("07-new-tab", ["P1", "P2", "N11"], "N11")
 assert "CRITICAL" not in log(), "a new tab from P1 was refused"
 select_tab(33)
 xdo("key", "ctrl+alt+d")
@@ -150,32 +166,35 @@ xdo("key", "ctrl+alt+n")
 sleep(1.0)
 name_tab("S1")
 capture("08-split-to-tab-from-first-pinned")
+assert_order("08-moved-split", ["P1", "P2", "S1", "N11"], "S1")
 assert "CRITICAL" not in log(), "a split pane moved from P1 was refused"
 assert closed() == kept, "a terminal closed while moving the split"
 
 # D-26: each move wraps inside its pinned/unpinned group. The selected
 # pinned tab is identifiable by the window title and its selected slot.
-def move_tab(key, shot):
+def move_tab(key, shot, expected, selected):
     if key.startswith("Move Tab"):
         palette(key)
         xdo("key", "Return")
     else:
         xdo("key", key)
     sleep(0.8)
+    assert_order(shot, expected, selected)
     capture(shot)
     assert "CRITICAL" not in log(), "move_tab crossed the pinned boundary: " + shot
 
 # P1, P2 | S1, N11 -> P2, P1 | S1, N11 (last pinned right).
 select_tab(72)
-move_tab("ctrl+alt+Right", "09-last-pinned-right")
+move_tab("ctrl+alt+Right", "09-last-pinned-right", ["P2", "P1", "S1", "N11"], "P2")
 # P2, P1 -> P1, P2 (first pinned left).
-move_tab("Move Tab Left", "10-first-pinned-left")
+move_tab("Move Tab Left", "10-first-pinned-left", ["P1", "P2", "S1", "N11"], "P2")
 # S1, N11 -> N11, S1 (first ordinary left).
 select_tab(340)
-move_tab("ctrl+alt+Left", "11-first-unpinned-left")
+move_tab("ctrl+alt+Left", "11-first-unpinned-left", ["P1", "P2", "N11", "S1"], "S1")
 # N11, S1 -> S1, N11 (last ordinary right).
-move_tab("Move Tab Right", "12-last-unpinned-right")
+move_tab("Move Tab Right", "12-last-unpinned-right", ["P1", "P2", "S1", "N11"], "S1")
 assert closed() == kept, "a terminal closed while moving tabs"
+save("-tab-orders.json", json.dumps(orders, indent=2))
 
 '''
 expect = [
@@ -197,5 +216,6 @@ expect = [
   "G28-10-first-pinned-left.png: selected P2 wraps back to the second pinned slot",
   "G28-11-first-unpinned-left.png: selected S1 wraps after N11; both pinned tabs stay at the start",
   "G28-12-last-unpinned-right.png: selected S1 wraps before N11, after both pinned tabs",
+  "G28-tab-orders.json: actual window titles prove insertion and move order at steps 07 through 12",
   "G28.log: no CRITICAL line up to the last step (the script asserts it)",
 ]
