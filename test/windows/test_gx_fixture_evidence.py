@@ -1,6 +1,7 @@
 """Offline contracts; all native APIs are mocked and files are temporary."""
 import contextlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -74,12 +75,68 @@ class SharedSlotTests(unittest.TestCase):
             yield
 
         gx_slots = SimpleNamespace(shared_root=lambda: shared, acquire=acquire)
-        with mock.patch.dict(sys.modules, {"gx_slots": gx_slots}):
-            with evidence.fixture_slots(Path("D:/elsewhere/worktree")):
-                pass
-            with evidence.fixture_slots(Path("D:/elsewhere/worktree"), desktop_held=True):
-                pass
+        with tempfile.TemporaryDirectory() as folder, self.environment():
+            worktree = Path(folder) / "worktree"
+            worktree.mkdir()
+            (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")  # A worktree's link file.
+            with mock.patch.dict(sys.modules, {"gx_slots": gx_slots}):
+                with evidence.fixture_slots(worktree):
+                    pass
+                with evidence.fixture_slots(worktree, desktop_held=True):
+                    pass
         self.assertEqual([(shared, "heavy", 45), (shared, "desktop", 45)], taken)
+
+    @contextlib.contextmanager
+    def environment(self, **values):
+        """os.environ without GX_FIXTURE_SLOT_ROOT, plus `values`."""
+        with mock.patch.dict(os.environ, values):
+            if "GX_FIXTURE_SLOT_ROOT" not in values:
+                os.environ.pop("GX_FIXTURE_SLOT_ROOT", None)
+            yield
+
+    @staticmethod
+    def no_git():
+        """A gx_slots whose shared_root, like git itself, must not be asked."""
+        def refuse(*args, **kwargs):
+            raise AssertionError(f"git must not run: {args}")
+        return SimpleNamespace(shared_root=refuse, acquire=None), refuse
+
+    def test_a_staged_copy_outside_any_checkout_keeps_its_own_slots(self):
+        # Review round 4: a VM stage of the Python fixtures has no git checkout;
+        # the default lock entry must work there as it did before shared slots.
+        gx_slots, refuse = self.no_git()
+        with tempfile.TemporaryDirectory() as folder, self.environment():
+            stage = Path(folder) / "stage"
+            stage.mkdir()
+            with mock.patch.dict(sys.modules, {"gx_slots": gx_slots}), mock.patch.object(evidence.subprocess, "run", side_effect=refuse):
+                self.assertEqual(stage / ".local" / "kernel-slots", evidence.slot_root(stage))
+
+    def test_an_explicit_absolute_slot_root_needs_no_git(self):
+        gx_slots, refuse = self.no_git()
+        with tempfile.TemporaryDirectory() as folder:
+            explicit = Path(folder) / "vm-slots"
+            with self.environment(GX_FIXTURE_SLOT_ROOT=str(explicit)), mock.patch.dict(sys.modules, {"gx_slots": gx_slots}), \
+                    mock.patch.object(evidence.subprocess, "run", side_effect=refuse):
+                self.assertEqual(explicit, evidence.slot_root(Path(__file__).resolve().parents[2]))
+        with self.environment(GX_FIXTURE_SLOT_ROOT="relative/slots"), self.assertRaisesRegex(ValueError, "absolute"):
+            evidence.slot_root(Path("D:/stage"))
+
+    def test_a_checkout_whose_git_fails_does_not_fall_back_to_private_slots(self):
+        # A worktree's own slots would not exclude the other worktrees.
+        def fail():
+            raise subprocess.CalledProcessError(128, ["git"])
+        gx_slots = SimpleNamespace(shared_root=fail, acquire=None)
+        with tempfile.TemporaryDirectory() as folder, self.environment():
+            worktree = Path(folder) / "worktree"
+            worktree.mkdir()
+            (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+            with mock.patch.dict(sys.modules, {"gx_slots": gx_slots}), self.assertRaises(subprocess.CalledProcessError):
+                evidence.slot_root(worktree)
+
+    def test_the_coordinator_held_entry_takes_no_lock_and_needs_no_slot_root(self):
+        with mock.patch.object(evidence, "slot_root", side_effect=AssertionError("no slot root when held")):
+            with evidence.fixture_slots(Path("D:/stage"), desktop_held=True):
+                pass
 
 
 if __name__ == "__main__":

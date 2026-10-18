@@ -8,8 +8,13 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+import os
 from pathlib import Path
 import subprocess
+
+# A controlled stage (a VM's copy of the Python fixtures, no git checkout)
+# may name its kernel-slot directory explicitly; see `slot_root`.
+SLOT_ROOT_ENV = "GX_FIXTURE_SLOT_ROOT"
 
 
 def sha256(path):
@@ -112,11 +117,34 @@ def drag_thresholds(dpi):
             for axis, dip in (("vertical", 15), ("horizontal", 10))}
 
 
+def in_checkout(root):
+    """Whether `root` lies in a git checkout: a `.git` directory, or a
+    worktree's `.git` file, at it or above. Read from the file system only."""
+    path = Path(root).resolve()
+    return any((candidate / ".git").exists() for candidate in (path, *path.parents))
+
+
 def slot_root(root):
-    """The kernel-slot directory every checkout of the repository shares: the
-    main checkout's .local/kernel-slots beside the git common directory, so a
-    fixture run from a worktree excludes the other worktrees' desktop and heavy
-    jobs. gx_slots.shared_root() is the source when this gx_slots has it."""
+    """The kernel-slot directory of the fixture's desktop and heavy locks.
+
+    1. `GX_FIXTURE_SLOT_ROOT`, an absolute path, when set: a controlled stage
+       names its slots without git (review round 4).
+    2. In a git checkout, the directory every checkout of the repository
+       shares: the main checkout's .local/kernel-slots beside the git common
+       directory, so a fixture run from a worktree excludes the other
+       worktrees' desktop and heavy jobs. gx_slots.shared_root() is the source
+       when this gx_slots has it. A git failure there is an error, never a
+       fallback: a worktree's own slots would not exclude the others.
+    3. A staged copy outside any checkout (a VM's): its own .local/kernel-slots,
+       as before slots were shared; nothing else there takes them.
+    """
+    explicit = os.environ.get(SLOT_ROOT_ENV)
+    if explicit:
+        if not Path(explicit).is_absolute():
+            raise ValueError(f"{SLOT_ROOT_ENV} must be an absolute path: {explicit!r}")
+        return Path(explicit)
+    if not in_checkout(root):
+        return Path(root) / ".local" / "kernel-slots"
     import gx_slots
     shared = getattr(gx_slots, "shared_root", None)
     if shared is not None:
@@ -132,7 +160,10 @@ def fixture_slots(root, desktop_held=False):
 
 The explicit flag is a caller assertion, not a new way to acquire the desktop.
 Every real run still requires the coordinator's idle and foreground guards.
-Locks live in the repository-wide `slot_root`, never a worktree's own copy.
+With it nothing is locked and `slot_root` is never asked, so a coordinator
+that holds the slots needs neither git nor a slot directory. Without it the
+locks live in `slot_root`: the repository-wide slots in a checkout, never a
+worktree's own copy.
 """
     if desktop_held:
         yield
