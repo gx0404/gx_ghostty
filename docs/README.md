@@ -45,4 +45,4 @@
 - 事实以源码、配置和测试为准；长期引用写 `path::symbol`，不写行号；命令只写 `justfile` 里真实存在的配方或上游真实命令。
 - fork 文档用中文，标识符、命令、路径保持英文。
 - 新增 fork 文档时在上表登记；`docs/**` 归 `development` 领域（见 `routes.toml`）。
-- 本目录的 `*.md` 都是知识库语料：改完跑 `just kb` 并审 diff，否则 `just framework-check` 里的 `kb-check` 会失败。
+- 本目录的 `*.md` 除阶段过程文档 `GX_UI_*.md` 外都是知识库语料（排除项按路径直接阅读）：改完跑 `just kb` 并审 diff，否则 `just framework-check` 里的 `kb-check` 会失败。

@@ -1,16 +1,47 @@
 id = "W08"
 title = "Five clipboard pastes in a row land in the search box, and Ctrl+Shift+V pastes into the shell"
+# R0: search-pasted and shell-pasted. The fixture never reads, saves or restores the clipboard
+# content it finds: it writes its own text with clip.exe (and, in the r6 extension, with OSC 52
+# from terminal output), so the pastes repeat one owned value.
+# Phase 6 (r6) extends the case for R2-Surface.04 and R2-Dialogs.01: an OSC 52 write, the unsafe
+# paste confirmation with its preview (line ends, a tab, hidden code points, a long line, wide
+# characters, rows past the box counted), the OSC 52 read request with its preview and Deny, an
+# empty OSC 52 write and a read of the emptied clipboard.
+# The OSC 52 read request needs the bundled ConPTY: the inbox conhost passes OSC 52 writes on but
+# not queries. Run W08 against the packaged layout (conpty.dll and OpenConsole.exe from the pinned
+# NuGet package next to ghostty.exe, docs/FORK_PATCHES.md GX-0007); the first step checks it.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 """
 expect = [
-  "search-pasted: the search box reads a1b2c3d4e5 (every paste landed, in order)",
+  "search-pasted: the search box reads a1a1a1a1a1 (every one of the five pastes landed)",
   "shell-pasted: the shell ran `echo pasted-into-shell` and printed pasted-into-shell",
+  "osc52-written: after the OSC 52 write the shell shows no stray characters; a toast says Copied to clipboard",
+  "paste-preview: Ctrl+Shift+V of the multi-line text asks with Warning: Potentially Unsafe Paste: the preview marks each line end with ↵, shows the tab as space, marks U+202E and U+200B as code points, wraps the long line, shows the wide characters, and counts the rows that do not fit; Cancel is the default",
+  "paste-cancelled: after Esc nothing was pasted: the prompt line is empty",
+  "read-ask: the OSC 52 read request asks (Authorize Clipboard Access) and previews the text the program would receive, with the Remember check box and the default Deny",
+  "read-denied: after Esc the dialog is gone and the prompt is usable",
+  "empty-write: an empty OSC 52 write emptied the clipboard: a toast says Cleared clipboard",
+  "empty-read: a read of the emptied clipboard shows no stale text (an empty preview that says The clipboard is empty, or no dialog at all)",
 ]
 
 [[step]]
+action = "wait_log"
+pattern = "ConPTY: bundled"
+timeout = 10
+
+[[step]]
 action = "ime_off"
+
+# The fixture's own clipboard text, written by clip.exe (set /p prints it without a newline).
+[[step]]
+action = "type"
+text = "echo|set /p=a1|clip\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
 
 [[step]]
 action = "key"
@@ -21,10 +52,14 @@ action = "wait_popup"
 cls = "GhosttyGxPopup"
 new = true
 
-# SendInput only queues the keys: wait for each paste before the clipboard changes again.
+# SendInput only queues the keys: wait for each paste before the next one.
 [[step]]
-action = "clipboard"
-text = "a1"
+action = "key"
+keys = "ctrl+v"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
 
 [[step]]
 action = "key"
@@ -35,10 +70,6 @@ action = "sleep"
 seconds = 0.4
 
 [[step]]
-action = "clipboard"
-text = "b2"
-
-[[step]]
 action = "key"
 keys = "ctrl+v"
 
@@ -47,32 +78,12 @@ action = "sleep"
 seconds = 0.4
 
 [[step]]
-action = "clipboard"
-text = "c3"
-
-[[step]]
 action = "key"
 keys = "ctrl+v"
 
 [[step]]
 action = "sleep"
 seconds = 0.4
-
-[[step]]
-action = "clipboard"
-text = "d4"
-
-[[step]]
-action = "key"
-keys = "ctrl+v"
-
-[[step]]
-action = "sleep"
-seconds = 0.4
-
-[[step]]
-action = "clipboard"
-text = "e5"
 
 [[step]]
 action = "key"
@@ -97,8 +108,24 @@ cls = "GhosttyGxPopup"
 present = false
 
 [[step]]
-action = "clipboard"
-text = "echo pasted-into-shell"
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "type"
+text = "echo|set /p=echo pasted-into-shell|clip\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
 
 [[step]]
 action = "key"
@@ -119,3 +146,177 @@ seconds = 0.5
 [[step]]
 action = "capture"
 name = "shell-pasted"
+
+# --- r6 extension (R2-Surface.04, R2-Dialogs.01) -------------------------------------------
+[[step]]
+action = "file"
+path = "osc52-unsafe.txt"
+text = "\u001b]52;c;Zmlyc3QgbGluZSBvZiB0aGUgb3duZWQgVzA4IHRleHQKc2Vjb25kCWxpbmUgd2l0aCBhIHRhYgpoaWRkZW4g4oCuIHJpZ2h0LXRvLWxlZnQgb3ZlcnJpZGUgYW5kIHplcm/igIt3aWR0aCBzcGFjZQpsb25nIDAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OQrkuK3mloflrr3lrZfnrKYgd2lkZSBjaGFyYWN0ZXJzCnJvdyAwNgpyb3cgMDcKcm93IDA4CnJvdyAwOQpyb3cgMTAKcm93IDExCnJvdyAxMgpyb3cgMTMKcm93IDE0CnJvdyAxNQpyb3cgMTYKcm93IDE3CnJvdyAxOApyb3cgMTkKcm93IDIwCnJvdyAyMQpyb3cgMjIKcm93IDIzCnJvdyAyNApyb3cgMjUKcm93IDI2CnJvdyAyNwpyb3cgMjgKcm93IDI5CnJvdyAzMAo=\u0007"
+
+[[step]]
+action = "file"
+path = "osc52-read.txt"
+text = "\u001b]52;c;?\u0007"
+
+[[step]]
+action = "file"
+path = "osc52-empty.txt"
+text = "\u001b]52;c;\u0007"
+
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "type"
+text = "type \"%LOCALAPPDATA%\\osc52-unsafe.txt\"\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "osc52-written"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+v"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "paste-preview"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "paste-cancelled"
+
+[[step]]
+action = "type"
+text = "type \"%LOCALAPPDATA%\\osc52-read.txt\"\n"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "read-ask"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 5
+
+# The (empty) reply arrives at cmd as typed characters: Escape clears the line.
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "read-denied"
+
+[[step]]
+action = "type"
+text = "type \"%LOCALAPPDATA%\\osc52-empty.txt\"\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "empty-write"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "type"
+text = "type \"%LOCALAPPDATA%\\osc52-read.txt\"\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "empty-read"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "assert_responsive"

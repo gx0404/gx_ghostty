@@ -877,10 +877,22 @@ palette: Palette = .{},
 /// still request an explicit cursor style using escape sequences (such as `CSI
 /// q`). Shell configurations will often request specific cursor styles.
 ///
-/// Note that shell integration will automatically set the cursor to a bar at
-/// a prompt, regardless of this configuration. You can disable that behavior
-/// by specifying `shell-integration-features = no-cursor` or disabling shell
+// fork(gx): GX-0047 begin: the prompt shows this style. Upstream text:
+// /// Note that shell integration will automatically set the cursor to a bar at
+// /// a prompt, regardless of this configuration. You can disable that behavior
+// /// by specifying `shell-integration-features = no-cursor` or disabling shell
+// /// integration entirely.
+/// Programs that do not request a cursor style of their own use this style
+/// (with `cursor-style-blink`): the shell integration resets the cursor to it
+/// before each command. Ghostty GX also shows it at the prompt by default, so
+/// a style that a program left behind is reset when the next prompt appears.
+/// With zsh or fish vi key bindings the prompt still tells the modes apart,
+/// by default with a bar while inserting and a block in command mode. To get
+/// upstream Ghostty's bar at the prompt while programs keep this style, set
+/// `gx-prompt-cursor = bar`. To stop the shell integration from changing the
+/// cursor, specify `shell-integration-features = no-cursor` or disable shell
 /// integration entirely.
+// fork(gx): GX-0047 end
 ///
 /// Valid values are:
 ///
@@ -2594,8 +2606,12 @@ keybind: Keybinds = .{},
 
 /// The time in milliseconds between clicks to consider a click a repeat
 /// (double, triple, etc.) or an entirely new single click. A value of zero will
-/// use a platform-specific default. The default on macOS is determined by the
-/// OS settings. On every other platform it is 500ms.
+// fork(gx): GX-0048 Windows also takes the default from the OS setting
+/// use a platform-specific default. The default on macOS and Windows is
+/// determined by the OS settings (on Windows, the double-click speed of the
+/// mouse settings), read when the configuration loads: reload the
+/// configuration after changing the OS setting. On every other platform it
+/// is 500ms.
 @"click-repeat-interval": u32 = 0,
 
 /// Additional configuration files to read. This configuration can be repeated
@@ -2975,7 +2991,12 @@ keybind: Keybinds = .{},
 ///
 /// Available features:
 ///
-///   * `cursor` - Set the cursor to a bar at the prompt.
+// fork(gx): GX-0047 begin: the prompt cursor follows gx-prompt-cursor. Upstream text:
+// ///   * `cursor` - Set the cursor to a bar at the prompt.
+///   * `cursor` - Set the cursor at the prompt: in Ghostty GX the configured
+///     `cursor-style` by default, or a bar like upstream Ghostty with
+///     `gx-prompt-cursor = bar`.
+// fork(gx): GX-0047 end
 ///
 ///   * `sudo` - Set sudo wrapper to preserve terminfo.
 ///
@@ -4152,6 +4173,27 @@ term: []const u8 = "xterm-ghostty",
 /// Windows and GTK only.
 /// Available since Ghostty GX 0.0.3.
 @"gx-ctrl-scroll-zoom": bool = true,
+
+/// What the shell integration `cursor` feature (see
+/// `shell-integration-features`) shows at the prompt. Valid values:
+///
+///   * `config` - The configured `cursor-style` and `cursor-style-blink`,
+///     so a cursor style that a program left behind is reset when the next
+///     prompt appears.
+///   * `bar` - A bar, blinking unless `cursor-style-blink = false`, like
+///     upstream Ghostty. Programs that do not request a cursor style of
+///     their own still use `cursor-style`.
+///
+/// With zsh vi key bindings both values show a bar while inserting and a
+/// block in command mode; fish vi key bindings set the cursor themselves.
+/// This applies to the bash, zsh, fish and elvish integrations. It has no
+/// effect with `shell-integration-features = no-cursor` or without shell
+/// integration, and a change only affects shells started afterwards.
+///
+/// The default is `config`.
+///
+/// Available since Ghostty GX 0.0.3.
+@"gx-prompt-cursor": gx_config_types.PromptCursor = .config,
 // fork(gx): GX-0010 end
 
 /// This is set by the CLI parser for deinit.

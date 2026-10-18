@@ -5,7 +5,7 @@
 
 语料是 Git 可见文件的闭集（git ls-files --cached --others --exclude-standard）：
 1. 文档：根与嵌套 AGENTS.md、CLAUDE.md、README.md、HACKING.md、CONTRIBUTING.md、
-   PACKAGING.md、AI_POLICY.md、CHANGELOG.md（前 6000 字符，锚点 recent）、docs/*.md、
+   PACKAGING.md、AI_POLICY.md、CHANGELOG.md（前 6000 字符，锚点 recent）、docs/*.md（排除 docs/GX_UI_*.md）、
    docs/AGENT_RULES/*.md。按 Markdown 标题切块（围栏代码块内不切），锚点为标题路径，正文原样。
 2. Zig 结构（锚点 structure）：src/**/*.zig 开头的 //! 模块文档（去掉标记，丢弃不含词的
    分隔线与字形表，超过 3000 字符在行边界截断），空一行后是 pub 声明签名（省略 pub 前缀；
@@ -63,6 +63,7 @@ ROOT_DOCS = (
     "AI_POLICY.md",
 )
 CHANGELOG = "CHANGELOG.md"
+EXCLUDED_DOCS = ("docs/GX_UI_*.md",)
 # 生成或第三方的 Zig 代码不进结构层（fnmatch 语义，`*` 可跨 `/`）。
 EXCLUDED_ZIG = (
     "src/font/nerd_font_*",
@@ -156,7 +157,8 @@ def select_corpus(files: list[str]) -> tuple[list[str], list[str], list[str]]:
         elif parts[0] == "docs" and rel.endswith(".md") and (
             len(parts) == 2 or (len(parts) == 3 and parts[1] == "AGENT_RULES")
         ):
-            docs.add(rel)
+            if not any(fnmatch.fnmatchcase(rel, pattern) for pattern in EXCLUDED_DOCS):
+                docs.add(rel)
         elif parts[0] == "src" and rel.endswith(".zig") and not is_excluded_zig(rel):
             zig.append(rel)
         elif rel.startswith("include/ghostty/") and rel.endswith(".h"):

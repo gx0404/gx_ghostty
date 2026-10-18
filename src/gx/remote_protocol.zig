@@ -96,6 +96,10 @@ pub const Input = struct {
     }
 };
 pub const Outcome = enum(u16) { completed, rejected, unavailable, cancelled, unknown };
+/// Test-only bodies appended to the v3 tag space. Existing wire layouts are
+/// unchanged; both GUI endpoints must explicitly enable GHOSTTY_GX_REMOTE_TEST.
+pub const TestQuery = struct { surface: refs.Reference, lease: Lease, input_request: u64, input_sequence: u64 };
+pub const TestState = struct { surface: refs.Reference, lease: Lease, total: u64, viewport: u64, offset: u64, applied: u64 };
 pub const ActionRequest = struct { surface: refs.Reference, lease: Lease, transaction: u64, config_generation: u64, action: ActionText, all: bool = false, global: bool = false };
 /// cancelled means the user handled an interaction without authorizing its
 /// effect. It consumes the initiating key but is never counted as performed.
@@ -208,6 +212,8 @@ pub const Body = union(enum(u16)) {
     ui_event_result: ActionResult,
     inspector_request: InspectorRequest,
     inspector_result: InspectorResult,
+    test_query: TestQuery,
+    test_state: TestState,
 };
 pub const Packet = struct {
     sender_epoch: u128,
@@ -380,6 +386,17 @@ pub fn validate(packet: *const Packet) Error!void {
                 // and invalid UTF-8). They are saved without text conversion.
                 .export_terminal_io => |*value| if (value.len > SnapshotText.capacity) return error.InvalidText,
             }
+        },
+        .test_query => |request| {
+            try reference(request.surface, ticket.source_epoch);
+            try validLease(request.lease, ticket);
+            if (packet.sender_epoch != ticket.target_epoch or request.input_request == 0 or request.input_sequence == 0) return error.InvalidInput;
+        },
+        .test_state => |state| {
+            try reference(state.surface, ticket.source_epoch);
+            try validLease(state.lease, ticket);
+            if (packet.sender_epoch != ticket.source_epoch) return error.InvalidIdentity;
+            if (state.viewport == 0 or state.viewport > state.total or state.offset > state.total - state.viewport) return error.InvalidInput;
         },
         .inspector_request => |request| {
             try reference(request.surface, ticket.source_epoch);
@@ -701,6 +718,47 @@ test "gx.remote measurement eligibility matches wire validation for text-bearing
         try std.testing.expectEqual(case.measurable, Input.measurable(case.event));
         if (case.measurable) try validate(packet) else try std.testing.expectError(error.InvalidInput, validate(packet));
     }
+}
+
+test "gx.remote test query and scrollback state preserve existing tags and validate exact direction lease and bounds" {
+    try std.testing.expectEqual(@intFromEnum(std.meta.Tag(Body).inspector_result) + 1, @intFromEnum(std.meta.Tag(Body).test_query));
+    const alloc = std.testing.allocator;
+    const packet = try alloc.create(Packet);
+    defer alloc.destroy(packet);
+    const decoded = try alloc.create(Packet);
+    defer alloc.destroy(decoded);
+    const buffer = try alloc.alloc(u8, max_frame_size);
+    defer alloc.free(buffer);
+    const leaf: refs.Reference = .{ .epoch = 1, .kind = .surface, .id = 5, .generation = 1 };
+    const lease: Lease = .{ .holder_epoch = 2, .transaction = 3, .generation = 4 };
+    packet.* = .{ .sender_epoch = 2, .recipient_epoch = 1, .request_id = 10, .ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 3, .generation = 4 }, .body = .{ .test_query = .{ .surface = leaf, .lease = lease, .input_request = 8, .input_sequence = 9 } } };
+    try decodeInto(try encode(buffer, packet), decoded);
+    try std.testing.expectEqual(packet.body.test_query, decoded.body.test_query);
+    packet.body.test_query.input_request = 0;
+    try std.testing.expectError(error.InvalidInput, validate(packet));
+    packet.body.test_query.input_request = 8;
+    packet.body.test_query.input_sequence = 0;
+    try std.testing.expectError(error.InvalidInput, validate(packet));
+    packet.body.test_query.input_sequence = 9;
+    packet.body.test_query.lease.generation += 1;
+    try std.testing.expectError(error.InvalidIdentity, validate(packet));
+    packet.sender_epoch = 1;
+    packet.recipient_epoch = 2;
+    packet.body = .{ .test_state = .{ .surface = leaf, .lease = lease, .total = 1000, .viewport = 24, .offset = 976, .applied = 10 } };
+    try decodeInto(try encode(buffer, packet), decoded);
+    try std.testing.expectEqual(packet.body.test_state, decoded.body.test_state);
+    packet.body.test_state.offset = 977;
+    try std.testing.expectError(error.InvalidInput, validate(packet));
+    packet.body.test_state.offset = 0;
+    packet.body.test_state.viewport = 0;
+    try std.testing.expectError(error.InvalidInput, validate(packet));
+    packet.body.test_state.viewport = 24;
+    packet.body.test_state.total = 23;
+    try std.testing.expectError(error.InvalidInput, validate(packet));
+    packet.body.test_state.total = 1000;
+    packet.sender_epoch = 2;
+    packet.recipient_epoch = 1;
+    try std.testing.expectError(error.InvalidIdentity, validate(packet));
 }
 
 test "remote input sequence survives reconnect and key tags require real enum membership" {

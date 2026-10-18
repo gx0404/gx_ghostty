@@ -1,19 +1,66 @@
 id = "G07"
-title = "R3-Window: the English main menu follows the Windows order and offers view controls"
+title = "R3-Window: the English main menu follows the Windows order and its view controls, open-config and button entries act"
 lang = "en"
-env = { GHOSTTY_GX_PERF = "1" }
+env = { GHOSTTY_GX_PERF = "1", PATH = "/tmp/gx-o6-shim-G07:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
 config = """
 command = /bin/bash --noprofile --norc
 language = en
 """
-xdotool = """
+# Intermediate screenshots use xdotool exec into the evidence directory next to
+# XDG_STATE_HOME, which the runner copies out with the rest; the whole script
+# must finish within the runner's 30 s xdotool timeout. The xdg-open on PATH is
+# a private shim written by the script that only records its arguments.
+xdotool = '''
+exec --sync sh -c "mkdir -p /tmp/gx-o6-shim-G07; echo '#!/bin/sh' > /tmp/gx-o6-shim-G07/xdg-open; echo 'echo xdg-open $* >> '$(dirname $XDG_STATE_HOME)/evidence/G07-xdg-open.txt >> /tmp/gx-o6-shim-G07/xdg-open; chmod +x /tmp/gx-o6-shim-G07/xdg-open"
 mousemove 400 300
 click 1
 sleep 0.3
 key ctrl+shift+m
 sleep 1
-"""
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s01-menu.png"
+mousemove 710 439
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s02-zoom-in.png"
+mousemove 617 439
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s03-zoom-reset.png"
+mousemove 758 439
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s04-find.png"
+key Escape
+sleep 0.5
+mousemove 761 123
+click 1
+sleep 0.5
+mousemove 200 300
+click 1
+sleep 0.3
+key ctrl+shift+m
+sleep 1
+mousemove 582 393
+click 1
+sleep 1.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s05-open-config.png"
+mousemove 658 28
+click 1
+sleep 1
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s06-menu-from-button.png"
+mousemove 798 439
+click 1
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s07-fullscreen.png"
+exec --sync rm -rf /tmp/gx-o6-shim-G07
+'''
 expect = [
   "G07.png: the English main window shows no missing glyphs",
-  "G07-after.png: twelve main entries follow the Windows order; zoom out, reset, zoom in, find and fullscreen form one control row; GX settings and shortcuts show accelerators",
+  "G07-s01-menu.png: twelve main entries follow the Windows order (New Tab, New Window, New Tab with Profile, Split, Command Palette, Settings…, Keyboard Shortcuts, Language, Reload Configuration, Open Configuration File, About Ghostty GX, Quit); zoom out, Reset Zoom, zoom in, find and fullscreen form one control row; the entries with bindings show their accelerators",
+  "G07-s02-zoom-in.png: the + button enlarged the terminal font behind the menu, which stays open for the control row",
+  "G07-s03-zoom-reset.png: Reset Zoom restored the configured font size",
+  "G07-s04-find.png: the find button opened the terminal search bar behind the open menu",
+  "G07-s05-open-config.png and G07-xdg-open.txt: Open Configuration File handed the private configuration file to xdg-open",
+  "G07-s06-menu-from-button.png: clicking the header bar menu button opens the same menu",
+  "G07-s07-fullscreen.png: the fullscreen button; Xvfb has no window manager to honour _NET_WM_STATE_FULLSCREEN, so a real WM is needed to prove the full-screen result",
 ]

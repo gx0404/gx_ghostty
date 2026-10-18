@@ -437,6 +437,16 @@ class CodeStructureTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_phase_documents_are_excluded_without_dropping_other_docs(self) -> None:
+        excluded = [
+            f"docs/GX_UI_{name}.md"
+            for name in ("REMAINING_PLAN", "HANDOFF_PLAN", "EVIDENCE_INDEX", "EXECUTION_PLAN", "FUTURE")
+        ]
+        retained = ["docs/guide.md", "docs/GX_FEATURES.md", "docs/GX_UI.md", "docs/AGENT_RULES/development.md"]
+        docs, zig, headers = build_agent_kb.select_corpus(excluded + retained)
+        self.assertEqual(docs, sorted(retained))
+        self.assertEqual((zig, headers), ([], []))
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -724,6 +734,15 @@ class RealCorpusTests(unittest.TestCase):
         self.assertTrue(routed, "routes.toml 没有 [[rules]]")
         missing = [doc for doc in routed if doc not in self.docs]
         self.assertEqual(missing, [], "routes.toml 登记的领域文档不在知识库中")
+
+    def test_top_level_docs_exclude_only_phase_documents(self) -> None:
+        visible = build_agent_kb.git_visible_files(REPO_ROOT)
+        docs = {rel for rel in visible if rel.startswith("docs/") and rel.endswith(".md")
+                and rel.count("/") == 1}
+        excluded = {rel for rel in docs if rel.startswith("docs/GX_UI_")}
+        self.assertTrue(excluded)
+        self.assertTrue(excluded.isdisjoint(self.docs))
+        self.assertEqual(self.docs & docs, docs - excluded)
 
     def test_golden_queries_hit_expected_docs(self) -> None:
         self.assertGreaterEqual(len(GOLDEN_QUERIES), 12)

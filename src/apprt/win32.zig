@@ -20,6 +20,7 @@ test {
     _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/Surface.zig");
     _ = @import("win32/Session.zig");
+    _ = @import("win32/ShellIntegration.zig");
     _ = @import("win32/shell/Identity.zig");
     _ = @import("win32/shell/ToastActivation.zig");
     _ = @import("win32/shell/WinRTToast.zig");
@@ -47,6 +48,7 @@ test {
     _ = @import("win32/ui/uia_remote.zig");
     _ = @import("win32/RemoteInput.zig");
     _ = @import("win32/RemotePerf.zig");
+    _ = @import("win32/RemoteControls.zig");
     _ = @import("win32/RemoteCoordinator.zig");
     _ = @import("win32/DropBridge.zig");
     _ = @import("win32/DropCompanion.zig");

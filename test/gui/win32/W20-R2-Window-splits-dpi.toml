@@ -1,5 +1,10 @@
 id = "W20"
 title = "Split drag, closed HWND and deferred background-tab DPI"
+# The command line turns confirm-close-surface back on over the harness line, so closing a
+# tab with running programs asks once; every other close in this run ends idle shells (no
+# question). GHOSTTY_GX_PERF logs surface.resize_wait for the resize steps.
+args = ["--confirm-close-surface=true"]
+env = { GHOSTTY_GX_PERF = "1" }
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
@@ -8,14 +13,28 @@ resize-overlay = after-first
 keybind = f6=new_split:right
 keybind = f7=new_split:down
 keybind = f8=goto_tab:1
-keybind = f9=goto_tab:2
+keybind = ctrl+shift+f9=gx:move_split_to_tab
 """
+# Later phases (R2-Surface.06/.07, R2-Window.05/.08/.10/.12): a split with an open search
+# bar moves into a new tab (the bar follows its terminal to the new parent); the open search
+# bar follows a window drag; fullscreen and maximize; the minimum track size; an odd resize;
+# closing a three-pane tab whose panes run ping asks once, Cancel keeps all three, and after
+# the pings end the tab closes its panes together.
 expect = [
   "startup: one pane, no columns-by-rows overlay or unpainted area",
   "hover: three panes with the horizontal divider hovered in the accent color",
   "dragged: nested divider at three quarters of the right column; size overlay in the focused pane",
   "closed: exit closes the bottom-right pane and focus-here prints in its surviving sibling",
   "background-dpi: selecting the first tab after a DPI change gives its split panes the new scale",
+  "search-before-move: the focused split shows its search bar with the query focus",
+  "search-after-reparent: the split moved into a new tab; its search bar shows again over it in the new place",
+  "search-follows-move: the window was dragged by its title bar; the open search bar moved with it and stays at the top right of the pane (the runner logs its rectangle before and after)",
+  "fullscreen: Ctrl+Enter made the window fullscreen: no caption buttons, the terminal fills the screen",
+  "maximized: the maximized window fills the work area with the tabs at the top edge",
+  "min-track: resizing to 200x100 px stops at the minimum track size: caption buttons, the main menu button, a tab and a drag strip still fit",
+  "resize-odd: after an odd resize the panes are fully painted, no black edges",
+  "close-tab-confirm: closing the three-pane tab asks once (Close Tab?) and lists the running PING processes without .exe; Cancel is the default",
+  "after-batch-close: after Cancel kept the panes and the pings ended, Ctrl+Shift+W closed the whole tab; another tab shows",
 ]
 
 [[step]]
@@ -115,3 +134,282 @@ seconds = 0.5
 [[step]]
 action = "capture"
 name = "background-dpi"
+
+[[step]]
+action = "dpi"
+value = 144
+
+[[step]]
+action = "resize"
+width = 1500
+height = 1000
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+# R2-Surface.07: the search bar of a split that moves to a new tab.
+[[step]]
+action = "ime_off"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "focus"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "search-before-move"
+what = "all"
+
+# The search field keeps plain keys; a bound Ctrl chord goes to the terminal's bindings.
+[[step]]
+action = "key"
+keys = "ctrl+shift+f9"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "search-after-reparent"
+what = "all"
+
+# R2-Window.08: the open search bar follows a window drag (empty title bar at x = -200 DIP).
+# The command palette cannot be used here: it is dismissed by a click outside it, the title
+# bar included. The two wait_popup steps log the bar's screen rectangle before and after.
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+
+[[step]]
+action = "drag"
+from = [-200, 20]
+to = [-320, 140]
+steps = 16
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 2
+
+[[step]]
+action = "capture"
+name = "search-follows-move"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# R2-Window.10: fullscreen and maximize.
+[[step]]
+action = "key"
+keys = "ctrl+enter"
+
+[[step]]
+action = "sleep"
+seconds = 1.2
+
+[[step]]
+action = "capture"
+name = "fullscreen"
+
+[[step]]
+action = "key"
+keys = "ctrl+enter"
+
+[[step]]
+action = "sleep"
+seconds = 1.2
+
+[[step]]
+action = "click"
+x = -69
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.2
+
+[[step]]
+action = "capture"
+name = "maximized"
+
+[[step]]
+action = "click"
+x = -69
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.2
+
+# R2-Window.12: the minimum track size.
+[[step]]
+action = "resize"
+width = 200
+height = 100
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "min-track"
+method = "print"
+
+# R2-Surface.06: resize frames at an odd size.
+[[step]]
+action = "resize"
+width = 1501
+height = 1003
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "resize-odd"
+
+# R2-Window.05: one question for a tab whose three panes run programs.
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "type"
+text = "ping -n 9 127.0.0.1\n"
+
+[[step]]
+action = "click"
+in = "terminal:1"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "type"
+text = "ping -n 9 127.0.0.1\n"
+
+[[step]]
+action = "click"
+in = "terminal:2"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "type"
+text = "ping -n 9 127.0.0.1\n"
+
+[[step]]
+action = "sleep"
+seconds = 2.5
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+w"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "close-tab-confirm"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "wait_terminals"
+count = 3
+
+[[step]]
+action = "sleep"
+seconds = 9.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+w"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "after-batch-close"

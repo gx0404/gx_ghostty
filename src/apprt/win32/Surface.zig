@@ -3444,14 +3444,10 @@ pub const WM_GHOSTTY_SIMULATE_GPU_RESET: u32 = w32.WM_USER + 0x48;
 const GPU_RESET_TIMER: usize = 0x4752; // 'GR'
 
 /// Called by the renderer thread (src/renderer/opengl/wgl.zig) inside a
-/// frame, with the renderer's draw mutex held, after it replaced an
-/// OpenGL context lost to a GPU reset: every GPU object the renderer made
-/// belongs to the dead context. Like `Renderer.threadExit`, mark the
-/// display unrealized (nothing is drawn with those objects, and the next
-/// render releases the swap chain and shaders while the new context is
-/// still empty, so no name of a new object is deleted by mistake) and
-/// drop the uploaded images; then let the GUI thread realize it again
-/// (`recoverGpuResources`).
+/// frame, with the renderer's draw mutex held and the old GL context still
+/// current. Mark the display unrealized and release uploaded images there.
+/// WGL releases the swap chain and shaders after this frame completes, then
+/// replaces the context. The GUI only realizes it after that succeeds.
 pub fn gpuContextReset(self: *Surface) void {
     const renderer = &self.core_surface.renderer;
     renderer.display_realized = false;
@@ -3464,10 +3460,8 @@ pub fn gpuContextReset(self: *Surface) void {
     if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, WM_APP_GPU_RESET, 0, 0);
 }
 
-/// Rebuild the renderer's GPU resources after a GPU reset: wake the
-/// renderer so it releases the dead objects (it is unrealized), then,
-/// from a timer once they are gone, realize the display again so the next
-/// frame recreates everything.
+/// Wait for the render thread to release the old resources and replace the
+/// lost context, then realize the display so the next frame rebuilds them.
 pub fn recoverGpuResources(self: *Surface) void {
     if (!self.core_surface_ready or self.gpu_reset_pending) return;
     self.gpu_reset_pending = true;
@@ -3494,12 +3488,16 @@ fn onGpuResetTimer(self: *Surface) void {
     }
     self.gpu_reset_attempts += 1;
     const renderer = &self.core_surface.renderer;
-    const released = released: {
+    const recovery = recovery: {
         renderer.draw_mutex.lockUncancelable(global.io());
         defer renderer.draw_mutex.unlock(global.io());
-        break :released renderer.swap_chain == null;
+        break :recovery gpuRecoveryState(
+            renderer.swap_chain == null,
+            renderer.api.wgl_context.drawable(),
+        );
     };
-    if (!released) {
+    if (recovery == .failed) return self.failGpuRecovery();
+    if (recovery == .pending) {
         if (self.gpu_reset_attempts >= gpu_reset_max_attempts) return self.failGpuRecovery();
         self.core_surface.renderer_thread.wakeup.notify() catch {};
         return;
@@ -3513,6 +3511,18 @@ fn onGpuResetTimer(self: *Surface) void {
     self.gpu_reset_pending = false;
     self.core_surface.renderer_thread.wakeup.notify() catch {};
     log.info("renderer resources rebuilt after the GPU reset", .{});
+}
+
+fn gpuRecoveryState(released: bool, drawable: bool) enum { pending, failed, ready } {
+    if (!released) return .pending;
+    return if (drawable) .ready else .failed;
+}
+
+test "D-11 GUI recovery requires both resource release and a working context" {
+    try std.testing.expectEqual(.pending, gpuRecoveryState(false, false));
+    try std.testing.expectEqual(.pending, gpuRecoveryState(false, true));
+    try std.testing.expectEqual(.failed, gpuRecoveryState(true, false));
+    try std.testing.expectEqual(.ready, gpuRecoveryState(true, true));
 }
 
 fn failGpuRecovery(self: *Surface) void {

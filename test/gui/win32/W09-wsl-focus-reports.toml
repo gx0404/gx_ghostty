@@ -1,15 +1,25 @@
 id = "W09"
 title = "WSL: focus reporting sends exactly one ^[[O / ^[[I pair per tab round trip"
 requires = ["wsl:Ubuntu-24.04"]
+# R0: enabled and focus-events. Phase 6 (r6) extends the case for R2-Surface.01/.02: mouse
+# motion reports (SGR any-event) without a duplicate for the same point, leaving the terminal,
+# and focus-follows-mouse between two splits. Not covered here: the pointer shape (screenshots
+# carry no cursor), Ctrl+wheel zoom (the runner cannot hold Ctrl over a wheel event), a real
+# IME, pinch and dead keys (see the r6 report).
 config = """
 command = wsl.exe -d Ubuntu-24.04 -e bash --noprofile --norc
 language = en
 keybind = f7=goto_tab:1
 keybind = f8=goto_tab:2
+keybind = f9=new_split:right
+focus-follows-mouse = true
 """
 expect = [
   "enabled: right after printf turns focus reporting on, before any tab switch, cat -v shows exactly one ^[[I (the DECSET 1004 report of the current focus) and nothing else",
   "focus-events: tab 1 shows cat -v output with that ^[[I followed by exactly two ^[[O^[[I pairs (two round trips), no extra events",
+  "motion-reports: with DECSET 1003/1006 on, cat -v shows motion reports ^[[<35;col;rowM for the entry point and for the second point, and no repeated report for the move to the same point",
+  "leave: moving onto the tab bar left the terminal; whatever it reported, no report has a column or row of 0 or below",
+  "focus-follows-mouse: after the pointer moved onto the left split, echo ffm-left ran in the left pane, not in the new right pane",
 ]
 
 [[step]]
@@ -65,3 +75,111 @@ seconds = 0.8
 [[step]]
 action = "capture"
 name = "focus-events"
+
+# --- r6 extension (R2-Surface.01, .02) ------------------------------------------------------
+[[step]]
+action = "key"
+keys = "ctrl+c"
+
+[[step]]
+action = "type"
+text = "clear; printf '\\e[?1003h\\e[?1006h'; cat -v\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "40%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "40%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "60%"
+y = "60%"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "motion-reports"
+
+# The tab bar belongs to the window, not to the terminal.
+[[step]]
+action = "move"
+in = "client"
+x = "50%"
+y = 12
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "leave"
+
+[[step]]
+action = "key"
+keys = "ctrl+c"
+
+[[step]]
+action = "type"
+text = "printf '\\e[?1003l\\e[?1006l'; clear\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "f9"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 3.0
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "type"
+text = "echo ffm-left\n"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "focus-follows-mouse"

@@ -1,14 +1,334 @@
 id = "W16"
-title = "Chrome tour: main menu, shortcuts cheat sheet and settings overlay"
+title = "Chrome tour: caption, window and main menus, shortcuts sheet, context menus, settings and About"
+# One instance walks the chrome in phases: A caption buttons, tooltips and the window
+# menu; B the main menu from the button and the keyboard, submenus and access keys; C the
+# keyboard shortcut sheet (search, recording, Enter, Ctrl+End, wheel, owner scale); D the
+# terminal and tab context menus; E the settings overlay (sections, focus ring, list
+# filter, search, change and reset, font loading, wheel, narrow layout); F the About dialog;
+# G a light theme. The window is resized to 1920x1200 (1280x800 DIP at 144 DPI): caption
+# buttons at x = -115, -69, -23 DIP, the main menu button at x = -160, all at y = 20.
+# Win+E is held by Explorer, so its global binding cannot register (a shortcut conflict).
+env = { GHOSTTY_GX_PERF = "1" }
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+window-width = 90
+window-height = 28
+cursor-style = bar
+keybind = global:super+e=new_tab
 """
 expect = [
-  "main-menu: opened from the keyboard, the main menu sits below the main-menu button on the right side of the chrome, aligned to the button's right edge, with its first item highlighted, its items and the shortcut column",
-  "keybinds: the keyboard shortcuts cheat sheet lists categories and key caps",
-  "settings: the settings overlay shows its six sections (Language, Appearance, Font, Interaction, Shell, About)",
+  "caption-tooltip-minimize: the pointer rests on the minimize button, which shows its hover fill, and a tooltip says Minimize",
+  "caption-tooltip-maximize: a tooltip says Maximize over the hovered maximize button",
+  "caption-close-hover: the window close button is hovered in red (D5), unlike the neutral tab close",
+  "caption-minimize-pressed: the minimize button is held down: its fill looks like the hover fill",
+  "caption-pressed-pointer-away: the button is still held but the pointer left it: no pressed look, nothing happened",
+  "caption-tooltip-restore: the window is maximized and the middle caption button's tooltip says Restore Down",
+  "system-menu-keyboard: Alt+Space opened the custom-drawn window menu (Restore, Move, Size, Minimize, Maximize, Close) at the top left of the window",
+  "system-menu-caption: a right click on the empty title bar opened the same window menu at the pointer",
+  "inactive-main: a second window took the activation; the main window's title bar and tab text show the inactive colors",
+  "active-main-again: the second window is closed and the main window is active again with the active colors",
+  "main-menu-click: the main menu opened below the main menu button, its right edge lined up with the button's right edge",
+  "main-menu-keyboard: Ctrl+Shift+M opens the same menu at the same place with the first item highlighted and access keys underlined",
+  "profile-submenu: Down twice and Right opened New Tab with Profile: launch profiles with their kind icons, the default tagged",
+  "submenu-parent-hot: Left closed the submenu and New Tab with Profile is highlighted again in the main menu",
+  "keybinds-from-access-key: K picked Keyboard Shortcuts: the sheet lists categories in order with key caps; the notice at the top names the taken keys (Win+E taken by another program) once per reason and their rows show a warning icon",
+  "keybinds-query-split: the query split keeps the split rows, ordered by score within their category",
+  "keybinds-recorded: Alt+K recorded Ctrl+Shift+T into the field as a key query; only the New Tab row is listed",
+  "keybinds-row-selected: Down selected the New Tab row",
+  "new-tab-from-sheet: Enter closed the sheet and ran New Tab: the window has two tabs",
+  "keybinds-ctrl-end: Ctrl+End selected the last row and scrolled the list to the end, the scroll bar thumb at the bottom",
+  "keybinds-wheel: the wheel scrolled the list back up; the row under the pointer is hovered",
+  "keybinds-dpi-96: after a simulated 96 DPI the sheet opens at 100% scale (smaller text and key caps)",
+  "context-menu-dpi-96: the terminal context menu at 96 DPI is drawn at 100% as well",
+  "settings-dpi-96: the settings overlay opened at 96 DPI lays out at the window's scale (100%)",
+  "context-menu-flipped: a right click near the bottom right of the terminal opened its menu above and to the left of the pointer so it fits on the screen",
+  "context-split-submenu: the context menu of a split: S opened Split with Move Split to New Tab and Move Split to New Window enabled",
+  "context-moved-split: M moved the split into a new tab; the window shows one pane",
+  "tab-context-menu: right click on the first tab: Rename Tab, Close Tab, Close Other Tabs, Close Tabs to the Right, Move Tab to New Window, Duplicate Tab, New Tab",
+  "settings-language: the settings overlay over a dimmed window, Language selected, its two choices",
+  "settings-appearance: Tab switched to Appearance: theme list, window material choices (unsupported ones disabled with the reason), opacity Auto/100/90/80/70, padding, cursor style with From the configuration file, cursor blink",
+  "settings-focus-ring: Down moved the keyboard focus, which shows a focus ring",
+  "settings-theme-filter: typing dra went into the theme filter box and the list shows only matching themes",
+  "settings-esc-clears-filter: the first Escape cleared the filter; the overlay is still open",
+  "settings-search: F6 and the query cursor style list the matching setting in the sidebar search",
+  "settings-search-revealed: Enter revealed Cursor Style on the Appearance page with the focus on it and the query cleared",
+  "settings-cursor-changed: Right changed the cursor style; it is saved and the reset button shows next to the setting",
+  "settings-cursor-reset: Delete removed the setting from the settings file; the value is Bar from the configuration file again and the reset button is gone",
+  "settings-font-loading: right after switching to Font the status says Loading font families or shows the last list",
+  "settings-font: the font size stepper, the font sample and the font family list",
+  "settings-font-size-stepped: Right stepped the font size up by one; the sample and the terminal behind grew",
+  "settings-interaction: right-click action with its five choices as radio rows, scroll bar, close confirmation, focus follows mouse, Ctrl+wheel zoom and the bell features Windows supports",
+  "settings-wheel: one wheel notch scrolled the page by the system's lines",
+  "settings-pagedown: PgDn scrolled the page further",
+  "settings-shell: the default shell choices with their commands",
+  "settings-about: version, notice, Graphics with the OpenGL backend, the configuration and settings file paths shortened in the middle, and the buttons",
+  "settings-narrow: in a narrow window the overlay keeps its 640 DIP minimum and choice chips wrap below their titles",
+  "about-dialog: About Ghostty GX: OK is the default button in the accent color, the three links are underlined with an external-link icon, the version and the graphics backend are listed",
+  "main-menu-light: after picking the light theme Catppuccin Latte the main menu is light and its surface is lifted toward white",
+  "light-chrome: the light title bar and tabs with readable inactive tab text",
 ]
+
+[[step]]
+action = "resize"
+width = 1920
+height = 1200
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+# A: caption buttons (R2-Caption.02, .07). Hovering maximize also opens the Windows 11 Snap
+# Layouts flyout (an Explorer window over ours), so those captures use PrintWindow.
+[[step]]
+action = "move"
+x = -115
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "caption-tooltip-minimize"
+what = "all"
+
+[[step]]
+action = "move"
+x = -69
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "caption-tooltip-maximize"
+what = "all"
+method = "print"
+
+[[step]]
+action = "move"
+x = 900
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "move"
+x = -23
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "caption-close-hover"
+
+[[step]]
+action = "mouse_down"
+x = -115
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "caption-minimize-pressed"
+
+[[step]]
+action = "move"
+x = 900
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "caption-pressed-pointer-away"
+
+[[step]]
+action = "mouse_up"
+x = 900
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "click"
+x = -69
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "move"
+x = -66
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "caption-tooltip-restore"
+what = "all"
+method = "print"
+
+[[step]]
+action = "click"
+x = -69
+y = 20
+
+[[step]]
+action = "move"
+x = 900
+y = 20
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+# A: the window menu (R2-Caption.04, R2-接口.05).
+[[step]]
+action = "key"
+keys = "alt+space"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "system-menu-keyboard"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "click"
+x = 700
+y = 20
+button = "right"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "system-menu-caption"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# A: active and inactive colors (R2-Caption.01).
+[[step]]
+action = "key"
+keys = "ctrl+shift+n"
+
+[[step]]
+action = "sleep"
+seconds = 2.0
+
+[[step]]
+action = "capture"
+name = "inactive-main"
+method = "print"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+w"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "activate"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "active-main-again"
+
+# B: the main menu (R2-Menu.01, .02, .05).
+[[step]]
+action = "click"
+x = -160
+y = 20
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "main-menu-click"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+# Move the pointer off the menu button so its "Main menu" tooltip does not linger and
+# count as an open popup in later waits.
+[[step]]
+action = "move"
+x = 600
+y = 400
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
 
 [[step]]
 action = "key"
@@ -25,7 +345,175 @@ seconds = 0.6
 
 [[step]]
 action = "capture"
-name = "main-menu"
+name = "main-menu-keyboard"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "down"
+repeat = 2
+
+[[step]]
+action = "key"
+keys = "right"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "profile-submenu"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "left"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "submenu-parent-hot"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "k"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+# C: the keyboard shortcut sheet (R2-Keybinds.01-.06, R2-App.05).
+[[step]]
+action = "capture"
+name = "keybinds-from-access-key"
+what = "all"
+
+[[step]]
+action = "type"
+text = "split"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "keybinds-query-split"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "backspace"
+repeat = 5
+
+[[step]]
+action = "key"
+keys = "alt+k"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+t"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "key"
+keys = "alt+k"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "keybinds-recorded"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "down"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "keybinds-row-selected"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "new-tab-from-sheet"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+slash"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "key"
+keys = "ctrl+end"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "keybinds-ctrl-end"
+what = "all"
+
+[[step]]
+action = "wheel"
+x = "50%"
+y = "50%"
+delta = 360
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "keybinds-wheel"
 what = "all"
 
 [[step]]
@@ -33,8 +521,17 @@ action = "key"
 keys = "escape"
 
 [[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "dpi"
+value = 96
+
+[[step]]
 action = "sleep"
-seconds = 0.5
+seconds = 0.8
 
 [[step]]
 action = "key"
@@ -51,7 +548,7 @@ seconds = 0.6
 
 [[step]]
 action = "capture"
-name = "keybinds"
+name = "keybinds-dpi-96"
 what = "all"
 
 [[step]]
@@ -59,8 +556,39 @@ action = "key"
 keys = "escape"
 
 [[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "40%"
+y = "40%"
+button = "right"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
 action = "sleep"
 seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "context-menu-dpi-96"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
 
 [[step]]
 action = "key"
@@ -77,5 +605,592 @@ seconds = 0.8
 
 [[step]]
 action = "capture"
-name = "settings"
+name = "settings-dpi-96"
 what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "dpi"
+value = 144
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+# D: context menus (R2-Menu.02 flip, R2-Menu.06).
+[[step]]
+action = "click"
+in = "terminal:0"
+x = -30
+y = -30
+button = "right"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "context-menu-flipped"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+o"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "click"
+in = "terminal:1"
+x = "50%"
+y = "50%"
+button = "right"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "key"
+keys = "s"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "context-split-submenu"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "m"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "context-moved-split"
+
+[[step]]
+action = "click"
+x = 128
+y = 24
+button = "right"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "tab-context-menu"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+# Off the tab too: its tooltip would otherwise show while the settings overlay opens.
+[[step]]
+action = "move"
+x = 600
+y = 400
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# E: the settings overlay (R2-Settings.01-.11).
+[[step]]
+action = "key"
+keys = "ctrl+comma"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "settings-language"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "tab"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-appearance"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "down"
+repeat = 2
+delay = 0.3
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "capture"
+name = "settings-focus-ring"
+what = "all"
+
+[[step]]
+action = "type"
+text = "dra"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-theme-filter"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 1
+
+[[step]]
+action = "capture"
+name = "settings-esc-clears-filter"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "type"
+text = "cursor style"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "settings-search"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-search-revealed"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "right"
+
+[[step]]
+action = "wait_log"
+pattern = "saved the settings to"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "settings-cursor-changed"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "delete"
+
+[[step]]
+action = "sleep"
+seconds = 1.2
+
+[[step]]
+action = "capture"
+name = "settings-cursor-reset"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+pagedown"
+
+[[step]]
+action = "sleep"
+seconds = 0.1
+
+[[step]]
+action = "capture"
+name = "settings-font-loading"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 2.0
+
+[[step]]
+action = "capture"
+name = "settings-font"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "type"
+text = "font size"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "key"
+keys = "right"
+
+[[step]]
+action = "sleep"
+seconds = 1.2
+
+[[step]]
+action = "capture"
+name = "settings-font-size-stepped"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+pagedown"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-interaction"
+what = "all"
+
+[[step]]
+action = "wheel"
+x = "60%"
+y = "60%"
+delta = -120
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "settings-wheel"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "pagedown"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "settings-pagedown"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+pagedown"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-shell"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+pagedown"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-about"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "resize"
+width = 1100
+height = 900
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "key"
+keys = "ctrl+comma"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "type"
+text = "material"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "settings-narrow"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "resize"
+width = 1920
+height = 1200
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+# F: the About dialog (R2-Dialogs.02). Its Copy Version button is never pressed.
+[[step]]
+action = "key"
+keys = "ctrl+shift+m"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "key"
+keys = "a"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "about-dialog"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "assert_responsive"
+
+# G: a light theme (R2-Menu.05 light menus, R2-Caption.07).
+[[step]]
+action = "key"
+keys = "ctrl+shift+p"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "type"
+text = "Catppuccin Latte"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+m"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "capture"
+name = "main-menu-light"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "move"
+x = 600
+y = 300
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "light-chrome"
+
+# R2-App.05: the global binding Explorer holds went into the conflict table.
+[[step]]
+action = "assert_log"
+pattern = 'failed to register global hotkey action=new_tab err=1409'

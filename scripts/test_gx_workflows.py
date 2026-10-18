@@ -44,7 +44,7 @@ ZIG_TEST_COMMANDS = {
 # Jobs that also run the main suite filtered to the fork code only their platform compiles.
 FILTERED_TEST_COMMANDS = {
     "windows-app": 'python scripts/zig_test.py --suite main -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu '
-                   '--filter apprt.win32 --filter gx. --filter font.directwrite --filter lib.tinyio '
+                   '--filter apprt.win32 --filter gx. --filter font.directwrite --filter renderer.opengl.wgl --filter Command: --filter lib.tinyio '
                    '--zig-arg=--summary --zig-arg=all '
                    '--json "$env:RUNNER_TEMP/gx-zig-test/windows-app.json"',
     "gtk-smoke": 'python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx '
@@ -617,6 +617,25 @@ class CiWorkflowTests(unittest.TestCase):
                        "$env:GALLIUM_DRIVER = 'llvmpipe'", "$env:GHOSTTY_GX_OPENGL = 'software'",
                        "Join-Path $env:LOCALAPPDATA 'ghostty\\logs\\ghostty.log'", "System.Drawing", "Stop-Process"):
             self.assertIn(needle, script)
+
+    def test_windows_app_checks_validate_config_exit_codes_on_every_stdout(self):
+        job_steps = steps(CI.job("windows-app"))
+        names = [field(step, "name", 8) for step in job_steps]
+        check = names.index("validate-config exit codes with stdout on a pipe, a file and NUL")
+        build = next(index for index, step in enumerate(job_steps) if WIN32_BUILD in "\n".join(step))
+        tests = next(index for index, step in enumerate(job_steps)
+                     if FILTERED_TEST_COMMANDS["windows-app"] in "\n".join(step))
+        self.assertLess(build, check)
+        self.assertLess(check, tests)
+        self.assertIsNone(field(job_steps[check], "if", 8))
+        script = run_scripts(job_steps[check])[0]
+        for needle in ("+validate-config", "$null = cmd /c $command", "> NUL", "out.txt",
+                       "@{ Config = $valid; Want = 0 }", "@{ Config = $invalid; Want = 1 }",
+                       "$env:LOCALAPPDATA = $dir", "$env:XDG_CONFIG_HOME = $dir"):
+            self.assertIn(needle, script)
+        self.assertEqual(script.count("if ($LASTEXITCODE -ne $case.Want) { throw"), 3)
+        # GitHub appends `exit $LASTEXITCODE` to pwsh steps; the expected exit 1 of the last case must not leak.
+        self.assertEqual([line.strip() for line in script.splitlines() if line.strip()][-1], "exit 0")
 
     def test_only_release_assets_use_the_gx_artifact_prefix_that_verify_downloads(self):
         for name, job in RELEASE.jobs().items():
