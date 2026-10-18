@@ -71,6 +71,24 @@ def save(path, data):
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def refuse_existing(paths):
+    """Final evidence is write-once: rerunning a subcommand with the same --name
+    must not erase the first (possibly failing) original."""
+    existing = [str(path) for path in paths if Path(path).exists()]
+    if existing:
+        raise FileExistsError(f"evidence already recorded; use a new --name instead of overwriting: {existing}")
+
+
+def save_new(path, data):
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def png_new(image, path):
+    with open(path, "xb") as handle:
+        handle.write(gui.png_bytes(image.width, image.height, image.rgb()))
+
+
 def token(pid):
     """Native token facts, not claimed labels supplied by a manifest.
 
@@ -408,16 +426,17 @@ def receipt(args, config):
         if path.exists():
             rows.extend(receipt_rows(path.read_text(encoding="utf-8", errors="replace"), companion.pid, companion.creation))
     case_id = {"rejected": "BRK-01", "expired": "BRK-02", "target_gone": "BRK-03", "cancelled": "BRK-04", "pasted": "BRK-05", "paste_failed": "BRK-06"}[args.expect]
-    companion.activate()
     image = f"{case_id}-receipt.png"
-    companion.capture_window(companion.require_window(), "screen").save_png(work / image)
+    refuse_existing([work / image, work / f"{case_id}-native.json", work / "reviews" / f"{case_id}.json"])
+    companion.activate()
+    png_new(companion.capture_window(companion.require_window(), "screen"), work / image)
     # The gated receipt hook is part of this build. Missing evidence is a
     # failed native assertion, not an unimplemented controller or environment.
     status = "PASS" if rows and rows[-1]["outcome"] == args.expect else "FAIL"
     result = {"case_id": case_id, "boundary": "R5-04 broker final receipt", "environment": "VM medium/high split token",
               "status": status, "expected": args.expect, "rows": rows, "companion": report["companion"],
               "reason": "missing final receipt for this PID/birth" if not rows else None}
-    save(work / f"{case_id}-native.json", result)
+    save_new(work / f"{case_id}-native.json", result)
     write_review(work, case_id, result["boundary"], result["environment"], status, [image], observation=result)
     print(json.dumps(result, indent=2))
     return int(status == "FAIL")
@@ -451,6 +470,7 @@ def boundary(args, config):
         print("Armed one authenticated broker admission rejection. Now run medium drop, then receipt --expect rejected.")
     else:
         work = case_path(args.root, args.name)
+        refuse_existing([work / name for name in ("target-gone-preview.png", "target-gone-survivor.png", "target-gone-transition.json")])
         report = json.loads((work / "report.json").read_text(encoding="utf-8"))
         assert report["target"]["pid"] == target.pid and report["target"]["birth"] == target.creation
         assert native.query(4) >= 2 or native.query(5, native.query(3)) > 1, "keep another live tab/pane before closing the selected target"
@@ -458,7 +478,7 @@ def boundary(args, config):
         dialogs = [w for w in target.popups() if w.cls in ("GhosttyGxPopup", "GhosttyGxPopupShadow", "#32770")]
         assert len(dialogs) == 1, "expected the single live broker preview"
         dialog = dialogs[0]
-        target.capture_window(dialog, "screen").save_png(work / "target-gone-preview.png")
+        png_new(target.capture_window(dialog, "screen"), work / "target-gone-preview.png")
         assert native.control(22) == 1
         if not gui.win32().activate(dialog.hwnd):
             raise gui.InputBlocked("cannot activate the owned old preview")
@@ -466,8 +486,8 @@ def boundary(args, config):
         target.press("escape")
         wait(lambda: not any(w.hwnd == dialog.hwnd for w in target.popups()))
         assert target.alive()
-        target.capture_window(target.require_window(), "screen").save_png(work / "target-gone-survivor.png")
-        save(work / "target-gone-transition.json", {"case_id": "BRK-03", "before": before, "after": native.tree(),
+        png_new(target.capture_window(target.require_window(), "screen"), work / "target-gone-survivor.png")
+        save_new(work / "target-gone-transition.json", {"case_id": "BRK-03", "before": before, "after": native.tree(),
                                                     "target_pid": target.pid, "target_birth": target.creation})
         print("Selected target removed; host remains alive. Verify medium receipt --expect target_gone.")
 
