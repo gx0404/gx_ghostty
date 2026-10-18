@@ -3296,7 +3296,22 @@ fn testDialog() !*GxSettingsDialog {
 
 test "settings reopen 100 times keeps synchronized allocations bounded" {
     const dialog = try testDialog();
-    defer dialog.unref();
+    var owned = true;
+    defer if (owned) dialog.unref();
+    // Object data is released at finalize, after the settings arenas are
+    // freed. A close signal or a weak notification during dispose is not
+    // sufficient, and the observer must not keep the dialog alive itself.
+    var finalized = false;
+    const finalize_key = "gx-settings-test-finalized";
+    dialog.as(gobject.Object).setDataFull(finalize_key, &finalized, struct {
+        fn notify(data: ?*anyopaque) callconv(.c) void {
+            const done: *bool = @ptrCast(@alignCast(data.?));
+            done.* = true;
+        }
+    }.notify);
+    defer if (!finalized) {
+        _ = dialog.as(gobject.Object).stealData(finalize_key);
+    };
     const st = &dialog.private().state;
     var config = try CoreConfig.default(testing.allocator);
     defer config.deinit();
@@ -3317,6 +3332,8 @@ test "settings reopen 100 times keeps synchronized allocations bounded" {
     defer window.as(gtk.Window).destroy();
     window.as(gtk.Window).setDefaultSize(1100, 740);
     window.as(gtk.Window).present();
+    kept_dialogs.keep(window.as(gtk.Window), dialog);
+    st.owner.set(window.as(gtk.Window));
     var baseline: usize = 0;
     for (0..102) |i| {
         dialog.reopen(&config, .appearance);
@@ -3332,11 +3349,31 @@ test "settings reopen 100 times keeps synchronized allocations bounded" {
         try testing.expect(dialog.as(adw.Dialog).close() != 0);
         try testing.expect(testWaitDialog(dialog, false));
         try testing.expect(!st.shown);
+        try testing.expect(!finalized);
+        try testing.expectEqual(dialog, kept_dialogs.get(window.as(gtk.Window)));
         if (i == 1) baseline = st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity() + st.shell_arena.queryCapacity();
         if (i > 1) try testing.expectEqual(baseline, st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity() + st.shell_arena.queryCapacity());
         try testing.expectEqualStrings("Monospace", st.font_families[0]);
         try testing.expectEqualStrings("bash --noprofile --norc", st.default_command);
     }
+    kept_dialogs.drop(window.as(gtk.Window));
+    try testing.expect(kept_dialogs.get(window.as(gtk.Window)) == null);
+    dialog.unref();
+    owned = false;
+    // GTK may release its final frame-clock reference asynchronously. Use
+    // the same two-second bound as opening/closing, observing only the
+    // finalization flag once the last reference we own has been released.
+    const tick = glib.timeoutAdd(5, struct {
+        fn wake(_: ?*anyopaque) callconv(.c) c_int {
+            return 1;
+        }
+    }.wake, null);
+    defer _ = glib.Source.remove(tick);
+    const deadline = glib.getMonotonicTime() + 2_000_000;
+    while (!finalized and glib.getMonotonicTime() < deadline) {
+        _ = glib.MainContext.iteration(null, 1);
+    }
+    try testing.expect(finalized);
 }
 
 fn testWaitDialog(dialog: *GxSettingsDialog, mapped: bool) bool {
