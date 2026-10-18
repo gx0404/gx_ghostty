@@ -79,6 +79,11 @@ pub const Bridge = struct {
         if (!self.publisher.accepts(action.*) or !pane.ready() or !pane.ui_attachment.matches(action.attachment)) return false;
         const key = self.key orelse return false;
         if (!key.matches(.{ .source = pane.source_reference, .attachment = pane.ui_attachment, .lease = pane.gate.lease orelse return false, .hwnd = pane.hwnd orelse return false })) return false;
+        // The pane's own focus event (`focusGained`); raising may reenter.
+        if (action.kind == .focus_changed) {
+            _ = self.publisher.raiseHostFocus(&uia_bridge.systemFocus);
+            return true;
+        }
         const live = app.resolveRemote(pane.ui_reference) orelse return false;
         if (action.kind != .focus or action.node_id != 1) return false;
         const hwnd = live.hwnd orelse return false;
@@ -86,6 +91,19 @@ pub const Bridge = struct {
         return w32.GetFocus() == hwnd;
     }
 };
+
+/// RemotePane's WM_SETFOCUS (D-29, as `TerminalRegistry.focused` for a
+/// local pane): with UIA in use and a client listening, make sure the pane
+/// has a current element and queue its focus changed event, which
+/// `Bridge.dispatch` raises from the App message loop while the pane keeps
+/// the system focus. UIA makes none of the window's EVENT_OBJECT_FOCUS for
+/// this provider-backed HWND. For RemotePane.zig's WM_SETFOCUS to call.
+pub fn focusGained(app: *App, pane: *RemotePane) void {
+    const api = app.uia_api orelse return;
+    if (!api.clientsListening()) return;
+    pane.ui.accessibility.publish(app, pane) catch return;
+    _ = pane.ui.accessibility.publisher.queueHostFocus();
+}
 
 pub fn onGetObject(app: *App, pane: *RemotePane, wparam: usize, lparam: isize) isize {
     // OBJID_CLIENT remains suppressed: Windows otherwise installs a competing
@@ -100,6 +118,10 @@ test "remote accessibility without a published snapshot is inert" {
     var bridge: Bridge = .{};
     bridge.hide();
     try std.testing.expectEqual(@as(isize, 0), bridge.publisher.returnProvider(0, 0));
+    // No element yet: a focus queues no event and raises none.
+    try std.testing.expect(!bridge.publisher.queueHostFocus());
+    try std.testing.expect(!bridge.publisher.raiseHostFocus(&uia_bridge.systemFocus));
+    _ = &focusGained;
     bridge.deinit();
 }
 

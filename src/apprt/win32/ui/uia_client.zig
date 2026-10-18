@@ -44,7 +44,97 @@ pub const Client = struct {
         if (call(self.automation, hwnd, &out) < 0) return error.ElementUnavailable;
         return .{ .object = out orelse return error.ElementUnavailable };
     }
+    /// IUIAutomation::AddFocusChangedEventHandler (slot 39), no cache
+    /// request: from now on UIA calls `watch` for every FocusChanged event.
+    pub fn addFocusHandler(self: Client, watch: *FocusWatch) !void {
+        const call = method(*const fn (*anyopaque, ?*anyopaque, *FocusWatch) callconv(.winapi) w32.HRESULT, self.automation, 39);
+        if (call(self.automation, null, watch) < 0) return error.SubscriptionFailed;
+    }
+    /// IUIAutomation::RemoveFocusChangedEventHandler (slot 40), from this
+    /// MTA thread, never from inside the handler.
+    pub fn removeFocusHandler(self: Client, watch: *FocusWatch) void {
+        const call = method(*const fn (*anyopaque, *FocusWatch) callconv(.winapi) w32.HRESULT, self.automation, 40);
+        _ = call(self.automation, watch);
+    }
 };
+
+/// An IUIAutomationFocusChangedEventHandler as a screen reader registers
+/// one. UIA calls it on its own threads; it counts the events and keeps the
+/// AutomationIds of the first `slots` senders in arrival order. The test owns
+/// its lifetime (no reference counting): it must outlive
+/// `removeFocusHandler` and `deinit`.
+pub const FocusWatch = extern struct {
+    vtable: *const FocusVtable = &focus_vtable,
+    events: u32 = 0,
+    /// Slot `i` is readable once `ready[i]` is set.
+    ready: [slots]u32 = [_]u32{0} ** slots,
+    lengths: [slots]u32 = [_]u32{0} ** slots,
+    ids: [slots][96]u8 = undefined,
+    /// Each sender's NativeWindowHandle (0 when it has none).
+    windows: [slots]i32 = [_]i32{0} ** slots,
+
+    pub const slots = 8;
+
+    pub fn count(self: *const FocusWatch) u32 {
+        return @atomicLoad(u32, &self.events, .acquire);
+    }
+    /// Whether one of the recorded senders has AutomationId `id`.
+    pub fn heard(self: *const FocusWatch, id: []const u8) bool {
+        for (0..slots) |index| {
+            if (@atomicLoad(u32, &self.ready[index], .acquire) == 0) continue;
+            if (std.mem.eql(u8, self.ids[index][0..self.lengths[index]], id)) return true;
+        }
+        return false;
+    }
+    /// The recorded senders as "|AutomationId@NativeWindowHandle", for a
+    /// failure message.
+    pub fn senders(self: *const FocusWatch, buffer: []u8) []const u8 {
+        var length: usize = 0;
+        for (0..slots) |index| {
+            if (@atomicLoad(u32, &self.ready[index], .acquire) == 0) continue;
+            const id = self.ids[index][0..self.lengths[index]];
+            const entry = std.fmt.bufPrint(buffer[length..], "|{s}@0x{x}", .{ id, @as(u32, @bitCast(self.windows[index])) }) catch break;
+            length += entry.len;
+        }
+        return buffer[0..length];
+    }
+};
+
+const FocusVtable = extern struct {
+    query_interface: *const fn (*FocusWatch, *const w32.GUID, *?*anyopaque) callconv(.winapi) w32.HRESULT,
+    add_ref: *const fn (*FocusWatch) callconv(.winapi) u32,
+    release: *const fn (*FocusWatch) callconv(.winapi) u32,
+    handle: *const fn (*FocusWatch, ?*anyopaque) callconv(.winapi) w32.HRESULT,
+};
+const focus_vtable: FocusVtable = .{ .query_interface = focusQuery, .add_ref = focusReference, .release = focusReference, .handle = focusChanged };
+const iid_unknown: w32.GUID = .{ .Data1 = 0, .Data2 = 0, .Data3 = 0, .Data4 = .{ 0xc0, 0, 0, 0, 0, 0, 0, 0x46 } };
+const iid_focus_handler: w32.GUID = .{ .Data1 = 0xc270f6b5, .Data2 = 0x5c69, .Data3 = 0x4290, .Data4 = .{ 0x97, 0x45, 0x7a, 0x7f, 0x97, 0x16, 0x94, 0x68 } };
+
+fn focusQuery(self: *FocusWatch, iid: *const w32.GUID, out: *?*anyopaque) callconv(.winapi) w32.HRESULT {
+    if (std.meta.eql(iid.*, iid_unknown) or std.meta.eql(iid.*, iid_focus_handler)) {
+        out.* = self;
+        return 0;
+    }
+    out.* = null;
+    return @bitCast(@as(u32, 0x80004002)); // E_NOINTERFACE
+}
+fn focusReference(_: *FocusWatch) callconv(.winapi) u32 {
+    return 1;
+}
+fn focusChanged(self: *FocusWatch, sender: ?*anyopaque) callconv(.winapi) w32.HRESULT {
+    // Each event owns one slot. The sender belongs to UIA: read it, never
+    // release it.
+    const index = @atomicRmw(u32, &self.events, .Add, 1, .acq_rel);
+    if (index >= FocusWatch.slots) return 0;
+    if (sender) |object| {
+        const element: Element = .{ .object = object };
+        const id: []const u8 = element.string(30011, &self.ids[index]) catch "";
+        self.lengths[index] = @intCast(id.len);
+        self.windows[index] = element.int(30020) catch 0;
+    }
+    @atomicStore(u32, &self.ready[index], 1, .release);
+    return 0;
+}
 
 pub const Element = struct {
     object: *anyopaque,

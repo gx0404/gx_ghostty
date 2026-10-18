@@ -198,6 +198,7 @@ const ReturnProvider = *const fn (w32.HWND, usize, isize, *Face) callconv(.winap
 const HostProvider = *const fn (w32.HWND, *?*Face) callconv(.winapi) HR;
 const Notify = *const fn (*Face, i32, i32, ?[*:0]u16, ?[*:0]u16) callconv(.winapi) HR;
 const Event = *const fn (*Face, i32) callconv(.winapi) HR;
+const Listening = *const fn () callconv(.winapi) i32;
 pub const Api = struct {
     alloc: Allocator,
     module: *anyopaque,
@@ -206,14 +207,21 @@ pub const Api = struct {
     host_provider: HostProvider,
     notification: ?Notify,
     event: ?Event,
+    listening: ?Listening,
     pub fn load(alloc: Allocator) !*Api {
         const module = w32.LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral("UIAutomationCore.dll"), null, 0x800) orelse return error.Unavailable;
         errdefer _ = w32.FreeLibrary(module);
         const ret = w32.GetProcAddress(module, "UiaReturnRawElementProvider") orelse return error.Unavailable;
         const host_proc = w32.GetProcAddress(module, "UiaHostProviderFromHwnd") orelse return error.Unavailable;
         const self = try alloc.create(Api);
-        self.* = .{ .alloc = alloc, .module = module, .return_provider = @ptrCast(ret), .host_provider = @ptrCast(host_proc), .notification = @ptrCast(w32.GetProcAddress(module, "UiaRaiseNotificationEvent")), .event = @ptrCast(w32.GetProcAddress(module, "UiaRaiseAutomationEvent")) };
+        self.* = .{ .alloc = alloc, .module = module, .return_provider = @ptrCast(ret), .host_provider = @ptrCast(host_proc), .notification = @ptrCast(w32.GetProcAddress(module, "UiaRaiseNotificationEvent")), .event = @ptrCast(w32.GetProcAddress(module, "UiaRaiseAutomationEvent")), .listening = @ptrCast(w32.GetProcAddress(module, "UiaClientsAreListening")) };
         return self;
+    }
+    /// UiaClientsAreListening: false only when no client wants events (an
+    /// API without the entry point counts as listening).
+    pub fn clientsListening(self: *const Api) bool {
+        const listening = self.listening orelse return true;
+        return listening() != 0;
     }
     pub fn retain(self: *Api) void {
         _ = self.count.fetchAdd(1, .monotonic);
@@ -269,7 +277,9 @@ pub const Publisher = struct {
     pub fn accepts(self: *const Publisher, action: Action) bool {
         const snapshot = self.current orelse return false;
         if (!snapshot.isActive() or !snapshot.attachment.matches(action.attachment)) return false;
-        if (snapshot.view) |view| return action.kind == .focus and action.node_id == 1 and action.view_id == view.id;
+        // A stable view takes a client's SetFocus of its root and the root's
+        // own focus changed event (`queueHostFocus`).
+        if (snapshot.view) |view| return (action.kind == .focus or action.kind == .focus_changed) and action.node_id == 1 and action.view_id == view.id;
         return action.view_id == 0 and snapshot.id == action.snapshot_id;
     }
     pub fn returnProvider(self: *const Publisher, wparam: usize, lparam: isize) isize {
@@ -327,6 +337,33 @@ pub const Publisher = struct {
         const node = snapshot.findNode(node_id) orelse return false;
         const raise = snapshot.api.event orelse return false;
         return raise(node.face(.simple), focus_changed_event) >= 0;
+    }
+    /// GUI thread: the window of a host-state root (`NodeSpec.host_state`)
+    /// got the keyboard focus. That root is the element clients get for the
+    /// window, and UIA makes no focus event of the window's EVENT_OBJECT_FOCUS
+    /// for a provider-backed HWND, so queue the root's focus changed event for
+    /// the App message loop (`raiseHostFocus`). False without an active
+    /// snapshot whose root is host-state, or when the queue refuses it.
+    pub fn queueHostFocus(self: *const Publisher) bool {
+        return self.queueHostFocusWith(w32.PostMessageW);
+    }
+    fn queueHostFocusWith(self: *const Publisher, post_message: anytype) bool {
+        const snapshot = self.current orelse return false;
+        if (!snapshot.isActive() or !snapshot.nodes[0].spec.host_state) return false;
+        return snapshot.queue.postWith(snapshot, snapshot.nodes[0].spec.id, .focus_changed, "", 0, post_message) == S_OK;
+    }
+    /// From the App message loop, outside locks: raise the focus changed
+    /// event of the host-state root if `has_focus(window)` still holds, i.e.
+    /// its window has not lost the focus since. Nothing of `self` is read
+    /// once the event may reenter. A true return is an API result, not
+    /// event receipt.
+    pub fn raiseHostFocus(self: *const Publisher, has_focus: *const fn (w32.HWND) bool) bool {
+        const snapshot = self.current orelse return false;
+        snapshot.retain();
+        defer snapshot.release();
+        if (!snapshot.isActive() or !snapshot.nodes[0].spec.host_state or !has_focus(snapshot.hwnd)) return false;
+        const raise = snapshot.api.event orelse return false;
+        return raise(snapshot.nodes[0].face(.simple), focus_changed_event) >= 0;
     }
     /// GUI thread, after a publication that moved a selection to node
     /// `node_id` (`PopupBridge` decides it did): queue its ElementSelected
@@ -1300,6 +1337,69 @@ test "UIA a host-state root leaves its focus and rectangle to the window and nam
     try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .host_state = true, .focused = true }}));
     try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .automation_id = "a\x00b" }}));
     try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .localized_type = "\xff" }}));
+}
+
+test "UIA a host-state root queues its focus event and raises it while its window has the focus" {
+    const alloc = std.testing.allocator;
+    const Recorder = struct {
+        var raised: usize = 0;
+        var face: ?*Face = null;
+        var event: i32 = 0;
+        var window_focused: bool = true;
+        fn raise(target: *Face, id: i32) callconv(.winapi) HR {
+            raised += 1;
+            face = target;
+            event = id;
+            return S_OK;
+        }
+        fn hasFocus(_: w32.HWND) bool {
+            return window_focused;
+        }
+    };
+    Recorder.raised = 0;
+    Recorder.window_focused = true;
+    var api: Api = undefined;
+    api.count = .init(1);
+    api.notification = null;
+    api.event = Recorder.raise;
+    const queue = try Queue.create(alloc, @ptrFromInt(1));
+    defer queue.release();
+    var publisher: Publisher = .{};
+    defer publisher.deinit();
+    try std.testing.expect(!publisher.queueHostFocusWith(testPost));
+    try publisher.publishStable(alloc, &api, queue, testAttachment(), @ptrFromInt(1), &.{
+        .{ .id = 1, .name = "pwsh", .role = .pane, .focusable = true, .host_state = true },
+    });
+    try std.testing.expect(publisher.queueHostFocusWith(testPost));
+    var queued = queue.pop().?;
+    defer queued.deinit();
+    try std.testing.expectEqual(ActionKind.focus_changed, queued.kind);
+    try std.testing.expectEqual(@as(u64, 1), queued.node_id);
+    try std.testing.expect(publisher.accepts(queued));
+    // The loop raises it from the root while the window has the focus.
+    try std.testing.expect(publisher.raiseHostFocus(&Recorder.hasFocus));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
+    try std.testing.expectEqual(@as(?*Face, publisher.current.?.nodes[0].face(.simple)), Recorder.face);
+    try std.testing.expectEqual(focus_changed_event, Recorder.event);
+    // The window lost the focus before the loop ran: nothing is raised.
+    Recorder.window_focused = false;
+    try std.testing.expect(!publisher.raiseHostFocus(&Recorder.hasFocus));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
+    // A new content revision keeps the view, so the queued event still
+    // applies; a hidden view takes none.
+    try publisher.publishStable(alloc, &api, queue, testAttachment(), @ptrFromInt(1), &.{
+        .{ .id = 1, .name = "vim", .role = .pane, .focusable = true, .host_state = true },
+    });
+    try std.testing.expect(publisher.accepts(queued));
+    publisher.hide();
+    try std.testing.expect(!publisher.accepts(queued));
+    try std.testing.expect(!publisher.queueHostFocusWith(testPost));
+    // A root that leaves nothing to its window queues no such event.
+    Recorder.window_focused = true;
+    try publisher.publish(alloc, &api, queue, testAttachment(), @ptrFromInt(1), &.{.{ .id = 1, .name = "Dialog", .patterns = .{ .window = true } }});
+    try std.testing.expect(!publisher.queueHostFocusWith(testPost));
+    try std.testing.expect(!publisher.raiseHostFocus(&Recorder.hasFocus));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
 }
 
 test "UIA a search edit names the list it controls and selection events follow the snapshot" {

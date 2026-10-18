@@ -209,6 +209,17 @@ pub fn terminalRoot(title: []const u8, reference: refs.Reference, automation_id:
     };
 }
 
+/// Whether `hwnd` has the system keyboard focus: its thread's focus, with
+/// its top-level window in the foreground. A terminal's focus event is only
+/// raised then (`Publisher.raiseHostFocus`): an event of a background window
+/// would pull a screen reader away from the user's app.
+pub fn systemFocus(hwnd: w32.HWND) bool {
+    if (w32.GetFocus() != hwnd) return false;
+    const top = w32.GetAncestor(hwnd, ga_root) orelse return false;
+    return w32.GetForegroundWindow() == top;
+}
+const ga_root: u32 = 2;
+
 /// One terminal HWND's provider (`terminalRoot`). A new title or language
 /// refreshes it without revoking the elements clients hold; a new attachment
 /// (the pane moved to another window) or `hide` revokes them.
@@ -248,6 +259,10 @@ pub const TerminalBridge = struct {
 /// HWND is destroyed (`forget`) or the App's teardown (`deinit`).
 pub const TerminalRegistry = struct {
     entries: std.ArrayList(Entry) = .empty,
+    /// Whether a terminal window still has the focus when its queued focus
+    /// event is raised (`systemFocus`). Tests, which own no foreground
+    /// window, substitute their thread's focus.
+    has_focus: *const fn (w32.HWND) bool = &systemFocus,
     const Entry = struct { hwnd: w32.HWND, bridge: TerminalBridge = .{} };
 
     /// WM_GETOBJECT of the pane's own HWND: its provider, or 0 to let
@@ -267,6 +282,17 @@ pub const TerminalRegistry = struct {
         try self.entries.append(std.heap.page_allocator, .{ .hwnd = hwnd });
         return &self.entries.items[self.entries.items.len - 1];
     }
+    /// WM_SETFOCUS of the pane's own HWND while UIA clients listen: make sure
+    /// it has a current provider and queue its root's focus changed event.
+    /// UIA makes none of the window's EVENT_OBJECT_FOCUS for a provider-backed
+    /// HWND, so without it a screen reader stays silent when a pane gets the
+    /// focus. `dispatch` raises it from the App message loop.
+    pub fn focused(self: *TerminalRegistry, api: *uia.Api, queue: *uia.Queue, pane: Pane) void {
+        const hwnd = pane.nativeHandle() orelse return;
+        const item = self.entry(hwnd) catch return;
+        item.bridge.publish(api, queue, pane, hwnd) catch return;
+        _ = item.bridge.publisher.queueHostFocus();
+    }
     /// WM_DESTROY of a terminal HWND: what UIA clients hold becomes inert.
     pub fn forget(self: *TerminalRegistry, hwnd: w32.HWND) void {
         for (self.entries.items, 0..) |*item, index| if (item.hwnd == hwnd) {
@@ -276,12 +302,17 @@ pub const TerminalRegistry = struct {
         };
         if (self.entries.items.len == 0) self.deinit();
     }
-    /// A client's SetFocus on a terminal root (the one action `accepts`
-    /// leaves a stable view), applied while it is still that visible pane.
-    /// Nothing of the registry is read once SetFocus may reenter.
+    /// The two actions `accepts` leaves a stable view: the root's own focus
+    /// event (`focused`), raised while its window keeps the focus, and a
+    /// client's SetFocus on a terminal root, applied while it is still that
+    /// visible pane. Nothing of the registry is read once either may reenter.
     pub fn dispatch(self: *const TerminalRegistry, app: *App, action: *const uia.Action) bool {
         for (self.entries.items) |*item| {
             if (!item.bridge.publisher.accepts(action.*)) continue;
+            if (action.kind == .focus_changed) {
+                _ = item.bridge.publisher.raiseHostFocus(self.has_focus);
+                return true;
+            }
             const hwnd = item.hwnd;
             const pane = app.resolvePaneView(action.attachment) orelse return false;
             const target = pane.nativeHandle() orelse return false;

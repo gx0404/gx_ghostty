@@ -1134,6 +1134,18 @@ pub fn uiaForTerminal(self: *App, surface: *Surface, wparam: usize, lparam: isiz
     return self.uia_terminals.getObject(self.uia_api.?, self.uia_queue.?, @import("Pane.zig").fromLocal(surface), wparam, lparam);
 }
 
+/// WM_SETFOCUS of a terminal HWND (D-29): its provider's root is the element
+/// screen readers follow, and UIA makes no focus event of the window's
+/// EVENT_OBJECT_FOCUS for a provider-backed HWND, so the provider raises its
+/// own (queued here, raised from `onUia`). Nothing happens before a client
+/// has used UIA in this process or while none listens.
+pub fn uiaTerminalFocused(self: *App, surface: *Surface) void {
+    const api = self.uia_api orelse return;
+    const queue = self.uia_queue orelse return;
+    if (!api.clientsListening()) return;
+    self.uia_terminals.focused(api, queue, @import("Pane.zig").fromLocal(surface));
+}
+
 fn refreshUia(self: *App) void {
     const api = self.uia_api orelse return;
     const queue = self.uia_queue orelse return;
@@ -4510,6 +4522,8 @@ fn surfaceWndProc(
             // which is not necessarily the active tab.
             _ = surface.parent_window.setActiveSurface(surface);
             surface.handleFocus(true);
+            // D-29: a listening screen reader hears the newly focused pane.
+            surface.app.uiaTerminalFocused(surface);
             return 0;
         },
         w32.WM_KILLFOCUS => {
@@ -4992,6 +5006,141 @@ test "D-29 a terminal HWND is its own named pane for an external UIA client" {
             try testing.expectEqualStrings(try std.fmt.bufPrint(&id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation}), probe.automation_id[0..probe.automation_id_len]);
             try testing.expectEqual(@as(i32, @bitCast(@as(u32, @truncate(@intFromPtr(child))))), probe.native);
             try testing.expectEqual(UiaClient.element_not_available, probe.after_destroy);
+        }
+    };
+    var result: ?anyerror = null;
+    const worker = try std.Thread.spawn(.{}, Gui.run, .{&result});
+    worker.join();
+    if (result) |err| return err;
+}
+
+test "D-29 a terminal HWND that gets the keyboard focus raises its focus event for a listening client" {
+    // A provider-backed HWND raises its own focus event: UIA made none of the
+    // window's EVENT_OBJECT_FOCUS for the named terminal (UIA-05 on the host),
+    // so a screen reader would stay silent when a pane gets the focus.
+    // Through the real window procedure and the App's UIA dispatch, a real
+    // UIAutomationCore client subscribed to FocusChanged must hear the
+    // terminal element. Windows live on a worker GUI thread.
+    const UiaClient = @import("ui/uia_client.zig");
+    const Probe = struct {
+        child: w32.HWND,
+        /// The terminal's AutomationId, owned here: a client that outlives a
+        /// failed GUI thread must not read that thread's stack.
+        id_buffer: [64]u8 = undefined,
+        id_len: usize = 0,
+        stage: std.atomic.Value(u32) = .init(0),
+        failure: ?anyerror = null,
+        watch: UiaClient.FocusWatch = .{},
+
+        fn expected(self: *const @This()) []const u8 {
+            return self.id_buffer[0..self.id_len];
+        }
+
+        fn client(self: *@This()) void {
+            self.listen() catch |err| {
+                self.failure = err;
+            };
+            self.stage.store(3, .release);
+        }
+        fn listen(self: *@This()) !void {
+            const automation = try UiaClient.Client.init();
+            defer automation.deinit();
+            // A screen reader already holds the terminal's element.
+            const element = try automation.fromHandle(self.child);
+            defer element.release();
+            try automation.addFocusHandler(&self.watch);
+            defer automation.removeFocusHandler(&self.watch);
+            self.stage.store(1, .release);
+            // The GUI thread focuses the terminal, then waits for the event.
+            while (self.stage.load(.acquire) < 2) w32.Sleep(1);
+            var waited: u32 = 0;
+            while (!self.watch.heard(self.expected()) and waited < 5_000) : (waited += 5) w32.Sleep(5);
+        }
+    };
+    const Gui = struct {
+        fn run(result: *?anyerror) void {
+            check() catch |err| {
+                result.* = err;
+            };
+        }
+        /// This thread's focus: the test owns no foreground window.
+        fn threadFocus(hwnd: w32.HWND) bool {
+            return w32.GetFocus() == hwnd;
+        }
+        fn check() !void {
+            const testing = std.testing;
+            const alloc = std.heap.page_allocator;
+            var apartment = ComApartment.init();
+            defer apartment.deinit() catch {};
+            try apartment.ensureCom();
+            const api = try Uia.Api.load(alloc);
+            defer api.release();
+            const static = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+            const sink = w32.CreateWindowExW(0, static, static, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(sink);
+            const queue = try Uia.Queue.create(alloc, sink);
+            defer {
+                queue.close();
+                queue.release();
+            }
+            var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(31), .uia_api = api, .uia_queue = queue };
+            app.uia_terminals.has_focus = &threadFocus;
+            var window: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+            var surface: Surface = .{ .app = &app, .parent_window = &window, .ui_reference = try app.ui_ids.surface(31) };
+            surface.ui_attachment = try app.ui_ids.attach(surface.ui_reference, window.ui_reference);
+            const title = "GX D-29 focus";
+            @memcpy(surface.title[0..title.len], title);
+            surface.title_len = title.len;
+            const hinstance = w32.GetModuleHandleW(null);
+            const class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTerminalD29FocusTest");
+            const terminal_class: w32.WNDCLASSEXW = .{ .cbSize = @sizeOf(w32.WNDCLASSEXW), .style = 0, .lpfnWndProc = &surfaceWndProc, .cbClsExtra = 0, .cbWndExtra = 0, .hInstance = hinstance, .hIcon = null, .hCursor = null, .hbrBackground = null, .lpszMenuName = null, .lpszClassName = class, .hIconSm = null };
+            if (w32.RegisterClassExW(&terminal_class) == 0) return error.TestWindowFailed;
+            defer _ = w32.UnregisterClassW(class, hinstance);
+            const parent = w32.CreateWindowExW(0, static, static, 0, 0, 0, 320, 200, null, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(parent);
+            const child = w32.CreateWindowExW(0, class, class, w32.WS_CHILD, 0, 0, 320, 200, parent, null, hinstance, null) orelse return error.TestWindowFailed;
+            defer if (w32.IsWindow(child) != 0) {
+                _ = w32.DestroyWindow(child);
+            };
+            surface.hwnd = child;
+            _ = w32.SetWindowLongPtrW(child, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&surface)));
+
+            const probe = try alloc.create(Probe);
+            probe.* = .{ .child = child };
+            probe.id_len = (try std.fmt.bufPrint(&probe.id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation})).len;
+            const thread = try std.Thread.spawn(.{}, Probe.client, .{probe});
+            var joined = false;
+            // After a timeout the client may still be inside UIA: it keeps its
+            // probe (leaked, never dangling) instead of a join that hangs.
+            errdefer if (!joined) thread.detach();
+            defer if (joined) alloc.destroy(probe);
+            UiaClient.pumpUntil(&probe.stage, 1, 10_000) catch |err| {
+                probe.stage.store(2, .release);
+                return err;
+            };
+            _ = w32.SetFocus(child);
+            const focused = w32.GetFocus() == child;
+            // The App message loop's part (`onUia`): run what the focus queued.
+            while (queue.pop()) |value| {
+                var action = value;
+                defer action.deinit();
+                _ = app.uia_terminals.dispatch(&app, &action);
+            }
+            probe.stage.store(2, .release);
+            try UiaClient.pumpUntil(&probe.stage, 3, 10_000);
+            thread.join();
+            joined = true;
+            if (probe.failure) |err| return err;
+            try testing.expect(focused);
+            // Activating the parent may come first; the terminal's own event
+            // must be among them. A failure lists every sender heard, with
+            // its window, next to the terminal's and the parent's.
+            if (!probe.watch.heard(probe.expected())) {
+                var wanted: [160]u8 = undefined;
+                var senders: [1024]u8 = undefined;
+                const want = try std.fmt.bufPrint(&wanted, "|{s}@0x{x} (parent 0x{x})", .{ probe.expected(), @intFromPtr(child) & 0xffffffff, @intFromPtr(parent) & 0xffffffff });
+                try testing.expectEqualStrings(want, probe.watch.senders(&senders));
+            }
         }
     };
     var result: ?anyerror = null;
