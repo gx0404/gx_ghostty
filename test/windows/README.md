@@ -111,7 +111,13 @@ FocusChanged 事件）；期望在 3 s 内轮询成立，否则 FAIL 并保留 `
 注册 ElementSelected（IUIAutomation 槽 32/33，TreeScope_Subtree），须同时给
 `--ready-file --continue-file --listen-ms`；controller 在 ready 之后按键、等约 1 s 再写
 continue，worker 再等 0.3 s 收尾。事件都只记目标 PID 的发送者，`after_ready` 标出 ready
-之后到达的；注册、移除与查询同线程。节点另记 `localized_type`、`native_window_handle`、
+之后到达的；注册、移除与查询同线程。ready 文件先置 `after_ready` 再整体出现
+（`gx_win_uia.publish_ready`：同目录临时文件写完后 `os.replace`），controller 一看到文件
+即可读全；controller 按键前核对其中 `focus_registered` / `selection_registered`（按所请求的
+`--observe-*`）为 true，否则 FAIL 不按键。N4（设置 Tab）另用两次新枚举：按键前要有且仅有
+一个 HasKeyboardFocus 元素、`check_focus` 确认它就是 GetFocusedElement；按键后同样取得新的
+焦点元素并确认，要求 ready 之后有一条 FocusChanged 的 AutomationId、ControlType、Name 都与
+它相同（设置的 AutomationId 是命中位置 gx-N，换分区会复用）。节点另记 `localized_type`、`native_window_handle`、
 `controller_for`（ControllerFor 所指元素的 AutomationId；客户端拿到的是 IUIAutomationElementArray，
 SAFEARRAY 形态也读）与 `controller_for_vt`（客户端得到的 VARIANT 类型）。
 
@@ -290,9 +296,12 @@ BRK-01～04 只在 VM 中同一用户的 medium/high 拆分令牌下运行，宿
   `gx_boundary_controller.py`、`gx_input_language.py`、`gx_session_ipc_fixture.py`，
   `scripts/` 的 `gx_win_gui.py`、`gx_slots.py`（复制全部 `test/windows/gx_*.py` 最省事）。
   现有 `stage-validation` 只暂存 `gx_vm_validation.ps1`，需扩展暂存清单或另行复制。
-- 暂存目录须可写：不带 `--desktop-held` 时在主检出（git common dir 旁）的
-  `.local/kernel-slots` 建槽锁，各 worktree 共用（`gx_fixture_evidence.slot_root`）；VM 内
-  没有其他工位时可加 `--desktop-held`。`--root` 用 medium 与 high 都可写的本地目录。
+- 暂存目录须可写。不带 `--desktop-held` 时的槽锁目录（`gx_fixture_evidence.slot_root`）：
+  环境变量 `GX_FIXTURE_SLOT_ROOT`（绝对路径）优先；否则在 git 检出里用主检出（git common
+  dir 旁）的 `.local/kernel-slots`，各 worktree 共用，git 失败即报错、不退回私有目录；不在任何
+  检出里的暂存副本（VM 的常态，无需 git）用暂存目录自己的 `.local/kernel-slots`。
+  协调器已持锁时加 `--desktop-held`：不加锁、不求槽目录、不调 git。`--root` 用 medium 与
+  high 都可写的本地目录。
 - `GHOSTTY_GX_REMOTE_TEST=1` 由夹具给 target 与 companion 设置，控制台无需预设；回执只认
   与当前 companion PID/birth 相符的 `fixture_receipt` 行。每次运行用新的 `--name`。
 
