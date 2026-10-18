@@ -562,17 +562,41 @@ def python_identity() -> dict:
                 launcher_sha256=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest())
 
 
+def console_output_utf8() -> dict:
+    """Set only this helper's attached console output code page, before output."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetStdHandle.argtypes, kernel.GetStdHandle.restype = [ctypes.c_uint32], ctypes.c_void_p
+    kernel.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel.GetConsoleMode.restype = ctypes.c_int
+    kernel.GetConsoleOutputCP.argtypes, kernel.GetConsoleOutputCP.restype = [], ctypes.c_uint32
+    kernel.SetConsoleOutputCP.argtypes, kernel.SetConsoleOutputCP.restype = [ctypes.c_uint32], ctypes.c_int
+    handle = kernel.GetStdHandle(0xfffffff5)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if not handle or handle == ctypes.c_void_p(-1).value or not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+        raise OSError('stimulus stdout is not an attached console')
+    before = kernel.GetConsoleOutputCP()
+    if not before:
+        raise OSError('GetConsoleOutputCP failed before UTF-8 setup')
+    if not kernel.SetConsoleOutputCP(65001):
+        raise OSError(f'SetConsoleOutputCP(65001) failed; before={before}')
+    after = kernel.GetConsoleOutputCP()
+    if after != 65001:
+        raise OSError(f'console output UTF-8 readback mismatch: before={before}, after={after}')
+    return dict(before=before, after=after, set_success=True, stdout_mode=mode.value)
+
+
 def shell_main(directory: Path, token: str) -> int:
     """Polling affects this owned helper, not the measured Ghostty CPU counter."""
     import msvcrt
     msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)  # Byte receipts must include exactly the bytes emitted.
+    output_cp = console_output_utf8()
     pid = os.getpid()
     receipt = directory / f'shell-{pid}.jsonl'
     def record(event, **fields):
         append_json(receipt, dict(event=event, pid=pid, token=token,
                                  time_ns=time.time_ns(), qpc_ns=time.perf_counter_ns(), **fields))
     os.write(sys.stdout.fileno(), b'GX C7 owned console\r\n')
-    record('ready', **python_identity())
+    record('ready', console_output_cp=output_cp, **python_identity())
     seen = set()
     while True:
         while msvcrt.kbhit():

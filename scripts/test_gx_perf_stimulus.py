@@ -23,6 +23,54 @@ def pdh_sample(count=10, stamp=100, tid=7, birth=55, pid=42):
                        for key, value in dict(pid=pid, tid=tid, birth=birth, switches=count).items()}}
 
 
+class ConsoleUtf8Tests(unittest.TestCase):
+    def kernel(self, before=936, after=65001, set_ok=1, mode_ok=1, handle=123):
+        dll = mock.Mock()
+        dll.GetStdHandle.return_value = handle
+        def get_mode(_handle, mode):
+            mode._obj.value = 7  # processed output, wrapping and VT
+            return mode_ok
+        dll.GetConsoleMode.side_effect = get_mode
+        dll.GetConsoleOutputCP.side_effect = [before, after]
+        dll.SetConsoleOutputCP.return_value = set_ok
+        return dll
+
+    def test_verified_utf8_receipt_keeps_console_mode(self):
+        for before in (936, 65001):
+            dll = self.kernel(before=before)
+            with self.subTest(before=before), mock.patch.object(ctypes, 'WinDLL', return_value=dll, create=True):
+                value = stimulus.console_output_utf8()
+            self.assertEqual(value, dict(before=before, after=65001, set_success=True, stdout_mode=7))
+            dll.SetConsoleOutputCP.assert_called_once_with(65001)
+            dll.SetConsoleMode.assert_not_called()
+            dll.SetConsoleCP.assert_not_called()
+
+    def test_missing_console_or_failed_set_or_readback_is_closed(self):
+        for kwargs in ({'handle': 0}, {'handle': ctypes.c_void_p(-1).value},
+                       {'mode_ok': 0}, {'before': 0}, {'set_ok': 0}, {'after': 0}, {'after': 936}):
+            dll = self.kernel(**kwargs)
+            with self.subTest(kwargs=kwargs), mock.patch.object(ctypes, 'WinDLL', return_value=dll, create=True):
+                with self.assertRaises((OSError, ValueError)):
+                    stimulus.console_output_utf8()
+            if 'handle' in kwargs or 'mode_ok' in kwargs or 'before' in kwargs:
+                dll.SetConsoleOutputCP.assert_not_called()
+
+    def test_c6_c7_failure_precedes_any_payload(self):
+        import gx_perf_font as font
+        for module in (font, stimulus):
+            with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as tmp, \
+                 mock.patch.dict(sys.modules, {'msvcrt': mock.Mock(kbhit=mock.Mock(return_value=False))}), \
+                 mock.patch.object(module.os, 'O_BINARY', 0x8000, create=True), \
+                 mock.patch.object(stimulus, 'console_output_utf8', side_effect=OSError('no console'), create=True), \
+                 mock.patch.object(module.os, 'write') as write, \
+                 mock.patch.object(stimulus, 'append_json') as append, \
+                 mock.patch.object(module.time, 'sleep', side_effect=RuntimeError('unexpected polling')):
+                with self.assertRaisesRegex(OSError, 'no console'):
+                    module.shell_main(Path(tmp), 'owned-token')
+                write.assert_not_called()
+                append.assert_not_called()
+
+
 class PythonImageTests(unittest.TestCase):
     def native(self, path, result=None):
         dll = mock.Mock()
@@ -79,6 +127,7 @@ class PythonImageTests(unittest.TestCase):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as tmp, \
                  mock.patch.dict(sys.modules, {'msvcrt': mock.Mock(kbhit=mock.Mock(return_value=False))}), \
                  mock.patch.object(module.os, 'O_BINARY', 0x8000, create=True), \
+                 mock.patch.object(stimulus, 'console_output_utf8', return_value=dict(before=936, after=65001, set_success=True, stdout_mode=7)), \
                  mock.patch.object(stimulus, 'python_identity', return_value=identity), \
                  mock.patch.object(stimulus, 'append_json') as append, \
                  mock.patch.object(module.os, 'write', side_effect=lambda fd, data: len(data)) as write, \
@@ -87,6 +136,7 @@ class PythonImageTests(unittest.TestCase):
                     module.shell_main(Path(tmp), 'owned-token')
                 self.assertEqual(write.call_args.args[1], expected)
                 row = append.call_args.args[1]
+                self.assertEqual(row['console_output_cp'], dict(before=936, after=65001, set_success=True, stdout_mode=7))
                 self.assertEqual(row['event'], 'ready')
                 self.assertEqual(row['token'], 'owned-token')
                 for key, value in identity.items():

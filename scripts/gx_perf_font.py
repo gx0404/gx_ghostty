@@ -316,6 +316,7 @@ def shell_main(directory: Path, token: str) -> int:
     """No shell profiles, prompt, IME, keyboard echo or non-ASCII startup output."""
     import msvcrt
     msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    output_cp = stimulus.console_output_utf8()
     receipt = directory / f'shell-{os.getpid()}.jsonl'
     def emit(event, payload, **fields):
         begin = time.perf_counter_ns()
@@ -328,7 +329,7 @@ def shell_main(directory: Path, token: str) -> int:
         stimulus.append_json(receipt, dict(event=event, pid=os.getpid(), token=token,
             qpc_ns=time.perf_counter_ns(), write_begin_qpc_ns=begin,
             written_bytes=offset, payload_hex=payload.hex(), **fields))
-    emit('ready', READY, **stimulus.python_identity())
+    emit('ready', READY, console_output_cp=output_cp, **stimulus.python_identity())
     seen = set()
     while True:
         for path in sorted(directory.glob('command-*.json')):
