@@ -618,10 +618,11 @@ pub const Window = extern struct {
 
         // Get the page position that contains the tab.
         const page = tab_view.getPage(tab.as(gtk.Widget));
+        const pos = tab_view.getPagePosition(page);
 
         // Move it
         // fork(gx): GX-0054 Keep moves inside the page's pinned or unpinned group.
-        const desired_pos = gx_gtk.window.movedTabPosition(tab_view, page, amount);
+        const desired_pos = gx_gtk.window.movedTabPosition(tab_view, page, pos, amount);
         assert(desired_pos >= 0);
         assert(desired_pos < total);
 
