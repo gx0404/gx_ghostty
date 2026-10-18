@@ -16,9 +16,11 @@
 //! way ends the search; a bound Alt+F4 (`close_window` by default) runs in
 //! the terminal instead, like the other bound function keys. Without
 //! Direct2D the bar cannot open, and a message box says so.
-//! The bar stays inside its window: from a pane too narrow for it, it
+//! The bar stays horizontally inside its window: from a pane too narrow for it, it
 //! moves left over the neighboring pane, and a window narrower than the bar
-//! bounds its width (`barSpan`).
+//! bounds its width (`barSpan`). Very short panes can overflow vertically;
+//! neighboring bars can overlap, and a clamped bar may cover part of an
+//! always-visible scrollbar. Window-wide avoidance is not implemented.
 //!
 //! The owning `Surface` embeds this struct as `search_bar` and forwards the
 //! `start_search`/`end_search`/`search_total`/`search_selected` apprt
@@ -28,7 +30,7 @@
 //! (`onReparented`) and `deinit`. The app's message loop gives keys typed
 //! into the bar to `handleKey` first (see `App.run`, `ownsEdit`), then lets
 //! keybindings with Ctrl and bound function keys (F1 to F24, also with
-//! Shift or Alt) reach the terminal, which takes the focus while the bar
+//! Shift, Alt or Win) reach the terminal, which takes the focus while the bar
 //! stays open.
 const SearchBar = @This();
 
@@ -297,7 +299,7 @@ fn barSpan(surface_left: i32, surface_width: i32, window_left: i32, window_right
 }
 
 /// The bar's screen rectangle: the top-right corner of the surface, inside
-/// the window (`barSpan`). The bar takes the content scale of the window
+/// the window horizontally (`barSpan`). The bar takes the content scale of the window
 /// first, like the terminal text (`Popup.setOwnerScale`).
 fn screenRect(self: *SearchBar) ?w32.RECT {
     const pane = self.paneView();
