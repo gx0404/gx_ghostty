@@ -727,6 +727,61 @@ class TestHookTests(unittest.TestCase):
                 with self.assertRaisesRegex(gui.GuiError, expected):
                     self.instance(fake).simulate_d2d_failure()
 
+    def test_system_theme_wparam_packs_app_simulated_system_theme(self):
+        # The values of the Zig test "SimulatedSystemTheme packs the scheme and high contrast".
+        self.assertEqual(0, gui.system_theme_wparam())
+        self.assertEqual(2, gui.system_theme_wparam("dark"))
+        self.assertEqual(0b0101, gui.system_theme_wparam("light", "on"))
+        self.assertEqual(0b1000, gui.system_theme_wparam("follow", "off"))
+        self.assertEqual(0b0110, gui.system_theme_wparam("dark", "on"))
+        for scheme, high_contrast in (("system", "follow"), ("dark", "true"), ("Dark", "on")):
+            with self.subTest(scheme=scheme, high_contrast=high_contrast), self.assertRaises(gui.UsageError):
+                gui.system_theme_wparam(scheme, high_contrast)
+
+    def test_system_theme_contract_follows_the_product_source(self):
+        window = zig_source("src/apprt/win32/Window.zig")
+        match = re.search(r"pub const WM_GHOSTTY_SIMULATE_SYSTEM_THEME: u32 = w32\.WM_USER \+ (0x[0-9A-Fa-f]+);", window)
+        self.assertEqual(gui.WM_GHOSTTY_SIMULATE_SYSTEM_THEME, gui.WM_USER + int(match.group(1), 16))
+        app = zig_source("src/apprt/win32/App.zig")
+        struct = re.search(r"pub const SimulatedSystemTheme = packed struct\(usize\) \{(.*?)\n\};", app, re.S).group(1)
+        fields = re.findall(r"(\w+): enum\(u2\) \{([^}]*)\}", struct)
+        self.assertEqual(["scheme", "high_contrast"], [name for name, _ in fields])  # scheme in the low bits
+        for (name, body), mapping in zip(fields, (gui.SYSTEM_THEME_SCHEMES, gui.SYSTEM_THEME_HIGH_CONTRAST)):
+            values = {key: int(value) for key, value in re.findall(r"(\w+) = (\d+)", body)}
+            ours = {("system" if key == "follow" else key): value for key, value in mapping.items()}
+            with self.subTest(field=name):
+                self.assertEqual(values, ours)
+
+    def test_simulated_system_theme_needs_the_hook_to_accept_it(self):
+        wparams = []
+        fake = FakeWin32(self.PID, self.PID)
+        fake.answers = {gui.WM_GHOSTTY_SIMULATE_SYSTEM_THEME: lambda wparam: wparams.append(wparam) or 1}
+        with mock.patch.object(gui, "win32", return_value=fake):
+            self.assertEqual(0b0110, self.instance(fake).simulate_system_theme("dark", "on"))
+        self.assertEqual([(0x10, gui.WM_USER + 0x49, 0b0110, 0)], fake.messages)
+        for expected, answer in (("did not answer", None), ("returned 0, not 1", 0)):
+            fake = FakeWin32(self.PID, self.PID)
+            fake.answers = {gui.WM_GHOSTTY_SIMULATE_SYSTEM_THEME: answer}
+            with self.subTest(expected=expected), mock.patch.object(gui, "win32", return_value=fake):
+                with self.assertRaisesRegex(gui.GuiError, expected):
+                    self.instance(fake).simulate_system_theme("light")
+        with self.assertRaises(gui.UsageError):
+            self.instance(fake).simulate_system_theme("sepia")
+
+    def test_system_theme_step(self):
+        self.assertEqual({"scheme": "dark", "high_contrast": "off"},
+                         gui.validate_step("s", {"action": "simulate_system_theme", "scheme": "dark",
+                                                 "high_contrast": "off"}).params)
+        for raw in ({"scheme": "night"}, {"high_contrast": True}, {"contrast": "on"}):
+            with self.subTest(raw=raw), self.assertRaises(gui.UsageError):
+                gui.validate_step("s", {"action": "simulate_system_theme", **raw})
+        run = gui.ScenarioRun(None, Path("ghostty.exe"), Path("."))  # type: ignore[arg-type]
+        run.instance = mock.Mock(spec=gui.Instance)
+        run.instance.simulate_system_theme.return_value = 0b0101
+        self.assertEqual("simulated apps scheme light, high contrast on (wparam 0x5)",
+                         run.do_simulate_system_theme({"scheme": "light", "high_contrast": "on"}))
+        run.instance.simulate_system_theme.assert_called_once_with("light", "on")
+
     def test_the_step_and_its_validation(self):
         self.assertEqual("simulate_d2d_failure", gui.validate_step("s", {"action": "simulate_d2d_failure"}).action)
         self.assertEqual({"window": "quick"},
