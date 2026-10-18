@@ -253,6 +253,14 @@ class ScenarioValidationTests(unittest.TestCase):
         self.assertEqual(["key", "capture"], [step.action for step in scenario.steps])
         self.assertEqual("language = en\n", scenario.full_config())
 
+    def test_the_file_header_documents_every_action(self):
+        header = gui.__doc__ or ""
+        steps = header[header.index("\nScenario files:"):]
+        steps = steps[:steps.index("\n\n", 1)]
+        for action in gui.ACTIONS:
+            with self.subTest(action=action):
+                self.assertRegex(steps, rf"(?m)^  (?:.*\s)?{action}\b")
+
     def test_rejections(self):
         capture = '[[step]]\naction = "capture"\nname = "x"\n'
         cases = {

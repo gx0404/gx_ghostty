@@ -31,6 +31,25 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   ime-off ENV_DIR                   ask the window's thread to switch to the US layout
   cancel-mode ENV_DIR               SendMessage WM_CANCELMODE to the focused terminal
 
+Scenario files: id, title and config (HARNESS_CONFIG is appended unless harness = false), optional
+env, args, requires, side_effects and expect, and [[step]] tables, each an action and its keys
+([bracketed] keys are optional; x/y/in/window address a point as described under Input safety):
+  wait_window [timeout window]          activate [window]               sleep seconds
+  wait_log pattern [timeout]            assert_log pattern [present]
+  wait_file path pattern [timeout]      (the whole text of the file at path matches)
+  wait_title pattern [timeout window]   assert_title pattern [window]
+  type text [delay repeat]              key keys [repeat delay]          clipboard text
+  click [x y in window button count mods]           mouse_down / mouse_up [x y in window button mods]
+  move [x y in window]                  drag from to [in window steps button]
+  drag_divider between fraction [steps]             wheel [x y in window delta horizontal count]
+  capture name [what=window|quick|popups|all method=screen|print]
+  pixel [x y in window expect differs tolerance method label]
+  dpi value                             ime_off                          cancel_mode [terminal]
+  gpu_reset [terminal]                  assert_responsive [timeout]      resize width height
+  wait_terminals count [timeout window] wait_popup [cls timeout present new]
+  close [timeout]                       file path text (a file inside the isolated profile)
+A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end.
+
 Isolation: LOCALAPPDATA and XDG_CONFIG_HOME point at ENV_DIR, so the configuration is
 ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log. APPDATA,
 XDG_STATE_HOME and XDG_CACHE_HOME use ENV_DIR/appdata, ENV_DIR/state and ENV_DIR/cache;
