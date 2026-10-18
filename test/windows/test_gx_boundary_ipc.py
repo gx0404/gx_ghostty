@@ -20,6 +20,15 @@ class IpcBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ipc.forged_hello(invalid, 55, 123456)
 
+    def test_replay_is_attributed_to_the_exact_launcher_pid_and_birth(self):
+        text = ('06:41:24.512 [47440] info(win32): fixture_ipc_replay pid=55 birth=900 outcome=completed\n'
+                '06:41:25.000 [47441] info(win32): fixture_ipc_replay pid=55 birth=901 outcome=completed\n'
+                '06:41:25.100 [47442] info(win32): fixture_ipc_replay pid=56 birth=900 outcome=rejected\n')
+        self.assertEqual(['completed'], ipc.replay_rows(text, 55, 900))
+        self.assertEqual([], ipc.replay_rows(text, 55, 902))
+        # The round-2 line without identity can no longer satisfy the assertion.
+        self.assertEqual([], ipc.replay_rows('info(win32): fixture_ipc_replay outcome=completed\n', 55, 900))
+
 
 if __name__ == "__main__":
     unittest.main()

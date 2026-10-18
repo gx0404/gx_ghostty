@@ -23,6 +23,12 @@ def forged_hello(original, pid, birth):
     return bytes(result)
 
 
+def replay_rows(text, pid, birth):
+    """Outcomes of the gated CLI replay logged by exactly this launcher PID/birth."""
+    return [outcome for source, created, outcome in re.findall(r"fixture_ipc_replay pid=(\d+) birth=(\d+) outcome=(\w+)", text)
+            if int(source) == pid and int(created) == birth]
+
+
 class FakeEndpoint(PipeApi):
     """Only a FIRST_PIPE_INSTANCE of the just-closed fixture host's namespace."""
     class Overlapped(C.Structure):
@@ -180,10 +186,18 @@ def run(fixture):
         before = native.query(102), native.query(103)
         launcher = fixture.start(path, ("+toggle-quick-terminal",), env={"GHOSTTY_GX_REMOTE_TEST_REPLAY": "1"})
         assert fixture.processes[launcher.pid].wait(timeout=20) == 0
+        # The duplicate send must actually have happened (same Attempt/key,
+        # same outcome) before "executed once" means anything.
+        logs = "".join(item.read_text(encoding="utf-8", errors="replace")
+                       for item in (launcher.log, launcher.log.with_name(launcher.log.name + ".1")) if item.exists())
+        replays = replay_rows(logs, launcher.pid, launcher.creation)
+        if replays != ["completed"]:
+            raise AssertionError(f"launcher {launcher.pid} did not replay the authenticated request exactly once: {replays}")
         wait(lambda: native.query(102) == before[0] + 1)
         assert native.query(103) == before[1] + 1
         quick = wait(lambda: next((w for w in host.windows() if w.cls == gui.WINDOW_CLASS and w.toolwindow and w.visible), None))
         fixture.capture(host, "duplicate-toggle-still-visible", quick)
-        fixture.check("authenticated-request-replay-executed-once", before=before,
+        fixture.check("authenticated-request-replay-executed-once", before=before, replay_outcomes=replays,
+                      launcher={"pid": launcher.pid, "birth": launcher.creation},
                       after=(native.query(102), native.query(103)), quick_hwnd=quick.hwnd)
     fixture.capture(host, "ipc-after")
