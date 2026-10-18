@@ -642,7 +642,7 @@ const Dialog = struct {
     fn focusTarget(self: *Dialog, index: usize) void {
         self.focus = index;
         self.keyboard = true;
-        self.popup.repaint();
+        self.popup.focusMoved();
     }
 
     fn linkCount(self: *const Dialog) usize {
@@ -1088,6 +1088,110 @@ test "UIA dialog focus preserves checkbox Toggle until the checkbox changes" {
     try testing.expect(dialog.checked);
     try testing.expect(!dialog.popup.uia_view.publisher.accepts(action));
     try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
+}
+
+test "UIA dialog focus moves report the focused element and keep every element" {
+    // The real publishDialog through a hidden (never shown) dialog window: a
+    // client holds the check box and the OK button. A focus request, then
+    // Shift+Tab and Tab, move HasKeyboardFocus between them in place; both
+    // stay usable, and the Toggle the client sends after focusing the check
+    // box is accepted, until the check box itself toggles.
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(owner);
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    var app: App = undefined;
+    app.uia_api = &api;
+    app.uia_queue = &queue;
+    app.drop_closing = false;
+    app.uia_popups = .{};
+    const tokens = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
+    var dialog: Dialog = .{
+        .app = undefined,
+        .owner = owner,
+        .tokens = tokens,
+        .uia_attachment = .{
+            .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+            .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+            .revision = 1,
+        },
+        .spec = .{ .title = "Test", .body = "", .check = "Remember", .buttons = &.{ .{ .label = "OK", .choice = .accept }, .{ .label = "Cancel", .choice = .cancel } } },
+    };
+    const Source = struct {
+        fn live(_: *anyopaque) bool {
+            return true;
+        }
+        fn build(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, a: *uia.Api, q: *uia.Queue) anyerror!void {
+            const self: *Dialog = @ptrCast(@alignCast(context));
+            try bridge.publishDialog(a, q, self.uia_attachment, self, .{ .context = self, .is_live = live, .action = uiaAction });
+        }
+    };
+    try dialog.popup.create(hinstance, owner, factory, popupOptions(dialog.spec, tokens), .{
+        .ctx = &dialog,
+        .paint = onPaint,
+        .uia_source = .{ .app = &app, .build = Source.build, .is_live = Source.live, .action = uiaAction },
+    });
+    defer dialog.popup.destroy();
+    dialog.popup.visible = true;
+    dialog.popup.focused = true;
+    dialog.popup.uia_layout_pending = false;
+    dialog.focus = dialog.checkIndex().? + 1;
+    // What WM_GETOBJECT publishes (Popup.uiaRefresh).
+    try Source.build(&dialog, &dialog.popup, &dialog.popup.uia_view, &api, &queue);
+    const snapshot = dialog.popup.uia_view.publisher.current.?;
+    const Simple = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+        GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
+        GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
+    };
+    const Probe = struct {
+        /// Usable (ProviderOptions succeeds) and whether it has the focus.
+        fn hasFocus(face: *uia.Face) !bool {
+            const table: *const Simple = @ptrCast(@alignCast(face.vtable));
+            var options: u32 = 0;
+            try testing.expectEqual(@as(i32, 0), table.ProviderOptions(face, &options));
+            var value: uia.Variant = .{};
+            try testing.expectEqual(@as(i32, 0), table.GetPropertyValue(face, 30008, &value));
+            return value.data.integer != 0;
+        }
+    };
+    // Nodes: the dialog, the check box, OK, Cancel.
+    const check = &snapshot.nodes[1].faces[0];
+    const ok = &snapshot.nodes[2].faces[0];
+    for ([_]*uia.Face{ check, ok }) |face| _ = @as(*const Simple, @ptrCast(@alignCast(face.vtable))).AddRef(face);
+    defer for ([_]*uia.Face{ check, ok }) |face| {
+        _ = @as(*const Simple, @ptrCast(@alignCast(face.vtable))).Release(face);
+    };
+    try testing.expect(!try Probe.hasFocus(check));
+    try testing.expect(try Probe.hasFocus(ok));
+    // A UIA SetFocus (or a click) on the check box, then Shift+Tab and Tab.
+    dialog.focusTarget(dialog.checkIndex().?);
+    try testing.expect(try Probe.hasFocus(check));
+    try testing.expect(!try Probe.hasFocus(ok));
+    dialog.moveFocus(true);
+    try testing.expect(!try Probe.hasFocus(check));
+    try testing.expect(try Probe.hasFocus(ok));
+    dialog.moveFocus(false);
+    try testing.expect(try Probe.hasFocus(check));
+    try testing.expectEqual(snapshot, dialog.popup.uia_view.publisher.current.?);
+    const toggle: uia.Action = .{ .attachment = dialog.uia_attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    try testing.expect(dialog.popup.uia_view.publisher.accepts(toggle));
+    // The Toggle itself changes the model and revokes the elements.
+    dialog.activate(dialog.checkIndex().?);
+    try testing.expect(dialog.checked);
+    try testing.expect(!dialog.popup.uia_view.publisher.accepts(toggle));
 }
 
 fn titleStyle(t: style.Tokens) d2d.TextStyle {
@@ -1866,7 +1970,7 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             // Pointer use hides the focus ring again (unless Windows
             // always shows it).
             self.keyboard = keyboardCues();
-            self.popup.repaint();
+            self.popup.focusMoved();
         },
         .up => if (event.button == .left) {
             const pressed = self.pressed;

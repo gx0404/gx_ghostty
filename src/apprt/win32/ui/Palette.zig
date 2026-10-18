@@ -2805,3 +2805,77 @@ test "pressed rows require the pointer and keep selection distinct" {
     const pressed = RowColors.of(t, .pressed);
     try testing.expect(style.contrast(pressed.fill.?, t.surface_raised) < style.contrast(hover.fill.?, t.surface_raised));
 }
+
+test "UIA a real UI Automation client hears the palette's arrow keys select another result" {
+    // The search box keeps the keyboard focus while Down selects the next
+    // result: the selection publishes the results anew, and a client
+    // subscribed to ElementSelected events, as Narrator is, hears that item
+    // once. The popup is a real, never shown window; the entries are fixed.
+    const testing = std.testing;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    var fixture: Popup.UiaTestClient.AppFixture = undefined;
+    try fixture.init(attachment);
+    defer fixture.deinit();
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(owner);
+    var items = [_]Item{
+        .{ .group = .commands, .icon = 0, .title = "Split Left", .title_en = "Split Left", .name = "Split Left", .name_en = "Split Left", .target = .clear_history },
+        .{ .group = .commands, .icon = 0, .title = "Split Right", .title_en = "Split Right", .name = "Split Right", .name_en = "Split Right", .target = .clear_history },
+    };
+    var rows = [_]Row{ .{ .kind = .{ .item = 0 }, .y = 0, .h = 20 }, .{ .kind = .{ .item = 1 }, .y = 20, .h = 20 } };
+    var palette: Palette = .{
+        .page = .root,
+        .active = true,
+        .selected = 0,
+        .uia_attachment = attachment,
+        .items = .{ .items = &items, .capacity = items.len },
+        .rows = .{ .items = &rows, .capacity = rows.len },
+    };
+    const Source = struct {
+        fn paint(_: *anyopaque, _: *Popup, _: *d2d.Canvas) void {}
+        fn live(context: *anyopaque) bool {
+            const self: *Palette = @ptrCast(@alignCast(context));
+            return self.active and self.popup.visible;
+        }
+        fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+            return false;
+        }
+        fn build(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+            const self: *Palette = @ptrCast(@alignCast(context));
+            try bridge.publishPalette(api, queue, self.uia_attachment, self, self.listView(), .{ .context = self, .is_live = live, .action = action });
+        }
+    };
+    try palette.popup.create(hinstance, owner, factory, .{}, .{
+        .ctx = &palette,
+        .paint = Source.paint,
+        .uia_source = .{ .app = &fixture.app, .build = Source.build, .is_live = Source.live, .action = Source.action },
+    });
+    defer palette.popup.destroy();
+    const hwnd = palette.popup.hwnd.?;
+    // Room for the list to show both results; never shown.
+    _ = w32.SetWindowPos(hwnd, null, 0, 0, 480, 320, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE | w32.SWP_NOMOVE);
+    palette.popup.visible = true;
+    const client = try Popup.UiaTestClient.create(hwnd);
+    defer client.destroy(&fixture.app);
+    try client.ready(&fixture.app);
+    client.settle(&fixture.app, 200);
+    client.clear();
+    // Down: what `select` does to the model (its scrolling into view needs
+    // the owner window), and the paint it asks for.
+    palette.selected = 1;
+    palette.popup.invalidate();
+    _ = w32.SendMessageW(hwnd, w32.WM_PAINT, 0, 0);
+    try client.expect(&fixture.app, .selected, "Split Right");
+    client.settle(&fixture.app, 100);
+    try testing.expectEqual(@as(usize, 1), client.times(.selected, "Split Right"));
+    try testing.expect(!client.saw(.selected, "Split Left"));
+    palette.popup.visible = false;
+}

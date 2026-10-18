@@ -335,6 +335,9 @@ uia_view: uia_bridge.PopupBridge = .{},
 uia_cookie: u64 = 0,
 uia_refreshing: bool = false,
 uia_layout_pending: bool = true,
+/// The keyboard focus moved and is reported once the next paint laid the
+/// popup out (`focusMovedAtPaint`).
+uia_focus_pending: bool = false,
 visible: bool = false,
 /// Created with `Options.activate`: the popup takes input, so it is
 /// activatable whenever it is shown (`mayActivate`). Owners that clear
@@ -1083,6 +1086,50 @@ pub fn repaint(self: *Popup) void {
     if (self.hwnd) |hwnd| _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
+/// The keyboard focus moved within the popup, or into or out of it, and the
+/// model did not change: repaint, and let UI Automation report the new
+/// focus at once (`HasKeyboardFocus`, `GetFocus` and the focus changed
+/// event, `reportFocus`) without revoking the elements clients hold. For
+/// widgets whose accessible model comes from their state, not from a paint.
+pub fn focusMoved(self: *Popup) void {
+    self.repaint();
+    self.reportFocus();
+}
+
+/// `focusMoved` for a widget whose accessible model comes from its last
+/// paint (the hit rectangles of the settings): the focus is reported after
+/// the paint that shows it, which may also scroll it into view. A paint that
+/// laid out anything else publishes everything anew instead, the focus
+/// included (`uiaLayoutChanged`).
+pub fn focusMovedAtPaint(self: *Popup) void {
+    self.uia_focus_pending = true;
+    self.repaint();
+}
+
+/// Report where the keyboard focus is now: the widget rebuilds its specs
+/// only to say so (`PopupBridge.focus_only`), the focus moves within the
+/// published snapshot and its changed event is queued for the message loop.
+/// Specs that differ in anything else revoke the snapshot, which is then
+/// published anew at once; so does a pending model change, at the paint it
+/// waits for.
+fn reportFocus(self: *Popup) void {
+    self.uia_focus_pending = false;
+    if (!self.visible or self.uia_refreshing or self.uia_view.needs_publish or self.uia_view.publisher.current == null) return;
+    const cb = self.callbacks orelse return;
+    const source = cb.uia_source orelse return;
+    if (source.app.drop_closing or !source.is_live(cb.ctx)) return;
+    const api = source.app.uia_api orelse return;
+    const queue = source.app.uia_queue orelse return;
+    {
+        self.uia_refreshing = true;
+        defer self.uia_refreshing = false;
+        self.uia_view.focus_only = true;
+        defer self.uia_view.focus_only = false;
+        source.build(cb.ctx, self, &self.uia_view, api, queue) catch self.uiaDirty();
+    }
+    if (self.uia_view.needs_publish) self.uiaRefresh();
+}
+
 fn uiaDirty(self: *Popup) void {
     self.uia_view.dirty();
     self.uia_layout_pending = true;
@@ -1102,6 +1149,7 @@ fn uiaDetach(self: *Popup) void {
     };
     self.uia_view.hide();
     self.uia_layout_pending = true;
+    self.uia_focus_pending = false;
 }
 
 fn uiaRefresh(self: *Popup) void {
@@ -1136,7 +1184,7 @@ fn uiaGetObject(self: *Popup, hwnd: w32.HWND, wparam: usize, lparam: isize) isiz
     const cookie = self.uia_cookie;
     if (!source.app.ensureUia()) return 0;
     const current = livePopup(hwnd, cookie) orelse return 0;
-    if (current.uia_layout_pending) current.paint(hwnd);
+    if (current.uia_layout_pending or current.uia_focus_pending) current.paint(hwnd);
     const ready = livePopup(hwnd, cookie) orelse return 0;
     ready.uiaRefresh();
     return ready.uia_view.publisher.returnProvider(wparam, lparam);
@@ -1852,7 +1900,7 @@ fn onFocus(self: *Popup, hwnd: w32.HWND, focused: bool) void {
             self.input.dragging = false;
         }
     }
-    self.repaint();
+    self.focusMoved();
 }
 
 fn handleKey(self: *Popup, hwnd: w32.HWND, key: Key) bool {
@@ -2017,7 +2065,11 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     };
     defer if (livePopup(hwnd, cookie)) |current| {
         current.uia_layout_pending = false;
+        const published = current.uia_view.publisher.current;
         current.uiaRefresh();
+        // A new publication reports the focus itself.
+        if (current.uia_view.publisher.current != published) current.uia_focus_pending = false;
+        if (current.uia_focus_pending) current.reportFocus();
     };
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc = w32.BeginPaint(hwnd, &ps);
@@ -2691,6 +2743,681 @@ test "P4 opening placement avoids redundant size and position changes" {
     try std.testing.expectEqual(w32.SWP_NOACTIVATE, showPlacementFlags(null, rect, false));
     // Geometry hints must not suppress z-order placement, activation or show.
     try std.testing.expect(showPlacementFlags(rect, rect, true) & w32.SWP_NOZORDER == 0);
+}
+
+/// An in-process UI Automation client for tests: `IUIAutomation`, on an MTA
+/// thread of its own, asks one popup window for its element and subscribes,
+/// as screen readers do, to the focus changed and ElementSelected events of
+/// the whole desktop; it keeps the names of the senders that are elements of
+/// this process. The test thread pumps messages meanwhile (`pump`): UI
+/// Automation asks the popup for its provider (WM_GETOBJECT) and the queued
+/// events are raised from that loop, as `App.onUia` does. Nothing is shown,
+/// activated or drawn on the desktop.
+pub const UiaTestClient = struct {
+    pub const Kind = enum(u8) { focus, selected };
+    pub const Event = struct {
+        kind: Kind,
+        name: [64]u16 = undefined,
+        len: usize = 0,
+
+        fn is(self: *const Event, kind: Kind, name: []const u8) bool {
+            if (self.kind != kind or self.len != name.len) return false;
+            for (self.name[0..self.len], name) |unit, byte| if (unit != byte) return false;
+            return true;
+        }
+    };
+
+    const HR = i32;
+    const E_NOINTERFACE: HR = @bitCast(@as(u32, 0x80004002));
+    const E_POINTER: HR = @bitCast(@as(u32, 0x80004003));
+    const Handler = extern struct { vtable: *const anyopaque, client: *UiaTestClient };
+    const Query = *const fn (*Handler, *const w32.GUID, *?*anyopaque) callconv(.winapi) HR;
+    const Ref = *const fn (*Handler) callconv(.winapi) u32;
+    const FocusTable = extern struct {
+        QueryInterface: Query = queryFocus,
+        AddRef: Ref = addRef,
+        Release: Ref = release,
+        HandleFocusChangedEvent: *const fn (*Handler, ?*anyopaque) callconv(.winapi) HR = handleFocus,
+    };
+    const EventTable = extern struct {
+        QueryInterface: Query = queryEvent,
+        AddRef: Ref = addRef,
+        Release: Ref = release,
+        HandleAutomationEvent: *const fn (*Handler, ?*anyopaque, i32) callconv(.winapi) HR = handleEvent,
+    };
+    const focus_table: FocusTable = .{};
+    const event_table: EventTable = .{};
+
+    // uiautomationclient.h
+    const clsid_automation = w32.GUID.parse("{ff48dba4-60ef-4201-aa87-54103eef594e}");
+    const iid_automation = w32.GUID.parse("{30cbe57d-d9d0-452a-ab13-7ac5ac4825ee}");
+    const iid_focus_handler = w32.GUID.parse("{c270f6b5-5c69-4290-9745-7a7f97169468}");
+    const iid_event_handler = w32.GUID.parse("{146c3c17-f12e-4e22-8c27-f894b9b79c69}");
+    const iid_unknown = w32.GUID.parse("{00000000-0000-0000-c000-000000000046}");
+    const iid_agile = w32.GUID.parse("{94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90}");
+    /// IUIAutomation methods, after IUnknown's three.
+    const slot_root_element = 5;
+    const slot_element_from_handle = 6;
+    const slot_add_event_handler = 32;
+    const slot_add_focus_handler = 39;
+    const slot_remove_all = 41;
+    /// IUIAutomationElement::GetCurrentPropertyValue.
+    const slot_property = 10;
+    const element_selected_event = 20012;
+    const tree_scope_subtree = 7;
+
+    extern "oleaut32" fn VariantClear(variant: *uia.Variant) callconv(.winapi) HR;
+    extern "oleaut32" fn SysStringLen(text: ?[*]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+    hwnd: w32.HWND,
+    thread: ?std.Thread = null,
+    stop_event: ?std.os.windows.HANDLE = null,
+    /// 0 starting, 1 subscribed, 2 failed, 3 unsubscribed.
+    state: std.atomic.Value(u8) = .init(0),
+    failure: std.atomic.Value(i32) = .init(0),
+    refs: std.atomic.Value(u32) = .init(0),
+    lock: std.os.windows.SRWLOCK = .{},
+    events: [32]Event = undefined,
+    count: usize = 0,
+    focus_handler: Handler = undefined,
+    event_handler: Handler = undefined,
+
+    /// Subscribe to the events of the popup window `hwnd`; the caller pumps
+    /// (`ready`). The client lives on the page allocator: UI Automation may
+    /// release its handlers after they were removed (`destroy`).
+    pub fn create(hwnd: w32.HWND) !*UiaTestClient {
+        const self = try std.heap.page_allocator.create(UiaTestClient);
+        self.* = .{ .hwnd = hwnd };
+        self.focus_handler = .{ .vtable = &focus_table, .client = self };
+        self.event_handler = .{ .vtable = &event_table, .client = self };
+        self.stop_event = w32.CreateEventW(null, 1, 0, null) orelse {
+            std.heap.page_allocator.destroy(self);
+            return error.TestUnexpectedResult;
+        };
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+            std.os.windows.CloseHandle(self.stop_event.?);
+            std.heap.page_allocator.destroy(self);
+            return err;
+        };
+        return self;
+    }
+
+    /// Wait, pumping messages for `app`, until the client subscribed.
+    pub fn ready(self: *UiaTestClient, app: *App) !void {
+        _ = pump(app, 10_000, self, started);
+        if (self.state.load(.acquire) == 1) return;
+        std.debug.print("UIA test client failed hr=0x{x}\n", .{@as(u32, @bitCast(self.failure.load(.acquire)))});
+        return error.TestUnexpectedResult;
+    }
+
+    /// Unsubscribe and end the client thread, pumping (UI Automation may
+    /// still ask the popup while it removes the handlers), then free it once
+    /// UI Automation released its handlers.
+    pub fn destroy(self: *UiaTestClient, app: *App) void {
+        if (self.stop_event) |event| _ = w32.SetEvent(event);
+        if (self.thread) |thread| {
+            _ = pump(app, 10_000, self, unsubscribed);
+            thread.join();
+        }
+        if (self.stop_event) |event| std.os.windows.CloseHandle(event);
+        _ = pump(app, 1_000, self, released);
+        // Still held by UI Automation: keep the memory rather than free it.
+        if (self.refs.load(.acquire) == 0) std.heap.page_allocator.destroy(self);
+    }
+
+    /// Forget what was recorded so far.
+    pub fn clear(self: *UiaTestClient) void {
+        std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.lock);
+        defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.lock);
+        self.count = 0;
+    }
+
+    /// Whether an event of `kind` came from an element named `name`.
+    pub fn saw(self: *UiaTestClient, kind: Kind, name: []const u8) bool {
+        return self.times(kind, name) > 0;
+    }
+
+    /// How many events of `kind` came from elements named `name`.
+    pub fn times(self: *UiaTestClient, kind: Kind, name: []const u8) usize {
+        std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.lock);
+        defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.lock);
+        var found: usize = 0;
+        for (self.events[0..self.count]) |*event| found += @intFromBool(event.is(kind, name));
+        return found;
+    }
+
+    /// Pump messages for `app` until an event of `kind` came from an
+    /// element named `name` (5 s at most).
+    pub fn expect(self: *UiaTestClient, app: *App, kind: Kind, name: []const u8) !void {
+        const Wanted = struct {
+            client: *UiaTestClient,
+            kind: Kind,
+            name: []const u8,
+            fn done(wanted: *const @This()) bool {
+                return wanted.client.saw(wanted.kind, wanted.name);
+            }
+        };
+        const wanted: Wanted = .{ .client = self, .kind = kind, .name = name };
+        if (pump(app, 5_000, &wanted, Wanted.done)) return;
+        std.debug.print("UIA test client: no {t} event from \"{s}\"; {d} recorded\n", .{ kind, name, self.count });
+        return error.TestExpectedEqual;
+    }
+
+    /// Pump messages for `timeout_ms` (events already queued arrive).
+    pub fn settle(self: *UiaTestClient, app: *App, timeout_ms: u64) void {
+        _ = pump(app, timeout_ms, self, never);
+    }
+
+    /// Pump messages until `done(context)` or `timeout_ms`: sent messages
+    /// (WM_GETOBJECT) are answered, and the UI Automation queue of `app` is
+    /// dispatched to its popups as `App.onUia` does.
+    pub fn pump(app: *App, timeout_ms: u64, context: anytype, comptime done: fn (@TypeOf(context)) bool) bool {
+        const deadline = GetTickCount64() + timeout_ms;
+        while (true) {
+            var msg: w32.MSG = undefined;
+            while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                if (msg.message == uia.wake_message) {
+                    const queue = app.uia_queue orelse continue;
+                    while (queue.pop()) |value| {
+                        var action = value;
+                        defer action.deinit();
+                        _ = app.uia_popups.dispatch(app, &action);
+                    }
+                    continue;
+                }
+                _ = w32.TranslateMessage(&msg);
+                _ = w32.DispatchMessageW(&msg);
+            }
+            if (done(context)) return true;
+            if (GetTickCount64() >= deadline) return false;
+            _ = w32.MsgWaitForMultipleObjectsEx(0, null, 10, w32.QS_ALLINPUT, w32.MWMO_INPUTAVAILABLE);
+        }
+    }
+
+    fn started(self: *UiaTestClient) bool {
+        return self.state.load(.acquire) != 0;
+    }
+    fn unsubscribed(self: *UiaTestClient) bool {
+        return self.state.load(.acquire) >= 2;
+    }
+    fn released(self: *UiaTestClient) bool {
+        return self.refs.load(.acquire) == 0;
+    }
+    fn never(_: *UiaTestClient) bool {
+        return false;
+    }
+
+    fn fail(self: *UiaTestClient, hr: HR) void {
+        self.failure.store(hr, .release);
+        self.state.store(2, .release);
+    }
+
+    fn run(self: *UiaTestClient) void {
+        const initialized = w32.CoInitializeEx(null, 0); // COINIT_MULTITHREADED
+        if (initialized < 0) return self.fail(initialized);
+        defer w32.CoUninitialize();
+        var automation: ?*anyopaque = null;
+        var hr = w32.CoCreateInstance(&clsid_automation, null, w32.CLSCTX_INPROC_SERVER, &iid_automation, &automation);
+        const client = automation orelse return self.fail(if (hr < 0) hr else E_POINTER);
+        defer _ = unknownRelease(client);
+        var root: ?*anyopaque = null;
+        hr = method(client, slot_element_from_handle, *const fn (*anyopaque, w32.HWND, *?*anyopaque) callconv(.winapi) HR)(client, self.hwnd, &root);
+        const element = root orelse return self.fail(if (hr < 0) hr else E_POINTER);
+        defer _ = unknownRelease(element);
+        var desktop_root: ?*anyopaque = null;
+        hr = method(client, slot_root_element, *const fn (*anyopaque, *?*anyopaque) callconv(.winapi) HR)(client, &desktop_root);
+        const desktop = desktop_root orelse return self.fail(if (hr < 0) hr else E_POINTER);
+        defer _ = unknownRelease(desktop);
+        hr = method(client, slot_add_focus_handler, *const fn (*anyopaque, ?*anyopaque, *Handler) callconv(.winapi) HR)(client, null, &self.focus_handler);
+        if (hr < 0) return self.fail(hr);
+        hr = method(client, slot_add_event_handler, *const fn (*anyopaque, i32, *anyopaque, i32, ?*anyopaque, *Handler) callconv(.winapi) HR)(client, element_selected_event, desktop, tree_scope_subtree, null, &self.event_handler);
+        if (hr < 0) {
+            _ = method(client, slot_remove_all, *const fn (*anyopaque) callconv(.winapi) HR)(client);
+            return self.fail(hr);
+        }
+        self.state.store(1, .release);
+        _ = w32.WaitForSingleObject(self.stop_event.?, 0xFFFFFFFF);
+        _ = method(client, slot_remove_all, *const fn (*anyopaque) callconv(.winapi) HR)(client);
+        self.state.store(3, .release);
+    }
+
+    fn method(object: *anyopaque, comptime slot: usize, comptime F: type) F {
+        const vtable: *const [*]const *const anyopaque = @ptrCast(@alignCast(object));
+        return @ptrCast(vtable.*[slot]);
+    }
+    fn unknownRelease(object: *anyopaque) u32 {
+        return method(object, 2, *const fn (*anyopaque) callconv(.winapi) u32)(object);
+    }
+    fn property(element: *anyopaque, id: i32, out: *uia.Variant) HR {
+        return method(element, slot_property, *const fn (*anyopaque, i32, *uia.Variant) callconv(.winapi) HR)(element, id, out);
+    }
+
+    fn queryFocus(handler: *Handler, iid: *const w32.GUID, out: *?*anyopaque) callconv(.winapi) HR {
+        return query(handler, iid, &iid_focus_handler, out);
+    }
+    fn queryEvent(handler: *Handler, iid: *const w32.GUID, out: *?*anyopaque) callconv(.winapi) HR {
+        return query(handler, iid, &iid_event_handler, out);
+    }
+    fn query(handler: *Handler, iid: *const w32.GUID, own: *const w32.GUID, out: *?*anyopaque) HR {
+        if (std.meta.eql(iid.*, own.*) or std.meta.eql(iid.*, iid_unknown) or std.meta.eql(iid.*, iid_agile)) {
+            _ = addRef(handler);
+            out.* = handler;
+            return 0;
+        }
+        out.* = null;
+        return E_NOINTERFACE;
+    }
+    fn addRef(handler: *Handler) callconv(.winapi) u32 {
+        return handler.client.refs.fetchAdd(1, .monotonic) + 1;
+    }
+    fn release(handler: *Handler) callconv(.winapi) u32 {
+        return handler.client.refs.fetchSub(1, .acq_rel) -% 1;
+    }
+    fn handleFocus(handler: *Handler, sender: ?*anyopaque) callconv(.winapi) HR {
+        handler.client.record(.focus, sender);
+        return 0;
+    }
+    fn handleEvent(handler: *Handler, sender: ?*anyopaque, event_id: i32) callconv(.winapi) HR {
+        if (event_id == element_selected_event) handler.client.record(.selected, sender);
+        return 0;
+    }
+
+    /// On a UI Automation thread: keep the sender's name if it is an
+    /// element of this process.
+    fn record(self: *UiaTestClient, kind: Kind, sender: ?*anyopaque) void {
+        const element = sender orelse return;
+        var pid: uia.Variant = .{};
+        if (property(element, 30002, &pid) < 0) return;
+        defer _ = VariantClear(&pid);
+        if (pid.tag != 3 or @as(u32, @bitCast(@as(i32, @truncate(pid.data.integer)))) != GetCurrentProcessId()) return;
+        var name: uia.Variant = .{};
+        if (property(element, 30005, &name) < 0) return;
+        defer _ = VariantClear(&name);
+        var event: Event = .{ .kind = kind };
+        if (name.tag == 8) if (name.data.pointer) |pointer| {
+            const text: [*]const u16 = @ptrCast(@alignCast(pointer));
+            event.len = @min(SysStringLen(text), event.name.len);
+            @memcpy(event.name[0..event.len], text[0..event.len]);
+        };
+        std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.lock);
+        defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.lock);
+        if (self.count < self.events.len) {
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+    }
+
+    /// What `pump` and popups need of an App: the real UI Automation API and
+    /// queue (on a message-only window of the test thread), its popup
+    /// registry, and one window the attachment of the popups resolves to.
+    pub const AppFixture = struct {
+        app: App,
+        window: @import("../Window.zig"),
+        windows: [1]*@import("../Window.zig"),
+        queue_hwnd: w32.HWND,
+
+        pub fn init(self: *AppFixture, attachment: @import("../../../gx/ui_ref.zig").Attachment) !void {
+            const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+            self.queue_hwnd = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+            errdefer _ = w32.DestroyWindow(self.queue_hwnd);
+            self.app = .{
+                .core_app = undefined,
+                .config = undefined,
+                .hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed,
+                .default_command_arena = undefined,
+                .ui_ids = .{ .epoch = attachment.owner.epoch },
+            };
+            const api = try uia.Api.load(std.heap.page_allocator);
+            errdefer api.release();
+            self.app.uia_api = api;
+            self.app.uia_queue = try uia.Queue.create(std.heap.page_allocator, self.queue_hwnd);
+            self.window = .{ .app = &self.app, .ui_reference = attachment.object, .ui_attachment = attachment };
+            self.windows = .{&self.window};
+            self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len };
+        }
+
+        pub fn deinit(self: *AppFixture) void {
+            self.app.uia_popups.deinit();
+            if (self.app.uia_queue) |queue| queue.release();
+            if (self.app.uia_api) |api| api.release();
+            _ = w32.DestroyWindow(self.queue_hwnd);
+        }
+    };
+};
+
+/// A popup widget publishing through the real `PopupBridge`: a check box and
+/// a button that take the focus (`focus` names one by token), and a list the
+/// keyboard selects in while the focus stays (`selected`).
+const ClientWidget = struct {
+    attachment: @import("../../../gx/ui_ref.zig").Attachment,
+    focus: u64 = 10,
+    selected: u64 = 30,
+    label: []const u8 = "Remember",
+
+    fn paint(_: *anyopaque, _: *Popup, _: *d2d.Canvas) void {}
+    fn live(_: *anyopaque) bool {
+        return true;
+    }
+    fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+        return true;
+    }
+    fn build(context: *anyopaque, popup: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+        const self: *ClientWidget = @ptrCast(@alignCast(context));
+        const nodes = [_]uia.NodeSpec{
+            .{ .id = 1, .name = "Widget", .role = .window, .patterns = .{ .window = true } },
+            .{ .id = 2, .parent = 0, .name = self.label, .role = .checkbox, .patterns = .{ .toggle = true }, .focusable = true, .focused = self.focus == 10 },
+            .{ .id = 3, .parent = 0, .name = "OK", .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = self.focus == 20 },
+            .{ .id = 4, .parent = 0, .name = "Results", .role = .list, .patterns = .{ .selection = true }, .selection_required = true },
+            .{ .id = 5, .parent = 3, .name = "Split Left", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = self.selected == 30 },
+            .{ .id = 6, .parent = 3, .name = "Split Right", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = self.selected == 31 },
+        };
+        // A publication that moved the selection of the shown list raises
+        // its ElementSelected event (`PopupBridge.trackSelection`).
+        try bridge.publish(api, queue, self.attachment, popup.hwnd.?, &nodes, &.{ 0, 10, 20, 29, 30, 31 }, .{ .context = self, .is_live = live, .action = action });
+    }
+};
+
+test "UIA a real UI Automation client hears a popup's focus moves and selections" {
+    // IUIAutomation in this process subscribes to focus changed events and to
+    // the ElementSelected events under a popup window that is never shown.
+    // Tab moves the focus within the published snapshot, a model change that
+    // also moves it publishes a new one, and the keyboard selects in a list
+    // while the focus stays: each is heard once, from the element it is about.
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    var fixture: UiaTestClient.AppFixture = undefined;
+    try fixture.init(attachment);
+    defer fixture.deinit();
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(std.testing.allocator);
+    defer factory.destroy();
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    var widget: ClientWidget = .{ .attachment = attachment };
+    var popup: Popup = .{};
+    defer popup.destroy();
+    try popup.create(hinstance, owner, factory, .{}, .{
+        .ctx = &widget,
+        .paint = ClientWidget.paint,
+        .uia_source = .{ .app = &fixture.app, .build = ClientWidget.build, .is_live = ClientWidget.live, .action = ClientWidget.action },
+    });
+    // Never shown: a hidden window that counts as shown.
+    popup.visible = true;
+    const client = try UiaTestClient.create(popup.hwnd.?);
+    defer client.destroy(&fixture.app);
+    try client.ready(&fixture.app);
+    // What came with the first publication is not looked at.
+    client.settle(&fixture.app, 200);
+    client.clear();
+    // Tab: the focus moves within the snapshot.
+    widget.focus = 20;
+    popup.focusMoved();
+    try client.expect(&fixture.app, .focus, "OK");
+    // A model change that moves the focus too: a new snapshot reports it.
+    client.clear();
+    widget.focus = 10;
+    widget.label = "Remember me";
+    popup.invalidate();
+    popup.paint(popup.hwnd.?);
+    try client.expect(&fixture.app, .focus, "Remember me");
+    // The keyboard selects another result while the focus stays.
+    client.clear();
+    widget.selected = 31;
+    popup.invalidate();
+    popup.paint(popup.hwnd.?);
+    try client.expect(&fixture.app, .selected, "Split Right");
+    // Published again unchanged: neither is announced a second time.
+    popup.invalidate();
+    popup.paint(popup.hwnd.?);
+    client.settle(&fixture.app, 100);
+    try std.testing.expectEqual(@as(usize, 1), client.times(.selected, "Split Right"));
+    try std.testing.expect(!client.saw(.focus, "Remember me"));
+    popup.visible = false;
+}
+
+/// The faces of a published element as a UI Automation client holds them:
+/// IRawElementProviderSimple (`faces[0]`) and, on the root, the fragment
+/// root (`faces[2]`).
+const FaceProbe = struct {
+    const Simple = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+        GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
+        GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
+    };
+    const Root = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ElementProviderFromPoint: *const fn (*uia.Face, f64, f64, *?*uia.Face) callconv(.winapi) i32,
+        GetFocus: *const fn (*uia.Face, *?*uia.Face) callconv(.winapi) i32,
+    };
+    /// UIA_E_ELEMENTNOTAVAILABLE: the element was revoked.
+    const unavailable: i32 = @bitCast(@as(u32, 0x80040201));
+
+    fn simple(face: *uia.Face) *const Simple {
+        return @ptrCast(@alignCast(face.vtable));
+    }
+    fn retain(face: *uia.Face) void {
+        _ = simple(face).AddRef(face);
+    }
+    fn release(face: *uia.Face) void {
+        _ = simple(face).Release(face);
+    }
+    /// ProviderOptions: S_OK while the element is usable.
+    fn options(face: *uia.Face) i32 {
+        var value: u32 = 0;
+        return simple(face).ProviderOptions(face, &value);
+    }
+    /// UIA_HasKeyboardFocusPropertyId.
+    fn hasFocus(face: *uia.Face) !bool {
+        var value: uia.Variant = .{};
+        try std.testing.expectEqual(@as(i32, 0), simple(face).GetPropertyValue(face, 30008, &value));
+        try std.testing.expectEqual(@as(u16, 11), value.tag);
+        return value.data.integer != 0;
+    }
+    /// The element the root reports focused, released again.
+    fn rootFocus(root: *uia.Face) !?*uia.Face {
+        const table: *const Root = @ptrCast(@alignCast(root.vtable));
+        var focused: ?*uia.Face = null;
+        try std.testing.expectEqual(@as(i32, 0), table.GetFocus(root, &focused));
+        const face = focused orelse return null;
+        _ = table.Release(face);
+        return face;
+    }
+};
+
+/// A popup widget publishing through the real `PopupBridge`: a window with
+/// two focusable elements (tokens 10 and 20), the focus on `focus`.
+const FocusWidget = struct {
+    focus: u64 = 10,
+    attachment: @import("../../../gx/ui_ref.zig").Attachment,
+
+    fn paint(_: *anyopaque, _: *Popup, _: *d2d.Canvas) void {}
+    fn live(_: *anyopaque) bool {
+        return true;
+    }
+    fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+        return true;
+    }
+    fn build(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+        const self: *FocusWidget = @ptrCast(@alignCast(context));
+        const nodes = [_]uia.NodeSpec{
+            .{ .id = 1, .name = "Dialog", .role = .window, .patterns = .{ .window = true } },
+            .{ .id = 2, .parent = 0, .name = "Remember", .role = .checkbox, .patterns = .{ .toggle = true }, .focusable = true, .focused = self.focus == 10 },
+            .{ .id = 3, .parent = 0, .name = "OK", .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = self.focus == 20 },
+        };
+        try bridge.publish(api, queue, self.attachment, @ptrFromInt(1), &nodes, &.{ 0, 10, 20 }, .{ .context = self, .is_live = FocusWidget.live, .action = FocusWidget.action });
+    }
+};
+
+test "UIA a focus move keeps the popup's elements and reports the new focus" {
+    // The real provider faces: HasKeyboardFocus of the element that had the
+    // focus and of the one that has it now, and the root's GetFocus. Both
+    // elements stay usable. No HWND, desktop or UIAutomationCore is involved.
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    var app: App = undefined;
+    app.uia_api = &api;
+    app.uia_queue = &queue;
+    app.drop_closing = false;
+    app.uia_popups = .{};
+    var widget: FocusWidget = .{ .attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    } };
+    var popup: Popup = .{ .visible = true, .uia_layout_pending = false, .callbacks = .{
+        .ctx = &widget,
+        .paint = FocusWidget.paint,
+        .uia_source = .{ .app = &app, .build = FocusWidget.build, .is_live = FocusWidget.live, .action = FocusWidget.action },
+    } };
+    defer popup.destroy();
+    popup.uiaRefresh();
+    const snapshot = popup.uia_view.publisher.current.?;
+    const remember = &snapshot.nodes[1].faces[0];
+    const ok = &snapshot.nodes[2].faces[0];
+    const root = &snapshot.nodes[0].faces[2];
+    for ([_]*uia.Face{ remember, ok, root }) |face| FaceProbe.retain(face);
+    defer for ([_]*uia.Face{ remember, ok, root }) |face| FaceProbe.release(face);
+    try testing.expect(try FaceProbe.hasFocus(remember));
+    try testing.expect(!try FaceProbe.hasFocus(ok));
+    try testing.expect((try FaceProbe.rootFocus(root)).?.node == remember.node);
+    // The focus moves on (Tab, an arrow key, WM_SETFOCUS): nothing else changed.
+    widget.focus = 20;
+    popup.onFocus(@ptrFromInt(1), true);
+    try testing.expectEqual(@as(i32, 0), FaceProbe.options(remember));
+    try testing.expectEqual(@as(i32, 0), FaceProbe.options(ok));
+    try testing.expect(!try FaceProbe.hasFocus(remember));
+    try testing.expect(try FaceProbe.hasFocus(ok));
+    try testing.expect((try FaceProbe.rootFocus(root)).?.node == ok.node);
+    try testing.expectEqual(snapshot, popup.uia_view.publisher.current.?);
+    // And away from both elements (the popup lost the focus).
+    widget.focus = 0;
+    popup.onFocus(@ptrFromInt(1), false);
+    try testing.expectEqual(@as(i32, 0), FaceProbe.options(ok));
+    try testing.expect(!try FaceProbe.hasFocus(remember));
+    try testing.expect(!try FaceProbe.hasFocus(ok));
+    try testing.expect(try FaceProbe.rootFocus(root) == null);
+}
+
+/// A widget whose accessible model comes from its last paint, as the hit
+/// rectangles of the settings do: two of the three rows show, from `scroll`
+/// on. The tokens are positions and the keys the rows (`publishKeyed`); a
+/// paint that laid the rows out otherwise than the published model revokes
+/// it (`uiaLayoutChanged`), as `Settings.checkUiaHits` does.
+const PaintWidget = struct {
+    attachment: @import("../../../gx/ui_ref.zig").Attachment,
+    /// The row with the focus, and the first row shown.
+    focus: usize = 0,
+    scroll: usize = 0,
+    /// The first row the last paint laid out, and the one the published
+    /// model shows.
+    laid: usize = 0,
+    published: ?usize = null,
+
+    const row_names = [_][]const u8{ "Font", "Theme", "Cursor" };
+
+    fn paint(context: *anyopaque, popup: *Popup, _: *d2d.Canvas) void {
+        const self: *PaintWidget = @ptrCast(@alignCast(context));
+        self.laid = self.scroll;
+        const published = self.published orelse return;
+        if (published == self.laid) return;
+        self.published = null;
+        popup.uiaLayoutChanged();
+    }
+    fn live(_: *anyopaque) bool {
+        return true;
+    }
+    fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+        return true;
+    }
+    fn build(context: *anyopaque, popup: *Popup, bridge: *uia_bridge.PopupBridge, api: *uia.Api, queue: *uia.Queue) anyerror!void {
+        const self: *PaintWidget = @ptrCast(@alignCast(context));
+        var nodes: [3]uia.NodeSpec = undefined;
+        var keys: [3]u64 = @splat(0);
+        nodes[0] = .{ .id = 1, .name = "Settings", .role = .window, .patterns = .{ .window = true } };
+        for (1..3) |slot| {
+            const row = self.laid + slot - 1;
+            nodes[slot] = .{ .id = @intCast(slot + 1), .parent = 0, .name = row_names[row], .role = .checkbox, .patterns = .{ .toggle = true }, .focusable = true, .focused = self.focus == row };
+            keys[slot] = 100 + @as(u64, @intCast(row));
+        }
+        const published = bridge.publisher.current;
+        try bridge.publishKeyed(api, queue, self.attachment, popup.hwnd.?, &nodes, &.{ 0, 1, 2 }, &keys, .{ .context = self, .is_live = PaintWidget.live, .action = PaintWidget.action });
+        if (bridge.publisher.current != published) self.published = self.laid;
+    }
+};
+
+test "UIA a real UI Automation client hears a focus move at the paint that shows it" {
+    // The settings move the keyboard focus with the arrow keys and report it
+    // after the paint that scrolls it into view (`focusMovedAtPaint`). A move
+    // that kept the layout is heard in place and the elements the client
+    // holds stay usable; one that scrolled revokes them, and the publication
+    // of the new layout is heard from the element that has the focus now.
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    var fixture: UiaTestClient.AppFixture = undefined;
+    try fixture.init(attachment);
+    defer fixture.deinit();
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(std.testing.allocator);
+    defer factory.destroy();
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    var widget: PaintWidget = .{ .attachment = attachment };
+    var popup: Popup = .{};
+    defer popup.destroy();
+    try popup.create(hinstance, owner, factory, .{}, .{
+        .ctx = &widget,
+        .paint = PaintWidget.paint,
+        .uia_source = .{ .app = &fixture.app, .build = PaintWidget.build, .is_live = PaintWidget.live, .action = PaintWidget.action },
+    });
+    // Never shown: a hidden window that counts as shown.
+    popup.visible = true;
+    const client = try UiaTestClient.create(popup.hwnd.?);
+    defer client.destroy(&fixture.app);
+    try client.ready(&fixture.app);
+    client.settle(&fixture.app, 200);
+    client.clear();
+    const first = popup.uia_view.publisher.current.?;
+    const font = &first.nodes[1].faces[0];
+    FaceProbe.retain(font);
+    defer FaceProbe.release(font);
+    // Down to the next row, shown already: reported in place.
+    widget.focus = 1;
+    popup.focusMovedAtPaint();
+    popup.paint(popup.hwnd.?);
+    try client.expect(&fixture.app, .focus, "Theme");
+    try std.testing.expectEqual(first, popup.uia_view.publisher.current.?);
+    try std.testing.expectEqual(@as(i32, 0), FaceProbe.options(font));
+    try std.testing.expect(!try FaceProbe.hasFocus(font));
+    // Down to the row below the view: the paint scrolls, the elements the
+    // client holds would name other rows now, and the new layout is
+    // published with the focus.
+    client.clear();
+    widget.focus = 2;
+    widget.scroll = 1;
+    popup.focusMovedAtPaint();
+    popup.paint(popup.hwnd.?);
+    try client.expect(&fixture.app, .focus, "Cursor");
+    try std.testing.expect(popup.uia_view.publisher.current.? != first);
+    try std.testing.expectEqual(FaceProbe.unavailable, FaceProbe.options(font));
+    popup.visible = false;
 }
 
 test "opening ready waits for synchronous show and a current-size DPI frame" {

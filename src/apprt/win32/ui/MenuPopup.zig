@@ -1323,9 +1323,10 @@ const Level = struct {
         if (self.hot == item and self.hot_keyboard == by_keyboard) return;
         self.hot = item;
         self.hot_keyboard = by_keyboard;
-        // Highlight/focus alone keeps item tokens stable. ensureVisible still
-        // invalidates when it actually scrolls the layout.
-        self.popup.repaint();
+        // Highlight/focus alone keeps item tokens stable: the item the
+        // keyboard highlights has the focus, reported in place.
+        // ensureVisible still invalidates when it actually scrolls.
+        self.popup.focusMoved();
     }
 
     /// Highlight `item` from the keyboard and scroll it into view.
@@ -1589,6 +1590,77 @@ test "UIA menu focus preserves Invoke unless revealing the row scrolls layout" {
         popup.hide();
         try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
     }
+}
+
+test "UIA a real UI Automation client hears the menu's arrow keys move the focus" {
+    // The root menu is never activated: the keyboard focus that Up and Down
+    // move is only what UI Automation reports. The item the keyboard
+    // highlights gets HasKeyboardFocus in place, and a client subscribed to
+    // focus changed events, as Narrator is, hears each one. The popup is a
+    // real, never shown window; its rows are laid out by hand.
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    var fixture: Popup.UiaTestClient.AppFixture = undefined;
+    try fixture.init(attachment);
+    defer fixture.deinit();
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(owner);
+    var items = [_]Item{ .{ .id = 1, .label = "New Tab" }, .{ .id = 2, .label = "New Window" }, .{ .id = 3, .label = "Settings" } };
+    var list: List = .{ .items = .{ .items = &items, .capacity = items.len } };
+    var rows = [_]Row{ .{ .top = 0, .height = 20 }, .{ .top = 20, .height = 20 }, .{ .top = 40, .height = 20 } };
+    var popup: Popup = .{};
+    var state: State = undefined;
+    state.host.app = &fixture.app;
+    state.uia_attachment = attachment;
+    state.depth = 1;
+    state.result = .open;
+    state.levels[0] = .{
+        .state = &state,
+        .index = 0,
+        .popup = &popup,
+        .list = &list,
+        .parent_item = null,
+        .rows = &rows,
+        .content_px = 60,
+        .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = 60 },
+    };
+    const level = &state.levels[0];
+    const NoPaint = struct {
+        fn paint(_: *anyopaque, _: *Popup, _: *d2d.Canvas) void {}
+    };
+    try popup.create(hinstance, owner, factory, .{ .activate = false }, .{
+        .ctx = level,
+        .paint = NoPaint.paint,
+        .uia_source = .{ .app = &fixture.app, .build = Level.uiaBuild, .is_live = Level.uiaLive, .action = Level.uiaAction },
+    });
+    defer popup.destroy();
+    popup.visible = true;
+    current = &state;
+    defer current = null;
+    // Opened from the keyboard: the first item has the focus.
+    level.hot = 0;
+    level.hot_keyboard = true;
+    const client = try Popup.UiaTestClient.create(popup.hwnd.?);
+    defer client.destroy(&fixture.app);
+    try client.ready(&fixture.app);
+    client.settle(&fixture.app, 200);
+    client.clear();
+    const snapshot = popup.uia_view.publisher.current.?;
+    // Down, Down.
+    level.select(1);
+    try client.expect(&fixture.app, .focus, "New Window");
+    level.select(2);
+    try client.expect(&fixture.app, .focus, "Settings");
+    // The items the client holds stay valid: nothing was published anew.
+    try testing.expectEqual(snapshot, popup.uia_view.publisher.current.?);
+    popup.visible = false;
 }
 
 const State = struct {

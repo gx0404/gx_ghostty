@@ -842,8 +842,9 @@ fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
 fn showUiaFocus(self: *Settings) void {
     self.focus_visible = true;
     // Focus rings do not change the hit-token mapping. Earlier helpers may
-    // have committed an edit and invalidated it; repaint must not undo that.
-    self.popup.repaint();
+    // have committed an edit and invalidated it; reporting the focus must
+    // not undo that.
+    self.popup.focusMoved();
 }
 
 test "UIA settings focus preserves the retained Toggle provider until a model edit" {
@@ -1567,7 +1568,7 @@ fn focusSearch(self: *Settings, select: bool) void {
     self.text_field = .search;
     if (select) self.popup.input.anchor = 0;
     self.stopTimer(.preview);
-    self.popup.repaint();
+    self.popup.focusMoved();
 }
 
 fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
@@ -1616,7 +1617,7 @@ fn beginSizeEdit(self: *Settings, text: []const u8, select: bool) void {
     self.text_field = .font_size;
     self.popup.input.setText(self.alloc, text) catch {};
     if (select) self.popup.input.anchor = 0;
-    self.popup.repaint();
+    self.popup.focusMoved();
 }
 
 /// Stops typing the font size, applying a valid size when `apply`.
@@ -2246,7 +2247,10 @@ fn moveFocus(self: *Settings, rows: []const Row, delta: isize) void {
     self.reveal_focus = true;
     if (i == 0 or firstFocusableBefore(rows, @intCast(i)) == null) self.body_scroll = 0;
     self.syncTextField();
-    self.invalidate();
+    // The paint reveals the row: the focus is reported in place after it
+    // when that kept the layout, else the paint publishes it anew
+    // (`checkUiaHits`).
+    self.popup.focusMovedAtPaint();
 }
 
 fn firstFocusableBefore(rows: []const Row, end: usize) ?usize {
@@ -3294,7 +3298,7 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
     }
     // A focus move or the pressed look only changes what is drawn; model
     // edits (a stepped size, a committed edit) invalidated themselves.
-    self.popup.repaint();
+    self.popup.focusMoved();
 }
 
 /// The left button went up over `target`, where it went down.
