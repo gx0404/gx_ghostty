@@ -328,7 +328,7 @@ def shell_main(directory: Path, token: str) -> int:
         stimulus.append_json(receipt, dict(event=event, pid=os.getpid(), token=token,
             qpc_ns=time.perf_counter_ns(), write_begin_qpc_ns=begin,
             written_bytes=offset, payload_hex=payload.hex(), **fields))
-    emit('ready', READY, executable=sys.executable)
+    emit('ready', READY, **stimulus.python_identity())
     seen = set()
     while True:
         for path in sorted(directory.glob('command-*.json')):
@@ -346,7 +346,7 @@ def shell_main(directory: Path, token: str) -> int:
 
 class OwnedFontShell(stimulus.OwnedShells):
     def config(self) -> str:
-        argv = [sys.executable, '-I', str(Path(__file__).resolve()), '--shell',
+        argv = [self.python_identity['executable'], '-I', str(Path(__file__).resolve()), '--shell',
                 str(self.directory.resolve()), '--token', self.token]
         # -I excludes the script directory from imports; shell bootstrap below restores it.
         return ('command = ' + subprocess.list2cmdline(argv) + '\n'
@@ -374,7 +374,9 @@ def measure(gui, instance, capture, args, counters, shell):
         default_user_path='not measured: GX CJK codepoint overrides explicitly reset in both arms',
         visual_review='PENDING', cache_scope='fresh process; OS font cache uncontrolled, AB/BA alternation',
         source=report['font_build'], shell_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        python_sha256=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
+        python=shell.python_identity['executable'], python_sha256=shell.python_identity['executable_sha256'],
+        python_launcher=shell.python_identity['launcher'],
+        python_launcher_sha256=shell.python_identity['launcher_sha256'],
         commit_source='native GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS_EX.PrivateUsage')
     startup_guard(report, capture.target, collect=True)
     perf.wait_until(lambda: shell.ready(gui, instance, 1), 'C6 owned ASCII shell ready')

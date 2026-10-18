@@ -133,6 +133,8 @@ class C6FormalTests(unittest.TestCase):
             capture = gx_perf.CaptureRun(instance, root, dict(font_build={}, pid=instance.pid,
                 creation=instance.creation, startup_ms=marks))
             shell = mock.Mock()
+            shell.python_identity = dict(executable="actual.exe", executable_sha256="a" * 64,
+                                         launcher="launcher.exe", launcher_sha256="b" * 64)
             shell.identities = {12: 34}
             shell.ready.return_value = True
             shell.rows.return_value = [dict(event='ready', payload_hex=font.READY.hex(), written_bytes=len(font.READY))]
@@ -264,6 +266,8 @@ class C6FormalTests(unittest.TestCase):
         for completed in (True, False):
             with self.subTest(completed=completed), tempfile.TemporaryDirectory() as tmp:
                 shell = mock.Mock()
+                shell.python_identity = dict(executable="actual.exe", executable_sha256="a" * 64,
+                                             launcher="launcher.exe", launcher_sha256="b" * 64)
                 shell.identities = {12: 34}
                 shell.ready.return_value = True
                 shell.rows.return_value = [dict(event='ready', payload_hex=font.READY.hex(), written_bytes=len(font.READY))]
@@ -291,6 +295,10 @@ class C6FormalTests(unittest.TestCase):
                         font.measure(None, instance, capture, object(), counters, shell)
                         capture.add.assert_any_call(font.METRIC, 2.5, 'ms')
                         capture.add.assert_any_call('process.commit.delta', 1000)
+                        self.assertEqual(capture.report['c6']['python'], 'actual.exe')
+                        self.assertEqual(capture.report['c6']['python_sha256'], 'a' * 64)
+                        self.assertEqual(capture.report['c6']['python_launcher'], 'launcher.exe')
+                        self.assertEqual(capture.report['c6']['python_launcher_sha256'], 'b' * 64)
                         self.assertEqual(capture.report['c6']['coverage'], 'captured')
                         self.assertEqual(capture.report['c6']['visual_review'], 'PENDING')
                     else:

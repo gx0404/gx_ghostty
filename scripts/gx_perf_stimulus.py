@@ -532,6 +532,36 @@ def kitty_animation_payload() -> bytes:
     return b''.join(b'\x1b_G' + cmd.encode('ascii') + b'\x1b\\' for cmd in commands)
 
 
+def current_python_image() -> str:
+    """Resolve this running interpreter, never a PATH search or a base-path hint."""
+    path = sys.executable
+    if sys.platform == 'win32':
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        filename = kernel.GetModuleFileNameW
+        filename.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        filename.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = filename(None, buffer, len(buffer))
+        # GetModuleFileNameW counts UTF-16 code units, not Python code points.
+        units = len(buffer.value.encode('utf-16-le')) // 2
+        if not 0 < length < len(buffer) or length != units:
+            raise ValueError('cannot resolve current Python process image')
+        path = buffer.value
+    if not path or not Path(path).is_absolute():
+        raise ValueError('current Python process image path is empty or relative')
+    image = Path(path).resolve(strict=True)
+    if not image.is_file():
+        raise ValueError('current Python process image is not a file')
+    return str(image)
+
+
+def python_identity() -> dict:
+    image = current_python_image()
+    return dict(executable=image, executable_sha256=hashlib.sha256(Path(image).read_bytes()).hexdigest(),
+                launcher=sys.executable,
+                launcher_sha256=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest())
+
+
 def shell_main(directory: Path, token: str) -> int:
     """Polling affects this owned helper, not the measured Ghostty CPU counter."""
     import msvcrt
@@ -542,7 +572,7 @@ def shell_main(directory: Path, token: str) -> int:
         append_json(receipt, dict(event=event, pid=pid, token=token,
                                  time_ns=time.time_ns(), qpc_ns=time.perf_counter_ns(), **fields))
     os.write(sys.stdout.fileno(), b'GX C7 owned console\r\n')
-    record('ready', executable=sys.executable)
+    record('ready', **python_identity())
     seen = set()
     while True:
         while msvcrt.kbhit():
@@ -574,6 +604,7 @@ def shell_main(directory: Path, token: str) -> int:
 
 class OwnedShells:
     def __init__(self, directory: Path):
+        self.python_identity = python_identity()
         self.directory = directory
         directory.mkdir()
         self.token = uuid.uuid4().hex
@@ -582,7 +613,7 @@ class OwnedShells:
     def config(self) -> str:
         # Exec.execCommand parses Windows shell-form argv without cmd.exe /c.
         # direct: naively splits spaces, so cannot represent these quoted paths.
-        argv = [sys.executable, str(Path(__file__).resolve()), '--shell',
+        argv = [self.python_identity['executable'], str(Path(__file__).resolve()), '--shell',
                 str(self.directory.resolve()), '--token', self.token]
         return 'command = ' + subprocess.list2cmdline(argv) + '\n'
 
@@ -600,14 +631,19 @@ class OwnedShells:
         for row in ready:
             pid = row['pid']
             birth = w.process_creation(pid)
-            if not instance.contains_pid(pid) or birth is None or not gui.same_path(w.process_image(pid) or '', sys.executable):
+            image = self.python_identity['executable']
+            if (not instance.contains_pid(pid) or birth is None or
+                    not gui.same_path(w.process_image(pid) or '', image) or
+                    not gui.same_path(row.get('executable') or '', image) or
+                    row.get('executable_sha256') != self.python_identity['executable_sha256']):
                 raise ValueError('stimulus shell identity is not an owned Python descendant')
             self.identities[pid] = birth
         return True
 
     def verify(self, gui, instance):
         for pid, birth in self.identities.items():
-            if (not instance.contains_pid(pid) or gui.win32().process_creation(pid) != birth):
+            if (not instance.contains_pid(pid) or gui.win32().process_creation(pid) != birth or
+                    not gui.same_path(gui.win32().process_image(pid) or '', self.python_identity['executable'])):
                 raise ValueError('stimulus shell ended or changed identity')
 
     def command(self, action: str, **fields) -> dict:

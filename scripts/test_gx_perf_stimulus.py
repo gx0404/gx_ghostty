@@ -23,6 +23,117 @@ def pdh_sample(count=10, stamp=100, tid=7, birth=55, pid=42):
                        for key, value in dict(pid=pid, tid=tid, birth=birth, switches=count).items()}}
 
 
+class PythonImageTests(unittest.TestCase):
+    def native(self, path, result=None):
+        dll = mock.Mock()
+        def filename(module, buffer, size):
+            self.assertIsNone(module)
+            buffer.value = path
+            return len(path.encode('utf-16-le')) // 2 if result is None else result
+        dll.GetModuleFileNameW.side_effect = filename
+        return dll
+
+    def test_native_image_wins_over_launcher_and_base_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / 'actual python.exe'
+            image.write_bytes(b'actual image')
+            with mock.patch.object(sys, 'platform', 'win32'), \
+                 mock.patch.object(sys, 'executable', str(Path(tmp) / 'launcher.exe')), \
+                 mock.patch.object(sys, '_base_executable', 'untrusted-hint.exe', create=True), \
+                 mock.patch.object(ctypes, 'WinDLL', return_value=self.native(str(image)), create=True):
+                self.assertEqual(str(image.resolve()), stimulus.current_python_image())
+
+    def test_native_non_bmp_path_uses_utf16_units(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / 'python-\U0001f680.exe'
+            image.write_bytes(b'actual image')
+            path = str(image)
+            self.assertEqual(len(path.encode('utf-16-le')) // 2, len(path) + 1)
+            with mock.patch.object(sys, 'platform', 'win32'), \
+                 mock.patch.object(ctypes, 'WinDLL', return_value=self.native(path), create=True):
+                self.assertEqual(str(image.resolve()), stimulus.current_python_image())
+            # A count in Python code points is not a valid native receipt.
+            with mock.patch.object(sys, 'platform', 'win32'), \
+                 mock.patch.object(ctypes, 'WinDLL', return_value=self.native(path, len(path)), create=True):
+                with self.assertRaisesRegex(ValueError, 'resolve'):
+                    stimulus.current_python_image()
+
+    def test_native_failure_empty_truncated_relative_or_missing_is_closed(self):
+        for path, result in [('', 0), ('', 1), ('relative.exe', None),
+                             ('missing-python.exe', 32768), ('Z:/absent/python.exe', None)]:
+            with self.subTest(path=path, result=result), \
+                 mock.patch.object(sys, 'platform', 'win32'), \
+                 mock.patch.object(ctypes, 'WinDLL', return_value=self.native(path, result), create=True):
+                with self.assertRaises((ValueError, OSError)):
+                    stimulus.current_python_image()
+        with mock.patch.object(sys, 'platform', 'win32'), \
+             mock.patch.object(ctypes, 'WinDLL', side_effect=OSError('native API failed'), create=True):
+            with self.assertRaises(OSError):
+                stimulus.current_python_image()
+
+    def test_c6_c7_ready_receipts_use_native_identity_without_changing_payload(self):
+        import gx_perf_font as font
+        identity = dict(executable='actual.exe', executable_sha256='a' * 64,
+                        launcher='entry.exe', launcher_sha256='b' * 64)
+        for module, expected in ((stimulus, b'GX C7 owned console\r\n'), (font, font.READY)):
+            with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as tmp, \
+                 mock.patch.dict(sys.modules, {'msvcrt': mock.Mock(kbhit=mock.Mock(return_value=False))}), \
+                 mock.patch.object(module.os, 'O_BINARY', 0x8000, create=True), \
+                 mock.patch.object(stimulus, 'python_identity', return_value=identity), \
+                 mock.patch.object(stimulus, 'append_json') as append, \
+                 mock.patch.object(module.os, 'write', side_effect=lambda fd, data: len(data)) as write, \
+                 mock.patch.object(module.time, 'sleep', side_effect=StopIteration):
+                with self.assertRaises(StopIteration):
+                    module.shell_main(Path(tmp), 'owned-token')
+                self.assertEqual(write.call_args.args[1], expected)
+                row = append.call_args.args[1]
+                self.assertEqual(row['event'], 'ready')
+                self.assertEqual(row['token'], 'owned-token')
+                for key, value in identity.items():
+                    self.assertEqual(row[key], value)
+
+    def test_c6_c7_launch_hash_and_receipt_bind_actual_image(self):
+        import gx_perf_font as font
+        with tempfile.TemporaryDirectory() as tmp:
+            image, launcher = Path(tmp) / 'real python.exe', Path(tmp) / 'launcher.exe'
+            image.write_bytes(b'actual'); launcher.write_bytes(b'launcher')
+            with mock.patch.object(sys, 'platform', 'win32'), \
+                 mock.patch.object(sys, 'executable', str(launcher)), \
+                 mock.patch.object(ctypes, 'WinDLL', return_value=self.native(str(image)), create=True):
+                for i, cls in enumerate((stimulus.OwnedShells, font.OwnedFontShell)):
+                    shell = cls(Path(tmp) / str(i))
+                    self.assertIn(subprocess.list2cmdline([str(image.resolve())]), shell.config())
+                    identity = stimulus.python_identity()
+                    self.assertEqual(shell.python_identity, identity)
+                    self.assertNotIn(str(launcher), shell.config())
+                    self.assertEqual(identity['executable_sha256'], stimulus.hashlib.sha256(b'actual').hexdigest())
+                    self.assertEqual(identity['launcher'], str(launcher))
+                    gui, instance = mock.Mock(), mock.Mock()
+                    gui.same_path.side_effect = lambda a, b: a == b
+                    gui.win32().process_image.return_value = str(image.resolve())
+                    gui.win32().process_creation.return_value = 900
+                    instance.contains_pid.return_value = True
+                    row = dict(event='ready', pid=42, token=shell.token, **identity)
+                    with mock.patch.object(shell, 'rows', return_value=[row]):
+                        self.assertTrue(shell.ready(gui, instance, 1))
+                        shell.verify(gui, instance)
+                        for changes in ({'executable': str(launcher)}, {'executable': ''},
+                                        {'executable_sha256': '0' * 64}):
+                            with self.subTest(changes=changes), mock.patch.object(shell, 'rows', return_value=[dict(row, **changes)]):
+                                with self.assertRaisesRegex(ValueError, 'identity'):
+                                    shell.ready(gui, instance, 1)
+                        for image_path, birth, owned in [(str(launcher), 900, True),
+                                                       ('', 900, True), (str(image.resolve()), None, True),
+                                                       (str(image.resolve()), 900, False)]:
+                            gui.win32().process_image.return_value = image_path
+                            gui.win32().process_creation.return_value = birth
+                            instance.contains_pid.return_value = owned
+                            with self.assertRaisesRegex(ValueError, 'identity'):
+                                shell.ready(gui, instance, 1)
+                            with self.assertRaisesRegex(ValueError, 'identity'):
+                                shell.verify(gui, instance)
+
+
 class PdhTests(unittest.TestCase):
     def test_raw_counts_are_joined_by_pid_tid_and_birth(self):
         first, last = pdh_sample(), pdh_sample(31, 200)
@@ -129,7 +240,7 @@ class ShellEvidenceTests(unittest.TestCase):
             self.shells.rows()
 
     def test_shell_ownership_binds_creation_and_image(self):
-        self.receipt(event='ready')
+        self.receipt(event='ready', **self.shells.python_identity)
         gui, instance = mock.Mock(), mock.Mock()
         instance.contains_pid.return_value = True
         gui.same_path.return_value = True

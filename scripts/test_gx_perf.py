@@ -2781,6 +2781,8 @@ class P7C7Tests(unittest.TestCase):
                                     {'capabilities': {'renderer.present': ''}, 'errors': []})
         args = SimpleNamespace(case='output-wakeup', tabs=11, state='visible', seconds=60, output_bytes=4096)
         shells = mock.Mock()
+        shells.python_identity = dict(executable="actual.exe", executable_sha256="a" * 64,
+                                      launcher="launcher.exe", launcher_sha256="b" * 64)
         shells.identities = {42: 123, 43: 124}
         shells.rows.return_value = []
         shells.command.return_value = {'id': 'wakeup', 'bytes': 4096}
@@ -2802,6 +2804,10 @@ class P7C7Tests(unittest.TestCase):
                 mock.patch.object(gx_perf.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0] + n)), \
                 mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]):
             gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells, pdh_factory=lambda: pdh)
+        self.assertEqual(capture.report['c7']['shell_python'], 'actual.exe')
+        self.assertEqual(capture.report['c7']['shell_python_sha256'], 'a' * 64)
+        self.assertEqual(capture.report['c7']['shell_python_launcher'], 'launcher.exe')
+        self.assertEqual(capture.report['c7']['shell_python_launcher_sha256'], 'b' * 64)
         self.assertEqual(61, pdh.sample.call_count)
         self.assertAlmostEqual(33.2, commands[0])
         self.assertEqual([60], capture.samples.values['threads.context_switches.pdh'])
@@ -2816,6 +2822,8 @@ class P7C7Tests(unittest.TestCase):
         capture = gx_perf.CaptureRun(self.instance, self.root, {'capabilities': {'renderer.present': ''}, 'errors': []})
         args = SimpleNamespace(case='visible', tabs=1, state='visible', seconds=2, output_bytes=4096)
         shells = mock.Mock()
+        shells.python_identity = dict(executable="actual.exe", executable_sha256="a" * 64,
+                                      launcher="launcher.exe", launcher_sha256="b" * 64)
         shells.identities, shells.rows.return_value = {42: 123}, []
         before = {'pid': 42, 'birth': 123, 'kernel_100ns': 0, 'user_100ns': 0,
                   'begin_ns': 0, 'end_ns': 1, 'threads': []}
@@ -2856,6 +2864,8 @@ class P7C7Tests(unittest.TestCase):
                     self.instance.input_events = []
                     self.instance.log.write_bytes(b'')
                     shells = mock.Mock()
+                    shells.python_identity = dict(executable="actual.exe", executable_sha256="a" * 64,
+                                                  launcher="launcher.exe", launcher_sha256="b" * 64)
                     shells.config.return_value = ''
                     shells.identities = {42: 123}
                     active = {'candidate': False, 'committed': False}

@@ -2332,7 +2332,10 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
                     'performance_verdict': 'not evaluated', 'visual_review': 'PENDING',
                     'animation_guards': 'separate kitty-animation/custom-shader cells; visual review remains required',
                     'shell_script_sha256': hashlib.sha256(Path(stimulus.__file__).read_bytes()).hexdigest(),
-                    'shell_python': sys.executable, 'shell_python_sha256': hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
+                    'shell_python': shells.python_identity['executable'],
+                    'shell_python_sha256': shells.python_identity['executable_sha256'],
+                    'shell_python_launcher': shells.python_identity['launcher'],
+                    'shell_python_launcher_sha256': shells.python_identity['launcher_sha256'],
                     'pdh': {'source': stimulus.PDH_PATHS, 'status': 'running', 'n': 0, 'unit': ''}}
     evidence = report['c7']
     helper = pdh = None
