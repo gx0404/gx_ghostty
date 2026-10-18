@@ -5,6 +5,7 @@ that only read files. The measurement commands (win32, gtk) need a desktop or WS
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import ctypes
 import io
@@ -244,7 +245,7 @@ class QuietTests(unittest.TestCase):
             self.assertEqual(0, gx_perf.run_quiet(self.args, self.probe, sleeper))
         sleeper.assert_called_once_with(900)
         paths = sorted(self.args.out.glob('attempt-*.json'))
-        self.assertEqual([3, 0], [json.loads(p.read_text())['exit'] for p in paths])
+        self.assertEqual([3, 0], [json.loads(p.read_text(encoding='utf-8'))['exit'] for p in paths])
         with self.assertRaises(gx_perf.PerfError):
             gx_perf.run_quiet(self.args, self.probe, sleeper)
 
@@ -391,13 +392,13 @@ class QuietBatchTests(unittest.TestCase):
             self.assertEqual(0, gx_perf.run_quiet_batch(args, self.probe, run))
         self.probe.input_ticks.assert_called_once()
         for name in ('before', 'after'):
-            data = json.loads((args.out / (name+'.json')).read_text())
+            data = json.loads((args.out / (name+'.json')).read_text(encoding='utf-8'))
             self.assertEqual('all four locks held by this batch', data['checks']['slots']['reason'])
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(('gx-quiet-batch-v2', 'VALID', 'VALID', 'COMPLETE', True, True),
                          (result['schema'], result['status'], result['quiet_status'], result['measurement'],
                           result['quiet_valid'], result['plan_compliant']))
-        self.assertTrue((args.out / 'SUMMARY.txt').read_text().startswith('VALID exit=0 quiet=VALID measurement=COMPLETE'))
+        self.assertTrue((args.out / 'SUMMARY.txt').read_text(encoding='utf-8').startswith('VALID exit=0 quiet=VALID measurement=COMPLETE'))
 
     def test_before_busy_never_runs_command_and_after_busy_invalidates(self):
         args = self.batch_args()
@@ -406,13 +407,13 @@ class QuietBatchTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
         runner.assert_not_called()
-        result = json.loads((args.out/'RESULT.json').read_text())
+        result = json.loads((args.out/'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(('NOT_STARTED', 'NOT_MET', 'NOT_RUN'), (result['status'], result['quiet_status'], result['measurement']))
         args.out = args.out.parent / 'second'
         self.probe.input_ticks.side_effect = [ticks(600), ticks(5)]
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
-        result = json.loads((args.out/'RESULT.json').read_text())
+        result = json.loads((args.out/'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(('INVALID', 'INVALID', 'COMPLETE'), (result['status'], result['quiet_status'], result['measurement']))
         self.assertFalse(result['quiet_valid'])
         self.assertFalse(result['plan_compliant'])
@@ -425,7 +426,7 @@ class QuietBatchTests(unittest.TestCase):
                                      {'win11': {'exists': True, 'owned': True, 'running': True}}]
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
-        result = json.loads((args.out/'RESULT.json').read_text())
+        result = json.loads((args.out/'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(('INVALID', 'quiet_criteria', ['vm']), (result['status'], result['failure_cause'], result['failed_checks']))
 
     def test_uninjected_end_check_rejects_any_input_after_the_start(self):
@@ -441,17 +442,17 @@ class QuietBatchTests(unittest.TestCase):
             with self.subTest(label), mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(0 if valid else 3, gx_perf.run_quiet_batch(args, self.probe, runner))
-                after = json.loads((args.out / 'after.json').read_text())['checks']['input']
+                after = json.loads((args.out / 'after.json').read_text(encoding='utf-8'))['checks']['input']
                 self.assertEqual('pass' if valid else 'fail', after['status'])
                 self.assertEqual(None if valid else 'foreign_input',
-                                 json.loads((args.out / 'RESULT.json').read_text())['failure_cause'])
+                                 json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))['failure_cause'])
                 self.assertEqual(1200, after['raw']['batch_seconds'])
                 self.assertEqual(start, after['raw']['batch_start_tick'])
 
     def run_batch(self, args, runner):
         with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
             code = gx_perf.run_quiet_batch(args, self.probe, runner)
-        return code, json.loads((args.out / 'RESULT.json').read_text())
+        return code, json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
 
     @staticmethod
     def command(code=0, guard=None, **extra):
@@ -477,7 +478,7 @@ class QuietBatchTests(unittest.TestCase):
             with self.subTest(label):
                 exit_code, result = self.run_batch(args, self.command(0))  # zero guard rows: nothing was injected
                 self.assertEqual((expected, status), (exit_code, result['status']))
-                raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
+                raw = json.loads((args.out / 'after.json').read_text(encoding='utf-8'))['checks']['input']['raw']
                 self.assertEqual(('last_input', 'last_input', 0, False, 90), (raw['mode'], raw['fallback'], raw['guards'],
                                                                              raw['injected'], raw['batch_seconds']))
         # A guard that failed before any input was sent also counts as no injection, but it fails the criterion.
@@ -487,7 +488,7 @@ class QuietBatchTests(unittest.TestCase):
         self.probe.input_ticks.return_value = ticks(700)
         exit_code, result = self.run_batch(args, self.command(0, guard='fail', cause='foreground_lost'))
         self.assertEqual((3, 'INVALID'), (exit_code, result['status']))
-        raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
+        raw = json.loads((args.out / 'after.json').read_text(encoding='utf-8'))['checks']['input']['raw']
         self.assertEqual(('guards', False), (raw['mode'], raw['injected']))
 
     def test_preflight_rejects_a_session_that_cannot_see_the_console_user(self):
@@ -581,10 +582,10 @@ class QuietBatchTests(unittest.TestCase):
                                  (exit_code, result['status'], result['quiet_status'], result['measurement']))
                 self.assertEqual(quiet == 'VALID', result['quiet_valid'])
                 self.assertEqual(None if code == 'raise' else code, result['command_exit'])
-        after = json.loads((self.args.out.parent / 'case-4' / 'after.json').read_text())
+        after = json.loads((self.args.out.parent / 'case-4' / 'after.json').read_text(encoding='utf-8'))
         self.assertEqual(('pass', 'last_input'), (after['checks']['input']['status'], after['checks']['input']['raw']['fallback']))
         self.assertNotIn('unverified_checks', after)
-        summary = (self.args.out.parent / 'case-0' / 'SUMMARY.txt').read_text()
+        summary = (self.args.out.parent / 'case-0' / 'SUMMARY.txt').read_text(encoding='utf-8')
         self.assertIn('never rerun to replace it', summary)
 
     def test_guard_evidence_failures_are_invalid_or_tool_errors(self):
@@ -595,11 +596,11 @@ class QuietBatchTests(unittest.TestCase):
                 exit_code, result = self.run_batch(args, self.command(code, guard, cause='foreground_lost'))
                 self.assertEqual((expected, status), (exit_code, result['status']))
         foreign = self.args.out.parent / 'foreign.jsonl'
-        foreign.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'other', 'event': 'guard', 'status': 'pass'}) + '\n')
+        foreign.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'other', 'event': 'guard', 'status': 'pass'}) + '\n', encoding='utf-8')
         with self.assertRaises(gx_perf.PerfError):
             gx_perf.guard_evidence(foreign, 'mine')
         release = self.args.out.parent / 'release.jsonl'
-        release.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'b', 'event': 'release', 'status': 'fail', 'reason': 'UIPI'}) + '\n')
+        release.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'b', 'event': 'release', 'status': 'fail', 'reason': 'UIPI'}) + '\n', encoding='utf-8')
         evidence = gx_perf.guard_evidence(release, 'b')
         self.assertEqual((1, False), (len(evidence['unexplained']), evidence['injected']))
         with self.assertRaisesRegex(gx_perf.PerfError, 'UIPI'):
@@ -639,7 +640,7 @@ class QuietBatchTests(unittest.TestCase):
                                  (exit_code, result['status'], result['failure_cause'], result['quiet_status']))
                 self.assertIn('instance_gone: Ghostty pid 42', ' '.join(result['errors']))
                 self.assertIn('never rerun to replace it', result['guidance'])
-                self.assertIn('failure_cause=instance_gone', (args.out / 'SUMMARY.txt').read_text())
+                self.assertIn('failure_cause=instance_gone', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
 
     def test_environment_causes_are_invalid_and_unknown_causes_are_tool_errors(self):
         sent = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
@@ -666,9 +667,9 @@ class QuietBatchTests(unittest.TestCase):
             with self.subTest(label):
                 exit_code, result = self.run_batch(args, self.audited(code, *rows))
                 self.assertEqual((expected, status, cause), (exit_code, result['status'], result['failure_cause']))
-        after = json.loads((self.args.out.parent / 'idle-foreign-input' / 'after.json').read_text())
+        after = json.loads((self.args.out.parent / 'idle-foreign-input' / 'after.json').read_text(encoding='utf-8'))
         self.assertEqual(('fail', 'foreign_input'), (after['checks']['input']['status'], after['checks']['input']['raw']['cause']))
-        self.assertEqual(['input'], json.loads((self.args.out.parent / 'idle-foreign-input' / 'RESULT.json').read_text())['failed_checks'])
+        self.assertEqual(['input'], json.loads((self.args.out.parent / 'idle-foreign-input' / 'RESULT.json').read_text(encoding='utf-8'))['failed_checks'])
 
     def test_noncompliant_thresholds_mode_mismatch_and_end_check_errors(self):
         args = self.batch_args('--idle-seconds', '5')
@@ -676,7 +677,7 @@ class QuietBatchTests(unittest.TestCase):
         exit_code, result = self.run_batch(args, self.command(0))
         self.assertEqual((5, 'NONCOMPLIANT', 'VALID', False, False),
                          (exit_code, result['status'], result['quiet_status'], result['plan_compliant'], result['thresholds_plan_compliant']))
-        self.assertIn('plan_compliant=false', (args.out / 'SUMMARY.txt').read_text())
+        self.assertIn('plan_compliant=false', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
         self.probe.input_ticks.return_value = ticks(600)
         args = self.batch_args()
         args.out = self.args.out.parent / 'mismatch'
@@ -755,7 +756,7 @@ class ExperimentTests(unittest.TestCase):
         instance = mock.Mock()
         instance.log = self.root/'old.log'
         text = 'info(gx_perf): scrollbar.paint 200us\n'
-        instance.log.write_text(text)
+        instance.log.write_text(text, encoding='utf-8')
         capture = gx_perf.CaptureRun(instance,self.root,{'baseline': True,'diagnostic':False})
         capture.count(text,'scrollbar.paint')
         self.assertEqual([.2],capture.samples.values['scrollbar.paint_time'])
@@ -770,13 +771,13 @@ class ExperimentTests(unittest.TestCase):
     def test_zero_count_requires_hash_bound_support_in_new_arm(self):
         instance = mock.Mock()
         instance.log = self.root/'new.log'
-        instance.log.write_text('')
+        instance.log.write_text('', encoding='utf-8')
         capture = gx_perf.CaptureRun(instance,self.root,{'baseline':False,'diagnostic':False})
         with self.assertRaisesRegex(gx_perf.PerfError,'unproved'):
             capture.count('', 'scrollbar.paint')
         manifest = self.root/'capabilities.json'
         manifest.write_text(json.dumps({'exe_sha256':gx_perf.hashlib.sha256(self.exe.read_bytes()).hexdigest(),
-                                        'metrics':{'scrollbar.paint':''}}))
+                                        'metrics':{'scrollbar.paint':''}}), encoding='utf-8')
         capabilities=gx_perf.metric_capabilities(['new:'+str(manifest)],['new'],[self.exe])
         capture.report['capabilities']=capabilities['new']
         capture.count('', 'scrollbar.paint')
@@ -788,7 +789,7 @@ class ExperimentTests(unittest.TestCase):
     def test_p4_old_without_metrics_completes_but_new_uses_ready_not_total(self):
         instance = mock.Mock()
         instance.log=self.root/'blank.log'
-        instance.log.write_text('')
+        instance.log.write_text('', encoding='utf-8')
         capture=gx_perf.CaptureRun(instance,self.root,{'baseline':True,'diagnostic':False})
         with mock.patch.object(gx_perf,'open_ui'),mock.patch.object(gx_perf,'close_ui'),mock.patch.object(capture,'drain'),mock.patch.object(gx_perf.time,'sleep'):
             gx_perf.measure_ui(mock.Mock(),instance,capture,self.args())
@@ -816,7 +817,7 @@ class ExperimentTests(unittest.TestCase):
                     capture.add(ui+'.profiles.path_scan',0)
         with mock.patch.object(gx_perf,'measure_ui',side_effect=measure),mock.patch.object(gx_perf.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0,gx_perf.run_experiment(args,gui))
-        result=json.loads((args.out/'RESULT.json').read_text())
+        result=json.loads((args.out/'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(['old','new','new','old'],[row['label'] for row in result['runs']])
         self.assertEqual(0,result['metrics']['old']['menu.open.ready']['n'])
         self.assertEqual(2,result['metrics']['new']['menu.open.ready']['n'])
@@ -836,16 +837,16 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(4, gx_perf.run_experiment(args, gui))
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual((True, True, 4), (result['valid'], result['gate_failed'], result['exit']))
         self.assertEqual('FAIL', result['runs'][0]['absolute_gate']['status'])
-        self.assertIn('complete; absolute gate FAIL observed; exit 4', (args.out / 'SUMMARY.txt').read_text())
+        self.assertIn('complete; absolute gate FAIL observed; exit 4', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
         args = self.args('win32-ui', '--runs', '2')
         args.out = self.root / 'incomplete'
         with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1, gx_perf.run_experiment(args, gui))
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual((False, True, 1), (result['valid'], result['gate_failed'], result['exit']))
 
     def test_comparison_keeps_each_arms_own_reason_for_absent_metrics(self):
@@ -861,10 +862,10 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'measure_idle', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, gx_perf.run_experiment(args, gui, counters_factory=mock.Mock()))
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual('partial', result['comparison']['threads.context_switches']['new']['status'])
         self.assertEqual('no_samples', result['comparison']['process.cpu']['new']['status'])
-        self.assertIn('threads.context_switches unit=count n=0 partial', (args.out / 'SUMMARY.txt').read_text())
+        self.assertIn('threads.context_switches unit=count n=0 partial', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
 
     def test_driver_records_the_failure_cause_of_a_run(self):
         import gx_win_gui as real
@@ -872,16 +873,16 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'measure_ui', side_effect=real.InputBlocked('Ghostty 实例 1 已结束', cause='instance_gone')), \
                 mock.patch.object(gx_perf.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1, gx_perf.run_experiment(args, gui))
-        self.assertEqual('instance_gone', json.loads((args.out / 'build/run-01/run.json').read_text())['failure_cause'])
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual('instance_gone', json.loads((args.out / 'build/run-01/run.json').read_text(encoding='utf-8'))['failure_cause'])
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual((['instance_gone'], 'instance_gone'), (result['failure_causes'], result['runs'][0]['failure_cause']))
-        self.assertIn('failure causes instance_gone', (args.out / 'SUMMARY.txt').read_text())
+        self.assertIn('failure causes instance_gone', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
 
     def test_unexpected_driver_exception_retains_failed_evidence(self):
         args,gui=self.args(),self.fake_gui()
         with mock.patch.object(gx_perf,'measure_ui',side_effect=StopIteration('window vanished')),mock.patch.object(gx_perf.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1,gx_perf.run_experiment(args,gui))
-        self.assertEqual('failed',json.loads((args.out/'build/run-01/run.json').read_text())['status'])
+        self.assertEqual('failed',json.loads((args.out/'build/run-01/run.json').read_text(encoding='utf-8'))['status'])
         self.assertTrue((args.out/'SUMMARY.txt').is_file())
 
     def test_open_ui_ignores_preexisting_popup(self):
@@ -895,13 +896,13 @@ class ExperimentTests(unittest.TestCase):
     def test_drain_waits_for_late_count_then_quiet_interval(self):
         instance=mock.Mock()
         instance.log=self.root/'drain.log'
-        instance.log.write_text('')
+        instance.log.write_text('', encoding='utf-8')
         capture=gx_perf.CaptureRun(instance,self.root,{})
         now=[0.0]
         def sleep(seconds):
             now[0]+=seconds
             if now[0] >= .4 and instance.log.stat().st_size == 0:
-                instance.log.write_text('info(gx_perf): metric scrollbar.paint 1\n')
+                instance.log.write_text('info(gx_perf): metric scrollbar.paint 1\n', encoding='utf-8')
         with mock.patch.object(gx_perf.time,'monotonic',side_effect=lambda:now[0]),mock.patch.object(gx_perf.time,'sleep',side_effect=sleep):
             capture.drain(['scrollbar.paint'],minimum=.6,quiet=.5)
         self.assertGreaterEqual(now[0],.9)
@@ -909,19 +910,19 @@ class ExperimentTests(unittest.TestCase):
     def test_unsettled_metric_window_is_counted_not_a_driver_error(self):
         instance = mock.Mock()
         instance.log = self.root / 'busy.log'
-        instance.log.write_text('')
+        instance.log.write_text('', encoding='utf-8')
         capture = gx_perf.CaptureRun(instance, self.root, {'baseline': False, 'diagnostic': False})
         now = [0.0]
         def sleep(seconds):
             now[0] += seconds
-            with instance.log.open('a') as stream:
+            with instance.log.open('a', encoding='utf-8') as stream:
                 stream.write('info(gx_perf): metric scrollbar.paint 1\n')
         with mock.patch.object(gx_perf.time, 'monotonic', side_effect=lambda: now[0]), \
                 mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep):
             self.assertFalse(capture.drain(['scrollbar.paint'], minimum=.6, quiet=.5))
         self.assertTrue(capture.report['measurement_unsettled'])
         self.assertEqual('timeout', capture.report['drains'][-1]['status'])
-        capture.count(instance.log.read_text(), 'scrollbar.paint')
+        capture.count(instance.log.read_text(encoding='utf-8'), 'scrollbar.paint')
         args = self.args()
         args.case = 'p3'
         self.assertEqual('FAIL', gx_perf.absolute_gate(args, capture)['status'])
@@ -933,9 +934,9 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(4, gx_perf.run_experiment(args, gui))
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual([{'label': 'build', 'run': 1, 'metrics': [['scrollbar.paint']]}], result['unsettled_runs'])
-        self.assertIn('Unsettled metric windows', (args.out / 'SUMMARY.txt').read_text())
+        self.assertIn('Unsettled metric windows', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
 
     def test_legacy_win32_guard_failure_is_not_retried(self):
         import gx_win_gui as gui
@@ -953,7 +954,7 @@ class ExperimentTests(unittest.TestCase):
             code = gx_perf.main(['win32', '--exe', str(self.exe), '--out', str(out), '--runs', '1'])
         self.assertEqual(1, code)
         self.assertEqual(2, len(calls))
-        self.assertEqual('raw failure evidence\n', (out / 'build/run-01.log').read_text())
+        self.assertEqual('raw failure evidence\n', (out / 'build/run-01.log').read_text(encoding='utf-8'))
 
     def fake_gui(self):
         import gx_win_gui as real
@@ -974,7 +975,7 @@ class ExperimentTests(unittest.TestCase):
             capture.add('palette.open.total', 2, 'ms')
         with mock.patch.object(gx_perf, 'measure_ui', side_effect=measure), mock.patch.object(gx_perf.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, gx_perf.run_experiment(args, gui))
-        batch = json.loads((args.out / 'RESULT.json').read_text())
+        batch = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(['old', 'new', 'new', 'old'], [r['label'] for r in batch['runs']])
         self.assertEqual([None, '1', '1', None], [c.kwargs['env'].get('TEST') for c in gui.launch.call_args_list])
         self.assertEqual([2, 2], gx_perf.collect([args.out / 'old']).values['palette.open.total'])
@@ -988,7 +989,7 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'measure_ui', side_effect=real.InputBlocked('foreground changed')), mock.patch.object(gx_perf.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1, gx_perf.run_experiment(args, gui))
         self.assertEqual(1, gui.launch.call_count)
-        run = json.loads((args.out / 'build/run-01/run.json').read_text())
+        run = json.loads((args.out / 'build/run-01/run.json').read_text(encoding='utf-8'))
         self.assertEqual('failed', run['status'])
         self.assertIn('foreground changed', run['errors'])
         self.assertTrue((args.out / 'build/run-01/ghostty.log').exists())
@@ -1066,7 +1067,7 @@ class ExperimentTests(unittest.TestCase):
         capture = gx_perf.CaptureRun(instance, self.root, {})
         def sleep(seconds):
             if seconds == 60:
-                with instance.log.open('a') as stream:
+                with instance.log.open('a', encoding='utf-8') as stream:
                     stream.write('info(gx_perf): metric proc.snapshot 2\ninfo(gx_perf): metric renderer.present 4\n')
         with mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 10)):
             gx_perf.idle_interval(gui, instance, capture, self.args('win32-idle'), counters)
@@ -1077,7 +1078,7 @@ class ExperimentTests(unittest.TestCase):
     def test_idle_thread_churn_preserves_p2_but_foreign_input_rejects(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
         instance.log = self.root/'idle.log'
-        instance.log.write_text('')
+        instance.log.write_text('', encoding='utf-8')
         gui.win32.return_value.window_pid.return_value = instance.pid
         before = dict(pid=1,birth=2,user_100ns=0,kernel_100ns=0,begin_ns=0,end_ns=1,
                       threads=[dict(tid=3,birth=4,switches=10)])
@@ -1085,7 +1086,7 @@ class ExperimentTests(unittest.TestCase):
         counters.sample.side_effect = [before, after, before, after]
         def sleep(seconds):
             if seconds == 60:
-                with instance.log.open('a') as stream:
+                with instance.log.open('a', encoding='utf-8') as stream:
                     stream.write('info(gx_perf): metric proc.snapshot 2\n')
         capture = gx_perf.CaptureRun(instance, self.root, {'diagnostic':False,'capabilities':{'proc.snapshot':''}})
         with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',return_value=(10,20)):
@@ -1142,7 +1143,7 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
                 mock.patch.object(gx_perf.CaptureRun, 'drain'), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, gx_perf.run_experiment(args, gui))
-        result = json.loads((args.out / 'RESULT.json').read_text())
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
         self.assertEqual(['completed'] * 4, [row['status'] for row in result['runs']])
         self.assertEqual({'theme_list_uia': {'status': 'not_instrumented', 'n': 0, 'runs': [1, 2],
                                              'scope': 'historical arm only; theme list items not readable through UIA'}},
@@ -1150,7 +1151,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertNotIn('new', result['missing_preconditions'])
         self.assertEqual(['not_evaluated', 'not_evaluated'], [gate['status'] for gate in result['absolute_gates']['old']])
         self.assertEqual(['PASS', 'PASS'], [gate['status'] for gate in result['absolute_gates']['new']])
-        self.assertIn('Missing preconditions (historical arm only', (args.out / 'SUMMARY.txt').read_text())
+        self.assertIn('Missing preconditions (historical arm only', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
         instance = mock.Mock()
         instance.uia_rows.return_value = []
         capture = gx_perf.CaptureRun(instance, self.root, {'baseline': False, 'diagnostic': False})
@@ -1183,7 +1184,7 @@ class ExperimentTests(unittest.TestCase):
         out = self.root / 'remote'
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, gx_perf.main(['remote', str(log), '--out', str(out)]))
-        report = json.loads((out / 'RESULT.json').read_text())['metrics']
+        report = json.loads((out / 'RESULT.json').read_text(encoding='utf-8'))['metrics']
         self.assertEqual({'remote.frame_bytes', 'remote.future'}, set(report))
         self.assertEqual(100, report['remote.frame_bytes']['sum'])
         self.assertEqual(.2, report['remote.future']['median'])
@@ -1413,7 +1414,7 @@ class CommandTests(unittest.TestCase):
             (path / "run.txt").write_text(metrics, encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1, gx_perf.report_runs(out, ["old", "new"], out / "result.json"))
-        self.assertEqual("rejected", json.loads((out / "result.json").read_text())["_validation"]["status"])
+        self.assertEqual("rejected", json.loads((out / "result.json").read_text(encoding='utf-8'))["_validation"]["status"])
 
     def test_old_nonzero_smoke_meta_cannot_be_accepted_as_history(self):
         (self.root / "perf.log").write_text("info(gx_perf): config_load 1us\n", encoding="utf-8")
@@ -1449,7 +1450,7 @@ class CommandTests(unittest.TestCase):
             with self.subTest(reason=reason), contextlib.redirect_stdout(io.StringIO()):
                 code = gx_perf.report_gtk_runs(out, batch, None)
                 self.assertNotEqual(0, code)
-                self.assertFalse(json.loads((out / "RESULT.json").read_text())["validation"]["status"] == "valid")
+                self.assertFalse(json.loads((out / "RESULT.json").read_text(encoding='utf-8'))["validation"]["status"] == "valid")
 
     def test_declared_ten_pair_batch_cannot_compare_one_selected_round(self):
         out = self.root / "selected"
@@ -1481,6 +1482,51 @@ class CommandTests(unittest.TestCase):
             (root / "perf-meta.json").write_text(json.dumps(meta), encoding="utf-8")
             with self.subTest(field=key), self.assertRaises(gx_perf.PerfError):
                 gx_perf.collect([root])
+
+
+class EncodingGuardTests(unittest.TestCase):
+    """Text files these tools write hold non-ASCII reasons; with Python's UTF-8 mode off (cp936 on a
+    Chinese Windows host) any read or write that leaves the encoding to the locale breaks."""
+
+    FILES = ("gx_perf.py", "gx_slots.py", "gx_win_gui.py", "test_gx_perf.py", "test_gx_slots.py",
+             "test_gx_win_gui.py")
+
+    @staticmethod
+    def unnamed_encodings(source: str):
+        def keyword(call, name):
+            return next((item.value for item in call.keywords if item.arg == name), None)
+
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call) or keyword(node, "encoding") is not None:
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in ("read_text", "write_text"):
+                yield node.lineno, f"{name}()"
+            elif name == "open" and not (isinstance(func, ast.Attribute) and getattr(func.value, "id", "") == "os"):
+                position = 0 if isinstance(func, ast.Attribute) else 1
+                mode = keyword(node, "mode") or (node.args[position] if len(node.args) > position else None)
+                # A mode that is not a string constant (window.open(area)) is not a text file.
+                text = "r" if mode is None else (mode.value if isinstance(mode, ast.Constant) else None)
+                if isinstance(text, str) and "b" not in text:
+                    yield node.lineno, f"open(mode={text!r})"
+            elif name in ("run", "check_output", "check_call", "call", "Popen"):
+                flag = keyword(node, "text") or keyword(node, "universal_newlines")
+                if isinstance(flag, ast.Constant) and flag.value is True:
+                    yield node.lineno, f"subprocess.{name}(text=True)"
+
+    def test_every_text_read_and_write_names_its_encoding(self):
+        for name in self.FILES:
+            with self.subTest(file=name):
+                found = list(self.unnamed_encodings((SCRIPTS / name).read_text(encoding="utf-8")))
+                self.assertEqual([], found, f"{name}: give these an explicit encoding")
+
+    def test_the_guard_sees_what_the_locale_would_decode(self):
+        source = ("p.read_text()\np.write_text(t)\nopen(p)\nopen(p, 'a')\np.open()\np.open('w')\n"
+                  "subprocess.run(a, text=True)\n"
+                  "p.read_text(encoding='utf-8')\nopen(p, 'rb')\np.open('ab')\nos.open(p, 1)\nwindow.open(area)\n"
+                  "subprocess.run(a, text=True, encoding='utf-8')\n")
+        self.assertEqual([1, 2, 3, 4, 5, 6, 7], [line for line, _ in self.unnamed_encodings(source)])
 
 
 if __name__ == "__main__":
