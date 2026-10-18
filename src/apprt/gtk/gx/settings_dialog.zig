@@ -32,6 +32,8 @@
 //! date, and the next opening builds a new one. One dialog shows at a
 //! time: opening it elsewhere first closes the one shown. If saving keeps
 //! it open, the request brings that dialog and its pending edits forward.
+//! On reopening, theme discovery is refreshed when its subpage is shown;
+//! shell discovery runs once in idle after the Shell page is shown.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -344,13 +346,14 @@ pub const GxSettingsDialog = extern struct {
     const State = struct {
         alloc: Allocator,
 
-        /// Owns the shell choices and other strings that live as long as
-        /// the dialog.
+        /// Owns theme directories and other strings stable for the lifetime
+        /// of the dialog.
         arena: ArenaAllocator,
 
         /// Replaced synchronized values do not accumulate in the lifetime arena.
         font_arena: ArenaAllocator,
         command_arena: ArenaAllocator,
+        shell_arena: ArenaAllocator,
 
         /// The language of the dialog text.
         lang: gx.i18n.Language = .default,
@@ -405,6 +408,7 @@ pub const GxSettingsDialog = extern struct {
         /// The listed themes, the directories they are read from and the
         /// swatches read so far.
         themes: ?settings_map.ThemeList = null,
+        themes_stale: bool = false,
         theme_dirs: []const []const u8 = &.{},
         swatches: theme_swatch.Cache = .{},
 
@@ -434,9 +438,10 @@ pub const GxSettingsDialog = extern struct {
         previewing: bool = false,
         preview_source: ?c_uint = null,
 
-        /// The shell choices, filled in when the shell page is first
-        /// shown; a choice's index is its position in the shell row.
+        /// The shell choices, refreshed once per opening after the shell
+        /// page is mapped; an index is its position in the shell row.
         shells_loaded: bool = false,
+        shell_source: ?c_uint = null,
         shells: []const Shell = &.{},
         shell: usize = 0,
 
@@ -621,6 +626,8 @@ pub const GxSettingsDialog = extern struct {
         const priv = self.private();
         std.debug.assert(!priv.state.shown);
         std.debug.assert(priv.state.changes.isEmpty() and !priv.state.apply_pending);
+        priv.state.themes_stale = true;
+        priv.state.shells_loaded = false;
         self.dismissToast();
         if (page orelse last_page) |name|
             self.showSettingsPage(name)
@@ -930,7 +937,7 @@ pub const GxSettingsDialog = extern struct {
             priv.font_choose_button.setFontDesc(@ptrCast(description));
         }
         priv.font_clear_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets("font-family")));
-        if (st.shells_loaded and st.shell < st.shells.len and st.shells[st.shell].command == null) {
+        if (st.shell < st.shells.len and st.shells[st.shell].command == null) {
             self.syncDefaultCommand(config);
         }
 
@@ -1084,6 +1091,23 @@ pub const GxSettingsDialog = extern struct {
         priv.theme_search.setKeyCaptureWidget(priv.theme_list.as(gtk.Widget));
     }
 
+    /// Refresh only when the list is requested after reopening. Drop model
+    /// indices before replacing names so callbacks cannot index the old list.
+    fn refreshDiscoveredThemes(self: *Self) void {
+        const st = &self.private().state;
+        if (!st.themes_stale) return;
+        const list = settings_map.listThemes(st.alloc, global.io(), st.theme_dirs) catch return;
+        st.selecting = true;
+        defer st.selecting = false;
+        st.visible.clearRetainingCapacity();
+        if (st.theme_model) |model| model.splice(0, model.as(gio.ListModel).getNItems(), @ptrCast(&[_:null]?[*:0]const u8{}));
+        if (st.themes) |*old| old.deinit();
+        st.themes = list;
+        st.swatches.deinit(st.alloc);
+        st.swatches = .{};
+        st.themes_stale = false;
+    }
+
     /// The combo rows whose models carry translated labels, built again
     /// for the current language and values.
     fn fillCombos(self: *Self) void {
@@ -1203,9 +1227,35 @@ pub const GxSettingsDialog = extern struct {
         self.updateShellSubtitle();
     }
 
-    /// Detects the shells and fills in the shell row, once: detecting
-    /// searches `PATH`, so it waits until the shell page is shown.
+    /// PATH discovery is deferred until after presentation, once per opening.
     fn loadShells(self: *Self) void {
+        const st = &self.private().state;
+        if (st.shells_loaded or st.shell_source != null or st.disposed or self.as(gtk.Widget).getMapped() == 0) return;
+        st.shell_source = glib.idleAddFull(glib.PRIORITY_DEFAULT_IDLE, shellIdle, self.ref(), unrefData);
+    }
+
+    fn shellMapped(_: *gtk.Widget, self: *Self) callconv(.c) void {
+        const name = self.as(adw.PreferencesDialog).getVisiblePageName() orelse return;
+        if (std.mem.eql(u8, std.mem.span(name), "shell")) self.loadShells();
+    }
+
+    fn shellIdle(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const st = &self.private().state;
+        st.shell_source = null;
+        if (!st.disposed and st.shown and self.as(gtk.Widget).getMapped() != 0) self.scanShells();
+        return 0;
+    }
+
+    fn cancelShellScan(self: *Self) void {
+        const st = &self.private().state;
+        if (st.shell_source) |source| {
+            st.shell_source = null;
+            _ = glib.Source.remove(source);
+        }
+    }
+
+    fn scanShells(self: *Self) void {
         const priv = self.private();
         const st = &priv.state;
         if (st.shells_loaded or st.disposed) return;
@@ -1214,11 +1264,16 @@ pub const GxSettingsDialog = extern struct {
         st.loading = true;
         defer st.loading = loading;
 
-        const app = Application.default();
-        const config_obj = app.getConfig();
-        defer config_obj.unref();
-        const config = config_obj.get();
-        const arena = st.arena.allocator();
+        const fixture = self.testBackend();
+        const config_obj = if (fixture == null) Application.default().getConfig() else null;
+        defer if (config_obj) |object| object.unref();
+        const config = if (fixture) |backend| backend.config else config_obj.?.get();
+        // GTK owns copies of its model strings. Clear our borrowed choices
+        // before resetting their storage; change handlers are loading-guarded.
+        st.shells = &.{};
+        st.herdr = null;
+        _ = st.shell_arena.reset(.retain_capacity);
+        const arena = st.shell_arena.allocator();
 
         self.syncDefaultCommand(config);
         const overlay_command = self.overlayValue(arena, "command");
@@ -1232,12 +1287,14 @@ pub const GxSettingsDialog = extern struct {
         for (launch.keys(), launch.values()) |name, command| {
             custom.append(arena, .{ .name = name, .command = command }) catch break;
         }
-        var env = global.environMap() catch |err| env: {
+        var env = std.process.Environ.Map.init(st.alloc);
+        defer env.deinit();
+        const supplied = if (fixture) |backend| backend.shell_env else null;
+        if (supplied == null) env = global.environMap() catch |err| env: {
             log.warn("cannot read the environment to detect shells err={}", .{err});
             break :env std.process.Environ.Map.init(st.alloc);
         };
-        defer env.deinit();
-        if (gx.profiles.detectSystem(st.alloc, global.io(), &env, custom.items)) |list_| {
+        if (gx.profiles.detectSystem(st.alloc, global.io(), supplied orelse &env, custom.items)) |list_| {
             var list = list_;
             defer list.deinit();
             for (list.profiles) |profile| {
@@ -1827,7 +1884,7 @@ pub const GxSettingsDialog = extern struct {
     /// Reads the value of `key` in the overlay file.
     fn overlayValue(self: *Self, alloc: Allocator, key: []const u8) ?[]const u8 {
         const st = &self.private().state;
-        const path = gx.config_layers.overlayPath(st.alloc) catch return null;
+        const path = self.savePath() catch return null;
         defer st.alloc.free(path);
         var overlay = gx.gui_settings.Overlay.load(st.alloc, global.io(), path) catch |err| {
             log.warn("cannot read {s} err={}", .{ path, err });
@@ -2254,6 +2311,7 @@ pub const GxSettingsDialog = extern struct {
         const st = &self.private().state;
         if (st.disposed) return;
         st.shown = false;
+        self.cancelShellScan();
 
         // The window keeps the dialog (`kept_dialogs`) for its next
         // opening; a timer or a running herdr may keep it alive meanwhile.
@@ -2297,6 +2355,7 @@ pub const GxSettingsDialog = extern struct {
     fn themeSubpageShown(_: *adw.NavigationPage, self: *Self) callconv(.c) void {
         const priv = self.private();
         if (priv.state.disposed) return;
+        self.refreshDiscoveredThemes();
         self.refilter(.open);
         _ = priv.theme_search.as(gtk.Widget).grabFocus();
     }
@@ -2632,14 +2691,17 @@ pub const GxSettingsDialog = extern struct {
             .arena = .init(alloc),
             .font_arena = .init(alloc),
             .command_arena = .init(alloc),
+            .shell_arena = .init(alloc),
             .changes = .init(alloc),
         };
         gtk.Widget.initTemplate(self.as(gtk.Widget));
+        _ = gtk.Widget.signals.map.connect(self.as(gtk.Widget), *Self, shellMapped, self, .{ .after = true });
     }
 
     fn dispose(self: *Self) callconv(.c) void {
         const st = &self.private().state;
         st.disposed = true;
+        self.cancelShellScan();
         st.owner.deinit();
         self.cancelPreview();
         if (st.save_source) |source| {
@@ -2681,6 +2743,7 @@ pub const GxSettingsDialog = extern struct {
         st.arena.deinit();
         st.font_arena.deinit();
         st.command_arena.deinit();
+        st.shell_arena.deinit();
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -3269,8 +3332,8 @@ test "settings reopen 100 times keeps synchronized allocations bounded" {
         try testing.expect(dialog.as(adw.Dialog).close() != 0);
         try testing.expect(testWaitDialog(dialog, false));
         try testing.expect(!st.shown);
-        if (i == 1) baseline = st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity();
-        if (i > 1) try testing.expectEqual(baseline, st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity());
+        if (i == 1) baseline = st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity() + st.shell_arena.queryCapacity();
+        if (i > 1) try testing.expectEqual(baseline, st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity() + st.shell_arena.queryCapacity());
         try testing.expectEqualStrings("Monospace", st.font_families[0]);
         try testing.expectEqualStrings("bash --noprofile --norc", st.default_command);
     }
@@ -3296,6 +3359,7 @@ const TestBackend = struct {
     path: []const u8,
     config: *const CoreConfig,
     fail_apply: bool = false,
+    shell_env: ?*const std.process.Environ.Map = null,
 };
 
 fn testPresentSettings(dialog: *GxSettingsDialog, window: *gtk.Window) !void {
@@ -3401,7 +3465,6 @@ test "cross window settings preserves the failed edit and retry instead of reope
     try testing.expectEqual(toast, st.toast);
 }
 
-
 test "revert keeps a new failure toast when restoring the saved configuration fails" {
     const dialog = try testDialog();
     defer dialog.unref();
@@ -3417,4 +3480,88 @@ test "revert keeps a new failure toast when restoring the saved configuration fa
     try testing.expect(st.changes.isEmpty());
     try testing.expect(st.toast != null);
     try testing.expect(!std.mem.eql(u8, std.mem.span(st.toast.?.getTitle().?), "old retry"));
+}
+
+test "reopen discovers theme files added while closed" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const dialog = try testDialog();
+    defer dialog.unref();
+    const st = &dialog.private().state;
+    st.theme_dirs = &.{root};
+    st.themes = try settings_map.listThemes(alloc, testing.io, st.theme_dirs);
+    const model = gtk.StringList.new(null);
+    st.theme_model = model;
+    st.theme_selection = gtk.SingleSelection.new(model.as(gio.ListModel));
+    dialog.private().theme_list.setModel(st.theme_selection.?.as(gtk.SelectionModel));
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    dialog.reopen(&config, .appearance);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "AddedTheme", .data = "background = 123456\n" });
+    dialog.reopen(&config, .appearance);
+    GxSettingsDialog.themeSubpageShown(dialog.private().theme_subpage, dialog);
+    try testing.expect(st.themes.?.indexOf("AddedTheme") != null);
+}
+
+fn testWaitShells(dialog: *GxSettingsDialog) bool {
+    const tick = glib.timeoutAdd(5, struct {
+        fn wake(_: ?*anyopaque) callconv(.c) c_int {
+            return 1;
+        }
+    }.wake, null);
+    defer _ = glib.Source.remove(tick);
+    const deadline = glib.getMonotonicTime() + 2_000_000;
+    while (!dialog.private().state.shells_loaded and glib.getMonotonicTime() < deadline) {
+        _ = glib.MainContext.iteration(null, 1);
+    }
+    return dialog.private().state.shells_loaded;
+}
+
+fn testHasShell(dialog: *GxSettingsDialog, path: []const u8) bool {
+    for (dialog.private().state.shells) |shell| if (shell.command) |command| {
+        if (std.mem.indexOf(u8, command, path) != null) return true;
+    };
+    return false;
+}
+
+test "reopen discovers a shell installed while closed" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    const shell_path = try std.fs.path.join(alloc, &.{ root, "bash" });
+    defer alloc.free(shell_path);
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("PATH", root);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config, .shell_env = &env };
+    const dialog = try testDialog();
+    defer dialog.unref();
+    dialog.private().state.test_backend = &backend;
+    const window = adw.Window.new();
+    defer window.as(gtk.Window).destroy();
+    dialog.reopen(&config, .appearance);
+    try testPresentSettings(dialog, window.as(gtk.Window));
+    dialog.loadShells();
+    try testing.expect(testWaitShells(dialog));
+    try testing.expect(!testHasShell(dialog, shell_path));
+    _ = dialog.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(dialog, false));
+    const executable = try tmp.dir.createFile(testing.io, "bash", .{ .permissions = .fromMode(0o755) });
+    executable.close(testing.io);
+    dialog.reopen(&config, .appearance);
+    try testPresentSettings(dialog, window.as(gtk.Window));
+    dialog.loadShells();
+    try testing.expect(testWaitShells(dialog));
+    try testing.expect(testHasShell(dialog, shell_path));
+    _ = dialog.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(dialog, false));
 }

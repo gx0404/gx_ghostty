@@ -135,6 +135,27 @@ xdo("mousemove", 987, 59, "click", 1)
 sleep(0.8)
 assert "CRITICAL" not in log(), "cross-window settings emitted CRITICAL"
 
+# A theme added while the kept dialog is closed is discovered without a
+# configuration reload or a new dialog instance.
+theme_dir = folder / "themes"
+theme_dir.mkdir(exist_ok=True)
+(theme_dir / "GX Reopen Fixture").write_text("background = 224466\nforeground = ffffff\n")
+before_builds = builds()
+open_settings("ctrl+alt+t")
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.8)
+before_preview = log().count("info(gx_perf): theme.reload ")
+search_theme("GX Reopen Fixture")
+capture("13-new-theme-discovered")
+assert builds() == before_builds, "discovery should reuse the dialog"
+assert log().count("info(gx_perf): theme.reload ") > before_preview, "new theme was not listed and previewed"
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+capture("14-new-theme-preview-ended")
+assert "GX Reopen Fixture" not in overlay.read_text()
+assert "CRITICAL" not in log()
+
+
 '''
 expect = [
   "G27.png: the isolated terminal before the settings open",
@@ -150,5 +171,7 @@ expect = [
   "G27-10-other-window-has-no-dialog.png: B has only its terminal, no second settings dialog",
   "G27-11-original-edit-and-retry-retained.png: A still shows Blinking Cursor on and Retry after both cross-window and repeated open requests",
   "G27-12-original-edit-retried.png: retry saves the visible true value and shows Settings saved",
+  "G27-13-new-theme-discovered.png: GX Reopen Fixture added while closed is listed and previewed, without rebuilding the dialog",
+  "G27-14-new-theme-preview-ended.png: closing restores Blue Dolphin and does not save the fixture theme",
   "G27-counts.json: three builds for seventeen openings",
 ]
