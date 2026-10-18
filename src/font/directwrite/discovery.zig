@@ -43,6 +43,50 @@ fn firstFallbackSpan(claimed: *std.atomic.Value(bool)) ?perf.Span {
     return .begin(global.io());
 }
 
+// Only the successful claim emits this diagnostic. Success means discovery
+// returned an iterator, not that a face was opened or a glyph rasterized.
+fn firstFallbackEnd(comptime recorder: type, span: ?perf.Span, cp: u32, success: bool) void {
+    const value = span orelse return;
+    const us = perf.sinceUs(global.io(), value.start);
+    recorder.record("font.first_fallback", us);
+    recorder.count("font.first_fallback.codepoint", cp);
+    recorder.count("font.first_fallback.success", @intFromBool(success));
+}
+
+test "first fallback diagnostic binds codepoint and success to the claimed span" {
+    const Recorder = struct {
+        var durations: usize = 0;
+        var codepoint: ?u64 = null;
+        var succeeded: ?u64 = null;
+        fn record(metric: []const u8, _: u64) void {
+            std.debug.assert(std.mem.eql(u8, metric, "font.first_fallback"));
+            durations += 1;
+        }
+        fn count(metric: []const u8, n: u64) void {
+            if (std.mem.eql(u8, metric, "font.first_fallback.codepoint")) codepoint = n;
+            if (std.mem.eql(u8, metric, "font.first_fallback.success")) succeeded = n;
+        }
+    };
+    const before = perf.enabled();
+    defer perf.setEnabled(before);
+    for ([_]bool{ false, true }) |success| {
+        Recorder.durations = 0;
+        Recorder.codepoint = null;
+        Recorder.succeeded = null;
+        var claimed: std.atomic.Value(bool) = .init(false);
+        perf.setEnabled(false);
+        firstFallbackEnd(Recorder, firstFallbackSpan(&claimed), 'A', success);
+        try std.testing.expect(!claimed.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), Recorder.durations);
+        perf.setEnabled(true);
+        firstFallbackEnd(Recorder, firstFallbackSpan(&claimed), '中', success);
+        firstFallbackEnd(Recorder, firstFallbackSpan(&claimed), 'A', !success);
+        try std.testing.expectEqual(@as(usize, 1), Recorder.durations);
+        try std.testing.expectEqual(@as(?u64, '中'), Recorder.codepoint);
+        try std.testing.expectEqual(@as(?u64, @intFromBool(success)), Recorder.succeeded);
+    }
+}
+
 test "first fallback timing claims once and stays untouched when disabled" {
     const before = perf.enabled();
     defer perf.setEnabled(before);
@@ -154,11 +198,12 @@ pub const DirectWrite = struct {
         desc: Descriptor,
     ) !DiscoverIterator {
         const span = firstFallbackSpan(&first_fallback);
-        defer if (span) |value| {
-            _ = value.end(global.io(), "font.first_fallback");
-        };
+        var success = false;
+        defer firstFallbackEnd(perf, span, desc.codepoint, success);
         _ = collection;
-        return try self.discover(alloc, desc);
+        const result = try self.discover(alloc, desc);
+        success = true;
+        return result;
     }
 
     pub fn discoverMappedFamily(

@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0055）之后的号。在册的 48 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0055，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0056）之后的号。在册的 49 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0056，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -130,6 +130,8 @@
 | GX-0053 | `src/Command.zig` | `fork(gx): GX-0053` | active |
 | GX-0054 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0054` | active |
 | GX-0055 | `pkg/fontconfig/build.zig` | `fork(gx): GX-0055` | active |
+| GX-0056 | `src/font/CodepointResolver.zig` | `fork(gx): GX-0056` | active |
+| GX-0056 | `src/font/SharedGrid.zig` | `fork(gx): GX-0056` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1537,3 +1539,14 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：更新 Fontconfig 后核对宏仍支持预定义，以及公开名与 IA__ 别名的绑定属性；不能只隐藏普通定义却重新导出 alias。新映像完整符号表 242 对别名同址且 LOCAL HIDDEN，Pango 的 58 个导入全部绑定同一系统库。
 - 移除条件：上游构建提供等价隔离，实际 exe 动态符号表和 Pango loader 绑定证据仍通过后移除，登记改为 removed。
 - 验证：`Gx0055ShapeTests` 锁定 Linux ELF/静态路径和三项flags，反证缺任一隐藏定义或扩大目标条件；`scripts/gx_fontconfig_link_check.py` 核动态导出与观察到的绑定，不独立认证进程身份或全符号覆盖。包16项、GTK定向24通过/4平台跳过、三次固定G03的源码snapshot/映像/日志/逐图证据见 `F3/D30/report.md`。最终ReleaseFast映像、其他发行版和长期压力仍需复验。
+
+## GX-0056 首次普通 CJK 回退至栅格可用的性能证据
+
+- 文件：`src/font/CodepointResolver.zig`、`src/font/SharedGrid.zig`；active，未回馈上游。主实现位于 fork 文件 `src/gx/font_fallback_perf.zig`；本补丁不改变字体预热默认值，也不代表 C6 已有性能收益。
+- 标记闭集：resolver 三处单行标记，分别覆盖普通发现前的开始与 defer 结束、成功 addDeferred 的局部 index、绑定 index 后返回；SharedGrid 十一处，覆盖 helper import、默认初始化的内联 `fallback_timing` 字段、两处码位缓存命中、独占锁中的 resolver scope、face 加载后绑定、结果身份检查、两处字形缓存命中、raster 开始及错误终止、atlas 重试与缓存发布后的完成。不能漏登字段和 import。
+- 原因：仅记录 DirectWrite 返回 discovery iterator 的耗时，不含 face 加载、shaping、调度和首次 raster，不能证明预热对首次 CJK 字形的完整影响。
+- 行为：`GHOSTTY_GX_PERF=1` 时以进程唯一 claim 和 grid 内联生命周期状态关联普通发现请求、font index 与 glyph；成功区间结束于同一字形的首次非缓存 raster、atlas 扩容重试及 glyph cache 发布之后，不含 GPU 上传或呈现。身份不符、重复查找、失败、空字形及缓存命中不能闭合该样本；销毁未完成的 grid 不产生成功样本。
+- 范围：正式 C6 驱动清空 codepoint map，以独立行、首列的 U+4E2D 固定刺激验证普通 fallback，不能外推默认 CJK map、复杂 cluster 或任意文字。PERF 关闭时 helper 在时钟、claim、额外 glyph 查询和日志前返回；内联诊断字段仍占空间，不声称结构布局或零开销不变。
+- 锁与平台：scope 只在 grid 独占锁内桥接 resolver，身份经原子 phase 发布；共享缓存路径只能拒绝，不建立新身份或完成样本，不新增锁或反向取得 renderer 锁。resolver 的 GX 引用受 `.ghostty` 编译期门约束，SharedGrid 本身属于 app，不向 lib-vt 引入 GX/global；实际 lib-vt/WASM 构建仍须验证。
+- 同步与移除：上游改动回退、锁提升、face 加载或 atlas 重试时逐一核对上述边界。上游提供同等完整且有身份绑定的性能事件，或 C6 实验撤销时，先移除调用、import 与内联字段，再移除 helper 并登记 removed；不影响独立的 DirectWrite discovery 诊断。
+- 验证：`Gx0056ShapeTests` 覆盖注册、LF/CRLF、缺 import/字段/任一钩子、lib-vt 门缺失、提前完成与重复钩子。原生状态、真实 shaping、SharedGrid 错误/缓存/atlas 重试测试见 `font_fallback_perf`；Windows 定向候选 40/40，POSIX、lib-vt/WASM、最终 GUI 和十对性能仍 PENDING。工具必须复核 before/after/final 原始日志链、映像身份及守护指标，不能以诊断事件或离线测试代正式采样。

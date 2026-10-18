@@ -36,6 +36,9 @@ const Style = font.Style;
 const RenderOptions = font.Glyph.RenderOptions;
 const global = @import("../global.zig");
 
+// fork(gx): GX-0056 app-only fallback timing and per-grid lifetime storage.
+const fallback_perf = @import("../gx/font_fallback_perf.zig");
+
 const log = std.log.scoped(.font_shared_grid);
 
 /// Cache for codepoints to font indexes in a group.
@@ -62,6 +65,9 @@ metrics: Metrics,
 /// callers can use this lock directly, maintainers need to be extra careful
 /// to review call sites to ensure they are using the lock correctly.
 lock: std.Io.RwLock,
+
+// fork(gx): GX-0056 lifetime-bound state; identity uses this grid's locking.
+fallback_timing: fallback_perf.State = .{},
 
 pub const init_tw = tripwire.module(enum {
     codepoints_capacity,
@@ -167,7 +173,11 @@ pub fn getIndex(
     {
         self.lock.lockSharedUncancelable(global.io());
         defer self.lock.unlockShared(global.io());
-        if (self.codepoints.get(key)) |v| return v;
+        if (self.codepoints.get(key)) |v| {
+            // fork(gx): GX-0056 reject ambiguous codepoint/font identity.
+            fallback_perf.indexObserved(&self.fallback_timing, cp, v, false);
+            return v;
+        }
     }
 
     // Slow path: we need to search this codepoint
@@ -176,8 +186,16 @@ pub fn getIndex(
 
     // Try to get it, if it is now in the cache another thread beat us to it.
     const gop = try self.codepoints.getOrPut(alloc, key);
-    if (gop.found_existing) return gop.value_ptr.*;
+    if (gop.found_existing) {
+        // fork(gx): GX-0056 the concurrent cache winner follows the same guard.
+        fallback_perf.indexObserved(&self.fallback_timing, cp, gop.value_ptr.*, false);
+        return gop.value_ptr.*;
+    }
     errdefer self.codepoints.removeByPtr(gop.key_ptr);
+
+    // fork(gx): GX-0056 bridge resolver recursion only for this locked grid.
+    const perf_scope = fallback_perf.enter(&self.fallback_timing, self);
+    defer perf_scope.end();
 
     // Load a value and cache it. This even caches negative matches.
     const value = self.resolver.getIndex(alloc, cp, style, p);
@@ -191,9 +209,13 @@ pub fn getIndex(
         // Load the face in case its deferred. If this fails then we would've
         // failed to load it in the future anyways so we want to undo all
         // the caching we did.
-        _ = try self.resolver.collection.getFace(idx);
+        // fork(gx): GX-0056 face loading is inside the span; bind its cmap glyph.
+        const face = try self.resolver.collection.getFace(idx);
+        fallback_perf.faceReady(&self.fallback_timing, cp, idx, face);
     }
 
+    // fork(gx): GX-0056 reject another codepoint selecting the claimed face.
+    fallback_perf.indexObserved(&self.fallback_timing, cp, value, true);
     return value;
 }
 
@@ -392,15 +414,26 @@ pub fn renderGlyph(
     {
         self.lock.lockSharedUncancelable(global.io());
         defer self.lock.unlockShared(global.io());
-        if (self.glyphs.get(key)) |v| return v;
+        if (self.glyphs.get(key)) |v| {
+            // fork(gx): GX-0056 a cached render cannot close a fresh-raster span.
+            _ = fallback_perf.rasterBegin(&self.fallback_timing, self, index, glyph_index, true);
+            return v;
+        }
     }
 
     // Slow path: we need to search this codepoint
     self.lock.lockUncancelable(global.io());
     defer self.lock.unlock(global.io());
 
+    // fork(gx): GX-0056 errors, including allocation and retry errors, consume it.
+    const perf_active = fallback_perf.rasterBegin(&self.fallback_timing, self, index, glyph_index, false);
+    errdefer fallback_perf.rasterFailed(&self.fallback_timing, perf_active);
     const gop = try self.glyphs.getOrPut(alloc, key);
-    if (gop.found_existing) return gop.value_ptr.*;
+    if (gop.found_existing) {
+        // fork(gx): GX-0056 reject a cache hit after lock promotion too.
+        _ = fallback_perf.rasterBegin(&self.fallback_timing, self, index, glyph_index, true);
+        return gop.value_ptr.*;
+    }
     errdefer self.glyphs.removeByPtr(gop.key_ptr);
 
     // Get the presentation to determine what atlas to use
@@ -460,6 +493,8 @@ pub fn renderGlyph(
         .presentation = p,
     };
 
+    // fork(gx): GX-0056 end after raster, atlas grow/retry and cache publication.
+    fallback_perf.rasterReady(&self.fallback_timing, perf_active, glyph, atlas);
     return gop.value_ptr.*;
 }
 

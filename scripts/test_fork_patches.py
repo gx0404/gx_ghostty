@@ -1791,6 +1791,114 @@ def gx0055_problems(source: str) -> list[str]:
     return problems
 
 
+GX0056_PATHS = ("src/font/CodepointResolver.zig", "src/font/SharedGrid.zig")
+GX0056_RESOLVER_CALLS = (
+    '@import("../gx/font_fallback_perf.zig").discoveryBegin(self, cp)',
+    '@import("../gx/font_fallback_perf.zig").discoveryEnd(perf_span);',
+    '@import("../gx/font_fallback_perf.zig").discoveryIndex(perf_span, index);',
+)
+GX0056_GRID_CALLS = (
+    ('fallback_perf.indexObserved(&self.fallback_timing, cp, v, false);', 1),
+    ('fallback_perf.indexObserved(&self.fallback_timing, cp, gop.value_ptr.*, false);', 1),
+    ('const perf_scope = fallback_perf.enter(&self.fallback_timing, self);', 1),
+    ('defer perf_scope.end();', 1),
+    ('fallback_perf.faceReady(&self.fallback_timing, cp, idx, face);', 1),
+    ('fallback_perf.indexObserved(&self.fallback_timing, cp, value, true);', 1),
+    ('fallback_perf.rasterBegin(&self.fallback_timing, self, index, glyph_index, true);', 2),
+    ('const perf_active = fallback_perf.rasterBegin(&self.fallback_timing, self, index, glyph_index, false);', 1),
+    ('errdefer fallback_perf.rasterFailed(&self.fallback_timing, perf_active);', 1),
+    ('fallback_perf.rasterReady(&self.fallback_timing, perf_active, glyph, atlas);', 1),
+)
+
+
+def gx0056_problems(resolver: str, grid: str) -> list[str]:
+    """Keep the app-only span, per-grid state, and all cache/error hooks explicit."""
+    resolver, grid = (text.replace("\r\n", "\n") for text in (resolver, grid))
+    problems = []
+    for name, text, count in (("resolver", resolver, 3), ("grid", grid, 11)):
+        if text.count("fork(gx): GX-0056") != count:
+            problems.append(f"{name}: unexpected GX-0056 marker count")
+    artifact_guard = 'if (comptime @import("terminal_options").artifact == .ghostty)'
+    if resolver.count(artifact_guard) != 3:
+        problems.append("resolver hooks must all exclude lib-vt")
+    for call in GX0056_RESOLVER_CALLS:
+        if resolver.count(call) != 1:
+            problems.append("missing or duplicate resolver hook: " + call)
+    for snippet in (
+        '// fork(gx): GX-0056 app-only fallback timing and per-grid lifetime storage.\n'
+        'const fallback_perf = @import("../gx/font_fallback_perf.zig");',
+        '// fork(gx): GX-0056 lifetime-bound state; identity uses this grid\'s locking.\n'
+        'fallback_timing: fallback_perf.State = .{},',
+    ):
+        if grid.count(snippet) != 1:
+            problems.append("missing marked grid import or lifetime state")
+    for call, count in GX0056_GRID_CALLS:
+        if grid.count(call) != count:
+            problems.append("missing or duplicate grid hook: " + call)
+    for text, header, statements in (
+        (resolver, "pub fn getIndex(", (
+            GX0056_RESOLVER_CALLS[0], "var disco_it = disco.discoverFallback(",
+            "const index = self.collection.addDeferred(", GX0056_RESOLVER_CALLS[2], "return index;")),
+        (grid, "pub fn getIndex(", (
+            "self.lock.lockUncancelable(global.io());", GX0056_GRID_CALLS[2][0],
+            "const value = self.resolver.getIndex(", "const face = try self.resolver.collection.getFace(idx);",
+            GX0056_GRID_CALLS[4][0], GX0056_GRID_CALLS[5][0], "return value;")),
+        (grid, "pub fn renderGlyph(", (
+            "self.lock.lockUncancelable(global.io());", GX0056_GRID_CALLS[7][0], GX0056_GRID_CALLS[8][0],
+            "const gop = try self.glyphs.getOrPut(", "errdefer self.glyphs.removeByPtr(gop.key_ptr);",
+            "gop.value_ptr.* = .{", GX0056_GRID_CALLS[9][0], "return gop.value_ptr.*;")),
+    ):
+        lines = text.splitlines()
+        span = zig_fn_lines(lines, header)
+        if span is None:
+            problems.append("missing unique function: " + header)
+            continue
+        body = "\n".join(lines[span[0]:span[1]])
+        offset = 0
+        for statement in statements:
+            found = body.find(statement, offset)
+            if found < 0:
+                problems.append("missing or reordered lifecycle hook: " + statement)
+                break
+            offset = found + len(statement)
+    return problems
+
+
+class Gx0056ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.resolver, cls.grid = ((ROOT / path).read_text(encoding="utf-8") for path in GX0056_PATHS)
+
+    def test_registered_import_state_and_all_hooks_lf_crlf(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for path in GX0056_PATHS:
+            self.assertIn(Patch("GX-0056", path, "fork(gx): GX-0056", "active"), patches)
+        self.assertEqual([], gx0056_problems(self.resolver, self.grid))
+        self.assertEqual([], gx0056_problems(self.resolver.replace("\n", "\r\n"), self.grid.replace("\n", "\r\n")))
+
+    def test_removed_resolver_guards_and_hooks_are_rejected(self):
+        for token in (*GX0056_RESOLVER_CALLS, 'if (comptime @import("terminal_options").artifact == .ghostty)',
+                      'fork(gx): GX-0056', 'const index = self.collection.addDeferred(', 'return index;'):
+            with self.subTest(token=token):
+                self.assertIn(token, self.resolver)
+                self.assertTrue(gx0056_problems(self.resolver.replace(token, "", 1), self.grid))
+
+    def test_removed_import_state_cache_failure_or_completion_is_rejected(self):
+        for token in (*(call for call, _ in GX0056_GRID_CALLS),
+                      'const fallback_perf = @import("../gx/font_fallback_perf.zig");',
+                      'fallback_timing: fallback_perf.State = .{},', 'fork(gx): GX-0056'):
+            with self.subTest(token=token):
+                self.assertIn(token, self.grid)
+                self.assertTrue(gx0056_problems(self.resolver, self.grid.replace(token, "", 1)))
+
+    def test_premature_completion_and_duplicate_hooks_are_rejected(self):
+        ready = GX0056_GRID_CALLS[-1][0]
+        changed = self.grid.replace(ready, "", 1).replace("const gop = try self.glyphs.getOrPut(", ready + "\n    const gop = try self.glyphs.getOrPut(", 1)
+        self.assertTrue(gx0056_problems(self.resolver, changed))
+        self.assertTrue(gx0056_problems(self.resolver, self.grid + "\n" + ready))
+        self.assertTrue(gx0056_problems(self.resolver + "\n// fork(gx): GX-0056 unexpected", self.grid))
+
+
 class Gx0055ShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
