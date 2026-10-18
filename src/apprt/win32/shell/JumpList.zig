@@ -312,3 +312,212 @@ test "D19 failed commit preserves the fingerprint and identical snapshot can ret
     try t.expectEqual(snapshot.fingerprint, publisher.applied.?);
     try t.expect(!try publisher.publishWith(&identity, &snapshot, Factory.backend(true)));
 }
+
+const iid_persist_file = Identity.guid("0000010b-0000-0000-c000-000000000046");
+extern "ole32" fn PropVariantClear(*PropertyVariant) callconv(.winapi) HRESULT;
+
+fn emptyAppId(store: *Interface) !bool {
+    var value: PropertyVariant = .{ .vt = 0, .value = .{ .storage = .{ 0, 0 } } };
+    try check(Identity.method(*const fn (*Interface, *const PropertyKey, *PropertyVariant) callconv(.winapi) HRESULT, store, 5)(store, &pkey_aumid, &value));
+    defer _ = PropVariantClear(&value);
+    return value.vt == 0 or (value.vt == 31 and @intFromPtr(value.value.string) != 0 and value.value.string[0] == 0);
+}
+
+fn pinCandidate(identity: *const Identity, empty: bool, target: []const u16, executable: []const u16) bool {
+    return identity.mode == .installed and identity.registration_verified and
+        std.mem.eql(u8, identity.aumid_utf8, Identity.installed_aumid) and empty and Identity.wideEqual(target, executable);
+}
+
+fn migrateShortcut(alloc: std.mem.Allocator, identity: *const Identity, path: [:0]const u16) !bool {
+    if (identity.mode != .installed or !identity.registration_verified or
+        !std.mem.eql(u8, identity.aumid_utf8, Identity.installed_aumid)) return false;
+    const link = try loadLink(path);
+    defer Identity.release(link);
+    const properties = try Identity.query(link, &iid_property_store);
+    defer Identity.release(properties);
+    if (!try emptyAppId(properties)) return false;
+    var target_buffer: [32768:0]u16 = @splat(0);
+    try check(Identity.method(*const fn (*Interface, [*]u16, c_int, ?*anyopaque, u32) callconv(.winapi) HRESULT, link, 3)(link, &target_buffer, target_buffer.len, null, 0));
+    // Native handles normalize short names, separators and reparse points.
+    // Do not invoke ShellLink Resolve: it can search for moved foreign targets.
+    const target = try Identity.finalPath(alloc, &target_buffer);
+    defer alloc.free(target);
+    const executable = try Identity.finalPath(alloc, identity.exe);
+    defer alloc.free(executable);
+    if (!pinCandidate(identity, true, target, executable)) return false;
+    try setString(properties, &pkey_aumid, identity.aumid);
+    try check(Identity.method(*const fn (*Interface) callconv(.winapi) HRESULT, properties, 7)(properties));
+    try saveLink(link, path);
+    return true;
+}
+
+fn saveLink(link: *Interface, path: [:0]const u16) !void {
+    const file = try Identity.query(link, &iid_persist_file);
+    defer Identity.release(file);
+    try check(Identity.method(*const fn (*Interface, [*:0]const u16, i32) callconv(.winapi) HRESULT, file, 6)(file, path, 1));
+}
+
+fn loadLink(path: [:0]const u16) !*Interface {
+    const link = try create(&clsid_link, &iid_link);
+    errdefer Identity.release(link);
+    const file = try Identity.query(link, &iid_persist_file);
+    defer Identity.release(file);
+    try check(Identity.method(*const fn (*Interface, [*:0]const u16, u32) callconv(.winapi) HRESULT, file, 5)(file, path, 2));
+    return link;
+}
+
+test "apprt.win32.shell.D28 pin filtering requires installed identity empty AUMID and exact canonical path" {
+    const t = std.testing;
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    var installed = try Identity.init(t.allocator, .installed, "C:/GX/ghostty.exe", true);
+    defer installed.deinit();
+    var portable = try Identity.init(t.allocator, .portable, "C:/GX/ghostty.exe", false);
+    defer portable.deinit();
+    try t.expect(pinCandidate(&installed, true, wide("C:\\GX\\GHOSTTY.EXE"), wide("c:\\gx\\ghostty.exe")));
+    try t.expect(!pinCandidate(&installed, false, installed.exe, installed.exe));
+    try t.expect(!pinCandidate(&portable, true, installed.exe, installed.exe));
+    try migratePinned(t.allocator, t.io, &portable);
+    try t.expect(!pinCandidate(&installed, true, wide("C:\\Other\\ghostty.exe"), installed.exe));
+    try t.expect(!pinCandidate(&installed, true, wide("C:\\GX\\ghostty.exe.other"), installed.exe));
+}
+
+test "apprt.win32.shell.D28 real saved links migrate only empty matching pin and are idempotent" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const Com = struct {
+        extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) HRESULT;
+        extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+    };
+    const initialized = Com.CoInitializeEx(null, 2);
+    if (initialized != @as(i32, @bitCast(@as(u32, 0x80010106)))) try check(initialized);
+    defer if (initialized >= 0) Com.CoUninitialize();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "ghostty.exe", "other.exe" }) |name| {
+        const file = try tmp.dir.createFile(t.io, name, .{});
+        file.close(t.io);
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", alloc);
+    defer alloc.free(root);
+    const exe = try std.fs.path.join(alloc, &.{ root, "ghostty.exe" });
+    defer alloc.free(exe);
+    var identity = try Identity.init(alloc, .installed, exe, true);
+    defer identity.deinit();
+    const other = try std.fs.path.join(alloc, &.{ root, "other.exe" });
+    defer alloc.free(other);
+    const other_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, other);
+    defer alloc.free(other_w);
+    try tmp.dir.createDir(t.io, "nested", .default_dir);
+    for (0..4) |index| {
+        const name = if (index == 0) try alloc.dupe(u8, "nested/0.LNK") else try std.fmt.allocPrint(alloc, "{d}.lnk", .{index});
+        defer alloc.free(name);
+        const path = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+        defer alloc.free(wide);
+        {
+            const link = try create(&clsid_link, &iid_link);
+            defer Identity.release(link);
+            try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 20)(link, if (index == 2) other_w else identity.exe));
+            const properties = try Identity.query(link, &iid_property_store);
+            defer Identity.release(properties);
+            if (index == 1 or index == 3) {
+                try setString(properties, &pkey_aumid, if (index == 1) std.unicode.utf8ToUtf16LeStringLiteral("another.application") else identity.aumid);
+                try check(Identity.method(*const fn (*Interface) callconv(.winapi) HRESULT, properties, 7)(properties));
+            }
+            try saveLink(link, wide);
+        }
+        const before = try tmp.dir.readFileAlloc(t.io, name, alloc, .limited(1024 * 1024));
+        defer alloc.free(before);
+        if (index == 0) {
+            var changed: usize = 0;
+            try migratePinDirectory(alloc, t.io, &identity, root, &changed);
+            try t.expectEqual(@as(usize, 1), changed);
+            try migratePinDirectory(alloc, t.io, &identity, root, &changed);
+            try t.expectEqual(@as(usize, 1), changed);
+        } else try t.expect(!try migrateShortcut(alloc, &identity, wide));
+        const after = try tmp.dir.readFileAlloc(t.io, name, alloc, .limited(1024 * 1024));
+        defer alloc.free(after);
+        if (index != 0) try t.expectEqualSlices(u8, before, after);
+        try t.expect(!try migrateShortcut(alloc, &identity, wide));
+        const twice = try tmp.dir.readFileAlloc(t.io, name, alloc, .limited(1024 * 1024));
+        defer alloc.free(twice);
+        try t.expectEqualSlices(u8, after, twice);
+        if (index == 0) {
+            const link = try loadLink(wide);
+            defer Identity.release(link);
+            const properties = try Identity.query(link, &iid_property_store);
+            defer Identity.release(properties);
+            var value: PropertyVariant = .{ .vt = 0, .value = .{ .storage = .{ 0, 0 } } };
+            try check(Identity.method(*const fn (*Interface, *const PropertyKey, *PropertyVariant) callconv(.winapi) HRESULT, properties, 5)(properties, &pkey_aumid, &value));
+            defer _ = PropVariantClear(&value);
+            try t.expectEqual(@as(u16, 31), value.vt);
+            try t.expectEqualSlices(u16, identity.aumid, std.mem.span(value.value.string));
+        }
+    }
+}
+
+extern "shell32" fn SHGetKnownFolderPath(*const GUID, u32, ?std.os.windows.HANDLE, *?[*:0]u16) callconv(.winapi) HRESULT;
+extern "shell32" fn SHChangeNotify(i32, u32, ?*const anyopaque, ?*const anyopaque) callconv(.winapi) void;
+extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
+extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) HRESULT;
+extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+const migration_log = std.log.scoped(.win32_shell);
+
+/// Runs only on the existing shell worker, using its owned identity snapshot.
+/// Every COM object stays on that thread. No registration or pin is created.
+pub fn migratePinned(alloc: std.mem.Allocator, io: std.Io, identity: *const Identity) !void {
+    if (identity.mode != .installed or !identity.registration_verified or
+        !std.mem.eql(u8, identity.aumid_utf8, Identity.installed_aumid)) return;
+    try check(CoInitializeEx(null, 0));
+    defer CoUninitialize();
+    var roaming: ?[*:0]u16 = null;
+    const folder = Identity.guid("3eb685db-65f9-4cf6-a03a-e3ef65729f3d");
+    try check(SHGetKnownFolderPath(&folder, 0, null, &roaming));
+    defer CoTaskMemFree(@ptrCast(roaming));
+    const base = try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(roaming orelse return error.ShellUnavailable));
+    defer alloc.free(base);
+    var changed: usize = 0;
+    // SHCNE_ASSOCCHANGED, SHCNF_IDLIST: let Explorer refresh cached grouping.
+    defer if (changed != 0) SHChangeNotify(0x08000000, 0, null, null);
+    for ([_][]const u8{ "TaskBar", "StartMenu", "ImplicitAppShortcuts" }) |name| {
+        const root = try std.fs.path.join(alloc, &.{ base, "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", name });
+        defer alloc.free(root);
+        migratePinDirectory(alloc, io, identity, root, &changed) catch |err| {
+            migration_log.warn("Pinned shortcut scan failed ({s}): {}", .{ name, err });
+        };
+    }
+}
+
+fn migratePinDirectory(alloc: std.mem.Allocator, io: std.Io, identity: *const Identity, root: []const u8, changed: *usize) !void {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer dir.close(io);
+    var walker = try dir.walkSelectively(alloc);
+    defer walker.deinit();
+    // Drain the walker even after individual failures, so one damaged pin or
+    // unreadable subdirectory cannot prevent migration of its siblings.
+    while (true) {
+        const entry = (walker.next(io) catch |err| {
+            migration_log.warn("Pinned shortcut enumeration failed: {}", .{err});
+            continue;
+        }) orelse break;
+        if (entry.kind == .directory) {
+            walker.enter(io, entry) catch |err| {
+                migration_log.warn("Pinned shortcut subdirectory failed: {}", .{err});
+            };
+            continue;
+        }
+        if (entry.kind != .file or !std.ascii.eqlIgnoreCase(std.fs.path.extension(entry.basename), ".lnk")) continue;
+        const path = try std.fs.path.join(alloc, &.{ root, entry.path });
+        defer alloc.free(path);
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+        defer alloc.free(wide);
+        if (migrateShortcut(alloc, identity, wide) catch |err| {
+            migration_log.warn("Pinned shortcut migration failed ({s}): {}", .{ entry.path, err });
+            continue;
+        }) changed.* += 1;
+    }
+}
