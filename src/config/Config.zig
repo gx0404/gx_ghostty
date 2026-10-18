@@ -886,12 +886,13 @@ palette: Palette = .{},
 /// (with `cursor-style-blink`): the shell integration resets the cursor to it
 /// before each command. Ghostty GX also shows it at the prompt by default, so
 /// a style that a program left behind is reset when the next prompt appears.
-/// With zsh or fish vi key bindings the prompt still tells the modes apart,
-/// by default with a bar while inserting and a block in command mode. To get
-/// upstream Ghostty's bar at the prompt while programs keep this style, set
-/// `gx-prompt-cursor = bar`. To stop the shell integration from changing the
-/// cursor, specify `shell-integration-features = no-cursor` or disable shell
-/// integration entirely.
+/// With zsh vi key bindings the prompt still tells the modes apart, with a
+/// bar while inserting and a block in command mode; fish vi key bindings set
+/// the cursor themselves. To get upstream Ghostty's bar at the prompt while
+/// programs keep this style, set `gx-prompt-cursor = bar`. To stop the shell
+/// integration from changing the cursor, specify
+/// `shell-integration-features = no-cursor` or disable shell integration
+/// entirely.
 // fork(gx): GX-0047 end
 ///
 /// Valid values are:
