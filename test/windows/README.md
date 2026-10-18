@@ -211,7 +211,9 @@ provider 状态，以随后的 `fixture_uia ... reason=` 为准。无 Value 正�
 弹层焦点原位移动（`Publisher.moveFocus`）入队时记 `fixture_uia ... kind=focus_changed
 reason=queued`，消息循环发事件时记 `fixture_uia_focus snapshot=N node=N raised=true|false`；
 `raised` 只是 UiaRaiseAutomationEvent 的返回值，不代表客户端收到，焦点已移走时为 false，
-快照已换则不派发也不记。
+快照已换则不派发也不记。焦点随新快照到达时（菜单滚动、键盘打开菜单/子菜单、Settings 换页），
+发布后同样入队一次 `focus_changed`：条件是焦点元素的稳定身份（令牌；Settings 为命中目标）
+与上次已发出事件的不同，或弹层刚显示（桥 `hide` 后）且有焦点元素；焦点不变的重发不入队。
 Python FAIL JSON 保留 `stage/node_id/pattern_id/call/hresult/action_results`，不重试。
 
 ### A2r 远程控制接口（MIG-07 / MIG-08）

@@ -288,19 +288,34 @@ pub const PopupBridge = struct {
     /// the keyboard focus is now (`Popup.focusMoved`): `publish` moves the
     /// focus within the current snapshot instead of replacing it.
     focus_only: bool = false,
+    /// Stable identity of each node of the current snapshot, parallel to
+    /// `tokens`: the token itself unless the widget's tokens are positions
+    /// (`publishKeyed`; Settings keys its hits by target).
+    keys: [uia.max_nodes]u64 = @splat(0),
+    /// Identity of the element the current snapshot gives the focus (null:
+    /// none, or no snapshot).
+    focus_key: ?u64 = null,
+    /// Identity whose focus changed event was last raised while it had the
+    /// focus. Null since the popup was shown, and whenever the focus left
+    /// every element: the next element to get the focus is reported.
+    focus_reported: ?u64 = null,
 
     /// A GUI model edit invalidates all pending index-based actions immediately.
     /// The owning widget schedules publish after its new model/layout is ready.
+    /// What the focus was last reported on survives, so a republication that
+    /// keeps the focus where it was raises no second event.
     pub fn dirty(self: *PopupBridge) void {
         self.publisher.hide();
         self.length = 0;
         self.needs_publish = true;
+        self.focus_key = null;
     }
     pub fn hide(self: *PopupBridge) void {
         self.dirty();
         self.announcement.cancel();
         self.callbacks = null;
         self.hwnd = null;
+        self.focus_reported = null;
     }
     pub fn deinit(self: *PopupBridge) void {
         self.hide();
@@ -311,9 +326,17 @@ pub const PopupBridge = struct {
         return !self.focus_only and !self.needs_publish and self.publisher.current != null;
     }
     pub fn publish(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, hwnd: w32.HWND, nodes: []const uia.NodeSpec, tokens: []const u64, callbacks: PopupCallbacks) !void {
+        return self.publishKeyed(api, queue, attachment, hwnd, nodes, tokens, tokens, callbacks);
+    }
+    /// `publish` with each node's stable identity in `keys` (parallel to
+    /// `tokens`) for widgets whose tokens are positions. A new snapshot that
+    /// gives the focus to an element other than the one last reported, or
+    /// to any element right after the popup was shown, queues its focus
+    /// changed event for the App message loop once published.
+    pub fn publishKeyed(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, hwnd: w32.HWND, nodes: []const uia.NodeSpec, tokens: []const u64, keys: []const u64, callbacks: PopupCallbacks) !void {
         errdefer self.hide();
         if (!callbacks.is_live(callbacks.context) or !attachment.isValid()) return self.hide();
-        if (nodes.len != tokens.len or nodes.len > self.tokens.len) return error.InvalidSnapshot;
+        if (nodes.len != tokens.len or keys.len != tokens.len or nodes.len > self.tokens.len) return error.InvalidSnapshot;
         if (!self.focus_only and !self.needs_publish and self.hwnd == hwnd and self.publisher.current != null) return;
         var effective: [uia.max_nodes]uia.NodeSpec = undefined;
         @memcpy(effective[0..nodes.len], nodes);
@@ -321,31 +344,52 @@ pub const PopupBridge = struct {
             node.enabled = false;
             if (node.patterns.window) node.window_interaction_state = 3;
         };
-        if (self.focus_only) return self.moveFocusTo(attachment, hwnd, effective[0..nodes.len], tokens, callbacks);
+        if (self.focus_only) return self.moveFocusTo(attachment, hwnd, effective[0..nodes.len], tokens, keys, callbacks);
         try self.publisher.publish(std.heap.page_allocator, api, queue, attachment, hwnd, effective[0..nodes.len]);
         @memcpy(self.tokens[0..tokens.len], tokens);
+        @memcpy(self.keys[0..keys.len], keys);
         self.length = tokens.len;
         self.hwnd = hwnd;
         self.callbacks = callbacks;
         self.needs_publish = false;
         self.announcement.retry(&self.publisher);
+        self.trackFocus(focusedKey(nodes, keys), true);
+    }
+    /// The identity of the node the snapshot gives the focus: the first one
+    /// marked focused, as `uia.Snapshot` takes it.
+    fn focusedKey(nodes: []const uia.NodeSpec, keys: []const u64) ?u64 {
+        for (nodes, keys) |node, key| if (node.focused) return key;
+        return null;
+    }
+    /// The focus is now on the element `key` (null: on none). A focus that
+    /// arrives with a new snapshot on an element other than the one last
+    /// reported is queued for the message loop here; an in-place move queued
+    /// its own event in `Publisher.moveFocus`.
+    fn trackFocus(self: *PopupBridge, key: ?u64, new_snapshot: bool) void {
+        self.focus_key = key;
+        const focused = key orelse {
+            self.focus_reported = null;
+            return;
+        };
+        if (self.focus_reported) |reported| if (reported == focused) return;
+        if (new_snapshot) _ = self.publisher.queueFocusChanged();
     }
     /// A focus-only rebuild (`focus_only`). When its specs describe the
     /// current snapshot's elements unchanged apart from the focus (the same
-    /// window, owner, callbacks, tokens in the same order and node specs),
-    /// the focus moves in place to the node they mark focused, and the
-    /// elements clients hold stay valid. Anything else is a model change no
-    /// invalidation announced: revoke the snapshot, and publish anew at the
-    /// next request. A focus-only rebuild never publishes.
-    fn moveFocusTo(self: *PopupBridge, attachment: refs.Attachment, hwnd: w32.HWND, nodes: []const uia.NodeSpec, tokens: []const u64, callbacks: PopupCallbacks) void {
+    /// window, owner, callbacks, tokens and keys in the same order and node
+    /// specs), the focus moves in place to the node they mark focused, and
+    /// the elements clients hold stay valid. Anything else is a model change
+    /// no invalidation announced: revoke the snapshot, and publish anew at
+    /// the next request. A focus-only rebuild never publishes.
+    fn moveFocusTo(self: *PopupBridge, attachment: refs.Attachment, hwnd: w32.HWND, nodes: []const uia.NodeSpec, tokens: []const u64, keys: []const u64, callbacks: PopupCallbacks) void {
         const current = self.callbacks orelse return self.dirty();
         if (self.hwnd == hwnd and std.meta.eql(current, callbacks) and std.mem.eql(u64, tokens, self.tokens[0..self.length]) and
-            self.publisher.matchesExceptFocus(attachment, hwnd, nodes))
+            std.mem.eql(u64, keys, self.keys[0..self.length]) and self.publisher.matchesExceptFocus(attachment, hwnd, nodes))
         {
             const focused: u64 = for (nodes) |node| {
                 if (node.focused) break node.id;
             } else 0;
-            if (self.publisher.moveFocus(focused)) return;
+            if (self.publisher.moveFocus(focused)) return self.trackFocus(focusedKey(nodes, keys), false);
         }
         self.dirty();
     }
@@ -372,14 +416,18 @@ pub const PopupBridge = struct {
             if (!delivered) std.log.scoped(.win32_uia).warn("notification API rejected an announcement", .{});
             return delivered;
         }
-        // Queued by Publisher.moveFocus and raised here, from the message
-        // loop: no widget callback, nothing revoked.
-        if (action.kind == .focus_changed) {
-            const raised = self.publisher.raiseFocusChanged(action.node_id);
-            if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_focus snapshot={d} node={d} raised={}", .{ action.snapshot_id, action.node_id, raised });
-            return raised;
-        }
+        if (action.kind == .focus_changed) return self.dispatchFocusChanged(action);
         return self.dispatchPrepared(callbacks, token, action);
+    }
+    /// A focus changed event of the current snapshot (queued by
+    /// `Publisher.moveFocus` or `trackFocus`), raised here from the message
+    /// loop, outside locks: no widget callback, nothing revoked. Raised while
+    /// its node still has the focus, that element counts as reported.
+    fn dispatchFocusChanged(self: *PopupBridge, action: *const uia.Action) bool {
+        const raised = self.publisher.raiseFocusChanged(action.node_id);
+        if (raised) self.focus_reported = self.focus_key;
+        if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_focus snapshot={d} node={d} raised={}", .{ action.snapshot_id, action.node_id, raised });
+        return raised;
     }
     fn dispatchPrepared(self: *PopupBridge, callbacks: PopupCallbacks, token: u64, action: *const uia.Action) bool {
         // UIAutomation may focus a Value target before calling SetValue on the
@@ -569,7 +617,7 @@ pub const PopupBridge = struct {
                 .chip => |chip| {
                     if (chip.row >= rows.len or chip.index >= rows[chip.row].choices.len) continue;
                     const row = rows[chip.row];
-                    if (groups[chip.row] == null) groups[chip.row] = try builder.add(.{ .id = 0, .parent = 0, .name = row.title, .role = .list, .bounds = spec.bounds, .patterns = .{ .selection = true }, .selection_required = true, .focusable = state.container_focusable, .focused = state.container_focused }, settings_hit_base + hit_index);
+                    if (groups[chip.row] == null) groups[chip.row] = try builder.addKeyed(.{ .id = 0, .parent = 0, .name = row.title, .role = .list, .bounds = spec.bounds, .patterns = .{ .selection = true }, .selection_required = true, .focusable = state.container_focusable, .focused = state.container_focused }, settings_hit_base + hit_index, settingsGroupKey(chip.row));
                     const parent = groups[chip.row].?;
                     builder.nodes[parent].bounds = unionRect(builder.nodes[parent].bounds, spec.bounds);
                     spec.parent = parent;
@@ -638,9 +686,9 @@ pub const PopupBridge = struct {
                     spec.selected = list.cursor == item.index;
                 },
             }
-            _ = try builder.add(spec, settings_hit_base + @as(u64, @intCast(hit_index)));
+            _ = try builder.addKeyed(spec, settings_hit_base + @as(u64, @intCast(hit_index)), settingsKey(hit.target));
         }
-        try self.publish(api, queue, attachment, hwnd, builder.nodes[0..builder.length], builder.tokens[0..builder.length], callbacks);
+        try self.publishKeyed(api, queue, attachment, hwnd, builder.nodes[0..builder.length], builder.tokens[0..builder.length], builder.keys[0..builder.length], callbacks);
     }
 };
 
@@ -835,6 +883,210 @@ test "popup focus-only rebuild moves HasKeyboardFocus and GetFocus in place" {
     try testing.expect(bridge.publisher.current == null and bridge.needs_publish);
 }
 
+test "popup publications report a focus that arrives with a new snapshot" {
+    // A popup just shown with a focused element, and a republication that
+    // gives the focus to another element (a menu that scrolls as the keyboard
+    // moves, a submenu or page opened from the keyboard), each queue one
+    // focus changed event for the new snapshot; a republication that keeps
+    // the focus where it was reported raises none. The queue posts to a real
+    // message-only window, and the event names the real provider face.
+    const testing = std.testing;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const sink = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer {
+        var drained: w32.MSG = undefined;
+        while (w32.PeekMessageW(&drained, sink, 0, 0, w32.PM_REMOVE) != 0) {}
+        _ = w32.DestroyWindow(sink);
+    }
+    const Recorder = struct {
+        var raised: usize = 0;
+        var sender: ?*uia.Face = null;
+        fn raise(face: *uia.Face, event: i32) callconv(.winapi) i32 {
+            if (event != 20005) return -1;
+            raised += 1;
+            sender = face;
+            return 0;
+        }
+    };
+    Recorder.raised = 0;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = Recorder.raise;
+    api.notification = null;
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = sink };
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    defer queue.close();
+    const attachment: refs.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const Widget = struct {
+        fn live(_: *anyopaque) bool {
+            return true;
+        }
+        fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+            return true;
+        }
+        /// A menu: New Tab (node 2) and the Split submenu (node 3);
+        /// `focus` is a node id, 0 for none.
+        fn specs(focus: u64, expanded: bool) [3]uia.NodeSpec {
+            return .{
+                .{ .id = 1, .name = "Menu", .role = .menu },
+                .{ .id = 2, .parent = 0, .name = "New Tab", .role = .menu_item, .patterns = .{ .invoke = true }, .focusable = true, .focused = focus == 2 },
+                .{ .id = 3, .parent = 0, .name = "Split", .role = .menu_item, .patterns = .{ .expand_collapse = true }, .expand_state = @intFromBool(expanded), .focusable = true, .focused = focus == 3 },
+            };
+        }
+    };
+    const Simple = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+        GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
+        GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
+    };
+    const Probe = struct {
+        /// UIA_HasKeyboardFocusPropertyId (30008) through the provider's vtable.
+        fn hasFocus(face: *uia.Face) !bool {
+            const table: *const Simple = @ptrCast(@alignCast(face.vtable));
+            var value: uia.Variant = .{};
+            try testing.expectEqual(@as(i32, 0), table.GetPropertyValue(face, 30008, &value));
+            return value.data.integer != 0;
+        }
+        /// The next queued action, which must be a focus changed event.
+        fn event(q: *uia.Queue) !uia.Action {
+            const action = q.pop() orelse return error.NoFocusEvent;
+            try testing.expectEqual(uia.ActionKind.focus_changed, action.kind);
+            return action;
+        }
+    };
+    var context: u8 = 0;
+    const callbacks: PopupCallbacks = .{ .context = &context, .is_live = Widget.live, .action = Widget.action };
+    const tokens = [_]u64{ 0, 1, 2 };
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+
+    // Shown with the keyboard on New Tab: reported once, naming its face.
+    const opened = Widget.specs(2, false);
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &opened, &tokens, callbacks);
+    const first = bridge.publisher.current.?;
+    var shown = try Probe.event(&queue);
+    defer shown.deinit();
+    try testing.expectEqual(first.id, shown.snapshot_id);
+    try testing.expectEqual(@as(u64, 2), shown.node_id);
+    try testing.expect(bridge.publisher.accepts(shown));
+    try testing.expect(bridge.dispatchFocusChanged(&shown));
+    try testing.expectEqual(@as(usize, 1), Recorder.raised);
+    try testing.expectEqual(@as(?*uia.Face, &first.nodes[1].faces[0]), Recorder.sender);
+    try testing.expect(queue.pop() == null);
+
+    // A model change that keeps the focus on New Tab: nothing to report.
+    bridge.dirty();
+    const expanded = Widget.specs(2, true);
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &expanded, &tokens, callbacks);
+    try testing.expect(queue.pop() == null);
+
+    // The keyboard moves to Split and the menu scrolls: the in-place event
+    // queued for the old snapshot goes stale; the new snapshot reports Split.
+    const down = Widget.specs(3, true);
+    bridge.focus_only = true;
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &down, &tokens, callbacks);
+    bridge.focus_only = false;
+    const before_scroll = bridge.publisher.current.?.id;
+    bridge.dirty();
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &down, &tokens, callbacks);
+    const scrolled = bridge.publisher.current.?;
+    var stale = try Probe.event(&queue);
+    defer stale.deinit();
+    try testing.expectEqual(before_scroll, stale.snapshot_id);
+    try testing.expect(!bridge.publisher.accepts(stale));
+    var moved = try Probe.event(&queue);
+    defer moved.deinit();
+    try testing.expectEqual(scrolled.id, moved.snapshot_id);
+    try testing.expectEqual(@as(u64, 3), moved.node_id);
+    try testing.expect(bridge.publisher.accepts(moved));
+    try testing.expect(bridge.dispatchFocusChanged(&moved));
+    try testing.expectEqual(@as(usize, 2), Recorder.raised);
+    try testing.expectEqual(@as(?*uia.Face, &scrolled.nodes[2].faces[0]), Recorder.sender);
+    try testing.expect(try Probe.hasFocus(&scrolled.nodes[2].faces[0]));
+    try testing.expect(!try Probe.hasFocus(&scrolled.nodes[1].faces[0]));
+    try testing.expect(queue.pop() == null);
+
+    // Settings-like positional tokens shift while the keys stay: the focus
+    // did not move, nothing is reported.
+    bridge.dirty();
+    try bridge.publishKeyed(&api, &queue, attachment, @ptrFromInt(1), &down, &[_]u64{ 0, 11, 12 }, &tokens, callbacks);
+    try testing.expect(queue.pop() == null);
+
+    // The focus leaves every element, then comes back to Split: reported.
+    bridge.dirty();
+    const away = Widget.specs(0, true);
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &away, &tokens, callbacks);
+    try testing.expect(queue.pop() == null);
+    bridge.dirty();
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &down, &tokens, callbacks);
+    var back = try Probe.event(&queue);
+    defer back.deinit();
+    try testing.expectEqual(@as(u64, 3), back.node_id);
+    try testing.expect(bridge.dispatchFocusChanged(&back));
+    try testing.expectEqual(@as(usize, 3), Recorder.raised);
+
+    // Hidden and shown again on the same element: reported again. An event
+    // the loop has not dispatched before the next publication is replaced
+    // by that publication's own, never raised twice.
+    bridge.hide();
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &down, &tokens, callbacks);
+    var reshown = try Probe.event(&queue);
+    defer reshown.deinit();
+    try testing.expect(bridge.publisher.accepts(reshown));
+    bridge.dirty();
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &down, &tokens, callbacks);
+    try testing.expect(!bridge.publisher.accepts(reshown));
+    var latest = try Probe.event(&queue);
+    defer latest.deinit();
+    try testing.expect(bridge.publisher.accepts(latest));
+    try testing.expect(bridge.dispatchFocusChanged(&latest));
+    try testing.expectEqual(@as(usize, 4), Recorder.raised);
+    try testing.expect(queue.pop() == null);
+}
+
+test "settings focus keys follow the hit target, not its position" {
+    const Section = enum { general, appearance };
+    const Step = enum { minus, plus };
+    const GroupButton = enum { reset, apply_theme, apply_font };
+    const Target = union(enum) {
+        section: Section,
+        search,
+        close,
+        row: u16,
+        chip: struct { row: u16, index: u8 },
+        step: struct { row: u16, step: Step },
+        value: u16,
+        item: struct { row: u16, index: u32 },
+        field: u16,
+        group_button: struct { row: u16, button: GroupButton },
+        reset: u16,
+    };
+    const targets = [_]Target{
+        .{ .section = .general },                                  .{ .section = .appearance },
+        .search,                                                   .close,
+        .{ .row = 3 },                                             .{ .row = 4 },
+        .{ .chip = .{ .row = 3, .index = 1 } },                    .{ .chip = .{ .row = 4, .index = 1 } },
+        .{ .step = .{ .row = 3, .step = .plus } },                 .{ .value = 3 },
+        .{ .item = .{ .row = 3, .index = 70000 } },                .{ .field = 3 },
+        .{ .group_button = .{ .row = 3, .button = .apply_font } }, .{ .reset = 3 },
+    };
+    for (targets, 0..) |target, i| {
+        // Equal targets give equal keys wherever their hits are.
+        try std.testing.expectEqual(settingsKey(target), settingsKey(targets[i]));
+        for (targets[i + 1 ..]) |other| try std.testing.expect(settingsKey(target) != settingsKey(other));
+        try std.testing.expect(settingsKey(target) != settingsGroupKey(3));
+    }
+    try std.testing.expect(settingsGroupKey(3) != settingsGroupKey(4));
+}
+
 pub const palette_root: u64 = 0;
 pub const palette_filter: u64 = 1;
 pub const palette_list: u64 = 2;
@@ -847,17 +1099,41 @@ pub const ControlState = struct { enabled: bool = true, focused: bool = false, f
 const PopupBuilder = struct {
     nodes: [uia.max_nodes]uia.NodeSpec = undefined,
     tokens: [uia.max_nodes]u64 = undefined,
+    keys: [uia.max_nodes]u64 = undefined,
     length: usize = 0,
     fn add(self: *PopupBuilder, input: uia.NodeSpec, token: u64) !u16 {
+        return self.addKeyed(input, token, token);
+    }
+    /// `key`: the node's stable identity where its token is a position.
+    fn addKeyed(self: *PopupBuilder, input: uia.NodeSpec, token: u64, key: u64) !u16 {
         if (self.length == self.nodes.len) return error.TooManyNodes;
         const index = self.length;
         self.nodes[index] = input;
         self.nodes[index].id = index + 1;
         self.tokens[index] = token;
+        self.keys[index] = key;
         self.length += 1;
         return @intCast(index);
     }
 };
+/// Settings tokens are hit positions, which scrolling shifts; the focus
+/// follows the hit's target, which stays with its control.
+fn settingsKey(target: anytype) u64 {
+    const payload: u64 = switch (target) {
+        .section => |section| @intFromEnum(section),
+        .search, .close => 0,
+        .row, .value, .field, .reset => |index| index,
+        .chip => |chip| @as(u64, chip.row) << 8 | chip.index,
+        .step => |step| @as(u64, step.row) << 8 | @intFromEnum(step.step),
+        .item => |item| @as(u64, item.row) << 32 | item.index,
+        .group_button => |group| @as(u64, group.row) << 8 | @intFromEnum(group.button),
+    };
+    return (@as(u64, @intFromEnum(std.meta.activeTag(target))) + 1) << 56 | payload;
+}
+/// The chip list of a row; no hit target is a row's chip list.
+fn settingsGroupKey(row: u16) u64 {
+    return @as(u64, 0xff) << 56 | row;
+}
 fn dipRect(rect: d2d.Rect, popup: w32.RECT, scale: f32) uia.Rect {
     return .{ .x = @as(f64, @floatFromInt(popup.left)) + @as(f64, rect.x * scale), .y = @as(f64, @floatFromInt(popup.top)) + @as(f64, rect.y * scale), .width = @max(0, rect.w * scale), .height = @max(0, rect.h * scale) };
 }

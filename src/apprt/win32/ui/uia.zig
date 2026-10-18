@@ -283,6 +283,21 @@ pub const Publisher = struct {
         _ = snapshot.queue.postWith(snapshot, node_id, .focus_changed, "", 0, post_message);
         return true;
     }
+    /// GUI thread, after a publication: queue the focus changed event of the
+    /// current snapshot's focused node for the App message loop, as
+    /// `moveFocus` does for an in-place move (`PopupBridge` decides whether
+    /// the publication moved the focus). False without an active snapshot or
+    /// a focused node (stable views included), or when the queue refuses it.
+    pub fn queueFocusChanged(self: *const Publisher) bool {
+        return self.queueFocusChangedWith(w32.PostMessageW);
+    }
+    fn queueFocusChangedWith(self: *const Publisher, post_message: anytype) bool {
+        const snapshot = self.current orelse return false;
+        if (!snapshot.isActive() or snapshot.view != null) return false;
+        const node_id = snapshot.focus.load(.acquire);
+        if (node_id == 0) return false;
+        return snapshot.queue.postWith(snapshot, node_id, .focus_changed, "", 0, post_message) == S_OK;
+    }
     /// From the App message loop, outside locks (`PopupBridge.dispatch`):
     /// raise UIA_AutomationFocusChangedEventId for `node_id` if it still has
     /// the focus in the current snapshot. A true return is an API result,
@@ -1338,4 +1353,36 @@ test "UIA only a focus difference matches a published snapshot" {
     try std.testing.expect(!publisher.moveFocusWith(1, testPost));
     publisher.hide();
     try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, &specs));
+}
+
+test "UIA a publication's focus is queued for the message loop on request" {
+    const alloc = std.testing.allocator;
+    var api: Api = undefined;
+    api.count = .init(1);
+    const queue = try Queue.create(alloc, @ptrFromInt(1));
+    defer queue.release();
+    var publisher: Publisher = .{};
+    defer publisher.deinit();
+    const attachment = testAttachment();
+    const hwnd: w32.HWND = @ptrFromInt(1);
+    try std.testing.expect(!publisher.queueFocusChangedWith(testPost));
+    try publisher.publish(alloc, &api, queue, attachment, hwnd, &.{
+        .{ .id = 1, .name = "Menu" },
+        .{ .id = 2, .parent = 0, .name = "New Tab", .focusable = true },
+        .{ .id = 3, .parent = 0, .name = "Split", .focusable = true, .focused = true },
+    });
+    try std.testing.expect(publisher.queueFocusChangedWith(testPost));
+    var queued = queue.pop().?;
+    defer queued.deinit();
+    try std.testing.expectEqual(ActionKind.focus_changed, queued.kind);
+    try std.testing.expectEqual(@as(u64, 3), queued.node_id);
+    try std.testing.expect(publisher.accepts(queued));
+    // Nothing focused, a stable view, or a hidden snapshot: nothing to queue.
+    try std.testing.expect(publisher.moveFocusWith(0, testPost));
+    try std.testing.expect(!publisher.queueFocusChangedWith(testPost));
+    try publisher.publishStableWithId(alloc, &api, queue, attachment, hwnd, 99, &.{.{ .id = 1, .name = "View", .focusable = true, .focused = true }});
+    try std.testing.expect(!publisher.queueFocusChangedWith(testPost));
+    publisher.hide();
+    try std.testing.expect(!publisher.queueFocusChangedWith(testPost));
+    try std.testing.expectEqual(@as(usize, 0), queue.length);
 }
