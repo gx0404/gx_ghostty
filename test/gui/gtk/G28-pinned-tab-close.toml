@@ -1,5 +1,5 @@
 id = "G28"
-title = "D-21/D-22/D-24: pinned tabs stay when the tabs to the right or the other tabs close (tab menu, key bindings, command palette), and new or moved-in tabs go after them"
+title = "D-21/D-22/D-24/D-26: pinned tabs stay when the tabs to the right or the other tabs close (tab menu, key bindings, command palette), new or moved-in tabs go after them, and moves wrap within each group"
 lang = "en"
 config = """
 command = direct:/bin/bash --noprofile --norc
@@ -11,6 +11,8 @@ keybind = ctrl+alt+o=close_tab:other
 keybind = ctrl+alt+g=close_tab:right
 keybind = ctrl+alt+d=new_split:right
 keybind = ctrl+alt+n=gx:move_split_to_tab
+keybind = ctrl+alt+right=move_tab:1
+keybind = ctrl+alt+left=move_tab:-1
 """
 # The window is 1100x740 at the top left: the tab bar is at y 67, and the
 # two pinned tabs P1 and P2 sit at x 33 and 72. Tab menu items lie 80 px
@@ -150,6 +152,31 @@ name_tab("S1")
 capture("08-split-to-tab-from-first-pinned")
 assert "CRITICAL" not in log(), "a split pane moved from P1 was refused"
 assert closed() == kept, "a terminal closed while moving the split"
+
+# D-26: each move wraps inside its pinned/unpinned group. The selected
+# pinned tab is identifiable by the window title and its selected slot.
+def move_tab(key, shot):
+    if key.startswith("Move Tab"):
+        palette(key)
+        xdo("key", "Return")
+    else:
+        xdo("key", key)
+    sleep(0.8)
+    capture(shot)
+    assert "CRITICAL" not in log(), "move_tab crossed the pinned boundary: " + shot
+
+# P1, P2 | S1, N11 -> P2, P1 | S1, N11 (last pinned right).
+select_tab(72)
+move_tab("ctrl+alt+Right", "09-last-pinned-right")
+# P2, P1 -> P1, P2 (first pinned left).
+move_tab("Move Tab Left", "10-first-pinned-left")
+# S1, N11 -> N11, S1 (first ordinary left).
+select_tab(340)
+move_tab("ctrl+alt+Left", "11-first-unpinned-left")
+# N11, S1 -> S1, N11 (last ordinary right).
+move_tab("Move Tab Right", "12-last-unpinned-right")
+assert closed() == kept, "a terminal closed while moving tabs"
+
 '''
 expect = [
   "G28.png: the isolated terminal with one tab",
@@ -166,5 +193,9 @@ expect = [
   "G28-closed.json: the surfaces each step closed: 2, 2, 3, 2 and 1",
   "G28-07-new-tab-from-first-pinned.png: with the first pinned tab P1 selected, Ctrl+Shift+T makes the selected tab N11 after the pinned P1 and P2",
   "G28-08-split-to-tab-from-first-pinned.png: the right split of P1 moved to the selected tab S1 after the pinned P1 and P2 and before N11; P1 keeps its other terminal",
+  "G28-09-last-pinned-right.png: selected P2 wraps to the first pinned slot; both pinned tabs and S1, N11 stay",
+  "G28-10-first-pinned-left.png: selected P2 wraps back to the second pinned slot",
+  "G28-11-first-unpinned-left.png: selected S1 wraps after N11; both pinned tabs stay at the start",
+  "G28-12-last-unpinned-right.png: selected S1 wraps before N11, after both pinned tabs",
   "G28.log: no CRITICAL line up to the last step (the script asserts it)",
 ]
