@@ -33,6 +33,8 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         -- COMMAND [ARGS...]
         --input-observe-only allowlists direct gx_perf.py gtk / just perf gtk and gx_wsl.py /
         just wsl smoke or scenario only; wrappers, run and unknown commands are rejected before locking.
+        Allowed just recipes become direct Python argv using scripts/ in the measurement cwd;
+        checked argv is executed with shell=False, so trailing shell controls stay literal arguments.
         Acquire all shared slots, check immediately inside the lease, run the command, check again
         before release. End-check failure invalidates the entire batch. With --injected-input a batch
         that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
@@ -1116,23 +1118,32 @@ def gate_exit_contract(command: Sequence[str]) -> bool:
     return False
 
 
+def normalize_observe_command(command: Sequence[str]) -> list[str]:
+    """Remove the just recipe's second shell interpretation, preserving measurement cwd.
+    In C1 the collector lives outside the frozen measurement checkout. Resolve its recipes
+    against the caller's cwd, never this collector's SCRIPTS; retain every trailing argv verbatim.
+    """
+    if len(command) >= 2 and process_name(command[0]).removesuffix('.exe') == 'just':
+        if command[1] in ('perf', 'wsl'):
+            script = Path.cwd() / 'scripts' / f'gx_{command[1]}.py'
+            return [sys.executable, str(script), *command[2:]]
+    return list(command)
+
+
 def desktop_command(command: Sequence[str]) -> bool:
-    """Conservatively require desktop input gates unless a direct Xvfb entry is allowlisted.
+    """Check normalized argv; require desktop input gates unless a direct Xvfb entry is allowlisted.
     Shell wrappers, Python module/command execution and unknown scripts are never unwrapped.
     """
     if len(command) < 3:
         return True
     launcher = process_name(command[0]).removesuffix('.exe')
     entry = process_name(command[1])
-    if launcher in ('python', 'python3', 'py'):
+    if launcher in ('python', 'python3', 'py') or command[0] == sys.executable:
         if entry not in ('gx_perf.py', 'gx_wsl.py'):
-            return True
-    elif launcher == 'just':
-        if entry not in ('perf', 'wsl'):
             return True
     else:
         return True
-    if entry in ('gx_perf.py', 'perf'):
+    if entry == 'gx_perf.py':
         return command[2] != 'gtk'
     # Only gx_wsl global options may precede its subcommand. Do not search arbitrary argv
     # for a token such as 'smoke': it could be a wrapper's argument or an option value.
@@ -1270,6 +1281,9 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     observe_input = bool(getattr(args, 'input_observe_only', False))
     if observe_input and args.injected_input:
         raise PerfError('--input-observe-only and --injected-input are mutually exclusive')
+    requested_command = list(command)
+    if observe_input:
+        command = normalize_observe_command(command)
     if observe_input and desktop_command(command):
         raise PerfError('--input-observe-only requires a direct gx_perf gtk or gx_wsl smoke/scenario command '
                         '(including just perf/just wsl); this command drives the Windows desktop or is not '
@@ -1277,6 +1291,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     out = new_output(args.out)
     guard_log = out / 'guards.jsonl'
     result = {'schema': 'gx-quiet-batch-v2', 'batch_id': uuid.uuid4().hex, 'command': command,
+              'requested_command': requested_command, 'command_cwd': str(Path.cwd()),
               'injected_input': args.injected_input, 'input_observe_only': observe_input, 'criteria': QUIET_CRITERIA,
               'criteria_options': {'strict_blacklist': bool(getattr(args, 'strict_blacklist', False)),
                                    'input_observe_only': observe_input},
@@ -1308,7 +1323,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                 try:
                     with (out / 'command.log').open('w', encoding='utf-8', newline='\n') as log:
                         runner = execute or subprocess.run
-                        child = runner(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
+                        child = runner(command, env=environment, stdout=log, stderr=subprocess.STDOUT, shell=False)
                         result['command_exit'] = child.returncode
                 except (Exception, KeyboardInterrupt) as exc:
                     raised = True
