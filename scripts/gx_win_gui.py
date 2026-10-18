@@ -24,7 +24,7 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   type ENV_DIR TEXT                 KEYEVENTF_UNICODE, "\\n" is Enter
   key ENV_DIR CHORD [--repeat N]    real virtual keys with scan codes, e.g. ctrl+shift+t
   click ENV_DIR X Y [--in ANCHOR] [--button left|right|middle|x1|x2] [--count N] [--mods ctrl,...]
-  wheel ENV_DIR X Y [--in ANCHOR] [--delta N] [--horizontal]
+  wheel ENV_DIR X Y [--in ANCHOR] [--delta N] [--horizontal] [--count N] [--mods ctrl,shift,alt,...]
   drag ENV_DIR X1 Y1 X2 Y2 [--in ANCHOR] [--steps N] [--button B]
   wait-log ENV_DIR REGEX [--timeout S]
   dpi ENV_DIR DPI                   test hook WM_GHOSTTY_SIMULATE_DPI (WM_USER+0x47)
@@ -46,7 +46,7 @@ with an action and its keys
   type text [delay repeat]              key keys [repeat delay]          clipboard text
   click [x y in window button count mods]           mouse_down / mouse_up [x y in window button mods]
   move [x y in window]                  drag from to [in window steps button]
-  drag_divider between fraction [steps]             wheel [x y in window delta horizontal count]
+  drag_divider between fraction [steps]             wheel [x y in window delta horizontal count mods]
   capture name [what=window|quick|popups|all method=screen|print]
   capture_window name [cls title timeout method]   another top-level window of the instance (not a
                                         GhosttyWindow; e.g. the MessageBox or TaskDialog of a failed
@@ -72,6 +72,9 @@ with an action and its keys
                                         without touching the Windows settings (WM_USER+0x49, wparam
                                         App.SimulatedSystemTheme); follow/follow returns to the system
 A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end.
+wheel with mods (a list such as ["ctrl"], e.g. Ctrl+wheel font zoom) presses those keys first, checks
+the guards again, sends the notches and then always releases exactly those keys, also when a guard
+or SendInput fails in between (audited as an abort release under GX_PERF_GUARD_LOG).
 
 file: path is relative to the isolated profile and must stay inside it. text writes the file (UTF-8,
 LF); directory = true creates the directory; readonly = true|false protects or releases the path.
@@ -204,6 +207,7 @@ SWP_NOOWNERZORDER = 0x0200
 
 MOD_KEYS = {"ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12, "menu": 0x12, "win": 0x5B,
             "super": 0x5B, "meta": 0x5B}
+MOD_NAMES = {0x11: "ctrl", 0x10: "shift", 0x12: "alt", 0x5B: "win"}
 NAMED_KEYS = {
     "enter": 0x0D, "return": 0x0D, "esc": 0x1B, "escape": 0x1B, "tab": 0x09, "space": 0x20,
     "backspace": 0x08, "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D, "home": 0x24,
@@ -271,6 +275,18 @@ def parse_chord(chord: str) -> tuple[list[int], int]:
         if MOD_KEYS[mod] not in vks:
             vks.append(MOD_KEYS[mod])
     return vks, key_vk(key, chord)
+
+
+def modifier_vks(mods: Iterable[str]) -> list[int]:
+    """Virtual keys of modifier names (ctrl, shift, alt, win and their aliases) without repeats."""
+    vks: list[int] = []
+    for mod in mods:
+        name = mod.strip().lower() if isinstance(mod, str) else mod
+        if name not in MOD_KEYS:
+            raise UsageError(f"unknown modifier {mod!r}; use {', '.join(MOD_KEYS)}")
+        if MOD_KEYS[name] not in vks:
+            vks.append(MOD_KEYS[name])
+    return vks
 
 
 def key_vk(key: str, chord: str = "") -> int:
@@ -1798,13 +1814,32 @@ class Instance:
         events += self._modifier_events(mods, True)
         w.send(events)
 
-    def wheel(self, x: int, y: int, delta: int = 120, horizontal: bool = False, count: int = 1) -> None:
+    def wheel(self, x: int, y: int, delta: int = 120, horizontal: bool = False, count: int = 1,
+              mods: Sequence[str] = ()) -> None:
+        """Wheel notches at (x, y). With mods those keys are pressed first and released after the notches,
+        always and only those, even when a guard or SendInput fails in between (as drag and hold_key)."""
         w = win32()
+        vks = modifier_vks(mods)
         self.ensure_foreground()
         self.ensure_point(x, y)
         events = [w.mouse_input(0x0001 | 0x8000 | 0x4000, x, y)]
         events += [w.mouse_input(0x1000 if horizontal else 0x0800, data=delta) for _ in range(count)]
-        w.send(events)
+        if not vks:
+            w.send(events)
+            return
+        # A completion flag rather than sys.exc_info(), as in hold_key.
+        pressed = completed = False
+        try:
+            pressed = True  # from here on some downs may be in the input stream, even if send() fails
+            w.send([w.key_input(vk, False) for vk in vks])
+            self.ensure_foreground()
+            self.ensure_point(x, y)
+            w.send(events)
+            completed = True
+        finally:
+            if pressed:
+                self.release_input([w.key_input(vk, True) for vk in reversed(vks)],
+                                   "+".join(MOD_NAMES[vk] for vk in vks), not completed)
 
     def drag(self, start: tuple[int, int], end: tuple[int, int], *, steps: int = 12, button: str = "left",
              release: bool = True, step_delay: float = 0.015) -> None:
@@ -2099,7 +2134,7 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "move": (frozenset(), POINT_KEYS),
     "drag": (frozenset(("from", "to")), frozenset(("in", "window", "steps", "button"))),
     "drag_divider": (frozenset(("between", "fraction")), frozenset(("steps",))),
-    "wheel": (frozenset(), POINT_KEYS | {"delta", "horizontal", "count"}),
+    "wheel": (frozenset(), POINT_KEYS | {"delta", "horizontal", "count", "mods"}),
     "capture": (frozenset(("name",)), frozenset(("what", "method"))),
     "pixel": (frozenset(), POINT_KEYS | {"expect", "differs", "tolerance", "method", "label"}),
     "dpi": (frozenset(("value",)), frozenset()),
@@ -2189,6 +2224,13 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
         raise UsageError(f"{where}: {action} does not take {', '.join(unknown)}")
     if "keys" in params:
         parse_chord(params["keys"])
+    if "mods" in params:
+        if not isinstance(params["mods"], list):
+            raise UsageError(f"{where}: mods must be a list such as [\"ctrl\"]")
+        try:
+            modifier_vks(params["mods"])
+        except UsageError as exc:
+            raise UsageError(f"{where}: {exc}") from None
     for key in ("expect", "differs"):
         if key in params:
             for color in params[key] if isinstance(params[key], list) else [params[key]]:
@@ -2531,8 +2573,9 @@ class ScenarioRun:
 
     def do_wheel(self, p):
         x, y = self.point(p)
-        self.gui.wheel(x, y, int(p.get("delta", 120)), bool(p.get("horizontal", False)), int(p.get("count", 1)))
-        return f"({x}, {y}) delta {p.get('delta', 120)}"
+        mods = p.get("mods", [])
+        self.gui.wheel(x, y, int(p.get("delta", 120)), bool(p.get("horizontal", False)), int(p.get("count", 1)), mods)
+        return f"({x}, {y}) delta {p.get('delta', 120)}" + (f" with {'+'.join(mods)}" if mods else "")
 
     def do_capture(self, p):
         what, method = p.get("what", "window"), p.get("method", "screen")
@@ -2936,6 +2979,8 @@ def build_parser() -> argparse.ArgumentParser:
     pointer(wheel)
     wheel.add_argument("--delta", type=int, default=120)
     wheel.add_argument("--horizontal", action="store_true")
+    wheel.add_argument("--count", type=int, default=1, help="notches to send")
+    wheel.add_argument("--mods", default="", help="comma separated modifiers held during the notches")
     drag = session("drag", "drag from one point to another")
     drag.add_argument("x1", type=coordinate)
     drag.add_argument("y1", type=coordinate)
@@ -3014,7 +3059,7 @@ def session_command(args: argparse.Namespace) -> int:
         instance.mouse(x, y, button=args.button, count=args.count, mods=mods)
     elif args.command == "wheel":
         x, y = instance.point(args.x, args.y, args.anchor)
-        instance.wheel(x, y, args.delta, args.horizontal)
+        instance.wheel(x, y, args.delta, args.horizontal, max(1, args.count), [mod for mod in args.mods.split(",") if mod])
     elif args.command == "drag":
         start = instance.point(args.x1, args.y1, args.anchor)
         end = instance.point(args.x2, args.y2, args.anchor)

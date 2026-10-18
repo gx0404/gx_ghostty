@@ -593,6 +593,82 @@ class InputGuardTests(unittest.TestCase):
             rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
         self.assertEqual([('instance', 'instance_gone')], [(row['event'], row['cause']) for row in rows])
 
+    def wheel_rows(self, fake, **kwargs):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'guards.jsonl'
+            with mock.patch.dict(os.environ, {'GX_PERF_BATCH_ID': 'batch', 'GX_PERF_GUARD_LOG': str(log)}), \
+                    mock.patch.object(gui, 'win32', return_value=fake):
+                try:
+                    self.instance().wheel(5, 6, **kwargs)
+                    error = None
+                except gui.GuiError as exc:
+                    error = exc
+            rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()] if log.exists() else []
+        return error, rows
+
+    def test_wheel_holds_the_modifiers_around_the_notches_only(self):
+        fake = FakeWin32(self.PID, self.PID)
+        error, rows = self.wheel_rows(fake, delta=120, count=2, mods=["Ctrl", "shift", "control"])
+        self.assertIsNone(error)
+        self.assertEqual([[("key", 0x11, False), ("key", 0x10, False)],
+                          [("mouse", 0xC001, 5, 6, 0), ("mouse", 0x800, 0, 0, 120), ("mouse", 0x800, 0, 0, 120)],
+                          [("key", 0x10, True), ("key", 0x11, True)]], fake.sent)
+        self.assertEqual(['ensure_foreground', 'ensure_point', 'ensure_foreground', 'ensure_point'],
+                         [row['check'] for row in rows if row['event'] == 'guard'])
+        release = [row for row in rows if row['event'] == 'release']
+        self.assertEqual([('ctrl+shift', False)], [(row['control'], row['abort_release']) for row in release])
+
+    def test_wheel_releases_the_modifiers_when_the_foreground_changes_after_the_downs(self):
+        fake = FakeWin32(self.PID, self.PID)
+        send = fake.send
+
+        def lose_foreground(inputs):
+            send(inputs)
+            fake.foreground_pid = 999
+
+        fake.send = lose_foreground
+        error, rows = self.wheel_rows(fake, mods=["ctrl"])
+        self.assertIsInstance(error, gui.InputBlocked)
+        self.assertEqual([[("key", 0x11, False)], [("key", 0x11, True)]], fake.sent)
+        self.assertEqual(('release', 'ctrl', True), (rows[-1]['event'], rows[-1]['control'], rows[-1]['abort_release']))
+
+    def test_wheel_releases_the_modifiers_when_send_input_fails(self):
+        for failing in (0, 1):  # the downs themselves, or the notches after them
+            fake = FakeWin32(self.PID, self.PID)
+            send, calls = fake.send, []
+
+            def flaky(inputs):
+                calls.append(inputs)
+                if len(calls) == failing + 1:
+                    raise gui.GuiError("SendInput sent 0 of 1 events")
+                send(inputs)
+
+            fake.send = flaky
+            with self.subTest(failing=failing):
+                error, rows = self.wheel_rows(fake, mods=["alt"])
+                self.assertRegex(str(error), "SendInput sent 0")
+                self.assertEqual([("key", 0x12, True)], fake.sent[-1])
+                self.assertTrue(rows[-1]['abort_release'])
+
+    def test_wheel_sends_nothing_when_a_guard_fails_first_and_one_batch_without_modifiers(self):
+        fake = FakeWin32(self.PID, 999)
+        error, _ = self.wheel_rows(fake, mods=["ctrl"])
+        self.assertIsInstance(error, gui.InputBlocked)
+        self.assertEqual([], fake.sent)
+        fake = FakeWin32(self.PID, self.PID)
+        self.assertIsNone(self.wheel_rows(fake, delta=-120, horizontal=True)[0])
+        self.assertEqual([[("mouse", 0xC001, 5, 6, 0), ("mouse", 0x1000, 0, 0, -120)]], fake.sent)
+        with self.assertRaisesRegex(gui.UsageError, "unknown modifier 'hyper'"):
+            self.instance().wheel(5, 6, mods=["hyper"])
+
+    def test_wheel_step_and_command_take_modifiers(self):
+        self.assertEqual(["ctrl"], gui.validate_step("s", {"action": "wheel", "mods": ["ctrl"]}).params["mods"])
+        for mods in ("ctrl", ["hyper"], [1]):
+            with self.subTest(mods=mods), self.assertRaises(gui.UsageError):
+                gui.validate_step("s", {"action": "wheel", "mods": mods})
+        args = gui.build_parser().parse_args(["wheel", "E:/env", "10", "20", "--mods", "ctrl,shift", "--count", "3"])
+        self.assertEqual(("ctrl,shift", 3), (args.mods, args.count))
+
     def test_completion_inside_a_caller_except_block_is_not_an_abort(self):
         fake = FakeWin32(self.PID, self.PID)
         instance = self.instance()
