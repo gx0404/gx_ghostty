@@ -2,7 +2,7 @@
 //! dialog only takes it out of its window, and the next opening there
 //! presents the same dialog again instead of building a new one. The
 //! window holds the reference: dropping the dialog (when what it shows is
-//! out of date) or destroying the window releases it.
+//! out of date) or finalizing the window object releases it.
 const std = @import("std");
 const adw = @import("adw");
 const glib = @import("glib");
