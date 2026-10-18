@@ -1120,7 +1120,17 @@ def main() -> int:
     parser.add_argument("--ole-source", type=Path, help="stage-validation: gx_ole_source.exe for the broker fixture")
     parser.add_argument("--name", help="queue-args: q/<name>.txt for gx-q.cmd <name>")
     parser.add_argument("--fixture-ref", help="stage-validation: take the broker fixture files as committed at this git ref")
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    command, _ = parser.parse_known_args(argv)
+    if command.command == "queue-args" and "--" in argv:
+        # Parse host options separately: nargs="*" may finish before an option
+        # and reject the later positional tail on some Python versions.
+        # Only the first separator belongs to us; guest tokens stay literal.
+        separator = argv.index("--")
+        args = parser.parse_args(argv[:separator])
+        args.items.extend(argv[separator + 1:])
+    else:
+        args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
         if args.command == "prepare":

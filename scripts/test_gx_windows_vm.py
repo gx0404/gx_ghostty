@@ -270,6 +270,50 @@ class WindowsVmTests(IsolatedTestCase):
         self.assertEqual(json.loads(stdout.getvalue())["line"],
                          "-Phase toast-matrix -Action status -RunId o10-xa -DelaySeconds 5")
 
+    def test_queue_args_cli_preserves_literal_tail_after_host_options(self):
+        destination = self.root / "win11" / "exchange" / "validation"
+        destination.mkdir(parents=True)
+        (destination / "validation-manifest.json").write_text("{}", encoding="utf-8")
+        host = ["--root", str(self.root), "--name", "literal"]
+        cases = [
+            (["queue-args", *host], ["-Phase", "toast-matrix"], '-Phase toast-matrix'),
+            ([*host, "queue-args"], ["a b", 'say "hi"', ""], '"a b" "say \\"hi\\"" ""'),
+            (["queue-args", "prefix", *host], ["-Phase", "dpi"], 'prefix -Phase dpi'),
+            (["queue-args", *host], ["--", "--root", "other", "--name", "other"],
+             '-- --root other --name other'),
+            (["queue-args", *host], ["$(whoami)", "`whoami`", "a;b"], '$(whoami) `whoami` a;b'),
+        ]
+        for head, tail, expected in cases:
+            with self.subTest(head=head, tail=tail), \
+                    mock.patch.object(sys, "argv", ["gx_windows_vm.py", *head, "--", *tail]), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(vm.main(), 0)
+                self.assertEqual(json.loads(stdout.getvalue())["line"], expected)
+                self.assertEqual((destination / "q" / "literal.txt").read_bytes(),
+                                 (expected + "\r\n").encode("ascii"))
+        self.assertEqual([path.name for path in (destination / "q").iterdir()], ["literal.txt"])
+
+    def test_queue_args_cli_rejects_injection_and_unknown_host_options(self):
+        destination = self.root / "win11" / "exchange" / "validation"
+        destination.mkdir(parents=True)
+        (destination / "validation-manifest.json").write_text("{}", encoding="utf-8")
+        host = ["queue-args", "--root", str(self.root), "--name", "unsafe"]
+        for value in ('a&b', '" & whoami & "', '%PATH%', '!PATH!', '^', '|', '<', '>',
+                      'a\nb', 'a\rb', 'a\tb'):
+            with self.subTest(value=value), \
+                    mock.patch.object(sys, "argv", ["gx_windows_vm.py", *host, "--", value]), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as caught:
+                    vm.main()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertIn("without % ! ^ & | < > or control characters", stderr.getvalue())
+        with mock.patch.object(sys, "argv", ["gx_windows_vm.py", *host, "--typo", "--", "safe"]), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as caught:
+                vm.main()
+            self.assertEqual(caught.exception.code, 2)
+        self.assertFalse((destination / "q").exists())
+
     def test_screenshot_png_round_trip(self):
         pixels = bytes(range(2 * 3 * 3))
         width, height, rgb = vm.parse_ppm(b"P6\n# c\n3 2\n255\n" + pixels)
