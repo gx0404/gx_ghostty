@@ -462,7 +462,10 @@ jobs:
           test -s "$evidence/ghostty-xvfb.png"
       # The GX layer of the GTK apprt only compiles into a test binary with the GTK runtime.
       - name: GTK GX layer tests, sharded across processes
-        run: python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx --zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-gtk-smoke/zig-test.json"
+        run: |
+          # The screenshot step's X server has exited; every test shard needs a live display.
+          export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx --zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-gtk-smoke/zig-test.json"
       - name: Upload smoke evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
