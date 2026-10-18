@@ -66,3 +66,51 @@ const Native = struct {
     extern "shell32" fn CommandLineToArgvW([*:0]const u16, *c_int) callconv(.winapi) ?[*][*:0]u16;
     extern "kernel32" fn LocalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
 };
+
+test "D18 native and Ghostty argv iterators preserve the quoting matrix" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const t = std.testing;
+    const args = [_][]const u8{
+        "C:\\Program Files\\Ghostty\\ghostty.exe",
+        "",
+        "C:\\dir with space\\",
+        "C:\\中文\\",
+        "embedded\"quote",
+        "one\\\"two\\\\\"three",
+        "\\\\server\\share\\\\",
+        "--gx-shell-profile=custom:GX JL Trail\\",
+        "--gx-shell-profile=custom:中文 \"Quote\"\\\\",
+    };
+    const encoded = try encode(t.allocator, &args);
+    defer t.allocator.free(encoded);
+    var count: c_int = 0;
+    const parsed = Native.CommandLineToArgvW(encoded, &count) orelse return error.DecodeFailed;
+    defer _ = Native.LocalFree(@ptrCast(parsed));
+    var ghostty = try std.process.Args.Iterator.Windows.init(t.allocator, encoded);
+    defer ghostty.deinit();
+    try t.expectEqual(@as(c_int, args.len), count);
+    for (args, 0..) |arg, i| {
+        const native = try std.unicode.utf16LeToUtf8Alloc(t.allocator, std.mem.span(parsed[i]));
+        defer t.allocator.free(native);
+        try t.expectEqualStrings(arg, native);
+        try t.expectEqualStrings(arg, ghostty.next().?);
+    }
+    try t.expect(ghostty.next() == null);
+}
+
+test "D18 a profile command must escape a backslash before its closing quote" {
+    const t = std.testing;
+    // This is the VM fixture's command value, before JumpList is involved.
+    // A single backslash escapes the quote in the Windows command grammar.
+    const inputs = [_][]const u8{ "cmd.exe /d /k call mark.cmd \"C:\\中文 dir\\\"", "cmd.exe /d /k call mark.cmd \"C:\\中文 dir\\\\\"" };
+    const expected = [_][]const u8{ "C:\\中文 dir\"", "C:\\中文 dir\\" };
+    for (inputs, expected) |input, last| {
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(t.allocator, input);
+        defer t.allocator.free(wide);
+        var iter = try std.process.Args.Iterator.Windows.init(t.allocator, wide);
+        defer iter.deinit();
+        for ([_][]const u8{ "cmd.exe", "/d", "/k", "call", "mark.cmd", last }) |arg|
+            try t.expectEqualStrings(arg, iter.next().?);
+        try t.expect(iter.next() == null);
+    }
+}
