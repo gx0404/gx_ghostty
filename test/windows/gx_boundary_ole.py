@@ -57,8 +57,10 @@ if ($env:GX_A3_SHELL_ACTION -eq 'close') { $window.Quit() }
 def close_private_explorer(directory, prior, owned, settle=5.0):
     """Quit every Shell window opened since `prior` that still shows exactly the
     private fixture folder, including a late or unattributed one. The Shell
-    "close" action rechecks the exact folder, so no other window is touched."""
+    "close" action rechecks the exact folder, so no other window is touched.
+    Each new HWND is attempted at most once, including rejected windows."""
     closed, errors = [], []
+    attempted = set()
     candidates = set() if owned is None else {owned}
     deadline = time.monotonic() + settle
     while True:
@@ -66,16 +68,20 @@ def close_private_explorer(directory, prior, owned, settle=5.0):
             candidates |= set(shell_windows("list", directory)) - prior
         except gui.InputBlocked as error:
             errors.append(str(error))
-        for hwnd in sorted(candidates - set(closed)):
+        for hwnd in sorted(candidates - prior - attempted):
+            # A rejection can mean navigation away or lost ownership. Never
+            # retry that HWND, even if a later enumeration still includes it.
+            attempted.add(hwnd)
             try:
                 shell_windows("close", directory, hwnd=hwnd)
                 closed.append(hwnd)
             except gui.InputBlocked as error:
                 errors.append(f"{hwnd:#x}: {error}")
         # Without an attributed window, keep watching briefly for a late one.
-        if owned is not None or time.monotonic() > deadline:
+        remaining = deadline - time.monotonic()
+        if owned is not None or remaining <= 0:
             return closed, errors
-        time.sleep(0.5)
+        time.sleep(min(0.5, remaining))
 
 
 class ExplorerDrag:
