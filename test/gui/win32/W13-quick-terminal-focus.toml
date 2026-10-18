@@ -5,14 +5,16 @@ title = "The quick terminal has the keyboard focus as soon as it starts sliding 
 # quick terminal, its own find bar not hiding it (autohide on), the find bar hiding with it and
 # the keyboard going back to the main window, a slide turned around midway keeping the toggle
 # intent, autohide when the main window is activated, and the last tab sliding out so that
-# the next toggle makes a new quick terminal. Work area, taskbar and DPI placement are not
-# covered (one monitor, no system changes).
+# the next toggle makes a new quick terminal, and a configuration reload that changes
+# quick-terminal-size moves the shown window to its new size without a size overlay. Work area,
+# taskbar, display changes and DPI placement are not covered (one monitor, no system changes).
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 keybind = global:ctrl+grave_accent=toggle_quick_terminal
 quick-terminal-animation-duration = 0.5
 quick-terminal-autohide = true
+keybind = ctrl+shift+r=reload_config
 """
 expect = [
   "quick: the quick terminal shows `echo typed-into-quick` and its output, typed right after the hotkey",
@@ -24,6 +26,8 @@ expect = [
   "after-reversal: a slide turned around midway, then the next toggle showed the quick terminal fully in place with its content (QT=1 still on screen)",
   "reshown-after-autohide: activating the main window autohid the quick terminal, so the next hotkey showed it again",
   "recreated: after `exit` closed its last tab, the next hotkey made a new quick terminal with a fresh prompt (no earlier output)",
+  "relayout-quick: after quick-terminal-size = 50% and a reload, the shown quick terminal is about half the work area high (was 400 DIP, 600 px)",
+  "relayout-popups: no columns × rows size overlay is among the popups after that program-driven resize (a reload toast may show)",
 ]
 
 [[step]]
@@ -237,3 +241,27 @@ seconds = 1.5
 action = "capture"
 name = "recreated"
 what = "quick"
+
+# A reload that changes the size moves the shown quick terminal (relayout) without a size overlay.
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "command = cmd.exe /d /k prompt $G$S\nlanguage = en\nkeybind = global:ctrl+grave_accent=toggle_quick_terminal\nquick-terminal-animation-duration = 0.5\nquick-terminal-autohide = true\nkeybind = ctrl+shift+r=reload_config\nquick-terminal-size = 50%\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "relayout-quick"
+what = "quick"
+
+[[step]]
+action = "capture"
+name = "relayout-popups"
+what = "all"
