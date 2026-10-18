@@ -2725,14 +2725,27 @@ function Restore-UserConfig {
 function Get-JumpListMarkDir { return Join-Path $script:RunRoot ('jl mark ' + (-join @([char]0x4E2D, [char]0x6587)) + " 'q'") }
 
 function Get-JumpListProfiles([string]$MarkDir) {
-    $mark = Join-Path $MarkDir 'gx-jl-mark.cmd'
+    # p6: an argument that ends in a backslash. In Windows (CRT) command-line syntax a backslash
+    # before the closing quote is written doubled ("<dir>\\"); the earlier "<dir>\" made \" an
+    # escaped quote, so the configuration itself asked for <dir>" (A7, F3\A7\report.md section 3).
+    # The child is a .NET process that records the command line it received and its parsed argv.
+    $argvScript = Join-Path $MarkDir 'gx-jl-argv.ps1'
     return @(
         [ordered]@{ key='p1'; name='GX JL Plain'; command='cmd.exe /d /k title GX_JL_P1' },
         [ordered]@{ key='p2'; name='GX JL Space Name'; command='cmd.exe /d /k title GX_JL_P2' },
         [ordered]@{ key='p3'; name=('GX JL ' + (-join @([char]0x4E2D, [char]0x6587))); command='cmd.exe /d /k title GX_JL_P3' },
         [ordered]@{ key='p4'; name='GX JL "Quote"'; command='cmd.exe /d /k title GX_JL_P4' },
         [ordered]@{ key='p5'; name='GX JL Trail\'; command='cmd.exe /d /k title GX_JL_P5' },
-        [ordered]@{ key='p6'; name='GX JL Path'; command=('cmd.exe /d /k call "' + $mark + '" "' + $MarkDir + '\"') })
+        [ordered]@{ key='p6'; name='GX JL Path'; command=('powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -File "' + $argvScript + '" "' + $MarkDir + '\\"') })
+}
+
+function Get-JumpListArgvScript {
+    return (@('# GX JumpList p6 argv marker (gx_vm_validation.ps1): the command line this process received.',
+        '$Host.UI.RawUI.WindowTitle = ''GX_JL_P6''',
+        '$record = [ordered]@{ pid=$PID; utc=[DateTime]::UtcNow.ToString(''o''); command_line=[Environment]::CommandLine;',
+        '    argv=@([Environment]::GetCommandLineArgs() | ForEach-Object { [string]$_ }); script_args=@($args | ForEach-Object { [string]$_ }) }',
+        '[IO.File]::WriteAllText((Join-Path $PSScriptRoot (''gx-jl-argv-'' + $PID + ''.json'')), ($record | ConvertTo-Json -Depth 3), (New-Object Text.UTF8Encoding $false))',
+        'Write-Host (''GX_JL_ARGV recorded '' + @($args).Count + '' argument(s)'')') -join "`r`n") + "`r`n"
 }
 
 function New-JumpListConfig([string]$Set, [string]$MarkDir) {
@@ -2914,9 +2927,7 @@ function Invoke-JumpListMatrix {
             $markDir = Get-JumpListMarkDir
             Assert-NoReparse $markDir
             [IO.Directory]::CreateDirectory($markDir) | Out-Null
-            $markScript = (@('@echo off', 'title GX_JL_P6', 'set "GXARG=%~1"',
-                '>>"%~dp0gx-jl-marker.txt" echo GX_JL_PATH_OK tail=[%GXARG:~-1%] at %DATE% %TIME%') -join "`r`n") + "`r`n"
-            [IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-mark.cmd'), $markScript, [Text.Encoding]::ASCII)
+            [IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-argv.ps1'), (Get-JumpListArgvScript), [Text.Encoding]::ASCII)
             $config = New-JumpListConfig $JumpListSet $markDir
             $path = (Get-UserConfigFiles)[0]
             if ((Test-Path -LiteralPath $path) -and -not (Test-FixtureOwnedFile $path)) { throw "Refusing to overwrite ${path}: it is not this fixture's file." }
@@ -2973,17 +2984,23 @@ function Invoke-JumpListMatrix {
                 [ordered]@{ pid=$app.pid; parent=$app.parent; created=$app.created; command_line=$app.command_line;
                     windows=@([GxVmWindows]::TopLevel($app.pid) | Where-Object { $_['class'] -ceq 'GhosttyWindow' } | ForEach-Object { [ordered]@{ hwnd=$_['hwnd']; title=$_['title']; visible=$_['visible'] } }) }
             })
-            $markerFile = Join-Path (Get-JumpListMarkDir) 'gx-jl-marker.txt'
-            $markers = if (Test-Path -LiteralPath $markerFile) { @([IO.File]::ReadAllLines($markerFile, [Text.Encoding]::Default)) } else { @() }
-            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; markers=$markers; jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
+            $markDir = Get-JumpListMarkDir
+            $markers = @(Get-ChildItem -LiteralPath $markDir -Filter 'gx-jl-argv-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc |
+                ForEach-Object { $script:ExportExtra.Add($_.FullName); Read-JsonFile $_.FullName })
+            $expectedArgument = $markDir + '\'
+            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; argv_markers=$markers; expected_last_argument=$expectedArgument;
+                jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
             if (-not $ExpectProfile -or $ExpectProfile -ceq 'none') { $result.fixture_verdict = 'OBSERVED'; return $result }
             $want = 'GX_JL_' + $ExpectProfile.ToUpperInvariant()
             $titled = @($seen | ForEach-Object { $_.windows } | Where-Object { $_.title -and $_.title.Contains($want) })
-            $markerOk = ($ExpectProfile -cne 'p6') -or (@($markers | Where-Object { $_ -match '^GX_JL_PATH_OK tail=\[\\\]' }).Count -gt 0)
+            # p6: the newest marker's only script argument and last argv entry are exactly <dir>\.
+            $latest = if ($markers.Count -gt 0) { $markers[-1] } else { $null }
+            $markerOk = ($ExpectProfile -cne 'p6') -or ($null -ne $latest -and @($latest.script_args).Count -eq 1 -and
+                [string]@($latest.script_args)[0] -ceq $expectedArgument -and [string]@($latest.argv)[-1] -ceq $expectedArgument)
             $result.window_with_title = $titled
             $result.marker_ok = $markerOk
             $result.fixture_verdict = if ($titled.Count -gt 0 -and $markerOk) { 'PASS' } else { 'FAIL' }
-            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 marker missing or trailing backslash lost' } else { $null }
+            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 argv marker missing, or its argument is not exactly the directory with one trailing backslash' } else { $null }
             return $result
         }
         'deny-commit' { return [ordered]@{ denied=@(Set-JumpListCommitDenied); next='change the profile set (config), reload the app, then snapshot' } }

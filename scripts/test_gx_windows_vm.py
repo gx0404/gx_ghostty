@@ -827,6 +827,36 @@ ConvertTo-GxJson ([ordered]@{ ai=((Get-NormalizedSddl $ai) -ceq (Get-NormalizedS
         out = self.run_body(body, ("ConvertTo-GxJson", "Get-NormalizedSddl"), ("LF", "JsonSource"))
         self.assertEqual(out, {"ai": True, "deny": False, "protected": False})
 
+    def test_jumplist_p6_asks_for_one_trailing_backslash_and_its_marker_records_it(self):
+        body = r"""
+$script:RunRoot = $Work
+$markDir = Get-JumpListMarkDir
+[IO.Directory]::CreateDirectory($markDir) | Out-Null
+[IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-argv.ps1'), (Get-JumpListArgvScript), [Text.Encoding]::ASCII)
+$p6 = @(Get-JumpListProfiles $markDir | Where-Object { $_.key -ceq 'p6' })[0]
+Add-Type -TypeDefinition $script:TokenSource -Language CSharp
+# CommandLineToArgvW is the CRT-compatible parse Ghostty's profile command follows.
+$argv = @([GxVmToken]::Arguments($p6.command))
+# Run the marker the way the profile would, without -NoExit, and read what it recorded.
+$start = [Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+$start.Arguments = $p6.command.Substring($p6.command.IndexOf(' ') + 1).Replace('-NoExit ', '')
+$start.UseShellExecute = $false
+$start.EnvironmentVariables.Remove('PSModulePath')
+$process = [Diagnostics.Process]::Start($start)
+if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'marker did not finish' }
+$marker = @(Get-ChildItem -LiteralPath $markDir -Filter 'gx-jl-argv-*.json')[0]
+$record = [IO.File]::ReadAllText($marker.FullName, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+ConvertTo-GxJson ([ordered]@{ dir=$markDir; argv=$argv; script_args=@($record.script_args); last=@($record.argv)[-1];
+    command_line=$record.command_line; exit=$process.ExitCode }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Get-JumpListMarkDir", "Get-JumpListProfiles", "Get-JumpListArgvScript"),
+                            ("LF", "JsonSource", "TokenSource"))
+        expected = out["dir"] + "\\"
+        self.assertIn("\u4e2d\u6587", out["dir"])
+        self.assertEqual(out["argv"][-1], expected)
+        self.assertEqual((out["script_args"], out["last"], out["exit"]), ([expected], expected, 0))
+        self.assertTrue(out["command_line"].endswith('"' + out["dir"] + '\\\\"'), out["command_line"])
+
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""
 $result = [ordered]@{}
