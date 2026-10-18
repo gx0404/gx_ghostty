@@ -1,5 +1,5 @@
 id = "G28"
-title = "D-21/D-22: closing the tabs to the right or the other tabs keeps the pinned tabs, from the tab menu, key bindings and the command palette"
+title = "D-21/D-22/D-24: pinned tabs stay when the tabs to the right or the other tabs close (tab menu, key bindings, command palette), and new or moved-in tabs go after them"
 lang = "en"
 config = """
 command = direct:/bin/bash --noprofile --norc
@@ -9,17 +9,24 @@ env = HISTFILE=/dev/null
 keybind = ctrl+alt+r=prompt_tab_title
 keybind = ctrl+alt+o=close_tab:other
 keybind = ctrl+alt+g=close_tab:right
+keybind = ctrl+alt+d=new_split:right
+keybind = ctrl+alt+n=gx:move_split_to_tab
 """
+# libadwaita refuses an unpinned tab among the pinned tabs with a CRITICAL
+# (D-24), so the whole run must stay free of them.
+forbid = ["Theme parser error", "css parsing failed", "CRITICAL"]
 # The window is 1100x740 at the top left: the tab bar is at y 67, and the
 # two pinned tabs P1 and P2 sit at x 33 and 72. Tab menu items lie 80 px
 # right of the right click and 119 (Pin Tab) or 228 (Close Tabs to the
-# Right) px below it. New tabs are only made while P2 or an unpinned tab
-# is selected: with P1 selected a new tab would go before P2, which
-# libadwaita refuses (a finding of this round, not covered here).
+# Right) px below it. The closing steps make their new tabs while P2 or an
+# unpinned tab is selected; the last steps make a new tab and move a split
+# pane to a new tab while the first pinned tab P1 is selected (D-24).
 script = '''
 results = {}
+def log():
+    return (evidence / "G28.log").read_text()
 def closed():
-    return (evidence / "G28.log").read_text().count("info(surface): surface closed")
+    return log().count("info(surface): surface closed")
 def record(label, before, count):
     for _ in range(30):
         if closed() - before >= count:
@@ -125,6 +132,25 @@ expected = {
     "palette close other from P2": 1,
 }
 assert results == expected, results
+
+# D-24: with the first pinned tab P1 selected, a new tab and a split pane
+# moved to a new tab both go after the pinned tabs.
+kept = closed()
+select_tab(33)
+xdo("key", "ctrl+shift+t")
+sleep(0.8)
+name_tab("N11")
+capture("07-new-tab-from-first-pinned")
+assert "CRITICAL" not in log(), "a new tab from P1 was refused"
+select_tab(33)
+xdo("key", "ctrl+alt+d")
+sleep(0.8)
+xdo("key", "ctrl+alt+n")
+sleep(1.0)
+name_tab("S1")
+capture("08-split-to-tab-from-first-pinned")
+assert "CRITICAL" not in log(), "a split pane moved from P1 was refused"
+assert closed() == kept, "a terminal closed while moving the split"
 '''
 expect = [
   "G28.png: the isolated terminal with one tab",
@@ -139,4 +165,7 @@ expect = [
   "G28-06-palette-close-other.png: the command palette filtered to Close Other Tabs, P2 selected behind it",
   "G28-06-palette-closed-other.png: the palette entry on P2 closed N10; the pinned P1 stays",
   "G28-closed.json: the surfaces each step closed: 2, 2, 3, 2 and 1",
+  "G28-07-new-tab-from-first-pinned.png: with the first pinned tab P1 selected, Ctrl+Shift+T makes the selected tab N11 after the pinned P1 and P2",
+  "G28-08-split-to-tab-from-first-pinned.png: the right split of P1 moved to the selected tab S1 after the pinned P1 and P2 and before N11; P1 keeps its other terminal",
+  "G28.log: no CRITICAL line (forbid)",
 ]
