@@ -93,15 +93,20 @@ subdirectories, no writes or deletions inside, reading still works). Both are pr
 attempt after being set and after being released; whatever is still read-only when the scenario
 ends or fails is released (run.json: readonly).
 
-Privacy backdrop: a scenario covers the work areas of the monitors its instance's windows are on
-with a solid window (backdrop = "#rrggbb", default #000000) right under the lowest of those
-windows: borderless, never activated, not in the taskbar or Alt-Tab, destroyed when the scenario
-ends or fails. backdrop = false (with backdrop_reason, for a test that must see the desktop through
-the window) turns it off, and notes.txt and run.json say so. Before every screen capture or pixel
-read it is put back under the instance and checked: no window of another process may show inside
-the capture or the 24 DIP band around it, and every band pixel outside the instance's windows must
-be the backdrop color or its shadow; otherwise the step fails and the screenshot is not saved.
-run.json lists every check (pixels counted, foreign windows by class, pid and image, no titles).
+Privacy backdrop: a scenario puts one solid window (backdrop = "#rrggbb", default #000000) right
+under the lowest of its instance's windows. It covers the work area of every display monitor that
+one of those windows, or a screen capture with the 24 DIP band around it, reaches (the whole monitor
+where a window reaches past the work area, such as a fullscreen window over the taskbar); being one
+window it is the bounding rectangle of those areas, and it only grows during a scenario. It is
+borderless, never activated, not in the taskbar or Alt-Tab, and destroyed when the scenario ends or
+fails. backdrop = false (with backdrop_reason, for a test that must see the desktop through the
+window) turns it off, and notes.txt and run.json say so. Before every screen capture or pixel read
+it is put back under the instance and checked: every pixel of the captured window must lie on a
+covered area (a window partly on no monitor fails before anything is captured), no window of
+another process may show inside the window or its band on the covered areas, and every band pixel
+outside the instance's windows must be the backdrop color or its shadow; otherwise the step fails
+and the screenshot is not saved. run.json lists every check (covered areas, band pieces, pixels
+counted, foreign windows by class, pid and image, no titles).
 
 Keyboard layouts: layout, the layout step and ime_off only switch to a layout GetKeyboardLayoutList
 reports for this user: they post WM_INPUTLANGCHANGEREQUEST to the window's focused thread and wait up
@@ -550,6 +555,93 @@ def rect_inflate(rect: Rect, by: int) -> Rect:
     return rect[0] - by, rect[1] - by, rect[2] + by, rect[3] + by
 
 
+def rect_area(rect: Rect) -> int:
+    return max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1])
+
+
+def rect_subtract(rect: Rect, holes: Iterable[Rect]) -> list[Rect]:
+    """The parts of `rect` outside every one of `holes`, as disjoint rectangles."""
+    pieces = [rect] if rect[0] < rect[2] and rect[1] < rect[3] else []
+    for hole in holes:
+        rest: list[Rect] = []
+        for piece in pieces:
+            cut = rect_intersection(piece, hole)
+            if cut is None:
+                rest.append(piece)
+                continue
+            left, top, right, bottom = piece
+            if top < cut[1]:
+                rest.append((left, top, right, cut[1]))
+            if cut[3] < bottom:
+                rest.append((left, cut[3], right, bottom))
+            if left < cut[0]:
+                rest.append((left, cut[1], cut[0], cut[3]))
+            if cut[2] < right:
+                rest.append((cut[2], cut[1], right, cut[3]))
+        pieces = rest
+    return pieces
+
+
+Monitor = tuple[Rect, Rect]  # a display monitor and its work area (without the taskbar), physical pixels
+
+
+def backdrop_cover(monitors: Sequence[Monitor], windows: Sequence[Rect], wanted: Sequence[Rect] = ()) -> list[Rect]:
+    """What the privacy backdrop has to cover: the work area of every monitor that one of the instance's
+    `windows` or a `wanted` region (a capture with its band) reaches, and the whole monitor where one of
+    the windows reaches past the work area (a fullscreen window over the taskbar)."""
+    cover: list[Rect] = []
+    for monitor, work in monitors:
+        if not any(rect_intersection(monitor, rect) for rect in (*windows, *wanted)):
+            continue
+        beyond = any(rect_subtract(part, [work]) for rect in windows if (part := rect_intersection(monitor, rect)))
+        area = monitor if beyond else work
+        if area not in cover:
+            cover.append(area)
+    return cover
+
+
+def backdrop_regions(capture: Rect, band: int, cover: Sequence[Rect]) -> list[Rect]:
+    """The `band` pixels wide frame around `capture` that lies on the covered areas, as disjoint pieces;
+    the band of a capture at a monitor edge goes on where a covered neighbour monitor continues it."""
+    ring = rect_inflate(capture, band)
+    pieces: list[Rect] = []
+    for area in cover:
+        part = rect_intersection(ring, area)
+        if part is not None:
+            pieces += [piece for piece in rect_subtract(part, [capture]) if piece not in pieces]
+    return pieces
+
+
+def row_spans(rects: Iterable[Rect], y: int, left: int, right: int) -> list[tuple[int, int]]:
+    """The merged [start, end) x spans that `rects` cover on row y, clipped to [left, right)."""
+    spans = sorted((max(r[0], left), min(r[2], right)) for r in rects if r[1] <= y < r[3])
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def spans_without(spans: Iterable[tuple[int, int]], holes: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """`spans` minus the sorted, merged `holes`."""
+    free: list[tuple[int, int]] = []
+    for start, end in spans:
+        x = start
+        for hole_start, hole_end in holes:
+            if hole_end <= x or hole_start >= end:
+                continue
+            if hole_start > x:
+                free.append((x, hole_start))
+            x = max(x, hole_end)
+        if x < end:
+            free.append((x, end))
+    return free
+
+
 def backdrop_shade(pixel: Sequence[int], color: Sequence[int], tolerance: int = BACKDROP_TOLERANCE) -> bool:
     """Whether `pixel` is the backdrop color, or that color darkened by a window shadow over it."""
     weight = sum(c * c for c in color)
@@ -560,25 +652,18 @@ def backdrop_shade(pixel: Sequence[int], color: Sequence[int], tolerance: int = 
 
 
 def backdrop_band(image: Image, keep_out: Sequence[Rect], color: Sequence[int],
-                  tolerance: int = BACKDROP_TOLERANCE) -> dict[str, Any]:
-    """Check every pixel of `image` outside the `keep_out` rectangles (the instance's windows): how many
-    were checked, how many are neither the backdrop color nor its shadow, and where the first one is."""
+                  tolerance: int = BACKDROP_TOLERANCE, inside: Sequence[Rect] | None = None) -> dict[str, Any]:
+    """Check every pixel of `image` (only those inside the `inside` rectangles, when given) outside the
+    `keep_out` rectangles (the instance's windows): how many were checked, how many are neither the
+    backdrop color nor its shadow, and where the first one is."""
     right_edge = image.left + image.width
     low = [max(0, c - tolerance) for c in color]
     high = [min(255, c + tolerance) for c in color]
     checked = foreign = 0
     first: list[Any] | None = None
     for y in range(image.top, image.top + image.height):
-        covered = sorted((start, end) for start, end in
-                         ((max(r[0], image.left), min(r[2], right_edge)) for r in keep_out if r[1] <= y < r[3])
-                         if start < end)
-        free, x = [], image.left
-        for start, end in covered:
-            if start > x:
-                free.append((x, start))
-            x = max(x, end)
-        if x < right_edge:
-            free.append((x, right_edge))
+        allowed = [(image.left, right_edge)] if inside is None else row_spans(inside, y, image.left, right_edge)
+        free = spans_without(allowed, row_spans(keep_out, y, image.left, right_edge))
         row = (y - image.top) * image.width - image.left
         for start, end in free:
             data = image.bgra[(row + start) * 4:(row + end) * 4]
@@ -636,14 +721,15 @@ class StackEntry:
         return pid in (self.pid, self.owner_pid)
 
 
-def backdrop_audit(stack: Sequence[StackEntry], backdrop: int, pid: int, area: Rect) -> tuple[list[StackEntry], bool]:
-    """Windows of other processes above the backdrop that show inside `area` (top to bottom), and
-    whether the backdrop is in `stack` at all."""
+def backdrop_audit(stack: Sequence[StackEntry], backdrop: int, pid: int,
+                   areas: Sequence[Rect]) -> tuple[list[StackEntry], bool]:
+    """Windows of other processes above the backdrop that show inside one of `areas` (top to bottom),
+    and whether the backdrop is in `stack` at all."""
     foreign = []
     for entry in stack:
         if entry.hwnd == backdrop:
             return foreign, True
-        if entry.shows() and not entry.belongs_to(pid) and rect_intersection(entry.rect, area):
+        if entry.shows() and not entry.belongs_to(pid) and any(rect_intersection(entry.rect, area) for area in areas):
             foreign.append(entry)
     return foreign, False
 
@@ -734,6 +820,7 @@ class Win32:
         self.BITMAPINFO, self.GUITHREADINFO, self.PROCESSENTRY32W = BITMAPINFO, GUITHREADINFO, PROCESSENTRY32W
         self.WNDCLASSEXW, self.MSG, self.MONITORINFO = WNDCLASSEXW, MSG, MONITORINFO
         self.WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        self.MONITORENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HMONITOR, wt.HDC, ctypes.POINTER(RECT), wt.LPARAM)
 
         def declare(dll, name, restype, *argtypes):
             function = getattr(dll, name)
@@ -795,7 +882,7 @@ class Win32:
         declare(u, "DispatchMessageW", lresult, ctypes.POINTER(MSG))
         declare(u, "PostQuitMessage", None, ctypes.c_int)
         declare(u, "LoadCursorW", wt.HICON, wt.HINSTANCE, wt.LPVOID)
-        declare(u, "MonitorFromWindow", wt.HMONITOR, wt.HWND, wt.DWORD)
+        declare(u, "EnumDisplayMonitors", wt.BOOL, wt.HDC, ctypes.POINTER(RECT), self.MONITORENUMPROC, wt.LPARAM)
         declare(u, "GetMonitorInfoW", wt.BOOL, wt.HMONITOR, ctypes.POINTER(MONITORINFO))
         declare(g, "CreateSolidBrush", wt.HBRUSH, wt.COLORREF)
         declare(k, "GetModuleHandleW", wt.HMODULE, wt.LPCWSTR)
@@ -1018,15 +1105,23 @@ class Win32:
                            self.root_owner_pid(hwnd), self.cloaked(hwnd), bool(self.IsIconic(hwnd)))
                 for hwnd in found if self.IsWindowVisible(hwnd)]
 
-    def work_area(self, hwnd: int) -> Rect:
-        """The work area (without the taskbar) of the monitor nearest to hwnd."""
-        monitor = self.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
-        info = self.MONITORINFO()
-        info.cbSize = ctypes.sizeof(info)
-        if not monitor or not self.GetMonitorInfoW(monitor, ctypes.byref(info)):
-            raise GuiError(f"no monitor for window {hwnd:#x}")
-        work = info.rcWork
-        return work.left, work.top, work.right, work.bottom
+    def monitors(self) -> list[Monitor]:
+        """Every display monitor with its work area (without the taskbar), in physical screen pixels."""
+        found: list[Monitor] = []
+
+        @self.MONITORENUMPROC
+        def collect(monitor, _dc, _rect, _data):
+            info = self.MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if self.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                whole, work = info.rcMonitor, info.rcWork
+                found.append(((whole.left, whole.top, whole.right, whole.bottom),
+                              (work.left, work.top, work.right, work.bottom)))
+            return True
+
+        if not self.EnumDisplayMonitors(None, None, collect, 0) or not found:
+            raise GuiError(f"cannot enumerate the display monitors (error {ctypes.get_last_error()})")
+        return found
 
     def child_windows(self, hwnd: int, cls: str | None = None) -> list[WindowInfo]:
         found: list[int] = []
@@ -1397,7 +1492,8 @@ class Backdrop:
         self.reason = reason  # why it is off
         self.initial = {"color": color, "reason": reason}
         self.window: Any = None
-        self.area: Rect | None = None  # where it was placed last
+        self.area: Rect | None = None  # where it was placed last: the bounding rectangle of `covers`
+        self.covers: list[Rect] = []  # every area this window had to cover so far; it never shrinks
         self.fresh = False  # new or moved since the last passing check: give it time to paint
         self.placements = 0
         self.restacks = 0  # placements that changed its position or the z-order
@@ -1411,8 +1507,9 @@ class Backdrop:
         self.events.append({"event": "set", "color": color, "reason": reason})
         return f"backdrop {color}" if color else f"backdrop off: {reason}"
 
-    def ensure(self, instance: "Instance") -> Rect | None:
-        """Cover the work areas of the instance's windows right under the lowest of them; that area."""
+    def ensure(self, instance: "Instance", capture: Rect | None = None, band: int = 0) -> list[Rect] | None:
+        """Cover what the instance's windows, and a `capture` with its `band`, need (backdrop_cover) right
+        under the lowest of those windows; what they need (None while off, [] on no monitor at all)."""
         if self.color is None:
             return None
         instance.ensure_owned()
@@ -1421,13 +1518,22 @@ class Backdrop:
         mine = [index for index, entry in enumerate(stack) if entry.shows() and entry.belongs_to(instance.pid)]
         if not mine:
             raise GuiError(f"ghostty pid {instance.pid} shows no window to put the privacy backdrop under")
-        area = rect_union(w.work_area(stack[index].hwnd) for index in mine)
+        windows = [stack[index].rect for index in mine] + ([capture] if capture else [])
+        need = backdrop_cover(w.monitors(), windows, [rect_inflate(capture, band)] if capture else [])
+        if not need:
+            return need  # nothing of the instance is on a monitor; a capture of it fails as uncovered
+        covers = self.covers + [area for area in need if area not in self.covers]
+        area = rect_union(covers)
         assert area is not None
         if self.window is None:
             window = BackdropWindow(parse_color(self.color))
             window.open(area)
             self.window = window
-            self.events.append({"event": "created", "color": self.color, "area": list(area)})
+            self.events.append({"event": "created", "color": self.color, "area": list(area),
+                                "covers": [list(item) for item in covers]})
+        elif area != self.area:
+            self.events.append({"event": "grown", "area": list(area), "covers": [list(item) for item in covers]})
+        self.covers = covers
         position = next((index for index, entry in enumerate(stack) if entry.hwnd == self.window.hwnd), None)
         moved = area != self.area
         restacked = moved or position != mine[-1] + 1  # not right under the lowest window of the instance
@@ -1439,18 +1545,31 @@ class Backdrop:
         if restacked:
             self.restacks += 1
             time.sleep(BACKDROP_COMPOSE_S)
-        return area
+        return need
 
     def capture(self, instance: "Instance", info: WindowInfo, method: str, label: str) -> Image:
         """A capture of `info`; from the screen only while nothing but the instance and the backdrop shows."""
         if self.color is None or method != "screen":
             return instance.capture_window(info, method)
-        area = self.ensure(instance)
-        assert area is not None
         w = win32()
         color = parse_color(self.color)
         band = max(1, round(BACKDROP_BAND_DIP * w.dpi(info.hwnd) / 96))
-        probe = rect_union([info.rect, rect_intersection(rect_inflate(info.rect, band), area) or info.rect])
+        need = self.ensure(instance, info.rect, band)
+        assert need is not None
+        check: dict[str, Any] = {"capture": label, "window": info.cls, "rect": list(info.rect),
+                                 "covered": [list(area) for area in need]}
+        uncovered = rect_subtract(info.rect, need)
+        if uncovered:
+            pixels = sum(rect_area(piece) for piece in uncovered)
+            check.update({"uncovered": [list(piece) for piece in uncovered], "uncovered_pixels": pixels,
+                          "status": "fail"})
+            self.checks.append(check)
+            raise GuiError(f"privacy backdrop check failed for {label}: {pixels} of {rect_area(info.rect)} window "
+                           f"pixels lie outside the privacy backdrop, on no display monitor it covers ("
+                           + ", ".join(str(list(piece)) for piece in uncovered) + "); the screenshot was not saved")
+        band_regions = backdrop_regions(info.rect, band, need)
+        regions = [info.rect, *band_regions]
+        probe = rect_union(regions)
         assert probe is not None
         deadline = time.monotonic() + (BACKDROP_SETTLE_S if self.fresh else 0)
         attempts = 0
@@ -1462,22 +1581,22 @@ class Backdrop:
             foreign: dict[int, StackEntry] = {}
             found = True
             for stack in (before, after):
-                entries, present = backdrop_audit(stack, self.window.hwnd, instance.pid, probe)
+                entries, present = backdrop_audit(stack, self.window.hwnd, instance.pid, regions)
                 found = found and present
                 foreign.update((entry.hwnd, entry) for entry in entries)
             keep_out = [rect_inflate(entry.rect, BACKDROP_EDGE_PX) for stack in (before, after) for entry in stack
                         if entry.shows() and entry.belongs_to(instance.pid)]
-            band_stats = backdrop_band(image, keep_out, color)
+            band_stats = backdrop_band(image, keep_out, color, inside=band_regions)
             passed = found and not foreign and not band_stats["foreign_pixels"]
             # Only a backdrop that may not have reached the screen yet is worth another look.
             if passed or foreign or not found or time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
-        check = {"capture": label, "window": info.cls, "rect": list(info.rect), "band": list(probe), **band_stats,
-                 "backdrop_in_stack": found, "attempts": attempts,
-                 "foreign_windows": [{"hwnd": f"{entry.hwnd:#x}", "class": entry.cls, "pid": entry.pid,
-                                      "image": image_name(entry.pid)} for entry in foreign.values()],
-                 "status": "pass" if passed else "fail"}
+        check.update({"band": list(probe), "band_regions": [list(piece) for piece in band_regions], **band_stats,
+                      "backdrop_in_stack": found, "attempts": attempts,
+                      "foreign_windows": [{"hwnd": f"{entry.hwnd:#x}", "class": entry.cls, "pid": entry.pid,
+                                           "image": image_name(entry.pid)} for entry in foreign.values()],
+                      "status": "pass" if passed else "fail"})
         self.checks.append(check)
         if not passed:
             problems = []
@@ -1499,7 +1618,7 @@ class Backdrop:
         """Destroy the window if there is one; never raises, the result is recorded."""
         if self.window is None:
             return
-        window, self.window, self.area = self.window, None, None
+        window, self.window, self.area, self.covers = self.window, None, None, []
         try:
             result = window.close()
         except Exception as exc:  # noqa: BLE001 - cleanup goes on; the failure is evidence

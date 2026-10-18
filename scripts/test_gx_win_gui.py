@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import struct
 import json
 import os
@@ -422,6 +423,7 @@ class FakeWin32:
         self.requests: list = []
         self.loaded: list = []
         self.unloaded: list = []
+        self.monitor_layout = [((0, 0, 1000, 800), (0, 0, 1000, 800))]  # monitors(): (monitor, work area)
 
     def process_alive(self, pid):
         return self.alive
@@ -462,8 +464,8 @@ class FakeWin32:
     def window_stack(self):
         return list(self.stack)
 
-    def work_area(self, hwnd):
-        return (0, 0, 1000, 800)
+    def monitors(self):
+        return list(self.monitor_layout)
 
     def current_user_sid(self):
         return "S-1-5-21-1"
@@ -1444,12 +1446,22 @@ def screen(region, paint=(), color=(255, 255, 255)):
     left, top, right, bottom = region
     width, height = right - left, bottom - top
     data = bytearray(b"\x00\x00\x00\xff" * (width * height))
+    pixel = bytes((color[2], color[1], color[0], 0xFF))
     for x0, y0, x1, y1 in paint:
+        x0, x1 = max(x0, left), min(x1, right)
+        if x0 >= x1:
+            continue
         for y in range(max(y0, top), min(y1, bottom)):
-            for x in range(max(x0, left), min(x1, right)):
-                offset = ((y - top) * width + (x - left)) * 4
-                data[offset:offset + 3] = bytes((color[2], color[1], color[0]))
+            offset = ((y - top) * width + (x0 - left)) * 4
+            data[offset:offset + (x1 - x0) * 4] = pixel * (x1 - x0)
     return gui.Image(width, height, bytes(data), left, top)
+
+
+# The host's monitors as EnumDisplayMonitors reports them to a Per-Monitor-V2 process (both at 150 %):
+# DISPLAY1, the primary, and DISPLAY2, a portrait monitor left of it that reaches higher and lower.
+HOST_MONITORS = [((0, 0, 3840, 2160), (0, 0, 3840, 2088)), ((-2160, -419, 0, 3421), (-2160, -419, 0, 3349))]
+# The same arrangement, smaller, for the tests that build screen images.
+SMALL_MONITORS = [((0, 0, 1000, 800), (0, 0, 1000, 760)), ((-600, -100, 0, 900), (-600, -100, 0, 860))]
 
 
 REAL_BACKDROP_WINDOW = gui.BackdropWindow
@@ -1514,6 +1526,17 @@ class BackdropTests(unittest.TestCase):
         self.assertEqual((-5, 0, 30, 40), gui.rect_union([(0, 0, 10, 10), (-5, 20, 30, 40), (50, 50, 50, 60)]))
         self.assertIsNone(gui.rect_union([(0, 0, 0, 10)]))
         self.assertEqual((-2, -2, 12, 12), gui.rect_inflate((0, 0, 10, 10), 2))
+        self.assertEqual((150, 0), (gui.rect_area((0, 0, 10, 15)), gui.rect_area((0, 0, -1, 15))))
+        self.assertEqual([(0, 0, 10, 10)], gui.rect_subtract((0, 0, 10, 10), []))
+        self.assertEqual([], gui.rect_subtract((0, 0, 10, 10), [(-5, -5, 20, 20)]))
+        pieces = gui.rect_subtract((0, 0, 10, 10), [(2, 3, 5, 6), (8, 0, 20, 20)])
+        self.assertEqual(100 - 9 - 20, sum(gui.rect_area(piece) for piece in pieces))
+        for a, b in itertools.combinations(pieces, 2):
+            self.assertIsNone(gui.rect_intersection(a, b), (a, b))
+        self.assertEqual([(-300, 200, 0, 700)], gui.rect_subtract((-300, 200, 500, 700), [(0, 0, 3840, 2088)]))
+        self.assertEqual([(0, 1), (3, 9)], gui.row_spans([(3, 0, 9, 5), (0, 0, 1, 5), (4, 0, 6, 5), (20, 0, 30, 5)],
+                                                          2, 0, 10))
+        self.assertEqual([(0, 2), (5, 6), (9, 10)], gui.spans_without([(0, 10)], [(2, 5), (6, 9)]))
         self.assertEqual(gui.MA_NOACTIVATE, gui.backdrop_message(gui.WM_MOUSEACTIVATE))
         self.assertIsNone(gui.backdrop_message(gui.WM_CLOSE))
 
@@ -1533,6 +1556,10 @@ class BackdropTests(unittest.TestCase):
         image = screen((0, 0, 10, 10), [(3, 3, 7, 7)])
         self.assertEqual({"checked_pixels": 84, "foreign_pixels": 0, "first_foreign": None},
                          gui.backdrop_band(image, [(3, 3, 7, 7), (50, 0, 60, 10), (-20, 0, -10, 10)], (0, 0, 0)))
+        # inside: only those pieces count; a white corner outside them (the taskbar) is never looked at.
+        corner = screen((0, 0, 10, 10), [(3, 3, 7, 7), (8, 8, 10, 10)])
+        self.assertEqual({"checked_pixels": 20 + 10 - 2, "foreign_pixels": 0, "first_foreign": None},
+                         gui.backdrop_band(corner, [(3, 3, 7, 7)], (0, 0, 0), inside=[(0, 0, 10, 2), (0, 0, 1, 10)]))
         stats = gui.backdrop_band(screen((0, 0, 10, 10), [(3, 3, 7, 7), (9, 0, 10, 1)]), [(3, 3, 7, 7)], (0, 0, 0))
         self.assertEqual((84, 1, [9, 0, "#ffffff"]), (stats["checked_pixels"], stats["foreign_pixels"], stats["first_foreign"]))
         offset = screen((-30, 40, -20, 50), [(-25, 45, -24, 46)], color=(9, 9, 9))
@@ -1550,8 +1577,51 @@ class BackdropTests(unittest.TestCase):
                  gui.StackEntry(0x7, gui.POPUP_CLASS, (0, 0, 100, 100), self.PID, self.PID),
                  gui.StackEntry(0xB0, "backdrop", (0, 0, 1000, 800), 1, 1),
                  gui.StackEntry(0x8, "Below", (0, 0, 100, 100), 777, 777)]
-        self.assertEqual(([foreign], True), gui.backdrop_audit(stack, 0xB0, self.PID, area))
-        self.assertEqual(([foreign], False), gui.backdrop_audit(stack[:3], 0xB0, self.PID, area))
+        self.assertEqual(([foreign], True), gui.backdrop_audit(stack, 0xB0, self.PID, [area]))
+        self.assertEqual(([foreign], False), gui.backdrop_audit(stack[:3], 0xB0, self.PID, [area]))
+        # Only the areas count, not their bounding rectangle: 0x2 lies between the two.
+        self.assertEqual(([foreign], True), gui.backdrop_audit(stack, 0xB0, self.PID, [area, (400, 400, 500, 500)]))
+        self.assertEqual(([], True), gui.backdrop_audit(stack, 0xB0, self.PID, [(0, 0, 40, 40), (400, 400, 500, 500)]))
+
+    def test_cover_reaches_every_monitor_the_windows_or_the_band_reach(self):
+        primary, portrait = HOST_MONITORS[0], HOST_MONITORS[1]
+        cases = {
+            "away from the edge": ([(800, 400, 2400, 1400)], [], [primary[1]]),
+            "across x = 0": ([(-600, 300, 1200, 1200)], [], [primary[1], portrait[1]]),
+            "only the band crosses": ([(20, 300, 1200, 1200)], [gui.rect_inflate((20, 300, 1200, 1200), 36)],
+                                      [primary[1], portrait[1]]),
+            "the band stays on the primary": ([(40, 300, 1200, 1200)], [gui.rect_inflate((40, 300, 1200, 1200), 36)],
+                                              [primary[1]]),
+            "maximized": ([primary[1]], [gui.rect_inflate(primary[1], 36)], [primary[1], portrait[1]]),
+            "fullscreen over the taskbar": ([primary[0]], [gui.rect_inflate(primary[0], 36)], [primary[0], portrait[1]]),
+            "on the portrait's taskbar": ([(-900, 3300, -100, 3400)], [], [portrait[0]]),
+            "on no monitor": ([(1000, -900, 1400, -500)], [], []),
+        }
+        for name, (windows, wanted, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(expected, gui.backdrop_cover(HOST_MONITORS, windows, wanted))
+
+    def test_the_band_goes_on_across_a_covered_neighbour_and_never_over_a_taskbar(self):
+        primary_work = HOST_MONITORS[0][1]
+        window = (20, 300, 1200, 1200)
+        cover = gui.backdrop_cover(HOST_MONITORS, [window], [gui.rect_inflate(window, 36)])
+        pieces = gui.backdrop_regions(window, 36, cover)
+        self.assertEqual(4 * 36 * 36 + 2 * 36 * (1200 - 20) + 2 * 36 * 900,
+                         sum(gui.rect_area(piece) for piece in pieces))
+        self.assertTrue(any(piece[2] <= 0 for piece in pieces), "the band on the portrait monitor")
+        self.assertEqual([], [piece for piece in pieces if gui.rect_intersection(piece, window)])
+        # Only the band on a covered area: without the portrait monitor the band ends at x = 0.
+        self.assertTrue(all(piece[0] >= 0 for piece in gui.backdrop_regions(window, 36, [primary_work])))
+        # Maximized on the primary, whose taskbar is lower than the portrait's: the band is the strip on
+        # the portrait monitor; the taskbar below the window is in no piece, so the audit never sees it.
+        cover = gui.backdrop_cover(HOST_MONITORS, [primary_work], [gui.rect_inflate(primary_work, 36)])
+        pieces = gui.backdrop_regions(primary_work, 36, cover)
+        self.assertEqual([(-36, -36, 0, 2124)], pieces)
+        taskbar = gui.StackEntry(0x77, "Shell_TrayWnd", (0, 2088, 3840, 2160), 900, 900)
+        maximized = gui.StackEntry(0x10, gui.WINDOW_CLASS, primary_work, self.PID, self.PID)
+        stack = [taskbar, maximized, self.backdrop_entry]
+        self.assertEqual(([], True), gui.backdrop_audit(stack, 0xB0, self.PID, [primary_work, *pieces]))
+        self.assertIsNotNone(gui.rect_intersection(taskbar.rect, gui.rect_union([primary_work, *pieces])))
 
     def test_screen_capture_through_a_checked_backdrop(self):
         backdrop = gui.Backdrop("#000000")
@@ -1583,17 +1653,105 @@ class BackdropTests(unittest.TestCase):
             backdrop.ensure(self.instance)
             sleep.assert_called_once_with(gui.BACKDROP_COMPOSE_S)
         self.assertEqual((3, 2, False), (backdrop.placements, backdrop.restacks, backdrop.fresh))
-        self.fake.work_area = lambda hwnd: (0, 0, 1200, 900)  # the window moved to a larger monitor
+        self.fake.monitor_layout = [((0, 0, 1200, 900), (0, 0, 1200, 900))]  # the monitor grew
         backdrop.ensure(self.instance)
         self.assertEqual(((0, 0, 1200, 900), True), (backdrop.area, backdrop.fresh))
 
     def test_the_lowest_instance_window_and_every_monitor_of_the_instance_count(self):
-        popup = gui.StackEntry(0x20, gui.POPUP_CLASS, (900, 10, 990, 60), self.PID, self.PID)
+        popup = gui.StackEntry(0x20, gui.POPUP_CLASS, (1900, 10, 1990, 60), self.PID, self.PID)
         self.fake.stack = [popup, gui.StackEntry(0x99, "Other", (600, 600, 700, 700), 777, 777), self.main,
                            self.backdrop_entry]
-        self.fake.work_area = lambda hwnd: (0, 0, 1000, 800) if hwnd == 0x10 else (1000, 0, 2000, 800)
+        self.fake.monitor_layout = [((0, 0, 1000, 800), (0, 0, 1000, 760)), ((1000, 0, 2000, 800), (1000, 0, 2000, 800))]
         gui.Backdrop("#000000").ensure(self.instance)
         self.assertEqual([((0, 0, 2000, 800), 0x10)], FakeBackdropWindow.made[0].placed)
+
+    def place_main(self, rect, monitors=SMALL_MONITORS):
+        self.fake.monitor_layout = list(monitors)
+        self.main = gui.StackEntry(0x10, gui.WINDOW_CLASS, rect, self.PID, self.PID)
+        self.fake.stack = [self.main, self.backdrop_entry]
+        return gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", rect, True, False, False)
+
+    def test_a_window_across_two_monitors_is_covered_and_checked_on_both(self):
+        info = self.place_main((-200, 100, 200, 300))
+        backdrop = gui.Backdrop("#000000")
+        backdrop.capture(self.instance, info, "screen", "01-across.png")
+        window = FakeBackdropWindow.made[0]
+        self.assertEqual(((-600, -100, 1000, 860), [((-600, -100, 1000, 860), 0x10)]), (window.opened, window.placed))
+        self.instance.capture_window.assert_called_once_with(info, "screen", region=(-224, 76, 224, 324),
+                                                             see_through=(0xB0,))
+        check = backdrop.checks[0]
+        self.assertEqual([[0, 0, 1000, 760], [-600, -100, 0, 860]], check["covered"])
+        self.assertEqual(("pass", 448 * 248 - 404 * 204), (check["status"], check["checked_pixels"]))
+        self.assertTrue(any(piece[2] <= 0 for piece in check["band_regions"]))
+        self.assertTrue(any(piece[0] >= 0 for piece in check["band_regions"]))
+        # A desktop pixel in the band on the portrait side fails the capture.
+        self.frames = [[(-210, 200, -209, 201)]]
+        with self.assertRaisesRegex(gui.GuiError, r"1 of \d+ band pixels are not #000000 \(first #ffffff at "
+                                                  r"\(-210, 200\)\).*not saved"):
+            backdrop.capture(self.instance, info, "screen", "02-across.png")
+
+    def test_a_band_at_the_screen_edge_ends_there(self):
+        info = self.place_main((10, 100, 300, 300), [SMALL_MONITORS[0]])
+        backdrop = gui.Backdrop("#000000")
+        backdrop.capture(self.instance, info, "screen", "01-edge.png")
+        check = backdrop.checks[0]
+        self.assertEqual(("pass", [[0, 0, 1000, 760]], [0, 76, 324, 324]), (check["status"], check["covered"], check["band"]))
+
+    def test_a_window_partly_on_no_monitor_fails_before_any_capture_and_saves_nothing(self):
+        info = self.place_main((-200, 100, 300, 400), [SMALL_MONITORS[0]])
+        with tempfile.TemporaryDirectory() as tmp:
+            run = gui.ScenarioRun(None, Path("ghostty.exe"), Path(tmp))  # type: ignore[arg-type]
+            run.backdrop = gui.Backdrop("#000000")
+            run.instance = self.instance
+            self.instance.require_window.return_value = info
+            with self.assertRaisesRegex(gui.GuiError, r"60000 of 150000 window pixels lie outside the privacy "
+                                                      r"backdrop.*\[-200, 100, 0, 400\].*not saved"):
+                run.do_capture({"name": "off-screen"})
+            self.assertEqual([], list(Path(tmp).iterdir()))
+        self.instance.capture_window.assert_not_called()
+        check = run.backdrop.checks[0]
+        self.assertEqual(("fail", [[-200, 100, 0, 400]], 60000), (check["status"], check["uncovered"],
+                                                                  check["uncovered_pixels"]))
+
+    def test_a_fullscreen_window_gets_its_whole_monitor_and_a_taskbar_on_top_fails_it(self):
+        info = self.place_main((0, 0, 1000, 800), [SMALL_MONITORS[0]])
+        backdrop = gui.Backdrop("#000000")
+        backdrop.capture(self.instance, info, "screen", "01-fullscreen.png")
+        self.assertEqual(("pass", [[0, 0, 1000, 800]]), (backdrop.checks[0]["status"], backdrop.checks[0]["covered"]))
+        self.assertEqual((0, 0, 1000, 800), FakeBackdropWindow.made[0].opened)
+        self.fake.stack.insert(0, gui.StackEntry(0x77, "Shell_TrayWnd", (0, 760, 1000, 800), 900, 900))
+        with self.assertRaisesRegex(gui.GuiError, r"1 window\(s\) of other processes show there \(Shell_TrayWnd"):
+            backdrop.capture(self.instance, info, "screen", "02-fullscreen.png")
+
+    def test_a_maximized_window_passes_with_the_taskbar_on_top_and_saves_no_taskbar_pixel(self):
+        info = self.place_main(SMALL_MONITORS[0][1])
+        self.fake.stack.insert(0, gui.StackEntry(0x77, "Shell_TrayWnd", (0, 760, 1000, 800), 900, 900))
+        self.frames = [[(0, 760, 1000, 800)]]  # the white taskbar below the window, inside the captured probe
+        backdrop = gui.Backdrop("#000000")
+        image = backdrop.capture(self.instance, info, "screen", "01-maximized.png")
+        check = backdrop.checks[0]
+        self.assertEqual(("pass", [-24, -24, 1000, 784], [[-24, -24, 0, 784]]),
+                         (check["status"], check["band"], check["band_regions"]))
+        self.assertEqual((1000, 760, 0, 0), (image.width, image.height, image.left, image.top), "it ends above the taskbar")
+
+    def test_the_backdrop_grows_to_what_captures_need_and_never_shrinks(self):
+        info = self.place_main((20, 100, 400, 400))
+        backdrop = gui.Backdrop("#000000")
+        self.assertEqual([(0, 0, 1000, 760)], backdrop.ensure(self.instance))
+        self.assertEqual((0, 0, 1000, 760), backdrop.area)
+        backdrop.fresh = False
+        backdrop.capture(self.instance, info, "screen", "01-near-the-edge.png")  # its band reaches the portrait
+        self.assertEqual(((-600, -100, 1000, 860), [(0, 0, 1000, 760), (-600, -100, 0, 860)]),
+                         (backdrop.area, backdrop.covers))
+        popup = gui.WindowInfo(0x20, gui.POPUP_CLASS, "", (600, 200, 700, 300), True, False, False)
+        self.fake.stack.insert(0, gui.StackEntry(0x20, gui.POPUP_CLASS, popup.rect, self.PID, self.PID))
+        backdrop.capture(self.instance, popup, "screen", "02-popup.png")
+        self.assertEqual([[0, 0, 1000, 760]], backdrop.checks[1]["covered"])
+        self.assertEqual((-600, -100, 1000, 860), backdrop.area, "it does not shrink back")
+        result = backdrop.finish()
+        self.assertEqual(["created", "grown", "destroyed"], [event["event"] for event in result["events"]])
+        self.assertEqual([[0, 0, 1000, 760], [-600, -100, 0, 860]], result["events"][1]["covers"])
+        self.assertEqual(([], None), (backdrop.covers, backdrop.area))
 
     def test_another_process_in_the_capture_fails_and_nothing_is_saved(self):
         self.fake.stack.insert(0, gui.StackEntry(0x99, "Chrome_WidgetWin_1", (120, 0, 900, 120), 777, 777))
@@ -1755,6 +1913,12 @@ class Win32StructureTests(unittest.TestCase):
         self.assertEqual(80 if wide else 48, ctypes.sizeof(backend.WNDCLASSEXW))
         self.assertEqual(48 if wide else 28, ctypes.sizeof(backend.MSG))
         self.assertEqual(40, ctypes.sizeof(backend.MONITORINFO))
+
+    def test_monitors_come_with_work_areas_on_them(self):
+        monitors = gui.win32().monitors()  # read-only: EnumDisplayMonitors and GetMonitorInfoW
+        self.assertTrue(monitors)
+        for whole, work in monitors:
+            self.assertEqual(work, gui.rect_intersection(whole, work), (whole, work))
 
 
 if __name__ == "__main__":
