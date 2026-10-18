@@ -813,6 +813,20 @@ ConvertTo-GxJson ([ordered]@{ ok=$ok; stuck=$stuck; disabled=$disabled; log=@($s
                                           "restore toast-notification-settings"])
         self.assertEqual(out["log"][-2:], ["set Enabled=0", "restore toast-notification-settings"])
 
+    def test_acl_comparison_ignores_only_the_auto_inherited_flags(self):
+        base = "O:S-1-5-21-1-2-3-1001G:S-1-5-21-1-2-3-513D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;S-1-5-21-1-2-3-1001)"
+        body = r"""
+$base = '__BASE__'
+$ai = $base.Replace('D:(', 'D:AI(')
+$deny = $base.Replace('D:(', 'D:(D;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;S-1-5-21-1-2-3-1001)')
+$protected = $base.Replace('D:(', 'D:P(')
+ConvertTo-GxJson ([ordered]@{ ai=((Get-NormalizedSddl $ai) -ceq (Get-NormalizedSddl $base));
+    deny=((Get-NormalizedSddl $deny) -ceq (Get-NormalizedSddl $base));
+    protected=((Get-NormalizedSddl $protected) -ceq (Get-NormalizedSddl $base)) }) -Compress
+""".replace("__BASE__", base)
+        out = self.run_body(body, ("ConvertTo-GxJson", "Get-NormalizedSddl"), ("LF", "JsonSource"))
+        self.assertEqual(out, {"ai": True, "deny": False, "protected": False})
+
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""
 $result = [ordered]@{}

@@ -1182,7 +1182,7 @@ function Probe-GL {
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($process.HasExited) { throw "Owned app exited $($process.ExitCode) before GL capability was established." }
             if (Test-Path -LiteralPath $log) {
-                $renderer = @(Get-Content -LiteralPath $log | Select-String 'loaded OpenGL [4-9].*vendor=.*software=' | ForEach-Object Line)
+                $renderer = @(Read-TextLines $log | Where-Object { $_ -match 'loaded OpenGL [4-9].*vendor=.*software=' })
                 if ($renderer.Count -gt 0) { break }
             }
             Start-Sleep -Milliseconds 100
@@ -1979,7 +1979,7 @@ function Get-RunConfigSource {
 
 function Get-RendererLines([string]$Log) {
     if (-not (Test-Path -LiteralPath $Log)) { return @() }
-    return @(Get-Content -LiteralPath $Log | Select-String 'loaded OpenGL' | Select-Object -First 4 | ForEach-Object Line)
+    return @(Read-TextLines $Log | Where-Object { $_ -match 'loaded OpenGL' } | Select-Object -First 4)
 }
 
 function Invoke-RunConfig {
@@ -2802,7 +2802,8 @@ function Get-JumpListLogLines {
     $lines = @()
     foreach ($name in @('ghostty.log.1', 'ghostty.log')) {
         $path = Join-Path $env:LOCALAPPDATA ('ghostty\logs\' + $name)
-        if (Test-Path -LiteralPath $path) { $lines += @(Get-Content -LiteralPath $path | Select-String -SimpleMatch 'JumpList' | ForEach-Object Line) }
+        # UTF-8 (profile names such as the lang-zh set's are not ASCII).
+        if (Test-Path -LiteralPath $path) { $lines += @(Read-TextLines $path | Where-Object { $_.IndexOf('JumpList', [StringComparison]::OrdinalIgnoreCase) -ge 0 }) }
     }
     return @($lines | Select-Object -Last 40)
 }
@@ -2849,6 +2850,16 @@ function Set-JumpListCommitDenied {
     return @($entries | ForEach-Object { [ordered]@{ path=$_.path; sddl_before=$_.sddl; sddl_now=(Get-Acl -LiteralPath $_.path).Sddl } })
 }
 
+function Get-NormalizedSddl([string]$Sddl) {
+    # Set-Acl writes a descriptor back with SE_DACL_AUTO_INHERITED, shown as "AI" ("D:AI(...)")
+    # although the entries are the same; r6-jl compared the strings and failed. Compare without
+    # the automatic-inheritance control flags: owner, group, protection and every ACE still count.
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+    $mask = [Security.AccessControl.ControlFlags]'DiscretionaryAclAutoInherited, SystemAclAutoInherited, DiscretionaryAclAutoInheritRequired, SystemAclAutoInheritRequired'
+    $raw.SetFlags([Security.AccessControl.ControlFlags]([int]$raw.ControlFlags -band (-bnot [int]$mask)))
+    return $raw.GetSddlForm([Security.AccessControl.AccessControlSections]::All)
+}
+
 function Restore-JumpListAcl {
     $record = Read-Record 'jumplist-acl'
     if ($null -eq $record) { return [ordered]@{ restored=$true; note='commits were never denied' } }
@@ -2860,7 +2871,10 @@ function Restore-JumpListAcl {
             $acl = Get-Acl -LiteralPath $entry.path
             $acl.SetSecurityDescriptorSddlForm($entry.sddl)
             Set-Acl -LiteralPath $entry.path -AclObject $acl
-            $item.ok = (Get-Acl -LiteralPath $entry.path).Sddl -ceq $entry.sddl
+            $item.sddl_now = (Get-Acl -LiteralPath $entry.path).Sddl
+            $item.identical = $item.sddl_now -ceq $entry.sddl
+            $item.normalized = Get-NormalizedSddl $entry.sddl
+            $item.ok = (Get-NormalizedSddl $item.sddl_now) -ceq $item.normalized
         }
         $item })
     $ok = @($items | Where-Object { -not $_.ok }).Count -eq 0
