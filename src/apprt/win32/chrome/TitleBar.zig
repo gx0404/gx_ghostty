@@ -416,7 +416,17 @@ pub fn handleMessage(
         w32.WM_CAPTURECHANGED, WM_CANCELMODE => {
             // The window and the tab bar handle them as well.
             const own = msg == w32.WM_CAPTURECHANGED and lparam == @as(isize, @bitCast(@intFromPtr(hwnd)));
-            _ = self.routeButtons(.{ .msg = msg, .own_capture = own });
+            // ReleaseCapture synchronously notifies us after releasing it.
+            // Refresh only our custom buttons, never a transfer to a popup
+            // or DWM's buttons. TabBar clears its press before releasing.
+            const released = msg == w32.WM_CAPTURECHANGED and lparam == 0 and
+                w32.GetCapture() == null and self.hasCaptionRow() and !self.nativeButtons();
+            _ = self.routeButtons(.{
+                .msg = msg,
+                .own_capture = own,
+                .capture_released = released,
+                .hit = if (released) self.pointerHit(self.layout()) else .none,
+            });
             return null;
         },
         else => {},
@@ -614,6 +624,9 @@ const ButtonInput = struct {
         hit: Hit = .none,
         /// `WM_CAPTURECHANGED`: the window taking the capture is this one.
         own_capture: bool = false,
+        /// The capture was released, not transferred to another window.
+        /// `hit` is the current pointer hit, limited to our custom frame.
+        capture_released: bool = false,
     };
 
     /// What else holds the pointer.
@@ -710,6 +723,11 @@ const ButtonInput = struct {
             w32.WM_CAPTURECHANGED, WM_CANCELMODE => if (m.msg == WM_CANCELMODE or !m.own_capture) {
                 if (m.msg == WM_CANCELMODE and self.captured) fx.capture = .release;
                 self.* = .{};
+                if (m.msg == w32.WM_CAPTURECHANGED and m.capture_released) {
+                    // Reuse layout-refresh semantics: update in one paint,
+                    // arm the matching leave tracking and restart tooltips.
+                    fx = self.route(.{ .msg = w32.WM_SIZE, .hit = m.hit }, ctx);
+                }
             },
             else => {},
         }
@@ -2046,6 +2064,51 @@ test "double clicks outside title bar buttons keep their default routing" {
     }
     var p: TestPointer = .{};
     try std.testing.expect(!p.nc(WM_NCLBUTTONDBLCLK, HTCAPTION).consumed);
+}
+
+test "releasing capture after cancelling a button immediately hovers the current button" {
+    const testing = std.testing;
+    for ([_]Hit{ TestPointer.minimize, TestPointer.maximize, TestPointer.close, TestPointer.menu, .none }) |hit| {
+        var p: TestPointer = .{};
+        const first = if (buttonOf(hit) == .close) TestPointer.minimize else TestPointer.close;
+        _ = p.send(w32.WM_LBUTTONDOWN, first);
+        _ = p.send(w32.WM_MOUSEMOVE, hit);
+        const up = p.send(w32.WM_LBUTTONUP, hit);
+        try testing.expectEqual(Button.none, up.perform);
+        try testing.expectEqual(ButtonInput.Capture.release, up.capture);
+        const fx = p.input.route(.{ .msg = w32.WM_CAPTURECHANGED, .capture_released = true, .hit = hit }, p.ctx);
+        try testing.expectEqual(buttonOf(hit), p.input.hover);
+        try testing.expectEqual(Button.none, p.input.pressed);
+        try testing.expect(!p.input.captured);
+        try testing.expectEqual(ButtonInput.trackOf(buttonOf(hit)), fx.track);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = buttonOf(hit) }, fx.tooltip);
+        try testing.expect(!fx.fade);
+        try testing.expect(!fx.consumed and !fx.tab_bar);
+        try testing.expectEqual(Button.none, fx.perform);
+        try testing.expectEqual(ButtonInput.Capture.keep, fx.capture);
+    }
+}
+
+test "tab drag release restores hover but capture transfer and active drag do not" {
+    const testing = std.testing;
+    for ([_]Hit{ TestPointer.minimize, TestPointer.maximize, TestPointer.close, TestPointer.menu }) |hit| {
+        var p: TestPointer = .{ .ctx = .{ .tab_press = true } };
+        _ = p.send(w32.WM_MOUSEMOVE, hit);
+        try testing.expectEqual(Button.none, p.input.hover);
+        // TabBar clears its drag/press before calling ReleaseCapture.
+        p.ctx.tab_press = false;
+        const fx = p.input.route(.{ .msg = w32.WM_CAPTURECHANGED, .capture_released = true, .hit = hit }, p.ctx);
+        try testing.expectEqual(buttonOf(hit), p.input.hover);
+        try testing.expectEqual(ButtonInput.trackOf(buttonOf(hit)), fx.track);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = buttonOf(hit) }, fx.tooltip);
+        try testing.expectEqual(Button.none, fx.perform);
+        // Another window taking capture must clear the restored hover.
+        _ = p.input.route(.{ .msg = w32.WM_CAPTURECHANGED, .hit = hit }, p.ctx);
+        try testing.expectEqual(ButtonInput{}, p.input);
+        p.ctx.tab_press = true;
+        _ = p.input.route(.{ .msg = w32.WM_CAPTURECHANGED, .capture_released = true, .hit = hit }, p.ctx);
+        try testing.expectEqual(ButtonInput{}, p.input);
+    }
 }
 
 test "maximize hovers, presses and performs through non-client messages" {
