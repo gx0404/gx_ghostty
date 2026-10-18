@@ -7,12 +7,12 @@
 //! (`chrome/TabBar.zig`), the main menu button and custom-drawn caption
 //! buttons. `WM_NCHITTEST` reports the empty parts of the row as
 //! `HTCAPTION` (drag, double-click maximize, right-click system menu), the
-//! top edge as `HTTOP`, the caption buttons as `HTMINBUTTON`,
-//! `HTMAXBUTTON` (Windows 11 shows the Snap Layouts flyout over it) and
-//! `HTCLOSE`, and the tabs and buttons as `HTCLIENT`; the geometry is the
+//! top edge as `HTTOP`, maximize as `HTMAXBUTTON` (Windows 11 shows the
+//! Snap Layouts flyout over it), close as `HTCLOSE`, and minimize, the tabs
+//! and menu as `HTCLIENT`; the geometry is the
 //! pure `chrome/caption_layout.zig`. A maximized window takes hits on the
 //! tabs and the main menu button up to the screen edge (`Layout.hit_top`).
-//! The caption buttons are handled through the non-client mouse messages
+//! Maximize and close are handled through the non-client mouse messages
 //! so DefWindowProc never draws its classic buttons over the row: they
 //! show their own tooltips, look pressed only while the pressed button is
 //! under the pointer, and fade out of their hover look. With a window
@@ -444,9 +444,19 @@ pub fn handleMessage(
         },
         WM_NCMOUSELEAVE => {
             self.tracking_nc = false;
-            if (self.hover != .menu) self.setHover(.none);
+            if (!clientButton(self.hover)) self.setHover(.none);
             self.setPressed(.none);
             return 0;
+        },
+        w32.WM_RBUTTONUP => {
+            // Minimize is client-owned, but still ignores right clicks as
+            // it did as a caption button (do not open the tab menu).
+            const pt = lparamPoint(lparam);
+            switch (self.hitTest(self.layout(), pt.x, pt.y)) {
+                .button => |button| if (button == .minimize) return 0,
+                else => {},
+            }
+            return null;
         },
         WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK => {
             const button = buttonFromHitCode(wparam);
@@ -510,19 +520,27 @@ fn onNcHitTest(self: *TitleBar, hwnd: w32.HWND, lparam: isize) ?isize {
     const lay = self.layout();
     if (lay.height() <= 0 and !f.extendsClient()) return null;
 
+    var pt = lparamPoint(lparam);
+    _ = w32.ScreenToClient(hwnd, &pt);
+    const hit = caption_layout.ncHit(lay, pt.x, pt.y, self.tabsAt(lay, pt.x, pt.y));
+    // HTMINBUTTON lets Windows create a second, system-language tooltip
+    // even when its hover message is consumed. Own this button as client
+    // input before consulting DefWindowProc; leave HTMAXBUTTON for Snap.
+    if (hit == .minimize) return ncHitCode(hit);
+
     // The default handles the left, right and bottom borders.
     const default = w32.DefWindowProcW(hwnd, WM_NCHITTEST, 0, lparam);
     if (default != w32.HTCLIENT) return default;
+    return ncHitCode(hit);
+}
 
-    var pt = lparamPoint(lparam);
-    _ = w32.ScreenToClient(hwnd, &pt);
-    return switch (caption_layout.ncHit(lay, pt.x, pt.y, self.tabsAt(lay, pt.x, pt.y))) {
-        .client => w32.HTCLIENT,
+fn ncHitCode(hit: caption_layout.NcHit) isize {
+    return switch (hit) {
+        .client, .minimize => w32.HTCLIENT,
         .caption => HTCAPTION,
         .top => HTTOP,
         .top_left => HTTOPLEFT,
         .top_right => HTTOPRIGHT,
-        .minimize => HTMINBUTTON,
         .maximize => HTMAXBUTTON,
         .close => HTCLOSE,
     };
@@ -587,7 +605,7 @@ fn syncHover(self: *TitleBar, lay: Layout) void {
     const button: Button = if (under == .menu and self.hover != .menu) .none else under;
     if (button == self.hover) return;
     self.setHoverWith(button, false);
-    if (button != .none and button != .menu) self.trackNcLeave(hwnd);
+    if (button != .none and !clientButton(button)) self.trackNcLeave(hwnd);
 }
 
 fn performButton(self: *TitleBar, button: Button) void {
@@ -617,9 +635,21 @@ fn performButton(self: *TitleBar, button: Button) void {
 }
 
 // -----------------------------------------------------------------------
-// Client mouse input in the chrome row (the main menu button; the rest is
-// forwarded to the tab bar)
+// Client mouse input in the chrome row (minimize and the main menu
+// button; the rest is forwarded to the tab bar)
 // -----------------------------------------------------------------------
+
+fn clientButton(button: Button) bool {
+    return button == .menu or button == .minimize;
+}
+
+fn clientRelease(pressed: Button, hit: Hit) Button {
+    const released: Button = switch (hit) {
+        .button => |button| button,
+        else => .none,
+    };
+    return if (clientButton(pressed) and pressed == released) pressed else .none;
+}
 
 /// Mouse movement in the client area. Returns true when it was over the
 /// chrome row.
@@ -627,7 +657,7 @@ pub fn onMouseMove(self: *TitleBar, x: i32, y: i32) bool {
     const lay = self.layout();
     const hit = self.hitTest(lay, x, y);
     self.setHover(switch (hit) {
-        .button => |button| if (button == .menu) .menu else .none,
+        .button => |button| if (clientButton(button)) button else .none,
         else => .none,
     });
     _ = self.window().tab_bar.onMouseMove(lay, x, lay.tabY(y));
@@ -660,11 +690,8 @@ pub fn onLeftButtonUp(self: *TitleBar, x: i32, y: i32) bool {
     const pressed = self.pressed;
     if (pressed != .none) {
         self.setPressed(.none);
-        const released_on_menu = switch (self.hitTest(lay, x, y)) {
-            .button => |button| button == .menu,
-            else => false,
-        };
-        if (pressed == .menu and released_on_menu) self.performButton(.menu);
+        const action = clientRelease(pressed, self.hitTest(lay, x, y));
+        if (action != .none) self.performButton(action);
         return true;
     }
     return self.window().tab_bar.onLeftButtonUp(lay, x, lay.tabY(y));
@@ -672,8 +699,8 @@ pub fn onLeftButtonUp(self: *TitleBar, x: i32, y: i32) bool {
 
 /// The mouse left the client area.
 pub fn onMouseLeave(self: *TitleBar) void {
-    if (self.hover == .menu) self.setHover(.none);
-    if (self.pressed == .menu) self.setPressed(.none);
+    if (clientButton(self.hover)) self.setHover(.none);
+    if (clientButton(self.pressed)) self.setPressed(.none);
     self.window().tab_bar.onMouseLeave();
 }
 
@@ -1781,4 +1808,26 @@ test "Direct2D failure keeps native controls visible without affecting other win
     try std.testing.expectEqual(Frame.custom, healthy.title_bar.frame());
     failed.title_bar.is_fullscreen = true;
     try std.testing.expectEqual(Frame.fullscreen, failed.title_bar.frame());
+}
+
+test "custom minimize hit avoids native tooltips while maximize retains Snap Layouts" {
+    try std.testing.expectEqual(w32.HTCLIENT, ncHitCode(.minimize));
+    try std.testing.expectEqual(HTMAXBUTTON, ncHitCode(.maximize));
+    try std.testing.expectEqual(HTCLOSE, ncHitCode(.close));
+    try std.testing.expectEqual(HTCAPTION, ncHitCode(.caption));
+    try std.testing.expectEqual(HTTOP, ncHitCode(.top));
+}
+
+test "client minimize hover and release retain click cancellation" {
+    for ([_]Button{ .menu, .minimize }) |button| {
+        try std.testing.expect(clientButton(button));
+        try std.testing.expectEqual(button, clientRelease(button, .{ .button = button }));
+        try std.testing.expectEqual(Button.none, clientRelease(button, .caption));
+        try std.testing.expectEqual(Button.none, clientRelease(button, .tabs));
+        try std.testing.expectEqual(Button.none, clientRelease(button, .{ .button = .maximize }));
+    }
+    for ([_]Button{ .none, .maximize, .close }) |button| {
+        try std.testing.expect(!clientButton(button));
+        try std.testing.expectEqual(Button.none, clientRelease(button, .{ .button = button }));
+    }
 }
