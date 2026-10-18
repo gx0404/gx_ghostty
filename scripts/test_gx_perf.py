@@ -2083,6 +2083,306 @@ class CommandTests(unittest.TestCase):
                 gx_perf.collect([root])
 
 
+class P7C7Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.instance = mock.Mock(pid=42, creation=123, exe=str(self.root / 'ghostty.exe'))
+        self.instance.log = self.root / 'ghostty.log'
+        self.instance.log.write_bytes(b'old log\r\n')
+        self.instance.responsive.return_value = True
+        self.instance.hang_evidence.return_value = None
+        self.instance.require_window.return_value = SimpleNamespace(hwnd=9, rect=(0, 0, 800, 600))
+        self.instance.terminals.return_value = [SimpleNamespace(hwnd=10, rect=(0, 30, 800, 600))]
+        self.gui = mock.Mock()
+        self.gui.win32().raw_window_rect.return_value = (0, 0, 800, 600)
+        self.gui.win32().foreground.return_value = 9
+        self.gui.win32().window_pid.return_value = 42
+        self.gui.win32().class_name.return_value = 'GhosttyWindow'
+        self.gui.image_name.return_value = 'ghostty.exe'
+        self.backdrop = mock.Mock()
+        self.backdrop.finish.return_value = {}
+        self.backdrop.teardown_failures.return_value = []
+        self.gui.Backdrop.return_value = self.backdrop
+        self.backdrop.capture.return_value.save_png.side_effect = lambda path: path.write_bytes(b'fake screenshot')
+
+    def test_p7_boundary_original_units_and_present_are_not_a_frame_fence(self):
+        report = {'capabilities': {'renderer.present': '', 'surface.resize_timeout': 'ms'}}
+        for index, elapsed in enumerate((15.9999, 16, 16.0001), 1):
+            def resize(_width, _height):
+                with self.instance.log.open('ab') as stream:
+                    stream.write(b'info(gx_perf): metric renderer.present 1\r\ninfo(gx_perf): surface.resize_timeout 1us\r\n')
+                return elapsed
+            self.instance.resize.side_effect = resize
+            actual = gx_perf.resize_evidence(self.gui, self.instance, self.root, index, 800, 600, report, self.backdrop)
+            self.assertEqual(elapsed, actual)
+            row = report['resizes'][-1]
+            self.assertEqual(elapsed >= 16, row['proxy_timeout'])
+            self.assertFalse(row['strict_final_frame'])
+            self.assertEqual(1, row['surface_resize_timeout_events'])
+            self.assertEqual([.001], row['presentation_metrics']['surface.resize_timeout']['values'])
+            self.assertEqual('ms', row['presentation_metrics']['surface.resize_timeout']['unit'])
+            self.assertTrue(row['target_size_matched'])
+            self.assertTrue((self.root / f'resize-{index:02d}.png').is_file())
+        self.assertTrue(report['resizes'][1]['log_start_byte'] == report['resizes'][0]['log_end_byte'])
+        self.assertEqual(3, self.instance.resize.call_count)
+
+    def test_p7_missing_counter_does_not_fabricate_zero(self):
+        self.instance.resize.return_value = 10
+        report = {}
+        gx_perf.resize_evidence(self.gui, self.instance, self.root, 1, 800, 600, report, self.backdrop)
+        self.assertIsNone(report['resizes'][0]['surface_resize_timeout_events'])
+        self.assertEqual('not_instrumented', report['resizes'][0]['presentation_metrics']['renderer.present']['status'])
+
+    def test_p7_capture_failure_keeps_sequence_dimensions_and_timing(self):
+        self.instance.resize.return_value = 21
+        self.backdrop.capture.side_effect = RuntimeError('covered')
+        with self.assertRaisesRegex(RuntimeError, 'covered'):
+            gx_perf.resize_evidence(self.gui, self.instance, self.root, 4, 800, 600, {}, self.backdrop)
+        row = json.loads((self.root / 'resize-04.json').read_text(encoding='utf-8'))
+        self.assertEqual(('failed', 4, 21, [800, 600]),
+                         (row['status'], row['index'], row['setwindowpos_ms'], row['actual_outer_px']))
+
+    def test_p7_truncated_log_and_unit_conflict_fail_with_raw_evidence(self):
+        self.instance.resize.return_value = 5
+        image = self.backdrop.capture.return_value
+        def replace_log(*_args):
+            self.instance.log.write_bytes(b'replaced\n')
+            return image
+        self.backdrop.capture.side_effect = replace_log
+        with self.assertRaisesRegex(gx_perf.PerfError, 'truncated or replaced'):
+            gx_perf.resize_evidence(self.gui, self.instance, self.root, 1, 800, 600, {}, self.backdrop)
+        self.assertEqual('failed', json.loads((self.root / 'resize-01.json').read_text(encoding='utf-8'))['status'])
+        self.backdrop.capture.side_effect = None
+        with self.assertRaisesRegex(gx_perf.PerfError, 'unit conflict'):
+            gx_perf.resize_evidence(self.gui, self.instance, self.root, 2, 800, 600,
+                                   {'capabilities': {'surface.resize_timeout': ''}}, self.backdrop)
+
+    def test_legacy_resizes_six_captures_every_operation(self):
+        self.gui.launch.return_value = self.instance
+        self.instance.wait_window.return_value = {'shown_ms': 1}
+        self.gui.win32().child_windows.return_value = []
+        self.instance.resize.return_value = 10
+        report = {'evidence_dir': str(self.root / 'resize')}
+        with mock.patch.object(gx_perf.time, 'sleep'), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 100)):
+            lines = gx_perf.measure_win32(self.gui, self.root / 'ghostty.exe', self.root, '', 6, report=report)
+        self.assertEqual(6, self.instance.resize.call_count)
+        self.assertEqual(6, len(list((self.root / 'resize').glob('*.png'))))
+        self.assertEqual(6, len([line for line in lines if line.startswith('metric resize.proxy_timeout')]))
+        self.assertEqual(list(range(1, 7)), [row['index'] for row in report['resizes']])
+
+    def test_c7_parser_matrix_requires_contract_and_no_observe_bypass(self):
+        args = gx_perf.build_parser().parse_args(['win32-c7', '--exe', 'old', '--exe', 'new', '--out', 'out'])
+        self.assertEqual(('matrix', 60, 10), (args.case, args.seconds, args.runs))
+        self.assertTrue(gx_perf.desktop_command(['python', 'scripts/gx_perf.py', 'win32-c7', '--out', 'out']))
+        with mock.patch.object(gx_perf, 'run_c7_matrix') as run, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, gx_perf.main(['win32-c7', '--exe', 'a', '--exe', 'b', '--out', 'out', '--seconds', '1']))
+            run.assert_not_called()
+
+    def test_c7_input_is_never_waived_and_hang_has_priority(self):
+        args = SimpleNamespace(state='visible')
+        with mock.patch.object(gx_perf, 'last_input_ticks', return_value=(11, 100)):
+            with self.assertRaises(gx_perf.PerfError) as raised:
+                gx_perf.c7_input_check(self.gui, self.instance, args, 10)
+            self.assertEqual('foreign_input', raised.exception.cause)
+            self.instance.hang_evidence.return_value = 'hung'
+            with self.assertRaises(gx_perf.PerfError) as raised:
+                gx_perf.c7_input_check(self.gui, self.instance, args, 10)
+            self.assertEqual('instance_hung', raised.exception.cause)
+
+    def test_matrix_product_failure_keeps_nested_arm_attribution(self):
+        path = self.root / '11-output-wakeup' / 'new' / 'run-03' / 'run.json'
+        gx_perf.write_json(path, {'pid': 42, 'label': 'new', 'run': 3, 'baseline': False})
+        rows = [{'instance_pid': 42, 'cause': 'instance_gone'}]
+        result = gx_perf.product_failure_runs(self.root, rows)
+        self.assertEqual(('new', 3), (result[0]['label'], result[0]['run']))
+
+    def test_c7_periodic_pdh_output_midpoint_and_raw_failure_preservation(self):
+        import gx_perf_stimulus as stimulus
+        from test_gx_perf_stimulus import pdh_sample
+        self.instance.log.write_bytes(b'')
+        capture = gx_perf.CaptureRun(self.instance, self.root,
+                                    {'capabilities': {'renderer.present': ''}, 'errors': []})
+        args = SimpleNamespace(case='output-wakeup', tabs=11, state='visible', seconds=60, output_bytes=4096)
+        shells = mock.Mock()
+        shells.identities = {42: 123, 43: 124}
+        shells.rows.return_value = []
+        shells.command.return_value = {'id': 'wakeup', 'bytes': 4096}
+        shells.output_receipts.return_value = [{'pid': 42, 'written_bytes': 4096}, {'pid': 43, 'written_bytes': 4096}]
+        before = {'pid': 42, 'birth': 123, 'kernel_100ns': 10, 'user_100ns': 20,
+                  'begin_ns': 0, 'end_ns': 1, 'threads': []}
+        after = {**before, 'kernel_100ns': 110, 'begin_ns': 60_000_000_001, 'end_ns': 60_000_000_002}
+        counters = mock.Mock()
+        counters.sample.side_effect = [before, after]
+        clock, commands = [0.0], []
+        def command(*argv, **kwargs):
+            commands.append(clock[0])
+            return {'id': 'wakeup', 'bytes': 4096}
+        shells.command.side_effect = command
+        pdh = mock.Mock()
+        pdh.sample.side_effect = lambda: pdh_sample(int(clock[0]) + 10, int(clock[0] * 1000) + 100)
+        with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
+                mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
+                mock.patch.object(gx_perf.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0] + n)), \
+                mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]):
+            gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells, pdh_factory=lambda: pdh)
+        self.assertEqual(61, pdh.sample.call_count)
+        self.assertAlmostEqual(33.2, commands[0])
+        self.assertEqual([60], capture.samples.values['threads.context_switches.pdh'])
+        self.assertNotIn('threads.context_switches', capture.samples.values)
+        self.assertEqual([8192], capture.samples.values['stimulus.output_bytes'])
+        self.assertEqual(61, len(stimulus.read_rows(self.root / 'pdh-raw.jsonl')))
+        pdh.close.assert_called_once()
+        self.instance.press.assert_not_called()  # Output wakeup needs no injected desktop input.
+
+    def test_c7_missing_os_counter_is_pending_without_synthetic_zero(self):
+        import gx_perf_stimulus as stimulus
+        capture = gx_perf.CaptureRun(self.instance, self.root, {'capabilities': {'renderer.present': ''}, 'errors': []})
+        args = SimpleNamespace(case='visible', tabs=1, state='visible', seconds=2, output_bytes=4096)
+        shells = mock.Mock()
+        shells.identities, shells.rows.return_value = {42: 123}, []
+        before = {'pid': 42, 'birth': 123, 'kernel_100ns': 0, 'user_100ns': 0,
+                  'begin_ns': 0, 'end_ns': 1, 'threads': []}
+        counters = mock.Mock()
+        counters.sample.side_effect = [before, {**before, 'begin_ns': 2_000_000_001}]
+        clock = [0.0]
+        with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
+                mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
+                mock.patch.object(gx_perf.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0] + n)), \
+                mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]):
+            gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells,
+                               pdh_factory=mock.Mock(side_effect=stimulus.PdhFailure('add', 0xc0000bb9)))
+        self.assertEqual('PENDING', capture.report['c7']['coverage'])
+        self.assertEqual(0, capture.report['missing_metrics']['threads.context_switches.pdh']['n'])
+        self.assertNotIn('threads.context_switches.pdh', capture.samples.values)
+        self.assertIn('0xc0000bb9', capture.report['c7']['pdh']['reason'])
+
+    def test_c7_classification_combinations_keep_control_and_stop_matrix(self):
+        import gx_perf_stimulus as stimulus
+        import gx_win_gui as real
+        # Exercise the real measurement, experiment finalizer and matrix together.
+        # Only OS boundaries, clocks and counters are replaced; no desktop is used.
+        for outcome in ('commit', 'pending', 'success'):
+            for teardown in (False, True):
+                with self.subTest(outcome=outcome, teardown=teardown):
+                    exe = self.root / 'ghostty.exe'
+                    exe.write_bytes(b'fake executable')
+                    out = self.root / f'{outcome}-{teardown}'
+                    args = gx_perf.build_parser().parse_args([
+                        'win32-c7', '--exe', str(exe), '--exe', str(exe),
+                        '--out', str(out), '--runs', '2', '--diagnostic'])
+                    args.seconds = 0  # Deterministic protocol test, never performance evidence.
+                    self.gui.HARNESS_CONFIG = ''
+                    self.gui.env_assignments = real.env_assignments
+                    self.gui.GuiError = real.GuiError
+                    self.instance.wait_window.return_value = {'shown_ms': 1}
+                    self.instance.close.return_value = 'closed'
+                    self.instance.input_events = []
+                    self.instance.log.write_bytes(b'')
+                    shells = mock.Mock()
+                    shells.config.return_value = ''
+                    shells.identities = {42: 123}
+                    active = {'candidate': False, 'committed': False}
+                    early = [{'event': 'input', 'pid': 42, 'text': 'n'}]
+                    committed = [{'event': 'input', 'pid': 42, 'text': text} for text in '你好']
+                    def launch(_exe, env_dir, **_kwargs):
+                        active.update(candidate=env_dir.parent.parent.name == 'new', committed=False)
+                        self.instance.press.reset_mock()
+                        self.backdrop.teardown_failures.return_value = (
+                            ['privacy backdrop teardown failed'] if active['candidate'] and teardown else [])
+                        return self.instance
+                    def press(key):
+                        if key == 'space':
+                            active['committed'] = True
+                    def rows():
+                        if active['candidate'] and outcome == 'commit' and self.instance.press.called:
+                            return early
+                        return committed if active['committed'] else []
+                    def ime_state(*_args):
+                        if active['candidate'] and outcome == 'pending':
+                            return {'status': 'PENDING', 'reason': 'owned target is not zh-CN'}
+                        return {'status': 'ready', 'layout': '0x00000804', 'open': 1, 'conversion': 1}
+                    self.gui.launch.side_effect = launch
+                    self.instance.press.side_effect = press
+                    shells.rows.side_effect = rows
+                    sample = {'pid': 42, 'birth': 123, 'kernel_100ns': 0, 'user_100ns': 0,
+                              'begin_ns': 0, 'end_ns': 1, 'threads': []}
+                    counters = mock.Mock()
+                    def cpu_sample(_instance):
+                        sample['begin_ns'] += 1_000_000
+                        sample['end_ns'] += 1_000_000
+                        return dict(sample)
+                    counters.sample.side_effect = cpu_sample
+                    pdh = mock.Mock()
+                    pdh.sample.return_value = {}
+                    experiment = gx_perf.run_experiment
+                    def run(cell):
+                        return experiment(cell, self.gui, counters_factory=lambda _gui: counters)
+                    with mock.patch.object(stimulus, 'CASES', ('ime-preedit', 'visible')), \
+                            mock.patch.object(stimulus, 'ANIMATION_CASES', ()), \
+                            mock.patch.object(stimulus, 'OwnedShells', return_value=shells), \
+                            mock.patch.object(stimulus, 'ime_state', side_effect=ime_state), \
+                            mock.patch.object(stimulus, 'PdhThreads', return_value=pdh), \
+                            mock.patch.object(stimulus, 'pdh_summary', return_value={'status': 'sampled', 'switches': 0}), \
+                            mock.patch.object(gx_perf, 'populate'), \
+                            mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
+                            mock.patch.object(gx_perf, 'idle_state_entry', return_value={}), \
+                            mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
+                            mock.patch.object(gx_perf.time, 'sleep'), \
+                            mock.patch.object(gx_perf, 'run_experiment', side_effect=run), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        code = gx_perf.run_c7_matrix(args)
+                    matrix = gx_perf.read_json(out / 'RESULT.json')
+                    cell = gx_perf.read_json(out / '1-ime-preedit/RESULT.json')
+                    control = gx_perf.read_json(out / '1-ime-preedit/old/run-01/run.json')
+                    self.assertEqual('completed', control['status'], control['errors'])
+                    candidate = gx_perf.read_json(out / '1-ime-preedit/new/run-01/run.json')
+                    fatal = outcome == 'commit' or teardown
+                    pending = outcome == 'pending' and not teardown
+                    self.assertEqual('completed', control['status'])
+                    self.assertEqual('你好', control['c7']['ime']['commit_text'])
+                    self.assertTrue((out / '1-ime-preedit/old/run-01/samples.txt').is_file())
+                    self.assertEqual('failed' if fatal else 'pending' if pending else 'completed', candidate['status'])
+                    self.assertEqual(pending, candidate.get('environment_pending', False))
+                    self.assertEqual(pending, cell['environment_pending'])
+                    self.assertEqual(pending, matrix['cells'][0]['environment_pending'])
+                    self.assertEqual(1 if fatal else 4, matrix['completed_cells'])
+                    self.assertEqual('1-ime-preedit' if fatal else None, matrix.get('stopped_after_failure'))
+                    self.assertEqual(1 if fatal or pending else 0, code)
+                    self.assertEqual(2 if fatal or pending else 4, len(cell['runs']))
+                    if outcome == 'commit':
+                        self.assertEqual(early, candidate['c7']['ime']['before_input'])
+                        self.assertTrue(any('instead of holding preedit' in e for e in candidate['errors']))
+                    if outcome == 'pending':
+                        self.assertIn('owned target is not zh-CN', candidate['errors'])
+                        self.assertNotIn('before_input', candidate['c7']['ime'])
+                    if teardown:
+                        self.assertIn('privacy backdrop teardown failed', candidate['errors'])
+
+    def test_matrix_keeps_all_twelve_cells_and_stops_only_on_non_environment_failure(self):
+        args = gx_perf.build_parser().parse_args(['win32-c7', '--exe', 'old', '--exe', 'new', '--out', str(self.root / 'matrix')])
+        calls = []
+        def run(cell):
+            calls.append((cell.tabs, cell.case))
+            cell.out.mkdir()
+            pending = cell.case == 'ime-preedit'
+            gx_perf.write_json(cell.out / 'RESULT.json', {'valid': not pending, 'environment_pending': pending})
+            return int(pending)
+        with mock.patch.object(gx_perf, 'run_experiment', side_effect=run):
+            self.assertEqual(1, gx_perf.run_c7_matrix(args))
+        self.assertEqual(16, len(calls))
+        self.assertEqual(2, sum(case == 'ime-preedit' for _, case in calls))
+        args.out = self.root / 'matrix-fail'
+        def failed(cell):
+            cell.out.mkdir()
+            gx_perf.write_json(cell.out / 'RESULT.json', {'valid': False, 'environment_pending': False})
+            return 1
+        with mock.patch.object(gx_perf, 'run_experiment', side_effect=failed) as measured:
+            self.assertEqual(1, gx_perf.run_c7_matrix(args))
+        self.assertEqual(1, measured.call_count)
+
+
 class EncodingGuardTests(unittest.TestCase):
     """Text files these tools write hold non-ASCII reasons; with Python's UTF-8 mode off (cp936 on a
     Chinese Windows host) any read or write that leaves the encoding to the locale breaks."""
