@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import struct
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -84,6 +85,33 @@ class RemoteControlsTests(unittest.TestCase):
         reads = iter([4, 2])
         with mock.patch.object(remote.time, "sleep"), self.assertRaisesRegex(AssertionError, "decreased"):
             remote.settle_counter(lambda: next(reads), 3)
+
+
+class FindTreeTests(unittest.TestCase):
+    """round3-batch-20261018-111343 MIG-02b: polling for the drag-back scanned a
+    source window that the product closed mid-scan; the HWND guard read the dead
+    window's PID 0 as "fixture window PID changed" and failed the case."""
+
+    def scan(self, windows, natives):
+        instance = mock.Mock(pid=42)
+        instance.windows.return_value = windows
+        with mock.patch.object(remote.gui, "win32") as api, mock.patch.object(remote, "Native", side_effect=natives):
+            api.return_value.IsWindow.side_effect = lambda hwnd: hwnd != 1
+            return remote.find_tree(instance, {7})
+
+    def test_a_window_closed_mid_scan_is_skipped(self):
+        gone = SimpleNamespace(hwnd=1, cls=remote.gui.WINDOW_CLASS)
+        alive = SimpleNamespace(hwnd=2, cls=remote.gui.WINDOW_CLASS)
+        survivor = mock.Mock()
+        survivor.query.return_value = 1
+        survivor.tree.return_value = {"nodes": [{"leaf": {"core": 7}}]}
+        found = self.scan([gone, alive], [remote.gui.InputBlocked("fixture window PID changed"), survivor])
+        self.assertEqual((survivor, 0), found[:2])
+
+    def test_a_live_window_with_a_foreign_identity_still_fails(self):
+        alive = SimpleNamespace(hwnd=2, cls=remote.gui.WINDOW_CLASS)
+        with self.assertRaisesRegex(remote.gui.InputBlocked, "PID changed"):
+            self.scan([alive], [remote.gui.InputBlocked("fixture window PID changed")])
 
 
 if __name__ == "__main__":

@@ -14,15 +14,24 @@ def core_set(tree):
 
 
 def find_tree(instance, cores):
+    """The owned window and tab holding exactly `cores`, or None.
+
+    A transfer or drag-back closes and creates windows while this polls; a
+    window destroyed mid-scan is skipped. A live HWND whose identity changed
+    still fails (Native.guard), as does any other error."""
     instance.ensure_owned()
     for window in instance.windows():
         if window.cls != gui.WINDOW_CLASS:
             continue
-        native = Native(instance, window.hwnd)
-        for tab in range(native.query(4)):
-            tree = native.tree(tab)
-            if core_set(tree) == cores:
-                return native, tab, tree
+        try:
+            native = Native(instance, window.hwnd)
+            for tab in range(native.query(4)):
+                tree = native.tree(tab)
+                if core_set(tree) == cores:
+                    return native, tab, tree
+        except (gui.InputBlocked, AssertionError, PeerInterfaceUnavailable):
+            if gui.win32().IsWindow(window.hwnd):
+                raise
     return None
 
 
