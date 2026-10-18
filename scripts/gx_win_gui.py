@@ -35,7 +35,9 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   cancel-mode ENV_DIR               SendMessage WM_CANCELMODE to the focused terminal
 
 Scenario files: id, title and config (HARNESS_CONFIG is appended unless harness = false), optional
-env, args, requires, side_effects and expect, and [[step]] tables, each an action and its keys
+env, args, requires, side_effects, expect and wait_window (false: the steps start right after the
+launch instead of when the main window shows, for a start that fails before it), and [[step]] tables
+with an action and its keys
 ([bracketed] keys are optional; x/y/in/window address a point as described under Input safety):
   wait_window [timeout window]          activate [window]               sleep seconds
   wait_log pattern [timeout]            assert_log pattern [present]
@@ -46,6 +48,11 @@ env, args, requires, side_effects and expect, and [[step]] tables, each an actio
   move [x y in window]                  drag from to [in window steps button]
   drag_divider between fraction [steps]             wheel [x y in window delta horizontal count]
   capture name [what=window|quick|popups|all method=screen|print]
+  capture_window name [cls title timeout method]   another top-level window of the instance (not a
+                                        GhosttyWindow; e.g. the MessageBox or TaskDialog of a failed
+                                        start): class cls and/or title matching the regex title, waited
+                                        for up to timeout (default 10 s, at most 120), saved like capture
+                                        with PrintWindow (method = "print", the default) or the screen
   pixel [x y in window expect differs tolerance method label]
   dpi value                             ime_off                          cancel_mode [terminal]
   gpu_reset [terminal]                  assert_responsive [timeout]      resize width height
@@ -1591,6 +1598,30 @@ class Instance:
                 raise GuiError(f"no {kind} window within {timeout:g}s")
             time.sleep(0.001)
 
+    def find_window(self, cls: str | None = None, title: str | None = None, timeout: float = 10.0) -> WindowInfo:
+        """A visible top-level window of this instance other than a GhosttyWindow (such as the MessageBox
+        or TaskDialog of a start that failed) with class `cls` and a title matching the regex `title`,
+        the topmost if several; waits up to `timeout` seconds."""
+        if cls is None and title is None:
+            raise UsageError("find_window needs a class or a title pattern")
+        regex = re.compile(title) if title is not None else None
+
+        def matches() -> list[WindowInfo]:
+            return [info for info in self.windows() if info.cls != WINDOW_CLASS and info.visible and not info.cloaked
+                    and info.rect[0] < info.rect[2] and info.rect[1] < info.rect[3]
+                    and (cls is None or info.cls == cls) and (regex is None or regex.search(info.title))]
+
+        deadline = time.monotonic() + timeout
+        while True:
+            found = matches()
+            if found:
+                return found[0]
+            if time.monotonic() >= deadline:
+                shown = "; ".join(info.describe() for info in self.windows() if info.visible) or "none"
+                raise GuiError(f"no window of ghostty pid {self.pid} with class {cls or 'any'} and a title matching "
+                               f"{title or 'anything'} within {timeout:g}s; visible: {shown}")
+            time.sleep(0.05)
+
     def terminals(self, window: WindowInfo | None = None) -> list[WindowInfo]:
         window = window or self.require_window()
         found = [info for info in win32().child_windows(window.hwnd, TERMINAL_CLASS) if info.visible]
@@ -2086,9 +2117,11 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "simulate_d2d_failure": (frozenset(), frozenset(("window",))),
     "simulate_system_theme": (frozenset(), frozenset(("scheme", "high_contrast"))),
     "restart": (frozenset(), frozenset(("timeout", "env", "wait"))),
+    "capture_window": (frozenset(("name",)), frozenset(("cls", "title", "timeout", "method"))),
 }
 SCENARIO_KEYS = frozenset(("id", "title", "config", "harness", "env", "args", "requires", "side_effects", "expect",
-                           "backdrop", "backdrop_reason", "step"))
+                           "backdrop", "backdrop_reason", "wait_window", "step"))
+CAPTURE_ACTIONS = frozenset(("capture", "capture_window"))
 SCENARIO_ID_RE = re.compile(r"^[WG]\d{2}$")
 INPUT_ACTIONS = frozenset(("type", "key", "click", "mouse_down", "mouse_up", "move", "drag", "drag_divider", "wheel"))
 CAPTURE_WHAT = ("window", "quick", "popups", "all")
@@ -2119,6 +2152,7 @@ class Scenario:
     expect: list[str] = field(default_factory=list)
     backdrop: str | None = BACKDROP_DEFAULT  # "#rrggbb", None when the scenario turns the backdrop off
     backdrop_reason: str | None = None
+    wait_window: bool = True  # wait for the main window before the first step
 
     def full_config(self) -> str:
         text = self.config if self.config.endswith("\n") or not self.config else self.config + "\n"
@@ -2194,6 +2228,19 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
             raise UsageError(f"{where}: file readonly must be true or false")
         if "text" in params and not isinstance(params["text"], str):
             raise UsageError(f"{where}: file text must be a string")
+    if action == "capture_window":
+        if "cls" not in params and "title" not in params:
+            raise UsageError(f"{where}: capture_window needs cls or title")
+        if params.get("method", "print") not in ("print", "screen"):
+            raise UsageError(f"{where}: capture_window method must be print or screen")
+        timeout = params.get("timeout", 10)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
+            raise UsageError(f"{where}: capture_window timeout must be a number of seconds in (0, 120]")
+        if "title" in params:
+            try:
+                re.compile(params["title"])
+            except (re.error, TypeError) as exc:
+                raise UsageError(f"{where}: bad title pattern {params['title']!r}: {exc}") from None
     if action == "restart":
         env = params.get("env", {})
         if not isinstance(env, dict) or not all(isinstance(name, str) and ENV_NAME_RE.match(name)
@@ -2251,15 +2298,18 @@ def load_scenario(path: Path) -> Scenario:
     steps = [validate_step(f"{path.name} step {index}", raw) for index, raw in enumerate(data.get("step", []), 1)]
     if not steps:
         raise UsageError(f"{path}: no steps")
-    if not any(step.action == "capture" for step in steps):
+    if not any(step.action in CAPTURE_ACTIONS for step in steps):
         raise UsageError(f"{path}: a scenario must capture at least one screenshot")
+    if not isinstance(data.get("wait_window", True), bool):
+        raise UsageError(f"{path}: wait_window must be true or false")
     env = data.get("env", {})
     if not isinstance(env, dict) or not all(ENV_NAME_RE.match(name) and isinstance(v, str) for name, v in env.items()):
         raise UsageError(f"{path}: env must map variable names to strings")
     backdrop, backdrop_reason = scenario_backdrop(str(path), data)
     return Scenario(path, data["id"], data["title"], data["config"], steps, bool(data.get("harness", True)), dict(env),
                     list(data.get("args", [])), list(data.get("requires", [])), list(data.get("side_effects", [])),
-                    list(data.get("expect", [])), backdrop=backdrop, backdrop_reason=backdrop_reason)
+                    list(data.get("expect", [])), backdrop=backdrop, backdrop_reason=backdrop_reason,
+                    wait_window=data.get("wait_window", True))
 
 
 def scenario_paths(selectors: Sequence[str], directory: Path = SCENARIO_DIR) -> list[Path]:
@@ -2509,6 +2559,17 @@ class ScenarioRun:
             self.captures.append(path.name)
         return ", ".join(path.name for path in saved)
 
+    def do_capture_window(self, p):
+        info = self.gui.find_window(p.get("cls"), p.get("title"), float(p.get("timeout", 10)))
+        step = self.capture_steps + 1
+        path = self.capture_name(p["name"], step)
+        image = self.capture(info, p.get("method", "print"), path.name)
+        image.save_png(path)
+        self.capture_steps = step
+        self.captures.append(path.name)
+        left, top, right, bottom = info.rect
+        return f"{path.name}: {info.cls} {right - left}x{bottom - top} {info.title!r}"
+
     def do_pixel(self, p):
         x, y = self.point(p)
         image = self.capture(self.gui.require_window(p.get("window", "main")), p.get("method", "screen"),
@@ -2662,10 +2723,13 @@ class ScenarioRun:
             self.instance = launch(self.exe, env_dir, config=scenario.full_config(), env=scenario.env, args=scenario.args)
             report["pid"] = self.instance.pid
             report["creation_filetime_100ns"] = str(self.instance.creation)
-            self.startup = self.gui.wait_window(20)
-            report["startup_ms"] = self.startup
-            self.gui.activate()
-            self.backdrop.ensure(self.gui)
+            if scenario.wait_window:
+                self.startup = self.gui.wait_window(20)
+                report["startup_ms"] = self.startup
+                self.gui.activate()
+                self.backdrop.ensure(self.gui)
+            else:
+                report["wait_window"] = False  # the steps begin right after the launch
             for index, step in enumerate(scenario.steps, 1):
                 began = time.monotonic()
                 if step.action in INPUT_ACTIONS:

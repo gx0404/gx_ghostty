@@ -407,6 +407,7 @@ class FakeWin32:
         self.stack: list = []  # window_stack(), top to bottom
         self.answers: dict = {}  # message -> what send_message returns (None: no answer)
         self.messages: list = []
+        self.tops: list = []  # top_windows(pid)
 
     def process_alive(self, pid):
         return self.alive
@@ -442,7 +443,7 @@ class FakeWin32:
         return ("mouse", flags, x, y, data)
 
     def top_windows(self, pid):
-        return []
+        return list(self.tops)
 
     def window_stack(self):
         return list(self.stack)
@@ -960,6 +961,90 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(["/deny", "close", "/remove:d"], [entry if entry == "close" else entry[1] for entry in log])
         self.assertEqual(["state is writable again (acl)"], report["readonly"]["released_at_end"])
         self.assertEqual(["readonly", "writable"], [event["event"] for event in report["readonly"]["events"]])
+
+
+class CaptureWindowTests(unittest.TestCase):
+    PID = 4242
+    MAIN = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "Ghostty", (0, 0, 100, 100), True, False, False)
+    DIALOG = gui.WindowInfo(0x20, gui.DIALOG_CLASS, "Ghostty", (10, 10, 60, 40), True, False, False)
+
+    def instance(self):
+        return gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+
+    def test_validation_and_the_capture_requirement(self):
+        self.assertEqual("capture_window", gui.validate_step("s", {"action": "capture_window", "name": "x",
+                                                                   "cls": "#32770"}).action)
+        cases = {"needs cls or title": {"name": "x"},
+                 "method must be print or screen": {"name": "x", "cls": "#32770", "method": "desktop"},
+                 "timeout must be a number": {"name": "x", "cls": "#32770", "timeout": 600},
+                 "bad title pattern": {"name": "x", "title": "("}}
+        for expected, raw in cases.items():
+            with self.subTest(case=expected), self.assertRaisesRegex(gui.UsageError, expected):
+                gui.validate_step("s", {"action": "capture_window", **raw})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-x.toml"
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nwait_window = false\n'
+                            '[[step]]\naction = "capture_window"\nname = "error"\ncls = "#32770"\n', encoding="utf-8")
+            self.assertFalse(gui.load_scenario(path).wait_window)
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nwait_window = "no"\n'
+                            '[[step]]\naction = "capture_window"\nname = "error"\ncls = "#32770"\n', encoding="utf-8")
+            with self.assertRaisesRegex(gui.UsageError, "wait_window must be true or false"):
+                gui.load_scenario(path)
+
+    def test_find_window_skips_the_main_window_and_waits_for_the_dialog(self):
+        fake = FakeWin32(self.PID, self.PID)
+        fake.tops = [self.MAIN, gui.WindowInfo(0x30, gui.DIALOG_CLASS, "Ghostty", (0, 0, 9, 9), False, False, False)]
+        calls = []
+
+        def sleep(_):
+            calls.append(1)
+            fake.tops = [self.MAIN, self.DIALOG]
+
+        with mock.patch.object(gui, "win32", return_value=fake), mock.patch.object(gui.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.DIALOG, self.instance().find_window(title="^Ghostty$", timeout=5))
+            self.assertEqual(1, len(calls))
+            self.assertEqual(self.DIALOG, self.instance().find_window(gui.DIALOG_CLASS))
+            with self.assertRaisesRegex(gui.GuiError, "no window of ghostty pid 4242 with class TaskDialog .* within 0s"):
+                self.instance().find_window("TaskDialog", timeout=0)
+            with self.assertRaises(gui.UsageError):
+                self.instance().find_window()
+            fake.alive = False
+            with self.assertRaises(gui.InputBlocked):
+                self.instance().find_window(gui.DIALOG_CLASS)
+
+    def test_the_step_saves_a_print_capture_like_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = gui.ScenarioRun(None, Path("ghostty.exe"), Path(tmp))  # type: ignore[arg-type]
+            run.instance = mock.Mock(spec=gui.Instance)
+            run.instance.find_window.return_value = self.DIALOG
+            run.instance.capture_window.side_effect = lambda info, method: screen(info.rect)
+            self.assertEqual("01-error.png: #32770 50x30 'Ghostty'",
+                             run.do_capture_window({"name": "error", "cls": "#32770", "timeout": 3}))
+            run.instance.find_window.assert_called_once_with("#32770", None, 3.0)
+            run.instance.capture_window.assert_called_once_with(self.DIALOG, "print")
+            self.assertEqual((["01-error.png"], 1), (run.captures, run.capture_steps))
+            self.assertTrue((Path(tmp) / "01-error.png").is_file())
+
+    def test_a_scenario_that_never_shows_its_main_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-x.toml"
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nwait_window = false\n'
+                            '[[step]]\naction = "capture_window"\nname = "error"\ncls = "#32770"\n', encoding="utf-8")
+            run = gui.ScenarioRun(gui.load_scenario(path), Path("ghostty.exe"), Path(tmp) / "out")
+            instance = mock.Mock()
+            instance.log = Path(tmp) / "absent.log"
+            instance.find_window.return_value = self.DIALOG
+            instance.capture_window.side_effect = lambda info, method: screen(info.rect)
+            backdrop = mock.patch.object(gui, "BackdropWindow", FakeBackdropWindow)
+            FakeBackdropWindow.made = []
+            with backdrop, mock.patch.object(gui, "launch", return_value=instance), \
+                    mock.patch.object(gui, "win32", return_value=FakeWin32(4242, 4242)), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                report = run.run()
+        self.assertEqual(("ok", False, ["01-error.png"]), (report["status"], report["wait_window"], report["captures"]))
+        instance.wait_window.assert_not_called()
+        instance.activate.assert_not_called()
+        self.assertEqual([], FakeBackdropWindow.made, "a print capture needs no backdrop")
 
 
 class RestartTests(unittest.TestCase):
