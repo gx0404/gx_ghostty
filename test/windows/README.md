@@ -214,6 +214,11 @@ reason=queued`，消息循环发事件时记 `fixture_uia_focus snapshot=N node=
 快照已换则不派发也不记。焦点随新快照到达时（菜单滚动、键盘打开菜单/子菜单、Settings 换页），
 发布后同样入队一次 `focus_changed`：条件是焦点元素的稳定身份（令牌；Settings 为命中目标）
 与上次已发出事件的不同，或弹层刚显示（桥 `hide` 后）且有焦点元素；焦点不变的重发不入队。
+列表选择随新快照移动时（命令面板方向键与重新筛选、单选项、Settings 分区），发布后对新选中项
+入队一次 `element_selected`：条件是上一快照已显示同一选择容器（令牌、角色与名称）而选中项
+（令牌与名称）不同；容器新出现或弹层刚显示只记录不入队，每次发布最多 4 个。消息循环发
+UIA_SelectionItem_ElementSelectedEventId 时记 `fixture_uia_selected snapshot=N node=N
+raised=true|false`，`raised` 含义同上。命令面板的 Search 编辑框以 ControllerFor 指向 Results。
 Python FAIL JSON 保留 `stage/node_id/pattern_id/call/hresult/action_results`，不重试。
 
 ### A2r 远程控制接口（MIG-07 / MIG-08）

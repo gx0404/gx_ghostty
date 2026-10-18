@@ -60,13 +60,20 @@ pub const NodeSpec = struct {
     localized_type: []const u8 = "",
     /// AutomationId; empty: "gx-<id>".
     automation_id: []const u8 = "",
+    /// Index of the node this element controls (ControllerFor), such as the
+    /// result list a search edit filters: with the focus kept in the edit,
+    /// screen readers follow that list's selection.
+    controller_for: ?u16 = null,
 };
-/// `focus_changed` is internal: only `Publisher.moveFocus` queues it, so the
-/// App message loop raises the focus changed event (`raiseFocusChanged`).
-/// No provider method can queue it.
-pub const ActionKind = enum { focus, invoke, select, add_selection, remove_selection, set_value, toggle, expand, collapse, close, set_window_state, notification, focus_changed };
+/// `focus_changed` and `element_selected` are internal: only the Publisher
+/// queues them (`moveFocus`, `queueFocusChanged`, `queueSelected`), so the
+/// App message loop raises their events (`raiseFocusChanged`,
+/// `raiseSelected`). No provider method can queue them.
+pub const ActionKind = enum { focus, invoke, select, add_selection, remove_selection, set_value, toggle, expand, collapse, close, set_window_state, notification, focus_changed, element_selected };
 /// UIA_AutomationFocusChangedEventId.
 const focus_changed_event: i32 = 20005;
+/// UIA_SelectionItem_ElementSelectedEventId.
+const element_selected_event: i32 = 20012;
 pub const Action = struct {
     attachment: refs.Attachment,
     snapshot_id: u64,
@@ -321,6 +328,35 @@ pub const Publisher = struct {
         const raise = snapshot.api.event orelse return false;
         return raise(node.face(.simple), focus_changed_event) >= 0;
     }
+    /// GUI thread, after a publication that moved a selection to node
+    /// `node_id` (`PopupBridge` decides it did): queue its ElementSelected
+    /// event for the App message loop (`raiseSelected`), as focus changes are.
+    /// False without an active snapshot or such a selected node (stable views
+    /// included), or when the queue refuses it.
+    pub fn queueSelected(self: *const Publisher, node_id: u64) bool {
+        return self.queueSelectedWith(node_id, w32.PostMessageW);
+    }
+    fn queueSelectedWith(self: *const Publisher, node_id: u64, post_message: anytype) bool {
+        const snapshot = self.current orelse return false;
+        if (!snapshot.isActive() or snapshot.view != null) return false;
+        const node = snapshot.findNode(node_id) orelse return false;
+        if (!node.spec.selected) return false;
+        return snapshot.queue.postWith(snapshot, node_id, .element_selected, "", 0, post_message) == S_OK;
+    }
+    /// From the App message loop, outside locks: raise
+    /// UIA_SelectionItem_ElementSelectedEventId for `node_id` if it is still
+    /// selected in the current snapshot. A true return is an API result, not
+    /// event receipt.
+    pub fn raiseSelected(self: *const Publisher, node_id: u64) bool {
+        const snapshot = self.current orelse return false;
+        snapshot.retain();
+        defer snapshot.release();
+        if (!snapshot.isActive()) return false;
+        const node = snapshot.findNode(node_id) orelse return false;
+        if (!node.spec.selected) return false;
+        const raise = snapshot.api.event orelse return false;
+        return raise(node.face(.simple), element_selected_event) >= 0;
+    }
     /// GUI thread: whether `specs` describe the current snapshot's elements
     /// unchanged, for the same owner and window, apart from which one has
     /// the focus (`NodeSpec.focused`), the one state `moveFocus` changes.
@@ -529,6 +565,7 @@ fn validate(nodes: []const NodeSpec) !void {
         if (node.id == 0 or (if (i == 0) node.parent != null else node.parent == null or node.parent.? >= i)) return error.InvalidSnapshot;
         for (nodes[0..i]) |other| if (other.id == node.id) return error.InvalidSnapshot;
         if (node.host_state and (i != 0 or node.focused)) return error.InvalidSnapshot;
+        if (node.controller_for) |target| if (target >= nodes.len or target == i) return error.InvalidSnapshot;
         for ([_][]const u8{ node.name, node.value, node.localized_type, node.automation_id }) |value| {
             if (value.len > max_string_bytes or !std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidSnapshot;
             bytes += value.len;
@@ -722,6 +759,16 @@ fn property(face: *Face, id: i32, out: *Variant) callconv(.winapi) HR {
             out.* = integer(node.toggle_state);
         },
         30135 => out.* = integer(node.live_setting),
+        30104 => if (node.controller_for) |target| {
+            const array = SafeArrayCreateVector(13, 0, 1) orelse return E_OUTOFMEMORY;
+            var index: i32 = 0;
+            // VT_UNKNOWN elements: SafeArrayPutElement takes its own reference.
+            if (SafeArrayPutElement(array, &index, face.node.snapshot.nodes[target].face(.simple)) < 0) {
+                _ = SafeArrayDestroy(array);
+                return E_OUTOFMEMORY;
+            }
+            out.* = .{ .tag = 0x200d, .data = .{ .pointer = array } };
+        },
         else => {},
     }
     return S_OK;
@@ -1253,6 +1300,73 @@ test "UIA a host-state root leaves its focus and rectangle to the window and nam
     try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .host_state = true, .focused = true }}));
     try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .automation_id = "a\x00b" }}));
     try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .localized_type = "\xff" }}));
+}
+
+test "UIA a search edit names the list it controls and selection events follow the snapshot" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const Recorder = struct {
+        var raised: usize = 0;
+        var sender: ?*Face = null;
+        fn raise(face: *Face, event: i32) callconv(.winapi) HR {
+            if (event != 20012) return E_INVALIDARG;
+            raised += 1;
+            sender = face;
+            return S_OK;
+        }
+        extern "oleaut32" fn SafeArrayAccessData(*anyopaque, *?*anyopaque) callconv(.winapi) HR;
+        extern "oleaut32" fn SafeArrayUnaccessData(*anyopaque) callconv(.winapi) HR;
+    };
+    Recorder.raised = 0;
+    var api: Api = undefined;
+    api.count = .init(1);
+    api.event = Recorder.raise;
+    api.notification = null;
+    defer std.testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    const queue = try Queue.create(alloc, @ptrFromInt(1));
+    defer queue.release();
+    var publisher: Publisher = .{};
+    defer publisher.deinit();
+    try publisher.publish(alloc, &api, queue, testAttachment(), @ptrFromInt(1), &.{
+        .{ .id = 1, .name = "Command Palette", .role = .window, .patterns = .{ .window = true } },
+        .{ .id = 2, .parent = 0, .name = "Search", .role = .edit, .patterns = .{ .value = true }, .focusable = true, .focused = true, .controller_for = 2 },
+        .{ .id = 3, .parent = 0, .name = "Results", .role = .list, .patterns = .{ .selection = true } },
+        .{ .id = 4, .parent = 2, .name = "Split Right", .role = .list_item, .patterns = .{ .selection_item = true } },
+        .{ .id = 5, .parent = 2, .name = "Split Left", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = true },
+    });
+    const snapshot = publisher.current.?;
+    // ControllerFor: a one-element VT_UNKNOWN array holding the list's face.
+    var controller: Variant = .{};
+    try std.testing.expectEqual(S_OK, property(snapshot.nodes[1].face(.simple), 30104, &controller));
+    try std.testing.expectEqual(@as(u16, 0x200d), controller.tag);
+    const array = controller.data.pointer.?;
+    var elements: ?*anyopaque = null;
+    try std.testing.expectEqual(S_OK, Recorder.SafeArrayAccessData(array, &elements));
+    const first: *const ?*anyopaque = @ptrCast(@alignCast(elements.?));
+    try std.testing.expectEqual(@as(?*anyopaque, snapshot.nodes[2].face(.simple)), first.*);
+    try std.testing.expectEqual(S_OK, Recorder.SafeArrayUnaccessData(array));
+    try std.testing.expectEqual(S_OK, SafeArrayDestroy(array));
+    var none: Variant = .{ .tag = 99 };
+    try std.testing.expectEqual(S_OK, property(snapshot.nodes[2].face(.simple), 30104, &none));
+    try std.testing.expectEqual(@as(u16, 0), none.tag);
+    // Only a selected node's event is queued, and it names that node's face.
+    try std.testing.expect(!publisher.queueSelectedWith(4, testPost));
+    try std.testing.expect(publisher.queueSelectedWith(5, testPost));
+    var action = queue.pop().?;
+    defer action.deinit();
+    try std.testing.expectEqual(ActionKind.element_selected, action.kind);
+    try std.testing.expectEqual(@as(u64, 5), action.node_id);
+    try std.testing.expect(publisher.accepts(action));
+    try std.testing.expect(publisher.raiseSelected(5));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
+    try std.testing.expectEqual(@as(?*Face, snapshot.nodes[4].face(.simple)), Recorder.sender);
+    try std.testing.expect(!publisher.raiseSelected(4));
+    publisher.hide();
+    try std.testing.expect(!publisher.raiseSelected(5));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
+    // A controlled element exists and is another node.
+    try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Edit", .controller_for = 0 }}));
+    try std.testing.expectError(error.InvalidSnapshot, validate(&.{ .{ .id = 1, .name = "Window" }, .{ .id = 2, .parent = 0, .name = "Edit", .controller_for = 2 } }));
 }
 
 test "UIA announcement survives full queue and republication without duplicate delivery" {
