@@ -280,11 +280,9 @@ class InputLanguage:
         """Microsoft Pinyin swallows Ctrl+Shift+F: use a loaded English (US) layout.
 
         gx_win_gui's ime_off of this tree loads 00000409 when it is missing, so it
-        is not used; a missing US layout is an environment condition on the host."""
-        try:
-            result = switch_to_us(gui.win32(), self.hwnd, added=self.added, allow_load=self.allow_load)
-        except LayoutUnavailable as error:
-            raise EnvironmentUnavailable(str(error)) from None
+        is not used. A missing US layout raises LayoutUnavailable, which run_case
+        reports as BLOCKED with a nonzero exit (never skipped silently)."""
+        result = switch_to_us(gui.win32(), self.hwnd, added=self.added, allow_load=self.allow_load)
         self.fixture.check("input-language-us", **result)
         if not result["switched"]:
             raise AssertionError(f"the owned GUI thread did not switch to the US layout: {result}")
@@ -802,6 +800,12 @@ class BoundaryFixture(SessionFixture):
             else:
                 self.migration()
             self.report["status"] = "PASS_NATIVE_VISUAL_PENDING"
+        except LayoutUnavailable as error:
+            # The host never loads a keyboard layout (root 10:45/11:16); the case
+            # needs one the user has not loaded: BLOCKED, nonzero, rerun in the VM
+            # with --allow-load-layouts.
+            self.report.update(status="BLOCKED", reason=str(error), blocked_by="keyboard-layout")
+            result = 2
         except EnvironmentUnavailable as error:
             self.report.update(status="PENDING", reason=str(error))
             result = 2

@@ -503,6 +503,12 @@ class Fixture:
         self.save()
         return result["switched"]
 
+    def require_us_layout(self, instance, hwnd, purpose):
+        """use_us_layout for steps that must not run without it: Blocked (exit 2), never a silent skip."""
+        if not self.use_us_layout(instance, hwnd):
+            raise Blocked(f"{purpose} needs a loaded US layout on the owned input thread "
+                          f"({self.report['input_language'].get('us')}); in the VM use --allow-load-layouts")
+
     def restore_layout(self):
         if self.layout_saved is None:
             return
@@ -684,8 +690,7 @@ class Fixture:
                     measurement_status="PENDING_ROOT_AGGREGATION", perf_enabled_roles=["source", "target"])
 
     def case_table(self, target, remote):
-        if not self.use_us_layout(target, remote.hwnd):
-            raise Blocked("persistent table needs US layout on the owned input thread")
+        self.require_us_layout(target, remote.hwnd, "the persistent key table case")
         self.focus_remote(target, remote.hwnd)
         target.press("ctrl+alt+t")
         for count in (1, 2):
@@ -1537,7 +1542,8 @@ class Fixture:
                 self.ime_control(ime_window, IMC_SETOPENSTATUS, state["open"])
             except AssertionError as exc:
                 state["restore_error"] = str(exc)
-            self.use_us_layout(target, remote.hwnd)
+            self.use_us_layout(target, remote.hwnd)  # best effort; never masks a failure in flight
+        self.require_us_layout(target, remote.hwnd, "typing the IME case redirect")
         target.type_text(">>ime.txt")
         target.press("enter")
         deadline = time.monotonic() + 10

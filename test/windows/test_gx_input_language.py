@@ -116,8 +116,9 @@ class FixtureCallSiteTests(unittest.TestCase):
                     offenders.append(f"{path.name}: {needle}")
         self.assertEqual([], offenders)
 
-    def test_controller_us_uses_loaded_layouts_and_reports_missing_as_environment(self):
+    def test_controller_us_uses_loaded_layouts_and_blocks_when_us_is_missing(self):
         import gx_boundary_controller as controller
+        import gx_input_language
         instance = mock.Mock(pid=42)
         for loaded, allow in (([0x08040804, 0x04090409], False), ([0x08040804], False)):
             fixture = SimpleNamespace(report={}, check=mock.Mock(), args=SimpleNamespace(allow_load_layouts=allow))
@@ -129,9 +130,37 @@ class FixtureCallSiteTests(unittest.TestCase):
                     language.us()
                     self.assertEqual(0x04090409, state["layout"])
                 else:
-                    with self.assertRaisesRegex(controller.EnvironmentUnavailable, "never loads"):
+                    with self.assertRaisesRegex(gx_input_language.LayoutUnavailable, "never loads"):
                         language.us()
         instance.ime_off.assert_not_called()
+
+    def test_controller_case_with_a_missing_us_layout_exits_nonzero_as_blocked(self):
+        import tempfile
+        import gx_boundary_controller as controller
+        import gx_input_language
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = controller.BoundaryFixture.__new__(controller.BoundaryFixture)
+            fixture.case_id, fixture.owned, fixture.processes = "MIG-08-local", [], {}
+            fixture.out, fixture.report = Path(directory), {"native": [], "captures": []}
+            fixture.migration = mock.Mock(side_effect=gx_input_language.LayoutUnavailable("the host never loads one"))
+            self.assertEqual(2, fixture.run_case())
+            self.assertEqual(("BLOCKED", "keyboard-layout"), (fixture.report["status"], fixture.report["blocked_by"]))
+            self.assertIn("never loads", fixture.report["reason"])
+
+    def test_remote_require_us_layout_raises_blocked_instead_of_typing_on(self):
+        import gx_remote_fixture as remote
+        fixture = remote.Fixture.__new__(remote.Fixture)
+        fixture.layout_saved, fixture.report, fixture.save = None, {}, mock.Mock()
+        fixture.allow_load_layouts, fixture.layouts_added = False, []
+        api, state = thread(0x08040804)
+        with mock.patch.object(remote.gui, "win32", return_value=api), \
+                mock.patch("gx_input_language._user32", return_value=FakeUser32([0x08040804])):
+            with self.assertRaisesRegex(remote.Blocked, "US layout"):
+                fixture.require_us_layout(mock.Mock(), 5, "IME case cleanup")
+        with mock.patch.object(remote.gui, "win32", return_value=api), \
+                mock.patch("gx_input_language._user32", return_value=FakeUser32([0x08040804, 0x04090409])):
+            fixture.require_us_layout(mock.Mock(), 5, "IME case cleanup")
+        self.assertEqual(0x04090409, state["layout"])
 
     def test_remote_fixture_uses_loaded_layouts_and_blocks_when_us_is_missing(self):
         import gx_remote_fixture as remote
