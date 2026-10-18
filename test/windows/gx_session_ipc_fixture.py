@@ -27,6 +27,7 @@ from gx_fixture_evidence import native_snapshot, sha256, write_review, fixture_s
 
 CONFIG = "language = en\nconfirm-close-surface = false\n"
 CREATE_SUSPENDED = 0x00000004  # Win32 creation flag; not exported by every Python build.
+WS_EX_NOACTIVATE = 0x08000000  # menu popups: Windows never makes them the foreground window
 CASE_IDS = {"multi": "IPC-01", "disabled": "SES-00", "custom": "SES-03a",
             "roundtrip": "SES-01", "missing_profile": "SES-02", "priority": "SES-03",
             "cancel_close": "SES-04", "write_failure": "SES-05", "dual_writer": "SES-06",
@@ -197,8 +198,15 @@ class Fixture:
     def capture(self, instance, name, window=None):
         instance.ensure_owned()
         window = window or instance.require_window()
+        # A menu popup never becomes the foreground window: the owned window
+        # that owns it (GA_ROOTOWNER) must hold the foreground instead.
+        foreground_hwnd = window.hwnd
+        if gui.win32().GetWindowLongPtrW(window.hwnd, -20) & WS_EX_NOACTIVATE:
+            foreground_hwnd = gui.win32().GetAncestor(window.hwnd, 3)
+            if not foreground_hwnd or foreground_hwnd == window.hwnd or gui.win32().window_pid(foreground_hwnd) != instance.pid:
+                raise gui.InputBlocked("non-activating popup has no owned owner window; stopping batch")
         # PrintWindow stays scoped to the owned HWND if Windows denies foreground.
-        foreground = gui.win32().activate(window.hwnd)
+        foreground = gui.win32().activate(foreground_hwnd)
         if not foreground:
             raise gui.InputBlocked("owned window foreground denied; stopping batch")
         time.sleep(0.2)
@@ -206,6 +214,8 @@ class Fixture:
         window = gui.win32().info(window.hwnd)
         if gui.win32().window_pid(window.hwnd) != instance.pid:
             raise gui.InputBlocked("capture HWND owner changed")
+        if not window.visible:
+            raise AssertionError(f"window {window.hwnd:#x} closed before its capture")
         occluders = set()
         left, top, right, bottom = window.rect
         for fx, fy in ((0.5, 0.1), (0.5, 0.5), (0.5, 0.9)):
@@ -216,7 +226,7 @@ class Fixture:
         method = "screen"
         instance.capture_window(window, method).save_png(self.out / f"{name}.png")
         self.report["captures"].append({"file": f"{name}.png", "method": method,
-                                        "foreground": foreground, "review": "PENDING_REVIEW",
+                                        "foreground": foreground, "foreground_hwnd": foreground_hwnd, "review": "PENDING_REVIEW",
                                         "window": asdict(window), "occluder_hwnds": sorted(occluders),
                                         "identity": native_snapshot(instance)})
 
