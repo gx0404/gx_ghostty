@@ -93,8 +93,10 @@ try:
     capture("07-save-failed-again")
     search("GX Mocha")
     capture("08-saved-theme-selected")
+    failures = (evidence / "G26.log").read_text().count("cannot save ")
     close()
     capture("09-closed")
+    assert (evidence / "G26.log").read_text().count("cannot save ") == failures, "selecting the saved theme must discard the failed save before closing"
 finally:
     read_only(False)
 assert "Chalkboard" not in overlay_text()
