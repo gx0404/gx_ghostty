@@ -306,6 +306,29 @@ jobs:
         run: |
           zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # +validate-config must keep its exit code whatever stdout is: a pipe, a file or NUL (GX-0049).
+      - name: validate-config exit codes with stdout on a pipe, a file and NUL
+        run: |
+          $exe = (Resolve-Path 'zig-out/bin/ghostty.exe').Path
+          $dir = Join-Path $env:RUNNER_TEMP 'gx-validate-config'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $env:LOCALAPPDATA = $dir
+          $env:XDG_CONFIG_HOME = $dir
+          $valid = Join-Path $dir 'valid.ghostty'
+          $invalid = Join-Path $dir 'invalid.ghostty'
+          Set-Content -LiteralPath $valid -Value 'font-size = 13'
+          Set-Content -LiteralPath $invalid -Value 'font-size = abc'
+          foreach ($case in @(@{ Config = $valid; Want = 0 }, @{ Config = $invalid; Want = 1 })) {
+            $command = '"{0}" +validate-config "--config-file={1}"' -f $exe, $case.Config
+            $null = cmd /c $command
+            if ($LASTEXITCODE -ne $case.Want) { throw "pipe: $($case.Config) exited $LASTEXITCODE, want $($case.Want)" }
+            cmd /c "$command > `"$(Join-Path $dir 'out.txt')`""
+            if ($LASTEXITCODE -ne $case.Want) { throw "file: $($case.Config) exited $LASTEXITCODE, want $($case.Want)" }
+            cmd /c "$command > NUL"
+            if ($LASTEXITCODE -ne $case.Want) { throw "NUL: $($case.Config) exited $LASTEXITCODE, want $($case.Want)" }
+          }
+          # The last case exits 1 on purpose; GitHub's pwsh wrapper would end the step with it.
+          exit 0
       # The win32 apprt, the GX core and DirectWrite only compile into a Windows test binary;
       # tinyio's symlink cases need the administrator token that hosted runners have.
       - name: win32 apprt, GX core, DirectWrite and tinyio tests, sharded across processes
