@@ -716,6 +716,34 @@ class QuietBatchTests(unittest.TestCase):
         self.assertEqual(('fail', 'foreign_input'), (after['checks']['input']['status'], after['checks']['input']['raw']['cause']))
         self.assertEqual(['input'], json.loads((self.args.out.parent / 'idle-foreign-input' / 'RESULT.json').read_text(encoding='utf-8'))['failed_checks'])
 
+    def test_idle_state_rows_are_classified_by_their_cause(self):
+        # gx_perf win32-idle audits a broken --state arrangement as a failed idle_state_window guard row.
+        sent = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
+        lost = {'event': 'guard', 'check': 'idle_state_window', 'status': 'fail', 'cause': 'foreground_lost', 'state': 'visible',
+                'other_pid': 7, 'other_class': 'Chrome_WidgetWin_1', 'other_image': 'chrome.exe',
+                'reason': 'visible measured process lost focus; the foreground window is 0x77 (Chrome_WidgetWin_1, pid 7)'}
+        hung = dict(lost, cause='instance_hung', reason='ghostty pid 42 hangs or crashed (IsHungAppWindow reports its '
+                                                        'GhosttyWindow 0x10): visible measured process lost focus')
+        helper_gone = dict(lost, cause='instance_gone', state='unfocused', helper_pid=50, helper_alive=False,
+                           reason='the focus helper ghostty pid 50 ended during the idle window: measured process regained focus')
+        cases = [  # (label, flags, rows, exit, status, failure cause)
+            # A one-tab win32-idle sends no input; another window took the foreground.
+            ('state-lost', (), (lost,), 3, 'INVALID', 'foreground_lost'),
+            # A multi-tab win32-idle: its setup input passed the guards first.
+            ('state-lost-injected', ('--injected-input',), (sent, lost), 3, 'INVALID', 'foreground_lost'),
+            ('state-hung', (), (hung,), 6, 'PRODUCT_FAIL', 'instance_hung'),
+            ('state-helper-gone', ('--injected-input',), (sent, helper_gone), 6, 'PRODUCT_FAIL', 'instance_gone'),
+        ]
+        for label, flags, rows, expected, status, cause in cases:
+            args = self.batch_args(*flags)
+            args.out = self.args.out.parent / label
+            with self.subTest(label):
+                exit_code, result = self.run_batch(args, self.audited(1, *rows))
+                self.assertEqual((expected, status, cause), (exit_code, result['status'], result['failure_cause']))
+        raw = json.loads((self.args.out.parent / 'state-lost' / 'after.json').read_text(encoding='utf-8'))['checks']['input']
+        self.assertEqual(('fail', 'foreground_lost'), (raw['status'], raw['raw']['cause']))
+        self.assertIn('input check idle_state_window failed', raw['raw']['reason'])
+
     def test_noncompliant_thresholds_mode_mismatch_and_end_check_errors(self):
         args = self.batch_args('--idle-seconds', '5')
         self.probe.input_ticks.return_value = ticks(30)
@@ -1147,6 +1175,93 @@ class ExperimentTests(unittest.TestCase):
         instance.record_input.assert_called_once_with('guard', check='idle_input_window', status='fail', cause='foreign_input',
                                                       reason='external input occurred during the idle measurement window',
                                                       before_tick=10, after_tick=11)
+
+    def test_idle_state_breaks_are_audited_with_a_structured_cause(self):
+        # After the idle window a broken --state arrangement writes one failed idle_state_window guard
+        # row with title-free facts about the foreground window and raises its cause; a state that
+        # held writes nothing.
+        import gx_win_gui as real
+        windows = [SimpleNamespace(hwnd=0x10), SimpleNamespace(hwnd=0x20)]
+
+        def check(state, foreground_pid, *, hang=None, helper=None, restored=()):
+            instance, gui = mock.Mock(pid=42), mock.Mock()
+            instance.hang_evidence.return_value = hang
+            w = gui.win32.return_value
+            w.foreground.return_value = 0x77
+            w.window_pid.return_value = foreground_pid
+            w.class_name.return_value = 'GhosttyWindow' if foreground_pid == 42 else 'Chrome_WidgetWin_1'
+            w.IsIconic.side_effect = lambda hwnd: hwnd not in restored
+            gui.image_name.return_value = 'ghostty.exe' if foreground_pid == 42 else 'chrome.exe'
+            with mock.patch.object(gx_perf, 'main_windows', return_value=windows):
+                try:
+                    gx_perf.idle_state_check(gui, instance, SimpleNamespace(state=state), helper)
+                except gx_perf.PerfError as exc:
+                    self.assertEqual(1, instance.record_input.call_count)
+                    return exc.cause, instance.record_input.call_args, instance
+            instance.record_input.assert_not_called()
+            return None, None, instance
+
+        self.assertIsNone(check('visible', 42)[0])
+        self.assertIsNone(check('unfocused', 7)[0])  # another app in front still leaves it unfocused
+        self.assertIsNone(check('minimized', 7)[0])
+        # Another window took the foreground of a visible instance: environment noise (INVALID).
+        cause, call, instance = check('visible', 7)
+        self.assertEqual('foreground_lost', cause)
+        self.assertEqual(mock.call('guard', check='idle_state_window', status='fail', cause='foreground_lost',
+                                   reason='visible measured process lost focus; the foreground window is 0x77 '
+                                          '(Chrome_WidgetWin_1, pid 7)',
+                                   state='visible', other_pid=7, other_class='Chrome_WidgetWin_1', other_image='chrome.exe'),
+                         call)
+        instance.hang_evidence.assert_called_once_with('Chrome_WidgetWin_1', 'chrome.exe')
+        # The same loss with hang evidence is a product failure (PRODUCT_FAIL).
+        cause, call, _ = check('visible', 7, hang='IsHungAppWindow reports its GhosttyWindow 0x10')
+        self.assertEqual('instance_hung', cause)
+        self.assertEqual('ghostty pid 42 hangs or crashed (IsHungAppWindow reports its GhosttyWindow 0x10): visible '
+                         'measured process lost focus; the foreground window is 0x77 (Chrome_WidgetWin_1, pid 7)',
+                         call.kwargs['reason'])
+        # Unfocused: the measured process took the foreground back from the live focus helper (INVALID) ...
+        cause, call, _ = check('unfocused', 42, helper=mock.Mock(pid=50, **{'alive.return_value': True}))
+        self.assertEqual(('foreground_lost', 'unfocused', 50, True, 'GhosttyWindow', 'ghostty.exe'),
+                         (cause, call.kwargs['state'], call.kwargs['helper_pid'], call.kwargs['helper_alive'],
+                          call.kwargs['other_class'], call.kwargs['other_image']))
+        # ... or because the helper, an owned process of the same build, ended: never noise (PRODUCT_FAIL).
+        cause, call, _ = check('unfocused', 42, helper=mock.Mock(pid=50, **{'alive.return_value': False}))
+        self.assertEqual('instance_gone', cause)
+        self.assertEqual('the focus helper ghostty pid 50 ended during the idle window: measured process regained '
+                         'focus; the foreground window is 0x77 (GhosttyWindow, pid 42)', call.kwargs['reason'])
+        # Minimized: the restored windows are listed by handle.
+        cause, call, _ = check('minimized', 42, restored=(0x20,))
+        self.assertEqual(('foreground_lost', 'minimized', ['0x20']), (cause, call.kwargs['state'], call.kwargs['restored']))
+        # The measured process ended: ensure_owned audits and raises instance_gone before a window is read.
+        instance, gui = mock.Mock(pid=42), mock.Mock()
+        instance.ensure_owned.side_effect = real.InputBlocked('ghostty pid 42 has ended', cause='instance_gone')
+        with self.assertRaises(real.InputBlocked) as raised:
+            gx_perf.idle_state_check(gui, instance, SimpleNamespace(state='visible'))
+        self.assertEqual('instance_gone', raised.exception.cause)
+        gui.win32.return_value.foreground.assert_not_called()
+        instance.record_input.assert_not_called()
+
+    def test_idle_state_check_runs_after_the_input_window_with_the_focus_helper(self):
+        instance, gui, counters = mock.Mock(pid=42, exe=str(self.exe)), mock.Mock(HARNESS_CONFIG=''), mock.Mock()
+        args = self.args('win32-idle', '--state', 'unfocused')
+        helper = gui.launch.return_value
+        with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
+                mock.patch.object(gx_perf, 'idle_interval') as interval:
+            gx_perf.measure_idle(gui, instance, gx_perf.CaptureRun(instance, self.root, {}), args, counters)
+        self.assertIs(helper, interval.call_args.kwargs['helper'])
+        helper.close.assert_called_once_with()
+        instance.log = self.root / 'idle-wiring.log'
+        instance.log.write_text('', encoding='utf-8')
+        sample = dict(pid=1, birth=2, user_100ns=0, kernel_100ns=0, begin_ns=0, end_ns=1, threads=[])
+        counters.sample.side_effect = [sample, dict(sample, begin_ns=60000000001)]
+        failure = gx_perf.PerfError('measured process regained focus', cause='foreground_lost')
+        with mock.patch.object(gx_perf.time, 'sleep'), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 10)), \
+                mock.patch.object(gx_perf, 'idle_state_check', side_effect=failure) as state_check:
+            with self.assertRaises(gx_perf.PerfError) as raised:
+                gx_perf.idle_interval(gui, instance, gx_perf.CaptureRun(instance, self.root, {}), args, counters, helper=helper)
+        state_check.assert_called_once_with(gui, instance, args, helper)
+        self.assertEqual('foreground_lost', raised.exception.cause)
+        self.assertEqual(2, counters.sample.call_count)  # both endpoints were sampled before the check
 
     def test_p3_drags_real_caption_and_p6_holds_key_at_30hz(self):
         gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()

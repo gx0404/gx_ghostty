@@ -1762,13 +1762,62 @@ def measure_idle(gui, instance, capture: CaptureRun, args, counters):
         try:
             helper.wait_window(30)
             helper.activate()
-            return idle_interval(gui, instance, capture, args, counters)
+            return idle_interval(gui, instance, capture, args, counters, helper=helper)
         finally:
             helper.close()
     return idle_interval(gui, instance, capture, args, counters)
 
 
-def idle_interval(gui, instance, capture, args, counters):
+def idle_state_check(gui, instance, args, helper=None) -> None:
+    """The --state arrangement must still hold after the idle window. A broken one is audited like a
+    failed guard (check idle_state_window, the same gx-input-guard-v1 fields and title-free
+    other_pid/other_class/other_image facts about the foreground window) and raised with that cause:
+
+    instance_gone   the measured process ended (ensure_owned audits and raises it), or the unfocused
+                    state's focus helper, an owned process of the same build, ended and so handed the
+                    foreground back: a product/driver failure, never noise (PRODUCT_FAIL).
+    instance_hung   Instance.hang_evidence: the measured process hangs or crashed (PRODUCT_FAIL).
+    foreground_lost any other loss of the arrangement without input: another window took the
+                    foreground of a visible instance, or the measured process regained the foreground
+                    from the live helper, or one of its minimized windows was restored (INVALID).
+    """
+    instance.ensure_owned()
+    w = gui.win32()
+    hwnd = w.foreground()
+    pid = w.window_pid(hwnd) if hwnd else 0
+    details = {}
+    if args.state == 'visible':
+        if pid == instance.pid:
+            return
+        message = 'visible measured process lost focus'
+    elif args.state == 'unfocused':
+        if pid != instance.pid:
+            return
+        message = 'measured process regained focus'
+        if helper is not None:
+            details.update(helper_pid=helper.pid, helper_alive=helper.alive())
+    else:
+        restored = [f'{window.hwnd:#x}' for window in main_windows(gui, instance) if not w.IsIconic(window.hwnd)]
+        if not restored:
+            return
+        message = 'a measured window was restored'
+        details['restored'] = restored
+    other_class = w.class_name(hwnd) if hwnd else 'none'
+    other_image = gui.image_name(pid) if pid else None
+    message += f'; the foreground window is {hwnd:#x} ({other_class}, pid {pid})'
+    cause = 'foreground_lost'
+    if hang := instance.hang_evidence(other_class, other_image):
+        cause = 'instance_hung'
+        message = f'ghostty pid {instance.pid} hangs or crashed ({hang}): {message}'
+    elif details.get('helper_alive') is False:
+        cause = 'instance_gone'
+        message = f'the focus helper ghostty pid {helper.pid} ended during the idle window: {message}'
+    instance.record_input('guard', check='idle_state_window', status='fail', cause=cause, reason=message,
+                          state=args.state, other_pid=pid, other_class=other_class, other_image=other_image, **details)
+    raise PerfError(message, cause=cause)
+
+
+def idle_interval(gui, instance, capture, args, counters, helper=None):
     time.sleep(2)
     before_log = capture.mark()
     input_before = last_input_ticks()[0]
@@ -1787,12 +1836,7 @@ def idle_interval(gui, instance, capture, args, counters):
         instance.record_input('guard', check='idle_input_window', status='fail', cause='foreign_input', reason=message,
                               before_tick=input_before, after_tick=input_after)
         raise PerfError(message, cause='foreign_input')
-    if args.state == 'visible' and gui.win32().window_pid(gui.win32().foreground()) != instance.pid:
-        raise PerfError('visible measured process lost focus')
-    if args.state == 'unfocused' and gui.win32().window_pid(gui.win32().foreground()) == instance.pid:
-        raise PerfError('measured process regained focus')
-    if args.state == 'minimized' and not all(gui.win32().IsIconic(w.hwnd) for w in main_windows(gui, instance)):
-        raise PerfError('a measured window was restored')
+    idle_state_check(gui, instance, args, helper)
     text = capture.window('idle', before_log)
     capture.count(text, 'proc.snapshot')
     capture.count(text, 'renderer.present', required=False)
