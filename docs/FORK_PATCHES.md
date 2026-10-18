@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0048）之后的号。在册的 42 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0048，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0049）之后的号。在册的 43 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0049，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -123,6 +123,7 @@
 | GX-0047 | `src/shell-integration/elvish/lib/ghostty-integration.elv` | `fork(gx): GX-0047` | active |
 | GX-0048 | `src/config/Config.zig` | `fork(gx): GX-0048` | active |
 | GX-0048 | `src/os/mouse.zig` | `fork(gx): GX-0048` | active |
+| GX-0049 | `src/cli/validate_config.zig` | `fork(gx): GX-0049` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1474,3 +1475,12 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：保持只在默认值 0 时取系统值；上游若为 Windows 实现同样的读取，删除本补丁。
 - 移除条件：上游在 `src/os/mouse.zig` 原生支持 Windows 双击间隔后，删除块与 `src/gx/os_mouse.zig`，登记改为 removed。
 - 验证：`just test --filter gx.os_mouse`（0 值与上限的纯函数用例；Windows 上断言与 `GetDoubleClickTime`、`clickInterval` 一致）；`python scripts/run_unittests.py test_fork_patches`（`Gx0048ShapeTests` 锁定块的位置与内容、剥离后等于上游原文、只在 0 值时取系统值）；最终构建上在 VM 内复验系统 300 ms 时 400 ms 间隔判为两次单击、用户设 350 ms 时 325 ms 间隔判为双击，复验前保持 PENDING。
+
+## GX-0049 validate-config 的标准输出只 flush 不截断
+
+- 文件：`src/cli/validate_config.zig`（`run` 末尾的 `stdout_writer.end()` 改为 `stdout_writer.flush()`，单行标记）；active，未回馈上游（上游 main 仍是 `end()`，适合由人回馈）。
+- 原因：Zig 0.16 的 `std.Io.File.Writer.end` 在 positional 模式下 flush 后按写入位置截断文件。Windows 上 stdout 的 writer 无论有没有输出都保持 positional；stdout 是管道或 NUL 时截断失败（具体错误随设备而异），`ghostty +validate-config` 因此对合法配置也退出 1（D-04，证据 `.local/evidence/R5/execution-20261013/final-r3/root/d04/`）；有诊断时退出码本来就是 1，掩盖了同一个错误。POSIX 上同一情形被忽略，不受影响。上游 4ea669562（#10147）对代码生成器做过同样的修复。
+- 行为：只改收尾方式，输出与退出码的语义不变（合法为 0，有诊断时输出诊断并为 1）；不再截断 stdout 指向的文件，与 `+version`、`+help`、`+show-config` 一致。`>` 重定向时 shell 已先截断；以不截断方式打开的已有文件会保留旧内容的尾部，与其他上游 CLI 动作一致。
+- 同步：上游改写 `run` 时，保持 stdout 只 flush、不 end。
+- 移除条件：上游 `validate_config.zig::run` 改为 flush（或改用 streaming writer），或 Zig 不再让这种截断失败时，删除标记、恢复上游行，登记改为 removed。
+- 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0049ShapeTests` 锁定 `run` 只 flush、不再出现 `stdout_writer.end()`）；进程级回归在 gx-ci `windows-app` 构建之后的一步：stdout 分别为管道、文件、NUL，合法配置须退出 0、非法配置须退出 1（本地按 GitHub pwsh 包装模拟，修复前的 r6 构建在管道与 NUL 下退出 1，修复后全部符合；`.local/evidence/R5/execution-20261013/final-r3/root/d04/gh-wrapper-sim.log`）。Zig 单测不可行：`run` 写进程真实的 stdout，而测试进程的 stdout 是测试运行器的协议通道。
