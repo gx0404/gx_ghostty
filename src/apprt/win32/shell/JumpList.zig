@@ -419,6 +419,17 @@ test "apprt.win32.shell.D28 real saved links migrate only empty matching pin and
             const link = try create(&clsid_link, &iid_link);
             defer Identity.release(link);
             try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 20)(link, if (index == 2) other_w else identity.exe));
+            if (index == 0) {
+                const w = std.unicode.utf8ToUtf16LeStringLiteral;
+                const cwd = try std.unicode.utf8ToUtf16LeAllocZ(alloc, root);
+                defer alloc.free(cwd);
+                try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 11)(link, w("--title=\"Custom pin\" --working-directory=\"C:\\Some Folder\"")));
+                try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 9)(link, cwd));
+                try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 7)(link, w("Custom legacy pin description")));
+                try check(Identity.method(*const fn (*Interface, [*:0]const u16, c_int) callconv(.winapi) HRESULT, link, 17)(link, other_w, 7));
+                try check(Identity.method(*const fn (*Interface, c_int) callconv(.winapi) HRESULT, link, 15)(link, 3));
+                try check(Identity.method(*const fn (*Interface, u16) callconv(.winapi) HRESULT, link, 13)(link, 0x0647));
+            }
             const properties = try Identity.query(link, &iid_property_store);
             defer Identity.release(properties);
             if (index == 1 or index == 3) {
@@ -429,6 +440,7 @@ test "apprt.win32.shell.D28 real saved links migrate only empty matching pin and
         }
         const before = try tmp.dir.readFileAlloc(t.io, name, alloc, .limited(1024 * 1024));
         defer alloc.free(before);
+        const semantics = if (index == 0) try PinSemantics.read(wide) else null;
         if (index == 0) {
             var changed: usize = 0;
             try migratePinDirectory(alloc, t.io, &identity, root, &changed);
@@ -444,6 +456,15 @@ test "apprt.win32.shell.D28 real saved links migrate only empty matching pin and
         defer alloc.free(twice);
         try t.expectEqualSlices(u8, after, twice);
         if (index == 0) {
+            const after_semantics = try PinSemantics.read(wide);
+            try t.expectEqualDeep(semantics.?, after_semantics);
+            try t.expect(semantics.?.text[0][0] != 0);
+            try t.expect(semantics.?.text[1][0] != 0);
+            try t.expect(semantics.?.text[2][0] != 0);
+            try t.expect(semantics.?.text[3][0] != 0);
+            try t.expectEqual(@as(c_int, 7), semantics.?.icon_index);
+            try t.expectEqual(@as(c_int, 3), semantics.?.show);
+            try t.expectEqual(@as(u16, 0x0647), semantics.?.hotkey);
             const link = try loadLink(wide);
             defer Identity.release(link);
             const properties = try Identity.query(link, &iid_property_store);
@@ -455,6 +476,138 @@ test "apprt.win32.shell.D28 real saved links migrate only empty matching pin and
             try t.expectEqualSlices(u16, identity.aumid, std.mem.span(value.value.string));
         }
     }
+}
+
+const PinSemantics = struct {
+    text: [4][4096]u16 = @splat(@splat(0)),
+    icon_index: c_int = 0,
+    show: c_int = 0,
+    hotkey: u16 = 0,
+
+    fn read(path: [:0]const u16) !PinSemantics {
+        const link = try loadLink(path);
+        defer Identity.release(link);
+        var result: PinSemantics = .{};
+        // IShellLinkW: arguments, working directory, description, icon.
+        inline for (.{ 10, 8, 6 }, 0..) |slot, i| {
+            try check(Identity.method(*const fn (*Interface, [*]u16, c_int) callconv(.winapi) HRESULT, link, slot)(link, &result.text[i], result.text[i].len));
+        }
+        try check(Identity.method(*const fn (*Interface, [*]u16, c_int, *c_int) callconv(.winapi) HRESULT, link, 16)(link, &result.text[3], result.text[3].len, &result.icon_index));
+        try check(Identity.method(*const fn (*Interface, *c_int) callconv(.winapi) HRESULT, link, 14)(link, &result.show));
+        try check(Identity.method(*const fn (*Interface, *u16) callconv(.winapi) HRESULT, link, 12)(link, &result.hotkey));
+        return result;
+    }
+};
+
+// Only used with paths inside the test's own temporary tree. Junctions do not
+// require the symbolic-link privilege or any change to host settings.
+fn testJunction(path: [:0]const u16, target: []const u16) !void {
+    const w = std.os.windows;
+    const Api = struct {
+        extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?w.HANDLE) callconv(.winapi) w.HANDLE;
+        extern "kernel32" fn DeviceIoControl(w.HANDLE, u32, ?*const anyopaque, u32, ?*anyopaque, u32, *u32, ?*anyopaque) callconv(.winapi) i32;
+    };
+    const handle = Api.CreateFileW(path, 0x40000000, 7, null, 3, 0x02200000, null);
+    if (handle == w.INVALID_HANDLE_VALUE) return error.JunctionOpenFailed;
+    defer w.CloseHandle(handle);
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("\\??\\");
+    const substitute = try std.mem.concat(std.testing.allocator, u16, &.{ prefix, target });
+    defer std.testing.allocator.free(substitute);
+    // REPARSE_DATA_BUFFER mount-point header, followed by two terminated names.
+    var data: [16384]u8 align(4) = @splat(0);
+    const bytes = (substitute.len + 1 + target.len + 1) * 2;
+    try std.testing.expect(16 + bytes <= data.len);
+    std.mem.writeInt(u32, data[0..4], 0xa0000003, .little);
+    std.mem.writeInt(u16, data[4..6], @intCast(8 + bytes), .little);
+    std.mem.writeInt(u16, data[10..12], @intCast(substitute.len * 2), .little);
+    std.mem.writeInt(u16, data[12..14], @intCast((substitute.len + 1) * 2), .little);
+    std.mem.writeInt(u16, data[14..16], @intCast(target.len * 2), .little);
+    @memcpy(data[16..][0 .. substitute.len * 2], std.mem.sliceAsBytes(substitute));
+    @memcpy(data[16 + (substitute.len + 1) * 2 ..][0 .. target.len * 2], std.mem.sliceAsBytes(target));
+    var returned: u32 = 0;
+    if (Api.DeviceIoControl(handle, 0x000900a4, &data, @intCast(16 + bytes), null, 0, &returned, null) == 0) return error.JunctionCreateFailed;
+}
+
+fn testPinLinks(comptime junction: bool) !void {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const initialized = CoInitializeEx(null, 2);
+    if (initialized != @as(i32, @bitCast(@as(u32, 0x80010106)))) try check(initialized);
+    defer if (initialized >= 0) CoUninitialize();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", alloc);
+    defer alloc.free(root);
+    const file = try tmp.dir.createFile(t.io, "ghostty.exe", .{});
+    file.close(t.io);
+    const exe = try std.fs.path.join(alloc, &.{ root, "ghostty.exe" });
+    defer alloc.free(exe);
+    var identity = try Identity.init(alloc, .installed, exe, true);
+    defer identity.deinit();
+    for ([_][]const u8{ "target", "scan" }) |name| try tmp.dir.createDir(t.io, name, .default_dir);
+    for ([_][]const u8{ "target/pin.lnk", "scan/normal.lnk" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+        defer alloc.free(wide);
+        const link = try create(&clsid_link, &iid_link);
+        defer Identity.release(link);
+        try check(Identity.method(*const fn (*Interface, [*:0]const u16) callconv(.winapi) HRESULT, link, 20)(link, identity.exe));
+        try saveLink(link, wide);
+    }
+    const target = try std.fs.path.join(alloc, &.{ root, "target" });
+    defer alloc.free(target);
+    const target_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, target);
+    defer alloc.free(target_w);
+    for ([_][]const u8{ "root-link", "scan/child-link" }) |name| {
+        if (junction) {
+            try tmp.dir.createDir(t.io, name, .default_dir);
+            const path = try std.fs.path.join(alloc, &.{ root, name });
+            defer alloc.free(path);
+            const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
+            defer alloc.free(wide);
+            try testJunction(wide, target_w);
+        } else try tmp.dir.symLink(t.io, target, name, .{ .is_directory = true });
+    }
+    if (!junction) {
+        const target_pin = try std.fs.path.join(alloc, &.{ target, "pin.lnk" });
+        defer alloc.free(target_pin);
+        try tmp.dir.symLink(t.io, target_pin, "scan/alias.lnk", .{});
+    }
+    const before = try tmp.dir.readFileAlloc(t.io, "target/pin.lnk", alloc, .limited(1024 * 1024));
+    defer alloc.free(before);
+    const linked_root = try std.fs.path.join(alloc, &.{ root, "root-link" });
+    defer alloc.free(linked_root);
+    const scan = try std.fs.path.join(alloc, &.{ root, "scan" });
+    defer alloc.free(scan);
+    var changed: usize = 0;
+    try migratePinDirectory(alloc, t.io, &identity, linked_root, &changed);
+    try t.expectEqual(@as(usize, 0), changed);
+    try migratePinDirectory(alloc, t.io, &identity, scan, &changed);
+    try t.expectEqual(@as(usize, 1), changed);
+    const after = try tmp.dir.readFileAlloc(t.io, "target/pin.lnk", alloc, .limited(1024 * 1024));
+    defer alloc.free(after);
+    try t.expectEqualSlices(u8, before, after);
+    const normal = try tmp.dir.readFileAlloc(t.io, "scan/normal.lnk", alloc, .limited(1024 * 1024));
+    defer alloc.free(normal);
+    try migratePinDirectory(alloc, t.io, &identity, linked_root, &changed);
+    try migratePinDirectory(alloc, t.io, &identity, scan, &changed);
+    try t.expectEqual(@as(usize, 1), changed);
+    const twice = try tmp.dir.readFileAlloc(t.io, "scan/normal.lnk", alloc, .limited(1024 * 1024));
+    defer alloc.free(twice);
+    try t.expectEqualSlices(u8, normal, twice);
+    const target_twice = try tmp.dir.readFileAlloc(t.io, "target/pin.lnk", alloc, .limited(1024 * 1024));
+    defer alloc.free(target_twice);
+    try t.expectEqualSlices(u8, before, target_twice);
+}
+
+test "apprt.win32.shell.D28 root and child junctions leave target pins untouched" {
+    try testPinLinks(true);
+}
+
+test "apprt.win32.shell.D28 root directory symlink child directory and lnk symlinks leave target pins untouched" {
+    // PermissionDenied remains a real environment failure, never a silent skip.
+    try testPinLinks(false);
 }
 
 extern "shell32" fn SHGetKnownFolderPath(*const GUID, u32, ?std.os.windows.HANDLE, *?[*:0]u16) callconv(.winapi) HRESULT;
@@ -490,11 +643,19 @@ pub fn migratePinned(alloc: std.mem.Allocator, io: std.Io, identity: *const Iden
 }
 
 fn migratePinDirectory(alloc: std.mem.Allocator, io: std.Io, identity: *const Identity, root: []const u8, changed: *usize) !void {
-    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
     defer dir.close(io);
+    // Inspect the opened root itself before enumeration. Entry-kind filtering
+    // below only protects children, not a root that is a junction or symlink.
+    const w = std.os.windows;
+    var status: w.IO_STATUS_BLOCK = undefined;
+    var attributes: w.FILE.ATTRIBUTE_TAG_INFO = undefined;
+    if (w.ntdll.NtQueryInformationFile(dir.handle, &status, &attributes, @sizeOf(w.FILE.ATTRIBUTE_TAG_INFO), .AttributeTag) != .SUCCESS)
+        return error.PinnedRootInspectionFailed;
+    if (attributes.FileAttributes & 0x400 != 0) return; // FILE_ATTRIBUTE_REPARSE_POINT
     var walker = try dir.walkSelectively(alloc);
     defer walker.deinit();
     // Drain the walker even after individual failures, so one damaged pin or
