@@ -20,7 +20,9 @@
 //! created once per level and reused for every submenu shown at that
 //! level; `Popup.show` keeps a popup cloaked until it has painted. Only the
 //! main-menu root host is retained hidden per owner between runs; callbacks
-//! and models are detached when a session ends. Other menus may only retain
+//! and models are detached when a session ends, and the next opening
+//! rebuilds it hidden when it is stale or was created for the other
+//! animation setting (`Popup.animationMatches`). Other menus may only retain
 //! their DC canvas and DIB for three seconds.
 //!
 //! Like a native menu, the menu takes neither activation nor keyboard
@@ -402,6 +404,69 @@ test "P4 retiring an owner's menu root lets its open session finish" {
     try std.testing.expect(state.result == .open);
     onOwnerDestroyed(owner);
     try std.testing.expect(state.result == .cancelled);
+}
+
+test "P4 reuse rebuilds the hidden main menu root when the animation setting changes" {
+    // The idle preparation may create the main menu root while animations
+    // are off and keep it hidden. Once they are on, the next opening must
+    // fade in again, and once off again it must not: the host is rebuilt
+    // hidden for the setting, never restyled. The setting is injected.
+    const Policy = struct {
+        fn off() bool {
+            return false;
+        }
+        fn on() bool {
+            return true;
+        }
+        fn rootHost(owner: w32.HWND) ?*RootHosts.Entry {
+            var it = root_hosts.first;
+            while (it) |entry| : (it = entry.next) {
+                if (entry.owner == owner) return entry;
+            }
+            return null;
+        }
+    };
+    const saved = Popup.animation_policy;
+    defer Popup.animation_policy = saved;
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(owner);
+    defer invalidateOwner(owner);
+    var menu: Builder = .init(testing.allocator);
+    defer menu.deinit();
+    try menu.add(&menu.root, .{ .id = 1, .label = "New Tab" });
+    try menu.add(&menu.root, .{ .id = 2, .label = "Settings" });
+    const quit = false;
+    const host: Host = .{
+        .hinstance = hinstance,
+        .factory = factory,
+        .tokens = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa)),
+        .quit_requested = &quit,
+    };
+    const options: Options = .{ .anchor = Options.at(.{ .x = 0, .y = 0 }), .alignment = .right, .keyboard = true, .reuse_root = true };
+    const offscreen: w32.RECT = .{ .left = -32000, .top = -32000, .right = -31900, .bottom = -31950 };
+    for ([_]bool{ false, true, false }) |animations| {
+        Popup.animation_policy = if (animations) &Policy.on else &Policy.off;
+        prepare(host, owner, &menu.root, options);
+        const entry = Policy.rootHost(owner) orelse return error.TestUnexpectedResult;
+        try testing.expect(!entry.borrowed and !entry.popup.visible);
+        try testing.expectEqual(animations, entry.popup.layered);
+        const hwnd = entry.popup.hwnd orelse return error.TestUnexpectedResult;
+        const ex_style: usize = @bitCast(w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE));
+        try testing.expectEqual(animations, ex_style & w32.WS_EX_LAYERED != 0);
+        try testing.expect(entry.popup.animationMatches());
+        // What the next opening does with it (off screen, no capture).
+        entry.popup.options.capture_mouse = false;
+        entry.popup.show(offscreen);
+        try testing.expectEqual(animations, entry.popup.fade_pending);
+        entry.popup.hide();
+        // Preparing again with the same setting keeps the host.
+        prepare(host, owner, &menu.root, options);
+        try testing.expectEqual(hwnd, Policy.rootHost(owner).?.popup.hwnd.?);
+    }
 }
 
 /// Nested submenus beyond this depth do not open.
@@ -1543,7 +1608,10 @@ const State = struct {
             .dismissed = Level.dismissed,
             .dpi_changed = Level.dpiChanged,
         };
-        if (popup.reuse_invalid) popup.destroy();
+        // A kept host is rebuilt hidden when it is stale, or was created for
+        // the other animation setting (`Popup.animationMatches`): the fade
+        // of this opening needs a layered window, a plain one none.
+        if (popup.reuse_invalid or (popup.hwnd != null and !popup.animationMatches())) popup.destroy();
         if (popup.hwnd == null) {
             const tokens = self.host.tokens;
             popup.create(self.host.hinstance, self.owner, self.host.factory, .{

@@ -36,7 +36,8 @@
 //! can keep painting its frame as active; the owner re-evaluates its
 //! frame on unlock. With `Options.motion` the popup fades in (`anim`, the
 //! 167 ms entrance of `gx.motion`) as a layered window painted through a
-//! `d2d.DibTarget`.
+//! `d2d.DibTarget`; whether a window is layered is decided when it is
+//! created (`animationMatches`).
 //!
 //! Text input: with `Options.text_input` the popup keeps a `TextInput`
 //! (`popup.input`) that receives typing, editing keys (`text_edit`: words,
@@ -236,6 +237,11 @@ pub const Motion = struct {
     offset_x: f32 = 0,
     offset_y: f32 = 0,
 };
+
+/// Whether a popup with `Options.motion` fades in (`anim.enabled`), asked
+/// when a host is created (layered or not) and when it is shown. Tests
+/// replace it and never change the system setting. GUI thread.
+pub var animation_policy: *const fn () bool = &anim.enabled;
 
 /// What a popup does when `show` painted no successful frame of its current
 /// size and DPI within `reveal_timeout_ms` (a lost or failing device).
@@ -514,7 +520,7 @@ pub fn create(
     // the old window left.
     self.freeResources();
 
-    const layered = options.motion != null and anim.enabled();
+    const layered = options.motion != null and animation_policy();
     // TOOLWINDOW keeps every popup out of Alt+Tab. A hidden reuse host must
     // never activate; an input popup is activatable in every show path.
     var ex_style: u32 = w32.WS_EX_TOOLWINDOW;
@@ -604,6 +610,16 @@ pub fn applyTheme(self: *Popup, tokens: style.Tokens) void {
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_USE_IMMERSIVE_DARK_MODE, @ptrCast(&dark), @sizeOf(u32));
     self.setBorderColor(tokens.border);
     self.repaint();
+}
+
+/// Whether this host can play the entrance an opening plays now
+/// (`animation_policy`): a host created while animations were off has no
+/// layered surface to fade with, and one created while they were on still
+/// paints as a layered window. `WS_EX_LAYERED` decides how a window is
+/// painted, not only its alpha, so a kept host that does not match is
+/// rebuilt hidden (`MenuPopup`), never restyled.
+pub fn animationMatches(self: *const Popup) bool {
+    return self.layered == (self.options.motion != null and animation_policy());
 }
 
 /// Name the popup for screen readers and automation (its window text),
@@ -697,7 +713,7 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
     if (self.open_timing) |*timing| timing.showing = true;
     if (self.options.activate and self.options.keep_owner_active) self.lockOwner();
     const motion = if (self.layered) self.options.motion else null;
-    const animate = motion != null and anim.enabled();
+    const animate = motion != null and animation_policy();
     self.composition_frame = null;
     // Cloaked until it painted and DWM had a frame for it.
     setCloaked(hwnd, true);
