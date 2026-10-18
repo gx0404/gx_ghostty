@@ -1290,6 +1290,95 @@ class LayoutTests(unittest.TestCase):
         self.assertTrue(parser.parse_args(["run", "--allow-load-layouts", "W01"]).allow_load_layouts)
 
 
+class BlockedTests(unittest.TestCase):
+    """A keyboard layout this user has not loaded is a missing host precondition: BLOCKED, exit 3."""
+
+    @staticmethod
+    def steps(*raw):
+        return [gui.validate_step(f"s{index}", item) for index, item in enumerate(raw, 1)]
+
+    def test_layout_blockers(self):
+        steps = self.steps({"action": "ime_off"}, {"action": "layout", "target": "0x04070407"},
+                           {"action": "layout", "target": "00000407"}, {"action": "layout", "target": "0x08040804"})
+        self.assertEqual([], gui.layout_blockers(steps, [0x08040804, 0x04090409, 0x04070407]))
+        reasons = gui.layout_blockers(steps, [0x08040804])
+        self.assertEqual(["step 1 ime_off needs a loaded English (US) layout (GetKeyboardLayoutList: 0x08040804)",
+                          "step 2 layout 0x04070407 is not loaded (GetKeyboardLayoutList: 0x08040804)",
+                          "step 3 layout 00000407 is not loaded (GetKeyboardLayoutList: 0x08040804); only "
+                          "--allow-load-layouts, in the VM, may load it"], reasons)
+        self.assertEqual(reasons[:2], gui.layout_blockers(steps, [0x08040804], allow_load=True))
+        self.assertEqual([], gui.layout_blockers(self.steps({"action": "sleep", "seconds": 1}), []))
+
+    def run_all(self, scenarios, layouts, launch=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "ghostty.exe"
+            exe.write_bytes(b"")
+            paths = []
+            for name, body in scenarios.items():
+                path = root / f"{name}-x.toml"
+                path.write_text(f'id = "{name}"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\n'
+                                f'backdrop_reason = "mock"\n' + body + '[[step]]\naction = "capture"\nname = "x"\n',
+                                encoding="utf-8")
+                paths.append(path)
+            fake = FakeWin32(1, 1)
+            fake.layouts = list(layouts)
+            out = root / "out"
+            stderr = io.StringIO()
+            with mock.patch.object(gui, "win32", return_value=fake), \
+                    mock.patch.object(gui, "launch", side_effect=launch or AssertionError("nothing may start")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                code = gui.run_scenarios(paths, exe=exe, out=out, allow_side_effects=False, retries=1, keep_open=False)
+            reports = {name: json.loads((out / name / "run.json").read_text(encoding="utf-8")) for name in scenarios}
+            notes = {name: (out / name / "notes.txt").read_text(encoding="utf-8") for name in scenarios}
+            return code, (out / "SUMMARY.txt").read_text(encoding="utf-8"), reports, notes, stderr.getvalue()
+
+    def test_a_scenario_that_needs_a_missing_layout_is_blocked_before_it_starts(self):
+        code, summary, reports, notes, stderr = self.run_all({"W90": '[[step]]\naction = "ime_off"\n'}, [0x08040804])
+        self.assertEqual(3, code)
+        self.assertIn("W90 BLOCKED t: step 1 ime_off needs a loaded English (US) layout", summary)
+        self.assertIn("record them PENDING with the reason, never PASS", summary)
+        self.assertEqual(("blocked", 1), (reports["W90"]["status"], len(reports["W90"]["blockers"])))
+        self.assertIn("BLOCKED: a precondition of this machine is missing", notes["W90"])
+        self.assertIn("W90 BLOCKED before the start", stderr)
+
+    def test_a_failure_elsewhere_still_exits_1(self):
+        code, summary, reports, _, _ = self.run_all(
+            {"W90": '[[step]]\naction = "ime_off"\n', "W91": '[[step]]\naction = "sleep"\nseconds = 0\n'},
+            [0x08040804], launch=gui.GuiError("ghostty pid 1 exited right after the start"))
+        self.assertEqual(1, code)
+        self.assertEqual(("blocked", "failed", 2), (reports["W90"]["status"], reports["W91"]["status"],
+                                                    reports["W91"]["attempt"]))
+
+    def test_a_layout_that_disappears_during_the_run_blocks_it_and_is_not_retried(self):
+        instance = mock.Mock()
+        instance.pid, instance.creation, instance.original_layout, instance.loaded_layouts = 1, 1, None, []
+        instance.log = Path("absent.log")
+        instance.wait_window.return_value = {}
+        instance.close.return_value = "closed"
+        instance.ime_off.side_effect = gui.Blocked("no English (US) keyboard layout is loaded for this user")
+        code, summary, reports, notes, _ = self.run_all({"W90": '[[step]]\naction = "ime_off"\n'},
+                                                        [0x08040804, 0x04090409], launch=lambda *a, **k: instance)
+        self.assertEqual((3, "blocked", 1), (code, reports["W90"]["status"], reports["W90"]["attempt"]))
+        self.assertEqual([], reports["W90"]["captures"], "no failure screenshot for a missing precondition")
+        self.assertIn("W90 BLOCKED t:", summary)
+
+    def test_the_session_commands_exit_3(self):
+        instance = mock.Mock(spec=gui.Instance)
+        instance.alive.return_value = True
+        instance.ime_off.side_effect = gui.Blocked("no English (US) keyboard layout is loaded for this user")
+        stderr = io.StringIO()
+        with mock.patch.object(gui.Instance, "load", return_value=instance), contextlib.redirect_stderr(stderr):
+            self.assertEqual(3, gui.main(["ime-off", "E:/env"]))
+        self.assertIn("BLOCKED: no English (US) keyboard layout", stderr.getvalue())
+        fake = FakeWin32(1, 1)
+        fake.layouts = [0x08040804]
+        layout = gui.Instance(1, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+        with mock.patch.object(gui, "win32", return_value=fake), self.assertRaises(gui.Blocked), \
+                mock.patch.object(gui.Instance, "require_window", return_value=LayoutTests.MAIN):
+            layout.switch_layout("00000407")
+
+
 class RestartTests(unittest.TestCase):
     BODY = ('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\nbackdrop_reason = "mock"\n'
             'args = ["--x"]\n[env]\nGHOSTTY_GX_OPENGL = "software"\nKEEP = "1"\n')

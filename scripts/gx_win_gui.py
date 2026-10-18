@@ -13,7 +13,9 @@ Scenario commands (scenarios are TOML files, by default test/gui/win32/W*.toml):
         screenshots, run.json (every step with its timing and result), the Ghostty log and
         notes.txt (what each screenshot must show). A scenario whose requirement is missing
         (such as a WSL distro) is SKIPPED; one with side effects (such as opening the
-        default browser) runs only with --allow-side-effects.
+        default browser) runs only with --allow-side-effects. A scenario whose ime_off or
+        layout step needs a keyboard layout this user does not have loaded is BLOCKED before
+        anything starts (run.json status blocked, with the reason): it did not run here.
 
 Session commands drive one instance whose state is ENV_DIR/session.json:
   start ENV_DIR [--exe PATH] [--config FILE] [--env NAME=VALUE]... [--timeout S] [-- ARGS...]
@@ -122,7 +124,11 @@ user's language list, so on the host a layout that is not loaded is refused. Onl
 and unloads it again at stop or at the end of the scenario. A plain KLID 0000LLLL names the HKL
 0xLLLLLLLL and an IME KLID E0xxxxxx itself; other KLIDs (variants such as 00010407) need their HKL from
 layout --list. Before the first switch the thread's layout is remembered; stop and the end of a
-scenario switch back to it while the instance still runs.
+scenario switch back to it while the instance still runs. A missing layout is a missing host
+precondition, not a failure: run checks every ime_off and layout step before it starts the scenario
+and reports it BLOCKED; the commands ime-off and layout, and a step that meets one anyway, end
+BLOCKED as well (exit code 3). Scenarios should not need a layout: bind the action under test to a
+function key, which no input method takes, instead of switching layouts.
 
 Isolation: LOCALAPPDATA and XDG_CONFIG_HOME point at ENV_DIR, so the configuration is
 ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log. APPDATA,
@@ -151,7 +157,8 @@ PW_RENDERFULLCONTENT and works for covered windows. Popups (GhosttyGxPopup, scro
 are separate top-level windows of the process and are captured one by one.
 
 Exit codes: 0 success; 1 a failed step, assertion or scenario; 2 usage errors, a missing
-executable, or a platform other than Windows.
+executable, or a platform other than Windows; 3 BLOCKED: a host precondition such as a keyboard
+layout is missing (run: some scenario is BLOCKED and none failed), record it PENDING, never PASS.
 """
 
 from __future__ import annotations
@@ -274,6 +281,11 @@ class UsageError(GuiError):
     """A usage or environment problem; reported with exit code 2."""
 
 
+class Blocked(GuiError):
+    """A precondition of this machine is missing (such as a keyboard layout this user has not loaded):
+    the scenario or command cannot run here; reported as BLOCKED with exit code 3."""
+
+
 class InputBlocked(GuiError):
     """Input was not sent because the foreground or pointed-at window is not the instance's.
 
@@ -364,6 +376,24 @@ def resolve_layout(target: str, loaded: Sequence[int]) -> tuple[int | None, str 
             wanted = None
         return (by_value.get(wanted) if wanted is not None else None), klid
     raise UsageError(f"keyboard layout {target!r}: use an HKL such as 0x08040804 or a KLID such as 00000407")
+
+
+def layout_blockers(steps: Sequence[Any], loaded: Sequence[int], allow_load: bool = False) -> list[str]:
+    """Why the ime_off and layout `steps` (Step objects) cannot run with the keyboard layouts `loaded` for
+    this user (GetKeyboardLayoutList), before anything starts; empty when they can. allow_load (VM only)
+    makes a KLID that is not loaded available."""
+    names = ", ".join(hkl_text(value) for value in loaded) or "none"
+    reasons = []
+    for index, step in enumerate(steps, 1):
+        if step.action == "ime_off" and not any(hkl & 0xFFFF == 0x0409 for hkl in loaded):
+            reasons.append(f"step {index} ime_off needs a loaded English (US) layout (GetKeyboardLayoutList: {names})")
+        elif step.action == "layout":
+            target = str(step.params["target"])
+            hkl, klid = resolve_layout(target, loaded)
+            if hkl is None and not (allow_load and klid is not None):
+                reasons.append(f"step {index} layout {target} is not loaded (GetKeyboardLayoutList: {names})"
+                               + ("; only --allow-load-layouts, in the VM, may load it" if klid is not None else ""))
+    return reasons
 
 
 def as_lparam(value: int) -> int:
@@ -2160,8 +2190,8 @@ class Instance:
             return "already US"
         us = [hkl for hkl in w.keyboard_layouts() if hkl & 0xFFFF == 0x0409]
         if not us:
-            raise GuiError("no English (US) keyboard layout is loaded for this user (GetKeyboardLayoutList); "
-                           "ime_off does not load one: add English (US) to the user's languages or run in the VM")
+            raise Blocked("no English (US) keyboard layout is loaded for this user (GetKeyboardLayoutList); "
+                          "ime_off does not load one: add English (US) to the user's languages or run in the VM")
         result = self.switch_layout(hkl_text(us[0]), strict=False)
         return result if result.startswith("layout is still") else f"switched to US ({result})"
 
@@ -2179,8 +2209,8 @@ class Instance:
             if not allow_load or klid is None:
                 hint = ("name an HKL from that list" if klid is None else
                         "pick a loaded one; only inside a VM may --allow-load load it")
-                raise GuiError(f"keyboard layout {target} is not loaded for this user (GetKeyboardLayoutList: "
-                               f"{', '.join(hkl_text(value) for value in loaded) or 'none'}); {hint}")
+                raise Blocked(f"keyboard layout {target} is not loaded for this user (GetKeyboardLayoutList: "
+                              f"{', '.join(hkl_text(value) for value in loaded) or 'none'}); {hint}")
             hkl = w.load_layout(klid)
             if hkl & 0xFFFFFFFF not in {value & 0xFFFFFFFF for value in loaded}:
                 added = True
@@ -3101,6 +3131,10 @@ class ScenarioRun:
                                      "seconds": round(time.monotonic() - began, 3), "detail": detail})
                 print(f"{TAG} {scenario.id} {index}/{len(scenario.steps)} {step.action}: {detail}", flush=True)
             completed = True
+        except Blocked as exc:
+            report["status"] = "blocked"
+            report["reason"] = str(exc)
+            print(f"{TAG} {scenario.id} BLOCKED: {exc}", file=sys.stderr, flush=True)
         except GuiError as exc:
             report["status"] = "failed"
             report["reason"] = str(exc)
@@ -3173,6 +3207,8 @@ def notes_text(scenario: Scenario, report: Mapping[str, Any]) -> str:
     lines = [f"{scenario.id} {scenario.title}", f"status: {report['status']}" +
              (f" ({report['reason']})" if report.get("reason") else ""), shown, "",
              "Read every screenshot before recording PASS. Expected:"]
+    if report.get("status") == "blocked":
+        lines[3:3] = ["BLOCKED: a precondition of this machine is missing; record PENDING with the reason, never PASS"]
     lines += [f"- {item}" for item in scenario.expect] or ["- (no expectations listed)"]
     lines += ["", "screenshots:"] + [f"- {name}" for name in report.get("captures", [])]
     return "\n".join(lines) + "\n"
@@ -3192,8 +3228,19 @@ def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_eff
             distros = installed_wsl_distros()
         return distros
 
+    def fresh(out_dir: Path) -> None:
+        if out_dir.exists():
+            if not (out_dir / "run.json").is_file() and not (out_dir / "env" / ENV_MARKER).is_file():
+                raise UsageError(f"{out_dir} exists and was not written by this tool")
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
+
+    def write_report(scenario: Scenario, out_dir: Path, report: Mapping[str, Any]) -> None:
+        (out_dir / "run.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        (out_dir / "notes.txt").write_text(notes_text(scenario, report), encoding="utf-8")
+
     summary = []
-    failed = 0
+    failed = blocked = 0
     for scenario in scenarios:
         out_dir = out / f"{scenario.id}"
         reasons = [reason for requirement in scenario.requires
@@ -3204,29 +3251,40 @@ def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_eff
             summary.append(f"{scenario.id} SKIPPED {scenario.title}: {'; '.join(reasons)}")
             print(f"{TAG} {scenario.id} skipped: {'; '.join(reasons)}", flush=True)
             continue
+        blockers = (layout_blockers(scenario.steps, win32().keyboard_layouts(), allow_load_layouts)
+                    if any(step.action in ("ime_off", "layout") for step in scenario.steps) else [])
+        if blockers:
+            fresh(out_dir)
+            report = {"id": scenario.id, "title": scenario.title, "file": scenario.path.name, "exe": str(exe),
+                      "started": _datetime.datetime.now().isoformat(timespec="seconds"), "status": "blocked",
+                      "reason": "; ".join(blockers), "blockers": blockers, "expect": scenario.expect}
+            write_report(scenario, out_dir, report)
+            summary.append(f"{scenario.id} BLOCKED {scenario.title}: {report['reason']}")
+            print(f"{TAG} {scenario.id} BLOCKED before the start: {report['reason']}", file=sys.stderr, flush=True)
+            blocked += 1
+            continue
         report: dict[str, Any] = {}
         for attempt in range(retries + 1):
-            if out_dir.exists():
-                if not (out_dir / "run.json").is_file() and not (out_dir / "env" / ENV_MARKER).is_file():
-                    raise UsageError(f"{out_dir} exists and was not written by this tool")
-                shutil.rmtree(out_dir)
-            out_dir.mkdir(parents=True)
+            fresh(out_dir)
             print(f"{TAG} {scenario.id} {scenario.title} (attempt {attempt + 1})", flush=True)
             report = ScenarioRun(scenario, exe, out_dir, keep_open, allow_load_layouts).run()
             report["attempt"] = attempt + 1
-            (out_dir / "run.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            (out_dir / "notes.txt").write_text(notes_text(scenario, report), encoding="utf-8")
-            if report["status"] == "ok":
+            write_report(scenario, out_dir, report)
+            if report["status"] in ("ok", "blocked"):
                 break
         status = report["status"].upper()
-        failed += status != "OK"
+        blocked += status == "BLOCKED"
+        failed += status not in ("OK", "BLOCKED")
         summary.append(f"{scenario.id} {status} {scenario.title}: {len(report.get('captures', []))} screenshots, "
                        f"{report.get('seconds', 0)}s" + (f" ({report.get('reason')})" if report.get("reason") else ""))
     text = "\n".join(summary) + "\n\nScreenshots prove nothing until they are read; see <id>/notes.txt.\n"
+    if blocked:
+        text += ("BLOCKED scenarios did not run on this machine (a missing precondition such as a keyboard "
+                 "layout): record them PENDING with the reason, never PASS.\n")
     (out / "SUMMARY.txt").write_text(text, encoding="utf-8")
     print(text, end="")
     print(f"{TAG} evidence: {out}")
-    return 1 if failed else 0
+    return 1 if failed else 3 if blocked else 0
 
 
 # ---------------------------------------------------------------------------
@@ -3498,6 +3556,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UsageError as exc:
         print(f"{TAG} error: {exc}", file=sys.stderr)
         return 2
+    except Blocked as exc:
+        print(f"{TAG} BLOCKED: {exc}", file=sys.stderr)
+        return 3
     except GuiError as exc:
         print(f"{TAG} error: {exc}", file=sys.stderr)
         return 1
