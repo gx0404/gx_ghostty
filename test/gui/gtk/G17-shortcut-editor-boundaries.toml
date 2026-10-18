@@ -1,0 +1,112 @@
+id = "G17"
+title = "Shortcut editor tables, chains, flags, conflicts and draft ownership"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+k=gx:keybinds
+keybind = ctrl+alt+0=activate_key_table_once:r6
+keybind = ctrl+alt+m=gx:main_menu
+keybind = ctrl+alt+s=gx:settings
+keybind = ctrl+alt+u=text:LOWER-BINDING
+keybind = ctrl+alt+l>u=text:LOWER-LEADER
+"""
+script = '''
+xdo("windowsize", window(), 1100, 740)
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+k")
+sleep(1)
+capture("shortcuts")
+xdo("mousemove", 730, 110, "click", 1)
+sleep(1)
+capture("editor")
+overlay = config_home / "ghostty/gui-settings.ghostty"
+def click(x, y):
+    xdo("mousemove", x, y, "click", 1)
+    sleep(0.25)
+def draft(text):
+    click(220, 537)
+    click(270, 310)
+    for index, line in enumerate(text.splitlines()):
+        if index:
+            xdo("key", "Return")
+        xdo("type", "--clearmodifiers", "--delay", 1, line)
+    sleep(0.5)
+def save_binding():
+    click(495, 537)
+    sleep(0.5)
+draft("r6/unconsumed:performable:ctrl+alt+x>y=text:R6-A\nchain=text:R6-B")
+capture("table-chain-flags-draft")
+save_binding()
+assert "r6/unconsumed:performable:ctrl+alt+x>y=text:R6-A" in overlay.read_text()
+assert "keybind = chain=text:R6-B\n" in overlay.read_text()
+capture("table-chain-flags-saved")
+draft("ctrl+alt+8=text:R6-RETRY")
+directory = overlay.parent
+directory.chmod(0o500)
+try:
+    save_binding()
+    assert "R6-RETRY" not in overlay.read_text()
+    capture("save-failure-retains-draft")
+finally:
+    directory.chmod(0o700)
+with overlay.open("a") as out:
+    out.write("\n# R6 external edit must survive\nkeybind = ctrl+alt+9=ignore\n")
+save_binding()
+assert "R6-RETRY" in overlay.read_text()
+assert "# R6 external edit must survive" in overlay.read_text()
+assert "ctrl+alt+9=ignore" in overlay.read_text()
+capture("retry-preserves-external-edit")
+draft("ctrl+alt+u=text:R6-CONFLICT")
+save_binding()
+capture("ordinary-conflict")
+xdo("key", "Escape")
+sleep(0.5)
+assert "R6-CONFLICT" not in overlay.read_text()
+capture("cancel-retains-draft")
+save_binding()
+click(630, 428)
+sleep(0.5)
+assert "R6-CONFLICT" in overlay.read_text()
+capture("ordinary-conflict-confirmed")
+draft("ctrl+alt+l=text:R6-PREFIX")
+save_binding()
+capture("leader-prefix-conflict")
+xdo("key", "Escape")
+sleep(0.5)
+assert "R6-PREFIX" not in overlay.read_text()
+# Closing without saving must not write the cancelled draft.
+xdo("key", "Escape")
+sleep(0.5)
+xdo("key", "Escape")
+sleep(0.5)
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+u")
+sleep(0.5)
+capture("confirmed-key-runs")
+xdo("key", "ctrl+c")
+xdo("key", "ctrl+alt+0")
+xdo("key", "ctrl+alt+x")
+xdo("key", "y")
+sleep(0.5)
+capture("table-chain-runs")
+assert "R6-PREFIX" not in overlay.read_text(), "closing must not save the cancelled draft"
+save("-overlay.txt", overlay.read_text())
+'''
+expect = [
+  "G17.png: an isolated English Bash terminal",
+  "G17-shortcuts.png: the shortcut reference and Edit Keyboard Shortcuts entry",
+  "G17-editor.png: source and advanced syntax are shown in the real editor",
+  "G17-table-chain-flags-draft.png: a named table, trigger sequence, flags and adjacent chain are visible",
+  "G17-table-chain-flags-saved.png: the editor reports a successful save",
+  "G17-save-failure-retains-draft.png: a save error is visible and R6-RETRY remains in the draft",
+  "G17-retry-preserves-external-edit.png: retry succeeds; the overlay assertion retains unrelated external lines",
+  "G17-ordinary-conflict.png: confirmation explains replacement or leader overlap",
+  "G17-cancel-retains-draft.png: cancellation retains the unsaved R6-CONFLICT draft",
+  "G17-ordinary-conflict-confirmed.png: Save Anyway commits the replacement",
+  "G17-leader-prefix-conflict.png: replacing a leader prefix requires confirmation",
+  "G17-confirmed-key-runs.png: the real key writes R6-CONFLICT into the terminal",
+  "G17-table-chain-runs.png and G17-after.png: entering table r6 and its sequence executes both R6-A and R6-B actions",
+]

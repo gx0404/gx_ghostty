@@ -1,0 +1,86 @@
+id = "G22"
+title = "Bash and Zsh cursor integration versus configured defaults and DECSCUSR"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+"""
+script = '''
+import shlex
+import os
+private_home = config_home / "shell-home"
+private_home.mkdir()
+(private_home / ".zshrc").write_text("PROMPT='R6-ZSH%# '\nprintf '%s\\n' \"$GHOSTTY_SHELL_FEATURES|$_ghostty_state\" > \"$HOME/integration.txt\"\n")
+# Set inherited environment before launching Ghostty. Config env=ZDOTDIR is
+# applied after automatic injection and would deliberately override its path.
+os.environ.update(HOME=str(private_home), ZDOTDIR=str(private_home), HISTFILE="/dev/null")
+probe = private_home / "cursor_probe.py"
+probe.write_text("""import os,sys,termios,tty,select,time,json
+from pathlib import Path
+old=termios.tcgetattr(0)
+try:
+ tty.setraw(0)
+ os.write(1,b'\\x1b[2 q\\x1bP$q q\\x1b\\\\')
+ result=b''
+ end=time.monotonic()+3
+ while time.monotonic()<end:
+  if select.select([0],[],[],0.1)[0]:
+   result+=os.read(0,1024)
+   if result.endswith(b'\\x1b\\\\'): break
+ Path(sys.argv[1]).write_text(json.dumps({'request':'DECSCUSR 2','response_hex':result.hex()}))
+ os.write(1,b'\\r\\nR6 TUI STEADY BLOCK; PRESS ENTER\\r\\n')
+ os.read(0,1)
+finally:
+ termios.tcsetattr(0,termios.TCSANOW,old)
+ os.write(1,b'\\x1b[0 q')
+""")
+results = []
+config_file = config_home / "ghostty/config.ghostty"
+for shell in ("bash", "zsh"):
+    for feature in ("cursor", "no-cursor"):
+        for style in ("block", "bar", "underline"):
+            for blink in (False, True):
+                label = f"{shell}-{feature}-{style}-{'blink' if blink else 'steady'}"
+                command = "direct:/bin/bash --noprofile --norc" if shell == "bash" else "direct:/usr/bin/zsh -d"
+                config_file.write_text(f"language = en\ncommand = {command}\nconfirm-close-surface = false\nenv = HISTFILE=/dev/null\ncursor-style = {style}\ncursor-style-blink = {str(blink).lower()}\nshell-integration-features = {feature}\n")
+                xdo("mousemove", 400, 300, "click", 1)
+                restart()
+                if shell == "zsh":
+                    integration = (private_home / "integration.txt").read_text()
+                    assert "|0" in integration, integration
+                    save("-" + label + "-integration.txt", integration)
+                xdo("mousemove", 400, 300, "click", 1)
+                sleep(0.2)
+                capture(label + "-prompt")
+                if blink:
+                    xdo("type", "x")
+                    xdo("key", "BackSpace")
+                    sleep(0.03)
+                    capture(label + "-prompt-active")
+                    sleep(0.65)
+                    capture(label + "-prompt-idle")
+                output = evidence / (label + "-query.json")
+                xdo("type", "--clearmodifiers", "--delay", 1, "python3 " + shlex.quote(str(probe)) + " " + shlex.quote(str(output)))
+                xdo("key", "Return")
+                for _ in range(60):
+                    if output.exists(): break
+                    sleep(0.1)
+                assert output.exists(), label
+                result = json.loads(output.read_text())
+                assert bytes.fromhex(result["response_hex"]) == b"\x1bP1$r2 q\x1b\\", result
+                capture(label + "-tui")
+                xdo("key", "Return")
+                sleep(0.4)
+                results.append({"case":label,"configured_style":style,"configured_blink":blink,"feature":feature,"shell":shell,**result})
+save("-cursor-matrix.json", json.dumps(results,indent=2))
+'''
+expect = [
+  "G22.png: an isolated initial Bash terminal",
+  "*-prompt.png: read the visible prompt cursor for each shell, integration feature, shape and blink setting",
+  "*-prompt-active.png and *-prompt-idle.png: blinking cases include a key-woken frame and a later frame",
+  "*-tui.png: a steady block requested by the test program; query JSON must contain the exact DECRQSS response for DECSCUSR 2",
+  "G22-after.png: the shell prompt returns after the final TUI exits",
+  "This GTK matrix does not substitute for the same configuration on Windows",
+]

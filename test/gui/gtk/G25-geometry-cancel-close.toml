@@ -1,0 +1,38 @@
+id = "G25"
+title = "Cancelling a busy-window close does not persist resized geometry"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+window-save-state = always
+env = HISTFILE=/dev/null
+"""
+script = '''
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--confirm-close-surface=true"])
+state = state_home / "ghostty/gx-window-state"
+before = state.read_bytes()
+xdo("windowsize", window(), 1000, 680)
+xdo("mousemove", 400, 300, "click", 1)
+xdo("type", "sleep 30")
+xdo("key", "Return")
+sleep(0.5)
+xdo("key", "ctrl+shift+q")
+sleep(0.5)
+capture("close-confirmation")
+assert state.read_bytes() == before
+xdo("key", "Escape")
+sleep(0.3)
+capture("cancelled")
+assert state.read_bytes() == before
+xdo("key", "ctrl+c")
+sleep(0.3)
+save("-state-before.json", before.decode())
+save("-state-after-cancel.json", state.read_text())
+'''
+expect = [
+  "G25.png: ordinary initial window",
+  "G25-close-confirmation.png: the real busy-process close confirmation",
+  "G25-cancelled.png and G25-after.png: the resized window remains alive; state bytes are unchanged",
+]
