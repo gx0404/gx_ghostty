@@ -36,6 +36,29 @@ class UiaProbeTests(unittest.TestCase):
         self.assertEqual('0x80040201', result['hresult'])
         self.assertEqual(1, len(result['action_results']))
 
+    def test_failure_report_keeps_the_events_seen_before_it(self):
+        # A missing FocusChanged must be told apart from one of another
+        # element or process (UIA-05): the failure carries what was seen.
+        focus = [{'pid': 42, 'automation_id': 'gx-terminal-5', 'after_ready': True}]
+        seen = probe.observed_events(focus, {'foreign': 3, 'callback_errors': 0}, [], {'foreign': 0, 'callback_errors': 1})
+        focus.append({'pid': 42, 'automation_id': 'later'})
+        self.assertEqual(['gx-terminal-5'], [event['automation_id'] for event in seen['focus_events']])
+        self.assertEqual((3, 0, [], 0, 1), (seen['foreign_focus_events'], seen['focus_callback_errors'], seen['selection_events'],
+                                            seen['foreign_selection_events'], seen['selection_callback_errors']))
+        failure = probe.ProbeFailure('focus expectations not met within 3 s', {'stage': 'action.focus', 'action_results': []})
+        failure.diagnostic.update(seen)
+        with mock.patch.object(probe, 'run_worker', side_effect=failure):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(1, probe.main(self.args('--worker')))
+        result = json.loads(output.getvalue())
+        self.assertEqual(('action.focus', 'gx-terminal-5', 3),
+                         (result['stage'], result['focus_events'][0]['automation_id'], result['foreign_focus_events']))
+        # Both failure paths of the worker attach them.
+        source = Path(probe.__file__).read_text(encoding='utf-8')
+        self.assertIn('error.diagnostic.update(seen)', source)
+        self.assertIn('diagnostic.update(seen)\n        raise ProbeFailure(str(error), diagnostic) from error', source)
+
     def test_parent_keeps_failed_worker_diagnostic_without_retry(self):
         payload = {'status': 'FAIL', 'error': 'COM failure 0x80040201', 'stage': 'action.pattern',
                    'node_id': 'gx-2', 'pattern_id': 10002, 'call': 'IUIAutomationElement.GetCurrentPattern',

@@ -85,6 +85,16 @@ def focus_event_seen(events, start, pid, automation_id):
     return any(event.get("pid") == pid and event.get("automation_id") == automation_id for event in events[start:])
 
 
+def observed_events(focus_events, focus_counts, selection_events, selection_counts):
+    """What the event handlers saw so far, under the keys of a PASS report.
+    A failure keeps it too, so a missing event can be told apart from an event
+    of another element or process."""
+    return {"focus_events": list(focus_events), "foreign_focus_events": focus_counts["foreign"],
+            "focus_callback_errors": focus_counts["callback_errors"],
+            "selection_events": list(selection_events), "foreign_selection_events": selection_counts["foreign"],
+            "selection_callback_errors": selection_counts["callback_errors"]}
+
+
 def read_plan(path):
     if path is None:
         return []
@@ -792,14 +802,17 @@ def run_worker(args) -> dict:
                 "truncated": truncated, "notification_supported": notifications_supported, "events": events,
                 "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr,
                 "actions": action_results, "queries_during_wait": queries, "unavailable_queries": unavailable_queries,
-                "focus_handler_registered": focus_handler is not None, "focus_events": focus_events,
-                "foreign_focus_events": focus_counts["foreign"], "focus_callback_errors": focus_counts["callback_errors"],
-                "selection_handler_registered": selection_handler is not None, "selection_events": selection_events,
-                "foreign_selection_events": selection_counts["foreign"], "selection_callback_errors": selection_counts["callback_errors"],
+                "focus_handler_registered": focus_handler is not None,
+                "selection_handler_registered": selection_handler is not None,
+                **observed_events(focus_events, focus_counts, selection_events, selection_counts),
                 "threads": lifecycle}
     except Exception as error:
+        # A failure keeps what the event handlers saw before it.
+        seen = observed_events(focus_events, focus_counts, selection_events, selection_counts)
         if isinstance(error, ProbeFailure):
+            error.diagnostic.update(seen)
             raise
+        diagnostic.update(seen)
         raise ProbeFailure(str(error), diagnostic) from error
     finally:
         original_failure = sys.exc_info()[1]
