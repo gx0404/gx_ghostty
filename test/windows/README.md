@@ -269,7 +269,9 @@ BRK-01～04 只在 VM 中同一用户的 medium/high 拆分令牌下运行，宿
   输入法”时对其他应用可见），结束时恢复；恢复结果写入 report 的 `input_language`，
   失败即 FAIL，需人工恢复。只切到 `GetKeyboardLayoutList` 已列出的布局
   （`gx_input_language.switch_to_us`，与 A2 第 6 轮 `gx_win_gui` 的 layout/ime_off 语义一致），
-  宿主绝不加载布局：缺美式布局时 controller 记环境不可用、远程夹具记 BLOCKED。
+  宿主绝不加载布局：缺美式布局时 controller 记 `BLOCKED`（`blocked_by=keyboard-layout`）、
+  远程夹具抛 Blocked，均以退出码 2 结束，不静默跳过、不在拼音状态下继续输入。
+  本树 `scripts/gx_win_gui.py` 尚无 A2 第 6 轮的 `layout`，故夹具自带同语义实现。
   `--allow-load-layouts`（controller 与 `gx_remote_fixture.py`）只在 VM 使用，夹具自己加载的
   布局在恢复原布局后卸载，结果记入 report 的 `input_language`。
 - OLE-07 经用户真实 Explorer 打开夹具私有目录，可能在当前用户的 Explorer 中留下文件夹
