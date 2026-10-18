@@ -1906,8 +1906,8 @@ class Instance:
               mods: Sequence[str] = ()) -> None:
         """Wheel notches at (x, y). With mods those keys are pressed first and released after the notches,
         always and only those, even when a guard or SendInput fails in between (as drag and hold_key)."""
+        vks = modifier_vks(mods)  # a usage error before anything else
         w = win32()
-        vks = modifier_vks(mods)
         self.ensure_foreground()
         self.ensure_point(x, y)
         events = [w.mouse_input(0x0001 | 0x8000 | 0x4000, x, y)]
