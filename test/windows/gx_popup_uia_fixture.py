@@ -146,6 +146,14 @@ def later_events(events, **match):
     return [event for event in events if event.get("after_ready") and all(event.get(key) == value for key, value in match.items())]
 
 
+def missing_subscriptions(ready, flags):
+    """The event subscriptions an observing worker was asked for (`flags`)
+    that its ready file does not report registered: the controller checks
+    them before it presses anything (review round 4)."""
+    wanted = (("--observe-focus", "focus_registered"), ("--observe-selection", "selection_registered"))
+    return [field for flag, field in wanted if flag in flags and ready.get(field) is not True]
+
+
 def choose_popup(windows):
     return next((window for window in windows if window.cls in POPUP_CLASSES), None)
 
@@ -644,6 +652,10 @@ class Fixture:
                 wait(lambda: ready.exists() or process.poll() is not None, 20)
                 if process.poll() is not None:
                     raise AssertionError(f"observing worker exited before ready: {stdout_path.name}")
+                # The worker publishes the whole file at once (gx_win_uia.publish_ready).
+                missing = missing_subscriptions(json.loads(ready.read_text(encoding="utf-8")), flags)
+                if missing:
+                    raise AssertionError(f"observing worker is ready without {missing}: {ready.name}")
                 act()
                 time.sleep(1.0)
                 proceed.write_text("keys delivered\n", encoding="utf-8")

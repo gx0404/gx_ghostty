@@ -168,6 +168,39 @@ class UiaProbeTests(unittest.TestCase):
             probe.physical_coordinates(user)
 
 
+class ReadyHandshakeTests(unittest.TestCase):
+    """Review round 4: the controller acts as soon as the ready file exists,
+    so the events of its actions must already count as after-ready and the
+    file must appear whole."""
+
+    def test_events_count_as_after_ready_before_the_whole_file_appears(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ready = Path(folder) / 'worker.ready.json'
+            marker = [False]
+            seen = []
+            real_replace = probe.os.replace
+
+            def replace(source, target):
+                # The moment a controller polling for the file can see it.
+                seen.append((marker[0], json.loads(Path(source).read_text(encoding='utf-8')), Path(target).exists()))
+                real_replace(source, target)
+
+            payload = {'registered': False, 'focus_registered': True, 'selection_registered': True}
+            with mock.patch.object(probe.os, 'replace', side_effect=replace):
+                probe.publish_ready(ready, payload, marker)
+            self.assertEqual([(True, payload, False)], seen)
+            self.assertEqual(payload, json.loads(ready.read_text(encoding='utf-8')))
+            self.assertEqual(['worker.ready.json'], [path.name for path in Path(folder).iterdir()])
+
+    def test_a_failed_publication_leaves_no_partial_ready_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ready = Path(folder) / 'worker.ready.json'
+            with mock.patch.object(probe.os, 'replace', side_effect=OSError('denied')):
+                with self.assertRaises(OSError):
+                    probe.publish_ready(ready, {'registered': True}, [False])
+            self.assertEqual([], list(Path(folder).iterdir()))
+
+
 class StaleActionTests(unittest.TestCase):
     """round3-batch-20261018-112356 UIA-02: GetCurrentPattern on a hidden
     palette's retained element answered S_OK with no pattern, so the expected

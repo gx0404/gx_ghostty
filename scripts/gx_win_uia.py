@@ -95,6 +95,25 @@ def observed_events(focus_events, focus_counts, selection_events, selection_coun
             "selection_callback_errors": selection_counts["callback_errors"]}
 
 
+def publish_ready(path, payload, marker):
+    """The ready handshake. The controller acts as soon as `path` exists, so
+    the events observed from now on are marked after-ready first (`marker`),
+    then the complete file appears at once: written beside it, then renamed.
+    A failure leaves no partial ready file (review round 4)."""
+    marker[0] = True
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def read_plan(path):
     if path is None:
         return []
@@ -778,12 +797,11 @@ def run_worker(args) -> dict:
 
         execute_actions(False)
         if args.ready_file:
-            with args.ready_file.open("x", encoding="utf-8") as stream:
-                json.dump({"pid": args.pid, "birth": args.birth, "hwnd": args.hwnd,
-                           "registered": registered, "focus_registered": focus_registered,
-                           "selection_registered": selection_registered, "retained_actions": len(plan), "thread": owner_thread,
-                           "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr}, stream)
-            ready_marker[0] = True
+            publish_ready(args.ready_file, {"pid": args.pid, "birth": args.birth, "hwnd": args.hwnd,
+                                            "registered": registered, "focus_registered": focus_registered,
+                                            "selection_registered": selection_registered, "retained_actions": len(plan),
+                                            "thread": owner_thread, "automation_clsid": automation_clsid(args.listen_ms),
+                                            "notification_interface_hr": notification_interface_hr}, ready_marker)
         deadline = time.monotonic() + args.listen_ms / 1000
         queries = 0
         unavailable_queries = 0

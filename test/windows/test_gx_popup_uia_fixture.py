@@ -113,6 +113,14 @@ class EventJudgmentTests(unittest.TestCase):
         self.assertEqual([events[1]], popup.later_events(events))
         self.assertEqual([], popup.later_events(events, name="New Tab"))
 
+    def test_an_observing_worker_must_be_ready_with_its_subscriptions(self):
+        # Review round 4: the controller checks the handshake before any key.
+        ready = {"registered": False, "focus_registered": True, "selection_registered": False}
+        self.assertEqual([], popup.missing_subscriptions(ready, ["--observe-focus"]))
+        self.assertEqual(["selection_registered"], popup.missing_subscriptions(ready, ["--observe-focus", "--observe-selection"]))
+        self.assertEqual(["focus_registered"], popup.missing_subscriptions({}, ["--observe-focus"]))
+        self.assertEqual([], popup.missing_subscriptions({}, []))
+
     def test_terminal_and_event_checks_run_on_their_own(self):
         base = ["--exe", "ghostty.exe", "--sha256", "a" * 64, "--out", "unused"]
         for extra in (["--terminal-checks", "--actions"], ["--event-checks", "--readonly-root"]):
