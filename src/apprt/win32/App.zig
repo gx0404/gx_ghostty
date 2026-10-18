@@ -585,6 +585,7 @@ pub fn run(self: *App) !void {
             self.session_save_ready = false;
             self.session.flush(self);
         }
+        Menu.prepareIdle(self);
         const result = w32.GetMessageW(&msg, null, 0, 0);
         if (result == 0) {
             // WM_QUIT received. Check if it's still wanted — stopQuitTimer()
@@ -1266,13 +1267,18 @@ pub fn wakeup(self: *App) void {
 /// broadcast, so the app acts for one of them (`primaryWindow`): the light
 /// or dark app mode ("ImmersiveColorSet") goes to the core and the
 /// terminals (`syncColorScheme`), and changed environment variables
-/// ("Environment") detect the shells of the launch profiles again.
+/// ("Environment") detect the shells of the launch profiles again. Hidden
+/// popup hosts follow only a change of what they draw with
+/// (`Menu.onSystemChange`) or of the detected shells (`Menu.onShellsDetected`).
 pub fn onSystemSettingChange(self: *App, window: *Window, change: w32.SystemChange) void {
+    Menu.onSystemChange(self);
     if (window != self.primaryWindow()) return;
     if (change.isArea("ImmersiveColorSet")) self.syncColorScheme();
     if (change.isArea("Environment")) {
+        const shells = Menu.shellsDigest(&self.profiles_cache);
         self.profiles_cache.invalidate();
         self.updateDefaultCommand();
+        Menu.onShellsDetected(self, shells);
     }
 }
 

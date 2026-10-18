@@ -591,9 +591,7 @@ fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
     if (index >= self.focusCount()) return false;
     switch (action.kind) {
         .focus => {
-            self.focus = index;
-            self.keyboard = true;
-            self.popup.invalidate();
+            self.focusTarget(index);
             const hwnd = self.popup.hwnd orelse return false;
             _ = w32.SetFocus(hwnd);
         },
@@ -640,6 +638,12 @@ const Dialog = struct {
 
     /// The window procedure of the popup before `subclass`.
     popup_proc: isize = 0,
+
+    fn focusTarget(self: *Dialog, index: usize) void {
+        self.focus = index;
+        self.keyboard = true;
+        self.popup.repaint();
+    }
 
     fn linkCount(self: *const Dialog) usize {
         return @min(self.spec.links.len, max_links);
@@ -741,9 +745,7 @@ const Dialog = struct {
     fn moveFocus(self: *Dialog, forward: bool) void {
         const count = self.focusCount();
         if (count == 0) return;
-        self.focus = if (forward) (self.focus + 1) % count else (self.focus + count - 1) % count;
-        self.keyboard = true;
-        self.popup.invalidate();
+        self.focusTarget(if (forward) (self.focus + 1) % count else (self.focus + count - 1) % count);
     }
 
     fn computeLayout(self: *Dialog, factory: *d2d.Factory) void {
@@ -1034,6 +1036,59 @@ const Dialog = struct {
         if (s.focused) controls.focusRing(canvas, canvas.snapRect(r), radius, t);
     }
 };
+
+test "UIA dialog focus preserves checkbox Toggle until the checkbox changes" {
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Dialog", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Remember", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var dialog: Dialog = .{
+        .app = undefined,
+        .owner = @ptrFromInt(1),
+        .tokens = undefined,
+        .spec = .{ .title = "Test", .body = "", .check = "Remember", .buttons = &.{.{ .label = "OK", .choice = .accept }} },
+    };
+    defer dialog.popup.destroy();
+    dialog.layout.check = .{ .x = 0, .y = 0, .w = 20, .h = 20 };
+    try dialog.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    const snapshot = dialog.popup.uia_view.publisher.current.?;
+    const face = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        query: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        retain: *const fn (*uia.Face) callconv(.winapi) u32,
+        release: *const fn (*uia.Face) callconv(.winapi) u32,
+        options: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(face.vtable));
+    _ = abi.retain(face);
+    defer _ = abi.release(face);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    dialog.focusTarget(dialog.checkIndex().?);
+    try testing.expectEqual(@as(i32, 0), abi.options(face, &options));
+    dialog.moveFocus(true);
+    dialog.moveFocus(false);
+    onMouse(&dialog, &dialog.popup, .{ .kind = .move, .pos = .{ .x = 1, .y = 1 } });
+    onMouse(&dialog, &dialog.popup, .{ .kind = .leave, .pos = .{ .x = 1, .y = 1 } });
+    try testing.expectEqual(@as(i32, 0), abi.options(face, &options));
+    try testing.expect(dialog.popup.uia_view.publisher.accepts(action));
+    // This is the actual Toggle implementation, without the desktop/queue
+    // boundary. Unlike focus it mutates the model and must revoke the snapshot.
+    dialog.activate(dialog.checkIndex().?);
+    try testing.expect(dialog.checked);
+    try testing.expect(!dialog.popup.uia_view.publisher.accepts(action));
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
+}
 
 fn titleStyle(t: style.Tokens) d2d.TextStyle {
     var s = style.type_ramp.subtitle.text(t.text);
@@ -1537,6 +1592,36 @@ fn windowOf(hwnd: w32.HWND) ?*Window {
 var open_dialogs: [max_depth]*Dialog = undefined;
 var open_count: usize = 0;
 
+/// The popup of a dialog: activating, closed only by an answer (Escape and
+/// Alt+F4 answer Cancel themselves), and revealed even when its first frame
+/// cannot be painted, so the question stays answerable and never answers
+/// itself (`Popup.RevealTimeout.reveal`).
+fn popupOptions(spec: Spec, tokens: style.Tokens) Popup.Options {
+    return .{
+        .activate = true,
+        .dismiss_on_escape = false,
+        .dismiss_on_outside_click = false,
+        .close_owner_on_close = false,
+        .corners = .round,
+        .shadow = true,
+        .border_color = tokens.border,
+        .dark = tokens.dark,
+        .accessible_name = spec.window_title orelse spec.title,
+        .reveal_timeout = .reveal,
+    };
+}
+
+test "P4 a dialog stays up and answerable when its first frame fails" {
+    const tokens = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
+    const options = popupOptions(.{ .title = "Close Terminal?", .body = "", .buttons = &.{.{ .label = "Close", .choice = .accept }} }, tokens);
+    try std.testing.expectEqual(Popup.RevealTimeout.reveal, options.reveal_timeout);
+    try std.testing.expect(options.activate and !options.dismiss_on_outside_click and !options.dismiss_on_escape);
+    try std.testing.expect(!options.reuse_host);
+    try std.testing.expectEqualStrings("Close Terminal?", options.accessible_name);
+    // Everything else (menus, the palette, settings) cancels instead.
+    try std.testing.expectEqual(Popup.RevealTimeout.cancel, (Popup.Options{}).reveal_timeout);
+}
+
 fn run(owner_: ?w32.HWND, spec: Spec) Answer {
     if (depth >= max_depth) {
         log.warn("too many nested dialogs, declining title={s}", .{spec.title});
@@ -1558,17 +1643,7 @@ fn run(owner_: ?w32.HWND, spec: Spec) Answer {
     };
     dialog.focus = dialog.buttonIndex(dialog.defaultButton());
 
-    dialog.popup.create(app.hinstance, owner, factory, .{
-        .activate = true,
-        .dismiss_on_escape = false,
-        .dismiss_on_outside_click = false,
-        .close_owner_on_close = false,
-        .corners = .round,
-        .shadow = true,
-        .border_color = dialog.tokens.border,
-        .dark = dialog.tokens.dark,
-        .accessible_name = spec.window_title orelse spec.title,
-    }, .{
+    dialog.popup.create(app.hinstance, owner, factory, popupOptions(spec, dialog.tokens), .{
         .ctx = &dialog,
         .paint = onPaint,
         .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
@@ -1777,13 +1852,13 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             const hit = self.hitTest(event.pos);
             if (hit != self.hover) {
                 self.hover = hit;
-                self.popup.invalidate();
+                self.popup.repaint();
             }
         },
         .leave => {
             self.hover = null;
             self.pressed = null;
-            self.popup.invalidate();
+            self.popup.repaint();
         },
         .down => if (event.button == .left) {
             self.pressed = self.hitTest(event.pos);
@@ -1791,12 +1866,12 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             // Pointer use hides the focus ring again (unless Windows
             // always shows it).
             self.keyboard = keyboardCues();
-            self.popup.invalidate();
+            self.popup.repaint();
         },
         .up => if (event.button == .left) {
             const pressed = self.pressed;
             self.pressed = null;
-            self.popup.invalidate();
+            self.popup.repaint();
             if (pressed != null and pressed == self.hitTest(event.pos)) self.activate(pressed.?);
         },
         .double_click, .wheel => {},

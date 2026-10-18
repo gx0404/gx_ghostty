@@ -19,8 +19,11 @@
 //! returned) or the menu is dismissed (null). The popups of one run are
 //! created once per level and reused for every submenu shown at that
 //! level; `Popup.show` keeps a popup cloaked until it has painted. Only the
-//! root's DC canvas and DIB may survive for three seconds between runs;
-//! no window, callback, menu model or text layout stays in that cache.
+//! main-menu root host is retained hidden per owner between runs; callbacks
+//! and models are detached when a session ends, and the next opening
+//! rebuilds it hidden when it is stale or was created for the other
+//! animation setting (`Popup.animationMatches`). Other menus may only retain
+//! their DC canvas and DIB for three seconds.
 //!
 //! Like a native menu, the menu takes neither activation nor keyboard
 //! focus. The loop handles the keyboard itself on the deepest open menu:
@@ -199,6 +202,8 @@ pub const Options = struct {
     owner_scale: ?f32 = null,
     /// Only the main menu root supplies a P4 opening measurement.
     open_timing: ?Popup.OpenTiming = null,
+    /// Main menu only: one address-stable hidden host per top-level owner.
+    reuse_root: bool = false,
 
     /// The anchor of a menu that opens at a point.
     pub fn at(pt: w32.POINT) w32.RECT {
@@ -216,6 +221,16 @@ pub fn cancel() void {
 /// Returns the id of the picked item, or null when the menu was dismissed,
 /// another menu is open or the owner went away.
 pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?usize {
+    return runSession(host, owner, root, options, false);
+}
+
+/// Prepare the main menu at an event-driven idle boundary, never entering a
+/// modal loop or showing/activating its host. Models remain session-owned.
+pub fn prepare(host: Host, owner: w32.HWND, root: *const List, options: Options) void {
+    _ = runSession(host, owner, root, options, true);
+}
+
+fn runSession(host: Host, owner: w32.HWND, root: *const List, options: Options, preparing: bool) ?usize {
     if (current != null or native_open) {
         log.debug("a menu is already open", .{});
         return null;
@@ -246,12 +261,16 @@ pub fn run(host: Host, owner: w32.HWND, root: *const List, options: Options) ?us
         .held_keys = heldKeys(),
         .cues = options.keyboard or keyboardCues(),
         .suffixes = options.keyboard,
+        .preparing = preparing,
+        .root_host = if (options.reuse_root) root_hosts.acquire(host.factory.alloc, owner) catch return null else null,
     };
     defer state.destroyPopups();
 
     current = &state;
     defer current = null;
     if (!state.open(root, null, options.keyboard)) return null;
+
+    if (preparing) return null;
 
     // The capture keeps WM_SETCURSOR away, so set the menu cursor once.
     if (w32.LoadCursorW(null, w32.IDC_ARROW)) |arrow| _ = w32.SetCursor(arrow);
@@ -270,6 +289,245 @@ var current: ?*State = null;
 
 /// A native menu (`runNative`) is running.
 var native_open = false;
+
+/// Address-stable root hosts. A borrowed entry can be retired during a modal
+/// dispatch, but must not be freed until that session unwinds.
+const RootHosts = struct {
+    const Entry = struct {
+        next: ?*Entry = null,
+        alloc: Allocator,
+        owner: w32.HWND,
+        popup: Popup = .{},
+        borrowed: bool = true,
+        retired: bool = false,
+    };
+    first: ?*Entry = null,
+
+    fn acquire(self: *RootHosts, alloc: Allocator, owner: w32.HWND) !*Entry {
+        var it = self.first;
+        while (it) |entry| : (it = entry.next) {
+            if (entry.owner == owner) {
+                if (entry.borrowed or entry.retired) return error.Busy;
+                entry.borrowed = true;
+                return entry;
+            }
+        }
+        const entry = try alloc.create(Entry);
+        entry.* = .{ .alloc = alloc, .owner = owner, .next = self.first };
+        self.first = entry;
+        return entry;
+    }
+
+    fn remove(self: *RootHosts, entry: *Entry) void {
+        var link = &self.first;
+        while (link.*) |current_entry| : (link = &current_entry.next) {
+            if (current_entry != entry) continue;
+            link.* = entry.next;
+            entry.popup.destroy();
+            entry.alloc.destroy(entry);
+            return;
+        }
+    }
+
+    fn release(self: *RootHosts, entry: *Entry) void {
+        entry.popup.hide();
+        entry.popup.callbacks = null;
+        entry.borrowed = false;
+        if (entry.retired or entry.popup.reuse_invalid) self.remove(entry);
+    }
+
+    fn invalidate(self: *RootHosts, owner: w32.HWND) void {
+        var it = self.first;
+        while (it) |entry| {
+            it = entry.next;
+            if (entry.owner != owner) continue;
+            if (entry.borrowed) entry.retired = true else self.remove(entry);
+        }
+    }
+};
+
+var root_hosts: RootHosts = .{};
+
+/// A configuration, language, DPI or system UI change retired `owner`'s
+/// hidden root host (`Menu.invalidateWindow`). A session on the stack keeps
+/// its borrowed root and frees it when it unwinds; the next opening builds
+/// a new one. Retiring it does not end the session: a language change also
+/// closes the open menu (`Menu.onLanguageChanged`), and the destruction of
+/// its owner does (`onOwnerDestroyed`).
+pub fn invalidateOwner(owner: w32.HWND) void {
+    root_hosts.invalidate(owner);
+}
+
+/// `owner` is about to be destroyed (`Settings.onWindowDestroyed`): retire
+/// its root host and cancel a menu open on it; the borrowed root is freed
+/// once that modal session unwinds.
+pub fn onOwnerDestroyed(owner: w32.HWND) void {
+    invalidateOwner(owner);
+    if (current) |state| if (state.owner == owner) state.dismiss();
+}
+
+test "P4 reuse retains one stable menu root for 100 sessions and retires a borrowed owner" {
+    var hosts: RootHosts = .{};
+    const owner: w32.HWND = @ptrFromInt(1);
+    defer hosts.invalidate(owner);
+    const first = try hosts.acquire(std.testing.allocator, owner);
+    const address = @intFromPtr(first);
+    hosts.release(first);
+    try std.testing.expect(hosts.first != null);
+    for (0..100) |_| {
+        const entry = try hosts.acquire(std.testing.allocator, owner);
+        try std.testing.expectEqual(address, @intFromPtr(entry));
+        try std.testing.expect(entry.next == null);
+        hosts.release(entry);
+    }
+    const borrowed = try hosts.acquire(std.testing.allocator, owner);
+    hosts.invalidate(owner);
+    try std.testing.expect(borrowed.retired);
+    try std.testing.expectError(error.Busy, hosts.acquire(std.testing.allocator, owner));
+    hosts.release(borrowed);
+    try std.testing.expect(hosts.first == null);
+}
+
+test "P4 retiring an owner's menu root lets its open session finish" {
+    // A configuration, DPI or system UI change during a menu: the menu stays
+    // open and ends normally; only a later opening rebuilds. (A language
+    // change closes it, see the next test.)
+    const owner: w32.HWND = @ptrFromInt(0x40);
+    var state: State = undefined;
+    state.owner = owner;
+    state.result = .open;
+    state.depth = 0;
+    const running = current;
+    current = &state;
+    defer current = running;
+    invalidateOwner(owner);
+    try std.testing.expect(state.result == .open);
+    // Of the owners' destructions, only its own ends it.
+    onOwnerDestroyed(@ptrFromInt(0x80));
+    try std.testing.expect(state.result == .open);
+    onOwnerDestroyed(owner);
+    try std.testing.expect(state.result == .cancelled);
+}
+
+test "P4 a UI language change closes an open menu, other invalidations only retire its host" {
+    // Through the whole notification chain of an applied `language` change:
+    // App.updateConfig → Window.onLanguageChanged → Menu.onLanguageChanged.
+    // The window has no HWND, so nothing reaches the desktop.
+    const Window = @import("../Window.zig");
+    const Config = @import("../../../config.zig").Config;
+    const i18n = @import("../../../gx/i18n.zig");
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = testing.allocator;
+    var app: App = .{
+        .core_app = &core,
+        .config = try Config.default(testing.allocator),
+        .hinstance = w32.GetModuleHandleW(null) orelse return error.TestUnexpectedResult,
+        .default_command_arena = .init(testing.allocator),
+    };
+    defer app.default_command_arena.deinit();
+    defer app.config.deinit();
+    var window: Window = .{ .app = &app };
+    var windows = [_]*Window{&window};
+    app.windows = .{ .items = &windows, .capacity = windows.len };
+    const language = i18n.current();
+    defer i18n.setCurrent(language);
+
+    const owner: w32.HWND = @ptrFromInt(0x40);
+    var state: State = undefined;
+    state.owner = owner;
+    state.result = .open;
+    state.depth = 0;
+    const running = current;
+    current = &state;
+    defer current = running;
+
+    // What a configuration, DPI or system UI change does to the menus of a
+    // window: the open menu goes on.
+    window.hwnd = owner;
+    @import("Menu.zig").invalidateWindow(&window);
+    window.hwnd = null;
+    try testing.expect(state.result == .open);
+    try testing.expect(window.palette.preparation.isPending());
+
+    // Another configuration without a new language: it stays open.
+    var same = try app.config.clone(testing.allocator);
+    defer same.deinit();
+    same.@"font-size" += 1;
+    try testing.expect(try app.performAction(.app, .config_change, .{ .config = &same }));
+    try testing.expect(state.result == .open);
+    try testing.expectEqual(language, i18n.current());
+
+    // The UI language changes: the open menu closes.
+    var next = try app.config.clone(testing.allocator);
+    defer next.deinit();
+    next.language = if (language == .en) "zh-CN" else "en";
+    try testing.expect(try app.performAction(.app, .config_change, .{ .config = &next }));
+    try testing.expect(i18n.current() != language);
+    try testing.expect(state.result == .cancelled);
+}
+
+test "P4 reuse rebuilds the hidden main menu root when the animation setting changes" {
+    // The idle preparation may create the main menu root while animations
+    // are off and keep it hidden. Once they are on, the next opening must
+    // fade in again, and once off again it must not: the host is rebuilt
+    // hidden for the setting, never restyled. The setting is injected.
+    const Policy = struct {
+        fn off() bool {
+            return false;
+        }
+        fn on() bool {
+            return true;
+        }
+        fn rootHost(owner: w32.HWND) ?*RootHosts.Entry {
+            var it = root_hosts.first;
+            while (it) |entry| : (it = entry.next) {
+                if (entry.owner == owner) return entry;
+            }
+            return null;
+        }
+    };
+    const saved = Popup.animation_policy;
+    defer Popup.animation_policy = saved;
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(owner);
+    defer invalidateOwner(owner);
+    var menu: Builder = .init(testing.allocator);
+    defer menu.deinit();
+    try menu.add(&menu.root, .{ .id = 1, .label = "New Tab" });
+    try menu.add(&menu.root, .{ .id = 2, .label = "Settings" });
+    const quit = false;
+    const host: Host = .{
+        .hinstance = hinstance,
+        .factory = factory,
+        .tokens = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa)),
+        .quit_requested = &quit,
+    };
+    const options: Options = .{ .anchor = Options.at(.{ .x = 0, .y = 0 }), .alignment = .right, .keyboard = true, .reuse_root = true };
+    const offscreen: w32.RECT = .{ .left = -32000, .top = -32000, .right = -31900, .bottom = -31950 };
+    for ([_]bool{ false, true, false }) |animations| {
+        Popup.animation_policy = if (animations) &Policy.on else &Policy.off;
+        prepare(host, owner, &menu.root, options);
+        const entry = Policy.rootHost(owner) orelse return error.TestUnexpectedResult;
+        try testing.expect(!entry.borrowed and !entry.popup.visible);
+        try testing.expectEqual(animations, entry.popup.layered);
+        const hwnd = entry.popup.hwnd orelse return error.TestUnexpectedResult;
+        const ex_style: usize = @bitCast(w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE));
+        try testing.expectEqual(animations, ex_style & w32.WS_EX_LAYERED != 0);
+        try testing.expect(entry.popup.animationMatches());
+        // What the next opening does with it (off screen, no capture).
+        entry.popup.options.capture_mouse = false;
+        entry.popup.show(offscreen);
+        try testing.expectEqual(animations, entry.popup.fade_pending);
+        entry.popup.hide();
+        // Preparing again with the same setting keeps the host.
+        prepare(host, owner, &menu.root, options);
+        try testing.expectEqual(hwnd, Policy.rootHost(owner).?.popup.hwnd.?);
+    }
+}
 
 /// Nested submenus beyond this depth do not open.
 const max_depth = 4;
@@ -1065,7 +1323,9 @@ const Level = struct {
         if (self.hot == item and self.hot_keyboard == by_keyboard) return;
         self.hot = item;
         self.hot_keyboard = by_keyboard;
-        self.popup.invalidate();
+        // Highlight/focus alone keeps item tokens stable. ensureVisible still
+        // invalidates when it actually scrolls the layout.
+        self.popup.repaint();
     }
 
     /// Highlight `item` from the keyboard and scroll it into view.
@@ -1268,6 +1528,69 @@ const Level = struct {
     }
 };
 
+test "UIA menu focus preserves Invoke unless revealing the row scrolls layout" {
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Menu", .role = .menu },
+        .{ .id = 2, .parent = 0, .name = "Action", .role = .menu_item, .patterns = .{ .invoke = true } },
+    };
+    const Abi = extern struct {
+        query: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        retain: *const fn (*uia.Face) callconv(.winapi) u32,
+        release: *const fn (*uia.Face) callconv(.winapi) u32,
+        options: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    for ([_]bool{ false, true }) |scrolls| {
+        var popup: Popup = .{};
+        defer popup.destroy();
+        try popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+        const snapshot = popup.uia_view.publisher.current.?;
+        const face = &snapshot.nodes[1].faces[0];
+        const abi: *const Abi = @ptrCast(@alignCast(face.vtable));
+        _ = abi.retain(face);
+        defer _ = abi.release(face);
+        const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .invoke, .value = &.{}, .alloc = testing.allocator };
+        var items = [_]Item{.{ .id = 42, .label = "Action" }};
+        var list: List = .{ .items = .{ .items = &items, .capacity = items.len } };
+        var rows = [_]Row{.{ .top = if (scrolls) 40 else 0, .height = 20 }};
+        var state: State = undefined;
+        state.levels[0] = .{
+            .state = &state,
+            .index = 0,
+            .popup = &popup,
+            .list = &list,
+            .parent_item = null,
+            .rows = &rows,
+            .content_px = 100,
+            .arrow_px = if (scrolls) 4 else 0,
+            .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = if (scrolls) 24 else 100 },
+        };
+        state.levels[0].select(0); // The same method called by uiaAction(.focus).
+        var options: u32 = 0;
+        if (!scrolls) {
+            try testing.expectEqual(@as(i32, 0), abi.options(face, &options));
+            try testing.expect(popup.uia_view.publisher.accepts(action));
+            state.activate(0, 0); // Actual Invoke implementation, no OS dispatch.
+            try testing.expectEqual(@as(usize, 42), state.result.picked);
+        } else {
+            try testing.expect(state.levels[0].scroll_px > 0);
+            try testing.expect(!popup.uia_view.publisher.accepts(action));
+            try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
+        }
+        popup.hide();
+        try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
+    }
+}
+
 const State = struct {
     host: Host,
     owner: w32.HWND,
@@ -1277,6 +1600,8 @@ const State = struct {
     alignment: Align,
     owner_scale: ?f32,
     open_timing: ?Popup.OpenTiming = null,
+    root_host: ?*RootHosts.Entry = null,
+    preparing: bool = false,
     /// The popup of each level, created when the level first opens and
     /// reused by every submenu shown there until the menu closes.
     popups: [max_depth]Popup = @splat(.{}),
@@ -1314,11 +1639,16 @@ const State = struct {
     /// the keyboard.
     suffixes: bool,
 
+    fn popupAt(self: *State, index: usize) *Popup {
+        if (index == 0) if (self.root_host) |entry| return &entry.popup;
+        return &self.popups[index];
+    }
+
     /// Open `list` as the next level; `parent_item` is the item of the
     /// current deepest level it belongs to.
     fn open(self: *State, list: *const List, parent_item: ?usize, keyboard: bool) bool {
         if (self.depth >= max_depth) return false;
-        const span = if (perf.enabled()) perf.Span.begin(global.io()) else null;
+        const span = if (!self.preparing and perf.enabled()) perf.Span.begin(global.io()) else null;
         defer if (span) |value| {
             _ = value.end(global.io(), "menu.open");
         };
@@ -1327,10 +1657,21 @@ const State = struct {
         if (index == 0) self.open_timing = null;
         if (timing) |*value| value.lap(.prepare);
         const level = &self.levels[index];
-        const popup = &self.popups[index];
+        const popup = self.popupAt(index);
         level.* = .{ .state = self, .index = index, .popup = popup, .list = list, .parent_item = parent_item };
         level.rows = self.alloc.alloc(Row, list.items.items.len) catch return false;
         @memset(level.rows, .{});
+        const callbacks: Popup.Callbacks = .{
+            .ctx = level,
+            .paint = Level.paint,
+            .uia_source = if (self.host.app) |app| .{ .app = app, .build = Level.uiaBuild, .is_live = Level.uiaLive, .action = Level.uiaAction } else null,
+            .dismissed = Level.dismissed,
+            .dpi_changed = Level.dpiChanged,
+        };
+        // A kept host is rebuilt hidden when it is stale, or was created for
+        // the other animation setting (`Popup.animationMatches`): the fade
+        // of this opening needs a layered window, a plain one none.
+        if (popup.reuse_invalid or (popup.hwnd != null and !popup.animationMatches())) popup.destroy();
         if (popup.hwnd == null) {
             const tokens = self.host.tokens;
             popup.create(self.host.hinstance, self.owner, self.host.factory, .{
@@ -1344,22 +1685,19 @@ const State = struct {
                 .dark = tokens.dark,
                 // Fade in (`anim.enabled`); `open` sets the direction.
                 .motion = .{},
-            }, .{
-                .ctx = level,
-                .paint = Level.paint,
-                .uia_source = if (self.host.app) |app| .{ .app = app, .build = Level.uiaBuild, .is_live = Level.uiaLive, .action = Level.uiaAction } else null,
-                .dismissed = Level.dismissed,
-                .dpi_changed = Level.dpiChanged,
-            }) catch |err| {
+            }, callbacks) catch |err| {
                 log.warn("failed to create a menu popup err={}", .{err});
                 return false;
             };
-            if (index == 0) {
+            if (index == 0 and self.root_host == null) {
                 const reused = raster_cache.restore(popup);
                 if (perf.enabled()) log.info("menu raster reused={}", .{reused});
             }
-            if (self.owner_scale) |owner_scale| popup.setOwnerScale(owner_scale);
         }
+        // No callbacks or stack addresses survive a closed session. Rebind
+        // only while this Level lives, without moving the Popup itself.
+        popup.callbacks = callbacks;
+        if (self.owner_scale) |owner_scale| popup.setOwnerScale(owner_scale);
         self.depth += 1;
         if (timing) |*value| value.lap(.create);
 
@@ -1370,6 +1708,10 @@ const State = struct {
         level.place();
         popup.options.motion = .{ .offset_y = if (index == 0) self.slideFor(level.bounds) else 0 };
         if (timing) |*value| value.lap(.layout);
+        if (self.preparing) {
+            popup.prepareHidden(level.bounds);
+            return true;
+        }
         popup.open_timing = timing;
         popup.show(level.bounds);
         if (popup.scale() != level.scale) {
@@ -1396,7 +1738,7 @@ const State = struct {
         if (self.depth <= index) return;
         while (self.depth > index) {
             self.depth -= 1;
-            self.popups[self.depth].hide();
+            self.popupAt(self.depth).hide();
             self.levels[self.depth].releaseLayouts();
         }
         if (self.press) |p| if (p.level >= index) {
@@ -1410,7 +1752,10 @@ const State = struct {
 
     fn destroyPopups(self: *State) void {
         self.closeFrom(0);
-        raster_cache.store(&self.popups[0]);
+        if (self.root_host) |entry| {
+            root_hosts.release(entry);
+            self.root_host = null;
+        } else raster_cache.store(&self.popups[0]);
         for (&self.popups) |*popup| popup.destroy();
     }
 
@@ -1424,7 +1769,7 @@ const State = struct {
     fn showCues(self: *State) void {
         if (self.cues) return;
         self.cues = true;
-        for (self.levels[0..self.depth]) |*level| level.popup.invalidate();
+        for (self.levels[0..self.depth]) |*level| level.popup.repaint();
     }
 
     fn openSubmenu(self: *State, level_index: usize, item: usize, keyboard: bool) void {
@@ -1798,7 +2143,7 @@ const State = struct {
                 level.setHot(item, false);
                 highlightPath(self.levels[0..self.depth], hit.level);
                 self.press = .{ .level = hit.level, .item = item };
-                level.popup.invalidate();
+                level.popup.repaint();
             },
             .separator, .header => {},
         }
@@ -1807,7 +2152,7 @@ const State = struct {
     fn mouseUp(self: *State, pt: w32.POINT) void {
         if (self.press) |p| {
             self.press = null;
-            if (p.level < self.depth) self.levels[p.level].popup.invalidate();
+            if (p.level < self.depth) self.levels[p.level].popup.repaint();
         }
         const hit = self.hitTest(pt) orelse return;
         const item = self.hitItem(hit) orelse return;

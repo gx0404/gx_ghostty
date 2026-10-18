@@ -113,6 +113,8 @@ GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来
 
 ## 耗时度量与基线
 
+P4 隐藏复用的功能门先于性能结论：按窗口核主菜单/设置宿主数量，关闭后不可见且不进 Alt-Tab，配置/DPI/主题/语言/设备失效后重建；100 次开关核资源稳定，菜单活动期间无关系统广播不取消，语言变化与 owner 销毁仍取消。空闲准备每单元让出，不主动文件 I/O；测试必须覆盖准备期间输入到达与多个 owner 公平推进。Windows 性能门取 `<ui>.open.ready`（入口至当前尺寸/DPI 成功首绘及同步显示，RV 等待之前），`open.total` 和 `prepare.idle` 单独保留，阈值仍为 6.25 ms。这不改变历史 P4 FAIL；最终树十轮热值与 PATH 扫描计数仍须实测。
+
 第 6 阶段新增工具：`win32-ui --case p3|p4|p5|p6`、`win32-idle --tabs 1|11 --windows N --state visible|unfocused|minimized --seconds 60`、`win32-gpu`、`win32-mem`；都用重复的 `--exe`/`--label`、`--out` 与 `--runs 10` 组织 AB/BA，`--capabilities LABEL:JSON` 将可证明零事件的指标能力绑定到实际映像哈希，缺声明或缺旧版埋点保持 unknown/n=0，不补造零。`remote <日志目录…>` 只归约真实远程夹具日志，不自行驱动迁移；保留 bytes/count 与 ms 的区别。`gtk` 与 `win32` 可用 `--label-env LABEL:NAME=VALUE` 给变体单独设置环境。`info(gx_perf): metric <name> <n>` 是无单位计数，不按微秒换算；原始时间日志保留单位，统计统一换算为 ms。
 
 GTK 的 `gtk --case p2|p4` 使用独立的动作采样合同，默认省略 `--case`（或 `standard`）仍为原 C1 完整负载，不改变旧命令。P2 每臂十轮、交替 1/11 标签，各采 60 秒；P4 每轮对主菜单和设置分别预热一次再热打开三次，热中位数必须每轮均不超过 6.25 ms，路径扫描计数为零。`--capabilities LABEL:JSON` 声明 `source`、`exe_sha256`、`metrics`（计数单位 `""`、耗时 `"ms"`），必须匹配实际源身份与映像，并有真实日志通道证据，才可解释无计数行为；缺指标为 unknown。驱动验证正常 ReleaseFast receipt、起止身份、原始日志区间和完整 AB/BA，P2 用带随机标记且有截止时间的客户端响应往返证明 GUI 主循环仍工作；P4 必须由完整 AT-SPI 树确认打开和关闭，查询错误、缺子节点或超时不能当作已关闭。

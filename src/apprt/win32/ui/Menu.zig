@@ -694,6 +694,515 @@ fn menuButtonAnchor(window: *Window) w32.RECT {
     return screenRect(hwnd, .{ .left = client.right, .top = top, .right = client.right, .bottom = top });
 }
 
+/// Invalidate generations, not live callback storage: a configuration, DPI
+/// or system UI change leaves an open palette, settings or menu open, only
+/// marked stale, and the next opening (or idle preparation) rebuilds their
+/// hosts. An open menu closes for a UI language change (`onLanguageChanged`,
+/// its labels would stay in the old language) and for the destruction of
+/// its owner (`MenuPopup.onOwnerDestroyed`), nothing else.
+pub fn invalidateWindow(window: *Window) void {
+    // A theme preview step retires the hosts like any change; the change
+    // that ends the preview asks to prepare them (`applyThemePreview`).
+    if (theme_preview_step) window.palette.retireHost() else window.palette.invalidateHost();
+    Settings.invalidateOwner(window);
+    if (window.hwnd) |hwnd| MenuPopup.invalidateOwner(hwnd);
+}
+
+/// Whether the configuration being applied is a theme preview step
+/// (`applyThemePreview`). GUI thread.
+var theme_preview_step = false;
+
+/// Apply `config`, a theme preview step (`Palette.applyTheme`,
+/// `Settings.applyConfig` with a theme override). Its configuration change
+/// retires the hidden hosts like any other, but asks no idle preparation
+/// of them: browsing themes does not rebuild the hidden UI of every window
+/// at each step. A preview ends with a change that is not a step (the saved
+/// theme again, or the one saved), which asks for it once; when it ends
+/// without one, the next opening rebuilds what is stale.
+pub fn applyThemePreview(app: *App, config: *configpkg.Config) !void {
+    theme_preview_step = true;
+    defer theme_preview_step = false;
+    try app.applyConfig(config);
+}
+
+test "P4 a theme preview step retires hidden hosts without asking to prepare them" {
+    // Browsing themes applies a configuration at every step. The hosts are
+    // stale after each like after any change, but rebuilding every window's
+    // hidden UI at each step is wasted: only the change that ends the
+    // preview asks idle preparation for it.
+    var fixture: InvalidationFixture = undefined;
+    fixture.init();
+    fixture.settle();
+    theme_preview_step = true;
+    for (fixture.windows) |owner| invalidateWindow(owner);
+    theme_preview_step = false;
+    for (fixture.windows) |owner| {
+        try std.testing.expect(owner.palette.popup.reuse_invalid);
+        try std.testing.expect(owner.palette.item_cache.stamp == null);
+        try std.testing.expect(!owner.palette.preparation.isPending());
+    }
+    for (fixture.windows) |owner| invalidateWindow(owner);
+    try std.testing.expect(try fixture.retired());
+}
+
+/// What hidden popup hosts draw with from the system (`style.system`):
+/// whether high contrast applies and, if it does, its system colors.
+const SystemUi = struct {
+    high_contrast: bool,
+    colors: ?style.SystemColors,
+
+    fn current() SystemUi {
+        const high_contrast = style.system.highContrast();
+        return .{ .high_contrast = high_contrast, .colors = if (high_contrast) style.system.colors else null };
+    }
+};
+
+/// The system UI state the hidden hosts were last retired for; null until
+/// the first broadcast of the process. GUI thread.
+var drawn_system: ?SystemUi = null;
+
+/// A system broadcast reached a window (`App.onSystemSettingChange`), after
+/// `style.system` was read again: retire every owner's hidden hosts only
+/// when what they draw with changed (`invalidateApp`). Every window hears
+/// each broadcast, and a new window hears its own WM_THEMECHANGED
+/// (`Backdrop.apply`); the first one that sees a change retires them all,
+/// the others see none. The app light or dark mode reaches the hosts as a
+/// configuration change when the configuration follows it.
+pub fn onSystemChange(app: *App) void {
+    const now = SystemUi.current();
+    if (drawn_system) |drawn| if (std.meta.eql(drawn, now)) return;
+    drawn_system = now;
+    invalidateApp(app);
+}
+
+/// A digest of the launch profiles detected in `cache`; null when none are
+/// cached (not detected yet, or invalidated).
+pub fn shellsDigest(cache: *const gx.profiles.Cache) ?u64 {
+    const shells = cache.shells orelse return null;
+    var hasher: std.hash.Wyhash = .init(0);
+    for (shells.profiles) |profile| {
+        hashBytes(&hasher, profile.id);
+        hashBytes(&hasher, profile.name);
+        hashBytes(&hasher, profile.name_arg orelse "");
+        std.hash.autoHash(&hasher, profile.kind);
+        std.hash.autoHash(&hasher, std.meta.activeTag(profile.command));
+        switch (profile.command) {
+            .argv => |argv| {
+                std.hash.autoHash(&hasher, argv.len);
+                for (argv) |arg| hashBytes(&hasher, arg);
+            },
+            .command_line => |line| hashBytes(&hasher, line),
+        }
+    }
+    return hasher.final();
+}
+
+fn hashBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    std.hash.autoHash(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+/// The launch profiles were detected again (an "Environment" broadcast,
+/// `App.onSystemSettingChange`); `before` is their `shellsDigest` from
+/// before. When they changed, or are not known, what lists them is read
+/// again at the next opening (the shells of the settings; the palette
+/// entries follow `profiles_cache` themselves) and every window prepares
+/// its hidden UI again. The hosts stay: nothing they draw with changed.
+pub fn onShellsDetected(app: *App, before: ?u64) void {
+    if (before) |old| if (shellsDigest(&app.profiles_cache)) |new| if (old == new) return;
+    for (app.windows.items) |window| shellsChanged(window);
+    if (app.quick_terminal) |qt| shellsChanged(qt.window);
+}
+
+fn shellsChanged(window: *Window) void {
+    Settings.invalidateData(window);
+    window.palette.preparation.request();
+}
+
+/// Test windows without an HWND for the invalidation tests.
+const InvalidationFixture = struct {
+    app: App,
+    primary: Window,
+    window: Window,
+    windows: [2]*Window,
+
+    fn init(self: *InvalidationFixture) void {
+        self.app = undefined;
+        self.app.quick_terminal = null;
+        self.primary = undefined;
+        self.primary.hwnd = null;
+        self.primary.palette = .{};
+        self.window = undefined;
+        self.window.hwnd = null;
+        self.window.palette = .{};
+        self.windows = .{ &self.primary, &self.window };
+        self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len };
+    }
+
+    fn settle(self: *InvalidationFixture) void {
+        for (self.windows) |owner| {
+            owner.palette.preparation.pending = .initEmpty();
+            owner.palette.popup.reuse_invalid = false;
+            owner.palette.item_cache.stamp = 123;
+        }
+    }
+
+    fn retired(self: *InvalidationFixture) !bool {
+        const first = self.windows[0].palette.popup.reuse_invalid;
+        for (self.windows) |owner| {
+            try std.testing.expectEqual(first, owner.palette.popup.reuse_invalid);
+            try std.testing.expectEqual(first, owner.palette.preparation.isPending());
+            try std.testing.expectEqual(first, owner.palette.item_cache.stamp == null);
+        }
+        return first;
+    }
+};
+
+test "P4 a change of what popups draw with retires every owner's hidden hosts once" {
+    // No HWND, desktop or native theme API: high contrast is forced, as
+    // `App.simulateSystemTheme` does before it broadcasts.
+    const forced = style.system.forced_high_contrast;
+    defer style.system.forced_high_contrast = forced;
+    const drawn = drawn_system;
+    defer drawn_system = drawn;
+    var fixture: InvalidationFixture = undefined;
+    fixture.init();
+    style.system.forced_high_contrast = false;
+    fixture.app.onSystemSettingChange(&fixture.window, .sys_colors);
+    fixture.settle();
+    style.system.forced_high_contrast = true;
+    // A non-primary window hears it first and retires every owner's hosts,
+    // although only the primary window applies process-wide changes.
+    fixture.app.onSystemSettingChange(&fixture.window, .sys_colors);
+    try std.testing.expect(try fixture.retired());
+    fixture.settle();
+    // The other windows hear the same broadcasts: nothing is retired twice.
+    fixture.app.onSystemSettingChange(&fixture.primary, .sys_colors);
+    fixture.app.onSystemSettingChange(&fixture.primary, .theme);
+    try std.testing.expect(!try fixture.retired());
+    style.system.forced_high_contrast = false;
+    fixture.app.onSystemSettingChange(&fixture.primary, .theme);
+    try std.testing.expect(try fixture.retired());
+}
+
+test "P4 broadcasts that change nothing popups draw with keep every hidden host" {
+    // Every window hears each broadcast, and a new window hears its own
+    // WM_THEMECHANGED (Backdrop.apply sets its window theme in init). None of
+    // them may retire the hosts unless what the popups draw with changed.
+    var app: App = undefined;
+    app.quick_terminal = null;
+    var primary: Window = undefined;
+    primary.hwnd = null;
+    primary.palette = .{};
+    var window: Window = undefined;
+    window.hwnd = null;
+    window.palette = .{};
+    var windows = [_]*Window{ &primary, &window };
+    app.windows = .{ .items = &windows, .capacity = windows.len };
+    // Whatever the first broadcast of this process does, the next ones see
+    // the same system state.
+    app.onSystemSettingChange(&window, .theme);
+    for (windows) |owner| {
+        owner.palette.preparation.pending = .initEmpty();
+        owner.palette.popup.reuse_invalid = false;
+        owner.palette.item_cache.stamp = 123;
+    }
+    app.onSystemSettingChange(&window, .theme);
+    app.onSystemSettingChange(&primary, .theme);
+    app.onSystemSettingChange(&window, .sys_colors);
+    app.onSystemSettingChange(&primary, .{ .colorization = .{ .color = 0xC40078D4, .opaque_blend = true } });
+    for (windows) |owner| {
+        try std.testing.expect(!owner.palette.preparation.isPending());
+        try std.testing.expect(!owner.palette.popup.reuse_invalid);
+        try std.testing.expect(owner.palette.item_cache.stamp == 123);
+    }
+}
+
+test "P4 re-detected launch profiles refresh what lists them only when they changed" {
+    var fixture: InvalidationFixture = undefined;
+    fixture.init();
+    fixture.settle();
+    fixture.app.profiles_cache = .{};
+    try std.testing.expect(shellsDigest(&fixture.app.profiles_cache) == null);
+    const first = [_]gx.profiles.Profile{.{ .id = "pwsh", .name = "PowerShell", .command = .{ .command_line = "pwsh.exe" }, .kind = .pwsh }};
+    fixture.app.profiles_cache.shells = .{ .arena = .init(std.testing.allocator), .profiles = &first };
+    defer fixture.app.profiles_cache.invalidate();
+    const before = shellsDigest(&fixture.app.profiles_cache);
+    try std.testing.expect(before != null);
+    // Detected again with the same result: nothing to do.
+    onShellsDetected(&fixture.app, before);
+    try std.testing.expect(!try fixture.retired());
+    // Another result, or none known before: the data and the preparation
+    // follow, the hosts stay.
+    const second = [_]gx.profiles.Profile{.{ .id = "pwsh", .name = "PowerShell", .command = .{ .command_line = "pwsh.exe -NoLogo" }, .kind = .pwsh }};
+    fixture.app.profiles_cache.shells.?.profiles = &second;
+    try std.testing.expect(shellsDigest(&fixture.app.profiles_cache).? != before.?);
+    for ([_]?u64{ before, null }) |known| {
+        fixture.settle();
+        onShellsDetected(&fixture.app, known);
+        for (fixture.windows) |owner| {
+            try std.testing.expect(owner.palette.preparation.isPending());
+            try std.testing.expect(!owner.palette.popup.reuse_invalid);
+            try std.testing.expect(owner.palette.item_cache.stamp == 123);
+        }
+    }
+}
+
+/// Retire the hidden hosts of every owner (`invalidateWindow`): a system UI
+/// change (`onSystemChange`) applies to all of them, whichever window heard
+/// the broadcast first.
+pub fn invalidateApp(app: *App) void {
+    for (app.windows.items) |window| invalidateWindow(window);
+    if (app.quick_terminal) |qt| invalidateWindow(qt.window);
+}
+
+/// Only the outer GUI loop calls this, after dispatch and before GetMessage.
+/// Pending units are requested by owner creation (enabled by its first
+/// frame) and by configuration, language, DPI and launch profile
+/// notifications. One unit runs at a time, the hidden palette, main menu or
+/// settings of one owner, and the input queue is looked at again before the
+/// next: input waits for one unit at most, and the rest goes on at the next
+/// idle boundary. Owners take turns, from the one after the owner served
+/// last. No unit reads a file: what needs one (detecting the launch
+/// profiles, the palette history, the theme directories, the configuration
+/// layers) is left to the real opening (`Palette.prepare`, `prepareMain`,
+/// `Settings.prepare`).
+pub fn prepareIdle(app: *App) void {
+    prepareIdleWith(app, IdleOps);
+}
+
+/// What idle preparation asks of the system and does with a unit; the
+/// scheduling tests replace it.
+const IdleOps = struct {
+    /// Whether input waits. PeekMessage may dispatch sent messages, even
+    /// the destruction of an owner.
+    fn inputPending() bool {
+        var message: w32.MSG = undefined;
+        return w32.PeekMessageW(&message, null, 0, 0, 0) != 0;
+    }
+
+    fn eligible(window: *Window) bool {
+        return window.shown and window.first_frame_surface == null and
+            !window.closing and !window.palette.active and !Settings.isOpen(window);
+    }
+
+    /// One unit; with `GHOSTTY_GX_PERF` the time of one that prepared its
+    /// hidden host is `<ui>.prepare.idle`.
+    fn run(window: *Window, unit: Popup.Preparation.Unit) void {
+        const span = if (gx.perf.enabled()) gx.perf.Span.begin(global.io()) else null;
+        const prepared = switch (unit) {
+            .palette => window.palette.prepare(),
+            .main_menu => prepareMain(window),
+            .settings => Settings.prepare(window),
+        };
+        if (span) |value| if (prepared) {
+            _ = value.end(global.io(), switch (unit) {
+                .palette => "palette.prepare.idle",
+                .main_menu => "menu.prepare.idle",
+                .settings => "settings.prepare.idle",
+            });
+        };
+    }
+};
+
+/// The owner served last by `prepareIdle`; the next unit comes from the
+/// owner after it. GUI thread.
+var idle_turn: ui_ref.Reference = .{};
+
+fn prepareIdleWith(app: *App, comptime Ops: type) void {
+    while (!app.quit_requested) {
+        // Looking at the queue may dispatch sent messages, even the
+        // destruction of an owner: no Window is borrowed across it, and the
+        // next unit is found again among the owners left.
+        if (Ops.inputPending()) return;
+        const next = nextIdleUnit(app, Ops) orelse return;
+        idle_turn = next.owner.ui_reference;
+        Ops.run(next.owner, next.unit);
+    }
+}
+
+const IdleUnit = struct { owner: *Window, unit: Popup.Preparation.Unit };
+
+/// The next waiting unit of an eligible owner, taken from it, looking at
+/// the owners from the one after `idle_turn`.
+fn nextIdleUnit(app: *App, comptime Ops: type) ?IdleUnit {
+    const count = app.windows.items.len + @intFromBool(app.quick_terminal != null);
+    var start: usize = 0;
+    for (0..count) |i| {
+        if (idle_turn.matches(idleOwner(app, i).ui_reference)) {
+            start = i + 1;
+            break;
+        }
+    }
+    for (0..count) |step| {
+        const owner = idleOwner(app, (start + step) % count);
+        if (owner.palette.preparation.takeNext(Ops.eligible(owner))) |unit| return .{ .owner = owner, .unit = unit };
+    }
+    return null;
+}
+
+/// The owners of hidden UI: the windows, then the quick terminal.
+fn idleOwner(app: *App, index: usize) *Window {
+    return if (index < app.windows.items.len) app.windows.items[index] else app.quick_terminal.?.window;
+}
+
+/// Whether the launch profiles are detected for the current environment,
+/// so listing them (`App.cachedLaunchProfiles`) probes no file. Idle
+/// preparation leaves a detection to the real opening.
+pub fn launchProfilesCached(app: *App) bool {
+    var env = global.environMap() catch return false;
+    defer env.deinit();
+    return app.profiles_cache.isCurrent(&env);
+}
+
+/// Owners without an HWND and a record of the idle units that ran, for the
+/// scheduling tests: no desktop or message queue.
+const IdleFixture = struct {
+    /// Units that may run in this idle before input arrives.
+    var allowed: usize = 0;
+    var served: usize = 0;
+    /// Each unit as 10 × its owner's id + the unit.
+    var runs: [32]u64 = undefined;
+    var count: usize = 0;
+    /// The first unit destroys the owner at this index (a message dispatched
+    /// while the queue is looked at would).
+    var destroy: ?struct { app: *App, index: usize } = null;
+
+    fn inputPending() bool {
+        return served >= allowed;
+    }
+
+    fn eligible(window: *Window) bool {
+        return window.shown;
+    }
+
+    fn run(window: *Window, unit: Popup.Preparation.Unit) void {
+        served += 1;
+        runs[count] = 10 * window.ui_reference.id + @intFromEnum(unit);
+        count += 1;
+        if (destroy) |gone| {
+            destroy = null;
+            _ = gone.app.windows.orderedRemove(gone.index);
+        }
+    }
+
+    fn ran() []const u64 {
+        return runs[0..count];
+    }
+
+    /// One idle boundary at which input arrives after `units` units.
+    fn idle(app: *App, units: usize) void {
+        allowed = units;
+        served = 0;
+        prepareIdleWith(app, IdleFixture);
+    }
+
+    fn init(app: *App, windows: []Window, list: []*Window) void {
+        count = 0;
+        destroy = null;
+        idle_turn = .{};
+        app.* = undefined;
+        app.quit_requested = false;
+        app.quick_terminal = null;
+        for (windows, list, 1..) |*window, *slot, id| {
+            window.* = undefined;
+            window.palette = .{};
+            window.shown = true;
+            window.ui_reference = .{ .epoch = 1, .kind = .window, .id = id, .generation = 1 };
+            slot.* = window;
+        }
+        app.windows = .{ .items = list, .capacity = list.len };
+    }
+};
+
+test "P4 idle preparation looks at the input again after every unit" {
+    // The palette, the main menu and the settings of an owner are three
+    // units: input that arrives during one waits for that one only, and the
+    // others continue at the next idle.
+    const turn = idle_turn;
+    defer idle_turn = turn;
+    var app: App = undefined;
+    var windows: [1]Window = undefined;
+    var list: [1]*Window = undefined;
+    IdleFixture.init(&app, &windows, &list);
+    IdleFixture.idle(&app, 1);
+    try testing.expectEqualSlices(u64, &.{10}, IdleFixture.ran());
+    try testing.expectEqual(@as(usize, 2), windows[0].palette.preparation.pending.count());
+    IdleFixture.idle(&app, 0);
+    try testing.expectEqualSlices(u64, &.{10}, IdleFixture.ran());
+    IdleFixture.idle(&app, std.math.maxInt(usize));
+    try testing.expectEqualSlices(u64, &.{ 10, 11, 12 }, IdleFixture.ran());
+    try testing.expect(!windows[0].palette.preparation.isPending());
+    // Nothing waits: an idle boundary does nothing, polls nothing.
+    IdleFixture.idle(&app, std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 3), IdleFixture.count);
+    // A requested quit ends the preparation before its next unit.
+    windows[0].palette.preparation.request();
+    app.quit_requested = true;
+    IdleFixture.idle(&app, std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 3), IdleFixture.count);
+}
+
+test "P4 idle preparation advances every owner in turn" {
+    // Owners take turns, starting after the one served last, also across
+    // idle boundaries; an owner not shown yet keeps its units.
+    const turn = idle_turn;
+    defer idle_turn = turn;
+    var app: App = undefined;
+    var windows: [3]Window = undefined;
+    var list: [3]*Window = undefined;
+    IdleFixture.init(&app, &windows, &list);
+    windows[2].shown = false;
+    for (0..4) |_| IdleFixture.idle(&app, 1);
+    try testing.expectEqualSlices(u64, &.{ 10, 20, 11, 21 }, IdleFixture.ran());
+    IdleFixture.idle(&app, std.math.maxInt(usize));
+    try testing.expectEqualSlices(u64, &.{ 10, 20, 11, 21, 12, 22 }, IdleFixture.ran());
+    try testing.expectEqual(@as(usize, 3), windows[2].palette.preparation.pending.count());
+    windows[2].shown = true;
+    windows[0].palette.preparation.request();
+    IdleFixture.idle(&app, std.math.maxInt(usize));
+    try testing.expectEqualSlices(u64, &.{ 10, 20, 11, 21, 12, 22, 30, 10, 31, 11, 32, 12 }, IdleFixture.ran());
+}
+
+test "P4 idle preparation finds its owners again after every unit" {
+    // A message dispatched while the queue is looked at may destroy an owner:
+    // the next unit is found among the owners left, never through a pointer
+    // kept from before.
+    const turn = idle_turn;
+    defer idle_turn = turn;
+    var app: App = undefined;
+    var windows: [3]Window = undefined;
+    var list: [3]*Window = undefined;
+    IdleFixture.init(&app, &windows, &list);
+    IdleFixture.destroy = .{ .app = &app, .index = 1 };
+    IdleFixture.idle(&app, std.math.maxInt(usize));
+    try testing.expectEqualSlices(u64, &.{ 10, 30, 11, 31, 12, 32 }, IdleFixture.ran());
+    try testing.expectEqual(@as(usize, 3), windows[1].palette.preparation.pending.count());
+}
+
+/// The idle unit of the main menu: build it and prepare its hidden root
+/// host (`MenuPopup.prepare`), unless that needs a launch profile detection.
+fn prepareMain(window: *Window) bool {
+    if (MenuPopup.preferNative()) return false;
+    const owner = window.hwnd orelse return false;
+    const app = window.app;
+    if (!launchProfilesCached(app)) return false;
+    const host = menuHost(app) orelse return false;
+    var launch: ProfileItems = .init(app);
+    defer launch.deinit();
+    var menu: MenuPopup.Builder = .init(app.core_app.alloc);
+    defer menu.deinit();
+    buildMainMenu(&menu, app, &launch) catch return false;
+    MenuPopup.prepare(host, owner, &menu.root, .{
+        .anchor = menuButtonAnchor(window),
+        .alignment = .right,
+        .keyboard = true,
+        .owner_scale = window.scale,
+        .reuse_root = true,
+    });
+    return true;
+}
+
 fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     const hwnd = window.hwnd orelse return;
     if (window.closing) return;
@@ -716,6 +1225,7 @@ fn openMainMenu(window: *Window, placement: MenuPopup.Options) void {
     var options = placement;
     if (options.open_timing) |*timing| timing.lap(.prepare);
     options.owner_scale = window.scale;
+    options.reuse_root = true;
     const id = runMenu(app, hwnd, &menu.root, options) orelse return;
     if (!windowOpen(app, window, attachment)) return;
 
@@ -1292,8 +1802,10 @@ fn setMenuItemEnabled(menu: w32.HMENU, item: u32, enabled: bool) void {
     _ = EnableMenuItem(menu, item, MF_BYCOMMAND | if (enabled) MF_ENABLED else w32.MF_GRAYED);
 }
 
-/// Hook for a language change. Menus are built on demand, so the next one
-/// uses the new language; a menu that is open closes.
+/// Hook for a language change (`Window.onLanguageChanged`). Menus are built
+/// on demand, so the next one uses the new language; a menu that is open
+/// closes, and its hidden root host, retired by `invalidateWindow`, is
+/// freed when that session unwinds.
 pub fn onLanguageChanged() void {
     MenuPopup.cancel();
 }

@@ -285,6 +285,7 @@ const ItemCache = struct {
 };
 
 popup: Popup = .{},
+preparation: Popup.Preparation = .{},
 uia_attachment: gx.ui_ref.Attachment = .{},
 
 /// The keyboard shortcut sheet of the window (see `Keybinds.show`).
@@ -431,36 +432,9 @@ pub fn open(self: *Palette, page: Page) void {
     const pane = self.paneView();
     pane.dismissSearch();
     self.uia_attachment = pane.attachment();
-    const window = pane.ownerWindow();
     const app = pane.app();
-    const owner = window.hwnd orelse return;
-    const t = self.tokens();
     if (timing) |*value| value.lap(.prepare);
-    if (!ensurePopup(&self.popup, app, owner, .{
-        .activate = true,
-        .text_input = true,
-        .dismiss_on_escape = true,
-        .dismiss_on_outside_click = true,
-        .corners = .round,
-        .shadow = true,
-        .border_color = t.border,
-        .dark = t.dark,
-        .keep_owner_active = true,
-        .accessible_name = i18n.tr("Command Palette"),
-    }, .{
-        .ctx = self,
-        .paint = paint,
-        .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
-        .key = onKey,
-        .mouse = onMouse,
-        .text_changed = onTextChanged,
-        .composition_changed = onCompositionChanged,
-        .dismissed = onDismissed,
-        .dpi_changed = onPopupDpiChanged,
-    })) return;
-    self.popup.applyTheme(t);
-    self.popup.setOwnerScale(window.scale);
-    self.popup.setAccessibleName(i18n.tr("Command Palette"));
+    if (!self.prepareHost()) return;
     if (timing) |*value| value.lap(.create);
 
     self.active = true;
@@ -476,6 +450,71 @@ pub fn open(self: *Palette, page: Page) void {
     self.popup.open_timing = timing;
     self.popup.show(rect);
     _ = span.end(global.io(), "palette_open");
+}
+
+fn prepareHost(self: *Palette) bool {
+    const window = self.ownerWindow();
+    const app = window.app;
+    const owner = window.hwnd orelse return false;
+    const t = self.tokens();
+    if (!ensurePopup(&self.popup, app, owner, .{
+        .activate = true,
+        .text_input = true,
+        .dismiss_on_escape = true,
+        .dismiss_on_outside_click = true,
+        .corners = .round,
+        .shadow = true,
+        .border_color = t.border,
+        .dark = t.dark,
+        .keep_owner_active = true,
+        .accessible_name = i18n.tr("Command Palette"),
+        .reuse_host = true,
+    }, .{
+        .ctx = self,
+        .paint = paint,
+        .uia_source = .{ .app = app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
+        .key = onKey,
+        .mouse = onMouse,
+        .text_changed = onTextChanged,
+        .composition_changed = onCompositionChanged,
+        .dismissed = onDismissed,
+        .dpi_changed = onPopupDpiChanged,
+    })) return false;
+    self.popup.setOwnerScale(window.scale);
+    return true;
+}
+
+/// Event-driven idle preparation of the hidden root (`Menu.prepareIdle`).
+/// It reads no file: without the launch profiles detected for the current
+/// environment it does nothing, and the history and the recent themes
+/// (their state file and directories) wait for the real opening. Every
+/// opening rebuilds the entries; the host, its target and the bounded text
+/// cache survive. Returns whether it prepared.
+pub fn prepare(self: *Palette) bool {
+    if (self.active or self.ownerWindow().activePane() == null) return false;
+    if (!@import("Menu.zig").launchProfilesCached(self.ownerWindow().app)) return false;
+    if (!self.prepareHost()) return false;
+    self.page = .root;
+    self.popup.input.clear();
+    self.mouse = null;
+    self.buildItemsReading(.memory);
+    self.refilter(.navigation);
+    self.popup.prepareHidden(self.bounds() orelse return false);
+    return true;
+}
+
+/// The hidden host is stale (`Menu.invalidateWindow`): the next opening
+/// rebuilds it and its entries, and idle preparation is asked to.
+pub fn invalidateHost(self: *Palette) void {
+    self.preparation.request();
+    self.retireHost();
+}
+
+/// Mark the hidden host and its cached entries stale without asking idle
+/// preparation to rebuild them (a theme preview step).
+pub fn retireHost(self: *Palette) void {
+    self.popup.reuse_invalid = true;
+    self.item_cache.stamp = null;
 }
 
 /// Hide the palette, ending a theme preview; `restore_focus` gives the
@@ -506,12 +545,14 @@ pub fn reposition(self: *Palette) void {
 
 /// The DPI of the surface changed: resize the palette.
 pub fn onDpiChanged(self: *Palette) void {
+    @import("Menu.zig").invalidateWindow(self.ownerWindow());
     self.reposition();
     self.keybinds.reposition();
 }
 
 /// The UI language changed: retranslate the entries.
 pub fn onLanguageChanged(self: *Palette) void {
+    @import("Menu.zig").invalidateWindow(self.ownerWindow());
     self.keybinds.onLanguageChanged();
     if (!self.active) return;
     self.buildItems();
@@ -559,6 +600,15 @@ fn bounds(self: *Palette) ?w32.RECT {
 
 /// Collect the entries for a new session.
 fn buildItems(self: *Palette) void {
+    self.buildItemsReading(.files);
+}
+
+/// What collecting the entries reads: an opening loads the history and lists
+/// the theme directories for the recent themes, idle preparation reads only
+/// what is in memory (without them).
+const Reads = enum { files, memory };
+
+fn buildItemsReading(self: *Palette, reads: Reads) void {
     if (self.arena) |*arena| {
         _ = arena.reset(.retain_capacity);
     } else {
@@ -567,14 +617,14 @@ fn buildItems(self: *Palette) void {
     const a = self.arena.?.allocator();
     self.items = .empty;
     self.theme_dirs = &.{};
-    loadHistory(self.alloc());
+    if (reads == .files) loadHistory(self.alloc());
 
     self.refreshItemCache() catch |err| log.warn("palette entries unavailable err={}", .{err});
     self.addTabs(a) catch |err| log.warn("palette tabs unavailable err={}", .{err});
     self.items.appendSlice(a, self.item_cache.entries) catch |err| log.warn("palette entries unavailable err={}", .{err});
     self.themes_start = self.items.items.len;
     self.themes_expanded = false;
-    if (!history.isEmpty()) self.addThemes(a, .recent) catch |err| log.warn("palette themes unavailable err={}", .{err});
+    if (reads == .files and !history.isEmpty()) self.addThemes(a, .recent) catch |err| log.warn("palette themes unavailable err={}", .{err});
     self.loadRanks(0);
 }
 
@@ -1330,7 +1380,7 @@ fn run(self: *Palette, index: usize, how: model.EnterAction) void {
         },
         .theme => |theme| if (how == .keep_open) {
             self.remember(item);
-            self.applyKeepOpen(index, theme.name);
+            self.applyKeepOpen(theme.name);
             return;
         },
         .clear_history => {
@@ -1396,19 +1446,114 @@ fn cloneTarget(target: Target, allocator: Allocator) !Target {
     };
 }
 
-/// Save theme `index` as the theme and keep the palette open on it.
-fn applyKeepOpen(self: *Palette, index: usize, name: []const u8) void {
+/// Save theme `name` as the theme and keep the palette open on it. Saving
+/// reloads the configuration; the session's entries then show its theme
+/// as a palette opened afresh does (`followTheme`).
+fn applyKeepOpen(self: *Palette, name: []const u8) void {
     const window = self.ownerWindow();
     self.endPreview(false);
     if (!saveSetting(window, "theme", name)) return;
-    for (self.items.items, 0..) |*item, i| {
-        if (item.group != .themes) continue;
-        item.current = i == index;
-        item.detail = if (item.current) i18n.tr("Current Theme") else "";
-    }
+    const current = gx.settings_map.themeName(window.app.config.theme);
+    if (self.arena) |*arena| followTheme(self.items.items, current, arena.allocator()) catch |err| {
+        log.warn("palette theme entries not refreshed err={}", .{err});
+    };
     if (!self.active) return;
     self.popup.applyTheme(self.tokens());
     self.popup.invalidate();
+}
+
+/// Show `current` (the configuration's theme, null for none or a light and
+/// dark pair) as the current theme in the session's `items`, as `addPages`
+/// and `addThemes` do for a new session: its row is marked, and "Change
+/// Theme…" names it on the root. `a` owns the new detail.
+fn followTheme(items: []Item, current: ?[]const u8, a: Allocator) !void {
+    const detail: []const u8 = if (current) |name| try a.dupe(u8, name) else "";
+    for (items) |*item| switch (item.target) {
+        .theme => |theme| {
+            item.current = if (current) |name| std.mem.eql(u8, name, theme.name) else false;
+            item.detail = if (item.current) i18n.tr("Current Theme") else "";
+        },
+        .page => |page| if (page == .themes) {
+            item.detail = detail;
+        },
+        else => {},
+    };
+}
+
+test "D13: a theme saved with the palette open shows on the root like a new session" {
+    const testing = std.testing;
+    const T = struct {
+        fn theme(name: []const u8, index: u32, rank: u64, current: bool) Item {
+            return .{
+                .group = .themes,
+                .icon = 0,
+                .title = name,
+                .title_en = name,
+                .name = name,
+                .name_en = name,
+                .detail = if (current) i18n.tr("Current Theme") else "",
+                .current = current,
+                .rank = rank,
+                .target = .{ .theme = .{ .name = name, .index = index } },
+            };
+        }
+        fn page(detail: []const u8) Item {
+            return .{ .group = .commands, .icon = 0, .title = "Change Theme…", .title_en = "Change Theme…", .name = "Change Theme…", .name_en = "Change Theme…", .detail = detail, .key = "page:themes", .rank = 2, .target = .{ .page = .themes } };
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // The session opened on Nord; Shift+Enter saved Nord Light, which the
+    // picks now rank first (`remember`).
+    var session = [_]Item{ T.page("Nord"), T.theme("Nord", 0, 0, true), T.theme("Nord Light", 1, 3, false), T.theme("Dracula", 2, 1, false) };
+    try followTheme(&session, "Nord Light", arena.allocator());
+    try testing.expectEqualStrings("Nord Light", session[0].detail);
+    try testing.expect(!session[1].current and session[2].current and !session[3].current);
+    try testing.expectEqualStrings("", session[1].detail);
+    try testing.expectEqualStrings(i18n.tr("Current Theme"), session[2].detail);
+
+    // Back on the root it lists what a palette opened on Nord Light lists:
+    // "Change Theme…" naming it and the other recent picks, the current
+    // theme left out like the current tab.
+    var fresh = [_]Item{ T.page("Nord Light"), T.theme("Nord", 0, 0, false), T.theme("Nord Light", 1, 3, true), T.theme("Dracula", 2, 1, false) };
+    var after: Palette = .{ .items = .{ .items = &session, .capacity = session.len } };
+    defer after.rows.deinit(testing.allocator);
+    try after.listRoot(testing.allocator);
+    var reopened: Palette = .{ .items = .{ .items = &fresh, .capacity = fresh.len } };
+    defer reopened.rows.deinit(testing.allocator);
+    try reopened.listRoot(testing.allocator);
+    try testing.expectEqual(reopened.rows.items.len, after.rows.items.len);
+    for (after.rows.items, reopened.rows.items) |row, expected| switch (expected.kind) {
+        .header => |group| try testing.expectEqual(group, row.kind.header),
+        .item => |i| {
+            const item = after.items.items[row.kind.item];
+            try testing.expectEqualStrings(fresh[i].title, item.title);
+            try testing.expectEqualStrings(fresh[i].detail, item.detail);
+        },
+    };
+    try testing.expectEqual(Group.recent, after.rows.items[0].kind.header);
+    try testing.expectEqual(@as(usize, 0), after.rows.items[1].kind.item);
+    try testing.expectEqual(@as(usize, 3), after.rows.items[2].kind.item);
+}
+
+test "D13: a reused palette host rebuilds its entries for a changed theme" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    const hints_: trigger.Hints = .{ .set = &config.keybind.set };
+    config.theme = .{ .light = "Nord", .dark = "Nord" };
+    const nord = configStamp(&config, hints_);
+    // The cached static entries ("Change Theme…" and the theme it names)
+    // belong to one theme: the next opening of a hidden host rebuilds them.
+    config.theme = .{ .light = "Nord Light", .dark = "Nord Light" };
+    try testing.expect(configStamp(&config, hints_) != nord);
+    // A configuration change also retires the hidden host and its cache.
+    var palette: Palette = .{};
+    palette.item_cache.stamp = nord;
+    palette.preparation.pending = .initEmpty();
+    palette.invalidateHost();
+    try testing.expect(palette.item_cache.stamp == null);
+    try testing.expect(palette.popup.reuse_invalid and palette.preparation.isPending());
 }
 
 /// Remember a pick of `item` and what was typed before it.
@@ -1568,7 +1713,8 @@ fn applyTheme(self: *Palette, theme: ?[]const u8) void {
     };
     defer config.deinit();
     gx.perf.count("theme.reload", 1);
-    app.applyConfig(&config) catch |err| {
+    const applied = if (theme != null) @import("Menu.zig").applyThemePreview(app, &config) else app.applyConfig(&config);
+    applied catch |err| {
         log.warn("cannot apply a theme preview err={}", .{err});
         return;
     };
@@ -2420,7 +2566,7 @@ pub fn ensurePopup(
     callbacks: Popup.Callbacks,
 ) bool {
     if (popup.hwnd != null) {
-        if (popupAlive(popup) and popup.owner == owner and popup.options.dark == options.dark) return true;
+        if (!popup.reuse_invalid and popupAlive(popup) and popup.owner == owner and popup.options.dark == options.dark) return true;
         releasePopup(popup);
     }
     const factory = app.uiFactory() orelse return false;

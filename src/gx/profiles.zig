@@ -600,6 +600,12 @@ pub const Cache = struct {
         self.shells = null;
     }
 
+    /// Whether `list` would return the shells already detected, for `env`
+    /// of the running system, without probing the file system again.
+    pub fn isCurrent(self: *const Cache, env: *const std.process.Environ.Map) bool {
+        return self.shells != null and self.key == fingerprint(.native, env);
+    }
+
     pub fn deinit(self: *Cache) void {
         self.invalidate();
         self.* = undefined;
@@ -1132,6 +1138,24 @@ test "Cache detects again only when the environment changes" {
     list = try cache.listFor(testing.allocator, with_distro, &.{});
     list.deinit();
     try testing.expectEqual(@as(u64, 4), cache.detections);
+}
+
+test "Cache.isCurrent says whether listing would detect again" {
+    // Idle preparation lists the profiles only when that probes nothing.
+    const testing = std.testing;
+    var env = try testEnv(testing.allocator, &.{.{ "PATH", "C:\\Windows" }});
+    defer env.deinit();
+    var cache: Cache = .{};
+    defer cache.deinit();
+    try testing.expect(!cache.isCurrent(&env));
+    cache.store(.{ .arena = .init(testing.allocator), .profiles = &.{} }, fingerprint(.native, &env));
+    try testing.expect(cache.isCurrent(&env));
+    try env.put("PATH", "C:\\Tools");
+    try testing.expect(!cache.isCurrent(&env));
+    try env.put("PATH", "C:\\Windows");
+    try testing.expect(cache.isCurrent(&env));
+    cache.invalidate();
+    try testing.expect(!cache.isCurrent(&env));
 }
 
 test "fingerprint covers the variables detection reads" {

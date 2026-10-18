@@ -1343,9 +1343,15 @@ pub const TextLayout = struct {
         return .{ .ptr = l, .len = @intCast(text.len), .weight = style.weight };
     }
 
+    /// Own a reference to the factory's bounded text cache. Callers only read
+    /// the base layout; Canvas.drawLayout restores its temporary run effects.
+    /// The reference remains valid if the cache evicts its own reference.
     pub fn initUtf8(factory: *Factory, text: []const u8, style: TextStyle, max_w: f32, max_h: f32) ?TextLayout {
-        const l = factory.createLayout(text, style, max_w, max_h) orelse return null;
-        return .{ .ptr = l, .len = @intCast(wstr.utf16Len(text)), .weight = style.weight };
+        const ref = factory.layout(text, style, max_w, max_h) orelse return null;
+        defer ref.deinit();
+        const unknown: *const *const IUnknownVtbl = @ptrCast(@alignCast(ref.layout));
+        _ = unknown.*.AddRef(@ptrCast(ref.layout));
+        return .{ .ptr = ref.layout, .len = @intCast(wstr.utf16Len(text)), .weight = style.weight };
     }
 
     pub fn deinit(self: *TextLayout) void {
@@ -2426,6 +2432,65 @@ test "ChromeAlpha native explicitly software DC and BitBlt preserve linear BGRA"
     }
     try testing.expectEqualSlices(u8, &.{ 0x1c, 0x1c, 0x1c, 0x03 }, std.mem.asBytes(&pixels[0]));
     try testing.expectEqualSlices(u8, &.{ 0x95, 0x95, 0x95, 0x4d }, std.mem.asBytes(&pixels[16]));
+}
+
+test "P4 styled text reuses bounded layouts and restores plain pixels" {
+    const testing = std.testing;
+    const factory = try Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = Canvas.init(factory);
+    defer canvas.deinit();
+    canvas.target = .{ .dc = canvas.createDcTarget(D2D1_RENDER_TARGET_TYPE_SOFTWARE, true, 96) orelse return error.SoftwareD2DUnavailable };
+    canvas.dc_alpha = true;
+    var output: DibTarget = .{};
+    defer output.deinit();
+    const pixels_size: SizeU = .{ .width = 256, .height = 48 };
+    const rect: Rect = .{ .x = 0, .y = 0, .w = 256, .h = 48 };
+    const text = "Menu and shortcuts";
+    const text_style: TextStyle = .{ .color = .black, .size = 14 };
+    const runs = [_]TextRun{.{ .start = 0, .len = 4, .color = .{ .r = 1, .g = 0, .b = 0 }, .weight = .bold, .underline = true }};
+    const before = factory.cachedLayouts();
+    _ = output.ensure(null, 256, 48) orelse return error.CreateDibFailed;
+    try testing.expect(canvas.beginDib(&output, pixels_size, 96));
+    canvas.clear(.white);
+    canvas.drawTextRuns(text, rect, text_style, &runs);
+    try testing.expectEqual(EndResult.ok, canvas.finish());
+    try testing.expect(before + 1 == factory.cachedLayouts());
+
+    try testing.expect(canvas.beginDib(&output, pixels_size, 96));
+    canvas.clear(.white);
+    canvas.drawText(text, rect, text_style);
+    try testing.expectEqual(EndResult.ok, canvas.finish());
+    try testing.expect(GdiFlush() != 0);
+    const pixels: [*]const u32 = @ptrCast(@alignCast(output.bits.?));
+    const plain = try testing.allocator.dupe(u32, pixels[0 .. 256 * 48]);
+    defer testing.allocator.free(plain);
+    const cached = (factory.layout(text, text_style, rect.w, rect.h) orelse return error.LayoutFailed).layout;
+    for (0..100) |_| {
+        try testing.expect(canvas.beginDib(&output, pixels_size, 96));
+        canvas.clear(.white);
+        canvas.drawTextRuns(text, rect, text_style, &runs);
+        try testing.expectEqual(EndResult.ok, canvas.finish());
+        try testing.expect(canvas.beginDib(&output, pixels_size, 96));
+        canvas.clear(.white);
+        canvas.drawText(text, rect, text_style);
+        try testing.expectEqual(EndResult.ok, canvas.finish());
+        try testing.expect(GdiFlush() != 0);
+        try testing.expectEqualSlices(u32, plain, pixels[0 .. 256 * 48]);
+        try testing.expectEqual(before + 1, factory.cachedLayouts());
+        try testing.expectEqual(cached, (factory.layout(text, text_style, rect.w, rect.h) orelse return error.LayoutFailed).layout);
+    }
+    var held = TextLayout.initUtf8(factory, text, text_style, rect.w, rect.h) orelse return error.LayoutFailed;
+    defer held.deinit();
+    factory.text_cache.clear(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), factory.cachedLayouts());
+    try testing.expect(held.size().width > 0);
+    try testing.expect(canvas.beginDib(&output, pixels_size, 96));
+    canvas.clear(.white);
+    canvas.drawLayout(&held, .{ .x = rect.x, .y = rect.y }, .black, &.{});
+    try testing.expectEqual(EndResult.ok, canvas.finish());
+    try testing.expect(GdiFlush() != 0);
+    try testing.expectEqualSlices(u32, plain, pixels[0 .. 256 * 48]);
 }
 
 test "opticalSize follows the Fluent type ramp" {

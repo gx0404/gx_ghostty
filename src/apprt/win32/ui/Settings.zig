@@ -36,9 +36,16 @@
 //! configuration file) after a short pause; a failed save keeps the
 //! changes, shows the reason and tries again with a growing delay
 //! (`settings/model.zig`). The configuration is then rebuilt from a
-//! `gx.config_layers.Layers` snapshot read when the overlay opens (no file
-//! is read again; the snapshot follows the changes made here) and the rows
-//! show the values it ends up with. "Reset to Default" (the ↺ button next to
+//! `gx.config_layers.Layers` snapshot (no file is read again; the snapshot
+//! follows the changes made here) and the rows show the values it ends up
+//! with. The snapshot, the theme directories and the launch profiles are
+//! read by the first opening after they became stale (`loadData`) and kept
+//! with the hidden overlay of the window between openings; any configuration
+//! change, a UI language, DPI or system UI change, and launch profiles
+//! detected anew make them stale (`onConfigChange`, `invalidateOwner`,
+//! `invalidateData`). Idle preparation never reads them (`prepare`); a
+//! change of the files by another program shows after a reload.
+//! "Reset to Default" (the ↺ button next to
 //! a setting that the settings file sets, or Delete) removes the key from
 //! the file, so the configuration file or the default applies again (D13);
 //! a value that comes from the configuration file or the command line says
@@ -60,7 +67,8 @@
 //! F6 focuses the sidebar search; labels, section names and configuration
 //! keys match across all six sections, and Enter reveals a result.
 //!
-//! There is one overlay per process, shown over one window at a time.
+//! Each owner retains at most one hidden overlay, with only one shown at a
+//! time. Configuration changes invalidate cached data and the next host.
 //! `Window` calls `onWindowDestroyed` when a window goes away.
 const Settings = @This();
 
@@ -148,20 +156,22 @@ const max_hits = 192;
 /// listed.
 pub const WM_FONTS_READY: u32 = w32.WM_APP + 2;
 
-/// The overlay, created by the first `show`.
+/// The currently selected overlay; hidden owners live in `instances`.
 var instance: ?*Settings = null;
+var instances: ?*Settings = null;
 
 alloc: Allocator,
 app: *App,
 window: *Window,
+next: ?*Settings = null,
+data_ready: bool = false,
 
 popup: Popup = .{},
 uia_attachment: gx.ui_ref.Attachment = .{},
 scrim: Scrim = .{},
 tooltip: Tooltip = .{},
 
-/// Owns the data loaded when the overlay opens (paths, shells, theme
-/// directories); reset when it closes.
+/// Cached paths, layers, shells and theme directories, reset on invalidation.
 arena: ArenaAllocator,
 /// Owns the strings of the rows built since the last paint.
 scratch: ArenaAllocator,
@@ -259,6 +269,11 @@ status_len: usize = 0,
 /// Hit-test rectangles of the last paint, later ones on top.
 hits: [max_hits]Hit = undefined,
 hit_count: usize = 0,
+/// The hits (targets and places) the published accessible model was built
+/// from (`uiaBuild`), as `hitsDigest`; null when none is published. Its
+/// tokens name hits by position, so a paint that lays them out anew revokes
+/// it (`checkUiaHits`).
+uia_hits: ?u64 = null,
 /// While the body paints: the body, which the hit rectangles of its rows
 /// are cut to (`hit_test.clip`).
 hit_clip: ?d2d.Rect = null,
@@ -283,21 +298,31 @@ const Tip = union(enum) {
 pub fn show(window: *Window) bool {
     const timing = Popup.OpenTiming.begin(.settings);
     if (!gx.config_layers.enabled(window.app.core_app.alloc) or window.app.uiFactory() == null) return openConfigInstead(window.app);
-    if (instance) |self| {
-        if (self.window == window) {
-            if (self.open) {
-                if (self.popup.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
-                return true;
-            }
-            return self.openOverlay(timing);
-        }
-        self.destroy();
+    const self = acquire(window) orelse return false;
+    if (instance) |old| if (old != self and old.open) old.finish(.deactivated);
+    instance = self;
+    if (self.open) {
+        if (self.popup.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
+        return true;
     }
+    return self.openOverlay(timing, false);
+}
+
+fn find(window: *Window) ?*Settings {
+    var it = instances;
+    while (it) |self| : (it = self.next) {
+        if (self.window == window) return self;
+    }
+    return null;
+}
+
+fn acquire(window: *Window) ?*Settings {
+    if (find(window)) |self| return self;
 
     const alloc = window.app.core_app.alloc;
     const self = alloc.create(Settings) catch |err| {
         log.err("cannot create the settings overlay err={}", .{err});
-        return false;
+        return null;
     };
     self.* = .{
         .alloc = alloc,
@@ -307,9 +332,67 @@ pub fn show(window: *Window) bool {
         .scratch = .init(alloc),
         .font_arena = .init(alloc),
         .changes = .init(alloc),
+        .next = instances,
     };
-    instance = self;
-    return self.openOverlay(timing);
+    instances = self;
+    return self;
+}
+
+test "P4 reuse keeps independent settings owners for 100 acquire close cycles" {
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core;
+    var a: Window = undefined;
+    var b: Window = undefined;
+    a.app = &app;
+    b.app = &app;
+    a.hwnd = null;
+    b.hwnd = null;
+    defer onWindowDestroyed(&a);
+    defer onWindowDestroyed(&b);
+    const first = acquire(&a).?;
+    const second = acquire(&b).?;
+    try std.testing.expect(find(&a) != null);
+    try std.testing.expect(first != second);
+    first.data_ready = true;
+    second.data_ready = true;
+    first.config_path = try first.arena.allocator().dupe(u8, "fixture-config");
+    const storage = first.config_path.ptr;
+    for (0..100) |_| {
+        try std.testing.expectEqual(first, acquire(&a).?);
+        first.open = true;
+        first.finish(.deactivated);
+        try std.testing.expectEqual(second, acquire(&b).?);
+        second.open = true;
+        second.finish(.deactivated);
+        try std.testing.expectEqual(storage, first.config_path.ptr);
+        try std.testing.expect(first.data_ready and second.data_ready);
+    }
+    invalidateOwner(&a);
+    try std.testing.expect(!first.data_ready and first.popup.reuse_invalid);
+    try std.testing.expect(second.data_ready and !second.popup.reuse_invalid);
+    invalidateData(&b);
+    try std.testing.expect(!second.data_ready and !second.popup.reuse_invalid);
+}
+
+test "P4 idle preparation leaves settings without read data to the opening" {
+    // Reading the configuration layers, the theme directories and the
+    // launch profiles is file work: idle preparation never does it, and
+    // creates no overlay for a window that has none.
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core;
+    var window: Window = undefined;
+    window.app = &app;
+    window.hwnd = null;
+    defer onWindowDestroyed(&window);
+    try std.testing.expect(!prepare(&window));
+    try std.testing.expect(find(&window) == null);
+    const self = acquire(&window).?;
+    try std.testing.expect(!prepare(&window));
+    try std.testing.expect(!self.data_ready and self.layers == null and self.popup.hwnd == null);
 }
 
 /// Like `show`, then switch to `section`: the command palette's
@@ -325,21 +408,60 @@ pub fn showSection(window: *Window, section: Section) bool {
 /// `window` is going away: save pending changes, end a theme preview and
 /// destroy the overlay if it belongs to that window.
 pub fn onWindowDestroyed(window: *Window) void {
-    const self = instance orelse return;
-    if (self.window != window) return;
-    self.destroy();
+    if (window.hwnd) |owner| @import("MenuPopup.zig").onOwnerDestroyed(owner);
+    if (find(window)) |self| self.destroy();
+}
+
+pub fn isOpen(window: *Window) bool {
+    const self = find(window) orelse return false;
+    return self.open;
+}
+
+pub fn invalidateOwner(window: *Window) void {
+    const self = find(window) orelse return;
+    self.data_ready = false;
+    self.popup.reuse_invalid = true;
+}
+
+/// The launch profiles were detected again with another result
+/// (`Menu.onShellsDetected`): read the data again at the next opening. The
+/// host stays, and an open overlay keeps what it shows.
+pub fn invalidateData(window: *Window) void {
+    const self = find(window) orelse return;
+    self.data_ready = false;
+}
+
+/// Idle preparation (`Menu.prepareIdle`) of the hidden overlay of
+/// `window`: lay it out and paint it hidden, only with the data an earlier
+/// opening read and nothing made stale since. It reads no file: the
+/// configuration layers, the theme directories and the launch profiles are
+/// read by the next opening (`loadData`). Returns whether it prepared.
+pub fn prepare(window: *Window) bool {
+    if (!gx.config_layers.enabled(window.app.core_app.alloc)) return false;
+    const self = find(window) orelse return false;
+    if (self.open or !self.data_ready) return false;
+    return self.openOverlay(null, true);
 }
 
 pub fn onConfigChange(app: *App) void {
-    const self = instance orelse return;
-    if (self.app != app or !self.open or self.applying) return;
+    var it = instances;
+    while (it) |self| : (it = self.next) {
+        if (self.app != app) continue;
+        self.data_ready = false;
+        self.popup.reuse_invalid = true;
+        if (!self.open or self.applying) continue;
+        self.followConfigChange();
+    }
+}
+
+fn followConfigChange(self: *Settings) void {
     self.stopTimer(.preview);
     self.preview_theme = null;
     self.applied_preview = null;
     self.followReload();
-    self.applied_inputs = inputsDigest(&app.config);
+    self.applied_inputs = inputsDigest(&self.app.config);
     self.swatches.deinit(self.alloc);
-    self.loadThemes(&app.config);
+    self.loadThemes(&self.app.config);
     self.loadShells();
     self.configApplied(false);
     self.popup.setAccessibleName(i18n.tr(msg.settings));
@@ -383,21 +505,41 @@ fn destroy(self: *Settings) void {
     self.arena.deinit();
     self.scratch.deinit();
     if (instance == self) instance = null;
+    var link = &instances;
+    while (link.*) |entry| : (link = &entry.next) {
+        if (entry != self) continue;
+        link.* = self.next;
+        break;
+    }
     self.alloc.destroy(self);
 }
 
-fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
+fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming, preparing: bool) bool {
     var timing = opened;
     const owner = self.window.hwnd orelse return false;
     if (self.window.closing) return false;
     self.uia_attachment = self.window.ui_attachment;
-    const factory = self.app.uiFactory() orelse return openConfigInstead(self.app);
+    const factory = self.app.uiFactory() orelse return if (preparing) false else openConfigInstead(self.app);
     const t = self.tokens();
     // Until the first frame is painted (`Popup.show` paints at once).
-    const span: gx.perf.Span = .begin(global.io());
-    defer _ = span.end(global.io(), "settings_open");
+    const span = if (!preparing) gx.perf.Span.begin(global.io()) else null;
+    defer if (span) |value| {
+        _ = value.end(global.io(), "settings_open");
+    };
     if (timing) |*value| value.lap(.prepare);
 
+    if (self.popup.reuse_invalid) {
+        // Detach asynchronous HWND recipients before replacing a hidden host.
+        if (self.font_loader) |loader| {
+            loader.detach();
+            self.fonts_checked = false;
+        }
+        self.font_loader = null;
+        inline for (comptime std.enums.values(Timer)) |timer| self.stopTimer(timer);
+        self.tooltip.destroy();
+        self.popup.destroy();
+        self.scrim.destroy();
+    }
     if (self.popup.hwnd == null) {
         self.popup.create(self.app.hinstance, owner, factory, .{
             .activate = true,
@@ -408,8 +550,8 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
             .text_input = true,
             .border_color = t.border,
             .dark = t.dark,
-            .release_target_on_hide = true,
             .accessible_name = i18n.tr(msg.settings),
+            .reuse_host = true,
         }, .{
             .ctx = self,
             .paint = paint,
@@ -424,11 +566,8 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
             .message = onMessage,
         }) catch |err| {
             log.err("cannot create the settings popup err={}", .{err});
-            return openConfigInstead(self.app);
+            return if (preparing) false else openConfigInstead(self.app);
         };
-    } else {
-        self.popup.applyTheme(t);
-        self.popup.setAccessibleName(i18n.tr(msg.settings));
     }
     if (self.scrim.hwnd == null) {
         self.scrim.create(self.app.hinstance, owner, scrim_alpha, .{
@@ -440,9 +579,21 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
         };
     }
 
+    // A replaced HWND also replaced its timers. Hidden failed saves and the
+    // user's existing shell helper keep their bounded retry/poll lifecycle.
+    if (!self.changes.isEmpty() and !self.timers.contains(.save)) {
+        if (model.saveRetryDelayMs(self.save_attempts)) |delay| self.startTimer(.save, delay);
+    }
+    if (self.herdr_run != null and !self.timers.contains(.herdr)) self.startTimer(.herdr, herdr_poll_ms);
+
     if (timing) |*value| value.lap(.create);
-    self.loadData();
+    if (!self.data_ready) self.loadData();
+    self.theme_query.clearRetainingCapacity();
+    self.font_query.clearRetainingCapacity();
+    self.refilter(.themes);
+    self.refilter(.fonts);
     self.clearStatus();
+    self.pointer = null;
     self.hover = null;
     self.pressed = null;
     self.focus_visible = false;
@@ -452,15 +603,18 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming) bool {
     self.enterSection(self.section);
 
     self.popup.setOwnerScale(self.window.scale);
+    const rect = self.popupRect(owner);
+    if (preparing) {
+        self.popup.prepareHidden(rect);
+        return true;
+    }
     const maximized = w32.IsZoomed(owner) != 0 or self.window.title_bar.is_fullscreen;
     self.scrim.show(Scrim.visibleBounds(owner), !maximized);
-    const rect = self.popupRect(owner);
     if (timing) |*value| value.lap(.layout);
     self.popup.open_timing = timing;
+    self.open = true;
     self.popup.show(rect);
     self.opened_ms = system.nowMs();
-    self.open = true;
-    self.popup.invalidate();
     return true;
 }
 
@@ -494,7 +648,6 @@ fn finish(self: *Settings, how: Close) void {
     self.popup.hide();
     self.text_field = null;
     self.popup.input.clear();
-    self.releaseData();
     if (how == .user) self.window.focusActiveSurface();
 }
 
@@ -583,8 +736,39 @@ fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api
     const rows = self.buildRows(&buf);
     var states: [max_hits]uia_bridge.ControlState = undefined;
     for (self.hits[0..self.hit_count], 0..) |hit, index| states[index] = self.uiaControlState(hit.target, rows);
+    const published = bridge.publisher.current;
     try bridge.publishSettings(api, queue, self.uia_attachment, self, rows, states[0..self.hit_count], .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+    if (bridge.publisher.current != published) self.notePublishedHits();
 }
+
+/// The hits of the last paint are what the accessible model now published
+/// was built from.
+fn notePublishedHits(self: *Settings) void {
+    self.uia_hits = self.hitsDigest();
+}
+
+/// The targets and places of the hits of the last paint.
+fn hitsDigest(self: *const Settings) u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    std.hash.autoHash(&hasher, self.hit_count);
+    for (self.hits[0..self.hit_count]) |hit| {
+        std.hash.autoHash(&hasher, hit.target);
+        hasher.update(std.mem.asBytes(&hit.rect));
+    }
+    return hasher.final();
+}
+
+/// After a paint laid the hits out: when they differ from those of the
+/// published accessible model (a scroll that revealed the focus, another
+/// section), its elements would act on other controls now. Revoke them; the
+/// paint publishes the new layout (`Popup.uiaLayoutChanged`).
+fn checkUiaHits(self: *Settings) void {
+    const published = self.uia_hits orelse return;
+    if (published == self.hitsDigest()) return;
+    self.uia_hits = null;
+    self.popup.uiaLayoutChanged();
+}
+
 fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
     const self: *Settings = @ptrCast(@alignCast(context));
     if (!uiaLive(context)) return false;
@@ -642,8 +826,7 @@ fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
             else => return false,
         }
         if (!Popup.uiaAlive(hwnd, cookie)) return false;
-        self.focus_visible = true;
-        self.invalidate();
+        self.showUiaFocus();
         _ = w32.SetFocus(hwnd);
         return true;
     }
@@ -654,6 +837,219 @@ fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
         else => self.click(target),
     }
     return true;
+}
+
+fn showUiaFocus(self: *Settings) void {
+    self.focus_visible = true;
+    // Focus rings do not change the hit-token mapping. Earlier helpers may
+    // have committed an edit and invalidated it; repaint must not undo that.
+    self.popup.repaint();
+}
+
+test "UIA settings focus preserves the retained Toggle provider until a model edit" {
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Settings", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Scrollbar", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.destroy();
+    // Popup.create normally supplies the input allocator; this fixture never
+    // creates an HWND, so initialize the same ownership explicitly.
+    self.popup.input.alloc = testing.allocator;
+    try self.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    const snapshot = self.popup.uia_view.publisher.current.?;
+    const provider = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(provider.vtable));
+    _ = abi.AddRef(provider);
+    defer _ = abi.Release(provider);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    self.showUiaFocus();
+    try testing.expect(self.focus_visible);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // Entering an editor is focus-only; applying/leaving an edited value is
+    // not, and continues to use the original model invalidation paths.
+    self.focusSearch(false);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    self.beginSizeEdit("14", true);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    self.invalidate();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+    try testing.expect(!self.popup.uia_view.publisher.accepts(action));
+}
+
+test "UIA settings hover and press feedback keep the retained provider" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Settings", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Scrollbar", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.destroy();
+    // Popup.create normally supplies the input allocator; this fixture never
+    // creates an HWND, so initialize the same ownership explicitly.
+    self.popup.input.alloc = testing.allocator;
+    try self.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    const snapshot = self.popup.uia_view.publisher.current.?;
+    const provider = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(provider.vtable));
+    _ = abi.AddRef(provider);
+    defer _ = abi.Release(provider);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    // The pointer moving over the overlay and leaving it only changes colors.
+    self.setHover(.close);
+    self.setHover(.{ .row = 1 });
+    self.setHover(null);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // Pressing a button or a row shows it pressed; it acts on release. A
+    // press on a field only moves the focus.
+    self.press(&self.popup, .close, false);
+    try testing.expect(std.meta.eql(self.pressed, @as(?Target, .close)));
+    self.press(&self.popup, .{ .row = 1 }, false);
+    self.press(&self.popup, .{ .field = 0 }, false);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    // Released elsewhere, and a press on empty space: only the look changes.
+    onMouse(&self, &self.popup, .{ .kind = .up, .button = .left, .pos = .{ .x = -100, .y = -100 } });
+    try testing.expect(self.pressed == null);
+    onMouse(&self, &self.popup, .{ .kind = .down, .button = .left, .pos = .{ .x = -100, .y = -100 } });
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // A model edit still revokes it.
+    self.invalidate();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+}
+
+test "UIA settings revokes its elements when a paint lays their hits out anew" {
+    // Settings tokens name hits by position (`uia_bridge.settings_hit_base`
+    // + index). A paint that scrolls (a revealed focus) or lays the hits out
+    // otherwise would leave a retained element acting on another control:
+    // it is revoked, and that paint publishes the new layout. A paint with
+    // the same layout (a focus ring, a hover) keeps it.
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Settings", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Scrollbar", .role = .checkbox, .patterns = .{ .toggle = true } },
+        .{ .id = 3, .parent = 0, .name = "Bell", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.destroy();
+    self.popup.input.alloc = testing.allocator;
+    self.hits[0] = .{ .rect = .{ .x = 0, .y = 0, .w = 100, .h = 20 }, .target = .{ .row = 0 } };
+    self.hits[1] = .{ .rect = .{ .x = 0, .y = 20, .w = 100, .h = 20 }, .target = .{ .row = 1 } };
+    self.hit_count = 2;
+    try self.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    self.popup.uia_view.needs_publish = false;
+    self.notePublishedHits();
+    const snapshot = self.popup.uia_view.publisher.current.?;
+    const provider = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(provider.vtable));
+    _ = abi.AddRef(provider);
+    defer _ = abi.Release(provider);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    // The next paint lays the same hits out again.
+    self.checkUiaHits();
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // A paint that scrolled by a row: the same tokens name other rows now.
+    self.hits[0] = .{ .rect = .{ .x = 0, .y = 0, .w = 100, .h = 20 }, .target = .{ .row = 1 } };
+    self.hits[1] = .{ .rect = .{ .x = 0, .y = 20, .w = 100, .h = 20 }, .target = .{ .row = 2 } };
+    self.checkUiaHits();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+    try testing.expect(!self.popup.uia_view.publisher.accepts(action));
+    try testing.expect(self.popup.uia_view.needs_publish and self.uia_hits == null);
 }
 
 // -----------------------------------------------------------------------
@@ -762,6 +1158,7 @@ fn loadData(self: *Settings) void {
     self.loadThemes(config);
     self.loadShells();
     self.updateFontPicker();
+    self.data_ready = true;
 }
 
 /// The first configured font family, in `alloc`.
@@ -773,6 +1170,7 @@ fn configuredFamily(self: *Settings, alloc: Allocator) []const u8 {
 
 /// Frees what was loaded for one opening; the theme and font lists stay.
 fn releaseData(self: *Settings) void {
+    self.data_ready = false;
     if (self.layers) |*layers| layers.deinit();
     self.layers = null;
     self.theme_list.clear();
@@ -1169,7 +1567,7 @@ fn focusSearch(self: *Settings, select: bool) void {
     self.text_field = .search;
     if (select) self.popup.input.anchor = 0;
     self.stopTimer(.preview);
-    self.invalidate();
+    self.popup.repaint();
 }
 
 fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
@@ -1218,7 +1616,7 @@ fn beginSizeEdit(self: *Settings, text: []const u8, select: bool) void {
     self.text_field = .font_size;
     self.popup.input.setText(self.alloc, text) catch {};
     if (select) self.popup.input.anchor = 0;
-    self.invalidate();
+    self.popup.repaint();
 }
 
 /// Stops typing the font size, applying a valid size when `apply`.
@@ -2254,7 +2652,8 @@ fn applyConfig(self: *Settings, theme: ?[]const u8, theme_action: bool) bool {
     if (gx.perf.enabled()) {
         if (theme_action or preview or self.app.config.changed(&config, .theme)) gx.perf.count("theme.reload", 1);
     }
-    self.app.applyConfig(&config) catch |err| return self.applyFailed(preview, err);
+    const applied = if (preview) @import("Menu.zig").applyThemePreview(self.app, &config) else self.app.applyConfig(&config);
+    applied catch |err| return self.applyFailed(preview, err);
     self.applied_inputs = inputsDigest(&self.app.config);
     if (!preview) self.applied_preview = null;
     self.configApplied(preview);
@@ -2411,7 +2810,7 @@ fn stopTimer(self: *Settings, timer: Timer) void {
 }
 
 fn timerProc(hwnd: ?w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void {
-    const self = instance orelse {
+    const self = byPopup(hwnd) orelse {
         _ = w32.KillTimer(hwnd, id);
         return;
     };
@@ -2431,6 +2830,15 @@ fn timerProc(hwnd: ?w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void 
             if (self.prefetchSwatches()) self.invalidate();
         },
     }
+}
+
+fn byPopup(hwnd: ?w32.HWND) ?*Settings {
+    if (hwnd == null) return null;
+    var it = instances;
+    while (it) |self| : (it = self.next) {
+        if (self.popup.hwnd == hwnd) return self;
+    }
+    return null;
 }
 
 /// Reads the swatches of the themes on display and of the pages above and
@@ -2597,7 +3005,9 @@ fn setHover(self: *Settings, target: ?Target) void {
     if (same) return;
     self.hover = target;
     self.updateTooltip();
-    self.invalidate();
+    // Drawn only: the accessible model does not include the hover, so
+    // providers a client holds stay valid.
+    self.popup.repaint();
 }
 
 fn updateTooltip(self: *Settings) void {
@@ -2819,7 +3229,8 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             self.tooltip.hide();
             const target = self.hitAt(event.pos) orelse {
                 self.endSizeEdit(true);
-                return self.invalidate();
+                // Only the focus ring goes; a committed size invalidated.
+                return self.popup.repaint();
             };
             self.press(popup, target, event.kind == .double_click);
         },
@@ -2832,9 +3243,13 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
                 _ = w32.ReleaseCapture();
             };
             if (self.hitAt(event.pos)) |target| {
-                if (std.meta.eql(target, pressed)) self.click(pressed);
+                if (std.meta.eql(target, pressed)) {
+                    self.click(pressed);
+                    return self.invalidate();
+                }
             }
-            self.invalidate();
+            // Released elsewhere: only the pressed look goes.
+            self.popup.repaint();
         },
         .wheel => self.wheel(event.pos, event.wheel),
     }
@@ -2856,6 +3271,8 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
             list.cursor = item.index;
             if (double) return self.activate(rows[item.row]);
             if (field == .themes) self.schedulePreview(.click);
+            // The list cursor is the selection the accessible model shows.
+            return self.invalidate();
         },
         .field => |i| self.focusRow(i),
         .value => |i| {
@@ -2875,7 +3292,9 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
             if (popup.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
         },
     }
-    self.invalidate();
+    // A focus move or the pressed look only changes what is drawn; model
+    // edits (a stepped size, a committed edit) invalidated themselves.
+    self.popup.repaint();
 }
 
 /// The left button went up over `target`, where it went down.
@@ -3004,6 +3423,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
         .w = @max(0, w - sidebar_width),
         .h = footer_height,
     });
+    self.checkUiaHits();
 
     // What is under the pointer may have moved (scrolling, a new section).
     if (self.pointer) |pos| {
@@ -3015,7 +3435,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
             self.invalidate();
         }
     }
-    if (self.swatches_pending and !self.timers.contains(.prefetch)) self.startTimer(.prefetch, 15);
+    if (self.open and self.swatches_pending and !self.timers.contains(.prefetch)) self.startTimer(.prefetch, 15);
 }
 
 fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) void {

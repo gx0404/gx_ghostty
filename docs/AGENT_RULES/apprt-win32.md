@@ -50,7 +50,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 | `GhosttyWindow` | `WM_APP+20` MAIN_MENU、`+31` FIRST_FRAME（core id）、`+38` OWNER_ACTIVE_LOCK、`+42/+43` SYNC_ACTIVATION/NATIVE_FALLBACK、`+0x61` CLOSE_TAB、`+0x68` TAB_DETACH；`WM_USER+0x47` SIMULATE_DPI、`+0x49` SIMULATE_SYSTEM_THEME、`+0x4A/+0x4B` WINDOW_STATE/SIMULATE_OCCLUSION、`+0x4C/+0x4D` SIMULATE_D2D_FAILURE/CAPTION_QUERY；`+0x4F/+0x50` REMOTE_BEGIN/QUERY（须 `GHOSTTY_GX_REMOTE_TEST=1`） | `HQ` 应用模式（旧 `HD` 退役）、`FF` 首帧、`CH` 标签栏轮询、`TT` 提示、`RG` 尺寸提示、`SN` 快捷键冲突提示条 |
 | `GhosttyTerminal` | `WM_APP+0x60` CONFIRM_CLOSE、`+30` GPU_RESET、`+32` CHILD_EXITED、`+33` CONFIRM_CLIPBOARD、`+35` RELEASE_BUTTONS、`WM_USER+0x48` SIMULATE_GPU_RESET（测试钩子） | `CR`、`CW` 剪贴板重试，`GR` GPU 重置 |
 | 滚动条弹层 | `WM_USER+1` SCROLLBAR_QUERY | 1 淡出、2 空闲 |
-| 其他弹层（`Popup`） | `WM_APP+39`、`+40` Notice、Toast 投递后显示；`WM_USER+0x4E` POPUP_DCOMP（实验的 reset/failure/query） | `RV` 首帧揭幕、`CB` 插入符、`RP` 按住连发；Notice `NT`、`NW`，Toast `TS`、`TW`；命令面板与设置浮层另用带 TIMERPROC 的小整数；`MenuPopup` 用线程计时器 |
+| 其他弹层（`Popup`） | `WM_APP+39`、`+40` Notice、Toast 投递后显示；`WM_USER+0x4E` POPUP_DCOMP（实验的 reset/failure/query） | `RV` 揭幕/重绘、`CB` 插入符、`RP` 按住连发；Notice `NT`、`NW`，Toast `TS`、`TW`；命令面板与设置浮层另用带 TIMERPROC 的小整数；`MenuPopup` 用线程计时器 |
 | `GhosttyGxAnimClock`（`ui/anim.zig`） | `WM_APP+37` TICK | 无 |
 
 ### 输入、IME、DPI 与文字
@@ -62,7 +62,7 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 - 剪贴板：`OpenClipboard` 都经 `clipboard.open`（有界重试，应对剪贴板管理器与远程桌面的短暂占用），终端读写另由 `CR`、`CW` 计时器再试约 0.6 s。自绘输入框粘贴只取第一行，截到 `text_edit.max_len`（4096 个 UTF-16 码元）。
 - `WM_SETTINGCHANGE` 只发给顶层窗口：滚动条模式由滚动条弹层自己处理，预留宽度变了经 `Surface.refitGrid` 重排。
 - DPI：PerMonitorV2。只有顶层窗口收到 `WM_DPICHANGED`：`Window.handleDpiChange` 重排 chrome 并转给每个 Surface，弹层自己处理。chrome 及其提示、菜单与新终端的初始缩放一律取 `Window.scale`（弹层经 `Popup.setOwnerScale`），只有 Windows 与 DWM 自己画的部分取 `GetDpiForWindow`；`WM_GHOSTTY_SIMULATE_DPI` 只改 `Window.scale`，混用两者在模拟时就会错位。
-- 界面文字：英文 msgid 经 `gx.i18n.tr`/`trRuntime` 翻译；菜单与对话框每次显示时重建，语言切换经 `onLanguageChanged` 下发（`gx-core.md`）。
+- 界面文字：英文 msgid 经 `gx.i18n.tr`/`trRuntime` 翻译；缓存随语言变化作废重建，语言切换经 `onLanguageChanged` 下发（`gx-core.md`）。
 
 ## 不变量
 
