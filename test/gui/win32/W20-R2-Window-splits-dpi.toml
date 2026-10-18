@@ -13,7 +13,8 @@ resize-overlay = after-first
 keybind = f6=new_split:right
 keybind = f7=new_split:down
 keybind = f8=goto_tab:1
-keybind = ctrl+shift+f9=gx:move_split_to_tab
+keybind = f9=goto_tab:2
+keybind = f10=gx:move_split_to_tab
 """
 # Later phases (R2-Surface.06/.07, R2-Window.05/.08/.10/.12): a split with an open search
 # bar moves into a new tab (the bar follows its terminal to the new parent); the open search
@@ -27,6 +28,8 @@ expect = [
   "closed: exit closes the bottom-right pane and focus-here prints in its surviving sibling",
   "background-dpi: selecting the first tab after a DPI change gives its split panes the new scale",
   "search-before-move: the focused split shows its search bar with the query focus",
+  "tab2-from-find: F9 from the search field selected tab 2, with one pane and no search bar",
+  "back-search-kept: F8 returned to tab 1 with two panes and the preserved focus query and counter",
   "search-after-reparent: the split moved into a new tab; its search bar shows again over it in the new place",
   "search-follows-move: the window was dragged by its title bar; the open search bar moved with it and stays at the top right of the pane (the runner logs its rectangle before and after)",
   "fullscreen: Ctrl+Enter made the window fullscreen: no caption buttons, the terminal fills the screen",
@@ -174,10 +177,56 @@ action = "capture"
 name = "search-before-move"
 what = "all"
 
-# The search field keeps plain keys; a bound Ctrl chord goes to the terminal's bindings.
+# Bound function keys reach terminal bindings from the find field (D-10).
 [[step]]
 action = "key"
-keys = "ctrl+shift+f9"
+keys = "f9"
+
+[[step]]
+action = "wait_terminals"
+count = 1
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 2
+
+[[step]]
+action = "capture"
+name = "tab2-from-find"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f8"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+timeout = 2
+
+[[step]]
+action = "capture"
+name = "back-search-kept"
+what = "all"
+
+# Refocus the preserved bar, then exercise WM_SYSKEYDOWN with F10.
+[[step]]
+action = "key"
+keys = "ctrl+shift+f"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+
+[[step]]
+action = "key"
+keys = "f10"
 
 [[step]]
 action = "wait_terminals"
