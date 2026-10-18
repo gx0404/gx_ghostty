@@ -42,4 +42,5 @@ test {
     _ = @import("session.zig");
     _ = @import("launch_profiles_dialog.zig");
     _ = @import("shortcut_editor.zig");
+    _ = @import("tab_actions.zig");
 }

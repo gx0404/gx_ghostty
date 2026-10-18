@@ -357,7 +357,7 @@ fn actionTabCloseOthers(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window
 /// counts only unpinned tabs. `closeOtherPages` would close them, because
 /// the window confirms every close request. Going from the last tab keeps
 /// the positions still to visit valid while tabs close.
-fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
+pub fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
     var i = view.getNPages();
     while (i > 0) {
         i -= 1;
@@ -376,7 +376,7 @@ fn actionTabCloseRight(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window)
 /// tabs come first, so from a pinned tab the later pinned ones stay.
 /// `closePagesAfter` would close them, because the window confirms every
 /// close request.
-fn closeTabsRight(view: *adw.TabView, page: *adw.TabPage) void {
+pub fn closeTabsRight(view: *adw.TabView, page: *adw.TabPage) void {
     const first = view.getPagePosition(page) + 1;
     var i = view.getNPages();
     while (i > first) {

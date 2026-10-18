@@ -162,6 +162,8 @@ fn tabUnmapped(_: *gtk.Widget, tab: *Tab) callconv(.c) void {
 }
 
 pub fn tabAttached(window: *Window, tab: *Tab) void {
+    // Key bindings and the command palette close tabs like the tab menu.
+    @import("tab_actions.zig").attach(tab);
     prepareTab(tab) catch |err| {
         log.err("cannot issue tab identity: {}", .{err});
         return;
