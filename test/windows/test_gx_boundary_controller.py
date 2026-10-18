@@ -80,6 +80,131 @@ class BoundaryTests(unittest.TestCase):
 
 
 
+class LayoutAndGestureTests(unittest.TestCase):
+    def fixture(self):
+        fixture = controller.BoundaryFixture.__new__(controller.BoundaryFixture)
+        fixture.report = {'native': [], 'captures': []}
+        fixture.capture_native = mock.Mock()
+        fixture.place = mock.Mock()
+        return fixture
+
+    @staticmethod
+    def natives(source_tabs=1, target_tabs=64):
+        source, target = mock.Mock(hwnd=11), mock.Mock(hwnd=22)
+        source.query.side_effect = lambda field, *args: {4: source_tabs}[field]
+        target.query.side_effect = lambda field, *args: {4: target_tabs}[field]
+        source.tree.return_value = tree()
+        return source, target
+
+    @staticmethod
+    def drop(delta, moved=(600, -27), pointer=(600, -27)):
+        return {'delta': delta, 'loop_rect': (0, 0, 10, 10), 'moving_rect': (moved[0], moved[1], 10, 10),
+                'loop_cursor': (0, 0), 'release_cursor': pointer}
+
+    def test_side_by_side_windows_stay_inside_the_primary_work_area(self):
+        area = (0, 0, 2560, 1392)
+        slots = controller.side_by_side(area)
+        self.assertEqual(slots[0][2:], slots[1][2:])
+        for x, y, w, h in slots:
+            self.assertTrue(controller.contains(area, (x, y, x + w, y + h)))
+        self.assertLess(slots[1][0] + slots[1][2], 2560)
+        with self.assertRaises(controller.EnvironmentUnavailable):
+            controller.side_by_side((0, 0, 1000, 600))
+
+    def test_full_target_rejects_a_drop_that_never_reached_the_refusal(self):
+        fixture = self.fixture()
+        for delta in ({'drops': 0, 'full_refusals': 0, 'merges': 0}, {'drops': 1, 'full_refusals': 0, 'merges': 1},
+                      {'drops': 1, 'full_refusals': 0, 'merges': 0}):
+            source, target = self.natives()
+            fixture.cross_window_drop = mock.Mock(return_value=self.drop(delta))
+            with self.subTest(delta=delta), mock.patch.object(controller.gui, 'win32'), \
+                    self.assertRaisesRegex(AssertionError, 'full-target refusal'):
+                fixture.full_target(mock.Mock(), source, target, tree())
+
+    def test_full_target_requires_the_window_to_follow_the_native_move_loop(self):
+        fixture = self.fixture()
+        source, target = self.natives()
+        refused = self.drop({'drops': 1, 'full_refusals': 1, 'merges': 0}, moved=(0, 0))
+        fixture.cross_window_drop = mock.Mock(return_value=refused)
+        with mock.patch.object(controller.gui, 'win32'), self.assertRaisesRegex(AssertionError, 'follow the pointer'):
+            fixture.full_target(mock.Mock(), source, target, tree())
+
+    def test_full_target_requires_a_merging_positive_control(self):
+        fixture = self.fixture()
+        source, target = self.natives()
+        target.control.return_value = 1
+        counts = iter([64, 64, 63, 63])
+        target.query.side_effect = lambda field, *args: next(counts) if field == 4 else 0
+        refused = self.drop({'drops': 1, 'full_refusals': 1, 'merges': 0})
+        missed = self.drop({'drops': 1, 'full_refusals': 0, 'merges': 0})
+        fixture.cross_window_drop = mock.Mock(side_effect=[refused, missed])
+        with mock.patch.object(controller.gui, 'win32') as api, mock.patch.object(controller.time, 'sleep'), \
+                self.assertRaisesRegex(AssertionError, 'control drop did not merge'):
+            api.return_value.IsWindow.return_value = True
+            fixture.full_target(mock.Mock(), source, target, tree())
+        target.control.assert_called_once_with(8)
+
+    def test_settled_reads_twice_after_the_input_queue_had_time(self):
+        reads = iter([0, 1])
+        with mock.patch.object(controller.time, 'sleep') as sleep:
+            self.assertEqual([0, 1], controller.BoundaryFixture.settled(lambda: next(reads)))
+        self.assertEqual([mock.call(controller.SETTLE_S)] * 2, sleep.call_args_list)
+
+    def test_calibration_corrects_an_off_by_one_absolute_mapping(self):
+        sent = []
+        api = mock.Mock()
+        api.virtual_screen.return_value = (0, 0, 2560, 1440)
+        api.send.side_effect = lambda items: sent.append((items[0].u.mi.dx, items[0].u.mi.dy))
+        api.mouse_input.side_effect = lambda *args: SimpleNamespace(u=SimpleNamespace(mi=SimpleNamespace(dx=0, dy=0)))
+        # The fake desktop maps one normalized unit range one pixel to the left.
+        pixel = lambda: (sent[-1][0] * 2560 // 65536 - 1, sent[-1][1] * 1440 // 65536)
+        with mock.patch.object(controller.gui, 'win32', return_value=api), \
+                mock.patch.object(controller, 'poll_cursor', side_effect=lambda point, timeout=0.5: pixel()):
+            normalized = controller.calibrate(mock.Mock(), (1000, 700))
+        self.assertEqual((1000, 700), (normalized[0] * 2560 // 65536 - 1, normalized[1] * 1440 // 65536))
+        with mock.patch.object(controller.gui, 'win32', return_value=api), \
+                mock.patch.object(controller, 'poll_cursor', return_value=(5, 5)), \
+                self.assertRaises(controller.EnvironmentUnavailable):
+            controller.calibrate(mock.Mock(), (1000, 700))
+
+    def test_button_up_is_never_sent_into_a_foreign_foreground(self):
+        fixture = self.fixture()
+        instance = mock.Mock(pid=42)
+        api = mock.Mock()
+        api.IsWindow.return_value = True
+        api.window_pid.side_effect = lambda hwnd: 42 if hwnd in (11, 12) else 7
+        api.foreground.return_value = 99
+        with mock.patch.object(controller.gui, 'win32', return_value=api), \
+                mock.patch.object(controller, 'thread_state', return_value={'move_size': 0, 'capture': 0}), \
+                self.assertRaises(controller.gui.InputBlocked):
+            fixture.release(instance, (11,))
+        api.send.assert_not_called()
+        with mock.patch.object(controller.gui, 'win32', return_value=api), \
+                mock.patch.object(controller, 'thread_state', return_value={'move_size': 0, 'capture': 12}):
+            fixture.release(instance, (11,))
+        api.send.assert_called_once()
+
+
+class InputLanguageTests(unittest.TestCase):
+    def test_restore_falls_back_to_an_owned_window_after_the_app_exited(self):
+        fixture = SimpleNamespace(report={}, check=mock.Mock())
+        instance = mock.Mock(pid=42)
+        instance.alive.return_value = False
+        with mock.patch.object(controller.gui, 'win32') as api:
+            api.return_value.keyboard_layout.return_value = 0x08040804
+            language = controller.InputLanguage(fixture, instance, 5)
+            with mock.patch.object(controller, 'owned_helper_language', return_value={'method': 'owned-helper-window', 'restored': True}) as helper:
+                self.assertTrue(language.restore()['restored'])
+            helper.assert_called_once_with(0x08040804)
+            with mock.patch.object(controller, 'owned_helper_language', return_value={'method': 'owned-helper-window', 'restored': False}), \
+                    self.assertRaisesRegex(AssertionError, 'not restored'):
+                language.restore()
+        self.assertEqual([True, False], [item['restored'] for item in fixture.report['input_language']])
+
+    def test_sign_extended_hkl(self):
+        self.assertEqual(0x08040804, controller.full_hkl(0x08040804))
+        self.assertEqual(-0x0FFDFBF7, controller.full_hkl(0xF0020409))
+
 
 if __name__ == '__main__':
     unittest.main()
