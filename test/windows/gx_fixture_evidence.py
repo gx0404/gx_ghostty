@@ -9,6 +9,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
+import subprocess
 
 
 def sha256(path):
@@ -111,17 +112,33 @@ def drag_thresholds(dpi):
             for axis, dip in (("vertical", 15), ("horizontal", 10))}
 
 
+def slot_root(root):
+    """The kernel-slot directory every checkout of the repository shares: the
+    main checkout's .local/kernel-slots beside the git common directory, so a
+    fixture run from a worktree excludes the other worktrees' desktop and heavy
+    jobs. gx_slots.shared_root() is the source when this gx_slots has it."""
+    import gx_slots
+    shared = getattr(gx_slots, "shared_root", None)
+    if shared is not None:
+        return Path(shared())
+    result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, encoding="utf-8", timeout=10, check=True)
+    return Path(result.stdout.strip()).parent / ".local" / "kernel-slots"
+
+
 @contextmanager
 def fixture_slots(root, desktop_held=False):
     """Avoid nested acquisition when root already used Invoke-Desktop.
 
 The explicit flag is a caller assertion, not a new way to acquire the desktop.
 Every real run still requires the coordinator's idle and foreground guards.
+Locks live in the repository-wide `slot_root`, never a worktree's own copy.
 """
     if desktop_held:
         yield
         return
     import gx_slots
-    with gx_slots.acquire(root / ".local/kernel-slots", "heavy", 45):
-        with gx_slots.acquire(root / ".local/kernel-slots", "desktop", 45):
+    shared = slot_root(root)
+    with gx_slots.acquire(shared, "heavy", 45):
+        with gx_slots.acquire(shared, "desktop", 45):
             yield

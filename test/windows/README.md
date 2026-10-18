@@ -285,7 +285,8 @@ BRK-01～04 只在 VM 中同一用户的 medium/high 拆分令牌下运行，宿
   `gx_boundary_controller.py`、`gx_input_language.py`、`gx_session_ipc_fixture.py`，
   `scripts/` 的 `gx_win_gui.py`、`gx_slots.py`（复制全部 `test/windows/gx_*.py` 最省事）。
   现有 `stage-validation` 只暂存 `gx_vm_validation.ps1`，需扩展暂存清单或另行复制。
-- 暂存目录须可写：不带 `--desktop-held` 时在 `<仓库根>/.local/kernel-slots` 建槽锁，VM 内
+- 暂存目录须可写：不带 `--desktop-held` 时在主检出（git common dir 旁）的
+  `.local/kernel-slots` 建槽锁，各 worktree 共用（`gx_fixture_evidence.slot_root`）；VM 内
   没有其他工位时可加 `--desktop-held`。`--root` 用 medium 与 high 都可写的本地目录。
 - `GHOSTTY_GX_REMOTE_TEST=1` 由夹具给 target 与 companion 设置，控制台无需预设；回执只认
   与当前 companion PID/birth 相符的 `fixture_receipt` 行。每次运行用新的 `--name`。
