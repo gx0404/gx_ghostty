@@ -579,7 +579,47 @@ pub const GxSettingsDialog = extern struct {
 
         /// Whether `theme` is the saved theme rather than a preview.
         theme: bool = true,
+
+        /// Whether a saved `theme` changed while another theme stays
+        /// previewed, so the saved theme is read from the saved layers.
+        saved_theme: bool = false,
     };
+
+    /// What saving the recorded `changes` refreshes. A failed Apply keeps
+    /// its `theme` change recorded and the theme previewed until a later
+    /// save writes it (Retry, or any other change): when that `theme` is
+    /// the previewed value it is no longer a preview (R3-Settings.04);
+    /// while another theme stays previewed, the saved theme is read from
+    /// the saved layers instead of the applied configuration.
+    const SaveEffects = struct {
+        sync: Sync,
+        end_preview: bool = false,
+    };
+
+    fn saveEffects(
+        changes: []const settings_map.Changes.Entry,
+        previewing: bool,
+        previewed: ?[]const u8,
+        pending: ?Sync,
+    ) SaveEffects {
+        var effects: SaveEffects = .{ .sync = pending orelse .{ .theme = !previewing } };
+        for (changes) |entry| {
+            if (std.mem.eql(u8, entry.key, "font-family")) effects.sync.font_family = true;
+            if (!previewing or !std.mem.eql(u8, entry.key, "theme")) continue;
+            const same = if (previewed) |value|
+                entry.values.len == 1 and std.mem.eql(u8, entry.values[0], value)
+            else
+                false;
+            if (same) {
+                effects.end_preview = true;
+                effects.sync.theme = true;
+                effects.sync.saved_theme = false;
+            } else if (!effects.end_preview) {
+                effects.sync.saved_theme = true;
+            }
+        }
+        return effects;
+    }
 
     /// Shows the values of `config`, without recording them as changes.
     fn syncValues(self: *Self, config: *const CoreConfig, sync: Sync) void {
@@ -589,7 +629,7 @@ pub const GxSettingsDialog = extern struct {
         st.loading = true;
         defer st.loading = loading;
 
-        if (sync.theme) self.setSavedTheme(config.theme);
+        if (sync.theme) self.setSavedTheme(config.theme) else if (sync.saved_theme) self.refreshSavedTheme();
 
         const opacity = config.@"background-opacity";
         const material = settings_map.Material.fromConfig(opacity, config.@"background-blur".enabled());
@@ -688,6 +728,19 @@ pub const GxSettingsDialog = extern struct {
         }
         self.refreshThemeChecks();
         self.updateThemeButtons();
+    }
+
+    /// Shows the theme the saved layers configure while another theme
+    /// stays previewed (the applied configuration has the preview).
+    fn refreshSavedTheme(self: *Self) void {
+        const st = &self.private().state;
+        const layers = &(st.layers orelse return);
+        var saved = layers.build(st.alloc, &.{}) catch |err| {
+            log.warn("cannot read the saved theme err={}", .{err});
+            return;
+        };
+        defer saved.deinit();
+        self.setSavedTheme(saved.theme);
     }
 
     fn isThemePair(self: *Self) bool {
@@ -1375,10 +1428,12 @@ pub const GxSettingsDialog = extern struct {
         if (st.changes.isEmpty() and !st.apply_pending) return true;
 
         if (!st.changes.isEmpty()) {
-            var sync: Sync = if (st.apply_pending) st.pending_sync else .{ .theme = !st.previewing };
-            for (st.changes.entries.items) |entry| {
-                if (std.mem.eql(u8, entry.key, "font-family")) sync.font_family = true;
-            }
+            const effects = saveEffects(
+                st.changes.entries.items,
+                st.previewing,
+                self.previewArg(),
+                if (st.apply_pending) st.pending_sync else null,
+            );
 
             const path = gx.config_layers.overlayPath(st.alloc) catch |err| {
                 log.warn("cannot locate {s} err={}", .{ gx.gui_settings.file_name, err });
@@ -1391,8 +1446,9 @@ pub const GxSettingsDialog = extern struct {
                 self.toastError(msg.save_failed, err, true);
                 return false;
             };
+            if (effects.end_preview) st.previewing = false;
             st.apply_pending = true;
-            st.pending_sync = sync;
+            st.pending_sync = effects.sync;
             self.reloadLayers();
         }
 
@@ -2620,6 +2676,41 @@ test "values the custom padding writes parse back" {
         try cfg.loadIter(testing.allocator, &it);
         try testing.expect(cfg.@"window-padding-x".equal(padding));
     }
+}
+
+test "a save that writes the previewed theme ends the preview" {
+    const Dialog = GxSettingsDialog;
+    const theme: []const settings_map.Changes.Entry = &.{.{ .key = "theme", .values = &.{"Chalkboard"} }};
+
+    // Retry after a failed Apply: the recorded theme is the previewed one,
+    // so the save ends the preview and shows the theme as saved.
+    const retried = Dialog.saveEffects(theme, true, "Chalkboard", null);
+    try testing.expect(retried.end_preview);
+    try testing.expect(retried.sync.theme and !retried.sync.saved_theme);
+
+    // Another theme is previewed meanwhile: it stays previewed and the
+    // saved theme is read from the saved layers.
+    const other = Dialog.saveEffects(theme, true, "Dracula", null);
+    try testing.expect(!other.end_preview);
+    try testing.expect(!other.sync.theme and other.sync.saved_theme);
+
+    // A pair value and a removed theme are not the previewed single theme.
+    const pair: []const settings_map.Changes.Entry = &.{.{ .key = "theme", .values = &.{"light:Chalkboard,dark:Dracula"} }};
+    try testing.expect(Dialog.saveEffects(pair, true, "Chalkboard", null).sync.saved_theme);
+    const reset: []const settings_map.Changes.Entry = &.{.{ .key = "theme", .values = &.{} }};
+    try testing.expect(!Dialog.saveEffects(reset, true, "Chalkboard", null).end_preview);
+
+    // Without a preview the applied configuration has the saved theme.
+    const plain = Dialog.saveEffects(theme, false, null, null);
+    try testing.expect(!plain.end_preview and plain.sync.theme and !plain.sync.saved_theme);
+
+    // Other settings saved during a preview leave the theme as it was, and a
+    // pending font family survives a retry that also saves the theme.
+    const font: []const settings_map.Changes.Entry = &.{.{ .key = "font-size", .values = &.{"14"} }};
+    const during = Dialog.saveEffects(font, true, "Chalkboard", null);
+    try testing.expect(!during.end_preview and !during.sync.theme and !during.sync.saved_theme);
+    const resumed = Dialog.saveEffects(theme, true, "Chalkboard", .{ .font_family = true, .theme = false });
+    try testing.expect(resumed.end_preview and resumed.sync.theme and resumed.sync.font_family);
 }
 
 test "failed settings saves preserve font edits and resets for retry" {
