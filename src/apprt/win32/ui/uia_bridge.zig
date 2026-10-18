@@ -595,16 +595,27 @@ pub const PopupBridge = struct {
     /// (`trackSelection`). Null since the popup was shown: its first
     /// publication only records what it shows.
     selection: ?Selection = null,
+    /// Per container of the last publication, the item last announced: what
+    /// it selected when it appeared, then each ElementSelected raised
+    /// (`dispatchSelected`). Kept apart from `selection`, so that a selection
+    /// whose event a republication revoked before the message loop raised it
+    /// is queued again for the new snapshot (review round 4, severe 2).
+    announced: Selection = .{},
+    /// The ElementSelected events of the current snapshot, with what each
+    /// announces once raised. A new snapshot refuses the older ones.
+    pending: [max_selection_events]PendingSelection = undefined,
+    pending_count: usize = 0,
 
     /// A GUI model edit invalidates all pending index-based actions immediately.
     /// The owning widget schedules publish after its new model/layout is ready.
-    /// What the focus was last reported on survives, so a republication that
-    /// keeps the focus where it was raises no second event.
+    /// What the focus was last reported on survives, and what each list last
+    /// announced, so a republication that keeps them raises no second event.
     pub fn dirty(self: *PopupBridge) void {
         self.publisher.hide();
         self.length = 0;
         self.needs_publish = true;
         self.focus_key = null;
+        self.pending_count = 0;
     }
     pub fn hide(self: *PopupBridge) void {
         self.dirty();
@@ -613,6 +624,7 @@ pub const PopupBridge = struct {
         self.hwnd = null;
         self.focus_reported = null;
         self.selection = null;
+        self.announced = .{};
     }
     pub fn deinit(self: *PopupBridge) void {
         self.hide();
@@ -653,26 +665,35 @@ pub const PopupBridge = struct {
         self.trackFocus(focusedKey(nodes, keys), true);
         self.trackSelection(nodes, keys);
     }
-    /// A publication that moves the selection of a container the previous
-    /// one already showed (the keyboard in a palette's results, a radio
-    /// choice, a settings section) queues ElementSelected for the newly
-    /// selected element, at most `max_selection_events` per publication.
-    /// A container that just appeared only records its selection: its
-    /// appearance is no selection change.
+    /// A publication whose selection container, shown by the previous one
+    /// too, selects another item than the one last announced there (the
+    /// keyboard in a palette's results, a radio choice, a settings section)
+    /// queues ElementSelected for it, at most `max_selection_events` per
+    /// publication: also when the event of that selection was queued for a
+    /// snapshot that this republication revoked before the message loop
+    /// raised it. A selection that moved back to the announced item queues
+    /// nothing. A container that just appeared only records its selection:
+    /// its appearance is no selection change.
     fn trackSelection(self: *PopupBridge, nodes: []const uia.NodeSpec, keys: []const u64) void {
         var current: Selection = .{};
-        var queued: usize = 0;
+        var announced: Selection = .{};
+        self.pending_count = 0;
         for (nodes, keys) |node, key| {
             if (!node.patterns.selection_item or !node.selected or current.count == Selection.slots) continue;
             const container = selectionContainer(nodes, node) orelse continue;
             const pair: Selection.Pair = .{ .container = identity(keys[container], nodes[container]), .item = identity(key, node) };
-            current.pairs[current.count] = pair;
-            current.count += 1;
-            if (self.selection) |previous| {
-                if (previous.moved(pair) and queued < max_selection_events and self.publisher.queueSelected(node.id)) queued += 1;
+            current.add(pair);
+            const shown = if (self.selection) |previous| previous.item(pair.container) else null;
+            const last = if (shown) |item| self.announced.item(pair.container) orelse item else pair.item;
+            announced.add(.{ .container = pair.container, .item = last });
+            if (last == pair.item or self.pending_count == max_selection_events) continue;
+            if (self.publisher.queueSelected(node.id)) {
+                self.pending[self.pending_count] = .{ .node_id = node.id, .pair = pair };
+                self.pending_count += 1;
             }
         }
         self.selection = current;
+        self.announced = announced;
     }
     /// The identity of the node the snapshot gives the focus: the first one
     /// marked focused, as `uia.Snapshot` takes it.
@@ -741,9 +762,13 @@ pub const PopupBridge = struct {
     }
     /// An ElementSelected event of the current snapshot (`trackSelection`),
     /// raised here from the message loop, outside locks, like a focus
-    /// change: no widget callback, nothing revoked.
+    /// change: no widget callback, nothing revoked. Raised, its selection
+    /// counts as announced: a republication keeping it queues nothing.
     fn dispatchSelected(self: *PopupBridge, action: *const uia.Action) bool {
         const raised = self.publisher.raiseSelected(action.node_id);
+        if (raised) for (self.pending[0..self.pending_count]) |entry| {
+            if (entry.node_id == action.node_id) self.announced.set(entry.pair);
+        };
         if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_selected snapshot={d} node={d} raised={}", .{ action.snapshot_id, action.node_id, raised });
         return raised;
     }
@@ -1483,6 +1508,8 @@ test "popup publications raise ElementSelected only when a shown list moves its 
     defer refiltered.deinit();
     try testing.expectEqual(@as(u64, 4), refiltered.node_id);
     try testing.expect(queue.pop() == null);
+    // The message loop raises it: announced, as the first one.
+    try testing.expect(bridge.dispatchSelected(&refiltered));
 
     // A list that appears with its own selection: no event for it.
     bridge.dirty();
@@ -1493,7 +1520,135 @@ test "popup publications raise ElementSelected only when a shown list moves its 
     bridge.hide();
     try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &Widget.specs(commands, 0, false), &tokens, callbacks);
     try testing.expect(queue.pop() == null);
-    try testing.expectEqual(@as(usize, 1), Recorder.raised);
+    try testing.expectEqual(@as(usize, 2), Recorder.raised);
+}
+
+test "popup ElementSelected survives republications before the message loop raises it" {
+    // Review round 4 (severe 2): a selection event queued for a snapshot that
+    // its owner replaces before the message loop raises it (a synchronous
+    // WM_GETOBJECT or focus message republishes, A1 0003) is heard from the
+    // newest snapshot, once, in tree order with the other lists'; a selection
+    // already announced is not announced again, one that moved back before
+    // the loop announces nothing, and one that moved on announces only where
+    // it ended. The queue posts to a real message-only window; `loop` runs
+    // what the App message loop runs (`Registry.dispatch`).
+    const testing = std.testing;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const sink = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer {
+        var drained: w32.MSG = undefined;
+        while (w32.PeekMessageW(&drained, sink, 0, 0, w32.PM_REMOVE) != 0) {}
+        _ = w32.DestroyWindow(sink);
+    }
+    const Recorder = struct {
+        var senders: [8]*uia.Face = undefined;
+        var raised: usize = 0;
+        fn raise(face: *uia.Face, event: i32) callconv(.winapi) i32 {
+            if (event != 20012 or raised == senders.len) return -1;
+            senders[raised] = face;
+            raised += 1;
+            return 0;
+        }
+    };
+    Recorder.raised = 0;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = Recorder.raise;
+    api.notification = null;
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = sink };
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    defer queue.close();
+    const attachment: refs.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const Widget = struct {
+        fn live(_: *anyopaque) bool {
+            return true;
+        }
+        fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+            return true;
+        }
+        /// A palette's results (row `results` of three selected) and a
+        /// themes list (row `themes` of two selected).
+        fn specs(results: usize, themes: usize) [8]uia.NodeSpec {
+            return .{
+                .{ .id = 1, .name = "Command Palette", .role = .window, .patterns = .{ .window = true } },
+                .{ .id = 2, .parent = 0, .name = "Results", .role = .list, .patterns = .{ .selection = true } },
+                .{ .id = 3, .parent = 1, .name = "Split Right", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = results == 0 },
+                .{ .id = 4, .parent = 1, .name = "Split Left", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = results == 1 },
+                .{ .id = 5, .parent = 1, .name = "Split Down", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = results == 2 },
+                .{ .id = 6, .parent = 0, .name = "Themes", .role = .list, .patterns = .{ .selection = true } },
+                .{ .id = 7, .parent = 5, .name = "Dark", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = themes == 0 },
+                .{ .id = 8, .parent = 5, .name = "Light", .role = .list_item, .patterns = .{ .selection_item = true }, .selected = themes == 1 },
+            };
+        }
+    };
+    var context: u8 = 0;
+    const callbacks: PopupCallbacks = .{ .context = &context, .is_live = Widget.live, .action = Widget.action };
+    const tokens = [_]u64{ 0, 1, 10, 11, 12, 2, 20, 21 };
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+    const Loop = struct {
+        /// The App message loop's part: every queued action the current
+        /// snapshot still accepts is dispatched; returns how many it refused.
+        fn run(q: *uia.Queue, b: *PopupBridge) !usize {
+            var refused: usize = 0;
+            while (q.pop()) |value| {
+                var action = value;
+                defer action.deinit();
+                try testing.expectEqual(uia.ActionKind.element_selected, action.kind);
+                if (!b.publisher.accepts(action)) {
+                    refused += 1;
+                    continue;
+                }
+                try testing.expect(b.dispatchSelected(&action));
+            }
+            return refused;
+        }
+    };
+    const publish = struct {
+        fn call(b: *PopupBridge, a: *uia.Api, q: *uia.Queue, at: refs.Attachment, cb: PopupCallbacks, t: []const u64, results: usize, themes: usize) !void {
+            b.dirty();
+            try b.publish(a, q, at, @ptrFromInt(1), &Widget.specs(results, themes), t, cb);
+        }
+    }.call;
+
+    // Shown: nothing to announce.
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 0, 0);
+    // Both lists move, and the popup republishes once more before the loop:
+    // the first snapshot's two events are refused, the newest one's raised,
+    // results before themes, from the faces of the newest snapshot.
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 1, 1);
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 1, 1);
+    const newest = bridge.publisher.current.?;
+    try testing.expectEqual(@as(usize, 2), try Loop.run(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 2), Recorder.raised);
+    try testing.expectEqual(&newest.nodes[3].faces[0], Recorder.senders[0]);
+    try testing.expectEqual(&newest.nodes[7].faces[0], Recorder.senders[1]);
+    // Announced: republished unchanged, nothing more.
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 1, 1);
+    try testing.expectEqual(@as(usize, 0), try Loop.run(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 2), Recorder.raised);
+    // Down then back Up before the loop: the announced row again, silence.
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 2, 1);
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 1, 1);
+    try testing.expectEqual(@as(usize, 1), try Loop.run(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 2), Recorder.raised);
+    // Moved on twice before the loop: only where it ended is heard.
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 2, 1);
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 0, 1);
+    const ended = bridge.publisher.current.?;
+    try testing.expectEqual(@as(usize, 1), try Loop.run(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 3), Recorder.raised);
+    try testing.expectEqual(&ended.nodes[2].faces[0], Recorder.senders[2]);
+    // Hidden and shown again: what it shows is no change.
+    bridge.hide();
+    try publish(&bridge, &api, &queue, attachment, callbacks, &tokens, 1, 0);
+    try testing.expectEqual(@as(usize, 0), try Loop.run(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 3), Recorder.raised);
 }
 
 test "settings focus keys follow the hit target, not its position" {
@@ -1546,13 +1701,26 @@ const Selection = struct {
     const Pair = struct { container: u64, item: u64 };
     pairs: [slots]Pair = undefined,
     count: usize = 0,
-    /// Whether `pair` moves the selection of a container this publication
-    /// also showed.
-    fn moved(self: *const Selection, pair: Pair) bool {
-        for (self.pairs[0..self.count]) |previous| if (previous.container == pair.container) return previous.item != pair.item;
-        return false;
+    fn add(self: *Selection, pair: Pair) void {
+        if (self.count == slots) return;
+        self.pairs[self.count] = pair;
+        self.count += 1;
+    }
+    /// The item of `container`, if it has one here.
+    fn item(self: *const Selection, container: u64) ?u64 {
+        for (self.pairs[0..self.count]) |pair| if (pair.container == container) return pair.item;
+        return null;
+    }
+    /// `pair.item` becomes the item of its container, if it has one here.
+    fn set(self: *Selection, pair: Pair) void {
+        for (self.pairs[0..self.count]) |*entry| if (entry.container == pair.container) {
+            entry.item = pair.item;
+            return;
+        };
     }
 };
+/// An ElementSelected event queued for the current snapshot's node `node_id`.
+const PendingSelection = struct { node_id: u64, pair: Selection.Pair };
 const max_selection_events = 4;
 /// The nearest ancestor with the Selection pattern, as UIA's SelectionContainer.
 fn selectionContainer(nodes: []const uia.NodeSpec, node: uia.NodeSpec) ?usize {
