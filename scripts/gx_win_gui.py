@@ -156,8 +156,11 @@ instance, and before every mouse event the window under the point too, otherwise
 sent and the command fails. Text is typed with KEYEVENTF_UNICODE; chords are real virtual
 keys with scan codes and the extended-key flag. With GX_PERF_GUARD_LOG set (scripts/gx_perf.py
 quiet-batch) every guard, release and unexpected end of the instance is appended as one
-gx-input-guard-v1 JSON line; a refusal carries `cause` (instance_gone, foreground_lost,
-pointer_target_lost, foreign_input, other) and title-free facts about the window in the way.
+gx-input-guard-v1 JSON line; a refusal carries `cause` (instance_gone, instance_hung,
+foreground_lost, pointer_target_lost, foreign_input, other) and title-free facts about the window in
+the way. instance_hung: one of the instance's windows is hung (IsHungAppWindow), or the window in the
+way is the Ghost Windows shows for a hung window or a WerFault dialog while the instance does not
+answer WM_NULL within 2 s; quiet-batch reads it, like instance_gone, as a product failure.
 
 Screenshots: `screen` (default) copies the window's visible bounds from the screen like
 CopyFromScreen and fails if another process's window covers it; `print` uses PrintWindow with
@@ -268,6 +271,11 @@ NAMED_KEYS = {
     "oem1": 0xBA, "oem2": 0xBF, "oem3": 0xC0, "oem4": 0xDB, "oem5": 0xDC, "oem6": 0xDD, "oem7": 0xDE,
     "oem8": 0xDF, "oem102": 0xE2,
 }
+# What stands in front of a hung or crashed window: the Ghost window Windows shows instead of a hung
+# window, and the Windows Error Reporting dialogs.
+HANG_CLASSES = ("Ghost",)
+CRASH_IMAGES = ("werfault.exe", "werfaultsecure.exe")
+
 # Keys that need KEYEVENTF_EXTENDEDKEY when MapVirtualKeyW cannot say (older systems).
 EXTENDED_VKS = frozenset((0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x2D, 0x2E, 0x5B, 0x5C, 0x5D,
                           0x6F, 0x90, 0xA3, 0xA5))
@@ -298,11 +306,12 @@ class InputBlocked(GuiError):
     """Input was not sent because the foreground or pointed-at window is not the instance's.
 
     `cause` classifies the refusal for the gx-input-guard-v1 audit: instance_gone (the
-    instance ended or its process identity changed), foreground_lost, pointer_target_lost,
-    foreign_input (input this tool did not send was observed) or other. `details` holds
-    title-free facts about the window in the way (other_pid, other_class, other_image)."""
+    instance ended or its process identity changed), instance_hung (it hangs or crashed: see
+    Instance.hang_evidence), foreground_lost, pointer_target_lost, foreign_input (input this
+    tool did not send was observed) or other. `details` holds title-free facts about the window
+    in the way (other_pid, other_class, other_image)."""
 
-    CAUSES = ("instance_gone", "foreground_lost", "pointer_target_lost", "foreign_input", "other")
+    CAUSES = ("instance_gone", "instance_hung", "foreground_lost", "pointer_target_lost", "foreign_input", "other")
 
     def __init__(self, message: str, cause: str = "other", **details: Any) -> None:
         if cause not in self.CAUSES:
@@ -931,6 +940,7 @@ class Win32:
         declare(u, "IsWindow", wt.BOOL, wt.HWND)
         declare(u, "IsWindowVisible", wt.BOOL, wt.HWND)
         declare(u, "IsIconic", wt.BOOL, wt.HWND)
+        declare(u, "IsHungAppWindow", wt.BOOL, wt.HWND)
         declare(u, "GetWindowRect", wt.BOOL, wt.HWND, ctypes.POINTER(RECT))
         declare(u, "GetClientRect", wt.BOOL, wt.HWND, ctypes.POINTER(RECT))
         declare(u, "ClientToScreen", wt.BOOL, wt.HWND, ctypes.POINTER(POINT))
@@ -1156,6 +1166,10 @@ class Win32:
         buffer = ctypes.create_unicode_buffer(1024)
         self.GetWindowTextW(hwnd, buffer, 1024)
         return buffer.value
+
+    def hung(self, hwnd: int) -> bool:
+        """IsHungAppWindow: the window's thread has not taken a message for about 5 s."""
+        return bool(self.IsHungAppWindow(hwnd))
 
     def cloaked(self, hwnd: int) -> bool:
         value = self.wt.DWORD(0)
@@ -2002,6 +2016,29 @@ class Instance:
 
     # -- guarded input --------------------------------------------------------
 
+    def hang_evidence(self, other_class: str, other_image: str | None) -> str | None:
+        """Why another window in the way means the instance hangs or crashed rather than a change of the
+        desktop: one of its visible windows is hung (IsHungAppWindow), or the window in the way is a
+        Ghost or WerFault window while the instance does not answer WM_NULL within 2 s; None otherwise."""
+        w = win32()
+        mine = [info for info in w.top_windows(self.pid) if info.visible]
+        hung = [info for info in mine if w.hung(info.hwnd)]
+        if hung:
+            return f"IsHungAppWindow reports its {hung[0].cls} {hung[0].hwnd:#x}"
+        if (other_class in HANG_CLASSES or (other_image or "").lower() in CRASH_IMAGES) and mine:
+            if w.send_message(mine[0].hwnd, WM_NULL, timeout_ms=2000) is None:
+                return f"{other_class} ({other_image}) is in front and its {mine[0].cls} does not answer WM_NULL in 2 s"
+        return None
+
+    def blocked(self, what: str, cause: str, pid: int, name: str) -> InputBlocked:
+        image = image_name(pid)
+        hang = self.hang_evidence(name, image)
+        if hang:
+            return InputBlocked(f"ghostty pid {self.pid} hangs or crashed ({hang}; {what}); no input was sent",
+                                cause="instance_hung", other_pid=pid, other_class=name, other_image=image)
+        return InputBlocked(f"{what}, not ghostty pid {self.pid}; no input was sent", cause=cause,
+                            other_pid=pid, other_class=name, other_image=image)
+
     @input_guard
     def ensure_foreground(self) -> None:
         self.ensure_owned()
@@ -2010,9 +2047,7 @@ class Instance:
         pid = w.window_pid(hwnd) if hwnd else 0
         if pid != self.pid:
             name = w.class_name(hwnd) if hwnd else "none"
-            raise InputBlocked(f"the foreground window {hwnd:#x} ({name}, pid {pid}) is not ghostty pid {self.pid}; "
-                               "no input was sent", cause="foreground_lost",
-                               other_pid=pid, other_class=name, other_image=image_name(pid))
+            raise self.blocked(f"the foreground window is {hwnd:#x} ({name}, pid {pid})", "foreground_lost", pid, name)
 
     @input_guard
     def ensure_point(self, x: int, y: int) -> None:
@@ -2022,9 +2057,8 @@ class Instance:
         if not hwnd or (w.window_pid(hwnd) != self.pid and w.root_owner_pid(hwnd) != self.pid):
             pid = w.window_pid(hwnd) if hwnd else 0
             name = w.class_name(hwnd) if hwnd else "none"
-            raise InputBlocked(f"the window at ({x}, {y}) is {hwnd:#x} ({name}, pid {pid}), not ghostty pid {self.pid}; "
-                               "no input was sent", cause="pointer_target_lost",
-                               other_pid=pid, other_class=name, other_image=image_name(pid))
+            raise self.blocked(f"the window at ({x}, {y}) is {hwnd:#x} ({name}, pid {pid})", "pointer_target_lost",
+                               pid, name)
 
     def activate(self, kind: str = "main") -> None:
         self.ensure_owned()

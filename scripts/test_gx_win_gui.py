@@ -418,6 +418,7 @@ class FakeWin32:
         self.answers: dict = {}  # message -> what send_message returns (None: no answer)
         self.messages: list = []
         self.tops: list = []  # top_windows(pid)
+        self.hung_windows: set = set()  # IsHungAppWindow
         self.layouts = [0x08040804, 0x04090409]  # GetKeyboardLayoutList, raw
         self.layout = 0x08040804  # the window thread's layout
         self.layout_follows = True  # a WM_INPUTLANGCHANGEREQUEST switches it
@@ -464,6 +465,9 @@ class FakeWin32:
 
     def window_stack(self):
         return list(self.stack)
+
+    def hung(self, hwnd):
+        return hwnd in self.hung_windows
 
     def monitors(self):
         return list(self.monitor_layout)
@@ -640,6 +644,39 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual([('instance', 'instance_gone')], [(row['event'], row['cause']) for row in rows])
         self.assertRegex(rows[0]['reason'], r'^ghostty pid \d+ had ended, or was no longer the process this tool '
                                             r'started, before the close$')
+
+    def test_a_hung_or_crashed_instance_is_a_product_cause_not_a_lost_foreground(self):
+        main = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (0, 0, 100, 100), True, False, False)
+
+        def fake(cls="Chrome_WidgetWin_1", image="C:/Program Files/Chrome/chrome.exe", hung=(), answers=False):
+            win = FakeWin32(foreground_pid=900, point_pid=900)
+            win.tops, win.hung_windows = [main], set(hung)
+            win.class_name = lambda hwnd: cls
+            win.process_image = lambda pid: "C:/g/ghostty.exe" if pid == self.PID else image
+            if answers:
+                win.answers[gui.WM_NULL] = 0
+            return win
+
+        cases = {  # name: (fake, cause, message)
+            "a window of it is hung": (fake(hung=[0x10]), "instance_hung", "IsHungAppWindow reports its GhosttyWindow 0x10"),
+            "Ghost in front, no answer": (fake(cls="Ghost", image="C:/Windows/System32/dwm.exe"), "instance_hung",
+                                          "Ghost \\(dwm.exe\\) is in front and its GhosttyWindow does not answer"),
+            "WerFault in front, no answer": (fake(image="C:/Windows/System32/WerFault.exe"), "instance_hung",
+                                             "\\(WerFault.exe\\) is in front"),
+            "Ghost in front, it answers": (fake(cls="Ghost", answers=True), "foreground_lost", "is 0x1000 \\(Ghost"),
+            "another window, no answer": (fake(), "foreground_lost", "the foreground window is 0x1000 "
+                                                                     "\\(Chrome_WidgetWin_1, pid 900\\), not ghostty pid"),
+        }
+        for name, (win, cause, message) in cases.items():
+            with self.subTest(case=name):
+                error, rows, _ = self.guard_rows(lambda instance: instance.press("enter"), win)
+                self.assertEqual((cause, cause), (error.cause, rows[-1]["cause"]))
+                self.assertRegex(str(error), message)
+                self.assertEqual([], win.sent)
+        win = fake(cls="Ghost")  # the pointer guard of a click lands on the Ghost of the hung window
+        win.foreground_pid = self.PID
+        error, rows, _ = self.guard_rows(lambda instance: instance.mouse(10, 10), win)
+        self.assertEqual(("instance_hung", "ensure_point", "Ghost"), (error.cause, rows[-1]["check"], rows[-1]["other_class"]))
 
     def test_the_caption_probe_audits_a_refusal_but_no_pass(self):
         window = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (0, 0, 400, 300), True, False, False)

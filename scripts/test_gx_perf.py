@@ -642,6 +642,21 @@ class QuietBatchTests(unittest.TestCase):
                 self.assertIn('never rerun to replace it', result['guidance'])
                 self.assertIn('failure_cause=instance_gone', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
 
+    def test_a_hung_instance_is_product_fail_too(self):
+        import gx_win_gui as real
+        sent = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
+        hung = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'fail', 'cause': 'instance_hung',
+                'reason': 'ghostty pid 42 hangs or crashed (IsHungAppWindow reports its GhosttyWindow 0x10)',
+                'other_class': 'Ghost', 'other_image': 'dwm.exe'}
+        args = self.batch_args('--injected-input')
+        exit_code, result = self.run_batch(args, self.audited(1, sent, hung))
+        self.assertEqual((6, 'PRODUCT_FAIL', 'instance_hung'), (exit_code, result['status'], result['failure_cause']))
+        self.assertIn('instance_hung: Ghostty pid 42 hangs or crashed mid-batch', ' '.join(result['errors']))
+        self.assertIn('instance_hung', gx_perf.PRODUCT_CAUSES)
+        self.assertNotIn('instance_hung', gx_perf.ENVIRONMENT_CAUSES)
+        self.assertEqual(set(real.InputBlocked.CAUSES) - {'other'},
+                         set(gx_perf.PRODUCT_CAUSES) | set(gx_perf.ENVIRONMENT_CAUSES))
+
     def test_environment_causes_are_invalid_and_unknown_causes_are_tool_errors(self):
         sent = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
         foreign = {'event': 'guard', 'check': 'idle_input_window', 'status': 'fail', 'cause': 'foreign_input',

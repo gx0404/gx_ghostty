@@ -31,7 +31,8 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         (with or without the flag) must have had no input at all since the start check.
         Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* driver exited 4), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
-        6 PRODUCT_FAIL (a measured Ghostty instance ended mid-batch: cause instance_gone).
+        6 PRODUCT_FAIL (a measured Ghostty instance ended or hung mid-batch: cause instance_gone or
+        instance_hung).
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
   win32-idle --exe PATH --out DIR [--tabs 1 --windows 1 --state visible --seconds 60]
   win32-gpu --exe PATH --out DIR              (PDH dedicated GPU bytes, 1/11 terminals)
@@ -924,10 +925,11 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
 # gx_win_gui runs these guards immediately before every SendInput (scripts/gx_win_gui.py::input_guard).
 SEND_GUARDS = ('ensure_foreground', 'ensure_point')
 # Audit causes (gx_win_gui.InputBlocked.CAUSES). Environment causes refute the plan §4 input
-# criterion (INVALID); instance_gone is a product/driver failure of the measured Ghostty and is
-# never read as noise: rerunning such a batch until one passes would cherry-pick the result.
+# criterion (INVALID); instance_gone (it ended) and instance_hung (it hangs or crashed, with a Ghost
+# or WerFault window in the way) are product/driver failures of the measured Ghostty and are never
+# read as noise: rerunning such a batch until one passes would cherry-pick the result.
 ENVIRONMENT_CAUSES = ('foreground_lost', 'pointer_target_lost', 'foreign_input')
-PRODUCT_CAUSES = ('instance_gone',)
+PRODUCT_CAUSES = ('instance_gone', 'instance_hung')
 
 
 def guard_evidence(path: Path, batch_id: str) -> dict:
@@ -935,7 +937,7 @@ def guard_evidence(path: Path, batch_id: str) -> dict:
 
     injected: input was actually sent (a passed SendInput guard or a sent key/button
     release). Failed rows are split by cause: environment (failed guards with an
-    ENVIRONMENT_CAUSES cause; nothing was sent at that point), product (instance_gone
+    ENVIRONMENT_CAUSES cause; nothing was sent at that point), product (PRODUCT_CAUSES
     rows of any event) and unexplained (any other failure: unknown or missing cause,
     a release that was not sent). Foreign, malformed or other-batch rows raise
     PerfError because the log cannot be trusted."""
@@ -967,7 +969,7 @@ def end_input(end: Mapping, probe, threshold: float) -> dict:
     win32-idle) - must have had no input at all since the start check:
     idle >= max(threshold, batch duration) on the same tick clock. Failed guards
     fail the criterion only for environment causes (foreground_lost, pointer_target_lost,
-    foreign_input); instance_gone rows are product failures handled by classify_batch;
+    foreign_input); instance_gone and instance_hung rows are product failures handled by classify_batch;
     unexplained failures (unknown cause, release not sent) are tool errors."""
     evidence = end['evidence']
     if isinstance(evidence, BaseException):
@@ -1038,7 +1040,8 @@ BATCH_GUIDANCE = {
     'NOT_STARTED': 'The start check did not pass or the slots stayed busy; the command was not run.',
     'ERROR': 'Tool or driver error: this batch is neither PASS nor FAIL evidence. Investigate before rerunning.',
     'NONCOMPLIANT': 'Quiet thresholds were weakened below plan §4 (idle < 600 s): never plan evidence.',
-    'PRODUCT_FAIL': 'A measured Ghostty instance ended or changed identity during the batch (cause instance_gone): '
+    'PRODUCT_FAIL': 'A measured Ghostty instance ended, changed identity or hung during the batch (cause '
+                    'instance_gone or instance_hung): '
                     'a FAIL-class product/driver failure, not environment noise. Keep it and count it; never rerun to '
                     'replace it; read ghostty.log, crash dumps and guards.jsonl before another attempt.',
     'RUNNING': 'The batch did not finish recording its result.',
@@ -1075,8 +1078,9 @@ def measurement_state(raised: bool, exit_code, gate_contract: bool = True) -> st
 def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool, product_failures: Sequence[Mapping] = ()) -> None:
     """Quiet validity comes only from the checks; the measurement only from the command.
     INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL.
-    A measured instance that ended mid-batch (instance_gone) is PRODUCT_FAIL even when the
-    environment was also noisy: reading it as INVALID would invite rerunning until it passes."""
+    A measured instance that ended or hung mid-batch (instance_gone, instance_hung) is PRODUCT_FAIL
+    even when the environment was also noisy: reading it as INVALID would invite rerunning until it
+    passes."""
     statuses = {name: row['status'] for name, row in after['checks'].items()}
     quiet = 'INVALID' if 'fail' in statuses.values() else 'ERROR' if 'error' in statuses.values() else 'VALID'
     result['quiet_status'], result['quiet_valid'] = quiet, quiet == 'VALID'
@@ -1089,9 +1093,10 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
     input_check = after['checks'].get('input', {})
     if product_failures:
         first = product_failures[0]
-        result['failure_cause'] = 'instance_gone'
-        result['errors'].append(f"instance_gone: Ghostty pid {first.get('instance_pid')} ended or changed identity mid-batch: "
-                                f"{first.get('reason')}")
+        cause = first.get('cause') if first.get('cause') in PRODUCT_CAUSES else 'instance_gone'
+        what = 'hangs or crashed' if cause == 'instance_hung' else 'ended or changed identity'
+        result['failure_cause'] = cause
+        result['errors'].append(f"{cause}: Ghostty pid {first.get('instance_pid')} {what} mid-batch: {first.get('reason')}")
         result['status'], result['exit'] = 'PRODUCT_FAIL', 6
     elif mode_mismatch:
         result['failure_cause'] = 'mode_mismatch'
