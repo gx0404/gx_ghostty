@@ -121,6 +121,42 @@ class EventJudgmentTests(unittest.TestCase):
         self.assertEqual(["focus_registered"], popup.missing_subscriptions({}, ["--observe-focus"]))
         self.assertEqual([], popup.missing_subscriptions({}, []))
 
+    SEARCH = {"name": "Search", "automation_id": "gx-11", "control_type": 50004, "focused": True}
+    LANGUAGE = {"name": "Language", "automation_id": "gx-13", "control_type": 50007, "focused": True}
+    THEME = {"name": "", "automation_id": "gx-11", "control_type": 50004, "focused": True}
+
+    def event(self, element, after_ready=True):
+        return {key: element[key] for key in ("name", "automation_id", "control_type")} | {"after_ready": after_ready}
+
+    def test_settings_tab_needs_an_initial_focus_and_the_event_of_the_new_one(self):
+        # Review round 4 (N4): the event must come from the element that has
+        # the focus after Tab, told apart from the one before by type and name
+        # too: Settings ids are hit positions (gx-11 before and after).
+        heard = [self.event(self.THEME)]
+        self.assertEqual([], popup.settings_tab_failures(self.LANGUAGE, self.THEME, heard))
+        self.assertEqual([], popup.settings_tab_failures(self.SEARCH, self.THEME, heard))
+        self.assertIn("no element had the keyboard focus before Tab", popup.settings_tab_failures(None, self.THEME, heard))
+        self.assertIn("Tab left the focus on the same element", popup.settings_tab_failures(self.THEME, dict(self.THEME), heard))
+        failures = popup.settings_tab_failures(self.LANGUAGE, None, heard)
+        self.assertIn("no element has the keyboard focus after Tab", failures)
+        # Another element's event, or the new one's from before ready, is no proof.
+        for events in ([self.event(self.SEARCH)], [self.event(self.LANGUAGE)], [self.event(self.THEME, after_ready=False)], []):
+            with self.subTest(events=events):
+                self.assertEqual(1, len(popup.settings_tab_failures(self.LANGUAGE, self.THEME, events)))
+
+    def test_the_focused_element_is_the_only_one_with_the_keyboard_focus(self):
+        other = {"name": "Close", "automation_id": "gx-3", "control_type": 50000, "focused": False}
+        self.assertEqual(self.LANGUAGE, popup.focused_element([other, self.LANGUAGE]))
+        self.assertIsNone(popup.focused_element([other]))
+        self.assertIsNone(popup.focused_element([self.LANGUAGE, self.THEME]))
+        rows = popup.check_focus_rows(self.THEME)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "plan.json"
+            path.write_text(json.dumps(rows), encoding="utf-8")
+            self.assertEqual(rows, worker.read_plan(path))
+        self.assertEqual([("gx-11", "check_focus", True, True)],
+                         [(r["automation_id"], r["operation"], r["expect_focus"], r["expect_focused_element"]) for r in rows])
+
     def test_terminal_and_event_checks_run_on_their_own(self):
         base = ["--exe", "ghostty.exe", "--sha256", "a" * 64, "--out", "unused"]
         for extra in (["--terminal-checks", "--actions"], ["--event-checks", "--readonly-root"]):

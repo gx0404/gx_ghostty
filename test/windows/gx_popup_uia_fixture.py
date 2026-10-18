@@ -154,6 +154,45 @@ def missing_subscriptions(ready, flags):
     return [field for flag, field in wanted if flag in flags and ready.get(field) is not True]
 
 
+def focused_element(nodes):
+    """The element of a probe that reports HasKeyboardFocus; None when none
+    or several do."""
+    focused = [node for node in nodes if node.get("focused") is True]
+    return focused[0] if len(focused) == 1 else None
+
+
+def same_element(first, second):
+    """Whether two probes' elements are one control. Settings automation ids
+    are hit positions (gx-N), which another section reuses for another
+    control, so its type and name are compared with it."""
+    return all(first.get(key) == second.get(key) for key in ("automation_id", "control_type", "name"))
+
+
+def check_focus_rows(node):
+    """A worker plan checking that `node`, taken from its own enumeration, has
+    HasKeyboardFocus and is what GetFocusedElement returns."""
+    return [{"automation_id": node["automation_id"], "pattern": "element", "operation": "check_focus",
+             "expect_focus": True, "expect_focused_element": True}]
+
+
+def settings_tab_failures(before, after, events):
+    """N4 (review round 4): Settings had a focused element before Tab, another
+    one has the focus after it, and a FocusChanged event from exactly that
+    element (id, type and name) arrived after the worker's ready file. Returns
+    the failures, empty when all hold."""
+    failures = []
+    if before is None:
+        failures.append("no element had the keyboard focus before Tab")
+    if after is None:
+        failures.append("no element has the keyboard focus after Tab")
+        return failures
+    if before is not None and same_element(before, after):
+        failures.append("Tab left the focus on the same element")
+    if not later_events(events, automation_id=after.get("automation_id"), control_type=after.get("control_type"), name=after.get("name")):
+        failures.append(f"no FocusChanged from {after.get('name')!r} ({after.get('automation_id')}) after ready")
+    return failures
+
+
 def choose_popup(windows):
     return next((window for window in windows if window.cls in POPUP_CLASSES), None)
 
@@ -352,7 +391,7 @@ class Fixture:
         assert len(observation["actions"]) == 1
         self.record(name, "PASS", case_id="UIA-01", native=observation, boundary="COM action accepted; resulting UI separately reviewed")
 
-    def focus_plan(self, instance, popup, name, rows):
+    def focus_plan(self, instance, popup, name, rows, case_id="UIA-01"):
         """One external MTA worker holds every target from one enumeration, moves
         the focus, then acts on the elements it already holds (UIA-01)."""
         plan = self.out / (name + ".plan.json")
@@ -369,7 +408,7 @@ class Fixture:
         observation = json.loads(result.stdout)
         if len(observation["actions"]) != len(rows):
             raise AssertionError(f"dynamic focus sequence ran {len(observation['actions'])} of {len(rows)} actions")
-        self.record(name, "PASS", case_id="UIA-01", native=observation,
+        self.record(name, "PASS", case_id=case_id, native=observation,
                     boundary="focus moved; elements held from before the move still answer and act")
         return observation
 
@@ -718,18 +757,28 @@ class Fixture:
             failures.append(f"N3 palette Down: ElementSelected for {expected['name']}={bool(received)}, Search controls Results={controls}")
         self.close_popup(instance, palette)
 
+        # N4 (review round 4): Settings opens with a focused element, which
+        # GetFocusedElement confirms; Tab switches the section, whose default
+        # control gets the focus. The event must come from the element that
+        # then has HasKeyboardFocus and is GetFocusedElement, in a fresh tree.
         settings = self.open_popup(instance, "ctrl+comma")
+        before = focused_element(self.uia(instance, settings.hwnd, "events-settings-before", ())["nodes"])
+        if before is None:
+            raise AssertionError("N4: Settings opened without exactly one element with the keyboard focus")
+        self.focus_plan(instance, settings, "events-settings-before-focus", check_focus_rows(before), case_id="UIA-06")
         result = self.observe(instance, settings.hwnd, "events-settings", ["--observe-focus", "--observe-selection"],
                               lambda: instance.press("tab"))
-        before = next((node for node in result["nodes"] if node.get("focused")), None)
-        moved = [event for event in later_events(result["focus_events"])
-                 if before is None or (event.get("automation_id"), event.get("name")) != (before["automation_id"], before["name"])]
-        self.capture(instance, settings.hwnd, "events-settings-tab", "设置浮层按 Tab 后焦点环移到下一个控件")
-        self.record("UIA-06/N4-settings-tab", "PASS" if moved else "FAIL", case_id="UIA-06",
-                    before=before and before["name"], focus_events=result["focus_events"],
-                    selection_events=result["selection_events"], evidence="events-settings.stdout.json")
-        if not moved:
-            failures.append("N4 settings Tab: no FocusChanged event for another element")
+        after = focused_element(self.uia(instance, settings.hwnd, "events-settings-after", ())["nodes"])
+        if after is not None:
+            self.focus_plan(instance, settings, "events-settings-after-focus", check_focus_rows(after), case_id="UIA-06")
+        n4 = settings_tab_failures(before, after, result["focus_events"])
+        self.capture(instance, settings.hwnd, "events-settings-tab",
+                     f"设置浮层按 Tab 换到下一分区，焦点环在 {after and after['name']!r}（之前 {before['name']!r}）")
+        self.record("UIA-06/N4-settings-tab", "FAIL" if n4 else "PASS", case_id="UIA-06", before=before, after=after,
+                    failures=n4, focus_events=result["focus_events"], selection_events=result["selection_events"],
+                    evidence=["events-settings-before-uia.json", "events-settings-before-focus.json", "events-settings.stdout.json",
+                              "events-settings-after-uia.json", "events-settings-after-focus.json"])
+        failures += [f"N4 settings Tab: {failure}" for failure in n4]
         self.close_popup(instance, settings)
         images = ["events-menu-down.png", "events-palette-down.png", "events-settings-tab.png"]
         write_review(self.out, "UIA-06", "D-03 N2-N4 focus and selection events received by a real client", "host",
