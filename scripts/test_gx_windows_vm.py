@@ -798,6 +798,13 @@ $fakeBase = New-Object psobject
 $fakeBase | Add-Member ScriptMethod CreateSubKey { param($k) [void]$script:Log.Add('key ' + $k); $fakeKey }
 $fakeBase | Add-Member ScriptMethod Dispose { }
 function Open-HkcuBase { $fakeBase }
+# The Settings switch fake: records the call; $script:SwitchFixes makes it take effect.
+$script:SwitchFixes = $false
+function Set-ToastSwitchInSettings($Aumid) {
+    [void]$script:Log.Add('switch ' + $Aumid)
+    if ($script:SwitchFixes) { $script:Seen = New-Object System.Collections.Queue; $script:Seen.Enqueue('Enabled') }
+    [ordered]@{ found=$true; toggles=@() }
+}
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\N\gx0404.GhosttyGX'
 $script:ToastSettleSeconds = @{ explicit=1; restore=1 }
@@ -814,23 +821,41 @@ $ok = Restore-ToastSettings
 $script:Seen = New-Object System.Collections.Queue
 $script:Seen.Enqueue('DisabledForApplication')
 $stuck = Restore-ToastSettings
+# Only the Settings switch refreshes the platform: the key write alone stays disabled.
+$script:Seen = New-Object System.Collections.Queue
+$script:Seen.Enqueue('DisabledForApplication')
+$script:SwitchFixes = $true
+$switched = Restore-ToastSettings
+$script:SwitchFixes = $false
+$script:Seen = New-Object System.Collections.Queue
+$script:Seen.Enqueue('DisabledForApplication')
 # A backup with Enabled=0 is put back as disabled, and that is what must take effect.
 function Read-Record($Name) { [pscustomobject]@{ restored=$false; before=[pscustomobject]@{ exists=$true;
     values=[pscustomobject]@{ 'value:Enabled'=[pscustomobject]@{ kind='DWord'; data=0 } } } } }
 $disabled = Restore-ToastSettings
-ConvertTo-GxJson ([ordered]@{ ok=$ok; stuck=$stuck; disabled=$disabled; log=@($script:Log) }) -Compress
+ConvertTo-GxJson ([ordered]@{ ok=$ok; stuck=$stuck; switched=$switched; disabled=$disabled; log=@($script:Log) }) -Compress
 """
         out = self.run_body(body, ("ConvertTo-GxJson", "Wait-ToastSetting", "Restore-ToastSettings"), ("LF", "JsonSource"))
         self.assertTrue(out["ok"]["ok"])
         self.assertEqual(out["ok"]["effective"]["want"], "Enabled")
         self.assertTrue(out["ok"]["effective"]["after_explicit"]["reached"])
+        self.assertIsNone(out["ok"]["effective"]["settings_switch"])
         self.assertFalse(out["stuck"]["ok"])
         self.assertEqual(out["stuck"]["effective"]["after_restore"]["setting"], "DisabledForApplication")
+        self.assertTrue(out["stuck"]["effective"]["settings_switch"]["found"])
+        self.assertTrue(out["switched"]["ok"])
+        self.assertTrue(out["switched"]["effective"]["after_switch"]["reached"])
+        # A backup that disabled the app never touches the Settings switch.
+        self.assertIsNone(out["disabled"]["effective"]["settings_switch"])
+        self.assertEqual([x for x in out["log"] if x.startswith("switch ")], ["switch gx0404.GhosttyGX"] * 2)
         self.assertEqual(out["disabled"]["effective"]["want"], "DisabledForApplication")
         self.assertTrue(out["disabled"]["ok"])
         # Each run writes Enabled first and restores the exact backup only afterwards.
         self.assertEqual(out["log"][:3], ["key Software\\N\\gx0404.GhosttyGX", "set Enabled=1",
                                           "restore toast-notification-settings"])
+        # The switch runs before the exact backup is restored.
+        self.assertEqual(out["log"][3:7], ["key Software\\N\\gx0404.GhosttyGX", "set Enabled=1",
+                                           "switch gx0404.GhosttyGX", "restore toast-notification-settings"])
         self.assertEqual(out["log"][-2:], ["set Enabled=0", "restore toast-notification-settings"])
 
     def test_acl_comparison_ignores_only_the_auto_inherited_flags(self):

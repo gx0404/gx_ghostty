@@ -1641,13 +1641,59 @@ function Wait-ToastSetting([string]$Aumid, [string]$Want, [int]$Seconds) {
         samples=@($samples | Select-Object -Last 8) }
 }
 
-$script:ToastSettleSeconds = @{ explicit=30; restore=15 }
+$script:ToastSettleSeconds = @{ explicit=10; restore=15 }
+
+function Set-ToastSwitchInSettings([string]$Aumid) {
+    # Writing the per-app key does not refresh the platform's cached setting (O10 on Win11: 30 s of
+    # DisabledForApplication with Enabled=1, also after restarting WpnUserService); the switch on
+    # Settings > System > Notifications does. Drive it through UI Automation: from On (stale) it
+    # goes Off then On. The Settings window is closed again when this step opened it.
+    $facts = [ordered]@{ aumid=$Aumid; automation_id=($Aumid + '0_ToggleSwitch'); found=$false; state_before=$null;
+        toggles=@(); settings_window_preexisting=$null; closed_window=$false; error=$null }
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+        $root = [Windows.Automation.AutomationElement]::RootElement
+        $nameCond = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::NameProperty, 'Settings')
+        $facts.settings_window_preexisting = ($null -ne $root.FindFirst([Windows.Automation.TreeScope]::Children, $nameCond))
+        Start-Process 'ms-settings:notifications'
+        $idCond = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::AutomationIdProperty, $facts.automation_id)
+        $window = $null
+        $toggle = $null
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($null -eq $toggle -and $clock.Elapsed.TotalSeconds -lt 20) {
+            Start-Sleep -Milliseconds 500
+            $window = $root.FindFirst([Windows.Automation.TreeScope]::Children, $nameCond)
+            if ($null -ne $window) { $toggle = $window.FindFirst([Windows.Automation.TreeScope]::Descendants, $idCond) }
+        }
+        if ($null -eq $toggle) { $facts.error = 'the app switch was not found on the Notifications page'; return $facts }
+        $facts.found = $true
+        $pattern = $toggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+        $facts.state_before = [string]$pattern.Current.ToggleState
+        $toggles = New-Object System.Collections.Generic.List[object]
+        foreach ($attempt in 1..3) {
+            $pattern.Toggle()
+            Start-Sleep -Milliseconds 1500
+            $state = [string]$pattern.Current.ToggleState
+            $setting = Get-ToastSetting $Aumid
+            $toggles.Add([ordered]@{ attempt=$attempt; state=$state; setting=$setting })
+            if ($state -ceq 'On' -and $setting -ceq 'Enabled') { break }
+        }
+        $facts.toggles = @($toggles)
+        if (-not $facts.settings_window_preexisting -and $null -ne $window) {
+            try { $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close(); $facts.closed_window = $true }
+            catch { $facts.error = 'closing Settings: ' + $_.Exception.Message }
+        }
+    } catch { $facts.error = $_.Exception.Message }
+    return $facts
+}
 
 function Restore-ToastSettings {
     # Restoring the backed-up key alone did not re-enable notifications in r6a: with Enabled
     # removed the platform kept DisabledForApplication until the Settings switch was toggled.
     # First write the backed-up Enabled state explicitly (1 unless the backup had 0) and wait until
-    # the platform reports it, then restore the exact backup and check the effective setting again.
+    # the platform reports it; when it does not, toggle the app's switch in Settings (the only
+    # path that refreshed the platform). Then restore the exact backup and check the effective
+    # setting again.
     $record = Read-Record 'toast-notification-settings'
     if ($null -eq $record -or $record.restored) { return [ordered]@{ registry=(Restore-HkcuKey 'toast-notification-settings'); effective=$null; ok=$true } }
     $enabled = 1
@@ -1661,10 +1707,17 @@ function Restore-ToastSettings {
         try { $key.SetValue('Enabled', $enabled, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
     } finally { $base.Dispose() }
     $explicit = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.explicit
+    $switch = $null
+    $afterSwitch = $null
+    if (-not $explicit.reached -and $want -ceq 'Enabled') {
+        $switch = Set-ToastSwitchInSettings $script:InstalledAumid
+        $afterSwitch = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.restore
+    }
     $registry = Restore-HkcuKey 'toast-notification-settings'
     $after = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.restore
     return [ordered]@{ registry=$registry; effective=[ordered]@{ before=$effectiveBefore; want=$want; explicit_value=$enabled;
-        after_explicit=$explicit; after_restore=$after }; ok=($registry.restored -and $after.reached) }
+        after_explicit=$explicit; settings_switch=$switch; after_switch=$afterSwitch; after_restore=$after };
+        ok=($registry.restored -and $after.reached) }
 }
 
 # Diagnostic only: the shell's quiet-hours (Focus assist / Do not disturb)
@@ -2621,7 +2674,7 @@ function Invoke-ToastMatrix {
             $settings = Restore-ToastSettings
             $script:Restore = $settings.registry
             $reason = if ($settings.ok) { $null } elseif (-not $settings.registry.restored) { 'the notification settings key was not restored' }
-                else { 'the effective notifier setting stayed ' + $settings.effective.after_restore.setting + '; toggle the app in Settings > System > Notifications' }
+                else { 'the effective notifier setting stayed ' + $settings.effective.after_restore.setting + ' after the Settings switch; see effective.settings_switch' }
             return [ordered]@{ restore=$script:Restore; effective=$settings.effective; installed=(Get-ToastFacts $script:InstalledAumid);
                 fixture_verdict=$(if ($settings.ok) { 'PASS' } else { 'FAIL' }); fixture_reason=$reason }
         }
