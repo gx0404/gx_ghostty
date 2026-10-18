@@ -1904,7 +1904,9 @@ def idle_state_entry(gui, instance, capture, args) -> dict:
              'foreground_class': w.class_name(hwnd) if hwnd else 'none',
              'foreground_image': gui.image_name(pid) if pid else None}
     capture.report['idle_state_entry'] = entry
-    if args.state == 'minimized':
+    if args.state == 'visible' and pid != instance.pid:
+        raise PerfError('idle state entry failed: measured main process does not own the foreground')
+    elif args.state == 'minimized':
         windows = main_windows(gui, instance)
         if not windows or any(not w.IsIconic(window.hwnd) for window in windows):
             raise PerfError('idle state entry failed: measured windows are not all minimized')
@@ -1927,7 +1929,8 @@ def idle_state_check(gui, instance, args, helper=None, *, entry_tick: int) -> No
     foreground_lost         another process took the foreground of a visible instance (INVALID).
     instance_self_activated without input since the state entry the measured process took the foreground
                             back from its live focus helper, or one of its own minimized windows was
-                            restored (PRODUCT_FAIL): measure_idle activates and restores none of them.
+                            restored, or a descendant took the visible main process's foreground
+                            (PRODUCT_FAIL): measure_idle activates and restores none of them.
     In the unfocused state another process in front leaves the instance unfocused: that is no failure.
     """
     instance.ensure_owned()
@@ -1935,10 +1938,12 @@ def idle_state_check(gui, instance, args, helper=None, *, entry_tick: int) -> No
     hwnd = w.foreground()
     pid = w.window_pid(hwnd) if hwnd else 0
     details = {}
+    unchanged = False
+    owned_foreground = False
     if args.state == 'visible':
-        if instance.contains_pid(pid):
-            return
-        message = 'visible measured process lost focus'
+        unchanged = pid == instance.pid
+        owned_foreground = unchanged or instance.contains_pid(pid)
+        message = 'visible measured process kept focus' if unchanged else 'visible measured process lost focus'
     elif args.state == 'unfocused':
         if not instance.contains_pid(pid):
             return
@@ -1966,11 +1971,14 @@ def idle_state_check(gui, instance, args, helper=None, *, entry_tick: int) -> No
     elif last_input != entry_tick:
         cause = 'foreign_input'
         message = f'input arrived after the state entry (last input tick {entry_tick} -> {last_input}): {message}'
-    elif args.state == 'visible' or (args.state == 'unfocused' and helper is None):
+    elif unchanged:
+        return
+    elif (args.state == 'visible' and not owned_foreground) or (args.state == 'unfocused' and helper is None):
         cause = 'foreground_lost'  # another process holds the foreground, or no live focus helper is known
     else:
         cause = 'instance_self_activated'
-        what = ('took the foreground back from its live focus helper' if args.state == 'unfocused'
+        what = ('handed the foreground to its descendant process' if args.state == 'visible'
+                else 'took the foreground back from its live focus helper' if args.state == 'unfocused'
                 else 'restored a minimized window')
         message = f'ghostty pid {instance.pid} {what} without input since the state entry: {message}'
     instance.record_input('guard', check='idle_state_window', status='fail', cause=cause, reason=message,

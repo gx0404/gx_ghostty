@@ -1383,6 +1383,8 @@ class ExperimentTests(unittest.TestCase):
 
     def test_idle_interval_excludes_setup_events_and_records_cpu(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        instance.hang_evidence.return_value = None
+        gui.win32.return_value.foreground.return_value = 0x77
         gui.win32.return_value.window_pid.return_value = instance.pid
         instance.log = self.root / 'idle.log'
         instance.log.write_text('info(gx_perf): metric proc.snapshot 99\n', encoding='utf-8')
@@ -1404,6 +1406,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_idle_thread_churn_preserves_p2_but_foreign_input_rejects(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        gui.win32.return_value.foreground.return_value = 0x77
         instance.hang_evidence.return_value = None
         instance.log = self.root/'idle.log'
         instance.log.write_text('', encoding='utf-8')
@@ -1467,6 +1470,44 @@ class ExperimentTests(unittest.TestCase):
         raised, _ = self.idle_end('unfocused', 84, descendants=True,
                                   helper=mock.Mock(pid=50, **{'alive.return_value': True}))
         self.assertEqual('instance_self_activated', raised.cause)
+
+    def test_visible_descendants_hang_and_input_priority(self):
+        for pid in (84, 85):  # child and grandchild are both proven by contains_pid
+            for hang, tick, expected in [(None, 1, 'instance_self_activated'),
+                                          (None, 2, 'foreign_input'),
+                                          ('hung window', 1, 'instance_hung'),
+                                          ('hung window', 2, 'instance_hung')]:
+                with self.subTest(pid=pid, hang=hang, tick=tick):
+                    raised, instance = self.idle_end('visible', pid, descendants=True, hang=hang,
+                                                     ticks=[(1, 10), (1, 20), (tick, 21)])
+                    self.assertEqual(expected, getattr(raised, 'cause', None))
+                    self.assertEqual(expected, instance.record_input.call_args.kwargs['cause'])
+
+    def test_visible_main_process_remains_valid_but_hang_or_input_is_reported(self):
+        for hang, tick, expected in [(None, 1, None), (None, 2, 'foreign_input'),
+                                      ('hung window', 1, 'instance_hung'), ('hung window', 2, 'instance_hung')]:
+            with self.subTest(hang=hang, tick=tick):
+                raised, instance = self.idle_end('visible', 42, hang=hang,
+                                                 ticks=[(1, 10), (1, 20), (tick, 21)])
+                self.assertEqual(expected, getattr(raised, 'cause', None))
+                if expected is None:
+                    instance.record_input.assert_not_called()
+
+    def test_visible_entry_requires_main_process_in_foreground(self):
+        for pid in (0, 7, 42, 84, 85):
+            instance, gui = mock.Mock(pid=42), mock.Mock()
+            instance.contains_pid.side_effect = lambda value: value in (42, 84, 85)
+            gui.win32.return_value.window_pid.return_value = pid
+            with self.subTest(pid=pid), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 2)):
+                capture = SimpleNamespace(report={})
+                if pid == 42:
+                    entry = gx_perf.idle_state_entry(gui, instance, capture, SimpleNamespace(state='visible'))
+                    self.assertEqual(42, entry['foreground_pid'])
+                else:
+                    with self.assertRaises(gx_perf.PerfError) as raised:
+                        gx_perf.idle_state_entry(gui, instance, capture, SimpleNamespace(state='visible'))
+                    self.assertIsNone(raised.exception.cause)
+                instance.record_input.assert_not_called()
 
     def test_state_entry_rejects_failed_arrangement(self):
         instance, gui = mock.Mock(pid=42), mock.Mock()
