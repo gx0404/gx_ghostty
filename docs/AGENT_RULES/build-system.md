@@ -62,9 +62,10 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 | help 字符串、Unicode 表、`+boo` 动画帧、terminfo、补全与编辑器语法、GTK gresource | `src/build/` 的 `HelpStrings`、`UnicodeTables`、`GhosttyFrameData`、`GhosttyResources` 等 | 只在 `.zig-cache/`；gresource 与动画帧另由 `dist` 预生成进源码包 |
 | `graphify-out/` 入库部分、`docs/kb/chunks.json` | `just graph`、`just kb` | 见 `development.md` |
 | `src/gx/i18n/zh_CN.zig` | `just i18n`（`scripts/gx_i18n.py`） | `just i18n-check`，见 `gx-core.md` |
-| `src/gx/pinyin/initials.zig`（数据来自钉版 pinyin-data，两份许可原文在同目录，随包许可见 `packaging-dist.md`） | `just pinyin`（`scripts/gx_pinyin.py --download`，联网） | `just pinyin-check`（离线校验摘要），见 `gx-core.md` |
+| `src/gx/pinyin/{initials,syllables}.zig`（输入是 `src/gx/pinyin/inputs/0.15.0/` 的钉版 pinyin-data，两份许可原文与生成物同目录，随包许可见 `packaging-dist.md`） | `just pinyin`（`scripts/gx_pinyin.py`，离线；显式 `--download` 才联网） | `just pinyin-check`（离线校验摘要并完整再生成比对），见 `gx-core.md` |
+| `src/gx/fluent/paths.zig`（输入是 `src/gx/fluent/inputs/` 的钉版 MIT SVG 与 `LICENSE`） | `just fluent`（`scripts/gx_fluent_icons.py`，离线） | `just fluent-check`（离线，不写文件），见 `gx-core.md` |
 
-翻译表与拼音表的检查都进 `just framework-check` 与 `just generated-check`（链见 `development.md`），不需要 Zig。
+翻译表与拼音表的检查都进 `just framework-check` 与 `just generated-check`，Fluent 路径的检查只进后者（链见 `development.md`）；三者都不需要 Zig。
 
 `nix/zigCacheHash.nix` 不被任何 Nix 表达式引用（`HACKING.md` 对它的说明与脚本不符）；`nix/build-support/update-mirror.nu` 向上游镜像上传依赖，fork 不用。
 

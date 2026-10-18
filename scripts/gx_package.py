@@ -85,8 +85,8 @@ Windows layout (top level exactly app/, fonts/, build-inputs/ and the manifest)
   app/                  the portable directory of gx_windows_package.build_tree without fonts/:
                         ghostty.exe, conpty.dll, OpenConsole.exe, mesa/, share/ (with
                         share/terminfo/ghostty.terminfo and fork themes), licenses/ (Ghostty-MIT.txt,
-                        THIRD-PARTY.txt and the ConPTY, Mesa, LLVM, font, pinyin-data and Unicode
-                        license texts), README.txt
+                        THIRD-PARTY.txt and the ConPTY, Mesa, LLVM, font, pinyin-data, Unicode and
+                        Fluent UI System Icons license texts), README.txt
   fonts/                the 8 pinned fonts of gx_release.WINDOWS_FONTS; GX Shell merges component fonts
                         only when the bytes match, so the four Oh My Zsh GX also ships are identical
   build-inputs/ghostty.ico   dist/windows/gx/ghostty-gx.ico (the Ghostty GX icon, see scripts/gx_icon.py)
@@ -105,7 +105,7 @@ Deb layout (top level exactly root/, fonts/ and the manifest)
                              Icon=com.gx0404.ghostty-gx, StartupWMClass=com.mitchellh.ghostty
   root/usr/share/icons/hicolor/<N>x<N>/apps/com.gx0404.ghostty-gx.png   from images/gnome/<N>.png
   root/usr/share/doc/ghostty-gx/copyright   machine-readable copyright (Ghostty MIT, fonts OFL-1.1,
-                             the pinyin table compiled into bin/ghostty MIT and Unicode-3.0)
+                             the pinyin tables compiled into bin/ghostty MIT and Unicode-3.0)
   fonts/                     the same 8 pinned fonts
 The deb --prefix is a plain prefix (bin/ghostty, share/, lib/) or a DESTDIR tree whose usr/ is that
 prefix; the binary must be an x86-64 ELF that embeds VS, without DT_RPATH and with no RUNPATH entry
@@ -476,9 +476,9 @@ def copyright_file(root: Path, fonts: Path, ofl: str) -> str:
         f"Copyright: {pinyin}",
         f" {unicode}",
         "License: MIT and Unicode-3.0",
-        "Comment: The pinyin initials compiled into bin/ghostty, generated from pinyin-data",
-        f" {gx_pinyin.SOURCE_VERSION} (https://github.com/mozillazg/pinyin-data, MIT), whose readings come",
-        " from the Unicode Unihan database (Unicode License V3).",
+        "Comment: The pinyin tables (initials and syllables) compiled into bin/ghostty, generated from",
+        f" pinyin-data {gx_pinyin.SOURCE_VERSION} (https://github.com/mozillazg/pinyin-data, MIT), whose readings",
+        " come from the Unicode Unihan database (Unicode License V3).",
         "",
         "License: MIT",
         *dep5_text(license_text),

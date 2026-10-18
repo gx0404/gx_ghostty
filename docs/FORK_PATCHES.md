@@ -1317,7 +1317,7 @@ python -m unittest scripts.test_fork_patches -v
 - 原因：GX-0004 已把请求接到 Windows WGL，字段文档却仍写只支持 macOS。
 - 行为不变：支持 swap-control 的 context 请求 0/1；驱动可能覆盖或拒绝。reload 仅影响新终端，context reset 保留原请求；关闭 vsync 不移除 `gl.finish()`，不保证任意刷新率。
 - 移除条件：上游字段文档覆盖同等 Windows 实现时移除，登记改为 removed。
-- 验证：`just build -Demit-webdata` 的生成文档及隔离 `+show-config --default --docs`；`Gx0033ShapeTests` 锁定请求/重载/恢复/finish 边界。驱动是否接受需渲染线程实测，日志参数不能代证。
+- 验证：`just build -Demit-webdata` 的生成文档及隔离 `+show-config --default --docs`。`Gx0033ShapeTests` 只锁定字段文档措辞（标记、WGL、true/false 对应 interval 1/0、驱动可覆盖、重建保留原请求、`gl.finish()`、重载只影响新终端，且不再写仅 macOS），不检查代码，也没有 Zig 单测断言 swap interval 的实参。请求、重载、恢复与 finish 的代码边界由 R6 C8 读码核实（`src/renderer/OpenGL.zig::init` 把 `vsync` 交给 `src/renderer/opengl/wgl.zig::Context`，`Context.threadEnter` 经 `wglSwapIntervalEXT` 请求，`Context.recover` 沿用同一请求，`src/renderer/generic.zig::Renderer.changeConfig` 不改它，`src/renderer/opengl/Frame.zig` 的 `gl.finish()` 与之无关），运行期由 Windows Debug 场景 W90/W91 的日志核实（`window-vsync=false` 时 `vsync=false`，模拟 context reset 后仍是 `vsync=false`；默认 `vsync=true`），证据在本机 `.local/evidence/R5/execution-20261013/final-r3/C8/`。驱动是否接受需渲染线程实测，日志参数不能代证。
 
 ## GX-0034 GTK 系统光标闪烁偏好的默认层接入
 
