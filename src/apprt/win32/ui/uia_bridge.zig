@@ -735,10 +735,11 @@ pub const PopupBridge = struct {
             self.focus_reported = null;
             return;
         };
-        if (self.focus_reported) |reported| if (reported == focused) return;
         // The element whose event is being raised right now (a publication
-        // reentering `dispatchFocusChanged`) counts as reported.
-        if (self.raising.focus) |raising| if (raising == focused) return;
+        // reentering `dispatchFocusChanged`) supersedes the previous report.
+        // Returning to that previous element still needs a new event.
+        const reported = self.raising.focus orelse self.focus_reported;
+        if (reported) |last| if (last == focused) return;
         if (new_snapshot) _ = self.publisher.queueFocusChanged();
     }
     /// A focus-only rebuild (`focus_only`). When its specs describe the
@@ -1822,6 +1823,9 @@ const ReentryProbe = struct {
         fn focusCancel() void {
             dialog(2) catch unreachable;
         }
+        fn focusAllow() void {
+            dialog(0) catch unreachable;
+        }
         fn hide() void {
             bridge.hide();
         }
@@ -1936,6 +1940,55 @@ test "popup focus dispatch records what it raised when a publication reenters it
     try Probe.Target.dialog(2);
     try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
     try testing.expectEqual(@as(usize, 3), Probe.raised);
+}
+
+test "popup focus return during UIA dispatch is reported once by the latest snapshot" {
+    const testing = std.testing;
+    const Probe = ReentryProbe;
+    // Cover both immediate delivery and a republication that revokes the
+    // return event before the message loop can deliver it.
+    for ([_]bool{ false, true }) |republish| {
+        const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+        const sink = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+        defer {
+            var drained: w32.MSG = undefined;
+            while (w32.PeekMessageW(&drained, sink, 0, 0, w32.PM_REMOVE) != 0) {}
+            _ = w32.DestroyWindow(sink);
+        }
+        Probe.reset();
+        var api: uia.Api = undefined;
+        api.count = .init(1);
+        api.event = Probe.raise;
+        api.notification = null;
+        defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+        var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = sink };
+        defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+        defer queue.close();
+        defer Probe.drain(&queue);
+        var bridge: PopupBridge = .{};
+        defer bridge.deinit();
+        Probe.Target.bridge = &bridge;
+        Probe.Target.api = &api;
+        Probe.Target.queue = &queue;
+
+        try Probe.Target.dialog(0);
+        try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 1), Probe.raised);
+        try Probe.Target.dialog(1);
+        Probe.reenter = Probe.Target.focusAllow;
+        try testing.expectEqual(Probe.Step.dispatched, try Probe.one(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 2), Probe.raised);
+        if (republish) try Probe.Target.dialog(0);
+        const newest = bridge.publisher.current.?;
+        try testing.expectEqual(@as(usize, if (republish) 1 else 0), try Probe.all(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 3), Probe.raised);
+        try testing.expectEqual(&newest.nodes[1].faces[0], Probe.senders[2]);
+        try testing.expectEqual(@as(i32, 20005), Probe.events[2]);
+        // The return was delivered, so an unchanged publication is silent.
+        try Probe.Target.dialog(0);
+        try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 3), Probe.raised);
+    }
 }
 
 test "popup dispatch touches nothing of a bridge hidden or freed during its UIA call" {
