@@ -701,9 +701,48 @@ fn menuButtonAnchor(window: *Window) w32.RECT {
 /// its labels would stay in the old language) and for the destruction of
 /// its owner (`MenuPopup.onOwnerDestroyed`), nothing else.
 pub fn invalidateWindow(window: *Window) void {
-    window.palette.invalidateHost();
+    // A theme preview step retires the hosts like any change; the change
+    // that ends the preview asks to prepare them (`applyThemePreview`).
+    if (theme_preview_step) window.palette.retireHost() else window.palette.invalidateHost();
     Settings.invalidateOwner(window);
     if (window.hwnd) |hwnd| MenuPopup.invalidateOwner(hwnd);
+}
+
+/// Whether the configuration being applied is a theme preview step
+/// (`applyThemePreview`). GUI thread.
+var theme_preview_step = false;
+
+/// Apply `config`, a theme preview step (`Palette.applyTheme`,
+/// `Settings.applyConfig` with a theme override). Its configuration change
+/// retires the hidden hosts like any other, but asks no idle preparation
+/// of them: browsing themes does not rebuild the hidden UI of every window
+/// at each step. A preview ends with a change that is not a step (the saved
+/// theme again, or the one saved), which asks for it once; when it ends
+/// without one, the next opening rebuilds what is stale.
+pub fn applyThemePreview(app: *App, config: *configpkg.Config) !void {
+    theme_preview_step = true;
+    defer theme_preview_step = false;
+    try app.applyConfig(config);
+}
+
+test "P4 a theme preview step retires hidden hosts without asking to prepare them" {
+    // Browsing themes applies a configuration at every step. The hosts are
+    // stale after each like after any change, but rebuilding every window's
+    // hidden UI at each step is wasted: only the change that ends the
+    // preview asks idle preparation for it.
+    var fixture: InvalidationFixture = undefined;
+    fixture.init();
+    fixture.settle();
+    theme_preview_step = true;
+    for (fixture.windows) |owner| invalidateWindow(owner);
+    theme_preview_step = false;
+    for (fixture.windows) |owner| {
+        try std.testing.expect(owner.palette.popup.reuse_invalid);
+        try std.testing.expect(owner.palette.item_cache.stamp == null);
+        try std.testing.expect(!owner.palette.preparation.isPending());
+    }
+    for (fixture.windows) |owner| invalidateWindow(owner);
+    try std.testing.expect(try fixture.retired());
 }
 
 /// What hidden popup hosts draw with from the system (`style.system`):

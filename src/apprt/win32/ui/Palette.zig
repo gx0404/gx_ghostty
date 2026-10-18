@@ -503,8 +503,16 @@ pub fn prepare(self: *Palette) bool {
     return true;
 }
 
+/// The hidden host is stale (`Menu.invalidateWindow`): the next opening
+/// rebuilds it and its entries, and idle preparation is asked to.
 pub fn invalidateHost(self: *Palette) void {
     self.preparation.request();
+    self.retireHost();
+}
+
+/// Mark the hidden host and its cached entries stale without asking idle
+/// preparation to rebuild them (a theme preview step).
+pub fn retireHost(self: *Palette) void {
     self.popup.reuse_invalid = true;
     self.item_cache.stamp = null;
 }
@@ -1705,7 +1713,8 @@ fn applyTheme(self: *Palette, theme: ?[]const u8) void {
     };
     defer config.deinit();
     gx.perf.count("theme.reload", 1);
-    app.applyConfig(&config) catch |err| {
+    const applied = if (theme != null) @import("Menu.zig").applyThemePreview(app, &config) else app.applyConfig(&config);
+    applied catch |err| {
         log.warn("cannot apply a theme preview err={}", .{err});
         return;
     };

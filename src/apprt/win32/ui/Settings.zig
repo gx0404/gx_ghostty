@@ -2547,7 +2547,8 @@ fn applyConfig(self: *Settings, theme: ?[]const u8, theme_action: bool) bool {
     if (gx.perf.enabled()) {
         if (theme_action or preview or self.app.config.changed(&config, .theme)) gx.perf.count("theme.reload", 1);
     }
-    self.app.applyConfig(&config) catch |err| return self.applyFailed(preview, err);
+    const applied = if (preview) @import("Menu.zig").applyThemePreview(self.app, &config) else self.app.applyConfig(&config);
+    applied catch |err| return self.applyFailed(preview, err);
     self.applied_inputs = inputsDigest(&self.app.config);
     if (!preview) self.applied_preview = null;
     self.configApplied(preview);
