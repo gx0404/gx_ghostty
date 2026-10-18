@@ -1759,14 +1759,19 @@ def same_path(a: str | Path, b: str | Path) -> bool:
 
 
 def input_guard(function):
+    """Audit a guard: every refusal, and every pass unless probe=True says that no input follows (a
+    passed guard is how quiet-batch tells that the batch injected input)."""
     @functools.wraps(function)
-    def checked(self, *args, **kwargs):
+    def checked(self, *args, probe: bool = False, **kwargs):
         try:
             result = function(self, *args, **kwargs)
         except InputBlocked as exc:
-            self.record_input('guard', check=function.__name__, status='fail', cause=exc.cause, reason=str(exc), **exc.details)
+            extra = {'probe': True} if probe else {}
+            self.record_input('guard', check=function.__name__, status='fail', cause=exc.cause, reason=str(exc),
+                              **extra, **exc.details)
             raise
-        self.record_input('guard', check=function.__name__, status='pass')
+        if not probe:
+            self.record_input('guard', check=function.__name__, status='pass')
         return result
     return checked
 
@@ -2109,7 +2114,7 @@ class Instance:
             for x in range(round(right - 16 * scale), round(left + 16 * scale), -max(1, round(8 * scale))):
                 packed = (x & 0xffff) | ((y & 0xffff) << 16)
                 if w.send_message(window.hwnd, 0x0084, 0, packed) == 2:  # WM_NCHITTEST / HTCAPTION
-                    self.ensure_point(x, y)
+                    self.ensure_point(x, y, probe=True)  # nothing is sent yet: the drag checks it again
                     return x, y
         raise GuiError('no visible draggable HTCAPTION point in the owned window')
 

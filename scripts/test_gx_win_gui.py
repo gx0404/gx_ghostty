@@ -641,6 +641,29 @@ class InputGuardTests(unittest.TestCase):
         self.assertRegex(rows[0]['reason'], r'^ghostty pid \d+ had ended, or was no longer the process this tool '
                                             r'started, before the close$')
 
+    def test_the_caption_probe_audits_a_refusal_but_no_pass(self):
+        window = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (0, 0, 400, 300), True, False, False)
+        fake = FakeWin32(self.PID, self.PID)
+        fake.answers[0x0084] = 2  # HTCAPTION everywhere
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'guards.jsonl'
+            instance = gui.Instance(self.PID, "C:/g/ghostty.exe", Path(temp), creation=1, launched=0)
+            with mock.patch.dict(os.environ, {'GX_PERF_BATCH_ID': 'batch', 'GX_PERF_GUARD_LOG': str(log)}), \
+                    mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(instance, "scale", return_value=1.0):
+                self.assertEqual((384, 16), instance.caption_point(window))
+                self.assertFalse(log.exists(), "a passed probe is not audited: nothing was sent")
+                instance.ensure_point(10, 10)  # a real guard before input passes and is audited
+            rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([("guard", "ensure_point", "pass")], [(r["event"], r["check"], r["status"]) for r in rows])
+        covered = FakeWin32(self.PID, 777)  # another process's window is under the caption point
+        covered.answers[0x0084] = 2
+        def blocked(instance):
+            with mock.patch.object(instance, "scale", return_value=1.0):
+                instance.caption_point(window)
+        error, rows, _ = self.guard_rows(blocked, covered)
+        self.assertEqual("pointer_target_lost", error.cause)
+        self.assertEqual([("fail", True)], [(row["status"], row["probe"]) for row in rows])
+
     def wheel_rows(self, fake, **kwargs):
         with tempfile.TemporaryDirectory() as temp:
             log = Path(temp) / 'guards.jsonl'
