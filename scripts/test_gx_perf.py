@@ -839,7 +839,18 @@ class QuietBatchTests(unittest.TestCase):
         self.assertIn('instance_self_activated', gx_perf.PRODUCT_CAUSES)
         self.assertNotIn('instance_self_activated', gx_perf.ENVIRONMENT_CAUSES)
 
-    WSL_BATCH = ('wsl.exe', '-d', 'Ubuntu-24.04', '--', 'python3', 'scripts/gx_wsl.py', 'smoke')
+    WSL_BATCH = ('python', 'scripts/gx_wsl.py', 'smoke')
+
+    def test_observe_only_rejects_wrappers_and_unknown_commands(self):
+        for index, command in enumerate([('pwsh', '-Command', 'python scripts/gx_perf.py gtk'),
+                        ('cmd', '/c', 'just wsl smoke'), ('python', '-m', 'gx_perf', 'gtk'),
+                        ('python', 'wrapper.py', 'scripts/gx_perf.py', 'gtk'),
+                        ('python', 'scripts/gx_wsl.py', 'run'), ('just', 'wsl', 'run'),
+                        ('python', 'scripts/gx_perf.py', 'remote', 'LOGS')]):
+            args = self.batch_args('--input-observe-only', command=command)
+            args.out = self.args.out.parent / f'wrapper-{index}'
+            with self.subTest(command=command), self.assertRaises(gx_perf.PerfError):
+                gx_perf.run_quiet_batch(args, self.probe, self.command(0))
 
     def test_input_observe_only_batch_records_foreign_input_and_stays_valid(self):
         # r6 13:20 item (4): a batch that runs only in WSL/Xvfb records user input, never gates on it.
@@ -899,7 +910,7 @@ class QuietBatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(gx_perf.PerfError, 'drives the Windows desktop'):
                     gx_perf.run_quiet_batch(args, self.probe, self.command(0))
         for command in (self.WSL_BATCH, ('python', 'scripts/gx_perf.py', 'gtk', '--clone=~/src/gx_ghostty', '--out', 'M'),
-                        ('python', 'scripts/gx_perf.py', 'remote', 'LOGS', '--label', 'ghostty')):
+                        ('just', 'perf', 'gtk'), ('just', 'wsl', '--clone', '~/src/gx', 'scenario')):
             self.assertFalse(gx_perf.desktop_command(command))
         # Any gx_win_gui guard row shows the batch touched the desktop after all: an ERROR, never VALID.
         args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)

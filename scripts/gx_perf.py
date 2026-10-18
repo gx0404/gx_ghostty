@@ -31,6 +31,8 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON.
   quiet-batch --out DIR [--timeout S] [--injected-input | --input-observe-only] [--strict-blacklist]
         -- COMMAND [ARGS...]
+        --input-observe-only allowlists direct gx_perf.py gtk / just perf gtk and gx_wsl.py /
+        just wsl smoke or scenario only; wrappers, run and unknown commands are rejected before locking.
         Acquire all shared slots, check immediately inside the lease, run the command, check again
         before release. End-check failure invalidates the entire batch. With --injected-input a batch
         that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
@@ -1115,21 +1117,35 @@ def gate_exit_contract(command: Sequence[str]) -> bool:
 
 
 def desktop_command(command: Sequence[str]) -> bool:
-    """Whether `command` drives the Windows desktop: gx_win_gui.py (`just win-gui`), a gx_perf.py
-    win32 / win32-* driver (`just perf win32...`), a Windows fixture under test/windows/ (such as
-    the remote fixture of the remote performance batch) or ghostty.exe itself. --input-observe-only
-    refuses these up front; the batch's guard log catches any other command that sends input through
-    gx_win_gui."""
-    names = [process_name(part) for part in command]
-    paths = [part.replace('\\', '/').casefold() for part in command]
-    if ('gx_win_gui.py' in names or ('just' in names and 'win-gui' in command)
-            or any('test/windows/' in path or path.endswith('ghostty.exe') for path in paths)):
+    """Conservatively require desktop input gates unless a direct Xvfb entry is allowlisted.
+    Shell wrappers, Python module/command execution and unknown scripts are never unwrapped.
+    """
+    if len(command) < 3:
         return True
-    for index in range(len(command) - 1):
-        if command[index + 1] in ('win32', *WIN32_DRIVERS) and (
-                names[index] == 'gx_perf.py' or (names[index] == 'perf' and 'just' in names[:index])):
+    launcher = process_name(command[0]).removesuffix('.exe')
+    entry = process_name(command[1])
+    if launcher in ('python', 'python3', 'py'):
+        if entry not in ('gx_perf.py', 'gx_wsl.py'):
             return True
-    return False
+    elif launcher == 'just':
+        if entry not in ('perf', 'wsl'):
+            return True
+    else:
+        return True
+    if entry in ('gx_perf.py', 'perf'):
+        return command[2] != 'gtk'
+    # Only gx_wsl global options may precede its subcommand. Do not search arbitrary argv
+    # for a token such as 'smoke': it could be a wrapper's argument or an option value.
+    index = 2
+    while index < len(command):
+        value = command[index]
+        if value in ('--clone', '--distro') and index + 1 < len(command):
+            index += 2
+        elif value.startswith(('--clone=', '--distro=')) or value == '--dry-run':
+            index += 1
+        else:
+            return value not in ('smoke', 'scenario')
+    return True
 
 
 def driver_out_dir(command: Sequence[str]) -> Path | None:
@@ -1253,9 +1269,9 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     if observe_input and args.injected_input:
         raise PerfError('--input-observe-only and --injected-input are mutually exclusive')
     if observe_input and desktop_command(command):
-        raise PerfError('--input-observe-only is only for batches that run in WSL/Xvfb; this command drives the Windows '
-                        'desktop (gx_win_gui, a gx_perf win32 driver, a test/windows fixture or ghostty.exe): run it '
-                        'without --input-observe-only')
+        raise PerfError('--input-observe-only requires a direct gx_perf gtk or gx_wsl smoke/scenario command '
+                        '(including just perf/just wsl); this command drives the Windows desktop or is not '
+                        'allowlisted: run it without --input-observe-only')
     out = new_output(args.out)
     guard_log = out / 'guards.jsonl'
     result = {'schema': 'gx-quiet-batch-v2', 'batch_id': uuid.uuid4().hex, 'command': command,
