@@ -1276,13 +1276,14 @@ class ExperimentTests(unittest.TestCase):
         calls = []
         def measure(*args):
             calls.append(args)
-            log = gui.log_path(args[2])
+            log = gui.log_path(args[1])
             log.parent.mkdir(parents=True, exist_ok=True)
             log.write_text('raw failure evidence\n', encoding='utf-8')
             if len(calls) == 1:
+                args[-1]['resize_input_tick'] = 123
                 return ['metric startup.shown 1 ms']
             raise gui.InputBlocked('foreground changed')
-        with mock.patch.object(gx_perf, 'measure_win32', side_effect=measure), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with mock.patch.object(gx_perf, 'measure_win32_bounded', side_effect=measure), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(123,1000)), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = gx_perf.main(['win32', '--exe', str(self.exe), '--out', str(out), '--runs', '1'])
         self.assertEqual(1, code)
         self.assertEqual(2, len(calls))
@@ -1305,7 +1306,13 @@ class ExperimentTests(unittest.TestCase):
         instance = mock.Mock(pid=73, creation=123)
         instance.wait_window.side_effect = real.InputBlocked('startup crashed', cause='instance_gone')
         out = self.root / 'legacy-startup'
-        with mock.patch.object(real, 'launch', return_value=instance), contextlib.redirect_stdout(io.StringIO()), \
+        # Exercise the real measurement function locally; the process boundary
+        # and result propagation have separate real-Job coverage.
+        def measure(exe, env_dir, config, resizes, env, report):
+            return gx_perf.measure_win32(real, exe, env_dir, config, resizes, env, report)
+        with mock.patch.object(real, 'launch', return_value=instance), \
+                mock.patch.object(gx_perf, 'measure_win32_bounded', side_effect=measure), \
+                mock.patch.object(gx_perf, 'last_input_ticks', return_value=(123,1000)), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(1, gx_perf.main(['win32', '--exe', str(self.exe), '--out', str(out), '--runs', '1']))
         report = json.loads((out / 'build/warmup-failed.json').read_text(encoding='utf-8'))
@@ -2091,12 +2098,25 @@ class P7C7Tests(unittest.TestCase):
         self.instance = mock.Mock(pid=42, creation=123, exe=str(self.root / 'ghostty.exe'))
         self.instance.log = self.root / 'ghostty.log'
         self.instance.log.write_bytes(b'old log\r\n')
+        import ctypes.wintypes
+        import gx_perf_stimulus as stimulus
+        composition = mock.patch.object(stimulus, 'dwm_flush')
+        composition.start()
+        self.addCleanup(composition.stop)
         self.instance.responsive.return_value = True
         self.instance.hang_evidence.return_value = None
         self.instance.require_window.return_value = SimpleNamespace(hwnd=9, rect=(0, 0, 800, 600))
         self.instance.terminals.return_value = [SimpleNamespace(hwnd=10, rect=(0, 30, 800, 600))]
         self.gui = mock.Mock()
         self.gui.win32().raw_window_rect.return_value = (0, 0, 800, 600)
+        self.gui.win32().process_creation.return_value = 123
+        self.gui.win32().send_message.return_value = 0
+        self.gui.win32().RECT = ctypes.wintypes.RECT
+        def client_rect(hwnd, result):
+            rect = self.gui.win32().raw_window_rect.return_value
+            result._obj.right, result._obj.bottom = rect[2]-rect[0], rect[3]-rect[1]
+            return 1
+        self.gui.win32().GetClientRect.side_effect = client_rect
         self.gui.win32().foreground.return_value = 9
         self.gui.win32().window_pid.return_value = 42
         self.gui.win32().class_name.return_value = 'GhosttyWindow'
@@ -2164,6 +2184,11 @@ class P7C7Tests(unittest.TestCase):
         self.instance.wait_window.return_value = {'shown_ms': 1}
         self.gui.win32().child_windows.return_value = []
         self.instance.resize.return_value = 10
+        def resize(width, height):
+            self.gui.win32().raw_window_rect.return_value = (0, 0, width, height)
+            self.instance.require_window.return_value.rect = (0, 0, width, height)
+            return 10
+        self.instance.resize.side_effect = resize
         report = {'evidence_dir': str(self.root / 'resize')}
         with mock.patch.object(gx_perf.time, 'sleep'), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 100)):
             lines = gx_perf.measure_win32(self.gui, self.root / 'ghostty.exe', self.root, '', 6, report=report)
@@ -2469,6 +2494,167 @@ class GtkWiringTests(unittest.TestCase):
             self.assertEqual(2, gx_perf.main(['gtk', '--clone', '/c', '--out', 'M',
                                              '--capabilities', 'build:identity.json']))
             driver.assert_not_called()
+
+
+
+
+class P7StrictWiringTests(unittest.TestCase):
+    def test_same_prefix_file_replacement_after_freeze_fails_closed(self):
+        import gx_perf_stimulus as stimulus
+        from test_gx_perf_stimulus import PresentFixture
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = PresentFixture()
+            fixture.instance.log = root/'ghostty.log'
+            original = b'info(gx_perf): metric renderer.present 1\r\n'
+            fixture.instance.log.write_bytes(original)
+            def capture(gui, instance, width, height, png, backdrop, raw, **kwargs):
+                raw.update(status='PASS', strict_final_frame=True, screenshot=str(png),
+                           screenshot_sha256='fixture', snapshots=[{'geometry':{'outer':[0,0,900,650]}}])
+                return 16.0
+            parse = gx_perf.arm_samples
+            calls = []
+            def replace(text, baseline):
+                calls.append(text)
+                if len(calls) == 2:
+                    other = root/'replacement.log'
+                    other.write_bytes(original)
+                    other.replace(fixture.instance.log)
+                return parse(text, baseline)
+            with mock.patch.object(stimulus, 'strict_resize_capture', capture), \
+                    mock.patch.object(gx_perf, 'arm_samples', replace):
+                with self.assertRaisesRegex(gx_perf.PerfError, 'file identity'):
+                    gx_perf.resize_evidence(fixture.gui, fixture.instance, root, 1, 900, 650, {}, fixture.backdrop)
+            row = json.loads((root/'resize-01.json').read_text(encoding='utf-8'))
+            self.assertFalse(row['strict_final_frame'])
+            self.assertEqual('FAIL', row['strict_frame_evidence']['status'])
+            self.assertEqual(b'', (root/'resize-01.segment.raw').read_bytes())
+            self.assertEqual(original, (root/'resize-01.failure-log.raw').read_bytes())
+
+    def test_bounded_wiring_keeps_input_epoch_and_recovers_timeout_queries(self):
+        import gx_perf_stimulus as stimulus
+        for mode in ('timeout', 'input', 'success'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                report = {'evidence_dir': str(out), 'worker_entry_input_tick': 123}
+                def supervise(command, directory, **kwargs):
+                    request = json.loads((directory/'worker-request.json').read_text(encoding='utf-8'))
+                    self.assertEqual(123, request['report']['worker_entry_input_tick'])
+                    self.assertEqual(120.0, kwargs['timeout'])
+                    stimulus.durable_json(directory/'supervisor.json', {'status':'FAIL' if mode == 'timeout' else 'PASS'})
+                    if mode == 'timeout':
+                        stimulus.durable_json(directory/'resize-01.json', {'index':1,'status':'running'})
+                        stimulus.durable_json(directory/'resize-01.before_capture.query.json',
+                            {'queries':[{'qpc_ns':42, 'answer':123}], 'status':'running'})
+                        raise stimulus.StrictFrameError('P7 worker timeout')
+                    result = {'status':'PASS', 'report':{'resize_input_tick':123}, 'lines':['metric fixture 1']}
+                    stimulus.durable_json(directory/'worker-result.json', result)
+                with mock.patch.object(stimulus, 'supervise_p7', supervise), \
+                        mock.patch.object(gx_perf, 'last_input_ticks', return_value=(456 if mode=='input' else 123,1000)):
+                    if mode == 'success':
+                        self.assertEqual(['metric fixture 1'], gx_perf.measure_win32_bounded(
+                            out/'app.exe', out, '', 6, {}, report))
+                    else:
+                        with self.assertRaises((stimulus.StrictFrameError, gx_perf.PerfError)):
+                            gx_perf.measure_win32_bounded(out/'app.exe', out, '', 6, {}, report)
+                        self.assertFalse(report['strict_final_frame'])
+                if mode == 'timeout':
+                    row = json.loads((out/'resize-01.worker-failure.json').read_text(encoding='utf-8'))
+                    self.assertEqual(123, row['strict_frame_evidence']['queries'][0]['answer'])
+                    self.assertEqual('FAIL', row['strict_frame_evidence']['status'])
+                    self.assertTrue((out/'resize-01.before_capture.query.json').exists())
+
+    def test_third_log_read_cannot_replace_frozen_metric_bytes(self):
+        import gx_perf_stimulus as stimulus
+        from test_gx_perf_stimulus import PresentFixture
+        for mode in ('append', 'truncate', 'replace'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                fixture = PresentFixture()
+                fixture.instance.log = root / 'ghostty.log'
+                before = b'initial\r\n'
+                segment = b'info(gx_perf): metric renderer.present 1\r\n'
+                frozen = before + segment
+                fixture.instance.log.write_bytes(before)
+                original_read = Path.read_bytes
+                reads = []
+                def read(path):
+                    if path != fixture.instance.log:
+                        return original_read(path)
+                    reads.append(path)
+                    if len(reads) == 1:
+                        return before
+                    if len(reads) == 2:
+                        return frozen
+                    return (frozen + b'info(gx_perf): metric renderer.present 2\r\n'
+                            if mode == 'append' else frozen[:-5] if mode == 'truncate' else b'replaced')
+                def capture(gui, instance, width, height, png, backdrop, raw, **kwargs):
+                    raw.update(status='PASS', strict_final_frame=True, screenshot=str(png),
+                               screenshot_sha256='fixture', snapshots=[{'geometry':{'outer':[0,0,900,650]}}])
+                    return 16.0
+                report = {}
+                with mock.patch.object(Path, 'read_bytes', read), \
+                        mock.patch.object(stimulus, 'strict_resize_capture', capture):
+                    if mode == 'append':
+                        gx_perf.resize_evidence(fixture.gui, fixture.instance, root, 1, 900, 650, report, fixture.backdrop)
+                    else:
+                        with self.assertRaisesRegex(gx_perf.PerfError, 'truncated|replaced'):
+                            gx_perf.resize_evidence(fixture.gui, fixture.instance, root, 1, 900, 650, report, fixture.backdrop)
+                row = json.loads((root/'resize-01.json').read_text(encoding='utf-8'))
+                self.assertEqual(segment, (root/'resize-01.segment.raw').read_bytes())
+                self.assertEqual(len(frozen), row['log_end_byte'])
+                self.assertEqual([1.0], row['presentation_metrics']['renderer.present']['values'])
+                self.assertEqual('captured' if mode == 'append' else 'failed', row['status'])
+                if mode != 'append':
+                    self.assertFalse(row['strict_final_frame'])
+                    self.assertTrue((root/'resize-01.failure-log.raw').exists())
+
+    def test_native_query_success_pending_and_deadline_evidence_on_disk(self):
+        import gx_perf_stimulus as stimulus
+        from test_gx_perf_stimulus import PresentFixture
+        for mode in ('success', 'legacy', 'failedpresent'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                fixture = PresentFixture(count=2)
+                fixture.instance.log = root / 'ghostty.log'
+                fixture.instance.log.write_bytes(b'initial\r\n')
+                if mode == 'legacy':
+                    fixture.absent = True
+                if mode == 'failedpresent':
+                    fixture.change = lambda stage: setattr(fixture, 'sequence', 10)
+                original_resize = fixture.resize
+                def resize(width, height):
+                    with fixture.instance.log.open('ab') as stream:
+                        stream.write(b'preserved timeout bytes\r\n')
+                    return original_resize(width, height)
+                fixture.instance.resize.side_effect = resize
+                original = stimulus.PresentQuery.snapshot
+                def snapshot(probe, stage, deadline):
+                    fixture.stage(stage)
+                    return original(probe, stage, deadline)
+                clock = [0.0]
+                def now():
+                    clock[0] += 0.0005
+                    return clock[0]
+                report = {}
+                with mock.patch.object(stimulus.PresentQuery, 'snapshot', snapshot), \
+                        mock.patch.object(stimulus, 'dwm_flush'), \
+                        mock.patch.object(stimulus.time, 'perf_counter', side_effect=now), \
+                        mock.patch.object(stimulus.time, 'sleep'):
+                    if mode == 'failedpresent':
+                        with self.assertRaisesRegex(stimulus.StrictFrameError, 'strict_final_frame_timeout'):
+                            gx_perf.resize_evidence(fixture.gui, fixture.instance, root, 1, 900, 650, report, fixture.backdrop)
+                    else:
+                        gx_perf.resize_evidence(fixture.gui, fixture.instance, root, 1, 900, 650, report, fixture.backdrop)
+                row = json.loads((root/'resize-01.json').read_text(encoding='utf-8'))
+                strict = row['strict_frame_evidence']
+                self.assertEqual({'success':'PASS','legacy':'PENDING','failedpresent':'FAIL'}[mode], strict['status'])
+                self.assertEqual(mode == 'success', row['strict_final_frame'])
+                self.assertEqual(16.0, row['setwindowpos_ms'])
+                self.assertTrue(row['proxy_timeout'])
+                self.assertTrue(strict['queries'])
+                self.assertEqual(b'preserved timeout bytes\r\n', (root/'resize-01.segment.raw').read_bytes())
+                self.assertEqual(mode != 'failedpresent', (root/'resize-01.png').exists())
 
 
 if __name__ == "__main__":

@@ -172,6 +172,10 @@ frame_event: ?w32.HANDLE = null,
 resize_deadline: ?w32.HANDLE = null,
 wanted_size: std.atomic.Value(u64) = .init(0),
 presented_size: std.atomic.Value(u64) = .init(0),
+// Immutable after init, before the renderer starts. No statistics writes when off.
+test_present_enabled: bool = false,
+test_present_invalid: std.atomic.Value(bool) = .init(false),
+test_present_frame: std.atomic.Value(u64) = .init(0),
 first_frame_hwnd: std.atomic.Value(usize) = .init(0),
 
 /// A changed grid waiting for a frame during live resize.
@@ -331,6 +335,7 @@ pub fn initWithOptions(
 ) !void {
     self.* = .{
         .app = app,
+        .test_present_enabled = @import("remote_test.zig").enabled(),
         .parent_window = parent,
         .current_cursor = w32.LoadCursorW(null, cursorIdFor(.text)),
         .erase_color = app.config.background,
@@ -703,6 +708,10 @@ pub fn setRemotePreview(self: *Surface, output: ?*@import("RemoteHost.zig").Outp
 }
 
 fn setRemoteOutputMode(self: *Surface, output: ?*@import("RemoteHost.zig").Output, detached: bool) void {
+    // A detached WGL readback also calls signalFrameDrawn. Permanently revoke
+    // this lifetime before transfer, including an aborted transfer, so racing
+    // callbacks can never certify that readback as a successful local swap.
+    if (self.test_present_enabled) self.test_present_invalid.store(true, .release);
     const was_visible = self.bell_border_requested_visible;
     std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.remote_mutex);
     self.remote_output = output;
@@ -3029,6 +3038,10 @@ test "imeCellRect clamps to the surface" {
 
 /// Render-thread completion; the event never deliberately accepts a stale size.
 pub fn signalFrameDrawn(self: *Surface, width: u32, height: u32) void {
+    if (self.test_present_enabled and !self.test_present_invalid.load(.acquire)) {
+        const previous = self.test_present_frame.load(.monotonic);
+        self.test_present_frame.store(testPresentNext(previous, width, height), .release);
+    }
     const size = packSize(width, height);
     self.presented_size.store(size, .release);
     const wanted = self.wanted_size.load(.acquire);
@@ -3048,6 +3061,104 @@ pub fn requestFirstFrameMessage(self: *Surface, window: w32.HWND) void {
 
 fn packSize(width: u32, height: u32) u64 {
     return @as(u64, height) << 32 | width;
+}
+
+// One render-thread writer, one u64 publication: sequence and size cannot tear.
+// Zero width with height=65535 is an explicit unrepresentable-size sentinel.
+fn testPresentNext(previous: u64, width: u32, height: u32) u64 {
+    const sequence: u32 = @as(u32, @truncate(previous >> 32)) +% 1;
+    const size: u32 = if (width == 0 or height == 0 or width > 65535 or height > 65535)
+        0xffff0000
+    else
+        height << 16 | width;
+    return @as(u64, sequence) << 32 | size;
+}
+
+/// GUI-only, lock-free P7 v1 query. Window selects the leaf; field is lParam's
+/// low byte for selector 19. A null leaf is explicitly unsupported, not a frame.
+pub fn testPresentQuery(surface: ?*const Surface, selector: usize, field: u8) isize {
+    const descriptor: u64 = (@as(u64, 0x47585037) << 32) | (1 << 16); // GXP7/v1
+    if (selector == 19 and field == 0) {
+        const value = surface orelse return @bitCast(descriptor | 3);
+        if (!value.test_present_enabled) return @bitCast(descriptor | 5);
+        if (value.test_present_invalid.load(.acquire)) return @bitCast(descriptor | 4);
+        if (!value.core_surface_ready or value.hwnd == null or !value.ui_attachment.isValid()) return @bitCast(descriptor | 3);
+        const client = value.client_size.load(.acquire);
+        if (value.width == 0 or value.height == 0 or value.width > 65535 or value.height > 65535 or
+            @as(u32, @truncate(client)) > 65535 or client >> 32 > 65535 or
+            @as(u32, @truncate(value.test_present_frame.load(.acquire))) == 0xffff0000)
+            return @bitCast(descriptor | 2);
+        return @bitCast(descriptor | 1);
+    }
+    const value = surface orelse return 0;
+    if (!value.test_present_enabled) return 0;
+    const result: u64 = switch (selector) {
+        17 => value.test_present_frame.load(.acquire),
+        18 => packSize(value.width, value.height),
+        19 => switch (field) {
+            1 => value.client_size.load(.acquire),
+            2 => value.ui_reference.generation,
+            3 => value.ui_attachment.revision,
+            4 => value.ui_attachment.owner.id,
+            5 => value.ui_attachment.owner.generation,
+            6 => value.ui_reference.id,
+            7 => if (value.hwnd) |child| @intFromPtr(child) else 0,
+            else => 0,
+        },
+        else => 0,
+    };
+    return @bitCast(result);
+}
+
+test "P7 successful frame publication is sized atomic wrapping and gated" {
+    const testing = std.testing;
+    var surface: Surface = .{ .app = undefined, .test_present_enabled = true };
+    surface.signalFrameDrawn(640, 480);
+    try testing.expectEqual((@as(u64, 1) << 32) | (480 << 16) | 640, surface.test_present_frame.load(.acquire));
+    surface.signalFrameDrawn(800, 600);
+    try testing.expectEqual((@as(u64, 2) << 32) | (600 << 16) | 800, surface.test_present_frame.load(.acquire));
+    try testing.expectEqual(@as(u64, (65535 << 16) | 65535), testPresentNext(0xffffffff00000000, 65535, 65535));
+    try testing.expectEqual(@as(u64, 0xffff0000), testPresentNext(0xffffffff00000000, 65536, 2));
+    for ([_]u32{ 0, 65536, std.math.maxInt(u32) }) |width| {
+        try testing.expectEqual(@as(u64, 0x1ffff0000), testPresentNext(0, width, 4));
+        try testing.expectEqual(@as(u64, 0x1ffff0000), testPresentNext(0, 4, width));
+    }
+    surface.test_present_invalid.store(true, .release);
+    const before = surface.test_present_frame.load(.acquire);
+    surface.signalFrameDrawn(900, 700);
+    try testing.expectEqual(before, surface.test_present_frame.load(.acquire));
+    var disabled: Surface = .{ .app = undefined };
+    disabled.signalFrameDrawn(800, 600);
+    try testing.expectEqual(@as(u64, 0), disabled.test_present_frame.load(.acquire));
+    try testing.expectEqual(packSize(800, 600), disabled.presented_size.load(.acquire));
+}
+
+test "P7 query reports support dimensions and lifetime attachment identity" {
+    const testing = std.testing;
+    var issuer = try ui_ref.Issuer.init(91);
+    const owner = try issuer.create(.window);
+    var surface: Surface = .{ .app = undefined, .test_present_enabled = true, .core_surface_ready = true, .hwnd = @ptrFromInt(1) };
+    surface.ui_reference = try issuer.surface(42);
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, owner);
+    surface.client_size.store(packSize(810, 600), .release);
+    try testing.expectEqual(@as(isize, 0x4758503700010001), testPresentQuery(&surface, 19, 0));
+    try testing.expectEqual(@as(isize, @intCast(packSize(800, 600))), testPresentQuery(&surface, 18, 0));
+    try testing.expectEqual(@as(isize, @intCast(packSize(810, 600))), testPresentQuery(&surface, 19, 1));
+    try testing.expectEqual(@as(isize, 42), testPresentQuery(&surface, 19, 6));
+    const original = testPresentQuery(&surface, 19, 3);
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, owner);
+    try testing.expect(original != testPresentQuery(&surface, 19, 3));
+    const generation = testPresentQuery(&surface, 19, 2);
+    surface.ui_reference = try issuer.surface(42);
+    try testing.expect(generation != testPresentQuery(&surface, 19, 2));
+    surface.signalFrameDrawn(65536, 2);
+    try testing.expectEqual(@as(isize, 2), testPresentQuery(&surface, 19, 0) & 0xffff);
+    surface.test_present_invalid.store(true, .release);
+    try testing.expectEqual(@as(isize, 4), testPresentQuery(&surface, 19, 0) & 0xffff);
+    surface.test_present_enabled = false;
+    try testing.expectEqual(@as(isize, 5), testPresentQuery(&surface, 19, 0) & 0xffff);
+    try testing.expectEqual(@as(isize, 0), testPresentQuery(&surface, 17, 0));
+    try testing.expectEqual(@as(isize, 3), testPresentQuery(null, 19, 0) & 0xffff);
 }
 
 test "only a correctly sized frame signals the resize event" {
@@ -3460,6 +3571,7 @@ const GPU_RESET_TIMER: usize = 0x4752; // 'GR'
 /// WGL releases the swap chain and shaders after this frame completes, then
 /// replaces the context. The GUI only realizes it after that succeeds.
 pub fn gpuContextReset(self: *Surface) void {
+    if (self.test_present_enabled) self.test_present_invalid.store(true, .release);
     const renderer = &self.core_surface.renderer;
     renderer.display_realized = false;
     renderer.images.deinit(renderer.alloc);

@@ -159,3 +159,7 @@
 - `just package-windows` 默认把 ReleaseFast 构建装进 `zig-out/`，之后要回到 Debug 构建就再跑一次 `just build`。
 - 装了 WSL2 时，`just wsl test`、`just wsl build --gtk` 与 `just wsl smoke --out <目录>` 在 WSL 克隆里补跑 Linux 完整单测、GTK 构建与 Xvfb 截图（见上文「WSL」）；这是本机 Linux 证据，与 `gx-ci` 的 job 互不代证。
 - 判断成败只看退出码，不把命令接到 `| tail`、`| head`；各 shell 的写法见 TESTING.md「证据规则」。
+
+## P7 成功呈现取证
+
+`just perf win32 --resizes 6` 在两个标签臂上均要求 `GHOSTTY_GX_REMOTE_TEST=1`；逐步 JSON 的 `strict_frame_evidence` 保存 GXP7/v1 握手，`strict_frame_status` 与 `strict_final_frame` 分开记录覆盖状态。整批包含历史不支持臂时严格覆盖仍为 PENDING；不能据退出 0 宣称旧臂末帧已证明。仅 root 在统一安静窗运行 GUI/性能实批。

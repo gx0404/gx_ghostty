@@ -1,10 +1,14 @@
 """Offline tests: never launch a terminal, query PDH or send desktop input."""
 import ctypes
 import json
+import os
 from pathlib import Path
 import tempfile
 import sys
+import subprocess
+import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -161,5 +165,446 @@ class ShellEvidenceTests(unittest.TestCase):
         instance.press.assert_not_called()
 
 
+class PresentFixture:
+    class RECT(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_long) for name in ('left', 'top', 'right', 'bottom')]
+
+    def __init__(self, count=1, sequence=10):
+        self.count, self.sequence = count, sequence
+        self.outer = [0, 0, 1000, 700]
+        self.size, self.frame_size = [900, 650], [900, 650]
+        self.birth, self.revision, self.generation = 900, 3, 2
+        self.status, self.absent, self.version = 1, False, 1
+        self.events, self.polls = [], 0
+        self.change = lambda stage: None
+        self.instance = mock.Mock(pid=42, creation=900)
+        self.instance.require_window.side_effect = lambda: SimpleNamespace(hwnd=1, rect=tuple(self.outer))
+        self.instance.terminals.side_effect = lambda info: [SimpleNamespace(hwnd=10 + i) for i in range(self.count)]
+        self.instance.resize.side_effect = self.resize
+        self.gui = SimpleNamespace(win32=lambda: self)
+        self.backdrop = mock.Mock()
+        self.backdrop.capture.return_value.save_png.side_effect = self.save
+
+    def resize(self, width, height):
+        self.events.append('resize')
+        self.outer = [0, 0, width, height]
+        self.size = [width - 100, height - 50]
+        return 16.0
+
+    def save(self, path):
+        self.events.append('capture')
+        path.write_bytes(b'owned fixture image')
+        self.change('capture')
+
+    def process_creation(self, pid):
+        return self.birth
+
+    def window_pid(self, hwnd):
+        return 42
+
+    def raw_window_rect(self, hwnd):
+        return self.outer if hwnd == 1 else [0, 0, *self.size]
+
+    def GetClientRect(self, hwnd, rect):
+        rect._obj.right, rect._obj.bottom = self.size
+        return 1
+
+    def send_message(self, hwnd, message, selector, argument, timeout_ms):
+        assert message == 0x450 and timeout_ms > 0
+        if self.absent:
+            return 0
+        if selector == 13:
+            return self.count
+        if selector == 17:
+            # Intentionally return signed LRESULT to exercise wrap/high-bit replies.
+            word = self.sequence << 32 | self.frame_size[1] << 16 | self.frame_size[0]
+            return ctypes.c_int64(word).value
+        if selector == 18:
+            return self.size[1] << 32 | self.size[0]
+        field, leaf = argument & 255, argument >> 8
+        return [stimulus.P7_MAGIC << 32 | self.version << 16 | self.status,
+                self.size[1] << 32 | self.size[0], self.generation,
+                self.revision, 91, 92, 41 + leaf, 9 + leaf][field]
+
+    def stage(self, stage):
+        self.events.append(stage)
+        if stage == 'poll':
+            self.polls += 1
+            self.sequence = (self.sequence + 1) & 0xffffffff
+            # An advanced OLD-sized frame must not release the screenshot.
+            if self.polls >= 2:
+                self.frame_size = self.size[:]
+        self.change(stage)
+
+
+class StrictPresentTests(unittest.TestCase):
+    def run_capture(self, fixture, *, raises=None, timeout=0.15):
+        raw = {}
+        clock = [0.0]
+        def now():
+            clock[0] += 0.00002
+            return clock[0]
+        original = stimulus.PresentQuery.snapshot
+        def snapshot(probe, stage, deadline):
+            fixture.stage(stage)
+            return original(probe, stage, deadline)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(stimulus.PresentQuery, 'snapshot', snapshot), \
+                mock.patch.object(stimulus.time, 'perf_counter', side_effect=now), \
+                mock.patch.object(stimulus.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                mock.patch.object(stimulus, 'dwm_flush', side_effect=lambda: fixture.events.append('flush')):
+            png = Path(tmp) / 'resize.png'
+            if raises:
+                with self.assertRaisesRegex(stimulus.StrictFrameError, raises):
+                    stimulus.strict_resize_capture(fixture.gui, fixture.instance, 900, 650, png,
+                                                    fixture.backdrop, raw, timeout)
+                self.assertEqual('FAIL', raw['status'])
+                self.assertFalse(raw['strict_final_frame'])
+            else:
+                self.assertEqual(16.0, stimulus.strict_resize_capture(fixture.gui, fixture.instance, 900, 650,
+                                 png, fixture.backdrop, raw, timeout))
+            raw['png_retained'] = png.exists()
+        return raw
+
+    def test_new_successful_size_all_leaves_then_flush_and_protected_capture(self):
+        fixture = PresentFixture(count=2)
+        raw = self.run_capture(fixture)
+        self.assertEqual(('PASS', True), (raw['status'], raw['strict_final_frame']))
+        self.assertEqual(2, fixture.polls)
+        self.assertEqual(['before_setwindowpos', 'resize', 'after_setwindowpos', 'poll', 'poll',
+                          'flush', 'before_capture', 'capture', 'after_capture'], fixture.events)
+        self.assertEqual(2, len(raw['matched']['leaves']))
+        self.assertTrue(raw['queries'])
+        fixture.instance.responsive.assert_not_called()
+        fixture.backdrop.capture.assert_called_once()
+
+    def test_failed_present_and_no_advance_timeout_keep_raw_without_capture(self):
+        for mode in ('failedpresent', 'noadvance', 'wrongsize'):
+            fixture = PresentFixture()
+            def change(stage):
+                if mode != 'wrongsize':
+                    fixture.sequence = 10
+                else:
+                    fixture.frame_size = [640, 480]
+            fixture.change = change
+            raw = self.run_capture(fixture, raises='strict_final_frame_timeout')
+            self.assertGreater(len(raw['queries']), 1)
+            self.assertTrue(raw['snapshots'])
+            self.assertNotIn('capture', fixture.events)
+            self.assertNotIn('flush', fixture.events)
+
+    def test_sequence_wrap_is_forward_and_signed_word_survives(self):
+        fixture = PresentFixture(sequence=0xfffffffe)
+        raw = self.run_capture(fixture)
+        self.assertEqual(0, raw['matched']['leaves'][0]['frame']['sequence'])
+        self.assertTrue(stimulus.present_advanced(0xffffffff, 0))
+        self.assertFalse(stimulus.present_advanced(0, 0xffffffff))
+        self.assertFalse(stimulus.present_advanced(0, 0x80000000))
+        self.assertFalse(stimulus.present_frame(0xffff0000)['size_supported'])
+
+    def test_absent_disabled_oversized_and_version_are_pending_not_success(self):
+        for mode in ('legacy', 'disabled', 'oversize', 'version'):
+            with self.subTest(mode=mode):
+                fixture = PresentFixture()
+                if mode == 'legacy':
+                    fixture.absent = True
+                elif mode == 'version':
+                    fixture.version = 2
+                else:
+                    fixture.status = 5 if mode == 'disabled' else 2
+                raw = self.run_capture(fixture)
+                self.assertEqual(('PENDING', False, True), (raw['status'], raw['strict_final_frame'], raw['png_retained']))
+                self.assertEqual(0, fixture.polls)
+
+    def test_identity_reset_migration_and_pid_reuse_stop_each_stage(self):
+        for stage in ('after_setwindowpos', 'poll', 'before_capture', 'capture'):
+            for field in ('birth', 'revision', 'generation'):
+                with self.subTest(stage=stage, field=field):
+                    fixture = PresentFixture()
+                    fixture.change = lambda s, stage=stage, field=field: setattr(fixture, field,
+                        getattr(fixture, field) + 1) if s == stage else None
+                    raw = self.run_capture(fixture, raises='identity|attachment|birth')
+                    if stage == 'capture':
+                        self.assertTrue(raw['png_retained'])
+                        self.assertIn('screenshot_sha256', raw)
+
+    def test_last_size_drift_and_frame_reset_fail_even_after_first_match(self):
+        for stage in ('before_capture', 'capture'):
+            for mode in ('geometry', 'frame', 'reset', 'disabled'):
+                fixture = PresentFixture()
+                def change(s):
+                    if s != stage:
+                        return
+                    if mode == 'geometry':
+                        fixture.outer[2] += 1
+                    elif mode == 'frame':
+                        fixture.frame_size = [640, 480]
+                    elif mode == 'disabled':
+                        fixture.status = 4
+                    else:
+                        fixture.sequence = 11  # Still newer than baseline, but older than matched=12.
+                fixture.change = change
+                self.run_capture(fixture, raises='geometry|no longer matches|reset/backwards|support')
+
+    def test_client_mismatch_and_unreached_outer_are_failures(self):
+        fixture = PresentFixture()
+        original = fixture.GetClientRect
+        def wrong(hwnd, rect):
+            original(hwnd, rect)
+            rect._obj.right += 1
+            return 1
+        fixture.GetClientRect = wrong
+        self.run_capture(fixture, raises='GetClientRect')
+        fixture = PresentFixture()
+        fixture.change = lambda s: fixture.outer.__setitem__(2, 901) if s == 'after_setwindowpos' else None
+        self.run_capture(fixture, raises='target size not reached')
+
+    def test_one_lagging_leaf_and_torn_metadata_cannot_release_capture(self):
+        fixture = PresentFixture(count=2)
+        send = fixture.send_message
+        def lagging(hwnd, message, selector, argument, timeout_ms):
+            if selector == 17 and argument == 2:
+                return 10 << 32 | 650 << 16 | 900
+            return send(hwnd, message, selector, argument, timeout_ms)
+        fixture.send_message = lagging
+        self.run_capture(fixture, raises='strict_final_frame_timeout')
+        fixture = PresentFixture()
+        send = fixture.send_message
+        def torn(hwnd, message, selector, argument, timeout_ms):
+            result = send(hwnd, message, selector, argument, timeout_ms)
+            if selector == 17:
+                fixture.revision += 1
+            return result
+        fixture.send_message = torn
+        self.run_capture(fixture, raises='changed during query')
+
+    def test_query_support_loss_and_topology_change_fail_without_retry(self):
+        for mode in ('support', 'topology'):
+            fixture = PresentFixture()
+            def change(stage):
+                if stage != 'after_setwindowpos':
+                    return
+                if mode == 'support':
+                    fixture.absent = True
+                else:
+                    fixture.count = 2
+            fixture.change = change
+            raw = self.run_capture(fixture, raises='identity|support')
+            self.assertNotIn('capture', fixture.events)
+            self.assertEqual('FAIL', raw['status'])
+
+    def test_privacy_disabled_never_captures(self):
+        fixture = PresentFixture()
+        fixture.backdrop.color = None
+        self.run_capture(fixture, raises='privacy backdrop')
+        self.assertEqual([], fixture.events)
+
+    def test_unresponsive_query_and_composition_failure_preserve_evidence(self):
+        fixture = PresentFixture()
+        fixture.send_message = lambda *args, **kwargs: None
+        raw = self.run_capture(fixture, raises='did not respond')
+        self.assertIsNone(raw['queries'][0]['answer'])
+        dll = mock.Mock()
+        dll.DwmFlush.return_value = -1
+        with mock.patch.object(ctypes, 'WinDLL', return_value=dll, create=True):
+            with self.assertRaisesRegex(stimulus.StrictFrameError, 'DwmFlush failed'):
+                stimulus.dwm_flush()
+
+
+class P7WorkerTests(unittest.TestCase):
+    def test_graceful_cleanup_never_terminates_by_pid(self):
+        gui, instance = mock.Mock(), mock.Mock()
+        gui.WINDOW_CLASS, gui.WM_CLOSE = 'GhosttyWindow', 16
+        instance.windows.return_value = [SimpleNamespace(hwnd=9, cls='GhosttyWindow')]
+        instance.alive.side_effect = [True, False]
+        with mock.patch.object(stimulus.time, 'sleep'):
+            stimulus.close_p7_instance(gui, instance)
+        gui.win32().PostMessageW.assert_called_once_with(9, 16, 0, 0)
+        gui.win32().terminate.assert_not_called()
+        instance.close.assert_not_called()
+
+    def test_checkpoint_failure_prevents_blocking_operation(self):
+        fixture = PresentFixture()
+        original = stimulus.PresentQuery.snapshot
+        def snapshot(probe, stage, deadline):
+            fixture.stage(stage)
+            return original(probe, stage, deadline)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(stimulus.PresentQuery, 'snapshot', snapshot), \
+                mock.patch.object(stimulus, 'durable_json', side_effect=OSError('disk failure')), \
+                mock.patch.object(stimulus, 'dwm_flush') as flush:
+            with self.assertRaisesRegex(OSError, 'disk failure'):
+                stimulus.strict_resize_capture(fixture.gui, fixture.instance, 900, 650,
+                                               Path(tmp) / 'resize.png', fixture.backdrop, {})
+            flush.assert_not_called()
+            fixture.instance.resize.assert_not_called()
+            fixture.backdrop.capture.assert_not_called()
+
+    def test_capture_past_round_deadline_retains_image_and_fails(self):
+        fixture = PresentFixture()
+        original = stimulus.PresentQuery.snapshot
+        clock = [0.0]
+        def snapshot(probe, stage, deadline):
+            fixture.stage(stage)
+            return original(probe, stage, deadline)
+        fixture.change = lambda stage: clock.__setitem__(0, 121.0) if stage == 'capture' else None
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(stimulus.PresentQuery, 'snapshot', snapshot), \
+                mock.patch.object(stimulus.time, 'perf_counter', side_effect=lambda: clock[0]), \
+                mock.patch.object(stimulus, 'dwm_flush'):
+            raw = {}
+            with self.assertRaises(stimulus.StrictFrameError):
+                stimulus.strict_resize_capture(fixture.gui, fixture.instance, 900, 650,
+                    Path(tmp) / 'resize.png', fixture.backdrop, raw, round_deadline=120.0)
+            self.assertEqual('FAIL', raw['status'])
+            self.assertFalse(raw['strict_final_frame'])
+            self.assertEqual(stimulus.hashlib.sha256(b'owned fixture image').hexdigest(), raw['screenshot_sha256'])
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows Job contract')
+    def test_success_exit_failure_and_unrelated_process_is_untouched(self):
+        sentinel = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        try:
+            for code in (0, 7):
+                with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                    command = [sys.executable, '-c',
+                               f'import sys; sys.exit({code} if sys.stdin.buffer.readline()==b"P7_GO\\n" else 8)']
+                    if code:
+                        with self.assertRaisesRegex(stimulus.StrictFrameError, 'abnormal exit 7'):
+                            stimulus.supervise_p7(command, Path(tmp), timeout=2, cleanup_timeout=2)
+                    else:
+                        result = stimulus.supervise_p7(command, Path(tmp), timeout=2, cleanup_timeout=2)
+                        self.assertEqual('PASS', result['status'])
+                    self.assertIsNone(sentinel.poll())
+        finally:
+            sentinel.kill()  # Exact test-owned handle, never a name or process inventory.
+            sentinel.wait(timeout=2)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows Job contract')
+    def test_cleanup_confirmation_error_is_not_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The real Job still kills its members on close, but a failed query
+            # cannot be reported as verified cleanup.
+            with mock.patch.object(stimulus.WindowsJob, 'active', side_effect=OSError('query denied')):
+                with self.assertRaisesRegex(stimulus.StrictFrameError, 'cleanup failed'):
+                    stimulus.supervise_p7([sys.executable, '-c', 'import sys; sys.stdin.buffer.readline()'],
+                                          Path(tmp), timeout=2, cleanup_timeout=2)
+            result = json.loads((Path(tmp) / 'supervisor.json').read_text(encoding='utf-8'))
+            self.assertEqual('FAIL', result['status'])
+            self.assertFalse(result['cleanup']['tree_exited'])
+            self.assertTrue(result['cleanup']['errors'])
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows Job contract')
+    def test_worker_entrypoint_keeps_failure_result_and_inherited_guard_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            collector = out / 'collector.py'
+            collector.write_text('import os\n'
+                'def last_input_ticks(): return (123, 1000)\n'
+                'def measure_win32(gui, exe, env_dir, config, resizes, env, report):\n'
+                ' report.update(batch=os.environ["GX_PERF_BATCH_ID"], guard=os.environ["GX_PERF_GUARD_LOG"])\n'
+                ' raise RuntimeError("fixture failure")\n', encoding='utf-8')
+            stimulus.durable_json(out / 'request.json', {'collector': str(collector), 'scripts': str(SCRIPTS),
+                'exe': 'unused.exe', 'env_dir': str(out), 'config': '', 'resizes': 6, 'env': {},
+                'report': {'worker_entry_input_tick': 123}})
+            environment = dict(os.environ, GX_PERF_BATCH_ID='original-batch', GX_PERF_GUARD_LOG=str(out/'guards.jsonl'))
+            with self.assertRaisesRegex(stimulus.StrictFrameError, 'abnormal exit 1'):
+                stimulus.supervise_p7([sys.executable, str(SCRIPTS/'gx_perf_stimulus.py'), '--p7-worker',
+                                      str(out/'request.json')], out, timeout=2, cleanup_timeout=2,
+                                     environment=environment)
+            result = json.loads((out/'worker-result.json').read_text(encoding='utf-8'))
+            self.assertEqual('FAIL', result['status'])
+            self.assertIn('fixture failure', result['error'])
+            self.assertEqual('original-batch', result['report']['batch'])
+            self.assertEqual(str(out/'guards.jsonl'), result['report']['guard'])
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows Job contract')
+    def test_input_arriving_across_gate_cannot_start_measurement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            collector = out / 'collector.py'
+            collector.write_text('from pathlib import Path\n'
+                'class PerfError(RuntimeError):\n'
+                ' def __init__(self, text, cause=None): super().__init__(text); self.cause=cause\n'
+                'def last_input_ticks(): return (124, 1000)\n'
+                'def measure_win32(*args): Path(__file__).with_suffix(".started").touch()\n', encoding='utf-8')
+            stimulus.durable_json(out / 'request.json', {'collector': str(collector), 'scripts': str(SCRIPTS),
+                'exe': 'unused.exe', 'env_dir': str(out), 'config': '', 'resizes': 6, 'env': {},
+                'report': {'worker_entry_input_tick': 123}})
+            with self.assertRaisesRegex(stimulus.StrictFrameError, 'abnormal exit 1'):
+                stimulus.supervise_p7([sys.executable, str(SCRIPTS/'gx_perf_stimulus.py'), '--p7-worker',
+                                      str(out/'request.json')], out, timeout=2, cleanup_timeout=2)
+            result = json.loads((out/'worker-result.json').read_text(encoding='utf-8'))
+            self.assertEqual('foreign_input', result['failure_cause'])
+            self.assertFalse(collector.with_suffix('.started').exists())
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows Job contract')
+    def test_blocked_flush_capture_save_and_child_are_terminated_with_checkpoint(self):
+        for stage in ('flush', 'capture', 'save'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                began = time.monotonic()
+                with self.assertRaisesRegex(stimulus.StrictFrameError, 'timeout'):
+                    stimulus.supervise_p7(
+                        [sys.executable, __file__, '--p7-block-fixture', tmp, stage],
+                        out, timeout=2.0, cleanup_timeout=2.0)
+                self.assertLess(time.monotonic() - began, 4.5)
+                result = json.loads((out / 'supervisor.json').read_text(encoding='utf-8'))
+                self.assertEqual('FAIL', result['status'])
+                self.assertTrue(result['cleanup']['tree_exited'])
+                self.assertEqual(0, result['cleanup']['active_processes'])
+                checkpoint = out / ('resize.before_dwm_flush.query.json' if stage == 'flush'
+                                    else 'resize.before_capture.query.json')
+                raw = json.loads(checkpoint.read_text(encoding='utf-8'))
+                self.assertTrue(raw['queries'])
+                self.assertEqual(900, raw['snapshots'][0]['geometry']['birth'])
+                self.assertTrue((out / 'descendant.pid').exists())
+                marker = (out / 'heartbeat').read_bytes()
+                time.sleep(0.15)
+                self.assertEqual(marker, (out / 'heartbeat').read_bytes())
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows Job contract')
+    def test_assignment_failure_never_opens_worker_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with mock.patch.object(stimulus.WindowsJob, 'assign', side_effect=OSError('assign denied')):
+                with self.assertRaisesRegex(stimulus.StrictFrameError, 'assign denied'):
+                    stimulus.supervise_p7([sys.executable, __file__, '--p7-block-fixture', tmp, 'flush'],
+                                          out, timeout=2, cleanup_timeout=2)
+            self.assertFalse((out / 'descendant.pid').exists())
+            result = json.loads((out / 'supervisor.json').read_text(encoding='utf-8'))
+            self.assertFalse(result['gate_released'])
+            self.assertTrue(result['cleanup']['tree_exited'])
+
+
+def blocked_p7_fixture(directory, stage):
+    # No app, child, thread or GUI action is permitted before this exact gate.
+    if sys.stdin.buffer.readline() != b'P7_GO\n':
+        return 2
+    out = Path(directory)
+    code = ('import pathlib,time; p=pathlib.Path(' + repr(str(out / 'heartbeat')) + '); '
+            '\nwhile True:\n p.write_text(str(time.monotonic()), encoding="utf-8"); time.sleep(.02)')
+    child = subprocess.Popen([sys.executable, '-c', code], stdin=subprocess.DEVNULL)
+    (out / 'descendant.pid').write_text(str(child.pid), encoding='utf-8')
+    fixture = PresentFixture()
+    original = stimulus.PresentQuery.snapshot
+    def snapshot(probe, name, deadline):
+        fixture.stage(name)
+        return original(probe, name, deadline)
+    def block(*args, **kwargs):
+        while True:
+            time.sleep(1)
+    if stage == 'capture':
+        fixture.backdrop.capture.side_effect = block
+    elif stage == 'save':
+        fixture.backdrop.capture.return_value.save_png.side_effect = block
+    with mock.patch.object(stimulus.PresentQuery, 'snapshot', snapshot), \
+            mock.patch.object(stimulus, 'dwm_flush', side_effect=block if stage == 'flush' else None):
+        stimulus.strict_resize_capture(fixture.gui, fixture.instance, 900, 650,
+                                       out / 'resize.png', fixture.backdrop, {})
+    return 0
+
+
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--p7-block-fixture':
+        raise SystemExit(blocked_p7_fixture(*sys.argv[2:]))
     unittest.main()

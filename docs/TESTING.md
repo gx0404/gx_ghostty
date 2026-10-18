@@ -121,7 +121,21 @@ GTK 的 `gtk --case p2|p4` 使用独立的动作采样合同，默认省略 `--c
 
 上述 GTK 动作采样需要 Xvfb、可用的会话 D-Bus 与 AT-SPI 库/桥接；隔离环境显式启用 `GHOSTTY_GX_PERF=1`、`GHOSTTY_LOG=stderr`、`NO_AT_BRIDGE=0`、`GTK_A11Y=atspi`。输出保留 `plan.json`、每轮 raw、receipt、状态记录、截图与 `gx-gtk-actions-v1` 汇总，不套用 C1 的 3000000 负载完成证明。十轮或指标不全时不能签收；脚本退出 0 不代替截图阅读，门值失败退出 4、工具错误退出 2。使用 `quiet-batch --input-observe-only` 直接包装该入口，不在子命令里另拿槽。
 
-`win32 --resizes 6` 另存每次缩放的图片、实际几何、日志字节区间与未舍入耗时，`resize.setwindowpos >= 16 ms` 计一次代理超时。`surface.resize_timeout` 原日志是一次 1 us 的事件标记，另按出现次数计数，不能将换算后的 .001 ms 相加冒充次数。当前操作后截图与消息响应**尚不能证明尺寸匹配的成功呈现末帧**，产物明确 `strict_final_frame=false`；P7 必须在产品侧的成功呈现查询接入并通过后签收，旧构建无此接口应如实记录。
+`win32 --resizes 6` 另存逐次几何、图片、原始日志字节与未舍入耗时，`resize.setwindowpos >= 16 ms` 计一次代理超时。`surface.resize_timeout` 的 1 us 日志标记按出现次数计数，不把 .001 ms 相加冒充次数。以下接口已接入；真实 rF 批次与逐图门未完成之前，仍不能签收 P7。
+
+P7 严格末帧使用 `GHOSTTY_GX_REMOTE_TEST=1` 下的 `GhosttyWindow` 消息 `0x450`。`GXP7/v1` 为只读成功呈现查询：`wParam=17` 返回 `(sequence:u32,height:u16,width:u16)` 原子字，`18` 返回 GUI 目标尺寸 `(height:u32,width:u32)`。两者 `lParam=0` 选活动叶，`1..N` 选当前标签 split tree 的第 N 个叶。`wParam=19` 的 `lParam=(leaf<<8)|field`：field 0 是 `0x47585037_0001_status` 描述符，1 是 GUI client 尺寸，2/3 是 surface generation/attachment revision，4/5 是 owner id/generation，6/7 是 surface id/child HWND。status 1 可用，2 尺寸不支持，3 无可用本地 surface，4 该生命周期曾迁移或重置，5 发布门未启用；整体消息门关闭或旧构建返回 0。完整宽高必须处于 1..65535；17 的低 32 位 `0xffff0000` 是不支持尺寸哨兵，绝不截断。sequence 按 32 位回绕，驱动只接受半区间内的前进值。
+
+驱动在每次 `SetWindowPos` 前保存全部可见叶的序号和 PID+creation、surface generation、attachment revision、owner、HWND 身份，返回后等待每个同身份叶出现新序号且帧尺寸精确等于 GUI target，并核 GUI client 与 `GetClientRect` 一致。每次 SetWindowPos 返回后的帧匹配查询期限为 2 s（不包含 flush/capture 的整步承诺）；1 ms sleep 仅是轮询间隔，WM_NULL 与 renderer.present 日志都不是完成证据。匹配后调用 `DwmFlush`，在受保护截图前后复查外框、client、target、身份和成功帧；尺寸变化、迁移、重建、序号倒退或超时均 FAIL，保留逐次原始 query、部分 snapshot、日志字节、已有 PNG 与 SHA256。测试接口不会冻结画面，不声称捕获第一帧；这里确认最终尺寸的成功帧和捕获边界，黑边/拉伸仍需读图。
+
+旧构建无接口、版本不支持或启动时无法提供有效尺寸时记 PENDING，可保存受保护诊断图，但 `strict_final_frame=false`；握手开始支持、途中失去支持则 FAIL。远程 readback 不等于本地 SwapBuffers，转出/预览/返回或 GPU reset 会在该 surface 生命周期内撤销严格查询，需要新的隔离实例重新采样。所有 P7 臂对称设置测试环境门。
+
+`gx_perf_stimulus.py::strict_resize_capture` 为握手真源，`gx_perf.py::resize_evidence` 负责保存其 raw 并维持现有耗时/计数口径。成功呈现序号与尺寸由 `Surface.signalFrameDrawn` 发布；新增统计仅在初始化时缓存的测试门开启后写入。测试门关闭时原有 resize event 和首帧消息行为不变。
+
+第二轮工具合同：`gx_perf_stimulus.py::P7_LIMITS` 是 2/120/60/5 秒真源。单臂单轮（通常含 6 次 resize）的 worker 执行期限为 120 s，warmup 为 60 s，均覆盖 worker 启动、app 启动、布局、帧查询、DwmFlush、隐私背板、截图保存与正常清理；超时或异常后的终止确认另限 5 s。父进程创建独有 Windows Job，分配 worker 成功后才打开 stdin 闸门；失败不放行。worker 只请求正常 WM_CLOSE，强制终止只作用于本次 Job；分配失败时只结束尚未放行的 worker 原进程句柄。父进程核验 worker 退出且 Job ActiveProcesses 为零；清理验证失败仍为 FAIL。没有用于逃逸阻塞调用的后台捕获线程。`quiet-batch --timeout` 仍是等槽期限。
+
+`before_setwindowpos`、`before_dwm_flush`、`before_capture` 各有 fsync + 原子更名的 `*.query.json` 检查点，保存已采原始查询、序号、目标及 PID/birth/leaf 代际。worker 异常或超时后，父进程保留检查点、单独落 `*.worker-failure.json`、`worker-failure-log.raw`；不覆盖已冻结 segment，不重跑。`resize_evidence` 只冻结一次日志字节，指标/offset/SHA256/`.segment.raw` 与 `.log-frozen.raw` 同源；第三读仅验证追加和文件身份，截断、替换（含相同前缀的新文件）失败关闭，异常另存 `.failure-log.raw`。16 ms 代理、原始计数单位、AB/BA 次数、输入及逐图视觉门不变。
+
+`GX_PERF_BATCH_ID`/`GX_PERF_GUARD_LOG` 继承到 worker；父子交接传递同一 GetLastInputInfo tick，跨 warmup/arm 的已知输入 tick 继续传递。门前及清理后的输入变化进入原 guard schema；不以 worker 新启动重新认定用户空闲。离线单测仅通过测试 API 缩短监督期限，生产 CLI 无降低这四个阈值的选项。
 
 `win32-c7 --case matrix --exe <同源GX-0031回退对照> --exe <候选> --runs 10 --seconds 60 --out <新目录>` 覆盖 1/11 标签 × 可见、失焦、最小化、关闭闪烁、真实 IME 预编辑、输出唤醒共 12 格，并加两种标签数的 Kitty/自定义 shader 动画 4 格；可用 `--case` 与 `--tabs` 单格运行。CPU 取被测进程累计差，PDH 保存线程身份、原始计数和采样时间；线程集合变化或 counter 缺失不补零，不以 NtQuery 端点诊断填洞，周期内短命线程不可见的限制必须列出。输出刺激由自有 shell 回执证明字节量与时刻，不等同呈现 ACK；IME 用已有中文布局的物理按键、未提交阶段截图及后续中文提交回执，不加载宿主布局、不用 Unicode 注入代替。前置缺失可记环境 PENDING，刺激后意外提交属于 FAIL；隐私遮罩清理失败覆盖环境 PENDING 并停止矩阵。`measurement_coverage=PENDING` 时，即使 quiet VALID 也不表示 C7 已完成。逐图审核光标两相位与动画仍是独立验收门。
 

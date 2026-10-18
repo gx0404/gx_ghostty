@@ -2637,41 +2637,64 @@ def run_remote(args) -> int:
 
 def resize_evidence(gui, instance, target: Path, index: int, width: int, height: int,
                     report: dict, backdrop) -> float:
-    """P7 post-operation evidence, explicitly not a renderer/DWM completion fence."""
+    """P7 size-matched successful-present query; legacy support remains PENDING."""
     target.mkdir(parents=True, exist_ok=True)
     row = {'index': index, 'target_outer_px': [width, height], 'pid': instance.pid,
            'creation': instance.creation, 'status': 'running', 'strict_final_frame': False,
-           'synchronization': 'SetWindowPos return + WM_NULL response; neither proves a presented frame',
-           'presentation_scope': 'renderer.present counts entry before SwapBuffers, with no size/frame ID',
+           'synchronization': 'GXP7/v1: before-resize sequence, all leaf target frames, DwmFlush, capture brackets',
+           'presentation_scope': 'atomic successful local swap; renderer.present log remains entry count',
            'begin_qpc_ns': time.perf_counter_ns(), 'begin_time_ns': time.time_ns()}
     report.setdefault('resizes', []).append(row)
     path = target / f'resize-{index:02d}.json'
+    import gx_perf_stimulus as stimulus
+    def identity():
+        stat = instance.log.stat() if instance.log.exists() else None
+        return [stat.st_dev, stat.st_ino] if stat else None
+    original_identity = identity()
+    expected_identity = original_identity
     before = instance.log.read_bytes() if instance.log.exists() else b''
-    row['log_start_byte'] = len(before)
+    row.update(log_start_byte=len(before), log_file_identity=original_identity,
+               log_start_sha256=hashlib.sha256(before).hexdigest(), limits=dict(stimulus.P7_LIMITS))
+    frozen = None
+    observed = None
+    def read_log():
+        nonlocal observed, expected_identity
+        first = identity()
+        observed = instance.log.read_bytes() if instance.log.exists() else b''
+        last = identity()
+        if first != last or (expected_identity is not None and first != expected_identity):
+            raise PerfError('resize log truncated or replaced (file identity)')
+        if expected_identity is None:
+            expected_identity = first
+            row['log_file_identity'] = first
+        return observed
+    def freeze(data):
+        nonlocal frozen
+        frozen = data
+        segment = data[len(before):]
+        row.update(log_end_byte=len(data), log_prefix_intact=True,
+                   log_frozen_sha256=hashlib.sha256(data).hexdigest(),
+                   log_segment_sha256=hashlib.sha256(segment).hexdigest())
+        (target / f'resize-{index:02d}.segment.raw').write_bytes(segment)
+        (target / f'resize-{index:02d}.log-frozen.raw').write_bytes(data)
+        return segment
+    stimulus.durable_json(path, row)
     try:
-        instance.ensure_foreground()
-        elapsed = instance.resize(width, height)
-        row.update(setwindowpos_ms=elapsed, proxy_timeout=elapsed >= 16.0,
-                   setwindowpos_return_qpc_ns=time.perf_counter_ns())
-        row['wm_null_responded'] = instance.responsive(2)
-        row['wm_null_return_qpc_ns'] = time.perf_counter_ns()
-        info = instance.require_window()
-        rect = gui.win32().raw_window_rect(info.hwnd)
-        row.update(hwnd=info.hwnd, actual_outer_rect_px=list(rect),
-                   actual_outer_px=[rect[2] - rect[0], rect[3] - rect[1]])
-        row['target_size_matched'] = row['actual_outer_px'] == row['target_outer_px']
-        row['terminals'] = [{'hwnd': term.hwnd, 'rect_px': list(term.rect)} for term in instance.terminals(info)]
-        row['capture_begin_qpc_ns'] = time.perf_counter_ns()
+        strict = row.setdefault('strict_frame_evidence', {})
         png = target / f'resize-{index:02d}.png'
-        backdrop.capture(instance, info, 'screen', png.name).save_png(png)
-        row.update(capture_end_qpc_ns=time.perf_counter_ns(), screenshot=str(png),
-                   screenshot_sha256=hashlib.sha256(png.read_bytes()).hexdigest(), visual_review='PENDING')
-        after = instance.log.read_bytes() if instance.log.exists() else b''
+        elapsed = stimulus.strict_resize_capture(gui, instance, width, height, png, backdrop, strict,
+            round_deadline=report.get('round_deadline_qpc'))
+        row.update(setwindowpos_ms=elapsed, proxy_timeout=elapsed >= 16.0,
+                   strict_final_frame=strict['strict_final_frame'], strict_frame_status=strict['status'],
+                   screenshot=strict['screenshot'], screenshot_sha256=strict['screenshot_sha256'],
+                   visual_review='PENDING')
+        rect = strict['snapshots'][-1]['geometry']['outer']
+        row.update(actual_outer_rect_px=rect, actual_outer_px=[rect[2]-rect[0], rect[3]-rect[1]],
+                   target_size_matched=True)
+        after = read_log()
         if not after.startswith(before):
             raise PerfError('resize log truncated or replaced')
-        row['log_end_byte'] = len(after)
-        segment = after[len(before):]
-        (target / f'resize-{index:02d}.segment.raw').write_bytes(segment)
+        segment = freeze(after)
         parsed = arm_samples(segment.decode('utf-8', errors='strict'), report.get('baseline', False))
         full = arm_samples(after.decode('utf-8', errors='strict'), report.get('baseline', False))
         row['presentation_metrics'] = {}
@@ -2686,38 +2709,76 @@ def resize_evidence(gui, instance, target: Path, index: int, width: int, height:
         # timing marker. Count occurrences; never sum its normalized ms as events.
         row['surface_resize_timeout_events'] = (len(parsed.values.get('surface.resize_timeout', []))
             if row['presentation_metrics']['surface.resize_timeout']['status'] != 'not_instrumented' else None)
-        if not row['wm_null_responded']:
-            instance.record_input('guard', check='p7_wm_null', status='fail', cause='instance_hung',
-                                  reason='P7 WM_NULL did not respond')
-            raise PerfError('P7 WM_NULL did not respond', cause='instance_hung')
+        # Revalidation can observe later appends, but cannot change the frozen
+        # bytes, offsets, hashes or metrics. Truncation/replacement invalidates all proof.
+        tail = read_log()
+        if not tail.startswith(frozen):
+            raise PerfError('resize log truncated or replaced after metric freeze')
+        row['log_validation_end_byte'] = len(tail)
         row['status'] = 'captured'
         return elapsed
     except Exception as exc:
-        row.update(status='failed', error=f'{type(exc).__name__}: {exc}')
+        row.update(status='failed', strict_final_frame=False, strict_frame_status='FAIL',
+                   error=f'{type(exc).__name__}: {exc}')
+        if row.get('strict_frame_evidence'):
+            row['strict_frame_evidence'].update(status='FAIL', strict_final_frame=False)
+        try:
+            if frozen is None and observed is None:
+                data = read_log()
+                if not data.startswith(before):
+                    raise PerfError('resize log truncated or replaced on failure')
+                freeze(data)
+        except Exception as evidence_error:
+            row['log_evidence_error'] = str(evidence_error)
+        if observed is not None:
+            (target / f'resize-{index:02d}.failure-log.raw').write_bytes(observed)
         raise
     finally:
+        strict = row.get('strict_frame_evidence', {})
+        if 'setwindowpos_ms' in strict:
+            row['setwindowpos_ms'] = strict['setwindowpos_ms']
+            row['proxy_timeout'] = strict['setwindowpos_ms'] >= 16.0
+        if strict.get('snapshots'):
+            geometry = strict['snapshots'][-1].get('geometry')
+            if geometry:
+                rect = geometry['outer']
+                row.update(actual_outer_rect_px=rect, actual_outer_px=[rect[2]-rect[0], rect[3]-rect[1]])
         row['end_qpc_ns'] = time.perf_counter_ns()
-        write_json(path, row)
+        stimulus.durable_json(path, row)
 
 
 def measure_win32(gui, exe: Path, env_dir: Path, config: str, resizes: int,
                   env: Mapping[str, str] | None = None, report: dict | None = None) -> list[str]:
     """One Windows run: `metric` lines for startup, a new tab, a split and resizes."""
-    instance = gui.launch(exe, env_dir, config=config, env=env)
     report = report if report is not None else {}
+    import gx_perf_stimulus as stimulus
+    def checkpoint(stage):
+        report['worker_stage'] = stage
+        if checkpoint_path := report.get('round_checkpoint'):
+            stimulus.durable_json(Path(checkpoint_path), report)
+    checkpoint('before_launch')
+    instance = gui.launch(exe, env_dir, config=config, env=env)
     report.update(pid=instance.pid, creation=instance.creation)
+    checkpoint('launched')
     backdrop = gui.Backdrop(gui.BACKDROP_DEFAULT) if resizes else None
     lines = [f"# gx_perf win32 run of {exe} (pid {instance.pid})"]
     try:
         for mark, value in instance.wait_window(30).items():
             lines.append(f"metric startup.{mark.removesuffix('_ms')} {value:.1f} ms")
+        if 'worker_entry_input_tick' in report and last_input_ticks()[0] != report['worker_entry_input_tick']:
+            instance.record_input('guard', check='p7_worker_start', status='fail', cause='foreign_input')
+            raise PerfError('input arrived during P7 worker startup', cause='foreign_input')
+        input_tick = report.get('worker_entry_input_tick')
         instance.activate()
         time.sleep(1.0)
         for name, keys in (("new_tab", NEW_TAB_KEYS), ("split", SPLIT_KEYS)):
             window = instance.require_window()
             before = {info.hwnd for info in gui.win32().child_windows(window.hwnd, gui.TERMINAL_CLASS)}
             began = time.perf_counter()
+            if input_tick is not None:
+                c7_input_check(gui, instance, argparse.Namespace(state='visible'), input_tick)
             instance.press(keys)
+            input_tick = last_input_ticks()[0]
             deadline = began + 10
             while True:
                 visible = [info for info in instance.terminals(window) if info.hwnd not in before]
@@ -2731,7 +2792,11 @@ def measure_win32(gui, exe: Path, env_dir: Path, config: str, resizes: int,
         window = instance.require_window()
         left, top, right, bottom = gui.win32().raw_window_rect(window.hwnd)
         width, height = right - left, bottom - top
-        resize_tick = last_input_ticks()[0] if resizes else None
+        resize_tick = input_tick
+        if resize_tick is not None:
+            c7_input_check(gui, instance, argparse.Namespace(state='visible'), resize_tick)
+        report['resize_input_tick'] = resize_tick
+        checkpoint('before_privacy_backdrop')
         if backdrop:
             # Establish the largest privacy cover before timing; backdrop capture
             # may itself wait for composition. Its timestamps are recorded below.
@@ -2749,19 +2814,89 @@ def measure_win32(gui, exe: Path, env_dir: Path, config: str, resizes: int,
             c7_input_check(gui, instance, argparse.Namespace(state='visible'), resize_tick)
         lines.append(f"metric responsive {1 if instance.responsive(2) else 0}")
     finally:
+        checkpoint('before_cleanup')
         active_error = sys.exc_info()[0] is not None
         report['input_events'] = instance.input_events if isinstance(instance.input_events, list) else []
         if backdrop:
             report['backdrop'] = backdrop.finish()
         try:
-            instance.close()
-        except gui.GuiError as exc:
+            if report.get('round_checkpoint'):
+                stimulus.close_p7_instance(gui, instance)
+            else:
+                instance.close()
+        except (gui.GuiError, stimulus.StrictFrameError) as exc:
             report['cleanup_error'] = str(exc)
             if not active_error:
                 raise
         if backdrop and backdrop.teardown_failures() and not active_error:
             raise PerfError('privacy backdrop cleanup failed: ' + '; '.join(backdrop.teardown_failures()))
+    checkpoint('complete')
     return lines
+
+
+def measure_win32_bounded(exe, env_dir, config, resizes, env, report):
+    import gx_perf_stimulus as stimulus
+    directory = Path(report['evidence_dir'])
+    directory.mkdir(parents=True, exist_ok=True)
+    timeout = stimulus.P7_LIMITS['round_seconds' if resizes else 'warmup_seconds']
+    report.update(limits=dict(stimulus.P7_LIMITS), worker_entry_input_tick=report.get('worker_entry_input_tick', last_input_ticks()[0]),
+                  round_deadline_qpc=time.perf_counter() + timeout,
+                  round_checkpoint=str(directory / 'round-checkpoint.json'))
+    request = {'collector': str(globals().get('P7_COLLECTOR_SOURCE', Path(__file__).resolve())),
+               'scripts': str(SCRIPTS), 'exe': str(exe), 'env_dir': str(env_dir),
+               'config': config, 'resizes': resizes, 'env': env, 'report': report}
+    request_path = directory / 'worker-request.json'
+    stimulus.durable_json(request_path, request)
+    try:
+        stimulus.supervise_p7([sys.executable, str(SCRIPTS / 'gx_perf_stimulus.py'),
+                              '--p7-worker', str(request_path)], directory, timeout=timeout)
+        result = json.loads((directory / 'worker-result.json').read_text(encoding='utf-8'))
+        report.update(result['report'])
+        if result['status'] != 'PASS':
+            raise PerfError(result.get('error', 'P7 worker failed'), cause=result.get('failure_cause'))
+        if not stimulus.p7_input_epoch(report['resize_input_tick'], last_input_ticks()[0], report, 'cleanup'):
+            raise PerfError('input arrived across P7 worker cleanup', cause='foreign_input')
+        return result['lines']
+    except Exception:
+        # The supervisor has terminated and verified its tree before returning.
+        # Never overwrite query checkpoints or a previously frozen log segment.
+        for source in ('round-checkpoint.json', 'worker-result.json'):
+            path = directory / source
+            if path.exists():
+                value = json.loads(path.read_text(encoding='utf-8'))
+                report.update(value.get('report', value))
+        rows = {row['index']: row for row in report.get('resizes', [])}
+        for path in sorted(directory.glob('resize-??.json')):
+            row = json.loads(path.read_text(encoding='utf-8'))
+            rows[row['index']] = row
+            if row['status'] == 'running':
+                checkpoints = [json.loads(p.read_text(encoding='utf-8'))
+                               for p in directory.glob(path.stem + '.*.query.json')]
+                if checkpoints:
+                    row['strict_frame_evidence'] = max(checkpoints, key=lambda r: max(
+                        (q['qpc_ns'] for q in r.get('queries', [])), default=0))
+                if row.get('strict_frame_evidence'):
+                    row['strict_frame_evidence'].update(status='FAIL', strict_final_frame=False)
+                row.update(status='failed', strict_final_frame=False, strict_frame_status='FAIL',
+                           error='P7 worker ended before resize evidence completed')
+                stimulus.durable_json(path.with_name(path.stem + '.worker-failure.json'), row)
+        report.update(resizes=list(rows.values()), strict_final_frame=False, strict_frame_status='FAIL')
+        import gx_win_gui as gui
+        log_path = gui.log_path(env_dir)
+        if log_path.is_file():
+            log = log_path.read_bytes()
+            (directory / 'worker-failure-log.raw').write_bytes(log)
+        stimulus.durable_json(directory / 'worker-failure.json', report)
+        result_path = directory / 'worker-result.json'
+        if result_path.exists():
+            result = json.loads(result_path.read_text(encoding='utf-8'))
+            if result.get('status') == 'FAIL':
+                raise PerfError(result.get('error', 'P7 worker failed'), cause=result.get('failure_cause'))
+        raise
+    finally:
+        supervisor = directory / 'supervisor.json'
+        if supervisor.exists():
+            report['worker_supervision'] = json.loads(supervisor.read_text(encoding='utf-8'))
 
 
 def run_win32(args: argparse.Namespace) -> int:
@@ -2781,9 +2916,11 @@ def run_win32(args: argparse.Namespace) -> int:
     labels = labels_for(len(exes), args.label)
     capabilities = metric_capabilities(getattr(args, 'capabilities', []), labels, exes)
     try:
-        environments = label_environments(labels, ['GHOSTTY_GX_PERF=1', *args.env], args.label_env, gui.env_assignments)
+        environments = label_environments(labels, ['GHOSTTY_GX_PERF=1', 'GHOSTTY_GX_REMOTE_TEST=1', *args.env], args.label_env, gui.env_assignments)
     except gui.UsageError as exc:
         raise PerfError(str(exc)) from None
+    if args.resizes and any(env.get('GHOSTTY_GX_REMOTE_TEST') != '1' for env in environments.values()):
+        raise PerfError('P7 requires GHOSTTY_GX_REMOTE_TEST=1 symmetrically')
     if any(env.get('GHOSTTY_GX_PERF') != '1' for env in environments.values()):
         raise PerfError('measurement requires GHOSTTY_GX_PERF=1')
     config = Path(args.config).read_text(encoding="utf-8") if args.config else DEFAULT_WIN32_CONFIG
@@ -2793,6 +2930,7 @@ def run_win32(args: argparse.Namespace) -> int:
     by_label = dict(zip(labels, exes))
     run_records = []
     run_report = {}
+    p7_input_tick = last_input_ticks()[0]
     def failed(label, name, exc):
         target = out / label / name
         log = gui.log_path(out / label / 'env')
@@ -2811,25 +2949,30 @@ def run_win32(args: argparse.Namespace) -> int:
         return 1
     for label in labels:
         run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'warmup',
+                      'worker_entry_input_tick': p7_input_tick,
                       'exe': str(by_label[label]), 'exe_sha256': hashlib.sha256(by_label[label].read_bytes()).hexdigest(),
-                      'capabilities': capabilities[label], 'config': config}
+                      'capabilities': capabilities[label], 'config': config,
+                      'evidence_dir': str(out / label / 'warmup-evidence')}
         env_dir = out / label / "env"
         gui.prepare_env_dir(env_dir, fresh=True)
         print(f"{TAG} {label}: warm-up run (discarded)", flush=True)
         try:
-            measure_win32(gui, by_label[label], env_dir, config, 0, environments[label], run_report)
+            measure_win32_bounded(by_label[label], env_dir, config, 0, environments[label], run_report)
+            p7_input_tick = run_report['resize_input_tick']
         except Exception as exc:
             print(f"{TAG} {label}: warm-up failed: {exc}", file=sys.stderr)
             return failed(label, 'warmup-failed', exc)
     for run, label in alternate(labels, args.runs):
         run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'measurement',
+                      'worker_entry_input_tick': p7_input_tick,
                       'exe': str(by_label[label]), 'exe_sha256': hashlib.sha256(by_label[label].read_bytes()).hexdigest(),
                       'capabilities': capabilities[label], 'config': config,
                       'evidence_dir': str(out / label / f'run-{run:02d}-resize')}
         target = out / label / f"run-{run:02d}.txt"
         env_dir = out / label / "env"
         try:
-            lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label], run_report)
+            lines = measure_win32_bounded(by_label[label], env_dir, config, args.resizes, environments[label], run_report)
+            p7_input_tick = run_report['resize_input_tick']
             if hashlib.sha256(by_label[label].read_bytes()).hexdigest() != run_report['exe_sha256']:
                 raise PerfError('executable changed during run')
         except Exception as exc:
@@ -2840,7 +2983,10 @@ def run_win32(args: argparse.Namespace) -> int:
         write_json(target.with_suffix(".json"), {**run_report, "label": label, "run": run, "env": environments[label]})
         run_records.append({'label': label, 'run': run, 'path': str(target.with_suffix('.json').relative_to(out)),
                             'pid': run_report.get('pid'), 'exe_sha256': run_report['exe_sha256'],
-                            'resizes': len(run_report.get('resizes', []))})
+                            'resizes': len(run_report.get('resizes', [])),
+                            'strict_final_frame': bool(run_report.get('resizes')) and all(
+                                row.get('strict_final_frame', False) for row in run_report['resizes']),
+                            'strict_frame_status': [row.get('strict_frame_status', 'PENDING') for row in run_report.get('resizes', [])]})
         log = gui.log_path(env_dir)
         if log.is_file():
             target.with_suffix(".log").write_bytes(log.read_bytes())  # Preserve the resize byte offsets exactly.
@@ -2849,7 +2995,9 @@ def run_win32(args: argparse.Namespace) -> int:
     code = report_runs(out, labels, args.json)
     write_json(out / 'RESULT.json', {'schema': 'gx-p7-batch-v1', 'status': 'captured' if code == 0 else 'failed',
         'planned_runs': args.runs, 'planned_resizes_per_run': args.resizes, 'runs': run_records,
-        'strict_final_frame': False, 'visual_review': 'PENDING', 'performance_verdict': 'not evaluated', 'exit': code})
+        'strict_final_frame': bool(run_records) and all(run['strict_final_frame'] for run in run_records),
+        'strict_frame_status': 'PASS' if run_records and all(run['strict_final_frame'] for run in run_records) else 'PENDING',
+        'visual_review': 'PENDING', 'performance_verdict': 'not evaluated', 'exit': code})
     return code
 
 

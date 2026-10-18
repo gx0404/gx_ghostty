@@ -4139,6 +4139,28 @@ pub fn windowWndProc(
         @import("remote_test.zig").query_message => {
             const fixture = @import("remote_test.zig");
             if (!fixture.enabled()) return 0;
+            // P7: lParam selects active leaf (0) or a one-based tree leaf.
+            // Selector 19 uses (leaf << 8) | field for metadata. Handle these
+            // before the remote forwarder: remote receipt is not local SwapBuffers.
+            if (wparam >= 17 and wparam <= 19) {
+                if (lparam < 0) return 0;
+                const argument: usize = @intCast(lparam);
+                const leaf_index = if (wparam == 19) argument >> 8 else argument;
+                var selected: ?*Surface = null;
+                if (leaf_index == 0) {
+                    selected = window.getActiveSurface();
+                } else if (window.tab_count != 0) {
+                    var iterator = window.tab_trees[window.active_tab].iterator();
+                    var index: usize = 1;
+                    while (iterator.next()) |entry| : (index += 1) {
+                        if (index == leaf_index) {
+                            selected = entry.view.local();
+                            break;
+                        }
+                    }
+                }
+                return Surface.testPresentQuery(selected, wparam, @truncate(argument));
+            }
             if (wparam >= 12 and wparam <= 16) {
                 if (wparam == 12) return @intCast(window.tab_count);
                 const leaf = window.activeLeaf() orelse return 0;
