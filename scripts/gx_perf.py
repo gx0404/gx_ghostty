@@ -36,8 +36,9 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
         (with or without the flag) must have had no input at all since the start check.
         --input-observe-only is for batches that run only in WSL/Xvfb (C1, C5, P9): the start idle
-        gate and the end input check are recorded, never gate; it refuses Windows-desktop drivers, and
-        a batch that still writes gx_win_gui guard rows is an ERROR.
+        gate and the end input check are recorded, never gate; it refuses commands that drive the
+        Windows desktop (gx_win_gui, gx_perf win32 drivers, test/windows fixtures, ghostty.exe), and a
+        batch that still writes gx_win_gui guard rows is an ERROR.
         Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* driver exited 4), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
         6 PRODUCT_FAIL (a measured Ghostty instance ended or hung mid-batch, or win32-idle saw it activate
@@ -1114,11 +1115,15 @@ def gate_exit_contract(command: Sequence[str]) -> bool:
 
 
 def desktop_command(command: Sequence[str]) -> bool:
-    """Whether `command` drives the Windows desktop: gx_win_gui.py (`just win-gui`) or a gx_perf.py
-    win32 / win32-* driver (`just perf win32...`). --input-observe-only refuses these up front; the
-    batch's guard log catches any other command that sends input through gx_win_gui."""
+    """Whether `command` drives the Windows desktop: gx_win_gui.py (`just win-gui`), a gx_perf.py
+    win32 / win32-* driver (`just perf win32...`), a Windows fixture under test/windows/ (such as
+    the remote fixture of the remote performance batch) or ghostty.exe itself. --input-observe-only
+    refuses these up front; the batch's guard log catches any other command that sends input through
+    gx_win_gui."""
     names = [process_name(part) for part in command]
-    if 'gx_win_gui.py' in names or ('just' in names and 'win-gui' in command):
+    paths = [part.replace('\\', '/').casefold() for part in command]
+    if ('gx_win_gui.py' in names or ('just' in names and 'win-gui' in command)
+            or any('test/windows/' in path or path.endswith('ghostty.exe') for path in paths)):
         return True
     for index in range(len(command) - 1):
         if command[index + 1] in ('win32', *WIN32_DRIVERS) and (
@@ -1249,7 +1254,8 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
         raise PerfError('--input-observe-only and --injected-input are mutually exclusive')
     if observe_input and desktop_command(command):
         raise PerfError('--input-observe-only is only for batches that run in WSL/Xvfb; this command drives the Windows '
-                        'desktop (gx_win_gui or a gx_perf win32 driver): run it without --input-observe-only')
+                        'desktop (gx_win_gui, a gx_perf win32 driver, a test/windows fixture or ghostty.exe): run it '
+                        'without --input-observe-only')
     out = new_output(args.out)
     guard_log = out / 'guards.jsonl'
     result = {'schema': 'gx-quiet-batch-v2', 'batch_id': uuid.uuid4().hex, 'command': command,

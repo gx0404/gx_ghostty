@@ -891,14 +891,15 @@ class QuietBatchTests(unittest.TestCase):
         for command in (('python', 'scripts/gx_perf.py', 'win32-idle', '--exe', 'g.exe', '--out', 'M'),
                         ('python', 'E:/r/scripts/gx_perf.py', 'win32', '--exe', 'g.exe', '--out', 'M'),
                         ('just', 'perf', 'win32-ui', '--case', 'p4'), ('python', 'scripts/gx_win_gui.py', 'run', 'W02'),
-                        ('just', 'win-gui', 'run', 'W13')):
+                        ('just', 'win-gui', 'run', 'W13'), ('python', 'test\\windows\\gx_remote_fixture.py', '--exe', 'g.exe'),
+                        ('E:/r6/zig-out/bin/ghostty.exe', '--config-default-files=false')):
             with self.subTest(command=command):
                 self.assertTrue(gx_perf.desktop_command(command))
                 args = self.batch_args('--input-observe-only', command=command)
                 with self.assertRaisesRegex(gx_perf.PerfError, 'drives the Windows desktop'):
                     gx_perf.run_quiet_batch(args, self.probe, self.command(0))
-        for command in (self.WSL_BATCH, ('python', 'scripts/gx_perf.py', 'gtk', '--clone', 'c', '--out', 'M'),
-                        ('python', 'scripts/gx_remote_fixture.py', 'run')):
+        for command in (self.WSL_BATCH, ('python', 'scripts/gx_perf.py', 'gtk', '--clone=~/src/gx_ghostty', '--out', 'M'),
+                        ('python', 'scripts/gx_perf.py', 'remote', 'LOGS', '--label', 'ghostty')):
             self.assertFalse(gx_perf.desktop_command(command))
         # Any gx_win_gui guard row shows the batch touched the desktop after all: an ERROR, never VALID.
         args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)
