@@ -1,8 +1,12 @@
 id = "W03"
 title = "Search highlights matches and Esc clears the highlight"
+# Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch, so this scenario opens
+# the search bar with F12 (start_search, bound below), a key no input method takes: it needs no
+# keyboard layout switch and runs the same with any input method.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+keybind = f12=start_search
 """
 expect = [
   "highlight: both needle words in the output are highlighted and the bar counts the matches",
@@ -14,11 +18,8 @@ action = "type"
 text = "echo needle-one and needle-two\n"
 
 [[step]]
-action = "ime_off"
-
-[[step]]
 action = "key"
-keys = "ctrl+shift+f"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"

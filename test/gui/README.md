@@ -11,6 +11,8 @@
 
 Windows：先 `just build`。看性能或发布形态时，改用 ReleaseFast 构建，再用 `--exe` 指过去。
 
+A2 的 W02、W03、W08、W13、W20 在隔离配置中绑定 `f12=start_search`，以 F12 打开查找栏，避免输入法截获组合键；F9 留给标签导航等场景动作。合入 findkeys 分支后，W20 新增的重新聚焦步骤与 W24 也须由该分支统一使用 F12。
+
 ```sh
 just win-gui list                                   # id、标题、前置条件与副作用
 just win-gui run --out .local/evidence/<任务>/shots W01 W03
@@ -40,14 +42,14 @@ just wsl scenario --out <目录> G02 G05
 - `harness`：默认 true，会在配置末尾追加 `confirm-close-surface = false`，关窗时就不会弹确认。
 - `env`：环境变量表。运行器启动 Ghostty 时会去掉调用方的 `NO_COLOR`、`TERM*`、`GHOSTTY_*`，需要的变量（如 `GHOSTTY_GX_OPENGL = "software"`）在这里写。
 - `args`：额外的命令行参数。
-- `requires`：前置条件，取值为 `wsl:<发行版>`、`file:<路径>` 或 `windows-build:<号>`。不满足的场景记 SKIPPED。
+- `requires`：前置条件，取值为 `wsl:<发行版>`、`file:<路径>` 或 `windows-build:<号>`。不满足的场景记 SKIPPED。`file:` 的路径展开环境变量，花括号语法与下文 `wait_file` 相同（字面花括号写 `{{`、`}}`），但不能用 `{log}`、`{env}`：前置条件在运行前检查，那时本场景的隔离目录还不存在。
 - `side_effects`：写明场景会影响桌面之外的东西（如打开默认浏览器）。这类场景只有加 `--allow-side-effects` 才会运行。
 - `expect`：截图必须显示的内容，写成「截图名: 内容」。
 - `[[step]]`：按顺序执行的步骤。
 
 步骤由 `action` 选定，参数表以 `scripts/gx_win_gui.py::ACTIONS` 为准：
 
-- 等待与断言：`wait_window`、`wait_terminals`、`wait_popup`、`wait_title`、`assert_title`、`wait_log`、`assert_log`、`wait_file`、`assert_responsive`、`pixel`。`wait_popup` 的 `cls` 按类名前缀匹配；`new = true` 时，只认最近一次输入之后才出现的弹层。`wait_file` 等一个文件的全文匹配正则，例如终端里的程序写出的结果，WSL 里的文件可以用 `\\wsl.localhost\<发行版>\…` 路径读。注意 shell 默认是规范模式：不按回车，`cat` 收不到输入，屏幕上看到的 `^[[O` 之类只是行规程的回显；要让程序直接拿到输入，先执行 `stty -icanon -echo`。
+- 等待与断言：`wait_window`、`wait_terminals`、`wait_popup`、`wait_title`、`assert_title`、`wait_log`、`assert_log`、`wait_file`、`assert_responsive`、`pixel`。`wait_popup` 的 `cls` 按类名前缀匹配；`new = true` 时，只认最近一次输入之后才出现的弹层。`wait_file` 等一个文件的全文匹配正则，例如终端里的程序写出的结果，WSL 里的文件可以用 `\\wsl.localhost\<发行版>\…` 路径读。`wait_file` 的 `path` 可以用占位符：`{log}` 是本场景实例的 `ghostty.log` 的绝对路径（`<env>/ghostty/logs/ghostty.log`），`{env}` 是本场景的隔离目录；字面花括号写 `{{`、`}}`。先替换占位符，值原样插入，再展开其余部分的环境变量（`%NAME%`、`$NAME`、`${NAME}`）。未知占位符或不成对的花括号在加载场景时就报错，不会当成字面路径。注意 shell 默认是规范模式：不按回车，`cat` 收不到输入，屏幕上看到的 `^[[O` 之类只是行规程的回显；要让程序直接拿到输入，先执行 `stty -icanon -echo`。
 - 输入：`type`（KEYEVENTF_UNICODE 逐字输入，`\n` 是回车）、`key`（带扫描码的真实虚拟键，如 `ctrl+shift+t`）、`click`、`mouse_down`、`mouse_up`、`move`、`drag`、`drag_divider`、`wheel`、`clipboard`。
 - 钩子：`dpi`（`WM_GHOSTTY_SIMULATE_DPI`）、`gpu_reset`、`cancel_mode`、`ime_off`、`resize`、`activate`、`close`、`file`（写一个文件）、`sleep`。
 - 截图：`capture`。`what` 可取 `window`（默认）、`quick`、`popups`、`all`（主窗加每个弹层）。`method` 可取 `screen`（默认，窗口被别的程序挡住时失败）或 `print`（PrintWindow）。

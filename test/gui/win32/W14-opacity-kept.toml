@@ -4,10 +4,8 @@ title = "Background opacity: toggled opaque stays opaque through a palette theme
 requires = ["windows-build:22621"]
 # GHOSTTY_GX_PERF logs the OpenGL probe thread (`wgl.probe`); only checked as a log line.
 env = { GHOSTTY_GX_PERF = "1", GHOSTTY_GX_ANIMATIONS = "0" }
-# Before running, set GX_W14_LOG in the runner environment to the absolute path
-# <out>/W14/env/ghostty/logs/ghostty.log (use --retries 0). wait_file reads the
-# whole log, unlike wait_log/assert_log which only match individual old lines.
-# This lets the existing runner check ordered reset/gauge cycles without code changes.
+# The runner expands {log} to this instance's isolated log (use --retries 0).
+# wait_file checks the complete log, so reset/gauge cycles must appear in order.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
@@ -126,7 +124,7 @@ terminal = 0
 
 [[step]]
 action = "wait_file"
-path = '%GX_W14_LOG%'
+path = '{log}'
 pattern = '(?s)metric renderer\.targets_live 2\r?\n(?:(?!metric renderer\.targets_live ).)*recreating the lost OpenGL context(?=.*renderer resources rebuilt after the GPU reset)(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 0\r?\n(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 2\r?\n'
 timeout = 5
 
@@ -200,7 +198,7 @@ terminal = 0
 
 [[step]]
 action = "wait_file"
-path = '%GX_W14_LOG%'
+path = '{log}'
 # Require the first completed cycle before the second: an old rebuilt line
 # must not make this wait succeed. Keep the process-wide 4 -> 2 -> 4 definition.
 pattern = '(?s)recreating the lost OpenGL context.*?renderer resources rebuilt after the GPU reset.*?metric renderer\.targets_live 4\r?\n(?:(?!metric renderer\.targets_live ).)*recreating the lost OpenGL context(?=.*renderer resources rebuilt after the GPU reset)(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 2\r?\n(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 4\r?\n'
