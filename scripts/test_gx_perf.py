@@ -9,6 +9,7 @@ import ast
 import contextlib
 import ctypes
 import io
+import os
 import json
 import sys
 import tempfile
@@ -841,6 +842,57 @@ class QuietBatchTests(unittest.TestCase):
 
     WSL_BATCH = ('python', 'scripts/gx_wsl.py', 'smoke')
 
+    def test_observe_just_uses_checked_python_argv_without_shell(self):
+        # These are inert argv fixtures. Never execute the shell-control payloads.
+        for index, (recipe, tail) in enumerate([
+                ('wsl', ['smoke', '--out', 'M', '&', 'python', 'scripts/gx_wsl.py', 'run']),
+                ('perf', ['gtk', '--out', 'M', '&&', 'python', 'scripts/gx_win_gui.py', 'run']),
+                ('wsl', ['--clone', '~/src/frozen', 'scenario', '--out', 'M;echo x', '|', 'cmd']),
+                ('perf', ['gtk', '--env', 'VALUE=$(echo x)', '--out', 'M with spaces'])]):
+            args = self.batch_args('--input-observe-only', command=['just', recipe, *tail])
+            args.out = self.args.out.parent / f'normalized-{index}'
+            expected = [sys.executable, str(Path.cwd() / 'scripts' / f'gx_{recipe}.py'), *tail]
+            runner = mock.Mock(return_value=SimpleNamespace(returncode=0))
+            original_check = gx_perf.desktop_command
+            checked = []
+            def check(command):
+                self.assertFalse(args.out.exists())
+                checked.append(list(command))
+                return original_check(command)
+            with self.subTest(recipe=recipe, tail=tail), \
+                    mock.patch.object(gx_perf, 'desktop_command', side_effect=check), \
+                    mock.patch.object(gx_perf.subprocess, 'run', runner):
+                code, result = self.run_batch(args, None)
+                self.assertEqual(0, code)
+                self.assertEqual([expected], checked)
+                self.assertEqual(expected, runner.call_args.args[0])
+                self.assertIs(False, runner.call_args.kwargs['shell'])
+                self.assertEqual(expected, result['command'])
+                self.assertEqual(['just', recipe, *tail], result['requested_command'])
+
+    def test_observe_normalization_keeps_measurement_cwd_and_frozen_scripts(self):
+        frozen = self.args.out.parent / 'frozen measurement'
+        (frozen / 'scripts').mkdir(parents=True)
+        (frozen / 'scripts/gx_perf.py').write_text('# frozen measurement collector\n', encoding='utf-8')
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(frozen)
+            for index, requested in enumerate([['just', 'perf', 'gtk'],
+                                                ['python', 'scripts/gx_perf.py', 'gtk']]):
+                args = self.batch_args('--input-observe-only', command=requested)
+                args.out = self.args.out.parent / f'frozen-{index}'
+                seen = []
+                def runner(command, **kwargs):
+                    seen.append((list(command), Path.cwd()))
+                    return SimpleNamespace(returncode=0)
+                code, result = self.run_batch(args, runner)
+                expected = [sys.executable, str(frozen / 'scripts/gx_perf.py'), 'gtk'] if index == 0 else requested
+                self.assertEqual((0, [(expected, frozen)]), (code, seen))
+                self.assertEqual(expected, result['command'])
+                self.assertEqual(str(frozen), result['command_cwd'])
+        finally:
+            os.chdir(original_cwd)
+
     def test_observe_only_rejects_wrappers_and_unknown_commands(self):
         for index, command in enumerate([('pwsh', '-Command', 'python scripts/gx_perf.py gtk'),
                         ('cmd', '/c', 'just wsl smoke'), ('python', '-m', 'gx_perf', 'gtk'),
@@ -911,7 +963,7 @@ class QuietBatchTests(unittest.TestCase):
                     gx_perf.run_quiet_batch(args, self.probe, self.command(0))
         for command in (self.WSL_BATCH, ('python', 'scripts/gx_perf.py', 'gtk', '--clone=~/src/gx_ghostty', '--out', 'M'),
                         ('just', 'perf', 'gtk'), ('just', 'wsl', '--clone', '~/src/gx', 'scenario')):
-            self.assertFalse(gx_perf.desktop_command(command))
+            self.assertFalse(gx_perf.desktop_command(gx_perf.normalize_observe_command(command)))
         # Any gx_win_gui guard row shows the batch touched the desktop after all: an ERROR, never VALID.
         args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)
         args.out = self.args.out.parent / 'guarded'
@@ -1331,6 +1383,8 @@ class ExperimentTests(unittest.TestCase):
 
     def test_idle_interval_excludes_setup_events_and_records_cpu(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        instance.hang_evidence.return_value = None
+        gui.win32.return_value.foreground.return_value = 0x77
         gui.win32.return_value.window_pid.return_value = instance.pid
         instance.log = self.root / 'idle.log'
         instance.log.write_text('info(gx_perf): metric proc.snapshot 99\n', encoding='utf-8')
@@ -1352,6 +1406,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_idle_thread_churn_preserves_p2_but_foreign_input_rejects(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        gui.win32.return_value.foreground.return_value = 0x77
         instance.hang_evidence.return_value = None
         instance.log = self.root/'idle.log'
         instance.log.write_text('', encoding='utf-8')
@@ -1415,6 +1470,44 @@ class ExperimentTests(unittest.TestCase):
         raised, _ = self.idle_end('unfocused', 84, descendants=True,
                                   helper=mock.Mock(pid=50, **{'alive.return_value': True}))
         self.assertEqual('instance_self_activated', raised.cause)
+
+    def test_visible_descendants_hang_and_input_priority(self):
+        for pid in (84, 85):  # child and grandchild are both proven by contains_pid
+            for hang, tick, expected in [(None, 1, 'instance_self_activated'),
+                                          (None, 2, 'foreign_input'),
+                                          ('hung window', 1, 'instance_hung'),
+                                          ('hung window', 2, 'instance_hung')]:
+                with self.subTest(pid=pid, hang=hang, tick=tick):
+                    raised, instance = self.idle_end('visible', pid, descendants=True, hang=hang,
+                                                     ticks=[(1, 10), (1, 20), (tick, 21)])
+                    self.assertEqual(expected, getattr(raised, 'cause', None))
+                    self.assertEqual(expected, instance.record_input.call_args.kwargs['cause'])
+
+    def test_visible_main_process_remains_valid_but_hang_or_input_is_reported(self):
+        for hang, tick, expected in [(None, 1, None), (None, 2, 'foreign_input'),
+                                      ('hung window', 1, 'instance_hung'), ('hung window', 2, 'instance_hung')]:
+            with self.subTest(hang=hang, tick=tick):
+                raised, instance = self.idle_end('visible', 42, hang=hang,
+                                                 ticks=[(1, 10), (1, 20), (tick, 21)])
+                self.assertEqual(expected, getattr(raised, 'cause', None))
+                if expected is None:
+                    instance.record_input.assert_not_called()
+
+    def test_visible_entry_requires_main_process_in_foreground(self):
+        for pid in (0, 7, 42, 84, 85):
+            instance, gui = mock.Mock(pid=42), mock.Mock()
+            instance.contains_pid.side_effect = lambda value: value in (42, 84, 85)
+            gui.win32.return_value.window_pid.return_value = pid
+            with self.subTest(pid=pid), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 2)):
+                capture = SimpleNamespace(report={})
+                if pid == 42:
+                    entry = gx_perf.idle_state_entry(gui, instance, capture, SimpleNamespace(state='visible'))
+                    self.assertEqual(42, entry['foreground_pid'])
+                else:
+                    with self.assertRaises(gx_perf.PerfError) as raised:
+                        gx_perf.idle_state_entry(gui, instance, capture, SimpleNamespace(state='visible'))
+                    self.assertIsNone(raised.exception.cause)
+                instance.record_input.assert_not_called()
 
     def test_state_entry_rejects_failed_arrangement(self):
         instance, gui = mock.Mock(pid=42), mock.Mock()
