@@ -406,6 +406,12 @@ pub fn handleMessage(
             // then.
             if (wparam == w32.SIZE_MINIMIZED) self.painted_layout = .{};
         },
+        w32.WM_CAPTURECHANGED, WM_CANCELMODE => {
+            // The window and the tab bar handle them as well.
+            const own = msg == w32.WM_CAPTURECHANGED and lparam == @as(isize, @bitCast(@intFromPtr(hwnd)));
+            _ = self.routeButtons(.{ .msg = msg, .own_capture = own });
+            return null;
+        },
         else => {},
     }
 
@@ -570,7 +576,9 @@ fn performButton(self: *TitleBar, button: Button) void {
 /// messages the window routes to `onMouseMove`, `onLeftButtonDown`,
 /// `onLeftButtonUp` and `onMouseLeave`, which hand the rest of the row on
 /// to the tab bar; `onSize` reports what the pointer hits after the layout
-/// moved under it as `WM_SIZE`.
+/// moved under it as `WM_SIZE`. Another window taking the mouse capture or
+/// a cancelled mode (`WM_CAPTURECHANGED`, `WM_CANCELMODE`, a dialog
+/// showing) drops the press and the hover.
 const ButtonInput = struct {
     /// The button under the pointer and the one being pressed.
     hover: Button = .none,
@@ -582,6 +590,8 @@ const ButtonInput = struct {
         msg: u32,
         wparam: usize = 0,
         hit: Hit = .none,
+        /// `WM_CAPTURECHANGED`: the window taking the capture is this one.
+        own_capture: bool = false,
     };
 
     /// What else holds the pointer.
@@ -656,6 +666,10 @@ const ButtonInput = struct {
                     fx.fade = false;
                     if (button != .none and !clientButton(button)) fx.track = .nonclient;
                 }
+            },
+            w32.WM_CAPTURECHANGED, WM_CANCELMODE => if (m.msg == WM_CANCELMODE or !m.own_capture) {
+                self.pressed = .none;
+                self.hover = .none;
             },
             else => {},
         }
@@ -1584,6 +1598,7 @@ const WM_NCRBUTTONDOWN: u32 = 0x00A4;
 const WM_NCRBUTTONUP: u32 = 0x00A5;
 const WM_NCRBUTTONDBLCLK: u32 = 0x00A6;
 const WM_NCMOUSELEAVE: u32 = 0x02A2;
+const WM_CANCELMODE: u32 = 0x001F;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 
 const HTCAPTION: isize = 2;
@@ -2061,4 +2076,37 @@ test "a resize hovers the caption button now under the pointer without a fade" {
     try testing.expectEqual(Button.none, p.input.hover);
     try testing.expect(!fx.fade);
     try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+}
+
+test "losing the mouse capture or cancelling a mode drops the press and the hover" {
+    const testing = std.testing;
+    for ([_]u32{ w32.WM_CAPTURECHANGED, WM_CANCELMODE }) |msg| {
+        var p: TestPointer = .{};
+        _ = p.send(w32.WM_MOUSEMOVE, TestPointer.menu);
+        _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.menu);
+        var fx = p.send(msg, .none);
+        // The window and the tab bar handle it as well.
+        try testing.expect(!fx.consumed and !fx.tab_bar);
+        try testing.expectEqual(ButtonInput{}, p.input);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+        // The release after it is the tab bar's: no menu.
+        fx = p.send(w32.WM_LBUTTONUP, TestPointer.menu);
+        try testing.expect(!fx.consumed and fx.tab_bar);
+        try testing.expectEqual(Button.none, fx.perform);
+
+        // A caption button pressed through the frame likewise.
+        _ = p.nc(WM_NCMOUSEMOVE, HTCLOSE);
+        _ = p.nc(WM_NCLBUTTONDOWN, HTCLOSE);
+        _ = p.send(msg, .none);
+        try testing.expectEqual(ButtonInput{}, p.input);
+        try testing.expectEqual(Button.none, p.nc(WM_NCLBUTTONUP, HTCLOSE).perform);
+    }
+    // The window taking the capture itself changes nothing.
+    var p: TestPointer = .{};
+    _ = p.send(w32.WM_MOUSEMOVE, TestPointer.minimize);
+    _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
+    const own = p.input.route(.{ .msg = w32.WM_CAPTURECHANGED, .own_capture = true }, p.ctx);
+    try testing.expectEqual(ButtonInput.TooltipChange.keep, own.tooltip);
+    try testing.expectEqual(Button.minimize, p.input.pressed);
+    try testing.expectEqual(Button.minimize, p.input.hover);
 }
