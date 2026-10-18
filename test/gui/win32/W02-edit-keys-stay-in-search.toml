@@ -17,9 +17,9 @@ expect = [
   "terminal-focus: after a click in the terminal the bar is still shown, without a caret in its field",
   "f3: F3 pressed while the terminal has the focus moved the current match forward; shift-f3: Shift+F3 moved it back",
   "no-results: the field reads zzqx with the caution border, the counter says No results in the caution color",
-  "narrow-clamp: in the narrow right pane the bar keeps its 240 DIP minimum (360 px at 144 DPI) and still shows the counter",
-  "link-left: with Ctrl held on the long URL, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
-  "link-right: with the pointer on the bubble's place (the bottom row), the bubble moved to the bottom-right corner",
+  "narrow-clamp: in the narrow right pane of the 1,400 px window the bar keeps its 240 DIP minimum (360 px at 144 DPI, wider than the pane) and still shows the counter",
+  "link-left: with Ctrl held on the long URL typed at the prompt, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
+  "link-right: with the pointer on the URL's bottom row, under the bubble's place, the bubble moved to the bottom-right corner",
   "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
 ]
 
@@ -238,7 +238,17 @@ action = "wait_popup"
 cls = "GhosttyGxPopup"
 present = false
 
-# A narrow pane: the second right split halves the right half again and takes the focus.
+# A narrow pane: in a 1,400 px wide window the second right split halves the right half again
+# (about 230 DIPs) and takes the focus, so the bar keeps its 240 DIP minimum.
+[[step]]
+action = "resize"
+width = 1400
+height = 1000
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
 [[step]]
 action = "key"
 keys = "ctrl+shift+o"
@@ -317,7 +327,8 @@ count = 1
 action = "sleep"
 seconds = 0.5
 
-# A long URL on the last rows: blank lines push it down, set /p prints it without a newline.
+# A long URL typed on cmd's command line (not run) fills the last rows of the terminal, so its last
+# row lies under the preview bubble's place: blank lines push the prompt to the bottom first.
 [[step]]
 action = "type"
 text = "cls\n"
@@ -332,19 +343,21 @@ seconds = 1.0
 
 [[step]]
 action = "type"
-text = "<nul set /p =https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end\n"
+text = "https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end"
 
 [[step]]
 action = "sleep"
 seconds = 1.0
 
 # The core reports a hovered link only while Ctrl is down. Held presses keep the bubble up, and
-# it stays 250 ms after the last release (the leave delay): long enough for the capture.
+# it stays 250 ms after the last release (the leave delay): long enough for the capture. Rows are
+# 21 DIPs; the bubble takes the bottom 34 DIPs (28 high, 6 margin). 42 DIPs up is the URL's row
+# above the bubble's place.
 [[step]]
 action = "move"
 in = "terminal:0"
 x = 60
-y = -50
+y = -42
 
 [[step]]
 action = "key"
@@ -361,12 +374,12 @@ what = "all"
 action = "sleep"
 seconds = 0.8
 
-# At the start of the bottom row the pointer is over the bubble's place: it moves to the right.
+# On the bottom row the pointer is over the URL and over the bubble's place: it moves right.
 [[step]]
 action = "move"
 in = "terminal:0"
 x = 8
-y = -12
+y = -20
 
 [[step]]
 action = "key"
