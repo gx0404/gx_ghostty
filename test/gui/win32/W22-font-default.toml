@@ -3,6 +3,8 @@ title = "R2-Font: default faces, Unicode fallback and missing characters"
 # Imported in phase 6 from the external R2-Font fixture W20-R2-Font-default.toml.
 # The prompt is PowerShell 7 (pwsh.exe); without it the scenario is SKIPPED.
 requires = ['file:%ProgramFiles%\PowerShell\7\pwsh.exe']
+# GHOSTTY_GX_PERF logs font.first_fallback once (R2-Font.01/.04 log evidence, no timing gate).
+env = { GHOSTTY_GX_PERF = "1" }
 config = """
 command = pwsh.exe -NoLogo -NoProfile
 language = en
@@ -12,6 +14,7 @@ window-height = 24
 expect = [
   "default-150: regular, bold, italic and bold italic are distinct; CJK, Greek, emoji and Nerd Font private-use glyphs render; U+0378 and U+FFFE are explicitly labeled expected missing glyphs",
   "default-100: the same content remains legible after isolated simulated 96 DPI, with no clipping or corrupted rows",
+  "default-200: the same content at a simulated 192 DPI (PrintWindow): every row legible and scaled, no clipped glyphs",
 ]
 
 [[step]]
@@ -52,3 +55,24 @@ seconds = 1.0
 [[step]]
 action = "capture"
 name = "default-100"
+
+[[step]]
+action = "dpi"
+value = 192
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "default-200"
+method = "print"
+
+[[step]]
+action = "assert_responsive"
+
+# R2-Font.01: the first fallback (CJK, Greek, emoji) was resolved and logged once.
+[[step]]
+action = "assert_log"
+pattern = 'gx_perf\): font\.first_fallback \d+us'

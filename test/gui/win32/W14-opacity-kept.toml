@@ -2,23 +2,57 @@ id = "W14"
 title = "Background opacity: toggled opaque stays opaque through a palette theme preview"
 # Window materials need Windows 11 22H2 (chrome/Backdrop.zig).
 requires = ["windows-build:22621"]
+# GHOSTTY_GX_PERF logs the OpenGL probe thread (`wgl.probe`); only checked as a log line.
+env = { GHOSTTY_GX_PERF = "1" }
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 gx-window-material = mica
 background-opacity = 0.8
+unfocused-split-opacity = 0.5
+unfocused-split-fill = #000000
 keybind = ctrl+shift+u=toggle_background_opacity
+keybind = f6=new_split:right
 """
+# R2-Render.01-05, R2-Tabs.07 and R2-App.11 also use this run: the WGL log lines (pixel
+# format without depth and stencil, the probed vendor, the probe thread), the active tab
+# that follows the terminals' alpha, the unfocused split dim (RGB only, kept across a GPU
+# context reset) and the edge fill after an odd resize. The palette preview runs last.
 expect = [
-  "translucent: the terminal shows the mica material through the background (not the solid GX Mocha #1f1f28)",
-  "opaque: after toggle_background_opacity the terminal is solid #1f1f28",
+  "translucent: the terminal shows the mica material through the background (not the solid GX Mocha #1f1f28); the active tab is as translucent as the terminal; DWM draws the caption buttons and the main menu button sits centered on them",
+  "opaque: after toggle_background_opacity the terminal is solid #1f1f28 and so is the active tab",
+  "split-dim: two panes; the unfocused left pane is darker than the focused right pane, which stays #1f1f28",
+  "split-dim-after-reset: after a simulated GPU context reset of the left pane it is still dimmed the same way, no black or stale frame",
+  "split-dim-translucent: with the translucency back on, the left pane is darker but still shows the material (the dim does not make it opaque)",
+  "odd-size: after resizing to an odd size the bottom and right edges of both panes are filled with the background, no garbage or black strips",
   "preview: the palette previews Nord and the terminal is solid Nord #2e3440",
   "restored: after Esc the terminal is solid GX Mocha #1f1f28 again, not translucent",
 ]
 
 [[step]]
+action = "resize"
+width = 1920
+height = 1200
+
+[[step]]
 action = "sleep"
-seconds = 0.5
+seconds = 0.8
+
+# R2-Render.03: the leanest pixel format, an alpha channel for per-pixel translucency and
+# no depth or stencil buffer.
+[[step]]
+action = "assert_log"
+pattern = 'window pixel format=\d+ srgb=true alpha=8 depth=0 stencil=0'
+
+# R2-Render.04: the probe records the implementation it actually loaded.
+[[step]]
+action = "assert_log"
+pattern = 'loaded OpenGL \d+\.\d+ vendor=\S.* renderer=\S.* software=false'
+
+# R2-Render.05: the device probe ran (on its own thread, see the thread id of the line).
+[[step]]
+action = "assert_log"
+pattern = 'gx_perf\): wgl\.probe \d+us'
 
 [[step]]
 action = "pixel"
@@ -28,6 +62,15 @@ y = -60
 differs = "#1f1f28"
 tolerance = 1
 label = "translucent at start"
+
+# The active tab (left margin 8 DIP, 240 DIP wide), below its label.
+[[step]]
+action = "pixel"
+x = 150
+y = 37
+differs = "#1f1f28"
+tolerance = 1
+label = "active tab translucent like the terminal"
 
 [[step]]
 action = "capture"
@@ -51,8 +94,148 @@ tolerance = 1
 label = "opaque GX Mocha"
 
 [[step]]
+action = "pixel"
+x = 150
+y = 37
+expect = "#1f1f28"
+tolerance = 1
+label = "active tab opaque with the terminal"
+
+[[step]]
 action = "capture"
 name = "opaque"
+
+# R2-Render.01: only the unfocused pane of a split is dimmed.
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "wait_terminals"
+count = 2
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+differs = "#1f1f28"
+tolerance = 2
+label = "unfocused split dimmed"
+
+[[step]]
+action = "pixel"
+in = "terminal:1"
+x = -80
+y = -60
+expect = "#1f1f28"
+tolerance = 1
+label = "focused split not dimmed"
+
+[[step]]
+action = "capture"
+name = "split-dim"
+
+[[step]]
+action = "gpu_reset"
+terminal = 0
+
+[[step]]
+action = "wait_log"
+pattern = "renderer resources rebuilt after the GPU reset"
+timeout = 5
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+differs = "#1f1f28"
+tolerance = 2
+label = "unfocused split still dimmed after the reset"
+
+[[step]]
+action = "pixel"
+in = "terminal:1"
+x = -80
+y = -60
+expect = "#1f1f28"
+tolerance = 1
+label = "focused split still not dimmed after the reset"
+
+[[step]]
+action = "capture"
+name = "split-dim-after-reset"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+u"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+[[step]]
+action = "pixel"
+in = "terminal:1"
+x = -80
+y = -60
+differs = "#1f1f28"
+tolerance = 1
+label = "translucent again"
+
+[[step]]
+action = "capture"
+name = "split-dim-translucent"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+u"
+
+[[step]]
+action = "sleep"
+seconds = 0.6
+
+# R2-Render.02: a size that is no multiple of the cell size; the renderer fills the edges.
+# Samples stay 6 DIP inside the window: DWM draws its 1 px border over the outermost pixels.
+[[step]]
+action = "resize"
+width = 1923
+height = 1207
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "pixel"
+in = "terminal:1"
+x = -6
+y = -6
+expect = "#1f1f28"
+tolerance = 1
+label = "bottom right edge of the focused pane"
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = 6
+y = -6
+differs = "#000000"
+tolerance = 2
+label = "bottom left edge of the unfocused pane is not black"
+
+[[step]]
+action = "capture"
+name = "odd-size"
 
 [[step]]
 action = "key"
@@ -69,21 +252,22 @@ text = "Nord"
 
 [[step]]
 action = "sleep"
-seconds = 0.8
+seconds = 1.2
+
+# Captured before the pixel check, so a failure still shows what the palette selected.
+[[step]]
+action = "capture"
+name = "preview"
+what = "all"
 
 [[step]]
 action = "pixel"
-in = "terminal:0"
+in = "terminal:1"
 x = -80
 y = -60
 expect = "#2e3440"
 tolerance = 1
 label = "opaque Nord preview"
-
-[[step]]
-action = "capture"
-name = "preview"
-what = "all"
 
 [[step]]
 action = "key"
@@ -100,7 +284,7 @@ seconds = 0.6
 
 [[step]]
 action = "pixel"
-in = "terminal:0"
+in = "terminal:1"
 x = -80
 y = -60
 expect = "#1f1f28"
