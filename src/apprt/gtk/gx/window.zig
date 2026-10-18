@@ -1,8 +1,9 @@
 //! Ghostty GX additions to `class/window.zig::Window`: menus and header
 //! bar tooltips in the current UI language (rebuilt when it changes, with a
 //! toast because some libadwaita labels only change in new windows), launch
-//! profiles in the new tab dropdown, the terminal context menu, and opening
-//! the main menu for the `gx:main_menu` action.
+//! profiles in the new tab dropdown, the terminal context menu, opening
+//! the main menu for the `gx:main_menu` action, and keeping new and
+//! adopted tabs out of the pinned tabs (`AdoptView`).
 const std = @import("std");
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -386,6 +387,49 @@ pub fn closeTabsRight(view: *adw.TabView, page: *adw.TabPage) void {
     }
 }
 
+/// The tab view as `Window.adoptTab` uses it (its GX-0039 block declares
+/// `tab_view` as one), for new tabs, duplicated tabs, split panes moved to a
+/// tab and restored tabs: the same view, except that `insert` never puts the
+/// tab among the pinned tabs (D-24). With `window-new-tab-position =
+/// current` and a pinned tab other than the last one selected, `adoptTab`
+/// asks for the position after it, which `adw_tab_view_insert` refuses (it
+/// only inserts unpinned pages after the pinned ones): no tab appeared, the
+/// page was null, and a moved split pane was lost with its tab. Such a
+/// position becomes the first unpinned one, like `adw_tab_view_add_page`
+/// does for a pinned parent. The other methods are the ones `adoptTab`
+/// calls; a new call there fails to compile until it is added here.
+pub const AdoptView = struct {
+    view: *adw.TabView,
+
+    pub fn of(view: *adw.TabView) AdoptView {
+        return .{ .view = view };
+    }
+
+    pub fn insert(self: AdoptView, child: *gtk.Widget, position: c_int) *adw.TabPage {
+        return self.view.insert(child, @max(position, self.view.getNPinnedPages()));
+    }
+
+    pub fn append(self: AdoptView, child: *gtk.Widget) *adw.TabPage {
+        return self.view.append(child);
+    }
+
+    pub fn getSelectedPage(self: AdoptView) ?*adw.TabPage {
+        return self.view.getSelectedPage();
+    }
+
+    pub fn setSelectedPage(self: AdoptView, page: *adw.TabPage) void {
+        self.view.setSelectedPage(page);
+    }
+
+    pub fn getPagePosition(self: AdoptView, page: *adw.TabPage) c_int {
+        return self.view.getPagePosition(page);
+    }
+
+    pub fn getNPages(self: AdoptView) c_int {
+        return self.view.getNPages();
+    }
+};
+
 fn actionTabDuplicate(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
     const page = contextPage(window) orelse return;
     const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
@@ -705,6 +749,43 @@ test "close tabs to the right keeps the pinned tabs" {
     closeTabsRight(view, kept);
     try testing.expectEqual(@as(c_int, 4), view.getNPages());
     try testing.expectEqual(@as(c_int, 3), view.getPagePosition(kept));
+}
+
+test "a tab adopted while a pinned tab other than the last one is selected goes after the pinned tabs" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const view = adw.TabView.new();
+    _ = view.as(gobject.Object).refSink();
+    defer view.as(gobject.Object).unref();
+    const adopt: AdoptView = .of(view);
+
+    // Two pinned tabs, then two unpinned ones.
+    var pages: [4]*adw.TabPage = undefined;
+    for (&pages) |*page| page.* = adopt.append(gtk.Label.new(null).as(gtk.Widget));
+    view.setPagePinned(pages[0], 1);
+    view.setPagePinned(pages[1], 1);
+
+    // `window-new-tab-position = current` with the first pinned tab
+    // selected asks for the position after it (D-24): the tab goes after
+    // the pinned tabs instead, unpinned, and the pinned tabs stay.
+    adopt.setSelectedPage(pages[0]);
+    const after_first = adopt.insert(gtk.Label.new(null).as(gtk.Widget), adopt.getPagePosition(adopt.getSelectedPage().?) + 1);
+    try testing.expectEqual(@as(c_int, 5), adopt.getNPages());
+    try testing.expectEqual(@as(c_int, 2), adopt.getPagePosition(after_first));
+    try testing.expect(after_first.getPinned() == 0);
+    try testing.expectEqual(@as(c_int, 2), view.getNPinnedPages());
+    for (pages[0..2], 0..) |page, i| try testing.expectEqual(@as(c_int, @intCast(i)), adopt.getPagePosition(page));
+
+    // After the last pinned tab, after an unpinned tab and at the end the
+    // position stays.
+    const after_last = adopt.insert(gtk.Label.new(null).as(gtk.Widget), adopt.getPagePosition(pages[1]) + 1);
+    try testing.expectEqual(@as(c_int, 2), adopt.getPagePosition(after_last));
+    const after_unpinned = adopt.insert(gtk.Label.new(null).as(gtk.Widget), adopt.getPagePosition(pages[2]) + 1);
+    try testing.expectEqual(adopt.getPagePosition(pages[2]) + 1, adopt.getPagePosition(after_unpinned));
+    const at_end = adopt.insert(gtk.Label.new(null).as(gtk.Widget), adopt.getNPages());
+    try testing.expectEqual(adopt.getNPages() - 1, adopt.getPagePosition(at_end));
+    try testing.expectEqual(@as(c_int, 8), adopt.getNPages());
+    try testing.expectEqual(@as(c_int, 2), view.getNPinnedPages());
 }
 
 fn testConfirmClose(view: *adw.TabView, page: *adw.TabPage, _: ?*anyopaque) callconv(.c) c_int {
