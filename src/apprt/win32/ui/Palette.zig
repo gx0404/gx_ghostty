@@ -2877,5 +2877,17 @@ test "UIA a real UI Automation client hears the palette's arrow keys select anot
     client.settle(&fixture.app, 100);
     try testing.expectEqual(@as(usize, 1), client.times(.selected, "Split Right"));
     try testing.expect(!client.saw(.selected, "Split Left"));
+    // Up, and the results are published once more before the message loop
+    // raises the queued event (A3 review round 4, severe 2): the selection
+    // is still heard, once.
+    client.clear();
+    palette.selected = 0;
+    palette.popup.invalidate();
+    _ = w32.SendMessageW(hwnd, w32.WM_PAINT, 0, 0);
+    palette.popup.invalidate();
+    _ = w32.SendMessageW(hwnd, w32.WM_PAINT, 0, 0);
+    try client.expect(&fixture.app, .selected, "Split Left");
+    client.settle(&fixture.app, 100);
+    try testing.expectEqual(@as(usize, 1), client.times(.selected, "Split Left"));
     palette.popup.visible = false;
 }

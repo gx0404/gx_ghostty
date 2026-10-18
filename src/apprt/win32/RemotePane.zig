@@ -608,6 +608,7 @@ pub fn wndProc(hwnd: w32.HWND, message: u32, wparam: usize, lparam: isize) callc
             self.focused = true;
             self.emit(.{ .focus = true });
             self.invalidate();
+            @import("ui/uia_remote.zig").focusGained(self.app, self);
             return 0;
         },
         w32.WM_KILLFOCUS => {
