@@ -408,6 +408,12 @@ class FakeWin32:
         self.answers: dict = {}  # message -> what send_message returns (None: no answer)
         self.messages: list = []
         self.tops: list = []  # top_windows(pid)
+        self.layouts = [0x08040804, 0x04090409]  # GetKeyboardLayoutList, raw
+        self.layout = 0x08040804  # the window thread's layout
+        self.layout_follows = True  # a WM_INPUTLANGCHANGEREQUEST switches it
+        self.requests: list = []
+        self.loaded: list = []
+        self.unloaded: list = []
 
     def process_alive(self, pid):
         return self.alive
@@ -465,6 +471,33 @@ class FakeWin32:
 
     def child_processes(self, pid):
         return []
+
+    def keyboard_layouts(self):
+        return list(self.layouts)
+
+    def keyboard_layout(self, hwnd):
+        return self.layout & 0xFFFFFFFF
+
+    def request_layout(self, hwnd, hkl):
+        self.requests.append(hkl)
+        if self.layout_follows:
+            self.layout = hkl
+
+    def load_layout(self, klid):
+        self.loaded.append(klid)
+        value = int(klid, 16)
+        hkl = (value << 16) | value if value >> 16 == 0 else 0xF0020000 | (value & 0xFFFF)
+        if hkl not in self.layouts:
+            self.layouts.append(hkl)
+        return hkl
+
+    def unload_layout(self, hkl):
+        self.unloaded.append(hkl)
+        self.layouts.remove(hkl)
+        return True
+
+    def LoadKeyboardLayoutW(self, *args):
+        raise AssertionError(f"LoadKeyboardLayoutW{args} must not be called")
 
     def send_message(self, hwnd, message, wparam=0, lparam=0, timeout_ms=5000):
         self.messages.append((hwnd, message, wparam, lparam))
@@ -1123,6 +1156,117 @@ class CaptureWindowTests(unittest.TestCase):
         self.assertEqual([], FakeBackdropWindow.made, "a print capture needs no backdrop")
 
 
+class LayoutTests(unittest.TestCase):
+    PID = 4242
+    MAIN = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (0, 0, 100, 100), True, False, False)
+
+    def setUp(self):
+        self.fake = FakeWin32(self.PID, self.PID)
+        for patch in (mock.patch.object(gui, "win32", return_value=self.fake),
+                      mock.patch.object(gui.Instance, "require_window", return_value=self.MAIN),
+                      mock.patch.object(gui.time, "sleep")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.instance = gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+
+    def test_resolve_layout(self):
+        loaded = [0x08040804, 0x04090409, 0xE0010804, 0xFFFFFFFFF0020407]
+        self.assertEqual((0x04090409, None), gui.resolve_layout("0x04090409", loaded))
+        self.assertEqual((0x04090409, None), gui.resolve_layout("0X4090409", loaded))
+        self.assertEqual((0x04090409, "00000409"), gui.resolve_layout("00000409", loaded))
+        self.assertEqual((None, "00000407"), gui.resolve_layout("00000407", loaded))
+        self.assertEqual((0xE0010804, "E0010804"), gui.resolve_layout("e0010804", loaded))
+        self.assertEqual((None, "00010407"), gui.resolve_layout("00010407", loaded), "a variant needs its HKL")
+        self.assertEqual((0xFFFFFFFFF0020407, None), gui.resolve_layout("0xf0020407", loaded))
+        for bad in ("us", "0409", "0x123456789", "", "000004090"):
+            with self.subTest(target=bad), self.assertRaises(gui.UsageError):
+                gui.resolve_layout(bad, loaded)
+        self.assertEqual(0x04090409, gui.as_lparam(0x04090409))
+        if gui.ctypes.sizeof(gui.ctypes.c_void_p) == 8:
+            self.assertEqual(0xFFFFFFFFF0020407 - (1 << 64), gui.as_lparam(0xFFFFFFFFF0020407))
+
+    def test_switching_to_a_loaded_layout_and_back(self):
+        self.assertEqual("keyboard layout 0x08040804 -> 0x04090409", self.instance.switch_layout("00000409"))
+        self.assertEqual(([0x04090409], 0x08040804), (self.fake.requests, self.instance.original_layout))
+        self.assertIn("(already)", self.instance.switch_layout("0x04090409"))
+        self.assertEqual("switched back: keyboard layout 0x04090409 -> 0x08040804", self.instance.restore_layout())
+        self.assertIsNone(self.instance.original_layout)
+        self.assertIsNone(self.instance.restore_layout())
+        self.assertEqual(([], []), (self.fake.loaded, self.fake.unloaded))
+
+    def test_a_layout_that_is_not_loaded_is_refused_without_allow_load(self):
+        with self.assertRaisesRegex(gui.GuiError, r"00000407 is not loaded for this user \(GetKeyboardLayoutList: "
+                                                  r"0x08040804, 0x04090409\); pick a loaded one; only inside a VM"):
+            self.instance.switch_layout("00000407")
+        with self.assertRaisesRegex(gui.GuiError, "name an HKL from that list"):
+            self.instance.switch_layout("0x04070407", allow_load=True)
+        self.assertEqual(([], []), (self.fake.loaded, self.fake.requests))
+        self.assertIsNone(self.instance.original_layout)
+
+    def test_allow_load_loads_switches_and_unloads_only_what_it_added(self):
+        self.assertEqual("keyboard layout 0x08040804 -> 0x04070407 (loaded 00000407)",
+                         self.instance.switch_layout("00000407", allow_load=True))
+        self.assertEqual((["00000407"], [0x04070407]), (self.fake.loaded, self.instance.loaded_layouts))
+        self.fake.layouts.append(0xF0020407)  # a variant this user already has
+        self.instance.switch_layout("00010407", allow_load=True)
+        self.assertEqual([0x04070407], self.instance.loaded_layouts, "an existing layout is never unloaded")
+        self.assertEqual(["unloaded 0x04070407"], self.instance.unload_layouts())
+        self.assertEqual(([0x04070407], []), (self.fake.unloaded, self.instance.loaded_layouts))
+        self.assertIn(0xF0020407, self.fake.layouts)
+
+    def test_a_thread_that_does_not_switch_fails_or_is_reported(self):
+        self.fake.layout_follows = False
+        clock = iter(range(100))
+        with mock.patch.object(gui.time, "monotonic", side_effect=lambda: next(clock)):
+            with self.assertRaisesRegex(gui.GuiError, "still uses 0x08040804, not 0x04090409, 2s after"):
+                self.instance.switch_layout("0x04090409")
+            self.assertEqual("layout is still 0x08040804", self.instance.switch_layout("0x04090409", strict=False))
+        self.fake.alive = False
+        self.assertEqual("not switched back to 0x08040804: the instance is gone", self.instance.restore_layout())
+
+    def test_the_step_the_run_cleanup_order_and_the_session(self):
+        self.assertEqual("layout", gui.validate_step("s", {"action": "layout", "target": "0x08040804"}).action)
+        for raw in ({}, {"target": "german"}, {"target": "00000407", "allow_load": True}):
+            with self.subTest(raw=raw), self.assertRaises(gui.UsageError):
+                gui.validate_step("s", {"action": "layout", **raw})
+        run = gui.ScenarioRun(None, Path("ghostty.exe"), Path("."), allow_load_layouts=True)  # type: ignore[arg-type]
+        run.instance = mock.Mock(spec=gui.Instance)
+        run.instance.switch_layout.return_value = "switched"
+        self.assertEqual("switched", run.do_layout({"target": "00000407"}))
+        run.instance.switch_layout.assert_called_once_with("00000407", allow_load=True)
+        log: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-layout.toml"
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\n'
+                            'backdrop_reason = "mock"\n[[step]]\naction = "capture"\nname = "x"\n', encoding="utf-8")
+            run = gui.ScenarioRun(gui.load_scenario(path), Path("ghostty.exe"), Path(tmp) / "out")
+            instance = mock.Mock()
+            instance.log = Path(tmp) / "absent.log"
+            instance.popups.return_value = []
+            instance.capture_window.return_value.save_png.side_effect = lambda target: target
+            instance.original_layout, instance.loaded_layouts = 0x08040804, [0x04070407]
+            instance.restore_layout.side_effect = lambda: log.append("switch back") or "switched back"
+            instance.close.side_effect = lambda: log.append("close") or "closed"
+            instance.unload_layouts.side_effect = lambda: log.append("unload") or ["unloaded 0x04070407"]
+            with mock.patch.object(gui, "launch", return_value=instance), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                report = run.run()
+        self.assertEqual(["switch back", "close", "unload"], log)
+        self.assertEqual({"switched_back": "switched back", "unloaded": ["unloaded 0x04070407"]}, report["layouts"])
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = gui.Instance(1, "C:/g/ghostty.exe", Path(tmp), creation=1, launched=0,
+                                 original_layout=0x08040804, loaded_layouts=[0x04070407])
+            saved.save()
+            again = gui.Instance.load(Path(tmp))
+            self.assertEqual((0x08040804, [0x04070407]), (again.original_layout, again.loaded_layouts))
+        parser = gui.build_parser()
+        args = parser.parse_args(["layout", "E:/env", "--list"])
+        self.assertEqual((None, True, False), (args.target, args.list, args.allow_load))
+        args = parser.parse_args(["layout", "E:/env", "00000407", "--allow-load"])
+        self.assertEqual(("00000407", True), (args.target, args.allow_load))
+        self.assertTrue(parser.parse_args(["run", "--allow-load-layouts", "W01"]).allow_load_layouts)
+
+
 class RestartTests(unittest.TestCase):
     BODY = ('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\nbackdrop_reason = "mock"\n'
             'args = ["--x"]\n[env]\nGHOSTTY_GX_OPENGL = "software"\nKEEP = "1"\n')
@@ -1163,6 +1307,7 @@ class RestartTests(unittest.TestCase):
             run = gui.ScenarioRun(scenario, Path("ghostty.exe"), Path(tmp))
             old = mock.Mock(spec=gui.Instance)
             old.pid, old.creation, old.env_dir, old.restarts = 100, 7, Path(tmp) / "env", []
+            old.original_layout, old.loaded_layouts = 0x08040804, [0x04070407]
             old.close.return_value = "closed"
             new = mock.Mock(spec=gui.Instance)
             new.pid, new.creation = 200, 9
@@ -1184,6 +1329,7 @@ class RestartTests(unittest.TestCase):
                               record["new_pid"], record["new_creation_filetime_100ns"], record["env_overrides"],
                               record["startup_ms"]))
             self.assertEqual([record], new.restarts)
+            self.assertEqual((0x08040804, [0x04070407]), (new.original_layout, new.loaded_layouts))
 
     def test_restart_refuses_held_buttons_a_gone_instance_and_a_close_that_hangs(self):
         with tempfile.TemporaryDirectory() as tmp:

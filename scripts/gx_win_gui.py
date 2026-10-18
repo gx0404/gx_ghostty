@@ -6,7 +6,8 @@ Usage: python scripts/gx_win_gui.py COMMAND [ARGS...]      (just win-gui COMMAND
 Scenario commands (scenarios are TOML files, by default test/gui/win32/W*.toml):
   list [SCENARIO...]
         Print id, title, requirements and side effects of the scenarios.
-  run [--out DIR] [--exe PATH] [--allow-side-effects] [--retries N] [--keep-open] [SCENARIO...]
+  run [--out DIR] [--exe PATH] [--allow-side-effects] [--retries N] [--keep-open] [--allow-load-layouts]
+      [SCENARIO...]
         Run scenarios one after another. Each gets DIR/<id>/ (default
         .local/evidence/win-gui/<time>/<id>/) with a fresh isolated profile in env/, its
         screenshots, run.json (every step with its timing and result), the Ghostty log and
@@ -32,6 +33,9 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   system-theme ENV_DIR [--scheme follow|light|dark] [--high-contrast follow|on|off]
                                     test hook WM_GHOSTTY_SIMULATE_SYSTEM_THEME (WM_USER+0x49)
   ime-off ENV_DIR                   ask the window's thread to switch to the US layout
+  layout ENV_DIR [HKL|KLID] [--allow-load] [--list]
+                                    switch the window's thread to a keyboard layout (see Keyboard
+                                    layouts); without one, or with --list, print the loaded layouts
   cancel-mode ENV_DIR               SendMessage WM_CANCELMODE to the focused terminal
 
 Scenario files: id, title and config (HARNESS_CONFIG is appended unless harness = false), optional
@@ -59,6 +63,9 @@ with an action and its keys
   wait_terminals count [timeout window] wait_popup [cls timeout present new]
   close [timeout]                       file path [text directory readonly]  (see below)
   backdrop [color enabled reason]       switch the privacy backdrop for the following steps
+  layout target                         switch the window's thread to the keyboard layout target (an HKL
+                                        such as "0x08040804" or a KLID such as "00000407"); switched back
+                                        and unloaded at the end (see Keyboard layouts)
   restart [timeout env wait]            close the instance gracefully (WM_CLOSE, then wait up to timeout,
                                         default 10 s; it is never forced) and start it again on the same
                                         isolated profile and config, with the scenario env plus env (a
@@ -93,6 +100,16 @@ read it is put back under the instance and checked: no window of another process
 the capture or the 24 DIP band around it, and every band pixel outside the instance's windows must
 be the backdrop color or its shadow; otherwise the step fails and the screenshot is not saved.
 run.json lists every check (pixels counted, foreign windows by class, pid and image, no titles).
+
+Keyboard layouts: layout, the layout step and ime_off only switch to a layout GetKeyboardLayoutList
+reports for this user: they post WM_INPUTLANGCHANGEREQUEST to the window's focused thread and wait up
+to 2 s for GetKeyboardLayout to confirm it. They never call LoadKeyboardLayout and never change the
+user's language list, so on the host a layout that is not loaded is refused. Only --allow-load (run:
+--allow-load-layouts), meant for the VM, loads a missing KLID (such as 00000407 for German dead keys)
+and unloads it again at stop or at the end of the scenario. A plain KLID 0000LLLL names the HKL
+0xLLLLLLLL and an IME KLID E0xxxxxx itself; other KLIDs (variants such as 00010407) need their HKL from
+layout --list. Before the first switch the thread's layout is remembered; stop and the end of a
+scenario switch back to it while the instance still runs.
 
 Isolation: LOCALAPPDATA and XDG_CONFIG_HOME point at ENV_DIR, so the configuration is
 ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log. APPDATA,
@@ -173,6 +190,8 @@ WM_NULL = 0x0000
 WM_CLOSE = 0x0010
 WM_CANCELMODE = 0x001F
 WM_INPUTLANGCHANGEREQUEST = 0x0050
+KLF_NOTELLSHELL = 0x0080
+LAYOUT_SWITCH_S = 2.0  # how long the window's thread may take to switch its keyboard layout
 WM_USER = 0x0400
 WM_GHOSTTY_SIMULATE_DPI = WM_USER + 0x47
 WM_GHOSTTY_SIMULATE_GPU_RESET = WM_USER + 0x48
@@ -303,6 +322,39 @@ def key_vk(key: str, chord: str = "") -> int:
     if key in MOD_KEYS:
         return MOD_KEYS[key]
     raise UsageError(f"unknown key {key!r}" + (f" in {chord!r}" if chord else ""))
+
+
+def hkl_text(hkl: int) -> str:
+    return f"0x{hkl & 0xFFFFFFFF:08x}"
+
+
+def resolve_layout(target: str, loaded: Sequence[int]) -> tuple[int | None, str | None]:
+    """The layout `target` names, an HKL such as 0x08040804 or a KLID such as 00000407: its raw handle
+    from `loaded` (GetKeyboardLayoutList), None when it is not loaded; and the KLID that would load it
+    (None for an HKL). A KLID 0000LLLL is the HKL 0xLLLLLLLL, an IME KLID E0xxxxxx is its own HKL;
+    other KLIDs (layout variants) cannot be matched without loading them."""
+    text = str(target).strip()
+    by_value = {hkl & 0xFFFFFFFF: hkl for hkl in loaded}
+    if re.fullmatch(r"0[xX][0-9A-Fa-f]{1,8}", text):
+        return by_value.get(int(text, 16)), None
+    if re.fullmatch(r"[0-9A-Fa-f]{8}", text):
+        klid = text.upper()
+        value = int(klid, 16)
+        if value >> 16 == 0:
+            wanted: int | None = (value << 16) | value
+        elif klid.startswith("E0"):
+            wanted = value
+        else:
+            wanted = None
+        return (by_value.get(wanted) if wanted is not None else None), klid
+    raise UsageError(f"keyboard layout {target!r}: use an HKL such as 0x08040804 or a KLID such as 00000407")
+
+
+def as_lparam(value: int) -> int:
+    """A pointer-sized handle as the signed LPARAM that carries it."""
+    bits = ctypes.sizeof(ctypes.c_void_p) * 8
+    value &= (1 << bits) - 1
+    return value - (1 << bits) if value >> (bits - 1) else value
 
 
 def utf16_units(text: str) -> list[int]:
@@ -719,6 +771,8 @@ class Win32:
         declare(u, "GetDC", wt.HDC, wt.HWND)
         declare(u, "ReleaseDC", ctypes.c_int, wt.HWND, wt.HDC)
         declare(u, "LoadKeyboardLayoutW", wt.HKL, wt.LPCWSTR, wt.UINT)
+        declare(u, "UnloadKeyboardLayout", wt.BOOL, wt.HKL)
+        declare(u, "GetKeyboardLayoutList", ctypes.c_int, ctypes.c_int, ctypes.POINTER(wt.HKL))
         declare(u, "GetKeyboardLayout", wt.HKL, wt.DWORD)
         declare(u, "GetGUIThreadInfo", wt.BOOL, wt.DWORD, ctypes.POINTER(GUITHREADINFO))
         declare(u, "OpenClipboard", wt.BOOL, wt.HWND)
@@ -1037,7 +1091,33 @@ class Win32:
     def keyboard_layout(self, hwnd: int) -> int:
         return (self.GetKeyboardLayout(self.window_thread(hwnd)) or 0) & 0xFFFFFFFF
 
+    def keyboard_layouts(self) -> list[int]:
+        """GetKeyboardLayoutList: the input locales loaded for this user, as raw HKL values."""
+        count = self.GetKeyboardLayoutList(0, None)
+        if count <= 0:
+            return []
+        buffer = (self.wt.HKL * count)()
+        count = self.GetKeyboardLayoutList(count, buffer)
+        return [value or 0 for value in buffer[:max(0, count)]]
+
+    def request_layout(self, hwnd: int, hkl: int) -> None:
+        """Ask hwnd's focused window to switch its thread to the loaded layout hkl."""
+        if not self.PostMessageW(self.focus_window(hwnd), WM_INPUTLANGCHANGEREQUEST, 0, as_lparam(hkl)):
+            raise GuiError(f"cannot post WM_INPUTLANGCHANGEREQUEST (error {ctypes.get_last_error()})")
+
+    def load_layout(self, klid: str) -> int:
+        """LoadKeyboardLayoutW without activating it (Instance.switch_layout with allow_load, VM only)."""
+        hkl = self.LoadKeyboardLayoutW(klid, KLF_NOTELLSHELL)
+        if not hkl:
+            raise GuiError(f"cannot load keyboard layout {klid} (error {ctypes.get_last_error()})")
+        return hkl
+
+    def unload_layout(self, hkl: int) -> bool:
+        return bool(self.UnloadKeyboardLayout(hkl))
+
     def request_us_layout(self, hwnd: int) -> None:
+        # Kept for test/windows fixtures. It LOADS 00000409 when it is missing, which the host must not
+        # do; gx_win_gui itself uses Instance.ime_off/switch_layout, which never load on their own.
         layout = self.LoadKeyboardLayoutW("00000409", 0)
         if not layout:
             raise GuiError("cannot load the US keyboard layout")
@@ -1468,6 +1548,8 @@ class Instance:
     closing: bool = False  # close() started: an ending process is expected from now on
     gone_noted: bool = False  # the unexpected end was already audited once
     restarts: list[dict] = field(default_factory=list)  # restart steps that led to this instance
+    original_layout: int | None = None  # the window thread's keyboard layout before the first switch
+    loaded_layouts: list[int] = field(default_factory=list)  # layouts allow_load added; unloaded at the end
 
     def record_input(self, event: str, **data) -> None:
         row = {'schema': 'gx-input-guard-v1', 'event': event, 'time_ns': time.time_ns(),
@@ -1500,7 +1582,7 @@ class Instance:
     def save(self) -> None:
         data = {"pid": self.pid, "exe": self.exe, "env_dir": str(self.env_dir), "creation": self.creation,
                 "launched": self.launched, "simulated_dpi": self.simulated_dpi, "children": self.children,
-                "restarts": self.restarts}
+                "restarts": self.restarts, "original_layout": self.original_layout, "loaded_layouts": self.loaded_layouts}
         (self.env_dir / SESSION_FILE).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     @classmethod
@@ -1510,7 +1592,8 @@ class Instance:
             raise UsageError(f"no session in {env_dir}; run: gx_win_gui.py start {env_dir}")
         data = json.loads(path.read_text(encoding="utf-8"))
         return cls(data["pid"], data["exe"], Path(data["env_dir"]), data["creation"], data["launched"],
-                   data.get("simulated_dpi"), data.get("children", []), restarts=data.get("restarts", []))
+                   data.get("simulated_dpi"), data.get("children", []), restarts=data.get("restarts", []),
+                   original_layout=data.get("original_layout"), loaded_layouts=data.get("loaded_layouts", []))
 
     # -- process ------------------------------------------------------------
 
@@ -1928,6 +2011,70 @@ class Instance:
             time.sleep(0.01)
         return f"layout is still {w.keyboard_layout(window.hwnd):#010x}"
 
+    def switch_layout(self, target: str, *, allow_load: bool = False, strict: bool = True) -> str:
+        """Switch the window's thread to the keyboard layout `target` (see Keyboard layouts). Only a
+        layout GetKeyboardLayoutList reports is used unless allow_load (VM only) may load a KLID; what
+        that adds is remembered for unload_layouts. Not strict: a thread that does not switch in time
+        is reported instead of failing."""
+        w = win32()
+        window = self.require_window()
+        loaded = w.keyboard_layouts()
+        hkl, klid = resolve_layout(target, loaded)
+        added = False
+        if hkl is None:
+            if not allow_load or klid is None:
+                hint = ("name an HKL from that list" if klid is None else
+                        "pick a loaded one; only inside a VM may --allow-load load it")
+                raise GuiError(f"keyboard layout {target} is not loaded for this user (GetKeyboardLayoutList: "
+                               f"{', '.join(hkl_text(value) for value in loaded) or 'none'}); {hint}")
+            hkl = w.load_layout(klid)
+            if hkl & 0xFFFFFFFF not in {value & 0xFFFFFFFF for value in loaded}:
+                added = True
+                self.loaded_layouts.append(hkl)
+        before = w.keyboard_layout(window.hwnd)
+        if self.original_layout is None:
+            self.original_layout = before
+        detail = f"keyboard layout {hkl_text(before)} -> {hkl_text(hkl)}" + (f" (loaded {klid})" if added else "")
+        if before == hkl & 0xFFFFFFFF:
+            return detail + " (already)"
+        w.request_layout(window.hwnd, hkl)
+        deadline = time.monotonic() + LAYOUT_SWITCH_S
+        while (current := w.keyboard_layout(window.hwnd)) != hkl & 0xFFFFFFFF:
+            if time.monotonic() >= deadline:
+                if strict:
+                    raise GuiError(f"the window's thread still uses {hkl_text(current)}, not {hkl_text(hkl)}, "
+                                   f"{LAYOUT_SWITCH_S:g}s after WM_INPUTLANGCHANGEREQUEST")
+                return f"layout is still {hkl_text(current)}"
+            time.sleep(0.02)
+        return detail
+
+    def restore_layout(self) -> str | None:
+        """Switch the window's thread back to the layout it had before the first switch; never raises."""
+        if self.original_layout is None:
+            return None
+        original = self.original_layout
+        try:
+            if not self.alive():
+                return f"not switched back to {hkl_text(original)}: the instance is gone"
+            result = self.switch_layout(hkl_text(original))
+            self.original_layout = None
+            return f"switched back: {result}"
+        except Exception as exc:  # noqa: BLE001 - cleanup goes on; the failure is evidence
+            return f"switching back to {hkl_text(original)} failed: {exc}"
+
+    def unload_layouts(self) -> list[str]:
+        """Unload the layouts allow_load added; never raises."""
+        results = []
+        while self.loaded_layouts:
+            hkl = self.loaded_layouts.pop()
+            try:
+                ok = win32().unload_layout(hkl)
+                results.append(f"unloaded {hkl_text(hkl)}" if ok else
+                               f"UnloadKeyboardLayout {hkl_text(hkl)} failed (error {ctypes.get_last_error()})")
+            except Exception as exc:  # noqa: BLE001 - cleanup goes on; the failure is evidence
+                results.append(f"unloading {hkl_text(hkl)} failed: {exc}")
+        return results
+
     def responsive(self, timeout: float = 2.0) -> bool:
         window = self.require_window()
         return win32().send_message(window.hwnd, WM_NULL, timeout_ms=int(timeout * 1000)) is not None
@@ -2153,6 +2300,7 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "simulate_system_theme": (frozenset(), frozenset(("scheme", "high_contrast"))),
     "restart": (frozenset(), frozenset(("timeout", "env", "wait"))),
     "capture_window": (frozenset(("name",)), frozenset(("cls", "title", "timeout", "method"))),
+    "layout": (frozenset(("target",)), frozenset()),
 }
 SCENARIO_KEYS = frozenset(("id", "title", "config", "harness", "env", "args", "requires", "side_effects", "expect",
                            "backdrop", "backdrop_reason", "wait_window", "step"))
@@ -2270,6 +2418,11 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
             raise UsageError(f"{where}: file readonly must be true or false")
         if "text" in params and not isinstance(params["text"], str):
             raise UsageError(f"{where}: file text must be a string")
+    if action == "layout":
+        try:
+            resolve_layout(params["target"], [])  # only the syntax; whether it is loaded is known at run time
+        except UsageError as exc:
+            raise UsageError(f"{where}: {exc}") from None
     if action == "capture_window":
         if "cls" not in params and "title" not in params:
             raise UsageError(f"{where}: capture_window needs cls or title")
@@ -2399,11 +2552,13 @@ def installed_wsl_distros() -> list[str]:
 class ScenarioRun:
     """Runs one scenario's steps against a fresh isolated instance."""
 
-    def __init__(self, scenario: Scenario, exe: Path, out_dir: Path, keep_open: bool = False) -> None:
+    def __init__(self, scenario: Scenario, exe: Path, out_dir: Path, keep_open: bool = False,
+                 allow_load_layouts: bool = False) -> None:
         self.scenario = scenario
         self.exe = exe
         self.out_dir = out_dir
         self.keep_open = keep_open
+        self.allow_load_layouts = allow_load_layouts  # VM only: the layout step may load a missing KLID
         self.instance: Instance | None = None
         self.captures: list[str] = []
         self.capture_steps = 0
@@ -2635,6 +2790,9 @@ class ScenarioRun:
     def do_ime_off(self, p):
         return self.gui.ime_off()
 
+    def do_layout(self, p):
+        return self.gui.switch_layout(p["target"], allow_load=self.allow_load_layouts)
+
     def do_simulate_system_theme(self, p):
         scheme, high_contrast = p.get("scheme", "follow"), p.get("high_contrast", "follow")
         wparam = self.gui.simulate_system_theme(scheme, high_contrast)
@@ -2713,6 +2871,8 @@ class ScenarioRun:
                                   "env_overrides": overrides, "same_profile": str(old.env_dir)}
         self.restarts.append(record)
         new.restarts = [*old.restarts, record]
+        # The keyboard layout to switch back to and what was loaded stay with the run.
+        new.original_layout, new.loaded_layouts = old.original_layout, old.loaded_layouts
         self.instance = new
         if p.get("wait", True):
             record["startup_ms"] = new.wait_window(20)
@@ -2796,6 +2956,9 @@ class ScenarioRun:
             try:
                 if self.instance is not None and self.held_buttons:
                     report["released_buttons"] = self.release_held_buttons(aborted=not completed)
+                layouts: dict[str, Any] = {}
+                if self.instance is not None and self.instance.original_layout is not None:
+                    layouts["switched_back"] = self.instance.restore_layout()  # while the instance still runs
                 if self.instance is not None and not self.keep_open:
                     try:
                         report["closed"] = self.instance.close()
@@ -2804,6 +2967,10 @@ class ScenarioRun:
                 elif self.instance is not None:
                     self.instance.save()
                     report["closed"] = f"kept open; stop with: gx_win_gui.py stop {env_dir}"
+                if self.instance is not None and self.instance.loaded_layouts and not self.keep_open:
+                    layouts["unloaded"] = self.instance.unload_layouts()
+                if layouts:
+                    report["layouts"] = layouts
                 # After the close, so a shutdown that writes into a read-only path still meets it.
                 released = self.readonly.release_all(env_dir.resolve())
                 if self.readonly.events or released:
@@ -2852,7 +3019,7 @@ def notes_text(scenario: Scenario, report: Mapping[str, Any]) -> str:
 
 
 def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_effects: bool, retries: int,
-                  keep_open: bool) -> int:
+                  keep_open: bool, allow_load_layouts: bool = False) -> int:
     if not exe.is_file():
         raise UsageError(f"{exe} does not exist; build it first with: just build")
     scenarios = [load_scenario(path) for path in paths]
@@ -2885,7 +3052,7 @@ def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_eff
                 shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True)
             print(f"{TAG} {scenario.id} {scenario.title} (attempt {attempt + 1})", flush=True)
-            report = ScenarioRun(scenario, exe, out_dir, keep_open).run()
+            report = ScenarioRun(scenario, exe, out_dir, keep_open, allow_load_layouts).run()
             report["attempt"] = attempt + 1
             (out_dir / "run.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             (out_dir / "notes.txt").write_text(notes_text(scenario, report), encoding="utf-8")
@@ -2935,6 +3102,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--allow-side-effects", action="store_true", help="also run scenarios with side effects")
     run.add_argument("--retries", type=int, default=0, help="rerun a failed scenario this many times")
     run.add_argument("--keep-open", action="store_true", help="leave the last instance running for inspection")
+    run.add_argument("--allow-load-layouts", action="store_true",
+                     help="VM only: let layout steps load keyboard layouts that are not loaded (unloaded at the end)")
     run.add_argument("scenarios", nargs="*", metavar="SCENARIO", help="ids such as W01 or .toml files (default all)")
 
     def session(name: str, help_text: str) -> argparse.ArgumentParser:
@@ -3000,6 +3169,11 @@ def build_parser() -> argparse.ArgumentParser:
     theme.add_argument("--scheme", choices=tuple(SYSTEM_THEME_SCHEMES), default="follow")
     theme.add_argument("--high-contrast", choices=tuple(SYSTEM_THEME_HIGH_CONTRAST), default="follow")
     session("ime-off", "switch the window's thread to the US keyboard layout")
+    layout = session("layout", "switch the window's thread to a keyboard layout, or list the loaded ones")
+    layout.add_argument("target", nargs="?", metavar="HKL|KLID", help="such as 0x08040804 or 00000407")
+    layout.add_argument("--allow-load", action="store_true",
+                        help="VM only: load a KLID that is not loaded; unloaded again by stop")
+    layout.add_argument("--list", action="store_true", help="print the loaded layouts and the current one")
     session("cancel-mode", "send WM_CANCELMODE to the focused terminal")
     return parser
 
@@ -3029,7 +3203,13 @@ def session_command(args: argparse.Namespace) -> int:
         return 0
     instance = Instance.load(env_dir)
     if args.command == "stop":
+        if instance.original_layout is not None:
+            print(instance.restore_layout())
         print(instance.close())
+        for line in instance.unload_layouts():
+            print(line)
+        instance.original_layout = None
+        instance.save()
         return 0
     if not instance.alive():
         raise GuiError(f"the instance in {env_dir} (pid {instance.pid}) is not running")
@@ -3074,6 +3254,15 @@ def session_command(args: argparse.Namespace) -> int:
         print(f"wparam {instance.simulate_system_theme(args.scheme, args.high_contrast):#x}")
     elif args.command == "ime-off":
         print(instance.ime_off())
+    elif args.command == "layout":
+        if args.list or args.target is None:
+            current = win32().keyboard_layout(instance.require_window().hwnd)
+            for hkl in win32().keyboard_layouts():
+                marks = [mark for mark, on in (("current", hkl & 0xFFFFFFFF == current),
+                                               ("loaded by this session", hkl in instance.loaded_layouts)) if on]
+                print(hkl_text(hkl) + (f"  ({', '.join(marks)})" if marks else ""))
+        else:
+            print(instance.switch_layout(args.target, allow_load=args.allow_load))
     elif args.command == "cancel-mode":
         instance.cancel_mode()
     instance.save()
@@ -3104,7 +3293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stamp = _datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             return run_scenarios(scenario_paths(args.scenarios), exe=args.exe, out=args.out or EVIDENCE_ROOT / stamp,
                                  allow_side_effects=args.allow_side_effects, retries=max(0, args.retries),
-                                 keep_open=args.keep_open)
+                                 keep_open=args.keep_open, allow_load_layouts=args.allow_load_layouts)
         return session_command(args)
     except UsageError as exc:
         print(f"{TAG} error: {exc}", file=sys.stderr)
