@@ -284,9 +284,46 @@ test "shutdown rejects initialization and is idempotent during COM reentry" {
 
 extern "ole32" fn CoGetApartmentType(kind: *i32, qualifier: *i32) callconv(.winapi) w32.HRESULT;
 
+// SDK APTTYPE/APTTYPEQUALIFIER values. Only MTA + IMPLICIT_MTA means
+// this thread inherited an apartment without acquiring a COM reference:
+// https://learn.microsoft.com/windows/win32/api/objidl/ne-objidl-apttypequalifier
+const NativeApartmentState = struct {
+    hr: w32.HRESULT,
+    kind: i32 = -1,
+    qualifier: i32 = -1,
+
+    const NoReference = enum { not_initialized, implicit_mta };
+    const not_initialized: w32.HRESULT = @bitCast(@as(u32, 0x800401f0));
+
+    fn query() NativeApartmentState {
+        var state: NativeApartmentState = .{ .hr = undefined };
+        state.hr = CoGetApartmentType(&state.kind, &state.qualifier);
+        return state;
+    }
+
+    fn noReference(self: NativeApartmentState) ?NoReference {
+        // Failed queries do not define the output kind/qualifier.
+        if (self.hr == not_initialized) return .not_initialized;
+        if (self.hr == 0 and self.kind == 1 and self.qualifier == 1) return .implicit_mta;
+        return null;
+    }
+
+    fn expectExplicit(self: NativeApartmentState, mta: bool) !void {
+        try std.testing.expectEqual(@as(w32.HRESULT, 0), self.hr);
+        try std.testing.expectEqual(@as(i32, 0), self.qualifier);
+        if (mta) {
+            try std.testing.expectEqual(@as(i32, 1), self.kind);
+        } else {
+            try std.testing.expect(self.kind == 0 or self.kind == 3);
+        }
+        try std.testing.expectEqual(@as(?NoReference, null), self.noReference());
+    }
+};
+
 const NativeScenario = struct {
     mode: enum { fresh, existing_sta, existing_mta },
     failure: ?anyerror = null,
+    require_implicit_mta: bool = false,
 
     fn run(self: *NativeScenario) void {
         self.check() catch |err| {
@@ -296,17 +333,22 @@ const NativeScenario = struct {
 
     fn check(self: *NativeScenario) !void {
         const testing = std.testing;
-        const not_initialized: w32.HRESULT = @as(i32, @bitCast(@as(u32, 0x800401f0)));
         const changed_mode: w32.HRESULT = @as(i32, @bitCast(@as(u32, 0x80010106)));
-        var kind: i32 = 0;
-        var qualifier: i32 = 0;
-        try testing.expectEqual(not_initialized, CoGetApartmentType(&kind, &qualifier));
+        const initial = NativeApartmentState.query().noReference() orelse
+            return error.UnexpectedExplicitApartment;
+        if (self.require_implicit_mta) {
+            try testing.expectEqual(NativeApartmentState.NoReference.implicit_mta, initial);
+        }
         var external_initialized = false;
         defer if (external_initialized) w32.CoUninitialize();
+        var external_state: ?NativeApartmentState = null;
         if (self.mode != .fresh) {
             const flags: u32 = if (self.mode == .existing_sta) w32.COINIT_APARTMENTTHREADED else 0;
-            try testing.expect(w32.CoInitializeEx(null, flags) >= 0);
-            external_initialized = true;
+            const hr = w32.CoInitializeEx(null, flags);
+            external_initialized = hr >= 0;
+            try testing.expectEqual(@as(w32.HRESULT, 0), hr);
+            external_state = NativeApartmentState.query();
+            try external_state.?.expectExplicit(self.mode == .existing_mta);
         }
         var apartment = Self.init();
         defer apartment.deinit() catch {};
@@ -317,30 +359,80 @@ const NativeScenario = struct {
             try apartment.ensureCom();
             try testing.expectEqual(@as(?w32.HRESULT, if (external_initialized) 1 else 0), apartment.last_hresult);
             try apartment.ensureOle();
-            try testing.expect(CoGetApartmentType(&kind, &qualifier) >= 0);
-            try testing.expect(kind == 0 or kind == 3);
+            try NativeApartmentState.query().expectExplicit(false);
         }
         try apartment.beginClose();
         try apartment.deinit();
-        if (self.mode == .fresh) {
-            try testing.expectEqual(not_initialized, CoGetApartmentType(&kind, &qualifier));
-        } else {
-            try testing.expect(CoGetApartmentType(&kind, &qualifier) >= 0);
-            if (self.mode == .existing_mta) {
-                try testing.expectEqual(@as(i32, 1), kind);
-            } else {
-                try testing.expect(kind == 0 or kind == 3);
-            }
+        if (external_state) |expected| {
+            // Releasing owned references must preserve the external reference,
+            // including explicit MTA (NONE), never merely an implicit MTA.
+            const remaining = NativeApartmentState.query();
+            try remaining.expectExplicit(self.mode == .existing_mta);
+            try testing.expectEqualDeep(expected, remaining);
+            w32.CoUninitialize();
+            external_initialized = false;
         }
+        // After every reference owned by this scenario is released, the same
+        // no-reference state must be restored; an arbitrary S_OK is not enough.
+        try testing.expectEqual(@as(?NativeApartmentState.NoReference, initial), NativeApartmentState.query().noReference());
     }
 };
 
-fn runNativeScenario(mode: @FieldType(NativeScenario, "mode")) !void {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
-    var scenario: NativeScenario = .{ .mode = mode };
+// Keeps a process MTA alive without initializing COM on the scenario thread.
+// The ready/release handshake makes this independent of UIA and test ordering.
+const NativeMtaHolder = struct {
+    ready: w32.HANDLE,
+    release: w32.HANDLE,
+    result: w32.HRESULT = -1,
+
+    fn run(self: *NativeMtaHolder) void {
+        self.result = w32.CoInitializeEx(null, 0);
+        defer if (self.result >= 0) w32.CoUninitialize();
+        _ = w32.SetEvent(self.ready);
+        _ = w32.WaitForSingleObject(self.release, w32.INFINITE);
+    }
+};
+
+fn runNativeThread(mode: @FieldType(NativeScenario, "mode"), require_implicit_mta: bool) !void {
+    var scenario: NativeScenario = .{ .mode = mode, .require_implicit_mta = require_implicit_mta };
     const thread = try std.Thread.spawn(.{}, NativeScenario.run, .{&scenario});
     thread.join();
     if (scenario.failure) |err| return err;
+}
+
+fn runNativeScenario(mode: @FieldType(NativeScenario, "mode")) !void {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    // Reject explicit STA/MTA, neutral apartments, and non-S_OK queries even
+    // when their output fields happen to resemble an implicit MTA.
+    for ([_]NativeApartmentState{
+        .{ .hr = 0, .kind = 0, .qualifier = 0 }, // STA
+        .{ .hr = 0, .kind = 3, .qualifier = 0 }, // MAINSTA
+        .{ .hr = 0, .kind = 1, .qualifier = 0 }, // Explicit MTA
+        .{ .hr = 0, .kind = 2, .qualifier = 4 }, // NA on implicit MTA
+        .{ .hr = 0, .kind = 0, .qualifier = 1 }, // Wrong kind
+        .{ .hr = 0, .kind = 1, .qualifier = 2 }, // Wrong qualifier
+        .{ .hr = 1, .kind = 1, .qualifier = 1 }, // S_FALSE is not S_OK
+        .{ .hr = @bitCast(@as(u32, 0x80004005)), .kind = 1, .qualifier = 1 }, // E_FAIL
+    }) |state| {
+        try std.testing.expectEqual(@as(?NativeApartmentState.NoReference, null), state.noReference());
+    }
+    const uninitialized: NativeApartmentState = .{ .hr = NativeApartmentState.not_initialized };
+    try std.testing.expectEqual(NativeApartmentState.NoReference.not_initialized, uninitialized.noReference().?);
+    try runNativeThread(mode, false);
+
+    const ready = w32.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
+    defer _ = w32.CloseHandle(ready);
+    const release = w32.CreateEventW(null, 1, 0, null) orelse return error.CreateEventFailed;
+    defer _ = w32.CloseHandle(release);
+    var holder: NativeMtaHolder = .{ .ready = ready, .release = release };
+    const thread = try std.Thread.spawn(.{}, NativeMtaHolder.run, .{&holder});
+    defer {
+        _ = w32.SetEvent(release);
+        thread.join();
+    }
+    try std.testing.expectEqual(w32.WAIT_OBJECT_0, w32.WaitForSingleObject(ready, 5000));
+    try std.testing.expectEqual(@as(w32.HRESULT, 0), holder.result);
+    try runNativeThread(mode, true);
 }
 
 test "native fresh STA and OLE are both released on their owner thread" {
