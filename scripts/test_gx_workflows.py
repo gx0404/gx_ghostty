@@ -634,6 +634,8 @@ class CiWorkflowTests(unittest.TestCase):
                        "$env:LOCALAPPDATA = $dir", "$env:XDG_CONFIG_HOME = $dir"):
             self.assertIn(needle, script)
         self.assertEqual(script.count("if ($LASTEXITCODE -ne $case.Want) { throw"), 3)
+        # GitHub appends `exit $LASTEXITCODE` to pwsh steps; the expected exit 1 of the last case must not leak.
+        self.assertEqual([line.strip() for line in script.splitlines() if line.strip()][-1], "exit 0")
 
     def test_only_release_assets_use_the_gx_artifact_prefix_that_verify_downloads(self):
         for name, job in RELEASE.jobs().items():
