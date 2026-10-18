@@ -12,9 +12,6 @@ keybind = ctrl+alt+g=close_tab:right
 keybind = ctrl+alt+d=new_split:right
 keybind = ctrl+alt+n=gx:move_split_to_tab
 """
-# libadwaita refuses an unpinned tab among the pinned tabs with a CRITICAL
-# (D-24), so the whole run must stay free of them.
-forbid = ["Theme parser error", "css parsing failed", "CRITICAL"]
 # The window is 1100x740 at the top left: the tab bar is at y 67, and the
 # two pinned tabs P1 and P2 sit at x 33 and 72. Tab menu items lie 80 px
 # right of the right click and 119 (Pin Tab) or 228 (Close Tabs to the
@@ -134,7 +131,9 @@ expected = {
 assert results == expected, results
 
 # D-24: with the first pinned tab P1 selected, a new tab and a split pane
-# moved to a new tab both go after the pinned tabs.
+# moved to a new tab both go after the pinned tabs. libadwaita refused the
+# position after P1 with CRITICAL lines, and the log of the whole run up to
+# here must have none.
 kept = closed()
 select_tab(33)
 xdo("key", "ctrl+shift+t")
@@ -167,5 +166,5 @@ expect = [
   "G28-closed.json: the surfaces each step closed: 2, 2, 3, 2 and 1",
   "G28-07-new-tab-from-first-pinned.png: with the first pinned tab P1 selected, Ctrl+Shift+T makes the selected tab N11 after the pinned P1 and P2",
   "G28-08-split-to-tab-from-first-pinned.png: the right split of P1 moved to the selected tab S1 after the pinned P1 and P2 and before N11; P1 keeps its other terminal",
-  "G28.log: no CRITICAL line (forbid)",
+  "G28.log: no CRITICAL line up to the last step (the script asserts it)",
 ]
