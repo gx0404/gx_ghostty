@@ -59,6 +59,37 @@ class PopupBoundaryTests(unittest.TestCase):
         self.assertTrue(report["input_language"]["restored"])
 
 
+class PopupTransitionTests(unittest.TestCase):
+    """round3-batch-20261018-125657 UIA-03: after Escape the closing menu was
+    still listed, was taken for the modal dialog, and was gone by the capture."""
+
+    def instance(self, frames):
+        frames = iter(frames)
+        last = []
+
+        def popups():
+            nonlocal last
+            last = next(frames, last)
+            return [SimpleNamespace(hwnd=hwnd) for hwnd in last]
+        return SimpleNamespace(popups=popups, press=mock.Mock())
+
+    def test_dismissal_waits_until_every_popup_visible_before_it_is_gone(self):
+        import gx_boundary_uia as boundary
+        instance = self.instance([[7, 8], [7, 8], [8], []])
+        with mock.patch.object(boundary.time, "sleep"):
+            boundary.dismiss_popups(instance)
+        instance.press.assert_called_once_with("escape")
+        self.assertEqual([], instance.popups())
+
+    def test_a_dismissed_popup_that_stays_fails_instead_of_standing_in(self):
+        import gx_boundary_uia as boundary
+        instance = self.instance([[7], [7]])
+        ticks = iter(range(100000))
+        with mock.patch("gx_session_ipc_fixture.time.monotonic", side_effect=lambda: next(ticks)), \
+                mock.patch("gx_session_ipc_fixture.time.sleep"), self.assertRaises(AssertionError):
+            boundary.dismiss_popups(instance)
+
+
 class PinyinEmulator:
     """Microsoft Pinyin through WM_IME_CONTROL as observed on the host: the first
     reads after a layout switch may show an activation state, a conversion mode

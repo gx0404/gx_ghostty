@@ -17,6 +17,16 @@ def popup(instance, exclude=()):
                              and w.hwnd not in exclude), None))
 
 
+def dismiss_popups(instance, key="escape"):
+    """Press `key` and wait until every popup visible before it is gone, so a
+    closing popup is never taken for the one that replaces it
+    (round3-batch-20261018-125657 UIA-03: the closing menu stood in for the
+    modal dialog and was destroyed before its capture)."""
+    before = {window.hwnd for window in instance.popups()}
+    instance.press(key)
+    wait(lambda: not any(window.hwnd in before for window in instance.popups()))
+
+
 class Worker:
     def __init__(self, fixture, instance, hwnd, label, *, actions=None, notification=False, stress=False):
         self.fixture, self.instance, self.hwnd, self.label = fixture, instance, hwnd, label
@@ -290,11 +300,11 @@ def stress(fixture, instance, native):
         instance.press("ctrl+shift+m")
         menu = popup(instance)
         fixture.capture(instance, "stress-menu", menu)
-        instance.press("escape")
+        dismiss_popups(instance)
         native.control(10, posted=True)
         dialog = popup(instance)
         fixture.capture(instance, "stress-modal", dialog)
-        instance.press("escape")
+        dismiss_popups(instance)
         time.sleep(0.3)
         result = worker.complete()
         assert result["queries_during_wait"] - result["unavailable_queries"] >= 5, "no usable queries during stress"
