@@ -23,6 +23,14 @@ expect = [
   "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
 ]
 
+# The pointer may rest on the chrome where a previous program left it (a tab bar button shows its
+# tooltip, another popup); park it in the terminal first.
+[[step]]
+action = "move"
+in = "terminal:0"
+x = "50%"
+y = "50%"
+
 # Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch.
 [[step]]
 action = "ime_off"
