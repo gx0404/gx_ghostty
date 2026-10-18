@@ -38,6 +38,59 @@ POPUPS = (
     ("settings", "ctrl+comma", ("selection", "selection_item")),
 )
 PHASES = {0: "reset", 1: "target", 2: "surface", 3: "begin", 4: "end", 5: "commit"}
+# UIA-01 dynamic focus (needs A1 0002): the owned shell's prompt asks to WRITE a
+# marker to the clipboard (OSC 52, ST-terminated via cmd's $E), which opens the
+# clipboard dialog with its "Remember choice" check box. The fixture only ever
+# answers Deny (also the default button): the clipboard is never read or written.
+CLIPBOARD_MARKER = "GX_UIA_01_FOCUS"
+DIALOG_CONFIG = CONFIG.replace("command = cmd.exe /d /k prompt $G$S",
+                               "clipboard-write = ask\ncommand = cmd.exe /d /k prompt $E]52;c;R1hfVUlBXzAxX0ZPQ1VT$E\\$G$S")
+
+
+def focusable(nodes, **pattern):
+    return [node for node in nodes if node.get("focusable") is True and node.get("enabled") is True
+            and all(node.get("patterns", {}).get(name) is value for name, value in pattern.items())]
+
+
+def palette_focus_rows(nodes, value):
+    """The client focuses Search, then calls Value.SetValue on the same element
+    it held before the focus call (UIA-01's original 0x80040201)."""
+    search = next(iter(focusable(nodes, value=True)), None)
+    if search is None:
+        raise AssertionError("palette exposes no focusable Value element")
+    return [{"automation_id": search["automation_id"], "pattern": "element", "operation": "set_focus",
+             "expect_focus": True, "expect_focused_element": True},
+            {"automation_id": search["automation_id"], "pattern": "value", "operation": "set", "value": value}]
+
+
+def menu_focus_rows(nodes):
+    """The focus moves New Tab -> Split; New Tab, held since before both moves,
+    reports no focus and still accepts Invoke (one new tab). A menu popup never
+    has the Win32 focus, so GetFocusedElement and events are not asserted here."""
+    items = {node["name"]: node for node in focusable(nodes)}
+    first, second = items.get("New Tab"), items.get("Split")
+    if first is None or second is None or first["patterns"].get("invoke") is not True:
+        raise AssertionError("menu lacks focusable New Tab (Invoke) and Split items")
+    return [{"automation_id": first["automation_id"], "pattern": "element", "operation": "set_focus", "expect_focus": True},
+            {"automation_id": second["automation_id"], "pattern": "element", "operation": "set_focus", "expect_focus": True},
+            {"automation_id": first["automation_id"], "pattern": "element", "operation": "check_focus", "expect_focus": False},
+            {"automation_id": first["automation_id"], "pattern": "invoke", "operation": "invoke"}]
+
+
+def dialog_focus_rows(nodes):
+    """The focus moves Deny -> the check box with HasKeyboardFocus,
+    GetFocusedElement and a FocusChanged event; Deny, held since before, reports
+    no focus; the check box held since before still toggles. Deny itself is
+    invoked afterwards on a fresh element: the toggle changes the dialog model."""
+    check = next(iter(focusable(nodes, toggle=True)), None)
+    deny = next((node for node in focusable(nodes, invoke=True) if node["name"] == "Deny"), None)
+    if check is None or deny is None:
+        raise AssertionError("clipboard dialog lacks a focusable check box and Deny button")
+    return [{"automation_id": deny["automation_id"], "pattern": "element", "operation": "set_focus", "expect_focus": True},
+            {"automation_id": check["automation_id"], "pattern": "element", "operation": "set_focus", "expect_focus": True,
+             "expect_focused_element": True, "expect_focus_event": True},
+            {"automation_id": deny["automation_id"], "pattern": "element", "operation": "check_focus", "expect_focus": False},
+            {"automation_id": check["automation_id"], "pattern": "toggle", "operation": "toggle"}]
 
 
 def choose_popup(windows):
@@ -76,6 +129,7 @@ class Fixture:
         self.method = args.capture
         self.readonly_root = args.readonly_root
         self.actions = args.actions
+        self.focus_checks = args.focus_checks
         self.modes = ("off", "on") if args.mode == "both" else (args.mode,)
         self.owned = []
         self.check_build()
@@ -112,15 +166,15 @@ class Fixture:
         self.report["cases"].append({"name": name, "status": status, **details})
         self.save()
 
-    def start(self, mode, *, activate=True):
+    def start(self, mode, *, activate=True, config=CONFIG, variant=""):
         self.check_build()
-        env_dir = (self.out / f"env-{mode}").resolve()
+        env_dir = (self.out / f"env-{mode}{variant}").resolve()
         gui.prepare_env_dir(env_dir, False)
         # The off case leaves the variable absent, verifying the default.
         extra = {"GHOSTTY_GX_REMOTE_TEST": "1"}
         if mode == "on":
             extra["GHOSTTY_GX_POPUP_DCOMP"] = "1"
-        instance = gui.launch(self.exe, env_dir, config=CONFIG, env=extra)
+        instance = gui.launch(self.exe, env_dir, config=config, env=extra)
         self.owned.append(instance)
         instance.ensure_owned()
         instance.save()
@@ -235,6 +289,68 @@ class Fixture:
         assert len(observation["actions"]) == 1
         self.record(name, "PASS", case_id="UIA-01", native=observation, boundary="COM action accepted; resulting UI separately reviewed")
 
+    def focus_plan(self, instance, popup, name, rows):
+        """One external MTA worker holds every target from one enumeration, moves
+        the focus, then acts on the elements it already holds (UIA-01)."""
+        plan = self.out / (name + ".plan.json")
+        plan.write_text(json.dumps(rows), encoding="utf-8")
+        command = [sys.executable, str(ROOT / "scripts/gx_win_uia.py"), "--worker", "--hwnd", str(popup.hwnd),
+                   "--pid", str(instance.pid), "--birth", str(instance.creation), "--exe", str(self.exe),
+                   "--sha256", self.expected_hash, "--max-nodes", "512", "--timeout", "20", "--action-plan", str(plan)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=25)
+        path = self.out / (name + ".json")
+        path.write_text(json.dumps({"command": command, "exit_code": result.returncode,
+                                   "stdout": result.stdout, "stderr": result.stderr}, indent=2), encoding="utf-8")
+        if result.returncode != 0:
+            raise AssertionError(f"dynamic focus sequence failed: {path.name}")
+        observation = json.loads(result.stdout)
+        if len(observation["actions"]) != len(rows):
+            raise AssertionError(f"dynamic focus sequence ran {len(observation['actions'])} of {len(rows)} actions")
+        self.record(name, "PASS", case_id="UIA-01", native=observation,
+                    boundary="focus moved; elements held from before the move still answer and act")
+        return observation
+
+    def focus_menu(self, instance, mode):
+        root = instance.require_window()
+        before = gui.win32().send_message(root.hwnd, 0x450, 12, 0, timeout_ms=2000)
+        assert before and before < 64
+        instance.ensure_foreground()
+        opened = {item.hwnd for item in instance.popups()}
+        instance.press("ctrl+shift+m")
+        menu = wait(lambda: next((item for item in instance.popups() if item.hwnd not in opened and item.cls in POPUP_CLASSES), None))
+        time.sleep(0.4)
+        probe = self.uia(instance, menu.hwnd, mode + "-focus-menu", ("invoke",))
+        self.focus_plan(instance, self.fresh_popup(instance, menu.hwnd), mode + "-focus-menu-sequence", menu_focus_rows(probe["nodes"]))
+        wait(lambda: gui.win32().send_message(root.hwnd, 0x450, 12, 0, timeout_ms=2000) == before + 1)
+        wait(lambda: not any(item.hwnd == menu.hwnd for item in instance.popups()))
+        image = mode + "-focus-menu-invoked.png"
+        instance.ensure_foreground()
+        instance.capture_window(instance.require_window(), self.method).save_png(self.out / image)
+        self.report["captures"].append({"file": image, "method": self.method, "review": "PENDING_REVIEW",
+                                         "expect": "焦点在 New Tab 与 Split 间移动后，此前保留的 New Tab 元素 Invoke 新增一标签"})
+        self.save()
+
+    def focus_dialog(self, mode):
+        instance = self.start(mode, config=DIALOG_CONFIG, variant="-dialog")
+        dialog = wait(lambda: choose_popup(instance.popups()), 15)
+        time.sleep(0.4)
+        dialog = self.fresh_popup(instance, dialog.hwnd)
+        self.capture(instance, dialog.hwnd, mode + "-focus-dialog", f"剪贴板写入询问对话框，预览 {CLIPBOARD_MARKER}，有记住选择复选框")
+        probe = self.uia(instance, dialog.hwnd, mode + "-focus-dialog", ("toggle", "invoke"))
+        before = next(node for node in focusable(probe["nodes"], toggle=True))
+        self.focus_plan(instance, dialog, mode + "-focus-dialog-sequence", dialog_focus_rows(probe["nodes"]))
+        after = self.uia(instance, dialog.hwnd, mode + "-focus-dialog-after-toggle", ("toggle", "invoke"))
+        toggled = next(node for node in focusable(after["nodes"], toggle=True))
+        if toggled["toggle_state"] == before["toggle_state"]:
+            raise AssertionError("Toggle on the check box held since before the focus moves did not reach the dialog")
+        self.capture(instance, dialog.hwnd, mode + "-focus-dialog-toggled", "复选框已勾选，焦点环在复选框上")
+        deny = next(node for node in focusable(after["nodes"], invoke=True) if node["name"] == "Deny")
+        self.pattern_call(instance, dialog, deny, "invoke", "invoke")
+        wait(lambda: not any(item.hwnd == dialog.hwnd for item in instance.popups()))
+        self.record(mode + "-focus-dialog/denied", "PASS", case_id="UIA-01", clipboard="denied by Invoke(Deny); never written")
+        self.report["cleanup"].append({"pid": instance.pid, "birth": instance.creation, "result": instance.close()})
+        self.save()
+
     def stale_palette(self, instance, mode):
         instance.press("ctrl+shift+p")
         popup = wait(lambda: choose_popup(instance.popups()))
@@ -326,8 +442,11 @@ class Fixture:
             if self.actions:
                 # Safe reversible operations, chosen from the live published tree.
                 if label == "palette":
-                    node = next(n for n in probe["nodes"] if n["patterns"].get("value"))
-                    self.pattern_call(instance, popup, node, "value", "set", "font")
+                    if self.focus_checks:
+                        self.focus_plan(instance, popup, name + "-focus-value", palette_focus_rows(probe["nodes"], "font"))
+                    else:
+                        node = next(n for n in probe["nodes"] if n["patterns"].get("value"))
+                        self.pattern_call(instance, popup, node, "value", "set", "font")
                     actual = self.uia(instance, popup.hwnd, name + "-value-after", ("value",))
                     assert any(n.get("value") == "font" for n in actual["nodes"]), "Value.SetValue did not reach GUI model"
                 elif label == "settings":
@@ -354,6 +473,8 @@ class Fixture:
             instance.press("escape")
             wait(lambda: not any(item.hwnd == popup.hwnd for item in instance.popups()))
             instance.ensure_owned()
+        if self.actions and self.focus_checks:
+            self.focus_menu(instance, mode)
         if self.actions:
             self.stale_palette(instance, mode)
             self.root_actions(instance, mode)
@@ -378,6 +499,8 @@ class Fixture:
             else:
                 for mode in self.modes:
                     self.run_mode(mode)
+                    if self.actions and self.focus_checks:
+                        self.focus_dialog(mode)
                 self.report["status"] = "PENDING_VISUAL_REVIEW"
             self.check_build()
             pending = any(case["status"] == "PENDING" for case in self.report["cases"])
@@ -430,7 +553,11 @@ def main(argv=None):
     parser.add_argument("--mode", choices=("both", "off", "on"), default="both")
     parser.add_argument("--readonly-root", action="store_true", help="query only root/window/pane properties, without activation, input, screenshots, or popup claims")
     parser.add_argument("--actions", action="store_true", help="exercise reversible COM patterns and retained-provider hide/reopen")
+    parser.add_argument("--focus-checks", action="store_true",
+                        help="with --actions: UIA-01 dynamic focus sequences (palette, menu, clipboard dialog; needs A1 0002)")
     args = parser.parse_args(argv)
+    if args.focus_checks and not args.actions:
+        parser.error("--focus-checks requires --actions")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
         parser.error("--sha256 must be a complete SHA-256 digest")
     if os.name != "nt":

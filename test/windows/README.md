@@ -74,6 +74,7 @@ FILETIME、exe 路径/哈希、HWND、core id 与 PTY 子进程身份；没有�
 | IPC-03/04 | session `--case crash_before_ready --case squatter` | ready 前自有 host 退出；同名不响应 endpoint 预占。若暂停时已创建 GUI/PTY，IPC-03 记 PENDING；IPC-04 不代有效伪造 hello 认证 |
 | IPC-05 | session `--case roots` | 配置根隔离；build/install/token/session/account 各维度另验 |
 | UIA-01/02 | popup `--mode off --actions` | 外部无 HWND MTA 调用 Invoke/SelectionItem/Value/Toggle/Expand；Palette hide/reopen 后保留旧 Value provider 实际调用必须不可用 |
+| UIA-01 动态焦点 | popup `--mode off --actions --focus-checks`（需含 A1 0002 的构建） | 同一 MTA worker 先保留元素再移动焦点：Palette SetFocus(Search) 后同一元素 SetValue；菜单焦点 New Tab→Split，旧 New Tab 报告无焦点且仍 Invoke（新增一标签）；剪贴板写入询问对话框（自有 shell 提示符经 OSC 52 请求写入 `GX_UIA_01_FOCUS`，只按 Deny，剪贴板不读不写）焦点 Deny→复选框，HasKeyboardFocus、GetFocusedElement、FocusChanged 事件都须成立，旧 Deny 报告无焦点，旧复选框仍 Toggle |
 | OLE-01/02/03/04/05/06 | ole `--case unicode/single_file/files/shell_metachar_files/quoted_path/uri/multiline/unterminated/bad_hdrop/bad_uri/text_limit/too_many_files`（每项独立 `--case`） | 真实 DoDragDrop、释放计数、源文件摘要保持；引号路径是明确的恶意合成 HDROP，Windows 不存在引号文件名；COPY 仅准入、粘贴与无 Enter 必须读图 |
 | BRK-01/02/03/04 | broker `receipt --expect rejected/expired/target_gone/cancelled` | VM 同用户 medium/high 拆分令牌；PID/birth 过滤真实完成回执。第二轮已加入门控 diagnostic；旧 app 缺 diagnostic 不能把截图或 OLE COPY 当 ACK |
 
