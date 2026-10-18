@@ -44,6 +44,10 @@ const restore_key = "gx-context-menu";
 /// the context menu back.
 const restore_handler_key = "gx-context-menu-handler";
 
+/// The object data key on the box of a terminal's context menu holding
+/// the main menu popover next to it (`mainPopover`).
+const main_popover_key = "gx-main-menu-popover";
+
 /// Brings the menus and tooltips of `window` up to date with the UI
 /// language, the launch profiles and the configuration. Called when the
 /// window is created and whenever its configuration changes.
@@ -103,10 +107,10 @@ pub fn syncSurfaceMenu(surface: *Surface) void {
 
 /// Opens the main menu of `window`: from its header bar or tab bar button
 /// when one is shown, else from the active terminal. Returns false if
-/// there is neither.
+/// there is neither. Both keep their menu between openings.
 pub fn popupMainMenu(window: *Window) bool {
     var timing = open_perf.begin(.menu);
-    var header: Header = .{};
+    var header: Header = .{ .translate = false };
     if (toolbar(window)) |widget| walk(widget, &header);
     for (header.menu_buttons.slice()) |button| {
         const widget = button.as(gtk.Widget);
@@ -123,16 +127,65 @@ pub fn popupMainMenu(window: *Window) bool {
     const button = if (header.menu_buttons.len > 0) header.menu_buttons.items[0] else return false;
     const model = button.getMenuModel() orelse return false;
     const surface = window.getActiveSurface() orelse return false;
-    const popover = surfacePopover(surface) orelse return false;
+    const context = surfacePopover(surface) orelse return false;
     open_perf.lap(&timing, .prepare);
-    showFromPopover(popover, model, &timing);
-    addViewControls(popover);
+    const popover = mainPopover(context, model) orelse return false;
+    open_perf.lap(&timing, .create);
+    pointAtTopRight(popover.as(gtk.Popover));
+    open_perf.lap(&timing, .layout);
+    open_perf.watch(popover.as(gtk.Widget), timing);
+    popover.as(gtk.Popover).popup();
     open_perf.presented(popover.as(gtk.Widget), timing);
     return true;
 }
 
+/// The main menu popover of a terminal whose window shows no main menu
+/// button, next to its context menu `context` (the main menu used to take
+/// the context menu's place, building both menus at every opening). It is
+/// built at the first opening and kept, and its menu is built again only
+/// when `model` changed. The box of the context menu holds it and removes
+/// it with the terminal.
+fn mainPopover(context: *gtk.PopoverMenu, model: *gio.MenuModel) ?*gtk.PopoverMenu {
+    const parent = context.as(gtk.Widget).getParent() orelse return null;
+    const box = gobject.ext.cast(gtk.Box, parent) orelse return null;
+    const object = box.as(gobject.Object);
+    if (object.getData(main_popover_key)) |data| {
+        const popover: *gtk.PopoverMenu = @ptrCast(@alignCast(data));
+        if (popover.getMenuModel() != model) {
+            removeViewControls(popover);
+            popover.setMenuModel(model);
+            addViewControls(popover);
+        }
+        return popover;
+    }
+    // Like the context menu it stands for.
+    const popover = gtk.PopoverMenu.newFromModelFull(model, .{ .nested = true });
+    popover.as(gtk.Widget).setHalign(.start);
+    popover.as(gtk.Popover).setHasArrow(0);
+    box.append(popover.as(gtk.Widget));
+    object.setData(main_popover_key, popover);
+    popover.as(gobject.Object).weakRef(&forgetMainPopover, object);
+    _ = gtk.Popover.signals.closed.connect(popover.as(gtk.Popover), ?*anyopaque, mainPopoverClosed, null, .{});
+    addViewControls(popover);
+    return popover;
+}
+
+fn forgetMainPopover(data: ?*anyopaque, _: *gobject.Object) callconv(.c) void {
+    const box: *gobject.Object = @ptrCast(@alignCast(data orelse return));
+    box.setData(main_popover_key, null);
+}
+
+/// Gives the focus back to the terminal when the main menu closes, like
+/// its context menu does (GTK would move it to the tab bar).
+fn mainPopoverClosed(popover: *gtk.Popover, _: ?*anyopaque) callconv(.c) void {
+    const widget = popover.as(gtk.Widget).getAncestor(Surface.getGObjectType()) orelse return;
+    if (widget.getRoot() == null) return;
+    const surface = gobject.ext.cast(Surface, widget) orelse return;
+    surface.grabFocus();
+}
+
 pub fn popupNewTabMenu(window: *Window) bool {
-    var header: Header = .{};
+    var header: Header = .{ .translate = false };
     if (toolbar(window)) |widget| walk(widget, &header);
     for (header.split_buttons.slice()) |button| {
         const widget = button.as(gtk.Widget);
@@ -145,7 +198,7 @@ pub fn popupNewTabMenu(window: *Window) bool {
     const model = button.getMenuModel() orelse return false;
     const surface = window.getActiveSurface() orelse return false;
     const popover = surfacePopover(surface) orelse return false;
-    showFromPopover(popover, model, null);
+    showFromPopover(popover, model);
     return true;
 }
 
@@ -416,28 +469,32 @@ fn Widgets(comptime T: type) type {
 }
 
 /// The new tab and main menu buttons of the header bar and the tab bar.
-/// Visiting a button also translates its tooltip.
 const Header = struct {
+    /// Whether visiting a button translates its tooltip, which `sync` does
+    /// when the language changes; opening a menu only looks it up.
+    translate: bool = true,
     menu_buttons: Widgets(gtk.MenuButton) = .{},
     split_buttons: Widgets(adw.SplitButton) = .{},
 
     /// Returns whether to visit the children of `widget`.
     fn visit(self: *Header, widget: *gtk.Widget) bool {
         if (gobject.ext.cast(adw.SplitButton, widget)) |button| {
-            widget.setTooltipText(tr("New Tab"));
-            button.setDropdownTooltip(tr("Launch Profiles and Splits"));
+            if (self.translate) {
+                widget.setTooltipText(tr("New Tab"));
+                button.setDropdownTooltip(tr("Launch Profiles and Splits"));
+            }
             self.split_buttons.add(button);
             return false;
         }
         if (gobject.ext.cast(gtk.MenuButton, widget)) |button| {
             if (iconIs(button.getIconName(), "open-menu-symbolic")) {
-                widget.setTooltipText(tr("Main Menu"));
+                if (self.translate) widget.setTooltipText(tr("Main Menu"));
                 self.menu_buttons.add(button);
             }
             return false;
         }
         if (gobject.ext.cast(gtk.ToggleButton, widget)) |button| {
-            if (iconIs(button.as(gtk.Button).getIconName(), "view-grid-symbolic")) {
+            if (self.translate and iconIs(button.as(gtk.Button).getIconName(), "view-grid-symbolic")) {
                 widget.setTooltipText(tr("View Open Tabs"));
             }
             return false;
@@ -487,9 +544,7 @@ pub fn toast(window: *Window, title: [:0]const u8) void {
 
 /// Shows `model` from the context menu popover of a terminal at its top
 /// right corner, then puts the context menu back when the popover closes.
-/// Building the menu of `model` is the `create` phase of a measured
-/// opening, placing it the `layout` phase.
-fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel, timing: ?*?open_perf.Timing) void {
+fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel) void {
     const object = popover.as(gobject.Object);
     if (object.getData(restore_handler_key) == null) {
         _ = gtk.Popover.signals.closed.connect(
@@ -506,8 +561,12 @@ fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel, timing: ?*?
         object.setDataFull(restore_key, context.as(gobject.Object).ref(), &unrefObject);
     }
     popover.setMenuModel(model);
-    if (timing) |value| open_perf.lap(value, .create);
+    pointAtTopRight(popover.as(gtk.Popover));
+    popover.as(gtk.Popover).popup();
+}
 
+/// Points `popover` at the top right corner of the terminal it belongs to.
+fn pointAtTopRight(popover: *gtk.Popover) void {
     const anchor = popover.as(gtk.Widget).getParent() orelse popover.as(gtk.Widget);
     const rect: gdk.Rectangle = .{
         .f_x = @max(anchor.getWidth() - 1, 0),
@@ -515,12 +574,7 @@ fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel, timing: ?*?
         .f_width = 1,
         .f_height = 1,
     };
-    popover.as(gtk.Popover).setPointingTo(&rect);
-    if (timing) |value| {
-        open_perf.lap(value, .layout);
-        open_perf.watch(popover.as(gtk.Widget), value.*);
-    }
-    popover.as(gtk.Popover).popup();
+    popover.setPointingTo(&rect);
 }
 
 fn restoreContextMenu(popover: *gtk.Popover, _: ?*anyopaque) callconv(.c) void {
