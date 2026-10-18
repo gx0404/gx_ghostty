@@ -28,6 +28,7 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   drag ENV_DIR X1 Y1 X2 Y2 [--in ANCHOR] [--steps N] [--button B]
   wait-log ENV_DIR REGEX [--timeout S]
   dpi ENV_DIR DPI                   test hook WM_GHOSTTY_SIMULATE_DPI (WM_USER+0x47)
+  d2d-failure ENV_DIR [--quick]     test hook WM_GHOSTTY_SIMULATE_D2D_FAILURE (WM_USER+0x4C)
   ime-off ENV_DIR                   ask the window's thread to switch to the US layout
   cancel-mode ENV_DIR               SendMessage WM_CANCELMODE to the focused terminal
 
@@ -49,6 +50,9 @@ env, args, requires, side_effects and expect, and [[step]] tables, each an actio
   wait_terminals count [timeout window] wait_popup [cls timeout present new]
   close [timeout]                       file path text (a file inside the isolated profile)
   backdrop [color enabled reason]       switch the privacy backdrop for the following steps
+  simulate_d2d_failure [window]         the window's title bar acts as if Direct2D failed and falls
+                                        back to the system caption (WM_USER+0x4C to that GhosttyWindow;
+                                        checked with WM_GHOSTTY_CAPTION_QUERY bit 3)
 A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end.
 
 Privacy backdrop: a scenario covers the work areas of the monitors its instance's windows are on
@@ -140,6 +144,10 @@ WM_INPUTLANGCHANGEREQUEST = 0x0050
 WM_USER = 0x0400
 WM_GHOSTTY_SIMULATE_DPI = WM_USER + 0x47
 WM_GHOSTTY_SIMULATE_GPU_RESET = WM_USER + 0x48
+# chrome/TitleBar.zig: handled by the title bar of the top-level GhosttyWindow before anything else.
+WM_GHOSTTY_SIMULATE_D2D_FAILURE = WM_USER + 0x4C  # wparam/lparam unused; 1 = the native fallback is queued
+WM_GHOSTTY_CAPTION_QUERY = WM_USER + 0x4D  # bit 0 active, 1 owner lock, 2 native buttons, 3 Direct2D failed
+CAPTION_DIRECT2D_FAILED = 0b1000
 
 # Privacy backdrop of scenario runs (Backdrop, BackdropWindow).
 BACKDROP_DEFAULT = "#000000"
@@ -1724,6 +1732,23 @@ class Instance:
             raise GuiError("the window did not answer WM_GHOSTTY_SIMULATE_DPI")
         self.simulated_dpi = dpi
 
+    def simulate_d2d_failure(self, kind: str = "main") -> int:
+        """Test hook WM_GHOSTTY_SIMULATE_D2D_FAILURE: the title bar of this window (only) marks Direct2D
+        as failed and queues the fallback to the system caption without tabs. Its caption state after."""
+        window = self.require_window(kind)
+        w = win32()
+        answer = w.send_message(window.hwnd, WM_GHOSTTY_SIMULATE_D2D_FAILURE)
+        if answer is None:
+            raise GuiError("the window did not answer WM_GHOSTTY_SIMULATE_D2D_FAILURE")
+        if answer != 1:
+            raise GuiError(f"WM_GHOSTTY_SIMULATE_D2D_FAILURE returned {answer}, not 1: the build lacks the hook")
+        state = w.send_message(window.hwnd, WM_GHOSTTY_CAPTION_QUERY)
+        if state is None:
+            raise GuiError("the window did not answer WM_GHOSTTY_CAPTION_QUERY")
+        if not state & CAPTION_DIRECT2D_FAILED:
+            raise GuiError(f"the title bar does not report the Direct2D failure (caption state {state:#06b})")
+        return state
+
     def focused_terminal(self) -> int:
         window = self.require_window()
         focus = win32().focus_window(window.hwnd)
@@ -1877,6 +1902,7 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "close": (frozenset(), frozenset(("timeout",))),
     "file": (frozenset(("path", "text")), frozenset()),
     "backdrop": (frozenset(), frozenset(("color", "enabled", "reason"))),
+    "simulate_d2d_failure": (frozenset(), frozenset(("window",))),
 }
 SCENARIO_KEYS = frozenset(("id", "title", "config", "harness", "env", "args", "requires", "side_effects", "expect",
                            "backdrop", "backdrop_reason", "step"))
@@ -2291,6 +2317,10 @@ class ScenarioRun:
     def do_ime_off(self, p):
         return self.gui.ime_off()
 
+    def do_simulate_d2d_failure(self, p):
+        state = self.gui.simulate_d2d_failure(p.get("window", "main"))
+        return f"Direct2D failure simulated; the title bar falls back to the system caption (caption state {state:#06b})"
+
     def do_cancel_mode(self, p):
         self.gui.cancel_mode(p.get("terminal"))
         return "WM_CANCELMODE sent"
@@ -2592,6 +2622,8 @@ def build_parser() -> argparse.ArgumentParser:
     wait_log.add_argument("--timeout", type=number, default=10.0)
     dpi = session("dpi", "simulate a DPI change")
     dpi.add_argument("dpi", type=int)
+    d2d = session("d2d-failure", "simulate a Direct2D failure of the title bar")
+    d2d.add_argument("--quick", action="store_true", help="the quick terminal's window instead of the main one")
     session("ime-off", "switch the window's thread to the US keyboard layout")
     session("cancel-mode", "send WM_CANCELMODE to the focused terminal")
     return parser
@@ -2661,6 +2693,8 @@ def session_command(args: argparse.Namespace) -> int:
         print(instance.wait_log(args.pattern, args.timeout))
     elif args.command == "dpi":
         instance.simulate_dpi(args.dpi)
+    elif args.command == "d2d-failure":
+        print(f"caption state {instance.simulate_d2d_failure('quick' if args.quick else 'main'):#06b}")
     elif args.command == "ime-off":
         print(instance.ime_off())
     elif args.command == "cancel-mode":

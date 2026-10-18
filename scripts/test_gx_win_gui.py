@@ -10,6 +10,7 @@ import io
 import struct
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -404,6 +405,8 @@ class FakeWin32:
         self.image = "C:/g/ghostty.exe"
         self.creation = 1
         self.stack: list = []  # window_stack(), top to bottom
+        self.answers: dict = {}  # message -> what send_message returns (None: no answer)
+        self.messages: list = []
 
     def process_alive(self, pid):
         return self.alive
@@ -446,6 +449,11 @@ class FakeWin32:
 
     def work_area(self, hwnd):
         return (0, 0, 1000, 800)
+
+    def send_message(self, hwnd, message, wparam=0, lparam=0, timeout_ms=5000):
+        self.messages.append((hwnd, message, wparam, lparam))
+        answer = self.answers.get(message)
+        return answer(wparam) if callable(answer) else answer
 
     def dpi(self, hwnd):
         return 96
@@ -671,6 +679,65 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual([("unicode", 0x4E2D, False), ("unicode", 0x4E2D, True)], han)
         self.assertEqual([("key", 0x11, False), ("mouse", 0xC001, 5, 6, 0), ("mouse", 0x80, 0, 0, 2),
                           ("mouse", 0x100, 0, 0, 2), ("key", 0x11, True)], click)
+
+
+def zig_source(relative: str) -> str:
+    return (ROOT / relative).read_text(encoding="utf-8")
+
+
+class TestHookTests(unittest.TestCase):
+    PID = 4242
+    MAIN = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (0, 0, 100, 100), True, False, False)
+
+    def instance(self, fake):
+        instance = gui.Instance(self.PID, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+        patch = mock.patch.object(gui.Instance, "require_window", return_value=self.MAIN)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return instance
+
+    def test_message_numbers_follow_the_product_source(self):
+        title_bar = zig_source("src/apprt/win32/chrome/TitleBar.zig")
+        for name, value in (("WM_GHOSTTY_SIMULATE_D2D_FAILURE", gui.WM_GHOSTTY_SIMULATE_D2D_FAILURE),
+                            ("WM_GHOSTTY_CAPTION_QUERY", gui.WM_GHOSTTY_CAPTION_QUERY)):
+            with self.subTest(name=name):
+                match = re.search(rf"pub const {name}: u32 = w32\.WM_USER \+ (0x[0-9A-Fa-f]+);", title_bar)
+                self.assertIsNotNone(match)
+                self.assertEqual(gui.WM_USER + int(match.group(1), 16), value)
+        self.assertIn("(@as(isize, @intFromBool(self.direct2d_failed)) << 3)", title_bar)
+
+    def test_simulated_d2d_failure_is_confirmed_by_the_caption_state(self):
+        fake = FakeWin32(self.PID, self.PID)
+        fake.answers = {gui.WM_GHOSTTY_SIMULATE_D2D_FAILURE: 1, gui.WM_GHOSTTY_CAPTION_QUERY: 0b1001}
+        with mock.patch.object(gui, "win32", return_value=fake):
+            self.assertEqual(0b1001, self.instance(fake).simulate_d2d_failure())
+        self.assertEqual([(0x10, gui.WM_USER + 0x4C, 0, 0), (0x10, gui.WM_USER + 0x4D, 0, 0)], fake.messages)
+        self.assertEqual([], fake.sent)
+
+    def test_simulated_d2d_failure_without_an_answer_or_the_hook_fails(self):
+        cases = {"did not answer WM_GHOSTTY_SIMULATE_D2D_FAILURE": {},
+                 "returned 0, not 1: the build lacks the hook": {gui.WM_GHOSTTY_SIMULATE_D2D_FAILURE: 0},
+                 "did not answer WM_GHOSTTY_CAPTION_QUERY": {gui.WM_GHOSTTY_SIMULATE_D2D_FAILURE: 1},
+                 "does not report the Direct2D failure": {gui.WM_GHOSTTY_SIMULATE_D2D_FAILURE: 1,
+                                                          gui.WM_GHOSTTY_CAPTION_QUERY: 0b0001}}
+        for expected, answers in cases.items():
+            fake = FakeWin32(self.PID, self.PID)
+            fake.answers = answers
+            with self.subTest(expected=expected), mock.patch.object(gui, "win32", return_value=fake):
+                with self.assertRaisesRegex(gui.GuiError, expected):
+                    self.instance(fake).simulate_d2d_failure()
+
+    def test_the_step_and_its_validation(self):
+        self.assertEqual("simulate_d2d_failure", gui.validate_step("s", {"action": "simulate_d2d_failure"}).action)
+        self.assertEqual({"window": "quick"},
+                         gui.validate_step("s", {"action": "simulate_d2d_failure", "window": "quick"}).params)
+        with self.assertRaisesRegex(gui.UsageError, "does not take"):
+            gui.validate_step("s", {"action": "simulate_d2d_failure", "wparam": 1})
+        run = gui.ScenarioRun(None, Path("ghostty.exe"), Path("."))  # type: ignore[arg-type]
+        run.instance = mock.Mock(spec=gui.Instance)
+        run.instance.simulate_d2d_failure.return_value = 0b1000
+        self.assertIn("0b1000", run.do_simulate_d2d_failure({"window": "quick"}))
+        run.instance.simulate_d2d_failure.assert_called_once_with("quick")
 
 
 class ScenarioReleaseTests(unittest.TestCase):
