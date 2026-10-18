@@ -320,9 +320,81 @@ class WaitFileTests(unittest.TestCase):
 
     def test_validation(self):
         self.assertEqual("wait_file", gui.validate_step("s", {"action": "wait_file", "path": "p", "pattern": "x"}).action)
-        for raw in ({"action": "wait_file", "path": "p"}, {"action": "wait_file", "path": "p", "pattern": "("}):
+        self.assertEqual("wait_file", gui.validate_step("s", {"action": "wait_file", "path": "{log}", "pattern": "x"}).action)
+        for raw in ({"action": "wait_file", "path": "p"}, {"action": "wait_file", "path": "p", "pattern": "("},
+                    {"action": "wait_file", "path": "{logs}", "pattern": "x"}, {"action": "wait_file", "path": 7, "pattern": "x"}):
             with self.subTest(raw=raw), self.assertRaises(gui.UsageError):
                 gui.validate_step("s", raw)
+
+
+class PathPlaceholderTests(unittest.TestCase):
+    VALUES = {"env": "C:/out/W14/env", "log": "C:/out/W14/env/ghostty/logs/ghostty.log"}
+
+    def test_placeholders_literal_braces_and_environment_variables(self):
+        values = self.VALUES
+        self.assertEqual(values["log"], gui.expand_path("{log}", values, "w"))
+        self.assertEqual("C:/out/W14/env/shell/done.txt", gui.expand_path("{env}/shell/done.txt", values, "w"))
+        self.assertEqual("C:/{GUID}/x", gui.expand_path("C:/{{GUID}}/x", values, "w"))
+        with mock.patch.dict(os.environ, {"GX_PH_DIR": "D:/data", "GX_PH_NAME": "marker.txt"}):
+            # Environment variables still expand around the placeholders, after them.
+            self.assertEqual("D:/data/marker.txt", gui.expand_path("${GX_PH_DIR}/$GX_PH_NAME", values, "w"))
+            self.assertEqual("C:/out/W14/env/marker.txt", gui.expand_path("{env}/${GX_PH_NAME}", values, "w"))
+            if os.name == "nt":  # %NAME% is the Windows syntax of os.path.expandvars
+                self.assertEqual("D:/data/marker.txt", gui.expand_path("%GX_PH_DIR%/%GX_PH_NAME%", values, "w"))
+                self.assertEqual("C:/out/W14/env/marker.txt", gui.expand_path("{env}/%GX_PH_NAME%", values, "w"))
+            # Values and literal braces are inserted verbatim: a $ or % inside them is never expanded again.
+            odd = {"env": "C:/50%GX_PH_NAME%/$GX_PH_DIR", "log": "L"}
+            self.assertEqual("C:/50%GX_PH_NAME%/$GX_PH_DIR/x", gui.expand_path("{env}/x", odd, "w"))
+            self.assertEqual("{GX_PH_DIR}", gui.expand_path("{{GX_PH_DIR}}", values, "w"))
+
+    def test_unknown_placeholders_and_unbalanced_braces_are_errors(self):
+        for template, message in (("{logs}", "unknown placeholder {logs}"), ("{}", "unknown placeholder {}"),
+                                  ("a{b", "unbalanced '{'"), ("a}b", "unbalanced '}'"), ("{{log}", "unbalanced '}'")):
+            with self.subTest(template=template), self.assertRaisesRegex(gui.UsageError, re.escape(message)):
+                gui.expand_path(template, self.VALUES, "w")
+        with self.assertRaisesRegex(gui.UsageError, "not available here"):
+            gui.expand_path("{log}", {}, "requires")
+
+    def test_wait_file_reads_the_instance_log_through_the_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "W14"
+            env = out / "env"
+            log = gui.log_path(env)
+            log.parent.mkdir(parents=True)
+            log.write_text("info(gx_perf): metric renderer.targets_live 2\n", encoding="utf-8")
+            run = gui.ScenarioRun(None, Path("ghostty.exe"), out)  # type: ignore[arg-type]
+            # Before the instance exists the placeholders name OUT/env; afterwards the instance's profile.
+            self.assertEqual({"env": str(env.resolve()), "log": str(log.resolve())}, run.path_values())
+            self.assertIn("ghostty.log", run.do_wait_file({"path": "{log}", "pattern": r"targets_live 2", "timeout": 0.2}))
+            (env / "marker.txt").write_text("done", encoding="utf-8")
+            run.instance = mock.Mock(env_dir=env)
+            self.assertIn("marker.txt", run.do_wait_file({"path": "{env}/marker.txt", "pattern": "done", "timeout": 0.2}))
+            with self.assertRaisesRegex(gui.GuiError, re.escape(str(log.resolve()))):
+                run.do_wait_file({"path": "{log}", "pattern": "never", "timeout": 0.1})
+
+    def test_scenarios_check_placeholders_when_they_load(self):
+        head = 'id = "W98"\ntitle = "t"\nconfig = ""\n'
+        capture = '[[step]]\naction = "capture"\nname = "c"\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W98-placeholders.toml"
+
+            def load(requires: str, wait_path: str):
+                path.write_text(head + requires + '[[step]]\naction = "wait_file"\npath = ' + wait_path +
+                                "\npattern = 'x'\n" + capture, encoding="utf-8")
+                return gui.load_scenario(path)
+
+            scenario = load("requires = ['file:C:/{{GUID}}/x']\n", "'{log}'")
+            self.assertEqual(["file:C:/{{GUID}}/x"], scenario.requires)
+            self.assertIn("does not exist", gui.missing_requirement(scenario.requires[0], lambda: []))
+            with self.assertRaisesRegex(gui.UsageError, re.escape("unknown placeholder {logs}")):
+                load("", "'{logs}'")
+            # requires is checked before the run, when this scenario's own profile does not exist yet.
+            with self.assertRaisesRegex(gui.UsageError, "not available here"):
+                load("requires = ['file:{log}']\n", "'{log}'")
+            with tempfile.TemporaryDirectory() as host:
+                (Path(host) / "{marker}.txt").write_text("x", encoding="utf-8")
+                with mock.patch.dict(os.environ, {"GX_PH_HOST": host}):
+                    self.assertIsNone(gui.missing_requirement("file:${GX_PH_HOST}/{{marker}}.txt", lambda: []))
 
 
 class CaptureTests(unittest.TestCase):

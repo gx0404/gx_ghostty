@@ -51,7 +51,7 @@ with an action and its keys
 ([bracketed] keys are optional; x/y/in/window address a point as described under Input safety):
   wait_window [timeout window]          activate [window]               sleep seconds
   wait_log pattern [timeout]            assert_log pattern [present]
-  wait_file path pattern [timeout]      (the whole text of the file at path matches)
+  wait_file path pattern [timeout]      (the whole text of the file at path matches; see Paths)
   wait_title pattern [timeout window]   assert_title pattern [window]
   type text [delay repeat]              key keys [repeat delay]          clipboard text
   click [x y in window button count mods]           mouse_down / mouse_up [x y in window button mods]
@@ -166,6 +166,14 @@ way is the Ghost Windows shows for a hung window or a WerFault dialog while the 
 answer WM_NULL within 2 s; quiet-batch reads it, like instance_gone, as a product failure. The same
 vocabulary has instance_self_activated, written only by gx_perf win32-idle (without input the
 instance took the foreground back or restored a minimized window), also a product failure.
+
+Paths: the path of a wait_file step may use {log}, the absolute path of this scenario instance's
+ghostty.log (ENV/ghostty/logs/ghostty.log), and {env}, its isolated profile directory ENV; write {{
+and }} for literal braces. Placeholders are replaced first and inserted verbatim; environment
+variables (%NAME%, $NAME, ${NAME}) in the rest of the path are expanded after them. An unknown
+placeholder or an unbalanced brace fails when the scenario loads, never as a literal path. The
+file: paths of `requires` take the same syntax but no placeholder: they are host prerequisites,
+checked before the run, when this scenario's own profile does not exist yet.
 
 Screenshots: `screen` (default) copies the window's visible bounds from the screen like
 CopyFromScreen and fails if another process's window covers it; `print` uses PrintWindow with
@@ -331,6 +339,47 @@ class InputBlocked(GuiError):
 # ---------------------------------------------------------------------------
 # Pure helpers (covered by scripts/test_gx_win_gui.py on any platform)
 # ---------------------------------------------------------------------------
+
+
+# wait_file paths: {log} and {env} name this scenario instance's files (see Paths in the module help).
+PATH_PLACEHOLDERS = ("env", "log")
+PATH_TOKEN_RE = re.compile(r"\$\{[^{}]*\}|\{\{|\}\}|\{[^{}]*\}|[{}]")
+
+
+def expand_path(template: str, values: Mapping[str, str], where: str) -> str:
+    """`template` with each {name} replaced by values[name] ({{ and }} are literal braces), then the
+    environment variables of the remaining text expanded (os.path.expandvars, which also reads ${NAME}).
+    Placeholder values and literal braces are inserted verbatim, never expanded again. An unknown
+    placeholder or an unbalanced brace is a UsageError, never a literal path."""
+    chunks: list[tuple[str, bool]] = []  # (text, expand environment variables)
+    position = 0
+    for match in PATH_TOKEN_RE.finditer(template):
+        chunks.append((template[position:match.start()], True))
+        position = match.end()
+        token = match.group(0)
+        if token.startswith("${"):
+            chunks.append((token, True))
+        elif token in ("{{", "}}"):
+            chunks.append((token[0], False))
+        elif token in ("{", "}"):
+            raise UsageError(f"{where}: unbalanced {token!r} in path {template!r}; write {{{{ or }}}} for a literal brace")
+        elif token[1:-1] in values:
+            chunks.append((values[token[1:-1]], False))
+        elif token[1:-1] in PATH_PLACEHOLDERS:
+            raise UsageError(f"{where}: {token} is not available here: {{env}} and {{log}} name this scenario's own "
+                             "profile, which only exists while it runs (use them in a wait_file step)")
+        else:
+            known = ", ".join("{" + name + "}" for name in sorted(values)) or "none"
+            raise UsageError(f"{where}: unknown placeholder {token} in path {template!r} (known: {known}; "
+                             "write {{ and }} for literal braces)")
+    chunks.append((template[position:], True))
+    merged: list[tuple[str, bool]] = []
+    for text, expand in chunks:
+        if merged and expand and merged[-1][1]:
+            merged[-1] = (merged[-1][0] + text, True)
+        else:
+            merged.append((text, expand))
+    return "".join(os.path.expandvars(text) if expand else text for text, expand in merged)
 
 
 def parse_chord(chord: str) -> tuple[list[int], int]:
@@ -2755,6 +2804,10 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
             re.compile(params["pattern"])
         except re.error as exc:
             raise UsageError(f"{where}: bad pattern {params['pattern']!r}: {exc}") from None
+    if action == "wait_file":
+        if not isinstance(params["path"], str):
+            raise UsageError(f"{where}: wait_file path must be a string")
+        expand_path(params["path"], dict.fromkeys(PATH_PLACEHOLDERS, ""), where)  # only the syntax
     if action == "backdrop":
         enabled = params.get("enabled", True)
         if not isinstance(enabled, bool):
@@ -2857,6 +2910,9 @@ def load_scenario(path: Path) -> Scenario:
         raise UsageError(f"{path}: a scenario must capture at least one screenshot")
     if not isinstance(data.get("wait_window", True), bool):
         raise UsageError(f"{path}: wait_window must be true or false")
+    for requirement in data.get("requires", []):
+        if isinstance(requirement, str) and requirement.startswith("file:"):
+            expand_path(requirement[5:], {}, f"{path}: requires {requirement!r}")
     env = data.get("env", {})
     if not isinstance(env, dict) or not all(ENV_NAME_RE.match(name) and isinstance(v, str) for name, v in env.items()):
         raise UsageError(f"{path}: env must map variable names to strings")
@@ -2891,7 +2947,7 @@ def missing_requirement(requirement: str, wsl_distros: Callable[[], list[str]]) 
         distro = requirement[4:]
         return None if distro in wsl_distros() else f"WSL distro {distro} is not installed"
     if requirement.startswith("file:"):
-        return None if Path(os.path.expandvars(requirement[5:])).exists() else f"{requirement[5:]} does not exist"
+        return None if Path(expand_path(requirement[5:], {}, "requires")).exists() else f"{requirement[5:]} does not exist"
     if requirement.startswith("windows-build:"):
         wanted = int(requirement.split(":", 1)[1])
         build = sys.getwindowsversion().build if sys.platform == "win32" else 0  # type: ignore[attr-defined]
@@ -2977,9 +3033,14 @@ class ScenarioRun:
             raise GuiError(f"log {'lacks' if not lines else 'has'} {p['pattern']!r}" + (f": {lines[0]}" if lines else ""))
         return lines[0] if lines else "absent"
 
+    def path_values(self) -> dict[str, str]:
+        """The wait_file placeholders: this scenario's isolated profile and its instance's ghostty.log."""
+        env = (self.instance.env_dir if self.instance is not None else self.out_dir / "env").resolve()
+        return {"env": str(env), "log": str(log_path(env))}
+
     def do_wait_file(self, p):
         """Wait until the whole text of a file (such as one a program in the terminal wrote) matches the pattern."""
-        path = Path(os.path.expandvars(p["path"]))
+        path = Path(expand_path(p["path"], self.path_values(), "wait_file"))
         regex = re.compile(p["pattern"])
         timeout = float(p.get("timeout", 5))
         deadline = time.monotonic() + timeout
