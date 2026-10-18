@@ -233,6 +233,8 @@ action = "capture"
 name = "leader-ended"
 what = "all"
 
+# cmd prints a blank line before its prompt: after cls the prompt is the second row (row height
+# 21 DIP at this font size), so the double-click lands on the word GX_W07.
 [[step]]
 action = "type"
 text = "cls\n"
@@ -244,8 +246,8 @@ seconds = 0.5
 [[step]]
 action = "click"
 in = "terminal:0"
-x = 20
-y = 10
+x = 30
+y = 49
 count = 2
 
 [[step]]
@@ -286,8 +288,8 @@ what = "all"
 [[step]]
 action = "click"
 in = "terminal:0"
-x = 20
-y = 10
+x = 30
+y = 49
 count = 2
 
 [[step]]
