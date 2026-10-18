@@ -139,7 +139,7 @@ Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --ex
 | IPC-06 | 已就绪 host 一次 GUI 创建故障；真实 secondary 请求收到非成功退出，host 无新窗口/PTY |
 | IPC-07 | CLI 通过真实认证管道重复发送同一 request key；先按 launcher PID/birth 断言日志恰有一条 `fixture_ipc_replay ... outcome=completed`（证明确实重发），再要求 host GUI toggle 与 execute 计数只增1，Quick 仍可见 |
 | UIA-02 | 外部 MTA 保留 provider，分别 hide/reopen、换子菜单、销毁窗口；旧对象实际调用必须 0x80040201，不能操作替补对象 |
-| UIA-03 | MTA 连续查询同时切兄弟 pane 焦点、真实中文 IME 组字、关 tab、开 menu、模态确认；无安装 IME 才属于环境 PENDING。组字前保存输入语言、IME open 与转换模式（转换模式只 OR 上 NATIVE 位），finally 先恢复 IME 状态再恢复输入语言，app 已退出时经夹具自有窗口恢复；未能恢复记 FAIL |
+| UIA-03 | MTA 连续查询同时切兄弟 pane 焦点、真实中文 IME 组字、关 tab、开 menu、模态确认；无安装 IME 才属于环境 PENDING。切到已加载的中文布局后等 IME 状态 0.3 s 不变再保存（首读与时间线入报告；组字只 OR 上 NATIVE 位）；finally 先打开 IME、设回转换模式并读回，最后恢复开关并等读回稳定，再恢复输入语言（app 已退出时经夹具自有窗口）。精确一致记 `exact`；保存态为关闭、开启时读回模式正确而关闭后被微软拼音清零记 `closed-mode-reset-by-ime`（保留原始读数）；开关或输入语言未恢复记 FAIL |
 | UIA-04 | 注册外部 Notification handler 完成握手后，GUI native publisher 发固定测试通知；必须实际收到正文，query/register/remove 同线程 |
 | OLE-07 | 用 `/n,/separate` 打开自建目录，Shell 确认是新增 HWND 且精确目录，UIA 找唯一自建文件后真实 Explorer drag；原生 Drop/queued 计数各增1；无论成败都在 finally 关掉所有新增且仍显示该私有目录的窗口（未归属成功时再观察 5 s 防迟到窗口），只关这些窗口，不终止 Explorer 进程 |
 | OLE-08 / OLE-09 | `--ole-source <exe>`：真实 DoDragDrop 已进入循环/目标 hover 时 reparent 或销毁目标；取消后 effect NONE、没有落到替补 pane，资源 release 配对 |
@@ -234,6 +234,30 @@ medium: receipt --root <private> --name BRK-03 --expect target_gone
 `receipt` 与 `boundary --transition target-gone` 的最终证据只写一次：同一 `--name` 重跑时
 若 `<case>-native.json`、回执截图、review 或 target-gone 文件已存在即拒绝，换新 `--name`。
 
+### VM broker 运行前提（O10 对接）
+
+BRK-01～04 只在 VM 中同一用户的 medium/high 拆分令牌下运行，宿主只做单测与语法检查。
+
+- 被测 app 必须含 A3 第二轮 `df33ee3fd`：`DropCompanion.zig` 的门控回执
+  `fixture_receipt`、`DropBridge.zig` 的拒绝注入、`Window.zig::fixtureMessage` 的
+  CONTROL 21/22。root 合入 A3 之前主线没有这三处，O7b 报的“源码里没有
+  fixture_receipt”即此原因；用 `wip/r6-a3-fixtures` 或合入后的 gx_ghostty 构建，并用
+  `python -c "import sys; print(b'fixture_receipt' in open(sys.argv[1], 'rb').read())" ghostty.exe`
+  核对二进制。
+- `gx_ole_source.exe` 在宿主按上文 build-exe 命令构建，带 SHA-256 进客机
+  （`setup --source ... --source-sha256 ...`）。
+- CPython ≥ 3.9 x64（用到 `Path.is_relative_to`；宿主实测 3.14），只用标准库与 ctypes，
+  无第三方包；medium 与 high 控制台用同一解释器。
+- 按仓库相对布局暂存（脚本以 `parents[2]` 定位仓库根并把 `scripts/` 加入 `sys.path`）：
+  `test/windows/` 的 `gx_drop_broker_fixture.py`、`gx_ole_fixture.py`、`gx_fixture_evidence.py`、
+  `gx_boundary_controller.py`、`gx_input_language.py`、`gx_session_ipc_fixture.py`，
+  `scripts/` 的 `gx_win_gui.py`、`gx_slots.py`（复制全部 `test/windows/gx_*.py` 最省事）。
+  现有 `stage-validation` 只暂存 `gx_vm_validation.ps1`，需扩展暂存清单或另行复制。
+- 暂存目录须可写：不带 `--desktop-held` 时在 `<仓库根>/.local/kernel-slots` 建槽锁，VM 内
+  没有其他工位时可加 `--desktop-held`。`--root` 用 medium 与 high 都可写的本地目录。
+- `GHOSTTY_GX_REMOTE_TEST=1` 由夹具给 target 与 companion 设置，控制台无需预设；回执只认
+  与当前 companion PID/birth 相符的 `fixture_receipt` 行。每次运行用新的 `--name`。
+
 ### 宿主副作用说明
 
 - controller 的 stage 配置把分屏焦点绑定为 Ctrl+Alt+Shift+J/K（不用 Ctrl+Alt+L/H），启动前用与
@@ -243,7 +267,10 @@ medium: receipt --root <private> --name BRK-03 --expect target_gone
 
 - UIA-03 与 MIG-08 / MIG-08-local 会切换自有 GUI 线程的输入语言（默认“所有应用同一
   输入法”时对其他应用可见），结束时恢复；恢复结果写入 report 的 `input_language`，
-  失败即 FAIL，需人工恢复。切到美式键盘沿用 `gx_win_gui ime_off`，若该布局原本未加载，
-  `LoadKeyboardLayoutW` 会让它在本次登录会话的输入法列表中出现到注销为止。
+  失败即 FAIL，需人工恢复。只切到 `GetKeyboardLayoutList` 已列出的布局
+  （`gx_input_language.switch_to_us`，与 A2 第 6 轮 `gx_win_gui` 的 layout/ime_off 语义一致），
+  宿主绝不加载布局：缺美式布局时 controller 记环境不可用、远程夹具记 BLOCKED。
+  `--allow-load-layouts`（controller 与 `gx_remote_fixture.py`）只在 VM 使用，夹具自己加载的
+  布局在恢复原布局后卸载，结果记入 report 的 `input_language`。
 - OLE-07 经用户真实 Explorer 打开夹具私有目录，可能在当前用户的 Explorer 中留下文件夹
   视图或最近访问等持久痕迹，宿主上无法避免；需要零痕迹时只在 VM 运行。
