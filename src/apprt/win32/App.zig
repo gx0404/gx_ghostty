@@ -1396,7 +1396,8 @@ pub fn performIpc(
     if (fixtureFlag("GHOSTTY_GX_REMOTE_TEST_REPLAY")) {
         const duplicate = try attempt.send(request);
         if (duplicate != outcome) return error.FixtureReplayMismatch;
-        log.info("fixture_ipc_replay outcome={s}", .{@tagName(outcome)});
+        // PID/birth attribute the replay to this exact launcher process.
+        log.info("fixture_ipc_replay pid={d} birth={d} outcome={s}", .{ local.identity.process.pid, local.identity.process.birth, @tagName(outcome) });
     }
     return switch (outcome) {
         .completed => true,
