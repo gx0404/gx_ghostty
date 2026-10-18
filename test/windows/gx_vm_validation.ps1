@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')]
+                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi','py-fixture')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -24,6 +24,9 @@ param(
     [ValidateSet('Value','Subkey','Both')][string]$ForeignKind = 'Both',
     [string]$Installer,
     [string]$InstallerSha256,
+    # install: the package is an older release (upgrade source) that predates part of the current
+    # integration baseline; missing groups are recorded as OBSERVED instead of failing the phase.
+    [switch]$OldPackage,
     [string]$AppSha256,
     [string]$AppRoot,
     [switch]$Rehearsal,
@@ -61,7 +64,8 @@ param(
     # apostrophe into the installed exe path (fixed names; CJK cannot be typed over HMP).
     [ValidateSet('none','space','cjk')][string]$PathPreset = 'none',
     # jumplist-matrix config: profile set written to the real user configuration.
-    [ValidateSet('base','deleted','lang-zh','lang-en')][string]$JumpListSet = 'base',
+    # p6-legacy: base with the original p6 input "<dir>\" (A/B for D-18; CRT reads it as <dir>").
+    [ValidateSet('base','deleted','lang-zh','lang-en','p6-legacy')][string]$JumpListSet = 'base',
     # jumplist-matrix config: back up and replace a configuration this fixture did not write.
     [switch]$AdoptUserConfig,
     # jumplist-matrix observe: profile key (p1-p6) whose launch is expected, or none.
@@ -69,7 +73,22 @@ param(
     # cross-account peer: also try to open each visible Ghostty pipe as a client (then close it).
     [switch]$ProbePipes,
     # dpi set: the custom scaling (LogPixels) for this user; effective after signing in again.
-    [ValidateSet('96','120','144','168','192')][string]$Dpi = '96'
+    [ValidateSet('96','120','144','168','192')][string]$Dpi = '96',
+    # py-fixture: a staged Python fixture (stage-validation --guest-python) and its argument line.
+    # Placeholders {run} {app} {app_sha256} {ole} {ole_sha256} expand to this run's values.
+    [ValidateSet('gx_drop_broker_fixture')][string]$PyFixture = 'gx_drop_broker_fixture',
+    [ValidateLength(0,2048)][string]$PyArgs = '',
+    [ValidateRange(10,1800)][int]$PyTimeoutSeconds = 300,
+    # py-fixture -Action respond-when-shown: the fixture root below the run, the case, and
+    # "decision,stage,delay_ms[,dx,dy]" entries separated by ';' (see Invoke-PyRespondWhenShown).
+    [ValidatePattern('^([A-Za-z0-9_-]{1,40})?$')][string]$PyRoot = '',
+    [ValidatePattern('^([A-Za-z0-9_-]{1,40})?$')][string]$PyCase = '',
+    [ValidatePattern('^((allow|cancel),(broker-preview|protected-paste),\d{1,5}(,-?\d{1,4},-?\d{1,4})?(;|$)){0,4}$')][string]$PyResponses = '',
+    [ValidateRange(5,300)][int]$PyWaitSeconds = 120,
+    # Waits before the phase samples anything. Started minimized and non-activating
+    # (cmd /c start "" /min cmd /c ...\gx-q.cmd <name>), a status step then records the
+    # foreground the operator left instead of the console that ran it.
+    [ValidateRange(0,120)][int]$DelaySeconds = 0
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -481,8 +500,162 @@ function Test-Elevated {
     return ([Security.Principal.WindowsPrincipal]::new($current)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Every JSON file goes through GxVmJson.Plain first: a bounded copy made of ordered dictionaries,
+# arrays and scalars. Windows PowerShell 5.1's ConvertTo-Json otherwise walks live .NET objects to
+# -Depth: the PSPath/PSDrive/PSProvider notes Get-Content attaches to every line made the r6-x
+# cross-account peer report run for 19 minutes and then fail (InvalidCastFromAnyTypeToString), so
+# no report was written. Extended PowerShell members are dropped, other objects are written as
+# text, and each such conversion is listed in json_notes. Write-Json never throws for content: a
+# value that still cannot be serialized is written as json_error plus its text and is also listed
+# in the phase report (json_errors).
+$script:JsonErrors = New-Object System.Collections.Generic.List[string]
+$script:JsonSource = @'
+using System;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Management.Automation;
+public sealed class GxVmJsonResult {
+    public object Value;
+    public int Nodes;
+    public ArrayList Notes = new ArrayList();
+}
+public static class GxVmJson {
+    public static GxVmJsonResult Plain(object value, int maxDepth, int maxNodes) {
+        GxVmJsonResult state = new GxVmJsonResult();
+        state.Value = Convert(value, 0, "$", maxDepth, maxNodes, state);
+        return state;
+    }
+    static void Note(GxVmJsonResult state, string path, string text) {
+        if (state.Notes.Count < 64) state.Notes.Add(path + ": " + text);
+        else if (state.Notes.Count == 64) state.Notes.Add("(further notes omitted)");
+    }
+    static string TypeName(object value) {
+        try { return value.GetType().FullName; } catch { return "object"; }
+    }
+    static string Text(object value, string path, GxVmJsonResult state) {
+        try { string text = value.ToString(); return text == null ? "" : text; }
+        catch (Exception error) {
+            Note(state, path, "ToString of " + TypeName(value) + " failed: " + error.Message);
+            return "<" + TypeName(value) + ">";
+        }
+    }
+    static bool IsScalar(object value) {
+        if (value is string || value is char || value is bool || value is DateTime || value is DateTimeOffset ||
+            value is Guid || value is Uri || value is decimal || value is double || value is float) return true;
+        Type type = value.GetType();
+        return type.IsPrimitive || type.IsEnum;
+    }
+    static object Convert(object value, int depth, string path, int maxDepth, int maxNodes, GxVmJsonResult state) {
+        if (value == null || value is DBNull) return null;
+        PSObject wrapped = value as PSObject;
+        bool custom = false;
+        if (wrapped != null) {
+            custom = wrapped.BaseObject is PSCustomObject;
+            if (!custom) {
+                // Extended members (such as Get-Content's PSPath/PSDrive notes) are dropped.
+                value = wrapped.BaseObject;
+                if (value == null || value is DBNull) return null;
+            }
+        }
+        if (!custom && IsScalar(value)) return value;
+        state.Nodes++;
+        if (state.Nodes > maxNodes) {
+            if (state.Nodes == maxNodes + 1) Note(state, path, "more than " + maxNodes + " values; the rest is omitted");
+            return null;
+        }
+        if (depth >= maxDepth) {
+            Note(state, path, "nested deeper than " + maxDepth + " levels; written as text");
+            return Text(value, path, state);
+        }
+        if (custom) {
+            OrderedDictionary record = new OrderedDictionary();
+            foreach (PSPropertyInfo property in wrapped.Properties) {
+                object item = null;
+                try { item = property.Value; }
+                catch (Exception error) { Note(state, path + "." + property.Name, "reading the property failed: " + error.Message); }
+                record[property.Name] = Convert(item, depth + 1, path + "." + property.Name, maxDepth, maxNodes, state);
+            }
+            return record;
+        }
+        IDictionary dictionary = value as IDictionary;
+        if (dictionary != null) {
+            OrderedDictionary map = new OrderedDictionary();
+            try {
+                foreach (DictionaryEntry entry in dictionary) {
+                    string key = entry.Key == null ? "" : (entry.Key as string ?? Text(entry.Key, path, state));
+                    if (map.Contains(key)) { Note(state, path, "duplicate key '" + key + "' omitted"); continue; }
+                    map[key] = Convert(entry.Value, depth + 1, path + "." + key, maxDepth, maxNodes, state);
+                }
+            } catch (Exception error) { Note(state, path, "enumerating the dictionary failed: " + error.Message); }
+            return map;
+        }
+        IEnumerable sequence = value as IEnumerable;
+        if (sequence != null) {
+            ArrayList list = new ArrayList();
+            try {
+                foreach (object item in sequence) list.Add(Convert(item, depth + 1, path + "[" + list.Count + "]", maxDepth, maxNodes, state));
+            } catch (Exception error) { Note(state, path, "enumerating the sequence failed: " + error.Message); }
+            return list.ToArray();
+        }
+        Note(state, path, TypeName(value) + " written as text");
+        return Text(value, path, state);
+    }
+}
+'@
+
+function ConvertTo-JsonText([string]$Text) {
+    # A JSON string literal built without ConvertTo-Json (for the fallback paths).
+    if ($null -eq $Text) { return 'null' }
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($char in $Text.ToCharArray()) {
+        $code = [int]$char
+        if ($code -eq 34) { [void]$builder.Append('\"') }
+        elseif ($code -eq 92) { [void]$builder.Append('\\') }
+        elseif ($code -lt 32) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$builder.Append($char) }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-SafeText($Value) {
+    try { $text = [string]$Value } catch { $text = '<unprintable value>' }
+    if ($null -eq $text) { $text = '' }
+    if ($text.Length -gt 65536) { $text = $text.Substring(0, 65536) + '...<truncated>' }
+    return $text
+}
+
+function ConvertTo-GxJson($Value, [switch]$Compress) {
+    if (-not ('GxVmJson' -as [type])) { Add-Type -TypeDefinition $script:JsonSource -Language CSharp }
+    $plain = [GxVmJson]::Plain($Value, 20, 100000)
+    $data = $plain.Value
+    if ($plain.Notes.Count -gt 0 -and $data -is [System.Collections.IDictionary]) { $data['json_notes'] = $plain.Notes.ToArray() }
+    return (ConvertTo-Json -InputObject $data -Depth 24 -Compress:$Compress)
+}
+
 function Write-Json([string]$Path, $Value) {
-    [IO.File]::WriteAllText($Path, (($Value | ConvertTo-Json -Depth 20) + $script:LF), [Text.UTF8Encoding]::new($false))
+    try { $text = ConvertTo-GxJson $Value }
+    catch {
+        $message = $_.Exception.Message
+        $script:JsonErrors.Add([IO.Path]::GetFileName($Path) + ': ' + $message)
+        $text = '{' + $script:LF + '    "json_error":  ' + (ConvertTo-JsonText $message) + ',' + $script:LF +
+            '    "text":  ' + (ConvertTo-JsonText (Get-SafeText $Value)) + $script:LF + '}'
+    }
+    [IO.File]::WriteAllText($Path, ($text + $script:LF), [Text.UTF8Encoding]::new($false))
+}
+
+function Read-TextLines([string]$Path) {
+    # UTF-8 text that a running app may still be writing (shared read), as plain strings:
+    # Get-Content decodes BOM-less UTF-8 as ANSI in Windows PowerShell 5.1 and attaches notes.
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try {
+        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false), $true)
+        try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+    $lines = [string[]]($text -split "`r?`n")
+    if ($lines.Count -gt 0 -and $lines[-1].Length -eq 0) { $lines = [string[]]($lines | Select-Object -First ($lines.Count - 1)) }
+    return $lines
 }
 
 function Assert-Hash([string]$Path, [string]$Expected) {
@@ -778,7 +951,11 @@ function Compare-SplitTokens($Medium, $High) {
     if ($Medium.session_id -ne $High.session_id) { $failures.Add('different Windows session') }
     if ($Medium.integrity -ne 'medium' -or $Medium.elevated -or $Medium.elevation_type -ne 'Limited') { $failures.Add('medium side is not a limited, non-elevated medium token') }
     if ($High.integrity -ne 'high' -or -not $High.elevated -or $High.elevation_type -ne 'Full') { $failures.Add('high side is not a full, elevated high token') }
-    if ($null -eq $Medium.linked -or $null -eq $High.linked) { $failures.Add('a linked token is missing') }
+    # Native facts are Hashtables; persisted JSON facts are PSCustomObjects.
+    if (-not ([pscustomobject]$Medium).PSObject.Properties['linked'] -or -not ([pscustomobject]$High).PSObject.Properties['linked'] -or
+        $null -eq $Medium.linked -or $null -eq $High.linked) { $failures.Add('a linked token is missing (legacy/Default token or incomplete record)') }
+    elseif (-not ([pscustomobject]$Medium.linked).PSObject.Properties['logon_id'] -or -not ([pscustomobject]$High.linked).PSObject.Properties['logon_id'] -or
+        -not $Medium.linked.logon_id -or -not $High.linked.logon_id) { $failures.Add('a linked token logon_id is missing') }
     elseif ($Medium.linked.logon_id -ne $High.logon_id -or $High.linked.logon_id -ne $Medium.logon_id) { $failures.Add('linked logon sessions do not point at each other') }
     if ($Medium.logon_id -eq $High.logon_id) { $failures.Add('both sides share one logon session, not a UAC split pair') }
     return @{ paired=($failures.Count -eq 0); failures=@($failures); sid=$Medium.sid; session_id=$Medium.session_id;
@@ -873,6 +1050,22 @@ function Assert-OwnedBaseline($Snapshot, [string]$Name) {
             }
         }
     }
+}
+
+function New-InstallResult($Installed, $Snapshot, [string]$AppSha, [bool]$AllowOld) {
+    # The registry snapshot is part of the evidence even when the baseline does not hold, so the
+    # comparison is recorded per group instead of throwing on the first difference.
+    $problems = New-Object System.Collections.Generic.List[object]
+    foreach ($name in $script:Keys.Keys) {
+        try { Assert-OwnedBaseline $Snapshot $name } catch { $problems.Add([ordered]@{ group=$name; problem=$_.Exception.Message }) }
+    }
+    $result = [ordered]@{ installer=$Installed; registry=$Snapshot; app_sha256=$AppSha; baseline_problems=$problems.ToArray() }
+    if ($problems.Count -gt 0) {
+        $groups = (@($problems | ForEach-Object { $_.group }) -join ', ')
+        if ($AllowOld) { $result.fixture_verdict = 'OBSERVED'; $result.fixture_reason = 'older package without the current baseline for: ' + $groups }
+        else { $result.fixture_verdict = 'FAIL'; $result.fixture_reason = 'integration baseline differs: ' + $groups }
+    }
+    return $result
 }
 
 function Foreign-Groups([bool]$BeforeInstall) {
@@ -1019,7 +1212,7 @@ function Probe-GL {
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($process.HasExited) { throw "Owned app exited $($process.ExitCode) before GL capability was established." }
             if (Test-Path -LiteralPath $log) {
-                $renderer = @(Get-Content -LiteralPath $log | Select-String 'loaded OpenGL [4-9].*vendor=.*software=' | ForEach-Object Line)
+                $renderer = @(Read-TextLines $log | Where-Object { $_ -match 'loaded OpenGL [4-9].*vendor=.*software=' })
                 if ($renderer.Count -gt 0) { break }
             }
             Start-Sleep -Milliseconds 100
@@ -1272,7 +1465,7 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi','py-fixture')
 $script:Restore = $null
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
@@ -1451,6 +1644,116 @@ function Get-ToastFacts([string]$Aumid) {
     return $facts
 }
 
+function Get-ToastSetting([string]$Aumid) {
+    try {
+        Initialize-Toast
+        return [string][Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($Aumid).Setting
+    } catch { return 'error: ' + $_.Exception.Message }
+}
+
+function Wait-ToastSetting([string]$Aumid, [string]$Want, [int]$Seconds) {
+    # The notification platform applies a registry change after a delay: poll the effective setting.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $samples = New-Object System.Collections.Generic.List[object]
+    do {
+        $setting = Get-ToastSetting $Aumid
+        $samples.Add([ordered]@{ ms=$clock.ElapsedMilliseconds; setting=$setting })
+        if ($setting -ceq $Want) { break }
+        Start-Sleep -Milliseconds 500
+    } while ($clock.Elapsed.TotalSeconds -lt $Seconds)
+    return [ordered]@{ want=$Want; reached=($setting -ceq $Want); setting=$setting; seconds=[Math]::Round($clock.Elapsed.TotalSeconds, 1);
+        samples=@($samples | Select-Object -Last 8) }
+}
+
+$script:ToastSettleSeconds = @{ explicit=10; restore=15 }
+
+function Set-ToastSwitchInSettings([string]$Aumid) {
+    # Writing the per-app key does not refresh the platform's cached setting (O10 on Win11: 30 s of
+    # DisabledForApplication with Enabled=1, also after restarting WpnUserService); the switch on
+    # Settings > System > Notifications does. Drive it through UI Automation: from On (stale) it
+    # goes Off then On. The Settings window is closed again when this step opened it.
+    $facts = [ordered]@{ aumid=$Aumid; automation_id=($Aumid + '0_ToggleSwitch'); found=$false; state_before=$null;
+        toggles=@(); settings_window_preexisting=$null; closed_window=$false; error=$null }
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+        $root = [Windows.Automation.AutomationElement]::RootElement
+        $nameCond = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::NameProperty, 'Settings')
+        $facts.settings_window_preexisting = ($null -ne $root.FindFirst([Windows.Automation.TreeScope]::Children, $nameCond))
+        Start-Process 'ms-settings:notifications'
+        $idCond = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::AutomationIdProperty, $facts.automation_id)
+        $window = $null
+        $toggle = $null
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($null -eq $toggle -and $clock.Elapsed.TotalSeconds -lt 20) {
+            Start-Sleep -Milliseconds 500
+            $window = $root.FindFirst([Windows.Automation.TreeScope]::Children, $nameCond)
+            if ($null -ne $window) { $toggle = $window.FindFirst([Windows.Automation.TreeScope]::Descendants, $idCond) }
+        }
+        if ($null -eq $toggle) { $facts.error = 'the app switch was not found on the Notifications page'; return $facts }
+        $facts.found = $true
+        $pattern = $toggle.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+        $facts.state_before = [string]$pattern.Current.ToggleState
+        $toggles = New-Object System.Collections.Generic.List[object]
+        foreach ($attempt in 1..3) {
+            $pattern.Toggle()
+            Start-Sleep -Milliseconds 1500
+            $state = [string]$pattern.Current.ToggleState
+            $setting = Get-ToastSetting $Aumid
+            $toggles.Add([ordered]@{ attempt=$attempt; state=$state; setting=$setting })
+            if ($state -ceq 'On' -and $setting -ceq 'Enabled') { break }
+        }
+        # PS 5.1 rejects $dict.key = @($genericList) ('Argument types do not match').
+        $facts['toggles'] = $toggles.ToArray()
+        if (-not $facts.settings_window_preexisting -and $null -ne $window) {
+            try { $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close(); $facts.closed_window = $true }
+            catch { $facts.error = 'closing Settings: ' + $_.Exception.Message }
+        }
+    } catch { $facts.error = $_.Exception.Message + ' (line ' + $_.InvocationInfo.ScriptLineNumber + ')' }
+    return $facts
+}
+
+function Restore-ToastSettings {
+    # Restoring the backed-up key alone did not re-enable notifications in r6a: with Enabled
+    # removed the platform kept DisabledForApplication until the Settings switch was toggled.
+    # First write the backed-up Enabled state explicitly (1 unless the backup had 0) and wait until
+    # the platform reports it; when it does not, toggle the app's switch in Settings (the only
+    # path that refreshed the platform). Then restore the exact backup and check the effective
+    # setting again.
+    $record = Read-Record 'toast-notification-settings'
+    if ($null -eq $record) { return [ordered]@{ registry=(Restore-HkcuKey 'toast-notification-settings'); effective=$null; ok=$true } }
+    $enabled = 1
+    $before = $record.before
+    if ($before.exists -and $before.values.PSObject.Properties['value:Enabled'] -and [long]$before.values.'value:Enabled'.data -eq 0) { $enabled = 0 }
+    $want = if ($enabled -eq 1) { 'Enabled' } else { 'DisabledForApplication' }
+    $effectiveBefore = Get-ToastSetting $script:InstalledAumid
+    # Every attempt mutates Enabled again. Invalidate the registry-only marker
+    # before that write so Restore-HkcuKey must restore and verify the exact backup.
+    Set-RecordField $record 'restored' $false
+    Set-RecordField $record 'effective_restored' $false
+    Save-Record 'toast-notification-settings' $record | Out-Null
+    $base = Open-HkcuBase
+    try {
+        $key = $base.CreateSubKey($script:NotificationSettingsKey)
+        try { $key.SetValue('Enabled', $enabled, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+    $explicit = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.explicit
+    $switch = $null
+    $afterSwitch = $null
+    if (-not $explicit.reached -and $want -ceq 'Enabled') {
+        $switch = Set-ToastSwitchInSettings $script:InstalledAumid
+        $afterSwitch = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.restore
+    }
+    $registry = Restore-HkcuKey 'toast-notification-settings'
+    $after = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.restore
+    $record = Read-Record 'toast-notification-settings'
+    Set-RecordField $record 'effective_restored' ([bool]$after.reached)
+    Set-RecordField $record 'effective_after_restore' $after
+    Save-Record 'toast-notification-settings' $record | Out-Null
+    return [ordered]@{ registry=$registry; effective=[ordered]@{ before=$effectiveBefore; want=$want; explicit_value=$enabled;
+        after_explicit=$explicit; settings_switch=$switch; after_switch=$afterSwitch; after_restore=$after };
+        ok=($registry.restored -and $after.reached) }
+}
+
 # Diagnostic only: the shell's quiet-hours (Focus assist / Do not disturb)
 # profile from WNF. The authoritative evidence is the notification center
 # screenshot; a nonzero status means the state could not be read here.
@@ -1507,6 +1810,28 @@ function Copy-PortableApp([string]$Destination) {
     $exe = Join-Path $Destination 'ghostty.exe'
     Assert-Hash $exe $AppSha256
     return @{ exe=$exe; files=$files.Count; aumid=(Get-PortableAumid $exe) }
+}
+
+$script:ExportAlias = @{}
+
+function Add-ExportFile([string]$Path, [string]$Alias) {
+    # Exported as <prefix><step>-<alias>; files that would share a name get a numbered suffix.
+    if (-not $script:ExportExtra.Contains($Path)) { $script:ExportExtra.Add($Path) }
+    if ($Alias) { $script:ExportAlias[$Path] = ($Alias -replace '[\\/:*?"<>|\s]+', '_') }
+}
+
+function Get-ExportNames {
+    # Existing extra files and their export names: the alias or the file name, made unique
+    # (case-insensitively, as on the share) with -2, -3, ... so no export overwrites another.
+    $used = @{}
+    foreach ($extra in $script:ExportExtra) {
+        if (-not (Test-Path -LiteralPath $extra -PathType Leaf)) { continue }
+        $leaf = if ($script:ExportAlias.ContainsKey($extra)) { $script:ExportAlias[$extra] } else { [IO.Path]::GetFileName($extra) }
+        $name = $leaf
+        for ($n = 2; $used.ContainsKey($name); $n++) { $name = [IO.Path]::GetFileNameWithoutExtension($leaf) + '-' + $n + [IO.Path]::GetExtension($leaf) }
+        $used[$name] = $true
+        [pscustomobject]@{ path=$extra; name=$name }
+    }
 }
 
 function Write-ExportMarker([string]$Suffix, $Value) {
@@ -1747,7 +2072,7 @@ function Get-RunConfigSource {
 
 function Get-RendererLines([string]$Log) {
     if (-not (Test-Path -LiteralPath $Log)) { return @() }
-    return @(Get-Content -LiteralPath $Log | Select-String 'loaded OpenGL' | Select-Object -First 4 | ForEach-Object Line)
+    return @(Read-TextLines $Log | Where-Object { $_ -match 'loaded OpenGL' } | Select-Object -First 4)
 }
 
 function Invoke-RunConfig {
@@ -2380,9 +2705,12 @@ function Invoke-ToastMatrix {
                 installed=(Get-ToastFacts $script:InstalledAumid) }
         }
         'enable-app' {
-            $script:Restore = Restore-HkcuKey 'toast-notification-settings'
-            return [ordered]@{ restore=$script:Restore; installed=(Get-ToastFacts $script:InstalledAumid);
-                fixture_verdict=$(if ($script:Restore.restored) { 'PASS' } else { 'FAIL' }) }
+            $settings = Restore-ToastSettings
+            $script:Restore = $settings.registry
+            $reason = if ($settings.ok) { $null } elseif (-not $settings.registry.restored) { 'the notification settings key was not restored' }
+                else { 'the effective notifier setting stayed ' + $settings.effective.after_restore.setting + ' after the Settings switch; see effective.settings_switch' }
+            return [ordered]@{ restore=$script:Restore; effective=$settings.effective; installed=(Get-ToastFacts $script:InstalledAumid);
+                fixture_verdict=$(if ($settings.ok) { 'PASS' } else { 'FAIL' }); fixture_reason=$reason }
         }
         'status' {
             $records = @(Get-ToastRecords)
@@ -2398,9 +2726,11 @@ function Invoke-ToastMatrix {
                 Set-RecordField $record 'close' $close
                 $record.status = if ($close.closed_normally -or $close.already_exited) { 'CLOSED' } else { 'CLOSE_FAILED' }
                 Save-Record ('toast-' + $record.label) $record | Out-Null
-                if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+                # One log per label: each app's private profile writes its own ghostty.log.
+                if (Test-Path -LiteralPath $record.log) { Add-ExportFile $record.log ('toast-' + $record.label + '-ghostty.log') }
                 $close })
-            $settings = Restore-HkcuKey 'toast-notification-settings'
+            $toastSettings = Restore-ToastSettings
+            $settings = $toastSettings.registry
             $removed = @(Get-ToastRecords | Where-Object { $_.app_class -ceq 'PORTABLE_COPY' -and $_.status -ceq 'CLOSED' } | ForEach-Object {
                 $dir = Split-Path -Parent $_.exe
                 $root = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
@@ -2408,12 +2738,13 @@ function Invoke-ToastMatrix {
                     Remove-Item -LiteralPath $dir -Recurse -Force
                     $dir
                 } })
-            $script:Restore = [ordered]@{ notification_settings=$settings; removed_portable_copies=$removed }
+            $script:Restore = [ordered]@{ notification_settings=$settings; notification_effective=$toastSettings.effective; removed_portable_copies=$removed }
             $bad = @($closes | Where-Object { -not $_.closed_normally -and -not $_.already_exited })
-            $verdict = if ($bad.Count -gt 0 -or -not $settings.restored) { 'FAIL' } else { 'PASS' }
+            $verdict = if ($bad.Count -gt 0 -or -not $toastSettings.ok) { 'FAIL' } else { 'PASS' }
             return [ordered]@{ closes=$closes; restore=$script:Restore; toast=(Get-ToastFacts $script:InstalledAumid);
                 probe_results=@(Get-ToastProbeResults); fixture_verdict=$verdict;
-                fixture_reason=$(if ($bad.Count -gt 0) { 'an owned app did not close normally' } elseif (-not $settings.restored) { 'notification settings were not restored' } else { $null }) }
+                fixture_reason=$(if ($bad.Count -gt 0) { 'an owned app did not close normally' } elseif (-not $settings.restored) { 'notification settings were not restored' }
+                    elseif (-not $toastSettings.ok) { 'the effective notifier setting was not restored' } else { $null }) }
         }
     }
 }
@@ -2486,19 +2817,34 @@ function Restore-UserConfig {
 
 function Get-JumpListMarkDir { return Join-Path $script:RunRoot ('jl mark ' + (-join @([char]0x4E2D, [char]0x6587)) + " 'q'") }
 
-function Get-JumpListProfiles([string]$MarkDir) {
-    $mark = Join-Path $MarkDir 'gx-jl-mark.cmd'
+function Get-JumpListProfiles([string]$MarkDir, [switch]$LegacyP6) {
+    # p6: an argument that ends in a backslash. In Windows (CRT) command-line syntax a backslash
+    # before the closing quote is written doubled ("<dir>\\"); the earlier "<dir>\" made \" an
+    # escaped quote, so the configuration itself asked for <dir>" (A7, F3\A7\report.md section 3).
+    # The child is a .NET process that records the command line it received and its parsed argv.
+    # -LegacyP6 keeps the original input for the A/B run (JumpList versus the in-app menu).
+    $argvScript = Join-Path $MarkDir 'gx-jl-argv.ps1'
+    $p6Tail = if ($LegacyP6) { '\"' } else { '\\"' }
     return @(
         [ordered]@{ key='p1'; name='GX JL Plain'; command='cmd.exe /d /k title GX_JL_P1' },
         [ordered]@{ key='p2'; name='GX JL Space Name'; command='cmd.exe /d /k title GX_JL_P2' },
         [ordered]@{ key='p3'; name=('GX JL ' + (-join @([char]0x4E2D, [char]0x6587))); command='cmd.exe /d /k title GX_JL_P3' },
         [ordered]@{ key='p4'; name='GX JL "Quote"'; command='cmd.exe /d /k title GX_JL_P4' },
         [ordered]@{ key='p5'; name='GX JL Trail\'; command='cmd.exe /d /k title GX_JL_P5' },
-        [ordered]@{ key='p6'; name='GX JL Path'; command=('cmd.exe /d /k call "' + $mark + '" "' + $MarkDir + '\"') })
+        [ordered]@{ key='p6'; name='GX JL Path'; command=('powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -File "' + $argvScript + '" "' + $MarkDir + $p6Tail) })
+}
+
+function Get-JumpListArgvScript {
+    return (@('# GX JumpList p6 argv marker (gx_vm_validation.ps1): the command line this process received.',
+        '$Host.UI.RawUI.WindowTitle = ''GX_JL_P6''',
+        '$record = [ordered]@{ pid=$PID; utc=[DateTime]::UtcNow.ToString(''o''); command_line=[Environment]::CommandLine;',
+        '    argv=@([Environment]::GetCommandLineArgs() | ForEach-Object { [string]$_ }); script_args=@($args | ForEach-Object { [string]$_ }) }',
+        '[IO.File]::WriteAllText((Join-Path $PSScriptRoot (''gx-jl-argv-'' + $PID + ''.json'')), ($record | ConvertTo-Json -Depth 3), (New-Object Text.UTF8Encoding $false))',
+        'Write-Host (''GX_JL_ARGV recorded '' + @($args).Count + '' argument(s)'')') -join "`r`n") + "`r`n"
 }
 
 function New-JumpListConfig([string]$Set, [string]$MarkDir) {
-    $profiles = @(Get-JumpListProfiles $MarkDir)
+    $profiles = @(Get-JumpListProfiles $MarkDir -LegacyP6:($Set -ceq 'p6-legacy'))
     if ($Set -ceq 'deleted') { $profiles = @($profiles | Where-Object { $_.key -cne 'p2' }) }
     $language = if ($Set -ceq 'lang-zh') { 'zh-CN' } else { 'en' }
     $lines = @((Get-FixtureConfigMarker), ('language = ' + $language), 'confirm-close-surface = false', 'gx-session-restore = false') +
@@ -2564,7 +2910,8 @@ function Get-JumpListLogLines {
     $lines = @()
     foreach ($name in @('ghostty.log.1', 'ghostty.log')) {
         $path = Join-Path $env:LOCALAPPDATA ('ghostty\logs\' + $name)
-        if (Test-Path -LiteralPath $path) { $lines += @(Get-Content -LiteralPath $path | Select-String -SimpleMatch 'JumpList' | ForEach-Object Line) }
+        # UTF-8 (profile names such as the lang-zh set's are not ASCII).
+        if (Test-Path -LiteralPath $path) { $lines += @(Read-TextLines $path | Where-Object { $_.IndexOf('JumpList', [StringComparison]::OrdinalIgnoreCase) -ge 0 }) }
     }
     return @($lines | Select-Object -Last 40)
 }
@@ -2611,6 +2958,16 @@ function Set-JumpListCommitDenied {
     return @($entries | ForEach-Object { [ordered]@{ path=$_.path; sddl_before=$_.sddl; sddl_now=(Get-Acl -LiteralPath $_.path).Sddl } })
 }
 
+function Get-NormalizedSddl([string]$Sddl) {
+    # Set-Acl writes a descriptor back with SE_DACL_AUTO_INHERITED, shown as "AI" ("D:AI(...)")
+    # although the entries are the same; r6-jl compared the strings and failed. Compare without
+    # the automatic-inheritance control flags: owner, group, protection and every ACE still count.
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+    $mask = [Security.AccessControl.ControlFlags]'DiscretionaryAclAutoInherited, SystemAclAutoInherited, DiscretionaryAclAutoInheritRequired, SystemAclAutoInheritRequired'
+    $raw.SetFlags([Security.AccessControl.ControlFlags]([int]$raw.ControlFlags -band (-bnot [int]$mask)))
+    return $raw.GetSddlForm([Security.AccessControl.AccessControlSections]::All)
+}
+
 function Restore-JumpListAcl {
     $record = Read-Record 'jumplist-acl'
     if ($null -eq $record) { return [ordered]@{ restored=$true; note='commits were never denied' } }
@@ -2622,7 +2979,10 @@ function Restore-JumpListAcl {
             $acl = Get-Acl -LiteralPath $entry.path
             $acl.SetSecurityDescriptorSddlForm($entry.sddl)
             Set-Acl -LiteralPath $entry.path -AclObject $acl
-            $item.ok = (Get-Acl -LiteralPath $entry.path).Sddl -ceq $entry.sddl
+            $item.sddl_now = (Get-Acl -LiteralPath $entry.path).Sddl
+            $item.identical = $item.sddl_now -ceq $entry.sddl
+            $item.normalized = Get-NormalizedSddl $entry.sddl
+            $item.ok = (Get-NormalizedSddl $item.sddl_now) -ceq $item.normalized
         }
         $item })
     $ok = @($items | Where-Object { -not $_.ok }).Count -eq 0
@@ -2662,9 +3022,7 @@ function Invoke-JumpListMatrix {
             $markDir = Get-JumpListMarkDir
             Assert-NoReparse $markDir
             [IO.Directory]::CreateDirectory($markDir) | Out-Null
-            $markScript = (@('@echo off', 'title GX_JL_P6', 'set "GXARG=%~1"',
-                '>>"%~dp0gx-jl-marker.txt" echo GX_JL_PATH_OK tail=[%GXARG:~-1%] at %DATE% %TIME%') -join "`r`n") + "`r`n"
-            [IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-mark.cmd'), $markScript, [Text.Encoding]::ASCII)
+            [IO.File]::WriteAllText((Join-Path $markDir 'gx-jl-argv.ps1'), (Get-JumpListArgvScript), [Text.Encoding]::ASCII)
             $config = New-JumpListConfig $JumpListSet $markDir
             $path = (Get-UserConfigFiles)[0]
             if ((Test-Path -LiteralPath $path) -and -not (Test-FixtureOwnedFile $path)) { throw "Refusing to overwrite ${path}: it is not this fixture's file." }
@@ -2721,17 +3079,41 @@ function Invoke-JumpListMatrix {
                 [ordered]@{ pid=$app.pid; parent=$app.parent; created=$app.created; command_line=$app.command_line;
                     windows=@([GxVmWindows]::TopLevel($app.pid) | Where-Object { $_['class'] -ceq 'GhosttyWindow' } | ForEach-Object { [ordered]@{ hwnd=$_['hwnd']; title=$_['title']; visible=$_['visible'] } }) }
             })
-            $markerFile = Join-Path (Get-JumpListMarkDir) 'gx-jl-marker.txt'
-            $markers = if (Test-Path -LiteralPath $markerFile) { @([IO.File]::ReadAllLines($markerFile, [Text.Encoding]::Default)) } else { @() }
-            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; markers=$markers; jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
+            $markDir = Get-JumpListMarkDir
+            $markers = @(Get-ChildItem -LiteralPath $markDir -Filter 'gx-jl-argv-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc |
+                ForEach-Object { $script:ExportExtra.Add($_.FullName); Read-JsonFile $_.FullName })
+            # p6 expectation: the configured argument read with the CRT rules (CommandLineToArgvW),
+            # which must also be the fixture's intent: <dir>\ (base) or <dir>" (p6-legacy A/B).
+            if (-not ('GxVmToken' -as [type])) { Add-Type -TypeDefinition $script:TokenSource -Language CSharp }
+            $configRecord = Read-Record 'jumplist-user-config'
+            $set = if ($configRecord -and $configRecord.PSObject.Properties['set']) { [string]$configRecord.set } else { 'base' }
+            $expectedArgument = if ($set -ceq 'p6-legacy') { $markDir + '"' } else { $markDir + '\' }
+            $configuredP6 = @(if ($configRecord -and $configRecord.PSObject.Properties['profiles']) { @($configRecord.profiles) | Where-Object { $_.key -ceq 'p6' } })
+            $configuredArgv = if ($configuredP6.Count -eq 1) { @([GxVmToken]::Arguments([string]$configuredP6[0].command)) } else { @() }
+            $result = [ordered]@{ expect=$ExpectProfile; apps=$seen; argv_markers=$markers; jumplist_set=$set; expected_last_argument=$expectedArgument;
+                configured_p6_crt_last=$(if ($configuredArgv.Count -gt 0) { $configuredArgv[-1] } else { $null });
+                jump_lists=(Get-JumpListFiles); log=@(Get-JumpListLogLines) }
             if (-not $ExpectProfile -or $ExpectProfile -ceq 'none') { $result.fixture_verdict = 'OBSERVED'; return $result }
             $want = 'GX_JL_' + $ExpectProfile.ToUpperInvariant()
             $titled = @($seen | ForEach-Object { $_.windows } | Where-Object { $_.title -and $_.title.Contains($want) })
-            $markerOk = ($ExpectProfile -cne 'p6') -or (@($markers | Where-Object { $_ -match '^GX_JL_PATH_OK tail=\[\\\]' }).Count -gt 0)
+            # p6: compare whole values, never just the last character. The newest marker's only
+            # script argument, the last entry of the .NET argv and the last entry of its raw command
+            # line decoded with CommandLineToArgvW must all equal the expected argument exactly.
+            $latest = if ($markers.Count -gt 0) { $markers[-1] } else { $null }
+            $crtArgv = if ($null -ne $latest) { @([GxVmToken]::Arguments([string]$latest.command_line)) } else { @() }
+            if ($null -ne $latest) {
+                $result.p6_received = [ordered]@{ pid=$latest.pid; command_line=[string]$latest.command_line; crt_argv=$crtArgv;
+                    dotnet_argv=@($latest.argv); script_args=@($latest.script_args); expected=$expectedArgument;
+                    expected_length=$expectedArgument.Length }
+            }
+            $markerOk = ($ExpectProfile -cne 'p6') -or ($null -ne $latest -and @($latest.script_args).Count -eq 1 -and
+                [string]@($latest.script_args)[0] -ceq $expectedArgument -and [string]@($latest.argv)[-1] -ceq $expectedArgument -and
+                $crtArgv.Count -gt 0 -and [string]$crtArgv[-1] -ceq $expectedArgument -and
+                [string]$result.configured_p6_crt_last -ceq $expectedArgument)
             $result.window_with_title = $titled
             $result.marker_ok = $markerOk
             $result.fixture_verdict = if ($titled.Count -gt 0 -and $markerOk) { 'PASS' } else { 'FAIL' }
-            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 marker missing or trailing backslash lost' } else { $null }
+            $result.fixture_reason = if ($titled.Count -eq 0) { "no Ghostty window titled $want" } elseif (-not $markerOk) { 'p6 argv marker missing, or the received argument (script args, .NET argv, CRT-decoded command line) is not exactly ' + $expectedArgument } else { $null }
             return $result
         }
         'deny-commit' { return [ordered]@{ denied=@(Set-JumpListCommitDenied); next='change the profile set (config), reload the app, then snapshot' } }
@@ -2953,6 +3335,13 @@ function Get-ForeignWindowCount([int]$ProcessId) {
     return @([GxVmWindows]::TopLevel($ProcessId) | Where-Object { $_['class'] -ceq 'GhosttyWindow' }).Count
 }
 
+function Add-ProbeError($Result, [string]$Probe, $ErrorRecord) {
+    # A probe that throws is recorded here and turns the verdict to FAIL; the others still run.
+    if (-not $Result.Contains('probe_errors')) { $Result['probe_errors'] = New-Object System.Collections.ArrayList }
+    [void]$Result['probe_errors'].Add([ordered]@{ probe=$Probe; error=$ErrorRecord.Exception.Message;
+        type=$ErrorRecord.Exception.GetType().FullName; position=$ErrorRecord.InvocationInfo.PositionMessage })
+}
+
 function Invoke-CrossPeer($Root) {
     if ($env:USERNAME -ine 'gxtest' -or (Test-Elevated)) { throw 'The peer step runs as the standard user gxtest (runas), not elevated.' }
     $owner = Read-JsonFile (Join-Path $Root 'owner.json')
@@ -2961,70 +3350,83 @@ function Invoke-CrossPeer($Root) {
     $exe = Join-Path $Root 'app\ghostty.exe'
     Assert-Hash $exe $AppSha256
     $configHome = Join-Path $Root 'config'
-    $result = [ordered]@{ host=$hostInfo; self=(Get-TokenFacts $PID); host_windows_before=(Get-ForeignWindowCount ([int]$hostInfo.pid)); pipes=@(Get-GhosttyPipes) }
+    # Each probe records its own exception in probe_errors instead of ending the step, so the
+    # report always carries what the other probes observed.
+    $result = [ordered]@{ host=$hostInfo }
+    try { $result.self = Get-TokenFacts $PID } catch { Add-ProbeError $result 'self' $_ }
+    try { $result.host_windows_before = Get-ForeignWindowCount ([int]$hostInfo.pid) } catch { Add-ProbeError $result 'host_windows_before' $_ }
+    $result.pipes = @(Get-GhosttyPipes)
     if ($ProbePipes) {
-        if (-not ('GxVmPipe' -as [type])) { Add-Type -TypeDefinition $script:PipeSource -Language CSharp }
-        $result.pipe_probes = @($result.pipes | Where-Object { $_ -notmatch '^error' } | ForEach-Object { [GxVmPipe]::Probe($_) })
+        try {
+            if (-not ('GxVmPipe' -as [type])) { Add-Type -TypeDefinition $script:PipeSource -Language CSharp }
+            $result.pipe_probes = @($result.pipes | Where-Object { $_ -notmatch '^error' } | ForEach-Object { [GxVmPipe]::Probe($_) })
+        } catch { Add-ProbeError $result 'pipe_probes' $_ }
     }
     # 1. Single instance: an ordinary, forwardable launch must start its own instance.
     $stateDir = Join-Path $script:RunRoot ($script:Step + '-xa-peer')
-    $process = Start-CrossApp $exe $stateDir $configHome
-    $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
-    $record.record_name = 'cross-peer'
-    Save-Record 'cross-peer' $record | Out-Null
     $launch = [ordered]@{ outcome=$null; exit_code=$null; own_window=$null }
-    try {
-        try { $launch.own_window = Wait-AppWindow $process 20; $launch.outcome = 'independent' }
-        catch {
-            $process.Refresh()
-            $launch.outcome = if ($process.HasExited) { 'exited' } else { 'no-window' }
-            if ($process.HasExited) { $launch.exit_code = $process.ExitCode }
-            $launch.error = $_.Exception.Message
-        }
-        $result.host_windows_after_launch = Get-ForeignWindowCount ([int]$hostInfo.pid)
-        if ($launch.outcome -ceq 'exited' -and $launch.exit_code -eq 0 -and $result.host_windows_after_launch -gt $result.host_windows_before) { $launch.outcome = 'forwarded-to-other-account' }
-        $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
-        if ($launch.outcome -ceq 'independent' -and $hold -gt 0) {
-            Write-ExportMarker 'cross-peer-holding' @{ pid=$process.Id; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
-            Start-Sleep -Seconds $hold
-        }
-    } finally { $process.Dispose() }
-    $record.status = 'RUNNING'
-    $close = Close-OwnedApp $record
-    $record.close = $close
-    $record.status = 'CLOSED'
-    Save-Record 'cross-peer' $record | Out-Null
     $result.launch = $launch
-    $result.close = $close
-    $result.session = Get-CrossSessionSummary (Join-Path $stateDir 'state')
+    try {
+        $process = Start-CrossApp $exe $stateDir $configHome
+        $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
+        $record.record_name = 'cross-peer'
+        Save-Record 'cross-peer' $record | Out-Null
+        try {
+            try { $launch.own_window = Wait-AppWindow $process 20; $launch.outcome = 'independent' }
+            catch {
+                $process.Refresh()
+                $launch.outcome = if ($process.HasExited) { 'exited' } else { 'no-window' }
+                if ($process.HasExited) { $launch.exit_code = $process.ExitCode }
+                $launch.error = $_.Exception.Message
+            }
+            $result.host_windows_after_launch = Get-ForeignWindowCount ([int]$hostInfo.pid)
+            if ($launch.outcome -ceq 'exited' -and $launch.exit_code -eq 0 -and $result.Contains('host_windows_before') -and
+                $result.host_windows_after_launch -gt $result.host_windows_before) { $launch.outcome = 'forwarded-to-other-account' }
+            $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
+            if ($launch.outcome -ceq 'independent' -and $hold -gt 0) {
+                Write-ExportMarker 'cross-peer-holding' @{ pid=$process.Id; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
+                Start-Sleep -Seconds $hold
+            }
+        } finally { $process.Dispose() }
+        $record.status = 'RUNNING'
+        $close = Close-OwnedApp $record
+        $record.close = $close
+        $record.status = 'CLOSED'
+        Save-Record 'cross-peer' $record | Out-Null
+        $result.close = $close
+    } catch { Add-ProbeError $result 'launch' $_ }
+    try { $result.session = Get-CrossSessionSummary (Join-Path $stateDir 'state') } catch { Add-ProbeError $result 'session' $_ }
     # 2. Session files: the other account's state directory must stay unreadable.
     $result.host_state_access = try { $null = Get-ChildItem -LiteralPath $hostInfo.state_dir -ErrorAction Stop; 'readable' } catch { 'refused: ' + $_.Exception.GetType().Name }
     # 3. Broker: a gxtest receiver must not pair with gxadmin's elevated host.
     if ($hostInfo.PSObject.Properties['broker'] -and $hostInfo.broker) {
-        $companionDir = Join-Path $script:RunRoot ($script:Step + '-xa-companion')
-        $arguments = @('--gx-shell-action=drop-companion', ('--gx-drop-target-pid=' + $hostInfo.broker.pid), ('--gx-drop-target-birth=' + $hostInfo.broker.birth_filetime))
-        $companion = Start-CrossApp $exe $companionDir $configHome $arguments
-        $companionRecord = New-AppRecord $companion $exe 'CROSS_COPY' $companionDir $null $null $arguments
-        $broker = [ordered]@{ target=$hostInfo.broker; pid=$companion.Id; exited=$false; exit_code=$null; windows=@() }
         try {
-            $broker.exited = $companion.WaitForExit(20000)
-            if ($broker.exited) { $broker.exit_code = $companion.ExitCode }
-            else { $broker.windows = @([GxVmWindows]::TopLevel($companion.Id) | Where-Object { $_['visible'] } | ForEach-Object { [ordered]@{ class=$_['class']; title=$_['title'] } }) }
-        } finally { $companion.Dispose() }
-        if (-not $broker.exited) { $broker.close = Close-OwnedApp $companionRecord }
-        $broker.refused = $broker.exited -and $broker.exit_code -ne 0
-        $logPath = Join-Path $companionDir 'ghostty\logs\ghostty.log'
-        if (Test-Path -LiteralPath $logPath) { $script:ExportExtra.Add($logPath); $broker.log_tail = @(Get-Content -LiteralPath $logPath | Select-Object -Last 20) }
-        $result.broker = $broker
+            $companionDir = Join-Path $script:RunRoot ($script:Step + '-xa-companion')
+            $arguments = @('--gx-shell-action=drop-companion', ('--gx-drop-target-pid=' + $hostInfo.broker.pid), ('--gx-drop-target-birth=' + $hostInfo.broker.birth_filetime))
+            $companion = Start-CrossApp $exe $companionDir $configHome $arguments
+            $companionRecord = New-AppRecord $companion $exe 'CROSS_COPY' $companionDir $null $null $arguments
+            $broker = [ordered]@{ target=$hostInfo.broker; pid=$companion.Id; exited=$false; exit_code=$null; windows=@() }
+            $result.broker = $broker
+            try {
+                $broker.exited = $companion.WaitForExit(20000)
+                if ($broker.exited) { $broker.exit_code = $companion.ExitCode }
+                else { $broker.windows = @([GxVmWindows]::TopLevel($companion.Id) | Where-Object { $_['visible'] } | ForEach-Object { [ordered]@{ class=$_['class']; title=$_['title'] } }) }
+            } finally { $companion.Dispose() }
+            if (-not $broker.exited) { $broker.close = Close-OwnedApp $companionRecord }
+            $broker.refused = $broker.exited -and $broker.exit_code -ne 0
+            $logPath = Join-Path $companionDir 'ghostty\logs\ghostty.log'
+            if (Test-Path -LiteralPath $logPath) { $script:ExportExtra.Add($logPath); $broker.log_tail = @(Read-TextLines $logPath | Select-Object -Last 20) }
+        } catch { Add-ProbeError $result 'broker' $_ }
     }
-    $result.host_windows_after = Get-ForeignWindowCount ([int]$hostInfo.pid)
+    try { $result.host_windows_after = Get-ForeignWindowCount ([int]$hostInfo.pid) } catch { Add-ProbeError $result 'host_windows_after' $_ }
     $failures = @()
     if ($launch.outcome -cne 'independent') { $failures += 'launch outcome ' + $launch.outcome }
-    if ($result.host_windows_after -ne $result.host_windows_before) { $failures += 'the other account''s window count changed' }
-    if ($result.session.exists -and $result.session.mentions_gxadmin -gt 0) { $failures += 'session file mentions gxadmin' }
+    if ($result.Contains('host_windows_after') -and $result.Contains('host_windows_before') -and $result.host_windows_after -ne $result.host_windows_before) { $failures += 'the other account''s window count changed' }
+    if ($result.Contains('session') -and $result.session.exists -and $result.session.mentions_gxadmin -gt 0) { $failures += 'session file mentions gxadmin' }
     if ($result.host_state_access -ceq 'readable') { $failures += 'the other account''s state directory is readable' }
-    if ($result.Contains('broker') -and -not $result.broker.refused) { $failures += 'the drop companion did not refuse the other account''s host' }
-    if ($ProbePipes -and @($result.pipe_probes | Where-Object { $_['opened'] }).Count -gt 0) { $failures += 'a Ghostty pipe of the other account was opened' }
+    if ($result.Contains('broker') -and -not ($result.broker.Contains('refused') -and $result.broker.refused)) { $failures += 'the drop companion did not refuse the other account''s host' }
+    if ($ProbePipes -and $result.Contains('pipe_probes') -and @($result.pipe_probes | Where-Object { $_['opened'] }).Count -gt 0) { $failures += 'a Ghostty pipe of the other account was opened' }
+    if ($result.Contains('probe_errors')) { $failures += 'probes failed: ' + (@($result.probe_errors | ForEach-Object { $_.probe }) -join ', ') }
     $result.fixture_verdict = if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }
     $result.fixture_reason = if ($failures.Count -eq 0) { $null } else { $failures -join '; ' }
     return $result
@@ -3146,6 +3548,239 @@ function Invoke-CrossAccount {
             return [ordered]@{ restore=$script:Restore; fixture_verdict=$(if ($script:Restore.removed) { 'PASS' } else { 'FAIL' }) }
         }
     }
+}
+
+# ---- py-fixture: a staged Python fixture under a pinned embeddable Python --
+# The guest has no Python. stage-validation --guest-python stages the python.org embeddable
+# package pinned by SHA-256 in scripts/gx_windows_vm.py (GUEST_PYTHON), the fixture's .py files
+# and the OLE source, all listed with their SHA-256 in the manifest. This phase copies each out
+# of the share, checks it again, extracts the package once per (version, SHA-256) below
+# LOCALAPPDATA, points its ._pth at the fixture tree and runs the fixture with the caller's
+# token (no elevation): a Run box command for medium, Ctrl+Shift+Enter for high.
+
+function Get-PyFixtureSpec($Identity) {
+    if (-not $Identity.PSObject.Properties['python_fixture'] -or $null -eq $Identity.python_fixture) {
+        throw 'This stage carries no Python fixture; run stage-validation with --guest-python and --ole-source.'
+    }
+    return $Identity.python_fixture
+}
+
+function Install-GuestPython($Python, [string]$Share) {
+    $root = Join-Path $env:LOCALAPPDATA 'GXVMValidation\Python'
+    $dir = Join-Path $root ($Python.version + '-' + ([string]$Python.sha256).Substring(0, 12))
+    $marker = Join-Path $dir 'gx-python.json'
+    Assert-NoReparse $dir
+    if (Test-Path -LiteralPath $dir) {
+        if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or (Read-JsonFile $marker).sha256 -cne $Python.sha256) {
+            throw "A Python directory without this package's marker exists: $dir"
+        }
+        return [ordered]@{ dir=$dir; extracted=$false }
+    }
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $zip = Join-Path $root $Python.file
+    Copy-Item -LiteralPath (Join-Path $Share ('py\' + $Python.file)) -Destination $zip -Force
+    Assert-Hash $zip $Python.sha256
+    $partial = $dir + '.partial-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $partial)
+    Write-Json (Join-Path $partial 'gx-python.json') ([ordered]@{ file=$Python.file; sha256=$Python.sha256; version=$Python.version;
+        extracted_utc=[DateTime]::UtcNow.ToString('o') })
+    [IO.Directory]::Move($partial, $dir)
+    Remove-Item -LiteralPath $zip
+    return [ordered]@{ dir=$dir; extracted=$true }
+}
+
+function Install-PyFixtureTree($Spec, [string]$Share) {
+    $dir = Join-Path $env:LOCALAPPDATA ('GXVMValidation\PyFixture\' + ([string]$Spec.tree_sha256).Substring(0, 12))
+    Assert-NoReparse $dir
+    $files = @()
+    foreach ($entry in @(Get-MapEntries $Spec.files)) {
+        $relative = [string]$entry.Name
+        if ($relative -cnotmatch '^(test/windows|scripts)/[A-Za-z0-9_]+\.py$') { throw "Unexpected fixture file in the manifest: $relative" }
+        $target = Join-Path $dir $relative.Replace('/', '\')
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $Share ('py\' + $relative.Replace('/', '\'))) -Destination $target -Force
+        Assert-Hash $target ([string]$entry.Value)
+        $files += [ordered]@{ path=$relative; sha256=[string]$entry.Value }
+    }
+    $ole = $null
+    if ($Spec.PSObject.Properties['ole_source'] -and $Spec.ole_source) {
+        if ([string]$Spec.ole_source.file -cnotmatch '^[A-Za-z0-9_]+\.exe$') { throw 'Unexpected OLE source name in the manifest.' }
+        $ole = Join-Path $dir $Spec.ole_source.file
+        Copy-Item -LiteralPath (Join-Path $Share ('py\' + $Spec.ole_source.file)) -Destination $ole -Force
+        Assert-Hash $ole $Spec.ole_source.sha256
+    }
+    return [ordered]@{ dir=$dir; files=$files; ole_source=$ole }
+}
+
+function Expand-PyArgs([string]$Text, [hashtable]$Values) {
+    foreach ($match in [regex]::Matches($Text, '\{([A-Za-z0-9_]+)\}')) {
+        $key = $match.Groups[1].Value
+        if (-not $Values.ContainsKey($key) -or $null -eq $Values[$key]) { throw "Unknown or unavailable placeholder {$key} in -PyArgs." }
+    }
+    foreach ($key in @($Values.Keys)) { if ($null -ne $Values[$key]) { $Text = $Text.Replace('{' + $key + '}', [string]$Values[$key]) } }
+    return $Text
+}
+
+function Initialize-PyFixture($Identity) {
+    # Hash-checked interpreter and fixture tree, the ._pth that names the tree, and placeholder values.
+    if (-not $ExportDir) { throw 'py-fixture runs through gx-run.cmd so the staged share is known.' }
+    $share = Split-Path -Parent $ExportDir
+    $spec = Get-PyFixtureSpec $Identity
+    $python = Install-GuestPython $spec.python $share
+    $tree = Install-PyFixtureTree $spec $share
+    $pth = @(Get-ChildItem -LiteralPath $python.dir -Filter 'python*._pth' -File)
+    if ($pth.Count -ne 1) { throw 'The embeddable package has no single python*._pth file.' }
+    # The embeddable package ignores PYTHONPATH and the script directory; its ._pth names the path.
+    $stem = [IO.Path]::GetFileNameWithoutExtension($pth[0].Name)
+    $pathLines = @(($stem + '.zip'), '.', (Join-Path $tree.dir 'test\windows'), (Join-Path $tree.dir 'scripts'))
+    [IO.File]::WriteAllText($pth[0].FullName, (($pathLines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
+    $fixture = Join-Path $tree.dir ('test\windows\' + $PyFixture + '.py')
+    if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) { throw "The staged fixture has no $PyFixture.py." }
+    $app = Join-Path $script:AppDir 'ghostty.exe'
+    $values = @{ run=$script:RunRoot; app=$app; app_sha256=$null; ole=$tree.ole_source;
+        ole_sha256=$(if ($tree.ole_source) { ([string]$spec.ole_source.sha256).ToLowerInvariant() } else { $null }) }
+    if ($PyArgs -match '\{app(_sha256)?\}') { Assert-Hash $app $AppSha256; $values.app_sha256 = $AppSha256.ToLowerInvariant() }
+    return [ordered]@{ spec=$spec; python=$python; tree=$tree; fixture=$fixture; values=$values; runs=0;
+        started=[DateTime]::UtcNow; summary=[ordered]@{ fixture=$PyFixture; python=[ordered]@{ version=$spec.python.version;
+            sha256=$spec.python.sha256; dir=$python.dir; extracted=$python.extracted }; tree=$tree } }
+}
+
+function Invoke-PyFixtureProcess($Context, [string]$Arguments, [string]$Tag) {
+    # One fixture interpreter run with the caller's token; output files are exported as py-<tag>-N.
+    $Context.runs++
+    $name = $Tag + '-' + $Context.runs
+    $commandLine = '-B -X utf8 "' + $Context.fixture + '" ' + $Arguments
+    $stdout = Join-Path $script:RunRoot ($script:Step + '-py-' + $name + '.stdout.txt')
+    $stderr = Join-Path $script:RunRoot ($script:Step + '-py-' + $name + '.stderr.txt')
+    $started = [DateTime]::UtcNow
+    $process = Start-Process -FilePath (Join-Path $Context.python.dir 'python.exe') -ArgumentList $commandLine -WorkingDirectory $script:RunRoot `
+        -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $null = $process.Handle
+    $timedOut = $false
+    try {
+        if (-not $process.WaitForExit($PyTimeoutSeconds * 1000)) {
+            # Only the fixture interpreter this step started; apps it launched keep running.
+            $timedOut = $true
+            $process.Kill()
+            $null = $process.WaitForExit(5000)
+        }
+        $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
+    } finally { $process.Dispose() }
+    # @(if ...) keeps one-line and empty output arrays (an if expression unrolls them).
+    $out = @(if (Test-Path -LiteralPath $stdout) { Read-TextLines $stdout })
+    $err = @(if (Test-Path -LiteralPath $stderr) { Read-TextLines $stderr })
+    Add-ExportFile $stdout ('py-' + $name + '.stdout.txt')
+    Add-ExportFile $stderr ('py-' + $name + '.stderr.txt')
+    $run = [ordered]@{ tag=$name; command_line=$commandLine; exit_code=$exitCode; timed_out=$timedOut; started_utc=$started.ToString('o');
+        elapsed_seconds=[Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 1);
+        stdout_tail=@($out | Select-Object -Last 80); stderr_tail=@($err | Select-Object -Last 80) }
+    # The fixture prints one JSON document last; keep it parsed when it is there.
+    $first = -1
+    for ($i = 0; $i -lt $out.Count; $i++) { if ($out[$i] -ceq '{') { $first = $i } }
+    if ($first -ge 0) { try { $run.output = (($out[$first..($out.Count - 1)]) -join "`n") | ConvertFrom-Json } catch { $run.output_error = $_.Exception.Message } }
+    $run.verdict = if ($timedOut) { 'FAIL' } elseif ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 2) { 'PENDING' } else { 'FAIL' }
+    return $run
+}
+
+function Export-PyFixtureFiles($Context) {
+    # Files the fixture wrote during this step (case reports, captures, reviews), flattened by path.
+    $prefix = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
+    $written = @(Get-ChildItem -LiteralPath $script:RunRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -ge $Context.started.AddSeconds(-2) -and $_.Length -le 8MB -and $_.Name -notlike ($script:Step + '-py-*') -and
+            -not $_.FullName.StartsWith($prefix + 'records\', [StringComparison]::OrdinalIgnoreCase) } | Sort-Object FullName | Select-Object -First 200)
+    return @($written | ForEach-Object {
+        $relative = $_.FullName.Substring($prefix.Length)
+        Add-ExportFile $_.FullName ('py-' + $relative)
+        # A running app still writes its log: hash with shared read, and record a failure instead of throwing.
+        $digest = try { Get-SharedSha256 $_.FullName } catch { 'unreadable: ' + $_.Exception.Message }
+        [ordered]@{ path=$relative; size=$_.Length; sha256=$digest } })
+}
+
+function Get-SharedSha256([string]$Path) {
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try { return ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose() }
+}
+
+function Get-PyPopups([int]$TargetPid, $Answered) {
+    if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
+    # Dialogs drawn with a drop shadow use the GhosttyGxPopupShadow class (src/apprt/win32/ui/Popup.zig).
+    return @([GxVmWindows]::TopLevel($TargetPid) | Where-Object { $_['visible'] -and $_['class'] -cin @('GhosttyGxPopup', 'GhosttyGxPopupShadow', '#32770') -and
+        $Answered -notcontains [Convert]::ToInt64($_['hwnd'].Substring(2), 16) })
+}
+
+function Invoke-PyRespondWhenShown($Context) {
+    # Broker confirmations have a 30 s lifetime, too short for a person to read an inspect capture
+    # and type a response. Each -PyResponses entry "decision,stage,delay_ms[,dx,dy]" waits for a new
+    # GhosttyGxPopup(Shadow)/#32770 of the case's target process, runs the fixture's inspect (captures),
+    # then its respond on that HWND. delay_ms counts from when the popup was first seen; allow
+    # clicks at the popup's left/top plus dx/dy (negative: from right/bottom), offsets read from an
+    # earlier reviewed capture of the same dialog. The fixture's own respond guards still apply.
+    if ($PyCase -notmatch '^[A-Za-z0-9_-]{1,40}$' -or $PyRoot -notmatch '^[A-Za-z0-9_-]{1,40}$') { throw 'respond-when-shown needs -PyRoot and -PyCase.' }
+    $root = Join-Path $script:RunRoot $PyRoot
+    $reportPath = Join-Path $root ('cases\' + $PyCase + '\report.json')
+    $answered = New-Object System.Collections.Generic.List[long]
+    $steps = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $PyResponses.Split(';')) {
+        $parts = $entry.Split(',')
+        $step = [ordered]@{ decision=$parts[0]; stage=$parts[1]; delay_ms=[int]$parts[2]; offset=$(if ($parts.Count -ge 5) { @([int]$parts[3], [int]$parts[4]) } else { $null }) }
+        $steps.Add($step)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $seen = $null
+        while ($clock.Elapsed.TotalSeconds -lt $PyWaitSeconds) {
+            if (Test-Path -LiteralPath $reportPath) {
+                # The drop step may still be writing its report; read it again on the next pass.
+                $targetPid = try { [int](Read-JsonFile $reportPath).target.pid } catch { 0 }
+                $seen = @(if ($targetPid -gt 0) { Get-PyPopups $targetPid $answered | Select-Object -First 1 })
+                if ($seen.Count -gt 0) { $seen = $seen[0]; break } else { $seen = $null }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($null -eq $seen) { $step.outcome = "no new confirmation within $PyWaitSeconds s"; break }
+        $detected = [Diagnostics.Stopwatch]::StartNew()
+        $step.seen = $seen
+        $step.seen_after_seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 2)
+        $inspect = Invoke-PyFixtureProcess $Context ('inspect --root "' + $root + '" --name ' + $PyCase + ' --desktop-held') 'inspect'
+        $step.inspect = $inspect
+        $hwnd = [Convert]::ToInt64($seen['hwnd'].Substring(2), 16)
+        $listed = @(if ($inspect.Contains('output')) { @($inspect.output.popups) | Where-Object { [long]$_.hwnd -eq $hwnd } })
+        if ($listed.Count -ne 1) { $step.outcome = 'inspect did not list the confirmation that was seen'; break }
+        $rect = @($listed[0].rect)
+        $arguments = 'respond --root "' + $root + '" --name ' + $PyCase + (' --popup-hwnd 0x{0:x}' -f $hwnd) + ' --decision ' + $step.decision + ' --stage ' + $step.stage + ' --desktop-held'
+        if ($step.decision -ceq 'allow') {
+            if ($null -eq $step.offset) { $step.outcome = 'allow needs reviewed dx,dy offsets'; break }
+            $x = if ($step.offset[0] -lt 0) { [int]$rect[2] + $step.offset[0] } else { [int]$rect[0] + $step.offset[0] }
+            $y = if ($step.offset[1] -lt 0) { [int]$rect[3] + $step.offset[1] } else { [int]$rect[1] + $step.offset[1] }
+            $arguments += ' --x ' + $x + ' --y ' + $y
+            $step.click = @($x, $y)
+        }
+        $remaining = [Math]::Max(0, $step.delay_ms - [int]$detected.ElapsedMilliseconds)
+        if ($remaining -gt 0) { $arguments += ' --delay-ms ' + $remaining }
+        $step.delay_passed_ms = $remaining
+        $respond = Invoke-PyFixtureProcess $Context $arguments 'respond'
+        $step.respond = $respond
+        $step.outcome = 'responded (exit ' + $respond.exit_code + ')'
+        $answered.Add($hwnd)
+        if ($respond.verdict -cne 'PASS') { break }
+    }
+    $failed = @($steps | Where-Object { -not $_.Contains('respond') -or $_.respond.verdict -cne 'PASS' })
+    return [ordered]@{ root=$root; case=$PyCase; steps=$steps.ToArray(); fixture_verdict=$(if ($failed.Count -eq 0) { 'PASS' } else { 'FAIL' });
+        fixture_reason=$(if ($failed.Count -eq 0) { $null } else { 'response steps that did not pass: ' + (@($failed | ForEach-Object { $_.decision + '@' + $_.stage + ': ' + $_.outcome }) -join '; ') }) }
+}
+
+function Invoke-PyFixture($Identity) {
+    $step = Assert-Action @('run','respond-when-shown') 'run'
+    $context = Initialize-PyFixture $Identity
+    if ($step -ceq 'respond-when-shown') { $result = Invoke-PyRespondWhenShown $context }
+    else {
+        $run = Invoke-PyFixtureProcess $context (Expand-PyArgs $PyArgs $context.values) 'run'
+        $result = [ordered]@{ run=$run; fixture_verdict=$run.verdict;
+            fixture_reason=$(if ($run.verdict -ceq 'PASS') { $null } elseif ($run.timed_out) { "the fixture did not finish within $PyTimeoutSeconds s" } else { 'the fixture exited ' + $run.exit_code }) }
+    }
+    foreach ($key in @($context.summary.Keys)) { $result[$key] = $context.summary[$key] }
+    $result.written = @(Export-PyFixtureFiles $context)
+    return $result
 }
 
 # ---- dpi: this user's custom scaling (applies at the next sign-in) --------
@@ -3314,6 +3949,7 @@ $report = [ordered]@{ phase=$Phase; status='PENDING'; run_id=$RunId; vm_uuid=$id
     scope=$Scope; app_dir=$script:AppDir; rehearsal=[bool]$Rehearsal; visual_review='PENDING';
     export_error=$script:ExportError; result=$null }
 try {
+    if ($DelaySeconds -gt 0) { $report.delay_seconds = $DelaySeconds; Start-Sleep -Seconds $DelaySeconds }
     if ($Phase -in $script:R6Phases) { $report.before = Get-PhaseState 'before' }
     switch ($Phase) {
         'inspect' { $report.result = Run-Inspect }
@@ -3337,9 +3973,8 @@ try {
             $script:State.installed = $true
             $script:State.installer_history = @(@($script:State.installer_history) + $InstallerSha256.ToLowerInvariant())
             $snapshot = Registry-Snapshot
-            foreach ($name in $script:Keys.Keys) { Assert-OwnedBaseline $snapshot $name }
-            $report.result = @{ installer=$installed; registry=$snapshot;
-                                app_sha256=(Get-FileHash -LiteralPath (Join-Path $script:AppDir 'ghostty.exe') -Algorithm SHA256).Hash }
+            $appSha = (Get-FileHash -LiteralPath (Join-Path $script:AppDir 'ghostty.exe') -Algorithm SHA256).Hash
+            $report.result = New-InstallResult $installed $snapshot $appSha ($Phase -eq 'install' -and $OldPackage)
         }
         'seed-foreign-before' { $report.result = Seed-Foreign $true }
         'expect-install-refused' {
@@ -3380,11 +4015,14 @@ try {
         'narrator' { $report.result = Invoke-Narrator }
         'cross-account' { $report.result = Invoke-CrossAccount }
         'dpi' { $report.result = Invoke-Dpi }
+        'py-fixture' { $report.result = Invoke-PyFixture $identity }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
     if ($report.result -is [System.Collections.IDictionary] -and $report.result.Contains('fixture_verdict')) { $verdict = $report.result['fixture_verdict'] }
-    $report.status = if ($verdict -ceq 'FAIL') { 'FAIL' } elseif ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
+    $report.status = if ($null -ne $verdict -and $verdict -cne 'PASS') {
+        if ($verdict -cin @('FAIL','PENDING','OBSERVED','RUNNING')) { $verdict } else { 'PENDING' }
+    } elseif ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
 } catch {
     $report.status = 'FAIL'
     $report.result = @{ reason=$_.Exception.Message; position=$_.InvocationInfo.PositionMessage }
@@ -3393,20 +4031,29 @@ try {
         try { $report.after = Get-PhaseState 'after' } catch { $report.after = @{ error=$_.Exception.Message } }
         $report.restore = $script:Restore
     }
-    Write-Json $statePath $script:State
+    try { Write-Json $statePath $script:State } catch { $report.state_write_error = $_.Exception.Message }
+    if ($script:JsonErrors.Count -gt 0) { $report.json_errors = $script:JsonErrors.ToArray() }
     $reportPath = Join-Path $script:RunRoot ($script:Step + '.json')
-    Write-Json $reportPath $report
+    try { Write-Json $reportPath $report }
+    catch {
+        # Last resort for an I/O failure: a minimal report still names the phase and the error.
+        $report.status = 'FAIL'
+        $minimal = '{"phase":' + (ConvertTo-JsonText $Phase) + ',"status":"FAIL","run_id":' + (ConvertTo-JsonText $RunId) +
+            ',"report_write_error":' + (ConvertTo-JsonText $_.Exception.Message) + '}'
+        try { [IO.File]::WriteAllText($reportPath, $minimal + $script:LF, [Text.UTF8Encoding]::new($false)) }
+        catch { Write-Warning ('Report write failed: ' + $_.Exception.Message) }
+    }
     if ($script:ExportRoot) {
         try {
             Copy-Item -LiteralPath $reportPath -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + [IO.Path]::GetFileName($reportPath))) -Force
             Copy-Item -LiteralPath $statePath -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + 'state.json')) -Force
-            foreach ($extra in $script:ExportExtra) {
-                if (Test-Path -LiteralPath $extra -PathType Leaf) {
-                    Copy-Item -LiteralPath $extra -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-' + [IO.Path]::GetFileName($extra))) -Force
-                }
+            foreach ($entry in @(Get-ExportNames)) {
+                try { Copy-Item -LiteralPath $entry.path -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-' + $entry.name)) -Force }
+                catch { Write-Warning ('Export of ' + $entry.path + ' failed: ' + $_.Exception.Message) }
             }
         } catch { Write-Warning ('Export failed: ' + $_.Exception.Message) }
     }
     [pscustomobject]@{ status=$report.status; evidence=$reportPath; export=$script:ExportRoot } | ConvertTo-Json -Compress
 }
 if ($report.status -eq 'FAIL') { exit 1 }
+if ($report.status -cne 'PASS_NATIVE_SCOPED') { exit 2 }

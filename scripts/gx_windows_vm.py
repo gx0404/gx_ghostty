@@ -32,13 +32,19 @@ QEMU human monitor inside the container.
                      drag first require an absolute current mouse (a relative one turns the
                      coordinates into motion from wherever the guest cursor is), report the mode
                      before and after, and refuse points outside the VNC screen unsent
-  stage-validation   stage the guest fixture after checking the live VM identity
+  queue-args         write one argument line to the staged q/<name>.txt for gx-q.cmd (the guest Run
+                     box takes 259 characters); "cmd /c start "" /min cmd /c ...\\gx-q.cmd <name>" runs
+                     it minimized without taking the guest foreground
+  stage-validation   stage the guest fixture after checking the live VM identity; with --guest-python
+                     (the pinned python.org embeddable zip, downloaded explicitly) and --ole-source it
+                     also stages the broker Python fixture for the guest's py-fixture phase
   rehearsal-layout   ghostty.exe plus pinned ConPTY/Mesa from the offline package cache, marked
                      REHEARSAL_NOT_FINAL, for GL rehearsal before the frozen installer exists
 """
 from __future__ import annotations
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -60,14 +66,37 @@ IMAGE = "dockurr/windows@sha256:59f8bed19cfd49cf1701debe34f9df6311e61a4e2ae68aa9
 OWNER = "gx-ghostty-ui-validation"
 VALIDATION_SCRIPT = ROOT / "test" / "windows" / "gx_vm_validation.ps1"
 GUEST_RUNNER = "gx-run.cmd"
+QUEUE_RUNNER = "gx-q.cmd"
+QUEUE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+# gx-q.cmd expands the line once with set /p and again through call: keep cmd metacharacters out.
+QUEUE_UNSAFE = re.compile(r"[%!^&|<>\r\n\t]")
 MONITOR = "/run/shm/monitor.sock"
-SLOTS = ROOT / ".local" / "kernel-slots"
 PORTS = {"win11": (18006, 13389), "win10": (18007, 13390)}
 CREDENTIAL_FIELDS = ("admin_password", "user_password")
 QCODE = re.compile(r"^[a-z0-9_]+(-[a-z0-9_]+)*$")
 UUID_TEXT = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 REHEARSAL_PAYLOAD = ("conpty.dll", "OpenConsole.exe", "mesa/opengl32.dll", "mesa/libgallium_wgl.dll", "mesa/dxil.dll")
+# The guest has no Python; the Python fixtures run on this python.org Windows embeddable package,
+# used inside the VM only. Its SHA-256 is the package checksum in the python.org SBOM
+# (python-3.12.10-embed-amd64.zip.spdx.json); the release page's MD5 is fe8ef205f2e9c3ba44d0cf9954e1abd3.
+# The host downloads it explicitly; stage-validation only checks and copies it.
+GUEST_PYTHON = {
+    "version": "3.12.10",
+    "file": "python-3.12.10-embed-amd64.zip",
+    "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+    "size": 11133606,
+    "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
+}
+# The broker fixture; stage-validation adds every test/windows or scripts module it imports.
+BROKER_ENTRY = "test/windows/gx_drop_broker_fixture.py"
+FIXTURE_FOLDERS = ("test/windows", "scripts")
+# Path-based reads are invisible to the import AST. Keep them in the same
+# source/ref and hash tree as their consumer (source_manifest in newer refs).
+FIXTURE_RUNTIME_DEPENDENCIES = {
+    "test/windows/gx_fixture_evidence.py": ("scripts/gx_win_uia.py",),
+}
+OLE_SOURCE_NAME = "gx_ole_source.exe"
 MEDIA = {
     "win11": {
         "file": "win11-25h2-en-us.iso",
@@ -642,6 +671,19 @@ def screenshot(docker: Docker, version: str, destination: Path) -> dict:
             "visual_review": "PENDING"}
 
 
+def slots_root(gx_slots) -> Path:
+    """The kernel-slot root shared by the main checkout and all of its worktrees.
+
+    gx_slots.shared_root resolves it from git's common directory. A checkout-relative
+    `.local/kernel-slots` gave each worktree its own locks, so a VM started from a worktree did not
+    exclude heavy jobs of the main checkout (or of another worktree)."""
+    shared = getattr(gx_slots, "shared_root", None)
+    if not callable(shared):
+        raise VmError("scripts/gx_slots.py has no shared_root(); merge the shared slot root "
+                      "(wip/r6-a2-perf-tools) before starting a VM")
+    return Path(shared())
+
+
 def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: float,
        replace_container: str | None = None, dry_run: bool = False) -> int:
     """Run the VM attached while holding one heavy gx_slots slot.
@@ -665,7 +707,7 @@ def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: f
               flush=True)
         return 0
     docker.run("image", "inspect", IMAGE)  # must already be cached; never pulled
-    with gx_slots.acquire(SLOTS, "heavy", slot_timeout):
+    with gx_slots.acquire(slots_root(gx_slots), "heavy", slot_timeout):
         for other in MEDIA:
             if container_state(docker, other)["running"]:
                 raise VmError(f"{container_name(other)} is already running; only one owned VM may run")
@@ -710,8 +752,99 @@ def stop(root: Path, version: str, docker: Docker) -> dict:
     return container_state(docker, version)
 
 
-def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str) -> Path:
-    """Stage a guest-only fixture; never touch Docker, host accounts or registry."""
+def verify_guest_python(path: Path) -> str:
+    if Path(path).stat().st_size != GUEST_PYTHON["size"] or sha256_file(path) != GUEST_PYTHON["sha256"]:
+        raise ValueError(f"{path} is not the pinned {GUEST_PYTHON['file']} (size/SHA256 differ)")
+    return GUEST_PYTHON["sha256"]
+
+
+def working_tree_reader(relative: str) -> bytes | None:
+    path = ROOT / relative
+    return path.read_bytes() if path.is_file() else None
+
+
+def git_reader(ref: str):
+    """Files as committed at ref (such as a fixture branch that is not merged yet); None if absent."""
+    found = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+                           capture_output=True, text=True)
+    if found.returncode != 0 or not found.stdout.strip():
+        raise ValueError(f"--fixture-ref {ref} is not a commit of this repository")
+    commit = found.stdout.strip()
+
+    def read(relative: str) -> bytes | None:
+        shown = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:{relative}"], capture_output=True)
+        return shown.stdout if shown.returncode == 0 else None
+
+    read.commit = commit
+    return read
+
+
+def fixture_closure(read, entry: str = BROKER_ENTRY) -> dict[str, bytes]:
+    """Repository imports plus required path-based runtime dependencies, from one reader."""
+    files: dict[str, bytes] = {}
+    pending = [(entry, True)]
+    while pending:
+        relative, required = pending.pop()
+        if relative in files:
+            continue
+        data = read(relative)
+        if data is None:
+            if required:
+                raise ValueError(f"{relative} is missing from the fixture source")
+            continue
+        files[relative] = data
+        pending.extend((path, True) for path in FIXTURE_RUNTIME_DEPENDENCIES.get(relative, ()))
+        for node in ast.walk(ast.parse(data.decode("utf-8"), relative)):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                names = [node.module]
+            else:
+                continue
+            pending.extend((f"{folder}/{name.split('.')[0]}.py", False)
+                           for name in names for folder in FIXTURE_FOLDERS)
+    return dict(sorted(files.items()))
+
+
+def stage_python_fixture(destination: Path, guest_python: Path, ole_source: Path, fixture_ref: str | None = None) -> dict:
+    """Copy the pinned embeddable Python, the broker fixture files and the OLE source to py/.
+
+    The fixture files come from the working tree, or as committed at fixture_ref."""
+    verify_guest_python(guest_python)
+    read = working_tree_reader if fixture_ref is None else git_reader(fixture_ref)
+    sources = fixture_closure(read)
+    folder = destination / "py"
+    folder.mkdir(exist_ok=True)
+    shutil.copyfile(guest_python, folder / GUEST_PYTHON["file"])
+    verify_guest_python(folder / GUEST_PYTHON["file"])
+    files = {}
+    for relative, data in sources.items():
+        target = folder / Path(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        files[relative] = hashlib.sha256(data).hexdigest()
+    ole = Path(ole_source).read_bytes()
+    if not ole.startswith(b"MZ"):
+        raise ValueError(f"{ole_source} is not a Windows executable")
+    (folder / OLE_SOURCE_NAME).write_bytes(ole)
+    tree = "\n".join(f"{name}={digest}" for name, digest in sorted(files.items()))
+    return {"python": {key: GUEST_PYTHON[key] for key in ("version", "file", "sha256", "url")},
+            "files": files, "tree_sha256": hashlib.sha256(tree.encode("utf-8")).hexdigest(),
+            "ole_source": {"file": OLE_SOURCE_NAME, "sha256": hashlib.sha256(ole).hexdigest(),
+                           "source_name": Path(ole_source).name},
+            "source": {"ref": fixture_ref, "commit": getattr(read, "commit", None),
+                       "kind": "working tree" if fixture_ref is None else "git"}}
+
+
+def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str,
+                     guest_python: Path | None = None, ole_source: Path | None = None,
+                     fixture_ref: str | None = None) -> Path:
+    """Stage a guest-only fixture; never touch Docker, host accounts or registry.
+
+    With guest_python (the pinned embeddable package) and ole_source, the broker fixture is staged
+    as well (py/ and the manifest's python_fixture) for the guest's py-fixture phase."""
+    if (guest_python is None) != (ole_source is None):
+        raise ValueError("--guest-python and --ole-source stage the broker fixture together")
     identity = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if identity.get("owner") != OWNER or identity.get("image") != IMAGE:
         raise ValueError("VM root does not belong to this pinned validation setup")
@@ -733,15 +866,20 @@ def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str)
         if saved.get("owner") != OWNER or saved.get("guest_uuid") != str(machine_uuid):
             raise ValueError("Existing validation fixture belongs to another owner or VM")
     setup = root / version / "oem" / "setup-guest.ps1"
+    if guest_python is not None:
+        verify_guest_python(guest_python)
     script_bytes = VALIDATION_SCRIPT.read_bytes()
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "out").mkdir(exist_ok=True)
     (destination / VALIDATION_SCRIPT.name).write_bytes(script_bytes)
+    python_fixture = (stage_python_fixture(destination, guest_python, ole_source, fixture_ref)
+                      if guest_python is not None else None)
     write(previous, json.dumps({
         "schema": 1, "owner": OWNER, "image": IMAGE, "version": version,
         "guest_uuid": str(machine_uuid), "guest_name": guest_name,
         "fixture_sha256": hashlib.sha256(script_bytes).hexdigest(),
         "setup_sha256": sha256_file(setup),
+        "python_fixture": python_fixture,
         "identity_source": "machine.json UUID passed to QEMU -uuid and read back live through HMP info uuid.",
         "limits": "No passwords; no host registry/account writes; runtime guest identity guard is mandatory.",
     }, indent=2) + "\n")
@@ -758,6 +896,19 @@ def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str)
         "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass"
         " -File \"%GXDST%\\gx_vm_validation.ps1\" -Manifest \"%GXDST%\\validation-manifest.json\""
         " -ExportDir \"%GXSRC%out\" %*\r\n"
+        "exit /b %ERRORLEVEL%\r\n"))
+    (destination / "q").mkdir(exist_ok=True)
+    write(destination / QUEUE_RUNNER, (
+        "@echo off\r\n"
+        "rem Runs gx-run.cmd with the argument line in q\\<name>.txt (gx_windows_vm.py queue-args);\r\n"
+        "rem the Run box takes 259 characters. Without taking the current foreground (status steps):\r\n"
+        "rem   cmd /c start \"\" /min cmd /c \\\\host.lan\\Data\\validation\\gx-q.cmd <name>\r\n"
+        "setlocal\r\n"
+        "if \"%~1\"==\"\" exit /b 2\r\n"
+        "set \"GXARGS=\"\r\n"
+        "set /p GXARGS=<\"%~dp0q\\%~1.txt\"\r\n"
+        "if not defined GXARGS exit /b 2\r\n"
+        "call \"%~dp0" + GUEST_RUNNER + "\" %GXARGS%\r\n"
         "exit /b %ERRORLEVEL%\r\n"))
     write(destination / "RUN-IN-GUEST.md", """# 仅在身份已核对的 Windows 测试虚拟机内执行
 
@@ -791,9 +942,31 @@ GL 只签真实 native renderer/window 与正常关闭；VM 无 GPU 时随包 Me
 
 干净卸载必须同时删除 App Paths、两组右键菜单、AUMID 与 Toast CLSID 键。首次账户检查不证明后续登录/实际权限操作；静态测试不代旧版升级、真实 registry、Toast/JumpList、DND/冷暖激活或 GUI 验收。安装器/卸载器等待有界，超时保留 owned PID 信息，不强杀未知进程。
 
+参数超过 Run 框 259 字符时，宿主用 queue-args --name <名> -- <参数…> 写 q\\<名>.txt，客机运行 cmd /c \\\\host.lan\\Data\\validation\\gx-q.cmd <名>。读状态的步骤（toast-matrix status、jumplist-matrix observe 等）要记录当前前台时，参数加 -DelaySeconds 5，并以 cmd /c start "" /min cmd /c \\\\host.lan\\Data\\validation\\gx-q.cmd <名> 最小化、不激活地启动，前台保持操作者留下的窗口。
+
+Python 夹具（broker）：宿主以 stage-validation --guest-python <钉版 embeddable zip> --ole-source <gx_ole_source.exe> 暂存，py\\ 下是 SHA-256 列在清单 python_fixture 里的解释器包、夹具 .py 与 OLE source。客机里 -Phase py-fixture -PyArgs "<夹具参数>" 逐个复核哈希，在 LOCALAPPDATA 下解压一次解释器并把 ._pth 指向夹具树，以调用者自己的令牌运行（medium 用 Run 框回车，high 用 Ctrl+Shift+Enter；不提权）。-PyArgs 里 {run}、{app}、{app_sha256}、{ole}、{ole_sha256} 展开为本 run 的值；退出码 0/2/其他记 PASS/PENDING/FAIL，夹具本步写出的文件以 py-<相对路径> 导出。
+
 r6 相位 run-config、osc52、toast-matrix、jumplist-matrix、narrator、cross-account、dpi 用 -Action 分步执行（start/status/collect/stop 等，每个相位只接受自己的步骤），记录写在 Runs\\<RunId>\\records，每份报告带 before、after 与 restore。只关闭本夹具启动或明确收编的进程；剪贴板只在 osc52 里由终端内探针写入测试内容；改动的设置（通知、真实配置、讲述人、DPI、JumpList ACL）都先备份再恢复；跨账户密码只经宿主 type-secret 输入。
 """)
     return destination
+
+
+def queue_args(root: Path, version: str, name: str, items: list[str]) -> Path:
+    """Write q/<name>.txt: one argument line for the staged gx-q.cmd (quoted like a command line)."""
+    if not QUEUE_NAME.fullmatch(name):
+        raise ValueError("queue-args --name takes 1-32 lowercase letters, digits and hyphens")
+    line = subprocess.list2cmdline(items)
+    if not items or len(line) > 1000 or not line.isascii() or QUEUE_UNSAFE.search(line):
+        raise ValueError("queue-args takes a non-empty ASCII line of at most 1000 characters without % ! ^ & | < > or control characters")
+    exchange = (Path(root) / version / "exchange").resolve(strict=True)
+    destination = (exchange / "validation").resolve()
+    if not destination.is_relative_to(exchange) or not (destination / "validation-manifest.json").is_file():
+        raise ValueError("Run stage-validation first: the staged validation directory has no manifest")
+    folder = destination / "q"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"{name}.txt"
+    write(path, line + "\r\n")
+    return path
 
 
 def rehearsal_layout(app: Path, output: Path, share: Path | None, cache: Path | None) -> dict:
@@ -914,6 +1087,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("prepare", "verify", "status", "up", "stop", "identity", "screenshot",
                                             "keys", "type", "type-secret", "pointer", "click", "drag", "stage-validation",
+                                            "queue-args",
                                             "rehearsal-layout"))
     parser.add_argument("items", nargs="*", help="keys: QEMU qcodes such as meta_l-r or ctrl-alt-delete; type: text")
     parser.add_argument("--root", type=Path, default=ROOT / ".local" / "windows-vm")
@@ -941,6 +1115,11 @@ def main() -> int:
     parser.add_argument("--app", type=Path, help="rehearsal-layout: old ghostty.exe")
     parser.add_argument("--share", type=Path, help="rehearsal-layout: prefix share/ directory")
     parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--guest-python", type=Path, help="stage-validation: the pinned " + GUEST_PYTHON["file"]
+                        + " (downloaded explicitly from " + GUEST_PYTHON["url"] + ")")
+    parser.add_argument("--ole-source", type=Path, help="stage-validation: gx_ole_source.exe for the broker fixture")
+    parser.add_argument("--name", help="queue-args: q/<name>.txt for gx-q.cmd <name>")
+    parser.add_argument("--fixture-ref", help="stage-validation: take the broker fixture files as committed at this git ref")
     args = parser.parse_args()
     root = args.root.resolve()
     try:
@@ -959,6 +1138,12 @@ def main() -> int:
                 "verified_utc": utc_now(), "file": path.name, "sha256": digest, "size": spec["size"],
                 "source": spec["url"], "image": IMAGE}, indent=2) + "\n")
             print(f"PASS {args.version}: {digest}")
+            return 0
+        if args.command == "queue-args":
+            if args.name is None:
+                raise VmError("queue-args requires --name")
+            path = queue_args(root, args.version, args.name, args.items)
+            print(json.dumps({"queued": str(path), "line": path.read_text(encoding="utf-8").strip()}))
             return 0
         if args.command == "rehearsal-layout":
             if args.app is None or args.out is None:
@@ -1029,7 +1214,8 @@ def main() -> int:
             if args.guest_uuid and str(uuid.UUID(args.guest_uuid)) != live:
                 raise VmError("--guest-uuid differs from the live QEMU UUID")
             name = args.guest_name or machine_identity(root, args.version)["host"]
-            destination = stage_validation(root, args.version, live, name)
+            destination = stage_validation(root, args.version, live, name, args.guest_python, args.ole_source,
+                                           args.fixture_ref)
             print(f"Staged guest-only validation fixture: {destination}")
     except (OSError, ValueError, VmError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"ERROR: {exc}\n")
