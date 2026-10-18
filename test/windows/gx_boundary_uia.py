@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 
-from gx_boundary_controller import Native, ROOT, EnvironmentUnavailable
+from gx_boundary_controller import InputLanguage, Native, ROOT, EnvironmentUnavailable
 from gx_session_ipc_fixture import wait
 import gx_win_gui as gui
 
@@ -140,38 +140,71 @@ def stale(fixture, instance, first, other):
         worker.close()
 
 
-def compose_ime(instance, native):
+IMC_GETCONVERSIONMODE, IMC_SETCONVERSIONMODE, IMC_GETOPENSTATUS, IMC_SETOPENSTATUS = 0x0001, 0x0002, 0x0005, 0x0006
+IME_CMODE_NATIVE = 0x0001
+
+
+def ime_control(ime, command, value=0):
+    result = gui.win32().send_message(ime, 0x0283, command, value, timeout_ms=2000)  # WM_IME_CONTROL
+    if result is None:
+        raise AssertionError("the owned IME window did not answer WM_IME_CONTROL")
+    return result
+
+
+def compose_ime(fixture, instance, native):
+    """Real Chinese IME composition on the owned GUI thread, then a full restore.
+
+    The original input language, IME open status and conversion mode are saved
+    first and restored in finally; the input language restore does not depend on
+    the app still being alive (InputLanguage falls back to an owned window)."""
     api = gui.win32()
     user = C.WinDLL("user32", use_last_error=True)
     user.GetKeyboardLayoutList.argtypes, user.GetKeyboardLayoutList.restype = [C.c_int, C.POINTER(C.c_void_p)], C.c_int
     count = user.GetKeyboardLayoutList(0, None)
     layouts = (C.c_void_p * max(1, count))()
     count = user.GetKeyboardLayoutList(count, layouts)
-    chinese = next((layouts[i] for i in range(count) if layouts[i] & 0xffff in (0x0804, 0x0404)), None)
+    chinese = next(((layouts[i] or 0) & 0xFFFFFFFF for i in range(count) if (layouts[i] or 0) & 0xffff in (0x0804, 0x0404)), None)
     if not chinese:
         raise EnvironmentUnavailable("no installed Chinese IME in this desktop session")
-    original = api.keyboard_layout(native.hwnd)
     hwnd = api.focus_window(native.hwnd)
     assert api.window_pid(hwnd) == instance.pid and api.class_name(hwnd) == gui.TERMINAL_CLASS
+    language = InputLanguage(fixture, instance, hwnd)
+    ime, state, report = None, None, {"layout": f"0x{chinese:08x}", "original_layout": f"0x{language.original:08x}"}
     try:
-        api.PostMessageW(hwnd, 0x50, 0, chinese)
-        wait(lambda: api.keyboard_layout(hwnd) & 0xffff == chinese & 0xffff, 5)
+        if language.original & 0xffff != chinese & 0xffff:
+            language.request(chinese)
+            wait(lambda: api.keyboard_layout(hwnd) & 0xffff == chinese & 0xffff, 5)
         imm = C.WinDLL("imm32", use_last_error=True)
         imm.ImmGetDefaultIMEWnd.argtypes, imm.ImmGetDefaultIMEWnd.restype = [W.HWND], W.HWND
         ime = imm.ImmGetDefaultIMEWnd(hwnd)
         if not ime or api.window_pid(ime) != instance.pid:
             raise EnvironmentUnavailable("owned thread's IME control window is unavailable")
-        api.send_message(ime, 0x283, 6, 1, timeout_ms=2000)
-        api.send_message(ime, 0x283, 2, 1, timeout_ms=2000)
+        state = {"open": ime_control(ime, IMC_GETOPENSTATUS), "mode": ime_control(ime, IMC_GETCONVERSIONMODE)}
+        report["ime_before"] = state
+        ime_control(ime, IMC_SETOPENSTATUS, 1)
+        ime_control(ime, IMC_SETCONVERSIONMODE, state["mode"] | IME_CMODE_NATIVE)  # keep the other mode bits
         before = native.query(106)
         instance.press("n")
         instance.press("i")
         wait(lambda: native.query(106) > before, 5)
         instance.press("escape")
-        return {"layout": chinese, "composition_events": native.query(106) - before}
+        report["composition_events"] = native.query(106) - before
+        return report
     finally:
-        if instance.alive() and api.IsWindow(hwnd):
-            api.PostMessageW(hwnd, 0x50, 0, original)
+        restored = None
+        try:
+            if state is not None and ime and api.IsWindow(ime) and api.window_pid(ime) == instance.pid:
+                ime_control(ime, IMC_SETCONVERSIONMODE, state["mode"])
+                ime_control(ime, IMC_SETOPENSTATUS, state["open"])
+                restored = {"open": ime_control(ime, IMC_GETOPENSTATUS), "mode": ime_control(ime, IMC_GETCONVERSIONMODE)}
+                report["ime_after"] = restored
+        finally:
+            try:
+                report["input_language"] = language.restore()
+            finally:
+                fixture.check("IME-restore", **report)
+        if state is not None and restored != state:
+            raise AssertionError(f"IME open/conversion state was not restored: {state} -> {restored}")
 
 
 def stress(fixture, instance, native):
@@ -185,7 +218,7 @@ def stress(fixture, instance, native):
             instance.press("ctrl+alt+h")
             instance.press("ctrl+alt+l")
         try:
-            fixture.check("IME-composition-during-MTA-query", **compose_ime(instance, native))
+            fixture.check("IME-composition-during-MTA-query", **compose_ime(fixture, instance, native))
         except EnvironmentUnavailable as error:
             unavailable = error
             fixture.check("IME-environment-unavailable", reason=str(error))
