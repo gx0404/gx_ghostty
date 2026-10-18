@@ -1,20 +1,91 @@
 id = "G05"
-title = "Two tabs and a split: the GX tab bar and the 1 px split divider"
+title = "Tabs and splits: GX tab strip, scrollbar, unread marks, progress, remote and superuser leaders, tab drag and the close confirmation"
 lang = "en"
 config = """
 command = /bin/bash --noprofile --norc
 language = en
 """
-xdotool = """
+# The remote and superuser leaders are private copies of /bin/sleep named ssh
+# and sudo in /tmp/gx-o6-G05 (classified by name, nothing connects or gains
+# rights). Intermediate screenshots and process lists use xdotool exec into the
+# evidence directory next to XDG_STATE_HOME, which the runner copies out with
+# the rest; the whole script must finish within the runner's 30 s timeout.
+xdotool = '''
+exec --sync sh -c "mkdir -p /tmp/gx-o6-G05 && cp /bin/sleep /tmp/gx-o6-G05/ssh && cp /bin/sleep /tmp/gx-o6-G05/sudo"
 mousemove 400 300
 click 1
-sleep 0.5
+sleep 0.3
+type --delay 6 "seq 1 400"
+key Return
+sleep 0.3
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s01-scrollbar-thin.png"
+mousemove 793 350
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s02-scrollbar-hover.png"
+mousemove 400 300
+type --delay 6 "while :; do date; sleep 1; done"
+key Return
 key ctrl+shift+t
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s03-two-tabs.png"
+type --delay 6 "printf '\e]9;4;1;40\a'"
+key Return
+sleep 1.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s04-progress.png"
+type --delay 6 "printf '\e]9;4;2;70\a'"
+key Return
+sleep 0.6
+type --delay 6 "/tmp/gx-o6-G05/ssh 60"
+key Return
 sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s05-remote-error.png"
 key ctrl+shift+o
+sleep 1.0
+type --delay 6 "/tmp/gx-o6-G05/sudo 60"
+key Return
 sleep 1.5
-"""
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s06-superuser-split.png"
+mousemove 430 68
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s07-leader-tooltip.png"
+mousemove 200 68
+click 1
+sleep 1.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s08-attention-cleared.png"
+exec --sync sh -c "for p in $(pgrep -f '^/tmp/gx-o6-G05/'); do ps -o pid=,lstart=,tty=,args= -p $p; done > $(dirname $XDG_STATE_HOME)/evidence/G05-processes-before-close.txt 2>&1"
+key ctrl+shift+q
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s09-close-confirmation.png"
+key Escape
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s10-close-cancelled.png"
+exec --sync sh -c "for p in $(pgrep -f '^/tmp/gx-o6-G05/'); do ps -o pid=,lstart=,tty=,args= -p $p; done > $(dirname $XDG_STATE_HOME)/evidence/G05-processes-after-cancel.txt 2>&1"
+mousemove 200 68
+mousedown 1
+mousemove 220 72
+sleep 0.2
+mousemove 260 180
+sleep 0.2
+mousemove 300 260
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G05-s11-tab-drag.png"
+key Escape
+mouseup 1
+sleep 0.6
+exec --sync rm -rf /tmp/gx-o6-G05
+'''
 expect = [
-  "G05.png: a single tab, so the tab bar stays hidden",
-  "G05-after.png: two tabs on the darker strip, the second selected in the terminal background (no outline, with its close button) and split left/right by a thin divider in the terminal colors, the focused split outlined in the accent blue",
+  "G05.png: a single tab, so the tab bar stays hidden (no pill or inset for one tab)",
+  "G05-s01-scrollbar-thin.png: while the output scrolls, the overlay scrollbar shows its thin indicator at the right edge",
+  "G05-s02-scrollbar-hover.png: hovering the right edge widens the scrollbar to the libadwaita slider with its trough",
+  "G05-s03-two-tabs.png: two tabs on the darker strip, the selected one in the terminal background with its close button and 8 px rounded corners",
+  "G05-s04-progress.png: OSC 9;4 40% shows a progress pie on the second tab and the progress bar under the banner; the first tab, printing every second in the background, has the needs-attention line",
+  "G05-s05-remote-error.png: the error state turns the pie red at 70%; the ssh leader adds the remote icon to the tab and tints the header and tab strip with palette 5",
+  "G05-s06-superuser-split.png: after a right split runs sudo, the tab shows the superuser icon, the bars take the palette 1 tint, the focused split has the accent outline and the other split is dimmed; the divider is 1 px",
+  "G05-s07-leader-tooltip.png: the tab tooltip names the directory, Superuser session and Error: 70%",
+  "G05-s08-attention-cleared.png: selecting the first tab clears its needs-attention line and the window drops the superuser tint",
+  "G05-s09-close-confirmation.png and G05-processes-before-close.txt: quitting asks first and lists the running processes (ssh, sudo, sleep), not the idle shells",
+  "G05-s10-close-cancelled.png and G05-processes-after-cancel.txt: cancelling keeps the window, and the ssh and sudo processes keep their PID, start time and PTY",
+  "G05-s11-tab-drag.png: dragging the first tab out of the strip shows it as a drag tab in the strip colors; Xvfb has no window manager, so GDK emulates the window move that a WM would own and the window follows the pointer",
+  "G05.log: one failed to export DMABUF warning for the three terminals, later renderers only log the debug line; the GX stylesheet is reloaded once and then reported unchanged; the GX checks back off from 1000 ms while nothing changes and run every 1000 ms for unread marks with two tabs",
 ]
