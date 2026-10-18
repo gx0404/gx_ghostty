@@ -75,13 +75,12 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
     if string match -q 'cursor*' -- $features
         set -l cursor 5                                   # blinking bar
         contains cursor:steady $features && set cursor 6  # steady bar
-        # fork(gx): GX-0047 use the effective configured cursor for GX prompts.
+        # fork(gx): GX-0047 gx-prompt-cursor = config: the prompt shows the configured cursor.
         contains cursor:config $features && set cursor 0
 
-        # fork(gx): GX-0047 select configuration at GX prompts, the legacy beam otherwise.
+        # Change the cursor to a beam on prompt.
         function __ghostty_set_cursor_beam --on-event fish_prompt -V cursor -d "Set cursor shape"
-            # fork(gx): GX-0047 configured prompt reset also applies with fish vi bindings.
-            if test "$cursor" = 0; or not functions -q fish_vi_cursor_handle
+            if not functions -q fish_vi_cursor_handle
                 echo -en "\e[$cursor q"
             end
         end
