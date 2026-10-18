@@ -18,7 +18,7 @@ expect = [
   "restored: after Esc the palette is closed and the terminal is Nord",
   "initials: the filter ct lists Change Theme… with its C and T highlighted (word initials)",
   "swapped: the misspelled filter Chnage Theme still finds Change Theme… (two neighbouring letters swapped)",
-  "zero-results: the filter qqzzxxvv shows the No results state with the hint to try the English name or the pinyin initials",
+  "zero-results: the filter qqzzxxvv shows No results for “qqzzxxvv” (in the English UI without the hint, which only a non-English UI adds)",
   "theme-page: Enter on Change Theme… opens the theme page with the theme swatches, its selection on the current theme Nord, the terminal still Nord (no preview on opening)",
   "theme-preview: Down moved the selection to the next theme and the terminal previews it",
   "shift-enter: Shift+Enter applied the previewed theme and kept the palette open on the theme page",
@@ -30,6 +30,7 @@ expect = [
   "history-cleared: after Clear Recently Used the root has no Recently Used group",
   "zh-root: after language = zh-CN and a reload, the palette lists its entries in Chinese",
   "english-alias: the English filter theme finds 更换主题… and shows the English title Change Theme… on its second line",
+  "zh-zero-results: in the Chinese UI the filter qqzzxxvv shows 没有与“qqzzxxvv”匹配的结果 and the hint 可尝试英文名称或拼音首字母。",
 ]
 
 [[step]]
@@ -557,6 +558,23 @@ seconds = 0.8
 [[step]]
 action = "capture"
 name = "english-alias"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "qqzzxxvv"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "zh-zero-results"
 what = "all"
 
 [[step]]
