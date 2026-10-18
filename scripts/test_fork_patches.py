@@ -1708,6 +1708,98 @@ class Gx0053ShapeTests(unittest.TestCase):
         self.assertEqual(squash(restored), squash(upstream))
 
 
+GTK_WINDOW_ZIG = "src/apprt/gtk/class/window.zig"
+GX0054 = "GX-0054"
+GX0054_ADOPT_MARKER = "        // fork(gx): GX-0054 Keep new and adopted tabs after pinned tabs."
+GX0054_MOVE_MARKER = "        // fork(gx): GX-0054 Keep moves inside the page's pinned or unpinned group."
+GX0054_ADOPT = "const page = tab_view.insert(tab.as(gtk.Widget), gx_gtk.window.adoptPosition(tab_view, position));"
+GX0054_MOVE = "const desired_pos = gx_gtk.window.movedTabPosition(tab_view, page, pos, amount);"
+GX0054_OLD_MOVE = """const desired_pos: c_int = desired: {
+            const initial: c_int = @intCast(pos + amount);
+            const max = total - 1;
+            break :desired if (initial < 0)
+                max + initial + 1
+            else if (initial > max)
+                initial - max - 1
+            else
+                initial;
+        };"""
+
+
+def gx0054_problems(source: str) -> list[str]:
+    """Keep both pinned-page constraints explicit at their upstream call sites."""
+    source = source.replace("\r\n", "\n")
+    problems = []
+    if source.count("fork(gx): GX-0054") != 2:
+        problems.append("expected exactly two GX-0054 markers")
+    for header, marker, call in (
+        ("pub fn adoptTab(", GX0054_ADOPT_MARKER, GX0054_ADOPT),
+        ("pub fn moveTab(", GX0054_MOVE_MARKER, GX0054_MOVE),
+    ):
+        span = zig_fn_lines(source.splitlines(), header)
+        if span is None:
+            problems.append("missing unique function: " + header)
+            continue
+        body = "\n".join(source.splitlines()[span[0]:span[1]])
+        if body.count(call) != 1 or marker + "\n        " + call not in body:
+            problems.append("constraint must immediately follow its marker: " + header)
+        if "const tab_view = priv.tab_view;" not in body or "AdoptView" in body:
+            problems.append("use the real upstream TabView: " + header)
+        if header == "pub fn moveTab(":
+            for statement in ("const pos = tab_view.getPagePosition(page);",
+                              "assert(desired_pos >= 0);", "assert(desired_pos < total);",
+                              "return tab_view.reorderPage(page, desired_pos) != 0;"):
+                if statement not in body:
+                    problems.append("upstream movement statement missing: " + statement)
+        elif "tab_view.insert(tab.as(gtk.Widget), position)" in body:
+            problems.append("unconstrained insertion remains")
+    return problems
+
+
+class Gx0054ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / GTK_WINDOW_ZIG).read_text(encoding="utf-8")
+
+    def test_registered_and_real_source_lf_crlf(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0054, GTK_WINDOW_ZIG, f"fork(gx): {GX0054}", "active"), patches)
+        self.assertEqual(gx0054_problems(self.source), [])
+        self.assertEqual(gx0054_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_removed_markers_calls_and_upstream_guards_are_rejected(self):
+        for old, new in (
+            (GX0054_ADOPT_MARKER, ""), (GX0054_MOVE_MARKER, ""),
+            (GX0054_ADOPT, "const page = tab_view.insert(tab.as(gtk.Widget), position);"),
+            (GX0054_MOVE, GX0054_OLD_MOVE),
+            ("const pos = tab_view.getPagePosition(page);", "const pos = 0;"),
+            ("assert(desired_pos < total);", ""),
+            ("return tab_view.reorderPage(page, desired_pos) != 0;", "return false;"),
+        ):
+            with self.subTest(old=old):
+                self.assertIn(old, self.source)
+                self.assertTrue(gx0054_problems(self.source.replace(old, new, 1)))
+
+    def test_hidden_adopt_wrapper_is_rejected(self):
+        start, end = zig_fn_lines(self.source.splitlines(), "pub fn adoptTab(")
+        lines = self.source.splitlines()
+        body = "\n".join(lines[start:end])
+        changed = body.replace("const tab_view = priv.tab_view;", "const tab_view = AdoptView.init(priv.tab_view);", 1)
+        self.assertNotEqual(body, changed)
+        self.assertTrue(gx0054_problems(self.source.replace(body, changed, 1)))
+
+    def test_restored_move_body_matches_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, GTK_WINDOW_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        restored = self.source.replace(GX0054_MOVE_MARKER + "\n", "").replace(GX0054_MOVE, GX0054_OLD_MOVE)
+        actual = restored.splitlines()
+        expected = upstream.splitlines()
+        start, end = zig_fn_lines(actual, "pub fn moveTab(")
+        old_start, old_end = zig_fn_lines(expected, "pub fn moveTab(")
+        self.assertEqual(squash("\n".join(actual[start:end])), squash("\n".join(expected[old_start:old_end])))
+
+
 class Gx0051ShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

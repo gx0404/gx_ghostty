@@ -102,6 +102,8 @@ W01–W15 逐条对应 R0 的验收点，W16 起采集界面现状截图。R0 �
 
 ## GTK 截图验证
 
+第 6 阶段设置与固定页回归用现有场景批次 `just wsl scenario --out <新目录> G03 G26 G27 G28 G09`：G26 校验保存失败后还原、重试及关闭时不再保存已撤销的主题；G27 校验重开复用、跨窗口保存失败时原实例与编辑保留，以及新增主题发现；G28 07–12 逐槽读取标题核对新建与组内移动顺序，不能只凭没有 CRITICAL 判通过。对应定向测试为 `just wsl test --gtk --filter apprt.gtk.gx`。100 次真实设置模板重开的分配测试仅证明被计量的 Zig 分配稳定，不代证整个 GTK/C 堆或 RSS。首次 G03 字体选择的 D-30 崩溃原件保留，后续成功不表示该缺陷已修；最终树仍需补验。
+
 GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来自下面两处，都要实际读图：
 
 - 本机 WSL：`just wsl build --gtk` 后 `just wsl smoke --out <Windows 目录>`（Xvfb，参数与 `gtk-smoke` 相同；`--lang`、`--xdotool`、`--config`、`--env`、`--settle` 按需），截图与日志复制回 Windows，读图后才记 PASS。它是 Ubuntu 24.04 上的证据，不代证 `gtk-smoke`。

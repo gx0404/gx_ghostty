@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0053）之后的号。在册的 46 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0054）之后的号。在册的 47 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0054，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -128,6 +128,7 @@
 | GX-0051 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0051` | active |
 | GX-0051 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0051` | active |
 | GX-0053 | `src/Command.zig` | `fork(gx): GX-0053` | active |
+| GX-0054 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0054` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -820,11 +821,11 @@ just wsl test --filter Binding --filter gx.
 
 ### 行为
 
-- `app.gx-settings`（无参数）显示设置对话框，挂在当前活动窗口上（`gtk.Application.getActiveWindow`，没有窗口时独立显示）；对话框已打开时把它提到前面。运行期 libadwaita 低于 1.5（没有 `AdwDialog`）时只记日志。
+- `app.gx-settings`（无参数）显示设置对话框，挂在当前活动窗口上（`gtk.Application.getActiveWindow`，没有窗口时独立显示）；对话框按窗口对象保留，关闭后再次打开时刷新配置并复用，缓存 drop 或窗口 finalize 时释放。跨窗口打开先关闭并保存原对话框；保存失败则聚焦原宿主，保留子页、未保存值与重试提示，不另建第二个可见对话框。配置重载、语言或主题变化使关闭的缓存作废；无父窗口时不缓存。运行期 libadwaita 低于 1.5（没有 `AdwDialog`）时只记日志。
 - `open_config` 的 `.os_open` 目标（默认 `ctrl+,`、主菜单的 `app.open-config::os-open`）：`gx-open-config-ui = settings` 时显示设置对话框；`editor` 或 libadwaita 低于 1.5 时与上游相同，用系统编辑器打开配置文件。`.new_window` 目标（在新窗口里用终端编辑器打开）不受影响。
 - 对话框分六页：语言（`language`）；外观（主题列表带搜索，在列表中移动即实时预览，「应用」或回车写入 `theme`，未应用就关闭对话框则恢复；窗口材质纯色 / 半透明 / 毛玻璃分别写 `background-opacity = 1` / `0.9` / `0.85` 与 `background-blur = false` / `false` / `true`，`gx-window-material` 只在 Windows 生效所以不写）；字体（`font-size` 6–100、步进 0.5、恢复默认 12；`font-family`，留空则删除）；交互（`right-click-action`、`scrollbar`、`confirm-close-surface`、`bell-features`）；Shell（`command`，取 `gx.profiles.detectSystem` 探测到的启动配置，参数不含空白时写 `direct:` 形式；选 GX Zsh 且探测到 herdr 时在后台运行 `herdr --gx-set-default-shell <gx-zsh>`，退出码 3 表示用户自管 herdr 配置，只提示不报错）；关于（版本、配置文件与 `gui-settings.ghostty` 的路径，「打开配置文件」按钮走上游 `.os_open` 的编辑器路径）。
 - 改动在 300 ms 内合并，经 `gx.gui_settings.Overlay` 写入 `gui-settings.ghostty`（从不写用户的 `config.ghostty`），再重新加载配置；保存、加载失败时在对话框里以 toast 提示。预览不写文件：用内存中的 `--theme=<名称>` 与去掉 `config-reload` 的 `--app-notifications` 覆盖加载配置后调用 `App.updateConfig`，所以不弹出「已重新加载配置」。环境变量 `GHOSTTY_GX_DEFAULTS=0` 关闭 GX 分层时不预览。
-- 界面文字用 Ghostty GX 翻译表（`src/gx/i18n.zig`），不经 gettext，`po/` 与 pot 不变；语言取对话框打开时配置的 `language`，每次打开都重新构建，所以切换语言后再打开即生效。
+- 界面文字用 Ghostty GX 翻译表（`src/gx/i18n.zig`），不经 gettext，`po/` 与 pot 不变；语言变化使缓存作废，下次打开重建。主题列表在下次进入子页时重新发现，Shell 列表在页面映射后的 idle 中探测，关闭时取消待执行探测。字体、默认命令与 Shell 临时字符串分别使用可复位的 arena；待保存值独立持有，不借用刷新后失效的切片。
 
 ### 上游状态
 
@@ -1390,6 +1391,7 @@ python -m unittest scripts.test_fork_patches -v
 - 真源：`src/apprt/gtk/gx/runtime.zig` 管理 qdata 身份和活对象查找；`origin.zig` 持有启动来源副本；`tree_lifecycle.zig` 预分配待收养的树。上游类仅提供创建、映射、附着、分离和销毁钩子。
 - 对象引用保持 host epoch，视图隐藏、移动和销毁撤销旧 attachment；旧 owner 的迟到 detach 不撤销新 owner。临时命令不猜测为 profile，owned 来源不借用临时列表内存。
 - 空 Tab/Window 和树收养不得创建 placeholder shell；树复制和可恢复分配失败在提交前处理，旧 listener 随 owner 解绑。
+- 固定页关闭策略由 `gx/tab_actions.zig` 处理：关闭其他与右侧标签保留固定页，`this` 在 Tab 上重新激活上游动作，其余动作继续按层级继承。收养与移动的位置约束独立登记为 GX-0054，`adoptTab` 中 `tab_view` 仍是真实 AdwTabView，不用包装类型隐式改变块外行为。
 - 移除条件：上游提供等价的稳定生命周期、typed 启动来源和无初始终端的收养接口后移除钩子，登记改为 removed。
 - 验证：GTK runtime/origin/tree_lifecycle/app/launch 定向单测、GTK app 构建、真实移窗后关闭旧窗继续 split/title；Windows/POSIX 共享引用测试；fork/roots/GTK contract 守门。未实际读图的项目保持 PENDING。
 
@@ -1515,3 +1517,13 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：上游改写 `windowsCreateCommandLine` 时保持“空参数加引号”，并保留既有的引号与反斜杠算法。
 - 移除条件：上游原生保留空参数后，删除单行守卫与测试块，登记改为 removed。
 - 验证：`just test --filter Command:`（Windows 上两条 `CommandLineToArgvW` 往返用例：空参数与 GX 编码器对照；其余 `Command:` 用例中有 POSIX 专用的会跳过），gx-ci `windows-app` 同样跑这组过滤；`python scripts/run_unittests.py test_fork_patches`（`Gx0053ShapeTests` 锁定守卫、编码算法与回归用例，还原后与上游一致）。回归用 Windows 原生解码器代证子进程收到的 argv（root 书面接受，未另起子进程）。
+
+## GX-0054 GTK 固定标签的位置约束：新标签插入与移动
+
+- 文件：`src/apprt/gtk/class/window.zig`；active，未回馈上游。`Window.adoptTab` 的 insert 行与 `Window.moveTab` 的 desired_pos 行前各有一处单行标记；实现位于 `src/apprt/gtk/gx/window.zig::adoptPosition`、`movedTabPosition`。
+- 原因：选中非末位固定标签后新建普通标签会插入固定区，libadwaita 拒绝；移动标签跨固定/普通分界时同样被拒绝。上游单次回绕对大位移还可能产生越界位置。
+- 行为：普通标签插入位置至少为固定页数；移动按当前页所属分组循环取模，先对 amount 取模再相加，避免 isize 极值溢出。新建、复制、树收养、分屏移入及恢复共用插入路径；当前会话格式不保存固定状态。
+- 兼容范围：无固定页时保持上游原本合法的结果，大位移改为合法取模；存在固定页时距离按组内计数。例如 6 页/2 固定、pos=5、amount=3 得 4（上游为 2）；5 页/2 固定、pos=0、amount=-4 不动（上游为 1）。这是有意的分组语义。
+- 同步：GX-0039 块保持真实 `priv.tab_view` 声明，不能用包装类型把修改藏到块外；移动函数保留上游 pos、两条 assert 和 reorder 返回值。上游插入路径继续保证位置不大于总页数。
+- 移除条件：上游原生提供等价的插入约束与全范围循环移动后移除钩子，登记改为 removed；移除 GX-0039 时不能顺带丢弃本约束。
+- 验证：真实 AdwTabView 插入/移动单测覆盖单页组、3/4 页组、极值及 7,236 组无固定页输入（612 组上游合法结果一致）；G28 07–12 校验实际标签标题顺序，移除移动动作的反向探针必须失败；G09 回归并读图。`Gx0054ShapeTests` 锁定标记、调用和上游保留语句，撤销移动替换后函数体应与上游一致。

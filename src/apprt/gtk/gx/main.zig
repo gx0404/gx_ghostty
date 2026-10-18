@@ -29,6 +29,7 @@ test {
     _ = window;
     _ = @import("style.zig");
     _ = @import("settings_dialog.zig");
+    _ = @import("dialog_cache.zig");
     _ = @import("app_mode.zig");
     _ = @import("progress.zig");
     _ = @import("font_zoom.zig");
@@ -41,4 +42,5 @@ test {
     _ = @import("session.zig");
     _ = @import("launch_profiles_dialog.zig");
     _ = @import("shortcut_editor.zig");
+    _ = @import("tab_actions.zig");
 }

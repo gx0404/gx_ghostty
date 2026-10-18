@@ -1,0 +1,177 @@
+id = "G27"
+title = "P4: the settings dialog is kept per window and presented again; reloads and theme changes build a new one"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+s=gx:settings
+keybind = ctrl+alt+t=gx:settings_page:appearance
+keybind = ctrl+alt+r=reload_config
+"""
+env = { GHOSTTY_GX_PERF = "1" }
+script = '''
+def log():
+    return (evidence / "G27.log").read_text()
+def builds():
+    return log().count("info(gx_perf): settings.load.layers ")
+def opens():
+    return log().count("info(gx_perf): settings.open.total ")
+def open_settings(key="ctrl+alt+s"):
+    xdo("key", key)
+    sleep(0.8)
+def close_settings():
+    xdo("key", "Escape")
+    sleep(0.8)
+def search_theme(query):
+    xdo("mousemove", 400, 96, "click", 1)
+    xdo("key", "ctrl+a")
+    xdo("type", "--delay", 1, query)
+    sleep(1.0)
+xdo("windowsize", window(), 1100, 740)
+xdo("mousemove", 400, 300, "click", 1)
+open_settings()
+capture("01-first")
+assert (builds(), opens()) == (1, 1), (builds(), opens())
+close_settings()
+for index in range(10):
+    open_settings()
+    if index == 9:
+        capture("02-tenth-reopen")
+    close_settings()
+assert (builds(), opens()) == (1, 11), (builds(), opens())
+open_settings("ctrl+alt+t")
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.8)
+search_theme("Dracula")
+capture("03-preview")
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+capture("04-closed-ends-preview")
+open_settings()
+capture("05-reopened-appearance")
+assert builds() == 1, builds()
+close_settings()
+xdo("key", "ctrl+alt+r")
+sleep(1.0)
+open_settings()
+capture("06-after-reload")
+assert builds() == 2, builds()
+close_settings()
+open_settings()
+assert builds() == 2, builds()
+close_settings()
+open_settings("ctrl+alt+t")
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.8)
+search_theme("Blue Dolphin")
+xdo("mousemove", 845, 96, "click", 1)
+sleep(0.8)
+assert "theme = Blue Dolphin" in (config_home / "ghostty/gui-settings.ghostty").read_text()
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+open_settings()
+capture("07-after-theme")
+assert builds() == 3, builds()
+close_settings()
+save("-counts.json", json.dumps({"builds": builds(), "opens": opens()}))
+
+# Cross-window settings: closing A before opening B saves pending edits.
+import os
+first = window()
+xdo("key", "ctrl+shift+n")
+sleep(1.0)
+windows = xdo("search", "--onlyvisible", "--pid", pid()).splitlines()
+second = next(w for w in windows if str(w) != str(first))
+xdo("windowsize", second, 1100, 740)
+xdo("windowmove", second, 0, 0)
+def focus_window(w):
+    xdo("windowraise", w, "windowfocus", "--sync", w)
+    sleep(0.1)
+
+focus_window(first)
+open_settings("ctrl+alt+t")
+xdo("mousemove", 800, 507, "click", 1)
+focus_window(second)
+xdo("key", "ctrl+comma")
+sleep(1.0)
+capture("08-cross-window-saved")
+folder = config_home / "ghostty"
+overlay = folder / "gui-settings.ghostty"
+assert "cursor-style-blink = false" in overlay.read_text()
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+
+# Failed edits in A must remain visible and pending, even after opening in
+# B and asking again in A. Raise each window explicitly under bare Xvfb.
+focus_window(first)
+open_settings("ctrl+alt+t")
+os.chmod(folder, 0o555)
+os.chmod(overlay, 0o444)
+try:
+    xdo("mousemove", 800, 507, "click", 1)
+    sleep(0.8)
+    capture("09-cross-window-save-failed")
+    focus_window(second)
+    xdo("key", "ctrl+comma")
+    sleep(0.8)
+    focus_window(second)
+    capture("10-other-window-has-no-dialog")
+    focus_window(first)
+    xdo("key", "ctrl+comma")
+    sleep(0.8)
+    capture("11-original-edit-and-retry-retained")
+    assert "cursor-style-blink = false" in overlay.read_text()
+finally:
+    os.chmod(folder, 0o755)
+    os.chmod(overlay, 0o644)
+xdo("mousemove", 738, 657, "click", 1)
+sleep(1.0)
+capture("12-original-edit-retried")
+assert "cursor-style-blink = true" in overlay.read_text()
+save("-cross-window-overlay.txt", overlay.read_text())
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+assert "CRITICAL" not in log(), "cross-window settings emitted CRITICAL"
+
+# A theme added while the kept dialog is closed is discovered without a
+# configuration reload or a new dialog instance.
+theme_dir = folder / "themes"
+theme_dir.mkdir(exist_ok=True)
+(theme_dir / "GX Reopen Fixture").write_text("background = 224466\nforeground = ffffff\n")
+before_builds = builds()
+open_settings("ctrl+alt+t")
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.8)
+before_preview = log().count("info(gx_perf): metric theme.reload ")
+search_theme("GX Reopen Fixture")
+capture("13-new-theme-discovered")
+assert builds() == before_builds, "discovery should reuse the dialog"
+assert log().count("info(gx_perf): metric theme.reload ") > before_preview, "new theme was not listed and previewed"
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+capture("14-new-theme-preview-ended")
+assert "GX Reopen Fixture" not in overlay.read_text()
+assert "CRITICAL" not in log()
+
+
+'''
+expect = [
+  "G27.png: the isolated terminal before the settings open",
+  "G27-01-first.png: the first opening builds the dialog on the Language page",
+  "G27-02-tenth-reopen.png: the eleventh opening presents the same dialog on the Language page, without a toast, like the first",
+  "G27-03-preview.png: the theme list of the kept dialog searched for Dracula previews it",
+  "G27-04-closed-ends-preview.png: closing restores the saved theme in the terminal",
+  "G27-05-reopened-appearance.png: reopening starts on the Appearance page it closed on, without the theme list or the search, the saved theme on the theme row",
+  "G27-06-after-reload.png: after reload_config the next opening builds a new dialog (one more settings.load sample)",
+  "G27-07-after-theme.png: after Apply saved Blue Dolphin the next opening builds a new dialog that shows it on the theme row",
+  "G27-08-cross-window-saved.png: B shows Appearance after A closed, Blinking Cursor is off and the pending change was saved",
+  "G27-09-cross-window-save-failed.png: A has Blinking Cursor on with a Retry toast; the saved file still says false",
+  "G27-10-other-window-has-no-dialog.png: B has only its terminal, no second settings dialog",
+  "G27-11-original-edit-and-retry-retained.png: A still shows Blinking Cursor on and Retry after both cross-window and repeated open requests",
+  "G27-12-original-edit-retried.png: retry saves the visible true value and shows Settings saved",
+  "G27-13-new-theme-discovered.png: GX Reopen Fixture added while closed is listed and previewed, without rebuilding the dialog",
+  "G27-14-new-theme-preview-ended.png: closing restores Blue Dolphin and does not save the fixture theme",
+  "G27-counts.json: three builds for seventeen openings",
+]

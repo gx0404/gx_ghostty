@@ -285,6 +285,24 @@ class TemplateChildTests(unittest.TestCase):
                 self.assertIn(node.kind, (kind, f"Gtk.{kind}"))
 
 
+class MainPopoverParentTests(unittest.TestCase):
+    @staticmethod
+    def check_parent(root):
+        parents = [node for node in root.walk()
+                   if any(child.id == "context_menu" for child in node.children)]
+        if len(parents) != 1 or parents[0].kind not in ("Box", "Gtk.Box"):
+            raise AssertionError("Surface.context_menu must have a Box parent for the GX main popover")
+
+    def test_context_menu_parent_is_a_box(self):
+        source = class_file("Surface").read_text(encoding="utf-8")
+        self.check_parent(blueprint(class_blueprint(source)))
+
+    def test_changed_parent_fails_the_contract(self):
+        root = parse_blueprint("Overlay {\n PopoverMenu context_menu {\n }\n}\n")
+        with self.assertRaisesRegex(AssertionError, "Box parent"):
+            self.check_parent(root)
+
+
 class HeaderBarTests(unittest.TestCase):
     def test_matched_icons_are_on_window_buttons(self):
         window = blueprint("1.5/window.blp")
@@ -481,6 +499,33 @@ class TransferRuntimeTests(unittest.TestCase):
         self.assertIn("try manualTitle(alloc, window.as(gobject.Object))", source)
         self.assertIn("if (!value.cli.title) if (saved_window.title_override)", source)
         self.assertIn("window.setTitleOverride(title)", source)
+
+
+
+
+class TabCloseRoutingTests(unittest.TestCase):
+    def test_upstream_close_has_string_parameter(self):
+        source = strip_comments((GTK / "class/tab.zig").read_text(encoding="utf-8"))
+        self.assertIn('const s_param_type = glib.ext.VariantType.newFor([:0]const u8)', source)
+        self.assertIn('.init("close", actionClose, s_param_type)', source)
+        self.assertIn('ext.actions.addAsGroup(Self, self, "tab", &actions)', source)
+
+    def test_application_still_activates_close_on_surface(self):
+        source = strip_comments((GTK / "class/application.zig").read_text(encoding="utf-8"))
+        body = source.split("pub fn closeTab(", 1)[1].split("pub fn ", 1)[0]
+        self.assertRegex(body, r'surface\.as\(gtk\.Widget\)\.activateAction\(\s*"tab.close"')
+
+    def test_descendants_do_not_replace_tab_action_group(self):
+        for name in ("split_tree", "surface"):
+            source = strip_comments((GTK / f"class/{name}.zig").read_text(encoding="utf-8"))
+            with self.subTest(name=name):
+                self.assertNotRegex(source, r'insertActionGroup\(\s*"tab"')
+                self.assertNotRegex(source, r'addAsGroup\([^;]*"tab"')
+
+    def test_this_is_forwarded_to_upstream(self):
+        source = strip_comments((GX / "tab_actions.zig").read_text(encoding="utf-8"))
+        self.assertIn('if (mode == .this) return closeThis(tab.as(gtk.Widget))', source)
+        self.assertIn('tab.activateAction("tab.close", "s", @as([*:0]const u8, "this"))', source)
 
 
 if __name__ == "__main__":

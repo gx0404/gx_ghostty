@@ -209,7 +209,9 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 | `language.zig`、`app.zig` | 启动与运行时应用 `language`：改写 `LANGUAGE` 与 `LC_MESSAGES`、让 gettext 缓存失效、切换 `gx.i18n`，子进程拿回原来的 `LANG`/`LANGUAGE`；app action `app.gx-language`、`app.gx-keybinds`、`app.gx-about`（`about.zig` 的 Ghostty GX 关于对话框，GX 主菜单用它代替上游 `win.about`）；`performGxAction` 执行前五个 `gx:` 动作，其余返回未执行；语言切换让默认命令面板条目的译文变化时，经 `gx.config_layers.rebuild` 在内存重建配置 |
 | `window.zig`、`menus.zig`、`ui/1.5/gx/menus.blp`、`launch.zig` | 菜单与按钮提示随语言重建（复刻上游菜单并加 GX 分区：设置…、键盘快捷键、语言）；新建标签页下拉的启动配置与「用启动配置新建窗口」 |
 | `shortcuts.zig`、`shortcuts_dialog.zig` | 快捷键速查表（`Adw.Dialog`，可搜索） |
-| `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`，运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
+| `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 可复用的设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`；保存失败时跨窗口打开仍保留原可见实例、编辑和 Retry；运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
+| `dialog_cache.zig` | 按窗口对象保留设置宿主，配置/主题/语言变化使缓存作废；drop 或窗口 finalize 时释放 |
+| `tab_actions.zig`、`window.zig::adoptPosition/movedTabPosition` | 关闭其他/右侧标签保留固定页，关闭当前标签转交上游；新建与收养避开固定区，移动在所属组内循环（GX-0054） |
 | `app_mode.zig`、`style.zig`、`style.css` | herdr 应用模式隐藏标签栏、GX 样式的 CSS provider 与 `window-theme` 随配置重设（GX-0016） |
 
 命令面板用上游原样的 `class/command_palette.zig`：它列出 `command-palette-entry` 里的 `gx:` 条目，选中后与绑定一样经 `Surface.performBindingAction`（GX-0014）交给 `App.gxAction`。面板原样显示配置里的标题与描述，GX 默认值写的是英文 msgid，所以 GTK 构建在加载配置时（`src/gx/config_layers.zig::translatePalette`）把默认值层的这些条目按 `language` 换成译文，语言切换后在内存重建配置即随之更新；win32 面板则在显示时经 `gx.i18n` 翻译。
