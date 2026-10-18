@@ -555,8 +555,11 @@ def label_environments(labels: Sequence[str], common: Sequence[str], overrides: 
 # Quiet checks observe state; they never stop a process, VM or WSL distribution.
 BUILD_PROCESSES = ("zig", "build", "test", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
                    "ninja", "msbuild", "cl", "link", "gcc", "g++", "make", "cmake", "rustc", "cargo")
-# Plan §4 lists these exact strings (both "Devin" and "devin"), so matching is a
-# case-sensitive substring of a process image name or main window title.
+# The plan §4 list, kept literally. Matching is a case-insensitive (casefold)
+# substring of a process image name or main window title: Windows reports image
+# names in whatever case the launcher used (todesk.exe, TODESK.EXE) and titles
+# are free text. Devin/devin fold to one entry. No bare "kimi": it would also
+# block kimi-cu, which root ruled is not Kimi Code.
 BLACKLIST = ("Devin", "devin", "ToDesk", "Kimi Code", "哔哩哔哩")
 # Other programs worth noting in the evidence (root ruling: kimi-cu is not "Kimi
 # Code"). Observation only: they never make a snapshot busy.
@@ -795,13 +798,17 @@ class QuietProbe:
                                "IDProcess,Name,PercentProcessorTime)} | ConvertTo-Json -Depth 5 -Compress")
 
 
-def program_matches(rows: Sequence[Mapping], names: Sequence[str], *, case_sensitive: bool) -> list[dict]:
-    """Rows whose image name or window title contains one of `names`; only pid/name/matches are returned."""
-    fold = (lambda text: text) if case_sensitive else str.casefold
+def program_matches(rows: Sequence[Mapping], names: Sequence[str]) -> list[dict]:
+    """Rows whose image name or window title contains one of `names`, compared after
+    casefold; names equal after casefold report once, as their first spelling.
+    Only pid/name/matches are returned, never the title."""
+    keys: dict[str, str] = {}
+    for name in names:
+        keys.setdefault(name.casefold(), name)
     found = []
     for row in rows:
-        texts = [fold(text or '') for text in (*(row.get('names') or [row.get('name')]), row.get('title'))]
-        matches = [name for name in names if any(fold(name) in text for text in texts)]
+        texts = [(text or '').casefold() for text in (*(row.get('names') or [row.get('name')]), row.get('title'))]
+        matches = [name for key, name in keys.items() if any(key in text for text in texts)]
         if matches:
             found.append({'pid': row['pid'], 'name': row.get('name'), 'matches': matches})
     return found
@@ -820,7 +827,7 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
             checks[name] = {"status": "error", "reason": str(exc)}
     builds = {process_name(name) for name in (*BUILD_PROCESSES, *(args.build_process or []))}
     blacklist = sorted({*BLACKLIST, *(args.blacklist or [])})
-    observed = sorted({name.casefold() for name in (*OBSERVED_PROGRAMS, *(getattr(args, 'observe', None) or []))})
+    observed = sorted({*OBSERVED_PROGRAMS, *(getattr(args, 'observe', None) or [])})
     def build_check(rows):
         found = [row for row in rows if any(process_name(name) in builds for name in row.get('names') or [row['name']])
                  or row.get('build_runner')]
@@ -832,9 +839,9 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
         checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
     else:
         rows = windows['raw']['processes']
-        check('blacklist', lambda: program_matches(rows, blacklist, case_sensitive=True),
+        check('blacklist', lambda: program_matches(rows, blacklist),
               lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
-        other_programs.update(status='recorded', matches=program_matches(rows, observed, case_sensitive=False))
+        other_programs.update(status='recorded', matches=program_matches(rows, observed))
         windows['command_lines_unavailable'] = sum(bool(row.get('command_line_unavailable')) for row in rows)
         windows['raw'] = {'processes': [{key: row[key] for key in ('pid', 'name', 'build_runner', 'command_line_unavailable',
                                                                    'runner_exclusion') if key in row} for row in rows],
@@ -887,7 +894,7 @@ def quiet_snapshot(args, probe=None, *, lease=None, guarded_input=None, input_si
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
             "other_programs": other_programs, "docker_containers": containers,
             "build_processes": sorted(builds), "blacklist": blacklist,
-            "blacklist_matching": "case-sensitive substring of a process image name or main window title",
+            "blacklist_matching": "case-insensitive (casefold) substring of a process image name or main window title",
             "scope": "batch-owned locks" if lease else "point-in-time probe; locks released, not a reservation"}
 
 
@@ -2240,7 +2247,7 @@ def build_parser() -> argparse.ArgumentParser:
     quiet.add_argument("--distro", default="Ubuntu-24.04")
     quiet.add_argument("--idle-seconds", type=float, default=600)
     quiet.add_argument("--build-process", action="append", help="add build process names (repeatable)")
-    quiet.add_argument("--blacklist", action="append", help="add case-sensitive name/title substrings (repeatable)")
+    quiet.add_argument("--blacklist", action="append", help="add case-insensitive name/title substrings (repeatable)")
     quiet.add_argument("--observe", action="append", help="add name/title substrings recorded as other programs, never a gate")
     quiet.add_argument("--wait", action="store_true")
     quiet.add_argument("--interval", type=float, default=900)

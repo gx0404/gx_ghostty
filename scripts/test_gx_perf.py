@@ -290,23 +290,33 @@ class QuietTests(unittest.TestCase):
         self.assertEqual((2, 'error'), (result['exit'], result['checks']['session']['status']))
         self.assertIn('not in the active console session', result['checks']['session']['reason'])
 
-    def test_blacklist_is_the_exact_plan_list_and_kimi_cu_is_only_observed(self):
+    def test_blacklist_is_the_plan_list_matched_case_insensitively_and_kimi_cu_is_only_observed(self):
         self.assertEqual(('Devin', 'devin', 'ToDesk', 'Kimi Code', '哔哩哔哩'), gx_perf.BLACKLIST)
         rows = [{'pid': 1, 'name': 'kimi-cu.exe', 'title': 'kimi-cu'}, {'pid': 2, 'name': 'todesk-lookalike', 'title': 'KIMI CODE'},
                 {'pid': 3, 'name': 'devin', 'title': ''}, {'pid': 4, 'name': 'Kimi Code.exe', 'title': ''},
-                {'pid': 5, 'name': 'player', 'title': '哔哩哔哩 (゜-゜)つロ'}]
+                {'pid': 5, 'name': 'player', 'title': '哔哩哔哩 (゜-゜)つロ'}, {'pid': 6, 'name': 'todesk.exe', 'title': ''},
+                {'pid': 7, 'name': 'TODESK.EXE', 'title': ''}, {'pid': 8, 'name': 'WindowsTerminal', 'title': 'Kimi code'},
+                {'pid': 9, 'name': 'DEVIN.EXE', 'title': ''}]
         self.probe.windows.return_value = windows_data(*rows)
         result = gx_perf.quiet_snapshot(self.args, self.probe)
-        self.assertEqual({3: ['devin'], 4: ['Kimi Code'], 5: ['哔哩哔哩']},
+        self.assertEqual(3, result['exit'])
+        self.assertEqual({2: ['Kimi Code', 'ToDesk'], 3: ['Devin'], 4: ['Kimi Code'], 5: ['哔哩哔哩'], 6: ['ToDesk'],
+                          7: ['ToDesk'], 8: ['Kimi Code'], 9: ['Devin']},
                          {row['pid']: row['matches'] for row in result['checks']['blacklist']['raw']})
+        self.assertIn('case-insensitive', result['blacklist_matching'])
         self.assertEqual('recorded', result['other_programs']['status'])
         self.assertEqual([1], [row['pid'] for row in result['other_programs']['matches']])
         self.assertNotIn('つロ', gx_perf.json.dumps(result, ensure_ascii=False))
-        self.probe.windows.return_value = windows_data(rows[0], rows[1])
+        for variant in rows[1], rows[5], rows[6], rows[7]:
+            with self.subTest(name=variant['name'], title=variant['title']):
+                self.probe.windows.return_value = windows_data(rows[0], variant)
+                self.assertEqual('fail', gx_perf.quiet_snapshot(self.args, self.probe)['checks']['blacklist']['status'])
+        # kimi-cu alone stays quiet: it is an observed program, never a gate.
+        self.probe.windows.return_value = windows_data(rows[0])
         result = gx_perf.quiet_snapshot(self.args, self.probe)
         self.assertEqual(0, result['exit'])
         self.assertEqual([1], [row['pid'] for row in result['other_programs']['matches']])
-        self.args.blacklist = ['kimi-cu']
+        self.args.blacklist = ['KIMI-CU']  # additions fold too
         self.assertEqual(3, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
 
     def test_ancestor_exemption_covers_runner_command_lines_only(self):
