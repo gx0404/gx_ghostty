@@ -354,8 +354,12 @@ revealing: bool = false,
 reveal_started_ms: u64 = 0,
 successful_frame: ?OpenTiming.Frame = null,
 /// Revealed without a successful frame (`RevealTimeout.reveal`): the reveal
-/// timer paints again every `repaint_retry_ms` until a frame succeeds.
+/// timer paints again after `repaint_retry_delay_ms` until a frame succeeds.
 repaint_retry: bool = false,
+/// The wait before the next paint retry: `repaint_retry_first_ms`, doubled
+/// after each retry that still painted no frame, at most
+/// `repaint_retry_max_ms` (`nextRepaintRetry`).
+repaint_retry_delay_ms: u32 = repaint_retry_first_ms,
 /// Created as a layered window for `Options.motion`; painted through `dib`.
 layered: bool = false,
 dib: d2d.DibTarget = .{},
@@ -419,8 +423,15 @@ const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
 /// frame, so DWM composed it before it appears.
 const reveal_ms: u32 = 16;
 const reveal_timeout_ms: u64 = 300;
-/// How often a modal popup revealed without a frame paints again.
-const repaint_retry_ms: u32 = 100;
+/// How long a modal popup revealed without a frame waits before it paints
+/// again: 100 ms at first, doubled after each failed paint, at most 1 s.
+const repaint_retry_first_ms: u32 = 100;
+const repaint_retry_max_ms: u32 = 1000;
+
+/// The wait after a paint retry that still produced no frame.
+fn nextRepaintRetry(delay_ms: u32) u32 {
+    return @min(delay_ms *| 2, repaint_retry_max_ms);
+}
 
 const RevealStep = enum { reveal, wait, cancel, reveal_unpainted };
 
@@ -471,6 +482,17 @@ test "P4 reuse reveal requires a current frame and bounds failure by 300ms" {
     // Without a frame by 300 ms: non-modal popups cancel, modal ones come up.
     try std.testing.expectEqual(RevealStep.cancel, revealStep(false, 300, .cancel));
     try std.testing.expectEqual(RevealStep.reveal_unpainted, revealStep(false, 300, .reveal));
+}
+
+test "P4 a modal popup's paint retry backs off from 100ms to at most 1s" {
+    var delay: u32 = repaint_retry_first_ms;
+    var waits: [7]u32 = undefined;
+    for (&waits) |*wait| {
+        wait.* = delay;
+        delay = nextRepaintRetry(delay);
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 100, 200, 400, 800, 1000, 1000, 1000 }, &waits);
+    try std.testing.expectEqual(repaint_retry_max_ms, nextRepaintRetry(std.math.maxInt(u32)));
 }
 
 /// Create the (hidden) popup window owned by `owner`.
@@ -932,10 +954,15 @@ test "P4 a modal popup with no first frame is revealed after 300ms, others cance
             .reveal => {
                 try testing.expect(popup.visible and w32.IsWindowVisible_(hwnd) != 0);
                 try testing.expect(popup.repaint_retry);
-                // The next reveal timer paints again; once a frame succeeds
-                // it stops.
+                try testing.expectEqual(repaint_retry_first_ms, popup.repaint_retry_delay_ms);
+                // The next reveal timers paint again, each waiting twice as
+                // long; once a frame succeeds they stop.
                 popup.reveal(hwnd);
                 try testing.expect(popup.repaint_retry and popup.visible);
+                try testing.expectEqual(@as(u32, 200), popup.repaint_retry_delay_ms);
+                popup.reveal(hwnd);
+                try testing.expect(popup.repaint_retry and popup.visible);
+                try testing.expectEqual(@as(u32, 400), popup.repaint_retry_delay_ms);
                 popup.callbacks = .{ .ctx = &context, .paint = ActivationFixture.paint };
                 popup.reveal(hwnd);
                 try testing.expect(!popup.repaint_retry and popup.visible);
@@ -948,6 +975,7 @@ test "P4 a modal popup with no first frame is revealed after 300ms, others cance
         }
         popup.hide();
         try testing.expect(!popup.repaint_retry);
+        try testing.expectEqual(repaint_retry_first_ms, popup.repaint_retry_delay_ms);
     }
 }
 
@@ -1121,6 +1149,7 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
             // and UI Automation, painted as soon as the device lets it.
             log.warn("popup first frame unavailable after 300ms; revealing it unpainted and painting again", .{});
             current.repaint_retry = true;
+            current.repaint_retry_delay_ms = repaint_retry_first_ms;
         },
         .reveal => {},
     }
@@ -1131,7 +1160,7 @@ fn reveal(self: *Popup, hwnd: w32.HWND) void {
         current.fade_pending = false;
         current.open_timing = null;
         if (current.layered) _ = w32.SetLayeredWindowAttributes(hwnd, 0, 255, w32.LWA_ALPHA);
-        if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, repaint_retry_ms, null) == 0) current.repaint_retry = false;
+        if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, current.repaint_retry_delay_ms, null) == 0) current.repaint_retry = false;
         return;
     }
     if (!self.fade_pending) {
@@ -1153,7 +1182,8 @@ fn frameReady(self: *Popup, hwnd: w32.HWND) bool {
 }
 
 /// A modal popup revealed without a frame (`RevealTimeout.reveal`): paint
-/// again every `repaint_retry_ms` until a frame of its size and DPI succeeds.
+/// again, backing off (`nextRepaintRetry`), until a frame of its size and
+/// DPI succeeds.
 fn retryPaint(self: *Popup, hwnd: w32.HWND) void {
     const cookie = self.uia_cookie;
     _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | RDW_UPDATENOW);
@@ -1164,7 +1194,8 @@ fn retryPaint(self: *Popup, hwnd: w32.HWND) void {
         log.info("popup painted after an unpainted reveal", .{});
         return;
     }
-    if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, repaint_retry_ms, null) == 0) current.repaint_retry = false;
+    current.repaint_retry_delay_ms = nextRepaintRetry(current.repaint_retry_delay_ms);
+    if (w32.SetTimer(hwnd, REVEAL_TIMER_ID, current.repaint_retry_delay_ms, null) == 0) current.repaint_retry = false;
 }
 
 fn animTick(animator: *anim.Animator, now: u64) bool {
@@ -1230,6 +1261,7 @@ fn endMotion(self: *Popup, hwnd: w32.HWND) void {
     self.open_timing = null;
     if (self.revealing or self.repaint_retry) _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
     self.repaint_retry = false;
+    self.repaint_retry_delay_ms = repaint_retry_first_ms;
     if (self.revealing) {
         setCloaked(hwnd, false);
         self.revealing = false;
@@ -1916,6 +1948,7 @@ fn onNcDestroy(self: *Popup, hwnd: w32.HWND) void {
     self.focused = false;
     self.revealing = false;
     self.repaint_retry = false;
+    self.repaint_retry_delay_ms = repaint_retry_first_ms;
     self.repeat_tag = null;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
 }
