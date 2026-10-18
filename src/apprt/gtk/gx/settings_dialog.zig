@@ -12,7 +12,8 @@
 //! each theme: the configuration is built in memory from a snapshot of
 //! the configuration layers (`gx.config_layers.Layers`) with a `--theme`
 //! override. Applying a theme saves it; reverting, going back or closing
-//! the dialog without applying ends the preview. A configuration that
+//! the dialog without applying ends the preview, and reverting or going
+//! back also drops a theme whose saving failed. A configuration that
 //! follows the system's light or dark mode with two themes shows a row
 //! for each.
 //!
@@ -619,6 +620,20 @@ pub const GxSettingsDialog = extern struct {
             }
         }
         return effects;
+    }
+
+    /// Drops the `theme` change a failed Apply left recorded, for Revert
+    /// and going back from the theme list (D-15): the dialog shows the
+    /// saved theme again, so no later save (Retry, another change or
+    /// closing) may write the reverted one. The other recorded changes
+    /// stay for their retry. Returns whether a change was dropped.
+    fn dropThemeChange(changes: *settings_map.Changes) bool {
+        for (changes.entries.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.key, "theme")) continue;
+            _ = changes.entries.orderedRemove(i);
+            return true;
+        }
+        return false;
     }
 
     /// Shows the values of `config`, without recording them as changes.
@@ -1755,11 +1770,21 @@ pub const GxSettingsDialog = extern struct {
         self.applySaved();
     }
 
-    /// Ends the preview and selects the saved theme again.
+    /// Ends the preview and selects the saved theme again, dropping the
+    /// theme a failed Apply left to save (`dropThemeChange`). With nothing
+    /// else to save, its retry toast goes and the dialog can close again.
     fn revertTheme(self: *Self) void {
         const priv = self.private();
         const st = &priv.state;
         self.endPreview();
+        if (dropThemeChange(&st.changes) and st.changes.isEmpty() and !st.apply_pending) {
+            if (st.save_source) |source| {
+                st.save_source = null;
+                _ = glib.Source.remove(source);
+            }
+            self.dismissToast();
+            self.as(adw.Dialog).setCanClose(1);
+        }
         if (st.theme_selection) |selection| {
             const saved = self.savedThemeIndex(st.target);
             const pos = if (saved) |index| std.mem.indexOfScalar(u32, st.visible.items, index) else null;
@@ -2744,6 +2769,42 @@ test "failed settings saves preserve font edits and resets for retry" {
     defer saved.deinit();
     try overlay.write(&saved.writer);
     try testing.expectEqualStrings("font-family = New Mono\nfont-family = CJK Fallback\n", saved.written());
+}
+
+test "reverting after a failed theme save keeps the reverted theme out of later saves" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "blocked", .data = "not a directory" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const blocked = try std.fs.path.join(alloc, &.{ root, "blocked", gx.gui_settings.file_name });
+    defer alloc.free(blocked);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = gx.gui_settings.file_name, .data = "theme = Saved\n" });
+
+    // Apply fails while a font size waits for the same save (D-15).
+    var changes = settings_map.Changes.init(alloc);
+    defer changes.deinit();
+    try changes.set("font-size", "14");
+    try changes.set("theme", "Chalkboard");
+    try testing.expectError(error.NotDir, changes.commit(alloc, io, blocked));
+
+    // Revert, then the next save: Retry, another change or closing.
+    const dropped = GxSettingsDialog.dropThemeChange(&changes);
+    try changes.commit(alloc, io, path);
+    var overlay = try gx.gui_settings.Overlay.load(alloc, io, path);
+    defer overlay.deinit();
+    try testing.expectEqualStrings("Saved", overlay.get("theme") orelse "");
+    try testing.expectEqualStrings("14", overlay.get("font-size") orelse "");
+    try testing.expect(dropped);
+
+    // Only the theme is dropped; without a recorded theme nothing is.
+    try changes.set("cursor-style", "bar");
+    try testing.expect(!GxSettingsDialog.dropThemeChange(&changes));
+    try testing.expectEqual(@as(usize, 1), changes.entries.items.len);
 }
 
 test "the dialog strings are translated" {
