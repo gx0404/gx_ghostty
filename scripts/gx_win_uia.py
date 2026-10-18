@@ -338,22 +338,52 @@ def run_worker(args) -> dict:
             aut.VariantClear(C.byref(value))
 
     element_iid = guid("d22108aa-8ac5-49a5-837b-37bbb3d7591e")
+    element_array_iid = guid("14314595-b4bc-4055-95f2-58f2e42c9855")
+
+    def element_array_ids(unknown):
+        """AutomationIds of an IUIAutomationElementArray (get_Length/GetElement
+        are slots 3/4), at most 64."""
+        array = pointer()
+        if method(unknown, 0, HRESULT, C.POINTER(GUID), C.POINTER(pointer))(unknown, C.byref(element_array_iid), C.byref(array)) < 0 or not array:
+            return []
+        try:
+            length = C.c_int()
+            check(method(array, 3, HRESULT, C.POINTER(C.c_int))(array, C.byref(length)))
+            ids = []
+            for index in range(max(0, min(length.value, 64))):
+                target = pointer()
+                if method(array, 4, HRESULT, C.c_int, C.POINTER(pointer))(array, index, C.byref(target)) >= 0 and target:
+                    try:
+                        ids.append(callback_property(target, 30011))
+                    finally:
+                        release(target)
+                else:
+                    ids.append(None)
+            return ids
+        finally:
+            release(array)
 
     def controller_ids(element):
-        """ControllerFor (30104): the AutomationIds of the elements it names."""
+        """ControllerFor (30104): the AutomationIds of the elements it names, and
+        the VARIANT type the client got. A client receives an
+        IUIAutomationElementArray (VT_UNKNOWN); a SAFEARRAY of elements
+        (VT_ARRAY|VT_UNKNOWN) is read too."""
         value = Variant()
         stage("enumerate.properties", "IUIAutomationElement.GetCurrentPropertyValue", property_id=30104)
         check(method(element, 10, HRESULT, C.c_int, C.POINTER(Variant))(element, 30104, C.byref(value)))
+        tag = f"0x{value.tag:04x}"
         try:
+            if value.tag == 0x000D and value.data.pointer:
+                return element_array_ids(value.data.pointer), tag
             if value.tag != 0x200D or not value.data.pointer:
-                return []
+                return [], tag
             array = value.data.pointer
             lower, upper = C.c_long(), C.c_long()
             check(aut.SafeArrayGetLBound(array, 1, C.byref(lower)))
             check(aut.SafeArrayGetUBound(array, 1, C.byref(upper)))
             count = upper.value - lower.value + 1
             if count <= 0:
-                return []
+                return [], tag
             data = pointer()
             check(aut.SafeArrayAccessData(array, C.byref(data)))
             try:
@@ -370,7 +400,7 @@ def run_worker(args) -> dict:
                         release(target)
                 else:
                     ids.append(None)
-            return ids
+            return ids, tag
         finally:
             aut.VariantClear(C.byref(value))
 
@@ -598,7 +628,7 @@ def run_worker(args) -> dict:
                               "value": property_value(element, 30045),
                               "localized_type": property_value(element, 30004),
                               "native_window_handle": property_value(element, 30020),
-                              "controller_for": controller_ids(element),
+                              **dict(zip(("controller_for", "controller_for_vt"), controller_ids(element))),
                               "toggle_state": property_value(element, 30086),
                               "expand_state": property_value(element, 30070),
                               "selected": property_value(element, 30079),

@@ -143,6 +143,16 @@ class UiaProbeTests(unittest.TestCase):
         self.assertIn('method(automation, 32, HRESULT, C.c_int, pointer, C.c_int, pointer, pointer)', source)
         self.assertIn('method(automation, 33, HRESULT, C.c_int, pointer, pointer)', source)
 
+    def test_controller_for_reads_the_client_element_array(self):
+        # UIA-06 N3: a client's GetCurrentPropertyValue(ControllerFor) hands back
+        # an IUIAutomationElementArray (VT_UNKNOWN), not the provider's SAFEARRAY;
+        # both are read (get_Length/GetElement are slots 3/4), and the VARIANT type
+        # is reported so an empty list is never ambiguous.
+        source = Path(probe.__file__).read_text(encoding='utf-8')
+        for needle in ('14314595-b4bc-4055-95f2-58f2e42c9855', 'method(array, 3, HRESULT, C.POINTER(C.c_int))',
+                       'method(array, 4, HRESULT, C.c_int, C.POINTER(pointer))', '"controller_for_vt"'):
+            self.assertTrue(needle in source, f'gx_win_uia.py lacks {needle}')
+
     def test_all_required_patterns_have_client_operations(self):
         self.assertEqual({'invoke', 'selection_item', 'value', 'toggle', 'expand_collapse'}, set(probe.PATTERNS))
         self.assertEqual((10005, {'expand': 3, 'collapse': 4}), probe.PATTERNS['expand_collapse'])
