@@ -2070,6 +2070,9 @@ pub const GxSettingsDialog = extern struct {
         const priv = self.private();
         const st = &priv.state;
         const revert = revertChanges(&st.changes, st.apply_pending);
+        // Dismiss the old save failure before restoring the configuration:
+        // a new apply failure must remain visible.
+        if (revert.settled) self.settleSaves();
         if (revert.reapply) {
             self.cancelPreview();
             st.previewing = false;
@@ -2077,7 +2080,6 @@ pub const GxSettingsDialog = extern struct {
         } else {
             self.endPreview();
         }
-        if (revert.settled) self.settleSaves();
         if (st.theme_selection) |selection| {
             const saved = self.savedThemeIndex(st.target);
             const pos = if (saved) |index| std.mem.indexOfScalar(u32, st.visible.items, index) else null;
@@ -3397,4 +3399,22 @@ test "cross window settings preserves the failed edit and retry instead of reope
     defer recovered.unref();
     try testing.expectEqual(first, recovered);
     try testing.expectEqual(toast, st.toast);
+}
+
+
+test "revert keeps a new failure toast when restoring the saved configuration fails" {
+    const dialog = try testDialog();
+    defer dialog.unref();
+    var config = try CoreConfig.default(testing.allocator);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = "", .config = &config, .fail_apply = true };
+    const st = &dialog.private().state;
+    st.test_backend = &backend;
+    try st.changes.set("theme", "Preview");
+    st.previewing = true;
+    dialog.showToast("old retry", true);
+    dialog.revertTheme();
+    try testing.expect(st.changes.isEmpty());
+    try testing.expect(st.toast != null);
+    try testing.expect(!std.mem.eql(u8, std.mem.span(st.toast.?.getTitle().?), "old retry"));
 }
