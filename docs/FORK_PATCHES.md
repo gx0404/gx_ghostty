@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0049）之后的号。在册的 43 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0049，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0050）之后的号。在册的 44 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0050，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -124,6 +124,7 @@
 | GX-0048 | `src/config/Config.zig` | `fork(gx): GX-0048` | active |
 | GX-0048 | `src/os/mouse.zig` | `fork(gx): GX-0048` | active |
 | GX-0049 | `src/cli/validate_config.zig` | `fork(gx): GX-0049` | active |
+| GX-0050 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0050` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -325,7 +326,7 @@ python -m unittest scripts.test_fork_patches -v
 - `OpenGL.init`（主线程）只记录 surface 的 HDC 与 `window-vsync`，不调用 GL；`threadEnter`（渲染线程）创建 4.3 core context、make current（NVIDIA 的线程化驱动在主线程显示或移动新窗口时会让 `wglMakeCurrent` 瞬时失败，所以最多重试 20 次、每次间隔 10 ms）、经 `wgl.getProcAddress`（`wglGetProcAddress` 加 DLL 导出回退）载入 glad、按 `window-vsync` 设 swap interval 1 或 0，非 Debug 构建关掉 NOTIFICATION 级的 GL 调试消息（`wgl.quietDebugOutput`，Release 本来也不记 debug 日志），并记日志 `loaded OpenGL X.Y vendor=… renderer=… software=…`；`threadExit` 释放并删除 context、卸载 glad。GL 调用仍只发生在渲染线程。
 - Windows 上 `swap_chain_count` 为 1：`present` 同步呈现、`Frame.complete` 随后 `gl.finish`，帧不会在 GPU 上重叠；`Target.init` 也不建导出纹理。每个终端的渲染目标从 3 帧 × 2 张降到 1 张，字形 atlas 也只传一份。GTK 仍是 3 帧。
 - `present` 关闭 `GL_FRAMEBUFFER_SRGB`，把 render target blit 到默认 framebuffer，再 `SwapBuffers`；窗口尺寸取 apprt 发布的 `Surface.clientSize`（渲染线程不调用 HWND API）。尺寸一致时只有这一次 blit、不清屏；窗口大于 target 时（拖动改尺寸的间隙、常显滚动条占掉的一列）帧贴左上角，最后一列、最后一行与右下角像素拉伸补满其余部分（`wgl.edgeFills`）。apprt 经 `Surface.unfocusedDim` 要求给未聚焦分屏变暗时，blit 之后用一个小着色程序把预乘色按 `rgb = dim.rgb·dst.a + dst.rgb·(1−dim.a)` 混合到整个窗口、alpha 不变（着色程序首次需要时建立，随 context 销毁、GPU 重置后重建）。没有变化的帧不进入 `Frame.complete`，因而不交换缓冲。Windows 上 `ExportedFrame` 为 `void`，不导出帧、不推 `.redraw`。视口仍由渲染器的 resize 路径（`setViewport`）设置。
-- 交换成功后调用 apprt 的 `signalFrameDrawn`（win32 apprt 在拖动改尺寸时最多等 16 ms 新帧）。驱动支持 `WGL_ARB_create_context_robustness` 时上下文按「重置即丢失」创建；GPU 重置（驱动超时恢复、驱动更新）后 `wgl.Context.present` 换上新上下文、调 apprt 的 `gpuContextReset` 让渲染器重建 GPU 资源，本帧以 `error.ContextLost` 放弃。这些都在新路径 `wgl.zig` 与 win32 apprt 里，补丁行不变。
+- 交换成功后调用 apprt 的 `signalFrameDrawn`（win32 apprt 在拖动改尺寸时最多等 16 ms 新帧）。驱动支持 `WGL_ARB_create_context_robustness` 时上下文按「重置即丢失」创建；GPU 重置（驱动超时恢复、驱动更新）后 `wgl.Context.present` 保留旧上下文、调 apprt 的 `gpuContextReset` 并以 `error.ContextLost` 放弃本帧；本帧归还后由 GX-0050 的 `drawFrameEnd` 钩子在旧上下文释放资源，再换上新上下文、让渲染器重建 GPU 资源。这些都在新路径 `wgl.zig` 与 win32 apprt 里，本补丁的行不变。
 - 非 Windows 目标的行为与产物不变。
 
 ### 上游状态
@@ -1484,3 +1485,12 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：上游改写 `run` 时，保持 stdout 只 flush、不 end。
 - 移除条件：上游 `validate_config.zig::run` 改为 flush（或改用 streaming writer），或 Zig 不再让这种截断失败时，删除标记、恢复上游行，登记改为 removed。
 - 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0049ShapeTests` 锁定 `run` 只 flush、不再出现 `stdout_writer.end()`）；进程级回归在 gx-ci `windows-app` 构建之后的一步：stdout 分别为管道、文件、NUL，合法配置须退出 0、非法配置须退出 1（本地按 GitHub pwsh 包装模拟，修复前的 r6 构建在管道与 NUL 下退出 1，修复后全部符合；`.local/evidence/R5/execution-20261013/final-r3/root/d04/gh-wrapper-sim.log`）。Zig 单测不可行：`run` 写进程真实的 stdout，而测试进程的 stdout 是测试运行器的协议通道。
+
+## GX-0050 Windows GPU 重置后的资源生命周期
+
+- 文件：`src/renderer/OpenGL.zig`；active，未回馈上游。`drawFrameEnd` 的 Windows 短转发、`surfaceSize` 与 `setViewport` 的 Windows 失败守卫各用一个 begin/end 块；这三个函数的 `_ = self;` 因参数开始被使用而移除，分别用紧邻的 GX-0050 单行标记注明。恢复主体在 fork 路径 `src/renderer/opengl/wgl.zig` 与 `src/apprt/win32/Surface.zig`，不修改 generic.zig 或 pkg/opengl。
+- 原因：旧实现先替换 context，再让渲染线程释放旧 shaders，导致新 context 中执行 `glDeleteProgram(旧名字)`、产生 GL_INVALID_VALUE；若名字已复用还可能误删新对象。在 present 内直接释放 swap chain 会等待当前帧尚未归还的 permit。
+- 行为：present 只暂停绘制并保留旧 context；drawFrameEnd 在 frameCompleted 归还 permit 后，在旧 context 中释放资源，再创建和初始化新 context。模拟重置下删除合法，真实丢失 context 下 GPU 操作由丢失 context 处理；CPU 所有权始终正常释放。GUI 只有在旧资源已释放且新 context 可绘制时才 realize。创建/绑定/loader 失败保持不可绘制、回收部分创建结果并保留空 GLAD 表，尺寸查询、resize 与最终 teardown 不访问失效入口。正常 teardown 保持实际 GL 删除。
+- 同步：保持 hook 位于 Frame.complete/frameCompleted 之后、仍持 draw_mutex；不能移到 present 内，也不能在新 context 建立后释放旧名字。`drawable` 的 GUI 读取须持 draw_mutex；Windows GL 操作只在渲染线程。删三个 begin/end 块，并把三个明确的 unused-self 替换标记还原为 `_ = self;` 后，三个函数应与上游一致。
+- 移除条件：上游提供等价的 context-reset 资源废弃/重建生命周期与失败守卫时，移除三个钩子和 fork 实现，并把登记改为 removed。
+- 验证：`python scripts/run_unittests.py test_fork_patches` 中 `Gx0050ShapeTests` 锁定 Windows 门控、调用位置、错误日志、失败守卫与上游还原；`just test --filter D-11` 覆盖旧 program 删除所属 context、名字复用、正常 teardown、创建/makeCurrent/loader 失败及 GUI ready 判定。再跑 renderer/apprt.win32 定向测试和 W14；真实 TDR 与未被夹具覆盖的第一恢复帧不得以单测代证。
