@@ -924,8 +924,8 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
 # gx_win_gui runs these guards immediately before every SendInput (scripts/gx_win_gui.py::input_guard).
 SEND_GUARDS = ('ensure_foreground', 'ensure_point')
 # Audit causes (gx_win_gui.InputBlocked.CAUSES). Environment causes refute the plan §4 input
-# criterion (INVALID); instance_gone is a product/driver failure of the measured Ghostty
-# and must never be read as noise (no rerun until a VALID batch appears).
+# criterion (INVALID); instance_gone is a product/driver failure of the measured Ghostty and is
+# never read as noise: rerunning such a batch until one passes would cherry-pick the result.
 ENVIRONMENT_CAUSES = ('foreground_lost', 'pointer_target_lost', 'foreign_input')
 PRODUCT_CAUSES = ('instance_gone',)
 
@@ -934,9 +934,11 @@ def guard_evidence(path: Path, batch_id: str) -> dict:
     """Facts from the batch-bound gx_win_gui audit log (gx-input-guard-v1); no file means no rows.
 
     injected: input was actually sent (a passed SendInput guard or a sent key/button
-    release). failures: failed guards (nothing was sent at that point);
-    release_failures: releases that could not be sent. Foreign, malformed or
-    other-batch rows raise PerfError because the log cannot be trusted."""
+    release). Failed rows are split by cause: environment (failed guards with an
+    ENVIRONMENT_CAUSES cause; nothing was sent at that point), product (instance_gone
+    rows of any event) and unexplained (any other failure: unknown or missing cause,
+    a release that was not sent). Foreign, malformed or other-batch rows raise
+    PerfError because the log cannot be trusted."""
     data = path.read_bytes() if path.is_file() else b''
     rows = [json.loads(line) for line in data.decode('utf-8').splitlines() if line.strip()]
     if any(not isinstance(row, dict) or row.get('schema') != 'gx-input-guard-v1' or row.get('batch_id') != batch_id for row in rows):
@@ -986,6 +988,8 @@ def end_input(end: Mapping, probe, threshold: float) -> dict:
     if end['injected_mode']:
         data['fallback'] = 'last_input'  # nothing was injected, so GetLastInputInfo shows only other input
     data['state'] = 'pass' if data['idle_seconds'] >= max(threshold, data['batch_seconds']) else 'fail'
+    if data['state'] == 'fail':
+        data['cause'] = 'foreign_input'  # input this batch did not send happened after the start check
     data['reason'] = (f"idle {data['idle_seconds']:.3f}s; batch {data['batch_seconds']:.3f}s; no input allowed after the start "
                       f"check (required >= {threshold:g}s and >= the batch duration)" +
                       ('; --injected-input batch sent no input: last-input fallback' if end['injected_mode'] else ''))

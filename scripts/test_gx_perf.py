@@ -416,6 +416,17 @@ class QuietBatchTests(unittest.TestCase):
         self.assertEqual(('INVALID', 'INVALID', 'COMPLETE'), (result['status'], result['quiet_status'], result['measurement']))
         self.assertFalse(result['quiet_valid'])
         self.assertFalse(result['plan_compliant'])
+        self.assertEqual(('foreign_input', ['input']), (result['failure_cause'], result['failed_checks']))
+        # A failed non-input criterion is reported as such.
+        args.out = args.out.parent / 'third'
+        self.probe.input_ticks.side_effect = None
+        self.probe.input_ticks.return_value = ticks(600)
+        self.probe.vm.side_effect = [{'win11': {'exists': True, 'owned': True, 'running': False}},
+                                     {'win11': {'exists': True, 'owned': True, 'running': True}}]
+        with mock.patch.object(gx_perf, 'shared_slots_root', return_value=args.slot_root), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(3, gx_perf.run_quiet_batch(args, self.probe, runner))
+        result = json.loads((args.out/'RESULT.json').read_text())
+        self.assertEqual(('INVALID', 'quiet_criteria', ['vm']), (result['status'], result['failure_cause'], result['failed_checks']))
 
     def test_uninjected_end_check_rejects_any_input_after_the_start(self):
         start = 0xFFFFFF00  # the tick clock wraps during this batch
@@ -432,6 +443,8 @@ class QuietBatchTests(unittest.TestCase):
                 self.assertEqual(0 if valid else 3, gx_perf.run_quiet_batch(args, self.probe, runner))
                 after = json.loads((args.out / 'after.json').read_text())['checks']['input']
                 self.assertEqual('pass' if valid else 'fail', after['status'])
+                self.assertEqual(None if valid else 'foreign_input',
+                                 json.loads((args.out / 'RESULT.json').read_text())['failure_cause'])
                 self.assertEqual(1200, after['raw']['batch_seconds'])
                 self.assertEqual(start, after['raw']['batch_start_tick'])
 
