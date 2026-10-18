@@ -495,8 +495,7 @@ pub const Window = extern struct {
     pub fn adoptTab(self: *Self, tab: *Tab) *adw.TabPage {
         assert(tab.as(gtk.Widget).getParent() == null);
         const priv = self.private();
-        // Its `insert` keeps the tab out of the pinned tabs (D-24).
-        const tab_view = gx_gtk.window.AdoptView.of(priv.tab_view);
+        const tab_view = priv.tab_view;
         // fork(gx): GX-0039 end
 
         // Get the position that we should insert the new tab at.
@@ -517,7 +516,8 @@ pub const Window = extern struct {
         };
 
         // Add the page and select it
-        const page = tab_view.insert(tab.as(gtk.Widget), position);
+        // fork(gx): GX-0054 Keep new and adopted tabs after pinned tabs.
+        const page = tab_view.insert(tab.as(gtk.Widget), gx_gtk.window.adoptPosition(tab_view, position));
         tab_view.setSelectedPage(page);
 
         // Create some property bindings
