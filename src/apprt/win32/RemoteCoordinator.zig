@@ -101,7 +101,7 @@ const Target = struct {
     inputs: RemoteInput.Buffer = .{},
     input_sequence: u64 = 0,
     wire_sequence: u64 = 0,
-    input_request: ?struct { request: u64, sequence: u64, surface: refs.Reference } = null,
+    input_request: ?struct { request: u64, sequence: u64, surface: refs.Reference, wire_sequence: u64, measurable: bool } = null,
     replies: [32]?*protocol.Body = @splat(null),
     reply_head: usize = 0,
     reply_len: usize = 0,
@@ -794,6 +794,16 @@ fn syncTimer(self: *Self, app: *App) void {
     for (self.targets) |slot| if (slot) |target| {
         if (target.connection != null and !target.window.unavailable and (!target.source_revoked or target.resend_receipts != null)) needed = true;
     };
+    // Test-only snapshots and ACK recovery use the existing GUI timer. No
+    // additional timer, polling or wire traffic exists without the opt-in gate.
+    if (@import("remote_test.zig").enabled()) {
+        for (self.sources) |slot| if (slot) |source| {
+            if (source.moved and !source.retired and source.connection != null) needed = true;
+        };
+        for (self.targets) |slot| if (slot) |target| {
+            if (target.connection != null and !target.window.unavailable) needed = true;
+        };
+    }
     if (self.closing) needed = false;
     if (needed == self.timer_active) return;
     const hwnd = app.msg_hwnd orelse return;
@@ -933,7 +943,18 @@ fn progressTarget(self: *Self, target: *Target) !void {
         if (@import("remote_test.zig").enabled() and ordered.event == .paste) log.info("remote paste sending queued_transfer={} wire_transfer={} chunk={} wire_sequence={}", .{ input.event.paste.transfer, ordered.event.paste.transfer, ordered.event.paste.index, ordered.sequence });
         const request = try connection.sendBody(target.ticket, .{ .input = ordered });
         target.wire_sequence = ordered.sequence;
-        target.input_request = .{ .request = request, .sequence = input.sequence, .surface = input.surface };
+        target.input_request = .{ .request = request, .sequence = input.sequence, .surface = input.surface, .wire_sequence = ordered.sequence, .measurable = protocol.Input.measurable(input.event) };
+    };
+    if (@import("remote_test.zig").enabled()) if (target.input_request) |pending| {
+        if (target.window.pane(pending.surface)) |pane| if (pane.test_controls.queryDue(true, now)) {
+            _ = try connection.sendBody(target.ticket, .{ .test_query = .{
+                .surface = pending.surface,
+                .lease = pane.gate.lease orelse return error.InvalidLease,
+                .input_request = pending.request,
+                .input_sequence = pending.wire_sequence,
+            } });
+            pane.test_controls.queried(now);
+        };
     };
 }
 
@@ -961,6 +982,11 @@ fn handle(self: *Self, app: *App, work: *transport.Work) !void {
             if (try RemoteSource.handle(app, self, packet)) return;
         }
         switch (packet.body) {
+            .test_query => |query| {
+                if (!@import("remote_test.zig").enabled()) return error.TestDisabled;
+                if (!source.state.acceptsInput(query.lease) or sourceLeaf(source, query.surface) == null or !source.moved or source.retired) return error.InvalidLease;
+                try work.connection.testReackInput(ticket, query);
+            },
             .ready => try source.state.ready(ticket, work.peer().epoch),
             .target_enabled => {
                 try source.state.targetEnabled(ticket, work.peer().epoch);
@@ -998,6 +1024,14 @@ fn handle(self: *Self, app: *App, work: *transport.Work) !void {
         if (try @import("RemotePaneUi.zig").handlePacket(app, pane, packet)) return;
     }
     switch (packet.body) {
+        .test_state => |snapshot| {
+            if (!@import("remote_test.zig").enabled()) return error.TestDisabled;
+            const pane = target.window.pane(snapshot.surface) orelse return error.InvalidSurface;
+            if (pane.closed or pane.unavailable) return error.InvalidSurface;
+            // Snapshot may precede source_revoked; the ticket already binds it
+            // to the exact future lease, checked by the wire validator.
+            pane.test_controls.acceptSnapshot(snapshot);
+        },
         .mapping_offer => |mapping| {
             const receipt_slot = for (&target.receipts) |*entry| {
                 if (entry.* == null) break entry;
@@ -1092,9 +1126,17 @@ fn handle(self: *Self, app: *App, work: *transport.Work) !void {
     }
 }
 fn acknowledge(self: *Self, app: *App, connection: *transport.Connection, packet: *const protocol.Packet) void {
+    return self.acknowledgeWithTestGate(@import("remote_test.zig").enabled(), app, connection, packet);
+}
+
+fn acknowledgeWithTestGate(self: *Self, enabled: bool, app: *App, connection: *transport.Connection, packet: *const protocol.Packet) void {
     if (self.targetConnection(connection)) |target| {
         if (!std.meta.eql(target.ticket, packet.ticket)) return;
         if (target.input_request) |pending| if (pending.request == packet.request_id) {
+            if (enabled) if (target.window.pane(pending.surface)) |pane| {
+                if (pane.test_controls.dropAck(true, pending.measurable, packet.body.acknowledgement.outcome)) return;
+                pane.test_controls.recovering = false;
+            };
             target.input_request = null;
             if (packet.body.acknowledgement.outcome != .completed) {
                 if (target.window.pane(pending.surface)) |pane| if (pane.closed) return;
@@ -1133,6 +1175,56 @@ fn acknowledge(self: *Self, app: *App, connection: *transport.Connection, packet
         return;
     };
     if (source.commit_request == packet.request_id and result.outcome != .completed) self.reclaim(app, source) catch {};
+}
+
+test "remote coordinator drops actual pending ACK once and only recorded reack releases queued input" {
+    const alloc = std.testing.allocator;
+    const pane = try alloc.create(RemotePane);
+    defer alloc.destroy(pane);
+    pane.* = undefined;
+    pane.source_reference = .{ .epoch = 1, .kind = .surface, .id = 5, .generation = 1 };
+    pane.test_controls = .{ .armed = true };
+    var tree: TargetTree = .{ .app = undefined, .reference = .{}, .owner = .{}, .tree = undefined };
+    tree.panes[0] = pane;
+    const connection: *transport.Connection = @ptrFromInt(0x1000);
+    const ticket: protocol.Ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 3, .generation = 4 };
+    var target: Target = .{ .connection = connection, .window = &tree, .ticket = ticket };
+    var self: Self = .{};
+    self.targets[0] = &target;
+    const event: protocol.Input = .{ .surface = pane.source_reference, .lease = .{ .holder_epoch = 2, .transaction = 3, .generation = 4 }, .sequence = 5, .event = .{ .text = try protocol.Text.init("x") } };
+    const packet = try alloc.create(protocol.Packet);
+    defer alloc.destroy(packet);
+    packet.* = .{ .sender_epoch = 1, .recipient_epoch = 2, .request_id = 10, .ticket = ticket, .body = .{ .acknowledgement = .{ .outcome = .completed } } };
+    try std.testing.expect(target.inputs.push(0, event));
+    target.input_request = .{ .request = 10, .sequence = 5, .wire_sequence = 9, .surface = event.surface, .measurable = true };
+    // A foreign ticket and an unrelated ACK cannot consume the armed fault.
+    packet.ticket.generation += 1;
+    self.acknowledgeWithTestGate(true, undefined, connection, packet);
+    packet.ticket = ticket;
+    packet.request_id = 11;
+    self.acknowledgeWithTestGate(true, undefined, connection, packet);
+    try std.testing.expect(pane.test_controls.armed);
+    packet.request_id = 10;
+    self.acknowledgeWithTestGate(true, undefined, connection, packet);
+    try std.testing.expect(target.input_request != null);
+    try std.testing.expect(target.inputs.peek() != null);
+    try std.testing.expectEqual(@as(u64, 1), pane.test_controls.dropped);
+    try std.testing.expect(pane.test_controls.recovering);
+    // The original request-id from the real ledger finishes the original path.
+    self.acknowledgeWithTestGate(true, undefined, connection, packet);
+    try std.testing.expect(target.input_request == null);
+    try std.testing.expect(target.inputs.peek() == null);
+    try std.testing.expect(!pane.test_controls.recovering);
+    try std.testing.expectEqual(@as(u64, 1), pane.test_controls.dropped);
+    try std.testing.expect(target.inputs.push(0, event));
+    target.input_request = .{ .request = 10, .sequence = 5, .wire_sequence = 9, .surface = event.surface, .measurable = true };
+    pane.test_controls.armed = true;
+    // Disabled gate preserves ordinary ACK delivery even if a fault was armed.
+    self.acknowledgeWithTestGate(false, undefined, connection, packet);
+    try std.testing.expect(target.input_request == null);
+    try std.testing.expect(target.inputs.peek() == null);
+    try std.testing.expect(pane.test_controls.armed);
+    try std.testing.expectEqual(@as(u64, 1), pane.test_controls.dropped);
 }
 
 fn watch(connection: *transport.Connection, surface: refs.Reference, ticket: protocol.Ticket, output: *Output) !void {
