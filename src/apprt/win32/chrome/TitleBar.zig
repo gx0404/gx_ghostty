@@ -13,9 +13,12 @@
 //! pure `chrome/caption_layout.zig`. A maximized window takes hits on the
 //! tabs and the main menu button up to the screen edge (`Layout.hit_top`).
 //! Maximize and close are handled through the non-client mouse messages
-//! so DefWindowProc never draws its classic buttons over the row: they
-//! show their own tooltips, look pressed only while the pressed button is
-//! under the pointer, and fade out of their hover look. With a window
+//! so DefWindowProc never draws its classic buttons over the row. All
+//! title bar buttons work like push buttons (`ButtonInput`): a left press
+//! captures the mouse until the release, the button looks pressed while
+//! the pointer is over it and performs only when released there. They
+//! show their own tooltips (none while pressed) and fade out of their
+//! hover look. With a window
 //! material the DWM frame extends under the row and DWM draws its own
 //! caption buttons there; the title bar then leaves the caption buttons to
 //! DWM (`nativeButtons`, `DwmDefWindowProc`) instead of drawing over them.
@@ -576,13 +579,19 @@ fn performButton(self: *TitleBar, button: Button) void {
 /// messages the window routes to `onMouseMove`, `onLeftButtonDown`,
 /// `onLeftButtonUp` and `onMouseLeave`, which hand the rest of the row on
 /// to the tab bar; `onSize` reports what the pointer hits after the layout
-/// moved under it as `WM_SIZE`. Another window taking the mouse capture or
-/// a cancelled mode (`WM_CAPTURECHANGED`, `WM_CANCELMODE`, a dialog
+/// moved under it as `WM_SIZE`. A left press on a button captures the
+/// mouse until the release (`press`, `release`), so the window gets the
+/// moves and the release wherever the pointer goes; meanwhile only the
+/// pressed button reacts to the pointer, without a tooltip, and the tab
+/// bar sees nothing. Another window taking the mouse capture or a
+/// cancelled mode (`WM_CAPTURECHANGED`, `WM_CANCELMODE`, a dialog
 /// showing) drops the press and the hover.
 const ButtonInput = struct {
     /// The button under the pointer and the one being pressed.
     hover: Button = .none,
     pressed: Button = .none,
+    /// The window holds the mouse capture for `pressed`.
+    captured: bool = false,
 
     /// A mouse message: a non-client one with its hit-test code in
     /// `wparam`, a client one (and `WM_SIZE`) with what its point hits.
@@ -607,6 +616,8 @@ const ButtonInput = struct {
 
     const Track = enum { none, nonclient };
 
+    const Capture = enum { keep, take, release };
+
     const Effects = struct {
         /// The title bar consumed the message: neither the tab bar nor
         /// the default handling sees it.
@@ -615,6 +626,8 @@ const ButtonInput = struct {
         tab_bar: bool = false,
         /// Perform this button.
         perform: Button = .none,
+        /// Take or release the mouse capture.
+        capture: Capture = .keep,
         /// Leave tracking to ask for.
         track: Track = .none,
         /// A hover change fades out the button left, unless the layout
@@ -629,13 +642,17 @@ const ButtonInput = struct {
         var fx: Effects = .{};
         switch (m.msg) {
             WM_NCMOUSEMOVE => {
-                self.hover = buttonFromHitCode(m.wparam);
-                if (self.hover != .none) fx = .{ .consumed = true, .track = .nonclient };
+                const button = buttonFromHitCode(m.wparam);
+                self.hover = self.reacting(button);
+                if (button != .none) fx = .{ .consumed = true, .track = .nonclient };
             },
+            // With the capture, the moves say where the pointer is.
             WM_NCMOUSELEAVE => {
-                if (!clientButton(self.hover)) self.hover = .none;
-                self.pressed = .none;
                 fx.consumed = true;
+                if (!self.captured) {
+                    if (!clientButton(self.hover)) self.hover = .none;
+                    if (!clientButton(self.pressed)) self.pressed = .none;
+                }
             },
             WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK => fx = self.press(ncHitOf(m.wparam)),
             w32.WM_LBUTTONDOWN => fx = self.press(m.hit),
@@ -643,13 +660,19 @@ const ButtonInput = struct {
             w32.WM_LBUTTONUP => fx = self.release(m.hit),
             w32.WM_MOUSEMOVE => {
                 const button = buttonOf(m.hit);
-                self.hover = if (clientButton(button)) button else .none;
-                fx.tab_bar = true;
+                if (self.pressed != .none) {
+                    self.hover = self.reacting(button);
+                } else {
+                    self.hover = if (clientButton(button)) button else .none;
+                    fx.tab_bar = true;
+                }
             },
             w32.WM_MOUSELEAVE => {
-                if (clientButton(self.hover)) self.hover = .none;
-                if (clientButton(self.pressed)) self.pressed = .none;
                 fx.tab_bar = true;
+                if (!self.captured) {
+                    if (clientButton(self.hover)) self.hover = .none;
+                    if (clientButton(self.pressed)) self.pressed = .none;
+                }
             },
             w32.WM_RBUTTONUP => fx.consumed = hitsButton(m.hit, .minimize),
             WM_NCRBUTTONDOWN, WM_NCRBUTTONDBLCLK, WM_NCRBUTTONUP => fx.consumed = buttonFromHitCode(m.wparam) != .none,
@@ -660,41 +683,60 @@ const ButtonInput = struct {
                 // only while still under the pointer; the next mouse move
                 // over it hovers it again.
                 const under = buttonOf(m.hit);
-                const button: Button = if (under == .menu and self.hover != .menu) .none else under;
-                if (button != self.hover) {
-                    self.hover = button;
-                    fx.fade = false;
-                    if (button != .none and !clientButton(button)) fx.track = .nonclient;
+                if (self.pressed != .none) {
+                    const button = self.reacting(under);
+                    if (button != self.hover) {
+                        self.hover = button;
+                        fx.fade = false;
+                    }
+                } else {
+                    const button: Button = if (under == .menu and self.hover != .menu) .none else under;
+                    if (button != self.hover) {
+                        self.hover = button;
+                        fx.fade = false;
+                        if (button != .none and !clientButton(button)) fx.track = .nonclient;
+                    }
                 }
             },
             w32.WM_CAPTURECHANGED, WM_CANCELMODE => if (m.msg == WM_CANCELMODE or !m.own_capture) {
-                self.pressed = .none;
-                self.hover = .none;
+                if (m.msg == WM_CANCELMODE and self.captured) fx.capture = .release;
+                self.* = .{};
             },
             else => {},
         }
-        if (self.hover != hover and fx.tooltip == .keep) fx.tooltip = .{ .point = self.hover };
+        if (self.hover != hover and fx.tooltip == .keep) {
+            fx.tooltip = .{ .point = if (self.pressed == .none) self.hover else .none };
+        }
         return fx;
+    }
+
+    /// The button reacting to a pointer over `button`: while one is
+    /// pressed, only that one.
+    fn reacting(self: *const ButtonInput, button: Button) Button {
+        return if (self.pressed == .none or button == self.pressed) button else .none;
     }
 
     fn press(self: *ButtonInput, hit: Hit) Effects {
         switch (hit) {
             .none => return .{},
             .button => |button| {
-                self.pressed = button;
-                return .{ .consumed = true, .tooltip = .hide };
+                self.* = .{ .hover = button, .pressed = button, .captured = true };
+                return .{ .consumed = true, .capture = .take, .tooltip = .hide };
             },
             .tabs => return .{ .consumed = true, .tab_bar = true, .tooltip = .hide },
             .caption => return .{ .consumed = true },
         }
     }
 
-    /// A left release performs the pressed button when it is over it.
+    /// A left release performs the pressed button when it is over it, and
+    /// ends the press and its capture wherever it is.
     fn release(self: *ButtonInput, hit: Hit) Effects {
         const pressed = self.pressed;
         if (pressed == .none) return .{ .tab_bar = true };
+        const capture: Capture = if (self.captured) .release else .keep;
         self.pressed = .none;
-        return .{ .consumed = true, .perform = if (hitsButton(hit, pressed)) pressed else .none };
+        self.captured = false;
+        return .{ .consumed = true, .capture = capture, .perform = if (hitsButton(hit, pressed)) pressed else .none };
     }
 };
 
@@ -732,8 +774,8 @@ fn buttonTooltip(button: Button) TooltipTarget {
 
 /// Feed `m` to the buttons and carry out the `Effects`: repaint the
 /// buttons whose look changed, fade out the one the pointer left, point
-/// the tooltip, ask for leave tracking and perform a button (last: the
-/// main menu runs a modal loop).
+/// the tooltip, ask for leave tracking, take or release the mouse capture
+/// and perform a button (last: the main menu runs a modal loop).
 fn routeButtons(self: *TitleBar, m: ButtonInput.Message) ButtonInput.Effects {
     const before = self.buttons;
     const fx = self.buttons.route(m, .{});
@@ -753,8 +795,20 @@ fn routeButtons(self: *TitleBar, m: ButtonInput.Message) ButtonInput.Effects {
         .hide => self.tooltip.hide(),
         .point => |button| self.setTooltipTarget(buttonTooltip(button)),
     }
-    if (fx.track == .nonclient) {
-        if (self.window().hwnd) |hwnd| self.trackNcLeave(hwnd);
+    const hwnd = self.window().hwnd orelse return fx;
+    if (fx.track == .nonclient) self.trackNcLeave(hwnd);
+    switch (fx.capture) {
+        .keep => {},
+        .take => {
+            _ = w32.SetCapture(hwnd);
+            // Without it (a window of another thread holds it), leaving
+            // the area of the button ends the press instead.
+            self.buttons.captured = w32.GetCapture() == hwnd;
+        },
+        // Sends WM_CAPTURECHANGED, which comes back to `route`.
+        .release => if (w32.GetCapture() == hwnd) {
+            _ = w32.ReleaseCapture();
+        },
     }
     if (fx.perform != .none) self.performButton(fx.perform);
     return fx;
@@ -1953,11 +2007,13 @@ test "maximize and close hover, press and perform through non-client messages" {
     try testing.expect(fx.consumed);
     try testing.expectEqual(Button.maximize, p.input.pressed);
     try testing.expectEqual(ButtonInput.TooltipChange.hide, fx.tooltip);
-    // Over close and back: still the press of maximize.
+    // Over close and back: still the press of maximize, which alone
+    // reacts to the pointer.
     _ = p.nc(WM_NCMOUSEMOVE, HTCLOSE);
-    try testing.expectEqual(Button.close, p.input.hover);
+    try testing.expectEqual(Button.none, p.input.hover);
     try testing.expectEqual(Button.maximize, p.input.pressed);
     _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
+    try testing.expectEqual(Button.maximize, p.input.hover);
     fx = p.nc(WM_NCLBUTTONUP, HTMAXBUTTON);
     try testing.expectEqual(Button.maximize, fx.perform);
     try testing.expectEqual(Button.none, p.input.pressed);
@@ -1969,6 +2025,8 @@ test "maximize and close hover, press and perform through non-client messages" {
     try testing.expectEqual(Button.none, p.input.pressed);
 
     // The empty caption is left to the default handling.
+    _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
+    try testing.expectEqual(Button.maximize, p.input.hover);
     fx = p.nc(WM_NCMOUSEMOVE, HTCAPTION);
     try testing.expect(!fx.consumed);
     try testing.expectEqual(Button.none, p.input.hover);
@@ -2109,4 +2167,88 @@ test "losing the mouse capture or cancelling a mode drops the press and the hove
     try testing.expectEqual(ButtonInput.TooltipChange.keep, own.tooltip);
     try testing.expectEqual(Button.minimize, p.input.pressed);
     try testing.expectEqual(Button.minimize, p.input.hover);
+}
+
+test "a pressed button follows the pointer off and back and performs on release over it" {
+    const testing = std.testing;
+    const cases = [_]struct { button: Button, nc: ?isize, beside: Hit }{
+        .{ .button = .minimize, .nc = null, .beside = TestPointer.maximize },
+        .{ .button = .menu, .nc = null, .beside = .tabs },
+        .{ .button = .maximize, .nc = HTMAXBUTTON, .beside = TestPointer.minimize },
+        .{ .button = .close, .nc = HTCLOSE, .beside = TestPointer.maximize },
+    };
+    for (cases) |case| {
+        const hit: Hit = .{ .button = case.button };
+        var p: TestPointer = .{};
+        // The press captures the mouse: the window gets the moves and the
+        // release wherever the pointer goes.
+        var fx = if (case.nc) |code| p.nc(WM_NCLBUTTONDOWN, code) else p.send(w32.WM_LBUTTONDOWN, hit);
+        try testing.expect(fx.consumed);
+        try testing.expectEqual(ButtonInput.Capture.take, fx.capture);
+        try testing.expectEqual(ButtonInput.TooltipChange.hide, fx.tooltip);
+        try testing.expectEqual(case.button, p.input.pressed);
+        try testing.expectEqual(case.button, p.input.hover);
+        // Leave notifications do not end a captured press.
+        _ = p.send(w32.WM_MOUSELEAVE, .none);
+        _ = p.nc(WM_NCMOUSELEAVE, 0);
+        try testing.expectEqual(case.button, p.input.pressed);
+        // Off the button it looks plain; its neighbor does not react, no
+        // tooltip shows and the tab bar sees nothing.
+        fx = p.send(w32.WM_MOUSEMOVE, case.beside);
+        try testing.expect(!fx.tab_bar);
+        try testing.expectEqual(Button.none, p.input.hover);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+        _ = p.send(w32.WM_MOUSEMOVE, .none);
+        try testing.expectEqual(Button.none, p.input.hover);
+        // Back on it: pressed again, still no tooltip; released there: it
+        // performs and the capture goes.
+        fx = p.send(w32.WM_MOUSEMOVE, hit);
+        try testing.expectEqual(case.button, p.input.hover);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+        fx = p.send(w32.WM_LBUTTONUP, hit);
+        try testing.expect(fx.consumed and !fx.tab_bar);
+        try testing.expectEqual(case.button, fx.perform);
+        try testing.expectEqual(ButtonInput.Capture.release, fx.capture);
+        try testing.expectEqual(Button.none, p.input.pressed);
+
+        // Off it and released there: nothing; the capture goes.
+        _ = if (case.nc) |code| p.nc(WM_NCLBUTTONDOWN, code) else p.send(w32.WM_LBUTTONDOWN, hit);
+        _ = p.send(w32.WM_MOUSEMOVE, case.beside);
+        fx = p.send(w32.WM_LBUTTONUP, case.beside);
+        try testing.expect(fx.consumed and !fx.tab_bar);
+        try testing.expectEqual(Button.none, fx.perform);
+        try testing.expectEqual(ButtonInput.Capture.release, fx.capture);
+        try testing.expectEqual(ButtonInput{}, p.input);
+    }
+}
+
+test "a cancelled mode releases the capture of a pressed button" {
+    const testing = std.testing;
+    var p: TestPointer = .{};
+    _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
+    var fx = p.send(WM_CANCELMODE, .none);
+    try testing.expectEqual(ButtonInput.Capture.release, fx.capture);
+    try testing.expectEqual(ButtonInput{}, p.input);
+    // Another window took the capture: nothing to release.
+    _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
+    fx = p.send(w32.WM_CAPTURECHANGED, .none);
+    try testing.expectEqual(ButtonInput.Capture.keep, fx.capture);
+    try testing.expectEqual(ButtonInput{}, p.input);
+}
+
+test "without the mouse capture, leaving the area of a pressed button ends the press" {
+    const testing = std.testing;
+    var p: TestPointer = .{};
+    _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
+    p.input.captured = false; // `routeButtons` found another window holding it
+    _ = p.nc(WM_NCMOUSELEAVE, 0);
+    try testing.expectEqual(Button.minimize, p.input.pressed);
+    _ = p.send(w32.WM_MOUSELEAVE, .none);
+    try testing.expectEqual(ButtonInput{}, p.input);
+    _ = p.nc(WM_NCLBUTTONDOWN, HTCLOSE);
+    p.input.captured = false;
+    _ = p.send(w32.WM_MOUSELEAVE, .none);
+    try testing.expectEqual(Button.close, p.input.pressed);
+    _ = p.nc(WM_NCMOUSELEAVE, 0);
+    try testing.expectEqual(ButtonInput{}, p.input);
 }
