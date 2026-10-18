@@ -29,8 +29,9 @@
 //!   (`shortcuts`).
 //! - Windows terminal support: win32-input-mode key records
 //!   (`win32_input`), the bundled ConPTY (`conpty`), OSC 7 working
-//!   directories (`osc7`) and shell quoting of dropped or pasted file
-//!   paths (`path_quote`).
+//!   directories (`osc7`), shell quoting of dropped or pasted file
+//!   paths (`path_quote`) and the double-click time of the mouse
+//!   settings (`os_mouse`).
 //! - The DMABUF export of the OpenGL renderer once it cannot work
 //!   (`dmabuf_export`).
 pub const action = @import("action.zig");
@@ -55,6 +56,7 @@ pub const ipc = struct {
 pub const leader = @import("leader.zig");
 pub const motion = @import("motion.zig");
 pub const osc7 = @import("osc7.zig");
+pub const os_mouse = @import("os_mouse.zig");
 pub const palette_history = @import("palette_history.zig");
 pub const path_quote = @import("path_quote.zig");
 pub const perf = @import("perf.zig");
@@ -104,6 +106,7 @@ test {
     _ = leader;
     _ = motion;
     _ = osc7;
+    _ = os_mouse;
     _ = palette_history;
     _ = path_quote;
     _ = perf;
