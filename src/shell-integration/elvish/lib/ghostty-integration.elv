@@ -105,6 +105,8 @@
     if (has-value $features cursor:steady) {
       set cursor = "6"  # steady bar
     }
+    # fork(gx): GX-0047 gx-prompt-cursor = config: the prompt shows the configured cursor.
+    if (has-value $features cursor:config) { set cursor = "0" }
 
     fn beam  { printf "\e["$cursor" q" }
     fn reset { printf "\e[0 q" }

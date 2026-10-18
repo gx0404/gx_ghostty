@@ -294,7 +294,21 @@ fn actionTabClose(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) call
 }
 
 fn actionTabCloseOthers(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
-    window.getTabView().closeOtherPages(contextPage(window) orelse return);
+    closeOtherTabs(window.getTabView(), contextPage(window) orelse return);
+}
+
+/// "Close Other Tabs": asks to close every unpinned tab other than `keep`.
+/// Pinned tabs are not other tabs (R3-Window.01), like the menu item that
+/// counts only unpinned tabs. `closeOtherPages` would close them, because
+/// the window confirms every close request. Going from the last tab keeps
+/// the positions still to visit valid while tabs close.
+fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
+    var i = view.getNPages();
+    while (i > 0) {
+        i -= 1;
+        const page = view.getNthPage(i);
+        if (page != keep and page.getPinned() == 0) view.closePage(page);
+    }
 }
 
 fn actionTabCloseRight(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
@@ -548,6 +562,42 @@ test "menuTrigger shows performable GX shortcuts without adding them to the reve
     try testing.expectEqual(@as(?input.Binding.Trigger, null), keybinds.set.getTrigger(action));
     try keybinds.parseCLI(arena.allocator(), "ctrl+alt+k=gx:keybinds");
     try testing.expect(menuTrigger(&keybinds.set, action).?.equal(keybinds.set.getTrigger(action).?));
+}
+
+test "close other tabs keeps the pinned tabs and the context tab" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const view = adw.TabView.new();
+    _ = view.as(gobject.Object).refSink();
+    defer view.as(gobject.Object).unref();
+    // The window confirms every close request, pinned or not
+    // (`Window.tabViewClosePage` without a running program).
+    _ = adw.TabView.signals.close_page.connect(view, ?*anyopaque, testConfirmClose, null, .{});
+
+    var pages: [6]*adw.TabPage = undefined;
+    for (&pages) |*page| {
+        page.* = view.append(gtk.Label.new(null).as(gtk.Widget));
+        _ = page.*.as(gobject.Object).ref();
+    }
+    defer for (pages) |page| page.as(gobject.Object).unref();
+    view.setPagePinned(pages[2], 1);
+    view.setPagePinned(pages[4], 1);
+
+    // From an unpinned tab: the pinned tabs stay.
+    closeOtherTabs(view, pages[3]);
+    try testing.expectEqual(@as(c_int, 3), view.getNPages());
+    for ([_]*adw.TabPage{ pages[2], pages[4], pages[3] }) |page| try testing.expect(view.getPagePosition(page) >= 0);
+
+    // From a pinned tab: only the unpinned tabs close.
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    closeOtherTabs(view, pages[4]);
+    try testing.expectEqual(@as(c_int, 2), view.getNPages());
+    for ([_]*adw.TabPage{ pages[2], pages[4] }) |page| try testing.expect(view.getPagePosition(page) >= 0);
+}
+
+fn testConfirmClose(view: *adw.TabView, page: *adw.TabPage, _: ?*anyopaque) callconv(.c) c_int {
+    view.closePageFinish(page, 1);
+    return 1;
 }
 
 test "menuTrigger never advertises a key sequence as a single menu accelerator" {

@@ -262,7 +262,12 @@ pub fn threadExit(self: *OpenGL) void {
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-    _ = self;
+    // fork(gx): GX-0050 begin: failed recovery has no current GL context.
+    if (comptime builtin.os.tag == .windows) {
+        if (!self.wgl_context.drawable()) return error.ContextLost;
+    }
+    // fork(gx): GX-0050 end
+    // fork(gx): GX-0050 replaces the now-invalid unused self discard.
     var viewport: [4]gl.c.GLint = undefined;
     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
     return .{
@@ -276,7 +281,12 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
 /// This used to be automatically called by the GtkGLArea upon resizing,
 /// but now we need to do this manually.
 pub fn setViewport(self: *const OpenGL, width: u32, height: u32) void {
-    _ = self;
+    // fork(gx): GX-0050 begin: mailbox resizes must not use unloaded GLAD.
+    if (comptime builtin.os.tag == .windows) {
+        if (!self.wgl_context.drawable()) return;
+    }
+    // fork(gx): GX-0050 end
+    // fork(gx): GX-0050 replaces the now-invalid unused self discard.
     gl.viewport(0, 0, @intCast(width), @intCast(height)) catch |err| {
         log.warn("failed to set OpenGL viewport err={}", .{err});
     };
@@ -293,7 +303,15 @@ pub fn drawFrameStart(self: *OpenGL) void {
 ///
 /// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
-    _ = self;
+    // fork(gx): GX-0050 begin: the completed frame has returned its permit.
+    if (comptime builtin.os.tag == .windows) {
+        self.wgl_context.finishRecovery(self.device) catch |err| {
+            log.err("cannot recreate the OpenGL context err={}", .{err});
+        };
+        return;
+    }
+    // fork(gx): GX-0050 end
+    // fork(gx): GX-0050 replaces the now-invalid unused self discard.
 }
 
 pub fn initShaders(

@@ -18,14 +18,14 @@
 - zsh（`setupZsh`）：`ZDOTDIR` 指向 `<resources>/shell-integration/zsh`，原值存入 `GHOSTTY_ZSH_ZDOTDIR`；`zsh/.zshenv` 先恢复 `ZDOTDIR` 并 source 用户的 `.zshenv`，交互 shell 再 autoload `ghostty-integration`（要求 zsh 5.1 及以上）。
 - fish、elvish（`setupXdgDataDirs`）：把 `<resources>/shell-integration` 前置到 `XDG_DATA_DIRS`（原来为空时补上 `/usr/local/share:/usr/share`），并存入 `GHOSTTY_SHELL_INTEGRATION_XDG_DIR`，脚本加载后自行从 `XDG_DATA_DIRS` 中移除它。elvish 只拿到模块路径，仍需用户 `use ghostty-integration`。
 - nushell（`setupNushell`）：同样设置 XDG，再追加 `--execute 'use ghostty *'`；遇到 `--command`、`--lsp` 或含 `c` 的短选项时放弃改写命令，但保留 XDG 改动。
-- `setupFeatures(env, features, cursor_blink)`：把 `src/config/Config.zig::ShellIntegrationFeatures`（`cursor`、`sudo`、`title`、`ssh-env`、`ssh-terminfo`、`path`）中开启的项按名称排序、用逗号连接后写入 `GHOSTTY_SHELL_FEATURES`；`cursor` 后附 `:blink` 或 `:steady`（取 `cursor-style-blink`，未设时按闪烁）；全部关闭时不设置该变量。
+- `setupFeatures(env, features, cursor_blink)`：把 `src/config/Config.zig::ShellIntegrationFeatures`（`cursor`、`sudo`、`title`、`ssh-env`、`ssh-terminfo`、`path`）中开启的项按名称排序、用逗号连接后写入 `GHOSTTY_SHELL_FEATURES`；`cursor` 后附 `:blink` 或 `:steady`（取 `cursor-style-blink`，未设时按闪烁）；全部关闭时不设置该变量。GX-0047：`Exec.Subprocess.init` 在它之后调用 `src/gx/prompt_cursor.zig::advertise`，`gx-prompt-cursor = config`（默认）时在 cursor 记号后追加 `cursor:config`；`setupFeatures` 本身保持上游。
 - 调用点 `src/termio/Exec.zig::Subprocess.init`（完整的子进程环境契约见 `termio-pty-os.md`）：总是先调用 `setupFeatures`，手动加载的集成也依赖它；`shell-integration = none` 或没有资源目录时不调用 `setup`。脚本依赖其中三项：`GHOSTTY_RESOURCES_DIR`；`TERMINFO=<resources>/../terminfo`（只在找到资源目录、`TERM` 取配置 `term` 时设置，否则 `TERM=xterm-256color`）；`GHOSTTY_BIN_DIR`（Flatpak 内不设置）。
 - `src/os/shell.zig::ShellCommandBuilder` 只用单个空格拼接参数、跳过空串、不加引号；`ShellEscapeWriter` 给 shell 特殊字符加反斜杠（换行除外），供 `src/os/edit.zig` 与 GTK 拖放路径使用。
 
 ### 脚本协议
 
 - 行为只由 `GHOSTTY_SHELL_FEATURES` 决定：`path` 把 `GHOSTTY_BIN_DIR` 追加到 `PATH` 末尾（已存在则跳过）；`sudo` 包装成 `sudo --preserve-env=TERMINFO`（带 `-e`、`--edit` 时不加；除 nushell 外还要求 `TERMINFO` 非空）；开启任一 `ssh-*` 时 `ssh` 改走 `"$GHOSTTY_BIN_DIR/ghostty" +ssh [--forward-env=false] [--terminfo=false] -- <参数>`。nushell 只实现 `ssh` 与 `sudo`，`title`、`cursor` 等由 nushell 自身提供（README）。
-- 发给终端的序列：OSC 133 语义提示（`A` 提示开始、`B` 输入开始、`C` 输出开始、`D;<状态>` 命令结束、`P;k=i|s` 主/次提示；bash 附带 `aid`、`redraw=last`、`cl=line`，fish 4.1 起附带 `click_events=1`）；OSC 7 报告工作目录（bash、zsh、elvish 用原始路径的 `kitty-shell-cwd://`，fish 用 URL 编码的 `file://`）；OSC 2 标题；`CSI 5 q`、`CSI 6 q` 在提示处设为闪烁或常亮竖条光标，执行命令前用 `CSI 0 q` 复位。
+- 发给终端的序列：OSC 133 语义提示（`A` 提示开始、`B` 输入开始、`C` 输出开始、`D;<状态>` 命令结束、`P;k=i|s` 主/次提示；bash 附带 `aid`、`redraw=last`、`cl=line`，fish 4.1 起附带 `click_events=1`）；OSC 7 报告工作目录（bash、zsh、elvish 用原始路径的 `kitty-shell-cwd://`，fish 用 URL 编码的 `file://`）；OSC 2 标题；`CSI 5 q`、`CSI 6 q` 在提示处设为闪烁或常亮竖条光标；有 `cursor:config` 时 bash、elvish、zsh 的 emacs 绑定与未自管 vi 光标的 fish 改发 `CSI 0 q`（复位为配置样式），zsh vi 绑定保持竖线/块状，fish 自管 vi 光标时不插手（GX-0047）；执行命令前用 `CSI 0 q` 复位。
 - 接收端：`src/terminal/osc/parsers/semantic_prompt.zig::parse`、`src/terminal/osc/parsers/report_pwd.zig::parse`，以及 `src/termio/stream_handler.zig::StreamHandler.reportPwd`（只接受 `file` 与 `kitty-shell-cwd` 两种 scheme）。
 
 ### terminfo
@@ -62,4 +62,5 @@
 - 命令拼接与转义：`just test --filter ShellCommandBuilder`、`just test --filter escape`。
 - terminfo：`just test --filter xtgettcap`（`Source.zig` 的应答表；过滤区分大小写）与 `just test-vt --filter XTGETTCAP`（libghostty-vt 侧的应答）。安装产物只能在 Linux 或 macOS 上检查：`just build -Demit-terminfo -Demit-termcap` 后查看 `zig-out/share/terminfo/`；本机 Windows 记 PENDING。
 - 脚本：仓库内没有脚本单测。`*.sh`、`*.bash` 用 `HACKING.md` 的 ShellCheck 一节给出的上游命令检查（本机未装 shellcheck，未运行就记 PENDING，fork CI 也不跑）；其余 shell 只能在 Linux GTK 构建里实机打开对应 shell，核对 `GHOSTTY_SHELL_FEATURES`、提示跳转与工作目录继承。`ssh-terminfo` 的端到端用例是 `nix/tests.nix` 中的 `ssh-integration-test`，按 `HACKING.md` 的 Nix VM 一节运行，需要 Nix，本机记 PENDING。
+- 提示符光标（GX-0047）：`python scripts/gx_wsl.py scenario --out <目录> G22`（bash/zsh 光标矩阵、vi 绑定、`gx-prompt-cursor = bar`），逐张读图；fish、elvish 未安装时记 PENDING。
 - 收尾：`just fmt-check`；改了 `pub` 签名或文档后跑 `just kb`。

@@ -5,8 +5,8 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0046）之后的号。在册的 40 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0046，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
-- 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；CSS 没有块标记，每处改动都写单行标记。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0049）之后的号。在册的 43 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0049，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
 - 移除：删掉改动与标记，把登记行的状态改为 `removed`，补丁小节保留作历史。
@@ -114,6 +114,16 @@
 | GX-0044 | `src/Surface.zig` | `fork(gx): GX-0044` | active |
 | GX-0045 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0045` | active |
 | GX-0046 | `src/Surface.zig` | `fork(gx): GX-0046` | active |
+| GX-0047 | `src/config/Config.zig` | `fork(gx): GX-0047` | active |
+| GX-0047 | `src/termio/Exec.zig` | `fork(gx): GX-0047` | active |
+| GX-0047 | `src/Surface.zig` | `fork(gx): GX-0047` | active |
+| GX-0047 | `src/shell-integration/bash/ghostty.bash` | `fork(gx): GX-0047` | active |
+| GX-0047 | `src/shell-integration/zsh/ghostty-integration` | `fork(gx): GX-0047` | active |
+| GX-0047 | `src/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish` | `fork(gx): GX-0047` | active |
+| GX-0047 | `src/shell-integration/elvish/lib/ghostty-integration.elv` | `fork(gx): GX-0047` | active |
+| GX-0048 | `src/config/Config.zig` | `fork(gx): GX-0048` | active |
+| GX-0048 | `src/os/mouse.zig` | `fork(gx): GX-0048` | active |
+| GX-0049 | `src/cli/validate_config.zig` | `fork(gx): GX-0049` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -591,19 +601,20 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 
-- 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（6 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
+- 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（7 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
 - 标记：`fork(gx): GX-0010`；四个纯新增块以 `// fork(gx): GX-0010 begin: <说明>` 开头、`// fork(gx): GX-0010 end` 结尾，`language` 注释上方是单行标记。
 - 状态：active，未回馈上游。
 - 改动量：改写 `language` 的 18 行文档注释为 25 行；新增约 125 行（键与文档约 100 行、钩子、包装与诊断重放约 25 行），不改、不删其他上游行。
 
 ### 原因
 
-Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/defaults.ghostty`，Windows 另加 `src/gx/defaults-windows.ghostty`）、设置界面写的覆盖文件 `gui-settings.ghostty`，以及固定的优先级「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< `gui-settings.ghostty` < 命令行」。上游 `Config.load` 依次读默认文件、命令行、再读 `config-file`，引入的文件会盖过命令行；`theme` 的加载与明暗切换（`loadTheme`、`changeConditionalState`）都靠重放 `_replay_steps` 重建配置。要让 `theme = GX Mocha` 这种默认值像普通配置一样被用户的 `theme` 与显式颜色覆盖，并在每次重放后保持层序，只能按层重排重放步骤再重建，而 `Replay` 是 `Config.zig` 的私有类型，所以需要一个公开入口。fork 配置键（`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`）必须是 `Config` 的字段，才能走同一套解析、`+show-config`、补全与文档生成；`language` 的语义在 GX 里也变了（只认 `zh-CN`/`en`，默认 `zh-CN`，Windows 与 GTK 可运行时切换），文档注释即用户文档，必须同步改写。
+Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/defaults.ghostty`，Windows 另加 `src/gx/defaults-windows.ghostty`）、设置界面写的覆盖文件 `gui-settings.ghostty`，以及固定的优先级「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< `gui-settings.ghostty` < 命令行」。上游 `Config.load` 依次读默认文件、命令行、再读 `config-file`，引入的文件会盖过命令行；`theme` 的加载与明暗切换（`loadTheme`、`changeConditionalState`）都靠重放 `_replay_steps` 重建配置。要让 `theme = GX Mocha` 这种默认值像普通配置一样被用户的 `theme` 与显式颜色覆盖，并在每次重放后保持层序，只能按层重排重放步骤再重建，而 `Replay` 是 `Config.zig` 的私有类型，所以需要一个公开入口。fork 配置键（`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`、`gx-prompt-cursor`）必须是 `Config` 的字段，才能走同一套解析、`+show-config`、补全与文档生成；`language` 的语义在 GX 里也变了（只认 `zh-CN`/`en`，默认 `zh-CN`，Windows 与 GTK 可运行时切换），文档注释即用户文档，必须同步改写。
 
 ### 行为
 
 - `GHOSTTY_GX_DEFAULTS` 未设置或不是 `0`/`false`/`off`/`no` 时，`Config.load` 改由 `src/gx/config_layers.zig::load` 完成：先按上游顺序读用户默认文件、命令行与 `config-file`，再读覆盖文件（`--config-default-files=false` 时不读用户文件与覆盖文件，但保留 GX 默认值），然后把重放步骤排成「GX 默认值 → 用户文件与全部 include → 覆盖文件 → 命令行 → `-e` 及其命令」，用 `gxReplay` 在空配置上重建，最后 `finalize`。某层设置 `font-family*` 时在该层第一处值前插入重置步骤，高层的字体列表替换低层而不是追加。
 - 重放诊断：上游 `Replay.Iterator` 重放 `.diagnostic` 步骤（`config-file` 打不开、循环引用、不是文件）时只把诊断加进新配置，不再记入新配置的 `_replay_steps`，于是设置了 `theme` 后第二次重放（明暗切换的 `changeConditionalState`、`ghostty +validate-config` 在 `Config.load` 之后再调一次 `finalize`）会丢掉这些诊断。GX 默认带主题，这个缺陷会让 `+validate-config` 漏报缺失的 include，所以补丁让重放把诊断步骤一并记回；每次重放都从空配置开始，诊断不会重复。上游路径（`GHOSTTY_GX_DEFAULTS=0`）同样受益。GX 分层还把读不出的 `gui-settings.ghostty` 与不受支持的 `language` 记成 `.diagnostic` 重放步骤，同样靠这处补丁在之后的每次重放、克隆与 `rebuild` 中保留（`+validate-config` 因此退出 1）。
+- `gx-prompt-cursor`（`config` 默认 / `bar`，值类型 `src/gx/config_types.zig::PromptCursor`）由 GX-0047 消费：选择 shell 集成 `cursor` 特性在提示符显示配置光标还是上游竖线，只影响之后启动的 shell。
 - 默认值引用内置主题 `GX Mocha` 时，加载前把 `src/gx/themes/GX Mocha` 写进用户主题目录（`<配置目录>/ghostty/themes`；文件首行带 GX 标记，内容变化才原子替换，同名但没有标记的用户文件不动），没有资源目录也能解析主题。
 - `GHOSTTY_GX_DEFAULTS=0` 时 `Config.load` 与上游完全一致。`Config.default`、`loadDefaultFiles`、`loadCliArgs`、`loadRecursiveFiles`、`finalize` 等其余入口不变，上游单测不经过 GX 分层。
 - 新增 6 个键都有默认值（`gx-herdr-app-mode = true`、`gx-window-material = solid`、`gx-open-config-ui = settings`、`gx-ctrl-scroll-zoom = true`，两个列表为空）；它们出现在 `+show-config`、shell 补全与生成的配置文档里。`gx-ctrl-scroll-zoom`（Ctrl+滚轮或触控板捏合缩放字号，文档写明只在 Windows 生效、自 Ghostty GX 0.0.3 起）目前只有键与设置项，win32 apprt 尚未按它处理滚轮。C API 按字符串键读取：布尔与枚举照常可读，两个列表类型返回 false（与上游同类键一致）。
@@ -1443,3 +1454,33 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：保持配置 deny 检查在钩子之前、空内容豁免在 deny 断言之后；不得把 `unsupported` 当成有效数据，也不得对 `started` 再回复。
 - 移除条件：上游原生对 `unavailable` 回复空 OSC 52、并对空内容免于 ask 授权后，删除三个块（含测试）并把登记改为 removed；不要误删 Windows fork 文件里的记忆拒绝修复。
 - 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0046ShapeTests` 锁定三块的位置与内容、剥离后等于上游原文）；`just test --filter gx.clipboard`，WSL 上 none 与 `--gtk` 各跑同一 filter；真实剪贴板链路由 VM 的 osc52 相位验证，验证前保持 PENDING。
+
+## GX-0047 shell 提示符光标：`gx-prompt-cursor`
+
+- 文件：`src/config/Config.zig`、`src/termio/Exec.zig`、`src/Surface.zig`、`src/shell-integration/bash/ghostty.bash`、`src/shell-integration/zsh/ghostty-integration`、`src/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish`、`src/shell-integration/elvish/lib/ghostty-integration.elv`；active，未回馈上游。`src/termio/shell_integration.zig` 不改（`setupFeatures` 与其测试保持上游原文）。新键 `gx-prompt-cursor` 写在 GX-0010 的 GX 键块内、属 GX-0010；值类型 `src/gx/config_types.zig::PromptCursor`，记号逻辑与单测在 `src/gx/prompt_cursor.zig`。
+- 标记：`fork(gx): GX-0047`。Zig：`Exec.zig` 两处单行标记（`Config.gx_prompt_cursor` 字段；`setupFeatures` 之后调用 `src/gx/prompt_cursor.zig::advertise`），`Surface.zig` 一处单行标记（`Exec.init` 传入 `.gx_prompt_cursor`），`Config.zig` 两个文档 begin/end 块（`cursor-style` 的说明段、`shell-integration-features` 的 `cursor` 项），块内以 `// ///` 普通注释保留被替换的上游原文。脚本：`#` 单行标记紧贴改动行；bash、fish、elvish 各为一行标记加一行新增；zsh 为一行标记加三行新增（`bar` 变量与 emacs 判断）和 `*)` 改动行上方一行标记（标记内写着上游原写法 `"\e[$(( 5 + steady )) q"`）。被替换的上游注释原样保留（fish `# Change the cursor to a beam on prompt.`、zsh 行尾 `# bar`）。
+- 原因：r6 C2-G 裁定（合同 §6 06:00、08:05）要求提示符处显示生效配置的 `cursor-style`/`cursor-style-blink`，程序运行期间 DECSCUSR 照常生效；zsh/fish 的 vi 绑定保持上游模式区分；并提供恢复上游行为的开关。这是默认提示符行为改动，独立提交、独立复审，用户可否决。
+- 实现：上游 `setupFeatures` 照旧写 `cursor:blink`/`cursor:steady`；`Exec.Subprocess.init` 随后调用 `advertise`，仅当 `gx-prompt-cursor = config`（默认）且 cursor 特性开启时在该记号后追加 `cursor:config`（已有则不重复）；`bar` 或 `no-cursor` 时 `GHOSTTY_SHELL_FEATURES` 与上游逐字相同。脚本识别 `cursor:config`：bash 的 PS1、elvish 的 before-readline 改发 `CSI 0 SP q`；fish 只在没有 `fish_vi_cursor_handle`（fish 未自管 vi 光标）时发送，上游守卫不变；zsh 只在 `$KEYMAP` 不以 `vi` 开头且 `bindkey -lL main` 显示 main 链接到 emacs 时发 0，vi 绑定保持上游的插入竖线、命令模式块状。zsh 5.9 实测 vi 插入模式的 `$KEYMAP` 也是 `main`，只能查 main 的链接；`bindkey -lL` 需命令替换，所以 emacs 绑定下每次 zle-line-init、line-finish 与切换到非 vi keymap 多一次 fork（WSL 实测约 0.46 ms/次），vicmd/visual/viins 不 fork。
+- 不变量：程序期间 DECSCUSR 不受限；`no-cursor` 不写任何 cursor 记号；PS0、preexec、after-readline 的执行前复位不变；`gx-prompt-cursor = bar` 与上游一致（提示符竖线、程序用 `cursor-style`）；旧脚本或手动加载的旧资源不识别新记号时仍是上游竖线。键只影响之后启动的 shell。
+- 验证：`gx.prompt_cursor` 两条单测（config 追加且幂等；bar、cursor 关闭、变量缺失保持上游）；Windows `--filter gx. --filter termio.shell_integration` 489 total / 481 pass / 8 skip，seed `0xcc922e59`；GTK `--filter apprt.gtk.gx --filter gx. --filter termio.shell_integration` 564 / 557 / 7，seed `0xdabae607`。Xvfb G22：24 组矩阵核对 shell 实收的 `GHOSTTY_SHELL_FEATURES`、提示符 DECRQSS、程序起始光标、程序 DECSCUSR 2 与回提示符；zsh 在 underline steady 与 GX 默认 blinking block 下 emacs 绑定为配置、vi 插入为竖线、命令模式为块状，回到 emacs 再为配置；`gx-prompt-cursor = bar` 下 bash/zsh 提示符为竖线、程序以配置的块状启动。126 张图经联系表读过。webgen 与 `+show-config --default --docs` 文档完整、无补丁标记泄漏；`+validate-config` 对 `bar`/`config` 退出 0、对非法值退出 1。证据 F3/A4/round3/。
+- 验证边界：fish、elvish、shellcheck 未安装，语法与运行均 PENDING；Windows 同配置终端、macOS 未验证。
+- 同步：更新上游脚本时先取上游主体，再加回 `cursor:config` 的识别；zsh 保持“仅 emacs 绑定发 0”的判断，fish 保留上游 vi 守卫。上游若改变 cursor 记号格式，`advertise` 找不到 cursor 记号就不追加（静默退回上游行为），需同步其单测。
+- 移除条件：上游提供等价的“提示符复位到配置”且保持 DECSCUSR、`no-cursor` 与 vi 语义时，删除全部 GX-0047 标记与改动（Config 文档按块内保留的上游原文恢复），`gx-prompt-cursor` 按键兼容规则处理；若用户否决新默认，把 `gx-prompt-cursor` 默认改为 `bar` 即恢复上游可见行为。七行改为 removed，保留本节历史。
+
+## GX-0048 Windows 双击间隔跟随系统设置
+
+- 文件：`src/os/mouse.zig`（`clickInterval` 的 switch 里一个 begin/end 块，块内只有 `.windows` 一行，转调 fork 路径 `src/gx/os_mouse.zig::doubleClickTime`）、`src/config/Config.zig`（`click-repeat-interval` 的文档注释，单行标记）；active，未回馈上游。
+- 原因：上游只在 macOS 读系统双击间隔，其他平台在 `click-repeat-interval = 0`（默认）时固定 500 ms。Windows 的双击间隔是用户在鼠标设置里调的值（宿主实测 480 ms）；C3 实验在 Win11 VM 把系统值设为 300 ms 后，400 ms 间隔的两次单击被 Ghostty 判为双击（选中整词），系统自己判为两次单击，两者不一致（证据 `.local/evidence/R5/execution-20261013/final-r3/vm-r6/c3/`）。
+- 行为：Windows 上 `clickInterval` 返回 `GetDoubleClickTime()` 的毫秒数；系统返回 0 时退回上游的 500 ms；上限 4294 ms（核心把它乘以 1_000_000 存进 `u32` 纳秒，而系统允许设到 5000 ms）。只在配置值为 0 时由 `Config.finalize` 取用，用户显式设置的 `click-repeat-interval` 仍然优先，不改系统设置。值在加载配置时读取，改了系统设置要重载配置才生效。其他平台不变。这是默认值改动：空配置下 Windows 的双击判定间隔由固定 500 ms 改为跟随系统（系统保持默认 500 ms 的用户没有变化），想恢复旧行为写 `click-repeat-interval = 500`。
+- 同步：保持只在默认值 0 时取系统值；上游若为 Windows 实现同样的读取，删除本补丁。
+- 移除条件：上游在 `src/os/mouse.zig` 原生支持 Windows 双击间隔后，删除块与 `src/gx/os_mouse.zig`，登记改为 removed。
+- 验证：`just test --filter gx.os_mouse`（0 值与上限的纯函数用例；Windows 上断言与 `GetDoubleClickTime`、`clickInterval` 一致）；`python scripts/run_unittests.py test_fork_patches`（`Gx0048ShapeTests` 锁定块的位置与内容、剥离后等于上游原文、只在 0 值时取系统值）；最终构建上在 VM 内复验系统 300 ms 时 400 ms 间隔判为两次单击、用户设 350 ms 时 325 ms 间隔判为双击，复验前保持 PENDING。
+
+## GX-0049 validate-config 的标准输出只 flush 不截断
+
+- 文件：`src/cli/validate_config.zig`（`run` 末尾的 `stdout_writer.end()` 改为 `stdout_writer.flush()`，单行标记）；active，未回馈上游（上游 main 仍是 `end()`，适合由人回馈）。
+- 原因：Zig 0.16 的 `std.Io.File.Writer.end` 在 positional 模式下 flush 后按写入位置截断文件。Windows 上 stdout 的 writer 无论有没有输出都保持 positional；stdout 是管道或 NUL 时截断失败（具体错误随设备而异），`ghostty +validate-config` 因此对合法配置也退出 1（D-04，证据 `.local/evidence/R5/execution-20261013/final-r3/root/d04/`）；有诊断时退出码本来就是 1，掩盖了同一个错误。POSIX 上同一情形被忽略，不受影响。上游 4ea669562（#10147）对代码生成器做过同样的修复。
+- 行为：只改收尾方式，输出与退出码的语义不变（合法为 0，有诊断时输出诊断并为 1）；不再截断 stdout 指向的文件，与 `+version`、`+help`、`+show-config` 一致。`>` 重定向时 shell 已先截断；以不截断方式打开的已有文件会保留旧内容的尾部，与其他上游 CLI 动作一致。
+- 同步：上游改写 `run` 时，保持 stdout 只 flush、不 end。
+- 移除条件：上游 `validate_config.zig::run` 改为 flush（或改用 streaming writer），或 Zig 不再让这种截断失败时，删除标记、恢复上游行，登记改为 removed。
+- 验证：`python scripts/run_unittests.py test_fork_patches`（`Gx0049ShapeTests` 锁定 `run` 只 flush、不再出现 `stdout_writer.end()`）；进程级回归在 gx-ci `windows-app` 构建之后的一步：stdout 分别为管道、文件、NUL，合法配置须退出 0、非法配置须退出 1（本地按 GitHub pwsh 包装模拟，修复前的 r6 构建在管道与 NUL 下退出 1，修复后全部符合；`.local/evidence/R5/execution-20261013/final-r3/root/d04/gh-wrapper-sim.log`）。Zig 单测不可行：`run` 写进程真实的 stdout，而测试进程的 stdout 是测试运行器的协议通道。

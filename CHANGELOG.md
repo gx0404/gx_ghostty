@@ -25,10 +25,12 @@
 - GTK：快捷键编辑器（键表、按键序列、标志与动作链）与启动配置管理器（新建、编辑、改名、删除自定义启动配置并设默认），都只写 `gui-settings.ghostty`，命令行与其他配置文件提供的条目只读，保存失败保留草稿；`gx:move_split_to_tab`、`gx:move_split_to_window` 把现有分屏连同其终端移到新标签或新窗口，不重启 shell；第一个普通窗口按上次正常关闭时的大小打开，并恢复最大化（`window-save-state = never`、显式的 `window-width`/`window-height`、`maximize` 或 `fullscreen` 优先，不记屏幕位置）。
 - Windows 弹层输入框（查找栏、命令面板、快捷键速查表与设置浮层的搜索框）的编辑能力：撤销与重做（Ctrl+Z、Alt+Backspace 撤销，Ctrl+Y、Ctrl+Shift+Z 重做）、按词移动与删除（Ctrl+←/→、Ctrl+Backspace、Ctrl+Delete，连续的汉字算一个词）、Shift+Insert / Ctrl+Insert / Shift+Delete、双击选词与三击全选；插入符按系统频率闪烁，且只在输入框获得焦点时显示。
 - Windows 命令面板与设置浮层（主题、字体列表）的过滤支持拼音首字母（例如输入 `zt` 能找到「主题」），多个词按任意顺序匹配，全角字母数字按半角匹配；名称以输入开头或完全相同的条目排在前面。
+- 新配置键 `gx-prompt-cursor`（`config` 默认、`bar`）：选择 shell 集成在提示符处显示配置的光标样式，还是像上游一样显示竖线；只影响之后启动的 shell。
 - 开发框架：`just win-gui`（Windows GUI 场景回放与截图取证，场景在 `test/gui/win32/`）、`just wsl scenario`（GTK 场景，在 `test/gui/gtk/`）、`just perf`（新旧构建交替测启动、新建标签、分屏与缩放耗时，报中位数与 p90）、`just pinyin` / `just pinyin-check`（拼音首字母表的生成与校验，`pinyin-check` 并入 `framework-check` 与 `generated-check`）；设 `GHOSTTY_GX_PERF=1` 时日志输出 `info(gx_perf)` 耗时打点；`gx-ci` 的 `windows-app` 与 `gtk-smoke` 增跑 GX 层单测。
 
 ### Changed
 
+- Windows 上 `click-repeat-interval` 为 0（默认）时，双击与三击的判定间隔改用系统鼠标设置里的双击速度（以前固定 500 ms；改了系统设置后重载配置生效）；显式设置的值仍然优先，写 `click-repeat-interval = 500` 可恢复以前的行为。
 - Windows 标签页标题：`set_tab_title` 与双击改名设的名字不再被程序标题（OSC 0/2）冲掉，改名留空或 `set_tab_title:`（空值）即恢复显示程序标题；标签页显示其中聚焦分屏的标题，切换分屏时随之更新。
 - Windows 子进程退出：只有命令启动即失败（在 `abnormal-command-exit-runtime` 内以非零码退出）时才在窗口底部显示「命令失败」提示，它不抢焦点、不阻塞窗口，在该终端按任意键关闭终端（以前是模态对话框）；正常退出不再提示，终端里显示 “Process exited…”，再按 `wait-after-command` 决定是否关闭（与 Linux、macOS 版一致）。
 - Windows 切换标签页：`goto_tab:N` 从 1 计数、超出标签数时到最后一个（以前差一，`goto_tab:1` 跳到第 2 个）；目标已是当前标签时，带 `performable` 的按键（如默认的 Alt+9 `last_tab`）交给 shell；`move_tab` 改为移动当前标签（以前只是切换过去）。
@@ -42,9 +44,13 @@
 - 配置诊断：`language` 填了不支持的值、`gui-settings.ghostty` 读不出来时会报告配置错误，`ghostty +validate-config` 因此返回 1。
 - GTK 切换界面语言与重新加载配置时在内存里重建配置，不再重新读盘。
 - Windows 便携包、安装包、Linux deb 与 debian13 GTK 压缩包附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本（压缩包在 `usr/share/doc/ghostty-gx/`，另附 Ghostty 的 MIT 许可）。
+- shell 集成的光标特性在提示符处显示配置的 `cursor-style` 与闪烁设置（GX 默认为闪烁块状），程序留下的光标形状在下一个提示符复位；程序运行期间仍可用 DECSCUSR 改变光标。zsh 与 fish 的 vi 绑定保持插入竖线、命令模式块状。想要上游的“提示符竖线、程序用配置样式”设 `gx-prompt-cursor = bar`；`no-cursor` 行为不变。
 
 ### Fixed
 
+- Windows 上 `ghostty +validate-config` 的标准输出接到管道或 NUL 时（被脚本、`findstr` 或 PowerShell 捕获，或 `> NUL`），合法配置不再返回 1；有诊断时仍输出诊断并返回 1。
+- GTK 设置里主题保存失败后点「重试」成功时，对话框结束预览并显示已保存的主题（以前仍停在预览状态，「应用」「还原」仍可点，外观页显示旧主题）。
+- GTK 标签页菜单的「关闭其他标签页」不再关闭固定标签。
 - Windows 上程序用 OSC 52 读取剪贴板、而剪贴板里没有文本时，终端回复空内容，不再让等待回复的程序一直挂起，也不为空内容弹出读取确认；某个分屏勾选“记住”并拒绝读取后，之后的读取请求同样得到空回复（与当次点“拒绝”一致）。
 - `-Dapp-runtime=none` 核心测试不再因远程一次性键表续延引用窗口动作分派而编译失败；保留无界面运行时下的键表代次回归测试，真实 apprt 的动作处理不变。
 - Linux 框架测试等待已 join 的工作线程从 `/proc` 消失后再核对 CPU 统计，避免内核线程尚未清理时偶发误报线程集合变化；超时仍失败，保留退出线程 CPU 累计与线程集合断言。
