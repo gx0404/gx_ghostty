@@ -614,7 +614,7 @@ const ButtonInput = struct {
         point: Button,
     };
 
-    const Track = enum { none, nonclient };
+    const Track = enum { none, client, nonclient };
 
     const Capture = enum { keep, take, release };
 
@@ -678,25 +678,15 @@ const ButtonInput = struct {
             WM_NCRBUTTONDOWN, WM_NCRBUTTONDBLCLK, WM_NCRBUTTONUP => fx.consumed = buttonFromHitCode(m.wparam) != .none,
             w32.WM_SIZE => {
                 // The layout moved under a pointer that stayed (a resize,
-                // maximizing): hover the caption button now under it,
-                // without a fade. The main menu button keeps its hover
-                // only while still under the pointer; the next mouse move
-                // over it hovers it again.
-                const under = buttonOf(m.hit);
-                if (self.pressed != .none) {
-                    const button = self.reacting(under);
-                    if (button != self.hover) {
-                        self.hover = button;
-                        fx.fade = false;
-                    }
-                } else {
-                    const button: Button = if (under == .menu and self.hover != .menu) .none else under;
-                    if (button != self.hover) {
-                        self.hover = button;
-                        fx.fade = false;
-                        if (button != .none and !clientButton(button)) fx.track = .nonclient;
-                    }
-                }
+                // maximizing): the button now under it reacts, without a
+                // fade, and its tooltip starts over (`onSize` hid it).
+                // Leave tracking drops the hover again should the pointer
+                // have left the window by then.
+                const button = self.reacting(buttonOf(m.hit));
+                self.hover = button;
+                fx.fade = false;
+                fx.tooltip = .{ .point = if (self.pressed == .none) button else .none };
+                if (!self.captured) fx.track = trackOf(button);
             },
             w32.WM_CAPTURECHANGED, WM_CANCELMODE => if (m.msg == WM_CANCELMODE or !m.own_capture) {
                 if (m.msg == WM_CANCELMODE and self.captured) fx.capture = .release;
@@ -714,6 +704,17 @@ const ButtonInput = struct {
     /// pressed, only that one.
     fn reacting(self: *const ButtonInput, button: Button) Button {
         return if (self.pressed == .none or button == self.pressed) button else .none;
+    }
+
+    /// The leave tracking that drops the hover of `button`: the client
+    /// area for minimize and the main menu button, the frame for maximize
+    /// and close.
+    fn trackOf(button: Button) Track {
+        return switch (button) {
+            .none => .none,
+            .minimize, .menu => .client,
+            .maximize, .close => .nonclient,
+        };
     }
 
     fn press(self: *ButtonInput, hit: Hit) Effects {
@@ -796,7 +797,11 @@ fn routeButtons(self: *TitleBar, m: ButtonInput.Message) ButtonInput.Effects {
         .point => |button| self.setTooltipTarget(buttonTooltip(button)),
     }
     const hwnd = self.window().hwnd orelse return fx;
-    if (fx.track == .nonclient) self.trackNcLeave(hwnd);
+    switch (fx.track) {
+        .none => {},
+        .client => self.window().tab_bar.trackLeave(),
+        .nonclient => self.trackNcLeave(hwnd),
+    }
     switch (fx.capture) {
         .keep => {},
         .take => {
@@ -1064,8 +1069,8 @@ fn onAppearanceChanged(self: *TitleBar) void {
 
 /// The window was resized (WM_SIZE, not minimized): drop the tooltip,
 /// repaint the row when its layout changed (not for a change of height
-/// only) and hover what is under the pointer now (maximizing moves the
-/// buttons).
+/// only) and hover what is under the pointer now, its tooltip starting
+/// over (maximizing moves the buttons).
 pub fn onSize(self: *TitleBar) void {
     self.tooltip.hide();
     self.forgetNativeBounds();
@@ -2251,4 +2256,44 @@ test "without the mouse capture, leaving the area of a pressed button ends the p
     try testing.expectEqual(Button.close, p.input.pressed);
     _ = p.nc(WM_NCMOUSELEAVE, 0);
     try testing.expectEqual(ButtonInput{}, p.input);
+}
+
+test "a resize hovers the button now under the pointer and points the tooltip at it" {
+    const testing = std.testing;
+    var p: TestPointer = .{};
+    // Minimize and the main menu button track the client area, maximize
+    // and close the frame; the tooltip starts over (`onSize` hid it).
+    const cases = [_]struct { hit: Hit, track: ButtonInput.Track }{
+        .{ .hit = TestPointer.minimize, .track = .client },
+        .{ .hit = TestPointer.minimize, .track = .client },
+        .{ .hit = TestPointer.menu, .track = .client },
+        .{ .hit = TestPointer.maximize, .track = .nonclient },
+        .{ .hit = TestPointer.close, .track = .nonclient },
+    };
+    for (cases) |case| {
+        const fx = p.send(w32.WM_SIZE, case.hit);
+        try testing.expectEqual(buttonOf(case.hit), p.input.hover);
+        try testing.expect(!fx.fade);
+        try testing.expectEqual(case.track, fx.track);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = buttonOf(case.hit) }, fx.tooltip);
+    }
+    // Moved away from under the pointer: no hover, no tooltip.
+    for ([_]Hit{ .tabs, .caption, .none }) |hit| {
+        _ = p.send(w32.WM_SIZE, TestPointer.minimize);
+        const fx = p.send(w32.WM_SIZE, hit);
+        try testing.expectEqual(Button.none, p.input.hover);
+        try testing.expectEqual(ButtonInput.Track.none, fx.track);
+        try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+    }
+    // During a press only the pressed button reacts, without tracking
+    // (the capture holds) or a tooltip.
+    _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
+    var fx = p.send(w32.WM_SIZE, TestPointer.maximize);
+    try testing.expectEqual(Button.none, p.input.hover);
+    try testing.expectEqual(ButtonInput.Track.none, fx.track);
+    try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+    fx = p.send(w32.WM_SIZE, TestPointer.minimize);
+    try testing.expectEqual(Button.minimize, p.input.hover);
+    try testing.expectEqual(ButtonInput.Track.none, fx.track);
+    try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
 }

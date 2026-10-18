@@ -1165,7 +1165,10 @@ pub fn transferSlotAt(self: *TabBar, point: w32.POINT) ?usize {
     return index + @as(usize, if (point.x >= tab_rect.left + @divTrunc(tab_rect.right - tab_rect.left, 2)) 1 else 0);
 }
 
-fn trackLeave(self: *TabBar) void {
+/// Ask for WM_MOUSELEAVE on the client area of the window, which the tab
+/// bar shares with the client buttons of the title bar (`TitleBar.onSize`
+/// asks for one when a resize put a button under the pointer).
+pub fn trackLeave(self: *TabBar) void {
     if (self.tracking_mouse) return;
     const hwnd = self.window().hwnd orelse return;
     var tme = w32.TRACKMOUSEEVENT{
