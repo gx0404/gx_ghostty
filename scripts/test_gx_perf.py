@@ -436,6 +436,33 @@ class QuietTests(unittest.TestCase):
 
 
 class QuietBatchTests(unittest.TestCase):
+    def test_gtk_action_exit4_and_standard_remains_error(self):
+        for index, case in enumerate(('p2', 'p4', 'standard')):
+            args = self.batch_args('--input-observe-only', command=(
+                'just', 'perf', 'gtk', '--case=' + case, '--clone', '/clone', '--out', 'measure'))
+            args.out = self.args.out.parent / f'gtk-gate-{index}'
+            code, result = self.run_batch(args, self.command(4))
+            self.assertEqual((2, 'ERROR', 'DRIVER_ERROR') if case == 'standard' else (4, 'FAIL', 'GATE_FAIL'),
+                             (code, result['status'], result['measurement']))
+            self.assertEqual(str(Path.cwd() / 'scripts/gx_perf.py'), result['command'][1])
+
+    def test_gtk_case_never_unwraps_non_wsl_entry(self):
+        for command in (
+                ['python', 'scripts/gx_perf.py', 'win32-ui', '--case', 'p4'],
+                ['python', 'wrapper.py', 'gtk', '--case', 'p2'],
+                ['cmd', '/c', 'python scripts/gx_perf.py gtk --case p4'],
+                ['python', '-m', 'gx_perf', 'gtk', '--case', 'p4']):
+            self.assertTrue(gx_perf.desktop_command(gx_perf.normalize_observe_command(command)))
+
+    def test_gtk_gate_parses_options_not_value_substrings(self):
+        prefix = ['python', 'scripts/gx_perf.py', 'gtk', '--clone', '/clone', '--out', 'measure']
+        for tail, accepted in ((['--case', 'p2'], True), (['--case=p4'], True),
+                               ([], False), (['--env=VALUE=--case=p4'], False),
+                               (['--case', 'p4', '--case=standard'], False),
+                               (['--case', 'p4', '&&', 'ghostty.exe'], False),
+                               (['--case=win32-ui'], False)):
+            self.assertEqual(accepted, gx_perf.gate_exit_contract(prefix + tail), tail)
+
     setUp = QuietTests.setUp
     DRIVER = ('python', 'scripts/gx_perf.py', 'win32-ui', '--case', 'p4')  # exit 4 = complete batch, gate FAIL
 
@@ -878,7 +905,11 @@ class QuietBatchTests(unittest.TestCase):
         try:
             os.chdir(frozen)
             for index, requested in enumerate([['just', 'perf', 'gtk'],
-                                                ['python', 'scripts/gx_perf.py', 'gtk']]):
+                                                ['python', 'scripts/gx_perf.py', 'gtk'],
+                                                ['just', 'perf', 'gtk', '--case', 'p2'],
+                                                ['just', 'perf', 'gtk', '--case=p4'],
+                                                ['python', 'scripts/gx_perf.py', 'gtk', '--case', 'p2'],
+                                                ['python', 'scripts/gx_perf.py', 'gtk', '--case=p4']]):
                 args = self.batch_args('--input-observe-only', command=requested)
                 args.out = self.args.out.parent / f'frozen-{index}'
                 seen = []
@@ -886,7 +917,7 @@ class QuietBatchTests(unittest.TestCase):
                     seen.append((list(command), Path.cwd()))
                     return SimpleNamespace(returncode=0)
                 code, result = self.run_batch(args, runner)
-                expected = [sys.executable, str(frozen / 'scripts/gx_perf.py'), 'gtk'] if index == 0 else requested
+                expected = [sys.executable, str(frozen / 'scripts/gx_perf.py'), *requested[2:]] if requested[0] == 'just' else requested
                 self.assertEqual((0, [(expected, frozen)]), (code, seen))
                 self.assertEqual(expected, result['command'])
                 self.assertEqual(str(frozen), result['command_cwd'])
@@ -2095,6 +2126,49 @@ class EncodingGuardTests(unittest.TestCase):
                   "p.read_text(encoding='utf-8')\nopen(p, 'rb')\np.open('ab')\nos.open(p, 1)\nwindow.open(area)\n"
                   "subprocess.run(a, text=True, encoding='utf-8')\n")
         self.assertEqual([1, 2, 3, 4, 5, 6, 7], [line for line, _ in self.unnamed_encodings(source)])
+
+
+class GtkWiringTests(unittest.TestCase):
+    def test_cases_delegate_only_to_gtk_module(self):
+        import gx_perf_gtk
+        import gx_wsl
+        for case in ('p2', 'p4'):
+            with mock.patch.object(gx_perf_gtk, 'run', return_value=4) as driver, \
+                    mock.patch.object(gx_wsl, 'main') as standard:
+                self.assertEqual(4, gx_perf.main(['gtk', '--clone', '/clone', '--out', 'M', '--case', case,
+                                                  '--capabilities', 'build:identity.json']))
+                self.assertEqual(case, driver.call_args.args[0].case)
+                self.assertEqual(['build:identity.json'], driver.call_args.args[0].capabilities)
+                standard.assert_not_called()
+
+    def test_default_and_explicit_standard_keep_smoke_perf_argv(self):
+        import gx_perf_gtk
+        import gx_wsl
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = []
+            for index, extra in enumerate(([], ['--case', 'standard'])):
+                target = Path(tmp) / str(index)
+                with mock.patch.object(gx_wsl, 'main', return_value=0) as smoke, \
+                        mock.patch.object(gx_perf, 'report_gtk_runs', return_value=0), \
+                        mock.patch.object(gx_perf_gtk, 'run') as actions, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(0, gx_perf.main(['gtk', '--clone', '/frozen', '--out', str(target),
+                                                      '--runs', '2', '--env', 'GSK_RENDERER=cairo', *extra]))
+                    actions.assert_not_called()
+                calls = [list(call.args[0]) for call in smoke.call_args_list]
+                for call in calls:
+                    self.assertIn('--perf', call)
+                    call[call.index('--out') + 1] = 'OUT'
+                commands.append(calls)
+            self.assertEqual(commands[0], commands[1])
+            self.assertEqual(2, len(commands[0]))
+
+    def test_invalid_case_rejected_before_driver_and_capabilities_not_ignored(self):
+        import gx_perf_gtk
+        with mock.patch.object(gx_perf_gtk, 'run') as driver, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, gx_perf.main(['gtk', '--clone', '/c', '--out', 'M', '--case=win32']))
+            self.assertEqual(2, gx_perf.main(['gtk', '--clone', '/c', '--out', 'M',
+                                             '--capabilities', 'build:identity.json']))
+            driver.assert_not_called()
 
 
 if __name__ == "__main__":
