@@ -163,7 +163,9 @@ gx-input-guard-v1 JSON line; a refusal carries `cause` (instance_gone, instance_
 foreground_lost, pointer_target_lost, foreign_input, other) and title-free facts about the window in
 the way. instance_hung: one of the instance's windows is hung (IsHungAppWindow), or the window in the
 way is the Ghost Windows shows for a hung window or a WerFault dialog while the instance does not
-answer WM_NULL within 2 s; quiet-batch reads it, like instance_gone, as a product failure.
+answer WM_NULL within 2 s; quiet-batch reads it, like instance_gone, as a product failure. The same
+vocabulary has instance_self_activated, written only by gx_perf win32-idle (without input the
+instance took the foreground back or restored a minimized window), also a product failure.
 
 Screenshots: `screen` (default) copies the window's visible bounds from the screen like
 CopyFromScreen and fails if another process's window covers it; `print` uses PrintWindow with
@@ -312,9 +314,11 @@ class InputBlocked(GuiError):
     instance ended or its process identity changed), instance_hung (it hangs or crashed: see
     Instance.hang_evidence), foreground_lost, pointer_target_lost, foreign_input (input this
     tool did not send was observed) or other. `details` holds title-free facts about the window
-    in the way (other_pid, other_class, other_image)."""
+    in the way (other_pid, other_class, other_image). The audit vocabulary also has
+    instance_self_activated, which only gx_perf win32-idle writes (its idle_state_window check)."""
 
-    CAUSES = ("instance_gone", "instance_hung", "foreground_lost", "pointer_target_lost", "foreign_input", "other")
+    CAUSES = ("instance_gone", "instance_hung", "instance_self_activated", "foreground_lost", "pointer_target_lost",
+              "foreign_input", "other")
 
     def __init__(self, message: str, cause: str = "other", **details: Any) -> None:
         if cause not in self.CAUSES:

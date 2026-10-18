@@ -31,8 +31,8 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         (with or without the flag) must have had no input at all since the start check.
         Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* driver exited 4), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
-        6 PRODUCT_FAIL (a measured Ghostty instance ended or hung mid-batch: cause instance_gone or
-        instance_hung).
+        6 PRODUCT_FAIL (a measured Ghostty instance ended or hung mid-batch, or win32-idle saw it activate
+        or restore itself without input: cause instance_gone, instance_hung or instance_self_activated).
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
   win32-idle --exe PATH --out DIR [--tabs 1 --windows 1 --state visible --seconds 60]
   win32-gpu --exe PATH --out DIR              (PDH dedicated GPU bytes, 1/11 terminals)
@@ -925,11 +925,13 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
 # gx_win_gui runs these guards immediately before every SendInput (scripts/gx_win_gui.py::input_guard).
 SEND_GUARDS = ('ensure_foreground', 'ensure_point')
 # Audit causes (gx_win_gui.InputBlocked.CAUSES). Environment causes refute the plan §4 input
-# criterion (INVALID); instance_gone (it ended) and instance_hung (it hangs or crashed, with a Ghost
-# or WerFault window in the way) are product/driver failures of the measured Ghostty and are never
-# read as noise: rerunning such a batch until one passes would cherry-pick the result.
+# criterion (INVALID); instance_gone (it ended), instance_hung (it hangs or crashed, with a Ghost
+# or WerFault window in the way) and instance_self_activated (win32-idle: without any input it took
+# the foreground back from its focus helper or restored a minimized window) are product/driver failures
+# of the measured Ghostty and are never read as noise: rerunning such a batch until one passes would
+# cherry-pick the result, and a defect that recurs on every attempt would end up BLOCKED.
 ENVIRONMENT_CAUSES = ('foreground_lost', 'pointer_target_lost', 'foreign_input')
-PRODUCT_CAUSES = ('instance_gone', 'instance_hung')
+PRODUCT_CAUSES = ('instance_gone', 'instance_hung', 'instance_self_activated')
 
 
 def guard_evidence(path: Path, batch_id: str) -> dict:
@@ -969,7 +971,8 @@ def end_input(end: Mapping, probe, threshold: float) -> dict:
     win32-idle) - must have had no input at all since the start check:
     idle >= max(threshold, batch duration) on the same tick clock. Failed guards
     fail the criterion only for environment causes (foreground_lost, pointer_target_lost,
-    foreign_input); instance_gone and instance_hung rows are product failures handled by classify_batch;
+    foreign_input); PRODUCT_CAUSES rows (instance_gone, instance_hung, instance_self_activated) are product
+    failures handled by classify_batch;
     unexplained failures (unknown cause, release not sent) are tool errors."""
     evidence = end['evidence']
     if isinstance(evidence, BaseException):
@@ -1040,8 +1043,8 @@ BATCH_GUIDANCE = {
     'NOT_STARTED': 'The start check did not pass or the slots stayed busy; the command was not run.',
     'ERROR': 'Tool or driver error: this batch is neither PASS nor FAIL evidence. Investigate before rerunning.',
     'NONCOMPLIANT': 'Quiet thresholds were weakened below plan §4 (idle < 600 s): never plan evidence.',
-    'PRODUCT_FAIL': 'A measured Ghostty instance ended, changed identity or hung during the batch (cause '
-                    'instance_gone or instance_hung): '
+    'PRODUCT_FAIL': 'A measured Ghostty instance ended, changed identity or hung during the batch, or activated or '
+                    'restored itself without input (cause instance_gone, instance_hung or instance_self_activated): '
                     'a FAIL-class product/driver failure, not environment noise. Keep it and count it; never rerun to '
                     'replace it; read ghostty.log, crash dumps and guards.jsonl before another attempt. '
                     'product_failure_runs names the arm and run of that instance; root rules on a crash of the '
@@ -1111,7 +1114,7 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
                    failure_runs: Sequence[Mapping] = ()) -> None:
     """Quiet validity comes only from the checks; the measurement only from the command.
     INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL.
-    A measured instance that ended or hung mid-batch (instance_gone, instance_hung) is PRODUCT_FAIL
+    A measured instance that ended, hung or activated itself mid-batch (PRODUCT_CAUSES) is PRODUCT_FAIL
     even when the environment was also noisy: reading it as INVALID would invite rerunning until it
     passes."""
     statuses = {name: row['status'] for name, row in after['checks'].items()}
@@ -1127,7 +1130,8 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
     if product_failures:
         first = product_failures[0]
         cause = first.get('cause') if first.get('cause') in PRODUCT_CAUSES else 'instance_gone'
-        what = 'hangs or crashed' if cause == 'instance_hung' else 'ended or changed identity'
+        what = {'instance_hung': 'hangs or crashed',
+                'instance_self_activated': 'activated or restored itself without input'}.get(cause, 'ended or changed identity')
         result['failure_cause'] = cause
         result['product_failure_runs'] = list(failure_runs)
         arm = next((item for item in failure_runs if item.get('instance_pid') == first.get('instance_pid')), None)
@@ -1750,7 +1754,11 @@ def measure_idle(gui, instance, capture: CaptureRun, args, counters):
     populate(gui, instance, args.tabs, args.windows)
     windows = main_windows(gui, instance)
     if args.state == 'minimized':
-        for window in windows:
+        # SW_MINIMIZE of the active window activates the next activatable top-level window, which is
+        # another measured window that is still shown: minimizing the foreground one last means this
+        # tool never activates a measured window, so a restore seen later is not its own doing.
+        foreground = gui.win32().foreground()
+        for window in sorted(windows, key=lambda window: window.hwnd == foreground):
             instance.ensure_owned()
             gui.win32().ShowWindow(window.hwnd, 6)  # SW_MINIMIZE, owned windows only.
     elif args.state == 'unfocused':
@@ -1762,24 +1770,44 @@ def measure_idle(gui, instance, capture: CaptureRun, args, counters):
         try:
             helper.wait_window(30)
             helper.activate()
-            return idle_interval(gui, instance, capture, args, counters, helper=helper)
+            return idle_interval(gui, instance, capture, args, counters, helper=helper,
+                                 entry=idle_state_entry(gui, instance, capture, args))
         finally:
             helper.close()
-    return idle_interval(gui, instance, capture, args, counters)
+    return idle_interval(gui, instance, capture, args, counters, entry=idle_state_entry(gui, instance, capture, args))
 
 
-def idle_state_check(gui, instance, args, helper=None) -> None:
+def idle_state_entry(gui, instance, capture, args) -> dict:
+    """The moment the --state arrangement is in place: the GetLastInputInfo tick from which the input
+    criterion and instance_self_activated count, and title-free facts about the foreground window.
+    This tool's own input is already counted by then: populate ends with a settle sleep after its
+    last key, and neither activating the focus helper nor minimizing sends input."""
+    w = gui.win32()
+    hwnd = w.foreground()
+    pid = w.window_pid(hwnd) if hwnd else 0
+    entry = {'state': args.state, 'tick': last_input_ticks()[0], 'foreground_pid': pid,
+             'foreground_class': w.class_name(hwnd) if hwnd else 'none',
+             'foreground_image': gui.image_name(pid) if pid else None}
+    capture.report['idle_state_entry'] = entry
+    return entry
+
+
+def idle_state_check(gui, instance, args, helper=None, *, entry_tick: int) -> None:
     """The --state arrangement must still hold after the idle window. A broken one is audited like a
-    failed guard (check idle_state_window, the same gx-input-guard-v1 fields and title-free
-    other_pid/other_class/other_image facts about the foreground window) and raised with that cause:
+    failed guard (check idle_state_window: the gx-input-guard-v1 fields, title-free other_pid/other_class/
+    other_image facts about the foreground window, entry_tick and last_input_tick) and raised with the
+    first cause that applies:
 
-    instance_gone   the measured process ended (ensure_owned audits and raises it), or the unfocused
-                    state's focus helper, an owned process of the same build, ended and so handed the
-                    foreground back: a product/driver failure, never noise (PRODUCT_FAIL).
-    instance_hung   Instance.hang_evidence: the measured process hangs or crashed (PRODUCT_FAIL).
-    foreground_lost any other loss of the arrangement without input: another window took the
-                    foreground of a visible instance, or the measured process regained the foreground
-                    from the live helper, or one of its minimized windows was restored (INVALID).
+    instance_hung           Instance.hang_evidence: the measured process hangs or crashed (PRODUCT_FAIL).
+    instance_gone           the measured process ended (ensure_owned audits and raises it), or the unfocused
+                            state's focus helper, an owned process of the same build, ended and so handed
+                            the foreground back (PRODUCT_FAIL).
+    foreign_input           GetLastInputInfo saw input after the state entry (the input criterion, INVALID).
+    foreground_lost         another process took the foreground of a visible instance (INVALID).
+    instance_self_activated without input since the state entry the measured process took the foreground
+                            back from its live focus helper, or one of its own minimized windows was
+                            restored (PRODUCT_FAIL): measure_idle activates and restores none of them.
+    In the unfocused state another process in front leaves the instance unfocused: that is no failure.
     """
     instance.ensure_owned()
     w = gui.win32()
@@ -1805,38 +1833,52 @@ def idle_state_check(gui, instance, args, helper=None) -> None:
     other_class = w.class_name(hwnd) if hwnd else 'none'
     other_image = gui.image_name(pid) if pid else None
     message += f'; the foreground window is {hwnd:#x} ({other_class}, pid {pid})'
-    cause = 'foreground_lost'
+    # Read after the facts above: an unchanged tick means no input arrived before they were seen.
+    last_input = last_input_ticks()[0]
+    details.update(entry_tick=entry_tick, last_input_tick=last_input)
     if hang := instance.hang_evidence(other_class, other_image):
         cause = 'instance_hung'
         message = f'ghostty pid {instance.pid} hangs or crashed ({hang}): {message}'
     elif details.get('helper_alive') is False:
         cause = 'instance_gone'
         message = f'the focus helper ghostty pid {helper.pid} ended during the idle window: {message}'
+    elif last_input != entry_tick:
+        cause = 'foreign_input'
+        message = f'input arrived after the state entry (last input tick {entry_tick} -> {last_input}): {message}'
+    elif args.state == 'visible' or (args.state == 'unfocused' and helper is None):
+        cause = 'foreground_lost'  # another process holds the foreground, or no live focus helper is known
+    else:
+        cause = 'instance_self_activated'
+        what = ('took the foreground back from its live focus helper' if args.state == 'unfocused'
+                else 'restored a minimized window')
+        message = f'ghostty pid {instance.pid} {what} without input since the state entry: {message}'
     instance.record_input('guard', check='idle_state_window', status='fail', cause=cause, reason=message,
                           state=args.state, other_pid=pid, other_class=other_class, other_image=other_image, **details)
     raise PerfError(message, cause=cause)
 
 
-def idle_interval(gui, instance, capture, args, counters, helper=None):
+def idle_interval(gui, instance, capture, args, counters, helper=None, entry=None):
     time.sleep(2)
     before_log = capture.mark()
     input_before = last_input_ticks()[0]
+    # The input criterion counts from the state entry (measure_idle), not just from the counter window.
+    start_tick = entry['tick'] if entry else input_before
     before = counters.sample(instance)
     time.sleep(args.seconds)
     after = counters.sample(instance)
     input_after = last_input_ticks()[0]
     capture.report.update(before=before, after=after,
-        input_window={'before_tick': input_before, 'after_tick': input_after},
+        input_window={'entry_tick': start_tick, 'before_tick': input_before, 'after_tick': input_after},
         context_switch_diagnostic=context_switch_diagnostic(before, after),
         context_switch_source='NtQuerySystemInformation(SystemProcessInformation), matched TID+CreateTime endpoints; diagnostic only',
         context_switch_scope='endpoint-surviving threads only; threads born and exited between endpoints are not observable')
-    if input_before != input_after:
+    if input_after != start_tick:
         message = 'external input occurred during the idle measurement window'
         # Audited like a failed guard so quiet-batch reads plan §4 noise (INVALID), not a tool error.
         instance.record_input('guard', check='idle_input_window', status='fail', cause='foreign_input', reason=message,
-                              before_tick=input_before, after_tick=input_after)
+                              before_tick=start_tick, after_tick=input_after, **({'since': 'state_entry'} if entry else {}))
         raise PerfError(message, cause='foreign_input')
-    idle_state_check(gui, instance, args, helper)
+    idle_state_check(gui, instance, args, helper, entry_tick=start_tick)
     text = capture.window('idle', before_log)
     capture.count(text, 'proc.snapshot')
     capture.count(text, 'renderer.present', required=False)
