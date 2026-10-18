@@ -2,8 +2,10 @@
 
 Only scalar test messages are sent to PID/birth/hash-checked owned windows.
 No remote protocol packet, clipboard content or foreign process is changed. An
-owned GUI thread's input language may be switched for VK chords or IME input;
-it is always restored and the outcome reported (README "宿主副作用说明").
+owned GUI thread's input language may be switched for VK chords or IME input,
+only to a layout already loaded for this user (the host never loads one;
+--allow-load-layouts is VM only); it is always restored and the outcome
+reported (README "宿主副作用说明").
 Environment/API absence and missing peer interfaces have different statuses;
 neither is reported as an implemented passing scenario.
 """
@@ -27,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import gx_win_gui as gui
 from gx_fixture_evidence import fixture_slots, native_snapshot, process_identity, sha256, write_review, drag_thresholds
+from gx_input_language import LayoutUnavailable, full_hkl, switch_to_us, unload_layouts
 from gx_session_ipc_fixture import Fixture as SessionFixture, complex_document, wait
 
 CONTROL, QUERY, MAGIC = 0x451, 0x452, 0x47584133
@@ -221,12 +224,6 @@ def calibrate(instance, point, tries=12):
     raise EnvironmentUnavailable(f"SendInput cannot place the cursor exactly on {point}: {seen}")
 
 
-def full_hkl(value):
-    """GetKeyboardLayout's 32-bit value as the pointer-sized, sign-extended HKL."""
-    value &= 0xFFFFFFFF
-    return value - (1 << 32) if value & 0x80000000 else value
-
-
 def owned_helper_language(layout, timeout=3.0):
     """Restore the user input language through a fixture-owned top-level window.
 
@@ -275,10 +272,22 @@ class InputLanguage:
     def __init__(self, fixture, instance, hwnd):
         self.fixture, self.instance, self.hwnd = fixture, instance, hwnd
         self.original = gui.win32().keyboard_layout(hwnd)
+        # VM only: may load a missing US layout; what it adds is unloaded in restore.
+        self.allow_load = bool(getattr(getattr(fixture, "args", None), "allow_load_layouts", False))
+        self.added = []
 
     def us(self):
-        result = self.instance.ime_off()  # Microsoft Pinyin swallows Ctrl+Shift+F.
-        self.fixture.check("input-language-us", before=f"0x{self.original:08x}", result=result)
+        """Microsoft Pinyin swallows Ctrl+Shift+F: use a loaded English (US) layout.
+
+        gx_win_gui's ime_off of this tree loads 00000409 when it is missing, so it
+        is not used; a missing US layout is an environment condition on the host."""
+        try:
+            result = switch_to_us(gui.win32(), self.hwnd, added=self.added, allow_load=self.allow_load)
+        except LayoutUnavailable as error:
+            raise EnvironmentUnavailable(str(error)) from None
+        self.fixture.check("input-language-us", **result)
+        if not result["switched"]:
+            raise AssertionError(f"the owned GUI thread did not switch to the US layout: {result}")
         return result
 
     def request(self, layout):
@@ -302,8 +311,10 @@ class InputLanguage:
                 outcome.update(owned_helper_language(self.original))
         except Exception as error:  # noqa: BLE001 - recorded, then fails the case below
             outcome.update(restored=False, error=str(error))
+        if self.added:
+            outcome["unloaded"] = unload_layouts(self.added)
         self.fixture.report.setdefault("input_language", []).append(outcome)
-        if not outcome.get("restored"):
+        if not outcome.get("restored") or not all(item["unloaded"] for item in outcome.get("unloaded", ())):
             raise AssertionError(f"input language was not restored: {outcome}")
         return outcome
 
@@ -844,6 +855,8 @@ def main(argv=None):
     parser.add_argument("--desktop-held", action="store_true")
     parser.add_argument("--ole-source", type=Path)
     parser.add_argument("--remote-controls", type=Path, help="root-provided A2r native selector contract")
+    parser.add_argument("--allow-load-layouts", action="store_true",
+                        help="VM only: load English (US) when it is not loaded (unloaded again); never on the host")
     parser.add_argument("--case", required=True, action="append", choices=("MIG-01", "MIG-02", "MIG-02-local", "MIG-02b", "MIG-03", "MIG-04", "MIG-05", "MIG-07", "MIG-08", "MIG-08-local",
                                                           "IPC-02h", "IPC-03", "IPC-04b", "IPC-06", "IPC-07",
                                                           "UIA-02", "UIA-03", "UIA-04", "OLE-07", "OLE-08", "OLE-09"))

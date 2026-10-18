@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import gx_slots  # noqa: E402
 import gx_win_gui as gui  # noqa: E402
 from gx_fixture_evidence import native_snapshot, write_review, drag_thresholds, fixture_slots
+from gx_input_language import LayoutUnavailable, full_hkl, switch_to, switch_to_us, unload_layouts  # noqa: E402
 
 BEGIN = 0x44F
 QUERY = 0x450
@@ -116,6 +117,9 @@ class Fixture:
         self.processes = {}
         self.expected_exit = set()
         self.layout_saved = None
+        # VM only: may load a missing US layout; restore_layout unloads what it added.
+        self.allow_load_layouts = bool(getattr(args, "allow_load_layouts", False))
+        self.layouts_added = []
         self.hooks_v2 = None
         self.source_child = None
         self.dragback_terminal = None
@@ -482,24 +486,22 @@ class Fixture:
     # -- input guards ----------------------------------------------------------------
 
     def use_us_layout(self, instance, hwnd):
-        """VK-typed letters must not start an IME composition. Restored at cleanup."""
+        """VK-typed letters must not start an IME composition. Only a US layout already
+        loaded for this user is used (the host never loads one); restored at cleanup."""
         api = gui.win32()
         current = api.keyboard_layout(hwnd)
         if self.layout_saved is None:
             self.layout_saved = (instance, hwnd, current)
             self.report["input_language"] = {"before": f"0x{current:08x}"}
-        if current & 0xFFFF == 0x0409:
-            return True
-        api.request_us_layout(hwnd)
         try:
-            wait(lambda: api.keyboard_layout(hwnd) & 0xFFFF == 0x0409, "US keyboard layout", 3)
-        except AssertionError:
-            self.report["input_language"]["us"] = f"not switched; still 0x{api.keyboard_layout(hwnd):08x}"
+            result = switch_to_us(api, hwnd, added=self.layouts_added, allow_load=self.allow_load_layouts)
+        except LayoutUnavailable as exc:
+            self.report["input_language"]["us"] = f"unavailable: {exc}"
             self.save()
             return False
-        self.report["input_language"]["us"] = f"0x{api.keyboard_layout(hwnd):08x}"
+        self.report["input_language"]["us"] = result
         self.save()
-        return True
+        return result["switched"]
 
     def restore_layout(self):
         if self.layout_saved is None:
@@ -508,11 +510,12 @@ class Fixture:
         api = gui.win32()
         try:
             if instance.alive() and api.IsWindow(hwnd) and api.keyboard_layout(hwnd) != before:
-                api.PostMessageW(api.focus_window(hwnd), WM_INPUTLANGCHANGEREQUEST, 0, before)
-                time.sleep(0.2)
+                switch_to(api, hwnd, before)
             self.report["input_language"]["restored"] = f"0x{api.keyboard_layout(hwnd):08x}" if instance.alive() else "owner exited"
         except Exception as exc:  # noqa: BLE001 - report, never mask the result
             self.report["input_language"]["restore_error"] = str(exc)
+        if self.layouts_added:
+            self.report["input_language"]["unloaded"] = unload_layouts(self.layouts_added)
 
     def focus_remote(self, target, window_hwnd):
         """The single visible remote pane, with keyboard focus inside the target."""
@@ -1502,7 +1505,7 @@ class Fixture:
             self.layout_saved = (target, remote.hwnd, api.keyboard_layout(remote.hwnd))
             self.report["input_language"] = {"before": f"0x{self.layout_saved[2]:08x}"}
         target.type_text("echo ")
-        api.PostMessageW(api.focus_window(remote.hwnd), WM_INPUTLANGCHANGEREQUEST, 0, chinese)
+        api.PostMessageW(api.focus_window(remote.hwnd), WM_INPUTLANGCHANGEREQUEST, 0, full_hkl(chinese))
         try:
             wait(lambda: api.keyboard_layout(remote.hwnd) == chinese, "the zh-CN input language", 3)
         except AssertionError:
@@ -1888,6 +1891,8 @@ def main(argv=None):
     parser.add_argument("--ole-source", type=Path, help="built test/windows/gx_ole_source.zig executable for the real OLE drag")
     parser.add_argument("--only", action="append", choices=("uia", "input", "performable", "once", "table", "perf-input", "drag-threshold"),
                         help="after the mandatory transfer run only these probes, in order, then close both apps (repeatable)")
+    parser.add_argument("--allow-load-layouts", action="store_true",
+                        help="VM only: load English (US) when it is not loaded (unloaded again); never on the host")
     parser.add_argument("--perf-count", type=int, default=50)
     parser.add_argument("--perf-interval-ms", type=int, default=200)
     parser.add_argument("--allow-clipboard-loss", action="store_true",
