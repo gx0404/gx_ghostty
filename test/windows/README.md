@@ -62,7 +62,7 @@ FILETIME、exe 路径/哈希、HWND、core id 与 PTY 子进程身份；没有�
 
 | 稳定 case id | 入口/参数 | 边界及限制 |
 |---|---|---|
-| MIG-01 | remote `--only drag-threshold` | 基础竖向探针；第二轮 controller 同时检查横向 drag-active。144 DPI 下 15 DIP=22.5 px，22/23 px 不冒称恰 15 DIP |
+| MIG-01 | remote `--only drag-threshold` | 基础竖向探针；第二轮起 controller 同时检查横向 drag-active。144 DPI 下 15 DIP=22.5 px，22/23 px 不冒称恰 15 DIP |
 | MIG-02/MIG-02b | remote 默认 transfer/dragback | 基础单叶探针；完整嵌套树、zoom、override、原 PTY/history 使用第二轮 controller |
 | MIG-06a/b/d | remote `--only performable --only once --only table` | 实际 shell marker 验证 fallback、once 与持久 table；chain 走默认完整序列 |
 | PERF-REMOTE-01 | remote `--only perf-input --perf-count 50 --perf-interval-ms 200` | 两端 `GHOSTTY_GX_PERF=1`，真实逐字符输入、不回车；由 root 的 quiet 批次汇总 `remote.input_to_present`，夹具不判性能门 |
@@ -120,31 +120,34 @@ BRK-02 对 text 的第一层预览 `respond --decision allow --delay-ms 31000`�
 ```powershell
 # 同前文先核 hash、空闲 >=600 并使用新的 out；每次只跑一个 case，失败保留且不自动重试。
 Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --exe $app --sha256 $hash --out "$run/MIG-05" --build coordinator-frozen --case MIG-05
+Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --exe $app --sha256 $hash --out "$run/MIG-07" --build coordinator-frozen --case MIG-07 --remote-controls "$F3/A2r-fix/remote-controls.json"
 ```
 
 | case | 实际 controller |
 |---|---|
-| MIG-01 | 按原生已绘制 tabRect 实际拖动，10 DIP 横向两侧读 drag.active；15 DIP 纵向两侧观测新窗口 |
+| MIG-01 | 按原生已绘制 tabRect 实际拖动；先在按键抬起时逐像素校准 SendInput 落点，再在同一次按下中跨越边界：阈值内一侧在 `GetCursorPos` 确认落点后等 ≥250 ms、隔 300 ms 读两次（横向 drag.active=0；纵向窗口数不变、无 move loop），越过一侧再等到 drag.active=1 / 新窗口 |
 | MIG-02 / MIG-02b / MIG-03 | 多进程完整嵌套树、0.3125/0.6875、zoom、手动标题、活动 core；每叶先输出 200 行，再核原源进程隐藏宿主的 HWND/PTY PID+birth/history；拖回与实际 shell marker |
-| MIG-02-local | 同进程跨窗合并与再拖出完整树，核每个真实子 HWND 的父子关系和原 PTY |
-| MIG-04 | Session 真正恢复 64 个目标 tab；鼠标实际拖单 tab 源窗口到满目标，目标仍 64，源树/core/PTY 保持 |
+| MIG-02-local | 同进程跨窗合并与拆出完整树，经 CONTROL 3/4 直接调用产品 `moveTabToWindow` / `detachTabForDrag`（没有鼠标手势；手势见 MIG-04），核每个真实子 HWND 的父子关系和原 PTY |
+| MIG-04 | Session 恢复 64 tab 目标与单 tab 源，两窗按主屏工作区并排且整窗可见；真实手势：在源 tab 上按下，纵向越过 15 DIP 触发产品 detach，等到源线程进入原生 SC_MOVE 循环（`GUI_INMOVESIZE`），沿途只经自有窗口移到目标 tab 栏后松开。断言释放点最上层是目标、源窗随指针位移、门控计数 drops/full_refusals/merges 恰为 +1/+1/0，目标仍 64、源树/core/PTY 保持；同一 controller 再删目标一个 tab 做正对照，同一手势必须 +1/0/+1 合入并保持完整树。未开“拖动时显示窗口内容”记环境 PENDING |
 | MIG-05 | 每个叶位置的真实 SetParent 失败（已移动的 HWND 回滚）；WH_CALLWNDPROC 在实际 SetParent 内同步尝试嵌套迁移，检查事务拒绝而非停止 shell |
-| MIG-07 | `--remote-controls <root给的JSON>` 丢一个真实 ACK，等待 query 计数增加；原 cmd 的 `set /p` 收到一个 x，验证没有重复输入 |
-| MIG-08 | 迁移后关闭原普通源窗口，继续远程 split、search 与 wheel；原 PTY history/offset 通过源宿主查询 |
+| MIG-07 | `--remote-controls <F3>/A2r-fix/remote-controls.json`：先轮询 capability 等于 magic，再取基线；先测无丢失时单字符的 input_applied 增量作对照，武装一次 ACK 丢弃后输入 x，要求 ack_dropped 恰 +1、input_query_count 增加、input_applied 增量与对照相同；原 cmd 的 `set /p` 输出文件恰为 `x` |
+| MIG-08 | 迁移后关闭原普通源窗口（同样要 `--remote-controls`），capability 仍就绪；Ctrl+Shift+F 前切到美式键盘（结束恢复原输入语言），继续远程 split、search 与 wheel；远程 scrollback 三项（实时状态量，不当单调值）在底部满足 offset+viewport=total，wheel 后 offset 变小，并与源进程隐藏宿主本地 PageList 查询一致 |
+| MIG-08-local | 同进程 CONTROL 3/4 迁移后关闭原源窗口，在拆出窗口 split、search（同样先切美式键盘并恢复）与 wheel，本地查询 search 计数与 offset 变化 |
 | IPC-02h | 6 个 launcher 竞争，1 个 host、5 个 exit0；唯一 Ctrl+Alt+Shift+F24 持久热键的 attempt/success/live 都为1 |
 | IPC-03 | 选主后、GUI/PTY/hotkey 前停在有界 native seam；只终止本夹具自启 host，secondary 必须非成功退出 |
 | IPC-04b | 从自己启动的真实 host 取得 hello，关闭 host 后 FIRST_PIPE_INSTANCE 占同名管道；只改 hello 的 PID/birth 为实际 Python impostor，其他合法字段原样；要求 DifferentImage 拒绝、无 GUI/PTY |
 | IPC-06 | 已就绪 host 一次 GUI 创建故障；真实 secondary 请求收到非成功退出，host 无新窗口/PTY |
-| IPC-07 | CLI 通过真实认证管道重复发送同一 request key，host GUI toggle 与 execute 计数只增1，Quick 仍可见 |
+| IPC-07 | CLI 通过真实认证管道重复发送同一 request key；先按 launcher PID/birth 断言日志恰有一条 `fixture_ipc_replay ... outcome=completed`（证明确实重发），再要求 host GUI toggle 与 execute 计数只增1，Quick 仍可见 |
 | UIA-02 | 外部 MTA 保留 provider，分别 hide/reopen、换子菜单、销毁窗口；旧对象实际调用必须 0x80040201，不能操作替补对象 |
-| UIA-03 | MTA 连续查询同时切兄弟 pane 焦点、真实中文 IME 组字、关 tab、开 menu、模态确认；无安装 IME 才属于环境 PENDING |
+| UIA-03 | MTA 连续查询同时切兄弟 pane 焦点、真实中文 IME 组字、关 tab、开 menu、模态确认；无安装 IME 才属于环境 PENDING。组字前保存输入语言、IME open 与转换模式（转换模式只 OR 上 NATIVE 位），finally 先恢复 IME 状态再恢复输入语言，app 已退出时经夹具自有窗口恢复；未能恢复记 FAIL |
 | UIA-04 | 注册外部 Notification handler 完成握手后，GUI native publisher 发固定测试通知；必须实际收到正文，query/register/remove 同线程 |
-| OLE-07 | 用 `/n,/separate` 打开自建目录，Shell 确认是新增 HWND 且精确目录，UIA 找唯一自建文件后真实 Explorer drag；原生 Drop/queued 计数各增1；只关自己打开的窗口，不终止 Explorer 进程 |
+| OLE-07 | 用 `/n,/separate` 打开自建目录，Shell 确认是新增 HWND 且精确目录，UIA 找唯一自建文件后真实 Explorer drag；原生 Drop/queued 计数各增1；无论成败都在 finally 关掉所有新增且仍显示该私有目录的窗口（未归属成功时再观察 5 s 防迟到窗口），只关这些窗口，不终止 Explorer 进程 |
 | OLE-08 / OLE-09 | `--ole-source <exe>`：真实 DoDragDrop 已进入循环/目标 hover 时 reparent 或销毁目标；取消后 effect NONE、没有落到替补 pane，资源 release 配对 |
 
-### 测试消息与诊断登记表（仅 GhosttyWindow）
+### 测试消息与诊断登记表
 
-`GHOSTTY_GX_REMOTE_TEST=1` 才响应；关闭时所有控制/查询返回0，故障与计数不改变。
+`GHOSTTY_GX_REMOTE_TEST=1` 才响应；关闭时所有控制/查询返回0（DefWindowProcW），故障与计数不改变。
+ID 只在同一 HWND 内唯一；新增前先查本表。GhosttyWindow 上 A3 的 CONTROL/QUERY：
 所有句柄参数只在当前 App 的 live window/attachment 中解析，不接受外部裸指针。
 
 | 消息 | wParam | lParam / 返回值 |
@@ -153,7 +156,7 @@ Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --ex
 | 同上 | 1 / 2 | 1-based SetParent 失败叶位置 / 同步重入叶位置；0 关闭 |
 | 同上 | 3 / 4 | 当前 tab 合入本 App 的目标 HWND / 拖到真实空新窗，4 返回新 HWND |
 | 同上 | 5 / 6 / 7 | 选择 tab / zoom node（-1取消）/ 活动 leaf node |
-| 同上 | 8 | 删除当前活动叶；保留其他叶/窗，供真实 OLE 销毁用例 |
+| 同上 | 8 | 经产品 `removeLeaf` 删除当前活动叶：多叶 tab 只删该叶；单叶 tab 删除整个 tab，若这是窗口唯一 tab 则窗口随之关闭（代码不保证保留其他叶/窗；OLE 销毁与 MIG-04 正对照前先确认还有别的 tab） |
 | 同上 | 9 / 10 | 当前已发布 Window UIA root 真实 Notification / 生产模态关闭确认（10 用 PostMessage，controller 用 Esc 关闭） |
 | 同上 | 20 / 21 / 22 / 23 | 下一次 newWindow 失败次数（<=16）/ 下一次认证 broker GUI admission 拒绝 / 删除 broker 当前绑定的目标叶 / 生产 addTab |
 | `WM_USER+0x52` = `0x452` QUERY | 0 / 1 / 2 / 3 / 4 | magic `0x47584133` / drag.active / window id / active tab / tab count |
@@ -164,7 +167,19 @@ Invoke-Desktop python test/windows/gx_boundary_controller.py --desktop-held --ex
 | 同上 | 30 / 31 / 32 / 33 | 已绘制 tab 的屏幕像素 x/y/width/height |
 | 同上 | 40 / 41 | SetParent 内真实同步重入数 / 事务拒绝数 |
 | 同上 | 100 / 101 / 102 / 103 / 104 / 105 / 106 | hotkey attempts/successes、GUI toggle、GUI IPC execute、剩余 window failure、当前持久热键数、实际 IME composition 消息数 |
+| 同上 | 107 / 108 / 109 | App 级真实标签拖放：原生 move loop 结束后进入目标查找的次数 / 命中活着的满 64 窗口而拒绝的次数 / 本地合入成功次数 |
 | 同上 | 200 / 201 | 真实 OLE Drop 回调数 / owned payload 成功排入数 |
+
+同进程其他测试消息（不归 A3，均须同一门）：
+
+| 窗口类 | 消息 | 用途 / 所有者 |
+|---|---|---|
+| GhosttyWindow | `WM_USER+0x4f` = `0x44f` / `WM_USER+0x50` = `0x450` | `remote_test` 远程迁移 BEGIN（wParam 目标 PID、lParam 目标 birth）/ QUERY（flags）；A2r |
+| GhosttyRemotePane | `WM_USER+0x50` = `0x450` | REMOTE_QUERY（0 magic `0x47585231`，1 flags）；A2r `remote_test` |
+| GhosttyRemotePane | `WM_USER+0x53` = `0x453` | REMOTE_TEST_QUERY：lParam 必须 0；selector 0 capability（magic `0x47585233`）、1/2/3 scrollback total/viewport/offset、4 input_applied、5 input_query_count、6 ack_dropped；-1 参数非法、-2 未就绪/断连；A2r `RemoteControls.zig` |
+| GhosttyRemotePane | `WM_USER+0x54` = `0x454` | REMOTE_TEST_ACK_DROP：wParam 1、lParam magic，返回 1 已武装下一次真实 completed 输入 ACK；重复武装或恢复中 -1，不可用 -2；A2r |
+
+以上 A2r 消息没有新计时器，复用 GhosttyMsg 的 `RM`。
 
 QUERY 的树索引使用 `lParam = tab | (node << 16)`，最多64 tab / 511 node；tabRect 只用
 tab。无效索引返回-1，远程 leaf 不由 A3拥有的元数据返回-2，不把它解释为0。Snapshot
@@ -172,23 +187,34 @@ tab。无效索引返回-1，远程 leaf 不由 A3拥有的元数据返回-2，�
 
 IPC 的附加 env 开关也必须同时启用主测试门：`GHOSTTY_GX_REMOTE_TEST_HOLD_READY=1`
 在选主后最多等待30s；`GHOSTTY_GX_REMOTE_TEST_REPLAY=1` 让 CLI 的同一个 Attempt 再发
-一次同 key 请求。日志 `fixture_hello <328hex>` 只有本机测试身份/隔离哈希，无终端文本。
+一次同 key 请求，并记 `fixture_ipc_replay pid=N birth=<FILETIME> outcome=<enum>`（发起
+launcher 的身份；日志行首的 `[N]` 是线程号，不是 PID）。日志 `fixture_hello <328hex>` 只有本机测试身份/隔离哈希，无终端文本。
 broker 回执为 `fixture_receipt pid=N request=N outcome=<enum> birth=<FILETIME>`；只认
 与当前 companion PID/birth 相符的记录。
 
 UIA test-only 日志 `fixture_uia` 给 snapshot/HWND/node/kind/reason/pending，queue日志
-在释放锁之后输出；`fixture_uia_dispatch` 给实际是否撤销 snapshot。无 Value 正文。
+在释放锁之后输出；`fixture_uia_dispatch ... invalidates=` 只表示桥层是否预撤销 snapshot
+（focus 为 false），回调自身改模型/布局时仍会 `Popup.invalidate()`，不能据此推断最终
+provider 状态，以随后的 `fixture_uia ... reason=` 为准。无 Value 正文。
 Python FAIL JSON 保留 `stage/node_id/pattern_id/call/hresult/action_results`，不重试。
 
-### A2r 远程控制接口依赖
+### A2r 远程控制接口（MIG-07 / MIG-08）
 
-A3 不修改 Remote*.zig，也不猜 selector。MIG-07 的 JSON 必须由 root 从 A2r 接口生成：
-`version=1`、`query_message`、`capability={selector,value}`、
-`ack_drop={message,wparam,lparam}`（单次丢弃真实输入 ACK、返回1）、整数 selector
-`scrollback_total/scrollback_viewport/scrollback_offset/input_applied/input_query_count/ack_dropped`。
-作用 HWND 是现有 `GhosttyRemotePane`，PID/birth/exe 与既有 QUERY source core id 先核。
-未提供接口报 `WAITING_INTERFACE`，与环境 PENDING 区分。其他迁移 case 已直接查询源
-进程隐藏宿主的真实 terminal 页状态，不用缺失的远程字段填0。
+A3 不修改 Remote*.zig，也不猜 selector；`--remote-controls` 读 root 提供的
+`F3/A2r-fix/remote-controls.json`（A2r b4d9257da）：`version=1`、`query_message=0x453`、
+`capability={selector:0,value:0x47585233}`、`ack_drop={message:0x454,wparam:1,lparam:0x47585233}`，
+selector `scrollback_total=1`、`scrollback_viewport=2`、`scrollback_offset=3`、
+`input_applied=4`、`input_query_count=5`、`ack_dropped=6`。作用 HWND 必须是同 PID 的
+`GhosttyRemotePane`（先核类名与 PID），查询 lParam=0。
+
+- `SendMessageTimeoutW` 的结果按有符号 LRESULT 归一；-1（参数非法/重复武装）与
+  -2（未就绪/断连）一律报错，不当计数增长。
+- 取任何基线前先轮询 capability 直到等于 magic（超时 FAIL）；整个超时内都是 0 说明
+  构建缺少该接口或门未开，记 `WAITING_INTERFACE`。
+- 只有 input_applied / input_query_count / ack_dropped 单调；scrollback 三项是
+  PageList.scrollbar 的实时状态，可随滚动、缩放、截断变小。
+
+两个进程都要 `GHOSTTY_GX_REMOTE_TEST=1`（夹具自动设置），构建需包含 A2r 提交。
 
 ### VM rejected / target_gone 触发
 
@@ -205,3 +231,14 @@ medium: receipt --root <private> --name BRK-03 --expect target_gone
 
 第二条路径在真实 preview 模态期间删除绑定叶、保留 host 与另一 tab，再取消旧 preview，
 由生产 `eligible` 检查返回 `target_gone`。不要杀整个 host，也不要将用户取消改叫 rejected。
+`receipt` 与 `boundary --transition target-gone` 的最终证据只写一次：同一 `--name` 重跑时
+若 `<case>-native.json`、回执截图、review 或 target-gone 文件已存在即拒绝，换新 `--name`。
+
+### 宿主副作用说明
+
+- UIA-03 与 MIG-08 / MIG-08-local 会切换自有 GUI 线程的输入语言（默认“所有应用同一
+  输入法”时对其他应用可见），结束时恢复；恢复结果写入 report 的 `input_language`，
+  失败即 FAIL，需人工恢复。切到美式键盘沿用 `gx_win_gui ime_off`，若该布局原本未加载，
+  `LoadKeyboardLayoutW` 会让它在本次登录会话的输入法列表中出现到注销为止。
+- OLE-07 经用户真实 Explorer 打开夹具私有目录，可能在当前用户的 Explorer 中留下文件夹
+  视图或最近访问等持久痕迹，宿主上无法避免；需要零痕迹时只在 VM 运行。
