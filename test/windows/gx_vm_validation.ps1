@@ -3585,7 +3585,15 @@ function Export-PyFixtureFiles($Context) {
     return @($written | ForEach-Object {
         $relative = $_.FullName.Substring($prefix.Length)
         Add-ExportFile $_.FullName ('py-' + $relative)
-        [ordered]@{ path=$relative; size=$_.Length; sha256=(Get-Sha256 $_.FullName) } })
+        # A running app still writes its log: hash with shared read, and record a failure instead of throwing.
+        $digest = try { Get-SharedSha256 $_.FullName } catch { 'unreadable: ' + $_.Exception.Message }
+        [ordered]@{ path=$relative; size=$_.Length; sha256=$digest } })
+}
+
+function Get-SharedSha256([string]$Path) {
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try { return ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose() }
 }
 
 function Get-PyPopups([int]$TargetPid, $Answered) {

@@ -911,6 +911,27 @@ ConvertTo-GxJson ([ordered]@{ one=$one; doc=$doc; names=@(Get-ExportNames | ForE
         self.assertEqual((out["doc"]["exit_code"], out["doc"]["verdict"]), (2, "PENDING"))
         self.assertEqual(out["names"], ["py-run-1.stdout.txt", "py-run-1.stderr.txt", "py-run-2.stdout.txt", "py-run-2.stderr.txt"])
 
+    def test_fixture_files_held_open_by_an_app_are_still_hashed_and_listed(self):
+        body = r"""
+$script:RunRoot = Join-Path $Work 'run'
+$script:Step = 'step'
+$script:ExportExtra = New-Object System.Collections.Generic.List[string]
+$log = Join-Path $script:RunRoot 'brk\profile\ghostty\logs\ghostty.log'
+[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($log)) | Out-Null
+# Held like a running app holds its log: write access, read and write sharing.
+$held = [IO.FileStream]::new($log, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+$bytes = [Text.Encoding]::ASCII.GetBytes('log line')
+$held.Write($bytes, 0, $bytes.Length); $held.Flush()
+try { $written = @(Export-PyFixtureFiles ([ordered]@{ started=[DateTime]::UtcNow.AddMinutes(-1) })) } finally { $held.Dispose() }
+ConvertTo-GxJson ([ordered]@{ written=$written; names=@(Get-ExportNames | ForEach-Object { $_.name }) }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Add-ExportFile", "Get-ExportNames", "Export-PyFixtureFiles", "Get-SharedSha256"),
+                            ("LF", "JsonSource", "ExportAlias"))
+        # The directory entry size of a file still open for writing may lag (0 here); the hash reads the data.
+        self.assertEqual([(item["path"], item["sha256"]) for item in out["written"]],
+                         [("brk\\profile\\ghostty\\logs\\ghostty.log", hashlib.sha256(b"log line").hexdigest())])
+        self.assertEqual(out["names"], ["py-brk_profile_ghostty_logs_ghostty.log"])
+
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""
 $result = [ordered]@{}
