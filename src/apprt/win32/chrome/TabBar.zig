@@ -1420,9 +1420,31 @@ pub fn onDoubleClick(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
 pub fn onMiddleButtonDown(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     const g = self.geometry(lay);
     const target = self.middleTarget(self.partAt(&g, x, y));
-    self.middle_press.down(target);
-    if (target != null) self.trackLeave();
+    self.beginMiddlePress(target);
     return target != null;
+}
+
+fn beginMiddlePress(self: *TabBar, target: ?u64) void {
+    self.middle_press.down(target);
+    if (target != null) {
+        self.clearMiddleTooltip();
+        self.trackLeave();
+    }
+}
+
+fn releaseMiddlePress(self: *TabBar, target: ?u64) bool {
+    const matched = self.middle_press.release(target);
+    // Movement during a long press may have rearmed the tooltip.
+    if (matched) self.clearMiddleTooltip();
+    return matched;
+}
+
+fn clearMiddleTooltip(self: *TabBar) void {
+    // The slot may name another tab after close: force the next move
+    // to establish a fresh hover target even when its index is equal.
+    self.window().title_bar.tooltip.hide();
+    self.hover = .none;
+    self.invalidate();
 }
 
 fn middleTarget(self: *const TabBar, part: Part) ?u64 {
@@ -1443,7 +1465,7 @@ fn middleTarget(self: *const TabBar, part: Part) ?u64 {
 pub fn onMiddleButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool {
     const g = self.geometry(lay);
     const part = self.partAt(&g, x, y);
-    const matched = self.middle_press.release(self.middleTarget(part));
+    const matched = self.releaseMiddlePress(self.middleTarget(part));
     const i = switch (part) {
         .tab, .tab_close => |i| i,
         .none => return false,
@@ -2263,6 +2285,32 @@ test "tooltips append the shortcut" {
     keys.len = text.len;
     try testing.expectEqualStrings("New tab (Ctrl+Shift+T)", withShortcut(&buf, "New tab", keys));
     try testing.expectEqualStrings("New tab", withShortcut(&buf, "New tab", null));
+}
+
+test "middle press cancels the old tab tooltip before closing its target" {
+    var win: Window = undefined;
+    win.hwnd = null;
+    win.title_bar = .{};
+    win.tab_bar = .{};
+    win.title_bar.tooltip.target = .{ .tab = 0 };
+    win.tab_bar.hover = .{ .tab = 0 };
+    win.tab_bar.beginMiddlePress(42);
+    try std.testing.expectEqual(TitleBar.TooltipTarget.none, win.title_bar.tooltip.target);
+    try std.testing.expectEqual(Part.none, win.tab_bar.hover);
+    // A move during the press can arm the same slot again. Closing it
+    // must clear the tooltip without needing any subsequent movement.
+    win.title_bar.tooltip.target = .{ .tab = 0 };
+    win.tab_bar.hover = .{ .tab = 0 };
+    try std.testing.expect(win.tab_bar.releaseMiddlePress(42));
+    try std.testing.expectEqual(TitleBar.TooltipTarget.none, win.title_bar.tooltip.target);
+    try std.testing.expectEqual(Part.none, win.tab_bar.hover);
+
+    // Non-tab presses do not disturb another chrome control's tooltip.
+    win.title_bar.tooltip.target = .new_tab;
+    win.tab_bar.beginMiddlePress(null);
+    try std.testing.expectEqual(TitleBar.TooltipTarget.new_tab, win.title_bar.tooltip.target);
+    try std.testing.expect(!win.tab_bar.releaseMiddlePress(42));
+    try std.testing.expectEqual(TitleBar.TooltipTarget.new_tab, win.title_bar.tooltip.target);
 }
 
 test "tooltip and title buffers keep complete utf8 codepoints" {
