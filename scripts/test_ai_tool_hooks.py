@@ -463,13 +463,15 @@ def _level(tool: str, tool_input: dict, **kwargs) -> str | None:
 
 
 def _probe_env(**overrides: str) -> dict:
-    """os.environ without the gate's watchdog override, then the overrides.
+    """Copy os.environ without inherited launcher home or watchdog, then apply overrides.
 
     A value exported in the developer's shell would time out ordinary probes; the tests of the
-    override pass an env that sets it explicitly.
+    override pass an env that sets it explicitly. A uv launcher may inject PYTHONHOME for its
+    own runtime; independently registered hooks can select a different Python interpreter.
     """
     env = dict(os.environ)
     env.pop(WATCHDOG_ENV, None)
+    env.pop("PYTHONHOME", None)
     env.update(overrides)
     return env
 
@@ -651,6 +653,42 @@ def _frontmatter(path: Path) -> tuple[dict, str]:
         elif item and key is not None:
             meta[key].append(item.group(1))
     return meta, "\n".join(lines[end + 1:]).strip()
+
+
+class ProbeEnvTests(unittest.TestCase):
+    def test_only_launcher_home_and_watchdog_are_removed_from_a_copy(self) -> None:
+        parent = {
+            "PYTHONHOME": "launcher-python", WATCHDOG_ENV: "0.001",
+            "PATH": "registered-python", "PYTHONPATH": "custom-modules",
+            "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1", "OTHER": "keep",
+        }
+        with mock.patch.dict(os.environ, parent, clear=True):
+            env = _probe_env()
+            self.assertEqual(env, {key: value for key, value in parent.items()
+                                   if key not in ("PYTHONHOME", WATCHDOG_ENV)})
+            env["PATH"] = "child-only"
+            self.assertEqual(dict(os.environ), parent)
+
+    def test_explicit_overrides_still_win(self) -> None:
+        parent = {"PYTHONHOME": "launcher-python", WATCHDOG_ENV: "0.001", "PATH": "original"}
+        overrides = {"PYTHONHOME": "explicit-python", WATCHDOG_ENV: "0.1", "PATH": "fixture"}
+        with mock.patch.dict(os.environ, parent, clear=True):
+            self.assertEqual(_probe_env(**overrides), overrides)
+            self.assertEqual(dict(os.environ), parent)
+
+    def test_registered_interpreter_lookup_is_not_redirected(self) -> None:
+        commands = _registered_commands()
+        with mock.patch.dict(os.environ, {"PYTHONHOME": "launcher-python"}):
+            parent = dict(os.environ)
+            env = _probe_env()
+            self.assertFalse("PYTHONHOME" in env)
+            self.assertEqual(env.get("PATH"), parent.get("PATH"))
+            for executable in ("python", "python3"):
+                with self.subTest(executable=executable):
+                    self.assertEqual(shutil.which(executable, path=env.get("PATH")),
+                                     shutil.which(executable, path=parent.get("PATH")))
+            self.assertEqual(_registered_commands(), commands)
+            self.assertEqual(dict(os.environ), parent)
 
 
 class PolicyFileTests(unittest.TestCase):
