@@ -367,7 +367,23 @@ fn closeOtherTabs(view: *adw.TabView, keep: *adw.TabPage) void {
 }
 
 fn actionTabCloseRight(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
-    window.getTabView().closePagesAfter(contextPage(window) orelse return);
+    closeTabsRight(window.getTabView(), contextPage(window) orelse return);
+}
+
+/// "Close Tabs to the Right": asks to close the unpinned tabs after
+/// `page`. Pinned tabs stay, like with "Close Other Tabs" (D-21), and like
+/// the menu item that counts only the unpinned tabs to the right; pinned
+/// tabs come first, so from a pinned tab the later pinned ones stay.
+/// `closePagesAfter` would close them, because the window confirms every
+/// close request.
+fn closeTabsRight(view: *adw.TabView, page: *adw.TabPage) void {
+    const first = view.getPagePosition(page) + 1;
+    var i = view.getNPages();
+    while (i > first) {
+        i -= 1;
+        const other = view.getNthPage(i);
+        if (other.getPinned() == 0) view.closePage(other);
+    }
 }
 
 fn actionTabDuplicate(_: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) callconv(.c) void {
@@ -656,6 +672,39 @@ test "close other tabs keeps the pinned tabs and the context tab" {
     closeOtherTabs(view, pages[4]);
     try testing.expectEqual(@as(c_int, 2), view.getNPages());
     for ([_]*adw.TabPage{ pages[2], pages[4] }) |page| try testing.expect(view.getPagePosition(page) >= 0);
+}
+
+test "close tabs to the right keeps the pinned tabs" {
+    const testing = std.testing;
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    const view = adw.TabView.new();
+    _ = view.as(gobject.Object).refSink();
+    defer view.as(gobject.Object).unref();
+    _ = adw.TabView.signals.close_page.connect(view, ?*anyopaque, testConfirmClose, null, .{});
+
+    var pages: [6]*adw.TabPage = undefined;
+    for (&pages) |*page| {
+        page.* = view.append(gtk.Label.new(null).as(gtk.Widget));
+        _ = page.*.as(gobject.Object).ref();
+    }
+    defer for (pages) |page| page.as(gobject.Object).unref();
+    // Three pinned tabs first: 0, 1 and 2, then the unpinned 3, 4 and 5.
+    for (pages[0..3]) |page| view.setPagePinned(page, 1);
+
+    // From the first pinned tab: the later pinned tabs stay, only the
+    // unpinned ones close.
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    closeTabsRight(view, pages[0]);
+    try testing.expectEqual(@as(c_int, 3), view.getNPages());
+    for (pages[0..3], 0..) |page, i| try testing.expectEqual(@as(c_int, @intCast(i)), view.getPagePosition(page));
+
+    // From an unpinned tab: only the tabs after it close.
+    const kept = view.append(gtk.Label.new(null).as(gtk.Widget));
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    _ = view.append(gtk.Label.new(null).as(gtk.Widget));
+    closeTabsRight(view, kept);
+    try testing.expectEqual(@as(c_int, 4), view.getNPages());
+    try testing.expectEqual(@as(c_int, 3), view.getPagePosition(kept));
 }
 
 fn testConfirmClose(view: *adw.TabView, page: *adw.TabPage, _: ?*anyopaque) callconv(.c) c_int {
