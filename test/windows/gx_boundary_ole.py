@@ -54,6 +54,30 @@ if ($env:GX_A3_SHELL_ACTION -eq 'close') { $window.Quit() }
     return json.loads(result.stdout.lstrip("\ufeff"))
 
 
+def close_private_explorer(directory, prior, owned, settle=5.0):
+    """Quit every Shell window opened since `prior` that still shows exactly the
+    private fixture folder, including a late or unattributed one. The Shell
+    "close" action rechecks the exact folder, so no other window is touched."""
+    closed, errors = [], []
+    candidates = set() if owned is None else {owned}
+    deadline = time.monotonic() + settle
+    while True:
+        try:
+            candidates |= set(shell_windows("list", directory)) - prior
+        except gui.InputBlocked as error:
+            errors.append(str(error))
+        for hwnd in sorted(candidates - set(closed)):
+            try:
+                shell_windows("close", directory, hwnd=hwnd)
+                closed.append(hwnd)
+            except gui.InputBlocked as error:
+                errors.append(f"{hwnd:#x}: {error}")
+        # Without an attributed window, keep watching briefly for a late one.
+        if owned is not None or time.monotonic() > deadline:
+            return closed, errors
+        time.sleep(0.5)
+
+
 class ExplorerDrag:
     def __init__(self, target, hwnd, directory):
         self.target, self.hwnd, self.directory = target, hwnd, directory
@@ -97,6 +121,7 @@ def explorer(fixture, instance, native):
     launcher = subprocess.Popen([str(Path(os.environ['WINDIR']) / 'explorer.exe'), '/n,/separate,', str(directory)])
     owned = None
     button = False
+    failure = None
     try:
         created = wait(lambda: set(shell_windows("list", directory)) - prior, 15)
         if len(created) != 1:
@@ -155,6 +180,9 @@ def explorer(fixture, instance, native):
                       file_hash=original, before=before, after=(native.query(200), native.query(201)), clipboard_access=False, enter_injected=False)
         gui.win32().activate(native.hwnd)
         fixture.capture_native(instance, native, "explorer-dropped-no-enter")
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         try:
             if button:
@@ -168,10 +196,13 @@ def explorer(fixture, instance, native):
                 else:
                     release_on_owned_app(instance)
         finally:
-            if owned is not None:
-                shell_windows("close", directory, hwnd=owned)
-            # Never terminate explorer.exe, including a shared shell process.
-            fixture.check("Explorer-cleanup", closed_hwnd=owned, launcher_pid=launcher.pid, process_terminated=False)
+            # Also on failure: every new window showing the private folder is
+            # quit. Never terminate explorer.exe, including a shared shell process.
+            closed, errors = close_private_explorer(directory, prior, owned)
+            fixture.check("Explorer-cleanup", owned_hwnd=owned, closed_hwnds=closed, cleanup_errors=errors,
+                          launcher_pid=launcher.pid, process_terminated=False)
+            if failure is None and owned is not None and owned not in closed:
+                raise AssertionError("the fixture's own Explorer window could not be closed")
 
 
 def release_on_owned_app(instance):

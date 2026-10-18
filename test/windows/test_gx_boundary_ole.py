@@ -26,6 +26,20 @@ class OleBoundaryTests(unittest.TestCase):
             drag = ole.OwnedDrag(instance, Path('app'), 'a', Path('source'), 'b', mock.Mock(), 1, 2, SimpleNamespace(hwnd=3))
         self.assertEqual(44, drag.target_hwnd)
 
+    def test_cleanup_quits_every_new_private_window_even_without_attribution(self):
+        def shell(action, directory, *, hwnd=0, name=""):
+            if action == "list":
+                return [1, 2, 3]
+            if hwnd == 3:
+                raise ole.gui.InputBlocked("Explorer navigated away; no action permitted")
+            return {"hwnd": hwnd, "action": action}
+        with mock.patch.object(boundary, "shell_windows", side_effect=shell) as calls, \
+                mock.patch.object(boundary.time, "sleep"):
+            closed, errors = boundary.close_private_explorer(Path("private"), {1}, None, settle=0)
+        self.assertEqual([2], closed)
+        self.assertEqual(1, len(errors))
+        self.assertNotIn(mock.call("close", Path("private"), hwnd=1), calls.call_args_list)
+
 
 if __name__ == "__main__":
     unittest.main()
