@@ -12,6 +12,7 @@ const d2d = @import("d2d.zig");
 const Palette = @import("Palette.zig");
 const Toast = @import("Toast.zig");
 const settings_map = @import("../../../gx/settings_map.zig");
+const fuzzy = @import("../../../gx/fuzzy.zig");
 const sw_minimize: i32 = 6;
 
 const Binding = union(enum) {
@@ -810,7 +811,10 @@ pub const PopupBridge = struct {
             if (visible_bottom <= visible_top) continue;
             const actionable = item.kind == .action or item.kind == .submenu;
             const expanded = item.kind == .submenu and level.state.depth > level.index + 1 and level.state.levels[level.index + 1].parent_item == index;
-            _ = try builder.add(.{ .id = 0, .parent = 0, .name = item.label, .role = if (actionable) .menu_item else .text, .bounds = screenRect(.{ .left = level.bounds.left, .top = visible_top, .right = level.bounds.right, .bottom = visible_bottom }), .enabled = actionable and item.enabled, .focusable = actionable and item.enabled, .focused = actionable and level.hot == index and level.hot_keyboard, .patterns = .{ .invoke = item.kind == .action, .expand_collapse = item.kind == .submenu }, .expand_state = if (expanded) 1 else 0 }, @as(u64, @intCast(index)) + 1);
+            // The keyboard focus is in the innermost open menu: a parent
+            // gives it back when its submenu closes (A1 proposal 32e5faa36).
+            const focused = actionable and level.hot == index and level.hot_keyboard and level.state.depth == level.index + 1;
+            _ = try builder.add(.{ .id = 0, .parent = 0, .name = item.label, .role = if (actionable) .menu_item else .text, .bounds = screenRect(.{ .left = level.bounds.left, .top = visible_top, .right = level.bounds.right, .bottom = visible_bottom }), .enabled = actionable and item.enabled, .focusable = actionable and item.enabled, .focused = focused, .patterns = .{ .invoke = item.kind == .action, .expand_collapse = item.kind == .submenu }, .expand_state = if (expanded) 1 else 0 }, @as(u64, @intCast(index)) + 1);
         }
         try self.publish(api, queue, attachment, hwnd, builder.nodes[0..builder.length], builder.tokens[0..builder.length], callbacks);
     }
@@ -929,6 +933,7 @@ pub const PopupBridge = struct {
         const sections = if (section_bounds) |rect| try builder.add(.{ .id = 0, .parent = 0, .name = i18n.tr("Settings"), .role = .tab, .bounds = rect, .patterns = .{ .selection = true }, .selection_required = true }, settings_container) else null;
         const radios = if (radio_bounds) |rect| try builder.add(.{ .id = 0, .parent = 0, .name = i18n.trRuntime(settings_map.pageLabel(settings.section)), .role = .list, .bounds = rect, .patterns = .{ .selection = true }, .selection_required = true }, settings_container) else null;
         var groups: [64]?u16 = @splat(null);
+        const searching = settingsSearching(settings);
         for (settings.hits[0..settings.hit_count], states, 0..) |hit, state, hit_index| {
             var spec: uia.NodeSpec = .{ .id = 0, .parent = 0, .name = "", .role = .button, .bounds = dipRect(hit.rect, bounds, scale), .enabled = state.enabled, .focused = state.focused, .focusable = state.focusable };
             switch (hit.target) {
@@ -973,7 +978,7 @@ pub const PopupBridge = struct {
                 .chip => |chip| {
                     if (chip.row >= rows.len or chip.index >= rows[chip.row].choices.len) continue;
                     const row = rows[chip.row];
-                    if (groups[chip.row] == null) groups[chip.row] = try builder.addKeyed(.{ .id = 0, .parent = 0, .name = row.title, .role = .list, .bounds = spec.bounds, .patterns = .{ .selection = true }, .selection_required = true, .focusable = state.container_focusable, .focused = state.container_focused }, settings_hit_base + hit_index, settingsGroupKey(chip.row));
+                    if (groups[chip.row] == null) groups[chip.row] = try builder.addKeyed(.{ .id = 0, .parent = 0, .name = row.title, .role = .list, .bounds = spec.bounds, .patterns = .{ .selection = true }, .selection_required = true, .focusable = state.container_focusable, .focused = state.container_focused }, settings_hit_base + hit_index, settingsGroupKey(settings.section, searching, chip.row));
                     const parent = groups[chip.row].?;
                     builder.nodes[parent].bounds = unionRect(builder.nodes[parent].bounds, spec.bounds);
                     spec.parent = parent;
@@ -1042,7 +1047,7 @@ pub const PopupBridge = struct {
                     spec.selected = list.cursor == item.index;
                 },
             }
-            _ = try builder.addKeyed(spec, settings_hit_base + @as(u64, @intCast(hit_index)), settingsKey(hit.target));
+            _ = try builder.addKeyed(spec, settings_hit_base + @as(u64, @intCast(hit_index)), settingsKey(settings.section, searching, hit.target));
         }
         try self.publishKeyed(api, queue, attachment, hwnd, builder.nodes[0..builder.length], builder.tokens[0..builder.length], builder.keys[0..builder.length], callbacks);
     }
@@ -1679,11 +1684,99 @@ test "settings focus keys follow the hit target, not its position" {
     };
     for (targets, 0..) |target, i| {
         // Equal targets give equal keys wherever their hits are.
-        try std.testing.expectEqual(settingsKey(target), settingsKey(targets[i]));
-        for (targets[i + 1 ..]) |other| try std.testing.expect(settingsKey(target) != settingsKey(other));
-        try std.testing.expect(settingsKey(target) != settingsGroupKey(3));
+        try std.testing.expectEqual(settingsKey(Section.general, false, target), settingsKey(Section.general, false, targets[i]));
+        for (targets[i + 1 ..]) |other| try std.testing.expect(settingsKey(Section.general, false, target) != settingsKey(Section.general, false, other));
+        try std.testing.expect(settingsKey(Section.general, false, target) != settingsGroupKey(Section.general, false, 3));
+        // The same row of another section, or of the search results, is
+        // another control; the section tabs, the search box and Close are
+        // the same in every section.
+        const shared = switch (target) {
+            .section, .search, .close => true,
+            else => false,
+        };
+        try std.testing.expectEqual(shared, settingsKey(Section.general, false, target) == settingsKey(Section.appearance, false, target));
+        try std.testing.expectEqual(shared, settingsKey(Section.general, false, target) == settingsKey(Section.general, true, target));
     }
-    try std.testing.expect(settingsGroupKey(3) != settingsGroupKey(4));
+    try std.testing.expect(settingsGroupKey(Section.general, false, 3) != settingsGroupKey(Section.general, false, 4));
+    try std.testing.expect(settingsGroupKey(Section.general, false, 3) != settingsGroupKey(Section.appearance, false, 3));
+    // `Settings.searching`'s test, on the query field.
+    const Query = struct { search_query: std.ArrayList(u8) };
+    var blank: [3]u8 = " \t ".*;
+    var text: [4]u8 = "font".*;
+    try std.testing.expect(!settingsSearching(Query{ .search_query = .{ .items = &blank, .capacity = blank.len } }));
+    try std.testing.expect(settingsSearching(Query{ .search_query = .{ .items = &text, .capacity = text.len } }));
+    try std.testing.expect(!settingsSearching(Query{ .search_query = .empty }));
+}
+
+test "menu focus is reported in the innermost open menu only" {
+    // Up and Down move the keyboard focus in the innermost open menu; its
+    // parent keeps the submenu's item highlighted but gives the focus back
+    // only when the submenu closes, so one element has HasKeyboardFocus, and
+    // the parent's publication after the close reports its item again.
+    // (A1 proposal 32e5faa36, adopted as is.)
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: refs.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const Fake = struct {
+        const Item = struct {
+            label: []const u8,
+            kind: enum { action, submenu, separator, header } = .action,
+            enabled: bool = true,
+        };
+        const List = struct { items: std.ArrayList(Item) };
+        const Row = struct { top: i32, height: i32 };
+        const PopupView = struct { hwnd: ?w32.HWND, visible: bool = true };
+        const State = struct { depth: usize, levels: [2]Level };
+        const Level = struct {
+            state: *const State,
+            index: usize,
+            popup: *PopupView,
+            list: *const List,
+            rows: []const Row,
+            bounds: w32.RECT,
+            arrow_px: i32 = 0,
+            scroll_px: i32 = 0,
+            hot: ?usize = null,
+            hot_keyboard: bool = false,
+            parent_item: ?usize = null,
+        };
+        fn live(_: *anyopaque) bool {
+            return true;
+        }
+        fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+            return true;
+        }
+    };
+    var items = [_]Fake.Item{ .{ .label = "New Tab" }, .{ .label = "Split", .kind = .submenu } };
+    const list: Fake.List = .{ .items = .{ .items = &items, .capacity = items.len } };
+    const rows = [_]Fake.Row{ .{ .top = 0, .height = 20 }, .{ .top = 20, .height = 20 } };
+    var view: Fake.PopupView = .{ .hwnd = @ptrFromInt(1) };
+    var state: Fake.State = undefined;
+    state.levels[0] = .{ .state = &state, .index = 0, .popup = &view, .list = &list, .rows = &rows, .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = 40 }, .hot = 1, .hot_keyboard = true };
+    state.levels[1] = .{ .state = &state, .index = 1, .popup = &view, .list = &list, .rows = &rows, .bounds = .{ .left = 100, .top = 20, .right = 200, .bottom = 60 }, .parent_item = 1 };
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+    const callbacks: PopupCallbacks = .{ .context = &state, .is_live = Fake.live, .action = Fake.action };
+    // Right opened Split from the keyboard: its item stays highlighted, the
+    // focus is in the submenu.
+    state.depth = 2;
+    try bridge.publishMenu(&api, &queue, attachment, &state.levels[0], callbacks);
+    try testing.expectEqual(@as(u64, 0), bridge.publisher.current.?.focus.load(.acquire));
+    // Left closed it: the parent menu publishes the focus on Split again.
+    state.depth = 1;
+    bridge.dirty();
+    try bridge.publishMenu(&api, &queue, attachment, &state.levels[0], callbacks);
+    try testing.expectEqual(@as(u64, 3), bridge.publisher.current.?.focus.load(.acquire));
 }
 
 pub const palette_root: u64 = 0;
@@ -1762,7 +1855,11 @@ const PopupBuilder = struct {
 };
 /// Settings tokens are hit positions, which scrolling shifts; the focus
 /// follows the hit's target, which stays with its control.
-fn settingsKey(target: anytype) u64 {
+/// Row-based targets name the rows of one section, or of the search
+/// results: the same row of another section (Tab, Ctrl+PageDown) or of the
+/// results is another control, with another key (bits 48..55; A1 proposal
+/// 32e5faa36).
+fn settingsKey(page: anytype, searching: bool, target: anytype) u64 {
     const payload: u64 = switch (target) {
         .section => |section| @intFromEnum(section),
         .search, .close => 0,
@@ -1772,11 +1869,25 @@ fn settingsKey(target: anytype) u64 {
         .item => |item| @as(u64, item.row) << 32 | item.index,
         .group_button => |group| @as(u64, group.row) << 8 | @intFromEnum(group.button),
     };
-    return (@as(u64, @intFromEnum(std.meta.activeTag(target))) + 1) << 56 | payload;
+    const rows: u64 = switch (target) {
+        .section, .search, .close => 0,
+        else => settingsRows(page, searching),
+    };
+    return (@as(u64, @intFromEnum(std.meta.activeTag(target))) + 1) << 56 | rows << 48 | payload;
 }
 /// The chip list of a row; no hit target is a row's chip list.
-fn settingsGroupKey(row: u16) u64 {
-    return @as(u64, 0xff) << 56 | row;
+fn settingsGroupKey(section: anytype, searching: bool, row: u16) u64 {
+    return @as(u64, 0xff) << 56 | settingsRows(section, searching) << 48 | row;
+}
+/// Which rows a row index names: those of `section`, or the results.
+fn settingsRows(section: anytype, searching: bool) u64 {
+    return (@as(u64, @intFromEnum(section)) << 1 | @intFromBool(searching)) & 0xff;
+}
+/// Whether Settings shows its search results instead of a section: the test
+/// of `Settings.searching` on the same query, read here so the bridge does
+/// not need that function to be public (A1 uia-r4/0001).
+fn settingsSearching(settings: anytype) bool {
+    return !fuzzy.isBlank(settings.search_query.items);
 }
 fn dipRect(rect: d2d.Rect, popup: w32.RECT, scale: f32) uia.Rect {
     return .{ .x = @as(f64, @floatFromInt(popup.left)) + @as(f64, rect.x * scale), .y = @as(f64, @floatFromInt(popup.top)) + @as(f64, rect.y * scale), .width = @max(0, rect.w * scale), .height = @max(0, rect.h * scale) };
