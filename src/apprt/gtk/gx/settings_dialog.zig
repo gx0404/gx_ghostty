@@ -347,6 +347,10 @@ pub const GxSettingsDialog = extern struct {
         /// the dialog.
         arena: ArenaAllocator,
 
+        /// Replaced synchronized values do not accumulate in the lifetime arena.
+        font_arena: ArenaAllocator,
+        command_arena: ArenaAllocator,
+
         /// The language of the dialog text.
         lang: gx.i18n.Language = .default,
 
@@ -880,7 +884,9 @@ pub const GxSettingsDialog = extern struct {
         priv.font_size_reset_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets("font-size")));
 
         if (sync.font_family) {
-            const arena = st.arena.allocator();
+            st.font_families = &.{};
+            _ = st.font_arena.reset(.retain_capacity);
+            const arena = st.font_arena.allocator();
             const families = config.@"font-family".list.items;
             var copies: std.ArrayList([]const u8) = .empty;
             for (families) |family| copies.append(arena, arena.dupe(u8, family) catch break) catch break;
@@ -894,10 +900,17 @@ pub const GxSettingsDialog = extern struct {
         }
         priv.font_clear_button.as(gtk.Widget).setSensitive(@intFromBool(self.overlaySets("font-family")));
         if (st.shells_loaded and st.shell < st.shells.len and st.shells[st.shell].command == null) {
-            st.default_command = if (config.command) |command| command.string(st.arena.allocator()) catch "" else "";
+            self.syncDefaultCommand(config);
         }
 
         self.updateNotes(config);
+    }
+
+    fn syncDefaultCommand(self: *Self, config: *const CoreConfig) void {
+        const st = &self.private().state;
+        st.default_command = "";
+        _ = st.command_arena.reset(.retain_capacity);
+        if (config.command) |command| st.default_command = command.string(st.command_arena.allocator()) catch "";
     }
 
     fn setSwitch(row: *adw.SwitchRow, on: bool) void {
@@ -1176,9 +1189,7 @@ pub const GxSettingsDialog = extern struct {
         const config = config_obj.get();
         const arena = st.arena.allocator();
 
-        if (config.command) |command| {
-            st.default_command = command.string(arena) catch "";
-        }
+        self.syncDefaultCommand(config);
         const overlay_command = self.overlayValue(arena, "command");
 
         var shells: std.ArrayList(Shell) = .empty;
@@ -1635,10 +1646,12 @@ pub const GxSettingsDialog = extern struct {
         if (st.changes.isEmpty() and !st.apply_pending) return true;
 
         if (!st.changes.isEmpty()) {
+            const preview = self.previewArg();
+            defer if (preview) |value| st.alloc.free(value);
             const effects = saveEffects(
                 st.changes.entries.items,
                 st.previewing,
-                self.previewArg(),
+                preview,
                 if (st.apply_pending) st.pending_sync else null,
             );
 
@@ -1667,7 +1680,9 @@ pub const GxSettingsDialog = extern struct {
     /// Returns whether applying succeeded.
     fn applyPending(self: *Self) bool {
         const st = &self.private().state;
-        var config = self.apply(self.previewArg()) orelse return false;
+        const preview = self.previewArg();
+        defer if (preview) |value| st.alloc.free(value);
+        var config = self.apply(preview) orelse return false;
         defer config.deinit();
         self.syncValues(&config, appliedSync(st.pending_sync, st.previewing));
         st.apply_pending = false;
@@ -1973,12 +1988,12 @@ pub const GxSettingsDialog = extern struct {
         self.updateThemeButtons();
     }
 
-    /// The `theme` value the applied configuration previews, if any.
-    fn previewArg(self: *Self) ?[]const u8 {
+    /// The previewed `theme` value, owned by the caller (state allocator).
+    fn previewArg(self: *Self) ?[:0]const u8 {
         const st = &self.private().state;
         if (!st.previewing) return null;
         const index = self.selectedTheme() orelse return null;
-        const value = themeValue(st.arena.allocator(), st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return null;
+        const value = themeValue(st.alloc, st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return null;
         return value;
     }
 
@@ -2555,10 +2570,12 @@ pub const GxSettingsDialog = extern struct {
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         // Before the template, whose signal handlers read the state.
-        const alloc = Application.default().allocator();
+        const alloc = if (@import("builtin").is_test) std.testing.allocator else Application.default().allocator();
         self.private().state = .{
             .alloc = alloc,
             .arena = .init(alloc),
+            .font_arena = .init(alloc),
+            .command_arena = .init(alloc),
             .changes = .init(alloc),
         };
         gtk.Widget.initTemplate(self.as(gtk.Widget));
@@ -2606,6 +2623,8 @@ pub const GxSettingsDialog = extern struct {
         st.visible.deinit(st.alloc);
         st.bound.deinit(st.alloc);
         st.arena.deinit();
+        st.font_arena.deinit();
+        st.command_arena.deinit();
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -3135,4 +3154,84 @@ test "the dialog strings are translated" {
         }
     }
     try testing.expectEqual(@as(usize, 0), missing);
+}
+
+// Use the real settings template and callbacks, without starting terminals or
+// reading the user's configuration. Tests supply the configuration and models.
+fn testDialog() !*GxSettingsDialog {
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    adw.init();
+    gobject.ext.ensureType(Application);
+    const dialog = gobject.ext.newInstance(GxSettingsDialog, .{});
+    _ = dialog.as(gobject.Object).refSink();
+    dialog.setUpFontChooser();
+    _ = dialog.as(gtk.Widget).addTickCallback(struct {
+        fn tick(widget: *gtk.Widget, _: *gdk.FrameClock, _: ?*anyopaque) callconv(.c) c_int {
+            const object = widget.as(gobject.Object);
+            object.setData("gx-settings-test-frames", @ptrFromInt(@intFromPtr(object.getData("gx-settings-test-frames")) + 1));
+            return 1;
+        }
+    }.tick, null, null);
+    return dialog;
+}
+
+test "settings reopen 100 times keeps synchronized allocations bounded" {
+    const dialog = try testDialog();
+    defer dialog.unref();
+    const st = &dialog.private().state;
+    var config = try CoreConfig.default(testing.allocator);
+    defer config.deinit();
+    var families: ArenaAllocator = .init(testing.allocator);
+    defer families.deinit();
+    try config.@"font-family".parseCLI(families.allocator(), "Monospace");
+    config.command = .{ .shell = "bash --noprofile --norc" };
+    config.theme = .{ .light = "Saved", .dark = "Saved" };
+    st.shells_loaded = true;
+    st.shells = &.{.{ .command = null, .label = .system_default }};
+    st.themes = .{ .arena = .init(testing.allocator), .names = &.{"Preview"} };
+    const model = gtk.StringList.new(null);
+    model.append("Preview");
+    st.theme_model = model;
+    st.theme_selection = gtk.SingleSelection.new(model.as(gio.ListModel));
+    try st.visible.append(st.alloc, 0);
+    const window = adw.Window.new();
+    defer window.as(gtk.Window).destroy();
+    window.as(gtk.Window).setDefaultSize(1100, 740);
+    window.as(gtk.Window).present();
+    var baseline: usize = 0;
+    for (0..102) |i| {
+        dialog.reopen(&config, .appearance);
+        st.shown = true;
+        dialog.as(gobject.Object).setData("gx-settings-test-frames", null);
+        dialog.as(adw.Dialog).present(window.as(gtk.Widget));
+        try testing.expect(testWaitDialog(dialog, true));
+        st.previewing = true;
+        const preview = dialog.previewArg() orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("Preview", preview);
+        st.alloc.free(preview);
+        st.previewing = false;
+        try testing.expect(dialog.as(adw.Dialog).close() != 0);
+        try testing.expect(testWaitDialog(dialog, false));
+        try testing.expect(!st.shown);
+        if (i == 1) baseline = st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity();
+        if (i > 1) try testing.expectEqual(baseline, st.arena.queryCapacity() + st.font_arena.queryCapacity() + st.command_arena.queryCapacity());
+        try testing.expectEqualStrings("Monospace", st.font_families[0]);
+        try testing.expectEqualStrings("bash --noprofile --norc", st.default_command);
+    }
+}
+
+fn testWaitDialog(dialog: *GxSettingsDialog, mapped: bool) bool {
+    const tick = glib.timeoutAdd(5, struct {
+        fn wake(_: ?*anyopaque) callconv(.c) c_int {
+            return 1;
+        }
+    }.wake, null);
+    defer _ = glib.Source.remove(tick);
+    const deadline = glib.getMonotonicTime() + 2_000_000;
+    while (glib.getMonotonicTime() < deadline) {
+        const widget = dialog.as(gtk.Widget);
+        if (if (mapped) widget.getMapped() != 0 and @intFromPtr(dialog.as(gobject.Object).getData("gx-settings-test-frames")) >= 3 else widget.getParent() == null) return true;
+        _ = glib.MainContext.iteration(null, 1);
+    }
+    return false;
 }
