@@ -29,7 +29,7 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         before release. End-check failure invalidates the entire batch. With --injected-input a batch
         that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
         (with or without the flag) must have had no input at all since the start check.
-        Exit 0 VALID, 4 FAIL (quiet valid, command gate FAIL), 3 NOT_STARTED/INVALID (quiet
+        Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* driver exited 4), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
         6 PRODUCT_FAIL (a measured Ghostty instance ended mid-batch: cause instance_gone).
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
@@ -1041,9 +1041,29 @@ BATCH_GUIDANCE = {
 }
 
 
-def measurement_state(raised: bool, exit_code) -> str:
-    """The command's own result: 0 complete, 4 absolute gate FAIL, anything else a driver/tool error."""
+WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem')
+
+
+def gate_exit_contract(command: Sequence[str]) -> bool:
+    """Whether exit 4 of `command` means "complete batch, absolute gate FAIL". Only the
+    gx_perf.py win32-* drivers promise that (run_experiment), run as
+    `python ... gx_perf.py win32-ui ...` or `just perf win32-ui ...` (just passes the
+    exit code through). Exit 4 of anything else is not a measured FAIL."""
+    names = [process_name(part) for part in command]
+    for index in range(len(command) - 1):
+        if command[index + 1] not in WIN32_DRIVERS:
+            continue
+        if names[index] == 'gx_perf.py' or (names[index] == 'perf' and 'just' in names[:index]):
+            return True
+    return False
+
+
+def measurement_state(raised: bool, exit_code, gate_contract: bool = True) -> str:
+    """The command's own result: 0 complete, 4 absolute gate FAIL (win32-* drivers only),
+    anything else a driver/tool error."""
     if raised or exit_code is None:
+        return 'DRIVER_ERROR'
+    if exit_code == 4 and not gate_contract:
         return 'DRIVER_ERROR'
     return {0: 'COMPLETE', 4: 'GATE_FAIL'}.get(exit_code, 'DRIVER_ERROR')
 
@@ -1117,6 +1137,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
               'injected_input': args.injected_input, 'status': 'NOT_STARTED', 'exit': 2,
               'quiet_status': 'NOT_CHECKED', 'quiet_valid': False, 'measurement': 'NOT_RUN', 'command_exit': None,
               'plan_compliant': False, 'thresholds_plan_compliant': args.idle_seconds >= PLAN_IDLE_SECONDS,
+              'gate_exit_contract': gate_exit_contract(command),
               'failure_cause': None, 'started_ns': None, 'ended_ns': None, 'errors': []}
     before = after = None
     write_json(out / 'RESULT.json', result)
@@ -1148,7 +1169,10 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                     result['errors'].append(f'command: {type(exc).__name__}: {exc}')
                 finally:
                     result['ended_ns'] = time.time_ns()
-                    result['measurement'] = measurement_state(raised, result['command_exit'])
+                    result['measurement'] = measurement_state(raised, result['command_exit'], result['gate_exit_contract'])
+                    if result['command_exit'] == 4 and not result['gate_exit_contract']:
+                        result['errors'].append('exit 4 means an absolute gate FAIL only for gx_perf.py win32-* drivers; '
+                                                'this command is not one, so it is a driver/tool error')
                     try:
                         evidence = guard_evidence(guard_log, result['batch_id'])
                     except Exception as exc:  # the end check's input item reports it as an error

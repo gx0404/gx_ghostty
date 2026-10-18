@@ -367,12 +367,14 @@ class QuietTests(unittest.TestCase):
 
 class QuietBatchTests(unittest.TestCase):
     setUp = QuietTests.setUp
-    def batch_args(self, *extra):
+    DRIVER = ('python', 'scripts/gx_perf.py', 'win32-ui', '--case', 'p4')  # exit 4 = complete batch, gate FAIL
+
+    def batch_args(self, *extra, command=('dummy-command',)):
         import gx_slots
         with gx_slots.acquire(self.args.slot_root, 'quiet'):
             pass
         return gx_perf.build_parser().parse_args(['quiet-batch', '--out', str(self.args.out),
-            '--slot-root', str(self.args.slot_root), *extra, '--', 'dummy-command'])
+            '--slot-root', str(self.args.slot_root), *extra, '--', *command])
 
     def test_checks_are_inside_lease_and_injected_end_uses_guards(self):
         import gx_slots
@@ -475,6 +477,29 @@ class QuietBatchTests(unittest.TestCase):
         raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
         self.assertEqual(('guards', False), (raw['mode'], raw['injected']))
 
+    def test_exit_4_is_a_gate_fail_only_for_gx_perf_win32_drivers(self):
+        commands = [  # (command, gate contract)
+            (self.DRIVER, True),
+            ((r'C:\Py\python.exe', '-X', 'utf8', r'E:\gx\scripts\GX_PERF.PY', 'win32-idle', '--tabs', '11'), True),
+            (('just', 'perf', 'win32-gpu', '--exe', 'new.exe'), True),
+            (('just.exe', '--justfile', 'justfile', 'perf', 'win32-mem'), True),
+            (('python', 'scripts/gx_perf.py', 'gtk', '--clone', 'x'), False),
+            (('python', 'scripts/gx_perf.py', 'win32', '--exe', 'x'), False),
+            (('perf', 'win32-ui'), False),
+            (('measure.cmd', 'win32-ui'), False),
+            (('dummy-command',), False),
+        ]
+        for index, (command, contract) in enumerate(commands):
+            self.assertEqual(contract, gx_perf.gate_exit_contract(list(command)), command)
+            args = self.batch_args(command=command)
+            args.out = self.args.out.parent / f'exit4-{index}'
+            with self.subTest(command=command):
+                exit_code, result = self.run_batch(args, self.command(4))
+                self.assertEqual((4, 'FAIL', 'GATE_FAIL') if contract else (2, 'ERROR', 'DRIVER_ERROR'),
+                                 (exit_code, result['status'], result['measurement']))
+                self.assertEqual(contract, result['gate_exit_contract'])
+                self.assertEqual(not contract, any('only for gx_perf.py win32-* drivers' in error for error in result['errors']))
+
     def test_preflight_rejects_impossible_batches_before_waiting_for_locks(self):
         import gx_slots
         args = self.batch_args('--timeout', '14400')
@@ -512,7 +537,7 @@ class QuietBatchTests(unittest.TestCase):
             (('--injected-input',), 'raise', None, 2, 'ERROR', 'VALID', 'DRIVER_ERROR'),
         ]
         for index, (flags, code, guard, expected, status, quiet, measurement) in enumerate(cases):
-            args = self.batch_args(*flags)
+            args = self.batch_args(*flags, command=self.DRIVER)
             args.out = self.args.out.parent / f'case-{index}'
             with self.subTest(flags=flags, code=code, guard=guard):
                 exit_code, result = self.run_batch(args, self.command(code, guard))
