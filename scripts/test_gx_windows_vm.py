@@ -889,6 +889,28 @@ ConvertTo-GxJson ([ordered]@{ verdict=$result.fixture_verdict; reason=$result.fi
         self.assertIn("--popup-hwnd 0x20b --decision cancel --stage protected-paste", calls[3])
         self.assertNotIn("--x", calls[3])
 
+    @unittest.skipUnless(Path(sys.executable).name.lower() == "python.exe", "needs a python.exe interpreter")
+    def test_fixture_process_output_of_one_line_or_a_json_document_is_kept(self):
+        body = r"""
+$script:RunRoot = $Work
+$script:Step = 'step'
+$script:ExportExtra = New-Object System.Collections.Generic.List[string]
+$PyTimeoutSeconds = 60
+[IO.File]::WriteAllText((Join-Path $Work 'one.py'), 'print("only line")')
+[IO.File]::WriteAllText((Join-Path $Work 'doc.py'), 'import json, sys; print("noise"); print(json.dumps({"status": "ok", "n": [1]}, indent=2)); sys.exit(2)')
+$context = [ordered]@{ python=[ordered]@{ dir='__PYDIR__' }; fixture=(Join-Path $Work 'one.py'); runs=0 }
+$one = Invoke-PyFixtureProcess $context '' 'run'
+$context.fixture = Join-Path $Work 'doc.py'
+$doc = Invoke-PyFixtureProcess $context '' 'run'
+ConvertTo-GxJson ([ordered]@{ one=$one; doc=$doc; names=@(Get-ExportNames | ForEach-Object { $_.name }) }) -Compress
+""".replace("__PYDIR__", str(Path(sys.executable).parent))
+        out = self.run_body(body, ("ConvertTo-GxJson", "Read-TextLines", "Add-ExportFile", "Get-ExportNames", "Invoke-PyFixtureProcess"),
+                            ("LF", "JsonSource", "ExportAlias"))
+        self.assertEqual((out["one"]["stdout_tail"], out["one"]["verdict"]), (["only line"], "PASS"))
+        self.assertEqual(out["doc"]["output"], {"status": "ok", "n": [1]})
+        self.assertEqual((out["doc"]["exit_code"], out["doc"]["verdict"]), (2, "PENDING"))
+        self.assertEqual(out["names"], ["py-run-1.stdout.txt", "py-run-1.stderr.txt", "py-run-2.stdout.txt", "py-run-2.stderr.txt"])
+
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""
 $result = [ordered]@{}

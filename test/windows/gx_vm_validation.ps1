@@ -3560,8 +3560,9 @@ function Invoke-PyFixtureProcess($Context, [string]$Arguments, [string]$Tag) {
         }
         $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
     } finally { $process.Dispose() }
-    $out = if (Test-Path -LiteralPath $stdout) { @(Read-TextLines $stdout) } else { @() }
-    $err = if (Test-Path -LiteralPath $stderr) { @(Read-TextLines $stderr) } else { @() }
+    # @(if ...) keeps one-line and empty output arrays (an if expression unrolls them).
+    $out = @(if (Test-Path -LiteralPath $stdout) { Read-TextLines $stdout })
+    $err = @(if (Test-Path -LiteralPath $stderr) { Read-TextLines $stderr })
     Add-ExportFile $stdout ('py-' + $name + '.stdout.txt')
     Add-ExportFile $stderr ('py-' + $name + '.stderr.txt')
     $run = [ordered]@{ tag=$name; command_line=$commandLine; exit_code=$exitCode; timed_out=$timedOut; started_utc=$started.ToString('o');
