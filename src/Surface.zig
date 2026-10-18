@@ -6488,9 +6488,89 @@ fn startClipboardRequest(
         .osc_52_write => unreachable,
     }
 
+    // fork(gx): GX-0046 begin: finish unavailable OSC 52 reads
+    if (effective_req == .osc_52_read) return gxStartClipboardReadOSC52(self, loc, effective_req.osc_52_read);
+    // fork(gx): GX-0046 end
     return try self.rt_surface.clipboardRequest(loc, effective_req);
 }
 
+// fork(gx): GX-0046 begin: deterministic OSC 52 completion seam
+fn gxStartClipboardReadOSC52(self: anytype, loc: apprt.Clipboard, clipboard: apprt.Clipboard) !apprt.ClipboardReadResult {
+    const result = try self.rt_surface.clipboardRequest(loc, .{ .osc_52_read = clipboard });
+    if (result == .unavailable) {
+        // No contents can be disclosed, even under an ask policy.
+        try self.completeClipboardReadOSC52("", clipboard, true);
+        return .started;
+    }
+    // A started request completes through apprt; unsupported retains its
+    // upstream no-reply behavior. Neither may receive a second reply here.
+    return result;
+}
+
+test "gx.clipboard unavailable OSC 52 read replies once without confirmation" {
+    const testing = std.testing;
+    const Runtime = struct {
+        result: apprt.ClipboardReadResult,
+        calls: usize = 0,
+
+        fn clipboardRequest(rt: *@This(), loc: apprt.Clipboard, req: apprt.ClipboardRequest) !apprt.ClipboardReadResult {
+            try testing.expectEqual(apprt.Clipboard.standard, loc);
+            try testing.expectEqual(apprt.Clipboard.selection, req.osc_52_read);
+            rt.calls += 1;
+            return rt.result;
+        }
+    };
+    const Requester = struct {
+        rt_surface: *Runtime,
+        core: *Surface,
+
+        fn completeClipboardReadOSC52(requester: *@This(), data: []const u8, clipboard: apprt.Clipboard, confirmed: bool) !void {
+            try requester.core.completeClipboardReadOSC52(data, clipboard, confirmed);
+        }
+    };
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.alloc = testing.allocator;
+    surface.readonly = false;
+    surface.config.clipboard_read = .ask;
+    surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer surface.io.mailbox.deinit(testing.allocator);
+
+    var rt: Runtime = .{ .result = .unavailable };
+    var requester: Requester = .{ .rt_surface = &rt, .core = surface };
+    try testing.expectEqual(apprt.ClipboardReadResult.started, try gxStartClipboardReadOSC52(&requester, .standard, .selection));
+    const message = surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.MissingClipboardReply;
+    defer message.deinit();
+    try testing.expectEqualStrings("\x1b]52;s;\x1b\\", message.write_alloc.data);
+    try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+    try testing.expectEqual(@as(usize, 1), rt.calls);
+
+    for ([_]apprt.ClipboardReadResult{ .started, .unsupported }) |result| {
+        rt.result = result;
+        try testing.expectEqual(result, try gxStartClipboardReadOSC52(&requester, .standard, .selection));
+        try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+    }
+}
+
+test "gx.clipboard empty OSC 52 completion bypasses ask but nonempty does not" {
+    const testing = std.testing;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.alloc = testing.allocator;
+    surface.readonly = false;
+    surface.config.clipboard_read = .ask;
+    surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer surface.io.mailbox.deinit(testing.allocator);
+
+    try surface.completeClipboardReadOSC52("", .standard, false);
+    const message = surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.MissingClipboardReply;
+    defer message.deinit();
+    try testing.expectEqualStrings("\x1b]52;c;\x1b\\", message.write_alloc.data);
+    try testing.expectError(error.UnauthorizedPaste, surface.completeClipboardReadOSC52("private", .standard, false));
+    try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+// fork(gx): GX-0046 end
 fn completeClipboardPaste(
     self: *Surface,
     data: []const u8,
@@ -6636,6 +6716,10 @@ fn completeClipboardReadOSC52(
     // We should never get here if clipboard-read is set to deny
     assert(self.config.clipboard_read != .deny);
 
+    // fork(gx): GX-0046 begin: empty reads disclose no clipboard contents
+    if (data.len == 0 and !confirmed) return self.completeClipboardReadOSC52(data, clipboard_type, true);
+
+    // fork(gx): GX-0046 end
     // If clipboard-read is set to ask and we haven't confirmed with the user,
     // do that now
     if (self.config.clipboard_read == .ask and !confirmed) {

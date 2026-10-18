@@ -1,0 +1,61 @@
+id = "G24"
+title = "Deleting an overlay profile reveals the lower source; CLI sources remain readonly"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+gx-launch-profile = Layer=direct:/bin/bash --noprofile --norc
+keybind = ctrl+alt+n=gx:new_tab_menu
+"""
+script = '''
+overlay = config_home / "ghostty/gui-settings.ghostty"
+overlay.write_text("# R6 keep this line\ngx-launch-profile = Layer=direct:/bin/bash --noprofile --norc -i\n")
+def manager():
+    xdo("windowsize", window(), 1100, 740)
+    sleep(1)
+    xdo("mousemove", 400, 300, "click", 1)
+    xdo("key", "ctrl+alt+n")
+    sleep(0.3)
+    xdo("mousemove", 100, 495, "click", 1)
+    sleep(0.4)
+    xdo("mousemove", 500, 238, "click", 1)
+    sleep(0.3)
+    capture("combo-open-" + str(pid()))
+    xdo("key", "--repeat", 4, "--delay", 150, "Down")
+    xdo("key", "Return")
+    sleep(0.3)
+xdo("mousemove", 400, 300, "click", 1)
+restart()
+manager()
+capture("owned-layer")
+xdo("mousemove", 457, 478, "click", 1)
+sleep(0.5)
+assert "gx-launch-profile" not in overlay.read_text()
+assert "# R6 keep this line" in overlay.read_text()
+xdo("mousemove", 500, 238, "click", 1)
+sleep(0.3)
+xdo("key", "--repeat", 4, "--delay", 150, "Down")
+xdo("key", "Return")
+sleep(0.3)
+capture("lower-reappears-readonly")
+xdo("key", "Escape")
+sleep(0.3)
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--gx-launch-profile=Layer=direct:/bin/bash --noprofile --norc -i", "--command=direct:/bin/bash --noprofile --norc"])
+manager()
+capture("cli-readonly")
+original = overlay.read_text()
+xdo("mousemove", 457, 478, "click", 1)
+xdo("mousemove", 280, 521, "click", 1)
+sleep(0.3)
+assert overlay.read_text() == original
+save("-overlay.txt", overlay.read_text())
+'''
+expect = [
+  "G24.png: isolated initial terminal",
+  "G24-owned-layer.png: overlay-owned Layer has editable fields and enabled Delete",
+  "G24-lower-reappears-readonly.png: deleting the override reveals the lower Layer with the readonly warning",
+  "G24-cli-readonly.png and G24-after.png: CLI profile and default-command controls cannot be changed",
+]

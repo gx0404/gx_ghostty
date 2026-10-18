@@ -1,0 +1,68 @@
+id = "G23"
+title = "CLI-controlled shortcuts are readonly; resetting an override restores the lower binding"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = clear
+keybind = ctrl+alt+k=gx:keybinds
+keybind = ctrl+alt+u=text:LOWER-RESTORED
+keybind = ctrl+shift+q=quit
+"""
+script = '''
+overlay = config_home / "ghostty/gui-settings.ghostty"
+seed = "# R6 unrelated line\nfont-size = 12\n# gx-keybind-editor begin 1\nkeybind = ctrl+alt+u=text:OWNED-OVERRIDE\n# gx-keybind-editor end 1\n"
+overlay.write_text(seed)
+def editor():
+    xdo("windowsize", window(), 1100, 740)
+    sleep(1)
+    xdo("mousemove", 400, 300, "click", 1)
+    xdo("key", "ctrl+alt+k")
+    sleep(1)
+    xdo("mousemove", 730, 110, "click", 1)
+    sleep(1)
+    capture("editor-open-" + str(pid()))
+    xdo("mousemove", 500, 150, "click", 1)
+    sleep(0.3)
+    capture("combo-open-" + str(pid()))
+    xdo("key", "--repeat", 3, "--delay", 150, "Down")
+    xdo("key", "Return")
+    sleep(0.4)
+def close_editor():
+    xdo("mousemove", 937, 93, "click", 1)
+    sleep(0.5)
+    xdo("mousemove", 867, 113, "click", 1)
+    sleep(0.5)
+xdo("mousemove", 400, 300, "click", 1)
+restart(["--keybind=ctrl+alt+u=text:CLI-CONTROLLED"])
+editor()
+capture("cli-readonly")
+xdo("mousemove", 650, 537, "click", 1)
+sleep(0.3)
+assert overlay.read_text() == seed
+close_editor()
+xdo("mousemove", 400, 300, "click", 1)
+restart([])
+editor()
+capture("overlay-editable")
+xdo("mousemove", 650, 537, "click", 1)
+sleep(0.5)
+assert "OWNED-OVERRIDE" not in overlay.read_text()
+assert "font-size = 12" in overlay.read_text()
+capture("override-reset")
+close_editor()
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+u")
+sleep(0.3)
+capture("lower-key-runs")
+save("-overlay.txt", overlay.read_text())
+'''
+expect = [
+  "G23.png: initial private terminal",
+  "G23-cli-readonly.png: the CLI warning is visible and edit/save/reset controls are disabled",
+  "G23-overlay-editable.png: the same saved override becomes editable after removing the CLI argument",
+  "G23-override-reset.png: reset succeeds while unrelated overlay content remains",
+  "G23-lower-key-runs.png and G23-after.png: the restored key writes LOWER-RESTORED",
+]

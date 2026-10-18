@@ -600,6 +600,135 @@ def gx0044_problems(source: str) -> list[str]:
     return problems
 
 
+GX0043 = "GX-0043"
+WIN32_SURFACE_ZIG = "src/apprt/win32/Surface.zig"
+
+
+def gx0043_readback_problems(wgl: str, surface: str) -> list[str]:
+    """The GX-0043 readback timing: one end stamp after the successful error check of the
+    remote ReadPixels and before success, and the remote frame logs only after unlocking."""
+    lines = wgl.splitlines()
+    try:
+        _, hunks = marked_hunks(wgl, GX0043)
+    except ValueError as err:
+        return [str(err)]
+    inside = [i for begin, end in hunks for i in range(begin, end)]
+    stamps = [i for i in inside if lines[i].strip() == "remote.frame.readbackComplete();"]
+    if len(wgl.split("readbackComplete(")) != 2 or len(stamps) != 1:
+        return ["expected exactly one remote.frame.readbackComplete() inside the GX-0043 hunk"]
+    stamp = stamps[0]
+    problems: list[str] = []
+    if not (lines[stamp - 1].strip() == "try gl.errors.getError();"
+            and "remote.frame.pixels().ptr" in lines[stamp - 2]
+            and lines[stamp + 1].strip() == "success = true;"):
+        problems.append("readbackComplete must follow the remote ReadPixels error check and precede success")
+    finish = surface[surface.index("pub const RemoteFrame = struct"):]
+    finish = finish[finish.index("pub fn finish("):finish.index("\n    }\n")]
+    order = ["self.frame.finish(success);", "RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);",
+             "self.frame.logPerfSamples();"]
+    places = [finish.find(step) for step in order]
+    if -1 in places or places != sorted(places):
+        problems.append("RemoteFrame.finish must finish, unlock and only then log the perf samples")
+    return problems
+
+
+GX0046 = "GX-0046"
+GX0046_HOOK = ("if (effective_req == .osc_52_read) return gxStartClipboardReadOSC52(self, loc, "
+               "effective_req.osc_52_read);")
+GX0046_EMPTY = ("if (data.len == 0 and !confirmed) return self.completeClipboardReadOSC52("
+                "data, clipboard_type, true);")
+
+
+def gx0046_problems(source: str) -> list[str]:
+    """Shape lock for GX-0046 in src/Surface.zig: the OSC 52 read hook after the deny check
+    of startClipboardRequest, the helper hunk, and the empty-read bypass after the deny
+    assertion of completeClipboardReadOSC52."""
+    try:
+        _, hunks = marked_hunks(source, GX0046)
+    except ValueError as err:
+        return [str(err)]
+    if len(hunks) != 3:
+        return [f"expected 3 {GX0046} hunks, found {len(hunks)}"]
+    lines = source.splitlines()
+    bodies = [[line.strip() for line in lines[b + 1:e] if line.strip()] for b, e in hunks]
+    problems: list[str] = []
+    if bodies[0] != [GX0046_HOOK]:
+        problems.append("the first GX-0046 hunk must hold only the OSC 52 read hook")
+    if bodies[2] != [GX0046_EMPTY]:
+        problems.append("the last GX-0046 hunk must hold only the empty-read bypass")
+    helper = "\n".join(bodies[1])
+    if "fn gxStartClipboardReadOSC52(" not in helper or "if (result == .unavailable) {" not in helper \
+            or 'try self.completeClipboardReadOSC52("", clipboard, true);' not in helper \
+            or "return .started;" not in helper:
+        problems.append("the helper must answer only an unavailable read, once, as started")
+    def exact_fn(name: str) -> tuple[int, int] | None:
+        # The upstream signatures break after "(", unlike same-named test doubles.
+        starts = [i for i, line in enumerate(lines) if line.strip() == f"fn {name}("]
+        if len(starts) != 1:
+            return None
+        end = next((i for i in range(starts[0] + 1, len(lines)) if lines[i] == "}"), None)
+        return None if end is None else (starts[0], end + 1)
+
+    start = exact_fn("startClipboardRequest")
+    complete = exact_fn("completeClipboardReadOSC52")
+    if start is None or complete is None:
+        return problems + ["startClipboardRequest or completeClipboardReadOSC52 is missing"]
+    deny = [i for i in range(*start) if lines[i].strip() == ".osc_52_read => if (self.config.clipboard_read == .deny) {"]
+    if not (start[0] <= hunks[0][0] < start[1]) or not deny or hunks[0][0] < deny[0]:
+        problems.append("the hook must sit in startClipboardRequest after its deny check")
+    elif lines[hunks[0][1] + 1].strip() != "return try self.rt_surface.clipboardRequest(loc, effective_req);":
+        problems.append("the hook must sit right above the upstream clipboardRequest return")
+    asserted = [i for i in range(*complete) if lines[i].strip() == "assert(self.config.clipboard_read != .deny);"]
+    if not (complete[0] <= hunks[2][0] < complete[1]) or not asserted or hunks[2][0] < asserted[0]:
+        problems.append("the empty-read bypass must follow the deny assertion")
+    return problems
+
+
+TARGET_ZIG = "src/renderer/opengl/Target.zig"
+WGL_ZIG = "src/renderer/opengl/wgl.zig"
+GX0045 = "GX-0045"
+GX0045_CALLS = (
+    'if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(true);',
+    'if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(false);',
+)
+
+
+def gx0045_problems(source: str) -> list[str]:
+    """Shape lock for GX-0045 in src/renderer/opengl/Target.zig: two one-line hunks, the
+    create count after the render framebuffer is complete and before the GX-0004 Windows
+    return, the release count after the four destroys in deinit."""
+    try:
+        _, hunks = marked_hunks(source, GX0045)
+    except ValueError as err:
+        return [str(err)]
+    lines = source.splitlines()
+    if len(hunks) != 2:
+        return [f"expected 2 {GX0045} hunks, found {len(hunks)}"]
+    problems: list[str] = []
+    for (begin, end), call in zip(hunks, GX0045_CALLS):
+        body = [line.strip() for line in lines[begin + 1:end]]
+        if body != [call]:
+            problems.append(f"line {begin + 1}: the {GX0045} hunk must hold only `{call}`")
+    init = zig_fn_lines(lines, "pub fn init(")
+    deinit = zig_fn_lines(lines, "pub fn deinit(")
+    if init is None or deinit is None:
+        return problems + ["Target.init or Target.deinit is missing"]
+    create, release = hunks[0][0], hunks[1][0]
+    complete = [i for i in range(*init) if lines[i].strip() == ".complete => {},"]
+    windows_return = [i for i in range(*init) if "GX-0004 begin: Windows blits" in lines[i]]
+    if not (init[0] <= create < init[1]):
+        problems.append("the create count must sit inside Target.init")
+    elif not complete or not windows_return or not (complete[0] < create < windows_return[0]):
+        problems.append("the create count must follow the complete render framebuffer and "
+                        "precede the GX-0004 Windows return")
+    destroys = [i for i in range(*deinit) if lines[i].strip().endswith(".destroy();")]
+    if not (deinit[0] <= release < deinit[1]):
+        problems.append("the release count must sit inside Target.deinit")
+    elif len(destroys) != 4 or release < max(destroys):
+        problems.append("the release count must follow the four destroys of Target.deinit")
+    return problems
+
+
 def _expand_ids(spec: str) -> set[str]:
     ids: set[str] = set()
     for first, last in re.findall(r"GX-(\d{4})(?:～GX-(\d{4}))?", spec):
@@ -1391,6 +1520,120 @@ class Gx0044ShapeTests(unittest.TestCase):
                 self.assertEqual(self.source.count(old), 1, old)
                 problems = gx0044_problems(self.source.replace(old, new))
                 self.assertTrue(any(expected in problem for problem in problems), problems)
+
+
+class Gx0043ReadbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.wgl = (ROOT / WGL_ZIG).read_text(encoding="utf-8")
+        cls.surface = (ROOT / WIN32_SURFACE_ZIG).read_text(encoding="utf-8")
+
+    def test_readback_stamp_and_unlocked_logging(self):
+        self.assertEqual(gx0043_readback_problems(self.wgl, self.surface), [])
+
+    def test_broken_shapes_are_rejected(self):
+        stamp = "                    remote.frame.readbackComplete();\n"
+        self.assertEqual(self.wgl.count(stamp), 1)
+        dropped = gx0043_readback_problems(self.wgl.replace(stamp, ""), self.surface)
+        self.assertTrue(any("exactly one" in p for p in dropped), dropped)
+        early = self.wgl.replace(stamp, "").replace(
+            "                    try gl.errors.getError();\n                    success = true;\n",
+            stamp + "                    try gl.errors.getError();\n                    success = true;\n", 1)
+        problems = gx0043_readback_problems(early, self.surface)
+        self.assertTrue(any("must follow" in p for p in problems), problems)
+        unlock = "        std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.surface.remote_mutex);\n"
+        log = "        self.frame.logPerfSamples();\n"
+        self.assertEqual(self.surface.count(unlock + log), 1)
+        locked = self.surface.replace(unlock + log, log + unlock, 1)
+        problems = gx0043_readback_problems(self.wgl, locked)
+        self.assertTrue(any("only then log" in p for p in problems), problems)
+
+
+class Gx0046ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / CORE_SURFACE_ZIG).read_text(encoding="utf-8")
+
+    def test_osc52_read_completion_stays_registered_and_in_place(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0046, CORE_SURFACE_ZIG, f"fork(gx): {GX0046}", "active"), patches)
+        self.assertEqual(gx0046_problems(self.source), [])
+        self.assertEqual(gx0046_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_broken_shapes_are_rejected(self):
+        cases = {
+            "only the OSC 52 read hook": (GX0046_HOOK, GX0046_HOOK + "\n    _ = 0;"),
+            "only the empty-read bypass": (GX0046_EMPTY, "if (data.len == 0) return;"),
+            "answer only an unavailable read": ("if (result == .unavailable) {", "if (result != .started) {"),
+        }
+        for expected, (old, new) in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(self.source.count(old), 1, old)
+                problems = gx0046_problems(self.source.replace(old, new))
+                self.assertTrue(any(expected in problem for problem in problems), problems)
+
+
+class Gx0045ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / TARGET_ZIG).read_text(encoding="utf-8")
+
+    def test_target_counts_stay_registered_and_in_place(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0045, TARGET_ZIG, f"fork(gx): {GX0045}", "active"), patches)
+        self.assertEqual(gx0045_problems(self.source), [])
+        self.assertEqual(gx0045_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_dropping_the_hunks_gives_back_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, TARGET_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        stripped, _ = marked_hunks(self.source, GX0045)
+        stripped, _ = marked_hunks(stripped, "GX-0004")
+        self.assertEqual(squash(stripped), squash(upstream))
+
+    def test_gauge_switch_comes_before_the_lock(self):
+        lines = (ROOT / WGL_ZIG).read_text(encoding="utf-8").splitlines()
+        start, end = zig_fn_lines(lines, "pub fn targetLifetime(")
+        body = [line.strip() for line in lines[start + 1:end] if line.strip()]
+        self.assertEqual(body[0], "if (!perf.enabled()) return;")
+        lock = next(i for i, line in enumerate(body) if "target_lock.lockUncancelable(" in line)
+        report = next(i for i, line in enumerate(body) if "target_counts.report()" in line)
+        self.assertLess(0, lock)
+        self.assertLess(lock, report)
+
+    def test_broken_shapes_are_rejected(self):
+        create, release = GX0045_CALLS
+        cases = {
+            "must hold only": (create, create + "\n    _ = 0;"),
+            "expected 2": (
+                "    // fork(gx): GX-0045 begin: account for released Windows target resources\n"
+                f"    {release}\n    // fork(gx): GX-0045 end\n",
+                ""),
+        }
+        for expected, (old, new) in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(self.source.count(old), 1, old)
+                problems = gx0045_problems(self.source.replace(old, new))
+                self.assertTrue(any(expected in problem for problem in problems), problems)
+        swapped = self.source.replace(create, "@@CREATE@@").replace(release, create).replace("@@CREATE@@", release)
+        self.assertTrue(gx0045_problems(swapped))
+        hunk = ("    // fork(gx): GX-0045 begin: count fully initialized Windows target resources\n"
+                f"    {create}\n    // fork(gx): GX-0045 end\n")
+        fbo = "    const fbo = try gl.Framebuffer.create();\n"
+        self.assertEqual(self.source.count(hunk), 1)
+        early = self.source.replace(hunk, "", 1).replace(fbo, hunk + fbo, 1)
+        problems = gx0045_problems(early)
+        self.assertTrue(any("precede the GX-0004 Windows return" in p for p in problems), problems)
+        moved = self.source.replace(
+            "    self.framebuffer.destroy();\n",
+            "    // fork(gx): GX-0045 begin: account for released Windows target resources\n"
+            f"    {release}\n    // fork(gx): GX-0045 end\n    self.framebuffer.destroy();\n", 1)
+        moved = moved.replace(
+            "    self.export_texture.destroy();\n    // fork(gx): GX-0045 begin: account for released Windows target resources\n"
+            f"    {release}\n    // fork(gx): GX-0045 end\n",
+            "    self.export_texture.destroy();\n", 1)
+        self.assertTrue(any("four destroys" in p for p in gx0045_problems(moved)), gx0045_problems(moved))
 
 
 class RegistryRuleTests(unittest.TestCase):

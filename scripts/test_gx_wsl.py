@@ -284,6 +284,20 @@ class ArgumentBuilderTests(unittest.TestCase):
 
 
 class ScriptTests(unittest.TestCase):
+    def expanded_smoke(self, name):
+        import ast
+        import base64
+        import zlib
+        script = all_invocations()[name].script
+        bootstrap = script.split("<<'GX_WSL_SESSION'\n", 1)[1].split("\nGX_WSL_SESSION", 1)[0]
+        tree = ast.parse(bootstrap)
+        payload = next(node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)
+                       and isinstance(node.value, str) and len(node.value) > 100)
+        program = zlib.decompress(base64.b64decode(payload)).decode("utf-8")
+        self.assertEqual(gx_wsl.PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + gx_wsl.SMOKE_PROGRAM, program)
+        compile(program, "expanded-smoke", "exec")
+        return script + "\n" + program
+
     def test_scripts_are_strict_and_free_of_argument_values(self) -> None:
         marker = "$(touch should-not-run)"
         invocation = gx_wsl.build_invocation(CLONE, False, [marker])
@@ -304,7 +318,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_smoke_matches_the_gx_ci_gtk_smoke_job(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "gx-ci.yml").read_text(encoding="utf-8")
-        script = all_invocations()["smoke"].script
+        script = self.expanded_smoke("smoke")
         self.assertIn(f"-screen 0 {gx_wsl.SMOKE_SCREEN}", workflow)
         self.assertIn("export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1", workflow)
         self.assertIn("export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1", script)
@@ -313,7 +327,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("ghostty --gtk-single-instance=false", workflow)
 
     def test_smoke_waits_for_the_window_instead_of_a_fixed_delay(self) -> None:
-        script = all_invocations()["smoke"].script
+        script = self.expanded_smoke("smoke")
         self.assertIn('["xdotool", "search", "--onlyvisible", "--pid", str(child.pid)]', script)
         self.assertIn("time.sleep(0.05)", script)
         self.assertNotIn("--sync", script)
@@ -328,7 +342,7 @@ class ScriptTests(unittest.TestCase):
         function = gx_wsl.perf_function()
         self.assertIn(gx_wsl.PERF_PROGRAM.strip(), function)
         self.assertEqual(1, function.splitlines().count(gx_wsl.PERF_DELIMITER))
-        script = all_invocations()["smoke-perf"].script
+        script = self.expanded_smoke("smoke-perf")
         self.assertIn(gx_wsl.smoke_function(), script)
         self.assertIn("export GHOSTTY_GX_PERF=1", script)
         self.assertIn('["-e", "sh", str(work / "workload.sh")]', script)
@@ -359,6 +373,22 @@ class ScriptTests(unittest.TestCase):
         self.assertLess(length, 32767)
         program = invocation.script.split("<<'GX_WSL_SESSION'\n", 1)[1].split("\nGX_WSL_SESSION", 1)[0]
         compile(program, "generated-smoke-session", "exec")
+
+    def test_smoke_bootstrap_registers_source_for_tracebacks(self):
+        import linecache
+        bootstrap = gx_wsl.smoke_function().split("<<'GX_WSL_SESSION'\n", 1)[1].split("\nGX_WSL_SESSION", 1)[0]
+        previous = linecache.cache.get("gx-wsl-session")
+        try:
+            executed = mock.Mock()
+            exec(bootstrap, {"exec": executed})
+            executed.assert_called_once()
+            expected = gx_wsl.PERF_PROGRAM.rsplit('\nif __name__ == "__main__":', 1)[0] + gx_wsl.SMOKE_PROGRAM
+            self.assertEqual(expected.splitlines(True), linecache.getlines("gx-wsl-session"))
+        finally:
+            if previous is None:
+                linecache.cache.pop("gx-wsl-session", None)
+            else:
+                linecache.cache["gx-wsl-session"] = previous
 
     @unittest.skipUnless(find_bash(), "needs a bash for `bash -n`")
     def test_scripts_parse(self) -> None:
@@ -778,12 +808,186 @@ mkdir() {
 
     def test_smoke_program_compiles_and_has_no_numeric_signal_fallback(self):
         self.supervisor()
-        script = gx_wsl.smoke_function()
+        script = ScriptTests().expanded_smoke("smoke-perf") + gx_wsl.smoke_function()
         self.assertNotIn('kill "$pid"', script)
         self.assertNotIn("os.kill(", script)
         self.assertNotIn("child.poll(", script)
         self.assertIn("pidfd unavailable; refusing to launch", script)
         self.assertIn("perf requires verified ReleaseFast", script)
+
+
+class ScenarioScriptTests(unittest.TestCase):
+    def helper(self, name, scope):
+        import ast
+        tree = ast.parse(gx_wsl.SMOKE_PROGRAM)
+        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "smoke_main")
+        node = next(n for n in main.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "scenario-helper", "exec"), scope)
+        return scope[name]
+
+    def test_capture_rejects_unsafe_and_duplicate_labels(self):
+        import re
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "G17"
+            capture = mock.Mock()
+            scope = dict(re=re, Path=Path, prefix=prefix, capture=capture)
+            helper = self.helper("scenario_capture", scope)
+            for label in ("", "../escape", "a/b", "a\\b", ".hidden"):
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    helper(label)
+            (Path(tmp) / "G17-used.png").write_bytes(b"existing")
+            with self.assertRaises(ValueError):
+                helper("used")
+            capture.assert_not_called()
+            helper("step-1")
+            capture.assert_called_once_with("-step-1.png")
+
+    def test_scenario_save_is_confined_and_never_overwrites(self):
+        import re
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(re=re, evidence=Path(tmp), name="G17")
+            helper = self.helper("scenario_save", scope)
+            for suffix in ("../outside", "/absolute", "-a/b", "-a\\b", ""):
+                with self.assertRaises(ValueError):
+                    helper(suffix, "bad")
+            helper("-result.json", "one")
+            with self.assertRaises(FileExistsError):
+                helper("-result.json", "two")
+            self.assertEqual("one", (Path(tmp) / "G17-result.json").read_text())
+
+    def test_process_snapshot_parses_descendants_and_rechecks_birth(self):
+        import re
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp)
+            def stat(pid, parent, birth, tty):
+                fields = ["0"] * 30
+                fields[0], fields[1], fields[4], fields[19] = "S", str(parent), str(tty), str(birth)
+                return f"{pid} (name (with) spaces) " + " ".join(fields)
+            for pid, parent, birth, tty in ((10, 1, 100, 0), (20, 10, 200, 7), (30, 20, 300, 7), (40, 1, 400, 9)):
+                (proc / str(pid)).mkdir()
+                (proc / str(pid) / "stat").write_text(stat(pid, parent, birth, tty))
+            (proc / "not-a-pid").mkdir()
+            (proc / "41").mkdir()
+            (proc / "41/stat").write_text("bad")
+            saved = mock.Mock()
+            guard = mock.Mock()
+            scope = dict(re=re, Path=lambda p: proc if str(p) == "/proc" else Path(p),
+                         child=SimpleNamespace(pid=10), guard=guard, json=json,
+                         save=saved, scenario_save=saved,
+                         os=SimpleNamespace(readlink=lambda p: "/dev/pts/7" if p.name == "0" else "/bin/bash"))
+            helper = self.helper("scenario_processes", scope)
+            result = helper("before")
+            self.assertEqual([20, 30], [r["pid"] for r in result])
+            self.assertEqual((10, 200, 7, "/dev/pts/7", "/bin/bash"),
+                             tuple(result[0][k] for k in ("ppid", "birth", "tty", "fd0", "exe")))
+            self.assertEqual([mock.call("process snapshot", True), mock.call("process snapshot finished", True)], guard.call_args_list)
+            with self.assertRaises(ValueError):
+                helper("../invalid")
+            def changed(path):
+                (proc / "20/stat").write_text(stat(20, 10, 201, 7))
+                return "/bin/bash"
+            scope["os"].readlink = changed
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                helper("race")
+
+    def test_python_and_legacy_dispatch_and_perf_rejection(self):
+        from types import SimpleNamespace
+        scope = dict(perf=False, Path=Path, os=SimpleNamespace(environ={"XDG_CONFIG_HOME":"config","XDG_STATE_HOME":"state"}),
+                     scenario_capture=mock.Mock(), scenario_xdo=mock.Mock(), scenario_restart=mock.Mock(),
+                     scenario_processes=mock.Mock(), scenario_save=mock.Mock(), time=SimpleNamespace(sleep=mock.Mock()),
+                     evidence=Path("evidence"), meta={"window":"42"}, child=SimpleNamespace(pid=10),
+                     json=json, checked=mock.Mock(), xdo="input.xdo")
+        helper = self.helper("scenario_dispatch", scope)
+        helper("# gx-scenario-python-v1\nsave('-ran.txt', 'yes')")
+        scope["scenario_save"].assert_called_once_with("-ran.txt", "yes")
+        scope["checked"].assert_not_called()
+        helper("key Escape")
+        scope["checked"].assert_called_once_with(["xdotool", "input.xdo", "10"], "xdotool script")
+        scope["perf"] = True
+        with self.assertRaisesRegex(ValueError, "performance"):
+            helper("# gx-scenario-python-v1\nraise AssertionError('must not run')")
+
+    def test_unexpected_script_errors_keep_type_and_traceback(self):
+        scope = dict(meta={"errors":[]}, save=mock.Mock())
+        helper = self.helper("scenario_failure", scope)
+        try:
+            {}["missing"]
+        except KeyError as exc:
+            helper(exc)
+        self.assertIn("KeyError", scope["meta"]["errors"][0])
+        suffix, trace = scope["save"].call_args.args
+        self.assertEqual("-failure.txt", suffix)
+        self.assertIn("KeyError", trace)
+        self.assertIn("test_unexpected_script_errors", trace)
+
+    def restart_helper(self, scope, child, pidfd):
+        import ast
+        import textwrap
+        tree = ast.parse(gx_wsl.SMOKE_PROGRAM)
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "smoke_main")
+        helper = next(node for node in main.body if isinstance(node, ast.FunctionDef) and node.name == "scenario_restart")
+        source = ast.get_source_segment(gx_wsl.SMOKE_PROGRAM, helper)
+        factory = "def factory(child, pidfd):\n" + textwrap.indent(source, "    ") + "\n    return scenario_restart\n"
+        exec(compile(factory, "restart-fixture", "exec"), scope)
+        return scope["factory"](child, pidfd)
+
+    def test_restart_waits_for_owned_child_and_reuses_private_environment(self):
+        import time
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            child = mock.Mock(pid=10)
+            child.wait.return_value = 0
+            new = mock.Mock(pid=20)
+            sub = mock.Mock()
+            sub.Popen.return_value = new
+            operating = mock.Mock()
+            operating.pidfd_open.return_value = 200
+            meta = {"identity": {"pid": 10}, "executable": {"path": "/own/exe", "sha256": "abc"},
+                    "command": ["/own/exe", "--gtk-single-instance=false"]}
+            checked = mock.Mock(side_effect=[SimpleNamespace(returncode=0, stdout="42\n"), SimpleNamespace(stdout="20\n")])
+            scope = dict(perf=False, guard=mock.Mock(), subprocess=sub, meta=meta, os=operating,
+                         exe="/own/exe", held="/proc/self/fd/9", exe_fd=9, extra=["--cursor-style=bar"],
+                         prefix=Path(tmp) / "case", process_identity=mock.Mock(return_value={"pid": 20, "sha256": "abc"}),
+                         wait_seconds="2", checked=checked, time=time, settle="0")
+            restart = self.restart_helper(scope, child, 100)
+            self.assertEqual("42", restart())
+            child.wait.assert_called_once_with(timeout=15)
+            operating.close.assert_called_once_with(100)
+            self.assertEqual(["/own/exe", "--gtk-single-instance=false", "--cursor-style=bar"], sub.Popen.call_args.args[0])
+            self.assertEqual("/proc/self/fd/9", sub.Popen.call_args.kwargs["executable"])
+            self.assertNotIn("env", sub.Popen.call_args.kwargs, "inherit the same private XDG homes")
+            self.assertEqual(0, meta["sessions"][0]["exit"])
+            self.assertEqual(["/own/exe", "--gtk-single-instance=false"], meta["sessions"][0]["command"])
+            self.assertEqual(sub.Popen.call_args.args[0], meta["command"])
+
+    def test_restart_rejects_perf_and_changed_process_before_input(self):
+        for perf in (True, False):
+            sub = mock.Mock()
+            scope = dict(perf=perf, guard=mock.Mock(side_effect=ValueError("changed identity")), subprocess=sub)
+            restart = self.restart_helper(scope, mock.Mock(), 100)
+            with self.assertRaises(ValueError):
+                restart()
+            sub.run.assert_not_called()
+            sub.Popen.assert_not_called()
+
+    def scenario(self, fields):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "G17-script.toml"
+            path.write_text('id="G17"\ntitle="script"\nconfig="language = en"\n' + fields, encoding="utf-8")
+            return gx_wsl.load_gtk_scenario(path)
+
+    def test_python_scenario_is_parsed_without_execution(self):
+        case = self.scenario('script="raise RuntimeError(123)"\n')
+        self.assertEqual("raise RuntimeError(123)", case.script)
+
+    def test_script_and_xdotool_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(gx_wsl.GxWslError, "mutually exclusive"):
+            self.scenario('script="pass"\nxdotool="sleep 1"\n')
+
+    def test_invalid_python_is_rejected_before_launch(self):
+        with self.assertRaisesRegex(gx_wsl.GxWslError, "invalid Python"):
+            self.scenario('script="if (:"\n')
 
 
 class SyncTargetTests(unittest.TestCase):
@@ -930,20 +1134,23 @@ class GtkScenarioTests(unittest.TestCase):
     def test_runner_writes_inputs_notes_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            first, second = root / "G01-a.toml", root / "G02-b.toml"
+            first, second, third = root / "G01-a.toml", root / "G02-b.toml", root / "G03-c.toml"
             first.write_text('id = "G01"\ntitle = "first"\nconfig = "language = en"\nexpect = ["a.png: x"]\n',
                              encoding="utf-8")
             second.write_text('id = "G02"\ntitle = "second"\nconfig = "language = en"\nxdotool = "key ctrl+t"\n',
                               encoding="utf-8")
-            logs = {"G01": "fine\n", "G02": "Theme parser error: <data>:1:2: boom\n"}
+            third.write_text('id="G03"\ntitle="python"\nconfig="language = en"\nscript="capture(123)"\n', encoding="utf-8")
+            logs = {"G01": "fine\n", "G02": "Theme parser error: <data>:1:2: boom\n", "G03": "fine\n"}
 
             def fake_execute(distro: str, invocation: gx_wsl.Invocation, *, dry_run: bool) -> int:
                 target, name = Path(invocation.args[1]), invocation.args[7]
                 (target / f"{name}.log").write_text(logs[name], encoding="utf-8")
+                if name == "G03":
+                    self.assertEqual(target / "script.py", Path(invocation.args[4]))
                 return 0
 
             args = argparse.Namespace(clone=CLONE, distro="Ubuntu-24.04", dry_run=False, out=str(root / "out"),
-                                      scenarios=[str(first), str(second)])
+                                      scenarios=[str(first), str(second), str(third)])
             with mock.patch.object(gx_wsl, "execute", side_effect=fake_execute), \
                     contextlib.redirect_stdout(io.StringIO()):
                 code = gx_wsl.run_gtk_scenarios(args)
@@ -952,6 +1159,8 @@ class GtkScenarioTests(unittest.TestCase):
             self.assertEqual("language = en", (out / "G01" / "config.ghostty").read_text(encoding="utf-8"))
             self.assertFalse((out / "G01" / "script.xdo").exists())
             self.assertEqual("key ctrl+t", (out / "G02" / "script.xdo").read_text(encoding="utf-8"))
+            self.assertEqual("# gx-scenario-python-v1\ncapture(123)", (out / "G03" / "script.py").read_text(encoding="utf-8"))
+            self.assertFalse((out / "G03" / "script.xdo").exists())
             summary = (out / "SUMMARY.txt").read_text(encoding="utf-8")
             self.assertIn("G01 OK first", summary)
             self.assertIn("G02 FAILED (1 forbidden log lines", summary)

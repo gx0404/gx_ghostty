@@ -16,6 +16,7 @@ pub const shortcuts_dialog = @import("shortcuts_dialog.zig");
 pub const window = @import("window.zig");
 
 test {
+    _ = @import("open_perf.zig");
     _ = app;
     _ = defaults;
     _ = @import("config_errors.zig");

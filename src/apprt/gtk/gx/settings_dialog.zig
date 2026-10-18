@@ -69,7 +69,35 @@ const save_delay_ms = 300;
 /// milliseconds: after moving through the list, so holding an arrow key
 /// does not reload for every row, and longer after typing a search.
 const preview_delay_ms = 150;
+
+/// Compare the live theme before updateConfig; UI preview flags may already
+/// have been cleared by Revert, close, or Apply.
+fn themeReloadChanged(previous: *const CoreConfig, next: *const CoreConfig) bool {
+    return previous.changed(next, .theme);
+}
 const typing_preview_delay_ms = 400;
+
+test "theme reload changes cover preview revert close and save without duplicate counts" {
+    const alloc = std.testing.allocator;
+    var saved = try CoreConfig.default(alloc);
+    defer saved.deinit();
+    saved.theme = .{ .light = "Saved", .dark = "Saved" };
+    var preview = try saved.clone(alloc);
+    defer preview.deinit();
+    preview.theme = .{ .light = "Preview", .dark = "Preview" };
+    try std.testing.expect(themeReloadChanged(&saved, &preview));
+    // Revert and close restore the saved theme after previewing was cleared.
+    try std.testing.expect(themeReloadChanged(&preview, &saved));
+    // Saving a different selection without a prior preview is a real change.
+    try std.testing.expect(themeReloadChanged(&saved, &preview));
+    // Applying an already visible preview, or changing another setting, is not.
+    var applied = try preview.clone(alloc);
+    defer applied.deinit();
+    applied.@"cursor-style" = .bar;
+    try std.testing.expect(!themeReloadChanged(&preview, &applied));
+    applied.theme = null;
+    try std.testing.expect(themeReloadChanged(&preview, &applied));
+}
 
 /// How long "Settings saved." shows, in seconds.
 const saved_toast_seconds = 2;
@@ -407,6 +435,8 @@ pub const GxSettingsDialog = extern struct {
     /// Like `show`, and shows `page` (`gx:settings_page:<page>`); without
     /// a page, a new dialog starts on the page the last one was closed on.
     pub fn showPage(app: *Application, page: ?settings_map.Page) void {
+        const open_perf = @import("open_perf.zig");
+        const started = open_perf.begin();
         if (!adw_version.supportsDialogs()) {
             log.warn("the settings dialog needs libadwaita 1.5 or newer", .{});
             return;
@@ -420,7 +450,9 @@ pub const GxSettingsDialog = extern struct {
         if (open_dialog.get()) |dialog| {
             defer dialog.unref();
             if (page) |name| dialog.showSettingsPage(name);
+            open_perf.watch(dialog.as(gtk.Widget), "settings.open.total", started);
             dialog.as(adw.Dialog).present(parent);
+            open_perf.presented(dialog.as(gtk.Widget), started);
             return;
         }
 
@@ -428,7 +460,9 @@ pub const GxSettingsDialog = extern struct {
         dialog.load(app);
         if (page orelse last_page) |name| dialog.showSettingsPage(name);
         open_dialog.set(dialog);
+        open_perf.watch(dialog.as(gtk.Widget), "settings.open.total", started);
         dialog.as(adw.Dialog).present(parent);
+        open_perf.presented(dialog.as(gtk.Widget), started);
     }
 
     /// Handles opening the configuration in the system editor (the
@@ -1408,12 +1442,18 @@ pub const GxSettingsDialog = extern struct {
             return null;
         };
         const app = Application.default();
+        const theme_changed = if (gx.perf.enabled()) changed: {
+            const previous = app.getConfig();
+            defer previous.unref();
+            break :changed themeReloadChanged(previous.get(), &config);
+        } else false;
         app.core().updateConfig(app.rt(), &config) catch |err| {
             log.warn("cannot apply the configuration err={}", .{err});
             self.toastError(failed, err, st.apply_pending);
             config.deinit();
             return null;
         };
+        if (theme_changed) gx.perf.count("theme.reload", 1);
         return config;
     }
 

@@ -14,6 +14,7 @@ const refs = @import("../../gx/ui_ref.zig");
 const win_input = @import("../../gx/win32_input.zig");
 const terminal = @import("../../terminal/main.zig");
 const w32 = @import("win32.zig");
+const perf = @import("../../gx/perf.zig");
 
 fn trace(comptime format: []const u8, args: anytype) void {
     if (!@import("remote_test.zig").enabled()) return;
@@ -124,6 +125,7 @@ pub fn install(surface: *Surface, lease: protocol.Lease) !void {
     }
     const state = try surface.app.core_app.alloc.create(State);
     state.* = .{ .surface = surface, .lease = lease, .view = .{ .surface = surface.ui_reference, .lease = lease } };
+    resetPerfInput(surface);
     surface.remote_source_state = state;
     surface.core_surface.gx_binding_route = .{ .context = state, .callback = routeBinding, .config_changed = configChanged };
     state.view.title = clipped(protocol.Title, surface.getTitle() orelse "");
@@ -140,6 +142,7 @@ pub fn install(surface: *Surface, lease: protocol.Lease) !void {
 
 pub fn release(surface: *Surface) void {
     const state = surface.remote_source_state orelse return;
+    resetPerfInput(surface);
     surface.remote_source_state = null;
     surface.core_surface.gx_binding_route = null;
     state.discard();
@@ -383,6 +386,66 @@ fn dispatchInput(state: *State, event: *const protocol.Input) !void {
             }
         },
     }
+    // An asynchronous binding has only been queued, not applied. Its original
+    // input is marked by advance after the continuation actually completes.
+    markCompletedPerfInput(state, event);
+}
+
+fn markCompletedPerfInput(state: *State, event: *const protocol.Input) void {
+    if (state.chain == null) markPerfInput(state.surface, event);
+}
+
+fn resetPerfInput(surface: *Surface) void {
+    if (!perf.enabled()) return;
+    if (surface.remote_output) |output| output.perf_input.store(.{});
+}
+
+/// GUI owns Output lifetime and is the sole stamp writer. Do not wait on the
+/// readback lock: the render thread takes a coherent atomic snapshot at begin.
+fn markPerfInput(surface: *Surface, event: *const protocol.Input) void {
+    if (!perf.enabled() or event.perf.sequence == 0) return;
+    if (surface.remote_output) |output| {
+        if (event.perf.sequence > output.perf_input.load().sequence) output.perf_input.store(event.perf);
+    }
+}
+
+test "remote applied performance stamp is monotonic independent of transport sequence and resets with lease" {
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    var event: protocol.Input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 100,
+        .event = .{ .text = try protocol.Text.init("x") },
+        .perf = .{ .sequence = 7, .qpc = 12345 },
+    };
+    // Off must not even dereference the surface or touch its export lock.
+    perf.setEnabled(false);
+    markPerfInput(undefined, &event);
+    resetPerfInput(undefined);
+    const alloc = std.testing.allocator;
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    var output: @import("RemoteHost.zig").Output = undefined;
+    output.perf_input = .{};
+    surface.* = undefined;
+    surface.remote_mutex = .{};
+    surface.remote_output = &output;
+    perf.setEnabled(true);
+    // Even while a renderer owns the readback lock, GUI stamp updates must
+    // finish without taking it. This thread holds it to model that condition.
+    std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&surface.remote_mutex);
+    defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&surface.remote_mutex);
+    markPerfInput(surface, &event);
+    try std.testing.expectEqual(event.perf, output.perf_input.load());
+    event.sequence = 200;
+    event.perf = .{ .sequence = 6, .qpc = 12000 };
+    markPerfInput(surface, &event);
+    try std.testing.expectEqual(@as(u64, 7), output.perf_input.load().sequence);
+    resetPerfInput(surface);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input.load());
+    surface.remote_output = null;
+    markPerfInput(surface, &event);
 }
 
 fn completePaste(state: *State, confirmed: bool) !void {
@@ -505,6 +568,7 @@ fn advance(state: *State) !void {
         defer core.gx_binding_bypass = false;
         try dispatchInput(state, &finished.original);
     }
+    markCompletedPerfInput(state, &finished.original);
 }
 
 pub fn handle(app: *App, coordinator: *Coordinator, packet: *const protocol.Packet) !bool {
@@ -1153,6 +1217,37 @@ test "apprt.win32 remote source owns bounded input queue instead of packet slabs
     try std.testing.expect(@sizeOf(State) < 20 * 1024);
     try std.testing.expectEqual(@as(usize, 4), utf8Prefix("hello"[0..4]));
     try std.testing.expectEqual(@as(usize, 0), utf8Prefix("\xe4\xb8"));
+}
+
+test "remote continuation must finish before marking its input performance stamp" {
+    const previous = perf.enabled();
+    defer perf.setEnabled(previous);
+    perf.setEnabled(true);
+    const alloc = std.testing.allocator;
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.* = undefined;
+    var output: @import("RemoteHost.zig").Output = undefined;
+    output.perf_input = .{};
+    surface.remote_output = &output;
+    const event: protocol.Input = .{
+        .surface = .{ .epoch = 1, .kind = .surface, .id = 4, .generation = 1 },
+        .lease = .{ .holder_epoch = 2, .transaction = 7, .generation = 9 },
+        .sequence = 100,
+        .event = .{ .text = try protocol.Text.init("x") },
+        .perf = .{ .sequence = 7, .qpc = 12345 },
+    };
+    var state: State = undefined;
+    state.surface = surface;
+    state.chain = .{ .actions = &.{}, .identity = undefined, .flags = .{}, .original = event, .event = .{}, .once = null, .waiting = true };
+    markCompletedPerfInput(&state, &event);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input.load());
+    state.chain.?.waiting = false; // runnable is not yet completed
+    markCompletedPerfInput(&state, &event);
+    try std.testing.expectEqual(@import("RemotePerf.zig").InputStamp{}, output.perf_input.load());
+    state.chain = null;
+    markCompletedPerfInput(&state, &event);
+    try std.testing.expectEqual(event.perf, output.perf_input.load());
 }
 
 test "apprt.win32 remote source native codepoints encode UTF16 scalar boundaries" {

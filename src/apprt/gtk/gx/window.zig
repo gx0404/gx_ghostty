@@ -23,6 +23,7 @@ const Window = @import("../class/window.zig").Window;
 const language = @import("language.zig");
 const launch = @import("launch.zig");
 const menus = @import("menus.zig");
+const open_perf = @import("open_perf.zig");
 
 const log = std.log.scoped(.gtk_gx_window);
 const tr = gx.i18n.tr;
@@ -104,12 +105,15 @@ pub fn syncSurfaceMenu(surface: *Surface) void {
 /// when one is shown, else from the active terminal. Returns false if
 /// there is neither.
 pub fn popupMainMenu(window: *Window) bool {
+    const started = open_perf.begin();
     var header: Header = .{};
     if (toolbar(window)) |widget| walk(widget, &header);
     for (header.menu_buttons.slice()) |button| {
         const widget = button.as(gtk.Widget);
         if (widget.isVisible() != 0 and widget.getMapped() != 0) {
+            if (button.getPopover()) |popover| open_perf.watch(popover.as(gtk.Widget), "menu.open.total", started);
             button.popup();
+            if (button.getPopover()) |popover| open_perf.presented(popover.as(gtk.Widget), started);
             return true;
         }
     }
@@ -118,8 +122,10 @@ pub fn popupMainMenu(window: *Window) bool {
     const model = button.getMenuModel() orelse return false;
     const surface = window.getActiveSurface() orelse return false;
     const popover = surfacePopover(surface) orelse return false;
+    open_perf.watch(popover.as(gtk.Widget), "menu.open.total", started);
     showFromPopover(popover, model);
     addViewControls(popover);
+    open_perf.presented(popover.as(gtk.Widget), started);
     return true;
 }
 

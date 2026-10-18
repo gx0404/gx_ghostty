@@ -41,10 +41,11 @@
 - Windows 标签栏每次刷新只拍一次系统进程快照（原来每个标签拍一次），标签多时 CPU 占用更低。
 - 配置诊断：`language` 填了不支持的值、`gui-settings.ghostty` 读不出来时会报告配置错误，`ghostty +validate-config` 因此返回 1。
 - GTK 切换界面语言与重新加载配置时在内存里重建配置，不再重新读盘。
-- Windows 便携包、安装包与 Linux deb 附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本。
+- Windows 便携包、安装包、Linux deb 与 debian13 GTK 压缩包附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本（压缩包在 `usr/share/doc/ghostty-gx/`，另附 Ghostty 的 MIT 许可）。
 
 ### Fixed
 
+- Windows 上程序用 OSC 52 读取剪贴板、而剪贴板里没有文本时，终端回复空内容，不再让等待回复的程序一直挂起，也不为空内容弹出读取确认；某个分屏勾选“记住”并拒绝读取后，之后的读取请求同样得到空回复（与当次点“拒绝”一致）。
 - `-Dapp-runtime=none` 核心测试不再因远程一次性键表续延引用窗口动作分派而编译失败；保留无界面运行时下的键表代次回归测试，真实 apprt 的动作处理不变。
 - Linux 框架测试等待已 join 的工作线程从 `/proc` 消失后再核对 CPU 统计，避免内核线程尚未清理时偶发误报线程集合变化；超时仍失败，保留退出线程 CPU 累计与线程集合断言。
 - GTK 分屏迁移与会话恢复不再留下焦点引用，关闭旧窗口或恢复后退出时能完整销毁终端，避免退出断言失败。

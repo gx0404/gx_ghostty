@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -23,6 +24,7 @@ if str(SCRIPTS) not in sys.path:
 
 import gx_release as release  # noqa: E402
 
+ROOT = SCRIPTS.parent
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 FORK = "0.1.0"
@@ -56,6 +58,16 @@ CONTRACT_ASSETS = {
 }
 WINDOWS_ZIP = f"ghostty-gx-{VS}-x86_64-windows.zip"
 WINDOWS_SETUP = f"ghostty-gx-{VS}-x86_64-windows-setup.exe"
+LINUX_APP = f"ghostty-gx-{VS}-x86_64-linux-debian13.tar.gz"
+# usr/share/doc/ghostty-gx/ of the Linux GTK asset: the deb stage's copyright name plus the verbatim texts
+# under the names they have in licenses/ of the Windows zip.
+LINUX_DOC = "usr/share/doc/ghostty-gx"
+LINUX_DOC_FILES = ("copyright", "Ghostty-MIT.txt", "pinyin-data-MIT.txt", "Unicode-License-V3.txt")
+LINUX_LICENSE_SOURCES = {
+    "Ghostty-MIT.txt": "LICENSE",
+    "pinyin-data-MIT.txt": "src/gx/pinyin/pinyin-data-LICENSE.txt",
+    "Unicode-License-V3.txt": "src/gx/pinyin/Unicode-LICENSE.txt",
+}
 TEST_INSTALLER_MIN_BYTES = 4096
 CHANGELOG_BODY = "### Added\n\n- 条目"
 MACOS_ASSETS = {
@@ -631,6 +643,7 @@ class VerifyTests(EnvironmentCase):
             (f"libghostty-vt-{VS}-wasm32-freestanding.tar.gz", "bin/ghostty-vt.wasm"),
             (f"libghostty-vt-{VS}-x86_64-windows-msvc.zip", "bin/ghostty-vt.dll"),
             (f"ghostty-gx-{VS}-x86_64-linux-debian13.tar.gz", "usr/bin/ghostty"),
+            *((LINUX_APP, f"{LINUX_DOC}/{name}") for name in LINUX_DOC_FILES),
             (f"ghostty-{VS}.tar.gz", "src/apprt/gtk/ghostty_resources.c"),
             (f"libghostty-vt-{VS}.tar.gz", "CMakeLists.txt"),
             (WINDOWS_ZIP, "conpty.dll"),
@@ -665,6 +678,13 @@ class VerifyTests(EnvironmentCase):
         self.assertEqual((setup.kind, setup.target, setup.min_bytes), ("installer", "x86_64-windows", TEST_INSTALLER_MIN_BYTES))
         with mock.patch.object(release, "INSTALLER_MIN_BYTES", 16 * 1024 * 1024):
             self.assertEqual(release.expected_assets(VS)[WINDOWS_SETUP].min_bytes, 16 * 1024 * 1024)
+
+    def test_linux_app_asset_ships_its_license_texts(self):
+        linux = release.expected_assets(VS)[LINUX_APP]
+        self.assertEqual((linux.kind, linux.target, linux.root), ("app", "x86_64-linux-debian13", LINUX_APP[:-7]))
+        self.assertEqual(release.LINUX_APP_DOC, LINUX_DOC)
+        self.assertEqual(linux.required, ("usr/bin/ghostty", *(f"{LINUX_DOC}/{name}" for name in LINUX_DOC_FILES)))
+        self.assertEqual(linux.required_prefixes, ("usr/share/ghostty/",))
 
     def test_refuses_installers_without_pe_headers_or_payload(self):
         path = self.folder / WINDOWS_SETUP
@@ -760,6 +780,139 @@ class VerifyTests(EnvironmentCase):
     def test_refuses_a_missing_artifact_directory(self):
         with self.assertRaisesRegex(release.ReleaseError, "not a real directory"):
             release.verify_artifacts(self.root, self.base / "absent", SHA)
+
+
+def copy_license_sources(base: Path, newline: bytes = b"\n") -> Path:
+    """A source tree holding only the license texts of the Linux GTK asset, with the given line ending."""
+    root = base / "source"
+    for source in LINUX_LICENSE_SOURCES.values():
+        path = root / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / source).read_bytes().replace(b"\r\n", b"\n").replace(b"\n", newline))
+    return root
+
+
+def paragraphs(text: str) -> list[str]:
+    return [paragraph for paragraph in text.split("\n\n") if paragraph.strip()]
+
+
+class LinuxAppDocTests(unittest.TestCase):
+    """usr/share/doc/ghostty-gx/ of ghostty-gx-$VS-x86_64-linux-debian13.tar.gz (O3 finding F-1)."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.doc = release.linux_app_doc(ROOT)
+
+    def run_main(self, *argv: str) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            code = release.main(list(argv))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_files_are_named_like_the_deb_stage_and_the_windows_zip(self):
+        import gx_package
+        import gx_windows_package as windows
+
+        self.assertEqual(list(self.doc), list(LINUX_DOC_FILES))
+        self.assertEqual(gx_package.COPYRIGHT, f"root/{LINUX_DOC}/copyright")
+        windows_names = {item.target for item in windows.PAYLOAD} | set(windows.GENERATED)
+        for name in LINUX_DOC_FILES[1:]:
+            self.assertIn(f"licenses/{name}", windows_names)
+        self.assertEqual({name: source for source, name in release.LINUX_APP_LICENSES}, LINUX_LICENSE_SOURCES)
+        self.assertEqual(LINUX_LICENSE_SOURCES["pinyin-data-MIT.txt"], windows.PINYIN_LICENSE)
+        self.assertEqual(LINUX_LICENSE_SOURCES["Unicode-License-V3.txt"], windows.UNICODE_LICENSE)
+
+    def test_license_texts_are_verbatim_and_match_the_windows_pins(self):
+        import gx_windows_package as windows
+
+        pins = {item.target: item.sha256 for item in windows.PAYLOAD}
+        for name, source in LINUX_LICENSE_SOURCES.items():
+            with self.subTest(name=name):
+                data = self.doc[name]
+                self.assertEqual(data, (ROOT / source).read_bytes().replace(b"\r\n", b"\n"))
+                self.assertNotIn(b"\r", data)
+                if name != "Ghostty-MIT.txt":
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), pins[f"licenses/{name}"])
+
+    def test_copyright_is_dep5_with_the_pinyin_paragraph_and_full_texts(self):
+        import gx_package
+        import gx_pinyin
+
+        text = self.doc["copyright"].decode("utf-8")
+        self.assertNotIn("\r", text)
+        self.assertTrue(text.startswith("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"))
+        self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
+        stanza = text.split("Files: src/gx/pinyin/*\n", 1)[1].split("\n\n", 1)[0]
+        self.assertTrue(stanza.startswith("Copyright: 2016 mozillazg\n "))
+        self.assertIn("Unicode, Inc.\nLicense: MIT and Unicode-3.0\nComment: ", stanza)
+        self.assertIn(f"pinyin-data {gx_pinyin.SOURCE_VERSION}", stanza)
+        self.assertIn("usr/bin/ghostty", stanza)
+        for name, license_name in (("Ghostty-MIT.txt", "MIT"), ("Unicode-License-V3.txt", "Unicode-3.0")):
+            body = (ROOT / LINUX_LICENSE_SOURCES[name]).read_text(encoding="utf-8")
+            self.assertIn("\n".join([f"License: {license_name}", *gx_package.dep5_text(body)]), text)
+        self.assertNotIn("OFL", text)
+        self.assertNotIn("Files: */", text)
+
+    def test_copyright_equals_the_deb_stage_without_the_font_paragraphs(self):
+        import gx_package
+        from test_gx_package import sfnt
+
+        fonts = self.base / "fonts"
+        fonts.mkdir()
+        (fonts / "JetBrainsMonoNerdFont-Regular.ttf").write_bytes(sfnt("JetBrainsMono NF Regular"))
+        (fonts / "NotoSansCJK-Regular.ttc").write_bytes(sfnt("Noto Sans CJK JP", ttc=True))
+        deb = paragraphs(gx_package.copyright_file(ROOT, fonts, "SIL Open Font License 1.1\n"))
+        ours = paragraphs(self.doc["copyright"].decode("utf-8"))
+        fonts_only = [paragraph for paragraph in deb if "OFL-1.1" in paragraph]
+        self.assertEqual(len(fonts_only), 3)
+        shared = [paragraph for paragraph in deb if paragraph not in fonts_only]
+        self.assertEqual(len(ours), len(shared))
+        for mine, theirs in zip(ours, shared):
+            if mine.startswith("Files: src/gx/pinyin/*"):
+                # Only the Comment differs: it names usr/bin/ghostty and the verbatim texts next to it.
+                self.assertEqual(mine.split("\nComment: ")[0], theirs.split("\nComment: ")[0])
+            else:
+                self.assertEqual(mine, theirs)
+
+    def test_a_crlf_checkout_gives_the_same_bytes(self):
+        self.assertEqual(release.linux_app_doc(copy_license_sources(self.base / "crlf", b"\r\n")), self.doc)
+        self.assertEqual(release.linux_app_doc(copy_license_sources(self.base / "lf")), self.doc)
+
+    def test_refuses_changed_or_missing_license_texts(self):
+        root = copy_license_sources(self.base)
+        pinyin = root / LINUX_LICENSE_SOURCES["pinyin-data-MIT.txt"]
+        pinyin.write_bytes(pinyin.read_bytes() + b"changed\n")
+        with self.assertRaisesRegex(release.ReleaseError, "pinned"):
+            release.linux_app_doc(root)
+        pinyin.unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "missing"):
+            release.linux_app_doc(root)
+        root = copy_license_sources(self.base / "other")
+        (root / "LICENSE").write_text("MIT License\n\nno holder line\n", encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "Copyright"):
+            release.linux_app_doc(root)
+
+    def test_linux_doc_command_writes_the_files_once(self):
+        source = copy_license_sources(self.base)
+        dest = self.base / "stage" / "name" / LINUX_DOC
+        code, out, err = self.run_main("linux-doc", "--root", str(source), "--dest", str(dest))
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("PASS", out)
+        self.assertEqual(sorted(path.name for path in dest.iterdir()), sorted(LINUX_DOC_FILES))
+        for name in LINUX_DOC_FILES:
+            self.assertEqual((dest / name).read_bytes(), self.doc[name])
+        (dest / "copyright").write_bytes(b"edited")
+        (dest / "Ghostty-MIT.txt").unlink()
+        code, _, err = self.run_main("linux-doc", "--root", str(source), "--dest", str(dest))
+        self.assertEqual(code, 1)
+        self.assertIn("refusing to overwrite", err)
+        self.assertEqual((dest / "copyright").read_bytes(), b"edited")
+        self.assertFalse((dest / "Ghostty-MIT.txt").exists())
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as raised:
+            release.main(["linux-doc", "--root", str(source)])
+        self.assertEqual(raised.exception.code, 2)
 
 
 class PublishTests(EnvironmentCase):
