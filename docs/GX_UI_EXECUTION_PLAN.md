@@ -14,7 +14,7 @@
 - 分工（同时不超过 10 个子智能体，每个文件只有一个写者，归属表见 `F3/r6-contract.md` 第 5 节）：root 负责调度、构建与 VM/WSL/桌面/性能的实际执行、接口裁决、集成提交、push 与 CI。
 - 实现工位：A1 Windows 埋点、P4 优化、采纳项接入与 Windows 缺陷修复；A2 `gx_perf.py`/`gx_slots.py` 新能力与远程性能链路；A3 迁移、会话、IPC、UIA、OLE、broker 夹具及相应修复；A4 GTK 侧 C1 集成、C2-G、C5、V7 与编辑器、管理器边界修复。
 - 辅助工位：O1 CI 修复、VM 相位、W/G 场景、C 变体分支与文档；O2 全部截图逐张读图，root 抽查不少于 10%；D1 142 叶映射、影响集、证据 JSON 与账本；R 在每个 src 提交前独立评审，P4 与 C1 另加 Astra 交叉审。
-- 当前模型分工（2026-10-18 用户更新，覆盖下文历史分工）：中等任务（原因明确的修复、返修、测试与夹具）使用 `worker`，显式指定 `gpt-6-astra` / `medium`；复杂任务继续用 `gx_complex`（Astra / `xhigh`）；所有原定 Opus 任务（简单实现、VM、文档、逐图审阅等）改用 `worker`，显式指定 `gpt-6.1-sol` / `max`，不再新派固定为 Opus 的 `gx_simple`；机械工作用 `gx_mechanical`（DeepSeek），独立评审用 `gx_ghostty_reviewer`。正在进行的任务完成当前工作，后续派发执行新分工。
+- 当前模型分工（2026-10-18 用户更新，覆盖下文历史分工）：中等任务（原因明确的修复、返修、测试与夹具）使用 `worker`，显式指定 `gpt-6-astra` / `medium`；复杂任务继续用 `gx_complex`（Astra / `xhigh`）；所有现有及后续原定 Opus 任务（简单实现、VM、文档、逐图审阅等）统一为 `gpt-6.1-sol` / `max`，`gx_simple` 的持久角色配置同步更改；当前会话仍显式指定模型，避免已加载的旧角色缓存继续使用 Opus。正在进行的 Opus 工位也必须交接替换，保留证据和自有运行进程状态；历史记录保留实际使用的模型。机械工作用 `gx_mechanical`（DeepSeek），独立评审用 `gx_ghostty_reviewer` 并显式选用 Sol max。
 - 波次一：W1 叶映射与 W2 工具、埋点、夹具并行；W2 还把外部 BellBorder 与两个 R2-Font 场景导入为 W21–W23（新 Windows 场景从 W24、GTK 从 G17 起连续编号），并建 `wip/C4-stack4m`、`wip/C6-nowarmup`、`wip/C7-blink-control` 三个只改一个变量的变体分支。
 - 波次二：r6 构建只做一次；W3 功能补验（宿主、VM、WSL，不需安静窗）；W4 在第一次安静窗做决策实验（C1 两批十对，C4–C7 各十对）。
 - 波次三：W5 工程改动与采纳项接入；r7 构建候选 rF，仍有修改最多再出 r8 一轮后冻结源码；W6 在 rF 上跑最终门，第二次安静窗跑 P00–P9、远程性能与 P4 终测。
