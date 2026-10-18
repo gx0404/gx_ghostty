@@ -1065,7 +1065,9 @@ const Level = struct {
         if (self.hot == item and self.hot_keyboard == by_keyboard) return;
         self.hot = item;
         self.hot_keyboard = by_keyboard;
-        self.popup.invalidate();
+        // Highlight/focus alone keeps item tokens stable. ensureVisible still
+        // invalidates when it actually scrolls the layout.
+        self.popup.repaint();
     }
 
     /// Highlight `item` from the keyboard and scroll it into view.
@@ -1268,6 +1270,69 @@ const Level = struct {
     }
 };
 
+test "UIA menu focus preserves Invoke unless revealing the row scrolls layout" {
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: @import("../../../gx/ui_ref.zig").Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Menu", .role = .menu },
+        .{ .id = 2, .parent = 0, .name = "Action", .role = .menu_item, .patterns = .{ .invoke = true } },
+    };
+    const Abi = extern struct {
+        query: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        retain: *const fn (*uia.Face) callconv(.winapi) u32,
+        release: *const fn (*uia.Face) callconv(.winapi) u32,
+        options: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    for ([_]bool{ false, true }) |scrolls| {
+        var popup: Popup = .{};
+        defer popup.destroy();
+        try popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+        const snapshot = popup.uia_view.publisher.current.?;
+        const face = &snapshot.nodes[1].faces[0];
+        const abi: *const Abi = @ptrCast(@alignCast(face.vtable));
+        _ = abi.retain(face);
+        defer _ = abi.release(face);
+        const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .invoke, .value = &.{}, .alloc = testing.allocator };
+        var items = [_]Item{.{ .id = 42, .label = "Action" }};
+        var list: List = .{ .items = .{ .items = &items, .capacity = items.len } };
+        var rows = [_]Row{.{ .top = if (scrolls) 40 else 0, .height = 20 }};
+        var state: State = undefined;
+        state.levels[0] = .{
+            .state = &state,
+            .index = 0,
+            .popup = &popup,
+            .list = &list,
+            .parent_item = null,
+            .rows = &rows,
+            .content_px = 100,
+            .arrow_px = if (scrolls) 4 else 0,
+            .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = if (scrolls) 24 else 100 },
+        };
+        state.levels[0].select(0); // The same method called by uiaAction(.focus).
+        var options: u32 = 0;
+        if (!scrolls) {
+            try testing.expectEqual(@as(i32, 0), abi.options(face, &options));
+            try testing.expect(popup.uia_view.publisher.accepts(action));
+            state.activate(0, 0); // Actual Invoke implementation, no OS dispatch.
+            try testing.expectEqual(@as(usize, 42), state.result.picked);
+        } else {
+            try testing.expect(state.levels[0].scroll_px > 0);
+            try testing.expect(!popup.uia_view.publisher.accepts(action));
+            try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
+        }
+        popup.hide();
+        try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.options(face, &options));
+    }
+}
+
 const State = struct {
     host: Host,
     owner: w32.HWND,
@@ -1424,7 +1489,7 @@ const State = struct {
     fn showCues(self: *State) void {
         if (self.cues) return;
         self.cues = true;
-        for (self.levels[0..self.depth]) |*level| level.popup.invalidate();
+        for (self.levels[0..self.depth]) |*level| level.popup.repaint();
     }
 
     fn openSubmenu(self: *State, level_index: usize, item: usize, keyboard: bool) void {
@@ -1798,7 +1863,7 @@ const State = struct {
                 level.setHot(item, false);
                 highlightPath(self.levels[0..self.depth], hit.level);
                 self.press = .{ .level = hit.level, .item = item };
-                level.popup.invalidate();
+                level.popup.repaint();
             },
             .separator, .header => {},
         }
@@ -1807,7 +1872,7 @@ const State = struct {
     fn mouseUp(self: *State, pt: w32.POINT) void {
         if (self.press) |p| {
             self.press = null;
-            if (p.level < self.depth) self.levels[p.level].popup.invalidate();
+            if (p.level < self.depth) self.levels[p.level].popup.repaint();
         }
         const hit = self.hitTest(pt) orelse return;
         const item = self.hitItem(hit) orelse return;
