@@ -16,7 +16,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Manifest,
     [Parameter(Mandatory=$true)]
     [ValidateSet('inspect','tokens','accounts','enable-uac','gl','broker-host','broker-peer','direct-target','drop-source','install','upgrade','seed-foreign-before','expect-install-refused','seed-foreign-after','uninstall','check-preserved','cleanup-foreign',
-                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')]
+                 'run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi','py-fixture')]
     [string]$Phase,
     [ValidatePattern('^[A-Za-z0-9_-]{1,48}$')][string]$RunId = 'validation-01',
     [ValidateSet('User','Machine')][string]$Scope = 'User',
@@ -69,7 +69,12 @@ param(
     # cross-account peer: also try to open each visible Ghostty pipe as a client (then close it).
     [switch]$ProbePipes,
     # dpi set: the custom scaling (LogPixels) for this user; effective after signing in again.
-    [ValidateSet('96','120','144','168','192')][string]$Dpi = '96'
+    [ValidateSet('96','120','144','168','192')][string]$Dpi = '96',
+    # py-fixture: a staged Python fixture (stage-validation --guest-python) and its argument line.
+    # Placeholders {run} {app} {app_sha256} {ole} {ole_sha256} expand to this run's values.
+    [ValidateSet('gx_drop_broker_fixture')][string]$PyFixture = 'gx_drop_broker_fixture',
+    [ValidateLength(0,2048)][string]$PyArgs = '',
+    [ValidateRange(10,1800)][int]$PyTimeoutSeconds = 300
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1426,7 +1431,7 @@ function Run-Inspect {
 # match the saved record; nothing else is closed or terminated. Multi-step
 # phases keep their records under <RunRoot>\records and are driven by -Action.
 
-$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi')
+$script:R6Phases = @('run-config','osc52','toast-matrix','jumplist-matrix','narrator','cross-account','dpi','py-fixture')
 $script:Restore = $null
 $script:InstalledAumid = 'gx0404.GhosttyGX'
 $script:NotificationSettingsKey = 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\' + $script:InstalledAumid
@@ -1661,6 +1666,28 @@ function Copy-PortableApp([string]$Destination) {
     $exe = Join-Path $Destination 'ghostty.exe'
     Assert-Hash $exe $AppSha256
     return @{ exe=$exe; files=$files.Count; aumid=(Get-PortableAumid $exe) }
+}
+
+$script:ExportAlias = @{}
+
+function Add-ExportFile([string]$Path, [string]$Alias) {
+    # Exported as <prefix><step>-<alias>; files that would share a name get a numbered suffix.
+    if (-not $script:ExportExtra.Contains($Path)) { $script:ExportExtra.Add($Path) }
+    if ($Alias) { $script:ExportAlias[$Path] = ($Alias -replace '[\\/:*?"<>|\s]+', '_') }
+}
+
+function Get-ExportNames {
+    # Existing extra files and their export names: the alias or the file name, made unique
+    # (case-insensitively, as on the share) with -2, -3, ... so no export overwrites another.
+    $used = @{}
+    foreach ($extra in $script:ExportExtra) {
+        if (-not (Test-Path -LiteralPath $extra -PathType Leaf)) { continue }
+        $leaf = if ($script:ExportAlias.ContainsKey($extra)) { $script:ExportAlias[$extra] } else { [IO.Path]::GetFileName($extra) }
+        $name = $leaf
+        for ($n = 2; $used.ContainsKey($name); $n++) { $name = [IO.Path]::GetFileNameWithoutExtension($leaf) + '-' + $n + [IO.Path]::GetExtension($leaf) }
+        $used[$name] = $true
+        [pscustomobject]@{ path=$extra; name=$name }
+    }
 }
 
 function Write-ExportMarker([string]$Suffix, $Value) {
@@ -3322,6 +3349,141 @@ function Invoke-CrossAccount {
     }
 }
 
+# ---- py-fixture: a staged Python fixture under a pinned embeddable Python --
+# The guest has no Python. stage-validation --guest-python stages the python.org embeddable
+# package pinned by SHA-256 in scripts/gx_windows_vm.py (GUEST_PYTHON), the fixture's .py files
+# and the OLE source, all listed with their SHA-256 in the manifest. This phase copies each out
+# of the share, checks it again, extracts the package once per (version, SHA-256) below
+# LOCALAPPDATA, points its ._pth at the fixture tree and runs the fixture with the caller's
+# token (no elevation): a Run box command for medium, Ctrl+Shift+Enter for high.
+
+function Get-PyFixtureSpec($Identity) {
+    if (-not $Identity.PSObject.Properties['python_fixture'] -or $null -eq $Identity.python_fixture) {
+        throw 'This stage carries no Python fixture; run stage-validation with --guest-python and --ole-source.'
+    }
+    return $Identity.python_fixture
+}
+
+function Install-GuestPython($Python, [string]$Share) {
+    $root = Join-Path $env:LOCALAPPDATA 'GXVMValidation\Python'
+    $dir = Join-Path $root ($Python.version + '-' + ([string]$Python.sha256).Substring(0, 12))
+    $marker = Join-Path $dir 'gx-python.json'
+    Assert-NoReparse $dir
+    if (Test-Path -LiteralPath $dir) {
+        if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or (Read-JsonFile $marker).sha256 -cne $Python.sha256) {
+            throw "A Python directory without this package's marker exists: $dir"
+        }
+        return [ordered]@{ dir=$dir; extracted=$false }
+    }
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $zip = Join-Path $root $Python.file
+    Copy-Item -LiteralPath (Join-Path $Share ('py\' + $Python.file)) -Destination $zip -Force
+    Assert-Hash $zip $Python.sha256
+    $partial = $dir + '.partial-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $partial)
+    Write-Json (Join-Path $partial 'gx-python.json') ([ordered]@{ file=$Python.file; sha256=$Python.sha256; version=$Python.version;
+        extracted_utc=[DateTime]::UtcNow.ToString('o') })
+    [IO.Directory]::Move($partial, $dir)
+    Remove-Item -LiteralPath $zip
+    return [ordered]@{ dir=$dir; extracted=$true }
+}
+
+function Install-PyFixtureTree($Spec, [string]$Share) {
+    $dir = Join-Path $env:LOCALAPPDATA ('GXVMValidation\PyFixture\' + ([string]$Spec.tree_sha256).Substring(0, 12))
+    Assert-NoReparse $dir
+    $files = @()
+    foreach ($entry in @(Get-MapEntries $Spec.files)) {
+        $relative = [string]$entry.Name
+        if ($relative -cnotmatch '^(test/windows|scripts)/[A-Za-z0-9_]+\.py$') { throw "Unexpected fixture file in the manifest: $relative" }
+        $target = Join-Path $dir $relative.Replace('/', '\')
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $Share ('py\' + $relative.Replace('/', '\'))) -Destination $target -Force
+        Assert-Hash $target ([string]$entry.Value)
+        $files += [ordered]@{ path=$relative; sha256=[string]$entry.Value }
+    }
+    $ole = $null
+    if ($Spec.PSObject.Properties['ole_source'] -and $Spec.ole_source) {
+        if ([string]$Spec.ole_source.file -cnotmatch '^[A-Za-z0-9_]+\.exe$') { throw 'Unexpected OLE source name in the manifest.' }
+        $ole = Join-Path $dir $Spec.ole_source.file
+        Copy-Item -LiteralPath (Join-Path $Share ('py\' + $Spec.ole_source.file)) -Destination $ole -Force
+        Assert-Hash $ole $Spec.ole_source.sha256
+    }
+    return [ordered]@{ dir=$dir; files=$files; ole_source=$ole }
+}
+
+function Expand-PyArgs([string]$Text, [hashtable]$Values) {
+    foreach ($match in [regex]::Matches($Text, '\{([A-Za-z0-9_]+)\}')) {
+        $key = $match.Groups[1].Value
+        if (-not $Values.ContainsKey($key) -or $null -eq $Values[$key]) { throw "Unknown or unavailable placeholder {$key} in -PyArgs." }
+    }
+    foreach ($key in @($Values.Keys)) { if ($null -ne $Values[$key]) { $Text = $Text.Replace('{' + $key + '}', [string]$Values[$key]) } }
+    return $Text
+}
+
+function Invoke-PyFixture($Identity) {
+    if (-not $ExportDir) { throw 'py-fixture runs through gx-run.cmd so the staged share is known.' }
+    $share = Split-Path -Parent $ExportDir
+    $spec = Get-PyFixtureSpec $Identity
+    $python = Install-GuestPython $spec.python $share
+    $tree = Install-PyFixtureTree $spec $share
+    $pth = @(Get-ChildItem -LiteralPath $python.dir -Filter 'python*._pth' -File)
+    if ($pth.Count -ne 1) { throw 'The embeddable package has no single python*._pth file.' }
+    # The embeddable package ignores PYTHONPATH and the script directory; its ._pth names the path.
+    $stem = [IO.Path]::GetFileNameWithoutExtension($pth[0].Name)
+    $pathLines = @(($stem + '.zip'), '.', (Join-Path $tree.dir 'test\windows'), (Join-Path $tree.dir 'scripts'))
+    [IO.File]::WriteAllText($pth[0].FullName, (($pathLines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($false))
+    $fixture = Join-Path $tree.dir ('test\windows\' + $PyFixture + '.py')
+    if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) { throw "The staged fixture has no $PyFixture.py." }
+    $app = Join-Path $script:AppDir 'ghostty.exe'
+    $values = @{ run=$script:RunRoot; app=$app; app_sha256=$null; ole=$tree.ole_source;
+        ole_sha256=$(if ($tree.ole_source) { ([string]$spec.ole_source.sha256).ToLowerInvariant() } else { $null }) }
+    if ($PyArgs -match '\{app(_sha256)?\}') { Assert-Hash $app $AppSha256; $values.app_sha256 = $AppSha256.ToLowerInvariant() }
+    $arguments = Expand-PyArgs $PyArgs $values
+    $commandLine = '-B -X utf8 "' + $fixture + '" ' + $arguments
+    $stdout = Join-Path $script:RunRoot ($script:Step + '-py.stdout.txt')
+    $stderr = Join-Path $script:RunRoot ($script:Step + '-py.stderr.txt')
+    $started = [DateTime]::UtcNow
+    $process = Start-Process -FilePath (Join-Path $python.dir 'python.exe') -ArgumentList $commandLine -WorkingDirectory $script:RunRoot `
+        -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $null = $process.Handle
+    $timedOut = $false
+    try {
+        if (-not $process.WaitForExit($PyTimeoutSeconds * 1000)) {
+            # Only the fixture interpreter this step started; apps it launched keep running.
+            $timedOut = $true
+            $process.Kill()
+            $null = $process.WaitForExit(5000)
+        }
+        $exitCode = if ($process.HasExited) { $process.ExitCode } else { $null }
+    } finally { $process.Dispose() }
+    $result = [ordered]@{ fixture=$PyFixture; python=[ordered]@{ version=$spec.python.version; sha256=$spec.python.sha256; dir=$python.dir; extracted=$python.extracted };
+        tree=$tree; command_line=$commandLine; exit_code=$exitCode; timed_out=$timedOut;
+        elapsed_seconds=[Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 1) }
+    $out = if (Test-Path -LiteralPath $stdout) { @(Read-TextLines $stdout) } else { @() }
+    $err = if (Test-Path -LiteralPath $stderr) { @(Read-TextLines $stderr) } else { @() }
+    Add-ExportFile $stdout 'py.stdout.txt'
+    Add-ExportFile $stderr 'py.stderr.txt'
+    $result.stdout_tail = @($out | Select-Object -Last 80)
+    $result.stderr_tail = @($err | Select-Object -Last 80)
+    # The fixture prints one JSON document last; keep it parsed when it is there.
+    $first = -1
+    for ($i = 0; $i -lt $out.Count; $i++) { if ($out[$i] -ceq '{') { $first = $i } }
+    if ($first -ge 0) { try { $result.fixture_output = (($out[$first..($out.Count - 1)]) -join "`n") | ConvertFrom-Json } catch { $result.fixture_output_error = $_.Exception.Message } }
+    # Files the fixture wrote during this step (case reports, captures, reviews), flattened by path.
+    $prefix = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
+    $written = @(Get-ChildItem -LiteralPath $script:RunRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -ge $started.AddSeconds(-2) -and $_.Length -le 8MB -and $_.FullName -ne $stdout -and $_.FullName -ne $stderr -and
+            -not $_.FullName.StartsWith($prefix + 'records\', [StringComparison]::OrdinalIgnoreCase) } | Sort-Object FullName | Select-Object -First 200)
+    $result.written = @($written | ForEach-Object {
+        $relative = $_.FullName.Substring($prefix.Length)
+        Add-ExportFile $_.FullName ('py-' + $relative)
+        [ordered]@{ path=$relative; size=$_.Length; sha256=(Get-Sha256 $_.FullName) } })
+    $result.fixture_verdict = if ($timedOut) { 'FAIL' } elseif ($exitCode -eq 0) { 'PASS' } elseif ($exitCode -eq 2) { 'PENDING' } else { 'FAIL' }
+    $result.fixture_reason = if ($timedOut) { "the fixture did not finish within $PyTimeoutSeconds s" } elseif ($exitCode -eq 0) { $null } elseif ($exitCode -eq 2) { 'the fixture reported PENDING (exit 2)' } else { "the fixture exited $exitCode" }
+    return $result
+}
+
 # ---- dpi: this user's custom scaling (applies at the next sign-in) --------
 
 $script:DesktopKey = 'Control Panel\Desktop'
@@ -3554,6 +3716,7 @@ try {
         'narrator' { $report.result = Invoke-Narrator }
         'cross-account' { $report.result = Invoke-CrossAccount }
         'dpi' { $report.result = Invoke-Dpi }
+        'py-fixture' { $report.result = Invoke-PyFixture $identity }
     }
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
@@ -3583,10 +3746,9 @@ try {
         try {
             Copy-Item -LiteralPath $reportPath -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + [IO.Path]::GetFileName($reportPath))) -Force
             Copy-Item -LiteralPath $statePath -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + 'state.json')) -Force
-            foreach ($extra in $script:ExportExtra) {
-                if (Test-Path -LiteralPath $extra -PathType Leaf) {
-                    Copy-Item -LiteralPath $extra -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-' + [IO.Path]::GetFileName($extra))) -Force
-                }
+            foreach ($entry in @(Get-ExportNames)) {
+                try { Copy-Item -LiteralPath $entry.path -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + $script:Step + '-' + $entry.name)) -Force }
+                catch { Write-Warning ('Export of ' + $entry.path + ' failed: ' + $_.Exception.Message) }
             }
         } catch { Write-Warning ('Export failed: ' + $_.Exception.Message) }
     }

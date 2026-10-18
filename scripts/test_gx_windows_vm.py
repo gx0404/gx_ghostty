@@ -1,6 +1,7 @@
 """Tests for gx_windows_vm.py. Every test is isolated from Docker, processes and kernel slots:
 IsolatedTestCase makes any unmocked subprocess call, docker CLI lookup or gx_slots acquisition fail
 the test, and fakes use a docker path that does not exist."""
+import ast
 import hashlib
 import io
 import json
@@ -12,6 +13,7 @@ import struct
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gx_windows_vm as vm
@@ -122,6 +124,69 @@ class WindowsVmTests(IsolatedTestCase):
         with self.assertRaisesRegex(ValueError, "nonzero"):
             vm.stage_validation(self.root, "win11", "00000000-0000-0000-0000-000000000000", "GX-WIN11")
         self.assertEqual((destination / "validation-manifest.json").read_bytes(), original)
+
+    def fake_python(self) -> tuple[Path, dict]:
+        """A small zip standing in for the pinned embeddable package (size/SHA patched in)."""
+        archive = self.root / "python-embed.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("python312._pth", "python312.zip\r\n.\r\n")
+            bundle.writestr("python.exe", b"MZ fake")
+        pinned = {"file": "python-3.12.10-embed-amd64.zip", "size": archive.stat().st_size,
+                  "sha256": vm.sha256_file(archive)}
+        return archive, pinned
+
+    def test_stage_validation_stages_the_pinned_python_broker_fixture(self):
+        vm.prepare(self.root)
+        machine = vm.machine_identity(self.root, "win11")
+        archive, pinned = self.fake_python()
+        ole = self.root / "gx_ole_source.exe"
+        ole.write_bytes(b"MZ ole source")
+        with mock.patch.dict(vm.GUEST_PYTHON, pinned):
+            destination = vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11", archive, ole)
+        data = json.loads((destination / "validation-manifest.json").read_text())
+        fixture = data["python_fixture"]
+        self.assertEqual(fixture["python"]["sha256"], pinned["sha256"])
+        self.assertEqual((destination / "py" / pinned["file"]).read_bytes(), archive.read_bytes())
+        self.assertEqual(sorted(fixture["files"]), sorted(vm.BROKER_FIXTURE))
+        for relative, digest in fixture["files"].items():
+            self.assertEqual(digest, vm.sha256_file(vm.ROOT / relative))
+            self.assertEqual(vm.sha256_file(destination / "py" / relative), digest)
+        tree = "\n".join(f"{name}={digest}" for name, digest in sorted(fixture["files"].items()))
+        self.assertEqual(fixture["tree_sha256"], hashlib.sha256(tree.encode()).hexdigest())
+        self.assertEqual(fixture["ole_source"]["sha256"], vm.sha256_file(ole))
+        self.assertEqual((destination / "py" / vm.OLE_SOURCE_NAME).read_bytes(), ole.read_bytes())
+        # Without the two inputs the stage carries no Python fixture (the guest phase refuses).
+        destination = vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11")
+        self.assertIsNone(json.loads((destination / "validation-manifest.json").read_text())["python_fixture"])
+
+    def test_stage_validation_refuses_an_unpinned_python_before_writing(self):
+        vm.prepare(self.root)
+        machine = vm.machine_identity(self.root, "win11")
+        archive, pinned = self.fake_python()
+        ole = self.root / "gx_ole_source.exe"
+        ole.write_bytes(b"MZ ole source")
+        with self.assertRaisesRegex(ValueError, "not the pinned"):
+            vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11", archive, ole)
+        self.assertFalse((self.root / "win11" / "exchange" / "validation").exists())
+        with self.assertRaisesRegex(ValueError, "together"):
+            vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11", archive, None)
+        with mock.patch.dict(vm.GUEST_PYTHON, pinned):
+            ole.write_bytes(b"not an executable")
+            with self.assertRaisesRegex(ValueError, "not a Windows executable"):
+                vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11", archive, ole)
+
+    def test_broker_fixture_stages_every_repository_module_it_imports(self):
+        local = {path.stem for folder in ("test/windows", "scripts") for path in (vm.ROOT / folder).glob("*.py")}
+        staged = {Path(relative).stem for relative in vm.BROKER_FIXTURE}
+        for relative in vm.BROKER_FIXTURE:
+            tree = ast.parse((vm.ROOT / relative).read_text(encoding="utf-8"))
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    imported.add(node.module.split(".")[0])
+            self.assertEqual(sorted((imported & local) - staged), [], relative)
 
     def test_media_rejects_corruption_and_truncation(self):
         path = self.root / "iso"
@@ -561,7 +626,9 @@ class ValidationScriptTests(unittest.TestCase):
             command = [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                        "-File", str(work / "harness.ps1"), "-Fixture", str(vm.VALIDATION_SCRIPT), "-Work", str(work),
                        "-Functions", ",".join(functions), "-Variables", ",".join(variables)]
-            result = subprocess.run(command, capture_output=True, timeout=timeout, cwd=work)
+            # A PSModulePath inherited from PowerShell 7 hides 5.1's own modules (Get-FileHash).
+            environment = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+            result = subprocess.run(command, capture_output=True, timeout=timeout, cwd=work, env=environment)
             output = result.stdout.decode("utf-8", "replace")
             self.assertEqual(result.returncode, 0, output + result.stderr.decode("utf-8", "replace"))
             return json.loads(output[output.index("{"):])
@@ -613,6 +680,68 @@ Write-Json (Join-Path $Work 'r.json') ([ordered]@{ a=1 })
         written = json.loads(out["text"])
         self.assertEqual(written["json_error"], "serializer unavailable")
         self.assertEqual(out["errors"], ["r.json: serializer unavailable"])
+
+    def test_export_names_never_overwrite_each_other(self):
+        body = r"""
+$script:ExportExtra = New-Object System.Collections.Generic.List[string]
+foreach ($name in 'a\ghostty.log', 'b\ghostty.log', 'c\ghostty.log', 'd\report.json') {
+    $path = Join-Path $Work $name
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path)) | Out-Null
+    [IO.File]::WriteAllText($path, 'x')
+}
+Add-ExportFile (Join-Path $Work 'a\ghostty.log') 'toast-a-ghostty.log'
+Add-ExportFile (Join-Path $Work 'b\ghostty.log') ''
+Add-ExportFile (Join-Path $Work 'c\ghostty.log') ''
+Add-ExportFile (Join-Path $Work 'd\report.json') 'py-broker/cases\BRK 04/report.json'
+Add-ExportFile (Join-Path $Work 'missing.txt') ''
+ConvertTo-GxJson ([ordered]@{ names=@(Get-ExportNames | ForEach-Object { $_.name }) }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Add-ExportFile", "Get-ExportNames"),
+                            ("LF", "JsonSource", "ExportAlias"))
+        self.assertEqual(out["names"], ["toast-a-ghostty.log", "ghostty.log", "ghostty-2.log",
+                                        "py-broker_cases_BRK_04_report.json"])
+
+    def test_py_fixture_tree_and_python_are_hash_checked_copies(self):
+        body = r"""
+$env:LOCALAPPDATA = Join-Path $Work 'localappdata'
+$share = Join-Path $Work 'share'
+[IO.Directory]::CreateDirectory((Join-Path $share 'py\test\windows')) | Out-Null
+[IO.Directory]::CreateDirectory((Join-Path $share 'py\scripts')) | Out-Null
+[IO.File]::WriteAllText((Join-Path $share 'py\test\windows\fx.py'), 'print(1)')
+[IO.File]::WriteAllText((Join-Path $share 'py\scripts\helper.py'), 'X = 1')
+[IO.File]::WriteAllBytes((Join-Path $share 'py\gx_ole_source.exe'), [byte[]](77, 90, 1))
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zipDir = Join-Path $Work 'zipsrc'
+[IO.Directory]::CreateDirectory($zipDir) | Out-Null
+[IO.File]::WriteAllText((Join-Path $zipDir 'python312._pth'), 'python312.zip')
+[IO.Compression.ZipFile]::CreateFromDirectory($zipDir, (Join-Path $share 'py\embed.zip'))
+$spec = [pscustomobject]@{
+    python=[pscustomobject]@{ version='3.12.10'; file='embed.zip'; sha256=(Get-Sha256 (Join-Path $share 'py\embed.zip')) }
+    files=[pscustomobject]@{ 'test/windows/fx.py'=(Get-Sha256 (Join-Path $share 'py\test\windows\fx.py')); 'scripts/helper.py'=(Get-Sha256 (Join-Path $share 'py\scripts\helper.py')) }
+    tree_sha256='0123456789abcdef0123'; ole_source=[pscustomobject]@{ file='gx_ole_source.exe'; sha256=(Get-Sha256 (Join-Path $share 'py\gx_ole_source.exe')) } }
+$first = Install-GuestPython $spec.python $share
+$again = Install-GuestPython $spec.python $share
+$tree = Install-PyFixtureTree $spec $share
+[IO.File]::WriteAllText((Join-Path $share 'py\scripts\helper.py'), 'X = 2')
+$tampered = try { $null = Install-PyFixtureTree $spec $share; 'accepted' } catch { $_.Exception.Message }
+$args1 = Expand-PyArgs 'setup --root {run}\b --exe {app} --sha256 {app_sha256}' @{ run='C:\r'; app='C:\a.exe'; app_sha256='ab' }
+$unknown = try { Expand-PyArgs '--x {nope}' @{ run='C:\r' } } catch { $_.Exception.Message }
+$unavailable = try { Expand-PyArgs '--x {ole}' @{ ole=$null } } catch { $_.Exception.Message }
+ConvertTo-GxJson ([ordered]@{ first=$first.extracted; again=$again.extracted; marker=(Test-Path (Join-Path $first.dir 'gx-python.json'));
+    pth=(Test-Path (Join-Path $first.dir 'python312._pth')); files=@($tree.files | ForEach-Object { $_.path });
+    ole=(Test-Path $tree.ole_source); tampered=$tampered; args1=$args1; unknown=$unknown; unavailable=$unavailable }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Write-Json", "ConvertTo-JsonText", "Get-SafeText", "Read-JsonFile",
+                                   "Get-Sha256", "Assert-Hash", "Assert-NoReparse", "Get-MapEntries", "Install-GuestPython",
+                                   "Install-PyFixtureTree", "Expand-PyArgs"),
+                            ("LF", "JsonSource", "JsonErrors"))
+        self.assertEqual((out["first"], out["again"], out["marker"], out["pth"]), (True, False, True, True))
+        self.assertEqual(sorted(out["files"]), ["scripts/helper.py", "test/windows/fx.py"])
+        self.assertTrue(out["ole"])
+        self.assertIn("Frozen file hash mismatch", out["tampered"])
+        self.assertEqual(out["args1"], "setup --root C:\\r\\b --exe C:\\a.exe --sha256 ab")
+        self.assertIn("{nope}", out["unknown"])
+        self.assertIn("{ole}", out["unavailable"])
 
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""

@@ -32,7 +32,9 @@ QEMU human monitor inside the container.
                      drag first require an absolute current mouse (a relative one turns the
                      coordinates into motion from wherever the guest cursor is), report the mode
                      before and after, and refuse points outside the VNC screen unsent
-  stage-validation   stage the guest fixture after checking the live VM identity
+  stage-validation   stage the guest fixture after checking the live VM identity; with --guest-python
+                     (the pinned python.org embeddable zip, downloaded explicitly) and --ole-source it
+                     also stages the broker Python fixture for the guest's py-fixture phase
   rehearsal-layout   ghostty.exe plus pinned ConPTY/Mesa from the offline package cache, marked
                      REHEARSAL_NOT_FINAL, for GL rehearsal before the frozen installer exists
 """
@@ -68,6 +70,21 @@ QCODE = re.compile(r"^[a-z0-9_]+(-[a-z0-9_]+)*$")
 UUID_TEXT = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 REHEARSAL_PAYLOAD = ("conpty.dll", "OpenConsole.exe", "mesa/opengl32.dll", "mesa/libgallium_wgl.dll", "mesa/dxil.dll")
+# The guest has no Python; the Python fixtures run on this python.org Windows embeddable package,
+# used inside the VM only. Its SHA-256 is the package checksum in the python.org SBOM
+# (python-3.12.10-embed-amd64.zip.spdx.json); the release page's MD5 is fe8ef205f2e9c3ba44d0cf9954e1abd3.
+# The host downloads it explicitly; stage-validation only checks and copies it.
+GUEST_PYTHON = {
+    "version": "3.12.10",
+    "file": "python-3.12.10-embed-amd64.zip",
+    "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+    "size": 11133606,
+    "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
+}
+# test/windows/gx_drop_broker_fixture.py and the repository modules it imports (py-fixture phase).
+BROKER_FIXTURE = ("test/windows/gx_drop_broker_fixture.py", "test/windows/gx_ole_fixture.py",
+                  "test/windows/gx_fixture_evidence.py", "scripts/gx_win_gui.py", "scripts/gx_slots.py")
+OLE_SOURCE_NAME = "gx_ole_source.exe"
 MEDIA = {
     "win11": {
         "file": "win11-25h2-en-us.iso",
@@ -710,8 +727,45 @@ def stop(root: Path, version: str, docker: Docker) -> dict:
     return container_state(docker, version)
 
 
-def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str) -> Path:
-    """Stage a guest-only fixture; never touch Docker, host accounts or registry."""
+def verify_guest_python(path: Path) -> str:
+    if Path(path).stat().st_size != GUEST_PYTHON["size"] or sha256_file(path) != GUEST_PYTHON["sha256"]:
+        raise ValueError(f"{path} is not the pinned {GUEST_PYTHON['file']} (size/SHA256 differ)")
+    return GUEST_PYTHON["sha256"]
+
+
+def stage_python_fixture(destination: Path, guest_python: Path, ole_source: Path) -> dict:
+    """Copy the pinned embeddable Python, the broker fixture files and the OLE source to py/."""
+    verify_guest_python(guest_python)
+    folder = destination / "py"
+    folder.mkdir(exist_ok=True)
+    shutil.copyfile(guest_python, folder / GUEST_PYTHON["file"])
+    verify_guest_python(folder / GUEST_PYTHON["file"])
+    files = {}
+    for relative in BROKER_FIXTURE:
+        data = (ROOT / relative).read_bytes()
+        target = folder / Path(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        files[relative] = hashlib.sha256(data).hexdigest()
+    ole = Path(ole_source).read_bytes()
+    if not ole.startswith(b"MZ"):
+        raise ValueError(f"{ole_source} is not a Windows executable")
+    (folder / OLE_SOURCE_NAME).write_bytes(ole)
+    tree = "\n".join(f"{name}={digest}" for name, digest in sorted(files.items()))
+    return {"python": {key: GUEST_PYTHON[key] for key in ("version", "file", "sha256", "url")},
+            "files": files, "tree_sha256": hashlib.sha256(tree.encode("utf-8")).hexdigest(),
+            "ole_source": {"file": OLE_SOURCE_NAME, "sha256": hashlib.sha256(ole).hexdigest(),
+                           "source_name": Path(ole_source).name}}
+
+
+def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str,
+                     guest_python: Path | None = None, ole_source: Path | None = None) -> Path:
+    """Stage a guest-only fixture; never touch Docker, host accounts or registry.
+
+    With guest_python (the pinned embeddable package) and ole_source, the broker fixture is staged
+    as well (py/ and the manifest's python_fixture) for the guest's py-fixture phase."""
+    if (guest_python is None) != (ole_source is None):
+        raise ValueError("--guest-python and --ole-source stage the broker fixture together")
     identity = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if identity.get("owner") != OWNER or identity.get("image") != IMAGE:
         raise ValueError("VM root does not belong to this pinned validation setup")
@@ -733,15 +787,19 @@ def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str)
         if saved.get("owner") != OWNER or saved.get("guest_uuid") != str(machine_uuid):
             raise ValueError("Existing validation fixture belongs to another owner or VM")
     setup = root / version / "oem" / "setup-guest.ps1"
+    if guest_python is not None:
+        verify_guest_python(guest_python)
     script_bytes = VALIDATION_SCRIPT.read_bytes()
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "out").mkdir(exist_ok=True)
     (destination / VALIDATION_SCRIPT.name).write_bytes(script_bytes)
+    python_fixture = stage_python_fixture(destination, guest_python, ole_source) if guest_python is not None else None
     write(previous, json.dumps({
         "schema": 1, "owner": OWNER, "image": IMAGE, "version": version,
         "guest_uuid": str(machine_uuid), "guest_name": guest_name,
         "fixture_sha256": hashlib.sha256(script_bytes).hexdigest(),
         "setup_sha256": sha256_file(setup),
+        "python_fixture": python_fixture,
         "identity_source": "machine.json UUID passed to QEMU -uuid and read back live through HMP info uuid.",
         "limits": "No passwords; no host registry/account writes; runtime guest identity guard is mandatory.",
     }, indent=2) + "\n")
@@ -790,6 +848,8 @@ GL 只签真实 native renderer/window 与正常关闭；VM 无 GPU 时随包 Me
 安装前冲突：干净用户状态下，分别以 Group=AppPath/Background/Directory/ShellIdentity 新 RunId 执行 seed-foreign-before，再 expect-install-refused（须退出码 7 且日志含对应具体原因），最后 check-preserved、cleanup-foreign。
 
 干净卸载必须同时删除 App Paths、两组右键菜单、AUMID 与 Toast CLSID 键。首次账户检查不证明后续登录/实际权限操作；静态测试不代旧版升级、真实 registry、Toast/JumpList、DND/冷暖激活或 GUI 验收。安装器/卸载器等待有界，超时保留 owned PID 信息，不强杀未知进程。
+
+Python 夹具（broker）：宿主以 stage-validation --guest-python <钉版 embeddable zip> --ole-source <gx_ole_source.exe> 暂存，py\\ 下是 SHA-256 列在清单 python_fixture 里的解释器包、夹具 .py 与 OLE source。客机里 -Phase py-fixture -PyArgs "<夹具参数>" 逐个复核哈希，在 LOCALAPPDATA 下解压一次解释器并把 ._pth 指向夹具树，以调用者自己的令牌运行（medium 用 Run 框回车，high 用 Ctrl+Shift+Enter；不提权）。-PyArgs 里 {run}、{app}、{app_sha256}、{ole}、{ole_sha256} 展开为本 run 的值；退出码 0/2/其他记 PASS/PENDING/FAIL，夹具本步写出的文件以 py-<相对路径> 导出。
 
 r6 相位 run-config、osc52、toast-matrix、jumplist-matrix、narrator、cross-account、dpi 用 -Action 分步执行（start/status/collect/stop 等，每个相位只接受自己的步骤），记录写在 Runs\\<RunId>\\records，每份报告带 before、after 与 restore。只关闭本夹具启动或明确收编的进程；剪贴板只在 osc52 里由终端内探针写入测试内容；改动的设置（通知、真实配置、讲述人、DPI、JumpList ACL）都先备份再恢复；跨账户密码只经宿主 type-secret 输入。
 """)
@@ -941,6 +1001,9 @@ def main() -> int:
     parser.add_argument("--app", type=Path, help="rehearsal-layout: old ghostty.exe")
     parser.add_argument("--share", type=Path, help="rehearsal-layout: prefix share/ directory")
     parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--guest-python", type=Path, help="stage-validation: the pinned " + GUEST_PYTHON["file"]
+                        + " (downloaded explicitly from " + GUEST_PYTHON["url"] + ")")
+    parser.add_argument("--ole-source", type=Path, help="stage-validation: gx_ole_source.exe for the broker fixture")
     args = parser.parse_args()
     root = args.root.resolve()
     try:
@@ -1029,7 +1092,7 @@ def main() -> int:
             if args.guest_uuid and str(uuid.UUID(args.guest_uuid)) != live:
                 raise VmError("--guest-uuid differs from the live QEMU UUID")
             name = args.guest_name or machine_identity(root, args.version)["host"]
-            destination = stage_validation(root, args.version, live, name)
+            destination = stage_validation(root, args.version, live, name, args.guest_python, args.ole_source)
             print(f"Staged guest-only validation fixture: {destination}")
     except (OSError, ValueError, VmError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"ERROR: {exc}\n")
