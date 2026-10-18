@@ -91,6 +91,11 @@ GUEST_PYTHON = {
 # The broker fixture; stage-validation adds every test/windows or scripts module it imports.
 BROKER_ENTRY = "test/windows/gx_drop_broker_fixture.py"
 FIXTURE_FOLDERS = ("test/windows", "scripts")
+# Path-based reads are invisible to the import AST. Keep them in the same
+# source/ref and hash tree as their consumer (source_manifest in newer refs).
+FIXTURE_RUNTIME_DEPENDENCIES = {
+    "test/windows/gx_fixture_evidence.py": ("scripts/gx_win_uia.py",),
+}
 OLE_SOURCE_NAME = "gx_ole_source.exe"
 MEDIA = {
     "win11": {
@@ -775,19 +780,20 @@ def git_reader(ref: str):
 
 
 def fixture_closure(read, entry: str = BROKER_ENTRY) -> dict[str, bytes]:
-    """The entry script and every test/windows or scripts module it imports, transitively."""
+    """Repository imports plus required path-based runtime dependencies, from one reader."""
     files: dict[str, bytes] = {}
-    pending = [entry]
+    pending = [(entry, True)]
     while pending:
-        relative = pending.pop()
+        relative, required = pending.pop()
         if relative in files:
             continue
         data = read(relative)
         if data is None:
-            if relative == entry:
-                raise ValueError(f"{entry} is missing from the fixture source")
+            if required:
+                raise ValueError(f"{relative} is missing from the fixture source")
             continue
         files[relative] = data
+        pending.extend((path, True) for path in FIXTURE_RUNTIME_DEPENDENCIES.get(relative, ()))
         for node in ast.walk(ast.parse(data.decode("utf-8"), relative)):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
@@ -795,7 +801,8 @@ def fixture_closure(read, entry: str = BROKER_ENTRY) -> dict[str, bytes]:
                 names = [node.module]
             else:
                 continue
-            pending.extend(f"{folder}/{name.split('.')[0]}.py" for name in names for folder in FIXTURE_FOLDERS)
+            pending.extend((f"{folder}/{name.split('.')[0]}.py", False)
+                           for name in names for folder in FIXTURE_FOLDERS)
     return dict(sorted(files.items()))
 
 

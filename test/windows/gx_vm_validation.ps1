@@ -951,7 +951,11 @@ function Compare-SplitTokens($Medium, $High) {
     if ($Medium.session_id -ne $High.session_id) { $failures.Add('different Windows session') }
     if ($Medium.integrity -ne 'medium' -or $Medium.elevated -or $Medium.elevation_type -ne 'Limited') { $failures.Add('medium side is not a limited, non-elevated medium token') }
     if ($High.integrity -ne 'high' -or -not $High.elevated -or $High.elevation_type -ne 'Full') { $failures.Add('high side is not a full, elevated high token') }
-    if ($null -eq $Medium.linked -or $null -eq $High.linked) { $failures.Add('a linked token is missing') }
+    # Native facts are Hashtables; persisted JSON facts are PSCustomObjects.
+    if (-not ([pscustomobject]$Medium).PSObject.Properties['linked'] -or -not ([pscustomobject]$High).PSObject.Properties['linked'] -or
+        $null -eq $Medium.linked -or $null -eq $High.linked) { $failures.Add('a linked token is missing (legacy/Default token or incomplete record)') }
+    elseif (-not ([pscustomobject]$Medium.linked).PSObject.Properties['logon_id'] -or -not ([pscustomobject]$High.linked).PSObject.Properties['logon_id'] -or
+        -not $Medium.linked.logon_id -or -not $High.linked.logon_id) { $failures.Add('a linked token logon_id is missing') }
     elseif ($Medium.linked.logon_id -ne $High.logon_id -or $High.linked.logon_id -ne $Medium.logon_id) { $failures.Add('linked logon sessions do not point at each other') }
     if ($Medium.logon_id -eq $High.logon_id) { $failures.Add('both sides share one logon session, not a UAC split pair') }
     return @{ paired=($failures.Count -eq 0); failures=@($failures); sid=$Medium.sid; session_id=$Medium.session_id;
@@ -1716,12 +1720,17 @@ function Restore-ToastSettings {
     # path that refreshed the platform). Then restore the exact backup and check the effective
     # setting again.
     $record = Read-Record 'toast-notification-settings'
-    if ($null -eq $record -or $record.restored) { return [ordered]@{ registry=(Restore-HkcuKey 'toast-notification-settings'); effective=$null; ok=$true } }
+    if ($null -eq $record) { return [ordered]@{ registry=(Restore-HkcuKey 'toast-notification-settings'); effective=$null; ok=$true } }
     $enabled = 1
     $before = $record.before
     if ($before.exists -and $before.values.PSObject.Properties['value:Enabled'] -and [long]$before.values.'value:Enabled'.data -eq 0) { $enabled = 0 }
     $want = if ($enabled -eq 1) { 'Enabled' } else { 'DisabledForApplication' }
     $effectiveBefore = Get-ToastSetting $script:InstalledAumid
+    # Every attempt mutates Enabled again. Invalidate the registry-only marker
+    # before that write so Restore-HkcuKey must restore and verify the exact backup.
+    Set-RecordField $record 'restored' $false
+    Set-RecordField $record 'effective_restored' $false
+    Save-Record 'toast-notification-settings' $record | Out-Null
     $base = Open-HkcuBase
     try {
         $key = $base.CreateSubKey($script:NotificationSettingsKey)
@@ -1736,6 +1745,10 @@ function Restore-ToastSettings {
     }
     $registry = Restore-HkcuKey 'toast-notification-settings'
     $after = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.restore
+    $record = Read-Record 'toast-notification-settings'
+    Set-RecordField $record 'effective_restored' ([bool]$after.reached)
+    Set-RecordField $record 'effective_after_restore' $after
+    Save-Record 'toast-notification-settings' $record | Out-Null
     return [ordered]@{ registry=$registry; effective=[ordered]@{ before=$effectiveBefore; want=$want; explicit_value=$enabled;
         after_explicit=$explicit; settings_switch=$switch; after_switch=$afterSwitch; after_restore=$after };
         ok=($registry.restored -and $after.reached) }
@@ -4007,7 +4020,9 @@ try {
     # r6 phases may report a fixture verdict without throwing, so their evidence stays intact.
     $verdict = $null
     if ($report.result -is [System.Collections.IDictionary] -and $report.result.Contains('fixture_verdict')) { $verdict = $report.result['fixture_verdict'] }
-    $report.status = if ($verdict -ceq 'FAIL') { 'FAIL' } elseif ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
+    $report.status = if ($null -ne $verdict -and $verdict -cne 'PASS') {
+        if ($verdict -cin @('FAIL','PENDING','OBSERVED','RUNNING')) { $verdict } else { 'PENDING' }
+    } elseif ($Rehearsal) { 'REHEARSAL_NOT_FINAL' } else { 'PASS_NATIVE_SCOPED' }
 } catch {
     $report.status = 'FAIL'
     $report.result = @{ reason=$_.Exception.Message; position=$_.InvocationInfo.PositionMessage }
@@ -4041,3 +4056,4 @@ try {
     [pscustomobject]@{ status=$report.status; evidence=$reportPath; export=$script:ExportRoot } | ConvertTo-Json -Compress
 }
 if ($report.status -eq 'FAIL') { exit 1 }
+if ($report.status -cne 'PASS_NATIVE_SCOPED') { exit 2 }

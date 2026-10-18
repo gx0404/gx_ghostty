@@ -4,6 +4,7 @@ the test, and fakes use a docker path that does not exist."""
 import ast
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -636,7 +637,62 @@ class WindowsVmTests(IsolatedTestCase):
 
 
 BROKER_CLOSURE = ("test/windows/gx_drop_broker_fixture.py", "test/windows/gx_ole_fixture.py",
-                  "test/windows/gx_fixture_evidence.py", "scripts/gx_win_gui.py", "scripts/gx_slots.py")
+                  "test/windows/gx_fixture_evidence.py", "scripts/gx_win_gui.py", "scripts/gx_slots.py",
+                  "scripts/gx_win_uia.py")
+
+
+class FixtureDependencyTests(unittest.TestCase):
+    """Real files and local Git only; never invoke the staged GUI fixtures."""
+
+    def test_real_ref_dependency_is_staged_hashed_and_required(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            repo = root / "repo"
+            repo.mkdir()
+            # Copy real sources, not an import-only mock closure.
+            for folder in vm.FIXTURE_FOLDERS:
+                for source in (vm.ROOT / folder).glob("gx_*.py"):
+                    target = repo / folder / source.name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+            def git(*args):
+                result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True)
+                return result.stdout.decode().strip()
+            git("init", "-q")
+            git("add", "scripts", "test")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+            commit = git("rev-parse", "HEAD")
+            dependency = "scripts/gx_win_uia.py"
+            frozen = subprocess.run(["git", "-C", str(repo), "show", f"{commit}:{dependency}"],
+                                    capture_output=True, check=True).stdout
+            (repo / dependency).write_text("raise RuntimeError('working tree must not be used')\n")
+            archive = root / "python.zip"
+            archive.write_bytes(b"pinned test archive")
+            ole = root / "ole.exe"
+            ole.write_bytes(b"MZ test")
+            destination = root / "stage"
+            destination.mkdir()
+            with mock.patch.object(vm, "ROOT", repo), mock.patch.dict(vm.GUEST_PYTHON, {
+                    "size": archive.stat().st_size, "sha256": vm.sha256_file(archive)}):
+                manifest = vm.stage_python_fixture(destination, archive, ole, commit)
+                self.assertIn(dependency, manifest["files"])
+                self.assertEqual((destination / "py" / dependency).read_bytes(), frozen)
+                self.assertEqual(manifest["files"][dependency], hashlib.sha256(frozen).hexdigest())
+                tree = "\n".join(f"{p}={h}" for p, h in sorted(manifest["files"].items()))
+                self.assertEqual(manifest["tree_sha256"], hashlib.sha256(tree.encode()).hexdigest())
+                evidence = destination / "py/test/windows/gx_fixture_evidence.py"
+                spec = importlib.util.spec_from_file_location("staged_evidence", evidence)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                # Newer fixture refs have the path-based source_manifest contract.
+                if hasattr(module, "source_manifest"):
+                    self.assertEqual(module.source_manifest()[dependency], manifest["files"][dependency])
+                git("rm", "-f", dependency)
+                git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "-c", "commit.gpgsign=false", "commit", "-qm", "missing dependency")
+                with self.assertRaisesRegex(ValueError, "gx_win_uia.py.*missing"):
+                    vm.stage_python_fixture(destination, archive, ole, "HEAD")
 
 
 def windows_powershell() -> str | None:
@@ -666,7 +722,9 @@ $names = @($Variables.Split(',') | Where-Object { $_ } | ForEach-Object { '$scri
 foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $false)) {
     if ($names -contains $node.Left.Extent.Text) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
+$global:LASTEXITCODE = 0
 . (Join-Path $Work 'body.ps1')
+exit $LASTEXITCODE
 """
 
 
@@ -675,7 +733,7 @@ class ValidationScriptTests(unittest.TestCase):
     """Runs pieces of the guest fixture under the guest's interpreter (Windows PowerShell 5.1)."""
 
     def run_body(self, body: str, functions: tuple[str, ...], variables: tuple[str, ...] = ("LF",),
-                 timeout: float = 120) -> dict:
+                 timeout: float = 120, expected_exit: int = 0) -> dict:
         with tempfile.TemporaryDirectory() as name:
             work = Path(name)
             (work / "harness.ps1").write_text(PS_HARNESS, encoding="utf-8-sig")
@@ -687,7 +745,7 @@ class ValidationScriptTests(unittest.TestCase):
             environment = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
             result = subprocess.run(command, capture_output=True, timeout=timeout, cwd=work, env=environment)
             output = result.stdout.decode("utf-8", "replace")
-            self.assertEqual(result.returncode, 0, output + result.stderr.decode("utf-8", "replace"))
+            self.assertEqual(result.returncode, expected_exit, output + result.stderr.decode("utf-8", "replace"))
             return json.loads(output[output.index("{"):])
 
     def test_fixture_is_ascii_and_parses_without_errors(self):
@@ -695,6 +753,134 @@ class ValidationScriptTests(unittest.TestCase):
         # Windows PowerShell 5.1 reads a BOM-less script as ANSI: non-ASCII text must be built from [char].
         self.assertEqual([index for index, byte in enumerate(data) if byte > 127], [])
         self.assertEqual(self.run_body("[ordered]@{ ok=$true } | ConvertTo-Json -Compress", ()), {"ok": True})
+
+    def test_split_tokens_accept_pair_and_reject_legacy_and_mixed_records(self):
+        body = r"""
+$medium = [pscustomobject]@{ sid='s'; session_id=1; integrity='medium'; elevated=$false; elevation_type='Limited'; logon_id='m'; linked=[pscustomobject]@{ logon_id='h' } }
+$high = [pscustomobject]@{ sid='s'; session_id=1; integrity='high'; elevated=$true; elevation_type='Full'; logon_id='h'; linked=[pscustomobject]@{ logon_id='m' } }
+$old = [pscustomobject]@{ sid='s'; session_id=1; integrity='high'; elevated=$true; elevation_type='Default'; logon_id='old' }
+$nullLink = $medium | ConvertTo-Json | ConvertFrom-Json
+$nullLink.linked = $null
+$brokenLink = $medium | ConvertTo-Json | ConvertFrom-Json
+$brokenLink.linked = [pscustomobject]@{}
+$nativeMedium = @{}; foreach ($p in $medium.PSObject.Properties) { $nativeMedium[$p.Name] = $p.Value }
+$nativeHigh = @{}; foreach ($p in $high.PSObject.Properties) { $nativeHigh[$p.Name] = $p.Value }
+$nativeMedium.linked = @{ logon_id='h' }; $nativeHigh.linked = @{ logon_id='m' }
+@{ good=(Compare-SplitTokens $medium $high); old=(Compare-SplitTokens $old $old);
+   native=(Compare-SplitTokens $nativeMedium $nativeHigh); mixedRepresentation=(Compare-SplitTokens $nativeMedium $high);
+   mixedHigh=(Compare-SplitTokens $medium $old); mixedMedium=(Compare-SplitTokens $old $high);
+   nullLink=(Compare-SplitTokens $nullLink $high); brokenLink=(Compare-SplitTokens $brokenLink $high) } | ConvertTo-Json -Depth 10 -Compress
+"""
+        out = self.run_body(body, ("Compare-SplitTokens",))
+        self.assertTrue(out["good"]["paired"])
+        self.assertTrue(out["native"]["paired"])
+        self.assertTrue(out["mixedRepresentation"]["paired"])
+        for name in ("old", "mixedHigh", "mixedMedium", "nullLink", "brokenLink"):
+            self.assertFalse(out[name]["paired"], name)
+            self.assertTrue(any("linked" in reason for reason in out[name]["failures"]), name)
+
+    def test_report_dispatch_persists_verdict_and_returns_nonzero_for_incomplete(self):
+        # Execute the actual main try/catch/finally and exit tail after replacing only
+        # external phase inputs. No VM identity bypass is added to production code.
+        body = r"""
+$Phase = '__PHASE__'
+$Rehearsal = __REHEARSAL__
+$DelaySeconds = 0
+$PyArgs = ''
+$PyTimeoutSeconds = 1
+$script:R6Phases = @('py-fixture')
+$script:RunRoot = $Work
+$script:Step = 'report'
+$script:State = @{}
+$script:Restore = @{}
+$script:ExportRoot = $null
+$statePath = Join-Path $Work 'state.json'
+$identity = @{}
+$RunId = 'test'
+$report = [ordered]@{ status='PENDING'; result=$null }
+function Get-PhaseState($When) { @{ when=$When } }
+function Assert-Action { 'run' }
+function Initialize-PyFixture { @{ summary=@{}; values=@{}; runs=0; python=@{ dir=$Work }; fixture='unused.py' } }
+function Export-PyFixtureFiles { @() }
+function Add-ExportFile { }
+function Start-Process {
+    $p = [pscustomobject]@{ Handle=1; HasExited=$true; ExitCode=__CODE__ }
+    $p | Add-Member ScriptMethod WaitForExit { param($ms) $true }
+    $p | Add-Member ScriptMethod Dispose { }
+    $p
+}
+$script:Keys = [ordered]@{ AppPath='a'; ShellAumid='b' }
+function Assert-OwnedBaseline($Snapshot, $Name) { if (-not $Snapshot[$Name].exists) { throw "missing $Name" } }
+function Run-Inspect {
+    New-InstallResult @{ exit_code=0 } @{ AppPath=@{ exists=$true }; ShellAumid=@{ exists=$false } } 'AB' $true
+}
+__OVERRIDE__
+# Keep real serialization; verify the on-disk report before the real exit tail runs.
+$main = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Body.Extent.Text.Contains('switch ($Phase)') })
+if ($main.Count -ne 1) { throw 'main dispatch not found' }
+$tail = $ast.Extent.Text.Substring($main[0].Extent.StartOffset)
+$tail = $tail.Insert($main[0].Extent.EndOffset - $main[0].Extent.StartOffset, @'
+
+$saved = Get-Content -Raw -LiteralPath (Join-Path $Work 'report.json') | ConvertFrom-Json
+if ($saved.status -cne '__STATUS__') { throw ('persisted status: ' + $saved.status) }
+if ($saved.result.fixture_verdict -cne '__VERDICT__') { throw 'lost inner verdict' }
+
+'@)
+. ([scriptblock]::Create($tail))
+"""
+        cases = [("py-fixture", 2, "PENDING", "PENDING", 2, False, ""),
+                 ("inspect", 0, "OBSERVED", "OBSERVED", 2, False, ""),
+                 ("py-fixture", 1, "FAIL", "FAIL", 1, False, ""),
+                 ("py-fixture", 0, "PASS", "PASS_NATIVE_SCOPED", 0, False, ""),
+                 ("py-fixture", 2, "PENDING", "PENDING", 2, True, ""),
+                 ("py-fixture", 0, "PASS", "REHEARSAL_NOT_FINAL", 2, True, ""),
+                 ("inspect", 0, "RUNNING", "RUNNING", 2, False,
+                  "function Run-Inspect { @{ fixture_verdict='RUNNING' } }")]
+        for phase, code, verdict, status, exit_code, rehearsal, override in cases:
+            with self.subTest(status=status, rehearsal=rehearsal):
+                script = body.replace('__PHASE__', phase).replace('__CODE__', str(code))
+                script = script.replace('__STATUS__', status).replace('__VERDICT__', verdict)
+                script = script.replace('__REHEARSAL__', '$true' if rehearsal else '$false').replace('__OVERRIDE__', override)
+                out = self.run_body(script, ("Invoke-PyFixture", "Invoke-PyFixtureProcess", "Expand-PyArgs",
+                    "New-InstallResult", "Write-Json", "ConvertTo-GxJson", "ConvertTo-JsonText", "Get-SafeText"),
+                    ("LF", "JsonSource", "JsonErrors"), expected_exit=exit_code)
+                self.assertEqual(out["status"], status)
+
+    def test_toast_restore_retries_verify_registry_and_effective_state(self):
+        body = self.TOAST_FAKES + r"""
+$script:ToastSettleSeconds = @{ explicit=0; restore=0 }
+$script:Record = [pscustomobject]@{ key='fake'; restored=$false; before=[pscustomobject]@{ exists=$true; values=[pscustomobject]@{} } }
+$script:ExactRestores = 0
+$script:Checks = 0
+$script:Setting = 'DisabledForApplication'
+function Read-Record { $script:Record }
+function Save-Record($Name, $Value) { $script:Record = $Value }
+function Set-RecordField($Record, $Name, $Value) { $Record | Add-Member NoteProperty $Name $Value -Force }
+function Restore-AnyKeyTree { $script:ExactRestores++ }
+function Read-AnyKeyTree { $script:Record.before }
+function Json-Normal($Value) { $Value | ConvertTo-Json -Depth 10 -Compress }
+function Get-ToastSetting { $script:Checks++; $script:Setting }
+# Use the real registry restore bookkeeping with fake in-memory registry I/O.
+$node = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Restore-HkcuKey' }, $true)
+. ([scriptblock]::Create($node.Extent.Text))
+$first = Restore-ToastSettings
+$checks1 = $script:Checks
+$second = Restore-ToastSettings
+$checks2 = $script:Checks
+$script:Setting = 'Enabled'
+$third = Restore-ToastSettings
+$checks3 = $script:Checks
+$fourth = Restore-ToastSettings
+ConvertTo-GxJson @{ results=@($first,$second,$third,$fourth); checks=@($checks1,$checks2,$checks3,$script:Checks);
+    exact_restores=$script:ExactRestores; record=$script:Record } -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Wait-ToastSetting", "Restore-ToastSettings"), ("LF", "JsonSource"))
+        self.assertEqual([x["ok"] for x in out["results"]], [False, False, True, True])
+        self.assertTrue(all(x["registry"]["restored"] for x in out["results"]))
+        self.assertEqual(out["exact_restores"], 4)
+        self.assertTrue(all(b > a for a, b in zip([0] + out["checks"], out["checks"])))
+        self.assertTrue(out["record"]["effective_restored"])
 
     def test_report_json_is_bounded_plain_utf8_and_records_conversions(self):
         body = r"""
@@ -804,6 +990,8 @@ ConvertTo-GxJson ([ordered]@{ first=$first.extracted; again=$again.extracted; ma
 $script:Log = New-Object System.Collections.ArrayList
 function Start-Sleep { param($Milliseconds, $Seconds) }
 function Restore-HkcuKey($Name) { [void]$script:Log.Add('restore ' + $Name); [ordered]@{ restored=$true } }
+function Set-RecordField($Record, $Name, $Value) { $Record | Add-Member NoteProperty $Name $Value -Force }
+function Save-Record($Name, $Record) { }
 $fakeKey = New-Object psobject
 $fakeKey | Add-Member ScriptMethod SetValue { param($n, $v, $k) [void]$script:Log.Add('set ' + $n + '=' + $v) }
 $fakeKey | Add-Member ScriptMethod Dispose { }
@@ -971,7 +1159,6 @@ ConvertTo-GxJson ([ordered]@{ verdict=$result.fixture_verdict; reason=$result.fi
         self.assertIn("--popup-hwnd 0x20b --decision cancel --stage protected-paste", calls[3])
         self.assertNotIn("--x", calls[3])
 
-    @unittest.skipUnless(Path(sys.executable).name.lower() == "python.exe", "needs a python.exe interpreter")
     def test_fixture_process_output_of_one_line_or_a_json_document_is_kept(self):
         body = r"""
 $script:RunRoot = $Work
@@ -985,7 +1172,7 @@ $one = Invoke-PyFixtureProcess $context '' 'run'
 $context.fixture = Join-Path $Work 'doc.py'
 $doc = Invoke-PyFixtureProcess $context '' 'run'
 ConvertTo-GxJson ([ordered]@{ one=$one; doc=$doc; names=@(Get-ExportNames | ForEach-Object { $_.name }) }) -Compress
-""".replace("__PYDIR__", str(Path(sys.executable).parent))
+""".replace("__PYDIR__", str(Path(sys._base_executable).parent))
         out = self.run_body(body, ("ConvertTo-GxJson", "Read-TextLines", "Add-ExportFile", "Get-ExportNames", "Invoke-PyFixtureProcess"),
                             ("LF", "JsonSource", "ExportAlias"))
         self.assertEqual((out["one"]["stdout_tail"], out["one"]["verdict"]), (["only line"], "PASS"))
