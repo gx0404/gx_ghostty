@@ -224,8 +224,8 @@ class QuietTests(unittest.TestCase):
         command.assert_called_once_with(['docker', 'ps', '-q'])
 
     def test_each_gate_and_probe_error_fail_closed(self):
+        # A blacklisted program is recorded, not a gate (r6 13:20 user ruling): see the blacklist tests.
         for method, value in [('windows', windows_data({'pid': 1, 'name': 'ZiG.ExE'})),
-                              ('windows', windows_data({'pid': 1, 'name': 'app', 'title': 'Kimi Code'})),
                               ('wsl', {'processes': [{'pid': 2, 'name': 'cc1plus'}]}),
                               ('vm', {'win11': {'running': True}}), ('slots', False), ('input_ticks', ticks(599.9))]:
             operation = getattr(self.probe, method)
@@ -284,7 +284,7 @@ class QuietTests(unittest.TestCase):
         self.assertFalse(result['plan_compliant'])
         self.assertFalse(result['thresholds_plan_compliant'])
         self.assertNotIn('private', json.dumps(result))
-        self.assertEqual(['ToDesk'], result['checks']['blacklist']['raw'][0]['matches'])
+        self.assertEqual(['ToDesk'], result['blacklist_observation']['matches'][0]['matches'])
         self.assertEqual('running in the active console session', result['checks']['session']['reason'])
         self.probe.session.return_value = {'interactive_console': False}
         result = gx_perf.quiet_snapshot(self.args, self.probe)
@@ -298,27 +298,90 @@ class QuietTests(unittest.TestCase):
                 {'pid': 5, 'name': 'player', 'title': '哔哩哔哩 (゜-゜)つロ'}, {'pid': 6, 'name': 'todesk.exe', 'title': ''},
                 {'pid': 7, 'name': 'TODESK.EXE', 'title': ''}, {'pid': 8, 'name': 'WindowsTerminal', 'title': 'Kimi code'},
                 {'pid': 9, 'name': 'DEVIN.EXE', 'title': ''}]
+        expected = {2: ['Kimi Code', 'ToDesk'], 3: ['Devin'], 4: ['Kimi Code'], 5: ['哔哩哔哩'], 6: ['ToDesk'],
+                    7: ['ToDesk'], 8: ['Kimi Code'], 9: ['Devin']}
         self.probe.windows.return_value = windows_data(*rows)
         result = gx_perf.quiet_snapshot(self.args, self.probe)
-        self.assertEqual(3, result['exit'])
-        self.assertEqual({2: ['Kimi Code', 'ToDesk'], 3: ['Devin'], 4: ['Kimi Code'], 5: ['哔哩哔哩'], 6: ['ToDesk'],
-                          7: ['ToDesk'], 8: ['Kimi Code'], 9: ['Devin']},
-                         {row['pid']: row['matches'] for row in result['checks']['blacklist']['raw']})
+        self.assertEqual(expected, {row['pid']: row['matches'] for row in result['blacklist_observation']['matches']})
         self.assertIn('case-insensitive', result['blacklist_matching'])
+        self.assertEqual(result['blacklist_matching'], result['blacklist_observation']['matching'])
         self.assertEqual('recorded', result['other_programs']['status'])
         self.assertEqual([1], [row['pid'] for row in result['other_programs']['matches']])
         self.assertNotIn('つロ', gx_perf.json.dumps(result, ensure_ascii=False))
+        # With --strict-blacklist each spelling is a gate again; kimi-cu alone never is.
+        self.args.strict_blacklist = True
+        self.assertEqual(expected, {row['pid']: row['matches'] for row in
+                                    gx_perf.quiet_snapshot(self.args, self.probe)['checks']['blacklist']['raw']})
         for variant in rows[1], rows[5], rows[6], rows[7]:
             with self.subTest(name=variant['name'], title=variant['title']):
                 self.probe.windows.return_value = windows_data(rows[0], variant)
                 self.assertEqual('fail', gx_perf.quiet_snapshot(self.args, self.probe)['checks']['blacklist']['status'])
-        # kimi-cu alone stays quiet: it is an observed program, never a gate.
         self.probe.windows.return_value = windows_data(rows[0])
         result = gx_perf.quiet_snapshot(self.args, self.probe)
         self.assertEqual(0, result['exit'])
         self.assertEqual([1], [row['pid'] for row in result['other_programs']['matches']])
         self.args.blacklist = ['KIMI-CU']  # additions fold too
         self.assertEqual(3, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+        self.args.strict_blacklist = False
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((0, [1]), (result['exit'], [row['pid'] for row in result['blacklist_observation']['matches']]))
+
+    def test_blacklisted_programs_are_recorded_not_gated_since_the_1320_ruling(self):
+        # r6-contract.md §6 13:20 (user ruling): other software is recorded like CPU; quiet, exit and
+        # plan_compliant ignore it. --strict-blacklist restores the gate of the earlier criteria.
+        self.probe.windows.return_value = windows_data({'pid': 10, 'name': 'ghostty', 'title': 'test'},
+                                                       {'pid': 77, 'name': 'Kimi Code.exe', 'title': 'private chat title'})
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((0, True, True), (result['exit'], result['quiet'], result['plan_compliant']))
+        self.assertEqual(('r6-13:20 user ruling', {'strict_blacklist': False, 'input_observe_only': False}),
+                         (result['criteria'], result['criteria_options']))
+        self.assertNotIn('blacklist', result['checks'])
+        self.assertEqual(['input', 'session', 'slots', 'vm', 'windows', 'wsl'], sorted(result['gates']))
+        self.assertIn('blacklist', result['observed_only'])
+        observation = result['blacklist_observation']
+        self.assertEqual(('recorded', [{'pid': 77, 'name': 'Kimi Code.exe', 'matches': ['Kimi Code']}]),
+                         (observation['status'], observation['matches']))
+        self.assertIn('never a quiet gate', observation['scope'])
+        self.assertIn('casefold', observation['matching'])
+        self.assertNotIn('private chat title', json.dumps(result, ensure_ascii=False))
+        self.args.strict_blacklist = True
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((3, False, False), (result['exit'], result['quiet'], result['plan_compliant']))
+        self.assertEqual(('fail', [77]), (result['checks']['blacklist']['status'],
+                                          [row['pid'] for row in result['checks']['blacklist']['raw']]))
+        self.assertTrue(result['criteria_options']['strict_blacklist'])
+        self.assertEqual(['blacklist', 'input', 'session', 'slots', 'vm', 'windows', 'wsl'], sorted(result['gates']))
+        self.assertNotIn('blacklist', result['observed_only'])
+        # An unavailable Windows inventory is a tool error only for the strict gate (the windows check errs anyway).
+        self.probe.windows.side_effect = OSError('CIM unavailable')
+        self.assertEqual('error', gx_perf.quiet_snapshot(self.args, self.probe)['checks']['blacklist']['status'])
+        self.args.strict_blacklist = False
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual(('unavailable', 'Windows inventory unavailable'),
+                         (result['blacklist_observation']['status'], result['blacklist_observation']['reason']))
+        self.assertNotIn('blacklist', result['checks'])
+        # Both switches reach the parser of `quiet`.
+        args = gx_perf.build_parser().parse_args(['quiet', '--out', 'x', '--strict-blacklist', '--input-observe-only'])
+        self.assertEqual((True, True), (args.strict_blacklist, args.input_observe_only))
+
+    def test_input_observe_only_records_the_idle_time_without_gating(self):
+        self.args.input_observe_only = True
+        self.probe.input_ticks.return_value = ticks(5)
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((0, True, True, True), (result['exit'], result['quiet'], result['plan_compliant'],
+                                                 result['thresholds_plan_compliant']))
+        row = result['checks']['input']
+        self.assertEqual(('observed', 'fail', 5.0), (row['status'], row['observed'], row['raw']['idle_seconds']))
+        self.assertEqual('observe only (--input-observe-only, a WSL/Xvfb batch): idle 5.000s; required 600s', row['reason'])
+        self.assertNotIn('input', result['gates'])
+        self.assertIn('input', result['observed_only'])
+        # This project's own load still gates, and a failing input probe is still a tool error.
+        self.probe.wsl.return_value = {'running': True, 'processes': [{'pid': 2, 'name': 'zig'}]}
+        self.assertEqual(3, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+        self.probe.wsl.return_value = {'running': False, 'processes': []}
+        self.probe.input_ticks.side_effect = OSError('GetLastInputInfo failed')
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((2, 'error'), (result['exit'], result['checks']['input']['status']))
 
     def test_ancestor_exemption_covers_runner_command_lines_only(self):
         me = gx_perf.os.getpid()
@@ -333,11 +396,16 @@ class QuietTests(unittest.TestCase):
         self.assertEqual({900: 'inventory', me: 'self', 50: 'ancestor', 60: 'ancestor'},
                          {row['pid']: row['reason'] for row in windows['raw']['runner_exclusions']})
         self.assertTrue(next(row for row in windows['raw']['runner_exclusions'] if row['pid'] == 50)['runner_match_suppressed'])
-        # The exemption hides only the runner command lines: an ancestor's build name and blacklist name still count.
+        # The exemption hides only the runner command lines: an ancestor's build name still gates and its
+        # blacklist name is still recorded (a gate with --strict-blacklist).
         self.assertEqual('fail', windows['status'])
         self.assertIn('[60]', windows['reason'])
-        self.assertEqual('fail', result['checks']['blacklist']['status'])
-        self.assertEqual([50], [row['pid'] for row in result['checks']['blacklist']['raw']])
+        self.assertNotIn('blacklist', result['checks'])
+        self.assertEqual([50], [row['pid'] for row in result['blacklist_observation']['matches']])
+        self.args.strict_blacklist = True
+        strict = gx_perf.quiet_snapshot(self.args, self.probe)['checks']['blacklist']
+        self.assertEqual(('fail', [50]), (strict['status'], [row['pid'] for row in strict['raw']]))
+        self.args.strict_blacklist = False
         self.assertEqual('root', windows['raw']['ancestor_chain_end'])
         self.assertNotIn('run_unittests', gx_perf.json.dumps(result))
 
@@ -770,6 +838,75 @@ class QuietBatchTests(unittest.TestCase):
                 self.assertIn('never rerun to replace it', result['guidance'])
         self.assertIn('instance_self_activated', gx_perf.PRODUCT_CAUSES)
         self.assertNotIn('instance_self_activated', gx_perf.ENVIRONMENT_CAUSES)
+
+    WSL_BATCH = ('wsl.exe', '-d', 'Ubuntu-24.04', '--', 'python3', 'scripts/gx_wsl.py', 'smoke')
+
+    def test_input_observe_only_batch_records_foreign_input_and_stays_valid(self):
+        # r6 13:20 item (4): a batch that runs only in WSL/Xvfb records user input, never gates on it.
+        args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)
+        # The user is at the computer: 5 s idle at the start, input 99 s into the 100 s batch.
+        self.probe.input_ticks.side_effect = [ticks(5), ticks(1, 50_100_000)]
+        exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((0, 'VALID', 'VALID', [], True, True),
+                         (exit_code, result['status'], result['quiet_status'], result['failed_checks'], result['plan_compliant'],
+                          result['thresholds_plan_compliant']))
+        self.assertEqual(('r6-13:20 user ruling', {'strict_blacklist': False, 'input_observe_only': True}, True),
+                         (result['criteria'], result['criteria_options'], result['input_observe_only']))
+        before = json.loads((args.out / 'before.json').read_text(encoding='utf-8'))['checks']['input']
+        after = json.loads((args.out / 'after.json').read_text(encoding='utf-8'))['checks']['input']
+        self.assertEqual(('observed', 'fail', 5.0), (before['status'], before['observed'], before['raw']['idle_seconds']))
+        self.assertEqual(('observed', 'fail', 1.0, 100.0, 'foreign_input'),
+                         (after['status'], after['observed'], after['raw']['idle_seconds'], after['raw']['batch_seconds'],
+                          after['raw']['cause']))
+        self.assertTrue(after['reason'].startswith('observe only (--input-observe-only, a WSL/Xvfb batch): idle 1.000s'))
+        self.assertIn('criteria: r6-13:20 user ruling strict_blacklist=false input_observe_only=true',
+                      (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
+        # The same batch without the switch is INVALID: the default stays the desktop rule.
+        args = self.batch_args(command=self.WSL_BATCH)
+        args.out = self.args.out.parent / 'gated'
+        self.probe.input_ticks.side_effect = [ticks(600), ticks(1, 50_100_000)]
+        exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((3, 'INVALID', 'foreign_input'), (exit_code, result['status'], result['failure_cause']))
+        # This project's own load still gates an observe-only batch: a validation VM started meanwhile.
+        args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)
+        args.out = self.args.out.parent / 'vm'
+        self.probe.input_ticks.side_effect = [ticks(5), ticks(1, 50_100_000)]
+        self.probe.vm.side_effect = [{'win11': {'exists': True, 'owned': True, 'running': False}},
+                                     {'win11': {'exists': True, 'owned': True, 'running': True}}]
+        exit_code, result = self.run_batch(args, self.command(0))
+        self.assertEqual((3, 'INVALID', 'quiet_criteria', ['vm']),
+                         (exit_code, result['status'], result['failure_cause'], result['failed_checks']))
+
+    def test_input_observe_only_excludes_injected_input_and_the_windows_desktop(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(2, gx_perf.main(['quiet-batch', '--out', str(self.args.out.parent / 'both'), '--injected-input',
+                                              '--input-observe-only', '--', 'cmd']))
+        self.assertIn('not allowed with argument', stderr.getvalue())
+        self.assertFalse((self.args.out.parent / 'both').exists())
+        args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)
+        args.injected_input = True  # built without the parser
+        with self.assertRaisesRegex(gx_perf.PerfError, 'mutually exclusive'):
+            gx_perf.run_quiet_batch(args, self.probe, self.command(0))
+        self.assertFalse(args.out.exists())
+        for command in (('python', 'scripts/gx_perf.py', 'win32-idle', '--exe', 'g.exe', '--out', 'M'),
+                        ('python', 'E:/r/scripts/gx_perf.py', 'win32', '--exe', 'g.exe', '--out', 'M'),
+                        ('just', 'perf', 'win32-ui', '--case', 'p4'), ('python', 'scripts/gx_win_gui.py', 'run', 'W02'),
+                        ('just', 'win-gui', 'run', 'W13')):
+            with self.subTest(command=command):
+                self.assertTrue(gx_perf.desktop_command(command))
+                args = self.batch_args('--input-observe-only', command=command)
+                with self.assertRaisesRegex(gx_perf.PerfError, 'drives the Windows desktop'):
+                    gx_perf.run_quiet_batch(args, self.probe, self.command(0))
+        for command in (self.WSL_BATCH, ('python', 'scripts/gx_perf.py', 'gtk', '--clone', 'c', '--out', 'M'),
+                        ('python', 'scripts/gx_remote_fixture.py', 'run')):
+            self.assertFalse(gx_perf.desktop_command(command))
+        # Any gx_win_gui guard row shows the batch touched the desktop after all: an ERROR, never VALID.
+        args = self.batch_args('--input-observe-only', command=self.WSL_BATCH)
+        args.out = self.args.out.parent / 'guarded'
+        self.probe.input_ticks.side_effect = [ticks(5), ticks(1, 50_100_000)]
+        exit_code, result = self.run_batch(args, self.command(0, guard='pass'))
+        self.assertEqual((2, 'ERROR', 'mode_mismatch'), (exit_code, result['status'], result['failure_cause']))
+        self.assertIn('--input-observe-only is only for batches that never touch the Windows desktop', ' '.join(result['errors']))
 
     def test_noncompliant_thresholds_mode_mismatch_and_end_check_errors(self):
         args = self.batch_args('--idle-seconds', '5')

@@ -22,13 +22,22 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         gtk-runs.json preserves every planned run, RESULT.json records validity (not a performance verdict).
         Missing/failed/changed-identity runs cannot be filtered into success.
   quiet --out DIR [--slot-root DIR] [--idle-seconds 600] [--wait --interval 900 --max-attempts 3]
-        Read-only Windows/WSL/VM/input/blacklist checks; probe all slots and immediately release.
-        Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON. CPU is observation only.
-  quiet-batch --out DIR [--timeout S] [--injected-input] -- COMMAND [ARGS...]
+        [--strict-blacklist] [--input-observe-only]
+        Read-only checks under the criteria named in the JSON (r6-13:20 user ruling): this project's
+        own load gates (Windows and WSL build/test processes, the validation VM, all slots probed and
+        immediately released), with the console session and user input; other software (the plan §4
+        blacklist, kimi-cu, CPU, Docker containers) is only recorded. --strict-blacklist makes the
+        blacklist a gate again; --input-observe-only records input instead of gating it.
+        Exit 0 quiet, 3 busy, 2 tool error. Every attempt is retained as JSON.
+  quiet-batch --out DIR [--timeout S] [--injected-input | --input-observe-only] [--strict-blacklist]
+        -- COMMAND [ARGS...]
         Acquire all shared slots, check immediately inside the lease, run the command, check again
         before release. End-check failure invalidates the entire batch. With --injected-input a batch
         that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
         (with or without the flag) must have had no input at all since the start check.
+        --input-observe-only is for batches that run only in WSL/Xvfb (C1, C5, P9): the start idle
+        gate and the end input check are recorded, never gate; it refuses Windows-desktop drivers, and
+        a batch that still writes gx_win_gui guard rows is an ERROR.
         Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* driver exited 4), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
         6 PRODUCT_FAIL (a measured Ghostty instance ended or hung mid-batch, or win32-idle saw it activate
@@ -562,12 +571,20 @@ def label_environments(labels: Sequence[str], common: Sequence[str], overrides: 
 # Quiet checks observe state; they never stop a process, VM or WSL distribution.
 BUILD_PROCESSES = ("zig", "build", "test", "ghostty-test", "clang", "clang++", "cc1", "cc1plus", "ld.lld", "lld-link",
                    "ninja", "msbuild", "cl", "link", "gcc", "g++", "make", "cmake", "rustc", "cargo")
-# The plan §4 list, kept literally. Matching is a case-insensitive (casefold)
+# The quiet criteria in force (the user's ruling of 2026-10-18 13:20, r6-contract.md §6): other
+# software is recorded, never gated (the plan §4 blacklist, like CPU); this project's own load still
+# gates (build/test processes on Windows and in WSL, the validation VM, every slot); Windows-desktop
+# batches still need >= 600 s without input before the start and none during the batch; WSL/Xvfb-only
+# batches (--input-observe-only) record input instead.
+QUIET_CRITERIA = 'r6-13:20 user ruling'
+# The plan §4 list, kept literally; recorded in blacklist_observation, a gate only with
+# --strict-blacklist (the criteria before the 13:20 ruling). Matching is a case-insensitive (casefold)
 # substring of a process image name or main window title: Windows reports image
 # names in whatever case the launcher used (todesk.exe, TODESK.EXE) and titles
 # are free text. Devin/devin fold to one entry. No bare "kimi": it would also
-# block kimi-cu, which root ruled is not Kimi Code.
+# match kimi-cu, which root ruled is not Kimi Code.
 BLACKLIST = ("Devin", "devin", "ToDesk", "Kimi Code", "哔哩哔哩")
+BLACKLIST_MATCHING = "case-insensitive (casefold) substring of a process image name or main window title"
 # Other programs worth noting in the evidence (root ruling: kimi-cu is not "Kimi
 # Code"). Observation only: they never make a snapshot busy.
 OBSERVED_PROGRAMS = ("kimi-cu",)
@@ -822,9 +839,14 @@ def program_matches(rows: Sequence[Mapping], names: Sequence[str]) -> list[dict]
 
 
 def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
-    """One check of every plan §4 criterion. `end` = {evidence, since, injected_mode}
-    turns the input item into the end-of-batch criterion (see end_input)."""
+    """One check of every criterion of QUIET_CRITERIA. `end` = {evidence, since, injected_mode}
+    turns the input item into the end-of-batch criterion (see end_input). The blacklist is
+    recorded in blacklist_observation and gates only with --strict-blacklist; with
+    --input-observe-only the input item is kept with status observed (its result in `observed`),
+    which never makes the snapshot busy."""
     probe = probe or QuietProbe()
+    strict = bool(getattr(args, 'strict_blacklist', False))
+    observe_input = bool(getattr(args, 'input_observe_only', False))
     checks = {}
     def check(name, operation, assess):
         try:
@@ -843,12 +865,20 @@ def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
     check("windows", lambda: windows_inventory(probe.windows(), os.getpid()), lambda data: build_check(data['processes']))
     windows = checks["windows"]
     other_programs = {'status': 'unavailable', 'names': observed, 'scope': 'observation only; never a quiet gate'}
+    blacklist_observation = {'status': 'unavailable', 'names': blacklist, 'matching': BLACKLIST_MATCHING,
+                             'scope': 'a quiet gate (--strict-blacklist)' if strict else
+                             f'observation only ({QUIET_CRITERIA}); never a quiet gate'}
     if windows['status'] == 'error':
-        checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
+        blacklist_observation['reason'] = 'Windows inventory unavailable'
+        if strict:
+            checks['blacklist'] = {"status": "error", "reason": "Windows inventory unavailable"}
     else:
         rows = windows['raw']['processes']
-        check('blacklist', lambda: program_matches(rows, blacklist),
-              lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
+        found = program_matches(rows, blacklist)
+        blacklist_observation.update(status='recorded', matches=found)
+        if strict:
+            check('blacklist', lambda: found,
+                  lambda found: (not found, 'blacklisted process present' if found else 'no blacklisted processes'))
         other_programs.update(status='recorded', matches=program_matches(rows, observed))
         windows['command_lines_unavailable'] = sum(bool(row.get('command_line_unavailable')) for row in rows)
         windows['raw'] = {'processes': [{key: row[key] for key in ('pid', 'name', 'build_runner', 'command_line_unavailable',
@@ -874,6 +904,11 @@ def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
               lambda data: (data['idle_seconds'] >= threshold, f"idle {data['idle_seconds']:.3f}s; required {threshold:g}s"))
     else:
         check('input', lambda: end_input(end, probe, threshold), lambda data: (data['state'] == 'pass', data['reason']))
+    if observe_input and checks['input']['status'] != 'error':
+        # A WSL/Xvfb batch: the values and the result the gate would have had are kept, never gating.
+        row = checks['input']
+        row.update(status='observed', observed=row['status'],
+                   reason=f"observe only (--input-observe-only, a WSL/Xvfb batch): {row['reason']}")
     try:
         observation = {"status": "recorded", "raw": probe.cpu()}
     except Exception as exc:
@@ -885,16 +920,24 @@ def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
         containers = {'status': 'unavailable', 'reason': str(exc), 'scope': container_scope}
     code = 2 if any(row['status'] == 'error' for row in checks.values()) else (
         3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
-    thresholds = args.idle_seconds >= PLAN_IDLE_SECONDS
+    thresholds = thresholds_plan_compliant(args)
     return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
+            'criteria': QUIET_CRITERIA, 'criteria_options': {'strict_blacklist': strict, 'input_observe_only': observe_input},
+            'gates': [name for name, row in checks.items() if row['status'] != 'observed'],
+            'observed_only': [*(['input'] if observe_input else []), *([] if strict else ['blacklist']),
+                              'other_programs', 'cpu_observation', 'docker_containers'],
             'thresholds_plan_compliant': thresholds,
-            # Every plan §4 criterion observed with the plan's thresholds (point in time; batches see RESULT.json).
+            # Every gate of `criteria` met with its thresholds (point in time; batches see RESULT.json).
             'plan_compliant': code == 0 and thresholds,
             "slot_root": str(args.slot_root), "checks": checks, "cpu_observation": observation,
-            "other_programs": other_programs, "docker_containers": containers,
-            "build_processes": sorted(builds), "blacklist": blacklist,
-            "blacklist_matching": "case-insensitive (casefold) substring of a process image name or main window title",
+            "other_programs": other_programs, "blacklist_observation": blacklist_observation, "docker_containers": containers,
+            "build_processes": sorted(builds), "blacklist": blacklist, "blacklist_matching": BLACKLIST_MATCHING,
             "scope": "batch-owned locks" if lease else "point-in-time probe; locks released, not a reservation"}
+
+
+def thresholds_plan_compliant(args) -> bool:
+    """The idle threshold is the plan's (>= 600 s); it does not apply when input is only observed."""
+    return bool(getattr(args, 'input_observe_only', False)) or args.idle_seconds >= PLAN_IDLE_SECONDS
 
 
 def new_output(path: Path) -> Path:
@@ -1070,6 +1113,20 @@ def gate_exit_contract(command: Sequence[str]) -> bool:
     return False
 
 
+def desktop_command(command: Sequence[str]) -> bool:
+    """Whether `command` drives the Windows desktop: gx_win_gui.py (`just win-gui`) or a gx_perf.py
+    win32 / win32-* driver (`just perf win32...`). --input-observe-only refuses these up front; the
+    batch's guard log catches any other command that sends input through gx_win_gui."""
+    names = [process_name(part) for part in command]
+    if 'gx_win_gui.py' in names or ('just' in names and 'win-gui' in command):
+        return True
+    for index in range(len(command) - 1):
+        if command[index + 1] in ('win32', *WIN32_DRIVERS) and (
+                names[index] == 'gx_perf.py' or (names[index] == 'perf' and 'just' in names[:index])):
+            return True
+    return False
+
+
 def driver_out_dir(command: Sequence[str]) -> Path | None:
     """The --out directory of a gx_perf.py win32-* driver command, the measurement quiet-batch runs."""
     if not gate_exit_contract(command):
@@ -1110,7 +1167,7 @@ def measurement_state(raised: bool, exit_code, gate_contract: bool = True) -> st
     return {0: 'COMPLETE', 4: 'GATE_FAIL'}.get(exit_code, 'DRIVER_ERROR')
 
 
-def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool, product_failures: Sequence[Mapping] = (),
+def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool | str, product_failures: Sequence[Mapping] = (),
                    failure_runs: Sequence[Mapping] = ()) -> None:
     """Quiet validity comes only from the checks; the measurement only from the command.
     INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL.
@@ -1144,7 +1201,8 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
         result['status'], result['exit'] = 'PRODUCT_FAIL', 6
     elif mode_mismatch:
         result['failure_cause'] = 'mode_mismatch'
-        result['errors'].append('the command injected guarded input but --injected-input was not given; rerun with --injected-input')
+        result['errors'].append(mode_mismatch if isinstance(mode_mismatch, str) else
+                                'the command injected guarded input but --injected-input was not given; rerun with --injected-input')
         result['status'], result['exit'] = 'ERROR', 2
     elif quiet == 'INVALID':
         result['failure_cause'] = (input_check.get('raw') or {}).get('cause') if input_check.get('status') == 'fail' else None
@@ -1171,7 +1229,9 @@ def batch_summary(result: Mapping, before: Mapping | None, after: Mapping | None
     lines = [f"{result['status']} exit={result['exit']} quiet={result['quiet_status']} measurement={result['measurement']} "
              f"command_exit={result['command_exit']} plan_compliant={str(result['plan_compliant']).lower()} "
              f"failure_cause={result.get('failure_cause') or 'none'}",
-             BATCH_GUIDANCE.get(result['status'], '')]
+             BATCH_GUIDANCE.get(result['status'], ''),
+             f"criteria: {result.get('criteria')} " + ' '.join(f'{key}={str(value).lower()}' for key, value in
+                                                               (result.get('criteria_options') or {}).items())]
     for name, snapshot in (('before', before), ('after', after)):
         if snapshot:
             lines.append(f'{name}: ' + ', '.join(f"{key}={row['status']}" for key, row in snapshot['checks'].items()))
@@ -1184,12 +1244,21 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
     command = args.batch_command[1:] if args.batch_command[:1] == ['--'] else args.batch_command
     if not command or not math.isfinite(args.timeout) or args.timeout < 0 or not math.isfinite(args.idle_seconds) or args.idle_seconds < 0:
         raise PerfError('quiet-batch requires a command and finite nonnegative timeout/idle threshold')
+    observe_input = bool(getattr(args, 'input_observe_only', False))
+    if observe_input and args.injected_input:
+        raise PerfError('--input-observe-only and --injected-input are mutually exclusive')
+    if observe_input and desktop_command(command):
+        raise PerfError('--input-observe-only is only for batches that run in WSL/Xvfb; this command drives the Windows '
+                        'desktop (gx_win_gui or a gx_perf win32 driver): run it without --input-observe-only')
     out = new_output(args.out)
     guard_log = out / 'guards.jsonl'
     result = {'schema': 'gx-quiet-batch-v2', 'batch_id': uuid.uuid4().hex, 'command': command,
-              'injected_input': args.injected_input, 'status': 'NOT_STARTED', 'exit': 2,
+              'injected_input': args.injected_input, 'input_observe_only': observe_input, 'criteria': QUIET_CRITERIA,
+              'criteria_options': {'strict_blacklist': bool(getattr(args, 'strict_blacklist', False)),
+                                   'input_observe_only': observe_input},
+              'status': 'NOT_STARTED', 'exit': 2,
               'quiet_status': 'NOT_CHECKED', 'quiet_valid': False, 'measurement': 'NOT_RUN', 'command_exit': None,
-              'plan_compliant': False, 'thresholds_plan_compliant': args.idle_seconds >= PLAN_IDLE_SECONDS,
+              'plan_compliant': False, 'thresholds_plan_compliant': thresholds_plan_compliant(args),
               'gate_exit_contract': gate_exit_contract(command),
               'failure_cause': None, 'started_ns': None, 'ended_ns': None, 'errors': []}
     before = after = None
@@ -1233,8 +1302,15 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                     end = {'evidence': evidence, 'since': before['checks']['input']['raw'], 'injected_mode': args.injected_input}
                     after = quiet_snapshot(args, probe, lease=lease, end=end)
                     write_json(out / 'after.json', after)
-                    # Input was sent although the batch claimed none: the last-input check is meaningless.
-                    mismatch = not args.injected_input and isinstance(evidence, dict) and evidence['injected']
+                    if observe_input:
+                        # A WSL/Xvfb batch never touches the Windows desktop: any guard row says it did.
+                        rows = evidence['events'] if isinstance(evidence, dict) else 0
+                        mismatch = rows and (f'--input-observe-only is only for batches that never touch the Windows '
+                                             f'desktop, but the command wrote {rows} gx_win_gui guard row(s); run it as a '
+                                             'desktop batch without --input-observe-only')
+                    else:
+                        # Input was sent although the batch claimed none: the last-input check is meaningless.
+                        mismatch = not args.injected_input and isinstance(evidence, dict) and evidence['injected']
                     product = evidence['product'] if isinstance(evidence, dict) else ()
                     classify_batch(result, before, after, mode_mismatch=mismatch, product_failures=product,
                                    failure_runs=product_failure_runs(driver_out_dir(command), product) if product else ())
@@ -2478,7 +2554,12 @@ def build_parser() -> argparse.ArgumentParser:
     quiet.add_argument("--distro", default="Ubuntu-24.04")
     quiet.add_argument("--idle-seconds", type=float, default=600)
     quiet.add_argument("--build-process", action="append", help="add build process names (repeatable)")
-    quiet.add_argument("--blacklist", action="append", help="add case-insensitive name/title substrings (repeatable)")
+    quiet.add_argument("--blacklist", action="append",
+                       help="add case-insensitive name/title substrings to the recorded blacklist (repeatable)")
+    quiet.add_argument("--strict-blacklist", action="store_true",
+                       help="make the blacklist a gate again (the criteria before the r6 13:20 user ruling)")
+    quiet.add_argument("--input-observe-only", action="store_true",
+                       help="record user input instead of gating it (polling before a WSL/Xvfb-only batch)")
     quiet.add_argument("--observe", action="append", help="add name/title substrings recorded as other programs, never a gate")
     quiet.add_argument("--wait", action="store_true")
     quiet.add_argument("--interval", type=float, default=900)
@@ -2490,12 +2571,19 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument('--distro', default='Ubuntu-24.04')
     batch.add_argument('--idle-seconds', type=float, default=600)
     batch.add_argument('--build-process', action='append')
-    batch.add_argument('--blacklist', action='append', help='add case-insensitive name/title substrings (repeatable)')
+    batch.add_argument('--blacklist', action='append',
+                       help='add case-insensitive name/title substrings to the recorded blacklist (repeatable)')
+    batch.add_argument('--strict-blacklist', action='store_true',
+                       help='make the blacklist a gate again (the criteria before the r6 13:20 user ruling)')
     batch.add_argument('--observe', action='append', help='add name/title substrings recorded as other programs, never a gate')
     batch.add_argument('--timeout', type=float, default=0)
-    batch.add_argument('--injected-input', action='store_true',
-                       help='the command may send input through gx_win_gui (all win32-* drivers): judge input by the '
-                            "batch's guard log; a batch that sent none falls back to no input since the start check")
+    input_mode = batch.add_mutually_exclusive_group()
+    input_mode.add_argument('--injected-input', action='store_true',
+                            help='the command may send input through gx_win_gui (all win32-* drivers): judge input by the '
+                                 "batch's guard log; a batch that sent none falls back to no input since the start check")
+    input_mode.add_argument('--input-observe-only', action='store_true',
+                            help='a batch that runs only in WSL/Xvfb (C1, C5, P9): record the start idle time and the end '
+                                 'input check without gating; refuses Windows-desktop drivers')
     batch.add_argument('batch_command', nargs=argparse.REMAINDER)
     remote = commands.add_parser('remote', allow_abbrev=False, help='summarize remote.* fixture logs only')
     remote.add_argument('paths', nargs='+', type=Path)
