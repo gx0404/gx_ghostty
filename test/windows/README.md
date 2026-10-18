@@ -111,8 +111,9 @@ FocusChanged 事件）；期望在 3 s 内轮询成立，否则 FAIL 并保留 `
 注册 ElementSelected（IUIAutomation 槽 32/33，TreeScope_Subtree），须同时给
 `--ready-file --continue-file --listen-ms`；controller 在 ready 之后按键、等约 1 s 再写
 continue，worker 再等 0.3 s 收尾。事件都只记目标 PID 的发送者，`after_ready` 标出 ready
-之后到达的；注册、移除与查询同线程。节点另记 `localized_type`、`native_window_handle` 与
-`controller_for`（ControllerFor 所指元素的 AutomationId）。
+之后到达的；注册、移除与查询同线程。节点另记 `localized_type`、`native_window_handle`、
+`controller_for`（ControllerFor 所指元素的 AutomationId；客户端拿到的是 IUIAutomationElementArray，
+SAFEARRAY 形态也读）与 `controller_for_vt`（客户端得到的 VARIANT 类型）。
 
 ### VM broker 命令与预期
 
@@ -229,7 +230,10 @@ reason=queued`，消息循环发事件时记 `fixture_uia_focus snapshot=N node=
 （令牌与名称）不同；容器新出现或弹层刚显示只记录不入队，每次发布最多 4 个。消息循环发
 UIA_SelectionItem_ElementSelectedEventId 时记 `fixture_uia_selected snapshot=N node=N
 raised=true|false`，`raised` 含义同上。命令面板的 Search 编辑框以 ControllerFor 指向 Results。
-Python FAIL JSON 保留 `stage/node_id/pattern_id/call/hresult/action_results`，不重试。
+Python FAIL JSON 保留 `stage/node_id/pattern_id/call/hresult/action_results` 和失败前已收到的事件
+（`focus_events/foreign_focus_events/selection_events/...`，键名同 PASS），不重试。
+终端 HWND 获得键盘焦点时（UIA 已在本进程使用且有客户端监听），provider 经同一队列补发根元素的 FocusChanged，
+`fixture_uia` 行的 kind 为 `focus_changed`；窗口不再持系统焦点时不发。
 
 ### A2r 远程控制接口（MIG-07 / MIG-08）
 
