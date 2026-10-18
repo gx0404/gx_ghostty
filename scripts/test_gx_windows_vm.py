@@ -38,6 +38,7 @@ class IsolatedTestCase(unittest.TestCase):
         self.protect = self.start(mock.patch.object(vm, "protect_directory"))
         self.slots = mock.MagicMock()
         self.slots.acquire.side_effect = refuse
+        self.slots.shared_root.return_value = Path("Z:/main-checkout/.local/kernel-slots")
         self.start(mock.patch.dict(sys.modules, {"gx_slots": self.slots}))
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -104,7 +105,7 @@ class WindowsVmTests(IsolatedTestCase):
         with self.assertRaisesRegex(AssertionError, "unmocked"):
             vm.docker_executable()
         with self.assertRaisesRegex(AssertionError, "unmocked"):
-            sys.modules["gx_slots"].acquire(vm.SLOTS, "heavy", 0)
+            sys.modules["gx_slots"].acquire(self.root, "heavy", 0)
 
     def test_stage_validation_binds_live_uuid_and_exact_fixture_hash(self):
         vm.prepare(self.root)
@@ -334,6 +335,15 @@ class WindowsVmTests(IsolatedTestCase):
                 vm.up(self.root, "win11", FakeDocker(None, root=self.root), self.root / "log", 0)
         self.slots.acquire.assert_not_called()
 
+    def test_up_refuses_without_the_shared_slot_root(self):
+        vm.prepare(self.root)
+        self.slots.acquire.side_effect = None
+        self.slots.shared_root = None
+        docker = FakeDocker(None, root=self.root)
+        with self.assertRaisesRegex(vm.VmError, "shared_root"):
+            vm.up(self.root, "win11", docker, self.root / "log", 0)
+        self.slots.acquire.assert_not_called()
+
     def run_up(self, inspect, replace=None):
         self.slots.acquire.side_effect = None
         docker = FakeDocker(inspect, root=self.root)
@@ -344,6 +354,9 @@ class WindowsVmTests(IsolatedTestCase):
                 result = vm.up(self.root, "win11", docker, self.root / "log", 0, replace)
             finally:
                 self.assertEqual(self.slots.acquire.call_args.args[1], "heavy")
+                # The shared root from git's common directory, never this checkout's .local.
+                self.assertEqual(self.slots.acquire.call_args.args[0], Path("Z:/main-checkout/.local/kernel-slots"))
+                self.assertNotEqual(self.slots.acquire.call_args.args[0], vm.ROOT / ".local" / "kernel-slots")
         argv = popen.call_args.args[0]
         self.assertEqual(argv[0], MISSING_DOCKER)
         self.assertIn("never", argv)

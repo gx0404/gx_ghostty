@@ -71,7 +71,6 @@ QUEUE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 # gx-q.cmd expands the line once with set /p and again through call: keep cmd metacharacters out.
 QUEUE_UNSAFE = re.compile(r"[%!^&|<>\r\n\t]")
 MONITOR = "/run/shm/monitor.sock"
-SLOTS = ROOT / ".local" / "kernel-slots"
 PORTS = {"win11": (18006, 13389), "win10": (18007, 13390)}
 CREDENTIAL_FIELDS = ("admin_password", "user_password")
 QCODE = re.compile(r"^[a-z0-9_]+(-[a-z0-9_]+)*$")
@@ -667,6 +666,19 @@ def screenshot(docker: Docker, version: str, destination: Path) -> dict:
             "visual_review": "PENDING"}
 
 
+def slots_root(gx_slots) -> Path:
+    """The kernel-slot root shared by the main checkout and all of its worktrees.
+
+    gx_slots.shared_root resolves it from git's common directory. A checkout-relative
+    `.local/kernel-slots` gave each worktree its own locks, so a VM started from a worktree did not
+    exclude heavy jobs of the main checkout (or of another worktree)."""
+    shared = getattr(gx_slots, "shared_root", None)
+    if not callable(shared):
+        raise VmError("scripts/gx_slots.py has no shared_root(); merge the shared slot root "
+                      "(wip/r6-a2-perf-tools) before starting a VM")
+    return Path(shared())
+
+
 def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: float,
        replace_container: str | None = None, dry_run: bool = False) -> int:
     """Run the VM attached while holding one heavy gx_slots slot.
@@ -690,7 +702,7 @@ def up(root: Path, version: str, docker: Docker, log_path: Path, slot_timeout: f
               flush=True)
         return 0
     docker.run("image", "inspect", IMAGE)  # must already be cached; never pulled
-    with gx_slots.acquire(SLOTS, "heavy", slot_timeout):
+    with gx_slots.acquire(slots_root(gx_slots), "heavy", slot_timeout):
         for other in MEDIA:
             if container_state(docker, other)["running"]:
                 raise VmError(f"{container_name(other)} is already running; only one owned VM may run")
