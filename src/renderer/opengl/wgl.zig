@@ -31,9 +31,9 @@
 //!
 //! The context asks to be told about GPU resets (driver timeout recovery,
 //! a driver update) where the driver supports it
-//! (WGL_ARB_create_context_robustness). After a reset `present` replaces
-//! the lost context with a new one and calls the apprt's
-//! `gpuContextReset`, which makes the renderer rebuild its GPU resources.
+//! (WGL_ARB_create_context_robustness). After a reset `present` calls the
+//! apprt's `gpuContextReset`. Once that frame completes, `finishRecovery`
+//! releases its resources in the old context before replacing the context.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -444,6 +444,9 @@ pub const Context = struct {
     /// The GL context, alive between `threadEnter` and `threadExit`.
     hglrc: ?HGLRC = null,
 
+    /// Accessed under the renderer's draw mutex, including GUI recovery checks.
+    recovery: enum { none, pending, failed } = .none,
+
     /// glGetGraphicsResetStatus, when the context reports GPU resets.
     get_reset_status: ?GetGraphicsResetStatusFn = null,
 
@@ -559,29 +562,50 @@ pub const Context = struct {
         return true;
     }
 
-    /// Replace a lost context with a new one on the render thread, load
-    /// the GL functions and the state `OpenGL.threadEnter` sets up again,
-    /// and tell the apprt that the renderer's GPU resources are gone with
-    /// the old context (`gpuContextReset`, called with the renderer's draw
-    /// mutex held by this thread).
+    /// Stop drawing, but keep the old context current until this frame has
+    /// returned its swap-chain permit. All old names must be released there,
+    /// never in the replacement context (where names may already be reused).
     fn recover(self: *Context, device: *const Device) void {
+        _ = device;
         log.warn("recreating the lost OpenGL context", .{});
-        self.threadExit(device);
-        gl.glad.unload();
-        self.threadEnter(device) catch |err| {
-            log.err("cannot recreate the OpenGL context err={}", .{err});
-            return;
-        };
-        _ = gl.glad.load(&getProcAddress) catch |err| {
-            log.err("cannot load OpenGL after recreating the context err={}", .{err});
-            return;
-        };
-        gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
-            log.warn("error enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
-        };
+        self.recovery = .pending;
         if (comptime @hasDecl(apprt.Surface, "gpuContextReset")) {
             self.surface.gpuContextReset();
         }
+    }
+
+    /// Runs after Frame.complete/frameCompleted, on the render thread with
+    /// draw_mutex held. Releasing the swap chain inside present would wait
+    /// on the permit of the very frame that is still being presented.
+    pub fn finishRecovery(self: *Context, device: *const Device) !void {
+        if (self.recovery != .pending) return;
+        const renderer = &self.surface.core_surface.renderer;
+        std.debug.assert(!renderer.display_realized);
+        renderer.releaseGpuResources();
+        self.threadExit(device);
+        gl.glad.unload();
+        // unload makes the table undefined. Keep an empty table so the final
+        // OpenGL.threadExit can safely unload again after any failure below.
+        gl.glad.context = std.mem.zeroes(gl.glad.Context);
+        self.recovery = .failed;
+
+        try self.threadEnter(device);
+        errdefer {
+            self.threadExit(device);
+            gl.glad.unload();
+            gl.glad.context = std.mem.zeroes(gl.glad.Context);
+        }
+        _ = try gl.glad.load(&getProcAddress);
+        try gl.enable(gl.c.GL_FRAMEBUFFER_SRGB);
+        try gl.viewport(0, 0, @intCast(renderer.size.screen.width), @intCast(renderer.size.screen.height));
+        quietDebugOutput();
+        self.recovery = .none;
+    }
+
+    /// The GUI checks this under draw_mutex before realizing the display.
+    /// Render callbacks and mailbox resizes also use it before touching GLAD.
+    pub fn drawable(self: *const Context) bool {
+        return self.hglrc != null and self.recovery == .none;
     }
 
     /// Log the implementation behind the current context. glad must be
@@ -601,7 +625,7 @@ pub const Context = struct {
 
     /// Copy the rendered target into the window and swap buffers.
     /// Called on the render thread with the context current. After a GPU
-    /// reset nothing is presented: the context is recreated (`recover`)
+    /// reset nothing is presented: recovery is queued until the frame ends
     /// and the frame fails with `error.ContextLost`.
     pub fn present(self: *Context, device: *const Device, target: Target) !void {
         perf.count("renderer.present", 1);
@@ -1773,6 +1797,276 @@ test parseVersion {
     try testing.expectEqual(Version{ .major = 4, .minor = 6 }, parseVersion("4.6.0 NVIDIA 555.85"));
     try testing.expectEqual(Version{ .major = 4, .minor = 5 }, parseVersion("4.5 (Core Profile) Mesa 24.2.0"));
     try testing.expectEqual(Version{ .major = 0, .minor = 0 }, parseVersion(""));
+}
+
+// A deterministic WGL/GL table: no window, driver, or desktop is involved.
+// Run the real Context.recover and Renderer.releaseGpuResources paths, including
+// Shaders.deinit -> Pipeline.deinit -> Program.destroy -> DeleteProgram.
+const ResetTest = struct {
+    const Fault = enum { none, create, make_current, loader };
+    threadlocal var fault: Fault = .none;
+    threadlocal var current: ?HGLRC = null;
+    threadlocal var program_owners: [32]?HGLRC = @splat(null);
+    threadlocal var creates: usize = 0;
+    threadlocal var context_deletes: usize = 0;
+    threadlocal var bind_attempts: usize = 0;
+    threadlocal var viewport_calls: usize = 0;
+    threadlocal var viewport_size: Size = .{ .width = 0, .height = 0 };
+    threadlocal var deletes: usize = 0;
+    threadlocal var wrong_context_deletes: usize = 0;
+    threadlocal var first_bad_program: gl.c.GLuint = 0;
+    threadlocal var gl_error: gl.c.GLenum = gl.c.GL_NO_ERROR;
+
+    fn oldContext() HGLRC {
+        return @ptrFromInt(0x1000);
+    }
+
+    fn newContext() HGLRC {
+        return @ptrFromInt(0x2000);
+    }
+
+    fn makeCurrent(_: ?HDC, context: ?HGLRC) callconv(.winapi) BOOL {
+        if (context == newContext()) {
+            bind_attempts += 1;
+            if (fault == .make_current) return .FALSE;
+        }
+        current = context;
+        return .TRUE;
+    }
+
+    fn deleteContext(_: HGLRC) callconv(.winapi) BOOL {
+        context_deletes += 1;
+        return .TRUE;
+    }
+
+    fn createContext(_: HDC, _: ?HGLRC, _: [*]const c_int) callconv(.winapi) ?HGLRC {
+        creates += 1;
+        if (fault == .create) return null;
+        return newContext();
+    }
+
+    fn getString(_: gl.c.GLenum) callconv(.c) [*c]const u8 {
+        if (fault == .loader) return "0.0";
+        return "4.3";
+    }
+
+    fn getStringi(_: gl.c.GLenum, _: gl.c.GLuint) callconv(.c) [*c]const u8 {
+        return "";
+    }
+
+    fn getInteger(name: gl.c.GLenum, value: [*c]gl.c.GLint) callconv(.c) void {
+        if (name == gl.c.GL_VIEWPORT) {
+            value[0] = 0;
+            value[1] = 0;
+            value[2] = @intCast(viewport_size.width);
+            value[3] = @intCast(viewport_size.height);
+            return;
+        }
+        std.debug.assert(name == gl.c.GL_NUM_EXTENSIONS);
+        value[0] = 0;
+    }
+
+    fn enable(_: gl.c.GLenum) callconv(.c) void {}
+
+    fn viewport(_: gl.c.GLint, _: gl.c.GLint, width: gl.c.GLsizei, height: gl.c.GLsizei) callconv(.c) void {
+        std.debug.assert(current == newContext());
+        viewport_calls += 1;
+        viewport_size = .{ .width = @intCast(width), .height = @intCast(height) };
+    }
+
+    fn createProgram() callconv(.c) gl.c.GLuint {
+        // Reuse an old name in the new namespace, as a real driver may do.
+        std.debug.assert(current == newContext());
+        program_owners[11] = current;
+        return 11;
+    }
+
+    fn getError() callconv(.c) gl.c.GLenum {
+        const result = gl_error;
+        gl_error = gl.c.GL_NO_ERROR;
+        return result;
+    }
+
+    fn deleteProgram(id: gl.c.GLuint) callconv(.c) void {
+        deletes += 1;
+        if (current == null or current != program_owners[id]) {
+            wrong_context_deletes += 1;
+            if (first_bad_program == 0) first_bad_program = id;
+            gl_error = gl.c.GL_INVALID_VALUE;
+        } else {
+            program_owners[id] = null;
+        }
+    }
+
+    fn unused() callconv(.c) void {
+        @panic("unexpected GL call in the reset test");
+    }
+
+    fn proc(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque {
+        const symbols = .{
+            .{ "glGetString", &getString },
+            .{ "glGetStringi", &getStringi },
+            .{ "glGetIntegerv", &getInteger },
+            .{ "glEnable", &enable },
+            .{ "glViewport", &viewport },
+            .{ "glGetError", &getError },
+            .{ "glDeleteProgram", &deleteProgram },
+            .{ "glCreateProgram", &createProgram },
+        };
+        inline for (symbols) |entry| {
+            if (std.mem.eql(u8, std.mem.span(name), entry[0])) return @ptrCast(entry[1]);
+        }
+        return @ptrCast(&unused);
+    }
+
+    fn init(surface: *apprt.Surface, device: *Device) !*Context {
+        fault = .none;
+        current = oldContext();
+        program_owners = @splat(null);
+        creates = 0;
+        context_deletes = 0;
+        bind_attempts = 0;
+        viewport_calls = 0;
+        viewport_size = .{ .width = 0, .height = 0 };
+        deletes = 0;
+        wrong_context_deletes = 0;
+        first_bad_program = 0;
+        gl_error = gl.c.GL_NO_ERROR;
+        device.* = .{ .state = .init(.ready), .owner_thread = std.Thread.getCurrentId() };
+        device.lib.makeCurrent = &makeCurrent;
+        device.lib.deleteContext = &deleteContext;
+        device.lib.createContextAttribs = &createContext;
+        device.lib.getProcAddress = &proc;
+        device.lib.swapInterval = null;
+        thread_lib = &device.lib;
+        gl.glad.context = std.mem.zeroes(gl.glad.Context);
+        _ = try gl.glad.load(&getProcAddress);
+
+        // These are the only Surface/Renderer fields used by reset and release.
+        surface.hwnd = null;
+        const renderer = &surface.core_surface.renderer;
+        renderer.alloc = std.testing.allocator;
+        renderer.display_realized = true;
+        renderer.images = .empty;
+        renderer.bg_image = null;
+        renderer.swap_chain = null;
+        renderer.size.screen = .{ .width = 640, .height = 480 };
+        renderer.shaders = .{ .pipelines = undefined, .post_pipelines = &.{} };
+        inline for (@typeInfo(@TypeOf(renderer.shaders.pipelines)).@"struct".fields, 0..) |field, i| {
+            program_owners[i + 11] = oldContext();
+            @field(renderer.shaders.pipelines, field.name) = .{
+                .program = .{ .id = @intCast(i + 11) },
+                .fbo = .{ .id = 0 },
+                .vao = .{ .id = 0 },
+                .stride = 0,
+                .blending_enabled = false,
+            };
+        }
+        renderer.api.device = device;
+        renderer.api.wgl_context = .{ .surface = surface, .hdc = @ptrFromInt(0x3000), .vsync = false, .hglrc = oldContext() };
+        return &renderer.api.wgl_context;
+    }
+
+    fn testFailure(inject: Fault, expected: anyerror) !void {
+        var surface: apprt.Surface = undefined;
+        var device: Device = undefined;
+        const context = try init(&surface, &device);
+        const renderer = &surface.core_surface.renderer;
+        defer renderer.api.threadExit();
+
+        context.recover(&device);
+        try std.testing.expectEqual(oldContext(), current.?);
+        try std.testing.expectEqual(@as(usize, 0), deletes);
+        fault = inject;
+        try std.testing.expectError(expected, context.finishRecovery(&device));
+        try std.testing.expectEqual(@as(usize, 5), deletes);
+        try std.testing.expectEqual(@as(usize, 0), wrong_context_deletes);
+        try std.testing.expect(!context.drawable());
+        try std.testing.expect(!renderer.display_realized);
+        try std.testing.expect(renderer.shaders.defunct);
+        try std.testing.expectEqual(@as(?HGLRC, null), context.hglrc);
+        try std.testing.expectEqual(@as(?HGLRC, null), current);
+        try std.testing.expect(gl.glad.context.GetError == null);
+        try std.testing.expect(gl.glad.context.glad_loader_handle == null);
+        try std.testing.expectEqual(@as(usize, if (inject == .create) 1 else 2), context_deletes);
+        try std.testing.expectEqual(@as(usize, if (inject == .make_current) make_current_attempts else if (inject == .loader) 1 else 0), bind_attempts);
+
+        // Exercise the production guards, including late resize/draw callbacks.
+        try std.testing.expectError(error.ContextLost, renderer.api.surfaceSize());
+        renderer.api.setViewport(1024, 768);
+        renderer.api.drawFrameEnd();
+        renderer.releaseGpuResources();
+        try std.testing.expectEqual(@as(usize, 0), viewport_calls);
+        try std.testing.expectEqual(@as(usize, 5), deletes);
+        try std.testing.expectEqual(@as(usize, if (inject == .create) 2 else 1), creates);
+        // The deferred real OpenGL.threadExit must tolerate the empty GL table.
+    }
+};
+
+test "D-11 reset never deletes old programs in the replacement context" {
+    var surface: apprt.Surface = undefined;
+    var device: Device = undefined;
+    const context = try ResetTest.init(&surface, &device);
+    const renderer = &surface.core_surface.renderer;
+    defer renderer.api.threadExit();
+
+    context.recover(&device);
+    try std.testing.expectEqual(ResetTest.oldContext(), ResetTest.current.?);
+    try std.testing.expectEqual(@as(usize, 0), ResetTest.deletes);
+    // Exercise the actual end-of-frame forwarding hook, after permit return.
+    renderer.api.drawFrameEnd();
+    try std.testing.expect(context.drawable());
+    try std.testing.expect(!renderer.display_realized);
+    try std.testing.expectEqual(ResetTest.newContext(), ResetTest.current.?);
+    try std.testing.expectEqual(@as(usize, 5), ResetTest.deletes);
+    try std.testing.expectEqual(@as(usize, 1), ResetTest.viewport_calls);
+    const size = try renderer.api.surfaceSize();
+    try std.testing.expectEqual(@as(u32, 640), size.width);
+    try std.testing.expectEqual(@as(u32, 480), size.height);
+
+    const replacement = try gl.Program.create();
+    renderer.releaseGpuResources();
+    renderer.api.drawFrameEnd();
+    try std.testing.expectEqual(@as(usize, 5), ResetTest.deletes);
+    try std.testing.expectEqual(@as(usize, 1), ResetTest.creates);
+    try std.testing.expectEqual(ResetTest.newContext(), ResetTest.program_owners[replacement.id].?);
+    if (ResetTest.first_bad_program != 0) std.debug.print(
+        "D-11 first error: glDeleteProgram({d}), current=0x{x}, owner=0x{x}, error=0x{x}\n",
+        .{ ResetTest.first_bad_program, @intFromPtr(ResetTest.current.?), @intFromPtr(ResetTest.oldContext()), ResetTest.gl_error },
+    );
+    try std.testing.expectEqual(@as(usize, 0), ResetTest.wrong_context_deletes);
+    try gl.errors.getError();
+    replacement.destroy();
+    try std.testing.expectEqual(@as(usize, 6), ResetTest.deletes);
+    try gl.errors.getError();
+}
+
+test "D-11 context creation failure leaves recovery undrawable" {
+    try ResetTest.testFailure(.create, error.WglCreateContextFailed);
+}
+
+test "D-11 makeCurrent failure leaves recovery undrawable" {
+    try ResetTest.testFailure(.make_current, error.WglMakeCurrentFailed);
+}
+
+test "D-11 loader failure leaves recovery undrawable" {
+    try ResetTest.testFailure(.loader, error.GLInitFailed);
+}
+
+test "D-11 normal teardown deletes programs in their owning context" {
+    var surface: apprt.Surface = undefined;
+    var device: Device = undefined;
+    const context = try ResetTest.init(&surface, &device);
+    defer {
+        context.threadExit(&device);
+        gl.glad.unload();
+    }
+
+    surface.core_surface.renderer.display_realized = false;
+    surface.core_surface.renderer.releaseGpuResources();
+    try std.testing.expectEqual(@as(usize, 5), ResetTest.deletes);
+    try std.testing.expectEqual(@as(usize, 0), ResetTest.wrong_context_deletes);
+    try gl.errors.getError();
 }
 
 test "Device.backend reports what the probe saw" {
