@@ -13,8 +13,9 @@
 //! find bars (without its caret then), F3/Shift+F3 navigate from the
 //! terminal too (performable bindings in `src/gx/defaults-windows.ghostty`),
 //! and it hides with its surface (a background tab). Closing the bar any
-//! way, Alt+F4 included, ends the search. Without Direct2D the bar cannot
-//! open, and a message box says so.
+//! way ends the search; a bound Alt+F4 (`close_window` by default) runs in
+//! the terminal instead, like the other bound function keys. Without
+//! Direct2D the bar cannot open, and a message box says so.
 //!
 //! The owning `Surface` embeds this struct as `search_bar` and forwards the
 //! `start_search`/`end_search`/`search_total`/`search_selected` apprt
@@ -23,8 +24,9 @@
 //! (`setOwnerVisible`), DPI changes, a move to another window
 //! (`onReparented`) and `deinit`. The app's message loop gives keys typed
 //! into the bar to `handleKey` first (see `App.run`, `ownsEdit`), then lets
-//! keybindings with Ctrl reach the terminal, which takes the focus while
-//! the bar stays open.
+//! keybindings with Ctrl and bound function keys (F1 to F24, also with
+//! Shift or Alt) reach the terminal, which takes the focus while the bar
+//! stays open.
 const SearchBar = @This();
 
 const std = @import("std");
@@ -446,8 +448,8 @@ fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
     self.search();
 }
 
-/// The bar closed itself (WM_CLOSE: Alt+F4 in the bar, a close from
-/// outside): the search ends with it, or the matches would stay
+/// The bar closed itself (WM_CLOSE: an unbound Alt+F4 in the bar, a close
+/// from outside): the search ends with it, or the matches would stay
 /// highlighted without a bar, e.g. after canceling the window close that
 /// Alt+F4 goes on to ask about.
 fn onDismissed(ctx: *anyopaque, popup: *Popup, reason: Popup.DismissReason) void {

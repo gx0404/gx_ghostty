@@ -605,8 +605,10 @@ pub fn run(self: *App) !void {
         }
 
         // Intercept keystrokes destined for popup edit controls so
-        // Enter/Escape/Arrow keys can be handled by our code.
-        if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null) {
+        // Enter/Escape/Arrow keys can be handled by our code. A find bar
+        // also takes the system keys a function key may arrive as
+        // (`editKeyStage`).
+        if ((msg.message == w32.WM_KEYDOWN or msg.message == w32.WM_SYSKEYDOWN) and msg.hwnd != null) {
             if (self.routeEditKey(&msg)) continue :loop;
         }
 
@@ -696,6 +698,9 @@ const EditOwner = union(enum) {
     remote_search: *RemotePane,
 };
 
+/// The kind of edit control a key was typed into (`editKeyRoute`).
+const EditField = std.meta.Tag(EditOwner);
+
 /// GUI-thread-only lookup. The returned pointer is borrowed until the next
 /// message pump; retain the reference and resolve again after modal/COM calls.
 pub fn resolveWindow(self: *App, reference: gx.ui_ref.Reference) ?*Window {
@@ -781,35 +786,41 @@ fn findEditOwnerIn(win: *Window, hwnd: w32.HWND) ?EditOwner {
     return null;
 }
 
-/// Handle a WM_KEYDOWN for one of the chrome/popup Edit controls before
-/// it is translated: Enter/Escape/arrows drive the rename, palette and
-/// search popups, then `editKeyRoute` decides between the edit control,
-/// the surface's keybindings and nothing. Returns true when the message
-/// was consumed.
+/// Handle a key press for one of the chrome/popup Edit controls before it
+/// is translated: Enter/Escape/arrows drive the rename, palette and search
+/// popups (`editKeyStage`), then `editKeyRoute` decides between the edit
+/// control, the surface's keybindings and nothing. Returns true when the
+/// message was consumed.
 fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
     const hwnd = msg.hwnd orelse return false;
     const owner = self.findEditOwner(hwnd) orelse return false;
     const vk: u16 = @intCast(msg.wParam & 0xFFFF);
-
-    switch (owner) {
-        .rename => |win| if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
-            if (vk == w32.VK_RETURN) {
-                win.tab_bar.finishRename();
-            } else {
-                win.tab_bar.cancelRename();
-            }
-            return true;
-        },
-        .search => |surface| if (surface.search_bar.handleKey(vk)) return true,
-        .remote_search => |remote| if (remote.ui.search_bar.handleKey(vk)) return true,
-        .palette => |win| if (win.palette.handleKey(vk)) return true,
-    }
-
+    const field = std.meta.activeTag(owner);
     const mods: input.Mods = .{
         .ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0,
         .shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0,
         .alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0,
+        .super = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
     };
+
+    switch (editKeyStage(field, msg.message, vk, mods.ctrl)) {
+        .none => return false,
+        .bindings => {},
+        .popup => switch (owner) {
+            .rename => |win| if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
+                if (vk == w32.VK_RETURN) {
+                    win.tab_bar.finishRename();
+                } else {
+                    win.tab_bar.cancelRename();
+                }
+                return true;
+            },
+            .search => |surface| if (surface.search_bar.handleKey(vk)) return true,
+            .remote_search => |remote| if (remote.ui.search_bar.handleKey(vk)) return true,
+            .palette => |win| if (win.palette.handleKey(vk)) return true,
+        },
+    }
+
     // The key goes to the pane below, so a remote one decides with the
     // source's keybind snapshot, like its find bar and the palette.
     const bindings = switch (owner) {
@@ -822,8 +833,7 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
         },
         .search => &self.config.keybind.set,
     };
-    const bound = mods.ctrl and trigger.isBound(bindings, vk, mods);
-    switch (editKeyRoute(vk, mods, bound)) {
+    switch (editKeyRoute(field, vk, mods, editKeyBound(field, bindings, vk, mods))) {
         .edit => return false,
         .swallow => return true,
         .bubble => {},
@@ -861,6 +871,55 @@ fn routeEditKey(self: *App, msg: *const w32.MSG) bool {
     return true;
 }
 
+/// How `routeEditKey` takes a key message for an edit control.
+const EditKeyStage = enum {
+    /// Not at all: the control's window procedure gets the message.
+    none,
+    /// The popup's own keys first (the find bar's F3/Shift+F3, Enter,
+    /// arrows and Escape, the palette's, Enter and Escape of the tab
+    /// rename), then `editKeyRoute`.
+    popup,
+    /// Straight to `editKeyRoute`: a system key in a find bar, which the
+    /// bar's own keys never are.
+    bindings,
+};
+
+/// The stage for `message` (WM_KEYDOWN or WM_SYSKEYDOWN) with the key `vk`
+/// in a `field` edit control. Windows sends F10 and keys pressed with Alt
+/// (without Ctrl) as WM_SYSKEYDOWN; a find bar routes the function keys
+/// among them, every other system key keeps its default handling (Alt+Space
+/// opens the window menu).
+fn editKeyStage(field: EditField, message: u32, vk: u16, ctrl: bool) EditKeyStage {
+    return switch (message) {
+        w32.WM_KEYDOWN => .popup,
+        w32.WM_SYSKEYDOWN => if (!ctrl and passesFunctionKeys(field) and isFunctionKey(vk)) .bindings else .none,
+        else => .none,
+    };
+}
+
+/// Whether a keybinding of `set` takes the key `vk` pressed with `mods` in
+/// a `field` edit control: a Ctrl chord, matched as before without the
+/// Windows key, or in a find bar a function key without Ctrl, matched with
+/// the modifiers the terminal sees (Shift, Alt and the Windows key). Other
+/// keys are typing and never looked up.
+fn editKeyBound(field: EditField, set: *const input.Binding.Set, vk: u16, mods: input.Mods) bool {
+    if (mods.ctrl) return trigger.isBound(set, vk, .{ .ctrl = true, .shift = mods.shift, .alt = mods.alt });
+    if (!passesFunctionKeys(field) or !isFunctionKey(vk)) return false;
+    return trigger.isBound(set, vk, mods.binding());
+}
+
+/// The find bars stay open while their terminal works (switching tabs,
+/// moving the split), so a bound function key acts there as in the
+/// terminal. The palette and the tab rename are short-lived and keep them.
+fn passesFunctionKeys(field: EditField) bool {
+    return field == .search or field == .remote_search;
+}
+
+/// F1 to F24.
+fn isFunctionKey(vk: u16) bool {
+    return vk >= w32.VK_F1 and vk <= w32.VK_F24;
+}
+
 /// Where a key typed into a popup edit control goes after the popup's own
 /// keys (`routeEditKey`).
 const EditKeyRoute = enum {
@@ -872,15 +931,16 @@ const EditKeyRoute = enum {
     swallow,
 };
 
-/// Route the key `vk` pressed with `mods` in a popup edit control (tab
+/// Route the key `vk` pressed with `mods` in a `field` edit control (tab
 /// rename, command palette, find bar); `bound` tells whether a keybinding
-/// takes it (`trigger.isBound`). Keys without Ctrl and editing keys
-/// stay with the edit control (moving, selecting and deleting, the
-/// clipboard, undo and redo, also with Ctrl or Ctrl+Shift); bound Ctrl
-/// chords go to the surface's keybindings; other Ctrl chords do nothing,
-/// except Ctrl+Alt, which is AltGr typing a character.
-fn editKeyRoute(vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
-    if (!mods.ctrl) return .edit;
+/// takes it (`editKeyBound`). Keys without Ctrl and editing keys stay with
+/// the edit control (moving, selecting and deleting, the clipboard, undo
+/// and redo, also with Ctrl or Ctrl+Shift), except a bound function key in
+/// a find bar, which goes to the surface's keybindings like bound Ctrl
+/// chords; other Ctrl chords do nothing, except Ctrl+Alt, which is AltGr
+/// typing a character. An unbound key never reaches the shell.
+fn editKeyRoute(field: EditField, vk: u16, mods: input.Mods, bound: bool) EditKeyRoute {
+    if (!mods.ctrl) return if (bound and passesFunctionKeys(field) and isFunctionKey(vk)) .bubble else .edit;
     switch (vk) {
         w32.VK_LEFT,
         w32.VK_RIGHT,
@@ -4826,38 +4886,166 @@ test "editKeyRoute keeps editing keys and unbound chords out of the shell" {
     const ctrl_shift: input.Mods = .{ .ctrl = true, .shift = true };
     const altgr: input.Mods = .{ .ctrl = true, .alt = true };
 
-    // Typing, with or without Shift, and keys a binding may use without
-    // Ctrl stay with the edit control.
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute('Q', .{}, false));
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute('Q', .{ .shift = true }, false));
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_INSERT, .{ .shift = true }, true));
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_F3, .{}, true));
+    // Every edit control routes typing and Ctrl chords alike.
+    for (std.enums.values(EditField)) |field| {
+        // Typing, with or without Shift, and editing keys a binding may
+        // use without Ctrl stay with the edit control.
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, 'Q', .{}, false));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, 'Q', .{ .shift = true }, false));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_INSERT, .{ .shift = true }, true));
 
-    // Editing keys stay with the edit control even when bound
-    // (Ctrl+Shift+V pastes, Ctrl+Shift+Left selects a word).
-    for ([_]u16{ w32.VK_LEFT, w32.VK_RIGHT, w32.VK_HOME, w32.VK_END, w32.VK_BACK, w32.VK_DELETE, w32.VK_INSERT, 'A', 'C', 'V', 'X', 'Y', 'Z' }) |vk| {
-        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(vk, ctrl, true));
-        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(vk, ctrl_shift, true));
-        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(vk, ctrl_shift, false));
+        // Editing keys stay with the edit control even when bound
+        // (Ctrl+Shift+V pastes, Ctrl+Shift+Left selects a word).
+        for ([_]u16{ w32.VK_LEFT, w32.VK_RIGHT, w32.VK_HOME, w32.VK_END, w32.VK_BACK, w32.VK_DELETE, w32.VK_INSERT, 'A', 'C', 'V', 'X', 'Y', 'Z' }) |vk| {
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, vk, ctrl, true));
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, vk, ctrl_shift, true));
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, vk, ctrl_shift, false));
+        }
+        // So do keys for the input method and modifiers on their own.
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_PROCESSKEY, ctrl, false));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_CONTROL, ctrl, false));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_SHIFT, ctrl_shift, false));
+
+        // Bound chords reach the terminal's bindings.
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, 'T', ctrl_shift, true));
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_PRIOR, ctrl, true));
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_TAB, ctrl, true));
+
+        // Unbound Ctrl chords do nothing.
+        try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute(field, 'Q', ctrl, false));
+        try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute(field, 'T', ctrl_shift, false));
+        try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute(field, w32.VK_F3, ctrl, false));
+
+        // Ctrl+Alt is AltGr typing a character unless a binding takes it.
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, 'Q', altgr, false));
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, 'Q', altgr, true));
     }
-    // So do keys for the input method and modifiers on their own.
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_PROCESSKEY, ctrl, false));
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_CONTROL, ctrl, false));
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(w32.VK_SHIFT, ctrl_shift, false));
 
-    // Bound chords reach the terminal's bindings.
-    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute('T', ctrl_shift, true));
-    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(w32.VK_PRIOR, ctrl, true));
-    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(w32.VK_TAB, ctrl, true));
+    // The tab rename and the palette keep function keys, bound or not.
+    for ([_]EditField{ .rename, .palette }) |field| {
+        for ([_]input.Mods{ .{}, .{ .shift = true }, .{ .alt = true } }) |mods| {
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_F3, mods, true));
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_F9, mods, true));
+        }
+    }
+}
 
-    // Unbound Ctrl chords do nothing.
-    try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute('Q', ctrl, false));
-    try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute('T', ctrl_shift, false));
-    try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute(w32.VK_F3, ctrl, false));
+test "D10: find bars send bound function keys to the terminal and keep typing" {
+    const testing = std.testing;
+    const shift: input.Mods = .{ .shift = true };
+    const alt: input.Mods = .{ .alt = true };
+    const shift_alt: input.Mods = .{ .shift = true, .alt = true };
+    for ([_]EditField{ .search, .remote_search }) |field| {
+        // F9 bound without modifiers, with Shift, with Alt (a system key)
+        // or with both acts like in the terminal.
+        for ([_]input.Mods{ .{}, shift, alt, shift_alt }) |mods| {
+            try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F9, mods, true));
+            // Unbound, it stays in the field and never reaches the shell.
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_F9, mods, false));
+        }
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F1, .{}, true));
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F24, .{}, true));
+        // Typing edits the needle even when a binding takes the key.
+        for ([_]u16{ 'Q', '1', w32.VK_SPACE, w32.VK_BACK, w32.VK_LEFT }) |vk| {
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, vk, .{}, true));
+            try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, vk, shift, true));
+        }
+        // Ctrl chords keep their routes, AltGr included.
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F9, .{ .ctrl = true }, true));
+        try testing.expectEqual(EditKeyRoute.swallow, editKeyRoute(field, w32.VK_F9, .{ .ctrl = true }, false));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, 'Q', .{ .ctrl = true, .alt = true }, false));
+    }
+}
 
-    // Ctrl+Alt is AltGr typing a character unless a binding takes it.
-    try testing.expectEqual(EditKeyRoute.edit, editKeyRoute('Q', altgr, false));
-    try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute('Q', altgr, true));
+test "D10: find bars match function keys like the terminal and never look up typing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // Function keys map to the same physical key with every layout.
+    var set: input.Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "f9=goto_tab:2");
+    try set.parseAndPut(alloc, "shift+f9=goto_tab:1");
+    try set.parseAndPut(alloc, "alt+f10=new_tab");
+    try set.parseAndPut(alloc, "f8>t=new_tab");
+    try set.parseAndPut(alloc, "q=new_window");
+    try set.parseAndPut(alloc, "ctrl+shift+t=new_tab");
+    var empty: input.Binding.Set = .{};
+    defer empty.deinit(alloc);
+
+    const shift: input.Mods = .{ .shift = true };
+    for ([_]EditField{ .search, .remote_search }) |field| {
+        // Bound F9 and Shift+F9 go to the terminal, unbound F9 stays.
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F9, .{}, editKeyBound(field, &set, w32.VK_F9, .{})));
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F9, shift, editKeyBound(field, &set, w32.VK_F9, shift)));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_F9, .{}, editKeyBound(field, &empty, w32.VK_F9, .{})));
+        // A bound letter edits the needle.
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, 'Q', .{}, editKeyBound(field, &set, 'Q', .{})));
+
+        try testing.expect(editKeyBound(field, &set, w32.VK_F10, .{ .alt = true }));
+        // Unbound: F7, Alt+F9, and Win+F9, which the terminal sees with the
+        // Windows key.
+        try testing.expect(!editKeyBound(field, &set, w32.VK_F7, .{}));
+        try testing.expect(!editKeyBound(field, &set, w32.VK_F9, .{ .alt = true }));
+        try testing.expect(!editKeyBound(field, &set, w32.VK_F9, .{ .super = true }));
+        // A leader key only starts a sequence.
+        try testing.expect(!editKeyBound(field, &set, w32.VK_F8, .{}));
+        // Typing is never looked up without Ctrl; Ctrl chords are.
+        try testing.expect(!editKeyBound(field, &set, 'Q', .{}));
+        try testing.expect(editKeyBound(field, &set, 'T', .{ .ctrl = true, .shift = true }));
+    }
+    // The other edit controls keep function keys; their chords are unchanged.
+    for ([_]EditField{ .rename, .palette }) |field| {
+        try testing.expect(!editKeyBound(field, &set, w32.VK_F9, .{}));
+        try testing.expect(editKeyBound(field, &set, 'T', .{ .ctrl = true, .shift = true }));
+    }
+}
+
+test "D10: find bar keys come first, F3 moves through the matches although bound" {
+    const testing = std.testing;
+    var cfg = try @import("../../gx/config_layers.zig").defaultConfig(testing.allocator);
+    defer cfg.deinit();
+    // The Windows defaults bind F3 and Shift+F3 (performable
+    // navigate_search), so as function keys they would go to the terminal.
+    try testing.expect(editKeyBound(.search, &cfg.keybind.set, w32.VK_F3, .{}));
+    try testing.expect(editKeyBound(.search, &cfg.keybind.set, w32.VK_F3, .{ .shift = true }));
+    // routeEditKey offers every key press to the bar first ...
+    for ([_]EditField{ .search, .remote_search }) |field| {
+        for ([_]u16{ w32.VK_F3, w32.VK_RETURN, w32.VK_UP, w32.VK_DOWN, w32.VK_ESCAPE, w32.VK_F9 }) |vk| {
+            try testing.expectEqual(EditKeyStage.popup, editKeyStage(field, w32.WM_KEYDOWN, vk, false));
+        }
+    }
+    // ... which takes its own keys and leaves the others (a surface that is
+    // not ready performs nothing).
+    var surface: Surface = undefined;
+    surface.core_surface_ready = false;
+    surface.hwnd = null;
+    surface.search_bar = .{ .active = true };
+    for ([_]u16{ w32.VK_F3, w32.VK_RETURN, w32.VK_UP, w32.VK_DOWN }) |vk| try testing.expect(surface.search_bar.handleKey(vk));
+    try testing.expect(!surface.search_bar.handleKey(w32.VK_F9));
+    try testing.expect(!surface.search_bar.handleKey('Q'));
+    try testing.expect(surface.search_bar.handleKey(w32.VK_ESCAPE));
+    try testing.expect(!surface.search_bar.active);
+}
+
+test "D10: only find bars take system function keys, and only without Ctrl" {
+    const testing = std.testing;
+    for ([_]EditField{ .search, .remote_search }) |field| {
+        // Alt+function keys and F10 arrive as WM_SYSKEYDOWN; none of them is
+        // one of the bar's own keys, Alt+F3 included.
+        for ([_]u16{ w32.VK_F9, w32.VK_F10, w32.VK_F3, w32.VK_F4 }) |vk| {
+            try testing.expectEqual(EditKeyStage.bindings, editKeyStage(field, w32.WM_SYSKEYDOWN, vk, false));
+        }
+        // Alt+Space opens the window menu, other system keys keep their
+        // handling, and so do system keys with Ctrl.
+        try testing.expectEqual(EditKeyStage.none, editKeyStage(field, w32.WM_SYSKEYDOWN, w32.VK_SPACE, false));
+        try testing.expectEqual(EditKeyStage.none, editKeyStage(field, w32.WM_SYSKEYDOWN, 'Q', false));
+        try testing.expectEqual(EditKeyStage.none, editKeyStage(field, w32.WM_SYSKEYDOWN, w32.VK_F9, true));
+        try testing.expectEqual(EditKeyStage.none, editKeyStage(field, w32.WM_KEYUP, w32.VK_F9, false));
+    }
+    for ([_]EditField{ .rename, .palette }) |field| {
+        try testing.expectEqual(EditKeyStage.none, editKeyStage(field, w32.WM_SYSKEYDOWN, w32.VK_F9, false));
+        try testing.expectEqual(EditKeyStage.popup, editKeyStage(field, w32.WM_KEYDOWN, w32.VK_F9, false));
+    }
 }
 
 test "childExitKind follows the core's abnormal exit rule" {
