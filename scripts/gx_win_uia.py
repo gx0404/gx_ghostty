@@ -32,6 +32,9 @@ PATTERNS = {"invoke": (10000, {"invoke": 3}), "selection_item": (10010, {"select
 ELEMENT_OPERATIONS = {"set_focus": 3, "check_focus": None}
 FOCUS_EXPECTATIONS = {"expect_focus": "has_keyboard_focus", "expect_focused_element": "focused_element_same",
                       "expect_focus_event": "focus_event"}
+# UIA_SelectionItem_ElementSelectedEventId and TreeScope_Subtree (uiautomationclient.h).
+ELEMENT_SELECTED_EVENT = 20012
+TREE_SCOPE_SUBTREE = 7
 
 
 class ProbeFailure(RuntimeError):
@@ -132,6 +135,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--ready-file", type=Path, help="new private handshake file after refs/event registration are retained")
     result.add_argument("--continue-file", type=Path, help="private file created by controller after hide/destroy/submenu transition")
     result.add_argument("--query-interval-ms", type=int, default=0, help="repeat root query during event/transition wait")
+    result.add_argument("--observe-focus", action="store_true",
+                        help="record the selected process's FocusChanged events (after_ready marks those after ready-file)")
+    result.add_argument("--observe-selection", action="store_true",
+                        help="record SelectionItem ElementSelected events under the root (after_ready as above)")
     result.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return result
 
@@ -159,6 +166,8 @@ def validate_args(args) -> None:
         raise ValueError("query-interval-ms must be 0 or 10..1000")
     if any(row.get("after_signal") for row in read_plan(args.action_plan)) and not args.continue_file:
         raise ValueError("after_signal actions require continue-file")
+    if (args.observe_focus or args.observe_selection) and not (args.continue_file and args.listen_ms):
+        raise ValueError("observing events requires ready-file, continue-file and listen-ms")
 
 
 def run_worker(args) -> dict:
@@ -318,6 +327,43 @@ def run_worker(args) -> dict:
         finally:
             aut.VariantClear(C.byref(value))
 
+    element_iid = guid("d22108aa-8ac5-49a5-837b-37bbb3d7591e")
+
+    def controller_ids(element):
+        """ControllerFor (30104): the AutomationIds of the elements it names."""
+        value = Variant()
+        stage("enumerate.properties", "IUIAutomationElement.GetCurrentPropertyValue", property_id=30104)
+        check(method(element, 10, HRESULT, C.c_int, C.POINTER(Variant))(element, 30104, C.byref(value)))
+        try:
+            if value.tag != 0x200D or not value.data.pointer:
+                return []
+            array = value.data.pointer
+            lower, upper = C.c_long(), C.c_long()
+            check(aut.SafeArrayGetLBound(array, 1, C.byref(lower)))
+            check(aut.SafeArrayGetUBound(array, 1, C.byref(upper)))
+            count = upper.value - lower.value + 1
+            if count <= 0:
+                return []
+            data = pointer()
+            check(aut.SafeArrayAccessData(array, C.byref(data)))
+            try:
+                items = list(C.cast(data, C.POINTER(pointer * count)).contents)
+            finally:
+                check(aut.SafeArrayUnaccessData(array))
+            ids = []
+            for item in items:
+                target = pointer()
+                if item and method(item, 0, HRESULT, C.POINTER(GUID), C.POINTER(pointer))(item, C.byref(element_iid), C.byref(target)) >= 0 and target:
+                    try:
+                        ids.append(callback_property(target, 30011))
+                    finally:
+                        release(target)
+                else:
+                    ids.append(None)
+            return ids
+        finally:
+            aut.VariantClear(C.byref(value))
+
     class Handler(C.Structure):
         _fields_ = [("vtable", C.POINTER(pointer))]
 
@@ -332,13 +378,20 @@ def run_worker(args) -> dict:
     focus_events, focus_counts = [], {"foreign": 0, "callback_errors": 0}
     focus_handler = None
     focus_registered = False
+    selection_events, selection_counts = [], {"foreign": 0, "callback_errors": 0}
+    selection_handler = None
+    selection_registered = False
+    # Events observed after the ready file exists, i.e. after the controller
+    # may act; earlier ones are kept but marked.
+    ready_marker = [False]
     plan = read_plan(args.action_plan)
     retained = [[] for _ in plan]
     retained_ids = [[] for _ in plan]
     action_results = diagnostic["action_results"]
     owner_thread = kernel.GetCurrentThreadId()
     lifecycle = {"query_thread": owner_thread, "registration_thread": None, "removal_thread": None,
-                 "focus_registration_thread": None, "focus_removal_thread": None}
+                 "focus_registration_thread": None, "focus_removal_thread": None,
+                 "selection_registration_thread": None, "selection_removal_thread": None}
     try:
         clsid = guid(automation_clsid(args.listen_ms))
         iid = guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")
@@ -405,7 +458,7 @@ def run_worker(args) -> dict:
                 registered = True
                 lifecycle["registration_thread"] = kernel.GetCurrentThreadId()
 
-        if any(action.get("expect_focus_event") for action in plan):
+        if args.observe_focus or any(action.get("expect_focus_event") for action in plan):
             focus_iid = uuid.UUID("c270f6b5-5c69-4290-9745-7a7f97169468").bytes_le
             unknown_iid = uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le
             focus_refs = [1]
@@ -442,7 +495,9 @@ def run_worker(args) -> dict:
                     elif len(focus_events) < 64:
                         focus_events.append({"pid": args.pid, "automation_id": callback_property(sender, 30011),
                                              "name": callback_property(sender, 30005),
+                                             "control_type": callback_property(sender, 30003),
                                              "has_keyboard_focus": callback_property(sender, 30008),
+                                             "after_ready": ready_marker[0],
                                              "thread": kernel.GetCurrentThreadId()})
                 except Exception:
                     focus_counts["callback_errors"] += 1
@@ -455,6 +510,61 @@ def run_worker(args) -> dict:
             check(method(automation, 39, HRESULT, pointer, pointer)(automation, None, C.byref(focus_handler)))
             focus_registered = True
             lifecycle["focus_registration_thread"] = kernel.GetCurrentThreadId()
+
+        if args.observe_selection:
+            event_iid = uuid.UUID("146c3c17-f12e-4e22-8c27-f894b9b79c69").bytes_le
+            unknown_iid = uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le
+            selection_refs = [1]
+            SelectionQuery = C.WINFUNCTYPE(HRESULT, pointer, C.POINTER(GUID), C.POINTER(pointer))
+            SelectionRef = C.WINFUNCTYPE(W.ULONG, pointer)
+            SelectionEvent = C.WINFUNCTYPE(HRESULT, pointer, pointer, C.c_int)
+
+            @SelectionQuery
+            def selection_query(this, requested, out):
+                out[0] = None
+                if bytes(requested.contents.bytes) not in (event_iid, unknown_iid):
+                    return -2147467262
+                selection_refs[0] += 1
+                out[0] = this
+                return 0
+
+            @SelectionRef
+            def selection_add_ref(_):
+                selection_refs[0] += 1
+                return selection_refs[0]
+
+            @SelectionRef
+            def selection_release(_):
+                selection_refs[0] -= 1
+                return selection_refs[0]
+
+            @SelectionEvent
+            def element_selected(_, sender, event_id):
+                # IUIAutomationEventHandler::HandleAutomationEvent on a UIA MTA
+                # thread; the subtree is the selected HWND's, PID still checked.
+                try:
+                    if not sender or callback_property(sender, 30002) != args.pid:
+                        selection_counts["foreign"] += 1
+                    elif len(selection_events) < 64:
+                        selection_events.append({"event_id": event_id, "pid": args.pid,
+                                                 "automation_id": callback_property(sender, 30011),
+                                                 "name": callback_property(sender, 30005),
+                                                 "control_type": callback_property(sender, 30003),
+                                                 "selected": callback_property(sender, 30079),
+                                                 "after_ready": ready_marker[0],
+                                                 "thread": kernel.GetCurrentThreadId()})
+                except Exception:
+                    selection_counts["callback_errors"] += 1
+                return 0
+
+            selection_table = (pointer * 4)(*[C.cast(fn, pointer) for fn in (selection_query, selection_add_ref, selection_release, element_selected)])
+            selection_handler = Handler(selection_table)
+            _CALLBACK_ANCHORS.append((selection_handler, selection_table, selection_query, selection_add_ref, selection_release, element_selected))
+            stage("selection.register", "IUIAutomation.AddAutomationEventHandler(ElementSelected)")
+            check(method(automation, 32, HRESULT, C.c_int, pointer, C.c_int, pointer, pointer)(
+                automation, ELEMENT_SELECTED_EVENT, root, TREE_SCOPE_SUBTREE, None, C.byref(selection_handler)))
+            selection_registered = True
+            lifecycle["selection_registration_thread"] = kernel.GetCurrentThreadId()
 
         # Retain a separate root reference because the root is also retained for
         # event registration/removal, which occur on this same MTA thread.
@@ -476,6 +586,9 @@ def run_worker(args) -> dict:
                               "focused": property_value(element, 30008),
                               "focusable": property_value(element, 30009),
                               "value": property_value(element, 30045),
+                              "localized_type": property_value(element, 30004),
+                              "native_window_handle": property_value(element, 30020),
+                              "controller_for": controller_ids(element),
                               "toggle_state": property_value(element, 30086),
                               "expand_state": property_value(element, 30070),
                               "selected": property_value(element, 30079),
@@ -627,8 +740,10 @@ def run_worker(args) -> dict:
         if args.ready_file:
             with args.ready_file.open("x", encoding="utf-8") as stream:
                 json.dump({"pid": args.pid, "birth": args.birth, "hwnd": args.hwnd,
-                           "registered": registered, "focus_registered": focus_registered, "retained_actions": len(plan), "thread": owner_thread,
+                           "registered": registered, "focus_registered": focus_registered,
+                           "selection_registered": selection_registered, "retained_actions": len(plan), "thread": owner_thread,
                            "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr}, stream)
+            ready_marker[0] = True
         deadline = time.monotonic() + args.listen_ms / 1000
         queries = 0
         unavailable_queries = 0
@@ -663,6 +778,8 @@ def run_worker(args) -> dict:
         if args.continue_file:
             if not args.continue_file.exists():
                 raise RuntimeError("controller transition signal timed out")
+            if args.observe_focus or args.observe_selection:
+                time.sleep(0.3)  # Events raised just before the signal still arrive.
             execute_actions(True)
         # Invoke may legitimately destroy its own HWND. The retained native
         # process identity still must match; never follow a replacement window.
@@ -677,6 +794,8 @@ def run_worker(args) -> dict:
                 "actions": action_results, "queries_during_wait": queries, "unavailable_queries": unavailable_queries,
                 "focus_handler_registered": focus_handler is not None, "focus_events": focus_events,
                 "foreign_focus_events": focus_counts["foreign"], "focus_callback_errors": focus_counts["callback_errors"],
+                "selection_handler_registered": selection_handler is not None, "selection_events": selection_events,
+                "foreign_selection_events": selection_counts["foreign"], "selection_callback_errors": selection_counts["callback_errors"],
                 "threads": lifecycle}
     except Exception as error:
         if isinstance(error, ProbeFailure):
@@ -692,6 +811,13 @@ def run_worker(args) -> dict:
             registered = False
             if hr < 0:
                 cleanup_error = f"UIA event unsubscription failed: 0x{hr & 0xffffffff:08x}"
+        if selection_registered:
+            hr = method(automation, 33, HRESULT, C.c_int, pointer, pointer)(automation, ELEMENT_SELECTED_EVENT, root, C.byref(selection_handler))
+            lifecycle["selection_removal_thread"] = kernel.GetCurrentThreadId()
+            selection_registered = False
+            if hr < 0:
+                failure = f"UIA selection event unsubscription failed: 0x{hr & 0xffffffff:08x}"
+                cleanup_error = f"{cleanup_error}; {failure}" if cleanup_error else failure
         if focus_registered:
             hr = method(automation, 40, HRESULT, pointer)(automation, C.byref(focus_handler))
             lifecycle["focus_removal_thread"] = kernel.GetCurrentThreadId()

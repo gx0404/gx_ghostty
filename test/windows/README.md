@@ -104,6 +104,13 @@ FocusChanged 事件）；期望在 3 s 内轮询成立，否则 FAIL 并保留 `
 （`expect_focus/expect_focused_element/expect_focus_event`）→ OK `check_focus`
 `expect_focus:false` → 复选框 Toggle，证明焦点移动后旧元素仍可用。
 
+事件观察（UIA-06）：`--observe-focus` 注册 FocusChanged、`--observe-selection` 在根子树
+注册 ElementSelected（IUIAutomation 槽 32/33，TreeScope_Subtree），须同时给
+`--ready-file --continue-file --listen-ms`；controller 在 ready 之后按键、等约 1 s 再写
+continue，worker 再等 0.3 s 收尾。事件都只记目标 PID 的发送者，`after_ready` 标出 ready
+之后到达的；注册、移除与查询同线程。节点另记 `localized_type`、`native_window_handle` 与
+`controller_for`（ControllerFor 所指元素的 AutomationId）。
+
 ### VM broker 命令与预期
 
 沿用本目录 `gx_drop_broker_fixture.py` 顶部的 setup/target/drop/inspect 流程，所有参数

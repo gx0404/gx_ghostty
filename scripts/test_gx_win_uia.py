@@ -101,6 +101,25 @@ class UiaProbeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 probe.validate_args(probe.parser().parse_args(args))
 
+    def test_event_observation_needs_a_bounded_window_after_ready(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ready, proceed = Path(folder) / 'ready', Path(folder) / 'continue'
+            window = ('--ready-file', str(ready), '--continue-file', str(proceed), '--listen-ms', '5000')
+            for flag in ('--observe-focus', '--observe-selection'):
+                with self.subTest(flag=flag):
+                    probe.validate_args(probe.parser().parse_args(self.args(flag, *window)))
+                    for missing in (window[:2], window[2:]):
+                        with self.assertRaises(ValueError):
+                            probe.validate_args(probe.parser().parse_args(self.args(flag, *missing)))
+
+    def test_selection_events_use_the_sdk_event_scope_and_slots(self):
+        # UIA_SelectionItem_ElementSelectedEventId, TreeScope_Subtree; IUIAutomationVtbl
+        # slots 32/33 are AddAutomationEventHandler/RemoveAutomationEventHandler.
+        self.assertEqual((20012, 7), (probe.ELEMENT_SELECTED_EVENT, probe.TREE_SCOPE_SUBTREE))
+        source = Path(probe.__file__).read_text(encoding='utf-8')
+        self.assertIn('method(automation, 32, HRESULT, C.c_int, pointer, C.c_int, pointer, pointer)', source)
+        self.assertIn('method(automation, 33, HRESULT, C.c_int, pointer, pointer)', source)
+
     def test_all_required_patterns_have_client_operations(self):
         self.assertEqual({'invoke', 'selection_item', 'value', 'toggle', 'expand_collapse'}, set(probe.PATTERNS))
         self.assertEqual((10005, {'expand': 3, 'collapse': 4}), probe.PATTERNS['expand_collapse'])
