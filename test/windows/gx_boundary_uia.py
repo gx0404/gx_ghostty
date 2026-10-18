@@ -215,8 +215,8 @@ def stress(fixture, instance, native):
     try:
         worker.await_ready()
         for _ in range(6):
-            instance.press("ctrl+alt+h")
-            instance.press("ctrl+alt+l")
+            instance.press("ctrl+alt+shift+k")
+            instance.press("ctrl+alt+shift+j")
         try:
             fixture.check("IME-composition-during-MTA-query", **compose_ime(fixture, instance, native))
         except EnvironmentUnavailable as error:

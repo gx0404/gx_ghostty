@@ -97,9 +97,11 @@ class LayoutAndGestureTests(unittest.TestCase):
         return source, target
 
     @staticmethod
-    def drop(delta, moved=(600, -27), pointer=(600, -27)):
+    def drop(delta, moved=(600, -27), pointer=(600, -27), outcome=None, hwnd=22):
+        outcome = outcome or ('full' if delta.get('full_refusals') else 'local')
         return {'delta': delta, 'loop_rect': (0, 0, 10, 10), 'moving_rect': (moved[0], moved[1], 10, 10),
-                'loop_cursor': (0, 0), 'release_cursor': pointer}
+                'loop_cursor': (0, 0), 'release_cursor': pointer, 'hit_before_release': None,
+                'product_trace': [{'outcome': outcome, 'hwnd': hwnd, 'pid': 42, 'class': 'GhosttyWindow'}]}
 
     def test_side_by_side_windows_stay_inside_the_primary_work_area(self):
         area = (0, 0, 2560, 1392)
@@ -108,6 +110,9 @@ class LayoutAndGestureTests(unittest.TestCase):
         for x, y, w, h in slots:
             self.assertTrue(controller.contains(area, (x, y, x + w, y + h)))
         self.assertLess(slots[1][0] + slots[1][2], 2560)
+        # Vertically centred: never near the top edge where Snap Layouts appears.
+        self.assertEqual((1392 - 780) // 2, slots[0][1])
+        self.assertEqual((2088 - 780) // 2, controller.side_by_side((0, 0, 3840, 2088))[0][1])
         with self.assertRaises(controller.EnvironmentUnavailable):
             controller.side_by_side((0, 0, 1000, 600))
 
@@ -121,13 +126,26 @@ class LayoutAndGestureTests(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, 'full-target refusal'):
                 fixture.full_target(mock.Mock(), source, target, tree())
 
+    def test_full_target_requires_the_product_to_name_the_full_target(self):
+        # Round-3 host run: drops+1 while Windows' Snap Layouts bar owned the
+        # point. Even matching counters cannot pass without the product trace.
+        fixture = self.fixture()
+        for trace in ({'outcome': 'foreign', 'hwnd': 77}, {'outcome': 'full', 'hwnd': 99}):
+            source, target = self.natives()
+            refused = self.drop({'drops': 1, 'full_refusals': 1, 'merges': 0}, outcome=trace['outcome'], hwnd=trace['hwnd'])
+            fixture.cross_window_drop = mock.Mock(return_value=refused)
+            instance = mock.Mock(pid=42)
+            with self.subTest(trace=trace), mock.patch.object(controller.gui, 'win32'), \
+                    self.assertRaisesRegex(AssertionError, 'full-target refusal'):
+                fixture.full_target(instance, source, target, tree())
+
     def test_full_target_requires_the_window_to_follow_the_native_move_loop(self):
         fixture = self.fixture()
         source, target = self.natives()
         refused = self.drop({'drops': 1, 'full_refusals': 1, 'merges': 0}, moved=(0, 0))
         fixture.cross_window_drop = mock.Mock(return_value=refused)
         with mock.patch.object(controller.gui, 'win32'), self.assertRaisesRegex(AssertionError, 'follow the pointer'):
-            fixture.full_target(mock.Mock(), source, target, tree())
+            fixture.full_target(mock.Mock(pid=42), source, target, tree())
 
     def test_full_target_requires_a_merging_positive_control(self):
         fixture = self.fixture()
@@ -141,7 +159,7 @@ class LayoutAndGestureTests(unittest.TestCase):
         with mock.patch.object(controller.gui, 'win32') as api, mock.patch.object(controller.time, 'sleep'), \
                 self.assertRaisesRegex(AssertionError, 'control drop did not merge'):
             api.return_value.IsWindow.return_value = True
-            fixture.full_target(mock.Mock(), source, target, tree())
+            fixture.full_target(mock.Mock(pid=42), source, target, tree())
         target.control.assert_called_once_with(8)
 
     def test_settled_reads_twice_after_the_input_queue_had_time(self):
@@ -183,6 +201,34 @@ class LayoutAndGestureTests(unittest.TestCase):
                 mock.patch.object(controller, 'thread_state', return_value={'move_size': 0, 'capture': 12}):
             fixture.release(instance, (11,))
         api.send.assert_called_once()
+
+
+class HotkeyProbeTests(unittest.TestCase):
+    def test_chords_held_by_another_program_are_reported_not_pressed(self):
+        user = mock.Mock()
+        registered = []
+        def register(hwnd, ident, mods, vk):
+            if vk == ord('L'):
+                return 0
+            registered.append(ident)
+            return 1
+        user.RegisterHotKey.side_effect = register
+        with mock.patch.object(controller.ctypes, 'WinDLL', return_value=user), \
+                mock.patch.object(controller.ctypes, 'get_last_error', return_value=1409):
+            held = controller.held_global_hotkeys(('ctrl+alt+r', 'ctrl+alt+l'))
+        self.assertEqual(['ctrl+alt+l'], held)
+        # Every successful probe is released at once.
+        self.assertEqual([mock.call(None, ident) for ident in registered], user.UnregisterHotKey.call_args_list)
+        self.assertEqual(0x2 | 0x1 | 0x4000, user.RegisterHotKey.call_args_list[0].args[2])
+        self.assertNotIn('ctrl+alt+l', controller.FIXTURE_CHORDS)
+
+    def test_product_trace_lines_are_parsed_exactly(self):
+        instance = mock.Mock()
+        instance.log_text.return_value = ('09:12:25.000 [1] info(win32): fixture_transfer_target outcome=full hwnd=0x360042 pid=50284 class=GhosttyWindow\n'
+                                          '09:12:26.000 [1] info(win32): fixture_transfer_target outcome=foreign hwnd=0x1a2b pid=7 class=Shell_TrayWnd\n')
+        self.assertEqual([{'outcome': 'full', 'hwnd': 0x360042, 'pid': 50284, 'class': 'GhosttyWindow'},
+                          {'outcome': 'foreign', 'hwnd': 0x1a2b, 'pid': 7, 'class': 'Shell_TrayWnd'}],
+                         controller.target_traces(instance))
 
 
 class InputLanguageTests(unittest.TestCase):

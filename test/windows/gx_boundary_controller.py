@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -61,14 +62,74 @@ def primary_work_area():
 
 
 def side_by_side(area, width=1200, height=780, margin=24):
-    """Two equal fixture windows, both fully inside the primary work area."""
+    """Two equal fixture windows, both fully inside the primary work area.
+
+    Vertically centred: a caption drag near the top edge makes Windows 11
+    show its Snap Layouts bar, a foreign top-level window that would own the
+    drop point (observed in round3-batch-20261018-091219, drop at y=156)."""
     left, top, right, bottom = area
     w = min(width, (right - left - 3 * margin) // 2)
     h = min(height, bottom - top - 2 * margin)
     if w < 640 or h < 420:
         raise EnvironmentUnavailable(f"primary work area {area} cannot hold two visible fixture windows")
-    y = top + min(120, max(margin, bottom - top - h - margin))
+    y = top + (bottom - top - h) // 2
     return [(left + margin, y, w, h), (left + 2 * margin + w, y, w, h)]
+
+
+# Every chord a boundary controller injects. Stage bindings avoid Ctrl+Alt+L/H:
+# on the r3 host another program holds Ctrl+Alt+L as a global hotkey, so an
+# injected press would act in that program instead of the owned app.
+FIXTURE_CHORDS = ("ctrl+alt+r", "ctrl+alt+shift+j", "ctrl+alt+shift+k", "ctrl+alt+b",
+                  "ctrl+shift+f", "ctrl+shift+p", "ctrl+shift+m", "ctrl+shift+t", "ctrl+shift+w")
+
+
+def held_global_hotkeys(chords):
+    """Chords another program holds as global hotkeys, by the product's own
+    probe (shortcut_conflicts.zig): RegisterHotKey then UnregisterHotKey at
+    once; ERROR_HOTKEY_ALREADY_REGISTERED means Windows would route the press
+    to that program."""
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    user.RegisterHotKey.restype = ctypes.c_int
+    user.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    flags = {0x11: 0x2, 0x12: 0x1, 0x10: 0x4, 0x5B: 0x8}  # MOD_CONTROL/ALT/SHIFT/WIN
+    held = []
+    for index, chord in enumerate(chords):
+        mods, vk = gui.parse_chord(chord)
+        ident = 0xA300 + index
+        if user.RegisterHotKey(None, ident, sum(flags[mod] for mod in mods) | 0x4000, vk):  # MOD_NOREPEAT
+            user.UnregisterHotKey(None, ident)
+        elif ctypes.get_last_error() == 1409:  # ERROR_HOTKEY_ALREADY_REGISTERED
+            held.append(chord)
+        else:
+            raise EnvironmentUnavailable(f"RegisterHotKey probe failed for {chord}: {ctypes.get_last_error()}")
+    return held
+
+
+TARGET_TRACE = re.compile(r"fixture_transfer_target outcome=(\w+) hwnd=0x([0-9a-f]+) pid=(\d+) class=(\S*)")
+
+
+def target_traces(instance):
+    """The product's gated record of the window that decided each real drop."""
+    return [{"outcome": outcome, "hwnd": int(hwnd, 16), "pid": int(pid), "class": cls}
+            for outcome, hwnd, pid, cls in TARGET_TRACE.findall(instance.log_text())]
+
+
+def zorder_hit(point, skip):
+    """Fixture mirror of TabTransfer.targetAt's hit test (first visible,
+    uncloaked, non-minimized top-level window containing the point)."""
+    api = gui.win32()
+    user = ctypes.WinDLL("user32")
+    user.GetTopWindow.argtypes = [ctypes.c_void_p]
+    user.GetTopWindow.restype = ctypes.c_void_p
+    hwnd = user.GetTopWindow(None) or 0
+    while hwnd:
+        if hwnd != skip and api.IsWindowVisible(hwnd) and not api.IsIconic(hwnd) and not api.cloaked(hwnd):
+            left, top, right, bottom = api.raw_window_rect(hwnd)
+            if left <= point[0] < right and top <= point[1] < bottom:
+                return {"hwnd": hwnd, "class": api.class_name(hwnd), "pid": api.window_pid(hwnd)}
+        hwnd = api.GetWindow(hwnd, 2) or 0  # GW_HWNDNEXT
+    return None
 
 
 def inside(rect, point):
@@ -361,8 +422,12 @@ class BoundaryFixture(SessionFixture):
     def stage(self, *, full=False, one_source=False, remote=False):
         path = self.environment("profile", "language = en\nconfirm-close-surface = false\ngx-single-instance = false\n"
                                 "gx-session-restore = true\ncommand = cmd.exe /d /k prompt $G$S\n"
-                                "keybind = ctrl+alt+r=new_split:right\nkeybind = ctrl+alt+l=goto_split:left\n"
-                                "keybind = ctrl+alt+h=goto_split:right\nkeybind = ctrl+alt+b=scroll_to_bottom\n")
+                                "keybind = ctrl+alt+r=new_split:right\nkeybind = ctrl+alt+shift+j=goto_split:left\n"
+                                "keybind = ctrl+alt+shift+k=goto_split:right\nkeybind = ctrl+alt+b=scroll_to_bottom\n")
+        held = held_global_hotkeys(FIXTURE_CHORDS)
+        self.check("fixture-chords-not-held-by-other-programs", chords=FIXTURE_CHORDS, held=held)
+        if held:
+            raise EnvironmentUnavailable(f"another program holds fixture chords as global hotkeys: {held}")
         seed = complex_document(path)
         if one_source:
             seed["windows"][0]["tabs"] = seed["windows"][0]["tabs"][:1]
@@ -582,6 +647,7 @@ class BoundaryFixture(SessionFixture):
             raise AssertionError(f"{label}: gesture endpoints are not on the visible owned tab bars: {roots}")
         counters = lambda: tuple(target.query(field) for field in (107, 108, 109))
         before = counters()
+        traced = len(target_traces(instance))
         record = {"label": label, "start": start, "detach": detach, "end": end, "target_tab": tab,
                   "target_tabs": target.query(4), "source_rect_before": api.raw_window_rect(source.hwnd),
                   "counters_before": before}
@@ -603,9 +669,11 @@ class BoundaryFixture(SessionFixture):
                 time.sleep(0.03)
             record["release_cursor"] = poll_cursor(end, 1.0)
             record["moving_rect"] = stable_rect(source.hwnd)
+            record["hit_before_release"] = zorder_hit(end, source.hwnd)
         finally:
             self.release(instance, (source.hwnd, target.hwnd))
         wait(lambda: counters()[0] == before[0] + 1, 10)
+        record["product_trace"] = wait(lambda: target_traces(instance)[traced:] or None, 5)
         time.sleep(SETTLE_S)
         after = counters()
         record.update(counters_after=after, move_loop_after=thread_state(target.hwnd)["move_size"],
@@ -618,8 +686,10 @@ class BoundaryFixture(SessionFixture):
             raise AssertionError("MIG-04 needs a restored 64-tab target and a single-tab source")
         refused = self.cross_window_drop(instance, source, target, "full-64")
         self.check("full-target-drop", **refused)
-        if refused["delta"] != {"drops": 1, "full_refusals": 1, "merges": 0}:
-            raise AssertionError(f"the real drop did not reach the full-target refusal: {refused['delta']}")
+        decided = [{"outcome": "full", "hwnd": target.hwnd, "pid": instance.pid, "class": gui.WINDOW_CLASS}]
+        if refused["delta"] != {"drops": 1, "full_refusals": 1, "merges": 0} or refused["product_trace"] != decided:
+            raise AssertionError(f"the real drop did not reach the full-target refusal: {refused['delta']}, "
+                                 f"decided by {refused['product_trace']}, z-order hit {refused['hit_before_release']}")
         moved = [refused["moving_rect"][axis] - refused["loop_rect"][axis] for axis in (0, 1)]
         pointer = [refused["release_cursor"][axis] - refused["loop_cursor"][axis] for axis in (0, 1)]
         if abs(pointer[0]) < 100 or max(abs(moved[axis] - pointer[axis]) for axis in (0, 1)) > 3:
@@ -640,8 +710,10 @@ class BoundaryFixture(SessionFixture):
         source_hwnd = source.hwnd
         merged = self.cross_window_drop(instance, source, target, "control-63")
         self.check("control-target-drop", **merged)
-        if merged["delta"] != {"drops": 1, "full_refusals": 0, "merges": 1}:
-            raise AssertionError(f"the control drop did not merge: {merged['delta']}")
+        decided = [{"outcome": "local", "hwnd": target.hwnd, "pid": instance.pid, "class": gui.WINDOW_CLASS}]
+        if merged["delta"] != {"drops": 1, "full_refusals": 0, "merges": 1} or merged["product_trace"] != decided:
+            raise AssertionError(f"the control drop did not merge: {merged['delta']}, decided by {merged['product_trace']}, "
+                                 f"z-order hit {merged['hit_before_release']}")
         wait(lambda: not api.IsWindow(source_hwnd), 10)
         if target.query(4) != 64:
             raise AssertionError("merged control drop did not fill the target to 64")
