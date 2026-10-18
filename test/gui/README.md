@@ -11,10 +11,12 @@
 
 Windows：先 `just build`。看性能或发布形态时，改用 ReleaseFast 构建，再用 `--exe` 指过去。
 
+A2 的 W02、W03、W08、W13、W20 在隔离配置中绑定 `f12=start_search`，以 F12 打开查找栏，避免输入法截获组合键；F9 留给标签导航等场景动作。合入 findkeys 分支后，W20 新增的重新聚焦步骤与 W24 也须由该分支统一使用 F12。
+
 ```sh
 just win-gui list                                   # id、标题、前置条件与副作用
 just win-gui run --out .local/evidence/<任务>/shots W01 W03
-just win-gui run --exe <ghostty.exe> --retries 1 --out <目录>
+just win-gui run --exe <ghostty.exe> --retries 0 --out <新目录>
 ```
 
 GTK：先把工作树同步进 WSL 克隆并构建：`just wsl sync --dirty`，然后 `just wsl build --gtk`。
@@ -24,7 +26,7 @@ just wsl scenario --out .local/evidence/<任务>/gtk          # 全部 G 场景
 just wsl scenario --out <目录> G02 G05
 ```
 
-运行器的退出码是 0 表示所有场景都 OK。这只说明步骤执行完了、断言通过了，读图仍然要逐张做。打开 `notes.txt` 对照其中的 `expect` 一条条看。
+退出码 0 只说明步骤/断言通过或声明前置被跳过，读图仍要逐张做。Windows 另以 1 表示场景失败、2 表示用法错误、3 表示缺键盘布局等前置（BLOCKED，台账为 PENDING）；不能将跳过和 BLOCKED 当成验收 PASS。打开 `notes.txt` 对照 `expect` 逐条看。
 
 ## 编号与覆盖
 
@@ -40,21 +42,21 @@ just wsl scenario --out <目录> G02 G05
 - `harness`：默认 true，会在配置末尾追加 `confirm-close-surface = false`，关窗时就不会弹确认。
 - `env`：环境变量表。运行器启动 Ghostty 时会去掉调用方的 `NO_COLOR`、`TERM*`、`GHOSTTY_*`，需要的变量（如 `GHOSTTY_GX_OPENGL = "software"`）在这里写。
 - `args`：额外的命令行参数。
-- `requires`：前置条件，取值为 `wsl:<发行版>`、`file:<路径>` 或 `windows-build:<号>`。不满足的场景记 SKIPPED。
+- `requires`：前置条件，取值为 `wsl:<发行版>`、`file:<路径>` 或 `windows-build:<号>`。不满足的场景记 SKIPPED。`file:` 的路径展开环境变量，花括号语法与下文 `wait_file` 相同（字面花括号写 `{{`、`}}`），但不能用 `{log}`、`{env}`：前置条件在运行前检查，那时本场景的隔离目录还不存在。
 - `side_effects`：写明场景会影响桌面之外的东西（如打开默认浏览器）。这类场景只有加 `--allow-side-effects` 才会运行。
 - `expect`：截图必须显示的内容，写成「截图名: 内容」。
 - `[[step]]`：按顺序执行的步骤。
 
 步骤由 `action` 选定，参数表以 `scripts/gx_win_gui.py::ACTIONS` 为准：
 
-- 等待与断言：`wait_window`、`wait_terminals`、`wait_popup`、`wait_title`、`assert_title`、`wait_log`、`assert_log`、`wait_file`、`assert_responsive`、`pixel`。`wait_popup` 的 `cls` 按类名前缀匹配；`new = true` 时，只认最近一次输入之后才出现的弹层。`wait_file` 等一个文件的全文匹配正则，例如终端里的程序写出的结果，WSL 里的文件可以用 `\\wsl.localhost\<发行版>\…` 路径读。注意 shell 默认是规范模式：不按回车，`cat` 收不到输入，屏幕上看到的 `^[[O` 之类只是行规程的回显；要让程序直接拿到输入，先执行 `stty -icanon -echo`。
+- 等待与断言：`wait_window`、`wait_terminals`、`wait_popup`、`wait_title`、`assert_title`、`wait_log`、`assert_log`、`wait_file`、`assert_responsive`、`pixel`。`wait_popup` 的 `cls` 按类名前缀匹配；`new = true` 时，只认最近一次输入之后才出现的弹层。`wait_file` 等一个文件的全文匹配正则，例如终端里的程序写出的结果，WSL 里的文件可以用 `\\wsl.localhost\<发行版>\…` 路径读。`wait_file` 的 `path` 可以用占位符：`{log}` 是本场景实例的 `ghostty.log` 的绝对路径（`<env>/ghostty/logs/ghostty.log`），`{env}` 是本场景的隔离目录；字面花括号写 `{{`、`}}`。先替换占位符，值原样插入，再展开其余部分的环境变量（`%NAME%`、`$NAME`、`${NAME}`）。未知占位符或不成对的花括号在加载场景时就报错，不会当成字面路径。注意 shell 默认是规范模式：不按回车，`cat` 收不到输入，屏幕上看到的 `^[[O` 之类只是行规程的回显；要让程序直接拿到输入，先执行 `stty -icanon -echo`。
 - 输入：`type`（KEYEVENTF_UNICODE 逐字输入，`\n` 是回车）、`key`（带扫描码的真实虚拟键，如 `ctrl+shift+t`）、`click`、`mouse_down`、`mouse_up`、`move`、`drag`、`drag_divider`、`wheel`、`clipboard`。
-- 钩子：`dpi`（`WM_GHOSTTY_SIMULATE_DPI`）、`gpu_reset`、`cancel_mode`、`ime_off`、`resize`、`activate`、`close`、`file`（写一个文件）、`sleep`。
+- 钩子：`dpi`（`WM_GHOSTTY_SIMULATE_DPI`）、`gpu_reset`、`cancel_mode`、`ime_off`、`layout`、`resize`、`activate`、`close`、`restart`、`file`（隔离文件及只读目录）、`sleep`；模拟主题、遮挡、D2D 等动作及参数以 `ACTIONS` 为准。布局加载只在明确标记的验证 VM 内允许，宿主缺布局返回 BLOCKED。
 - 截图：`capture`。`what` 可取 `window`（默认）、`quick`、`popups`、`all`（主窗加每个弹层）。`method` 可取 `screen`（默认，窗口被别的程序挡住时失败）或 `print`（PrintWindow）。
 
 坐标都是 DIP，相对于锚点：`in = "client"`（默认）、`"window"` 或 `"terminal:N"`（第 N 个可见终端，按先上后下、先左后右排序）。运行器按窗口 DPI（或 `dpi` 步骤模拟的 DPI）换算成物理像素。负数从右下角往回算，也可以写百分比（如 `"25%"`）。
 
-每次发输入之前，运行器都会确认前台窗口属于这个实例；发鼠标事件之前，还要确认指针下的窗口也属于它。条件不满足就不发送，并让这一步失败。运行器从不把输入打到别的程序。宿主程序偶尔会抢走前台，这时加 `--retries 1` 让失败的场景重跑一次。
+每次发输入之前，运行器确认前台窗口属于实例；发鼠标事件之前还确认指针下窗口的归属。不满足就停止该步，并补发已经按下的自有按钮松开。第 6 阶段固定 `--retries 0`，保留抢焦点等失败原件，下一次满足空闲条件时另建目录，不覆盖旧件。截图默认在窗口后加黑色隐私遮罩；需要背景时显式给原因，遮罩覆盖范围与清理结果写入 `run.json`。
 
 ## GTK 场景格式
 
@@ -70,5 +72,5 @@ Xvfb 里没有窗口管理器，脚本要先 `mousemove 400 300` 再 `click 1` �
 - shell 用固定提示符，截图与像素断言才稳定：Windows 写 `command = cmd.exe /d /k prompt $G$S`，GTK 写 `command = /bin/bash --noprofile --norc`。
 - 弹层（菜单、面板、设置、对话框）是独立的顶层窗口。按键之后先 `wait_popup`（`new = true`）等它出现，再截图，并在截图里用 `what = "all"` 把弹层一起截下来。
 - 模态对话框会让主窗失去输入能力。运行器激活主窗时，实际激活的是它的 `GW_ENABLEDPOPUP`，所以测试顺序不会让对话框丢掉键盘焦点。
-- 微软拼音会把 Ctrl+Shift+F 当作简繁切换吞掉，打开查找栏之前先 `ime_off`。
+- 微软拼音会吞掉 Ctrl+Shift+F；在隔离配置里将 `start_search` 绑到 F12，避免与标签导航的 F9 冲突，不为场景改变宿主布局。
 - 连续粘贴时，每次粘贴后等约 0.4 s，让剪贴板读取完成。

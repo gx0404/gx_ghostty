@@ -94,6 +94,6 @@ ID 只在同一 HWND 内唯一。窗口私有消息与测试钩子用 `WM_USER +
 - 构建：`just build`（Windows 主机自动补 `-Dtarget=x86_64-windows-gnu`，默认 `-Dapp-runtime=win32`）产出 `zig-out/bin/ghostty.exe`；发布形态 `just package-windows`。
 - 单测：`just test --filter apprt.win32`，共享核心 `just test --filter gx.`（条数以运行器输出为准，零命中不算通过）。带测试的文件须在 `src/apprt/win32.zig` 的 `test` 块显式引用，否则会悄悄漏收（`python scripts/run_unittests.py test_gx_test_roots` 守门）。
 - GUI 证据，GUI 可见改动必做：`just win-gui run --out <证据目录> [W01 …]` 回放 `test/gui/win32/W*.toml`（隔离、输入守门与单步子命令见 `docs/TESTING.md`）；步骤通过只说明断言成立，逐张读图核对后才记 PASS。改用其他截图方式时同样隔离并去掉 `NO_COLOR`。
-- 已知坑：隔离后探测不到只装在真实 `%LOCALAPPDATA%\Programs` 下的 GX Zsh；微软拼音吞掉 Ctrl+Shift+F（先 `just win-gui ime-off <目录>`）；GUI 子系统的 exe 没有控制台，`+version` 等输出要重定向。
+- 已知坑：隔离后探测不到只装在真实 `%LOCALAPPDATA%\Programs` 下的 GX Zsh；微软拼音吞掉 Ctrl+Shift+F（场景把查找绑到 F 键）；GUI 子系统的 exe 没有控制台，`+version` 等输出要重定向。
 - CI：`gx-ci` 的 `windows-app` job（`ci-release.md`）；`win_smoke` 的截图读回前记 PENDING。
 - 改 Zig 跑 `just fmt-check`；改了 `pub` 签名或 `//!` 文档跑 `just kb`。

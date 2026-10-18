@@ -56,7 +56,7 @@
 
 可以记 PASS 的证据：在真实桌面会话里截下、已经读过、能看出预期状态的截图，加上对应的日志行。不能记 PASS 的：只确认进程在运行或窗口存在；截图全黑、全白或截到了别的窗口；截了但没读；只读日志没看界面。
 
-已知的坑：微软拼音把 Ctrl+Shift+F 当作简繁切换吞掉，自动化测试查找栏前先切到英文键盘布局，或从命令面板打开查找；GUI 子系统的 exe 没有控制台（见下文「Windows 本机限制」）；复现 CI 的软件渲染设 `GHOSTTY_GX_OPENGL=software`，并把 Mesa 的 DLL 放进 exe 旁的 `mesa\`。
+已知的坑：微软拼音把 Ctrl+Shift+F 当作简繁切换吞掉，场景在隔离配置里将 `start_search` 绑定到 F12，或从命令面板打开查找。宿主不加载新键盘布局；`ime-off`/`layout` 找不到所需已安装布局时返回 3，记录环境 PENDING。只有验证 VM 内并明确设置 `GX_WIN_GUI_VM=1` 后，才允许 `layout --allow-load` 或场景的 `--allow-load-layouts`。GUI 子系统的 exe 没有控制台（见下文「Windows 本机限制」）；复现 CI 的软件渲染设 `GHOSTTY_GX_OPENGL=software`，并把 Mesa 的 DLL 放进 exe 旁的 `mesa\`。
 
 难在本机复现的路径有测试钩子：向顶层窗口 `SendMessage` `src/apprt/win32/Window.zig::WM_GHOSTTY_SIMULATE_DPI`（`wParam` 为 DPI）走一遍 `WM_DPICHANGED` 的处理，向终端子窗口发 `src/apprt/win32/Surface.zig::WM_GHOSTTY_SIMULATE_GPU_RESET` 让渲染器把下一帧当作 GPU 重置处理。钩子只证明这两条代码路径，不代证真实的多显示器与驱动重置。软件渲染路径用 `GHOSTTY_GX_OPENGL=software` 加 exe 旁的 `mesa\` 验证（`gx-ci` 的 `win_smoke` 也是这样做的）。
 
@@ -64,11 +64,11 @@
 
 `scripts/gx_win_gui.py` 只用标准库与 ctypes，把上面的隔离、输入、截图与取证做成命令：
 
-- **场景**：`test/gui/win32/W*.toml`，格式见 `test/gui/README.md`。`just win-gui run --out <目录> [W01 …]` 逐个场景用全新的隔离配置启动、执行步骤、截图，在 `<目录>/<id>/` 写截图、`run.json`（每步的耗时与结果，以及 `startup_ms`）、日志副本与 `notes.txt`（每张图必须显示什么）。缺前置（WSL 发行版、Windows 版本）的场景记 SKIPPED；有副作用的场景（W06 会打开默认浏览器）只在加 `--allow-side-effects` 时运行；`--retries N` 重跑失败的场景。退出码 0 只说明步骤与断言通过，图仍要逐张读。
+- **场景**：`test/gui/win32/W*.toml`，格式见 `test/gui/README.md`。`just win-gui run --out <目录> [W01 …]` 逐个场景用全新的隔离配置启动、执行步骤、截图，在 `<目录>/<id>/` 写截图、`run.json`（每步的耗时与结果，以及 `startup_ms`）、日志副本与 `notes.txt`（每张图必须显示什么）。缺声明前置（WSL 发行版、Windows 版本）的场景记 SKIPPED；缺布局等运行前置记 BLOCKED（台账写 PENDING）。有副作用的 W06 只在加 `--allow-side-effects` 时运行。第 6 阶段统一 `--retries 0`，失败原件保留，下一次空闲另用新目录；不要用重试覆盖失败。退出码 0 为步骤成功或声明跳过，1 为失败，2 为用法错误，3 为缺前置且无其他失败；图仍要逐张读。`file` 步骤可在隔离目录制造只读路径，结束时恢复自有路径并记录清理结果。
 - **单步**：`just win-gui start <ENV_DIR> [--config <文件>] [--env 名=值]` 启动一个实例（状态在 `ENV_DIR/session.json`），之后用 `key`、`type`、`click`、`wheel`、`drag`、`capture`、`pixel`、`wait-log`、`dpi`、`ime-off`、`cancel-mode`、`windows`、`activate` 操作它，`stop` 关闭。
 - **隔离**：`LOCALAPPDATA` 与 `XDG_CONFIG_HOME` 指向 `env/`，去掉调用方的 `NO_COLOR`、`TERM`、`COLORTERM`、`TERM_PROGRAM*`、`GHOSTTY_*`；GX 开关用 `--env` 或场景的 `env` 显式传。只关自己启动的实例：结束进程前核对映像路径与创建时间。清空配置目录前，要求其中有本工具写的标记文件。
 - **输入守门**：进程以 Per-Monitor-V2 DPI 感知、用物理像素工作。每次 `SendInput` 前，前台窗口必须属于该实例；鼠标事件前，指针下的窗口也必须属于它，否则不发送并让这一步失败。坐标写 DIP，按窗口 DPI（或 `dpi` 步骤模拟的 DPI）换算；双屏时虚拟桌面原点可能为负，绝对坐标按虚拟桌面归一化。
-- **截图**：默认 `screen`，像 `CopyFromScreen` 那样截屏幕，窗口被别的进程挡住时失败；`print` 用 `PrintWindow`（`PW_RENDERFULLCONTENT`），挡住也能截。菜单、面板、设置等弹层（`GhosttyGxPopup`）是进程的独立顶层窗口，`what = "all"` 把它们逐个截下。
+- **截图**：默认 `screen`，截屏前在实例窗口后放黑色隐私遮罩并核对，其他进程遮挡时失败；`print` 用 `PrintWindow`（`PW_RENDERFULLCONTENT`）。菜单、面板、设置等弹层（`GhosttyGxPopup`）是独立顶层窗口，`what = "all"` 分别截图。单步 `capture`/`pixel` 支持 `--backdrop '#RRGGBB'`；确需观察背景时用 `--no-backdrop <原因>`，记录警告与可能暴露的范围。遮罩只覆盖被测窗口背后，不代表整个桌面被遮住。输入中断会补发自有按键/鼠标的松开并记审计，不重新按下或激活窗口。
 
 | 场景 | 验证内容 | 前置 / 副作用 |
 |---|---|---|
@@ -95,7 +95,7 @@
 
 W01–W15 逐条对应 R0 的验收点，W16 起采集界面现状截图。R0 验收时踩过、已写进工具与场景的坑：
 
-- 宿主程序（如 agent 的桌面端）偶尔抢走前台：守门拒绝发送，这一步失败，场景不会误操作别的窗口；加 `--retries 1` 重跑。
+- 宿主程序（如 agent 的桌面端）偶尔抢走前台：守门拒绝发送，这一步失败，场景不会误操作别的窗口；第 6 阶段保持 `--retries 0`，保留失败目录，等下一次空闲再用新目录补验。
 - 模态对话框会禁用主窗：`activate` 改为激活主窗的 `GW_ENABLEDPOPUP`，否则对话框拿不到键盘焦点。W07 的失败提示是非模态 Notice，不经这条路径：先用绑定动作确认主窗仍收键，再在失败终端按空格（不触发输入法组字）关闭它，并等提示消失。
 - 弹层出现有延迟：按键后先等 `wait_popup`（`new = true` 只认这次输入之后出现的弹层），再截图。
 - 连续粘贴之间等约 0.4 s，让剪贴板读取完成（W08）。
@@ -112,6 +112,14 @@ GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来
 - 读图之前一律记 PENDING：提交没 push、CI 没跑、artifact 还没下载或下载了没读，都不能记 PASS。
 
 ## 耗时度量与基线
+
+第 6 阶段新增工具：`win32-ui --case p3|p4|p5|p6`、`win32-idle --tabs 1|11 --windows N --state visible|unfocused|minimized --seconds 60`、`win32-gpu`、`win32-mem`；都用重复的 `--exe`/`--label`、`--out` 与 `--runs 10` 组织 AB/BA，`--capabilities LABEL:JSON` 将可证明零事件的指标能力绑定到实际映像哈希，缺声明或缺旧版埋点保持 unknown/n=0，不补造零。`remote <日志目录…>` 只归约真实远程夹具日志，不自行驱动迁移；保留 bytes/count 与 ms 的区别。`gtk` 与 `win32` 可用 `--label-env LABEL:NAME=VALUE` 给变体单独设置环境。`info(gx_perf): metric <name> <n>` 是无单位计数，不按微秒换算；原始时间日志保留单位，统计统一换算为 ms。
+
+`quiet --out <新目录>` 只读检查并落 JSON：0 表示当下满足、3 表示不满足、2 表示探测错误；它不为后续测量持锁。实际批次使用 `quiet-batch --out <新目录> --timeout 0 [--injected-input|--input-observe-only] -- <直接命令>`，自行持有全部重型与桌面槽，禁止外套 `Invoke-Heavy`/`Invoke-Desktop` 或嵌套槽。批次前后检查本项目构建/测试、验证 VM 已停、活动会话、槽与输入；按用户 2026-10-18 裁定，ToDesk 等原黑名单及全机 CPU 只记录，`--strict-blacklist` 才恢复旧黑名单门。桌面批次开始前仍需空闲 600 秒，注入输入批次用 `--injected-input` 读取守门行，无注入时核对整个区间没有新输入。
+
+仅 WSL/Xvfb 批次用 `--input-observe-only`，输入只记录。命令白名单仅允许直接 Python 的 `gx_perf.py gtk`、`gx_wsl.py smoke/scenario` 及等价 just 入口；just 入口先规范化成测量工作目录下的直接 Python argv，同一向量用于验证和执行且 `shell=False`，不会二次解释参数。`pwsh/cmd` 包装、任意脚本、`python -m`、`gx_wsl run` 等均拒绝；模式与实际守门行不符为 ERROR。WSL 克隆参数写成 `--clone=~/src/...`，避免 PowerShell 把独立 `~` 参数展开成 Windows 用户目录。
+
+批次 `RESULT.json` 分开记录环境有效性和门值结论：0 VALID；2 ERROR（工具错误；若前置探测出错而未启动，JSON 状态仍为 NOT_STARTED）；3 NOT_STARTED/INVALID（没有开始或整批环境失效）；4 FAIL（有效批次未达指标门）；5 NONCOMPLIANT（人为降低输入阈值等，不得签收）；6 PRODUCT_FAIL。被测进程崩溃、挂死、无输入下自行恢复或同树子孙抢前台记 PRODUCT_FAIL，优先于同时出现的环境噪声；不能改成 INVALID 后刷绿。启动期与旧 `win32` 驱动也记录 pid、轮次与臂，无法关联时明确 unknown。失焦/最小化/可见状态进入时先核实实际前提，不成立记工具 ERROR。每批保留 before/after、完整 raw、命令及退出码，旧失败不覆盖；按计划每 15 分钟轮询，每批每天最多 3 次。
 
 `scripts/gx_perf.py`（`just perf`）收集、汇总并对比 GUI 的耗时样本，只管测量与统计；结论要写明机器、构建类型与负载。
 
