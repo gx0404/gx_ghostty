@@ -1,5 +1,5 @@
 //! Native process/token facts and protected pipe DACLs. Ordinary IPC keeps its
-//! user ACL; the drop-only endpoint admits actual local/linked logon SIDs.
+//! user ACL; the drop endpoint also requires actual local/linked logon membership.
 const std = @import("std");
 const n = @import("native.zig");
 pub const policy = @import("../../../gx/ipc/policy.zig");
@@ -149,21 +149,23 @@ fn logonSid(token: n.HANDLE, buffer: []align(8) u8) !*anyopaque {
     return sid;
 }
 
-fn dropSddl(buffer: *[512:0]u16, local: []const u16, linked: ?[]const u16) ![:0]const u16 {
-    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("D:P");
-    const ace = std.unicode.utf8ToUtf16LeStringLiteral("(A;;GA;;;");
+fn dropSddl(buffer: *[512:0]u16, user: []const u16, local: []const u16, linked: ?[]const u16) ![:0]const u16 {
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    const prefix = wide("D:P");
     @memcpy(buffer[0..prefix.len], prefix);
     var len: usize = prefix.len;
     const sids = [_]?[]const u16{ local, linked };
     for (sids, 0..) |sid_, index| if (sid_) |sid| {
         if (index != 0 and std.mem.eql(u16, local, sid)) continue;
-        if (sid.len == 0 or len + ace.len + sid.len + 1 >= buffer.len) return error.SidTooLong;
-        @memcpy(buffer[len..][0..ace.len], ace);
-        len += ace.len;
-        @memcpy(buffer[len..][0..sid.len], sid);
-        len += sid.len;
-        buffer[len] = ')';
-        len += 1;
+        if (user.len == 0 or sid.len == 0) return error.SidTooLong;
+        // The user principal AND the logon condition must both match. RunAs
+        // can share a logon SID across users, so a logon-only ACE is unsafe.
+        const parts = [_][]const u16{ wide("(XA;;GA;;;"), user, wide(";(Member_of{SID("), sid, wide(")}))") };
+        for (parts) |part| {
+            if (len + part.len >= buffer.len) return error.SidTooLong;
+            @memcpy(buffer[len..][0..part.len], part);
+            len += part.len;
+        }
     };
     buffer[len] = 0;
     return buffer[0..len :0];
@@ -171,9 +173,9 @@ fn dropSddl(buffer: *[512:0]u16, local: []const u16, linked: ?[]const u16) ![:0]
 
 pub const Descriptor = struct {
     memory: *anyopaque,
-    /// Only the dedicated drop broker uses this ACL. Its two principals come
-    /// from TokenLogonSid on actual token handles; no user/world/admin wildcard
-    /// is added. A missing linked token grants only the current logon.
+    /// Only the drop broker uses this ACL. The user SID comes from TokenUser;
+    /// each conditional ACE additionally requires a native TokenLogonSid.
+    /// A verified split token adds a second condition for the same user.
     pub fn initDrop() !Descriptor {
         const local = try inspect(n.GetCurrentProcessId());
         defer local.deinit();
@@ -186,6 +188,9 @@ pub const Descriptor = struct {
             _ = n.CloseHandle(value.handle);
         };
         var buffer: [4096]u8 align(8) = undefined;
+        var user_text: ?[*:0]u16 = null;
+        if (ConvertSidToStringSidW(try tokenSid(try info(token, 1, &buffer)), &user_text) == 0) return error.SidConversionFailed;
+        defer _ = n.LocalFree(@ptrCast(user_text.?));
         var local_text: ?[*:0]u16 = null;
         if (ConvertSidToStringSidW(try logonSid(token, &buffer), &local_text) == 0) return error.SidConversionFailed;
         defer _ = n.LocalFree(@ptrCast(local_text.?));
@@ -197,7 +202,7 @@ pub const Descriptor = struct {
             if (ConvertSidToStringSidW(try logonSid(value.handle, &buffer), &linked_text) == 0) return error.SidConversionFailed;
         }
         var sddl_buffer: [512:0]u16 = undefined;
-        const sddl = try dropSddl(&sddl_buffer, std.mem.span(local_text.?), if (linked_text) |value| std.mem.span(value) else null);
+        const sddl = try dropSddl(&sddl_buffer, std.mem.span(user_text.?), std.mem.span(local_text.?), if (linked_text) |value| std.mem.span(value) else null);
         var memory: ?*anyopaque = null;
         if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.ptr, 1, &memory, null) == 0) return error.DescriptorFailed;
         return .{ .memory = memory orelse return error.DescriptorFailed };
@@ -246,12 +251,70 @@ test "apprt.win32.ipc.Security reads real own token and process birth" {
     defer drop_descriptor.deinit();
 }
 
-test "apprt.win32.ipc.Security drop ACL contains only exact native logon principals" {
+test "apprt.win32.ipc.Security D27 drop ACL requires user and exact native logon principals" {
+    const user = std.unicode.utf8ToUtf16LeStringLiteral("S-1-5-21-1-2-3-1001");
     const local = std.unicode.utf8ToUtf16LeStringLiteral("S-1-5-5-10-20");
     const linked = std.unicode.utf8ToUtf16LeStringLiteral("S-1-5-5-10-30");
     var buffer: [512:0]u16 = undefined;
-    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;;GA;;;S-1-5-5-10-20)(A;;GA;;;S-1-5-5-10-30)"), try dropSddl(&buffer, local, linked));
-    const single = std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;;GA;;;S-1-5-5-10-20)");
-    try std.testing.expectEqualSlices(u16, single, try dropSddl(&buffer, local, null));
-    try std.testing.expectEqualSlices(u16, single, try dropSddl(&buffer, local, local));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("D:P(XA;;GA;;;S-1-5-21-1-2-3-1001;(Member_of{SID(S-1-5-5-10-20)}))(XA;;GA;;;S-1-5-21-1-2-3-1001;(Member_of{SID(S-1-5-5-10-30)}))"), try dropSddl(&buffer, user, local, linked));
+    const single = std.unicode.utf8ToUtf16LeStringLiteral("D:P(XA;;GA;;;S-1-5-21-1-2-3-1001;(Member_of{SID(S-1-5-5-10-20)}))");
+    try std.testing.expectEqualSlices(u16, single, try dropSddl(&buffer, user, local, null));
+    try std.testing.expectEqualSlices(u16, single, try dropSddl(&buffer, user, local, local));
+}
+
+test "apprt.win32.ipc.Security D27 real drop pipe admits its own token" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const descriptor = try Descriptor.initDrop();
+    defer descriptor.deinit();
+    var attributes = descriptor.attributes();
+    var name_buffer: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "\\\\.\\pipe\\gx-d27-test-{x}", .{try n.epoch()});
+    const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+    defer std.testing.allocator.free(wide);
+    const server = n.CreateNamedPipeW(wide, 3 | 0x40000000 | 0x80000, 8, 1, 4096, 4096, 0, &attributes);
+    try std.testing.expect(server != n.INVALID);
+    defer _ = n.CloseHandle(server);
+    const client = n.CreateFileW(wide, 0xc0000000, 0, null, 3, 0, null);
+    try std.testing.expect(client != n.INVALID);
+    defer _ = n.CloseHandle(client);
+}
+
+test "apprt.win32.ipc.Security D27 native conditional ACE rejects either mismatched principal" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const facts = try inspect(n.GetCurrentProcessId());
+    defer facts.deinit();
+    var token: n.HANDLE = undefined;
+    if (OpenProcessToken(facts.process, 8, &token) == 0) return error.OpenTokenFailed;
+    defer _ = n.CloseHandle(token);
+    var buffer: [4096]u8 align(8) = undefined;
+    var user: ?[*:0]u16 = null;
+    if (ConvertSidToStringSidW(try tokenSid(try info(token, 1, &buffer)), &user) == 0) return error.SidConversionFailed;
+    defer _ = n.LocalFree(@ptrCast(user.?));
+    var logon: ?[*:0]u16 = null;
+    if (ConvertSidToStringSidW(try logonSid(token, &buffer), &logon) == 0) return error.SidConversionFailed;
+    defer _ = n.LocalFree(@ptrCast(logon.?));
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    for (0..2) |index| {
+        var sddl_buffer: [512:0]u16 = undefined;
+        const sddl = try dropSddl(&sddl_buffer, if (index == 0) wide("S-1-5-21-0-0-0-1001") else std.mem.span(user.?), if (index == 1) wide("S-1-5-5-0-0") else std.mem.span(logon.?), null);
+        var memory: ?*anyopaque = null;
+        try std.testing.expect(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.ptr, 1, &memory, null) != 0);
+        const descriptor: Descriptor = .{ .memory = memory.? };
+        defer descriptor.deinit();
+        var attributes = descriptor.attributes();
+        var name_buffer: [128]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "\\\\.\\pipe\\gx-d27-deny-{x}", .{try n.epoch()});
+        const name_w = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
+        defer std.testing.allocator.free(name_w);
+        const server = n.CreateNamedPipeW(name_w, 3 | 0x40000000 | 0x80000, 8, 1, 4096, 4096, 0, &attributes);
+        try std.testing.expect(server != n.INVALID);
+        defer _ = n.CloseHandle(server);
+        const client = n.CreateFileW(name_w, 0xc0000000, 0, null, 3, 0, null);
+        const last_error = n.GetLastError();
+        defer if (client != n.INVALID) {
+            _ = n.CloseHandle(client);
+        };
+        try std.testing.expect(client == n.INVALID);
+        try std.testing.expectEqual(@as(u32, 5), last_error);
+    }
 }
