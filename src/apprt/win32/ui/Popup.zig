@@ -450,32 +450,52 @@ fn revealStep(ready: bool, elapsed_ms: u64, timeout: RevealTimeout) RevealStep {
     };
 }
 
-/// Coalesced event work, consumed only at an outer message-loop idle boundary.
-/// A blocked owner keeps its request; a consumed request never polls itself.
+/// Coalesced event work for the hidden UI of one owner, consumed one unit at
+/// a time at an outer message-loop idle boundary (`Menu.prepareIdle`). A
+/// blocked owner keeps its units; a consumed unit never polls itself.
 pub const Preparation = struct {
-    pending: bool = true,
+    /// The hidden UI one owner prepares, in this order; each is one unit of
+    /// idle work.
+    pub const Unit = enum { palette, main_menu, settings };
 
+    pending: std.EnumSet(Unit) = .initFull(),
+
+    /// Prepare every unit again, at the next idle boundaries.
     pub fn request(self: *Preparation) void {
-        self.pending = true;
+        self.pending = .initFull();
     }
 
-    pub fn take(self: *Preparation, eligible: bool, queue_empty: bool) bool {
-        if (!self.pending or !eligible or !queue_empty) return false;
-        self.pending = false;
-        return true;
+    /// Whether a unit waits.
+    pub fn isPending(self: *const Preparation) bool {
+        return self.pending.count() > 0;
+    }
+
+    /// Consume the next waiting unit of an `eligible` owner; an owner that is
+    /// not eligible keeps them all.
+    pub fn takeNext(self: *Preparation, eligible: bool) ?Unit {
+        if (!eligible) return null;
+        var units = self.pending.iterator();
+        const unit = units.next() orelse return null;
+        self.pending.remove(unit);
+        return unit;
     }
 };
 
-test "P4 reuse preparation consumes one event at idle and never polls" {
+test "P4 reuse preparation hands out one unit at a time and never polls" {
+    const testing = std.testing;
     var preparation: Preparation = .{};
-    try std.testing.expect(!preparation.take(false, true));
-    try std.testing.expect(!preparation.take(true, false));
-    try std.testing.expect(preparation.take(true, true));
-    for (0..100) |_| try std.testing.expect(!preparation.take(true, true));
+    try testing.expect(preparation.takeNext(false) == null);
+    try testing.expect(preparation.isPending());
+    for (std.enums.values(Preparation.Unit)) |unit| try testing.expectEqual(unit, preparation.takeNext(true).?);
+    try testing.expect(!preparation.isPending());
+    for (0..100) |_| try testing.expect(preparation.takeNext(true) == null);
     preparation.request();
     preparation.request();
-    try std.testing.expect(preparation.take(true, true));
-    try std.testing.expect(!preparation.take(true, true));
+    try testing.expectEqual(Preparation.Unit.palette, preparation.takeNext(true).?);
+    try testing.expect(preparation.takeNext(false) == null);
+    try testing.expectEqual(Preparation.Unit.main_menu, preparation.takeNext(true).?);
+    try testing.expectEqual(Preparation.Unit.settings, preparation.takeNext(true).?);
+    try testing.expect(preparation.takeNext(true) == null);
 }
 
 test "P4 reuse reveal requires a current frame and bounds failure by 300ms" {

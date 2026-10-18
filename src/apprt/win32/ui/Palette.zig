@@ -484,17 +484,23 @@ fn prepareHost(self: *Palette) bool {
     return true;
 }
 
-/// Event-driven idle preparation of the hidden root. Dynamic tab rows are
-/// still rebuilt at open, while the host/target and bounded text cache survive.
-pub fn prepare(self: *Palette) void {
-    if (self.active or self.ownerWindow().activePane() == null) return;
-    if (!self.prepareHost()) return;
+/// Event-driven idle preparation of the hidden root (`Menu.prepareIdle`).
+/// It reads no file: without the launch profiles detected for the current
+/// environment it does nothing, and the history and the recent themes
+/// (their state file and directories) wait for the real opening. Every
+/// opening rebuilds the entries; the host, its target and the bounded text
+/// cache survive. Returns whether it prepared.
+pub fn prepare(self: *Palette) bool {
+    if (self.active or self.ownerWindow().activePane() == null) return false;
+    if (!@import("Menu.zig").launchProfilesCached(self.ownerWindow().app)) return false;
+    if (!self.prepareHost()) return false;
     self.page = .root;
     self.popup.input.clear();
     self.mouse = null;
-    self.buildItems();
+    self.buildItemsReading(.memory);
     self.refilter(.navigation);
-    self.popup.prepareHidden(self.bounds() orelse return);
+    self.popup.prepareHidden(self.bounds() orelse return false);
+    return true;
 }
 
 pub fn invalidateHost(self: *Palette) void {
@@ -586,6 +592,15 @@ fn bounds(self: *Palette) ?w32.RECT {
 
 /// Collect the entries for a new session.
 fn buildItems(self: *Palette) void {
+    self.buildItemsReading(.files);
+}
+
+/// What collecting the entries reads: an opening loads the history and lists
+/// the theme directories for the recent themes, idle preparation reads only
+/// what is in memory (without them).
+const Reads = enum { files, memory };
+
+fn buildItemsReading(self: *Palette, reads: Reads) void {
     if (self.arena) |*arena| {
         _ = arena.reset(.retain_capacity);
     } else {
@@ -594,14 +609,14 @@ fn buildItems(self: *Palette) void {
     const a = self.arena.?.allocator();
     self.items = .empty;
     self.theme_dirs = &.{};
-    loadHistory(self.alloc());
+    if (reads == .files) loadHistory(self.alloc());
 
     self.refreshItemCache() catch |err| log.warn("palette entries unavailable err={}", .{err});
     self.addTabs(a) catch |err| log.warn("palette tabs unavailable err={}", .{err});
     self.items.appendSlice(a, self.item_cache.entries) catch |err| log.warn("palette entries unavailable err={}", .{err});
     self.themes_start = self.items.items.len;
     self.themes_expanded = false;
-    if (!history.isEmpty()) self.addThemes(a, .recent) catch |err| log.warn("palette themes unavailable err={}", .{err});
+    if (reads == .files and !history.isEmpty()) self.addThemes(a, .recent) catch |err| log.warn("palette themes unavailable err={}", .{err});
     self.loadRanks(0);
 }
 
@@ -1527,10 +1542,10 @@ test "D13: a reused palette host rebuilds its entries for a changed theme" {
     // A configuration change also retires the hidden host and its cache.
     var palette: Palette = .{};
     palette.item_cache.stamp = nord;
-    palette.preparation.pending = false;
+    palette.preparation.pending = .initEmpty();
     palette.invalidateHost();
     try testing.expect(palette.item_cache.stamp == null);
-    try testing.expect(palette.popup.reuse_invalid and palette.preparation.pending);
+    try testing.expect(palette.popup.reuse_invalid and palette.preparation.isPending());
 }
 
 /// Remember a pick of `item` and what was typed before it.

@@ -364,6 +364,25 @@ test "P4 reuse keeps independent settings owners for 100 acquire close cycles" {
     try std.testing.expect(!second.data_ready and !second.popup.reuse_invalid);
 }
 
+test "P4 idle preparation leaves settings without read data to the opening" {
+    // Reading the configuration layers, the theme directories and the
+    // launch profiles is file work: idle preparation never does it, and
+    // creates no overlay for a window that has none.
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core;
+    var window: Window = undefined;
+    window.app = &app;
+    window.hwnd = null;
+    defer onWindowDestroyed(&window);
+    try std.testing.expect(!prepare(&window));
+    try std.testing.expect(find(&window) == null);
+    const self = acquire(&window).?;
+    try std.testing.expect(!prepare(&window));
+    try std.testing.expect(!self.data_ready and self.layers == null and self.popup.hwnd == null);
+}
+
 /// Like `show`, then switch to `section`: the command palette's
 /// "Settings: <section>" entries and `gx:settings_page:<page>`.
 pub fn showSection(window: *Window, section: Section) bool {
@@ -400,10 +419,16 @@ pub fn invalidateData(window: *Window) void {
     self.data_ready = false;
 }
 
-pub fn prepare(window: *Window) void {
-    if (!gx.config_layers.enabled(window.app.core_app.alloc)) return;
-    const self = acquire(window) orelse return;
-    if (!self.open) _ = self.openOverlay(null, true);
+/// Idle preparation (`Menu.prepareIdle`) of the hidden overlay of
+/// `window`: lay it out and paint it hidden, only with the data an earlier
+/// opening read and nothing made stale since. It reads no file: the
+/// configuration layers, the theme directories and the launch profiles are
+/// read by the next opening (`loadData`). Returns whether it prepared.
+pub fn prepare(window: *Window) bool {
+    if (!gx.config_layers.enabled(window.app.core_app.alloc)) return false;
+    const self = find(window) orelse return false;
+    if (self.open or !self.data_ready) return false;
+    return self.openOverlay(null, true);
 }
 
 pub fn onConfigChange(app: *App) void {
