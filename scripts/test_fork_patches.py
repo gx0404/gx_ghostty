@@ -1756,6 +1756,73 @@ def gx0054_problems(source: str) -> list[str]:
     return problems
 
 
+FONTCONFIG_BUILD = "pkg/fontconfig/build.zig"
+GX0055 = "GX-0055"
+GX0055_BODY = r'''if (target.result.os.tag == .linux and target.result.ofmt == .elf) {
+        try flags.appendSlice(b.allocator, &.{
+            "-fvisibility=hidden",
+            "-DFcPublic=__attribute__((visibility(\"hidden\")))",
+            "-DFC_ATTRIBUTE_VISIBILITY_EXPORT=__attribute__((visibility(\"hidden\")))",
+        });
+    }'''
+
+
+def gx0055_problems(source: str) -> list[str]:
+    """Only the Linux ELF static build may hide bundled Fontconfig symbols."""
+    source = source.replace("\r\n", "\n")
+    try:
+        _, hunks = marked_hunks(source, GX0055)
+    except ValueError as exc:
+        return [str(exc)]
+    if len(hunks) != 1:
+        return ["expected exactly one GX-0055 hunk"]
+    lines = source.splitlines()
+    first, last = hunks[0]
+    problems = []
+    if squash("\n".join(lines[first + 1:last])) != squash(GX0055_BODY):
+        problems.append("GX-0055 must contain only the Linux ELF visibility flags")
+    build = zig_fn_lines(lines, "fn buildLib(")
+    if build is None or not (build[0] < first < last < build[1]):
+        problems.append("GX-0055 must be inside the static buildLib")
+    previous = next((line.strip() for line in reversed(lines[:first]) if line.strip()), "")
+    following = next((line.strip() for line in lines[last + 1:] if line.strip()), "")
+    if previous != "defer flags.deinit(b.allocator);" or following != "const version = try std.SemanticVersion.parse(build_zon.version);":
+        problems.append("GX-0055 must follow flags initialization and precede version flags")
+    return problems
+
+
+class Gx0055ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / FONTCONFIG_BUILD).read_text(encoding="utf-8")
+
+    def test_registry_and_lf_crlf(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0055, FONTCONFIG_BUILD, f"fork(gx): {GX0055}", "active"), patches)
+        self.assertEqual(gx0055_problems(self.source), [])
+        self.assertEqual(gx0055_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_removing_the_hunk_restores_the_entire_upstream_build(self):
+        upstream, reason = merged_upstream_text(ROOT, FONTCONFIG_BUILD)
+        if upstream is None:
+            self.skipTest(reason)
+        restored, _ = marked_hunks(self.source, GX0055)
+        self.assertEqual(squash(restored), squash(upstream))
+
+    def test_partial_visibility_and_wider_targets_are_rejected(self):
+        for old, new in (
+            ("// fork(gx): GX-0055 end", ""),
+            ("target.result.os.tag == .linux and ", ""),
+            (" and target.result.ofmt == .elf", ""),
+            ('"-fvisibility=hidden",', ""),
+            ("-DFcPublic=", "-DUnusedPublic="),
+            ("-DFC_ATTRIBUTE_VISIBILITY_EXPORT=", "-DUnusedExport="),
+        ):
+            with self.subTest(old=old):
+                self.assertIn(old, self.source)
+                self.assertTrue(gx0055_problems(self.source.replace(old, new, 1)))
+
+
 class Gx0054ShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0054）之后的号。在册的 47 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0054，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0055）之后的号。在册的 48 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0055，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -129,6 +129,7 @@
 | GX-0051 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0051` | active |
 | GX-0053 | `src/Command.zig` | `fork(gx): GX-0053` | active |
 | GX-0054 | `src/apprt/gtk/class/window.zig` | `fork(gx): GX-0054` | active |
+| GX-0055 | `pkg/fontconfig/build.zig` | `fork(gx): GX-0055` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1527,3 +1528,12 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：GX-0039 块保持真实 `priv.tab_view` 声明，不能用包装类型把修改藏到块外；移动函数保留上游 pos、两条 assert 和 reorder 返回值。上游插入路径继续保证位置不大于总页数。
 - 移除条件：上游原生提供等价的插入约束与全范围循环移动后移除钩子，登记改为 removed；移除 GX-0039 时不能顺带丢弃本约束。
 - 验证：真实 AdwTabView 插入/移动单测覆盖单页组、3/4 页组、极值及 7,236 组无固定页输入（612 组上游合法结果一致）；G28 07–12 校验实际标签标题顺序，移除移动动作的反向探针必须失败；G09 回归并读图。`Gx0054ShapeTests` 锁定标记、调用和上游保留语句，撤销移动替换后函数体应与上游一致。
+
+## GX-0055 Linux 静态 Fontconfig 符号隔离
+
+- 文件：`pkg/fontconfig/build.zig::buildLib`；active，未回馈上游。flags 初始化后、版本宏之前的一个纯新增 begin/end 块，删除后还原上游构建文件。
+- 原因：GTK/Pango 动态依赖使用系统 Fontconfig，而程序静态库导出的部分 Fc 符号抢占其绑定，导致同一进程混用两份 Fontconfig 的对象与全局状态。旧映像导出 28 个 Fc 符号，Pango 58 个导入中 23 个绑定 exe、35 个绑定系统库；原 G03 崩溃栈在 FcPatternReference/FcRefInc，链接隔离及有限回归不能单独证明原间歇崩溃完全消失。
+- 实现：仅 Linux ELF 的静态 C 构建追加 `-fvisibility=hidden`，并将 `FcPublic`、`FC_ATTRIBUTE_VISIBILITY_EXPORT` 预定义为 hidden。钉版头文件的可覆盖宏和 fcalias 内部/公开别名保持；系统库模式、其他平台、依赖版本与生成头不变，不默认切换 `-fsys=fontconfig`。
+- 同步：更新 Fontconfig 后核对宏仍支持预定义，以及公开名与 IA__ 别名的绑定属性；不能只隐藏普通定义却重新导出 alias。新映像完整符号表 242 对别名同址且 LOCAL HIDDEN，Pango 的 58 个导入全部绑定同一系统库。
+- 移除条件：上游构建提供等价隔离，实际 exe 动态符号表和 Pango loader 绑定证据仍通过后移除，登记改为 removed。
+- 验证：`Gx0055ShapeTests` 锁定 Linux ELF/静态路径和三项flags，反证缺任一隐藏定义或扩大目标条件；`scripts/gx_fontconfig_link_check.py` 核动态导出与观察到的绑定，不独立认证进程身份或全符号覆盖。包16项、GTK定向24通过/4平台跳过、三次固定G03的源码snapshot/映像/日志/逐图证据见 `F3/D30/report.md`。最终ReleaseFast映像、其他发行版和长期压力仍需复验。

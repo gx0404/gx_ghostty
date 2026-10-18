@@ -145,6 +145,17 @@ fn buildLib(b: *std.Build, options: anytype) !*std.Build.Step.Compile {
     var flags: std.ArrayList([]const u8) = .empty;
     defer flags.deinit(b.allocator);
 
+    // fork(gx): GX-0055 begin
+    // Keep GTK/Pango on the system Fontconfig, including fcalias exports.
+    if (target.result.os.tag == .linux and target.result.ofmt == .elf) {
+        try flags.appendSlice(b.allocator, &.{
+            "-fvisibility=hidden",
+            "-DFcPublic=__attribute__((visibility(\"hidden\")))",
+            "-DFC_ATTRIBUTE_VISIBILITY_EXPORT=__attribute__((visibility(\"hidden\")))",
+        });
+    }
+    // fork(gx): GX-0055 end
+
     const version = try std.SemanticVersion.parse(build_zon.version);
     try flags.appendSlice(b.allocator, &.{
         b.fmt("-DFC_VERSION_MAJOR={d}", .{version.major}),
