@@ -2354,10 +2354,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument('--distro', default='Ubuntu-24.04')
     batch.add_argument('--idle-seconds', type=float, default=600)
     batch.add_argument('--build-process', action='append')
-    batch.add_argument('--blacklist', action='append')
-    batch.add_argument('--observe', action='append')
+    batch.add_argument('--blacklist', action='append', help='add case-insensitive name/title substrings (repeatable)')
+    batch.add_argument('--observe', action='append', help='add name/title substrings recorded as other programs, never a gate')
     batch.add_argument('--timeout', type=float, default=0)
-    batch.add_argument('--injected-input', action='store_true', help='end input check uses batch-bound gx_win_gui guard log')
+    batch.add_argument('--injected-input', action='store_true',
+                       help='the command may send input through gx_win_gui (all win32-* drivers): judge input by the '
+                            "batch's guard log; a batch that sent none falls back to no input since the start check")
     batch.add_argument('batch_command', nargs=argparse.REMAINDER)
     remote = commands.add_parser('remote', allow_abbrev=False, help='summarize remote.* fixture logs only')
     remote.add_argument('paths', nargs='+', type=Path)
