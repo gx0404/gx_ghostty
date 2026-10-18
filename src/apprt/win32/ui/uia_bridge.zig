@@ -284,6 +284,10 @@ pub const PopupBridge = struct {
     hwnd: ?w32.HWND = null,
     needs_publish: bool = true,
     announcement: uia.PendingAnnouncement = .{},
+    /// Set while the owning popup rebuilds its specs only to report where
+    /// the keyboard focus is now (`Popup.focusMoved`): `publish` moves the
+    /// focus within the current snapshot instead of replacing it.
+    focus_only: bool = false,
 
     /// A GUI model edit invalidates all pending index-based actions immediately.
     /// The owning widget schedules publish after its new model/layout is ready.
@@ -301,17 +305,23 @@ pub const PopupBridge = struct {
     pub fn deinit(self: *PopupBridge) void {
         self.hide();
     }
+    /// Nothing to publish: no model change since the last publication, and
+    /// not a focus-only rebuild (`focus_only`).
+    fn upToDate(self: *const PopupBridge) bool {
+        return !self.focus_only and !self.needs_publish and self.publisher.current != null;
+    }
     pub fn publish(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, hwnd: w32.HWND, nodes: []const uia.NodeSpec, tokens: []const u64, callbacks: PopupCallbacks) !void {
         errdefer self.hide();
         if (!callbacks.is_live(callbacks.context) or !attachment.isValid()) return self.hide();
         if (nodes.len != tokens.len or nodes.len > self.tokens.len) return error.InvalidSnapshot;
-        if (!self.needs_publish and self.hwnd == hwnd and self.publisher.current != null) return;
+        if (!self.focus_only and !self.needs_publish and self.hwnd == hwnd and self.publisher.current != null) return;
         var effective: [uia.max_nodes]uia.NodeSpec = undefined;
         @memcpy(effective[0..nodes.len], nodes);
         if (w32.IsWindowEnabled(hwnd) == 0) for (effective[0..nodes.len]) |*node| {
             node.enabled = false;
             if (node.patterns.window) node.window_interaction_state = 3;
         };
+        if (self.focus_only) return self.moveFocusTo(attachment, hwnd, effective[0..nodes.len], tokens, callbacks);
         try self.publisher.publish(std.heap.page_allocator, api, queue, attachment, hwnd, effective[0..nodes.len]);
         @memcpy(self.tokens[0..tokens.len], tokens);
         self.length = tokens.len;
@@ -319,6 +329,25 @@ pub const PopupBridge = struct {
         self.callbacks = callbacks;
         self.needs_publish = false;
         self.announcement.retry(&self.publisher);
+    }
+    /// A focus-only rebuild (`focus_only`). When its specs describe the
+    /// current snapshot's elements unchanged apart from the focus (the same
+    /// window, owner, callbacks, tokens in the same order and node specs),
+    /// the focus moves in place to the node they mark focused, and the
+    /// elements clients hold stay valid. Anything else is a model change no
+    /// invalidation announced: revoke the snapshot, and publish anew at the
+    /// next request. A focus-only rebuild never publishes.
+    fn moveFocusTo(self: *PopupBridge, attachment: refs.Attachment, hwnd: w32.HWND, nodes: []const uia.NodeSpec, tokens: []const u64, callbacks: PopupCallbacks) void {
+        const current = self.callbacks orelse return self.dirty();
+        if (self.hwnd == hwnd and std.meta.eql(current, callbacks) and std.mem.eql(u64, tokens, self.tokens[0..self.length]) and
+            self.publisher.matchesExceptFocus(attachment, hwnd, nodes))
+        {
+            const focused: u64 = for (nodes) |node| {
+                if (node.focused) break node.id;
+            } else 0;
+            if (self.publisher.moveFocus(focused)) return;
+        }
+        self.dirty();
     }
     pub fn announce(self: *PopupBridge, text: []const u8) void {
         self.announcement.stage(text);
@@ -334,7 +363,7 @@ pub const PopupBridge = struct {
         if (!owner_live) return false;
         const callbacks = self.callbacks orelse return false;
         const hwnd = self.hwnd orelse return false;
-        if (action.kind != .notification and w32.IsWindowEnabled(hwnd) == 0) return false;
+        if (action.kind != .notification and action.kind != .focus_changed and w32.IsWindowEnabled(hwnd) == 0) return false;
         const token = self.tokens[@intCast(action.node_id - 1)];
         if (!callbacks.is_live(callbacks.context)) return false;
         if (action.kind == .notification) {
@@ -343,6 +372,9 @@ pub const PopupBridge = struct {
             if (!delivered) std.log.scoped(.win32_uia).warn("notification API rejected an announcement", .{});
             return delivered;
         }
+        // Queued by Publisher.moveFocus and raised here, from the message
+        // loop: no widget callback, nothing revoked.
+        if (action.kind == .focus_changed) return self.publisher.raiseFocusChanged(action.node_id);
         return self.dispatchPrepared(callbacks, token, action);
     }
     fn dispatchPrepared(self: *PopupBridge, callbacks: PopupCallbacks, token: u64, action: *const uia.Action) bool {
@@ -359,7 +391,7 @@ pub const PopupBridge = struct {
     /// Called inside MenuPopup with its actual Level. Rows already carry their
     /// pixel layout; no duplicate menu model or guessed item rectangles.
     pub fn publishMenu(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, level: anytype, callbacks: PopupCallbacks) !void {
-        if (!self.needs_publish and self.publisher.current != null) return;
+        if (self.upToDate()) return;
         const hwnd = level.popup.hwnd orelse return self.hide();
         if (!level.popup.visible) return self.hide();
         var builder: PopupBuilder = .{};
@@ -381,7 +413,7 @@ pub const PopupBridge = struct {
     /// Palette supplies its private listView() rectangle in DIPs. Filter value,
     /// rows and selection come directly from its current GUI model.
     pub fn publishPalette(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, palette: *Palette, view: d2d.Rect, callbacks: PopupCallbacks) !void {
-        if (!self.needs_publish and self.publisher.current != null) return;
+        if (self.upToDate()) return;
         const hwnd = palette.popup.hwnd orelse return self.hide();
         if (!palette.active or !palette.popup.visible) return self.hide();
         var bounds: w32.RECT = undefined;
@@ -416,7 +448,7 @@ pub const PopupBridge = struct {
     /// the Notification export is absent and a polite live region is used.
     /// Publication does not itself imply a new semantic announcement.
     pub fn publishToast(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, toast: *Toast, callbacks: PopupCallbacks) !bool {
-        if (!self.needs_publish and self.publisher.current != null) return false;
+        if (self.upToDate()) return false;
         const hwnd = toast.popup.hwnd orelse {
             self.hide();
             return false;
@@ -435,7 +467,7 @@ pub const PopupBridge = struct {
     /// Called from Dialogs with its live Dialog, including its actual layout and
     /// focus order. Action tokens map to Dialog.activate/target, not mouse input.
     pub fn publishDialog(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, dialog: anytype, callbacks: PopupCallbacks) !void {
-        if (!self.needs_publish and self.publisher.current != null) return;
+        if (self.upToDate()) return;
         const hwnd = dialog.popup.hwnd orelse return self.hide();
         if (!dialog.popup.visible or dialog.result != null) return self.hide();
         var bounds: w32.RECT = undefined;
@@ -465,7 +497,7 @@ pub const PopupBridge = struct {
     /// by its hit targets. All rectangles and action tokens use that same hit
     /// list, so clipping/search/reordering cannot select a guessed control.
     pub fn publishSettings(self: *PopupBridge, api: *uia.Api, queue: *uia.Queue, attachment: refs.Attachment, settings: anytype, rows: anytype, states: []const ControlState, callbacks: PopupCallbacks) !void {
-        if (!self.needs_publish and self.publisher.current != null) return;
+        if (self.upToDate()) return;
         const hwnd = settings.popup.hwnd orelse return self.hide();
         if (!settings.open or !settings.popup.visible) return self.hide();
         if (states.len != settings.hit_count or rows.len > 64) return error.InvalidSnapshot;
@@ -662,6 +694,141 @@ test "popup focus dispatch preserves the retained Value provider and pending act
     try testing.expect(bridge.dispatchPrepared(callbacks, palette_filter, &value));
     try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), table.options(face, &options));
     try testing.expect(!bridge.publisher.accepts(value));
+}
+
+test "popup focus-only rebuild moves HasKeyboardFocus and GetFocus in place" {
+    // The popup rebuilds its specs only to report a focus move (the real
+    // PopupBridge.publish): the elements a client holds stay usable and
+    // report the new focus. No HWND, desktop or UIAutomationCore is used.
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: refs.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const Widget = struct {
+        fn live(_: *anyopaque) bool {
+            return true;
+        }
+        fn action(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+            return true;
+        }
+        /// A dialog, its check box (node 2) and OK (node 3); `focus` is a node id.
+        fn specs(focus: u64, checked: bool) [3]uia.NodeSpec {
+            return .{
+                .{ .id = 1, .name = "Dialog", .role = .window, .patterns = .{ .window = true } },
+                .{ .id = 2, .parent = 0, .name = "Remember", .role = .checkbox, .patterns = .{ .toggle = true }, .toggle_state = @intFromBool(checked), .focusable = true, .focused = focus == 2 },
+                .{ .id = 3, .parent = 0, .name = "OK", .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = focus == 3 },
+            };
+        }
+    };
+    const Simple = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+        GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
+        GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
+    };
+    const Root = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ElementProviderFromPoint: *const fn (*uia.Face, f64, f64, *?*uia.Face) callconv(.winapi) i32,
+        GetFocus: *const fn (*uia.Face, *?*uia.Face) callconv(.winapi) i32,
+    };
+    const Probe = struct {
+        fn table(face: *uia.Face) *const Simple {
+            return @ptrCast(@alignCast(face.vtable));
+        }
+        /// ProviderOptions: S_OK while usable, UIA_E_ELEMENTNOTAVAILABLE once revoked.
+        fn options(face: *uia.Face) i32 {
+            var flags: u32 = 0;
+            return table(face).ProviderOptions(face, &flags);
+        }
+        /// UIA_HasKeyboardFocusPropertyId (30008), a VT_BOOL.
+        fn hasFocus(face: *uia.Face) !bool {
+            var value: uia.Variant = .{};
+            try testing.expectEqual(@as(i32, 0), table(face).GetPropertyValue(face, 30008, &value));
+            try testing.expectEqual(@as(u16, 11), value.tag);
+            return value.data.integer != 0;
+        }
+        /// The node IRawElementProviderFragmentRoot::GetFocus reports.
+        fn rootFocus(root: *uia.Face) !?*anyopaque {
+            const vtable: *const Root = @ptrCast(@alignCast(root.vtable));
+            var focused: ?*uia.Face = null;
+            try testing.expectEqual(@as(i32, 0), vtable.GetFocus(root, &focused));
+            const face = focused orelse return null;
+            _ = vtable.Release(face);
+            return face.node;
+        }
+    };
+    var context: u8 = 0;
+    const callbacks: PopupCallbacks = .{ .context = &context, .is_live = Widget.live, .action = Widget.action };
+    const tokens = [_]u64{ 0, 10, 20 };
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+    const first = Widget.specs(2, false);
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &first, &tokens, callbacks);
+    const snapshot = bridge.publisher.current.?;
+    const check = &snapshot.nodes[1].faces[0];
+    const ok = &snapshot.nodes[2].faces[0];
+    const root = &snapshot.nodes[0].faces[2];
+    for ([_]*uia.Face{ check, ok, root }) |face| _ = Probe.table(face).AddRef(face);
+    defer for ([_]*uia.Face{ check, ok, root }) |face| {
+        _ = Probe.table(face).Release(face);
+    };
+    try testing.expect(try Probe.hasFocus(check));
+    try testing.expect(!try Probe.hasFocus(ok));
+    try testing.expectEqual(@as(?*anyopaque, check.node), try Probe.rootFocus(root));
+
+    // Tab: the focus moves from the check box to OK and nothing else changed.
+    const moved = Widget.specs(3, false);
+    bridge.focus_only = true;
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &moved, &tokens, callbacks);
+    bridge.focus_only = false;
+    try testing.expectEqual(snapshot, bridge.publisher.current.?);
+    try testing.expectEqual(@as(i32, 0), Probe.options(check));
+    try testing.expectEqual(@as(i32, 0), Probe.options(ok));
+    try testing.expect(!try Probe.hasFocus(check));
+    try testing.expect(try Probe.hasFocus(ok));
+    try testing.expectEqual(@as(?*anyopaque, ok.node), try Probe.rootFocus(root));
+
+    // The popup lost the focus: still the same elements, none focused.
+    const away = Widget.specs(0, false);
+    bridge.focus_only = true;
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &away, &tokens, callbacks);
+    bridge.focus_only = false;
+    try testing.expectEqual(snapshot, bridge.publisher.current.?);
+    try testing.expect(!try Probe.hasFocus(check));
+    try testing.expect(!try Probe.hasFocus(ok));
+    try testing.expectEqual(@as(?*anyopaque, null), try Probe.rootFocus(root));
+
+    // A focus-only rebuild that finds anything else changed (the check box
+    // toggled with no invalidation) revokes the snapshot and publishes
+    // nothing; the next ordinary publication replaces it.
+    const toggled = Widget.specs(2, true);
+    bridge.focus_only = true;
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &toggled, &tokens, callbacks);
+    try testing.expect(bridge.publisher.current == null and bridge.needs_publish);
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), Probe.options(check));
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &toggled, &tokens, callbacks);
+    try testing.expect(bridge.publisher.current == null);
+    bridge.focus_only = false;
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &toggled, &tokens, callbacks);
+    try testing.expect(bridge.publisher.current.? != snapshot);
+    // So does one with other elements (tokens).
+    bridge.focus_only = true;
+    try bridge.publish(&api, &queue, attachment, @ptrFromInt(1), &toggled, &[_]u64{ 0, 10, 30 }, callbacks);
+    bridge.focus_only = false;
+    try testing.expect(bridge.publisher.current == null and bridge.needs_publish);
 }
 
 pub const palette_root: u64 = 0;

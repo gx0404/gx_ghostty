@@ -51,7 +51,12 @@ pub const NodeSpec = struct {
     /// synthetic nonclient title bar. Native/DWM captions retain their provider.
     refuse_nonclient: bool = false,
 };
-pub const ActionKind = enum { focus, invoke, select, add_selection, remove_selection, set_value, toggle, expand, collapse, close, set_window_state, notification };
+/// `focus_changed` is internal: only `Publisher.moveFocus` queues it, so the
+/// App message loop raises the focus changed event (`raiseFocusChanged`).
+/// No provider method can queue it.
+pub const ActionKind = enum { focus, invoke, select, add_selection, remove_selection, set_value, toggle, expand, collapse, close, set_window_state, notification, focus_changed };
+/// UIA_AutomationFocusChangedEventId.
+const focus_changed_event: i32 = 20005;
 pub const Action = struct {
     attachment: refs.Attachment,
     snapshot_id: u64,
@@ -258,6 +263,49 @@ pub const Publisher = struct {
         if (!snapshot.isActive()) return 0;
         return snapshot.api.return_provider(snapshot.hwnd, wparam, lparam, snapshot.nodes[0].face(.simple));
     }
+    /// GUI thread: the keyboard focus moved to the node `node_id` of the
+    /// current snapshot (0: to none of its nodes) and nothing else changed.
+    /// The snapshot keeps its identity, so every element clients hold stays
+    /// valid, and `HasKeyboardFocus` and `GetFocus` report the new focus at
+    /// once. A move to another node queues its focus changed event for the
+    /// App message loop (`raiseFocusChanged`); nothing is raised from here,
+    /// and a full queue only loses the event. Returns false without an active
+    /// snapshot or such a node, and for a stable view, which reports the
+    /// focus of each content revision (`publishStable`).
+    pub fn moveFocus(self: *const Publisher, node_id: u64) bool {
+        return self.moveFocusWith(node_id, w32.PostMessageW);
+    }
+    fn moveFocusWith(self: *const Publisher, node_id: u64, post_message: anytype) bool {
+        const snapshot = self.current orelse return false;
+        if (!snapshot.isActive() or snapshot.view != null) return false;
+        if (node_id != 0 and snapshot.findNode(node_id) == null) return false;
+        if (snapshot.focus.swap(node_id, .acq_rel) == node_id or node_id == 0) return true;
+        _ = snapshot.queue.postWith(snapshot, node_id, .focus_changed, "", 0, post_message);
+        return true;
+    }
+    /// From the App message loop, outside locks (`PopupBridge.dispatch`):
+    /// raise UIA_AutomationFocusChangedEventId for `node_id` if it still has
+    /// the focus in the current snapshot. A true return is an API result,
+    /// not event receipt.
+    pub fn raiseFocusChanged(self: *const Publisher, node_id: u64) bool {
+        const snapshot = self.current orelse return false;
+        snapshot.retain();
+        defer snapshot.release();
+        if (!snapshot.isActive() or snapshot.focus.load(.acquire) != node_id) return false;
+        const node = snapshot.findNode(node_id) orelse return false;
+        const raise = snapshot.api.event orelse return false;
+        return raise(node.face(.simple), focus_changed_event) >= 0;
+    }
+    /// GUI thread: whether `specs` describe the current snapshot's elements
+    /// unchanged, for the same owner and window, apart from which one has
+    /// the focus (`NodeSpec.focused`), the one state `moveFocus` changes.
+    pub fn matchesExceptFocus(self: *const Publisher, attachment: refs.Attachment, hwnd: w32.HWND, specs: []const NodeSpec) bool {
+        const snapshot = self.current orelse return false;
+        if (!snapshot.isActive() or snapshot.view != null or snapshot.hwnd != hwnd or !snapshot.attachment.matches(attachment)) return false;
+        if (snapshot.nodes.len != specs.len) return false;
+        for (snapshot.nodes, specs) |*node, spec| if (!sameExceptFocus(node.spec, spec)) return false;
+        return true;
+    }
     /// Call outside locks. A true return is an API result, not event receipt.
     pub fn notify(self: *const Publisher, text: []const u8) bool {
         const snapshot = self.current orelse return false;
@@ -381,6 +429,11 @@ const Snapshot = struct {
     view: ?*ViewLifetime = null,
     active: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    /// The id of the node with the keyboard focus (0: none), first from the
+    /// specs' `focused`. The one state of a published snapshot that changes
+    /// in place (`Publisher.moveFocus`, GUI thread); providers read it
+    /// atomically, so a focus move needs no publication and revokes nothing.
+    focus: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     fn create(alloc: Allocator, api: *Api, queue: *Queue, attachment: refs.Attachment, hwnd: w32.HWND, id: u64, specs: []const NodeSpec) !*Snapshot {
         try validate(specs);
         if (!attachment.isValid()) return error.InvalidSnapshot;
@@ -399,8 +452,17 @@ const Snapshot = struct {
         }
         api.retain();
         queue.retain();
-        self.* = .{ .alloc = alloc, .arena = arena, .api = api, .queue = queue, .attachment = attachment, .hwnd = hwnd, .id = id, .nodes = nodes };
+        self.* = .{ .alloc = alloc, .arena = arena, .api = api, .queue = queue, .attachment = attachment, .hwnd = hwnd, .id = id, .nodes = nodes, .focus = .init(initialFocus(specs)) };
         return self;
+    }
+    fn initialFocus(specs: []const NodeSpec) u64 {
+        for (specs) |spec| if (spec.focused) return spec.id;
+        return 0;
+    }
+    fn findNode(self: *Snapshot, id: u64) ?*Node {
+        if (id == 0) return null;
+        for (self.nodes) |*node| if (node.spec.id == id) return node;
+        return null;
     }
     fn retain(self: *Snapshot) void {
         _ = self.count.fetchAdd(1, .monotonic);
@@ -418,6 +480,20 @@ const Snapshot = struct {
         }
     }
 };
+
+/// Field by field, strings by content. `focused` is the one field a focus
+/// move changes (`Publisher.matchesExceptFocus`).
+fn sameExceptFocus(a: NodeSpec, b: NodeSpec) bool {
+    inline for (@typeInfo(NodeSpec).@"struct".fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "focused")) continue;
+        const equal = if (field.type == []const u8)
+            std.mem.eql(u8, @field(a, field.name), @field(b, field.name))
+        else
+            std.meta.eql(@field(a, field.name), @field(b, field.name));
+        if (!equal) return false;
+    }
+    return true;
+}
 
 fn validate(nodes: []const NodeSpec) !void {
     if (nodes.len == 0 or nodes.len > max_nodes) return error.InvalidSnapshot;
@@ -575,7 +651,7 @@ fn property(face: *Face, id: i32, out: *Variant) callconv(.winapi) HR {
         30002 => out.* = integer(@bitCast(GetCurrentProcessId())),
         30003 => out.* = integer(@intFromEnum(node.role)),
         30005 => return stringProperty(face, node.name, out),
-        30008 => out.* = boolean(node.focused),
+        30008 => out.* = boolean(face.node.snapshot.focus.load(.acquire) == node.id),
         30009 => out.* = boolean(node.focusable),
         30010 => out.* = boolean(node.enabled),
         30011 => {
@@ -732,8 +808,9 @@ fn atPoint(face: *Face, x: f64, y: f64, out: *?*Face) callconv(.winapi) HR {
 fn getFocus(face: *Face, out: *?*Face) callconv(.winapi) HR {
     out.* = null;
     if (!live(face)) return UNAVAILABLE;
-    for (face.node.snapshot.nodes) |*node| if (node.spec.focused) return returnFace(node, .fragment, out);
-    return S_OK;
+    const snapshot = face.node.snapshot;
+    const node = snapshot.findNode(snapshot.focus.load(.acquire)) orelse return S_OK;
+    return returnFace(node, .fragment, out);
 }
 const RootTable = extern struct {
     unknown: UnknownTable = .{},
@@ -1123,4 +1200,142 @@ test "UIA announcement survives full queue and republication without duplicate d
     var cancelled = queue.pop().?;
     defer cancelled.deinit();
     try std.testing.expect(!announcement.consume(&cancelled));
+}
+
+test "UIA a focus move updates HasKeyboardFocus and GetFocus in place and queues one event" {
+    const alloc = std.testing.allocator;
+    const Recorder = struct {
+        var raised: usize = 0;
+        var face: ?*Face = null;
+        var event: i32 = 0;
+        fn raise(target: *Face, id: i32) callconv(.winapi) HR {
+            raised += 1;
+            face = target;
+            event = id;
+            return S_OK;
+        }
+        fn hasFocus(target: *Face) !bool {
+            var value: Variant = .{};
+            try std.testing.expectEqual(S_OK, property(target, 30008, &value));
+            try std.testing.expectEqual(@as(u16, 11), value.tag);
+            return value.data.integer != 0;
+        }
+        fn focusOf(root: *Face) !?*Node {
+            var out: ?*Face = null;
+            try std.testing.expectEqual(S_OK, getFocus(root, &out));
+            const focused = out orelse return null;
+            defer _ = releaseFace(focused);
+            return focused.node;
+        }
+    };
+    Recorder.raised = 0;
+    var api: Api = undefined;
+    api.count = .init(1);
+    api.notification = null;
+    api.event = Recorder.raise;
+    const queue = try Queue.create(alloc, @ptrFromInt(1));
+    defer queue.release();
+    var publisher: Publisher = .{};
+    defer publisher.deinit();
+    try publisher.publish(alloc, &api, queue, testAttachment(), @ptrFromInt(1), &.{
+        .{ .id = 1, .name = "Dialog", .patterns = .{ .window = true } },
+        .{ .id = 2, .parent = 0, .name = "A", .focusable = true, .focused = true },
+        .{ .id = 3, .parent = 0, .name = "B", .focusable = true },
+    });
+    const snapshot = publisher.current.?;
+    const root = snapshot.nodes[0].face(.root);
+    const a = snapshot.nodes[1].face(.simple);
+    const b = snapshot.nodes[2].face(.simple);
+    try std.testing.expect(try Recorder.hasFocus(a));
+    try std.testing.expect(!try Recorder.hasFocus(b));
+    try std.testing.expectEqual(@as(?*Node, &snapshot.nodes[1]), try Recorder.focusOf(root));
+
+    try std.testing.expect(publisher.moveFocusWith(3, testPost));
+    try std.testing.expect(!try Recorder.hasFocus(a));
+    try std.testing.expect(try Recorder.hasFocus(b));
+    try std.testing.expectEqual(@as(?*Node, &snapshot.nodes[2]), try Recorder.focusOf(root));
+    // Same identity: every element stays valid and actions on it are accepted.
+    try std.testing.expectEqual(snapshot, publisher.current.?);
+    var flags: u32 = 0;
+    try std.testing.expectEqual(S_OK, options(a, &flags));
+    try std.testing.expectEqual(S_OK, options(b, &flags));
+    try std.testing.expectEqual(@as(usize, 1), queue.length);
+    var queued = queue.pop().?;
+    defer queued.deinit();
+    try std.testing.expectEqual(ActionKind.focus_changed, queued.kind);
+    try std.testing.expectEqual(@as(u64, 3), queued.node_id);
+    try std.testing.expect(publisher.accepts(queued));
+    // No second event for the same node; no move to a node it does not have.
+    try std.testing.expect(publisher.moveFocusWith(3, testPost));
+    try std.testing.expect(!publisher.moveFocusWith(9, testPost));
+    try std.testing.expectEqual(@as(usize, 0), queue.length);
+    try std.testing.expect(try Recorder.hasFocus(b));
+    // The loop raises it while the node still has the focus.
+    try std.testing.expect(publisher.raiseFocusChanged(3));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
+    try std.testing.expectEqual(@as(?*Face, b), Recorder.face);
+    try std.testing.expectEqual(focus_changed_event, Recorder.event);
+    // An event the focus has already moved on from raises nothing.
+    try std.testing.expect(publisher.moveFocusWith(2, testPost));
+    var back = queue.pop().?;
+    defer back.deinit();
+    try std.testing.expectEqual(@as(u64, 2), back.node_id);
+    try std.testing.expect(!publisher.raiseFocusChanged(3));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.raised);
+    // Away from every node: nothing queued, nothing reports the focus.
+    try std.testing.expect(publisher.moveFocusWith(0, testPost));
+    try std.testing.expectEqual(@as(usize, 0), queue.length);
+    try std.testing.expect(!publisher.raiseFocusChanged(2));
+    try std.testing.expect(!try Recorder.hasFocus(a));
+    try std.testing.expect(!try Recorder.hasFocus(b));
+    try std.testing.expectEqual(@as(?*Node, null), try Recorder.focusOf(root));
+    // A hidden snapshot moves nothing.
+    publisher.hide();
+    try std.testing.expect(!publisher.moveFocusWith(2, testPost));
+}
+
+test "UIA only a focus difference matches a published snapshot" {
+    const alloc = std.testing.allocator;
+    var api: Api = undefined;
+    api.count = .init(1);
+    const queue = try Queue.create(alloc, @ptrFromInt(1));
+    defer queue.release();
+    var publisher: Publisher = .{};
+    defer publisher.deinit();
+    const attachment = testAttachment();
+    const hwnd: w32.HWND = @ptrFromInt(1);
+    var name = [_]u8{ 'O', 'K' };
+    const specs = [_]NodeSpec{
+        .{ .id = 1, .name = "Dialog", .patterns = .{ .window = true } },
+        .{ .id = 2, .parent = 0, .name = &name, .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = true },
+    };
+    try publisher.publish(alloc, &api, queue, attachment, hwnd, &specs);
+    // Another focus, and equal strings in other memory, still match.
+    var moved = specs;
+    moved[0].focused = true;
+    moved[1].focused = false;
+    var copy = [_]u8{ 'O', 'K' };
+    moved[1].name = &copy;
+    try std.testing.expect(publisher.matchesExceptFocus(attachment, hwnd, &moved));
+    // Anything else is a model change.
+    var renamed = moved;
+    renamed[1].name = "Cancel";
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, &renamed));
+    var disabled = moved;
+    disabled[1].enabled = false;
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, &disabled));
+    var resized = moved;
+    resized[1].bounds.width = 1;
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, &resized));
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, moved[0..1]));
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, @ptrFromInt(2), &moved));
+    var reopened = attachment;
+    reopened.revision += 1;
+    try std.testing.expect(!publisher.matchesExceptFocus(reopened, hwnd, &moved));
+    // A stable view reports the focus of each content revision instead.
+    try publisher.publishStableWithId(alloc, &api, queue, attachment, hwnd, 99, &specs);
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, &moved));
+    try std.testing.expect(!publisher.moveFocusWith(1, testPost));
+    publisher.hide();
+    try std.testing.expect(!publisher.matchesExceptFocus(attachment, hwnd, &specs));
 }
