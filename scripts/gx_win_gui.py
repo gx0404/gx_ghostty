@@ -84,7 +84,8 @@ with an action and its keys
                                         scheme (follow|light|dark) and high contrast (follow|on|off)
                                         without touching the Windows settings (WM_USER+0x49, wparam
                                         App.SimulatedSystemTheme); follow/follow returns to the system
-A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end.
+A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end. A
+key, click or mouse_down whose SendInput fails part way releases its key, button and modifiers at once.
 wheel with mods (a list such as ["ctrl"], e.g. Ctrl+wheel font zoom) presses those keys first, checks
 the guards again, sends the notches and then always releases exactly those keys, also when a guard
 or SendInput fails in between (audited as an abort release under GX_PERF_GUARD_LOG).
@@ -2082,6 +2083,20 @@ class Instance:
                 w.send([w.unicode_input(unit, False), w.unicode_input(unit, True)])
             time.sleep(delay)
 
+    def send_or_release(self, events: Sequence[Any], ups: Sequence[Any], control: str) -> None:
+        """One SendInput of `events`. When it fails part way, some of its downs may be in the input
+        stream: send `ups`, the release of everything the batch presses, then raise (audited as an
+        abort release under GX_PERF_GUARD_LOG)."""
+        try:
+            win32().send(events)
+        except GuiError:
+            if ups:
+                try:
+                    self.release_input(ups, control, True)
+                except GuiError:
+                    pass
+            raise
+
     def press(self, chord: str, repeat: int = 1, delay: float = 0.05) -> None:
         w = win32()
         mods, vk = parse_chord(chord)
@@ -2090,7 +2105,8 @@ class Instance:
             events = [w.key_input(mod, False) for mod in mods]
             events += [w.key_input(vk, False), w.key_input(vk, True)]
             events += [w.key_input(mod, True) for mod in reversed(mods)]
-            w.send(events)
+            self.send_or_release(events, [w.key_input(vk, True)] + [w.key_input(mod, True) for mod in reversed(mods)],
+                                 chord)
             if index + 1 < repeat:
                 time.sleep(delay)
 
@@ -2180,7 +2196,8 @@ class Instance:
         elif action != "move":
             raise UsageError(f"unknown mouse action {action!r}")
         events += self._modifier_events(mods, True)
-        w.send(events)
+        ups = ([w.mouse_input(up, data=data)] if action in ("click", "down") else []) + self._modifier_events(mods, True)
+        self.send_or_release(events, ups, "+".join([*mods, button]))
 
     def wheel(self, x: int, y: int, delta: int = 120, horizontal: bool = False, count: int = 1,
               mods: Sequence[str] = ()) -> None:

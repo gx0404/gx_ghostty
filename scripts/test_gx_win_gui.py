@@ -678,6 +678,41 @@ class InputGuardTests(unittest.TestCase):
         error, rows, _ = self.guard_rows(lambda instance: instance.mouse(10, 10), win)
         self.assertEqual(("instance_hung", "ensure_point", "Ghost"), (error.cause, rows[-1]["check"], rows[-1]["other_class"]))
 
+    def test_a_chord_or_click_that_fails_part_way_releases_what_it_pressed(self):
+        cases = {
+            "chord": (lambda instance: instance.press("ctrl+shift+t"),
+                      [("key", 0x54, True), ("key", 0x10, True), ("key", 0x11, True)], "ctrl+shift+t"),
+            "ctrl+click": (lambda instance: instance.mouse(10, 10, mods=["ctrl"]),
+                           [("mouse", 0x0004, 0, 0, 0), ("key", 0x11, True)], "ctrl+left"),
+            "mouse_down": (lambda instance: instance.mouse(10, 10, action="down", button="right"),
+                           [("mouse", 0x0010, 0, 0, 0)], "right"),
+        }
+        for name, (act, ups, control) in cases.items():
+            with self.subTest(case=name):
+                fake = FakeWin32(self.PID, self.PID)
+                calls: list = []
+                def send(inputs, calls=calls):
+                    calls.append(list(inputs))
+                    if len(calls) == 1:
+                        raise gui.GuiError("SendInput sent 1 of 4 events (error 5)")
+                fake.send = send
+                with tempfile.TemporaryDirectory() as temp:
+                    log = Path(temp) / "guards.jsonl"
+                    instance = gui.Instance(self.PID, "C:/g/ghostty.exe", Path(temp), creation=1, launched=0)
+                    with mock.patch.dict(os.environ, {"GX_PERF_BATCH_ID": "batch", "GX_PERF_GUARD_LOG": str(log)}), \
+                            mock.patch.object(gui, "win32", return_value=fake), \
+                            self.assertRaisesRegex(gui.GuiError, "sent 1 of 4"):
+                        act(instance)
+                    rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(ups, calls[1])
+                self.assertEqual(("release", control, True, "pass"), (rows[-1]["event"], rows[-1]["control"],
+                                                                      rows[-1]["abort_release"], rows[-1]["status"]))
+        fake = FakeWin32(self.PID, self.PID)  # a plain move presses nothing, so nothing is released
+        fake.send = mock.Mock(side_effect=gui.GuiError("SendInput sent 0 of 1 events"))
+        with mock.patch.object(gui, "win32", return_value=fake), self.assertRaises(gui.GuiError):
+            gui.Instance(self.PID, "C:/g/ghostty.exe", Path("."), creation=1, launched=0).mouse(5, 5, action="move")
+        self.assertEqual(1, fake.send.call_count)
+
     def test_the_caption_probe_audits_a_refusal_but_no_pass(self):
         window = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (0, 0, 400, 300), True, False, False)
         fake = FakeWin32(self.PID, self.PID)
