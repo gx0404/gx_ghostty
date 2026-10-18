@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0050）之后的号。在册的 44 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0050，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0051）之后的号。在册的 45 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0051，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -125,6 +125,8 @@
 | GX-0048 | `src/os/mouse.zig` | `fork(gx): GX-0048` | active |
 | GX-0049 | `src/cli/validate_config.zig` | `fork(gx): GX-0049` | active |
 | GX-0050 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0050` | active |
+| GX-0051 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0051` | active |
+| GX-0051 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0051` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1494,3 +1496,12 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：保持 hook 位于 Frame.complete/frameCompleted 之后、仍持 draw_mutex；不能移到 present 内，也不能在新 context 建立后释放旧名字。`drawable` 的 GUI 读取须持 draw_mutex；Windows GL 操作只在渲染线程。删三个 begin/end 块，并把三个明确的 unused-self 替换标记还原为 `_ = self;` 后，三个函数应与上游一致。
 - 移除条件：上游提供等价的 context-reset 资源废弃/重建生命周期与失败守卫时，移除三个钩子和 fork 实现，并把登记改为 removed。
 - 验证：`python scripts/run_unittests.py test_fork_patches` 中 `Gx0050ShapeTests` 锁定 Windows 门控、调用位置、错误日志、失败守卫与上游还原；`just test --filter D-11` 覆盖旧 program 删除所属 context、名字复用、正常 teardown、创建/makeCurrent/loader 失败及 GUI ready 判定。再跑 renderer/apprt.win32 定向测试和 W14；真实 TDR 与未被夹具覆盖的第一恢复帧不得以单测代证。
+
+## GX-0051 OpenGL native 混合的目标编码空间
+
+- 文件：`src/renderer/OpenGL.zig`、`src/renderer/opengl/Target.zig`；active，未回馈上游。Target增加默认true的srgb选项和模块说明，纯新增部分用begin/end；image2D格式参数替换有紧邻单行标记。OpenGL给initTarget传blending.isLinear，textureOptions的自定义shader中间目标采用同样规则；两处原unused-self discard因开始使用self而用单行标记替换。三条测试入口用begin/end，实现在fork新路径`src/renderer/opengl/gx_color_test.zig`。
+- 原因：native的shader输出是已编码RGB，写入启用FRAMEBUFFER_SRGB的sRGBA目标会再次编码，#808080变为188；Windows与GTK均实测复现。
+- 行为：native最终目标和自定义shader ping-pong目标使用RGBA8；linear/linear-corrected保持sRGBA。图片和彩色atlas的源采样格式不改，保留现有解码/按模式编码逻辑。present/export/恢复后的FRAMEBUFFER_SRGB状态不改；native的RGBA8附件不会因此编码。既有配置重载会重建目标与中间纹理，使用当前模式。
+- 同步：中间目标与最终目标同按模式选格式（中间那次多余编码会在下次采样时抵消，只留 8 位往返的 ±1 量化误差，统一格式免去这层误差）；不能把图片/彩色atlas源改成RGBA8。保持默认srgb=true以兼容直接Target.init调用；保持generic.changeConfig更新api.blending与target_config_modified以及FrameState.resize重建中间纹理的链。上游如重构这条链，需要同步审查本补丁。
+- 移除条件：上游OpenGL目标与中间纹理已按混合模式选择编码空间，且同色表/重载/恢复验证等价通过时移除；Metal已使用类似模式选择，不属于本补丁。
+- 验证：D-16注入GL表的最终目标、中间目标、源采样格式测试；Windows renderer/apprt.win32和GTK renderer定向测试；两端native/linear/linear-corrected不透明色表，Kitty图像、两级透传shader，Windows模式重载和模拟GPU重置。低alpha、文字抗锯齿、透明背景、VM 软件 GL（Mesa）、真实TDR和其他显示链另验，验证前保持 PENDING，不以不透明探针代证。
