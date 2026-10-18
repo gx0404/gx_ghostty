@@ -206,6 +206,8 @@ uia_api: ?*Uia.Api = null,
 uia_queue: ?*Uia.Queue = null,
 uia_initializing: bool = false,
 uia_popups: @import("ui/uia_bridge.zig").Registry = .{},
+/// Providers of the terminal HWNDs UIA asked for (D-29; `uiaForTerminal`).
+uia_terminals: @import("ui/uia_bridge.zig").TerminalRegistry = .{},
 fluent_icons: @import("ui/fluent_icons.zig").Cache = .{},
 drop_feedback: @import("ui/DropFeedback.zig") = .{},
 pending_drops: std.ArrayList(PendingDrop) = .empty,
@@ -946,6 +948,7 @@ pub fn terminate(self: *App) void {
     self.ui_ids.epoch = 0;
     if (self.uia_queue) |queue| queue.close();
     self.uia_popups.deinit();
+    self.uia_terminals.deinit();
     self.drop_closing = true;
     var pending_drops = self.pending_drops;
     self.pending_drops = .empty;
@@ -1122,6 +1125,15 @@ pub fn uiaForWindow(self: *App, window: *Window, wparam: usize, lparam: isize) i
     return live.uia_bridge.publisher.returnProvider(wparam, lparam);
 }
 
+/// UIA's WM_GETOBJECT of a terminal HWND (D-29): the terminal's own provider,
+/// so the element that has the system focus is the named pane screen readers
+/// announce. The Window fragment no longer repeats it as a sibling node.
+pub fn uiaForTerminal(self: *App, surface: *Surface, wparam: usize, lparam: isize) isize {
+    if (w32.objectId(lparam) != Uia.root_object_id) return 0;
+    if (!self.ensureUia()) return 0;
+    return self.uia_terminals.getObject(self.uia_api.?, self.uia_queue.?, @import("Pane.zig").fromLocal(surface), wparam, lparam);
+}
+
 fn refreshUia(self: *App) void {
     const api = self.uia_api orelse return;
     const queue = self.uia_queue orelse return;
@@ -1149,6 +1161,7 @@ fn onUia(self: *App) void {
         var action = value;
         defer action.deinit();
         if (self.uia_popups.dispatch(self, &action)) continue;
+        if (self.uia_terminals.dispatch(self, &action)) continue;
         if (self.dispatchRemoteUia(&action)) continue;
         // dispatch may close a window or enter a modal loop. Stop iterating as
         // soon as the snapshot owner matches; no list pointer survives it.
@@ -4283,6 +4296,8 @@ fn surfaceWndProc(
             // parent Window destruction). Clear state so deinit()
             // doesn't double-destroy. Lifecycle is managed by Window.
             _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+            // D-29: the UIA elements of this terminal become inert.
+            surface.app.uia_terminals.forget(hwnd);
             surface.hwnd = null;
             surface.core_surface_ready = false;
             return 0;
@@ -4364,6 +4379,9 @@ fn surfaceWndProc(
             // to accessibility tools anyway, so this only drops the generic
             // window-frame proxy that screen readers would otherwise see.
             if (w32.objectId(lparam) == w32.OBJID_CLIENT) return 0;
+            // UIA's own request gets the terminal's provider instead (D-29):
+            // a named pane, the element screen readers announce on focus.
+            if (w32.objectId(lparam) == Uia.root_object_id) return surface.app.uiaForTerminal(surface, wparam, lparam);
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
@@ -4854,6 +4872,132 @@ test "OLE outer-loop retirement revokes before destroying registered child and p
     app.reapDropTargets();
     try testing.expect(app.retired_drop_targets == null);
     try testing.expect(w32.IsWindow(child) == 0 and w32.IsWindow(parent) == 0);
+}
+
+test "D-29 a terminal HWND is its own named pane for an external UIA client" {
+    // The terminal HWND holds the system focus, so it is what a screen reader
+    // announces: through the real window procedure and a real UIAutomationCore
+    // client it must be the named terminal pane, not an anonymous Win32
+    // window. Windows live on a worker GUI thread; the runner's message queue
+    // is never touched.
+    const UiaClient = @import("ui/uia_client.zig");
+    const Probe = struct {
+        child: w32.HWND,
+        stage: std.atomic.Value(u32) = .init(0),
+        failure: ?anyerror = null,
+        framework: [64]u8 = undefined,
+        framework_len: usize = 0,
+        name: [256]u8 = undefined,
+        name_len: usize = 0,
+        localized: [128]u8 = undefined,
+        localized_len: usize = 0,
+        automation_id: [128]u8 = undefined,
+        automation_id_len: usize = 0,
+        control_type: i32 = 0,
+        native: i32 = 0,
+        after_destroy: i32 = 0,
+
+        fn client(self: *@This()) void {
+            self.inspect() catch |err| {
+                self.failure = err;
+            };
+            self.stage.store(3, .release);
+        }
+        fn inspect(self: *@This()) !void {
+            const automation = try UiaClient.Client.init();
+            defer automation.deinit();
+            const element = try automation.fromHandle(self.child);
+            defer element.release();
+            self.framework_len = (try element.string(30024, &self.framework)).len;
+            self.name_len = (try element.string(30005, &self.name)).len;
+            self.localized_len = (try element.string(30004, &self.localized)).len;
+            self.automation_id_len = (try element.string(30011, &self.automation_id)).len;
+            self.control_type = try element.int(30003);
+            self.native = try element.int(30020);
+            // The GUI thread destroys the terminal HWND now: an element held
+            // from before must then be unavailable, not a stale terminal.
+            self.stage.store(1, .release);
+            while (self.stage.load(.acquire) < 2) w32.Sleep(1);
+            self.after_destroy = element.result(30005);
+        }
+    };
+    const Gui = struct {
+        fn run(result: *?anyerror) void {
+            check() catch |err| {
+                result.* = err;
+            };
+        }
+        fn check() !void {
+            const testing = std.testing;
+            const alloc = std.heap.page_allocator;
+            var apartment = ComApartment.init();
+            defer apartment.deinit() catch {};
+            try apartment.ensureCom();
+            const api = try Uia.Api.load(alloc);
+            defer api.release();
+            const static = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+            const sink = w32.CreateWindowExW(0, static, static, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(sink);
+            const queue = try Uia.Queue.create(alloc, sink);
+            defer {
+                queue.close();
+                queue.release();
+            }
+            var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(29), .uia_api = api, .uia_queue = queue };
+            var window: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+            var surface: Surface = .{ .app = &app, .parent_window = &window, .ui_reference = try app.ui_ids.surface(29) };
+            surface.ui_attachment = try app.ui_ids.attach(surface.ui_reference, window.ui_reference);
+            const title = "GX D-29 终端 ✓";
+            @memcpy(surface.title[0..title.len], title);
+            surface.title_len = title.len;
+            const hinstance = w32.GetModuleHandleW(null);
+            const class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTerminalD29Test");
+            const terminal_class: w32.WNDCLASSEXW = .{ .cbSize = @sizeOf(w32.WNDCLASSEXW), .style = 0, .lpfnWndProc = &surfaceWndProc, .cbClsExtra = 0, .cbWndExtra = 0, .hInstance = hinstance, .hIcon = null, .hCursor = null, .hbrBackground = null, .lpszMenuName = null, .lpszClassName = class, .hIconSm = null };
+            if (w32.RegisterClassExW(&terminal_class) == 0) return error.TestWindowFailed;
+            defer _ = w32.UnregisterClassW(class, hinstance);
+            const parent = w32.CreateWindowExW(0, static, static, 0, 0, 0, 320, 200, null, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(parent);
+            const child = w32.CreateWindowExW(0, class, class, w32.WS_CHILD, 0, 0, 320, 200, parent, null, hinstance, null) orelse return error.TestWindowFailed;
+            defer if (w32.IsWindow(child) != 0) {
+                _ = w32.DestroyWindow(child);
+            };
+            surface.hwnd = child;
+            _ = w32.SetWindowLongPtrW(child, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&surface)));
+
+            const probe = try alloc.create(Probe);
+            probe.* = .{ .child = child };
+            const thread = try std.Thread.spawn(.{}, Probe.client, .{probe});
+            var joined = false;
+            // After a timeout the client may still be inside UIA: it keeps its
+            // probe (leaked, never dangling) instead of a join that hangs.
+            errdefer if (!joined) thread.detach();
+            defer if (joined) alloc.destroy(probe);
+            UiaClient.pumpUntil(&probe.stage, 1, 10_000) catch |err| {
+                probe.stage.store(2, .release);
+                return err;
+            };
+            if (probe.stage.load(.acquire) == 1) {
+                _ = w32.DestroyWindow(child);
+                probe.stage.store(2, .release);
+            }
+            try UiaClient.pumpUntil(&probe.stage, 3, 10_000);
+            thread.join();
+            joined = true;
+            try testing.expectEqualStrings("GhosttyGX", probe.framework[0..probe.framework_len]);
+            if (probe.failure) |err| return err;
+            try testing.expectEqualStrings(title, probe.name[0..probe.name_len]);
+            try testing.expectEqual(@as(i32, 50033), probe.control_type);
+            try testing.expectEqualStrings(i18n.tr("Terminal"), probe.localized[0..probe.localized_len]);
+            var id_buffer: [64]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation}), probe.automation_id[0..probe.automation_id_len]);
+            try testing.expectEqual(@as(i32, @bitCast(@as(u32, @truncate(@intFromPtr(child))))), probe.native);
+            try testing.expectEqual(UiaClient.element_not_available, probe.after_destroy);
+        }
+    };
+    var result: ?anyerror = null;
+    const worker = try std.Thread.spawn(.{}, Gui.run, .{&result});
+    worker.join();
+    if (result) |err| return err;
 }
 
 test "SimulatedSystemTheme packs the scheme and high contrast" {

@@ -50,6 +50,16 @@ pub const NodeSpec = struct {
     /// Only a root with an actual custom caption suppresses the HWND host's
     /// synthetic nonclient title bar. Native/DWM captions retain their provider.
     refuse_nonclient: bool = false,
+    /// Root only, never `focused`: the HWND host provider reports this
+    /// element's keyboard focus and bounding rectangle, which then follow the
+    /// window itself. A terminal HWND takes the system focus, and UIA makes
+    /// the root of the focused HWND the focused element while GetFocus names
+    /// no other one, so the element screen readers announce is this one.
+    host_state: bool = false,
+    /// LocalizedControlType; empty: UIA derives it from `role`.
+    localized_type: []const u8 = "",
+    /// AutomationId; empty: "gx-<id>".
+    automation_id: []const u8 = "",
 };
 /// `focus_changed` is internal: only `Publisher.moveFocus` queues it, so the
 /// App message loop raises the focus changed event (`raiseFocusChanged`).
@@ -462,6 +472,8 @@ const Snapshot = struct {
             var owned = spec;
             owned.name = try storage.dupe(u8, spec.name);
             owned.value = try storage.dupe(u8, spec.value);
+            owned.localized_type = try storage.dupe(u8, spec.localized_type);
+            owned.automation_id = try storage.dupe(u8, spec.automation_id);
             nodes[index] = .{ .snapshot = self, .index = index, .spec = owned, .faces = undefined };
             inline for (0..face_count) |i| nodes[index].faces[i] = .{ .vtable = vtables[i], .node = &nodes[index] };
         }
@@ -516,7 +528,8 @@ fn validate(nodes: []const NodeSpec) !void {
     for (nodes, 0..) |node, i| {
         if (node.id == 0 or (if (i == 0) node.parent != null else node.parent == null or node.parent.? >= i)) return error.InvalidSnapshot;
         for (nodes[0..i]) |other| if (other.id == node.id) return error.InvalidSnapshot;
-        for ([_][]const u8{ node.name, node.value }) |value| {
+        if (node.host_state and (i != 0 or node.focused)) return error.InvalidSnapshot;
+        for ([_][]const u8{ node.name, node.value, node.localized_type, node.automation_id }) |value| {
             if (value.len > max_string_bytes or !std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidSnapshot;
             bytes += value.len;
         }
@@ -556,6 +569,10 @@ fn equalGuid(a: *const w32.GUID, b: *const w32.GUID) bool {
 }
 fn live(face: *Face) bool {
     return face.node.snapshot.isActive();
+}
+/// A root whose focus and rectangle its HWND host reports (`NodeSpec.host_state`).
+fn hostState(node: *const Node) bool {
+    return node.index == 0 and node.spec.host_state;
 }
 fn retainFace(face: *Face) callconv(.winapi) u32 {
     return @intCast(face.node.snapshot.count.fetchAdd(1, .monotonic) + 1);
@@ -650,7 +667,8 @@ fn property(face: *Face, id: i32, out: *Variant) callconv(.winapi) HR {
     if (!live(face)) return UNAVAILABLE;
     const node = face.node.spec;
     switch (id) {
-        30001 => {
+        // VT_EMPTY for a host-state root: UIA takes the host window's.
+        30001 => if (!hostState(face.node)) {
             const array = SafeArrayCreateVector(5, 0, 4) orelse return E_OUTOFMEMORY;
             const values = [_]f64{ node.bounds.x, node.bounds.y, node.bounds.width, node.bounds.height };
             for (values, 0..) |value, i| {
@@ -665,11 +683,15 @@ fn property(face: *Face, id: i32, out: *Variant) callconv(.winapi) HR {
         },
         30002 => out.* = integer(@bitCast(GetCurrentProcessId())),
         30003 => out.* = integer(@intFromEnum(node.role)),
+        30004 => if (node.localized_type.len > 0) return stringProperty(face, node.localized_type, out),
         30005 => return stringProperty(face, node.name, out),
-        30008 => out.* = boolean(face.node.snapshot.focus.load(.acquire) == node.id),
+        30008 => if (!hostState(face.node)) {
+            out.* = boolean(face.node.snapshot.focus.load(.acquire) == node.id);
+        },
         30009 => out.* = boolean(node.focusable),
         30010 => out.* = boolean(node.enabled),
         30011 => {
+            if (node.automation_id.len > 0) return stringProperty(face, node.automation_id, out);
             var buffer: [32]u8 = undefined;
             const id_text = std.fmt.bufPrint(&buffer, "gx-{d}", .{node.id}) catch return E_INVALIDARG;
             return stringProperty(face, id_text, out);
@@ -772,7 +794,8 @@ fn runtimeId(face: *Face, out: *?*anyopaque) callconv(.winapi) HR {
 fn bounds(face: *Face, out: *Rect) callconv(.winapi) HR {
     out.* = .{};
     if (!live(face)) return UNAVAILABLE;
-    out.* = face.node.spec.bounds;
+    // An empty rectangle: UIA takes the host window's.
+    if (!hostState(face.node)) out.* = face.node.spec.bounds;
     return S_OK;
 }
 fn embedded(face: *Face, out: *?*anyopaque) callconv(.winapi) HR {
@@ -1169,6 +1192,67 @@ test "UIA custom caption root alone refuses synthetic nonclient support" {
         try std.testing.expectEqual(@as(u32, if (custom_caption) 0x52 else 0x12), root_flags);
         try std.testing.expectEqual(@as(u32, 0x12), child_flags);
     }
+}
+
+fn expectStringProperty(face: *Face, id: i32, expected: []const u8) !void {
+    var value: Variant = .{};
+    try std.testing.expectEqual(S_OK, property(face, id, &value));
+    try std.testing.expectEqual(@as(u16, 8), value.tag);
+    const text: [*:0]u16 = @ptrCast(@alignCast(value.data.pointer.?));
+    defer SysFreeString(text);
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, std.mem.span(text));
+    defer std.testing.allocator.free(utf8);
+    try std.testing.expectEqualStrings(expected, utf8);
+}
+
+test "UIA a host-state root leaves its focus and rectangle to the window and names its type" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const api = try Api.load(alloc);
+    defer api.release();
+    const queue = try Queue.create(alloc, @ptrFromInt(1));
+    defer queue.release();
+    var publisher: Publisher = .{};
+    defer publisher.deinit();
+    const area: Rect = .{ .x = 1, .y = 2, .width = 3, .height = 4 };
+    try publisher.publishStable(alloc, api, queue, testAttachment(), @ptrFromInt(1), &.{
+        .{ .id = 1, .name = "pwsh", .role = .pane, .bounds = area, .focusable = true, .host_state = true, .localized_type = "terminal", .automation_id = "gx-terminal-7" },
+        .{ .id = 2, .parent = 0, .name = "output", .role = .text, .bounds = area },
+    });
+    const nodes = publisher.current.?.nodes;
+    const root = nodes[0].face(.simple);
+    // HasKeyboardFocus and BoundingRectangle: VT_EMPTY, so UIA asks the host.
+    for ([_]i32{ 30008, 30001 }) |id| {
+        var value: Variant = .{ .tag = 99 };
+        try std.testing.expectEqual(S_OK, property(root, id, &value));
+        try std.testing.expectEqual(@as(u16, 0), value.tag);
+    }
+    var rect: Rect = area;
+    try std.testing.expectEqual(S_OK, bounds(nodes[0].face(.fragment), &rect));
+    try std.testing.expectEqual(Rect{}, rect);
+    // Its child keeps its own.
+    try std.testing.expectEqual(S_OK, bounds(nodes[1].face(.fragment), &rect));
+    try std.testing.expectEqual(area, rect);
+    var child_focus: Variant = .{};
+    try std.testing.expectEqual(S_OK, property(nodes[1].face(.simple), 30008, &child_focus));
+    try std.testing.expectEqual(@as(u16, 11), child_focus.tag);
+    // GetFocus names no element: the root of the focused window is the focus.
+    var focused: ?*Face = null;
+    try std.testing.expectEqual(S_OK, getFocus(nodes[0].face(.root), &focused));
+    try std.testing.expect(focused == null);
+    try expectStringProperty(root, 30005, "pwsh");
+    try expectStringProperty(root, 30004, "terminal");
+    try expectStringProperty(root, 30011, "gx-terminal-7");
+    // Unset strings keep the defaults: the id-based AutomationId, no type text.
+    try expectStringProperty(nodes[1].face(.simple), 30011, "gx-2");
+    var child_type: Variant = .{ .tag = 99 };
+    try std.testing.expectEqual(S_OK, property(nodes[1].face(.simple), 30004, &child_type));
+    try std.testing.expectEqual(@as(u16, 0), child_type.tag);
+    // Only an unfocused root takes the host's state; strings are checked as names are.
+    try std.testing.expectError(error.InvalidSnapshot, validate(&.{ .{ .id = 1, .name = "Window" }, .{ .id = 2, .parent = 0, .name = "Pane", .host_state = true } }));
+    try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .host_state = true, .focused = true }}));
+    try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .automation_id = "a\x00b" }}));
+    try std.testing.expectError(error.InvalidSnapshot, validate(&.{.{ .id = 1, .name = "Pane", .localized_type = "\xff" }}));
 }
 
 test "UIA announcement survives full queue and republication without duplicate delivery" {

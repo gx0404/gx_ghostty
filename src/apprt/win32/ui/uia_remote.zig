@@ -4,6 +4,7 @@ const std = @import("std");
 const App = @import("../App.zig");
 const RemotePane = @import("../RemotePane.zig");
 const uia = @import("uia.zig");
+const uia_bridge = @import("uia_bridge.zig");
 const w32 = @import("../win32.zig");
 const refs = @import("../../../gx/ui_ref.zig");
 const protocol = @import("../../../gx/remote_protocol.zig");
@@ -46,19 +47,20 @@ pub const Bridge = struct {
         var bounds: w32.RECT = undefined;
         if (w32.GetWindowRect(hwnd, &bounds) == 0) return self.hide();
         const rect: uia.Rect = .{ .x = @floatFromInt(bounds.left), .y = @floatFromInt(bounds.top), .width = @floatFromInt(@max(0, bounds.right - bounds.left)), .height = @floatFromInt(@max(0, bounds.bottom - bounds.top)) };
-        const title = pane.getTitle() orelse "";
         const text = pane.ui.visible_text;
-        const focused = w32.GetFocus() == hwnd;
+        var nodes: [18]uia.NodeSpec = undefined;
+        // The same terminal element as a local pane's (D-29): the window
+        // reports its focus, so a focus change needs no new revision.
+        var id_buffer: [48]u8 = undefined;
+        nodes[0] = uia_bridge.terminalRoot(pane.getTitle() orelse "", pane.ui_reference, &id_buffer);
         var signature = std.hash.Wyhash.init(0);
         signature.update(std.mem.asBytes(&rect));
-        signature.update(&.{@intFromBool(focused)});
-        signature.update(title);
-        signature.update(&.{0});
-        signature.update(text);
+        for ([_][]const u8{ nodes[0].name, nodes[0].localized_type, nodes[0].automation_id, text }) |part| {
+            signature.update(part);
+            signature.update(&.{0});
+        }
         const content_hash = signature.final();
         if (self.publisher.current != null and self.content_hash == content_hash) return;
-        var nodes: [18]uia.NodeSpec = undefined;
-        nodes[0] = .{ .id = 1, .name = title, .role = .pane, .bounds = rect, .focusable = true, .focused = focused };
         var offset: usize = 0;
         var count: usize = 1;
         while (offset < text.len and count < nodes.len) {

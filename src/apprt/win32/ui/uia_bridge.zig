@@ -3,6 +3,7 @@
 const std = @import("std");
 const App = @import("../App.zig");
 const Window = @import("../Window.zig");
+const Pane = @import("../Pane.zig");
 const w32 = @import("../win32.zig");
 const uia = @import("uia.zig");
 const refs = @import("../../../gx/ui_ref.zig");
@@ -24,7 +25,6 @@ const Binding = union(enum) {
     close_window,
     select_tab: refs.Reference,
     close_tab: refs.Reference,
-    focus_surface: refs.Attachment,
 };
 
 const Builder = struct {
@@ -120,20 +120,8 @@ pub const WindowBridge = struct {
                 _ = try button(&builder, 0, i18n.tr("Launch Profiles"), clientRect(.{ .left = geometry.profiles.left, .top = geometry.profiles.top, .right = geometry.profiles.right, .bottom = geometry.profiles.bottom }, origin), .profiles);
             }
         }
-        if (window.tab_count > 0 and !minimized) {
-            const focus = w32.GetFocus();
-            var iterator = window.tab_trees[window.active_tab].iterator();
-            while (iterator.next()) |entry| {
-                const pane = entry.view.pane();
-                const state = pane.snapshot();
-                if (!state.ready or !state.attachment.isValid()) continue;
-                const surface_hwnd = pane.nativeHandle() orelse continue;
-                if (w32.IsWindowVisible_(surface_hwnd) == 0) continue;
-                var pane_rect: w32.RECT = undefined;
-                if (w32.GetWindowRect(surface_hwnd, &pane_rect) == 0) continue;
-                _ = try builder.add(.{ .id = 0, .parent = 0, .role = .pane, .name = if (state.title.len > 0) state.title.slice() else i18n.tr("Terminal"), .bounds = screenRect(pane_rect), .focusable = true, .focused = focus == surface_hwnd }, .{ .focus_surface = state.attachment });
-            }
-        }
+        // No node for a terminal pane: its own HWND is its element
+        // (`terminalRoot`), which UIA places under this window's element.
         for (builder.specs[1..builder.length]) |*spec| {
             if (!enabled) spec.enabled = false;
             if (minimized) spec.offscreen = true;
@@ -180,12 +168,6 @@ pub const WindowBridge = struct {
                 const index = window.resolveTab(tab) orelse return false;
                 window.closeTabByIndex(index);
             },
-            .focus_surface => |attachment| {
-                if (action.kind != .focus) return false;
-                const pane = app.resolvePaneView(attachment) orelse return false;
-                const target = pane.nativeHandle() orelse return false;
-                _ = w32.SetFocus(target);
-            },
             else => {
                 if (action.kind != .invoke) return false;
                 switch (binding) {
@@ -208,6 +190,114 @@ pub const WindowBridge = struct {
     }
 };
 
+/// The UIA element of a terminal pane (D-29): the root of its own HWND's
+/// provider, a local Surface's GhosttyTerminal or a RemotePane window. That
+/// HWND takes the system focus, so this is the element screen readers
+/// announce: named after the terminal, its type localized, its focus and
+/// rectangle those of the window itself (`host_state`). A Window fragment
+/// never repeats it: UIA places child HWNDs under their window's element.
+pub fn terminalRoot(title: []const u8, reference: refs.Reference, automation_id: *[48]u8) uia.NodeSpec {
+    return .{
+        .id = 1,
+        .name = if (title.len > 0) title else i18n.tr("Terminal"),
+        .role = .pane,
+        .localized_type = i18n.tr("Terminal"),
+        // Unique among sibling panes for the whole life of the terminal.
+        .automation_id = std.fmt.bufPrint(automation_id, "gx-terminal-{d}", .{reference.generation}) catch unreachable,
+        .focusable = true,
+        .host_state = true,
+    };
+}
+
+/// One terminal HWND's provider (`terminalRoot`). A new title or language
+/// refreshes it without revoking the elements clients hold; a new attachment
+/// (the pane moved to another window) or `hide` revokes them.
+pub const TerminalBridge = struct {
+    publisher: uia.Publisher = .{},
+    attachment: ?refs.Attachment = null,
+    content_hash: ?u64 = null,
+
+    pub fn hide(self: *TerminalBridge) void {
+        self.publisher.hide();
+        self.attachment = null;
+        self.content_hash = null;
+    }
+    /// GUI thread, for a WM_GETOBJECT of `hwnd`, the pane's own window.
+    pub fn publish(self: *TerminalBridge, api: *uia.Api, queue: *uia.Queue, pane: Pane, hwnd: w32.HWND) !void {
+        errdefer self.hide();
+        const state = pane.snapshot();
+        if (!state.attachment.isValid()) return self.hide();
+        if (self.attachment) |old| if (!old.matches(state.attachment)) self.hide();
+        var id_buffer: [48]u8 = undefined;
+        const root = terminalRoot(state.title.slice(), state.reference, &id_buffer);
+        var signature = std.hash.Wyhash.init(0);
+        for ([_][]const u8{ root.name, root.localized_type, root.automation_id }) |text| {
+            signature.update(text);
+            signature.update(&.{0});
+        }
+        const content_hash = signature.final();
+        if (self.publisher.current != null and self.content_hash == content_hash) return;
+        try self.publisher.publishStable(std.heap.page_allocator, api, queue, state.attachment, hwnd, &.{root});
+        self.attachment = state.attachment;
+        self.content_hash = content_hash;
+    }
+};
+
+/// GUI-thread registry of the local terminal HWNDs UIA asked for (a
+/// RemotePane keeps its own, `uia_remote.Bridge`). An entry lives until its
+/// HWND is destroyed (`forget`) or the App's teardown (`deinit`).
+pub const TerminalRegistry = struct {
+    entries: std.ArrayList(Entry) = .empty,
+    const Entry = struct { hwnd: w32.HWND, bridge: TerminalBridge = .{} };
+
+    /// WM_GETOBJECT of the pane's own HWND: its provider, or 0 to let
+    /// Windows answer (another object ID, or no provider).
+    pub fn getObject(self: *TerminalRegistry, api: *uia.Api, queue: *uia.Queue, pane: Pane, wparam: usize, lparam: isize) isize {
+        if (w32.objectId(lparam) != uia.root_object_id) return 0;
+        const hwnd = pane.nativeHandle() orelse return 0;
+        const item = self.entry(hwnd) catch return 0;
+        item.bridge.publish(api, queue, pane, hwnd) catch |err| {
+            std.log.scoped(.win32_uia).warn("terminal UIA snapshot unavailable err={}", .{err});
+            return 0;
+        };
+        return item.bridge.publisher.returnProvider(wparam, lparam);
+    }
+    fn entry(self: *TerminalRegistry, hwnd: w32.HWND) !*Entry {
+        for (self.entries.items) |*item| if (item.hwnd == hwnd) return item;
+        try self.entries.append(std.heap.page_allocator, .{ .hwnd = hwnd });
+        return &self.entries.items[self.entries.items.len - 1];
+    }
+    /// WM_DESTROY of a terminal HWND: what UIA clients hold becomes inert.
+    pub fn forget(self: *TerminalRegistry, hwnd: w32.HWND) void {
+        for (self.entries.items, 0..) |*item, index| if (item.hwnd == hwnd) {
+            item.bridge.hide();
+            _ = self.entries.swapRemove(index);
+            break;
+        };
+        if (self.entries.items.len == 0) self.deinit();
+    }
+    /// A client's SetFocus on a terminal root (the one action `accepts`
+    /// leaves a stable view), applied while it is still that visible pane.
+    /// Nothing of the registry is read once SetFocus may reenter.
+    pub fn dispatch(self: *const TerminalRegistry, app: *App, action: *const uia.Action) bool {
+        for (self.entries.items) |*item| {
+            if (!item.bridge.publisher.accepts(action.*)) continue;
+            const hwnd = item.hwnd;
+            const pane = app.resolvePaneView(action.attachment) orelse return false;
+            const target = pane.nativeHandle() orelse return false;
+            if (target != hwnd or w32.IsWindowVisible_(hwnd) == 0 or w32.IsWindowEnabled(hwnd) == 0) return false;
+            _ = w32.SetFocus(hwnd);
+            return w32.GetFocus() == hwnd;
+        }
+        return false;
+    }
+    pub fn deinit(self: *TerminalRegistry) void {
+        for (self.entries.items) |*item| item.bridge.hide();
+        self.entries.deinit(std.heap.page_allocator);
+        self.entries = .empty;
+    }
+};
+
 fn button(builder: *Builder, parent: u16, name: []const u8, bounds: uia.Rect, binding: Binding) !u16 {
     return builder.add(.{ .id = 0, .parent = parent, .name = name, .role = .button, .bounds = bounds, .patterns = .{ .invoke = true }, .offscreen = bounds.width <= 0 or bounds.height <= 0 }, binding);
 }
@@ -225,6 +315,82 @@ test "UIA bridge translates client pixels and keeps offscreen rectangles empty" 
     const result = clientRect(.{ .left = 10, .top = 20, .right = 30, .bottom = 50 }, .{ .x = -200, .y = 100 });
     try std.testing.expectEqual(uia.Rect{ .x = -190, .y = 120, .width = 20, .height = 30 }, result);
     try std.testing.expectEqual(@as(f64, 0), screenRect(.{ .left = 20, .top = 0, .right = 10, .bottom = 0 }).width);
+}
+
+test "terminal provider keeps held elements across a title change and revokes them on a move" {
+    // The real TerminalBridge over a real local pane adapter. No HWND,
+    // desktop or UIAutomationCore is used: providers are called directly.
+    const testing = std.testing;
+    const Surface = @import("../Surface.zig");
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const Simple = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+        GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
+        GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
+    };
+    const Probe = struct {
+        extern "oleaut32" fn SysFreeString(?[*:0]u16) callconv(.winapi) void;
+        fn table(face: *uia.Face) *const Simple {
+            return @ptrCast(@alignCast(face.vtable));
+        }
+        /// ProviderOptions: S_OK while usable, UIA_E_ELEMENTNOTAVAILABLE once revoked.
+        fn options(face: *uia.Face) i32 {
+            var flags: u32 = 0;
+            return table(face).ProviderOptions(face, &flags);
+        }
+        fn name(face: *uia.Face, buffer: []u8) ![]const u8 {
+            var value: uia.Variant = .{};
+            try testing.expectEqual(@as(i32, 0), table(face).GetPropertyValue(face, 30005, &value));
+            const text: [*:0]u16 = @ptrCast(@alignCast(value.data.pointer.?));
+            defer SysFreeString(text);
+            return buffer[0..try std.unicode.utf16LeToUtf8(buffer, std.mem.span(text))];
+        }
+        fn setTitle(surface: *Surface, title: []const u8) void {
+            @memcpy(surface.title[0..title.len], title);
+            surface.title[title.len] = 0;
+            surface.title_len = title.len;
+        }
+    };
+    var issuer = try refs.Issuer.init(7);
+    const first_window = try issuer.create(.window);
+    const second_window = try issuer.create(.window);
+    var surface: Surface = .{ .app = undefined, .parent_window = undefined, .ui_reference = try issuer.surface(5) };
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, first_window);
+    Probe.setTitle(&surface, "first");
+    const hwnd: w32.HWND = @ptrFromInt(0x40);
+    var bridge: TerminalBridge = .{};
+    defer bridge.hide();
+    var buffer: [64]u8 = undefined;
+    try bridge.publish(&api, &queue, Pane.fromLocal(&surface), hwnd);
+    const first = bridge.publisher.current.?;
+    const held = &first.nodes[0].faces[0];
+    _ = Probe.table(held).AddRef(held);
+    defer _ = Probe.table(held).Release(held);
+    try testing.expectEqualStrings("first", try Probe.name(held, &buffer));
+    // Nothing new: the very same snapshot.
+    try bridge.publish(&api, &queue, Pane.fromLocal(&surface), hwnd);
+    try testing.expect(bridge.publisher.current.? == first);
+    // A new title is a new revision; the element held still answers.
+    Probe.setTitle(&surface, "second");
+    try bridge.publish(&api, &queue, Pane.fromLocal(&surface), hwnd);
+    const second = bridge.publisher.current.?;
+    try testing.expect(second != first);
+    try testing.expectEqualStrings("second", try Probe.name(&second.nodes[0].faces[0], &buffer));
+    try testing.expectEqual(@as(i32, 0), Probe.options(held));
+    // Moved to another window: the new attachment revokes every revision.
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, second_window);
+    try bridge.publish(&api, &queue, Pane.fromLocal(&surface), hwnd);
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), Probe.options(held));
+    try testing.expectEqual(@as(i32, 0), Probe.options(&bridge.publisher.current.?.nodes[0].faces[0]));
 }
 
 pub const PopupCallbacks = struct {
