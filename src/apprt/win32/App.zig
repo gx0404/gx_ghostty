@@ -5027,6 +5027,23 @@ test "D10: find bar keys come first, F3 moves through the matches although bound
     try testing.expect(!surface.search_bar.active);
 }
 
+test "D10: default Alt+F4 closes the window through find bar routing" {
+    const testing = std.testing;
+    var cfg = try @import("../../gx/config_layers.zig").defaultConfig(testing.allocator);
+    defer cfg.deinit();
+    const mods: input.Mods = .{ .alt = true };
+    const action = trigger.actionForKey(&cfg.keybind.set, w32.VK_F4, .{ .alt = true }) orelse
+        return error.TestExpectedCloseWindowBinding;
+    try testing.expectEqual(input.Binding.Action.Key.close_window, std.meta.activeTag(action));
+    for ([_]EditField{ .search, .remote_search }) |field| {
+        try testing.expectEqual(EditKeyStage.bindings, editKeyStage(field, w32.WM_SYSKEYDOWN, w32.VK_F4, false));
+        const bound = editKeyBound(field, &cfg.keybind.set, w32.VK_F4, mods);
+        try testing.expect(bound);
+        try testing.expectEqual(EditKeyRoute.bubble, editKeyRoute(field, w32.VK_F4, mods, bound));
+        try testing.expectEqual(EditKeyRoute.edit, editKeyRoute(field, w32.VK_F4, mods, false));
+    }
+}
+
 test "D10: only find bars take system function keys, and only without Ctrl" {
     const testing = std.testing;
     for ([_]EditField{ .search, .remote_search }) |field| {
