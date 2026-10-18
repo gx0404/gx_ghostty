@@ -470,7 +470,7 @@ class QuietBatchTests(unittest.TestCase):
         args.out = self.args.out.parent / 'failed-first-guard'
         self.probe.input_ticks.side_effect = None
         self.probe.input_ticks.return_value = ticks(700)
-        exit_code, result = self.run_batch(args, self.command(0, guard='fail'))
+        exit_code, result = self.run_batch(args, self.command(0, guard='fail', cause='foreground_lost'))
         self.assertEqual((3, 'INVALID'), (exit_code, result['status']))
         raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
         self.assertEqual(('guards', False), (raw['mode'], raw['injected']))
@@ -531,7 +531,7 @@ class QuietBatchTests(unittest.TestCase):
             args = self.batch_args('--injected-input')
             args.out = self.args.out.parent / f'guard-{index}'
             with self.subTest(code=code, guard=guard):
-                exit_code, result = self.run_batch(args, self.command(code, guard))
+                exit_code, result = self.run_batch(args, self.command(code, guard, cause='foreground_lost'))
                 self.assertEqual((expected, status), (exit_code, result['status']))
         foreign = self.args.out.parent / 'foreign.jsonl'
         foreign.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'other', 'event': 'guard', 'status': 'pass'}) + '\n')
@@ -540,11 +540,74 @@ class QuietBatchTests(unittest.TestCase):
         release = self.args.out.parent / 'release.jsonl'
         release.write_text(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': 'b', 'event': 'release', 'status': 'fail', 'reason': 'UIPI'}) + '\n')
         evidence = gx_perf.guard_evidence(release, 'b')
-        self.assertEqual((1, False), (len(evidence['release_failures']), evidence['injected']))
+        self.assertEqual((1, False), (len(evidence['unexplained']), evidence['injected']))
         with self.assertRaisesRegex(gx_perf.PerfError, 'UIPI'):
             gx_perf.end_input({'evidence': evidence, 'since': ticks(700), 'injected_mode': True}, self.probe, 600)
-        self.assertEqual({'events': 0, 'guards': 0, 'passed_guards': 0, 'injected': False, 'failures': [], 'release_failures': [],
-                          'sha256': None}, gx_perf.guard_evidence(self.args.out.parent / 'absent.jsonl', 'b'))
+        self.assertEqual({'events': 0, 'guards': 0, 'passed_guards': 0, 'injected': False, 'environment': [], 'product': [],
+                          'unexplained': [], 'sha256': None}, gx_perf.guard_evidence(self.args.out.parent / 'absent.jsonl', 'b'))
+
+    @staticmethod
+    def audited(code, *rows):
+        """A command that leaves the given gx-input-guard-v1 rows, like gx_win_gui does."""
+        def runner(command, **kwargs):
+            with Path(kwargs['env']['GX_PERF_GUARD_LOG']).open('a', encoding='utf-8') as log:
+                for row in rows:
+                    log.write(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'],
+                                          'instance_pid': 42, **row}) + '\n')
+            return SimpleNamespace(returncode=code)
+        return runner
+
+    def test_instance_gone_is_product_fail_never_invalid(self):
+        sent = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
+        gone = {'event': 'instance', 'status': 'fail', 'cause': 'instance_gone', 'reason': 'Ghostty 实例 42 已结束'}
+        gone_guard = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'fail', 'cause': 'instance_gone', 'reason': 'gone'}
+        lost = {'event': 'guard', 'check': 'ensure_point', 'status': 'fail', 'cause': 'pointer_target_lost', 'reason': 'covered'}
+        cases = [  # (label, flags, command exit, rows, quiet status)
+            ('crash-mid-input', ('--injected-input',), 1, (sent, gone, gone_guard), 'VALID'),
+            ('crash-and-noise', ('--injected-input',), 1, (sent, lost, gone), 'INVALID'),
+            # A one-tab win32-idle sends no input; the instance died during the idle window.
+            ('crash-without-input', (), 1, (gone,), 'VALID'),
+            ('helper-crash-command-ok', ('--injected-input',), 0, (sent, gone), 'VALID'),
+        ]
+        for label, flags, code, rows, quiet in cases:
+            args = self.batch_args(*flags)
+            args.out = self.args.out.parent / label
+            with self.subTest(label):
+                exit_code, result = self.run_batch(args, self.audited(code, *rows))
+                self.assertEqual((6, 'PRODUCT_FAIL', 'instance_gone', quiet),
+                                 (exit_code, result['status'], result['failure_cause'], result['quiet_status']))
+                self.assertIn('instance_gone: Ghostty pid 42', ' '.join(result['errors']))
+                self.assertIn('never rerun to replace it', result['guidance'])
+                self.assertIn('failure_cause=instance_gone', (args.out / 'SUMMARY.txt').read_text())
+
+    def test_environment_causes_are_invalid_and_unknown_causes_are_tool_errors(self):
+        sent = {'event': 'guard', 'check': 'ensure_foreground', 'status': 'pass'}
+        foreign = {'event': 'guard', 'check': 'idle_input_window', 'status': 'fail', 'cause': 'foreign_input',
+                   'reason': 'external input occurred during the idle measurement window'}
+        cases = [  # (label, flags, command exit, rows, exit, status, failure cause)
+            ('foreground', ('--injected-input',), 1, (sent, {'event': 'guard', 'check': 'ensure_foreground', 'status': 'fail',
+                                                            'cause': 'foreground_lost', 'other_image': 'explorer.exe'}),
+             3, 'INVALID', 'foreground_lost'),
+            ('pointer', ('--injected-input',), 1, (sent, {'event': 'guard', 'check': 'ensure_point', 'status': 'fail',
+                                                         'cause': 'pointer_target_lost'}), 3, 'INVALID', 'pointer_target_lost'),
+            # Multi-tab win32-idle: setup input passed its guards, then the driver saw foreign input and exited 1.
+            ('idle-foreign-input', ('--injected-input',), 1, (sent, foreign), 3, 'INVALID', 'foreign_input'),
+            # Without the flag a failed check is still noise, not a mode mismatch: nothing was sent.
+            ('idle-foreign-input-uninjected', (), 1, (foreign,), 3, 'INVALID', 'foreign_input'),
+            ('unknown-cause', ('--injected-input',), 1, (sent, {'event': 'guard', 'check': 'ensure_point', 'status': 'fail',
+                                                               'cause': 'other'}), 2, 'ERROR', 'end_check_error'),
+            ('legacy-row-without-cause', ('--injected-input',), 1, (sent, {'event': 'guard', 'check': 'ensure_point',
+                                                                          'status': 'fail'}), 2, 'ERROR', 'end_check_error'),
+        ]
+        for label, flags, code, rows, expected, status, cause in cases:
+            args = self.batch_args(*flags)
+            args.out = self.args.out.parent / label
+            with self.subTest(label):
+                exit_code, result = self.run_batch(args, self.audited(code, *rows))
+                self.assertEqual((expected, status, cause), (exit_code, result['status'], result['failure_cause']))
+        after = json.loads((self.args.out.parent / 'idle-foreign-input' / 'after.json').read_text())
+        self.assertEqual(('fail', 'foreign_input'), (after['checks']['input']['status'], after['checks']['input']['raw']['cause']))
+        self.assertEqual(['input'], json.loads((self.args.out.parent / 'idle-foreign-input' / 'RESULT.json').read_text())['failed_checks'])
 
     def test_noncompliant_thresholds_mode_mismatch_and_end_check_errors(self):
         args = self.batch_args('--idle-seconds', '5')
@@ -741,6 +804,17 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual('partial', result['comparison']['threads.context_switches']['new']['status'])
         self.assertEqual('no_samples', result['comparison']['process.cpu']['new']['status'])
         self.assertIn('threads.context_switches unit=count n=0 partial', (args.out / 'SUMMARY.txt').read_text())
+
+    def test_driver_records_the_failure_cause_of_a_run(self):
+        import gx_win_gui as real
+        args, gui = self.args('win32-ui', '--runs', '2'), self.fake_gui()
+        with mock.patch.object(gx_perf, 'measure_ui', side_effect=real.InputBlocked('Ghostty 实例 1 已结束', cause='instance_gone')), \
+                mock.patch.object(gx_perf.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1, gx_perf.run_experiment(args, gui))
+        self.assertEqual('instance_gone', json.loads((args.out / 'build/run-01/run.json').read_text())['failure_cause'])
+        result = json.loads((args.out / 'RESULT.json').read_text())
+        self.assertEqual((['instance_gone'], 'instance_gone'), (result['failure_causes'], result['runs'][0]['failure_cause']))
+        self.assertIn('failure causes instance_gone', (args.out / 'SUMMARY.txt').read_text())
 
     def test_unexpected_driver_exception_retains_failed_evidence(self):
         args,gui=self.args(),self.fake_gui()
@@ -960,8 +1034,12 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual('partial', capture.report['missing_metrics']['threads.context_switches']['status'])
         self.assertEqual('not_instrumented',capture.report['missing_metrics']['renderer.present']['status'])
         with mock.patch.object(gx_perf.time,'sleep',side_effect=sleep), mock.patch.object(gx_perf,'last_input_ticks',side_effect=[(10,20),(11,21)]):
-            with self.assertRaisesRegex(gx_perf.PerfError,'input'):
+            with self.assertRaisesRegex(gx_perf.PerfError,'input') as raised:
                 gx_perf.idle_interval(gui,instance,capture,self.args('win32-idle'),counters)
+        self.assertEqual('foreign_input', raised.exception.cause)
+        instance.record_input.assert_called_once_with('guard', check='idle_input_window', status='fail', cause='foreign_input',
+                                                      reason='external input occurred during the idle measurement window',
+                                                      before_tick=10, after_tick=11)
 
     def test_p3_drags_real_caption_and_p6_holds_key_at_30hz(self):
         gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()

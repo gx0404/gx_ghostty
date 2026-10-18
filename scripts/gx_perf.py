@@ -30,7 +30,8 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         that sent input is judged by its batch-bound gx_win_gui guard JSONL; a batch that sent none
         (with or without the flag) must have had no input at all since the start check.
         Exit 0 VALID, 4 FAIL (quiet valid, command gate FAIL), 3 NOT_STARTED/INVALID (quiet
-        criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4).
+        criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
+        6 PRODUCT_FAIL (a measured Ghostty instance ended mid-batch: cause instance_gone).
   win32-ui --exe PATH [--exe PATH] --out DIR --case p3|p4|p5|p6 [--runs 10] [--diagnostic]
   win32-idle --exe PATH --out DIR [--tabs 1 --windows 1 --state visible --seconds 60]
   win32-gpu --exe PATH --out DIR              (PDH dedicated GPU bytes, 1/11 terminals)
@@ -116,7 +117,12 @@ def to_ms(value: float, unit: str | None) -> float:
 
 
 class PerfError(RuntimeError):
-    """A usage problem (exit 2)."""
+    """A usage problem (exit 2), or a failed measurement step. `cause` mirrors
+    gx_win_gui.InputBlocked.cause when the failure is attributable (e.g. foreign_input)."""
+
+    def __init__(self, *args, cause: str | None = None) -> None:
+        super().__init__(*args)
+        self.cause = cause
 
 
 @dataclass
@@ -917,6 +923,11 @@ def run_quiet(args, probe=None, sleep=time.sleep) -> int:
 
 # gx_win_gui runs these guards immediately before every SendInput (scripts/gx_win_gui.py::input_guard).
 SEND_GUARDS = ('ensure_foreground', 'ensure_point')
+# Audit causes (gx_win_gui.InputBlocked.CAUSES). Environment causes refute the plan §4 input
+# criterion (INVALID); instance_gone is a product/driver failure of the measured Ghostty
+# and must never be read as noise (no rerun until a VALID batch appears).
+ENVIRONMENT_CAUSES = ('foreground_lost', 'pointer_target_lost', 'foreign_input')
+PRODUCT_CAUSES = ('instance_gone',)
 
 
 def guard_evidence(path: Path, batch_id: str) -> dict:
@@ -933,10 +944,15 @@ def guard_evidence(path: Path, batch_id: str) -> dict:
     guards = [row for row in rows if row.get('event') == 'guard']
     sent = [row for row in guards if row.get('status') == 'pass' and row.get('check') in SEND_GUARDS]
     releases = [row for row in rows if row.get('event') == 'release']
+    failed = [row for row in rows if row.get('status') != 'pass']
+    product = [row for row in failed if row.get('cause') in PRODUCT_CAUSES]
     return {'events': len(rows), 'guards': len(guards), 'passed_guards': len(sent),
             'injected': bool(sent) or any(row.get('status') == 'pass' for row in releases),
-            'failures': [row for row in guards if row.get('status') != 'pass'],
-            'release_failures': [row for row in releases if row.get('status') != 'pass'],
+            'environment': [row for row in failed if row.get('cause') in ENVIRONMENT_CAUSES and row.get('event') == 'guard'],
+            'product': product,
+            # Anything else that failed is not understood: an unknown cause or a release that was not sent.
+            'unexplained': [row for row in failed if row not in product and
+                            not (row.get('cause') in ENVIRONMENT_CAUSES and row.get('event') == 'guard')],
             'sha256': hashlib.sha256(data).hexdigest() if data else None}
 
 
@@ -948,17 +964,21 @@ def end_input(end: Mapping, probe, threshold: float) -> dict:
     --injected-input, or with it but no input was ever sent (one-tab one-window
     win32-idle) - must have had no input at all since the start check:
     idle >= max(threshold, batch duration) on the same tick clock. Failed guards
-    always fail the criterion; failed releases are tool errors."""
+    fail the criterion only for environment causes (foreground_lost, pointer_target_lost,
+    foreign_input); instance_gone rows are product failures handled by classify_batch;
+    unexplained failures (unknown cause, release not sent) are tool errors."""
     evidence = end['evidence']
     if isinstance(evidence, BaseException):
         raise evidence
-    if evidence['release_failures']:
-        raise PerfError(f"input release failed: {evidence['release_failures'][0].get('reason')}")
+    if evidence['unexplained']:
+        first = evidence['unexplained'][0]
+        raise PerfError(f"unexplained input audit failure ({first.get('event')}, cause {first.get('cause')}): {first.get('reason')}")
     summary = {key: evidence[key] for key in ('events', 'guards', 'passed_guards', 'injected', 'sha256')}
-    if evidence['failures']:
-        first = evidence['failures'][0]
-        return {**summary, 'mode': 'guards', 'state': 'fail', 'failures': evidence['failures'],
-                'reason': f"input guard {first.get('check')} failed: {first.get('reason')}"}
+    summary['product_failures'] = len(evidence['product'])
+    if evidence['environment']:
+        first = evidence['environment'][0]
+        return {**summary, 'mode': 'guards', 'state': 'fail', 'cause': first['cause'], 'failures': evidence['environment'],
+                'reason': f"{first['cause']}: input check {first.get('check')} failed: {first.get('reason')}"}
     if end['injected_mode'] and evidence['injected']:
         return {**summary, 'mode': 'guards', 'state': 'pass',
                 'reason': f"injected input: {evidence['passed_guards']} audited input guards passed, not GetLastInputInfo"}
@@ -1014,6 +1034,9 @@ BATCH_GUIDANCE = {
     'NOT_STARTED': 'The start check did not pass or the slots stayed busy; the command was not run.',
     'ERROR': 'Tool or driver error: this batch is neither PASS nor FAIL evidence. Investigate before rerunning.',
     'NONCOMPLIANT': 'Quiet thresholds were weakened below plan §4 (idle < 600 s): never plan evidence.',
+    'PRODUCT_FAIL': 'A measured Ghostty instance ended or changed identity during the batch (cause instance_gone): '
+                    'a FAIL-class product/driver failure, not environment noise. Keep it and count it; never rerun to '
+                    'replace it; read ghostty.log, crash dumps and guards.jsonl before another attempt.',
     'RUNNING': 'The batch did not finish recording its result.',
 }
 
@@ -1025,30 +1048,47 @@ def measurement_state(raised: bool, exit_code) -> str:
     return {0: 'COMPLETE', 4: 'GATE_FAIL'}.get(exit_code, 'DRIVER_ERROR')
 
 
-def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool) -> None:
+def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool, product_failures: Sequence[Mapping] = ()) -> None:
     """Quiet validity comes only from the checks; the measurement only from the command.
-    INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL."""
-    statuses = [row['status'] for row in after['checks'].values()]
-    quiet = 'INVALID' if 'fail' in statuses else 'ERROR' if 'error' in statuses else 'VALID'
+    INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL.
+    A measured instance that ended mid-batch (instance_gone) is PRODUCT_FAIL even when the
+    environment was also noisy: reading it as INVALID would invite rerunning until it passes."""
+    statuses = {name: row['status'] for name, row in after['checks'].items()}
+    quiet = 'INVALID' if 'fail' in statuses.values() else 'ERROR' if 'error' in statuses.values() else 'VALID'
     result['quiet_status'], result['quiet_valid'] = quiet, quiet == 'VALID'
+    result['failed_checks'] = sorted(name for name, status in statuses.items() if status == 'fail')
+    result['error_checks'] = sorted(name for name, status in statuses.items() if status == 'error')
     thresholds = before['thresholds_plan_compliant'] and after['thresholds_plan_compliant']
     result['plan_compliant'] = result['quiet_valid'] and thresholds
     if result['measurement'] == 'DRIVER_ERROR' and result['command_exit'] is not None:
         result['errors'].append(f"command exited {result['command_exit']}: driver or tool error")
-    if mode_mismatch:
+    input_check = after['checks'].get('input', {})
+    if product_failures:
+        first = product_failures[0]
+        result['failure_cause'] = 'instance_gone'
+        result['errors'].append(f"instance_gone: Ghostty pid {first.get('instance_pid')} ended or changed identity mid-batch: "
+                                f"{first.get('reason')}")
+        result['status'], result['exit'] = 'PRODUCT_FAIL', 6
+    elif mode_mismatch:
+        result['failure_cause'] = 'mode_mismatch'
         result['errors'].append('the command injected guarded input but --injected-input was not given; rerun with --injected-input')
         result['status'], result['exit'] = 'ERROR', 2
     elif quiet == 'INVALID':
+        result['failure_cause'] = (input_check.get('raw') or {}).get('cause') if input_check.get('status') == 'fail' else None
+        result['failure_cause'] = result['failure_cause'] or 'quiet_criteria'
         result['errors'].append('end check did not pass; entire batch is INVALID, originals retained')
         result['status'], result['exit'] = 'INVALID', 3
     elif quiet == 'ERROR':
+        result['failure_cause'] = 'end_check_error'
         result['errors'].append('end check raised a tool error; quiet validity is unproved')
         result['status'], result['exit'] = 'ERROR', 2
     elif result['measurement'] == 'DRIVER_ERROR':
+        result['failure_cause'] = 'driver_error'
         result['status'], result['exit'] = 'ERROR', 2
     elif not thresholds:
         result['status'], result['exit'] = 'NONCOMPLIANT', 5
     elif result['measurement'] == 'GATE_FAIL':
+        result['failure_cause'] = 'gate_fail'
         result['status'], result['exit'] = 'FAIL', 4
     else:
         result['status'], result['exit'] = 'VALID', 0
@@ -1056,7 +1096,8 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
 
 def batch_summary(result: Mapping, before: Mapping | None, after: Mapping | None) -> str:
     lines = [f"{result['status']} exit={result['exit']} quiet={result['quiet_status']} measurement={result['measurement']} "
-             f"command_exit={result['command_exit']} plan_compliant={str(result['plan_compliant']).lower()}",
+             f"command_exit={result['command_exit']} plan_compliant={str(result['plan_compliant']).lower()} "
+             f"failure_cause={result.get('failure_cause') or 'none'}",
              BATCH_GUIDANCE.get(result['status'], '')]
     for name, snapshot in (('before', before), ('after', after)):
         if snapshot:
@@ -1076,7 +1117,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
               'injected_input': args.injected_input, 'status': 'NOT_STARTED', 'exit': 2,
               'quiet_status': 'NOT_CHECKED', 'quiet_valid': False, 'measurement': 'NOT_RUN', 'command_exit': None,
               'plan_compliant': False, 'thresholds_plan_compliant': args.idle_seconds >= PLAN_IDLE_SECONDS,
-              'started_ns': None, 'ended_ns': None, 'errors': []}
+              'failure_cause': None, 'started_ns': None, 'ended_ns': None, 'errors': []}
     before = after = None
     write_json(out / 'RESULT.json', result)
     try:
@@ -1117,7 +1158,8 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                     write_json(out / 'after.json', after)
                     # Input was sent although the batch claimed none: the last-input check is meaningless.
                     mismatch = not args.injected_input and isinstance(evidence, dict) and evidence['injected']
-                    classify_batch(result, before, after, mode_mismatch=mismatch)
+                    classify_batch(result, before, after, mode_mismatch=mismatch,
+                                   product_failures=evidence['product'] if isinstance(evidence, dict) else ())
     except TimeoutError as exc:
         result.update(exit=3, quiet_status='NOT_MET')
         result['errors'].append(f'slots: {exc}')
@@ -1666,7 +1708,11 @@ def idle_interval(gui, instance, capture, args, counters):
         context_switch_source='NtQuerySystemInformation(SystemProcessInformation), matched TID+CreateTime endpoints; diagnostic only',
         context_switch_scope='endpoint-surviving threads only; threads born and exited between endpoints are not observable')
     if input_before != input_after:
-        raise PerfError('external input occurred during the idle measurement window')
+        message = 'external input occurred during the idle measurement window'
+        # Audited like a failed guard so quiet-batch reads plan §4 noise (INVALID), not a tool error.
+        instance.record_input('guard', check='idle_input_window', status='fail', cause='foreign_input', reason=message,
+                              before_tick=input_before, after_tick=input_after)
+        raise PerfError(message, cause='foreign_input')
     if args.state == 'visible' and gui.win32().window_pid(gui.win32().foreground()) != instance.pid:
         raise PerfError('visible measured process lost focus')
     if args.state == 'unfocused' and gui.win32().window_pid(gui.win32().foreground()) == instance.pid:
@@ -1838,6 +1884,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         except Exception as exc:
             report['status'] = 'failed'
             report['errors'].append(str(exc))
+            report['failure_cause'] = getattr(exc, 'cause', None) or 'other'
         finally:
             if instance:
                 try:
@@ -1872,6 +1919,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 resources.append({'label': label, 'run': run, 'populations': [row['terminal_population'] for row in report['resources']],
                                   'target_ratios': [row.get('targets_per_visible_terminal') for row in report['resources']]})
             batch['runs'][-1]['status'] = report['status']
+            if report.get('failure_cause'):
+                batch['runs'][-1]['failure_cause'] = report['failure_cause']
             batch['runs'][-1]['absolute_gate'] = report.get('absolute_gate', {'status': 'not_evaluated'})
             batch['errors'].extend(f'{label}/{run}: {error}' for error in report['errors'])
             write_json(out / 'RESULT.json', batch)
@@ -1879,6 +1928,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         if report['status'] != 'completed':
             break  # Never retry or continue input after a failed guard.
     batch['valid'] = not batch['errors'] and len(batch['runs']) == args.runs * len(labels)
+    batch['failure_causes'] = sorted({item['failure_cause'] for item in batch['runs'] if item.get('failure_cause')})
     batch['gate_failed'] = any(item['absolute_gate']['status'] == 'FAIL' for item in batch['runs'])
     # 1 = incomplete driver evidence (any observed gate FAIL stays in absolute_gates);
     # 4 = complete batch whose new-arm absolute gate failed: keep it as FAIL evidence.
@@ -1910,7 +1960,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         text += ('Unsettled metric windows (still changing at the 3 s limit; counted as observed): ' +
                  json.dumps(unsettled, ensure_ascii=False) + '\n')
     text += ('Driver result: ' + ('complete' if batch['valid'] else 'incomplete (driver error)') +
-             ('; absolute gate FAIL observed' if batch['gate_failed'] else '') + f"; exit {batch['exit']}\n")
+             ('; absolute gate FAIL observed' if batch['gate_failed'] else '') +
+             (f"; failure causes {', '.join(batch['failure_causes'])}" if batch['failure_causes'] else '') + f"; exit {batch['exit']}\n")
     if resources:
         batch['resource_populations'] = resources
         text += ('\nP8: one window, 1/11 tabs, one terminal per tab; dedicated-byte increment denominator=10.\n'
