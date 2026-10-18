@@ -419,8 +419,7 @@ pub fn handleMessage(
             // ReleaseCapture synchronously notifies us after releasing it.
             // Refresh only our custom buttons, never a transfer to a popup
             // or DWM's buttons. TabBar clears its press before releasing.
-            const released = msg == w32.WM_CAPTURECHANGED and lparam == 0 and
-                w32.GetCapture() == null and self.hasCaptionRow() and !self.nativeButtons();
+            const released = captureReleased(msg, lparam, w32.GetCapture() == null, self.hasCaptionRow(), self.nativeButtons());
             _ = self.routeButtons(.{
                 .msg = msg,
                 .own_capture = own,
@@ -615,6 +614,8 @@ const ButtonInput = struct {
     pressed: Button = .none,
     /// The window holds the mouse capture for `pressed`.
     captured: bool = false,
+    /// Suppress hover on the release nested inside cancellation (including tabs).
+    cancel_release_pending: bool = false,
 
     /// A mouse message: a non-client one with its hit-test code in
     /// `wparam`, a client one (and `WM_SIZE`) with what its point hits.
@@ -670,6 +671,10 @@ const ButtonInput = struct {
         const hover = self.hover;
         var fx: Effects = .{};
         switch (m.msg) {
+            w32.WM_MOUSEMOVE, WM_NCMOUSEMOVE, w32.WM_LBUTTONDOWN, w32.WM_LBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK => self.cancel_release_pending = false,
+            else => {},
+        }
+        switch (m.msg) {
             WM_NCMOUSEMOVE => {
                 const button = buttonFromHitCode(m.wparam);
                 self.hover = self.reacting(button, ctx);
@@ -722,8 +727,9 @@ const ButtonInput = struct {
             },
             w32.WM_CAPTURECHANGED, WM_CANCELMODE => if (m.msg == WM_CANCELMODE or !m.own_capture) {
                 if (m.msg == WM_CANCELMODE and self.captured) fx.capture = .release;
-                self.* = .{};
-                if (m.msg == w32.WM_CAPTURECHANGED and m.capture_released) {
+                const cancelled = m.msg == WM_CANCELMODE or self.cancel_release_pending;
+                self.* = .{ .cancel_release_pending = m.msg == WM_CANCELMODE };
+                if (m.msg == w32.WM_CAPTURECHANGED and m.capture_released and !cancelled) {
                     // Reuse layout-refresh semantics: update in one paint,
                     // arm the matching leave tracking and restart tooltips.
                     fx = self.route(.{ .msg = w32.WM_SIZE, .hit = m.hit }, ctx);
@@ -857,12 +863,21 @@ fn routeButtons(self: *TitleBar, m: ButtonInput.Message) ButtonInput.Effects {
     return fx;
 }
 
+fn captureReleased(msg: u32, new_capture: isize, capture_is_null: bool, caption_row: bool, native_buttons: bool) bool {
+    return msg == w32.WM_CAPTURECHANGED and new_capture == 0 and capture_is_null and caption_row and !native_buttons;
+}
+
+fn pointerWindowMatches(cursor_valid: bool, window_matches: bool) bool {
+    return cursor_valid and window_matches;
+}
+
 /// What the pointer hits in `lay` where it is now; nothing when it is not
 /// over this window.
 fn pointerHit(self: *TitleBar, lay: Layout) Hit {
     const hwnd = self.window().hwnd orelse return .none;
     var pt: w32.POINT = undefined;
-    if (w32.GetCursorPos_(&pt) == 0 or WindowFromPoint(pt) != hwnd) return .none;
+    const cursor_valid = w32.GetCursorPos_(&pt) != 0;
+    if (!pointerWindowMatches(cursor_valid, cursor_valid and WindowFromPoint(pt) == hwnd)) return .none;
     _ = w32.ScreenToClient(hwnd, &pt);
     return self.hitTest(lay, pt.x, pt.y);
 }
@@ -2264,7 +2279,7 @@ test "losing the mouse capture or cancelling a mode drops the press and the hove
         var fx = p.send(msg, .none);
         // The window and the tab bar handle it as well.
         try testing.expect(!fx.consumed and !fx.tab_bar);
-        try testing.expectEqual(ButtonInput{}, p.input);
+        try testing.expectEqual(ButtonInput{ .cancel_release_pending = msg == WM_CANCELMODE }, p.input);
         try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
         // The release after it is the tab bar's: no menu.
         fx = p.send(w32.WM_LBUTTONUP, TestPointer.menu);
@@ -2275,7 +2290,7 @@ test "losing the mouse capture or cancelling a mode drops the press and the hove
         _ = p.nc(WM_NCMOUSEMOVE, HTMAXBUTTON);
         _ = p.nc(WM_NCLBUTTONDOWN, HTMAXBUTTON);
         _ = p.send(msg, .none);
-        try testing.expectEqual(ButtonInput{}, p.input);
+        try testing.expectEqual(ButtonInput{ .cancel_release_pending = msg == WM_CANCELMODE }, p.input);
         try testing.expectEqual(Button.none, p.nc(WM_NCLBUTTONUP, HTMAXBUTTON).perform);
     }
     // The window taking the capture itself changes nothing.
@@ -2347,7 +2362,7 @@ test "a cancelled mode releases the capture of a pressed button" {
     _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
     var fx = p.send(WM_CANCELMODE, .none);
     try testing.expectEqual(ButtonInput.Capture.release, fx.capture);
-    try testing.expectEqual(ButtonInput{}, p.input);
+    try testing.expectEqual(ButtonInput{ .cancel_release_pending = true }, p.input);
     // Another window took the capture: nothing to release.
     _ = p.send(w32.WM_LBUTTONDOWN, TestPointer.minimize);
     fx = p.send(w32.WM_CAPTURECHANGED, .none);
@@ -2431,4 +2446,41 @@ test "the title bar buttons do not react while the tab bar holds a press or drag
     p.ctx.tab_press = false;
     _ = p.send(w32.WM_MOUSEMOVE, TestPointer.minimize);
     try testing.expectEqual(Button.minimize, p.input.hover);
+}
+
+test "cancel mode suppresses nested capture release hover for buttons and tabs" {
+    for ([_]bool{ false, true }) |tab_press| {
+        var p: TestPointer = .{};
+        if (!tab_press) {
+            _ = p.send(w32.WM_LBUTTONDOWN, .{ .button = .minimize });
+            p.input.captured = true;
+        }
+        p.ctx.tab_press = tab_press;
+        const cancel = p.send(WM_CANCELMODE, .none);
+        try std.testing.expectEqual(if (tab_press) ButtonInput.Capture.keep else ButtonInput.Capture.release, cancel.capture);
+        p.ctx.tab_press = false;
+        const fx = p.input.route(.{ .msg = w32.WM_CAPTURECHANGED, .capture_released = true, .hit = .{ .button = .close } }, p.ctx);
+        try std.testing.expectEqual(Button.none, p.input.hover);
+        try std.testing.expectEqual(Button.none, p.input.pressed);
+        try std.testing.expectEqual(ButtonInput.Track.none, fx.track);
+        _ = p.send(w32.WM_MOUSEMOVE, .{ .button = .close });
+        try std.testing.expectEqual(Button.close, p.input.hover);
+    }
+}
+
+test "capture release gate rejects transfers and noncustom frames" {
+    try std.testing.expect(captureReleased(w32.WM_CAPTURECHANGED, 0, true, true, false));
+    try std.testing.expect(!captureReleased(WM_CANCELMODE, 0, true, true, false));
+    try std.testing.expect(!captureReleased(w32.WM_MOUSEMOVE, 0, true, true, false));
+    try std.testing.expect(!captureReleased(w32.WM_CAPTURECHANGED, 1, true, true, false));
+    try std.testing.expect(!captureReleased(w32.WM_CAPTURECHANGED, 0, false, true, false));
+    try std.testing.expect(!captureReleased(w32.WM_CAPTURECHANGED, 0, true, false, false));
+    try std.testing.expect(!captureReleased(w32.WM_CAPTURECHANGED, 0, true, true, true));
+}
+
+test "pointer hover requires a valid cursor over this top level window" {
+    try std.testing.expect(pointerWindowMatches(true, true));
+    try std.testing.expect(!pointerWindowMatches(false, true));
+    try std.testing.expect(!pointerWindowMatches(true, false));
+    try std.testing.expect(!pointerWindowMatches(false, false));
 }

@@ -49,7 +49,6 @@ const min_tab_parts = [_]f32{
     tab_layout.buttons_gap,
     tab_layout.new_tab_width,
     tab_layout.profile_width,
-    tab_layout.badge_width,
 };
 /// The invisible resize border plus the visible border of a window side
 /// at 100% (`SM_CXSIZEFRAME` + `SM_CXPADDEDBORDER`), in DIPs.
@@ -328,12 +327,14 @@ pub fn ncHit(lay: Layout, x: i32, y: i32, tabs: bool) NcHit {
 /// `WM_GETMINMAXINFO`. The integrated title bar row then still holds the
 /// caption buttons, the main menu button, a strip to drag the window by
 /// and one complete active tab with the overflow controls and the new-tab
-/// buttons, with room for the administrator badge (`min_tab_parts`); a
+/// buttons (`min_tab_parts`). Reserve the administrator badge only when
+/// `show_admin_badge` is true (510 DIPs without it, 538 with it); a
 /// terminal's `size_limit` can raise it further.
-pub fn minTrackSize(scale: f32) Size {
+pub fn minTrackSize(scale: f32, show_admin_badge: bool) Size {
     var width = 2 * px(frame_border, scale) + px(left_margin_caption, scale) + px(drag_reserve_caption, scale) +
         px(menu_button_width, scale) + px(menu_gap_caption, scale) + 3 * px(caption_button_width, scale);
     for (min_tab_parts) |part| width += px(part, scale);
+    if (show_admin_badge) width += px(tab_layout.badge_width, scale);
     const height = title_bar_height + frame_border;
     return .{ .width = width, .height = px(height, scale) };
 }
@@ -460,12 +461,12 @@ test "buttonRect names what a hover change repaints" {
 
 test "minTrackSize fits the caption buttons, the main menu button, a tab and a drag strip" {
     for ([_]f32{ 1, 1.25, 1.5, 2 }) |s| {
-        const size = minTrackSize(s);
+        const size = minTrackSize(s, true);
         try testing.expectEqual(px(title_bar_height + frame_border, s), size.height);
         // The client area of such a window.
         const client = size.width - 2 * px(frame_border, s);
         const lay = compute(.{ .width = client, .bar_height = px(title_bar_height, s), .frame = .custom, .scale = s });
-        var tab_width: i32 = 0;
+        var tab_width: i32 = px(tab_layout.badge_width, s);
         for (min_tab_parts) |part| tab_width += px(part, s);
         try testing.expectEqual(tab_width, rectWidth(lay.tabs));
         try testing.expect(lay.tabs.left < lay.tabs.right);
@@ -497,14 +498,14 @@ test "DWM button bounds follow the visible frame without the invisible resize bo
 test "minimum window reveals a complete active tab with overflow controls and badge" {
     const tabs = @import("tab_layout.zig");
     for ([_]f32{ 1, 1.25, 1.5, 1.75, 2, 2.25 }) |s| {
-        const size = minTrackSize(s);
-        const lay = compute(.{
-            .width = size.width - 2 * px(frame_border, s),
-            .bar_height = px(title_bar_height, s),
-            .frame = .custom,
-            .scale = s,
-        });
         for ([_]bool{ false, true }) |badge| {
+            const size = minTrackSize(s, badge);
+            const lay = compute(.{
+                .width = size.width - 2 * px(frame_border, s),
+                .bar_height = px(title_bar_height, s),
+                .frame = .custom,
+                .scale = s,
+            });
             for ([_]usize{ 1, 3, 64 }) |count| {
                 for ([_]usize{ 0, count / 2, count - 1 }) |active| {
                     var in: tabs.Input = .{
@@ -526,5 +527,22 @@ test "minimum window reveals a complete active tab with overflow controls and ba
                 }
             }
         }
+    }
+}
+
+test "minimum width reserves only the visible administrator badge" {
+    for ([_]f32{ 1, 1.25, 1.5, 1.75, 2, 2.25 }) |scale| {
+        const normal = minTrackSize(scale, false);
+        const elevated = minTrackSize(scale, true);
+        try testing.expectEqual(px(tab_layout.badge_width, scale), elevated.width - normal.width);
+    }
+    try testing.expectEqual(@as(i32, 510), minTrackSize(1, false).width);
+    try testing.expectEqual(@as(i32, 538), minTrackSize(1, true).width);
+}
+
+test "minimum widths retain individual pixel rounding at each DPI" {
+    for ([_]f32{ 1, 1.25, 1.5, 1.75, 2, 2.25 }, [_]i32{ 510, 639, 765, 894, 1020, 1149 }, [_]i32{ 538, 674, 807, 943, 1076, 1212 }) |scale, normal, elevated| {
+        try testing.expectEqual(normal, minTrackSize(scale, false).width);
+        try testing.expectEqual(elevated, minTrackSize(scale, true).width);
     }
 }

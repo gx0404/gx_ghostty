@@ -546,7 +546,7 @@ fn restoredRect(self: *Window, default: w32.RECT) ?w32.RECT {
     };
     const dpi = monitorDpi(monitor);
     const scale = @as(f32, @floatFromInt(dpi)) / 96.0;
-    const chrome = caption_layout.minTrackSize(scale);
+    const chrome = caption_layout.minTrackSize(scale, self.tab_bar.showsAdminBadge());
     const min: ws.Size = .{
         .width = @max(ws.scale(restore_min_dip[0], dpi), chrome.width),
         .height = @max(ws.scale(restore_min_dip[1], dpi), chrome.height),
@@ -2951,6 +2951,31 @@ pub fn adoptSessionTab(self: *Window, tree: *Tree, focused: *Leaf, title: ?tabs.
     return index;
 }
 
+fn fitSessionRect(rect: gx.window_state.Rect, work: gx.window_state.Rect, dpi: u32, show_admin_badge: bool) gx.window_state.Rect {
+    const minimum = caption_layout.minTrackSize(@as(f32, @floatFromInt(dpi)) / 96, show_admin_badge);
+    var expanded = rect;
+    expanded.width = @max(expanded.width, minimum.width);
+    expanded.height = @max(expanded.height, minimum.height);
+    return gx.window_state.fit(expanded, work);
+}
+
+test "session geometry expands before fitting the target work area" {
+    const ws = gx.window_state;
+    for ([_]u32{ 96, 120, 144, 168, 192, 216 }) |dpi| {
+        for ([_]bool{ false, true }) |badge| {
+            const work: ws.Rect = .{ .x = -1920, .y = 40, .width = 1920, .height = 1040 };
+            const minimum = caption_layout.minTrackSize(@as(f32, @floatFromInt(dpi)) / 96, badge);
+            const fitted = fitSessionRect(.{ .x = -100, .y = 1070, .width = 80, .height = 20 }, work, dpi, badge);
+            try std.testing.expectEqual(minimum.width, fitted.width);
+            try std.testing.expectEqual(minimum.height, fitted.height);
+            try std.testing.expectEqual(work.right(), fitted.right());
+            try std.testing.expectEqual(work.bottom(), fitted.bottom());
+            const large: ws.Rect = .{ .x = -1800, .y = 100, .width = 1500, .height = 800 };
+            try std.testing.expectEqual(large, fitSessionRect(large, work, dpi, badge));
+        }
+    }
+}
+
 pub fn revealSession(self: *Window, active: usize, geometry: ?gx.session.Geometry) !void {
     if (self.closing or self.tab_count == 0) return error.InvalidOwner;
     const hwnd = self.hwnd orelse return error.InvalidOwner;
@@ -2962,14 +2987,15 @@ pub fn revealSession(self: *Window, active: usize, geometry: ?gx.session.Geometr
         var info: w32.MONITORINFO = .{ .cbSize = @sizeOf(w32.MONITORINFO), .rcMonitor = undefined, .rcWork = undefined, .dwFlags = 0 };
         if (w32.GetMonitorInfoW(monitor, &info) == 0) return error.Win32Error;
         const ws = gx.window_state;
-        const scaled = ws.rescale(.{ .x = hint.left, .y = hint.top, .width = @intCast(saved.width), .height = @intCast(saved.height) }, saved.dpi, monitorDpi(monitor));
+        const target_dpi = monitorDpi(monitor);
+        const scaled = ws.rescale(.{ .x = hint.left, .y = hint.top, .width = @intCast(saved.width), .height = @intCast(saved.height) }, saved.dpi, target_dpi);
         const cfg = &self.app.config;
-        const placed = ws.fit(.{
+        const placed = fitSessionRect(.{
             .x = if (cfg.@"window-position-x" == null) scaled.x else current.left,
             .y = if (cfg.@"window-position-y" == null) scaled.y else current.top,
             .width = if (cfg.@"window-width" == 0) scaled.width else current.right - current.left,
             .height = if (cfg.@"window-height" == 0) scaled.height else current.bottom - current.top,
-        }, .{ .x = info.rcWork.left, .y = info.rcWork.top, .width = info.rcWork.right - info.rcWork.left, .height = info.rcWork.bottom - info.rcWork.top });
+        }, .{ .x = info.rcWork.left, .y = info.rcWork.top, .width = info.rcWork.right - info.rcWork.left, .height = info.rcWork.bottom - info.rcWork.top }, target_dpi, self.tab_bar.showsAdminBadge());
         _ = w32.SetWindowPos(hwnd, null, placed.x, placed.y, placed.width, placed.height, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
         self.start_maximized = saved.maximized and ws.use(cfg).maximized;
         for (cfg._replay_steps.items) |step| switch (step) {
@@ -4052,7 +4078,7 @@ pub fn windowWndProc(
             // Apply the size limits (the chrome's own minimum and the
             // user-configured ones) if any. lparam points to a MINMAXINFO
             // the OS will consult for resize clamping.
-            const chrome = caption_layout.minTrackSize(window.scale);
+            const chrome = caption_layout.minTrackSize(window.scale, window.tab_bar.showsAdminBadge());
             const min_w = @max(window.min_track_w, chrome.width);
             const min_h = @max(window.min_track_h, chrome.height);
             if (min_w > 0 or min_h > 0 or

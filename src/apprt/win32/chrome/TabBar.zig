@@ -349,18 +349,29 @@ pub fn deinit(self: *TabBar) void {
 /// even a single tab. Returns true when it changed, so the window must
 /// lay itself out again.
 pub fn updateVisibility(self: *TabBar) bool {
-    const win = self.window();
     _ = self.isElevated();
-    const caption_row = win.title_bar.hasCaptionRow() or win.title_bar.frame() == .borderless;
-    const should_show = if (win.is_quick_terminal or win.tab_bar_suppressed) false else switch (win.app.config.@"window-show-tab-bar") {
-        .always => true,
-        .auto => caption_row or win.tab_count > 1,
-        .never => false,
-    };
+    const should_show = self.shouldShow();
     if (should_show == self.visible) return false;
     self.visible = should_show;
     self.reveal_pending = true;
     return true;
+}
+
+fn shouldShow(self: *const TabBar) bool {
+    const win = self.windowConst();
+    const caption_row = win.title_bar.hasCaptionRow() or win.title_bar.frame() == .borderless;
+    return if (win.is_quick_terminal or win.tab_bar_suppressed) false else switch (win.app.config.@"window-show-tab-bar") {
+        .always => true,
+        .auto => caption_row or win.tab_count > 1,
+        .never => false,
+    };
+}
+
+/// Whether the row displays the administrator badge. Resolve elevation even
+/// before the first visibility update, while restoring initial geometry.
+pub fn showsAdminBadge(self: *const TabBar) bool {
+    return !self.windowConst().title_bar.direct2d_failed and self.shouldShow() and
+        (self.elevated orelse processElevated());
 }
 
 /// Repaint the chrome row.
@@ -387,7 +398,7 @@ fn geometryInput(self: *const TabBar, lay: TitleBar.Layout) tab_layout.Input {
         .scale = lay.scale,
         .count = @min(win.tab_count, max_tabs),
         .active = win.active_tab,
-        .badge = self.elevated orelse false,
+        .badge = self.showsAdminBadge(),
         .frozen = self.frozen,
         .scroll = self.scroll,
     };
@@ -1267,9 +1278,7 @@ pub fn onLeftButtonUp(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) bool 
     if (pressed == .none) return false;
     self.pressed = .none;
     self.stopScrollRepeat();
-    if (win.hwnd) |h| {
-        if (w32.GetCapture() == h) _ = w32.ReleaseCapture();
-    }
+    self.releaseCapture();
     self.invalidate();
     const g = self.geometry(lay);
     if (!self.partAt(&g, x, y).eql(pressed)) return true;
@@ -1359,6 +1368,8 @@ fn slideTick(animator: *anim.Animator, now: u64) bool {
 }
 
 fn releaseCapture(self: *TabBar) void {
+    // ReleaseCapture synchronously reenters TitleBar to restore hover.
+    std.debug.assert(!self.holdsPress());
     const hwnd = self.window().hwnd orelse return;
     if (w32.GetCapture() == hwnd) _ = w32.ReleaseCapture();
 }
@@ -2624,4 +2635,31 @@ test "ChromeAlpha native fade replaces strip alpha without accumulating underlay
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "administrator badge sizing follows elevation and tab visibility before first layout" {
+    var app: @import("../App.zig") = undefined;
+    app.config.@"window-show-tab-bar" = .auto;
+    var win: Window = undefined;
+    win.app = &app;
+    win.is_quick_terminal = false;
+    win.tab_bar_suppressed = false;
+    win.tab_count = 1;
+    win.title_bar = .{};
+    win.tab_bar = .{ .elevated = false };
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.tab_bar.elevated = true;
+    try std.testing.expect(win.tab_bar.showsAdminBadge());
+    app.config.@"window-show-tab-bar" = .never;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    app.config.@"window-show-tab-bar" = .always;
+    try std.testing.expect(win.tab_bar.showsAdminBadge());
+    win.tab_bar_suppressed = true;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.tab_bar_suppressed = false;
+    win.title_bar.direct2d_failed = true;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
+    win.title_bar.direct2d_failed = false;
+    win.is_quick_terminal = true;
+    try std.testing.expect(!win.tab_bar.showsAdminBadge());
 }
