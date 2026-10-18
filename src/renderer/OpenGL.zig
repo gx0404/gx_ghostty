@@ -34,6 +34,18 @@ pub const custom_shader_target: shadertoy.Target = .glsl;
 // The fragCoord for OpenGL shaders is +Y = up.
 pub const custom_shader_y_is_down = false;
 
+// fork(gx): GX-0051 begin: verify the color contract through injected GL calls.
+test "D-16 final targets follow the blending mode on rebuild" {
+    try @import("opengl/gx_color_test.zig").targetFormats();
+}
+test "D-16 custom shader intermediates follow the blending mode" {
+    try @import("opengl/gx_color_test.zig").intermediateFormats();
+}
+test "D-16 image and atlas sampling formats remain mode independent" {
+    try @import("opengl/gx_color_test.zig").sampledFormats();
+}
+// fork(gx): GX-0051 end
+
 /// Triple-buffering gives the GPU room to pipeline renders without
 /// having to wait on the apprt consuming previous frames.
 // fork(gx): GX-0004 Windows presents (and finishes) every frame before the next, so one is enough
@@ -328,10 +340,13 @@ pub fn initShaders(
 
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
-    _ = self;
+    // fork(gx): GX-0051 self now supplies the target color space.
     return Target.init(.{
         .width = width,
         .height = height,
+        // fork(gx): GX-0051 begin: only linear shader output needs encoding.
+        .srgb = self.blending.isLinear(),
+        // fork(gx): GX-0051 end
     });
 }
 
@@ -412,10 +427,11 @@ pub const bgImageBufferOptions = bufferOptions;
 
 /// Returns the options to use when constructing textures.
 pub inline fn textureOptions(self: OpenGL) Texture.Options {
-    _ = self;
+    // fork(gx): GX-0051 self also controls custom shader ping-pong targets.
     return .{
         .format = .rgba,
-        .internal_format = .srgba,
+        // fork(gx): GX-0051 keep intermediate writes and samples in the same space.
+        .internal_format = if (self.blending.isLinear()) .srgba else .rgba,
         .target = .@"2d",
         .min_filter = .linear,
         .mag_filter = .linear,
