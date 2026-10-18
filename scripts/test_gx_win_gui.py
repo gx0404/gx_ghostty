@@ -104,6 +104,22 @@ class GeometryTests(unittest.TestCase):
 
 
 class IsolationTests(unittest.TestCase):
+    def test_immediate_exit_audits_pid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe = root / 'ghostty.exe'
+            exe.write_bytes(b'fake')
+            native = mock.Mock()
+            native.process_creation.return_value = None
+            native.now_filetime.return_value = 1
+            with mock.patch.object(gui, 'win32', return_value=native), \
+                    mock.patch.object(gui.subprocess, 'Popen', return_value=mock.Mock(pid=73)), \
+                    mock.patch.object(gui.Instance, 'record_input') as audit, \
+                    self.assertRaises(gui.InputBlocked) as raised:
+                gui.launch(exe, root)
+            self.assertEqual((73, 'instance_gone'), (raised.exception.instance_pid, raised.exception.cause))
+            self.assertEqual('instance_gone', audit.call_args.kwargs['cause'])
+
     def test_launch_resolves_relative_isolation_before_changing_child_cwd(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -610,6 +626,30 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual([('key', 0x28, True)], fake.sent[-1])
 
     def test_drag_checks_pointer_at_every_step(self):
+    def test_process_tree_includes_grandchildren_but_not_reused_parent(self):
+        instance = self.instance()
+        native = mock.Mock()
+        births = {instance.pid: instance.creation, 70: instance.creation + 1, 80: instance.creation + 2}
+        native.process_creation.side_effect = births.get
+        native.process_alive.return_value = True
+        native.child_processes.side_effect = lambda pid: {instance.pid: [(70, 'shell.exe')],
+                                                         70: [(80, 'OpenConsole.exe')]}.get(pid, [])
+        with mock.patch.object(gui, 'win32', return_value=native), mock.patch.object(instance, 'alive', return_value=True):
+            self.assertTrue(instance.contains_pid(80))
+            self.assertFalse(instance.contains_pid(999))
+            births[70] = instance.creation - 1
+            self.assertFalse(instance.contains_pid(80))
+
+    def test_exit_before_first_window_audits_product_failure(self):
+        instance = self.instance()
+        native = mock.Mock()
+        native.process_alive.return_value = False
+        with mock.patch.object(gui, 'win32', return_value=native), mock.patch.object(instance, 'windows', return_value=[]), \
+                self.assertRaises(gui.InputBlocked) as raised:
+            instance.wait_window(30)
+        self.assertEqual('instance_gone', raised.exception.cause)
+        self.assertEqual('instance_gone', instance.input_events[-1]['cause'])
+
         fake = FakeWin32(self.PID, self.PID)
         original = fake.send
         def send(events):

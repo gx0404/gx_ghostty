@@ -1205,6 +1205,32 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
         self.assertEqual('raw failure evidence\n', (out / 'build/run-01.log').read_text(encoding='utf-8'))
 
+    def test_startup_failure_keeps_pid_and_arm(self):
+        import gx_win_gui as real
+        args, gui = self.args(), self.fake_gui()
+        instance = gui.launch(self.exe, self.root / 'fake-env')
+        instance.wait_window.side_effect = real.InputBlocked('startup crashed', cause='instance_gone')
+        gui.launch.side_effect = None
+        gui.launch.return_value = instance
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1, gx_perf.run_experiment(args, gui))
+        report = json.loads((args.out / 'build/run-01/run.json').read_text(encoding='utf-8'))
+        self.assertEqual((1, 'build', 'instance_gone'), (report.get('pid'), report['label'], report['failure_cause']))
+
+    def test_legacy_startup_failure_keeps_pid_and_arm(self):
+        import gx_win_gui as real
+        instance = mock.Mock(pid=73, creation=123)
+        instance.wait_window.side_effect = real.InputBlocked('startup crashed', cause='instance_gone')
+        out = self.root / 'legacy-startup'
+        with mock.patch.object(real, 'launch', return_value=instance), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(1, gx_perf.main(['win32', '--exe', str(self.exe), '--out', str(out), '--runs', '1']))
+        report = json.loads((out / 'build/warmup-failed.json').read_text(encoding='utf-8'))
+        self.assertEqual((73, 'build', 'instance_gone'), (report.get('pid'), report['label'], report.get('failure_cause')))
+        failures = gx_perf.product_failure_runs(out, [{'instance_pid': 73}])
+        self.assertEqual('build', failures[0]['label'])
+        self.assertEqual(out, gx_perf.driver_out_dir(['python', 'scripts/gx_perf.py', 'win32', '--out', str(out)]))
+
     def fake_gui(self):
         import gx_win_gui as real
         gui = mock.Mock(GuiError=real.GuiError, InputBlocked=real.InputBlocked, HARNESS_CONFIG='', env_assignments=real.env_assignments)
@@ -1326,6 +1352,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_idle_thread_churn_preserves_p2_but_foreign_input_rejects(self):
         instance, gui, counters = mock.Mock(), mock.Mock(), mock.Mock()
+        instance.hang_evidence.return_value = None
         instance.log = self.root/'idle.log'
         instance.log.write_text('', encoding='utf-8')
         gui.win32.return_value.window_pid.return_value = instance.pid
@@ -1352,12 +1379,13 @@ class ExperimentTests(unittest.TestCase):
                                                       reason='external input occurred during the idle measurement window',
                                                       before_tick=10, after_tick=11)
 
-    def idle_end(self, state, foreground_pid, *, helper=None, restored=(), hang=None, ticks=None, entry=None):
+    def idle_end(self, state, foreground_pid, *, helper=None, restored=(), hang=None, ticks=None, entry=None, descendants=False):
         """idle_interval against a fake desktop; (the PerfError it raised or None, the instance)."""
         instance, gui, counters = mock.Mock(pid=42), mock.Mock(), mock.Mock()
         instance.log = self.root / f'idle-{state}-{foreground_pid}.log'
         instance.log.write_text('', encoding='utf-8')
         instance.hang_evidence.return_value = hang
+        instance.contains_pid.side_effect = lambda pid: pid == 42 or descendants
         w = gui.win32.return_value
         w.foreground.return_value = 0x77
         w.window_pid.return_value = foreground_pid
@@ -1377,6 +1405,28 @@ class ExperimentTests(unittest.TestCase):
             except gx_perf.PerfError as exc:
                 return exc, instance
         return None, instance
+
+    def test_hang_wins_over_input(self):
+        raised, instance = self.idle_end('visible', 42, hang='hung window', ticks=[(1, 10), (2, 20)])
+        self.assertEqual('instance_hung', raised.cause)
+        self.assertEqual('instance_hung', instance.record_input.call_args.kwargs['cause'])
+
+    def test_descendant_regaining_focus_is_self_activation(self):
+        raised, _ = self.idle_end('unfocused', 84, descendants=True,
+                                  helper=mock.Mock(pid=50, **{'alive.return_value': True}))
+        self.assertEqual('instance_self_activated', raised.cause)
+
+    def test_state_entry_rejects_failed_arrangement(self):
+        instance, gui = mock.Mock(pid=42), mock.Mock()
+        gui.win32.return_value.window_pid.return_value = 42
+        gui.win32.return_value.IsIconic.return_value = False
+        instance.contains_pid.return_value = True
+        for state in ('unfocused', 'minimized'):
+            with self.subTest(state=state), mock.patch.object(gx_perf, 'last_input_ticks', return_value=(1, 2)), \
+                    mock.patch.object(gx_perf, 'main_windows', return_value=[SimpleNamespace(hwnd=10)]), \
+                    self.assertRaises(gx_perf.PerfError) as raised:
+                gx_perf.idle_state_entry(gui, instance, SimpleNamespace(report={}), SimpleNamespace(state=state))
+        instance.record_input.assert_not_called()
 
     def test_idle_state_breaks_keep_their_environment_and_product_causes(self):
         # Kept from round 7 (48ed500a3), end to end through idle_interval without any input: another
@@ -1443,6 +1493,7 @@ class ExperimentTests(unittest.TestCase):
 
         def check(state, pid, *, helper=None, hang=None):
             instance, gui = mock.Mock(pid=42), mock.Mock()
+            instance.contains_pid.side_effect = lambda value: value == 42
             instance.hang_evidence.return_value = hang
             w = gui.win32.return_value
             w.foreground.return_value = 0x77
@@ -1502,6 +1553,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_idle_state_check_runs_after_the_input_window_with_the_focus_helper(self):
         instance, gui, counters = mock.Mock(pid=42, exe=str(self.exe)), mock.Mock(HARNESS_CONFIG=''), mock.Mock()
+        instance.contains_pid.return_value = False
         args = self.args('win32-idle', '--state', 'unfocused')
         helper = gui.launch.return_value
         with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \

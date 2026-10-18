@@ -1934,6 +1934,31 @@ class Instance:
             self.note_gone(message)
             raise InputBlocked(message, cause="instance_gone")
 
+    def contains_pid(self, pid: int) -> bool:
+        """Current, live process-tree ownership, including grandchildren such as OpenConsole.
+        Check creation times so a reused pid cannot confer ownership on an unrelated process.
+        """
+        if not self.alive():
+            return False
+        if pid == self.pid:
+            return True
+        w = win32()
+        pending = [(self.pid, self.creation)]
+        seen = set()
+        while pending:
+            parent, birth = pending.pop()
+            if parent in seen or w.process_creation(parent) != birth:
+                continue
+            seen.add(parent)
+            for child, _name in w.child_processes(parent):
+                created = w.process_creation(child)
+                if created is None or created < birth or not w.process_alive(child):
+                    continue
+                if child == pid:
+                    return True
+                pending.append((child, created))
+        return False
+
     def remember_children(self) -> None:
         w = win32()
         known = {entry[0] for entry in self.children}
@@ -2011,7 +2036,9 @@ class Instance:
                 marks["shown_ms"] = (now - self.creation) / 10_000
                 return marks
             if not w.process_alive(self.pid):
-                raise GuiError(f"ghostty exited before showing a {kind} window; see {self.log}")
+                message = f"ghostty exited before showing a {kind} window; see {self.log}"
+                self.note_gone(message)
+                raise InputBlocked(message, cause='instance_gone')
             if time.monotonic() > deadline:
                 raise GuiError(f"no {kind} window within {timeout:g}s")
             time.sleep(0.001)
@@ -2539,7 +2566,11 @@ def launch(exe: Path, env_dir: Path, *, config: str | None = None, env: Mapping[
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     creation = w.process_creation(process.pid)
     if creation is None:
-        raise GuiError(f"ghostty pid {process.pid} exited right after the start")
+        message = f"ghostty pid {process.pid} exited right after the start"
+        Instance(process.pid, str(exe), env_dir, 0, launched).note_gone(message)
+        error = InputBlocked(message, cause='instance_gone')
+        error.instance_pid = process.pid
+        raise error
     return Instance(process.pid, str(exe.resolve()), env_dir.resolve(), creation, launched)
 
 

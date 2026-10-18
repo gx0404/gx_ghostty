@@ -1150,7 +1150,9 @@ def desktop_command(command: Sequence[str]) -> bool:
 
 def driver_out_dir(command: Sequence[str]) -> Path | None:
     """The --out directory of a gx_perf.py win32-* driver command, the measurement quiet-batch runs."""
-    if not gate_exit_contract(command):
+    if not gate_exit_contract(command) and not any(
+            process_name(command[index]) in ('gx_perf.py', 'perf') and command[index + 1] == 'win32'
+            for index in range(len(command) - 1)):
         return None
     for index, part in enumerate(command):
         if part == '--out' and index + 1 < len(command):
@@ -1166,7 +1168,7 @@ def product_failure_runs(out_dir: Path | None, rows: Sequence[Mapping]) -> list[
     label and run stay None when no such run.json exists (another command, or a pid it never wrote)."""
     runs: dict[int, dict] = {}
     if out_dir is not None and out_dir.is_dir():
-        for path in sorted(out_dir.glob('*/run-*/run.json')):
+        for path in sorted(set(out_dir.glob('*/run-*/run.json')) | set(out_dir.glob('*/*.json'))):
             try:
                 report = json.loads(path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
@@ -1887,6 +1889,12 @@ def idle_state_entry(gui, instance, capture, args) -> dict:
              'foreground_class': w.class_name(hwnd) if hwnd else 'none',
              'foreground_image': gui.image_name(pid) if pid else None}
     capture.report['idle_state_entry'] = entry
+    if args.state == 'minimized':
+        windows = main_windows(gui, instance)
+        if not windows or any(not w.IsIconic(window.hwnd) for window in windows):
+            raise PerfError('idle state entry failed: measured windows are not all minimized')
+    elif args.state == 'unfocused' and instance.contains_pid(pid):
+        raise PerfError('idle state entry failed: measured process tree still owns the foreground')
     return entry
 
 
@@ -1913,11 +1921,11 @@ def idle_state_check(gui, instance, args, helper=None, *, entry_tick: int) -> No
     pid = w.window_pid(hwnd) if hwnd else 0
     details = {}
     if args.state == 'visible':
-        if pid == instance.pid:
+        if instance.contains_pid(pid):
             return
         message = 'visible measured process lost focus'
     elif args.state == 'unfocused':
-        if pid != instance.pid:
+        if not instance.contains_pid(pid):
             return
         message = 'measured process regained focus'
         if helper is not None:
@@ -1971,6 +1979,15 @@ def idle_interval(gui, instance, capture, args, counters, helper=None, entry=Non
         context_switch_source='NtQuerySystemInformation(SystemProcessInformation), matched TID+CreateTime endpoints; diagnostic only',
         context_switch_scope='endpoint-surviving threads only; threads born and exited between endpoints are not observable')
     if input_after != start_tick:
+        instance.ensure_owned()
+        w = gui.win32()
+        hwnd = w.foreground()
+        pid = w.window_pid(hwnd) if hwnd else 0
+        if hang := instance.hang_evidence(w.class_name(hwnd) if hwnd else 'none', gui.image_name(pid) if pid else None):
+            message = f'ghostty pid {instance.pid} hangs or crashed ({hang}) during the idle measurement window'
+            instance.record_input('guard', check='idle_input_window', status='fail', cause='instance_hung', reason=message,
+                                  before_tick=start_tick, after_tick=input_after)
+            raise PerfError(message, cause='instance_hung')
         message = 'external input occurred during the idle measurement window'
         # Audited like a failed guard so quiet-batch reads plan §4 noise (INVALID), not a tool error.
         instance.record_input('guard', check='idle_input_window', status='fail', cause='foreign_input', reason=message,
@@ -2123,7 +2140,9 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         try:
             gui.prepare_env_dir(target / 'env', fresh=False)
             instance = gui.launch(exe, target / 'env', config=config, env=envs[label])
-            report.update(pid=instance.pid, creation=instance.creation, startup_ms=instance.wait_window(30))
+            report.update(pid=instance.pid, creation=instance.creation)
+            write_json(target / 'run.json', report)
+            report['startup_ms'] = instance.wait_window(30)
             instance.activate()
             time.sleep(1)
             capture = CaptureRun(instance, target, report)
@@ -2143,6 +2162,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
             report['status'] = 'failed'
             report['errors'].append(str(exc))
             report['failure_cause'] = getattr(exc, 'cause', None) or 'other'
+            if getattr(exc, 'instance_pid', None) is not None:
+                report['pid'] = exc.instance_pid
         finally:
             if instance:
                 try:
@@ -2266,9 +2287,11 @@ def run_remote(args) -> int:
 
 
 def measure_win32(gui, exe: Path, env_dir: Path, config: str, resizes: int,
-                  env: Mapping[str, str] | None = None) -> list[str]:
+                  env: Mapping[str, str] | None = None, report: dict | None = None) -> list[str]:
     """One Windows run: `metric` lines for startup, a new tab, a split and resizes."""
     instance = gui.launch(exe, env_dir, config=config, env=env)
+    if report is not None:
+        report.update(pid=instance.pid, creation=instance.creation)
     lines = [f"# gx_perf win32 run of {exe} (pid {instance.pid})"]
     try:
         for mark, value in instance.wait_window(30).items():
@@ -2331,36 +2354,42 @@ def run_win32(args: argparse.Namespace) -> int:
     config += gui.HARNESS_CONFIG
     out = new_output(Path(args.out))
     by_label = dict(zip(labels, exes))
+    run_report = {}
     def failed(label, name, exc):
         target = out / label / name
         log = gui.log_path(out / label / 'env')
         if log.is_file():
             target.with_suffix('.log').write_bytes(log.read_bytes())
-        result = {'status': 'failed', 'label': label, 'run': name, 'env': environments[label], 'error': str(exc)}
+        result = {**run_report, 'status': 'failed', 'label': label, 'run': name, 'env': environments[label],
+                  'error': str(exc), 'failure_cause': getattr(exc, 'cause', None) or 'other'}
+        if getattr(exc, 'instance_pid', None) is not None:
+            result['pid'] = exc.instance_pid
         write_json(target.with_suffix('.json'), result)
         write_json(args.json, result)
         (out / 'SUMMARY.txt').write_text(f'FAILED {label}/{name}: {exc}\n', encoding='utf-8', newline='\n')
         return 1
     for label in labels:
+        run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'warmup'}
         env_dir = out / label / "env"
         gui.prepare_env_dir(env_dir, fresh=True)
         print(f"{TAG} {label}: warm-up run (discarded)", flush=True)
         try:
-            measure_win32(gui, by_label[label], env_dir, config, 0, environments[label])
+            measure_win32(gui, by_label[label], env_dir, config, 0, environments[label], run_report)
         except gui.GuiError as exc:
             print(f"{TAG} {label}: warm-up failed: {exc}", file=sys.stderr)
             return failed(label, 'warmup-failed', exc)
     for run, label in alternate(labels, args.runs):
+        run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'measurement'}
         target = out / label / f"run-{run:02d}.txt"
         env_dir = out / label / "env"
         try:
-            lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label])
+            lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label], run_report)
         except gui.GuiError as exc:
             print(f"{TAG} {label} run {run} failed: {exc}", file=sys.stderr)
             return failed(label, f'run-{run:02d}', exc)
         lines.insert(0, "# environment " + json.dumps(environments[label], sort_keys=True))
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        write_json(target.with_suffix(".json"), {"label": label, "run": run, "env": environments[label]})
+        write_json(target.with_suffix(".json"), {**run_report, "label": label, "run": run, "env": environments[label]})
         log = gui.log_path(env_dir)
         if log.is_file():
             target.with_suffix(".log").write_text(log.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
