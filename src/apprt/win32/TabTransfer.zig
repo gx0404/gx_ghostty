@@ -15,6 +15,7 @@ extern "user32" fn CallNextHookEx(?*anyopaque, i32, usize, isize) callconv(.wina
 extern "dwmapi" fn DwmGetWindowAttribute(w32.HWND, u32, *anyopaque, u32) callconv(.winapi) i32;
 extern "user32" fn GetClassNameW(w32.HWND, [*]u16, i32) callconv(.winapi) i32;
 extern "user32" fn GetWindowThreadProcessId(w32.HWND, *u32) callconv(.winapi) u32;
+const log = std.log.scoped(.win32);
 
 const escape = struct {
     var hook: ?*anyopaque = null;
@@ -92,10 +93,13 @@ pub fn run(app: *App, source_reference: refs.Reference, tab: refs.Reference, poi
     }
     var cursor: w32.POINT = undefined;
     if (w32.GetCursorPos_(&cursor) == 0) return;
+    // Test-gated drop evidence; off-gate the counters never change.
+    const fixture_gate = @import("remote_test.zig").enabled();
+    app.fixture.count(fixture_gate, "transfer_drops");
     const destination = targetAt(app, location.window.ui_reference, cursor) orelse return;
     const fresh = app.resolveTab(tab) orelse return;
     switch (destination) {
-        .local => |local| _ = try fresh.window.moveTabToWindow(tab, local.window, local.position),
+        .local => |local| if (try fresh.window.moveTabToWindow(tab, local.window, local.position)) app.fixture.count(fixture_gate, "transfer_merges"),
         .remote => |process| {
             const returned = app.remote.returnRemoteTab(app, tab, process) catch |err| {
                 showRemoteError(fresh.window, err);
@@ -122,6 +126,7 @@ const Target = union(enum) {
     remote: @import("ipc/Security.zig").policy.Process,
 };
 fn targetAt(app: *App, moving: refs.Reference, point: w32.POINT) ?Target {
+    const trace = @import("remote_test.zig").enabled();
     var cursor = GetTopWindow(null);
     while (cursor) |hwnd| : (cursor = GetWindow(hwnd, 2)) {
         if (w32.IsWindowVisible_(hwnd) == 0 or w32.IsIconic(hwnd) != 0) continue;
@@ -134,16 +139,31 @@ fn targetAt(app: *App, moving: refs.Reference, point: w32.POINT) ?Target {
         // through an unrelated app to a Ghostty window behind it.
         for (app.windows.items) |window| {
             if (window.hwnd != hwnd) continue;
-            if (window.closing or !window.ui_attachment.isValid() or window.is_quick_terminal or window.tab_count >= @import("Window.zig").MAX_TABS) return null;
+            const full = window.tab_count >= @import("Window.zig").MAX_TABS;
+            if (window.closing or !window.ui_attachment.isValid() or window.is_quick_terminal or full) {
+                // Gated evidence that a real drop hit a live full target.
+                if (full and !window.closing and !window.is_quick_terminal) app.fixture.count(trace, "transfer_full_refusals");
+                fixtureTarget(trace, hwnd, if (full) "full" else "unavailable");
+                return null;
+            }
             var client = point;
             if (w32.ScreenToClient(hwnd, &client) == 0) return null;
-            return .{ .local = .{ .window = window.ui_reference, .position = window.tab_bar.transferSlotAt(client) orelse return null } };
+            const position = window.tab_bar.transferSlotAt(client) orelse {
+                fixtureTarget(trace, hwnd, "no_slot");
+                return null;
+            };
+            fixtureTarget(trace, hwnd, "local");
+            return .{ .local = .{ .window = window.ui_reference, .position = position } };
         }
         // This is discovery only. A class name/PID is never authentication:
         // the remote service rechecks both tokens, executable and isolation.
         var name: [64]u16 = undefined;
         const length = GetClassNameW(hwnd, &name, name.len);
-        if (length <= 0 or !std.mem.eql(u16, name[0..@intCast(length)], App.WINDOW_CLASS_NAME)) return null;
+        if (length <= 0 or !std.mem.eql(u16, name[0..@intCast(length)], App.WINDOW_CLASS_NAME)) {
+            fixtureTarget(trace, hwnd, "foreign");
+            return null;
+        }
+        fixtureTarget(trace, hwnd, "peer");
         var client = point;
         if (w32.ScreenToClient(hwnd, &client) == 0 or client.y < 0 or client.y >= @divTrunc(@as(i32, @intCast(w32.GetDpiForWindow(hwnd))), 2)) return null;
         var pid: u32 = 0;
@@ -156,5 +176,30 @@ fn targetAt(app: *App, moving: refs.Reference, point: w32.POINT) ?Target {
         security.verifyImage(local, peer) catch return null;
         return .{ .remote = peer.identity.process };
     }
+    fixtureTarget(trace, null, "none");
     return null;
+}
+
+/// Test-gated record of the window that decided a real drop (class names are
+/// ASCII; anything else is written as '?'). Off-gate it reads nothing.
+fn fixtureTarget(enabled: bool, hwnd: ?w32.HWND, outcome: []const u8) void {
+    if (!enabled) return;
+    var pid: u32 = 0;
+    var wide: [64]u16 = undefined;
+    var class: [64]u8 = undefined;
+    var count: usize = 0;
+    if (hwnd) |value| {
+        _ = GetWindowThreadProcessId(value, &pid);
+        const length = GetClassNameW(value, &wide, wide.len);
+        if (length > 0) for (wide[0..@intCast(length)]) |unit| {
+            class[count] = if (unit >= 0x20 and unit < 0x7f) @intCast(unit) else '?';
+            count += 1;
+        };
+    }
+    log.info("fixture_transfer_target outcome={s} hwnd=0x{x} pid={d} class={s}", .{ outcome, if (hwnd) |value| @intFromPtr(value) else 0, pid, class[0..count] });
+}
+
+test "tab transfer target trace is inert without the explicit test gate" {
+    // Undefined handle proves the disabled path reads no window state.
+    fixtureTarget(false, @ptrFromInt(0x10), "foreign");
 }

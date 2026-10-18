@@ -56,11 +56,11 @@ def require_broker_preview(case, stage, title):
         raise ValueError("multiline allow requires the exact English broker-preview title")
 
 
-def receipt_rows(text, pid):
-    return [{"pid": int(source), "request": int(request), "outcome": outcome}
-            for source, request, outcome in re.findall(
-                r"fixture_receipt pid=(\d+) request=(\d+) outcome=(pasted|cancelled|rejected|target_gone|expired|paste_failed)\b", text)
-            if int(source) == pid]
+def receipt_rows(text, pid, birth=None):
+    return [{"pid": int(source), "request": int(request), "outcome": outcome, "birth": int(created) if created else None}
+            for source, request, outcome, created in re.findall(
+                r"fixture_receipt pid=(\d+) request=(\d+) outcome=(pasted|cancelled|rejected|target_gone|expired|paste_failed)\b(?: birth=(\d+))?", text)
+            if int(source) == pid and (birth is None or (created and int(created) == birth))]
 
 
 def digest(path):
@@ -69,6 +69,24 @@ def digest(path):
 
 def save(path, data):
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def refuse_existing(paths):
+    """Final evidence is write-once: rerunning a subcommand with the same --name
+    must not erase the first (possibly failing) original."""
+    existing = [str(path) for path in paths if Path(path).exists()]
+    if existing:
+        raise FileExistsError(f"evidence already recorded; use a new --name instead of overwriting: {existing}")
+
+
+def save_new(path, data):
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def png_new(image, path):
+    with open(path, "xb") as handle:
+        handle.write(gui.png_bytes(image.width, image.height, image.rgb()))
 
 
 def token(pid):
@@ -239,6 +257,12 @@ def start_target(args, config):
     save(path, value)  # Preserve ownership even if startup fails.
     instance.wait_window(15)
     instance.activate()
+    if args.tabs > 1:
+        from gx_boundary_controller import Native
+        native = Native(instance, instance.require_window().hwnd)
+        for count in range(2, args.tabs + 1):
+            instance.press("ctrl+shift+t")
+            wait(lambda: native.query(4) == count)
     instance.capture_window(instance.require_window(), "screen").save_png(args.root / f"target-{args.integrity}.png")
     print(json.dumps(value, indent=2))
 
@@ -354,7 +378,7 @@ def inspect_or_respond(args, config):
     level = report["target"]["token"]["integrity"]
     same_session(require_level(level), report["target"]["token"])
     stamp = str(time.time_ns())
-    popups = [popup for popup in target.popups() if popup.cls in ("GhosttyGxPopup", "#32770")]
+    popups = [popup for popup in target.popups() if popup.cls in ("GhosttyGxPopup", "GhosttyGxPopupShadow", "#32770")]
     evidence = {"status": "VISUAL_PENDING", "popups": [], "enter_injected": False}
     for popup in popups:
         filename = f"popup-{stamp}-{popup.hwnd:x}.png"
@@ -400,21 +424,22 @@ def receipt(args, config):
     rows = []
     for path in (companion.log, companion.log.with_name(companion.log.name + ".1")):
         if path.exists():
-            rows.extend(receipt_rows(path.read_text(encoding="utf-8", errors="replace"), companion.pid))
+            rows.extend(receipt_rows(path.read_text(encoding="utf-8", errors="replace"), companion.pid, companion.creation))
     case_id = {"rejected": "BRK-01", "expired": "BRK-02", "target_gone": "BRK-03", "cancelled": "BRK-04", "pasted": "BRK-05", "paste_failed": "BRK-06"}[args.expect]
-    companion.activate()
     image = f"{case_id}-receipt.png"
-    companion.capture_window(companion.require_window(), "screen").save_png(work / image)
-    # Missing logging is not proof that the GUI receipt happened. It is an
-    # explicit integration dependency, and keeps the native case pending.
-    status = "PENDING" if not rows else ("PASS" if rows[-1]["outcome"] == args.expect else "FAIL")
+    refuse_existing([work / image, work / f"{case_id}-native.json", work / "reviews" / f"{case_id}.json"])
+    companion.activate()
+    png_new(companion.capture_window(companion.require_window(), "screen"), work / image)
+    # The gated receipt hook is part of this build. Missing evidence is a
+    # failed native assertion, not an unimplemented controller or environment.
+    status = "PASS" if rows and rows[-1]["outcome"] == args.expect else "FAIL"
     result = {"case_id": case_id, "boundary": "R5-04 broker final receipt", "environment": "VM medium/high split token",
               "status": status, "expected": args.expect, "rows": rows, "companion": report["companion"],
-              "reason": "requires test-gated DropCompanion fixture_receipt diagnostic" if not rows else None}
-    save(work / f"{case_id}-native.json", result)
+              "reason": "missing final receipt for this PID/birth" if not rows else None}
+    save_new(work / f"{case_id}-native.json", result)
     write_review(work, case_id, result["boundary"], result["environment"], status, [image], observation=result)
     print(json.dumps(result, indent=2))
-    return 2 if status == "PENDING" else int(status == "FAIL")
+    return int(status == "FAIL")
 
 
 def close(args, config):
@@ -432,10 +457,45 @@ def close(args, config):
     print("Verified owned process closed normally.")
 
 
+def boundary(args, config):
+    """Run from the existing high-token console, never elevate or bypass UIPI."""
+    from gx_boundary_controller import Native
+    require_level("high")
+    data = json.loads((args.root / "target-high.json").read_text(encoding="utf-8"))
+    target = owner(data, config)
+    same_session(require_level("high"), data["token"])
+    native = Native(target, target.require_window().hwnd)
+    if args.transition == "rejected":
+        assert native.control(21, 1) == 1
+        print("Armed one authenticated broker admission rejection. Now run medium drop, then receipt --expect rejected.")
+    else:
+        work = case_path(args.root, args.name)
+        refuse_existing([work / name for name in ("target-gone-preview.png", "target-gone-survivor.png", "target-gone-transition.json")])
+        report = json.loads((work / "report.json").read_text(encoding="utf-8"))
+        assert report["target"]["pid"] == target.pid and report["target"]["birth"] == target.creation
+        assert native.query(4) >= 2 or native.query(5, native.query(3)) > 1, "keep another live tab/pane before closing the selected target"
+        before = native.tree()
+        dialogs = [w for w in target.popups() if w.cls in ("GhosttyGxPopup", "GhosttyGxPopupShadow", "#32770")]
+        assert len(dialogs) == 1, "expected the single live broker preview"
+        dialog = dialogs[0]
+        png_new(target.capture_window(dialog, "screen"), work / "target-gone-preview.png")
+        assert native.control(22) == 1
+        if not gui.win32().activate(dialog.hwnd):
+            raise gui.InputBlocked("cannot activate the owned old preview")
+        target.ensure_foreground()
+        target.press("escape")
+        wait(lambda: not any(w.hwnd == dialog.hwnd for w in target.popups()))
+        assert target.alive()
+        png_new(target.capture_window(target.require_window(), "screen"), work / "target-gone-survivor.png")
+        save_new(work / "target-gone-transition.json", {"case_id": "BRK-03", "before": before, "after": native.tree(),
+                                                    "target_pid": target.pid, "target_birth": target.creation})
+        print("Selected target removed; host remains alive. Verify medium receipt --expect target_gone.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("setup", "target", "drop", "inspect", "respond", "receipt", "close"):
+    for name in ("setup", "target", "drop", "inspect", "respond", "receipt", "boundary", "close"):
         command = sub.add_parser(name)
         command.add_argument("--root", type=Path, required=True)
         command.add_argument("--desktop-held", action="store_true", help="caller already holds Invoke-Desktop")
@@ -446,6 +506,10 @@ def main():
             command.add_argument("--source-sha256", required=True)
         if name == "target":
             command.add_argument("--integrity", choices=("medium", "high"), required=True)
+            command.add_argument("--tabs", type=int, choices=(1, 2), default=2)
+        if name == "boundary":
+            command.add_argument("--transition", choices=("rejected", "target-gone"), required=True)
+            command.add_argument("--name", required=True)
         if name in ("drop", "inspect", "respond", "receipt", "close"):
             command.add_argument("--name", required=name != "close")
         if name == "drop":
@@ -471,6 +535,9 @@ def main():
         return 0
     config = settings(args.root)
     with fixture_slots(ROOT, args.desktop_held):
+        if args.command == "boundary":
+            boundary(args, config)
+            return 0
         if args.command == "receipt":
             return receipt(args, config)
         if args.command == "target":

@@ -31,6 +31,7 @@ selected: refs.Attachment = .{},
 pending: [contract.max_pending]?*Pending = @splat(null),
 draining: bool = false,
 closing: bool = false,
+fixture_reject: bool = false,
 
 const Pending = struct {
     bridge: *Self,
@@ -123,6 +124,12 @@ pub fn drain(self: *Self, app: *App) void {
 }
 
 fn preview(self: *Self, app: *App, broker: *transport.Broker, work: contract.Work) !void {
+    // The normal authenticated protocol still prepared/decoded this request.
+    // Only the explicitly gated fixture can exhaust GUI admission on demand.
+    if (self.takeFixtureRejection(@import("remote_test.zig").enabled())) {
+        try broker.complete(work.key, .rejected);
+        return;
+    }
     const surface = eligible(app, work.target) orelse {
         try broker.complete(work.key, .target_gone);
         return;
@@ -177,6 +184,20 @@ fn preview(self: *Self, app: *App, broker: *transport.Broker, work: contract.Wor
         Pending.finish(pending, .paste_failed);
         log.warn("drop broker protected paste could not start: {}", .{err});
     };
+}
+
+fn takeFixtureRejection(self: *Self, enabled: bool) bool {
+    if (!enabled or !self.fixture_reject) return false;
+    self.fixture_reject = false;
+    return true;
+}
+
+test "broker fixture rejection is one shot and inert with gate off" {
+    var bridge: Self = .{ .fixture_reject = true };
+    try std.testing.expect(!bridge.takeFixtureRejection(false));
+    try std.testing.expect(bridge.fixture_reject);
+    try std.testing.expect(bridge.takeFixtureRejection(true));
+    try std.testing.expect(!bridge.takeFixtureRejection(true));
 }
 
 fn clonePayload(allocator: std.mem.Allocator, payload: contract.Payload) !data.Payload {

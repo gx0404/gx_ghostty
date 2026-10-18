@@ -8,7 +8,13 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+import os
 from pathlib import Path
+import subprocess
+
+# A controlled stage (a VM's copy of the Python fixtures, no git checkout)
+# may name its kernel-slot directory explicitly; see `slot_root`.
+SLOT_ROOT_ENV = "GX_FIXTURE_SLOT_ROOT"
 
 
 def sha256(path):
@@ -17,6 +23,12 @@ def sha256(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def source_manifest():
+    root = Path(__file__).resolve().parents[2]
+    paths = sorted((root / "test/windows").glob("gx_*.py")) + [root / "scripts/gx_win_uia.py"]
+    return {str(path.relative_to(root)).replace("\\", "/"): sha256(path) for path in paths}
 
 
 def process_identity(api, pid):
@@ -56,6 +68,24 @@ def native_snapshot(instance, *, hooks=True):
             pid = api.send_message(window.hwnd, 0x450, 3, 0, timeout_ms=2000)
             if pid:
                 entry["pty"] = process_identity(api, pid)
+            if api.send_message(window.hwnd, 0x452, 0, 0, timeout_ms=2000) == 0x47584133:
+                entry["window_id"] = api.send_message(window.hwnd, 0x452, 2, 0, timeout_ms=2000)
+                tab = api.send_message(window.hwnd, 0x452, 3, 0, timeout_ms=2000)
+                count = api.send_message(window.hwnd, 0x452, 5, tab, timeout_ms=2000)
+                if count is not None and 1 <= count <= 511:
+                    for index in range(count):
+                        position = tab | (index << 16)
+                        if api.send_message(window.hwnd, 0x452, 10, position, timeout_ms=2000) != 1:
+                            continue
+                        core = api.send_message(window.hwnd, 0x452, 11, position, timeout_ms=2000)
+                        if core != entry["surface_id"]:
+                            continue
+                        total = api.send_message(window.hwnd, 0x452, 20, position, timeout_ms=2000)
+                        viewport = api.send_message(window.hwnd, 0x452, 21, position, timeout_ms=2000)
+                        if total is not None and viewport is not None and 0 <= viewport <= total < (1 << 63):
+                            entry.update(scrollback_count=total - viewport, scrollback_total=total,
+                                         viewport_rows=viewport, scrollback_status="OBSERVED_NATIVE")
+                        break
         windows.append(entry)
     instance.ensure_owned()
     return {"process": process, "windows": windows,
@@ -87,17 +117,59 @@ def drag_thresholds(dpi):
             for axis, dip in (("vertical", 15), ("horizontal", 10))}
 
 
+def in_checkout(root):
+    """Whether `root` lies in a git checkout: a `.git` directory, or a
+    worktree's `.git` file, at it or above. Read from the file system only."""
+    path = Path(root).resolve()
+    return any((candidate / ".git").exists() for candidate in (path, *path.parents))
+
+
+def slot_root(root):
+    """The kernel-slot directory of the fixture's desktop and heavy locks.
+
+    1. `GX_FIXTURE_SLOT_ROOT`, an absolute path, when set: a controlled stage
+       names its slots without git (review round 4).
+    2. In a git checkout, the directory every checkout of the repository
+       shares: the main checkout's .local/kernel-slots beside the git common
+       directory, so a fixture run from a worktree excludes the other
+       worktrees' desktop and heavy jobs. gx_slots.shared_root() is the source
+       when this gx_slots has it. A git failure there is an error, never a
+       fallback: a worktree's own slots would not exclude the others.
+    3. A staged copy outside any checkout (a VM's): its own .local/kernel-slots,
+       as before slots were shared; nothing else there takes them.
+    """
+    explicit = os.environ.get(SLOT_ROOT_ENV)
+    if explicit:
+        if not Path(explicit).is_absolute():
+            raise ValueError(f"{SLOT_ROOT_ENV} must be an absolute path: {explicit!r}")
+        return Path(explicit)
+    if not in_checkout(root):
+        return Path(root) / ".local" / "kernel-slots"
+    import gx_slots
+    shared = getattr(gx_slots, "shared_root", None)
+    if shared is not None:
+        return Path(shared())
+    result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, encoding="utf-8", timeout=10, check=True)
+    return Path(result.stdout.strip()).parent / ".local" / "kernel-slots"
+
+
 @contextmanager
 def fixture_slots(root, desktop_held=False):
     """Avoid nested acquisition when root already used Invoke-Desktop.
 
 The explicit flag is a caller assertion, not a new way to acquire the desktop.
 Every real run still requires the coordinator's idle and foreground guards.
+With it nothing is locked and `slot_root` is never asked, so a coordinator
+that holds the slots needs neither git nor a slot directory. Without it the
+locks live in `slot_root`: the repository-wide slots in a checkout, never a
+worktree's own copy.
 """
     if desktop_held:
         yield
         return
     import gx_slots
-    with gx_slots.acquire(root / ".local/kernel-slots", "heavy", 45):
-        with gx_slots.acquire(root / ".local/kernel-slots", "desktop", 45):
+    shared = slot_root(root)
+    with gx_slots.acquire(shared, "heavy", 45):
+        with gx_slots.acquire(shared, "desktop", 45):
             yield

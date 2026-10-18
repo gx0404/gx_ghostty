@@ -52,6 +52,57 @@ class SessionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'dynamic title'):
             sessions.assert_private_document(document, ('中文',))
 
+    def capture_setup(self, root, exstyle, owner=0x100, owner_pid=42):
+        exe = root / 'fixture.exe'
+        exe.write_bytes(b'fixture')
+        fixture = sessions.Fixture(exe, root / 'out', 'unit')
+        target = sessions.gui.WindowInfo(0x200, 'GhosttyGxPopup', '', (10, 10, 110, 60), True, False, False)
+        image = mock.Mock()
+        instance = SimpleNamespace(pid=42, ensure_owned=mock.Mock(), capture_window=mock.Mock(return_value=image))
+        api = mock.Mock()
+        api.GetWindowLongPtrW.return_value = exstyle
+        api.GetAncestor.side_effect = lambda hwnd, flag: owner if flag == 3 else hwnd
+        api.window_pid.side_effect = lambda hwnd: owner_pid if hwnd == owner else 42
+        api.info.return_value = target
+        api.window_at.return_value = target.hwnd
+        return fixture, target, instance, api, image
+
+    def test_a_menu_popup_is_captured_with_its_owner_holding_the_foreground(self):
+        # A menu popup (WS_EX_NOACTIVATE) never becomes the foreground window, so
+        # asking to activate it fails; its owned root owner holds the foreground.
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, popup, instance, api, image = self.capture_setup(Path(folder), 0x08000000 | 0x80)
+            api.activate.side_effect = lambda hwnd: hwnd == 0x100
+            with mock.patch.object(sessions.gui, 'win32', return_value=api), \
+                    mock.patch.object(sessions, 'native_snapshot', return_value={}), mock.patch.object(sessions.time, 'sleep'):
+                fixture.capture(instance, 'menu', popup)
+            api.activate.assert_called_once_with(0x100)
+            instance.capture_window.assert_called_once_with(popup, 'screen')
+            image.save_png.assert_called_once_with(fixture.out / 'menu.png')
+            record = fixture.report['captures'][-1]
+            self.assertEqual((True, 0x100), (record['foreground'], record['foreground_hwnd']))
+
+    def test_a_menu_popup_owned_by_another_process_or_closed_by_the_activation_is_not_captured(self):
+        for label, owner_pid, visible in (('foreign owner', 7, True), ('closed', 42, False)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                fixture, popup, instance, api, _ = self.capture_setup(Path(folder), 0x08000000, owner_pid=owner_pid)
+                api.activate.return_value = True
+                api.info.return_value = sessions.gui.WindowInfo(popup.hwnd, popup.cls, '', popup.rect, visible, False, False)
+                with mock.patch.object(sessions.gui, 'win32', return_value=api), \
+                        mock.patch.object(sessions, 'native_snapshot', return_value={}), mock.patch.object(sessions.time, 'sleep'), \
+                        self.assertRaises((sessions.gui.InputBlocked, AssertionError)):
+                    fixture.capture(instance, 'menu', popup)
+                instance.capture_window.assert_not_called()
+
+    def test_an_activatable_window_must_itself_hold_the_foreground(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, window, instance, api, _ = self.capture_setup(Path(folder), 0)
+            api.activate.return_value = False
+            with mock.patch.object(sessions.gui, 'win32', return_value=api), self.assertRaisesRegex(sessions.gui.InputBlocked, 'foreground denied'):
+                fixture.capture(instance, 'palette', window)
+            api.activate.assert_called_once_with(window.hwnd)
+            instance.capture_window.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

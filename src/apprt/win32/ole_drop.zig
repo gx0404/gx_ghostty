@@ -336,7 +336,18 @@ fn leaveAt(self: *Target, expected: refs.Attachment) HRESULT {
     self.notify(expected, .leave, .{ .x = 0, .y = 0 }, false);
     return 0;
 }
+/// Diagnostic counts are GUI/COM-apartment owned and contain no payload data.
+pub const FixtureCounts = struct {
+    drops: usize = 0,
+    queued: usize = 0,
+    pub fn record(self: *FixtureCounts, enabled: bool, comptime field: []const u8) void {
+        if (enabled) @field(self, field) +|= 1;
+    }
+};
+pub var fixture_counts: FixtureCounts = .{};
+
 fn drop(value: *Interface, object: *DataObject, _: u32, point: w32.POINT, effect: *u32) callconv(.winapi) HRESULT {
+    fixture_counts.record(@import("remote_test.zig").enabled(), "drops");
     _ = addRef(value);
     defer _ = release(value);
     const self = fromInterface(value);
@@ -356,6 +367,7 @@ fn drop(value: *Interface, object: *DataObject, _: u32, point: w32.POINT, effect
     if (!self.liveAt(expected)) return 0;
     const callbacks = self.callbacks.?;
     transferred = callbacks.post(callbacks.context, expected, payload);
+    if (transferred) fixture_counts.record(@import("remote_test.zig").enabled(), "queued");
     if (transferred) effect.* = COPY;
     if (self.helperRef(expected)) |helper| {
         defer _ = helper.vtable.Release(helper);
@@ -364,6 +376,15 @@ fn drop(value: *Interface, object: *DataObject, _: u32, point: w32.POINT, effect
     self.notify(expected, if (transferred) .queued else .rejected, point, transferred);
     if (!self.liveAt(expected)) effect.* = 0;
     return 0;
+}
+
+test "OLE fixture counters do not change without the test gate" {
+    var counts: FixtureCounts = .{};
+    counts.record(false, "drops");
+    counts.record(false, "queued");
+    try std.testing.expectEqualDeep(FixtureCounts{}, counts);
+    counts.record(true, "drops");
+    try std.testing.expectEqual(@as(usize, 1), counts.drops);
 }
 const vtable: Interface.VTable = .{ .QueryInterface = query, .AddRef = addRef, .Release = release, .DragEnter = enter, .DragOver = over, .DragLeave = leave, .Drop = drop };
 extern "ole32" fn RegisterDragDrop(w32.HWND, *Interface) callconv(.winapi) HRESULT;

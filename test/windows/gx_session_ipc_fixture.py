@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import asdict
 import ctypes
 import hashlib
 import json
@@ -22,10 +23,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import gx_slots  # noqa: E402
 import gx_win_gui as gui  # noqa: E402
-from gx_fixture_evidence import native_snapshot, sha256, write_review, fixture_slots
+from gx_fixture_evidence import native_snapshot, sha256, write_review, fixture_slots, source_manifest
 
 CONFIG = "language = en\nconfirm-close-surface = false\n"
 CREATE_SUSPENDED = 0x00000004  # Win32 creation flag; not exported by every Python build.
+WS_EX_NOACTIVATE = 0x08000000  # menu popups: Windows never makes them the foreground window
 CASE_IDS = {"multi": "IPC-01", "disabled": "SES-00", "custom": "SES-03a",
             "roundtrip": "SES-01", "missing_profile": "SES-02", "priority": "SES-03",
             "cancel_close": "SES-04", "write_failure": "SES-05", "dual_writer": "SES-06",
@@ -143,6 +145,7 @@ class Fixture:
             "app_mtime_ns": self.exe.stat().st_mtime_ns, "build_label": build,
             "tree_boundary": "Build label is caller supplied; the current source tree is not a build receipt.",
             "cases": [], "processes": [], "captures": [], "visual_review": "PENDING",
+            "fixture_sources": source_manifest(),
         }
 
     def environment(self, name, config):
@@ -151,7 +154,7 @@ class Fixture:
         gui.write_config(path, config)
         return path
 
-    def start(self, path, args=(), *, resume=True, exe=None, expected_hash=None):
+    def start(self, path, args=(), *, resume=True, exe=None, expected_hash=None, env=None):
         assert path.is_absolute()
         image = exe.resolve(strict=True) if exe else self.exe
         image_hash = sha256(image)
@@ -159,7 +162,7 @@ class Fixture:
         # Query identity before the launcher can exit. Retain our exact process
         # handle for exit codes and crash tests; never infer exit success by PID.
         launched = gui.win32().now_filetime()
-        environment = gui.isolated_environment(os.environ, path, {"GHOSTTY_GX_REMOTE_TEST": "1"})
+        environment = gui.isolated_environment(os.environ, path, {"GHOSTTY_GX_REMOTE_TEST": "1", **(env or {})})
         process = subprocess.Popen([str(image), *args], cwd=path, env=environment,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    creationflags=CREATE_SUSPENDED)
@@ -195,16 +198,36 @@ class Fixture:
     def capture(self, instance, name, window=None):
         instance.ensure_owned()
         window = window or instance.require_window()
+        # A menu popup never becomes the foreground window: the owned window
+        # that owns it (GA_ROOTOWNER) must hold the foreground instead.
+        foreground_hwnd = window.hwnd
+        if gui.win32().GetWindowLongPtrW(window.hwnd, -20) & WS_EX_NOACTIVATE:
+            foreground_hwnd = gui.win32().GetAncestor(window.hwnd, 3)
+            if not foreground_hwnd or foreground_hwnd == window.hwnd or gui.win32().window_pid(foreground_hwnd) != instance.pid:
+                raise gui.InputBlocked("non-activating popup has no owned owner window; stopping batch")
         # PrintWindow stays scoped to the owned HWND if Windows denies foreground.
-        foreground = gui.win32().activate(window.hwnd)
+        foreground = gui.win32().activate(foreground_hwnd)
         if not foreground:
             raise gui.InputBlocked("owned window foreground denied; stopping batch")
         time.sleep(0.2)
         instance.ensure_owned()
+        window = gui.win32().info(window.hwnd)
+        if gui.win32().window_pid(window.hwnd) != instance.pid:
+            raise gui.InputBlocked("capture HWND owner changed")
+        if not window.visible:
+            raise AssertionError(f"window {window.hwnd:#x} closed before its capture")
+        occluders = set()
+        left, top, right, bottom = window.rect
+        for fx, fy in ((0.5, 0.1), (0.5, 0.5), (0.5, 0.9)):
+            hit = gui.win32().window_at(round(left + (right - left) * fx), round(top + (bottom - top) * fy))
+            root = gui.win32().GetAncestor(hit, 2) if hit else 0
+            if root and root != window.hwnd:
+                occluders.add(root)
         method = "screen"
         instance.capture_window(window, method).save_png(self.out / f"{name}.png")
         self.report["captures"].append({"file": f"{name}.png", "method": method,
-                                        "foreground": foreground, "review": "PENDING_REVIEW",
+                                        "foreground": foreground, "foreground_hwnd": foreground_hwnd, "review": "PENDING_REVIEW",
+                                        "window": asdict(window), "occluder_hwnds": sorted(occluders),
                                         "identity": native_snapshot(instance)})
 
     def close(self, instance):

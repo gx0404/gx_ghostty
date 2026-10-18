@@ -105,7 +105,7 @@ class OwnedDrag:
         self.instance, self.exe, self.app_hash = instance, exe, app_hash.lower()
         self.source, self.source_hash, self.process, self.birth = source, source_hash.lower(), process, birth
         self.source_hwnd, self.terminal = source_hwnd, terminal
-        self.target_hwnd = instance.require_window().hwnd
+        self.target_hwnd = gui.win32().GetAncestor(terminal.hwnd, 2)
         self.last_point = None
         self.check_identity()
 
