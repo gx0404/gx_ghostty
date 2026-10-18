@@ -147,7 +147,8 @@ class WindowsVmTests(IsolatedTestCase):
         fixture = data["python_fixture"]
         self.assertEqual(fixture["python"]["sha256"], pinned["sha256"])
         self.assertEqual((destination / "py" / pinned["file"]).read_bytes(), archive.read_bytes())
-        self.assertEqual(sorted(fixture["files"]), sorted(vm.BROKER_FIXTURE))
+        self.assertEqual(sorted(fixture["files"]), sorted(BROKER_CLOSURE))
+        self.assertEqual(fixture["source"], {"ref": None, "commit": None, "kind": "working tree"})
         for relative, digest in fixture["files"].items():
             self.assertEqual(digest, vm.sha256_file(vm.ROOT / relative))
             self.assertEqual(vm.sha256_file(destination / "py" / relative), digest)
@@ -175,18 +176,33 @@ class WindowsVmTests(IsolatedTestCase):
             with self.assertRaisesRegex(ValueError, "not a Windows executable"):
                 vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11", archive, ole)
 
-    def test_broker_fixture_stages_every_repository_module_it_imports(self):
-        local = {path.stem for folder in ("test/windows", "scripts") for path in (vm.ROOT / folder).glob("*.py")}
-        staged = {Path(relative).stem for relative in vm.BROKER_FIXTURE}
-        for relative in vm.BROKER_FIXTURE:
-            tree = ast.parse((vm.ROOT / relative).read_text(encoding="utf-8"))
-            imported = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported.update(alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-                    imported.add(node.module.split(".")[0])
-            self.assertEqual(sorted((imported & local) - staged), [], relative)
+    def test_broker_fixture_closure_follows_repository_imports(self):
+        self.assertEqual(sorted(vm.fixture_closure(vm.working_tree_reader)), sorted(BROKER_CLOSURE))
+        # A fixture branch can import a module the working tree does not have yet.
+        sources = {"test/windows/gx_drop_broker_fixture.py": b"import json\nfrom gx_boundary_controller import Native\n",
+                   "test/windows/gx_boundary_controller.py": b"import gx_win_gui as gui\nimport os.path\n",
+                   "scripts/gx_win_gui.py": b"from gx_drop_broker_fixture import x\n"}
+        self.assertEqual(sorted(vm.fixture_closure(sources.get)), sorted(sources))
+        with self.assertRaisesRegex(ValueError, "missing"):
+            vm.fixture_closure({}.get)
+
+    def test_stage_validation_takes_the_fixture_from_a_git_ref(self):
+        vm.prepare(self.root)
+        machine = vm.machine_identity(self.root, "win11")
+        archive, pinned = self.fake_python()
+        ole = self.root / "gx_ole_source.exe"
+        ole.write_bytes(b"MZ ole source")
+        sources = {"test/windows/gx_drop_broker_fixture.py": b"import gx_ole_fixture\n",
+                   "test/windows/gx_ole_fixture.py": b"print('ref')\n"}
+        reader = mock.Mock(side_effect=sources.get)
+        reader.commit = "0123456789abcdef0123456789abcdef01234567"
+        with mock.patch.dict(vm.GUEST_PYTHON, pinned), mock.patch.object(vm, "git_reader", return_value=reader) as git:
+            destination = vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11", archive, ole, "wip/fixtures")
+        git.assert_called_once_with("wip/fixtures")
+        fixture = json.loads((destination / "validation-manifest.json").read_text())["python_fixture"]
+        self.assertEqual(fixture["source"], {"ref": "wip/fixtures", "commit": reader.commit, "kind": "git"})
+        self.assertEqual(sorted(fixture["files"]), sorted(sources))
+        self.assertEqual((destination / "py" / "test" / "windows" / "gx_ole_fixture.py").read_bytes(), b"print('ref')\n")
 
     def test_media_rejects_corruption_and_truncation(self):
         path = self.root / "iso"
@@ -604,6 +620,10 @@ class WindowsVmTests(IsolatedTestCase):
                     mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
                 self.assertEqual(vm.main(), code)
             self.assertEqual(json.loads(stdout.getvalue())["absolute"], code == 0)
+
+
+BROKER_CLOSURE = ("test/windows/gx_drop_broker_fixture.py", "test/windows/gx_ole_fixture.py",
+                  "test/windows/gx_fixture_evidence.py", "scripts/gx_win_gui.py", "scripts/gx_slots.py")
 
 
 def windows_powershell() -> str | None:

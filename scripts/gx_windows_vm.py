@@ -44,6 +44,7 @@ QEMU human monitor inside the container.
 from __future__ import annotations
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -88,9 +89,9 @@ GUEST_PYTHON = {
     "size": 11133606,
     "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
 }
-# test/windows/gx_drop_broker_fixture.py and the repository modules it imports (py-fixture phase).
-BROKER_FIXTURE = ("test/windows/gx_drop_broker_fixture.py", "test/windows/gx_ole_fixture.py",
-                  "test/windows/gx_fixture_evidence.py", "scripts/gx_win_gui.py", "scripts/gx_slots.py")
+# The broker fixture; stage-validation adds every test/windows or scripts module it imports.
+BROKER_ENTRY = "test/windows/gx_drop_broker_fixture.py"
+FIXTURE_FOLDERS = ("test/windows", "scripts")
 OLE_SOURCE_NAME = "gx_ole_source.exe"
 MEDIA = {
     "win11": {
@@ -740,16 +741,65 @@ def verify_guest_python(path: Path) -> str:
     return GUEST_PYTHON["sha256"]
 
 
-def stage_python_fixture(destination: Path, guest_python: Path, ole_source: Path) -> dict:
-    """Copy the pinned embeddable Python, the broker fixture files and the OLE source to py/."""
+def working_tree_reader(relative: str) -> bytes | None:
+    path = ROOT / relative
+    return path.read_bytes() if path.is_file() else None
+
+
+def git_reader(ref: str):
+    """Files as committed at ref (such as a fixture branch that is not merged yet); None if absent."""
+    found = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+                           capture_output=True, text=True)
+    if found.returncode != 0 or not found.stdout.strip():
+        raise ValueError(f"--fixture-ref {ref} is not a commit of this repository")
+    commit = found.stdout.strip()
+
+    def read(relative: str) -> bytes | None:
+        shown = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:{relative}"], capture_output=True)
+        return shown.stdout if shown.returncode == 0 else None
+
+    read.commit = commit
+    return read
+
+
+def fixture_closure(read, entry: str = BROKER_ENTRY) -> dict[str, bytes]:
+    """The entry script and every test/windows or scripts module it imports, transitively."""
+    files: dict[str, bytes] = {}
+    pending = [entry]
+    while pending:
+        relative = pending.pop()
+        if relative in files:
+            continue
+        data = read(relative)
+        if data is None:
+            if relative == entry:
+                raise ValueError(f"{entry} is missing from the fixture source")
+            continue
+        files[relative] = data
+        for node in ast.walk(ast.parse(data.decode("utf-8"), relative)):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                names = [node.module]
+            else:
+                continue
+            pending.extend(f"{folder}/{name.split('.')[0]}.py" for name in names for folder in FIXTURE_FOLDERS)
+    return dict(sorted(files.items()))
+
+
+def stage_python_fixture(destination: Path, guest_python: Path, ole_source: Path, fixture_ref: str | None = None) -> dict:
+    """Copy the pinned embeddable Python, the broker fixture files and the OLE source to py/.
+
+    The fixture files come from the working tree, or as committed at fixture_ref."""
     verify_guest_python(guest_python)
+    read = working_tree_reader if fixture_ref is None else git_reader(fixture_ref)
+    sources = fixture_closure(read)
     folder = destination / "py"
     folder.mkdir(exist_ok=True)
     shutil.copyfile(guest_python, folder / GUEST_PYTHON["file"])
     verify_guest_python(folder / GUEST_PYTHON["file"])
     files = {}
-    for relative in BROKER_FIXTURE:
-        data = (ROOT / relative).read_bytes()
+    for relative, data in sources.items():
         target = folder / Path(relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
@@ -762,11 +812,14 @@ def stage_python_fixture(destination: Path, guest_python: Path, ole_source: Path
     return {"python": {key: GUEST_PYTHON[key] for key in ("version", "file", "sha256", "url")},
             "files": files, "tree_sha256": hashlib.sha256(tree.encode("utf-8")).hexdigest(),
             "ole_source": {"file": OLE_SOURCE_NAME, "sha256": hashlib.sha256(ole).hexdigest(),
-                           "source_name": Path(ole_source).name}}
+                           "source_name": Path(ole_source).name},
+            "source": {"ref": fixture_ref, "commit": getattr(read, "commit", None),
+                       "kind": "working tree" if fixture_ref is None else "git"}}
 
 
 def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str,
-                     guest_python: Path | None = None, ole_source: Path | None = None) -> Path:
+                     guest_python: Path | None = None, ole_source: Path | None = None,
+                     fixture_ref: str | None = None) -> Path:
     """Stage a guest-only fixture; never touch Docker, host accounts or registry.
 
     With guest_python (the pinned embeddable package) and ole_source, the broker fixture is staged
@@ -800,7 +853,8 @@ def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str,
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "out").mkdir(exist_ok=True)
     (destination / VALIDATION_SCRIPT.name).write_bytes(script_bytes)
-    python_fixture = stage_python_fixture(destination, guest_python, ole_source) if guest_python is not None else None
+    python_fixture = (stage_python_fixture(destination, guest_python, ole_source, fixture_ref)
+                      if guest_python is not None else None)
     write(previous, json.dumps({
         "schema": 1, "owner": OWNER, "image": IMAGE, "version": version,
         "guest_uuid": str(machine_uuid), "guest_name": guest_name,
@@ -1046,6 +1100,7 @@ def main() -> int:
                         + " (downloaded explicitly from " + GUEST_PYTHON["url"] + ")")
     parser.add_argument("--ole-source", type=Path, help="stage-validation: gx_ole_source.exe for the broker fixture")
     parser.add_argument("--name", help="queue-args: q/<name>.txt for gx-q.cmd <name>")
+    parser.add_argument("--fixture-ref", help="stage-validation: take the broker fixture files as committed at this git ref")
     args = parser.parse_args()
     root = args.root.resolve()
     try:
@@ -1140,7 +1195,8 @@ def main() -> int:
             if args.guest_uuid and str(uuid.UUID(args.guest_uuid)) != live:
                 raise VmError("--guest-uuid differs from the live QEMU UUID")
             name = args.guest_name or machine_identity(root, args.version)["host"]
-            destination = stage_validation(root, args.version, live, name, args.guest_python, args.ole_source)
+            destination = stage_validation(root, args.version, live, name, args.guest_python, args.ole_source,
+                                           args.fixture_ref)
             print(f"Staged guest-only validation fixture: {destination}")
     except (OSError, ValueError, VmError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"ERROR: {exc}\n")

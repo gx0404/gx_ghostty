@@ -3598,14 +3598,15 @@ function Get-SharedSha256([string]$Path) {
 
 function Get-PyPopups([int]$TargetPid, $Answered) {
     if (-not ('GxVmWindows' -as [type])) { Add-Type -TypeDefinition $script:WindowSource -Language CSharp }
-    return @([GxVmWindows]::TopLevel($TargetPid) | Where-Object { $_['visible'] -and ($_['class'] -ceq 'GhosttyGxPopup' -or $_['class'] -ceq '#32770') -and
+    # Dialogs drawn with a drop shadow use the GhosttyGxPopupShadow class (src/apprt/win32/ui/Popup.zig).
+    return @([GxVmWindows]::TopLevel($TargetPid) | Where-Object { $_['visible'] -and $_['class'] -cin @('GhosttyGxPopup', 'GhosttyGxPopupShadow', '#32770') -and
         $Answered -notcontains [Convert]::ToInt64($_['hwnd'].Substring(2), 16) })
 }
 
 function Invoke-PyRespondWhenShown($Context) {
     # Broker confirmations have a 30 s lifetime, too short for a person to read an inspect capture
     # and type a response. Each -PyResponses entry "decision,stage,delay_ms[,dx,dy]" waits for a new
-    # GhosttyGxPopup/#32770 of the case's target process, runs the fixture's inspect (captures),
+    # GhosttyGxPopup(Shadow)/#32770 of the case's target process, runs the fixture's inspect (captures),
     # then its respond on that HWND. delay_ms counts from when the popup was first seen; allow
     # clicks at the popup's left/top plus dx/dy (negative: from right/bottom), offsets read from an
     # earlier reviewed capture of the same dialog. The fixture's own respond guards still apply.
