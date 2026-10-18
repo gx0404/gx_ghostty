@@ -481,8 +481,162 @@ function Test-Elevated {
     return ([Security.Principal.WindowsPrincipal]::new($current)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Every JSON file goes through GxVmJson.Plain first: a bounded copy made of ordered dictionaries,
+# arrays and scalars. Windows PowerShell 5.1's ConvertTo-Json otherwise walks live .NET objects to
+# -Depth: the PSPath/PSDrive/PSProvider notes Get-Content attaches to every line made the r6-x
+# cross-account peer report run for 19 minutes and then fail (InvalidCastFromAnyTypeToString), so
+# no report was written. Extended PowerShell members are dropped, other objects are written as
+# text, and each such conversion is listed in json_notes. Write-Json never throws for content: a
+# value that still cannot be serialized is written as json_error plus its text and is also listed
+# in the phase report (json_errors).
+$script:JsonErrors = New-Object System.Collections.Generic.List[string]
+$script:JsonSource = @'
+using System;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Management.Automation;
+public sealed class GxVmJsonResult {
+    public object Value;
+    public int Nodes;
+    public ArrayList Notes = new ArrayList();
+}
+public static class GxVmJson {
+    public static GxVmJsonResult Plain(object value, int maxDepth, int maxNodes) {
+        GxVmJsonResult state = new GxVmJsonResult();
+        state.Value = Convert(value, 0, "$", maxDepth, maxNodes, state);
+        return state;
+    }
+    static void Note(GxVmJsonResult state, string path, string text) {
+        if (state.Notes.Count < 64) state.Notes.Add(path + ": " + text);
+        else if (state.Notes.Count == 64) state.Notes.Add("(further notes omitted)");
+    }
+    static string TypeName(object value) {
+        try { return value.GetType().FullName; } catch { return "object"; }
+    }
+    static string Text(object value, string path, GxVmJsonResult state) {
+        try { string text = value.ToString(); return text == null ? "" : text; }
+        catch (Exception error) {
+            Note(state, path, "ToString of " + TypeName(value) + " failed: " + error.Message);
+            return "<" + TypeName(value) + ">";
+        }
+    }
+    static bool IsScalar(object value) {
+        if (value is string || value is char || value is bool || value is DateTime || value is DateTimeOffset ||
+            value is Guid || value is Uri || value is decimal || value is double || value is float) return true;
+        Type type = value.GetType();
+        return type.IsPrimitive || type.IsEnum;
+    }
+    static object Convert(object value, int depth, string path, int maxDepth, int maxNodes, GxVmJsonResult state) {
+        if (value == null || value is DBNull) return null;
+        PSObject wrapped = value as PSObject;
+        bool custom = false;
+        if (wrapped != null) {
+            custom = wrapped.BaseObject is PSCustomObject;
+            if (!custom) {
+                // Extended members (such as Get-Content's PSPath/PSDrive notes) are dropped.
+                value = wrapped.BaseObject;
+                if (value == null || value is DBNull) return null;
+            }
+        }
+        if (!custom && IsScalar(value)) return value;
+        state.Nodes++;
+        if (state.Nodes > maxNodes) {
+            if (state.Nodes == maxNodes + 1) Note(state, path, "more than " + maxNodes + " values; the rest is omitted");
+            return null;
+        }
+        if (depth >= maxDepth) {
+            Note(state, path, "nested deeper than " + maxDepth + " levels; written as text");
+            return Text(value, path, state);
+        }
+        if (custom) {
+            OrderedDictionary record = new OrderedDictionary();
+            foreach (PSPropertyInfo property in wrapped.Properties) {
+                object item = null;
+                try { item = property.Value; }
+                catch (Exception error) { Note(state, path + "." + property.Name, "reading the property failed: " + error.Message); }
+                record[property.Name] = Convert(item, depth + 1, path + "." + property.Name, maxDepth, maxNodes, state);
+            }
+            return record;
+        }
+        IDictionary dictionary = value as IDictionary;
+        if (dictionary != null) {
+            OrderedDictionary map = new OrderedDictionary();
+            try {
+                foreach (DictionaryEntry entry in dictionary) {
+                    string key = entry.Key == null ? "" : (entry.Key as string ?? Text(entry.Key, path, state));
+                    if (map.Contains(key)) { Note(state, path, "duplicate key '" + key + "' omitted"); continue; }
+                    map[key] = Convert(entry.Value, depth + 1, path + "." + key, maxDepth, maxNodes, state);
+                }
+            } catch (Exception error) { Note(state, path, "enumerating the dictionary failed: " + error.Message); }
+            return map;
+        }
+        IEnumerable sequence = value as IEnumerable;
+        if (sequence != null) {
+            ArrayList list = new ArrayList();
+            try {
+                foreach (object item in sequence) list.Add(Convert(item, depth + 1, path + "[" + list.Count + "]", maxDepth, maxNodes, state));
+            } catch (Exception error) { Note(state, path, "enumerating the sequence failed: " + error.Message); }
+            return list.ToArray();
+        }
+        Note(state, path, TypeName(value) + " written as text");
+        return Text(value, path, state);
+    }
+}
+'@
+
+function ConvertTo-JsonText([string]$Text) {
+    # A JSON string literal built without ConvertTo-Json (for the fallback paths).
+    if ($null -eq $Text) { return 'null' }
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($char in $Text.ToCharArray()) {
+        $code = [int]$char
+        if ($code -eq 34) { [void]$builder.Append('\"') }
+        elseif ($code -eq 92) { [void]$builder.Append('\\') }
+        elseif ($code -lt 32) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$builder.Append($char) }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-SafeText($Value) {
+    try { $text = [string]$Value } catch { $text = '<unprintable value>' }
+    if ($null -eq $text) { $text = '' }
+    if ($text.Length -gt 65536) { $text = $text.Substring(0, 65536) + '...<truncated>' }
+    return $text
+}
+
+function ConvertTo-GxJson($Value, [switch]$Compress) {
+    if (-not ('GxVmJson' -as [type])) { Add-Type -TypeDefinition $script:JsonSource -Language CSharp }
+    $plain = [GxVmJson]::Plain($Value, 20, 100000)
+    $data = $plain.Value
+    if ($plain.Notes.Count -gt 0 -and $data -is [System.Collections.IDictionary]) { $data['json_notes'] = $plain.Notes.ToArray() }
+    return (ConvertTo-Json -InputObject $data -Depth 24 -Compress:$Compress)
+}
+
 function Write-Json([string]$Path, $Value) {
-    [IO.File]::WriteAllText($Path, (($Value | ConvertTo-Json -Depth 20) + $script:LF), [Text.UTF8Encoding]::new($false))
+    try { $text = ConvertTo-GxJson $Value }
+    catch {
+        $message = $_.Exception.Message
+        $script:JsonErrors.Add([IO.Path]::GetFileName($Path) + ': ' + $message)
+        $text = '{' + $script:LF + '    "json_error":  ' + (ConvertTo-JsonText $message) + ',' + $script:LF +
+            '    "text":  ' + (ConvertTo-JsonText (Get-SafeText $Value)) + $script:LF + '}'
+    }
+    [IO.File]::WriteAllText($Path, ($text + $script:LF), [Text.UTF8Encoding]::new($false))
+}
+
+function Read-TextLines([string]$Path) {
+    # UTF-8 text that a running app may still be writing (shared read), as plain strings:
+    # Get-Content decodes BOM-less UTF-8 as ANSI in Windows PowerShell 5.1 and attaches notes.
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try {
+        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false), $true)
+        try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+    $lines = [string[]]($text -split "`r?`n")
+    if ($lines.Count -gt 0 -and $lines[-1].Length -eq 0) { $lines = [string[]]($lines | Select-Object -First ($lines.Count - 1)) }
+    return $lines
 }
 
 function Assert-Hash([string]$Path, [string]$Expected) {
@@ -2953,6 +3107,13 @@ function Get-ForeignWindowCount([int]$ProcessId) {
     return @([GxVmWindows]::TopLevel($ProcessId) | Where-Object { $_['class'] -ceq 'GhosttyWindow' }).Count
 }
 
+function Add-ProbeError($Result, [string]$Probe, $ErrorRecord) {
+    # A probe that throws is recorded here and turns the verdict to FAIL; the others still run.
+    if (-not $Result.Contains('probe_errors')) { $Result['probe_errors'] = New-Object System.Collections.ArrayList }
+    [void]$Result['probe_errors'].Add([ordered]@{ probe=$Probe; error=$ErrorRecord.Exception.Message;
+        type=$ErrorRecord.Exception.GetType().FullName; position=$ErrorRecord.InvocationInfo.PositionMessage })
+}
+
 function Invoke-CrossPeer($Root) {
     if ($env:USERNAME -ine 'gxtest' -or (Test-Elevated)) { throw 'The peer step runs as the standard user gxtest (runas), not elevated.' }
     $owner = Read-JsonFile (Join-Path $Root 'owner.json')
@@ -2961,70 +3122,83 @@ function Invoke-CrossPeer($Root) {
     $exe = Join-Path $Root 'app\ghostty.exe'
     Assert-Hash $exe $AppSha256
     $configHome = Join-Path $Root 'config'
-    $result = [ordered]@{ host=$hostInfo; self=(Get-TokenFacts $PID); host_windows_before=(Get-ForeignWindowCount ([int]$hostInfo.pid)); pipes=@(Get-GhosttyPipes) }
+    # Each probe records its own exception in probe_errors instead of ending the step, so the
+    # report always carries what the other probes observed.
+    $result = [ordered]@{ host=$hostInfo }
+    try { $result.self = Get-TokenFacts $PID } catch { Add-ProbeError $result 'self' $_ }
+    try { $result.host_windows_before = Get-ForeignWindowCount ([int]$hostInfo.pid) } catch { Add-ProbeError $result 'host_windows_before' $_ }
+    $result.pipes = @(Get-GhosttyPipes)
     if ($ProbePipes) {
-        if (-not ('GxVmPipe' -as [type])) { Add-Type -TypeDefinition $script:PipeSource -Language CSharp }
-        $result.pipe_probes = @($result.pipes | Where-Object { $_ -notmatch '^error' } | ForEach-Object { [GxVmPipe]::Probe($_) })
+        try {
+            if (-not ('GxVmPipe' -as [type])) { Add-Type -TypeDefinition $script:PipeSource -Language CSharp }
+            $result.pipe_probes = @($result.pipes | Where-Object { $_ -notmatch '^error' } | ForEach-Object { [GxVmPipe]::Probe($_) })
+        } catch { Add-ProbeError $result 'pipe_probes' $_ }
     }
     # 1. Single instance: an ordinary, forwardable launch must start its own instance.
     $stateDir = Join-Path $script:RunRoot ($script:Step + '-xa-peer')
-    $process = Start-CrossApp $exe $stateDir $configHome
-    $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
-    $record.record_name = 'cross-peer'
-    Save-Record 'cross-peer' $record | Out-Null
     $launch = [ordered]@{ outcome=$null; exit_code=$null; own_window=$null }
-    try {
-        try { $launch.own_window = Wait-AppWindow $process 20; $launch.outcome = 'independent' }
-        catch {
-            $process.Refresh()
-            $launch.outcome = if ($process.HasExited) { 'exited' } else { 'no-window' }
-            if ($process.HasExited) { $launch.exit_code = $process.ExitCode }
-            $launch.error = $_.Exception.Message
-        }
-        $result.host_windows_after_launch = Get-ForeignWindowCount ([int]$hostInfo.pid)
-        if ($launch.outcome -ceq 'exited' -and $launch.exit_code -eq 0 -and $result.host_windows_after_launch -gt $result.host_windows_before) { $launch.outcome = 'forwarded-to-other-account' }
-        $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
-        if ($launch.outcome -ceq 'independent' -and $hold -gt 0) {
-            Write-ExportMarker 'cross-peer-holding' @{ pid=$process.Id; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
-            Start-Sleep -Seconds $hold
-        }
-    } finally { $process.Dispose() }
-    $record.status = 'RUNNING'
-    $close = Close-OwnedApp $record
-    $record.close = $close
-    $record.status = 'CLOSED'
-    Save-Record 'cross-peer' $record | Out-Null
     $result.launch = $launch
-    $result.close = $close
-    $result.session = Get-CrossSessionSummary (Join-Path $stateDir 'state')
+    try {
+        $process = Start-CrossApp $exe $stateDir $configHome
+        $record = New-AppRecord $process $exe 'CROSS_COPY' $stateDir $null (Get-AppEnvironment) @()
+        $record.record_name = 'cross-peer'
+        Save-Record 'cross-peer' $record | Out-Null
+        try {
+            try { $launch.own_window = Wait-AppWindow $process 20; $launch.outcome = 'independent' }
+            catch {
+                $process.Refresh()
+                $launch.outcome = if ($process.HasExited) { 'exited' } else { 'no-window' }
+                if ($process.HasExited) { $launch.exit_code = $process.ExitCode }
+                $launch.error = $_.Exception.Message
+            }
+            $result.host_windows_after_launch = Get-ForeignWindowCount ([int]$hostInfo.pid)
+            if ($launch.outcome -ceq 'exited' -and $launch.exit_code -eq 0 -and $result.Contains('host_windows_before') -and
+                $result.host_windows_after_launch -gt $result.host_windows_before) { $launch.outcome = 'forwarded-to-other-account' }
+            $hold = [Math]::Max($HoldSeconds, $RunHoldSeconds)
+            if ($launch.outcome -ceq 'independent' -and $hold -gt 0) {
+                Write-ExportMarker 'cross-peer-holding' @{ pid=$process.Id; hold_seconds=$hold; utc=[DateTime]::UtcNow.ToString('o') }
+                Start-Sleep -Seconds $hold
+            }
+        } finally { $process.Dispose() }
+        $record.status = 'RUNNING'
+        $close = Close-OwnedApp $record
+        $record.close = $close
+        $record.status = 'CLOSED'
+        Save-Record 'cross-peer' $record | Out-Null
+        $result.close = $close
+    } catch { Add-ProbeError $result 'launch' $_ }
+    try { $result.session = Get-CrossSessionSummary (Join-Path $stateDir 'state') } catch { Add-ProbeError $result 'session' $_ }
     # 2. Session files: the other account's state directory must stay unreadable.
     $result.host_state_access = try { $null = Get-ChildItem -LiteralPath $hostInfo.state_dir -ErrorAction Stop; 'readable' } catch { 'refused: ' + $_.Exception.GetType().Name }
     # 3. Broker: a gxtest receiver must not pair with gxadmin's elevated host.
     if ($hostInfo.PSObject.Properties['broker'] -and $hostInfo.broker) {
-        $companionDir = Join-Path $script:RunRoot ($script:Step + '-xa-companion')
-        $arguments = @('--gx-shell-action=drop-companion', ('--gx-drop-target-pid=' + $hostInfo.broker.pid), ('--gx-drop-target-birth=' + $hostInfo.broker.birth_filetime))
-        $companion = Start-CrossApp $exe $companionDir $configHome $arguments
-        $companionRecord = New-AppRecord $companion $exe 'CROSS_COPY' $companionDir $null $null $arguments
-        $broker = [ordered]@{ target=$hostInfo.broker; pid=$companion.Id; exited=$false; exit_code=$null; windows=@() }
         try {
-            $broker.exited = $companion.WaitForExit(20000)
-            if ($broker.exited) { $broker.exit_code = $companion.ExitCode }
-            else { $broker.windows = @([GxVmWindows]::TopLevel($companion.Id) | Where-Object { $_['visible'] } | ForEach-Object { [ordered]@{ class=$_['class']; title=$_['title'] } }) }
-        } finally { $companion.Dispose() }
-        if (-not $broker.exited) { $broker.close = Close-OwnedApp $companionRecord }
-        $broker.refused = $broker.exited -and $broker.exit_code -ne 0
-        $logPath = Join-Path $companionDir 'ghostty\logs\ghostty.log'
-        if (Test-Path -LiteralPath $logPath) { $script:ExportExtra.Add($logPath); $broker.log_tail = @(Get-Content -LiteralPath $logPath | Select-Object -Last 20) }
-        $result.broker = $broker
+            $companionDir = Join-Path $script:RunRoot ($script:Step + '-xa-companion')
+            $arguments = @('--gx-shell-action=drop-companion', ('--gx-drop-target-pid=' + $hostInfo.broker.pid), ('--gx-drop-target-birth=' + $hostInfo.broker.birth_filetime))
+            $companion = Start-CrossApp $exe $companionDir $configHome $arguments
+            $companionRecord = New-AppRecord $companion $exe 'CROSS_COPY' $companionDir $null $null $arguments
+            $broker = [ordered]@{ target=$hostInfo.broker; pid=$companion.Id; exited=$false; exit_code=$null; windows=@() }
+            $result.broker = $broker
+            try {
+                $broker.exited = $companion.WaitForExit(20000)
+                if ($broker.exited) { $broker.exit_code = $companion.ExitCode }
+                else { $broker.windows = @([GxVmWindows]::TopLevel($companion.Id) | Where-Object { $_['visible'] } | ForEach-Object { [ordered]@{ class=$_['class']; title=$_['title'] } }) }
+            } finally { $companion.Dispose() }
+            if (-not $broker.exited) { $broker.close = Close-OwnedApp $companionRecord }
+            $broker.refused = $broker.exited -and $broker.exit_code -ne 0
+            $logPath = Join-Path $companionDir 'ghostty\logs\ghostty.log'
+            if (Test-Path -LiteralPath $logPath) { $script:ExportExtra.Add($logPath); $broker.log_tail = @(Read-TextLines $logPath | Select-Object -Last 20) }
+        } catch { Add-ProbeError $result 'broker' $_ }
     }
-    $result.host_windows_after = Get-ForeignWindowCount ([int]$hostInfo.pid)
+    try { $result.host_windows_after = Get-ForeignWindowCount ([int]$hostInfo.pid) } catch { Add-ProbeError $result 'host_windows_after' $_ }
     $failures = @()
     if ($launch.outcome -cne 'independent') { $failures += 'launch outcome ' + $launch.outcome }
-    if ($result.host_windows_after -ne $result.host_windows_before) { $failures += 'the other account''s window count changed' }
-    if ($result.session.exists -and $result.session.mentions_gxadmin -gt 0) { $failures += 'session file mentions gxadmin' }
+    if ($result.Contains('host_windows_after') -and $result.Contains('host_windows_before') -and $result.host_windows_after -ne $result.host_windows_before) { $failures += 'the other account''s window count changed' }
+    if ($result.Contains('session') -and $result.session.exists -and $result.session.mentions_gxadmin -gt 0) { $failures += 'session file mentions gxadmin' }
     if ($result.host_state_access -ceq 'readable') { $failures += 'the other account''s state directory is readable' }
-    if ($result.Contains('broker') -and -not $result.broker.refused) { $failures += 'the drop companion did not refuse the other account''s host' }
-    if ($ProbePipes -and @($result.pipe_probes | Where-Object { $_['opened'] }).Count -gt 0) { $failures += 'a Ghostty pipe of the other account was opened' }
+    if ($result.Contains('broker') -and -not ($result.broker.Contains('refused') -and $result.broker.refused)) { $failures += 'the drop companion did not refuse the other account''s host' }
+    if ($ProbePipes -and $result.Contains('pipe_probes') -and @($result.pipe_probes | Where-Object { $_['opened'] }).Count -gt 0) { $failures += 'a Ghostty pipe of the other account was opened' }
+    if ($result.Contains('probe_errors')) { $failures += 'probes failed: ' + (@($result.probe_errors | ForEach-Object { $_.probe }) -join ', ') }
     $result.fixture_verdict = if ($failures.Count -eq 0) { 'PASS' } else { 'FAIL' }
     $result.fixture_reason = if ($failures.Count -eq 0) { $null } else { $failures -join '; ' }
     return $result
@@ -3393,9 +3567,18 @@ try {
         try { $report.after = Get-PhaseState 'after' } catch { $report.after = @{ error=$_.Exception.Message } }
         $report.restore = $script:Restore
     }
-    Write-Json $statePath $script:State
+    try { Write-Json $statePath $script:State } catch { $report.state_write_error = $_.Exception.Message }
+    if ($script:JsonErrors.Count -gt 0) { $report.json_errors = $script:JsonErrors.ToArray() }
     $reportPath = Join-Path $script:RunRoot ($script:Step + '.json')
-    Write-Json $reportPath $report
+    try { Write-Json $reportPath $report }
+    catch {
+        # Last resort for an I/O failure: a minimal report still names the phase and the error.
+        $report.status = 'FAIL'
+        $minimal = '{"phase":' + (ConvertTo-JsonText $Phase) + ',"status":"FAIL","run_id":' + (ConvertTo-JsonText $RunId) +
+            ',"report_write_error":' + (ConvertTo-JsonText $_.Exception.Message) + '}'
+        try { [IO.File]::WriteAllText($reportPath, $minimal + $script:LF, [Text.UTF8Encoding]::new($false)) }
+        catch { Write-Warning ('Report write failed: ' + $_.Exception.Message) }
+    }
     if ($script:ExportRoot) {
         try {
             Copy-Item -LiteralPath $reportPath -Destination (Join-Path $script:ExportRoot ($script:ExportPrefix + [IO.Path]::GetFileName($reportPath))) -Force

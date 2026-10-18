@@ -4,6 +4,7 @@ the test, and fakes use a docker path that does not exist."""
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -514,6 +515,117 @@ class WindowsVmTests(IsolatedTestCase):
                     mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
                 self.assertEqual(vm.main(), code)
             self.assertEqual(json.loads(stdout.getvalue())["absolute"], code == 0)
+
+
+def windows_powershell() -> str | None:
+    """Windows PowerShell 5.1, the guest's interpreter for gx_vm_validation.ps1 (None elsewhere)."""
+    root = os.environ.get("SystemRoot")
+    if os.name != "nt" or not root:
+        return None
+    path = Path(root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(path) if path.is_file() else None
+
+
+# Loads named functions and $script: assignments of the fixture through the PowerShell parser
+# (the fixture's own body runs the VM identity guard, so it is never executed here), then runs
+# the test body. Output is the body's JSON on stdout.
+PS_HARNESS = r"""
+param([string]$Fixture, [string]$Work, [string]$Functions, [string]$Variables)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Fixture, [ref]$tokens, [ref]$errors)
+if (@($errors).Count -gt 0) { throw ('parse errors: ' + (@($errors | ForEach-Object { $_.Message + ' @' + $_.Extent.StartLineNumber }) -join '; ')) }
+$wanted = @($Functions.Split(',') | Where-Object { $_ })
+foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($wanted -contains $node.Name) { . ([scriptblock]::Create($node.Extent.Text)) }
+}
+$names = @($Variables.Split(',') | Where-Object { $_ } | ForEach-Object { '$script:' + $_ })
+foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $false)) {
+    if ($names -contains $node.Left.Extent.Text) { . ([scriptblock]::Create($node.Extent.Text)) }
+}
+. (Join-Path $Work 'body.ps1')
+"""
+
+
+@unittest.skipUnless(windows_powershell(), "needs Windows PowerShell 5.1")
+class ValidationScriptTests(unittest.TestCase):
+    """Runs pieces of the guest fixture under the guest's interpreter (Windows PowerShell 5.1)."""
+
+    def run_body(self, body: str, functions: tuple[str, ...], variables: tuple[str, ...] = ("LF",),
+                 timeout: float = 120) -> dict:
+        with tempfile.TemporaryDirectory() as name:
+            work = Path(name)
+            (work / "harness.ps1").write_text(PS_HARNESS, encoding="utf-8-sig")
+            (work / "body.ps1").write_text(body, encoding="utf-8-sig")
+            command = [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                       "-File", str(work / "harness.ps1"), "-Fixture", str(vm.VALIDATION_SCRIPT), "-Work", str(work),
+                       "-Functions", ",".join(functions), "-Variables", ",".join(variables)]
+            result = subprocess.run(command, capture_output=True, timeout=timeout, cwd=work)
+            output = result.stdout.decode("utf-8", "replace")
+            self.assertEqual(result.returncode, 0, output + result.stderr.decode("utf-8", "replace"))
+            return json.loads(output[output.index("{"):])
+
+    def test_fixture_is_ascii_and_parses_without_errors(self):
+        data = vm.VALIDATION_SCRIPT.read_bytes()
+        # Windows PowerShell 5.1 reads a BOM-less script as ANSI: non-ASCII text must be built from [char].
+        self.assertEqual([index for index, byte in enumerate(data) if byte > 127], [])
+        self.assertEqual(self.run_body("[ordered]@{ ok=$true } | ConvertTo-Json -Compress", ()), {"ok": True})
+
+    def test_report_json_is_bounded_plain_utf8_and_records_conversions(self):
+        body = r"""
+$log = Join-Path $Work 'app.log'
+$zh = -join @([char]0x547D, [char]0x4EE4, [char]0x63D0, [char]0x793A, [char]0x7B26)
+[IO.File]::WriteAllText($log, ('one' + [char]13 + [char]10 + 'two ' + $zh + [char]10), [Text.UTF8Encoding]::new($false))
+Add-Type -TypeDefinition 'public class GxVmTestBad { public override string ToString() { throw new System.Exception("boom"); } }'
+# Get-Content lines carry PSPath/PSDrive/PSProvider notes: the r6-x peer report hang.
+$value = [ordered]@{ content=@(Get-Content -LiteralPath $log); tail=@(Read-TextLines $log | Select-Object -Last 20);
+    bad=(New-Object GxVmTestBad); int_keys=@{ 7='seven' }; empty=@(); one=@('x'); zh=$zh;
+    custom=[pscustomobject]@{ a=1; b=@(1, 2) } }
+$clock = [Diagnostics.Stopwatch]::StartNew()
+Write-Json (Join-Path $Work 'report.json') $value
+$bytes = [IO.File]::ReadAllBytes((Join-Path $Work 'report.json'))
+[ordered]@{ ms=$clock.ElapsedMilliseconds; bom=($bytes[0] -eq 0xEF); report=[Text.Encoding]::UTF8.GetString($bytes); errors=$script:JsonErrors.Count } | ConvertTo-Json -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-JsonText", "Get-SafeText", "ConvertTo-GxJson", "Write-Json", "Read-TextLines"),
+                            ("LF", "JsonErrors", "JsonSource"))
+        self.assertLess(out["ms"], 20000)
+        self.assertFalse(out["bom"])
+        self.assertEqual(out["errors"], 0)
+        report = json.loads(out["report"])
+        self.assertEqual(len(report["content"]), 2)
+        self.assertTrue(all(isinstance(line, str) for line in report["content"]))
+        self.assertEqual(report["tail"], ["one", "two \u547d\u4ee4\u63d0\u793a\u7b26"])
+        self.assertEqual(report["zh"], "\u547d\u4ee4\u63d0\u793a\u7b26")
+        self.assertEqual(report["int_keys"], {"7": "seven"})
+        self.assertEqual((report["empty"], report["one"]), ([], ["x"]))
+        self.assertEqual(report["custom"], {"a": 1, "b": [1, 2]})
+        self.assertEqual(report["bad"], "<GxVmTestBad>")
+        self.assertTrue(any("ToString of GxVmTestBad failed: boom" in note for note in report["json_notes"]))
+
+    def test_unserializable_value_still_writes_a_json_error_file(self):
+        body = r"""
+function ConvertTo-GxJson($Value) { throw 'serializer unavailable' }
+Write-Json (Join-Path $Work 'r.json') ([ordered]@{ a=1 })
+[ordered]@{ text=[IO.File]::ReadAllText((Join-Path $Work 'r.json')); errors=@($script:JsonErrors) } | ConvertTo-Json -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-JsonText", "Get-SafeText", "Write-Json"), ("LF", "JsonErrors"))
+        written = json.loads(out["text"])
+        self.assertEqual(written["json_error"], "serializer unavailable")
+        self.assertEqual(out["errors"], ["r.json: serializer unavailable"])
+
+    def test_probe_errors_are_collected_without_stopping_the_step(self):
+        body = r"""
+$result = [ordered]@{}
+try { throw 'first probe' } catch { Add-ProbeError $result 'first' $_ }
+$result.second = 'still ran'
+try { [void][IO.File]::ReadAllText((Join-Path $Work 'missing.txt')) } catch { Add-ProbeError $result 'third' $_ }
+ConvertTo-GxJson $result -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Add-ProbeError"), ("LF", "JsonSource"))
+        self.assertEqual(out["second"], "still ran")
+        self.assertEqual([item["probe"] for item in out["probe_errors"]], ["first", "third"])
+        self.assertEqual(out["probe_errors"][0]["error"], "first probe")
 
 
 if __name__ == "__main__":
