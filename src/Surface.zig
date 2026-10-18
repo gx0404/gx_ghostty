@@ -696,6 +696,8 @@ pub fn init(
             .shell_integration = config.@"shell-integration",
             .shell_integration_features = config.@"shell-integration-features",
             .cursor_blink = config.@"cursor-style-blink",
+            // fork(gx): GX-0047 the prompt cursor of the GX shell integrations
+            .gx_prompt_cursor = config.@"gx-prompt-cursor",
             .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
             .resources_dir = global.resourcesDir().host(),
             .term = config.term,

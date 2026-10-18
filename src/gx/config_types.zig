@@ -14,3 +14,9 @@ pub const OpenConfigUi = enum {
     settings,
     editor,
 };
+
+/// Valid values for `gx-prompt-cursor`.
+pub const PromptCursor = enum {
+    config,
+    bar,
+};

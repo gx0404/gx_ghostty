@@ -4161,6 +4161,27 @@ term: []const u8 = "xterm-ghostty",
 /// Windows and GTK only.
 /// Available since Ghostty GX 0.0.3.
 @"gx-ctrl-scroll-zoom": bool = true,
+
+/// What the shell integration `cursor` feature (see
+/// `shell-integration-features`) shows at the prompt. Valid values:
+///
+///   * `config` - The configured `cursor-style` and `cursor-style-blink`,
+///     so a cursor style that a program left behind is reset when the next
+///     prompt appears.
+///   * `bar` - A bar, blinking unless `cursor-style-blink = false`, like
+///     upstream Ghostty. Programs that do not request a cursor style of
+///     their own still use `cursor-style`.
+///
+/// With zsh vi key bindings both values show a bar while inserting and a
+/// block in command mode; fish vi key bindings set the cursor themselves.
+/// This applies to the bash, zsh, fish and elvish integrations. It has no
+/// effect with `shell-integration-features = no-cursor` or without shell
+/// integration, and a change only affects shells started afterwards.
+///
+/// The default is `config`.
+///
+/// Available since Ghostty GX 0.0.3.
+@"gx-prompt-cursor": gx_config_types.PromptCursor = .config,
 // fork(gx): GX-0010 end
 
 /// This is set by the CLI parser for deinit.
