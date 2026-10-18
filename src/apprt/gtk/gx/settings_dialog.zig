@@ -44,6 +44,7 @@ const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("../class/application.zig").Application;
+const open_perf = @import("open_perf.zig");
 
 const settings_map = gx.settings_map;
 const msg = settings_map.msg;
@@ -436,8 +437,7 @@ pub const GxSettingsDialog = extern struct {
     /// Like `show`, and shows `page` (`gx:settings_page:<page>`); without
     /// a page, a new dialog starts on the page the last one was closed on.
     pub fn showPage(app: *Application, page: ?settings_map.Page) void {
-        const open_perf = @import("open_perf.zig");
-        const started = open_perf.begin();
+        var timing = open_perf.begin(.settings);
         if (!adw_version.supportsDialogs()) {
             log.warn("the settings dialog needs libadwaita 1.5 or newer", .{});
             return;
@@ -450,20 +450,25 @@ pub const GxSettingsDialog = extern struct {
 
         if (open_dialog.get()) |dialog| {
             defer dialog.unref();
+            open_perf.lap(&timing, .prepare);
             if (page) |name| dialog.showSettingsPage(name);
-            open_perf.watch(dialog.as(gtk.Widget), "settings.open.total", started);
+            open_perf.lap(&timing, .layout);
+            open_perf.watch(dialog.as(gtk.Widget), timing);
             dialog.as(adw.Dialog).present(parent);
-            open_perf.presented(dialog.as(gtk.Widget), started);
+            open_perf.presented(dialog.as(gtk.Widget), timing);
             return;
         }
 
+        open_perf.lap(&timing, .prepare);
         const dialog = gobject.ext.newInstance(Self, .{});
+        open_perf.lap(&timing, .create);
         dialog.load(app);
         if (page orelse last_page) |name| dialog.showSettingsPage(name);
         open_dialog.set(dialog);
-        open_perf.watch(dialog.as(gtk.Widget), "settings.open.total", started);
+        open_perf.lap(&timing, .layout);
+        open_perf.watch(dialog.as(gtk.Widget), timing);
         dialog.as(adw.Dialog).present(parent);
-        open_perf.presented(dialog.as(gtk.Widget), started);
+        open_perf.presented(dialog.as(gtk.Widget), timing);
     }
 
     /// Handles opening the configuration in the system editor (the
@@ -504,6 +509,7 @@ pub const GxSettingsDialog = extern struct {
     fn load(self: *Self, app: *Application) void {
         const priv = self.private();
         const st = &priv.state;
+        var steps: open_perf.Steps = .begin();
         const config_obj = app.getConfig();
         defer config_obj.unref();
         const config = config_obj.get();
@@ -512,16 +518,21 @@ pub const GxSettingsDialog = extern struct {
         st.notifications = config.@"app-notifications";
         st.layered = gx.config_layers.enabled(st.alloc);
         if (st.layered) self.reloadLayers();
+        steps.step("settings.load.layers");
         st.loading = true;
         defer st.loading = false;
 
         self.setUpThemes();
+        steps.step("settings.load.themes");
         self.setUpFontChooser();
+        steps.step("settings.load.fonts");
         self.addRowSwatches();
         self.syncValues(config, .{ .font_family = true });
+        steps.step("settings.load.values");
         self.loadAbout();
         if (!st.layered) self.disableEditing();
         self.applyTexts();
+        steps.step("settings.load.texts");
 
         st.config_handler = gobject.Object.signals.notify.connect(
             app,

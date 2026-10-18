@@ -105,15 +105,17 @@ pub fn syncSurfaceMenu(surface: *Surface) void {
 /// when one is shown, else from the active terminal. Returns false if
 /// there is neither.
 pub fn popupMainMenu(window: *Window) bool {
-    const started = open_perf.begin();
+    var timing = open_perf.begin(.menu);
     var header: Header = .{};
     if (toolbar(window)) |widget| walk(widget, &header);
     for (header.menu_buttons.slice()) |button| {
         const widget = button.as(gtk.Widget);
         if (widget.isVisible() != 0 and widget.getMapped() != 0) {
-            if (button.getPopover()) |popover| open_perf.watch(popover.as(gtk.Widget), "menu.open.total", started);
+            // The button keeps its popover and menu: nothing to create.
+            open_perf.lap(&timing, .prepare);
+            if (button.getPopover()) |popover| open_perf.watch(popover.as(gtk.Widget), timing);
             button.popup();
-            if (button.getPopover()) |popover| open_perf.presented(popover.as(gtk.Widget), started);
+            if (button.getPopover()) |popover| open_perf.presented(popover.as(gtk.Widget), timing);
             return true;
         }
     }
@@ -122,10 +124,10 @@ pub fn popupMainMenu(window: *Window) bool {
     const model = button.getMenuModel() orelse return false;
     const surface = window.getActiveSurface() orelse return false;
     const popover = surfacePopover(surface) orelse return false;
-    open_perf.watch(popover.as(gtk.Widget), "menu.open.total", started);
-    showFromPopover(popover, model);
+    open_perf.lap(&timing, .prepare);
+    showFromPopover(popover, model, &timing);
     addViewControls(popover);
-    open_perf.presented(popover.as(gtk.Widget), started);
+    open_perf.presented(popover.as(gtk.Widget), timing);
     return true;
 }
 
@@ -143,7 +145,7 @@ pub fn popupNewTabMenu(window: *Window) bool {
     const model = button.getMenuModel() orelse return false;
     const surface = window.getActiveSurface() orelse return false;
     const popover = surfacePopover(surface) orelse return false;
-    showFromPopover(popover, model);
+    showFromPopover(popover, model, null);
     return true;
 }
 
@@ -485,7 +487,9 @@ pub fn toast(window: *Window, title: [:0]const u8) void {
 
 /// Shows `model` from the context menu popover of a terminal at its top
 /// right corner, then puts the context menu back when the popover closes.
-fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel) void {
+/// Building the menu of `model` is the `create` phase of a measured
+/// opening, placing it the `layout` phase.
+fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel, timing: ?*?open_perf.Timing) void {
     const object = popover.as(gobject.Object);
     if (object.getData(restore_handler_key) == null) {
         _ = gtk.Popover.signals.closed.connect(
@@ -502,6 +506,7 @@ fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel) void {
         object.setDataFull(restore_key, context.as(gobject.Object).ref(), &unrefObject);
     }
     popover.setMenuModel(model);
+    if (timing) |value| open_perf.lap(value, .create);
 
     const anchor = popover.as(gtk.Widget).getParent() orelse popover.as(gtk.Widget);
     const rect: gdk.Rectangle = .{
@@ -511,6 +516,10 @@ fn showFromPopover(popover: *gtk.PopoverMenu, model: *gio.MenuModel) void {
         .f_height = 1,
     };
     popover.as(gtk.Popover).setPointingTo(&rect);
+    if (timing) |value| {
+        open_perf.lap(value, .layout);
+        open_perf.watch(popover.as(gtk.Widget), value.*);
+    }
     popover.as(gtk.Popover).popup();
 }
 
