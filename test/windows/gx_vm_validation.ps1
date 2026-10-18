@@ -74,7 +74,11 @@ param(
     # Placeholders {run} {app} {app_sha256} {ole} {ole_sha256} expand to this run's values.
     [ValidateSet('gx_drop_broker_fixture')][string]$PyFixture = 'gx_drop_broker_fixture',
     [ValidateLength(0,2048)][string]$PyArgs = '',
-    [ValidateRange(10,1800)][int]$PyTimeoutSeconds = 300
+    [ValidateRange(10,1800)][int]$PyTimeoutSeconds = 300,
+    # Waits before the phase samples anything. Started minimized and non-activating
+    # (cmd /c start "" /min cmd /c ...\gx-q.cmd <name>), a status step then records the
+    # foreground the operator left instead of the console that ran it.
+    [ValidateRange(0,120)][int]$DelaySeconds = 0
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1610,6 +1614,53 @@ function Get-ToastFacts([string]$Aumid) {
     return $facts
 }
 
+function Get-ToastSetting([string]$Aumid) {
+    try {
+        Initialize-Toast
+        return [string][Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($Aumid).Setting
+    } catch { return 'error: ' + $_.Exception.Message }
+}
+
+function Wait-ToastSetting([string]$Aumid, [string]$Want, [int]$Seconds) {
+    # The notification platform applies a registry change after a delay: poll the effective setting.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $samples = New-Object System.Collections.Generic.List[object]
+    do {
+        $setting = Get-ToastSetting $Aumid
+        $samples.Add([ordered]@{ ms=$clock.ElapsedMilliseconds; setting=$setting })
+        if ($setting -ceq $Want) { break }
+        Start-Sleep -Milliseconds 500
+    } while ($clock.Elapsed.TotalSeconds -lt $Seconds)
+    return [ordered]@{ want=$Want; reached=($setting -ceq $Want); setting=$setting; seconds=[Math]::Round($clock.Elapsed.TotalSeconds, 1);
+        samples=@($samples | Select-Object -Last 8) }
+}
+
+$script:ToastSettleSeconds = @{ explicit=30; restore=15 }
+
+function Restore-ToastSettings {
+    # Restoring the backed-up key alone did not re-enable notifications in r6a: with Enabled
+    # removed the platform kept DisabledForApplication until the Settings switch was toggled.
+    # First write the backed-up Enabled state explicitly (1 unless the backup had 0) and wait until
+    # the platform reports it, then restore the exact backup and check the effective setting again.
+    $record = Read-Record 'toast-notification-settings'
+    if ($null -eq $record -or $record.restored) { return [ordered]@{ registry=(Restore-HkcuKey 'toast-notification-settings'); effective=$null; ok=$true } }
+    $enabled = 1
+    $before = $record.before
+    if ($before.exists -and $before.values.PSObject.Properties['value:Enabled'] -and [long]$before.values.'value:Enabled'.data -eq 0) { $enabled = 0 }
+    $want = if ($enabled -eq 1) { 'Enabled' } else { 'DisabledForApplication' }
+    $effectiveBefore = Get-ToastSetting $script:InstalledAumid
+    $base = Open-HkcuBase
+    try {
+        $key = $base.CreateSubKey($script:NotificationSettingsKey)
+        try { $key.SetValue('Enabled', $enabled, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $key.Dispose() }
+    } finally { $base.Dispose() }
+    $explicit = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.explicit
+    $registry = Restore-HkcuKey 'toast-notification-settings'
+    $after = Wait-ToastSetting $script:InstalledAumid $want $script:ToastSettleSeconds.restore
+    return [ordered]@{ registry=$registry; effective=[ordered]@{ before=$effectiveBefore; want=$want; explicit_value=$enabled;
+        after_explicit=$explicit; after_restore=$after }; ok=($registry.restored -and $after.reached) }
+}
+
 # Diagnostic only: the shell's quiet-hours (Focus assist / Do not disturb)
 # profile from WNF. The authoritative evidence is the notification center
 # screenshot; a nonzero status means the state could not be read here.
@@ -2561,9 +2612,12 @@ function Invoke-ToastMatrix {
                 installed=(Get-ToastFacts $script:InstalledAumid) }
         }
         'enable-app' {
-            $script:Restore = Restore-HkcuKey 'toast-notification-settings'
-            return [ordered]@{ restore=$script:Restore; installed=(Get-ToastFacts $script:InstalledAumid);
-                fixture_verdict=$(if ($script:Restore.restored) { 'PASS' } else { 'FAIL' }) }
+            $settings = Restore-ToastSettings
+            $script:Restore = $settings.registry
+            $reason = if ($settings.ok) { $null } elseif (-not $settings.registry.restored) { 'the notification settings key was not restored' }
+                else { 'the effective notifier setting stayed ' + $settings.effective.after_restore.setting + '; toggle the app in Settings > System > Notifications' }
+            return [ordered]@{ restore=$script:Restore; effective=$settings.effective; installed=(Get-ToastFacts $script:InstalledAumid);
+                fixture_verdict=$(if ($settings.ok) { 'PASS' } else { 'FAIL' }); fixture_reason=$reason }
         }
         'status' {
             $records = @(Get-ToastRecords)
@@ -2579,9 +2633,11 @@ function Invoke-ToastMatrix {
                 Set-RecordField $record 'close' $close
                 $record.status = if ($close.closed_normally -or $close.already_exited) { 'CLOSED' } else { 'CLOSE_FAILED' }
                 Save-Record ('toast-' + $record.label) $record | Out-Null
-                if (Test-Path -LiteralPath $record.log) { $script:ExportExtra.Add($record.log) }
+                # One log per label: each app's private profile writes its own ghostty.log.
+                if (Test-Path -LiteralPath $record.log) { Add-ExportFile $record.log ('toast-' + $record.label + '-ghostty.log') }
                 $close })
-            $settings = Restore-HkcuKey 'toast-notification-settings'
+            $toastSettings = Restore-ToastSettings
+            $settings = $toastSettings.registry
             $removed = @(Get-ToastRecords | Where-Object { $_.app_class -ceq 'PORTABLE_COPY' -and $_.status -ceq 'CLOSED' } | ForEach-Object {
                 $dir = Split-Path -Parent $_.exe
                 $root = [IO.Path]::GetFullPath($script:RunRoot).TrimEnd('\') + '\'
@@ -2589,12 +2645,13 @@ function Invoke-ToastMatrix {
                     Remove-Item -LiteralPath $dir -Recurse -Force
                     $dir
                 } })
-            $script:Restore = [ordered]@{ notification_settings=$settings; removed_portable_copies=$removed }
+            $script:Restore = [ordered]@{ notification_settings=$settings; notification_effective=$toastSettings.effective; removed_portable_copies=$removed }
             $bad = @($closes | Where-Object { -not $_.closed_normally -and -not $_.already_exited })
-            $verdict = if ($bad.Count -gt 0 -or -not $settings.restored) { 'FAIL' } else { 'PASS' }
+            $verdict = if ($bad.Count -gt 0 -or -not $toastSettings.ok) { 'FAIL' } else { 'PASS' }
             return [ordered]@{ closes=$closes; restore=$script:Restore; toast=(Get-ToastFacts $script:InstalledAumid);
                 probe_results=@(Get-ToastProbeResults); fixture_verdict=$verdict;
-                fixture_reason=$(if ($bad.Count -gt 0) { 'an owned app did not close normally' } elseif (-not $settings.restored) { 'notification settings were not restored' } else { $null }) }
+                fixture_reason=$(if ($bad.Count -gt 0) { 'an owned app did not close normally' } elseif (-not $settings.restored) { 'notification settings were not restored' }
+                    elseif (-not $toastSettings.ok) { 'the effective notifier setting was not restored' } else { $null }) }
         }
     }
 }
@@ -3650,6 +3707,7 @@ $report = [ordered]@{ phase=$Phase; status='PENDING'; run_id=$RunId; vm_uuid=$id
     scope=$Scope; app_dir=$script:AppDir; rehearsal=[bool]$Rehearsal; visual_review='PENDING';
     export_error=$script:ExportError; result=$null }
 try {
+    if ($DelaySeconds -gt 0) { $report.delay_seconds = $DelaySeconds; Start-Sleep -Seconds $DelaySeconds }
     if ($Phase -in $script:R6Phases) { $report.before = Get-PhaseState 'before' }
     switch ($Phase) {
         'inspect' { $report.result = Run-Inspect }

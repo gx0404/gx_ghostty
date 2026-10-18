@@ -32,6 +32,9 @@ QEMU human monitor inside the container.
                      drag first require an absolute current mouse (a relative one turns the
                      coordinates into motion from wherever the guest cursor is), report the mode
                      before and after, and refuse points outside the VNC screen unsent
+  queue-args         write one argument line to the staged q/<name>.txt for gx-q.cmd (the guest Run
+                     box takes 259 characters); "cmd /c start "" /min cmd /c ...\\gx-q.cmd <name>" runs
+                     it minimized without taking the guest foreground
   stage-validation   stage the guest fixture after checking the live VM identity; with --guest-python
                      (the pinned python.org embeddable zip, downloaded explicitly) and --ole-source it
                      also stages the broker Python fixture for the guest's py-fixture phase
@@ -62,6 +65,10 @@ IMAGE = "dockurr/windows@sha256:59f8bed19cfd49cf1701debe34f9df6311e61a4e2ae68aa9
 OWNER = "gx-ghostty-ui-validation"
 VALIDATION_SCRIPT = ROOT / "test" / "windows" / "gx_vm_validation.ps1"
 GUEST_RUNNER = "gx-run.cmd"
+QUEUE_RUNNER = "gx-q.cmd"
+QUEUE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+# gx-q.cmd expands the line once with set /p and again through call: keep cmd metacharacters out.
+QUEUE_UNSAFE = re.compile(r"[%!^&|<>\r\n\t]")
 MONITOR = "/run/shm/monitor.sock"
 SLOTS = ROOT / ".local" / "kernel-slots"
 PORTS = {"win11": (18006, 13389), "win10": (18007, 13390)}
@@ -817,6 +824,19 @@ def stage_validation(root: Path, version: str, guest_uuid: str, guest_name: str,
         " -File \"%GXDST%\\gx_vm_validation.ps1\" -Manifest \"%GXDST%\\validation-manifest.json\""
         " -ExportDir \"%GXSRC%out\" %*\r\n"
         "exit /b %ERRORLEVEL%\r\n"))
+    (destination / "q").mkdir(exist_ok=True)
+    write(destination / QUEUE_RUNNER, (
+        "@echo off\r\n"
+        "rem Runs gx-run.cmd with the argument line in q\\<name>.txt (gx_windows_vm.py queue-args);\r\n"
+        "rem the Run box takes 259 characters. Without taking the current foreground (status steps):\r\n"
+        "rem   cmd /c start \"\" /min cmd /c \\\\host.lan\\Data\\validation\\gx-q.cmd <name>\r\n"
+        "setlocal\r\n"
+        "if \"%~1\"==\"\" exit /b 2\r\n"
+        "set \"GXARGS=\"\r\n"
+        "set /p GXARGS=<\"%~dp0q\\%~1.txt\"\r\n"
+        "if not defined GXARGS exit /b 2\r\n"
+        "call \"%~dp0" + GUEST_RUNNER + "\" %GXARGS%\r\n"
+        "exit /b %ERRORLEVEL%\r\n"))
     write(destination / "RUN-IN-GUEST.md", """# 仅在身份已核对的 Windows 测试虚拟机内执行
 
 宿主只运行 gx_windows_vm.py：up 持有 heavy 槽启动唯一一台 VM，identity 核对 QEMU UUID，stage-validation 暂存本目录，screenshot 只取 VM 画面，keys/type/type-secret 经容器内 QEMU monitor 输入；宿主不运行下列 PowerShell。fixture 自身再核名字、UUID、QEMU/OVMF 硬件和自身 SHA，不支持跳过守门。
@@ -849,11 +869,31 @@ GL 只签真实 native renderer/window 与正常关闭；VM 无 GPU 时随包 Me
 
 干净卸载必须同时删除 App Paths、两组右键菜单、AUMID 与 Toast CLSID 键。首次账户检查不证明后续登录/实际权限操作；静态测试不代旧版升级、真实 registry、Toast/JumpList、DND/冷暖激活或 GUI 验收。安装器/卸载器等待有界，超时保留 owned PID 信息，不强杀未知进程。
 
+参数超过 Run 框 259 字符时，宿主用 queue-args --name <名> -- <参数…> 写 q\\<名>.txt，客机运行 cmd /c \\\\host.lan\\Data\\validation\\gx-q.cmd <名>。读状态的步骤（toast-matrix status、jumplist-matrix observe 等）要记录当前前台时，参数加 -DelaySeconds 5，并以 cmd /c start "" /min cmd /c \\\\host.lan\\Data\\validation\\gx-q.cmd <名> 最小化、不激活地启动，前台保持操作者留下的窗口。
+
 Python 夹具（broker）：宿主以 stage-validation --guest-python <钉版 embeddable zip> --ole-source <gx_ole_source.exe> 暂存，py\\ 下是 SHA-256 列在清单 python_fixture 里的解释器包、夹具 .py 与 OLE source。客机里 -Phase py-fixture -PyArgs "<夹具参数>" 逐个复核哈希，在 LOCALAPPDATA 下解压一次解释器并把 ._pth 指向夹具树，以调用者自己的令牌运行（medium 用 Run 框回车，high 用 Ctrl+Shift+Enter；不提权）。-PyArgs 里 {run}、{app}、{app_sha256}、{ole}、{ole_sha256} 展开为本 run 的值；退出码 0/2/其他记 PASS/PENDING/FAIL，夹具本步写出的文件以 py-<相对路径> 导出。
 
 r6 相位 run-config、osc52、toast-matrix、jumplist-matrix、narrator、cross-account、dpi 用 -Action 分步执行（start/status/collect/stop 等，每个相位只接受自己的步骤），记录写在 Runs\\<RunId>\\records，每份报告带 before、after 与 restore。只关闭本夹具启动或明确收编的进程；剪贴板只在 osc52 里由终端内探针写入测试内容；改动的设置（通知、真实配置、讲述人、DPI、JumpList ACL）都先备份再恢复；跨账户密码只经宿主 type-secret 输入。
 """)
     return destination
+
+
+def queue_args(root: Path, version: str, name: str, items: list[str]) -> Path:
+    """Write q/<name>.txt: one argument line for the staged gx-q.cmd (quoted like a command line)."""
+    if not QUEUE_NAME.fullmatch(name):
+        raise ValueError("queue-args --name takes 1-32 lowercase letters, digits and hyphens")
+    line = subprocess.list2cmdline(items)
+    if not items or len(line) > 1000 or not line.isascii() or QUEUE_UNSAFE.search(line):
+        raise ValueError("queue-args takes a non-empty ASCII line of at most 1000 characters without % ! ^ & | < > or control characters")
+    exchange = (Path(root) / version / "exchange").resolve(strict=True)
+    destination = (exchange / "validation").resolve()
+    if not destination.is_relative_to(exchange) or not (destination / "validation-manifest.json").is_file():
+        raise ValueError("Run stage-validation first: the staged validation directory has no manifest")
+    folder = destination / "q"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"{name}.txt"
+    write(path, line + "\r\n")
+    return path
 
 
 def rehearsal_layout(app: Path, output: Path, share: Path | None, cache: Path | None) -> dict:
@@ -974,6 +1014,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("prepare", "verify", "status", "up", "stop", "identity", "screenshot",
                                             "keys", "type", "type-secret", "pointer", "click", "drag", "stage-validation",
+                                            "queue-args",
                                             "rehearsal-layout"))
     parser.add_argument("items", nargs="*", help="keys: QEMU qcodes such as meta_l-r or ctrl-alt-delete; type: text")
     parser.add_argument("--root", type=Path, default=ROOT / ".local" / "windows-vm")
@@ -1004,6 +1045,7 @@ def main() -> int:
     parser.add_argument("--guest-python", type=Path, help="stage-validation: the pinned " + GUEST_PYTHON["file"]
                         + " (downloaded explicitly from " + GUEST_PYTHON["url"] + ")")
     parser.add_argument("--ole-source", type=Path, help="stage-validation: gx_ole_source.exe for the broker fixture")
+    parser.add_argument("--name", help="queue-args: q/<name>.txt for gx-q.cmd <name>")
     args = parser.parse_args()
     root = args.root.resolve()
     try:
@@ -1022,6 +1064,12 @@ def main() -> int:
                 "verified_utc": utc_now(), "file": path.name, "sha256": digest, "size": spec["size"],
                 "source": spec["url"], "image": IMAGE}, indent=2) + "\n")
             print(f"PASS {args.version}: {digest}")
+            return 0
+        if args.command == "queue-args":
+            if args.name is None:
+                raise VmError("queue-args requires --name")
+            path = queue_args(root, args.version, args.name, args.items)
+            print(json.dumps({"queued": str(path), "line": path.read_text(encoding="utf-8").strip()}))
             return 0
         if args.command == "rehearsal-layout":
             if args.app is None or args.out is None:

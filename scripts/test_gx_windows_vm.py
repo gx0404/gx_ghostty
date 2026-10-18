@@ -228,6 +228,30 @@ class WindowsVmTests(IsolatedTestCase):
             self.assertIn("fDisableCdm -Value 1", setup)
         self.assertEqual(len(uuids), 2)
 
+    def test_queue_args_writes_one_quoted_line_for_gx_q(self):
+        vm.prepare(self.root)
+        machine = vm.machine_identity(self.root, "win11")
+        with self.assertRaisesRegex(ValueError, "stage-validation first"):
+            vm.queue_args(self.root, "win11", "tstat", ["-Phase", "dpi"])
+        destination = vm.stage_validation(self.root, "win11", machine["uuid"], "GX-WIN11")
+        runner = (destination / vm.QUEUE_RUNNER).read_text()
+        self.assertIn('set /p GXARGS=<"%~dp0q\\%~1.txt"', runner)
+        self.assertIn('call "%~dp0gx-run.cmd" %GXARGS%', runner)
+        path = vm.queue_args(self.root, "win11", "brk-setup", ["-Phase", "py-fixture", "-PyArgs",
+                                                               "setup --root {run}\\broker --exe {app}"])
+        self.assertEqual(path, destination / "q" / "brk-setup.txt")
+        self.assertEqual(path.read_bytes(), b'-Phase py-fixture -PyArgs "setup --root {run}\\broker --exe {app}"\r\n')
+        for name, items in (("Bad", ["-Phase", "dpi"]), ("ok", ["-Phase", "a&b"]), ("ok", ["%PATH%"]),
+                            ("ok", ["x" * 1001]), ("ok", ["\u4e2d"]), ("ok", [])):
+            with self.assertRaises(ValueError):
+                vm.queue_args(self.root, "win11", name, items)
+        argv = ["gx_windows_vm.py", "queue-args", "--root", str(self.root), "--name", "tstat", "--",
+                "-Phase", "toast-matrix", "-Action", "status", "-RunId", "o10-xa", "-DelaySeconds", "5"]
+        with mock.patch.object(sys, "argv", argv), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(vm.main(), 0)
+        self.assertEqual(json.loads(stdout.getvalue())["line"],
+                         "-Phase toast-matrix -Action status -RunId o10-xa -DelaySeconds 5")
+
     def test_screenshot_png_round_trip(self):
         pixels = bytes(range(2 * 3 * 3))
         width, height, rgb = vm.parse_ppm(b"P6\n# c\n3 2\n255\n" + pixels)
@@ -742,6 +766,52 @@ ConvertTo-GxJson ([ordered]@{ first=$first.extracted; again=$again.extracted; ma
         self.assertEqual(out["args1"], "setup --root C:\\r\\b --exe C:\\a.exe --sha256 ab")
         self.assertIn("{nope}", out["unknown"])
         self.assertIn("{ole}", out["unavailable"])
+
+    TOAST_FAKES = r"""
+$script:Log = New-Object System.Collections.ArrayList
+function Start-Sleep { param($Milliseconds, $Seconds) }
+function Restore-HkcuKey($Name) { [void]$script:Log.Add('restore ' + $Name); [ordered]@{ restored=$true } }
+$fakeKey = New-Object psobject
+$fakeKey | Add-Member ScriptMethod SetValue { param($n, $v, $k) [void]$script:Log.Add('set ' + $n + '=' + $v) }
+$fakeKey | Add-Member ScriptMethod Dispose { }
+$fakeBase = New-Object psobject
+$fakeBase | Add-Member ScriptMethod CreateSubKey { param($k) [void]$script:Log.Add('key ' + $k); $fakeKey }
+$fakeBase | Add-Member ScriptMethod Dispose { }
+function Open-HkcuBase { $fakeBase }
+$script:InstalledAumid = 'gx0404.GhosttyGX'
+$script:NotificationSettingsKey = 'Software\N\gx0404.GhosttyGX'
+$script:ToastSettleSeconds = @{ explicit=1; restore=1 }
+"""
+
+    def test_toast_settings_are_written_explicitly_then_restored_and_verified(self):
+        body = self.TOAST_FAKES + r"""
+$script:Seen = New-Object System.Collections.Queue
+foreach ($s in 'DisabledForApplication', 'DisabledForApplication', 'Enabled', 'Enabled') { $script:Seen.Enqueue($s) }
+function Get-ToastSetting($Aumid) { if ($script:Seen.Count -gt 1) { $script:Seen.Dequeue() } else { $script:Seen.Peek() } }
+# The backup had no Enabled value (the app was enabled by default).
+function Read-Record($Name) { [pscustomobject]@{ restored=$false; before=[pscustomobject]@{ exists=$true; values=[pscustomobject]@{} } } }
+$ok = Restore-ToastSettings
+$script:Seen = New-Object System.Collections.Queue
+$script:Seen.Enqueue('DisabledForApplication')
+$stuck = Restore-ToastSettings
+# A backup with Enabled=0 is put back as disabled, and that is what must take effect.
+function Read-Record($Name) { [pscustomobject]@{ restored=$false; before=[pscustomobject]@{ exists=$true;
+    values=[pscustomobject]@{ 'value:Enabled'=[pscustomobject]@{ kind='DWord'; data=0 } } } } }
+$disabled = Restore-ToastSettings
+ConvertTo-GxJson ([ordered]@{ ok=$ok; stuck=$stuck; disabled=$disabled; log=@($script:Log) }) -Compress
+"""
+        out = self.run_body(body, ("ConvertTo-GxJson", "Wait-ToastSetting", "Restore-ToastSettings"), ("LF", "JsonSource"))
+        self.assertTrue(out["ok"]["ok"])
+        self.assertEqual(out["ok"]["effective"]["want"], "Enabled")
+        self.assertTrue(out["ok"]["effective"]["after_explicit"]["reached"])
+        self.assertFalse(out["stuck"]["ok"])
+        self.assertEqual(out["stuck"]["effective"]["after_restore"]["setting"], "DisabledForApplication")
+        self.assertEqual(out["disabled"]["effective"]["want"], "DisabledForApplication")
+        self.assertTrue(out["disabled"]["ok"])
+        # Each run writes Enabled first and restores the exact backup only afterwards.
+        self.assertEqual(out["log"][:3], ["key Software\\N\\gx0404.GhosttyGX", "set Enabled=1",
+                                          "restore toast-notification-settings"])
+        self.assertEqual(out["log"][-2:], ["set Enabled=0", "restore toast-notification-settings"])
 
     def test_probe_errors_are_collected_without_stopping_the_step(self):
         body = r"""
