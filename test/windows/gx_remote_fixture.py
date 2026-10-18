@@ -72,7 +72,8 @@ CASE_IDS = {"transfer": "MIG-02", "remote-input-to-original-shell": "MIG-03",
             "activate-key-table-once": "MIG-06b", "chained-new-split-continuation": "MIG-06c",
             "persistent-key-table": "MIG-06d", "dragback-returns-original-tab": "MIG-02b",
             "drag-threshold": "MIG-01",
-            "mixed-tab-transfer-rejected": "MIG-04b", "perf-input": "PERF-REMOTE-01"}
+            "mixed-tab-transfer-rejected": "MIG-04b", "perf-input": "PERF-REMOTE-01",
+            "remote-terminal-uia": "UIA-05r"}
 
 
 class Blocked(RuntimeError):
@@ -797,6 +798,48 @@ class Fixture:
                     return
             time.sleep(0.5)
         raise AssertionError(f"remote UIA never exposed the source text {source_marker}: {attempts!r}")
+
+    def remote_uia_probe(self, target, hwnd, cls, name, rows=None):
+        """One external MTA probe of an owned HWND; the root must be the app's
+        own provider (gx_win_uia checks FrameworkId GhosttyGX)."""
+        self.fresh(target, hwnd, cls)
+        command = [sys.executable, str(ROOT / "scripts/gx_win_uia.py"), "--worker",
+                   "--hwnd", str(hwnd), "--pid", str(target.pid), "--birth", str(target.creation),
+                   "--exe", str(self.exe), "--timeout", "15", "--max-nodes", "128", "--max-depth", "8"]
+        if rows:
+            plan = self.out / f"{name}.plan.json"
+            plan.write_text(json.dumps(rows), encoding="utf-8")
+            command += ["--sha256", self.expected_hash, "--action-plan", str(plan)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=20)
+        (self.out / f"{name}.json").write_text(json.dumps({"command": command, "returncode": result.returncode,
+                                                         "stdout": result.stdout, "stderr": result.stderr},
+                                                        ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.fresh(target, hwnd, cls)
+        probe = json.loads(result.stdout) if result.stdout.strip() else {}
+        if result.returncode != 0 or probe.get("status") != "PASS":
+            raise AssertionError(f"UIA probe failed: {name}.json")
+        if probe.get("apartment") != "MTA" or probe.get("created_hwnd") is not False:
+            raise AssertionError("probe did not confirm the external windowless MTA contract")
+        return probe
+
+    def case_terminal_uia(self, target, remote):
+        """UIA-05r (D-29 for a remote pane): the focused remote pane HWND is
+        the named terminal element, and the target window's tree holds it once."""
+        from gx_popup_uia_fixture import duplicate_panes, terminal_elements, terminal_root_facts
+        pane = self.focus_remote(target, remote.hwnd)
+        root = self.remote_uia_probe(target, pane.hwnd, REMOTE_PANE_CLASS, "remote-terminal-uia-root")["nodes"][0]
+        failed = terminal_root_facts(root, pane.hwnd)
+        if failed:
+            raise AssertionError(f"D-29 remote root facts failed: {failed}: {root}")
+        rows = [{"automation_id": root["automation_id"], "pattern": "element", "operation": "check_focus",
+                 "expect_focus": True, "expect_focused_element": True}]
+        self.remote_uia_probe(target, pane.hwnd, REMOTE_PANE_CLASS, "remote-terminal-uia-focus", rows)
+        nodes = self.remote_uia_probe(target, remote.hwnd, gui.WINDOW_CLASS, "remote-terminal-uia-window")["nodes"]
+        if [node["automation_id"] for node in terminal_elements(nodes)] != [root["automation_id"]] or duplicate_panes(nodes):
+            raise AssertionError("the target window tree does not hold the remote terminal exactly once")
+        self.capture(target, remote.hwnd, gui.WINDOW_CLASS, "remote-terminal-uia", "目标窗只有一个远程窗格且键盘焦点在其中")
+        self.record("remote-terminal-uia", root=root, evidence=["remote-terminal-uia-root.json",
+                                                                "remote-terminal-uia-focus.json", "remote-terminal-uia-window.json"])
 
     def case_performable(self, target, remote):
         self.focus_remote(target, remote.hwnd)
@@ -1736,6 +1779,7 @@ class Fixture:
         if self.only:
             # Narrow diagnosis: transfer and its continuity checks above stay mandatory.
             probes = {"uia": ("remote-uia-external-mta", self.case_uia),
+                      "terminal-uia": ("remote-terminal-uia", self.case_terminal_uia),
                       "input": ("remote-input-to-original-shell", self.case_input),
                       "performable": ("performable-fallback-without-selection", self.case_performable),
                       "once": ("activate-key-table-once", self.case_once),
@@ -1895,7 +1939,7 @@ def main(argv=None):
     parser.add_argument("--skip", action="append", choices=OPTIONAL_CASES, help="skip an optional case (repeatable)")
     parser.add_argument("--rehearsal", action="store_true", help="label the evidence as a rehearsal, never acceptance")
     parser.add_argument("--ole-source", type=Path, help="built test/windows/gx_ole_source.zig executable for the real OLE drag")
-    parser.add_argument("--only", action="append", choices=("uia", "input", "performable", "once", "table", "perf-input", "drag-threshold"),
+    parser.add_argument("--only", action="append", choices=("uia", "terminal-uia", "input", "performable", "once", "table", "perf-input", "drag-threshold"),
                         help="after the mandatory transfer run only these probes, in order, then close both apps (repeatable)")
     parser.add_argument("--allow-load-layouts", action="store_true",
                         help="VM only: load English (US) when it is not loaded (unloaded again); never on the host")
