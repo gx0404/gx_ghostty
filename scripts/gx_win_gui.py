@@ -125,8 +125,11 @@ Keyboard layouts: layout, the layout step and ime_off only switch to a layout Ge
 reports for this user: they post WM_INPUTLANGCHANGEREQUEST to the window's focused thread and wait up
 to 2 s for GetKeyboardLayout to confirm it. They never call LoadKeyboardLayout and never change the
 user's language list, so on the host a layout that is not loaded is refused. Only --allow-load (run:
---allow-load-layouts), meant for the VM, loads a missing KLID (such as 00000407 for German dead keys)
-and unloads it again at stop or at the end of the scenario. A plain KLID 0000LLLL names the HKL
+--allow-load-layouts) loads a missing KLID (such as 00000407 for German dead keys) and unloads it
+again at stop or at the end of the scenario, and only inside the test VM: GX_WIN_GUI_VM=1 must be set
+and the firmware in HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS must be the VM's QEMU/OVMF (the pattern of
+test/windows/gx_vm_validation.ps1); anywhere else the option is refused (exit code 2) before
+anything starts, and run.json and notes.txt record the evidence. A plain KLID 0000LLLL names the HKL
 0xLLLLLLLL and an IME KLID E0xxxxxx itself; other KLIDs (variants such as 00010407) need their HKL from
 layout --list. Before the first switch the thread's layout is remembered; stop and the end of a
 scenario switch back to it while the instance still runs. A missing layout is a missing host
@@ -381,6 +384,45 @@ def resolve_layout(target: str, loaded: Sequence[int]) -> tuple[int | None, str 
             wanted = None
         return (by_value.get(wanted) if wanted is not None else None), klid
     raise UsageError(f"keyboard layout {target!r}: use an HKL such as 0x08040804 or a KLID such as 00000407")
+
+
+VM_MARKER = "GX_WIN_GUI_VM"  # set to 1 inside the test VM only
+# The firmware of the QEMU/OVMF test VM; the same pattern as the guest guard of test/windows/gx_vm_validation.ps1.
+VM_FIRMWARE = re.compile(r"QEMU|Bochs|SeaBIOS|OVMF|EDK II", re.IGNORECASE)
+BIOS_VALUES = ("SystemManufacturer", "SystemProductName", "BIOSVendor", "BIOSVersion", "BaseBoardManufacturer")
+
+
+def bios_description() -> str:
+    """The firmware strings of HKLM\\HARDWARE\\DESCRIPTION\\System\\BIOS (read only); "" where there are none."""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    values = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS") as key:
+            for name in BIOS_VALUES:
+                try:
+                    values.append(str(winreg.QueryValueEx(key, name)[0]).strip())
+                except OSError:
+                    pass
+    except OSError:
+        return ""
+    return " ".join(value for value in values if value)
+
+
+def vm_guard(what: str, environ: Mapping[str, str] | None = None, bios: Callable[[], str] | None = None) -> str:
+    """Refuse `what` (loading keyboard layouts) outside the test VM: GX_WIN_GUI_VM=1 must be set and the
+    firmware must be the VM's QEMU/OVMF. The evidence when it may run."""
+    environ = os.environ if environ is None else environ
+    description = (bios or bios_description)()
+    marker = environ.get(VM_MARKER) == "1"
+    firmware = bool(VM_FIRMWARE.search(description))
+    if not (marker and firmware):
+        missing = ([] if marker else [f"{VM_MARKER}=1 is not set"]) + (
+            [] if firmware else [f"the firmware ({description or 'unknown'}) is not the test VM's QEMU/OVMF"])
+        raise UsageError(f"{what} only runs inside the test VM: {'; '.join(missing)}; nothing was loaded")
+    return f"test VM: {VM_MARKER}=1, firmware {description}"
 
 
 def layout_blockers(steps: Sequence[Any], loaded: Sequence[int], allow_load: bool = False) -> list[str]:
@@ -2230,6 +2272,7 @@ class Instance:
                         "pick a loaded one; only inside a VM may --allow-load load it")
                 raise Blocked(f"keyboard layout {target} is not loaded for this user (GetKeyboardLayoutList: "
                               f"{', '.join(hkl_text(value) for value in loaded) or 'none'}); {hint}")
+            vm_guard(f"loading keyboard layout {klid}")
             hkl = w.load_layout(klid)
             if hkl & 0xFFFFFFFF not in {value & 0xFFFFFFFF for value in loaded}:
                 added = True
@@ -3281,6 +3324,9 @@ def notes_text(scenario: Scenario, report: Mapping[str, Any]) -> str:
              "Read every screenshot before recording PASS. Expected:"]
     if report.get("status") == "blocked":
         lines[3:3] = ["BLOCKED: a precondition of this machine is missing; record PENDING with the reason, never PASS"]
+    if report.get("allow_load_layouts"):
+        lines[3:3] = [f"keyboard layouts: --allow-load-layouts ({report['allow_load_layouts']}); layout steps may "
+                      "load missing layouts, unloaded at the end"]
     lines += [f"- {item}" for item in scenario.expect] or ["- (no expectations listed)"]
     lines += ["", "screenshots:"] + [f"- {name}" for name in report.get("captures", [])]
     return "\n".join(lines) + "\n"
@@ -3291,6 +3337,7 @@ def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_eff
     if not exe.is_file():
         raise UsageError(f"{exe} does not exist; build it first with: just build")
     scenarios = [load_scenario(path) for path in paths]
+    vm = vm_guard("--allow-load-layouts") if allow_load_layouts else None
     out.mkdir(parents=True, exist_ok=True)
     distros: list[str] | None = None
 
@@ -3341,6 +3388,8 @@ def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_eff
             print(f"{TAG} {scenario.id} {scenario.title} (attempt {attempt + 1})", flush=True)
             report = ScenarioRun(scenario, exe, out_dir, keep_open, allow_load_layouts).run()
             report["attempt"] = attempt + 1
+            if vm is not None:
+                report["allow_load_layouts"] = vm
             write_report(scenario, out_dir, report)
             if report["status"] in ("ok", "blocked"):
                 break
@@ -3528,6 +3577,8 @@ def session_capture(instance: Instance, args: argparse.Namespace) -> int:
 
 def session_command(args: argparse.Namespace) -> int:
     env_dir: Path = args.env_dir
+    if args.command == "layout" and args.allow_load:
+        print(vm_guard("layout --allow-load"))  # before anything else: on the host nothing may be loaded
     if args.command == "start":
         if (env_dir / SESSION_FILE).is_file():
             previous = Instance.load(env_dir)

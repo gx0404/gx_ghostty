@@ -1261,6 +1261,7 @@ class LayoutTests(unittest.TestCase):
         self.fake = FakeWin32(self.PID, self.PID)
         for patch in (mock.patch.object(gui, "win32", return_value=self.fake),
                       mock.patch.object(gui.Instance, "require_window", return_value=self.MAIN),
+                      mock.patch.object(gui, "vm_guard", return_value="test VM: mock"),  # VmGuardTests checks it
                       mock.patch.object(gui.time, "sleep")):
             patch.start()
             self.addCleanup(patch.stop)
@@ -1464,6 +1465,89 @@ class BlockedTests(unittest.TestCase):
         with mock.patch.object(gui, "win32", return_value=fake), self.assertRaises(gui.Blocked), \
                 mock.patch.object(gui.Instance, "require_window", return_value=LayoutTests.MAIN):
             layout.switch_layout("00000407")
+
+
+class VmGuardTests(unittest.TestCase):
+    """--allow-load (run: --allow-load-layouts) loads keyboard layouts only inside the test VM."""
+
+    HOST = "ASUS System Product Name American Megatrends Inc. 1701 ASUSTeK COMPUTER INC."
+    VM = "QEMU Standard PC (Q35 + ICH9, 2009) EDK II edk2-stable202408 QEMU"
+
+    def test_both_the_marker_and_the_vm_firmware_are_needed(self):
+        cases = {
+            "host": ({}, self.HOST, r"GX_WIN_GUI_VM=1 is not set; the firmware \(ASUS .*\) is not the test VM's"),
+            "host with the marker": ({"GX_WIN_GUI_VM": "1"}, self.HOST, r"only runs inside the test VM: the firmware"),
+            "VM without the marker": ({}, self.VM, r"only runs inside the test VM: GX_WIN_GUI_VM=1 is not set; nothing"),
+            "marker not 1": ({"GX_WIN_GUI_VM": "yes"}, self.VM, r"GX_WIN_GUI_VM=1 is not set"),
+            "no firmware strings": ({"GX_WIN_GUI_VM": "1"}, "", r"the firmware \(unknown\)"),
+        }
+        for name, (environ, bios, expected) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(gui.UsageError, expected):
+                gui.vm_guard("--allow-load-layouts", environ, lambda bios=bios: bios)
+        self.assertEqual(f"test VM: GX_WIN_GUI_VM=1, firmware {self.VM}",
+                         gui.vm_guard("x", {"GX_WIN_GUI_VM": "1"}, lambda: self.VM))
+
+    def test_nothing_is_loaded_or_started_on_the_host(self):
+        fake = FakeWin32(1, 1)
+        fake.layouts = [0x08040804]
+        instance = gui.Instance(1, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+        with mock.patch.object(gui, "win32", return_value=fake), mock.patch.object(gui, "bios_description",
+                                                                                   return_value=self.HOST), \
+                mock.patch.dict(os.environ, {"GX_WIN_GUI_VM": ""}), \
+                mock.patch.object(gui.Instance, "require_window", return_value=LayoutTests.MAIN):
+            with self.assertRaisesRegex(gui.UsageError, "loading keyboard layout 00000407 only runs inside the test VM"):
+                instance.switch_layout("00000407", allow_load=True)
+            self.assertEqual(([], []), (fake.loaded, instance.loaded_layouts))
+            with tempfile.TemporaryDirectory() as tmp:
+                exe = Path(tmp) / "ghostty.exe"
+                exe.write_bytes(b"")
+                scenario = Path(tmp) / "W90-x.toml"
+                scenario.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\n[[step]]\naction = "layout"\n'
+                                    'target = "00000407"\n[[step]]\naction = "capture"\nname = "x"\n', encoding="utf-8")
+                stderr = io.StringIO()
+                with mock.patch.object(gui, "launch", side_effect=AssertionError("nothing may start")), \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    code = gui.main(["run", "--exe", str(exe), "--out", str(Path(tmp) / "out"), "--allow-load-layouts",
+                                     str(scenario)])
+                    self.assertEqual(2, code)
+                    self.assertIn("--allow-load-layouts only runs inside the test VM", stderr.getvalue())
+                    self.assertFalse((Path(tmp) / "out").exists())
+                    session = mock.Mock(spec=gui.Instance)
+                    session.alive.return_value = True
+                    with mock.patch.object(gui.Instance, "load", return_value=session):
+                        self.assertEqual(2, gui.main(["layout", str(Path(tmp) / "env"), "00000407", "--allow-load"]))
+                    session.switch_layout.assert_not_called()
+
+    def test_inside_the_vm_run_json_and_notes_record_it(self):
+        instance = mock.Mock()
+        instance.pid, instance.creation, instance.original_layout, instance.loaded_layouts = 1, 1, None, []
+        instance.log = Path("absent.log")
+        instance.wait_window.return_value = {}
+        instance.close.return_value = "closed"
+        instance.switch_layout.return_value = "keyboard layout 0x08040804 -> 0x04070407 (loaded 00000407)"
+        instance.capture_window.return_value.save_png.side_effect = lambda target: target
+        instance.popups.return_value = []
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "ghostty.exe"
+            exe.write_bytes(b"")
+            path = Path(tmp) / "W90-x.toml"
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\nbackdrop_reason = "mock"\n'
+                            '[[step]]\naction = "layout"\ntarget = "00000407"\n[[step]]\naction = "capture"\nname = "x"\n',
+                            encoding="utf-8")
+            fake = FakeWin32(1, 1)
+            fake.layouts = [0x08040804]
+            with mock.patch.object(gui, "win32", return_value=fake), mock.patch.object(gui, "launch", return_value=instance), \
+                    mock.patch.object(gui, "bios_description", return_value=self.VM), \
+                    mock.patch.dict(os.environ, {"GX_WIN_GUI_VM": "1"}), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = gui.run_scenarios([path], exe=exe, out=Path(tmp) / "out", allow_side_effects=False, retries=0,
+                                         keep_open=False, allow_load_layouts=True)
+            report = json.loads((Path(tmp) / "out" / "W90" / "run.json").read_text(encoding="utf-8"))
+            notes = (Path(tmp) / "out" / "W90" / "notes.txt").read_text(encoding="utf-8")
+        self.assertEqual((0, "ok"), (code, report["status"]))
+        self.assertEqual(f"test VM: GX_WIN_GUI_VM=1, firmware {self.VM}", report["allow_load_layouts"])
+        self.assertIn("keyboard layouts: --allow-load-layouts (test VM: GX_WIN_GUI_VM=1, firmware QEMU", notes)
+        instance.switch_layout.assert_called_once_with("00000407", allow_load=True)
 
 
 class RestartTests(unittest.TestCase):
