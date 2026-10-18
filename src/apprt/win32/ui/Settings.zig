@@ -269,6 +269,11 @@ status_len: usize = 0,
 /// Hit-test rectangles of the last paint, later ones on top.
 hits: [max_hits]Hit = undefined,
 hit_count: usize = 0,
+/// The hits (targets and places) the published accessible model was built
+/// from (`uiaBuild`), as `hitsDigest`; null when none is published. Its
+/// tokens name hits by position, so a paint that lays them out anew revokes
+/// it (`checkUiaHits`).
+uia_hits: ?u64 = null,
 /// While the body paints: the body, which the hit rectangles of its rows
 /// are cut to (`hit_test.clip`).
 hit_clip: ?d2d.Rect = null,
@@ -731,8 +736,39 @@ fn uiaBuild(context: *anyopaque, _: *Popup, bridge: *uia_bridge.PopupBridge, api
     const rows = self.buildRows(&buf);
     var states: [max_hits]uia_bridge.ControlState = undefined;
     for (self.hits[0..self.hit_count], 0..) |hit, index| states[index] = self.uiaControlState(hit.target, rows);
+    const published = bridge.publisher.current;
     try bridge.publishSettings(api, queue, self.uia_attachment, self, rows, states[0..self.hit_count], .{ .context = self, .is_live = uiaLive, .action = uiaAction });
+    if (bridge.publisher.current != published) self.notePublishedHits();
 }
+
+/// The hits of the last paint are what the accessible model now published
+/// was built from.
+fn notePublishedHits(self: *Settings) void {
+    self.uia_hits = self.hitsDigest();
+}
+
+/// The targets and places of the hits of the last paint.
+fn hitsDigest(self: *const Settings) u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    std.hash.autoHash(&hasher, self.hit_count);
+    for (self.hits[0..self.hit_count]) |hit| {
+        std.hash.autoHash(&hasher, hit.target);
+        hasher.update(std.mem.asBytes(&hit.rect));
+    }
+    return hasher.final();
+}
+
+/// After a paint laid the hits out: when they differ from those of the
+/// published accessible model (a scroll that revealed the focus, another
+/// section), its elements would act on other controls now. Revoke them; the
+/// paint publishes the new layout (`Popup.uiaLayoutChanged`).
+fn checkUiaHits(self: *Settings) void {
+    const published = self.uia_hits orelse return;
+    if (published == self.hitsDigest()) return;
+    self.uia_hits = null;
+    self.popup.uiaLayoutChanged();
+}
+
 fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
     const self: *Settings = @ptrCast(@alignCast(context));
     if (!uiaLive(context)) return false;
@@ -945,6 +981,75 @@ test "UIA settings hover and press feedback keep the retained provider" {
     // A model edit still revokes it.
     self.invalidate();
     try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+}
+
+test "UIA settings revokes its elements when a paint lays their hits out anew" {
+    // Settings tokens name hits by position (`uia_bridge.settings_hit_base`
+    // + index). A paint that scrolls (a revealed focus) or lays the hits out
+    // otherwise would leave a retained element acting on another control:
+    // it is revoked, and that paint publishes the new layout. A paint with
+    // the same layout (a focus ring, a hover) keeps it.
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Settings", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Scrollbar", .role = .checkbox, .patterns = .{ .toggle = true } },
+        .{ .id = 3, .parent = 0, .name = "Bell", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.destroy();
+    self.popup.input.alloc = testing.allocator;
+    self.hits[0] = .{ .rect = .{ .x = 0, .y = 0, .w = 100, .h = 20 }, .target = .{ .row = 0 } };
+    self.hits[1] = .{ .rect = .{ .x = 0, .y = 20, .w = 100, .h = 20 }, .target = .{ .row = 1 } };
+    self.hit_count = 2;
+    try self.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    self.popup.uia_view.needs_publish = false;
+    self.notePublishedHits();
+    const snapshot = self.popup.uia_view.publisher.current.?;
+    const provider = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(provider.vtable));
+    _ = abi.AddRef(provider);
+    defer _ = abi.Release(provider);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    // The next paint lays the same hits out again.
+    self.checkUiaHits();
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // A paint that scrolled by a row: the same tokens name other rows now.
+    self.hits[0] = .{ .rect = .{ .x = 0, .y = 0, .w = 100, .h = 20 }, .target = .{ .row = 1 } };
+    self.hits[1] = .{ .rect = .{ .x = 0, .y = 20, .w = 100, .h = 20 }, .target = .{ .row = 2 } };
+    self.checkUiaHits();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+    try testing.expect(!self.popup.uia_view.publisher.accepts(action));
+    try testing.expect(self.popup.uia_view.needs_publish and self.uia_hits == null);
 }
 
 // -----------------------------------------------------------------------
@@ -3318,6 +3423,7 @@ fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
         .w = @max(0, w - sidebar_width),
         .h = footer_height,
     });
+    self.checkUiaHits();
 
     // What is under the pointer may have moved (scrolling, a new section).
     if (self.pointer) |pos| {

@@ -1088,6 +1088,14 @@ fn uiaDirty(self: *Popup) void {
     self.uia_layout_pending = true;
 }
 
+/// What the published accessible model was built from was laid out anew
+/// while painting (a widget whose tokens are positions scrolled): revoke
+/// the elements clients hold. The paint that is running publishes the new
+/// layout when it ends.
+pub fn uiaLayoutChanged(self: *Popup) void {
+    self.uiaDirty();
+}
+
 fn uiaDetach(self: *Popup) void {
     if (self.callbacks) |cb| if (cb.uia_source) |source| {
         source.app.uia_popups.unregister(&self.uia_view);
