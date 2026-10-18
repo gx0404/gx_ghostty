@@ -583,9 +583,10 @@ fn performButton(self: *TitleBar, button: Button) void {
 /// mouse until the release (`press`, `release`), so the window gets the
 /// moves and the release wherever the pointer goes; meanwhile only the
 /// pressed button reacts to the pointer, without a tooltip, and the tab
-/// bar sees nothing. Another window taking the mouse capture or a
-/// cancelled mode (`WM_CAPTURECHANGED`, `WM_CANCELMODE`, a dialog
-/// showing) drops the press and the hover.
+/// bar sees nothing. While the tab bar holds a press or a drag of its own
+/// (`Context.tab_press`), no button reacts. Another window taking the
+/// mouse capture or a cancelled mode (`WM_CAPTURECHANGED`,
+/// `WM_CANCELMODE`, a dialog showing) drops the press and the hover.
 const ButtonInput = struct {
     /// The button under the pointer and the one being pressed.
     hover: Button = .none,
@@ -604,7 +605,11 @@ const ButtonInput = struct {
     };
 
     /// What else holds the pointer.
-    const Context = struct {};
+    const Context = struct {
+        /// The tab bar holds a left press or a drag, and with it the
+        /// mouse capture (`TabBar.holdsPress`).
+        tab_press: bool = false,
+    };
 
     const TooltipChange = union(enum) {
         keep,
@@ -637,13 +642,12 @@ const ButtonInput = struct {
     };
 
     fn route(self: *ButtonInput, m: Message, ctx: Context) Effects {
-        _ = ctx;
         const hover = self.hover;
         var fx: Effects = .{};
         switch (m.msg) {
             WM_NCMOUSEMOVE => {
                 const button = buttonFromHitCode(m.wparam);
-                self.hover = self.reacting(button);
+                self.hover = self.reacting(button, ctx);
                 if (button != .none) fx = .{ .consumed = true, .track = .nonclient };
             },
             // With the capture, the moves say where the pointer is.
@@ -661,9 +665,9 @@ const ButtonInput = struct {
             w32.WM_MOUSEMOVE => {
                 const button = buttonOf(m.hit);
                 if (self.pressed != .none) {
-                    self.hover = self.reacting(button);
+                    self.hover = self.reacting(button, ctx);
                 } else {
-                    self.hover = if (clientButton(button)) button else .none;
+                    self.hover = if (clientButton(button)) self.reacting(button, ctx) else .none;
                     fx.tab_bar = true;
                 }
             },
@@ -682,7 +686,7 @@ const ButtonInput = struct {
                 // fade, and its tooltip starts over (`onSize` hid it).
                 // Leave tracking drops the hover again should the pointer
                 // have left the window by then.
-                const button = self.reacting(buttonOf(m.hit));
+                const button = self.reacting(buttonOf(m.hit), ctx);
                 self.hover = button;
                 fx.fade = false;
                 fx.tooltip = .{ .point = if (self.pressed == .none) button else .none };
@@ -700,9 +704,10 @@ const ButtonInput = struct {
         return fx;
     }
 
-    /// The button reacting to a pointer over `button`: while one is
-    /// pressed, only that one.
-    fn reacting(self: *const ButtonInput, button: Button) Button {
+    /// The button reacting to a pointer over `button`: none while the tab
+    /// bar holds the pointer, only the pressed one while one is pressed.
+    fn reacting(self: *const ButtonInput, button: Button, ctx: Context) Button {
+        if (ctx.tab_press) return .none;
         return if (self.pressed == .none or button == self.pressed) button else .none;
     }
 
@@ -779,7 +784,7 @@ fn buttonTooltip(button: Button) TooltipTarget {
 /// and perform a button (last: the main menu runs a modal loop).
 fn routeButtons(self: *TitleBar, m: ButtonInput.Message) ButtonInput.Effects {
     const before = self.buttons;
-    const fx = self.buttons.route(m, .{});
+    const fx = self.buttons.route(m, .{ .tab_press = self.window().tab_bar.holdsPress() });
     const after = self.buttons;
     if (after.pressed != before.pressed) {
         self.invalidateButton(before.pressed);
@@ -2296,4 +2301,25 @@ test "a resize hovers the button now under the pointer and points the tooltip at
     try testing.expectEqual(Button.minimize, p.input.hover);
     try testing.expectEqual(ButtonInput.Track.none, fx.track);
     try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+}
+
+test "the title bar buttons do not react while the tab bar holds a press or drag" {
+    const testing = std.testing;
+    var p: TestPointer = .{ .ctx = .{ .tab_press = true } };
+    // A tab dragged over the buttons: the drag gets the moves; the buttons
+    // neither hover nor point the tooltip.
+    for ([_]Hit{ TestPointer.minimize, TestPointer.menu, TestPointer.maximize }) |hit| {
+        const fx = p.send(w32.WM_MOUSEMOVE, hit);
+        try testing.expect(fx.tab_bar);
+        try testing.expectEqual(Button.none, p.input.hover);
+        try testing.expectEqual(ButtonInput.TooltipChange.keep, fx.tooltip);
+    }
+    const fx = p.send(w32.WM_SIZE, TestPointer.minimize);
+    try testing.expectEqual(Button.none, p.input.hover);
+    try testing.expectEqual(ButtonInput.Track.none, fx.track);
+    try testing.expectEqual(ButtonInput.TooltipChange{ .point = .none }, fx.tooltip);
+    // Dropped: the button under the pointer reacts again.
+    p.ctx.tab_press = false;
+    _ = p.send(w32.WM_MOUSEMOVE, TestPointer.minimize);
+    try testing.expectEqual(Button.minimize, p.input.hover);
 }

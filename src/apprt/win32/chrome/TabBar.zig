@@ -1210,6 +1210,12 @@ pub fn onMouseLeave(self: *TabBar) void {
     }
 }
 
+/// Whether a left press or a drag on the tab bar holds the mouse capture:
+/// the title bar buttons do not react to the pointer meanwhile.
+pub fn holdsPress(self: *const TabBar) bool {
+    return self.drag != null or self.pressed != .none;
+}
+
 /// A left-button press on the tab bar: select (and start tracking a
 /// potential drag of) a tab, or press a button.
 pub fn onLeftButtonDown(self: *TabBar, lay: TitleBar.Layout, x: i32, y: i32) void {
