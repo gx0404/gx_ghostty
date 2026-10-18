@@ -98,7 +98,9 @@ files or subdirectories, and the entries inside can be neither written nor renam
 probed after being set and after being released: a write attempt, and for a directory opening each
 of its first 16 existing entries for DELETE access (which deletes nothing; run.json says when there
 were none). Whatever is still read-only when the scenario ends or fails is released, after the
-instance closed and whatever else the cleanup did (run.json: readonly).
+instance closed and whatever else the cleanup did (run.json: readonly). If the harness itself was
+killed before that, the next run of the scenario resets the leftover entries before it empties the
+directory; by hand: icacls "DIR" /reset /T /C /Q, then attrib -R "DIR\\*" /S /D.
 
 Privacy backdrop: a scenario puts one solid window (backdrop = "#rrggbb", default #000000) right
 under the lowest of its instance's windows. It covers the work area of every display monitor that
@@ -2329,12 +2331,37 @@ class Instance:
             time.sleep(0.05)
 
 
+def remove_tree(path: Path, acl: Callable[[Sequence[str]], tuple[int, str]] | None = None) -> str:
+    """shutil.rmtree for a directory this tool wrote. When a deny entry or read-only attribute that an
+    aborted run left there (file steps with readonly) refuses it, reset the ACLs below `path` to the
+    inherited ones, clear the read-only attributes and try once more; how it went."""
+    try:
+        shutil.rmtree(path)
+        return "removed"
+    except PermissionError as exc:
+        first = exc
+    code, output = (acl or run_icacls)([str(path), "/reset", "/T", "/C", "/Q"])
+    for folder, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                os.chmod(os.path.join(folder, name), stat.S_IREAD | stat.S_IWRITE)
+            except OSError:
+                pass
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise GuiError(f"cannot remove {path}: {exc} (first attempt: {first}; icacls /reset exit {code}: "
+                       f"{output}); recover by hand: icacls \"{path}\" /reset /T /C /Q, then "
+                       f"attrib -R \"{path}\\*\" /S /D") from None
+    return f"removed after icacls /reset (exit {code}) and clearing read-only attributes"
+
+
 def prepare_env_dir(env_dir: Path, fresh: bool) -> None:
     """Create the isolated profile directory; with fresh, empty one this tool made before (never other folders)."""
     if fresh and env_dir.exists():
         if not (env_dir / ENV_MARKER).is_file():
             raise UsageError(f"{env_dir} exists and was not created by this tool; use a new directory")
-        shutil.rmtree(env_dir)
+        remove_tree(env_dir)
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / ENV_MARKER).write_text("isolated LOCALAPPDATA and XDG_CONFIG_HOME of gx_win_gui.py\n", encoding="utf-8")
 
@@ -3184,34 +3211,37 @@ class ScenarioRun:
             self.capture_failure()
         finally:
             try:
-                if self.instance is not None and self.held_buttons:
-                    report["released_buttons"] = self.release_held_buttons(aborted=not completed)
-                layouts: dict[str, Any] = {}
-                if self.instance is not None and self.instance.original_layout is not None:
-                    layouts["switched_back"] = self.instance.restore_layout()  # while the instance still runs
-                if self.instance is not None and not self.keep_open:
-                    try:
-                        report["closed"] = self.instance.close()
-                    except GuiError as exc:
-                        report["closed"] = f"failed: {exc}"
-                elif self.instance is not None:
-                    self.instance.save()
-                    report["closed"] = f"kept open; stop with: gx_win_gui.py stop {env_dir}"
-                if self.instance is not None and self.instance.loaded_layouts and not self.keep_open:
-                    layouts["unloaded"] = self.instance.unload_layouts()
-                if layouts:
-                    report["layouts"] = layouts
-                # After the close, so a shutdown that writes into a read-only path still meets it.
-                released = self.readonly.release_all(env_dir.resolve())
-                if self.readonly.events or released:
-                    report["readonly"] = {"events": self.readonly.events, "released_at_end": released}
-                if self.clipboard_changed:
-                    try:
-                        win32().set_clipboard_text(self.saved_clipboard or "")
-                    except GuiError:
-                        pass
-                if self.instance is not None and self.instance.log.is_file():
-                    shutil.copyfile(self.instance.log, self.out_dir / "ghostty.log")
+                try:
+                    if self.instance is not None and self.held_buttons:
+                        report["released_buttons"] = self.release_held_buttons(aborted=not completed)
+                    layouts: dict[str, Any] = {}
+                    if self.instance is not None and self.instance.original_layout is not None:
+                        layouts["switched_back"] = self.instance.restore_layout()  # while the instance still runs
+                    if self.instance is not None and not self.keep_open:
+                        try:
+                            report["closed"] = self.instance.close()
+                        except GuiError as exc:
+                            report["closed"] = f"failed: {exc}"
+                    elif self.instance is not None:
+                        self.instance.save()
+                        report["closed"] = f"kept open; stop with: gx_win_gui.py stop {env_dir}"
+                    if self.instance is not None and self.instance.loaded_layouts and not self.keep_open:
+                        layouts["unloaded"] = self.instance.unload_layouts()
+                    if layouts:
+                        report["layouts"] = layouts
+                    if self.clipboard_changed:
+                        try:
+                            win32().set_clipboard_text(self.saved_clipboard or "")
+                        except GuiError:
+                            pass
+                    if self.instance is not None and self.instance.log.is_file():
+                        shutil.copyfile(self.instance.log, self.out_dir / "ghostty.log")
+                finally:
+                    # After the close, so a shutdown that writes into a read-only path still meets it, and
+                    # whatever failed above (a second Ctrl+C, a save that raised), no deny entry stays behind.
+                    released = self.readonly.release_all(env_dir.resolve())
+                    if self.readonly.events or released:
+                        report["readonly"] = {"events": self.readonly.events, "released_at_end": released}
             finally:
                 # Whatever failed above, the backdrop never outlives the scenario.
                 report["backdrop"] = self.backdrop.finish()
@@ -3274,7 +3304,7 @@ def run_scenarios(paths: Sequence[Path], *, exe: Path, out: Path, allow_side_eff
         if out_dir.exists():
             if not (out_dir / "run.json").is_file() and not (out_dir / "env" / ENV_MARKER).is_file():
                 raise UsageError(f"{out_dir} exists and was not written by this tool")
-            shutil.rmtree(out_dir)
+            remove_tree(out_dir)
         out_dir.mkdir(parents=True)
 
     def write_report(scenario: Scenario, out_dir: Path, report: Mapping[str, Any]) -> None:

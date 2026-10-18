@@ -1120,6 +1120,55 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(["readonly", "writable"], [event["event"] for event in report["readonly"]["events"]])
 
 
+class CleanupTests(unittest.TestCase):
+    def test_the_release_survives_a_cleanup_that_raises(self):
+        log: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-ro.toml"
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\n'
+                            'backdrop_reason = "fake capture"\n[[step]]\naction = "file"\npath = "state"\n'
+                            'directory = true\nreadonly = true\n[[step]]\naction = "capture"\nname = "x"\n',
+                            encoding="utf-8")
+            acl = FakeAcl(log=log)
+            with mock.patch.object(gui, "run_icacls", acl), mock.patch.object(gui, "write_probe", acl.probe), \
+                    mock.patch.object(gui, "deletable_entries", acl.delete_check):
+                run = gui.ScenarioRun(gui.load_scenario(path), Path("ghostty.exe"), Path(tmp) / "out", keep_open=True)
+            instance = mock.Mock()
+            instance.env_dir = (Path(tmp) / "out" / "env").resolve()
+            instance.original_layout, instance.loaded_layouts = None, []
+            instance.popups.return_value = []
+            instance.capture_window.return_value.save_png.side_effect = lambda target: target
+            instance.save.side_effect = OSError("the disk is full")  # --keep-open saves the session
+            with mock.patch.object(gui, "launch", return_value=instance), \
+                    mock.patch.object(gui, "win32", return_value=FakeWin32(4242, 4242)), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaisesRegex(OSError, "the disk is full"):
+                run.run()
+        self.assertEqual(["/deny", "/remove:d"], [entry[1] for entry in log], "released although the cleanup raised")
+        self.assertEqual({}, run.readonly.paths)
+
+    def test_remove_tree_resets_what_an_aborted_run_left_and_says_how_to_recover(self):
+        calls: list = []
+        acl = lambda args: calls.append(list(args)) or (0, "Successfully processed 3 files")  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "W90"
+            (target / "env").mkdir(parents=True)
+            self.assertEqual("removed", gui.remove_tree(target, acl))
+            self.assertEqual([], calls)
+            (target / "env").mkdir(parents=True)
+            real = gui.shutil.rmtree
+            with mock.patch.object(gui.shutil, "rmtree", side_effect=[PermissionError("denied"), None]) as rmtree:
+                self.assertIn("after icacls /reset (exit 0)", gui.remove_tree(target, acl))
+            self.assertEqual([[str(target), "/reset", "/T", "/C", "/Q"]], calls)
+            self.assertEqual(2, rmtree.call_count)
+            with mock.patch.object(gui.shutil, "rmtree", side_effect=[PermissionError("denied"),
+                                                                      PermissionError("still denied")]):
+                with self.assertRaisesRegex(gui.GuiError, r"cannot remove .*still denied.*recover by hand: icacls "
+                                                          r"\".*W90\" /reset /T /C /Q, then attrib -R"):
+                    gui.remove_tree(target, acl)
+            real(target)
+
+
 class CaptureWindowTests(unittest.TestCase):
     PID = 4242
     MAIN = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "Ghostty", (0, 0, 100, 100), True, False, False)
