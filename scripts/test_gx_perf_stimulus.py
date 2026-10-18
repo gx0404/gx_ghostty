@@ -1,5 +1,6 @@
 """Offline tests: never launch a terminal, query PDH or send desktop input."""
 import ctypes
+import copy
 import json
 import os
 from pathlib import Path
@@ -185,6 +186,105 @@ class PythonImageTests(unittest.TestCase):
 
 
 class PdhTests(unittest.TestCase):
+    def assert_pending(self, sample):
+        value = stimulus.pdh_summary([pdh_sample(), sample], 42)
+        self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+        self.assertNotIn('switches', value)
+
+    def test_foreign_duplicate_names_do_not_invalidate_owned_threads(self):
+        samples = [pdh_sample(), pdh_sample(31, 200)]
+        for sample in samples:
+            for key, rows in sample['arrays'].items():
+                for pid in (91, 92):
+                    rows.append(dict(rows[0], name='other/0', first=pid))
+                # Independent ordering is deliberately different per counter.
+                if key in ('tid', 'switches'):
+                    rows.reverse()
+        value = stimulus.pdh_summary(samples, 42)
+        self.assertEqual(('sampled', 1, 21), (value['status'], value['n'], value.get('switches')))
+
+    def test_owned_identity_explicitly_includes_pid_tid_and_raw_birth(self):
+        self.assertEqual({(42, 7, 55)}, set(stimulus.pdh_owned(pdh_sample(), 42)))
+
+    def test_independently_reordered_owned_arrays_preserve_counts(self):
+        samples = [pdh_sample(), pdh_sample(31, 200)]
+        for index, sample in enumerate(samples):
+            other = pdh_sample(100 + index * 9, 100 + index * 100, tid=8, birth=56)
+            for key, rows in sample['arrays'].items():
+                rows.append(dict(other['arrays'][key][0], name='ghostty/1'))
+                if (key in ('pid', 'birth')) != bool(index):
+                    rows.reverse()
+            owned = stimulus.pdh_owned(sample, 42)
+            self.assertEqual({(42, 7, 55): 10 if index == 0 else 31,
+                              (42, 8, 56): 100 + index * 9},
+                             {identity: row['first'] for identity, row in owned.items()})
+        value = stimulus.pdh_summary(samples, 42)
+        self.assertEqual(('sampled', 30), (value['status'], value['switches']))
+
+    def test_target_name_collision_never_uses_first_or_occurrence_order(self):
+        for foreign in (False, True):
+            for reverse in (False, True):
+                with self.subTest(foreign=foreign, reverse=reverse):
+                    sample = pdh_sample(31, 200)
+                    other = pdh_sample(500, 200, tid=8, birth=99, pid=91 if foreign else 42)
+                    for key, rows in sample['arrays'].items():
+                        rows.extend(other['arrays'][key])
+                        if reverse:
+                            rows.reverse()
+                    self.assert_pending(sample)
+
+    def test_missing_or_extra_array_rows_cannot_hide_owned_identity(self):
+        for key in stimulus.PDH_PATHS:
+            for change in ('missing', 'extra', 'renamed'):
+                with self.subTest(counter=key, change=change):
+                    sample = pdh_sample(31, 200)
+                    if change == 'missing':
+                        sample['arrays'][key].clear()
+                    elif change == 'extra':
+                        sample['arrays'][key].append(dict(sample['arrays'][key][0], name='orphan/0'))
+                    else:
+                        sample['arrays'][key][0]['name'] = 'orphan/0'
+                    self.assert_pending(sample)
+
+    def test_foreign_invalid_pid_cannot_be_silently_ignored(self):
+        sample = pdh_sample(31, 200)
+        for key, rows in sample['arrays'].items():
+            rows.append(dict(rows[0], name='other/0', first=91,
+                             status=0xc0000bba if key == 'pid' else 0))
+        self.assert_pending(sample)
+
+    def test_target_invalid_fields_and_mixed_collection_timestamps(self):
+        mutations = [('tid', 'first', 0), ('tid', 'first', True),
+                     ('birth', 'first', 0), ('birth', 'first', -1),
+                     ('birth', 'first', 1.5), ('switches', 'first', -1),
+                     ('switches', 'first', 2.5), ('pid', 'first', True)]
+        mutations += [(key, 'timestamp_100ns', 201) for key in stimulus.PDH_PATHS]
+        mutations += [(key, 'status', 0xc0000bba) for key in stimulus.PDH_PATHS]
+        for key, field, value in mutations:
+            with self.subTest(counter=key, field=field, value=value):
+                sample = pdh_sample(31, 200)
+                sample['arrays'][key][0][field] = value
+                self.assert_pending(sample)
+
+    def test_two_names_for_same_tid_are_ambiguous_even_with_different_birth(self):
+        for birth in (55, 56):
+            sample = pdh_sample(31, 200)
+            other = pdh_sample(31, 200, birth=birth)
+            for key, rows in sample['arrays'].items():
+                rows.append(dict(other['arrays'][key][0], name='ghostty/1'))
+            self.assert_pending(sample)
+
+    def test_new_data_status_and_zero_delta_are_valid_without_synthesis(self):
+        first, last = pdh_sample(), pdh_sample(10, 200)
+        for sample in (first, last):
+            for rows in sample['arrays'].values():
+                rows[0]['status'] = 1
+        original = copy.deepcopy([first, last])
+        result = stimulus.pdh_summary([first, last], 42)
+        self.assertEqual(('sampled', 0), (result['status'], result['switches']))
+        self.assertEqual(original, [first, last])
+
+
     def test_raw_counts_are_joined_by_pid_tid_and_birth(self):
         first, last = pdh_sample(), pdh_sample(31, 200)
         # Instance names may be reused/renumbered. The actual identity wins.

@@ -2341,13 +2341,23 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
     helper = pdh = None
     backdrop = gui.Backdrop(gui.BACKDROP_DEFAULT)
     rows = []
-    def shot(name):
+    def shot(name, method='screen'):
+        # IME overlays belong to another process. PrintWindow requests only the
+        # owned target's pixels; it is not proof that WGL/preedit was rendered.
+        # Keep input/foreground checks around it, and never fall back on failure.
+        if method == 'print':
+            c7_input_check(gui, instance, argparse.Namespace(state='visible'), setup_tick)
         info = instance.require_window()
         path = capture.target / (name + '.png')
         began = time.perf_counter_ns()
-        backdrop.capture(instance, info, 'screen', name).save_png(path)
+        image = backdrop.capture(instance, info, method, name)
+        if method == 'print':
+            c7_input_check(gui, instance, argparse.Namespace(state='visible'), setup_tick)
+        image.save_png(path)
         evidence.setdefault('screenshots', []).append({'path': path.name, 'begin_qpc_ns': began,
             'end_qpc_ns': time.perf_counter_ns(), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'method': method, 'capture_scope': 'target-window-only' if method == 'print' else 'guarded-screen',
+            'rendered_pixels': 'unknown',
             'phase': 'observed image; blink/preedit state requires visual review'})
     try:
         populate(gui, instance, args.tabs, 1)
@@ -2378,7 +2388,7 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
             evidence['ime']['before_input'] = [r for r in shells.rows() if r['event'] == 'input']
             if evidence['ime']['before_input']:
                 raise PerfError('installed IME passed raw keys to the console instead of holding preedit')
-            shot('ime-preedit-entry')
+            shot('ime-preedit-entry', method='print')
             c7_input_check(gui, instance, argparse.Namespace(state='visible'), setup_tick)
         windows = main_windows(gui, instance)
         if args.state == 'minimized':
@@ -2472,7 +2482,7 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
             evidence['output_log_end_byte'] = report['windows'][-1]['end_byte']
         if args.state == 'visible':
             for index in range(8):
-                shot(f'c7-after-{index + 1}')
+                shot(f'c7-after-{index + 1}', method='print' if args.case == 'ime-preedit' else 'screen')
                 time.sleep(0.15)
                 c7_input_check(gui, instance, args, entry['tick'], helper)
         if args.case == 'ime-preedit':

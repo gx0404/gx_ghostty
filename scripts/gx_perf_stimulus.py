@@ -734,8 +734,11 @@ class PdhThreads:
     """One live query, sampled periodically. English counter API is locale independent.
 
     Raw Context Switches/sec FirstValue is a cumulative per-thread count. PID,
-    TID and Elapsed Time's start counter join the samples, never instance name
-    alone. Thread churn is retained and makes the interval partial, not zero.
+    TID and Elapsed Time's raw start counter join the samples, never instance
+    name alone. Keep every array item: szName is not a globally unique key and
+    separate counter arrays have no guaranteed common ordering. Ambiguous
+    owned names cannot be recovered by pairing duplicate occurrences.
+    Thread churn is retained and makes the interval partial, not zero.
     """
     def __init__(self):
         self.query = ctypes.c_void_p()
@@ -805,25 +808,65 @@ class PdhThreads:
 
 
 def pdh_owned(sample: dict, pid: int) -> dict:
+    """Join only unique owned names within one collection, then bind PID/TID/birth.
+
+    Foreign duplicate names are harmless only when every ID Process row proves
+    foreign ownership. Missing PID rows or invalid ownership remain fail-closed.
+    Matching name multiplicities detect incomplete arrays, not positional joins.
+    Elapsed Time FirstValue is a raw start tick, not elapsed seconds or FILETIME.
+    """
+    def integer(value):
+        return type(value) is int
+
+    if not integer(pid) or pid <= 0:
+        raise ValueError('invalid owned PDH PID')
     arrays = {}
     for counter in PDH_PATHS:
-        rows = sample['arrays'][counter]
-        arrays[counter] = {row['name']: row for row in rows}
-        if len(arrays[counter]) != len(rows):
-            raise ValueError('duplicate PDH instance name')
+        groups = {}
+        for row in sample['arrays'][counter]:
+            name = row['name']
+            if not isinstance(name, str) or not name:
+                raise ValueError('invalid PDH instance name')
+            groups.setdefault(name, []).append(row)
+        arrays[counter] = groups
+    counts = {name: len(rows) for name, rows in arrays['pid'].items()}
+    if any({name: len(rows) for name, rows in groups.items()} != counts
+           for groups in arrays.values()):
+        raise ValueError('PDH array instance coverage differs; ownership incomplete')
     result = {}
-    for name, row in arrays['pid'].items():
-        if row['status'] not in (0, 1):
+    tids = set()
+    collection_stamp = None
+    for name, rows in arrays['pid'].items():
+        if any(not integer(row['status']) or row['status'] not in (0, 1) or
+               not integer(row['first']) or row['first'] < 0 for row in rows):
             raise ValueError('PDH ID Process unavailable; ownership cannot be determined')
-        if row['first'] != pid:
+        for row in rows:
+            stamp = row['timestamp_100ns']
+            if not integer(stamp) or stamp <= 0:
+                raise ValueError('invalid PDH collection timestamp')
+            if collection_stamp is not None and stamp != collection_stamp:
+                raise ValueError('PDH collection timestamps differ')
+            collection_stamp = stamp
+        if all(row['first'] != pid for row in rows):
             continue
-        fields = [arrays[key].get(name) for key in PDH_PATHS]
-        if any(item is None or item['status'] not in (0, 1) for item in fields):
+        if len(rows) != 1:
+            raise ValueError('duplicate owned PDH instance name; identity ambiguous')
+        fields = {key: arrays[key][name][0] for key in PDH_PATHS}
+        if any(not integer(item['status']) or item['status'] not in (0, 1)
+               for item in fields.values()):
             raise ValueError('owned PDH counter missing or invalid')
-        identity = (arrays['tid'][name]['first'], arrays['birth'][name]['first'])
-        if identity in result or identity[0] <= 0:
+        if any(not integer(item['timestamp_100ns']) or
+               item['timestamp_100ns'] != collection_stamp for item in fields.values()):
+            raise ValueError('owned PDH counter timestamps differ')
+        tid, birth = fields['tid']['first'], fields['birth']['first']
+        if (not integer(tid) or not integer(birth) or tid <= 0 or birth <= 0 or
+                tid in tids):
             raise ValueError('invalid or duplicate PDH thread identity')
-        result[identity] = arrays['switches'][name]
+        switches = fields['switches']
+        if not integer(switches['first']) or switches['first'] < 0:
+            raise ValueError('invalid owned PDH switch count')
+        tids.add(tid)
+        result[(pid, tid, birth)] = switches
     if not result:
         raise ValueError('no PDH thread counters for owned PID')
     return result

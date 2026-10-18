@@ -2641,6 +2641,115 @@ class GtkMetricCoverageTests(unittest.TestCase):
 
 
 class P7C7Tests(unittest.TestCase):
+    def run_capture_case(self, case='ime-preedit'):
+        import gx_perf_stimulus as stimulus
+        capture = gx_perf.CaptureRun(self.instance, self.root, {'capabilities': {}, 'errors': []})
+        self.capture = capture
+        args = SimpleNamespace(case=case, tabs=1, state='visible', seconds=0)
+        shells = mock.Mock()
+        shells.python_identity = dict(executable='python.exe', executable_sha256='a' * 64,
+                                      launcher='launcher.exe', launcher_sha256='b' * 64)
+        shells.identities = {42: 123}
+        shells.rows.side_effect = lambda: ([{'event': 'input', 'pid': 42, 'text': c} for c in '你好']
+                                          if mock.call('space') in self.instance.press.call_args_list else [])
+        before = {'pid': 42, 'birth': 123, 'kernel_100ns': 0, 'user_100ns': 0,
+                  'begin_ns': 0, 'end_ns': 1, 'threads': []}
+        counters = mock.Mock()
+        counters.sample.side_effect = [before, {**before, 'begin_ns': 1_000_000_001}]
+        with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
+                mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
+                mock.patch.object(gx_perf.time, 'sleep'), \
+                mock.patch.object(stimulus, 'ime_state', return_value={'status': 'ready'}):
+            gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells,
+                               pdh_factory=mock.Mock(side_effect=stimulus.PdhFailure('add', 0xc0000bb9)))
+        return capture.report['c7']
+
+    def test_c7_ime_capture_is_target_only_with_explicit_unverified_metadata(self):
+        image = self.backdrop.capture.return_value
+        def capture(_instance, _info, method, label):
+            if label == 'ime-preedit-entry' or label.startswith('c7-after-'):
+                if method == 'screen':
+                    raise RuntimeError('covered by external IME window')
+            return image
+        self.backdrop.capture.side_effect = capture
+        evidence = self.run_capture_case()
+        shots = evidence['screenshots']
+        self.assertEqual(['screen'] * 8 + ['print'] * 9, [s['method'] for s in shots])
+        for shot in shots[8:]:
+            self.assertEqual('target-window-only', shot['capture_scope'])
+            self.assertEqual('unknown', shot['rendered_pixels'])
+        self.assertEqual('PENDING', evidence['visual_review'])
+        self.assertEqual('你好', evidence['ime']['commit_text'])
+        self.assertEqual([mock.call(k) for k in 'nihao'] + [mock.call('space')],
+                         self.instance.press.call_args_list)
+
+    def test_c7_non_ime_keeps_screen_default(self):
+        evidence = self.run_capture_case('visible')
+        self.assertEqual(['screen'] * 16, [s['method'] for s in evidence['screenshots']])
+        self.instance.press.assert_not_called()
+
+    def test_c7_screen_privacy_failure_still_stops_before_ime_input(self):
+        self.backdrop.capture.side_effect = RuntimeError('screen privacy coverage failed')
+        with self.assertRaisesRegex(RuntimeError, 'screen privacy coverage failed'):
+            self.run_capture_case()
+        self.backdrop.capture.assert_called_once_with(
+            self.instance, self.instance.require_window.return_value, 'screen', 'c7-before-1')
+        self.instance.press.assert_not_called()
+
+    def test_c7_ime_print_failure_is_fatal_without_screen_fallback(self):
+        image = self.backdrop.capture.return_value
+        def capture(_instance, _info, method, label):
+            if label == 'ime-preedit-entry':
+                self.assertEqual('print', method)
+                raise RuntimeError('PrintWindow failed')
+            return image
+        self.backdrop.capture.side_effect = capture
+        with self.assertRaisesRegex(RuntimeError, 'PrintWindow failed'):
+            self.run_capture_case()
+        self.assertEqual(9, self.backdrop.capture.call_count)
+        self.assertEqual(8, len(self.capture.report['c7']['screenshots']))
+        self.assertNotIn(mock.call('space'), self.instance.press.call_args_list)
+        self.backdrop.finish.assert_called_once()
+
+    def test_c7_ime_print_does_not_waive_foreground_or_input_guards(self):
+        for failure in ('foreground', 'input', 'ownership'):
+            with self.subTest(failure=failure):
+                self.gui.win32().foreground.return_value = 9
+                self.gui.win32().window_pid.side_effect = lambda hwnd: 42 if hwnd == 9 else 55528
+                self.instance.contains_pid.return_value = False
+                self.instance.ensure_owned.side_effect = None
+                self.instance.press.reset_mock()
+                image = self.backdrop.capture.return_value
+                def capture(_instance, _info, method, label):
+                    if label == 'ime-preedit-entry':
+                        self.assertEqual('print', method)
+                        if failure == 'foreground':
+                            self.gui.win32().foreground.return_value = 999
+                        elif failure == 'input':
+                            gx_perf.last_input_ticks.return_value = (11, 100)
+                        else:
+                            self.instance.ensure_owned.side_effect = RuntimeError('ownership lost')
+                    return image
+                self.backdrop.capture.side_effect = capture
+                with self.assertRaises((gx_perf.PerfError, RuntimeError)):
+                    self.run_capture_case()
+                self.assertFalse((self.root / 'ime-preedit-entry.png').exists())
+                self.assertEqual(8, len(self.capture.report['c7']['screenshots']))
+                self.assertNotIn(mock.call('space'), self.instance.press.call_args_list)
+
+    def test_c7_ime_guard_failure_blocks_print_before_capture(self):
+        def press(key):
+            if key == 'o':
+                self.gui.win32().window_pid.return_value = 55528
+                self.instance.contains_pid.return_value = False
+        self.instance.press.side_effect = press
+        with self.assertRaises(gx_perf.PerfError) as raised:
+            self.run_capture_case()
+        self.assertEqual('foreground_lost', raised.exception.cause)
+        self.assertEqual(8, self.backdrop.capture.call_count)
+        self.assertFalse((self.root / 'ime-preedit-entry.png').exists())
+        self.assertNotIn(mock.call('space'), self.instance.press.call_args_list)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
