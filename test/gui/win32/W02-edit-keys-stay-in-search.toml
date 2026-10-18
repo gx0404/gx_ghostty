@@ -23,7 +23,7 @@ expect = [
   "no-results: the field reads zzqx with the caution border, the counter says No results in the caution color",
   "narrow-clamp: in the narrow right pane of the 1,400 px window the bar keeps its 240 DIP minimum (360 px at 144 DPI, wider than the pane) and still shows the counter; the whole bar and close button stay inside the window",
   "narrow-closed: clicking the close button inside the window ended the search (old geometry leaves the bar open)",
-  "link-left: with Ctrl held on a row of the long URL output, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
+  "link-left: with Ctrl held on a row of the long URL output, the preview bubble at the bottom-left keeps the complete authority https://example.com immediately followed by one middle ellipsis (U+2026), and the complete /tail-end; at most 60% of the terminal wide, with no second tail ellipsis",
   "link-right: with the pointer on the URL prompt in the last row, under the bubble's place, the bubble for https://example.com/gx-r6-right/prompt shows at the bottom-right corner",
   "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
 ]
