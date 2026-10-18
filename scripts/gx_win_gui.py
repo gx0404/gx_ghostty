@@ -52,6 +52,11 @@ env, args, requires, side_effects and expect, and [[step]] tables, each an actio
   wait_terminals count [timeout window] wait_popup [cls timeout present new]
   close [timeout]                       file path [text directory readonly]  (see below)
   backdrop [color enabled reason]       switch the privacy backdrop for the following steps
+  restart [timeout env wait]            close the instance gracefully (WM_CLOSE, then wait up to timeout,
+                                        default 10 s; it is never forced) and start it again on the same
+                                        isolated profile and config, with the scenario env plus env (a
+                                        table, e.g. env = { GHOSTTY_GX_A11Y = "screen-reader" }); wait =
+                                        false skips waiting for the new main window. run.json: restarts
   simulate_d2d_failure [window]         the window's title bar acts as if Direct2D failed and falls
                                         back to the system caption (WM_USER+0x4C to that GhosttyWindow;
                                         checked with WM_GHOSTTY_CAPTION_QUERY bit 3)
@@ -147,6 +152,8 @@ DIALOG_CLASS = "#32770"
 STRIPPED_ENV = ("NO_COLOR", "TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "GHOSTTY_LOG")
 STRIPPED_ENV_PREFIXES = ("GHOSTTY_",)
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The variables isolated_environment points into the profile; neither --env nor a scenario changes them.
+ISOLATED_VARIABLES = ("LOCALAPPDATA", "APPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 
 # Appended to every scenario configuration unless it sets harness = false: no close
 # confirmation, so the harness can always close the instance it started.
@@ -1437,6 +1444,7 @@ class Instance:
     input_events: list[dict] = field(default_factory=list)
     closing: bool = False  # close() started: an ending process is expected from now on
     gone_noted: bool = False  # the unexpected end was already audited once
+    restarts: list[dict] = field(default_factory=list)  # restart steps that led to this instance
 
     def record_input(self, event: str, **data) -> None:
         row = {'schema': 'gx-input-guard-v1', 'event': event, 'time_ns': time.time_ns(),
@@ -1468,7 +1476,8 @@ class Instance:
 
     def save(self) -> None:
         data = {"pid": self.pid, "exe": self.exe, "env_dir": str(self.env_dir), "creation": self.creation,
-                "launched": self.launched, "simulated_dpi": self.simulated_dpi, "children": self.children}
+                "launched": self.launched, "simulated_dpi": self.simulated_dpi, "children": self.children,
+                "restarts": self.restarts}
         (self.env_dir / SESSION_FILE).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     @classmethod
@@ -1478,7 +1487,7 @@ class Instance:
             raise UsageError(f"no session in {env_dir}; run: gx_win_gui.py start {env_dir}")
         data = json.loads(path.read_text(encoding="utf-8"))
         return cls(data["pid"], data["exe"], Path(data["env_dir"]), data["creation"], data["launched"],
-                   data.get("simulated_dpi"), data.get("children", []))
+                   data.get("simulated_dpi"), data.get("children", []), restarts=data.get("restarts", []))
 
     # -- process ------------------------------------------------------------
 
@@ -1510,8 +1519,9 @@ class Instance:
                 if created is not None:
                     self.children.append([pid, created, name])
 
-    def close(self, timeout: float = 5.0) -> str:
-        """Close the instance: WM_CLOSE to its windows, then terminate it and its leftover child processes."""
+    def close(self, timeout: float = 5.0, *, force: bool = True) -> str:
+        """Close the instance: WM_CLOSE to its windows, then terminate it and its leftover child processes.
+        With force=False a process still running after `timeout` is left alone and GuiError raised."""
         w = win32()
         if not self.alive():
             self.note_gone(f"Ghostty 实例 {self.pid} 在关闭前已结束或进程身份已变化")
@@ -1525,6 +1535,9 @@ class Instance:
         while time.monotonic() < deadline and w.process_alive(self.pid):
             time.sleep(0.05)
         how = "closed"
+        if w.process_alive(self.pid) and not force:
+            self.closing = False
+            raise GuiError(f"ghostty pid {self.pid} did not exit within {timeout:g}s after WM_CLOSE; not forcing it")
         if w.process_alive(self.pid):
             if not self.owned():
                 raise GuiError(f"pid {self.pid} is no longer the instance this tool started; not terminating it")
@@ -2072,6 +2085,7 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "backdrop": (frozenset(), frozenset(("color", "enabled", "reason"))),
     "simulate_d2d_failure": (frozenset(), frozenset(("window",))),
     "simulate_system_theme": (frozenset(), frozenset(("scheme", "high_contrast"))),
+    "restart": (frozenset(), frozenset(("timeout", "env", "wait"))),
 }
 SCENARIO_KEYS = frozenset(("id", "title", "config", "harness", "env", "args", "requires", "side_effects", "expect",
                            "backdrop", "backdrop_reason", "step"))
@@ -2180,6 +2194,19 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
             raise UsageError(f"{where}: file readonly must be true or false")
         if "text" in params and not isinstance(params["text"], str):
             raise UsageError(f"{where}: file text must be a string")
+    if action == "restart":
+        env = params.get("env", {})
+        if not isinstance(env, dict) or not all(isinstance(name, str) and ENV_NAME_RE.match(name)
+                                                and isinstance(value, str) for name, value in env.items()):
+            raise UsageError(f"{where}: restart env must map variable names to strings")
+        isolated = sorted(name for name in env if name.upper() in ISOLATED_VARIABLES)
+        if isolated:
+            raise UsageError(f"{where}: restart env cannot change the isolated paths: {', '.join(isolated)}")
+        if "wait" in params and not isinstance(params["wait"], bool):
+            raise UsageError(f"{where}: restart wait must be true or false")
+        timeout = params.get("timeout", 10)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
+            raise UsageError(f"{where}: restart timeout must be a number of seconds in (0, 120]")
     if action == "simulate_system_theme":
         try:
             system_theme_wparam(params.get("scheme", "follow"), params.get("high_contrast", "follow"))
@@ -2297,6 +2324,7 @@ class ScenarioRun:
         self.backdrop = (Backdrop(scenario.backdrop, scenario.backdrop_reason) if scenario is not None
                          else Backdrop(None, "no scenario"))
         self.readonly = ReadOnlyPaths()
+        self.restarts: list[dict[str, Any]] = []
 
     # -- addressing -----------------------------------------------------------
 
@@ -2565,6 +2593,30 @@ class ScenarioRun:
     def do_close(self, p):
         return self.gui.close(float(p.get("timeout", 5)))
 
+    def do_restart(self, p):
+        if self.held_buttons:
+            raise GuiError(f"release the held mouse buttons ({', '.join(self.held_buttons)}) before a restart")
+        old = self.gui
+        began = time.monotonic()
+        closed = old.close(float(p.get("timeout", 10)), force=False)
+        if closed != "closed":
+            raise GuiError(f"ghostty pid {old.pid} was not running any more ({closed}); nothing to restart")
+        overrides = dict(p.get("env", {}))
+        new = launch(self.exe, old.env_dir, config=None, env={**self.scenario.env, **overrides}, args=self.scenario.args)
+        record: dict[str, Any] = {"old_pid": old.pid, "old_creation_filetime_100ns": str(old.creation),
+                                  "closed": closed, "close_seconds": round(time.monotonic() - began, 3),
+                                  "new_pid": new.pid, "new_creation_filetime_100ns": str(new.creation),
+                                  "env_overrides": overrides, "same_profile": str(old.env_dir)}
+        self.restarts.append(record)
+        new.restarts = [*old.restarts, record]
+        self.instance = new
+        if p.get("wait", True):
+            record["startup_ms"] = new.wait_window(20)
+            new.activate()
+            self.backdrop.ensure(new)
+        return (f"pid {old.pid} {closed}; restarted as pid {new.pid}"
+                + (f" with {', '.join(f'{name}={value}' for name, value in overrides.items())}" if overrides else ""))
+
     def do_file(self, p):
         root = self.gui.env_dir.resolve()
         path = (root / p["path"]).resolve()
@@ -2662,6 +2714,8 @@ class ScenarioRun:
         report["seconds"] = round(time.monotonic() - started, 2)
         report["steps"] = self.results
         report["captures"] = self.captures
+        if self.restarts:
+            report["restarts"] = self.restarts
         return report
 
     def capture_failure(self) -> None:

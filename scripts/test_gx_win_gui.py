@@ -453,6 +453,18 @@ class FakeWin32:
     def current_user_sid(self):
         return "S-1-5-21-1"
 
+    def PostMessageW(self, hwnd, message, wparam, lparam):
+        self.messages.append((hwnd, message, wparam, lparam))
+        return True
+
+    def terminate(self, pid):
+        self.terminated = [*getattr(self, "terminated", []), pid]
+        self.alive = False
+        return True
+
+    def child_processes(self, pid):
+        return []
+
     def send_message(self, hwnd, message, wparam=0, lparam=0, timeout_ms=5000):
         self.messages.append((hwnd, message, wparam, lparam))
         answer = self.answers.get(message)
@@ -948,6 +960,114 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(["/deny", "close", "/remove:d"], [entry if entry == "close" else entry[1] for entry in log])
         self.assertEqual(["state is writable again (acl)"], report["readonly"]["released_at_end"])
         self.assertEqual(["readonly", "writable"], [event["event"] for event in report["readonly"]["events"]])
+
+
+class RestartTests(unittest.TestCase):
+    BODY = ('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\nbackdrop_reason = "mock"\n'
+            'args = ["--x"]\n[env]\nGHOSTTY_GX_OPENGL = "software"\nKEEP = "1"\n')
+
+    def scenario(self, tmp: str, steps: str = '[[step]]\naction = "capture"\nname = "x"\n'):
+        path = Path(tmp) / "W90-restart.toml"
+        path.write_text(self.BODY + steps, encoding="utf-8")
+        return gui.load_scenario(path)
+
+    def test_validation(self):
+        ok = gui.validate_step("s", {"action": "restart", "timeout": 30, "wait": False,
+                                     "env": {"GHOSTTY_GX_A11Y": "screen-reader"}})
+        self.assertEqual("restart", ok.action)
+        cases = {"map variable names to strings": {"env": {"A": 1}},
+                 "cannot change the isolated paths: LocalAppData": {"env": {"LocalAppData": "C:/x"}},
+                 "wait must be true or false": {"wait": "no"},
+                 "timeout must be a number": {"timeout": 0}}
+        for expected, raw in cases.items():
+            with self.subTest(case=expected), self.assertRaisesRegex(gui.UsageError, expected):
+                gui.validate_step("s", {"action": "restart", **raw})
+        with self.assertRaisesRegex(gui.UsageError, "timeout must be a number"):
+            gui.validate_step("s", {"action": "restart", "timeout": 121})
+
+    def test_close_without_force_never_terminates(self):
+        fake = FakeWin32(4242, 4242)
+        instance = gui.Instance(4242, "C:/g/ghostty.exe", Path("E:/ev/env"), creation=1, launched=0)
+        with mock.patch.object(gui, "win32", return_value=fake), mock.patch.object(gui.time, "sleep"):
+            with self.assertRaisesRegex(gui.GuiError, "did not exit within 0s after WM_CLOSE; not forcing it"):
+                instance.close(0, force=False)
+            self.assertFalse(instance.closing)
+            self.assertFalse(hasattr(fake, "terminated"))
+            self.assertEqual("terminated", instance.close(0))
+        self.assertEqual([4242], fake.terminated)
+
+    def test_restart_starts_the_same_profile_again_with_the_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario = self.scenario(tmp)
+            run = gui.ScenarioRun(scenario, Path("ghostty.exe"), Path(tmp))
+            old = mock.Mock(spec=gui.Instance)
+            old.pid, old.creation, old.env_dir, old.restarts = 100, 7, Path(tmp) / "env", []
+            old.close.return_value = "closed"
+            new = mock.Mock(spec=gui.Instance)
+            new.pid, new.creation = 200, 9
+            new.wait_window.return_value = {"shown_ms": 321.0}
+            run.instance = old
+            with mock.patch.object(gui, "launch", return_value=new) as launched:
+                detail = run.do_restart({"timeout": 15, "env": {"GHOSTTY_GX_A11Y": "screen-reader"}})
+            self.assertEqual("pid 100 closed; restarted as pid 200 with GHOSTTY_GX_A11Y=screen-reader", detail)
+            old.close.assert_called_once_with(15.0, force=False)
+            launched.assert_called_once_with(Path("ghostty.exe"), Path(tmp) / "env", config=None,
+                                             env={"GHOSTTY_GX_OPENGL": "software", "KEEP": "1",
+                                                  "GHOSTTY_GX_A11Y": "screen-reader"}, args=["--x"])
+            new.wait_window.assert_called_once_with(20)
+            new.activate.assert_called_once_with()
+            self.assertIs(new, run.instance)
+            record = run.restarts[0]
+            self.assertEqual((100, "7", "closed", 200, "9", {"GHOSTTY_GX_A11Y": "screen-reader"}, {"shown_ms": 321.0}),
+                             (record["old_pid"], record["old_creation_filetime_100ns"], record["closed"],
+                              record["new_pid"], record["new_creation_filetime_100ns"], record["env_overrides"],
+                              record["startup_ms"]))
+            self.assertEqual([record], new.restarts)
+
+    def test_restart_refuses_held_buttons_a_gone_instance_and_a_close_that_hangs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = gui.ScenarioRun(self.scenario(tmp), Path("ghostty.exe"), Path(tmp))
+            run.instance = mock.Mock(spec=gui.Instance)
+            run.held_buttons = ["left"]
+            with self.assertRaisesRegex(gui.GuiError, r"held mouse buttons \(left\)"):
+                run.do_restart({})
+            run.instance.close.assert_not_called()
+            run.held_buttons = []
+            run.instance.pid = 100
+            run.instance.close.return_value = "not running"
+            with mock.patch.object(gui, "launch") as launched:
+                with self.assertRaisesRegex(gui.GuiError, "was not running any more"):
+                    run.do_restart({})
+                run.instance.close.side_effect = gui.GuiError("did not exit within 10s after WM_CLOSE; not forcing it")
+                with self.assertRaisesRegex(gui.GuiError, "not forcing it"):
+                    run.do_restart({})
+                launched.assert_not_called()
+            self.assertEqual([], run.restarts)
+
+    def test_restarts_reach_run_json_and_the_session_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario = self.scenario(tmp, '[[step]]\naction = "restart"\nwait = false\n'
+                                          '[[step]]\naction = "capture"\nname = "x"\n')
+            run = gui.ScenarioRun(scenario, Path("ghostty.exe"), Path(tmp) / "out")
+            old, new = mock.Mock(), mock.Mock()
+            for instance, pid in ((old, 100), (new, 200)):
+                instance.pid, instance.creation, instance.restarts = pid, pid, []
+                instance.env_dir = Path(tmp) / "out" / "env"
+                instance.log = Path(tmp) / "absent.log"
+                instance.popups.return_value = []
+                instance.capture_window.return_value.save_png.side_effect = lambda target: target
+            old.close.return_value = "closed"
+            with mock.patch.object(gui, "launch", side_effect=[old, new]), \
+                    mock.patch.object(gui, "win32", return_value=FakeWin32(4242, 4242)), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                report = run.run()
+            self.assertEqual("ok", report["status"])
+            self.assertEqual([(100, 200)], [(item["old_pid"], item["new_pid"]) for item in report["restarts"]])
+            self.assertNotIn("startup_ms", report["restarts"][0])
+            new.close.assert_called_once_with()
+            saved = gui.Instance(200, "C:/g/ghostty.exe", Path(tmp), creation=1, launched=0, restarts=report["restarts"])
+            saved.save()
+            self.assertEqual(report["restarts"], gui.Instance.load(Path(tmp)).restarts)
 
 
 class ScenarioReleaseTests(unittest.TestCase):
