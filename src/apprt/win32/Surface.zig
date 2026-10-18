@@ -507,7 +507,13 @@ pub fn deinit(self: *Surface) void {
     self.ui_reference = .{};
     self.ui_attachment = .{};
     self.core_surface_ready = false;
-    if (self.hwnd) |hwnd| _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+    if (self.hwnd) |hwnd| {
+        // D-29: what UIA clients hold of this terminal becomes inert now. Its
+        // WM_DESTROY no longer reaches surfaceWndProc once the userdata is
+        // cleared, and the OLE reaper may defer the destruction itself.
+        self.app.uia_terminals.forget(hwnd);
+        _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+    }
     self.revokeDropTarget();
     self.stopBellBorder();
     self.setScrollbarOwnerVisible(false);
@@ -651,6 +657,9 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     self.ui_attachment.setVisible(&self.app.ui_ids, self.ui_reference, self.parent_window.ui_reference, state.popups and self.core_surface_ready) catch |err| {
         log.warn("cannot publish surface view err={}", .{err});
     };
+    // D-29: the UIA elements of a hidden terminal are inert at once; shown
+    // again (a new attachment) it publishes new ones.
+    if (self.hwnd) |hwnd| self.app.uia_terminals.sync(hwnd, self.ui_attachment);
     self.queueDropTarget();
     if (self.parent_window.closing) self.bell_border_state.stop();
     if (self.parent_window.is_quick_terminal and !state.popups) self.bell_border_state.clear();
@@ -3178,6 +3187,8 @@ pub fn onReparented(self: *Surface, window: *Window, attachment: ui_ref.Attachme
     std.debug.assert(attachment.owner.matches(window.ui_reference));
     self.revokeDropTarget();
     self.ui_attachment = attachment;
+    // D-29: what UIA clients hold of the old attachment is inert at once.
+    if (self.hwnd) |hwnd| self.app.uia_terminals.sync(hwnd, attachment);
     if (self.parent_window == window) return;
     self.bell_border_snapshot.store(0, .release);
     if (self.core_surface_initialized) self.parent_window.toast.hideForSurface(self.core_surface.id);

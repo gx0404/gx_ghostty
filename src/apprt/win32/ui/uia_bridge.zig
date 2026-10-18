@@ -222,7 +222,8 @@ const ga_root: u32 = 2;
 
 /// One terminal HWND's provider (`terminalRoot`). A new title or language
 /// refreshes it without revoking the elements clients hold; a new attachment
-/// (the pane moved to another window) or `hide` revokes them.
+/// (the pane moved to another window, or hidden and shown again) or `hide`
+/// revokes them, as soon as the Surface changes it (`TerminalRegistry.sync`).
 pub const TerminalBridge = struct {
     publisher: uia.Publisher = .{},
     attachment: ?refs.Attachment = null,
@@ -256,7 +257,8 @@ pub const TerminalBridge = struct {
 
 /// GUI-thread registry of the local terminal HWNDs UIA asked for (a
 /// RemotePane keeps its own, `uia_remote.Bridge`). An entry lives until its
-/// HWND is destroyed (`forget`) or the App's teardown (`deinit`).
+/// Surface lets the HWND go (`forget`: `Surface.deinit`, or the WM_DESTROY
+/// of a parent destroyed first) or the App's teardown (`deinit`).
 pub const TerminalRegistry = struct {
     entries: std.ArrayList(Entry) = .empty,
     /// Whether a terminal window still has the focus when its queued focus
@@ -293,7 +295,23 @@ pub const TerminalRegistry = struct {
         item.bridge.publish(api, queue, pane, hwnd) catch return;
         _ = item.bridge.publisher.queueHostFocus();
     }
-    /// WM_DESTROY of a terminal HWND: what UIA clients hold becomes inert.
+    /// The Surface changed the attachment of its HWND `hwnd` (hidden: none;
+    /// shown again or moved: a new one): what UIA clients hold of another
+    /// attachment becomes inert now, not at the next WM_GETOBJECT, and that
+    /// one publishes anew. The unchanged attachment of every layout pass
+    /// revokes nothing. Only atomics and reference counts are touched: no
+    /// COM call, nothing that pumps messages.
+    pub fn sync(self: *TerminalRegistry, hwnd: w32.HWND, attachment: refs.Attachment) void {
+        for (self.entries.items) |*item| if (item.hwnd == hwnd) {
+            const published = item.bridge.attachment orelse return;
+            if (!published.matches(attachment)) item.bridge.hide();
+            return;
+        };
+    }
+    /// The Surface lets its HWND go (`Surface.deinit`, before it clears the
+    /// HWND's userdata, so that its WM_DESTROY no longer reaches
+    /// `surfaceWndProc`), or the HWND is destroyed with its parent first:
+    /// what UIA clients hold becomes inert and the entry is removed.
     pub fn forget(self: *TerminalRegistry, hwnd: w32.HWND) void {
         for (self.entries.items, 0..) |*item, index| if (item.hwnd == hwnd) {
             item.bridge.hide();
@@ -348,18 +366,10 @@ test "UIA bridge translates client pixels and keeps offscreen rectangles empty" 
     try std.testing.expectEqual(@as(f64, 0), screenRect(.{ .left = 20, .top = 0, .right = 10, .bottom = 0 }).width);
 }
 
-test "terminal provider keeps held elements across a title change and revokes them on a move" {
-    // The real TerminalBridge over a real local pane adapter. No HWND,
-    // desktop or UIAutomationCore is used: providers are called directly.
-    const testing = std.testing;
+/// Tests: a terminal provider face's own IRawElementProviderSimple methods,
+/// called directly (no UIAutomationCore).
+const TerminalProbe = struct {
     const Surface = @import("../Surface.zig");
-    var api: uia.Api = undefined;
-    api.count = .init(1);
-    api.event = null;
-    api.notification = null;
-    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
-    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
-    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
     const Simple = extern struct {
         QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
         AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
@@ -368,29 +378,52 @@ test "terminal provider keeps held elements across a title change and revokes th
         GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
         GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
     };
-    const Probe = struct {
-        extern "oleaut32" fn SysFreeString(?[*:0]u16) callconv(.winapi) void;
-        fn table(face: *uia.Face) *const Simple {
-            return @ptrCast(@alignCast(face.vtable));
-        }
-        /// ProviderOptions: S_OK while usable, UIA_E_ELEMENTNOTAVAILABLE once revoked.
-        fn options(face: *uia.Face) i32 {
-            var flags: u32 = 0;
-            return table(face).ProviderOptions(face, &flags);
-        }
-        fn name(face: *uia.Face, buffer: []u8) ![]const u8 {
-            var value: uia.Variant = .{};
-            try testing.expectEqual(@as(i32, 0), table(face).GetPropertyValue(face, 30005, &value));
-            const text: [*:0]u16 = @ptrCast(@alignCast(value.data.pointer.?));
-            defer SysFreeString(text);
-            return buffer[0..try std.unicode.utf16LeToUtf8(buffer, std.mem.span(text))];
-        }
-        fn setTitle(surface: *Surface, title: []const u8) void {
-            @memcpy(surface.title[0..title.len], title);
-            surface.title[title.len] = 0;
-            surface.title_len = title.len;
-        }
-    };
+    const unavailable: i32 = @bitCast(@as(u32, 0x80040201));
+    extern "oleaut32" fn SysFreeString(?[*:0]u16) callconv(.winapi) void;
+    fn table(face: *uia.Face) *const Simple {
+        return @ptrCast(@alignCast(face.vtable));
+    }
+    /// ProviderOptions: S_OK while usable, UIA_E_ELEMENTNOTAVAILABLE once revoked.
+    fn options(face: *uia.Face) i32 {
+        var flags: u32 = 0;
+        return table(face).ProviderOptions(face, &flags);
+    }
+    /// The current snapshot's root face, held (AddRef) like a client's element.
+    fn hold(bridge: *const TerminalBridge) *uia.Face {
+        const face = &bridge.publisher.current.?.nodes[0].faces[0];
+        _ = table(face).AddRef(face);
+        return face;
+    }
+    fn drop(face: *uia.Face) void {
+        _ = table(face).Release(face);
+    }
+    fn name(face: *uia.Face, buffer: []u8) ![]const u8 {
+        var value: uia.Variant = .{};
+        try std.testing.expectEqual(@as(i32, 0), table(face).GetPropertyValue(face, 30005, &value));
+        const text: [*:0]u16 = @ptrCast(@alignCast(value.data.pointer.?));
+        defer SysFreeString(text);
+        return buffer[0..try std.unicode.utf16LeToUtf8(buffer, std.mem.span(text))];
+    }
+    fn setTitle(surface: *Surface, title: []const u8) void {
+        @memcpy(surface.title[0..title.len], title);
+        surface.title[title.len] = 0;
+        surface.title_len = title.len;
+    }
+};
+
+test "terminal provider keeps held elements across a title change and revokes them on a move" {
+    // The real TerminalBridge over a real local pane adapter. No HWND,
+    // desktop or UIAutomationCore is used: providers are called directly.
+    const testing = std.testing;
+    const Surface = TerminalProbe.Surface;
+    const Probe = TerminalProbe;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
     var issuer = try refs.Issuer.init(7);
     const first_window = try issuer.create(.window);
     const second_window = try issuer.create(.window);
@@ -422,6 +455,68 @@ test "terminal provider keeps held elements across a title change and revokes th
     try bridge.publish(&api, &queue, Pane.fromLocal(&surface), hwnd);
     try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), Probe.options(held));
     try testing.expectEqual(@as(i32, 0), Probe.options(&bridge.publisher.current.?.nodes[0].faces[0]));
+}
+
+test "terminal registry revokes a hidden or moved terminal at once and forgets a closed one" {
+    // Review round 4 (severe 1): the registry does not wait for the next
+    // WM_GETOBJECT. The Surface's attachment change (none while hidden, a new
+    // one shown again or moved) revokes what clients hold of the old one at
+    // once; the unchanged attachment of each layout pass and another
+    // terminal's change revoke nothing; a closed terminal is forgotten.
+    // App.test "D-29 a terminal's UIA elements become inert ..." runs the
+    // same through the real Surface and a real UIA client.
+    const testing = std.testing;
+    const Probe = TerminalProbe;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = null;
+    api.notification = null;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    var issuer = try refs.Issuer.init(9);
+    const window = try issuer.create(.window);
+    const other_window = try issuer.create(.window);
+    var surface: Probe.Surface = .{ .app = undefined, .parent_window = undefined, .ui_reference = try issuer.surface(3) };
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, window);
+    Probe.setTitle(&surface, "registry");
+    const hwnd: w32.HWND = @ptrFromInt(0x50);
+    var registry: TerminalRegistry = .{};
+    defer registry.deinit();
+    const pane = Pane.fromLocal(&surface);
+
+    try (try registry.entry(hwnd)).bridge.publish(&api, &queue, pane, hwnd);
+    const shown = Probe.hold(&(try registry.entry(hwnd)).bridge);
+    defer Probe.drop(shown);
+    // Every layout pass shows the pane again with the same attachment, and
+    // another terminal hides: nothing of this one is revoked.
+    registry.sync(hwnd, surface.ui_attachment);
+    registry.sync(@ptrFromInt(0x51), .{});
+    try testing.expectEqual(@as(i32, 0), Probe.options(shown));
+    // Hidden: inert at once.
+    surface.ui_attachment = .{};
+    registry.sync(hwnd, surface.ui_attachment);
+    try testing.expectEqual(Probe.unavailable, Probe.options(shown));
+
+    // Shown again: a new attachment publishes anew; then moved: inert.
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, window);
+    registry.sync(hwnd, surface.ui_attachment);
+    try (try registry.entry(hwnd)).bridge.publish(&api, &queue, pane, hwnd);
+    const again = Probe.hold(&(try registry.entry(hwnd)).bridge);
+    defer Probe.drop(again);
+    try testing.expectEqual(@as(i32, 0), Probe.options(again));
+    surface.ui_attachment = try issuer.attach(surface.ui_reference, other_window);
+    registry.sync(hwnd, surface.ui_attachment);
+    try testing.expectEqual(Probe.unavailable, Probe.options(again));
+
+    // Closed: inert, and no entry is left.
+    try (try registry.entry(hwnd)).bridge.publish(&api, &queue, pane, hwnd);
+    const moved = Probe.hold(&(try registry.entry(hwnd)).bridge);
+    defer Probe.drop(moved);
+    try testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    registry.forget(hwnd);
+    try testing.expectEqual(Probe.unavailable, Probe.options(moved));
+    try testing.expectEqual(@as(usize, 0), registry.entries.items.len);
 }
 
 pub const PopupCallbacks = struct {

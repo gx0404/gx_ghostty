@@ -4308,7 +4308,9 @@ fn surfaceWndProc(
             // parent Window destruction). Clear state so deinit()
             // doesn't double-destroy. Lifecycle is managed by Window.
             _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
-            // D-29: the UIA elements of this terminal become inert.
+            // D-29: the UIA elements of this terminal become inert. Only a
+            // parent destroyed first gets here: Surface.deinit forgets the
+            // terminal itself before it clears the userdata.
             surface.app.uia_terminals.forget(hwnd);
             surface.hwnd = null;
             surface.core_surface_ready = false;
@@ -5141,6 +5143,166 @@ test "D-29 a terminal HWND that gets the keyboard focus raises its focus event f
                 const want = try std.fmt.bufPrint(&wanted, "|{s}@0x{x} (parent 0x{x})", .{ probe.expected(), @intFromPtr(child) & 0xffffffff, @intFromPtr(parent) & 0xffffffff });
                 try testing.expectEqualStrings(want, probe.watch.senders(&senders));
             }
+        }
+    };
+    var result: ?anyerror = null;
+    const worker = try std.Thread.spawn(.{}, Gui.run, .{&result});
+    worker.join();
+    if (result) |err| return err;
+}
+
+test "D-29 a terminal's UIA elements become inert when the Surface hides, moves or closes it" {
+    // Review round 4 (severe 1): the real Surface lifecycle, not a bare
+    // DestroyWindow. A UIA client holds the terminal's element while the GUI
+    // thread hides the pane (Surface.setVisible), moves it to another window
+    // (Surface.onReparented) and closes it (Surface.deinit, which clears the
+    // HWND's userdata first: its WM_DESTROY never reaches surfaceWndProc).
+    // Each time what the client holds must be unavailable at once, not at the
+    // next WM_GETOBJECT, and the closed terminal leaves no registry entry.
+    // Windows live on a worker GUI thread; the runner's queue is untouched.
+    const UiaClient = @import("ui/uia_client.zig");
+    const Probe = struct {
+        child: w32.HWND,
+        stage: std.atomic.Value(u32) = .init(0),
+        failure: ?anyerror = null,
+        /// The Name of each element taken (shown, shown again, moved), then
+        /// the HRESULT of reading it once more after the next transition.
+        names: [3][128]u8 = undefined,
+        name_lens: [3]usize = .{ 0, 0, 0 },
+        after: [3]i32 = .{ 0, 0, 0 },
+        const done: u32 = 9;
+
+        fn client(self: *@This()) void {
+            self.run() catch |err| {
+                self.failure = err;
+            };
+            self.stage.store(done, .release);
+        }
+        fn waitFor(self: *@This(), value: u32) void {
+            while (self.stage.load(.acquire) < value) w32.Sleep(1);
+        }
+        fn take(self: *@This(), automation: UiaClient.Client, index: usize) !UiaClient.Element {
+            const element = try automation.fromHandle(self.child);
+            errdefer element.release();
+            self.name_lens[index] = (try element.string(30005, &self.names[index])).len;
+            return element;
+        }
+        fn run(self: *@This()) !void {
+            const automation = try UiaClient.Client.init();
+            defer automation.deinit();
+            const shown = try self.take(automation, 0);
+            defer shown.release();
+            self.stage.store(1, .release);
+            self.waitFor(2); // Hidden.
+            self.after[0] = shown.result(30005);
+            self.stage.store(3, .release);
+            self.waitFor(4); // Shown again.
+            const again = try self.take(automation, 1);
+            defer again.release();
+            self.stage.store(5, .release);
+            self.waitFor(6); // Moved to another window.
+            self.after[1] = again.result(30005);
+            const moved = try self.take(automation, 2);
+            defer moved.release();
+            self.stage.store(7, .release);
+            self.waitFor(8); // Closed.
+            self.after[2] = moved.result(30005);
+        }
+        fn name(self: *const @This(), index: usize) []const u8 {
+            return self.names[index][0..self.name_lens[index]];
+        }
+    };
+    const Gui = struct {
+        fn run(result: *?anyerror) void {
+            check() catch |err| {
+                result.* = err;
+            };
+        }
+        /// Wait for the client to reach `value`; a timeout releases it for
+        /// good, so it never waits on a GUI thread that gave up.
+        fn step(probe: *Probe, value: u32) !void {
+            UiaClient.pumpUntil(&probe.stage, value, 10_000) catch |err| {
+                probe.stage.store(Probe.done, .release);
+                return err;
+            };
+        }
+        fn check() !void {
+            const testing = std.testing;
+            const alloc = std.heap.page_allocator;
+            var apartment = ComApartment.init();
+            defer apartment.deinit() catch {};
+            try apartment.ensureCom();
+            const api = try Uia.Api.load(alloc);
+            defer api.release();
+            const static = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+            const sink = w32.CreateWindowExW(0, static, static, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(sink);
+            const queue = try Uia.Queue.create(alloc, sink);
+            defer {
+                queue.close();
+                queue.release();
+            }
+            var config = try configpkg.Config.default(alloc);
+            defer config.deinit();
+            var core_app: CoreApp = undefined;
+            core_app.alloc = alloc;
+            var app: App = .{ .core_app = &core_app, .config = config, .hinstance = undefined, .default_command_arena = undefined, .ui_ids = try gx.ui_ref.Issuer.init(37), .uia_api = api, .uia_queue = queue };
+            defer app.uia_terminals.deinit();
+            var source: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+            var destination: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+            var surface: Surface = .{ .app = &app, .parent_window = &source, .ui_reference = try app.ui_ids.surface(37) };
+            surface.ui_attachment = try app.ui_ids.attach(surface.ui_reference, source.ui_reference);
+            const title = "GX D-29 lifecycle";
+            @memcpy(surface.title[0..title.len], title);
+            surface.title_len = title.len;
+            const hinstance = w32.GetModuleHandleW(null);
+            const class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTerminalD29LifecycleTest");
+            const terminal_class: w32.WNDCLASSEXW = .{ .cbSize = @sizeOf(w32.WNDCLASSEXW), .style = 0, .lpfnWndProc = &surfaceWndProc, .cbClsExtra = 0, .cbWndExtra = 0, .hInstance = hinstance, .hIcon = null, .hCursor = null, .hbrBackground = null, .lpszMenuName = null, .lpszClassName = class, .hIconSm = null };
+            if (w32.RegisterClassExW(&terminal_class) == 0) return error.TestWindowFailed;
+            defer _ = w32.UnregisterClassW(class, hinstance);
+            const parent = w32.CreateWindowExW(0, static, static, 0, 0, 0, 320, 200, null, null, null, null) orelse return error.TestWindowFailed;
+            defer _ = w32.DestroyWindow(parent);
+            const child = w32.CreateWindowExW(0, class, class, w32.WS_CHILD, 0, 0, 320, 200, parent, null, hinstance, null) orelse return error.TestWindowFailed;
+            defer if (w32.IsWindow(child) != 0) {
+                _ = w32.DestroyWindow(child);
+            };
+            surface.hwnd = child;
+            _ = w32.SetWindowLongPtrW(child, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&surface)));
+
+            const probe = try alloc.create(Probe);
+            probe.* = .{ .child = child };
+            const thread = try std.Thread.spawn(.{}, Probe.client, .{probe});
+            var joined = false;
+            // After a timeout the client may still be inside UIA: it keeps its
+            // probe (leaked, never dangling) instead of a join that hangs.
+            errdefer if (!joined) thread.detach();
+            defer if (joined) alloc.destroy(probe);
+            try step(probe, 1);
+            // Hidden, as a tab switch hides its panes: no attachment.
+            surface.setVisible(false);
+            probe.stage.store(2, .release);
+            try step(probe, 3);
+            // Shown again (a fresh attachment in the same window).
+            surface.onReparented(&source, try surface.prepareReparent(&source));
+            probe.stage.store(4, .release);
+            try step(probe, 5);
+            surface.onReparented(&destination, try surface.prepareReparent(&destination));
+            probe.stage.store(6, .release);
+            try step(probe, 7);
+            surface.deinit();
+            const entries = app.uia_terminals.entries.items.len;
+            const destroyed = w32.IsWindow(child) == 0;
+            probe.stage.store(8, .release);
+            try step(probe, Probe.done);
+            thread.join();
+            joined = true;
+            if (probe.failure) |err| return err;
+            for (0..3) |index| try testing.expectEqualStrings(title, probe.name(index));
+            try testing.expectEqual(UiaClient.element_not_available, probe.after[0]);
+            try testing.expectEqual(UiaClient.element_not_available, probe.after[1]);
+            try testing.expectEqual(UiaClient.element_not_available, probe.after[2]);
+            try testing.expectEqual(@as(usize, 0), entries);
+            try testing.expect(destroyed);
         }
     };
     var result: ?anyerror = null;
