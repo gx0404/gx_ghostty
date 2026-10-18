@@ -18,8 +18,8 @@ expect = [
   "f3: F3 pressed while the terminal has the focus moved the current match forward; shift-f3: Shift+F3 moved it back",
   "no-results: the field reads zzqx with the caution border, the counter says No results in the caution color",
   "narrow-clamp: in the narrow right pane of the 1,400 px window the bar keeps its 240 DIP minimum (360 px at 144 DPI, wider than the pane) and still shows the counter",
-  "link-left: with Ctrl held on the long URL typed at the prompt, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
-  "link-right: with the pointer on the URL's bottom row, under the bubble's place, the bubble moved to the bottom-right corner",
+  "link-left: with Ctrl held on a row of the long URL output, the preview bubble at the bottom-left of the terminal keeps https://example.com/ and the end of the URL with an ellipsis in the middle, at most 60% of the terminal wide",
+  "link-right: with the pointer on the URL prompt in the last row, under the bubble's place, the bubble for https://example.com/gx-r6-right/prompt shows at the bottom-right corner",
   "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
 ]
 
@@ -327,8 +327,9 @@ count = 1
 action = "sleep"
 seconds = 0.5
 
-# A long URL typed on cmd's command line (not run) fills the last rows of the terminal, so its last
-# row lies under the preview bubble's place: blank lines push the prompt to the bottom first.
+# The link preview. Output soft-wraps, so every row of a long URL printed by a program is part of
+# the link; a command line echoed by ConPTY does not (its rows are separate lines), so the URLs come
+# from output and from the prompt text. Blank lines push the prompt to the bottom first.
 [[step]]
 action = "type"
 text = "cls\n"
@@ -343,21 +344,21 @@ seconds = 1.0
 
 [[step]]
 action = "type"
-text = "https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end"
+text = "<nul set /p =https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end\n"
 
 [[step]]
 action = "sleep"
 seconds = 1.0
 
 # The core reports a hovered link only while Ctrl is down. Held presses keep the bubble up, and
-# it stays 250 ms after the last release (the leave delay): long enough for the capture. Rows are
-# 21 DIPs; the bubble takes the bottom 34 DIPs (28 high, 6 margin). 42 DIPs up is the URL's row
-# above the bubble's place.
+# it stays 250 ms after the last release (the leave delay): long enough for the capture. 50 DIPs
+# above the terminal's bottom is a row of the URL output (the prompt is the last row), above the
+# bubble's place (the bottom 34 DIPs).
 [[step]]
 action = "move"
 in = "terminal:0"
 x = 60
-y = -42
+y = -50
 
 [[step]]
 action = "key"
@@ -374,12 +375,20 @@ what = "all"
 action = "sleep"
 seconds = 0.8
 
-# On the bottom row the pointer is over the URL and over the bubble's place: it moves right.
+# A prompt that is a short URL puts a link on the last row, under the bubble's place.
+[[step]]
+action = "type"
+text = "prompt https://example.com/gx-r6-right/prompt$G$S\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
 [[step]]
 action = "move"
 in = "terminal:0"
 x = 8
-y = -20
+y = -12
 
 [[step]]
 action = "key"
