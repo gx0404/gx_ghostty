@@ -109,6 +109,28 @@ class ExplorerDrag:
         api.send(events)
 
 
+def explorer_drag_start(nodes, index, window):
+    """Physical point where the owned Explorer drag begins: the center of the
+    item's name cell (Details view: a descendant with automation id
+    System.ItemNameDisplay), else of the item itself, clipped to the owned
+    window rectangle. A details row can be wider than the window; its center
+    then lies over another window (round3-batch-20261018-105235 pressed on the
+    target terminal and selected text instead of starting an OLE drag)."""
+    item = nodes[index]
+    rect = item["bounds"]
+    for node in nodes[index + 1:]:
+        if node["depth"] <= item["depth"]:
+            break
+        if node.get("automation_id") == "System.ItemNameDisplay" and node.get("bounds") and node["bounds"][2] > 0:
+            rect = node["bounds"]
+            break
+    left, top = max(rect[0], window[0]), max(rect[1], window[1])
+    right, bottom = min(rect[0] + rect[2], window[2]), min(rect[1] + rect[3], window[3])
+    if right - left < 2 or bottom - top < 2:
+        raise gui.InputBlocked(f"Explorer source item {rect} is not inside the owned window {window}")
+    return round((left + right) / 2), round((top + bottom) / 2)
+
+
 def explorer(fixture, instance, native):
     directory = fixture.out / "Explorer-private-source"
     directory.mkdir()
@@ -147,15 +169,19 @@ def explorer(fixture, instance, native):
         nodes = json.loads(result.stdout)["nodes"]
         # Explorer may hide the extension. Both exact spellings identify only
         # the uniquely named file we just created, never another directory item.
-        candidates = [n for n in nodes if n["name"] in (file.name, file.stem) and n.get("bounds") and n["bounds"][2] > 0]
+        candidates = [i for i, n in enumerate(nodes) if n["name"] in (file.name, file.stem) and n.get("bounds") and n["bounds"][2] > 0]
         assert candidates, "private Explorer source item has no bounded UIA rectangle"
-        item = min(candidates, key=lambda n: n["bounds"][2] * n["bounds"][3])
-        x, y, width, height = item["bounds"]
-        start = round(x + width / 2), round(y + height / 2)
+        index = min(candidates, key=lambda i: nodes[i]["bounds"][2] * nodes[i]["bounds"][3])
+        start = explorer_drag_start(nodes, index, gui.win32().window_rect(owned))
+        # The press must land on the owned Explorer, not on the target behind it.
+        if gui.win32().GetAncestor(gui.win32().window_at(*start), 2) != owned:
+            raise gui.InputBlocked(f"drag start {start} is not on the owned Explorer window")
         tree = native.tree()
         leaf = next(n["leaf"] for n in tree["nodes"] if "leaf" in n and n["leaf"]["core"] == tree["active_core"])
         terminal = gui.win32().window_rect(leaf["hwnd"])
         end = terminal[2] - 70, terminal[1] + (terminal[3] - terminal[1]) // 2
+        if gui.win32().GetAncestor(gui.win32().window_at(*end), 2) != native.hwnd:
+            raise gui.InputBlocked(f"drop point {end} is not on the target window")
         before = native.query(200), native.query(201)
         drag.guard()
         source_rect = gui.win32().window_rect(owned)
@@ -176,7 +202,7 @@ def explorer(fixture, instance, native):
         button = False
         wait(lambda: native.query(200) == before[0] + 1 and native.query(201) == before[1] + 1)
         assert sha256(file) == original
-        fixture.check("Explorer-real-OLE-source", explorer=drag.identity, source_hwnd=owned, folder=str(directory),
+        fixture.check("Explorer-real-OLE-source", explorer=drag.identity, source_hwnd=owned, folder=str(directory), drag_start=start,
                       file_hash=original, before=before, after=(native.query(200), native.query(201)), clipboard_access=False, enter_injected=False)
         gui.win32().activate(native.hwnd)
         fixture.capture_native(instance, native, "explorer-dropped-no-enter")
