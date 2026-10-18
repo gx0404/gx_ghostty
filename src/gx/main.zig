@@ -138,4 +138,5 @@ test {
     _ = @import("renderer_recovery.zig");
     _ = @import("font_zoom.zig");
     _ = @import("environment.zig");
+    _ = @import("prompt_cursor.zig");
 }
