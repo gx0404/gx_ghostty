@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gx_perf as perf
@@ -50,7 +50,7 @@ class CaptureTests(unittest.TestCase):
                 self.capture["intervals"].append({"name": kind, "open": index,
                     "phase": "warmup" if index == 0 else "hot", "before": before, "after": after})
                 self.capture["observations"] += [
-                    {"widget": kind, "opened": opened, "live": before["live"], "nodes": [{"role": "dialog"}],
+                    {"widget": kind, "opened": opened, "complete": True, "live": before["live"], "nodes": [{"role": "dialog"}],
                      "ns": before["ns"] + offset} for opened, offset in ((True, 1), (False, 2))]
         self.save()
 
@@ -136,12 +136,42 @@ class CaptureTests(unittest.TestCase):
         states = [{"ns": i * 1_000_000_000, "live": before["live"], "windows": ["99"],
                    "shells": [{"exe": "/bin/bash", "fd0": "/dev/pts/1"}]} for i in range(1, 62)]
         self.capture["intervals"] = [{"name": "idle", "before": before, "after": after, "states": states}]
+        for state in states:
+            state["response"] = self.response(state["ns"])
+        self.capture["intervals"][0]["end_state"] = {
+            **states[-1], "ns": 61_200_000_000, "response": self.response(61_200_000_000)}
         self.save()
         self.assertEqual(self.reduce()["values"]["proc.snapshot"], 0)
         self.capture["intervals"][0]["after"]["live"] = {"pid": 101, "birth": 200}
         self.save()
         with self.assertRaisesRegex(perf.PerfError, "identity"):
             self.reduce()
+
+    @staticmethod
+    def response(ns):
+        return {"protocol": "_NET_WM_PING", "window": "99", "token": ns % 0xffffffff + 1,
+                "sent_ns": ns - 2, "received_ns": ns - 1, "deadline_ns": ns - 2 + 1_000_000_000}
+
+    def test_p2_rejects_missing_middle_late_and_missing_end_response(self):
+        self.test_p2_zero_requires_identity_and_full_duration()
+        item = self.capture["intervals"][0]
+        item["after"]["live"] = item["before"]["live"]
+        original = copy.deepcopy(item)
+        for failure in ("middle", "late", "end", "reused"):
+            with self.subTest(failure=failure):
+                item = copy.deepcopy(original)
+                if failure == "middle":
+                    item["states"][30].pop("response")
+                elif failure == "late":
+                    item["states"][30]["response"]["received_ns"] += 2_000_000_000
+                elif failure == "end":
+                    item.pop("end_state")
+                else:
+                    item["states"][30]["response"] = item["states"][29]["response"]
+                self.capture["intervals"] = [item]
+                self.save()
+                with self.assertRaisesRegex(perf.PerfError, "GUI response"):
+                    self.reduce()
 
     def test_time_count_conflict_and_negative_count(self):
         for raw in (b"info(gx_perf): proc.snapshot 1us\n", b"info(gx_perf): metric proc.snapshot -1\n",
@@ -153,6 +183,24 @@ class CaptureTests(unittest.TestCase):
         self.capture["observations"].pop()
         self.save()
         with self.assertRaisesRegex(perf.PerfError, "state observations"):
+            self.reduce()
+
+    def test_partial_last_close_rejected_and_originals_retained(self):
+        self.capture["observations"][-1]["complete"] = False
+        self.save()
+        originals = {p: p.read_bytes() for p in self.root.iterdir()}
+        with self.assertRaises(perf.PerfError):
+            self.reduce()
+        self.assertEqual(originals, {p: p.read_bytes() for p in self.root.iterdir()})
+
+    def test_p2_without_gui_response_cannot_reduce_to_zero(self):
+        self.spec["case"] = self.capture["case"] = "p2"
+        before, after = self.mark(1_000_000_000), self.mark(61_100_000_000)
+        states = [{"ns": i * 1_000_000_000, "live": before["live"], "windows": ["99"],
+                   "shells": [{"exe": "/bin/bash", "fd0": "/dev/pts/1"}]} for i in range(1, 62)]
+        self.capture["intervals"] = [{"name": "idle", "before": before, "after": after, "states": states}]
+        self.save()
+        with self.assertRaises(perf.PerfError):
             self.reduce()
 
     def test_time_metric_never_synthesizes_zero(self):
@@ -179,6 +227,125 @@ class CaptureTests(unittest.TestCase):
         self.assertFalse(gtk.log_channel(raw))
         self.assertIsNone(gtk.metric(raw, "proc.snapshot", "", self.cap, gtk.log_channel(raw)))
         self.assertEqual(gtk.metric(b"", "proc.snapshot", "", self.cap, True), [])
+
+
+class ProbeTests(unittest.TestCase):
+    def test_x11_requires_advertised_ping_and_matching_root_reply(self):
+        import ctypes as c
+        import contextlib
+        import io
+        for supported in (False, True):
+            lib = Mock()
+            lib.XOpenDisplay.return_value = 1
+            lib.XDefaultRootWindow.return_value = 10
+            lib.XInternAtom.side_effect = [20, 30]
+            atoms = (c.c_ulong * 1)(30 if supported else 40)
+            def protocols(display, window, ptr, count):
+                c.cast(ptr, c.POINTER(c.POINTER(c.c_ulong)))[0] = c.cast(atoms, c.POINTER(c.c_ulong))
+                c.cast(count, c.POINTER(c.c_int))[0] = 1
+                return 1
+            lib.XGetWMProtocols.side_effect = protocols
+            def send(display, window, propagate, mask, ptr):
+                event = c.cast(ptr, lib.XSendEvent.argtypes[-1]).contents.client
+                self.assertEqual((window, event.window, event.type, event.format), (99, 99, 33, 32))
+                self.assertEqual(list(event.data.l[:3]), [30, 8, 99])
+                return 1
+            lib.XSendEvent.side_effect = send
+            replies = [(99, 8, 99), (10, 7, 99), (10, 8, 100), (10, 8, 99)]
+            def next_event(display, ptr):
+                root, token, target = replies.pop(0)
+                event = c.cast(ptr, lib.XNextEvent.argtypes[-1]).contents.client
+                event.type, event.send_event, event.window = 33, 1, root
+                event.message_type, event.format = 20, 32
+                event.data.l[:3] = (30, token, target)
+                return 0
+            lib.XNextEvent.side_effect = next_event
+            output = io.StringIO()
+            with patch("ctypes.CDLL", return_value=lib), contextlib.redirect_stdout(output):
+                if supported:
+                    gtk.x11_ping(99, 8)
+                    self.assertEqual(json.loads(output.getvalue())["token"], 8)
+                    self.assertEqual(lib.XNextEvent.call_count, 4)
+                else:
+                    with self.assertRaisesRegex(ValueError, "advertise"):
+                        gtk.x11_ping(99, 8)
+                    lib.XSendEvent.assert_not_called()
+            lib.XCloseDisplay.assert_called_once_with(1)
+
+    def test_ping_success_timeout_wrong_reply_and_late_response(self):
+        import subprocess
+        reply = {"protocol": "_NET_WM_PING", "window": "99", "token": 8}
+        with patch("secrets.randbelow", return_value=7), patch("subprocess.run") as run:
+            run.return_value = Mock(stdout=json.dumps(reply))
+            with patch("time.monotonic_ns", side_effect=[100, 200]):
+                self.assertEqual(gtk.gui_roundtrip(99)["token"], 8)
+            self.assertEqual(run.call_args.kwargs["timeout"], 1)
+            run.side_effect = subprocess.TimeoutExpired("ping", 1)
+            with self.assertRaisesRegex(ValueError, "GUI response failed"):
+                gtk.gui_roundtrip(99)
+            run.side_effect = None
+            for changed in ({**reply, "token": 9}, {**reply, "window": "100"}, {}):
+                run.return_value = Mock(stdout=json.dumps(changed))
+                with patch("time.monotonic_ns", side_effect=[100, 200]), self.assertRaises(ValueError):
+                    gtk.gui_roundtrip(99)
+            run.return_value = Mock(stdout=json.dumps(reply))
+            with patch("time.monotonic_ns", side_effect=[100, 1_000_000_101]), self.assertRaises(ValueError):
+                gtk.gui_roundtrip(99)
+
+    def test_partial_retry_success_and_deadline_failure(self):
+        now, attempts = [0.0], []
+        def sleep(delay):
+            now[0] += delay
+        rows = [{"name": "main", "role": "frame"}]
+        read = Mock(side_effect=[ValueError("partial"), rows])
+        self.assertEqual(gtk.await_tree(read, lambda r: r == rows, attempts.append,
+                                        lambda: now[0], sleep), rows)
+        self.assertEqual(attempts, [{"complete": False, "error": "partial"}])
+        read = Mock(side_effect=ValueError("partial"))
+        with self.assertRaisesRegex(ValueError, "deadline"):
+            gtk.await_tree(read, lambda r: True, attempts.append, lambda: now[0], sleep)
+        self.assertTrue(all(not a["complete"] for a in attempts))
+        self.assertLess(now[0], 5.2)
+
+    def test_snapshot_subprocess_is_bounded_and_preserves_stderr(self):
+        import subprocess
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(
+                1, "snapshot", output="partial raw", stderr="GError raw")) as run:
+            with self.assertRaisesRegex(ValueError, "GError raw"):
+                gtk.accessibility_reader(100)(0.25)
+            self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+
+    def test_atspi_complete_or_partial_and_gerror(self):
+        import ctypes
+        for failure in (None, "count", "child", "error", "state", "name", "pid"):
+            with self.subTest(failure=failure):
+                lib, glib, obj = Mock(), Mock(), Mock()
+                buffers = [ctypes.create_string_buffer(b"main"), ctypes.create_string_buffer(b"frame")]
+                lib.atspi_init.return_value = 0
+                lib.atspi_get_desktop.return_value = 1
+                lib.atspi_accessible_get_child_count.side_effect = lambda node, err: (1 if node == 1 else
+                    -1 if failure == "count" else 1 if failure == "child" else 0)
+                lib.atspi_accessible_get_child_at_index.side_effect = lambda node, index, err: 2 if node == 1 else None
+                lib.atspi_accessible_get_process_id.return_value = 0 if failure == "pid" else 100
+                lib.atspi_accessible_get_state_set.return_value = None if failure == "state" else 3
+                lib.atspi_state_set_contains.side_effect = lambda state, flag: flag == 25
+                lib.atspi_accessible_get_name.return_value = None if failure == "name" else ctypes.addressof(buffers[0])
+                lib.atspi_accessible_get_role_name.return_value = ctypes.addressof(buffers[1])
+                if failure == "error":
+                    def fail(node, err):
+                        ctypes.cast(err, ctypes.POINTER(ctypes.c_void_p))[0] = 42
+                        return 0
+                    lib.atspi_accessible_get_child_count.side_effect = fail
+                    lib.atspi_accessible_get_child_count.__name__ = "child_count"
+                with patch("ctypes.CDLL", side_effect=[lib, glib, obj]):
+                    if failure:
+                        with self.assertRaisesRegex(ValueError, "partial_nodes"):
+                            gtk.accessibility_snapshot(100)
+                    else:
+                        self.assertEqual(gtk.accessibility_snapshot(100), [{"name": "main", "role": "frame"}])
+                if failure == "error":
+                    glib.g_error_free.assert_called_once()
+                obj.g_object_unref.assert_any_call(1)
 
 
 class DriverTests(unittest.TestCase):

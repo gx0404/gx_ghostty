@@ -3,7 +3,7 @@
 
 Only gx_wsl's public smoke/scenario interfaces are used. The generated scenario
 runs outside the measured checkout; it verifies the normal install receipt itself.
-No build, source edits, retries, or Windows input occur here.
+No build, source edits, measurement retries, or Windows input occur here.
 """
 from __future__ import annotations
 
@@ -23,6 +23,255 @@ def idle_ticks(clock, sleep):
     for index in range(60):
         sleep(max(0, started + index + 1 - clock()))
         yield index
+
+
+# AT-SPI is an OS runtime prerequisite, accessed through the standard library.
+# An unavailable bridge or ambiguous widget state is an error, never a delay-based success.
+def accessibility_snapshot(pid):
+    import json
+    import ctypes
+    lib = ctypes.CDLL("libatspi.so.0")
+    glib = ctypes.CDLL("libglib-2.0.so.0")
+    obj = ctypes.CDLL("libgobject-2.0.so.0")
+    ptr, integer = ctypes.c_void_p, ctypes.c_int
+    def bind(name, restype, args):
+        fn = getattr(lib, name)
+        fn.restype, fn.argtypes = restype, args
+        return fn
+    desktop = bind("atspi_get_desktop", ptr, [integer])
+    children = bind("atspi_accessible_get_child_count", integer, [ptr, ptr])
+    child = bind("atspi_accessible_get_child_at_index", ptr, [ptr, integer, ptr])
+    process = bind("atspi_accessible_get_process_id", ctypes.c_uint, [ptr, ptr])
+    name = bind("atspi_accessible_get_name", ptr, [ptr, ptr])
+    role = bind("atspi_accessible_get_role_name", ptr, [ptr, ptr])
+    states = bind("atspi_accessible_get_state_set", ptr, [ptr])
+    contains = bind("atspi_state_set_contains", integer, [ptr, integer])
+    obj.g_object_unref.argtypes = [ptr]
+    glib.g_free.argtypes = [ptr]
+    glib.g_error_free.argtypes = [ptr]
+    if bind("atspi_init", integer, [])() not in (0, 1):
+        raise ValueError("AT-SPI initialization failed")
+    bind("atspi_set_timeout", None, [integer, integer])(1500, 3000)
+
+    def checked(fn, *args, release=None):
+        error = ptr()
+        value = fn(*args, ctypes.byref(error))
+        if error.value:
+            glib.g_error_free(error)
+            if value and release:
+                release(value)
+            raise ValueError("AT-SPI query failed: " + fn.__name__)
+        return value
+
+    def count_children(node):
+        count = checked(children, node)
+        if count < 0:
+            raise ValueError("negative AT-SPI child count")
+        return count
+
+    def get_child(node, index):
+        value = checked(child, node, index, release=obj.g_object_unref)
+        if not value:
+            raise ValueError("null AT-SPI child")
+        return value
+
+    def string(fn, node):
+        value = checked(fn, node, release=glib.g_free)
+        if not value:
+            raise ValueError("null AT-SPI string")
+        try:
+            return ctypes.string_at(value).decode("utf-8", errors="strict")
+        finally:
+            glib.g_free(value)
+
+    rows = []
+    def read():
+        count = 0
+        def visit(node, depth):
+            nonlocal count
+            if not node:
+                raise ValueError("null AT-SPI node")
+            try:
+                count += 1
+                if depth > 40 or count > 4000:
+                    raise ValueError("accessibility tree exceeds bounded traversal")
+                state = states(node)
+                try:
+                    if not state or contains(state, 6):  # ATSPI_STATE_DEFUNCT
+                        raise ValueError("unknown AT-SPI node state")
+                    showing = bool(contains(state, 25))  # ATSPI_STATE_SHOWING
+                finally:
+                    if state:
+                        obj.g_object_unref(state)
+                if showing:
+                    rows.append({"name": string(name, node), "role": string(role, node)})
+                for index in range(count_children(node)):
+                    visit(get_child(node, index), depth + 1)
+            finally:
+                obj.g_object_unref(node)
+        top = desktop(0)
+        if not top:
+            raise ValueError("AT-SPI desktop unavailable")
+        try:
+            for index in range(count_children(top)):
+                app = get_child(top, index)
+                try:
+                    owner = checked(process, app)
+                except BaseException:
+                    obj.g_object_unref(app)
+                    raise
+                if not owner:
+                    obj.g_object_unref(app)
+                    raise ValueError("unknown AT-SPI application PID")
+                if owner == pid:
+                    visit(app, 0)
+                else:
+                    obj.g_object_unref(app)
+        finally:
+            obj.g_object_unref(top)
+        if not rows:
+            raise ValueError("no showing AT-SPI nodes for measured PID")
+        return rows
+    try:
+        return read()
+    except ValueError as exc:
+        raise ValueError(json.dumps({"error": str(exc), "partial_nodes": rows})) from exc
+
+
+def accessibility_reader(pid):
+    def read(timeout):
+        import json
+        import subprocess
+        import sys
+        try:
+            result = subprocess.run([sys.executable, "-c", ACCESS_PROGRAM, str(pid)],
+                                    capture_output=True, text=True, timeout=timeout, check=True)
+            rows = json.loads(result.stdout)
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("empty AT-SPI snapshot")
+            return rows
+        except (subprocess.SubprocessError, ValueError) as exc:
+            raise ValueError(f"AT-SPI snapshot unknown: {exc}; stdout={getattr(exc, 'stdout', None)!r}; "
+                             f"stderr={getattr(exc, 'stderr', None)!r}") from exc
+    return read
+
+
+ACCESS_PROGRAM = (inspect.getsource(accessibility_snapshot) +
+                  "\nimport json, sys\nprint(json.dumps(accessibility_snapshot(int(sys.argv[1]))))\n")
+
+
+def x11_ping(window, token):
+    """Wait for the client's EWMH reply, not an X server property roundtrip.
+
+    Runs in a disposable process: the parent bounds even blocking Xlib calls.
+    The request goes to the client window; only the reply goes to the root.
+    """
+    import ctypes as c
+    import json
+    lib = c.CDLL("libX11.so.6")
+    ptr, ulong, integer = c.c_void_p, c.c_ulong, c.c_int
+
+    class Data(c.Union):
+        _fields_ = [("b", c.c_char * 20), ("s", c.c_short * 10), ("l", c.c_long * 5)]
+
+    class Message(c.Structure):
+        _fields_ = [("type", integer), ("serial", ulong), ("send_event", integer),
+                    ("display", ptr), ("window", ulong), ("message_type", ulong),
+                    ("format", integer), ("data", Data)]
+
+    class Event(c.Union):
+        _fields_ = [("client", Message), ("pad", c.c_long * 24)]
+
+    def bind(name, result, args):
+        fn = getattr(lib, name)
+        fn.restype, fn.argtypes = result, args
+        return fn
+
+    open_display = bind("XOpenDisplay", ptr, [c.c_char_p])
+    close = bind("XCloseDisplay", integer, [ptr])
+    root_window = bind("XDefaultRootWindow", ulong, [ptr])
+    atom = bind("XInternAtom", ulong, [ptr, c.c_char_p, integer])
+    protocols = bind("XGetWMProtocols", integer, [ptr, ulong, c.POINTER(c.POINTER(ulong)), c.POINTER(integer)])
+    free = bind("XFree", integer, [ptr])
+    select = bind("XSelectInput", integer, [ptr, ulong, c.c_long])
+    send = bind("XSendEvent", integer, [ptr, ulong, integer, c.c_long, c.POINTER(Event)])
+    flush = bind("XFlush", integer, [ptr])
+    next_event = bind("XNextEvent", integer, [ptr, c.POINTER(Event)])
+    display = open_display(None)
+    if not display:
+        raise ValueError("X11 display unavailable")
+    try:
+        root = root_window(display)
+        wm = atom(display, b"WM_PROTOCOLS", 0)
+        ping = atom(display, b"_NET_WM_PING", 0)
+        supported, count = c.POINTER(ulong)(), integer()
+        try:
+            if not protocols(display, window, c.byref(supported), c.byref(count)) or \
+                    ping not in [supported[i] for i in range(count.value)]:
+                raise ValueError("client does not advertise _NET_WM_PING")
+        finally:
+            if supported:
+                free(supported)
+        select(display, root, 1 << 19)  # SubstructureNotifyMask, not WM ownership.
+        event = Event()
+        event.client.type, event.client.window = 33, window
+        event.client.message_type, event.client.format = wm, 32
+        event.client.data.l[0:3] = (ping, token, window)
+        if not send(display, window, 0, 0, c.byref(event)):
+            raise ValueError("X11 ping send failed")
+        flush(display)
+        while True:
+            next_event(display, c.byref(event))
+            reply = event.client
+            if reply.type == 33 and reply.send_event and reply.window == root and \
+                    reply.message_type == wm and reply.format == 32 and \
+                    tuple(v & 0xffffffff for v in reply.data.l[:3]) == (ping, token, window):
+                print(json.dumps({"protocol": "_NET_WM_PING", "window": str(window), "token": token}))
+                return
+    finally:
+        close(display)
+
+
+def gui_roundtrip(window):
+    import json
+    import secrets
+    import subprocess
+    import sys
+    import time
+    token = secrets.randbelow(0xffffffff) + 1
+    started = time.monotonic_ns()
+    try:
+        result = subprocess.run([sys.executable, "-c", PING_PROGRAM, str(window), str(token)],
+                                capture_output=True, text=True, timeout=1, check=True)
+    except subprocess.SubprocessError as exc:
+        raise ValueError(f"GUI response failed: window={window}, token={token}, sent_ns={started}, "
+                         f"deadline_ns={started + 1_000_000_000}; {exc}; "
+                         f"stdout={getattr(exc, 'stdout', None)!r}; stderr={getattr(exc, 'stderr', None)!r}") from exc
+    ended = time.monotonic_ns()
+    reply = json.loads(result.stdout)
+    if reply != {"protocol": "_NET_WM_PING", "window": str(window), "token": token} or \
+            not 0 < ended - started <= 1_000_000_000:
+        raise ValueError("missing, mismatched or late GUI response")
+    return {**reply, "sent_ns": started, "received_ns": ended, "deadline_ns": started + 1_000_000_000}
+
+
+PING_PROGRAM = inspect.getsource(x11_ping) + "\nimport sys\nx11_ping(int(sys.argv[1]), int(sys.argv[2]))\n"
+
+
+def await_tree(read, predicate, record, clock, sleep):
+    """Unknown snapshots cannot prove absence; preserve every failed attempt."""
+    deadline = clock() + 5
+    while True:
+        try:
+            rows = read(max(0.001, deadline - clock()))
+        except ValueError as exc:
+            record({"complete": False, "error": str(exc)})
+        else:
+            if clock() < deadline and predicate(rows):
+                return rows
+        if clock() >= deadline:
+            raise ValueError("AT-SPI state unknown or did not reach requested state before deadline")
+        sleep(0.05)
 
 
 def capture_session(api, identity, spec):
@@ -80,85 +329,11 @@ def capture_session(api, identity, spec):
         shells = [r for r in rows if r["exe"].endswith("/bash") and r["fd0"].startswith("/dev/pts/")]
         if len(shells) != spec["tabs"] or len({r["fd0"] for r in shells}) != spec["tabs"]:
             raise ValueError("terminal PTY/shell population differs from requested tabs")
-        state = {"live": live(), "windows": windows, "shells": shells, "ns": time.monotonic_ns()}
+        response = gui_roundtrip(api["window"]()) if spec["case"] == "p2" else None
+        state = {"response": response, "live": live(), "windows": windows, "shells": shells, "ns": time.monotonic_ns()}
         report["observations"].append(state)
         persist()
         return state
-
-    # AT-SPI is an OS runtime prerequisite, accessed through the standard library.
-    # An unavailable bridge or ambiguous widget state is an error, never a delay-based success.
-    def accessibility_reader():
-        lib = ctypes.CDLL("libatspi.so.0")
-        glib = ctypes.CDLL("libglib-2.0.so.0")
-        obj = ctypes.CDLL("libgobject-2.0.so.0")
-        ptr, integer = ctypes.c_void_p, ctypes.c_int
-        def bind(name, restype, args):
-            fn = getattr(lib, name)
-            fn.restype, fn.argtypes = restype, args
-            return fn
-        desktop = bind("atspi_get_desktop", ptr, [integer])
-        children = bind("atspi_accessible_get_child_count", integer, [ptr, ptr])
-        child = bind("atspi_accessible_get_child_at_index", ptr, [ptr, integer, ptr])
-        process = bind("atspi_accessible_get_process_id", ctypes.c_uint, [ptr, ptr])
-        name = bind("atspi_accessible_get_name", ptr, [ptr, ptr])
-        role = bind("atspi_accessible_get_role_name", ptr, [ptr, ptr])
-        states = bind("atspi_accessible_get_state_set", ptr, [ptr])
-        contains = bind("atspi_state_set_contains", integer, [ptr, integer])
-        obj.g_object_unref.argtypes = [ptr]
-        glib.g_free.argtypes = [ptr]
-        bind("atspi_init", integer, [])()
-        bind("atspi_set_timeout", None, [integer, integer])(1500, 3000)
-
-        def string(fn, node):
-            value = fn(node, None)
-            if not value:
-                return ""
-            try:
-                return ctypes.string_at(value).decode("utf-8", errors="strict")
-            finally:
-                glib.g_free(value)
-
-        def read():
-            rows = []
-            count = 0
-            def visit(node, depth):
-                nonlocal count
-                if not node:
-                    return
-                try:
-                    count += 1
-                    if depth > 40 or count > 4000:
-                        raise ValueError("accessibility tree exceeds bounded traversal")
-                    state = states(node)
-                    try:
-                        showing = bool(state and contains(state, 25))  # ATSPI_STATE_SHOWING
-                    finally:
-                        if state:
-                            obj.g_object_unref(state)
-                    if showing:
-                        rows.append({"name": string(name, node), "role": string(role, node)})
-                    for index in range(children(node, None)):
-                        visit(child(node, index, None), depth + 1)
-                finally:
-                    obj.g_object_unref(node)
-            top = desktop(0)
-            if not top:
-                raise ValueError("AT-SPI desktop unavailable")
-            try:
-                for index in range(children(top, None)):
-                    app = child(top, index, None)
-                    if not app:
-                        continue
-                    if process(app, None) == api["pid"]():
-                        visit(app, 0)
-                    else:
-                        obj.g_object_unref(app)
-            finally:
-                obj.g_object_unref(top)
-            if not rows:
-                raise ValueError("no showing AT-SPI nodes for measured PID")
-            return rows
-        return read
 
     def widget_state(rows, kind):
         if kind == "settings":
@@ -168,18 +343,16 @@ def capture_session(api, identity, spec):
         return "New Tab" in names and "Quit" in names and "Keyboard Shortcuts" in names
 
     def await_widget(kind, opened):
-        deadline = time.monotonic() + 5
-        while True:
-            live()
-            rows = read_widgets()
-            if widget_state(rows, kind) == opened:
-                report["observations"].append({"widget": kind, "opened": opened,
-                                                "ns": time.monotonic_ns(), "nodes": rows, "live": live()})
-                persist()
-                return
-            if time.monotonic() >= deadline:
-                raise ValueError(f"{kind} did not reach opened={opened}")
-            time.sleep(0.05)
+        def unknown(attempt):
+            report["observations"].append({**attempt, "widget": kind, "requested_opened": opened,
+                                            "ns": time.monotonic_ns(), "live": live()})
+            persist()
+        live()
+        rows = await_tree(read_widgets, lambda rows: widget_state(rows, kind) == opened,
+                          unknown, time.monotonic, time.sleep)
+        report["observations"].append({"widget": kind, "opened": opened, "complete": True,
+                                        "ns": time.monotonic_ns(), "nodes": rows, "live": live()})
+        persist()
 
     persist()
     try:
@@ -230,9 +403,10 @@ def capture_session(api, identity, spec):
                     raise ValueError("terminal identity changed while idle")
                 interval["states"].append(observed)
             interval["after"] = mark()
+            interval["end_state"] = terminal_state("idle-end-response")
             api["capture"]("idle-end")
         else:
-            read_widgets = accessibility_reader()
+            read_widgets = accessibility_reader(api["pid"]())
             kinds = ["menu", "settings"] if spec["run"] % 2 else ["settings", "menu"]
             for kind in kinds:
                 await_widget(kind, False)
@@ -269,9 +443,13 @@ def capture_session(api, identity, spec):
 
 def scenario(spec: dict) -> str:
     receipt_program = gx_wsl.RECEIPT_PROGRAM.split("\ndef build_main(", 1)[0]
-    return ("# gx-scenario-python-v1\n" + inspect.getsource(idle_ticks) + "\n" + inspect.getsource(capture_session) +
+    functions = (idle_ticks, accessibility_reader, gui_roundtrip, await_tree, capture_session)
+    return ("# gx-scenario-python-v1\nPING_PROGRAM = " + repr(PING_PROGRAM) +
+            "\nACCESS_PROGRAM = " + repr(ACCESS_PROGRAM) + "\n" +
+            "\n".join(inspect.getsource(fn) for fn in functions) +
             "\n_identity = {}\nexec(" + repr(receipt_program) + ", _identity)\n" +
             "capture_session(globals(), _identity, " + repr(spec) + ")\n")
+
 
 
 def interval_bytes(log: bytes, interval: dict) -> bytes:
@@ -349,6 +527,22 @@ def reduce_capture(target: Path, spec: dict) -> dict:
         if not 60 <= duration <= 62 or len(item["states"]) < 60:
             raise perf.PerfError("incomplete 60 s idle sampling window")
         states = item["states"]
+        end_state = item.get("end_state")
+        if not end_state:
+            raise perf.PerfError("missing end GUI response")
+        for state in [*states, end_state]:
+            response = state.get("response") or {}
+            sent, received = response.get("sent_ns", 0), response.get("received_ns", 0)
+            if response.get("protocol") != "_NET_WM_PING" or \
+                    response.get("window") not in state.get("windows", []) or \
+                    not isinstance(response.get("token"), int) or not 0 < response["token"] <= 0xffffffff or \
+                    not 0 < sent < received <= response.get("deadline_ns", 0) == sent + 1_000_000_000 or \
+                    not received <= state["ns"] <= received + 1_000_000_000:
+                raise perf.PerfError("missing, invalid or late GUI response")
+        if end_state["response"]["sent_ns"] < item["after"]["ns"] or \
+                end_state["ns"] - item["after"]["ns"] > 2_000_000_000 or \
+                any(end_state[k] != states[0][k] for k in ("live", "windows", "shells")):
+            raise perf.PerfError("invalid end GUI response/state")
         for index, state in enumerate(states):
             shells = state.get("shells", [])
             if state.get("live") != item["before"]["live"] or len(state.get("windows", [])) != 1 or \
@@ -356,6 +550,8 @@ def reduce_capture(target: Path, spec: dict) -> dict:
                     any(not r["exe"].endswith("/bash") or not r["fd0"].startswith("/dev/pts/") for r in shells) or \
                     shells != states[0]["shells"] or state["windows"] != states[0]["windows"]:
                 raise perf.PerfError("idle process/window/terminal state incomplete or changed")
+            if index and state["response"]["sent_ns"] <= states[index - 1]["ns"]:
+                raise perf.PerfError("reused GUI response")
             if index and not 0 < state["ns"] - states[index - 1]["ns"] <= 2_000_000_000:
                 raise perf.PerfError("idle state observation gap exceeds two seconds")
         if states[0]["ns"] > item["before"]["ns"] or states[-1]["ns"] < item["after"]["ns"] - 2_000_000_000:
@@ -370,8 +566,12 @@ def reduce_capture(target: Path, spec: dict) -> dict:
         for item in intervals:
             observed = [o for o in capture["observations"] if o.get("widget") == item["name"] and
                         item["before"]["ns"] <= o["ns"] <= item["after"]["ns"]]
-            if [o["opened"] for o in observed] != [True, False] or any(
-                    o.get("live") != item["before"]["live"] or not o.get("nodes") for o in observed):
+            successful = [o for o in observed if o.get("complete") is True]
+            if any(o.get("complete") is not True and (o.get("opened") is not None or not o.get("error"))
+                   for o in observed):
+                raise perf.PerfError("partial widget state observations cannot prove closure")
+            if [o["opened"] for o in successful] != [True, False] or any(
+                    o.get("live") != item["before"]["live"] or not o.get("nodes") for o in successful):
                 raise perf.PerfError("open/close widget state observations missing")
         for kind in kinds:
             hot, scans = [], []
