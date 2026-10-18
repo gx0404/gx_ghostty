@@ -1,21 +1,74 @@
 id = "G02"
-title = "Chinese UI: the main menu opened with gx:main_menu is translated"
+title = "Chinese UI: the translated main menu, a same-language no-op and quiet language switches with one toast for two windows"
 lang = "zh_CN"
 config = """
 command = /bin/bash --noprofile --norc
 language = zh-CN
 """
-# Click into the terminal for the keyboard focus (Xvfb has no window manager), then
-# Ctrl+Shift+M (gx:main_menu in the GX defaults).
-xdotool = """
-mousemove 400 300
-click 1
+# Two windows side by side (Xvfb has no window manager: xdotool sizes, moves and
+# focuses them). Intermediate screenshots and file dumps use xdotool exec into
+# the evidence directory next to XDG_STATE_HOME, which the runner copies out
+# with the rest; the whole script must finish within the runner's 30 s timeout.
+xdotool = '''
+search --onlyvisible --pid $1
+windowsize %1 640 560
 sleep 0.5
+key ctrl+shift+n
+sleep 2
+search --onlyvisible --pid $1
+windowsize %2 640 560
+windowmove %2 640 0
+sleep 0.8
+windowfocus --sync %1
+mousemove 300 300
+click 1
+sleep 0.3
 key ctrl+shift+m
+sleep 1
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s01-two-windows-menu.png"
+mousemove 380 318
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s02-language-submenu.png"
+mousemove 400 113
+click 1
 sleep 1.5
-"""
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s03-same-language-noop.png"
+exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G02-gui-settings-1-after-same.txt 2>&1"
+key ctrl+shift+m
+sleep 1
+mousemove 380 318
+click 1
+sleep 0.8
+mousemove 400 144
+click 1
+sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s04-english-one-toast.png"
+exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G02-gui-settings-2-after-english.txt 2>&1"
+mousemove 546 508
+click 1
+sleep 0.6
+key ctrl+shift+m
+sleep 1
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s05-english-menu.png"
+mousemove 380 316
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s06-english-language-submenu.png"
+mousemove 400 113
+click 1
+sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s07-chinese-one-toast.png"
+exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G02-gui-settings-3-after-chinese.txt 2>&1"
+'''
 expect = [
-  "G02.png: the window at startup, no menu yet",
-  "G02-after.png: the main menu is open and every label is Chinese (复制 … 设置…, 键盘快捷键, 语言, 关于 Ghostty GX, 退出), Han characters render (no boxes)",
-  "The black rectangle behind the popover is Xvfb without a compositor (no alpha), not a rendering bug",
+  "G02.png: the window at startup, no menu yet, Han characters render (no boxes)",
+  "G02-s01-two-windows-menu.png: two windows side by side; the left window's main menu is open and every label is Chinese (新建标签页 … 设置…, 键盘快捷键, 语言, 关于 Ghostty GX, 退出); the black rectangle behind the popover is Xvfb without a compositor",
+  "G02-s02-language-submenu.png: the 语言 submenu lists 中文 (selected) and English",
+  "G02-s03-same-language-noop.png and G02-gui-settings-1-after-same.txt: picking the language in use changes nothing: no toast in either window and no settings file is written",
+  "G02-s04-english-one-toast.png and G02-gui-settings-2-after-english.txt: switching to English reloads quietly: exactly one Language changed toast across the two windows, no Reloaded the configuration toast, the overlay holds language = en",
+  "G02-s05-english-menu.png: after the toast is dismissed (Xvfb never makes a window active, so libadwaita does not time toasts out), the reopened main menu is English in the same order",
+  "G02-s06-english-language-submenu.png: the Language submenu now marks English",
+  "G02-s07-chinese-one-toast.png and G02-gui-settings-3-after-chinese.txt: switching back shows exactly one Chinese language toast across the two windows; the overlay holds language = zh-CN",
+  "G02.log: no Chinese glyphs are missing warning (fonts-noto-cjk is installed); the missing-font path is not exercised here",
 ]

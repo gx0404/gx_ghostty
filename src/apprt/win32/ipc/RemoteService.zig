@@ -46,12 +46,16 @@ pub const Endpoint = struct {
     }
 };
 
-const Record = struct { id: u64, digest: [32]u8, ticket: protocol.Ticket, outcome: ?protocol.Outcome = null, offer_id: u64 = 0, target_handle: u64 = 0, ack_pending: bool = false };
+const Record = struct { id: u64, digest: [32]u8, ticket: protocol.Ticket, outcome: ?protocol.Outcome = null, offer_id: u64 = 0, target_handle: u64 = 0, ack_pending: bool = false, test_input: ?struct { surface: @import("../../../gx/ui_ref.zig").Reference, sequence: u64 } = null };
 const Ledger = struct {
     records: [128]?Record = @splat(null),
     high_water: u64 = 0,
     next: usize = 0,
-    fn admit(self: *Ledger, packet: *const protocol.Packet, bytes: []const u8) !union(enum) { fresh, pending, complete: Record } {
+    const Admission = union(enum) { fresh, pending, complete: Record };
+    fn admit(self: *Ledger, packet: *const protocol.Packet, bytes: []const u8) !Admission {
+        return self.admitForTest(packet, bytes, @import("../remote_test.zig").enabled());
+    }
+    fn admitForTest(self: *Ledger, packet: *const protocol.Packet, bytes: []const u8, enabled: bool) !Admission {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         for (self.records) |entry| if (entry) |record| if (record.id == packet.request_id) {
@@ -61,9 +65,20 @@ const Ledger = struct {
         if (packet.request_id <= self.high_water) return error.ExpiredRequest;
         if (self.records[self.next]) |old| if (old.outcome == null or old.ack_pending) return error.QueueFull;
         self.records[self.next] = .{ .id = packet.request_id, .digest = digest, .ticket = packet.ticket };
+        if (enabled and packet.body == .input) self.records[self.next].?.test_input = .{ .surface = packet.body.input.surface, .sequence = packet.body.input.sequence };
         self.next = (self.next + 1) % self.records.len;
         self.high_water = packet.request_id;
         return .fresh;
+    }
+    /// Query the exact recorded input; never admit or execute a new request.
+    fn inputResult(self: *const Ledger, ticket: protocol.Ticket, query: protocol.TestQuery) !Record {
+        for (self.records) |entry| if (entry) |record| if (record.id == query.input_request) {
+            const input = record.test_input orelse return error.InvalidInput;
+            if (!std.meta.eql(record.ticket, ticket) or !input.surface.matches(query.surface) or input.sequence != query.input_sequence) return error.InvalidInput;
+            if (record.outcome == null) return error.PendingInput;
+            return record;
+        };
+        return error.UnknownRequest;
     }
     fn finish(self: *Ledger, id: u64, outcome: protocol.Outcome, offer_id: u64, target_handle: u64) !Record {
         for (&self.records) |*entry| if (entry.*) |*record| if (record.id == id) {
@@ -149,6 +164,7 @@ pub const Connection = struct {
     in_len: usize = 0,
     stopped_input: ?*protocol.Packet = null,
     ledger: Ledger = .{},
+    test_enabled: bool = false,
     sent_high_water: u64 = 0,
     highest_offer_id: u64 = 0,
     watches: [protocol.max_leaves]?Watch = @splat(null),
@@ -164,6 +180,7 @@ pub const Connection = struct {
         const incoming_changed = n.CreateEventW(null, 0, 0, null) orelse return error.EventFailed;
         errdefer _ = n.CloseHandle(incoming_changed);
         self.* = .{ .allocator = alloc, .endpoint = endpoint, .local_epoch = epoch, .pipe = pipe, .server_side = server_side, .stop = stop, .changed = changed, .incoming_changed = incoming_changed, .hwnd = hwnd, .message = message };
+        self.test_enabled = @import("../remote_test.zig").enabled();
         return self;
     }
     fn lock(self: *Connection) void {
@@ -295,6 +312,20 @@ pub const Connection = struct {
     fn ack(self: *Connection, record: Record) !void {
         self.lock();
         defer self.unlock();
+        _ = try self.ledger.finish(record.id, record.outcome.?, record.offer_id, record.target_handle);
+        _ = n.SetEvent(self.changed);
+    }
+    /// Only the gated GUI fixture handler can request this lookup. It schedules
+    /// the original recorded ACK through collectAcks, not a synthetic completion.
+    pub fn testReackInput(self: *Connection, ticket: protocol.Ticket, query: protocol.TestQuery) !void {
+        return self.testReackInputWithGate(@import("../remote_test.zig").enabled(), ticket, query);
+    }
+    fn testReackInputWithGate(self: *Connection, enabled: bool, ticket: protocol.Ticket, query: protocol.TestQuery) !void {
+        if (!enabled) return error.TestDisabled;
+        self.lock();
+        defer self.unlock();
+        if (!self.connected or self.closing) return error.NotConnected;
+        const record = try self.ledger.inputResult(ticket, query);
         _ = try self.ledger.finish(record.id, record.outcome.?, record.offer_id, record.target_handle);
         _ = n.SetEvent(self.changed);
     }
@@ -474,7 +505,7 @@ pub const Connection = struct {
             }
             if (packet.body != .acknowledgement) {
                 self.lock();
-                const admission = self.ledger.admit(packet, bytes) catch |err| {
+                const admission = self.ledger.admitForTest(packet, bytes, self.test_enabled) catch |err| {
                     self.unlock();
                     return err;
                 };
@@ -957,10 +988,89 @@ test "persistent native remote pipe authenticates twice and ACK waits for GUI co
     }
     try std.testing.expect(resized);
     client.unwatchFrame(surface);
+    // Opt in only this test connection. Production captures the environment
+    // gate at creation; no process environment mutation is needed in tests.
+    const server = mapping_work.connection;
+    server.lock();
+    server.test_enabled = true;
+    server.unlock();
+    const input_ticket: protocol.Ticket = .{ .source_epoch = epoch, .target_epoch = client_epoch, .transaction = 20, .generation = 21 };
+    const input_surface: @import("../../../gx/ui_ref.zig").Reference = .{ .epoch = epoch, .kind = .surface, .id = 10, .generation = 1 };
+    const lease: protocol.Lease = .{ .holder_epoch = client_epoch, .transaction = 20, .generation = 21 };
+    const input_id = try client.sendBody(input_ticket, .{ .input = .{ .surface = input_surface, .lease = lease, .sequence = 1, .event = .{ .text = try protocol.Text.init("x") } } });
+    var input_work = try NativeTest.waitPacket(client, service);
+    defer input_work.release();
+    try std.testing.expect(input_work.event.packet.body == .input);
+    var applied_count: u64 = 1; // One real source GUI delivery.
+    try input_work.connection.finish(&input_work, .completed);
+    var lost = try NativeTest.waitPacket(client, null);
+    defer lost.release();
+    try std.testing.expectEqual(input_id, lost.event.packet.request_id);
+    const Controls = @import("../RemoteControls.zig");
+    var controls: Controls.State = .{ .armed = true };
+    try std.testing.expect(controls.dropAck(true, true, lost.event.packet.body.acknowledgement.outcome));
+    const query: protocol.TestQuery = .{ .surface = input_surface, .lease = lease, .input_request = input_id, .input_sequence = 1 };
+    const query_id = try client.sendBody(input_ticket, .{ .test_query = query });
+    controls.queried(100);
+    var query_work = try NativeTest.waitPacket(client, service);
+    defer query_work.release();
+    if (query_work.event.packet.body == .input) applied_count += 1;
+    try std.testing.expectEqual(query_id, query_work.event.packet.request_id);
+    try std.testing.expect(query_work.event.packet.body == .test_query);
+    try query_work.connection.testReackInputWithGate(true, input_ticket, query_work.event.packet.body.test_query);
+    try query_work.connection.finish(&query_work, .completed);
+    var original_acks: usize = 0;
+    var query_acks: usize = 0;
+    for (0..2) |_| {
+        var response = try NativeTest.waitPacket(client, null);
+        defer response.release();
+        try std.testing.expectEqual(protocol.Outcome.completed, response.event.packet.body.acknowledgement.outcome);
+        if (response.event.packet.request_id == input_id) {
+            try std.testing.expect(!controls.dropAck(true, true, .completed));
+            controls.recovering = false;
+            original_acks += 1;
+        } else if (response.event.packet.request_id == query_id) query_acks += 1 else return error.UnexpectedAcknowledgement;
+    }
+    try std.testing.expectEqual(@as(usize, 1), original_acks);
+    try std.testing.expectEqual(@as(usize, 1), query_acks);
+    try std.testing.expectEqual(@as(u64, 1), applied_count);
+    try std.testing.expectEqual(@as(u64, 1), controls.queries);
+    try std.testing.expectEqual(@as(u64, 1), controls.dropped);
+    try std.testing.expect(!controls.recovering);
     // A consumer-held Work survives connection shutdown and prevents teardown.
     mapping_work.connection.shutdown();
     try std.testing.expectError(error.Busy, mapping_work.connection.destroy());
     try std.testing.expectEqual(client_epoch, mapping_work.peer().epoch);
+}
+
+test "remote test input receipt query rejects disabled missing pending wrong leaf ticket and sequence" {
+    const disabled: *Connection = undefined;
+    const empty_query: protocol.TestQuery = undefined;
+    try std.testing.expectError(error.TestDisabled, disabled.testReackInputWithGate(false, undefined, empty_query));
+    var ledger: Ledger = .{};
+    const ticket: protocol.Ticket = .{ .source_epoch = 1, .target_epoch = 2, .transaction = 3, .generation = 4 };
+    const leaf: @import("../../../gx/ui_ref.zig").Reference = .{ .epoch = 1, .kind = .surface, .id = 5, .generation = 1 };
+    const lease: protocol.Lease = .{ .holder_epoch = 2, .transaction = 3, .generation = 4 };
+    const packet: protocol.Packet = .{ .sender_epoch = 2, .recipient_epoch = 1, .request_id = 8, .ticket = ticket, .body = .{ .input = .{ .surface = leaf, .lease = lease, .sequence = 9, .event = .{ .text = try protocol.Text.init("x") } } } };
+    var query: protocol.TestQuery = .{ .surface = leaf, .lease = lease, .input_request = 8, .input_sequence = 9 };
+    try std.testing.expectError(error.UnknownRequest, ledger.inputResult(ticket, query));
+    _ = try ledger.admitForTest(&packet, "input", false);
+    try std.testing.expect(ledger.records[0].?.test_input == null);
+    try std.testing.expectError(error.InvalidInput, ledger.inputResult(ticket, query));
+    ledger = .{};
+    _ = try ledger.admitForTest(&packet, "input", true);
+    try std.testing.expectError(error.PendingInput, ledger.inputResult(ticket, query));
+    _ = try ledger.finish(8, .completed, 0, 0);
+    try std.testing.expectEqual(protocol.Outcome.completed, (try ledger.inputResult(ticket, query)).outcome.?);
+    query.input_sequence += 1;
+    try std.testing.expectError(error.InvalidInput, ledger.inputResult(ticket, query));
+    query.input_sequence -= 1;
+    query.surface.id += 1;
+    try std.testing.expectError(error.InvalidInput, ledger.inputResult(ticket, query));
+    query.surface = leaf;
+    var wrong_ticket = ticket;
+    wrong_ticket.generation += 1;
+    try std.testing.expectError(error.InvalidInput, ledger.inputResult(wrong_ticket, query));
 }
 
 test "frame collection OOM does not consume sequence or allocate request id" {

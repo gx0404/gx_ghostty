@@ -7,18 +7,56 @@ language = en
 keybind = ctrl+alt+c=copy_to_clipboard
 keybind = ctrl+alt+x=copy_to_clipboard
 keybind = ctrl+alt+v=copy_to_clipboard
+keybind = shift+alt+ctrl+super+k=clear_screen
 keybind = demo/ctrl+c=copy_to_clipboard
 keybind = demo/escape=deactivate_key_table
 """
+# Intermediate screenshots are taken with xdotool `exec` into the evidence
+# directory next to $XDG_STATE_HOME, which the runner copies out with the rest.
+# The whole script must finish within the runner's 30 s xdotool timeout.
 xdotool = """
 mousemove 400 300
 click 1
 sleep 0.3
 key ctrl+shift+slash
-sleep 1
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s01-list.png"
 type --delay 40 "copy"
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s02-copy.png"
+mousemove 649 211
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s02b-more-tooltip.png"
+mousemove 400 300
+key ctrl+a
+type --delay 30 "clear"
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s03-order.png"
+key ctrl+a
+type --delay 30 "page"
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s04-page.png"
+key ctrl+a
+type --delay 20 "no-such-shortcut-r3"
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s05-empty.png"
+key Escape
+sleep 0.6
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G10-s06-cleared.png"
+key Escape
+sleep 0.7
+type --delay 20 "echo R3-ESC-OK"
+key Return
 sleep 0.5
 """
 expect = [
-  "G10-after.png: search and rows align; Copy has at most two horizontal keycap combinations plus +N; Key Table: demo is separate",
+  "G10.png: the English main window before the cheat sheet opens",
+  "G10-s01-list.png: the Keyboard Shortcuts dialog; the search field is clamped to the same width as the groups below it",
+  "G10-s02-copy.png: query copy; the Copy to Clipboard row shows two horizontal keycap combinations plus +4, and Key Table: demo is a separate section after the categories",
+  "G10-s02b-more-tooltip.png: hovering +4 shows the folded key combinations in its tooltip",
+  "G10-s03-order.png: query clear; Clear Screen shows Super + Ctrl + Alt + Shift + K in the shared modifier order",
+  "G10-s04-page.png: query page; the rows name the keys Page Up and Page Down",
+  "G10-s05-empty.png: an unmatched query shows the centered No results status page",
+  "G10-s06-cleared.png: the first Escape clears the search and the full list is back, the dialog stays open",
+  "G10-after.png: the second Escape closed the dialog and R3-ESC-OK appears in the terminal, proving focus returned",
 ]
