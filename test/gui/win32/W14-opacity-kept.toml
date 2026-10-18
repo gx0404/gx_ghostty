@@ -3,10 +3,16 @@ title = "Background opacity: toggled opaque stays opaque through a palette theme
 # Window materials need Windows 11 22H2 (chrome/Backdrop.zig).
 requires = ["windows-build:22621"]
 # GHOSTTY_GX_PERF logs the OpenGL probe thread (`wgl.probe`); only checked as a log line.
-env = { GHOSTTY_GX_PERF = "1" }
+env = { GHOSTTY_GX_PERF = "1", GHOSTTY_GX_ANIMATIONS = "0" }
+# Before running, set GX_W14_LOG in the runner environment to the absolute path
+# <out>/W14/env/ghostty/logs/ghostty.log (use --retries 0). wait_file reads the
+# whole log, unlike wait_log/assert_log which only match individual old lines.
+# This lets the existing runner check ordered reset/gauge cycles without code changes.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
+cursor-style-blink = false
+custom-shader-animation = false
 gx-window-material = mica
 background-opacity = 0.8
 unfocused-split-opacity = 0.5
@@ -21,8 +27,10 @@ keybind = f6=new_split:right
 expect = [
   "translucent: the terminal shows the mica material through the background (not the solid GX Mocha #1f1f28); the active tab is as translucent as the terminal; DWM draws the caption buttons and the main menu button sits centered on them",
   "opaque: after toggle_background_opacity the terminal is solid #1f1f28 and so is the active tab",
+  "single-reset-early, single-reset-followup-1, single-reset-followup-2: static opaque single pane matches opaque; ordered process gauge 2 -> reset -> 0 -> 2; these are post-rebuild observations, NOT proof of the first successful present",
   "split-dim: two panes; the unfocused left pane is darker than the focused right pane, which stays #1f1f28",
   "split-dim-after-reset: after a simulated GPU context reset of the left pane it is still dimmed the same way, no black or stale frame",
+  "split-reset-early, split-reset-followup: match split-dim; ordered process gauge 4 -> second reset -> 2 -> 4; exact first-frame capture remains pending a product handshake/freeze hook",
   "split-dim-translucent: with the translucency back on, the left pane is darker but still shows the material (the dim does not make it opaque)",
   "odd-size: after resizing to an odd size the bottom and right edges of both panes are filled with the background, no garbage or black strips",
   "preview: the palette previews Nord and the terminal is solid Nord #2e3440",
@@ -105,6 +113,52 @@ label = "active tab opaque with the terminal"
 action = "capture"
 name = "opaque"
 
+# A single surface owns one Target (texture + FBO = 2). Anchor the cycle to
+# recover(), so a resize replacement or an old startup value cannot satisfy it.
+[[step]]
+action = "assert_log"
+pattern = 'recreating the lost OpenGL context'
+present = false
+
+[[step]]
+action = "gpu_reset"
+terminal = 0
+
+[[step]]
+action = "wait_file"
+path = '%GX_W14_LOG%'
+pattern = '(?s)metric renderer\.targets_live 2\r?\n(?:(?!metric renderer\.targets_live ).)*recreating the lost OpenGL context(?=.*renderer resources rebuilt after the GPU reset)(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 0\r?\n(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 2\r?\n'
+timeout = 5
+
+# No settling sleep before the earliest observation. Neither rebuilt nor the
+# renderer.present entry counter proves successful SwapBuffers; the latter is
+# emitted even for the reset-triggering failed attempt. There is no completion
+# log/frame id or freeze handshake, so do not call these the first recovery frame.
+[[step]]
+action = "capture"
+name = "single-reset-early"
+
+[[step]]
+action = "sleep"
+seconds = 0.1
+
+[[step]]
+action = "capture"
+name = "single-reset-followup-1"
+
+[[step]]
+action = "sleep"
+seconds = 0.1
+
+[[step]]
+action = "capture"
+name = "single-reset-followup-2"
+
+[[step]]
+action = "assert_log"
+pattern = '(?i)InvalidValue|GL_INVALID_VALUE|SwapBuffers failed'
+present = false
+
 # R2-Render.01: only the unfocused pane of a split is dimmed.
 [[step]]
 action = "key"
@@ -145,13 +199,28 @@ action = "gpu_reset"
 terminal = 0
 
 [[step]]
-action = "wait_log"
-pattern = "renderer resources rebuilt after the GPU reset"
+action = "wait_file"
+path = '%GX_W14_LOG%'
+# Require the first completed cycle before the second: an old rebuilt line
+# must not make this wait succeed. Keep the process-wide 4 -> 2 -> 4 definition.
+pattern = '(?s)recreating the lost OpenGL context.*?renderer resources rebuilt after the GPU reset.*?metric renderer\.targets_live 4\r?\n(?:(?!metric renderer\.targets_live ).)*recreating the lost OpenGL context(?=.*renderer resources rebuilt after the GPU reset)(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 2\r?\n(?:(?!metric renderer\.targets_live ).)*metric renderer\.targets_live 4\r?\n'
 timeout = 5
 
 [[step]]
+action = "capture"
+name = "split-reset-early"
+
+[[step]]
 action = "sleep"
-seconds = 1.0
+seconds = 0.1
+
+[[step]]
+action = "capture"
+name = "split-reset-followup"
+
+[[step]]
+action = "sleep"
+seconds = 0.1
 
 [[step]]
 action = "pixel"
@@ -294,3 +363,8 @@ label = "opaque GX Mocha after Esc"
 [[step]]
 action = "capture"
 name = "restored"
+
+[[step]]
+action = "assert_log"
+pattern = '(?i)InvalidValue|GL_INVALID_VALUE|SwapBuffers failed'
+present = false
