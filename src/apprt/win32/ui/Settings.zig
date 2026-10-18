@@ -747,8 +747,7 @@ fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
             else => return false,
         }
         if (!Popup.uiaAlive(hwnd, cookie)) return false;
-        self.focus_visible = true;
-        self.invalidate();
+        self.showUiaFocus();
         _ = w32.SetFocus(hwnd);
         return true;
     }
@@ -759,6 +758,76 @@ fn uiaAction(context: *anyopaque, token: u64, action: *const uia.Action) bool {
         else => self.click(target),
     }
     return true;
+}
+
+fn showUiaFocus(self: *Settings) void {
+    self.focus_visible = true;
+    // Focus rings do not change the hit-token mapping. Earlier helpers may
+    // have committed an edit and invalidated it; repaint must not undo that.
+    self.popup.repaint();
+}
+
+test "UIA settings focus preserves the retained Toggle provider until a model edit" {
+    const testing = std.testing;
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Settings", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Scrollbar", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.destroy();
+    // Popup.create normally supplies the input allocator; this fixture never
+    // creates an HWND, so initialize the same ownership explicitly.
+    self.popup.input.alloc = testing.allocator;
+    try self.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    const snapshot = self.popup.uia_view.publisher.current.?;
+    const provider = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(provider.vtable));
+    _ = abi.AddRef(provider);
+    defer _ = abi.Release(provider);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    self.showUiaFocus();
+    try testing.expect(self.focus_visible);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // Entering an editor is focus-only; applying/leaving an edited value is
+    // not, and continues to use the original model invalidation paths.
+    self.focusSearch(false);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    self.beginSizeEdit("14", true);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    self.invalidate();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+    try testing.expect(!self.popup.uia_view.publisher.accepts(action));
 }
 
 // -----------------------------------------------------------------------
@@ -1276,7 +1345,7 @@ fn focusSearch(self: *Settings, select: bool) void {
     self.text_field = .search;
     if (select) self.popup.input.anchor = 0;
     self.stopTimer(.preview);
-    self.invalidate();
+    self.popup.repaint();
 }
 
 fn onTextChanged(ctx: *anyopaque, popup: *Popup) void {
@@ -1325,7 +1394,7 @@ fn beginSizeEdit(self: *Settings, text: []const u8, select: bool) void {
     self.text_field = .font_size;
     self.popup.input.setText(self.alloc, text) catch {};
     if (select) self.popup.input.anchor = 0;
-    self.invalidate();
+    self.popup.repaint();
 }
 
 /// Stops typing the font size, applying a valid size when `apply`.

@@ -1483,7 +1483,7 @@ fn onFocus(self: *Popup, hwnd: w32.HWND, focused: bool) void {
             self.input.dragging = false;
         }
     }
-    self.invalidate();
+    self.repaint();
 }
 
 fn handleKey(self: *Popup, hwnd: w32.HWND, key: Key) bool {
@@ -2236,6 +2236,10 @@ test "caret blinking preserves the live UIA snapshot and queued Value action" {
     try testing.expect(popup.input.caret_on);
     try testing.expect(popup.uia_view.publisher.accepts(action));
     popup.repaint();
+    // Native keyboard focus is visual too. With text_input disabled this
+    // exercises WM_SETFOCUS's handler without calling any desktop/caret API.
+    popup.options.text_input = false;
+    popup.onFocus(@ptrFromInt(1), true);
     try testing.expect(popup.uia_view.publisher.accepts(action));
     try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(retained, &options));
 
