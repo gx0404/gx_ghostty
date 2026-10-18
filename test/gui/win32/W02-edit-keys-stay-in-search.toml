@@ -9,7 +9,7 @@ command = cmd.exe /d /k prompt $G$S
 language = en
 """
 expect = [
-  "search-box: the typed text and the editing chords stayed in the search box (word-wise editing removes the words abc and x; until the text editor gets word boundaries Ctrl+Backspace and Ctrl+Delete remove one character, leaving `needle ab`)",
+  "search-box: the typed text and the editing chords stayed in the search box (Ctrl+Backspace and Ctrl+Delete remove the words abc and x, leaving `needle`)",
   "shell-clean: after Esc the prompt line `> ` is empty: no needle, abc, ^Q or stray characters",
   "counter: the reopened bar reads needle and its counter shows {current}/6 (three matches on the command line, three in the output); the bar is 380 DIPs wide (570 px at 144 DPI) at the top-right of the terminal",
   "enter-next: Enter in the bar moved the current match; the total stayed 6",
@@ -247,6 +247,99 @@ action = "wait_popup"
 cls = "GhosttyGxPopup"
 present = false
 
+# The link preview. Output soft-wraps, so every row of a long URL printed by a program is part of
+# the link; a command line echoed by ConPTY does not (its rows are separate lines), so the URLs come
+# from output and from the prompt text. Blank lines push the prompt to the bottom first.
+[[step]]
+action = "type"
+text = "cls\n"
+
+[[step]]
+action = "type"
+text = "for /L %i in (1,1,60) do @echo.\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "type"
+text = "<nul set /p =https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+# The core reports a hovered link only while Ctrl is down. Held presses keep the bubble up, and
+# it stays 250 ms after the last release (the leave delay): long enough for the capture. 50 DIPs
+# above the terminal's bottom is a row of the URL output (the prompt is the last row), above the
+# bubble's place (the bottom 34 DIPs).
+[[step]]
+action = "move"
+in = "terminal:0"
+x = 60
+y = -50
+
+[[step]]
+action = "key"
+keys = "ctrl"
+repeat = 10
+delay = 0.1
+
+[[step]]
+action = "capture"
+name = "link-left"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+# A prompt that is a short URL puts a link on the last row, under the bubble's place.
+[[step]]
+action = "type"
+text = "prompt https://example.com/gx-r6-right/prompt$G$S\n"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "move"
+in = "terminal:0"
+x = 8
+y = -12
+
+[[step]]
+action = "key"
+keys = "ctrl"
+repeat = 10
+delay = 0.1
+
+[[step]]
+action = "capture"
+name = "link-right"
+what = "all"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "resize"
+width = 1500
+height = 1000
+
+[[step]]
+action = "sleep"
+seconds = 0.25
+
+[[step]]
+action = "capture"
+name = "resize-overlay"
+what = "all"
+
+# Keep narrow-pane geometry after the link checks so their original width is preserved.
 # A narrow right-edge pane: drag the nested divider so the bar cannot fit,
 # regardless of the desktop DPI. The bar must move left inside the window.
 [[step]]
@@ -355,95 +448,3 @@ count = 1
 [[step]]
 action = "sleep"
 seconds = 0.5
-
-# The link preview. Output soft-wraps, so every row of a long URL printed by a program is part of
-# the link; a command line echoed by ConPTY does not (its rows are separate lines), so the URLs come
-# from output and from the prompt text. Blank lines push the prompt to the bottom first.
-[[step]]
-action = "type"
-text = "cls\n"
-
-[[step]]
-action = "type"
-text = "for /L %i in (1,1,60) do @echo.\n"
-
-[[step]]
-action = "sleep"
-seconds = 1.0
-
-[[step]]
-action = "type"
-text = "<nul set /p =https://example.com/gx-r6-preview/012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789/tail-end\n"
-
-[[step]]
-action = "sleep"
-seconds = 1.0
-
-# The core reports a hovered link only while Ctrl is down. Held presses keep the bubble up, and
-# it stays 250 ms after the last release (the leave delay): long enough for the capture. 50 DIPs
-# above the terminal's bottom is a row of the URL output (the prompt is the last row), above the
-# bubble's place (the bottom 34 DIPs).
-[[step]]
-action = "move"
-in = "terminal:0"
-x = 60
-y = -50
-
-[[step]]
-action = "key"
-keys = "ctrl"
-repeat = 10
-delay = 0.1
-
-[[step]]
-action = "capture"
-name = "link-left"
-what = "all"
-
-[[step]]
-action = "sleep"
-seconds = 0.8
-
-# A prompt that is a short URL puts a link on the last row, under the bubble's place.
-[[step]]
-action = "type"
-text = "prompt https://example.com/gx-r6-right/prompt$G$S\n"
-
-[[step]]
-action = "sleep"
-seconds = 1.0
-
-[[step]]
-action = "move"
-in = "terminal:0"
-x = 8
-y = -12
-
-[[step]]
-action = "key"
-keys = "ctrl"
-repeat = 10
-delay = 0.1
-
-[[step]]
-action = "capture"
-name = "link-right"
-what = "all"
-
-[[step]]
-action = "sleep"
-seconds = 1.0
-
-[[step]]
-action = "resize"
-width = 1500
-height = 1000
-
-[[step]]
-action = "sleep"
-seconds = 0.25
-
-[[step]]
-action = "capture"
-name = "resize-overlay"
-what = "all"
