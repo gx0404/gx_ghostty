@@ -12,10 +12,11 @@
 //! each theme: the configuration is built in memory from a snapshot of
 //! the configuration layers (`gx.config_layers.Layers`) with a `--theme`
 //! override. Applying a theme saves it; reverting, going back or closing
-//! the dialog without applying ends the preview, and reverting or going
-//! back also drops a theme whose saving failed. A configuration that
-//! follows the system's light or dark mode with two themes shows a row
-//! for each.
+//! the dialog without applying ends the preview. Reverting, going back or
+//! selecting the saved theme again also drops a theme whose saving failed;
+//! when the theme was saved and only applying it failed, reverting applies
+//! the saved configuration again instead. A configuration that follows the
+//! system's light or dark mode with two themes shows a row for each.
 //!
 //! The text is translated with the Ghostty GX tables (`src/gx/i18n.zig`,
 //! not gettext) into the language of the configuration, and follows it
@@ -732,10 +733,11 @@ pub const GxSettingsDialog = extern struct {
 
     /// What saving the recorded `changes` refreshes. A failed Apply keeps
     /// its `theme` change recorded and the theme previewed until a later
-    /// save writes it (Retry, or any other change): when that `theme` is
-    /// the previewed value it is no longer a preview (R3-Settings.04);
-    /// while another theme stays previewed, the saved theme is read from
-    /// the saved layers instead of the applied configuration.
+    /// save writes it (Retry, or any other change), or reverting drops it
+    /// (`revertChanges`): when that `theme` is the previewed value it is no
+    /// longer a preview (R3-Settings.04); while another theme stays
+    /// previewed, the saved theme is read from the saved layers instead of
+    /// the applied configuration (`appliedSync`).
     const SaveEffects = struct {
         sync: Sync,
         end_preview: bool = false,
@@ -766,6 +768,25 @@ pub const GxSettingsDialog = extern struct {
         return effects;
     }
 
+    /// How applying the saved settings refreshes the theme rows. While a
+    /// theme stays previewed the applied configuration has the preview, so
+    /// a saved theme is read from the saved layers (`saved_theme`) rather
+    /// than shown from it: after a save whose applying failed, Retry while
+    /// another theme is previewed would otherwise show that theme as
+    /// saved. Without a preview the applied configuration has the saved
+    /// theme.
+    fn appliedSync(sync: Sync, previewing: bool) Sync {
+        var applied = sync;
+        if (previewing) {
+            applied.saved_theme = sync.theme or sync.saved_theme;
+            applied.theme = false;
+        } else {
+            applied.theme = true;
+            applied.saved_theme = false;
+        }
+        return applied;
+    }
+
     /// Drops the `theme` change a failed Apply left recorded, for Revert
     /// and going back from the theme list (D-15): the dialog shows the
     /// saved theme again, so no later save (Retry, another change or
@@ -778,6 +799,31 @@ pub const GxSettingsDialog = extern struct {
             return true;
         }
         return false;
+    }
+
+    /// What reverting the theme list does with what failed saves left
+    /// (D-15). Revert, going back and selecting the saved theme again all
+    /// revert.
+    const Revert = struct {
+        /// The unsaved `theme` change was dropped, so no later save
+        /// writes it.
+        dropped: bool,
+        /// Nothing is left to save: the retry toast goes and the dialog
+        /// can close again, even while the settings folder stays read-only.
+        settled: bool,
+        /// A save wrote the theme already and only applying it failed:
+        /// the saved configuration is applied again and shown as saved,
+        /// rather than as an undone change.
+        reapply: bool,
+    };
+
+    fn revertChanges(changes: *settings_map.Changes, apply_pending: bool) Revert {
+        const dropped = dropThemeChange(changes);
+        return .{
+            .dropped = dropped,
+            .settled = dropped and changes.isEmpty() and !apply_pending,
+            .reapply = apply_pending,
+        };
     }
 
     /// Shows the values of `config`, without recording them as changes.
@@ -893,8 +939,10 @@ pub const GxSettingsDialog = extern struct {
     /// stays previewed (the applied configuration has the preview).
     fn refreshSavedTheme(self: *Self) void {
         const st = &self.private().state;
-        const layers = &(st.layers orelse return);
-        var saved = layers.build(st.alloc, &.{}) catch |err| {
+        var saved = (if (st.layers) |*layers|
+            layers.build(st.alloc, &.{})
+        else
+            gx.config_layers.loadWithOverrides(st.alloc, &.{})) catch |err| {
             log.warn("cannot read the saved theme err={}", .{err});
             return;
         };
@@ -1610,14 +1658,36 @@ pub const GxSettingsDialog = extern struct {
             st.pending_sync = effects.sync;
             self.reloadLayers();
         }
+        return self.applyPending();
+    }
 
+    /// Applies what the last save wrote (`apply_pending`) and shows it: the
+    /// saved theme, the configured font family. With nothing else left to
+    /// save the dialog can close again and says the settings are saved.
+    /// Returns whether applying succeeded.
+    fn applyPending(self: *Self) bool {
+        const st = &self.private().state;
         var config = self.apply(self.previewArg()) orelse return false;
         defer config.deinit();
-        self.syncValues(&config, st.pending_sync);
+        self.syncValues(&config, appliedSync(st.pending_sync, st.previewing));
         st.apply_pending = false;
-        self.as(adw.Dialog).setCanClose(1);
-        if (!st.disposed) self.showToast(self.tr(text.saved), false);
+        if (st.changes.isEmpty()) {
+            self.as(adw.Dialog).setCanClose(1);
+            if (!st.disposed) self.showToast(self.tr(text.saved), false);
+        }
         return true;
+    }
+
+    /// Nothing is left to save: the retry toast goes and the dialog can
+    /// close again, even while the settings folder stays read-only.
+    fn settleSaves(self: *Self) void {
+        const st = &self.private().state;
+        if (st.save_source) |source| {
+            st.save_source = null;
+            _ = glib.Source.remove(source);
+        }
+        self.dismissToast();
+        self.as(adw.Dialog).setCanClose(1);
     }
 
     /// Builds the configuration with in-memory overrides, the previewed
@@ -1886,16 +1956,13 @@ pub const GxSettingsDialog = extern struct {
         return 0;
     }
 
-    /// Applies the selected theme without saving it, or the saved
-    /// configuration when the saved theme is selected.
+    /// Applies the selected theme without saving it. Selecting the saved
+    /// theme again reverts (`revertTheme`): the saved configuration applies
+    /// and a theme whose saving failed is dropped.
     fn previewSelected(self: *Self) void {
         const st = &self.private().state;
         const index = self.selectedTheme() orelse return;
-        if (self.isSavedTheme(index)) {
-            if (st.previewing) self.endPreview();
-            self.updateThemeButtons();
-            return;
-        }
+        if (self.isSavedTheme(index)) return self.revertTheme();
         const value = themeValue(st.alloc, st.target, st.saved_light, st.saved_dark, self.themeNames()[index]) catch return;
         defer st.alloc.free(value);
         if (self.apply(value)) |config_| {
@@ -1924,21 +1991,24 @@ pub const GxSettingsDialog = extern struct {
         self.applySaved();
     }
 
-    /// Ends the preview and selects the saved theme again, dropping the
-    /// theme a failed Apply left to save (`dropThemeChange`). With nothing
-    /// else to save, its retry toast goes and the dialog can close again.
+    /// Ends the preview and selects the saved theme again (D-15). The theme
+    /// a failed Apply left to save is dropped, and with nothing else to
+    /// save its retry toast goes and the dialog can close again. When a
+    /// save wrote the theme and only applying it failed, the saved
+    /// configuration is applied again instead, so the dialog shows what the
+    /// file has rather than an undone change.
     fn revertTheme(self: *Self) void {
         const priv = self.private();
         const st = &priv.state;
-        self.endPreview();
-        if (dropThemeChange(&st.changes) and st.changes.isEmpty() and !st.apply_pending) {
-            if (st.save_source) |source| {
-                st.save_source = null;
-                _ = glib.Source.remove(source);
-            }
-            self.dismissToast();
-            self.as(adw.Dialog).setCanClose(1);
+        const revert = revertChanges(&st.changes, st.apply_pending);
+        if (revert.reapply) {
+            self.cancelPreview();
+            st.previewing = false;
+            _ = self.applyPending();
+        } else {
+            self.endPreview();
         }
+        if (revert.settled) self.settleSaves();
         if (st.theme_selection) |selection| {
             const saved = self.savedThemeIndex(st.target);
             const pos = if (saved) |index| std.mem.indexOfScalar(u32, st.visible.items, index) else null;
@@ -2961,6 +3031,69 @@ test "reverting after a failed theme save keeps the reverted theme out of later 
     try changes.set("cursor-style", "bar");
     try testing.expect(!GxSettingsDialog.dropThemeChange(&changes));
     try testing.expectEqual(@as(usize, 1), changes.entries.items.len);
+}
+
+test "reverting settles a failed theme save, or applies a theme that was saved but not applied" {
+    const alloc = testing.allocator;
+    const Dialog = GxSettingsDialog;
+
+    // Only the theme failed to save: Revert, going back or selecting the
+    // saved theme again drop it, nothing is left to save or retry, and the
+    // dialog can close while the folder stays read-only.
+    var only = settings_map.Changes.init(alloc);
+    defer only.deinit();
+    try only.set("theme", "Chalkboard");
+    const settled = Dialog.revertChanges(&only, false);
+    try testing.expect(settled.dropped and settled.settled and !settled.reapply);
+    try testing.expect(only.isEmpty());
+
+    // Another change still waits for its retry: it stays, and so does the
+    // retry toast.
+    var mixed = settings_map.Changes.init(alloc);
+    defer mixed.deinit();
+    try mixed.set("font-size", "14");
+    try mixed.set("theme", "Chalkboard");
+    const waiting = Dialog.revertChanges(&mixed, false);
+    try testing.expect(waiting.dropped and !waiting.settled and !waiting.reapply);
+    try testing.expectEqual(@as(usize, 1), mixed.entries.items.len);
+    try testing.expectEqualStrings("font-size", mixed.entries.items[0].key);
+
+    // The save wrote the theme and only applying it failed: nothing is
+    // dropped, the saved configuration is applied again and shown as saved
+    // rather than as undone; a theme that failed to save after that is
+    // dropped as well.
+    var written = settings_map.Changes.init(alloc);
+    defer written.deinit();
+    const reapplied = Dialog.revertChanges(&written, true);
+    try testing.expect(!reapplied.dropped and !reapplied.settled and reapplied.reapply);
+    try written.set("theme", "Dracula");
+    const both = Dialog.revertChanges(&written, true);
+    try testing.expect(both.dropped and !both.settled and both.reapply);
+    try testing.expect(written.isEmpty());
+
+    // Reverting a plain preview has nothing to settle.
+    const plain = Dialog.revertChanges(&written, false);
+    try testing.expect(!plain.dropped and !plain.settled and !plain.reapply);
+}
+
+test "applying saved settings while another theme stays previewed reads the saved theme from the layers" {
+    const Dialog = GxSettingsDialog;
+
+    // A save wrote the theme, applying it failed, another theme is previewed
+    // and Retry applies: the applied configuration has the preview, so the
+    // saved theme comes from the layers.
+    const retried = Dialog.appliedSync(.{ .theme = true }, true);
+    try testing.expect(!retried.theme and retried.saved_theme);
+    const kept = Dialog.appliedSync(.{ .theme = false, .saved_theme = true, .font_family = true }, true);
+    try testing.expect(!kept.theme and kept.saved_theme and kept.font_family);
+
+    // Other settings saved during a preview leave the theme rows.
+    const font = Dialog.appliedSync(.{ .theme = false, .font_family = true }, true);
+    try testing.expect(!font.theme and !font.saved_theme and font.font_family);
+
+    // Without a preview the applied configuration has the saved theme.
+    const plain = Dialog.appliedSync(.{ .theme = false, .saved_theme = true }, false);
+    try testing.expect(plain.theme and !plain.saved_theme);
 }
 
 test "a kept dialog opens again only while its language and theme stay and no reload came" {
