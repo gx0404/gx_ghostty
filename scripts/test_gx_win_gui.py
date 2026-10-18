@@ -1471,6 +1471,7 @@ class FakeBackdropWindow:
     """Stands in for BackdropWindow: nothing is created on the desktop."""
 
     made: list = []
+    close_error: Exception | None = None  # what close() raises, as a thread that does not end would
 
     def __init__(self, color):
         self.color = color
@@ -1488,6 +1489,8 @@ class FakeBackdropWindow:
 
     def close(self):
         self.closed += 1
+        if FakeBackdropWindow.close_error is not None:
+            raise FakeBackdropWindow.close_error
         return "destroyed"
 
 
@@ -1498,6 +1501,7 @@ class BackdropTests(unittest.TestCase):
 
     def setUp(self):
         FakeBackdropWindow.made = []
+        FakeBackdropWindow.close_error = None
         self.fake = FakeWin32(self.PID, self.PID)
         self.main = gui.StackEntry(0x10, gui.WINDOW_CLASS, self.WINDOW.rect, self.PID, self.PID)
         self.backdrop_entry = gui.StackEntry(0xB0, gui.BACKDROP_CLASS + "000000", (0, 0, 1000, 800), 1, 1)
@@ -1770,6 +1774,7 @@ class BackdropTests(unittest.TestCase):
         self.assertEqual([[0, 0, 1000, 760]], backdrop.checks[1]["covered"])
         self.assertEqual((-600, -100, 1000, 860), backdrop.area, "it does not shrink back")
         result = backdrop.finish()
+        self.assertEqual([], backdrop.teardown_failures())
         self.assertEqual(["created", "grown", "destroyed"], [event["event"] for event in result["events"]])
         self.assertEqual([[0, 0, 1000, 760], [-600, -100, 0, 860]], result["events"][1]["covers"])
         self.assertEqual(([], None), (backdrop.covers, backdrop.area))
@@ -1867,7 +1872,7 @@ class BackdropScenarioTests(unittest.TestCase):
             with self.subTest(case=expected), self.assertRaisesRegex(gui.UsageError, expected):
                 self.load(body + self.CAPTURE)
 
-    def run_scenario(self, body: str, fail: bool = False):
+    def run_scenario(self, body: str, fail: bool = False, stderr: io.StringIO | None = None):
         fake = FakeWin32(4242, 4242)
         window = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (100, 100, 140, 130), True, False, False)
         fake.stack = [gui.StackEntry(0x10, gui.WINDOW_CLASS, window.rect, 4242, 4242),
@@ -1888,7 +1893,7 @@ class BackdropScenarioTests(unittest.TestCase):
                 lambda info, method, region=None, see_through=(): screen(region or info.rect, [info.rect]))
             with mock.patch.object(gui, "launch", return_value=instance), mock.patch.object(gui, "win32", return_value=fake), \
                     mock.patch.object(gui, "BackdropWindow", FakeBackdropWindow), \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr or io.StringIO()):
                 report = run.run()
             return report, gui.notes_text(scenario, report), [path.name for path in (Path(tmp) / "out").glob("*.png")]
 
@@ -1902,6 +1907,19 @@ class BackdropScenarioTests(unittest.TestCase):
         self.assertEqual(("failed", []), (report["status"], pngs))
         self.assertEqual(1, FakeBackdropWindow.made[0].closed)
         self.assertEqual("destroyed", report["backdrop"]["events"][-1]["result"])
+
+    def test_a_backdrop_that_is_not_destroyed_fails_the_scenario(self):
+        self.addCleanup(setattr, FakeBackdropWindow, "close_error", None)
+        FakeBackdropWindow.close_error = gui.GuiError("the privacy backdrop thread did not end within 5s")
+        stderr = io.StringIO()
+        report, notes, pngs = self.run_scenario(BackdropScenarioTests.CAPTURE, stderr=stderr)
+        self.assertEqual(("failed", ["01-x.png"]), (report["status"], pngs), "the capture itself passed")
+        self.assertEqual("the privacy backdrop was not destroyed (scenario end: failed: the privacy backdrop thread "
+                         "did not end within 5s)", report["reason"])
+        self.assertIn("W90 FAILED: the privacy backdrop was not destroyed", stderr.getvalue())
+        self.assertIn("status: failed (the privacy backdrop was not destroyed", notes)
+        report, _, _ = self.run_scenario(BackdropScenarioTests.CAPTURE, fail=True)
+        self.assertRegex(report["reason"], r"^capture failed; the privacy backdrop was not destroyed \(")
 
     def test_a_scenario_without_the_backdrop_says_so(self):
         body = 'backdrop = false\nbackdrop_reason = "W14 checks the wallpaper"\n' + BackdropScenarioTests.CAPTURE

@@ -104,10 +104,10 @@ window) turns it off, and notes.txt and run.json say so. Before every screen cap
 it is put back under the instance and checked: every pixel of the captured window must lie on a
 covered area (a window partly on no monitor fails before anything is captured), the window must be
 above the backdrop before and after the capture, no window of another process may show inside the
-window or its band on the covered areas, and every band pixel
-outside the instance's windows must be the backdrop color or its shadow; otherwise the step fails
-and the screenshot is not saved. run.json lists every check (covered areas, band pieces, pixels
-counted, foreign windows by class, pid and image, no titles).
+window or its band on the covered areas, and every band pixel outside the instance's windows must be
+the backdrop color or its shadow; otherwise the step fails and the screenshot is not saved. A
+backdrop that cannot be destroyed fails the scenario. run.json lists every check (covered areas,
+band pieces, pixels counted, foreign windows by class, pid and image, no titles).
 
 Keyboard layouts: layout, the layout step and ime_off only switch to a layout GetKeyboardLayoutList
 reports for this user: they post WM_INPUTLANGCHANGEREQUEST to the window's focused thread and wait up
@@ -1630,16 +1630,22 @@ class Backdrop:
         self.fresh = False
         return crop(image, info.rect)
 
-    def drop(self, why: str) -> None:
-        """Destroy the window if there is one; never raises, the result is recorded."""
+    def drop(self, why: str) -> str | None:
+        """Destroy the window if there is one; never raises, the result is recorded and returned."""
         if self.window is None:
-            return
+            return None
         window, self.window, self.area, self.covers = self.window, None, None, []
         try:
             result = window.close()
         except Exception as exc:  # noqa: BLE001 - cleanup goes on; the failure is evidence
             result = f"failed: {exc}"
         self.events.append({"event": "destroyed", "why": why, "result": result})
+        return result
+
+    def teardown_failures(self) -> list[str]:
+        """Every destruction that did not succeed: that window may still cover the user's monitors."""
+        return [f"{event['why']}: {event['result']}" for event in self.events
+                if event.get("event") == "destroyed" and event.get("result") != "destroyed"]
 
     def finish(self) -> dict[str, Any]:
         self.drop("scenario end")
@@ -3128,6 +3134,12 @@ class ScenarioRun:
             finally:
                 # Whatever failed above, the backdrop never outlives the scenario.
                 report["backdrop"] = self.backdrop.finish()
+        teardown = self.backdrop.teardown_failures()
+        if teardown:
+            reason = "the privacy backdrop was not destroyed (" + "; ".join(teardown) + ")"
+            report["status"] = "failed"
+            report["reason"] = f"{report['reason']}; {reason}" if report.get("reason") else reason
+            print(f"{TAG} {scenario.id} FAILED: {reason}", file=sys.stderr, flush=True)
         report["seconds"] = round(time.monotonic() - started, 2)
         report["steps"] = self.results
         report["captures"] = self.captures
