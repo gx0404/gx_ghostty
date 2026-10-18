@@ -905,6 +905,7 @@ const Script = struct {
     loan: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(true),
     early: bool = false,
+    reset_completes: bool = true,
     blocked: std.atomic.Value(u32) = .init(0),
     entered: std.atomic.Value(u32) = .init(0),
     gate: ?w32.HANDLE = null,
@@ -965,7 +966,7 @@ const Script = struct {
     fn reset(ctx: ?*anyopaque, _: *anyopaque) u32 {
         const self = selfFrom(ctx);
         const code = self.enter(.reset);
-        if (code == 0) self.complete();
+        if (code == 0 and self.reset_completes) self.complete();
         return code;
     }
 
@@ -1231,6 +1232,52 @@ test "bell audio early and absent completion retain loan until unprepare succeed
     try player.request("not-a-file.wav", 0);
     try awaitFlag(&player.cache_present, false);
     try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+}
+
+test "bell audio absent callback and buffer return retain quarantine until the driver releases" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try testFile(tmp.dir, "bell.wav", 20000);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "bell.wav", t.allocator);
+    defer t.allocator.free(path);
+    // Reset returns success, but neither signals completion nor returns the
+    // loan. There will be no callback even when the test later returns it.
+    var script: Script = .{ .reset_completes = false };
+    script.done.store(false, .release);
+    const player = try Player.create(t.allocator, .{ .api = script.api() });
+    player.retain();
+    var destroyed = false;
+    defer {
+        releaseScript(&script);
+        if (!destroyed) player.destroy();
+        player.flushRetained() catch @panic("absent callback did not release ownership");
+    }
+    try player.request(path, 0.5);
+    try Observer.awaitCount(&player.started, 1);
+    try destroyWithinBudget(player);
+    destroyed = true;
+    try script.awaitCalls(.unprepare, 1);
+    try t.expectEqual(w32.WAIT_TIMEOUT, w32.WaitForSingleObject(player.finished_event, 0));
+    try t.expectEqual(w32.WAIT_TIMEOUT, w32.WaitForSingleObject(player.state.backend.event.?, 0));
+    try t.expectEqual(@as(usize, 0), player.completed.load(.acquire));
+    try t.expect(script.loan.load(.acquire));
+    try t.expect(player.cache_present.load(.acquire));
+    const header: *WaveHeader = @ptrFromInt(script.header_address.load(.acquire));
+    try t.expectEqual(&player.state.backend.header, header);
+    try t.expectEqual(@as(i16, 10000), std.mem.readInt(i16, header.data[0..2], .little));
+    for (0..100) |_| try t.expectError(error.PlayerStopped, player.request(path, 1));
+    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.write)].load(.acquire));
+    // Successful unprepare is the ownership fence; no callback is required.
+    script.done.store(true, .release);
+    player.signal();
+    try t.expectEqual(w32.WAIT_OBJECT_0, w32.WaitForSingleObject(player.finished_event, 5000));
+    try t.expect(!script.loan.load(.acquire));
+    try t.expect(!player.cache_present.load(.acquire));
+    try t.expect(player.state.backend.handle == null);
+    try t.expect(player.state.backend.event == null);
+    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.close)].load(.acquire));
 }
 
 test "bell audio new serial while prepare blocks does not submit the obsolete gain" {
