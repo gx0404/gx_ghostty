@@ -5,9 +5,10 @@
 //! its caption buttons; what a point of the row hits (`hit`, `ncHit`); and
 //! the smallest window the row fits in (`minTrackSize`), which `Window`
 //! reports in `WM_GETMINMAXINFO`. `chrome/TitleBar.zig` gathers the inputs
-//! from the window. Only depends on `std` and `win32.RECT`.
+//! from the window. Tab strip dimensions come from `tab_layout`.
 const std = @import("std");
 const RECT = @import("../win32.zig").RECT;
+const tab_layout = @import("tab_layout.zig");
 
 pub const empty_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 
@@ -38,8 +39,18 @@ const menu_gap: f32 = 6;
 const drag_reserve_caption: f32 = 40;
 const drag_reserve_row: f32 = 24;
 const drag_reserve_none: f32 = 4;
-/// One 72-DIP tab and the new-tab and launch profile buttons with their gap.
-const min_tab_row: f32 = 128;
+/// One complete active tab, including overflow controls, trailing buttons
+/// and the optional administrator badge. Round each part like the layout.
+const min_tab_parts = [_]f32{
+    tab_layout.active_min_width,
+    tab_layout.scroll_button_width,
+    tab_layout.scroll_button_width,
+    tab_layout.list_button_width,
+    tab_layout.buttons_gap,
+    tab_layout.new_tab_width,
+    tab_layout.profile_width,
+    tab_layout.badge_width,
+};
 /// The invisible resize border plus the visible border of a window side
 /// at 100% (`SM_CXSIZEFRAME` + `SM_CXPADDEDBORDER`), in DIPs.
 const frame_border: f32 = 8;
@@ -317,10 +328,11 @@ pub fn ncHit(lay: Layout, x: i32, y: i32, tabs: bool) NcHit {
 /// and a tab with the new-tab buttons; a terminal's `size_limit` can raise
 /// it further.
 pub fn minTrackSize(scale: f32) Size {
-    const width = 2 * frame_border + left_margin_caption + min_tab_row + drag_reserve_caption +
-        menu_button_width + menu_gap_caption + 3 * caption_button_width;
+    var width = 2 * px(frame_border, scale) + px(left_margin_caption, scale) + px(drag_reserve_caption, scale) +
+        px(menu_button_width, scale) + px(menu_gap_caption, scale) + 3 * px(caption_button_width, scale);
+    for (min_tab_parts) |part| width += px(part, scale);
     const height = title_bar_height + frame_border;
-    return .{ .width = px(width, scale), .height = px(height, scale) };
+    return .{ .width = width, .height = px(height, scale) };
 }
 
 const testing = std.testing;
@@ -446,12 +458,13 @@ test "buttonRect names what a hover change repaints" {
 test "minTrackSize fits the caption buttons, the main menu button, a tab and a drag strip" {
     for ([_]f32{ 1, 1.25, 1.5, 2 }) |s| {
         const size = minTrackSize(s);
-        try testing.expectEqual(px(370, s), size.width);
         try testing.expectEqual(px(title_bar_height + frame_border, s), size.height);
         // The client area of such a window.
         const client = size.width - 2 * px(frame_border, s);
         const lay = compute(.{ .width = client, .bar_height = px(title_bar_height, s), .frame = .custom, .scale = s });
-        try testing.expect(rectWidth(lay.tabs) >= px(min_tab_row, s) - 1);
+        var tab_width: i32 = 0;
+        for (min_tab_parts) |part| tab_width += px(part, s);
+        try testing.expectEqual(tab_width, rectWidth(lay.tabs));
         try testing.expect(lay.tabs.left < lay.tabs.right);
         try testing.expect(lay.menu.right <= lay.minimize.left);
         try testing.expect(lay.menu.left - lay.tabs.right >= px(drag_reserve_caption, s));
@@ -476,4 +489,39 @@ test "DWM button bounds follow the visible frame without the invisible resize bo
     const lay = compute(.{ .width = 3840, .bar_height = 60, .frame = .custom, .scale = 1.5, .zoomed = true, .buttons = .{ .dwm = maximized } });
     try testing.expectEqual(@as(i32, 44), lay.menu.top + lay.menu.bottom);
     try testing.expectEqual(@as(i32, 3624), lay.menu.right);
+}
+
+test "minimum window reveals a complete active tab with overflow controls and badge" {
+    const tabs = @import("tab_layout.zig");
+    for ([_]f32{ 1, 1.25, 1.5, 1.75, 2, 2.25 }) |s| {
+        const size = minTrackSize(s);
+        const lay = compute(.{
+            .width = size.width - 2 * px(frame_border, s),
+            .bar_height = px(title_bar_height, s),
+            .frame = .custom,
+            .scale = s,
+        });
+        for ([_]bool{ false, true }) |badge| {
+            for ([_]usize{ 1, 3, 64 }) |count| {
+                for ([_]usize{ 0, count / 2, count - 1 }) |active| {
+                    var in: tabs.Input = .{
+                        .area = .{ .left = lay.tabs.left, .right = lay.tabs.right, .top = lay.tabs.top, .bottom = lay.tabs.bottom },
+                        .hit_top = lay.hit_top,
+                        .scale = s,
+                        .count = count,
+                        .active = active,
+                        .badge = badge,
+                    };
+                    var strip = tabs.compute(in);
+                    in.scroll = strip.revealScroll(active);
+                    strip = tabs.compute(in);
+                    const shown = strip.visibleRect(active);
+                    try testing.expect(shown.width() >= tabs.px(tabs.active_min_width, s));
+                    try testing.expectEqual(strip.tabRect(active), shown);
+                    try testing.expect(strip.profiles.right <= lay.tabs.right);
+                    try testing.expectEqual(active, strip.tabAt(shown.left, shown.top).?);
+                }
+            }
+        }
+    }
 }
