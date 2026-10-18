@@ -94,8 +94,13 @@ def resolve_cli(root: Path, env: dict[str, str]) -> list[str]:
     )
 
 
-def graphify_env(base: dict[str, str], *, rebuild: bool = False) -> dict[str, str]:
+def graphify_env(
+    base: dict[str, str], *, rebuild: bool = False, builtin_venv: bool = False,
+) -> dict[str, str]:
     env = dict(base)
+    if builtin_venv:
+        # A launcher may inject its own Python home, incompatible with this venv.
+        env.pop("PYTHONHOME", None)
     # 输出目录由项目钉死，不继承外部 GRAPHIFY_OUT；禁止 graphify 顺手刷新用户级 skill 目录。
     env["GRAPHIFY_OUT"] = GRAPH_OUT
     env["GRAPHIFY_NO_AUTO_REFRESH"] = "1"
@@ -194,8 +199,11 @@ def run_command(argv: list[str], root: Path, base_env: dict[str, str]) -> int:
     if command == "rebuild":
         if args:
             raise GraphifyError("rebuild 不接受额外参数", 2)
-        env = graphify_env(base_env, rebuild=True)
-        cli = resolve_cli(root, env)
+        cli = resolve_cli(root, base_env)
+        env = graphify_env(
+            base_env, rebuild=True,
+            builtin_venv=cli == [str(venv_python(root)), "-m", "graphify"],
+        )
         ensure_version(cli, env)
         rebuild(root, cli, env)
         return 0
@@ -203,8 +211,11 @@ def run_command(argv: list[str], root: Path, base_env: dict[str, str]) -> int:
         command_args = passthrough_args(command, args)
         if not (root / GRAPH_JSON).is_file():
             raise GraphifyError(f"本机尚未构建 {GRAPH_JSON}（不入库）；先运行 just graph")
-        env = graphify_env(base_env)
-        cli = resolve_cli(root, env)
+        cli = resolve_cli(root, base_env)
+        env = graphify_env(
+            base_env,
+            builtin_venv=cli == [str(venv_python(root)), "-m", "graphify"],
+        )
         ensure_version(cli, env)
         return _run([*cli, *command_args], root, env)
     raise GraphifyError(

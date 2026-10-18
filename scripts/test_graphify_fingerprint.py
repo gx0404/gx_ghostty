@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -475,6 +476,37 @@ class WrapperGuardTests(unittest.TestCase):
 
 
 class WrapperCliTests(unittest.TestCase):
+    def test_pythonhome_isolated_only_for_builtin_venv(self) -> None:
+        python = wrapper.venv_python(self.root)
+        for path in (python, wrapper.venv_cli(self.root)):
+            write(self.root, path.relative_to(self.root).as_posix(), "fake")
+            if os.name != "nt":
+                path.chmod(0o755)
+        write(self.root, wrapper.GRAPH_JSON, "{}\n")
+        for source in ("venv", "override", "path"):
+            for command in (["query", "renderer"], ["path", "a", "b"],
+                            ["explain", "renderer"], ["rebuild"]):
+                with self.subTest(source=source, command=command):
+                    base = dict(self.env, PYTHONHOME="foreign-python", PYTHONPATH="custom-modules")
+                    base["PATH"] = str(self.bin)
+                    if source == "override":
+                        base[wrapper.CLI_ENV] = str(self.cli)
+                    before = dict(base)
+                    with mock.patch.object(wrapper, "_is_executable", return_value=source != "path"), \
+                            mock.patch.object(wrapper.subprocess, "run") as run, \
+                            mock.patch.object(wrapper, "rebuild") as rebuild:
+                        run.return_value = subprocess.CompletedProcess([], 0, "graphify 0.9.73\n", "")
+                        self.assertEqual(wrapper.run_command(command, self.root, base), 0)
+                    environments = [call.kwargs["env"] for call in run.call_args_list]
+                    if command == ["rebuild"]:
+                        environments.append(rebuild.call_args.args[2])
+                    self.assertEqual(len(environments), 2)
+                    for env in environments:
+                        self.assertEqual(env.get("PYTHONHOME"), None if source == "venv" else "foreign-python")
+                        self.assertEqual(env["PYTHONPATH"], "custom-modules")
+                        self.assertEqual(env["GRAPHIFY_NO_AUTO_REFRESH"], "1")
+                    self.assertEqual(base, before)
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
