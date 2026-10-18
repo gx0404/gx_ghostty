@@ -92,10 +92,13 @@ or SendInput fails in between (audited as an abort release under GX_PERF_GUARD_L
 file: path is relative to the isolated profile and must stay inside it. text writes the file (UTF-8,
 LF); directory = true creates the directory; readonly = true|false protects or releases the path.
 A read-only file gets the read-only attribute; a directory, whose attribute Windows ignores for
-writes, gets an inheritable ACL entry denying the current user WD, AD, WEA, WA and DC (no new files or
-subdirectories, no writes or deletions inside, reading still works). Both are probed with a write
-attempt after being set and after being released; whatever is still read-only when the scenario
-ends or fails is released (run.json: readonly).
+writes, gets an inheritable ACL entry denying the current user DE, WD, AD, WEA, WA and DC: no new
+files or subdirectories, and the entries inside can be neither written nor renamed nor deleted
+(reading and listing still work; the directory itself stays renamable through its parent). Both are
+probed after being set and after being released: a write attempt, and for a directory opening each
+of its first 16 existing entries for DELETE access (which deletes nothing; run.json says when there
+were none). Whatever is still read-only when the scenario ends or fails is released, after the
+instance closed and whatever else the cleanup did (run.json: readonly).
 
 Privacy backdrop: a scenario puts one solid window (backdrop = "#rrggbb", default #000000) right
 under the lowest of its instance's windows. It covers the work area of every display monitor that
@@ -959,6 +962,7 @@ class Win32:
         declare(k, "Process32FirstW", wt.BOOL, wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
         declare(k, "Process32NextW", wt.BOOL, wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
         declare(k, "GetCurrentProcess", wt.HANDLE)
+        declare(k, "CreateFileW", wt.HANDLE, wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE)
         declare(k, "LocalFree", wt.HLOCAL, wt.HLOCAL)
         self.advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         declare(self.advapi32, "OpenProcessToken", wt.BOOL, wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE))
@@ -1053,6 +1057,19 @@ class Win32:
         finally:
             self.CloseHandle(snapshot)
         return children
+
+    def can_open_for_delete(self, path: Path) -> bool:
+        """Whether the current user may open `path` with DELETE access, as deleting or renaming it would;
+        nothing is deleted (the handle is closed without a delete disposition)."""
+        flags = 0x02000000 if path.is_dir() else 0  # FILE_FLAG_BACKUP_SEMANTICS opens a directory
+        handle = self.CreateFileW(str(path), 0x00010000, 7, None, 3, flags, None)  # DELETE, share all, OPEN_EXISTING
+        if handle is None or handle == ctypes.c_void_p(-1).value:
+            error = ctypes.get_last_error()
+            if error == 5:  # ERROR_ACCESS_DENIED
+                return False
+            raise GuiError(f"cannot probe {path} for DELETE access (CreateFileW error {error})")
+        self.CloseHandle(handle)
+        return True
 
     def current_user_sid(self) -> str:
         """The string SID of the user this process runs as (TokenUser)."""
@@ -2368,19 +2385,33 @@ def write_probe(path: Path) -> bool:
     return True
 
 
+def deletable_entries(path: Path, limit: int = 16) -> tuple[int, list[str]]:
+    """How many of the first `limit` entries inside the directory `path` were tried, and the names of
+    those the current user could still delete or rename (Win32.can_open_for_delete)."""
+    tried, deletable = 0, []
+    for entry in sorted(path.iterdir())[:limit]:
+        tried += 1
+        if win32().can_open_for_delete(entry):
+            deletable.append(entry.name)
+    return tried, deletable
+
+
 class ReadOnlyPaths:
     """Files and directories file steps made read-only, released again at the end of the scenario.
 
     acl runs icacls with arguments and answers (exit code, output); sid gives the current user's SID;
-    probe answers whether the current user may write a path. All three can be replaced for tests."""
+    probe answers whether the current user may write a path; delete_check answers how many entries of a
+    directory it tried and which could still be deleted. All four can be replaced for tests."""
 
-    DENY = "(OI)(CI)(WD,AD,WEA,WA,DC)"
+    DENY = "(OI)(CI)(DE,WD,AD,WEA,WA,DC)"
 
     def __init__(self, acl: Callable[[Sequence[str]], tuple[int, str]] | None = None,
-                 sid: Callable[[], str] | None = None, probe: Callable[[Path], bool] | None = None) -> None:
+                 sid: Callable[[], str] | None = None, probe: Callable[[Path], bool] | None = None,
+                 delete_check: Callable[[Path], tuple[int, list[str]]] | None = None) -> None:
         self.acl = acl or run_icacls
         self.sid = sid or (lambda: win32().current_user_sid())
         self.probe = probe or write_probe
+        self.delete_check = delete_check or deletable_entries
         self.paths: dict[Path, str] = {}  # path -> "attribute" or "acl", in the order they were protected
         self.events: list[dict[str, Any]] = []
 
@@ -2407,8 +2438,19 @@ class ReadOnlyPaths:
         if self.probe(path):
             self.release(path, label)
             raise GuiError(f"{label} is still writable after making it read-only ({method}); released it again")
-        self.events.append({"event": "readonly", "path": label, "method": method, "probe": "write refused"})
-        return f"{label} is read-only ({method}; a write attempt was refused)"
+        event: dict[str, Any] = {"event": "readonly", "path": label, "method": method, "probe": "write refused"}
+        detail = "a write attempt was refused"
+        if method == "acl":
+            tried, deletable = self.delete_check(path)
+            if deletable:
+                self.release(path, label)
+                raise GuiError(f"{label}: {', '.join(deletable)} could still be deleted after making it read-only; "
+                               "released it again")
+            event["delete_probe"] = {"entries_tried": tried, "deletable": []}
+            detail += (f", DELETE access to its {tried} existing entries too" if tried else
+                       ", and it has no entries to try DELETE access on")
+        self.events.append(event)
+        return f"{label} is read-only ({method}; {detail})"
 
     def release(self, path: Path, label: str) -> str:
         method = self.paths.pop(path, None) or ("acl" if path.is_dir() else "attribute")

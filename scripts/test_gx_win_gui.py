@@ -934,8 +934,9 @@ class FakeAcl:
     """Stands in for icacls: remembers which directories deny the user; probe() reads that state
     (and a file's write bit), so nothing depends on the platform or on running as root."""
 
-    def __init__(self, deny_works=True, remove_works=True, reset_works=True, log=None):
+    def __init__(self, deny_works=True, remove_works=True, reset_works=True, log=None, delete_denied=True):
         self.deny_works, self.remove_works, self.reset_works = deny_works, remove_works, reset_works
+        self.delete_denied = delete_denied  # whether the deny entry also stops DELETE of the entries inside
         self.calls = log if log is not None else []
         self.denied: set = set()
 
@@ -953,12 +954,17 @@ class FakeAcl:
             return str(path) not in self.denied
         return bool(path.stat().st_mode & gui.stat.S_IWRITE)
 
+    def delete_check(self, path):
+        entries = sorted(entry.name for entry in path.iterdir())
+        protected = str(path) in self.denied and self.delete_denied
+        return len(entries), [] if protected else entries
+
 
 class ReadOnlyTests(unittest.TestCase):
     SID = "S-1-5-21-1"
 
     def paths(self, acl):
-        return gui.ReadOnlyPaths(acl=acl, sid=lambda: self.SID, probe=acl.probe)
+        return gui.ReadOnlyPaths(acl=acl, sid=lambda: self.SID, probe=acl.probe, delete_check=acl.delete_check)
 
     def test_file_step_validation(self):
         for raw in ({"path": "a", "text": ""}, {"path": "d", "directory": True}, {"path": "d", "readonly": False},
@@ -980,14 +986,45 @@ class ReadOnlyTests(unittest.TestCase):
             directory.mkdir()
             acl = FakeAcl()
             paths = self.paths(acl)
-            self.assertEqual("state is read-only (acl; a write attempt was refused)", paths.protect(directory, "state"))
-            self.assertEqual([[str(directory), "/deny", f"*{self.SID}:(OI)(CI)(WD,AD,WEA,WA,DC)"]], acl.calls)
+            self.assertEqual("state is read-only (acl; a write attempt was refused, and it has no entries to try "
+                             "DELETE access on)", paths.protect(directory, "state"))
+            self.assertEqual([[str(directory), "/deny", f"*{self.SID}:(OI)(CI)(DE,WD,AD,WEA,WA,DC)"]], acl.calls)
             self.assertEqual({directory: "acl"}, paths.paths)
             self.assertEqual("state is read-only already", paths.protect(directory, "state"))
             self.assertEqual("state is writable again (acl)", paths.release(directory, "state"))
             self.assertEqual([str(directory), "/remove:d", f"*{self.SID}"], acl.calls[-1])
             self.assertEqual({}, paths.paths)
             self.assertEqual(["readonly", "writable"], [event["event"] for event in paths.events])
+            self.assertEqual({"entries_tried": 0, "deletable": []}, paths.events[0]["delete_probe"])
+
+    def test_existing_entries_must_not_be_deletable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "state"
+            directory.mkdir()
+            (directory / "session.json").write_text("{}", encoding="utf-8")
+            (directory / "windows").mkdir()
+            paths = self.paths(FakeAcl())
+            self.assertEqual("state is read-only (acl; a write attempt was refused, DELETE access to its 2 existing "
+                             "entries too)", paths.protect(directory, "state"))
+            self.assertEqual({"entries_tried": 2, "deletable": []}, paths.events[0]["delete_probe"])
+            paths.release(directory, "state")
+            acl = FakeAcl(delete_denied=False)  # an entry without DE: deletable through an inherited allow
+            paths = self.paths(acl)
+            with self.assertRaisesRegex(gui.GuiError, r"state: session.json, windows could still be deleted after "
+                                                      r"making it read-only; released it again"):
+                paths.protect(directory, "state")
+            self.assertEqual(["/deny", "/remove:d"], [call[1] for call in acl.calls])
+            self.assertEqual({}, paths.paths)
+
+    def test_the_delete_probe_opens_for_delete_without_deleting(self):
+        fake = FakeWin32(1, 1)
+        fake.can_open_for_delete = mock.Mock(side_effect=lambda entry: entry.name == "b")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gui, "win32", return_value=fake):
+            for name in "cab":
+                (Path(tmp) / name).write_text(name, encoding="utf-8")
+            self.assertEqual((3, ["b"]), gui.deletable_entries(Path(tmp)))
+            self.assertEqual((1, []), gui.deletable_entries(Path(tmp), limit=1))
+            self.assertEqual(["a", "b", "c"], sorted(path.name for path in Path(tmp).iterdir()))
 
     def test_a_deny_entry_without_effect_is_undone_and_fails_the_step(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1044,7 +1081,8 @@ class ReadOnlyTests(unittest.TestCase):
             acl = FakeAcl()
             run.readonly = self.paths(acl)
             state = os.path.join("state", "ghostty")
-            self.assertEqual(f"{state} is a directory; {state} is read-only (acl; a write attempt was refused)",
+            self.assertEqual(f"{state} is a directory; {state} is read-only (acl; a write attempt was refused, and it "
+                             "has no entries to try DELETE access on)",
                              run.do_file({"path": "state/ghostty", "directory": True, "readonly": True}))
             with self.assertRaisesRegex(gui.GuiError, "read-only from an earlier step"):
                 run.do_file({"path": "state/ghostty", "text": "x"})
