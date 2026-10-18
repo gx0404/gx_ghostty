@@ -141,5 +141,57 @@ class StaleActionTests(unittest.TestCase):
         self.assertEqual(0, probe.stale_action_hresult(0, False, mock.Mock(return_value=0)))
 
 
+class FocusPlanTests(unittest.TestCase):
+    """UIA-01 after the dynamic focus fix: a client moves the focus with
+    IUIAutomationElement.SetFocus, then reads HasKeyboardFocus on elements it
+    already holds, GetFocusedElement and its FocusChanged events."""
+
+    def plan(self, rows):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'plan.json'
+            path.write_text(json.dumps(rows), encoding='utf-8')
+            return probe.read_plan(path)
+
+    def test_element_focus_actions_and_their_expectations_are_accepted(self):
+        rows = [{'automation_id': 'gx-4', 'pattern': 'element', 'operation': 'check_focus', 'expect_focus': True},
+                {'automation_id': 'gx-3', 'pattern': 'element', 'operation': 'set_focus', 'expect_focus': True,
+                 'expect_focused_element': True, 'expect_focus_event': True},
+                {'automation_id': 'gx-4', 'pattern': 'element', 'operation': 'check_focus', 'expect_focus': False},
+                {'automation_id': 'gx-3', 'pattern': 'toggle', 'operation': 'toggle'}]
+        self.assertEqual(rows, self.plan(rows))
+
+    def test_focus_expectations_must_be_checkable(self):
+        for row in ({'name': 'OK', 'pattern': 'element', 'operation': 'check_focus'},
+                    {'name': 'OK', 'pattern': 'element', 'operation': 'set_focus', 'expect_focus': 'yes'},
+                    {'name': 'OK', 'pattern': 'element', 'operation': 'set_focus', 'expect_focus_event': False},
+                    {'name': 'OK', 'pattern': 'element', 'operation': 'check_focus', 'expect_focus': True,
+                     'after_signal': True, 'expect_unavailable': True},
+                    {'name': 'OK', 'pattern': 'element', 'operation': 'invoke'},
+                    {'name': 'OK', 'pattern': 'toggle', 'operation': 'toggle', 'expect_focus': True,
+                     'after_signal': True, 'expect_unavailable': True}):
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                self.plan([row])
+
+    def test_expectations_hold_only_when_every_requested_fact_matches(self):
+        action = {'expect_focus': False, 'expect_focused_element': True, 'expect_focus_event': True}
+        facts = {'has_keyboard_focus': False, 'focused_element_same': True, 'focus_event': True}
+        self.assertTrue(probe.focus_expectations_hold(action, facts))
+        for fact in facts:
+            changed = dict(facts, **{fact: not facts[fact]})
+            with self.subTest(fact=fact):
+                self.assertFalse(probe.focus_expectations_hold(action, changed))
+        self.assertTrue(probe.focus_expectations_hold({'pattern': 'toggle'}, {}))
+
+    def test_set_focus_is_the_element_vtable_slot_from_the_sdk(self):
+        # uiautomationclient.h IUIAutomationElementVtbl: QueryInterface, AddRef, Release, SetFocus.
+        self.assertEqual({'set_focus': 3, 'check_focus': None}, probe.ELEMENT_OPERATIONS)
+
+    def test_only_a_later_event_from_the_target_process_and_element_counts(self):
+        events = [{'pid': 42, 'automation_id': 'gx-3'}, {'pid': 42, 'automation_id': 'gx-4'}]
+        self.assertTrue(probe.focus_event_seen(events, 1, 42, 'gx-4'))
+        self.assertFalse(probe.focus_event_seen(events, 1, 42, 'gx-3'))
+        self.assertFalse(probe.focus_event_seen(events, 0, 7, 'gx-3'))
+
+
 if __name__ == '__main__':
     unittest.main()

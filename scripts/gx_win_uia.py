@@ -4,6 +4,9 @@
 No desktop searches, HWND creation, input, or clipboard access. A parent process
 enforces a hard timeout even if the UIA server blocks a COM call. --birth is the
 process creation FILETIME (integer); --exe must match the process image exactly.
+FocusChanged events are desktop-wide: only the selected process's senders are
+recorded; other programs' focus changes are counted, never described, and
+GetFocusedElement is only compared with the selected process's own element.
 """
 from __future__ import annotations
 
@@ -24,6 +27,11 @@ _CALLBACK_ANCHORS = []
 PATTERNS = {"invoke": (10000, {"invoke": 3}), "selection_item": (10010, {"select": 3, "add": 4, "remove": 5}),
             "value": (10002, {"set": 3}), "toggle": (10015, {"toggle": 3}),
             "expand_collapse": (10005, {"expand": 3, "collapse": 4})}
+# IUIAutomationElement methods a plan calls on the element itself, not through a
+# control pattern (vtable slot): SetFocus, and a HasKeyboardFocus read only.
+ELEMENT_OPERATIONS = {"set_focus": 3, "check_focus": None}
+FOCUS_EXPECTATIONS = {"expect_focus": "has_keyboard_focus", "expect_focused_element": "focused_element_same",
+                      "expect_focus_event": "focus_event"}
 
 
 class ProbeFailure(RuntimeError):
@@ -62,6 +70,18 @@ def stale_action_hresult(hr, has_pattern, followup):
     return followup()
 
 
+def focus_expectations_hold(action, facts):
+    """Whether every focus fact the action asks for has its expected value:
+    HasKeyboardFocus of its retained element, GetFocusedElement being that
+    element, a FocusChanged event from it."""
+    return all(facts.get(fact) == action[key] for key, fact in FOCUS_EXPECTATIONS.items() if key in action)
+
+
+def focus_event_seen(events, start, pid, automation_id):
+    """A FocusChanged event from this exact element, after the action began."""
+    return any(event.get("pid") == pid and event.get("automation_id") == automation_id for event in events[start:])
+
+
 def read_plan(path):
     if path is None:
         return []
@@ -71,13 +91,23 @@ def read_plan(path):
     if not isinstance(rows, list) or not 1 <= len(rows) <= 32:
         raise ValueError("action plan must contain 1..32 exact-node actions")
     for row in rows:
-        if not isinstance(row, dict) or set(row) - {"automation_id", "name", "pattern", "operation", "value", "after_signal", "expect_unavailable"}:
+        if not isinstance(row, dict) or set(row) - {"automation_id", "name", "pattern", "operation", "value", "after_signal",
+                                                    "expect_unavailable", *FOCUS_EXPECTATIONS}:
             raise ValueError("invalid action fields")
         if not isinstance(row.get("automation_id", row.get("name")), str):
             raise ValueError("action requires an exact automation_id or unique name")
         pattern = row.get("pattern")
-        if pattern not in PATTERNS or row.get("operation") not in PATTERNS[pattern][1]:
+        operations = ELEMENT_OPERATIONS if pattern == "element" else PATTERNS.get(pattern, (None, {}))[1]
+        if row.get("operation") not in operations:
             raise ValueError("unsupported pattern operation")
+        if any(not isinstance(row[key], bool) for key in FOCUS_EXPECTATIONS if key in row):
+            raise ValueError("focus expectations are booleans")
+        if row.get("expect_focus_event") is False:
+            raise ValueError("an absent event cannot be awaited; expect_focus_event must be true")
+        if row.get("operation") == "check_focus" and "expect_focus" not in row:
+            raise ValueError("check_focus requires expect_focus")
+        if row.get("expect_unavailable") and any(key in row for key in FOCUS_EXPECTATIONS):
+            raise ValueError("a stale-provider action has no focus expectation")
         if pattern == "value" and (not isinstance(row.get("value"), str) or len(row["value"]) > 4096):
             raise ValueError("Value.SetValue requires <=4096 characters")
         if row.get("expect_unavailable") and not row.get("after_signal"):
@@ -238,9 +268,9 @@ def run_worker(args) -> dict:
         diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
         return hr
 
-    def property_value(element, property_id):
+    def property_value(element, property_id, stage_name="enumerate.properties"):
         value = Variant()
-        stage("enumerate.properties", "IUIAutomationElement.GetCurrentPropertyValue", property_id=property_id)
+        stage(stage_name, "IUIAutomationElement.GetCurrentPropertyValue", property_id=property_id)
         check(method(element, 10, HRESULT, C.c_int, C.POINTER(Variant))(element, property_id, C.byref(value)))
         try:
             if value.tag == 8 and value.data.pointer:
@@ -271,6 +301,26 @@ def run_worker(args) -> dict:
         finally:
             aut.VariantClear(C.byref(value))
 
+    def callback_property(element, property_id):
+        """An event callback's property read: no shared diagnostic, never raises."""
+        value = Variant()
+        hr = method(element, 10, HRESULT, C.c_int, C.POINTER(Variant))(element, property_id, C.byref(value))
+        try:
+            if hr < 0:
+                return f"0x{hr & 0xffffffff:08x}"
+            if value.tag == 8 and value.data.pointer:
+                return C.wstring_at(value.data.pointer, min(aut.SysStringLen(value.data.pointer), 4096))
+            if value.tag == 3:
+                return C.c_int(value.data.integer & 0xffffffff).value
+            if value.tag == 11:
+                return bool(value.data.integer & 0xffff)
+            return None
+        finally:
+            aut.VariantClear(C.byref(value))
+
+    class Handler(C.Structure):
+        _fields_ = [("vtable", C.POINTER(pointer))]
+
     verify_identity()
     stage("connect", "CoInitializeEx")
     check(ole.CoInitializeEx(None, 0))  # COINIT_MULTITHREADED; no window on this thread.
@@ -279,12 +329,16 @@ def run_worker(args) -> dict:
     registered = False
     events = []
     handler = None
+    focus_events, focus_counts = [], {"foreign": 0, "callback_errors": 0}
+    focus_handler = None
+    focus_registered = False
     plan = read_plan(args.action_plan)
     retained = [[] for _ in plan]
     retained_ids = [[] for _ in plan]
     action_results = diagnostic["action_results"]
     owner_thread = kernel.GetCurrentThreadId()
-    lifecycle = {"query_thread": owner_thread, "registration_thread": None, "removal_thread": None}
+    lifecycle = {"query_thread": owner_thread, "registration_thread": None, "removal_thread": None,
+                 "focus_registration_thread": None, "focus_removal_thread": None}
     try:
         clsid = guid(automation_clsid(args.listen_ms))
         iid = guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")
@@ -344,16 +398,63 @@ def run_worker(args) -> dict:
                     return 0
 
                 table = (pointer * 4)(*[C.cast(fn, pointer) for fn in (query, add_ref, release_ref, notification)])
-
-                class Handler(C.Structure):
-                    _fields_ = [("vtable", C.POINTER(pointer))]
-
                 handler = Handler(table)
                 _CALLBACK_ANCHORS.append((handler, table, query, add_ref, release_ref, notification))
                 stage("notification.register", "IUIAutomation5.AddNotificationEventHandler")
                 check(method(automation5, 68, HRESULT, pointer, C.c_int, pointer, pointer)(automation5, root, 7, None, C.byref(handler)))
                 registered = True
                 lifecycle["registration_thread"] = kernel.GetCurrentThreadId()
+
+        if any(action.get("expect_focus_event") for action in plan):
+            focus_iid = uuid.UUID("c270f6b5-5c69-4290-9745-7a7f97169468").bytes_le
+            unknown_iid = uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le
+            focus_refs = [1]
+            FocusQuery = C.WINFUNCTYPE(HRESULT, pointer, C.POINTER(GUID), C.POINTER(pointer))
+            FocusRef = C.WINFUNCTYPE(W.ULONG, pointer)
+            FocusEvent = C.WINFUNCTYPE(HRESULT, pointer, pointer)
+
+            @FocusQuery
+            def focus_query(this, requested, out):
+                out[0] = None
+                if bytes(requested.contents.bytes) not in (focus_iid, unknown_iid):
+                    return -2147467262
+                focus_refs[0] += 1
+                out[0] = this
+                return 0
+
+            @FocusRef
+            def focus_add_ref(_):
+                focus_refs[0] += 1
+                return focus_refs[0]
+
+            @FocusRef
+            def focus_release(_):
+                focus_refs[0] -= 1
+                return focus_refs[0]
+
+            @FocusEvent
+            def focus_changed(_, sender):
+                # On a UIA MTA thread. Desktop-wide: other programs' senders are
+                # only counted. An error never crosses back into UIA.
+                try:
+                    if not sender or callback_property(sender, 30002) != args.pid:
+                        focus_counts["foreign"] += 1
+                    elif len(focus_events) < 64:
+                        focus_events.append({"pid": args.pid, "automation_id": callback_property(sender, 30011),
+                                             "name": callback_property(sender, 30005),
+                                             "has_keyboard_focus": callback_property(sender, 30008),
+                                             "thread": kernel.GetCurrentThreadId()})
+                except Exception:
+                    focus_counts["callback_errors"] += 1
+                return 0
+
+            focus_table = (pointer * 4)(*[C.cast(fn, pointer) for fn in (focus_query, focus_add_ref, focus_release, focus_changed)])
+            focus_handler = Handler(focus_table)
+            _CALLBACK_ANCHORS.append((focus_handler, focus_table, focus_query, focus_add_ref, focus_release, focus_changed))
+            stage("focus.register", "IUIAutomation.AddFocusChangedEventHandler")
+            check(method(automation, 39, HRESULT, pointer, pointer)(automation, None, C.byref(focus_handler)))
+            focus_registered = True
+            lifecycle["focus_registration_thread"] = kernel.GetCurrentThreadId()
 
         # Retain a separate root reference because the root is also retained for
         # event registration/removal, which occur on this same MTA thread.
@@ -373,6 +474,7 @@ def run_worker(args) -> dict:
                               "control_type": property_value(element, 30003),
                               "enabled": property_value(element, 30010),
                               "focused": property_value(element, 30008),
+                              "focusable": property_value(element, 30009),
                               "value": property_value(element, 30045),
                               "toggle_state": property_value(element, 30086),
                               "expand_state": property_value(element, 30070),
@@ -382,9 +484,11 @@ def run_worker(args) -> dict:
                                   "value": 30043, "toggle": 30041, "expand_collapse": 30028, "window": 30044}.items()}})
                 descriptor = nodes[-1]
                 for index, action in enumerate(plan):
+                    target = (descriptor["focusable"] if action["pattern"] == "element"
+                              else descriptor["patterns"].get(action["pattern"]))
                     if (("automation_id" not in action or action["automation_id"] == descriptor["automation_id"])
                             and ("name" not in action or action["name"] == descriptor["name"])
-                            and descriptor["patterns"].get(action["pattern"]) is True):
+                            and target is True):
                         method(element, 1, W.ULONG)(element)
                         retained[index].append(element)
                         retained_ids[index].append(descriptor["automation_id"])
@@ -422,11 +526,65 @@ def run_worker(args) -> dict:
             if len(elements) != 1:
                 raise RuntimeError(f"action target is missing or ambiguous ({len(elements)}): {action}")
 
+        def focus_facts(action, element, node_id, events_start):
+            facts = {}
+            if "expect_focus" in action:
+                facts["has_keyboard_focus"] = property_value(element, 30008, "action.focus")
+            if "expect_focused_element" in action:
+                focused, same = pointer(), W.BOOL()
+                stage("action.focus", "IUIAutomation.GetFocusedElement")
+                check(method(automation, 8, HRESULT, C.POINTER(pointer))(automation, C.byref(focused)))
+                try:
+                    if focused:
+                        stage("action.focus", "IUIAutomation.CompareElements")
+                        check(method(automation, 3, HRESULT, pointer, pointer, C.POINTER(W.BOOL))(automation, focused, element, C.byref(same)))
+                    facts["focused_element_same"] = bool(same.value)
+                finally:
+                    release(focused)
+            if "expect_focus_event" in action:
+                facts["focus_event"] = focus_event_seen(focus_events, events_start, args.pid, node_id)
+            return facts
+
+        def await_focus(action, element, node_id, events_start):
+            """The focus moves on the GUI thread after the call: poll, bounded."""
+            if not any(key in action for key in FOCUS_EXPECTATIONS):
+                return {}
+            deadline = time.monotonic() + 3
+            polls = 0
+            while True:
+                facts = focus_facts(action, element, node_id, events_start)
+                polls += 1
+                if focus_expectations_hold(action, facts) or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            facts["polls"] = polls
+            if not focus_expectations_hold(action, facts):
+                diagnostic.update(stage="action.focus", call="focus expectations", focus=facts)
+                raise ProbeFailure(f"focus expectations not met within 3 s: {facts}", diagnostic)
+            return {"focus": facts}
+
         def execute_actions(after_signal):
             for action, elements, node_ids in zip(plan, retained, retained_ids):
                 if bool(action.get("after_signal")) != after_signal:
                     continue
                 verify_identity(require_hwnd=not after_signal)
+                events_start = len(focus_events)
+                if action["pattern"] == "element":
+                    operation = action["operation"]
+                    stage("action.invoke", "IUIAutomationElement.SetFocus" if operation == "set_focus" else "HasKeyboardFocus",
+                          node_id=node_ids[0], pattern_id=None, action_index=len(action_results), property_id=None)
+                    hr = method(elements[0], ELEMENT_OPERATIONS[operation], HRESULT)(elements[0]) if operation == "set_focus" else 0
+                    result = {"action": action, "hresult": f"0x{hr & 0xffffffff:08x}", "thread": kernel.GetCurrentThreadId(),
+                              "stage": diagnostic["stage"], "call": diagnostic["call"], "node_id": diagnostic["node_id"], "pattern_id": None}
+                    diagnostic["hresult"] = result["hresult"]
+                    action_results.append(result)
+                    if action.get("expect_unavailable"):
+                        if hr & 0xffffffff != 0x80040201:
+                            raise ProbeFailure(f"stale provider did not return UIA_E_ELEMENTNOTAVAILABLE: {result}", diagnostic)
+                        continue
+                    check(hr)
+                    result.update(await_focus(action, elements[0], node_ids[0], events_start))
+                    continue
                 pattern_id, operations = PATTERNS[action["pattern"]]
                 pattern = pointer()
                 stage("action.pattern", "IUIAutomationElement.GetCurrentPattern", node_id=node_ids[0],
@@ -461,6 +619,7 @@ def run_worker(args) -> dict:
                             raise ProbeFailure(f"stale provider did not return UIA_E_ELEMENTNOTAVAILABLE: {result}", diagnostic)
                     else:
                         check(hr)
+                        result.update(await_focus(action, elements[0], node_ids[0], events_start))
                 finally:
                     release(pattern)
 
@@ -468,7 +627,7 @@ def run_worker(args) -> dict:
         if args.ready_file:
             with args.ready_file.open("x", encoding="utf-8") as stream:
                 json.dump({"pid": args.pid, "birth": args.birth, "hwnd": args.hwnd,
-                           "registered": registered, "retained_actions": len(plan), "thread": owner_thread,
+                           "registered": registered, "focus_registered": focus_registered, "retained_actions": len(plan), "thread": owner_thread,
                            "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr}, stream)
         deadline = time.monotonic() + args.listen_ms / 1000
         queries = 0
@@ -516,6 +675,8 @@ def run_worker(args) -> dict:
                 "truncated": truncated, "notification_supported": notifications_supported, "events": events,
                 "automation_clsid": automation_clsid(args.listen_ms), "notification_interface_hr": notification_interface_hr,
                 "actions": action_results, "queries_during_wait": queries, "unavailable_queries": unavailable_queries,
+                "focus_handler_registered": focus_handler is not None, "focus_events": focus_events,
+                "foreign_focus_events": focus_counts["foreign"], "focus_callback_errors": focus_counts["callback_errors"],
                 "threads": lifecycle}
     except Exception as error:
         if isinstance(error, ProbeFailure):
@@ -531,6 +692,13 @@ def run_worker(args) -> dict:
             registered = False
             if hr < 0:
                 cleanup_error = f"UIA event unsubscription failed: 0x{hr & 0xffffffff:08x}"
+        if focus_registered:
+            hr = method(automation, 40, HRESULT, pointer)(automation, C.byref(focus_handler))
+            lifecycle["focus_removal_thread"] = kernel.GetCurrentThreadId()
+            focus_registered = False
+            if hr < 0:
+                failure = f"UIA focus event unsubscription failed: 0x{hr & 0xffffffff:08x}"
+                cleanup_error = f"{cleanup_error}; {failure}" if cleanup_error else failure
         for element, _ in pending:
             release(element)
         for elements in retained:

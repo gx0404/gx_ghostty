@@ -92,6 +92,17 @@ UIA 工具的 `--action-plan <JSON>` 支持精确 `automation_id` 或唯一 `nam
 移除线程 ID 记录在 `threads` 中。`--query-interval-ms 20` 在等待时持续查询，不创建窗口。
 所有等待受父进程 timeout 限制；超时记 FAIL。
 
+焦点动作（UIA-01 动态焦点复验）：`pattern:"element"` 配 `operation:"set_focus"`
+（IUIAutomationElement.SetFocus）或 `"check_focus"`（只读 HasKeyboardFocus），目标须
+IsKeyboardFocusable。任一动作可带布尔期望：`expect_focus`（该动作在枚举时保留的元素的
+HasKeyboardFocus）、`expect_focused_element`（IUIAutomation.GetFocusedElement 经
+CompareElements 是否就是该元素）、`expect_focus_event:true`（动作开始后收到该元素的
+FocusChanged 事件）；期望在 3 s 内轮询成立，否则 FAIL 并保留 `focus` 事实。焦点事件处理器
+只在计划需要时注册，注册与移除和查询同一线程；它是全桌面的，只记录目标进程的发送者，
+其他程序只计数（`foreign_focus_events`）。例：保留复选框与 OK → set_focus 复选框
+（`expect_focus/expect_focused_element/expect_focus_event`）→ OK `check_focus`
+`expect_focus:false` → 复选框 Toggle，证明焦点移动后旧元素仍可用。
+
 ### VM broker 命令与预期
 
 沿用本目录 `gx_drop_broker_fixture.py` 顶部的 setup/target/drop/inspect 流程，所有参数
