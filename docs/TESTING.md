@@ -119,6 +119,10 @@ GTK 的 `gtk --case p2|p4` 使用独立的动作采样合同，默认省略 `--c
 
 上述 GTK 动作采样需要 Xvfb、可用的会话 D-Bus 与 AT-SPI 库/桥接；隔离环境显式启用 `GHOSTTY_GX_PERF=1`、`GHOSTTY_LOG=stderr`、`NO_AT_BRIDGE=0`、`GTK_A11Y=atspi`。输出保留 `plan.json`、每轮 raw、receipt、状态记录、截图与 `gx-gtk-actions-v1` 汇总，不套用 C1 的 3000000 负载完成证明。十轮或指标不全时不能签收；脚本退出 0 不代替截图阅读，门值失败退出 4、工具错误退出 2。使用 `quiet-batch --input-observe-only` 直接包装该入口，不在子命令里另拿槽。
 
+`win32 --resizes 6` 另存每次缩放的图片、实际几何、日志字节区间与未舍入耗时，`resize.setwindowpos >= 16 ms` 计一次代理超时。`surface.resize_timeout` 原日志是一次 1 us 的事件标记，另按出现次数计数，不能将换算后的 .001 ms 相加冒充次数。当前操作后截图与消息响应**尚不能证明尺寸匹配的成功呈现末帧**，产物明确 `strict_final_frame=false`；P7 必须在产品侧的成功呈现查询接入并通过后签收，旧构建无此接口应如实记录。
+
+`win32-c7 --case matrix --exe <同源GX-0031回退对照> --exe <候选> --runs 10 --seconds 60 --out <新目录>` 覆盖 1/11 标签 × 可见、失焦、最小化、关闭闪烁、真实 IME 预编辑、输出唤醒共 12 格，并加两种标签数的 Kitty/自定义 shader 动画 4 格；可用 `--case` 与 `--tabs` 单格运行。CPU 取被测进程累计差，PDH 保存线程身份、原始计数和采样时间；线程集合变化或 counter 缺失不补零，不以 NtQuery 端点诊断填洞，周期内短命线程不可见的限制必须列出。输出刺激由自有 shell 回执证明字节量与时刻，不等同呈现 ACK；IME 用已有中文布局的物理按键、未提交阶段截图及后续中文提交回执，不加载宿主布局、不用 Unicode 注入代替。前置缺失可记环境 PENDING，刺激后意外提交属于 FAIL；隐私遮罩清理失败覆盖环境 PENDING 并停止矩阵。`measurement_coverage=PENDING` 时，即使 quiet VALID 也不表示 C7 已完成。逐图审核光标两相位与动画仍是独立验收门。
+
 `quiet --out <新目录>` 只读检查并落 JSON：0 表示当下满足、3 表示不满足、2 表示探测错误；它不为后续测量持锁。实际批次使用 `quiet-batch --out <新目录> --timeout 0 [--injected-input|--input-observe-only] -- <直接命令>`，自行持有全部重型与桌面槽，禁止外套 `Invoke-Heavy`/`Invoke-Desktop` 或嵌套槽。批次前后检查本项目构建/测试、验证 VM 已停、活动会话、槽与输入；按用户 2026-10-18 裁定，ToDesk 等原黑名单及全机 CPU 只记录，`--strict-blacklist` 才恢复旧黑名单门。桌面批次开始前仍需空闲 600 秒，注入输入批次用 `--injected-input` 读取守门行，无注入时核对整个区间没有新输入。
 
 仅 WSL/Xvfb 批次用 `--input-observe-only`，输入只记录。命令白名单仅允许直接 Python 的 `gx_perf.py gtk`、`gx_wsl.py smoke/scenario` 及等价 just 入口；just 入口先规范化成测量工作目录下的直接 Python argv，同一向量用于验证和执行且 `shell=False`，不会二次解释参数。`pwsh/cmd` 包装、任意脚本、`python -m`、`gx_wsl run` 等均拒绝；模式与实际守门行不符为 ERROR。WSL 克隆参数写成 `--clone=~/src/...`，避免 PowerShell 把独立 `~` 参数展开成 Windows 用户目录。

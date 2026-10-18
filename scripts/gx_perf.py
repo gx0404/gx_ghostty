@@ -1104,7 +1104,7 @@ BATCH_GUIDANCE = {
 }
 
 
-WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem')
+WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem', 'win32-c7')
 
 
 def gate_exit_contract(command: Sequence[str]) -> bool:
@@ -1196,7 +1196,8 @@ def product_failure_runs(out_dir: Path | None, rows: Sequence[Mapping]) -> list[
     label and run stay None when no such run.json exists (another command, or a pid it never wrote)."""
     runs: dict[int, dict] = {}
     if out_dir is not None and out_dir.is_dir():
-        for path in sorted(set(out_dir.glob('*/run-*/run.json')) | set(out_dir.glob('*/*.json'))):
+        for path in sorted(set(out_dir.glob('*/run-*/run.json')) | set(out_dir.glob('*/*.json')) |
+                           set(out_dir.glob('*/*/run-*/run.json'))):
             try:
                 report = json.loads(path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
@@ -2103,6 +2104,239 @@ def measure_resources(gui, instance, capture: CaptureRun, args, counters):
         capture.add('gpu.dedicated.per_added_terminal', (samples[1]['gpu']['dedicated_bytes'] - samples[0]['gpu']['dedicated_bytes']) / 10)
 
 
+def c7_input_check(gui, instance, args, entry_tick, helper=None):
+    """No synthetic input is sent inside the counter window, including output wakeup."""
+    instance.ensure_owned()
+    w = gui.win32()
+    hwnd = w.foreground()
+    pid = w.window_pid(hwnd) if hwnd else 0
+    hang = instance.hang_evidence(w.class_name(hwnd) if hwnd else 'none', gui.image_name(pid) if pid else None)
+    tick = last_input_ticks()[0]
+    cause = 'instance_hung' if hang else 'foreign_input' if tick != entry_tick else None
+    if cause:
+        message = str(hang) if hang else 'input arrived during the C7 observation interval'
+        instance.record_input('guard', check='c7_input_window', status='fail', cause=cause,
+                              reason=message, before_tick=entry_tick, after_tick=tick)
+        raise PerfError(message, cause=cause)
+    idle_state_check(gui, instance, args, helper, entry_tick=entry_tick)
+
+
+def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None):
+    import gx_perf_stimulus as stimulus
+    pdh_factory = pdh_factory or stimulus.PdhThreads
+    report = capture.report
+    report['c7'] = {'case': args.case, 'terminal_count': args.tabs, 'seconds_requested': args.seconds,
+                    'performance_verdict': 'not evaluated', 'visual_review': 'PENDING',
+                    'animation_guards': 'separate kitty-animation/custom-shader cells; visual review remains required',
+                    'shell_script_sha256': hashlib.sha256(Path(stimulus.__file__).read_bytes()).hexdigest(),
+                    'shell_python': sys.executable, 'shell_python_sha256': hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
+                    'pdh': {'source': stimulus.PDH_PATHS, 'status': 'running', 'n': 0, 'unit': ''}}
+    evidence = report['c7']
+    helper = pdh = None
+    backdrop = gui.Backdrop(gui.BACKDROP_DEFAULT)
+    rows = []
+    def shot(name):
+        info = instance.require_window()
+        path = capture.target / (name + '.png')
+        began = time.perf_counter_ns()
+        backdrop.capture(instance, info, 'screen', name).save_png(path)
+        evidence.setdefault('screenshots', []).append({'path': path.name, 'begin_qpc_ns': began,
+            'end_qpc_ns': time.perf_counter_ns(), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'phase': 'observed image; blink/preedit state requires visual review'})
+    try:
+        populate(gui, instance, args.tabs, 1)
+        setup_tick = last_input_ticks()[0]
+        wait_until(lambda: shells.ready(gui, instance, args.tabs), 'owned C7 shell receipts')
+        evidence['shells'] = [{'pid': pid, 'creation': birth} for pid, birth in shells.identities.items()]
+        # Photographs are outside the CPU/PDH measurement window. A delay is not
+        # evidence that two photographs captured opposite blink phases.
+        if args.case == 'kitty-animation':
+            animation_command = shells.command('kitty-animation')
+            evidence['animation_command'] = animation_command
+            wait_until(lambda: len([r for r in shells.rows() if r['event'] == 'kitty-animation' and
+                                    r['id'] == animation_command['id']]) == args.tabs,
+                       'owned Kitty animation write receipts')
+        for index in range(8):
+            shot(f'c7-before-{index + 1}')
+            time.sleep(0.15)
+        c7_input_check(gui, instance, argparse.Namespace(state='visible'), setup_tick)
+        if args.case == 'ime-preedit':
+            evidence['ime'] = stimulus.ime_state(gui, instance)
+            if evidence['ime']['status'] == 'PENDING':
+                raise stimulus.EnvironmentUnavailable(evidence['ime']['reason'])
+            for key in 'nihao':
+                instance.press(key)
+                time.sleep(0.08)
+            setup_tick = last_input_ticks()[0]  # Last deliberate input, before the preedit observation.
+            time.sleep(0.3)
+            evidence['ime']['before_input'] = [r for r in shells.rows() if r['event'] == 'input']
+            if evidence['ime']['before_input']:
+                raise PerfError('installed IME passed raw keys to the console instead of holding preedit')
+            shot('ime-preedit-entry')
+            c7_input_check(gui, instance, argparse.Namespace(state='visible'), setup_tick)
+        windows = main_windows(gui, instance)
+        if args.state == 'minimized':
+            foreground = gui.win32().foreground()
+            for window in sorted(windows, key=lambda window: window.hwnd == foreground):
+                instance.ensure_owned()
+                gui.win32().ShowWindow(window.hwnd, 6)
+        elif args.state == 'unfocused':
+            helper_dir = capture.target / 'focus-env'
+            gui.prepare_env_dir(helper_dir, fresh=False)
+            helper = gui.launch(Path(instance.exe), helper_dir, config=DEFAULT_WIN32_CONFIG + gui.HARNESS_CONFIG)
+            report['focus_helper'] = {'pid': helper.pid, 'creation': helper.creation, 'separate_process': True}
+            helper.wait_window(30)
+            helper.activate()
+        entry = idle_state_entry(gui, instance, capture, args)
+        entry['tick'] = setup_tick  # State changes and screenshots sent no input.
+        c7_input_check(gui, instance, args, entry['tick'], helper)
+        time.sleep(2)
+        c7_input_check(gui, instance, args, entry['tick'], helper)
+        try:
+            pdh = pdh_factory()
+        except stimulus.PdhFailure as exc:
+            if not exc.unavailable:
+                raise
+            evidence['pdh'].update(status='PENDING', reason=f'{type(exc).__name__}: {exc}')
+        def pdh_sample():
+            nonlocal pdh
+            if pdh is None:
+                return
+            try:
+                row = pdh.sample()
+                rows.append(row)
+                stimulus.append_json(capture.target / 'pdh-raw.jsonl', row)
+            except stimulus.PdhFailure as exc:
+                if not exc.unavailable:
+                    raise
+                evidence['pdh'].update(status='PENDING', reason=f'{type(exc).__name__}: {exc}')
+                stimulus.append_json(capture.target / 'pdh-raw.jsonl',
+                                     {'error': str(exc), 'qpc_ns': time.perf_counter_ns()})
+                pdh.close()
+                pdh = None
+        pdh_sample()
+        log_before = capture.mark()
+        before = counters.sample(instance)
+        report['before'] = before
+        evidence['cpu_scope'] = 'owned Ghostty PID only; Python stimulus and focus helper CPU excluded'
+        began = time.perf_counter()
+        deadline = began + args.seconds
+        evidence['counter_window_begin_qpc_ns'] = time.perf_counter_ns()
+        output = None
+        next_sample = began + 1
+        while True:
+            now = time.perf_counter()
+            if now >= deadline:
+                break
+            time.sleep(max(0, min(next_sample, deadline) - now))
+            c7_input_check(gui, instance, args, entry['tick'], helper)
+            pdh_sample()
+            now = time.perf_counter()
+            if args.case == 'output-wakeup' and output is None and now - began >= args.seconds / 2:
+                shells.verify(gui, instance)
+                evidence['output_log_start_byte'] = len(capture.mark())
+                output = shells.command('output', bytes=args.output_bytes)
+                evidence['output_command'] = output
+            next_sample = now + 1
+        after = counters.sample(instance)
+        evidence['counter_window_end_qpc_ns'] = time.perf_counter_ns()
+        report.update(after=after, context_switch_diagnostic=context_switch_diagnostic(before, after))
+        c7_input_check(gui, instance, args, entry['tick'], helper)
+        shells.verify(gui, instance)
+        text = capture.window('c7-counter-window', log_before)
+        capture.count(text, 'renderer.present', required=False)
+        for name, (value, unit) in idle_delta(before, after).items():
+            if name != 'threads.context_switches':  # NT endpoint numbers never impersonate PDH.
+                capture.add(name, value, unit)
+        if evidence['pdh']['status'] != 'PENDING':
+            evidence['pdh'] = stimulus.pdh_summary(rows, instance.pid)
+        evidence['pdh']['creation'] = instance.creation
+        if evidence['pdh']['status'] == 'sampled':
+            capture.add('threads.context_switches.pdh', evidence['pdh']['switches'])
+        else:
+            report['missing_metrics']['threads.context_switches.pdh'] = evidence['pdh']
+        evidence['input_during_window'] = [r for r in shells.rows() if r['event'] == 'input']
+        if evidence['input_during_window']:
+            raise PerfError('console received unexpected committed input in the C7 window')
+        if output:
+            evidence['output_receipts'] = shells.output_receipts(output, evidence['counter_window_end_qpc_ns'])
+            if {r['pid'] for r in evidence['output_receipts']} != set(shells.identities):
+                raise PerfError('not every owned terminal acknowledged output within the measurement window')
+            capture.add('stimulus.output_bytes', sum(r['written_bytes'] for r in evidence['output_receipts']))
+            evidence['output_log_end_byte'] = report['windows'][-1]['end_byte']
+        if args.state == 'visible':
+            for index in range(8):
+                shot(f'c7-after-{index + 1}')
+                time.sleep(0.15)
+                c7_input_check(gui, instance, args, entry['tick'], helper)
+        if args.case == 'ime-preedit':
+            # This commit happens AFTER the counter/log endpoints. No reset of the
+            # window's last-input sentinel is needed to excuse injected input.
+            c7_input_check(gui, instance, args, entry['tick'], helper)
+            instance.press('space')
+            wait_until(lambda: len([r for r in shells.rows() if r['event'] == 'input']) >= 2,
+                       'real IME committed Chinese characters', timeout=5)
+            committed = [r for r in shells.rows() if r['event'] == 'input']
+            evidence['ime']['committed_input'] = committed
+            evidence['ime']['commit_text'] = ''.join(r['text'] for r in committed)
+            if evidence['ime']['commit_text'] != '你好' or len({r['pid'] for r in committed}) != 1:
+                raise PerfError('IME commit verification failed: physical nihao+space did not produce exactly 你好; inspect raw receipts')
+            evidence['ime'].update(status='observed_commit',
+                preedit_verification='PENDING visual review; no cross-process internal preedit query exists')
+        evidence['coverage'] = ('PENDING' if evidence['pdh']['status'] != 'sampled' or
+                                'renderer.present' in report['missing_metrics'] else 'captured')
+        if hashlib.sha256(Path(stimulus.__file__).read_bytes()).hexdigest() != evidence['shell_script_sha256']:
+            raise PerfError('stimulus script changed during run')
+    finally:
+        if pdh:
+            pdh.close()
+        evidence['shell_receipts'] = shells.rows()
+        report['backdrop'] = backdrop.finish()
+        teardown_errors = backdrop.teardown_failures()
+        if teardown_errors:
+            report['backdrop_teardown_errors'] = teardown_errors
+            report.setdefault('errors', []).extend(teardown_errors)
+        if helper:
+            helper.close()
+
+
+def run_c7_matrix(args) -> int:
+    import copy
+    import gx_perf_stimulus as stimulus
+    out = new_output(args.out)
+    result = {'schema': 'gx-c7-matrix-v1', 'planned_cells': 12, 'planned_animation_guards': 4, 'cells': [],
+              'performance_verdict': 'not evaluated', 'visual_and_animation_guards': 'PENDING'}
+    write_json(out / 'RESULT.json', result)
+    exit_code = 0
+    for tabs in (1, 11):
+        for case in (*stimulus.CASES, *stimulus.ANIMATION_CASES):
+            cell = copy.copy(args)
+            cell.tabs, cell.case = tabs, case
+            cell.state = case if case in ('unfocused', 'minimized') else 'visible'
+            cell.out, cell.json = out / f'{tabs}-{case}', None
+            code = run_experiment(cell)
+            details = read_json(cell.out / 'RESULT.json')
+            result['cells'].append({'tabs': tabs, 'case': case, 'path': cell.out.name,
+                                     'exit': code, 'valid': details['valid'],
+                                     'measurement_coverage': details.get('measurement_coverage', 'PENDING'),
+                                     'environment_pending': details.get('environment_pending', False)})
+            result['failure_causes'] = sorted(set(result.get('failure_causes', [])) | set(details.get('failure_causes', [])))
+            exit_code = max(exit_code, code)
+            write_json(out / 'RESULT.json', result)
+            if code and not details.get('environment_pending'):
+                result['stopped_after_failure'] = cell.out.name
+                break  # No more input after product/guard/tool failure.
+        if result.get('stopped_after_failure'):
+            break
+    result.update(exit=exit_code, status='incomplete' if exit_code else
+                  'PENDING' if any(cell['measurement_coverage'] == 'PENDING' for cell in result['cells']) else 'captured',
+                  completed_cells=len(result['cells']))
+    write_json(out / 'RESULT.json', result)
+    write_json(args.json, result)
+    (out / 'SUMMARY.txt').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8', newline='\n')
+    return exit_code
+
+
 def absolute_gate(args, capture: CaptureRun) -> dict:
     if capture.report.get('baseline') or args.diagnostic:
         return {'status': 'not_evaluated', 'reason': 'baseline' if capture.report.get('baseline') else 'diagnostic'}
@@ -2130,6 +2364,7 @@ def absolute_gate(args, capture: CaptureRun) -> dict:
 
 
 def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
+    import gx_perf_stimulus as stimulus
     if gui is None:
         import gx_win_gui as gui
     exes = [Path(path).resolve() for path in args.exe]
@@ -2167,9 +2402,21 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         target = out / label / f'run-{run:02d}'
         target.mkdir(parents=True)
         exe = exes[labels.index(label)]
+        run_config = config
+        shells = None
+        if args.command == 'win32-c7':
+            shells = stimulus.OwnedShells(target / 'stimulus')
+            run_config += shells.config()
+            run_config += 'shell-integration = none\n'
+            if args.case == 'blink-off':
+                run_config += 'cursor-style-blink = false\n'
+            if args.case == 'custom-shader':
+                shader = target / 'c7-animation.glsl'
+                shader.write_text(stimulus.ANIMATION_SHADER, encoding='utf-8', newline='\n')
+                run_config += f'custom-shader = {shader.as_posix()}\ncustom-shader-animation = true\n'
         report = {'schema': 'gx-win32-perf-run-v1', 'label': label, 'run': run, 'command': args.command,
                   'baseline': label == baseline or label in unsupported, 'capabilities': capabilities[label],
-                  'case': getattr(args, 'case', None), 'env': envs[label], 'config': config, 'diagnostic': args.diagnostic,
+                  'case': getattr(args, 'case', None), 'env': envs[label], 'config': run_config, 'diagnostic': args.diagnostic,
                   'exe': str(exe), 'exe_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
                   'state': getattr(args, 'state', None), 'tabs': getattr(args, 'tabs', None), 'windows_count': getattr(args, 'windows', None),
                   'seconds': getattr(args, 'seconds', None), 'status': 'running', 'errors': []}
@@ -2179,7 +2426,7 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         instance = capture = None
         try:
             gui.prepare_env_dir(target / 'env', fresh=False)
-            instance = gui.launch(exe, target / 'env', config=config, env=envs[label])
+            instance = gui.launch(exe, target / 'env', config=run_config, env=envs[label])
             report.update(pid=instance.pid, creation=instance.creation)
             write_json(target / 'run.json', report)
             report['startup_ms'] = instance.wait_window(30)
@@ -2190,6 +2437,8 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 measure_ui(gui, instance, capture, args)
             elif args.command == 'win32-idle':
                 measure_idle(gui, instance, capture, args, counters_factory(gui))
+            elif args.command == 'win32-c7':
+                measure_c7(gui, instance, capture, args, counters_factory(gui), shells)
             else:
                 measure_resources(gui, instance, capture, args, counters_factory(gui))
             instance.ensure_owned()
@@ -2202,6 +2451,9 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
             report['status'] = 'failed'
             report['errors'].append(str(exc))
             report['failure_cause'] = getattr(exc, 'cause', None) or 'other'
+            if isinstance(exc, stimulus.EnvironmentUnavailable):
+                report['environment_pending'] = True
+                report['status'] = 'pending'
             if getattr(exc, 'instance_pid', None) is not None:
                 report['pid'] = exc.instance_pid
         finally:
@@ -2210,15 +2462,24 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                     report['cleanup'] = instance.close()
                 except Exception as exc:
                     report['status'] = 'failed'
+                    report['environment_pending'] = False
                     report['errors'].append('cleanup: ' + str(exc))
                 try:
                     if instance.log.exists():
                         (target / 'ghostty.log').write_bytes(instance.log.read_bytes())
                 except Exception as exc:
                     report['status'] = 'failed'
+                    report['environment_pending'] = False
                     report['errors'].append('copy raw log: ' + str(exc))
                 report['input_events'] = instance.input_events if isinstance(instance.input_events, list) else []
+            # Cleanup failure must override an environmental exception caught above.
+            # Keep both reasons, but never authorize the matrix to continue input.
+            if report.get('backdrop_teardown_errors'):
+                report['status'] = 'failed'
+                report['environment_pending'] = False
             if capture:
+                if report['errors'] and report['status'] == 'completed':
+                    report['status'] = 'failed'
                 report['metrics'] = summary_table(capture.samples)[1]
                 report['metrics'].update({key: value for key, value in report['missing_metrics'].items() if key not in report['metrics']})
                 missing[label].update(report['missing_metrics'])
@@ -2238,6 +2499,10 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
                 resources.append({'label': label, 'run': run, 'populations': [row['terminal_population'] for row in report['resources']],
                                   'target_ratios': [row.get('targets_per_visible_terminal') for row in report['resources']]})
             batch['runs'][-1]['status'] = report['status']
+            if args.command == 'win32-c7':
+                batch['runs'][-1]['c7_coverage'] = report.get('c7', {}).get('coverage', 'PENDING')
+            if report.get('environment_pending'):
+                batch['runs'][-1]['environment_pending'] = True
             if report.get('failure_cause'):
                 batch['runs'][-1]['failure_cause'] = report['failure_cause']
             batch['runs'][-1]['absolute_gate'] = report.get('absolute_gate', {'status': 'not_evaluated'})
@@ -2247,6 +2512,12 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
         if report['status'] != 'completed':
             break  # Never retry or continue input after a failed guard.
     batch['valid'] = not batch['errors'] and len(batch['runs']) == args.runs * len(labels)
+    batch['environment_pending'] = any(item.get('environment_pending') for item in batch['runs'])
+    if args.command == 'win32-c7':
+        batch['measurement_coverage'] = ('captured' if batch['valid'] and
+            all(item.get('c7_coverage') == 'captured' for item in batch['runs']) else 'PENDING')
+        batch['measurement_units']['threads.context_switches.pdh'] = 'context switches per sampled window'
+        batch['measurement_units']['stimulus.output_bytes'] = 'bytes written to all owned consoles'
     batch['failure_causes'] = sorted({item['failure_cause'] for item in batch['runs'] if item.get('failure_cause')})
     batch['gate_failed'] = any(item['absolute_gate']['status'] == 'FAIL' for item in batch['runs'])
     # 1 = incomplete driver evidence (any observed gate FAIL stays in absolute_gates);
@@ -2281,6 +2552,9 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
     text += ('Driver result: ' + ('complete' if batch['valid'] else 'incomplete (driver error)') +
              ('; absolute gate FAIL observed' if batch['gate_failed'] else '') +
              (f"; failure causes {', '.join(batch['failure_causes'])}" if batch['failure_causes'] else '') + f"; exit {batch['exit']}\n")
+    if args.command == 'win32-c7':
+        text += ('C7 metric coverage: ' + batch['measurement_coverage'] +
+                 '; visual blink/preedit/animation checks remain PENDING; NT endpoints do not substitute for PDH.\n')
     if resources:
         batch['resource_populations'] = resources
         text += ('\nP8: one window, 1/11 tabs, one terminal per tab; dedicated-byte increment denominator=10.\n'
@@ -2326,12 +2600,78 @@ def run_remote(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+def resize_evidence(gui, instance, target: Path, index: int, width: int, height: int,
+                    report: dict, backdrop) -> float:
+    """P7 post-operation evidence, explicitly not a renderer/DWM completion fence."""
+    target.mkdir(parents=True, exist_ok=True)
+    row = {'index': index, 'target_outer_px': [width, height], 'pid': instance.pid,
+           'creation': instance.creation, 'status': 'running', 'strict_final_frame': False,
+           'synchronization': 'SetWindowPos return + WM_NULL response; neither proves a presented frame',
+           'presentation_scope': 'renderer.present counts entry before SwapBuffers, with no size/frame ID',
+           'begin_qpc_ns': time.perf_counter_ns(), 'begin_time_ns': time.time_ns()}
+    report.setdefault('resizes', []).append(row)
+    path = target / f'resize-{index:02d}.json'
+    before = instance.log.read_bytes() if instance.log.exists() else b''
+    row['log_start_byte'] = len(before)
+    try:
+        instance.ensure_foreground()
+        elapsed = instance.resize(width, height)
+        row.update(setwindowpos_ms=elapsed, proxy_timeout=elapsed >= 16.0,
+                   setwindowpos_return_qpc_ns=time.perf_counter_ns())
+        row['wm_null_responded'] = instance.responsive(2)
+        row['wm_null_return_qpc_ns'] = time.perf_counter_ns()
+        info = instance.require_window()
+        rect = gui.win32().raw_window_rect(info.hwnd)
+        row.update(hwnd=info.hwnd, actual_outer_rect_px=list(rect),
+                   actual_outer_px=[rect[2] - rect[0], rect[3] - rect[1]])
+        row['target_size_matched'] = row['actual_outer_px'] == row['target_outer_px']
+        row['terminals'] = [{'hwnd': term.hwnd, 'rect_px': list(term.rect)} for term in instance.terminals(info)]
+        row['capture_begin_qpc_ns'] = time.perf_counter_ns()
+        png = target / f'resize-{index:02d}.png'
+        backdrop.capture(instance, info, 'screen', png.name).save_png(png)
+        row.update(capture_end_qpc_ns=time.perf_counter_ns(), screenshot=str(png),
+                   screenshot_sha256=hashlib.sha256(png.read_bytes()).hexdigest(), visual_review='PENDING')
+        after = instance.log.read_bytes() if instance.log.exists() else b''
+        if not after.startswith(before):
+            raise PerfError('resize log truncated or replaced')
+        row['log_end_byte'] = len(after)
+        segment = after[len(before):]
+        (target / f'resize-{index:02d}.segment.raw').write_bytes(segment)
+        parsed = arm_samples(segment.decode('utf-8', errors='strict'), report.get('baseline', False))
+        full = arm_samples(after.decode('utf-8', errors='strict'), report.get('baseline', False))
+        row['presentation_metrics'] = {}
+        for name, unit in (('renderer.present', ''), ('surface.resize_timeout', 'ms'), ('surface.resize_wait', 'ms')):
+            known = full.units.get(name, report.get('capabilities', {}).get(name))
+            if known is not None and known != unit:
+                raise PerfError(f'{name}: capability/log unit conflict')
+            values = parsed.values.get(name, [])
+            row['presentation_metrics'][name] = {'unit': unit, 'n': len(values), 'values': values,
+                'status': 'observed' if values else 'supported_zero_events' if known is not None else 'not_instrumented'}
+        # surface.resize_timeout is historically record(..., 1), i.e. a 1 us
+        # timing marker. Count occurrences; never sum its normalized ms as events.
+        row['surface_resize_timeout_events'] = (len(parsed.values.get('surface.resize_timeout', []))
+            if row['presentation_metrics']['surface.resize_timeout']['status'] != 'not_instrumented' else None)
+        if not row['wm_null_responded']:
+            instance.record_input('guard', check='p7_wm_null', status='fail', cause='instance_hung',
+                                  reason='P7 WM_NULL did not respond')
+            raise PerfError('P7 WM_NULL did not respond', cause='instance_hung')
+        row['status'] = 'captured'
+        return elapsed
+    except Exception as exc:
+        row.update(status='failed', error=f'{type(exc).__name__}: {exc}')
+        raise
+    finally:
+        row['end_qpc_ns'] = time.perf_counter_ns()
+        write_json(path, row)
+
+
 def measure_win32(gui, exe: Path, env_dir: Path, config: str, resizes: int,
                   env: Mapping[str, str] | None = None, report: dict | None = None) -> list[str]:
     """One Windows run: `metric` lines for startup, a new tab, a split and resizes."""
     instance = gui.launch(exe, env_dir, config=config, env=env)
-    if report is not None:
-        report.update(pid=instance.pid, creation=instance.creation)
+    report = report if report is not None else {}
+    report.update(pid=instance.pid, creation=instance.creation)
+    backdrop = gui.Backdrop(gui.BACKDROP_DEFAULT) if resizes else None
     lines = [f"# gx_perf win32 run of {exe} (pid {instance.pid})"]
     try:
         for mark, value in instance.wait_window(30).items():
@@ -2356,17 +2696,36 @@ def measure_win32(gui, exe: Path, env_dir: Path, config: str, resizes: int,
         window = instance.require_window()
         left, top, right, bottom = gui.win32().raw_window_rect(window.hwnd)
         width, height = right - left, bottom - top
+        resize_tick = last_input_ticks()[0] if resizes else None
+        if backdrop:
+            # Establish the largest privacy cover before timing; backdrop capture
+            # may itself wait for composition. Its timestamps are recorded below.
+            backdrop.ensure(instance, capture=window.rect, band=32)
         for index in range(resizes):
+            c7_input_check(gui, instance, argparse.Namespace(state='visible'), resize_tick)
             smaller = index % 2 == 0
-            elapsed = instance.resize(width - 240 if smaller else width, height - 160 if smaller else height)
-            lines.append(f"metric resize.setwindowpos {elapsed:.2f} ms")
-            time.sleep(0.4)
+            elapsed = resize_evidence(gui, instance, Path(report.get('evidence_dir', env_dir / 'resize-evidence')),
+                index + 1, width - 240 if smaller else width, height - 160 if smaller else height, report, backdrop)
+            lines.append(f"metric resize.setwindowpos {elapsed:.9f} ms")
+            lines.append(f"metric resize.proxy_timeout {int(elapsed >= 16.0)}")
+            events = report['resizes'][-1]['surface_resize_timeout_events']
+            if events is not None:
+                lines.append(f"metric resize.surface_timeout_events {events}")
+            c7_input_check(gui, instance, argparse.Namespace(state='visible'), resize_tick)
         lines.append(f"metric responsive {1 if instance.responsive(2) else 0}")
     finally:
+        active_error = sys.exc_info()[0] is not None
+        report['input_events'] = instance.input_events if isinstance(instance.input_events, list) else []
+        if backdrop:
+            report['backdrop'] = backdrop.finish()
         try:
             instance.close()
-        except gui.GuiError:
-            pass
+        except gui.GuiError as exc:
+            report['cleanup_error'] = str(exc)
+            if not active_error:
+                raise
+        if backdrop and backdrop.teardown_failures() and not active_error:
+            raise PerfError('privacy backdrop cleanup failed: ' + '; '.join(backdrop.teardown_failures()))
     return lines
 
 
@@ -2385,15 +2744,19 @@ def run_win32(args: argparse.Namespace) -> int:
         if not exe.is_file():
             raise PerfError(f"{exe} does not exist")
     labels = labels_for(len(exes), args.label)
+    capabilities = metric_capabilities(getattr(args, 'capabilities', []), labels, exes)
     try:
-        environments = label_environments(labels, args.env, args.label_env, gui.env_assignments)
+        environments = label_environments(labels, ['GHOSTTY_GX_PERF=1', *args.env], args.label_env, gui.env_assignments)
     except gui.UsageError as exc:
         raise PerfError(str(exc)) from None
+    if any(env.get('GHOSTTY_GX_PERF') != '1' for env in environments.values()):
+        raise PerfError('measurement requires GHOSTTY_GX_PERF=1')
     config = Path(args.config).read_text(encoding="utf-8") if args.config else DEFAULT_WIN32_CONFIG
     config += "" if config.endswith("\n") else "\n"
     config += gui.HARNESS_CONFIG
     out = new_output(Path(args.out))
     by_label = dict(zip(labels, exes))
+    run_records = []
     run_report = {}
     def failed(label, name, exc):
         target = out / label / name
@@ -2405,37 +2768,54 @@ def run_win32(args: argparse.Namespace) -> int:
         if getattr(exc, 'instance_pid', None) is not None:
             result['pid'] = exc.instance_pid
         write_json(target.with_suffix('.json'), result)
+        write_json(out / 'RESULT.json', {'schema': 'gx-p7-batch-v1', 'status': 'failed',
+                   'planned_runs': args.runs, 'planned_resizes_per_run': args.resizes,
+                   'runs': run_records, 'failure': result, 'performance_verdict': 'not evaluated'})
         write_json(args.json, result)
         (out / 'SUMMARY.txt').write_text(f'FAILED {label}/{name}: {exc}\n', encoding='utf-8', newline='\n')
         return 1
     for label in labels:
-        run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'warmup'}
+        run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'warmup',
+                      'exe': str(by_label[label]), 'exe_sha256': hashlib.sha256(by_label[label].read_bytes()).hexdigest(),
+                      'capabilities': capabilities[label], 'config': config}
         env_dir = out / label / "env"
         gui.prepare_env_dir(env_dir, fresh=True)
         print(f"{TAG} {label}: warm-up run (discarded)", flush=True)
         try:
             measure_win32(gui, by_label[label], env_dir, config, 0, environments[label], run_report)
-        except gui.GuiError as exc:
+        except Exception as exc:
             print(f"{TAG} {label}: warm-up failed: {exc}", file=sys.stderr)
             return failed(label, 'warmup-failed', exc)
     for run, label in alternate(labels, args.runs):
-        run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'measurement'}
+        run_report = {'baseline': len(labels) == 2 and label == labels[0], 'phase': 'measurement',
+                      'exe': str(by_label[label]), 'exe_sha256': hashlib.sha256(by_label[label].read_bytes()).hexdigest(),
+                      'capabilities': capabilities[label], 'config': config,
+                      'evidence_dir': str(out / label / f'run-{run:02d}-resize')}
         target = out / label / f"run-{run:02d}.txt"
         env_dir = out / label / "env"
         try:
             lines = measure_win32(gui, by_label[label], env_dir, config, args.resizes, environments[label], run_report)
-        except gui.GuiError as exc:
+            if hashlib.sha256(by_label[label].read_bytes()).hexdigest() != run_report['exe_sha256']:
+                raise PerfError('executable changed during run')
+        except Exception as exc:
             print(f"{TAG} {label} run {run} failed: {exc}", file=sys.stderr)
             return failed(label, f'run-{run:02d}', exc)
         lines.insert(0, "# environment " + json.dumps(environments[label], sort_keys=True))
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         write_json(target.with_suffix(".json"), {**run_report, "label": label, "run": run, "env": environments[label]})
+        run_records.append({'label': label, 'run': run, 'path': str(target.with_suffix('.json').relative_to(out)),
+                            'pid': run_report.get('pid'), 'exe_sha256': run_report['exe_sha256'],
+                            'resizes': len(run_report.get('resizes', []))})
         log = gui.log_path(env_dir)
         if log.is_file():
-            target.with_suffix(".log").write_text(log.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            target.with_suffix(".log").write_bytes(log.read_bytes())  # Preserve the resize byte offsets exactly.
         print(f"{TAG} {label} run {run}: " + ", ".join(line.split(None, 1)[1] for line in lines if line.startswith("metric ")
                                                       and not line.startswith("metric resize")), flush=True)
-    return report_runs(out, labels, args.json)
+    code = report_runs(out, labels, args.json)
+    write_json(out / 'RESULT.json', {'schema': 'gx-p7-batch-v1', 'status': 'captured' if code == 0 else 'failed',
+        'planned_runs': args.runs, 'planned_resizes_per_run': args.resizes, 'runs': run_records,
+        'strict_final_frame': False, 'visual_review': 'PENDING', 'performance_verdict': 'not evaluated', 'exit': code})
+    return code
 
 
 def run_gtk(args: argparse.Namespace) -> int:
@@ -2634,6 +3014,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="environment variable for every run, e.g. GHOSTTY_GX_PERF=1 (repeatable)")
     win32.add_argument("--json", type=Path)
     win32.add_argument("--label-env", action="append", default=[], metavar="LABEL:NAME=VALUE")
+    win32.add_argument('--capabilities', action='append', default=[], metavar='LABEL:JSON')
     gtk = commands.add_parser("gtk", allow_abbrev=False, help="measure GTK builds in WSL clones")
     gtk.add_argument("--clone", action="append", required=True, metavar="PATH")
     gtk.add_argument("--case", choices=("standard", "p2", "p4"), default="standard")
@@ -2689,7 +3070,7 @@ def build_parser() -> argparse.ArgumentParser:
     remote.add_argument('paths', nargs='+', type=Path)
     remote.add_argument('--out', type=Path)
     remote.add_argument('--json', type=Path)
-    for name in ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem'):
+    for name in WIN32_DRIVERS:
         experiment = commands.add_parser(name, allow_abbrev=False, help='isolated AB/BA Windows measurement')
         experiment.add_argument('--exe', action='append', required=True)
         experiment.add_argument('--label', action='append', default=[])
@@ -2709,6 +3090,14 @@ def build_parser() -> argparse.ArgumentParser:
             experiment.add_argument('--windows', type=int, default=1)
             experiment.add_argument('--state', choices=('visible', 'unfocused', 'minimized'), default='visible')
             experiment.add_argument('--seconds', type=float, default=60)
+        if name == 'win32-c7':
+            import gx_perf_stimulus as stimulus
+            experiment.add_argument('--case', choices=('matrix', *stimulus.CASES, *stimulus.ANIMATION_CASES), default='matrix')
+            experiment.add_argument('--tabs', type=int, choices=(1, 11), default=1)
+            experiment.add_argument('--seconds', type=float, default=60)
+            experiment.add_argument('--output-bytes', type=int, default=4096,
+                                    help='bytes written by EACH owned terminal at the midpoint')
+            experiment.set_defaults(windows=1, state='visible')
     return parser
 
 
@@ -2758,11 +3147,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.runs < 1:
             raise PerfError("--runs must be at least 1")
         if args.command.startswith('win32-'):
+            if args.command == 'win32-c7':
+                if (not math.isfinite(args.seconds) or args.seconds < 2 or
+                        not 64 <= args.output_bytes <= 1048576):
+                    raise PerfError('C7 requires seconds >= 2 and output bytes in [64, 1048576]')
+                if not args.diagnostic and (args.seconds != 60 or args.runs != 10 or len(args.exe) != 2):
+                    raise PerfError('C7 requires 60 seconds, 10 AB/BA pairs and two builds (or explicit --diagnostic)')
+                args.state = args.case if args.case in ('unfocused', 'minimized') else 'visible'
+                if args.case == 'matrix':
+                    return run_c7_matrix(args)
             if args.command == 'win32-idle' and (not 1 <= args.tabs <= 64 or not 1 <= args.windows <= 16 or
                                                 not math.isfinite(args.seconds) or args.seconds <= 0):
                 raise PerfError('invalid --tabs, --windows or --seconds')
             return run_experiment(args)
         if args.command == "win32":
+            if args.resizes < 0:
+                raise PerfError('--resizes must be nonnegative')
             return run_win32(args)
         return run_gtk(args)
     except (PerfError, OSError, ValueError, subprocess.SubprocessError) as exc:
