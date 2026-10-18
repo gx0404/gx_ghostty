@@ -841,6 +841,80 @@ test "UIA settings focus preserves the retained Toggle provider until a model ed
     try testing.expect(!self.popup.uia_view.publisher.accepts(action));
 }
 
+test "UIA settings hover and press feedback keep the retained provider" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1) };
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    const attachment: gx.ui_ref.Attachment = .{
+        .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+        .revision = 1,
+    };
+    const nodes = [_]uia.NodeSpec{
+        .{ .id = 1, .name = "Settings", .role = .window },
+        .{ .id = 2, .parent = 0, .name = "Scrollbar", .role = .checkbox, .patterns = .{ .toggle = true } },
+    };
+    var self: Settings = .{
+        .alloc = testing.allocator,
+        .app = undefined,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(&config, null),
+    };
+    defer self.arena.deinit();
+    defer self.scratch.deinit();
+    defer self.font_arena.deinit();
+    defer self.changes.deinit();
+    defer self.popup.destroy();
+    // Popup.create normally supplies the input allocator; this fixture never
+    // creates an HWND, so initialize the same ownership explicitly.
+    self.popup.input.alloc = testing.allocator;
+    try self.popup.uia_view.publisher.publish(testing.allocator, &api, &queue, attachment, @ptrFromInt(1), &nodes);
+    const snapshot = self.popup.uia_view.publisher.current.?;
+    const provider = &snapshot.nodes[1].faces[0];
+    const Abi = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+    };
+    const abi: *const Abi = @ptrCast(@alignCast(provider.vtable));
+    _ = abi.AddRef(provider);
+    defer _ = abi.Release(provider);
+    const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .toggle, .value = &.{}, .alloc = testing.allocator };
+    var options: u32 = 0;
+    // The pointer moving over the overlay and leaving it only changes colors.
+    self.setHover(.close);
+    self.setHover(.{ .row = 1 });
+    self.setHover(null);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // Pressing a button or a row shows it pressed; it acts on release. A
+    // press on a field only moves the focus.
+    self.press(&self.popup, .close, false);
+    try testing.expect(std.meta.eql(self.pressed, @as(?Target, .close)));
+    self.press(&self.popup, .{ .row = 1 }, false);
+    self.press(&self.popup, .{ .field = 0 }, false);
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    // Released elsewhere, and a press on empty space: only the look changes.
+    onMouse(&self, &self.popup, .{ .kind = .up, .button = .left, .pos = .{ .x = -100, .y = -100 } });
+    try testing.expect(self.pressed == null);
+    onMouse(&self, &self.popup, .{ .kind = .down, .button = .left, .pos = .{ .x = -100, .y = -100 } });
+    try testing.expectEqual(@as(i32, 0), abi.ProviderOptions(provider, &options));
+    try testing.expect(self.popup.uia_view.publisher.accepts(action));
+    // A model edit still revokes it.
+    self.invalidate();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), abi.ProviderOptions(provider, &options));
+}
+
 // -----------------------------------------------------------------------
 // Data
 // -----------------------------------------------------------------------
@@ -2793,7 +2867,9 @@ fn setHover(self: *Settings, target: ?Target) void {
     if (same) return;
     self.hover = target;
     self.updateTooltip();
-    self.invalidate();
+    // Drawn only: the accessible model does not include the hover, so
+    // providers a client holds stay valid.
+    self.popup.repaint();
 }
 
 fn updateTooltip(self: *Settings) void {
@@ -3015,7 +3091,8 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
             self.tooltip.hide();
             const target = self.hitAt(event.pos) orelse {
                 self.endSizeEdit(true);
-                return self.invalidate();
+                // Only the focus ring goes; a committed size invalidated.
+                return self.popup.repaint();
             };
             self.press(popup, target, event.kind == .double_click);
         },
@@ -3028,9 +3105,13 @@ fn onMouse(ctx: *anyopaque, popup: *Popup, event: Popup.MouseEvent) void {
                 _ = w32.ReleaseCapture();
             };
             if (self.hitAt(event.pos)) |target| {
-                if (std.meta.eql(target, pressed)) self.click(pressed);
+                if (std.meta.eql(target, pressed)) {
+                    self.click(pressed);
+                    return self.invalidate();
+                }
             }
-            self.invalidate();
+            // Released elsewhere: only the pressed look goes.
+            self.popup.repaint();
         },
         .wheel => self.wheel(event.pos, event.wheel),
     }
@@ -3052,6 +3133,8 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
             list.cursor = item.index;
             if (double) return self.activate(rows[item.row]);
             if (field == .themes) self.schedulePreview(.click);
+            // The list cursor is the selection the accessible model shows.
+            return self.invalidate();
         },
         .field => |i| self.focusRow(i),
         .value => |i| {
@@ -3071,7 +3154,9 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
             if (popup.hwnd) |hwnd| _ = w32.SetCapture(hwnd);
         },
     }
-    self.invalidate();
+    // A focus move or the pressed look only changes what is drawn; model
+    // edits (a stepped size, a committed edit) invalidated themselves.
+    self.popup.repaint();
 }
 
 /// The left button went up over `target`, where it went down.
