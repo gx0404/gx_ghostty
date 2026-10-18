@@ -242,6 +242,15 @@ class ImageTests(unittest.TestCase):
 
 
 class ScenarioFileTests(unittest.TestCase):
+    def test_a2_find_shortcut_leaves_f9_for_tab_navigation(self):
+        for number in ('W02', 'W03', 'W08', 'W13', 'W20'):
+            path = next((ROOT / 'test/gui/win32').glob(number + '-*.toml'))
+            text = path.read_text(encoding='utf-8')
+            with self.subTest(path=path.name):
+                self.assertIn('keybind = f12=start_search', text)
+                self.assertNotIn('f9=start_search', text)
+                self.assertNotIn('keys = "f9"', text)
+
     def test_the_windows_scenarios_cover_the_r0_checks(self):
         paths = gui.scenario_paths([])
         scenarios = [gui.load_scenario(path) for path in paths]
@@ -617,15 +626,6 @@ class FakeWin32:
 class InputGuardTests(unittest.TestCase):
     PID = 4242
 
-    def test_held_key_uses_repeat_downs_and_one_release(self):
-        fake = FakeWin32(self.PID, self.PID)
-        with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
-            self.instance().hold_key('down', seconds=2, hz=30)
-        self.assertEqual(61, len(fake.sent))
-        self.assertTrue(all(events == [('key', 0x28, False)] for events in fake.sent[:-1]))
-        self.assertEqual([('key', 0x28, True)], fake.sent[-1])
-
-    def test_drag_checks_pointer_at_every_step(self):
     def test_process_tree_includes_grandchildren_but_not_reused_parent(self):
         instance = self.instance()
         native = mock.Mock()
@@ -650,6 +650,15 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual('instance_gone', raised.exception.cause)
         self.assertEqual('instance_gone', instance.input_events[-1]['cause'])
 
+    def test_held_key_uses_repeat_downs_and_one_release(self):
+        fake = FakeWin32(self.PID, self.PID)
+        with mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
+            self.instance().hold_key('down', seconds=2, hz=30)
+        self.assertEqual(61, len(fake.sent))
+        self.assertTrue(all(events == [('key', 0x28, False)] for events in fake.sent[:-1]))
+        self.assertEqual([('key', 0x28, True)], fake.sent[-1])
+
+    def test_drag_checks_pointer_at_every_step(self):
         fake = FakeWin32(self.PID, self.PID)
         original = fake.send
         def send(events):

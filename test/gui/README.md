@@ -11,6 +11,8 @@
 
 Windows：先 `just build`。看性能或发布形态时，改用 ReleaseFast 构建，再用 `--exe` 指过去。
 
+A2 的 W02、W03、W08、W13、W20 在隔离配置中绑定 `f12=start_search`，以 F12 打开查找栏，避免输入法截获组合键；F9 留给标签导航等场景动作。合入 findkeys 分支后，W20 新增的重新聚焦步骤与 W24 也须由该分支统一使用 F12。
+
 ```sh
 just win-gui list                                   # id、标题、前置条件与副作用
 just win-gui run --out .local/evidence/<任务>/shots W01 W03

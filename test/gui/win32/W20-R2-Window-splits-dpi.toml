@@ -6,7 +6,7 @@ title = "Split drag, closed HWND and deferred background-tab DPI"
 args = ["--confirm-close-surface=true"]
 env = { GHOSTTY_GX_PERF = "1" }
 # Microsoft Pinyin takes Ctrl+Shift+F as its simplified/traditional switch, so this scenario opens
-# the search bar with F9 (start_search, bound below), a key no input method takes: it needs no
+# the search bar with F12 (start_search, bound below), a key no input method takes: it needs no
 # keyboard layout switch and runs the same with any input method.
 config = """
 command = cmd.exe /d /k prompt $G$S
@@ -17,7 +17,7 @@ keybind = f6=new_split:right
 keybind = f7=new_split:down
 keybind = f8=goto_tab:1
 keybind = ctrl+shift+f9=gx:move_split_to_tab
-keybind = f9=start_search
+keybind = f12=start_search
 """
 # Later phases (R2-Surface.06/.07, R2-Window.05/.08/.10/.12): a split with an open search
 # bar moves into a new tab (the bar follows its terminal to the new parent); the open search
@@ -155,7 +155,7 @@ seconds = 0.8
 # R2-Surface.07: the search bar of a split that moves to a new tab.
 [[step]]
 action = "key"
-keys = "f9"
+keys = "f12"
 
 [[step]]
 action = "wait_popup"
