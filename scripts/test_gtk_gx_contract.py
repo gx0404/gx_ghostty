@@ -501,5 +501,32 @@ class TransferRuntimeTests(unittest.TestCase):
         self.assertIn("window.setTitleOverride(title)", source)
 
 
+
+
+class TabCloseRoutingTests(unittest.TestCase):
+    def test_upstream_close_has_string_parameter(self):
+        source = strip_comments((GTK / "class/tab.zig").read_text(encoding="utf-8"))
+        self.assertIn('const s_param_type = glib.ext.VariantType.newFor([:0]const u8)', source)
+        self.assertIn('.init("close", actionClose, s_param_type)', source)
+        self.assertIn('ext.actions.addAsGroup(Self, self, "tab", &actions)', source)
+
+    def test_application_still_activates_close_on_surface(self):
+        source = strip_comments((GTK / "class/application.zig").read_text(encoding="utf-8"))
+        body = source.split("pub fn closeTab(", 1)[1].split("pub fn ", 1)[0]
+        self.assertRegex(body, r'surface\.as\(gtk\.Widget\)\.activateAction\(\s*"tab.close"')
+
+    def test_descendants_do_not_replace_tab_action_group(self):
+        for name in ("split_tree", "surface"):
+            source = strip_comments((GTK / f"class/{name}.zig").read_text(encoding="utf-8"))
+            with self.subTest(name=name):
+                self.assertNotRegex(source, r'insertActionGroup\(\s*"tab"')
+                self.assertNotRegex(source, r'addAsGroup\([^;]*"tab"')
+
+    def test_this_is_forwarded_to_upstream(self):
+        source = strip_comments((GX / "tab_actions.zig").read_text(encoding="utf-8"))
+        self.assertIn('if (mode == .this) return closeThis(tab.as(gtk.Widget))', source)
+        self.assertIn('tab.activateAction("tab.close", "s", @as([*:0]const u8, "this"))', source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,8 @@
 //! `close`, on the split tree of each tab, answers first: GTK looks a
 //! prefixed action up from the widget towards the root and goes on to the
 //! next group with that prefix when one lacks the action, so the tab's
-//! other actions still come from the tab, and no upstream file changes.
+//! other actions still come from the tab. Closing this tab is forwarded to
+//! the upstream action on the Tab itself, above our group.
 const std = @import("std");
 const adw = @import("adw");
 const gio = @import("gio");
@@ -66,20 +67,26 @@ fn actionClose(_: *gio.SimpleAction, param_: ?*glib.Variant, tree: *SplitTree) c
     };
     const tab = ext.getAncestor(Tab, tree.as(gtk.Widget)) orelse return;
     const view = ext.getAncestor(adw.TabView, tab.as(gtk.Widget)) orelse return;
+    if (mode == .this) return closeThis(tab.as(gtk.Widget));
     close(view, view.getPage(tab.as(gtk.Widget)), mode);
+}
+
+fn closeThis(tab: *gtk.Widget) void {
+    _ = tab.activateAction("tab.close", "s", @as([*:0]const u8, "this"));
 }
 
 /// Asks to close what `mode` names from `page`: the page itself, or the
 /// unpinned tabs other than it or after it, like the tab menu.
 fn close(view: *adw.TabView, page: *adw.TabPage, mode: apprt.action.CloseTabMode) void {
     switch (mode) {
-        .this => view.closePage(page),
+        .this => unreachable, // Forwarded to the upstream Tab before entering here.
         .other => window.closeOtherTabs(view, page),
         .right => window.closeTabsRight(view, page),
     }
 }
 
 const TestCounts = struct {
+    tab: ?*gtk.Widget = null,
     tab_close: u32 = 0,
     gx_close: u32 = 0,
     next_page: u32 = 0,
@@ -92,6 +99,7 @@ fn testTabClose(_: *gio.SimpleAction, _: ?*glib.Variant, counts: *TestCounts) ca
 fn testGxClose(_: *gio.SimpleAction, param: ?*glib.Variant, counts: *TestCounts) callconv(.c) void {
     var str: ?[*:0]const u8 = null;
     param.?.get("&s", &str);
+    if (std.mem.eql(u8, std.mem.span(str.?), "this")) return closeThis(counts.tab.?);
     if (std.mem.eql(u8, std.mem.span(str.?), "right")) counts.gx_close += 1;
 }
 
@@ -116,7 +124,7 @@ test "a close group on the split tree answers tab.close and leaves the other tab
     const item = gtk.Button.new();
     tree.append(item.as(gtk.Widget));
 
-    var counts: TestCounts = .{};
+    var counts: TestCounts = .{ .tab = tab.as(gtk.Widget) };
     const tab_group = gio.SimpleActionGroup.new();
     defer tab_group.unref();
     const s_type = glib.ext.VariantType.newFor([:0]const u8);
@@ -144,6 +152,13 @@ test "a close group on the split tree answers tab.close and leaves the other tab
     try testing.expect(item.as(gtk.Widget).getSensitive() == 0);
     next.setEnabled(1);
     try testing.expect(item.as(gtk.Widget).getSensitive() != 0);
+
+    // From the surface, this forwards to upstream exactly once, without
+    // recursing through our group or implementing upstream close semantics.
+    try testing.expect(surface.as(gtk.Widget).activateAction("tab.close", "s", @as([*:0]const u8, "this")) != 0);
+    try testing.expectEqual(@as(u32, 1), counts.tab_close);
+    try testing.expectEqual(@as(u32, 1), counts.gx_close);
+    counts.tab_close = 0;
 
     // Above the split tree the tab's own close still answers.
     try testing.expect(tab.as(gtk.Widget).activateAction("tab.close", "s", @as([*:0]const u8, "this")) != 0);
@@ -176,10 +191,6 @@ test "closing from a key binding keeps the pinned tabs" {
     close(view, pages[0], .right);
     try testing.expectEqual(@as(c_int, 2), view.getNPages());
     for ([_]*adw.TabPage{ pages[0], pages[1] }) |page| try testing.expect(view.getPagePosition(page) >= 0);
-
-    // close_tab:this closes the tab, pinned or not.
-    close(view, pages[1], .this);
-    try testing.expectEqual(@as(c_int, 1), view.getNPages());
 }
 
 fn testConfirmClose(view: *adw.TabView, page: *adw.TabPage, _: ?*anyopaque) callconv(.c) c_int {
