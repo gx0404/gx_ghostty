@@ -468,6 +468,7 @@ fn prepareHost(self: *Palette) bool {
         .dark = t.dark,
         .keep_owner_active = true,
         .accessible_name = i18n.tr("Command Palette"),
+        .reuse_host = true,
     }, .{
         .ctx = self,
         .paint = paint,

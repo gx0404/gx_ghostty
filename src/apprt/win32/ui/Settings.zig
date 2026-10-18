@@ -504,6 +504,7 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming, preparing: bool) bool
             .border_color = t.border,
             .dark = t.dark,
             .accessible_name = i18n.tr(msg.settings),
+            .reuse_host = true,
         }, .{
             .ctx = self,
             .paint = paint,

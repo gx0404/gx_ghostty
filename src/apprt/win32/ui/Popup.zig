@@ -23,6 +23,9 @@
 //! hidden popup ignores it. When Windows destroys the popup with its owner
 //! (WM_NCDESTROY), `hwnd` becomes null and the render target goes; the
 //! owner frees the rest with `destroy` or recreates it with `create`.
+//! A host kept hidden between openings (`Options.reuse_host`) cannot be
+//! activated while hidden; any show makes a popup that takes input
+//! activatable, also when it bypasses `show` (`mayActivate`).
 //! With `Options.keep_owner_active` an activating popup sends
 //! `WM_GX_OWNER_ACTIVE_LOCK` (wparam 1) to its root owner before it takes
 //! activation and (wparam 0) once it hid or lost activation, so the owner
@@ -267,6 +270,12 @@ pub const Options = struct {
     /// (`Callbacks.dismissed` with `.owner`). Popups that never take the
     /// focus only hide.
     close_owner_on_close: bool = true,
+    /// A host kept hidden between openings for reuse (the command palette,
+    /// the settings): while hidden (created, prepared or closed) it cannot
+    /// be activated (`WS_EX_NOACTIVATE`), so neither preparing it nor an
+    /// outside caller takes the focus from the window. Any show makes an
+    /// activating host activatable again (`mayActivate`).
+    reuse_host: bool = false,
 };
 
 /// Sent (not posted) to the root owner window of a popup with
@@ -298,6 +307,11 @@ uia_cookie: u64 = 0,
 uia_refreshing: bool = false,
 uia_layout_pending: bool = true,
 visible: bool = false,
+/// Created with `Options.activate`: the popup takes input, so it is
+/// activatable whenever it is shown (`mayActivate`). Owners that clear
+/// `options.activate` around one `show` that must not take the focus (the
+/// remote inspector) do not change it.
+activatable: bool = false,
 /// An invalidated host may finish its active transaction, but cannot be reused
 /// by a later opening (configuration/DPI/device generation changed).
 reuse_invalid: bool = false,
@@ -349,6 +363,18 @@ const DWMWA_CLOAK: u32 = 13;
 const HTTRANSPARENT: isize = -1;
 const WM_NCHITTEST: u32 = 0x0084;
 const WM_NCDESTROY: u32 = 0x0082;
+const WM_WINDOWPOSCHANGING: u32 = 0x0046;
+const WM_WINDOWPOSCHANGED: u32 = 0x0047;
+const SWP_HIDEWINDOW: u32 = 0x0080;
+const WINDOWPOS = extern struct {
+    hwnd: ?w32.HWND,
+    hwndInsertAfter: ?w32.HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: u32,
+};
 const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_RBUTTONDBLCLK: u32 = 0x0206;
 const WM_IME_CHAR: u32 = 0x0286;
@@ -434,9 +460,10 @@ pub fn create(
     self.freeResources();
 
     const layered = options.motion != null and anim.enabled();
-    // Hidden/prepared hosts must never activate. show restores activation for
-    // interactive widgets, hide removes it again; TOOLWINDOW excludes Alt-Tab.
-    var ex_style: u32 = w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE;
+    // TOOLWINDOW keeps every popup out of Alt+Tab. A hidden reuse host must
+    // never activate; an input popup is activatable in every show path.
+    var ex_style: u32 = w32.WS_EX_TOOLWINDOW;
+    if (!mayActivate(options.activate, options.reuse_host, false)) ex_style |= w32.WS_EX_NOACTIVATE;
     if (layered) ex_style |= w32.WS_EX_LAYERED;
     const hwnd = w32.CreateWindowExW(
         ex_style,
@@ -460,6 +487,7 @@ pub fn create(
         .composition_requested = dcomp.enabled(),
         .alloc = factory.alloc,
         .options = options,
+        .activatable = options.activate,
         .callbacks = callbacks,
         .uia_cookie = uia_cookie,
         .dpi = dpiOf(owner),
@@ -610,7 +638,7 @@ pub fn show(self: *Popup, rect: w32.RECT) void {
 
     self.uiaDetach();
     self.successful_frame = null;
-    self.setActivationStyle(self.options.activate);
+    self.syncActivationStyle(true);
     if (self.open_timing) |*timing| timing.showing = true;
     if (self.options.activate and self.options.keep_owner_active) self.lockOwner();
     const motion = if (self.layered) self.options.motion else null;
@@ -688,6 +716,21 @@ pub fn prepareHidden(self: *Popup, rect: w32.RECT) void {
     _ = w32.SendMessageW(hwnd, w32.WM_PAINT, 0, 0);
 }
 
+/// Whether the popup window may be activated (no `WS_EX_NOACTIVATE`): one
+/// that takes input may be in every show path, including those that bypass
+/// `show` (`SearchBar.showInactive`, `Palette.adoptShown`, the owner coming
+/// back from minimized), except a reuse host while it is hidden.
+fn mayActivate(activatable: bool, reuse_host: bool, shown: bool) bool {
+    return activatable and (shown or !reuse_host);
+}
+
+/// Set the activation style for the popup being `shown` or hidden. Every
+/// show and hide passes here (`show`, `hide`, and WM_WINDOWPOSCHANGING /
+/// WM_WINDOWPOSCHANGED for the paths that do not use them).
+fn syncActivationStyle(self: *Popup, shown: bool) void {
+    self.setActivationStyle(mayActivate(self.activatable, self.options.reuse_host, shown));
+}
+
 fn setActivationStyle(self: *Popup, activate: bool) void {
     const hwnd = self.hwnd orelse return;
     const old = w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE);
@@ -706,6 +749,124 @@ test "P4 reuse hidden hosts cannot activate and remain tool windows" {
     try std.testing.expect(hidden & w32.WS_EX_NOACTIVATE != 0);
     try std.testing.expect(hidden & tool == tool);
     try std.testing.expectEqual(tool, activationStyle(hidden, true));
+}
+
+test "P4 only a hidden reuse host refuses activation" {
+    // Input popups (find bar, dialogs, inspector): activatable hidden or shown.
+    try std.testing.expect(mayActivate(true, false, false));
+    try std.testing.expect(mayActivate(true, false, true));
+    // Palette and settings hosts: not while hidden or prepared, yes once shown.
+    try std.testing.expect(!mayActivate(true, true, false));
+    try std.testing.expect(mayActivate(true, true, true));
+    // Previews, tooltips, menus: never.
+    for ([_]bool{ false, true }) |reuse| for ([_]bool{ false, true }) |shown| {
+        try std.testing.expect(!mayActivate(false, reuse, shown));
+    };
+}
+
+/// Real (hidden, cloaked, off-screen) popup windows for activation tests;
+/// nothing is ever activated or drawn on the desktop.
+const ActivationFixture = struct {
+    const MA_ACTIVATE_: isize = 1;
+
+    fn paint(_: *anyopaque, _: *Popup, _: *d2d.Canvas) void {}
+
+    fn owner() !w32.HWND {
+        const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+        return w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse error.TestWindowFailed;
+    }
+
+    fn noActivate(hwnd: w32.HWND) bool {
+        const bits: usize = @bitCast(w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE));
+        return bits & w32.WS_EX_NOACTIVATE != 0;
+    }
+
+    /// What a left click asks the popup before Windows activates it.
+    fn mouseActivate(hwnd: w32.HWND, owner_hwnd: w32.HWND) isize {
+        const lparam: isize = (@as(isize, w32.WM_LBUTTONDOWN) << 16) | @as(isize, w32.HTCLIENT);
+        return w32.SendMessageW(hwnd, w32.WM_MOUSEACTIVATE, @intFromPtr(owner_hwnd), lparam);
+    }
+
+    /// `SearchBar.showInactive` (and an outside `ShowWindow` that
+    /// `Palette.adoptShown` adopts): shown without `Popup.show`.
+    fn showInactive(popup: *Popup) void {
+        const hwnd = popup.hwnd.?;
+        setCloaked(hwnd, true);
+        _ = w32.SetWindowPos(hwnd, null, -32000, -32000, 64, 32, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+        _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+        popup.visible = true;
+    }
+};
+
+test "P4 an input popup shown outside Popup.show stays click-activatable" {
+    // The find bar comes back with SearchBar.showInactive when its tab is
+    // shown again or its split moved to another window. A click on it must
+    // activate it and give it the keyboard (WM_MOUSEACTIVATE answers
+    // MA_ACTIVATE and no WS_EX_NOACTIVATE refuses it), or typing goes on to
+    // the terminal under it and Enter runs in the shell.
+    const testing = std.testing;
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    var context: u8 = 0;
+    var find: Popup = .{};
+    defer find.destroy();
+    try find.create(hinstance, owner, factory, .{
+        .activate = true,
+        .text_input = true,
+        .dismiss_on_escape = false,
+        .dismiss_on_outside_click = false,
+        .keep_owner_active = true,
+    }, .{ .ctx = &context, .paint = ActivationFixture.paint });
+    const hwnd = find.hwnd.?;
+    try testing.expect(!ActivationFixture.noActivate(hwnd));
+    ActivationFixture.showInactive(&find);
+    try testing.expect(!ActivationFixture.noActivate(hwnd));
+    try testing.expectEqual(ActivationFixture.MA_ACTIVATE_, ActivationFixture.mouseActivate(hwnd, owner));
+    // The tab is hidden again and comes back once more.
+    find.hide();
+    try testing.expect(!ActivationFixture.noActivate(hwnd));
+    ActivationFixture.showInactive(&find);
+    try testing.expect(!ActivationFixture.noActivate(hwnd));
+    try testing.expectEqual(ActivationFixture.MA_ACTIVATE_, ActivationFixture.mouseActivate(hwnd, owner));
+
+    // The remote inspector clears options.activate around one show that must
+    // not take the focus; clicking it afterwards still activates it.
+    var inspector: Popup = .{};
+    defer inspector.destroy();
+    try inspector.create(hinstance, owner, factory, .{ .activate = true, .dismiss_on_outside_click = false, .close_owner_on_close = false }, .{ .ctx = &context, .paint = ActivationFixture.paint });
+    inspector.options.activate = false;
+    inspector.show(.{ .left = -32000, .top = -32000, .right = -31936, .bottom = -31968 });
+    inspector.options.activate = true;
+    try testing.expect(inspector.visible);
+    try testing.expect(!ActivationFixture.noActivate(inspector.hwnd.?));
+    inspector.hide();
+    try testing.expect(!ActivationFixture.noActivate(inspector.hwnd.?));
+
+    // A reuse host (palette, settings) refuses activation only while hidden,
+    // also when an outside caller shows it by handle (Palette.adoptShown).
+    var host: Popup = .{};
+    defer host.destroy();
+    try host.create(hinstance, owner, factory, .{ .activate = true, .text_input = true, .reuse_host = true }, .{ .ctx = &context, .paint = ActivationFixture.paint });
+    const host_hwnd = host.hwnd.?;
+    try testing.expect(ActivationFixture.noActivate(host_hwnd));
+    ActivationFixture.showInactive(&host);
+    try testing.expect(!ActivationFixture.noActivate(host_hwnd));
+    try testing.expectEqual(ActivationFixture.MA_ACTIVATE_, ActivationFixture.mouseActivate(host_hwnd, owner));
+    host.hide();
+    try testing.expect(ActivationFixture.noActivate(host_hwnd));
+
+    // A preview never activates, shown or not.
+    var preview: Popup = .{};
+    defer preview.destroy();
+    try preview.create(hinstance, owner, factory, .{ .activate = false }, .{ .ctx = &context, .paint = ActivationFixture.paint });
+    try testing.expect(ActivationFixture.noActivate(preview.hwnd.?));
+    ActivationFixture.showInactive(&preview);
+    try testing.expect(ActivationFixture.noActivate(preview.hwnd.?));
+    try testing.expectEqual(w32.MA_NOACTIVATE, ActivationFixture.mouseActivate(preview.hwnd.?, owner));
+    preview.hide();
 }
 
 fn place(self: *Popup, hwnd: w32.HWND, rect: w32.RECT) void {
@@ -749,7 +910,7 @@ pub fn hide(self: *Popup) void {
     self.endMotion(hwnd);
     // After hiding: the owner has the activation back by now.
     self.unlockOwner();
-    self.setActivationStyle(false);
+    self.syncActivationStyle(false);
     if (self.options.release_target_on_hide) self.discardTarget();
 }
 
@@ -1936,6 +2097,21 @@ fn wndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_ERASEBKGND => return 1,
+        WM_WINDOWPOSCHANGING => {
+            // Before the window appears, whichever path shows it (`show`,
+            // `SearchBar.showInactive`, an outside ShowWindow, the owner
+            // restored): a popup that takes input can be clicked active.
+            const pos: *const WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (pos.flags & w32.SWP_SHOWWINDOW != 0) self.syncActivationStyle(true);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        WM_WINDOWPOSCHANGED => {
+            // Hidden by any path: a reuse host refuses activation again.
+            const pos: *const WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (pos.flags & SWP_HIDEWINDOW != 0) self.syncActivationStyle(false);
+            // DefWindowProc sends WM_SIZE and WM_MOVE.
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_SHOWWINDOW => {
             // Restoring the owner shows the popups that minimizing it hid,
             // including one hidden in the meantime (a find bar whose
