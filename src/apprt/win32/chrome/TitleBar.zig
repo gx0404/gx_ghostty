@@ -171,6 +171,9 @@ pub const Decoration = enum {
 
 fn buttonFromHitCode(code: usize) Button {
     return switch (code) {
+        // Minimize answers `WM_NCHITTEST` with `HTCLIENT` (`ncHitCode`);
+        // should the default handling ever report `HTMINBUTTON`, it is
+        // still the button.
         HTMINBUTTON => .minimize,
         HTMAXBUTTON => .maximize,
         HTCLOSE => .close,

@@ -291,7 +291,9 @@ pub fn hit(lay: Layout, x: i32, y: i32, tabs: bool) Hit {
     return .caption;
 }
 
-/// The `WM_NCHITTEST` answers for the chrome row.
+/// What a point of the chrome row is for `WM_NCHITTEST`. `TitleBar`
+/// answers `.minimize` with `HTCLIENT` (minimize takes client input,
+/// `TitleBar.ncHitCode`) and the others with their hit-test codes.
 pub const NcHit = enum { client, caption, top, top_left, top_right, minimize, maximize, close };
 
 /// What `WM_NCHITTEST` reports for client point (`x`, `y`) of `lay` that
@@ -325,8 +327,9 @@ pub fn ncHit(lay: Layout, x: i32, y: i32, tabs: bool) NcHit {
 /// window at content scale `scale` needs: the least `ptMinTrackSize` of
 /// `WM_GETMINMAXINFO`. The integrated title bar row then still holds the
 /// caption buttons, the main menu button, a strip to drag the window by
-/// and a tab with the new-tab buttons; a terminal's `size_limit` can raise
-/// it further.
+/// and one complete active tab with the overflow controls and the new-tab
+/// buttons, with room for the administrator badge (`min_tab_parts`); a
+/// terminal's `size_limit` can raise it further.
 pub fn minTrackSize(scale: f32) Size {
     var width = 2 * px(frame_border, scale) + px(left_margin_caption, scale) + px(drag_reserve_caption, scale) +
         px(menu_button_width, scale) + px(menu_gap_caption, scale) + 3 * px(caption_button_width, scale);
