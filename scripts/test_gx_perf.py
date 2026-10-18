@@ -25,7 +25,7 @@ if str(SCRIPTS) not in sys.path:
 
 import gx_perf  # noqa: E402
 import gx_wsl  # noqa: E402
-from test_gx_wsl import stat_line  # noqa: E402
+from test_gx_wsl import monotonic_times, stat_line  # noqa: E402
 
 
 def ticks(idle_seconds: float, now: int = 50_000_000) -> dict:
@@ -85,6 +85,69 @@ def gtk_fixture(root: Path, thread_comm: str | None = None) -> dict:
             "artifact_sha256": {name: gx_perf.hashlib.sha256((root / name).read_bytes()).hexdigest() for name in files}}
     (root / "perf-meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return meta
+
+
+class GtkClockEvidenceTests(unittest.TestCase):
+    def fixture(self, root):
+        meta = gtk_fixture(root)
+        meta.update(schema="gx-gtk-perf-v2", clock_schema="gx-gtk-monotonic-ns-v1", clock_unit="ns")
+        values = monotonic_times()
+        self.persist(root, meta, values)
+        return meta, values
+
+    def persist(self, root, meta, values):
+        times = "\n".join(f"{key} {value}" for key, value in values.items()) + "\n"
+        (root / "perf-times.txt").write_text(times, encoding="utf-8", newline="\n")
+        for name in meta["files"]:
+            meta["artifact_sha256"][name] = gx_perf.hashlib.sha256((root / name).read_bytes()).hexdigest()
+        (root / "perf-meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def test_collector_accepts_v2_wall_jumps_and_v1_history(self):
+        for modern in (False, True):
+            with self.subTest(modern=modern), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root) if modern else gtk_fixture(root)
+                meta, samples = gx_perf.gtk_evidence(root / "perf-meta.json")
+                self.assertEqual("gx-gtk-perf-v2" if modern else "gx-gtk-perf-v1", meta["schema"])
+                self.assertEqual([1000.0], samples.values["window_seconds"])
+
+    def test_collector_rejects_clock_corruption_even_with_updated_artifact_hash(self):
+        for fault in ("missing", "reverse", "nanoseconds", "duration", "unit", "version", "strip-all", "downgrade", "meta-unit"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                meta, values = self.fixture(root)
+                if fault == "missing":
+                    del values["workload_begin_monotonic_ns"]
+                elif fault == "reverse":
+                    values["window_monotonic_ns"] = values["launch_monotonic_ns"] - 1
+                elif fault == "nanoseconds":
+                    values["window_monotonic_ns"] += 1
+                elif fault == "duration":
+                    values["window_seconds"] = 1.000000002  # Same displayed ms, different raw ns.
+                elif fault == "unit":
+                    values["clock_unit"] = "us"
+                elif fault == "version":
+                    values["clock_schema"] = "unknown"
+                elif fault == "strip-all":
+                    values = {k: v for k, v in values.items() if not k.startswith("clock_") and not k.endswith("_monotonic_ns")}
+                elif fault == "downgrade":
+                    meta["schema"] = "gx-gtk-perf-v1"
+                    del meta["clock_schema"], meta["clock_unit"]
+                elif fault == "meta-unit":
+                    meta["clock_unit"] = "s"
+                self.persist(root, meta, values)
+                with self.assertRaises(gx_perf.PerfError):
+                    gx_perf.gtk_evidence(root / "perf-meta.json")
+
+    def test_historical_negative_window_is_not_repaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meta = gtk_fixture(root)
+            values = {"pid": 10, "workload_finished": 1, "run_exit": 0,
+                      "window_seconds": -0.36676621437072754, "workload_seconds": 1}
+            self.persist(root, meta, values)
+            with self.assertRaisesRegex(gx_perf.PerfError, "missing or invalid window_seconds"):
+                gx_perf.gtk_evidence(root / "perf-meta.json")
 
 
 LOG = """18:15:01.100 [1] info(gx_perf): first_frame 183456us

@@ -272,7 +272,7 @@ def gtk_evidence(path: Path) -> tuple[dict, Samples]:
 
 def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
     meta = read_json(path)
-    if meta.get("schema") != "gx-gtk-perf-v1":
+    if meta.get("schema") not in ("gx-gtk-perf-v1", "gx-gtk-perf-v2"):
         raise PerfError(f"{path}: unknown GTK evidence schema")
     if meta.get("valid") is not True or meta.get("exit") != 0 or meta.get("errors"):
         raise PerfError(f"{path}: rejected GTK run: {meta.get('errors', [])}")
@@ -338,6 +338,7 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
             raise ValueError("source changed since normal build or during smoke")
         namespace["validate_receipt"](receipt, source, executable, version, meta.get("version_exit"))
         before, after, times = raw("-tasks-before.txt"), raw("-tasks-after.txt"), raw("-times.txt")
+        namespace["validate_clock"](namespace["parse_times"](times), meta)
         namespace["measurement"](before, after, times)
         for text in (before, after):
             task = namespace["parse_tasks"](text).get(str(identity["pid"]), {})
