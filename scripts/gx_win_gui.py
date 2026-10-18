@@ -47,7 +47,10 @@ with the window's DPI (or the DPI a `dpi` step simulated); negative values count
 right or bottom edge. Before every SendInput the foreground window must belong to the
 instance, and before every mouse event the window under the point too, otherwise nothing is
 sent and the command fails. Text is typed with KEYEVENTF_UNICODE; chords are real virtual
-keys with scan codes and the extended-key flag.
+keys with scan codes and the extended-key flag. With GX_PERF_GUARD_LOG set (scripts/gx_perf.py
+quiet-batch) every guard, release and unexpected end of the instance is appended as one
+gx-input-guard-v1 JSON line; a refusal carries `cause` (instance_gone, foreground_lost,
+pointer_target_lost, foreign_input, other) and title-free facts about the window in the way.
 
 Screenshots: `screen` (default) copies the window's visible bounds from the screen like
 CopyFromScreen and fails if another process's window covers it; `print` uses PrintWindow with
@@ -141,7 +144,21 @@ class UsageError(GuiError):
 
 
 class InputBlocked(GuiError):
-    """Input was not sent because the foreground or pointed-at window is not the instance's."""
+    """Input was not sent because the foreground or pointed-at window is not the instance's.
+
+    `cause` classifies the refusal for the gx-input-guard-v1 audit: instance_gone (the
+    instance ended or its process identity changed), foreground_lost, pointer_target_lost,
+    foreign_input (input this tool did not send was observed) or other. `details` holds
+    title-free facts about the window in the way (other_pid, other_class, other_image)."""
+
+    CAUSES = ("instance_gone", "foreground_lost", "pointer_target_lost", "foreign_input", "other")
+
+    def __init__(self, message: str, cause: str = "other", **details: Any) -> None:
+        if cause not in self.CAUSES:
+            raise ValueError(f"unknown input-block cause {cause!r}")
+        super().__init__(message)
+        self.cause = cause
+        self.details = details
 
 
 # ---------------------------------------------------------------------------
@@ -905,11 +922,17 @@ def input_guard(function):
         try:
             result = function(self, *args, **kwargs)
         except InputBlocked as exc:
-            self.record_input('guard', check=function.__name__, status='fail', reason=str(exc))
+            self.record_input('guard', check=function.__name__, status='fail', cause=exc.cause, reason=str(exc), **exc.details)
             raise
         self.record_input('guard', check=function.__name__, status='pass')
         return result
     return checked
+
+
+def image_name(pid: int) -> str | None:
+    """Base name of a process image (no path, no window title); None when unreadable."""
+    image = win32().process_image(pid) if pid else None
+    return Path(image).name if image else None
 
 
 @dataclass
@@ -922,6 +945,8 @@ class Instance:
     simulated_dpi: int | None = None
     children: list[list[Any]] = field(default_factory=list)  # [pid, creation, image name]
     input_events: list[dict] = field(default_factory=list)
+    closing: bool = False  # close() started: an ending process is expected from now on
+    gone_noted: bool = False  # the unexpected end was already audited once
 
     def record_input(self, event: str, **data) -> None:
         row = {'schema': 'gx-input-guard-v1', 'event': event, 'time_ns': time.time_ns(),
@@ -931,6 +956,13 @@ class Instance:
         if path := os.environ.get('GX_PERF_GUARD_LOG'):
             with Path(path).open('a', encoding='utf-8', newline='\n') as stream:
                 stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+    def note_gone(self, reason: str) -> None:
+        """Audit, once, that the instance ended or changed identity without this tool closing it.
+        quiet-batch reads cause instance_gone as a product/driver failure, never as noise."""
+        if not (self.closing or self.gone_noted):
+            self.gone_noted = True
+            self.record_input('instance', status='fail', cause='instance_gone', reason=reason)
 
     def release_input(self, events, control: str, aborted: bool) -> None:
         # Release only what this operation pressed. Never move the pointer,
@@ -975,7 +1007,9 @@ class Instance:
 
     def ensure_owned(self) -> None:
         if not self.alive():
-            raise InputBlocked(f"Ghostty 实例 {self.pid} 已结束或进程身份已变化；未发送输入或执行界面操作")
+            message = f"Ghostty 实例 {self.pid} 已结束或进程身份已变化；未发送输入或执行界面操作"
+            self.note_gone(message)
+            raise InputBlocked(message, cause="instance_gone")
 
     def remember_children(self) -> None:
         w = win32()
@@ -990,8 +1024,10 @@ class Instance:
         """Close the instance: WM_CLOSE to its windows, then terminate it and its leftover child processes."""
         w = win32()
         if not self.alive():
+            self.note_gone(f"Ghostty 实例 {self.pid} 在关闭前已结束或进程身份已变化")
             return "not running"
         self.remember_children()
+        self.closing = True
         for info in self.windows():
             if info.cls == WINDOW_CLASS:
                 w.PostMessageW(info.hwnd, WM_CLOSE, 0, 0)
@@ -1093,7 +1129,8 @@ class Instance:
         if pid != self.pid:
             name = w.class_name(hwnd) if hwnd else "none"
             raise InputBlocked(f"the foreground window {hwnd:#x} ({name}, pid {pid}) is not ghostty pid {self.pid}; "
-                               "no input was sent")
+                               "no input was sent", cause="foreground_lost",
+                               other_pid=pid, other_class=name, other_image=image_name(pid))
 
     @input_guard
     def ensure_point(self, x: int, y: int) -> None:
@@ -1102,8 +1139,10 @@ class Instance:
         hwnd = w.window_at(x, y)
         if not hwnd or (w.window_pid(hwnd) != self.pid and w.root_owner_pid(hwnd) != self.pid):
             pid = w.window_pid(hwnd) if hwnd else 0
-            raise InputBlocked(f"the window at ({x}, {y}) is {hwnd:#x} ({w.class_name(hwnd) if hwnd else 'none'}, "
-                               f"pid {pid}), not ghostty pid {self.pid}; no input was sent")
+            name = w.class_name(hwnd) if hwnd else "none"
+            raise InputBlocked(f"the window at ({x}, {y}) is {hwnd:#x} ({name}, pid {pid}), not ghostty pid {self.pid}; "
+                               "no input was sent", cause="pointer_target_lost",
+                               other_pid=pid, other_class=name, other_image=image_name(pid))
 
     def activate(self, kind: str = "main") -> None:
         self.ensure_owned()

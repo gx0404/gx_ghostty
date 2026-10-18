@@ -429,6 +429,9 @@ class FakeWin32:
     def mouse_input(self, flags, x=0, y=0, data=0):
         return ("mouse", flags, x, y, data)
 
+    def top_windows(self, pid):
+        return []
+
     def send(self, inputs):
         self.sent.append(list(inputs))
 
@@ -494,6 +497,59 @@ class InputGuardTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.instance().drag((10, 10), (20, 20), release=False)
         self.assertEqual([('mouse', 0x4, 0, 0, 0)], fake.sent[-1])
+
+    def guard_rows(self, action, fake, env_dir=None):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'guards.jsonl'
+            instance = gui.Instance(self.PID, "C:/g/ghostty.exe", Path(env_dir or temp), creation=1, launched=0)
+            with mock.patch.dict(os.environ, {'GX_PERF_BATCH_ID': 'batch', 'GX_PERF_GUARD_LOG': str(log)}), \
+                    mock.patch.object(gui, 'win32', return_value=fake), mock.patch.object(gui.time, 'sleep'):
+                with self.assertRaises(gui.InputBlocked) as blocked:
+                    action(instance)
+            rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+        return blocked.exception, rows, instance
+
+    def test_guard_failures_carry_a_structured_cause(self):
+        error, rows, _ = self.guard_rows(lambda instance: instance.press('enter'), FakeWin32(foreground_pid=16136, point_pid=self.PID))
+        self.assertEqual('foreground_lost', error.cause)
+        self.assertEqual([('guard', 'ensure_foreground', 'fail', 'foreground_lost')],
+                         [(row['event'], row['check'], row['status'], row['cause']) for row in rows])
+        self.assertEqual((16136, 'Chrome_WidgetWin_1', 'ghostty.exe'), (rows[0]['other_pid'], rows[0]['other_class'], rows[0]['other_image']))
+        self.assertNotIn('title', rows[0])
+        error, rows, _ = self.guard_rows(lambda instance: instance.mouse(5, 6), FakeWin32(foreground_pid=self.PID, point_pid=999))
+        self.assertEqual('pointer_target_lost', error.cause)
+        self.assertEqual([('ensure_foreground', 'pass', None), ('ensure_point', 'fail', 'pointer_target_lost')],
+                         [(row['check'], row['status'], row.get('cause')) for row in rows])
+        self.assertEqual(999, rows[-1]['other_pid'])
+        with self.assertRaisesRegex(ValueError, 'cause'):
+            gui.InputBlocked('x', cause='typo')
+        self.assertEqual('other', gui.InputBlocked('legacy message').cause)
+
+    def test_instance_gone_is_audited_once_and_not_after_an_intended_close(self):
+        fake = FakeWin32(self.PID, self.PID)
+        fake.alive = False
+        def act(instance):
+            try:
+                instance.press('enter')
+            finally:
+                with self.assertRaises(gui.InputBlocked):
+                    instance.windows()  # a second detection must not add a second instance row
+        error, rows, instance = self.guard_rows(act, fake)
+        self.assertEqual('instance_gone', error.cause)
+        self.assertEqual([('instance', 'fail', 'instance_gone'), ('guard', 'fail', 'instance_gone')],
+                         [(row['event'], row['status'], row['cause']) for row in rows])
+        self.assertEqual([], fake.sent)
+        # close() that finds the process already gone audits the unexpected end too.
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'guards.jsonl'
+            with mock.patch.dict(os.environ, {'GX_PERF_BATCH_ID': 'batch', 'GX_PERF_GUARD_LOG': str(log)}), \
+                    mock.patch.object(gui, 'win32', return_value=fake):
+                self.assertEqual('not running', self.instance().close())
+                closing = self.instance()
+                closing.closing = True  # an end this tool caused is not audited
+                closing.note_gone('expected')
+            rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([('instance', 'instance_gone')], [(row['event'], row['cause']) for row in rows])
 
     def test_completion_inside_a_caller_except_block_is_not_an_abort(self):
         fake = FakeWin32(self.PID, self.PID)
