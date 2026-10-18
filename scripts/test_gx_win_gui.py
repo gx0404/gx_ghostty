@@ -2246,6 +2246,18 @@ class BackdropScenarioTests(unittest.TestCase):
         report, _, _ = self.run_scenario(BackdropScenarioTests.CAPTURE, fail=True)
         self.assertRegex(report["reason"], r"^capture failed; the privacy backdrop was not destroyed \(")
 
+    def test_notes_warn_about_a_material_that_shows_the_wallpaper(self):
+        self.assertEqual("gx-window-material = mica", gui.wallpaper_material("a = 1\ngx-window-material = mica\n"))
+        self.assertIsNone(gui.wallpaper_material("gx-window-material = mica\ngx-window-material = solid\n"))
+        self.assertEqual("gx-window-material = acrylic, background-blur = 20",
+                         gui.wallpaper_material("background-blur = 20\n", ["--gx-window-material=acrylic"]))
+        self.assertIsNone(gui.wallpaper_material("background-blur = false\n", ["--gx-window-material="]))
+        w14 = gui.load_scenario(next(gui.SCENARIO_DIR.glob("W14-*.toml")))
+        self.assertIn("wallpaper: gx-window-material = mica makes DWM sample the desktop wallpaper",
+                      gui.notes_text(w14, {"status": "ok"}))
+        _, notes, _ = self.run_scenario(BackdropScenarioTests.CAPTURE)
+        self.assertNotIn("wallpaper:", notes)
+
     def test_a_scenario_without_the_backdrop_says_so(self):
         body = 'backdrop = false\nbackdrop_reason = "W14 checks the wallpaper"\n' + BackdropScenarioTests.CAPTURE
         report, notes, pngs = self.run_scenario(body)

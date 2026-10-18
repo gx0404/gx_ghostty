@@ -119,7 +119,9 @@ backdrop that cannot be destroyed fails the scenario. run.json lists every check
 band pieces, pixels counted, foreign windows by class, pid and image, no titles). The session
 commands capture and pixel do the same with --method screen: a backdrop of their own (--backdrop,
 default #000000) for that one command, destroyed before it returns (exit 1 when that fails);
---no-backdrop REASON captures without one and prints a warning.
+--no-backdrop REASON captures without one and prints a warning. A window material (a
+gx-window-material other than solid, or background-blur) makes DWM sample the desktop wallpaper,
+which no backdrop covers; notes.txt says so for such a scenario.
 
 Keyboard layouts: layout, the layout step and ime_off only switch to a layout GetKeyboardLayoutList
 reports for this user: they post WM_INPUTLANGCHANGEREQUEST to the window's focused thread and wait up
@@ -3353,6 +3355,24 @@ class ScenarioRun:
             pass
 
 
+def wallpaper_material(config: str, args: Sequence[str] = ()) -> str | None:
+    """The settings that make DWM sample the desktop wallpaper behind the window (a gx-window-material
+    other than solid, background-blur): the privacy backdrop does not cover the wallpaper."""
+    settings: dict[str, str] = {}
+    for line in config.splitlines():
+        if match := re.fullmatch(r"\s*(gx-window-material|background-blur)\s*=\s*(.*?)\s*", line):
+            settings[match[1]] = match[2]
+    for arg in args:
+        if match := re.fullmatch(r"--(gx-window-material|background-blur)=(.*)", arg):
+            settings[match[1]] = match[2].strip()
+    found = []
+    if settings.get("gx-window-material", "solid") not in ("", "solid"):
+        found.append(f"gx-window-material = {settings['gx-window-material']}")
+    if settings.get("background-blur", "false") not in ("", "false", "0"):
+        found.append(f"background-blur = {settings['background-blur']}")
+    return ", ".join(found) or None
+
+
 def notes_text(scenario: Scenario, report: Mapping[str, Any]) -> str:
     backdrop = report.get("backdrop") or {"initial": {"color": scenario.backdrop, "reason": scenario.backdrop_reason}}
     initial = backdrop["initial"]
@@ -3360,6 +3380,9 @@ def notes_text(scenario: Scenario, report: Mapping[str, Any]) -> str:
              else f"backdrop: OFF ({initial['reason']}); screen captures may show the desktop behind the window")
     if any(event.get("event") == "set" for event in backdrop.get("events", [])):
         shown += "; a backdrop step changed it, see run.json"
+    if material := wallpaper_material(scenario.full_config(), scenario.args):
+        shown += (f"\nwallpaper: {material} makes DWM sample the desktop wallpaper behind the window, which the "
+                  "backdrop does not cover: the screenshots may show it")
     lines = [f"{scenario.id} {scenario.title}", f"status: {report['status']}" +
              (f" ({report['reason']})" if report.get("reason") else ""), shown, "",
              "Read every screenshot before recording PASS. Expected:"]
