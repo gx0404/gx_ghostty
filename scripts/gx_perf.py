@@ -21,6 +21,9 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         New/empty DIR only; no automatic warm-up; AB/BA order. DIR/<label>/run-NN/ holds raw evidence,
         gtk-runs.json preserves every planned run, RESULT.json records validity (not a performance verdict).
         Missing/failed/changed-identity runs cannot be filtered into success.
+        --case p2|p4 selects the isolated idle/UI driver (default: standard, unchanged C1 load).
+        P2/P4 require 10 runs; --capabilities LABEL:JSON_FILE binds instrumentation to source/exe.
+        Their separate action schema retains unknown counters; exit 4 means a failed absolute gate.
   quiet --out DIR [--slot-root DIR] [--idle-seconds 600] [--wait --interval 900 --max-attempts 3]
         [--strict-blacklist] [--input-observe-only]
         Read-only checks under the criteria named in the JSON (r6-13:20 user ruling): this project's
@@ -43,7 +46,7 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         gate and the end input check are recorded, never gate; it refuses commands that drive the
         Windows desktop (gx_win_gui, gx_perf win32 drivers, test/windows fixtures, ghostty.exe), and a
         batch that still writes gx_win_gui guard rows is an ERROR.
-        Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* driver exited 4), 3 NOT_STARTED/INVALID (quiet
+        Exit 0 VALID, 4 FAIL (quiet valid; a gx_perf win32-* or GTK P2/P4 driver exited 4), 3 NOT_STARTED/INVALID (quiet
         criteria not met), 2 ERROR (tool/driver), 5 NONCOMPLIANT (thresholds below plan §4),
         6 PRODUCT_FAIL (a measured Ghostty instance ended or hung mid-batch, or win32-idle saw it activate
         or restore itself without input: cause instance_gone, instance_hung or instance_self_activated).
@@ -68,7 +71,7 @@ Samples come from these lines:
   - the `startup_ms` block of a scripts/gx_win_gui.py run.json (startup.<mark>).
 Times are reported in milliseconds; metrics without a unit are counts. p90 is the nearest-rank
 90th percentile. Exit codes: 0 success, 1 a failed measurement run, 2 usage errors or no samples,
-4 a complete win32-* batch whose new-arm absolute gate failed (truthful FAIL evidence).
+4 a complete win32-* or GTK P2/P4 batch whose new-arm absolute gate failed (truthful FAIL evidence).
 """
 
 from __future__ import annotations
@@ -1105,10 +1108,24 @@ WIN32_DRIVERS = ('win32-ui', 'win32-idle', 'win32-gpu', 'win32-mem')
 
 
 def gate_exit_contract(command: Sequence[str]) -> bool:
-    """Whether exit 4 of `command` means "complete batch, absolute gate FAIL". Only the
+    """Whether exit 4 means an absolute gate FAIL (including direct GTK P2/P4).
     gx_perf.py win32-* drivers promise that (run_experiment), run as
     `python ... gx_perf.py win32-ui ...` or `just perf win32-ui ...` (just passes the
-    exit code through). Exit 4 of anything else is not a measured FAIL."""
+    exit code through). Direct GTK P2/P4 includes just calls normalized by observe mode.
+    Exit 4 of anything else is not a measured FAIL."""
+    # Interpret GTK options with the actual parser, not a token search: --case
+    # may also occur as an option value. Never unwrap a shell or module launcher.
+    if len(command) >= 3 and process_name(command[1]) == 'gx_perf.py' and command[2] == 'gtk':
+        if process_name(command[0]).removesuffix('.exe') not in ('python', 'python3', 'py') and command[0] != sys.executable:
+            return False
+        import contextlib
+        import io
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                args = build_parser().parse_args(list(command[2:]))
+        except SystemExit:
+            return False
+        return args.case in ('p2', 'p4')
     names = [process_name(part) for part in command]
     for index in range(len(command) - 1):
         if command[index + 1] not in WIN32_DRIVERS:
@@ -1192,7 +1209,7 @@ def product_failure_runs(out_dir: Path | None, rows: Sequence[Mapping]) -> list[
 
 
 def measurement_state(raised: bool, exit_code, gate_contract: bool = True) -> str:
-    """The command's own result: 0 complete, 4 absolute gate FAIL (win32-* drivers only),
+    """The command's own result: 0 complete, 4 absolute gate FAIL (recognized drivers),
     anything else a driver/tool error."""
     if raised or exit_code is None:
         return 'DRIVER_ERROR'
@@ -1332,7 +1349,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                     result['ended_ns'] = time.time_ns()
                     result['measurement'] = measurement_state(raised, result['command_exit'], result['gate_exit_contract'])
                     if result['command_exit'] == 4 and not result['gate_exit_contract']:
-                        result['errors'].append('exit 4 means an absolute gate FAIL only for gx_perf.py win32-* drivers; '
+                        result['errors'].append('exit 4 means an absolute gate FAIL only for gx_perf.py win32-* drivers or direct gtk --case p2/p4; '
                                                 'this command is not one, so it is a driver/tool error')
                     try:
                         evidence = guard_evidence(guard_log, result['batch_id'])
@@ -2422,6 +2439,12 @@ def run_win32(args: argparse.Namespace) -> int:
 
 
 def run_gtk(args: argparse.Namespace) -> int:
+    if getattr(args, "case", "standard") != "standard":
+        sys.path.insert(0, str(SCRIPTS))
+        import gx_perf_gtk
+        return gx_perf_gtk.run(args)
+    if getattr(args, "capabilities", []):
+        raise PerfError("--capabilities is only supported by gtk --case p2 or p4")
     sys.path.insert(0, str(SCRIPTS))
     import gx_wsl
 
@@ -2613,6 +2636,9 @@ def build_parser() -> argparse.ArgumentParser:
     win32.add_argument("--label-env", action="append", default=[], metavar="LABEL:NAME=VALUE")
     gtk = commands.add_parser("gtk", allow_abbrev=False, help="measure GTK builds in WSL clones")
     gtk.add_argument("--clone", action="append", required=True, metavar="PATH")
+    gtk.add_argument("--case", choices=("standard", "p2", "p4"), default="standard")
+    gtk.add_argument("--capabilities", action="append", default=[], metavar="LABEL:JSON_FILE",
+                     help="P2/P4 source/exe-bound instrumentation declaration; missing means unknown")
     gtk.add_argument("--label", action="append", default=[])
     gtk.add_argument("--distro")
     gtk.add_argument("--out", type=Path, required=True)

@@ -115,6 +115,10 @@ GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来
 
 第 6 阶段新增工具：`win32-ui --case p3|p4|p5|p6`、`win32-idle --tabs 1|11 --windows N --state visible|unfocused|minimized --seconds 60`、`win32-gpu`、`win32-mem`；都用重复的 `--exe`/`--label`、`--out` 与 `--runs 10` 组织 AB/BA，`--capabilities LABEL:JSON` 将可证明零事件的指标能力绑定到实际映像哈希，缺声明或缺旧版埋点保持 unknown/n=0，不补造零。`remote <日志目录…>` 只归约真实远程夹具日志，不自行驱动迁移；保留 bytes/count 与 ms 的区别。`gtk` 与 `win32` 可用 `--label-env LABEL:NAME=VALUE` 给变体单独设置环境。`info(gx_perf): metric <name> <n>` 是无单位计数，不按微秒换算；原始时间日志保留单位，统计统一换算为 ms。
 
+GTK 的 `gtk --case p2|p4` 使用独立的动作采样合同，默认省略 `--case`（或 `standard`）仍为原 C1 完整负载，不改变旧命令。P2 每臂十轮、交替 1/11 标签，各采 60 秒；P4 每轮对主菜单和设置分别预热一次再热打开三次，热中位数必须每轮均不超过 6.25 ms，路径扫描计数为零。`--capabilities LABEL:JSON` 声明 `source`、`exe_sha256`、`metrics`（计数单位 `""`、耗时 `"ms"`），必须匹配实际源身份与映像，并有真实日志通道证据，才可解释无计数行为；缺指标为 unknown。驱动验证正常 ReleaseFast receipt、起止身份、原始日志区间和完整 AB/BA，P2 用带随机标记且有截止时间的客户端响应往返证明 GUI 主循环仍工作；P4 必须由完整 AT-SPI 树确认打开和关闭，查询错误、缺子节点或超时不能当作已关闭。
+
+上述 GTK 动作采样需要 Xvfb、可用的会话 D-Bus 与 AT-SPI 库/桥接；隔离环境显式启用 `GHOSTTY_GX_PERF=1`、`GHOSTTY_LOG=stderr`、`NO_AT_BRIDGE=0`、`GTK_A11Y=atspi`。输出保留 `plan.json`、每轮 raw、receipt、状态记录、截图与 `gx-gtk-actions-v1` 汇总，不套用 C1 的 3000000 负载完成证明。十轮或指标不全时不能签收；脚本退出 0 不代替截图阅读，门值失败退出 4、工具错误退出 2。使用 `quiet-batch --input-observe-only` 直接包装该入口，不在子命令里另拿槽。
+
 `quiet --out <新目录>` 只读检查并落 JSON：0 表示当下满足、3 表示不满足、2 表示探测错误；它不为后续测量持锁。实际批次使用 `quiet-batch --out <新目录> --timeout 0 [--injected-input|--input-observe-only] -- <直接命令>`，自行持有全部重型与桌面槽，禁止外套 `Invoke-Heavy`/`Invoke-Desktop` 或嵌套槽。批次前后检查本项目构建/测试、验证 VM 已停、活动会话、槽与输入；按用户 2026-10-18 裁定，ToDesk 等原黑名单及全机 CPU 只记录，`--strict-blacklist` 才恢复旧黑名单门。桌面批次开始前仍需空闲 600 秒，注入输入批次用 `--injected-input` 读取守门行，无注入时核对整个区间没有新输入。
 
 仅 WSL/Xvfb 批次用 `--input-observe-only`，输入只记录。命令白名单仅允许直接 Python 的 `gx_perf.py gtk`、`gx_wsl.py smoke/scenario` 及等价 just 入口；just 入口先规范化成测量工作目录下的直接 Python argv，同一向量用于验证和执行且 `shell=False`，不会二次解释参数。`pwsh/cmd` 包装、任意脚本、`python -m`、`gx_wsl run` 等均拒绝；模式与实际守门行不符为 ERROR。WSL 克隆参数写成 `--clone=~/src/...`，避免 PowerShell 把独立 `~` 参数展开成 Windows 用户目录。
