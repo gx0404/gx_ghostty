@@ -6,6 +6,7 @@ the input guard. Nothing here starts Ghostty or sends input; the Win32 backend i
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import io
 import itertools
 import struct
@@ -18,6 +19,7 @@ import unittest
 import zlib
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -25,6 +27,152 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import gx_win_gui as gui  # noqa: E402
+
+
+class StartupNative(gui.Win32):
+    """Actual window enumeration/FILETIME wrappers with only OS calls mocked."""
+
+    def __init__(self, pid=42, creation=123, polls=None):
+        class FILETIME(ctypes.Structure):
+            _fields_ = [('low', ctypes.c_uint32), ('high', ctypes.c_uint32)]
+
+        self.FILETIME = FILETIME
+        self.wt = SimpleNamespace(DWORD=ctypes.c_uint32)
+        self.pid, self.creation = pid, creation
+        self.hwnd, self.cloak_hresult = 101, 0
+        self.image = 'C:/g/ghostty.exe'
+        self.polls = iter(polls or [(creation + 100_000, True, True, False)])
+        self.present = self.visible = self.cloak = False
+
+        def filetime(pointer, value):
+            pointer._obj.low, pointer._obj.high = value & 0xFFFFFFFF, value >> 32
+
+        def now(pointer):
+            ticks, self.present, self.visible, self.cloak = next(self.polls)
+            filetime(pointer, ticks)
+
+        def times(_handle, created, *_rest):
+            filetime(created, self.creation)
+            return True
+
+        def window_pid(_hwnd, pointer):
+            pointer._obj.value = self.pid
+            return 1
+
+        def class_name(_hwnd, buffer, _size):
+            buffer.value = gui.WINDOW_CLASS
+            return len(buffer.value)
+
+        def dwm(_hwnd, attribute, pointer, _size):
+            assert attribute == 14
+            pointer._obj.value = int(self.cloak)
+            return self.cloak_hresult
+
+        self.GetSystemTimePreciseAsFileTime = mock.Mock(side_effect=now)
+        self.GetProcessTimes = mock.Mock(side_effect=times)
+        self._open = mock.Mock(return_value=1)
+        self.CloseHandle = mock.Mock()
+        self.process_alive = mock.Mock(return_value=True)
+        self.process_image = mock.Mock(side_effect=lambda _pid: self.image)
+        self.GetWindowThreadProcessId = mock.Mock(side_effect=window_pid)
+        self.GetClassNameW = mock.Mock(side_effect=class_name)
+        self.GetWindowLongPtrW = mock.Mock(return_value=0)
+        self.IsWindowVisible = mock.Mock(side_effect=lambda _hwnd: self.visible)
+        self.DwmGetWindowAttribute = mock.Mock(side_effect=dwm)
+        self.window_text = mock.Mock(return_value='')
+        self.window_rect = mock.Mock(return_value=(0, 0, 100, 100))
+        self.WNDENUMPROC = lambda fn: fn
+        self.EnumWindows = mock.Mock(side_effect=lambda fn, arg: fn(self.hwnd, arg) if self.present else True)
+
+
+def observe_startup(directory, *, evidence=False, pid=42, creation=123, native=None):
+    """Produce evidence through wait_window, never synthesize a startup log row."""
+    native = native or StartupNative(pid, creation)
+    instance = gui.Instance(pid, native.image, Path(directory) / 'env', creation, creation - 1)
+    options = {'startup_evidence': Path(directory) / 'startup-observation.json'} if evidence else {}
+    with mock.patch.object(gui, 'win32', return_value=native), mock.patch.object(gui.time, 'sleep'):
+        marks = instance.wait_window(30, **options)
+    return instance, marks
+
+
+class StartupObservationTests(unittest.TestCase):
+    def test_real_polling_retains_p1_marks_and_raw_filetime_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            birth = 134_000_000_000_000_123
+            polls = [(birth + 10_000, False, False, False), (birth + 20_000, True, False, True),
+                     (birth + 30_000, True, True, True), (birth + 40_000, True, True, False)]
+            native = StartupNative(creation=birth, polls=polls)
+            instance, marks = observe_startup(root, evidence=True, creation=birth, native=native)
+            self.assertEqual(marks, dict(created_ms=2, visible_ms=3, shown_ms=4))
+            raw = json.loads((root / 'startup-observation.json').read_text(encoding='utf-8'))
+            self.assertEqual(raw['start_filetime_100ns'], birth)
+            self.assertEqual(raw['end_filetime_100ns'], birth + 40_000)
+            self.assertEqual(raw['window']['hwnd'], native.hwnd)
+            self.assertEqual(raw['confirmation']['birth'], birth)
+            self.assertEqual(gui.startup_shown_ms(raw, pid=42, creation=birth), marks['shown_ms'])
+            self.assertNotIn('shown_ms', raw)
+            self.assertFalse(instance.log.exists())
+            self.assertEqual(native.GetSystemTimePreciseAsFileTime.call_count, 4)
+            # Legacy mode takes the same timestamps and returns the same marks.
+            legacy = StartupNative(creation=birth, polls=polls)
+            with mock.patch.object(legacy, 'startup_window_state', side_effect=AssertionError('not opted in')):
+                _, old_marks = observe_startup(root, creation=birth, native=legacy)
+            self.assertEqual(old_marks, marks)
+            self.assertEqual(legacy.GetSystemTimePreciseAsFileTime.call_count, 4)
+
+    def test_raw_dwm_failure_cannot_masquerade_as_uncloaked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = StartupNative()
+            native.cloak_hresult = -1
+            with self.assertRaisesRegex(gui.GuiError, 'uncloaked'):
+                observe_startup(tmp, evidence=True, native=native)
+            self.assertFalse((Path(tmp) / 'startup-observation.json').exists())
+
+    def test_changed_pid_birth_or_window_state_during_confirmation_rejects(self):
+        for case in ('pid', 'birth', 'hidden', 'cloaked', 'class', 'toolwindow'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                native = StartupNative()
+                original = native.startup_window_state
+                def confirm(hwnd):
+                    if case == 'pid':
+                        native.pid += 1
+                    elif case == 'birth':
+                        native.creation += 1
+                    elif case == 'hidden':
+                        native.visible = False
+                    elif case == 'cloaked':
+                        native.cloak = True
+                    elif case == 'class':
+                        native.GetClassNameW.side_effect = lambda _h, buf, _n: setattr(buf, 'value', 'OtherWindow')
+                    else:
+                        native.GetWindowLongPtrW.return_value = 0x80
+                    return original(hwnd)
+                with mock.patch.object(native, 'startup_window_state', side_effect=confirm), self.assertRaises(gui.GuiError):
+                    observe_startup(tmp, evidence=True, native=native)
+                self.assertFalse((Path(tmp) / 'startup-observation.json').exists())
+
+    def test_never_overwrites_evidence_or_app_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance, _ = observe_startup(tmp, evidence=True)
+            path = Path(tmp) / 'startup-observation.json'
+            original = path.read_bytes()
+            with self.assertRaises(gui.GuiError):
+                instance.wait_window(1, startup_evidence=path)
+            self.assertEqual(path.read_bytes(), original)
+            # Reject even a not-yet-created app log before touching the OS.
+            with self.assertRaises(gui.GuiError):
+                instance.wait_window(1, startup_evidence=instance.log)
+            self.assertFalse(instance.log.exists())
+
+    def test_timeout_or_gone_process_produces_no_success_record(self):
+        for gone in (False, True):
+            with self.subTest(gone=gone), tempfile.TemporaryDirectory() as tmp:
+                native = StartupNative(polls=[(10_123, True, False, True)])
+                native.process_alive.return_value = not gone
+                with mock.patch.object(gui.time, 'monotonic', side_effect=[0, 31]), self.assertRaises(gui.GuiError):
+                    observe_startup(tmp, evidence=True, native=native)
+                self.assertFalse((Path(tmp) / 'startup-observation.json').exists())
 
 # The R0 acceptance checks every Windows scenario set must keep covering (W01-W15).
 R0_COVERAGE = {

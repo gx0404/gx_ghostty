@@ -850,6 +850,62 @@ class WindowInfo:
                 + (" toolwindow" if self.toolwindow else "") + (f" {self.title!r}" if self.title else ""))
 
 
+STARTUP_OBSERVATION_SCHEMA = 'gx-gui-startup-observation-v1'
+STARTUP_OBSERVATION_CLOCK = {
+    'unit': 'filetime_100ns',
+    'start_source': 'GetProcessTimes.creation',
+    'end_source': 'GetSystemTimePreciseAsFileTime',
+    'end_phase': 'poll_begin_before_window_enumeration',
+}
+
+
+def startup_shown_ms(raw: dict, *, pid: int, creation: int, kind: str = 'main') -> float:
+    """Validate GUI facts and reduce the existing P1 FILETIME definition.
+
+    The endpoint precedes enumeration, just like wait_window's original marks.
+    It is not a native product event or a QPC interval. Confirmation is a later
+    OS query of the same HWND, not a replacement timestamp.
+    """
+    def positive_int(value):
+        return type(value) is int and 0 < value < 2**64
+
+    try:
+        if (not isinstance(raw, dict) or set(raw) != {'schema', 'producer', 'clock', 'pid',
+                'window_kind', 'start_filetime_100ns', 'end_filetime_100ns', 'window', 'confirmation'} or
+                not positive_int(pid) or pid >= 2**32 or not positive_int(creation) or
+                raw['schema'] != STARTUP_OBSERVATION_SCHEMA or
+                raw['producer'] != 'gx_win_gui.Instance.wait_window' or
+                raw['clock'] != STARTUP_OBSERVATION_CLOCK or
+                raw['window_kind'] != kind or kind not in ('main', 'quick')):
+            raise ValueError('schema, clock or process identity')
+        for key in ('pid', 'start_filetime_100ns', 'end_filetime_100ns'):
+            if not positive_int(raw[key]):
+                raise ValueError(key)
+        if (raw['pid'] != pid or raw['start_filetime_100ns'] != creation or
+                raw['end_filetime_100ns'] < creation):
+            raise ValueError('PID, creation or reversed endpoints')
+        window, confirmation = raw['window'], raw['confirmation']
+        if (not isinstance(window, dict) or set(window) != {'hwnd', 'cls', 'visible', 'cloaked', 'toolwindow'} or
+                not isinstance(confirmation, dict) or set(confirmation) !=
+                {'hwnd', 'pid', 'birth', 'cls', 'visible', 'toolwindow', 'cloaked', 'cloak_hresult'}):
+            raise ValueError('raw window endpoints')
+        for endpoint in (window, confirmation):
+            if (not positive_int(endpoint['hwnd']) or endpoint['cls'] != WINDOW_CLASS or
+                    endpoint['visible'] is not True or
+                    endpoint['toolwindow'] is not (kind == 'quick')):
+                raise ValueError('HWND, class or visible/main state')
+        if (window['cloaked'] is not False or
+                any(type(confirmation[key]) is not int or confirmation[key] != 0
+                    for key in ('cloak_hresult', 'cloaked')) or
+                not positive_int(confirmation['pid']) or not positive_int(confirmation['birth']) or
+                confirmation['hwnd'] != window['hwnd'] or
+                (confirmation['pid'], confirmation['birth']) != (pid, creation)):
+            raise ValueError('HWND ownership, birth or uncloaked state')
+        return (raw['end_filetime_100ns'] - raw['start_filetime_100ns']) / 10_000
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GuiError('invalid startup observation: ' + str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class StackEntry:
     """A visible top-level window of any process, in z-order; its title is never read."""
@@ -1232,6 +1288,16 @@ class Win32:
         if self.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), ctypes.sizeof(value)) != 0:  # DWMWA_CLOAKED
             return False
         return value.value != 0
+
+    def startup_window_state(self, hwnd: int) -> dict:
+        """Raw confirmation for opt-in startup evidence; retain DWM failures."""
+        value = self.wt.DWORD(0)
+        hr = self.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), ctypes.sizeof(value))
+        pid = self.window_pid(hwnd)
+        return dict(hwnd=hwnd, pid=pid, birth=self.process_creation(pid),
+                    cls=self.class_name(hwnd), visible=bool(self.IsWindowVisible(hwnd)),
+                    toolwindow=bool(self.GetWindowLongPtrW(hwnd, -20) & 0x80),
+                    cloaked=value.value, cloak_hresult=hr)
 
     def window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
         rect = self.RECT()
@@ -2020,8 +2086,16 @@ class Instance:
             raise GuiError(f"ghostty pid {self.pid} shows no {kind} window")
         return info
 
-    def wait_window(self, timeout: float, kind: str = "main") -> dict[str, float]:
-        """Wait until the window is created, visible and uncloaked; milliseconds after launch for each."""
+    def wait_window(self, timeout: float, kind: str = "main", *,
+                    startup_evidence: Path | None = None) -> dict[str, float]:
+        """Wait for created/visible/uncloaked; milliseconds after process creation.
+
+        Optional evidence is a separate, exclusive raw JSON observation. The
+        returned marks and their original FILETIME sampling point are unchanged.
+        """
+        if startup_evidence is not None:
+            if startup_evidence.resolve() == self.log.resolve() or startup_evidence.exists():
+                raise GuiError('startup evidence must be a new file separate from the app log')
         w = win32()
         marks: dict[str, float] = {}
         deadline = time.monotonic() + timeout
@@ -2032,8 +2106,21 @@ class Instance:
                 marks["created_ms"] = (now - self.creation) / 10_000
             if any(info.visible for info in infos) and "visible_ms" not in marks:
                 marks["visible_ms"] = (now - self.creation) / 10_000
-            if any(info.visible and not info.cloaked for info in infos):
+            shown = next((info for info in infos if info.visible and not info.cloaked), None)
+            if shown is not None:
                 marks["shown_ms"] = (now - self.creation) / 10_000
+                if startup_evidence is not None:
+                    raw = dict(schema=STARTUP_OBSERVATION_SCHEMA, producer='gx_win_gui.Instance.wait_window',
+                        clock=dict(STARTUP_OBSERVATION_CLOCK), pid=self.pid, window_kind=kind,
+                        start_filetime_100ns=self.creation, end_filetime_100ns=now,
+                        window=dict(hwnd=shown.hwnd, cls=shown.cls, visible=shown.visible,
+                                    cloaked=shown.cloaked, toolwindow=shown.toolwindow),
+                        confirmation=w.startup_window_state(shown.hwnd))
+                    startup_shown_ms(raw, pid=self.pid, creation=self.creation, kind=kind)
+                    with startup_evidence.open('x', encoding='utf-8', newline='\n') as stream:
+                        stream.write(json.dumps(raw, indent=2) + '\n')
+                        stream.flush()
+                        os.fsync(stream.fileno())
                 return marks
             if not w.process_alive(self.pid):
                 message = f"ghostty exited before showing a {kind} window; see {self.log}"

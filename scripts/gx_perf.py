@@ -2641,7 +2641,10 @@ def run_experiment(args, gui=None, counters_factory=NativeCounters) -> int:
             instance = gui.launch(exe, target / 'env', config=run_config, env=envs[label])
             report.update(pid=instance.pid, creation=instance.creation)
             write_json(target / 'run.json', report)
-            report['startup_ms'] = instance.wait_window(30)
+            if args.command == 'win32-c6':
+                report['startup_ms'] = instance.wait_window(30, startup_evidence=target / font.STARTUP_FILE)
+            else:
+                report['startup_ms'] = instance.wait_window(30)
             instance.activate()
             time.sleep(1)
             capture = CaptureRun(instance, target, report)
