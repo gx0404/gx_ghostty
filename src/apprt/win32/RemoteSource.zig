@@ -15,6 +15,7 @@ const win_input = @import("../../gx/win32_input.zig");
 const terminal = @import("../../terminal/main.zig");
 const w32 = @import("win32.zig");
 const perf = @import("../../gx/perf.zig");
+const RemoteControls = @import("RemoteControls.zig");
 
 fn trace(comptime format: []const u8, args: anytype) void {
     if (!@import("remote_test.zig").enabled()) return;
@@ -65,6 +66,8 @@ pub const State = struct {
         selection: ?terminal.Selection = null,
     } = null,
     view: protocol.SurfaceState,
+    test_applied: RemoteControls.Applied = .{},
+    test_snapshot: ?protocol.TestState = null,
 
     fn transaction(self: *State) !u64 {
         self.serial = std.math.add(u64, self.serial, 1) catch return error.Exhausted;
@@ -171,6 +174,7 @@ pub fn drain(app: *App) void {
         if (surface.remote_source_state) |state| {
             drainQueue(state) catch {};
             publishState(state) catch {};
+            if (@import("remote_test.zig").enabled()) publishTestState(state) catch {};
         }
     }
 }
@@ -197,6 +201,65 @@ fn publishState(state: *State) !void {
     state.view.cursor_width = ime.width;
     state.view.cursor_height = ime.height;
     if (!sameViewState(&previous, &state.view)) try state.surface.app.remote.postToTarget(state.surface.ui_reference, .{ .surface_state = state.view });
+}
+
+fn publishTestState(state: *State) !void {
+    const snapshot = readTestState(true, state) orelse return;
+    if (state.test_snapshot) |previous| if (std.meta.eql(previous, snapshot)) return;
+    try state.surface.app.remote.postToTarget(state.surface.ui_reference, .{ .test_state = snapshot });
+    state.test_snapshot = snapshot;
+}
+
+fn readTestState(enabled: bool, state: *State) ?protocol.TestState {
+    if (!enabled) return null;
+    if (!state.surface.core_surface_ready) return null;
+    const core = &state.surface.core_surface;
+    const scrollbar = block: {
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
+        break :block core.io.terminal.screens.active.pages.scrollbar();
+    };
+    return .{
+        .surface = state.surface.ui_reference,
+        .lease = state.lease,
+        .total = scrollbar.total,
+        .viewport = scrollbar.len,
+        .offset = scrollbar.offset,
+        .applied = state.test_applied.count,
+    };
+}
+
+test "remote fixture snapshot reads real terminal scrollback and disabled gate touches nothing" {
+    try std.testing.expectEqual(@as(?protocol.TestState, null), readTestState(false, undefined));
+    const alloc = std.testing.allocator;
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.* = undefined;
+    surface.ui_reference = .{ .epoch = 1, .kind = .surface, .id = 5, .generation = 1 };
+    surface.core_surface_ready = false;
+    const lease: protocol.Lease = .{ .holder_epoch = 2, .transaction = 3, .generation = 4 };
+    var state: State = .{ .surface = surface, .lease = lease, .view = .{ .surface = surface.ui_reference, .lease = lease } };
+    try std.testing.expectEqual(@as(?protocol.TestState, null), readTestState(true, &state));
+    surface.core_surface_ready = true;
+    const core = &surface.core_surface;
+    core.io.terminal = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+    defer core.io.terminal.deinit(alloc);
+    var mutex: std.Io.Mutex = .init;
+    core.renderer_state = .{ .mutex = &mutex, .terminal = &core.io.terminal };
+    for (0..99) |_| try core.io.terminal.linefeed();
+    state.test_applied.count = 9;
+    const bottom = readTestState(true, &state).?;
+    try std.testing.expectEqual(@as(u64, 100), bottom.total);
+    try std.testing.expectEqual(@as(u64, 24), bottom.viewport);
+    try std.testing.expectEqual(@as(u64, 76), bottom.offset);
+    try std.testing.expectEqual(@as(u64, 9), bottom.applied);
+    try std.testing.expectEqual(surface.ui_reference, bottom.surface);
+    try std.testing.expectEqual(lease, bottom.lease);
+    core.io.terminal.scrollViewport(.top);
+    const top = readTestState(true, &state).?;
+    try std.testing.expectEqual(bottom.total, top.total);
+    try std.testing.expectEqual(@as(u64, 0), top.offset);
+    try std.testing.expectEqual(bottom.applied, top.applied);
 }
 
 fn sameViewState(first: *const protocol.SurfaceState, second: *const protocol.SurfaceState) bool {
@@ -392,6 +455,7 @@ fn dispatchInput(state: *State, event: *const protocol.Input) !void {
 }
 
 fn markCompletedPerfInput(state: *State, event: *const protocol.Input) void {
+    if (@import("remote_test.zig").enabled()) state.test_applied.note(true, state.chain == null, event);
     if (state.chain == null) markPerfInput(state.surface, event);
 }
 
