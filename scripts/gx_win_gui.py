@@ -48,7 +48,18 @@ env, args, requires, side_effects and expect, and [[step]] tables, each an actio
   gpu_reset [terminal]                  assert_responsive [timeout]      resize width height
   wait_terminals count [timeout window] wait_popup [cls timeout present new]
   close [timeout]                       file path text (a file inside the isolated profile)
+  backdrop [color enabled reason]       switch the privacy backdrop for the following steps
 A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end.
+
+Privacy backdrop: a scenario covers the work areas of the monitors its instance's windows are on
+with a solid window (backdrop = "#rrggbb", default #000000) right under the lowest of those
+windows: borderless, never activated, not in the taskbar or Alt-Tab, destroyed when the scenario
+ends or fails. backdrop = false (with backdrop_reason, for a test that must see the desktop through
+the window) turns it off, and notes.txt and run.json say so. Before every screen capture or pixel
+read it is put back under the instance and checked: no window of another process may show inside
+the capture or the 24 DIP band around it, and every band pixel outside the instance's windows must
+be the backdrop color or its shadow; otherwise the step fails and the screenshot is not saved.
+run.json lists every check (pixels counted, foreign windows by class, pid and image, no titles).
 
 Isolation: LOCALAPPDATA and XDG_CONFIG_HOME point at ENV_DIR, so the configuration is
 ENV_DIR/ghostty/config.ghostty and the log ENV_DIR/ghostty/logs/ghostty.log. APPDATA,
@@ -93,6 +104,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zlib
 from dataclasses import dataclass, field
@@ -128,6 +140,26 @@ WM_INPUTLANGCHANGEREQUEST = 0x0050
 WM_USER = 0x0400
 WM_GHOSTTY_SIMULATE_DPI = WM_USER + 0x47
 WM_GHOSTTY_SIMULATE_GPU_RESET = WM_USER + 0x48
+
+# Privacy backdrop of scenario runs (Backdrop, BackdropWindow).
+BACKDROP_DEFAULT = "#000000"
+BACKDROP_CLASS = "GxWinGuiBackdrop"
+BACKDROP_TITLE = "gx_win_gui privacy backdrop"
+BACKDROP_BAND_DIP = 24  # band around a screen capture whose pixels must show the backdrop
+BACKDROP_EDGE_PX = 2  # edges of the instance's windows (DWM border, antialiasing) left out of the band
+BACKDROP_TOLERANCE = 2  # per channel
+BACKDROP_SETTLE_S = 1.0  # how long a new or moved backdrop may take to paint and reach the screen
+BACKDROP_COMPOSE_S = 0.05  # a few frames for DWM to compose a changed z-order before a capture
+WS_POPUP = 0x80000000
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+WS_EX_NOACTIVATE = 0x08000000
+WM_DESTROY = 0x0002
+WM_MOUSEACTIVATE = 0x0021
+MA_NOACTIVATE = 3
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+SWP_NOOWNERZORDER = 0x0200
 
 MOD_KEYS = {"ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12, "menu": 0x12, "win": 0x5B,
             "super": 0x5B, "meta": 0x5B}
@@ -375,6 +407,71 @@ def rect_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tupl
     raise GuiError("the terminals overlap; there is no divider between them")
 
 
+Rect = tuple[int, int, int, int]  # left, top, right, bottom in physical screen pixels
+
+
+def rect_intersection(a: Rect, b: Rect) -> Rect | None:
+    left, top, right, bottom = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    return (left, top, right, bottom) if left < right and top < bottom else None
+
+
+def rect_union(rects: Iterable[Rect]) -> Rect | None:
+    """The bounding rectangle of the non-empty `rects`, None without any."""
+    rects = [rect for rect in rects if rect[0] < rect[2] and rect[1] < rect[3]]
+    if not rects:
+        return None
+    return (min(r[0] for r in rects), min(r[1] for r in rects), max(r[2] for r in rects), max(r[3] for r in rects))
+
+
+def rect_inflate(rect: Rect, by: int) -> Rect:
+    return rect[0] - by, rect[1] - by, rect[2] + by, rect[3] + by
+
+
+def backdrop_shade(pixel: Sequence[int], color: Sequence[int], tolerance: int = BACKDROP_TOLERANCE) -> bool:
+    """Whether `pixel` is the backdrop color, or that color darkened by a window shadow over it."""
+    weight = sum(c * c for c in color)
+    if weight == 0:
+        return max(pixel) <= tolerance
+    k = min(1.0, max(0.0, sum(p * c for p, c in zip(pixel, color)) / weight))
+    return all(abs(p - k * c) <= tolerance + 0.5 for p, c in zip(pixel, color))
+
+
+def backdrop_band(image: Image, keep_out: Sequence[Rect], color: Sequence[int],
+                  tolerance: int = BACKDROP_TOLERANCE) -> dict[str, Any]:
+    """Check every pixel of `image` outside the `keep_out` rectangles (the instance's windows): how many
+    were checked, how many are neither the backdrop color nor its shadow, and where the first one is."""
+    right_edge = image.left + image.width
+    low = [max(0, c - tolerance) for c in color]
+    high = [min(255, c + tolerance) for c in color]
+    checked = foreign = 0
+    first: list[Any] | None = None
+    for y in range(image.top, image.top + image.height):
+        covered = sorted((start, end) for start, end in
+                         ((max(r[0], image.left), min(r[2], right_edge)) for r in keep_out if r[1] <= y < r[3])
+                         if start < end)
+        free, x = [], image.left
+        for start, end in covered:
+            if start > x:
+                free.append((x, start))
+            x = max(x, end)
+        if x < right_edge:
+            free.append((x, right_edge))
+        row = (y - image.top) * image.width - image.left
+        for start, end in free:
+            data = image.bgra[(row + start) * 4:(row + end) * 4]
+            checked += end - start
+            channels = (data[2::4], data[1::4], data[0::4])  # red, green, blue
+            if all(low[i] <= min(channels[i]) and max(channels[i]) <= high[i] for i in range(3)):
+                continue
+            for index in range(end - start):
+                pixel = (data[index * 4 + 2], data[index * 4 + 1], data[index * 4])
+                if not backdrop_shade(pixel, color, tolerance):
+                    foreign += 1
+                    if first is None:
+                        first = [start + index, y, color_hex(pixel)]
+    return {"checked_pixels": checked, "foreign_pixels": foreign, "first_foreign": first}
+
+
 # ---------------------------------------------------------------------------
 # Win32 backend
 # ---------------------------------------------------------------------------
@@ -395,6 +492,42 @@ class WindowInfo:
         left, top, right, bottom = self.rect
         return (f"{self.hwnd:#010x} {self.cls:<24} {right - left}x{bottom - top}+{left}+{top} {state}"
                 + (" toolwindow" if self.toolwindow else "") + (f" {self.title!r}" if self.title else ""))
+
+
+@dataclass(frozen=True)
+class StackEntry:
+    """A visible top-level window of any process, in z-order; its title is never read."""
+
+    hwnd: int
+    cls: str
+    rect: Rect  # visible bounds, physical screen pixels
+    pid: int
+    owner_pid: int  # pid of its root owner window
+    cloaked: bool = False
+    iconic: bool = False
+
+    def shows(self) -> bool:
+        return not (self.cloaked or self.iconic) and self.rect[0] < self.rect[2] and self.rect[1] < self.rect[3]
+
+    def belongs_to(self, pid: int) -> bool:
+        return pid in (self.pid, self.owner_pid)
+
+
+def backdrop_audit(stack: Sequence[StackEntry], backdrop: int, pid: int, area: Rect) -> tuple[list[StackEntry], bool]:
+    """Windows of other processes above the backdrop that show inside `area` (top to bottom), and
+    whether the backdrop is in `stack` at all."""
+    foreign = []
+    for entry in stack:
+        if entry.hwnd == backdrop:
+            return foreign, True
+        if entry.shows() and not entry.belongs_to(pid) and rect_intersection(entry.rect, area):
+            foreign.append(entry)
+    return foreign, False
+
+
+def backdrop_message(message: int) -> int | None:
+    """What the backdrop window procedure answers itself (None: DefWindowProcW): clicks never activate it."""
+    return MA_NOACTIVATE if message == WM_MOUSEACTIVATE else None
 
 
 class Win32:
@@ -459,8 +592,24 @@ class Win32:
                         ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", wt.LONG), ("dwFlags", wt.DWORD),
                         ("szExeFile", wt.WCHAR * 260)]
 
+        self.WNDPROC = ctypes.WINFUNCTYPE(lresult, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", self.WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HICON), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                        ("lpszClassName", wt.LPCWSTR), ("hIconSm", wt.HICON)]
+
+        class MSG(ctypes.Structure):
+            _fields_ = [("hwnd", wt.HWND), ("message", wt.UINT), ("wParam", wt.WPARAM), ("lParam", wt.LPARAM),
+                        ("time", wt.DWORD), ("pt", POINT), ("lPrivate", wt.DWORD)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", wt.DWORD)]
+
         self.POINT, self.RECT, self.INPUT, self.FILETIME = POINT, RECT, INPUT, FILETIME
         self.BITMAPINFO, self.GUITHREADINFO, self.PROCESSENTRY32W = BITMAPINFO, GUITHREADINFO, PROCESSENTRY32W
+        self.WNDCLASSEXW, self.MSG, self.MONITORINFO = WNDCLASSEXW, MSG, MONITORINFO
         self.WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
         def declare(dll, name, restype, *argtypes):
@@ -512,6 +661,19 @@ class Win32:
         declare(u, "SetClipboardData", wt.HANDLE, wt.UINT, wt.HANDLE)
         declare(u, "GetClipboardData", wt.HANDLE, wt.UINT)
         declare(u, "IsClipboardFormatAvailable", wt.BOOL, wt.UINT)
+        declare(u, "RegisterClassExW", wt.ATOM, ctypes.POINTER(WNDCLASSEXW))
+        declare(u, "CreateWindowExW", wt.HWND, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID)
+        declare(u, "DefWindowProcW", lresult, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+        declare(u, "GetMessageW", wt.BOOL, ctypes.POINTER(MSG), wt.HWND, wt.UINT, wt.UINT)
+        declare(u, "TranslateMessage", wt.BOOL, ctypes.POINTER(MSG))
+        declare(u, "DispatchMessageW", lresult, ctypes.POINTER(MSG))
+        declare(u, "PostQuitMessage", None, ctypes.c_int)
+        declare(u, "LoadCursorW", wt.HICON, wt.HINSTANCE, wt.LPVOID)
+        declare(u, "MonitorFromWindow", wt.HMONITOR, wt.HWND, wt.DWORD)
+        declare(u, "GetMonitorInfoW", wt.BOOL, wt.HMONITOR, ctypes.POINTER(MONITORINFO))
+        declare(g, "CreateSolidBrush", wt.HBRUSH, wt.COLORREF)
+        declare(k, "GetModuleHandleW", wt.HMODULE, wt.LPCWSTR)
         declare(g, "CreateCompatibleDC", wt.HDC, wt.HDC)
         declare(g, "CreateDIBSection", wt.HBITMAP, wt.HDC, ctypes.POINTER(BITMAPINFO), wt.UINT,
                 ctypes.POINTER(ctypes.c_void_p), wt.HANDLE, wt.DWORD)
@@ -686,6 +848,31 @@ class Win32:
 
         self.EnumWindows(collect, 0)
         return [self.info(hwnd) for hwnd in found]
+
+    def window_stack(self) -> list[StackEntry]:
+        """The visible top-level windows of every process from the top of the z-order down (the order
+        EnumWindows reports), without their titles."""
+        found: list[int] = []
+
+        @self.WNDENUMPROC
+        def collect(hwnd, _):
+            found.append(hwnd)
+            return True
+
+        self.EnumWindows(collect, 0)
+        return [StackEntry(hwnd, self.class_name(hwnd), self.window_rect(hwnd), self.window_pid(hwnd),
+                           self.root_owner_pid(hwnd), self.cloaked(hwnd), bool(self.IsIconic(hwnd)))
+                for hwnd in found if self.IsWindowVisible(hwnd)]
+
+    def work_area(self, hwnd: int) -> Rect:
+        """The work area (without the taskbar) of the monitor nearest to hwnd."""
+        monitor = self.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        info = self.MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not monitor or not self.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            raise GuiError(f"no monitor for window {hwnd:#x}")
+        work = info.rcWork
+        return work.left, work.top, work.right, work.bottom
 
     def child_windows(self, hwnd: int, cls: str | None = None) -> list[WindowInfo]:
         found: list[int] = []
@@ -924,6 +1111,225 @@ def win32() -> Win32:
     if _WIN32 is None:
         _WIN32 = Win32()
     return _WIN32
+
+
+_BACKDROP_LOCK = threading.Lock()
+_BACKDROP_PROC: Any = None  # window procedure of every backdrop class, alive as long as the process
+
+
+class BackdropWindow:
+    """The privacy backdrop: a solid WS_POPUP window with WS_EX_TOOLWINDOW (no taskbar button, not in
+    Alt-Tab) and WS_EX_NOACTIVATE (never takes the foreground; clicks answer MA_NOACTIVATE). It is
+    created and pumped on a thread of its own, so it keeps answering while the harness waits; when
+    that thread or the process ends, Windows destroys it."""
+
+    STYLE = WS_POPUP
+    EXSTYLE = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+
+    def __init__(self, color: tuple[int, int, int]) -> None:
+        self.color = color
+        self.hwnd = 0
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+
+    def open(self, rect: Rect) -> None:
+        self._thread = threading.Thread(target=self._pump, args=(rect,), name="gx-win-gui-backdrop", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(5):
+            raise GuiError("the privacy backdrop window did not start within 5s")
+        if self._error is not None:
+            raise GuiError(f"cannot create the privacy backdrop: {self._error}")
+
+    def _register(self, w: Win32) -> str:
+        global _BACKDROP_PROC
+        name = BACKDROP_CLASS + color_hex(self.color)[1:]
+        with _BACKDROP_LOCK:
+            if _BACKDROP_PROC is None:
+                def procedure(hwnd, message, wparam, lparam):
+                    if message == WM_DESTROY:
+                        w.PostQuitMessage(0)
+                        return 0
+                    answer = backdrop_message(message)
+                    return w.DefWindowProcW(hwnd, message, wparam, lparam) if answer is None else answer
+
+                _BACKDROP_PROC = w.WNDPROC(procedure)
+            red, green, blue = self.color
+            wc = w.WNDCLASSEXW()
+            wc.cbSize = ctypes.sizeof(wc)
+            wc.lpfnWndProc = _BACKDROP_PROC
+            wc.hInstance = w.GetModuleHandleW(None)
+            wc.hCursor = w.LoadCursorW(None, ctypes.c_void_p(32512))  # IDC_ARROW
+            wc.hbrBackground = w.CreateSolidBrush(red | (green << 8) | (blue << 16))
+            wc.lpszClassName = name
+            if not w.RegisterClassExW(ctypes.byref(wc)):
+                error = ctypes.get_last_error()
+                w.DeleteObject(wc.hbrBackground)
+                if error != 1410:  # ERROR_CLASS_ALREADY_EXISTS: an earlier backdrop of this color
+                    raise GuiError(f"RegisterClassExW failed (error {error})")
+        return name
+
+    def _pump(self, rect: Rect) -> None:
+        try:
+            w = win32()
+            name = self._register(w)
+            left, top, right, bottom = rect
+            hwnd = w.CreateWindowExW(self.EXSTYLE, name, BACKDROP_TITLE, self.STYLE, left, top, right - left,
+                                     bottom - top, None, None, w.GetModuleHandleW(None), None)
+            if not hwnd:
+                raise GuiError(f"CreateWindowExW failed (error {ctypes.get_last_error()})")
+            self.hwnd = hwnd
+        except BaseException as exc:  # noqa: BLE001 - open() reports it
+            self._error = exc
+            self._ready.set()
+            return
+        self._ready.set()
+        message = w.MSG()
+        while w.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            w.TranslateMessage(ctypes.byref(message))
+            w.DispatchMessageW(ctypes.byref(message))
+
+    def place(self, rect: Rect, under: int) -> None:
+        """Cover `rect` right below the window `under` in the z-order, shown and not activated."""
+        left, top, right, bottom = rect
+        if not win32().SetWindowPos(self.hwnd, under, left, top, right - left, bottom - top,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER):
+            raise GuiError(f"cannot place the privacy backdrop (SetWindowPos error {ctypes.get_last_error()})")
+
+    def close(self, timeout: float = 5.0) -> str:
+        w = win32()
+        if self.hwnd and w.IsWindow(self.hwnd):
+            w.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+        if self._thread is not None:
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                raise GuiError(f"the privacy backdrop thread did not end within {timeout:g}s")
+        if self.hwnd and w.IsWindow(self.hwnd):
+            raise GuiError(f"the privacy backdrop {self.hwnd:#x} still exists")
+        return "destroyed"
+
+
+class Backdrop:
+    """The privacy backdrop of one scenario run: what it is set to, its window, and every check."""
+
+    def __init__(self, color: str | None, reason: str | None = None) -> None:
+        self.color = color  # "#rrggbb" while on, None while off
+        self.reason = reason  # why it is off
+        self.initial = {"color": color, "reason": reason}
+        self.window: Any = None
+        self.area: Rect | None = None  # where it was placed last
+        self.fresh = False  # new or moved since the last passing check: give it time to paint
+        self.placements = 0
+        self.restacks = 0  # placements that changed its position or the z-order
+        self.events: list[dict[str, Any]] = []
+        self.checks: list[dict[str, Any]] = []
+
+    def set(self, color: str | None, reason: str | None) -> str:
+        if color != self.color:
+            self.drop("switched")
+        self.color, self.reason = color, reason
+        self.events.append({"event": "set", "color": color, "reason": reason})
+        return f"backdrop {color}" if color else f"backdrop off: {reason}"
+
+    def ensure(self, instance: "Instance") -> Rect | None:
+        """Cover the work areas of the instance's windows right under the lowest of them; that area."""
+        if self.color is None:
+            return None
+        instance.ensure_owned()
+        w = win32()
+        stack = w.window_stack()
+        mine = [index for index, entry in enumerate(stack) if entry.shows() and entry.belongs_to(instance.pid)]
+        if not mine:
+            raise GuiError(f"ghostty pid {instance.pid} shows no window to put the privacy backdrop under")
+        area = rect_union(w.work_area(stack[index].hwnd) for index in mine)
+        assert area is not None
+        if self.window is None:
+            window = BackdropWindow(parse_color(self.color))
+            window.open(area)
+            self.window = window
+            self.events.append({"event": "created", "color": self.color, "area": list(area)})
+        position = next((index for index, entry in enumerate(stack) if entry.hwnd == self.window.hwnd), None)
+        moved = area != self.area
+        restacked = moved or position != mine[-1] + 1  # not right under the lowest window of the instance
+        self.window.place(area, stack[mine[-1]].hwnd)
+        self.placements += 1
+        if moved:
+            self.fresh = True
+            self.area = area
+        if restacked:
+            self.restacks += 1
+            time.sleep(BACKDROP_COMPOSE_S)
+        return area
+
+    def capture(self, instance: "Instance", info: WindowInfo, method: str, label: str) -> Image:
+        """A capture of `info`; from the screen only while nothing but the instance and the backdrop shows."""
+        if self.color is None or method != "screen":
+            return instance.capture_window(info, method)
+        area = self.ensure(instance)
+        assert area is not None
+        w = win32()
+        color = parse_color(self.color)
+        band = max(1, round(BACKDROP_BAND_DIP * w.dpi(info.hwnd) / 96))
+        probe = rect_union([info.rect, rect_intersection(rect_inflate(info.rect, band), area) or info.rect])
+        assert probe is not None
+        deadline = time.monotonic() + (BACKDROP_SETTLE_S if self.fresh else 0)
+        attempts = 0
+        while True:
+            attempts += 1
+            before = w.window_stack()
+            image = instance.capture_window(info, "screen", region=probe, see_through=(self.window.hwnd,))
+            after = w.window_stack()
+            foreign: dict[int, StackEntry] = {}
+            found = True
+            for stack in (before, after):
+                entries, present = backdrop_audit(stack, self.window.hwnd, instance.pid, probe)
+                found = found and present
+                foreign.update((entry.hwnd, entry) for entry in entries)
+            keep_out = [rect_inflate(entry.rect, BACKDROP_EDGE_PX) for stack in (before, after) for entry in stack
+                        if entry.shows() and entry.belongs_to(instance.pid)]
+            band_stats = backdrop_band(image, keep_out, color)
+            passed = found and not foreign and not band_stats["foreign_pixels"]
+            # Only a backdrop that may not have reached the screen yet is worth another look.
+            if passed or foreign or not found or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        check = {"capture": label, "window": info.cls, "rect": list(info.rect), "band": list(probe), **band_stats,
+                 "backdrop_in_stack": found, "attempts": attempts,
+                 "foreign_windows": [{"hwnd": f"{entry.hwnd:#x}", "class": entry.cls, "pid": entry.pid,
+                                      "image": image_name(entry.pid)} for entry in foreign.values()],
+                 "status": "pass" if passed else "fail"}
+        self.checks.append(check)
+        if not passed:
+            problems = []
+            if foreign:
+                problems.append(f"{len(foreign)} window(s) of other processes show there (" + "; ".join(
+                    f"{item['class']} pid {item['pid']} {item['image']}" for item in check["foreign_windows"]) + ")")
+            if not found:
+                problems.append("the backdrop is not in the window stack")
+            if band_stats["foreign_pixels"]:
+                x, y, seen = band_stats["first_foreign"]
+                problems.append(f"{band_stats['foreign_pixels']} of {band_stats['checked_pixels']} band pixels are not "
+                                f"{self.color} (first {seen} at ({x}, {y}))")
+            raise GuiError(f"privacy backdrop check failed for {label}: {'; '.join(problems)}; "
+                           "the screenshot was not saved")
+        self.fresh = False
+        return crop(image, info.rect)
+
+    def drop(self, why: str) -> None:
+        """Destroy the window if there is one; never raises, the result is recorded."""
+        if self.window is None:
+            return
+        window, self.window, self.area = self.window, None, None
+        try:
+            result = window.close()
+        except Exception as exc:  # noqa: BLE001 - cleanup goes on; the failure is evidence
+            result = f"failed: {exc}"
+        self.events.append({"event": "destroyed", "why": why, "result": result})
+
+    def finish(self) -> dict[str, Any]:
+        self.drop("scenario end")
+        return {"initial": self.initial, "color": self.color, "reason": self.reason, "placements": self.placements,
+                "restacks": self.restacks, "events": self.events, "checks": self.checks}
 
 
 # ---------------------------------------------------------------------------
@@ -1363,7 +1769,10 @@ class Instance:
 
     # -- capture --------------------------------------------------------------
 
-    def capture_window(self, info: WindowInfo, method: str = "screen") -> Image:
+    def capture_window(self, info: WindowInfo, method: str = "screen", region: Rect | None = None,
+                       see_through: Sequence[int] = ()) -> Image:
+        """Capture a window; with `region` (screen only) that larger screen area around it. A window in
+        `see_through` (the privacy backdrop) showing through a transparent part does not cover it."""
         self.ensure_owned()
         w = win32()
         if method == "print":
@@ -1374,10 +1783,10 @@ class Instance:
         for fx, fy in ((0.5, 0.5), (0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)):
             x, y = round(left + (right - left) * fx), round(top + (bottom - top) * fy)
             hwnd = w.window_at(x, y)
-            if hwnd and w.window_pid(hwnd) != self.pid and w.root_owner_pid(hwnd) != self.pid:
+            if hwnd and hwnd not in see_through and w.window_pid(hwnd) != self.pid and w.root_owner_pid(hwnd) != self.pid:
                 raise GuiError(f"window {info.hwnd:#x} is covered at ({x}, {y}) by {w.class_name(hwnd)} of pid "
                                f"{w.window_pid(hwnd)}; bring it to the front or use --method print")
-        return w.capture_screen(info.rect)
+        return w.capture_screen(region or info.rect)
 
     # -- log --------------------------------------------------------------------
 
@@ -1467,9 +1876,10 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "resize": (frozenset(("width", "height")), frozenset()),
     "close": (frozenset(), frozenset(("timeout",))),
     "file": (frozenset(("path", "text")), frozenset()),
+    "backdrop": (frozenset(), frozenset(("color", "enabled", "reason"))),
 }
 SCENARIO_KEYS = frozenset(("id", "title", "config", "harness", "env", "args", "requires", "side_effects", "expect",
-                           "step"))
+                           "backdrop", "backdrop_reason", "step"))
 SCENARIO_ID_RE = re.compile(r"^[WG]\d{2}$")
 INPUT_ACTIONS = frozenset(("type", "key", "click", "mouse_down", "mouse_up", "move", "drag", "drag_divider", "wheel"))
 CAPTURE_WHAT = ("window", "quick", "popups", "all")
@@ -1498,6 +1908,8 @@ class Scenario:
     requires: list[str] = field(default_factory=list)
     side_effects: list[str] = field(default_factory=list)
     expect: list[str] = field(default_factory=list)
+    backdrop: str | None = BACKDROP_DEFAULT  # "#rrggbb", None when the scenario turns the backdrop off
+    backdrop_reason: str | None = None
 
     def full_config(self) -> str:
         text = self.config if self.config.endswith("\n") or not self.config else self.config + "\n"
@@ -1550,7 +1962,40 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
             re.compile(params["pattern"])
         except re.error as exc:
             raise UsageError(f"{where}: bad pattern {params['pattern']!r}: {exc}") from None
+    if action == "backdrop":
+        enabled = params.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise UsageError(f"{where}: backdrop enabled must be true or false")
+        if not enabled and not (isinstance(params.get("reason"), str) and params["reason"].strip()):
+            raise UsageError(f"{where}: backdrop enabled = false needs a reason")
+        if enabled and "reason" in params:
+            raise UsageError(f"{where}: a backdrop reason only goes with enabled = false")
+        if not enabled and "color" in params:
+            raise UsageError(f"{where}: a backdrop that is off has no color")
+        if "color" in params:
+            parse_color(params["color"])
     return Step(action, params)
+
+
+def scenario_backdrop(where: str, data: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """The scenario's backdrop color ("#rrggbb", None when off) and why it is off."""
+    value, reason = data.get("backdrop", True), data.get("backdrop_reason")
+    if value is True:
+        color = BACKDROP_DEFAULT
+    elif value is False:
+        color = None
+    elif isinstance(value, str):
+        try:
+            color = color_hex(parse_color(value))
+        except UsageError as exc:
+            raise UsageError(f"{where}: backdrop: {exc}") from None
+    else:
+        raise UsageError(f"{where}: backdrop must be true, false or a #rrggbb color")
+    if color is None and not (isinstance(reason, str) and reason.strip()):
+        raise UsageError(f"{where}: backdrop = false needs backdrop_reason (why the screenshots must show the desktop)")
+    if color is not None and reason is not None:
+        raise UsageError(f"{where}: backdrop_reason only goes with backdrop = false")
+    return color, reason
 
 
 def load_scenario(path: Path) -> Scenario:
@@ -1573,9 +2018,10 @@ def load_scenario(path: Path) -> Scenario:
     env = data.get("env", {})
     if not isinstance(env, dict) or not all(ENV_NAME_RE.match(name) and isinstance(v, str) for name, v in env.items()):
         raise UsageError(f"{path}: env must map variable names to strings")
+    backdrop, backdrop_reason = scenario_backdrop(str(path), data)
     return Scenario(path, data["id"], data["title"], data["config"], steps, bool(data.get("harness", True)), dict(env),
                     list(data.get("args", [])), list(data.get("requires", [])), list(data.get("side_effects", [])),
-                    list(data.get("expect", [])))
+                    list(data.get("expect", [])), backdrop=backdrop, backdrop_reason=backdrop_reason)
 
 
 def scenario_paths(selectors: Sequence[str], directory: Path = SCENARIO_DIR) -> list[Path]:
@@ -1637,6 +2083,8 @@ class ScenarioRun:
         self.clipboard_changed = False
         self.startup: dict[str, float] = {}
         self.held_buttons: list[str] = []  # pressed by mouse_down, not yet released by mouse_up
+        self.backdrop = (Backdrop(scenario.backdrop, scenario.backdrop_reason) if scenario is not None
+                         else Backdrop(None, "no scenario"))
 
     # -- addressing -----------------------------------------------------------
 
@@ -1647,6 +2095,10 @@ class ScenarioRun:
 
     def point(self, params: Mapping[str, Any]) -> tuple[int, int]:
         return self.gui.point(params.get("x"), params.get("y"), params.get("in", "client"), params.get("window", "main"))
+
+    def capture(self, info: WindowInfo, method: str, label: str) -> Image:
+        """Every scenario screenshot and pixel read goes through the privacy backdrop."""
+        return self.backdrop.capture(self.gui, info, method, label)
 
     def capture_name(self, name: str, step: int | None = None) -> Path:
         """OUT/NN-name.png, NN numbering the capture steps (the popups of one step share it)."""
@@ -1798,19 +2250,20 @@ class ScenarioRun:
         path = self.capture_name(p["name"], step)
         saved = []
         if what in ("window", "all"):
-            image = self.gui.capture_window(self.gui.require_window("main"), method)
+            image = self.capture(self.gui.require_window("main"), method, path.name)
             saved.append(image.save_png(path))
         if what == "quick":
-            image = self.gui.capture_window(self.gui.require_window("quick"), method)
+            image = self.capture(self.gui.require_window("quick"), method, path.name)
             saved.append(image.save_png(path))
         if what in ("popups", "all"):
             popups = self.gui.popups()
             if not popups and what == "popups":
                 raise GuiError("no visible popup to capture")
             for index, info in enumerate(popups, 1):
-                image = self.gui.capture_window(info, method)
                 cls = re.sub(r"[^A-Za-z0-9._-]", lambda match: f"_{ord(match[0]):x}_", info.cls) or "unknown"
-                saved.append(image.save_png(self.capture_name(f"{p['name']}-{cls}-{index}", step)))
+                target = self.capture_name(f"{p['name']}-{cls}-{index}", step)
+                image = self.capture(info, method, target.name)
+                saved.append(image.save_png(target))
         self.capture_steps = step
         for path in saved:
             self.captures.append(path.name)
@@ -1818,7 +2271,8 @@ class ScenarioRun:
 
     def do_pixel(self, p):
         x, y = self.point(p)
-        image = self.gui.capture_window(self.gui.require_window(p.get("window", "main")), p.get("method", "screen"))
+        image = self.capture(self.gui.require_window(p.get("window", "main")), p.get("method", "screen"),
+                             f"pixel {p.get('label', 'pixel')}")
         color = image.pixel(x, y)
         tolerance = int(p.get("tolerance", 0))
         detail = f"{p.get('label', 'pixel')} at ({x}, {y}) is {color_hex(color)}"
@@ -1899,6 +2353,13 @@ class ScenarioRun:
         path.write_text(p["text"], encoding="utf-8", newline="\n")
         return str(path.relative_to(root))
 
+    def do_backdrop(self, p):
+        if not p.get("enabled", True):
+            return self.backdrop.set(None, p["reason"])
+        detail = self.backdrop.set(color_hex(parse_color(p.get("color", self.backdrop.color or BACKDROP_DEFAULT))), None)
+        self.backdrop.ensure(self.gui)
+        return detail
+
     # -- driver -------------------------------------------------------------------
 
     def run(self) -> dict[str, Any]:
@@ -1917,6 +2378,7 @@ class ScenarioRun:
             self.startup = self.gui.wait_window(20)
             report["startup_ms"] = self.startup
             self.gui.activate()
+            self.backdrop.ensure(self.gui)
             for index, step in enumerate(scenario.steps, 1):
                 began = time.monotonic()
                 if step.action in INPUT_ACTIONS:
@@ -1937,23 +2399,27 @@ class ScenarioRun:
             print(f"{TAG} {scenario.id} FAILED: {exc}", file=sys.stderr, flush=True)
             self.capture_failure()
         finally:
-            if self.instance is not None and self.held_buttons:
-                report["released_buttons"] = self.release_held_buttons(aborted=not completed)
-            if self.instance is not None and not self.keep_open:
-                try:
-                    report["closed"] = self.instance.close()
-                except GuiError as exc:
-                    report["closed"] = f"failed: {exc}"
-            elif self.instance is not None:
-                self.instance.save()
-                report["closed"] = f"kept open; stop with: gx_win_gui.py stop {env_dir}"
-            if self.clipboard_changed:
-                try:
-                    win32().set_clipboard_text(self.saved_clipboard or "")
-                except GuiError:
-                    pass
-            if self.instance is not None and self.instance.log.is_file():
-                shutil.copyfile(self.instance.log, self.out_dir / "ghostty.log")
+            try:
+                if self.instance is not None and self.held_buttons:
+                    report["released_buttons"] = self.release_held_buttons(aborted=not completed)
+                if self.instance is not None and not self.keep_open:
+                    try:
+                        report["closed"] = self.instance.close()
+                    except GuiError as exc:
+                        report["closed"] = f"failed: {exc}"
+                elif self.instance is not None:
+                    self.instance.save()
+                    report["closed"] = f"kept open; stop with: gx_win_gui.py stop {env_dir}"
+                if self.clipboard_changed:
+                    try:
+                        win32().set_clipboard_text(self.saved_clipboard or "")
+                    except GuiError:
+                        pass
+                if self.instance is not None and self.instance.log.is_file():
+                    shutil.copyfile(self.instance.log, self.out_dir / "ghostty.log")
+            finally:
+                # Whatever failed above, the backdrop never outlives the scenario.
+                report["backdrop"] = self.backdrop.finish()
         report["seconds"] = round(time.monotonic() - started, 2)
         report["steps"] = self.results
         report["captures"] = self.captures
@@ -1971,8 +2437,14 @@ class ScenarioRun:
 
 
 def notes_text(scenario: Scenario, report: Mapping[str, Any]) -> str:
+    backdrop = report.get("backdrop") or {"initial": {"color": scenario.backdrop, "reason": scenario.backdrop_reason}}
+    initial = backdrop["initial"]
+    shown = (f"backdrop: {initial['color']} under the instance's windows (privacy mask)" if initial["color"]
+             else f"backdrop: OFF ({initial['reason']}); screen captures may show the desktop behind the window")
+    if any(event.get("event") == "set" for event in backdrop.get("events", [])):
+        shown += "; a backdrop step changed it, see run.json"
     lines = [f"{scenario.id} {scenario.title}", f"status: {report['status']}" +
-             (f" ({report['reason']})" if report.get("reason") else ""), "",
+             (f" ({report['reason']})" if report.get("reason") else ""), shown, "",
              "Read every screenshot before recording PASS. Expected:"]
     lines += [f"- {item}" for item in scenario.expect] or ["- (no expectations listed)"]
     lines += ["", "screenshots:"] + [f"- {name}" for name in report.get("captures", [])]

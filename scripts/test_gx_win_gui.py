@@ -403,6 +403,7 @@ class FakeWin32:
         self.alive = True
         self.image = "C:/g/ghostty.exe"
         self.creation = 1
+        self.stack: list = []  # window_stack(), top to bottom
 
     def process_alive(self, pid):
         return self.alive
@@ -439,6 +440,15 @@ class FakeWin32:
 
     def top_windows(self, pid):
         return []
+
+    def window_stack(self):
+        return list(self.stack)
+
+    def work_area(self, hwnd):
+        return (0, 0, 1000, 800)
+
+    def dpi(self, hwnd):
+        return 96
 
     def send(self, inputs):
         self.sent.append(list(inputs))
@@ -626,6 +636,16 @@ class InputGuardTests(unittest.TestCase):
             self.instance().type_text("ab", delay=0)
         self.assertEqual(1, len(fake.sent))
 
+    def test_the_backdrop_showing_through_does_not_cover_a_window(self):
+        fake = FakeWin32(foreground_pid=self.PID, point_pid=1)  # the harness's own backdrop is under every point
+        fake.capture_screen = lambda rect: rect
+        info = gui.WindowInfo(0x10, gui.POPUP_CLASS, "", (0, 0, 10, 10), True, False, True)
+        with mock.patch.object(gui, "win32", return_value=fake):
+            with self.assertRaisesRegex(gui.GuiError, "is covered"):
+                self.instance().capture_window(info)
+            self.assertEqual((-5, -5, 15, 15), self.instance().capture_window(info, region=(-5, -5, 15, 15),
+                                                                              see_through=(0x2000,)))
+
     def test_stale_identity_blocks_window_lookup_activation_and_capture(self):
         fake = FakeWin32(foreground_pid=self.PID, point_pid=self.PID)
         fake.creation = 2
@@ -654,7 +674,8 @@ class InputGuardTests(unittest.TestCase):
 
 
 class ScenarioReleaseTests(unittest.TestCase):
-    BODY = 'id = "W90"\ntitle = "t"\nconfig = "language = en"\n'
+    BODY = ('id = "W90"\ntitle = "t"\nconfig = "language = en"\n'
+            'backdrop = false\nbackdrop_reason = "the release tests capture through a mock"\n')
 
     def run_scenario(self, steps: str, capture_error: bool):
         with tempfile.TemporaryDirectory() as tmp:
@@ -693,6 +714,302 @@ class ScenarioReleaseTests(unittest.TestCase):
         instance.release_input.assert_called_once_with([("mouse", 0x100, 0, 0, 2)], "x2", False)
 
 
+def screen(region, paint=(), color=(255, 255, 255)):
+    """A black screen capture of `region` with the `paint` rectangles in `color`."""
+    left, top, right, bottom = region
+    width, height = right - left, bottom - top
+    data = bytearray(b"\x00\x00\x00\xff" * (width * height))
+    for x0, y0, x1, y1 in paint:
+        for y in range(max(y0, top), min(y1, bottom)):
+            for x in range(max(x0, left), min(x1, right)):
+                offset = ((y - top) * width + (x - left)) * 4
+                data[offset:offset + 3] = bytes((color[2], color[1], color[0]))
+    return gui.Image(width, height, bytes(data), left, top)
+
+
+REAL_BACKDROP_WINDOW = gui.BackdropWindow
+
+
+class FakeBackdropWindow:
+    """Stands in for BackdropWindow: nothing is created on the desktop."""
+
+    made: list = []
+
+    def __init__(self, color):
+        self.color = color
+        self.hwnd = 0xB0
+        self.opened = None
+        self.placed: list = []
+        self.closed = 0
+        FakeBackdropWindow.made.append(self)
+
+    def open(self, rect):
+        self.opened = rect
+
+    def place(self, rect, under):
+        self.placed.append((rect, under))
+
+    def close(self):
+        self.closed += 1
+        return "destroyed"
+
+
+class BackdropTests(unittest.TestCase):
+    PID = 4242
+    WINDOW = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (100, 100, 140, 130), True, False, False)
+    PROBE = (76, 76, 164, 154)  # the window and its 24 DIP band at 96 dpi
+
+    def setUp(self):
+        FakeBackdropWindow.made = []
+        self.fake = FakeWin32(self.PID, self.PID)
+        self.main = gui.StackEntry(0x10, gui.WINDOW_CLASS, self.WINDOW.rect, self.PID, self.PID)
+        self.backdrop_entry = gui.StackEntry(0xB0, gui.BACKDROP_CLASS + "000000", (0, 0, 1000, 800), 1, 1)
+        self.fake.stack = [self.main, self.backdrop_entry]
+        self.instance = mock.Mock(spec=gui.Instance)
+        self.instance.pid = self.PID
+        self.frames = []
+
+        def capture_window(info, method, region=None, see_through=()):
+            if method == "print":
+                return screen(info.rect, [info.rect])
+            frame = self.frames.pop(0) if self.frames else []
+            return screen(region or info.rect, [info.rect] + list(frame))
+
+        self.instance.capture_window.side_effect = capture_window
+        patches = [mock.patch.object(gui, "win32", return_value=self.fake),
+                   mock.patch.object(gui, "BackdropWindow", FakeBackdropWindow),
+                   mock.patch.object(gui.time, "sleep")]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_pure_helpers(self):
+        self.assertEqual((5, 5, 10, 10), gui.rect_intersection((0, 0, 10, 10), (5, 5, 20, 20)))
+        self.assertIsNone(gui.rect_intersection((0, 0, 10, 10), (10, 0, 20, 10)))
+        self.assertEqual((-5, 0, 30, 40), gui.rect_union([(0, 0, 10, 10), (-5, 20, 30, 40), (50, 50, 50, 60)]))
+        self.assertIsNone(gui.rect_union([(0, 0, 0, 10)]))
+        self.assertEqual((-2, -2, 12, 12), gui.rect_inflate((0, 0, 10, 10), 2))
+        self.assertEqual(gui.MA_NOACTIVATE, gui.backdrop_message(gui.WM_MOUSEACTIVATE))
+        self.assertIsNone(gui.backdrop_message(gui.WM_CLOSE))
+
+    def test_shade_accepts_the_color_and_its_shadows_only(self):
+        self.assertTrue(gui.backdrop_shade((0, 0, 0), (0, 0, 0)))
+        self.assertTrue(gui.backdrop_shade((2, 1, 2), (0, 0, 0)))
+        self.assertFalse(gui.backdrop_shade((3, 0, 0), (0, 0, 0)))
+        magenta = (200, 100, 50)
+        for pixel in ((200, 100, 50), (100, 50, 25), (20, 10, 5), (0, 0, 0), (201, 99, 51)):
+            with self.subTest(pixel=pixel):
+                self.assertTrue(gui.backdrop_shade(pixel, magenta))
+        for pixel in ((100, 100, 50), (230, 115, 57), (255, 255, 255), (50, 100, 200)):
+            with self.subTest(pixel=pixel):
+                self.assertFalse(gui.backdrop_shade(pixel, magenta))
+
+    def test_band_counts_only_pixels_outside_the_instance_windows(self):
+        image = screen((0, 0, 10, 10), [(3, 3, 7, 7)])
+        self.assertEqual({"checked_pixels": 84, "foreign_pixels": 0, "first_foreign": None},
+                         gui.backdrop_band(image, [(3, 3, 7, 7), (50, 0, 60, 10), (-20, 0, -10, 10)], (0, 0, 0)))
+        stats = gui.backdrop_band(screen((0, 0, 10, 10), [(3, 3, 7, 7), (9, 0, 10, 1)]), [(3, 3, 7, 7)], (0, 0, 0))
+        self.assertEqual((84, 1, [9, 0, "#ffffff"]), (stats["checked_pixels"], stats["foreign_pixels"], stats["first_foreign"]))
+        offset = screen((-30, 40, -20, 50), [(-25, 45, -24, 46)], color=(9, 9, 9))
+        self.assertEqual([-25, 45, "#090909"], gui.backdrop_band(offset, [], (0, 0, 0))["first_foreign"])
+
+    def test_audit_lists_other_processes_above_the_backdrop_only(self):
+        area = (0, 0, 100, 100)
+        foreign = gui.StackEntry(0x1, "Chrome_WidgetWin_1", (50, 50, 300, 300), 777, 777)
+        stack = [foreign,
+                 gui.StackEntry(0x2, "Elsewhere", (200, 200, 300, 300), 777, 777),
+                 gui.StackEntry(0x3, "Cloaked", (0, 0, 100, 100), 777, 777, cloaked=True),
+                 gui.StackEntry(0x4, "Minimized", (0, 0, 100, 100), 777, 777, iconic=True),
+                 gui.StackEntry(0x5, "Empty", (10, 10, 10, 50), 777, 777),
+                 gui.StackEntry(0x6, "IME", (0, 0, 100, 100), 778, self.PID),
+                 gui.StackEntry(0x7, gui.POPUP_CLASS, (0, 0, 100, 100), self.PID, self.PID),
+                 gui.StackEntry(0xB0, "backdrop", (0, 0, 1000, 800), 1, 1),
+                 gui.StackEntry(0x8, "Below", (0, 0, 100, 100), 777, 777)]
+        self.assertEqual(([foreign], True), gui.backdrop_audit(stack, 0xB0, self.PID, area))
+        self.assertEqual(([foreign], False), gui.backdrop_audit(stack[:3], 0xB0, self.PID, area))
+
+    def test_screen_capture_through_a_checked_backdrop(self):
+        backdrop = gui.Backdrop("#000000")
+        image = backdrop.capture(self.instance, self.WINDOW, "screen", "01-x.png")
+        window = FakeBackdropWindow.made[0]
+        self.assertEqual(((0, 0, 0), (0, 0, 1000, 800)), (window.color, window.opened))
+        self.assertEqual([((0, 0, 1000, 800), 0x10)], window.placed)
+        self.instance.capture_window.assert_called_once_with(self.WINDOW, "screen", region=self.PROBE, see_through=(0xB0,))
+        self.assertEqual((40, 30, 100, 100), (image.width, image.height, image.left, image.top))
+        check = backdrop.checks[0]
+        self.assertEqual(("pass", 88 * 78 - 44 * 34, 0, 1, []),
+                         (check["status"], check["checked_pixels"], check["foreign_pixels"], check["attempts"],
+                          check["foreign_windows"]))
+        result = backdrop.finish()
+        self.assertEqual(1, window.closed)
+        self.assertEqual(["created", "destroyed"], [event["event"] for event in result["events"]])
+        self.assertEqual({"color": "#000000", "reason": None}, result["initial"])
+        self.assertEqual((1, 1), (result["placements"], result["restacks"]))
+
+    def test_a_backdrop_out_of_place_is_put_back_and_given_time_to_compose(self):
+        backdrop = gui.Backdrop("#000000")
+        backdrop.ensure(self.instance)  # new: restacked and fresh
+        backdrop.fresh = False
+        with mock.patch.object(gui.time, "sleep") as sleep:
+            backdrop.ensure(self.instance)  # already right under the instance: nothing to wait for
+            sleep.assert_not_called()
+            foreign = gui.StackEntry(0x99, "Chrome_WidgetWin_1", (0, 0, 50, 50), 777, 777)
+            self.fake.stack = [self.main, foreign, self.backdrop_entry]  # activation left a window in between
+            backdrop.ensure(self.instance)
+            sleep.assert_called_once_with(gui.BACKDROP_COMPOSE_S)
+        self.assertEqual((3, 2, False), (backdrop.placements, backdrop.restacks, backdrop.fresh))
+        self.fake.work_area = lambda hwnd: (0, 0, 1200, 900)  # the window moved to a larger monitor
+        backdrop.ensure(self.instance)
+        self.assertEqual(((0, 0, 1200, 900), True), (backdrop.area, backdrop.fresh))
+
+    def test_the_lowest_instance_window_and_every_monitor_of_the_instance_count(self):
+        popup = gui.StackEntry(0x20, gui.POPUP_CLASS, (900, 10, 990, 60), self.PID, self.PID)
+        self.fake.stack = [popup, gui.StackEntry(0x99, "Other", (600, 600, 700, 700), 777, 777), self.main,
+                           self.backdrop_entry]
+        self.fake.work_area = lambda hwnd: (0, 0, 1000, 800) if hwnd == 0x10 else (1000, 0, 2000, 800)
+        gui.Backdrop("#000000").ensure(self.instance)
+        self.assertEqual([((0, 0, 2000, 800), 0x10)], FakeBackdropWindow.made[0].placed)
+
+    def test_another_process_in_the_capture_fails_and_nothing_is_saved(self):
+        self.fake.stack.insert(0, gui.StackEntry(0x99, "Chrome_WidgetWin_1", (120, 0, 900, 120), 777, 777))
+        with tempfile.TemporaryDirectory() as tmp:
+            run = gui.ScenarioRun(None, Path("ghostty.exe"), Path(tmp))  # type: ignore[arg-type]
+            run.backdrop = gui.Backdrop("#000000")
+            run.instance = self.instance
+            self.instance.require_window.return_value = self.WINDOW
+            with self.assertRaisesRegex(gui.GuiError, r"1 window\(s\) of other processes show there "
+                                                      r"\(Chrome_WidgetWin_1 pid 777 ghostty.exe\).*not saved"):
+                run.do_capture({"name": "leak"})
+            self.assertEqual([], list(Path(tmp).iterdir()))
+        check = run.backdrop.checks[0]
+        self.assertEqual(("fail", [{"hwnd": "0x99", "class": "Chrome_WidgetWin_1", "pid": 777, "image": "ghostty.exe"}]),
+                         (check["status"], check["foreign_windows"]))
+        self.assertNotIn("title", json.dumps(run.backdrop.checks))
+
+    def test_band_pixels_get_the_settle_time_of_a_new_backdrop_only(self):
+        self.frames = [[(80, 80, 81, 81)]]  # the first frame still shows the desktop in the band
+        clock = iter(range(100))
+        with mock.patch.object(gui.time, "monotonic", side_effect=lambda: next(clock) * 0.1):
+            backdrop = gui.Backdrop("#000000")
+            backdrop.capture(self.instance, self.WINDOW, "screen", "01-a.png")
+            self.assertEqual(("pass", 2), (backdrop.checks[0]["status"], backdrop.checks[0]["attempts"]))
+            self.frames = [[(80, 80, 81, 81)]] * 30
+            with self.assertRaisesRegex(gui.GuiError, rf"1 of {88 * 78 - 44 * 34} band pixels are not #000000 "
+                                                      r"\(first #ffffff at \(80, 80\)\)"):
+                backdrop.capture(self.instance, self.WINDOW, "screen", "02-b.png")
+        self.assertEqual(("fail", 1), (backdrop.checks[1]["status"], backdrop.checks[1]["attempts"]))
+
+    def test_a_backdrop_missing_from_the_stack_fails(self):
+        self.fake.stack = [self.main]
+        with self.assertRaisesRegex(gui.GuiError, "not in the window stack"):
+            gui.Backdrop("#000000").capture(self.instance, self.WINDOW, "screen", "01-x.png")
+
+    def test_print_captures_and_a_backdrop_that_is_off_do_not_need_the_desktop(self):
+        gui.Backdrop("#000000").capture(self.instance, self.WINDOW, "print", "01-x.png")
+        backdrop = gui.Backdrop(None, "W14 shows the wallpaper")
+        backdrop.capture(self.instance, self.WINDOW, "screen", "02-x.png")
+        self.assertIsNone(backdrop.ensure(self.instance))
+        self.assertEqual([mock.call(self.WINDOW, "print"), mock.call(self.WINDOW, "screen")],
+                         self.instance.capture_window.call_args_list)
+        self.assertEqual([], FakeBackdropWindow.made)
+
+    def test_switching_color_or_off_replaces_or_removes_the_window(self):
+        backdrop = gui.Backdrop("#000000")
+        backdrop.ensure(self.instance)
+        backdrop.fresh = False
+        backdrop.set("#ff00ff", None)
+        backdrop.ensure(self.instance)
+        self.assertTrue(backdrop.fresh, "a new window gets time to paint")
+        self.assertEqual([(0, 0, 0), (255, 0, 255)], [window.color for window in FakeBackdropWindow.made])
+        self.assertEqual([1, 0], [window.closed for window in FakeBackdropWindow.made])
+        backdrop.set(None, "check the desktop shows through")
+        self.assertEqual([1, 1], [window.closed for window in FakeBackdropWindow.made])
+        self.assertIsNone(backdrop.window)
+
+    def test_the_window_styles_keep_it_out_of_the_taskbar_alt_tab_and_the_foreground(self):
+        self.assertEqual(gui.WS_POPUP, REAL_BACKDROP_WINDOW.STYLE)
+        self.assertTrue(REAL_BACKDROP_WINDOW.EXSTYLE & gui.WS_EX_TOOLWINDOW)
+        self.assertTrue(REAL_BACKDROP_WINDOW.EXSTYLE & gui.WS_EX_NOACTIVATE)
+        self.assertFalse(REAL_BACKDROP_WINDOW.EXSTYLE & gui.WS_EX_APPWINDOW)
+
+
+class BackdropScenarioTests(unittest.TestCase):
+    BASE = 'id = "W90"\ntitle = "t"\nconfig = "language = en"\n'
+    CAPTURE = '[[step]]\naction = "capture"\nname = "x"\n'
+
+    def load(self, body: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-x.toml"
+            path.write_text(self.BASE + body, encoding="utf-8")
+            return gui.load_scenario(path)
+
+    def test_settings_and_their_validation(self):
+        self.assertEqual(("#000000", None), (self.load(self.CAPTURE).backdrop, self.load(self.CAPTURE).backdrop_reason))
+        self.assertEqual("#ff00ff", self.load('backdrop = "FF00FF"\n' + self.CAPTURE).backdrop)
+        off = self.load('backdrop = false\nbackdrop_reason = "W14 checks the wallpaper"\n' + self.CAPTURE)
+        self.assertEqual((None, "W14 checks the wallpaper"), (off.backdrop, off.backdrop_reason))
+        cases = {
+            "needs backdrop_reason": 'backdrop = false\n',
+            "only goes with backdrop = false": 'backdrop_reason = "x"\n',
+            "backdrop: bad color": 'backdrop = "pink"\n',
+            "true, false or a #rrggbb": 'backdrop = 1\n',
+            "enabled = false needs a reason": '[[step]]\naction = "backdrop"\nenabled = false\n',
+            "reason only goes with enabled = false": '[[step]]\naction = "backdrop"\nreason = "x"\n',
+            "off has no color": '[[step]]\naction = "backdrop"\nenabled = false\nreason = "x"\ncolor = "#000000"\n',
+            "must be true or false": '[[step]]\naction = "backdrop"\nenabled = "no"\n',
+            "bad color": '[[step]]\naction = "backdrop"\ncolor = "#12"\n',
+        }
+        for expected, body in cases.items():
+            with self.subTest(case=expected), self.assertRaisesRegex(gui.UsageError, expected):
+                self.load(body + self.CAPTURE)
+
+    def run_scenario(self, body: str, fail: bool = False):
+        fake = FakeWin32(4242, 4242)
+        window = gui.WindowInfo(0x10, gui.WINDOW_CLASS, "main", (100, 100, 140, 130), True, False, False)
+        fake.stack = [gui.StackEntry(0x10, gui.WINDOW_CLASS, window.rect, 4242, 4242),
+                      gui.StackEntry(0xB0, "backdrop", (0, 0, 1000, 800), 1, 1)]
+        FakeBackdropWindow.made = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-x.toml"
+            path.write_text(self.BASE + body, encoding="utf-8")
+            scenario = gui.load_scenario(path)
+            run = gui.ScenarioRun(scenario, Path("ghostty.exe"), Path(tmp) / "out")
+            instance = mock.Mock()
+            instance.pid = 4242
+            instance.log = Path(tmp) / "absent.log"
+            instance.popups.return_value = []
+            instance.require_window.return_value = window
+            instance.capture_window.side_effect = (
+                gui.GuiError("capture failed") if fail else
+                lambda info, method, region=None, see_through=(): screen(region or info.rect, [info.rect]))
+            with mock.patch.object(gui, "launch", return_value=instance), mock.patch.object(gui, "win32", return_value=fake), \
+                    mock.patch.object(gui, "BackdropWindow", FakeBackdropWindow), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                report = run.run()
+            return report, gui.notes_text(scenario, report), [path.name for path in (Path(tmp) / "out").glob("*.png")]
+
+    def test_a_scenario_runs_on_the_default_backdrop_and_always_removes_it(self):
+        report, notes, pngs = self.run_scenario(BackdropScenarioTests.CAPTURE)
+        self.assertEqual(("ok", ["01-x.png"]), (report["status"], pngs))
+        self.assertEqual(1, FakeBackdropWindow.made[0].closed)
+        self.assertEqual(["pass"], [check["status"] for check in report["backdrop"]["checks"]])
+        self.assertIn("backdrop: #000000 under the instance's windows", notes)
+        report, notes, pngs = self.run_scenario(BackdropScenarioTests.CAPTURE, fail=True)
+        self.assertEqual(("failed", []), (report["status"], pngs))
+        self.assertEqual(1, FakeBackdropWindow.made[0].closed)
+        self.assertEqual("destroyed", report["backdrop"]["events"][-1]["result"])
+
+    def test_a_scenario_without_the_backdrop_says_so(self):
+        body = 'backdrop = false\nbackdrop_reason = "W14 checks the wallpaper"\n' + BackdropScenarioTests.CAPTURE
+        report, notes, pngs = self.run_scenario(body)
+        self.assertEqual(("ok", [], ["01-x.png"]), (report["status"], FakeBackdropWindow.made, pngs))
+        self.assertIn("backdrop: OFF (W14 checks the wallpaper)", notes)
+        report, notes, _ = self.run_scenario('[[step]]\naction = "backdrop"\ncolor = "#00ff00"\n'
+                                             + BackdropScenarioTests.CAPTURE)
+        self.assertEqual([(0, 0, 0), (0, 255, 0)], [window.color for window in FakeBackdropWindow.made])
+        self.assertIn("a backdrop step changed it", notes)
+
+
 @unittest.skipUnless(sys.platform == "win32", "the ctypes structures are Windows only")
 class Win32StructureTests(unittest.TestCase):
     def test_input_structure_size_matches_the_platform(self):
@@ -701,6 +1018,15 @@ class Win32StructureTests(unittest.TestCase):
         backend = gui.win32()
         self.assertEqual(40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28, ctypes.sizeof(backend.INPUT))
         self.assertEqual(4, len(backend.virtual_screen()))
+
+    def test_backdrop_window_structures_match_the_platform(self):
+        import ctypes
+
+        backend = gui.win32()
+        wide = ctypes.sizeof(ctypes.c_void_p) == 8
+        self.assertEqual(80 if wide else 48, ctypes.sizeof(backend.WNDCLASSEXW))
+        self.assertEqual(48 if wide else 28, ctypes.sizeof(backend.MSG))
+        self.assertEqual(40, ctypes.sizeof(backend.MONITORINFO))
 
 
 if __name__ == "__main__":
