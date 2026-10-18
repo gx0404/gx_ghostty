@@ -17,10 +17,12 @@
 //! Lifecycle: `show` from hidden keeps the window cloaked until it painted
 //! once (synchronously) and a frame passed (timer `RV`), so DWM never
 //! shows it empty; `show` and `setBounds` leave an unchanged window alone.
-//! Without a successful frame of its size and DPI 300 ms after `show`, a
-//! popup cancels its opening, or with `RevealTimeout.reveal` (modal
-//! questions) comes up anyway and keeps painting (timer `RV`) until a
-//! frame succeeds.
+//! When the reveal timer next gets to run 300 ms or more after `show`
+//! without a successful frame of its size and DPI, the popup applies its
+//! timeout policy: it cancels its opening, or with `RevealTimeout.reveal`
+//! (modal questions) comes up anyway and keeps painting (timer `RV`, from
+//! 100 ms up to 1 s apart) until a frame succeeds. A busy thread can run
+//! the timer later than 300 ms; nothing is decided before it runs.
 //! WM_CLOSE (Alt+F4, the system close) hides a shown popup instead of
 //! destroying it, reports `.owner` and, for an activating popup with
 //! `Options.close_owner_on_close`, closes the window it belongs to; a
@@ -243,8 +245,9 @@ pub const Motion = struct {
 /// replace it and never change the system setting. GUI thread.
 pub var animation_policy: *const fn () bool = &anim.enabled;
 
-/// What a popup does when `show` painted no successful frame of its current
-/// size and DPI within `reveal_timeout_ms` (a lost or failing device).
+/// What a popup does when its reveal timer next gets to run at least
+/// `reveal_timeout_ms` after `show` and there is still no successful frame
+/// of its current size and DPI (a lost or failing device).
 pub const RevealTimeout = enum {
     /// Cancel the opening and log it: the popup hides and reports a
     /// dismissal (`.owner`). Menus, the command palette, the settings and
@@ -299,8 +302,8 @@ pub const Options = struct {
     /// outside caller takes the focus from the window. Any show makes an
     /// activating host activatable again (`mayActivate`).
     reuse_host: bool = false,
-    /// What the first-frame reveal does without a successful frame 300 ms
-    /// after `show` (`RevealTimeout`).
+    /// What the first-frame reveal does when it next runs 300 ms or more
+    /// after `show` without a successful frame (`RevealTimeout`).
     reveal_timeout: RevealTimeout = .cancel,
 };
 
@@ -1154,8 +1157,9 @@ fn setCloaked(hwnd: w32.HWND, cloaked: bool) void {
 
 /// A frame passed since the first paint: paint again (DWM can drop the
 /// first frame of a new window), uncloak and start the fade-in. Without a
-/// successful frame it waits up to `reveal_timeout_ms`, then cancels or (with
-/// `RevealTimeout.reveal`) reveals the popup unpainted and paints again.
+/// successful frame it waits; the first time it runs `reveal_timeout_ms` or
+/// more after `show` it cancels or (with `RevealTimeout.reveal`) reveals the
+/// popup unpainted and paints again.
 fn reveal(self: *Popup, hwnd: w32.HWND) void {
     _ = w32.KillTimer(hwnd, REVEAL_TIMER_ID);
     if (!self.revealing) {

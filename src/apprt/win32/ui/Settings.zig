@@ -36,9 +36,16 @@
 //! configuration file) after a short pause; a failed save keeps the
 //! changes, shows the reason and tries again with a growing delay
 //! (`settings/model.zig`). The configuration is then rebuilt from a
-//! `gx.config_layers.Layers` snapshot read when the overlay opens (no file
-//! is read again; the snapshot follows the changes made here) and the rows
-//! show the values it ends up with. "Reset to Default" (the ↺ button next to
+//! `gx.config_layers.Layers` snapshot (no file is read again; the snapshot
+//! follows the changes made here) and the rows show the values it ends up
+//! with. The snapshot, the theme directories and the launch profiles are
+//! read by the first opening after they became stale (`loadData`) and kept
+//! with the hidden overlay of the window between openings; any configuration
+//! change, a UI language, DPI or system UI change, and launch profiles
+//! detected anew make them stale (`onConfigChange`, `invalidateOwner`,
+//! `invalidateData`). Idle preparation never reads them (`prepare`); a
+//! change of the files by another program shows after a reload.
+//! "Reset to Default" (the ↺ button next to
 //! a setting that the settings file sets, or Delete) removes the key from
 //! the file, so the configuration file or the default applies again (D13);
 //! a value that comes from the configuration file or the command line says
