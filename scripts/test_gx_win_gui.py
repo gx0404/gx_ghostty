@@ -160,7 +160,8 @@ class IsolationTests(unittest.TestCase):
     def test_explicit_environment_cannot_escape_private_profile_paths(self):
         for name in ("LOCALAPPDATA", "APPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
             for key in (name, name.lower()):
-                with self.subTest(key=key), self.assertRaises(gui.UsageError):
+                with self.subTest(key=key), self.assertRaisesRegex(gui.UsageError, rf"cannot override the isolated "
+                                                                                   rf"path variable {key}$"):
                     gui.isolated_environment({}, Path("E:/ev/env"), {key: "C:/outside"})
 
     def test_env_assignments(self):
@@ -623,6 +624,8 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual('instance_gone', error.cause)
         self.assertEqual([('instance', 'fail', 'instance_gone'), ('guard', 'fail', 'instance_gone')],
                          [(row['event'], row['status'], row['cause']) for row in rows])
+        self.assertRegex(rows[0]['reason'], r'^ghostty pid \d+ has ended or is no longer the process this tool started; '
+                                            r'no input was sent')
         self.assertEqual([], fake.sent)
         # close() that finds the process already gone audits the unexpected end too.
         with tempfile.TemporaryDirectory() as temp:
@@ -635,6 +638,8 @@ class InputGuardTests(unittest.TestCase):
                 closing.note_gone('expected')
             rows = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
         self.assertEqual([('instance', 'instance_gone')], [(row['event'], row['cause']) for row in rows])
+        self.assertRegex(rows[0]['reason'], r'^ghostty pid \d+ had ended, or was no longer the process this tool '
+                                            r'started, before the close$')
 
     def wheel_rows(self, fake, **kwargs):
         with tempfile.TemporaryDirectory() as temp:

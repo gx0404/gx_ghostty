@@ -527,7 +527,7 @@ def isolated_environment(base: Mapping[str, str], env_dir: Path, extra: Mapping[
              "XDG_STATE_HOME": env_dir / "state", "XDG_CACHE_HOME": env_dir / "cache"}
     for name in extra or {}:
         if name.upper() in paths:
-            raise UsageError(f"不能通过 --env 覆盖隔离路径变量: {name}")
+            raise UsageError(f"--env cannot override the isolated path variable {name}")
     env = {}
     for name, value in base.items():
         upper = name.upper()
@@ -1854,7 +1854,8 @@ class Instance:
 
     def ensure_owned(self) -> None:
         if not self.alive():
-            message = f"Ghostty 实例 {self.pid} 已结束或进程身份已变化；未发送输入或执行界面操作"
+            message = (f"ghostty pid {self.pid} has ended or is no longer the process this tool started; "
+                       "no input was sent and no window was touched")
             self.note_gone(message)
             raise InputBlocked(message, cause="instance_gone")
 
@@ -1872,7 +1873,8 @@ class Instance:
         With force=False a process still running after `timeout` is left alone and GuiError raised."""
         w = win32()
         if not self.alive():
-            self.note_gone(f"Ghostty 实例 {self.pid} 在关闭前已结束或进程身份已变化")
+            self.note_gone(f"ghostty pid {self.pid} had ended, or was no longer the process this tool started, "
+                           "before the close")
             return "not running"
         self.remember_children()
         self.closing = True
