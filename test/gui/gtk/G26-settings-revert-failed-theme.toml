@@ -1,0 +1,67 @@
+id = "G26"
+title = "D-15: reverting a theme whose saving failed drops it, so no later save writes it"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+t=gx:settings_page:appearance
+"""
+script = '''
+import os
+folder = config_home / "ghostty"
+overlay = folder / "gui-settings.ghostty"
+def overlay_text():
+    return overlay.read_text() if overlay.exists() else ""
+xdo("windowsize", window(), 1100, 740)
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+t")
+sleep(0.8)
+xdo("mousemove", 550, 170, "click", 1)
+sleep(0.8)
+xdo("mousemove", 400, 96, "click", 1)
+xdo("key", "ctrl+a")
+xdo("type", "--delay", 1, "Chalkboard")
+sleep(1.0)
+capture("01-preview")
+os.chmod(folder, 0o555)
+if overlay.exists():
+    os.chmod(overlay, 0o444)
+try:
+    xdo("mousemove", 845, 96, "click", 1)
+    sleep(0.8)
+    capture("02-save-failed")
+    assert "Chalkboard" not in overlay_text()
+    xdo("mousemove", 755, 96, "click", 1)
+    sleep(0.8)
+    capture("03-reverted")
+    # Nothing is left to save, so the dialog closes while the folder is
+    # still read-only.
+    for step in range(3):
+        xdo("key", "Escape")
+        sleep(0.8)
+        capture("04-escape-%d" % (step + 1))
+finally:
+    os.chmod(folder, 0o755)
+    if overlay.exists():
+        os.chmod(overlay, 0o644)
+text = overlay_text()
+save("-overlay.txt", text)
+assert "Chalkboard" not in text, text
+xdo("key", "ctrl+alt+t")
+sleep(0.8)
+capture("05-reopened")
+xdo("key", "Escape")
+sleep(0.8)
+assert "Chalkboard" not in overlay_text()
+'''
+expect = [
+  "G26.png: the isolated terminal before the settings open",
+  "G26-01-preview.png: the theme list searched for Chalkboard previews it; the saved theme keeps its check mark",
+  "G26-02-save-failed.png: with the settings folder read-only, Apply shows the failure toast with Retry and Chalkboard stays previewed",
+  "G26-03-reverted.png: Revert brings the saved theme back, selected with its check mark; the retry toast is gone and Apply/Revert are insensitive",
+  "G26-04-escape-1.png to G26-04-escape-3.png: with the folder still read-only, Escape leaves the theme list and closes the dialog without a failure toast",
+  "G26-overlay.txt: after the folder became writable again the settings file has no theme = Chalkboard: nothing saved the reverted theme",
+  "G26-05-reopened.png: the appearance page shows the saved theme, not Chalkboard",
+]
