@@ -1801,10 +1801,13 @@ def wait_until(predicate, description: str, timeout: float = 10):
         time.sleep(0.02)
 
 
+UI_POPUP_CLASSES = frozenset(('GhosttyGxPopup', 'GhosttyGxPopupShadow'))
+
+
 def open_ui(instance, name: str):
-    previous = {popup.hwnd for popup in instance.popups() if popup.cls == 'GhosttyGxPopup'}
+    previous = {popup.hwnd for popup in instance.popups() if popup.cls in UI_POPUP_CLASSES}
     instance.press(UI_KEYS[name])
-    return wait_until(lambda: next((p for p in instance.popups() if p.cls == 'GhosttyGxPopup' and p.hwnd not in previous), None), name)
+    return wait_until(lambda: next((p for p in instance.popups() if p.cls in UI_POPUP_CLASSES and p.hwnd not in previous), None), name)
 
 
 def arm_samples(text: str, baseline: bool = False) -> Samples:
@@ -1840,7 +1843,7 @@ def metric_capabilities(values: Sequence[str], labels, exes) -> dict:
 
 def close_ui(instance):
     instance.press('escape')
-    wait_until(lambda: not any(p.cls == 'GhosttyGxPopup' for p in instance.popups()), 'popup close')
+    wait_until(lambda: not any(p.cls in UI_POPUP_CLASSES for p in instance.popups()), 'popup close')
     time.sleep(0.25)
 
 

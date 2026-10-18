@@ -1138,6 +1138,91 @@ class CounterTests(unittest.TestCase):
             self.assertEqual(44, ctypes.sizeof(gx_perf.ProcessMemory))
 
 
+class PopupClassTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        patches = contextlib.ExitStack()
+        self.addCleanup(patches.close)
+        patches.enter_context(mock.patch.object(gx_perf.time, 'monotonic', side_effect=lambda: self.now))
+        self.sleep = patches.enter_context(mock.patch.object(gx_perf.time, 'sleep', side_effect=self.advance))
+        self.instance = mock.Mock()
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def popup_sequence(self, *snapshots):
+        sequence = iter(snapshots)
+        self.instance.popups.side_effect = lambda: next(sequence, snapshots[-1])
+
+    def test_open_accepts_exact_popup_classes(self):
+        for cls in ('GhosttyGxPopup', 'GhosttyGxPopupShadow'):
+            for name in ('palette', 'menu', 'settings'):
+                with self.subTest(cls=cls, name=name):
+                    popup = SimpleNamespace(hwnd=2, cls=cls)
+                    self.instance.reset_mock()
+                    self.popup_sequence([], [], [popup])
+                    self.assertIs(popup, gx_perf.open_ui(self.instance, name))
+                    self.assertEqual(3, self.instance.popups.call_count)
+                    self.instance.press.assert_called_once_with(gx_perf.UI_KEYS[name])
+
+    def test_open_ignores_preexisting_shadow_until_new_popup(self):
+        old = SimpleNamespace(hwnd=1, cls='GhosttyGxPopupShadow')
+        new = SimpleNamespace(hwnd=2, cls='GhosttyGxPopupShadow')
+        self.popup_sequence([old], [old], [old, new])
+        self.assertIs(new, gx_perf.open_ui(self.instance, 'palette'))
+        self.assertEqual(3, self.instance.popups.call_count)
+
+    def test_open_times_out_with_only_preexisting_shadow(self):
+        old = SimpleNamespace(hwnd=1, cls='GhosttyGxPopupShadow')
+        self.instance.popups.return_value = [old]
+        with self.assertRaisesRegex(gx_perf.PerfError, 'timeout waiting for palette'):
+            gx_perf.open_ui(self.instance, 'palette')
+
+    def test_close_waits_until_popup_disappears(self):
+        for cls in ('GhosttyGxPopup', 'GhosttyGxPopupShadow'):
+            with self.subTest(cls=cls):
+                popup = SimpleNamespace(hwnd=1, cls=cls)
+                self.instance.reset_mock()
+                self.sleep.reset_mock()
+                self.popup_sequence([popup], [popup], [])
+                gx_perf.close_ui(self.instance)
+                self.assertEqual(3, self.instance.popups.call_count)
+                self.instance.press.assert_called_once_with('escape')
+                self.assertEqual([mock.call(.02), mock.call(.02), mock.call(.25)], self.sleep.call_args_list)
+
+    def test_close_times_out_while_shadow_remains_visible(self):
+        self.instance.popups.return_value = [SimpleNamespace(hwnd=1, cls='GhosttyGxPopupShadow')]
+        with self.assertRaisesRegex(gx_perf.PerfError, 'timeout waiting for popup close'):
+            gx_perf.close_ui(self.instance)
+        self.assertNotIn(mock.call(.25), self.sleep.call_args_list)
+
+    def test_open_recognizes_reused_hidden_host_when_shown_again(self):
+        for cls in ('GhosttyGxPopup', 'GhosttyGxPopupShadow'):
+            with self.subTest(cls=cls):
+                popup = SimpleNamespace(hwnd=1, cls=cls)
+                # Instance.popups owns visibility/cloaking filtering: a hidden
+                # host is absent, even though its HWND still exists for reuse.
+                self.instance.reset_mock()
+                self.popup_sequence([], [popup], [popup], [], [], [], [popup])
+                self.assertIs(popup, gx_perf.open_ui(self.instance, 'palette'))
+                gx_perf.close_ui(self.instance)
+                self.assertIs(popup, gx_perf.open_ui(self.instance, 'palette'))
+                self.assertEqual(7, self.instance.popups.call_count)
+                self.instance.windows.assert_not_called()
+
+    def test_other_classes_neither_open_nor_block_close(self):
+        for cls in ('GhosttyGxPopupExtra', 'GhosttyGxPopupShadowExtra', 'GhosttyGx', 'Other'):
+            with self.subTest(cls=cls):
+                popup = SimpleNamespace(hwnd=2, cls=cls)
+                # The unrelated window appears only after the opening key,
+                # so previous cannot hide an overly broad class predicate.
+                self.instance.popups.side_effect = lambda: [] if not self.instance.press.called else [popup]
+                self.instance.press.reset_mock()
+                with self.assertRaisesRegex(gx_perf.PerfError, 'timeout waiting for palette'):
+                    gx_perf.open_ui(self.instance, 'palette')
+                gx_perf.close_ui(self.instance)
+
+
 class ExperimentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
