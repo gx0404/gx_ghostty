@@ -100,7 +100,7 @@ fn registrationMatches(alloc: std.mem.Allocator, exe: [:0]const u16, activator: 
     defer alloc.free(server);
     return wideEqual(actual, owned) and wideEqual(actual, server);
 }
-fn finalPath(alloc: std.mem.Allocator, path: [*:0]const u16) ![]u16 {
+pub fn finalPath(alloc: std.mem.Allocator, path: [*:0]const u16) ![]u16 {
     const text = std.mem.span(path);
     const slash = struct {
         fn is(c: u16) bool {
@@ -121,7 +121,7 @@ fn finalPath(alloc: std.mem.Allocator, path: [*:0]const u16) ![]u16 {
     alloc.free(data);
     return result;
 }
-fn wideEqual(a: []const u16, b: []const u16) bool {
+pub fn wideEqual(a: []const u16, b: []const u16) bool {
     return CompareStringOrdinal(a.ptr, @intCast(a.len), b.ptr, @intCast(b.len), 1) == 2;
 }
 extern "advapi32" fn RegGetValueW(*anyopaque, [*:0]const u16, [*:0]const u16, u32, ?*u32, ?*anyopaque, *u32) callconv(.winapi) i32;

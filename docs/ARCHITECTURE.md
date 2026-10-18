@@ -172,6 +172,10 @@ Surface（src/Surface.zig）
 - 界面文字全部经 `gx.i18n`（Windows 构建没有 gettext），语言切换时窗口、菜单、命令面板与设置浮层当场重建文字。
 - 测试钩子：向窗口 `SendMessage` `src/apprt/win32/Window.zig::WM_GHOSTTY_SIMULATE_DPI` 走一遍 DPI 变化路径，向终端子窗口发 `src/apprt/win32/Surface.zig::WM_GHOSTTY_SIMULATE_GPU_RESET` 让渲染器把下一帧当作 GPU 重置处理；用法见 [TESTING.md](TESTING.md)。
 
+Windows 拖放入口的 DACL 由 `ipc/Security.zig::dropSddl/initDrop` 构造：每条条件允许 ACE 同时匹配用户 SID 与该令牌的登录 SID，当前登录与经过同用户、同会话、互补权限校验的 linked 登录分别成条；不是将用户与登录条件独立放行。`DropBroker.Descriptor` 保留 DACL 并加完整性标签，协议层的对端身份校验仍执行；失败不降级为空 DACL。
+
+安装版 Shell 工作线程在正常启动时调用 `shell/JumpList.zig::migratePinned`，只对目标规范路径匹配当前 exe 且缺 AUMID 的旧快捷方式补写身份；`activation_only` 和便携版不迁移。迁移保留其他快捷方式属性，已有正确或其他 AUMID 的项目不改写。扫描根以不跟随链接方式打开，检查同一目录句柄的 AttributeTag，根重解析点直接跳过，查询失败向调用方报告并记录 warning；子目录与快捷方式链接同样跳过。此保证针对已打开的扫描根与枚举类型，不宣称祖先路径或并发换链完全受保护；二次运行幂等，实际 Explorer 归组以最终 VM 证据为准。
+
 ## 7. GX 共享核心与配置分层
 
 `src/gx/main.zig` 汇总共享模块，单测经 GX-0010 在 `src/config/Config.zig` 里的 `test` 块进入 `ghostty-test`：

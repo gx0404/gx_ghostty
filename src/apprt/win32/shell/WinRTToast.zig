@@ -131,6 +131,11 @@ pub fn destroy(self: *Self) void {
 
 fn run(self: *Self) void {
     defer self.state.store(.stopped, .release);
+    if (!self.options.activation_only) {
+        @import("JumpList.zig").migratePinned(self.allocator, @import("../../../global.zig").io(), &self.identity) catch |err| {
+            std.log.scoped(.win32_shell).warn("Pinned shortcut migration failed: {}", .{err});
+        };
+    }
     var api = Api.load() catch {
         self.unavailableLoop();
         return;
