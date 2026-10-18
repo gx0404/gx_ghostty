@@ -694,10 +694,12 @@ fn menuButtonAnchor(window: *Window) w32.RECT {
     return screenRect(hwnd, .{ .left = client.right, .top = top, .right = client.right, .bottom = top });
 }
 
-/// Invalidate generations, not live callback storage. Active overlays finish
-/// their transaction (an open menu, palette or settings stays open, only
-/// marked stale); the next idle preparation/open rebuilds their hosts. Only
-/// the owner's destruction ends an open menu (`Settings.onWindowDestroyed`).
+/// Invalidate generations, not live callback storage: a configuration, DPI
+/// or system UI change leaves an open palette, settings or menu open, only
+/// marked stale, and the next opening (or idle preparation) rebuilds their
+/// hosts. An open menu closes for a UI language change (`onLanguageChanged`,
+/// its labels would stay in the old language) and for the destruction of
+/// its owner (`MenuPopup.onOwnerDestroyed`), nothing else.
 pub fn invalidateWindow(window: *Window) void {
     window.palette.invalidateHost();
     Settings.invalidateOwner(window);
@@ -1761,8 +1763,10 @@ fn setMenuItemEnabled(menu: w32.HMENU, item: u32, enabled: bool) void {
     _ = EnableMenuItem(menu, item, MF_BYCOMMAND | if (enabled) MF_ENABLED else w32.MF_GRAYED);
 }
 
-/// Hook for a language change. Menus are built on demand, so the next one
-/// uses the new language; a menu that is open closes.
+/// Hook for a language change (`Window.onLanguageChanged`). Menus are built
+/// on demand, so the next one uses the new language; a menu that is open
+/// closes, and its hidden root host, retired by `invalidateWindow`, is
+/// freed when that session unwinds.
 pub fn onLanguageChanged() void {
     MenuPopup.cancel();
 }

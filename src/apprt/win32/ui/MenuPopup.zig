@@ -350,8 +350,10 @@ var root_hosts: RootHosts = .{};
 
 /// A configuration, language, DPI or system UI change retired `owner`'s
 /// hidden root host (`Menu.invalidateWindow`). A session on the stack keeps
-/// its borrowed root, finishes normally and frees it when it unwinds; the
-/// next opening builds a new one.
+/// its borrowed root and frees it when it unwinds; the next opening builds
+/// a new one. Retiring it does not end the session: a language change also
+/// closes the open menu (`Menu.onLanguageChanged`), and the destruction of
+/// its owner does (`onOwnerDestroyed`).
 pub fn invalidateOwner(owner: w32.HWND) void {
     root_hosts.invalidate(owner);
 }
@@ -387,8 +389,9 @@ test "P4 reuse retains one stable menu root for 100 sessions and retires a borro
 }
 
 test "P4 retiring an owner's menu root lets its open session finish" {
-    // A configuration, language, DPI or system UI change during a menu: the
-    // menu stays open and ends normally; only a later opening rebuilds.
+    // A configuration, DPI or system UI change during a menu: the menu stays
+    // open and ends normally; only a later opening rebuilds. (A language
+    // change closes it, see the next test.)
     const owner: w32.HWND = @ptrFromInt(0x40);
     var state: State = undefined;
     state.owner = owner;
@@ -399,11 +402,68 @@ test "P4 retiring an owner's menu root lets its open session finish" {
     defer current = running;
     invalidateOwner(owner);
     try std.testing.expect(state.result == .open);
-    // Only the owner's destruction ends it.
+    // Of the owners' destructions, only its own ends it.
     onOwnerDestroyed(@ptrFromInt(0x80));
     try std.testing.expect(state.result == .open);
     onOwnerDestroyed(owner);
     try std.testing.expect(state.result == .cancelled);
+}
+
+test "P4 a UI language change closes an open menu, other invalidations only retire its host" {
+    // Through the whole notification chain of an applied `language` change:
+    // App.updateConfig → Window.onLanguageChanged → Menu.onLanguageChanged.
+    // The window has no HWND, so nothing reaches the desktop.
+    const Window = @import("../Window.zig");
+    const Config = @import("../../../config.zig").Config;
+    const i18n = @import("../../../gx/i18n.zig");
+    var core: @import("../../../App.zig") = undefined;
+    core.alloc = testing.allocator;
+    var app: App = .{
+        .core_app = &core,
+        .config = try Config.default(testing.allocator),
+        .hinstance = w32.GetModuleHandleW(null) orelse return error.TestUnexpectedResult,
+        .default_command_arena = .init(testing.allocator),
+    };
+    defer app.default_command_arena.deinit();
+    defer app.config.deinit();
+    var window: Window = .{ .app = &app };
+    var windows = [_]*Window{&window};
+    app.windows = .{ .items = &windows, .capacity = windows.len };
+    const language = i18n.current();
+    defer i18n.setCurrent(language);
+
+    const owner: w32.HWND = @ptrFromInt(0x40);
+    var state: State = undefined;
+    state.owner = owner;
+    state.result = .open;
+    state.depth = 0;
+    const running = current;
+    current = &state;
+    defer current = running;
+
+    // What a configuration, DPI or system UI change does to the menus of a
+    // window: the open menu goes on.
+    window.hwnd = owner;
+    @import("Menu.zig").invalidateWindow(&window);
+    window.hwnd = null;
+    try testing.expect(state.result == .open);
+    try testing.expect(window.palette.preparation.isPending());
+
+    // Another configuration without a new language: it stays open.
+    var same = try app.config.clone(testing.allocator);
+    defer same.deinit();
+    same.@"font-size" += 1;
+    try testing.expect(try app.performAction(.app, .config_change, .{ .config = &same }));
+    try testing.expect(state.result == .open);
+    try testing.expectEqual(language, i18n.current());
+
+    // The UI language changes: the open menu closes.
+    var next = try app.config.clone(testing.allocator);
+    defer next.deinit();
+    next.language = if (language == .en) "zh-CN" else "en";
+    try testing.expect(try app.performAction(.app, .config_change, .{ .config = &next }));
+    try testing.expect(i18n.current() != language);
+    try testing.expect(state.result == .cancelled);
 }
 
 test "P4 reuse rebuilds the hidden main menu root when the animation setting changes" {
