@@ -194,8 +194,11 @@ def compose_ime(fixture, instance, native):
         restored = None
         try:
             if state is not None and ime and api.IsWindow(ime) and api.window_pid(ime) == instance.pid:
-                ime_control(ime, IMC_SETCONVERSIONMODE, state["mode"])
+                # Open status first: closing Microsoft Pinyin after a composition
+                # resets the conversion mode (round3-batch-20261018-101019:
+                # mode-then-open read back (0,1) as (0,0)), so mode goes last.
                 ime_control(ime, IMC_SETOPENSTATUS, state["open"])
+                ime_control(ime, IMC_SETCONVERSIONMODE, state["mode"])
                 restored = {"open": ime_control(ime, IMC_GETOPENSTATUS), "mode": ime_control(ime, IMC_GETCONVERSIONMODE)}
                 report["ime_after"] = restored
         finally:

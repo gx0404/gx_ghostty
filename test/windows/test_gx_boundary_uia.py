@@ -22,6 +22,8 @@ class PopupBoundaryTests(unittest.TestCase):
             if command in (0x0006, 0x0002):
                 sets.append((command, value))
                 ime_state['open' if command == 0x0006 else 'mode'] = value
+                if command == 0x0006 and value == 0:
+                    ime_state['mode'] = 0  # Pinyin: closing resets the conversion mode.
                 return 0
             return ime_state['open' if command == 0x0005 else 'mode']
 
