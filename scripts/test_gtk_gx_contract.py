@@ -285,6 +285,24 @@ class TemplateChildTests(unittest.TestCase):
                 self.assertIn(node.kind, (kind, f"Gtk.{kind}"))
 
 
+class MainPopoverParentTests(unittest.TestCase):
+    @staticmethod
+    def check_parent(root):
+        parents = [node for node in root.walk()
+                   if any(child.id == "context_menu" for child in node.children)]
+        if len(parents) != 1 or parents[0].kind not in ("Box", "Gtk.Box"):
+            raise AssertionError("Surface.context_menu must have a Box parent for the GX main popover")
+
+    def test_context_menu_parent_is_a_box(self):
+        source = class_file("Surface").read_text(encoding="utf-8")
+        self.check_parent(blueprint(class_blueprint(source)))
+
+    def test_changed_parent_fails_the_contract(self):
+        root = parse_blueprint("Overlay {\n PopoverMenu context_menu {\n }\n}\n")
+        with self.assertRaisesRegex(AssertionError, "Box parent"):
+            self.check_parent(root)
+
+
 class HeaderBarTests(unittest.TestCase):
     def test_matched_icons_are_on_window_buttons(self):
         window = blueprint("1.5/window.blp")
