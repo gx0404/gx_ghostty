@@ -1,5 +1,7 @@
-"""Offline contracts of the UIA-01 dynamic focus plans; no window is created."""
+"""Offline contracts of the UIA-01/05/06 plans and judgments; no window is created."""
 import base64
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -63,6 +65,59 @@ class FocusPlanTests(unittest.TestCase):
         self.assertTrue(line.endswith("$E\\$G$S"))
         self.assertIn("clipboard-write = ask", popup.DIALOG_CONFIG)
         self.assertNotIn("clipboard-read", popup.DIALOG_CONFIG)
+
+
+class TerminalJudgmentTests(unittest.TestCase):
+    """UIA-05 (D-29) judgments over probe nodes."""
+
+    ROOT = {"name": "C:\\Windows\\system32\\cmd.exe", "control_type": 50033, "localized_type": "Terminal",
+            "automation_id": "gx-terminal-7", "native_window_handle": 0x40482}
+
+    def test_the_root_must_be_the_named_terminal_pane_of_that_hwnd(self):
+        self.assertEqual([], popup.terminal_root_facts(self.ROOT, 0x40482))
+        # The r6 VM probe: the anonymous Win32 HWND element.
+        anonymous = {"name": "", "control_type": 50033, "localized_type": "pane", "automation_id": "", "native_window_handle": 0x40482}
+        self.assertEqual(["named", "localized_type", "automation_id"], popup.terminal_root_facts(anonymous, 0x40482))
+        self.assertEqual(["native_window_handle"], popup.terminal_root_facts(self.ROOT, 0x50492))
+        # A handle reported as a negative VT_I4 still matches its low 32 bits.
+        self.assertEqual([], popup.terminal_root_facts(self.ROOT | {"native_window_handle": -0x7ffbfb7e}, 0x80040482))
+
+    def test_a_window_fragment_twin_of_a_terminal_is_a_duplicate(self):
+        window = {"name": self.ROOT["name"], "control_type": 50032, "automation_id": "gx-1"}
+        twin = {"name": self.ROOT["name"], "control_type": 50033, "automation_id": "gx-11"}
+        self.assertEqual([self.ROOT], popup.terminal_elements([window, self.ROOT]))
+        self.assertEqual([], popup.duplicate_panes([window, self.ROOT]))
+        self.assertEqual([twin], popup.duplicate_panes([window, self.ROOT, twin]))
+
+
+class EventJudgmentTests(unittest.TestCase):
+    """UIA-06 (D-03 N2-N4): what the keyboard move is expected to report."""
+
+    def test_the_menu_expects_the_item_after_the_focused_one(self):
+        items = [{"name": "New Tab", "control_type": 50011, "focusable": True, "focused": True},
+                 {"name": "Language", "control_type": 50020, "focusable": False},
+                 {"name": "New Window", "control_type": 50011, "focusable": True, "focused": False}]
+        before, expected = popup.next_after_focus(items, popup.UIA_MENU_ITEM)
+        self.assertEqual(("New Tab", "New Window"), (before["name"], expected["name"]))
+        self.assertEqual((None, None), popup.next_after_focus(items[2:], popup.UIA_MENU_ITEM))
+
+    def test_the_palette_expects_the_row_after_the_selected_one(self):
+        row = {"control_type": 50007, "patterns": {"selection_item": True}}
+        rows = [row | {"name": "Split Right", "selected": True}, row | {"name": "Split Left", "selected": False}]
+        before, expected = popup.next_after_selection(rows)
+        self.assertEqual(("Split Right", "Split Left"), (before["name"], expected["name"]))
+        self.assertEqual((None, None), popup.next_after_selection(rows[:1]))
+
+    def test_only_events_after_the_ready_file_count(self):
+        events = [{"name": "New Tab", "after_ready": False}, {"name": "New Window", "after_ready": True}]
+        self.assertEqual([events[1]], popup.later_events(events))
+        self.assertEqual([], popup.later_events(events, name="New Tab"))
+
+    def test_terminal_and_event_checks_run_on_their_own(self):
+        base = ["--exe", "ghostty.exe", "--sha256", "a" * 64, "--out", "unused"]
+        for extra in (["--terminal-checks", "--actions"], ["--event-checks", "--readonly-root"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                popup.main(base + extra)
 
 
 if __name__ == "__main__":

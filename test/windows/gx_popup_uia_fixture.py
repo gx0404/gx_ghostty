@@ -45,6 +45,13 @@ PHASES = {0: "reset", 1: "target", 2: "surface", 3: "begin", 4: "end", 5: "commi
 CLIPBOARD_MARKER = "GX_UIA_01_FOCUS"
 DIALOG_CONFIG = CONFIG.replace("command = cmd.exe /d /k prompt $G$S",
                                "clipboard-write = ask\ncommand = cmd.exe /d /k prompt $E]52;c;R1hfVUlBXzAxX0ZPQ1VT$E\\$G$S")
+# UIA-05 (D-29): a terminal split on a chord the fixture checks no other
+# program holds as a global hotkey.
+SPLIT_CHORD = "ctrl+alt+shift+d"
+TERMINAL_CONFIG = CONFIG + f"keybind = {SPLIT_CHORD}=new_split:right\n"
+TERMINAL_CLASS = "GhosttyTerminal"
+UIA_PANE, UIA_EDIT, UIA_LIST_ITEM, UIA_LIST, UIA_MENU_ITEM = 50033, 50004, 50007, 50008, 50011
+ELEMENT_SELECTED = 20012
 
 
 def focusable(nodes, **pattern):
@@ -93,6 +100,52 @@ def dialog_focus_rows(nodes):
             {"automation_id": check["automation_id"], "pattern": "toggle", "operation": "toggle"}]
 
 
+def terminal_root_facts(root, hwnd, language="Terminal"):
+    """D-29: the root of a terminal HWND's own provider is the named pane
+    (UIA-05); returns the failed facts, empty when all hold."""
+    facts = {"control_type": root.get("control_type") == UIA_PANE, "named": bool(root.get("name")),
+             "localized_type": root.get("localized_type") == language,
+             "automation_id": str(root.get("automation_id", "")).startswith("gx-terminal-"),
+             "native_window_handle": (root.get("native_window_handle") or 0) & 0xFFFFFFFF == hwnd & 0xFFFFFFFF}
+    return [name for name, holds in facts.items() if not holds]
+
+
+def terminal_elements(nodes):
+    """The terminal elements of a window's tree (their own HWND providers)."""
+    return [node for node in nodes if str(node.get("automation_id", "")).startswith("gx-terminal-")]
+
+
+def duplicate_panes(nodes):
+    """Window fragment nodes that repeat a terminal as an unnamed-HWND twin
+    (D-29): a pane with a terminal's name that is not that terminal."""
+    names = {node.get("name") for node in terminal_elements(nodes)}
+    return [node for node in nodes if node.get("control_type") == UIA_PANE and node.get("name") in names
+            and node not in terminal_elements(nodes)]
+
+
+def next_after_focus(nodes, control_type):
+    """The focused element of `control_type` and the next one in tree order."""
+    items = [node for node in nodes if node.get("control_type") == control_type and node.get("focusable")]
+    index = next((i for i, node in enumerate(items) if node.get("focused")), None)
+    if index is None or index + 1 >= len(items):
+        return None, None
+    return items[index], items[index + 1]
+
+
+def next_after_selection(nodes):
+    """The selected list item and the next one in tree order."""
+    rows = [node for node in nodes if node.get("control_type") == UIA_LIST_ITEM and node.get("patterns", {}).get("selection_item")]
+    index = next((i for i, node in enumerate(rows) if node.get("selected")), None)
+    if index is None or index + 1 >= len(rows):
+        return None, None
+    return rows[index], rows[index + 1]
+
+
+def later_events(events, **match):
+    """Events recorded after the worker's ready file whose fields all match."""
+    return [event for event in events if event.get("after_ready") and all(event.get(key) == value for key, value in match.items())]
+
+
 def choose_popup(windows):
     return next((window for window in windows if window.cls in POPUP_CLASSES), None)
 
@@ -130,6 +183,8 @@ class Fixture:
         self.readonly_root = args.readonly_root
         self.actions = args.actions
         self.focus_checks = args.focus_checks
+        self.terminal_checks = args.terminal_checks
+        self.event_checks = args.event_checks
         self.modes = ("off", "on") if args.mode == "both" else (args.mode,)
         self.owned = []
         self.check_build()
@@ -481,9 +536,206 @@ class Fixture:
         self.report["cleanup"].append({"pid": instance.pid, "birth": instance.creation, "result": instance.close()})
         self.save()
 
+    @staticmethod
+    def fresh_terminal(instance, hwnd):
+        instance.ensure_owned()
+        api = gui.win32()
+        if api.window_pid(hwnd) != instance.pid or api.class_name(hwnd) != TERMINAL_CLASS:
+            raise gui.InputBlocked("terminal HWND no longer belongs to the fixture process")
+
+    def terminal_probe(self, instance, hwnd, name, rows=None):
+        """External MTA probe of a terminal child HWND; its root must be the
+        app's own provider (gx_win_uia checks FrameworkId GhosttyGX)."""
+        self.fresh_terminal(instance, hwnd)
+        command = [sys.executable, str(ROOT / "scripts/gx_win_uia.py"), "--worker", "--hwnd", str(hwnd),
+                   "--pid", str(instance.pid), "--birth", str(instance.creation), "--exe", str(self.exe),
+                   "--timeout", "15", "--max-nodes", "64", "--max-depth", "4"]
+        if rows:
+            plan = self.out / (name + ".plan.json")
+            plan.write_text(json.dumps(rows), encoding="utf-8")
+            command += ["--sha256", self.expected_hash, "--action-plan", str(plan)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=20)
+        path = self.out / f"{name}-uia.json"
+        path.write_text(json.dumps({"command": command, "returncode": result.returncode, "stdout": result.stdout,
+                                    "stderr": result.stderr}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.fresh_terminal(instance, hwnd)
+        if result.returncode != 0:
+            raise AssertionError(f"terminal UIA probe failed: {path.name}")
+        probe = json.loads(result.stdout)
+        if probe.get("status") != "PASS" or probe.get("apartment") != "MTA" or probe.get("created_hwnd") is not False:
+            raise AssertionError("probe did not confirm the external windowless MTA contract")
+        return probe
+
+    def capture_root(self, instance, name, expect):
+        instance.ensure_foreground()
+        window = instance.require_window()
+        instance.capture_window(window, self.method).save_png(self.out / name)
+        self.report["captures"].append({"file": name, "method": self.method, "review": "PENDING_REVIEW", "expect": expect,
+                                         "pid": instance.pid, "birth": instance.creation, "window": asdict(window)})
+        self.save()
+
+    def terminal_checks_run(self):
+        """UIA-05 (D-29): the terminal HWND with the system focus is the named
+        pane screen readers announce, each terminal appears once in its window's
+        tree, and a UIA SetFocus on another pane raises its FocusChanged."""
+        from gx_boundary_controller import held_global_hotkeys
+        held = held_global_hotkeys([SPLIT_CHORD])
+        if held:
+            raise Blocked(f"another program holds the split chord as a global hotkey: {held}")
+        instance = self.start("off", config=TERMINAL_CONFIG, variant="-terminal")
+        window = instance.require_window()
+        terminals = instance.terminals(window)
+        focused = instance.focused_terminal()
+        if [item.hwnd for item in terminals] != [focused]:
+            raise AssertionError(f"expected one focused terminal, found {[item.hwnd for item in terminals]} focus {focused}")
+        probe = self.terminal_probe(instance, focused, "terminal-single")
+        root = probe["nodes"][0]
+        failed = terminal_root_facts(root, focused)
+        if failed:
+            raise AssertionError(f"D-29 terminal root facts failed: {failed}: {root}")
+        rows = [{"automation_id": root["automation_id"], "pattern": "element", "operation": "check_focus",
+                 "expect_focus": True, "expect_focused_element": True}]
+        self.terminal_probe(instance, focused, "terminal-single-focus", rows)
+        tree = self.uia(instance, window.hwnd, "terminal-window", (), root=True)
+        if [node["automation_id"] for node in terminal_elements(tree["nodes"])] != [root["automation_id"]] or duplicate_panes(tree["nodes"]):
+            raise AssertionError("the window tree does not hold the terminal exactly once")
+        if tree["nodes"][0].get("name") != root["name"]:
+            raise AssertionError(f"terminal name {root['name']!r} differs from the window title {tree['nodes'][0].get('name')!r}")
+        self.record("UIA-05/single", "PASS", case_id="UIA-05", hwnd=focused, root=root,
+                    evidence=["terminal-single-uia.json", "terminal-single-focus-uia.json", "terminal-window-uia.json"])
+        instance.ensure_foreground()
+        instance.press(SPLIT_CHORD)
+        wait(lambda: len(instance.terminals(window)) == 2)
+        time.sleep(0.4)
+        split_focus = instance.focused_terminal()
+        other = next(item.hwnd for item in instance.terminals(window) if item.hwnd != split_focus)
+        tree = self.uia(instance, window.hwnd, "terminal-split-window", (), root=True)
+        ids = [node["automation_id"] for node in terminal_elements(tree["nodes"])]
+        if len(ids) != 2 or len(set(ids)) != 2 or duplicate_panes(tree["nodes"]):
+            raise AssertionError(f"split window tree does not hold two distinct terminals once each: {ids}")
+        target = self.terminal_probe(instance, other, "terminal-split-other")["nodes"][0]
+        failed = terminal_root_facts(target, other)
+        if failed:
+            raise AssertionError(f"D-29 split pane root facts failed: {failed}: {target}")
+        rows = [{"automation_id": target["automation_id"], "pattern": "element", "operation": "set_focus",
+                 "expect_focus": True, "expect_focused_element": True, "expect_focus_event": True}]
+        self.terminal_probe(instance, other, "terminal-split-focus", rows)
+        wait(lambda: instance.focused_terminal() == other)
+        self.capture_root(instance, "terminal-split-focus.png", "两个左右分屏，焦点（光标与焦点样式）在左侧原终端；无空白或残影")
+        self.record("UIA-05/split-focus", "PASS", case_id="UIA-05", terminals=ids, focused=other,
+                    evidence=["terminal-split-window-uia.json", "terminal-split-other-uia.json", "terminal-split-focus-uia.json"])
+        write_review(self.out, "UIA-05", "D-29 terminal HWND is the named UIA pane", "host", "PASS",
+                     ["terminal-split-focus.png"], identity=native_snapshot(instance))
+        self.report["cleanup"].append({"pid": instance.pid, "birth": instance.creation, "result": instance.close()})
+        self.save()
+
+    def observe(self, instance, hwnd, name, flags, act):
+        """One external MTA worker on `hwnd` records events while `act` drives
+        the keyboard between its ready file and the continue file."""
+        ready, proceed = (self.out / (name + suffix) for suffix in (".ready.json", ".continue"))
+        command = [sys.executable, str(ROOT / "scripts/gx_win_uia.py"), "--worker", "--hwnd", str(hwnd),
+                   "--pid", str(instance.pid), "--birth", str(instance.creation), "--exe", str(self.exe),
+                   "--max-nodes", "512", "--max-depth", "12", "--timeout", "25", "--listen-ms", "20000",
+                   "--ready-file", str(ready), "--continue-file", str(proceed), *flags]
+        stdout_path = self.out / (name + ".stdout.json")
+        with stdout_path.open("w", encoding="utf-8") as stdout, (self.out / (name + ".stderr.txt")).open("w", encoding="utf-8") as stderr:
+            process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+            try:
+                wait(lambda: ready.exists() or process.poll() is not None, 20)
+                if process.poll() is not None:
+                    raise AssertionError(f"observing worker exited before ready: {stdout_path.name}")
+                act()
+                time.sleep(1.0)
+                proceed.write_text("keys delivered\n", encoding="utf-8")
+                if process.wait(timeout=25) != 0:
+                    raise AssertionError(f"observing worker failed: {stdout_path.name}")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+        return json.loads(stdout_path.read_text(encoding="utf-8"))
+
+    def open_popup(self, instance, chord):
+        before = {item.hwnd for item in instance.popups()}
+        instance.ensure_foreground()
+        instance.press(chord)
+        popup = wait(lambda: next((item for item in instance.popups() if item.hwnd not in before and item.cls in POPUP_CLASSES), None))
+        time.sleep(0.5)
+        return self.fresh_popup(instance, popup.hwnd)
+
+    def close_popup(self, instance, popup):
+        instance.ensure_foreground()
+        instance.press("escape")
+        wait(lambda: not any(item.hwnd == popup.hwnd for item in instance.popups()))
+
+    def event_checks_run(self):
+        """UIA-06 (D-03 N2-N4): a real external client subscribed to
+        FocusChanged and ElementSelected receives the events of keyboard moves
+        in the menu, the command palette and Settings."""
+        instance = self.start("off", variant="-events")
+        failures = []
+        menu = self.open_popup(instance, "ctrl+shift+m")
+        result = self.observe(instance, menu.hwnd, "events-menu", ["--observe-focus"], lambda: instance.press("down"))
+        before, expected = next_after_focus(result["nodes"], UIA_MENU_ITEM)
+        if expected is None:
+            raise AssertionError("N2: the keyboard-opened menu reports no focused item with a next one")
+        received = later_events(result["focus_events"], automation_id=expected["automation_id"], name=expected["name"])
+        self.capture(instance, menu.hwnd, "events-menu-down", f"主菜单键盘高亮从 {before['name']} 移到 {expected['name']}")
+        self.record("UIA-06/N2-menu-down", "PASS" if received else "FAIL", case_id="UIA-06", expected=expected["name"],
+                    focus_events=result["focus_events"], evidence="events-menu.stdout.json")
+        if not received:
+            failures.append(f"N2 menu Down: no FocusChanged for {expected['name']}")
+        self.close_popup(instance, menu)
+
+        palette = self.open_popup(instance, "ctrl+shift+p")
+        result = self.observe(instance, palette.hwnd, "events-palette", ["--observe-selection", "--observe-focus"],
+                              lambda: instance.press("down"))
+        nodes = result["nodes"]
+        search = next((node for node in nodes if node.get("control_type") == UIA_EDIT and node.get("patterns", {}).get("value")), None)
+        results = next((node for node in nodes if node.get("control_type") == UIA_LIST), None)
+        controls = bool(search and results and results["automation_id"] in (search.get("controller_for") or []))
+        before, expected = next_after_selection(nodes)
+        if expected is None:
+            raise AssertionError("N3: the palette shows no selected result with a next one")
+        received = later_events(result["selection_events"], name=expected["name"], event_id=ELEMENT_SELECTED)
+        self.capture(instance, palette.hwnd, "events-palette-down", f"命令面板选中从 {before['name']} 移到 {expected['name']}")
+        self.record("UIA-06/N3-palette-down", "PASS" if received and controls else "FAIL", case_id="UIA-06",
+                    expected=expected["name"], search_controls_results=controls,
+                    selection_events=result["selection_events"], evidence="events-palette.stdout.json")
+        if not received or not controls:
+            failures.append(f"N3 palette Down: ElementSelected for {expected['name']}={bool(received)}, Search controls Results={controls}")
+        self.close_popup(instance, palette)
+
+        settings = self.open_popup(instance, "ctrl+comma")
+        result = self.observe(instance, settings.hwnd, "events-settings", ["--observe-focus", "--observe-selection"],
+                              lambda: instance.press("tab"))
+        before = next((node for node in result["nodes"] if node.get("focused")), None)
+        moved = [event for event in later_events(result["focus_events"])
+                 if before is None or (event.get("automation_id"), event.get("name")) != (before["automation_id"], before["name"])]
+        self.capture(instance, settings.hwnd, "events-settings-tab", "设置浮层按 Tab 后焦点环移到下一个控件")
+        self.record("UIA-06/N4-settings-tab", "PASS" if moved else "FAIL", case_id="UIA-06",
+                    before=before and before["name"], focus_events=result["focus_events"],
+                    selection_events=result["selection_events"], evidence="events-settings.stdout.json")
+        if not moved:
+            failures.append("N4 settings Tab: no FocusChanged event for another element")
+        self.close_popup(instance, settings)
+        images = ["events-menu-down.png", "events-palette-down.png", "events-settings-tab.png"]
+        write_review(self.out, "UIA-06", "D-03 N2-N4 focus and selection events received by a real client", "host",
+                     "FAIL" if failures else "PASS", images, identity=native_snapshot(instance), failures=failures)
+        self.report["cleanup"].append({"pid": instance.pid, "birth": instance.creation, "result": instance.close()})
+        self.save()
+        if failures:
+            raise AssertionError("; ".join(failures))
+
     def run(self):
         try:
-            if self.readonly_root:
+            if self.terminal_checks or self.event_checks:
+                if self.terminal_checks:
+                    self.terminal_checks_run()
+                if self.event_checks:
+                    self.event_checks_run()
+                self.report["status"] = "PENDING_VISUAL_REVIEW"
+            elif self.readonly_root:
                 instance = self.start("off", activate=False)
                 root = instance.require_window()
                 probe = self.uia(instance, root.hwnd, "readonly-root", ("window",), root=True)
@@ -555,7 +807,13 @@ def main(argv=None):
     parser.add_argument("--actions", action="store_true", help="exercise reversible COM patterns and retained-provider hide/reopen")
     parser.add_argument("--focus-checks", action="store_true",
                         help="with --actions: UIA-01 dynamic focus sequences (palette, menu, clipboard dialog; needs A1 0002)")
+    parser.add_argument("--terminal-checks", action="store_true",
+                        help="UIA-05 (D-29): the focused terminal HWND is the named pane, once per window; split SetFocus event")
+    parser.add_argument("--event-checks", action="store_true",
+                        help="UIA-06 (D-03 N2-N4): FocusChanged/ElementSelected of menu, palette and Settings keyboard moves")
     args = parser.parse_args(argv)
+    if (args.terminal_checks or args.event_checks) and (args.readonly_root or args.actions):
+        parser.error("--terminal-checks/--event-checks run on their own")
     if args.focus_checks and not args.actions:
         parser.error("--focus-checks requires --actions")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
