@@ -30,7 +30,8 @@
 //! configuration (P4). A configuration reload, a change of the UI
 //! language or of the theme, or the window going away puts it out of
 //! date, and the next opening builds a new one. One dialog shows at a
-//! time: opening it in another window closes the one shown.
+//! time: opening it elsewhere first closes the one shown. If saving keeps
+//! it open, the request brings that dialog and its pending edits forward.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -462,6 +463,10 @@ pub const GxSettingsDialog = extern struct {
 
         /// The UI language and theme the dialog was built with.
         built: Built = .{ .lang = .default, .theme = 0 },
+
+        // Tests keep real widget, save and close paths; only the application
+        // boundary and overlay location are supplied by an isolated fixture.
+        test_backend: if (@import("builtin").is_test) ?*TestBackend else void = if (@import("builtin").is_test) null else {},
     };
 
     const Shell = struct {
@@ -509,18 +514,23 @@ pub const GxSettingsDialog = extern struct {
         else
             null;
 
-        if (open_dialog.get()) |shown| {
+        if (existingFor(host)) |shown| {
             defer shown.unref();
-            if (shown.isShownIn(host)) {
-                open_perf.lap(&timing, .prepare);
+            open_perf.lap(&timing, .prepare);
+            const state = &shown.private().state;
+            // A failed save belongs to the visible controls. Do not pop a
+            // subpage or reset them while the user still needs to retry.
+            if (state.changes.isEmpty() and !state.apply_pending) {
                 if (page) |name| shown.showSettingsPage(name);
-                open_perf.lap(&timing, .layout);
-                open_perf.watch(shown.as(gtk.Widget), timing);
-                shown.as(adw.Dialog).present(parent);
-                open_perf.presented(shown.as(gtk.Widget), timing);
-                return;
             }
-            shown.closeElsewhere();
+            const owner = state.owner.get();
+            defer if (owner) |value| value.unref();
+            if (owner) |value| value.present();
+            open_perf.lap(&timing, .layout);
+            open_perf.watch(shown.as(gtk.Widget), timing);
+            shown.as(adw.Dialog).present(if (owner) |value| value.as(gtk.Widget) else null);
+            open_perf.presented(shown.as(gtk.Widget), timing);
+            return;
         }
 
         const config_obj = app.getConfig();
@@ -554,6 +564,24 @@ pub const GxSettingsDialog = extern struct {
         open_perf.watch(dialog.as(gtk.Widget), timing);
         dialog.as(adw.Dialog).present(parent);
         open_perf.presented(dialog.as(gtk.Widget), timing);
+    }
+
+    /// Returns a retained dialog when an opening should use the one shown.
+    fn existingFor(host: ?*gtk.Window) ?*Self {
+        if (open_dialog.get()) |shown| {
+            if (shown.private().state.shown and !shown.isShownIn(host)) shown.closeElsewhere();
+            if (shown.private().state.shown) return shown;
+            shown.unref();
+        }
+        // Also guard the borrowed cache candidate: being stale does not
+        // make a visible dialog (or its pending edits) safe to replace.
+        if (host) |window| if (kept_dialogs.get(window)) |candidate| {
+            if (candidate.private().state.shown) {
+                open_dialog.set(candidate);
+                return candidate.ref();
+            }
+        };
+        return null;
     }
 
     /// Whether the dialog shows in `host`, the window that keeps it (null:
@@ -591,6 +619,8 @@ pub const GxSettingsDialog = extern struct {
     /// save keeps the dialog open, so a closed one has no changes to drop.
     fn reopen(self: *Self, config: *const CoreConfig, page: ?settings_map.Page) void {
         const priv = self.private();
+        std.debug.assert(!priv.state.shown);
+        std.debug.assert(priv.state.changes.isEmpty() and !priv.state.apply_pending);
         self.dismissToast();
         if (page orelse last_page) |name|
             self.showSettingsPage(name)
@@ -684,6 +714,7 @@ pub const GxSettingsDialog = extern struct {
     /// Reads the configuration layers again, so builds see the files as
     /// they are now.
     fn reloadLayers(self: *Self) void {
+        if (self.testBackend() != null) return;
         const st = &self.private().state;
         if (st.layers) |*layers| layers.deinit();
         _ = @import("defaults.zig").sampleSystemCursorBlink();
@@ -1637,6 +1668,17 @@ pub const GxSettingsDialog = extern struct {
     /// Saves the recorded changes to the overlay and applies the
     /// configuration. On failure the changes are kept for another try.
     /// Returns whether the changes are saved.
+    fn testBackend(self: *Self) ?*TestBackend {
+        if (comptime @import("builtin").is_test) return self.private().state.test_backend;
+        return null;
+    }
+
+    fn savePath(self: *Self) ![]const u8 {
+        const alloc = self.private().state.alloc;
+        if (self.testBackend()) |backend| return alloc.dupe(u8, backend.path);
+        return gx.config_layers.overlayPath(alloc);
+    }
+
     fn saveNow(self: *Self) bool {
         const st = &self.private().state;
         if (st.save_source) |source| {
@@ -1655,7 +1697,7 @@ pub const GxSettingsDialog = extern struct {
                 if (st.apply_pending) st.pending_sync else null,
             );
 
-            const path = gx.config_layers.overlayPath(st.alloc) catch |err| {
+            const path = self.savePath() catch |err| {
                 log.warn("cannot locate {s} err={}", .{ gx.gui_settings.file_name, err });
                 self.toastError(msg.save_failed, err, true);
                 return false;
@@ -1712,6 +1754,18 @@ pub const GxSettingsDialog = extern struct {
     fn apply(self: *Self, theme: ?[]const u8) ?CoreConfig {
         const st = &self.private().state;
         const failed: [:0]const u8 = if (theme != null) msg.preview_failed else msg.reload_failed;
+        if (self.testBackend()) |backend| {
+            if (backend.fail_apply) {
+                self.toastError(failed, error.OutOfMemory, st.apply_pending);
+                return null;
+            }
+            var config = backend.config.clone(st.alloc) catch return null;
+            config.loadFile(config._arena.?.allocator(), backend.path) catch {
+                config.deinit();
+                return null;
+            };
+            return config;
+        }
 
         var quiet_buf: [128]u8 = undefined;
         const quiet = settings_map.quietReloadArg(&quiet_buf, st.notifications) catch |err| {
@@ -3234,4 +3288,113 @@ fn testWaitDialog(dialog: *GxSettingsDialog, mapped: bool) bool {
         _ = glib.MainContext.iteration(null, 1);
     }
     return false;
+}
+
+const TestBackend = struct {
+    path: []const u8,
+    config: *const CoreConfig,
+    fail_apply: bool = false,
+};
+
+fn testPresentSettings(dialog: *GxSettingsDialog, window: *gtk.Window) !void {
+    window.setDefaultSize(1100, 740);
+    window.present();
+    dialog.private().state.owner.set(window);
+    dialog.private().state.shown = true;
+    dialog.as(gobject.Object).setData("gx-settings-test-frames", null);
+    open_dialog.set(dialog);
+    dialog.as(adw.Dialog).present(window.as(gtk.Widget));
+    try testing.expect(testWaitDialog(dialog, true));
+}
+
+test "cross window settings closes and saves before allowing another dialog" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config };
+    const first = try testDialog();
+    defer first.unref();
+    first.private().state.test_backend = &backend;
+    first.reopen(&config, .appearance);
+    first.private().state.loading = false;
+    const a = adw.Window.new();
+    defer a.as(gtk.Window).destroy();
+    const b = adw.Window.new();
+    defer b.as(gtk.Window).destroy();
+    try testPresentSettings(first, a.as(gtk.Window));
+    first.private().cursor_blink_row.setActive(0);
+    try testing.expect(!first.private().state.changes.isEmpty());
+    const existing = GxSettingsDialog.existingFor(b.as(gtk.Window));
+    defer if (existing) |value| value.unref();
+    try testing.expect(existing == null);
+    try testing.expect(!first.private().state.shown);
+    try testing.expect(first.private().state.changes.isEmpty());
+    var overlay = try gx.gui_settings.Overlay.load(alloc, testing.io, path);
+    defer overlay.deinit();
+    try testing.expectEqualStrings("false", overlay.get("cursor-style-blink").?);
+    try testing.expect(testWaitDialog(first, false));
+    const second = try testDialog();
+    defer second.unref();
+    try testPresentSettings(second, b.as(gtk.Window));
+    try testing.expect(second.private().state.shown and !first.private().state.shown);
+    _ = second.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(second, false));
+}
+
+test "cross window settings preserves the failed edit and retry instead of reopening" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "blocked", .data = "not a directory" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "blocked", gx.gui_settings.file_name });
+    defer alloc.free(path);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config };
+    const first = try testDialog();
+    defer first.unref();
+    const st = &first.private().state;
+    st.test_backend = &backend;
+    first.reopen(&config, .appearance);
+    st.loading = false;
+    const a = adw.Window.new();
+    defer a.as(gtk.Window).destroy();
+    const b = adw.Window.new();
+    defer b.as(gtk.Window).destroy();
+    try testPresentSettings(first, a.as(gtk.Window));
+    first.private().cursor_blink_row.setActive(0);
+    try testing.expect(!first.saveNow());
+    defer {
+        st.changes.deinit();
+        st.changes = .init(alloc);
+        first.as(adw.Dialog).forceClose();
+    }
+    const existing = GxSettingsDialog.existingFor(b.as(gtk.Window));
+    defer if (existing) |value| value.unref();
+    try testing.expectEqual(first, existing orelse return error.TestUnexpectedResult);
+    try testing.expect(st.shown);
+    try testing.expect(st.toast != null);
+    const toast = st.toast;
+    const again = GxSettingsDialog.existingFor(a.as(gtk.Window));
+    defer if (again) |value| value.unref();
+    try testing.expectEqual(first, again.?);
+    try testing.expectEqual(toast, st.toast);
+    try testing.expectEqual(@as(c_int, 0), first.private().cursor_blink_row.getActive());
+    try testing.expectEqualStrings("false", st.changes.entries.items[0].values[0]);
+    try testing.expectEqual(@as(c_int, 0), first.as(adw.Dialog).getCanClose());
+    kept_dialogs.keep(a.as(gtk.Window), first);
+    st.stale = true;
+    open_dialog.set(null);
+    const recovered = GxSettingsDialog.existingFor(a.as(gtk.Window)).?;
+    defer recovered.unref();
+    try testing.expectEqual(first, recovered);
+    try testing.expectEqual(toast, st.toast);
 }

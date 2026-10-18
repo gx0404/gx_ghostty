@@ -76,6 +76,65 @@ capture("07-after-theme")
 assert builds() == 3, builds()
 close_settings()
 save("-counts.json", json.dumps({"builds": builds(), "opens": opens()}))
+
+# Cross-window settings: closing A before opening B saves pending edits.
+import os
+first = window()
+xdo("key", "ctrl+shift+n")
+sleep(1.0)
+windows = xdo("search", "--onlyvisible", "--pid", pid()).splitlines()
+second = next(w for w in windows if str(w) != str(first))
+xdo("windowsize", second, 1100, 740)
+xdo("windowmove", second, 0, 0)
+def focus_window(w):
+    xdo("windowraise", w, "windowfocus", "--sync", w)
+    sleep(0.1)
+
+focus_window(first)
+open_settings("ctrl+alt+t")
+xdo("mousemove", 800, 507, "click", 1)
+focus_window(second)
+xdo("key", "ctrl+comma")
+sleep(1.0)
+capture("08-cross-window-saved")
+folder = config_home / "ghostty"
+overlay = folder / "gui-settings.ghostty"
+assert "cursor-style-blink = false" in overlay.read_text()
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+
+# Failed edits in A must remain visible and pending, even after opening in
+# B and asking again in A. Raise each window explicitly under bare Xvfb.
+focus_window(first)
+open_settings("ctrl+alt+t")
+os.chmod(folder, 0o555)
+os.chmod(overlay, 0o444)
+try:
+    xdo("mousemove", 800, 507, "click", 1)
+    sleep(0.8)
+    capture("09-cross-window-save-failed")
+    focus_window(second)
+    xdo("key", "ctrl+comma")
+    sleep(0.8)
+    focus_window(second)
+    capture("10-other-window-has-no-dialog")
+    focus_window(first)
+    xdo("key", "ctrl+comma")
+    sleep(0.8)
+    capture("11-original-edit-and-retry-retained")
+    assert "cursor-style-blink = false" in overlay.read_text()
+finally:
+    os.chmod(folder, 0o755)
+    os.chmod(overlay, 0o644)
+xdo("mousemove", 738, 657, "click", 1)
+sleep(1.0)
+capture("12-original-edit-retried")
+assert "cursor-style-blink = true" in overlay.read_text()
+save("-cross-window-overlay.txt", overlay.read_text())
+xdo("mousemove", 987, 59, "click", 1)
+sleep(0.8)
+assert "CRITICAL" not in log(), "cross-window settings emitted CRITICAL"
+
 '''
 expect = [
   "G27.png: the isolated terminal before the settings open",
@@ -86,5 +145,10 @@ expect = [
   "G27-05-reopened-appearance.png: reopening starts on the Appearance page it closed on, without the theme list or the search, the saved theme on the theme row",
   "G27-06-after-reload.png: after reload_config the next opening builds a new dialog (one more settings.load sample)",
   "G27-07-after-theme.png: after Apply saved Blue Dolphin the next opening builds a new dialog that shows it on the theme row",
+  "G27-08-cross-window-saved.png: B shows Appearance after A closed, Blinking Cursor is off and the pending change was saved",
+  "G27-09-cross-window-save-failed.png: A has Blinking Cursor on with a Retry toast; the saved file still says false",
+  "G27-10-other-window-has-no-dialog.png: B has only its terminal, no second settings dialog",
+  "G27-11-original-edit-and-retry-retained.png: A still shows Blinking Cursor on and Retry after both cross-window and repeated open requests",
+  "G27-12-original-edit-retried.png: retry saves the visible true value and shows Settings saved",
   "G27-counts.json: three builds for seventeen openings",
 ]
