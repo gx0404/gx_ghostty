@@ -7,6 +7,9 @@ title = "Five clipboard pastes in a row land in the search box, and Ctrl+Shift+V
 # paste confirmation with its preview (line ends, a tab, hidden code points, a long line, wide
 # characters, rows past the box counted), the OSC 52 read request with its preview and Deny, an
 # empty OSC 52 write and a read of the emptied clipboard.
+# The OSC 52 read request needs the bundled ConPTY: the inbox conhost passes OSC 52 writes on but
+# not queries. Run W08 against the packaged layout (conpty.dll and OpenConsole.exe from the pinned
+# NuGet package next to ghostty.exe, docs/FORK_PATCHES.md GX-0007); the first step checks it.
 config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
@@ -22,6 +25,11 @@ expect = [
   "empty-write: an empty OSC 52 write emptied the clipboard: a toast says Cleared clipboard",
   "empty-read: a read of the emptied clipboard shows no stale text (an empty preview that says The clipboard is empty, or no dialog at all)",
 ]
+
+[[step]]
+action = "wait_log"
+pattern = "ConPTY: bundled"
+timeout = 10
 
 [[step]]
 action = "ime_off"
