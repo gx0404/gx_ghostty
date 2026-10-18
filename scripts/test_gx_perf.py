@@ -639,8 +639,38 @@ class QuietBatchTests(unittest.TestCase):
                 self.assertEqual((6, 'PRODUCT_FAIL', 'instance_gone', quiet),
                                  (exit_code, result['status'], result['failure_cause'], result['quiet_status']))
                 self.assertIn('instance_gone: Ghostty pid 42', ' '.join(result['errors']))
+                self.assertIn('(arm unknown: no driver run.json names that pid)', ' '.join(result['errors']))
                 self.assertIn('never rerun to replace it', result['guidance'])
                 self.assertIn('failure_cause=instance_gone', (args.out / 'SUMMARY.txt').read_text(encoding='utf-8'))
+
+    def test_a_product_failure_names_the_arm_and_run_of_its_instance(self):
+        self.assertEqual(Path('M'), gx_perf.driver_out_dir(['python', 'scripts/gx_perf.py', 'win32-ui', '--out', 'M']))
+        self.assertEqual(Path('M'), gx_perf.driver_out_dir(['just', 'perf', 'win32-idle', '--out=M']))
+        self.assertIsNone(gx_perf.driver_out_dir(['python', 'other.py', '--out', 'M']))
+        measurement = self.args.out.parent / 'measurement'
+        def runner(command, **kwargs):
+            for label, run, pid, baseline in (('old', 1, 41, True), ('new', 2, 42, False)):
+                target = measurement / label / f'run-{run:02d}'
+                target.mkdir(parents=True)
+                (target / 'run.json').write_text(json.dumps({'label': label, 'run': run, 'pid': pid, 'baseline': baseline}),
+                                                 encoding='utf-8')
+            with Path(kwargs['env']['GX_PERF_GUARD_LOG']).open('a', encoding='utf-8') as log:
+                for pid, cause in ((41, 'instance_gone'), (42, 'instance_hung')):
+                    log.write(json.dumps({'schema': 'gx-input-guard-v1', 'batch_id': kwargs['env']['GX_PERF_BATCH_ID'],
+                                          'event': 'instance', 'status': 'fail', 'cause': cause, 'instance_pid': pid,
+                                          'reason': f'pid {pid}'}) + '\n')
+            return SimpleNamespace(returncode=1)
+        args = self.batch_args(command=('python', 'scripts/gx_perf.py', 'win32-ui', '--out', str(measurement), '--case', 'p4'))
+        exit_code, result = self.run_batch(args, runner)
+        self.assertEqual((6, 'PRODUCT_FAIL', 'instance_gone'), (exit_code, result['status'], result['failure_cause']))
+        self.assertEqual([{'instance_pid': 41, 'label': 'old', 'run': 1, 'baseline': True, 'path': 'old/run-01'},
+                          {'instance_pid': 42, 'label': 'new', 'run': 2, 'baseline': False, 'path': 'new/run-02'}],
+                         result['product_failure_runs'])
+        self.assertIn('instance_gone: Ghostty pid 41 ended or changed identity mid-batch in arm old run 1 (the historical '
+                      'arm): pid 41', result['errors'])
+        self.assertIn('root rules on a crash of the historical arm', result['guidance'])
+        self.assertEqual([{'instance_pid': 7, 'label': None, 'run': None, 'baseline': None, 'path': None}],
+                         gx_perf.product_failure_runs(None, [{'instance_pid': 7}, {'instance_pid': 7}]))
 
     def test_a_hung_instance_is_product_fail_too(self):
         import gx_win_gui as real

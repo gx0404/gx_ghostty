@@ -1043,7 +1043,9 @@ BATCH_GUIDANCE = {
     'PRODUCT_FAIL': 'A measured Ghostty instance ended, changed identity or hung during the batch (cause '
                     'instance_gone or instance_hung): '
                     'a FAIL-class product/driver failure, not environment noise. Keep it and count it; never rerun to '
-                    'replace it; read ghostty.log, crash dumps and guards.jsonl before another attempt.',
+                    'replace it; read ghostty.log, crash dumps and guards.jsonl before another attempt. '
+                    'product_failure_runs names the arm and run of that instance; root rules on a crash of the '
+                    'historical arm.',
     'RUNNING': 'The batch did not finish recording its result.',
 }
 
@@ -1065,6 +1067,36 @@ def gate_exit_contract(command: Sequence[str]) -> bool:
     return False
 
 
+def driver_out_dir(command: Sequence[str]) -> Path | None:
+    """The --out directory of a gx_perf.py win32-* driver command, the measurement quiet-batch runs."""
+    if not gate_exit_contract(command):
+        return None
+    for index, part in enumerate(command):
+        if part == '--out' and index + 1 < len(command):
+            return Path(command[index + 1])
+        if part.startswith('--out='):
+            return Path(part[len('--out='):])
+    return None
+
+
+def product_failure_runs(out_dir: Path | None, rows: Sequence[Mapping]) -> list[dict]:
+    """The driver arm and run that started the instance of each product failure row: the run.json
+    under out_dir (LABEL/run-NN/run.json of run_experiment) whose pid is the row's instance_pid;
+    label and run stay None when no such run.json exists (another command, or a pid it never wrote)."""
+    runs: dict[int, dict] = {}
+    if out_dir is not None and out_dir.is_dir():
+        for path in sorted(out_dir.glob('*/run-*/run.json')):
+            try:
+                report = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                continue
+            if isinstance(report, dict) and isinstance(report.get('pid'), int):
+                runs[report['pid']] = {'label': report.get('label'), 'run': report.get('run'),
+                                       'baseline': bool(report.get('baseline')), 'path': path.parent.relative_to(out_dir).as_posix()}
+    unknown = {'label': None, 'run': None, 'baseline': None, 'path': None}
+    return [{'instance_pid': pid, **runs.get(pid, unknown)} for pid in dict.fromkeys(row.get('instance_pid') for row in rows)]
+
+
 def measurement_state(raised: bool, exit_code, gate_contract: bool = True) -> str:
     """The command's own result: 0 complete, 4 absolute gate FAIL (win32-* drivers only),
     anything else a driver/tool error."""
@@ -1075,7 +1107,8 @@ def measurement_state(raised: bool, exit_code, gate_contract: bool = True) -> st
     return {0: 'COMPLETE', 4: 'GATE_FAIL'}.get(exit_code, 'DRIVER_ERROR')
 
 
-def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool, product_failures: Sequence[Mapping] = ()) -> None:
+def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bool, product_failures: Sequence[Mapping] = (),
+                   failure_runs: Sequence[Mapping] = ()) -> None:
     """Quiet validity comes only from the checks; the measurement only from the command.
     INVALID means a quiet criterion failed; a gate FAIL under valid checks stays FAIL.
     A measured instance that ended or hung mid-batch (instance_gone, instance_hung) is PRODUCT_FAIL
@@ -1096,7 +1129,14 @@ def classify_batch(result: dict, before: dict, after: dict, *, mode_mismatch: bo
         cause = first.get('cause') if first.get('cause') in PRODUCT_CAUSES else 'instance_gone'
         what = 'hangs or crashed' if cause == 'instance_hung' else 'ended or changed identity'
         result['failure_cause'] = cause
-        result['errors'].append(f"{cause}: Ghostty pid {first.get('instance_pid')} {what} mid-batch: {first.get('reason')}")
+        result['product_failure_runs'] = list(failure_runs)
+        arm = next((item for item in failure_runs if item.get('instance_pid') == first.get('instance_pid')), None)
+        if arm and arm.get('label') is not None:
+            where = f" in arm {arm['label']} run {arm['run']}" + (" (the historical arm)" if arm.get('baseline') else "")
+        else:
+            where = " (arm unknown: no driver run.json names that pid)"
+        result['errors'].append(f"{cause}: Ghostty pid {first.get('instance_pid')} {what} mid-batch{where}: "
+                                f"{first.get('reason')}")
         result['status'], result['exit'] = 'PRODUCT_FAIL', 6
     elif mode_mismatch:
         result['failure_cause'] = 'mode_mismatch'
@@ -1191,8 +1231,9 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                     write_json(out / 'after.json', after)
                     # Input was sent although the batch claimed none: the last-input check is meaningless.
                     mismatch = not args.injected_input and isinstance(evidence, dict) and evidence['injected']
-                    classify_batch(result, before, after, mode_mismatch=mismatch,
-                                   product_failures=evidence['product'] if isinstance(evidence, dict) else ())
+                    product = evidence['product'] if isinstance(evidence, dict) else ()
+                    classify_batch(result, before, after, mode_mismatch=mismatch, product_failures=product,
+                                   failure_runs=product_failure_runs(driver_out_dir(command), product) if product else ())
     except TimeoutError as exc:
         result.update(exit=3, quiet_status='NOT_MET')
         result['errors'].append(f'slots: {exc}')
