@@ -51,15 +51,14 @@ const TestCache = Cache(adw.Dialog, "gx-test-dialog-cache");
 
 /// Runs the main loop until `done` returns true, for at most `ms`
 /// milliseconds; returns whether it did.
-fn runUntil(comptime done: fn (*adw.Dialog) bool, dialog: *adw.Dialog, ms: u32) bool {
+fn runUntil(context: anytype, comptime done: fn (@TypeOf(context)) bool, ms: u32) bool {
     // Wakes the loop up so that the deadline is checked.
     const tick = glib.timeoutAdd(5, &keepTicking, null);
     defer _ = glib.Source.remove(tick);
-    var waited: u32 = 0;
-    while (!done(dialog)) {
-        if (waited >= ms) return false;
+    const deadline = glib.getMonotonicTime() + @as(i64, ms) * 1000;
+    while (!done(context)) {
+        if (glib.getMonotonicTime() >= deadline) return false;
         _ = glib.MainContext.iteration(null, 1);
-        waited += 5;
     }
     return true;
 }
@@ -120,9 +119,10 @@ test "a kept dialog opens and closes 100 times without growing its window" {
     try testing.expect(hostsDialogs(gtk_window));
     const toplevels = gtk.Window.getToplevels().getNItems();
 
-    var dialog_gone = false;
+    var finalized: Finalization = .{};
+    defer finalized.deinit();
     const first = adw.Dialog.new();
-    first.as(gobject.Object).weakRef(&markGone, &dialog_gone);
+    finalized.watch(first.as(gobject.Object));
     first.setChild(gtk.Label.new("kept").as(gtk.Widget));
     _ = first.as(gtk.Widget).addTickCallback(&countFrame, null, null);
     TestCache.keep(gtk_window, first);
@@ -136,23 +136,26 @@ test "a kept dialog opens and closes 100 times without growing its window" {
         try testing.expectEqual(first, dialog);
         dialog.as(gobject.Object).setData(frames_key, null);
         dialog.present(window.as(gtk.Widget));
-        try testing.expect(runUntil(shown, dialog, 2000));
+        try testing.expect(runUntil(dialog, shown, 2000));
         const count = widgetCount(window.as(gtk.Widget));
         if (shown_count) |expected| try testing.expectEqual(expected, count) else shown_count = count;
         try testing.expect(dialog.close() != 0);
-        try testing.expect(runUntil(removed, dialog, 2000));
+        try testing.expect(runUntil(dialog, removed, 2000));
         const after = widgetCount(window.as(gtk.Widget));
         if (closed_count) |expected| try testing.expectEqual(expected, after) else closed_count = after;
         try testing.expect(after < shown_count.?);
         try testing.expectEqual(toplevels, gtk.Window.getToplevels().getNItems());
     }
-    try testing.expect(!dialog_gone);
+    try testing.expect(!finalized.done());
 
     // Dropped (out of date), the hidden dialog goes, and the next opening
     // builds a new one.
     TestCache.drop(gtk_window);
-    try testing.expect(dialog_gone);
     try testing.expect(TestCache.get(gtk_window) == null);
+    // GTK can keep an unparented widget until the frame clock's after-paint
+    // phase completes. Dropping our reference must still really finalize
+    // it; unparenting or clearing the cache alone does not prove that.
+    try testing.expect(runUntil(&finalized, Finalization.done, 2000));
 }
 
 test "destroying its window releases the kept dialog" {
@@ -160,19 +163,74 @@ test "destroying its window releases the kept dialog" {
     adw.init();
     const window = adw.Window.new();
     const gtk_window = window.as(gtk.Window);
-    var dialog_gone = false;
+    var finalized: Finalization = .{};
+    defer finalized.deinit();
     const dialog = adw.Dialog.new();
-    dialog.as(gobject.Object).weakRef(&markGone, &dialog_gone);
+    finalized.watch(dialog.as(gobject.Object));
     TestCache.keep(gtk_window, dialog);
     // Keeping another one releases the first.
-    var second_gone = false;
+    var second_finalized: Finalization = .{};
+    defer second_finalized.deinit();
     const second = adw.Dialog.new();
-    second.as(gobject.Object).weakRef(&markGone, &second_gone);
+    second_finalized.watch(second.as(gobject.Object));
     TestCache.keep(gtk_window, second);
-    try testing.expect(dialog_gone);
-    try testing.expect(!second_gone);
+    try testing.expect(finalized.done());
+    try testing.expect(!second_finalized.done());
     gtk_window.destroy();
-    try testing.expect(second_gone);
+    try testing.expect(second_finalized.done());
+}
+
+test "dropping a cached dialog releases only the cache reference" {
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    adw.init();
+    const window = adw.Window.new().as(gtk.Window);
+    defer window.destroy();
+    var finalized: Finalization = .{};
+    defer finalized.deinit();
+    const dialog = adw.Dialog.new();
+    finalized.watch(dialog.as(gobject.Object));
+    {
+        const owned = dialog.as(gobject.Object).refSink();
+        defer owned.unref();
+        const child = gtk.Label.new("still owned").as(gtk.Widget);
+        dialog.setChild(child);
+        TestCache.keep(window, dialog);
+        TestCache.drop(window);
+        try testing.expect(TestCache.get(window) == null);
+        try testing.expect(!finalized.done());
+        try testing.expectEqual(child, dialog.getChild());
+    }
+    try testing.expect(finalized.done());
+}
+
+test "destroying a window finalizes its presented or hidden cached dialog" {
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+    adw.init();
+    for ([_]bool{ false, true }) |close_first| {
+        const window = adw.Window.new().as(gtk.Window);
+        var destroyed = false;
+        defer if (!destroyed) window.destroy();
+        window.setDefaultSize(800, 600);
+        window.present();
+        var finalized: Finalization = .{};
+        defer finalized.deinit();
+        const dialog = adw.Dialog.new();
+        finalized.watch(dialog.as(gobject.Object));
+        dialog.setChild(gtk.Label.new("owned by window").as(gtk.Widget));
+        _ = dialog.as(gtk.Widget).addTickCallback(&countFrame, null, null);
+        TestCache.keep(window, dialog);
+        dialog.present(window.as(gtk.Widget));
+        try testing.expect(runUntil(dialog, shown, 2000));
+        if (close_first) {
+            try testing.expect(dialog.close() != 0);
+            try testing.expect(runUntil(dialog, removed, 2000));
+            try testing.expectEqual(dialog, TestCache.get(window));
+            try testing.expect(!finalized.done());
+        }
+        window.destroy();
+        destroyed = true;
+        try testing.expect(runUntil(&finalized, Finalization.done, 2000));
+    }
 }
 
 test "only windows that show dialogs inside them keep one" {
@@ -187,7 +245,28 @@ test "only windows that show dialogs inside them keep one" {
     try testing.expect(!hostsDialogs(fixed.as(gtk.Window)));
 }
 
-fn markGone(data: ?*anyopaque, _: *gobject.Object) callconv(.c) void {
-    const gone: *bool = @ptrCast(@alignCast(data orelse return));
-    gone.* = true;
-}
+// Object data is destroyed at finalization, whereas a weak notification can
+// already run during dispose. Never retain the object being observed. Remove
+// the stack-backed observer on early test failure before its scope ends.
+const Finalization = struct {
+    const key = "gx-test-finalization";
+    object: ?*gobject.Object = null,
+
+    fn watch(self: *Finalization, object: *gobject.Object) void {
+        self.object = object;
+        object.setDataFull(key, self, &notify);
+    }
+
+    fn deinit(self: *Finalization) void {
+        if (self.object) |object| _ = object.stealData(key);
+    }
+
+    fn done(self: *Finalization) bool {
+        return self.object == null;
+    }
+
+    fn notify(data: ?*anyopaque) callconv(.c) void {
+        const self: *Finalization = @ptrCast(@alignCast(data orelse return));
+        self.object = null;
+    }
+};
