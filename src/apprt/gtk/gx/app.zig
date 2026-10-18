@@ -77,7 +77,13 @@ pub fn configChanged(app: *Application) void {
 /// `gx.action.Action`; see `request`. Returns false when the action is
 /// not handled, so that `performable:` bindings pass their key on.
 pub fn performGxAction(app: *Application, target: apprt.Target, action: anytype) bool {
-    return switch (request(action)) {
+    const requested = request(action);
+    const measurement = @import("open_perf.zig").ActionScope.begin(switch (requested) {
+        .main_menu, .settings, .settings_page => true,
+        else => false,
+    });
+    defer measurement.end();
+    return switch (requested) {
         .settings => openSettings(app),
         .settings_page => |page| openSettingsPage(app, page),
         .main_menu => if (targetWindow(app, target)) |window| gx_window.popupMainMenu(window) else false,

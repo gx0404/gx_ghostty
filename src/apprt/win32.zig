@@ -47,6 +47,7 @@ test {
     _ = @import("win32/ui/uia_remote.zig");
     _ = @import("win32/RemoteInput.zig");
     _ = @import("win32/RemotePerf.zig");
+    _ = @import("win32/RemoteControls.zig");
     _ = @import("win32/RemoteCoordinator.zig");
     _ = @import("win32/DropBridge.zig");
     _ = @import("win32/DropCompanion.zig");

@@ -1,0 +1,163 @@
+id = "G18"
+title = "Launch profile CRUD, ownership, defaults and existing shells"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+gx-launch-profile = Lower=direct:/bin/bash --noprofile --norc
+keybind = ctrl+alt+n=gx:new_tab_menu
+"""
+script = '''
+xdo("windowsize", window(), 1100, 740)
+sleep(1)
+xdo("mousemove", 400, 300, "click", 1)
+old_window = window()
+xdo("key", "ctrl+shift+n")
+sleep(1)
+windows = xdo("search", "--onlyvisible", "--pid", pid()).splitlines()
+assert len(windows) == 2, windows
+second = next(item for item in windows if item != old_window)
+xdo("windowsize", second, 1100, 740)
+def focus(target):
+    xdo("windowraise", target)
+    xdo("windowfocus", target)
+    xdo("mousemove", 400, 300, "click", 1)
+    sleep(0.5)
+focus(second)
+# Prime the second window's menu before any profile mutations.
+xdo("key", "ctrl+alt+n")
+sleep(0.5)
+capture("second-before-mutations")
+xdo("key", "Escape")
+focus(old_window)
+before = processes("before")
+assert sum(row["exe"] == "/usr/bin/bash" for row in before) == 2, before
+xdo("key", "ctrl+alt+n")
+sleep(0.5)
+capture("menu")
+xdo("mousemove", 100, 495, "click", 1)
+sleep(1)
+capture("manager")
+overlay = config_home / "ghostty/gui-settings.ghostty"
+def click(x, y):
+    xdo("mousemove", x, y, "click", 1)
+    sleep(0.3)
+def entry(y, text):
+    click(450, y)
+    xdo("key", "ctrl+a")
+    xdo("type", "--clearmodifiers", "--delay", 1, text)
+    sleep(0.2)
+click(265, 478)
+entry(308, "Owned")
+entry(380, "direct:/bin/bash --noprofile --norc")
+capture("create-draft")
+click(372, 478)
+sleep(0.5)
+assert "Owned=direct:/bin/bash --noprofile --norc" in overlay.read_text()
+capture("created")
+click(280, 521)
+sleep(0.5)
+assert "command = direct:/bin/bash --noprofile --norc" in overlay.read_text()
+capture("default")
+with overlay.open("a") as out:
+    out.write("\n# R6 external profile edit\nkeybind = ctrl+alt+7=gx:new_tab_profile:custom:Owned\n")
+entry(308, "Renamed")
+click(372, 478)
+sleep(0.5)
+assert "Renamed=direct:/bin/bash --noprofile --norc" in overlay.read_text()
+assert "gx:new_tab_profile:custom:Owned" in overlay.read_text()
+assert "# R6 external profile edit" in overlay.read_text()
+capture("renamed-stale-reference")
+stale_before = processes("before-stale-reference")
+xdo("mousemove", 887, 180, "click", 1)
+sleep(0.5)
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+7")
+sleep(0.5)
+assert processes("after-stale-reference") == stale_before
+assert (evidence / "G18.log").read_text().count("unknown launch profile custom:Owned") == 1
+capture("stale-reference-no-launch")
+xdo("key", "ctrl+alt+n")
+sleep(0.5)
+click(100, 527)
+sleep(0.5)
+click(500, 238)
+xdo("key", "--repeat", 5, "--delay", 150, "Down")
+xdo("key", "Return")
+sleep(0.5)
+click(457, 478)
+sleep(0.5)
+assert "gx-launch-profile = Renamed=" not in overlay.read_text()
+assert "command = direct:/bin/bash --noprofile --norc" in overlay.read_text()
+capture("deleted-keeps-default")
+click(447, 521)
+sleep(0.5)
+assert "\ncommand =" not in overlay.read_text()
+after = processes("after")
+assert before == after, (before, after)
+capture("reset-default-old-shell-alive")
+click(265, 478)
+entry(308, "Sync")
+entry(380, "direct:/bin/bash --noprofile --norc -i")
+click(372, 478)
+sleep(0.5)
+click(887, 180)
+def open_manager(target, count):
+    focus(target)
+    xdo("key", "ctrl+alt+n")
+    sleep(0.5)
+    click(100, 495 + 32 * (count - 5))
+    sleep(0.5)
+    click(500, 238)
+    xdo("key", "--repeat", count - 1, "--delay", 150, "Down")
+    xdo("key", "Return")
+    sleep(0.5)
+def check_second(label, count, command):
+    focus(second)
+    xdo("key", "ctrl+alt+n")
+    sleep(0.5)
+    capture(label + "-menu")
+    xdo("key", "Escape")
+    open_manager(second, count)
+    capture(label)
+    # Prove the old window's manager selected the newly current entry, rather
+    # than accepting a screenshot or a no-new-process assertion on its own.
+    click(280, 521)
+    assert "command = " + command in overlay.read_text()
+    click(887, 180)
+check_second("cross-window-created", 6, "direct:/bin/bash --noprofile --norc -i")
+open_manager(old_window, 6)
+entry(308, "SyncRenamed")
+entry(380, "direct:/bin/bash --noprofile --norc --noediting")
+click(372, 478)
+sleep(0.5)
+click(887, 180)
+check_second("cross-window-renamed", 6, "direct:/bin/bash --noprofile --norc --noediting")
+open_manager(old_window, 6)
+click(457, 478)
+sleep(0.5)
+click(887, 180)
+check_second("cross-window-deleted", 5, "direct:/bin/bash --noprofile --norc")
+check_second("reopened-after-delete", 5, "direct:/bin/bash --noprofile --norc")
+final = processes("cross-window")
+assert all(row in final for row in before), (before, final)
+save("-overlay.txt", overlay.read_text())
+'''
+expect = [
+  "G18.png: an isolated English terminal",
+  "G18-menu.png: launch choices include the user Lower profile and profile manager entry",
+  "G18-manager.png: the native profile manager shows source and rename guidance",
+  "G18-create-draft.png and G18-created.png: Owned is created in the overlay",
+  "G18-default.png: the selected profile is used as the default",
+  "G18-renamed-stale-reference.png: Renamed is selected and rename guidance explains stable ID consequences",
+  "G18-stale-reference-no-launch.png: the binding still naming custom:Owned does not launch a replacement shell; PID/birth/PTY set is unchanged",
+  "G18-deleted-keeps-default.png: deleting the profile does not rewrite the default command",
+  "G18-reset-default-old-shell-alive.png: resetting the default preserves the existing shell (PID/birth/PTY assertions)",
+  "G18-second-before-mutations.png: the second window already exists and its menu is built before editing",
+  "G18-cross-window-created*.png: that pre-existing window sees Sync",
+  "G18-cross-window-renamed*.png: it sees SyncRenamed and the changed command",
+  "G18-cross-window-deleted*.png and G18-reopened-after-delete*.png: the deleted profile disappears; Lower is selected",
+  "G18-after.png: both ordinary windows survive; original shell PID/birth/PTY remain unchanged",
+]

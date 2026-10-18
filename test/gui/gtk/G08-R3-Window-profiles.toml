@@ -1,20 +1,84 @@
 id = "G08"
-title = "R3-Window: Chinese launch profiles mark the configured default and offer settings and editing"
+title = "R3-Window: Chinese launch profiles mark the default, start it, open the Shell settings, the manager and About, and stay cached across windows"
 lang = "zh_CN"
+env = { GHOSTTY_GX_PERF = "1" }
 config = """
 command = direct:/bin/bash --noprofile --norc
 language = zh-CN
 gx-launch-profile = Demo=direct:/bin/bash --noprofile --norc
 keybind = ctrl+alt+n=gx:new_tab_menu
 """
-xdotool = """
+# Intermediate screenshots use xdotool exec into the evidence directory next to
+# XDG_STATE_HOME, which the runner copies out with the rest; the whole script
+# must finish within the runner's 30 s xdotool timeout. GHOSTTY_GX_PERF=1 adds
+# the launch profile detection and menu builder lines to the log.
+xdotool = '''
 mousemove 400 300
 click 1
 sleep 0.3
 key ctrl+alt+n
 sleep 1
-"""
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s01-profiles.png"
+mousemove 60 236
+click 1
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s02-demo-tab.png"
+key ctrl+alt+n
+sleep 1
+mousemove 68 467
+click 1
+sleep 2.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s03-settings-shell.png"
+key Escape
+sleep 0.8
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+alt+n
+sleep 1
+mousemove 64 499
+click 1
+sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s04-profile-manager.png"
+key Escape
+sleep 0.8
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+shift+m
+sleep 1
+mousemove 573 487
+click 1
+sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s05-about.png"
+mousemove 400 348
+click 1
+sleep 1.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s05b-about-details.png"
+key Escape
+sleep 0.4
+key Escape
+sleep 0.8
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+shift+n
+sleep 2.0
+mousemove 400 300
+click 1
+sleep 0.3
+key ctrl+alt+n
+sleep 1
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s06-second-window-profiles.png"
+'''
 expect = [
   "G08.png: the Chinese main window shows readable Han text",
-  "G08-after.png: the profile dropdown marks Demo as default and includes Set Default Shell and Edit Launch Profiles in Chinese",
+  "G08-s01-profiles.png: the profile dropdown lists the detected profiles and Demo（默认） as the configured default, then 用启动配置新建窗口, the splits, 设置默认 Shell… and 编辑启动配置…",
+  "G08-s02-demo-tab.png: choosing Demo opened a second tab running the Demo command",
+  "G08-s03-settings-shell.png: 设置默认 Shell… opened the settings dialog directly on the Shell page (gx:settings_page:shell) showing the default shell",
+  "G08-s04-profile-manager.png: 编辑启动配置… opened the launch profile manager",
+  "G08-s05-about.png: 关于 Ghostty GX opens the GX About dialog: Ghostty GX, the unofficial-fork byline, the version, and the graphics backend and issue link in its details",
+  "G08-s05b-about-details.png: the Details page shows the GX notice, the licence, Graphics: OpenGL (EGL: …); GTK: <renderer> and the issue link; GTK and libadwaita built-in labels stay English because their zh_CN catalogs are not installed in this WSL",
+  "G08-s06-second-window-profiles.png: a second window offers the same profile list",
+  "G08.log: with GHOSTTY_GX_PERF=1 the launch profile lines show detection reused (cached=true) for later menus and windows, and gtk_menu_builder_load appears once for the Chinese menus",
 ]

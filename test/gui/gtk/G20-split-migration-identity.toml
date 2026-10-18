@@ -1,0 +1,88 @@
+id = "G20"
+title = "Nested and zoomed split migration preserves process identity and scrollback"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+shell-integration-features = no-title
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+t=gx:move_split_to_tab
+keybind = ctrl+alt+w=gx:move_split_to_window
+keybind = ctrl+alt+z=toggle_split_zoom
+keybind = ctrl+alt+d=new_split:right
+keybind = ctrl+alt+e=new_split:down
+"""
+script = '''
+import shlex
+xdo("windowsize", window(), 1100, 740)
+xdo("mousemove", 400, 300, "click", 1)
+old_window = window()
+xdo("key", "ctrl+alt+d")
+sleep(0.7)
+xdo("key", "ctrl+alt+e")
+sleep(0.7)
+moved_pid_file = evidence / "G20-moved-shell.pid"
+xdo("type", "--delay", 1, "printf '%s' \"$$\" > " + shlex.quote(str(moved_pid_file)) + "; printf 'R6-SCROLLBACK-%03d\\n' {1..80}")
+xdo("key", "Return")
+sleep(0.5)
+before = processes("before")
+moved_shell = next(row for row in before if row["pid"] == int(moved_pid_file.read_text()))
+assert len({row["fd0"] for row in before}) == 3, before
+assert sum(row["exe"] == "/usr/bin/bash" for row in before) == 3, before
+capture("nested")
+xdo("key", "ctrl+alt+z")
+sleep(0.3)
+capture("zoomed")
+xdo("key", "ctrl+alt+t")
+sleep(0.7)
+assert processes("after-tab") == before
+capture("moved-tab")
+xdo("key", "ctrl+alt+d")
+sleep(0.7)
+# The new leaf is now active; focus the retained original leaf for the next move.
+xdo("key", "ctrl+alt+Left")
+xdo("mousemove", 260, 300, "click", 1)
+before_window = processes("before-window")
+xdo("key", "ctrl+alt+w")
+sleep(0.7)
+assert processes("after-window") == before_window
+capture("moved-window")
+windows = xdo("search", "--onlyvisible", "--pid", pid()).splitlines()
+assert len(windows) == 2, windows
+new_window = next(item for item in windows if item != old_window)
+xdo("windowfocus", old_window)
+xdo("key", "ctrl+shift+w")
+sleep(0.5)
+# The original window has another tab; close it too.
+xdo("key", "ctrl+shift+w")
+sleep(0.5)
+xdo("windowfocus", new_window)
+xdo("mousemove", 260, 300, "click", 1)
+xdo("key", "ctrl+shift+f")
+xdo("type", "R6-SCROLLBACK-040")
+sleep(0.5)
+xdo("key", "Return")
+sleep(0.5)
+capture("search-after-old-close")
+xdo("key", "Escape")
+xdo("type", "--delay", 1, "printf '\\033]0;R6-MOVED-TITLE\\007'")
+xdo("key", "Return")
+sleep(0.5)
+assert xdo("getwindowname", new_window) == "R6-MOVED-TITLE"
+capture("title-after-old-close")
+xdo("key", "ctrl+alt+d")
+sleep(0.7)
+capture("split-after-old-close")
+final = processes("final")
+assert moved_shell in final, (moved_shell, final)
+'''
+expect = [
+  "G20.png: one initial terminal",
+  "G20-nested.png and G20-zoomed.png: nested layout followed by zoom of the marked leaf",
+  "G20-moved-tab.png: moved leaf retains output; process JSON has identical PID/birth/PTY",
+  "G20-moved-window.png: a new window contains the retained leaf without a new shell",
+  "G20-search-after-old-close.png: search finds old scrollback after closing the source window",
+  "G20-title-after-old-close.png: OSC title still updates the destination window",
+  "G20-split-after-old-close.png and G20-after.png: creating another split still works",
+]

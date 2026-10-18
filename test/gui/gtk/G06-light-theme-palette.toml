@@ -1,19 +1,72 @@
 id = "G06"
-title = "A light theme: GX colors follow it and the command palette opens over it"
+title = "A light theme with a material and one configuration error: GX colors, palette, diagnostics shown once and theme previews that keep the focus"
 lang = "en"
 config = """
 command = /bin/bash --noprofile --norc
 language = en
 theme = Catppuccin Latte
+background-opacity = 0.9
+background-blur = true
+gx-o6-not-a-key = 1
 """
-xdotool = """
+# gx-o6-not-a-key is a deliberate configuration error. Intermediate screenshots
+# use xdotool exec into the evidence directory next to XDG_STATE_HOME, which
+# the runner copies out with the rest; the whole script must finish within the
+# runner's 30 s xdotool timeout.
+xdotool = '''
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s01-diagnostics.png"
+key Escape
+sleep 0.8
 mousemove 400 300
 click 1
-sleep 0.5
+sleep 0.3
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s02-dismissed.png"
+key ctrl+shift+comma
+sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s03-reload-no-repeat.png"
 key ctrl+shift+p
-sleep 2
-"""
+sleep 1.5
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s04-palette.png"
+key Escape
+sleep 0.5
+key ctrl+comma
+sleep 2.0
+mousemove 245 541
+click 1
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s05-appearance-material.png"
+mousemove 400 172
+click 1
+sleep 1.2
+key Down
+sleep 0.5
+key Down
+sleep 0.5
+key Down
+sleep 1.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s06-theme-preview-focus.png"
+type --delay 30 "rose"
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s07-search-keeps-focus.png"
+key Escape
+sleep 0.4
+key Escape
+sleep 0.8
+key Escape
+sleep 0.8
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s08-preview-reverted.png"
+key ctrl+shift+n
+sleep 2.0
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s09-new-window-no-repeat.png"
+'''
 expect = [
-  "G06.png: the header bar and terminal use the light Catppuccin Latte colors",
-  "G06-after.png: the command palette is open over the light window and readable",
+  "G06.png and G06-s01-diagnostics.png: the light Catppuccin Latte window shows the Configuration Errors dialog once at startup, naming gx-o6-not-a-key",
+  "G06-s02-dismissed.png: Escape dismissed it; header bar, tab strip and terminal use the light colors",
+  "G06-s03-reload-no-repeat.png: reloading the configuration with the same error shows only the reload toast, not the dialog again",
+  "G06-s04-palette.png: the command palette is open over the light window and readable",
+  "G06-s05-appearance-material.png: the settings show Window Material Blur and Background Opacity 90% with the Blur needs compositor support note; Xvfb has no compositor, so the translucent header and popovers cannot be seen here",
+  "G06-s06-theme-preview-focus.png: three Down presses in the theme list preview other themes (the window recolors) while the theme subpage keeps the keyboard focus and the configuration errors dialog does not come back",
+  "G06-s07-search-keeps-focus.png: typing rose goes into the theme search, proving the previews did not move the focus",
+  "G06-s08-preview-reverted.png: leaving the subpage and closing the dialog ends the preview and the window is back to Catppuccin Latte",
+  "G06-s09-new-window-no-repeat.png: a new window does not show the already reported diagnostics again",
 ]
