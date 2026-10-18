@@ -910,6 +910,161 @@ test "UIA settings focus preserves the retained Toggle provider until a model ed
     try testing.expect(!self.popup.uia_view.publisher.accepts(action));
 }
 
+// Exercise the real Settings key handler and accessible model with a hidden
+// popup. Only painting is replaced: the two button hits stand for its layout.
+const GroupFocusProbe = struct {
+    const Simple = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ProviderOptions: *const fn (*uia.Face, *u32) callconv(.winapi) i32,
+        GetPatternProvider: *const fn (*uia.Face, i32, *?*uia.Face) callconv(.winapi) i32,
+        GetPropertyValue: *const fn (*uia.Face, i32, *uia.Variant) callconv(.winapi) i32,
+    };
+    const Root = extern struct {
+        QueryInterface: *const fn (*uia.Face, *const w32.GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*uia.Face) callconv(.winapi) u32,
+        Release: *const fn (*uia.Face) callconv(.winapi) u32,
+        ElementProviderFromPoint: *const fn (*uia.Face, f64, f64, *?*uia.Face) callconv(.winapi) i32,
+        GetFocus: *const fn (*uia.Face, *?*uia.Face) callconv(.winapi) i32,
+    };
+    fn simple(face: *uia.Face) *const Simple {
+        return @ptrCast(@alignCast(face.vtable));
+    }
+    fn paint(ctx: *anyopaque, _: *Popup, _: *d2d.Canvas) void {
+        const self: *Settings = @ptrCast(@alignCast(ctx));
+        self.checkUiaHits();
+    }
+    fn check(root: *uia.Face, buttons: [2]*uia.Face, focused: usize) !void {
+        for (buttons, 0..) |face, index| {
+            var options: u32 = 0;
+            try std.testing.expectEqual(@as(i32, 0), simple(face).ProviderOptions(face, &options));
+            var value: uia.Variant = .{};
+            try std.testing.expectEqual(@as(i32, 0), simple(face).GetPropertyValue(face, 30008, &value));
+            try std.testing.expectEqual(@as(u16, 11), value.tag);
+            try std.testing.expectEqual(index == focused, value.data.integer != 0);
+        }
+        const table: *const Root = @ptrCast(@alignCast(root.vtable));
+        var focus: ?*uia.Face = null;
+        try std.testing.expectEqual(@as(i32, 0), table.GetFocus(root, &focus));
+        const face = focus orelse return error.TestUnexpectedResult;
+        defer _ = simple(face).Release(face);
+        try std.testing.expectEqual(buttons[focused].node, face.node);
+    }
+    fn run(section: Section) !void {
+        const testing = std.testing;
+        // UiaTestClient compares ASCII event names. Keep this fixture's
+        // language explicit and restore the process setting on every exit.
+        const language = i18n.current();
+        i18n.setCurrent(.en);
+        defer i18n.setCurrent(language);
+        const attachment: gx.ui_ref.Attachment = .{
+            .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+            .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+            .revision = 1,
+        };
+        var fixture: Popup.UiaTestClient.AppFixture = undefined;
+        try fixture.init(attachment);
+        defer fixture.deinit();
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+        const factory = try d2d.Factory.create(testing.allocator);
+        defer factory.destroy();
+        const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+        const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
+        defer _ = w32.DestroyWindow(owner);
+        var self: Settings = .{
+            .alloc = testing.allocator,
+            .app = &fixture.app,
+            .window = &fixture.window,
+            .arena = .init(testing.allocator),
+            .scratch = .init(testing.allocator),
+            .font_arena = .init(testing.allocator),
+            .changes = .init(testing.allocator),
+            .layers = .{ .arena = .init(testing.allocator) },
+            .values = .fromConfig(&config, null),
+            .section = section,
+            .open = true,
+            .uia_attachment = attachment,
+        };
+        defer self.arena.deinit();
+        defer self.scratch.deinit();
+        defer self.font_arena.deinit();
+        defer self.changes.deinit();
+        defer self.layers.?.deinit();
+        defer self.theme_list.deinit(testing.allocator);
+        defer self.font_query.deinit(testing.allocator);
+        defer self.popup.destroy();
+        try self.layers.?.setOverlay(if (section == .appearance) "theme" else "font-family", &.{"Test"});
+        try self.theme_list.matches.append(testing.allocator, 0);
+        try self.font_query.appendSlice(testing.allocator, "Test");
+        var rows_buf: [max_rows]Row = undefined;
+        const rows = self.buildRows(&rows_buf);
+        self.focus = for (rows, 0..) |row, index| {
+            if (row.kind == .group and row.buttons.len == 2) break index;
+        } else return error.TestUnexpectedResult;
+        const row = rows[self.focus];
+        try testing.expectEqual(GroupButton.reset, row.buttons[0]);
+        for (row.buttons, 0..) |button, index| self.hits[index] = .{
+            .rect = .{ .x = @as(f32, @floatFromInt(index)) * 120, .y = 0, .w = 100, .h = 24 },
+            .target = .{ .group_button = .{ .row = @intCast(self.focus), .button = button } },
+        };
+        self.hit_count = 2;
+        try self.popup.create(fixture.app.hinstance, owner, factory, .{}, .{
+            .ctx = &self,
+            .paint = GroupFocusProbe.paint,
+            .uia_source = .{ .app = &fixture.app, .build = uiaBuild, .is_live = uiaLive, .action = uiaAction },
+        });
+        // Never show or activate this window on the desktop.
+        self.popup.visible = true;
+        self.popup.focused = true;
+        const client = try Popup.UiaTestClient.create(self.popup.hwnd.?);
+        defer client.destroy(&fixture.app);
+        try client.ready(&fixture.app);
+        client.settle(&fixture.app, 200);
+        const snapshot = self.popup.uia_view.publisher.current.?;
+        const snapshot_id = snapshot.id;
+        const buttons: [2]*uia.Face = .{ &snapshot.nodes[1].faces[0], &snapshot.nodes[2].faces[0] };
+        const root = &snapshot.nodes[0].faces[2];
+        for (buttons) |face| _ = simple(face).AddRef(face);
+        _ = simple(root).AddRef(root);
+        defer for (buttons) |face| {
+            _ = simple(face).Release(face);
+        };
+        defer _ = simple(root).Release(root);
+        try check(root, buttons, 0);
+        for ([_]u16{ w32.VK_RIGHT, w32.VK_RIGHT, w32.VK_LEFT, w32.VK_LEFT }, [_]usize{ 1, 1, 0, 0 }, 0..) |vk, index, step| {
+            client.clear();
+            try testing.expect(onKey(&self, &self.popup, .{ .vk = vk, .ctrl = false, .shift = false, .alt = false }));
+            try testing.expectEqual(index, self.focus_button);
+            try check(root, buttons, index);
+            try testing.expectEqual(snapshot, self.popup.uia_view.publisher.current.?);
+            try testing.expectEqual(snapshot_id, self.popup.uia_view.publisher.current.?.id);
+            try testing.expect(self.focus_visible);
+            const label = if (index == 0) i18n.tr("Reset") else if (section == .appearance) i18n.tr("Apply Theme") else i18n.tr("Apply Font");
+            const name = try std.fmt.allocPrint(testing.allocator, "{s}: {s}", .{ row.title, label });
+            defer testing.allocator.free(name);
+            if (step % 2 == 0) try client.expect(&fixture.app, .focus, name);
+            client.settle(&fixture.app, 100);
+            try testing.expectEqual(@as(usize, if (step % 2 == 0) 1 else 0), client.times(.focus, name));
+        }
+        // A changed hit layout must still revoke every retained provider.
+        self.hits[0].rect.y += 24;
+        self.checkUiaHits();
+        var options: u32 = 0;
+        for (buttons) |face| try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80040201))), simple(face).ProviderOptions(face, &options));
+        self.popup.visible = false;
+    }
+};
+
+test "UIA settings theme group arrows preserve providers and report focus to a real client" {
+    try GroupFocusProbe.run(.appearance);
+}
+
+test "UIA settings font group arrows preserve providers and report focus to a real client" {
+    try GroupFocusProbe.run(.font);
+}
+
 test "UIA settings hover and press feedback keep the retained provider" {
     const testing = std.testing;
     var config = try Config.default(testing.allocator);
@@ -3156,6 +3311,8 @@ fn onKey(ctx: *anyopaque, popup: *Popup, key: Popup.Key) bool {
                 .group => {
                     if (right and self.focus_button + 1 < row.buttons.len) self.focus_button += 1;
                     if (!right and self.focus_button > 0) self.focus_button -= 1;
+                    self.showUiaFocus();
+                    return true;
                 },
                 else => return false,
             }
