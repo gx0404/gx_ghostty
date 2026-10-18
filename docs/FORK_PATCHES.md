@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0051）之后的号。在册的 45 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0051，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0053）之后的号。在册的 46 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -127,6 +127,7 @@
 | GX-0050 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0050` | active |
 | GX-0051 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0051` | active |
 | GX-0051 | `src/renderer/opengl/Target.zig` | `fork(gx): GX-0051` | active |
+| GX-0053 | `src/Command.zig` | `fork(gx): GX-0053` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1505,3 +1506,12 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：中间目标与最终目标同按模式选格式（中间那次多余编码会在下次采样时抵消，只留 8 位往返的 ±1 量化误差，统一格式免去这层误差）；不能把图片/彩色atlas源改成RGBA8。保持默认srgb=true以兼容直接Target.init调用；保持generic.changeConfig更新api.blending与target_config_modified以及FrameState.resize重建中间纹理的链。上游如重构这条链，需要同步审查本补丁。
 - 移除条件：上游OpenGL目标与中间纹理已按混合模式选择编码空间，且同色表/重载/恢复验证等价通过时移除；Metal已使用类似模式选择，不属于本补丁。
 - 验证：D-16注入GL表的最终目标、中间目标、源采样格式测试；Windows renderer/apprt.win32和GTK renderer定向测试；两端native/linear/linear-corrected不透明色表，Kitty图像、两级透传shader，Windows模式重载和模拟GPU重置。低alpha、文字抗锯齿、透明背景、VM 软件 GL（Mesa）、真实TDR和其他显示链另验，验证前保持 PENDING，不以不透明探针代证。
+
+## GX-0053 Windows 子进程保留空参数
+
+- 文件：`src/Command.zig`；active，未回馈上游（上游 main 仍有此问题，适合由人回馈）。`windowsCreateCommandLine` 的不加引号分支多一个非空条件（单行标记）；两条回归测试与其辅助函数在一个纯新增 begin/end 块内。
+- 原因：上游编码器把空字符串当成“不需要引号”，写出零字节，`CreateProcessW` 的命令行解码后这个参数消失，后面参数的位置也随之前移（D-23；Zig 0.16 标准库自己的编码器已给空参数加引号）。
+- 行为：空参数走既有的加引号分支，写成 `""`，保留它在 argv 中的位置与个数（中间、末尾与连续的空参数都保留）；非空参数的编码不变。尾反斜杠、连续反斜杠、引号前的 2n+1 转义、CJK 与空格经 Windows 原生解码后与 `src/gx/windows_argv.zig::encode` 一致（两者的命令行字符串可能不同：GX 编码器总加引号）。唯一调用方是启动终端子进程的路径。
+- 同步：上游改写 `windowsCreateCommandLine` 时保持“空参数加引号”，并保留既有的引号与反斜杠算法。
+- 移除条件：上游原生保留空参数后，删除单行守卫与测试块，登记改为 removed。
+- 验证：`just test --filter Command:`（Windows 上两条 `CommandLineToArgvW` 往返用例：空参数与 GX 编码器对照；其余 `Command:` 用例中有 POSIX 专用的会跳过），gx-ci `windows-app` 同样跑这组过滤；`python scripts/run_unittests.py test_fork_patches`（`Gx0053ShapeTests` 锁定守卫、编码算法与回归用例，还原后与上游一致）。回归用 Windows 原生解码器代证子进程收到的 argv（root 书面接受，未另起子进程）。

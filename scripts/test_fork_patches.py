@@ -1648,6 +1648,66 @@ def gx0051_problems(opengl: str, target: str) -> list[str]:
     return problems
 
 
+COMMAND_ZIG = "src/Command.zig"
+GX0053 = "GX-0053"
+GX0053_GUARD = 'if (arg.len != 0 and mem.indexOfAny(u8, arg, " \\t\\n\\"") == null) {'
+GX0053_OLD_GUARD = 'if (mem.indexOfAny(u8, arg, " \\t\\n\\"") == null) {'
+GX0053_MARKER = "        // fork(gx): GX-0053 empty arguments need quotes to survive argv decoding."
+
+
+def gx0053_problems(source: str) -> list[str]:
+    """Empty Windows arguments are quoted; the rest of the upstream encoder stays."""
+    source = source.replace("\r\n", "\n")
+    lines = source.splitlines()
+    span = zig_fn_lines(lines, "fn windowsCreateCommandLine(")
+    if span is None:
+        return ["expected exactly one windowsCreateCommandLine"]
+    body = "\n".join(lines[span[0]:span[1]])
+    problems = []
+    if body.count(GX0053_GUARD) != 1 or GX0053_OLD_GUARD in body:
+        problems.append("the nonempty guard must keep the original whitespace predicate")
+    if GX0053_MARKER + "\n        " + GX0053_GUARD not in body:
+        problems.append("the GX-0053 marker must sit right above the nonempty guard")
+    for statement in ("try writer.writeByte('\"');",
+                      "try writer.splatByteAll('\\\\', backslash_count * 2 + 1);",
+                      "try writer.splatByteAll('\\\\', backslash_count * 2);"):
+        if statement not in body:
+            problems.append("the quote/backslash encoder must stay: " + statement)
+    for name in ("Command: D23 native Windows argv preserves empty arguments",
+                 "Command: D23 Windows quoting agrees with GX for slashes quotes and Unicode"):
+        if source.count('test "' + name + '"') != 1:
+            problems.append("missing native regression: " + name)
+    return problems
+
+
+class Gx0053ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / COMMAND_ZIG).read_text(encoding="utf-8")
+
+    def test_registered(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        self.assertIn(Patch(GX0053, COMMAND_ZIG, f"fork(gx): {GX0053}", "active"), patches)
+
+    def test_real_source_lf_and_crlf(self):
+        self.assertEqual(gx0053_problems(self.source), [])
+        self.assertEqual(gx0053_problems(self.source.replace("\n", "\r\n")), [])
+
+    def test_reversions_are_detected(self):
+        for old, new in ((GX0053_GUARD, GX0053_OLD_GUARD), (GX0053_MARKER, ""),
+                         ("backslash_count * 2 + 1", "backslash_count + 1")):
+            with self.subTest(old=old):
+                self.assertTrue(gx0053_problems(self.source.replace(old, new, 1)))
+
+    def test_undoing_the_patch_gives_back_upstream(self):
+        upstream, reason = merged_upstream_text(ROOT, COMMAND_ZIG)
+        if upstream is None:
+            self.skipTest(reason)
+        restored = self.source.replace(GX0053_MARKER + "\n", "").replace(GX0053_GUARD, GX0053_OLD_GUARD)
+        restored, _ = marked_hunks(restored, GX0053)
+        self.assertEqual(squash(restored), squash(upstream))
+
+
 class Gx0051ShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
