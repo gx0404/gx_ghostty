@@ -712,6 +712,8 @@ import sys
 FIRST = ("main", "renderer", "io", "io-reader", "io-gather")
 COUNTERS = ("utime", "stime", "minflt", "majflt")
 DMABUF_WARNINGS = ("failed to export DMABUF", "failed to build dmabuf")
+CLOCK_SCHEMA = "gx-gtk-monotonic-ns-v1"
+CLOCK_STAGES = ("launch", "window", "workload_begin", "workload_end")
 
 
 def group_name(comm):
@@ -742,11 +744,54 @@ def parse_tasks(text):
 
 def parse_times(text):
     values = {}
+    duplicates = set()
+    clock_fields = {"clock_schema", "clock_unit", "window_seconds", "workload_seconds"}
+    clock_fields.update(stage + suffix for stage in CLOCK_STAGES
+                        for suffix in ("_monotonic_ns", "_realtime"))
     for line in text.splitlines():
         key, _, value = line.strip().partition(" ")
         if key:
+            if key in values and key in clock_fields:
+                duplicates.add(key)
             values[key] = value.strip()
+    if has_monotonic_clock(values) and duplicates:
+        raise ValueError("duplicate monotonic timing fields: " + ", ".join(sorted(duplicates)))
     return values
+
+
+def has_monotonic_clock(times):
+    return any(key.startswith("clock_") or key.endswith("_monotonic_ns") for key in times)
+
+
+def validate_clock(times, meta=None):
+    modern = has_monotonic_clock(times)
+    if meta is not None:
+        if meta.get("schema") == "gx-gtk-perf-v2":
+            if not modern or meta.get("clock_schema") != CLOCK_SCHEMA or meta.get("clock_unit") != "ns":
+                raise ValueError("missing or invalid monotonic clock metadata")
+        elif meta.get("schema") != "gx-gtk-perf-v1" or modern or has_monotonic_clock(meta):
+            raise ValueError("timing schema conflicts with GTK evidence schema")
+    if not modern:
+        return  # Historical realtime evidence keeps its original validation.
+    if times.get("clock_schema") != CLOCK_SCHEMA or times.get("clock_unit") != "ns":
+        raise ValueError("missing or invalid monotonic clock schema/unit")
+    endpoints = []
+    for stage in CLOCK_STAGES:
+        key = stage + "_monotonic_ns"
+        raw = times.get(key, "")
+        if not re.fullmatch(r"[0-9]{1,19}", raw) or int(raw) > 2**63 - 1:
+            raise ValueError("missing or invalid " + key)
+        endpoints.append(int(raw))
+        if not math.isfinite(float(times.get(stage + "_realtime", "nan"))):
+            raise ValueError("missing or invalid realtime provenance: " + stage)
+    if any(end < begin for begin, end in zip(endpoints, endpoints[1:])):
+        raise ValueError("monotonic timing endpoints out of order")
+    for key, begin, end in (("window_seconds", endpoints[0], endpoints[1]),
+                            ("workload_seconds", endpoints[2], endpoints[3])):
+        # Subtract integer ns before conversion; no clipping or realtime fallback.
+        seconds = (end - begin) / 1_000_000_000
+        if float(times.get(key, "nan")) != seconds:
+            raise ValueError(key + " differs from monotonic endpoints")
 
 
 def deltas(before, after, pid):
@@ -788,6 +833,7 @@ def measurement(before_text, after_text, times_text):
         value = float(times.get(key, "nan"))
         if not math.isfinite(value) or value < 0:
             raise ValueError("missing or invalid " + key)
+    validate_clock(times)
     return groups
 
 
@@ -830,7 +876,10 @@ def cpu_accounting(before_text, after_text, process_before, process_after, pid, 
 
 
 def report(before_text, after_text, times_text, log_text, clk_tck, process_before=None, process_after=None):
-    times = parse_times(times_text)
+    try:
+        times = parse_times(times_text)
+    except ValueError as exc:
+        return "valid: no\nrejected: " + str(exc) + "\n"
     lines = ["# gx-wsl smoke --perf",
              "workload: seq 1 3000000 run by `ghostty -e sh workload.sh` once the first screenshot is taken",
              "finished: " + ("yes" if times.get("workload_finished") == "1" else "no")]
@@ -842,7 +891,9 @@ def report(before_text, after_text, times_text, log_text, clk_tck, process_befor
     except (ValueError, KeyError, TypeError) as exc:
         return "\n".join([*lines, "valid: no", "rejected: " + str(exc)]) + "\n"
     lines += ["valid: yes (identity/build receipt must be checked in meta.json)",
-              "clock: realtime elapsed; window/done polling 50 ms; CPU includes the 1 s drain tail",
+              ("clock: monotonic_ns elapsed; realtime provenance only; window/done polling 50 ms; CPU includes the 1 s drain tail"
+               if has_monotonic_clock(times) else
+               "clock: realtime elapsed; window/done polling 50 ms; CPU includes the 1 s drain tail"),
               "population: endpoint identities only; transient population not proven",
               "cpu.total: " + ("process aggregate including exited threads" if accounting else "unverified endpoint sum; no process reconciliation")]
     order = [name for name in FIRST if name in groups]
@@ -973,14 +1024,15 @@ def smoke_main(argv):
     evidence, work = Path(evidence), Path(work)
     perf = perf == "1"
     prefix = evidence / name
-    meta = {"schema": "gx-gtk-perf-v1", "perf": perf, "valid": False, "exit": 1, "errors": [],
+    meta = {"schema": "gx-gtk-perf-v2", "perf": perf, "valid": False, "exit": 1, "errors": [],
             "started_realtime": time.time(), "identity_checks": [], "workload_finished": False,
             "effective_env": {key: os.environ.get(key) for key in ENV_KEYS}, "screen": screen,
-            "clock": "realtime elapsed; 50 ms polling; CPU includes 1 s drain tail", "warmup": "none",
+            "clock": "monotonic_ns elapsed; realtime provenance only; 50 ms polling; CPU includes 1 s drain tail",
+            "clock_schema": CLOCK_SCHEMA, "clock_unit": "ns", "warmup": "none",
             "clk_tck": os.sysconf("SC_CLK_TCK"),
             "renderer_evidence": {"egl": "unknown", "cpu_fallback": "unknown", "hardware": "unknown"}}
     meta["capture_id"] = uuid.uuid4().hex
-    times = {}
+    times = {"clock_schema": CLOCK_SCHEMA, "clock_unit": "ns"}
     child = pidfd = exe_fd = None
     before = after = ""
     process_before = process_after = None
@@ -1171,6 +1223,7 @@ def smoke_main(argv):
         if perf:
             command += ["-e", "sh", str(work / "workload.sh")]
         meta["command"] = command
+        times["launch_monotonic_ns"] = time.monotonic_ns()
         times["launch_realtime"] = time.time()
         with open(str(prefix) + ".log", "w") as log:
             child = subprocess.Popen(command, executable=held, pass_fds=(exe_fd,), stdout=log, stderr=log)
@@ -1195,11 +1248,14 @@ def smoke_main(argv):
         if not window:
             raise ValueError("no visible window within " + wait_seconds + " s")
         meta["window"] = window
-        times["window_seconds"] = time.time() - times["launch_realtime"]
+        times["window_monotonic_ns"] = time.monotonic_ns()
+        times["window_realtime"] = time.time()
+        times["window_seconds"] = (times["window_monotonic_ns"] - times["launch_monotonic_ns"]) / 1_000_000_000
         time.sleep(float(settle))
         capture(".png")
         if perf:
             before, process_before = snapshot("before")
+            times["workload_begin_monotonic_ns"] = time.monotonic_ns()
             times["workload_begin_realtime"] = time.time()
             (work / "go").touch()
             deadline = time.monotonic() + 300
@@ -1209,8 +1265,9 @@ def smoke_main(argv):
                     meta["workload_finished"] = True
                     break
                 time.sleep(0.05)
+            times["workload_end_monotonic_ns"] = time.monotonic_ns()
             times["workload_end_realtime"] = time.time()
-            times["workload_seconds"] = times["workload_end_realtime"] - times["workload_begin_realtime"]
+            times["workload_seconds"] = (times["workload_end_monotonic_ns"] - times["workload_begin_monotonic_ns"]) / 1_000_000_000
             times["workload_finished"] = int(meta["workload_finished"])
             meta["workload_exit"] = (work / "workload-exit").read_text().strip() if (work / "workload-exit").exists() else None
             if meta["workload_exit"] != "0":

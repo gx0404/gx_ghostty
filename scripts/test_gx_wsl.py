@@ -515,6 +515,142 @@ def stat_line(tid: int, comm: str, minflt: int, majflt: int, utime: int, stime: 
     return f"{tid}\t{tid} ({comm}) {' '.join(fields)}"
 
 
+def monotonic_times() -> dict:
+    # Deliberately beyond binary64's exact integer range: subtract integer ns first.
+    start = 10**16
+    return {"clock_schema": "gx-gtk-monotonic-ns-v1", "clock_unit": "ns",
+            "launch_monotonic_ns": start, "window_monotonic_ns": start + 1_000_000_001,
+            "workload_begin_monotonic_ns": start + 2_000_000_000,
+            "workload_end_monotonic_ns": start + 3_000_000_007,
+            "launch_realtime": 100, "window_realtime": 99,
+            "workload_begin_realtime": 101, "workload_end_realtime": 98,
+            "window_seconds": 1.000000001, "workload_seconds": 1.000000007,
+            "pid": 10, "workload_finished": 1, "run_exit": 0}
+
+
+class MonotonicClockTests(unittest.TestCase):
+    def setUp(self):
+        self.program = perf_namespace()
+        self.tasks = "\n".join((stat_line(10, "ghostty", 0, 0, 0, 0),
+                                stat_line(11, "renderer", 0, 0, 0, 0)))
+
+    def validate(self, values):
+        text = "\r\n".join(f"{key} {value}" for key, value in values.items()) + "\r\n"
+        return self.program["measurement"](self.tasks, self.tasks, text)
+
+    def test_wall_clock_jumps_do_not_change_monotonic_durations(self):
+        for jump in (-3600, 3600):
+            values = monotonic_times()
+            values["window_realtime"] = values["launch_realtime"] + jump
+            values["workload_end_realtime"] = values["workload_begin_realtime"] + jump
+            with self.subTest(jump=jump):
+                self.validate(values)
+
+    def test_missing_reversed_tampered_or_wrong_unit_clock_is_rejected(self):
+        original = monotonic_times()
+        cases = [{key: value for key, value in original.items() if key != missing}
+                 for missing in ("clock_schema", "clock_unit", "launch_monotonic_ns", "window_monotonic_ns",
+                                 "workload_begin_monotonic_ns", "workload_end_monotonic_ns")]
+        cases += [original | changes for changes in (
+            {"clock_schema": "unknown"}, {"clock_unit": "s"},
+            {"window_monotonic_ns": original["launch_monotonic_ns"] - 1},
+            {"workload_begin_monotonic_ns": original["launch_monotonic_ns"] - 1},
+            {"workload_end_monotonic_ns": original["workload_begin_monotonic_ns"] - 1},
+            {"workload_end_monotonic_ns": original["workload_end_monotonic_ns"] + 1},
+            {"window_seconds": 1.0}, {"window_seconds": "nan"}, {"workload_seconds": "inf"},
+            {"launch_monotonic_ns": -1}, {"launch_monotonic_ns": "1e16"},
+            {"launch_monotonic_ns": "10000000000000000.0"}, {"clock_unit": "us"},
+            {"workload_end_monotonic_ns": "9" * 400}, {"workload_end_monotonic_ns": 2**63})]
+        for values in cases:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.validate(values)
+
+    def test_duplicate_clock_rows_rejected_even_when_equal(self):
+        values = monotonic_times()
+        text = "\r\n".join(f"{key} {value}" for key, value in values.items()) + "\r\n"
+        keys = ("clock_schema", "clock_unit", "window_seconds", "workload_seconds")
+        keys += tuple(stage + suffix for stage in ("launch", "window", "workload_begin", "workload_end")
+                      for suffix in ("_monotonic_ns", "_realtime"))
+        for key in keys:
+            for duplicate in (values[key], "different"):
+                with self.subTest(key=key, duplicate=duplicate), self.assertRaisesRegex(ValueError, "duplicate monotonic"):
+                    self.program["measurement"](self.tasks, self.tasks, text + f"{key} {duplicate}\r\n")
+
+    def test_duplicate_nonclock_rows_keep_last_value_in_v1_and_v2(self):
+        for modern in (False, True):
+            values = monotonic_times() if modern else {
+                "pid": 10, "run_exit": 0, "workload_finished": 1, "window_seconds": 1, "workload_seconds": 1}
+            for key, invalid in (("pid", 999), ("run_exit", 1), ("workload_finished", 0)):
+                for first in (values[key], invalid):
+                    with self.subTest(modern=modern, key=key, first=first):
+                        initial = values | {key: first}
+                        text = "\r\n".join(f"{k} {v}" for k, v in initial.items()) + f"\r\n{key} {values[key]}\r\n"
+                        self.assertEqual(str(values[key]), self.program["parse_times"](text)[key])
+                        self.program["measurement"](self.tasks, self.tasks, text)
+            for first in ("old", "new"):
+                with self.subTest(modern=modern, extension=first):
+                    text = "\n".join(f"{k} {v}" for k, v in values.items())
+                    text += f"\nextra_field {first}\nextra_field new\n"
+                    self.assertEqual("new", self.program["parse_times"](text)["extra_field"])
+                    self.program["measurement"](self.tasks, self.tasks, text)
+
+    def test_duplicate_nonclock_invalid_last_value_still_rejected(self):
+        for modern in (False, True):
+            values = monotonic_times() if modern else {
+                "pid": 10, "run_exit": 0, "workload_finished": 1, "window_seconds": 1, "workload_seconds": 1}
+            for key, invalid, error in (("pid", 999, "missing main thread"),
+                                        ("run_exit", 1, "nonzero run exit"),
+                                        ("workload_finished", 0, "incomplete workload")):
+                for first in (values[key], invalid):
+                    with self.subTest(modern=modern, key=key, first=first):
+                        initial = values | {key: first}
+                        text = "\n".join(f"{k} {v}" for k, v in initial.items()) + f"\n{key} {invalid}\n"
+                        self.assertEqual(str(invalid), self.program["parse_times"](text)[key])
+                        with self.assertRaisesRegex(ValueError, error):
+                            self.program["measurement"](self.tasks, self.tasks, text)
+
+    def test_legacy_negative_stays_rejected_and_positive_stays_accepted(self):
+        values = {"pid": 10, "workload_finished": 1, "window_seconds": 1, "workload_seconds": 1}
+        self.validate(values)
+        with self.assertRaisesRegex(ValueError, "missing or invalid window_seconds"):
+            self.validate(values | {"window_seconds": -0.36676621437072754})
+
+    def test_actual_smoke_timing_statements_ignore_wall_jumps(self):
+        # Execute the timing statements from smoke_main with injected clocks.
+        # No window/process/WSL is launched; call sites, raw persistence and math
+        # all come from the real producer, not a reimplementation in the test.
+        import ast
+        from types import SimpleNamespace
+        tree = ast.parse(gx_wsl.SMOKE_PROGRAM)
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "smoke_main")
+        stages = ("launch", "window", "workload_begin", "workload_end")
+        keys = {stage + suffix for stage in stages for suffix in ("_realtime", "_monotonic_ns")}
+        keys |= {"window_seconds", "workload_seconds"}
+        nodes = []
+        for node in ast.walk(main):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and target.value.id == "times" \
+                        and isinstance(target.slice, ast.Constant) and target.slice.value in keys:
+                    nodes.append(node)
+        nodes.sort(key=lambda node: node.lineno)
+        code = compile(ast.Module(body=nodes, type_ignores=[]), "actual-smoke-clock", "exec")
+        for realtime in ([100, 99, 101, 98], [100, 3700, 3701, 7301]):
+            with self.subTest(realtime=realtime):
+                clock = SimpleNamespace(time=mock.Mock(side_effect=realtime),
+                                        monotonic_ns=mock.Mock(side_effect=[10**16, 10**16 + 1_000_000_001,
+                                                                           10**16 + 2_000_000_000,
+                                                                           10**16 + 3_000_000_007]))
+                scope = self.program | {"time": clock, "times": {}}
+                exec(code, scope)
+                self.assertEqual(1.000000001, scope["times"]["window_seconds"])
+                self.assertEqual(1.000000007, scope["times"]["workload_seconds"])
+                self.assertEqual(4, clock.monotonic_ns.call_count)
+                for stage, wall in zip(stages, realtime):
+                    self.assertEqual(wall, scope["times"][stage + "_realtime"])
+                    self.assertIs(type(scope["times"][stage + "_monotonic_ns"]), int)
+
+
 class PerfProgramTests(unittest.TestCase):
     def setUp(self) -> None:
         self.program = perf_namespace()
