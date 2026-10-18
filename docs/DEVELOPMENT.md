@@ -95,7 +95,7 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 
 ### 7. 生成物与版本
 
-- KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。产物是 schema 2 的紧凑 JSON：首行文件头，每个文档一行 `[path, source_sha256, [`（逐文档的来源哈希），其后每片一行 `[anchor, text]`，所以 diff 里变化的行就是变化的小节；chunk id 不入库，`kb-query --json` 的 `id` 由 `path#anchor` 推导。Markdown 正文原样收录；代码层为控制体积做了裁剪：Zig 结构省略 `pub` 前缀，模块文档丢掉分隔线与字形表、超过 3000 字符截断，`///` 与头文件注释只留首句及 120 字符内的后续整句。体积预算 2.5 MiB 由 `scripts/test_agent_kb.py` 锁定，逼近时收紧代码层裁剪、用 `just kb-query` 对照代表查询的前后结果，不放宽预算，也不删 Markdown 语料。
+- KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。产物是 schema 2 的紧凑 JSON：首行文件头，每个文档一行 `[path, source_sha256, [`（逐文档的来源哈希），其后每片一行 `[anchor, text]`，所以 diff 里变化的行就是变化的小节；chunk id 不入库，`kb-query --json` 的 `id` 由 `path#anchor` 推导。Markdown 正文原样收录；代码层为控制体积做了裁剪：Zig 结构省略 `pub` 前缀，模块文档丢掉分隔线与字形表、超过 3000 字符截断，`///` 与头文件注释只留首句及 120 字符内的后续整句。体积预算 2.5 MiB 由 `scripts/test_agent_kb.py` 锁定，逼近时收紧代码层裁剪、用 `just kb-query` 对照代表查询的前后结果，不放宽预算，也不删其余 Markdown 语料。阶段过程文档 `docs/GX_UI_*.md`（REMAINING_PLAN、HANDOFF_PLAN、EVIDENCE_INDEX、EXECUTION_PLAN）不进 KB，按路径直接阅读，避免过时计划混入代码知识；其他 `docs/*.md` 仍收录。排除模式由 `scripts/build_agent_kb.py::EXCLUDED_DOCS` 维护。
 - GX 译表：改了两份 `.po` 就 `just i18n`，`src/gx/i18n/zh_CN.zig` 随改动提交。
 - 拼音首字母表：只在升级钉版 pinyin-data 或改生成规则时 `just pinyin`（联网），`src/gx/pinyin/initials.zig` 随改动提交；平时 `just pinyin-check` 离线校验。数据编进 exe，随包许可由打包脚本写进 Windows 包的 `licenses/` 与 deb stage 的 copyright（`packaging-dist.md`）。
 - 图谱：日常不强制重建；发版前和上游同步后必须 `just graph`，再跑 `just generated-check`。
@@ -317,7 +317,7 @@ just generated-check
 
 | 产物 | 何时重建 | 生成 | 校验 | 入库 |
 |---|---|---|---|---|
-| `docs/kb/chunks.json` | KB 语料变化：根与嵌套 `AGENTS.md`、`CLAUDE.md`、`README.md`、`HACKING.md`、`CONTRIBUTING.md`、`PACKAGING.md`、`AI_POLICY.md`、`CHANGELOG.md`、`docs/*.md`、`docs/AGENT_RULES/*.md`、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含其 `///` 注释）、`include/ghostty/**/*.h` 的声明 | `just kb` | `just kb-check`，属于 framework-check 与 `gx-ci` 的 `framework` job | 是 |
+| `docs/kb/chunks.json` | KB 语料变化：根与嵌套 `AGENTS.md`、`CLAUDE.md`、`README.md`、`HACKING.md`、`CONTRIBUTING.md`、`PACKAGING.md`、`AI_POLICY.md`、`CHANGELOG.md`、`docs/*.md`（排除 `docs/GX_UI_*.md`）、`docs/AGENT_RULES/*.md`、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含其 `///` 注释）、`include/ghostty/**/*.h` 的声明 | `just kb` | `just kb-check`，属于 framework-check 与 `gx-ci` 的 `framework` job | 是 |
 | `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` | 被索引源码增删改：Git 可见、未被 `.graphifyignore` 排除、扩展名在 `scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS` 内的文件（如 `.zig .swift .c .h .cpp .m .py .sh`），实际主要是 `src/`、`pkg/`、`include/`、`macos/` 与 `build.zig`；或者管线输入 `scripts/graphify.py`、`scripts/graphify_fingerprint.py`、`.graphifyignore` 变化 | `just graph` | `just graph-check`，只在 `gx-release` 的 prepare 阶段与上游同步后强制 | 是 |
 | `graphify-out/graph.json` | 同上，约 20 MB | `just graph` | 无 | 否，仅本机 |
 | `src/gx/i18n/zh_CN.zig` | `po/zh_CN.po` 或 `src/gx/i18n/gx.zh_CN.po` 变化（上游同步改了 `po/zh_CN.po` 也算） | `just i18n` | `just i18n-check`，属于 framework-check 与 generated-check；`scripts/test_gx_i18n.py` 也校验，随框架单测进 `gx-ci` 的 `framework` job | 是 |
