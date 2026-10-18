@@ -1,0 +1,115 @@
+id = "W25"
+title = "标题栏按钮快速重试与捕获释放后的悬停"
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+window-save-state = never
+"""
+expect = [
+  "rapid-menu-retry: main menu opens after cancelled first press and immediate retry",
+  "cancel-over-close: close is hovered red without any mouse move after release",
+  "drag-end-over-minimize: minimize is hovered without any mouse move after release",
+  "caption-double-click-maximized: blank caption double-click maximizes the window",
+  "caption-double-click-restored: second blank caption double-click restores the window",
+  "tab-double-click-rename: rename editor opens",
+]
+[[step]]
+action = "resize"
+width = 1500
+height = 1000
+[[step]]
+action = "mouse_down"
+x = -160
+y = 20
+[[step]]
+action = "mouse_up"
+x = 700
+y = 300
+[[step]]
+action = "click"
+x = -160
+y = 20
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+[[step]]
+action = "capture"
+name = "rapid-menu-retry"
+what = "all"
+[[step]]
+action = "key"
+keys = "escape"
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+[[step]]
+action = "mouse_down"
+x = -115
+y = 20
+[[step]]
+action = "move"
+x = -23
+y = 20
+[[step]]
+action = "mouse_up"
+x = -23
+y = 20
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "cancel-over-close"
+method = "print"
+[[step]]
+action = "mouse_down"
+x = 60
+y = 24
+[[step]]
+action = "move"
+x = -115
+y = 20
+[[step]]
+action = "mouse_up"
+x = -115
+y = 20
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "drag-end-over-minimize"
+method = "print"
+[[step]]
+action = "click"
+x = 700
+y = 20
+count = 2
+[[step]]
+action = "sleep"
+seconds = 0.3
+[[step]]
+action = "capture"
+name = "caption-double-click-maximized"
+[[step]]
+action = "click"
+x = 700
+y = 20
+count = 2
+[[step]]
+action = "sleep"
+seconds = 0.3
+[[step]]
+action = "capture"
+name = "caption-double-click-restored"
+[[step]]
+action = "click"
+x = 60
+y = 24
+count = 2
+[[step]]
+action = "capture"
+name = "tab-double-click-rename"
+what = "all"
