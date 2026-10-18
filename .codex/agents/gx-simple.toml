@@ -1,7 +1,7 @@
 name = "gx_simple"
 description = "GX 边界明确的小功能、测试夹具、文档和系统验证。"
-model = "claude-opus-5-5"
-model_reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+model_reasoning_effort = "max"
 
 developer_instructions = """
 只作为当前对话的原生子智能体工作，provider 与认证沿用主会话；不创建独立对话或后台 CLI 会话，不自行替换模型。
