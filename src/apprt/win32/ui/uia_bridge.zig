@@ -606,6 +606,14 @@ pub const PopupBridge = struct {
     /// announces once raised. A new snapshot refuses the older ones.
     pending: [max_selection_events]PendingSelection = undefined,
     pending_count: usize = 0,
+    /// This show of the popup, from its first publication to `hide`. A
+    /// dispatch holds it across its UIA call, which may reenter the GUI
+    /// thread, and touches the bridge again only while it lives.
+    session: ?*Session = null,
+    /// What the events being raised right now announce (`dispatchFocusChanged`,
+    /// `dispatchSelected`), taken before their UIA call: a publication that
+    /// reenters the call counts them as announced.
+    raising: Raising = .{},
 
     /// A GUI model edit invalidates all pending index-based actions immediately.
     /// The owning widget schedules publish after its new model/layout is ready.
@@ -626,6 +634,12 @@ pub const PopupBridge = struct {
         self.focus_reported = null;
         self.selection = null;
         self.announced = .{};
+        self.raising = .{};
+        if (self.session) |session| {
+            self.session = null;
+            session.live = false;
+            session.release();
+        }
     }
     pub fn deinit(self: *PopupBridge) void {
         self.hide();
@@ -655,6 +669,7 @@ pub const PopupBridge = struct {
             if (node.patterns.window) node.window_interaction_state = 3;
         };
         if (self.focus_only) return self.moveFocusTo(attachment, hwnd, effective[0..nodes.len], tokens, keys, callbacks);
+        if (self.session == null) self.session = try Session.create();
         try self.publisher.publish(std.heap.page_allocator, api, queue, attachment, hwnd, effective[0..nodes.len]);
         @memcpy(self.tokens[0..tokens.len], tokens);
         @memcpy(self.keys[0..keys.len], keys);
@@ -673,8 +688,10 @@ pub const PopupBridge = struct {
     /// publication: also when the event of that selection was queued for a
     /// snapshot that this republication revoked before the message loop
     /// raised it. A selection that moved back to the announced item queues
-    /// nothing. A container that just appeared only records its selection:
-    /// its appearance is no selection change.
+    /// nothing; one whose event is being raised right now (a publication
+    /// reentering `dispatchSelected`) counts as announced. A container that
+    /// just appeared only records its selection: its appearance is no
+    /// selection change.
     fn trackSelection(self: *PopupBridge, nodes: []const uia.NodeSpec, keys: []const u64) void {
         var current: Selection = .{};
         var announced: Selection = .{};
@@ -685,8 +702,9 @@ pub const PopupBridge = struct {
             const pair: Selection.Pair = .{ .container = identity(keys[container], nodes[container]), .item = identity(key, node) };
             current.add(pair);
             const shown = if (self.selection) |previous| previous.item(pair.container) else null;
-            const last = if (shown) |item| self.announced.item(pair.container) orelse item else pair.item;
-            announced.add(.{ .container = pair.container, .item = last });
+            const recorded = if (shown) |item| self.announced.item(pair.container) orelse item else pair.item;
+            announced.add(.{ .container = pair.container, .item = recorded });
+            const last = if (shown != null) self.raisingItem(pair.container) orelse recorded else recorded;
             if (last == pair.item or self.pending_count == max_selection_events) continue;
             if (self.publisher.queueSelected(node.id)) {
                 self.pending[self.pending_count] = .{ .node_id = node.id, .pair = pair };
@@ -695,6 +713,11 @@ pub const PopupBridge = struct {
         }
         self.selection = current;
         self.announced = announced;
+    }
+    /// The item of `container` whose ElementSelected is being raised right now.
+    fn raisingItem(self: *const PopupBridge, container: u64) ?u64 {
+        const raising = self.raising.selection orelse return null;
+        return if (raising.container == container) raising.item else null;
     }
     /// The identity of the node the snapshot gives the focus: the first one
     /// marked focused, as `uia.Snapshot` takes it.
@@ -713,6 +736,9 @@ pub const PopupBridge = struct {
             return;
         };
         if (self.focus_reported) |reported| if (reported == focused) return;
+        // The element whose event is being raised right now (a publication
+        // reentering `dispatchFocusChanged`) counts as reported.
+        if (self.raising.focus) |raising| if (raising == focused) return;
         if (new_snapshot) _ = self.publisher.queueFocusChanged();
     }
     /// A focus-only rebuild (`focus_only`). When its specs describe the
@@ -763,24 +789,49 @@ pub const PopupBridge = struct {
     }
     /// An ElementSelected event of the current snapshot (`trackSelection`),
     /// raised here from the message loop, outside locks, like a focus
-    /// change: no widget callback, nothing revoked. Raised, its selection
-    /// counts as announced: a republication keeping it queues nothing.
+    /// change: no widget callback, nothing revoked. What it announces is
+    /// taken before the UIA call, from the pending events of the snapshot
+    /// that accepted it. The call may reenter the GUI thread (a sent message
+    /// republishing, hiding or destroying the popup): a publication there
+    /// counts that selection as announced, and afterwards the bridge is
+    /// touched only while the session held across the call lives. Raised,
+    /// that selection, never a newer snapshot's, counts as announced.
     fn dispatchSelected(self: *PopupBridge, action: *const uia.Action) bool {
+        const session = self.session orelse return false;
+        const pair: ?Selection.Pair = for (self.pending[0..self.pending_count]) |entry| {
+            if (entry.node_id == action.node_id) break entry.pair;
+        } else null;
+        const outer = self.raising.selection;
+        session.retain();
+        defer session.release();
+        self.raising.selection = pair;
         const raised = self.publisher.raiseSelected(action.node_id);
-        if (raised) for (self.pending[0..self.pending_count]) |entry| {
-            if (entry.node_id == action.node_id) self.announced.set(entry.pair);
-        };
         if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_selected snapshot={d} node={d} raised={}", .{ action.snapshot_id, action.node_id, raised });
+        if (!session.live) return raised;
+        self.raising.selection = outer;
+        if (raised) if (pair) |done| self.announced.set(done);
         return raised;
     }
     /// A focus changed event of the current snapshot (queued by
     /// `Publisher.moveFocus` or `trackFocus`), raised here from the message
-    /// loop, outside locks: no widget callback, nothing revoked. Raised while
-    /// its node still has the focus, that element counts as reported.
+    /// loop, outside locks: no widget callback, nothing revoked. The element
+    /// it announces is taken before the UIA call; as for `dispatchSelected`,
+    /// a publication reentering the call counts it as reported, and the
+    /// bridge is touched afterwards only while its session lives. Raised
+    /// while its node had the focus, that element counts as reported, unless
+    /// the focus left every element during the call: then the next one is.
     fn dispatchFocusChanged(self: *PopupBridge, action: *const uia.Action) bool {
+        const session = self.session orelse return false;
+        const key = self.focus_key;
+        const outer = self.raising.focus;
+        session.retain();
+        defer session.release();
+        self.raising.focus = key;
         const raised = self.publisher.raiseFocusChanged(action.node_id);
-        if (raised) self.focus_reported = self.focus_key;
         if (@import("../remote_test.zig").enabled()) std.log.scoped(.win32_uia).info("fixture_uia_focus snapshot={d} node={d} raised={}", .{ action.snapshot_id, action.node_id, raised });
+        if (!session.live) return raised;
+        self.raising.focus = outer;
+        if (raised and self.focus_key != null) self.focus_reported = key;
         return raised;
     }
     fn dispatchPrepared(self: *PopupBridge, callbacks: PopupCallbacks, token: u64, action: *const uia.Action) bool {
@@ -1656,6 +1707,301 @@ test "popup ElementSelected survives republications before the message loop rais
     try testing.expectEqual(@as(usize, 3), Recorder.raised);
 }
 
+/// Tests: popup bridges over a real message-only queue whose UIA raise
+/// (`api.event`) records each event and may run one reentrant action inside
+/// it, as a sent message the GUI thread handles while UIA raises would
+/// (A3 review-round4-fix.md).
+const ReentryProbe = struct {
+    var senders: [8]*uia.Face = undefined;
+    var events: [8]i32 = undefined;
+    var raised: usize = 0;
+    var reenter: ?*const fn () void = null;
+    fn raise(face: *uia.Face, event: i32) callconv(.winapi) i32 {
+        if (raised == senders.len) return -1;
+        senders[raised] = face;
+        events[raised] = event;
+        raised += 1;
+        if (reenter) |hook| {
+            reenter = null;
+            hook();
+        }
+        return 0;
+    }
+    fn reset() void {
+        raised = 0;
+        reenter = null;
+    }
+    const Step = enum { empty, refused, dispatched };
+    /// The App message loop's part for one queued action (`Registry.dispatch`):
+    /// dispatched only if the current snapshot accepts it. Nothing of
+    /// `bridge` is read after the dispatch, which may have freed it.
+    fn one(queue: *uia.Queue, bridge: *PopupBridge) !Step {
+        const value = queue.pop() orelse return .empty;
+        var queued = value;
+        defer queued.deinit();
+        if (!bridge.publisher.accepts(queued)) return .refused;
+        switch (queued.kind) {
+            .focus_changed => _ = bridge.dispatchFocusChanged(&queued),
+            .element_selected => _ = bridge.dispatchSelected(&queued),
+            else => return error.UnexpectedAction,
+        }
+        return .dispatched;
+    }
+    /// Every queued action (`one`); returns how many were refused.
+    fn all(queue: *uia.Queue, bridge: *PopupBridge) !usize {
+        var refused: usize = 0;
+        while (true) switch (try one(queue, bridge)) {
+            .empty => return refused,
+            .refused => refused += 1,
+            .dispatched => {},
+        };
+    }
+    /// Drop whatever is queued without reading any bridge.
+    fn drain(queue: *uia.Queue) void {
+        while (queue.pop()) |value| {
+            var queued = value;
+            queued.deinit();
+        }
+    }
+    fn widgetLive(_: *anyopaque) bool {
+        return true;
+    }
+    fn widgetAction(_: *anyopaque, _: u64, _: *const uia.Action) bool {
+        return true;
+    }
+    const result_tokens = [_]u64{ 0, 1, 10, 11, 12 };
+    /// A palette's results: three rows named `names`, row `choice` selected.
+    fn results(names: [3][]const u8, choice: usize) [5]uia.NodeSpec {
+        return .{
+            .{ .id = 1, .name = "Command Palette", .role = .window, .patterns = .{ .window = true } },
+            .{ .id = 2, .parent = 0, .name = "Results", .role = .list, .patterns = .{ .selection = true } },
+            .{ .id = 3, .parent = 1, .name = names[0], .role = .list_item, .patterns = .{ .selection_item = true }, .selected = choice == 0 },
+            .{ .id = 4, .parent = 1, .name = names[1], .role = .list_item, .patterns = .{ .selection_item = true }, .selected = choice == 1 },
+            .{ .id = 5, .parent = 1, .name = names[2], .role = .list_item, .patterns = .{ .selection_item = true }, .selected = choice == 2 },
+        };
+    }
+    const button_tokens = [_]u64{ 0, 1, 2, 3 };
+    /// A dialog's three buttons, `focus` with the keyboard focus.
+    fn buttons(focus: usize) [4]uia.NodeSpec {
+        return .{
+            .{ .id = 1, .name = "Dialog", .role = .window, .patterns = .{ .window = true } },
+            .{ .id = 2, .parent = 0, .name = "Allow", .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = focus == 0 },
+            .{ .id = 3, .parent = 0, .name = "Deny", .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = focus == 1 },
+            .{ .id = 4, .parent = 0, .name = "Cancel", .role = .button, .patterns = .{ .invoke = true }, .focusable = true, .focused = focus == 2 },
+        };
+    }
+    const commands = [3][]const u8{ "Split Right", "Split Left", "Split Down" };
+    const filtered = [3][]const u8{ "Split Up", "Split Below", "Split Above" };
+    /// What the reentrant hooks publish on: the test's bridge and its queue.
+    const Target = struct {
+        var bridge: *PopupBridge = undefined;
+        var api: *uia.Api = undefined;
+        var queue: *uia.Queue = undefined;
+        const attachment: refs.Attachment = .{
+            .object = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+            .owner = .{ .epoch = 1, .kind = .window, .id = 1, .generation = 1 },
+            .revision = 1,
+        };
+        var context: u8 = 0;
+        fn callbacks() PopupCallbacks {
+            return .{ .context = &context, .is_live = widgetLive, .action = widgetAction };
+        }
+        /// The widget republishes its results (a model change).
+        fn list(names: [3][]const u8, choice: usize) !void {
+            bridge.dirty();
+            try bridge.publish(api, queue, attachment, @ptrFromInt(1), &results(names, choice), &result_tokens, callbacks());
+        }
+        /// The widget republishes its buttons, `focus` focused.
+        fn dialog(focus: usize) !void {
+            bridge.dirty();
+            try bridge.publish(api, queue, attachment, @ptrFromInt(1), &buttons(focus), &button_tokens, callbacks());
+        }
+        fn refilter() void {
+            list(filtered, 1) catch unreachable;
+        }
+        fn focusCancel() void {
+            dialog(2) catch unreachable;
+        }
+        fn hide() void {
+            bridge.hide();
+        }
+        fn destroy() void {
+            bridge.deinit();
+            std.heap.page_allocator.destroy(bridge);
+        }
+    };
+};
+
+test "popup selection dispatch records what it raised when a publication reenters its UIA call" {
+    // A3 review-round4-fix.md (severe): UIA may reenter the GUI thread while
+    // `dispatchSelected` raises ElementSelected, and a publication there may
+    // give the same node another selection, queueing its own event. The
+    // dispatch records what it raised, never that newer selection: when a
+    // second republication revokes the newer event before the loop raises
+    // it, the newer selection is queued again and heard.
+    const testing = std.testing;
+    const Probe = ReentryProbe;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const sink = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer {
+        var drained: w32.MSG = undefined;
+        while (w32.PeekMessageW(&drained, sink, 0, 0, w32.PM_REMOVE) != 0) {}
+        _ = w32.DestroyWindow(sink);
+    }
+    Probe.reset();
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = Probe.raise;
+    api.notification = null;
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = sink };
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    defer queue.close();
+    defer Probe.drain(&queue);
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+    Probe.Target.bridge = &bridge;
+    Probe.Target.api = &api;
+    Probe.Target.queue = &queue;
+
+    try Probe.Target.list(Probe.commands, 0);
+    try Probe.Target.list(Probe.commands, 1);
+    // Split Left is raised; typing during the call refilters, and the
+    // selected row now shows Split Below, whose event is queued.
+    Probe.reenter = Probe.Target.refilter;
+    try testing.expectEqual(Probe.Step.dispatched, try Probe.one(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 1), Probe.raised);
+    // Republished before the loop raises it: that event is refused, and the
+    // newest snapshot queues Split Below again.
+    try Probe.Target.list(Probe.filtered, 1);
+    const newest = bridge.publisher.current.?;
+    try testing.expectEqual(@as(usize, 1), try Probe.all(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 2), Probe.raised);
+    try testing.expectEqual(&newest.nodes[3].faces[0], Probe.senders[1]);
+    // Announced: republished unchanged, nothing more.
+    try Probe.Target.list(Probe.filtered, 1);
+    try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 2), Probe.raised);
+}
+
+test "popup focus dispatch records what it raised when a publication reenters its UIA call" {
+    // The focus changed event has the same hazard as the selection one
+    // (A3 review-round4-fix.md): a publication reentering its UIA call moves
+    // the focus on and queues that element's event; the dispatch records the
+    // element it raised, so that event revoked by one more republication is
+    // queued again.
+    const testing = std.testing;
+    const Probe = ReentryProbe;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const sink = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer {
+        var drained: w32.MSG = undefined;
+        while (w32.PeekMessageW(&drained, sink, 0, 0, w32.PM_REMOVE) != 0) {}
+        _ = w32.DestroyWindow(sink);
+    }
+    Probe.reset();
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = Probe.raise;
+    api.notification = null;
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = sink };
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    defer queue.close();
+    defer Probe.drain(&queue);
+    var bridge: PopupBridge = .{};
+    defer bridge.deinit();
+    Probe.Target.bridge = &bridge;
+    Probe.Target.api = &api;
+    Probe.Target.queue = &queue;
+
+    // Shown with Allow focused: heard.
+    try Probe.Target.dialog(0);
+    try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 1), Probe.raised);
+    // Deny is raised; during the call the focus moves on to Cancel.
+    try Probe.Target.dialog(1);
+    Probe.reenter = Probe.Target.focusCancel;
+    try testing.expectEqual(Probe.Step.dispatched, try Probe.one(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 2), Probe.raised);
+    // Republished before the loop raises Cancel's event: refused, and the
+    // newest snapshot queues Cancel again.
+    try Probe.Target.dialog(2);
+    const newest = bridge.publisher.current.?;
+    try testing.expectEqual(@as(usize, 1), try Probe.all(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 3), Probe.raised);
+    try testing.expectEqual(&newest.nodes[3].faces[0], Probe.senders[2]);
+    try testing.expectEqual(@as(i32, 20005), Probe.events[2]);
+    // Reported: republished unchanged, nothing more.
+    try Probe.Target.dialog(2);
+    try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+    try testing.expectEqual(@as(usize, 3), Probe.raised);
+}
+
+test "popup dispatch touches nothing of a bridge hidden or freed during its UIA call" {
+    // A3 review-round4-fix.md: UIA may reenter while the event is raised and
+    // hide the popup, or let its owner free the bridge. The dispatch then
+    // touches nothing of it: a hidden popup's next show starts afresh, and a
+    // freed bridge (page memory, unmapped when freed) is never read again.
+    const testing = std.testing;
+    const Probe = ReentryProbe;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const sink = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer {
+        var drained: w32.MSG = undefined;
+        while (w32.PeekMessageW(&drained, sink, 0, 0, w32.PM_REMOVE) != 0) {}
+        _ = w32.DestroyWindow(sink);
+    }
+    Probe.reset();
+    var api: uia.Api = undefined;
+    api.count = .init(1);
+    api.event = Probe.raise;
+    api.notification = null;
+    defer testing.expectEqual(@as(usize, 1), api.count.load(.acquire)) catch unreachable;
+    var queue: uia.Queue = .{ .alloc = testing.allocator, .hwnd = sink };
+    defer testing.expectEqual(@as(usize, 1), queue.refs_count.load(.acquire)) catch unreachable;
+    defer queue.close();
+    defer Probe.drain(&queue);
+    Probe.Target.api = &api;
+    Probe.Target.queue = &queue;
+
+    // Hidden while ElementSelected is raised: shown again, what it shows is
+    // no change, and a move from there is heard.
+    {
+        var bridge: PopupBridge = .{};
+        defer bridge.deinit();
+        Probe.Target.bridge = &bridge;
+        try Probe.Target.list(Probe.commands, 0);
+        try Probe.Target.list(Probe.commands, 1);
+        Probe.reenter = Probe.Target.hide;
+        try testing.expectEqual(Probe.Step.dispatched, try Probe.one(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 1), Probe.raised);
+        try Probe.Target.list(Probe.commands, 2);
+        try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 1), Probe.raised);
+        try Probe.Target.list(Probe.commands, 0);
+        try testing.expectEqual(@as(usize, 0), try Probe.all(&queue, &bridge));
+        try testing.expectEqual(@as(usize, 2), Probe.raised);
+    }
+    // Freed while ElementSelected is raised, then while a focus event is.
+    for ([_]bool{ false, true }) |focus| {
+        const bridge = try std.heap.page_allocator.create(PopupBridge);
+        bridge.* = .{};
+        Probe.Target.bridge = bridge;
+        if (focus) {
+            try Probe.Target.dialog(0);
+        } else {
+            try Probe.Target.list(Probe.commands, 0);
+            try Probe.Target.list(Probe.commands, 1);
+        }
+        const before = Probe.raised;
+        Probe.reenter = Probe.Target.destroy;
+        try testing.expectEqual(Probe.Step.dispatched, try Probe.one(&queue, bridge));
+        try testing.expectEqual(before + 1, Probe.raised);
+        Probe.drain(&queue);
+    }
+}
+
 test "settings focus keys follow the hit target, not its position" {
     const Section = enum { general, appearance };
     const Step = enum { minus, plus };
@@ -1814,6 +2160,31 @@ const Selection = struct {
 };
 /// An ElementSelected event queued for the current snapshot's node `node_id`.
 const PendingSelection = struct { node_id: u64, pair: Selection.Pair };
+/// GUI-thread lifetime of one show of a popup's announcements, from its first
+/// publication to `PopupBridge.hide` (which unregistration and deinit run
+/// before the owner frees the bridge). A dispatch holds a reference across
+/// its UIA call; once the session is dead it touches nothing of the bridge.
+const Session = struct {
+    live: bool = true,
+    refs: u32 = 1,
+    fn create() !*Session {
+        const session = try std.heap.page_allocator.create(Session);
+        session.* = .{};
+        return session;
+    }
+    fn retain(self: *Session) void {
+        self.refs += 1;
+    }
+    fn release(self: *Session) void {
+        self.refs -= 1;
+        if (self.refs == 0) std.heap.page_allocator.destroy(self);
+    }
+};
+/// The focus and selection identities of the events being raised.
+const Raising = struct {
+    focus: ?u64 = null,
+    selection: ?Selection.Pair = null,
+};
 const max_selection_events = 4;
 /// The nearest ancestor with the Selection pattern, as UIA's SelectionContainer.
 fn selectionContainer(nodes: []const uia.NodeSpec, node: uia.NodeSpec) ?usize {
