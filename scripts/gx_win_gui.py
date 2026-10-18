@@ -50,7 +50,7 @@ env, args, requires, side_effects and expect, and [[step]] tables, each an actio
   dpi value                             ime_off                          cancel_mode [terminal]
   gpu_reset [terminal]                  assert_responsive [timeout]      resize width height
   wait_terminals count [timeout window] wait_popup [cls timeout present new]
-  close [timeout]                       file path text (a file inside the isolated profile)
+  close [timeout]                       file path [text directory readonly]  (see below)
   backdrop [color enabled reason]       switch the privacy backdrop for the following steps
   simulate_d2d_failure [window]         the window's title bar acts as if Direct2D failed and falls
                                         back to the system caption (WM_USER+0x4C to that GhosttyWindow;
@@ -60,6 +60,14 @@ env, args, requires, side_effects and expect, and [[step]] tables, each an actio
                                         without touching the Windows settings (WM_USER+0x49, wparam
                                         App.SimulatedSystemTheme); follow/follow returns to the system
 A failed step stops the scenario; buttons a mouse_down step left pressed are released at the end.
+
+file: path is relative to the isolated profile and must stay inside it. text writes the file (UTF-8,
+LF); directory = true creates the directory; readonly = true|false protects or releases the path.
+A read-only file gets the read-only attribute; a directory, whose attribute Windows ignores for
+writes, gets an inheritable ACL entry denying the current user WD, AD, WEA, WA and DC (no new files or
+subdirectories, no writes or deletions inside, reading still works). Both are probed with a write
+attempt after being set and after being released; whatever is still read-only when the scenario
+ends or fails is released (run.json: readonly).
 
 Privacy backdrop: a scenario covers the work areas of the monitors its instance's windows are on
 with a solid window (backdrop = "#rrggbb", default #000000) right under the lowest of those
@@ -111,6 +119,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -726,6 +735,13 @@ class Win32:
         declare(k, "CreateToolhelp32Snapshot", wt.HANDLE, wt.DWORD, wt.DWORD)
         declare(k, "Process32FirstW", wt.BOOL, wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
         declare(k, "Process32NextW", wt.BOOL, wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        declare(k, "GetCurrentProcess", wt.HANDLE)
+        declare(k, "LocalFree", wt.HLOCAL, wt.HLOCAL)
+        self.advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        declare(self.advapi32, "OpenProcessToken", wt.BOOL, wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE))
+        declare(self.advapi32, "GetTokenInformation", wt.BOOL, wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD,
+                ctypes.POINTER(wt.DWORD))
+        declare(self.advapi32, "ConvertSidToStringSidW", wt.BOOL, ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR))
         self._enable_dpi_awareness()
 
     def _enable_dpi_awareness(self) -> None:
@@ -814,6 +830,28 @@ class Win32:
         finally:
             self.CloseHandle(snapshot)
         return children
+
+    def current_user_sid(self) -> str:
+        """The string SID of the user this process runs as (TokenUser)."""
+        token = self.wt.HANDLE()
+        if not self.OpenProcessToken(self.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+            raise GuiError(f"OpenProcessToken failed (error {ctypes.get_last_error()})")
+        try:
+            size = self.wt.DWORD(0)
+            self.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
+            buffer = ctypes.create_string_buffer(size.value)
+            if not size.value or not self.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
+                raise GuiError(f"GetTokenInformation failed (error {ctypes.get_last_error()})")
+            sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]  # TOKEN_USER.User.Sid
+            text = self.wt.LPWSTR()
+            if not self.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+                raise GuiError(f"ConvertSidToStringSidW failed (error {ctypes.get_last_error()})")
+            try:
+                return text.value or ""
+            finally:
+                self.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        finally:
+            self.CloseHandle(token)
 
     # -- windows -----------------------------------------------------------
 
@@ -1895,6 +1933,105 @@ def launch(exe: Path, env_dir: Path, *, config: str | None = None, env: Mapping[
     return Instance(process.pid, str(exe.resolve()), env_dir.resolve(), creation, launched)
 
 
+def run_icacls(args: Sequence[str]) -> tuple[int, str]:
+    result = subprocess.run(["icacls", *args], capture_output=True, timeout=60, check=False)
+    output = (result.stdout + result.stderr).decode("mbcs" if sys.platform == "win32" else "utf-8", errors="replace")
+    return result.returncode, output.strip()
+
+
+def write_probe(path: Path) -> bool:
+    """Whether the current user may write `path`: append to a file (writing nothing), or create and
+    delete a probe file in a directory."""
+    try:
+        if path.is_dir():
+            probe = path / f".gx-win-gui-probe-{os.getpid()}-{time.time_ns()}"
+            with probe.open("xb"):
+                pass
+            probe.unlink()
+        else:
+            with path.open("ab"):
+                pass
+    except PermissionError:
+        return False
+    except OSError as exc:
+        raise GuiError(f"the write probe of {path} failed: {exc}") from None
+    return True
+
+
+class ReadOnlyPaths:
+    """Files and directories file steps made read-only, released again at the end of the scenario.
+
+    acl runs icacls with arguments and answers (exit code, output); sid gives the current user's SID;
+    probe answers whether the current user may write a path. All three can be replaced for tests."""
+
+    DENY = "(OI)(CI)(WD,AD,WEA,WA,DC)"
+
+    def __init__(self, acl: Callable[[Sequence[str]], tuple[int, str]] | None = None,
+                 sid: Callable[[], str] | None = None, probe: Callable[[Path], bool] | None = None) -> None:
+        self.acl = acl or run_icacls
+        self.sid = sid or (lambda: win32().current_user_sid())
+        self.probe = probe or write_probe
+        self.paths: dict[Path, str] = {}  # path -> "attribute" or "acl", in the order they were protected
+        self.events: list[dict[str, Any]] = []
+
+    def _icacls(self, *args: str) -> None:
+        code, output = self.acl(list(args))
+        if code != 0:
+            raise GuiError(f"icacls {' '.join(args)} failed ({code}): {output}")
+
+    def protect(self, path: Path, label: str) -> str:
+        if path in self.paths:
+            return f"{label} is read-only already"
+        if not path.exists():
+            raise GuiError(f"{label} does not exist; write it (text) or create it (directory = true) first")
+        if path.is_dir():
+            method = "acl"
+            self._icacls(str(path), "/deny", f"*{self.sid()}:{self.DENY}")
+        else:
+            method = "attribute"
+            try:
+                os.chmod(path, stat.S_IREAD)
+            except OSError as exc:
+                raise GuiError(f"cannot make {label} read-only: {exc}") from None
+        self.paths[path] = method
+        if self.probe(path):
+            self.release(path, label)
+            raise GuiError(f"{label} is still writable after making it read-only ({method}); released it again")
+        self.events.append({"event": "readonly", "path": label, "method": method, "probe": "write refused"})
+        return f"{label} is read-only ({method}; a write attempt was refused)"
+
+    def release(self, path: Path, label: str) -> str:
+        method = self.paths.pop(path, None) or ("acl" if path.is_dir() else "attribute")
+        how = method
+        if method == "acl":
+            self._icacls(str(path), "/remove:d", f"*{self.sid()}")
+            if not self.probe(path):
+                self._icacls(str(path), "/reset", "/T", "/C")  # back to the inherited entries only
+                how = "acl, reset"
+        else:
+            try:
+                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            except OSError as exc:
+                self.paths[path] = method
+                raise GuiError(f"cannot make {label} writable again: {exc}") from None
+        if not self.probe(path):
+            self.paths[path] = method
+            raise GuiError(f"{label} is still not writable after releasing it ({how})")
+        self.events.append({"event": "writable", "path": label, "method": how, "probe": "write allowed"})
+        return f"{label} is writable again ({how})"
+
+    def release_all(self, root: Path) -> list[str]:
+        """Release every path still protected, newest first; never raises."""
+        results = []
+        for path in reversed(list(self.paths)):
+            label = str(path.relative_to(root)) if root in path.parents else str(path)
+            try:
+                results.append(self.release(path, label))
+            except Exception as exc:  # noqa: BLE001 - cleanup goes on; the failure is evidence
+                results.append(f"{label}: release failed: {exc}")
+        return results
+
+
 # ---------------------------------------------------------------------------
 # Scenarios
 # ---------------------------------------------------------------------------
@@ -1931,7 +2068,7 @@ ACTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "wait_popup": (frozenset(), frozenset(("cls", "timeout", "present", "new"))),
     "resize": (frozenset(("width", "height")), frozenset()),
     "close": (frozenset(), frozenset(("timeout",))),
-    "file": (frozenset(("path", "text")), frozenset()),
+    "file": (frozenset(("path",)), frozenset(("text", "directory", "readonly"))),
     "backdrop": (frozenset(), frozenset(("color", "enabled", "reason"))),
     "simulate_d2d_failure": (frozenset(), frozenset(("window",))),
     "simulate_system_theme": (frozenset(), frozenset(("scheme", "high_contrast"))),
@@ -2032,6 +2169,17 @@ def validate_step(where: str, raw: Mapping[str, Any]) -> Step:
             raise UsageError(f"{where}: a backdrop that is off has no color")
         if "color" in params:
             parse_color(params["color"])
+    if action == "file":
+        if not params.keys() & {"text", "directory", "readonly"}:
+            raise UsageError(f"{where}: file needs text, directory = true or readonly")
+        if "text" in params and "directory" in params:
+            raise UsageError(f"{where}: file takes text or directory, not both")
+        if "directory" in params and params["directory"] is not True:
+            raise UsageError(f"{where}: file directory only takes true")
+        if "readonly" in params and not isinstance(params["readonly"], bool):
+            raise UsageError(f"{where}: file readonly must be true or false")
+        if "text" in params and not isinstance(params["text"], str):
+            raise UsageError(f"{where}: file text must be a string")
     if action == "simulate_system_theme":
         try:
             system_theme_wparam(params.get("scheme", "follow"), params.get("high_contrast", "follow"))
@@ -2148,6 +2296,7 @@ class ScenarioRun:
         self.held_buttons: list[str] = []  # pressed by mouse_down, not yet released by mouse_up
         self.backdrop = (Backdrop(scenario.backdrop, scenario.backdrop_reason) if scenario is not None
                          else Backdrop(None, "no scenario"))
+        self.readonly = ReadOnlyPaths()
 
     # -- addressing -----------------------------------------------------------
 
@@ -2421,9 +2570,23 @@ class ScenarioRun:
         path = (root / p["path"]).resolve()
         if root not in path.parents:
             raise UsageError(f"file path {p['path']!r} must stay inside the isolated profile")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(p["text"], encoding="utf-8", newline="\n")
-        return str(path.relative_to(root))
+        label = str(path.relative_to(root))
+        done = []
+        try:
+            if "text" in p:
+                if path in self.readonly.paths:
+                    raise GuiError(f"{label} is read-only from an earlier step; set readonly = false first")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(p["text"], encoding="utf-8", newline="\n")
+                done.append(f"{label} written")
+            if p.get("directory"):
+                path.mkdir(parents=True, exist_ok=True)
+                done.append(f"{label} is a directory")
+        except OSError as exc:  # for example inside a directory an earlier step made read-only
+            raise GuiError(f"cannot write {label}: {exc}") from None
+        if "readonly" in p:
+            done.append(self.readonly.protect(path, label) if p["readonly"] else self.readonly.release(path, label))
+        return "; ".join(done)
 
     def do_backdrop(self, p):
         if not p.get("enabled", True):
@@ -2482,6 +2645,10 @@ class ScenarioRun:
                 elif self.instance is not None:
                     self.instance.save()
                     report["closed"] = f"kept open; stop with: gx_win_gui.py stop {env_dir}"
+                # After the close, so a shutdown that writes into a read-only path still meets it.
+                released = self.readonly.release_all(env_dir.resolve())
+                if self.readonly.events or released:
+                    report["readonly"] = {"events": self.readonly.events, "released_at_end": released}
                 if self.clipboard_changed:
                     try:
                         win32().set_clipboard_text(self.saved_clipboard or "")

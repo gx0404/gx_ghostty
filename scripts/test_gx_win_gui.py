@@ -450,6 +450,9 @@ class FakeWin32:
     def work_area(self, hwnd):
         return (0, 0, 1000, 800)
 
+    def current_user_sid(self):
+        return "S-1-5-21-1"
+
     def send_message(self, hwnd, message, wparam=0, lparam=0, timeout_ms=5000):
         self.messages.append((hwnd, message, wparam, lparam))
         answer = self.answers.get(message)
@@ -793,6 +796,158 @@ class TestHookTests(unittest.TestCase):
         run.instance.simulate_d2d_failure.return_value = 0b1000
         self.assertIn("0b1000", run.do_simulate_d2d_failure({"window": "quick"}))
         run.instance.simulate_d2d_failure.assert_called_once_with("quick")
+
+
+class FakeAcl:
+    """Stands in for icacls: remembers which directories deny the user; probe() reads that state
+    (and a file's write bit), so nothing depends on the platform or on running as root."""
+
+    def __init__(self, deny_works=True, remove_works=True, reset_works=True, log=None):
+        self.deny_works, self.remove_works, self.reset_works = deny_works, remove_works, reset_works
+        self.calls = log if log is not None else []
+        self.denied: set = set()
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        path, verb = args[0], args[1]
+        if verb == "/deny" and self.deny_works:
+            self.denied.add(path)
+        elif (verb == "/remove:d" and self.remove_works) or (verb == "/reset" and self.reset_works):
+            self.denied.discard(path)
+        return 0, "Successfully processed 1 files"
+
+    def probe(self, path):
+        if path.is_dir():
+            return str(path) not in self.denied
+        return bool(path.stat().st_mode & gui.stat.S_IWRITE)
+
+
+class ReadOnlyTests(unittest.TestCase):
+    SID = "S-1-5-21-1"
+
+    def paths(self, acl):
+        return gui.ReadOnlyPaths(acl=acl, sid=lambda: self.SID, probe=acl.probe)
+
+    def test_file_step_validation(self):
+        for raw in ({"path": "a", "text": ""}, {"path": "d", "directory": True}, {"path": "d", "readonly": False},
+                    {"path": "d", "directory": True, "readonly": True}, {"path": "a", "text": "x", "readonly": True}):
+            with self.subTest(raw=raw):
+                self.assertEqual("file", gui.validate_step("s", {"action": "file", **raw}).action)
+        cases = {"needs text, directory = true or readonly": {"path": "a"},
+                 "text or directory, not both": {"path": "a", "text": "", "directory": True},
+                 "directory only takes true": {"path": "a", "directory": False},
+                 "readonly must be true or false": {"path": "a", "readonly": "yes"},
+                 "text must be a string": {"path": "a", "text": 1}}
+        for expected, raw in cases.items():
+            with self.subTest(case=expected), self.assertRaisesRegex(gui.UsageError, expected):
+                gui.validate_step("s", {"action": "file", **raw})
+
+    def test_a_directory_gets_an_inheritable_deny_entry_and_is_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "state"
+            directory.mkdir()
+            acl = FakeAcl()
+            paths = self.paths(acl)
+            self.assertEqual("state is read-only (acl; a write attempt was refused)", paths.protect(directory, "state"))
+            self.assertEqual([[str(directory), "/deny", f"*{self.SID}:(OI)(CI)(WD,AD,WEA,WA,DC)"]], acl.calls)
+            self.assertEqual({directory: "acl"}, paths.paths)
+            self.assertEqual("state is read-only already", paths.protect(directory, "state"))
+            self.assertEqual("state is writable again (acl)", paths.release(directory, "state"))
+            self.assertEqual([str(directory), "/remove:d", f"*{self.SID}"], acl.calls[-1])
+            self.assertEqual({}, paths.paths)
+            self.assertEqual(["readonly", "writable"], [event["event"] for event in paths.events])
+
+    def test_a_deny_entry_without_effect_is_undone_and_fails_the_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            acl = FakeAcl(deny_works=False)
+            paths = self.paths(acl)
+            with self.assertRaisesRegex(gui.GuiError, r"still writable after making it read-only \(acl\)"):
+                paths.protect(directory, "state")
+            self.assertEqual(["/deny", "/remove:d"], [call[1] for call in acl.calls])
+            self.assertEqual({}, paths.paths)
+
+    def test_release_falls_back_to_reset_and_reports_what_stays_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "state"
+            directory.mkdir()
+            acl = FakeAcl(remove_works=False)
+            paths = self.paths(acl)
+            paths.protect(directory, "state")
+            self.assertEqual("state is writable again (acl, reset)", paths.release(directory, "state"))
+            self.assertEqual([str(directory), "/reset", "/T", "/C"], acl.calls[-1])
+            acl = FakeAcl(remove_works=False, reset_works=False)
+            paths = self.paths(acl)
+            paths.protect(directory, "state")
+            with self.assertRaisesRegex(gui.GuiError, r"still not writable after releasing it \(acl, reset\)"):
+                paths.release(directory, "state")
+            self.assertIn(directory, paths.paths)
+            self.assertEqual(["state: release failed: state is still not writable after releasing it (acl, reset)"],
+                             paths.release_all(Path(tmp)))
+            acl.reset_works = True
+            self.assertEqual(["state is writable again (acl, reset)"], paths.release_all(Path(tmp)))
+            self.assertEqual({}, paths.paths)
+
+    def test_a_file_gets_the_read_only_attribute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.json"
+            path.write_text("{}", encoding="utf-8")
+            acl = FakeAcl()
+            paths = self.paths(acl)
+            self.assertIn("(attribute;", paths.protect(path, "session.json"))
+            self.assertFalse(path.stat().st_mode & gui.stat.S_IWRITE)
+            self.assertEqual("session.json is writable again (attribute)", paths.release(path, "session.json"))
+            self.assertTrue(path.stat().st_mode & gui.stat.S_IWRITE)
+            self.assertEqual([], acl.calls)
+            with self.assertRaisesRegex(gui.GuiError, "does not exist"):
+                paths.protect(Path(tmp) / "absent", "absent")
+
+    def test_file_steps_inside_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "env"
+            env.mkdir()
+            run = gui.ScenarioRun(None, Path("ghostty.exe"), Path(tmp))  # type: ignore[arg-type]
+            run.instance = mock.Mock(spec=gui.Instance)
+            run.instance.env_dir = env
+            acl = FakeAcl()
+            run.readonly = self.paths(acl)
+            state = os.path.join("state", "ghostty")
+            self.assertEqual(f"{state} is a directory; {state} is read-only (acl; a write attempt was refused)",
+                             run.do_file({"path": "state/ghostty", "directory": True, "readonly": True}))
+            with self.assertRaisesRegex(gui.GuiError, "read-only from an earlier step"):
+                run.do_file({"path": "state/ghostty", "text": "x"})
+            with mock.patch.object(gui.Path, "write_text", side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(gui.GuiError, r"cannot write state.ghostty.s.json: denied"):
+                    run.do_file({"path": "state/ghostty/s.json", "text": "{}"})
+            self.assertEqual("a.txt written", run.do_file({"path": "a.txt", "text": "x"}))
+            with self.assertRaises(gui.UsageError):
+                run.do_file({"path": "../outside", "readonly": True})
+
+    def test_a_scenario_releases_what_it_left_read_only_after_closing_the_instance(self):
+        log: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "W90-ro.toml"
+            path.write_text('id = "W90"\ntitle = "t"\nconfig = "language = en"\nbackdrop = false\n'
+                            'backdrop_reason = "fake capture"\n[[step]]\naction = "file"\npath = "state"\n'
+                            'directory = true\nreadonly = true\n[[step]]\naction = "capture"\nname = "x"\n',
+                            encoding="utf-8")
+            acl = FakeAcl(log=log)
+            with mock.patch.object(gui, "run_icacls", acl), mock.patch.object(gui, "write_probe", acl.probe):
+                run = gui.ScenarioRun(gui.load_scenario(path), Path("ghostty.exe"), Path(tmp) / "out")
+            instance = mock.Mock()
+            instance.env_dir = (Path(tmp) / "out" / "env").resolve()
+            instance.log = Path(tmp) / "absent.log"
+            instance.popups.return_value = []
+            instance.capture_window.return_value.save_png.side_effect = lambda target: target
+            instance.close.side_effect = lambda: log.append("close") or "closed"
+            with mock.patch.object(gui, "launch", return_value=instance), \
+                    mock.patch.object(gui, "win32", return_value=FakeWin32(4242, 4242)), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                report = run.run()
+        self.assertEqual("ok", report["status"])
+        self.assertEqual(["/deny", "close", "/remove:d"], [entry if entry == "close" else entry[1] for entry in log])
+        self.assertEqual(["state is writable again (acl)"], report["readonly"]["released_at_end"])
+        self.assertEqual(["readonly", "writable"], [event["event"] for event in report["readonly"]["events"]])
 
 
 class ScenarioReleaseTests(unittest.TestCase):
@@ -1140,6 +1295,9 @@ class Win32StructureTests(unittest.TestCase):
         backend = gui.win32()
         self.assertEqual(40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28, ctypes.sizeof(backend.INPUT))
         self.assertEqual(4, len(backend.virtual_screen()))
+
+    def test_current_user_sid(self):
+        self.assertRegex(gui.win32().current_user_sid(), r"^S-1-5-\d+(-\d+)+$")
 
     def test_backdrop_window_structures_match_the_platform(self):
         import ctypes
