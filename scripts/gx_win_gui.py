@@ -32,7 +32,7 @@ Session commands drive one instance whose state is ENV_DIR/session.json:
   d2d-failure ENV_DIR [--quick]     test hook WM_GHOSTTY_SIMULATE_D2D_FAILURE (WM_USER+0x4C)
   system-theme ENV_DIR [--scheme follow|light|dark] [--high-contrast follow|on|off]
                                     test hook WM_GHOSTTY_SIMULATE_SYSTEM_THEME (WM_USER+0x49)
-  ime-off ENV_DIR                   ask the window's thread to switch to the US layout
+  ime-off ENV_DIR                   switch the window's thread to a loaded US layout (never loads one)
   layout ENV_DIR [HKL|KLID] [--allow-load] [--list]
                                     switch the window's thread to a keyboard layout (see Keyboard
                                     layouts); without one, or with --list, print the loaded layouts
@@ -2000,16 +2000,19 @@ class Instance:
             raise GuiError("the terminal did not answer WM_GHOSTTY_SIMULATE_GPU_RESET")
 
     def ime_off(self) -> str:
+        """Switch the window's thread to a loaded English (US) layout, so an IME such as Microsoft Pinyin
+        does not take the keys of the following steps. Like layout it never loads one (see Keyboard
+        layouts); the previous layout is restored at stop or at the end of the scenario."""
         w = win32()
         window = self.require_window()
         if w.keyboard_layout(window.hwnd) & 0xFFFF == 0x0409:
             return "already US"
-        w.request_us_layout(window.hwnd)
-        for _ in range(100):
-            if w.keyboard_layout(window.hwnd) & 0xFFFF == 0x0409:
-                return "switched to US"
-            time.sleep(0.01)
-        return f"layout is still {w.keyboard_layout(window.hwnd):#010x}"
+        us = [hkl for hkl in w.keyboard_layouts() if hkl & 0xFFFF == 0x0409]
+        if not us:
+            raise GuiError("no English (US) keyboard layout is loaded for this user (GetKeyboardLayoutList); "
+                           "ime_off does not load one: add English (US) to the user's languages or run in the VM")
+        result = self.switch_layout(hkl_text(us[0]), strict=False)
+        return result if result.startswith("layout is still") else f"switched to US ({result})"
 
     def switch_layout(self, target: str, *, allow_load: bool = False, strict: bool = True) -> str:
         """Switch the window's thread to the keyboard layout `target` (see Keyboard layouts). Only a

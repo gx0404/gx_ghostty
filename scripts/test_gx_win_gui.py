@@ -1224,6 +1224,19 @@ class LayoutTests(unittest.TestCase):
         self.fake.alive = False
         self.assertEqual("not switched back to 0x08040804: the instance is gone", self.instance.restore_layout())
 
+    def test_ime_off_only_switches_to_a_loaded_us_layout(self):
+        self.assertEqual("switched to US (keyboard layout 0x08040804 -> 0x04090409)", self.instance.ime_off())
+        self.assertEqual(([0x04090409], 0x08040804), (self.fake.requests, self.instance.original_layout))
+        self.assertEqual("already US", self.instance.ime_off())
+        self.fake.layout, self.fake.layouts, self.fake.requests = 0x08040804, [0x08040804], []
+        with self.assertRaisesRegex(gui.GuiError, "no English \\(US\\) keyboard layout is loaded.*does not load one"):
+            self.instance.ime_off()
+        self.assertEqual(([], []), (self.fake.requests, self.fake.loaded))
+        self.fake.layouts, self.fake.layout_follows = [0x08040804, 0x04090409], False
+        clock = iter(range(100))
+        with mock.patch.object(gui.time, "monotonic", side_effect=lambda: next(clock)):
+            self.assertEqual("layout is still 0x08040804", self.instance.ime_off())
+
     def test_the_step_the_run_cleanup_order_and_the_session(self):
         self.assertEqual("layout", gui.validate_step("s", {"action": "layout", "target": "0x08040804"}).action)
         for raw in ({}, {"target": "german"}, {"target": "00000407", "allow_load": True}):
