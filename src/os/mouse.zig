@@ -20,30 +20,10 @@ pub fn clickInterval() ?u32 {
             break :macos ms;
         },
 
-        // fork(gx): GX-0048 begin: Windows reports the user's double-click time
-        .windows => windows: {
-            const ms = gxWindowsDoubleClickTime();
-            break :windows if (ms == 0) null else ms;
-        },
+        // fork(gx): GX-0048 begin: Windows reads the double-click time of the mouse settings
+        .windows => @import("../gx/os_mouse.zig").doubleClickTime(),
         // fork(gx): GX-0048 end
 
         else => null,
     };
 }
-
-// fork(gx): GX-0048 begin: the Windows mouse setting, and a test that the
-// configured default follows it.
-fn gxWindowsDoubleClickTime() u32 {
-    const user32 = struct {
-        extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;
-    };
-    return user32.GetDoubleClickTime();
-}
-
-test "gx clickInterval follows the Windows double-click time" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-    const system = gxWindowsDoubleClickTime();
-    try std.testing.expect(system != 0);
-    try std.testing.expectEqual(@as(?u32, system), clickInterval());
-}
-// fork(gx): GX-0048 end

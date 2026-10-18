@@ -2597,7 +2597,9 @@ keybind: Keybinds = .{},
 // fork(gx): GX-0048 Windows also takes the default from the OS setting
 /// use a platform-specific default. The default on macOS and Windows is
 /// determined by the OS settings (on Windows, the double-click speed of the
-/// mouse settings). On every other platform it is 500ms.
+/// mouse settings), read when the configuration loads: reload the
+/// configuration after changing the OS setting. On every other platform it
+/// is 500ms.
 @"click-repeat-interval": u32 = 0,
 
 /// Additional configuration files to read. This configuration can be repeated
