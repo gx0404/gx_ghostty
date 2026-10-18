@@ -3291,11 +3291,15 @@ fn fixtureMessage(self: *Window, enabled: bool, message: u32, field: usize, argu
             6 => {
                 if (self.tab_count == 0) return 0;
                 const tree = &self.tab_trees[self.active_tab];
+                const before = tree.zoomed;
                 if (argument < 0) tree.zoom(null) else {
                     const index: usize = @intCast(argument);
                     if (index >= tree.nodes.len or tree.nodes[index] != .leaf) return 0;
                     tree.zoom(@enumFromInt(index));
                 }
+                // Same follow-up as toggleSplitZoom: without it the tab bar kept a
+                // stale zoom marker in fixture screenshots (round3 MIG-02/MIG-03).
+                if (!std.meta.eql(before, tree.zoomed)) self.onTabZoomChanged(self.active_tab);
                 self.relayout();
             },
             7 => {
