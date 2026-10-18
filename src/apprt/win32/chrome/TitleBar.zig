@@ -466,6 +466,14 @@ pub fn handleMessage(
             }
             return null;
         },
+        w32.WM_LBUTTONDBLCLK => {
+            // Windows reports a quick second press as a double click,
+            // even when the first press was cancelled outside the button.
+            // Leave tabs and the empty caption to their existing handlers.
+            const pt = lparamPoint(lparam);
+            const hit = self.hitTest(self.layout(), pt.x, pt.y);
+            return if (self.routeButtons(.{ .msg = msg, .hit = hit }).consumed) 0 else null;
+        },
         w32.WM_RBUTTONUP => {
             // Minimize and close are client input, but still ignore right
             // clicks as they did as caption buttons (no tab menu).
@@ -664,6 +672,9 @@ const ButtonInput = struct {
             },
             WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK => fx = self.press(ncHitOf(m.wparam)),
             w32.WM_LBUTTONDOWN => fx = self.press(m.hit),
+            w32.WM_LBUTTONDBLCLK => {
+                if (buttonOf(m.hit) != .none) fx = self.press(m.hit);
+            },
             WM_NCLBUTTONUP => fx = self.release(ncHitOf(m.wparam)),
             w32.WM_LBUTTONUP => fx = self.release(m.hit),
             w32.WM_MOUSEMOVE => {
@@ -2007,6 +2018,35 @@ const TestPointer = struct {
         return self.input.route(.{ .msg = msg, .wparam = @intCast(code) }, self.ctx);
     }
 };
+
+test "client button double click after a cancelled press performs exactly once" {
+    const testing = std.testing;
+    for ([_]Hit{ TestPointer.minimize, TestPointer.close, TestPointer.menu }) |hit| {
+        var p: TestPointer = .{};
+        _ = p.send(w32.WM_LBUTTONDOWN, hit);
+        _ = p.send(w32.WM_MOUSEMOVE, .caption);
+        try testing.expectEqual(Button.none, p.send(w32.WM_LBUTTONUP, .caption).perform);
+        _ = p.send(w32.WM_CAPTURECHANGED, .none);
+        const down = p.send(w32.WM_LBUTTONDBLCLK, hit);
+        try testing.expect(down.consumed);
+        try testing.expectEqual(ButtonInput.Capture.take, down.capture);
+        try testing.expectEqual(Button.none, down.perform);
+        try testing.expectEqual(buttonOf(hit), p.send(w32.WM_LBUTTONUP, hit).perform);
+        _ = p.send(w32.WM_CAPTURECHANGED, .none);
+        try testing.expectEqual(Button.none, p.send(w32.WM_LBUTTONUP, hit).perform);
+    }
+}
+
+test "double clicks outside title bar buttons keep their default routing" {
+    for ([_]Hit{ .none, .caption, .tabs }) |hit| {
+        var p: TestPointer = .{};
+        const fx = p.send(w32.WM_LBUTTONDBLCLK, hit);
+        try std.testing.expectEqual(ButtonInput.Effects{}, fx);
+        try std.testing.expectEqual(ButtonInput{}, p.input);
+    }
+    var p: TestPointer = .{};
+    try std.testing.expect(!p.nc(WM_NCLBUTTONDBLCLK, HTCAPTION).consumed);
+}
 
 test "maximize hovers, presses and performs through non-client messages" {
     const testing = std.testing;
