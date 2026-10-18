@@ -618,6 +618,23 @@ class CiWorkflowTests(unittest.TestCase):
                        "Join-Path $env:LOCALAPPDATA 'ghostty\\logs\\ghostty.log'", "System.Drawing", "Stop-Process"):
             self.assertIn(needle, script)
 
+    def test_windows_app_checks_validate_config_exit_codes_on_every_stdout(self):
+        job_steps = steps(CI.job("windows-app"))
+        names = [field(step, "name", 8) for step in job_steps]
+        check = names.index("validate-config exit codes with stdout on a pipe, a file and NUL")
+        build = next(index for index, step in enumerate(job_steps) if WIN32_BUILD in "\n".join(step))
+        tests = next(index for index, step in enumerate(job_steps)
+                     if FILTERED_TEST_COMMANDS["windows-app"] in "\n".join(step))
+        self.assertLess(build, check)
+        self.assertLess(check, tests)
+        self.assertIsNone(field(job_steps[check], "if", 8))
+        script = run_scripts(job_steps[check])[0]
+        for needle in ("+validate-config", "$null = cmd /c $command", "> NUL", "out.txt",
+                       "@{ Config = $valid; Want = 0 }", "@{ Config = $invalid; Want = 1 }",
+                       "$env:LOCALAPPDATA = $dir", "$env:XDG_CONFIG_HOME = $dir"):
+            self.assertIn(needle, script)
+        self.assertEqual(script.count("if ($LASTEXITCODE -ne $case.Want) { throw"), 3)
+
     def test_only_release_assets_use_the_gx_artifact_prefix_that_verify_downloads(self):
         for name, job in RELEASE.jobs().items():
             for step in steps(job):
