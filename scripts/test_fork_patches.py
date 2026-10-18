@@ -1549,6 +1549,29 @@ class Gx0043ReadbackTests(unittest.TestCase):
         self.assertTrue(any("only then log" in p for p in problems), problems)
 
 
+class Gx0048ShapeTests(unittest.TestCase):
+    def test_windows_click_interval_stays_a_default_only(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for rel in ("src/os/mouse.zig", "src/config/Config.zig"):
+            self.assertIn(Patch("GX-0048", rel, "fork(gx): GX-0048", "active"), patches)
+        mouse = (ROOT / "src/os/mouse.zig").read_text(encoding="utf-8")
+        stripped, hunks = marked_hunks(mouse, "GX-0048")
+        self.assertEqual(len(hunks), 1)
+        self.assertIn('.windows => @import("../gx/os_mouse.zig").doubleClickTime(),', mouse)
+        self.assertNotIn("GetDoubleClickTime", mouse)
+        upstream, reason = merged_upstream_text(ROOT, "src/os/mouse.zig")
+        if upstream is not None:
+            self.assertEqual(stripped.replace("\r\n", "\n"), upstream)
+        helper = (ROOT / "src/gx/os_mouse.zig").read_text(encoding="utf-8")
+        # The OS value is clamped so the core's u32 nanoseconds cannot overflow.
+        self.assertIn("pub const max_ms: u32 = std.math.maxInt(u32) / std.time.ns_per_ms;", helper)
+        self.assertIn("return @min(ms, max_ms);", helper)
+        config = (ROOT / "src/config/Config.zig").read_text(encoding="utf-8")
+        # Only the zero default consults the OS; an explicit value still wins.
+        self.assertIn('if (self.@"click-repeat-interval" == 0 and', config)
+        self.assertIn("internal_os.clickInterval() orelse 500;", config)
+
+
 class Gx0046ShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

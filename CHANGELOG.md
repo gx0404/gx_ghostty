@@ -30,6 +30,7 @@
 
 ### Changed
 
+- Windows 上 `click-repeat-interval` 为 0（默认）时，双击与三击的判定间隔改用系统鼠标设置里的双击速度（以前固定 500 ms；改了系统设置后重载配置生效）；显式设置的值仍然优先，写 `click-repeat-interval = 500` 可恢复以前的行为。
 - Windows 标签页标题：`set_tab_title` 与双击改名设的名字不再被程序标题（OSC 0/2）冲掉，改名留空或 `set_tab_title:`（空值）即恢复显示程序标题；标签页显示其中聚焦分屏的标题，切换分屏时随之更新。
 - Windows 子进程退出：只有命令启动即失败（在 `abnormal-command-exit-runtime` 内以非零码退出）时才在窗口底部显示「命令失败」提示，它不抢焦点、不阻塞窗口，在该终端按任意键关闭终端（以前是模态对话框）；正常退出不再提示，终端里显示 “Process exited…”，再按 `wait-after-command` 决定是否关闭（与 Linux、macOS 版一致）。
 - Windows 切换标签页：`goto_tab:N` 从 1 计数、超出标签数时到最后一个（以前差一，`goto_tab:1` 跳到第 2 个）；目标已是当前标签时，带 `performable` 的按键（如默认的 Alt+9 `last_tab`）交给 shell；`move_tab` 改为移动当前标签（以前只是切换过去）。

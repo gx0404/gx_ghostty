@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0047）之后的号。在册的 41 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0047，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020 与 GX-0025 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0048）之后的号。在册的 42 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026～GX-0048，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -121,6 +121,8 @@
 | GX-0047 | `src/shell-integration/zsh/ghostty-integration` | `fork(gx): GX-0047` | active |
 | GX-0047 | `src/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish` | `fork(gx): GX-0047` | active |
 | GX-0047 | `src/shell-integration/elvish/lib/ghostty-integration.elv` | `fork(gx): GX-0047` | active |
+| GX-0048 | `src/config/Config.zig` | `fork(gx): GX-0048` | active |
+| GX-0048 | `src/os/mouse.zig` | `fork(gx): GX-0048` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1463,3 +1465,12 @@ python -m unittest scripts.test_fork_patches -v
 - 验证边界：fish、elvish、shellcheck 未安装，语法与运行均 PENDING；Windows 同配置终端、macOS 未验证。
 - 同步：更新上游脚本时先取上游主体，再加回 `cursor:config` 的识别；zsh 保持“仅 emacs 绑定发 0”的判断，fish 保留上游 vi 守卫。上游若改变 cursor 记号格式，`advertise` 找不到 cursor 记号就不追加（静默退回上游行为），需同步其单测。
 - 移除条件：上游提供等价的“提示符复位到配置”且保持 DECSCUSR、`no-cursor` 与 vi 语义时，删除全部 GX-0047 标记与改动（Config 文档按块内保留的上游原文恢复），`gx-prompt-cursor` 按键兼容规则处理；若用户否决新默认，把 `gx-prompt-cursor` 默认改为 `bar` 即恢复上游可见行为。七行改为 removed，保留本节历史。
+
+## GX-0048 Windows 双击间隔跟随系统设置
+
+- 文件：`src/os/mouse.zig`（`clickInterval` 的 switch 里一个 begin/end 块，块内只有 `.windows` 一行，转调 fork 路径 `src/gx/os_mouse.zig::doubleClickTime`）、`src/config/Config.zig`（`click-repeat-interval` 的文档注释，单行标记）；active，未回馈上游。
+- 原因：上游只在 macOS 读系统双击间隔，其他平台在 `click-repeat-interval = 0`（默认）时固定 500 ms。Windows 的双击间隔是用户在鼠标设置里调的值（宿主实测 480 ms）；C3 实验在 Win11 VM 把系统值设为 300 ms 后，400 ms 间隔的两次单击被 Ghostty 判为双击（选中整词），系统自己判为两次单击，两者不一致（证据 `.local/evidence/R5/execution-20261013/final-r3/vm-r6/c3/`）。
+- 行为：Windows 上 `clickInterval` 返回 `GetDoubleClickTime()` 的毫秒数；系统返回 0 时退回上游的 500 ms；上限 4294 ms（核心把它乘以 1_000_000 存进 `u32` 纳秒，而系统允许设到 5000 ms）。只在配置值为 0 时由 `Config.finalize` 取用，用户显式设置的 `click-repeat-interval` 仍然优先，不改系统设置。值在加载配置时读取，改了系统设置要重载配置才生效。其他平台不变。这是默认值改动：空配置下 Windows 的双击判定间隔由固定 500 ms 改为跟随系统（系统保持默认 500 ms 的用户没有变化），想恢复旧行为写 `click-repeat-interval = 500`。
+- 同步：保持只在默认值 0 时取系统值；上游若为 Windows 实现同样的读取，删除本补丁。
+- 移除条件：上游在 `src/os/mouse.zig` 原生支持 Windows 双击间隔后，删除块与 `src/gx/os_mouse.zig`，登记改为 removed。
+- 验证：`just test --filter gx.os_mouse`（0 值与上限的纯函数用例；Windows 上断言与 `GetDoubleClickTime`、`clickInterval` 一致）；`python scripts/run_unittests.py test_fork_patches`（`Gx0048ShapeTests` 锁定块的位置与内容、剥离后等于上游原文、只在 0 值时取系统值）；最终构建上在 VM 内复验系统 300 ms 时 400 ms 间隔判为两次单击、用户设 350 ms 时 325 ms 间隔判为双击，复验前保持 PENDING。
