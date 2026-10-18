@@ -116,5 +116,30 @@ class UiaProbeTests(unittest.TestCase):
             probe.physical_coordinates(user)
 
 
+class StaleActionTests(unittest.TestCase):
+    """round3-batch-20261018-112356 UIA-02: GetCurrentPattern on a hidden
+    palette's retained element answered S_OK with no pattern, so the expected
+    UIA_E_ELEMENTNOTAVAILABLE never surfaced at that call."""
+    UNAVAILABLE = 0x80040201 - (1 << 32)
+
+    def test_an_error_from_get_current_pattern_decides_without_a_followup(self):
+        followup = mock.Mock()
+        self.assertEqual(self.UNAVAILABLE, probe.stale_action_hresult(self.UNAVAILABLE, False, followup))
+        followup.assert_not_called()
+
+    def test_a_returned_pattern_goes_on_to_the_action_call(self):
+        followup = mock.Mock()
+        self.assertIsNone(probe.stale_action_hresult(0, True, followup))
+        followup.assert_not_called()
+
+    def test_no_pattern_with_s_ok_is_decided_by_the_providers_own_property_answer(self):
+        followup = mock.Mock(return_value=self.UNAVAILABLE)
+        self.assertEqual(self.UNAVAILABLE, probe.stale_action_hresult(0, False, followup))
+        followup.assert_called_once_with()
+
+    def test_a_stale_element_that_still_answers_is_not_inert(self):
+        self.assertEqual(0, probe.stale_action_hresult(0, False, mock.Mock(return_value=0)))
+
+
 if __name__ == '__main__':
     unittest.main()

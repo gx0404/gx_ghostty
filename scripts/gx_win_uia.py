@@ -49,6 +49,19 @@ def physical_coordinates(user):
         raise RuntimeError("cannot establish per-monitor-v2 UIA client coordinates")
 
 
+def stale_action_hresult(hr, has_pattern, followup):
+    """For an expect_unavailable action: the HRESULT that decides it, or None to
+    go on to the action call. A failed GetCurrentPattern decides at once. UIA
+    core can answer S_OK with no pattern for a hidden provider's retained element
+    (round3-batch-20261018-112356 UIA-02) without surfacing the provider's error;
+    then the provider's own answer to a property read (followup) decides."""
+    if hr < 0:
+        return hr
+    if has_pattern:
+        return None
+    return followup()
+
+
 def read_plan(path):
     if path is None:
         return []
@@ -215,6 +228,15 @@ def run_worker(args) -> dict:
                     raise RuntimeError("process executable digest changed")
         finally:
             kernel.CloseHandle(handle)
+
+    def raw_property_hresult(element, property_id):
+        """GetCurrentPropertyValue's own HRESULT, without raising (stale checks)."""
+        value = Variant()
+        stage("action.stale_property", "IUIAutomationElement.GetCurrentPropertyValue", property_id=property_id)
+        hr = method(element, 10, HRESULT, C.c_int, C.POINTER(Variant))(element, property_id, C.byref(value))
+        aut.VariantClear(C.byref(value))
+        diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
+        return hr
 
     def property_value(element, property_id):
         value = Variant()
@@ -411,8 +433,14 @@ def run_worker(args) -> dict:
                       pattern_id=pattern_id, action_index=len(action_results), property_id=None)
                 hr = method(elements[0], 16, HRESULT, C.c_int, C.POINTER(pointer))(elements[0], pattern_id, C.byref(pattern))
                 diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
+                lookup = {"pattern_hresult": diagnostic["hresult"], "pattern_returned": bool(pattern)}
                 try:
-                    if hr >= 0 and pattern:
+                    decided = None
+                    if action.get("expect_unavailable"):
+                        decided = stale_action_hresult(hr, bool(pattern), lambda: raw_property_hresult(elements[0], 30005))
+                    if decided is not None:
+                        hr, lookup["decided_by"] = decided, diagnostic["call"]
+                    elif hr >= 0 and pattern:
                         operation = operations[action["operation"]]
                         call_name = {"invoke": "Invoke", "select": "Select", "add": "AddToSelection", "remove": "RemoveFromSelection",
                                      "set": "SetValue", "toggle": "Toggle", "expand": "Expand", "collapse": "Collapse"}[action["operation"]]
@@ -424,7 +452,8 @@ def run_worker(args) -> dict:
                     elif hr >= 0:
                         raise RuntimeError("pattern disappeared without an unavailable HRESULT")
                     result = {"action": action, "hresult": f"0x{hr & 0xffffffff:08x}", "thread": kernel.GetCurrentThreadId(),
-                              "stage": diagnostic["stage"], "call": diagnostic["call"], "node_id": diagnostic["node_id"], "pattern_id": pattern_id}
+                              "stage": diagnostic["stage"], "call": diagnostic["call"], "node_id": diagnostic["node_id"], "pattern_id": pattern_id,
+                              **lookup}
                     diagnostic["hresult"] = result["hresult"]
                     action_results.append(result)
                     if action.get("expect_unavailable"):
