@@ -477,6 +477,29 @@ class QuietBatchTests(unittest.TestCase):
         raw = json.loads((args.out / 'after.json').read_text())['checks']['input']['raw']
         self.assertEqual(('guards', False), (raw['mode'], raw['injected']))
 
+    def test_preflight_rejects_a_session_that_cannot_see_the_console_user(self):
+        import gx_slots
+        args = self.batch_args('--timeout', '14400')
+        self.probe.session.return_value = {'interactive_console': False, 'process_session': 2, 'active_console_session': 1}
+        runner = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(gx_slots, 'acquire', side_effect=AssertionError('waited for locks')):
+            exit_code, result = self.run_batch(args, runner)
+        self.assertEqual((2, 'NOT_STARTED', 'NOT_RUN', 'NOT_CHECKED'),
+                         (exit_code, result['status'], result['measurement'], result['quiet_status']))
+        self.assertIn('not in the active console session', ' '.join(result['errors']))
+        self.assertNotIn('preflight', result)
+        self.assertFalse((args.out / 'before.json').exists())
+        runner.assert_not_called()
+        self.probe.registered.assert_called_once_with('Ubuntu-24.04')
+        self.probe.input_ticks.assert_not_called()
+        # A failing session probe is a tool error too, still before any lock.
+        args.out = self.args.out.parent / 'session-error'
+        self.probe.session.side_effect = OSError('WTSGetActiveConsoleSessionId failed')
+        with mock.patch.object(gx_slots, 'acquire', side_effect=AssertionError('waited for locks')):
+            exit_code, result = self.run_batch(args, runner)
+        self.assertEqual((2, 'NOT_STARTED'), (exit_code, result['status']))
+        self.assertIn('WTSGetActiveConsoleSessionId failed', ' '.join(result['errors']))
+
     def test_exit_4_is_a_gate_fail_only_for_gx_perf_win32_drivers(self):
         commands = [  # (command, gate contract)
             (self.DRIVER, True),
