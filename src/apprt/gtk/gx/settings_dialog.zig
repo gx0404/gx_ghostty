@@ -22,6 +22,14 @@
 //! when it changes while the dialog is open. Without the Ghostty GX
 //! layers (`GHOSTTY_GX_DEFAULTS=0`) the overlay is not loaded, so the
 //! settings are shown but cannot be changed.
+//!
+//! Closing the dialog only takes it out of its window, which keeps it
+//! (`dialog_cache`) and presents it again at its next opening there, on
+//! the page a new dialog would start on and with the values of the
+//! configuration (P4). A configuration reload, a change of the UI
+//! language or of the theme, or the window going away puts it out of
+//! date, and the next opening builds a new one. One dialog shows at a
+//! time: opening it in another window closes the one shown.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -45,6 +53,7 @@ const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("../class/application.zig").Application;
 const open_perf = @import("open_perf.zig");
+const dialog_cache = @import("dialog_cache.zig");
 
 const settings_map = gx.settings_map;
 const msg = settings_map.msg;
@@ -133,8 +142,12 @@ const text = struct {
     pub const bell_audio_hint = "Set bell-audio-path in the configuration file to choose the sound.";
 };
 
-/// The open dialog, if any. Opening the settings again presents it.
+/// The dialog shown, if any. Opening the settings again in its window
+/// brings it to the front; opening them in another window closes it.
 var open_dialog: WeakRef(GxSettingsDialog) = .empty;
+
+/// The dialog each window keeps after it closed.
+const kept_dialogs = dialog_cache.Cache(GxSettingsDialog, "gx-settings-dialog");
 
 /// The page the dialog showed when it was last closed; the next opening
 /// starts there.
@@ -164,6 +177,29 @@ fn themeValue(
         .dark => .{ .light = light orelse name, .dark = name },
     };
     return try pair.value(alloc);
+}
+
+/// What a dialog shows of the configuration it was built with that only
+/// building it again updates: the UI language of its static text and the
+/// theme. A kept dialog opens again only while both are unchanged.
+const Built = struct {
+    lang: gx.i18n.Language,
+    theme: u64,
+
+    fn of(config: *const CoreConfig) Built {
+        return .{ .lang = gx.i18n.resolve(config.language), .theme = themeStamp(config.theme) };
+    }
+};
+
+/// A hash of a `theme` value: its light and its dark theme.
+fn themeStamp(theme: ?CoreConfig.Theme) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    if (theme) |value| {
+        hasher.update(value.light);
+        hasher.update(&.{0});
+        hasher.update(value.dark);
+    }
+    return hasher.final();
 }
 
 /// `command` without the `direct:` or `shell:` prefix that tells how it
@@ -403,6 +439,24 @@ pub const GxSettingsDialog = extern struct {
 
         /// The herdr executable, if herdr was detected.
         herdr: ?[:0]const u8 = null,
+
+        /// The window that keeps the dialog (`kept_dialogs`); none for a
+        /// dialog in a window of its own, which every opening builds anew.
+        owner: WeakRef(gtk.Window) = .empty,
+
+        /// Whether the dialog is presented: from opening until it closes.
+        shown: bool = false,
+
+        /// Set while `apply` updates the configuration, which tells the
+        /// dialog's own changes from a reload.
+        applying: bool = false,
+
+        /// Set by a configuration change the dialog did not make (a reload,
+        /// another settings UI): the next opening builds a new dialog.
+        stale: bool = false,
+
+        /// The UI language and theme the dialog was built with.
+        built: Built = .{ .lang = .default, .theme = 0 },
     };
 
     const Shell = struct {
@@ -435,7 +489,7 @@ pub const GxSettingsDialog = extern struct {
     }
 
     /// Like `show`, and shows `page` (`gx:settings_page:<page>`); without
-    /// a page, a new dialog starts on the page the last one was closed on.
+    /// a page, the dialog starts on the page the last one was closed on.
     pub fn showPage(app: *Application, page: ?settings_map.Page) void {
         var timing = open_perf.begin(.settings);
         if (!adw_version.supportsDialogs()) {
@@ -443,32 +497,110 @@ pub const GxSettingsDialog = extern struct {
             return;
         }
 
-        const parent: ?*gtk.Widget = if (app.as(gtk.Application).getActiveWindow()) |window|
-            window.as(gtk.Widget)
+        const window = app.as(gtk.Application).getActiveWindow();
+        const parent: ?*gtk.Widget = if (window) |value| value.as(gtk.Widget) else null;
+        const host: ?*gtk.Window = if (window) |value|
+            if (dialog_cache.hostsDialogs(value)) value else null
         else
             null;
 
-        if (open_dialog.get()) |dialog| {
-            defer dialog.unref();
-            open_perf.lap(&timing, .prepare);
-            if (page) |name| dialog.showSettingsPage(name);
-            open_perf.lap(&timing, .layout);
-            open_perf.watch(dialog.as(gtk.Widget), timing);
-            dialog.as(adw.Dialog).present(parent);
-            open_perf.presented(dialog.as(gtk.Widget), timing);
-            return;
+        if (open_dialog.get()) |shown| {
+            defer shown.unref();
+            if (shown.isShownIn(host)) {
+                open_perf.lap(&timing, .prepare);
+                if (page) |name| shown.showSettingsPage(name);
+                open_perf.lap(&timing, .layout);
+                open_perf.watch(shown.as(gtk.Widget), timing);
+                shown.as(adw.Dialog).present(parent);
+                open_perf.presented(shown.as(gtk.Widget), timing);
+                return;
+            }
+            shown.closeElsewhere();
         }
 
+        const config_obj = app.getConfig();
+        defer config_obj.unref();
+        const config = config_obj.get();
+        const reused: ?*Self = find: {
+            const value = host orelse break :find null;
+            const candidate = kept_dialogs.get(value) orelse break :find null;
+            const st = &candidate.private().state;
+            if (upToDate(st.built, st.stale, config)) break :find candidate;
+            kept_dialogs.drop(value);
+            break :find null;
+        };
         open_perf.lap(&timing, .prepare);
-        const dialog = gobject.ext.newInstance(Self, .{});
-        open_perf.lap(&timing, .create);
-        dialog.load(app);
-        if (page orelse last_page) |name| dialog.showSettingsPage(name);
+
+        const dialog: *Self = if (reused) |candidate| candidate else build: {
+            const created = gobject.ext.newInstance(Self, .{});
+            open_perf.lap(&timing, .create);
+            created.load(app);
+            if (page orelse last_page) |name| created.showSettingsPage(name);
+            if (host) |value| {
+                kept_dialogs.keep(value, created);
+                created.private().state.owner.set(value);
+            }
+            break :build created;
+        };
+        if (reused != null) dialog.reopen(config, page);
+        dialog.private().state.shown = true;
         open_dialog.set(dialog);
         open_perf.lap(&timing, .layout);
         open_perf.watch(dialog.as(gtk.Widget), timing);
         dialog.as(adw.Dialog).present(parent);
         open_perf.presented(dialog.as(gtk.Widget), timing);
+    }
+
+    /// Whether the dialog shows in `host`, the window that keeps it (null:
+    /// in a window of its own).
+    fn isShownIn(self: *Self, host: ?*gtk.Window) bool {
+        const owner = self.private().state.owner.get();
+        defer if (owner) |value| value.unref();
+        return owner == host;
+    }
+
+    /// Closes the dialog shown in another window, which saves its changes
+    /// first (a failed save keeps it open). A dialog whose window went away
+    /// is no longer shown.
+    fn closeElsewhere(self: *Self) void {
+        if (self.as(gtk.Widget).getRoot() == null) {
+            self.private().state.shown = false;
+            open_dialog.set(null);
+            return;
+        }
+        _ = self.as(adw.Dialog).close();
+    }
+
+    /// Whether a dialog built with `built` still shows what a new one would
+    /// show for `config`: no reload came since (`stale`), and neither the
+    /// UI language nor the theme changed.
+    fn upToDate(built: Built, stale: bool, config: *const CoreConfig) bool {
+        const now: Built = .of(config);
+        return !stale and built.lang == now.lang and built.theme == now.theme;
+    }
+
+    /// Shows a kept dialog again the way a new one opens: on `page` (else
+    /// the page the last dialog was closed on), without the theme list or a
+    /// toast, with the values of `config` (text typed and not applied goes),
+    /// scrolled to the top and with the first control focused. A failed
+    /// save keeps the dialog open, so a closed one has no changes to drop.
+    fn reopen(self: *Self, config: *const CoreConfig, page: ?settings_map.Page) void {
+        const priv = self.private();
+        self.dismissToast();
+        if (page orelse last_page) |name|
+            self.showSettingsPage(name)
+        else
+            _ = self.as(adw.PreferencesDialog).popSubpage();
+        self.syncValues(config, .{ .font_family = true });
+        for ([_]*adw.PreferencesPage{
+            priv.language_page,
+            priv.appearance_page,
+            priv.font_page,
+            priv.interaction_page,
+            priv.shell_page,
+            priv.about_page,
+        }) |preferences| preferences.scrollToTop();
+        self.as(adw.Dialog).setFocus(null);
     }
 
     /// Handles opening the configuration in the system editor (the
@@ -515,6 +647,7 @@ pub const GxSettingsDialog = extern struct {
         const config = config_obj.get();
 
         st.lang = gx.i18n.resolve(config.language);
+        st.built = .of(config);
         st.notifications = config.@"app-notifications";
         st.layered = gx.config_layers.enabled(st.alloc);
         if (st.layered) self.reloadLayers();
@@ -1529,7 +1662,12 @@ pub const GxSettingsDialog = extern struct {
             defer previous.unref();
             break :changed themeReloadChanged(previous.get(), &config);
         } else false;
-        app.core().updateConfig(app.rt(), &config) catch |err| {
+        const updated = updated: {
+            st.applying = true;
+            defer st.applying = false;
+            break :updated app.core().updateConfig(app.rt(), &config);
+        };
+        updated catch |err| {
             log.warn("cannot apply the configuration err={}", .{err});
             self.toastError(failed, err, st.apply_pending);
             config.deinit();
@@ -1566,10 +1704,15 @@ pub const GxSettingsDialog = extern struct {
         self.unref();
     }
 
-    /// Follows the zoom switch and UI language without overwriting pending edits.
+    /// Follows the zoom switch and UI language without overwriting pending
+    /// edits. A change the dialog did not make puts it out of date, so the
+    /// next opening builds a new one; a closed dialog leaves the rest to its
+    /// next opening.
     fn appConfigChanged(app: *Application, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
         const st = &self.private().state;
         if (st.disposed) return;
+        if (!st.applying) st.stale = true;
+        if (!st.shown) return;
         const config = app.getConfig();
         defer config.unref();
         if (st.changes.isEmpty() and !st.apply_pending) {
@@ -1969,9 +2112,10 @@ pub const GxSettingsDialog = extern struct {
         defer keep.unref();
         const st = &self.private().state;
         if (st.disposed) return;
+        st.shown = false;
 
-        // The next opening builds a new dialog, even while this one is
-        // kept alive by a timer or a running herdr.
+        // The window keeps the dialog (`kept_dialogs`) for its next
+        // opening; a timer or a running herdr may keep it alive meanwhile.
         if (open_dialog.get()) |dialog| {
             defer dialog.unref();
             if (dialog == self) open_dialog.set(null);
@@ -2353,6 +2497,7 @@ pub const GxSettingsDialog = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const st = &self.private().state;
         st.disposed = true;
+        st.owner.deinit();
         self.cancelPreview();
         if (st.save_source) |source| {
             st.save_source = null;
@@ -2816,6 +2961,35 @@ test "reverting after a failed theme save keeps the reverted theme out of later 
     try changes.set("cursor-style", "bar");
     try testing.expect(!GxSettingsDialog.dropThemeChange(&changes));
     try testing.expectEqual(@as(usize, 1), changes.entries.items.len);
+}
+
+test "a kept dialog opens again only while its language and theme stay and no reload came" {
+    const alloc = testing.allocator;
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    config.language = "en";
+    config.theme = .{ .light = "Light", .dark = "Dark" };
+    const built: Built = .of(&config);
+    try testing.expect(GxSettingsDialog.upToDate(built, false, &config));
+    // A reload, or another settings UI, came while it was closed.
+    try testing.expect(!GxSettingsDialog.upToDate(built, true, &config));
+
+    var other = try config.clone(alloc);
+    defer other.deinit();
+    other.theme = .{ .light = "Dark", .dark = "Light" };
+    try testing.expect(!GxSettingsDialog.upToDate(built, false, &other));
+    other.theme = null;
+    try testing.expect(!GxSettingsDialog.upToDate(built, false, &other));
+    other.theme = config.theme;
+    try testing.expect(GxSettingsDialog.upToDate(built, false, &other));
+    other.language = "zh-CN";
+    try testing.expect(!GxSettingsDialog.upToDate(built, false, &other));
+
+    // Other settings it shows are synced at the next opening instead.
+    other.language = config.language;
+    other.@"font-size" = 18;
+    try testing.expect(GxSettingsDialog.upToDate(built, false, &other));
+    try testing.expect(themeStamp(.{ .light = "ab", .dark = "c" }) != themeStamp(.{ .light = "a", .dark = "bc" }));
 }
 
 test "the dialog strings are translated" {
