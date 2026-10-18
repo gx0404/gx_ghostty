@@ -144,11 +144,11 @@ before_builds = builds()
 open_settings("ctrl+alt+t")
 xdo("mousemove", 550, 170, "click", 1)
 sleep(0.8)
-before_preview = log().count("info(gx_perf): theme.reload ")
+before_preview = log().count("info(gx_perf): metric theme.reload ")
 search_theme("GX Reopen Fixture")
 capture("13-new-theme-discovered")
 assert builds() == before_builds, "discovery should reuse the dialog"
-assert log().count("info(gx_perf): theme.reload ") > before_preview, "new theme was not listed and previewed"
+assert log().count("info(gx_perf): metric theme.reload ") > before_preview, "new theme was not listed and previewed"
 xdo("mousemove", 987, 59, "click", 1)
 sleep(0.8)
 capture("14-new-theme-preview-ended")
