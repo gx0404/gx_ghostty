@@ -281,6 +281,25 @@ def await_tree(read, predicate, record, clock, sleep):
         sleep(0.05)
 
 
+def widget_state(rows, kind):
+    """Identify the showing widget, not labels from unrelated tree branches.
+
+    GTK 4.14 exposes the GX popover as menu/Main Menu while some GMenu item
+    labels are absent from AT-SPI. The header's push/toggle button has the same
+    name, so a name-only match cannot prove an open menu. The caller supplies a
+    complete showing-only snapshot of the identified process, never a partial
+    tree; unrecognized widget roles remain unsupported rather than guessed.
+    """
+    targets = {"menu": ("menu", "Main Menu"), "settings": ("dialog", "Settings")}
+    if kind not in targets:
+        raise ValueError("unknown performance widget: " + kind)
+    role, name = targets[kind]
+    matches = [row for row in rows if row["role"] == role and row["name"] == name]
+    if len(matches) > 1:
+        raise ValueError("ambiguous showing performance widget: " + kind)
+    return bool(matches)
+
+
 def capture_session(api, identity, spec):
     """Self-contained Linux scenario; source is copied into the evidence script."""
     import ctypes
@@ -341,13 +360,6 @@ def capture_session(api, identity, spec):
         report["observations"].append(state)
         persist()
         return state
-
-    def widget_state(rows, kind):
-        if kind == "settings":
-            return any(r["role"] == "dialog" and r["name"] == "Settings" for r in rows)
-        # GX menu is a GTK popover; GTK versions differ in its accessible role.
-        names = {r["name"].replace("_", "").rstrip(".…") for r in rows}
-        return "New Tab" in names and "Quit" in names and "Keyboard Shortcuts" in names
 
     def await_widget(kind, opened):
         def unknown(attempt):
@@ -452,7 +464,7 @@ def capture_session(api, identity, spec):
 
 def scenario(spec: dict) -> str:
     receipt_program = gx_wsl.RECEIPT_PROGRAM.split("\ndef build_main(", 1)[0]
-    functions = (idle_ticks, accessibility_reader, gui_roundtrip, await_tree, capture_session)
+    functions = (idle_ticks, accessibility_reader, gui_roundtrip, await_tree, widget_state, capture_session)
     return ("# gx-scenario-python-v1\nPING_PROGRAM = " + repr(PING_PROGRAM) +
             "\nACCESS_PROGRAM = " + repr(ACCESS_PROGRAM) + "\n" +
             "\n".join(inspect.getsource(fn) for fn in functions) +

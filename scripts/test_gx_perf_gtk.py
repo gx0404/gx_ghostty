@@ -417,6 +417,44 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(glib.g_free.call_count, 3 if failure else 4)
 
 
+class WidgetStateTests(unittest.TestCase):
+    def test_gtk_414_main_menu_without_gmenu_item_labels(self):
+        # Observed in the complete p4-gtk-r7-20261019-03 AT-SPI snapshots:
+        # GMenu item labels are absent, but the showing menu object is named.
+        rows = [{"role": "frame", "name": "terminal"},
+                {"role": "toggle button", "name": "Main Menu"},
+                {"role": "menu", "name": "Main Menu"},
+                {"role": "push button", "name": "Reset Zoom"},
+                {"role": "push button", "name": "Find…"}]
+        self.assertTrue(gtk.widget_state(rows, "menu"))
+
+    def test_header_button_does_not_prove_open_menu(self):
+        self.assertFalse(gtk.widget_state([
+            {"role": "toggle button", "name": "Main Menu"},
+            {"role": "push button", "name": "Main Menu"}], "menu"))
+
+    def test_unrelated_labels_do_not_prove_open_menu(self):
+        self.assertFalse(gtk.widget_state([
+            {"role": "label", "name": name}
+            for name in ("New Tab", "Quit", "Keyboard Shortcuts")], "menu"))
+
+    def test_other_menu_does_not_prove_main_menu(self):
+        self.assertFalse(gtk.widget_state([
+            {"role": "menu", "name": "Launch Profiles and Splits"}], "menu"))
+
+    def test_ambiguous_widgets_are_unknown_not_closed(self):
+        for kind, role, name in (("menu", "menu", "Main Menu"),
+                                 ("settings", "dialog", "Settings")):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "ambiguous"):
+                gtk.widget_state([{"role": role, "name": name}] * 2, kind)
+
+    def test_settings_requires_dialog_and_unknown_kind_rejected(self):
+        self.assertTrue(gtk.widget_state([{"role": "dialog", "name": "Settings"}], "settings"))
+        self.assertFalse(gtk.widget_state([{"role": "push button", "name": "Settings"}], "settings"))
+        with self.assertRaises(ValueError):
+            gtk.widget_state([], "unknown")
+
+
 class DriverTests(unittest.TestCase):
     def test_probe_cost_does_not_accumulate(self):
         now = [100.0]
