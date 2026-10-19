@@ -370,10 +370,51 @@ class ProbeTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "partial_nodes"):
                             gtk.accessibility_snapshot(100)
                     else:
-                        self.assertEqual(gtk.accessibility_snapshot(100), [{"name": "main", "role": "frame"}])
+                        self.assertEqual(gtk.accessibility_snapshot(100), [
+                            {"name": "main", "role": "frame", "path": [0], "parent": None}])
                 if failure == "error":
                     glib.g_error_free.assert_called_once()
                 obj.g_object_unref.assert_any_call(1)
+
+    def test_snapshot_paths_keep_hidden_parent_and_release_on_failure(self):
+        import ctypes
+        # Desktop -> app -> hidden container -> two visible menu items.
+        tree = {1: [2], 2: [3], 3: [4, 5], 4: [], 5: []}
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                lib, glib, obj = Mock(), Mock(), Mock()
+                empty = ctypes.create_string_buffer(b"")
+                role = ctypes.create_string_buffer(b"menu item")
+                lib.atspi_init.return_value = 0
+                lib.atspi_get_desktop.return_value = 1
+                lib.atspi_accessible_get_child_count.side_effect = lambda n, e: len(tree[n])
+                lib.atspi_accessible_get_child_at_index.side_effect = lambda n, i, e: tree[n][i]
+                lib.atspi_accessible_get_process_id.return_value = 100
+                lib.atspi_accessible_get_state_set.side_effect = lambda n: n + 10
+                lib.atspi_state_set_contains.side_effect = lambda s, f: f == 25 and s in (14, 15)
+                def get_name(n, e):
+                    if failure and n == 5:
+                        ctypes.cast(e, ctypes.POINTER(ctypes.c_void_p))[0] = 42
+                    return ctypes.addressof(empty)
+                lib.atspi_accessible_get_name.side_effect = get_name
+                lib.atspi_accessible_get_name.__name__ = "get_name"
+                lib.atspi_accessible_get_role_name.return_value = ctypes.addressof(role)
+                expected = [{"name": "", "role": "menu item", "path": [0, 0, i],
+                             "parent": [0, 0]} for i in range(2)]
+                with patch("ctypes.CDLL", side_effect=[lib, glib, obj]):
+                    if failure:
+                        with self.assertRaises(ValueError) as raised:
+                            gtk.accessibility_snapshot(100)
+                        detail = json.loads(str(raised.exception))
+                        self.assertEqual(detail["partial_nodes"], expected[:1])
+                        self.assertIn("get_name", detail["error"])
+                        glib.g_error_free.assert_called_once()
+                    else:
+                        self.assertEqual(gtk.accessibility_snapshot(100), expected)
+                self.assertEqual([call.args[0] for call in lib.atspi_accessible_get_name.call_args_list], [4, 5])
+                self.assertCountEqual([call.args[0] for call in obj.g_object_unref.call_args_list],
+                                      [1, 2, 3, 4, 5, 12, 13, 14, 15])
+                self.assertEqual(glib.g_free.call_count, 3 if failure else 4)
 
 
 class DriverTests(unittest.TestCase):

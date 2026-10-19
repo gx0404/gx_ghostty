@@ -12,7 +12,21 @@ expect = [
   "caption-double-click-maximized: blank caption double-click maximizes the window",
   "caption-double-click-restored: second blank caption double-click restores the window",
   "tab-double-click-rename: rename editor opens",
+  "caption-tooltip-restore: in the existing maximized state, the middle caption button has the restore glyph and its GhosttyGxPopupShadow companion PNG visibly reads Restore Down, not Maximize or a resize dimension",
+  "caption-tooltip-minimize: the restored window's minimize button is hovered and its GhosttyGxPopupShadow companion PNG visibly reads Minimize, not a resize dimension",
+  "caption-tooltip-maximize: the restored window's middle caption button has the maximize glyph and its GhosttyGxPopupShadow companion PNG visibly reads Maximize, not Restore Down",
+  "caption-close-hover: window close has a red fill and white X; compare the same button interior with caption-close-held-pressed",
+  "caption-close-held-pressed: captured between mouse_down and mouse_up on close; the red fill is less opaque than caption-close-hover, with the same white X and unchanged button bounds",
+  "caption-minimize-hover: minimize has a neutral hover fill, not close-button red; compare the same button interior with caption-minimize-held-pressed",
+  "caption-minimize-held-pressed: captured between mouse_down and mouse_up on minimize; the neutral fill is less opaque than caption-minimize-hover, with the same glyph and unchanged button bounds",
+  "caption-safe-release: after both held presses were moved to the terminal before release, the restored window and terminal remain visible, neither closed nor minimized, and no caption button remains pressed",
 ]
+# Coordinates are client DIPs: caption_layout.compute uses 46-DIP buttons and a
+# 40-DIP row. At 144 DPI each button is 69 px wide; -115/-69/-23 and y=20
+# stay inside minimize/maximize/close, as in W16. Keep the original 1500x1000
+# resize and (700,300) terminal safe point. The driver scales input by DPI.
+# Added stills cover tooltip content and held-state appearance only; they do
+# not measure the 150 ms fill / 100 ms glyph fade durations.
 [[step]]
 action = "resize"
 width = 1500
@@ -94,6 +108,37 @@ seconds = 0.3
 action = "capture"
 name = "caption-double-click-maximized"
 [[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+present = false
+[[step]]
+action = "move"
+x = -69
+y = 20
+# Tooltip.zig uses Popup's default shadow=true: GhosttyGxPopupShadow.
+# Do not use new=true: the chrome tooltip reuses its HWND between targets.
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+[[step]]
+action = "capture"
+name = "caption-tooltip-restore"
+what = "all"
+# As in W16, PrintWindow avoids an Explorer Snap Layouts flyout occlusion.
+method = "print"
+[[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+present = false
+[[step]]
 action = "click"
 x = 700
 y = 20
@@ -104,6 +149,123 @@ seconds = 0.3
 [[step]]
 action = "capture"
 name = "caption-double-click-restored"
+[[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+present = false
+[[step]]
+action = "move"
+x = -115
+y = 20
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+[[step]]
+action = "capture"
+name = "caption-tooltip-minimize"
+what = "all"
+method = "print"
+[[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+present = false
+[[step]]
+action = "move"
+x = -69
+y = 20
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+[[step]]
+action = "capture"
+name = "caption-tooltip-maximize"
+what = "all"
+method = "print"
+[[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopupShadow"
+present = false
+# Capture each pair on the same button, with no release between down and
+# held-pressed capture. Move away while still held before sending mouse_up.
+[[step]]
+action = "move"
+x = -23
+y = 20
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "caption-close-hover"
+method = "print"
+[[step]]
+action = "mouse_down"
+x = -23
+y = 20
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "caption-close-held-pressed"
+method = "print"
+[[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "mouse_up"
+x = 700
+y = 300
+[[step]]
+action = "move"
+x = -115
+y = 20
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "caption-minimize-hover"
+method = "print"
+[[step]]
+action = "mouse_down"
+x = -115
+y = 20
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "caption-minimize-held-pressed"
+method = "print"
+[[step]]
+action = "move"
+x = 700
+y = 300
+[[step]]
+action = "mouse_up"
+x = 700
+y = 300
+[[step]]
+action = "sleep"
+seconds = 0.2
+[[step]]
+action = "capture"
+name = "caption-safe-release"
+method = "print"
 [[step]]
 action = "click"
 x = 60

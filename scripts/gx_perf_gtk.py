@@ -87,7 +87,7 @@ def accessibility_snapshot(pid):
     rows = []
     def read():
         count = 0
-        def visit(node, depth):
+        def visit(node, depth, path):
             nonlocal count
             if not node:
                 raise ValueError("null AT-SPI node")
@@ -104,9 +104,12 @@ def accessibility_snapshot(pid):
                     if state:
                         obj.g_object_unref(state)
                 if showing:
-                    rows.append({"name": string(name, node), "role": string(role, node)})
+                    # Snapshot-local child indices, not persistent object identities.
+                    # Keep hidden ancestors in the path without promoting their names.
+                    rows.append({"name": string(name, node), "role": string(role, node),
+                                 "path": path, "parent": path[:-1] if depth else None})
                 for index in range(count_children(node)):
-                    visit(get_child(node, index), depth + 1)
+                    visit(get_child(node, index), depth + 1, [*path, index])
             finally:
                 obj.g_object_unref(node)
         top = desktop(0)
@@ -124,7 +127,7 @@ def accessibility_snapshot(pid):
                     obj.g_object_unref(app)
                     raise ValueError("unknown AT-SPI application PID")
                 if owner == pid:
-                    visit(app, 0)
+                    visit(app, 0, [index])
                 else:
                     obj.g_object_unref(app)
         finally:
