@@ -1,6 +1,21 @@
 # GX UI 后续实施证据索引
 
-核对日期：2026-10-14（R6 文档收口）。整体状态：**not_complete**。本文件是实施中的独立证据导航，不修改原验收范围，不代替任务账本，也不重开原 37 份源码审计。
+最新核对：2026-10-19（第 6 阶段追加）；下方原 10-14／10-18 记录保留历史语境。整体状态：**not_complete**。本文件是实施中的独立证据导航，不修改原验收范围，不代替任务账本，也不重开原 37 份源码审计。
+
+## 第 6 阶段追加入口（2026-10-19）
+
+本节 `F3` 指 `.local/evidence/R5/execution-20261013/final-r3/`；完整当前口径见 `docs/GX_UI_EXECUTION_PLAN.md` 文首。后续授权允许 push 到 `origin/gx_ghostty` 与 gx-ci，不允许发布、tag、PR 或 Issue；下方早期“不 push”仅为当时授权。
+
+| 证据入口（相对 F3） | 当前结论与范围 |
+|---|---|
+| `root/session-review-archive-20261019-2320/index.json` | 28 份原会话审阅记录及摘要已追加归档，另有策略与 GTK 夹具审阅。不是新测试或补造的历史 receipt。r10b 构建仍是 `d3006954c` 加 Surface／ole_drop 两源摘要，exe `fae6657a…49426`；旧 r5/r7/r9 证据不冒充它。 |
+| `root/p4-r10-20261019-01/root-closeout.json` | Windows 最终采样 **FAIL**：完整十对／20 runs、quiet VALID。Menu 10/10 ≤6.25 ms；Palette、Settings 各 0/10；三类 PATH 扫描各十次全 0。O2 180 图全读，root 18 图抽查并重核全部 SHA；不追加优化、不重采翻绿。GTK 另为 PENDING。 |
+| `root/p1-p7-r10-20261019-01/{quiet/RESULT.json,measure/SUMMARY.txt,o2-review-final.json}` | P1 本批数值限定通过：中位数 405.35→299.1 ms（改善106.25 ms），p90 427.8→321.3 ms；每臂 n10。120 图全读、root 抽查12。误重复附带的 P7 仅额外诊断，不替换原 FAIL；P00／rF 最终绑定未完成。 |
+| `root/r10-uia-retained-pattern-20261019-02/report.json` | 修正 typed 客户端 ABI/BSTR 后，SetValue 仍返回 `0x80131509` 而非严格预期 `0x80040201`，**FAIL** 保留，产品归因 PENDING。旧属性失效、真实 Notification 接收、短 IME 压力的限定证据分别保留，不相互替代。 |
+| `root/framework-r10-closeout-20261019-01/` | 完整框架1590项／9 skip／2 fail，原件保留；仅测试夹具修正后，Windows／WSL 全打包模块各55/55通过，未改生产打包代码、未增加skip。不冒称完整1590重跑通过。 |
+| `D1-r10-signoff-20261019-2320/`、`root/leaf-checkpoint-20261019-2345/root-audit.json` | 142叶／29主批次草案已核对，正式账本仅追加 results 与 case_to_leaves：**139 PENDING、2历史限定PASS_SCOPED、1 DEFERRED**，不是142项已验收；65入口文件／610条关联重核。46个case入口含补充映射；P4失败关联19个依赖叶，不虚构19个独立功能缺陷。 |
+
+用户已人工落实单一证据目录写入例外，67项边界测试通过；旧“写入受阻”不再是当前状态。Win10按用户决定本轮暂不做，原VM已停止；GTK Dock进度仍明确延期。未覆盖的硬件、平台、C/V/P和逐叶语义继续按原合同补验。
 
 ## 1. 真源与证据边界
 

@@ -88,6 +88,19 @@ r9 离线包仅记 **PASS_SCOPED（包构造与内容核验）**：root 已完�
 - P5/P6 Windows、P8、GTK P2、C6、C8、C2-G 优先做身份／覆盖核对与签收，不因报告旧视觉 PENDING 字段重复采样或读图。V2 已有 18 次环回原件，优先绑定，不误称完全未做；人耳试听仍 PENDING。142 叶继续复用场景映射，不新建逐叶场景。
 - 手工证据追加例外虽已获用户批准，安全策略文件尚未由人工落实，正式审阅归档与账本写入仍受阻；不通过换工具／目录绕过。对应待生效的 hook 测试仍 RED、未提交，本次局部通过不代 `framework-check` 或最终整套通过。
 
+### 2026-10-19 23:40 归档解锁与 P4 结案
+
+- 用户已人工保存获批证据目录例外；策略仅一条 FILE 正则变化，其他独立 deny 不变。策略 SHA256 `02623edc…75a43`，67 项 hook 测试全部通过、独审通过，提交 `59280500b`；不是所有客户端实际加载状态的证明。此前“归档受阻／测试 RED”保留为历史，不再是当前障碍。
+- 28 份此前只保存在会话里的 root／O2 记录已追加到 `root/session-review-archive-20261019-2320/`，`index.json` 绑定摘要；另追加 GTK 夹具和策略审阅记录。它们是原返回记录归档，不是新跑测试或补造干净构建 receipt。`tasks.json` 已追加 checkpoint，旧内容有完整快照；142 叶结果仍由 root 核对 D1 草案后再合入。
+- Windows P4：`root/p4-r10-20261019-01/root-closeout.json` **FAIL**。完整 AB/BA 十对共 20 runs，quiet **VALID**，驱动 exit 4；主菜单热值 n10 median/p90 **5.437/5.970 ms**、max **6.142 ms**，10/10 达到 6.25 ms；Palette **8.6275/9.142 ms**、Settings **12.5725/13.711 ms**，两者各 0/10 达标。三类 PATH 扫描各十次全 0。旧臂无埋点 n0，不是 0 ms，也不宣称新旧提升。O2 原图 **180/180**，root 抽查 **18/180** 并重核全部摘要；仅首屏可读性，不代全部子页功能。未新增优化轮，旧 FAIL 保留，当日不再采样。
+- GTK P4 原超时已定位到夹具依赖缺失的 GMenu 项标签；16 份完整旧树均有 `menu/Main Menu`。修为目标 PID 的完整 showing-only 树中唯一 role/name 匹配，重复／未知对象拒绝，partial 仍不能证明关闭；`f0d642bb6` 双平台各 **39/39**，独审通过。旧 ERROR 不覆盖；当天额度已满，实际 GTK 性能仍 PENDING，最早下一允许日复验。
+- P1 附带的 120 图已全部由 O2 逐张读取，root 抽查 12；归档 `root/p1-p7-r10-20261019-01/o2-review-final.json`。P1 仅本批数值限定成立，P7 仍按上节保留原 FAIL，本批额外诊断不替换裁定。
+- 完整框架检查 `root/framework-r10-closeout-20261019-01/framework.log`：**1590 项、9 SKIP、2 FAIL**，98.70 s／jobs2。两项均在 Debian stage 的 Windows 测试夹具：原相对目录链接写成 POSIX 分隔符，Windows 不能实际遍历；Windows chmod 不能用 stat 证明 Unix 0755。修正原生链接并断言确为目录，所有目录仍要求真实 chmod 收到 0755，POSIX 保留实际 stat 断言。生产代码不变、不新增 skip；Windows／WSL 全 `test_gx_package` 各 **55/55**、独审通过。完整 1590 原 FAIL 不改写，不冒称重跑全套通过。
+- P3 最新记录实际上是 **NOT_STARTED**，旧 active-terminal 竞态已有有界等待修复，未发现新夹具故障；不为旧报告重复改代码。最早 10-20 按最新驱动身份重排，启动 600 秒门仍按用户裁定豁免，其他批内守门和当日次数不变。
+- `5dfe55041` 的 push CI 为 **39275819564**：最后可读状态仍 in_progress；jobs 接口连续三次 HTTP 502，停止重复请求该接口，不能据超时判作失败／完成或重启任务。总状态继续 **not_complete**。
+
+23:43 逐叶 checkpoint：root 已重算 **65 个入口文件、610 条叶入口关联**，核对 142 个 ID 与 29 个主批次无遗漏／重复；仅追加正式 `leaf-matrix.json` 的 `results` 与 `case_to_leaves`，其他原元数据不变，旧文件完整备份在 `root/leaf-checkpoint-20261019-2345/`。目前 **139 PENDING、2 PASS_SCOPED、1 DEFERRED、0 完整 PASS**；两个限定项仅继承 G05 的历史视觉／日志，不将 Windows r10b 身份当 GTK receipt。P4 的最终 FAIL 单列并关联 19 个依赖叶，不自动认定 19 个功能失败；C6 保留预热／INSUFFICIENT，GTK Dock 仍 DEFERRED。此为明确缺口的首次逐叶登记，不是最终签收完成；补验命令中尚未绑定的占位项仍不可直接执行。打包测试夹具修复已提交 `8bf7ae868`。
+
 ## 历史依据（截至 2026-10-18，正文原样保留）
 
 本计划依据当前对话 2026-10-14 的授权、2026-10-17 的模型分工更新及 2026-10-18 第 6 阶段与后续裁定，覆盖旧交接文档的任务组织、构建频次和提交授权；功能范围仍是 F1–F10，原完整验收契约（`docs/GX_UI_REMAINING_PLAN.md`）中的门不因本计划而视为通过。原定截止北京时间 2026-10-14 02:48 **已超期**，如实保留，已用时间不清零。当前总状态 **`not_complete`**。
