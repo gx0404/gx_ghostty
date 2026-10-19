@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import traceback
 
 from gx_boundary_controller import Native, ROOT, assert_continuity, PeerInterfaceUnavailable, EnvironmentUnavailable
 from gx_fixture_evidence import process_identity, sha256, native_snapshot
@@ -246,10 +247,154 @@ def release_on_owned_app(instance):
               api.mouse_input(gui.MOUSE_BUTTONS["left"][1])])
 
 
+def require_left_button_up():
+    query = gui.win32().user32.GetAsyncKeyState
+    query.argtypes, query.restype = [ctypes.c_int], ctypes.c_short
+    if query(1) & 0x8000:
+        raise gui.InputBlocked("left button is already down; refusing to take ownership or send input")
+
+
+def lifecycle_drag_layout(target, source, terminal):
+    """Place the unchanged source size inside the target client, clear of the endpoint."""
+    left, top, right, bottom = target
+    width, height = source[2] - source[0], source[3] - source[1]
+    if (width <= 0 or height <= 0 or width + 32 > right - left or height + 32 > bottom - top
+            or terminal[2] - terminal[0] < 2 or terminal[3] - terminal[1] < 2
+            or not (left <= terminal[0] < terminal[2] <= right and top <= terminal[1] < terminal[3] <= bottom)):
+        raise gui.InputBlocked("owned source/terminal cannot fit inside the target client")
+    end = (terminal[2] - min(60, (terminal[2] - terminal[0]) // 2), (terminal[1] + terminal[3]) // 2)
+    for x, y in ((left + 16, top + 16), (left + 16, bottom - height - 16),
+                 (right - width - 16, top + 16), (right - width - 16, bottom - height - 16)):
+        if not (x <= end[0] < x + width and y <= end[1] < y + height):
+            return (x, y, width, height), end
+    raise gui.InputBlocked("owned source would obscure the terminal endpoint")
+
+
+def preflight_lifecycle_path(drag, points):
+    """Read-only hit tests for every planned point and every pixel between them."""
+    drag.check_foreground()
+    api = gui.win32()
+    if len(points) < 2:
+        raise gui.InputBlocked("owned drag path is empty")
+
+    def check(point):
+        hit = api.window_at(*point)
+        root = api.GetAncestor(hit, 2) if hit else 0
+        pid = api.window_pid(hit) if hit else 0
+        if not ((root == drag.source_hwnd and pid == drag.process.pid)
+                or (root == drag.target_hwnd and pid == drag.instance.pid)):
+            raise gui.InputBlocked(f"drag preflight point {point} is outside both owned windows; no input sent")
+        return hit, root
+
+    if check(points[0])[1] != drag.source_hwnd:
+        raise gui.InputBlocked("drag preflight start is not on the owned source")
+    remaining = 8192
+    for start, end in zip(points, points[1:]):
+        steps = max(abs(end[0] - start[0]), abs(end[1] - start[1]), 1)
+        remaining -= steps
+        if remaining < 0:
+            raise gui.InputBlocked("owned drag path exceeds the bounded preflight")
+        for step in range(1, steps + 1):
+            check((round(start[0] + (end[0] - start[0]) * step / steps),
+                   round(start[1] + (end[1] - start[1]) * step / steps)))
+    if check(points[-1])[0] != drag.terminal.hwnd:
+        raise gui.InputBlocked("drag preflight endpoint is not the verified terminal HWND")
+    drag.check_foreground()
+
+
+def prepare_lifecycle_drag(drag, facts=None):
+    facts = {} if facts is None else facts
+    facts["preflight"] = "PENDING"
+    drag.check_identity()
+    api = gui.win32()
+    target = api.client_rect(drag.target_hwnd)
+    source, terminal = api.raw_window_rect(drag.source_hwnd), api.client_rect(drag.terminal.hwnd)
+    facts.update(target_client=target, source_before=source, terminal_client=terminal)
+    placement, end = lifecycle_drag_layout(target, source, terminal)
+    facts.update(placement=placement, end=end)
+    drag.check_identity()
+    if not api.SetWindowPos(drag.source_hwnd, None, *placement, 0x0014):  # NOZORDER | NOACTIVATE
+        raise gui.InputBlocked("cannot place owned source inside the target")
+    drag.check_identity()
+    actual = api.raw_window_rect(drag.source_hwnd)
+    facts["source_after"] = actual
+    if not (target[0] <= actual[0] < actual[2] <= target[2]
+            and target[1] <= actual[1] < actual[3] <= target[3]):
+        raise gui.InputBlocked("owned source placement escaped the target client")
+    drag.activate_source()
+    start = drag.start_point()
+    points = [(round(start[0] + (end[0] - start[0]) * step / 16),
+               round(start[1] + (end[1] - start[1]) * step / 16)) for step in range(17)]
+    facts["points"] = points
+    preflight_lifecycle_path(drag, points)
+    facts["preflight"] = "PASS"
+    return points
+
+
+def verify_lifecycle_source(source, source_hash, process, birth):
+    api = gui.win32()
+    if (not birth or process.poll() is not None or api.process_creation(process.pid) != birth
+            or not gui.same_path(api.process_image(process.pid) or "", source)
+            or sha256(source) != source_hash):
+        raise gui.InputBlocked("OLE source PID/birth/image changed; refusing cleanup")
+
+
+def release_lifecycle_button(instance, source, source_hash, process, birth, source_hwnd):
+    api = gui.win32()
+    foreground = api.foreground()
+    if source_hwnd and foreground and api.GetAncestor(foreground, 3) == source_hwnd:
+        verify_lifecycle_source(source, source_hash, process, birth)
+        if (not api.IsWindow(source_hwnd) or api.window_pid(source_hwnd) != process.pid
+                or api.class_name(source_hwnd) != "GxOwnedOleDragSource"):
+            raise gui.InputBlocked("owned OLE source HWND changed; no cleanup input sent")
+        foreground = api.foreground()  # Recheck after image hashing; never activate.
+        if (not foreground or api.GetAncestor(foreground, 3) != source_hwnd
+                or api.window_pid(foreground) != process.pid or api.process_creation(process.pid) != birth):
+            raise gui.InputBlocked("foreground left owned OLE source; no cleanup input sent")
+        api.send([api.key_input(0x1b, False), api.key_input(0x1b, True),
+                  api.mouse_input(gui.MOUSE_BUTTONS["left"][1])])
+    else:
+        release_on_owned_app(instance)
+
+
+def cleanup_lifecycle(report, instance, source, source_hash, process, birth, source_hwnd, button, failure):
+    errors, interruption = [], None
+    try:
+        if button:
+            release_lifecycle_button(instance, source, source_hash, process, birth, source_hwnd)
+            button = False
+    except BaseException as error:
+        errors.append({"phase": "button_release", "type": type(error).__name__, "error": str(error)})
+        if not isinstance(error, Exception):
+            interruption = error
+    try:
+        if process.poll() is None:
+            if not birth:
+                raise gui.InputBlocked("OLE source birth unavailable; refusing cleanup")
+            verify_lifecycle_source(source, source_hash, process, birth)
+            process.terminate()
+            process.wait(timeout=5)
+    except BaseException as error:
+        errors.append({"phase": "source_exit", "type": type(error).__name__, "error": str(error)})
+        if interruption is None and not isinstance(error, Exception):
+            interruption = error
+    report["ole_lifecycle_cleanup"] = {"button_release_pending": button, "errors": errors}
+    # Finish both phases and record them before propagating an interruption.
+    # A pending primary exception always takes precedence over cleanup errors.
+    if failure is None:
+        if interruption is not None:
+            report.update(status="FAIL", reason=str(interruption), interruption_type=type(interruption).__name__)
+            raise interruption
+        if errors:
+            raise RuntimeError("OLE lifecycle cleanup failed: " + "; ".join(item["error"] for item in errors))
+
+
 def lifecycle(fixture, instance, first, destination):
+    require_left_button_up()
     if fixture.args.ole_source is None:
         raise PeerInterfaceUnavailable("build the owned gx_ole_source and provide --ole-source")
     source = fixture.args.ole_source.resolve(strict=True)
+    source_hash = sha256(source)
     before = first.tree()
     leaf = next(n["leaf"] for n in before["nodes"] if "leaf" in n and n["leaf"]["core"] == before["active_core"])
     terminal = gui.win32().info(leaf["hwnd"])
@@ -258,23 +403,34 @@ def lifecycle(fixture, instance, first, destination):
     command = [str(source), "--run", "--source-window", f"--hwnd={terminal.hwnd}", f"--pid={instance.pid}",
                f"--birth={instance.creation}", f"--exe={instance.exe}", f"--sha256={fixture.report['app_sha256']}",
                f"--work-dir={work}", "--case=unicode", "--timeout-ms=20000"]
-    button = False
+    button, failure, source_hwnd = False, None, None
     with (work / "stdout.txt").open("wb") as stdout, (work / "stderr.txt").open("wb") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
-        birth = gui.win32().process_creation(process.pid)
+        birth = None
         try:
+            birth = gui.win32().process_creation(process.pid)
+            if not birth:
+                raise gui.InputBlocked("OLE source birth unavailable; no input sent")
             ready = wait(lambda: next(work.glob(f"gx-ole-{process.pid}-*/ready.json"), None))
             facts = json.loads(ready.read_text(encoding="utf-8"))
-            assert facts["source_pid"] == process.pid and facts["target_hwnd"] == terminal.hwnd
-            drag = OwnedDrag(instance, fixture.exe, fixture.report["app_sha256"], source, sha256(source), process, birth, facts["source_hwnd"], terminal)
-            drag.target_hwnd = first.hwnd
-            drag.activate_source()
-            start = drag.start_point()
-            end = terminal.rect[2] - 60, terminal.rect[1] + 140
-            drag.mouse(*start, action="down")
+            assert (facts["source_pid"] == process.pid and facts["target_pid"] == instance.pid
+                    and facts["target_birth"] == instance.creation and facts["target_hwnd"] == terminal.hwnd
+                    and facts["app_sha256"].lower() == fixture.report["app_sha256"].lower())
+            source_hwnd = facts["source_hwnd"]
+            drag = OwnedDrag(instance, fixture.exe, fixture.report["app_sha256"], source, source_hash, process, birth, source_hwnd, terminal)
+            if drag.target_hwnd != first.hwnd:
+                raise gui.InputBlocked("terminal belongs to another target window")
+            plan = fixture.report["ole_lifecycle_drag"] = {}
+            points = prepare_lifecycle_drag(drag, plan)
+            fixture.check("OLE-drag-preflight", source_pid=process.pid, source_birth=birth,
+                          source_hwnd=source_hwnd, target_hwnd=drag.target_hwnd, points=points)
+            require_left_button_up()
+            # A partial SendInput can press the button and still raise. From
+            # this attempt onward, only a successful release clears the flag.
             button = True
-            for step in range(1, 17):
-                drag.mouse(round(start[0] + (end[0] - start[0]) * step / 16), round(start[1] + (end[1] - start[1]) * step / 16))
+            drag.mouse(*points[0], action="down")
+            for index, point in enumerate(points[1:], 1):
+                drag.mouse(*point, target_only=index == len(points) - 1)
                 time.sleep(0.03)
             trace = ready.parent / "trace.jsonl"
             wait(lambda: trace.exists() and 'continue' in trace.read_text(encoding="utf-8"))
@@ -287,37 +443,27 @@ def lifecycle(fixture, instance, first, destination):
                 wait(lambda: not gui.win32().IsWindow(terminal.hwnd))
             # Cancel the in-flight real OLE operation through the owned source
             # if still alive, otherwise release onto the surviving owned app.
-            if process.poll() is None and gui.win32().IsWindow(facts["source_hwnd"]):
-                api = gui.win32()
-                if api.window_pid(api.foreground()) == process.pid and api.process_creation(process.pid) == birth:
-                    api.send([api.key_input(0x1b, False), api.key_input(0x1b, True),
-                              api.mouse_input(gui.MOUSE_BUTTONS["left"][1])])
-                else:
-                    release_on_owned_app(instance)
-                button = False
+            release_lifecycle_button(instance, source, source_hash, process, birth, source_hwnd)
+            button = False
             code = process.wait(timeout=10)
-            if button:
-                release_on_owned_app(instance)
-                button = False
             evidence = json.loads((ready.parent / "evidence.json").read_text(encoding="utf-8"))
             assert code in (3, 4) and evidence["effect"] == 0 and evidence["get_data"] == evidence["medium_releases"]
             assert destination.query(201) == queued, "lifecycle cancellation pasted into a replacement target"
             fixture.check("real-OLE-lifecycle", before=before, native=evidence, source_pid=process.pid, source_birth=birth,
                           after=destination.tree() if fixture.case_id == "OLE-08" else first.tree())
             fixture.capture_native(instance, destination if fixture.case_id == "OLE-08" else first, "OLE-lifecycle-after")
+        except BaseException as error:
+            failure = error
+            fixture.report["ole_lifecycle_failure"] = {"type": type(error).__name__, "reason": str(error),
+                                                       "traceback": traceback.format_exc()}
+            raise
         finally:
-            try:
-                if button:
-                    release_on_owned_app(instance)
-            finally:
-                if process.poll() is None:
-                    if gui.win32().process_creation(process.pid) != birth:
-                        raise gui.InputBlocked("OLE source PID reused; refusing cleanup")
-                    process.terminate()
-                    process.wait(timeout=5)
+            cleanup_lifecycle(fixture.report, instance, source, source_hash, process, birth, source_hwnd, button, failure)
 
 
 def run(fixture):
+    if fixture.case_id != "OLE-07":
+        require_left_button_up()
     instance, first, _, second = fixture.stage()
     if fixture.case_id == "OLE-07":
         explorer(fixture, instance, first)
