@@ -2302,25 +2302,91 @@ class Instance:
                 self.release_input([w.key_input(vk, True)], key, not completed)
 
     def uia_rows(self, hwnd: int) -> list[dict]:
-        """Read geometry under an owned HWND; no UIA invocation or desktop search."""
+        """Read visible geometry and selection/parent facts under an owned HWND.
+
+        Existing geometry fields are unchanged. selected is null when the
+        SelectionItem pattern is unavailable; parent identity is snapshot-local.
+        No UIA action or desktop search is performed.
+        """
         self.ensure_owned()
         if win32().window_pid(hwnd) != self.pid:
             raise InputBlocked("UIA root no longer belongs to this instance")
         script = ("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; "
                   "Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes; "
                   f"$root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]{int(hwnd)}); "
+                  "$rc=$root.Current; $rr=$rc.BoundingRectangle; "
+                  f"$rootInfo=@{{hwnd={int(hwnd)};runtime_id=($root.GetRuntimeId() -join '.'); "
+                  "name=$rc.Name;type=$rc.ControlType.ProgrammaticName;rect=@($rr.X,$rr.Y,$rr.Width,$rr.Height)}; "
                   "$nodes=$root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition); "
-                  "@($nodes | ForEach-Object {$c=$_.Current; $r=$c.BoundingRectangle; "
+                  "$walker=[Windows.Automation.TreeWalker]::RawViewWalker; "
+                  "$rows=@($nodes | ForEach-Object {$c=$_.Current; $r=$c.BoundingRectangle; "
                   "if (!$c.IsOffscreen -and $r.Width -gt 0 -and $r.Height -gt 0) { "
+                  "$supported=$_.GetCurrentPropertyValue([Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty); "
+                  "$selected=$null; if ($supported -eq $true) { "
+                  "$selected=$_.GetCurrentPropertyValue([Windows.Automation.SelectionItemPattern]::IsSelectedProperty) }; "
+                  "$p=$walker.GetParent($_); $parent=$null; if ($null -ne $p) { "
+                  "$pc=$p.Current; $parent=@{runtime_id=($p.GetRuntimeId() -join '.'); "
+                  "id=$pc.AutomationId;name=$pc.Name;type=$pc.ControlType.ProgrammaticName} }; "
                   "@{name=$c.Name;id=$c.AutomationId;type=$c.ControlType.ProgrammaticName; "
-                  "rect=@($r.X,$r.Y,$r.Width,$r.Height)}}}) | ConvertTo-Json -Depth 4 -Compress")
+                  "runtime_id=($_.GetRuntimeId() -join '.');root=$rootInfo; "
+                  "selected=$selected;selection_item=($supported -eq $true);parent=$parent; "
+                  "rect=@($r.X,$r.Y,$r.Width,$r.Height)}}}); ConvertTo-Json -InputObject $rows -Depth 5 -Compress")
         result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
                                 capture_output=True, timeout=20)
         self.ensure_owned()
-        if win32().window_pid(hwnd) != self.pid or result.returncode:
-            raise GuiError(f"UIA geometry probe failed: {result.stderr.decode('utf-8', errors='replace')}")
-        data = json.loads(result.stdout.decode('utf-8-sig'))
-        return data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        def failed(reason):
+            # Preserve bounded raw excerpts (including non-UTF8 bytes) in the
+            # caller's normal error evidence. Blank stdout is NOT an empty tree.
+            return GuiError(f'UIA geometry probe {reason}; hwnd={hwnd} pid={self.pid} '
+                            f'exit={result.returncode}; stdout[{len(result.stdout)}]={result.stdout[:4096]!r}; '
+                            f'stderr[{len(result.stderr)}]={result.stderr[:4096]!r}')
+        if win32().window_pid(hwnd) != self.pid:
+            raise failed('owner changed')
+        if result.returncode:
+            raise failed('provider/process failed')
+        try:
+            data = json.loads(result.stdout.decode('utf-8-sig'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise failed(f'invalid JSON: {exc}') from exc
+        # Keep the existing single-object compatibility, but do not silently
+        # accept null/scalars/malformed rows as a successful empty enumeration.
+        rows = [data] if isinstance(data, dict) else data
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise failed('invalid JSON shape: expected an array of node objects')
+        # Validate the enumerator's wire contract, not a particular provider's
+        # semantics. Names/AutomationIds can be empty, RawView parents can be
+        # null, and non-selection controls deliberately emit selected=null.
+        # Keep all fields verbatim; never filter invalid nodes into an empty tree.
+        import math
+        def descriptor(value, *, automation_id=False):
+            keys = ('name', 'type', 'runtime_id') + (('id',) if automation_id else ())
+            return (isinstance(value, dict) and all(isinstance(value.get(k), str) for k in keys)
+                    and bool(value['type']))
+
+        def rectangle(value, *, visible=False):
+            return (isinstance(value, list) and len(value) == 4
+                    and all(type(v) in (int, float) and math.isfinite(v) for v in value)
+                    and all(v > 0 if visible else v >= 0 for v in value[2:]))
+
+        for index, row in enumerate(rows):
+            problem = None
+            root = row.get('root')
+            parent = row.get('parent')
+            if not descriptor(row, automation_id=True):
+                problem = 'node name/id/type/runtime_id must be strings; type must be nonempty'
+            elif not rectangle(row.get('rect'), visible=True):
+                problem = 'node rect must contain four finite numbers and positive dimensions'
+            elif (type(row.get('selection_item')) is not bool or 'selected' not in row
+                  or (type(row['selected']) is not bool if row['selection_item'] else row['selected'] is not None)):
+                problem = 'selection_item must be boolean; selected must be boolean when supported, otherwise null'
+            elif ('parent' not in row or (parent is not None and not descriptor(parent, automation_id=True))):
+                problem = 'parent must be null or a name/id/type/runtime_id descriptor'
+            elif (not descriptor(root) or type(root.get('hwnd')) is not int or root['hwnd'] != hwnd
+                  or not rectangle(root.get('rect'))):
+                problem = 'root must describe the requested HWND with finite nonnegative geometry'
+            if problem:
+                raise failed(f'invalid node schema at row {index}: {problem}')
+        return rows
 
     def caption_point(self, window: WindowInfo) -> tuple[int, int]:
         """Find a real HTCAPTION point; do not guess where tabs end."""

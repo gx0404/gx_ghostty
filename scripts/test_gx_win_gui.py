@@ -29,6 +29,112 @@ if str(SCRIPTS) not in sys.path:
 import gx_win_gui as gui  # noqa: E402
 
 
+class UiaSelectionRowsTests(unittest.TestCase):
+    @staticmethod
+    def node():
+        return {'name': '', 'id': '', 'type': 'ControlType.Pane', 'runtime_id': '1.2',
+                'rect': [-10, 20, 100.5, 40], 'selected': None, 'selection_item': False,
+                'parent': None,
+                'root': {'hwnd': 100, 'runtime_id': '1', 'name': '', 'type': 'ControlType.Window',
+                         'rect': [-20, 0, 500, 400]}}
+
+    def test_nonempty_node_schema_rejects_missing_and_mistyped_fields(self):
+        import copy
+        node = self.node()
+        self.assertEqual([node], self.probe(json.dumps([node]).encode())[0])
+        invalid = [{}]
+        for key in node:
+            row = copy.deepcopy(node); del row[key]; invalid.append(row)
+        for path, value in [(('rect',), [0, 0, True, 4]), (('rect',), [0, 0, 0, 4]),
+                            (('rect',), [0, 0, float('inf'), 4]), (('rect',), [1, 2]),
+                            (('name',), None), (('id',), 3), (('type',), ''), (('runtime_id',), []),
+                            (('selected',), False), (('selection_item',), 1),
+                            (('root',), None), (('root', 'hwnd'), 200), (('root', 'hwnd'), True),
+                            (('root', 'rect'), [0, 0, -1, 2]), (('root', 'runtime_id'), None),
+                            (('parent',), {}), (('parent',), 'parent')]:
+            row = copy.deepcopy(node); target = row
+            for key in path[:-1]: target = target[key]
+            target[path[-1]] = value; invalid.append(row)
+        row = copy.deepcopy(node); row['selection_item'] = True; invalid.append(row)
+        for row in invalid:
+            with self.subTest(row=row), self.assertRaisesRegex(gui.GuiError, 'schema.*row 0.*stdout'):
+                self.probe(json.dumps([row]).encode())
+        # Never filter a bad row out of an otherwise valid collection.
+        with self.assertRaisesRegex(gui.GuiError, 'schema.*row 1'):
+            self.probe(json.dumps([node, {}]).encode())
+
+    def probe(self, stdout=b'[]', stderr=b'', code=0):
+        instance = gui.Instance(42, 'C:/g/ghostty.exe', Path('E:/ev/env'), creation=1, launched=0)
+        backend = mock.Mock(); backend.window_pid.return_value = 42
+        result = SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+        with mock.patch.object(gui, 'win32', return_value=backend), \
+                mock.patch.object(instance, 'ensure_owned'), \
+                mock.patch.object(gui.subprocess, 'run', return_value=result) as run:
+            rows = instance.uia_rows(100)
+        return rows, run.call_args.args[0][-1]
+
+    def test_empty_array_is_valid_but_empty_malformed_and_provider_errors_are_not(self):
+        self.assertEqual([], self.probe()[0])
+        self.assertEqual([self.node()], self.probe(json.dumps(self.node()).encode())[0])
+        for raw in (b'', b'  \r\n', b'not-json', b'null', b'7', b'[null]', b'\xff'):
+            with self.subTest(raw=raw), self.assertRaisesRegex(gui.GuiError, 'UIA.*stdout'):
+                self.probe(raw, b'provider diagnostic')
+        with self.assertRaisesRegex(gui.GuiError, 'provider exploded'):
+            self.probe(b'[]', b'provider exploded', 1)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows PowerShell serialization contract')
+    def test_real_powershell_serializes_zero_one_many_without_uia(self):
+        # Execute only the actual serializer tail, with synthetic in-memory rows.
+        # No UIA assemblies, HWND, app process, input or desktop enumeration.
+        import subprocess
+        legacy = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                                 '@() | ConvertTo-Json -Depth 4 -Compress'], capture_output=True, timeout=15)
+        self.assertEqual(0, legacy.returncode, legacy.stderr)
+        self.assertEqual(b'', legacy.stdout)
+        with self.assertRaisesRegex(json.JSONDecodeError, 'Expecting value'):
+            json.loads(legacy.stdout.decode('utf-8-sig'))
+        _, script = self.probe()
+        tail = script[script.rindex('ConvertTo-Json'):]
+        for values, expected in (('@()', []), ('@(@{name="one"})', [{'name': 'one'}]),
+                                 ('@(@{name="one"},@{name="two"})', [{'name': 'one'}, {'name': 'two'}])):
+            with self.subTest(values=values):
+                result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                                         '$rows=' + values + '; ' + tail], capture_output=True, timeout=15)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(expected, json.loads(result.stdout.decode('utf-8-sig')))
+
+    def test_selection_parent_fields_preserve_geometry_and_owned_checks(self):
+        instance = gui.Instance(42, 'C:/g/ghostty.exe', Path('E:/ev/env'), creation=1, launched=0)
+        row = {**self.node(), 'name': 'Alpha', 'id': 'gx-1', 'type': 'ControlType.ListItem', 'rect': [1, 2, 3, 4],
+               'selected': True, 'selection_item': True,
+               'parent': {'runtime_id': '1.3', 'id': '', 'name': '', 'type': 'ControlType.List'},
+               'future_raw_field': 'preserved'}
+        backend = mock.Mock(); backend.window_pid.return_value = 42
+        result = SimpleNamespace(returncode=0, stdout=json.dumps(row).encode(), stderr=b'')
+        with mock.patch.object(gui, 'win32', return_value=backend), \
+                mock.patch.object(instance, 'ensure_owned') as owned, \
+                mock.patch.object(gui.subprocess, 'run', return_value=result) as run:
+            self.assertEqual([row], instance.uia_rows(100))
+        self.assertEqual(2, owned.call_count)
+        script = run.call_args.args[0][-1]
+        self.assertIn('SelectionItemPattern]::IsSelectedProperty', script)
+        self.assertIn('$walker.GetParent($_)', script)
+        self.assertIn('$selected=$null', script)
+        self.assertIn("runtime_id=($_.GetRuntimeId() -join '.')", script)
+        self.assertIn('root=$rootInfo', script)
+        self.assertIn('$rootInfo=@{hwnd=100;', script)
+        self.assertNotIn('.Select()', script)
+
+    def test_selection_probe_rejects_replaced_owner(self):
+        instance = gui.Instance(42, 'C:/g/ghostty.exe', Path('E:/ev/env'), creation=1, launched=0)
+        backend = mock.Mock(); backend.window_pid.side_effect = [42, 99]
+        with mock.patch.object(gui, 'win32', return_value=backend), \
+                mock.patch.object(instance, 'ensure_owned'), \
+                mock.patch.object(gui.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'[]', stderr=b'')), \
+                self.assertRaises(gui.GuiError):
+            instance.uia_rows(100)
+
+
 class StartupNative(gui.Win32):
     """Actual window enumeration/FILETIME wrappers with only OS calls mocked."""
 
@@ -390,6 +496,63 @@ class ImageTests(unittest.TestCase):
 
 
 class ScenarioFileTests(unittest.TestCase):
+    def test_w26_cursor_precedence_keeps_transport_and_visual_evidence_separate(self):
+        scenario = gui.load_scenario(ROOT / 'test/gui/win32/W26-cursor-precedence.toml')
+        phases = [
+            ('preflight-unset-underline', 4), ('preflight-unset-bar', 6), ('preflight-unset-blink', 5),
+            ('shape-only', 6), ('blink-only', 6), ('equal-default', 6), ('empty', 4),
+            ('explicit-both', 3), ('reload-remove-shape', 3), ('reload-remove-blink', 3),
+        ]
+        steps = scenario.steps
+        files = [step.params for step in steps if step.action == 'file']
+        controls = [p['text'].strip() for p in files if p['path'] == 'cursor/control.txt']
+        self.assertEqual([f'{name}|{code}' for name, code in phases] + ['stop'], controls)
+        captures = [s.params['name'] for s in steps if s.action == 'capture']
+        self.assertEqual([f'{name}-{frame}' for name, _ in phases for frame in 'abcd'], captures)
+        reloads = [p['text'] for p in files if p['path'] == 'ghostty/config.ghostty']
+        cursor_settings = [
+            '\n'.join(line for line in config.splitlines() if line.startswith(('cursor-style =', 'cursor-style-blink =')))
+            for config in reloads
+        ]
+        self.assertEqual([
+            'cursor-style = underline', 'cursor-style-blink = true',
+            'cursor-style = block\ncursor-style-blink = true', 'cursor-style =\ncursor-style-blink =',
+            'cursor-style = bar\ncursor-style-blink = false', 'cursor-style-blink = false', '',
+        ], cursor_settings)
+        # Empty shape is an explicit block, unlike empty blink (null/released).
+        empty_expect = [item for item in scenario.expect if item.startswith('empty-[a-d]:')]
+        self.assertEqual([
+            "empty-[a-d]: steady block: empty cursor-style locks block; empty cursor-style-blink releases blink to the program's steady underline request",
+        ], empty_expect)
+        self.assertEqual(7, sum(s.action == 'key' and s.params['keys'] == 'f12' for s in steps))
+        for config in [scenario.config, *reloads]:
+            self.assertIn('shell-integration = none', config)
+            self.assertIn('keybind = f12=reload_config', config)
+            self.assertIn('language = en', config)
+        self.assertEqual(1, sum(s.action == 'type' for s in steps))  # one live producer across reloads
+        self.assertFalse(any(s.action in ('restart', 'dpi', 'layout', 'simulate_system_theme') for s in steps))
+        probe = next(p['text'] for p in files if p['path'] == 'cursor/probe.ps1')
+        self.assertIn('$clock.Elapsed.TotalSeconds -lt 300', probe)
+        self.assertIn('[Console]::Write("${e}[$code q")', probe)
+        self.assertIn('$clock.Elapsed.TotalSeconds + 1.7', probe)
+        self.assertIn('$count -eq 2', probe)
+        self.assertIn("evidence='producer-only'", probe)
+        self.assertNotIn('$q', probe)  # no DECRQSS answer mistaken for Ghostty state
+        for name, _ in phases:
+            control = next(i for i, s in enumerate(steps)
+                           if s.action == 'file' and s.params.get('text', '').strip().startswith(name + '|'))
+            ready = next(i for i, s in enumerate(steps)
+                         if s.action == 'wait_title' and s.params['pattern'] == f'^W26 {name} ready$')
+            receipt = next(i for i, s in enumerate(steps)
+                           if s.action == 'wait_file' and s.params['path'] == '{env}/cursor/' + name + '.json')
+            first = next(i for i, s in enumerate(steps)
+                         if s.action == 'capture' and s.params['name'] == name + '-a')
+            self.assertLess(control, ready)
+            self.assertLess(ready, receipt)
+            self.assertLess(receipt, first)
+        self.assertIn('PENDING', ' '.join(scenario.expect))
+        self.assertIn('ConPTY', ' '.join(scenario.expect))
+
     def test_a2_find_shortcut_leaves_f9_for_tab_navigation(self):
         for number in ('W02', 'W03', 'W08', 'W13', 'W20', 'W24'):
             path = next((ROOT / 'test/gui/win32').glob(number + '-*.toml'))

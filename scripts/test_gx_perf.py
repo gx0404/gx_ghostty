@@ -28,6 +28,211 @@ import gx_wsl  # noqa: E402
 from test_gx_wsl import monotonic_times, stat_line  # noqa: E402
 
 
+class P3FixtureTests(unittest.TestCase):
+    def test_tab_transition_waits_for_unique_new_pane_before_input(self):
+        for mode in ('settles', 'both', 'old-only', 'foreign'):
+            with self.subTest(mode=mode):
+                gui, instance, capture, windows, _ = self.fixture()
+                old = SimpleNamespace(hwnd=100, visible=True, cloaked=False, rect=(0, 40, 800, 600))
+                new = SimpleNamespace(hwnd=101, visible=True, cloaked=False, rect=old.rect)
+                api = gui.win32.return_value
+                phase = [0]
+                polls = [0]
+                def children(*_):
+                    if phase[0] == 0:
+                        return [old]
+                    polls[0] += 1
+                    if mode == 'settles' and polls[0] >= 3:
+                        old.visible = False
+                    return [old] if mode == 'old-only' else [old, new]
+                api.child_windows.side_effect = children
+                api.window_pid.side_effect = lambda hwnd: 999 if mode == 'foreign' and hwnd == 101 else 123
+                def populate(*_, prepare):
+                    prepare(windows[0])
+                    self.assertEqual(2, instance.type_text.call_count)
+                    phase[0] = 1
+                    prepare(windows[0], {100})
+                    raise RuntimeError('prepared new pane')
+                with mock.patch.object(gx_perf, 'populate', side_effect=populate), \
+                        mock.patch.object(gx_perf.time, 'monotonic', side_effect=range(1000)), \
+                        mock.patch.object(gx_perf.time, 'sleep'):
+                    if mode == 'settles':
+                        with self.assertRaisesRegex(RuntimeError, 'prepared new pane'):
+                            gx_perf.prepare_p3(gui, instance, capture)
+                        self.assertEqual(4, instance.type_text.call_count)
+                        self.assertEqual([100, 101], [r['hwnd'] for r in capture.report['p3_fixture']['terminals']])
+                    else:
+                        with self.assertRaises(gx_perf.PerfError):
+                            gx_perf.prepare_p3(gui, instance, capture)
+                        self.assertEqual(2, instance.type_text.call_count)  # no input after the first pane
+                        wait = capture.report['p3_fixture']['terminal_waits'][-1]
+                        self.assertEqual('failed', wait['status'])
+                        self.assertEqual(100, wait['candidates'][0]['hwnd'])
+                        self.assertTrue(wait['candidates'][0]['visible'])
+                        self.assertEqual(123, wait['candidates'][0]['pid'])
+
+    def fixture(self, *, baseline=False, count=45, foreign=False, bar_state=2, bar_visible=True, acknowledge=True):
+        gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()
+        gui.TERMINAL_CLASS = 'GhosttyTerminal'
+        instance.pid = 123
+        instance.scale.return_value = 1
+        instance.caption_point.return_value = (400, 20)
+        capture.report = {'config': gx_perf.DEFAULT_WIN32_CONFIG, 'baseline': baseline}
+        windows = [SimpleNamespace(hwnd=i, rect=(0, 0, 800, 600)) for i in (1, 2, 3)]
+        terminals = {w.hwnd: [SimpleNamespace(hwnd=w.hwnd * 100 + i, visible=False, cloaked=False,
+                                              rect=(0, 40, 800, 600)) for i in range(15)] for w in windows}
+        api = gui.win32.return_value
+        api.child_windows.side_effect = lambda hwnd, cls: terminals[hwnd]
+        api.window_pid.return_value = 999 if foreign else instance.pid
+        api.foreground.return_value = 3
+        api.window_text.side_effect = lambda hwnd: instance.type_text.call_args.args[0].removeprefix('title ') if acknowledge else ''
+        bar = SimpleNamespace(hwnd=999, cls='GhosttyScrollbar', visible=bar_visible, cloaked=False, rect=(790, 40, 800, 600))
+        instance.windows.return_value = [bar]
+        api.GetWindow.return_value = 314
+        api.send_message.return_value = bar_state
+
+        def populate(_gui, _instance, tabs, nwindow, prepare=None):
+            self.assertEqual((15, 3), (tabs, nwindow))
+            done = 0
+            for window in windows:
+                for terminal in terminals[window.hwnd]:
+                    for other in terminals[window.hwnd]:
+                        other.visible = False
+                    terminal.visible = True
+                    if done < count:
+                        prepare(window)
+                    done += 1
+
+        return gui, instance, capture, windows, populate
+
+    def run_fixture(self, **kwargs):
+        gui, instance, capture, windows, populate = self.fixture(**kwargs)
+        with mock.patch.object(gx_perf, 'populate', side_effect=populate), \
+                mock.patch.object(gx_perf, 'main_windows', return_value=windows), \
+                mock.patch.object(gx_perf.time, 'monotonic', side_effect=range(1000)), \
+                mock.patch.object(gx_perf.time, 'monotonic_ns', return_value=123456), \
+                mock.patch.object(gx_perf.time, 'sleep'):
+            result = gx_perf.prepare_p3(gui, instance, capture)
+        return gui, instance, capture, result
+
+    def test_both_arms_prepare_all_terminals_with_identical_real_stimulus(self):
+        old = self.run_fixture(baseline=True)
+        new = self.run_fixture(baseline=False)
+        for gui, instance, capture, result in (old, new):
+            evidence = capture.report['p3_fixture']
+            self.assertEqual((3, 45), (evidence['actual_windows'], evidence['actual_terminals']))
+            self.assertEqual(45, len({row['marker'] for row in evidence['terminals']}))
+            self.assertTrue(all(row['title_acknowledged'] and row['output_lines'] == 300 for row in evidence['terminals']))
+            self.assertEqual('prepared', evidence['status'])
+            self.assertEqual('PENDING', evidence['image_review'])
+            self.assertEqual(3, result.hwnd)
+            instance.wheel.assert_called_once_with(400, 320, delta=120, count=3)
+            capture.screenshot.assert_called_once_with('p3-before-drag', result)
+            self.assertEqual('unknown', evidence['before_drag'][0]['total'])
+            self.assertTrue(all(call.args == (999, 0x0401, 0) for call in gui.win32.return_value.send_message.call_args_list))
+        self.assertEqual(old[1].type_text.call_args_list, new[1].type_text.call_args_list)
+        self.assertEqual(old[1].press.call_args_list, new[1].press.call_args_list)
+
+    def test_missing_visible_bar_wrong_pid_count_and_title_timeout_fail(self):
+        for kwargs, message in [({'bar_state': 0}, 'timeout'), ({'bar_visible': False}, 'timeout'),
+                                ({'foreign': True}, 'foreign PID'), ({'count': 44}, '45 terminals'),
+                                ({'acknowledge': False}, 'output completion title')]:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(gx_perf.PerfError, message):
+                self.run_fixture(**kwargs)
+
+    def test_bar_owner_and_protocol_timeout_fail(self):
+        for owner, pid, state in [(9999, 123, 2), (314, 999, 2), (314, 123, None)]:
+            gui, instance, capture, windows, populate = self.fixture()
+            api = gui.win32.return_value
+            api.GetWindow.return_value = owner
+            api.window_pid.side_effect = lambda hwnd: pid if hwnd == 999 else 123
+            api.send_message.return_value = state
+            with mock.patch.object(gx_perf, 'populate', side_effect=populate), \
+                    mock.patch.object(gx_perf, 'main_windows', return_value=windows), \
+                    mock.patch.object(gx_perf.time, 'monotonic', side_effect=range(1000)), \
+                    mock.patch.object(gx_perf.time, 'sleep'), self.assertRaises(gx_perf.PerfError):
+                gx_perf.prepare_p3(gui, instance, capture)
+
+    def test_custom_shell_or_include_is_explicitly_rejected_before_input(self):
+        for config in ('command = pwsh.exe\n', gx_perf.DEFAULT_WIN32_CONFIG + 'config-file = other\n'):
+            gui, instance, capture, _, _ = self.fixture()
+            capture.report['config'] = config
+            with self.assertRaisesRegex(gx_perf.PerfError, 'custom configuration'):
+                gx_perf.prepare_p3(gui, instance, capture)
+            instance.type_text.assert_not_called()
+
+    def test_top_level_owner_is_bound_by_active_terminal_geometry(self):
+        gui, instance, capture, windows, populate = self.fixture()
+        gui.win32.return_value.GetWindow.return_value = 3
+        with mock.patch.object(gx_perf, 'populate', side_effect=populate), \
+                mock.patch.object(gx_perf, 'main_windows', return_value=windows):
+            gx_perf.prepare_p3(gui, instance, capture)
+        self.assertEqual(3, capture.report['p3_fixture']['before_drag'][0]['owner'])
+
+    def test_populate_calls_prepare_for_first_and_every_added_tab(self):
+        gui, instance = mock.Mock(), mock.Mock()
+        gui.TERMINAL_CLASS = 'GhosttyTerminal'
+        windows = [SimpleNamespace(hwnd=1, visible=True, cloaked=False)]
+        terminals = {1: [SimpleNamespace(hwnd=100, visible=True)]}
+        instance.require_window.return_value = windows[0]
+        gui.win32.return_value.child_windows.side_effect = lambda hwnd, cls: list(terminals[hwnd])
+        def press(key):
+            if key == 'ctrl+shift+n':
+                hwnd = len(windows) + 1
+                windows.append(SimpleNamespace(hwnd=hwnd, visible=True, cloaked=False))
+                terminals[hwnd] = [SimpleNamespace(hwnd=hwnd * 100, visible=True)]
+            else:
+                self.assertEqual(gx_perf.NEW_TAB_KEYS, key)
+                children = terminals[windows[-1].hwnd]
+                children.append(SimpleNamespace(hwnd=children[0].hwnd + len(children), visible=True))
+        instance.press.side_effect = press
+        prepared = []
+        with mock.patch.object(gx_perf, 'main_windows', side_effect=lambda *a: list(windows)), \
+                mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.populate(gui, instance, 15, 3,
+                             prepare=lambda window, previous=(): prepared.append(terminals[window.hwnd][-1].hwnd))
+        self.assertEqual(45, len(set(prepared)))
+
+    def test_measurement_mark_follows_preconditions_and_drag_keeps_original_contract(self):
+        gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()
+        capture.report = {'p3_fixture': {'drag_start': (400, 20), 'drag_end': (520, 60)}}
+        current = SimpleNamespace(hwnd=1, rect=(0, 0, 800, 600))
+        moved = SimpleNamespace(hwnd=1, rect=(120, 40, 920, 640))
+        instance.scale.return_value = 1
+        instance.caption_point.return_value = (400, 20)
+        order = []
+        def prepare(*_):
+            order.append('prepared')
+            return current
+        capture.mark.side_effect = lambda: order.append('mark') or b''
+        instance.drag.side_effect = lambda *a, **k: order.append('drag')
+        with mock.patch.object(gx_perf, 'prepare_p3', side_effect=prepare), \
+                mock.patch.object(gx_perf, 'p3_scrollbars', return_value=[]), \
+                mock.patch.object(gx_perf, 'main_windows', return_value=[moved]):
+            gx_perf.measure_ui(gui, instance, capture, SimpleNamespace(case='p3'))
+        self.assertEqual(['prepared', 'mark', 'drag'], order)
+        instance.drag.assert_called_once_with((400, 20), (520, 60), steps=60, step_delay=2/60)
+        capture.count.assert_called_once_with(capture.window.return_value, 'scrollbar.paint')
+
+    def test_caption_probe_fade_rejects_before_mark_or_drag(self):
+        gui, instance, capture, windows, populate = self.fixture()
+        def caption(_):
+            # Model a blocking caption probe outlasting the overlay's auto-fade.
+            gui.win32.return_value.send_message.return_value = 0
+            instance.windows.return_value[0].visible = False
+            return (400, 20)
+        instance.caption_point.side_effect = caption
+        with mock.patch.object(gx_perf, 'populate', side_effect=populate), \
+                mock.patch.object(gx_perf, 'main_windows', return_value=windows):
+            with self.assertRaisesRegex(gx_perf.PerfError, 'faded before measurement'):
+                gx_perf.measure_ui(gui, instance, capture, SimpleNamespace(case='p3'))
+        instance.drag.assert_not_called()
+        capture.mark.assert_not_called()
+        capture.window.assert_not_called()
+        capture.count.assert_not_called()
+        self.assertNotEqual('prepared', capture.report['p3_fixture']['status'])
+
+
 def ticks(idle_seconds: float, now: int = 50_000_000) -> dict:
     """A fake QuietProbe.input_ticks() result with the given idle time."""
     return {'last_input_tick': (now - round(idle_seconds * 1000)) & 0xFFFFFFFF, 'tick_count': now & 0xFFFFFFFF}
@@ -1888,19 +2093,23 @@ class ExperimentTests(unittest.TestCase):
 
     def test_p3_drags_real_caption_and_p6_holds_key_at_30hz(self):
         gui, instance, capture = mock.Mock(), mock.Mock(), mock.Mock()
-        capture.report = {'observations': {}}
+        capture.report = {'observations': {}, 'p3_fixture': {'drag_start': (500, 20), 'drag_end': (620, 60)}}
         old = SimpleNamespace(hwnd=10, rect=(0, 0, 800, 600))
         new = SimpleNamespace(hwnd=10, rect=(100, 50, 900, 650))
         gui.win32.return_value.foreground.return_value = 10
         instance.scale.return_value = 1
         instance.caption_point.return_value = (500, 20)
-        with mock.patch.object(gx_perf, 'populate') as populate, mock.patch.object(gx_perf, 'main_windows', side_effect=[[old], [new]]), mock.patch.object(gx_perf.time, 'sleep'):
+        with mock.patch.object(gx_perf, 'prepare_p3', return_value=old) as prepare, \
+                mock.patch.object(gx_perf, 'p3_scrollbars', return_value=[]), \
+                mock.patch.object(gx_perf, 'main_windows', return_value=[new]), mock.patch.object(gx_perf.time, 'sleep'):
             args = self.args()
             args.case = 'p3'
             gx_perf.measure_ui(gui, instance, capture, args)
-        populate.assert_called_once_with(gui, instance, 15, 3)
+        prepare.assert_called_once_with(gui, instance, capture)
         instance.drag.assert_called_once_with((500, 20), (620, 60), steps=60, step_delay=2/60)
-        instance.uia_rows.return_value = [{'type': 'ControlType.ListItem'}]
+        instance.uia_rows.side_effect = [
+            UiWorkloadProofTests.snapshot([UiWorkloadProofTests.theme(), UiWorkloadProofTests.theme('Beta', selected=False)]),
+            UiWorkloadProofTests.snapshot([UiWorkloadProofTests.theme(selected=False), UiWorkloadProofTests.theme('Beta')])]
         with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'):
             args.case = 'p6'
             gx_perf.measure_ui(gui, instance, capture, args)
@@ -1915,7 +2124,10 @@ class ExperimentTests(unittest.TestCase):
             instance = launch(exe, env_dir, **kwargs)
             new = kwargs['env'].get('GX_TEST_ARM') == 'new'
             # The historical image has no settings UIA provider: no theme list items, no theme.reload counter.
-            instance.uia_rows.return_value = [{'type': 'ControlType.ListItem'}] if new else [{'type': 'ControlType.Window'}]
+            instance.uia_rows.side_effect = ([
+                UiWorkloadProofTests.snapshot([UiWorkloadProofTests.theme(), UiWorkloadProofTests.theme('Beta', selected=False)]),
+                UiWorkloadProofTests.snapshot([UiWorkloadProofTests.theme(selected=False), UiWorkloadProofTests.theme('Beta')])]
+                if new else [[{'type': 'ControlType.Window'}]])
             def hold(*_, **__):
                 if new:
                     with instance.log.open('a', encoding='utf-8') as log:
@@ -1943,22 +2155,249 @@ class ExperimentTests(unittest.TestCase):
             gx_perf.measure_ui(mock.Mock(), instance, capture, args)
         instance.hold_key.assert_not_called()
 
-    def test_p5_sweeps_overlapping_pages_until_viewport_stops(self):
+    def test_p6_old_real_uia_parser_empty_tree_still_holds_but_bad_json_stops(self):
+        import gx_win_gui as gui
+        for raw in (b'[]', b'broken-json', b'[{}]'):
+            with self.subTest(raw=raw):
+                instance, backend = mock.Mock(), mock.Mock()
+                instance.pid = 42
+                instance.log = self.root / 'old-uia.log'
+                instance.log.write_text('', encoding='utf-8')
+                backend.window_pid.return_value = 42
+                instance.uia_rows.side_effect = lambda _: gui.Instance.uia_rows(instance, 100)
+                capture = gx_perf.CaptureRun(instance, self.root, {'baseline': True, 'diagnostic': False})
+                args = self.args(); args.case = 'p6'
+                result = SimpleNamespace(returncode=0, stdout=raw, stderr=b'probe detail')
+                with mock.patch.object(gui, 'win32', return_value=backend), \
+                        mock.patch.object(gui.subprocess, 'run', return_value=result), \
+                        mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), \
+                        mock.patch.object(capture, 'screenshot'), mock.patch.object(capture, 'drain', return_value=True), \
+                        mock.patch.object(gx_perf.time, 'sleep'):
+                    if raw != b'[]':
+                        reason = 'invalid node schema.*row 0' if raw == b'[{}]' else 'invalid JSON.*broken-json'
+                        with self.assertRaisesRegex(gui.GuiError, reason + '.*probe detail'):
+                            gx_perf.measure_ui(gui, instance, capture, args)
+                        instance.hold_key.assert_not_called()
+                        self.assertNotIn('missing_preconditions', capture.report)
+                        continue
+                    gx_perf.measure_ui(gui, instance, capture, args)
+                instance.hold_key.assert_called_once_with('down', seconds=2, hz=30)
+                self.assertEqual(0, capture.report['missing_preconditions']['theme_list_uia']['n'])
+                self.assertEqual(0, capture.report['missing_metrics']['theme.reload']['n'])
+                self.assertNotIn('theme.reload', capture.samples.values)
+
+    def test_p5_sweeps_every_entry_until_end_anchor_and_extra_down(self):
         import gx_win_gui as gui
         instance, capture, backend = mock.Mock(), mock.Mock(), mock.Mock()
         backend.client_rect.return_value = (0, 0, 400, 220)
         instance.scale.return_value = 1
-        image = gui.Image(400, 220, bytes(400 * 220 * 4))
-        instance.capture_window.return_value = image
+        # End, stable End, Home, after Home hover, Down, after last hover, extra Down.
+        instance.capture_window.side_effect = [gui.Image(400, 220, bytes([n]) * (400 * 220 * 4))
+                                              for n in (2, 2, 1, 1, 2, 2, 2)]
         capture.window.return_value = 'info(gx_perf): keybinds.paint 400us\n'
         capture.report = {}
         args = self.args()
         args.case = 'p5'
         with mock.patch.object(gui, 'win32', return_value=backend), mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), mock.patch.object(gx_perf.time, 'sleep'):
             gx_perf.measure_ui(gui, instance, capture, args)
-        self.assertEqual(1, instance.wheel.call_count)
+        instance.wheel.assert_not_called()
+        self.assertEqual([mock.call('ctrl+end'), mock.call('ctrl+home'), mock.call('down'), mock.call('down')],
+                         instance.press.call_args_list)
         self.assertGreater(instance.mouse.call_count, 10)
-        self.assertEqual(1, len(capture.report['frames']))
+        self.assertEqual(2, len(capture.report['frames']))
+
+    def test_p6_existing_provider_with_no_movement_fails_even_with_reload(self):
+        instance, capture = mock.Mock(), mock.Mock()
+        rows = UiWorkloadProofTests.snapshot([UiWorkloadProofTests.theme(), UiWorkloadProofTests.theme('Beta', selected=False)])
+        instance.uia_rows.return_value = rows
+        capture.report = {'observations': {}, 'baseline': False}
+        args = self.args(); args.case = 'p6'
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
+                self.assertRaisesRegex(gx_perf.PerfError, 'did not move'):
+            gx_perf.measure_ui(mock.Mock(), instance, capture, args)
+        instance.hold_key.assert_called_once_with('down', seconds=2, hz=30)
+        capture.count.assert_called_once()
+
+    def test_p6_saved_theme_preparation_is_outside_counted_hold(self):
+        instance = mock.Mock()
+        instance.log = self.root / 'theme-preparation.log'
+        instance.log.write_text('', encoding='utf-8')
+        def snapshot(selected, apply):
+            items = [UiWorkloadProofTests.theme(name, selected=name == selected)
+                     for name in ('Alpha', 'Beta', 'Gamma')]
+            items[2]['rect'][1] = 312
+            rows = UiWorkloadProofTests.snapshot(items)
+            rows[4]['rect'][3] = 108
+            return rows if apply else [r for r in rows if r.get('name') != 'Theme: Apply Theme']
+        instance.uia_rows.side_effect = [snapshot('Alpha', False), snapshot('Beta', True), snapshot('Gamma', True)]
+        capture = gx_perf.CaptureRun(instance, self.root, {'baseline': False, 'diagnostic': False,
+                                                         'capabilities': {'theme.reload': ''}})
+        def press(key):
+            if key == 'down':
+                with instance.log.open('a', encoding='utf-8') as log:
+                    log.write('info(gx_perf): metric theme.reload 1\n')
+        instance.press.side_effect = press
+        def hold(*_, **__):
+            with instance.log.open('a', encoding='utf-8') as log:
+                log.write('info(gx_perf): metric theme.reload 1\n')
+        instance.hold_key.side_effect = hold
+        args = self.args(); args.case = 'p6'
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), \
+                mock.patch.object(capture, 'screenshot'), mock.patch.object(capture, 'drain', return_value=True), \
+                mock.patch.object(gx_perf.time, 'sleep'):
+            gx_perf.measure_ui(mock.Mock(), instance, capture, args)
+        self.assertEqual([mock.call('ctrl+pagedown'), mock.call('down')], instance.press.call_args_list)
+        instance.hold_key.assert_called_once_with('down', seconds=2, hz=30)
+        self.assertEqual([1], capture.samples.values['theme.reload'])
+        self.assertEqual(2, instance.log.read_text(encoding='utf-8').count('theme.reload'))
+        self.assertEqual('Beta', capture.report['observations']['theme_selection_before']['selected'])
+
+    def test_p6_preparation_failure_never_starts_formal_hold(self):
+        import copy
+        initial = UiWorkloadProofTests.snapshot([
+            UiWorkloadProofTests.theme(), UiWorkloadProofTests.theme('Beta', selected=False)])
+        initial = [r for r in initial if r.get('name') != 'Theme: Apply Theme']
+        for failure in ('missing_anchor', 'unchanged', 'no_successor', 'unsettled'):
+            with self.subTest(failure=failure):
+                instance, capture = mock.Mock(), mock.Mock()
+                capture.report = {'observations': {}, 'baseline': False}
+                if failure == 'missing_anchor':
+                    after = copy.deepcopy(initial)
+                else:
+                    after = UiWorkloadProofTests.snapshot([
+                        UiWorkloadProofTests.theme(selected=failure == 'unchanged'),
+                        UiWorkloadProofTests.theme('Beta', selected=failure != 'unchanged')])
+                if failure == 'unsettled':
+                    gamma = UiWorkloadProofTests.theme('Gamma', selected=False)
+                    gamma['rect'][1] = 312
+                    after = UiWorkloadProofTests.snapshot([
+                        UiWorkloadProofTests.theme(selected=False), UiWorkloadProofTests.theme('Beta'), gamma])
+                    after[4]['rect'][3] = 108
+                instance.uia_rows.side_effect = [initial, after]
+                capture.drain.return_value = failure != 'unsettled'
+                args = self.args(); args.case = 'p6'
+                with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
+                        self.assertRaises(gx_perf.PerfError):
+                    gx_perf.measure_ui(mock.Mock(), instance, capture, args)
+                instance.hold_key.assert_not_called()
+                capture.mark.assert_not_called()
+                capture.count.assert_not_called()
+
+    def test_p6_without_visible_successor_stops_before_hold_without_claiming_end(self):
+        instance, capture = mock.Mock(), mock.Mock()
+        instance.uia_rows.return_value = UiWorkloadProofTests.snapshot([
+            UiWorkloadProofTests.theme(selected=False), UiWorkloadProofTests.theme('Beta')])
+        capture.report = {'observations': {}, 'baseline': False}
+        args = self.args(); args.case = 'p6'
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
+                self.assertRaisesRegex(gx_perf.PerfError, 'no visible following item'):
+            gx_perf.measure_ui(mock.Mock(), instance, capture, args)
+        instance.hold_key.assert_not_called()
+        capture.count.assert_not_called()
+
+    def test_p6_provider_disappearance_after_hold_is_not_historical_missing(self):
+        for baseline in (False, True):
+            with self.subTest(baseline=baseline):
+                instance, capture = mock.Mock(), mock.Mock()
+                instance.uia_rows.side_effect = [UiWorkloadProofTests.snapshot([
+                    UiWorkloadProofTests.theme(), UiWorkloadProofTests.theme('Beta', selected=False)]), []]
+                capture.report = {'observations': {}, 'baseline': baseline}
+                args = self.args(); args.case = 'p6'
+                with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf.time, 'sleep'), \
+                        self.assertRaisesRegex(gx_perf.PerfError, 'structure is absent'):
+                    gx_perf.measure_ui(mock.Mock(), instance, capture, args)
+                instance.hold_key.assert_called_once_with('down', seconds=2, hz=30)
+                self.assertNotIn('missing_preconditions', capture.report)
+
+    def test_p5_false_end_and_empty_hover_never_complete(self):
+        import gx_win_gui as gui
+        for pixels, raw, reason in [
+                ((2, 2, 1, 1, 1), 'info(gx_perf): keybinds.paint 400us\n', 'stalled'),
+                ((2, 2, 1), '', 'no paint'),
+                ((2, 2, 2), '', 'indistinguishable'),
+                ((2, 3), '', 'unstable')]:
+            with self.subTest(reason=reason):
+                instance, capture, backend = mock.Mock(), mock.Mock(), mock.Mock()
+                backend.client_rect.return_value = (0, 0, 400, 220)
+                instance.scale.return_value = 1
+                instance.capture_window.side_effect = [gui.Image(400, 220, bytes([n]) * (400 * 220 * 4))
+                                                      for n in pixels]
+                capture.window.return_value = raw
+                capture.report = {}
+                args = self.args(); args.case = 'p5'
+                with mock.patch.object(gui, 'win32', return_value=backend), \
+                        mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui') as close, \
+                        mock.patch.object(gx_perf.time, 'sleep'), self.assertRaisesRegex(gx_perf.PerfError, reason):
+                    gx_perf.measure_ui(gui, instance, capture, args)
+                close.assert_not_called()
+
+    def test_p5_real_capture_old_missing_continues_but_new_empty_rejects(self):
+        import gx_win_gui as gui
+        for baseline in (True, False):
+            with self.subTest(baseline=baseline):
+                instance, backend = mock.Mock(), mock.Mock()
+                instance.log = self.root / ('old-empty.log' if baseline else 'new-empty.log')
+                instance.log.write_text('', encoding='utf-8')
+                instance.scale.return_value = 1
+                backend.client_rect.return_value = (0, 0, 400, 220)
+                instance.capture_window.side_effect = [gui.Image(400, 220, bytes([n]) * (400 * 220 * 4))
+                                                      for n in (2, 2, 1, 1, 2, 2, 2)]
+                capture = gx_perf.CaptureRun(instance, self.root, {
+                    'baseline': baseline, 'diagnostic': False,
+                    'capabilities': {} if baseline else {'keybinds.paint': 'ms', 'd2d.layout_create': ''}})
+                args = self.args(); args.case = 'p5'
+                with mock.patch.object(gui, 'win32', return_value=backend), \
+                        mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui') as close, \
+                        mock.patch.object(capture, 'screenshot'), mock.patch.object(gx_perf.time, 'sleep'):
+                    if not baseline:
+                        with self.assertRaisesRegex(gx_perf.PerfError, 'no paint frames'):
+                            gx_perf.measure_ui(gui, instance, capture, args)
+                        close.assert_not_called()
+                        self.assertNotEqual('PASS', gx_perf.absolute_gate(args, capture)['status'])
+                        continue
+                    gx_perf.measure_ui(gui, instance, capture, args)
+                self.assertEqual([mock.call('ctrl+end'), mock.call('ctrl+home'),
+                                  mock.call('down'), mock.call('down')], instance.press.call_args_list)
+                self.assertEqual([0, 0], [page['frames'] for page in capture.report['hover_pages']])
+                for name in ('keybinds.paint', 'd2d.layout_create.per_frame'):
+                    self.assertNotIn(name, capture.samples.values)
+                    self.assertEqual(0, capture.report['missing_metrics'][name]['n'])
+                    self.assertEqual('not_instrumented', capture.report['missing_metrics'][name]['status'])
+                self.assertEqual('not_evaluated', gx_perf.absolute_gate(args, capture)['status'])
+
+    def test_p6_no_move_batch_cannot_have_pass_gate(self):
+        args = self.args('win32-ui', '--case', 'p6')
+        gui = self.fake_gui()
+        launch = gui.launch.side_effect
+        def launch_arm(*argv, **kwargs):
+            instance = launch(*argv, **kwargs)
+            instance.uia_rows.return_value = UiWorkloadProofTests.snapshot([UiWorkloadProofTests.theme(),
+                                             UiWorkloadProofTests.theme('Beta', selected=False)])
+            def hold(*_, **__):
+                with instance.log.open('a', encoding='utf-8') as log:
+                    log.write('info(gx_perf): metric theme.reload 1\n')
+            instance.hold_key.side_effect = hold
+            return instance
+        gui.launch.side_effect = launch_arm
+        with mock.patch.object(gx_perf, 'open_ui'), mock.patch.object(gx_perf, 'close_ui'), \
+                mock.patch.object(gx_perf.CaptureRun, 'drain'), mock.patch.object(gx_perf.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1, gx_perf.run_experiment(args, gui))
+        result = json.loads((args.out / 'RESULT.json').read_text(encoding='utf-8'))
+        self.assertFalse(result['valid'])
+        self.assertNotEqual('PASS', result['runs'][0]['absolute_gate']['status'])
+
+    def test_p5_p6_original_numeric_thresholds_are_unchanged(self):
+        args = self.args(); args.case = 'p6'
+        capture = gx_perf.CaptureRun(mock.Mock(), self.root, {'baseline': False})
+        for count, expected in ((0, 'FAIL'), (1, 'PASS'), (2, 'FAIL')):
+            capture.samples.values['theme.reload'] = [count]
+            self.assertEqual(expected, gx_perf.absolute_gate(args, capture)['status'])
+        args.case = 'p5'
+        for paint, layouts, expected in ((1.999, 10, 'PASS'), (2, 10, 'FAIL'), (1, 11, 'FAIL')):
+            capture.samples.values['keybinds.paint'] = [paint]
+            capture.samples.values['d2d.layout_create.per_frame'] = [layouts]
+            self.assertEqual(expected, gx_perf.absolute_gate(args, capture)['status'])
 
     def test_remote_accepts_unknown_remote_names_and_ignores_other_metrics(self):
         log = self.root / 'remote.log'
@@ -1971,6 +2410,128 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual({'remote.frame_bytes', 'remote.future'}, set(report))
         self.assertEqual(100, report['remote.frame_bytes']['sum'])
         self.assertEqual(.2, report['remote.future']['median'])
+
+
+class UiWorkloadProofTests(unittest.TestCase):
+    @staticmethod
+    def theme(name='Alpha', parent='themes', selected=True):
+        return {'type': 'ControlType.ListItem', 'name': name, 'id': name, 'runtime_id': name,
+                'rect': [220, 240 if name == 'Alpha' else 276, 360, 36],
+                'selection_item': True, 'selected': selected,
+                'parent': {'runtime_id': parent, 'name': '', 'type': 'ControlType.List'}}
+
+    @staticmethod
+    def snapshot(items):
+        root = {'hwnd': 100, 'runtime_id': 'root', 'name': 'Settings',
+                'type': 'ControlType.Window', 'rect': [0, 0, 640, 500]}
+        rows = [
+            {'runtime_id': 'sections', 'name': 'Settings', 'type': 'ControlType.Tab',
+             'parent': root, 'rect': [10, 80, 170, 400]},
+            {'runtime_id': 'appearance', 'name': 'Appearance', 'type': 'ControlType.TabItem',
+             'parent': {'runtime_id': 'sections'}, 'selected': True, 'selection_item': True,
+             'rect': [10, 120, 170, 40]},
+            {'runtime_id': 'apply', 'name': 'Theme: Apply Theme', 'type': 'ControlType.Button',
+             'parent': root, 'rect': [500, 130, 100, 30]},
+            {'runtime_id': 'search', 'name': '', 'type': 'ControlType.Edit',
+             'parent': root, 'rect': [210, 190, 390, 30]},
+            {'runtime_id': 'themes', 'name': '', 'type': 'ControlType.List',
+             'parent': root, 'rect': [220, 240, 360, 72]},
+            *items]
+        return [{**row, 'root': dict(root)} for row in rows]
+
+    def test_empty_name_real_provider_shape_and_structural_rejections(self):
+        import copy
+        rows = self.snapshot([self.theme(), self.theme('Beta', selected=False)])
+        self.assertEqual('Alpha', gx_perf.theme_selection(rows)['selected'])
+        for defect in ('section', 'position', 'ambiguous', 'owner', 'parent', 'search', 'button'):
+            bad = copy.deepcopy(rows)
+            if defect == 'section': bad[1]['name'] = 'Font'
+            elif defect == 'position': bad[4]['rect'][0] = 5
+            elif defect == 'ambiguous': bad.insert(4, {**bad[4], 'runtime_id': 'another-list'})
+            elif defect == 'owner': bad[-1]['root']['hwnd'] = 200
+            elif defect == 'parent': bad[4]['parent'] = {'runtime_id': 'foreign'}
+            elif defect == 'search': bad[3]['rect'][1] = 350
+            else: bad[2]['name'] = 'Font: Apply Font'
+            with self.subTest(defect=defect), self.assertRaises(gx_perf.PerfError):
+                gx_perf.theme_selection(bad)
+
+    def test_optional_apply_is_preparation_only_and_list_may_be_inset(self):
+        rows = self.snapshot([self.theme(), self.theme('Beta', selected=False)])
+        # List bounds are the visible child union, not the width of the search.
+        rows[4]['rect'][0:3:2] = [280, 200]
+        for item in rows[5:]:
+            item['rect'][0:3:2] = [280, 200]
+        rows[2]['rect'][0] = 450  # Apply can leave space at the right edge.
+        gx_perf.theme_selection(rows)
+        rows = [r for r in rows if r.get('name') != 'Theme: Apply Theme']
+        self.assertIsNone(gx_perf.theme_selection(rows, require_apply=False)['apply_rect'])
+        with self.assertRaisesRegex(gx_perf.PerfError, 'apply button'):
+            gx_perf.theme_selection(rows)
+
+    def test_tab_and_list_must_have_own_snapshot_identity_and_correct_parent(self):
+        import copy
+        rows = self.snapshot([self.theme(), self.theme('Beta', selected=False)])
+        for index, key in ((0, 'runtime_id'), (4, 'runtime_id'), (0, 'parent'), (4, 'parent')):
+            bad = copy.deepcopy(rows)
+            bad[index].pop(key)
+            with self.subTest(index=index, key=key), self.assertRaises(gx_perf.PerfError):
+                gx_perf.theme_selection(bad, require_apply=False)
+
+    def test_theme_selection_requires_unique_theme_container_and_selection(self):
+        rows = [self.theme(), self.theme('Beta', selected=False)]
+        self.assertEqual('Alpha', gx_perf.theme_selection(self.snapshot(rows))['selected'])
+        for bad in ([], [self.theme(selected=False)],
+                    [self.theme(), self.theme('Beta')],
+                    [{**self.theme(), 'selected': None}],
+                    [{**self.theme(), 'selection_item': False}],
+                    [{**self.theme(), 'parent': {'name': 'Font', 'type': 'ControlType.List', 'runtime_id': 'x'}}],
+                    [self.theme(), self.theme('Beta', parent='other', selected=False)]):
+            with self.subTest(rows=bad), self.assertRaises(gx_perf.PerfError):
+                gx_perf.theme_selection(self.snapshot(bad))
+
+    def test_theme_selection_movement_is_semantic_not_item_id(self):
+        before = gx_perf.theme_selection(self.snapshot([self.theme(), self.theme('Beta', selected=False)]))
+        changed_id = self.theme(); changed_id['id'] = 'replacement'
+        same = gx_perf.theme_selection(self.snapshot([changed_id, self.theme('Beta', selected=False)]))
+        with self.assertRaisesRegex(gx_perf.PerfError, 'did not move'):
+            gx_perf.theme_movement(before, same)
+        after = gx_perf.theme_selection(self.snapshot([self.theme(selected=False), self.theme('Beta')]))
+        gx_perf.theme_movement(before, after)
+        after['container']['name'] = 'Font'
+        with self.assertRaisesRegex(gx_perf.PerfError, 'container'):
+            gx_perf.theme_movement(before, after)
+
+    def test_provider_rebuild_is_allowed_but_not_evidence_of_selection_movement(self):
+        def rebuilt(value):
+            if isinstance(value, list):
+                return [rebuilt(item) for item in value]
+            if isinstance(value, dict):
+                return {key: (item + '-rebuilt' if key in ('runtime_id', 'id') and isinstance(item, str)
+                              else rebuilt(item)) for key, item in value.items()}
+            return value
+        rows = self.snapshot([self.theme(), self.theme('Beta', selected=False)])
+        before = gx_perf.theme_selection(rows)
+        with self.assertRaisesRegex(gx_perf.PerfError, 'did not move'):
+            gx_perf.theme_movement(before, gx_perf.theme_selection(rebuilt(rows)))
+        rows = self.snapshot([self.theme(selected=False), self.theme('Beta')])
+        after = gx_perf.theme_selection(rebuilt(rows))
+        gx_perf.theme_movement(before, after)
+        after['search_rect'][0] += 20
+        with self.assertRaisesRegex(gx_perf.PerfError, 'column moved'):
+            gx_perf.theme_movement(before, after)
+
+    def test_visible_candidates_are_sorted_by_geometry_not_uia_enumeration(self):
+        rows = self.snapshot([self.theme('Beta', selected=False), self.theme()])
+        state = gx_perf.theme_selection(rows)
+        self.assertEqual(['Alpha', 'Beta'], state['visible_names'])
+        self.assertIn('not the complete', state['coverage'])
+
+    def test_p5_unchanged_is_only_terminal_at_independent_anchor(self):
+        self.assertTrue(gx_perf.keybind_end('end', 'end', 'end', set()))
+        self.assertFalse(gx_perf.keybind_end('first', 'next', 'end', {'first'}))
+        for before, after, seen in [('middle', 'middle', set()), ('a', 'b', {'b'})]:
+            with self.assertRaises(gx_perf.PerfError):
+                gx_perf.keybind_end(before, after, 'end', seen)
 
 
 class StatisticsTests(unittest.TestCase):

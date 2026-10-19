@@ -1811,6 +1811,126 @@ def keybind_frames(text: str) -> list[dict]:
     return frames
 
 
+def keybind_end(before: str, after: str, anchor: str, seen: set[str]) -> bool:
+    if before == after == anchor:
+        return True
+    if before == after or after in seen:
+        raise PerfError('shortcut navigation stalled or cycled before the independent End anchor')
+    return False
+
+
+def theme_selection(rows: Sequence[Mapping], *, require_apply: bool = True) -> dict:
+    # publishSettings gives the themes list/search an EMPTY name, unlike its
+    # preceding Theme group. Identify the actual Appearance structure, not an
+    # arbitrary list or an imagined accessible label. Runtime IDs bind one
+    # snapshot only; scrolling can rebuild them.
+    def rect(row):
+        value = row.get('rect')
+        if (not isinstance(value, (list, tuple)) or len(value) != 4
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in value)
+                or value[2] <= 0 or value[3] <= 0):
+            raise PerfError('theme structure has invalid geometry')
+        x, y, w, h = value
+        return x, y, x + w, y + h
+
+    def one(values, name):
+        if len(values) != 1:
+            raise PerfError(f'theme {name} is absent or ambiguous')
+        return values[0]
+
+    if not rows:
+        raise PerfError('theme structure is absent')
+    root = rows[0].get('root') or {}
+    if (root.get('name') != 'Settings' or root.get('type') != 'ControlType.Window'
+            or type(root.get('hwnd')) is not int or root['hwnd'] <= 0 or not root.get('runtime_id')
+            or any(row.get('root') != root for row in rows)):
+        raise PerfError('theme structure has inconsistent owned popup identity')
+    rx, ry, rr, rb = rect(root)
+    ids = [row.get('runtime_id') for row in rows]
+    if any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
+        raise PerfError('theme snapshot node identities are absent or ambiguous')
+    def parent(row):
+        return (row.get('parent') or {}).get('runtime_id')
+    if any(parent(row) not in {*ids, root['runtime_id']} for row in rows):
+        raise PerfError('theme snapshot has an unresolved parent')
+    direct = [row for row in rows if parent(row) == root['runtime_id']]
+    tabs = one([r for r in direct if r.get('type') == 'ControlType.Tab'
+                and r.get('name') == 'Settings'], 'section container')
+    selected_sections = [r for r in rows if parent(r) == tabs['runtime_id']
+                         and r.get('type') == 'ControlType.TabItem' and r.get('selected') is True]
+    section = one(selected_sections, 'selected section')
+    if section.get('name') != 'Appearance' or section.get('selection_item') is not True:
+        raise PerfError('theme selected section is not Appearance')
+    buttons = [r for r in direct if r.get('type') == 'ControlType.Button'
+               and r.get('name') == 'Theme: Apply Theme']
+    # The normal saved selection has no Apply hit/provider. Only preparation
+    # may proceed without it; still reject multiple anchors rather than guessing.
+    button = one(buttons, 'apply button') if buttons or require_apply else None
+    search = one([r for r in direct if r.get('type') == 'ControlType.Edit'
+                  and r.get('name') == ''], 'search field')
+    container = one([r for r in direct if r.get('type') == 'ControlType.List'
+                     and r.get('name') == ''], 'list container')
+    tx, ty, tr, tb = rect(tabs)
+    sx, sy, sr, sb = rect(search)
+    lx, ly, lr, lb = rect(container)
+    # Geometry is in screen pixels; tolerate only rounding at shared edges.
+    # The list's published bounds are the UNION OF VISIBLE ITEMS, not its
+    # total scroll range. Search spans the content column; Apply is at its right.
+    tol = 2
+    for node in (tabs, section, search, container, *([button] if button else [])):
+        x, y, right, bottom = rect(node)
+        if x < rx-tol or y < ry-tol or right > rr+tol or bottom > rb+tol:
+            raise PerfError('theme structure extends outside owned popup')
+    if not (tr <= sx+tol and sb <= ly+tol
+            and sx-tol <= lx < lr <= sr+tol
+            and ly-sb <= 2*(sb-sy)):
+        raise PerfError('theme list/search/apply geometry is not one adjacent content column')
+    if button:
+        bx, by, br, bb = rect(button)
+        if not (sx-tol <= bx < br <= sr+tol and bb <= sy+tol and sy-bb <= 4*(sb-sy)):
+            raise PerfError('theme Apply anchor is outside the adjacent content column')
+    items = [r for r in rows if parent(r) == container['runtime_id']
+             and r.get('type') == 'ControlType.ListItem']
+    if not items:
+        raise PerfError('theme list has no visible candidates')
+    items.sort(key=lambda row: rect(row)[1])
+    previous_bottom = None
+    for item in items:
+        x, y, right, bottom = rect(item)
+        if (x < lx-tol or right > lr+tol or y < ly-tol or bottom > lb+tol
+                or (previous_bottom is not None and y < previous_bottom-tol)):
+            raise PerfError('theme candidate geometry is outside list or overlapping')
+        previous_bottom = bottom
+    if any(row.get('selection_item') is not True or type(row.get('selected')) is not bool
+           or not row.get('name') for row in items):
+        raise PerfError('theme list selection provider is incomplete')
+    selected = [row for row in items if row['selected']]
+    if len(selected) != 1:
+        raise PerfError('theme list must expose exactly one selected item')
+    names = [row['name'] for row in items]
+    if len(set(names)) != len(names):
+        raise PerfError('theme names are ambiguous')
+    return {'root': dict(root), 'section': 'Appearance', 'container': dict(container),
+            'search_rect': list(search['rect']), 'apply_rect': list(button['rect']) if button else None,
+            'selected': selected[0]['name'], 'visible_names': names,
+            'coverage': 'visible candidates only; not the complete theme inventory'}
+
+
+def theme_movement(before: Mapping, after: Mapping) -> None:
+    if before['root']['hwnd'] != after['root']['hwnd'] or before['section'] != after['section']:
+        raise PerfError('theme owned popup or section changed')
+    if any(before['container'].get(key) != after['container'].get(key) for key in ('name', 'type')):
+        raise PerfError('theme list container changed')
+    geometry_keys = ['search_rect']
+    if before['apply_rect'] is not None and after['apply_rect'] is not None:
+        geometry_keys.append('apply_rect')
+    if any(abs(a-b) > 2 for key in geometry_keys
+           for a, b in zip(before[key], after[key])):
+        raise PerfError('theme content column moved during held Down')
+    if before['selected'] == after['selected']:
+        raise PerfError('theme selection did not move during held Down')
+
+
 def wait_until(predicate, description: str, timeout: float = 10):
     deadline = time.monotonic() + timeout
     while True:
@@ -1872,7 +1992,7 @@ def main_windows(gui, instance):
     return [w for w in instance.windows() if w.cls == gui.WINDOW_CLASS and not w.toolwindow]
 
 
-def populate(gui, instance, tabs: int, windows: int):
+def populate(gui, instance, tabs: int, windows: int, prepare=None):
     """All terminals belong to one owned PID; creation uses default keybindings."""
     for window_index in range(windows):
         if window_index:
@@ -1884,17 +2004,143 @@ def populate(gui, instance, tabs: int, windows: int):
             current = instance.require_window()
         if not gui.win32().activate(current.hwnd):
             raise gui.InputBlocked('cannot activate the owned window')
+        if prepare is not None:
+            prepare(current)
         for _ in range(tabs - 1):
             before = {w.hwnd for w in gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)}
             instance.press(NEW_TAB_KEYS)
-            wait_until(lambda: any(w.hwnd not in before and w.visible for w in
-                                   gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)), 'new tab')
+            if prepare is not None:
+                prepare(current, before)
+            else:
+                wait_until(lambda: any(w.hwnd not in before and w.visible for w in
+                                       gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS)), 'new tab')
         actual = len(gui.win32().child_windows(current.hwnd, gui.TERMINAL_CLASS))
         if actual != tabs:
             raise PerfError(f"expected {tabs} terminal children, found {actual}")
     if len(main_windows(gui, instance)) != windows:
         raise PerfError('window count differs from requested topology')
     time.sleep(1)
+
+
+def p3_scrollbars(gui, instance):
+    """Use only the visibility query supported by both historical and current images."""
+    api = gui.win32()
+    rows = []
+    for bar in instance.windows():
+        if bar.cls != 'GhosttyScrollbar':
+            continue
+        owner = api.GetWindow(bar.hwnd, 4)  # GW_OWNER may normalize a child owner to its top-level window.
+        if api.window_pid(bar.hwnd) != instance.pid or api.window_pid(owner) != instance.pid:
+            raise PerfError('P3 scrollbar has a foreign PID')
+        state = api.send_message(bar.hwnd, 0x0401, 0)
+        if state not in (0, 1, 2, 3):
+            raise PerfError('P3 scrollbar visibility query failed')
+        rows.append(dict(hwnd=bar.hwnd, owner=owner, pid=instance.pid, state=state,
+                         visible=bar.visible, cloaked=bar.cloaked, rect=list(bar.rect),
+                         total='unknown', offset='unknown', length='unknown'))
+    return rows
+
+
+def prepare_p3(gui, instance, capture):
+    # Accept the known cmd invocation only. Includes/profiles can change its semantics;
+    # refusing them is safer than silently replacing the user's configuration.
+    config = capture.report['config']
+    settings = [line.strip() for line in config.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+    allowed = {'command = cmd.exe /d /k prompt $G$S', 'language = en', 'confirm-close-surface = false'}
+    if set(settings) - allowed or settings.count('command = cmd.exe /d /k prompt $G$S') != 1:
+        raise PerfError('P3 requires the default cmd configuration; custom configuration is unsupported')
+    evidence = dict(status='preparing', terminals=[], protocol='WM_USER+1/wparam=0 visibility only',
+                    auto_fade='allowed; no host setting or mode override', image_review='PENDING')
+    capture.report['p3_fixture'] = evidence
+    api = gui.win32()
+
+    def prepare(window, previous=()):
+        excluded = set(previous) | {row['hwnd'] for row in evidence['terminals']}
+        observation = dict(window=window.hwnd, expected_pid=instance.pid,
+                           excluded_hwnds=sorted(excluded), polls=0, status='waiting', candidates=[])
+        evidence.setdefault('terminal_waits', []).append(observation)
+
+        def unique_new_pane():
+            # a353 selects/layouts the new pane before hiding the old one.
+            # Wait for that transition, without ever typing into an old pane.
+            terminals = api.child_windows(window.hwnd, gui.TERMINAL_CLASS)
+            rows = [dict(hwnd=w.hwnd, visible=w.visible, cloaked=w.cloaked,
+                         pid=api.window_pid(w.hwnd), rect=list(w.rect), excluded=w.hwnd in excluded)
+                    for w in terminals]
+            observation.update(candidates=rows, window_pid=api.window_pid(window.hwnd),
+                               polls=observation['polls'] + 1)
+            if observation['window_pid'] != instance.pid or any(row['pid'] != instance.pid for row in rows):
+                raise PerfError('P3 terminal has a foreign PID')
+            visible = [w for w in terminals if w.visible and not w.cloaked]
+            return visible[0] if len(visible) == 1 and visible[0].hwnd not in excluded else None
+
+        try:
+            terminal = wait_until(unique_new_pane, 'P3 unique owned visible new pane', timeout=10)
+        except PerfError as exc:
+            observation.update(status='failed', error=str(exc))
+            raise PerfError(f'{exc}; candidates={observation["candidates"]}') from exc
+        observation.update(status='ready', selected_hwnd=terminal.hwnd)
+        marker = f'GX-P3-{instance.pid}-{terminal.hwnd}-{time.monotonic_ns()}'
+        # The title is emitted AFTER all lines, and must be observed, not inferred
+        # from elapsed time or from the echoed command line.
+        instance.type_text(f'for /L %i in (1,1,300) do @echo GX-P3-LINE-%i')
+        instance.press('enter')
+        instance.type_text(f'title {marker}')
+        instance.press('enter')
+        wait_until(lambda: api.window_text(window.hwnd) == marker, 'P3 output completion title')
+        evidence['terminals'].append(dict(hwnd=terminal.hwnd, window=window.hwnd, pid=instance.pid,
+                                          marker=marker, output_lines=300, title_acknowledged=True))
+
+    populate(gui, instance, 15, 3, prepare=prepare)
+    windows = main_windows(gui, instance)
+    actual = {w.hwnd: [t.hwnd for t in api.child_windows(w.hwnd, gui.TERMINAL_CLASS)] for w in windows}
+    prepared = {row['hwnd'] for row in evidence['terminals']}
+    if (len(actual) != 3 or any(len(ts) != 15 for ts in actual.values()) or len(prepared) != 45
+            or prepared != {t for ts in actual.values() for t in ts}):
+        raise PerfError('P3 prepared topology is not 3 windows / 45 terminals')
+    evidence.update(actual_windows=len(actual), actual_terminals=len(prepared), topology=actual)
+    current = next((w for w in windows if w.hwnd == api.foreground()), None)
+    if current is None:
+        raise PerfError('P3 active window is not owned')
+    target = evidence['terminals'][-1]
+    if target['window'] != current.hwnd:
+        raise PerfError('P3 active window differs from the prepared target')
+    terminal = next(t for t in api.child_windows(current.hwnd, gui.TERMINAL_CLASS) if t.hwnd == target['hwnd'])
+    if not terminal.visible or terminal.cloaked:
+        raise PerfError('P3 target terminal is hidden')
+    evidence['before_wheel'] = p3_scrollbars(gui, instance)
+    left, top, right, bottom = terminal.rect
+    point = ((left + right) // 2, (top + bottom) // 2)
+    instance.wheel(*point, delta=120, count=3)
+
+    def shown():
+        rows = p3_scrollbars(gui, instance)
+        # With a normalized top-level owner, the sole visible bar along the active
+        # terminal's right edge identifies it. Hidden siblings remain in evidence.
+        matches = [row for row in rows if row['visible'] and not row['cloaked']
+                   and row['owner'] in (terminal.hwnd, current.hwnd)
+                   and left <= row['rect'][0] < right and abs(row['rect'][2] - right) <= 2
+                   and top <= row['rect'][1] < row['rect'][3] <= bottom]
+        if len(matches) > 1:
+            raise PerfError('P3 target has multiple scrollbars')
+        return rows if len(matches) == 1 and matches[0]['state'] == 2 and matches[0]['visible'] and not matches[0]['cloaked'] else None
+
+    evidence['before_drag'] = wait_until(shown, 'P3 owned visible shown scrollbar')
+    evidence.update(target=target, wheel=dict(point=point, delta=120, count=3),
+                    target_binding='owned HWND + sole visible bar at active terminal right edge')
+    capture.screenshot('p3-before-drag', current)
+    # Capture and caption probing can outlast auto-fade. Finish all potentially
+    # blocking preparation before the final ownership/visibility check and mark.
+    scale = instance.scale(current)
+    x, y = instance.caption_point(current)
+    evidence.update(drag_start=(round(x), round(y)),
+                    drag_end=(round(x + 120 * scale), round(y + 40 * scale)))
+    final_shown = shown()
+    if not final_shown:
+        raise PerfError('P3 scrollbar faded before measurement')
+    evidence['before_drag'] = final_shown
+    evidence['status'] = 'prepared'
+    return current
 
 
 class CaptureRun:
@@ -1989,17 +2235,23 @@ class CaptureRun:
 def measure_ui(gui, instance, capture: CaptureRun, args):
     case = args.case
     if case == 'p3':
-        populate(gui, instance, 15, 3)
-        current = next(w for w in main_windows(gui, instance) if w.hwnd == gui.win32().foreground())
-        scale = instance.scale(current)
-        x, y = instance.caption_point(current)
+        current = prepare_p3(gui, instance, capture)
+        fixture = capture.report['p3_fixture']
         before = capture.mark()
-        instance.drag((round(x), round(y)), (round(x + 120 * scale), round(y + 40 * scale)), steps=60, step_delay=2 / 60)
+        began = time.monotonic()
+        instance.drag(fixture['drag_start'], fixture['drag_end'], steps=60, step_delay=2 / 60)
+        ended = time.monotonic()
+        capture.report['p3_fixture'].update(drag_seconds=ended - began,
+                                          drag_start_monotonic=began, drag_end_monotonic=ended,
+                                          drag_steps=60, drag_step_delay=2 / 60)
+        capture.report['p3_fixture']['after_drag'] = p3_scrollbars(gui, instance)
         capture.drain(['scrollbar.paint'], minimum=0.6, quiet=0.5)
         capture.count(capture.window('drag', before), 'scrollbar.paint')
         moved = next(w for w in main_windows(gui, instance) if w.hwnd == current.hwnd)
         if moved.rect[:2] == current.rect[:2]:
             raise PerfError('title-bar drag did not move the window')
+        capture.report['p3_fixture'].update(start_rect=list(current.rect), end_rect=list(moved.rect),
+                                          after_drain=p3_scrollbars(gui, instance), counter_scope='whole owned process log')
         capture.screenshot('drag', moved)
     elif case == 'p4':
         for name in ('palette', 'menu', 'settings'):
@@ -2038,21 +2290,38 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
     elif case == 'p5':
         popup = open_ui(instance, 'keybinds')
         time.sleep(0.6)
-        instance.press('ctrl+home')
-        time.sleep(0.2)
         # Keybinds has no UIA row provider. Sweep every 8 DIP (rows >=32 DIP)
-        # and overlap wheel pages, so each visible entry receives hover without
-        # invoking a private hook. Crop out the blinking search caret and scrollbar.
+        # and advance one entry at a time: category headers cannot cause skipped
+        # rows. Crop out the blinking search caret and scrollbar.
         scale = instance.scale(instance.require_window())
         left, top, right, bottom = gui.win32().client_rect(popup.hwnd)
         x = round((left + right) / 2)
         first_y, last_y = round(top + 112 * scale), round(bottom - 8 * scale)
         viewport = (round(left + 24 * scale), first_y, round(right - 24 * scale), last_y)
         frames, pages = [], []
+        # Keep partial traversal evidence even when a later guard rejects it.
+        capture.report['frames'] = frames
+        capture.report['hover_pages'] = pages
         def fingerprint():
+            # Same non-list pointer position for anchors and every comparison.
+            # Selection stays visible, so stalled keys cannot masquerade as progress.
+            instance.mouse(x, round(top + 80 * scale), action='move')
+            time.sleep(0.2)
             image = instance.capture_window(popup)
             return hashlib.sha256(gui.crop(image, viewport).bgra).hexdigest()
-        for page in range(100):
+        instance.press('ctrl+end')
+        anchor = fingerprint()
+        capture.screenshot('keybinds-end-anchor', popup)
+        if fingerprint() != anchor:
+            raise PerfError('shortcut End anchor is unstable')
+        instance.press('ctrl+home')
+        current = fingerprint()
+        capture.screenshot('keybinds-home-anchor', popup)
+        if current == anchor:
+            raise PerfError('shortcut Home/End anchors are indistinguishable')
+        capture.report['keybinds_anchors'] = {'home': current, 'end': anchor}
+        seen = {current}
+        for page in range(4096):
             before = capture.mark()
             points = list(range(first_y, last_y, max(1, round(8 * scale))))
             if not points:
@@ -2061,18 +2330,31 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
                 instance.mouse(x, y, action='move')
                 time.sleep(0.05)
             time.sleep(0.1)
-            frames.extend(keybind_frames(capture.window(f'hover-page-{page + 1}', before)))
-            pages.append({'page': page + 1, 'points': len(points)})
-            old_image = fingerprint()
-            instance.wheel(x, points[-1], delta=-120, count=1)
-            time.sleep(0.3)
-            if fingerprint() == old_image:
+            measured = keybind_frames(capture.window(f'hover-page-{page + 1}', before))
+            if not measured:
+                # Historical builds without paint instrumentation still perform
+                # the full guarded traversal. Missing samples are never zeros.
+                # A declared/observed emitter (even in the old arm), or any new
+                # arm, must actually emit a frame for each hover sweep.
+                historical_missing = (capture.report.get('baseline', False)
+                                      and not capture.supported('keybinds.paint', 'ms'))
+                if not historical_missing:
+                    raise PerfError('shortcut hover sweep produced no paint frames')
+            frames.extend(measured)
+            pages.append({'page': page + 1, 'points': len(points), 'fingerprint': current,
+                          'frames': len(measured)})
+            capture.screenshot(f'keybinds-step-{page + 1:04d}', popup)
+            if fingerprint() != current:
+                raise PerfError('shortcut viewport changed during hover sweep')
+            instance.press('down')
+            following = fingerprint()
+            if keybind_end(current, following, anchor, seen):
                 break
+            seen.add(following)
+            current = following
         else:
-            raise PerfError('shortcut sheet did not reach its last page')
-        capture.report['frames'] = frames
-        capture.report['hover_pages'] = pages
-        capture.report['hover_strategy'] = '8 DIP vertical sweep, overlapping 3-row wheel pages; unchanged viewport ends traversal'
+            raise PerfError('shortcut sheet did not reach its independent End anchor')
+        capture.report['hover_strategy'] = '8 DIP sweep; single Down per entry; independent End anchor plus stable extra Down'
         layout_supported = capture.supported('d2d.layout_create')
         for frame in frames:
             capture.add('keybinds.paint', frame['paint_ms'], 'ms')
@@ -2092,6 +2374,7 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
         rows = instance.uia_rows(popup.hwnd)
         items = sum(row.get('type') == 'ControlType.ListItem' for row in rows)
         capture.report['observations']['theme_list_uia'] = {'list_items': items}
+        selection_before = None
         if not items:
             if not capture.report.get('baseline'):
                 raise PerfError('theme page has no theme list items')
@@ -2099,10 +2382,41 @@ def measure_ui(gui, instance, capture: CaptureRun, args):
             # missing metric (M5) this is not_instrumented and never stops AB/BA.
             capture.report.setdefault('missing_preconditions', {})['theme_list_uia'] = {
                 'status': 'not_instrumented', 'n': 0, 'scope': 'historical arm only; theme list items not readable through UIA'}
+        else:
+            # Provider present but wrong/incomplete is never a historical exemption.
+            selection_before = theme_selection(rows, require_apply=False)
+            names = selection_before['visible_names']
+            if names.index(selection_before['selected']) == len(names) - 1:
+                raise PerfError('theme selection has no visible following item; cannot prove Down workload')
+            if selection_before['apply_rect'] is None:
+                # The saved theme legitimately omits Apply. Use only the proven
+                # Appearance/list structure, then require both semantic movement
+                # and the real Apply provider before opening the formal window.
+                capture.report['observations']['theme_preparation_before'] = selection_before
+                capture.screenshot('theme-preparation-before', popup)
+                instance.press('down')
+                time.sleep(0.5)
+                prepared = theme_selection(instance.uia_rows(popup.hwnd))
+                capture.report['observations']['theme_preparation_after'] = prepared
+                theme_movement(selection_before, prepared)
+                selection_before = prepared
+                names = selection_before['visible_names']
+                if names.index(selection_before['selected']) == len(names) - 1:
+                    raise PerfError('prepared theme selection has no visible following item; cannot prove Down workload')
+        capture.report['observations']['theme_selection_before'] = selection_before
+        capture.screenshot('theme-before', popup)
+        # Setup preview work must settle before the counted hold. Do not query
+        # UIA during the timed hold/drain; it can synchronously run provider code.
+        if capture.drain(['theme.reload'], minimum=1, quiet=0.5) is False:
+            raise PerfError('theme preparation reloads did not settle before the formal window')
         before = capture.mark()
         instance.hold_key('down', seconds=2, hz=30)
         capture.drain(['theme.reload'], minimum=1, quiet=0.5)
         capture.count(capture.window('theme-hold', before), 'theme.reload')
+        if selection_before is not None:
+            selection_after = theme_selection(instance.uia_rows(popup.hwnd))
+            capture.report['observations']['theme_selection_after'] = selection_after
+            theme_movement(selection_before, selection_after)
         capture.screenshot('theme', popup)
         close_ui(instance)
 
