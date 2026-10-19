@@ -1089,6 +1089,32 @@ class QuietBatchTests(unittest.TestCase):
         self.assertEqual((2, 'ERROR', 'ERROR', 'COMPLETE'), (exit_code, result['status'], result['quiet_status'], result['measurement']))
 
 class CounterTests(unittest.TestCase):
+    def test_c7_cpu_endpoint_keeps_getprocesstimes_identity_without_nt_or_memory(self):
+        import ctypes
+        class FileTime(ctypes.Structure):
+            _fields_ = [('low', ctypes.c_uint32), ('high', ctypes.c_uint32)]
+        counters = gx_perf.NativeCounters.__new__(gx_perf.NativeCounters)
+        counters.w = mock.Mock(FILETIME=FileTime)
+        counters.w._open.return_value = 99
+        counters.memory = mock.Mock(side_effect=AssertionError('memory probe in C7 endpoint'))
+        counters.threads = mock.Mock(side_effect=AssertionError('NT probe in C7 endpoint'))
+        instance = mock.Mock(pid=42, creation=123)
+        def read(_handle, birth, _exit, kernel, user):
+            birth._obj.low, kernel._obj.low, user._obj.low = 123, 700, 900
+            return 1
+        counters.w.GetProcessTimes.side_effect = read
+        with mock.patch.object(gx_perf.time, 'perf_counter_ns', side_effect=[100, 101]):
+            row = counters.cpu_sample(instance)
+        self.assertEqual((700, 900, 100, 101),
+                         (row['kernel_100ns'], row['user_100ns'], row['begin_ns'], row['end_ns']))
+        counters.w.CloseHandle.assert_called_once_with(99)
+        counters.memory.assert_not_called()
+        counters.threads.assert_not_called()
+        instance.creation = 124
+        with self.assertRaisesRegex(gx_perf.PerfError, 'birth changed'):
+            counters.cpu_sample(instance)
+        self.assertEqual(2, counters.w.CloseHandle.call_count)
+
     def test_nt_snapshot_decoder_rejects_truncation_and_foreign_threads(self):
         process, thread = gx_perf.NativeProcess(), gx_perf.NativeThread()
         process.pid, process.birth, process.threads = 42, 123, 1
@@ -2640,6 +2666,111 @@ class GtkMetricCoverageTests(unittest.TestCase):
                 gx_perf.canonical_plan(root, truncated)
 
 
+class C7TimingTests(unittest.TestCase):
+    def endpoints(self):
+        def endpoint(t, sequence):
+            return {'begin_ns': t, 'end_ns': t,
+                    'log': {'begin_ns': t, 'end_ns': t, 'byte_offset': sequence},
+                    'cpu': {'begin_ns': t, 'end_ns': t},
+                    'pdh': {'sequence': sequence, 'collection_qpc_begin_ns': t, 'collection_qpc_end_ns': t}}
+        start, end = endpoint(10_000_000_000, 1), endpoint(70_000_000_000, 61)
+        rows = []
+        for second in range(61):
+            t = start['begin_ns'] + second * 1_000_000_000
+            ep = endpoint(t, second + 1)
+            rows.append(dict(ep['pdh'], phase='start' if second == 0 else 'end' if second == 60 else 'periodic',
+                             scheduled_qpc_ns=t if 0 < second < 60 else None,
+                             timestamp_100ns=t // 100, recorded_qpc_ns=t))
+        return start, end, rows
+
+    def test_exact_requested_window_and_explicit_precision(self):
+        start, end, rows = self.endpoints()
+        result = gx_perf.c7_window_timing(start, end, rows, 60, 0, [])
+        self.assertEqual('valid', result['status'])
+        self.assertEqual(61, len(rows))
+        self.assertEqual(60_000_000_000, result['pdh_timestamp_duration_ns'])
+        self.assertEqual('PENDING', gx_perf.c7_window_timing(start, end, rows, 60, None, [])['status'])
+
+    def test_planned_periodic_slots_must_be_complete_unique_and_in_order(self):
+        for issue in ('endpoints-only', 'first-missing', 'last-missing', 'duplicate', 'wrong-order', 'wrong-phase'):
+            with self.subTest(issue=issue):
+                start, end, rows = self.endpoints()
+                if issue == 'endpoints-only':
+                    rows = [rows[0], rows[-1]]
+                elif issue == 'first-missing':
+                    del rows[1]
+                elif issue == 'last-missing':
+                    del rows[-2]
+                elif issue == 'duplicate':
+                    rows[2]['scheduled_qpc_ns'] = rows[1]['scheduled_qpc_ns']
+                elif issue == 'wrong-order':
+                    rows[1]['scheduled_qpc_ns'], rows[2]['scheduled_qpc_ns'] = (
+                        rows[2]['scheduled_qpc_ns'], rows[1]['scheduled_qpc_ns'])
+                else:
+                    rows[1]['phase'] = 'start'
+                result = gx_perf.c7_window_timing(start, end, rows, 60, 50, [])
+                self.assertEqual('PENDING', result['status'])
+                self.assertIn('planned periodic slots', result['reason'])
+
+    def test_finite_explicit_precision_preserves_actual_interval(self):
+        start, end, rows = self.endpoints()
+        for key in ('begin_ns', 'end_ns'):
+            end[key] += 500_000
+            end['log'][key] += 500_000
+            end['cpu'][key] += 500_000
+        for key in ('collection_qpc_begin_ns', 'collection_qpc_end_ns'):
+            end['pdh'][key] += 500_000
+            rows[-1][key] += 500_000
+        rows[-1]['timestamp_100ns'] += 5000
+        result = gx_perf.c7_window_timing(start, end, rows, 60, 1, [])
+        self.assertEqual('valid', result['status'])
+        self.assertEqual([60_000_500_000] * 2, result['duration_bounds_ns']['cpu'])
+        self.assertEqual(60_000_500_000, result['pdh_timestamp_duration_ns'])
+        self.assertEqual(1_000_000, result['endpoint_budget_ns'])
+        self.assertEqual('PENDING', gx_perf.c7_window_timing(start, end, rows, 60, 0.4, [])['status'])
+
+    def test_formal_cli_requires_explicit_finite_precision(self):
+        argv = ['win32-c7', '--exe', 'old', '--exe', 'new', '--out', 'out']
+        with mock.patch.object(gx_perf, 'run_c7_matrix', return_value=0) as run, \
+                contextlib.redirect_stderr(io.StringIO()):
+            for suffix in ([], ['--endpoint-budget-ms', '-1'], ['--endpoint-budget-ms', 'nan'],
+                           ['--endpoint-budget-ms', 'inf']):
+                self.assertEqual(2, gx_perf.main(argv + suffix))
+            run.assert_not_called()
+            self.assertEqual(0, gx_perf.main(argv + ['--endpoint-budget-ms', '1']))
+            self.assertEqual(1, run.call_args.args[0].endpoint_budget_ms)
+
+    def test_slow_collect_shifted_endpoint_missing_stream_and_clock_jump_reject(self):
+        for issue in ('late', 'early-pdh', 'cpu', 'pdh', 'log', 'stamp', 'periodic-overrun'):
+            with self.subTest(issue=issue):
+                start, end, rows = self.endpoints()
+                if issue == 'late':
+                    end['end_ns'] += 8_000_000_000
+                elif issue == 'early-pdh':
+                    start['pdh']['collection_qpc_begin_ns'] -= 8_000_000_000
+                elif issue in ('cpu', 'pdh', 'log'):
+                    end[issue] = None
+                elif issue == 'stamp':
+                    rows[-1]['timestamp_100ns'] += 80_000_000
+                else:
+                    rows.insert(1, dict(rows[0], phase='periodic', recorded_qpc_ns=end['end_ns'] + 1))
+                result = gx_perf.c7_window_timing(start, end, rows, 60, 1, [])
+                self.assertEqual('PENDING', result['status'])
+
+    def test_each_missing_metric_prevents_partial_formal_values(self):
+        names = ('process.cpu', 'threads.context_switches.pdh', 'renderer.present')
+        for absent in names:
+            capture = SimpleNamespace(samples=gx_perf.Samples(), report={'missing_metrics': {}})
+            for name in names:
+                if name != absent:
+                    capture.samples.add(name, 0, 'ms' if name == 'process.cpu' else None)
+            evidence = {'timing': {'status': 'valid'}}
+            gx_perf.c7_complete_metrics(capture, evidence)
+            self.assertEqual('PENDING', evidence['coverage'])
+            self.assertFalse(capture.samples.values)
+            self.assertEqual(set(names), set(capture.report['missing_metrics']))
+
+
 class P7C7Tests(unittest.TestCase):
     def run_capture_case(self, case='ime-preedit'):
         import gx_perf_stimulus as stimulus
@@ -2656,6 +2787,7 @@ class P7C7Tests(unittest.TestCase):
                   'begin_ns': 0, 'end_ns': 1, 'threads': []}
         counters = mock.Mock()
         counters.sample.side_effect = [before, {**before, 'begin_ns': 1_000_000_001}]
+        counters.cpu_sample = counters.sample
         with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
                 mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
                 mock.patch.object(gx_perf.time, 'sleep'), \
@@ -2687,6 +2819,13 @@ class P7C7Tests(unittest.TestCase):
         evidence = self.run_capture_case('visible')
         self.assertEqual(['screen'] * 16, [s['method'] for s in evidence['screenshots']])
         self.instance.press.assert_not_called()
+
+    def test_c7_refuses_existing_raw_instead_of_merging_or_relabelling_it(self):
+        path = self.root / 'pdh-raw.jsonl'
+        path.write_bytes(b'preserved old raw\n')
+        with self.assertRaisesRegex(gx_perf.PerfError, 'fresh evidence directory required'):
+            self.run_capture_case('visible')
+        self.assertEqual(b'preserved old raw\n', path.read_bytes())
 
     def test_c7_screen_privacy_failure_still_stops_before_ime_input(self):
         self.backdrop.capture.side_effect = RuntimeError('screen privacy coverage failed')
@@ -2888,7 +3027,8 @@ class P7C7Tests(unittest.TestCase):
         self.instance.log.write_bytes(b'')
         capture = gx_perf.CaptureRun(self.instance, self.root,
                                     {'capabilities': {'renderer.present': ''}, 'errors': []})
-        args = SimpleNamespace(case='output-wakeup', tabs=11, state='visible', seconds=60, output_bytes=4096)
+        args = SimpleNamespace(case='output-wakeup', tabs=11, state='visible', seconds=60, output_bytes=4096,
+                               endpoint_budget_ms=0)
         shells = mock.Mock()
         shells.python_identity = dict(executable="actual.exe", executable_sha256="a" * 64,
                                       launcher="launcher.exe", launcher_sha256="b" * 64)
@@ -2902,22 +3042,35 @@ class P7C7Tests(unittest.TestCase):
         counters = mock.Mock()
         counters.sample.side_effect = [before, after]
         clock, commands = [0.0], []
+        endpoints = iter((before, after))
+        counters.cpu_sample.side_effect = lambda _instance: dict(next(endpoints),
+            begin_ns=round(clock[0] * 1e9), end_ns=round(clock[0] * 1e9))
         def command(*argv, **kwargs):
             commands.append(clock[0])
             return {'id': 'wakeup', 'bytes': 4096}
         shells.command.side_effect = command
         pdh = mock.Mock()
-        pdh.sample.side_effect = lambda: pdh_sample(int(clock[0]) + 10, int(clock[0] * 1000) + 100)
+        pdh.prepare.return_value = {}
+        sequence = [0]
+        def collect():
+            sequence[0] += 1
+            return dict(sequence=sequence[0], collection_qpc_begin_ns=round(clock[0] * 1e9),
+                        collection_qpc_end_ns=round(clock[0] * 1e9))
+        pdh.capture.side_effect = collect
+        pdh.read.side_effect = lambda token: dict(pdh_sample(int(clock[0]) + 10, round(clock[0] * 1e7) + 100), **token)
         with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
                 mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
                 mock.patch.object(gx_perf.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0] + n)), \
-                mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]):
+                mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]), \
+                mock.patch.object(gx_perf.time, 'perf_counter_ns', side_effect=lambda: round(clock[0] * 1e9)):
             gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells, pdh_factory=lambda: pdh)
         self.assertEqual(capture.report['c7']['shell_python'], 'actual.exe')
         self.assertEqual(capture.report['c7']['shell_python_sha256'], 'a' * 64)
         self.assertEqual(capture.report['c7']['shell_python_launcher'], 'launcher.exe')
         self.assertEqual(capture.report['c7']['shell_python_launcher_sha256'], 'b' * 64)
-        self.assertEqual(61, pdh.sample.call_count)
+        self.assertEqual(61, pdh.capture.call_count)
+        self.assertEqual('captured', capture.report['c7']['coverage'])
+        self.assertEqual('valid', capture.report['c7']['timing']['status'])
         self.assertAlmostEqual(33.2, commands[0])
         self.assertEqual([60], capture.samples.values['threads.context_switches.pdh'])
         self.assertNotIn('threads.context_switches', capture.samples.values)
@@ -2938,17 +3091,110 @@ class P7C7Tests(unittest.TestCase):
                   'begin_ns': 0, 'end_ns': 1, 'threads': []}
         counters = mock.Mock()
         counters.sample.side_effect = [before, {**before, 'begin_ns': 2_000_000_001}]
+        counters.cpu_sample = counters.sample
         clock = [0.0]
         with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
                 mock.patch.object(gx_perf, 'last_input_ticks', return_value=(10, 100)), \
                 mock.patch.object(gx_perf.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0] + n)), \
-                mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]):
+                mock.patch.object(gx_perf.time, 'perf_counter', side_effect=lambda: clock[0]), \
+                mock.patch.object(gx_perf.time, 'perf_counter_ns', side_effect=lambda: round(clock[0] * 1e9)):
             gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells,
                                pdh_factory=mock.Mock(side_effect=stimulus.PdhFailure('add', 0xc0000bb9)))
         self.assertEqual('PENDING', capture.report['c7']['coverage'])
         self.assertEqual(0, capture.report['missing_metrics']['threads.context_switches.pdh']['n'])
         self.assertNotIn('threads.context_switches.pdh', capture.samples.values)
         self.assertIn('0xc0000bb9', capture.report['c7']['pdh']['reason'])
+
+    def test_c7_slow_collection_and_incomplete_streams_never_become_formal_samples(self):
+        from test_gx_perf_stimulus import pdh_sample
+        for issue in ('none', 'slow-start', 'cross-deadline', 'late-periodic', 'cpu-skew', 'cpu-missing',
+                      'pdh-missing', 'present-missing', 'thread-change', 'last-slot-sleep',
+                      'last-slot-guard', 'slow-start-read'):
+            with self.subTest(issue=issue):
+                target = self.root / issue
+                target.mkdir()
+                self.instance.log.write_bytes(b'')
+                capture = gx_perf.CaptureRun(self.instance, target, {
+                    'capabilities': {} if issue == 'present-missing' else {'renderer.present': ''}, 'errors': []})
+                slot_case = issue in ('last-slot-sleep', 'last-slot-guard', 'slow-start-read')
+                args = SimpleNamespace(case='visible', tabs=1, state='visible', seconds=60 if slot_case else 2,
+                                       diagnostic=False, endpoint_budget_ms=50 if slot_case else 0)
+                clock, sequence, window_start = [0.0], [0], [None]
+                shells = mock.Mock()
+                shells.python_identity = dict(executable='python.exe', executable_sha256='a'*64,
+                    launcher='python.exe', launcher_sha256='a'*64)
+                shells.identities, shells.rows.return_value = {42: 123}, []
+                counters = mock.Mock()
+                def cpu(_instance):
+                    if issue == 'cpu-missing':
+                        raise OSError('CPU read unavailable')
+                    t = round(clock[0] * 1e9)
+                    return dict(pid=42, birth=123, kernel_100ns=round(clock[0]*10000), user_100ns=0,
+                        begin_ns=t-1 if issue == 'cpu-skew' else t, end_ns=t, threads=[])
+                counters.cpu_sample.side_effect = cpu
+                pdh = mock.Mock()
+                def prepare():
+                    clock[0] += 8  # Expensive discovery MUST precede both endpoints.
+                    return {'qpc_end_ns': round(clock[0]*1e9)}
+                pdh.prepare.side_effect = prepare
+                def collect():
+                    if issue == 'pdh-missing':
+                        return None
+                    sequence[0] += 1
+                    begin = round(clock[0]*1e9)
+                    if sequence[0] == 1:
+                        window_start[0] = clock[0]
+                    if (issue == 'slow-start' and sequence[0] == 1 or
+                            issue == 'cross-deadline' and sequence[0] == 2):
+                        clock[0] += 8
+                    if issue == 'late-periodic' and sequence[0] == 2:
+                        clock[0] += 0.01  # Inside the window, outside its explicit 0 ms budget.
+                    return dict(sequence=sequence[0], collection_qpc_begin_ns=begin,
+                                collection_qpc_end_ns=round(clock[0]*1e9))
+                pdh.capture.side_effect = collect
+                def read(token):
+                    row = dict(pdh_sample(sequence[0]*10, round(clock[0]*1e7),
+                        tid=9 if issue == 'thread-change' and sequence[0] > 1 else 7), **token)
+                    if issue == 'slow-start-read' and sequence[0] == 1:
+                        clock[0] += 60.01
+                    return row
+                pdh.read.side_effect = read
+                def sleep(seconds):
+                    clock[0] += seconds
+                    if issue == 'last-slot-sleep' and sequence[0] == 59:
+                        clock[0] = window_start[0] + 60.01
+                def input_ticks():
+                    if (issue == 'last-slot-guard' and sequence[0] == 59 and
+                            clock[0] >= window_start[0] + 59):
+                        clock[0] = window_start[0] + 60.01
+                    return 10, 100
+                with mock.patch.object(gx_perf, 'populate'), mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
+                        mock.patch.object(gx_perf, 'last_input_ticks', side_effect=input_ticks), \
+                        mock.patch.object(gx_perf.time, 'sleep', side_effect=sleep), \
+                        mock.patch.object(gx_perf.time, 'perf_counter_ns', side_effect=lambda: round(clock[0]*1e9)):
+                    if issue == 'none':
+                        gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells, lambda: pdh)
+                        self.assertEqual('captured', capture.report['c7']['coverage'])
+                        self.assertEqual(2_000_000_000, capture.report['c7']['timing']['pdh_timestamp_duration_ns'])
+                    else:
+                        with self.assertRaisesRegex(gx_perf.PerfError, 'coordinated counter window incomplete'):
+                            gx_perf.measure_c7(self.gui, self.instance, capture, args, counters, shells, lambda: pdh)
+                        self.assertEqual('PENDING', capture.report['c7']['coverage'])
+                        for name in ('process.cpu', 'threads.context_switches.pdh', 'renderer.present'):
+                            self.assertNotIn(name, capture.samples.values)
+                    self.assertGreaterEqual(capture.report['c7']['counter_window_begin_qpc_ns'], 8_000_000_000)
+                    pdh.prepare.assert_called_once()
+                    pdh.close.assert_called_once()
+                if issue == 'cross-deadline':
+                    self.assertEqual(2, pdh.capture.call_count)  # No extra late collect or retry.
+                    self.assertEqual(2, len((target/'pdh-raw.jsonl').read_text(encoding='utf-8').splitlines()))
+                if issue in ('last-slot-sleep', 'last-slot-guard'):
+                    timing = capture.report['c7']['timing']
+                    self.assertIn('planned periodic slots', timing['reason'])
+                    self.assertEqual(60, pdh.capture.call_count)  # 59th periodic slot missing, no catch-up.
+                    self.assertLessEqual(timing['end']['end_ns'], timing['deadline_qpc_ns'] + 50_000_000)
+                if issue == 'slow-start-read':
+                    self.assertEqual(1, pdh.capture.call_count)
 
     def test_c7_classification_combinations_keep_control_and_stop_matrix(self):
         import gx_perf_stimulus as stimulus
@@ -3008,8 +3254,10 @@ class P7C7Tests(unittest.TestCase):
                         sample['end_ns'] += 1_000_000
                         return dict(sample)
                     counters.sample.side_effect = cpu_sample
+                    counters.cpu_sample = counters.sample
                     pdh = mock.Mock()
-                    pdh.sample.return_value = {}
+                    pdh.prepare.return_value = {}
+                    pdh.capture.return_value = None
                     experiment = gx_perf.run_experiment
                     def run(cell):
                         return experiment(cell, self.gui, counters_factory=lambda _gui: counters)
@@ -3017,7 +3265,7 @@ class P7C7Tests(unittest.TestCase):
                             mock.patch.object(stimulus, 'ANIMATION_CASES', ()), \
                             mock.patch.object(stimulus, 'OwnedShells', return_value=shells), \
                             mock.patch.object(stimulus, 'ime_state', side_effect=ime_state), \
-                            mock.patch.object(stimulus, 'PdhThreads', return_value=pdh), \
+                            mock.patch.object(stimulus, 'PdhThreads', return_value=pdh) as native_pdh, \
                             mock.patch.object(stimulus, 'pdh_summary', return_value={'status': 'sampled', 'switches': 0}), \
                             mock.patch.object(gx_perf, 'populate'), \
                             mock.patch.object(gx_perf, 'main_windows', return_value=[]), \
@@ -3027,6 +3275,9 @@ class P7C7Tests(unittest.TestCase):
                             mock.patch.object(gx_perf, 'run_experiment', side_effect=run), \
                             contextlib.redirect_stdout(io.StringIO()):
                         code = gx_perf.run_c7_matrix(args)
+                    self.assertTrue(native_pdh.call_args_list)
+                    self.assertTrue(all(call == mock.call(pid=self.instance.pid)
+                                        for call in native_pdh.call_args_list))
                     matrix = gx_perf.read_json(out / 'RESULT.json')
                     cell = gx_perf.read_json(out / '1-ime-preedit/RESULT.json')
                     control = gx_perf.read_json(out / '1-ime-preedit/old/run-01/run.json')

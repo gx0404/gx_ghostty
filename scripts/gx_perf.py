@@ -1662,6 +1662,27 @@ class NativeCounters:
             length = max(length * 2, needed.value + 65536)
         raise PerfError("SystemProcessInformation kept growing")
 
+    def cpu_sample(self, instance) -> dict:
+        """C7 endpoint: the same cumulative CPU source, without NT/memory probes."""
+        instance.ensure_owned()
+        handle = self.w._open(instance.pid, 0x0400)
+        if not handle:
+            raise PerfError('cannot open owned process for CPU counters')
+        try:
+            created, exited, kernel, user = (self.w.FILETIME() for _ in range(4))
+            began = time.perf_counter_ns()
+            if not self.w.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            ended = time.perf_counter_ns()
+            value = lambda ft: (ft.high << 32) | ft.low
+            if value(created) != instance.creation:
+                raise PerfError('process birth changed during CPU read')
+            return {'begin_ns': began, 'end_ns': ended, 'pid': instance.pid, 'birth': value(created),
+                    'kernel_100ns': value(kernel), 'user_100ns': value(user), 'threads': [],
+                    'thread_error': 'NT diagnostic excluded from C7 endpoint'}
+        finally:
+            self.w.CloseHandle(handle)
+
     def sample(self, instance) -> dict:
         instance.ensure_owned()
         began = time.perf_counter_ns()
@@ -2324,9 +2345,107 @@ def c7_input_check(gui, instance, args, entry_tick, helper=None):
     idle_state_check(gui, instance, args, helper, entry_tick=entry_tick)
 
 
+def c7_window_timing(start, end, samples, seconds, budget_ms, failures):
+    """Bound all three endpoint uncertainties; never normalize to requested time.
+
+    Each endpoint is a QPC envelope containing the log mark, CPU read and PDH
+    collect. The end envelope targets start.begin + requested_ns. An explicitly
+    reviewed budget bounds endpoint width, scheduling lateness AND each possible
+    metric duration's error. No budget means diagnostic-only, never captured.
+    """
+    requested = round(seconds * 1e9)
+    result = {'status': 'PENDING', 'policy': 'c7-qpc-endpoints-v1', 'requested_ns': requested,
+              'endpoint_budget_ms': budget_ms, 'start': start, 'end': end, 'samples': samples,
+              'failures': list(failures), 'duration_bounds_ns': {}}
+    try:
+        def interval(row, begin='begin_ns', finish='end_ns'):
+            a, b = row[begin], row[finish]
+            if type(a) is not int or type(b) is not int or a < 0 or b < a:
+                raise ValueError('invalid C7 raw endpoint interval')
+            return a, b
+        first, last = interval(start), interval(end)
+        deadline = first[0] + requested
+        result['deadline_qpc_ns'] = deadline
+        for key in ('log', 'cpu', 'pdh'):
+            if not isinstance(start.get(key), dict) or not isinstance(end.get(key), dict):
+                raise ValueError('missing C7 ' + key + ' endpoint')
+            fields = ('collection_qpc_begin_ns', 'collection_qpc_end_ns') if key == 'pdh' else ('begin_ns', 'end_ns')
+            a, b = interval(start[key], *fields), interval(end[key], *fields)
+            if not (first[0] <= a[0] <= a[1] <= first[1] and last[0] <= b[0] <= b[1] <= last[1]):
+                raise ValueError(key + ' endpoint is outside coordinated QPC envelope')
+            result['duration_bounds_ns'][key] = [b[0] - a[1], b[1] - a[0]]
+        if len(samples) < 2 or samples[0]['phase'] != 'start' or samples[-1]['phase'] != 'end':
+            raise ValueError('missing C7 PDH endpoint samples')
+        if (samples[0]['sequence'] != start['pdh']['sequence'] or
+                samples[-1]['sequence'] != end['pdh']['sequence']):
+            raise ValueError('C7 endpoint does not bind its PDH collection')
+        planned = list(range(first[0] + 1_000_000_000, deadline, 1_000_000_000))
+        observed = [sample.get('scheduled_qpc_ns') for sample in samples[1:-1]]
+        result['planned_periodic_qpc_ns'] = planned
+        result['observed_periodic_qpc_ns'] = observed
+        # For 60 seconds this must be exactly B+1..B+59, in order. A late
+        # sleep/guard may jump straight to the end endpoint within its budget;
+        # endpoint precision alone does not prove that every slot was sampled.
+        if (any(sample.get('phase') != 'periodic' for sample in samples[1:-1]) or
+                any(type(due) is not int for due in observed) or observed != planned):
+            raise ValueError('C7 planned periodic slots missing, duplicated or out of order')
+        for i, sample in enumerate(samples):
+            a, b = interval(sample, 'collection_qpc_begin_ns', 'collection_qpc_end_ns')
+            if sample['phase'] == 'periodic' and sample['recorded_qpc_ns'] >= deadline:
+                raise ValueError('periodic PDH sample crossed the deadline')
+            if i and (sample['sequence'] <= samples[i-1]['sequence'] or
+                      a < samples[i-1]['collection_qpc_end_ns'] or
+                      sample['timestamp_100ns'] <= samples[i-1]['timestamp_100ns']):
+                raise ValueError('C7 PDH collection order or timestamp did not advance')
+        result['pdh_timestamp_duration_ns'] = (samples[-1]['timestamp_100ns'] - samples[0]['timestamp_100ns']) * 100
+        if budget_ms is None:
+            raise ValueError('endpoint precision not specified; independent review required before formal sampling')
+        if not math.isfinite(budget_ms) or budget_ms < 0:
+            raise ValueError('invalid C7 endpoint precision')
+        budget = round(budget_ms * 1e6)
+        result['endpoint_budget_ns'] = budget
+        for sample in samples:
+            if sample['phase'] == 'periodic':
+                due = sample['scheduled_qpc_ns']
+                if not due <= sample['collection_qpc_begin_ns'] <= sample['collection_qpc_end_ns'] <= due + budget:
+                    raise ValueError('periodic PDH collection exceeded the explicit timing budget')
+        if requested <= 0 or first[1] - first[0] > budget or not deadline <= last[0] <= last[1] <= deadline + budget:
+            raise ValueError('C7 endpoint exceeded the explicit timing budget')
+        for bounds in result['duration_bounds_ns'].values():
+            if not requested - budget <= bounds[0] <= bounds[1] <= requested + budget:
+                raise ValueError('C7 actual metric duration differs from requested window')
+        if abs(result['pdh_timestamp_duration_ns'] - requested) > budget:
+            raise ValueError('C7 PDH timestamp duration differs from requested window')
+        if failures:
+            raise ValueError('; '.join(failures))
+        result['status'] = 'valid'
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        result['reason'] = str(exc)
+    return result
+
+
+def c7_complete_metrics(capture, evidence):
+    required = {'process.cpu': 'ms', 'threads.context_switches.pdh': '', 'renderer.present': ''}
+    complete = evidence['timing']['status'] == 'valid' and all(
+        len(capture.samples.values.get(name, [])) == 1 and name not in capture.report['missing_metrics']
+        for name in required)
+    evidence['coverage'] = 'captured' if complete else 'PENDING'
+    if 'pdh' in evidence:
+        evidence['pdh']['measurement_eligible'] = complete
+    if not complete:
+        evidence['diagnostic_metrics'] = {name: list(capture.samples.values.get(name, []))
+                                          for name in (*required, 'idle.wall')}
+        reason = evidence['timing'].get('reason', 'C7 requires CPU, PDH and present in the same valid window')
+        for name, unit in required.items():
+            capture.report['missing_metrics'].setdefault(name, {'status': 'PENDING', 'n': 0, 'unit': unit, 'reason': reason})
+        for name in (*required, 'idle.wall'):
+            capture.samples.values.pop(name, None)
+            capture.samples.units.pop(name, None)
+
+
 def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None):
     import gx_perf_stimulus as stimulus
-    pdh_factory = pdh_factory or stimulus.PdhThreads
+    pdh_factory = pdh_factory or (lambda: stimulus.PdhThreads(pid=instance.pid))
     report = capture.report
     report['c7'] = {'case': args.case, 'terminal_count': args.tabs, 'seconds_requested': args.seconds,
                     'performance_verdict': 'not evaluated', 'visual_review': 'PENDING',
@@ -2338,9 +2457,13 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
                     'shell_python_launcher_sha256': shells.python_identity['launcher_sha256'],
                     'pdh': {'source': stimulus.PDH_PATHS, 'status': 'running', 'n': 0, 'unit': ''}}
     evidence = report['c7']
+    clock_info = time.get_clock_info('perf_counter')
+    evidence['clock'] = {'implementation': clock_info.implementation, 'monotonic': clock_info.monotonic,
+                         'resolution_seconds': clock_info.resolution, 'resolution_is_not_a_tolerance': True}
     helper = pdh = None
     backdrop = gui.Backdrop(gui.BACKDROP_DEFAULT)
-    rows = []
+    sample_times, timing_failures = [], []
+    raw_path = capture.target / 'pdh-raw.jsonl'
     def shot(name, method='screen'):
         # IME overlays belong to another process. PrintWindow requests only the
         # owned target's pixels; it is not proof that WGL/preedit was rendered.
@@ -2360,6 +2483,8 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
             'rendered_pixels': 'unknown',
             'phase': 'observed image; blink/preedit state requires visual review'})
     try:
+        if raw_path.exists():
+            raise PerfError('C7 raw counter path already exists; fresh evidence directory required')
         populate(gui, instance, args.tabs, 1)
         setup_tick = last_input_ticks()[0]
         wait_until(lambda: shells.ready(gui, instance, args.tabs), 'owned C7 shell receipts')
@@ -2410,67 +2535,143 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
         c7_input_check(gui, instance, args, entry['tick'], helper)
         try:
             pdh = pdh_factory()
+            preparation = pdh.prepare()
+            write_json(capture.target / 'pdh-prepare.json', preparation)
+            evidence['pdh_preparation'] = {'path': 'pdh-prepare.json',
+                'begin_qpc_ns': preparation.get('qpc_begin_ns'), 'end_qpc_ns': preparation.get('qpc_end_ns')}
         except stimulus.PdhFailure as exc:
             if not exc.unavailable:
                 raise
             evidence['pdh'].update(status='PENDING', reason=f'{type(exc).__name__}: {exc}')
-        def pdh_sample():
+            if pdh:
+                pdh.close()
+                pdh = None
+        def pdh_failure(exc):
             nonlocal pdh
+            if not exc.unavailable:
+                raise exc
+            evidence['pdh'].update(status='PENDING', reason=f'{type(exc).__name__}: {exc}')
+            stimulus.append_json(raw_path, {'error': str(exc), 'qpc_ns': time.perf_counter_ns()})
+            pdh.close()
+            pdh = None
+        def collect_pdh():
             if pdh is None:
                 return
             try:
-                row = pdh.sample()
-                rows.append(row)
-                stimulus.append_json(capture.target / 'pdh-raw.jsonl', row)
+                return pdh.capture()
             except stimulus.PdhFailure as exc:
-                if not exc.unavailable:
-                    raise
-                evidence['pdh'].update(status='PENDING', reason=f'{type(exc).__name__}: {exc}')
-                stimulus.append_json(capture.target / 'pdh-raw.jsonl',
-                                     {'error': str(exc), 'qpc_ns': time.perf_counter_ns()})
-                pdh.close()
-                pdh = None
-        pdh_sample()
-        log_before = capture.mark()
-        before = counters.sample(instance)
+                pdh_failure(exc)
+        def read_pdh(token, phase, scheduled_ns=None):
+            if token is None:
+                return
+            try:
+                row = pdh.read(token)
+                stimulus.append_json(raw_path, row)
+                sample_times.append(dict(token, phase=phase, scheduled_qpc_ns=scheduled_ns,
+                    recorded_qpc_ns=time.perf_counter_ns(),
+                    timestamp_100ns=row.get('arrays', {}).get('pid', [{}])[0].get('timestamp_100ns')))
+            except stimulus.PdhFailure as exc:
+                pdh_failure(exc)
+        def endpoint(phase, include_pdh=True):
+            began = time.perf_counter_ns()
+            log_begin = time.perf_counter_ns()
+            log = capture.mark()
+            log_end = time.perf_counter_ns()
+            try:
+                cpu = counters.cpu_sample(instance)
+            except OSError as exc:
+                evidence['cpu_error'] = f'{type(exc).__name__}: {exc}'
+                cpu = None
+            token = collect_pdh() if include_pdh else None
+            value = {'begin_ns': began, 'end_ns': time.perf_counter_ns(),
+                     'log': {'begin_ns': log_begin, 'end_ns': log_end, 'byte_offset': len(log)},
+                     'cpu': cpu, 'pdh': token}
+            # Local decoding and disk writes must not move the frozen endpoints.
+            read_pdh(token, phase)
+            return value, log, cpu
+        c7_input_check(gui, instance, args, entry['tick'], helper)
+        start, log_before, before = endpoint('start')
         report['before'] = before
         evidence['cpu_scope'] = 'owned Ghostty PID only; Python stimulus and focus helper CPU excluded'
-        began = time.perf_counter()
-        deadline = began + args.seconds
-        evidence['counter_window_begin_qpc_ns'] = time.perf_counter_ns()
+        began = start['begin_ns']
+        deadline = began + round(args.seconds * 1e9)
+        evidence['counter_window_begin_qpc_ns'] = began
         output = None
-        next_sample = began + 1
+        next_sample = began + 1_000_000_000
+        missed_deadline = time.perf_counter_ns() >= deadline and args.seconds > 0
+        if missed_deadline:
+            timing_failures.append('start sample decoding/persistence crossed the deadline')
         while True:
-            now = time.perf_counter()
+            now = time.perf_counter_ns()
+            if now >= deadline or missed_deadline:
+                break
+            due = min(next_sample, deadline)
+            if args.case == 'output-wakeup' and output is None:
+                due = min(due, began + round(args.seconds * 1e9) // 2)
+            time.sleep(max(0, (due - now) / 1e9))
+            c7_input_check(gui, instance, args, entry['tick'], helper)
+            now = time.perf_counter_ns()
             if now >= deadline:
                 break
-            time.sleep(max(0, min(next_sample, deadline) - now))
-            c7_input_check(gui, instance, args, entry['tick'], helper)
-            pdh_sample()
-            now = time.perf_counter()
-            if args.case == 'output-wakeup' and output is None and now - began >= args.seconds / 2:
+            if args.case == 'output-wakeup' and output is None and now - began >= round(args.seconds * 1e9) // 2:
                 shells.verify(gui, instance)
                 evidence['output_log_start_byte'] = len(capture.mark())
+                evidence['output_begin_qpc_ns'] = time.perf_counter_ns()
                 output = shells.command('output', bytes=args.output_bytes)
                 evidence['output_command'] = output
-            next_sample = now + 1
-        after = counters.sample(instance)
-        evidence['counter_window_end_qpc_ns'] = time.perf_counter_ns()
-        report.update(after=after, context_switch_diagnostic=context_switch_diagnostic(before, after))
+                evidence['output_end_qpc_ns'] = time.perf_counter_ns()
+            if time.perf_counter_ns() >= deadline:
+                missed_deadline = True
+                timing_failures.append('stimulus crossed the deadline before PDH collection')
+                break
+            if time.perf_counter_ns() >= next_sample:
+                read_pdh(collect_pdh(), 'periodic', next_sample)
+                next_sample += 1_000_000_000
+                if time.perf_counter_ns() >= next_sample:
+                    timing_failures.append('periodic PDH sampler missed its fixed one-second cadence')
+                    # Do not catch up by taking multiple samples at one instant.
+                    next_sample = time.perf_counter_ns() + 1_000_000_000
+            if time.perf_counter_ns() >= deadline:
+                missed_deadline = True
+                timing_failures.append('periodic collection or stimulus crossed the deadline')
+        c7_input_check(gui, instance, args, entry['tick'], helper)
+        end, log_after, after = endpoint('end', include_pdh=not missed_deadline)
+        if any(log and not log.endswith(b'\n') for log in (log_before, log_after)):
+            timing_failures.append('present log endpoint contains an incomplete record')
+        evidence['counter_window_end_qpc_ns'] = end['end_ns']
+        evidence['timing'] = c7_window_timing(start, end, sample_times, args.seconds,
+                                             getattr(args, 'endpoint_budget_ms', None), timing_failures)
+        report.update(after=after, context_switch_diagnostic={'status': 'not_collected',
+                      'scope': 'C7 endpoint reads process CPU only; context switches come from PDH'})
         c7_input_check(gui, instance, args, entry['tick'], helper)
         shells.verify(gui, instance)
-        text = capture.window('c7-counter-window', log_before)
+        if not log_after.startswith(log_before):
+            raise PerfError('log truncated or replaced during measurement')
+        text = log_after[len(log_before):].decode('utf-8', errors='strict')
+        report['windows'].append({'name': 'c7-counter-window', 'start_byte': len(log_before), 'end_byte': len(log_after),
+                                  'start_qpc': start['log'], 'end_qpc': end['log']})
         capture.count(text, 'renderer.present', required=False)
-        for name, (value, unit) in idle_delta(before, after).items():
-            if name != 'threads.context_switches':  # NT endpoint numbers never impersonate PDH.
-                capture.add(name, value, unit)
+        try:
+            for name, (value, unit) in idle_delta(before, after).items():
+                if name != 'threads.context_switches':  # NT endpoint numbers never impersonate PDH.
+                    capture.add(name, value, unit)
+        except (KeyError, TypeError, ValueError) as exc:
+            report['missing_metrics']['process.cpu'] = {'status': 'PENDING', 'n': 0, 'unit': 'ms',
+                'reason': evidence.get('cpu_error', f'incomplete CPU endpoint: {exc}')}
         if evidence['pdh']['status'] != 'PENDING':
-            evidence['pdh'] = stimulus.pdh_summary(rows, instance.pid)
+            # Stream archived raw data after the window: retain at most one full
+            # machine sample, not sixty copies of every foreign thread array.
+            if raw_path.exists():
+                with raw_path.open(encoding='utf-8') as stream:
+                    evidence['pdh'] = stimulus.pdh_summary((json.loads(line) for line in stream), instance.pid)
+            else:
+                evidence['pdh'] = stimulus.pdh_summary([], instance.pid)
         evidence['pdh']['creation'] = instance.creation
         if evidence['pdh']['status'] == 'sampled':
             capture.add('threads.context_switches.pdh', evidence['pdh']['switches'])
         else:
             report['missing_metrics']['threads.context_switches.pdh'] = evidence['pdh']
+        c7_complete_metrics(capture, evidence)
         evidence['input_during_window'] = [r for r in shells.rows() if r['event'] == 'input']
         if evidence['input_during_window']:
             raise PerfError('console received unexpected committed input in the C7 window')
@@ -2499,8 +2700,9 @@ def measure_c7(gui, instance, capture, args, counters, shells, pdh_factory=None)
                 raise PerfError('IME commit verification failed: physical nihao+space did not produce exactly 你好; inspect raw receipts')
             evidence['ime'].update(status='observed_commit',
                 preedit_verification='PENDING visual review; no cross-process internal preedit query exists')
-        evidence['coverage'] = ('PENDING' if evidence['pdh']['status'] != 'sampled' or
-                                'renderer.present' in report['missing_metrics'] else 'captured')
+        if evidence['coverage'] != 'captured' and not getattr(args, 'diagnostic', True):
+            raise PerfError('C7 coordinated counter window incomplete; preserve raw and reject formal sample',
+                            cause='c7_incomplete_window')
         if hashlib.sha256(Path(stimulus.__file__).read_bytes()).hexdigest() != evidence['shell_script_sha256']:
             raise PerfError('stimulus script changed during run')
     finally:
@@ -3501,6 +3703,8 @@ def build_parser() -> argparse.ArgumentParser:
             experiment.add_argument('--case', choices=('matrix', *stimulus.CASES, *stimulus.ANIMATION_CASES), default='matrix')
             experiment.add_argument('--tabs', type=int, choices=(1, 11), default=1)
             experiment.add_argument('--seconds', type=float, default=60)
+            experiment.add_argument('--endpoint-budget-ms', type=float,
+                                    help='explicit reviewed bound on endpoint skew/duration error; no default, omission is diagnostic-only')
             experiment.add_argument('--output-bytes', type=int, default=4096,
                                     help='bytes written by EACH owned terminal at the midpoint')
             experiment.set_defaults(windows=1, state='visible')
@@ -3564,6 +3768,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise PerfError("--runs must be at least 1")
         if args.command.startswith('win32-'):
             if args.command == 'win32-c7':
+                if args.endpoint_budget_ms is not None and (not math.isfinite(args.endpoint_budget_ms) or args.endpoint_budget_ms < 0):
+                    raise PerfError('C7 endpoint budget must be finite and nonnegative')
+                if not args.diagnostic and args.endpoint_budget_ms is None:
+                    raise PerfError('C7 formal sampling requires an explicitly reviewed --endpoint-budget-ms')
                 if (not math.isfinite(args.seconds) or args.seconds < 2 or
                         not 64 <= args.output_bytes <= 1048576):
                     raise PerfError('C7 requires seconds >= 2 and output bytes in [64, 1048576]')

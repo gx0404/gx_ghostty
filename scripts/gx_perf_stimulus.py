@@ -9,12 +9,14 @@ separate evidence. No keyboard layout is loaded, selected or changed here.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import ctypes
 import hashlib
 import importlib.util
 import json
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -33,6 +35,9 @@ ANIMATION_SHADER = '''void mainImage(out vec4 color, in vec2 coord) {
 PDH_PATHS = {name: rf'\Thread(*)\{counter}' for name, counter in (
     ('pid', 'ID Process'), ('tid', 'ID Thread'), ('birth', 'Elapsed Time'),
     ('switches', 'Context Switches/sec'))}
+# Win32_PerfRawData_PerfProc_Thread CounterType qualifiers. None contains
+# PERF_MULTI_COUNTER; PDH_RAW_COUNTER.MultiCount is not data for these types.
+PDH_COUNTER_TYPES = dict(pid=65536, tid=65536, birth=807666944, switches=272696320)
 
 
 class EnvironmentUnavailable(RuntimeError):
@@ -730,6 +735,86 @@ class PdhFailure(RuntimeError):
         super().__init__(f'{operation}: PDH status 0x{status:08x}')
 
 
+class PdhRaw(ctypes.Structure):
+    _fields_ = [('status', ctypes.c_uint32), ('timestamp', ctypes.c_uint32 * 2),
+                ('first', ctypes.c_int64), ('second', ctypes.c_int64), ('multi', ctypes.c_uint32)]
+
+
+class PdhCounterInfoPrefix(ctypes.Structure):
+    # Fixed prefix of PDH_COUNTER_INFO_W, through szFullPath. LONG is 32 bits
+    # even on Win64; DWORD_PTR follows pointer width. The union is not read.
+    _fields_ = [(name, ctypes.c_uint32) for name in
+                ('length', 'type', 'version', 'status', 'scale', 'default_scale')] + [
+                ('user', ctypes.c_size_t), ('query_user', ctypes.c_size_t),
+                ('path', ctypes.c_wchar_p)]
+
+
+def pdh_raw_row(name, raw):
+    return dict(name=name, status=raw.status, first=raw.first, second=raw.second,
+                multi=raw.multi, timestamp_100ns=(raw.timestamp[1] << 32) | raw.timestamp[0])
+
+
+def pdh_path_parts(path):
+    """Parse the documented parent/instance#index form, never infer an index.
+
+    https://learn.microsoft.com/windows/win32/perfctrs/specifying-a-counter-path
+    PDH reserves these delimiters; names using them cannot be safely addressed.
+    """
+    if not isinstance(path, str):
+        raise ValueError('invalid explicit PDH path')
+    match = re.fullmatch(r'(.*\\[^\\()]+)\(([^\\()#*]+)(?:#([0-9]+))?\)\\([^\\()*]+)', path)
+    if not match or match[2].count('/') != 1:
+        raise ValueError('invalid explicit PDH thread path')
+    return match[1], match[2], int(match[3] or 0), match[4]
+
+
+def pdh_local_machine():
+    """Read the local NetBIOS name; never infer it from an expanded path."""
+    get_name = ctypes.WinDLL('kernel32', use_last_error=True).GetComputerNameW
+    get_name.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)]
+    get_name.restype = ctypes.c_int32
+    buffer = ctypes.create_unicode_buffer(16)  # MAX_COMPUTERNAME_LENGTH + 1
+    size = ctypes.c_uint32(len(buffer))
+    if not get_name(buffer, ctypes.byref(size)) or not 0 < size.value < len(buffer):
+        raise ValueError('GetComputerNameW failed; local PDH machine identity unavailable')
+    if len(buffer.value) != size.value:
+        raise ValueError('invalid GetComputerNameW result length')
+    return buffer.value
+
+
+def pdh_path_identity(path, source, local_machine=None):
+    """Compare path components, qualifying only an evidenced local machine.
+
+    ExpandWildCardPathW with no data source or machine searches the local
+    computer. Its returned paths can include that machine's NetBIOS name.
+    GetComputerNameW supplies the authority; dropping any UNC prefix would
+    instead accept arbitrary remote hosts. Object/counter names stay exact.
+    """
+    obj, name, index, counter = pdh_path_parts(path)
+    wildcard = re.fullmatch(r'(.+)\(\*\)\\([^\\()*]+)', source)
+    if not wildcard:
+        raise ValueError('invalid PDH wildcard source')
+    if local_machine is not None and (not isinstance(local_machine, str) or
+            not re.fullmatch(r'[^\\()/*#\x00]{1,15}', local_machine)):
+        raise ValueError('invalid local PDH machine identity')
+
+    def canonical_object(value):
+        parts = re.fullmatch(r'(?:\\\\([^\\()/*#\x00]+))?\\([^\\()/*#\x00]+)', value)
+        if not parts:
+            raise ValueError('invalid PDH machine/object path')
+        machine = parts[1]
+        if local_machine is not None:
+            if machine is not None and machine != local_machine:
+                raise ValueError('native PDH path refers to a different machine')
+            machine = local_machine
+        return machine, parts[2]
+
+    identity_object = canonical_object(obj)
+    if identity_object != canonical_object(wildcard[1]) or counter != wildcard[2]:
+        raise ValueError('native PDH indexed path does not match its source')
+    return identity_object, name, index
+
+
 class PdhThreads:
     """One live query, sampled periodically. English counter API is locale independent.
 
@@ -737,12 +822,25 @@ class PdhThreads:
     TID and Elapsed Time's raw start counter join the samples, never instance
     name alone. Keep every array item: szName is not a globally unique key and
     separate counter arrays have no guaranteed common ordering. Ambiguous
-    owned names cannot be recovered by pairing duplicate occurrences.
+    owned names cannot be recovered by pairing duplicate occurrences. With a
+    target PID, native indexed paths resolve those names. Keep the original
+    arrays and require the scalar handles to reproduce their complete group
+    from the SAME collection before trusting the path associations.
     Thread churn is retained and makes the interval partial, not zero.
     """
-    def __init__(self):
+    def __init__(self, pid=None):
+        if pid is not None and (type(pid) is not int or pid <= 0):
+            raise ValueError('invalid owned PDH PID')
+        self.pid = pid
         self.query = ctypes.c_void_p()
         self.counters = {}
+        self.indexed_counters = {}
+        self.localized_paths = {}
+        self.counter_types = {}
+        self.local_machine = None
+        self.preparation = None
+        self.sequence = 0
+        self.indexed_error = None
         dll = ctypes.WinDLL('pdh')
         dword, handle = ctypes.c_uint32, ctypes.c_void_p
         def bind(name, *args):
@@ -753,6 +851,12 @@ class PdhThreads:
         self.add = bind('PdhAddEnglishCounterW', handle, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(handle))
         self.collect = bind('PdhCollectQueryData', handle)
         self.array = bind('PdhGetRawCounterArrayW', handle, ctypes.POINTER(dword), ctypes.POINTER(dword), ctypes.c_void_p)
+        self.info = bind('PdhGetCounterInfoW', handle, ctypes.c_int32, ctypes.POINTER(dword), ctypes.c_void_p)
+        self.expand = bind('PdhExpandWildCardPathW', ctypes.c_wchar_p, ctypes.c_wchar_p,
+                           ctypes.c_void_p, ctypes.POINTER(dword), dword)
+        self.add_localized = bind('PdhAddCounterW', handle, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(handle))
+        self.remove = bind('PdhRemoveCounter', handle)
+        self.raw_value = bind('PdhGetRawCounterValue', handle, ctypes.POINTER(dword), ctypes.POINTER(PdhRaw))
         self.close_query = bind('PdhCloseQuery', handle)
         try:
             self.check('PdhOpenQueryW', self.open(None, 0, ctypes.byref(self.query)))
@@ -769,15 +873,106 @@ class PdhThreads:
         if status:
             raise PdhFailure(operation, status)
 
-    def sample(self) -> dict:
+    def localized_counter_info(self, counter):
+        # Microsoft's documented English wildcard procedure: AddEnglish ->
+        # GetCounterInfo -> ExpandWildCardPath -> AddCounter (localized).
+        for _ in range(4):
+            size = ctypes.c_uint32()
+            status = self.info(counter, 0, ctypes.byref(size), None)
+            if status != 0x800007D2 or size.value < ctypes.sizeof(PdhCounterInfoPrefix):
+                raise PdhFailure('PdhGetCounterInfoW size', status)
+            buffer = ctypes.create_string_buffer(size.value)
+            status = self.info(counter, 0, ctypes.byref(size), buffer)
+            if status == 0x800007D2:
+                continue
+            self.check('PdhGetCounterInfoW', status)
+            if size.value > ctypes.sizeof(buffer):
+                raise ValueError('PDH counter info exceeds returned buffer')
+            info = ctypes.cast(buffer, ctypes.POINTER(PdhCounterInfoPrefix)).contents
+            path = info.path
+            if not path or '(*)\\' not in path:
+                raise ValueError('PDH localized wildcard path unavailable')
+            return path, info.type
+        raise PdhFailure('PdhGetCounterInfoW retry limit', 0x800007D2)
+
+    def expanded_paths(self, path):
+        # Refresh once, not again between sizing and reading. PDH does not
+        # promise an atomic snapshot: allow bounded growth, then fail closed.
+        # On MORE_DATA with a nonzero input size, the returned size is expressly
+        # unreliable. Re-query with zero instead of trusting that output.
+        # https://learn.microsoft.com/windows/win32/api/pdh/nf-pdh-pdhexpandwildcardpathw
+        capacity = 0
+        max_chars = 8 * 1024 * 1024  # 16 MiB of UTF-16; never truncate to fit.
+        for attempt in range(4):
+            size = ctypes.c_uint32()
+            status = self.expand(None, path, None, ctypes.byref(size), 4 if attempt == 0 else 0)
+            if status != 0x800007D2 or size.value < 2:
+                raise PdhFailure('PdhExpandWildCardPathW size', status)
+            required = size.value
+            if required > max_chars:
+                raise ValueError('PDH expanded path list exceeds buffer budget')
+            headroom = min(65536, max(256, required // 8))
+            capacity = min(max_chars, max(required + headroom, capacity * 2))
+            buffer = ctypes.create_unicode_buffer(capacity)
+            size.value = capacity
+            status = self.expand(None, path, buffer, ctypes.byref(size), 0)
+            if status == 0x800007D2:
+                continue
+            self.check('PdhExpandWildCardPathW', status)
+            if size.value > len(buffer) or size.value < 2:
+                raise ValueError('invalid PDH expanded path buffer size')
+            text = buffer[:size.value]
+            terminator = text.find('\0\0')
+            if terminator < 0:
+                raise ValueError('unterminated PDH expanded path list')
+            if any(character != '\0' for character in text[terminator + 2:]):
+                raise ValueError('nonzero data after PDH expanded path terminator')
+            paths = text[:terminator].split('\0')
+            if any(not item for item in paths):
+                raise ValueError('empty PDH expanded path')
+            return paths
+        raise PdhFailure('PdhExpandWildCardPathW retry limit', 0x800007D2)
+
+    def prepare_indexed(self, names):
+        if self.local_machine is None:
+            self.local_machine = pdh_local_machine()
+        if not self.localized_paths:
+            info = {key: self.localized_counter_info(counter) for key, counter in self.counters.items()}
+            self.counter_types = {key: value[1] for key, value in info.items()}
+            if self.counter_types != PDH_COUNTER_TYPES:
+                raise ValueError('unsupported native PDH thread counter types')
+            self.localized_paths = {key: value[0] for key, value in info.items()}
+        desired = {}
+        identities = set()
+        for path in self.expanded_paths(self.localized_paths['pid']):
+            obj, name, index = pdh_path_identity(path, self.localized_paths['pid'], self.local_machine)
+            if name not in names:
+                continue
+            identity = (obj, name, index)
+            if identity in identities:
+                raise ValueError('duplicate native PDH indexed path')
+            identities.add(identity)
+            for key, source in self.localized_paths.items():
+                full_path = path.rsplit('\\', 1)[0] + '\\' + source.rsplit('\\', 1)[1]
+                pdh_path_identity(full_path, source, self.local_machine)
+                desired[full_path] = (key, name)
+        if {identity[1] for identity in identities} != names:
+            raise ValueError('native PDH paths do not cover owned duplicate names')
+        for path in self.indexed_counters.keys() - desired.keys():
+            self.check('PdhRemoveCounter', self.remove(self.indexed_counters[path][2]))
+            del self.indexed_counters[path]
+        for path, (key, name) in desired.items():
+            if path not in self.indexed_counters:
+                counter = ctypes.c_void_p()
+                self.check('PdhAddCounterW ' + path,
+                           self.add_localized(self.query, path, 0, ctypes.byref(counter)))
+                self.indexed_counters[path] = (key, name, counter)
+
+    def read_arrays(self):
         dword = ctypes.c_uint32
-        class Raw(ctypes.Structure):
-            _fields_ = [('status', dword), ('timestamp', dword * 2), ('first', ctypes.c_int64),
-                        ('second', ctypes.c_int64), ('multi', dword)]
         class Item(ctypes.Structure):
-            _fields_ = [('name', ctypes.c_wchar_p), ('raw', Raw)]
-        result = {'qpc_begin_ns': time.perf_counter_ns(), 'time_ns': time.time_ns(), 'arrays': {}}
-        self.check('PdhCollectQueryData', self.collect(self.query))
+            _fields_ = [('name', ctypes.c_wchar_p), ('raw', PdhRaw)]
+        arrays = {}
         for name, counter in self.counters.items():
             for attempt in range(4):
                 size, count = dword(), dword()
@@ -793,22 +988,140 @@ class PdhThreads:
                     raise PdhFailure('empty PDH array ' + name, 0x800007D1)
                 if count.value * ctypes.sizeof(Item) > size.value or size.value > ctypes.sizeof(buffer):
                     raise ValueError('PDH array count exceeds returned buffer')
-                result['arrays'][name] = [dict(name=item.name, status=item.raw.status,
-                    first=item.raw.first, second=item.raw.second, multi=item.raw.multi,
-                    timestamp_100ns=(item.raw.timestamp[1] << 32) | item.raw.timestamp[0])
+                arrays[name] = [pdh_raw_row(item.name, item.raw)
                     for item in ctypes.cast(buffer, ctypes.POINTER(Item * count.value)).contents]
                 break
+        return arrays
+
+    def prepare(self) -> dict:
+        """Discover and bind once, before the measurement window. Never retry in it."""
+        if self.preparation is not None:
+            return self.preparation
+        result = {'qpc_begin_ns': time.perf_counter_ns(), 'time_ns': time.time_ns()}
+        self.check('PdhCollectQueryData', self.collect(self.query))
+        result['arrays'] = self.read_arrays()
+        counts = Counter(row['name'] for row in result['arrays']['pid'])
+        names = {row['name'] for row in result['arrays']['pid']
+                 if self.pid is not None and row['status'] in (0, 1) and row['first'] == self.pid
+                 and counts[row['name']] > 1}
+        if names:
+            try:
+                self.prepare_indexed(names)
+            except (PdhFailure, ValueError) as exc:
+                if isinstance(exc, PdhFailure) and not exc.unavailable:
+                    raise
+                self.indexed_error = str(exc)
+                result['indexed_error'] = str(exc)
+        result['indexed_paths'] = list(self.indexed_counters)
         result['qpc_end_ns'] = time.perf_counter_ns()
+        self.preparation = result
+        return result
+
+    def capture(self) -> dict:
+        """Freeze ONE collection; decode/serialize its data outside the endpoint."""
+        if self.preparation is None:
+            raise ValueError('PDH query must be prepared outside the measurement window')
+        self.sequence += 1
+        began = time.perf_counter_ns()
+        self.check('PdhCollectQueryData', self.collect(self.query))
+        return {'sequence': self.sequence, 'collection_qpc_begin_ns': began,
+                'collection_qpc_end_ns': time.perf_counter_ns(), 'time_ns': time.time_ns()}
+
+    def read(self, token) -> dict:
+        if token['sequence'] != self.sequence:
+            raise ValueError('PDH collection overwritten before read')
+        result = dict(token, qpc_begin_ns=token['collection_qpc_begin_ns'], arrays=self.read_arrays())
+        if self.indexed_counters:
+            indexed = {'source': dict(self.localized_paths), 'local_machine': self.local_machine,
+                       'types': dict(self.counter_types), 'arrays': {key: [] for key in PDH_PATHS}}
+            for path, (key, name, counter) in self.indexed_counters.items():
+                raw, counter_type = PdhRaw(), ctypes.c_uint32()
+                self.check('PdhGetRawCounterValue ' + path,
+                           self.raw_value(counter, ctypes.byref(counter_type), ctypes.byref(raw)))
+                indexed['arrays'][key].append(dict(pdh_raw_row(name, raw), path=path, type=counter_type.value))
+            result['indexed'] = indexed
+        if self.indexed_error:
+            result['indexed_error'] = self.indexed_error
+        result['qpc_end_ns'] = time.perf_counter_ns()
+        return result
+
+    def sample(self) -> dict:
+        # Convenience for diagnostic callers. C7 calls prepare explicitly and
+        # brackets capture with its CPU/log endpoints before read/serialization.
+        began = time.perf_counter_ns()
+        first = self.preparation is None
+        preparation = self.prepare()
+        result = self.read(self.capture())
+        result.update(sample_call_begin_ns=began, sample_call_end_ns=time.perf_counter_ns())
+        if first:
+            result['preparation_qpc'] = {key: preparation[key] for key in ('qpc_begin_ns', 'qpc_end_ns')}
         return result
 
     def close(self):
         if self.query.value:
             self.close_query(self.query)
             self.query = ctypes.c_void_p()
+            self.indexed_counters.clear()
+
+
+def pdh_indexed_group(sample, arrays, name):
+    """Use native paths only when they cover the entire ambiguous raw group.
+
+    Multisets prove coverage, not association. Only the explicit path associates
+    counters; no occurrence order or values are used to pair the raw arrays.
+    """
+    if 'indexed' not in sample or 'indexed_error' in sample:
+        detail = sample.get('indexed_error', 'identity ambiguous')
+        raise ValueError('duplicate owned PDH instance name; ' + detail)
+    indexed = sample['indexed']
+    fields = ('status', 'first', 'second', 'multi', 'timestamp_100ns')
+
+    def fingerprint(row, typed):
+        values = tuple(row[field] for field in fields)
+        if any(type(value) is not int for value in values):
+            raise ValueError('invalid native PDH indexed value')
+        if not 0 <= row['multi'] <= 0xffffffff:
+            raise ValueError('invalid native PDH MultiCount')
+        # MultiCount is defined only for PERF_MULTI_COUNTER. Exclude it only
+        # after BOTH native APIs confirm these known non-multi counter types.
+        # Old evidence without type metadata retains the strict comparison.
+        if typed:
+            values = values[:3] + values[4:]
+        # VALID_DATA and NEW_DATA both certify a valid raw value. Newly added
+        # scalar handles need not have the wildcard handle's read history.
+        return (0 if values[0] in (0, 1) else values[0], *values[1:])
+
+    by_counter = {}
+    for key in PDH_PATHS:
+        by_path = {}
+        rows = [row for row in indexed['arrays'][key] if row['name'] == name]
+        typed = 'types' in indexed
+        if typed:
+            counter_type = indexed['types'][key]
+            if (type(counter_type) is not int or counter_type != PDH_COUNTER_TYPES[key] or
+                    any(type(row.get('type')) is not int or row['type'] != counter_type for row in rows)):
+                raise ValueError('unsupported or inconsistent native PDH counter type')
+        for row in rows:
+            obj, path_name, index = pdh_path_identity(
+                row['path'], indexed['source'][key], indexed.get('local_machine'))
+            if path_name != name:
+                raise ValueError('native PDH indexed path does not match its source')
+            identity = (obj, path_name, index)
+            if identity in by_path:
+                raise ValueError('duplicate native PDH indexed identity')
+            by_path[identity] = row
+        if (Counter(fingerprint(row, typed) for row in rows) !=
+                Counter(fingerprint(row, typed) for row in arrays[key][name])):
+            raise ValueError('native PDH indexed coverage differs from raw array')
+        by_counter[key] = by_path
+    identities = by_counter['pid'].keys()
+    if any(rows.keys() != identities for rows in by_counter.values()):
+        raise ValueError('native PDH indexed counter paths differ')
+    return [{key: by_counter[key][identity] for key in PDH_PATHS} for identity in identities]
 
 
 def pdh_owned(sample: dict, pid: int) -> dict:
-    """Join only unique owned names within one collection, then bind PID/TID/birth.
+    """Join unique names or proven native paths, then bind PID/TID/birth.
 
     Foreign duplicate names are harmless only when every ID Process row proves
     foreign ownership. Missing PID rows or invalid ownership remain fail-closed.
@@ -849,39 +1162,45 @@ def pdh_owned(sample: dict, pid: int) -> dict:
             collection_stamp = stamp
         if all(row['first'] != pid for row in rows):
             continue
-        if len(rows) != 1:
-            raise ValueError('duplicate owned PDH instance name; identity ambiguous')
-        fields = {key: arrays[key][name][0] for key in PDH_PATHS}
-        if any(not integer(item['status']) or item['status'] not in (0, 1)
-               for item in fields.values()):
-            raise ValueError('owned PDH counter missing or invalid')
-        if any(not integer(item['timestamp_100ns']) or
-               item['timestamp_100ns'] != collection_stamp for item in fields.values()):
-            raise ValueError('owned PDH counter timestamps differ')
-        tid, birth = fields['tid']['first'], fields['birth']['first']
-        if (not integer(tid) or not integer(birth) or tid <= 0 or birth <= 0 or
-                tid in tids):
-            raise ValueError('invalid or duplicate PDH thread identity')
-        switches = fields['switches']
-        if not integer(switches['first']) or switches['first'] < 0:
-            raise ValueError('invalid owned PDH switch count')
-        tids.add(tid)
-        result[(pid, tid, birth)] = switches
+        groups = (pdh_indexed_group(sample, arrays, name) if len(rows) != 1 else
+                  [{key: arrays[key][name][0] for key in PDH_PATHS}])
+        for fields in groups:
+            if fields['pid']['first'] != pid:
+                continue
+            if any(not integer(item['status']) or item['status'] not in (0, 1)
+                   for item in fields.values()):
+                raise ValueError('owned PDH counter missing or invalid')
+            if any(not integer(item['timestamp_100ns']) or
+                   item['timestamp_100ns'] != collection_stamp for item in fields.values()):
+                raise ValueError('owned PDH counter timestamps differ')
+            tid, birth = fields['tid']['first'], fields['birth']['first']
+            if (not integer(tid) or not integer(birth) or tid <= 0 or birth <= 0 or
+                    tid in tids):
+                raise ValueError('invalid or duplicate PDH thread identity')
+            switches = fields['switches']
+            if not integer(switches['first']) or switches['first'] < 0:
+                raise ValueError('invalid owned PDH switch count')
+            tids.add(tid)
+            result[(pid, tid, birth)] = switches
     if not result:
         raise ValueError('no PDH thread counters for owned PID')
     return result
 
 
-def pdh_summary(samples: list[dict], pid: int) -> dict:
+def pdh_summary(samples, pid: int) -> dict:
     result = {'status': 'PENDING', 'n': 0, 'unit': '', 'intervals': [],
               'source': PDH_PATHS, 'pid': pid,
               'scope': 'periodic PDH thread counters; sub-sample thread lifetimes remain unobservable'}
     try:
-        if len(samples) < 2:
+        samples = iter(samples)
+        first = next(samples, None)
+        if first is None:
             raise ValueError('PDH requires at least two samples')
-        previous = pdh_owned(samples[0], pid)
+        previous = pdh_owned(first, pid)
+        sample_count = 1
         total = 0
-        for sample in samples[1:]:
+        for sample in samples:
+            sample_count += 1
             current = pdh_owned(sample, pid)
             matched = previous.keys() & current.keys()
             deltas = []
@@ -895,9 +1214,11 @@ def pdh_summary(samples: list[dict], pid: int) -> dict:
                 'added': sorted(current.keys() - previous.keys()), 'removed': sorted(previous.keys() - current.keys())})
             total += sum(deltas)
             previous = current
+        if sample_count < 2:
+            raise ValueError('PDH requires at least two samples')
         if any(row['added'] or row['removed'] for row in result['intervals']):
             raise ValueError('PDH thread set changed; complete process switch count unavailable')
-        result.update(status='sampled', n=1, switches=total, sample_count=len(samples))
+        result.update(status='sampled', n=1, switches=total, sample_count=sample_count)
     except (KeyError, ValueError) as exc:
         result['reason'] = str(exc)
     return result

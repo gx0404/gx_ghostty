@@ -341,6 +341,550 @@ class PdhTests(unittest.TestCase):
         self.assertEqual('raw array', raised.exception.operation)
 
 
+def indexed_pdh_sample(count=10, stamp=100, target_index=1):
+    """Two native paths, with identical wildcard szName and independent order."""
+    target = pdh_sample(count, stamp)
+    helper = pdh_sample(900, stamp, pid=91, tid=8, birth=56)
+    types = dict(pid=65536, tid=65536, birth=807666944, switches=272696320)
+    sample = {'arrays': {}, 'indexed': {'source': dict(stimulus.PDH_PATHS), 'types': types, 'arrays': {}}}
+    for key in stimulus.PDH_PATHS:
+        rows = [target['arrays'][key][0], helper['arrays'][key][0]]
+        sample['arrays'][key] = copy.deepcopy(rows[::-1] if key in ('tid', 'birth') else rows)
+        sample['indexed']['arrays'][key] = [dict(row, type=types[key], path=stimulus.PDH_PATHS[key].replace(
+            '*', 'ghostty/0' + ('#1' if index else '')))
+            for index, row in ((target_index, rows[0]), (1 - target_index, rows[1]))]
+        if key in ('pid', 'switches'):
+            sample['indexed']['arrays'][key].reverse()
+    return sample
+
+
+class IndexedPdhTests(unittest.TestCase):
+    def test_non_multi_counter_types_do_not_compare_unused_multicount(self):
+        samples = [indexed_pdh_sample(), indexed_pdh_sample(31, 200)]
+        for sample in samples:
+            for rows in sample['arrays'].values():
+                for row in rows:
+                    row['multi'] = 0  # Native wildcard=0, scalar=1.
+        original = copy.deepcopy(samples)
+        value = stimulus.pdh_summary(samples, 42)
+        self.assertEqual(('sampled', 21), (value['status'], value.get('switches')))
+        self.assertEqual(original, samples)
+        for kind in ('no-types', 'unknown-type', 'multi-type', 'scalar-type', 'missing-scalar-type'):
+            with self.subTest(kind=kind):
+                changed = copy.deepcopy(samples)
+                indexed = changed[-1]['indexed']
+                if kind == 'no-types':
+                    del indexed['types']
+                elif kind in ('unknown-type', 'multi-type'):
+                    indexed['types']['pid'] = 0 if kind == 'unknown-type' else 0x02010000
+                elif kind == 'scalar-type':
+                    indexed['arrays']['pid'][0]['type'] = 0x02010000
+                else:
+                    del indexed['arrays']['pid'][0]['type']
+                value = stimulus.pdh_summary(changed, 42)
+                self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+                self.assertNotIn('switches', value)
+
+    def test_native_machine_prefix_matches_only_recorded_local_machine(self):
+        samples = [indexed_pdh_sample(), indexed_pdh_sample(31, 200)]
+        for sample in samples:
+            sample['indexed']['local_machine'] = 'GX'
+            for rows in sample['indexed']['arrays'].values():
+                for row in rows:
+                    row['path'] = r'\\GX' + row['path']
+        original = copy.deepcopy(samples)
+        value = stimulus.pdh_summary(samples, 42)
+        self.assertEqual(('sampled', 21), (value['status'], value.get('switches')))
+        self.assertEqual(original, samples)
+        for change in ('missing-machine', 'foreign-machine', 'foreign-source', 'object', 'counter'):
+            with self.subTest(change=change):
+                changed = copy.deepcopy(samples)
+                indexed = changed[-1]['indexed']
+                if change == 'missing-machine':
+                    del indexed['local_machine']
+                elif change in ('foreign-machine', 'foreign-source'):
+                    for key, rows in indexed['arrays'].items():
+                        for row in rows:
+                            row['path'] = row['path'].replace(r'\\GX', r'\\OTHER')
+                        if change == 'foreign-source':
+                            indexed['source'][key] = r'\\OTHER' + indexed['source'][key]
+                else:
+                    row = indexed['arrays']['pid'][0]
+                    row['path'] = row['path'].replace('Thread(', 'Process(') if change == 'object' else row['path'].replace('ID Process', 'ID Thread')
+                value = stimulus.pdh_summary(changed, 42)
+                self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+                self.assertNotIn('switches', value)
+
+    def test_native_index_paths_disambiguate_without_array_order(self):
+        samples = [indexed_pdh_sample(), indexed_pdh_sample(31, 200, target_index=0)]
+        original = copy.deepcopy(samples)
+        value = stimulus.pdh_summary(samples, 42)
+        self.assertEqual(('sampled', 1, 21), (value['status'], value['n'], value.get('switches')))
+        self.assertEqual(original, samples)
+
+    def test_old_raw_duplicates_still_fail_without_native_path_evidence(self):
+        sample = indexed_pdh_sample(31, 200)
+        del sample['indexed']
+        value = stimulus.pdh_summary([indexed_pdh_sample(), sample], 42)
+        self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+        self.assertIn('duplicate owned', value['reason'])
+        self.assertNotIn('switches', value)
+
+    def test_new_scalar_data_status_is_valid_and_raw_is_not_relabelled(self):
+        samples = [indexed_pdh_sample(), indexed_pdh_sample(31, 200)]
+        for sample in samples:
+            for rows in sample['indexed']['arrays'].values():
+                for row in rows:
+                    row['status'] = 1
+        original = copy.deepcopy(samples)
+        value = stimulus.pdh_summary(samples, 42)
+        self.assertEqual(('sampled', 21), (value['status'], value.get('switches')))
+        self.assertEqual(original, samples)
+
+    def test_indexed_coverage_and_identity_fail_closed(self):
+        def wrong_source(sample):
+            sample['indexed']['source']['pid'] = r'\Process(*)\ID Process'
+        def duplicate_zero(sample):
+            for key, rows in sample['indexed']['arrays'].items():
+                for row in rows:
+                    row['path'] = stimulus.PDH_PATHS[key].replace('*', 'ghostty/0#0')
+        mutations = [wrong_source, duplicate_zero]
+        for key in stimulus.PDH_PATHS:
+            mutations += [lambda s, k=key: s['indexed']['arrays'][k].pop(),
+                          lambda s, k=key: s['indexed']['arrays'][k][0].update(first=12345),
+                          lambda s, k=key: s['indexed']['arrays'][k][0].update(timestamp_100ns=201),
+                          lambda s, k=key: s['indexed']['arrays'][k][0].update(status=0xc0000bba),
+                          lambda s, k=key: s['indexed']['arrays'][k][0].update(path=r'\Thread(*)\ID Process')]
+        for i, mutate in enumerate(mutations):
+            with self.subTest(mutation=i):
+                sample = indexed_pdh_sample(31, 200)
+                mutate(sample)
+                value = stimulus.pdh_summary([indexed_pdh_sample(), sample], 42)
+                self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+                self.assertNotIn('switches', value)
+
+    def test_indexed_path_birth_and_thread_churn_remain_missing(self):
+        for key, changed in [('birth', 99), ('tid', 9), ('switches', 9)]:
+            sample = indexed_pdh_sample(31, 200)
+            # Change the same target in both native views, so coverage is valid.
+            for row in sample['arrays'][key]:
+                if row['first'] == {'birth': 55, 'tid': 7, 'switches': 31}[key]:
+                    row['first'] = changed
+            for row in sample['indexed']['arrays'][key]:
+                if '#1)' in row['path']:
+                    row['first'] = changed
+            value = stimulus.pdh_summary([indexed_pdh_sample(), sample], 42)
+            self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+            self.assertNotIn('switches', value)
+
+
+class FakeIndexedPdh:
+    """PDH ABI fixture: native path handles, never array position, select values."""
+    class Raw(ctypes.Structure):
+        _fields_ = [('status', ctypes.c_uint32), ('timestamp', ctypes.c_uint32 * 2),
+                    ('first', ctypes.c_int64), ('second', ctypes.c_int64), ('multi', ctypes.c_uint32)]
+
+    def __init__(self):
+        self.dll = mock.Mock()
+        self.handles = {}
+        self.keepalive = []
+        self.snapshot = indexed_pdh_sample()
+        self.paths = {key: rf'\线程(*)\{name}' for key, name in
+                      zip(stimulus.PDH_PATHS, ('进程标识', '线程标识', '运行时间', '上下文切换/秒'))}
+        self.expansions = [self.paths['pid'].replace('*', name) for name in ('ghostty/0', 'ghostty/0#1')]
+        self.collects = 0
+        self.add_failure = 0
+        self.expand_failure = 0
+        self.grow_once = False
+        self.on_collect = None
+        self.dll.PdhOpenQueryW.side_effect = self.open
+        self.dll.PdhAddEnglishCounterW.side_effect = self.add_english
+        self.dll.PdhGetCounterInfoW.side_effect = self.info
+        self.dll.PdhExpandWildCardPathW.side_effect = self.expand
+        self.dll.PdhAddCounterW.side_effect = self.add_localized
+        self.dll.PdhRemoveCounter.side_effect = self.remove
+        self.dll.PdhCollectQueryData.side_effect = self.collect
+        self.dll.PdhGetRawCounterArrayW.side_effect = self.array
+        self.dll.PdhGetRawCounterValue.side_effect = self.value
+        self.dll.PdhCloseQuery.return_value = 0
+        self.dll.GetComputerNameW.side_effect = self.computer_name
+
+    def computer_name(self, buffer, size):
+        buffer.value = 'GX'
+        size._obj.value = 2
+        return 1
+
+    def open(self, _source, _context, handle):
+        handle._obj.value = 123
+        return 0
+
+    def add_handle(self, path, handle):
+        handle._obj.value = max(self.handles, default=0) + 1
+        self.handles[handle._obj.value] = path
+        return 0
+
+    def add_english(self, _query, path, _context, handle):
+        key = next(key for key, value in stimulus.PDH_PATHS.items() if value == path)
+        return self.add_handle(self.paths[key], handle)
+
+    def add_localized(self, _query, path, _context, handle):
+        return self.add_failure or self.add_handle(path, handle)
+
+    def remove(self, handle):
+        del self.handles[handle.value]
+        return 0
+
+    def info(self, handle, _explain, size, buffer):
+        class Header(ctypes.Structure):
+            _fields_ = [('fixed', ctypes.c_uint32 * 6), ('contexts', ctypes.c_size_t * 2),
+                        ('path', ctypes.c_wchar_p)]
+        size._obj.value = ctypes.sizeof(Header)
+        if buffer is None:
+            return 0x800007d2
+        header = Header.from_buffer(buffer)
+        header.path = self.handles[handle.value]
+        key = next(key for key, path in self.paths.items() if path == header.path)
+        header.fixed[1] = self.snapshot['indexed']['types'][key]
+        self.keepalive.append(header)
+        return 0
+
+    def expand(self, _source, path, buffer, size, flags):
+        assert path == self.paths['pid'] and flags in (0, 4)
+        if buffer is not None:
+            assert flags == 0
+        if self.expand_failure:
+            return self.expand_failure
+        text = '\0'.join(self.expansions) + '\0\0'
+        size._obj.value = len(text)
+        if buffer is None:
+            return 0x800007d2
+        if self.grow_once:
+            self.grow_once = False
+            size._obj.value = 999999  # Not a trustworthy resize result.
+            return 0x800007d2
+        buffer[:len(text)] = text
+        return 0
+
+    def collect(self, _query):
+        self.collects += 1
+        if self.on_collect:
+            self.on_collect(self.collects)
+        return 0
+
+    def set_raw(self, raw, row):
+        raw.status, raw.first, raw.second, raw.multi = (row[key] for key in ('status', 'first', 'second', 'multi'))
+        raw.timestamp[:] = (row['timestamp_100ns'] & 0xffffffff, row['timestamp_100ns'] >> 32)
+
+    def array(self, handle, size, count, buffer):
+        key = next(key for key, path in self.paths.items() if path == self.handles[handle.value])
+        rows = self.snapshot['arrays'][key]
+        class Item(ctypes.Structure):
+            _fields_ = [('name', ctypes.c_wchar_p), ('raw', FakeIndexedPdh.Raw)]
+        count._obj.value, size._obj.value = len(rows), len(rows) * ctypes.sizeof(Item)
+        if buffer is None:
+            return 0x800007d2
+        items = (Item * len(rows)).from_buffer(buffer)
+        for item, row in zip(items, rows):
+            item.name = row['name']
+            self.set_raw(item.raw, row)
+        self.keepalive.append(items)
+        return 0
+
+    def value(self, handle, _type, raw):
+        path = self.handles[handle.value]
+        key = next(key for key, source in self.paths.items() if path.rsplit('\\', 1)[1] == source.rsplit('\\', 1)[1])
+        instance = path.split('(', 1)[1].split(')', 1)[0]
+        row = next(row for row in self.snapshot['indexed']['arrays'][key]
+                   if row['path'].split('(', 1)[1].split(')', 1)[0] == instance)
+        self.set_raw(raw._obj, row)
+        if _type is not None:
+            _type._obj.value = row['type']
+        return 0
+
+
+class PdhExpansionTests(unittest.TestCase):
+    def collector(self, expand):
+        collector = stimulus.PdhThreads.__new__(stimulus.PdhThreads)
+        collector.expand = expand
+        return collector
+
+    def test_refreshes_once_and_returns_every_path_from_the_native_list(self):
+        paths = [r'\\GX\Thread(ghostty/0)\ID Process']
+        flags_seen = []
+        def expand(_source, _path, buffer, size, flags):
+            flags_seen.append(flags)
+            if flags & 4:
+                paths.append(rf'\\GX\Thread(worker/{len(paths)})\ID Process')
+            text = '\0'.join(paths) + '\0\0'
+            supplied = size._obj.value
+            size._obj.value = len(text)
+            if buffer is None or supplied < len(text):
+                return 0x800007d2
+            buffer[:len(text)] = text
+            return 0
+        result = self.collector(expand).expanded_paths(stimulus.PDH_PATHS['pid'])
+        self.assertEqual(paths, result)
+        self.assertEqual([4, 0], flags_seen)
+
+    def test_growth_resizes_from_zero_length_query_not_failed_data_length(self):
+        paths = [r'\\GX\Thread(ghostty/0)\ID Process']
+        flags_seen, capacities = [], []
+        def expand(_source, _path, buffer, size, flags):
+            flags_seen.append(flags)
+            if buffer is not None:
+                capacities.append(size._obj.value)
+                if len(capacities) == 1:
+                    paths.extend(rf'\\GX\Thread(worker/{i})\ID Process' for i in range(100))
+                    size._obj.value = 0xffffffff  # Documented as untrustworthy on this failure.
+                    return 0x800007d2
+            text = '\0'.join(paths) + '\0\0'
+            supplied = size._obj.value
+            size._obj.value = len(text)
+            if buffer is None or supplied < len(text):
+                return 0x800007d2
+            buffer[:len(text)] = text
+            return 0
+        result = self.collector(expand).expanded_paths(stimulus.PDH_PATHS['pid'])
+        self.assertEqual(paths, result)
+        self.assertEqual([4, 0, 0, 0], flags_seen)
+        self.assertGreater(capacities[1], capacities[0])
+        self.assertLess(capacities[1], 100_000)
+
+    def test_continuous_growth_still_fails_after_four_data_attempts(self):
+        flags_seen, capacities = [], []
+        def expand(_source, _path, buffer, size, flags):
+            flags_seen.append(flags)
+            if buffer is None:
+                size._obj.value = 64
+            else:
+                capacities.append(size._obj.value)
+                size._obj.value = 0xffffffff
+            return 0x800007d2
+        with self.assertRaisesRegex(stimulus.PdhFailure, 'retry limit'):
+            self.collector(expand).expanded_paths(stimulus.PDH_PATHS['pid'])
+        self.assertEqual(4, len(capacities))
+        self.assertEqual(1, flags_seen.count(4))
+        self.assertTrue(all(b > a for a, b in zip(capacities, capacities[1:])))
+
+    def test_oversized_required_list_rejects_without_allocating_or_dropping_paths(self):
+        def expand(_source, _path, _buffer, size, _flags):
+            size._obj.value = 0xffffffff
+            return 0x800007d2
+        with mock.patch.object(ctypes, 'create_unicode_buffer', side_effect=AssertionError('unbounded allocation')):
+            with self.assertRaisesRegex(ValueError, 'buffer budget'):
+                self.collector(expand).expanded_paths(stimulus.PDH_PATHS['pid'])
+
+    def test_multisz_zero_padding_is_not_an_empty_instance(self):
+        path = r'\\GX\Thread(ghostty/0#1)\ID Process'
+        def expand(_source, _path, buffer, size, _flags):
+            if buffer is None:
+                size._obj.value = len(path) + 8
+                return 0x800007d2
+            text = path + '\0\0' + '\0' * 6
+            buffer[:len(text)] = text
+            size._obj.value = len(text)
+            return 0
+        self.assertEqual([path], self.collector(expand).expanded_paths(stimulus.PDH_PATHS['pid']))
+
+    def test_nonzero_data_after_multisz_terminator_is_not_silently_dropped(self):
+        text = '\\Thread(ghostty/0)\\ID Process\0\0\\Thread(ghostty/0#1)\\ID Process\0\0'
+        def expand(_source, _path, buffer, size, _flags):
+            size._obj.value = len(text)
+            if buffer is None:
+                return 0x800007d2
+            buffer[:len(text)] = text
+            return 0
+        with self.assertRaises(ValueError):
+            self.collector(expand).expanded_paths(stimulus.PDH_PATHS['pid'])
+
+
+class NativeIndexedPdhTests(unittest.TestCase):
+    def test_prebound_collection_never_discovers_or_recollects_in_window(self):
+        fake = FakeIndexedPdh()
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                preparation = collector.prepare()
+                expanded = fake.dll.PdhExpandWildCardPathW.call_count
+                before = fake.collects
+                token = collector.capture()
+                row = collector.read(token)
+                self.assertEqual(before + 1, fake.collects)
+                self.assertEqual(expanded, fake.dll.PdhExpandWildCardPathW.call_count)
+                self.assertEqual(8, fake.dll.PdhAddCounterW.call_count)
+                self.assertLessEqual(preparation['qpc_end_ns'], row['collection_qpc_begin_ns'])
+                self.assertLessEqual(row['collection_qpc_end_ns'], row['qpc_end_ns'])
+                collector.capture()
+                with self.assertRaisesRegex(ValueError, 'overwritten'):
+                    collector.read(token)
+            finally:
+                collector.close()
+
+    def test_recorded_types_support_native_multicount_difference(self):
+        fake = FakeIndexedPdh()
+        fake.expansions = [r'\\GX' + path for path in fake.expansions]
+        for rows in fake.snapshot['arrays'].values():
+            for row in rows:
+                row['multi'] = 0
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                row = collector.sample()
+            finally:
+                collector.close()
+        self.assertEqual({(42, 7, 55)}, set(stimulus.pdh_owned(row, 42)))
+        self.assertEqual(fake.snapshot['indexed']['types'], row['indexed']['types'])
+        self.assertEqual({0}, {x['multi'] for x in row['arrays']['pid']})
+        self.assertEqual({1}, {x['multi'] for x in row['indexed']['arrays']['pid']})
+
+    def test_native_machine_qualified_expansion_from_local_source(self):
+        fake = FakeIndexedPdh()
+        fake.expansions = [r'\\GX' + path for path in fake.expansions]
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                first = collector.sample()
+                fake.snapshot = indexed_pdh_sample(31, 200)
+                last = collector.sample()
+            finally:
+                collector.close()
+        value = stimulus.pdh_summary([first, last], 42)
+        self.assertEqual(('sampled', 21), (value['status'], value.get('switches')))
+        self.assertEqual('GX', last['indexed']['local_machine'])
+        self.assertEqual(fake.paths, last['indexed']['source'])
+        fake.dll.GetComputerNameW.assert_called_once()
+
+    def test_untrusted_machine_or_counter_is_rejected_before_adding_handles(self):
+        for kind in ('remote', 'counter', 'counter-type', 'missing-local-name'):
+            with self.subTest(kind=kind):
+                fake = FakeIndexedPdh()
+                if kind == 'remote':
+                    fake.expansions = [r'\\OTHER' + path for path in fake.expansions]
+                elif kind == 'counter':
+                    fake.expansions[0] = fake.expansions[0].replace('进程标识', '线程标识')
+                elif kind == 'counter-type':
+                    fake.snapshot['indexed']['types']['pid'] = 0
+                else:
+                    fake.dll.GetComputerNameW.side_effect = None
+                    fake.dll.GetComputerNameW.return_value = 0
+                with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+                    collector = stimulus.PdhThreads(pid=42)
+                    try:
+                        row = collector.sample()
+                    finally:
+                        collector.close()
+                self.assertIn('indexed_error', row)
+                fake.dll.PdhAddCounterW.assert_not_called()
+                value = stimulus.pdh_summary([row, row], 42)
+                self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+
+    def test_localized_native_paths_resolve_helper_and_index_renumbering(self):
+        fake = FakeIndexedPdh()
+        fake.grow_once = True
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                first = collector.sample()
+                fake.snapshot = indexed_pdh_sample(31, 200, target_index=0)
+                last = collector.sample()
+            finally:
+                collector.close()
+                collector.close()
+        value = stimulus.pdh_summary([first, last], 42)
+        self.assertEqual(('sampled', 21), (value['status'], value.get('switches')))
+        self.assertEqual(3, fake.collects)  # one discovery, two measured collections
+        self.assertEqual(fake.snapshot['arrays'], last['arrays'])
+        self.assertEqual(fake.paths, last['indexed']['source'])
+        self.assertEqual(8, fake.dll.PdhAddCounterW.call_count)
+        self.assertTrue(all('线程(' in call.args[1] for call in fake.dll.PdhAddCounterW.call_args_list))
+        fake.dll.PdhCloseQuery.assert_called_once()
+
+    def test_native_path_unavailable_or_duplicate_preserves_raw_pending(self):
+        for failure in ('missing', 'duplicate', 'no_index', 'add'):
+            with self.subTest(failure=failure):
+                fake = FakeIndexedPdh()
+                if failure == 'missing':
+                    fake.expand_failure = 0xc0000bb8
+                elif failure == 'duplicate':
+                    fake.expansions *= 2
+                elif failure == 'no_index':
+                    fake.expansions = fake.expansions[:1]
+                else:
+                    fake.add_failure = 0xc0000bb9
+                with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+                    collector = stimulus.PdhThreads(pid=42)
+                    try:
+                        row = collector.sample()
+                    finally:
+                        collector.close()
+                self.assertEqual(fake.snapshot['arrays'], row['arrays'])
+                value = stimulus.pdh_summary([row, row], 42)
+                self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+                self.assertNotIn('switches', value)
+
+    def test_discovery_and_measurement_are_not_mixed_across_collections(self):
+        fake = FakeIndexedPdh()
+        def change_on_second(n):
+            if n == 2:
+                fake.snapshot = indexed_pdh_sample(31, 200, target_index=0)
+        fake.on_collect = change_on_second
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                row = collector.sample()
+            finally:
+                collector.close()
+        owned = stimulus.pdh_owned(row, 42)
+        self.assertEqual(31, owned[(42, 7, 55)]['first'])
+        self.assertEqual(200, owned[(42, 7, 55)]['timestamp_100ns'])
+
+    def test_uncovered_thread_arrival_after_discovery_is_pending(self):
+        fake = FakeIndexedPdh()
+        def add_on_second(n):
+            if n == 2:
+                extra = pdh_sample(50, pid=42, tid=10, birth=60)
+                for key, rows in fake.snapshot['arrays'].items():
+                    rows.extend(extra['arrays'][key])
+        fake.on_collect = add_on_second
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                row = collector.sample()
+            finally:
+                collector.close()
+        value = stimulus.pdh_summary([row, row], 42)
+        self.assertEqual(('PENDING', 0), (value['status'], value['n']))
+        self.assertIn('coverage', value['reason'])
+
+    def test_legacy_factory_and_unique_target_do_not_expand_foreign_duplicates(self):
+        for pid in (None, 123):
+            fake = FakeIndexedPdh()
+            if pid == 123:
+                for key, rows in fake.snapshot['arrays'].items():
+                    rows.append(dict(pdh_sample(pid=123)['arrays'][key][0], name='target/0'))
+            with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+                collector = stimulus.PdhThreads(pid=pid)
+                try:
+                    row = collector.sample()
+                finally:
+                    collector.close()
+            self.assertEqual(2, fake.collects)  # preparation plus one measurement
+            fake.dll.PdhExpandWildCardPathW.assert_not_called()
+            self.assertNotIn('indexed', row)
+
+    def test_unknown_native_failure_is_not_converted_to_environment_pending(self):
+        fake = FakeIndexedPdh()
+        fake.expand_failure = 0xc0000bbc
+        with mock.patch.object(ctypes, 'WinDLL', return_value=fake.dll, create=True):
+            collector = stimulus.PdhThreads(pid=42)
+            try:
+                with self.assertRaises(stimulus.PdhFailure):
+                    collector.sample()
+            finally:
+                collector.close()
+        fake.dll.PdhCloseQuery.assert_called_once()
+
+
 class ShellEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
