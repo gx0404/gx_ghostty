@@ -106,6 +106,244 @@ class SessionContractTests(unittest.TestCase):
             instance.capture_window.assert_not_called()
 
 
+class StartupBaselineTests(unittest.TestCase):
+    def harness(self, folder, *, layout_bad=False, never_ready=False, mutate=False,
+                old_error=False, new_error=True, restore_error=False):
+        root = Path(folder)
+        exe = root / 'fixture.exe'; exe.write_bytes(b'fixture')
+        fixture = sessions.Fixture(exe, root / 'out', 'unit')
+        path = root / 'private'; path.mkdir()
+        log = root / 'ghostty.log'
+        log.write_bytes(b'session save failed: old startup error\n' if old_error else b'')
+        dialog = sessions.gui.WindowInfo(200, 'GhosttyGxPopup', 'Confirm', (0, 0, 100, 50), True, False, True)
+        instance = SimpleNamespace(pid=42, creation=123, exe=str(exe), log=log,
+            ensure_owned=mock.Mock(), activate=mock.Mock(), require_window=mock.Mock(return_value=SimpleNamespace(hwnd=100)),
+            popups=mock.Mock(return_value=[dialog]), wait_log=mock.Mock())
+        state = {'time': 0, 'saved': False, 'acl': [], 'quit': 0, 'action_generation': None}
+        def startup_save():
+            if state['saved'] or never_ready: return
+            document = sessions.complex_document(path); document['generation'] = 8
+            if layout_bad: document['windows'][0]['tabs'][0]['nodes'][1]['leaf']['font_size'] = 99
+            fixture.session(path).write_text(json.dumps(document), encoding='utf-8')
+            state['saved'] = True
+        def sleep(seconds):
+            state['time'] += seconds
+            startup_save()
+        def capture(*args):
+            startup_save()  # Legitimate first-only save, not the action under test.
+        def press(key):
+            if key == 'escape':
+                instance.popups.return_value = []
+                if mutate:
+                    target = fixture.session(path); target.write_bytes(target.read_bytes() + b' ')
+            elif key == 'ctrl+shift+t':
+                state['action_generation'] = json.loads(fixture.session(path).read_bytes())['generation']
+                if new_error:
+                    with log.open('ab') as stream: stream.write(b'session save failed: injected\n')
+                if mutate:
+                    target = fixture.session(path); target.write_bytes(target.read_bytes() + b' ')
+        instance.press = mock.Mock(side_effect=press)
+        def post(*args):
+            state['action_generation'] = json.loads(fixture.session(path).read_bytes())['generation']
+        api = mock.Mock(); api.PostMessageW.side_effect = post
+        def acl_run(argv, **kwargs):
+            state['acl'].append(argv)
+            # Another realistic delivery point during preparation of DACL.
+            if '/save' in argv: startup_save()
+            return SimpleNamespace(returncode=1 if restore_error and '/restore' in argv else 0,
+                                   stdout='', stderr='restore failed' if restore_error else '')
+        original_open = Path.open
+        def file_open(p, *args, **kwargs):
+            if p.name == 'denied-write-probe': raise PermissionError('private test DACL')
+            return original_open(p, *args, **kwargs)
+        stack = ExitStack(); self.addCleanup(stack.close)
+        for name, value in [('environment', mock.Mock(return_value=path)), ('start', mock.Mock(return_value=instance)),
+                            ('windows', mock.Mock(return_value=[1, 2])), ('capture', mock.Mock(side_effect=capture)),
+                            ('quit', mock.Mock(side_effect=lambda _: state.update(quit=state['quit']+1)))]:
+            stack.enter_context(mock.patch.object(fixture, name, value))
+        stack.enter_context(mock.patch.object(sessions.time, 'monotonic', side_effect=lambda: state['time']))
+        stack.enter_context(mock.patch.object(sessions.time, 'sleep', side_effect=sleep))
+        stack.enter_context(mock.patch.object(sessions.gui, 'win32', return_value=api))
+        stack.enter_context(mock.patch.object(sessions.gui, 'write_config'))
+        stack.enter_context(mock.patch.object(sessions.subprocess, 'check_output', return_value='"user","S-1-5-21-test"\n'))
+        stack.enter_context(mock.patch.object(sessions.subprocess, 'run', side_effect=acl_run))
+        stack.enter_context(mock.patch.object(Path, 'open', file_open))
+        return fixture, path, instance, state
+
+    def test_cancel_close_waits_for_legitimate_startup_save_before_baseline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, _, state = self.harness(folder)
+            fixture.cancel_close()
+            self.assertEqual(8, state['action_generation'])
+            self.assertEqual(1, state['quit'])
+            self.assertEqual('PASS', fixture.report['cases'][-1]['status'])
+
+    def test_write_failure_waits_for_legitimate_startup_save_before_dacl(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, _, state = self.harness(folder)
+            fixture.write_failure()
+            self.assertEqual(8, state['action_generation'])
+            self.assertEqual(1, state['quit'])
+            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertEqual('PASS', fixture.report['cases'][-1]['status'])
+
+    def assert_late_readiness_rejected(self, late_stage):
+        for case in ('cancel_close', 'write_failure'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                fixture, _, instance, state = self.harness(folder)
+                normal_sleep = sessions.time.sleep.side_effect
+                sleeps = 0
+                def advance(seconds):
+                    nonlocal sleeps
+                    normal_sleep(seconds)
+                    sleeps += 1
+                    # Seed -> first saved sample -> stable success poll starts
+                    # before the deadline, but finishes after it.
+                    if sleeps == 2:
+                        state['time'] = 14.99
+                sessions.time.sleep.side_effect = advance
+                if late_stage == 'poll':
+                    def windows(_):
+                        if fixture.windows.call_count == 3:
+                            state['time'] = 15.01
+                        return [1, 2]
+                    fixture.windows.side_effect = windows
+                else:
+                    def owned():
+                        if instance.ensure_owned.call_count == 4:
+                            state['time'] = 15.01
+                    instance.ensure_owned.side_effect = owned
+                with self.assertRaisesRegex(AssertionError, 'deadline'):
+                    getattr(fixture, case)()
+                self.assertIsNone(state['action_generation'])
+                self.assertEqual([], state['acl'])
+                instance.press.assert_not_called()
+                fixture.capture.assert_not_called()
+                fixture.quit.assert_not_called()
+                self.assertEqual('FAIL', fixture.report['startup_readiness'][case]['status'])
+
+    def test_successful_readiness_poll_crossing_deadline_is_rejected(self):
+        self.assert_late_readiness_rejected('poll')
+
+    def test_final_owned_check_crossing_deadline_is_rejected(self):
+        self.assert_late_readiness_rejected('identity')
+
+    def test_readiness_timeout_or_wrong_layout_never_performs_action_or_acl(self):
+        for case in ('cancel_close', 'write_failure'):
+            for defect in ('timeout', 'layout'):
+                with self.subTest(case=case, defect=defect), tempfile.TemporaryDirectory() as folder:
+                    fixture, _, instance, state = self.harness(folder, never_ready=defect == 'timeout',
+                                                               layout_bad=defect == 'layout')
+                    with self.assertRaises(AssertionError):
+                        getattr(fixture, case)()
+                    self.assertIsNone(state['action_generation'])
+                    self.assertEqual([], state['acl'])
+                    self.assertEqual(0, state['quit'])
+                    instance.press.assert_not_called()
+                    self.assertEqual('FAIL', fixture.report['startup_readiness'][case]['status'])
+                    self.assertLessEqual(state['time'], 15.05)
+
+    def test_real_byte_changes_after_cancel_or_denied_write_still_fail(self):
+        for case in ('cancel_close', 'write_failure'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                fixture, path, _, state = self.harness(folder, mutate=True)
+                with self.assertRaises(AssertionError):
+                    getattr(fixture, case)()
+                # Only whitespace changed: logical equality must NOT replace the
+                # original post-action byte equality predicate.
+                self.assertTrue(fixture.session(path).read_bytes().endswith(b' '))
+                self.assertEqual('READY', fixture.report['startup_readiness'][case]['status'])
+                self.assertFalse(fixture.report['cases'])
+                if case == 'write_failure':
+                    self.assertTrue(any('/restore' in argv for argv in state['acl']))
+
+    def test_old_error_alone_is_not_evidence_and_readonly_bytes_remain_protected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, instance, state = self.harness(folder, old_error=True, new_error=False)
+            with self.assertRaisesRegex(AssertionError, 'bounded wait'):
+                fixture.write_failure()
+            self.assertEqual('FAIL', fixture.report['write_failure_log']['status'])
+            self.assertEqual(len(b'session save failed: old startup error\n'),
+                             fixture.report['write_failure_log']['start_byte'])
+            raw = fixture.session(path).read_bytes()
+            self.assertEqual(sessions.hashlib.sha256(raw).hexdigest(),
+                             fixture.report['startup_readiness']['write_failure']['sha256'])
+            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            instance.wait_log.assert_not_called()
+            self.assertFalse(fixture.report['cases'])
+
+    def test_new_error_after_old_error_is_accepted_with_offset_and_acl_restored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, _, state = self.harness(folder, old_error=True, new_error=True)
+            fixture.write_failure()
+            evidence = fixture.report['write_failure_log']
+            self.assertEqual('OBSERVED', evidence['status'])
+            self.assertGreater(evidence['end_byte'], evidence['start_byte'])
+            self.assertEqual(8, json.loads(fixture.session(path).read_bytes())['generation'])
+            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+
+    def test_acl_restore_failure_is_fatal_even_after_successful_observation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, _, state = self.harness(folder, restore_error=True)
+            with self.assertRaisesRegex(AssertionError, 'ACL operation failed'):
+                fixture.write_failure()
+            self.assertEqual('OBSERVED', fixture.report['write_failure_log']['status'])
+            self.assertEqual(1, state['quit'])
+            self.assertEqual('/restore', state['acl'][-1][2])
+            self.assertEqual(1, fixture.report['acl_commands'][-1]['exit_code'])
+            self.assertFalse(fixture.report['cases'])
+            self.assertEqual(8, json.loads(fixture.session(path).read_bytes())['generation'])
+
+    def test_readiness_rechecks_owned_identity_and_does_not_accept_seed_generation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, instance, state = self.harness(folder)
+            instance.ensure_owned.side_effect = [None, AssertionError('owned birth changed')]
+            with self.assertRaisesRegex(AssertionError, 'owned birth changed'):
+                fixture.cancel_close()
+            self.assertIsNone(state['action_generation'])
+            self.assertEqual('FAIL', fixture.report['startup_readiness']['cancel_close']['status'])
+
+    def test_log_replacement_after_injection_is_not_silently_treated_as_new_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, instance, state = self.harness(folder, old_error=True)
+            original = instance.press.side_effect
+            def press(key):
+                original(key)
+                if key == 'ctrl+shift+t': instance.log.write_bytes(b'session save failed: replaced log\n')
+            instance.press.side_effect = press
+            with self.assertRaisesRegex(AssertionError, 'truncated or replaced'):
+                fixture.write_failure()
+            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertFalse(fixture.report['cases'])
+
+    def test_continuing_valid_saves_never_count_as_byte_stable_readiness(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, instance, state = self.harness(folder)
+            def changing():
+                document = sessions.complex_document(path)
+                document['generation'] = 8 + int(state['time'] * 100)
+                fixture.session(path).write_text(json.dumps(document), encoding='utf-8')
+            instance.ensure_owned.side_effect = changing
+            with self.assertRaisesRegex(AssertionError, 'bounded wait'):
+                fixture.write_failure()
+            self.assertLessEqual(state['time'], 15.05)
+            self.assertEqual([], state['acl'])
+            self.assertIsNone(state['action_generation'])
+
+    def test_readonly_archive_is_compared_again_after_normal_quit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, _, state = self.harness(folder)
+            def quit_mutation(_):
+                state['quit'] += 1
+                target = fixture.session(path); target.write_bytes(target.read_bytes() + b' ')
+            fixture.quit.side_effect = quit_mutation
+            with self.assertRaises(AssertionError):
+                fixture.write_failure()
+            self.assertEqual(1, state['quit'])
+            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertFalse(fixture.report['cases'])
+
+
 class DualWriterTests(unittest.TestCase):
     def harness(self, folder, *, change=None, busy=True, capture_error=False, second_exit=0,
                 popup_class='GhosttyGxPopup', popup_title=None, popup_visible=True, popup_cloaked=False):

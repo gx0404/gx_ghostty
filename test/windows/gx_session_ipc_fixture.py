@@ -770,12 +770,71 @@ class Fixture:
         assert_private_document(saved, (marker,))
         self.report["cases"].append({"case_id": "SES-07", "name": "archive-schema-and-private-markers", "status": "PASS"})
 
+    def restored_baseline(self, instance, path, expected, case):
+        """Observe the owned startup save, not just restored HWNDs, within 15s.
+
+        Same generation/layout/two-identical-byte criteria as SES-06 readiness.
+        This combines the old window wait and save readiness in ONE budget;
+        elapsed time and screenshots are never evidence of readiness.
+        """
+        deadline = time.monotonic() + 15
+        expected_layout = layout_contract(expected)
+        evidence = {"pid": instance.pid, "birth": instance.creation, "exe": instance.exe,
+                    "seed_generation": expected["generation"], "budget_seconds": 15,
+                    "polls": 0, "status": "WAITING"}
+        self.report.setdefault("startup_readiness", {})[case] = evidence
+        previous = None
+
+        def remaining():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise AssertionError("startup readiness deadline exceeded")
+            return seconds
+
+        def sample():
+            nonlocal previous
+            instance.ensure_owned()
+            evidence["polls"] += 1
+            if len(self.windows(instance)) != len(expected["windows"]):
+                previous = None
+                return None
+            raw = self.session(path).read_bytes()
+            document = json.loads(raw)
+            evidence["last_generation"] = document["generation"]
+            if document["generation"] <= expected["generation"]:
+                previous = None
+                return None
+            if layout_contract(document) != expected_layout:
+                evidence["invalid_sha256"] = hashlib.sha256(raw).hexdigest()
+                raise AssertionError("startup saved an unexpected logical layout")
+            stable, previous = raw == previous, raw
+            return raw if stable else None
+
+        def ready():
+            remaining()
+            value = sample()
+            remaining()  # A poll begun in budget may still finish too late.
+            return value
+
+        try:
+            raw = wait(ready, remaining())
+            remaining()
+            instance.ensure_owned()
+            result = {"generation": json.loads(raw)["generation"],
+                      "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw), "stable_samples": 2}
+            remaining()  # Include final ownership query and baseline bookkeeping.
+        except BaseException as error:
+            evidence.update(status="FAIL", error=str(error))
+            raise
+        evidence.update(status="READY", **result)
+        return raw
+
     def cancel_close(self):
         path = self.environment("cancel-close", "language = en\nconfirm-close-surface = always\ngx-session-restore = true\n")
-        self.seed_document(path, complex_document(path))
+        expected = complex_document(path)
+        self.seed_document(path, expected)
         instance = self.start(path)
-        wait(lambda: len(self.windows(instance)) == 2)
-        original = self.session(path).read_bytes()
+        original = self.restored_baseline(instance, path, expected, "cancel_close")
         window = instance.require_window()
         instance.ensure_owned()
         gui.win32().PostMessageW(window.hwnd, gui.WM_CLOSE, 0, 0)
@@ -795,10 +854,10 @@ class Fixture:
 
     def write_failure(self):
         path = self.environment("write-failure", CONFIG + "gx-session-restore = true\n")
-        self.seed_document(path, complex_document(path))
+        expected = complex_document(path)
+        self.seed_document(path, expected)
         instance = self.start(path)
-        wait(lambda: len(self.windows(instance)) == 2)
-        original = self.session(path).read_bytes()
+        original = self.restored_baseline(instance, path, expected, "write_failure")
         directory = self.session(path).parent.resolve()
         assert directory.is_relative_to(path.resolve())
         acl = self.out / "write-failure-original.acl"
@@ -821,9 +880,33 @@ class Fixture:
                 pass
             else:
                 raise AssertionError("private state directory is still writable; failure injection invalid")
+            instance.ensure_owned()
+            # Exclude errors from startup, ACL setup and earlier attempts. An
+            # error must be newly appended after this injection/action boundary.
+            before_log = instance.log.read_bytes() if instance.log.is_file() else b""
+            observation = {"pid": instance.pid, "birth": instance.creation,
+                           "start_byte": len(before_log), "status": "WAITING"}
+            self.report["write_failure_log"] = observation
             instance.activate()
             instance.press("ctrl+shift+t")
-            instance.wait_log("session save failed", 10)
+
+            def new_failure():
+                instance.ensure_owned()
+                current = instance.log.read_bytes() if instance.log.is_file() else b""
+                if not current.startswith(before_log):
+                    raise AssertionError("owned log was truncated or replaced after injection")
+                suffix = current[len(before_log):]
+                if b"session save failed" not in suffix:
+                    return False
+                observation.update(status="OBSERVED", end_byte=len(current),
+                                   suffix_sha256=hashlib.sha256(suffix).hexdigest())
+                return True
+
+            try:
+                wait(new_failure, 10)
+            except BaseException as error:
+                observation.update(status="FAIL", error=str(error))
+                raise
             self.capture(instance, "write-failure-feedback")
             assert self.session(path).read_bytes() == original
             self.quit(instance)
