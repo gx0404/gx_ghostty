@@ -857,6 +857,29 @@ class FileProbeTests(unittest.TestCase):
                 with self.subTest(path=form):
                     self.assertIsNone(_level("Write", {"file_path": form}, cwd=REPO_ROOT))
 
+    def test_authorized_phase_evidence_directory_is_the_only_local_exception(self) -> None:
+        prefix = ".local/evidence/R5/execution-20261013/"
+        for relative in (prefix + "tasks.json", prefix + "leaf-matrix.json",
+                         prefix + "final-r3/reviews/new-review.json"):
+            for form in self._forms(relative):
+                for tool in WRITE_TOOLS:
+                    key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+                    with self.subTest(tool=tool, path=form):
+                        self.assertIsNone(_level(tool, {key: form}, cwd=REPO_ROOT))
+
+    def test_phase_evidence_exception_preserves_other_denials(self) -> None:
+        prefix = ".local/evidence/R5/execution-20261013/"
+        denied = (prefix.rstrip("/"), prefix + "../other/report.json",
+                  prefix + "../../../toolchains/zig", prefix + DOT_ENV,
+                  prefix + "private.pem", ".local/evidence/R5/execution-20261013-old/report.json",
+                  ".local/evidence/R5/execution-20261014/report.json",
+                  ".local/evidence/R4/execution-20261013/report.json",
+                  ".local/tools/venv/config.json")
+        for relative in denied:
+            for form in self._forms(relative):
+                with self.subTest(path=form):
+                    self.assertEqual("deny", _level("Write", {"file_path": form}, cwd=REPO_ROOT))
+
     def test_written_content_is_not_parsed_as_a_patch(self) -> None:
         content = _patch("*** Update File: docs/kb/chunks.json")
         self.assertIsNone(_level("Write", {"file_path": "docs/notes.md", "content": content}, cwd=REPO_ROOT))
