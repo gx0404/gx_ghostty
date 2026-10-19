@@ -155,17 +155,37 @@ def run(fixture):
         hello = forged_hello(original, impostor["pid"], impostor["birth"])
         server = FakeEndpoint(name, hello)
         try:
+            # file_log shares this path and rotates it on the first write of a
+            # process; its bracketed identifier is a thread ID, not a PID.
+            log_before = host.log.stat()
+            bytes_before = host.log.read_bytes()
             launcher = fixture.start(path)
+            process = fixture.processes[launcher.pid]
             seen = []
             deadline = time.monotonic() + 15
             while launcher.alive() and time.monotonic() < deadline:
                 seen.extend(gui.win32().child_processes(launcher.pid))
-                assert not fixture.windows(launcher), "impostor connection started a GUI"
+                try:
+                    assert not fixture.windows(launcher), "impostor connection started a GUI"
+                except gui.InputBlocked as exc:
+                    # Loss of PID identity alone does not prove our process
+                    # exited. Only the retained Popen handle can establish it.
+                    if exc.cause != "instance_gone" or process.poll() is None:
+                        raise
+                    break
                 time.sleep(0.02)
-            code = fixture.processes[launcher.pid].wait(timeout=2)
+            code = process.wait(timeout=2)
             assert code != 0 and not seen and server.sent and server.error is None
-            logs = launcher.log.read_text(encoding="utf-8", errors="replace")
-            assert "DifferentImage" in logs, "failure was not native image authentication"
+            log_after = launcher.log.stat()
+            logs = launcher.log.read_bytes()
+            if (log_after.st_dev, log_after.st_ino) == (log_before.st_dev, log_before.st_ino):
+                assert logs.startswith(bytes_before), "shared log truncated without a bound rotation"
+                logs = logs[len(bytes_before):]
+            else:
+                rotated = launcher.log.with_name(launcher.log.name + ".1").stat()
+                assert (rotated.st_dev, rotated.st_ino) == (log_before.st_dev, log_before.st_ino), \
+                    "shared log rotation does not belong to this launch"
+            assert b"DifferentImage" in logs, "failure was not native image authentication"
             fixture.check("valid-hello-impostor-rejected", endpoint=name, impostor=impostor,
                           hello_sha256=__import__('hashlib').sha256(hello).hexdigest(), exit_code=code,
                           failure="DifferentImage", payload_claims_match_native_impostor=True)
