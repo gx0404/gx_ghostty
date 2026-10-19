@@ -106,6 +106,291 @@ class SessionContractTests(unittest.TestCase):
             instance.capture_window.assert_not_called()
 
 
+class AclRollbackTests(unittest.TestCase):
+    sid = 'S-1-5-21-123'
+
+    def exercise(self, original, restored=None, verified=None):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        directory = root / 'state'; directory.mkdir()
+        snapshots = iter([original, restored or original, verified or original])
+        def command(*args):
+            if '/save' in args:
+                entries = next(snapshots)
+                Path(args[2]).write_text(''.join(f'{key}\n{value}\n' for key, value in entries.items()),
+                                         encoding='utf-16-le')
+        calls = mock.Mock(side_effect=command)
+        reader = io.BytesIO(b'original')
+        opened = self.enterContext(mock.patch.object(sessions, 'open_shared_archive', return_value=reader))
+        repair = self.enterContext(mock.patch.object(sessions, 'restore_dacl_metadata'))
+        evidence = {}
+        context = sessions.deny_state_writes(directory, directory/'archive', self.sid,
+                                            root/'before.acl', root/'after.acl', calls, evidence)
+        return context, calls, opened, reader, repair, evidence
+
+    def test_explicit_allow_rejected_before_any_mutation(self):
+        for kind in ('A', 'OA'):
+            for flags in ('', 'OI', 'CI', 'OICI', 'IO', 'OICIIO', 'NP'):
+                with self.subTest(kind=kind, flags=flags):
+                    ace = f'({kind};{flags};FA;;;{self.sid})'
+                    context, calls, opened, _, _, _ = self.exercise({'state': 'D:' + ace})
+                    with self.assertRaisesRegex(AssertionError, 'explicit.*allow'):
+                        with context: self.fail('unsafe injection accepted')
+                    opened.assert_not_called()
+                    self.assertEqual(1, calls.call_count)
+
+    def test_inherited_allow_and_other_sid_are_not_rejected(self):
+        for kind in ('A', 'OA'):
+            for flags, sid in (('ID', self.sid), ('OICIID', self.sid), ('OICIIOID', self.sid),
+                               ('', self.sid + '4'), ('', 'S-1-5-18')):
+                with self.subTest(kind=kind, flags=flags, sid=sid):
+                    context, _, _, reader, repair, evidence = self.exercise(
+                        {'state': f'D:({kind};{flags};FA;;;{sid})'})
+                    with context: pass
+                    self.assertTrue(reader.closed)
+                    repair.assert_not_called()
+                    self.assertTrue(evidence['exact_dacl_match'])
+
+    def test_original_deny_including_object_and_inherited_is_rejected(self):
+        for kind in ('D', 'OD'):
+            for flags in ('', 'ID', 'OICIIOID'):
+                with self.subTest(kind=kind, flags=flags):
+                    context, calls, opened, _, _, _ = self.exercise(
+                        {'state': 'D:', 'state/archive': f'D:({kind};{flags};WD;;;{self.sid})'})
+                    with self.assertRaisesRegex(AssertionError, 'already denies'):
+                        with context: self.fail('unsafe injection accepted')
+                    opened.assert_not_called()
+                    self.assertEqual(1, calls.call_count)
+
+    def test_object_guids_callback_and_sid_boundaries(self):
+        guid = '00112233-4455-6677-8899-aabbccddeeff'
+        for kind in ('OA', 'XA', 'ZA', 'OD', 'XD', 'ZD'):
+            for trustee in (self.sid, self.sid.lower(), self.sid + '4'):
+                with self.subTest(kind=kind, trustee=trustee):
+                    suffix = ';(@User.flag == 1)' if kind in ('XA', 'ZA', 'XD', 'ZD') else ''
+                    ace = f'({kind};OICI;0x1f01ff;{guid};{guid};{trustee}{suffix})'
+                    context, calls, opened, _, _, _ = self.exercise({'state': 'D:', 'state/archive': 'D:' + ace})
+                    if trustee.casefold() == self.sid.casefold():
+                        with self.assertRaisesRegex(AssertionError, 'explicit.*allow|already denies'):
+                            with context: self.fail('unsafe injection accepted')
+                        opened.assert_not_called()
+                        self.assertEqual(1, calls.call_count)
+                    else:
+                        with context: pass
+
+    def test_only_ai_metadata_is_repaired_and_exact_snapshot_verified(self):
+        for prefix in ('D:', 'D:P'):
+            with self.subTest(prefix=prefix):
+                original = {'state': prefix + '(A;;FA;;;SY)', 'state/archive': 'D:AI(A;;FR;;;SY)'}
+                changed = dict(original, state=prefix + 'AI(A;;FA;;;SY)')
+                context, calls, _, reader, repair, evidence = self.exercise(original, changed)
+                with context: pass
+                self.assertEqual(5, calls.call_count)
+                self.assertEqual({'state': original['state']}, repair.call_args.args[1])
+                self.assertTrue(reader.closed)
+                self.assertTrue(evidence['exact_dacl_match'])
+
+    def test_failed_exact_verification_after_ai_repair_is_rejected(self):
+        original = {'state': 'D:(A;;FA;;;SY)'}
+        changed = {'state': 'D:AI(A;;FA;;;SY)'}
+        context, _, _, reader, repair, evidence = self.exercise(original, changed, changed)
+        with self.assertRaisesRegex(AssertionError, 'DACL differs'):
+            with context: pass
+        repair.assert_called_once()
+        self.assertTrue(reader.closed)
+        self.assertNotIn('exact_dacl_match', evidence)
+
+    def test_real_ace_or_control_or_entry_difference_never_repaired(self):
+        for changed in ({'state': 'D:AI(A;;FR;;;SY)'}, {'state': 'D:PAI(A;;FA;;;SY)'},
+                        {'state': 'D:AI(A;;FA;;;SY)', 'state/new': 'D:'}):
+            with self.subTest(changed=changed):
+                context, _, _, reader, repair, _ = self.exercise({'state': 'D:(A;;FA;;;SY)'}, changed)
+                with self.assertRaisesRegex(AssertionError, 'DACL differs'):
+                    with context: pass
+                repair.assert_not_called()
+                self.assertTrue(reader.closed)
+
+    def test_metadata_repair_failure_closes_reader_without_claiming_restored(self):
+        context, _, _, reader, repair, evidence = self.exercise(
+            {'state': 'D:(A;;FA;;;SY)'}, {'state': 'D:AI(A;;FA;;;SY)'})
+        repair.side_effect = OSError('metadata repair failed')
+        with self.assertRaises(OSError):
+            with context: pass
+        self.assertTrue(reader.closed)
+        self.assertEqual('RESTORE_PENDING', evidence['status'])
+        self.assertNotIn('exact_dacl_match', evidence)
+
+
+class AclMetadataApiTests(unittest.TestCase):
+    def harness(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        directory = root / 'state'; directory.mkdir()
+        api, kernel = mock.Mock(), mock.Mock()
+        def convert(sddl, revision, output, size):
+            sessions.ctypes.cast(output, sessions.ctypes.POINTER(sessions.ctypes.c_void_p))[0] = 1234
+            return 1
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.side_effect = convert
+        api.SetFileSecurityW.return_value = 1
+        self.enterContext(mock.patch.object(sessions.ctypes, 'WinDLL', create=True,
+                                           side_effect=lambda name, **kw: api if name == 'advapi32' else kernel))
+        self.enterContext(mock.patch.object(sessions.ctypes, 'WinError', create=True, return_value=OSError('native failure')))
+        self.enterContext(mock.patch.object(sessions.ctypes, 'get_last_error', create=True, return_value=5))
+        return root, directory, api, kernel
+
+    def test_sets_only_dacl_and_frees_descriptor(self):
+        _, directory, api, kernel = self.harness()
+        sessions.restore_dacl_metadata(directory, {'state': 'D:(A;;FA;;;SY)'})
+        args = api.SetFileSecurityW.call_args.args
+        self.assertEqual((str(directory.resolve()), 4, 1234), (args[0], args[1], args[2].value))
+        kernel.LocalFree.assert_called_once_with(args[2])
+        self.assertEqual(('D:(A;;FA;;;SY)', 1), api.ConvertStringSecurityDescriptorToSecurityDescriptorW.call_args.args[:2])
+
+    def test_set_failure_still_frees_descriptor(self):
+        _, directory, api, kernel = self.harness()
+        api.SetFileSecurityW.return_value = 0
+        with self.assertRaises(OSError):
+            sessions.restore_dacl_metadata(directory, {'state': 'D:'})
+        kernel.LocalFree.assert_called_once()
+        self.assertEqual(1234, kernel.LocalFree.call_args.args[0].value)
+
+    def test_conversion_failure_does_not_set_or_free_unallocated_descriptor(self):
+        _, directory, api, kernel = self.harness()
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.side_effect = None
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.return_value = 0
+        with self.assertRaises(OSError):
+            sessions.restore_dacl_metadata(directory, {'state': 'D:'})
+        api.SetFileSecurityW.assert_not_called()
+        kernel.LocalFree.assert_not_called()
+
+    def test_escape_is_rejected_before_conversion(self):
+        root, directory, api, _ = self.harness()
+        (root/'outside').write_bytes(b'')
+        for relative in ('outside', 'state/../outside', str(root/'outside')):
+            with self.subTest(relative=relative), self.assertRaisesRegex(AssertionError, 'escapes'):
+                sessions.restore_dacl_metadata(directory, {relative: 'D:'})
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.assert_not_called()
+        api.SetFileSecurityW.assert_not_called()
+
+    def test_reparse_on_target_or_parent_or_root_is_rejected(self):
+        _, directory, api, _ = self.harness()
+        parent = directory/'nested'; parent.mkdir()
+        target = parent/'archive'; target.write_bytes(b'')
+        original_lstat = Path.lstat
+        for unsafe in (target, parent, directory):
+            def lstat(path, *args, **kwargs):
+                result = original_lstat(path, *args, **kwargs)
+                if path == unsafe:
+                    return SimpleNamespace(st_file_attributes=0x400, st_mode=result.st_mode)
+                return result
+            with self.subTest(unsafe=unsafe), mock.patch.object(Path, 'lstat', lstat):
+                # A junction is not a symlink; stat follows it and loses the
+                # reparse attribute, while lstat describes the junction itself.
+                self.assertFalse(unsafe.is_symlink())
+                self.assertFalse(getattr(unsafe.stat(), 'st_file_attributes', 0) & 0x400)
+                self.assertTrue(unsafe.lstat().st_file_attributes & 0x400)
+                with self.assertRaisesRegex(AssertionError, 'reparse'):
+                    sessions.restore_dacl_metadata(directory, {'state/nested/archive': 'D:'})
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.assert_not_called()
+        api.SetFileSecurityW.assert_not_called()
+
+    def assert_native_junction_rejected(self, *, at_root):
+        root, _, api, kernel = self.harness()
+        outside = root/'outside'/'state'; outside.mkdir(parents=True)
+        archive = outside/'archive'; archive.write_bytes(b'outside sentinel')
+        private = root/'private'; private.mkdir()
+        directory = private/'state'
+        if at_root:
+            junction = directory
+            relative = 'state/archive'
+        else:
+            directory.mkdir()
+            junction = directory/'nested'
+            relative = 'state/nested/archive'
+        # Both endpoints are owned by this TemporaryDirectory. Remove only
+        # the junction before TemporaryDirectory recursively cleans real dirs.
+        self.assertTrue(junction.parent.resolve().is_relative_to(root.resolve()))
+        self.assertTrue(outside.resolve().is_relative_to(root.resolve()))
+        try:
+            result = sessions.subprocess.run(
+                ['cmd.exe', '/d', '/c', 'mklink', '/J', str(junction), str(outside)],
+                capture_output=True, timeout=10)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertFalse(junction.is_symlink())
+            self.assertFalse(junction.stat().st_file_attributes & 0x400)
+            self.assertTrue(junction.lstat().st_file_attributes & 0x400)
+            self.assertEqual(outside.resolve(), junction.resolve())
+            with self.assertRaisesRegex(AssertionError, 'reparse'):
+                sessions.restore_dacl_metadata(directory, {relative: 'D:'})
+            api.ConvertStringSecurityDescriptorToSecurityDescriptorW.assert_not_called()
+            api.SetFileSecurityW.assert_not_called()
+            kernel.LocalFree.assert_not_called()
+        finally:
+            if junction.is_junction():
+                sessions.os.rmdir(junction)
+            self.assertFalse(junction.exists())
+            self.assertEqual(b'outside sentinel', archive.read_bytes())
+
+    @unittest.skipUnless(sessions.os.name == 'nt', 'Windows junction required')
+    def test_native_root_junction_cannot_redefine_private_boundary(self):
+        self.assert_native_junction_rejected(at_root=True)
+
+    @unittest.skipUnless(sessions.os.name == 'nt', 'Windows junction required')
+    def test_native_parent_junction_is_rejected_before_resolution(self):
+        self.assert_native_junction_rejected(at_root=False)
+
+    def test_symlink_is_rejected_before_conversion(self):
+        _, directory, api, _ = self.harness()
+        with mock.patch.object(Path, 'is_symlink', return_value=True):
+            with self.assertRaisesRegex(AssertionError, 'reparse'):
+                sessions.restore_dacl_metadata(directory, {'state': 'D:'})
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.assert_not_called()
+
+
+class SharedArchiveHandleTests(unittest.TestCase):
+    def harness(self):
+        kernel = mock.Mock()
+        kernel.CreateFileW.return_value = 123
+        runtime = SimpleNamespace(open_osfhandle=mock.Mock(return_value=456))
+        self.enterContext(mock.patch.dict(sessions.sys.modules, msvcrt=runtime))
+        self.enterContext(mock.patch.object(sessions.ctypes, 'WinDLL', create=True, return_value=kernel))
+        self.enterContext(mock.patch.object(sessions.os, 'O_BINARY', 0, create=True))
+        return kernel, runtime
+
+    def test_create_failure_does_not_close_invalid_handle(self):
+        kernel, runtime = self.harness()
+        kernel.CreateFileW.return_value = sessions.ctypes.c_void_p(-1).value
+        with mock.patch.object(sessions.ctypes, 'WinError', create=True, return_value=OSError('open failed')), \
+                mock.patch.object(sessions.ctypes, 'get_last_error', create=True, return_value=5):
+            with self.assertRaises(OSError): sessions.open_shared_archive(Path('archive'))
+        runtime.open_osfhandle.assert_not_called()
+        kernel.CloseHandle.assert_not_called()
+
+    def test_handle_transfer_failure_closes_native_handle(self):
+        kernel, runtime = self.harness()
+        runtime.open_osfhandle.side_effect = OSError('transfer failed')
+        with self.assertRaises(OSError): sessions.open_shared_archive(Path('archive'))
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_fdopen_failure_closes_transferred_fd_not_handle_twice(self):
+        kernel, _ = self.harness()
+        with mock.patch.object(sessions.os, 'fdopen', side_effect=OSError('fdopen failed')), \
+                mock.patch.object(sessions.os, 'close') as close:
+            with self.assertRaises(OSError): sessions.open_shared_archive(Path('archive'))
+        close.assert_called_once_with(456)
+        kernel.CloseHandle.assert_not_called()
+
+    def test_success_transfers_ownership_and_preserves_share_delete(self):
+        kernel, runtime = self.harness()
+        reader = io.BytesIO(b'original')
+        with mock.patch.object(sessions.os, 'fdopen', return_value=reader) as fdopen:
+            with sessions.open_shared_archive(Path('archive')) as result:
+                self.assertIs(reader, result)
+            fdopen.assert_called_once_with(456, 'rb', buffering=0)
+        self.assertTrue(reader.closed)
+        self.assertEqual(7, kernel.CreateFileW.call_args.args[2])
+        runtime.open_osfhandle.assert_called_once()
+        kernel.CloseHandle.assert_not_called()
+
+
 class StartupBaselineTests(unittest.TestCase):
     def harness(self, folder, *, layout_bad=False, never_ready=False, mutate=False,
                 old_error=False, new_error=True, restore_error=False):
@@ -149,8 +434,12 @@ class StartupBaselineTests(unittest.TestCase):
         def acl_run(argv, **kwargs):
             state['acl'].append(argv)
             # Another realistic delivery point during preparation of DACL.
-            if '/save' in argv: startup_save()
-            return SimpleNamespace(returncode=1 if restore_error and '/restore' in argv else 0,
+            if '/save' in argv:
+                startup_save()
+                Path(argv[argv.index('/save') + 1]).write_text(
+                    'ghostty\nD:AI(A;;FA;;;SY)\nghostty\\gx-session.json\nD:AI(A;;FA;;;SY)\n',
+                    encoding='utf-16')
+            return SimpleNamespace(returncode=1 if restore_error and '/remove:d' in argv else 0,
                                    stdout='', stderr='restore failed' if restore_error else '')
         original_open = Path.open
         def file_open(p, *args, **kwargs):
@@ -168,6 +457,8 @@ class StartupBaselineTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(sessions.subprocess, 'check_output', return_value='"user","S-1-5-21-test"\n'))
         stack.enter_context(mock.patch.object(sessions.subprocess, 'run', side_effect=acl_run))
         stack.enter_context(mock.patch.object(Path, 'open', file_open))
+        stack.enter_context(mock.patch.object(sessions, 'open_shared_archive',
+                                             side_effect=lambda p: original_open(p, 'rb', buffering=0)))
         return fixture, path, instance, state
 
     def test_cancel_close_waits_for_legitimate_startup_save_before_baseline(self):
@@ -184,8 +475,97 @@ class StartupBaselineTests(unittest.TestCase):
             fixture.write_failure()
             self.assertEqual(8, state['action_generation'])
             self.assertEqual(1, state['quit'])
-            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
             self.assertEqual('PASS', fixture.report['cases'][-1]['status'])
+
+    def test_denied_new_reads_still_compare_live_archive_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, _, state = self.harness(folder)
+            original_read = Path.read_bytes
+            def read(target):
+                denied = state['acl'] and '/deny' in state['acl'][-1]
+                if target == fixture.session(path) and denied and state['action_generation'] is not None:
+                    raise PermissionError('new read handles denied by the injected ACL')
+                return original_read(target)
+            with mock.patch.object(Path, 'read_bytes', read):
+                fixture.write_failure()
+            self.assertEqual('PASS', fixture.report['cases'][-1]['status'])
+            self.assertEqual(1, state['quit'])
+
+    def test_restore_does_not_require_restore_privilege(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, _, state = self.harness(folder)
+            original_run = sessions.subprocess.run.side_effect
+            def run(argv, **kwargs):
+                if '/restore' in argv:
+                    return SimpleNamespace(returncode=1300, stdout='', stderr='privilege not held')
+                return original_run(argv, **kwargs)
+            sessions.subprocess.run.side_effect = run
+            fixture.write_failure()
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
+            self.assertFalse(any('/restore' in row['argv'] for row in fixture.report['acl_commands']))
+
+    def test_retained_old_handle_does_not_hide_replaced_archive_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, path, _, state = self.harness(folder)
+            sessions.open_shared_archive.side_effect = lambda p: io.BytesIO(p.read_bytes())
+            def replace_on_quit(_):
+                state['quit'] += 1
+                target = fixture.session(path)
+                replacement = target.with_suffix('.new')
+                replacement.write_bytes(target.read_bytes() + b' ')
+                replacement.replace(target)
+            fixture.quit.side_effect = replace_on_quit
+            with self.assertRaises(AssertionError):
+                fixture.write_failure()
+            self.assertEqual('RESTORED', fixture.report['write_failure_acl']['status'])
+            self.assertFalse(fixture.report['cases'])
+
+    def test_dacl_mismatch_after_removal_cannot_pass(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, _, _ = self.harness(folder)
+            original_run = sessions.subprocess.run.side_effect
+            def run(argv, **kwargs):
+                result = original_run(argv, **kwargs)
+                if '/save' in argv and 'restored' in str(argv[argv.index('/save') + 1]):
+                    Path(argv[argv.index('/save') + 1]).write_text('ghostty\nD:AI\n', encoding='utf-16')
+                return result
+            sessions.subprocess.run.side_effect = run
+            with self.assertRaisesRegex(AssertionError, 'DACL differs'):
+                fixture.write_failure()
+            self.assertFalse(fixture.report['cases'])
+
+    def test_existing_deny_is_rejected_before_injection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, instance, state = self.harness(folder)
+            original_run = sessions.subprocess.run.side_effect
+            def run(argv, **kwargs):
+                result = original_run(argv, **kwargs)
+                if '/save' in argv:
+                    Path(argv[argv.index('/save') + 1]).write_text(
+                        'ghostty\nD:(D;;WD;;;S-1-5-21-test)\n', encoding='utf-16')
+                return result
+            sessions.subprocess.run.side_effect = run
+            with self.assertRaisesRegex(AssertionError, 'already denies'):
+                fixture.write_failure()
+            self.assertFalse(any('/deny' in argv or '/remove:d' in argv for argv in state['acl']))
+            instance.press.assert_not_called()
+
+    def test_partial_deny_command_failure_still_rolls_back(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture, _, instance, state = self.harness(folder)
+            original_run = sessions.subprocess.run.side_effect
+            def run(argv, **kwargs):
+                result = original_run(argv, **kwargs)
+                if '/deny' in argv:
+                    result.returncode = 1
+                return result
+            sessions.subprocess.run.side_effect = run
+            with self.assertRaisesRegex(AssertionError, 'ACL operation failed'):
+                fixture.write_failure()
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
+            self.assertEqual('RESTORED', fixture.report['write_failure_acl']['status'])
+            instance.press.assert_not_called()
 
     def assert_late_readiness_rejected(self, late_stage):
         for case in ('cancel_close', 'write_failure'):
@@ -255,7 +635,7 @@ class StartupBaselineTests(unittest.TestCase):
                 self.assertEqual('READY', fixture.report['startup_readiness'][case]['status'])
                 self.assertFalse(fixture.report['cases'])
                 if case == 'write_failure':
-                    self.assertTrue(any('/restore' in argv for argv in state['acl']))
+                    self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
 
     def test_old_error_alone_is_not_evidence_and_readonly_bytes_remain_protected(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -268,7 +648,7 @@ class StartupBaselineTests(unittest.TestCase):
             raw = fixture.session(path).read_bytes()
             self.assertEqual(sessions.hashlib.sha256(raw).hexdigest(),
                              fixture.report['startup_readiness']['write_failure']['sha256'])
-            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
             instance.wait_log.assert_not_called()
             self.assertFalse(fixture.report['cases'])
 
@@ -280,7 +660,7 @@ class StartupBaselineTests(unittest.TestCase):
             self.assertEqual('OBSERVED', evidence['status'])
             self.assertGreater(evidence['end_byte'], evidence['start_byte'])
             self.assertEqual(8, json.loads(fixture.session(path).read_bytes())['generation'])
-            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
 
     def test_acl_restore_failure_is_fatal_even_after_successful_observation(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -289,7 +669,7 @@ class StartupBaselineTests(unittest.TestCase):
                 fixture.write_failure()
             self.assertEqual('OBSERVED', fixture.report['write_failure_log']['status'])
             self.assertEqual(1, state['quit'])
-            self.assertEqual('/restore', state['acl'][-1][2])
+            self.assertEqual('/remove:d', state['acl'][-1][2])
             self.assertEqual(1, fixture.report['acl_commands'][-1]['exit_code'])
             self.assertFalse(fixture.report['cases'])
             self.assertEqual(8, json.loads(fixture.session(path).read_bytes())['generation'])
@@ -313,7 +693,7 @@ class StartupBaselineTests(unittest.TestCase):
             instance.press.side_effect = press
             with self.assertRaisesRegex(AssertionError, 'truncated or replaced'):
                 fixture.write_failure()
-            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
             self.assertFalse(fixture.report['cases'])
 
     def test_continuing_valid_saves_never_count_as_byte_stable_readiness(self):
@@ -340,8 +720,78 @@ class StartupBaselineTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 fixture.write_failure()
             self.assertEqual(1, state['quit'])
-            self.assertTrue(any('/restore' in argv for argv in state['acl']))
+            self.assertTrue(any('/remove:d' in argv for argv in state['acl']))
             self.assertFalse(fixture.report['cases'])
+
+
+@unittest.skipUnless(sessions.os.name == 'nt', 'Windows native file sharing and DACL required')
+class NativeArchiveAclTests(unittest.TestCase):
+    def replace_like_zig(self, source, target):
+        # Match pinned Zig 0.16 Io.Threaded.dirRenameWindowsInner: RenameEx
+        # with REPLACE_IF_EXISTS | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE.
+        # Python's MoveFileEx replacement does not request POSIX semantics.
+        c = sessions.ctypes
+        class Rename(c.Structure):
+            _fields_ = [('flags', c.c_uint32), ('root', c.c_void_p),
+                        ('length', c.c_uint32), ('name', c.c_uint16 * 1)]
+        class Status(c.Structure):
+            _fields_ = [('status', c.c_void_p), ('information', c.c_size_t)]
+        kernel = c.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [c.c_wchar_p, c.c_uint32, c.c_uint32, c.c_void_p,
+                                       c.c_uint32, c.c_uint32, c.c_void_p]
+        kernel.CreateFileW.restype = c.c_void_p
+        kernel.CloseHandle.argtypes = [c.c_void_p]
+        native = c.WinDLL('ntdll').NtSetInformationFile
+        native.argtypes = [c.c_void_p, c.POINTER(Status), c.c_void_p, c.c_uint32, c.c_uint32]
+        native.restype = c.c_int32
+        name = ('\\??\\' + str(target)).encode('utf-16-le')
+        buffer = c.create_string_buffer(Rename.name.offset + len(name))
+        header = c.cast(buffer, c.POINTER(Rename)).contents
+        header.flags, header.root, header.length = 0x43, None, len(name)
+        c.memmove(c.addressof(buffer) + Rename.name.offset, name, len(name))
+        handle = kernel.CreateFileW(str(source), 0x40110000, 7, None, 3, 0x80, None)
+        self.assertNotEqual(c.c_void_p(-1).value, handle, c.get_last_error())
+        try:
+            result = native(handle, c.byref(Status()), buffer, len(buffer), 65)
+            self.assertEqual(0, result, f'NtSetInformationFile RenameEx: {result & 0xffffffff:#x}')
+        finally:
+            kernel.CloseHandle(handle)
+
+    def test_retained_reader_allows_atomic_replacement_without_injection(self):
+        with tempfile.TemporaryDirectory(prefix='gx-archive-share-') as folder:
+            target = Path(folder) / 'archive.json'
+            target.write_bytes(b'old')
+            with sessions.open_shared_archive(target) as reader:
+                replacement = target.with_suffix('.new')
+                replacement.write_bytes(b'new')
+                self.replace_like_zig(replacement, target)
+                self.assertEqual(b'old', reader.read())
+                self.assertEqual(b'new', target.read_bytes())
+            self.assertTrue(reader.closed)
+
+    def test_native_denial_retains_read_access_and_restores_exact_dacl(self):
+        with tempfile.TemporaryDirectory(prefix='gx-archive-acl-') as folder:
+            root = Path(folder)
+            directory = root / 'state'; directory.mkdir()
+            target = directory / 'archive.json'; target.write_bytes(b'baseline')
+            sid = list(sessions.csv.reader(sessions.subprocess.check_output(
+                ['whoami', '/user', '/fo', 'csv', '/nh'], text=True).splitlines()))[0][1]
+            def command(*args):
+                result = sessions.subprocess.run(['icacls', *map(str, args)], cwd=root,
+                                                capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, result.stderr)
+            evidence = {}
+            with sessions.deny_state_writes(directory, target, sid, root/'before.acl', root/'after.acl',
+                                             command, evidence) as reader:
+                with self.assertRaises(PermissionError):
+                    (directory/'new-file').write_bytes(b'denied')
+                self.assertEqual(b'baseline', reader.read())
+                reader.seek(0)
+                self.assertEqual(b'baseline', reader.read())
+            self.assertTrue(reader.closed)
+            self.assertEqual(b'baseline', target.read_bytes())
+            self.assertEqual('RESTORED', evidence['status'])
+            self.assertTrue(evidence['exact_dacl_match'])
 
 
 class DualWriterTests(unittest.TestCase):

@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager
 from dataclasses import asdict
 import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import subprocess
 import shutil
@@ -40,6 +42,128 @@ CASE_IDS = {"multi": "IPC-01", "disabled": "SES-00", "custom": "SES-03a",
             "privacy": "SES-07", "quick_excluded": "SES-08", "race": "IPC-02",
             "roots": "IPC-05a", "installs": "IPC-05b", "builds": "IPC-05c"}
 CASE_IDS.update(crash_before_ready="IPC-03", squatter="IPC-04")
+
+
+def open_shared_archive(path):
+    """Retain read access without introducing a sharing-violation injection."""
+    import msvcrt
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                               ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    api.CreateFileW.restype = ctypes.c_void_p
+    api.CloseHandle.argtypes = [ctypes.c_void_p]
+    api.CloseHandle.restype = ctypes.c_int
+    # Share READ, WRITE and DELETE: retaining this handle must not itself stop
+    # the application's normal atomic save/rename path.
+    handle = api.CreateFileW(str(path), 0x80000000, 7, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        api.CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(fd, "rb", buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def restore_dacl_metadata(directory, entries):
+    """Restore saved DACL control bits without owner/SACL or restore privileges."""
+    api = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint32)]
+    api.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = ctypes.c_int
+    api.SetFileSecurityW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p]
+    api.SetFileSecurityW.restype = ctypes.c_int
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    def reject_reparse(target):
+        if target.is_symlink() or getattr(target.lstat(), "st_file_attributes", 0) & 0x400:
+            raise AssertionError("refusing ACL metadata repair through a reparse point")
+
+    reject_reparse(directory)
+    directory = directory.resolve(strict=True)
+    for relative, sddl in entries.items():
+        target = directory.parent / relative
+        if ".." in Path(relative).parts or (target != directory and not target.is_relative_to(directory)):
+            raise AssertionError("ACL metadata repair escapes private state")
+        for component in (target, *target.parents):
+            reject_reparse(component)
+            if component == directory:
+                break
+        target = target.resolve(strict=True)
+        if target != directory and not target.is_relative_to(directory):
+            raise AssertionError("ACL metadata repair escapes private state")
+        descriptor = ctypes.c_void_p()
+        if not api.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not api.SetFileSecurityW(str(target), 4, descriptor):  # DACL_SECURITY_INFORMATION only
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.LocalFree(descriptor)
+
+
+@contextmanager
+def deny_state_writes(directory, archive, sid, original_acl, restored_acl, command, evidence):
+    """Undo only our new deny ACE, then verify the entire original DACL map."""
+    def snapshot(destination):
+        command(directory.name, "/save", destination, "/t")
+        # icacls writes UTF-16LE without a BOM on the supported Windows hosts.
+        lines = destination.read_text(encoding="utf-16-le").removeprefix("\ufeff").splitlines()
+        if not lines or len(lines) % 2:
+            raise AssertionError("invalid private ACL snapshot")
+        result = dict(zip(lines[::2], lines[1::2]))
+        if len(result) != len(lines) // 2 or directory.name not in result:
+            raise AssertionError("invalid private ACL snapshot entries")
+        return result
+
+    original = snapshot(original_acl)
+    for value in original.values():
+        for ace in re.finditer(r"\(([^;()]+);([^;()]*);[^;()]*;[^;()]*;[^;()]*;([^;()]+)(?:;|\))", value):
+            kind, flags, trustee = ace.groups()
+            if trustee.casefold() != sid.casefold():
+                continue
+            if kind in ("D", "OD", "XD", "ZD"):
+                raise AssertionError("private ACL already denies this SID; refusing ambiguous rollback")
+            # /deny removes matching explicit grants; /remove:d cannot restore
+            # them. Reject all explicit allows for this SID conservatively,
+            # including object/callback and inherit-only ACEs. ID alone marks
+            # an inherited ACE; OI/CI/IO do not make an explicit grant safe.
+            if kind in ("A", "OA", "XA", "ZA") and "ID" not in re.findall(r"..", flags):
+                raise AssertionError("private ACL has explicit allow for this SID; refusing lossy rollback")
+    evidence.update(status="PREPARED", original_entries=len(original))
+    with open_shared_archive(archive) as reader:
+        try:
+            # Enter finally even if icacls reports failure after changing an ACE.
+            command(directory.name, "/deny", f"*{sid}:(OI)(CI)(WD,AD,DC,D)")
+            evidence["status"] = "INJECTED"
+            yield reader
+        finally:
+            evidence["status"] = "RESTORE_PENDING"
+            command(directory.name, "/remove:d", f"*{sid}")
+            restored = snapshot(restored_acl)
+            if restored != original and restored.keys() == original.keys():
+                # Windows may add AUTO_INHERITED to an otherwise identical
+                # DACL. Restore that bit rather than weakening the equality gate.
+                changed = {name: value for name, value in original.items() if restored[name] != value}
+                metadata_only = all(
+                    value.partition("(")[0] in ("D:", "D:P") and
+                    restored[name] == value.partition("(")[0] + "AI(" + value.partition("(")[2]
+                    for name, value in changed.items())
+                if metadata_only:
+                    restore_dacl_metadata(directory, changed)
+                    evidence["metadata_repaired"] = list(changed)
+                    verified = restored_acl.with_name(restored_acl.stem + "-verified.acl")
+                    restored = snapshot(verified)
+            if restored != original:
+                raise AssertionError("private state DACL differs after rollback")
+            evidence.update(status="RESTORED", exact_dacl_match=True, restored_entries=len(restored))
 
 
 def pipe_names():
@@ -858,9 +982,11 @@ class Fixture:
         self.seed_document(path, expected)
         instance = self.start(path)
         original = self.restored_baseline(instance, path, expected, "write_failure")
+        (self.out / "write-failure-before.json").write_bytes(original)
         directory = self.session(path).parent.resolve()
         assert directory.is_relative_to(path.resolve())
         acl = self.out / "write-failure-original.acl"
+        restored_acl = self.out / "write-failure-restored.acl"
         sid_rows = list(csv.reader(subprocess.check_output(["whoami", "/user", "/fo", "csv", "/nh"], text=True).splitlines()))
         sid = sid_rows[0][1]
         assert sid.startswith("S-1-")
@@ -870,9 +996,13 @@ class Fixture:
                                                                "stdout": result.stdout, "stderr": result.stderr})
             if result.returncode:
                 raise AssertionError("private state ACL operation failed")
-        icacls(directory.name, "/save", acl, "/t")
-        try:
-            icacls(directory.name, "/deny", f"*{sid}:(OI)(CI)(WD,AD,DC,D)")
+        restoration = self.report["write_failure_acl"] = {}
+        with deny_state_writes(directory, self.session(path), sid, acl, restored_acl, icacls, restoration) as reader:
+            def preserved_bytes():
+                reader.seek(0)
+                return reader.read()
+
+            assert preserved_bytes() == original
             try:
                 with (directory / "denied-write-probe").open("x"):
                     pass
@@ -908,11 +1038,18 @@ class Fixture:
                 observation.update(status="FAIL", error=str(error))
                 raise
             self.capture(instance, "write-failure-feedback")
-            assert self.session(path).read_bytes() == original
+            after_action = preserved_bytes()
+            (self.out / "write-failure-after-action.json").write_bytes(after_action)
+            assert after_action == original
             self.quit(instance)
-            assert self.session(path).read_bytes() == original
-        finally:
-            icacls(".", "/restore", acl)
+            after_quit = preserved_bytes()
+            (self.out / "write-failure-after-quit.json").write_bytes(after_quit)
+            assert after_quit == original
+        # The retained handle alone cannot detect replacement of its pathname.
+        # After normal Quit and exact ACL rollback, also compare the live path.
+        after_restore = self.session(path).read_bytes()
+        (self.out / "write-failure-after-restore.json").write_bytes(after_restore)
+        assert after_restore == original
         self.report["cases"].append({"case_id": "SES-05", "name": "readonly-state-preserves-old-archive", "status": "PASS",
                                      "injection": "private directory DACL denies writes/deletes; original ACL restored"})
 
