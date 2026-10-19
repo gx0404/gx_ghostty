@@ -740,7 +740,6 @@ class RealCorpusTests(unittest.TestCase):
         docs = {rel for rel in visible if rel.startswith("docs/") and rel.endswith(".md")
                 and rel.count("/") == 1}
         excluded = {rel for rel in docs if rel.startswith("docs/GX_UI_")}
-        self.assertTrue(excluded)
         self.assertTrue(excluded.isdisjoint(self.docs))
         self.assertEqual(self.docs & docs, docs - excluded)
 

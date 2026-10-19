@@ -95,7 +95,7 @@ resolver 先列出命中的领域文档 `docs/AGENT_RULES/<id>.md`，再列出�
 
 ### 7. 生成物与版本
 
-- KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。产物是 schema 2 的紧凑 JSON：首行文件头，每个文档一行 `[path, source_sha256, [`（逐文档的来源哈希），其后每片一行 `[anchor, text]`，所以 diff 里变化的行就是变化的小节；chunk id 不入库，`kb-query --json` 的 `id` 由 `path#anchor` 推导。Markdown 正文原样收录；代码层为控制体积做了裁剪：Zig 结构省略 `pub` 前缀，模块文档丢掉分隔线与字形表、超过 3000 字符截断，`///` 与头文件注释只留首句及 120 字符内的后续整句。体积预算 2.5 MiB 由 `scripts/test_agent_kb.py` 锁定，逼近时收紧代码层裁剪、用 `just kb-query` 对照代表查询的前后结果，不放宽预算，也不删其余 Markdown 语料。阶段过程文档 `docs/GX_UI_*.md`（REMAINING_PLAN、HANDOFF_PLAN、EVIDENCE_INDEX、EXECUTION_PLAN）不进 KB，按路径直接阅读，避免过时计划混入代码知识；其他 `docs/*.md` 仍收录。排除模式由 `scripts/build_agent_kb.py::EXCLUDED_DOCS` 维护。
+- KB：改了语料就 `just kb`，审 diff 后随改动一起提交。只改函数体不会让 KB 过期，改公开签名、文档注释或文档才会；语料范围见下文「生成物重建时机」。产物是 schema 2 的紧凑 JSON：首行文件头，每个文档一行 `[path, source_sha256, [`（逐文档的来源哈希），其后每片一行 `[anchor, text]`，所以 diff 里变化的行就是变化的小节；chunk id 不入库，`kb-query --json` 的 `id` 由 `path#anchor` 推导。Markdown 正文原样收录；代码层为控制体积做了裁剪：Zig 结构省略 `pub` 前缀，模块文档丢掉分隔线与字形表、超过 3000 字符截断，`///` 与头文件注释只留首句及 120 字符内的后续整句。体积预算 2.5 MiB 由 `scripts/test_agent_kb.py` 锁定，逼近时收紧代码层裁剪、用 `just kb-query` 对照代表查询的前后结果，不放宽预算，也不删其余 Markdown 语料。知识库按 `docs/GX_UI_*.md` 排除阶段过程文档，避免过时计划混入代码知识；其他 `docs/*.md` 仍收录。排除模式由 `scripts/build_agent_kb.py::EXCLUDED_DOCS` 维护。
 - GX 译表：改了两份 `.po` 就 `just i18n`，`src/gx/i18n/zh_CN.zig` 随改动提交。
 - 拼音首字母表：只在升级钉版 pinyin-data 或改生成规则时 `just pinyin`（联网），`src/gx/pinyin/initials.zig` 随改动提交；平时 `just pinyin-check` 离线校验。数据编进 exe，随包许可由打包脚本写进 Windows 包的 `licenses/` 与 deb stage 的 copyright（`packaging-dist.md`）。
 - 图谱：日常不强制重建；发版前和上游同步后必须 `just graph`，再跑 `just generated-check`。
