@@ -11,6 +11,10 @@ config = """
 command = cmd.exe /d /k prompt $G$S
 language = en
 keybind = f12=start_search
+keybind = f10=scroll_to_top
+keybind = f11=scroll_to_bottom
+scrollback-limit-lines = 1200
+scrollback-limit-bytes = 50000000
 """
 expect = [
   "search-box: the typed text and the editing chords stayed in the search box (Ctrl+Backspace and Ctrl+Delete remove the words abc and x, leaving `needle`)",
@@ -26,6 +30,11 @@ expect = [
   "link-left: with Ctrl held on a row of the long URL output, the preview bubble at the bottom-left keeps the complete authority https://example.com immediately followed by one middle ellipsis (U+2026), and the complete /tail-end; at most 60% of the terminal wide, with no second tail ellipsis",
   "link-right: with the pointer on the URL prompt in the last row, under the bubble's place, the bubble for https://example.com/gx-r6-right/prompt shows at the bottom-right corner",
   "resize-overlay: right after the window was resized, the columns × rows overlay is shown in semibold",
+  "v5-seeded: W02V5-EARLY-DISCARD is visible before filling history; v5-bottom: row 4000 and W02 V5 ready title are visible, with none of the three W02V5-HIT markers on screen",
+  "v5-full-top: F10 reached the oldest retained history: numbered W02V5-row lines start well after row 1 and W02V5-EARLY-DISCARD is gone. The 1200-line limit is approximate (page granularity); do not assert an exact first row",
+  "v5-search: the counter totals 3 but may have no selected result (-/3), with the viewport still at the tail. v5-enter: Enter brings a previously offscreen W02V5-HIT island and surrounding rows into view. v5-enter-next: a second Enter moves from that selected island to a DIFFERENT island and its rows, not merely a different counter",
+  "v5-terminal-focus, v5-f3 and v5-shift-f3: terminal click keeps the selected island and removes the field caret; F3 shows a different island and surrounding rows; Shift+F3 returns to the island and rows seen in v5-terminal-focus",
+  "V5 remains PENDING until root reads all v5 screenshots from the fixed r10b executable: every selected marker must be visible, adjacent islands must be offscreen, and the full-top and navigation evidence must both hold. Title acknowledgement proves producer completion only; sleeps and counters do not prove viewport movement",
 ]
 
 # The pointer may rest on the chrome where a previous program left it (a tab bar button shows its
@@ -448,3 +457,187 @@ count = 1
 [[step]]
 action = "sleep"
 seconds = 0.5
+
+# --- V5: full scrollback and real offscreen match navigation --------------------
+# Keep every earlier step and its six-match expectation. Limits above apply from
+# surface creation; changing them at runtime would not affect this surface.
+# The existing 1400 x 1000 window fits far fewer than 250 terminal rows.
+# No cls/clear after the seed: disappearance at the top must be eviction.
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "75%"
+
+[[step]]
+action = "type"
+text = "prompt $G$S&echo W02V5-EARLY-DISCARD&title W02 V5 seeded\n"
+
+[[step]]
+action = "wait_title"
+pattern = "^W02 V5 seeded$"
+timeout = 10
+
+[[step]]
+action = "capture"
+name = "v5-seeded"
+what = "all"
+
+# Finite producer: 4000 numbered rows + 3 markers, < 100 KiB ASCII output.
+# @echo off prevents command echoes from duplicating the search markers.
+# Only the isolated profile receives this file. No external programs or inputs.
+# The 30 s acknowledgement deadline fails the scenario and invokes normal owned
+# instance cleanup if output does not finish; there is no unbounded producer.
+[[step]]
+action = "file"
+path = "v5/fill.cmd"
+text = '''
+@echo off
+for /L %%i in (1,1,3200) do echo W02V5-row-%%i
+echo W02V5-HIT-A
+for /L %%i in (3201,1,3450) do echo W02V5-row-%%i
+echo W02V5-HIT-B
+for /L %%i in (3451,1,3700) do echo W02V5-row-%%i
+echo W02V5-HIT-C
+for /L %%i in (3701,1,4000) do echo W02V5-row-%%i
+title W02 V5 ready
+'''
+
+[[step]]
+action = "type"
+text = 'call "%LOCALAPPDATA%\v5\fill.cmd"'
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "wait_title"
+pattern = "^W02 V5 ready$"
+timeout = 30
+
+[[step]]
+action = "capture"
+name = "v5-bottom"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f10"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "v5-full-top"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f11"
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "key"
+keys = "ctrl+a"
+
+[[step]]
+action = "type"
+text = "W02V5-HIT"
+
+# These short waits permit search/render settling only. Visual assertions above
+# remain manual; the driver has no terminal-content/selected-match predicate.
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "v5-search"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "v5-enter"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "v5-enter-next"
+what = "all"
+
+[[step]]
+action = "click"
+in = "terminal:0"
+x = "50%"
+y = "75%"
+
+[[step]]
+action = "sleep"
+seconds = 0.3
+
+[[step]]
+action = "capture"
+name = "v5-terminal-focus"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "f3"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "v5-f3"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "shift+f3"
+
+[[step]]
+action = "sleep"
+seconds = 0.5
+
+[[step]]
+action = "capture"
+name = "v5-shift-f3"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
