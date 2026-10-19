@@ -61,6 +61,7 @@
 const Popup = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const clipboard = @import("../clipboard.zig");
 const w32 = @import("../win32.zig");
@@ -290,6 +291,11 @@ pub const Options = struct {
     accessible_name: []const u8 = "",
     /// Release the render target while hidden (popups shown rarely).
     release_target_on_hide: bool = false,
+    /// Prefer the software-first DC/DIB path for legacy painting, including
+    /// its default-target fallback if software target creation fails. False
+    /// keeps HWND painting for non-layered popups. DirectComposition still
+    /// takes priority; this does not change activation, layering or reveal.
+    prefer_software: bool = false,
     /// When an activating popup gets WM_CLOSE (Alt+F4, the system close),
     /// also close its root owner window: Alt+F4 closes the window, not just
     /// the popup. Modal dialogs turn it off and treat the close as Cancel
@@ -375,6 +381,9 @@ repaint_retry_delay_ms: u32 = repaint_retry_first_ms,
 /// Created as a layered window for `Options.motion`; painted through `dib`.
 layered: bool = false,
 dib: d2d.DibTarget = .{},
+/// Native tests can reject the copy after a successful EndDraw. No state or
+/// failure branch exists in production builds.
+test_fail_blit: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 /// The fade-in: its animator, progress and the final place.
 animator: anim.Animator = .{ .tick = animTick },
 fade: anim.Tween = .{ .start_ns = 0, .duration_ns = 0 },
@@ -2082,8 +2091,9 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
     // Only a text input drawn by this paint takes clicks and the I-beam.
     self.input.field = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     if (self.paintComposition(hwnd, canvas, cb)) return;
-    if (self.layered) {
-        // A layered window shows GDI content reliably: draw into a DIB.
+    if (self.layered or self.options.prefer_software) {
+        // Layered windows require the GDI path. Small, non-layered popups
+        // can opt into the same DIB without creating an HWND render target.
         const dc = hdc orelse return;
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(hwnd, &client) == 0) return;
@@ -2094,7 +2104,13 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
         canvas.clear(.{ .r = 0, .g = 0, .b = 0, .a = 0 });
         cb.paint(cb.ctx, self, canvas);
         switch (canvas.finish()) {
-            .ok => if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd, frame),
+            .ok => {
+                const source: w32.HDC = if (builtin.is_test)
+                    (if (self.test_fail_blit) @ptrFromInt(1) else mem)
+                else
+                    mem;
+                if (w32.BitBlt(dc, 0, 0, client.right, client.bottom, source, 0, 0, w32.SRCCOPY) != 0) self.markLegacyFrame(hwnd, frame);
+            },
             .recreate => {
                 self.reuse_invalid = true;
                 self.repaint();
@@ -2114,6 +2130,213 @@ fn paint(self: *Popup, hwnd: w32.HWND) void {
             self.repaint();
         },
         .failed => self.reuse_invalid = true,
+    }
+}
+
+const SoftwarePaintFixture = struct {
+    fail_end_draw: bool = false,
+    dc_paints: usize = 0,
+    borrowed_paints: usize = 0,
+
+    // Off-screen, owned windows exercise show/reveal without taking focus.
+    const rect: w32.RECT = .{ .left = -32000, .top = -32000, .right = -31880, .bottom = -31940 };
+
+    fn paint(ctx: *anyopaque, popup: *Popup, canvas: *d2d.Canvas) void {
+        const self: *SoftwarePaintFixture = @ptrCast(@alignCast(ctx));
+        const size = popup.sizeDip();
+        const full: d2d.Rect = .{ .x = 0, .y = 0, .w = size.width, .h = size.height };
+        canvas.clear(.{ .r = 1, .g = 0, .b = 0 });
+        canvas.fillRect(.{ .x = size.width / 2, .y = 0, .w = size.width / 2, .h = size.height }, .{ .r = 0, .g = 0, .b = 1 });
+        canvas.drawText("P7", full, .{ .size = 14, .color = .white, .align_x = .center, .align_y = .center });
+        switch (canvas.target) {
+            .dc => |rt| {
+                self.dc_paints += 1;
+                // A real D2D error, reported by EndDraw: no clip was pushed.
+                if (self.fail_end_draw) rt.vtable.render_target.PopAxisAlignedClip(@ptrCast(rt));
+            },
+            .borrowed => self.borrowed_paints += 1,
+            else => {},
+        }
+    }
+
+    fn expectPixels(_: *const SoftwarePaintFixture, popup: *const Popup) !void {
+        try std.testing.expect(GdiFlush() != 0);
+        const frame = popup.openFrame(popup.hwnd.?) orelse return error.NoTestFrame;
+        const pixels: [*]const u32 = @ptrCast(@alignCast(popup.dib.bits orelse return error.NoTestPixels));
+        const row: usize = @intCast(popup.dib.width);
+        // Away from the centered label, both colored halves must be present.
+        try std.testing.expectEqual(@as(u32, 0xff0000), pixels[row * 2 + 2] & 0xffffff);
+        try std.testing.expectEqual(@as(u32, 0x0000ff), pixels[row * 2 + frame.width - 3] & 0xffffff);
+    }
+
+    extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
+};
+
+test "P7 software popup paints current frames and releases its raster resources" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    var context: SoftwarePaintFixture = .{};
+    var popup: Popup = .{};
+    defer popup.destroy();
+    try testing.expect(!popup.options.prefer_software);
+    try popup.create(hinstance, owner, factory, .{ .prefer_software = true }, .{
+        .ctx = &context,
+        .paint = SoftwarePaintFixture.paint,
+    });
+    // Exercise only legacy painting, independent of the caller's DComp opt-in.
+    // The popup stays hidden and never takes focus.
+    popup.composition_requested = false;
+    const hwnd = popup.hwnd.?;
+    try testing.expect(w32.SetWindowPos(hwnd, null, -32000, -32000, 120, 60, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE) != 0);
+    try testing.expect(!popup.layered);
+    try testing.expect(ActivationFixture.noActivate(hwnd));
+    try testing.expect(!popup.frameReady(hwnd));
+    popup.paint(hwnd);
+    try testing.expect(popup.canvas.?.target == .dc);
+    try testing.expect(popup.frameReady(hwnd));
+    try context.expectPixels(&popup);
+    const target = popup.canvas.?.target.dc;
+    const bitmap = popup.dib.bitmap.?;
+
+    // A smaller frame reuses the buffer but cannot reveal the old dimensions.
+    try testing.expect(w32.SetWindowPos(hwnd, null, -32000, -32000, 100, 50, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE) != 0);
+    try testing.expect(!popup.frameReady(hwnd));
+    popup.paint(hwnd);
+    try testing.expect(popup.frameReady(hwnd));
+    try testing.expectEqual(target, popup.canvas.?.target.dc);
+    try testing.expectEqual(bitmap, popup.dib.bitmap.?);
+
+    // The owner's content scale changes the frame's DPI without a new HWND.
+    popup.setOwnerScale(popup.ownerScale() * 1.5);
+    try testing.expect(!popup.frameReady(hwnd));
+    popup.paint(hwnd);
+    try testing.expect(popup.frameReady(hwnd));
+    try testing.expectEqual(@as(f32, @floatFromInt(popup.canvasDpi())), popup.canvas.?.dpi);
+
+    popup.discardTarget();
+    try testing.expect(popup.canvas.?.target == .none);
+    try testing.expect(popup.dib.dc == null and popup.dib.bitmap == null);
+    try testing.expect(!popup.frameReady(hwnd));
+    const callbacks = popup.callbacks;
+    popup.callbacks = null;
+    popup.paint(hwnd);
+    try testing.expect(!popup.frameReady(hwnd));
+    popup.callbacks = callbacks;
+    popup.paint(hwnd);
+    try testing.expect(popup.canvas.?.target == .dc);
+    try testing.expect(popup.frameReady(hwnd));
+    try context.expectPixels(&popup);
+    try testing.expect(w32.IsWindowVisible_(hwnd) == 0);
+    try testing.expect(ActivationFixture.noActivate(hwnd));
+}
+
+test "P7 software first paint failures cancel at 300ms and recover on reopening" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    const Failure = enum { end_draw, bitblt };
+    for ([_]Failure{ .end_draw, .bitblt }) |failure| {
+        var context: SoftwarePaintFixture = .{ .fail_end_draw = failure == .end_draw };
+        var popup: Popup = .{};
+        defer popup.destroy();
+        try popup.create(hinstance, owner, factory, .{ .prefer_software = true }, .{
+            .ctx = &context,
+            .paint = SoftwarePaintFixture.paint,
+        });
+        popup.composition_requested = false;
+        popup.test_fail_blit = failure == .bitblt;
+        const hwnd = popup.hwnd.?;
+        popup.show(SoftwarePaintFixture.rect);
+        try testing.expect(context.dc_paints > 0);
+        try testing.expect(popup.visible and popup.revealing);
+        try testing.expect(popup.successful_frame == null and !popup.frameReady(hwnd));
+        if (failure == .end_draw) {
+            try testing.expect(popup.reuse_invalid and popup.canvas.?.warned);
+        } else {
+            // EndDraw produced pixels; the actual BitBlt rejects HDC(1).
+            try testing.expect(!popup.canvas.?.warned);
+            try context.expectPixels(&popup);
+        }
+
+        // Advance only the existing reveal deadline; no sleep or message pump.
+        popup.reveal_started_ms -|= reveal_timeout_ms;
+        popup.reveal(hwnd);
+        try testing.expect(!popup.visible and !popup.revealing and !popup.repaint_retry);
+        try testing.expect(w32.IsWindowVisible_(hwnd) == 0);
+        try testing.expect(popup.successful_frame == null);
+
+        context.fail_end_draw = false;
+        popup.test_fail_blit = false;
+        popup.discardTarget();
+        popup.show(SoftwarePaintFixture.rect);
+        try testing.expect(popup.revealing and popup.frameReady(hwnd));
+        try context.expectPixels(&popup);
+        popup.reveal(hwnd);
+        try testing.expect(popup.visible and !popup.revealing and !popup.repaint_retry);
+        try testing.expect(w32.IsWindowVisible_(hwnd) != 0);
+        try testing.expect(popup.frameReady(hwnd) and ActivationFixture.noActivate(hwnd));
+        popup.hide();
+    }
+}
+
+test "P7 DComp precedes software painting and failed composition waits for a DC frame" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    // Populate the existing factory-owned device without changing the process
+    // environment. Missing native DComp is a failure, not a skipped assertion.
+    factory.popup_device = try dcomp.Device.init(factory.d2d);
+    factory.popup_device_attempted = true;
+    const owner = try ActivationFixture.owner();
+    defer _ = w32.DestroyWindow(owner);
+    const hinstance = w32.GetModuleHandleW(null) orelse return error.TestWindowFailed;
+    for ([_]dcomp.Failure{ .none, .begin, .end, .commit }) |failure| {
+        var context: SoftwarePaintFixture = .{};
+        var popup: Popup = .{};
+        defer popup.destroy();
+        try popup.create(hinstance, owner, factory, .{ .prefer_software = true }, .{
+            .ctx = &context,
+            .paint = SoftwarePaintFixture.paint,
+        });
+        popup.composition_requested = true;
+        popup.composition_failure = failure;
+        // Successful composition must bypass even a failing legacy copy.
+        popup.test_fail_blit = true;
+        const hwnd = popup.hwnd.?;
+        popup.show(SoftwarePaintFixture.rect);
+        try testing.expect(popup.visible and popup.revealing);
+        if (failure == .none) {
+            try testing.expect(context.borrowed_paints > 0 and context.dc_paints == 0);
+            try testing.expect(popup.dib.dc == null and popup.successful_frame == null);
+            try testing.expect(popup.frameReady(hwnd));
+            try testing.expectEqual(@as(isize, 6), popup.compositionStatus(hwnd) & 6);
+        } else {
+            try testing.expect(popup.composition_failed and context.dc_paints > 0);
+            // Retain the failed composition resource domain until the fallback
+            // copy actually succeeds; no successful/stale frame may reveal it.
+            try testing.expect(popup.composition != null);
+            try testing.expect(popup.successful_frame == null and !popup.frameReady(hwnd));
+            try testing.expectEqual(@as(isize, 16), popup.compositionStatus(hwnd) & 22);
+            try context.expectPixels(&popup);
+            const borrowed_paints = context.borrowed_paints;
+            popup.test_fail_blit = false;
+            popup.reveal(hwnd);
+            try testing.expectEqual(borrowed_paints, context.borrowed_paints);
+            try testing.expect(popup.composition == null and popup.canvas.?.target == .dc);
+            try testing.expectEqual(@as(isize, 20), popup.compositionStatus(hwnd) & 22);
+            try context.expectPixels(&popup);
+        }
+        popup.reveal(hwnd);
+        try testing.expect(popup.visible and !popup.revealing and popup.frameReady(hwnd));
+        try testing.expect(ActivationFixture.noActivate(hwnd));
+        popup.hide();
     }
 }
 

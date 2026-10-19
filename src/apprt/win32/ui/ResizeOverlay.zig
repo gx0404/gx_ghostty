@@ -224,6 +224,8 @@ pub fn showPaneIn(self: *ResizeOverlay, pane: Pane, area: w32.RECT) void {
         .shadow = true,
         .border_color = t.border,
         .dark = t.dark,
+        // Keep the first synchronous resize overlay on the existing DC path.
+        .prefer_software = true,
     }, .{
         .ctx = self,
         .paint = paint,
