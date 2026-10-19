@@ -13,11 +13,41 @@ const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const terminfo = @import("../terminfo/main.zig");
 const posix = std.posix;
+// fork(gx): GX-0057 app-only cursor state and explicit configuration overrides.
+const gx_cursor_policy = @import("../gx/cursor_policy.zig");
 // fork(gx): GX-0008 begin: OSC 7 working directories on Windows
 const gx_osc7 = @import("../gx/osc7.zig");
 // fork(gx): GX-0008 end
 
 const log = std.log.scoped(.io_handler);
+
+// fork(gx): GX-0057 begin: verify real VT dispatch and replies in one input block.
+// Real stream dispatch instantiates App callbacks absent from the none runtime.
+// Pure cursor policy and configuration tests remain enabled on every runtime.
+test "GX0057 app stream cursor precedence" {
+    if (comptime gx_cursor_policy.enabledFor(build_config.app_runtime)) {
+        try gx_cursor_policy.testStream(StreamHandler);
+    } else return error.SkipZigTest;
+}
+
+test "GX0057 app stream mode save restore releases program blink" {
+    if (comptime gx_cursor_policy.enabledFor(build_config.app_runtime)) {
+        try gx_cursor_policy.testStreamModeSaveRestore(StreamHandler);
+    } else return error.SkipZigTest;
+}
+
+test "GX0057 resize mode 40 keeps effective cursor after screen replacement" {
+    if (comptime gx_cursor_policy.enabledFor(build_config.app_runtime)) {
+        try gx_cursor_policy.testResize(termio.Termio, .mode_3);
+    } else return error.SkipZigTest;
+}
+
+test "GX0057 resize DECCOLM keeps effective cursor after screen replacement" {
+    if (comptime gx_cursor_policy.enabledFor(build_config.app_runtime)) {
+        try gx_cursor_policy.testResize(termio.Termio, .deccolm);
+    } else return error.SkipZigTest;
+}
+// fork(gx): GX-0057 end
 
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
@@ -27,6 +57,8 @@ pub const StreamHandler = struct {
     alloc: Allocator,
     size: *renderer.Size,
     terminal: *terminal.Terminal,
+    // fork(gx): GX-0057 values only; all access shares renderer_state.mutex.
+    gx_cursor_policy: gx_cursor_policy.State = .{},
 
     /// Mailbox for data to the termio thread.
     termio_mailbox: *termio.Mailbox,
@@ -129,8 +161,8 @@ pub const StreamHandler = struct {
         self.clipboard_write_limit = config.clipboard_write_limit;
         self.enquiry_response = config.enquiry_response;
         self.xt_checksum_report = config.xt_checksum_report;
-        self.terminal.setDefaultCursorStyle(config.cursor_style);
-        self.terminal.setDefaultCursorBlink(config.cursor_blink);
+        // fork(gx): GX-0057 restore program state, update defaults, then publish effective state.
+        self.gx_cursor_policy.changeConfig(self.terminal, config.cursor_style, config.cursor_blink, config.gx_cursor_overrides);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
 
         // The config could have changed any of our colors so update mode 2031
@@ -257,7 +289,8 @@ pub const StreamHandler = struct {
                 self.terminal.screens.active.cursor.y + 1 +| value.value,
                 self.terminal.screens.active.cursor.x + 1,
             ),
-            .cursor_style => self.terminal.setCursorStyle(value),
+            // fork(gx): GX-0057 publish effective state before the next VT action/query.
+            .cursor_style => self.gx_cursor_policy.request(self.terminal, value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
             .erase_display_complete => {
@@ -285,15 +318,18 @@ pub const StreamHandler = struct {
             .next_line => try self.nextLine(),
             .reverse_index => try self.reverseIndex(),
             .full_reset => try self.fullReset(),
-            .soft_reset => self.terminal.softReset(),
+            // fork(gx): GX-0057 DECSTR also discards shadow program requests.
+            .soft_reset => self.gx_cursor_policy.reset(self.terminal, .soft),
             .set_mode => try self.setMode(value.mode, true),
             .reset_mode => try self.setMode(value.mode, false),
-            .save_mode => self.terminal.modes.save(value.mode),
+            // fork(gx): GX-0057 save program blink rather than its effective override.
+            .save_mode => self.gx_cursor_policy.saveMode(self.terminal, value.mode),
             .restore_mode => {
                 // For restore mode we have to restore but if we set it, we
                 // always have to call setMode because setting some modes have
                 // side effects and we want to make sure we process those.
-                const v = self.terminal.modes.restore(value.mode);
+                // fork(gx): GX-0057 restore writes the mode before setMode's legacy guard.
+                const v = self.gx_cursor_policy.restoreMode(self.terminal, value.mode);
                 try self.setMode(value.mode, v);
             },
             .request_mode => try self.requestMode(value.mode),
@@ -705,15 +741,18 @@ pub const StreamHandler = struct {
             },
 
             .alt_screen_legacy => {
-                try self.terminal.switchScreenMode(.@"47", enabled);
+                // fork(gx): GX-0057 screen copies must copy the program's cursor state.
+                try self.gx_cursor_policy.screenMode(self.terminal, .@"47", enabled);
             },
 
             .alt_screen => {
-                try self.terminal.switchScreenMode(.@"1047", enabled);
+                // fork(gx): GX-0057 screen copies must copy the program's cursor state.
+                try self.gx_cursor_policy.screenMode(self.terminal, .@"1047", enabled);
             },
 
             .alt_screen_save_cursor_clear_enter => {
-                try self.terminal.switchScreenMode(.@"1049", enabled);
+                // fork(gx): GX-0057 saved positions do not save cursor appearance.
+                try self.gx_cursor_policy.screenMode(self.terminal, .@"1049", enabled);
             },
 
             // Mode 1048 is xterm's conditional save cursor depending
@@ -731,7 +770,9 @@ pub const StreamHandler = struct {
             // Force resize back to the window size
             .enable_mode_3 => {
                 const grid_size = self.size.grid();
-                self.terminal.resize(
+                // fork(gx): GX-0057 resize may replace the active screen even on recovery.
+                self.gx_cursor_policy.resize(
+                    self.terminal,
                     self.alloc,
                     .{
                         .cols = grid_size.columns,
@@ -742,7 +783,9 @@ pub const StreamHandler = struct {
                 };
             },
 
-            .@"132_column" => try self.terminal.deccolm(
+            // fork(gx): GX-0057 DECCOLM contains another terminal resize entry.
+            .@"132_column" => try self.gx_cursor_policy.deccolm(
+                self.terminal,
                 self.alloc,
                 if (enabled) .@"132_cols" else .@"80_cols",
             ),
@@ -920,7 +963,8 @@ pub const StreamHandler = struct {
     pub fn fullReset(
         self: *StreamHandler,
     ) !void {
-        self.terminal.fullReset();
+        // fork(gx): GX-0057 finish effective state before setMouseShape can send/unlock.
+        self.gx_cursor_policy.reset(self.terminal, .full);
         try self.setMouseShape(.text);
 
         // Full reset clears Kitty clipboard session grants.

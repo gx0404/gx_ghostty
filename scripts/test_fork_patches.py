@@ -1899,6 +1899,682 @@ class Gx0056ShapeTests(unittest.TestCase):
         self.assertTrue(gx0056_problems(self.resolver + "\n// fork(gx): GX-0056 unexpected", self.grid))
 
 
+GX0057_PATHS = ("src/config/Config.zig", "src/termio/Termio.zig",
+                "src/termio/stream_handler.zig", "src/Surface.zig")
+GX0057_TOKENS = {
+    GX0057_PATHS[0]: (
+        'gx_default_cursor_arg: [:0]const u8,',
+        'if (@TypeOf(iter.*) == Replay.Iterator)',
+        'if (iter.gxCursorStep()) |step|',
+        'try self._replay_steps.append(alloc, try step.clone(alloc));',
+        '.gx_default_cursor_arg => |v| .{ .gx_default_cursor_arg = try alloc.dupeZ(u8, v) },',
+        '.gx_default_cursor_arg => |arg| return arg,',
+        'gx_config_layers.isCursorKey(key)',
+        'if (comptime !@import("../gx/cursor_policy.zig").enabledFor(build_config.app_runtime)) break :conditional null;',
+    ),
+    GX0057_PATHS[1]: (
+        'const gx_cursor_policy = @import("../gx/cursor_policy.zig");',
+        'gx_cursor_overrides: gx_cursor_policy.Overrides = .{},',
+        '.gx_cursor_overrides = if (comptime gx_cursor_policy.enabledFor(@import("../build_config.zig").app_runtime))',
+        '@import("../gx/config_layers.zig").cursorOverrides(config) else .{},',
+        '.gx_cursor_policy = gx_cursor_policy.State.init(&term, opts.config.gx_cursor_overrides),',
+        'try self.terminal_stream.handler.gx_cursor_policy.resize(',
+        'try gx_cursor_policy.testResize(Termio, .termio);',
+    ),
+    GX0057_PATHS[2]: (
+        'const gx_cursor_policy = @import("../gx/cursor_policy.zig");',
+        'gx_cursor_policy: gx_cursor_policy.State = .{},',
+        'self.gx_cursor_policy.changeConfig(self.terminal, config.cursor_style, config.cursor_blink, config.gx_cursor_overrides);',
+        '.cursor_style => self.gx_cursor_policy.request(self.terminal, value),',
+        '.soft_reset => self.gx_cursor_policy.reset(self.terminal, .soft),',
+        '.save_mode => self.gx_cursor_policy.saveMode(self.terminal, value.mode),',
+        'const v = self.gx_cursor_policy.restoreMode(self.terminal, value.mode);',
+        'try self.gx_cursor_policy.screenMode(self.terminal, .@"47", enabled);',
+        'try self.gx_cursor_policy.screenMode(self.terminal, .@"1047", enabled);',
+        'try self.gx_cursor_policy.screenMode(self.terminal, .@"1049", enabled);',
+        'self.gx_cursor_policy.reset(self.terminal, .full);',
+        'try gx_cursor_policy.testStream(StreamHandler);',
+        'try gx_cursor_policy.testStreamModeSaveRestore(StreamHandler);',
+        'self.gx_cursor_policy.resize(',
+        '.@"132_column" => try self.gx_cursor_policy.deccolm(',
+        'try gx_cursor_policy.testResize(termio.Termio, .mode_3);',
+        'try gx_cursor_policy.testResize(termio.Termio, .deccolm);',
+    ),
+    GX0057_PATHS[3]: (
+        'self.io.terminal_stream.handler.gx_cursor_policy.reset(self.renderer_state.terminal, .full);',
+    ),
+}
+
+
+def gx0057_problems(sources: dict[str, str]) -> list[str]:
+    sources = {path: text.replace("\r\n", "\n") for path, text in sources.items()}
+    problems = []
+    for path, count in zip(GX0057_PATHS, (14, 7, 15, 1)):
+        source = sources[path]
+        if source.count("fork(gx): GX-0057") != count:
+            problems.append(path + ": missing or extra marker")
+        for token in GX0057_TOKENS[path]:
+            if source.count(token) != 1:
+                problems.append(path + ": missing or duplicate hook " + token)
+    for path, header, ordered in (
+        (GX0057_PATHS[2], "pub fn fullReset(", (
+            'self.gx_cursor_policy.reset(self.terminal, .full);',
+            'try self.setMouseShape(.text);',
+            'self.messageWriter(',
+        )),
+        (GX0057_PATHS[2], "pub fn changeConfig(", (
+            GX0057_TOKENS[GX0057_PATHS[2]][2], 'self.messageWriter(',
+        )),
+        (GX0057_PATHS[1], "pub fn changeConfig(", (
+            'self.renderer_state.mutex.lockUncancelable(global.io());',
+            'self.terminal_stream.handler.changeConfig(&self.config);',
+        )),
+        (GX0057_PATHS[1], "pub fn resize(", (
+            'self.renderer_state.mutex.lockUncancelable(global.io());',
+            'try self.terminal_stream.handler.gx_cursor_policy.resize(',
+            '&self.terminal,',
+            'try self.sizeReportLocked(td, .mode_2048);',
+            'self.renderer_mailbox.push(',
+        )),
+        (GX0057_PATHS[2], "pub fn setMode(", (
+            '.enable_mode_3 => {',
+            'self.gx_cursor_policy.resize(',
+            'self.terminal,',
+            '.@"132_column" => try self.gx_cursor_policy.deccolm(',
+            'self.terminal,',
+        )),
+    ):
+        lines = sources[path].splitlines()
+        span = zig_fn_lines(lines, header)
+        if span is None:
+            problems.append(path + ": missing function " + header)
+            continue
+        body = "\n".join(lines[span[0]:span[1]])
+        offset = 0
+        for statement in ordered:
+            found = body.find(statement, offset)
+            if found < 0:
+                problems.append(path + ": missing/reordered locked publication " + statement)
+                break
+            offset = found + len(statement)
+    surface = sources[GX0057_PATHS[3]].split('        .reset => {', 1)[1].split('\n        },', 1)[0]
+    if surface.find('mutex.lockUncancelable') > surface.find(GX0057_TOKENS[GX0057_PATHS[3]][0]) or 'mutex.lockUncancelable' not in surface:
+        problems.append("UI reset must hold the shared mutex")
+    handler = sources[GX0057_PATHS[2]]
+    if 'self.terminal.cursor.default_blink != null)' not in handler:
+        problems.append("legacy mode 12 default rule changed")
+    for original in ('.cursor_style => self.terminal.setCursorStyle(value)',
+                     '.soft_reset => self.terminal.softReset()',
+                     '.save_mode => self.terminal.modes.save(value.mode)',
+                     'const v = self.terminal.modes.restore(value.mode);',
+                     'self.terminal.resize(', 'self.terminal.deccolm('):
+        if original in handler:
+            problems.append("unprotected cursor write: " + original)
+    return problems
+
+
+def gx0057_save_mode_problems(policy: str) -> list[str]:
+    """XTSAVE must save program blink and republish effective state before return."""
+    lines = policy.replace("\r\n", "\n").splitlines()
+    span = zig_fn_lines(lines, "pub fn saveMode(")
+    if span is None:
+        return ["missing unique saveMode wrapper"]
+    body = "\n".join(lines[span[0]:span[1]])
+    ordered = (
+        'if (mode != .cursor_blinking or self.overrides.blink == null)',
+        'return t.modes.save(mode);',
+        'self.restore(t);',
+        't.modes.save(mode);',
+        'self.apply(t);',
+    )
+    offset = 0
+    for statement in ordered:
+        found = body.find(statement, offset)
+        if found < 0:
+            return ["missing/reordered saveMode operation: " + statement]
+        offset = found + len(statement)
+    return []
+
+
+def gx0057_resize_problems(policy: str) -> list[str]:
+    """Both resize primitives must republish effective state on errors as well."""
+    lines = policy.replace("\r\n", "\n").splitlines()
+    problems = []
+    for method, argument in (("resize", "opts"), ("deccolm", "mode")):
+        span = zig_fn_lines(lines, "pub fn " + method + "(")
+        if span is None:
+            problems.append("missing unique " + method + " wrapper")
+            continue
+        body = "\n".join(lines[span[0]:span[1]])
+        argument_type = 'Resize' if method == 'resize' else 'DeccolmMode'
+        if f'{argument}: @TypeOf(t.*).{argument_type}' not in body:
+            problems.append(method + ": lost terminal argument type")
+        ordered = ('self.restore(t);', 'defer self.apply(t);',
+                   f'try t.{method}(alloc, {argument});')
+        offset = 0
+        for statement in ordered:
+            found = body.find(statement, offset)
+            if found < 0:
+                problems.append("missing/reordered " + method + " operation: " + statement)
+                break
+            offset = found + len(statement)
+    return problems
+
+
+GX0057_APP_TESTS = (
+    (GX0057_PATHS[1], "GX0057 resize termio keeps effective cursor after screen replacement",
+     'try gx_cursor_policy.testResize(Termio, .termio);', '@import("../build_config.zig").app_runtime'),
+    (GX0057_PATHS[2], "GX0057 app stream cursor precedence",
+     'try gx_cursor_policy.testStream(StreamHandler);', 'build_config.app_runtime'),
+    (GX0057_PATHS[2], "GX0057 app stream mode save restore releases program blink",
+     'try gx_cursor_policy.testStreamModeSaveRestore(StreamHandler);', 'build_config.app_runtime'),
+    (GX0057_PATHS[2], "GX0057 resize mode 40 keeps effective cursor after screen replacement",
+     'try gx_cursor_policy.testResize(termio.Termio, .mode_3);', 'build_config.app_runtime'),
+    (GX0057_PATHS[2], "GX0057 resize DECCOLM keeps effective cursor after screen replacement",
+     'try gx_cursor_policy.testResize(termio.Termio, .deccolm);', 'build_config.app_runtime'),
+)
+GX0057_PURE_TESTS = {
+    "src/gx/cursor_policy.zig": (
+        "GX0057 runtime scope",
+        "GX0057 independent overrides and actual cursor queries",
+        "GX0057 reload releases only the removed override and resets discard old requests",
+        "GX0057 screen modes and DECSC DECRC keep program state separate",
+        "GX0057 mode restore cannot bypass explicit blink",
+    ),
+    "src/gx/config_layers.zig": (
+        "GX0057 cursor origins survive layers equal values and copies",
+        "GX0057 cursor priority invalid input empty input and overlay removal",
+        "GX0057 theme cursors stay defaults across conditional replay",
+    ),
+}
+
+
+def gx0057_test_scope_problems(sources: dict[str, str]) -> list[str]:
+    """Exactly five app integration tests need a runtime; all eight pure tests remain."""
+    sources = {path: text.replace("\r\n", "\n") for path, text in sources.items()}
+    problems = []
+    app_bodies = []
+    for path, name, call, runtime in GX0057_APP_TESTS:
+        lines = sources[path].splitlines()
+        span = zig_fn_lines(lines, f'test "{name}" {{')
+        if span is None:
+            problems.append("missing app test: " + name)
+            continue
+        body = "\n".join(lines[span[0] + 1:span[1] - 1])
+        expected = f'if (comptime gx_cursor_policy.enabledFor({runtime})) {{ {call} }} else return error.SkipZigTest;'
+        if squash(body) != squash(expected):
+            problems.append("app call must be inside its compile-time GX gate: " + name)
+        app_bodies.append(body)
+    if sum(body.count('else return error.SkipZigTest;') for body in app_bodies) != 5:
+        problems.append("expected exactly five missing-GX-App skips")
+    for path, names in GX0057_PURE_TESTS.items():
+        lines = sources[path].splitlines()
+        for name in names:
+            span = zig_fn_lines(lines, f'test "{name}" {{')
+            if span is None:
+                problems.append("missing pure test: " + name)
+                continue
+            body = "\n".join(lines[span[0]:span[1]])
+            if 'SkipZigTest' in body:
+                problems.append("pure test must not skip for missing App: " + name)
+        if path.endswith('cursor_policy.zig') and 'SkipZigTest' in sources[path]:
+            problems.append("runtime skips belong only at the five app test calls")
+    return problems
+
+
+class Gx0057ShapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.sources = {path: (ROOT / path).read_text(encoding="utf-8") for path in GX0057_PATHS}
+
+    def test_registered_hooks_lf_crlf(self):
+        patches = parse_registry((ROOT / REGISTRY).read_text(encoding="utf-8"))
+        for path in GX0057_PATHS:
+            self.assertIn(Patch("GX-0057", path, "fork(gx): GX-0057", "active"), patches)
+        self.assertEqual([], gx0057_problems(self.sources))
+        self.assertEqual([], gx0057_problems({p: s.replace("\n", "\r\n") for p, s in self.sources.items()}))
+
+    def test_missing_or_duplicate_hooks_and_guards_are_rejected(self):
+        for path, tokens in GX0057_TOKENS.items():
+            for token in (*tokens, 'fork(gx): GX-0057'):
+                for replacement in ("", token + token):
+                    with self.subTest(path=path, token=token, replacement=replacement):
+                        broken = dict(self.sources)
+                        broken[path] = broken[path].replace(token, replacement, 1)
+                        self.assertTrue(gx0057_problems(broken))
+
+    def test_effective_reset_must_precede_callback(self):
+        path = GX0057_PATHS[2]
+        call = 'self.gx_cursor_policy.reset(self.terminal, .full);'
+        broken = dict(self.sources)
+        broken[path] = broken[path].replace(call, "", 1).replace(
+            'try self.setMouseShape(.text);', 'try self.setMouseShape(.text);\n        ' + call, 1)
+        self.assertTrue(gx0057_problems(broken))
+
+    def test_runtime_gate_and_shadow_scope(self):
+        policy = (ROOT / "src/gx/cursor_policy.zig").read_text(encoding="utf-8")
+        self.assertIn('.gtk, .win32 => true,', policy)
+        self.assertIn('else => false,', policy)
+        self.assertIn('t.screens.generation(key) == saved.generation', policy)
+        self.assertIn('defer self.apply(t);', policy)
+        production = policy.split('test "GX0057 runtime scope"', 1)[0]
+        for forbidden in ('*Screen', 'unlock(', 'messageWriter', 'global.', 't.cursor.is_default ='):
+            self.assertNotIn(forbidden, production)
+        handler = self.sources[GX0057_PATHS[2]]
+        printing = handler.split('.print => {', 1)[1].split('.print_repeat =>', 1)[0]
+        self.assertNotIn('gx_cursor', printing)
+
+    def test_mode_save_shadow_order_and_negative_probes(self):
+        policy = (ROOT / "src/gx/cursor_policy.zig").read_text(encoding="utf-8")
+        self.assertEqual([], gx0057_save_mode_problems(policy))
+        self.assertEqual([], gx0057_save_mode_problems(policy.replace("\n", "\r\n")))
+        start = policy.index('    pub fn saveMode(')
+        end = policy.index('    pub fn restoreMode(', start)
+        body = policy[start:end]
+        for token in ('if (mode != .cursor_blinking or self.overrides.blink == null)',
+                      'return t.modes.save(mode);', 'self.restore(t);',
+                      '        t.modes.save(mode);', 'self.apply(t);'):
+            with self.subTest(token=token):
+                changed = body.replace(token, '', 1)
+                self.assertTrue(gx0057_save_mode_problems(policy[:start] + changed + policy[end:]))
+        changed = body.replace('self.apply(t);', '', 1).replace(
+            'self.restore(t);', 'self.apply(t);\n        self.restore(t);', 1)
+        self.assertTrue(gx0057_save_mode_problems(policy[:start] + changed + policy[end:]))
+
+    def test_resize_shadow_order_and_error_defers(self):
+        policy = (ROOT / "src/gx/cursor_policy.zig").read_text(encoding="utf-8")
+        self.assertEqual([], gx0057_resize_problems(policy))
+        self.assertEqual([], gx0057_resize_problems(policy.replace("\n", "\r\n")))
+        for method, argument in (("resize", "opts"), ("deccolm", "mode")):
+            start = policy.index('    pub fn ' + method + '(')
+            end = policy.index('\n    pub fn ', start + 1)
+            body = policy[start:end]
+            primitive = f'try t.{method}(alloc, {argument});'
+            for old, new in (('self.restore(t);', ''),
+                             ('defer self.apply(t);', ''),
+                             ('defer self.apply(t);', 'self.apply(t);'),
+                             (f'{argument}: @TypeOf(t.*).' + ('Resize' if method == 'resize' else 'DeccolmMode'),
+                              f'{argument}: anytype'),
+                             (primitive, '')):
+                with self.subTest(method=method, old=old, new=new):
+                    changed = body.replace(old, new, 1)
+                    self.assertTrue(gx0057_resize_problems(policy[:start] + changed + policy[end:]))
+            changed = body.replace('defer self.apply(t);', '', 1).replace(
+                primitive, primitive + '\n        defer self.apply(t);', 1)
+            self.assertTrue(gx0057_resize_problems(policy[:start] + changed + policy[end:]))
+
+    def test_app_only_gates_preserve_all_pure_tests(self):
+        sources = dict(self.sources)
+        sources.update({path: (ROOT / path).read_text(encoding="utf-8") for path in GX0057_PURE_TESTS})
+        self.assertEqual([], gx0057_test_scope_problems(sources))
+        self.assertEqual([], gx0057_test_scope_problems({p: s.replace("\n", "\r\n") for p, s in sources.items()}))
+        for path, name, call, runtime in GX0057_APP_TESTS:
+            header = f'test "{name}" {{'
+            lines = sources[path].splitlines()
+            first, last = zig_fn_lines(lines, header)
+            body = "\n".join(lines[first + 1:last - 1])
+            guard = f'if (comptime gx_cursor_policy.enabledFor({runtime}))'
+            for old, new in ((guard, 'if (true)'), (guard, 'if (false)'),
+                             (call, ''), ('else return error.SkipZigTest;', 'else {}')):
+                with self.subTest(test=name, old=old):
+                    broken = dict(sources)
+                    changed = body.replace(old, new, 1)
+                    broken[path] = "\n".join(lines[:first + 1] + [changed] + lines[last - 1:])
+                    self.assertTrue(gx0057_test_scope_problems(broken))
+        for path, names in GX0057_PURE_TESTS.items():
+            for name in names:
+                header = f'test "{name}" {{'
+                for replacement in (header + '\n    return error.SkipZigTest;',
+                                    header.replace('GX0057', 'Removed')):
+                    with self.subTest(test=name, replacement=replacement):
+                        broken = dict(sources)
+                        broken[path] = broken[path].replace(header, replacement, 1)
+                        self.assertTrue(gx0057_test_scope_problems(broken))
+
+    def test_g22_script_and_nested_probe_parse(self):
+        import ast
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        path = ROOT / "test/gui/gtk/G22-cursor-precedence.toml"
+        scenario = tomllib.loads(path.read_text(encoding="utf-8"))
+        tree = ast.parse(scenario["script"])
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'write_text':
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == 'probe':
+                    ast.parse(ast.literal_eval(node.args[0]))
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'reload_probe_source' for target in node.targets):
+                ast.parse(ast.literal_eval(node.value))
+        self.assertIn('run_program(label, configured)', scenario['script'])
+        self.assertIn('reload-explicit', scenario['script'])
+        self.assertIn('reload-removed', scenario['script'])
+
+
+class G22PromptCursorReadTests(unittest.TestCase):
+    """Run the scenario's actual query functions with controlled nonblocking IO."""
+
+    def prompt_fixture(self, reads):
+        import ast
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+
+        path = ROOT / "test/gui/gtk/G22-cursor-precedence.toml"
+        script = tomllib.loads(path.read_text(encoding="utf-8"))["script"]
+        functions = [node for node in ast.parse(script).body
+                     if isinstance(node, ast.FunctionDef) and node.name in ("decrqss", "prompt_cursor")]
+        self.assertEqual(["decrqss", "prompt_cursor"], [node.name for node in functions])
+        clock = [0.0]
+        stopped = [False]
+        identity = {"pid": 321, "birth": 9876, "fd0": "/fake/pty"}
+
+        def stat():
+            fields = ["T" if stopped[0] else "S", *(["0"] * 18), str(identity["birth"])]
+            return "321 (owned probe) " + " ".join(fields)
+
+        def signal_send(handle, signum):
+            self.assertEqual(101, handle)
+            self.assertIn(signum, (19, 18))
+            stopped[0] = signum == 19
+
+        def select_readable(readable, writable, exceptional, timeout):
+            self.assertEqual(([102], [], []), (readable, writable, exceptional))
+            self.assertGreaterEqual(timeout, 0)
+            self.assertLessEqual(timeout, 0.1)
+            clock[0] = round(clock[0] + timeout, 10)
+            # Fail instead of hanging the offline test if the deadline moves.
+            self.assertLessEqual(clock[0], 3.0, "query exceeded its original three-second deadline")
+            return readable, [], []
+
+        fake_os = SimpleNamespace(
+            O_RDWR=1, O_NOCTTY=2, O_NONBLOCK=4,
+            pidfd_open=Mock(return_value=101), open=Mock(return_value=102),
+            read=Mock(side_effect=reads), write=Mock(side_effect=lambda _fd, data: len(data)), close=Mock(),
+        )
+        fake_signal = SimpleNamespace(SIGSTOP=19, SIGCONT=18, pidfd_send_signal=Mock(side_effect=signal_send))
+        scope = {
+            "Path": Mock(return_value=SimpleNamespace(read_text=stat)),
+            "os": fake_os, "signal": fake_signal,
+            "termios": SimpleNamespace(ICANON=2, tcgetattr=Mock(return_value=[0, 0, 0, 0])),
+            "select": SimpleNamespace(select=Mock(side_effect=select_readable)),
+            "time": SimpleNamespace(monotonic=Mock(side_effect=lambda: clock[0])),
+            "sleep": Mock(side_effect=AssertionError("owned probe should stop immediately")),
+            "save": Mock(), "json": json,
+        }
+        # Compile only the two original function ASTs; never execute scenario
+        # setup, process launches, signals, filesystem writes or GUI actions.
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), scope)
+        return SimpleNamespace(query=scope["prompt_cursor"], identity=identity, scope=scope,
+                               os=fake_os, signal=fake_signal, clock=clock, stopped=stopped)
+
+    def assert_query_cleanup(self, fixture):
+        from unittest.mock import call
+        fixture.os.pidfd_open.assert_called_once_with(321)
+        fixture.os.open.assert_called_once_with("/fake/pty", 7)
+        fixture.os.write.assert_called_once_with(102, b"\x1bP$q q\x1b\\")
+        self.assertEqual([call(101, 19), call(101, 18)], fixture.signal.pidfd_send_signal.call_args_list)
+        self.assertEqual([call(102), call(101)], fixture.os.close.call_args_list)
+        self.assertFalse(fixture.stopped[0])
+
+    def test_eagain_then_complete_reply_keeps_single_query(self):
+        import errno
+        import json
+        reply = b"\x1bP1$r4 q\x1b\\"
+        fixture = self.prompt_fixture([BlockingIOError(errno.EAGAIN, "try again"), reply])
+        self.assertEqual(4, fixture.query("reload-removed", fixture.identity))
+        self.assertEqual(2, fixture.os.read.call_count)
+        self.assertEqual(0.2, fixture.clock[0])
+        fixture.scope["save"].assert_called_once()
+        suffix, contents = fixture.scope["save"].call_args.args
+        self.assertEqual("-reload-removed-prompt-query.json", suffix)
+        self.assertEqual({"identity": fixture.identity, "response_hex": reply.hex(), "value": 4}, json.loads(contents))
+        self.assert_query_cleanup(fixture)
+
+    def test_persistent_eagain_fails_at_original_deadline_and_resumes_probe(self):
+        import errno
+        fixture = self.prompt_fixture(BlockingIOError(errno.EAGAIN, "try again"))
+        with self.assertRaises(AssertionError) as failure:
+            fixture.query("reload-removed", fixture.identity)
+        self.assertEqual((b"",), failure.exception.args)
+        self.assertEqual(30, fixture.os.read.call_count)
+        self.assertEqual(3.0, fixture.clock[0])
+        fixture.scope["save"].assert_not_called()
+        self.assert_query_cleanup(fixture)
+
+    def test_other_read_errors_propagate_and_still_resume_probe(self):
+        import errno
+        error = OSError(errno.EIO, "read failed")
+        fixture = self.prompt_fixture(error)
+        with self.assertRaises(OSError) as failure:
+            fixture.query("reload-removed", fixture.identity)
+        self.assertIs(error, failure.exception)
+        self.assertEqual(1, fixture.os.read.call_count)
+        fixture.scope["save"].assert_not_called()
+        self.assert_query_cleanup(fixture)
+
+    def test_prompt_poll_is_capped_by_remaining_deadline(self):
+        fixture = self.prompt_fixture([b'\x1bP1$r4 q\x1b\\'])
+        fixture.clock[0] = 2.99
+        first = [True]
+
+        def monotonic():
+            if first[0]:
+                first[0] = False
+                return 0.0  # Original deadline is 3.0; the next turn starts at 2.99.
+            return fixture.clock[0]
+
+        def readable(readable, writable, exceptional, timeout):
+            self.assertEqual(([102], [], []), (readable, writable, exceptional))
+            self.assertAlmostEqual(0.01, timeout)
+            fixture.clock[0] = 2.995
+            return readable, [], []
+
+        fixture.scope['time'].monotonic.side_effect = monotonic
+        fixture.scope['select'].select.side_effect = readable
+        try:
+            self.assertEqual(4, fixture.query('prompt-before-deadline', fixture.identity))
+        finally:
+            self.assert_query_cleanup(fixture)
+
+    def test_prompt_rejects_complete_reply_at_or_after_deadline_and_cleans_up(self):
+        for completed_at in (3.0, 3.05):
+            with self.subTest(completed_at=completed_at):
+                fixture = self.prompt_fixture([])
+
+                def late_read(fd, size):
+                    self.assertEqual((102, 1024), (fd, size))
+                    fixture.clock[0] = completed_at
+                    return b'\x1bP1$r4 q\x1b\\'
+
+                fixture.os.read.side_effect = late_read
+                try:
+                    with self.assertRaises(TimeoutError):
+                        fixture.query('prompt-late-reply', fixture.identity)
+                finally:
+                    self.assert_query_cleanup(fixture)
+                fixture.scope['save'].assert_not_called()
+                self.assertEqual(1, fixture.os.read.call_count)
+
+
+class G22ReloadProbeTests(unittest.TestCase):
+    """Exercise the actual persistent-probe functions, without signals or a GUI."""
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        cls.path = ROOT / "test/gui/gtk/G22-cursor-precedence.toml"
+        cls.script = tomllib.loads(cls.path.read_text(encoding="utf-8"))["script"]
+        cls.tree = ast.parse(cls.script)
+        source = next(node.value for node in cls.tree.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == 'reload_probe_source' for target in node.targets))
+        cls.probe_tree = ast.parse(ast.literal_eval(source))
+
+    def function(self, tree, name, scope):
+        import ast
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        self.assertEqual(1, len(nodes))
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(self.path), "exec"), scope)
+        return scope[name]
+
+    def query_fixture(self, reads):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        clock = [0.0]
+
+        def readable(fds, writes, errors, timeout):
+            self.assertEqual(([0], [], []), (fds, writes, errors))
+            self.assertGreaterEqual(timeout, 0)
+            self.assertLessEqual(timeout, 0.1)
+            clock[0] = round(clock[0] + timeout, 10)
+            self.assertLessEqual(clock[0], 3.0, "original deadline was extended")
+            return fds, [], []
+
+        fake_os = SimpleNamespace(write=Mock(), read=Mock(side_effect=reads))
+        scope = dict(os=fake_os, select=SimpleNamespace(select=readable),
+                     time=SimpleNamespace(monotonic=lambda: clock[0]))
+        query = self.function(self.probe_tree, 'query_cursor', scope)
+        return query, fake_os, clock
+
+    def test_probe_queries_once_through_partial_reply_and_eagain(self):
+        import errno
+        reply = b'\x1bP1$r4 q\x1b\\'
+        query, fake_os, clock = self.query_fixture([reply[:4], BlockingIOError(errno.EAGAIN, 'again'), reply[4:]])
+        self.assertEqual(reply, query({'issued': 0.0}))
+        fake_os.write.assert_called_once_with(1, b'\x1bP$q q\x1b\\')
+        self.assertEqual(3, fake_os.read.call_count)
+        self.assertEqual(0.3, clock[0])
+
+    def test_probe_eagain_is_bounded_and_expired_request_does_not_query(self):
+        import errno
+        query, fake_os, clock = self.query_fixture(BlockingIOError(errno.EAGAIN, 'again'))
+        with self.assertRaises(TimeoutError):
+            query({'issued': 0.0})
+        self.assertEqual(3.0, clock[0])
+        self.assertEqual(30, fake_os.read.call_count)
+        fake_os.write.assert_called_once_with(1, b'\x1bP$q q\x1b\\')
+        query, fake_os, _ = self.query_fixture([])
+        with self.assertRaises(AssertionError):
+            query({'issued': -3.0})
+        fake_os.write.assert_not_called()
+
+    def test_probe_does_not_swallow_other_read_errors(self):
+        import errno
+        error = OSError(errno.EIO, 'read failed')
+        query, fake_os, _ = self.query_fixture(error)
+        with self.assertRaises(OSError) as failure:
+            query({'issued': 0.0})
+        self.assertIs(error, failure.exception)
+        fake_os.write.assert_called_once_with(1, b'\x1bP$q q\x1b\\')
+
+    def test_probe_rejects_complete_reply_at_or_after_original_deadline(self):
+        for completed_at in (3.0, 3.05):
+            with self.subTest(completed_at=completed_at):
+                query, fake_os, clock = self.query_fixture([])
+
+                def late_read(fd, size):
+                    self.assertEqual((0, 1024), (fd, size))
+                    clock[0] = completed_at
+                    return b'\x1bP1$r4 q\x1b\\'
+
+                fake_os.read.side_effect = late_read
+                with self.assertRaises(TimeoutError):
+                    query({'issued': 0.0})
+                fake_os.write.assert_called_once_with(1, b'\x1bP$q q\x1b\\')
+                self.assertEqual(1, fake_os.read.call_count)
+
+    def test_control_request_binds_run_phase_pid_birth_and_nonce(self):
+        validate = self.function(self.probe_tree, 'validate_request', {})
+        identity = dict(pid=321, birth=9876)
+        request = dict(run='run-1', stage='reload-explicit', pid=321, birth=9876,
+                       nonce='new-nonce', issued=0.0, op='query')
+        validate(request, identity, 'run-1', 'reload-explicit', 'old-nonce')
+        for key, value in (('run', 'other'), ('stage', 'reload-before'), ('pid', 322),
+                           ('birth', 9877), ('nonce', 'old-nonce'), ('nonce', ''), ('op', 'style')):
+            with self.subTest(key=key, value=value), self.assertRaises(AssertionError):
+                validate(dict(request, **{key: value}), identity, 'run-1', 'reload-explicit', 'old-nonce')
+
+    def test_reload_guard_rejects_stopped_probe_and_shell_foreground(self):
+        from types import SimpleNamespace
+        identity, shell = dict(pid=321, birth=9876), dict(pid=123, birth=4567)
+        rows = {321: dict(state='S', ppid=123, pgrp=321, tpgid=321, birth=9876),
+                123: dict(state='S', ppid=1, pgrp=123, tpgid=321, birth=4567)}
+
+        def path(value):
+            pid = int(str(value).split('/')[2])
+            row = rows[pid]
+            fields = [row['state'], str(row['ppid']), str(row['pgrp']), '0', '0', str(row['tpgid']),
+                      *(['0'] * 13), str(row['birth'])]
+            return SimpleNamespace(read_text=lambda: f'{pid} (owned) ' + ' '.join(fields))
+
+        guard = self.function(self.tree, 'reload_owner', dict(Path=path))
+        self.assertEqual(321, guard(identity, shell)['probe']['pid'])
+        for pid, key, value in ((321, 'state', 'T'), (321, 'birth', 9999),
+                                (321, 'ppid', 1), (321, 'tpgid', 123), (123, 'tpgid', 123)):
+            old = rows[pid][key]
+            with self.subTest(pid=pid, key=key, value=value):
+                rows[pid][key] = value
+                with self.assertRaises(AssertionError):
+                    guard(identity, shell)
+                rows[pid][key] = old
+
+    def test_reload_response_requires_matching_phase_pid_nonce(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        for mismatch in (None, 'run', 'stage', 'pid', 'birth', 'nonce', 'issued'):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                control = Path(directory)
+                clock = [0.0]
+                identity, shell = dict(pid=321, birth=9876), dict(pid=123, birth=4567)
+
+                def advance(delay):
+                    clock[0] += delay
+                    request = json.loads((control / 'request.json').read_text())
+                    snapshot = dict(pid=321, birth=9876, ppid=123, state='S', pgrp=321, tpgid=321)
+                    response = dict(request, before=snapshot, after=snapshot,
+                                    response_hex=b'\x1bP1$r4 q\x1b\\'.hex(), value=4, finished=clock[0])
+                    if mismatch:
+                        response[mismatch] = 'wrong'
+                    (control / 'reload-before-fresh.json').write_text(json.dumps(response))
+
+                capture, save = Mock(), Mock()
+                scope = dict(json=json, uuid=SimpleNamespace(uuid4=lambda: SimpleNamespace(hex='fresh')),
+                             time=SimpleNamespace(monotonic=lambda: clock[0]), sleep=advance,
+                             reload_owner=Mock(return_value={}), capture=capture, save=save)
+                self.function(self.tree, 'decrqss', scope)
+                query = self.function(self.tree, 'reload_query', scope)
+                if mismatch:
+                    with self.assertRaises(AssertionError):
+                        query(control, 'run-1', identity, shell, 'reload-before', 4)
+                    capture.assert_not_called()
+                else:
+                    self.assertEqual(4, query(control, 'run-1', identity, shell, 'reload-before', 4))
+                    capture.assert_called_once_with('reload-before')
+
+    def test_reload_never_freezes_probe_or_resends_style(self):
+        import ast
+        for name in ('reload_owner', 'reload_query', 'run_reload_case'):
+            node = next(node for node in self.tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+            for call in (item for item in ast.walk(node) if isinstance(item, ast.Call)):
+                if isinstance(call.func, ast.Name):
+                    self.assertNotIn(call.func.id, ('prompt_cursor', 'expect_prompt', 'run_program'))
+                elif isinstance(call.func, ast.Attribute):
+                    self.assertNotIn(call.func.attr, ('kill', 'killpg', 'pidfd_send_signal'))
+        style_requests = sum(node.value.count(b'\x1b[4 q') for node in ast.walk(self.probe_tree)
+                             if isinstance(node, ast.Constant) and isinstance(node.value, bytes))
+        self.assertEqual(1, style_requests)
+        self.assertIn('priority.append(run_reload_case())', self.script)
+
+
 class Gx0055ShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

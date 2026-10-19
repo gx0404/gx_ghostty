@@ -22,8 +22,19 @@ const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_file = @import("../lib/compat/file.zig");
+// fork(gx): GX-0057 app-only cursor policy; lib-vt never imports termio.
+const gx_cursor_policy = @import("../gx/cursor_policy.zig");
 
 const log = std.log.scoped(.io_exec);
+
+// fork(gx): GX-0057 begin: exercise the real app resize entry with allocator faults.
+// Real app dispatch requires a GX runtime; none has no App wakeup/mailbox host.
+test "GX0057 resize termio keeps effective cursor after screen replacement" {
+    if (comptime gx_cursor_policy.enabledFor(@import("../build_config.zig").app_runtime)) {
+        try gx_cursor_policy.testResize(Termio, .termio);
+    } else return error.SkipZigTest;
+}
+// fork(gx): GX-0057 end
 
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
@@ -187,6 +198,8 @@ pub const DerivedConfig = struct {
     image_storage_limit: usize,
     cursor_style: terminalpkg.CursorStyle,
     cursor_blink: ?bool,
+    // fork(gx): GX-0057 owned values, derived before crossing the thread boundary.
+    gx_cursor_overrides: gx_cursor_policy.Overrides = .{},
     cursor_color: ?configpkg.Config.TerminalColor,
     foreground: configpkg.Config.Color,
     background: configpkg.Config.Color,
@@ -226,6 +239,8 @@ pub const DerivedConfig = struct {
             .image_storage_limit = config.@"image-storage-limit",
             .cursor_style = config.@"cursor-style",
             .cursor_blink = config.@"cursor-style-blink",
+            // fork(gx): GX-0057 only the two GX app runtimes enable explicit priority.
+            .gx_cursor_overrides = if (comptime gx_cursor_policy.enabledFor(@import("../build_config.zig").app_runtime)) @import("../gx/config_layers.zig").cursorOverrides(config) else .{},
             .cursor_color = config.@"cursor-color",
             .foreground = config.foreground,
             .background = config.background,
@@ -321,6 +336,8 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_mailbox = opts.renderer_mailbox,
         .size = &self.size,
         .terminal = &self.terminal,
+        // fork(gx): GX-0057 initialize before publishing the terminal to any thread.
+        .gx_cursor_policy = gx_cursor_policy.State.init(&term, opts.config.gx_cursor_overrides),
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .clipboard_write_limit = opts.config.clipboard_write_limit,
@@ -531,7 +548,9 @@ pub fn resize(
         defer self.renderer_state.mutex.unlock(global.io());
 
         // Update the size of our terminal state
-        try self.terminal.resize(
+        // fork(gx): GX-0057 publish effective cursor before reports or leaving the lock.
+        try self.terminal_stream.handler.gx_cursor_policy.resize(
+            &self.terminal,
             self.alloc,
             .{
                 .cols = grid_size.columns,

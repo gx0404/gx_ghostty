@@ -873,9 +873,20 @@ palette: Palette = .{},
 /// make it difficult to find the cursor.
 @"cursor-opacity": f64 = 1.0,
 
-/// The style of the cursor. This sets the default style. A running program can
-/// still request an explicit cursor style using escape sequences (such as `CSI
-/// q`). Shell configurations will often request specific cursor styles.
+// fork(gx): GX-0057 begin: explicit configuration wins in the two GX apps. Upstream text:
+// /// The style of the cursor. This sets the default style. A running program can
+// /// still request an explicit cursor style using escape sequences (such as `CSI
+// /// q`). Shell configurations will often request specific cursor styles.
+/// The style of the cursor. On GTK and Windows, a successfully parsed explicit
+/// value overrides program requests, including Vim, fzf and shell vi modes.
+/// The GX, system and theme defaults do not lock the cursor. An explicit value
+/// equal to the default still takes priority; an empty value explicitly selects
+/// `block`. Delete the setting from every user layer to release the override.
+/// Configuration reload restores the retained program state when an override
+/// is removed. Shape and `cursor-style-blink` have independent priority.
+/// This also applies without shell integration and with `gx-prompt-cursor = bar`.
+/// Other runtimes, including macOS embedded, retain the default-only behavior.
+// fork(gx): GX-0057 end
 ///
 // fork(gx): GX-0047 begin: the prompt shows this style. Upstream text:
 // /// Note that shell integration will automatically set the cursor to a bar at
@@ -886,7 +897,7 @@ palette: Palette = .{},
 /// (with `cursor-style-blink`): the shell integration resets the cursor to it
 /// before each command. Ghostty GX also shows it at the prompt by default, so
 /// a style that a program left behind is reset when the next prompt appears.
-/// With zsh vi key bindings the prompt still tells the modes apart, with a
+/// Without an explicit GX override, zsh vi key bindings tell the modes apart, with a
 /// bar while inserting and a block in command mode; fish vi key bindings set
 /// the cursor themselves. To get upstream Ghostty's bar at the prompt while
 /// programs keep this style, set `gx-prompt-cursor = bar`. To stop the shell
@@ -903,9 +914,17 @@ palette: Palette = .{},
 ///   * `block_hollow`
 @"cursor-style": terminal.CursorStyle = .block,
 
-/// Sets the default blinking state of the cursor. This is just the default
-/// state; running programs may override the cursor style using `DECSCUSR` (`CSI
-/// q`).
+// fork(gx): GX-0057 begin: blink has its own explicit priority. Upstream text:
+// /// Sets the default blinking state of the cursor. This is just the default
+// /// state; running programs may override the cursor style using `DECSCUSR` (`CSI
+// /// q`).
+/// Sets the blinking state of the cursor. On GTK and Windows, explicit `true`
+/// or `false` overrides DECSCUSR independently of `cursor-style`, including
+/// requests from Vim, fzf and shell vi modes. GX, system and theme defaults do
+/// not acquire this override. An empty value releases it; deleting a setting
+/// reveals lower layers. Reloading releases removed overrides immediately.
+/// Other runtimes, including macOS embedded, treat this as a default only.
+// fork(gx): GX-0057 end
 ///
 /// If this is not set, the cursor blinks by default. Note that this is not the
 /// same as a "true" value, as noted below.
@@ -913,7 +932,8 @@ palette: Palette = .{},
 /// If this is not set at all (`null`), then Ghostty will respect DEC Mode 12
 /// (AT&T cursor blink) as an alternate approach to turning blinking on/off. If
 /// this is set to any value other than null, DEC mode 12 will be ignored but
-/// `DECSCUSR` will still be respected.
+// fork(gx): GX-0057 qualify the upstream DECSCUSR exception.
+/// `DECSCUSR` is respected unless an explicit GTK/Windows blink override applies.
 ///
 /// Valid values are:
 ///
@@ -4185,8 +4205,11 @@ term: []const u8 = "xterm-ghostty",
 ///     upstream Ghostty. Programs that do not request a cursor style of
 ///     their own still use `cursor-style`.
 ///
-/// With zsh vi key bindings both values show a bar while inserting and a
-/// block in command mode; fish vi key bindings set the cursor themselves.
+// fork(gx): GX-0057 prompt policy cannot bypass explicit user settings (inside GX-0010).
+/// On GTK and Windows, explicit `cursor-style` and `cursor-style-blink` take
+/// precedence over both choices, including the requests of zsh/fish vi modes.
+/// Without explicit overrides, zsh shows a bar while inserting and a block
+/// in command mode; fish vi key bindings set the cursor themselves.
 /// This applies to the bash, zsh, fish and elvish integrations. It has no
 /// effect with `shell-integration-features = no-cursor` or without shell
 /// integration, and a change only affects shells started afterwards.
@@ -4905,6 +4928,8 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     conditional: for (new_config._replay_steps.items) |*item| {
         switch (item.*) {
             .expand, .diagnostic => {},
+            // fork(gx): GX-0057 defaults remain non-explicit during theme replay.
+            .gx_default_cursor_arg => {},
 
             // If we see "-e" then we do NOT make the following arguments
             // conditional since they are supposed to be part of the
@@ -5217,6 +5242,14 @@ pub fn parseManuallyHook(
     }
 
     // Keep track of our input args for replay
+    // fork(gx): GX-0057 begin: retain cursor default/theme origin during replay.
+    if (@TypeOf(iter.*) == Replay.Iterator) {
+        if (iter.gxCursorStep()) |step| {
+            try self._replay_steps.append(alloc, try step.clone(alloc));
+            return true;
+        }
+    }
+    // fork(gx): GX-0057 end
     try self._replay_steps.append(
         alloc,
         .{ .arg = try alloc.dupeZ(u8, arg) },
@@ -5597,6 +5630,9 @@ const Replay = struct {
         /// An argument to parse as if it came from the CLI or file.
         arg: [:0]const u8,
 
+        // fork(gx): GX-0057 default cursor inputs never acquire user ownership.
+        gx_default_cursor_arg: [:0]const u8,
+
         /// A base path to expand relative paths against.
         expand: []const u8,
 
@@ -5636,6 +5672,8 @@ const Replay = struct {
                 .@"-e" => self,
                 .diagnostic => |v| .{ .diagnostic = try v.clone(alloc) },
                 .arg => |v| .{ .arg = try alloc.dupeZ(u8, v) },
+                // fork(gx): GX-0057 preserve source through owned configuration copies.
+                .gx_default_cursor_arg => |v| .{ .gx_default_cursor_arg = try alloc.dupeZ(u8, v) },
                 .expand => |v| .{ .expand = try alloc.dupe(u8, v) },
                 .conditional_arg => |v| conditional: {
                     var conds = try alloc.alloc(Conditional, v.conditions.len);
@@ -5655,6 +5693,22 @@ const Replay = struct {
         config: *Config,
         slice: []const Replay.Step,
         idx: usize = 0,
+
+        // fork(gx): GX-0057 begin: next has advanced past its returned argument.
+        fn gxCursorStep(self: *const Self) ?Step {
+            if (self.idx == 0) return null;
+            const step = self.slice[self.idx - 1];
+            return switch (step) {
+                .gx_default_cursor_arg => step,
+                .conditional_arg => |v| if (std.mem.startsWith(u8, v.arg, "--")) conditional: {
+                    if (comptime !@import("../gx/cursor_policy.zig").enabledFor(build_config.app_runtime)) break :conditional null;
+                    const key = v.arg[2 .. std.mem.indexOfScalar(u8, v.arg, '=') orelse v.arg.len];
+                    break :conditional if (gx_config_layers.isCursorKey(key)) step else null;
+                } else null,
+                else => null,
+            };
+        }
+        // fork(gx): GX-0057 end
 
         pub fn next(self: *Self) ?[]const u8 {
             while (true) {
@@ -5701,6 +5755,8 @@ const Replay = struct {
                     },
 
                     .arg => |arg| return arg,
+                    // fork(gx): GX-0057 parse defaults normally while retaining their origin.
+                    .gx_default_cursor_arg => |arg| return arg,
                     .@"-e" => return "-e",
                 }
             }

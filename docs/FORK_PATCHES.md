@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0056）之后的号。在册的 49 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0056，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0057）之后的号。在册的 50 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0057，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -132,6 +132,10 @@
 | GX-0055 | `pkg/fontconfig/build.zig` | `fork(gx): GX-0055` | active |
 | GX-0056 | `src/font/CodepointResolver.zig` | `fork(gx): GX-0056` | active |
 | GX-0056 | `src/font/SharedGrid.zig` | `fork(gx): GX-0056` | active |
+| GX-0057 | `src/config/Config.zig` | `fork(gx): GX-0057` | active |
+| GX-0057 | `src/termio/Termio.zig` | `fork(gx): GX-0057` | active |
+| GX-0057 | `src/termio/stream_handler.zig` | `fork(gx): GX-0057` | active |
+| GX-0057 | `src/Surface.zig` | `fork(gx): GX-0057` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1466,15 +1470,17 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0047 shell 提示符光标：`gx-prompt-cursor`
 
+当前优先级由 GX-0057 补齐：GTK/Windows 的显式 shape/blink 分别高于程序与集成请求；下文 r6 裁定及旧验证数字保留为历史，不再证明显式配置可被 DECSCUSR 覆盖。未显式配置的行为及脚本记号沿用本补丁。
+
 - 文件：`src/config/Config.zig`、`src/termio/Exec.zig`、`src/Surface.zig`、`src/shell-integration/bash/ghostty.bash`、`src/shell-integration/zsh/ghostty-integration`、`src/shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish`、`src/shell-integration/elvish/lib/ghostty-integration.elv`；active，未回馈上游。`src/termio/shell_integration.zig` 不改（`setupFeatures` 与其测试保持上游原文）。新键 `gx-prompt-cursor` 写在 GX-0010 的 GX 键块内、属 GX-0010；值类型 `src/gx/config_types.zig::PromptCursor`，记号逻辑与单测在 `src/gx/prompt_cursor.zig`。
 - 标记：`fork(gx): GX-0047`。Zig：`Exec.zig` 两处单行标记（`Config.gx_prompt_cursor` 字段；`setupFeatures` 之后调用 `src/gx/prompt_cursor.zig::advertise`），`Surface.zig` 一处单行标记（`Exec.init` 传入 `.gx_prompt_cursor`），`Config.zig` 两个文档 begin/end 块（`cursor-style` 的说明段、`shell-integration-features` 的 `cursor` 项），块内以 `// ///` 普通注释保留被替换的上游原文。脚本：`#` 单行标记紧贴改动行；bash、fish、elvish 各为一行标记加一行新增；zsh 为一行标记加三行新增（`bar` 变量与 emacs 判断）和 `*)` 改动行上方一行标记（标记内写着上游原写法 `"\e[$(( 5 + steady )) q"`）。被替换的上游注释原样保留（fish `# Change the cursor to a beam on prompt.`、zsh 行尾 `# bar`）。
 - 原因：r6 C2-G 裁定（合同 §6 06:00、08:05）要求提示符处显示生效配置的 `cursor-style`/`cursor-style-blink`，程序运行期间 DECSCUSR 照常生效；zsh/fish 的 vi 绑定保持上游模式区分；并提供恢复上游行为的开关。这是默认提示符行为改动，独立提交、独立复审，用户可否决。
 - 实现：上游 `setupFeatures` 照旧写 `cursor:blink`/`cursor:steady`；`Exec.Subprocess.init` 随后调用 `advertise`，仅当 `gx-prompt-cursor = config`（默认）且 cursor 特性开启时在该记号后追加 `cursor:config`（已有则不重复）；`bar` 或 `no-cursor` 时 `GHOSTTY_SHELL_FEATURES` 与上游逐字相同。脚本识别 `cursor:config`：bash 的 PS1、elvish 的 before-readline 改发 `CSI 0 SP q`；fish 只在没有 `fish_vi_cursor_handle`（fish 未自管 vi 光标）时发送，上游守卫不变；zsh 只在 `$KEYMAP` 不以 `vi` 开头且 `bindkey -lL main` 显示 main 链接到 emacs 时发 0，vi 绑定保持上游的插入竖线、命令模式块状。zsh 5.9 实测 vi 插入模式的 `$KEYMAP` 也是 `main`，只能查 main 的链接；`bindkey -lL` 需命令替换，所以 emacs 绑定下每次 zle-line-init、line-finish 与切换到非 vi keymap 多一次 fork（WSL 实测约 0.46 ms/次），vicmd/visual/viins 不 fork。
-- 不变量：程序期间 DECSCUSR 不受限；`no-cursor` 不写任何 cursor 记号；PS0、preexec、after-readline 的执行前复位不变；`gx-prompt-cursor = bar` 与上游一致（提示符竖线、程序用 `cursor-style`）；旧脚本或手动加载的旧资源不识别新记号时仍是上游竖线。键只影响之后启动的 shell。
+- 当前不变量：未显式配置的维度在程序期间可由 DECSCUSR 改变；`no-cursor` 不写任何 cursor 记号；PS0、preexec、after-readline 的执行前复位不变；`gx-prompt-cursor = bar` 在无显式 shape 覆盖时保持上游提示符竖线；旧脚本或手动加载的旧资源不识别新记号时仍是上游竖线。键只影响之后启动的 shell。
 - 验证：`gx.prompt_cursor` 两条单测（config 追加且幂等；bar、cursor 关闭、变量缺失保持上游）；Windows `--filter gx. --filter termio.shell_integration` 489 total / 481 pass / 8 skip，seed `0xcc922e59`；GTK `--filter apprt.gtk.gx --filter gx. --filter termio.shell_integration` 564 / 557 / 7，seed `0xdabae607`。Xvfb G22：24 组矩阵核对 shell 实收的 `GHOSTTY_SHELL_FEATURES`、提示符 DECRQSS、程序起始光标、程序 DECSCUSR 2 与回提示符；zsh 在 underline steady 与 GX 默认 blinking block 下 emacs 绑定为配置、vi 插入为竖线、命令模式为块状，回到 emacs 再为配置；`gx-prompt-cursor = bar` 下 bash/zsh 提示符为竖线、程序以配置的块状启动。126 张图经联系表读过。webgen 与 `+show-config --default --docs` 文档完整、无补丁标记泄漏；`+validate-config` 对 `bar`/`config` 退出 0、对非法值退出 1。证据 F3/A4/round3/。
 - 验证边界：fish、elvish、shellcheck 未安装，语法与运行均 PENDING；Windows 同配置终端、macOS 未验证。
 - 同步：更新上游脚本时先取上游主体，再加回 `cursor:config` 的识别；zsh 保持“仅 emacs 绑定发 0”的判断，fish 保留上游 vi 守卫。上游若改变 cursor 记号格式，`advertise` 找不到 cursor 记号就不追加（静默退回上游行为），需同步其单测。
-- 移除条件：上游提供等价的“提示符复位到配置”且保持 DECSCUSR、`no-cursor` 与 vi 语义时，删除全部 GX-0047 标记与改动（Config 文档按块内保留的上游原文恢复），`gx-prompt-cursor` 按键兼容规则处理；若用户否决新默认，把 `gx-prompt-cursor` 默认改为 `bar` 即恢复上游可见行为。七行改为 removed，保留本节历史。
+- 移除条件：上游提供等价的“提示符复位到配置”且保持 DECSCUSR、`no-cursor` 与 vi 语义时，删除全部 GX-0047 标记与改动（Config 文档按块内保留的上游原文恢复），`gx-prompt-cursor` 按键兼容规则处理；仅调整提示符默认时可将 `gx-prompt-cursor` 默认改为 `bar`；GTK/Windows 显式配置仍按 GX-0057 优先。七行改为 removed，保留本节历史。
 
 ## GX-0048 Windows 双击间隔跟随系统设置
 
@@ -1550,3 +1556,21 @@ python -m unittest scripts.test_fork_patches -v
 - 锁与平台：scope 只在 grid 独占锁内桥接 resolver，身份经原子 phase 发布；共享缓存路径只能拒绝，不建立新身份或完成样本，不新增锁或反向取得 renderer 锁。resolver 的 GX 引用受 `.ghostty` 编译期门约束，SharedGrid 本身属于 app，不向 lib-vt 引入 GX/global；实际 lib-vt/WASM 构建仍须验证。
 - 同步与移除：上游改动回退、锁提升、face 加载或 atlas 重试时逐一核对上述边界。上游提供同等完整且有身份绑定的性能事件，或 C6 实验撤销时，先移除调用、import 与内联字段，再移除 helper 并登记 removed；不影响独立的 DirectWrite discovery 诊断。
 - 验证：`Gx0056ShapeTests` 覆盖注册、LF/CRLF、缺 import/字段/任一钩子、lib-vt 门缺失、提前完成与重复钩子。原生状态、真实 shaping、SharedGrid 错误/缓存/atlas 重试测试见 `font_fallback_perf`；Windows 定向候选 40/40，POSIX、lib-vt/WASM、最终 GUI 和十对性能仍 PENDING。工具必须复核 before/after/final 原始日志链、映像身份及守护指标，不能以诊断事件或离线测试代正式采样。
+
+## GX-0057 显式光标配置高于程序与集成请求
+
+- 文件：`src/config/Config.zig`、`src/termio/Termio.zig`、`src/termio/stream_handler.zig`、`src/Surface.zig`；active，未回馈上游。用户明确恢复 phase6-plan §4 C2-G 的「用户配置 > 程序请求 > 集成默认」，取代 r6 合同 05:50/06:00/08:05 的程序期例外；历史报告与旧性能原件不删除、不移签。
+- 来源真源：`src/gx/config_layers.zig::cursorOverrides` 只接受成功解析的输入，复用 `cli.args.parseIntoField`。GX 和系统光标默认记录为私有 `Replay.Step.gx_default_cursor_arg`，主题光标仍记录为 conditional_arg；记录、克隆、finalize、条件重放与 rebuild 保留身份。默认值与用户值相等仍以来源区分，非法高层值不取得所有权；`-e` 后不参与。层序不变：默认 < 用户/全部 include < GUI < CLI < 临时预览。launch profile 目前只选命令等，不存在独立 cursor 层；命令参数不是配置。
+- 行为：GTK 与 Windows GX app 中，显式 `cursor-style` 只锁 shape，显式 `cursor-style-blink=true/false` 只锁 blink，分别压过 Vim/fzf、shell vi 模式和 `gx-prompt-cursor=bar` 的请求。默认/system/theme 不锁 DECSCUSR。空 style 是显式 block；空 blink 是 null，释放 blink 覆盖。GUI 恢复默认通过删键暴露下层；重载删除最后一个显式来源后恢复保留的程序状态，不需程序重新发请求。`GHOSTTY_GX_DEFAULTS=0` 仍关闭分层，不关闭 GX app 的显式优先级。
+- 程序状态：`src/gx/cursor_policy.zig::State` 保存主/备用屏的值与代次、全局 blink，不保留屏指针。`Terminal.cursor.is_default` 仍表示程序选择；DECSCUSR 0、RIS、DECSTR 清掉相应程序请求并使用当前默认。DECSC/DECRC（含 CSI s/u、1048）只存位置、SGR、字符集等，不存 cursor_style/is_default/blink；47/1047/1049 通过 cursorCopy 复制形状，必须经过策略包装。mode 12 的原有非 null default 特例不变；XTSAVE 在同锁内恢复 shadow 后保存程序 blink，再发布 effective 状态，不能把覆盖值写入 saved mode；XTRESTORE 的 `modes.restore` 会先写 mode，接点确保它不能绕过显式 blink。无 blink 覆盖或其他 mode 的保存仍直接透传。
+- 锁：初始化在发布前；其余所有策略操作与终端原语在同一 renderer_state.mutex 内完成。恢复 shadow → 原语 → 保存程序值 → 应用显式值之间不回调、不投递、不解锁；屏切换失败也以 defer 发布 effective 状态。RIS 的策略处理先于 setMouseShape/进度回调；界面 reset 有独立接点。DECSCUSR 与 DECRQSS 在同一块内也立即一致。真实状态是渲染快照与既有 DCS 编码器共同的输入，block_hollow 按既有协议报告为 block 1/2；IME、失焦等渲染规则不变。
+- 边界：策略仅由 gtk/win32 的 DerivedConfig 启用；macOS embedded 与 lib-vt 维持原行为，无 C ABI、Terminal/Screen 公共字段或快照格式变更。Config 内只增私有 replay tag；app 内增 `DerivedConfig.gx_cursor_overrides`、`StreamHandler.gx_cursor_policy` 与 GX helper。Config 字段类型依赖保持轻量。未显式/其他运行时透传原语，不在 print/print_slice 路径加检查。
+- 钩子：Config 的 doc blocks、replay tag/clone/iterator/record；Termio 的 import、derived field/初始化与 handler 初始化；StreamHandler 的 import/state、changeConfig、cursor_style、soft_reset、save_mode、restore_mode、三种屏切换、fullReset 与行为测试入口；Surface 的 reset。完整闭集由 `Gx0057ShapeTests` 锁定，不能只保留 renderer 或查询前修正。
+- 验证：`GX0057` Zig 用例覆盖来源、等值、无效/空值、clone/theme/rebuild、所有 DECSCUSR、独立维度、reload、reset、主/备用屏、模式恢复，app stream 同块请求/DECRQSS 检查实际 mailbox 回复；`Gx0057ShapeTests` 做缺钩子、缺门控、顺序及 LF/CRLF 反证。G22 修订旧硬编码 2 预期，覆盖集成开关、显式维度、include/GUI/CLI、bar 冲突和运行中等值设置增删。新 Zig/GUI/Windows/性能验证由 root 统一安排，未运行均 PENDING，不沿用 GX-0047 旧 PASS。
+- 返修证据：root 报告 `F3/root/c2g-red-20261019-02/` 的 native RED 为 2 项、1 PASS/1 FAIL，seed `0x57001019`。真实 stream 在显式 blink=true 生效后执行 `CSI 6 q`、`?12s`、`?12r`，撤销覆盖后 DECRQSS 期望 6 q、实际 5 q；此失败先于 saveMode 生产修复保留。同批删除设置的测试夹具改为含注释换行后 PASS，未改生产空文件处理。回归同时覆盖反向 blink=false；saveMode 缺守卫、缺恢复/保存/应用及错误顺序由形状反证覆盖。修后 Windows Debug/ReleaseFast 与 GTK 定向集均 53/53 PASS（seed `0x57001019`），包含真实保存/恢复与查询回归。
+- resize 补齐：`Termio.resize`、`StreamHandler.setMode` 的 mode 40 resize 与 DECCOLM 三处新增 GX-0057 接点；两个 GX 包装先恢复程序状态，再以 defer 应用覆盖，确保成功、重建 alternate、回落 primary 和错误返回都在同锁内重新发布 effective 状态，先于 size report、回调与解锁。参数保留 `Terminal.Resize`/`DeccolmMode` 类型，无 Terminal/Exec 改动。`Gx0057ShapeTests` 锁定三处接点、标记、参数类型、先后顺序与 error defer，并对缺失/顺序错误做反证。
+- resize 证据：`F3/root/c2g-resize-red-20261019-03/native.json` 为 seed `0x57001019` 的 saveMode GREEN 1 PASS、resize 三入口 RED 3 FAIL（期望 DECRQSS 3 q、实际 1 q，induced failure/代次前置断言先通过）。测试经真实 FailingAllocator/Terminal/Exec 路径覆盖正常、replacement、replacement 失败回落 primary；Termio/DECCOLM 另验 primary OOM，handler 请求与查询同块。测试保留主屏原始 shape=style、备用屏程序 shape=block；撤销覆盖后 fallback 必须恢复 style，其余恢复 block，blink 均为 false，不把两屏设成同值削弱隔离验证。resize 三入口修后已随 Windows/GTK 的 53 项定向集通过；POSIX none 为 48 PASS/5 环境跳过，五个 App 整合用例在编译期限定 GTK/win32，纯策略与配置用例不跳过。
+- 图证与夹具：Windows W26 的 142 步完成，40/40 原图经 O2 读取、root 抽查 14 张，限定证明实际 system ConPTY 路径的显式形状/闪烁、等值与空值及连续程序重载。GTK G22 原 167 图批次在 reload 查询失败，原件保留；读图发现暂停前台 probe 使 shell 收回终端，不能把旧数值当持续程序证明。补验改为同 PID/birth、前台组与 nonce 绑定的 probe 自查询，不再发送样式，原三秒时限不变；独立 reload-only 补验得到 DECRQSS 4/1/4，6/6 图均由 O2 与 root 读取。静态灭相不推断形状或精确闪烁周期；原完整批次不追改 PASS。普通查询与 probe 均拒绝到达截止时刻后的完整回复，边界反例和清理路径有离线回归。
+- 日志核对：钉版 Zig `lib/compiler/test_runner.zig::log` 仅对 err 累加 log_err_count；testing 日志初值为 warn，定向 filter 未执行 `src/main.zig` 的无名日志级别测试，所以 warn 可打印。`scripts/zig_test.py::classify` 按协议 status/leak/log_err 判定，不以任意 stderr 输出判失败；上述 RED 的 log_err=0，失败来自查询断言。mode 40 的既有 primary OOM log.err 未改，该错误由 Termio/DECCOLM 测试，mode 40 验可恢复分支；新增策略没有日志，不降低 error 等级或吞诊断。
+- 风险与复验：显式用户会主动失去程序的形状/闪烁指示，未显式者保留。重点复验配置加载/重载、C7 闪烁与 terminal-stream 守护；其余历史证据按实际影响及源/映像身份复核。新增公共调用或屏状态写入时检查是否需经过策略，不能在解锁后补应用。
+- 移除条件：上游有等价、区分显式来源的 app 策略与真实状态查询，且以上矩阵通过后，移除四文件钩子与 GX 实现，登记 removed；不因此移除独立的 GX-0047 脚本功能。

@@ -6,8 +6,11 @@
 //! the integrations set a bar at every prompt. For `config`, `advertise` adds
 //! `cursor:config` right after that feature; the bash, zsh, fish and elvish
 //! integrations then send DECSCUSR 0 at the prompt, which shows the configured
-//! `cursor-style` and `cursor-style-blink`. Zsh vi key bindings keep their bar
-//! and block, and fish keeps its own vi cursor. For `bar`, and when the
+//! `cursor-style` and `cursor-style-blink`. Without explicit overrides, zsh vi
+//! key bindings keep their bar and block, and fish keeps its own vi cursor.
+//! GTK/Windows explicit shape and blink settings override every program or
+//! integration request independently (GX-0057), including `bar` and vi modes.
+//! For `bar`, and when the
 //! `cursor` feature is disabled, the variable stays exactly as upstream wrote
 //! it.
 

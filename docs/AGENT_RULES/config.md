@@ -24,7 +24,7 @@
 - `loadRecursiveFiles`：按出现顺序加载 `config-file`，`?` 前缀表示可选，同一路径再次出现记 cycle 诊断；`-e` 及其后的参数始终留在 replay 末尾。
 - `finalize`：先处理 `theme`（`loadTheme` 会整体替换 Config），再补 `font-family-*`、`term`、`command`、`working-directory` 的默认值并夹取数值范围；幂等，但多次调用浪费内存。
 - `Config.parseManuallyHook`：`-e` 吞掉其后全部参数作为 `initial-command`，并隐含设置 `gtk-single-instance`、`quit-after-last-window-closed` 等；其余参数原样记入 replay。
-- replay：`Config._replay_steps` 记录全部输入（`Replay.Step` 的 `arg`、`expand`、`conditional_arg`、`diagnostic`、`-e`）。`loadTheme` 读完主题文件后重放用户输入；`changeConditionalState` 只重放、不重读配置文件（随后的 `finalize` 仍会重新打开主题文件），所以配置文件中途被删也能切换明暗。
+- replay：`_replay_steps` 保存参数、路径、条件、诊断与 `-e`。GX-0057 用 `gx_default_cursor_arg` 区分默认光标输入，主题保持条件身份；显式优先及重载规则见 `FORK_PATCHES.md`。`loadTheme` 重放用户输入；`changeConditionalState` 不重读配置，`finalize` 仍读主题。
 - 条件配置：`src/config/conditional.zig::State`（目前只有 `theme` 明暗与 `os`）。`loadTheme` 把主题文件的每个参数改写成以 `theme == <当前明暗>` 为条件的 `conditional_arg`，再重放用户输入，所以用户设置总是覆盖主题；明暗主题不同时把 `.theme` 记入 `_conditional_set`，并把 `window-theme = auto` 改为 `system`。
 - 主题查找：`src/config/theme.zig::open` 按 `LocationIterator` 先找 `$XDG_CONFIG_HOME/ghostty/themes`，再找资源目录下的 `themes`（由构建依赖 `iterm2_themes` 安装，受 `-Demit-themes` 控制）；非绝对路径的主题名不得含路径分隔符。
 - 诊断：`Config._diagnostics` 的类型是 `src/cli/diagnostics.zig::DiagnosticList`。

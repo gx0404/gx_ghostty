@@ -1,0 +1,808 @@
+id = "W26"
+title = "GX0057: Windows cursor precedence under continuing ConPTY program requests"
+requires = ['file:%ProgramFiles%\PowerShell\7\pwsh.exe']
+# Only the owned app and its isolated profile are changed. No system settings,
+# injected native hooks, terminal-state queries or execution-policy changes.
+# Windows output passes through ConPTY (bundled or system: preserve ghostty.log).
+# ConPTY can consume/normalize DECSCUSR or answer queries itself. A producer
+# receipt below proves Write completed, NOT byte-transparent delivery or the
+# Ghostty terminal's effective state. No DECRQSS/DECRQM assertion is made.
+# FIRST review preflight-unset-*. If shape/blink requests do not appear there,
+# mark that path PENDING/transport-limited; never count the locked cases as PASS.
+# Each phase has four real screen frames over 1.11 s. Blink needs visible on/off
+# evidence at the same cell; identical frames alone cannot prove steady/blink.
+# The program resends every 1.7 s (not every frame, which could restart blink).
+# ConPTY may deduplicate identical requests; receipts do not prove forwarding.
+# Native GX0057 cursor_policy + app stream tests separately cover effective
+# state/query/reload semantics; they do not substitute for these GUI frames.
+# If local PowerShell policy prevents this isolated script from running, keep
+# the run PENDING; do not change policy, install tools, or substitute a VM here.
+# Empty cursor-style successfully parses as explicit block and locks shape;
+# only removing every explicit shape layer releases it. Empty cursor-style-blink
+# parses as null and releases blink to the program's request.
+config = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+"""
+expect = [
+  "preflight-unset-underline-[a-d]: steady underline; first transport control",
+  "preflight-unset-bar-[a-d]: steady bar, visibly different from the underline control",
+  "preflight-unset-blink-[a-d]: blinking bar; on/off evidence required before blink claims",
+  "shape-only-[a-d]: steady underline: configured shape wins, program steady blink remains",
+  "blink-only-[a-d]: blinking bar: configured blink wins, program bar shape remains",
+  "equal-default-[a-d]: blinking block despite steady bar requests; explicit values equal GX defaults",
+  "empty-[a-d]: steady block: empty cursor-style locks block; empty cursor-style-blink releases blink to the program's steady underline request",
+  "explicit-both-[a-d]: steady bar despite continuing blinking underline requests",
+  "reload-remove-shape-[a-d]: steady underline: only shape override removed while the same program runs",
+  "reload-remove-blink-[a-d]: blinking underline: both overrides now absent while the same program runs",
+  "All frames: cursor at row 8 next to cursor here; four frames are temporal samples, not a native state query. Ambiguous blink or failed preflight remains PENDING.",
+  "env/cursor/*.json: the same producer PID sends each phase twice before readiness; producer-only receipts never assert Ghostty state. Reloads use F12 and wait for the owned reload toast to close.",
+  "ghostty.log: retain bundled/system ConPTY identity. Native GX0057 tests and this visual run are separate evidence; no Windows shell-integration or raw VT transport claim.",
+]
+[[step]]
+action = "file"
+path = "cursor/probe.ps1"
+text = '''
+$ErrorActionPreference = 'Stop'
+$root = Join-Path $env:LOCALAPPDATA 'cursor'
+$control = Join-Path $root 'control.txt'
+$e = [char]27
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$previous = ''
+$count = 0
+$next = 0
+try {
+    while ($clock.Elapsed.TotalSeconds -lt 300) {
+        try {
+            $phase = [IO.File]::ReadAllText($control).Trim()
+        } catch [IO.IOException] {
+            # File steps can briefly hold the control file while replacing it.
+            Start-Sleep -Milliseconds 25
+            continue
+        }
+        if ($phase -eq 'stop') {
+            $Host.UI.RawUI.WindowTitle = 'W26 stopped'
+            return
+        }
+        # A file step may briefly truncate while rewriting; never execute it.
+        if ($phase -notmatch '^([a-z0-9-]+)\|([1-6])$') {
+            Start-Sleep -Milliseconds 25
+            continue
+        }
+        $label = $Matches[1]
+        $code = [int]$Matches[2]
+        if ($phase -ne $previous) {
+            $previous = $phase
+            $count = 0
+            $next = 0
+            [Console]::Write("${e}[2J${e}[H W26 $label`r`n DECSCUSR $code; sender PID $PID`r`n Receipt = producer only; inspect actual yellow cursor.`r`n${e}[8;10Hcursor here > ${e}[?25h")
+        }
+        if ($clock.Elapsed.TotalSeconds -ge $next) {
+            [Console]::Write("${e}[$code q")
+            $count++
+            $next = $clock.Elapsed.TotalSeconds + 1.7
+            if ($count -eq 2) {
+                $receipt = @{phase=$label; pid=$PID; request=$code; writes=$count; evidence='producer-only'; utc=[DateTime]::UtcNow.ToString('o')}
+                [IO.File]::WriteAllText((Join-Path $root "$label.json"), ($receipt | ConvertTo-Json -Compress))
+                $Host.UI.RawUI.WindowTitle = "W26 $label ready"
+            }
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'W26 bounded producer timed out'
+} finally {
+    # Restore visibility only; the owned instance is closed by the harness.
+    [Console]::Write("${e}[?25h")
+}
+'''
+
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "preflight-unset-underline|4"
+
+[[step]]
+action = "type"
+text = '''& (Join-Path $env:LOCALAPPDATA 'cursor/probe.ps1')
+'''
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 preflight-unset-underline ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/preflight-unset-underline.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "preflight-unset-underline-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "preflight-unset-underline-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "preflight-unset-underline-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "preflight-unset-underline-d"
+
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "preflight-unset-bar|6"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 preflight-unset-bar ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/preflight-unset-bar.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "preflight-unset-bar-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "preflight-unset-bar-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "preflight-unset-bar-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "preflight-unset-bar-d"
+
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "preflight-unset-blink|5"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 preflight-unset-blink ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/preflight-unset-blink.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "preflight-unset-blink-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "preflight-unset-blink-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "preflight-unset-blink-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "preflight-unset-blink-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+cursor-style = underline
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "shape-only|6"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 shape-only ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/shape-only.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "shape-only-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "shape-only-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "shape-only-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "shape-only-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+cursor-style-blink = true
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "blink-only|6"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 blink-only ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/blink-only.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "blink-only-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "blink-only-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "blink-only-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "blink-only-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+cursor-style = block
+cursor-style-blink = true
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "equal-default|6"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 equal-default ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/equal-default.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "equal-default-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "equal-default-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "equal-default-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "equal-default-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+cursor-style =
+cursor-style-blink =
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "empty|4"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 empty ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/empty.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "empty-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "empty-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "empty-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "empty-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+cursor-style = bar
+cursor-style-blink = false
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "explicit-both|3"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 explicit-both ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/explicit-both.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "explicit-both-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "explicit-both-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "explicit-both-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "explicit-both-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+cursor-style-blink = false
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "reload-remove-shape|3"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 reload-remove-shape ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/reload-remove-shape.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "reload-remove-shape-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "reload-remove-shape-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "reload-remove-shape-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "reload-remove-shape-d"
+
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = """
+command = pwsh.exe -NoLogo -NoProfile
+language = en
+shell-integration = none
+window-width = 80
+window-height = 20
+font-size = 20
+cursor-color = #ffff00
+background = #101010
+foreground = #eeeeee
+keybind = f12=reload_config
+confirm-close-surface = false
+"""
+
+[[step]]
+action = "key"
+keys = "f12"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+timeout = 6
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "reload-remove-blink|3"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 reload-remove-blink ready$"
+timeout = 10
+
+[[step]]
+action = "wait_file"
+path = "{env}/cursor/reload-remove-blink.json"
+pattern = '"evidence":"producer-only"'
+
+[[step]]
+action = "assert_responsive"
+
+[[step]]
+action = "capture"
+name = "reload-remove-blink-a"
+
+[[step]]
+action = "sleep"
+seconds = 0.31
+
+[[step]]
+action = "capture"
+name = "reload-remove-blink-b"
+
+[[step]]
+action = "sleep"
+seconds = 0.37
+
+[[step]]
+action = "capture"
+name = "reload-remove-blink-c"
+
+[[step]]
+action = "sleep"
+seconds = 0.43
+
+[[step]]
+action = "capture"
+name = "reload-remove-blink-d"
+
+[[step]]
+action = "file"
+path = "cursor/control.txt"
+text = "stop"
+
+[[step]]
+action = "wait_title"
+pattern = "^W26 stopped$"
+timeout = 10

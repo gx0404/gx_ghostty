@@ -50,10 +50,11 @@
 - 配置诊断：`language` 填了不支持的值、`gui-settings.ghostty` 读不出来时会报告配置错误，`ghostty +validate-config` 因此返回 1。
 - GTK 切换界面语言与重新加载配置时在内存里重建配置，不再重新读盘。
 - Windows 便携包、安装包、Linux deb 与 debian13 GTK 压缩包附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本（压缩包在 `usr/share/doc/ghostty-gx/`，另附 Ghostty 的 MIT 许可）。
-- shell 集成的光标特性在提示符处显示配置的 `cursor-style` 与闪烁设置（GX 默认为闪烁块状），程序留下的光标形状在下一个提示符复位；程序运行期间仍可用 DECSCUSR 改变光标。zsh 与 fish 的 vi 绑定保持插入竖线、命令模式块状。想要上游的“提示符竖线、程序用配置样式”设 `gx-prompt-cursor = bar`；`no-cursor` 行为不变。
+- shell 集成的光标特性在提示符处显示配置的 `cursor-style` 与闪烁设置（GX 默认为闪烁块状），程序留下的光标形状在下一个提示符复位；未显式设置的维度仍可由程序 DECSCUSR 改变，zsh 与 fish 的 vi 绑定保留模式指示。未显式设置形状时，`gx-prompt-cursor = bar` 恢复上游提示符竖线；`no-cursor` 只关闭集成脚本的光标处理。
 
 ### Fixed
 
+- GTK/Windows 光标优先级：成功解析的显式 `cursor-style` 和 `cursor-style-blink=true/false` 分别高于 Vim/fzf、shell vi 模式及 `gx-prompt-cursor=bar` 的请求；等于默认值也优先。GX、系统与主题默认不锁光标，未显式用户保留程序控制。空 style 显式选择 block，空 blink 释放闪烁覆盖；重载删去最后一项显式来源后恢复程序状态。实际终端状态、渲染与 DECRQSS 一致，集成关闭时同样生效；macOS embedded 与 lib-vt 维持原行为。历史 C2-G 报告保留，新行为需重新验收。
 - Windows 尺寸提示在传统绘制路径中优先复用软件 DC/DIB，避免首次显示时创建独立的 HWND 渲染目标；提示的出现时机、窗格位置和首帧失败处理不变，DComp 仍是默认关闭的可选实验路径。本轮候选未再观察到原先的固定慢点，但 P7 的“超时次数严格少于旧版”仍未满足，不宣称该性能门通过。
 - Windows C7 采样明确记录 CPU、PDH 与呈现计数的实际起止范围；准备工作移到窗口外，缺少计划周期点或超出事前确定的计时精度时不再产出正式性能指标，失败原始数据仍保留。
 - Windows C7 性能夹具在被测窗口与失焦辅助窗口同名时，用 PDH 原生实例索引关联线程计数；同时校验本机路径、实际计数器类型及原始数组的完整覆盖，无法消歧仍保留缺测，不改用估算值。

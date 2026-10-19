@@ -70,6 +70,7 @@ const gui_settings = @import("gui_settings.zig");
 const i18n = @import("i18n.zig");
 const perf = @import("perf.zig");
 const gx_theme = @import("theme.zig");
+const cursor_policy = @import("cursor_policy.zig");
 
 const log = std.log.scoped(.gx_config);
 
@@ -196,6 +197,49 @@ const defaults_location = "<Ghostty GX defaults>";
 
 /// A recorded configuration input (`Config._replay_steps`).
 const Step = std.meta.Elem(@FieldType(@FieldType(Config, "_replay_steps"), "items"));
+
+/// Only successfully parsed explicit cursor inputs acquire an override.
+/// Defaults retain a distinct replay tag; themes retain their conditional tag.
+/// Equal values still count, and arguments after -e belong to the child.
+pub fn cursorOverrides(config: *const Config) cursor_policy.Overrides {
+    var result: cursor_policy.Overrides = .{};
+    // Reuse the parser and reset defaults without loading files or allocating.
+    const Values = struct {
+        @"cursor-style": @FieldType(Config, "cursor-style") = .block,
+        @"cursor-style-blink": @FieldType(Config, "cursor-style-blink") = null,
+    };
+    var values: Values = .{};
+    var buffer: [0]u8 = .{};
+    var scratch: std.heap.FixedBufferAllocator = .init(&buffer);
+    for (config._replay_steps.items) |step| {
+        const source: struct { []const u8, bool } = switch (step) {
+            .arg => |arg| .{ @as([]const u8, arg), true },
+            .gx_default_cursor_arg => |arg| .{ @as([]const u8, arg), false },
+            .conditional_arg => |v| conditional: {
+                for (v.conditions) |cond| {
+                    if (!config._conditional_state.match(cond)) break :conditional .{ @as([]const u8, ""), false };
+                }
+                break :conditional .{ v.arg, false };
+            },
+            .@"-e" => break,
+            else => continue,
+        };
+        const arg, const explicit = source;
+        const key = argKey(arg) orelse continue;
+        if (!isCursorKey(key)) continue;
+        const value = if (std.mem.indexOfScalar(u8, arg, '=')) |eq| arg[eq + 1 ..] else null;
+        cli.args.parseIntoField(Values, scratch.allocator(), &values, key, value) catch continue;
+        if (std.mem.eql(u8, key, "cursor-style")) {
+            result.style = if (explicit) values.@"cursor-style" else null;
+        } else result.blink = if (explicit) values.@"cursor-style-blink" else null;
+    }
+    return result;
+}
+
+/// Cursor keys whose source must survive theme/conditional configuration replay.
+pub fn isCursorKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "cursor-style") or std.mem.eql(u8, key, "cursor-style-blink");
+}
 
 /// The keys whose values replace, rather than extend, the values from
 /// lower layers, with the step that resets each of them.
@@ -621,6 +665,7 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
 fn cloneStep(arena: Allocator, step: Step) Allocator.Error!Step {
     return switch (step) {
         .arg => |arg| .{ .arg = try arena.dupeZ(u8, arg) },
+        .gx_default_cursor_arg => |arg| .{ .gx_default_cursor_arg = try arena.dupeZ(u8, arg) },
         .expand => |base| .{ .expand = try arena.dupe(u8, base) },
         .conditional_arg => |value| .{ .conditional_arg = .{
             .conditions = conditions: {
@@ -700,9 +745,13 @@ fn effectiveDefaults(arena: Allocator, raw: []const Step, user_font: bool, blink
     var result: std.ArrayList(Step) = .empty;
     for (raw) |step| {
         if (user_font and step == .arg and stepsSet(&.{step}, "font-codepoint-map")) continue;
-        try result.append(arena, step);
+        const tagged: Step = if (step == .arg and isCursorKey(argKey(step.arg) orelse ""))
+            .{ .gx_default_cursor_arg = step.arg }
+        else
+            step;
+        try result.append(arena, tagged);
     }
-    if (blink == false) try result.append(arena, .{ .arg = "--cursor-style-blink=false" });
+    if (blink == false) try result.append(arena, .{ .gx_default_cursor_arg = "--cursor-style-blink=false" });
     return result.items;
 }
 
@@ -998,6 +1047,121 @@ test "the embedded defaults parse cleanly" {
     try testing.expect(gx_entries[1].action.equal(.{ .gx = .keybinds }));
     try testing.expectEqualStrings("Main Menu", gx_entries[2].title);
     try testing.expect(gx_entries[2].action.equal(.{ .gx = .main_menu }));
+}
+
+test "GX0057 cursor origins survive layers equal values and copies" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const raw = "cursor-style = block\ncursor-style-blink = true\n";
+    const user = try dir.write(arena, "cursor.ghostty", raw);
+    const include = try dir.write(arena, "include.ghostty", "config-file = cursor.ghostty\n");
+    const include_arg = try std.fmt.allocPrintSentinel(arena, "--config-file={s}", .{user}, 0);
+    const cases = [_]struct { sources: TestSources, explicit: bool }{
+        .{ .sources = .{ .defaults_text = raw }, .explicit = false },
+        .{ .sources = .{ .defaults_text = raw, .system_cursor_blink = false }, .explicit = false },
+        .{ .sources = .{ .defaults_text = raw, .user_path = user }, .explicit = true },
+        .{ .sources = .{ .defaults_text = raw, .user_path = include }, .explicit = true },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{include_arg} }, .explicit = true },
+        .{ .sources = .{ .defaults_text = raw, .overlay_path = user }, .explicit = true },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{ "--cursor-style=block", "--cursor-style-blink=true" } }, .explicit = true },
+        .{ .sources = .{ .defaults_text = raw, .overrides = &.{ "--cursor-style=block", "--cursor-style-blink=true" } }, .explicit = true },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{ "-e", "vim", "--cursor-style=block", "--cursor-style-blink=true" } }, .explicit = false },
+        .{ .sources = .{ .defaults_text = raw, .user_path = user, .args = &.{"--config-default-files=false"} }, .explicit = false },
+        .{ .sources = .{ .defaults_text = raw, .args = &.{"--gx-launch-profile=Test=direct:vim --cursor-style=bar"} }, .explicit = false },
+    };
+    for (cases) |case| {
+        var cfg = try loadWith(alloc, case.sources);
+        defer cfg.deinit();
+        try expectNoDiagnostics(&cfg);
+        const expected: cursor_policy.Overrides = if (case.explicit) .{ .style = .block, .blink = true } else .{};
+        try testing.expectEqualDeep(expected, cursorOverrides(&cfg));
+        var clone = try cfg.clone(alloc);
+        defer clone.deinit();
+        try testing.expectEqualDeep(expected, cursorOverrides(&clone));
+        var rebuilt = try rebuild(&clone, alloc, &.{});
+        defer rebuilt.deinit();
+        try testing.expectEqualDeep(expected, cursorOverrides(&rebuilt));
+    }
+}
+
+test "GX0057 cursor priority invalid input empty input and overlay removal" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const user = try dir.write(arena, "cursor.ghostty", "cursor-style = bar\ncursor-style-blink = false\n");
+    const overlay = try dir.write(arena, "gui-settings.ghostty", "cursor-style = underline\ncursor-style-blink = true\n");
+    var layers = try Layers.read(alloc, TestSources{ .defaults_text = "cursor-style=block\ncursor-style-blink=true\n", .user_path = user, .overlay_path = overlay });
+    defer layers.deinit();
+    var cfg = try layers.build(alloc, &.{ "--cursor-style=block_hollow", "--cursor-style-blink=false" });
+    defer cfg.deinit();
+    try testing.expectEqualDeep(cursor_policy.Overrides{ .style = .block_hollow, .blink = false }, cursorOverrides(&cfg));
+    var invalid = try layers.build(alloc, &.{ "--cursor-style=invalid", "--cursor-style-blink=invalid" });
+    defer invalid.deinit();
+    try testing.expect(!invalid._diagnostics.empty());
+    try testing.expectEqualDeep(cursor_policy.Overrides{ .style = .underline, .blink = true }, cursorOverrides(&invalid));
+    var empty = try rebuild(&cfg, alloc, &.{ "--cursor-style=", "--cursor-style-blink=" });
+    defer empty.deinit();
+    try testing.expectEqualDeep(cursor_policy.Overrides{ .style = .block }, cursorOverrides(&empty));
+    try layers.setOverlay("cursor-style", &.{});
+    try layers.setOverlay("cursor-style-blink", &.{});
+    var removed = try layers.build(alloc, &.{});
+    defer removed.deinit();
+    try testing.expectEqualDeep(cursor_policy.Overrides{ .style = .bar, .blink = false }, cursorOverrides(&removed));
+    // A disk reload with the last explicit input removed releases ownership.
+    // TestSources uses loadFile directly, unlike production loadDefaultFiles
+    // through loadOptionalFile. Keep the input nonempty to test removed keys,
+    // rather than the optional-file handling of a zero-byte file.
+    _ = try dir.write(arena, "cursor.ghostty", "# Cursor overrides removed.\n");
+    _ = try dir.write(arena, "gui-settings.ghostty", "# Cursor overrides removed.\n");
+    var reloaded = try loadWith(alloc, TestSources{ .defaults_text = "cursor-style=block\ncursor-style-blink=true\n", .user_path = user, .overlay_path = overlay });
+    defer reloaded.deinit();
+    try expectNoDiagnostics(&reloaded);
+    try testing.expectEqualDeep(cursor_policy.Overrides{}, cursorOverrides(&reloaded));
+    var invalid_only = try loadWith(alloc, TestSources{ .defaults_text = "cursor-style=block\n", .args = &.{"--cursor-style=invalid"} });
+    defer invalid_only.deinit();
+    try testing.expectEqualDeep(cursor_policy.Overrides{}, cursorOverrides(&invalid_only));
+}
+
+test "GX0057 theme cursors stay defaults across conditional replay" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var scratch: ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const light = try dir.write(arena, "Light", "cursor-style=bar\ncursor-style-blink=false\n");
+    const dark = try dir.write(arena, "Dark", "cursor-style=underline\ncursor-style-blink=true\n");
+    const theme_arg = try std.fmt.allocPrintSentinel(arena, "--theme=light:{s},dark:{s}", .{ light, dark }, 0);
+    var cfg = try loadWith(alloc, TestSources{ .defaults_text = "", .args = &.{theme_arg} });
+    defer cfg.deinit();
+    try expectNoDiagnostics(&cfg);
+    try testing.expectEqualDeep(cursor_policy.Overrides{}, cursorOverrides(&cfg));
+    var state = cfg._conditional_state;
+    state.theme = if (state.theme == .light) .dark else .light;
+    var changed = (try cfg.changeConditionalState(state)).?;
+    defer changed.deinit();
+    if (comptime cursor_policy.enabledFor(build_config.app_runtime)) {
+        try testing.expectEqualDeep(cursor_policy.Overrides{}, cursorOverrides(&changed));
+    }
+    var explicit = try rebuild(&changed, alloc, &.{ "--cursor-style=block", "--cursor-style-blink=true" });
+    defer explicit.deinit();
+    try testing.expectEqualDeep(cursor_policy.Overrides{ .style = .block, .blink = true }, cursorOverrides(&explicit));
+    // Loading without GX layers has no artificial default cursor arguments.
+    var upstream = try Config.default(alloc);
+    defer upstream.deinit();
+    var it = cli.args.sliceIterator(&.{ "--cursor-style=block", "--cursor-style-blink" });
+    try upstream.loadIter(alloc, &it);
+    try testing.expectEqualDeep(cursor_policy.Overrides{ .style = .block, .blink = true }, cursorOverrides(&upstream));
 }
 
 test "the embedded defaults set no colors" {

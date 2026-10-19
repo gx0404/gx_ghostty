@@ -5232,7 +5232,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .reset => {
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
-            self.renderer_state.terminal.fullReset();
+            // fork(gx): GX-0057 the UI reset must discard shadow cursor requests under the same lock.
+            self.io.terminal_stream.handler.gx_cursor_policy.reset(self.renderer_state.terminal, .full);
         },
 
         .start_search => {
