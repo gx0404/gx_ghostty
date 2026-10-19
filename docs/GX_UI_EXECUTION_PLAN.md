@@ -1,10 +1,46 @@
 # GX UI 当前执行计划：单对话原生子智能体、集中验证、R6 收口
 
+## 当前检查点（2026-10-19，r9）
+
+本节是当前执行口径；后文 10-18/r5 的“当前状态”“最新候选”“已无额外实现工作”及批次收尾均为历史记录，正文原样保留，不代表 r9 已完成。总状态仍为 **`not_complete`**；142 叶正式账本 `.local/evidence/R5/execution-20261013/leaf-matrix.json` 的 **`results` 仍为 0**，候选映射与工具独审、离线 GREEN 均不代实测 PASS。下称 F3 为 `.local/evidence/R5/execution-20261013/final-r3`，表中路径相对 `F3/root/`。
+
+- 用户裁定（已写入 `F3/r6-contract.md` 的 2026-10-19 补充）：C2-G **显式配置始终优先**，不只在 shell 提示符处；形状与闪烁分别约束，显式等于默认值也有效。修复已提交 `805fa4556`；旧解释与旧证据保留，不能据此签完整 PASS。Win11 无系统设置副作用的隔离普通功能允许在宿主补验，仍不改宿主系统设置；跨账户、安装升级/注册冲突、DPI/高对比/勿扰等系统改动留 VM，Win11 不可代证 Win10。
+- 身份：当前 Git HEAD 为 `805fa4556`、tree 为 `521b0c2c72ba0a29af107dd5f2630149ff1671da`；r9 构建身份仍是 `dc02219fe`、tree `08e903eba89f6cd8eefa466b8a1bfbf205d71dd3`、`source_dirty=true` 加 `r9-current-bind-20261019-01/native-source-before.json` 的文件哈希。root 本次回传已核对当前 1543/1543 native 文件与该清单一致，不倒写为构建于当前 HEAD。r9 app SHA256 为 `d98ad539f1c94387001f052fd8a3610c7af4fdc7787bbfb99d76c0fe44375861`；root 核对原执行目录没有 ConPTY/OpenConsole 旁车。
+- 构建次数：r9 已超出下文原定“最多 r8 后冻结”的上限，是为实际缺陷修复（含落实 C2-G 原计划语义的优先级修复与测试运行时守卫）追加的实际轮次；原上限不倒改，也不因此认定 r9 已是签收完成的 rF。
+
+原报告中的视觉 PENDING 字段保留；已读图结论与读取记录是否归档分别核对，未归档不等于未读。
+
+| 核对项 | 原始入口 | 当前可记录的结论与边界 |
+|---|---|---|
+| r9 构建与测试 | `r9-current-bind-20261019-01/`：`windows-build.exit`、`gtk-build-receipt.json`、`rf-targeted.json`、`windows-main-final.json`、`windows-main-exact-failure.json` | Windows/GTK 构建记录 exit 0；定向 **53/53 PASS**。Windows 全量 **FAIL**：5255 总、5179 PASS、73 SKIP、3 个符号链接 `PermissionDenied`；D28 单项复现仍 FAIL。GTK receipt `perf_eligible=false`，不代性能验收。 |
+| C2-G | `c2g-w26-r9-20261019-01/`；`c2g-reload-supplement-20261019-02/run/G22/` | W26 SUMMARY 为 OK，已有 O2 40 图及 root 抽查 14 图报告；其 `build-identity-win.json` 是 `ac4c068e…25955` 候选且 `not_rF=true`，不能混写成 `d98ad539…75861` 的新运行。GTK 补验 meta exit 0，原生 DECRQSS 为 **4→1→4**；本检查点不扩大为完整 C2-G PASS。 |
+| Session | `r9-session-roundtrip-20261019-01/report.json`；`r9-session-boundaries-20261019-01/report.json` | roundtrip 两次、缺失 profile 与 CLI 优先级的原生检查记 PASS。`dual_writer`：**旧夹具检测到归档变化，写者归因未成立；原 FAIL 保留，改进夹具待实测**，不认定产品锁缺陷。root 离线反例中首写者启动 300 ms 合法 debounce 可在旧 before 后落盘，第二写者零写也会触发旧断言。root 此前回报 session 定向 **18/18 PASS**；后续独审发现“暂停成功→恢复标志设定”间异常可遗留进程暂停，作者返修中，**旧版不得实跑**。原报告视觉字段仍 PENDING，单测不代场景或 GUI 签收。 |
+| UIA | `r9-uia-terminal-events-20261019-01/report.json`、`reviews/UIA-05.json`、`reviews/UIA-06.json` | 终端节点、分屏焦点与真实客户端 N2–N4 事件的自动检查 PASS；报告仍为 `PENDING_VISUAL_REVIEW`，不代讲述人、Win10 或完整无障碍签收。 |
+| P6 诊断 | `p6-fixture-diagnostic-r9-20261019-{01,02}/{quiet,measure}/RESULT.json` | 01 DRIVER_ERROR 原件保留；02 quiet **VALID / COMPLETE**、quiet/measure exit 0，仅诊断 **1 对**。old 缺 UIA、`theme.reload=not_instrumented/n0`；r9 动作前 `0x96f` 仅证明选中 BlueMatrix，动作后才见 Previewing、`theme.reload=1`。root 全读 4 图（old GX Mocha→Kanso Pearl）；O2 Nash **4/4 PASS**，仅限真实选项移动与动作后 Previewing，报告未落盘。**正式门 n0**，无性能结论。 |
+| 验证回归 | root 回报 | 工具：Windows **443 项、3 SKIP**，WSL **443 项、6 SKIP**；完整框架 **1530 项、17 SKIP**；rules/version/kb/i18n/pinyin/fluent/graph checks 均 exit 0。此文档排除于 KB 语料，不重生 KB；回归检查不代 P6 正式门。 |
+| P4 / P7 | `p4-r7-20261019-02/measure/RESULT.json`；`p1-p7-r7-20261019-01/measure/`；`p1-p7-r8candidate-20261019-01/measure/`（两批 `RESULT.json` 的 `runs[].path` 指向逐轮原始 JSON）；后者目录上层 `engineering-review.json` | **P4/P7 FAIL 保留**。P4 新臂绝对门仍失败。P7 逐轮原始 `setwindowpos_ms ≥16` 计数：r7 为 old **1/60**、new **10/60**；后续 r8 候选为 old **0/60**、new **0/60**，两批 quiet VALID，后者仍未满足严格减少，数值门 **FAIL**。captured、exit 0 及原件的严格终帧/视觉 PENDING 不覆盖该结论，也不能据此否定已读图记录。 |
+
+CI 已只读核对：[push 39206683669](https://github.com/gx0404/gx_ghostty/actions/runs/39206683669) 与 [dispatch 39206713871](https://github.com/gx0404/gx_ghostty/actions/runs/39206713871) 均已完成且 **failure**，HEAD 均为 `805fa4556`。唯一失败 job 是 `lib-vt-cross (x86_64-windows-gnu)`：`pkg/translate-c/build.zig.zon:15` 下载 Codeberg 的 translate-c 时 `NameServerFailure`。其余已执行 job 成功；push 的 macos/gtk-smoke skipped，dispatch 两项均 success；不称整次 CI 绿，也不代 macOS app GUI 验收。核对入口：`gh run view <run-id> --repo gx0404/gx_ghostty --json status,conclusion,headSha,jobs` 与 `--log-failed`。
+
+r9 离线包仅记 **PASS_SCOPED（包构造与内容核验）**：root 已完成 `gx_windows_package.py --prefix zig-out-delivery-r9 --output-dir <F3>/root/r9-package-20261019-01/dist --offline`，无 `--build`、未安装。该 dist 中 zip 为 85,509,986 B、SHA256 `2409eb885e4810f4b9a5be0df717dd5a296369d7d113bc337d803ba3d9e559c7`；setup 为 60,855,398 B、SHA256 `85c62fec7dc2041211d53dd78242c3312afab866650455cb3d2110a9748166ac`。只读内容核验确认 ZIP 内 exe 与上述 r9 哈希一致，pinyin-data/Unicode/Fluent 三许可与 Git HEAD 真源逐字节一致；ZIP 含钉版 `conpty.dll`（`5afea6c9…34852`）与 `OpenConsole.exe`（`6f8e68de…5737`）。这不代包内旁车路径、安装或 GUI 验收。
+
+剩余动作由 root 统一安排，不因本次文档更新重跑全量：
+
+1. 完成 session 暂停恢复异常窗的返修与增量独审后再安排双写实测，旧版不得实跑；P6 诊断读图已完成，正式门仍待补，1 对诊断不充作正式样本。旧夹具 FAIL 和诊断原件保留，归因未成立的不写成产品缺陷，单测绿不升级为场景绿。
+2. 核对 C2-G、Session、UIA 等已有截图的逐图结论及对应 app 身份；读取记录未落盘时不称“已归档”。完成 r9/rF 绑定、复用范围裁决后才逐叶写正式结果，142 叶候选清单不等于签收。
+3. 保留 P4/P7 FAIL 与其余平台/硬件等缺口；按原门槛在有效环境补测。由 root 决定补验离线包安装、GUI 与旁车路径，并处理 Codeberg DNS 后的 cross-win CI 重试，不以包或工具检查代证。
+
+本节是计划要求的跟进文档，**不代替被 hook 拒绝的证据归档**。
+
+## 历史依据（截至 2026-10-18，正文原样保留）
+
 本计划依据当前对话 2026-10-14 的授权、2026-10-17 的模型分工更新及 2026-10-18 第 6 阶段与后续裁定，覆盖旧交接文档的任务组织、构建频次和提交授权；功能范围仍是 F1–F10，原完整验收契约（`docs/GX_UI_REMAINING_PLAN.md`）中的门不因本计划而视为通过。原定截止北京时间 2026-10-14 02:48 **已超期**，如实保留，已用时间不清零。当前总状态 **`not_complete`**。
 
 ## 第 6 阶段（2026-10-18 起，进行中）
 
 本节只概括第 6 阶段的安排，不记录任何结论。完整真源是用户批准的计划原文 `.local/evidence/R5/execution-20261013/final-r3/phase6-plan.md`（该目录下称 F3）与子智能体共同合同 `F3/r6-contract.md`；本节与二者不一致时以原文为准。总状态仍为 `not_complete`，后文各节的历史记录保持原样。
+
+本阶段最新模型分工、安静判据与授权继续有效；下列波次保留原安排，r9 的实际执行与原上限偏离见文首检查点。
 
 - 目标：在本机、Win11/Win10 VM、WSL 与 gx-ci 能覆盖的范围内，把 C1–C8、V1–V7、P00–P9 与远程性能、8 组功能边界、平台项、142 叶签收与 R6 收口逐项做出确定结论；发现缺陷就修，不降门槛，不改写历史结论。
 - 结论口径：PASS；FAIL（已尝试修复，原件保留）；PENDING（写明环境原因与补验命令）；BLOCKED（附轮询记录）。142 叶另可记 PASS_SCOPED（列缺口），C 项另可记 INSUFFICIENT，见下文与 F3。
@@ -32,7 +68,7 @@
 - 用户已授权把全部已有与新增改动做本地阶段 commit，无需逐次确认：精确暂存、提交信息按根 `AGENTS.md`「提交规范」。不 push、不建 PR/Issue/tag/release、不新增下载，不触碰 `GX_API`。
 - 主树按文件单写者工作；所有权按文件显式移交；状态经原生消息回传，不共写状态文件。文档、CHANGELOG、补丁登记与证据导航由文档工位独占，证据 JSON 由机械工位维护。
 
-## 当前状态（2026-10-18 核对）
+## 历史｜当前状态（2026-10-18 核对）
 
 - 已有本地阶段提交：`8a2b4bb59` 保存整体实现，`de3149e1f` 修 GTK 恢复泄漏，`03c8e138f` 隔离 VM 单测并核验容器归属，`c9dd5eb7c` 修 ReleaseFast 远程粘贴事务身份，`ff41652c2` 修远程取消、映射替换和退出清理，`b0de75a1b` 补远程压力与焦点时序夹具，`84671b9b6` 修通知激活器快捷方式 GUID，`f55771d84`、`432f91eb4` 补 VM 关闭结果、拖放源与指针模式，`3aeb28f15` 让拖放接收器以关联令牌启动，`d5c4f911d` 为文档检查点，`5fd3a2741` 让 VM 夹具自动衔接真实拖放与身份校验（这两个提交未改 `src/**`）。`eb2f37d2e` 精确单文件提交同用户三向原生拖放夹具（作者本机核过解析、Add-Type 与 token 用例 3 正 8 负、错误 birth 在输入前拒绝，独立复审 PASS）。HEAD 为 `aa9fec9d7`；`5fd3a2741` 保留为本轮开工核对身份，不回写历史 receipt。`src/apprt/win32/App.zig`、`src/apprt/win32/ShellIntegration.zig` 的冷激活提示最窄修复已独立 review PASS、构建为 r5，并单独提交为 `aa9fec9d7`（两文件冻结哈希不变，全部 `src/**` 已提交，当前实树源码与 r5 构建字节相同）；r5 构建身份仍是 `eb2f37d2e` 加这两个文件的哈希，不倒写为构建于 `aa9fec9d7`；r4 哈希保留为历史证据；文档、KB 与图谱由 root 最终提交。提交不是验收通过。2026-10-17 机械核对（`final-r2/identity-20261017.json`）：`src/**` 1223/1223 与 r4 构建前快照一致，r4 app/setup/zip 与 r3 test-bin 哈希全部匹配，当时无需重编；r4 app 哈希此后未变。
 - 最新候选为 r5（见下条）。此前 r4 为 `zig-out-delivery-r4/bin/ghostty.exe`，SHA256 `eece67e02e54823a8336849359776c86fe1195c1fef4d721c146f40013c37e90`；离线包 setup `de2a810188d84c94dabad61719dea320f0144b9ea36584be11f637264013c9ea`、zip `9d440ea5…fc25f`。r4 相对 r3（`95d7a015…8eba`，合并构建与 50 项定向通过）只把接收器启动令牌权限由 `0x0B` 改为 `0x18B`，r3 的测试、远程与 GUI 证据只覆盖未改动的逻辑，按范围复用，不计为 r4 的新测试结果；令牌权限改动由 VM 四组令牌对照与接收器配对实证覆盖。Toast 诊断 app `435c87aa…236e` 不作最终包，四个诊断源码文件已精确撤回（补丁留存），撤回后源码曾与 r4 清单一致。此前 `cc2edbc9…663f76` 的已验范围独立保留。源身份以构建时 HEAD 加文件摘要为准，不因后来提交而改写 receipt。最新已验 GTK 快照为 `38e3e644f`。
@@ -48,7 +84,7 @@
 - 2026-10-17 已重新启动 Docker，并复用原 Win11 容器（`a8771d3f…`，此前 exited 255，live UUID 匹配），heavy 由 session 9120 持有；direct 三向已完成，三个 app 已正常关闭，VM GUI 已交还 root，VM 最终已 owned stop 关闭（见上条）；10-14 的客机 PID 一律不视为在运行。
 - 10-17 的 framework 日志曾为 936 项、17 skip、exit 0（历史）。10-18 root 用 `python scripts/gx_slots.py --kind heavy -- python scripts/run_unittests.py --jobs 2` 集中跑完整框架单测：936 项、17 skip，唯一 FAIL 是 `test_agent_kb.RealCorpusTests.test_checked_in_kb_is_fresh`（新文档后尚未生成 KB），其余通过；原日志 `final-r2/framework-20261018.log`，wall 436.36 s。这次记 FAIL，不是 PASS，也不是 15 s 级的快速检查。`just fmt-check`、`just fluent-check`、`just graph-check` 在 r5 两文件修改之前由 root 运行，exit 0；修改后已按两源变化重建图谱（`final-r2/graph-20261018.log` exit 0，35 处头文件解析限制不变）；r5 源码冻结后 graph-check 与 fmt-check 重新 exit 0（本轮工具记录），i18n、pinyin、fluent 真源未变且 check exit 0。
 
-## 功能状态
+## 历史｜功能状态
 
 | 项 | 源码 | 现有证据 | 状态 |
 |---|---|---|---|
@@ -72,7 +108,7 @@
 - 协议 v2：两端共享规范动作文本；请求与结果携带 surface、lease、transaction、config_generation；快照文本有界（60 KiB），不按值扩张队列槽位。源持有终端与绑定状态，目标持有可见 UI。
 - 语义：源丢失不重放命令；目标退出归还源；纯远程标签可拖回源，混合标签禁止跨进程迁移；all/global 只作用目标可见窗格；Session 不保存远程叶；Quick Terminal 拒收远程。粘贴单块受协议上限约束、总量不超过 16 MiB，不追加 Enter。模态返回后重查稳定引用。
 
-## 批次记录与收尾
+## 历史｜批次记录与收尾
 
 原定构建/打包次数已因真实系统缺陷超出：r3 合并 app/test-bin，r4 仅 app 热修，单独 Toast 日志诊断 app，以及 r5 冷激活提示的必要热修（合并构建 app 与 test-bin 一次；首次因 PowerShell 拆分版本参数报 InvalidVersion、未编译，原件保留，修正参数后成功）；r3/r4/r5 各离线打包一次，诊断 app 不作为最终包，其源码改动已撤回。未追加完整 main。已生成的 KB/图谱在真源再变后需重验新鲜度，按实际影响补生成，不把旧产物冒充最终冻结结果。
 
