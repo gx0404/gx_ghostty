@@ -450,6 +450,46 @@ class ParseTests(unittest.TestCase):
 
 
 class QuietTests(unittest.TestCase):
+    def test_start_idle_waiver_is_explicit_and_audited(self):
+        parsed = gx_perf.build_parser().parse_args(['quiet', '--out', str(self.args.out), '--no-start-idle-gate'])
+        self.assertTrue(parsed.no_start_idle_gate)
+        self.assertEqual(600, parsed.idle_seconds)
+        self.assertFalse(self.args.no_start_idle_gate)
+        self.probe.input_ticks.return_value = ticks(5)
+        self.assertEqual(3, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+        self.args.idle_seconds = 0
+        self.assertFalse(gx_perf.quiet_snapshot(self.args, self.probe)['plan_compliant'])
+        self.args.no_start_idle_gate = True
+        self.assertTrue(gx_perf.thresholds_plan_compliant(self.args))
+        self.args.idle_seconds = 600
+        result = gx_perf.quiet_snapshot(self.args, self.probe)
+        self.assertEqual((0, True, 'observed', 'fail'),
+                         (result['exit'], result['plan_compliant'], result['checks']['input']['status'],
+                          result['checks']['input']['observed']))
+        self.assertTrue(result['start_idle_waiver']['enabled'])
+        self.assertFalse(result['legacy_start_idle_compliant'])
+        self.assertIn('2026-10-19', result['criteria'])
+        self.assertNotIn('input', result['gates'])
+        self.assertFalse(result['criteria_options']['input_observe_only'])
+        self.assertEqual('gx-quiet-v2', result['schema'])
+
+    def test_start_idle_waiver_keeps_every_other_gate_and_unknown(self):
+        self.args.no_start_idle_gate = True
+        self.probe.input_ticks.return_value = ticks(5)
+        for method, value, code in (
+                ('windows', windows_data({'pid': 1, 'name': 'zig.exe'}), 3),
+                ('wsl', {'processes': [{'pid': 2, 'name': 'cc1plus'}]}, 3),
+                ('vm', {'win11': {'running': True}}, 3), ('slots', False, 3),
+                ('session', {'interactive_console': False}, 2)):
+            with self.subTest(method=method):
+                operation = getattr(self.probe, method)
+                original = operation.return_value
+                operation.return_value = value
+                self.assertEqual(code, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+                operation.return_value = original
+        self.probe.input_ticks.side_effect = OSError('unknown input ticks')
+        self.assertEqual(2, gx_perf.quiet_snapshot(self.args, self.probe)['exit'])
+
     def test_wsl_build_runner_detection_does_not_persist_command_lines(self):
         with mock.patch.object(gx_perf, 'command_output', side_effect=[
                 'Ubuntu-24.04\n', 'Ubuntu-24.04\n', '10 python3 python3 scripts/run_unittests.py test_x\n11 ps ps -eo pid=,comm=,args=\n']):
@@ -707,6 +747,49 @@ class QuietTests(unittest.TestCase):
 
 
 class QuietBatchTests(unittest.TestCase):
+    def test_start_idle_waiver_keeps_end_input_and_failure_classification(self):
+        for index, (idle, code, guard, cause, expected) in enumerate((
+                (610, 0, None, None, (0, 'VALID')),
+                (610, 4, None, None, (4, 'FAIL')),
+                (610, 0, 'fail', 'foreground_lost', (3, 'INVALID')),
+                (610, 0, 'fail', 'pointer_target_lost', (3, 'INVALID')),
+                (610, 0, 'fail', 'unknown', (2, 'ERROR')),
+                (20, 0, None, None, (3, 'INVALID')))):
+            with self.subTest(index=index):
+                args = self.batch_args('--no-start-idle-gate', command=self.DRIVER)
+                args.out = args.out.parent / str(index)
+                self.probe.input_ticks.side_effect = [ticks(5, 1_000_000), ticks(idle, 1_605_000)]
+                actual, result = self.run_batch(args, self.command(code, guard, cause=cause))
+                self.assertEqual(expected, (actual, result['status']))
+                self.assertTrue(result['start_idle_waiver']['enabled'])
+                self.assertFalse(result['legacy_start_idle_compliant'])
+                self.assertFalse(result['input_observe_only'])
+                self.assertEqual('gx-quiet-batch-v3', result['schema'])
+                if expected[0] in (0, 4):
+                    self.assertTrue(result['plan_compliant'])
+                before = json.loads((args.out / 'before.json').read_text(encoding='utf-8'))
+                self.assertEqual('observed', before['checks']['input']['status'])
+                self.assertEqual('all four locks held by this batch', before['checks']['slots']['reason'])
+
+    def test_start_idle_waiver_does_not_relax_unmeasured_command_end_or_gtk_allowlist(self):
+        args = self.batch_args('--no-start-idle-gate')
+        self.probe.input_ticks.side_effect = [ticks(5, 1_000_000), ticks(65, 1_060_000)]
+        code, result = self.run_batch(args, self.command())
+        self.assertEqual((3, 'INVALID'), (code, result['status']))
+        args = self.batch_args('--no-start-idle-gate', '--input-observe-only', command=self.DRIVER)
+        with self.assertRaises(gx_perf.PerfError):
+            self.run_batch(args, self.command())
+
+    def test_start_idle_waiver_is_required_for_lower_threshold_compliance(self):
+        for waived in (False, True):
+            args = self.batch_args('--idle-seconds', '1', *(['--no-start-idle-gate'] if waived else []))
+            args.out = args.out.parent / str(waived)
+            self.probe.input_ticks.side_effect = [ticks(5, 1_000_000), ticks(65, 1_060_000)]
+            code, result = self.run_batch(args, self.command())
+            self.assertEqual((0, 'VALID') if waived else (5, 'NONCOMPLIANT'), (code, result['status']))
+            self.assertEqual(waived, result['plan_compliant'])
+            self.assertFalse(result['legacy_start_idle_compliant'])
+
     def test_gtk_action_exit4_and_standard_remains_error(self):
         for index, case in enumerate(('p2', 'p4', 'standard')):
             args = self.batch_args('--input-observe-only', command=(

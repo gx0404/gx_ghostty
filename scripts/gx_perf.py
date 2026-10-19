@@ -25,6 +25,9 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         P2/P4 require 10 runs; --capabilities LABEL:JSON_FILE binds instrumentation to source/exe.
         Their separate action schema retains unknown counters; exit 4 means a failed absolute gate.
   quiet --out DIR [--slot-root DIR] [--idle-seconds 600] [--wait --interval 900 --max-attempts 3]
+        quiet and quiet-batch accept --no-start-idle-gate: explicit opt-in to the 2026-10-19
+        start-only waiver. Input ticks are still read; end input, all other gates and driver
+        measurement requirements are unchanged. Waived reports use gx-quiet-v2/gx-quiet-batch-v3.
         [--strict-blacklist] [--input-observe-only]
         Read-only checks under the criteria named in the JSON (r6-13:20 user ruling): this project's
         own load gates (Windows and WSL build/test processes, the validation VM, all slots probed and
@@ -633,6 +636,25 @@ BUILD_PROCESSES = ("zig", "build", "test", "ghostty-test", "clang", "clang++", "
 # batches still need >= 600 s without input before the start and none during the batch; WSL/Xvfb-only
 # batches (--input-observe-only) record input instead.
 QUIET_CRITERIA = 'r6-13:20 user ruling'
+START_IDLE_CRITERIA = '2026-10-19 user ruling: waive start idle threshold only'
+
+
+def quiet_policy(args) -> dict:
+    waived = bool(getattr(args, 'no_start_idle_gate', False))
+    return {
+        'criteria': START_IDLE_CRITERIA if waived else QUIET_CRITERIA,
+        'criteria_options': {'strict_blacklist': bool(getattr(args, 'strict_blacklist', False)),
+                             'input_observe_only': bool(getattr(args, 'input_observe_only', False)),
+                             **({'no_start_idle_gate': True} if waived else {})},
+        'start_idle_waiver': {
+            'enabled': waived, 'ruling': START_IDLE_CRITERIA if waived else None,
+            'scope': 'start GetLastInputInfo idle threshold only; end input and driver gates unchanged',
+            'legacy_criteria': QUIET_CRITERIA, 'legacy_required_seconds': PLAN_IDLE_SECONDS,
+            'requested_idle_seconds': args.idle_seconds,
+        },
+    }
+
+
 # The plan §4 list, kept literally; recorded in blacklist_observation, a gate only with
 # --strict-blacklist (the criteria before the 13:20 ruling). Matching is a case-insensitive (casefold)
 # substring of a process image name or main window title: Windows reports image
@@ -960,7 +982,12 @@ def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
               lambda data: (data['idle_seconds'] >= threshold, f"idle {data['idle_seconds']:.3f}s; required {threshold:g}s"))
     else:
         check('input', lambda: end_input(end, probe, threshold), lambda data: (data['state'] == 'pass', data['reason']))
-    if observe_input and checks['input']['status'] != 'error':
+    start_waived = end is None and bool(getattr(args, 'no_start_idle_gate', False))
+    if start_waived and checks['input']['status'] != 'error':
+        row = checks['input']
+        row.update(status='observed', observed=row['status'],
+                   reason=f"start idle threshold waived (--no-start-idle-gate): {row['reason']}")
+    if observe_input and not start_waived and checks['input']['status'] != 'error':
         # A WSL/Xvfb batch: the values and the result the gate would have had are kept, never gating.
         row = checks['input']
         row.update(status='observed', observed=row['status'],
@@ -977,10 +1004,14 @@ def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
     code = 2 if any(row['status'] == 'error' for row in checks.values()) else (
         3 if any(row['status'] == 'fail' for row in checks.values()) else 0)
     thresholds = thresholds_plan_compliant(args)
-    return {"schema": "gx-quiet-v1", "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
-            'criteria': QUIET_CRITERIA, 'criteria_options': {'strict_blacklist': strict, 'input_observe_only': observe_input},
+    raw_input = checks['input'].get('raw', {})
+    legacy_start = (raw_input['idle_seconds'] >= PLAN_IDLE_SECONDS and threshold >= PLAN_IDLE_SECONDS
+                    if end is None and 'idle_seconds' in raw_input else None)
+    return {"schema": "gx-quiet-v2" if getattr(args, 'no_start_idle_gate', False) else "gx-quiet-v1",
+            "time_ns": time.time_ns(), "quiet": code == 0, "exit": code,
+            **quiet_policy(args), 'legacy_start_idle_compliant': legacy_start,
             'gates': [name for name, row in checks.items() if row['status'] != 'observed'],
-            'observed_only': [*(['input'] if observe_input else []), *([] if strict else ['blacklist']),
+            'observed_only': [*(['input'] if observe_input or start_waived else []), *([] if strict else ['blacklist']),
                               'other_programs', 'cpu_observation', 'docker_containers'],
             'thresholds_plan_compliant': thresholds,
             # Every gate of `criteria` met with its thresholds (point in time; batches see RESULT.json).
@@ -992,8 +1023,9 @@ def quiet_snapshot(args, probe=None, *, lease=None, end=None) -> dict:
 
 
 def thresholds_plan_compliant(args) -> bool:
-    """The idle threshold is the plan's (>= 600 s); it does not apply when input is only observed."""
-    return bool(getattr(args, 'input_observe_only', False)) or args.idle_seconds >= PLAN_IDLE_SECONDS
+    """Compliance with the explicitly selected ruling, not a claim about the legacy start gate."""
+    return (bool(getattr(args, 'no_start_idle_gate', False)) or
+            bool(getattr(args, 'input_observe_only', False)) or args.idle_seconds >= PLAN_IDLE_SECONDS)
 
 
 def new_output(path: Path) -> Path:
@@ -1502,11 +1534,11 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
                         'allowlisted: run it without --input-observe-only')
     out = new_output(args.out)
     guard_log = out / 'guards.jsonl'
-    result = {'schema': 'gx-quiet-batch-v2', 'batch_id': uuid.uuid4().hex, 'command': command,
+    result = {'schema': 'gx-quiet-batch-v3' if getattr(args, 'no_start_idle_gate', False) else 'gx-quiet-batch-v2',
+              'batch_id': uuid.uuid4().hex, 'command': command,
               'requested_command': requested_command, 'command_cwd': str(Path.cwd()),
-              'injected_input': args.injected_input, 'input_observe_only': observe_input, 'criteria': QUIET_CRITERIA,
-              'criteria_options': {'strict_blacklist': bool(getattr(args, 'strict_blacklist', False)),
-                                   'input_observe_only': observe_input},
+              'injected_input': args.injected_input, 'input_observe_only': observe_input,
+              **quiet_policy(args), 'legacy_start_idle_compliant': None,
               'status': 'NOT_STARTED', 'exit': 2,
               'quiet_status': 'NOT_CHECKED', 'quiet_valid': False, 'measurement': 'NOT_RUN', 'command_exit': None,
               'plan_compliant': False, 'thresholds_plan_compliant': thresholds_plan_compliant(args),
@@ -1522,6 +1554,7 @@ def run_quiet_batch(args, probe=None, execute=None) -> int:
         # previous quiet snapshot authorizes running after waiting for resources.
         with gx_slots.acquire(args.slot_root, 'quiet', args.timeout) as lease:
             before = quiet_snapshot(args, probe, lease=lease)
+            result['legacy_start_idle_compliant'] = before['legacy_start_idle_compliant']
             write_json(out / 'before.json', before)
             if before['exit']:
                 result['quiet_status'] = 'NOT_MET' if before['exit'] == 3 else 'ERROR'
@@ -3954,6 +3987,8 @@ def build_parser() -> argparse.ArgumentParser:
     quiet.add_argument("--slot-root", type=Path)
     quiet.add_argument("--distro", default="Ubuntu-24.04")
     quiet.add_argument("--idle-seconds", type=float, default=600)
+    quiet.add_argument('--no-start-idle-gate', action='store_true',
+                       help='opt in to the 2026-10-19 ruling: observe start idle only; keep all other gates')
     quiet.add_argument("--build-process", action="append", help="add build process names (repeatable)")
     quiet.add_argument("--blacklist", action="append",
                        help="add case-insensitive name/title substrings to the recorded blacklist (repeatable)")
@@ -3971,6 +4006,8 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument('--slot-root', type=Path)
     batch.add_argument('--distro', default='Ubuntu-24.04')
     batch.add_argument('--idle-seconds', type=float, default=600)
+    batch.add_argument('--no-start-idle-gate', action='store_true',
+                       help='opt in to the 2026-10-19 ruling: waive start idle only; end input and driver gates unchanged')
     batch.add_argument('--build-process', action='append')
     batch.add_argument('--blacklist', action='append',
                        help='add case-insensitive name/title substrings to the recorded blacklist (repeatable)')
