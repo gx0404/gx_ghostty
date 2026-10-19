@@ -39,6 +39,26 @@ def wait(test, timeout=12):
     raise TimeoutError("bounded fixture wait expired")
 
 
+def capture_failure_after(instance, app_hash, work, record):
+    """Best-effort evidence without activation, input, or changing the failure."""
+    try:
+        instance.ensure_owned()
+        instance.ensure_foreground(probe=True)
+        identity = native_snapshot(instance)
+        if identity["process"]["sha256"].lower() != app_hash.lower():
+            raise gui.InputBlocked("app hash changed before failure capture")
+        record["failure_after_identity"] = identity
+        window = instance.require_window()
+        # Snapshot queries and hashing take time. Recheck both guards directly
+        # before capture; never activate a window to make this diagnostic pass.
+        instance.ensure_owned()
+        instance.ensure_foreground(probe=True)
+        instance.capture_window(window, "screen").save_png(work / "failure-after.png")
+        record["captures"].append("failure-after.png")
+    except Exception as error:
+        record["failure_after_error"] = str(error)
+
+
 def timeout_snapshot(instance, source, source_pid, source_birth, source_hash, work):
     """Read only verified owned GUI thread state; no input or focus changes."""
     instance.ensure_owned()
@@ -302,6 +322,8 @@ def main():
                 record["status"] = "NATIVE_PASS_VISUAL_PENDING"
             except Exception as error:
                 record.update(status="FAIL", reason=str(error), traceback=traceback.format_exc())
+                if instance is not None:
+                    capture_failure_after(instance, args.sha256, work, record)
                 if isinstance(error, subprocess.TimeoutExpired) and instance is not None and process is not None:
                     try:
                         record["timeout_diagnostics"] = timeout_snapshot(

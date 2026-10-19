@@ -87,25 +87,36 @@ extern "user32" fn SetProcessDpiAwarenessContext(isize) callconv(.winapi) i32;
 
 // Single STA only. Synchronous writes survive fixture termination; no payload
 // text, paths, clipboard contents or unbounded callback log is recorded.
-var trace_file: ?H = null;
-var trace_count: usize = 0;
-var trace_last: u64 = 0;
-var trace_suppressed: usize = 0;
-fn trace(comptime event: []const u8, comptime fields: []const u8, args: anytype, critical: bool) void {
-    const file = trace_file orelse return;
-    const now = GetTickCount64();
-    if (trace_count >= 256 or (!critical and trace_count >= 128 and now -| trace_last < 1000)) {
-        trace_suppressed +|= 1;
-        return;
+const TraceClass = enum { probe, medium, release, final };
+const TraceBudget = struct {
+    // Independent quotas: rejected format probes cannot consume the space for
+    // owned media, releases, or the final DoDragDrop/cleanup result. Total: 256.
+    const limits = [_]usize{ 128, 48, 48, 32 };
+    counts: [4]usize = @splat(0),
+    suppressed: usize = 0,
+
+    fn admit(self: *TraceBudget, class: TraceClass) bool {
+        const index = @intFromEnum(class);
+        if (self.counts[index] >= limits[index]) {
+            self.suppressed +|= 1;
+            return false;
+        }
+        self.counts[index] += 1;
+        return true;
     }
+};
+var trace_file: ?H = null;
+var trace_budget: TraceBudget = .{};
+fn trace(comptime event: []const u8, comptime fields: []const u8, args: anytype, class: TraceClass) void {
+    const file = trace_file orelse return;
+    if (!trace_budget.admit(class)) return;
+    const now = GetTickCount64();
     var detail: [512]u8 = undefined;
     const extra = std.fmt.bufPrint(&detail, fields, args) catch return;
     var buffer: [768]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{{\"event\":\"{s}\",\"tick_ms\":{d},\"thread_id\":{d},\"suppressed\":{d}{s}}}\n", .{ event, now, GetCurrentThreadId(), trace_suppressed, extra }) catch return;
+    const line = std.fmt.bufPrint(&buffer, "{{\"event\":\"{s}\",\"class\":\"{s}\",\"tick_ms\":{d},\"thread_id\":{d},\"suppressed\":{d}{s}}}\n", .{ event, @tagName(class), now, GetCurrentThreadId(), trace_budget.suppressed, extra }) catch return;
     var written: u32 = 0;
     _ = WriteFile(file, line.ptr, @intCast(line.len), &written, null);
-    trace_count += 1;
-    trace_last = now;
 }
 
 const Case = enum { text, unicode, multiline, single_file, files, shell_metachar_files, quoted_path, uri, unterminated, bad_hdrop, bad_uri, text_limit, too_many_files };
@@ -252,6 +263,7 @@ const Source = struct {
     format: u16,
     target: Target,
     deadline: u64,
+    get_calls: usize = 0,
     gets: usize = 0,
     queries: usize = 0,
     releases: usize = 0,
@@ -274,7 +286,7 @@ const Source = struct {
         return @alignCast(@fieldParentPtr("drop", value));
     }
     fn queryData(value: *DataObject, id: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
-        trace("query_data", ",\"iid_a\":{d}", .{id.a}, false);
+        trace("query_data", ",\"iid_a\":{d}", .{id.a}, .probe);
         out.* = null;
         if (!equal(id, &iid_unknown) and !equal(id, &iid(0x10e))) return no_interface;
         _ = fromData(value).retain();
@@ -282,7 +294,7 @@ const Source = struct {
         return 0;
     }
     fn queryDrop(value: *DropSource, id: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
-        trace("query_drop", ",\"iid_a\":{d}", .{id.a}, false);
+        trace("query_drop", ",\"iid_a\":{d}", .{id.a}, .probe);
         out.* = null;
         if (!equal(id, &iid_unknown) and !equal(id, &iid(0x121))) return no_interface;
         _ = fromDrop(value).retain();
@@ -302,16 +314,24 @@ const Source = struct {
         return fromDrop(value).release();
     }
     fn queryGet(value: *DataObject, format: *const Format) callconv(.winapi) HRESULT {
-        trace("query_get_enter", ",\"format\":{d}", .{format.format}, false);
+        trace("query_get_enter", ",\"format\":{d}", .{format.format}, .probe);
         const self = fromData(value);
         self.queries += 1;
         const result: HRESULT = if (self.target.live() and format.format == self.format and format.aspect == 1 and format.index == -1 and format.medium & 1 != 0) 0 else bad_format;
-        trace("query_get_return", ",\"hresult\":{d}", .{@as(u32, @bitCast(result))}, false);
+        trace("query_get_return", ",\"hresult\":{d}", .{@as(u32, @bitCast(result))}, .probe);
         return result;
     }
     fn get(value: *DataObject, format: *const Format, medium: *Medium) callconv(.winapi) HRESULT {
-        trace("get_data_enter", ",\"format\":{d}", .{format.format}, true);
-        defer trace("get_data_return", ",\"medium_kind\":{d}", .{medium.kind}, true);
+        const self = fromData(value);
+        self.get_calls += 1;
+        const call = self.get_calls;
+        trace("get_data_enter", ",\"call\":{d},\"format\":{d}", .{ call, format.format }, .probe);
+        const result = getMedium(value, format, medium);
+        const medium_id = if (medium.owner) |owner| MediumOwner.parent(owner).id else 0;
+        trace("get_data_return", ",\"call\":{d},\"format\":{d},\"hresult\":{d},\"medium_kind\":{d},\"medium_id\":{d}", .{ call, format.format, @as(u32, @bitCast(result)), medium.kind, medium_id }, if (result == 0) .medium else .probe);
+        return result;
+    }
+    fn getMedium(value: *DataObject, format: *const Format, medium: *Medium) HRESULT {
         medium.* = .{};
         const self = fromData(value);
         if (queryGet(value, format) != 0) return bad_format;
@@ -331,7 +351,7 @@ const Source = struct {
             return @bitCast(@as(u32, 0x8007000e));
         };
         _ = self.retain();
-        owner.* = .{ .source = self, .handle = handle };
+        owner.* = .{ .source = self, .handle = handle, .id = self.gets + 1 };
         self.gets += 1;
         medium.* = .{ .kind = 1, .handle = handle, .owner = &owner.interface };
         return 0;
@@ -370,21 +390,21 @@ const Source = struct {
     fn continueDrag(value: *DropSource, escape: i32, keys: u32) callconv(.winapi) HRESULT {
         const self = fromDrop(value);
         self.continuations += 1;
-        trace("continue_enter", ",\"keys\":{d},\"escape\":{d},\"async_left\":{d},\"calls\":{d}", .{ keys, escape, @as(u16, @bitCast(GetAsyncKeyState(1))), self.continuations }, false);
+        trace("continue_enter", ",\"keys\":{d},\"escape\":{d},\"async_left\":{d},\"calls\":{d}", .{ keys, escape, @as(u16, @bitCast(GetAsyncKeyState(1))), self.continuations }, .probe);
         var point: POINT = undefined;
         if (self.cancelled or escape != 0 or GetTickCount64() >= self.deadline or GetCursorPos(&point) == 0 or
             ((!self.source_window or keys & 1 == 0) and !self.target.contains(point)))
         {
             self.cancelled = true;
-            trace("continue_cancel", "", .{}, true);
+            trace("continue_cancel", "", .{}, .final);
             return 0x00040101;
         }
-        trace("continue_point_valid", ",\"keys\":{d}", .{keys}, false);
-        if (keys & 1 == 0) trace("continue_drop", "", .{}, true);
+        trace("continue_point_valid", ",\"keys\":{d}", .{keys}, .probe);
+        if (keys & 1 == 0) trace("continue_drop", "", .{}, .final);
         return if (keys & 1 == 0) 0x00040100 else 0;
     }
     fn feedback(_: *DropSource, effect: u32) callconv(.winapi) HRESULT {
-        trace("feedback", ",\"effect\":{d}", .{effect}, false);
+        trace("feedback", ",\"effect\":{d}", .{effect}, .probe);
         return 0x00040102;
     }
     const data_vtable: DataVTable = .{ .query = queryData, .add = addData, .release = releaseData, .get = get, .get_here = getHere, .query_get = queryGet, .canonical = canonicalFormat, .set = set, .enumerate = enumerate, .advise = advise, .unadvise = unadvise, .enum_advise = enumAdvise };
@@ -416,7 +436,7 @@ const DragWindow = struct {
         current = self;
         _ = ShowWindow(self.hwnd.?, 1);
         if (SetTimer(self.hwnd, 1, 100, null) == 0) return error.SourceTimerFailed;
-        trace("source_window_ready", ",\"hwnd\":{d}", .{@intFromPtr(self.hwnd.?)}, true);
+        trace("source_window_ready", ",\"hwnd\":{d}", .{@intFromPtr(self.hwnd.?)}, .final);
     }
     fn deinit(self: *DragWindow) void {
         current = null;
@@ -444,7 +464,7 @@ const DragWindow = struct {
                 if (!self.dragging and !self.finished) {
                     self.down = point(lparam);
                     _ = SetCapture(hwnd);
-                    trace("source_mouse_down", "", .{}, true);
+                    trace("source_mouse_down", "", .{}, .probe);
                 }
                 return 0;
             },
@@ -456,9 +476,9 @@ const DragWindow = struct {
                     self.down = null;
                     _ = ReleaseCapture();
                     self.source.deadline = GetTickCount64() + self.timeout_ms;
-                    trace("dodragdrop_enter", ",\"source_hwnd\":{d}", .{@intFromPtr(hwnd)}, true);
+                    trace("dodragdrop_enter", ",\"source_hwnd\":{d}", .{@intFromPtr(hwnd)}, .final);
                     self.result = DoDragDrop(&self.source.data, &self.source.drop, 1, &self.effect);
-                    trace("dodragdrop_return", ",\"hresult\":{d},\"effect\":{d}", .{ @as(u32, @bitCast(self.result)), self.effect }, true);
+                    trace("dodragdrop_return", ",\"hresult\":{d},\"effect\":{d}", .{ @as(u32, @bitCast(self.result)), self.effect }, .final);
                     self.dragging = false;
                     self.finished = true;
                 }
@@ -573,7 +593,7 @@ fn dragTimer(_: ?HWND, _: u32, _: usize, _: u32) callconv(.winapi) void {
         (@as(u32, @as(u16, @bitCast(@as(i16, @truncate(point.y))))) << 16);
     const buttons: usize = if (@as(u16, @bitCast(GetAsyncKeyState(1))) & 0x8000 != 0) 1 else 0;
     const posted = PostThreadMessageW(GetCurrentThreadId(), 0x200, buttons, @bitCast(@as(usize, packed_point)));
-    trace("timer", ",\"buttons\":{d},\"posted\":{d}", .{ buttons, posted }, false);
+    trace("timer", ",\"buttons\":{d},\"posted\":{d}", .{ buttons, posted }, .probe);
 }
 
 const MediumOwner = struct {
@@ -581,6 +601,7 @@ const MediumOwner = struct {
     refs: u32 = 1,
     source: *Source,
     handle: H,
+    id: usize,
     fn parent(value: *Unknown) *MediumOwner {
         return @alignCast(@fieldParentPtr("interface", value));
     }
@@ -594,11 +615,13 @@ const MediumOwner = struct {
     fn add(value: *Unknown) callconv(.winapi) u32 {
         const self = parent(value);
         self.refs += 1;
+        trace("medium_add_ref", ",\"medium_id\":{d},\"refs\":{d}", .{ self.id, self.refs }, .medium);
         return self.refs;
     }
     fn release(value: *Unknown) callconv(.winapi) u32 {
         const self = parent(value);
-        trace("medium_release_enter", ",\"refs\":{d}", .{self.refs}, true);
+        const id = self.id;
+        trace("medium_release_enter", ",\"medium_id\":{d},\"refs\":{d}", .{ id, self.refs }, .release);
         self.refs -= 1;
         const remaining = self.refs;
         if (remaining == 0) {
@@ -608,7 +631,7 @@ const MediumOwner = struct {
             source.alloc.destroy(self);
             _ = source.release();
         }
-        trace("medium_release_return", ",\"refs\":{d}", .{remaining}, true);
+        trace("medium_release_return", ",\"medium_id\":{d},\"refs\":{d}", .{ id, remaining }, .release);
         return remaining;
     }
     const vtable: UnknownVTable = .{ .query = query, .add = add, .release = release };
@@ -672,7 +695,7 @@ fn run(init: std.process.Init) !u8 {
         trace_file = null;
         _ = CloseHandle(trace_handle);
     }
-    trace("fixture_verified", ",\"target_pid\":{d},\"target_hwnd\":{d}", .{ opts.pid, opts.hwnd }, true);
+    trace("fixture_verified", ",\"target_pid\":{d},\"target_hwnd\":{d}", .{ opts.pid, opts.hwnd }, .final);
     const marker = try std.fmt.allocPrint(alloc, "GX_OLE_FIXTURE_{d}", .{GetCurrentProcessId()});
     var format: u16 = 13;
     const bytes: []const u8 = switch (opts.case) {
@@ -722,9 +745,13 @@ fn run(init: std.process.Init) !u8 {
         },
     };
     const hr = OleInitialize(null);
-    trace("ole_initialized", ",\"hresult\":{d}", .{@as(u32, @bitCast(hr))}, true);
+    trace("ole_initialized", ",\"hresult\":{d}", .{@as(u32, @bitCast(hr))}, .final);
     if (hr < 0) return error.OleInitializeFailed;
-    defer OleUninitialize();
+    defer {
+        trace("ole_uninitialize_enter", "", .{}, .final);
+        OleUninitialize();
+        trace("ole_uninitialize_return", "", .{}, .final);
+    }
     var point: POINT = undefined;
     if (opts.x) |x| {
         point = .{ .x = x, .y = opts.y.? };
@@ -737,14 +764,17 @@ fn run(init: std.process.Init) !u8 {
     }
     const source = try init.gpa.create(Source);
     source.* = .{ .alloc = init.gpa, .bytes = bytes, .format = format, .target = target, .deadline = GetTickCount64() + opts.timeout_ms, .unterminated = opts.case == .unterminated, .source_window = opts.source_window };
-    defer _ = source.release();
+    defer {
+        const remaining = source.release();
+        trace("source_owner_release", ",\"refs\":{d}", .{remaining}, .final);
+    }
     var source_window: DragWindow = .{ .source = source, .timeout_ms = opts.timeout_ms, .idle_deadline = GetTickCount64() + 30000 };
     defer source_window.deinit();
     if (opts.source_window) try source_window.create();
     const ready = try std.json.Stringify.valueAlloc(alloc, .{ .status = "ready", .source_pid = GetCurrentProcessId(), .source_hwnd = if (source_window.hwnd) |hwnd| @intFromPtr(hwnd) else 0, .target_pid = opts.pid, .target_birth = opts.birth, .target_hwnd = opts.hwnd, .case = @tagName(opts.case), .app_sha256 = opts.sha256 }, .{});
     try dir.writeFile(init.io, .{ .sub_path = "ready.json", .data = ready });
     const timer = SetTimer(null, 0, 50, dragTimer);
-    trace("timer_installed", ",\"timer\":{d}", .{timer}, true);
+    trace("timer_installed", ",\"timer\":{d}", .{timer}, .final);
     if (timer == 0) return error.DragTimerFailed;
     defer _ = KillTimer(null, timer);
     var effect: u32 = 0;
@@ -753,12 +783,13 @@ fn run(init: std.process.Init) !u8 {
         effect = source_window.effect;
         break :result source_window.result;
     } else result: {
-        trace("dodragdrop_enter", "", .{}, true);
+        trace("dodragdrop_enter", "", .{}, .final);
         const native_result = DoDragDrop(&source.data, &source.drop, 1, &effect);
-        trace("dodragdrop_return", ",\"hresult\":{d},\"effect\":{d}", .{ @as(u32, @bitCast(native_result)), effect }, true);
+        trace("dodragdrop_return", ",\"hresult\":{d},\"effect\":{d}", .{ @as(u32, @bitCast(native_result)), effect }, .final);
         break :result native_result;
     };
-    const evidence = try std.json.Stringify.valueAlloc(alloc, .{ .status = "finished", .hresult = @as(u32, @bitCast(result)), .effect = effect, .source_pid = GetCurrentProcessId(), .target_pid = opts.pid, .target_birth = opts.birth, .target_hwnd = opts.hwnd, .app_sha256 = opts.sha256, .case = @tagName(opts.case), .payload_bytes = bytes.len, .query_get_data = source.queries, .get_data = source.gets, .medium_releases = source.releases, .continue_drag_calls = source.continuations, .cancelled = source.cancelled, .target_alive = target.live(), .evidence_dir = root, .paste_completed = "PENDING_TARGET_VERIFICATION", .clipboard_access = false, .enter_injected = false }, .{});
+    trace("medium_balance", ",\"get_data_calls\":{d},\"get_data\":{d},\"medium_releases\":{d},\"source_refs\":{d}", .{ source.get_calls, source.gets, source.releases, source.refs.load(.monotonic) }, .final);
+    const evidence = try std.json.Stringify.valueAlloc(alloc, .{ .status = "finished", .hresult = @as(u32, @bitCast(result)), .effect = effect, .source_pid = GetCurrentProcessId(), .target_pid = opts.pid, .target_birth = opts.birth, .target_hwnd = opts.hwnd, .app_sha256 = opts.sha256, .case = @tagName(opts.case), .payload_bytes = bytes.len, .query_get_data = source.queries, .get_data_calls = source.get_calls, .get_data = source.gets, .medium_releases = source.releases, .continue_drag_calls = source.continuations, .cancelled = source.cancelled, .target_alive = target.live(), .evidence_dir = root, .paste_completed = "PENDING_TARGET_VERIFICATION", .clipboard_access = false, .enter_injected = false }, .{});
     try dir.writeFile(init.io, .{ .sub_path = "evidence.json", .data = evidence });
     var out_buffer: [2048]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &out_buffer);
@@ -785,4 +816,29 @@ test "fixture native payload encodes bounded terminated Unicode and HDROP" {
     try std.testing.expectEqual(@as(u32, 20), std.mem.readInt(u32, files[0..4], .little));
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, files[16..20], .little));
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, files[files.len - 4 ..]);
+}
+
+test "fixture trace reserves releases and final results after probe and medium floods" {
+    var budget: TraceBudget = .{};
+    for (0..10000) |_| {
+        _ = budget.admit(.probe);
+        _ = budget.admit(.medium);
+    }
+    try std.testing.expect(budget.admit(.release));
+    try std.testing.expect(budget.admit(.final));
+    try std.testing.expectEqual(@as(usize, 128), budget.counts[@intFromEnum(TraceClass.probe)]);
+    try std.testing.expectEqual(@as(usize, 48), budget.counts[@intFromEnum(TraceClass.medium)]);
+    try std.testing.expectEqual(@as(usize, 20000 - 128 - 48), budget.suppressed);
+}
+
+test "fixture trace is bounded to 256 entries even for critical floods" {
+    var budget: TraceBudget = .{};
+    var admitted: usize = 0;
+    for (0..10000) |_| {
+        for ([_]TraceClass{ .probe, .medium, .release, .final }) |class| {
+            if (budget.admit(class)) admitted += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 256), admitted);
+    try std.testing.expectEqual(@as(usize, 40000 - 256), budget.suppressed);
 }
