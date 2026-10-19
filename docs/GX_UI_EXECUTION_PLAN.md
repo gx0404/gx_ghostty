@@ -1,11 +1,11 @@
 # GX UI 当前执行计划：单对话原生子智能体、集中验证、R6 收口
 
-## 当前检查点（2026-10-19，r9）
+## 当前检查点（2026-10-19，r9 基础及 r10 OLE 候选）
 
 本节是当前执行口径；后文 10-18/r5 的“当前状态”“最新候选”“已无额外实现工作”及批次收尾均为历史记录，正文原样保留，不代表 r9 已完成。总状态仍为 **`not_complete`**；142 叶正式账本 `.local/evidence/R5/execution-20261013/leaf-matrix.json` 的 **`results` 仍为 0**，候选映射与工具独审、离线 GREEN 均不代实测 PASS。下称 F3 为 `.local/evidence/R5/execution-20261013/final-r3`，表中路径相对 `F3/root/`。
 
 - 用户裁定（已写入 `F3/r6-contract.md` 的 2026-10-19 补充）：C2-G **显式配置始终优先**，不只在 shell 提示符处；形状与闪烁分别约束，显式等于默认值也有效。修复已提交 `805fa4556`；旧解释与旧证据保留，不能据此签完整 PASS。Win11 无系统设置副作用的隔离普通功能允许在宿主补验，仍不改宿主系统设置；跨账户、安装升级/注册冲突、DPI/高对比/勿扰等系统改动留 VM，Win11 不可代证 Win10。
-- 身份：此检查点核对的 HEAD 为 `38686a750`、tree 为 `ecf6108dbc04568fa252c88a68fc95fe196c6be1`；r9 构建身份仍是 `dc02219fe`、tree `08e903eba89f6cd8eefa466b8a1bfbf205d71dd3`、`source_dirty=true` 加 `r9-current-bind-20261019-01/native-source-before.json` 的文件哈希。root 此前核对 1543/1543 native 文件与该清单一致；后续工具或文档提交不倒写构建身份。r9 app SHA256 为 `d98ad539f1c94387001f052fd8a3610c7af4fdc7787bbfb99d76c0fe44375861`；root 核对原执行目录没有 ConPTY/OpenConsole 旁车。
+- 身份：此检查点核对的 HEAD 为 `700ada696`、tree 为 `418c0388a858b751a7b83f16f2f6cec223fc110b`；r9 构建身份仍是 `dc02219fe`、tree `08e903eba89f6cd8eefa466b8a1bfbf205d71dd3`、`source_dirty=true` 加 `r9-current-bind-20261019-01/native-source-before.json` 的文件哈希。root 此前核对 1543/1543 native 文件与该清单一致；后续工具或文档提交不倒写构建身份。r9 app SHA256 为 `d98ad539f1c94387001f052fd8a3610c7af4fdc7787bbfb99d76c0fe44375861`；root 核对原执行目录没有 ConPTY/OpenConsole 旁车。
 - 构建次数：r9 已超出下文原定“最多 r8 后冻结”的上限，是为实际缺陷修复（含落实 C2-G 原计划语义的优先级修复与测试运行时守卫）追加的实际轮次；原上限不倒改，也不因此认定 r9 已是签收完成的 rF。
 
 原报告中的视觉 PENDING 字段保留；已读图结论与读取记录是否归档分别核对，未归档不等于未读。
@@ -17,6 +17,8 @@
 | Session | `r9-session-{roundtrip,boundaries}-20261019-01/report.json`；`r9-session-dual-privacy-quick-20261019-{01,02}/report.json` 及 02 的 raw/3 PNG | 第三批 02 已 exit 0，**SES-06/07/08 三项 native PASS**。paused before/after 字节相等（SHA `733a28e5…e6166`、gen8），first `resume_verified=true`，正常 Quit 后 gen9、完整 2 窗各 2 tab 保留；second exit 0。root 与 O2 Faraday 各 **3/3 已读**，O2 已核 SHA：`GhosttyGxPopupShadow` Busy 完整提示 PASS；privacy 合成环境/动态 title/scrollback marker 实际上屏、session JSON 无 marker。Quick 图仅窗口与块光标、无 prompt，不代 shell ready；工具窗口及关闭后 2 普通窗归档逻辑相等，排除结论仅据 native。root 核四个原 PID 均不存在；夹具作者/root 各 **31 项离线 PASS**，独审通过。01 second-busy FAIL 及更早写者归因未成立的 FAIL 原件均保留，既有范围不扩大。 |
 | UIA | `r9-uia-terminal-events-20261019-01/report.json`、`reviews/UIA-05.json`、`reviews/UIA-06.json` | 终端节点、分屏焦点与真实客户端 N2–N4 事件的自动检查 PASS；报告仍为 `PENDING_VISUAL_REVIEW`，不代讲述人、Win10 或完整无障碍签收。 |
 | GTK 设置定向回归 | `r9-gtk-settings-regression-20261019-01/{G26,G27}/` | **PASS_SCOPED**：G26 14 张、G27 16 张全部由 O2 逐张读取，root 重核全部 30 张 SHA 并累计独立抽查 7 张。保存失败、Revert、预览另一主题时 Retry、跨窗失败草稿保留与重试符合本批预期。G27 的 counts.json 为中途 **3 builds/17 opens**，完整 raw 是 **4 builds/21 opens、5 条 theme.reload**，不能混用。仅 GTK r9 Debug/X11/Xvfb 回归；meta exit 0 不等于 app 正常退出：清理记录为 owned pidfd SIGTERM、child_exit=-15。不代 P4 性能或完整 C2-G；人工读图结果仍未落盘归档。 |
+| Session 追加边界 | `r9-session-final-boundaries-20261019-01/`；`r9-session-write-failure-20261019-02/` | 18:38 批次 **SES-00/03a/04 自动检查 PASS**，root 读完 8 图；SES-05 因夹具读取受拒和 `icacls /restore` 缺权限 **FAIL 保留**。root 已精确恢复旧批次 3 份 DACL、核原存档哈希未变，5 个自有应用 PID 均不存在。最小夹具返修后 18:57 仅复验 SES-05，exit 0：前／动作后／Quit 后／恢复后及实际路径 **5 份存档逐字节一致**，SHA `f9d7ad18…ce501`；3 份 DACL 精确恢复，PID 35324 已不存在。root 与独立 O2 均 **9/9 已读**，O2 判四项 PASS_SCOPED；两张失败提示图的 occluder HWND 缺 owner/PID，归属仍 PENDING，不能猜定。随后独审发现原始显式 ALLOW 可能被 `/deny` 削减；新增注入前保护及 AI／重解析点回归后 Windows **72/72**、WSL **68 PASS/4 原生平台 SKIP**，三轮独审通过，已提交 `700ada696`。18:57 GUI 对应旧驱动 SHA `dfc5fd35…19f91`，不冒充最新 `2fd5459b…c3b5` 的运行；最新驱动 GUI 及正式归档 PENDING，不能签完整 Session PASS。 |
+| V4 原生补验 | `r9-native-bell-system-20261019-01/`；`r9-native-bell-software-20261019-{01,02}/` | 同 r9 test exe SHA `515542eb…cc08cb`，`--no-build --filter "native bell border" --jobs 1 --seed 0xb3111019`：NVIDIA **5/5**，显式 `GALLIUM_DRIVER=llvmpipe LP_NUM_THREADS=4` 的 Mesa **5/5**，无 skip。原件证明隐藏 FBO 像素／状态／上下文重建与空闲发布唤醒链；不代桌面 SwapBuffers、DWM、真实 DPI、GTK 或完整 V4。软件 01 没经过产品 `chooseLib` 的 llvmpipe 固定逻辑，首项原 **600 s timeout** 后 root 中止其余等待，自有进程核空；机器汇总未生成，超时仅存会话命令原件。02 使用同 exe／DLL、同 seed 修正调用环境后通过，不改写 01。可补旧叶映射 R2-App.07／R2-Render.01 的同名 N 测试跳过缺口，但不是两叶完整签收。 |
 | P6 正式 | `p6-r9-final-20261019-01/{quiet,measure}/RESULT.json`；旧诊断 `p6-fixture-diagnostic-r9-20261019-{01,02}/` 保留 | 十对 **20 runs 完成**，quiet **VALID**、command exit 0；新臂 **10/10 各唯一 `theme.reload=1`**，旧臂无埋点仍 n0。O2 40 张、root 抽查 4 张已读（会话证据，未手工归档）；动作前选中不等于预览，动作后 Previewing 另有图证。仅记 r9 范围，旧诊断不充正式样本。 |
 | P5 正式 | `p5-r9-final-20261019-01/{quiet,measure}/RESULT.json` 及逐轮 raw | 十对 **20 runs 完成**，quiet **VALID**、command exit 0；新臂 **9240 frames**，paint median **0.6365 ms**、p90 **0.719 ms**，layout/frame max **0**；每轮 paint p90<2 ms、layout/frame max≤10。root 按 raw 每窗口/线程逐帧重数 9240 一致；8 工位 O2 全读 **1010 张**且逐图 SHA 核对一致，root 已读/hash **101 张原图**。**PASS（仅 r9 测量范围）**；旧臂无埋点 n0，不扩大到未绑定的 rF 或所有视觉平台。 |
 | C8 | `c8-r9-webdata-20261019-01/webdata-verify.json`；工具提交 `38686a750` | 既有 config/actions/commands 三份 MDX 全文比对 **PASS**，不重编。新提交仅工具；root 回报 Windows/WSL 各 **24 项 PASS**。**exe→source receipt 仍缺**，不称 C8 完整 PASS，CI 的 `5ea7604b4` 成功也不覆盖此工具提交。 |
@@ -29,11 +31,34 @@ r9 离线包仅记 **PASS_SCOPED（包构造与内容核验）**：root 已完�
 
 剩余动作由 root 统一安排，不因本次文档更新重跑全量：
 
-1. Session 本批仅 **SES-06/07/08** native PASS（另有既有 **SES-01/02/03** 限定证据），不代表 Session 全关；**SES-00/03a/04/05** 等未跑会话边界、IPC 及原计划其他功能/V/P 缺口仍须按 `docs/GX_UI_REMAINING_PLAN.md` 原完整契约补验，并核对最终树绑定与实际影响，不是仅剩绑定。root 确认第三批已于 **17:24:00**（idle **909.89 s**）实际执行并 exit 0，逐图结论见上表。**15:16:45** 的 idle=598 s、未启动记录保留，不记作 17:16；01 及更早夹具 FAIL 不回写，归因未成立的不写成产品缺陷。
+1. **SES-00/03a/04/05** 的追加执行及失败修复见上表，独审与 O2 已完成，待最新驱动 GUI／最终树绑定；既有 **SES-01/02/03/06/07/08** 仍按所列限定证据，不代表 Session 全关。IPC 及原计划其他功能/V/P 缺口仍须按 `docs/GX_UI_REMAINING_PLAN.md` 原完整契约补验，不是仅剩绑定。root 确认 SES-06/07/08 第三批于 **17:24:00**（idle **909.89 s**）实际执行并 exit 0。**15:16:45** 的 idle=598 s、未启动记录保留，不记作 17:16；各旧 FAIL 不回写，归因未成立的不写成产品缺陷。
 2. 核对 C2-G、Session、UIA 等已有截图的逐图结论及对应 app 身份；读取记录未落盘时不称“已归档”。完成 r9/rF 绑定、复用范围裁决后才逐叶写正式结果，142 叶候选清单不等于签收。
 3. 保留 P4/P7 FAIL 与其余平台/硬件等缺口，按原门槛补测；C8 补齐 exe→source receipt 后再作完整裁决。由 root 决定离线包安装、GUI 与旁车路径补验，不以包或工具检查代证。
 
 本节是计划要求的跟进文档，**不代替被 hook 拒绝的证据归档**。
+
+19:00 补记：`c0ea2a078` 的 push CI **39235905376 success**，应运行 job 全通过；macos、gtk-smoke 按 push 条件跳过，不冒称本树手动冒烟已跑。四份单测原件已下载至 `F3/ci-artifacts/39235905376/{early,late}/`：Windows app 1310 PASS/23 SKIP、Linux main 4410/62、Linux VT 6650/70、Windows VT 6662/62；本地 3 个权限失败同名用例在本轮 CI 均 PASS，本地 FAIL 不改写。该 CI 不覆盖上述未提交的 ACL 夹具返修。Win10 始终未确认登录，最新锁屏图为 `win10-r9-20261019-01/login-status-03.png`；19:00 已正常 owned stop、容器 exited 143、启动包装器 exit 0，两个 VM 均停止，磁盘／ISO／r9 包保留。Win10 暂存夹具仍绑定 `c0ea2a078`，尚不含未提交返修；登录后执行前须更新并重新核身份。
+
+20:36 追加检查点（不回写上面的历史执行条件）：
+
+- 用户取消启动前十分钟桌面空闲门；`--no-start-idle-gate` 显式记录新条件和旧条件是否满足，默认行为不变。其他软件仅观察的既有裁定继续有效；批内输入／前台／指针、自有身份、槽、构建测试与 VM 门、原性能数值门保持。新工具独审通过；Windows 三个相关框架模块 449 项、3 SKIP，其余 PASS；WSL `test_gx_perf` 207 项、1 SKIP，其余 PASS。旧 P2 三次未启动仍 n=0，当日同批尝试不重置。
+- IPC：`r9-ipc-boundaries-20261019-02` 与 `r9-ipc-negative-20261019-01` 共 8 图独立 O2 全读、SHA 匹配，root 已抽查。范围限 launcher 复用／独立执行、六 launcher 竞争、不同私有配置根、相同 exe 不同目录、非响应冒名端点；不代不同构建、实际安装及跨账户隔离。早期 crash 例无内部 ready 证据；另批 `r9-ipc-native-seams-20261019-01/IPC-03` 用 hold-ready 原生 marker 补验通过。
+- IPC-04b 的快速退出观测竞态修复已独审，Windows／WSL 各 12/12。`r9-ipc-native-seams-20261019-02` 实际四项 exit 0：合法格式冒名 hello 因 `DifferentImage` 被拒、GUI 失败 secondary exit 1、不重复执行重放、六 launcher 的全局热键 attempts/success/current 为 1/1/1。12 个自有 app PID 复查均不在；O2 5/5 图已读、SHA 匹配，root 抽查 Quick 图。四例 N 为 PASS_SCOPED；IPC-07 主窗口 after 被同进程 Quick 窗遮挡，完整主窗口 G 仍 PENDING，不误报产品故障。旧 04b FAIL 保留。
+- OLE：`r9-ole-typed-source-20261019-01` 前五项原生断言通过，O2 11/11 图已读并核 SHA、root 抽查 2 图。Unicode／单文件／多文件／URI 四例可见预期粘贴内容；shell_metachar 显示 `Cannot drop here` 且提示符后为空，只签拒绝反馈，不因 COPY 签成功粘贴。完整无 Enter 仍需目标输入证据。quoted_path **FAIL**（source exit 2、effect COPY、成功 medium 2／释放 1），multiline 未跑。候选旧 HDROP 回退链尚缺最终 trace，先补有界关键 trace 与失败 after 取证，不放宽拒绝或释放断言；controlled IDataObject 不是 Explorer 真源。
+- `700ada696` 的 push CI **39249027328 success**；四份新 artifacts 已下载至 `F3/ci-artifacts/39249027328/` 并逐条重数：Windows app 1310 PASS/23 SKIP（seed `0xd8c08786`），Linux main 4410/62（`0xfb310740`），Linux VT 6650/70（`0xb5432289`），Windows VT 6662/62（`0xc37e6958`）。本地三个 FAIL 的精确同名用例在新 CI 均 PASS，本地原件不改写；另有 tinyio `openFile symlink handling` 在 Windows CI 为 SKIP，不误报全族通过。IPC／perf 修复已分别提交 `20ff175fa`／`a5dbedb52`，不将旧 CI 覆盖扩大到它们。
+- 启动豁免实机探针 `start-idle-waiver-probe-20261019-01` exit 0：新条件满足，旧 idle 门不满足（36.25 秒），所有其他门通过；这不是性能测量结果。P2 单窗 11 标签可见批 `p2-r9-w1-t11-visible-20261019-01` 已实际运行：old 完成 5 轮、r9 完成 4 轮，r9 第 5 轮因 60 秒测量窗内外部输入终止（tick `177599531→177614406`）。结束时其他门全部通过，但批内输入门失败，整批 **INVALID**，原件保留、有效正式样本 n=0，不拼接局部数值签收。证据目录写入例外虽获授权，策略仍未由人工改入；正式审阅归档与叶账本仍未写入，不把会话报告称作已归档。
+
+20:55 OLE 补证：新 helper SHA `6abf0651…c45dc`（源码 `ad4a0c6c…e1ff8`）经 fmt-check、Zig 4/4 与 build-exe 验证；Python 最初 Windows 9/9，WSL 因未 mock `CREATE_NO_WINDOW` 失败，补平台常量 mock 后 root 两平台各 9/9。`r9-ole-quoted-trace-20261019-02` 再现原 **FAIL**：149 行 trace 保住最终事件，medium 1 引用 3→0，medium 2 无释放，DoDragDrop 返回 COPY，旧 HDROP 路径仍记录拒绝引用。新增 failure-after 已读：空提示符及小窗口残影，不猜定残影归属。`r9-ole-multiline-20261019-01` exit 0、GetData/release 1/1，多行保护显示 2 行 37 字符，Esc 后提示符为空；root 已读保护与取消两图，O2 六张新图已逐张读取并核对 SHA；保护与取消路径 PASS_SCOPED，完整无 Enter 及残影归属仍 PENDING。两批各 app/source/PTY/conhost 的四个 PID 均已不存在；不扩大为产品缺陷已修。独审另指出纯失败截图不应写成输入注入痕迹；夹具两处 `probe=True` 与真实审计回归已修，root 双平台各 10/10，独审通过，三夹具文件提交 `d3006954c`。两批 GUI 的 driver 仍是 `63b9d932…3010f`，不能代最终 `03f753b1…d84c7` 的输入审计实测。产品旧入口修复另行实现，不把工具补证当作产品修复。
+
+### r10 OLE 最小修复候选
+
+生产改动仅在成功安装 OLE target、重新解析 attachment 并接管后关闭该 HWND 的旧文件拖放入口；不在撤销或重挂接时重新启用。新增真实窗口注册成功／失败、撤销／重新安装及恶意 HDROP 拒绝回归。只涉及 `src/apprt/win32/Surface.zig` 与 `ole_drop.zig`，后者仅测试变化。r10 为新发现缺陷而追加，继续保留原构建轮次上限的偏离，不称全计划已冻结。
+
+- 首轮 `zig-out-delivery-r10` 编译因新增测试 `defer if` 赋值语法退出 1，没有运行测试；原输出保留。只加 block 修复后，新目录 `zig-out-delivery-r10b` 的 `install test-bin` 构建 exit 0。
+- 构建身份：`d3006954c` 加未提交的 Surface SHA `09123d8508d7885e6f983189c6edb4e3ec23f8c8fe285126541055e94bc02481`、ole_drop SHA `0c159e2c03055a46147de5ead2a40b82366b3c9365d9a2fb5553fa09313905fe`。1543 个 native 文件相对 r9 原清单只有这两项变化。ReleaseFast app SHA `fae6657ab92292726720e1218d87dca28f7e8a06e732db1939820a34fa749426`，Debug test SHA `6e5f05ce0fefd9e63f2f5373e21381e79b0e29267b1b09590f502c87d57df536`；不倒写 clean receipt，正式构建归档仍 PENDING。
+- `r10-ole-targeted-20261019-01/tests.json`：`--filter "OLE " --filter "runtime reference reparent" --jobs 2 --seed 0xa101019 --no-build`，**16/16 PASS、0 SKIP**；补丁闭集／测试根框架 **146/146**，规则检查、格式检查及 KB 新鲜度通过。不是最终完整框架、main 或平台门。
+- `r10-ole-rejection-control-20261019-01` 真实回放 exit 0：quoted_path source exit 4、effect 0、medium 1/1，旧 HDROP 拒绝日志不再出现；single_file source exit 0、effect 1、medium 1/1。root 已读两张 after：恶意路径后空提示符，正常带空格／中文／emoji 的完整路径带双引号显示。8 个 app/source/PTY/conhost PID 复查均不存在。O2 四图全部独立读取并核 SHA、两例 N/G PASS_SCOPED，源码独审通过；修复提交 `7ece28e73`，r10b 构建身份仍保留为 `d3006954c` 加当时两份摘要。r9 两批 FAIL 保留，Explorer／完整无 Enter／完整重挂接矩阵不扩签。
+- 三个工具提交已 push 至 origin；`d3006954c` 的 gx-ci `39257738400` 仍运行，不把它覆盖扩大到后续 r10 源码提交。完整框架另受待人工应用的证据目录策略例外影响，`test_ai_tool_hooks` 当前 RED 未提交；不以局部通过冒充全树通过。
 
 ## 历史依据（截至 2026-10-18，正文原样保留）
 
