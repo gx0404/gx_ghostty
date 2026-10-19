@@ -267,8 +267,12 @@ def await_tree(read, predicate, record, clock, sleep):
         except ValueError as exc:
             record({"complete": False, "error": str(exc)})
         else:
-            if clock() < deadline and predicate(rows):
+            within_deadline = clock() < deadline
+            matched = predicate(rows)
+            if within_deadline and matched:
                 return rows
+            record({"complete": True, "nodes": rows, "matched": matched,
+                    "within_deadline": within_deadline})
         if clock() >= deadline:
             raise ValueError("AT-SPI state unknown or did not reach requested state before deadline")
         sleep(0.05)
@@ -344,8 +348,10 @@ def capture_session(api, identity, spec):
 
     def await_widget(kind, opened):
         def unknown(attempt):
-            report["observations"].append({**attempt, "widget": kind, "requested_opened": opened,
-                                            "ns": time.monotonic_ns(), "live": live()})
+            # Rejected complete trees are diagnostics, never successful transitions.
+            target = report.setdefault("widget_attempts", []) if attempt["complete"] else report["observations"]
+            target.append({**attempt, "widget": kind, "requested_opened": opened,
+                           "ns": time.monotonic_ns(), "live": live()})
             persist()
         live()
         rows = await_tree(read_widgets, lambda rows: widget_state(rows, kind) == opened,

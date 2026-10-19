@@ -315,6 +315,34 @@ class ProbeTests(unittest.TestCase):
                 gtk.accessibility_reader(100)(0.25)
             self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
 
+    def test_complete_mismatch_retained_before_unknown_deadline(self):
+        now, attempts = [0.0], []
+        rows = [{"name": "Main Menu", "role": "toggle button"}]
+        def read(timeout):
+            if not attempts:
+                now[0] = 4.8
+                return rows
+            now[0] += timeout
+            raise ValueError("snapshot timed out")
+        def sleep(delay):
+            now[0] += delay
+        with self.assertRaisesRegex(ValueError, "deadline"):
+            gtk.await_tree(read, lambda r: False, attempts.append, lambda: now[0], sleep)
+        self.assertEqual(attempts, [
+            {"complete": True, "nodes": rows, "matched": False, "within_deadline": True},
+            {"complete": False, "error": "snapshot timed out"}])
+
+    def test_matching_tree_after_deadline_retained_but_rejected(self):
+        now, attempts = [0.0], []
+        rows = [{"name": "Settings", "role": "dialog"}]
+        def read(timeout):
+            now[0] = 5.0
+            return rows
+        with self.assertRaisesRegex(ValueError, "deadline"):
+            gtk.await_tree(read, lambda r: True, attempts.append, lambda: now[0], Mock())
+        self.assertEqual(attempts, [
+            {"complete": True, "nodes": rows, "matched": True, "within_deadline": False}])
+
     def test_atspi_complete_or_partial_and_gerror(self):
         import ctypes
         for failure in (None, "count", "child", "error", "state", "name", "pid"):
