@@ -1174,13 +1174,16 @@ class DebStageTests(Case):
             ("link out of share", lambda usr: os.symlink("../../bin/ghostty", usr / "share/ghostty/escape"),
              "outside share/"),
             ("dangling link", lambda usr: os.symlink("missing", usr / "share/ghostty/dangling"), "not a file"),
-            ("linked directory", lambda usr: os.symlink("../locale", usr / "share/ghostty/linked"),
+            ("linked directory", lambda usr: os.symlink(str(Path("..") / "locale"), usr / "share/ghostty/linked",
+                                                       target_is_directory=True),
              "symlink or reparse point"),
         )
         for index, (label, mutate, message) in enumerate(cases):
             with self.subTest(case=label):
                 destdir = deb_prefix(self.base / f"case-{index}")
                 mutate(destdir / "usr")
+                if label == "linked directory":
+                    self.assertTrue((destdir / "usr/share/ghostty/linked").is_dir())
                 with self.assertRaisesRegex(pkg.PackageError, message):
                     self.build(self.base / f"stage-{index}", prefix=destdir, deb_depends="libc6")
                 self.assertFalse((self.base / f"stage-{index}").exists())
@@ -1188,6 +1191,12 @@ class DebStageTests(Case):
     def test_test_package_from_the_stage(self):
         stage, manifest = self.build()
         seen = {}
+        chmod_requests = {}
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            chmod_requests[Path(path)] = mode
+            return real_chmod(path, mode, *args, **kwargs)
 
         def runner(command, **kwargs):
             tree = Path(command[-2])
@@ -1195,11 +1204,16 @@ class DebStageTests(Case):
             seen["link"] = os.readlink(tree / "usr/bin/ghostty-gx")
             seen["modes"] = {oct((tree / path).stat().st_mode & 0o777)
                              for path in ("usr", "usr/lib/ghostty-gx/bin", "DEBIAN")}
+            # Windows chmod only controls the read-only bit. Still verify every
+            # directory received the exact POSIX mode; Linux also checks stat.
+            seen["requested_modes"] = {chmod_requests[Path(directory)]
+                                       for directory, _, _ in os.walk(tree)}
             write(Path(command[-1]), b"!<arch>\n")
             return subprocess.CompletedProcess(command, 0)
 
         output = self.base / "out" / "test.deb"
-        with mock.patch.object(stage_mod.shutil, "which", return_value="/usr/bin/dpkg-deb"):
+        with mock.patch.object(stage_mod.shutil, "which", return_value="/usr/bin/dpkg-deb"), \
+                mock.patch.object(stage_mod.os, "chmod", side_effect=chmod):
             self.assertEqual(stage_mod.test_deb(stage, output, runner), output)
             with self.assertRaisesRegex(pkg.PackageError, "must not exist yet"):
                 stage_mod.test_deb(stage, output, runner)
@@ -1208,7 +1222,9 @@ class DebStageTests(Case):
                      f"Depends: {manifest['deb_depends']}", f" gx0404/gx_ghostty {SHA}. GX Shell ships the real package."):
             self.assertIn(line, control)
         self.assertEqual(seen["link"], "../lib/ghostty-gx/bin/ghostty")
-        self.assertEqual(seen["modes"], {"0o755"})
+        self.assertEqual(seen["requested_modes"], {0o755})
+        if os.name != "nt":
+            self.assertEqual(seen["modes"], {"0o755"})
         with mock.patch.object(stage_mod.shutil, "which", return_value=None), \
                 self.assertRaisesRegex(pkg.PackageError, "dpkg-deb is not installed"):
             stage_mod.test_deb(stage, self.base / "other.deb", runner)
