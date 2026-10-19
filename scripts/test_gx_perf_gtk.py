@@ -418,6 +418,39 @@ class ProbeTests(unittest.TestCase):
 
 
 class WidgetStateTests(unittest.TestCase):
+    @staticmethod
+    def embedded_settings():
+        return ([{"role": "panel", "name": "Settings", "path": [0, 3]}] +
+                [{"role": "page tab", "name": name, "path": [0, 3, 1, i]}
+                 for i, name in enumerate(("Language", "Appearance", "Font", "Interaction", "Shell", "About"))] +
+                [{"role": "push button", "name": "Close", "path": [0, 3, 2]}])
+
+    def test_gtk_414_embedded_settings_panel(self):
+        # Adw 1.5 exposes the in-window Settings dialog as a panel. The six
+        # page tabs and its own Close button identify that panel's subtree.
+        self.assertTrue(gtk.widget_state(self.embedded_settings(), "settings"))
+
+    def test_settings_panel_incomplete_or_foreign_subtree_is_unknown(self):
+        for change in (lambda rows: rows.pop(), lambda rows: rows.pop(1),
+                       lambda rows: rows[-1].update(path=[0, 4, 2]),
+                       lambda rows: rows[1].update(path=[0, 4, 1, 0])):
+            rows = self.embedded_settings()
+            change(rows)
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                gtk.widget_state(rows, "settings")
+
+    def test_settings_panel_requires_snapshot_local_paths(self):
+        for path in (None, [], "0/3", [0, -3], [False, 3]):
+            rows = self.embedded_settings()
+            rows[0]["path"] = path
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                gtk.widget_state(rows, "settings")
+
+    def test_settings_multiple_representations_are_ambiguous(self):
+        rows = self.embedded_settings() + [{"role": "dialog", "name": "Settings"}]
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            gtk.widget_state(rows, "settings")
+
     def test_gtk_414_main_menu_without_gmenu_item_labels(self):
         # Observed in the complete p4-gtk-r7-20261019-03 AT-SPI snapshots:
         # GMenu item labels are absent, but the showing menu object is named.

@@ -294,9 +294,27 @@ def widget_state(rows, kind):
     if kind not in targets:
         raise ValueError("unknown performance widget: " + kind)
     role, name = targets[kind]
-    matches = [row for row in rows if row["role"] == role and row["name"] == name]
+    roles = ("dialog", "panel") if kind == "settings" else (role,)
+    matches = [row for row in rows if row["role"] in roles and row["name"] == name]
     if len(matches) > 1:
         raise ValueError("ambiguous showing performance widget: " + kind)
+    if matches and matches[0]["role"] == "panel":
+        # Adw 1.5's in-window dialog has a panel role. Require its actual
+        # subtree, not six labels or the main window's Close button elsewhere.
+        def path_of(row):
+            path = row.get("path")
+            if not isinstance(path, list) or not path or any(type(i) is not int or i < 0 for i in path):
+                raise ValueError("missing or invalid Settings snapshot path")
+            return path
+        root = path_of(matches[0])
+        descendants = [row for row in rows if len(path_of(row)) > len(root) and
+                       path_of(row)[:len(root)] == root]
+        tabs = [row["name"] for row in descendants if row["role"] == "page tab"]
+        required = {"Language", "Appearance", "Font", "Interaction", "Shell", "About"}
+        close = [row for row in descendants if row["role"] == "push button" and row["name"] == "Close"]
+        if len(tabs) != len(required) or set(tabs) != required or len(close) != 1:
+            # A visible but incomplete panel is unknown, never proof of closure.
+            raise ValueError("incomplete Settings panel subtree")
     return bool(matches)
 
 
