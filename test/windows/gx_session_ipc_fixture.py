@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 import subprocess
 import shutil
+import threading
 import time
 import traceback
 
@@ -28,6 +29,11 @@ from gx_fixture_evidence import native_snapshot, sha256, write_review, fixture_s
 CONFIG = "language = en\nconfirm-close-surface = false\n"
 CREATE_SUSPENDED = 0x00000004  # Win32 creation flag; not exported by every Python build.
 WS_EX_NOACTIVATE = 0x08000000  # menu popups: Windows never makes them the foreground window
+SESSION_BUSY = "The session is already in use by another instance."
+# Popup.zig registers exactly these two classes; Toast requests shadow=true.
+GX_POPUP_CLASSES = ("GhosttyGxPopup", "GhosttyGxPopupShadow")
+POPUP_OBSERVATION_LIMIT = 32
+POPUP_TEXT_LIMIT = 256
 CASE_IDS = {"multi": "IPC-01", "disabled": "SES-00", "custom": "SES-03a",
             "roundtrip": "SES-01", "missing_profile": "SES-02", "priority": "SES-03",
             "cancel_close": "SES-04", "write_failure": "SES-05", "dual_writer": "SES-06",
@@ -127,6 +133,230 @@ def wait(predicate, seconds=15):
     raise AssertionError("bounded wait failed")
 
 
+class ProcessControl:
+    """Query and suspend/resume only the retained Popen handle; never reopen a PID."""
+    def __init__(self):
+        from ctypes import wintypes as w
+        self.w = w
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.nt = ctypes.WinDLL("ntdll")
+        for library, name, result, args in (
+            (self.kernel, "GetProcessId", w.DWORD, [w.HANDLE]),
+            (self.kernel, "GetProcessTimes", w.BOOL, [w.HANDLE, *([ctypes.POINTER(w.FILETIME)] * 4)]),
+            (self.kernel, "QueryFullProcessImageNameW", w.BOOL, [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]),
+            (self.kernel, "WaitForSingleObject", w.DWORD, [w.HANDLE, w.DWORD]),
+            (self.nt, "NtSuspendProcess", ctypes.c_long, [w.HANDLE]),
+            (self.nt, "NtResumeProcess", ctypes.c_long, [w.HANDLE]),
+        ):
+            function = getattr(library, name)
+            function.restype, function.argtypes = result, args
+
+    def identity(self, handle):
+        created, exited, kernel, user = (self.w.FILETIME() for _ in range(4))
+        image, length = ctypes.create_unicode_buffer(32768), self.w.DWORD(32768)
+        if (not self.kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                            ctypes.byref(kernel), ctypes.byref(user)) or
+                not self.kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length))):
+            raise AssertionError("cannot query owned process handle")
+        return {"pid": self.kernel.GetProcessId(handle), "birth": (created.dwHighDateTime << 32) | created.dwLowDateTime,
+                "exe": image.value, "live": self.kernel.WaitForSingleObject(handle, 0) == 0x102}
+
+    def suspend(self, handle):
+        return self.nt.NtSuspendProcess(handle)
+
+    def resume(self, handle):
+        return self.nt.NtResumeProcess(handle)
+
+
+def owned_process_handle(process, instance, control):
+    """The OS facts must match the launch identity, including the exact handle's PID."""
+    handle = int(process._handle)
+    actual = control.identity(handle)
+    if (process.pid != instance.pid or actual["pid"] != instance.pid or not instance.creation or
+            actual["birth"] != instance.creation or not actual["live"] or
+            not gui.same_path(actual["exe"], instance.exe)):
+        raise AssertionError("owned process handle identity mismatch")
+    return handle
+
+
+class PausedProcess:
+    """Keep the Store's kernel lease alive while excluding its owner's writes.
+
+    No window query or PID-based operation is permitted here. Recovery uses the
+    original handle: one resume attempt, or termination with confirmed exit.
+    Watchdog expiry and forced cleanup can never count as a normal Quit.
+    """
+    def __init__(self, process, instance, evidence, *, control=None):
+        self.process, self.instance, self.evidence = process, instance, evidence
+        self.control = control if control is not None else ProcessControl()
+        self.lock = threading.Lock()
+        self.resume_due = False
+        self.cleanup_required = False
+        self.failed_restore = False
+        self.failure_cleanup = {"status": "NOT_REQUIRED", "normal_quit": False, "exit_code": None, "attempts": []}
+        self.timed_out = False
+        self.watchdog_error = None
+        self.timer = None
+        self.evidence.update(timed_out=False, resume_verified=False, events=[], failure_cleanup=self.failure_cleanup)
+
+    def __enter__(self):
+        self.handle = owned_process_handle(self.process, self.instance, self.control)
+        self.evidence.update(pid=self.instance.pid, birth=self.instance.creation, exe=self.instance.exe,
+                             handle=self.handle, identity_verified=True, budget_seconds=45,
+                             lease="Suspension retains the process and its Store lock handle; no unlock or close.")
+        self.deadline = time.monotonic() + 45
+        status = None
+        try:
+            # Register compensation BEFORE entering ctypes: an interruption can
+            # hide a successful native return. Only a known failure cancels it.
+            self.cleanup_required = True
+            self.resume_due = True
+            try:
+                status = self.control.suspend(self.handle)
+            finally:
+                if status is not None and status < 0:
+                    self.resume_due = False
+                    self.cleanup_required = False
+            self.evidence["suspend_status"] = status
+            if status < 0:
+                raise AssertionError("NtSuspendProcess failed for owned process")
+            self.evidence["suspend_outcome"] = "success"
+            self.evidence["events"].append({"phase": "suspended", "monotonic_ns": time.monotonic_ns()})
+            self.timer = threading.Timer(max(0, self.deadline - time.monotonic()), self._watchdog)
+            self.timer.daemon = True
+            self.timer.start()
+            return self
+        except BaseException:
+            try:
+                self._resume("enter-failed")
+            finally:
+                if self.timer is not None:
+                    self.timer.cancel()
+                self.evidence["suspend_outcome"] = "unknown" if status is None else ("failed" if status < 0 else "success")
+            raise
+
+    def _resume(self, phase):
+        # Serialize the watchdog against normal cleanup: never decrement a
+        # suspend count twice. Retaining Popen keeps this handle owned throughout.
+        with self.lock:
+            if not self.resume_due:
+                if self.cleanup_required:
+                    self._terminate_locked(phase)
+                return
+            status, verified = None, False
+            # Claim the single attempt before ctypes. If its result is unknown,
+            # retrying could consume another suspend count. The independent
+            # cleanup obligation survives until resume or exit is confirmed.
+            try:
+                self.resume_due = False
+                status = self.control.resume(self.handle)
+                if status < 0:
+                    raise AssertionError("NtResumeProcess failed for owned process")
+                if owned_process_handle(self.process, self.instance, self.control) != self.handle:
+                    raise AssertionError("owned process handle changed after resume")
+                verified = True
+                self.cleanup_required = False
+            finally:
+                try:
+                    if self.cleanup_required:
+                        self._terminate_locked(phase)
+                finally:
+                    # Evidence cannot prevent cleanup or re-arm resume, even
+                    # when a dictionary write itself raises an exception.
+                    self.evidence["resume_outcome"] = "unknown" if status is None else ("failed" if status < 0 else "success")
+                    self.evidence["resume_status"] = status
+                    self.evidence["resume_verified"] = verified
+                    self.evidence["events"].append({"phase": phase, "status": status, "monotonic_ns": time.monotonic_ns()})
+
+    def _terminate_locked(self, phase):
+        """Fail closed using retained Popen's Windows handle, never Instance.close.
+
+        TerminateProcess is asynchronous. Even when terminate raises (including
+        an interrupted return), only wait on that same handle can prove exit.
+        This five-second failure cleanup is separate from the 45-second probe.
+        """
+        self.failed_restore = True
+        terminate_error, wait_error, code = None, None, None
+        try:
+            if int(self.process._handle) != self.handle:
+                raise AssertionError("owned Popen handle changed; refusing failure cleanup")
+            try:
+                self.process.terminate()
+            except BaseException as error:
+                terminate_error = f"{type(error).__name__}: {error}"
+            finally:
+                if int(self.process._handle) != self.handle:
+                    raise AssertionError("owned Popen handle changed before exit confirmation")
+                code = self.process.wait(timeout=5)
+                if type(code) is not int:
+                    raise AssertionError("owned process wait did not confirm an exit code")
+                self.cleanup_required = False
+        except BaseException as error:
+            wait_error = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            # Record only after the handle operations so logging cannot leave
+            # a suspended first writer behind. Never label this normal Quit.
+            attempt = {"phase": phase, "handle": self.handle, "exit_code": code,
+                       "monotonic_ns": time.monotonic_ns()}
+            if terminate_error:
+                attempt["terminate_error"] = terminate_error
+            if wait_error:
+                attempt["wait_error"] = wait_error
+            self.failure_cleanup["attempts"].append(attempt)
+            self.failure_cleanup["status"] = "EXIT_UNCONFIRMED" if self.cleanup_required else "EXIT_CONFIRMED"
+            self.failure_cleanup["exit_code"] = None if self.cleanup_required else code
+
+    def fail_closed(self):
+        """Runner fallback for an unconfirmed exit; never retry resume or use GUI."""
+        with self.lock:
+            if self.cleanup_required:
+                self._terminate_locked("runner-cleanup")
+
+    def _watchdog(self):
+        self.timed_out = True
+        try:
+            self._resume("watchdog-resume")
+        except BaseException as error:
+            self.watchdog_error = str(error)
+        finally:
+            try:
+                self.evidence["timed_out"] = True
+                if self.watchdog_error:
+                    self.evidence["watchdog_error"] = self.watchdog_error
+            except BaseException as error:
+                self.watchdog_error = self.watchdog_error or str(error)
+
+    def remaining(self, limit=15):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            self._watchdog()
+        if self.timed_out:
+            raise AssertionError("first writer pause budget exceeded (45 seconds); isolation lost")
+        if self.failed_restore:
+            raise AssertionError("first writer required failure termination; not a normal Quit")
+        return min(limit, remaining)
+
+    def __exit__(self, *_):
+        try:
+            if self.deadline <= time.monotonic():
+                self.timed_out = True
+        finally:
+            try:
+                self._resume("finally-resume")
+            finally:
+                if self.timer is not None:
+                    self.timer.cancel()
+                    self.timer.join()
+        self.evidence["timed_out"] = self.timed_out
+        if self.watchdog_error:
+            self.evidence["watchdog_error"] = self.watchdog_error
+        if self.timed_out:
+            raise AssertionError("first writer pause budget exceeded (45 seconds); isolation lost")
+        if self.failed_restore:
+            raise AssertionError("first writer required failure termination; not a normal Quit")
+
+
 class Fixture:
     def __init__(self, exe, out, build, expected_hash=None, peer_exe=None, peer_hash=None):
         self.exe, self.out = exe.resolve(strict=True), out.resolve()
@@ -135,6 +365,7 @@ class Fixture:
         self.out.mkdir(parents=True, exist_ok=False)
         self.owned = []
         self.processes = {}
+        self.pause_guards = {}
         self.expected_terminations = set()
         self.peer_exe = peer_exe.resolve(strict=True) if peer_exe else None
         self.peer_hash = peer_hash
@@ -147,6 +378,9 @@ class Fixture:
             "cases": [], "processes": [], "captures": [], "visual_review": "PENDING",
             "fixture_sources": source_manifest(),
         }
+        for module in (gui, gx_slots):
+            source = Path(module.__file__)
+            self.report["fixture_sources"][str(source.relative_to(ROOT)).replace("\\", "/")] = sha256(source)
 
     def environment(self, name, config):
         path = self.out / name
@@ -339,18 +573,187 @@ class Fixture:
 
     def dual_writer(self):
         path = self.environment("dual-writer", CONFIG + "gx-session-restore = true\ngx-single-instance = false\n")
-        self.seed_document(path, complex_document(path))
-        first = self.start(path)
-        wait(lambda: len(self.windows(first)) == 2)
-        before = self.session(path).read_bytes()
-        second = self.start(path)
-        second.wait_window(15)
-        self.capture(second, "dual-writer-busy-feedback")
-        self.close(second)
-        assert self.session(path).read_bytes() == before, "second writer changed the first writer's archive"
-        self.quit(first)
-        assert layout_contract(self.load_document(path)) == layout_contract(complex_document(path))
-        self.report["cases"].append({"case_id": "SES-06", "name": "single-private-state-writer", "status": "PASS"})
+        evidence = {"phase": "seed", "events": [], "archives": [], "logs": [], "pause": {}}
+        self.report["dual_writer"] = evidence
+        expected = complex_document(path)
+        expected_layout = layout_contract(expected)
+
+        def phase(name):
+            evidence["phase"] = name
+            evidence["events"].append({"phase": name, "monotonic_ns": time.monotonic_ns()})
+
+        def archive(label, raw=None):
+            entry = {"phase": label, "source": str(self.session(path)), "monotonic_ns": time.monotonic_ns(),
+                     "file": f"dual-writer-{label}.raw", "pause_timed_out": evidence["pause"].get("timed_out")}
+            evidence["archives"].append(entry)
+            try:
+                raw = self.session(path).read_bytes() if raw is None else raw
+                (self.out / entry["file"]).write_bytes(raw)
+                entry.update(sha256=hashlib.sha256(raw).hexdigest(), size=len(raw))
+            except BaseException as error:
+                entry["error"] = str(error)
+                raise
+            # Preserve bytes before parsing; read failures stay explicit above.
+            # Parsed metadata never substitutes for byte equality.
+            try:
+                entry["generation"] = json.loads(raw)["generation"]
+            except (ValueError, KeyError, TypeError) as error:
+                entry["parse_error"] = str(error)
+            return raw
+
+        def shared_logs(label):
+            for suffix in ("", ".1"):
+                source = gui.log_path(path).with_name("ghostty.log" + suffix)
+                entry = {"phase": label, "source": str(source), "attribution": "shared path; not a per-PID log"}
+                evidence["logs"].append(entry)
+                if not source.is_file():
+                    entry["missing"] = True
+                    continue
+                try:
+                    raw = source.read_bytes()
+                    name = f"dual-writer-{label}-shared-ghostty.log{suffix}"
+                    (self.out / name).write_bytes(raw)
+                    entry.update(file=name, sha256=hashlib.sha256(raw).hexdigest(), size=len(raw))
+                except BaseException as error:
+                    entry["error"] = str(error)
+                    raise
+
+        try:
+            archive("seed", self.seed_document(path, expected))
+            first = self.start(path)
+            phase("first-ready")
+            wait(lambda: len(self.windows(first)) == 2)
+            evidence["first"] = native_snapshot(first)
+            previous = None
+
+            def ready():
+                nonlocal previous
+                first.ensure_owned()
+                raw = self.session(path).read_bytes()
+                document = json.loads(raw)
+                if document["generation"] <= expected["generation"]:
+                    return None
+                if layout_contract(document) != expected_layout:
+                    archive("ready-invalid", raw)
+                    raise AssertionError("first writer saved an unexpected logical layout")
+                stable, previous = raw == previous, raw
+                return raw if stable else None
+
+            ready_raw = archive("ready", wait(ready, 15))
+            phase("pause-first")
+            paused = PausedProcess(self.processes[first.pid], first, evidence["pause"])
+            self.pause_guards[first.pid] = paused
+            with paused:
+                second = None
+                try:
+                    phase("before")
+                    before = archive("before")
+                    baseline = json.loads(before)
+                    assert baseline["generation"] >= json.loads(ready_raw)["generation"]
+                    assert layout_contract(baseline) == expected_layout, "first layout changed before suspension"
+                    shared_logs("before")
+                    paused.remaining()
+                    phase("second-start")
+                    second = self.start(path)
+                    evidence["second"] = {"pid": second.pid, "birth": second.creation, "exe": second.exe}
+                    second.wait_window(paused.remaining())
+                    phase("second-busy")
+                    evidence["busy"] = {"status": "NOT_OBSERVED", "expected_text": SESSION_BUSY,
+                                        "source_pid": second.pid, "source_birth": second.creation, "polls": 0,
+                                        "observations": [], "observations_limit": POPUP_OBSERVATION_LIMIT,
+                                        "text_limit": POPUP_TEXT_LIMIT, "text_truncated_count": 0, "observations_dropped": 0}
+
+                    def busy_popup():
+                        paused.remaining()
+                        second.ensure_owned()
+                        busy = evidence["busy"]
+                        busy["polls"] += 1
+                        api = gui.win32()
+                        # Observe only second's HWNDs, including hidden/cloaked
+                        # ones for timeout diagnostics. Never query paused first.
+                        for popup in second.windows():
+                            pid = api.window_pid(popup.hwnd)
+                            observation = {"class": popup.cls[:POPUP_TEXT_LIMIT], "title": popup.title[:POPUP_TEXT_LIMIT],
+                                           "hwnd": popup.hwnd, "pid": pid, "visible": popup.visible, "cloaked": popup.cloaked,
+                                           "text_truncated": len(popup.cls) > POPUP_TEXT_LIMIT or len(popup.title) > POPUP_TEXT_LIMIT}
+                            # Count window samples with any truncated text,
+                            # including repeats and records later evicted.
+                            busy["text_truncated_count"] += int(observation["text_truncated"])
+                            if observation not in busy["observations"]:
+                                if len(busy["observations"]) == POPUP_OBSERVATION_LIMIT:
+                                    busy["observations"].pop(0)
+                                    busy["observations_dropped"] += 1
+                                busy["observations"].append(observation)
+                            # Truncated diagnostic strings never authorize a
+                            # match: require the exact native class and text.
+                            if (popup.cls not in GX_POPUP_CLASSES or popup.title != SESSION_BUSY
+                                    or not popup.visible or popup.cloaked
+                                    or popup.rect[2] <= popup.rect[0] or popup.rect[3] <= popup.rect[1]):
+                                continue
+                            owner = api.GetAncestor(popup.hwnd, 3)
+                            owner_pid = api.window_pid(owner) if owner else 0
+                            observation.update(owner_hwnd=owner, owner_pid=owner_pid)
+                            if not owner or owner == popup.hwnd or pid != second.pid or owner_pid != second.pid:
+                                raise gui.InputBlocked("Busy popup has no owned second-writer window")
+                            second.ensure_owned()
+                            return popup
+                        return None
+
+                    popup = wait(busy_popup, paused.remaining())
+                    phase("second-busy-capture")
+                    count = len(self.report["captures"])
+                    self.capture(second, "dual-writer-busy-feedback", popup)
+                    assert len(self.report["captures"]) == count + 1
+                    captured = self.report["captures"][-1]
+                    assert captured["window"]["hwnd"] == popup.hwnd and captured["window"]["title"] == SESSION_BUSY, "Busy popup changed before capture"
+                    assert captured["window"]["cls"] == popup.cls, "Busy popup class changed before capture"
+                    assert captured["identity"]["process"]["pid"] == second.pid and captured["identity"]["process"]["birth"] == second.creation
+                    evidence["busy"].update(status="OBSERVED_NATIVE", text=SESSION_BUSY, hwnd=popup.hwnd,
+                                            **{"class": popup.cls}, pid=second.pid, birth=second.creation,
+                                            capture=captured["file"], visual_review="PENDING_REVIEW")
+                    paused.remaining()
+                except BaseException:
+                    evidence["failed_phase"] = evidence["phase"]
+                    raise
+                finally:
+                    try:
+                        if second is not None:
+                            phase("second-close")
+                            try:
+                                if self.processes[second.pid].poll() is None:
+                                    self.close(second)
+                            finally:
+                                evidence["second_exit"] = self.processes[second.pid].poll()
+                            assert evidence["second_exit"] == 0, "second writer did not exit normally"
+                    except BaseException:
+                        evidence.setdefault("failed_phase", evidence["phase"])
+                        raise
+                    finally:
+                        phase("after-before-resume")
+                        after = archive("after")
+                        shared_logs("after")
+                paused.remaining()
+                phase("compare-paused")
+                evidence["bytes_equal_while_paused"] = after == before
+                assert evidence["bytes_equal_while_paused"], "archive changed while first writer was suspended"
+                phase("first-resume")
+            phase("first-quit")
+            self.quit(first)
+            evidence["first_exit"] = self.processes[first.pid].wait(timeout=5)
+            assert evidence["first_exit"] == 0, "first writer did not exit normally"
+            final = json.loads(archive("first-quit"))
+            assert final["generation"] > baseline["generation"], "first writer did not save after resume"
+            assert final["windows"] and layout_contract(final) == expected_layout, "first writer archive is no longer usable"
+            phase("complete")
+        except BaseException as error:
+            evidence.setdefault("failed_phase", evidence["phase"])
+            evidence["error"] = str(error)
+            archive("failure")
+            raise
+        finally:
+            shared_logs("final")
+        self.report["cases"].append({"case_id": "SES-06", "name": "single-private-state-writer", "status": "PASS",
+                                     "evidence": evidence})
 
     def privacy(self):
         marker = "GX_PRIVATE_53B18"
@@ -376,7 +779,7 @@ class Fixture:
         window = instance.require_window()
         instance.ensure_owned()
         gui.win32().PostMessageW(window.hwnd, gui.WM_CLOSE, 0, 0)
-        dialog = wait(lambda: next((w for w in instance.popups() if w.cls in ("GhosttyGxPopup", "#32770")), None))
+        dialog = wait(lambda: next((w for w in instance.popups() if w.cls in (*GX_POPUP_CLASSES, "#32770")), None))
         self.capture(instance, "cancel-close-confirm", dialog)
         instance.press("escape")
         wait(lambda: not any(w.hwnd == dialog.hwnd for w in instance.popups()))
@@ -650,14 +1053,30 @@ class Fixture:
                 first_result = len(self.report["cases"])
                 try:
                     getattr(self, name)()
-                except Exception as error:
+                except BaseException as error:
+                    if not isinstance(error, Exception) and name != "dual_writer":
+                        raise
                     self.report["cases"].append({"name": name, "status": "FAIL", "reason": str(error),
-                                                 "traceback": traceback.format_exc()})
+                                                 "traceback": traceback.format_exc(),
+                                                 **({"evidence": self.report["dual_writer"]} if name == "dual_writer" and "dual_writer" in self.report else {})})
+                    if not isinstance(error, Exception):
+                        raise
                 finally:
                     for instance in self.owned[first:]:
-                        if instance.log.is_file():
+                        if name != "dual_writer" and instance.log.is_file():
                             (self.out / f"{name}-{instance.pid}.log").write_bytes(instance.log.read_bytes())
                     for instance in self.owned:
+                        guard = self.pause_guards.get(instance.pid)
+                        if guard is not None and (guard.failed_restore or guard.cleanup_required):
+                            cleanup = {"name": name + "/cleanup", "status": "FAIL", "pid": instance.pid,
+                                       "reason": "first writer required handle-only failure cleanup; never normal Quit",
+                                       "evidence": guard.failure_cleanup}
+                            self.report["cases"].append(cleanup)
+                            try:
+                                guard.fail_closed()
+                            except BaseException as error:
+                                cleanup["error"] = f"{type(error).__name__}: {error}"
+                            continue  # In particular, no alive/close call on a possibly suspended GUI.
                         if instance.alive():
                             outcome = instance.close(1)
                             if outcome == "terminated":
