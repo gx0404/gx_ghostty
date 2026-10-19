@@ -27,6 +27,17 @@ _CALLBACK_ANCHORS = []
 PATTERNS = {"invoke": (10000, {"invoke": 3}), "selection_item": (10010, {"select": 3, "add": 4, "remove": 5}),
             "value": (10002, {"set": 3}), "toggle": (10015, {"toggle": 3}),
             "expand_collapse": (10005, {"expand": 3, "collapse": 4})}
+# Verified against Microsoft Windows SDK 10.0.26100.0 um/UIAutomationClient.h:
+# IUIAutomationElementVtbl slot 14: GetCurrentPatternAs(PATTERNID, REFIID, void**).
+# Slot 16 returns IUnknown**, whose vtable must never be used as a typed pattern.
+# These are CLIENT IUIAutomation*Pattern IIDs, not provider I*Provider IIDs.
+PATTERN_IIDS = {"invoke": "fb377fbe-8ea6-46d5-9c73-6499642d3059",
+                "selection_item": "a8efa66a-0fda-421a-9194-38021f3578ea",
+                "value": "a94cd8b1-0844-4cd6-9d2d-640537ab39e9",
+                "toggle": "94cf8058-9b8d-4ab9-8bfd-4cd0a33c8c70",
+                "expand_collapse": "619be086-1f4e-4ee4-bafa-210128738730"}
+
+
 # IUIAutomationElement methods a plan calls on the element itself, not through a
 # control pattern (vtable slot): SetFocus, and a HasKeyboardFocus read only.
 ELEMENT_OPERATIONS = {"set_focus": 3, "check_focus": None}
@@ -62,7 +73,7 @@ def physical_coordinates(user):
 
 def stale_action_hresult(hr, has_pattern, followup):
     """For an expect_unavailable action: the HRESULT that decides it, or None to
-    go on to the action call. A failed GetCurrentPattern decides at once. UIA
+    go on to the action call. A failed typed pattern lookup decides at once. UIA
     core can answer S_OK with no pattern for a hidden provider's retained element
     (round3-batch-20261018-112356 UIA-02) without surfacing the provider's error;
     then the provider's own answer to a property read (followup) decides."""
@@ -71,6 +82,185 @@ def stale_action_hresult(hr, has_pattern, followup):
     if has_pattern:
         return None
     return followup()
+
+
+CALL_NAMES = {"invoke": "Invoke", "select": "Select", "add": "AddToSelection", "remove": "RemoveFromSelection",
+              "set": "SetValue", "toggle": "Toggle", "expand": "Expand", "collapse": "Collapse"}
+
+
+def get_typed_pattern(method, element, action, pattern):
+    """The caller owns the out-pointer even if COM fails after populating it."""
+    import ctypes as C
+    iid = (C.c_ubyte * 16).from_buffer_copy(uuid.UUID(PATTERN_IIDS[action["pattern"]]).bytes_le)
+    return method(element, 14, C.c_long, C.c_int, C.POINTER(type(iid)), C.POINTER(C.c_void_p))(
+        element, PATTERNS[action["pattern"]][0], C.byref(iid), C.byref(pattern))
+
+
+class Cleanup:
+    """Attempt each caller-supplied cleanup once, defer errors until all finish."""
+    def __init__(self):
+        self.records = []
+        self.interruption = None
+
+    def run(self, label, function, *, hresult=False):
+        row = {"call": label, "succeeded": False}
+        self.records.append(row)
+        try:
+            result = function()
+            if hresult:
+                row["hresult"] = f"0x{result & 0xffffffff:08x}"
+                if result < 0:
+                    raise RuntimeError(f"COM failure {row['hresult']}")
+            row["succeeded"] = True
+        except BaseException as error:
+            row["error"] = f"{type(error).__name__}: {error}"
+            if not isinstance(error, Exception) and self.interruption is None:
+                self.interruption = error
+        return row["succeeded"]
+
+    def finish(self, original, diagnostic):
+        diagnostic["cleanup"] = self.records
+        failures = [f"{row['call']}: {row['error']}" for row in self.records if not row["succeeded"]]
+        if failures:
+            diagnostic["cleanup_error"] = "; ".join(failures)
+        if isinstance(original, ProbeFailure):
+            # Preserve the primary call/stage/HRESULT frozen at failure.
+            original.diagnostic["cleanup"] = copy.deepcopy(self.records)
+            if failures:
+                original.diagnostic["cleanup_error"] = diagnostic["cleanup_error"]
+        if original is not None:
+            return  # Includes KeyboardInterrupt/SystemExit already propagating.
+        if self.interruption is not None:
+            raise self.interruption
+        if failures:
+            raise ProbeFailure(diagnostic["cleanup_error"], diagnostic)
+
+
+def call_pattern(method, pattern, action, strings, cleanup=None, on_call=None):
+    """Client Value.SetValue takes BSTR (SDK UIAutomationClient.h), not LPCWSTR.
+    SysAllocStringLen counts UTF-16 code units; Python len counts code points.
+    """
+    import ctypes as C
+    operation = PATTERNS[action["pattern"]][1][action["operation"]]
+    if action["pattern"] != "value":
+        function = method(pattern, operation, C.c_long)
+        if on_call:
+            on_call()
+        return function(pattern)
+    strings.SysAllocStringLen.argtypes = [C.POINTER(C.c_ushort), C.c_uint]
+    strings.SysAllocStringLen.restype = C.c_void_p
+    strings.SysFreeString.argtypes, strings.SysFreeString.restype = [C.c_void_p], None
+    encoded = action["value"].encode("utf-16-le", errors="surrogatepass")
+    source = C.create_string_buffer(encoded + b"\0\0")
+    own_cleanup = cleanup is None
+    if own_cleanup:
+        cleanup = Cleanup()
+    bstr = strings.SysAllocStringLen(C.cast(source, C.POINTER(C.c_ushort)), len(encoded) // 2)
+    if not bstr:
+        raise MemoryError("SysAllocStringLen returned null")
+    try:
+        function = method(pattern, operation, C.c_long, C.c_void_p)
+        if on_call:
+            on_call()
+        return function(pattern, bstr)
+    finally:
+        original = sys.exc_info()[1]
+        cleanup.run("SysFreeString", lambda: strings.SysFreeString(bstr))
+        if own_cleanup:
+            cleanup.finish(original, {})
+
+
+class RetainedPatterns:
+    """Explicit ownership on the worker's MTA; never release via a destructor.
+
+    Register the out-pointer before calling COM so even a failed acquisition
+    with a non-null output is cleaned up by the worker's outer finally.
+    """
+    def __init__(self, method, release, thread_id, stage, diagnostic, strings, cleanup=None):
+        self.method, self.release, self.thread_id = method, release, thread_id
+        self.stage, self.diagnostic = stage, diagnostic
+        self.strings, self.cleanup = strings, cleanup
+        self.owner = thread_id()
+        self.refs = {}
+        self.audit = {"acquired": 0, "released": 0, "release_attempts": 0, "interfaces": []}
+        diagnostic["retained_patterns"] = self.audit
+
+    def require_owner(self):
+        if self.thread_id() != self.owner:
+            raise RuntimeError("retained patterns must stay on their owning MTA thread")
+
+    def acquire(self, index, action, element, node_id):
+        import ctypes as C
+        self.require_owner()
+        if index in self.refs:
+            raise RuntimeError("pattern already retained for this action")
+        pattern = C.c_void_p()
+        entry = {"action_index": index, "node_id": node_id, "pattern_id": PATTERNS[action["pattern"]][0],
+                 "acquired_at": "before_ready", "acquisition_thread": self.owner,
+                 "pattern_hresult": None, "pattern_returned": False, "release_thread": None,
+                 "pattern_iid": PATTERN_IIDS[action["pattern"]], "acquisition_call": "IUIAutomationElement.GetCurrentPatternAs"}
+        self.refs[index] = (pattern, entry)
+        self.audit["interfaces"].append(entry)
+        self.stage("retain.pattern", "IUIAutomationElement.GetCurrentPatternAs", node_id=node_id,
+                   pattern_id=entry["pattern_id"], action_index=index, property_id=None)
+        try:
+            hr = get_typed_pattern(self.method, element, action, pattern)
+            entry["pattern_hresult"] = f"0x{hr & 0xffffffff:08x}"
+            self.diagnostic["hresult"] = entry["pattern_hresult"]
+        finally:
+            entry["pattern_returned"] = bool(pattern)
+            self.audit["acquired"] += int(bool(pattern))
+        if hr < 0 or not pattern:
+            raise ProbeFailure("cannot retain pattern before ready: successful HRESULT and non-null interface required",
+                               self.diagnostic)
+
+    def invoke(self, index, action):
+        self.require_owner()
+        pattern, entry = self.refs[index]
+        if not pattern or entry["pattern_hresult"] is None or int(entry["pattern_hresult"], 16) & 0x80000000:
+            raise ProbeFailure("no successfully retained pattern to invoke", self.diagnostic)
+        call = CALL_NAMES[action["operation"]]
+        self.stage("action.invoke", call, node_id=entry["node_id"], pattern_id=entry["pattern_id"],
+                   action_index=index, property_id=None)
+        entry.update(method_called=False, method_call=call, method_thread=self.owner, method_at="after_signal")
+        hr = call_pattern(self.method, pattern, action, self.strings, self.cleanup,
+                          on_call=lambda: entry.update(method_called=True))
+        entry["method_hresult"] = f"0x{hr & 0xffffffff:08x}"
+        self.diagnostic["hresult"] = entry["method_hresult"]
+        result = {"action": action, "hresult": entry["method_hresult"], "thread": self.owner,
+                  "stage": "action.invoke", "call": call, "node_id": entry["node_id"],
+                  "pattern_id": entry["pattern_id"], "pattern_hresult": entry["pattern_hresult"],
+                  "pattern_returned": True, "decided_by": "retained_pattern_method",
+                  "pattern_iid": entry["pattern_iid"], "acquisition_call": entry["acquisition_call"],
+                  "acquired_at": entry["acquired_at"], "acquisition_thread": entry["acquisition_thread"],
+                  "method_called": True, "method_at": "after_signal"}
+        self.diagnostic.setdefault("action_results", []).append(result)
+        if action.get("expect_unavailable"):
+            if hr & 0xffffffff != 0x80040201:
+                raise ProbeFailure(f"stale pattern method did not return UIA_E_ELEMENTNOTAVAILABLE: {result}", self.diagnostic)
+        elif hr < 0:
+            raise ProbeFailure(f"COM failure {result['hresult']}", self.diagnostic)
+        return result
+
+    def close(self, cleanup=None):
+        self.require_owner()
+        own_cleanup = cleanup is None
+        if own_cleanup:
+            cleanup = Cleanup()
+        while self.refs:
+            index, (pattern, entry) = self.refs.popitem()
+            if pattern:
+                entry["release_thread"] = self.owner
+                entry["release_attempted"] = True
+                self.audit["release_attempts"] += 1
+                success = cleanup.run(f"retained pattern[{index}].Release", lambda: self.release(pattern))
+                entry["release_succeeded"] = success
+                if success:
+                    self.audit["released"] += 1
+                else:
+                    entry["release_error"] = cleanup.records[-1]["error"]
+        if own_cleanup:
+            cleanup.finish(sys.exc_info()[1], self.diagnostic)
 
 
 def focus_expectations_hold(action, facts):
@@ -124,11 +314,16 @@ def read_plan(path):
         raise ValueError("action plan must contain 1..32 exact-node actions")
     for row in rows:
         if not isinstance(row, dict) or set(row) - {"automation_id", "name", "pattern", "operation", "value", "after_signal",
-                                                    "expect_unavailable", *FOCUS_EXPECTATIONS}:
+                                                    "expect_unavailable", "retain_pattern", *FOCUS_EXPECTATIONS}:
             raise ValueError("invalid action fields")
         if not isinstance(row.get("automation_id", row.get("name")), str):
             raise ValueError("action requires an exact automation_id or unique name")
         pattern = row.get("pattern")
+        if "retain_pattern" in row:
+            if not isinstance(row["retain_pattern"], bool):
+                raise ValueError("retain_pattern must be boolean")
+            if row.get("after_signal") is not True or pattern == "element":
+                raise ValueError("retain_pattern requires after_signal=true and a non-element pattern")
         operations = ELEMENT_OPERATIONS if pattern == "element" else PATTERNS.get(pattern, (None, {}))[1]
         if row.get("operation") not in operations:
             raise ValueError("unsupported pattern operation")
@@ -239,9 +434,14 @@ def run_worker(args) -> dict:
         if hr < 0:
             raise ProbeFailure(f"COM failure 0x{hr & 0xffffffff:08x}", diagnostic)
 
+    cleanup = Cleanup()
+
+    def release_raw(obj):
+        method(obj, 2, W.ULONG)(obj)
+
     def release(obj):
         if obj:
-            method(obj, 2, W.ULONG)(obj)
+            cleanup.run("IUnknown.Release", lambda: release_raw(obj))
 
     ole.CoInitializeEx.argtypes = [pointer, W.DWORD]
     ole.CoInitializeEx.restype = HRESULT
@@ -448,6 +648,7 @@ def run_worker(args) -> dict:
     retained_ids = [[] for _ in plan]
     action_results = diagnostic["action_results"]
     owner_thread = kernel.GetCurrentThreadId()
+    patterns = RetainedPatterns(method, release_raw, kernel.GetCurrentThreadId, stage, diagnostic, aut, cleanup)
     lifecycle = {"query_thread": owner_thread, "registration_thread": None, "removal_thread": None,
                  "focus_registration_thread": None, "focus_removal_thread": None,
                  "selection_registration_thread": None, "selection_removal_thread": None}
@@ -736,7 +937,7 @@ def run_worker(args) -> dict:
             return {"focus": facts}
 
         def execute_actions(after_signal):
-            for action, elements, node_ids in zip(plan, retained, retained_ids):
+            for index, (action, elements, node_ids) in enumerate(zip(plan, retained, retained_ids)):
                 if bool(action.get("after_signal")) != after_signal:
                     continue
                 verify_identity(require_hwnd=not after_signal)
@@ -757,28 +958,29 @@ def run_worker(args) -> dict:
                     check(hr)
                     result.update(await_focus(action, elements[0], node_ids[0], events_start))
                     continue
-                pattern_id, operations = PATTERNS[action["pattern"]]
+                if action.get("retain_pattern"):
+                    result = patterns.invoke(index, action)
+                    if not action.get("expect_unavailable"):
+                        result.update(await_focus(action, elements[0], node_ids[0], events_start))
+                    continue
+                pattern_id = PATTERNS[action["pattern"]][0]
                 pattern = pointer()
-                stage("action.pattern", "IUIAutomationElement.GetCurrentPattern", node_id=node_ids[0],
+                stage("action.pattern", "IUIAutomationElement.GetCurrentPatternAs", node_id=node_ids[0],
                       pattern_id=pattern_id, action_index=len(action_results), property_id=None)
-                hr = method(elements[0], 16, HRESULT, C.c_int, C.POINTER(pointer))(elements[0], pattern_id, C.byref(pattern))
-                diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
-                lookup = {"pattern_hresult": diagnostic["hresult"], "pattern_returned": bool(pattern)}
                 try:
+                    hr = get_typed_pattern(method, elements[0], action, pattern)
+                    diagnostic["hresult"] = f"0x{hr & 0xffffffff:08x}"
+                    lookup = {"pattern_hresult": diagnostic["hresult"], "pattern_returned": bool(pattern),
+                              "pattern_iid": PATTERN_IIDS[action["pattern"]],
+                              "acquisition_call": "IUIAutomationElement.GetCurrentPatternAs"}
                     decided = None
                     if action.get("expect_unavailable"):
                         decided = stale_action_hresult(hr, bool(pattern), lambda: raw_property_hresult(elements[0], 30005))
                     if decided is not None:
                         hr, lookup["decided_by"] = decided, diagnostic["call"]
                     elif hr >= 0 and pattern:
-                        operation = operations[action["operation"]]
-                        call_name = {"invoke": "Invoke", "select": "Select", "add": "AddToSelection", "remove": "RemoveFromSelection",
-                                     "set": "SetValue", "toggle": "Toggle", "expand": "Expand", "collapse": "Collapse"}[action["operation"]]
-                        stage("action.invoke", call_name)
-                        if action["pattern"] == "value":
-                            hr = method(pattern, operation, HRESULT, W.LPCWSTR)(pattern, action["value"])
-                        else:
-                            hr = method(pattern, operation, HRESULT)(pattern)
+                        stage("action.invoke", CALL_NAMES[action["operation"]])
+                        hr = call_pattern(method, pattern, action, aut, cleanup)
                     elif hr >= 0:
                         raise RuntimeError("pattern disappeared without an unavailable HRESULT")
                     result = {"action": action, "hresult": f"0x{hr & 0xffffffff:08x}", "thread": kernel.GetCurrentThreadId(),
@@ -796,12 +998,16 @@ def run_worker(args) -> dict:
                     release(pattern)
 
         execute_actions(False)
+        for index, (action, elements, node_ids) in enumerate(zip(plan, retained, retained_ids)):
+            if action.get("retain_pattern"):
+                patterns.acquire(index, action, elements[0], node_ids[0])
         if args.ready_file:
             publish_ready(args.ready_file, {"pid": args.pid, "birth": args.birth, "hwnd": args.hwnd,
                                             "registered": registered, "focus_registered": focus_registered,
                                             "selection_registered": selection_registered, "retained_actions": len(plan),
                                             "thread": owner_thread, "automation_clsid": automation_clsid(args.listen_ms),
-                                            "notification_interface_hr": notification_interface_hr}, ready_marker)
+                                            "notification_interface_hr": notification_interface_hr,
+                                            "retained_patterns": patterns.audit}, ready_marker)
         deadline = time.monotonic() + args.listen_ms / 1000
         queries = 0
         unavailable_queries = 0
@@ -853,7 +1059,7 @@ def run_worker(args) -> dict:
                 "focus_handler_registered": focus_handler is not None,
                 "selection_handler_registered": selection_handler is not None,
                 **observed_events(focus_events, focus_counts, selection_events, selection_counts),
-                "threads": lifecycle}
+                "threads": lifecycle, "retained_patterns": patterns.audit, "cleanup": cleanup.records}
     except Exception as error:
         # A failure keeps what the event handlers saw before it.
         seen = observed_events(focus_events, focus_counts, selection_events, selection_counts)
@@ -864,28 +1070,22 @@ def run_worker(args) -> dict:
         raise ProbeFailure(str(error), diagnostic) from error
     finally:
         original_failure = sys.exc_info()[1]
-        cleanup_error = None
+        cleanup.run("retained patterns cleanup", lambda: patterns.close(cleanup))
         if registered:
-            # HRESULT failure must not masquerade as successful event cleanup.
-            hr = method(automation5, 69, HRESULT, pointer, pointer)(automation5, root, C.byref(handler))
             lifecycle["removal_thread"] = kernel.GetCurrentThreadId()
             registered = False
-            if hr < 0:
-                cleanup_error = f"UIA event unsubscription failed: 0x{hr & 0xffffffff:08x}"
+            cleanup.run("UIA event unsubscription", lambda: method(automation5, 69, HRESULT, pointer, pointer)(
+                automation5, root, C.byref(handler)), hresult=True)
         if selection_registered:
-            hr = method(automation, 33, HRESULT, C.c_int, pointer, pointer)(automation, ELEMENT_SELECTED_EVENT, root, C.byref(selection_handler))
             lifecycle["selection_removal_thread"] = kernel.GetCurrentThreadId()
             selection_registered = False
-            if hr < 0:
-                failure = f"UIA selection event unsubscription failed: 0x{hr & 0xffffffff:08x}"
-                cleanup_error = f"{cleanup_error}; {failure}" if cleanup_error else failure
+            cleanup.run("UIA selection event unsubscription", lambda: method(automation, 33, HRESULT, C.c_int, pointer, pointer)(
+                automation, ELEMENT_SELECTED_EVENT, root, C.byref(selection_handler)), hresult=True)
         if focus_registered:
-            hr = method(automation, 40, HRESULT, pointer)(automation, C.byref(focus_handler))
             lifecycle["focus_removal_thread"] = kernel.GetCurrentThreadId()
             focus_registered = False
-            if hr < 0:
-                failure = f"UIA focus event unsubscription failed: 0x{hr & 0xffffffff:08x}"
-                cleanup_error = f"{cleanup_error}; {failure}" if cleanup_error else failure
+            cleanup.run("UIA focus event unsubscription", lambda: method(automation, 40, HRESULT, pointer)(
+                automation, C.byref(focus_handler)), hresult=True)
         for element, _ in pending:
             release(element)
         for elements in retained:
@@ -893,12 +1093,10 @@ def run_worker(args) -> dict:
                 release(element)
         for element in (walker, root, automation5, automation):
             release(element)
-        ole.CoUninitialize()
-        if cleanup_error:
-            if isinstance(original_failure, ProbeFailure):
-                original_failure.diagnostic["cleanup_error"] = cleanup_error
-            else:
-                raise ProbeFailure(cleanup_error, diagnostic)
+        cleanup.run("CoUninitialize", ole.CoUninitialize)
+        if isinstance(original_failure, ProbeFailure):
+            original_failure.diagnostic["retained_patterns"] = copy.deepcopy(patterns.audit)
+        cleanup.finish(original_failure, diagnostic)
 
 
 def main(argv=None) -> int:

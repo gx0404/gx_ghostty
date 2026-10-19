@@ -10,6 +10,7 @@ import time
 from gx_boundary_controller import InputLanguage, Native, ROOT, EnvironmentUnavailable
 from gx_session_ipc_fixture import wait
 import gx_win_gui as gui
+import gx_win_uia as uia
 
 
 def popup(instance, exclude=()):
@@ -93,20 +94,47 @@ def probe(fixture, instance, hwnd, label, action=None):
     return json.loads(result.stdout)
 
 
+
+def assert_retained_method(result, ready, call):
+    """UIA-02 requires the old pattern's method, not a later property failure."""
+    before, after = ready["retained_patterns"], result["retained_patterns"]
+    assert before["acquired"] == after["acquired"] == after["released"] == 1
+    assert before["released"] == before["release_attempts"] == 0
+    assert after["release_attempts"] == 1
+    assert len(before["interfaces"]) == len(after["interfaces"]) == len(result["actions"]) == 1
+    acquired, released, action = before["interfaces"][0], after["interfaces"][0], result["actions"][0]
+    assert acquired["pattern_iid"] == released["pattern_iid"] == action["pattern_iid"] == uia.PATTERN_IIDS[action["action"]["pattern"]]
+    assert acquired["acquisition_call"] == released["acquisition_call"] == action["acquisition_call"] == "IUIAutomationElement.GetCurrentPatternAs"
+    assert released["release_attempted"] is released["release_succeeded"] is True
+    assert acquired["pattern_returned"] is True and int(acquired["pattern_hresult"], 16) < 0x80000000
+    assert acquired["acquired_at"] == action["acquired_at"] == "before_ready"
+    assert not acquired.get("method_called", False)
+    assert action["action"]["retain_pattern"] is True
+    assert action["decided_by"] == "retained_pattern_method" and action["stage"] == "action.invoke"
+    assert action["method_called"] is released["method_called"] is True
+    assert action["method_at"] == released["method_at"] == "after_signal"
+    assert action["call"] == released["method_call"] == call
+    assert action["hresult"] == released["method_hresult"] == "0x80040201"
+    assert acquired["acquisition_thread"] == action["acquisition_thread"] == action["thread"] == ready["thread"]
+    assert released["method_thread"] == released["release_thread"] == ready["thread"] == result["threads"]["query_thread"]
+    assert acquired["node_id"] == released["node_id"] == action["node_id"]
+    assert acquired["pattern_id"] == released["pattern_id"] == action["pattern_id"]
+
+
 def stale(fixture, instance, first, other):
     gui.win32().activate(first.hwnd)
     instance.press("ctrl+shift+p")
     old = popup(instance)
     worker = Worker(fixture, instance, old.hwnd, "hide-reopen", actions=[{
         "name": "Search", "pattern": "value", "operation": "set", "value": "GX_STALE_MUST_NOT_APPEAR",
-        "after_signal": True, "expect_unavailable": True}])
+        "after_signal": True, "expect_unavailable": True, "retain_pattern": True}])
     try:
-        worker.await_ready()
+        ready = worker.await_ready()
         instance.press("escape")
         wait(lambda: not any(w.hwnd == old.hwnd for w in instance.popups()))
         instance.press("ctrl+shift+p")
         replacement = popup(instance)
-        worker.complete()
+        assert_retained_method(worker.complete(), ready, "SetValue")
         fresh = probe(fixture, instance, replacement.hwnd, "replacement-palette")
         assert not any(n.get("value") == "GX_STALE_MUST_NOT_APPEAR" for n in fresh["nodes"])
         fixture.capture(instance, "hide-reopen-inert", replacement)
@@ -121,14 +149,14 @@ def stale(fixture, instance, first, other):
     nodes = probe(fixture, instance, child.hwnd, "old-submenu")["nodes"]
     node = next(n for n in nodes if n["patterns"].get("invoke") and n["enabled"])
     worker = Worker(fixture, instance, child.hwnd, "submenu-replaced", actions=[{
-        "automation_id": node["automation_id"], "pattern": "invoke", "operation": "invoke", "after_signal": True, "expect_unavailable": True}])
+        "automation_id": node["automation_id"], "pattern": "invoke", "operation": "invoke", "after_signal": True, "expect_unavailable": True, "retain_pattern": True}])
     try:
-        worker.await_ready()
+        ready = worker.await_ready()
         instance.press("escape")
         wait(lambda: not any(w.hwnd == child.hwnd for w in instance.popups()))
         probe(fixture, instance, root.hwnd, "expand-split", {"name": "Split", "pattern": "expand_collapse", "operation": "expand"})
         replacement = popup(instance, (root.hwnd,))
-        worker.complete()
+        assert_retained_method(worker.complete(), ready, "Invoke")
         fixture.capture(instance, "submenu-old-provider-inert", replacement)
         instance.press("escape")
         instance.press("escape")
@@ -137,13 +165,13 @@ def stale(fixture, instance, first, other):
 
     before_tabs = other.query(4)
     worker = Worker(fixture, instance, first.hwnd, "root-destroyed", actions=[{
-        "name": "New Tab", "pattern": "invoke", "operation": "invoke", "after_signal": True, "expect_unavailable": True}])
+        "name": "New Tab", "pattern": "invoke", "operation": "invoke", "after_signal": True, "expect_unavailable": True, "retain_pattern": True}])
     try:
-        worker.await_ready()
+        ready = worker.await_ready()
         first.guard()
         gui.win32().PostMessageW(first.hwnd, gui.WM_CLOSE, 0, 0)
         wait(lambda: not gui.win32().IsWindow(first.hwnd))
-        worker.complete()
+        assert_retained_method(worker.complete(), ready, "Invoke")
         assert other.query(4) == before_tabs
         fixture.capture_native(instance, other, "destroyed-provider-no-replacement-action")
     finally:

@@ -157,7 +157,7 @@ def run_compose(pinyin, press=None):
     error = None
     with mock.patch.object(boundary.gui, "win32", return_value=api), \
             mock.patch("gx_boundary_controller.gui.win32", return_value=api), \
-            mock.patch.object(boundary.C, "WinDLL", return_value=native_dll), \
+            mock.patch.object(boundary.C, "WinDLL", return_value=native_dll, create=True), \
             mock.patch.object(boundary.time, "monotonic", side_effect=lambda: next(ticks) * 0.05), \
             mock.patch.object(boundary.time, "sleep"):
         try:
@@ -166,6 +166,61 @@ def run_compose(pinyin, press=None):
             error = caught
     report = fixture.check.call_args.kwargs if fixture.check.call_args else {}
     return report, error
+
+
+class RetainedBoundaryTests(unittest.TestCase):
+    def test_rejects_the_old_property_based_pass(self):
+        import gx_boundary_uia as boundary
+        with self.assertRaises((KeyError, AssertionError)):
+            boundary.assert_retained_method({'actions': [{'hresult': '0x80040201',
+                'decided_by': 'IUIAutomationElement.GetCurrentPropertyValue'}]}, {}, 'Invoke')
+
+    def test_method_receipt_requires_thread_order_hresult_and_release_evidence(self):
+        import copy
+        import gx_boundary_uia as boundary
+        entry = {'node_id': 'gx-search', 'pattern_id': 10002, 'pattern_returned': True,
+                 'pattern_hresult': '0x00000000', 'acquired_at': 'before_ready', 'acquisition_thread': 71,
+                 'pattern_iid': 'a94cd8b1-0844-4cd6-9d2d-640537ab39e9',
+                 'acquisition_call': 'IUIAutomationElement.GetCurrentPatternAs'}
+        ready = {'thread': 71, 'retained_patterns': {'acquired': 1, 'released': 0, 'release_attempts': 0, 'interfaces': [entry]}}
+        released = dict(entry, method_called=True, method_at='after_signal', method_call='SetValue',
+                        method_hresult='0x80040201', method_thread=71, release_thread=71,
+                        release_attempted=True, release_succeeded=True)
+        action = dict(entry, action={'retain_pattern': True, 'pattern': 'value'}, decided_by='retained_pattern_method',
+                      stage='action.invoke', method_called=True, method_at='after_signal', call='SetValue',
+                      hresult='0x80040201', thread=71)
+        result = {'retained_patterns': {'acquired': 1, 'released': 1, 'release_attempts': 1, 'interfaces': [released]},
+                  'actions': [action], 'threads': {'query_thread': 71}}
+        boundary.assert_retained_method(result, ready, 'SetValue')
+        for key, value in (('decided_by', 'property'), ('method_called', False), ('method_at', 'before_ready'),
+                           ('hresult', '0x00000000'), ('thread', 72), ('call', 'Invoke'),
+                           ('pattern_iid', '00000000-0000-0000-c000-000000000046'),
+                           ('acquisition_call', 'IUIAutomationElement.GetCurrentPattern')):
+            changed = copy.deepcopy(result)
+            changed['actions'][0][key] = value
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                boundary.assert_retained_method(changed, ready, 'SetValue')
+        for key in ('acquired', 'released', 'release_attempts'):
+            changed = copy.deepcopy(result)
+            changed['retained_patterns'][key] = 0
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                boundary.assert_retained_method(changed, ready, 'SetValue')
+
+    def test_all_three_stale_scenarios_require_method_evidence(self):
+        import ast
+        import inspect
+        import gx_boundary_uia as boundary
+        tree = ast.parse(inspect.getsource(boundary.stale))
+        rows = [node for node in ast.walk(tree) if isinstance(node, ast.Dict)
+                and any(isinstance(k, ast.Constant) and k.value == 'expect_unavailable' for k in node.keys)]
+        self.assertEqual(3, len(rows))
+        for row in rows:
+            fields = {k.value: v for k, v in zip(row.keys, row.values) if isinstance(k, ast.Constant)}
+            self.assertIs(True, ast.literal_eval(fields['retain_pattern']))
+        checks = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == 'assert_retained_method']
+        self.assertEqual(['SetValue', 'Invoke', 'Invoke'], [ast.literal_eval(node.args[2]) for node in checks])
+
 
 if __name__ == "__main__":
     unittest.main()
