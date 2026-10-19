@@ -427,6 +427,8 @@ const TestSource = struct {
     release_object: Unknown = .{ .vtable = &unknown_vtable },
     handle: ?*anyopaque = null,
     releases: usize = 0,
+    format: u16 = 13,
+    bytes: []const u8 = &.{ 'a', 0, '\r', 0, '\n', 0, 0, 0 },
     invalidates: ?*Target = null,
     renew_at_get: ?*Target = null,
     renew_at_release: ?*Target = null,
@@ -455,12 +457,12 @@ const TestSource = struct {
     }
     fn get(value: *DataObject, _: *const FormatEtc, medium: *Medium) callconv(.winapi) HRESULT {
         const self: *TestSource = @fieldParentPtr("object", value);
-        const handle = w32.GlobalAlloc(0x0042, 8) orelse return @bitCast(@as(u32, 0x8007000e));
+        const handle = w32.GlobalAlloc(0x0042, self.bytes.len) orelse return @bitCast(@as(u32, 0x8007000e));
         const memory = w32.GlobalLock(handle) orelse {
             _ = w32.GlobalFree(handle);
             return @bitCast(@as(u32, 0x8007000e));
         };
-        @memcpy(memory[0..8], &[_]u8{ 'a', 0, '\r', 0, '\n', 0, 0, 0 });
+        @memcpy(memory[0..self.bytes.len], self.bytes);
         _ = w32.GlobalUnlock(handle);
         self.handle = handle;
         medium.* = .{ .kind = 1, .handle = handle, .release_owner = &self.release_object };
@@ -475,7 +477,7 @@ const TestSource = struct {
     fn queryData(value: *DataObject, format: *const FormatEtc) callconv(.winapi) HRESULT {
         const self: *TestSource = @fieldParentPtr("object", value);
         if (self.invalidates) |target| target.active = false;
-        return if (format.format == 13) 0 else @bitCast(@as(u32, 0x80040064));
+        return if (format.format == self.format) 0 else @bitCast(@as(u32, 0x80040064));
     }
     const object_vtable: DataObject.VTable = .{
         .QueryInterface = @ptrCast(&unused),
@@ -505,6 +507,31 @@ test "OLE medium releases its owned IUnknown exactly once after copying" {
     try std.testing.expectEqual(@as(usize, 1), source.releases);
     try std.testing.expect(source.handle == null);
     try std.testing.expectEqualStrings("a\r\n", context.payload.?.content.text);
+}
+
+test "OLE malformed quoted HDROP rejects COPY and releases its medium" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const path = std.unicode.utf8ToUtf16LeStringLiteral("C:\\owned\\bad\"&echo GX_MUST_NOT_EXECUTE.txt");
+    var bytes: [20 + (path.len + 2) * @sizeOf(u16)]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[0..4], 20, .little);
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    @memcpy(bytes[20..][0 .. path.len * 2], std.mem.sliceAsBytes(path[0..path.len]));
+    // The container is well-formed; it is the hostile filename that is refused.
+    try testing.expectError(error.UnsafePath, data.hdrop(testing.allocator, &bytes));
+    var context: TestContext = .{};
+    defer if (context.payload) |*payload| payload.deinit();
+    var target: Target = .{ .alloc = testing.allocator, .hwnd = @ptrFromInt(1), .attachment = testAttachment(), .callbacks = context.callbacks() };
+    var source: TestSource = .{ .format = 15, .bytes = &bytes };
+    defer if (source.handle) |handle| {
+        _ = w32.GlobalFree(handle);
+    };
+    var effect: u32 = COPY;
+    try testing.expectEqual(@as(HRESULT, 0), drop(&target.interface, &source.object, 0, .{ .x = 1, .y = 2 }, &effect));
+    try testing.expectEqual(@as(u32, 0), effect);
+    try testing.expect(context.payload == null);
+    try testing.expectEqual(@as(usize, 1), source.releases);
+    try testing.expect(source.handle == null);
 }
 
 test "OLE QueryGetData reentrancy revokes acceptance before GetData" {

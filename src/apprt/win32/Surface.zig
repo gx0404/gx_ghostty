@@ -387,8 +387,8 @@ pub fn initWithOptions(
         self.hwnd = null;
     }
 
-    // Accept dropped files so a file dragged onto the terminal pastes
-    // its path. WM_DROPFILES is delivered to surfaceWndProc.
+    // Accept legacy file drops until an OLE target is successfully installed.
+    // WM_DROPFILES is delivered to surfaceWndProc.
     w32.DragAcceptFiles(hwnd, 1);
 
     // Store the Surface pointer in the window's GWLP_USERDATA so that
@@ -3377,6 +3377,105 @@ pub fn installDropTarget(self: *Surface) void {
         return;
     }
     live.drop_target = target;
+    // An OLE rejection must not fall through to legacy WM_DROPFILES acceptance.
+    // Disable it only after adoption, and keep it disabled across retirement
+    // and reparenting. Do not reuse live after this native call.
+    w32.DragAcceptFiles(hwnd, 0);
+}
+
+fn testOleLegacyDropFlag(block_registration: bool, legacy_enabled: bool) !void {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    var app: App = .{
+        .core_app = &core_app,
+        .config = undefined,
+        .hinstance = undefined,
+        .default_command_arena = undefined,
+        .ui_ids = try ui_ref.Issuer.init(123),
+        .com_apartment = @import("ComApartment.zig").init(),
+    };
+    defer app.com_apartment.deinit() catch {};
+    defer app.windows.deinit(alloc);
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const hwnd = w32.CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;
+    defer _ = w32.DestroyWindow(hwnd);
+    var window: Window = .{ .app = &app, .ui_reference = try app.ui_ids.create(.window) };
+    // The stack model keeps one reference; the test tree owns another.
+    var surface: Surface = .{
+        .app = &app,
+        .parent_window = &window,
+        .hwnd = hwnd,
+        .ref_count = 1,
+        .core_surface_initialized = true,
+        .core_surface_ready = true,
+        .ui_reference = try app.ui_ids.surface(42),
+    };
+    surface.ui_attachment = try app.ui_ids.attach(surface.ui_reference, window.ui_reference);
+    try core_app.surfaces.append(alloc, &surface);
+    try app.windows.append(alloc, &window);
+    const leaf = try @import("Leaf.zig").fromLocal(alloc, &surface);
+    window.tab_trees[0] = @TypeOf(window.tab_trees[0]).init(alloc, leaf) catch |err| {
+        leaf.discardUnretained(alloc);
+        return err;
+    };
+    window.tab_count = 1;
+    defer window.tab_trees[0].deinit();
+    defer {
+        if (surface.drop_target) |target| _ = target.destroy();
+        while (app.retired_drop_targets) |target| {
+            app.retired_drop_targets = target.retired_next;
+            _ = target.destroy();
+        }
+    }
+    w32.DragAcceptFiles(hwnd, @intFromBool(legacy_enabled));
+    const accepts_files: isize = 0x10; // WS_EX_ACCEPTFILES
+    try testing.expectEqual(legacy_enabled, w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & accepts_files != 0);
+    // A real prior registration makes the second RegisterDragDrop fail.
+    const blocker = if (block_registration)
+        try OleDrop.Target.create(alloc, &app.com_apartment, hwnd, surface.ui_attachment, app.dropCallbacks())
+    else
+        null;
+    defer if (blocker) |target| {
+        _ = target.destroy();
+    };
+    surface.installDropTarget();
+    try testing.expect(app.constructing_drop_hwnd == null);
+    if (block_registration) {
+        try testing.expect(surface.drop_target == null);
+        try testing.expect(blocker.?.registered);
+        try testing.expectEqual(legacy_enabled, w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & accepts_files != 0);
+        return;
+    }
+    try testing.expect(surface.drop_target != null);
+    try testing.expect(surface.drop_target.?.registered);
+    try testing.expectEqual(@as(isize, 0), w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & accepts_files);
+    surface.revokeDropTarget();
+    try testing.expect(surface.drop_target == null and app.retired_drop_targets != null);
+    try testing.expect(!app.retired_drop_targets.?.active);
+    try testing.expectEqual(@as(isize, 0), w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & accepts_files);
+    const retired = app.retired_drop_targets.?;
+    app.retired_drop_targets = retired.retired_next;
+    try testing.expectEqual(@as(i32, 0), retired.destroy());
+    try testing.expectEqual(@as(isize, 0), w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & accepts_files);
+    // Reinstall on the same HWND with a renewed view, as after reparenting.
+    surface.ui_attachment = try app.ui_ids.attach(surface.ui_reference, window.ui_reference);
+    surface.installDropTarget();
+    try testing.expect(surface.drop_target != null and surface.drop_target.?.registered);
+    try testing.expectEqual(@as(isize, 0), w32.GetWindowLongPtrW(hwnd, w32.GWL_EXSTYLE) & accepts_files);
+}
+
+test "OLE surface adoption keeps legacy file drops disabled through retirement and reinstallation" {
+    try testOleLegacyDropFlag(false, true);
+}
+
+test "OLE surface registration failure preserves the previous legacy drop flag" {
+    try testOleLegacyDropFlag(true, true);
+    try testOleLegacyDropFlag(true, false);
 }
 
 test "runtime reference reparent reservations preserve the old view until commit" {
