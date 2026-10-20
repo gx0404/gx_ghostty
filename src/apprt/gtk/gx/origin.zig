@@ -6,6 +6,7 @@ const configpkg = @import("../../../config.zig");
 const Application = @import("../class/application.zig").Application;
 const Surface = @import("../class/surface.zig").Surface;
 const Overrides = @import("../class/Overrides.zig");
+const launch = @import("launch.zig");
 const key = "gx-launch-origin";
 const failed_key = "gx-launch-origin-failed";
 pub const LaunchOrigin = profiles.LaunchOrigin;
@@ -54,14 +55,24 @@ pub fn created(surface: *Surface, overrides: Overrides, command_copied: bool) vo
 
 /// initial-command is applied by the core only to its first surface, and
 /// overrides every other origin. Configured commands are never reverse-matched
-/// to a profile. Only an explicit stable profile request grants profile origin.
-pub fn initializing(surface: *Surface, config: *const configpkg.Config) !void {
+/// to a profile. Only an explicit stable profile request grants profile origin,
+/// besides the default launch profile: a surface without an explicit origin or
+/// command, when no `command` is configured and GX Zsh is the default profile
+/// (`launch.defaultCommand`), runs GX Zsh and records its id. Otherwise it
+/// keeps the upstream shell of `config` and an unknown origin.
+pub fn initializing(surface: *Surface, config: *configpkg.Config) !void {
     const object = surface.as(gobject.Object);
     if (object.getData(failed_key) != null) return error.OutOfMemory;
-    if (Application.default().core().first and config.@"initial-command" != null) {
+    const app = Application.default();
+    if (app.core().first and config.@"initial-command" != null) {
         try set(surface, .ad_hoc);
     } else if (object.getData(key) == null) {
-        try set(surface, .unknown);
+        if (try launch.defaultCommand(app, config, config.arenaAlloc())) |default| {
+            config.command = default.command;
+            try set(surface, .{ .profile = default.id });
+        } else {
+            try set(surface, .unknown);
+        }
     }
 }
 

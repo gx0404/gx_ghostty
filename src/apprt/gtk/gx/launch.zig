@@ -3,6 +3,10 @@
 //! current UI language and the arguments that start them through the
 //! `app.new-tab` and `app.new-window-command` actions.
 //!
+//! Without a configured `command`, new terminals start the default launch
+//! profile when it is GX Zsh (`defaultCommand`), as on Windows; otherwise
+//! they keep the shell `Config.finalize` chose (the upstream login shell).
+//!
 //! The application keeps the detected shells (`list`), so the menus of
 //! every window, which follow each configuration change, do not probe the
 //! file system each time; detection runs again when `PATH` or `SHELL`
@@ -102,7 +106,6 @@ pub fn list(app: *Application, config: *const configpkg.Config) Allocator.Error!
     const alloc = app.allocator();
     const cache = appCache(app) orelse return try detect(alloc, config);
     const now = glib.getMonotonicTime();
-    if (now - cache.detected_us > cache_lifetime_us) cache.shells.invalidate();
 
     var result: List = .{ .arena = .init(alloc) };
     errdefer result.deinit();
@@ -115,9 +118,8 @@ pub fn list(app: *Application, config: *const configpkg.Config) Allocator.Error!
     defer env.deinit();
 
     const detections = cache.shells.detections;
-    var profiles = try cache.shells.list(alloc, global.io(), &env, custom);
+    var profiles = try cachedProfiles(cache, alloc, &env, custom, now);
     defer profiles.deinit();
-    if (cache.shells.detections != detections) cache.detected_us = now;
     try fill(&result, profiles.profiles, config);
     gx.perf.record("gtk_launch_profiles", @intCast(@max(glib.getMonotonicTime() - now, 0)));
     if (gx.perf.enabled()) log.info("launch profile detections={d} cached={}", .{ cache.shells.detections, cache.shells.detections == detections });
@@ -144,6 +146,84 @@ pub fn detect(alloc: Allocator, config: *const configpkg.Config) Allocator.Error
     return result;
 }
 
+/// The shells the application detected, then `custom`; detects again when
+/// the environment changed or the shells are older than `cache_lifetime_us`.
+/// The caller owns the list.
+fn cachedProfiles(
+    cache: *Cache,
+    alloc: Allocator,
+    env: *const std.process.Environ.Map,
+    custom: []const gx.profiles.Custom,
+    now: i64,
+) Allocator.Error!gx.profiles.List {
+    if (now - cache.detected_us > cache_lifetime_us) cache.shells.invalidate();
+    const detections = cache.shells.detections;
+    const profiles = try cache.shells.list(alloc, global.io(), env, custom);
+    if (cache.shells.detections != detections) cache.detected_us = now;
+    return profiles;
+}
+
+/// The launch profile new terminals start when no `command` is configured.
+pub const Default = struct {
+    /// The stable profile id (`gx-zsh`), for the launch origin.
+    id: [:0]const u8,
+
+    /// The command that starts it.
+    command: configpkg.Command,
+};
+
+/// The default launch profile for the detected `profiles`: null when
+/// `command` is `configured` in any configuration layer
+/// (`gx.profiles.commandConfigured`), or when the platform's default
+/// profile (`gx.profiles.defaultProfile`) is not GX Zsh, so that new
+/// terminals keep the shell `Config.finalize` chose. The id and command
+/// are copied into `alloc` (the arena of the surface configuration).
+pub fn resolveDefault(
+    alloc: Allocator,
+    configured: bool,
+    profiles: []const gx.profiles.Profile,
+    platform: gx.profiles.Platform,
+) Allocator.Error!?Default {
+    if (configured) return null;
+    const profile = gx.profiles.defaultProfile(profiles, platform) orelse return null;
+    if (profile.kind != .gx_zsh) return null;
+    const argv = switch (profile.command) {
+        .argv => |argv| argv,
+        .command_line => return null,
+    };
+    if (argv.len == 0) return null;
+    const copy = try alloc.alloc([:0]const u8, argv.len);
+    for (argv, copy) |arg, *out| out.* = try alloc.dupeZ(u8, arg);
+    return .{
+        .id = try alloc.dupeZ(u8, profile.id),
+        .command = .{ .direct = copy },
+    };
+}
+
+/// The default launch profile of new terminals on the running system for
+/// `config` (`resolveDefault`), with the shells the application detected.
+/// Allocates the result with `alloc`. When the environment cannot be read
+/// it logs and returns null: new terminals keep the upstream shell.
+pub fn defaultCommand(
+    app: *Application,
+    config: *const configpkg.Config,
+    alloc: Allocator,
+) Allocator.Error!?Default {
+    if (gx.profiles.commandConfigured(config._replay_steps.items)) return null;
+    var env = global.environMap() catch |err| {
+        log.warn("cannot read the environment to detect the default shell err={}", .{err});
+        return null;
+    };
+    defer env.deinit();
+    const gpa = app.allocator();
+    var profiles = if (appCache(app)) |cache|
+        try cachedProfiles(cache, gpa, &env, &.{}, glib.getMonotonicTime())
+    else
+        try gx.profiles.detectSystem(gpa, global.io(), &env, &.{});
+    defer profiles.deinit();
+    return try resolveDefault(alloc, false, profiles.profiles, .native);
+}
+
 fn customProfiles(arena: Allocator, config: *const configpkg.Config) Allocator.Error![]const gx.profiles.Custom {
     var custom: std.ArrayList(gx.profiles.Custom) = .empty;
     var it = config.@"gx-launch-profile".iterator();
@@ -154,7 +234,10 @@ fn customProfiles(arena: Allocator, config: *const configpkg.Config) Allocator.E
 }
 
 /// Fills `result` with the items of `profiles`, copied into its arena,
-/// and the default profile of `config`.
+/// and the default profile of `config`: the profile of a configured
+/// `command`, else the platform's default profile (GX Zsh, then the login
+/// shell), which new terminals start (`defaultCommand`). The `command`
+/// that `Config.finalize` fills in is not a configured one.
 fn fill(result: *List, profiles: []const gx.profiles.Profile, config: *const configpkg.Config) Allocator.Error!void {
     const arena = result.arena.allocator();
     const items = try arena.alloc(Item, profiles.len);
@@ -167,10 +250,11 @@ fn fill(result: *List, profiles: []const gx.profiles.Profile, config: *const con
         };
     }
     result.items = items;
+    const configured = gx.profiles.commandConfigured(config._replay_steps.items);
     result.default = try gx.settings_map.commandProfile(
         arena,
         profiles,
-        config.command,
+        if (configured) config.command else null,
         gx.profiles.Platform.native,
     );
 }
@@ -232,15 +316,73 @@ test "List.find matches ids, then names ignoring case" {
     try testing.expectEqual(@as(?*const Item, null), list_.find("fish"));
 }
 
+fn testLoad(config: *configpkg.Config, text: []const u8) !void {
+    const cli = @import("../../../cli.zig");
+    var reader: std.Io.Reader = .fixed(text);
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "test" };
+    try config.loadIter(std.testing.allocator, &iter);
+}
+
+/// GX Zsh, a login shell and bash with distinct program names.
+const test_profiles = [_]gx.profiles.Profile{
+    .{ .id = "gx-zsh", .name = "GX Zsh", .command = .{ .argv = &.{"/usr/lib/ohmyzsh-gx/bin/gx-zsh"} }, .kind = .gx_zsh },
+    .{ .id = "login-shell", .name = "Login Shell", .command = .{ .argv = &.{"/usr/bin/zsh"} }, .kind = .login_shell },
+    .{ .id = "bash", .name = "Bash", .command = .{ .argv = &.{"/usr/bin/bash"} }, .kind = .bash },
+};
+
+test "resolveDefault starts GX Zsh only when it is the default and command is not configured" {
+    const testing = std.testing;
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const default = (try resolveDefault(alloc, false, &test_profiles, .linux)).?;
+    try testing.expectEqualStrings("gx-zsh", default.id);
+    try testing.expectEqual(@as(usize, 1), default.command.direct.len);
+    try testing.expectEqualStrings("/usr/lib/ohmyzsh-gx/bin/gx-zsh", default.command.direct[0]);
+    // Copied into the surface configuration's arena, not borrowed from the detected list.
+    try testing.expect(default.command.direct[0].ptr != test_profiles[0].command.argv[0].ptr);
+
+    try testing.expect(try resolveDefault(alloc, true, &test_profiles, .linux) == null);
+    // Only the login shell and bash: new terminals keep the upstream shell.
+    try testing.expect(try resolveDefault(alloc, false, test_profiles[1..], .linux) == null);
+    try testing.expect(try resolveDefault(alloc, false, &.{}, .linux) == null);
+}
+
+test "fill marks GX Zsh as the default unless command is configured" {
+    const testing = std.testing;
+    var config: configpkg.Config = try .default(testing.allocator);
+    defer config.deinit();
+    // The shell Config.finalize fills in is not a configured command.
+    config.command = .{ .shell = "/usr/bin/bash" };
+
+    var detected: List = .{ .arena = .init(testing.allocator) };
+    defer detected.deinit();
+    try fill(&detected, &test_profiles, &config);
+    try testing.expectEqual(@as(?usize, 0), detected.default);
+
+    var without_gx: List = .{ .arena = .init(testing.allocator) };
+    defer without_gx.deinit();
+    try fill(&without_gx, test_profiles[1..], &config);
+    try testing.expectEqualStrings("login-shell", without_gx.items[without_gx.default.?].id);
+
+    try testLoad(&config, "command = /usr/bin/bash\n");
+    var configured: List = .{ .arena = .init(testing.allocator) };
+    defer configured.deinit();
+    try fill(&configured, &test_profiles, &config);
+    try testing.expectEqualStrings("bash", configured.items[configured.default.?].id);
+}
+
 test "detect lists custom profiles after the detected ones and marks the default" {
     const testing = std.testing;
     var config: configpkg.Config = try .default(testing.allocator);
     defer config.deinit();
-    const alloc = config._arena.?.allocator();
-    try config.@"gx-launch-profile".parseCLI(alloc, "Logs=direct:tail -f /tmp/x.log");
-    var command: configpkg.Command = undefined;
-    try command.parseCLI(alloc, "direct:tail -f /tmp/x.log");
-    config.command = command;
+    // Through a configuration file, so that the replay steps record `command`.
+    try testLoad(&config,
+        \\gx-launch-profile = Logs=direct:tail -f /tmp/x.log
+        \\command = direct:tail -f /tmp/x.log
+        \\
+    );
 
     var result = try detect(testing.allocator, &config);
     defer result.deinit();

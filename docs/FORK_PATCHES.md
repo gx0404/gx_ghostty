@@ -1398,6 +1398,7 @@ python -m unittest scripts.test_fork_patches -v
 - 原因：异步消费者需要区分对象与视图寿命；显式 profile 的内部命令包装丢失稳定来源；Tab 迁移后旧 Window 的 SplitTree.changed 监听未解绑；原 Tab 构造必然启动一个 shell。
 - 真源：`src/apprt/gtk/gx/runtime.zig` 管理 qdata 身份和活对象查找；`origin.zig` 持有启动来源副本；`tree_lifecycle.zig` 预分配待收养的树。上游类仅提供创建、映射、附着、分离和销毁钩子。
 - 对象引用保持 host epoch，视图隐藏、移动和销毁撤销旧 attachment；旧 owner 的迟到 detach 不撤销新 owner。临时命令不猜测为 profile，owned 来源不借用临时列表内存。
+- 默认启动配置：没有显式来源或命令覆盖的 surface，在各配置层都没设 `command`（`gx.profiles.commandConfigured`）且默认启动配置是 GX Zsh 时，`origin.zig::initializing` 经 `launch.zig::defaultCommand` 改跑 GX Zsh 并记为 `gx-zsh`（与 Windows 的 `LaunchOrigin.select` 一致）；否则保留 `Config.finalize` 选的上游 shell，来源仍为 `.unknown`。钩子不变，只是 `initializing` 改收可写的 surface 配置。
 - 空 Tab/Window 和树收养不得创建 placeholder shell；树复制和可恢复分配失败在提交前处理，旧 listener 随 owner 解绑。
 - 固定页关闭策略由 `gx/tab_actions.zig` 处理：关闭其他与右侧标签保留固定页，`this` 在 Tab 上重新激活上游动作，其余动作继续按层级继承。收养与移动的位置约束独立登记为 GX-0054，`adoptTab` 中 `tab_view` 仍是真实 AdwTabView，不用包装类型隐式改变块外行为。
 - 移除条件：上游提供等价的稳定生命周期、typed 启动来源和无初始终端的收养接口后移除钩子，登记改为 removed。

@@ -1,0 +1,106 @@
+id = "G29"
+title = "Without a configured command new terminals start GX Zsh and the window shows the GX icon; a configured command wins"
+lang = "en"
+env = { PATH = "/tmp/gx-g29-shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+config = """
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+s=gx:settings_page:shell
+"""
+# No command in the configuration: the default launch profile decides, and the
+# io_exec log line "started subcommand path=..." shows what each session ran.
+# With GX Zsh installed (/usr/lib/ohmyzsh-gx/bin/gx-zsh) the first window must
+# run it. Without it, a session runs the login shell, then a gx-zsh shim put
+# first on PATH (it records each start in the evidence directory). Last, a
+# configured --command wins over GX Zsh.
+script = '''
+import re
+import shutil
+import struct
+import subprocess
+import zlib
+
+# The window icon GTK hands to X11 (_NET_WM_ICON) comes from the icons the GTK
+# resources embed (GX-0058): save its largest image as a PNG to read.
+prop = subprocess.run(["xprop", "-id", str(window()), "-notype", "-f", "_NET_WM_ICON", "32c", "=$0+", "_NET_WM_ICON"],
+                      capture_output=True, text=True, check=True, timeout=30).stdout
+values = [int(value) for value in prop.split("=", 1)[1].split(",")]
+icons, at = [], 0
+while at + 2 <= len(values):
+    width, height = values[at], values[at + 1]
+    icons.append((width, height, values[at + 2:at + 2 + width * height]))
+    at += 2 + width * height
+assert icons, prop[:200]
+width, height, argb = max(icons, key=lambda icon: icon[0] * icon[1])
+def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+rows = b"".join(b"\x00" + b"".join(bytes(((p >> 16) & 255, (p >> 8) & 255, p & 255, (p >> 24) & 255)) for p in argb[y * width:(y + 1) * width]) for y in range(height))
+(evidence / "G29-window-icon.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+                                             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+save("-window-icon.json", json.dumps({"sizes": [[w, h] for w, h, _ in icons]}) + "\n")
+
+log = evidence / "G29.log"
+installed = Path("/usr/lib/ohmyzsh-gx/bin/gx-zsh")
+shim = Path("/tmp/gx-g29-shim")
+runs = evidence / "G29-shim-runs.txt"
+
+def started():
+    return re.findall(r"started subcommand path=(\S+) pid=", log.read_text(errors="replace"))
+
+def count():
+    return runs.read_text().count("run\n") if runs.exists() else 0
+
+sleep(1)
+if installed.exists():
+    # An installed GX Shell (or Oh My Zsh GX) comes before PATH: the first window runs it.
+    expected = str(installed)
+    assert started() == [expected], started()
+    capture("gx-zsh")
+else:
+    expected = str(shim / "gx-zsh")
+    shutil.rmtree(shim, ignore_errors=True)
+    xdo("mousemove", 400, 300, "click", 1)
+    restart()
+    sleep(1.5)
+    assert started()[-1] != expected and count() == 0, (started(), count())
+    capture("login-shell")
+    shim.mkdir()
+    (shim / "gx-zsh").write_text(
+        "#!/bin/sh\n"
+        f"echo run >> '{runs}'\n"
+        "printf 'GX-ZSH-SHIM-STARTED\\n'\n"
+        "exec /bin/bash --noprofile --norc\n"
+    )
+    (shim / "gx-zsh").chmod(0o755)
+    xdo("mousemove", 400, 300, "click", 1)
+    restart()
+    sleep(1.5)
+    assert started()[-1] == expected and count() == 1, (started(), count())
+    capture("gx-zsh")
+
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+s")
+sleep(2)
+capture("settings-shell")
+xdo("key", "Escape")
+sleep(0.8)
+
+shims = count()
+xdo("mousemove", 400, 300, "click", 1)
+# Without shell integration, which would wrap bash in /bin/sh -c.
+restart(["--command=direct:/bin/bash --noprofile --norc", "--shell-integration=none"])
+sleep(1.5)
+assert started()[-1] == "/bin/bash" and count() == shims, (started(), count())
+capture("configured")
+save("-started.txt", "\n".join(started()) + "\n")
+shutil.rmtree(shim, ignore_errors=True)
+'''
+expect = [
+  "G29.png: the first window starts",
+  "G29-window-icon.png: the largest _NET_WM_ICON image GTK set on the window is the Ghostty GX >_ GX icon, not the Ghostty ghost (sizes in G29-window-icon.json)",
+  "G29-gx-zsh.png: the terminal runs GX Zsh: the installed /usr/lib/ohmyzsh-gx/bin/gx-zsh (its prompt), or without it the PATH shim, which prints GX-ZSH-SHIM-STARTED above a bash prompt after G29-login-shell.png showed the login shell",
+  "G29-settings-shell.png: the Shell page selects System Default and its subtitle is the GX Zsh path that G29-started.txt lists",
+  "G29-configured.png and G29-after.png: with --command the terminal shows a plain bash prompt; G29-started.txt ends with /bin/bash and a shim did not run again",
+  "Xvfb shows no dock or launcher: the GX Shell deb's launcher icon needs a real Ubuntu 24.04 GNOME session",
+]

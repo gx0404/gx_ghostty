@@ -58,6 +58,7 @@ const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("../class/application.zig").Application;
 const open_perf = @import("open_perf.zig");
 const dialog_cache = @import("dialog_cache.zig");
+const gx_launch = @import("launch.zig");
 
 const settings_map = gx.settings_map;
 const msg = settings_map.msg;
@@ -447,6 +448,11 @@ pub const GxSettingsDialog = extern struct {
 
         /// The command new terminals run when the overlay sets none.
         default_command: [:0]const u8 = "",
+
+        /// The GX Zsh command new terminals run when no `command` is
+        /// configured (`gx_launch.resolveDefault`), from the last shell
+        /// detection; null before it or without GX Zsh. In `shell_arena`.
+        default_shell: ?[:0]const u8 = null,
 
         /// The herdr executable, if herdr was detected.
         herdr: ?[:0]const u8 = null,
@@ -944,10 +950,17 @@ pub const GxSettingsDialog = extern struct {
         self.updateNotes(config);
     }
 
+    /// What the System Default choice runs: GX Zsh when it is the default
+    /// launch profile and no `command` is configured (as new terminals
+    /// do, `gx_launch.defaultCommand`), else `command` of `config`.
     fn syncDefaultCommand(self: *Self, config: *const CoreConfig) void {
         const st = &self.private().state;
         st.default_command = "";
         _ = st.command_arena.reset(.retain_capacity);
+        if (st.default_shell) |shell| if (!gx.profiles.commandConfigured(config._replay_steps.items)) {
+            st.default_command = shell;
+            return;
+        };
         if (config.command) |command| st.default_command = command.string(st.command_arena.allocator()) catch "";
     }
 
@@ -1272,6 +1285,7 @@ pub const GxSettingsDialog = extern struct {
         // before resetting their storage; change handlers are loading-guarded.
         st.shells = &.{};
         st.herdr = null;
+        st.default_shell = null;
         _ = st.shell_arena.reset(.retain_capacity);
         const arena = st.shell_arena.allocator();
 
@@ -1320,9 +1334,13 @@ pub const GxSettingsDialog = extern struct {
                     selected = shells.items.len - 1;
                 }
             }
+            const default = gx_launch.resolveDefault(arena, false, list.profiles, gx.profiles.Platform.native) catch null;
+            if (default) |value| st.default_shell = value.command.string(arena) catch null;
         } else |err| {
             log.warn("cannot detect the shells err={}", .{err});
         }
+        // The System Default row names what new terminals now run.
+        self.syncDefaultCommand(config);
 
         if (selected == null) custom: {
             // A command the settings UI did not write.
@@ -3599,6 +3617,58 @@ test "reopen discovers a shell installed while closed" {
     dialog.loadShells();
     try testing.expect(testWaitShells(dialog));
     try testing.expect(testHasShell(dialog, shell_path));
+    _ = dialog.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(dialog, false));
+}
+
+test "System Default names GX Zsh unless command is configured" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    const shell_path = try std.fs.path.join(alloc, &.{ root, "gx-zsh" });
+    defer alloc.free(shell_path);
+    const executable = try tmp.dir.createFile(testing.io, "gx-zsh", .{ .permissions = .fromMode(0o755) });
+    executable.close(testing.io);
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("PATH", root);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    // The shell Config.finalize fills in is not a configured command.
+    config.command = .{ .shell = "/bin/sh" };
+    var backend: TestBackend = .{ .path = path, .config = &config, .shell_env = &env };
+    const dialog = try testDialog();
+    defer dialog.unref();
+    dialog.private().state.test_backend = &backend;
+    const window = adw.Window.new();
+    defer window.as(gtk.Window).destroy();
+    const st = &dialog.private().state;
+
+    dialog.reopen(&config, .appearance);
+    try testPresentSettings(dialog, window.as(gtk.Window));
+    dialog.loadShells();
+    try testing.expect(testWaitShells(dialog));
+    // An installed GX Shell's GX Zsh comes before PATH (gx.profiles.detect).
+    const installed = installed: {
+        std.Io.Dir.accessAbsolute(testing.io, "/usr/lib/ohmyzsh-gx/bin/gx-zsh", .{}) catch break :installed false;
+        break :installed true;
+    };
+    try testing.expectEqualStrings(if (installed) "/usr/lib/ohmyzsh-gx/bin/gx-zsh" else shell_path, st.default_command);
+    try testing.expect(st.shells[0].command == null);
+    _ = dialog.as(adw.Dialog).close();
+    try testing.expect(testWaitDialog(dialog, false));
+
+    var it = @import("../../../cli.zig").args.sliceIterator(&.{"--command=/bin/sh -l"});
+    try config.loadIter(alloc, &it);
+    dialog.reopen(&config, .appearance);
+    try testPresentSettings(dialog, window.as(gtk.Window));
+    dialog.loadShells();
+    try testing.expect(testWaitShells(dialog));
+    try testing.expectEqualStrings("/bin/sh -l", st.default_command);
     _ = dialog.as(adw.Dialog).close();
     try testing.expect(testWaitDialog(dialog, false));
 }
