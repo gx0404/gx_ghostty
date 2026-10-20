@@ -13,7 +13,8 @@
 //! then reordered by layer and the configuration is rebuilt from them, so
 //! theme loading and conditional reloads (which replay the same steps)
 //! keep the layer order. The defaults are plain configuration lines: a
-//! user `theme` replaces `theme = GX Mocha`, and explicit colors still
+//! user `theme` replaces `theme = light:GX Latte,dark:GX Mocha`, and
+//! explicit colors still
 //! override the theme. When a layer sets a `font-family*` key, its values
 //! replace the list from lower layers instead of extending it, the same
 //! way command-line font families replace configured ones upstream. Ordinary
@@ -33,8 +34,8 @@
 //! `.diagnostic` steps, so every later replay reports them again: an
 //! overlay file that cannot be read, and a `language` value Ghostty GX
 //! does not support. `diagnosticsDigest` tells app runtimes whether the
-//! diagnostics changed. The built-in theme is installed into the user's
-//! theme directory once per process.
+//! diagnostics changed. The built-in themes are installed into the user's
+//! theme directory once per process when the configuration uses one.
 //!
 //! A window material (`gx-window-material`) that shows behind the
 //! terminals comes with a `background-opacity` in the defaults layer
@@ -627,28 +628,30 @@ const SystemSources = struct {
     }
 };
 
-/// Whether the built-in theme was installed (or tried to be) in this
+/// Whether the built-in themes were installed (or tried to be) in this
 /// process.
 var theme_installed: std.atomic.Value(bool) = .init(false);
 
-/// Installs the built-in theme into the user's theme directory, once per
-/// process: later loads find it there.
+/// Installs the built-in themes into the user's theme directory, once per
+/// process: later loads find them there, and the settings list both.
 fn installThemeOnce(alloc: Allocator) void {
     if (theme_installed.swap(true, .acq_rel)) return;
     var arena: ArenaAllocator = .init(alloc);
     defer arena.deinit();
     const dir = themepkg.Location.user.dir(arena.allocator()) catch null orelse {
-        log.warn("no user theme directory for the {s} theme", .{gx_theme.name});
+        log.warn("no user theme directory for the built-in themes", .{});
         return;
     };
-    const result = gx_theme.install(alloc, global.io(), dir) catch |err| {
-        log.warn("cannot install the {s} theme into {s} err={}", .{ gx_theme.name, dir, err });
-        return;
-    };
-    switch (result) {
-        .created, .updated => log.info("installed the {s} theme into {s}", .{ gx_theme.name, dir }),
-        .unchanged => {},
-        .user_file => log.info("keeping the user's {s} theme in {s}", .{ gx_theme.name, dir }),
+    for (gx_theme.all) |theme| {
+        const result = gx_theme.install(alloc, global.io(), dir, theme) catch |err| {
+            log.warn("cannot install the {s} theme into {s} err={}", .{ theme.name, dir, err });
+            continue;
+        };
+        switch (result) {
+            .created, .updated => log.info("installed the {s} theme into {s}", .{ theme.name, dir }),
+            .unchanged => {},
+            .user_file => log.info("keeping the user's {s} theme in {s}", .{ theme.name, dir }),
+        }
     }
 }
 
@@ -980,8 +983,9 @@ test "the embedded defaults parse cleanly" {
     defer cfg.deinit();
     try expectNoDiagnostics(&cfg);
 
-    try testing.expectEqualStrings("GX Mocha", cfg.theme.?.light);
+    try testing.expectEqualStrings("GX Latte", cfg.theme.?.light);
     try testing.expectEqualStrings("GX Mocha", cfg.theme.?.dark);
+    try testing.expectEqual(config_types.AccentColor.brand, cfg.@"gx-accent-color");
     try testing.expectEqualStrings("zh-CN", cfg.language.?);
     try expectFamilies(if (builtin.os.tag == .windows) &.{"JetBrainsMono Nerd Font"} else &.{}, cfg.@"font-family");
     for ([_]u21{ 0x3200, 0x33ff, 0xfe10, 0xfe1f }) |codepoint| {
@@ -1194,18 +1198,24 @@ test "the embedded defaults set no colors" {
     try testing.expect(count > 0);
 }
 
-test "the GX Mocha theme parses cleanly" {
+test "the built-in themes parse cleanly" {
     const testing = std.testing;
-    var cfg = try Config.default(testing.allocator);
-    defer cfg.deinit();
-    var reader: std.Io.Reader = .fixed(gx_theme.content);
-    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = gx_theme.name };
-    try cfg.loadIter(testing.allocator, &iter);
-    try expectNoDiagnostics(&cfg);
-    try testing.expectEqual(Config.Color{ .r = 0x1f, .g = 0x1f, .b = 0x28 }, cfg.background);
-    try testing.expectEqual(Config.Color{ .r = 0xff, .g = 0xff, .b = 0xff }, cfg.foreground);
-    try testing.expectEqual(@as(u8, 0x45), cfg.palette.value[0].r);
-    try testing.expectEqual(@as(u8, 0xf3), cfg.palette.value[1].r);
+    const expected = [_]struct { gx_theme.Theme, Config.Color, Config.Color }{
+        .{ gx_theme.mocha, .{ .r = 0x1f, .g = 0x1f, .b = 0x28 }, .{ .r = 0xcd, .g = 0xd6, .b = 0xf4 } },
+        .{ gx_theme.latte, .{ .r = 0xef, .g = 0xf1, .b = 0xf5 }, .{ .r = 0x4c, .g = 0x4f, .b = 0x69 } },
+    };
+    for (expected) |case| {
+        var cfg = try Config.default(testing.allocator);
+        defer cfg.deinit();
+        var reader: std.Io.Reader = .fixed(case[0].content);
+        var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = case[0].name };
+        try cfg.loadIter(testing.allocator, &iter);
+        try expectNoDiagnostics(&cfg);
+        try testing.expectEqual(case[1], cfg.background);
+        try testing.expectEqual(case[2], cfg.foreground);
+        // The bright colors differ from the normal ones.
+        for (1..7) |i| try testing.expect(!std.meta.eql(cfg.palette.value[i], cfg.palette.value[i + 8]));
+    }
 }
 
 test "layer precedence: defaults < user < overlay < command line" {
@@ -2385,8 +2395,8 @@ test "R4 migrated theme is loaded with corrected ANSI whites" {
     const arena = scratch.allocator();
     var dir = try TestDir.init();
     defer dir.deinit();
-    const path = try dir.write(arena, gx_theme.name, gx_theme.marker ++ "\n# gx-theme-version: 1\npalette = 7=#bac2de\npalette = 15=#a6adc8\n");
-    try std.testing.expectEqual(gx_theme.InstallResult.updated, try gx_theme.install(alloc, std.testing.io, dir.root));
+    const path = try dir.write(arena, gx_theme.mocha.name, gx_theme.mocha.marker ++ "\n# gx-theme-version: 1\npalette = 7=#bac2de\npalette = 15=#a6adc8\n");
+    try std.testing.expectEqual(gx_theme.InstallResult.updated, try gx_theme.install(alloc, std.testing.io, dir.root, gx_theme.mocha));
     var config = try loadWith(alloc, TestSources{ .defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\n", .{path}) });
     defer config.deinit();
     try expectNoDiagnostics(&config);

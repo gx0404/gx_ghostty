@@ -19,6 +19,7 @@ const Config = @import("../config/Config.zig");
 const action = @import("action.zig");
 const branding = @import("branding.zig");
 const config_layers = @import("config_layers.zig");
+const config_types = @import("config_types.zig");
 const gui_settings = @import("gui_settings.zig");
 const profiles = @import("profiles.zig");
 
@@ -73,6 +74,8 @@ pub const msg = struct {
     pub const light_theme = "Light Theme";
     pub const dark_theme = "Dark Theme";
     pub const theme_pair_hint = "Windows follow the light or dark mode of the system.";
+    pub const accent_color = "Accent Color";
+    pub const accent_color_hint = "Marks the active tab, switches, selected items and the keyboard focus.";
     pub const opacity = "Background Opacity";
     pub const opacity_hint = "Automatic keeps the opacity that goes with the window material.";
     pub const cursor = "Cursor";
@@ -263,6 +266,41 @@ pub const ctrl_scroll_zoom: Switch = .{
     .key = "gx-ctrl-scroll-zoom",
     .label = msg.ctrl_scroll_zoom,
     .hint = msg.ctrl_scroll_zoom_hint,
+};
+
+/// The `gx-accent-color` choices, in display order. A color of its own is
+/// not a choice: a UI shows it as `custom_label`, read-only, until "Reset
+/// to Default".
+pub const Accent = enum {
+    brand,
+    theme,
+
+    pub const key = "gx-accent-color";
+
+    /// The label of a color set in a configuration file.
+    pub const custom_label = "Custom Color";
+
+    /// The msgid of the label.
+    pub fn label(self: Accent) [:0]const u8 {
+        return switch (self) {
+            .brand => "Ghostty GX Purple",
+            .theme => "From the Theme",
+        };
+    }
+
+    /// The value written.
+    pub fn value(self: Accent) [:0]const u8 {
+        return @tagName(self);
+    }
+
+    /// The choice that shows `accent`, or null for a color of its own.
+    pub fn fromConfig(accent: config_types.AccentColor) ?Accent {
+        return switch (accent) {
+            .brand => .brand,
+            .theme => .theme,
+            .color => null,
+        };
+    }
 };
 
 /// The `background-opacity` choices, in display order.
@@ -986,6 +1024,23 @@ test "switches write booleans their keys parse" {
     try testing.expect(defaults.@"gx-ctrl-scroll-zoom");
 }
 
+test "accent choices write values that parse back" {
+    for (std.enums.values(Accent)) |choice| {
+        var buf: [64]u8 = undefined;
+        var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--{s}={s}", .{ Accent.key, choice.value() })});
+        defer cfg.deinit();
+        try testing.expectEqual(choice, Accent.fromConfig(cfg.@"gx-accent-color").?);
+    }
+    var cfg = try testConfig(&.{"--gx-accent-color=#e5a50a"});
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?Accent, null), Accent.fromConfig(cfg.@"gx-accent-color"));
+    // The default is the brand, the first choice.
+    var plain = try testConfig(&.{});
+    defer plain.deinit();
+    try testing.expectEqual(Accent.brand, Accent.fromConfig(plain.@"gx-accent-color").?);
+    try testing.expectEqual(Accent.brand, std.enums.values(Accent)[0]);
+}
+
 test "opacity choices write values that parse back" {
     for (std.enums.values(Opacity)) |choice| {
         const text = choice.value() orelse {
@@ -1415,6 +1470,8 @@ test "settings strings are translated" {
     for (bell_features) |feature| check(feature.label, &missing);
     for (std.enums.values(Material)) |material| check(material.label(), &missing);
     for (std.enums.values(Padding)) |preset| check(preset.label(), &missing);
+    for (std.enums.values(Accent)) |accent| check(accent.label(), &missing);
+    check(Accent.custom_label, &missing);
     check(Opacity.automatic.label(), &missing);
     for ([_]anyerror{
         error.AccessDenied,

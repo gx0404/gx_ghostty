@@ -3,6 +3,8 @@
 //! `close_button`, `selection_indicator`, `focus_ring`; the older
 //! `metrics` and `font_size` stay for existing callers), and the helpers
 //! to scale them to pixels and to shade a fill for hover and press.
+//! Spacing, radii, control and row heights and the type ramp are the
+//! shared sizes of `gx.ui_metrics`, which the GTK look uses as well.
 //! Spacing, radii and control, row and button sizes are multiples of 4
 //! DIPs (checked at compile time); hairlines are one device pixel
 //! (`d2d.Canvas.hairline`).
@@ -33,6 +35,7 @@ const configpkg = @import("../../../config.zig");
 const Config = configpkg.Config;
 const chrome = @import("../../../gx/chrome.zig");
 const ui_color = @import("../../../gx/ui_color.zig");
+const ui_metrics = @import("../../../gx/ui_metrics.zig");
 const ui_tokens = @import("../../../gx/ui_tokens.zig");
 const d2d = @import("d2d.zig");
 
@@ -68,6 +71,7 @@ pub const Tokens = struct {
     accent: Color,
     on_accent: Color,
     accent_text: Color,
+    link: Color,
     focus_stroke: Color,
     focus_stroke_inner: Color,
     focus_stroke_accent: Color,
@@ -79,8 +83,11 @@ pub const Tokens = struct {
     text_placeholder: Color,
     text_disabled: Color,
     caution: Color,
+    caution_text: Color,
     success: Color,
+    success_text: Color,
     critical: Color,
+    critical_text: Color,
 
     /// Fill of the title bar row with the solid window material
     /// (`gx.chrome.titleBar`): at least 1.12:1 from the terminal
@@ -254,37 +261,43 @@ extern "user32" fn SystemParametersInfoW(
 // Sizes
 // -----------------------------------------------------------------------
 
-/// Spacing steps in DIPs: dialogs, settings and the shortcut sheet use
-/// `xl`, notices `l`, panels and the find bar `s`, items in a row `m`.
+/// Spacing steps in DIPs (`gx.ui_metrics.space`): dialogs, settings and
+/// the shortcut sheet use `xl`, notices `l`, panels and the find bar `s`,
+/// items in a row `m`, groups of a page `xxl`.
 pub const space = struct {
-    pub const xs: f32 = 4;
-    pub const s: f32 = 8;
-    pub const m: f32 = 12;
-    pub const l: f32 = 16;
-    pub const xl: f32 = 24;
+    pub const xs: f32 = ui_metrics.space.xs;
+    pub const s: f32 = ui_metrics.space.s;
+    pub const m: f32 = ui_metrics.space.m;
+    pub const l: f32 = ui_metrics.space.l;
+    pub const xl: f32 = ui_metrics.space.xl;
+    pub const xxl: f32 = ui_metrics.space.xxl;
 };
 
-/// Corner radii: `control` for buttons, inputs, list row fills, cards,
-/// key caps and caption buttons; `overlay` for popups, dialogs and tab
-/// tops (tooltips and link previews use `control`).
+/// Corner radii (`gx.ui_metrics.radius`): `control` for buttons, inputs,
+/// list row fills, cards, key caps and caption buttons; `overlay` for
+/// popups, dialogs and tab tops (tooltips and link previews use
+/// `control`); `window` for large panels.
 pub const radius = struct {
-    pub const control: f32 = 4;
-    pub const overlay: f32 = 8;
+    pub const control: f32 = ui_metrics.radius.control;
+    pub const overlay: f32 = ui_metrics.radius.overlay;
+    pub const window: f32 = ui_metrics.radius.window;
 };
 
-/// Control heights: buttons and inputs, and icon buttons inside bars.
+/// Control heights (`gx.ui_metrics.control`): buttons and inputs, and icon
+/// buttons inside bars.
 pub const control = struct {
-    pub const height: f32 = 32;
-    pub const compact: f32 = 28;
+    pub const height: f32 = ui_metrics.control.height;
+    pub const compact: f32 = ui_metrics.control.compact;
 };
 
-/// Row heights: menus, settings lists and group headers; the command
-/// palette, the shortcut sheet and navigation; rows with two lines.
+/// Row heights (`gx.ui_metrics.row`): menus, settings lists and group
+/// headers; the command palette, the shortcut sheet and navigation; rows
+/// with two lines.
 pub const row = struct {
-    pub const menu: f32 = 32;
-    pub const header: f32 = 32;
-    pub const list: f32 = 36;
-    pub const two_line: f32 = 52;
+    pub const menu: f32 = ui_metrics.row.menu;
+    pub const header: f32 = ui_metrics.row.header;
+    pub const list: f32 = ui_metrics.row.list;
+    pub const two_line: f32 = ui_metrics.row.two_line;
 };
 
 /// A step of the type ramp: size and line height in DIPs, and weight.
@@ -297,6 +310,10 @@ pub const TypeStyle = struct {
     pub fn text(self: TypeStyle, color: Color) d2d.TextStyle {
         return .{ .size = self.size, .weight = self.weight, .color = color, .line_height = self.line };
     }
+
+    fn of(step: ui_metrics.TypeStep) TypeStyle {
+        return .{ .size = step.size, .line = step.line, .weight = if (step.semibold) .semibold else .normal };
+    }
 };
 
 /// The Fluent type ramp (Windows typography): caption 12/16, body 14/20,
@@ -304,12 +321,12 @@ pub const TypeStyle = struct {
 /// semibold, title 28/36 semibold. Menu shortcuts use caption with
 /// `text_secondary`.
 pub const type_ramp = struct {
-    pub const caption: TypeStyle = .{ .size = 12, .line = 16 };
-    pub const body: TypeStyle = .{ .size = 14, .line = 20 };
-    pub const body_strong: TypeStyle = .{ .size = 14, .line = 20, .weight = .semibold };
-    pub const body_large: TypeStyle = .{ .size = 18, .line = 24 };
-    pub const subtitle: TypeStyle = .{ .size = 20, .line = 28, .weight = .semibold };
-    pub const title: TypeStyle = .{ .size = 28, .line = 36, .weight = .semibold };
+    pub const caption: TypeStyle = .of(ui_metrics.type_ramp.caption);
+    pub const body: TypeStyle = .of(ui_metrics.type_ramp.body);
+    pub const body_strong: TypeStyle = .of(ui_metrics.type_ramp.body_strong);
+    pub const body_large: TypeStyle = .of(ui_metrics.type_ramp.body_large);
+    pub const subtitle: TypeStyle = .of(ui_metrics.type_ramp.subtitle);
+    pub const title: TypeStyle = .of(ui_metrics.type_ramp.title);
 };
 
 /// Icon glyph sizes: standard; chevrons, check marks and close glyphs;
@@ -389,12 +406,13 @@ pub const font_size = struct {
 
 comptime {
     const sizes = [_]f32{
-        space.xs,                 space.s,                space.m,               space.l,
-        space.xl,                 radius.control,         radius.overlay,        control.height,
-        control.compact,          row.menu,               row.header,            row.list,
-        row.two_line,             close_button.size,      close_button.compact,  selection_indicator.height,
-        metrics.title_bar_height, metrics.tab_bar_height, metrics.corner_radius, metrics.item_height,
-        metrics.input_height,     metrics.icon_size,      metrics.padding_x,     metrics.padding_y,
+        space.xs,              space.s,                    space.m,                  space.l,
+        space.xl,              space.xxl,                  radius.control,           radius.overlay,
+        radius.window,         control.height,             control.compact,          row.menu,
+        row.header,            row.list,                   row.two_line,             close_button.size,
+        close_button.compact,  selection_indicator.height, metrics.title_bar_height, metrics.tab_bar_height,
+        metrics.corner_radius, metrics.item_height,        metrics.input_height,     metrics.icon_size,
+        metrics.padding_x,     metrics.padding_y,
     };
     for (sizes) |v| {
         if (@mod(v, 4) != 0) @compileError("UI spacing, radii and control sizes are multiples of 4 DIPs");

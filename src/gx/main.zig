@@ -7,7 +7,7 @@
 //!   `gui-settings.ghostty`, the file the settings UIs write
 //!   (`gui_settings`); the settings model that the GTK settings dialog
 //!   and the Windows settings overlay render (`settings_map`); the
-//!   built-in GX Mocha theme (`theme`).
+//!   built-in themes GX Mocha and GX Latte (`theme`).
 //! - State kept between runs outside the configuration (`state_file`):
 //!   the place of the last window (`window_state`) and the command palette
 //!   history (`palette_history`).
@@ -23,7 +23,8 @@
 //! - The colors of the GTK look, as CSS (`gtk_css`).
 //! - The interface library of both apprts: color math and the accent
 //!   (`ui_color`), the design tokens (`ui_tokens`) and window chrome
-//!   colors (`chrome`) derived from the terminal colors, motion
+//!   colors (`chrome`) derived from the terminal colors, sizes
+//!   (`ui_metrics`), motion
 //!   (`motion`), fuzzy matching with pinyin initials (`fuzzy`, `pinyin`),
 //!   theme swatches (`theme_swatch`) and the keyboard shortcut sheet
 //!   (`shortcuts`).
@@ -74,6 +75,7 @@ pub const state_file = @import("state_file.zig");
 pub const theme = @import("theme.zig");
 pub const theme_swatch = @import("theme_swatch.zig");
 pub const ui_color = @import("ui_color.zig");
+pub const ui_metrics = @import("ui_metrics.zig");
 pub const ui_ref = @import("ui_ref.zig");
 pub const ui_tokens = @import("ui_tokens.zig");
 pub const unread = @import("unread.zig");
@@ -131,6 +133,7 @@ test {
     _ = theme;
     _ = theme_swatch;
     _ = ui_color;
+    _ = ui_metrics;
     _ = ui_ref;
     _ = ui_tokens;
     _ = unread;

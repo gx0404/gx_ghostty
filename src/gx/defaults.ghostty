@@ -3,7 +3,8 @@
 # includes), gui-settings.ghostty and command-line flags all override them.
 # Keep colors out of this file; they come from the theme.
 
-theme = GX Mocha
+# The built-in themes follow the light or dark mode of the system.
+theme = light:GX Latte,dark:GX Mocha
 language = zh-CN
 
 # GTK uses the embedded font chain; Windows adds its monospace family.

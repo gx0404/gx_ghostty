@@ -4218,6 +4218,29 @@ term: []const u8 = "xterm-ghostty",
 ///
 /// Available since Ghostty GX 0.0.3.
 @"gx-prompt-cursor": gx_config_types.PromptCursor = .config,
+
+/// The accent color of the Ghostty GX interface: the marker of the active
+/// tab, switches, selected items, focus rings and the main button of
+/// dialogs, settings and popups. Valid values:
+///
+///   * `brand` - The Ghostty GX purple: a pale shade on dark terminal
+///     backgrounds and a deep one on light backgrounds.
+///   * `theme` - A color of the terminal theme: the cursor color when it
+///     is colorful, else palette 4 or palette 12.
+///   * A color, such as `#e5a50a` or `orange`.
+///
+/// Ghostty GX adjusts the lightness of any accent so that it stands out
+/// from the interface surfaces. Links keep the Ghostty GX blue unless
+/// this is `theme`, which takes palette 4 for them as well.
+///
+/// On GTK this applies while `window-theme` is `auto` or `ghostty`, where
+/// the interface follows the terminal colors.
+///
+/// The default is `brand`.
+///
+/// Windows and GTK only.
+/// Available since Ghostty GX 0.0.3.
+@"gx-accent-color": gx_config_types.AccentColor = .brand,
 // fork(gx): GX-0010 end
 
 /// This is set by the CLI parser for deinit.

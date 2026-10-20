@@ -722,6 +722,21 @@ msgstr "深色主题"
 msgid "Windows follow the light or dark mode of the system."
 msgstr "窗口跟随系统的浅色或深色模式。"
 
+msgid "Accent Color"
+msgstr "强调色"
+
+msgid "Marks the active tab, switches, selected items and the keyboard focus."
+msgstr "用于活动标签页、开关、选中项与键盘焦点。"
+
+msgid "Ghostty GX Purple"
+msgstr "Ghostty GX 紫"
+
+msgid "From the Theme"
+msgstr "跟随主题"
+
+msgid "Custom Color"
+msgstr "自定义颜色"
+
 msgid "Background Opacity"
 msgstr "背景不透明度"
 

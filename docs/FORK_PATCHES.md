@@ -614,23 +614,24 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0010 Ghostty GX 配置分层与 fork 配置键
 
-- 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（7 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
+- 文件：`src/config/Config.zig`，五处：`language` 字段的文档注释（单行标记，改写上游注释）；字段区末尾 `auto-update-channel` 之后的纯新增块（10 个 `gx-*` 键）；`deinit` 与 `load` 之间的纯新增块（导入 `src/gx/config_layers.zig`、`src/gx/config_types.zig`，`pub fn gxReplay`，引入 `src/gx/**` 单测的 `test` 块）；`Config.load` 函数体开头的纯新增块（启用时转交 `src/gx/config_layers.zig::load`）；`Replay.Iterator.next` 处理 `.diagnostic` 步骤处的纯新增块（把诊断重新记入 `_replay_steps`）。
 - 标记：`fork(gx): GX-0010`；四个纯新增块以 `// fork(gx): GX-0010 begin: <说明>` 开头、`// fork(gx): GX-0010 end` 结尾，`language` 注释上方是单行标记。
 - 状态：active，未回馈上游。
 - 改动量：改写 `language` 的 18 行文档注释为 25 行；新增约 125 行（键与文档约 100 行、钩子、包装与诊断重放约 25 行），不改、不删其他上游行。
 
 ### 原因
 
-Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/defaults.ghostty`，Windows 另加 `src/gx/defaults-windows.ghostty`）、设置界面写的覆盖文件 `gui-settings.ghostty`，以及固定的优先级「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< `gui-settings.ghostty` < 命令行」。上游 `Config.load` 依次读默认文件、命令行、再读 `config-file`，引入的文件会盖过命令行；`theme` 的加载与明暗切换（`loadTheme`、`changeConditionalState`）都靠重放 `_replay_steps` 重建配置。要让 `theme = GX Mocha` 这种默认值像普通配置一样被用户的 `theme` 与显式颜色覆盖，并在每次重放后保持层序，只能按层重排重放步骤再重建，而 `Replay` 是 `Config.zig` 的私有类型，所以需要一个公开入口。fork 配置键（`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`、`gx-prompt-cursor`）必须是 `Config` 的字段，才能走同一套解析、`+show-config`、补全与文档生成；`language` 的语义在 GX 里也变了（只认 `zh-CN`/`en`，默认 `zh-CN`，Windows 与 GTK 可运行时切换），文档注释即用户文档，必须同步改写。
+Ghostty GX 要在上游配置之上加三层：内嵌的 GX 默认值（`src/gx/defaults.ghostty`，Windows 另加 `src/gx/defaults-windows.ghostty`）、设置界面写的覆盖文件 `gui-settings.ghostty`，以及固定的优先级「GX 默认值 < 用户配置（含 `config-file` 引入的文件）< `gui-settings.ghostty` < 命令行」。上游 `Config.load` 依次读默认文件、命令行、再读 `config-file`，引入的文件会盖过命令行；`theme` 的加载与明暗切换（`loadTheme`、`changeConditionalState`）都靠重放 `_replay_steps` 重建配置。要让 `theme = GX Mocha` 这种默认值像普通配置一样被用户的 `theme` 与显式颜色覆盖，并在每次重放后保持层序，只能按层重排重放步骤再重建，而 `Replay` 是 `Config.zig` 的私有类型，所以需要一个公开入口。fork 配置键（`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-single-instance`、`gx-session-restore`、`gx-ctrl-scroll-zoom`、`gx-prompt-cursor`、`gx-accent-color`）必须是 `Config` 的字段，才能走同一套解析、`+show-config`、补全与文档生成；`language` 的语义在 GX 里也变了（只认 `zh-CN`/`en`，默认 `zh-CN`，Windows 与 GTK 可运行时切换），文档注释即用户文档，必须同步改写。
 
 ### 行为
 
 - `GHOSTTY_GX_DEFAULTS` 未设置或不是 `0`/`false`/`off`/`no` 时，`Config.load` 改由 `src/gx/config_layers.zig::load` 完成：先按上游顺序读用户默认文件、命令行与 `config-file`，再读覆盖文件（`--config-default-files=false` 时不读用户文件与覆盖文件，但保留 GX 默认值），然后把重放步骤排成「GX 默认值 → 用户文件与全部 include → 覆盖文件 → 命令行 → `-e` 及其命令」，用 `gxReplay` 在空配置上重建，最后 `finalize`。某层设置 `font-family*` 时在该层第一处值前插入重置步骤，高层的字体列表替换低层而不是追加。
 - 重放诊断：上游 `Replay.Iterator` 重放 `.diagnostic` 步骤（`config-file` 打不开、循环引用、不是文件）时只把诊断加进新配置，不再记入新配置的 `_replay_steps`，于是设置了 `theme` 后第二次重放（明暗切换的 `changeConditionalState`、`ghostty +validate-config` 在 `Config.load` 之后再调一次 `finalize`）会丢掉这些诊断。GX 默认带主题，这个缺陷会让 `+validate-config` 漏报缺失的 include，所以补丁让重放把诊断步骤一并记回；每次重放都从空配置开始，诊断不会重复。上游路径（`GHOSTTY_GX_DEFAULTS=0`）同样受益。GX 分层还把读不出的 `gui-settings.ghostty` 与不受支持的 `language` 记成 `.diagnostic` 重放步骤，同样靠这处补丁在之后的每次重放、克隆与 `rebuild` 中保留（`+validate-config` 因此退出 1）。
 - `gx-prompt-cursor`（`config` 默认 / `bar`，值类型 `src/gx/config_types.zig::PromptCursor`）由 GX-0047 消费：选择 shell 集成 `cursor` 特性在提示符显示配置光标还是上游竖线，只影响之后启动的 shell。
-- 默认值引用内置主题 `GX Mocha` 时，加载前把 `src/gx/themes/GX Mocha` 写进用户主题目录（`<配置目录>/ghostty/themes`；文件首行带 GX 标记，内容变化才原子替换，同名但没有标记的用户文件不动），没有资源目录也能解析主题。
+- `gx-accent-color`（`brand` 默认 / `theme` / 颜色，值类型 `src/gx/config_types.zig::AccentColor`）决定 GX 界面的强调色：`brand` 是 Ghostty GX 品牌紫（深色背景 `#cba6f7`、浅色背景 `#8839ef`），`theme` 沿用由光标色、palette 4、palette 12 挑选的主题色，颜色值按对比度保底后使用；`src/gx/ui_tokens.zig::Scheme.fromConfig` 读取，win32 与 GTK 的 GX 界面共用。C API 按字符串键读取时返回 false（联合类型，与上游 `bold-color` 一致）。
+- 配置的主题（含明暗两部分）用到内置主题（`GX Mocha`、`GX Latte`，默认值 `theme = light:GX Latte,dark:GX Mocha`）时，加载前把 `src/gx/themes/` 下的全部内置主题写进用户主题目录（`<配置目录>/ghostty/themes`；文件首行带各自的 GX 标记，内容变化才原子替换，同名但没有该标记的用户文件不动），没有资源目录也能解析主题。
 - `GHOSTTY_GX_DEFAULTS=0` 时 `Config.load` 与上游完全一致。`Config.default`、`loadDefaultFiles`、`loadCliArgs`、`loadRecursiveFiles`、`finalize` 等其余入口不变，上游单测不经过 GX 分层。
-- 新增 6 个键都有默认值（`gx-herdr-app-mode = true`、`gx-window-material = solid`、`gx-open-config-ui = settings`、`gx-ctrl-scroll-zoom = true`，两个列表为空）；它们出现在 `+show-config`、shell 补全与生成的配置文档里。`gx-ctrl-scroll-zoom`（Ctrl+滚轮或触控板捏合缩放字号，文档写明只在 Windows 生效、自 Ghostty GX 0.0.3 起）目前只有键与设置项，win32 apprt 尚未按它处理滚轮。C API 按字符串键读取：布尔与枚举照常可读，两个列表类型返回 false（与上游同类键一致）。
+- 新增键都有默认值（`gx-herdr-app-mode = true`、`gx-window-material = solid`、`gx-open-config-ui = settings`、`gx-single-instance = true`、`gx-session-restore = false`、`gx-ctrl-scroll-zoom = true`、`gx-prompt-cursor = config`、`gx-accent-color = brand`，两个列表为空）；它们出现在 `+show-config`、shell 补全与生成的配置文档里。`gx-ctrl-scroll-zoom`（Ctrl+滚轮或触控板捏合缩放字号，文档写明只在 Windows 生效、自 Ghostty GX 0.0.3 起）目前只有键与设置项，win32 apprt 尚未按它处理滚轮。C API 按字符串键读取：布尔与枚举照常可读，两个列表类型返回 false（与上游同类键一致）。
 - 已知差异：经 GX 分层加载的配置诊断不带文件与行号。上游只要设置了 `theme` 就会在 `loadTheme` 重放时丢掉位置信息，GX 默认带主题，所以总是如此。
 
 ### 上游状态

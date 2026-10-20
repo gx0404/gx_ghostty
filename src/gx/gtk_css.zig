@@ -28,7 +28,10 @@
 //!   variables instead, which `writeVariables416` writes for GTK 4.16 and
 //!   newer.
 //!
-//! Only `window-theme = auto` and `ghostty` get colors, and
+//! Only `window-theme = auto` and `ghostty` get colors, and `system` when
+//! the theme has a light and a dark part (`followsTerminal`): upstream
+//! turns `auto` into `system` for such a theme, whose colors follow the
+//! system's mode anyway, and the Ghostty GX defaults use one. The style
 //! `src/apprt/gtk/gx/style.zig` drops them in high contrast, leaving the
 //! system's high contrast colors (like `ui_tokens.Tokens.fromSystem` on
 //! Windows). With `ghostty`, upstream's runtime CSS paints every header bar
@@ -94,16 +97,24 @@ pub const Colors = struct {
     bar_opacity: f32 = 1,
 };
 
-/// The colors of the GX look for `config`, or null unless the window
-/// follows the terminal colors (`window-theme = auto` or `ghostty`); with
-/// `system`, `light` and `dark` everything keeps the libadwaita colors.
-pub fn fromConfig(config: *const Config) ?Colors {
-    const opacity: f32 = @floatCast(std.math.clamp(config.@"background-opacity", 0, 1));
-    const ghostty = switch (config.@"window-theme") {
-        .auto => false,
-        .ghostty => true,
-        .system, .light, .dark => return null,
+/// Whether the window follows the terminal colors: `window-theme = auto`
+/// or `ghostty`, or `system` with a theme that has a light and a dark
+/// part (see the file header); with `system` otherwise, `light` and
+/// `dark` everything keeps the libadwaita colors.
+pub fn followsTerminal(config: *const Config) bool {
+    return switch (config.@"window-theme") {
+        .auto, .ghostty => true,
+        .system => config._conditional_set.contains(.theme),
+        .light, .dark => false,
     };
+}
+
+/// The colors of the GX look for `config`, or null unless the window
+/// follows the terminal colors (`followsTerminal`).
+pub fn fromConfig(config: *const Config) ?Colors {
+    if (!followsTerminal(config)) return null;
+    const opacity: f32 = @floatCast(std.math.clamp(config.@"background-opacity", 0, 1));
+    const ghostty = config.@"window-theme" == .ghostty;
     const tokens: ui_tokens.Tokens = .derive(.fromConfig(config));
     // `chrome.Options.fromConfig` drops the title bar colors on Windows,
     // which has no GTK look; reading them here keeps the CSS the same on
@@ -399,6 +410,8 @@ fn gxMochaConfig() !Config {
     config.palette.value[4] = .{ .r = 0x89, .g = 0xb4, .b = 0xfa };
     config.palette.value[5] = .{ .r = 0xf5, .g = 0xc2, .b = 0xe7 };
     config.palette.value[12] = .{ .r = 0x89, .g = 0xb4, .b = 0xfa };
+    // These tests follow the theme's accent; `brand` has its own test.
+    config.@"gx-accent-color" = .theme;
     return config;
 }
 
@@ -445,6 +458,34 @@ test "fromConfig follows window-theme" {
         config.@"window-theme" = theme;
         try testing.expectEqual(@as(?Colors, null), fromConfig(&config));
     }
+}
+
+test "a light and dark theme pair keeps the GX colors" {
+    // Upstream turns `auto` into `system` for `theme = light:…,dark:…`,
+    // as with the Ghostty GX defaults.
+    var config = try gxMochaConfig();
+    defer config.deinit();
+    config.@"window-theme" = .system;
+    config._conditional_set.insert(.theme);
+    try testing.expect(followsTerminal(&config));
+    const colors = fromConfig(&config).?;
+    try testing.expectEqual(colors.tokens.surface_raised, colors.surface);
+    for ([_]Config.WindowTheme{ .light, .dark }) |theme| {
+        config.@"window-theme" = theme;
+        try testing.expect(!followsTerminal(&config));
+    }
+}
+
+test "the default brand accent is the GX purple, links the GX blue" {
+    var config = try gxMochaConfig();
+    defer config.deinit();
+    config.@"gx-accent-color" = .brand;
+    const colors = fromConfig(&config).?;
+    try testing.expectEqual(ui_tokens.brand.purple_dark, colors.tokens.accent);
+    try testing.expectEqual(ui_tokens.brand.blue_dark, colors.tokens.link);
+    const named: Named = .fromColors(colors);
+    try testing.expectEqual(@as(u24, 0xcba6f7), named.accent_bg_color.toHex());
+    try testing.expectEqual(Color.black, named.accent_fg_color);
 }
 
 test "the selected tab stands out of the strip" {

@@ -1,22 +1,44 @@
-//! The built-in Ghostty GX theme "GX Mocha": the Catppuccin Mocha ANSI
-//! palette on a #1f1f28 background with white text.
+//! The built-in Ghostty GX themes: "GX Mocha", the Catppuccin Mocha ANSI
+//! palette, text and bright colors on a #1f1f28 background, and its light
+//! partner "GX Latte", the Catppuccin Latte palette. The defaults pair
+//! them (`theme = light:GX Latte,dark:GX Mocha`), so windows follow the
+//! light or dark mode of the system.
 //!
-//! Ghostty resolves `theme = GX Mocha` like any other theme name, first in
-//! the user's theme directory (`<config dir>/ghostty/themes`) and then in
-//! the resources directory. `install` writes the embedded theme into the
-//! user's theme directory so the name resolves even without installed
-//! resources; the file carries `marker` so later versions can replace it
-//! without touching a user's own file of the same name.
+//! Ghostty resolves a built-in theme name like any other theme name,
+//! first in the user's theme directory (`<config dir>/ghostty/themes`)
+//! and then in the resources directory. `install` writes an embedded theme
+//! into the user's theme directory so the name resolves even without
+//! installed resources; each file starts with the marker of its theme so
+//! later versions can replace it without touching a user's own file of
+//! the same name.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const name = "GX Mocha";
+/// A built-in theme.
+pub const Theme = struct {
+    name: []const u8,
+    /// The first line of its theme file.
+    marker: []const u8,
+    /// The theme file, with LF line endings regardless of the checkout.
+    content: []const u8,
+};
 
-/// The first line of a theme file written by Ghostty GX.
-pub const marker = "# Ghostty GX built-in theme: " ++ name;
+/// The first line of a theme file written by Ghostty GX, before the name.
+pub const marker_prefix = "# Ghostty GX built-in theme: ";
 
-/// The theme file, with LF line endings regardless of the checkout.
-pub const content: []const u8 = withoutCr(@embedFile("themes/GX Mocha"));
+pub const mocha = embedded("GX Mocha");
+pub const latte = embedded("GX Latte");
+
+/// Every built-in theme.
+pub const all = [_]Theme{ mocha, latte };
+
+fn embedded(comptime name: []const u8) Theme {
+    return .{
+        .name = name,
+        .marker = marker_prefix ++ name,
+        .content = withoutCr(@embedFile("themes/" ++ name)),
+    };
+}
 
 fn withoutCr(comptime text: []const u8) []const u8 {
     comptime {
@@ -34,9 +56,12 @@ fn withoutCr(comptime text: []const u8) []const u8 {
 }
 
 /// Whether a theme name from the configuration (a `theme` value, or its
-/// light or dark part) is the built-in theme.
+/// light or dark part) is a built-in theme.
 pub fn isBuiltin(theme: []const u8) bool {
-    return std.mem.eql(u8, theme, name);
+    for (all) |builtin| {
+        if (std.mem.eql(u8, theme, builtin.name)) return true;
+    }
+    return false;
 }
 
 pub const InstallResult = enum {
@@ -54,27 +79,27 @@ pub const InstallResult = enum {
 /// The largest existing theme file `install` reads.
 const max_file_size = 64 * 1024;
 
-/// Makes `<dir_path>/GX Mocha` hold the built-in theme, creating
+/// Makes `<dir_path>/<theme name>` hold the built-in `theme`, creating
 /// `dir_path` if needed. The file is replaced atomically.
-pub fn install(alloc: Allocator, io: std.Io, dir_path: []const u8) !InstallResult {
+pub fn install(alloc: Allocator, io: std.Io, dir_path: []const u8, theme: Theme) !InstallResult {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
     defer dir.close(io);
 
-    const existing: ?[]u8 = dir.readFileAlloc(io, name, alloc, .limited(max_file_size)) catch |err| switch (err) {
+    const existing: ?[]u8 = dir.readFileAlloc(io, theme.name, alloc, .limited(max_file_size)) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
     defer if (existing) |old| alloc.free(old);
     if (existing) |old| {
-        if (equalIgnoringCr(old, content)) return .unchanged;
-        if (!std.mem.startsWith(u8, old, marker)) return .user_file;
+        if (equalIgnoringCr(old, theme.content)) return .unchanged;
+        if (!std.mem.startsWith(u8, old, theme.marker)) return .user_file;
     }
 
     var buf: [1024]u8 = undefined;
-    var atomic_file = try dir.createFileAtomic(io, name, .{ .replace = true });
+    var atomic_file = try dir.createFileAtomic(io, theme.name, .{ .replace = true });
     defer atomic_file.deinit(io);
     var file_writer = atomic_file.file.writer(io, &buf);
-    file_writer.interface.writeAll(content) catch return file_writer.err orelse error.WriteFailed;
+    file_writer.interface.writeAll(theme.content) catch return file_writer.err orelse error.WriteFailed;
     file_writer.interface.flush() catch return file_writer.err orelse error.WriteFailed;
     try atomic_file.replace(io);
     return if (existing == null) .created else .updated;
@@ -93,18 +118,38 @@ fn equalIgnoringCr(a: []const u8, b: []const u8) bool {
     }
 }
 
-test "content starts with the marker and sets no fonts" {
+test "every theme starts with its marker and sets no fonts" {
     const testing = std.testing;
-    try testing.expect(std.mem.startsWith(u8, content, marker ++ "\n"));
-    try testing.expect(std.mem.indexOfScalar(u8, content, '\r') == null);
-    try testing.expect(std.mem.indexOf(u8, content, "background = #1f1f28\n") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "foreground = #ffffff\n") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "font-") == null);
-    try testing.expect(std.mem.indexOf(u8, content, "# gx-theme-version: 2\n") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "palette = 7=#a6adc8\n") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "palette = 15=#bac2de\n") != null);
-    try testing.expect(isBuiltin("GX Mocha"));
+    inline for (all) |theme| {
+        try testing.expect(std.mem.startsWith(u8, theme.content, theme.marker ++ "\n"));
+        try testing.expect(std.mem.indexOfScalar(u8, theme.content, '\r') == null);
+        try testing.expect(std.mem.indexOf(u8, theme.content, "font-") == null);
+        try testing.expect(std.mem.indexOf(u8, theme.content, "# gx-theme-version: ") != null);
+        try testing.expect(isBuiltin(theme.name));
+    }
     try testing.expect(!isBuiltin("gx mocha"));
+    try testing.expect(!isBuiltin("Catppuccin Latte"));
+}
+
+test "GX Mocha has soft text and the Catppuccin bright colors" {
+    const testing = std.testing;
+    const content = mocha.content;
+    try testing.expect(std.mem.indexOf(u8, content, "# gx-theme-version: 3\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "background = #1f1f28\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "foreground = #cdd6f4\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 7=#a6adc8\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 9=#f37799\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 14=#6bd7ca\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 15=#bac2de\n") != null);
+}
+
+test "GX Latte is the Catppuccin Latte palette" {
+    const testing = std.testing;
+    const content = latte.content;
+    try testing.expect(std.mem.indexOf(u8, content, "background = #eff1f5\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "foreground = #4c4f69\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 4=#1e66f5\n") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "palette = 12=#456eff\n") != null);
 }
 
 test "equalIgnoringCr" {
@@ -126,34 +171,44 @@ test "install creates, keeps and updates the theme file" {
     const themes = try std.fs.path.join(alloc, &.{ root, "ghostty", "themes" });
     defer alloc.free(themes);
 
-    try testing.expectEqual(InstallResult.created, try install(alloc, io, themes));
-    try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes));
+    for (all) |theme| {
+        try testing.expectEqual(InstallResult.created, try install(alloc, io, themes, theme));
+        try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes, theme));
+    }
 
-    const path = "ghostty/themes/" ++ name;
+    const content = mocha.content;
+    const path = "ghostty/themes/" ++ mocha.name;
     var buf: [max_file_size]u8 = undefined;
     try testing.expectEqualStrings(content, try tmp.dir.readFile(io, path, &buf));
+    try testing.expectEqualStrings(latte.content, try tmp.dir.readFile(io, "ghostty/themes/" ++ latte.name, &buf));
 
     const crlf = try std.mem.replaceOwned(u8, alloc, content, "\n", "\r\n");
     defer alloc.free(crlf);
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = crlf });
-    try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes));
+    try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes, mocha));
 
-    const old_version = try std.mem.replaceOwned(u8, alloc, content, "# gx-theme-version: 2", "# gx-theme-version: 1");
+    // Version 2 of GX Mocha, with white text and the bright colors equal
+    // to the normal ones, is replaced.
+    const old_version = try std.mem.replaceOwned(u8, alloc, content, "# gx-theme-version: 3", "# gx-theme-version: 2");
     defer alloc.free(old_version);
-    const old_seven = try std.mem.replaceOwned(u8, alloc, old_version, "palette = 7=#a6adc8", "palette = 7=#bac2de");
-    defer alloc.free(old_seven);
-    const old_theme = try std.mem.replaceOwned(u8, alloc, old_seven, "palette = 15=#bac2de", "palette = 15=#a6adc8");
+    const old_text = try std.mem.replaceOwned(u8, alloc, old_version, "foreground = #cdd6f4", "foreground = #ffffff");
+    defer alloc.free(old_text);
+    const old_theme = try std.mem.replaceOwned(u8, alloc, old_text, "palette = 9=#f37799", "palette = 9=#f38ba8");
     defer alloc.free(old_theme);
     const old_crlf = try std.mem.replaceOwned(u8, alloc, old_theme, "\n", "\r\n");
     defer alloc.free(old_crlf);
     for ([_][]const u8{ old_theme, old_crlf }) |old| {
         try tmp.dir.writeFile(io, .{ .sub_path = path, .data = old });
-        try testing.expectEqual(InstallResult.updated, try install(alloc, io, themes));
+        try testing.expectEqual(InstallResult.updated, try install(alloc, io, themes, mocha));
         try testing.expectEqualStrings(content, try tmp.dir.readFile(io, path, &buf));
-        try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes));
+        try testing.expectEqual(InstallResult.unchanged, try install(alloc, io, themes, mocha));
     }
 
+    // A file with another theme's marker is not this theme's file.
+    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = latte.content });
+    try testing.expectEqual(InstallResult.user_file, try install(alloc, io, themes, mocha));
+
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "background = #123456\n" });
-    try testing.expectEqual(InstallResult.user_file, try install(alloc, io, themes));
+    try testing.expectEqual(InstallResult.user_file, try install(alloc, io, themes, mocha));
     try testing.expectEqualStrings("background = #123456\n", try tmp.dir.readFile(io, path, &buf));
 }
