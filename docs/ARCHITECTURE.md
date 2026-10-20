@@ -219,7 +219,7 @@ GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrains
 | 模块 | 作用 |
 |---|---|
 | `language.zig`、`app.zig` | 启动与运行时应用 `language`：改写 `LANGUAGE` 与 `LC_MESSAGES`、让 gettext 缓存失效、切换 `gx.i18n`，子进程拿回原来的 `LANG`/`LANGUAGE`；app action `app.gx-language`、`app.gx-keybinds`、`app.gx-about`（`about.zig` 的 Ghostty GX 关于对话框，GX 主菜单用它代替上游 `win.about`）；`performGxAction` 执行前五个 `gx:` 动作，其余返回未执行；语言切换让默认命令面板条目的译文变化时，经 `gx.config_layers.rebuild` 在内存重建配置 |
-| `window.zig`、`menus.zig`、`ui/1.5/gx/menus.blp`、`launch.zig` | 菜单与按钮提示随语言重建（复刻上游菜单并加 GX 分区：设置…、键盘快捷键、语言）；新建标签页下拉的启动配置与「用启动配置新建窗口」 |
+| `window.zig`、`menus.zig`、`ui/1.5/gx/menus.blp`、`launch.zig` | 菜单与按钮提示随语言重建（复刻上游菜单并加 GX 分区：设置…、键盘快捷键、语言）；新建标签页下拉的启动配置与「用启动配置新建窗口」；未设 `command` 时新终端默认 GX Zsh（`launch.zig::defaultCommand`，经 `origin.zig` 接入） |
 | `shortcuts.zig`、`shortcuts_dialog.zig` | 快捷键速查表（`Adw.Dialog`，可搜索） |
 | `settings_dialog.zig`、`ui/1.5/gx-settings-dialog.blp` | 可复用的设置对话框（`Adw.PreferencesDialog`，app action `app.gx-settings`；保存失败时跨窗口打开仍保留原可见实例、编辑和 Retry；运行期 libadwaita 低于 1.5 时只记日志；GX-0015） |
 | `dialog_cache.zig` | 按窗口对象保留设置宿主，配置/主题/语言变化使缓存作废；drop 或窗口 finalize 时释放 |

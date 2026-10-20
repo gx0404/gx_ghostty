@@ -49,6 +49,8 @@
 - Windows 标签栏每次刷新只拍一次系统进程快照（原来每个标签拍一次），标签多时 CPU 占用更低。
 - 配置诊断：`language` 填了不支持的值、`gui-settings.ghostty` 读不出来时会报告配置错误，`ghostty +validate-config` 因此返回 1。
 - GTK 切换界面语言与重新加载配置时在内存里重建配置，不再重新读盘。
+- Linux GTK：各配置层都没设 `command` 时，新标签页、分屏与窗口默认启动 GX Zsh（先找 `/usr/lib/ohmyzsh-gx/bin/gx-zsh`，再找 `PATH`），与 Windows 一致，开启 `gx-session-restore` 时这些终端也按 GX Zsh 恢复；找不到时仍是上游的登录 shell。新建标签页下拉与设置 Shell 页的「系统默认」随之标出 GX Zsh；写了 `command` 或用 `-e` 时照旧。
+- Linux GTK 程序内嵌的窗口图标与 GX Shell 的 Ubuntu deb 启动器图标改用 Ghostty GX 的 `>_` 图标（与 Windows 相同，`scripts/gx_icon.py` 生成 `dist/linux/gx/icons/`），不再是 Ghostty 的幽灵图标；`zig build install` 与 Debian 13 压缩包安装的系统图标保持上游。
 - Windows 便携包、安装包、Linux deb 与 debian13 GTK 压缩包附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本（压缩包在 `usr/share/doc/ghostty-gx/`，另附 Ghostty 的 MIT 许可）。
 - shell 集成的光标特性在提示符处显示配置的 `cursor-style` 与闪烁设置（GX 默认为闪烁块状），程序留下的光标形状在下一个提示符复位；未显式设置的维度仍可由程序 DECSCUSR 改变，zsh 与 fish 的 vi 绑定保留模式指示。未显式设置形状时，`gx-prompt-cursor = bar` 恢复上游提示符竖线；`no-cursor` 只关闭集成脚本的光标处理。
 

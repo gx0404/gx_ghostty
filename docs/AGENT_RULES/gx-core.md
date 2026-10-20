@@ -57,7 +57,7 @@
 ### gx: 动作与启动配置
 
 - `action.zig::Action` 的语法是 `gx:<name>[:<argument>]`：`settings`、`main_menu`、`keybinds`、`new_tab_profile:<id>`、`new_window_profile:<id>`，以及 `settings_page:<页>`（六页）、`new_tab_menu`、`context_menu`、`move_split_to_tab`、`move_split_to_window`、`tab_switcher`。GX-0014 给 `input.Binding.Action` 加 `gx` 成员；核心 `Surface.performBindingAction` 在 apprt 声明了 `gxAction` 时调用它（win32 `App.gxAction`，GTK 转给 `src/apprt/gtk/gx/app.zig`），否则记 warn 并返回 false。两个 apprt 都执行全部动作，没有可作用的目标时返回 false，`performable:` 绑定因而把按键交还终端。
-- `profiles.zig::detect` 是 `Environment` 的纯函数：GX Zsh 与 herdr 先查随包与 GX Shell 安装目录的 `bin` 再查 `PATH`；Windows 另有 PowerShell 7/5.1、cmd、Git Bash、MSYS2 UCRT64、Nushell 与注册表里的 WSL 发行版（`isUtilityDistro` 跳过 Docker/Rancher 内部发行版），Linux 另有登录 shell、zsh、bash、fish；最后是 `custom:<名称>`。`defaultProfile`：Windows 依次 GX Zsh、pwsh、powershell、cmd，Linux 依次 GX Zsh、登录 shell；`commandConfigured` 判断各层是否设了 `command`。
+- `profiles.zig::detect` 是 `Environment` 的纯函数：GX Zsh 与 herdr 先查随包与 GX Shell 安装目录的 `bin` 再查 `PATH`；Windows 另有 PowerShell 7/5.1、cmd、Git Bash、MSYS2 UCRT64、Nushell 与注册表里的 WSL 发行版（`isUtilityDistro` 跳过 Docker/Rancher 内部发行版），Linux 另有登录 shell、zsh、bash、fish；最后是 `custom:<名称>`。`defaultProfile`：Windows 依次 GX Zsh、pwsh、powershell、cmd，Linux 依次 GX Zsh、登录 shell（GTK 只替换为 GX Zsh，见 `apprt-gtk.md`）；`commandConfigured` 判断各层是否设了 `command`。
 - `profiles.Cache`（app 一份）按环境变量指纹缓存 shell，重载配置时 `invalidate`；`List.resolve` 解析 `gx:new_*_profile:<参数>`：id，再自定义配置名，再英文或当前语言的显示名（忽略大小写）。
 
 ### 界面库

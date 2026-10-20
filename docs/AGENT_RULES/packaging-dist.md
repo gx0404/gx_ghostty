@@ -29,7 +29,7 @@
 - Flatpak：`flatpak/com.mitchellh.ghostty.yml`（ReleaseFast）与 `com.mitchellh.ghostty-debug.yml`（Debug）以仓库目录为源，用 `-Dflatpak=true --system $PWD/vendor/p` 构建，依赖源取自生成的 `flatpak/zig-packages.json`；`flatpak/dependencies.yml` 用 sha256 钉住 Zig 0.16.0 官方包。
 - Snap：`snap/snapcraft.yaml` 从 ziglang.org 下载 Zig 0.16.0（不校验摘要），用 `craftctl set version=$(cat VERSION)` 取版本，所以输入必须是源码包；`-Dsnap -Doptimize=ReleaseFast -Dcpu=baseline`，classic confinement，启动器 `snap/local/launcher`。
 - Nix：`nix/package.nix` 以 `build.zig.zon.nix` 为离线依赖，传硬编码的 `-Dversion-string=1.3.2-dev+<rev>-nix` 与 `-Dcpu=baseline`，只声明 Linux 平台。
-- 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程。图标：`images/gnome/` 供 Linux 安装、GTK gresource 与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
+- 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程。图标：`images/gnome/` 供 Linux 安装与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
 
 ### fork 发布资产（`gx-release`）
 
@@ -54,9 +54,9 @@
 
 ### Ghostty GX 图标（`scripts/gx_icon.py`）
 
-- Ghostty 维护者要求非官方构建不用 Ghostty 品牌，Windows 产物因此用 `dist/windows/gx/ghostty-gx.ico`（16～256 像素）：只用标准库的 `python scripts/gx_icon.py` 生成，`--check` 逐像素比对，`--png <目录>` 导出供审阅；改图案改生成器，不手改 ico。
+- Ghostty 维护者要求非官方构建不用 Ghostty 品牌，因此用 `dist/windows/gx/ghostty-gx.ico`（16～256 像素）与 `dist/linux/gx/icons/`（16～2048）：只用标准库的 `python scripts/gx_icon.py` 生成，`--check` 逐像素比对，`--png <目录>` 导出供审阅；改图案改生成器，不手改。
 - 使用者：exe 资源、安装包的 `SetupIconFile`（`scripts/gx_windows_package.py::ICON`）与 Windows stage 的 `build-inputs/ghostty.ico`（GX Shell 安装包图标，stage 契约不变）。
-- Linux 保持上游图标：GTK 窗口图标取应用 ID `com.mitchellh.ghostty`，只换 deb stage 启动器的图标会与窗口不一致，所以 deb stage 仍取 `images/gnome/`。
+- Linux：PNG 是 GTK gresource 内嵌的窗口图标（GX-0058，名仍为应用 ID）与 deb stage 的启动器图标；`zig build install` 与 debian13 压缩包里的 hicolor 图标仍是上游的。
 
 ### GX Shell 组件 stage（`scripts/gx_package.py`、`scripts/gx_linux_build.py`）
 

@@ -20,7 +20,7 @@
 ### GObject、Blueprint 与资源
 
 - `class.zig::Common`：`as`（编译期保证安全的上转）、`ref`/`unref`、`private`、私有字段属性访问器、`Class.bindTemplateChildPrivate`、`Class.bindTemplateCallback`。另有 `weak_ref.zig::WeakRef` 与 `ext/actions.zig`（action 名在编译期校验）。
-- `build/gresource.zig::blueprints` 是 UI 模板登记表，目录名即模板要求的最低 libadwaita 版本；`build/gresource.zig::blueprint` 在编译期把登记项映射为资源路径，未登记即 `@compileError`。同文件登记 `css` 与 `icon_sizes`（取自 `images/gnome/`）。
+- `build/gresource.zig::blueprints` 是 UI 模板登记表，目录名即模板要求的最低 libadwaita 版本；`build/gresource.zig::blueprint` 在编译期把登记项映射为资源路径，未登记即 `@compileError`。同文件登记 `css` 与 `icon_sizes`（取自 `dist/linux/gx/icons/`，GX-0058）。
 - `build/blueprint.zig` 构建期检查 libadwaita 头文件版本，以及 `blueprint-compiler` 不低于 `required_blueprint_version`（当前 0.16.0）。
 - `src/build/SharedDeps.zig::gtkNgDistResources` 逐个 `blueprint-compiler compile`，再用 `glib-compile-resources` 生成 `ghostty_resources.{c,h}`。源码包内它们是预生成的 dist 资源（`src/build/GhosttyDist.zig::Resource`），Git 检出里出现会被忽略并告警。
 - `build/info.zig`：`application_id` 在 Debug/ReleaseSafe 下追加 `-debug`，另有 `resource_path`、`object_path`。
@@ -37,7 +37,7 @@
 
 ### GX 层
 
-- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`，写明非官方分支，代替上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单与启动配置下拉随语言重建）、`launch.zig`、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
+- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`，写明非官方分支，代替上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单与启动配置下拉随语言重建）、`launch.zig`（未设 `command` 时新终端默认 GX Zsh，经 `origin.zig` 接入，GX-0039）、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
 
 ### i18n
 
