@@ -103,7 +103,8 @@ Deb layout (top level exactly root/, fonts/ and the manifest)
   root/usr/bin/ghostty-gx    symlink to ../lib/ghostty-gx/bin/ghostty
   root/usr/share/applications/com.gx0404.ghostty-gx.desktop   Name=Ghostty GX, Exec=ghostty-gx,
                              Icon=com.gx0404.ghostty-gx, StartupWMClass=com.mitchellh.ghostty
-  root/usr/share/icons/hicolor/<N>x<N>/apps/com.gx0404.ghostty-gx.png   from images/gnome/<N>.png
+  root/usr/share/icons/hicolor/<N>x<N>/apps/com.gx0404.ghostty-gx.png   from dist/linux/gx/icons/<N>.png
+                             (the Ghostty GX icon, scripts/gx_icon.py; the GTK app embeds the same set)
   root/usr/share/doc/ghostty-gx/copyright   machine-readable copyright (Ghostty MIT, fonts OFL-1.1,
                              the pinyin tables compiled into bin/ghostty MIT and Unicode-3.0)
   fonts/                     the same 8 pinned fonts
@@ -145,6 +146,7 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import gx_icon  # noqa: E402  (scripts/gx_icon.py)
 import gx_linux_build as linux  # noqa: E402  (scripts/gx_linux_build.py)
 import gx_pinyin  # noqa: E402  (scripts/gx_pinyin.py)
 import gx_release  # noqa: E402  (scripts/gx_release.py)
@@ -618,7 +620,7 @@ def stage_deb(stage: Path, prefix: Path, version_string: str, cache: Path, *, ro
     desktop.parent.mkdir(parents=True, exist_ok=True)
     desktop.write_bytes(desktop_entry().encode("utf-8"))
     for size in ICON_SIZES:
-        copy_file(Path(root) / "images" / "gnome" / f"{size}.png",
+        copy_file(Path(root) / gx_icon.linux_icon(size),
                   stage / f"root/usr/share/icons/hicolor/{size}x{size}/apps/{APP_ID}.png")
     licenses = materialize_fonts(stage, cache, root=root, offline=offline, fetcher=fetcher,
                                  downloads=downloads, payload=payload)

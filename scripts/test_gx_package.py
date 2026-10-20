@@ -25,6 +25,7 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import gx_icon  # noqa: E402
 import gx_linux_build as linux  # noqa: E402
 import gx_package as stage_mod  # noqa: E402
 import gx_pinyin as pinyin  # noqa: E402
@@ -38,7 +39,7 @@ SHA = "a" * 40
 ROOT_FILES = (
     "LICENSE", "CHANGELOG.md", "build.zig.zon", "scripts/setup_zig.py", "dist/windows/gx/ghostty-gx.ico",
     "dist/windows/gx/ghostty-gx.iss", *(item.member for item in pkg.PAYLOAD if item.source == pkg.REPO),
-    *(f"images/gnome/{size}.png" for size in stage_mod.ICON_SIZES),
+    *(gx_icon.linux_icon(size).as_posix() for size in stage_mod.ICON_SIZES),
 )
 
 
@@ -1077,6 +1078,16 @@ class BuildCommandTests(unittest.TestCase):
                                      ("deb", True, Path(f"ghostty-{VS}.tar.gz"))])
 
 
+class DebIconTests(unittest.TestCase):
+    def test_deb_icons_are_the_ghostty_gx_icon(self):
+        # The launcher icon matches the window icon the GTK resources embed (GX-0058).
+        self.assertLessEqual(set(stage_mod.ICON_SIZES), set(gx_icon.LINUX_SIZES))
+        for size in stage_mod.ICON_SIZES:
+            with self.subTest(size=size):
+                dim, rgba = gx_icon.decode_png((ROOT / gx_icon.linux_icon(size)).read_bytes())
+                self.assertEqual((dim, rgba), (size, gx_icon.render(size)))
+
+
 @unittest.skipUnless(symlinks_supported(), "deb stages need symlinks (Developer Mode on Windows)")
 class DebStageTests(Case):
     def build(self, stage: Path | None = None, prefix: Path | None = None, **kwargs) -> tuple[Path, dict]:
@@ -1116,7 +1127,7 @@ class DebStageTests(Case):
             self.assertIn(line + "\n", desktop)
         for size in stage_mod.ICON_SIZES:
             icon = stage / f"root/usr/share/icons/hicolor/{size}x{size}/apps/com.gx0404.ghostty-gx.png"
-            self.assertEqual(icon.read_bytes(), (ROOT / f"images/gnome/{size}.png").read_bytes())
+            self.assertEqual(icon.read_bytes(), (ROOT / gx_icon.linux_icon(size)).read_bytes())
         copyright_text = (stage / "root/usr/share/doc/ghostty-gx/copyright").read_text(encoding="utf-8")
         for needle in ("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
                        "Copyright: 2024 Mitchell Hashimoto, Ghostty contributors", "License: MIT",

@@ -80,8 +80,10 @@ pub const file_inputs = deps: {
     var deps: [total][]const u8 = undefined;
     var index: usize = 0;
     for (icon_sizes) |size| {
-        deps[index] = std.fmt.comptimePrint("images/gnome/{d}.png", .{size});
-        deps[index + 1] = std.fmt.comptimePrint("images/gnome/{d}.png", .{size * 2});
+        // fork(gx): GX-0058 begin: the Ghostty GX icon (scripts/gx_icon.py) instead of images/gnome
+        deps[index] = std.fmt.comptimePrint("dist/linux/gx/icons/{d}.png", .{size});
+        deps[index + 1] = std.fmt.comptimePrint("dist/linux/gx/icons/{d}.png", .{size * 2});
+        // fork(gx): GX-0058 end
         index += 2;
     }
     for (blueprints) |bp| {
@@ -163,7 +165,8 @@ fn genIcons(io: std.Io, writer: *std.Io.Writer) !void {
         // 1x
         {
             const alias = std.fmt.comptimePrint("{d}x{d}", .{ size, size });
-            const source = std.fmt.comptimePrint("images/gnome/{d}.png", .{size});
+            // fork(gx): GX-0058 the Ghostty GX icon instead of images/gnome/{d}.png
+            const source = std.fmt.comptimePrint("dist/linux/gx/icons/{d}.png", .{size});
             try cwd.access(io, source, .{});
             try writer.print(
                 \\    <file alias="{s}/apps/{s}.png">{s}</file>
@@ -176,7 +179,8 @@ fn genIcons(io: std.Io, writer: *std.Io.Writer) !void {
         // 2x
         {
             const alias = std.fmt.comptimePrint("{d}x{d}@2", .{ size, size });
-            const source = std.fmt.comptimePrint("images/gnome/{d}.png", .{size * 2});
+            // fork(gx): GX-0058 the Ghostty GX icon instead of images/gnome/{d}.png
+            const source = std.fmt.comptimePrint("dist/linux/gx/icons/{d}.png", .{size * 2});
             try cwd.access(io, source, .{});
             try writer.print(
                 \\    <file alias="{s}/apps/{s}.png">{s}</file>

@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0057）之后的号。在册的 50 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0057，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0058）之后的号。在册的 51 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0058，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -136,6 +136,7 @@
 | GX-0057 | `src/termio/Termio.zig` | `fork(gx): GX-0057` | active |
 | GX-0057 | `src/termio/stream_handler.zig` | `fork(gx): GX-0057` | active |
 | GX-0057 | `src/Surface.zig` | `fork(gx): GX-0057` | active |
+| GX-0058 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0058` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1574,3 +1575,12 @@ python -m unittest scripts.test_fork_patches -v
 - 日志核对：钉版 Zig `lib/compiler/test_runner.zig::log` 仅对 err 累加 log_err_count；testing 日志初值为 warn，定向 filter 未执行 `src/main.zig` 的无名日志级别测试，所以 warn 可打印。`scripts/zig_test.py::classify` 按协议 status/leak/log_err 判定，不以任意 stderr 输出判失败；上述 RED 的 log_err=0，失败来自查询断言。mode 40 的既有 primary OOM log.err 未改，该错误由 Termio/DECCOLM 测试，mode 40 验可恢复分支；新增策略没有日志，不降低 error 等级或吞诊断。
 - 风险与复验：显式用户会主动失去程序的形状/闪烁指示，未显式者保留。重点复验配置加载/重载、C7 闪烁与 terminal-stream 守护；其余历史证据按实际影响及源/映像身份复核。新增公共调用或屏状态写入时检查是否需经过策略，不能在解锁后补应用。
 - 移除条件：上游有等价、区分显式来源的 app 策略与真实状态查询，且以上矩阵通过后，移除四文件钩子与 GX 实现，登记 removed；不因此移除独立的 GX-0047 脚本功能。
+
+## GX-0058 GTK 内嵌图标改用 Ghostty GX 图标
+
+- 文件：`src/apprt/gtk/build/gresource.zig`；active，不回馈上游。`file_inputs` 的 1x/2x 两行用 begin/end 块包住，`genIcons` 的两处 `source` 各有一行单行标记；只换 PNG 来源目录，资源别名、图标名（`com.mitchellh.ghostty`）与 `icon_sizes` 不变。
+- 原因：Ghostty 维护者要求非官方构建不用 Ghostty 品牌（同 GX-0026）。GTK 窗口按应用 ID `com.mitchellh.ghostty` 找图标，gresource 里内嵌的是 `images/gnome/` 的幽灵图标，Ubuntu 24.04 上 GX Shell 的 Ghostty GX 因此在窗口与切换器里显示上游图标；gresource 只能经这个构建期生成器选定来源，没有构建参数可替换。
+- 行为：gresource 改从 `dist/linux/gx/icons/<N>.png` 内嵌 16～1024 像素的 1x 与 2x 图标（2048 为 1024@2），这些 PNG 由 `scripts/gx_icon.py` 与 Windows 的 `ghostty-gx.ico` 同一图案生成；GX Shell 的 deb stage（`scripts/gx_package.py`）用同一组 PNG 作启动器图标 `com.gx0404.ghostty-gx`。上游的 `images/gnome/`、`zig build install` 安装的 hicolor 图标、Flatpak/Snap 与 Debian 13 tarball 都不变：装了上游 hicolor 图标的系统，图标主题查找仍可能先命中上游幽灵图标（共用应用 ID 的已知限制），所以 GX 的关于对话框继续不显示 logo。
+- 同步：上游改 `icon_sizes` 或图标来源时取上游版本，再把两处 `file_inputs` 与两处 `source` 指回 `dist/linux/gx/icons/` 并保留标记；新增尺寸要同步加进 `scripts/gx_icon.py::LINUX_SIZES`（含 2x）并重新生成。
+- 移除条件：Ghostty GX 不再发布 Linux GTK 程序，或改用独立应用 ID 与自有资源前缀后，删除改动与标记，登记改为 removed。
+- 验证：`python scripts/gx_icon.py --check`；`python scripts/run_unittests.py test_gx_icon test_gx_package test_fork_patches`（`test_gx_icon` 锁定四处来源路径、`icon_sizes` 与 2x 都在 `LINUX_SIZES` 里，`test_gx_package` 锁定 deb 图标与渲染一致）；GTK 构建 `just wsl build --gtk` 后在 Xvfb 场景或真实 Ubuntu 24.04 桌面截图确认窗口图标，Dock/Activities 的启动器图标须在装好 GX Shell deb 的 GNOME 上验收，Xvfb 截图不能代替。

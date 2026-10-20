@@ -3,8 +3,12 @@
 //! Ghostty by the Ghostty developers; this one names Ghostty GX, its
 //! maintainer and links, and says on its first page that Ghostty GX is an
 //! unofficial fork that the Ghostty project does not endorse. It shows no
-//! logo: the Linux build keeps the upstream Ghostty application icon, which
-//! this dialog must not present as the Ghostty GX logo.
+//! logo: the dialog would look the icon up by the application id the fork
+//! keeps (`com.mitchellh.ghostty`), and although the GTK resources embed
+//! the Ghostty GX icon under that name (GX-0058), a build that installs the
+//! upstream hicolor icons (`zig build install`, the Debian 13 tarball) can
+//! still resolve it to the upstream Ghostty logo, which this dialog must not
+//! present as the Ghostty GX logo.
 const std = @import("std");
 const adw = @import("adw");
 const gtk = @import("gtk");

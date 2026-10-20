@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Ghostty GX 应用图标 dist/windows/gx/ghostty-gx.ico 的生成器（只用 Python 标准库）。
+"""Ghostty GX 应用图标的生成器（只用 Python 标准库）：Windows 的 dist/windows/gx/ghostty-gx.ico
+与 Linux 的 dist/linux/gx/icons/<尺寸>.png。
 
 用法：
-  python scripts/gx_icon.py              渲染全部尺寸并写入 ico（字节不变时不改文件）
-  python scripts/gx_icon.py --check      只读校验：已提交的 ico 与重新渲染的像素逐个比对，不一致退出 1
-  python scripts/gx_icon.py --png DIR    另把每个尺寸写成 DIR/ghostty-gx-<尺寸>.png，供审阅
+  python scripts/gx_icon.py              渲染全部尺寸，写入 ico 与 Linux PNG（像素不变的文件不改）
+  python scripts/gx_icon.py --check      只读校验：已提交的 ico 与 PNG 与重新渲染的像素逐个比对，不一致退出 1
+  python scripts/gx_icon.py --png DIR    另把 ico 的每个尺寸写成 DIR/ghostty-gx-<尺寸>.png，供审阅
   可选 --root PATH（测试用，默认取脚本所在仓库）
 
 图案：GX Mocha 配色（背景 #1f1f28 与 Catppuccin Mocha 色板）的深色圆角方块，蓝色提示符 `>`；
 48 像素及以上在提示符旁画 `GX` 字样与光标，32 像素及以下只画 `>_`，保证 16×16 仍可辨认。
 不使用 Ghostty 的幽灵图标。小尺寸按像素网格取整，大尺寸在 256 单位的设计坐标里画；
 边缘抗锯齿按像素中心的有符号距离计算，只用 IEEE 精确的四则运算与开方，结果与平台无关。
+`render_reference` 是逐像素求值的定义；`render` 沿每行做球面追踪（距离函数都是 1-Lipschitz），
+只在形状边缘附近求值，逐字节等于前者（测试锁定），2048 像素因此也只要几秒。
 
 ico 内含 16、20、24、32、40、48、64、96、128、256 像素：256 像素是 PNG（Windows Vista 起支持），
-其余是 32 位 BMP（带 AND 掩码，兼容资源编译器与 Inno Setup）。PNG 的压缩字节可能随 zlib
-版本变化，所以 --check 解码后比较像素，不比较文件字节。
+其余是 32 位 BMP（带 AND 掩码，兼容资源编译器与 Inno Setup）。Linux PNG 有 16、32、64、128、256、
+512、1024、2048 像素，覆盖 GTK gresource 的 1x 与 2x 图标（GX-0058，src/apprt/gtk/build/gresource.zig）
+和 GX Shell deb stage 的 hicolor 图标（scripts/gx_package.py）。PNG 的压缩字节可能随 zlib 版本变化，
+所以 --check 与写入都解码后比较像素，不比较文件字节。
 
-退出码：0 成功（或 --check 时一致）；1 --check 时 ico 缺失、无法解析或与渲染不一致；2 用法错误。
+退出码：0 成功（或 --check 时一致）；1 --check 时 ico 或 PNG 缺失、无法解析或与渲染不一致；2 用法错误。
 """
 
 from __future__ import annotations
@@ -32,6 +37,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ICON = Path("dist/windows/gx/ghostty-gx.ico")
 SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+LINUX_ICONS = Path("dist/linux/gx/icons")
+LINUX_SIZES = (16, 32, 64, 128, 256, 512, 1024, 2048)
 PNG_MIN_SIZE = 256
 SMALL_MAX_SIZE = 32
 DESIGN = 256.0
@@ -164,9 +171,10 @@ def lerp(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[fl
     return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
 
 
-@functools.cache
-def render(size: int) -> bytes:
-    """Straight-alpha RGBA rows, top to bottom."""
+def render_reference(size: int) -> bytes:
+    """Straight-alpha RGBA rows, top to bottom, evaluating every shape at every pixel.
+
+    The definition of the icon: `render` returns the same bytes faster, which the tests check."""
     layout = Layout(size)
     out = bytearray()
     span = size - 2 * layout.margin
@@ -187,10 +195,130 @@ def render(size: int) -> bytes:
                     over(pixel, MARK, min(body, coverage(layout.mark_distance(px, py))))
             alpha = pixel[3]
             if alpha <= 0.0:
-                out += b"\x00\x00\x00\x00"
+                out += TRANSPARENT
                 continue
             out += bytes(int(clamp(pixel[i] / alpha) * 255.0 + 0.5) for i in range(3))
             out.append(int(alpha * 255.0 + 0.5))
+    return bytes(out)
+
+
+# Distance bands over which a term of `render_reference` is constant: open intervals with a
+# label. A pixel whose distance lies inside one is classified by the label (a string, so that
+# it never equals a distance); any other pixel keeps its distance (a float) and goes through
+# the same arithmetic as `render_reference`. Background: IN has body 1 and no rim, RIM_FULL
+# body 1 and a fully opaque rim, OUT is transparent. Shapes: INSIDE has coverage 1, OUTSIDE 0.
+IN, RIM_FULL, OUT = "in", "rim", "out"
+INSIDE, OUTSIDE = "inside", "outside"
+SHAPE_BANDS = ((-math.inf, -0.5, INSIDE), (0.5, math.inf, OUTSIDE))
+# How far inside a band a distance must be, in pixels. It dwarfs the rounding error of the
+# distance functions (about 1e-12 for coordinates below 4096), so neither a classified pixel
+# nor a skipped one can be on the other side of a band edge.
+TRACE_MARGIN = 1e-6
+TRANSPARENT = b"\x00\x00\x00\x00"
+
+
+def background_bands(rim: float) -> tuple[tuple[float, float, str], ...]:
+    return ((-math.inf, -(rim + 0.5), IN), (-rim + 0.5, -0.5, RIM_FULL), (0.5, math.inf, OUT))
+
+
+def trace(distance, py: float, size: int, bands) -> list[tuple[int, int, object]]:
+    """The pixels of row `py` as runs (start, end, value) of one `distance` function.
+
+    The value is the label of a band for pixels whose distance is provably inside it, else
+    the distance of one pixel. Every distance function here is 1-Lipschitz (exact signed
+    distances, their negations, minima and maxima), so the distance of a pixel `j` columns
+    to the right differs by at most `j`: a distance `room` inside a band keeps the next
+    `room` pixels there without evaluating them (sphere tracing along the row)."""
+    runs: list[tuple[int, int, object]] = []
+    x = 0
+    while x < size:
+        value = distance(x + 0.5, py)
+        for low, high, label in bands:
+            room = min(value - low, high - value)
+            if room > TRACE_MARGIN:
+                end = min(size, x + 1 + int(room - TRACE_MARGIN))
+                runs.append((x, end, label))
+                x = end
+                break
+        else:
+            runs.append((x, x + 1, value))
+            x += 1
+    return runs
+
+
+def merge(size: int, traces: list[list[tuple[int, int, object]]]):
+    """Yield (start, end, values): the runs over which every trace keeps one value."""
+    positions = [0] * len(traces)
+    x = 0
+    while x < size:
+        end = size
+        values = []
+        for runs, position in zip(traces, positions):
+            _, run_end, value = runs[position]
+            end = min(end, run_end)
+            values.append(value)
+        yield x, end, tuple(values)
+        for i, runs in enumerate(traces):
+            if runs[positions[i]][1] == end:
+                positions[i] += 1
+        x = end
+
+
+def shape_coverage(value: object) -> float:
+    if type(value) is str:
+        return 1.0 if value == INSIDE else 0.0
+    return coverage(value)
+
+
+def compose(layout: Layout, shade: tuple[float, float, float], values: tuple) -> bytes:
+    """One pixel of `render_reference` from the classified terms of `trace`."""
+    background = values[0]
+    if type(background) is str:
+        if background == OUT:
+            return TRANSPARENT
+        body, rim = 1.0, (1.0 if background == RIM_FULL else 0.0)
+    else:
+        body = coverage(background)
+        if not body > 0.0:
+            return TRANSPARENT
+        rim = min(body, coverage(-(background + layout.rim)))
+    pixel = [0.0, 0.0, 0.0, 0.0]
+    over(pixel, shade, body)
+    over(pixel, RIM, rim)
+    over(pixel, PROMPT, min(body, shape_coverage(values[1])))
+    over(pixel, CURSOR, min(body, shape_coverage(values[2])))
+    if layout.mark is not None:
+        over(pixel, MARK, min(body, shape_coverage(values[3])))
+    alpha = pixel[3]
+    if alpha <= 0.0:
+        return TRANSPARENT
+    return bytes(int(clamp(pixel[i] / alpha) * 255.0 + 0.5) for i in range(3)) + bytes((int(alpha * 255.0 + 0.5),))
+
+
+@functools.cache
+def render(size: int) -> bytes:
+    """Straight-alpha RGBA rows, top to bottom: `render_reference`, byte for byte.
+
+    Each row is traced per term (`trace`), and every run of pixels that classify alike is
+    composed once (`compose`), so large sizes evaluate the shapes only near their edges."""
+    layout = Layout(size)
+    distances = [layout.background, layout.prompt_distance, layout.cursor_distance]
+    bands = [background_bands(layout.rim), SHAPE_BANDS, SHAPE_BANDS]
+    if layout.mark is not None:
+        distances.append(layout.mark_distance)
+        bands.append(SHAPE_BANDS)
+    out = bytearray()
+    span = size - 2 * layout.margin
+    for y in range(size):
+        py = y + 0.5
+        shade = lerp(BACKGROUND_TOP, BACKGROUND_BOTTOM, clamp((py - layout.margin) / span))
+        traces = [trace(distance, py, size, band) for distance, band in zip(distances, bands)]
+        pixels: dict[tuple, bytes] = {}
+        for start, end, values in merge(size, traces):
+            pixel = pixels.get(values)
+            if pixel is None:
+                pixel = pixels[values] = compose(layout, shade, values)
+            out += pixel * (end - start)
     return bytes(out)
 
 
@@ -294,34 +422,66 @@ def render_all() -> dict[int, bytes]:
     return {size: render(size) for size in SIZES}
 
 
+def linux_icon(size: int) -> Path:
+    return LINUX_ICONS / f"{size}.png"
+
+
+def read_ico(path: Path) -> dict[int, bytes]:
+    return decode_ico(path.read_bytes())
+
+
+def read_png(path: Path) -> dict[int, bytes]:
+    dim, rgba = decode_png(path.read_bytes())
+    return {dim: rgba}
+
+
+def stale(path: Path, read, images: dict[int, bytes]) -> str | None:
+    """Why the file at `path` does not hold exactly `images`, or None when it does."""
+    try:
+        committed = read(path)
+    except (OSError, ValueError, zlib.error, struct.error) as err:
+        return f"cannot read the icon: {err}"
+    if committed != images:
+        return "is stale: run python scripts/gx_icon.py"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate dist/windows/gx/ghostty-gx.ico")
-    parser.add_argument("--check", action="store_true", help="compare the committed icon with a fresh rendering")
-    parser.add_argument("--png", type=Path, help="also write every size as a PNG into this directory")
+    parser = argparse.ArgumentParser(description="Generate the Ghostty GX icons (Windows ico and Linux PNGs)")
+    parser.add_argument("--check", action="store_true", help="compare the committed icons with a fresh rendering")
+    parser.add_argument("--png", type=Path, help="also write every ico size as a PNG into this directory")
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     args = parser.parse_args(argv)
     if args.check and args.png:
         parser.error("--check does not write files")
-    target = args.root / ICON
     images = render_all()
+    outputs = [(ICON, read_ico, images, lambda: encode_ico(images))]
+    for size in LINUX_SIZES:
+        rgba = render(size)
+        outputs.append((linux_icon(size), read_png, {size: rgba}, lambda size=size, rgba=rgba: encode_png(size, rgba)))
     if args.check:
-        try:
-            committed = decode_ico(target.read_bytes())
-        except (OSError, ValueError, zlib.error, struct.error) as err:
-            print(f"{ICON.as_posix()}: cannot read the icon: {err}", file=sys.stderr)
+        problems = []
+        for relative, read, expected, _ in outputs:
+            problem = stale(args.root / relative, read, expected)
+            if problem is not None:
+                separator = ": " if problem.startswith("cannot") else " "
+                problems.append(f"{relative.as_posix()}{separator}{problem}")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        if problems:
             return 1
-        if committed != images:
-            print(f"{ICON.as_posix()} is stale: run python scripts/gx_icon.py", file=sys.stderr)
-            return 1
-        print(f"{ICON.as_posix()} is up to date ({', '.join(map(str, SIZES))} px)")
+        print(f"{ICON.as_posix()} ({', '.join(map(str, SIZES))} px) and {LINUX_ICONS.as_posix()}/ "
+              f"({', '.join(map(str, LINUX_SIZES))} px) are up to date")
         return 0
-    data = encode_ico(images)
-    if not target.is_file() or target.read_bytes() != data:
+    for relative, read, expected, encode in outputs:
+        target = args.root / relative
+        if stale(target, read, expected) is None:
+            print(f"{relative.as_posix()} unchanged")
+            continue
+        data = encode()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-        print(f"wrote {ICON.as_posix()} ({len(data)} bytes)")
-    else:
-        print(f"{ICON.as_posix()} unchanged")
+        print(f"wrote {relative.as_posix()} ({len(data)} bytes)")
     if args.png:
         args.png.mkdir(parents=True, exist_ok=True)
         for size, rgba in images.items():
