@@ -26,11 +26,11 @@ expect = [
   "progress-expired: more than 15 s after t4's last prompt its progress ring is gone",
   "max-top-edge-click: in the maximized window a click at the very top screen edge selected t1",
   "max-close-top-edge: a click at the top edge of t3's close column closed t3",
-  "twelve-tabs: twelve tabs overflow: scroll buttons at both ends, the all-tabs button, fades at the clipped ends; the active tab keeps its minimum width and close button",
+  "twelve-tabs: twelve tabs overflow: scroll buttons at both ends, the all-tabs button, fades at the clipped ends; the active tab keeps its minimum width, close button and brand signature bar",
   "scrolled-back: the scroll back button moved the strip by 50 DIP",
   "wheel-scrolled: the wheel over the tab bar scrolled the strip",
   "all-tabs-menu: the all-tabs button opened a menu listing every tab with the active one marked",
-  "active-into-view: F7 selected the first tab and the strip scrolled it into view",
+  "active-into-view: F7 selected the first tab and the strip scrolled it into view; the brand signature bar moved to it",
   "tab-pressed: an inactive tab held down shows the pressed fill, lighter than hover",
 ]
 

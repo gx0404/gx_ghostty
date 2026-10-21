@@ -26,8 +26,8 @@ expect = [
   "caption-tooltip-restore: the window is maximized and the middle caption button's tooltip says Restore Down",
   "system-menu-keyboard: Alt+Space opened the custom-drawn window menu (Restore, Move, Size, Minimize, Maximize, Close) at the top left of the window",
   "system-menu-caption: a right click on the empty title bar opened the same window menu at the pointer",
-  "inactive-main: a second window took the activation; the main window's title bar and tab text show the inactive colors",
-  "active-main-again: the second window is closed and the main window is active again with the active colors",
+  "inactive-main: a second window took the activation; the main window's title bar and tab text show the inactive colors, the active tab keeps its 2 px brand signature bar",
+  "active-main-again: the second window is closed and the main window is active again with the active colors; the single active tab has the purple 2 px brand signature bar along its top, inside its rounded corners",
   "main-menu-click: the main menu opened below the main menu button, its right edge lined up with the button's right edge",
   "main-menu-keyboard: Ctrl+Shift+M opens the same menu at the same place with the first item highlighted and access keys underlined",
   "profile-submenu: Down twice and Right opened New Tab with Profile: launch profiles with their kind icons, the default tagged",
@@ -66,7 +66,7 @@ expect = [
   "settings-narrow: in a narrow window the overlay keeps its 640 DIP minimum and choice chips wrap below their titles",
   "about-dialog: About Ghostty GX: OK is the default button in the accent color, the three links are underlined with an external-link icon, the version and the graphics backend are listed",
   "main-menu-light: after picking the light theme Catppuccin Latte the main menu is light and its surface is lifted toward white",
-  "light-chrome: the light title bar and tabs with readable inactive tab text",
+  "light-chrome: the light title bar and tabs with readable inactive tab text; the active tab's brand signature bar is the deep purple of light themes",
 ]
 
 [[step]]

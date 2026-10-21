@@ -1,7 +1,7 @@
 //! The tab bar of a top-level terminal window: the tabs inside the chrome
 //! row of `chrome/TitleBar.zig`, painted with Direct2D (8 DIP rounded top
 //! corners; the active tab has the terminal background and flows into the
-//! terminal below), hit-testing, hover, drag-to-reorder, the per-tab close
+//! terminal below, with the brand signature along its top), hit-testing, hover, drag-to-reorder, the per-tab close
 //! button, the tab status (progress, bell, new output, zoom), the new-tab
 //! and launch profile buttons, the right-click menu, middle-click close and
 //! inline renaming of tab and window titles.
@@ -291,15 +291,15 @@ pub const Part = union(enum) {
 // Sizes in DIPs.
 const tab_radius: f32 = style.radius.overlay;
 const tab_flare: f32 = 6;
-const tab_pad_x: f32 = 12;
-const text_pad_right: f32 = 8;
-const icon_size: f32 = 16;
+const tab_pad_x: f32 = style.space.m;
+const text_pad_right: f32 = style.space.s;
+const icon_size: f32 = style.icon.standard;
 const icon_gap: f32 = 6;
-const status_glyph_size: f32 = 12;
-const status_gap: f32 = 4;
-const title_font_size: f32 = 12;
+const status_glyph_size: f32 = style.icon.small;
+const status_gap: f32 = style.space.xs;
+const title_font_size: f32 = style.font_size.caption;
 const unread_dot_size: f32 = 6;
-const close_glyph_size: f32 = 10;
+const close_glyph_size: f32 = style.icon.caption;
 const fade_width: f32 = 16;
 const progress_radius: f32 = 6;
 const progress_stroke: f32 = 2;
@@ -508,6 +508,8 @@ const Colors = struct {
     hover: d2d.Color,
     pressed: d2d.Color,
     accent: d2d.Color,
+    /// The brand signature along the top of the active tab (`signatureOf`).
+    signature: d2d.Color,
     critical: d2d.Color,
     caution: d2d.Color,
     /// Glyphs on an opaque hover or press fill (high contrast), else null
@@ -600,12 +602,24 @@ fn colorsFor(self: *TabBar, ctx: TitleBar.PaintContext) Colors {
     }
     c.on_hover = if (t.high_contrast) t.hover_text else null;
     c.accent = t.accent;
+    c.signature = signatureOf(t, chrome);
     c.critical = t.critical;
     c.caution = t.caution;
     c.active_fill = active_fill;
     applyCaptionColors(&c, ctx);
     c.track = c.hover_text.withAlpha(0.22);
     return c;
+}
+
+/// The brand signature of the active tab, the color the GTK tab bar draws
+/// (`gx.chrome.tabSignature`): the accent at 3:1 on the tab, which has the
+/// terminal background (or shows it through when translucent), plain,
+/// hovered and pressed, also while dragged or in an inactive window. In
+/// high contrast the system highlight as it is, the color of selected
+/// items there, since the active tab then has the strip's window color.
+fn signatureOf(t: style.Tokens, chrome: gx.chrome.Chrome) d2d.Color {
+    if (t.high_contrast) return t.accent;
+    return gx.chrome.tabSignature(t.accent, chrome, chrome.active_tab, t.background);
 }
 
 fn applyCaptionColors(colors: *Colors, ctx: anytype) void {
@@ -791,6 +805,7 @@ fn paintTab(
 
     if (active) {
         self.fillActiveTab(canvas, r, colors.active_fill);
+        self.paintSignature(canvas, r, colors.signature, ctx.layout.scale);
     } else if (hovered or dragged) {
         // Rounded top corners only: let the bottom corners fall outside
         // the row.
@@ -941,6 +956,22 @@ fn fillActiveTab(self: *TabBar, canvas: *d2d.Canvas, r: d2d.Rect, pixel: u32) vo
         canvas.fillRoundedRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h + tab_radius }, tab_radius, .white);
     }
     canvas.endReplacement();
+}
+
+/// The brand signature: `gx.ui_metrics.signature.bar` DIPs in whole
+/// pixels (`tab_layout.signaturePixels`) along the top of the active tab
+/// `r`, cut to its outline so it stays inside the rounded corners. Drawn
+/// over the replaced fill, so it is opaque over a translucent tab too.
+fn paintSignature(self: *TabBar, canvas: *d2d.Canvas, r: d2d.Rect, color: d2d.Color, scale: f32) void {
+    const h = @min(style.dip(tab_layout.signaturePixels(scale), scale), r.h);
+    if (h <= 0 or r.w <= 0) return;
+    canvas.pushClip(.{ .x = r.x, .y = r.y, .w = r.w, .h = h });
+    if (self.active_path) |*path| {
+        canvas.fillPath(path, color);
+    } else {
+        canvas.fillRoundedRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h + tab_radius }, tab_radius, color);
+    }
+    canvas.popClip();
 }
 
 fn activeOutline(canvas: *d2d.Canvas, r: d2d.Rect) ?d2d.Path {
@@ -2487,6 +2518,77 @@ test "ChromeAlpha native active coverage matches rounded outline at every DPI an
             }
         }
     }
+}
+
+test "the signature bar lines the top of the active tab inside its corners" {
+    const testing = std.testing;
+    const factory = try d2d.Factory.create(testing.allocator);
+    defer factory.destroy();
+    var canvas = d2d.Canvas.init(factory);
+    defer canvas.deinit();
+    var target: d2d.DibTarget = .{};
+    defer target.deinit();
+    var bar: TabBar = .{};
+    defer if (bar.active_path) |*path| path.deinit();
+    const r: d2d.Rect = .{ .x = 24, .y = 4, .w = 80, .h = 36 };
+    const sig = d2d.Color.hex(0xcba6f7);
+    const sig_pixel = d2d.colorPixel(sig);
+    for ([_]u32{ 96, 120, 144, 168, 192 }) |dpi| {
+        const s = @as(f32, @floatFromInt(dpi)) / 96;
+        const w = style.px(128, s);
+        const h = style.px(40, s);
+        _ = target.ensure(null, w, h) orelse return error.CreateDibFailed;
+        for ([_]f64{ 1, 0.3 }) |opacity| {
+            const pixel = tab_layout.backgroundPixel(.{ 31, 31, 40 }, opacity, true);
+            try testing.expect(canvas.beginDib(&target, .{ .width = @intCast(w), .height = @intCast(h) }, dpi));
+            canvas.clear(d2d.Color.black.withAlpha(0));
+            bar.fillActiveTab(&canvas, r, pixel);
+            bar.paintSignature(&canvas, r, sig, s);
+            try testing.expectEqual(d2d.EndResult.ok, canvas.finish());
+            try testing.expect(GdiFlush() != 0);
+            const actual: [*]const u32 = @ptrCast(@alignCast(target.bits.?));
+            const stride: usize = @intCast(target.width);
+            const top: usize = @intCast(style.px(r.y, s));
+            const left: usize = @intCast(style.px(r.x, s));
+            const center: usize = @intCast(style.px(r.x + r.w / 2, s));
+            const n: usize = @intCast(tab_layout.signaturePixels(s));
+            // Whole pixels of the opaque bar, then the tab, nothing above.
+            for (0..n) |k| try testing.expectEqual(sig_pixel, actual[(top + k) * stride + center]);
+            try testing.expectEqual(pixel, actual[(top + n) * stride + center]);
+            try testing.expectEqual(@as(u32, 0), actual[(top - 1) * stride + center]);
+            // The rounded corners cut it: the corner pixels stay clear.
+            try testing.expectEqual(@as(u32, 0), actual[top * stride + left]);
+            try testing.expectEqual(@as(u32, 0), actual[top * stride + left - 1]);
+            const right: usize = @intCast(style.px(r.x + r.w, s) - 1);
+            try testing.expectEqual(@as(u32, 0), actual[top * stride + right]);
+        }
+    }
+}
+
+test "the signature takes the shared chrome color, the highlight in high contrast" {
+    const testing = std.testing;
+    const mocha: gx.ui_tokens.Scheme = .{
+        .background = d2d.Color.hex(0x1f1f28),
+        .foreground = d2d.Color.hex(0xcdd6f4),
+        .blue = d2d.Color.hex(0x89b4fa),
+        .accent = .brand,
+    };
+    const tokens = style.Tokens.fromColors(mocha.background, mocha.foreground, mocha.blue.?);
+    const shared: gx.ui_tokens.Tokens = .derive(mocha);
+    const chrome: gx.chrome.Chrome = .derive(&shared, .{});
+    // The win32 tokens with the brand accent (`fromColors` follows the
+    // theme), as `Tokens.fromConfig` derives them by default.
+    var brand = tokens;
+    inline for (@typeInfo(gx.ui_tokens.Tokens).@"struct".fields) |field| {
+        @field(brand, field.name) = @field(shared, field.name);
+    }
+    try testing.expectEqual(@as(u24, 0xcba6f7), signatureOf(brand, chrome).toHex());
+    try testing.expectEqual(gx.chrome.tabSignature(brand.accent, chrome, chrome.active_tab, brand.background), signatureOf(brand, chrome));
+    try testing.expect(style.contrast(signatureOf(brand, chrome), chrome.active_tab) >= gx.ui_tokens.floor.non_text);
+
+    const system: gx.ui_tokens.SystemColors = .{ .highlight = d2d.Color.hex(0x1aebff) };
+    const hc = style.Tokens.fromSystem(system);
+    try testing.expectEqual(system.highlight, signatureOf(hc, .fromSystem(system)));
 }
 
 fn testChromeScene(canvas: *d2d.Canvas, bar: *TabBar, tokens: style.Tokens, strip: d2d.Color, pixel: u32, dirty: d2d.Rect, state: u2) void {

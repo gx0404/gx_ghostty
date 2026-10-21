@@ -14,7 +14,10 @@
 //!   mixed into the background with a 1.4:1 floor) and the accent for a
 //!   divider being hovered or dragged;
 //! - the 1px Windows 11 window border and the red of a hovered caption
-//!   close button.
+//!   close button;
+//! - the brand signature, the accent bar along the top of the selected tab
+//!   (`ui_metrics.signature.bar` thick): the accent moved to 3:1 against
+//!   every fill the bar is drawn on (`signature`, `tabSignature`).
 //!
 //! `window-titlebar-background` and `-foreground` replace the strip
 //! colors where the GTK app honors them (`Options.fromConfig`). In high
@@ -153,6 +156,30 @@ pub fn divider(bg: Color, fg: Color) Color {
     return ui_color.ensureContrast(ui_color.mix(bg, tint, 0.15), bg, ui_tokens.floor.border);
 }
 
+/// The accent bar of the brand signature: the accent, moved to 3:1 against
+/// every fill it is drawn on (`fills`, taken as opaque: a translucent fill
+/// shows the terminal or the strip through, which are among the fills).
+/// At most eight fills count.
+pub fn signature(accent: Color, fills: []const Color) Color {
+    var opaque_fills: [8]Color = undefined;
+    const n = @min(fills.len, opaque_fills.len);
+    for (fills[0..n], opaque_fills[0..n]) |fill, *out| out.* = fill.withAlpha(1);
+    return ui_color.ensureContrastAll(accent.withAlpha(1), opaque_fills[0..n], ui_tokens.floor.non_text);
+}
+
+/// The signature on the selected tab of the strip `bars`, whose fill is
+/// `selected`: at 3:1 on it plain, hovered and pressed, and on the terminal
+/// background `background`, which a translucent tab shows through. The
+/// win32 and the GTK tab bars draw this color.
+pub fn tabSignature(accent: Color, bars: Chrome, selected: Color, background: Color) Color {
+    return signature(accent, &.{
+        selected,
+        ui_color.over(bars.hover, selected),
+        ui_color.over(bars.pressed, selected),
+        background,
+    });
+}
+
 const testing = std.testing;
 const contrast = ui_color.contrast;
 const luminance = ui_color.luminance;
@@ -253,6 +280,86 @@ test "the caption close button is red, or the highlight in high contrast" {
     try testing.expectEqual(system.highlight, hc.close_hover);
     try testing.expectEqual(system.highlight_text, hc.close_hover_text);
     try testing.expect(hc.dark);
+}
+
+const gx_mocha: ui_tokens.Scheme = .{
+    .background = Color.hex(0x1f1f28),
+    .foreground = Color.hex(0xcdd6f4),
+    .cursor = Color.hex(0xf5e0dc),
+    .blue = Color.hex(0x89b4fa),
+    .bright_blue = Color.hex(0x74a8fc),
+    .red = Color.hex(0xf38ba8),
+};
+const gx_latte: ui_tokens.Scheme = .{
+    .background = Color.hex(0xeff1f5),
+    .foreground = Color.hex(0x4c4f69),
+    .cursor = Color.hex(0xdc8a78),
+    .blue = Color.hex(0x1e66f5),
+    .bright_blue = Color.hex(0x456eff),
+    .red = Color.hex(0xd20f39),
+};
+
+fn expectSignatureOn(sig: Color, fills: []const Color) !void {
+    try testing.expectEqual(@as(f32, 1), sig.a);
+    for (fills) |fill| try testing.expect(contrast(sig, fill.withAlpha(1)) >= ui_tokens.floor.non_text);
+}
+
+test "the signature marks the selected tab at 3:1 on every fill" {
+    for ([_]ui_tokens.Scheme{ gx_mocha, gx_latte }) |base| {
+        for ([_]ui_tokens.Accent{ .brand, .theme, .{ .color = Color.hex(0x777777) } }) |accent| {
+            var scheme = base;
+            scheme.accent = accent;
+            const tokens: ui_tokens.Tokens = .derive(scheme);
+            const bg = tokens.background;
+            // The derived strip (win32, GTK with `window-theme = auto`), a
+            // strip in the terminal background (GTK `window-theme =
+            // ghostty`, which selects a step from it) and a translucent tab.
+            const strips = [_]Options{ .{}, .{ .title_bar = bg } };
+            for (strips) |options| {
+                const bars: Chrome = .derive(&tokens, options);
+                for ([_]Color{ bars.active_tab, ui_color.mix(bars.title_bar, bars.text, 0.12), bg.withAlpha(0.6) }) |selected| {
+                    const sig = tabSignature(tokens.accent, bars, selected, bg);
+                    try expectSignatureOn(sig, &.{
+                        selected,
+                        ui_color.over(bars.hover, selected),
+                        ui_color.over(bars.pressed, selected),
+                        bg,
+                    });
+                }
+            }
+            // A single tab on a strip tinted for a superuser or remote
+            // session (palette 1 mixed in, as GTK tints it).
+            const bars: Chrome = .derive(&tokens, .{});
+            const tinted = ui_color.mix(bars.title_bar, base.red.?, 0.24);
+            try expectSignatureOn(signature(tokens.accent, &.{ tinted, bars.title_bar }), &.{ tinted, bars.title_bar });
+        }
+    }
+}
+
+test "the brand signature keeps the brand purple where it reads" {
+    var mocha = gx_mocha;
+    mocha.accent = .brand;
+    const dark: ui_tokens.Tokens = .derive(mocha);
+    const bars: Chrome = .derive(&dark, .{});
+    try testing.expectEqual(@as(u24, 0xcba6f7), tabSignature(dark.accent, bars, bars.active_tab, dark.background).toHex());
+
+    var latte = gx_latte;
+    latte.accent = .brand;
+    const light: ui_tokens.Tokens = .derive(latte);
+    const light_bars: Chrome = .derive(&light, .{});
+    const sig = tabSignature(light.accent, light_bars, light_bars.active_tab, light.background);
+    try testing.expect(contrast(sig, light.background) >= ui_tokens.floor.non_text);
+    try testing.expect(ui_color.toOklch(sig).c > 0.1);
+}
+
+test "the signature ignores fills past eight and their alpha" {
+    const accent = Color.hex(0x404040).withAlpha(0.5);
+    const sig = signature(accent, &.{Color.black.withAlpha(0.1)});
+    try testing.expectEqual(@as(f32, 1), sig.a);
+    try testing.expect(contrast(sig, Color.black) >= ui_tokens.floor.non_text);
+    var many: [10]Color = @splat(Color.white);
+    many[9] = Color.black;
+    try testing.expect(contrast(signature(Color.hex(0x7a7a7a), &many), Color.white) >= ui_tokens.floor.non_text);
 }
 
 test "Options.fromConfig" {

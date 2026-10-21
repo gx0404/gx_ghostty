@@ -1001,27 +1001,18 @@ fn headerStyle(color: d2d.Color) d2d.TextStyle {
     return .{ .size = style.font_size.caption, .weight = .semibold, .color = color };
 }
 
-/// The fills of a menu. Windows 11 raises flyouts above the window in both
-/// modes, lighter than it; the shared popup surface steps toward the
-/// foreground, which raises it in a dark theme but darkens it in a light
-/// one, so a light theme's menu blends its background toward white
-/// instead, with hover and pressed shades of that.
+/// The fills of a menu: the shared popup surface with its hover and
+/// pressed shades. Windows 11 raises flyouts above the window in both
+/// modes, lighter than it; `ui_tokens` lifts the popup surface of a light
+/// theme toward white for that (`ui_tokens.light_lift`), so menus need no
+/// lift of their own.
 pub const Fills = struct {
     surface: d2d.Color,
     hover: d2d.Color,
     pressed: d2d.Color,
 
-    /// How far a light theme's menu moves from the background to white.
-    pub const light_lift: f32 = 0.6;
-
     pub fn of(t: style.Tokens) Fills {
-        if (t.dark or t.high_contrast) return .{ .surface = t.surface_raised, .hover = t.hover, .pressed = t.pressed };
-        const surface = style.mix(t.background, d2d.Color.white, light_lift);
-        return .{
-            .surface = surface,
-            .hover = style.hoverOf(surface, t),
-            .pressed = style.pressedOf(surface, t),
-        };
+        return .{ .surface = t.surface_raised, .hover = t.hover, .pressed = t.pressed };
     }
 };
 
@@ -2627,13 +2618,17 @@ test "waitMs sleeps until a deadline rather than polling at 50 Hz" {
     try testing.expectEqual(@as(u32, 0), state.waitMs(1020));
 }
 
-test "light menus lift toward white without changing dark surfaces" {
+test "menus use the popup surface, lifted toward white in a light theme" {
     const light = style.Tokens.fromColors(d2d.Color.hex(0xeeeeee), d2d.Color.hex(0x202020), d2d.Color.hex(0x0067c0));
     const fills = Fills.of(light);
     try testing.expect(fills.surface.r > light.background.r);
     try testing.expect(style.contrast(light.text_secondary, fills.surface) >= 4.5);
-    const dark = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
-    try testing.expectEqual(dark.surface_raised, Fills.of(dark).surface);
+    for ([_]style.Tokens{ light, style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa)) }) |t| {
+        const f = Fills.of(t);
+        try testing.expectEqual(t.surface_raised, f.surface);
+        try testing.expectEqual(t.hover, f.hover);
+        try testing.expectEqual(t.pressed, f.pressed);
+    }
 }
 
 test "Left restores the parent entry after hovering a sibling" {

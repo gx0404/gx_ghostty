@@ -1,0 +1,325 @@
+id = "W27"
+title = "Settings appearance: the accent color chips and one half of the default light and dark theme pair"
+# Stage 3 of the GX brand: the Appearance page offers the accent color (Ghostty GX Purple or From
+# the Theme, gx-accent-color) right after the theme, and a light and dark theme pair (the default
+# theme = light:GX Latte,dark:GX Mocha) shows the chips Light Theme and Dark Theme above the theme
+# list: the list marks and edits that half only, so a preview or an Apply writes
+# theme = light:…,dark:… and keeps following the system's mode.
+config = """
+command = cmd.exe /d /k prompt $G$S
+language = en
+window-width = 110
+window-height = 34
+keybind = f7=gx:settings_page:appearance
+keybind = ctrl+shift+r=reload_config
+"""
+expect = [
+  "light-default: in light mode with the default themes the overlay is light (GX Latte, lifted toward white, deep GX purple): Light Theme is selected, the list marks GX Latte, Ghostty GX Purple is outlined in purple with its dot",
+  "dark-appearance: in dark mode the Appearance page shows the theme group with Light: GX Latte · Dark: GX Mocha, the chips Light Theme and Dark Theme with Dark Theme selected, the list on GX Mocha with its check mark, then Accent Color with Ghostty GX Purple selected (a purple dot) and From the Theme",
+  "dark-accent-theme: From the Theme is selected; switches, the selected chips, the section indicator and the check mark take the theme's accent (the GX Mocha blue) instead of the purple",
+  "dark-accent-brand: Ghostty GX Purple is selected again and the accent is purple again",
+  "dark-light-half: Light Theme is selected and the list marks GX Latte; the terminal is still GX Mocha",
+  "light-half-preview: the filter Nord lists Nord under the cursor; previewing the light half leaves the dark terminal GX Mocha",
+  "light-half-applied: after Enter the settings file has theme = light:Nord,dark:GX Mocha and the list marks Nord",
+  "light-window: in light mode the terminal is Nord (#2e3440), the light half that was applied",
+  "light-appearance: in light mode the overlay takes the Nord colors of the light half, Light Theme is selected, the list marks Nord and the group reads Light: Nord · Dark: GX Mocha",
+  "zh-appearance: after language = zh-CN the page reads 主题, 浅色：Nord · 深色：GX Mocha, 浅色主题 / 深色主题, 强调色 with Ghostty GX 紫 and 跟随主题, without boxes",
+]
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "simulate_system_theme"
+scheme = "light"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "light-default"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+[[step]]
+action = "simulate_system_theme"
+scheme = "dark"
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "dark-appearance"
+what = "all"
+
+# The accent: find it, then From the Theme and back to the brand purple.
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "type"
+text = "Accent Color"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "key"
+keys = "right"
+
+[[step]]
+action = "wait_file"
+path = "{env}/ghostty/gui-settings.ghostty"
+pattern = '(?m)^gx-accent-color = theme$'
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "dark-accent-theme"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "left"
+
+[[step]]
+action = "wait_file"
+path = "{env}/ghostty/gui-settings.ghostty"
+pattern = '(?m)^gx-accent-color = brand$'
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "dark-accent-brand"
+what = "all"
+
+# The light half of the pair while the system is dark.
+[[step]]
+action = "key"
+keys = "f6"
+
+[[step]]
+action = "type"
+text = "Theme to Edit"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "key"
+keys = "left"
+
+[[step]]
+action = "sleep"
+seconds = 0.8
+
+[[step]]
+action = "capture"
+name = "dark-light-half"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "down"
+
+[[step]]
+action = "type"
+text = "Nord"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "capture"
+name = "light-half-preview"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "enter"
+
+[[step]]
+action = "wait_file"
+path = "{env}/ghostty/gui-settings.ghostty"
+pattern = '(?m)^theme = light:Nord,dark:GX Mocha$'
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "light-half-applied"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "sleep"
+seconds = 0.4
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# Light mode: the terminal takes the light half that was applied.
+[[step]]
+action = "simulate_system_theme"
+scheme = "light"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "pixel"
+in = "terminal:0"
+x = -80
+y = -60
+expect = "#2e3440"
+tolerance = 3
+label = "Nord in light mode"
+
+[[step]]
+action = "capture"
+name = "light-window"
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "light-appearance"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false
+
+# The same page in Chinese.
+[[step]]
+action = "file"
+path = "ghostty/config.ghostty"
+text = "command = cmd.exe /d /k prompt $G$S\nlanguage = zh-CN\nwindow-width = 110\nwindow-height = 34\nkeybind = f7=gx:settings_page:appearance\nkeybind = ctrl+shift+r=reload_config\nconfirm-close-surface = false\n"
+
+[[step]]
+action = "key"
+keys = "ctrl+shift+r"
+
+[[step]]
+action = "sleep"
+seconds = 1.5
+
+[[step]]
+action = "key"
+keys = "f7"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+new = true
+
+[[step]]
+action = "sleep"
+seconds = 1.0
+
+[[step]]
+action = "capture"
+name = "zh-appearance"
+what = "all"
+
+[[step]]
+action = "key"
+keys = "escape"
+
+[[step]]
+action = "wait_popup"
+cls = "GhosttyGxPopup"
+present = false

@@ -1636,3 +1636,10 @@ msgstr "设置"
 msgctxt "shortcut source"
 msgid "Command Line"
 msgstr "命令行"
+
+#. Windows settings: the light and dark theme pair
+msgid "Light: {light} · Dark: {dark}"
+msgstr "浅色：{light} · 深色：{dark}"
+
+msgid "Theme to Edit"
+msgstr "要编辑的主题"

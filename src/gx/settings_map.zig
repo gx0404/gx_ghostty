@@ -1505,3 +1505,98 @@ test "accent hints are translated" {
         try testing.expect(i18n.lookup(.zh_CN, accentHint(accent)) != null);
     }
 }
+
+/// The half of a light and dark theme pair (`ThemePair`) a settings UI
+/// edits: a theme list chooses the theme of that half and keeps the other.
+pub const ThemeHalf = enum {
+    light,
+    dark,
+
+    /// The msgid of the label.
+    pub fn label(self: ThemeHalf) [:0]const u8 {
+        return switch (self) {
+            .light => msg.light_theme,
+            .dark => msg.dark_theme,
+        };
+    }
+
+    /// The half the system's light or dark mode shows now.
+    pub fn ofSystem(dark: bool) ThemeHalf {
+        return if (dark) .dark else .light;
+    }
+
+    /// The theme `pair` uses for this half.
+    pub fn name(self: ThemeHalf, pair: ThemePair) []const u8 {
+        return switch (self) {
+            .light => pair.light,
+            .dark => pair.dark,
+        };
+    }
+
+    /// `pair` with this half set to `theme`; the other half stays. When
+    /// both halves end up the same, the pair is one theme again.
+    pub fn replace(self: ThemeHalf, pair: ThemePair, theme: []const u8) ThemePair {
+        return switch (self) {
+            .light => .{ .light = theme, .dark = pair.dark },
+            .dark => .{ .light = pair.light, .dark = theme },
+        };
+    }
+};
+
+/// The msgid of the summary of a light and dark pair, with the
+/// `{light}` and `{dark}` placeholders.
+pub const theme_pair_summary = "Light: {light} · Dark: {dark}";
+
+/// The msgid of the title of the choice between the halves of a pair.
+pub const theme_half_title = "Theme to Edit";
+
+test "ThemeHalf replaces one half of a pair and keeps the other" {
+    const alloc = testing.allocator;
+    const pair: ThemePair = .{ .light = "GX Latte", .dark = "GX Mocha" };
+    try testing.expectEqualStrings("GX Latte", ThemeHalf.light.name(pair));
+    try testing.expectEqualStrings("GX Mocha", ThemeHalf.dark.name(pair));
+    try testing.expectEqual(ThemeHalf.dark, ThemeHalf.ofSystem(true));
+    try testing.expectEqual(ThemeHalf.light, ThemeHalf.ofSystem(false));
+
+    const cases = [_]struct { ThemeHalf, []const u8, []const u8 }{
+        .{ .light, "Builtin Solarized Light", "light:Builtin Solarized Light,dark:GX Mocha" },
+        .{ .dark, "Dracula", "light:GX Latte,dark:Dracula" },
+        // Choosing the other half's theme leaves one theme.
+        .{ .light, "GX Mocha", "GX Mocha" },
+        .{ .dark, "GX Latte", "GX Latte" },
+    };
+    for (cases) |case| {
+        const replaced = case[0].replace(pair, case[1]);
+        const value = try replaced.value(alloc);
+        defer alloc.free(value);
+        try testing.expectEqualStrings(case[2], value);
+
+        // The value parses back to the pair, so a preview or a save keeps
+        // the half that was not edited.
+        const arg = try replaced.arg(alloc);
+        defer alloc.free(arg);
+        var cfg = try testConfig(&.{arg});
+        defer cfg.deinit();
+        const parsed = ThemePair.fromConfig(cfg.theme).?;
+        try testing.expectEqualStrings(replaced.light, parsed.light);
+        try testing.expectEqualStrings(replaced.dark, parsed.dark);
+        try testing.expectEqualStrings(case[1], case[0].name(parsed));
+    }
+}
+
+test "the default theme is a light and dark pair" {
+    const line = "theme = light:GX Latte,dark:GX Mocha";
+    try testing.expect(std.mem.indexOf(u8, config_layers.defaults, line) != null);
+    var cfg = try testConfig(&.{"--theme=light:GX Latte,dark:GX Mocha"});
+    defer cfg.deinit();
+    const pair = ThemePair.fromConfig(cfg.theme) orelse return error.TestUnexpectedResult;
+    try testing.expect(pair.isPair());
+    try testing.expectEqualStrings("GX Latte", ThemeHalf.light.name(pair));
+    try testing.expectEqualStrings("GX Mocha", ThemeHalf.dark.name(pair));
+}
+
+test "theme half strings are translated" {
+    for (std.enums.values(ThemeHalf)) |half| try testing.expect(i18n.lookup(.zh_CN, half.label()) != null);
+    try testing.expect(i18n.lookup(.zh_CN, theme_pair_summary) != null);
+    try testing.expect(i18n.lookup(.zh_CN, theme_half_title) != null);
+}

@@ -109,35 +109,56 @@ const WindowMaterial = gx.config_types.WindowMaterial;
 
 const log = std.log.scoped(.win32_settings);
 
-// Sizes in DIPs.
+// Sizes in DIPs, from the shared steps of `gx.ui_metrics` (`style`) where
+// one fits; the others are the panel layout of the Windows settings design.
+
+/// The section list on the left (design: 200), its insets and the height
+/// and spacing of its items.
 const sidebar_width: f32 = 200;
+const sidebar_inset: f32 = style.space.s;
+const sidebar_item_height: f32 = style.row.list;
+const sidebar_item_gap: f32 = style.space.xs;
+/// The page title band (design: 64, two `space.xxl`) and the status line
+/// (design: 44, a control with `space.m` around it; no shared step).
 const header_height: f32 = 64;
 const footer_height: f32 = 44;
-const content_pad: f32 = 24;
-const top_pad: f32 = 8;
-const bottom_pad: f32 = 16;
-const row_gap: f32 = 6;
+const content_pad: f32 = style.space.xl;
+const top_pad: f32 = style.space.s;
+const bottom_pad: f32 = style.space.l;
+const row_gap: f32 = style.space.s;
+/// The inner padding of a card and the gap between its parts.
+const card_pad: f32 = style.space.l;
+const card_inner_gap: f32 = style.space.s;
+/// A card with one line: a body line with 12 above and below. No row step
+/// of `ui_metrics` is 44 (`row.list` 36 would crowd the radio and switch).
 const card_height: f32 = 44;
-const card_height_detail: f32 = 58;
-const choice_height: f32 = 48;
+/// A card with a title and a detail line.
+const card_height_detail: f32 = style.row.two_line;
+/// A card with chips or buttons: a control with `space.s` around it.
+const choice_height: f32 = style.control.height + 2 * style.space.s;
 /// The line the chips of a choice take below its title when they do not fit
 /// next to it.
-const chip_line: f32 = draw.chip_height + 8;
-const item_height: f32 = 30;
-const list_pad: f32 = 4;
+const chip_line: f32 = draw.chip_height + style.space.s;
+/// A group title line.
+const group_height: f32 = style.row.header;
+const item_height: f32 = style.row.menu;
+const list_pad: f32 = style.space.xs;
 const field_height: f32 = style.metrics.input_height;
-const field_gap: f32 = 8;
+const field_gap: f32 = style.space.s;
 const min_list_items = 4;
 /// How much of the rows below a list stays in view when the list is
-/// sized, so the page shows that it goes on.
+/// sized, so the page shows that it goes on (about two cards; no shared
+/// step).
 const list_peek: f32 = 112;
+/// The font sample: room for the largest sample size (no shared step).
 const sample_height: f32 = 64;
+/// The bounds of the panel within the window (design limits).
 const min_width: f32 = 640;
 const max_width: f32 = 920;
 const min_height: f32 = 460;
 const max_height: f32 = 680;
-/// The page scrolls this much per wheel line.
-const body_line: f32 = 32;
+/// The page scrolls this much per wheel line: one list row.
+const body_line: f32 = style.row.menu;
 
 /// How long changes are collected before they are saved.
 const save_delay_ms = 300;
@@ -230,6 +251,12 @@ preview_theme: ?u32 = null,
 applied_preview: ?u32 = null,
 /// A paint left swatches unread.
 swatches_pending: bool = false,
+/// The `theme` of the configuration (names in `arena`): one theme, or a
+/// light and dark pair whose `theme_half` the list edits.
+saved_pair: ?settings_map.ThemePair = null,
+/// The half of a light and dark pair the theme list shows and edits; set to
+/// the system's mode when the overlay opens.
+theme_half: settings_map.ThemeHalf = .dark,
 
 /// The installed font families, kept between openings.
 fonts: ?system.FontFamilies = null,
@@ -590,8 +617,14 @@ fn openOverlay(self: *Settings, opened: ?Popup.OpenTiming, preparing: bool) bool
     if (!self.data_ready) self.loadData();
     self.theme_query.clearRetainingCapacity();
     self.font_query.clearRetainingCapacity();
+    // A pair opens on the theme the system shows now.
+    self.theme_half = .ofSystem(!self.app.appsUseLightTheme());
+    self.saved_theme = self.savedThemeIndex();
     self.refilter(.themes);
     self.refilter(.fonts);
+    // The lists open on the configured theme and font family.
+    if (self.saved_theme) |saved| self.theme_list.select(saved);
+    if (self.font_picker.indexOf(self.font_family)) |index| self.font_list.select(index);
     self.clearStatus();
     self.pointer = null;
     self.hover = null;
@@ -1228,9 +1261,17 @@ const Values = struct {
     focus_follows_mouse: bool,
     ctrl_scroll_zoom: bool,
     bell: Config.BellFeatures,
+    /// Null for a color of its own (`accent_color`), which is shown, not
+    /// chosen (`settings_map.Accent`).
+    accent: ?settings_map.Accent,
+    accent_color: Config.Color,
+    /// The accent each choice gives with the current theme, in the order of
+    /// `accents`.
+    accent_dots: [accents.len]d2d.Color,
 
     fn fromConfig(config: *const Config, layers: ?*const Layers) Values {
         const padding_keys = settings_map.Padding.keys;
+        const accent_config = config.@"gx-accent-color";
         return .{
             .language = i18n.resolve(config.language),
             .material = config.@"gx-window-material",
@@ -1249,7 +1290,27 @@ const Values = struct {
             .focus_follows_mouse = config.@"focus-follows-mouse",
             .ctrl_scroll_zoom = config.@"gx-ctrl-scroll-zoom",
             .bell = config.@"bell-features",
+            .accent = settings_map.Accent.fromConfig(accent_config),
+            .accent_color = switch (accent_config) {
+                .color => |color| color,
+                .brand, .theme => .{ .r = 0, .g = 0, .b = 0 },
+            },
+            .accent_dots = accentDots(config),
         };
+    }
+
+    /// The accent of each choice of `accents` with the colors of `config`.
+    fn accentDots(config: *const Config) [accents.len]d2d.Color {
+        var scheme = gx.ui_tokens.Scheme.fromConfig(config);
+        var dots: [accents.len]d2d.Color = undefined;
+        for (accents, &dots) |choice, *dot| {
+            scheme.accent = switch (choice) {
+                .brand => .brand,
+                .theme => .theme,
+            };
+            dot.* = gx.ui_tokens.Tokens.derive(scheme).accent;
+        }
+        return dots;
     }
 
     /// Whether a layer above the defaults sets `key`; without the layers,
@@ -1370,7 +1431,7 @@ fn loadThemes(self: *Settings, config: *const Config) void {
             self.swatches.deinit(self.alloc);
         }
     }
-    self.saved_theme = self.configuredTheme(config);
+    self.rememberTheme(config);
     self.refilter(.themes);
     if (self.saved_theme) |saved| self.theme_list.select(saved);
 }
@@ -1381,8 +1442,30 @@ fn sameNames(a: []const [:0]const u8, b: []const [:0]const u8) bool {
     return true;
 }
 
-fn configuredTheme(self: *Settings, config: *const Config) ?u32 {
-    const name = settings_map.themeName(config.theme) orelse return null;
+/// Keeps the `theme` of `config` (`saved_pair`) and marks the theme the
+/// list edits (`saved_theme`).
+fn rememberTheme(self: *Settings, config: *const Config) void {
+    self.saved_pair = null;
+    if (settings_map.ThemePair.fromConfig(config.theme)) |pair| {
+        const arena = self.arena.allocator();
+        const light = arena.dupe(u8, pair.light) catch return;
+        const dark = if (pair.isPair()) (arena.dupe(u8, pair.dark) catch return) else light;
+        self.saved_pair = .{ .light = light, .dark = dark };
+    }
+    self.saved_theme = self.savedThemeIndex();
+}
+
+/// The light and dark pair of the configuration, null for one theme.
+fn themePair(self: *const Settings) ?settings_map.ThemePair {
+    const pair = self.saved_pair orelse return null;
+    return if (pair.isPair()) pair else null;
+}
+
+/// The theme the list edits: the configured one, or its `theme_half` of a
+/// pair (an index into `themes.names`).
+fn savedThemeIndex(self: *const Settings) ?u32 {
+    const pair = self.saved_pair orelse return null;
+    const name = if (pair.isPair()) self.theme_half.name(pair) else pair.light;
     const list = if (self.themes) |*themes| themes else return null;
     const index = list.indexOf(name) orelse return null;
     return @intCast(index);
@@ -1843,6 +1926,9 @@ const Action = union(enum) {
     none,
     goto: Goto,
     language: i18n.Language,
+    /// Which half of a light and dark theme pair the theme list edits.
+    theme_half,
+    accent,
     material,
     opacity,
     padding,
@@ -1885,6 +1971,11 @@ const Row = struct {
     keys: []const []const u8 = &.{},
     /// Draw a reset button: the settings file sets `keys`.
     resettable: bool = false,
+    /// A choice whose group row above names it: the chips start on the left
+    /// and `title` only names them for search and accessibility.
+    chips_only: bool = false,
+    /// A color dot before the label of each choice, or none.
+    dots: []const d2d.Color = &.{},
 
     fn focusable(self: Row) bool {
         return switch (self.kind) {
@@ -1979,6 +2070,10 @@ const keys_padding: []const []const u8 = &.{ settings_map.Padding.keys[0], setti
 const keys_cursor_style: []const []const u8 = &.{"cursor-style"};
 const keys_cursor_blink: []const []const u8 = &.{settings_map.cursor_blink.key};
 const keys_theme: []const []const u8 = &.{"theme"};
+const keys_accent: []const []const u8 = &.{settings_map.Accent.key};
+/// The accent choices, in display order.
+const accents = std.enums.values(settings_map.Accent);
+const theme_halves = std.enums.values(settings_map.ThemeHalf);
 const keys_font_size: []const []const u8 = &.{"font-size"};
 const keys_font_family: []const []const u8 = &.{"font-family"};
 const keys_right_click: []const []const u8 = &.{"right-click-action"};
@@ -2072,8 +2167,25 @@ fn buildSectionRows(self: *Settings, section: Section, buf: *[max_rows]Row) []Ro
             }
         },
         .appearance => {
-            rows.add(self.settingGroup(scratch, i18n.tr(msg.theme), keys_theme, if (self.layered) i18n.tr(msg.theme_hint) else "", &.{.apply_theme}));
+            const pair = self.themePair();
+            var theme_group = self.settingGroup(scratch, i18n.tr(msg.theme), keys_theme, if (self.layered) i18n.tr(msg.theme_hint) else "", &.{.apply_theme});
+            if (pair) |p| theme_group.detail = self.pairDetail(scratch, p, theme_group.detail);
+            rows.add(theme_group);
+            if (pair != null) {
+                var half_labels: [theme_halves.len][]const u8 = undefined;
+                for (theme_halves, &half_labels) |half, *label| label.* = i18n.trRuntime(half.label());
+                rows.add(.{
+                    .kind = .choice,
+                    .action = .theme_half,
+                    .title = i18n.tr(settings_map.theme_half_title),
+                    .choices = scratch.dupe([]const u8, &half_labels) catch &.{},
+                    .choice = std.mem.indexOfScalar(settings_map.ThemeHalf, theme_halves, self.theme_half),
+                    .chips_only = true,
+                });
+            }
             rows.add(.{ .kind = .list, .action = .themes, .keys = keys_theme });
+
+            self.addAccentRows(&rows, scratch);
 
             rows.add(.{ .kind = .group, .title = i18n.tr("Window") });
             const materials = std.enums.values(WindowMaterial);
@@ -2277,6 +2389,59 @@ fn buildSectionRows(self: *Settings, section: Section, buf: *[max_rows]Row) []Ro
     return rows.items();
 }
 
+/// The detail of the theme group of a light and dark pair: both themes,
+/// then `hint`.
+fn pairDetail(self: *Settings, alloc: Allocator, pair: settings_map.ThemePair, hint: []const u8) []const u8 {
+    _ = self;
+    const summary = i18n.fill(alloc, i18n.tr(settings_map.theme_pair_summary), .{ .light = pair.light, .dark = pair.dark }) catch return hint;
+    const pair_hint = i18n.tr(msg.theme_pair_hint);
+    // Sentences ending in a full-width stop (Chinese) need no space.
+    const space: []const u8 = if (pair_hint.len > 0 and pair_hint[pair_hint.len - 1] < 0x80) " " else "";
+    const explained = if (hint.len > 0)
+        std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ pair_hint, space, hint }) catch hint
+    else
+        pair_hint;
+    return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ summary, explained }) catch summary;
+}
+
+/// The accent color: a group with the chips of `accents`, or a color of its
+/// own from a configuration file, shown and not chosen.
+fn addAccentRows(self: *Settings, rows: *RowList, scratch: Allocator) void {
+    var group = self.settingGroup(scratch, i18n.tr(msg.accent_color), keys_accent, i18n.tr(msg.accent_color_hint), &.{});
+    var row: Row = .{
+        .kind = .choice,
+        .action = .accent,
+        .title = i18n.tr(msg.accent_color),
+        .keys = keys_accent,
+        .chips_only = true,
+    };
+    if (self.values.accent) |accent| {
+        var labels: [accents.len][]const u8 = undefined;
+        for (accents, &labels) |choice, *label| label.* = i18n.trRuntime(choice.label());
+        row.choices = scratch.dupe([]const u8, &labels) catch &.{};
+        row.choice = std.mem.indexOfScalar(settings_map.Accent, accents, accent);
+        row.dots = &self.values.accent_dots;
+    } else {
+        // Read-only: one chip that cannot be picked, the color and where
+        // it comes from.
+        const color = self.values.accent_color;
+        const layer: ?gx.config_layers.Layer = if (self.layersPtr()) |layers| layers.provenance(settings_map.Accent.key) else null;
+        group.detail = std.fmt.allocPrint(scratch, "#{x:0>2}{x:0>2}{x:0>2} \u{00B7} {s}", .{
+            color.r,
+            color.g,
+            color.b,
+            i18n.trRuntime(settings_map.provenanceLabel(layer)),
+        }) catch group.detail;
+        group.detail_warning = layer == .cli;
+        row.choices = scratch.dupe([]const u8, &.{i18n.tr(settings_map.Accent.custom_label)}) catch &.{};
+        row.choice = null;
+        row.disabled = 1;
+        row.dots = scratch.dupe(d2d.Color, &.{d2d.Color.rgb(color.r, color.g, color.b)}) catch &.{};
+    }
+    rows.add(group);
+    rows.add(row);
+}
+
 fn windowsPath(alloc: Allocator, path: []const u8) []const u8 {
     const buf = alloc.alloc(u8, path.len) catch return path;
     return model.windowsPath(buf, path);
@@ -2423,7 +2588,7 @@ fn activate(self: *Settings, row: Row) void {
         .none, .font_size => {},
         .goto => |target| self.gotoSetting(target),
         .language => |lang| self.setLanguage(lang),
-        .material, .opacity, .padding, .cursor_style, .close_confirmation => self.stepChoice(row, 1),
+        .theme_half, .accent, .material, .opacity, .padding, .cursor_style, .close_confirmation => self.stepChoice(row, 1),
         .themes => self.applyTheme(),
         .font_family => self.applyFontFamily(),
         .right_click => |i| self.setRightClick(i),
@@ -2469,6 +2634,12 @@ fn setChoice(self: *Settings, row: Row, index: usize) void {
     if (row.disabled & (@as(u8, 1) << @intCast(index)) != 0) return;
     if (row.choice == index) return;
     switch (row.action) {
+        .theme_half => self.setThemeHalf(theme_halves[index]),
+        .accent => {
+            const accent = accents[index];
+            self.values.accent = accent;
+            self.queueSet(settings_map.Accent.key, accent.value());
+        },
         .material => {
             const material = std.enums.values(WindowMaterial)[index];
             self.values.material = material;
@@ -2602,7 +2773,7 @@ fn resetAll(self: *Settings) void {
         keys_language,     keys_material, keys_opacity,             keys_padding,          keys_cursor_style,
         keys_cursor_blink, keys_theme,    keys_font_size,           keys_font_family,      keys_right_click,
         keys_scrollbar,    keys_close,    keys_focus_follows_mouse, keys_ctrl_scroll_zoom, keys_bell,
-        keys_command,
+        keys_command,      keys_accent,
     }) |keys| self.queueReset(keys);
     self.stopTimer(.preview);
     self.preview_theme = null;
@@ -2660,6 +2831,34 @@ fn themeName(self: *Settings, index: u32) ?[:0]const u8 {
     return if (index < names.len) names[index] else null;
 }
 
+/// The `theme` value that keeps theme `index`: the theme alone, or the
+/// configured pair with its `theme_half` replaced, so the system's light
+/// or dark mode is still followed. Owned by `alloc`.
+fn themeValue(self: *Settings, alloc: Allocator, index: u32) ?[:0]u8 {
+    const name = self.themeName(index) orelse return null;
+    const pair = self.themePair() orelse return alloc.dupeZ(u8, name) catch null;
+    return self.theme_half.replace(pair, name).value(alloc) catch null;
+}
+
+/// Shows and edits the `half` of a light and dark pair; a preview of the
+/// other half ends.
+fn setThemeHalf(self: *Settings, half: settings_map.ThemeHalf) void {
+    if (half == self.theme_half) return;
+    self.endPreview();
+    self.theme_half = half;
+    self.saved_theme = self.savedThemeIndex();
+    if (self.saved_theme) |saved| self.theme_list.select(saved);
+}
+
+/// Stops a theme preview and applies the saved configuration again.
+fn endPreview(self: *Settings) void {
+    self.stopTimer(.preview);
+    const previewed = self.applied_preview != null;
+    self.preview_theme = null;
+    self.applied_preview = null;
+    if (previewed) _ = self.applyConfig(null, true);
+}
+
 /// Previews the theme under the cursor once it rests for the time
 /// `trigger` asks for (`model.previewDelayMs`): every move starts the wait
 /// again, so moving through the list previews where it stops.
@@ -2676,10 +2875,12 @@ fn previewNow(self: *Settings) void {
     const index = self.preview_theme orelse return;
     if (self.applied_preview == index) return;
     const name = self.themeName(index) orelse return;
+    const value = self.themeValue(self.alloc, index) orelse return;
+    defer self.alloc.free(value);
     const span: gx.perf.Span = .begin(global.io());
     defer _ = span.end(global.io(), "settings_preview");
     const saved = self.commitChanges();
-    if (self.applyConfig(name, true)) {
+    if (self.applyConfig(value, true)) {
         self.applied_preview = index;
         if (saved) self.setStatus(.info, "Previewing {name}", .{ .name = name });
     }
@@ -2687,12 +2888,13 @@ fn previewNow(self: *Settings) void {
 
 fn applyTheme(self: *Settings) void {
     const index = self.theme_list.current() orelse return;
-    const name = self.themeName(index) orelse return;
+    const value = self.themeValue(self.alloc, index) orelse return;
+    defer self.alloc.free(value);
     self.stopTimer(.preview);
     self.preview_theme = null;
     self.applied_preview = null;
     self.saved_theme = index;
-    self.queueSet("theme", name);
+    self.queueSet("theme", value);
     _ = self.saveNow();
     self.invalidate();
 }
@@ -2782,7 +2984,9 @@ fn saveNow(self: *Settings) bool {
     }
     if (!self.commitChanges()) return false;
     const preview = self.preview_theme orelse self.applied_preview;
-    const ok = self.applyConfig(if (preview) |index| self.themeName(index) else null, theme_action);
+    const preview_value: ?[:0]u8 = if (preview) |index| self.themeValue(self.alloc, index) else null;
+    defer if (preview_value) |value| self.alloc.free(value);
+    const ok = self.applyConfig(preview_value, theme_action);
     if (ok) self.setStatus(.success, "Settings saved.", .{});
     return ok;
 }
@@ -2884,7 +3088,7 @@ fn configApplied(self: *Settings, preview: bool) void {
     self.updateFontPicker();
     if (!preview) {
         self.notifications = config.@"app-notifications";
-        self.saved_theme = self.configuredTheme(config);
+        self.rememberTheme(config);
         if (self.saved_theme) |saved| {
             if (self.theme_list.current() == null) self.theme_list.select(saved);
         }
@@ -3603,19 +3807,19 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
     canvas.fillRect(.{ .x = 0, .y = 0, .w = sidebar_width, .h = h }, t.surface);
     canvas.fillRect(.{ .x = sidebar_width - 1, .y = 0, .w = 1, .h = h }, t.border);
 
-    canvas.drawIcon(draw.icons.settings, .{ .x = 18, .y = 18, .w = 22, .h = 28 }, 18, t.accent);
-    canvas.drawText(i18n.tr(msg.settings), .{ .x = 48, .y = 18, .w = sidebar_width - 60, .h = 28 }, .{
-        .size = 18,
-        .weight = .semibold,
-        .color = t.text,
-    });
+    // The title: the settings icon and the panel name in body large.
+    const title_y = (header_height - style.type_ramp.body_large.line - style.space.s) / 2;
+    canvas.drawIcon(draw.icons.settings, .{ .x = sidebar_inset + style.space.s, .y = title_y, .w = 22, .h = 28 }, style.type_ramp.body_large.size, t.accent);
+    var title_style = style.type_ramp.body_large.text(t.text);
+    title_style.weight = .semibold;
+    canvas.drawText(i18n.tr(msg.settings), .{ .x = 48, .y = title_y, .w = sidebar_width - 48 - style.space.m, .h = 28 }, title_style);
 
-    const search: d2d.Rect = .{ .x = 10, .y = 58, .w = sidebar_width - 20, .h = field_height };
+    const search: d2d.Rect = .{ .x = sidebar_inset, .y = header_height - style.space.s, .w = sidebar_width - 2 * sidebar_inset, .h = field_height };
     if (self.text_field == .search) {
         self.popup.drawTextInputEx(canvas, search, t, .{ .placeholder = i18n.tr("Search settings…"), .focused = true });
     } else {
-        canvas.fillRoundedRect(search, 4, t.surface_raised);
-        canvas.strokeRoundedRect(search, 4, t.border, 1);
+        canvas.fillRoundedRect(search, draw.radius, t.surface_raised);
+        canvas.strokeRoundedRect(search, draw.radius, t.border, 1);
         canvas.drawText(i18n.tr("Search settings…"), search.inset(style.metrics.padding_x, 0), .{
             .size = style.font_size.body,
             .color = t.text_placeholder,
@@ -3623,18 +3827,18 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
     }
     self.addHit(search, .search);
 
-    var y: f32 = 104;
+    var y: f32 = search.y + search.h + style.space.m;
     for (std.enums.values(Section)) |section| {
-        const item: d2d.Rect = .{ .x = 10, .y = y, .w = sidebar_width - 20, .h = 36 };
+        const item: d2d.Rect = .{ .x = sidebar_inset, .y = y, .w = sidebar_width - 2 * sidebar_inset, .h = sidebar_item_height };
         const selected = section == self.section and !self.searching();
         const state = self.stateOf(.{ .section = section }, true);
         if (selected) {
-            canvas.fillRoundedRect(item, 4, t.selected);
-            canvas.fillRoundedRect(.{ .x = item.x, .y = item.y + 10, .w = 3, .h = 16 }, 1.5, t.accent);
+            canvas.fillRoundedRect(item, draw.radius, t.selected);
+            draw.selectionIndicator(canvas, item, t);
         } else if (state.pressed) {
-            canvas.fillRoundedRect(item, 4, t.pressed);
+            canvas.fillRoundedRect(item, draw.radius, t.pressed);
         } else if (state.hover) {
-            canvas.fillRoundedRect(item, 4, t.hover);
+            canvas.fillRoundedRect(item, draw.radius, t.hover);
         }
         const icon_rect: d2d.Rect = .{ .x = item.x + 12, .y = item.y + (item.h - 18) / 2, .w = 18, .h = 18 };
         const fluent_id: @import("fluent_icons.zig").Id = switch (section) {
@@ -3654,18 +3858,19 @@ fn paintSidebar(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, h: f32) v
             .color = if (selected) t.selected_text else t.text,
         });
         self.addHit(item, .{ .section = section });
-        y += 40;
+        y += sidebar_item_height + sidebar_item_gap;
     }
 }
 
 fn paintHeader(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, w: f32) void {
+    const close_y = (header_height - style.close_button.size) / 2;
     canvas.drawText(if (self.searching()) i18n.tr("Search Settings") else sectionTitle(self.section), .{
         .x = sidebar_width + content_pad,
-        .y = 16,
-        .w = @max(0, w - sidebar_width - content_pad - 64),
-        .h = 34,
+        .y = close_y,
+        .w = @max(0, w - sidebar_width - content_pad - 2 * style.close_button.size),
+        .h = style.close_button.size,
     }, .{ .size = style.font_size.subtitle, .weight = .semibold, .color = t.text });
-    const close: d2d.Rect = .{ .x = w - 16 - style.close_button.size, .y = 17, .w = style.close_button.size, .h = style.close_button.size };
+    const close: d2d.Rect = .{ .x = w - style.space.l - style.close_button.size, .y = close_y, .w = style.close_button.size, .h = style.close_button.size };
     draw.iconButton(canvas, close, d2d.icons.cancel, self.stateOf(.close, true), t);
     self.addHit(close, .close);
 }
@@ -3695,23 +3900,23 @@ fn paintFooter(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, rect: d2d.
     var widths: [hints.len]f32 = undefined;
     for (hints, &widths, 0..) |hint, *width, i| {
         width.* = draw.keyHintWidth(canvas, &self.measurements, hint[0], hint[1]);
-        hints_w += width.* + if (i > 0) @as(f32, 16) else 0;
+        hints_w += width.* + if (i > 0) style.space.l else 0;
     }
 
     const full_w = @max(0, rect.w - 2 * content_pad);
-    const fits = self.measurements.measure(canvas, text, text_style, 10_000).width <= full_w - hints_w - 16;
+    const fits = self.measurements.measure(canvas, text, text_style, 10_000).width <= full_w - hints_w - style.space.l;
     if (!fits) text_style.wrap = true;
     canvas.drawText(text, .{
         .x = rect.x + content_pad,
         .y = rect.y + 1,
-        .w = if (fits) full_w - hints_w - 16 else full_w,
+        .w = if (fits) full_w - hints_w - style.space.l else full_w,
         .h = rect.h - 1,
     }, text_style);
     if (!fits) return;
     var x = rect.x + rect.w - content_pad - hints_w;
     for (hints, widths) |hint, width| {
         _ = draw.keyHint(canvas, &self.measurements, x, rect.y, rect.h, hint[0], hint[1], t);
-        x += width + 16;
+        x += width + style.space.l;
     }
 }
 
@@ -3792,25 +3997,27 @@ fn paintBody(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, body: d2d.Re
 fn rowGeometry(self: *Settings, canvas: *d2d.Canvas, row: Row, width: f32) Geometry {
     return switch (row.kind) {
         .group => {
-            var h: f32 = 34;
-            if (row.detail.len > 0) h += 2 + measureWrapped(canvas, row.detail, width);
+            var h: f32 = group_height;
+            if (row.detail.len > 0) h += measureWrapped(canvas, row.detail, width);
             return .{ .height = h };
         },
         .note => .{ .height = measureWrapped(canvas, row.detail, width) + 4 },
         .radio, .toggle, .result => .{ .height = if (row.detail.len > 0) card_height_detail else card_height },
         .stepper => .{ .height = if (row.detail.len > 0) card_height_detail else choice_height },
         .choice => {
+            if (row.chips_only) return .{ .height = choice_height };
             const base: f32 = if (row.detail.len > 0) card_height_detail else choice_height;
             const body_style: d2d.TextStyle = .{ .size = style.font_size.body, .ellipsis = false };
             const caption_style: d2d.TextStyle = .{ .size = style.font_size.caption, .ellipsis = false };
             var title_w = self.measurements.measure(canvas, row.title, body_style, 10_000).width;
             if (row.detail.len > 0) title_w = @max(title_w, self.measurements.measure(canvas, row.detail, caption_style, 10_000).width);
-            const reset_w: f32 = if (row.resettable) draw.icon_button_size + 8 else 0;
-            const wrap = model.chipsWrap(title_w, draw.chipsWidth(canvas, &self.measurements, row.choices) + reset_w, 16, width - 32);
+            const reset_w: f32 = if (row.resettable) draw.icon_button_size + card_inner_gap else 0;
+            const chips_w = draw.chipsWidth(canvas, &self.measurements, row.choices, row.dots.len > 0);
+            const wrap = model.chipsWrap(title_w, chips_w + reset_w, card_pad, width - 2 * card_pad);
             return .{ .height = if (wrap) base + chip_line else base, .wrap = wrap };
         },
         .info => .{ .height = card_height_detail },
-        .button => .{ .height = draw.button_height + 8 },
+        .button => .{ .height = draw.button_height + style.space.s },
         .sample => .{ .height = sample_height },
         .list => .{ .height = 0 },
     };
@@ -3849,84 +4056,91 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
                 state.focused = ring and @min(self.focus_button, row.buttons.len - 1) == i;
                 if (button == .reset) {
                     bx -= draw.icon_button_size;
-                    const brect: d2d.Rect = .{ .x = bx, .y = rect.y + 3, .w = draw.icon_button_size, .h = draw.icon_button_size };
+                    const brect: d2d.Rect = .{ .x = bx, .y = rect.y + (group_height - draw.icon_button_size) / 2, .w = draw.icon_button_size, .h = draw.icon_button_size };
                     draw.iconButton(canvas, brect, draw.icons.reset, state, t);
                     self.addHit(brect, target);
                 } else {
                     const label = i18n.tr(msg.apply);
                     const bw = draw.buttonWidth(canvas, &self.measurements, label, null);
                     bx -= bw;
-                    const brect: d2d.Rect = .{ .x = bx, .y = rect.y + 2, .w = bw, .h = draw.button_height };
+                    const brect: d2d.Rect = .{ .x = bx, .y = rect.y + (group_height - draw.button_height) / 2, .w = bw, .h = draw.button_height };
                     draw.button(canvas, brect, label, null, .primary, state, t);
                     if (enabled) self.addHit(brect, target);
                 }
-                bx -= 8;
+                bx -= card_inner_gap;
             }
             var group_style = title_style;
             group_style.weight = .semibold;
-            canvas.drawText(row.title, .{ .x = rect.x, .y = rect.y + 4, .w = @max(0, bx - rect.x), .h = 26 }, group_style);
+            canvas.drawText(row.title, .{ .x = rect.x, .y = rect.y, .w = @max(0, bx - rect.x), .h = group_height }, group_style);
             if (row.detail.len > 0) {
-                canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 34, .w = rect.w, .h = rect.h - 34 }, captionStyle(t, row.detail_warning));
+                canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + group_height, .w = rect.w, .h = rect.h - group_height }, captionStyle(t, row.detail_warning));
             }
             return;
         },
         .note => return canvas.drawText(row.detail, .{ .x = rect.x, .y = rect.y + 2, .w = rect.w, .h = rect.h }, captionStyle(t, row.detail_warning)),
         .result => {
             draw.card(canvas, rect, t, row_state);
-            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = rect.w - 60, .h = rect.h });
-            canvas.drawIcon(0xE76C, .{ .x = rect.x + rect.w - 32, .y = rect.y, .w = 20, .h = rect.h }, 12, t.text_secondary);
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + card_pad, .y = rect.y, .w = rect.w - 60, .h = rect.h });
+            canvas.drawIcon(0xE76C, .{ .x = rect.x + rect.w - 32, .y = rect.y, .w = 20, .h = rect.h }, style.icon.small, t.text_secondary);
             self.addHit(rect, .{ .row = index });
         },
         .radio => {
             draw.card(canvas, rect, t, row_state);
-            draw.radio(canvas, .{ .x = rect.x + 12, .y = rect.y, .w = 24, .h = rect.h }, row.on, row_state, t);
-            self.paintTitle(canvas, t, row, .{ .x = rect.x + 48, .y = rect.y, .w = rect.w - 64, .h = rect.h });
+            draw.radio(canvas, .{ .x = rect.x + style.space.m, .y = rect.y, .w = 24, .h = rect.h }, row.on, row_state, t);
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + 48, .y = rect.y, .w = rect.w - 48 - card_pad, .h = rect.h });
             self.addHit(rect, .{ .row = index });
         },
         .toggle => {
             draw.card(canvas, rect, t, row_state);
             self.addHit(rect, .{ .row = index });
             const sw: d2d.Rect = .{
-                .x = rect.x + rect.w - 16 - draw.switch_width,
+                .x = rect.x + rect.w - card_pad - draw.switch_width,
                 .y = rect.y + (rect.h - draw.switch_height) / 2,
                 .w = draw.switch_width,
                 .h = draw.switch_height,
             };
             draw.switchControl(canvas, sw, row.on, row_state, t);
-            var right = sw.x - 8;
-            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (rect.h - draw.icon_button_size) / 2) - 8;
-            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, right - rect.x - 16), .h = rect.h });
+            var right = sw.x - card_inner_gap;
+            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (rect.h - draw.icon_button_size) / 2) - card_inner_gap;
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + card_pad, .y = rect.y, .w = @max(0, right - rect.x - card_pad), .h = rect.h });
         },
         .choice => {
             draw.card(canvas, rect, t, .{});
             self.addHit(rect, .{ .row = index });
             const head_h = if (geometry.wrap) rect.h - chip_line else rect.h;
-            const chips_w = draw.chipsWidth(canvas, &self.measurements, row.choices);
-            const chips_left = rect.x + rect.w - 12 - chips_w;
-            var cx = if (geometry.wrap) rect.x + 16 else chips_left;
+            const dotted = row.dots.len > 0;
+            const chips_w = draw.chipsWidth(canvas, &self.measurements, row.choices, dotted);
+            const chips_left = rect.x + rect.w - style.space.m - chips_w;
+            var cx = if (geometry.wrap or row.chips_only) rect.x + card_pad else chips_left;
             const cy = if (geometry.wrap) rect.y + head_h - 2 else rect.y + (rect.h - draw.chip_height) / 2;
             for (row.choices, 0..) |label, i| {
                 if (i >= 8) break;
-                const chip_w = draw.chipWidth(canvas, &self.measurements, label);
+                const chip_w = draw.chipWidth(canvas, &self.measurements, label, dotted);
                 const chip_rect: d2d.Rect = .{ .x = cx, .y = cy, .w = chip_w, .h = draw.chip_height };
                 const enabled = row.disabled & (@as(u8, 1) << @intCast(i)) == 0;
                 const target: Target = .{ .chip = .{ .row = index, .index = @intCast(i) } };
-                draw.chip(canvas, chip_rect, label, row.choice == i, self.stateOf(target, enabled), t);
+                const dot: ?d2d.Color = if (i < row.dots.len) row.dots[i] else null;
+                draw.chip(canvas, chip_rect, label, row.choice == i, dot, self.stateOf(target, enabled), t);
                 if (enabled) self.addHit(chip_rect, target);
                 cx += chip_w + draw.chip_gap;
             }
-            var right = if (geometry.wrap) rect.x + rect.w - 12 else chips_left - 8;
-            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (head_h - draw.icon_button_size) / 2) - 8;
-            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, right - rect.x - 16), .h = head_h });
+            if (row.chips_only) {
+                // The group row above names the chips and has the reset button.
+                if (ring) draw.focusRing(canvas, rect, draw.radius, t);
+                return;
+            }
+            var right = if (geometry.wrap) rect.x + rect.w - style.space.m else chips_left - card_inner_gap;
+            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (head_h - draw.icon_button_size) / 2) - card_inner_gap;
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + card_pad, .y = rect.y, .w = @max(0, right - rect.x - card_pad), .h = head_h });
         },
         .stepper => {
             draw.card(canvas, rect, t, .{});
             self.addHit(rect, .{ .row = index });
             const FontSize = settings_map.FontSize;
             const by = rect.y + (rect.h - draw.button_height) / 2;
-            const plus: d2d.Rect = .{ .x = rect.x + rect.w - 12 - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
-            const value: d2d.Rect = .{ .x = plus.x - 4 - 64, .y = by, .w = 64, .h = draw.button_height };
-            const minus: d2d.Rect = .{ .x = value.x - 4 - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
+            const plus: d2d.Rect = .{ .x = rect.x + rect.w - style.space.m - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
+            const value: d2d.Rect = .{ .x = plus.x - style.space.xs - 64, .y = by, .w = 64, .h = draw.button_height };
+            const minus: d2d.Rect = .{ .x = value.x - style.space.xs - draw.button_height, .y = by, .w = draw.button_height, .h = draw.button_height };
             const steps = [_]struct { d2d.Rect, Step, u21, bool }{
                 .{ minus, .minus, draw.icons.remove, self.values.font_size > FontSize.min },
                 .{ plus, .plus, draw.icons.add, self.values.font_size < FontSize.max },
@@ -3940,20 +4154,21 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
                 self.popup.drawTextInputEx(canvas, value, t, .{ .focused = true });
             } else {
                 const value_state = self.stateOf(.{ .value = index }, true);
-                canvas.fillRoundedRect(value, 4, if (value_state.hover) style.hoverOf(t.surface_raised, t) else t.surface_raised);
-                canvas.strokeRoundedRect(value, 4, t.border, 1);
+                canvas.fillRoundedRect(value, draw.radius, if (value_state.hover) style.hoverOf(t.surface_raised, t) else t.surface_raised);
+                canvas.strokeRoundedRect(value, draw.radius, t.border, 1);
                 canvas.drawText(row.value, value, .{ .size = style.font_size.body, .weight = .semibold, .color = t.text, .align_x = .center });
             }
             self.addHit(value, .{ .value = index });
-            var right = minus.x - 8;
-            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (rect.h - draw.icon_button_size) / 2) - 8;
-            self.paintTitle(canvas, t, row, .{ .x = rect.x + 16, .y = rect.y, .w = @max(0, right - rect.x - 16), .h = rect.h });
+            var right = minus.x - card_inner_gap;
+            if (row.resettable) right = self.paintReset(canvas, t, index, right, rect.y + (rect.h - draw.icon_button_size) / 2) - card_inner_gap;
+            self.paintTitle(canvas, t, row, .{ .x = rect.x + card_pad, .y = rect.y, .w = @max(0, right - rect.x - card_pad), .h = rect.h });
         },
         .list => return self.paintList(canvas, t, row, index, rect, body),
         .info => {
             draw.card(canvas, rect, t, .{});
-            canvas.drawText(row.title, .{ .x = rect.x + 16, .y = rect.y + 8, .w = rect.w - 32, .h = 22 }, title_style);
-            canvas.drawTextMiddle(row.detail, .{ .x = rect.x + 16, .y = rect.y + 30, .w = rect.w - 32, .h = 20 }, .{
+            const two_line = twoLineTop(rect);
+            canvas.drawText(row.title, .{ .x = rect.x + card_pad, .y = two_line, .w = rect.w - 2 * card_pad, .h = style.type_ramp.body.line }, title_style);
+            canvas.drawTextMiddle(row.detail, .{ .x = rect.x + card_pad, .y = two_line + style.type_ramp.body.line, .w = rect.w - 2 * card_pad, .h = style.type_ramp.caption.line }, .{
                 .size = style.font_size.caption,
                 .color = t.text_secondary,
             });
@@ -3961,7 +4176,7 @@ fn paintRow(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, ind
         },
         .button => {
             const bw = draw.buttonWidth(canvas, &self.measurements, row.title, row.icon);
-            const brect: d2d.Rect = .{ .x = rect.x, .y = rect.y + 4, .w = bw, .h = draw.button_height };
+            const brect: d2d.Rect = .{ .x = rect.x, .y = rect.y + style.space.xs, .w = bw, .h = draw.button_height };
             var state = row_state;
             state.focused = ring;
             draw.button(canvas, brect, row.title, row.icon, .normal, state, t);
@@ -3994,12 +4209,18 @@ fn paintTitle(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, r
         canvas.drawText(row.title, rect, title_style);
         return;
     }
-    const top = rect.y + (rect.h - 44) / 2;
-    canvas.drawText(row.title, .{ .x = rect.x, .y = top + 2, .w = rect.w, .h = 22 }, title_style);
-    canvas.drawText(row.detail, .{ .x = rect.x, .y = top + 24, .w = rect.w, .h = 18 }, .{
+    const top = twoLineTop(rect);
+    canvas.drawText(row.title, .{ .x = rect.x, .y = top, .w = rect.w, .h = style.type_ramp.body.line }, title_style);
+    canvas.drawText(row.detail, .{ .x = rect.x, .y = top + style.type_ramp.body.line, .w = rect.w, .h = style.type_ramp.caption.line }, .{
         .size = style.font_size.caption,
         .color = if (row.detail_warning) draw.cautionColor(t) else t.text_secondary,
     });
+}
+
+/// The top of a title over a detail line (body over caption) centered in
+/// `rect`.
+fn twoLineTop(rect: d2d.Rect) f32 {
+    return rect.y + (rect.h - style.type_ramp.body.line - style.type_ramp.caption.line) / 2;
 }
 
 fn groupButtonEnabled(self: *Settings, button: GroupButton) bool {
@@ -4040,8 +4261,8 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
     if (focused and self.text_field == field) {
         self.popup.drawTextInput(canvas, field_rect, t, placeholder);
     } else {
-        canvas.fillRoundedRect(field_rect, 4, t.surface);
-        canvas.strokeRoundedRect(field_rect, 4, t.border, 1);
+        canvas.fillRoundedRect(field_rect, draw.radius, t.surface);
+        canvas.strokeRoundedRect(field_rect, draw.radius, t.border, 1);
         const query = self.queryOf(field).items;
         canvas.drawText(if (query.len > 0) query else placeholder, field_rect.inset(style.metrics.padding_x, 0), .{
             .size = style.font_size.body,
@@ -4099,19 +4320,19 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
         };
         const target: Target = .{ .item = .{ .row = index, .index = @intCast(i) } };
         if (i == list.cursor) {
-            canvas.fillRoundedRect(item_rect, 4, if (focused) t.selected else style.mix(t.surface, t.selected, 0.6));
-            if (focused) canvas.fillRoundedRect(.{ .x = item_rect.x, .y = item_rect.y + 8, .w = 3, .h = item_rect.h - 16 }, 1.5, t.accent);
+            canvas.fillRoundedRect(item_rect, draw.radius, if (focused) t.selected else style.mix(t.surface, t.selected, 0.6));
+            if (focused) draw.selectionIndicator(canvas, item_rect, t);
         } else if (self.isHover(target)) {
-            canvas.fillRoundedRect(item_rect, 4, t.hover);
+            canvas.fillRoundedRect(item_rect, draw.radius, t.hover);
         }
         const text_color = if (i == list.cursor and focused) t.selected_text else t.text;
-        var right = item_rect.x + item_rect.w - 8;
+        var right = item_rect.x + item_rect.w - style.space.s;
         if (field == .themes) {
             const swatch_rect: d2d.Rect = .{
                 .x = right - draw.swatch_width,
-                .y = item_rect.y + 5,
+                .y = item_rect.y + style.space.xs,
                 .w = draw.swatch_width,
-                .h = item_rect.h - 10,
+                .h = item_rect.h - 2 * style.space.xs,
             };
             if (self.swatches.map.get(name_index)) |colors| {
                 draw.themeSwatch(canvas, swatch_rect, colors, t);
@@ -4119,23 +4340,23 @@ fn paintList(self: *Settings, canvas: *d2d.Canvas, t: style.Tokens, row: Row, in
                 draw.swatchPlaceholder(canvas, swatch_rect, t);
                 self.swatches_pending = true;
             }
-            right = swatch_rect.x - 8;
+            right = swatch_rect.x - style.space.s;
         }
         if (saved == name_index) {
-            canvas.drawIcon(draw.icons.check, .{ .x = right - 20, .y = item_rect.y, .w = 20, .h = item_rect.h }, 12, t.accent);
-            right -= 28;
+            canvas.drawIcon(draw.icons.check, .{ .x = right - 20, .y = item_rect.y, .w = 20, .h = item_rect.h }, style.icon.small, t.accent);
+            right -= 20 + style.space.s;
         }
         const name_style: d2d.TextStyle = .{
             .size = style.font_size.body,
             .color = text_color,
             .weight = if (saved == name_index) .semibold else .normal,
         };
-        const name_rect: d2d.Rect = .{ .x = item_rect.x + 12, .y = item_rect.y, .w = @max(0, right - item_rect.x - 12), .h = item_rect.h };
+        const name_rect: d2d.Rect = .{ .x = item_rect.x + style.space.m, .y = item_rect.y, .w = @max(0, right - item_rect.x - style.space.m), .h = item_rect.h };
         const local: ?[:0]const u8 = if (field != .themes and name_index < self.font_picker.local_names.len) self.font_picker.local_names[name_index] else null;
         if (local) |local_name| {
             const name_w = @min(name_rect.w * 0.6, @ceil(canvas.measureText(names[name_index], name_style, 10_000).width));
             canvas.drawText(names[name_index], .{ .x = name_rect.x, .y = name_rect.y, .w = name_w, .h = name_rect.h }, name_style);
-            canvas.drawText(local_name, .{ .x = name_rect.x + name_w + 12, .y = name_rect.y, .w = @max(0, name_rect.w - name_w - 12), .h = name_rect.h }, .{
+            canvas.drawText(local_name, .{ .x = name_rect.x + name_w + style.space.m, .y = name_rect.y, .w = @max(0, name_rect.w - name_w - style.space.m), .h = name_rect.h }, .{
                 .size = style.font_size.caption,
                 .color = if (i == list.cursor and focused) t.selected_text else t.text_secondary,
                 .align_x = .trailing,
@@ -4348,6 +4569,161 @@ test "activation spaces outside a field do not change focus or start a preview" 
         try testing.expectEqual(@as(usize, 0), self.search_query.items.len);
         try testing.expectEqual(@as(usize, 0), self.theme_query.items.len);
     }
+}
+
+test "settings sizes follow the shared metrics" {
+    const testing = std.testing;
+    const ui_metrics = gx.ui_metrics;
+    try testing.expectEqual(ui_metrics.space.xl, content_pad);
+    try testing.expectEqual(ui_metrics.space.s, top_pad);
+    try testing.expectEqual(ui_metrics.space.l, bottom_pad);
+    try testing.expectEqual(ui_metrics.space.s, row_gap);
+    try testing.expectEqual(ui_metrics.space.l, card_pad);
+    try testing.expectEqual(ui_metrics.row.two_line, card_height_detail);
+    try testing.expectEqual(ui_metrics.control.height + 2 * ui_metrics.space.s, choice_height);
+    try testing.expectEqual(ui_metrics.row.header, group_height);
+    try testing.expectEqual(ui_metrics.row.menu, item_height);
+    try testing.expectEqual(ui_metrics.row.list, sidebar_item_height);
+    try testing.expectEqual(ui_metrics.control.height, field_height);
+    try testing.expectEqual(ui_metrics.radius.control, draw.radius);
+    try testing.expectEqual(ui_metrics.control.height, draw.button_height);
+    try testing.expectEqual(ui_metrics.control.compact, draw.chip_height);
+    // A title and a detail line fit a two-line card.
+    try testing.expect(style.type_ramp.body.line + style.type_ramp.caption.line <= card_height_detail - 2 * style.space.s);
+    // The sizes the panel keeps stay on the 4 DIP grid.
+    for ([_]f32{ sidebar_width, header_height, footer_height, card_height, list_peek, sample_height, body_line }) |size| {
+        try testing.expectEqual(@as(f32, 0), @mod(size, 4));
+    }
+}
+
+/// An overlay without a window for the tests of its model; `app` only
+/// answers what the rows of the Appearance section ask.
+fn testSettings(config: *const Config, app: *App) Settings {
+    const testing = std.testing;
+    app.alpha_frames = true;
+    return .{
+        .alloc = testing.allocator,
+        .app = app,
+        .window = undefined,
+        .arena = .init(testing.allocator),
+        .scratch = .init(testing.allocator),
+        .font_arena = .init(testing.allocator),
+        .changes = .init(testing.allocator),
+        .values = .fromConfig(config, null),
+    };
+}
+
+fn testSettingsDeinit(self: *Settings) void {
+    self.arena.deinit();
+    self.scratch.deinit();
+    self.font_arena.deinit();
+    self.changes.deinit();
+    self.theme_list.deinit(std.testing.allocator);
+    if (self.themes) |*themes| themes.deinit();
+}
+
+fn testThemes(self: *Settings, names: []const [:0]const u8) !void {
+    self.themes = .{ .arena = .init(std.testing.allocator), .names = names };
+    try self.theme_list.matches.ensureTotalCapacity(std.testing.allocator, names.len);
+    for (0..names.len) |i| self.theme_list.matches.appendAssumeCapacity(@intCast(i));
+}
+
+test "a light and dark pair edits one half and keeps the other" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    config.theme = .{ .light = "GX Latte", .dark = "GX Mocha" };
+    var app: App = undefined;
+    var self = testSettings(&config, &app);
+    defer testSettingsDeinit(&self);
+    try testThemes(&self, &.{ "Dracula", "GX Latte", "GX Mocha", "Nord" });
+
+    self.theme_half = .dark;
+    self.rememberTheme(&config);
+    try testing.expect(self.themePair() != null);
+    try testing.expectEqual(@as(?u32, 2), self.saved_theme);
+    {
+        const value = self.themeValue(testing.allocator, 0).?;
+        defer testing.allocator.free(value);
+        try testing.expectEqualStrings("light:GX Latte,dark:Dracula", value);
+    }
+
+    // The light half: the list marks GX Latte and keeps the dark theme.
+    self.setThemeHalf(.light);
+    try testing.expectEqual(settings_map.ThemeHalf.light, self.theme_half);
+    try testing.expectEqual(@as(?u32, 1), self.saved_theme);
+    try testing.expectEqual(@as(?u32, 1), self.theme_list.current());
+    {
+        const value = self.themeValue(testing.allocator, 3).?;
+        defer testing.allocator.free(value);
+        try testing.expectEqualStrings("light:Nord,dark:GX Mocha", value);
+    }
+
+    // The pair shows the chips of its halves above the list.
+    var buf: [max_rows]Row = undefined;
+    const rows = self.buildSectionRows(.appearance, &buf);
+    var half_row: ?Row = null;
+    for (rows) |row| if (row.action == .theme_half) {
+        half_row = row;
+    };
+    try testing.expectEqual(@as(?usize, 0), half_row.?.choice);
+    try testing.expect(std.mem.indexOf(u8, rows[0].detail, "GX Latte") != null);
+    try testing.expect(std.mem.indexOf(u8, rows[0].detail, "GX Mocha") != null);
+}
+
+test "one theme edits the theme alone" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    config.theme = .{ .light = "Nord", .dark = "Nord" };
+    var app: App = undefined;
+    var self = testSettings(&config, &app);
+    defer testSettingsDeinit(&self);
+    try testThemes(&self, &.{ "Dracula", "Nord" });
+    self.rememberTheme(&config);
+    try testing.expect(self.themePair() == null);
+    try testing.expectEqual(@as(?u32, 1), self.saved_theme);
+    const value = self.themeValue(testing.allocator, 0).?;
+    defer testing.allocator.free(value);
+    try testing.expectEqualStrings("Dracula", value);
+
+    var buf: [max_rows]Row = undefined;
+    for (self.buildSectionRows(.appearance, &buf)) |row| try testing.expect(row.action != .theme_half);
+}
+
+test "the accent chips write gx-accent-color and a color of its own is read-only" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+    var app: App = undefined;
+    var self = testSettings(&config, &app);
+    defer testSettingsDeinit(&self);
+
+    var buf: [max_rows]Row = undefined;
+    var accent_row: ?Row = null;
+    for (self.buildSectionRows(.appearance, &buf)) |row| if (row.action == .accent) {
+        accent_row = row;
+    };
+    const row = accent_row.?;
+    try testing.expectEqual(accents.len, row.choices.len);
+    try testing.expectEqual(accents.len, row.dots.len);
+    try testing.expectEqual(@as(?usize, 0), row.choice);
+    self.setChoice(row, 1);
+    try testing.expectEqual(@as(?settings_map.Accent, .theme), self.values.accent);
+    const entry = self.changes.entries.items[0];
+    try testing.expectEqualStrings(settings_map.Accent.key, entry.key);
+    try testing.expectEqualStrings("theme", entry.values[0]);
+
+    config.@"gx-accent-color" = .{ .color = .{ .r = 0xe5, .g = 0xa5, .b = 0x0a } };
+    self.values = .fromConfig(&config, null);
+    _ = self.scratch.reset(.retain_capacity);
+    const rows = self.buildSectionRows(.appearance, &buf);
+    for (rows, 0..) |custom, i| if (custom.action == .accent) {
+        try testing.expectEqual(@as(usize, 1), custom.choices.len);
+        try testing.expectEqual(@as(?usize, null), custom.choice);
+        try testing.expectEqual(@as(u8, 1), custom.disabled);
+        try testing.expect(std.mem.startsWith(u8, rows[i - 1].detail, "#e5a50a"));
+    };
 }
 
 test {

@@ -69,13 +69,26 @@ const Tokens = style.Tokens;
 /// The state of a control: hovered, pressed, keyboard focus, disabled.
 pub const State = controls.State;
 
-pub const radius: f32 = 6;
-pub const chip_height: f32 = 28;
-pub const chip_gap: f32 = 6;
-pub const button_height: f32 = 30;
-pub const icon_button_size: f32 = 28;
+// Sizes in DIPs, from the shared steps of `gx.ui_metrics` (`style`).
+
+/// Cards, lists, buttons, fields and key caps.
+pub const radius: f32 = style.radius.control;
+/// Chips and the icon buttons inside cards (reset).
+pub const chip_height: f32 = style.control.compact;
+pub const chip_gap: f32 = style.space.s;
+/// Buttons: Apply, the font size steps and the About buttons.
+pub const button_height: f32 = style.control.height;
+pub const icon_button_size: f32 = style.control.compact;
+/// The Fluent toggle switch (WinUI ToggleSwitch: 40 x 20); no shared step.
 pub const switch_width: f32 = 40;
 pub const switch_height: f32 = 20;
+/// The color dot of a chip (`chip` with a dot) and the gap after it.
+pub const chip_dot: f32 = 10;
+const chip_dot_gap: f32 = 6;
+/// The accent outline of a selected chip with a dot.
+const chip_outline: f32 = 2;
+/// The horizontal padding of a chip's label.
+const chip_pad: f32 = style.space.m;
 
 /// Extra glyphs of Segoe Fluent Icons / Segoe MDL2 Assets.
 pub const icons = struct {
@@ -126,6 +139,14 @@ pub fn card(canvas: *d2d.Canvas, rect: Rect, t: Tokens, state: State) void {
         t.surface;
     canvas.fillRoundedRect(rect, radius, fill);
     canvas.strokeRoundedRect(rect, radius, t.border, style.metrics.border_width);
+}
+
+/// The accent pill on the left edge of the selected item `rect` of a list
+/// or the section list (`style.selection_indicator`).
+pub fn selectionIndicator(canvas: *d2d.Canvas, rect: Rect, t: Tokens) void {
+    const size = style.selection_indicator;
+    const h = @min(size.height, rect.h);
+    canvas.fillRoundedRect(.{ .x = rect.x, .y = rect.y + (rect.h - h) / 2, .w = size.width, .h = h }, size.width / 2, t.accent);
 }
 
 /// The keyboard focus ring around `rect`, whose corners have `corner`.
@@ -195,27 +216,37 @@ fn labelStyle(t: Tokens) d2d.TextStyle {
 }
 
 /// The width of a chip showing `label` (measured semibold, like a selected
-/// chip).
-pub fn chipWidth(canvas: *d2d.Canvas, measurements: *Measurements, label: []const u8) f32 {
+/// chip), with room for a color dot when `dot`.
+pub fn chipWidth(canvas: *d2d.Canvas, measurements: *Measurements, label: []const u8, dot: bool) f32 {
     var s = label_style;
     s.weight = .semibold;
-    return @ceil(measurements.measure(canvas, label, s, 1000).width) + 24;
+    const extra: f32 = if (dot) chip_dot + chip_dot_gap else 0;
+    return @ceil(measurements.measure(canvas, label, s, 1000).width) + 2 * chip_pad + extra;
 }
 
 /// The width of the chips for `labels`, with `chip_gap` between them.
-pub fn chipsWidth(canvas: *d2d.Canvas, measurements: *Measurements, labels: []const []const u8) f32 {
+pub fn chipsWidth(canvas: *d2d.Canvas, measurements: *Measurements, labels: []const []const u8, dots: bool) f32 {
     var total: f32 = 0;
     for (labels, 0..) |label, i| {
-        total += chipWidth(canvas, measurements, label);
+        total += chipWidth(canvas, measurements, label, dots);
         if (i > 0) total += chip_gap;
     }
     return total;
 }
 
-/// One choice of a segmented control.
-pub fn chip(canvas: *d2d.Canvas, rect: Rect, label: []const u8, selected: bool, state: State, t: Tokens) void {
+/// One choice of a segmented control, with a color dot before the label
+/// when `dot` is set. A selected chip is filled with the accent; one with a
+/// dot is outlined in it instead, so a dot of the accent's own color shows.
+pub fn chip(canvas: *d2d.Canvas, rect: Rect, label: []const u8, selected: bool, dot: ?Color, state: State, t: Tokens) void {
     var text = labelStyle(t);
-    if (selected) {
+    if (selected and dot != null) {
+        const fill = if (state.disabled) t.surface_raised else if (state.pressed) t.pressed else if (state.hover) style.hoverOf(t.selected, t) else t.selected;
+        canvas.fillRoundedRect(rect, rect.h / 2, fill);
+        const inset = chip_outline / 2;
+        canvas.strokeRoundedRect(rect.inset(inset, inset), rect.h / 2 - inset, if (state.disabled) t.text_disabled else t.accent, chip_outline);
+        text.color = if (state.disabled) t.text_disabled else t.selected_text;
+        text.weight = .semibold;
+    } else if (selected) {
         const fill = if (state.disabled)
             t.text_disabled
         else if (state.pressed)
@@ -233,7 +264,15 @@ pub fn chip(canvas: *d2d.Canvas, rect: Rect, label: []const u8, selected: bool, 
         canvas.strokeRoundedRect(rect, rect.h / 2, t.border, 1);
         text.color = if (state.disabled) t.text_disabled else if (state.pressed) t.text_secondary else t.text;
     }
-    canvas.drawText(label, rect, text);
+    var label_rect = rect;
+    if (dot) |color| {
+        const d: Rect = .{ .x = rect.x + chip_pad, .y = rect.y + (rect.h - chip_dot) / 2, .w = chip_dot, .h = chip_dot };
+        canvas.fillRoundedRect(d, chip_dot / 2, color);
+        canvas.strokeRoundedRect(d, chip_dot / 2, t.border, 1);
+        label_rect.x += chip_dot + chip_dot_gap;
+        label_rect.w -= chip_dot + chip_dot_gap;
+    }
+    canvas.drawText(label, label_rect, text);
     if (state.focused) focusRing(canvas, rect, rect.h / 2, t);
 }
 
@@ -263,8 +302,8 @@ pub fn button(
         .subtle => .subtle,
     };
     const colors = controls.buttonColors(control_kind, state, t);
-    if (colors.fill) |fill| canvas.fillRoundedRect(rect, 4, fill);
-    if (colors.border) |border| canvas.strokeRoundedRect(rect, 4, border, 1);
+    if (colors.fill) |fill| canvas.fillRoundedRect(rect, radius, fill);
+    if (colors.border) |border| canvas.strokeRoundedRect(rect, radius, border, 1);
     var text = labelStyle(t);
     text.color = colors.text;
     if (icon) |glyph| {
@@ -277,7 +316,7 @@ pub fn button(
     } else {
         canvas.drawText(label, rect, text);
     }
-    if (state.focused) focusRing(canvas, rect, 4, t);
+    if (state.focused) focusRing(canvas, rect, radius, t);
 }
 
 /// A subtle square button with an icon (reset, close).
@@ -293,8 +332,8 @@ pub fn keyHint(canvas: *d2d.Canvas, measurements: *Measurements, x: f32, y: f32,
     cap_style.align_x = .center;
     const cap_w = @ceil(measurements.measure(canvas, key, cap_style, 200).width) + 12;
     const cap: Rect = .{ .x = x, .y = y + (h - 20) / 2, .w = cap_w, .h = 20 };
-    canvas.fillRoundedRect(cap, 4, t.surface);
-    canvas.strokeRoundedRect(cap, 4, t.border, 1);
+    canvas.fillRoundedRect(cap, radius, t.surface);
+    canvas.strokeRoundedRect(cap, radius, t.border, 1);
     canvas.drawText(key, cap, cap_style);
     const label_w = @ceil(measurements.measure(canvas, label, small, 400).width);
     canvas.drawText(label, .{ .x = x + cap_w + 6, .y = y, .w = label_w + 2, .h = h }, small);
@@ -310,8 +349,8 @@ pub fn keyHintWidth(canvas: *d2d.Canvas, measurements: *Measurements, key: []con
 /// The colors of a theme: its background with "Aa" in the foreground and
 /// the six bright palette colors.
 pub fn themeSwatch(canvas: *d2d.Canvas, rect: Rect, s: swatch.Swatch, t: Tokens) void {
-    canvas.fillRoundedRect(rect, 4, rgb(s.background));
-    canvas.strokeRoundedRect(rect, 4, t.border, 1);
+    canvas.fillRoundedRect(rect, radius, rgb(s.background));
+    canvas.strokeRoundedRect(rect, radius, t.border, 1);
     const text: d2d.TextStyle = .{ .size = 11, .weight = .semibold, .color = rgb(s.foreground), .align_x = .center, .align_y = .center, .ellipsis = false };
     canvas.drawText("Aa", .{ .x = rect.x + 2, .y = rect.y, .w = 22, .h = rect.h }, text);
     const dot: f32 = 6;
@@ -325,8 +364,8 @@ pub fn themeSwatch(canvas: *d2d.Canvas, rect: Rect, s: swatch.Swatch, t: Tokens)
 
 /// The place of a swatch whose file was not read yet.
 pub fn swatchPlaceholder(canvas: *d2d.Canvas, rect: Rect, t: Tokens) void {
-    canvas.fillRoundedRect(rect, 4, t.surface_raised);
-    canvas.strokeRoundedRect(rect, 4, t.border, 1);
+    canvas.fillRoundedRect(rect, radius, t.surface_raised);
+    canvas.strokeRoundedRect(rect, radius, t.border, 1);
 }
 
 /// The width `themeSwatch` needs.
@@ -355,6 +394,17 @@ pub fn fontSample(canvas: *d2d.Canvas, rect: Rect, family: []const u8, size: f32
 
 fn rgb(c: swatch.Rgb) Color {
     return Color.rgb(c.r, c.g, c.b);
+}
+
+test "control sizes follow the shared metrics" {
+    const ui_metrics = @import("../../../../gx/ui_metrics.zig");
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(ui_metrics.radius.control, radius);
+    try expectEqual(ui_metrics.control.compact, chip_height);
+    try expectEqual(ui_metrics.control.compact, icon_button_size);
+    try expectEqual(ui_metrics.control.height, button_height);
+    try expectEqual(ui_metrics.space.s, chip_gap);
+    try expectEqual(ui_metrics.space.m, chip_pad);
 }
 
 test "measurement keys follow layout, locale and DPI but not colors" {

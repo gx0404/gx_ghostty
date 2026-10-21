@@ -18,9 +18,9 @@ window-height = 20
 # window open) and a minimize/restore bracketed by DPI log markers, so the log shows
 # whether the renderer presented while minimized.
 expect = [
-  "dpi-96: title bar, tab and terminal text at 100% scale",
-  "dpi-144: everything at 150%: tab bar height, caption buttons and terminal font grow together",
-  "dpi-192: everything at 200%, nothing clipped or misaligned",
+  "dpi-96: title bar, tab and terminal text at 100% scale; the tab's brand signature bar is 2 px",
+  "dpi-144: everything at 150%: tab bar height, caption buttons and terminal font grow together; the signature bar is 3 px",
+  "dpi-192: everything at 200%, nothing clipped or misaligned; the signature bar is 4 px, sharp and inside the tab's corners",
   "menu-dpi-192: the main menu opened at 192 DPI is drawn at 200% like the window (owner scale)",
   "progress-normal: the tab shows a normal (accent) progress ring at 60%",
   "progress-error: the tab's progress ring is red (error) at 60%",

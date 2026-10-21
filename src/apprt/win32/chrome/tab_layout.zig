@@ -13,6 +13,7 @@
 //! button the widths stay (`Frozen`) until the pointer leaves the strip, so
 //! the next close button lands under the pointer.
 const std = @import("std");
+const ui_metrics = @import("../../../gx/ui_metrics.zig");
 
 /// A rectangle in client pixels, laid out like `w32.RECT`.
 pub const Rect = extern struct {
@@ -73,6 +74,13 @@ pub const close_margin: f32 = 4;
 /// A length in DIPs as whole pixels at `scale`.
 pub fn px(length: f32, scale: f32) i32 {
     return @intFromFloat(@round(length * scale));
+}
+
+/// The brand signature bar along the top of the active tab
+/// (`gx.ui_metrics.signature.bar`) in whole pixels at `scale`, at least
+/// one so it shows at any scale.
+pub fn signaturePixels(scale: f32) i32 {
+    return @max(1, px(ui_metrics.signature.bar, scale));
 }
 
 /// The widths kept after a tab closed through its close button, for a strip
@@ -794,6 +802,16 @@ test "labels show the title of an idle shell and the program otherwise" {
     const cut = busy.write(&small);
     try testing.expect(cut.len <= small.len);
     try testing.expect(std.mem.startsWith(u8, "vim \u{00B7} ~/src", cut));
+}
+
+test "the signature bar is whole pixels at every scale" {
+    const cases = [_]struct { f32, i32 }{
+        .{ 0.25, 1 }, .{ 0.5, 1 },  .{ 1, 2 }, .{ 1.25, 3 },
+        .{ 1.5, 3 },  .{ 1.75, 4 }, .{ 2, 4 }, .{ 2.5, 5 },
+        .{ 3, 6 },    .{ 3.5, 7 },  .{ 4, 8 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case[1], signaturePixels(case[0]));
+    try std.testing.expectEqual(@as(f32, 2), ui_metrics.signature.bar);
 }
 
 test "the active tab fill premultiplies like the renderer" {

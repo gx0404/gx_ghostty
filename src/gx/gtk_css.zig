@@ -22,7 +22,8 @@
 //!   accent along the top of the selected tab (an inset box shadow, inside
 //!   the rounded corners), also with a single tab and on a dragged tab,
 //!   kept at 3:1 on the tab in every state and on tinted strips
-//!   (`signature`). `style.css` has a fallback in libadwaita's accent.
+//!   (`chrome.signature` and `chrome.tabSignature`, which the win32 tab bar
+//!   draws too). `style.css` has a fallback in libadwaita's accent.
 //! - The terminal overlays that upstream's `css/style.css` draws in fixed
 //!   colors: the find, key table, resize and link overlays on
 //!   `surface_raised` with `text` and a `border` outline, the bell border
@@ -307,16 +308,9 @@ pub const Tint = struct {
     }
 };
 
-/// The accent bar of the brand signature on the selected tab: the accent,
-/// moved to 3:1 against every fill it is drawn on (`fills`, taken as
-/// opaque: a frosted fill shows the terminal or the strip through, which
-/// are among the fills).
-pub fn signature(accent: Color, fills: []const Color) Color {
-    var opaque_fills: [8]Color = undefined;
-    const n = @min(fills.len, opaque_fills.len);
-    for (fills[0..n], opaque_fills[0..n]) |fill, *out| out.* = fill.withAlpha(1);
-    return ui_color.ensureContrastAll(accent.withAlpha(1), opaque_fills[0..n], floor.non_text);
-}
+/// The accent bar of the brand signature (`chrome.signature`, shared with
+/// the win32 tab bar).
+pub const signature = chrome.signature;
 
 /// The color of links in the main window and the Ghostty GX dialogs:
 /// `tokens.link` at 4.5:1 on the dialog surface, cards, the tab strip and
@@ -400,8 +394,6 @@ pub fn write(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void {
 
     // The brand signature, over the selected tab in every state; a single
     // tab and a dragged one sit on the strip, frosted over the terminal.
-    const active_hover = ui_color.over(bars.hover, active);
-    const active_pressed = ui_color.over(bars.pressed, active);
     try writer.print(
         \\toolbarview.gx-chrome tabbar tabbox:not(.single-tab) tab:selected {{
         \\  box-shadow: inset 0 {[bar]d}px 0 0 {[tabs]f};
@@ -415,7 +407,7 @@ pub fn write(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void {
         \\
     , .{
         .bar = ui_metrics.signature.bar,
-        .tabs = css(signature(t.accent, &.{ active, active_hover, active_pressed, t.background })),
+        .tabs = css(chrome.tabSignature(t.accent, bars, active, t.background)),
         .single = css(signature(t.accent, &.{ bars.title_bar, t.background })),
         .dragged = css(signature(t.accent, &.{bars.title_bar})),
     });
