@@ -30,47 +30,35 @@
 - FILE 段匹配写文件工具（Edit、Write、MultiEdit、NotebookEdit）的目标路径，以及 Codex `apply_patch` 补丁头里的路径（见下文）：先相对化到仓库根（由 hook 文件位置推导，不依赖会话 cwd），再按大小写不敏感匹配。
 - 同一调用同时命中 deny 与 ask 时，deny 优先。
 
-deny：
+2026-10 用户授权把安全门收窄为「最小核心防线」：只保留以下四类 deny，其余策略规则与 ask 级规则全部放开。放开的操作（推送 `upstream`、`--no-verify`、`git add -f`、历史清理、`gh` 写操作与发版触发、系统级安装、shell 改写生成物、改安全门与客户端配置、`reset --hard`、`pkill` 等）不再被拦截，但根 `AGENTS.md` 与 `docs/AGENT_RULES/` 的流程要求不变，仍须遵守。
 
-- force push（`-f`、`--force`、`--mirror`、`+refspec`；参数带引号也算，如 `"+HEAD:gx_ghostty"`、`"--force"`）。
-- 推送到名为 `upstream` 的 remote，或推送到含 `ghostty-org/ghostty` 的 URL。
-- 绕过仓库 hooks：`--no-verify`（`git commit` 还包括 `-n`），以及 `git -c core.hooksPath=…`、`--config-env` 临时改 hooks 路径。
-- `git add -f`；`filter-branch`、`filter-repo`、`replace`、`reflog expire`。
-- `gh issue create|new`、`gh pr create|new|merge`、`gh release create|new|edit|delete|delete-asset|upload`、`gh workflow run … gx-release`。
-- `gh api` 以写方法改 `releases`、`dispatches`、`git/refs`、`actions/workflows`：显式 `-X`/`--method` 为 POST、PATCH、PUT 或 DELETE，或带 `-f`、`-F`、`--field`、`--raw-field`、`--input` 而没有显式 GET（此时 gh 默认 POST）。
+deny（SHELL 段，共三条）：
+
+- force push（`-f`、`--force`、`--mirror`、`+refspec`；参数带引号也算，如 `"+HEAD:gx_ghostty"`、`"--force"`）。`--force-with-lease` 不在拒绝之列（原 ask 规则已放开）。
+- 删除命令以根目录、家目录或盘符根为操作数：`rm`、`Remove-Item` 及别名（`ri`、`rd`、`del`、`erase`）后跟 `/`、`/*`、`//`、`~`、`~/`、`~/*`、`$HOME`/`${HOME}`（含 `/*` 变体）或 `C:\`、`C:/*`、`/c/`、`/c/*` 这类盘符根；`--` 分隔符、多次短选项与大小写命令名都算。普通目标（`rm -rf build/`、`rm -rf ~/src/x`、`rm -rf /tmp/x`）照常放行。
 - 读取私钥、`.ssh/` 或 `.env`。读取类命令除 `cat`、`head`、`cp` 等外，还包括 `grep`、`rg`、`sed`、`awk`、`sort`、`diff` 等文本工具，`python`、`node`、`perl`、`ruby` 解释器，以及 PowerShell 的 `Get-Content`、`gc`、`type`、`Select-String`、`Copy-Item`（不区分大小写）。
-- 系统级安装或升级：`winget`、`choco`、`scoop` 的 `install`、`add`、`upgrade`、`update`，`cinst`、`cup`，以及 `msiexec /i`。
-- 改写生成物：重定向、`tee`、`sed -i`/`--in-place`、`mv`（生成物作源或目标都算），以 `cp` 覆盖生成物，以及 PowerShell 的 `Set-Content`、`Add-Content`、`Out-File`、`Move-Item`、`Copy-Item`；路径用 `/` 或 `\` 分隔都算，不区分大小写。`cp`/`Copy-Item` 只按最后一个参数（目标）判定，把生成物复制出去只是读取，照常放行。
 
-ask：
+deny（FILE 段，共两条）：
 
-- `--force-with-lease`；删除远端分支或 tag（`git push --delete`、`-d`、`origin :branch`）；`git reset --hard`；`git clean -f/-d`；`pkill`、`killall`、`taskkill`；`gh run rerun`（重跑 gx-release 的 publish run 会再发一次版）。
-- `git config` 设置或清除 `core.hooksPath`（`--unset`、`unset`、`set` 都算），它会停用 commit-msg 校验；只读查询照常放行，启用 hooks 用 `just install-hooks`。
-- 用 shell 改写、移动或删除安全门自身与客户端权限配置（路径见下方 FILE ask）：重定向、`tee`、`sed -i`/`--in-place`、`mv`、`rm`、以 `cp` 覆盖，以及 PowerShell 的 `Set-Content`、`Add-Content`、`Out-File`、`Move-Item`、`Remove-Item`、`Copy-Item`、`del`；`rm -rf .claude` 这类整目录删除同样要确认。
+- 凭据写入：`.env` 及其变体（`.env.example` 等模板与上游的 `.envrc` 除外）。
+- 私钥与 SSH 目录写入：`id_rsa` 等非 `.pub` 私钥、`*.pem`、`*.key`、`*.p12`、`*.pfx` 与 `.ssh/`。
 
-FILE deny：
-
-- 生成物：`graphify-out/`、`docs/kb/chunks.json`、`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`。
-- 本机工具链：`.local/`。
-- 归档的上游 workflow：`.github/workflows-archive/*.yml`。同目录的 `README.md` 是 fork 自有文件，不拦。
-- 凭据：`.env` 及其变体（`.env.example` 等模板与上游的 `.envrc` 除外），私钥，`.ssh/`。
-
-FILE ask：安全门自身与客户端权限配置，即 `.claude/hooks/`、`.claude/settings.json`、`.claude/settings.local.json`、`.codex/config.toml`、`.codex/hooks/`、`.zcode/config.json`。改它们可能削弱安全门，所以要人工确认；Codex 没有 ask，这些路径在 Codex 里直接拒绝，由人工修改。
+ask：当前策略没有 ask 规则（机制保留；未获新的用户授权不得恢复限制）。
 
 ### 命令位置锚定
 
-所有 SHELL 规则（以 `>` 开头的两条重定向规则除外）共用同一个前缀，只在以下位置命中：
+所有 SHELL 规则共用同一个前缀，只在以下位置命中：
 
 - 行首；
 - `;`、`&`、`|`、`(`、`)`、`{`、反引号、`$(` 之后，其中 `)` 覆盖 `case` 分支；
 - 上述位置之后的 shell 关键字 `if`、`elif`、`while`、`until`、`then`、`do`、`else` 与 `!` 之后；
 - `sudo`、`env`、`xargs`、`timeout`、`bash -c`、`sh -c`、`eval`、`powershell`、`pwsh`、`wsl`，以及 PowerShell 的 `iex`、`Invoke-Expression`、`Start-Process`（不区分大小写）等包装词之后，而且包装词本身也要处在命令位置；
 - 容许 `VAR=x` 前缀、`git -C <path>` 这类全局选项，以及用 `/` 或 `\` 分隔的命令路径；
-- 命令名、git/gh 子命令与 push 的危险参数可以带引号（`"git" push`、`& "git" push`、`git "push"`），参数之间可以是逗号（`Start-Process git -ArgumentList "push","--force"`）。
+- 命令名、git 子命令与 push 的危险参数可以带引号（`"git" push`、`& "git" push`、`git "push"`），参数之间可以是逗号（`Start-Process git -ArgumentList "push","--force"`）。
 
 关键字和包装词分开处理：关键字后面紧跟的就是命令，所以 `if rg -q 'git push -f' docs; then …` 仍然放行；包装词会跳过任意参数，误拦面更大，因此不把关键字并进包装词列表。
 
-git 与 gh 的全局选项用无歧义的 `--?\w[\w-]*` 逐个跳过。旧写法 `-{1,2}[\w-]+` 对 `--x` 有两种切分，匹配失败时指数回溯：带 22 个长选项的命令实测要 7 秒，24 个要 22 秒，而 hook 超时等于放行。测试锁定 40 个长选项在 1 秒内判完。包装词之后的参数跳过仍有平方级最坏情况（单行几万字符、同一命令名重复上千次的刻意构造），由下文的判定看门狗兜底。
+git 的全局选项用无歧义的 `--?\w[\w-]*` 逐个跳过。旧写法 `-{1,2}[\w-]+` 对 `--x` 有两种切分，匹配失败时指数回溯：带 22 个长选项的命令实测要 7 秒，24 个要 22 秒，而 hook 超时等于放行。测试锁定 40 个长选项在 1 秒内判完。包装词之后的参数跳过仍有平方级最坏情况（单行几万字符、同一命令名重复上千次的刻意构造），由下文的判定看门狗兜底。
 
 因此：
 
@@ -111,8 +99,8 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 
 - **Claude Code**：
   - `defaultMode: acceptEdits`。
-  - allow：仓内 `Read(./**)` 与 `Edit(./**)`，Glob、Grep、WebSearch、WebFetch、Agent、Skill，以及常用命令前缀：常规 git 子命令、`just`、`python`/`python3 scripts/*`、`python -m unittest`、`zig build`、`zig fmt`、`gh run list|view`、`actionlint`。
-  - deny：读取 `.env`、`*.pem` 与 `.git/`。
+  - allow：仓内 `Read(./**)` 与 `Edit(./**)`，Glob、Grep、WebSearch、WebFetch、Agent、Skill，以及整工具 `Bash`（2026-10 白名单放开，不再限定命令前缀）。
+  - deny：凭据/私钥的读取与写入，即 `Read`/`Edit` 的 `.env`（含变体）、`*.pem`、`*.key`、`id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`（不含 `.pub`）与 `.ssh/`。
   - 不设 ask 列表：ask 在任何模式下都会弹窗，allow 与 hook 都压不住。
   - 不写 `Write(...)` 路径规则：Claude Code 只按 `Read(...)`/`Edit(...)` 判定文件权限，`Edit` 规则同时覆盖 Write 与 NotebookEdit。
   - reviewer 的 `permissionMode` 会被主会话的 acceptEdits 覆盖，所以只读边界靠工具白名单（Read、Grep、Glob、Bash）与 `disallowedTools`。
@@ -148,6 +136,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 
 - 从 Git Bash 运行 `python -m unittest scripts.test_ai_tool_hooks`：62 项通过，exit 0。
 - 从 cmd.exe 在最小 Windows PATH 下运行同一命令：此时 `bash` 先解析到 WindowsApps 的 WSL 启动器，测试改从 `git --exec-path` 推导出 Git Bash，62 项同样全部通过，exit 0。
+- 2026-10-21 策略收窄为最小核心防线后，从 Git Bash 重跑同一命令：64 项通过，exit 0。
 - PowerShell 测试在本机用 Windows PowerShell 5.1.26100 与 PowerShell 7.6.6 原样执行注册的 `command_windows`；Windows 上两者都找不到时测试失败而不是跳过，只有非 Windows 主机才跳过。
 - `command_windows` 的键名用 `codex -c … features list`（0.160.0）离线核对：把它设成整数时配置加载报类型错误，未知键不报错；同一 hooks 段放进临时 `CODEX_HOME` 的 `config.toml` 时加载通过。
 
@@ -169,7 +158,7 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 | 严格配置解析（真实启动） | PENDING | PASS（0.160.0，`codex exec --strict-config --ephemeral` 短真实调用 exit 0；不代证项目层实际生效） | N/A | PENDING |
 | 新会话加载规则入口 | PENDING | PASS（0.160.0，根 `AGENTS.md` 自动注入） | PASS（2.1.1，工具调用前已复述 fork 三条规则） | PENDING |
 | 项目层配置实际生效 | PENDING | PENDING（项目层是否受信任并被加载尚未确认） | N/A（无项目配置） | PENDING |
-| 真实会话中 shell hook 拦截 | PENDING | FAIL（两条安全探针均未出现预期 deny，见下文） | N/A（无项目级 hooks） | PENDING |
+| 真实会话中 shell hook 拦截 | PENDING | FAIL（2026-10-07 两条探针未出现预期 deny，见下文；探针命令基于旧策略，2026-10-21 起按下方新探针补验） | N/A（无项目级 hooks） | PENDING |
 | 信任流程与真实 `apply_patch` hook | PENDING | PENDING（未修改信任状态；FILE 探针未完成） | PENDING（新会话信任流程未测） | PENDING |
 | MCP | N/A（本仓无项目级 MCP） | N/A | N/A | N/A |
 
@@ -177,16 +166,16 @@ Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `a
 
 - **Kimi Code 2.1.1**：用 `kimi --output-format stream-json -p <短只读提示>` 开新会话，在任何工具调用前答出中文提交规范、Zig 必须经 `scripts/zigw.py`、Windows 只有 lib-vt 三条 fork 规则（第三条是当时 fork 段的说法，现已过时：Windows 已有 win32 app）；唯一工具调用为 `git --no-optional-locks status --short --branch`，exit 0，没有通过 Read 临时补读规则。这证明新会话自动注入，不证明信任流程或 hooks。
 - **Codex 0.160.0**：`codex exec --strict-config --ephemeral <短提示>` 的真实调用 exit 0，新会话自动注入根 `AGENTS.md`。启动头显示 `read-only`，但 `exec` 默认即为只读，不能据此判定项目配置未加载；项目层实际生效仍为 PENDING。`codex --strict-config --version` 不加载配置，不能代替本次真实调用。
-- **Codex 拦截失败**：`gh pr create --help` 实际进入 gh，因 gh 配置访问 `Access denied` 退出 1，而不是 hook deny；`git clean -n -d` 实际执行、exit 0。两项预期拒绝断言均为 FAIL；`git status` 成功也不能代证 hook 参与。`codex features list` 显示 `hooks=true`，但功能开关开启不证明项目 hook 已加载或受信任。
+- **Codex 拦截失败**：`gh pr create --help` 实际进入 gh，因 gh 配置访问 `Access denied` 退出 1，而不是 hook deny；`git clean -n -d` 实际执行、exit 0。两项预期拒绝断言均为 FAIL（这两条当时分别命中旧策略的 gh 写操作 deny 与 `git clean` ask，2026-10-21 起已放开，不能再用作探针）。`git status` 成功也不能代证 hook 参与。`codex features list` 显示 `hooks=true`，但功能开关开启不证明项目 hook 已加载或受信任。
 - [Codex 官方 hooks 文档](https://developers.openai.com/codex/hooks/)明确 `exec_command` 也匹配 `Bash`，当前 `^(Bash|apply_patch)$` matcher 无须因此改名。项目受信任与当前 hook hash 被单独信任是前提，漏拦的具体原因仍为 PENDING，不能归因于 matcher、PowerShell 或配置层中的某一项。
 - `command -v claude` 与 `command -v zcode` 均 exit 1，客户端未安装；离线适配器测试不能把它们的真实会话状态改成 PASS。
 
 补验方式：由人类在对应客户端里从仓库根开新会话，先做只读检查，不由 agent 自动授予信任：
 
 1. 规则入口：Claude Code 用 `/context` 或 `/memory` 确认 `CLAUDE.md` 与导入的 `AGENTS.md` 已加载；其他客户端先复述 fork 规则再调用工具。Codex 用 `/debug-config` 查看项目配置来源与有效值，用 `/hooks` 只读检查 hook 加载状态及当前 hash 的信任状态。是否信任项目或 hook 由人类决定；不读取私有配置、会话文件，也不使用 `config/read` 全层 RPC。
-2. 拦截：让 agent 执行 `gh pr create --help`，应被 deny；这条命令即使漏拦也只会打印帮助。
-3. ask：执行 `git clean -n -d`，Claude Code 与 ZCode 应弹出确认，Codex 应被 deny；`-n` 让它即使漏拦也只是演练。
-4. FILE：Claude Code 与 ZCode 写 `graphify-out/__probe__.txt`，Codex 用 `apply_patch` 新增同一文件，都应被 deny；该目录已被忽略，漏拦也无害。
+2. 拦截（force push）：执行 `git push --force --dry-run origin <分支>`，应被 deny；`--dry-run` 让它即使漏拦也不改远端。
+3. 拦截（凭据读取）：执行 `cat .env`（仓库里没有这个文件），应被 deny；漏拦也只会报文件不存在。
+4. FILE：Claude Code 与 ZCode 写 `.env.probe.txt`，Codex 用 `apply_patch` 新增同一文件，都应被 deny；漏拦也只会在工作区留下一个未跟踪文件，删掉即可。
 5. 放行：执行 `git status`，应直接通过。
 6. Windows 上的 hook shell：
    - Codex：确认它在 Windows 上执行的是 `command_windows`，而且是经 PowerShell 执行。可以在 `docs/` 下用 `apply_patch` 新增一个文件看能否放行，再按第 4 步看能否拦截。只要 hook 能在 Windows 上判定，就说明 `$(git rev-parse --show-toplevel)` 已展开、退出码判定生效。

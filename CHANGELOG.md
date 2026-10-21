@@ -58,6 +58,7 @@
 - Linux GTK 程序内嵌的窗口图标与 GX Shell 的 Ubuntu deb 启动器图标改用 Ghostty GX 的 `>_` 图标（与 Windows 相同，`scripts/gx_icon.py` 生成 `dist/linux/gx/icons/`），不再是 Ghostty 的幽灵图标；`zig build install` 与 Debian 13 压缩包安装的系统图标保持上游。
 - Windows 便携包、安装包、Linux deb 与 debian13 GTK 压缩包附带拼音数据（pinyin-data，MIT）与 Unicode License V3 的许可文本（压缩包在 `usr/share/doc/ghostty-gx/`，另附 Ghostty 的 MIT 许可）。
 - shell 集成的光标特性在提示符处显示配置的 `cursor-style` 与闪烁设置（GX 默认为闪烁块状），程序留下的光标形状在下一个提示符复位；未显式设置的维度仍可由程序 DECSCUSR 改变，zsh 与 fish 的 vi 绑定保留模式指示。未显式设置形状时，`gx-prompt-cursor = bar` 恢复上游提示符竖线；`no-cursor` 只关闭集成脚本的光标处理。
+- AI 协作安全门按 2026-10 用户授权收窄为「最小核心防线」：hook 只拦截 force push、根/家目录 rm 与凭据/私钥读写四类 deny，其余 deny/ask 策略与 Claude 命令白名单全部放开；探针 `scripts/test_ai_tool_hooks.py` 与文档同步更新。
 
 ### Fixed
 

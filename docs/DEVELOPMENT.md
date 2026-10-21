@@ -311,7 +311,7 @@ just generated-check
 
 **优先于上游 skill**：上游的 `.agents/skills/writing-commit-messages`（`<subsystem>: <summary>` 格式）保持原样，只用于准备回馈上游的提交；在 `gx_ghostty` 上与本节冲突时以本节为准。该 skill 里「直接提交」的步骤也不构成提交授权。
 
-**hook 与暂存**：`just install-hooks` 后，`.githooks/commit-msg` 对每次提交运行同一检查，包括 `git merge` 生成的合并提交；hook 安全门禁止 `--no-verify`。暂存时精确列出路径，不用 `git add -A`，也不用 `git add -f` 强加被忽略的文件。`.githooks/commit-msg` 首次入库必须用 `git add --chmod=+x .githooks/commit-msg`（本仓 `core.filemode=false`，否则以 100644 入库，POSIX 上的 git 会忽略这个 hook；`scripts/test_conventional_commits.py` 在它入库后检查模式为 100755）。
+**hook 与暂存**：`just install-hooks` 后，`.githooks/commit-msg` 对每次提交运行同一检查，包括 `git merge` 生成的合并提交。暂存时精确列出路径，不用 `git add -A`，也不用 `git add -f` 强加被忽略的文件。`.githooks/commit-msg` 首次入库必须用 `git add --chmod=+x .githooks/commit-msg`（本仓 `core.filemode=false`，否则以 100644 入库，POSIX 上的 git 会忽略这个 hook；`scripts/test_conventional_commits.py` 在它入库后检查模式为 100755）。
 
 ## 生成物重建时机
 

@@ -87,6 +87,10 @@ HOOKS_PATH = "core.hooks" + "Path"
 APPLY_PATCH = "apply" + "_patch"
 FORCE_PUSH = f"{GIT} {PUSH} {FORCE} origin main"
 HARD_RESET = f"{GIT} reset --hard HEAD~1"
+RM = "r" + "m"
+RM_RF = "-" + "rf"
+REMOVE_ITEM = "Remove-" + "Item"
+ROOT_RM = f"{RM} {RM_RF} /"
 
 
 def _patch(*headers: str) -> str:
@@ -132,48 +136,45 @@ SHELL_DENY = [
     f"{GIT} {PUSH} \\\n  {FORCE} origin gx_ghostty",
     f"{GIT} {PUSH} \\\r\n  {FORCE} origin gx_ghostty",
     f"{GIT} pu\\\nsh -f origin x",
-    f"{GH} release \\\n  create gx-v1.0.0",
     f"{GIT} {PUSH} `\n  {FORCE} origin x",
     f"echo a \\\\\n{GIT} {PUSH} -f",
-    f"{GIT} {PUSH} upstream",
-    f"{GIT} --no-pager {PUSH} upstream main",
-    f"{GIT} {PUSH} -u upstream feature/x",
-    f"{GIT} {PUSH} https://github.com/ghostty-org/ghostty.git main",
-    f"{GIT} {PUSH} git@github.com:Ghostty-Org/Ghostty.git main",
-    f"{GIT} {PUSH} upstream --delete x",
-    f"{GIT} commit {NO_VERIFY} -m x",
-    f"{GIT} commit -n -m x",
-    f"{GIT} commit -nm x",
-    f'{GIT} commit -m "msg" -n',
-    f"if true; then {GIT} commit -m x {NO_VERIFY}; fi",
-    f"{GIT} merge {NO_VERIFY} main",
-    f"{GIT} -c {HOOKS_PATH}=/dev/null commit -m x",
-    f"{GIT} -c core.autocrlf=false -c core.hookspath= commit -m x",
-    f"{GIT} --config-env={HOOKS_PATH}=HP commit -m x",
-    f"{GIT} add -f .claude/settings.local.json",
-    f"{GIT} add --force x",
-    f"{GIT} add -Af",
-    f"{GIT} filter-branch --all",
-    f"{GIT} filter-repo --path x",
-    f"{GIT} replace a b",
-    f"{GIT} reflog expire --expire=now --all",
-    f"{GH} issue create --title x",
-    f"{GH} issue new",
-    f"{GH} pr create --fill",
-    f"{GH} pr new",
-    f"{GH} pr merge 12",
-    f"{GH} -R ghostty-org/ghostty pr create",
-    f"bash -c '{GH} pr merge 1'",
-    f"{GH} release create gx-v0.1.0",
-    f"{GH} release delete-asset gx-v0.1.0 a.tar.gz",
-    f"GH_TOKEN=x {GH} release upload gx-v0.1.0 a.tar.gz",
-    f"{GH} workflow run gx-release.yml -f publish=true",
-    f"{GH} -R gx0404/gx_ghostty workflow run gx-release.yml --ref gx_ghostty",
-    f"{GH} api -X POST repos/gx0404/gx_ghostty/releases -f tag_name=gx-v1.0.0",
-    f"{GH} api repos/gx0404/gx_ghostty/actions/workflows/gx-release.yml/dispatches -f ref=gx_ghostty",
-    f"{GH} api --method DELETE repos/gx0404/gx_ghostty/git/refs/tags/gx-v1.0.0",
-    f"{GH} api -XPATCH repos/o/r/releases/1 -F draft=false",
-    f"{GH} api --method=put repos/o/r/actions/workflows/1/enable",
+    # Quoted command names, subcommands and force arguments.
+    f'{GIT} {PUSH} origin "+HEAD:gx_ghostty"',
+    f"{GIT} {PUSH} origin '+main'",
+    f'{GIT} {PUSH} "{FORCE}"',
+    f"{GIT} {PUSH} '-f' origin x",
+    f'{GIT} "{PUSH}" -f',
+    f'"{GIT}" {PUSH} -f',
+    f'& "{GIT}" {PUSH} {FORCE}',
+    # Root and home directory deletion: rm, Remove-Item and their aliases.
+    ROOT_RM,
+    f"{RM} -fr /",
+    f"{RM} --recursive --force /",
+    f"{RM} {RM_RF} -- /",
+    f"{RM} {RM_RF} '/'",
+    f"{RM} {RM_RF} /*",
+    f"{RM} {RM_RF} //",
+    f"sudo {RM} {RM_RF} /",
+    f"bash -c '{RM} {RM_RF} /'",
+    f"wsl {RM} {RM_RF} /",
+    f"if true; then {RM} {RM_RF} /; fi",
+    f"bash <<'EOF'\n{ROOT_RM}\nEOF",
+    f"{RM} {RM_RF} ~",
+    f"{RM} {RM_RF} ~/",
+    f"{RM} {RM_RF} '~'",
+    f"{RM} {RM_RF} ~/*",
+    f"{RM} {RM_RF} $HOME",
+    f'{RM} {RM_RF} "$HOME"',
+    f"{RM} {RM_RF} ${{HOME}}/*",
+    f"{RM} {RM_RF} C:\\",
+    f"{RM} {RM_RF} C:/*",
+    f"{RM} {RM_RF} /c/",
+    f"{RM} {RM_RF} /c/*",
+    f"RM -RF /",
+    f"{REMOVE_ITEM} -Recurse -Force ~",
+    f"{REMOVE_ITEM} -Recurse C:\\*",
+    f"powershell -Command {REMOVE_ITEM} -Recurse /",
+    # Credential and private key reads.
     f"cat {SSH_DIR}/id_rsa",
     f"cat {SSH_DIR}/config",
     f"cat {DOT_SSH}/config",
@@ -192,99 +193,14 @@ SHELL_DENY = [
     f"type {DOT_ENV}",
     f"Select-String -Path {DOT_ENV} -Pattern TOKEN",
     f"Copy-Item {SSH_DIR}/id_rsa C:/tmp/k",
-    f"{WINGET} install Zig.Zig",
-    f"{CHOCO} install zig",
-    f"{SCOOP} install zig",
-    f"{WINGET} upgrade --all",
-    f"{WINGET} update Zig.Zig",
-    f"{CHOCO} upgrade zig",
-    f"{SCOOP} update zig",
-    f"{MSIEXEC} /i foo.msi",
-    f"{MSIEXEC} /qn /i foo.msi",
-    f"just setup && {WINGET} install Perl",
-    "echo x > graphify-out/GRAPH_REPORT.md",
-    "echo x >> ./docs/kb/chunks.json",
-    "echo x > .\\docs\\kb\\chunks.json",
-    "sed -i s/a/b/ docs/kb/chunks.json",
-    "cat x | tee build.zig.zon.json",
-    "Set-Content -Path docs/kb/chunks.json -Value x",
-    "'x' | Out-File -FilePath graphify-out\\GRAPH_REPORT.md",
-    "add-content docs\\kb\\chunks.json x",
-    "sed --in-place s/a/b/ docs/kb/chunks.json",
-    "cp /tmp/chunks.json docs/kb/chunks.json",
-    "cp x graphify-out/GRAPH_REPORT.md",
-    "mv /tmp/x build.zig.zon.json",
-    "mv docs/kb/chunks.json /tmp/",
-    "Copy-Item C:\\tmp\\x docs\\kb\\chunks.json",
-    "Move-Item x flatpak\\zig-packages.json",
-    f"{APPLY_PATCH} <<'EOF'\n{_patch('*** Update File: docs/kb/chunks.json')}EOF",
     # PowerShell and WSL wrappers.
     f'iex "{GIT} {PUSH} -f origin x"',
     f"Invoke-Expression '{GIT} {PUSH} {FORCE} origin x'",
-    f'invoke-expression "{GH} pr create --fill"',
     f"wsl {GIT} {PUSH} -f origin x",
     f"wsl.exe -- {GIT} {PUSH} {FORCE}",
     f"wsl cat {SSH_DIR}/id_rsa",
     f"Start-Process {GIT} -ArgumentList '{PUSH} {FORCE}' -Wait",
     f'Start-Process -FilePath "{GIT}" -ArgumentList "{PUSH}","{FORCE}"',
-    f"start-process {GH} 'release create gx-v1.0.0'",
-    # Quoted command names, subcommands and force arguments.
-    f'{GIT} {PUSH} origin "+HEAD:gx_ghostty"',
-    f"{GIT} {PUSH} origin '+main'",
-    f'{GIT} {PUSH} "{FORCE}"',
-    f"{GIT} {PUSH} '-f' origin x",
-    f'{GIT} "{PUSH}" -f',
-    f'"{GIT}" {PUSH} -f',
-    f'& "{GIT}" {PUSH} {FORCE}',
-]
-SHELL_ASK = [
-    f"{GIT} {PUSH} {LEASE} origin x",
-    f"{GIT} {PUSH} {LEASE}=main:abc origin main",
-    f"{GIT} {PUSH} --delete origin feature/x",
-    f"{GIT} {PUSH} origin --delete gx-v1.0.0",
-    f"{GIT} {PUSH} -d origin x",
-    f"{GIT} {PUSH} origin :feature/x",
-    HARD_RESET,
-    f"if true; then {HARD_RESET}; fi",
-    f"{GIT} clean -fd",
-    f"{GIT} clean -fdx",
-    f"{PKILL} -9 zig",
-    f"just build && {PKILL} zig",
-    f"sudo {KILLALL} zig",
-    f"pgrep zig | xargs -r {PKILL} -f",
-    f"bash -c '{PKILL} zig'",
-    f"bash <<'EOF'\n{PKILL} zig\nEOF",
-    f"GX=1 {PKILL} zig",
-    f"{GH} run rerun 123",
-    f"{GH} run rerun 123 --failed",
-    f"iex '{GIT} reset --hard'",
-    f'{GIT} {PUSH} origin "--delete" x',
-    f'{GIT} {PUSH} "{LEASE}"',
-    # Setting or clearing core.hooksPath switches the repository hooks off.
-    f"{GIT} config {HOOKS_PATH} .githooks",
-    f"{GIT} config --global {HOOKS_PATH} ~/.hooks",
-    f"{GIT} config set {HOOKS_PATH} /dev/null",
-    f'{GIT} config {HOOKS_PATH} ""',
-    f"{GIT} config --unset {HOOKS_PATH}",
-    f"{GIT} config unset {HOOKS_PATH}",
-    f"{GIT} config --local --unset-all core.hookspath",
-    # Shell writes to the gate's own policy, adapters and client configs.
-    "echo x > .claude/settings.json",
-    "echo '{}' >> .claude/settings.local.json",
-    "echo x > D:/gx_projects/gx_ghostty/.codex/hooks/x.py",
-    "cat x | tee .codex/config.toml",
-    "sed -i s/a/b/ .claude/hooks/dangerous_patterns.conf",
-    "sed --in-place s/a/b/ .zcode/config.json",
-    "Set-Content -Path .codex\\hooks\\pre_tool_use_policy.py -Value x",
-    "'x' | Out-File .claude\\settings.json",
-    "cp /tmp/x .claude/settings.json",
-    "Copy-Item x .zcode\\config.json",
-    "mv .claude/hooks /tmp/h",
-    "rm -rf .claude/hooks",
-    "rm -rf .claude",
-    "rm .codex/config.toml",
-    "Remove-Item -Recurse .claude\\hooks",
-    "del .claude\\settings.local.json",
 ]
 SHELL_ALLOW = [
     f"{GIT} status",
@@ -388,34 +304,114 @@ SHELL_ALLOW = [
     "rm .claude/rules/old.md",
     f"{GIT} diff .claude/settings.json",
     "rg 'tee .claude/settings.json' docs/",
+    # 2026-10 最小核心防线放开的操作：上游推送、绕过 hooks、历史清理、gh 写操作与系统级安装不再拦截。
+    f"{GIT} --no-pager {PUSH} upstream main",
+    f"{GIT} {PUSH} upstream",
+    f"{GIT} {PUSH} -u upstream feature/x",
+    f"{GIT} {PUSH} upstream --delete x",
+    f"{GIT} {PUSH} https://github.com/ghostty-org/ghostty.git main",
+    f"{GIT} {PUSH} git@github.com:Ghostty-Org/Ghostty.git main",
+    f"{GIT} {PUSH} {LEASE} origin x",
+    f"{GIT} {PUSH} {LEASE}=main:abc origin main",
+    f'{GIT} {PUSH} "{LEASE}"',
+    f"{GIT} {PUSH} origin --delete gx-v1.0.0",
+    f"{GIT} {PUSH} -d origin x",
+    f"{GIT} {PUSH} origin :feature/x",
+    HARD_RESET,
+    f"if true; then {HARD_RESET}; fi",
+    f"iex '{GIT} reset --hard'",
+    f"{GIT} clean -fd",
+    f"{GIT} clean -fdx",
+    f"{GIT} commit {NO_VERIFY} -m x",
+    f"{GIT} commit -n -m x",
+    f"{GIT} merge {NO_VERIFY} main",
+    f"{GIT} -c {HOOKS_PATH}=/dev/null commit -m x",
+    f"{GIT} --config-env={HOOKS_PATH}=HP commit -m x",
+    f"{GIT} config {HOOKS_PATH} .githooks",
+    f"{GIT} config --global {HOOKS_PATH} ~/.hooks",
+    f"{GIT} config --unset {HOOKS_PATH}",
+    f"{GIT} add -f .claude/settings.local.json",
+    f"{GIT} filter-branch --all",
+    f"{GIT} filter-repo --path x",
+    f"{GIT} replace a b",
+    f"{GIT} reflog expire --expire=now --all",
+    f"{GH} issue create --title x",
+    f"{GH} issue new",
+    f"{GH} pr create --fill",
+    f"{GH} pr new",
+    f"{GH} pr merge 12",
+    f"{GH} release create gx-v0.1.0",
+    f"{GH} release upload gx-v0.1.0 a.tar.gz",
+    f"{GH} workflow run gx-release.yml -f publish=true",
+    f"{GH} api -X POST repos/gx0404/gx_ghostty/releases -f tag_name=gx-v1.0.0",
+    f"{GH} run rerun 123",
+    f"{GH} run rerun 123 --failed",
+    f"{PKILL} -9 zig",
+    f"just build && {PKILL} zig",
+    f"sudo {KILLALL} zig",
+    f"pgrep zig | xargs -r {PKILL} -f",
+    f"bash -c '{PKILL} zig'",
+    f"bash <<'EOF'\n{PKILL} zig\nEOF",
+    f"GX=1 {PKILL} zig",
+    f"{WINGET} install Zig.Zig",
+    f"{CHOCO} install zig",
+    f"{SCOOP} install zig",
+    f"{WINGET} upgrade --all",
+    f"{CHOCO} upgrade zig",
+    f"{MSIEXEC} /i foo.msi",
+    f"{MSIEXEC} /qn /i foo.msi",
+    f"just setup && {WINGET} install Perl",
+    # 生成物、安全门与客户端配置只受 docs/AGENT_RULES/ 的流程约束，不再被安全门拦截。
+    "echo x > graphify-out/GRAPH_REPORT.md",
+    "echo x >> ./docs/kb/chunks.json",
+    "sed -i s/a/b/ docs/kb/chunks.json",
+    "sed --in-place s/a/b/ docs/kb/chunks.json",
+    "cat x | tee build.zig.zon.json",
+    "Set-Content -Path docs/kb/chunks.json -Value x",
+    "'x' | Out-File -FilePath graphify-out\\GRAPH_REPORT.md",
+    "add-content docs\\kb\\chunks.json x",
+    "cp /tmp/chunks.json docs/kb/chunks.json",
+    "cp x graphify-out/GRAPH_REPORT.md",
+    "mv /tmp/x build.zig.zon.json",
+    "mv docs/kb/chunks.json /tmp/",
+    "Copy-Item C:\\tmp\\x docs\\kb\\chunks.json",
+    "Move-Item x flatpak\\zig-packages.json",
+    f"{APPLY_PATCH} <<'EOF'\n{_patch('*** Update File: docs/kb/chunks.json')}EOF",
+    "echo x > .claude/settings.json",
+    "echo '{}' >> .claude/settings.local.json",
+    "echo x > D:/gx_projects/gx_ghostty/.codex/hooks/x.py",
+    "cat x | tee .codex/config.toml",
+    "sed -i s/a/b/ .claude/hooks/dangerous_patterns.conf",
+    "sed --in-place s/a/b/ .zcode/config.json",
+    "Set-Content -Path .codex\\hooks\\pre_tool_use_policy.py -Value x",
+    "'x' | Out-File .claude\\settings.json",
+    "cp /tmp/x .claude/settings.json",
+    "Copy-Item x .zcode\\config.json",
+    "mv .claude/hooks /tmp/h",
+    "rm -rf .claude/hooks",
+    "rm -rf .claude",
+    "rm .codex/config.toml",
+    "Remove-Item -Recurse .claude\\hooks",
+    "del .claude\\settings.local.json",
+    # 根/家目录 rm 只拦操作数是根、家或盘符根的删除；普通目标照常放行。
+    f"{RM} -rf build/",
+    "rm file.txt",
+    f"{RM} -rf /tmp/gx-probe",
+    f"{RM} -rf ~/src/gx",
+    f"{RM} -rf /c/tmp",
+    f"{RM} -rf zig-out",
+    f"echo '{ROOT_RM}'",
+    f"echo {ROOT_RM}",
+    f"rg '{ROOT_RM}' docs/",
 ]
 FILE_DENY = [
-    "graphify-out/graph.json",
-    "graphify-out/GRAPH_REPORT.md",
-    "graphify-out/source-fingerprint.json",
-    "docs/kb/chunks.json",
-    ".local/toolchains/zig/zig-0.16.0/zig",
-    "build.zig.zon.json",
-    "build.zig.zon.nix",
-    "build.zig.zon.txt",
-    "flatpak/zig-packages.json",
-    "vendor/glad/src/gl.c",
-    ".github/workflows-archive/test.yml",
     DOT_ENV,
     f"config/{DOT_ENV}.local",
     "certs/server.pem",
+    "keys/server.key",
+    "id_rsa",
     "id_ed25519",
-]
-# The safety gate's own policy, adapters and client hook/permission configs.
-FILE_ASK = [
-    ".claude/settings.json",
-    ".claude/settings.local.json",
-    ".claude/hooks/dangerous_patterns.conf",
-    ".claude/hooks/pre_tool_use_gate.py",
-    ".claude/hooks/block_dangerous.sh",
-    ".codex/config.toml",
-    ".codex/hooks/pre_tool_use_policy.py",
-    ".zcode/config.json",
+    ".ssh/id_ed25519",
 ]
 FILE_ALLOW = [
     "src/terminal/Terminal.zig",
@@ -434,6 +430,27 @@ FILE_ALLOW = [
     ".codex/README.md",
     ".codex/agents/gx-ghostty-reviewer.toml",
     ".zcode/README.md",
+    # 2026-10 最小核心防线放开的路径：生成物与安全门/客户端配置不再被 FILE 规则拦截。
+    "graphify-out/graph.json",
+    "graphify-out/GRAPH_REPORT.md",
+    "graphify-out/source-fingerprint.json",
+    "docs/kb/chunks.json",
+    ".local/toolchains/zig/zig-0.17.0/zig",
+    ".local/evidence/R4/execution-20261013/report.json",
+    "build.zig.zon.json",
+    "build.zig.zon.nix",
+    "build.zig.zon.txt",
+    "flatpak/zig-packages.json",
+    "vendor/glad/src/gl.c",
+    ".github/workflows-archive/test.yml",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    ".claude/hooks/dangerous_patterns.conf",
+    ".claude/hooks/pre_tool_use_gate.py",
+    ".claude/hooks/block_dangerous.sh",
+    ".codex/config.toml",
+    ".codex/hooks/pre_tool_use_policy.py",
+    ".zcode/config.json",
 ]
 GIT_LONG_OPTIONS = (
     "--no-pager", "--literal-pathspecs", "--no-replace-objects", "--glob-pathspecs",
@@ -696,11 +713,11 @@ class PolicyFileTests(unittest.TestCase):
         self.gate = _gate()
         self.rules = self.gate.load_rules()
 
-    def test_policy_loads_with_both_sections_and_levels(self) -> None:
-        self.assertGreaterEqual(len(self.rules), 30)
+    def test_policy_is_the_minimal_core_defense(self) -> None:
+        # 2026-10 用户授权：只保留 force push、根/家目录 rm、凭据/私钥读取与写入四类 deny。
+        self.assertEqual(5, len(self.rules))
         self.assertEqual({"SHELL", "FILE"}, {rule.section for rule in self.rules})
-        self.assertEqual({"deny", "ask"}, {rule.level for rule in self.rules})
-        self.assertEqual({"deny", "ask"}, {rule.level for rule in self.rules if rule.section == "FILE"})
+        self.assertEqual({"deny"}, {rule.level for rule in self.rules})
         for rule in self.rules:
             self.assertTrue(rule.reason.strip(), rule.line_no)
 
@@ -770,19 +787,10 @@ class ShellProbeTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual("deny", _level("Bash", {"command": command}))
 
-    def test_risky_execution_asks(self) -> None:
-        for command in SHELL_ASK:
-            with self.subTest(command=command):
-                self.assertEqual("ask", _level("Bash", {"command": command}))
-
     def test_text_mentions_and_routine_commands_pass(self) -> None:
         for command in SHELL_ALLOW:
             with self.subTest(command=command):
                 self.assertIsNone(_level("Bash", {"command": command}))
-
-    def test_deny_wins_over_ask(self) -> None:
-        self.assertEqual("deny", _level("Bash", {"command": f"{PKILL} zig; {FORCE_PUSH}"}))
-        self.assertEqual("deny", _level("Bash", {"command": f"{HARD_RESET} && {FORCE_PUSH}"}))
 
     def test_argv_style_command_is_joined(self) -> None:
         self.assertEqual("deny", _level("Bash", {"command": [GIT, PUSH, FORCE]}))
@@ -801,16 +809,16 @@ class ShellProbeTests(unittest.TestCase):
 
     def test_long_option_runs_do_not_backtrack(self) -> None:
         options = " ".join(GIT_LONG_OPTIONS[i % len(GIT_LONG_OPTIONS)] for i in range(40))
-        for command in (
-            f"{GIT} {options} status; {GIT} {PUSH} -f",
-            f"{GH} {options} pr view 1; {GH} pr merge 1",
-            f"{GIT} {options} commit -m x; {GIT} {PUSH} upstream",
+        for command, expected in (
+            (f"{GIT} {options} status; {GIT} {PUSH} -f", "deny"),
+            (f"{GH} {options} pr view 1; {GH} pr merge 1", None),
+            (f"{GIT} {options} commit -m x; {GIT} {PUSH} upstream", None),
         ):
             with self.subTest(command=command[:40]):
                 started = time.perf_counter()
                 level = _level("Bash", {"command": command})
                 self.assertLess(time.perf_counter() - started, 1.0, "the hook timeout (30 s) would allow the call")
-                self.assertEqual("deny", level)
+                self.assertEqual(expected, level)
 
     def test_tool_names_are_case_insensitive_and_unguarded_tools_pass(self) -> None:
         self.assertEqual("deny", _level("bash", {"command": FORCE_PUSH}))
@@ -836,19 +844,20 @@ class FileProbeTests(unittest.TestCase):
                     with self.subTest(tool=tool, path=form):
                         self.assertEqual("deny", _level(tool, {key: form}, cwd=REPO_ROOT))
 
-    def test_gate_and_client_configs_ask_for_every_write_tool(self) -> None:
-        for relative in FILE_ASK:
-            for form in self._forms(relative):
+    def test_gate_and_client_configs_pass_for_every_write_tool(self) -> None:
+        # 2026-10 最小核心防线：安全门与客户端配置不再需要人工确认，与普通文件一样放行。
+        for relative in FILE_ALLOW:
+            for form in (relative, "./" + relative, str(REPO_ROOT / relative)):
                 for tool in WRITE_TOOLS:
                     key = "notebook_path" if tool == "NotebookEdit" else "file_path"
                     with self.subTest(tool=tool, path=form):
-                        self.assertEqual("ask", _level(tool, {key: form}, cwd=REPO_ROOT))
+                        self.assertIsNone(_level(tool, {key: form}, cwd=REPO_ROOT))
 
     def test_kimi_style_path_key_is_gated(self) -> None:
         # Kimi Code's Write/Edit tools name the target "path" instead of "file_path".
         for tool in ("Write", "Edit"):
             with self.subTest(tool=tool):
-                self.assertEqual("deny", _level(tool, {"path": str(REPO_ROOT / "docs" / "kb" / "chunks.json")}))
+                self.assertEqual("deny", _level(tool, {"path": str(REPO_ROOT / DOT_ENV)}))
                 self.assertIsNone(_level(tool, {"path": str(REPO_ROOT / "docs" / "kb" / "README.md")}))
 
     def test_ordinary_paths_pass(self) -> None:
@@ -857,43 +866,23 @@ class FileProbeTests(unittest.TestCase):
                 with self.subTest(path=form):
                     self.assertIsNone(_level("Write", {"file_path": form}, cwd=REPO_ROOT))
 
-    def test_authorized_phase_evidence_directory_is_the_only_local_exception(self) -> None:
-        prefix = ".local/evidence/R5/execution-20261013/"
-        for relative in (prefix + "tasks.json", prefix + "leaf-matrix.json",
-                         prefix + "final-r3/reviews/new-review.json"):
-            for form in self._forms(relative):
-                for tool in WRITE_TOOLS:
-                    key = "notebook_path" if tool == "NotebookEdit" else "file_path"
-                    with self.subTest(tool=tool, path=form):
-                        self.assertIsNone(_level(tool, {key: form}, cwd=REPO_ROOT))
-
-    def test_phase_evidence_exception_preserves_other_denials(self) -> None:
-        prefix = ".local/evidence/R5/execution-20261013/"
-        denied = (prefix.rstrip("/"), prefix + "../other/report.json",
-                  prefix + "../../../toolchains/zig", prefix + DOT_ENV,
-                  prefix + "private.pem", ".local/evidence/R5/execution-20261013-old/report.json",
-                  ".local/evidence/R5/execution-20261014/report.json",
-                  ".local/evidence/R4/execution-20261013/report.json",
-                  ".local/tools/venv/config.json")
-        for relative in denied:
-            for form in self._forms(relative):
-                with self.subTest(path=form):
-                    self.assertEqual("deny", _level("Write", {"file_path": form}, cwd=REPO_ROOT))
-
     def test_written_content_is_not_parsed_as_a_patch(self) -> None:
         content = _patch("*** Update File: docs/kb/chunks.json")
         self.assertIsNone(_level("Write", {"file_path": "docs/notes.md", "content": content}, cwd=REPO_ROOT))
 
     def test_relative_paths_resolve_against_the_session_cwd(self) -> None:
-        self.assertEqual("deny", _level("Edit", {"file_path": "kb/chunks.json"}, cwd=REPO_ROOT / "docs"))
-        self.assertEqual("deny", _level("Edit", {"file_path": f"../{REPO_ROOT.name}/graphify-out/x"}, cwd=REPO_ROOT))
+        self.assertEqual("deny", _level("Edit", {"file_path": DOT_ENV}, cwd=REPO_ROOT / "docs"))
+        self.assertEqual("deny", _level("Edit", {"file_path": f"../{REPO_ROOT.name}/config/{DOT_ENV}"}, cwd=REPO_ROOT / "docs"))
+        self.assertIsNone(_level("Edit", {"file_path": "kb/chunks.json"}, cwd=REPO_ROOT / "docs"))
         self.assertIsNone(_level("Edit", {"file_path": "kb/README.md"}, cwd=REPO_ROOT / "docs"))
 
     def test_outside_checkout_only_unanchored_rules_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outside = Path(tmp)
             self.assertIsNone(_level("Write", {"file_path": str(outside / "graphify-out" / "x.json")}))
+            self.assertIsNone(_level("Write", {"file_path": str(outside / ".local" / "toolchains" / "zig")}))
             self.assertEqual("deny", _level("Write", {"file_path": str(outside / DOT_ENV)}))
+            self.assertEqual("deny", _level("Write", {"file_path": str(outside / "id_rsa")}))
 
     def test_repo_relative_normalization(self) -> None:
         gate = _gate()
@@ -919,25 +908,26 @@ class PatchProbeTests(unittest.TestCase):
         self.assertEqual(["x.zig"], gate.patch_targets("*** Begin Patch\r\n*** Update File: x.zig \r\n*** End Patch\r\n"))
         self.assertEqual([], gate.patch_targets({"command": "rg '*** Update File: docs/kb/chunks.json'"}))
 
-    def test_generated_and_secret_targets_are_denied(self) -> None:
+    def test_secret_targets_are_denied(self) -> None:
         cases = [
-            {"command": _patch("*** Update File: docs/kb/chunks.json")},
-            {"input": _patch("*** Update File: src/x.zig", "*** Move to: graphify-out/x.json")},
-            {"patch": _patch("*** Delete File: build.zig.zon.json")},
-            {"command": [APPLY_PATCH, _patch("*** Add File: config/" + DOT_ENV + ".local")]},
-            {"input": _patch("*** Update File: " + str(REPO_ROOT / "vendor" / "glad" / "src" / "gl.c"))},
-            {"input": _patch("*** Update File: src/terminal/Terminal.zig", "*** Update File: docs/kb/chunks.json")},
+            {"command": _patch("*** Add File: " + DOT_ENV)},
+            {"input": _patch("*** Update File: config/" + DOT_ENV + ".local")},
+            {"patch": _patch("*** Delete File: certs/server.pem")},
+            {"command": [APPLY_PATCH, _patch("*** Add File: id_ed25519")]},
+            {"input": _patch("*** Update File: .ssh/id_ed25519")},
+            {"input": _patch("*** Update File: src/x.zig", "*** Move to: " + DOT_ENV)},
         ]
         for tool_input in cases:
             with self.subTest(tool_input=tool_input):
                 self.assertEqual("deny", _level(APPLY_PATCH, tool_input, cwd=REPO_ROOT))
         self.assertEqual("deny", _level("Apply_Patch", cases[0], cwd=REPO_ROOT))
-        self.assertEqual("deny", _level(APPLY_PATCH, {"input": _patch("*** Update File: kb/chunks.json")}, cwd=REPO_ROOT / "docs"))
+        self.assertEqual("deny", _level(APPLY_PATCH, {"input": _patch("*** Update File: " + DOT_ENV)}, cwd=REPO_ROOT / "docs"))
 
-    def test_gate_configs_ask_and_ordinary_targets_pass(self) -> None:
-        self.assertEqual("ask", _level(APPLY_PATCH, {"input": _patch("*** Add File: .claude/hooks/x.py")}, cwd=REPO_ROOT))
-        self.assertEqual("ask", _level(APPLY_PATCH, {"input": _patch("*** Update File: .codex/config.toml")}, cwd=REPO_ROOT))
+    def test_gate_configs_and_ordinary_targets_pass(self) -> None:
         for tool_input in (
+            {"input": _patch("*** Add File: .claude/hooks/x.py")},
+            {"input": _patch("*** Update File: .codex/config.toml")},
+            {"input": _patch("*** Update File: docs/kb/chunks.json")},
             {"input": _patch("*** Update File: src/terminal/Terminal.zig")},
             {"command": _patch("*** Add File: docs/notes.md", "*** Delete File: scripts/old.py")},
             {"command": "no patch headers here"},
@@ -954,8 +944,8 @@ class ProtocolTests(unittest.TestCase):
         payload = {"tool_name": tool, "tool_input": tool_input}
         return [sys.executable, str(GATE_PATH), "--protocol", protocol], payload, {}
 
-    def test_claude_protocol_reports_deny_and_ask(self) -> None:
-        cases = ((FORCE_PUSH, "deny"), (HARD_RESET, "ask"))
+    def test_claude_protocol_reports_deny(self) -> None:
+        cases = ((FORCE_PUSH, "deny"), (ROOT_RM, "deny"), (f"cat {DOT_ENV}", "deny"))
         with _started([self._gate_call("claude", "Bash", {"command": command}) for command, _ in cases]) as results:
             for (_, expected), future in zip(cases, results):
                 with self.subTest(expected=expected):
@@ -971,9 +961,9 @@ class ProtocolTests(unittest.TestCase):
     def test_codex_protocol_never_asks_and_fits_the_codex_schema(self) -> None:
         cases = (
             ("Bash", {"command": FORCE_PUSH}),
-            ("Bash", {"command": HARD_RESET}),
-            (APPLY_PATCH, {"input": _patch("*** Update File: docs/kb/chunks.json")}),
-            (APPLY_PATCH, {"input": _patch("*** Update File: .codex/config.toml")}),
+            ("Bash", {"command": ROOT_RM}),
+            (APPLY_PATCH, {"input": _patch("*** Add File: " + DOT_ENV)}),
+            (APPLY_PATCH, {"input": _patch("*** Update File: .ssh/id_ed25519")}),
         )
         with _started([self._gate_call("codex", tool, tool_input) for tool, tool_input in cases]) as results:
             for (tool, tool_input), future in zip(cases, results):
@@ -988,9 +978,16 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual("deny", specific["permissionDecision"])
                     self.assertTrue(specific["permissionDecisionReason"].strip())
                     self.assertNotIn('"ask"', result.stdout.decode("utf-8"))
-            # The HARD_RESET case is the ask-level rule; its deny explains why.
-            asked = _decision(results[1].result())
-        self.assertIn("不支持 ask", asked["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_codex_protocol_renders_an_ask_rule_as_deny(self) -> None:
+        # 当前策略只有 deny 规则；ask→deny 的协议行为用 render 直接锁定，不依赖真实 conf。
+        gate = _gate()
+        decision = gate.Decision("ask", "需人工确认")
+        claude = gate.render(decision, "claude")["hookSpecificOutput"]
+        self.assertEqual("ask", claude["permissionDecision"])
+        codex = gate.render(decision, "codex")["hookSpecificOutput"]
+        self.assertEqual("deny", codex["permissionDecision"])
+        self.assertIn("不支持 ask", codex["permissionDecisionReason"])
 
     def test_allowed_calls_print_nothing(self) -> None:
         probes = (("Bash", {"command": f"{GIT} status"}), (APPLY_PATCH, {"input": _patch("*** Add File: x.md")}))
@@ -1197,12 +1194,17 @@ class RegisteredEntryTests(unittest.TestCase):
 
     PROBES = [
         ("Bash", {"command": FORCE_PUSH}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
-        ("Bash", {"command": HARD_RESET}, {"claude": "ask", "zcode": "ask", "codex": "deny"}),
+        ("Bash", {"command": ROOT_RM}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        ("Bash", {"command": f"cat {DOT_ENV}"}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        ("Bash", {"command": HARD_RESET}, {"claude": None, "zcode": None, "codex": None}),
         ("Bash", {"command": f"{GIT} status"}, {"claude": None, "zcode": None, "codex": None}),
-        ("Write", {"file_path": str(REPO_ROOT / "docs" / "kb" / "chunks.json")}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        ("Write", {"file_path": str(REPO_ROOT / DOT_ENV)}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        ("Write", {"file_path": str(REPO_ROOT / "docs" / "kb" / "chunks.json")}, {"claude": None, "zcode": None, "codex": None}),
         ("Edit", {"file_path": str(REPO_ROOT / "src" / "main.zig")}, {"claude": None, "zcode": None, "codex": None}),
-        (APPLY_PATCH, {"input": _patch("*** Update File: " + str(REPO_ROOT / "docs" / "kb" / "chunks.json"))},
+        (APPLY_PATCH, {"input": _patch("*** Add File: " + str(REPO_ROOT / DOT_ENV))},
          {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        (APPLY_PATCH, {"input": _patch("*** Update File: " + str(REPO_ROOT / "docs" / "kb" / "chunks.json"))},
+         {"claude": None, "zcode": None, "codex": None}),
         (APPLY_PATCH, {"input": _patch("*** Update File: " + str(REPO_ROOT / "src" / "terminal" / "Terminal.zig"))},
          {"claude": None, "zcode": None, "codex": None}),
     ]
@@ -1210,12 +1212,13 @@ class RegisteredEntryTests(unittest.TestCase):
     # how an entry locates its script (git rev-parse) and the payload cwd, so there each entry runs
     # the probe whose answer differs per protocol plus a path that resolves against that cwd.
     SUBDIR_PROBES = [
-        PROBES[1],
-        ("Write", {"file_path": "../docs/kb/chunks.json"}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        PROBES[3],
+        ("Write", {"file_path": "../" + DOT_ENV}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
     ]
     # CLAUDE_PROJECT_DIR only changes how the Claude entry finds its script: one probe per answer
-    # (deny through a FILE rule, ask, allow) shows that each form gates from outside the checkout.
-    PROJECT_DIR_PROBES = [PROBES[3], PROBES[1], PROBES[2]]
+    # (deny through a FILE rule, deny through a SHELL rule, allow) shows that each form gates from
+    # outside the checkout.
+    PROJECT_DIR_PROBES = [PROBES[5], PROBES[0], PROBES[4]]
     GUARDED_STATUS = {"tool_name": "Bash", "tool_input": {"command": f"{GIT} status"}}
 
     def _bash(self) -> str:
@@ -1318,7 +1321,7 @@ class RegisteredEntryTests(unittest.TestCase):
         bash = self._bash()
         payload = {
             "tool_name": "Write",
-            "tool_input": {"file_path": str(REPO_ROOT / "docs" / "kb" / "chunks.json"), "content": "x" * 2_000_000},
+            "tool_input": {"file_path": str(REPO_ROOT / DOT_ENV), "content": "x" * 2_000_000},
         }
         started = time.monotonic()
         result = _run([bash, "-c", CLAUDE_HOOK_COMMAND], payload, env=_bash_env())
@@ -1432,18 +1435,25 @@ class ClaudeConfigTests(unittest.TestCase):
     def test_permission_shape(self) -> None:
         self.assertEqual("acceptEdits", self.permissions["defaultMode"])
         self.assertNotIn("ask", self.permissions, "ask rules prompt in every mode and no allow can override them")
-        for rule in ("Read(./.env)", "Read(./**/.env)", "Read(./**/*.pem)", "Read(./.git/**)"):
-            self.assertIn(rule, self.permissions["deny"])
-        allow = self.permissions["allow"]
-        for rule in ("Read(./**)", "Edit(./**)", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"):
-            self.assertIn(rule, allow)
-        self.assertNotIn("Bash", allow, "Bash stays scoped to explicit command prefixes")
-        for rule in allow:
+        # 2026-10 白名单放开：Bash 不再限定命令前缀，其余工具整工具放行。
+        self.assertEqual(
+            {"Read(./**)", "Edit(./**)", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill", "Bash"},
+            set(self.permissions["allow"]),
+        )
+        # 最小核心防线：deny 只覆盖凭据/私钥的读取与写入；Edit 规则同时覆盖 Write 与 NotebookEdit。
+        expected = {
+            f"{tool}({path})"
+            for tool in ("Read", "Edit")
+            for path in (
+                "./.env", "./**/.env", "./**/*.pem", "./**/*.key",
+                "./**/id_rsa", "./**/id_dsa", "./**/id_ecdsa", "./**/id_ed25519", "./**/.ssh/**",
+            )
+        }
+        self.assertEqual(expected, set(self.permissions["deny"]))
+        for rule in self.permissions["allow"]:
             with self.subTest(rule=rule):
                 # Write/MultiEdit/NotebookEdit path rules are never consulted; Edit covers them.
                 self.assertIsNone(re.match(r"(?:Write|MultiEdit|NotebookEdit)\(", rule))
-                if rule.startswith("Bash"):
-                    self.assertRegex(rule, r"^Bash\([^()*]+ \*\)$|^Bash\([^()*]+/\*\)$")
 
     def test_pre_tool_use_hook(self) -> None:
         blocks = self.settings["hooks"]["PreToolUse"]
